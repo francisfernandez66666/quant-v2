@@ -39,7 +39,8 @@ func (s *Server) handleRiskGates(w http.ResponseWriter, r *http.Request) {
 			switches["concentration"] = rg.SingleStockValuePct > 0
 			switches["stale_quote"] = rg.StaleQuoteMs > 0
 			switches["limit_up_block_buy"] = rg.LimitUpBlockBuy
-			switches["limit_down_block_sell"] = rg.LimitDownBlockSell
+			// §A5-常开：展示"生效值"而非"配置值"——未配置时跌停追卖闸即为开（owner 裁决 2026-09-26）。
+			switches["limit_down_block_sell"] = rg.LimitDownBlockSellEnabled()
 			// §AUDIT-PM 2026-09-15 单笔金额绝对帽开关（保存即生效，不走开关队列）
 			switches["max_order_amount"] = rg.MaxOrderAmount > 0
 		}

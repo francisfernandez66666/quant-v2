@@ -410,6 +410,14 @@ class XtBroker(Broker):
             # 与策略桥 qmt_bridge_strategy.query_positions/embed_positions 的字段集完全一致。
             # 此前 xt 直连通道丢 can_use_qty——同一账户走不同通道回报的字段集不同，
             # T+1 可卖量在直连通道不可见（tests/test_channel_position_fields.py 锁死 diff 为空）。
+            # §0925EVE-W2-A1（2026-09-26 批）本行键集即契约真行采样
+            # （contract/positions_sample.json）钉死的对象：can_use_qty 的 Go 腿已补
+            # （store.RealPosition.CanUseQty → real_positions.can_use_qty 列 → checkT1Sellable
+            # 柜台值优先）；cost_price/highest_price 与 open_price 同值属 §M5 通道对齐的
+            # 一源三路冗余，裁决=**登记进 golden 而非在此清除**——三处映射（本函数/
+            # 策略桥 query/策略桥 embed）被 AST 对齐锁钉成同一键集，且 qmt_bridge_strategy.py/
+            # qmt_bridge.py 不在本批边界，单边清除必打红对齐锁；open_price 键在 Go 侧以
+            # RealPosition.OpenPrice 登记接住（不消费），杜绝发出而未登记的静默丢腿。
             out.append({
                 "ts_code": getattr(p, "stock_code", ""),
                 "name": getattr(p, "stock_name", ""),

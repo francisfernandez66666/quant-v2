@@ -15,13 +15,20 @@
 #   - 计划任务提供登录自启 + 每 5 分钟幂等守护（端口活着就不动，死了才拉起）。
 #   - -InstallQmtAutostart：把 XtItClient.exe 快捷方式放进当前用户启动文件夹；
 #     需配合 Windows 自动登录（netplwiz），否则重启后无人登录、客户端与网关都起不来。
+#
+# §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯）已收编进 service_definitions.ps1 的定义：
+#   交互任务名（$SvcTaskGatewayEnsure/$SvcTaskGatewayLogon）、守护间隔（$SvcGatewayEnsureIntervalMin）、
+#   遗留 NSSM 网关服务名清单（$SvcLegacyGwServiceNames）、网关目录推导缺省（$SvcGatewayDir）、
+#   幂等判据端口（§H8 $ProbeGatewayPort，旧版在此脚本硬编码 8789 两处）。param() 字面量保留为
+#   定义文件缺失时的回退；操作人显式传参永远赢过单源缺省。
 param(
     [string]$PythonExe = "",
-    [string]$GatewayDir = "",      # 留空取本仓库相对路径 qmt_gateway
+    [string]$GatewayDir = "",      # 留空取 §C7 单源 $SvcGatewayDir（现网 C:\qmt\quant-trading-v2\qmt_gateway），
+                                   # 定义文件缺失时回退本仓库相对路径 qmt_gateway
     [string]$ConfigFile = "",      # 留空取 <GatewayDir>\config.xt.json
-    [string]$TaskEnsureName = "QMT-Gateway-Ensure",
-    [string]$TaskLogonName = "QMT-Gateway-Logon",
-    [int]$EnsureIntervalMin = 5,
+    [string]$TaskEnsureName = "",  # 留空取 §C7 单源（默认 QMT-Gateway-Ensure）
+    [string]$TaskLogonName = "",   # 留空取 §C7 单源（默认 QMT-Gateway-Logon）
+    [int]$EnsureIntervalMin = 0,   # 0 = 取 §C7 单源（默认 5 分钟）
     [switch]$InstallQmtRestart,
     [switch]$InstallQmtAutostart
 )
@@ -32,6 +39,22 @@ function Ok($m)   { Write-Host "[ ok ] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[warn] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[fail] $m" -ForegroundColor Red; exit 1 }
 
+# ---- §C7-OPS：服务/任务定义单源（缺失回退本脚本字面量并告警，不阻断——注册步是施工入口）----
+$svcDefs = Join-Path $PSScriptRoot "service_definitions.ps1"
+if (Test-Path $svcDefs) {
+    . $svcDefs
+    Info "service definitions loaded: $svcDefs (§C7 服务/任务定义同源)"
+} else {
+    Warn "missing $svcDefs - 任务名/端口回退本脚本字面量（§C7：watchdog 与本脚本的定义将脱钩，请补齐部署清单）"
+    $SvcTaskGatewayEnsure = "QMT-Gateway-Ensure"; $SvcTaskGatewayLogon = "QMT-Gateway-Logon"
+    $SvcGatewayEnsureIntervalMin = 5
+    $SvcLegacyGwServiceNames = @("qmt-gateway", "quant-gateway")
+    $ProbeGatewayPort = 8789
+}
+if (-not $TaskEnsureName)   { $TaskEnsureName = $SvcTaskGatewayEnsure }
+if (-not $TaskLogonName)    { $TaskLogonName = $SvcTaskGatewayLogon }
+if ($EnsureIntervalMin -le 0) { $EnsureIntervalMin = $SvcGatewayEnsureIntervalMin }
+
 # ---- 0. 管理员校验 ----
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -41,7 +64,13 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 # ---- 1. 路径默认值 ----
 if (-not $GatewayDir) {
-    $GatewayDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "qmt_gateway"
+    # §C7-OPS：现网网关目录取单源 $SvcGatewayDir（= deploy_guangzhou.sh QMT_GATEWAY_DIR）；
+    # 定义文件缺失（上面已 Warn）时回退旧的"本仓库相对路径"推导。
+    if ($SvcGatewayDir -and (Test-Path $SvcGatewayDir)) {
+        $GatewayDir = $SvcGatewayDir
+    } else {
+        $GatewayDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "qmt_gateway"
+    }
 }
 if (-not $ConfigFile) { $ConfigFile = Join-Path $GatewayDir "config.xt.json" }
 if (-not (Test-Path $ConfigFile)) { Die "缺少 $ConfigFile —— 先运行 setup_windows.ps1 生成配置" }
@@ -54,17 +83,26 @@ Info "python: $PythonExe"
 Info "config: $ConfigFile"
 
 # ---- 2. 停用遗留 NSSM 网关服务（Session 0 实例永远连不上，且会抢占 8789 端口）----
-foreach ($legacy in "qmt-gateway", "quant-gateway") {
+# §C7-OPS：遗留名清单来自 service_definitions.ps1（含 all_service_watchdog 旧守护清单用过的
+# 下划线名 qmt_gateway——若那台机器真按旧径装过它，一并停用；绝不可把它当网关拉起路径复活）。
+$nssmLegacy = if (Get-Command Resolve-SvcNssm -ErrorAction SilentlyContinue) { Resolve-SvcNssm } else { $null }
+if (-not $nssmLegacy) { $nssmLegacy = (Join-Path $PSScriptRoot "tools\nssm-2.24\win64\nssm.exe") }
+foreach ($legacy in $SvcLegacyGwServiceNames) {
     $svc = Get-Service -Name $legacy -ErrorAction SilentlyContinue
     if ($svc) {
         Warn "检测到遗留服务 $legacy（NSSM/Session 0）—— 停止并禁用"
         Stop-Service $legacy -Force -ErrorAction SilentlyContinue
-        & (Join-Path $PSScriptRoot "tools\nssm-2.24\win64\nssm.exe") set $legacy Start SERVICE_DISABLED 2>$null
-        if ($LASTEXITCODE -ne 0) { Set-Service $legacy -StartupType Disabled -ErrorAction SilentlyContinue }
+        if (Test-Path $nssmLegacy) {
+            & $nssmLegacy set $legacy Start SERVICE_DISABLED 2>$null
+            if ($LASTEXITCODE -ne 0) { Set-Service $legacy -StartupType Disabled -ErrorAction SilentlyContinue }
+        } else {
+            Set-Service $legacy -StartupType Disabled -ErrorAction SilentlyContinue
+        }
     }
 }
 
-# ---- 3. 生成守护 wrapper：8789 未监听才拉起（幂等），与客户端同交互会话 ----
+# ---- 3. 生成守护 wrapper：网关口未监听才拉起（幂等），与客户端同交互会话 ----
+# §C7-OPS：判据端口来自 §H8 单源 $ProbeGatewayPort（旧版在这里和 :health 检查两处硬编码 8789）。
 $wrapper = Join-Path $PSScriptRoot "ensure_gateway.ps1"
 $wrap = @"
 `$ErrorActionPreference = 'SilentlyContinue'
@@ -74,7 +112,7 @@ $wrap = @"
 `$dir = '$GatewayDir'
 # xtquant <-> QMT 客户端经按会话隔离的共享内存通信：网关必须与客户端同交互会话，
 # 绝不能以服务/SYSTEM 会话运行（详见 register_service.ps1 文件头说明）。
-`$listening = Get-NetTCPConnection -LocalPort 8789 -State Listen
+`$listening = Get-NetTCPConnection -LocalPort $ProbeGatewayPort -State Listen
 if (-not `$listening) {
   Start-Process -FilePath `$py -ArgumentList "`"`$gw`" -c `"`$cfg`"" -WorkingDirectory `$dir -WindowStyle Hidden
   exit 1
@@ -105,10 +143,10 @@ if ($LASTEXITCODE -eq 0) { Ok "任务 $TaskLogonName 已创建（用户登录即
 schtasks /Run /TN $TaskEnsureName
 Start-Sleep -Seconds 8
 try {
-    $h = Invoke-RestMethod "http://127.0.0.1:8789/health" -TimeoutSec 5
+    $h = Invoke-RestMethod "http://127.0.0.1:$ProbeGatewayPort/health" -TimeoutSec 5
     Ok "网关 /health: ok=$($h.ok) broker=$($h.broker) broker_connected=$($h.broker_connected)（xt 通道需客户端已登录才为 true）"
 } catch {
-    Warn "本机 8789 健康检查失败: $($_.Exception.Message)（gateway-<pid>.log 可查；先确认 QMT 客户端在线）"
+    Warn "本机 $ProbeGatewayPort 健康检查失败: $($_.Exception.Message)（gateway-<pid>.log 可查；先确认 QMT 客户端在线）"
 }
 
 # ---- 6. 可选：每日 07:40 重启 QMT 客户端（内存增长守卫）----
@@ -147,4 +185,4 @@ if ($InstallQmtAutostart) {
     }
 }
 
-Ok "全部完成。验证命令：schtasks /Query /TN $TaskEnsureName ；curl http://127.0.0.1:8789/health"
+Ok "全部完成。验证命令：schtasks /Query /TN $TaskEnsureName ；curl http://127.0.0.1:$ProbeGatewayPort/health"

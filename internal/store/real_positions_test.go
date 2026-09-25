@@ -1085,3 +1085,104 @@ func TestRaiseRealPositionHighOnlyUp(t *testing.T) {
 		t.Fatalf("u2 行 highest_price 应保持 6, got %v", p.HighestPrice)
 	}
 }
+
+// intPtr 测试夹具：取 int 值地址（CanUseQty *int 三态构造：nil=未知 / &0=柜台真值 0）。
+func intPtr(v int) *int { return &v }
+
+// TestRealPositionCanUseQty §0925EVE-W2-A1（2026-09-26 批）柜台 T+1 可卖量入账回归：
+// ① 快照携带 → 落库并读回（含 *int 真值 0 与 NULL 未知的三态区分）；
+// ② 后续快照未携带（旧桥通道 7 键行）→ 保留最近一次已知值，不得清空成未知；
+// ③ 柜台携带 0（当日新仓全锁）→ 覆盖旧值为 0，真值 0 不是「缺失」；
+// ④ 生产主路径 ReconcilePositionsForUser 同口径；
+// ⑤ 成交回报建的行（ApplyRealFill）该列为 NULL=未知，T+1 闸据此自动退回本地推算。
+// English: §A1 — persistence round-trip for the broker-reported T+1 sellable qty, keeping
+// "counter 0" distinguishable from "never reported" (NULL), and pinning the COALESCE keep-last
+// behavior when a legacy bridge-channel snapshot omits the key.
+func TestRealPositionCanUseQty(t *testing.T) {
+	db := testDB(t)
+
+	// ① 首次对账即携带柜台值。
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10, Amount: 5000,
+			HighestPrice: 10, CanUseQty: intPtr(300)},
+	}); err != nil {
+		t.Fatalf("upsert with can_use_qty: %v", err)
+	}
+	p, err := db.RealPositionByCode("600000.SH")
+	if err != nil {
+		t.Fatalf("by code: %v", err)
+	}
+	if p.CanUseQty == nil || *p.CanUseQty != 300 {
+		t.Fatalf("① can_use_qty 应读回 300, got %+v", p.CanUseQty)
+	}
+
+	// ② 旧桥通道快照（无该键 → nil）：保留最近一次已知值 300，不得清成未知。
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10, Amount: 5000, HighestPrice: 10},
+	}); err != nil {
+		t.Fatalf("upsert without key: %v", err)
+	}
+	if p, _ := db.RealPositionByCode("600000.SH"); p.CanUseQty == nil || *p.CanUseQty != 300 {
+		t.Fatalf("② 未携带该键的快照不得清空已知柜台值, got %+v", p.CanUseQty)
+	}
+
+	// ③ 柜台真值 0（当日新仓全锁）：必须覆盖旧值——0 与「没读到」两态在此分家。
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10, Amount: 5000,
+			HighestPrice: 10, CanUseQty: intPtr(0)},
+	}); err != nil {
+		t.Fatalf("upsert zero: %v", err)
+	}
+	p, _ = db.RealPositionByCode("600000.SH")
+	if p.CanUseQty == nil || *p.CanUseQty != 0 {
+		t.Fatalf("③ 柜台真值 0 应落 0 而非 NULL, got %+v", p.CanUseQty)
+	}
+
+	// ④ 生产主路径 ReconcilePositionsForUser：落库 + 按账号读取口回读。
+	if _, err := db.ReconcilePositionsForUser("u1", []RealPosition{
+		{TsCode: "000001.SZ", Name: "平安", Qty: 200, CostPrice: 12, Amount: 2400,
+			HighestPrice: 12, CanUseQty: intPtr(100)},
+	}); err != nil {
+		t.Fatalf("reconcile for user: %v", err)
+	}
+	pu, err := db.RealPositionByCodeForUser("u1", "000001.SZ")
+	if err != nil {
+		t.Fatalf("by code for user: %v", err)
+	}
+	if pu.CanUseQty == nil || *pu.CanUseQty != 100 {
+		t.Fatalf("④ ReconcilePositionsForUser 应透传 can_use_qty=100, got %+v", pu.CanUseQty)
+	}
+	all, err := db.RealPositionsForUser("u1")
+	if err != nil || len(all) != 1 {
+		t.Fatalf("④ RealPositionsForUser 回读: n=%d err=%v", len(all), err)
+	}
+	if all[0].CanUseQty == nil || *all[0].CanUseQty != 100 {
+		t.Fatalf("④ 列表读取口丢腿, got %+v", all[0].CanUseQty)
+	}
+	// 全表读取口同样带腿。行数=1 是既有 P2#17 语义：ReconcilePositionsForUser 会把
+	// 不在本账号快照内的遗留全局行（早前 UpsertRealPositions 建的 600000 行，user_id=”）
+	// 一并清除，此处只余 u1 的 000001 行。
+	if all2, err := db.RealPositions(); err != nil || len(all2) != 1 {
+		t.Fatalf("④ RealPositions 全表读取口: n=%d err=%v", len(all2), err)
+	} else if all2[0].CanUseQty == nil || *all2[0].CanUseQty != 100 {
+		t.Fatalf("④ RealPositions 全表读取口丢腿, got %+v", all2[0].CanUseQty)
+	}
+
+	// ⑤ 成交回报建的行不写该列（NULL=未知）：改前该列不存在，改后必须可分辨「没读到」。
+	if err := db.ApplyRealFill(RealFill{OrderID: "O9", Code: "300750.SZ", Side: "买入",
+		Price: 20, Qty: 100, Amount: 2000, TradedAt: "2026-09-26 09:35:00", SignalID: "S9", UserID: "u1"}); err != nil {
+		t.Fatalf("apply fill: %v", err)
+	}
+	pf, err := db.RealPositionByCodeForUser("u1", "300750.SZ")
+	if err != nil {
+		t.Fatalf("read fill row: %v", err)
+	}
+	if pf.CanUseQty != nil {
+		t.Fatalf("⑤ 成交回报建行 can_use_qty 必须为 NULL(未知)，got %d", *pf.CanUseQty)
+	}
+
+	// 幂等：重复 Open（迁移再跑一遍）不得因补列报错。
+	if err := db.ensureCanUseQtyColumn(); err != nil {
+		t.Fatalf("ensure 幂等: %v", err)
+	}
+}

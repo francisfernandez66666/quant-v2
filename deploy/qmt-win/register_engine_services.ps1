@@ -27,6 +27,12 @@
 #                  xtquant talks to the QMT client via per-session shared-memory queues,
 #                  a Session-0/NSSM instance can never complete the heartbeat handshake.
 #   qmtctl         scheduled task (interactive session, every 10 min) - must NOT use NSSM (needs GUI login)
+# NOTE (§C7-OPS 2026-09-26, FIX_PLAN_20260925EVE ⑯)：已收编进 service_definitions.ps1 的定义——
+#   NSSM 服务名（quant/quant-research/pydata）、qmtctl 任务名（QMT-Ensure-Running）、
+#   日志清理任务名（Quant-Log-Prune）、MiniQmtPath/DataDir 缺省值、§H8 端口变量的转发。
+#   本文件顶部 param() 的字面量保留为「定义文件缺失时的回退」；定义文件在位且操作人未显式
+#   传参时被单源覆盖。收尾键名断言块的 "quant"/"quant-research" 字面量**刻意不收编**——
+#   verify_changes.sh §67 的必需键同源等值锁按该字面量行比对，改变量会造成门禁失明。
 param(
     [string]$QuantExe = "C:\opt\quant\quant.exe",
     [string]$ResearchExe = "C:\opt\quant\researchd.exe",
@@ -66,6 +72,24 @@ if (Test-Path $probeCfg) {
     $ProbeQuantPort  = 8081
     $ProbePydataPort = 8787
     $ProbeGatewayUrl = "http://127.0.0.1:8789/health"
+}
+
+# §C7-OPS(2026-09-26)：服务/任务定义单源（service_definitions.ps1）。与 §H8 同法：缺失回退
+# 本文件字面量并告警，不阻断注册（注册步是施工入口，宁可用旧字面量完成也不把人卡在门外；
+# 但 watchdog 那边缺单源是致命退出——守护误动作比施工降级更危险，两侧方向不同是有意的）。
+# 覆盖原则：操作人显式传参（$PSBoundParameters）永远赢过单源缺省。
+$svcDefsFile = Join-Path $PSScriptRoot "service_definitions.ps1"
+if (Test-Path $svcDefsFile) {
+    . $svcDefsFile
+    Info "service definitions loaded: $svcDefsFile (§C7 服务/任务定义同源)"
+    if (-not $PSBoundParameters.ContainsKey('MiniQmtPath')) { $MiniQmtPath = $SvcMiniQmtClientExe }
+    if (-not $PSBoundParameters.ContainsKey('DataDir'))     { $DataDir     = $SvcDataDir }
+} else {
+    Warn "missing $svcDefsFile - 服务名/任务名/路径回退本脚本字面量（§C7：watchdog 与注册步的定义将脱钩，请补齐部署清单）"
+    $SvcNameQuant = "quant"; $SvcNameResearch = "quant-research"; $SvcNamePydata = "pydata"
+    $SvcTaskQmtctl = "QMT-Ensure-Running"; $SvcTaskLogPrune = "Quant-Log-Prune"
+    $SvcQmtctlIntervalMin = 10
+    $SvcTaskGatewayEnsure = "QMT-Gateway-Ensure"; $SvcTaskGatewayLogon = "QMT-Gateway-Logon"
 }
 
 # ── §N-5(2026-09-23 晚批) 密钥解析：参数缺省时从磁盘密钥文件 / 机器级环境变量取，绝不"缺省即跳过" ──
@@ -211,6 +235,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 # 1. prepare nssm
+# §C7-OPS：安装位表达式即 service_definitions.ps1 Resolve-SvcNssm 候选表的解析位（脚本落
+# C:\opt\quant\qmt-win 时 = 现网唯一 NSSM 位，deploy_guangzhou.sh:85 / verify_deploy_guangzhou.sh:241）。
 $tools = Join-Path $PSScriptRoot "tools"
 $nssm = Join-Path $tools "nssm-2.24\win64\nssm.exe"
 if (-not (Test-Path $nssm)) {
@@ -243,7 +269,7 @@ function Register-NssmService($name, $exe, $appArgs, $priority) {
 
 # 2. quant (NORMAL)
 if (-not (Test-Path $QuantExe)) { Die "missing $QuantExe" }
-Register-NssmService "quant" $QuantExe @() "NORMAL_PRIORITY_CLASS"
+Register-NssmService $SvcNameQuant $QuantExe @() "NORMAL_PRIORITY_CLASS"
 # §部署修复 2026-09-17：端口必须是 127.0.0.1:8081——广州拓扑下 Caddy 占用 :8080
 # （Caddyfile /api/* → reverse_proxy 127.0.0.1:8081）。旧值 0.0.0.0:8080 与 Caddy
 # 撞端口，配合 §W4-b fail-fast 会让 quant 服务起不来（5s 重启循环，部署实录）。
@@ -252,20 +278,20 @@ Register-NssmService "quant" $QuantExe @() "NORMAL_PRIORITY_CLASS"
 # AppEnvironmentExtra 是整体替换语义，所以旧注释要求"必须带全量再叠 QUANT_ADDR"，
 # 而"全量"取决于本次命令行传了哪些密钥 → 少传即少删。现改走 Set-ServiceEnvExtra：
 # 先 nssm get 读回现值做并集，再一次性写回，QUANT_ADDR 只是叠加的一个键，**不再有删东西的能力**。
-Set-ServiceEnvExtra "quant" ((Get-BaseEnvExtra) + @("QUANT_ADDR=127.0.0.1:$ProbeQuantPort"))
+Set-ServiceEnvExtra $SvcNameQuant ((Get-BaseEnvExtra) + @("QUANT_ADDR=127.0.0.1:$ProbeQuantPort"))
 if (-not $HithinkResolved) {
     Warn "HITHINK_FINANCE_API_KEY 三处来源（参数/密钥文件/机器级环境变量）都没取到：交易日历将按周末口径兜底（法定节假日会误判为交易日），尾部键名断言会判红"
 }
-& $nssm restart quant
+& $nssm restart $SvcNameQuant
 Start-Sleep -Seconds 2
-Ok "quant registered/restarted"
+Ok "$SvcNameQuant registered/restarted"
 
 # 3. quant-research (BELOW_NORMAL)
 if (-not (Test-Path $ResearchExe)) { Die "missing $ResearchExe" }
-Register-NssmService "quant-research" $ResearchExe @() "BELOW_NORMAL_PRIORITY_CLASS"
-& $nssm restart quant-research
+Register-NssmService $SvcNameResearch $ResearchExe @() "BELOW_NORMAL_PRIORITY_CLASS"
+& $nssm restart $SvcNameResearch
 Start-Sleep -Seconds 2
-Ok "quant-research registered/restarted"
+Ok "$SvcNameResearch registered/restarted"
 
 # 4. pydata (baostock sidecar, port 8787)
 $pyExe = Join-Path $PydataVenv "Scripts\python.exe"
@@ -275,11 +301,11 @@ if (-not (Test-Path $pyScript)) {
 } elseif (-not (Test-Path $pyExe)) {
     Warn "missing venv python $pyExe - skip pydata (run setup_venv first)"
 } else {
-    Register-NssmService "pydata" $pyExe @("$pyScript", "--host", "127.0.0.1", "--port", "$ProbePydataPort") "BELOW_NORMAL_PRIORITY_CLASS"
-    & $nssm set pydata AppDirectory "C:\opt\quant\pydata" | Out-Null
-    & $nssm restart pydata
+    Register-NssmService $SvcNamePydata $pyExe @("$pyScript", "--host", "127.0.0.1", "--port", "$ProbePydataPort") "BELOW_NORMAL_PRIORITY_CLASS"
+    & $nssm set $SvcNamePydata AppDirectory "C:\opt\quant\pydata" | Out-Null
+    & $nssm restart $SvcNamePydata
     Start-Sleep -Seconds 2
-    Ok "pydata registered/restarted (127.0.0.1:$ProbePydataPort)"
+    Ok "$SvcNamePydata registered/restarted (127.0.0.1:$ProbePydataPort)"
 }
 
 # 5. qmtctl scheduled task (interactive session) - generate a wrapper ps1 to avoid nested quoting
@@ -290,14 +316,14 @@ if (-not (Test-Path $QmtctlExe)) {
     $wrapContent = "& '$QmtctlExe' ensure-miniqmt -path '$MiniQmtPath' -gateway-url $ProbeGatewayUrl"
     # UTF8（PS5.1 带 BOM）：MiniQmtPath 常含中文安装目录，ASCII 会写成 '?' 导致启动失败
     Set-Content -Path $wrapper -Value $wrapContent -Encoding UTF8
-    $taskName = "QMT-Ensure-Running"
+    $taskName = $SvcTaskQmtctl
     # §FIX 2026-08-31：无窗口包装——wscript(GUI 子系统)经 VBS 隐藏运行，根除交互任务
     # 每 10 分钟的黑框闪烁（"监控闪退"观感）。VBS 内容 ASCII（wscript 不认 UTF-8 BOM）。
     $vbs = Join-Path $PSScriptRoot "run_qmt_ensure.vbs"
     [IO.File]::WriteAllText($vbs, "CreateObject(""WScript.Shell"").Run ""powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"", 0, True", (New-Object Text.ASCIIEncoding))
     $action = "wscript.exe //B $vbs"
     # no /RU SYSTEM: runs in the logged-on interactive session (MiniQMT needs GUI session)
-    schtasks /Create /F /SC MINUTE /MO 10 /TN $taskName /TR $action
+    schtasks /Create /F /SC MINUTE /MO $SvcQmtctlIntervalMin /TN $taskName /TR $action
     if ($LASTEXITCODE -eq 0) { Ok "task $taskName created (every 10 min, interactive)" }
     else { Warn "schtasks create failed (exit=$LASTEXITCODE); create manually (current user, not SYSTEM)" }
 }
@@ -305,9 +331,9 @@ if (-not (Test-Path $QmtctlExe)) {
 # 6. §RFIX-5 日志保留计划任务（每日 07:30，SYSTEM 可无窗执行——纯文件清理不涉 GUI）
 $prune = Join-Path $PSScriptRoot "prune_logs.ps1"
 if (Test-Path $prune) {
-    schtasks /Create /F /SC DAILY /ST 07:30 /TN "Quant-Log-Prune" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $prune" | Out-Null
-    if ($LASTEXITCODE -eq 0) { Ok "task Quant-Log-Prune created (daily 07:30, keep 20 rotations)" }
-    else { Warn "Quant-Log-Prune 创建失败（exit=$LASTEXITCODE）：轮转日志将无限累积，请手动创建" }
+    schtasks /Create /F /SC DAILY /ST 07:30 /TN $SvcTaskLogPrune /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $prune" | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok "task $SvcTaskLogPrune created (daily 07:30, keep 20 rotations)" }
+    else { Warn "$SvcTaskLogPrune 创建失败（exit=$LASTEXITCODE）：轮转日志将无限累积，请手动创建" }
 } else {
     Warn "missing $prune - skip log-prune task（researchd/quant_stderr 轮转日志不会自动清理）"
 }
@@ -377,4 +403,4 @@ if ($envMissing.Count -gt 0) {
 }
 Ok "服务 env 键名断言通过：quant 4 硬键 + quant-research 3 硬键在位，LLM 来源已确认（全程未回显任何值）"
 
-Ok "engine services registered. Verify: Get-Service quant,quant-research,pydata ; schtasks /Query /TN QMT-Ensure-Running"
+Ok "engine services registered. Verify: Get-Service $SvcNameQuant,$SvcNameResearch,$SvcNamePydata ; schtasks /Query /TN $SvcTaskQmtctl ; 网关守护腿见 service_definitions.ps1（$SvcTaskGatewayEnsure/$SvcTaskGatewayLogon，register_service.ps1 注册）"

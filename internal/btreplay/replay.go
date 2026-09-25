@@ -890,12 +890,15 @@ type Options struct {
 	// 默认 0（A 股保守口径）；参考可配国债利率如 0.02。English: §WS-D D3 annual risk-free rate used in
 	// the daily-frequency Sharpe formula; default 0, a reasonable A-share reference is ~0.02.
 	RiskFreeRate float64
-	// PointInTime §WS-D D-2 时点股票池：置真时以回测起始日"当时点已上市且未退市"的股票池
-	//（store.UniverseAt(o.Start)，含退市样本消除幸存者偏差）替代全量 StockCodes()——
-	// 需 dataload 已用 --with-delisted 装载含退市元数据。English: §WS-D D-2 point-in-time universe —
-	// when set, run on the universe listed-and-not-yet-delisted at the backtest start (drops survivorship
-	// bias); requires dataload loaded with --with-delisted.
-	PointInTime bool
+	// PointInTime §WS-D D-2 时点股票池：**缺省开**（owner 裁决 2026-09-26「幸存者偏差开关：
+	// 开，默认打开」）。nil=开；显式 false 才退回"今天在市的票"旧口径。置真时以回测起始日
+	// "当时点已上市且未退市"的股票池（store.UniverseAt(o.Start)，含退市样本消除幸存者偏差）
+	// 替代全量 StockCodes()——数据前提是 dataload §B4-META 已回填 list_date/delist_date；
+	// 元数据覆盖为 0 时本闸把降级抬成**可见读数**（报告首行池口径声明），不静默空跑。
+	// English: §WS-D D-2 point-in-time universe — ON by default (owner ruling 2026-09-26);
+	// explicit false opts back into the survivorship-biased "today-listed" pool. Empty metadata
+	// coverage degrades loudly (pool-basis line in the report), never silently.
+	PointInTime *bool
 	// Codes 非空时直接作为回放股票池（跳过 StockCodes/质控/时点三条池解析路径）。
 	// strategy-survey 用它把排摸窗口/池与研究面板装配钉在同一份清单上，保证成分因子健康度
 	// 与回放结果口径一致。English: explicit universe, bypassing DB pool resolution (survey uses this).
@@ -929,6 +932,20 @@ type Options struct {
 	// nil = 研究库没有 minute_klines（旧库/未回填）⇒ 动量判档整体退回日线近似，输出与升级前
 	// 逐字节一致。装配点见 applyMinuteScope。
 	minuteSrc *storeMinuteMACD
+	// poolNote §B4-PIT 运行期池口径读数（collect 装配一次，非配置项）：本轮股票池到底是不是
+	// 时点口径、降级时为什么降级——随报告首行出门，引用数字的人与前提同屏。
+	poolNote string
+	// finaSrc §B2 运行期财务输入源（collect/runSweep 各装配一次，非配置项）：
+	// 因子规则回放逐股喂"判定日可见"的财报（与实盘 finaCache 同一份裁决函数）。
+	// nil＝不喂（财务腿按缺失计入），§B2-FINA 读数行会如实说"未装配"。装配点见 applyFinaScope。
+	finaSrc *finaProvider
+}
+
+// PITEnabled §B4-PIT（owner 裁决 2026-09-26）：时点股票池是否生效——nil（未配置）→ 默认开；
+// 显式 false 才关。判定姿势与 config.EnforceT1Enabled 同款。
+// English: §B4-PIT — point-in-time universe is enabled unless explicitly set false (nil = on).
+func (o *Options) PITEnabled() bool {
+	return o.PointInTime == nil || *o.PointInTime
 }
 
 // minuteMACDScale 动量口径使用的分钟周期：与实盘 fetchMinuteKLine 的 scale=5 同一数字。
@@ -1040,7 +1057,9 @@ func newAdapter(name string, industry bool, d1 float64) (adapter, error) {
 
 // ruleEvalAdapter 因子/形态规则回测适配器：直接复用实盘 FactorStrategy / PatternStrategy 的
 // Evaluate 逻辑（seriesFromKLines 由日K计算因子 → 时间序列分位×权重×方向 / [min,max) 条件解释），
-// 与 8a/8b 实盘同一套打分口径；退出用通用移动止盈+超期（与实盘未知战法回退 genericTrailingExit 同口径）。
+// 与 8a/8b 实盘同一套打分口径；§B2 起因子侧还把"判定日可见"的财报喂进 md.Fina（与实盘 finaCache
+// 共享同一份可见性/新鲜度裁决），"同一套打分口径"从"只对价量成立"补齐到含财务成分的规则。
+// 退出用通用移动止盈+超期（与实盘未知战法回退 genericTrailingExit 同口径）。
 // 每条启用规则一个 adapter 实例，结果按规则名分组统计。
 // English: factor/pattern rule backtest adapters — reuses the live FactorStrategy/PatternStrategy
 // Evaluate (factors computed from daily bars; percentile×weight×direction scoring or [min,max) condition
@@ -1054,6 +1073,15 @@ type ruleEvalAdapter struct {
 	// §P2-d 规则级出场覆盖（扫参审批写入 applied_*.json；nil=用全局默认 8%/15 天）。
 	trailOverride *float64
 	holdOverride  *int
+	// §B2 财务输入注入态（逐股由 applyFinaScope 装配）：finaSrc=nil 或 finaCode="" 时不喂，
+	// Evaluate 拿到的 md.Fina 与升级前逐字节一致（Fina 恒 nil → 财务因子按 NaN 跳过成分）。
+	finaSrc  *finaProvider
+	finaCode string
+}
+
+// setFinaScope 实现 finaScoped：逐股装配财务输入源与当前票代码（装配点每次换票都调）。
+func (a *ruleEvalAdapter) setFinaScope(p *finaProvider, tsCode string) {
+	a.finaSrc, a.finaCode = p, tsCode
 }
 
 // Name 返回规则显示名（如"因子战法#1"/"形态战法#2"），作为回测报告的分组键。
@@ -1073,6 +1101,16 @@ func (a *ruleEvalAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (ma
 	}
 	last := klines[len(klines)-1]
 	md := &strategy_engine.StockMarketData{KLines: klines}
+	// §B2（owner 裁决 2026-09-26「因子回放要不要喂财务数据：要」）：因子规则补上"判定日可见"
+	// 的财务腿——裁决全走与实盘 finaCache 共享的 strategy_engine 函数（ann_date≤判定日、
+	// 过旧停用、查库失败按缺失），回放数字从此回答"实盘机制那天会怎么打分"。
+	// 未装配（finaSrc=nil）时 Fina 保持 nil，与升级前行为逐字节一致。
+	// 形态规则不喂：pattern.seriesFromKLines 只有价量字段，Fina 无人消费。
+	// English: §B2 — feed the factor rule the report visible on the judgment day via the same
+	// shared predicates the live cache uses; unassembled stays byte-identical to pre-upgrade.
+	if a.fs != nil && a.finaSrc != nil && a.finaCode != "" {
+		md.Fina = a.finaSrc.visibleFina(a.finaCode, last.Date)
+	}
 	var eval *strategy.Evaluation
 	var err error
 	if a.fs != nil {
@@ -1718,6 +1756,11 @@ func (o *Options) Run() error {
 		return err
 	}
 	fmt.Printf("%s\n", o.Library.String())
+	// §B4-PIT：池口径读数与库读数同出口出门——"这组数字跑在什么股票池上"是引用数字的人
+	// 必须先看到的前提（缺它=幸存者偏差静默在体）。
+	if o.poolNote != "" {
+		fmt.Printf("%s\n", o.poolNote)
+	}
 	printReports(summaries, stockCount)
 	return nil
 }
@@ -1737,13 +1780,84 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 
 	// §质控筛选：Screen 非空时用质控池（剔 ST/退市/多年亏损/地量股）替代全量 StockCodes()，
 	// 再叠加 MaxStocks 截断——全量回测不再是 maxstocks=300 的字母序傻截。
-	// §WS-D D-2：PointInTime=true 时改用"回测起始日时点股票池"（含退市样本），消除幸存者偏差。
-	// English: with a quality Screen set, build the universe from ScreenedCodes (drops ST/delisted/
-	// multi-year-loss/illiquid names), then apply the MaxStocks cap on top. §WS-D D-2 — PointInTime
-	// switches to the listed-at-start universe (delisted included) to kill survivorship bias.
+	// §B4-PIT（owner 裁决 2026-09-26「幸存者偏差开关：开，默认打开」）：时点股票池缺省生效，
+	// 池=回测起始日"已上市且未退市"（store.UniverseAt(Start)，含退市样本消除幸存者偏差）。
+	// 与质控叠加时两轴正交：退市时点统一交给时点池裁决（质控腿的 ExcludeDelist 置假——它按
+	// "今天还退市与否"一刀切，正是幸存者偏差的来源；Start 之后才退市的票必须在池内）。
+	// 降级可见：元数据覆盖为 0（dataload §B4-META 未回填）或 Start 为空时建不出时点池，
+	// 不静默按旧口径跑——poolNote 抬出"本轮非时点口径（幸存者偏差在体）"读数，随报告首行出门
+	// （与 minuteCoverageNote 同姿势：前提与数字同屏）。
+	// English: §B4-PIT — point-in-time universe is the default; screen and PIT compose orthogonally
+	// (delisting timing owned by PIT, quality by screen); unbuildable PIT degrades LOUDLY via the
+	// report's first-line pool-basis note, never silently.
 	var codes []string
 	var err error
+	pitOn := o.PITEnabled()
+	var pitList []string
+	var pitSet map[string]bool
 	switch {
+	case pitOn && len(o.Codes) > 0:
+		// 显式池（strategy-survey 面板清单）：时点裁决归清单作者，本处只把读数抬出来不越权代办。
+		o.poolNote = fmt.Sprintf("池口径=显式清单 %d 只（§B4-PIT 不接管——清单若不是时点名单，幸存者偏差风险随清单出门）", len(o.Codes))
+		log.Printf("回放 %s", o.poolNote)
+		codes = o.Codes
+	case pitOn:
+		stats, serr := db.StockMetaStats()
+		if serr != nil {
+			return nil, nil, 0, fmt.Errorf("§B4-PIT 覆盖率探针: %w", serr)
+		}
+		switch {
+		case o.Start == "":
+			pitOn = false
+			o.poolNote = "池口径=非时点（§B4-PIT 降级：回放起始日为空，时点池无从建起）——幸存者偏差在体"
+		case stats.WithList == 0:
+			pitOn = false
+			o.poolNote = fmt.Sprintf("池口径=非时点（§B4-PIT 降级：stocks.list_date 覆盖 0/%d，未跑 dataload meta-dates 回填）——幸存者偏差在体", stats.Total)
+		default:
+			pitList, err = db.UniverseAt(o.Start)
+			if err != nil {
+				return nil, nil, 0, fmt.Errorf("时点股票池(%s): %w", o.Start, err)
+			}
+			pitSet = make(map[string]bool, len(pitList))
+			for _, ts := range pitList {
+				pitSet[ts] = true
+			}
+			o.poolNote = fmt.Sprintf("池口径=时点（§B4-PIT）：截至 %s 在市 %d 只；元数据 list_date 覆盖 %d/%d、退市样本 %d",
+				o.Start, len(pitList), stats.WithList, stats.Total, stats.WithDelist)
+		}
+		if o.poolNote != "" {
+			log.Printf("回放 %s", o.poolNote)
+		}
+		switch {
+		case pitOn && o.Screen != nil:
+			sc := *o.Screen
+			if sc.End == "" && o.End != "" {
+				sc.End = o.End // 质控窗口结束日对齐回测区间，避免用"今天"跨出回测区间
+			}
+			sc.ExcludeDelist = false // 退市时点由时点池裁决（见上：按今天一刀切正是偏差来源）
+			codes, err = db.ScreenedCodes(sc)
+			if err == nil {
+				before := len(codes)
+				kept := make([]string, 0, before)
+				for _, ts := range codes {
+					if pitSet[ts] {
+						kept = append(kept, ts)
+					}
+				}
+				codes = kept
+				log.Printf("回放股票池：质控 %d → ∩时点池 %d 只（退市按 %s 时点裁决）", before, len(codes), o.Start)
+			}
+		case pitOn:
+			codes = pitList
+		case o.Screen != nil:
+			sc := *o.Screen
+			if sc.End == "" && o.End != "" {
+				sc.End = o.End
+			}
+			codes, err = db.ScreenedCodes(sc)
+		default:
+			codes, err = db.StockCodes()
+		}
 	case len(o.Codes) > 0:
 		// 显式池（strategy-survey）：与调用方研究面板用同一份清单。
 		codes = o.Codes
@@ -1753,13 +1867,9 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 			sc.End = o.End // 质控窗口结束日对齐回测区间，避免用"今天"跨出回测区间
 		}
 		codes, err = db.ScreenedCodes(sc)
-	case o.PointInTime:
-		codes, err = db.UniverseAt(o.Start)
-		if err != nil {
-			return nil, nil, 0, fmt.Errorf("时点股票池(%s): %w", o.Start, err)
-		}
-		log.Printf("回放股票池：时点口径 %d 只（截至 %s，含退市消除幸存者偏差）", len(codes), o.Start)
 	default:
+		o.poolNote = "池口径=非时点（§B4-PIT 显式关闭 PointInTime=false）——按今天在市名单回测，幸存者偏差在体"
+		log.Printf("回放 %s", o.poolNote)
 		codes, err = db.StockCodes()
 	}
 	if err != nil {
@@ -1829,6 +1939,13 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 			st.Rows, st.Codes, st.FirstTs, st.LastTs, st.AvgBars)
 	}
 
+	// §B2 财务输入装配点（一次）：因子规则回放逐股喂"判定日可见"的财报（owner 裁决 2026-09-26
+	// 「因子回放要不要喂财务数据：要」）。库里一行业绩没有也照样装配——那是"回填还没跑的态"
+	// （与 §MINUTE-K 同一姿势），裸奔规模由收尾的 §B2-FINA 读数行点名，不判红也不静默。
+	// English: §B2 — attach the per-day point-in-time financial source once per collect; an empty
+	// fina_indicator is a legitimate not-yet-loaded state surfaced via the readout line, never silent.
+	o.finaSrc = newFinaProvider(db)
+
 	// §P2 参数扫参模式：触发一次性预计算 + 逐组合廉价模拟统一出场（见 sweep.go）。
 	// English: sweep mode — pre-compute triggers once, then cheaply simulate each param combo.
 	if o.Sweep != nil {
@@ -1870,6 +1987,8 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 			klines := toDataKLine(bars)
 			// §MINUTE-K 逐股注入分钟口径来源（动量适配器认它，其它适配器跳过）。
 			o.applyMinuteScope(ad, tsCode)
+			// §B2 财务输入逐股注入（含兜底兄弟，见 applyFinaScope 的 B6 教训注释）。
+			o.applyFinaScope(ad, tsCode)
 			// §Risk-1 单位自校：tushare 口径库 amount=千元，均价带判定后归一（仅增强模式）
 			if o.slip != nil && fixAmountScale(klines) {
 				amountFixed++
@@ -1902,6 +2021,8 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 	// §MINUTE-K 收尾读数：队列 worker 抓的就是这里的日志行，报告之外也要看得见"这一轮
 	// 动量到底用了多少真分钟"（只回显、不参与判红）。
 	log.Printf("%s", o.minuteCoverageNote())
+	// §B2-FINA 收尾读数：这一轮因子判定到底有多少票吃到了"判定日可见"的财报（只回显、不判红）。
+	log.Printf("%s", o.finaSrc.String())
 	return summaries, ids, len(codes), nil
 }
 

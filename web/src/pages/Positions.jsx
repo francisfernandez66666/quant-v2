@@ -57,10 +57,14 @@ export default function Positions() {
   const balanceConfirmedRef = useRef(cache.balance)
   // 新增/编辑持仓弹窗显隐
   const [showAdd, setShowAdd] = useState(false)
-  // 盈亏显示偏移量（用于「清零」显示，持久化到 localStorage）
-  const [pnlOffset, setPnlOffset] = useState(parseFloat(localStorage.getItem('pnl_offset') || '0'))
-  // 累计已实现盈亏
-  const [totalRealizedPnl, setTotalRealizedPnl] = useState(0)
+  // §E1 盈亏单轨（owner 裁决 2026-09-26）：显示偏移量不再存 localStorage（旧 'pnl_offset' 键
+  // 换设备即丢、全程无痕），改由后端 /api/holdings 随汇总下发，校准动作走 POST /api/holdings/pnl-offset 入库留痕。
+  // 偏移值本页只回显、不参与本地算式——总盈亏算式已收敛到后端 paperPnlTotals 一处。
+  const [pnlOffset, setPnlOffset] = useState(0)
+  // §E1：后端算好的纸面总盈亏（null=后端读数不可得，页头显示"—"，绝不本地兜底重算回两套账）
+  const [totalPnl, setTotalPnl] = useState(null)
+  // §E1：累计已实现盈亏不再单列 state——它已并入后端 total_pnl 算式（paperPnlTotals），
+  // 前端只消费 total_pnl/pnl_offset 两个读数（原 [totalRealizedPnl, setTotalRealizedPnl] 删除）。
 
   // 当前账本标签：paper=纸面持仓，real=实盘持仓
   const [bookTab, setBookTab] = useState('paper')
@@ -169,17 +173,8 @@ export default function Positions() {
   // SSE 订阅取消函数
   const unsubSSE = useRef(null)
 
-  // 计算总盈亏 = 累计已实现盈亏 + 各持仓浮盈（现价-成本）×数量 - 显示偏移量
-  const totalPnl = useMemo(() => {
-    let sum = totalRealizedPnl
-    for (const h of holdings) {
-      const qty = h.quantity || 1
-      const cost = h.cost_price || 0
-      const cur = h.cur_price || 0
-      sum += (cur - cost) * qty
-    }
-    return sum - pnlOffset
-  }, [holdings, totalRealizedPnl, pnlOffset])
+  // §E1：总盈亏 = 后端 /api/holdings 的 total_pnl（已实现 + 浮动 − 入库校准偏移），
+  // 旧版此处前端逐持仓自算再减 localStorage 私有偏移（两套账的前端半边），已删除。
 
   // §F1 是否有实盘数据（持仓或账户上报存在）：有则页头展示实盘盈亏/可用资金，无才回落纸面
   const hasReal = useMemo(
@@ -202,6 +197,9 @@ export default function Positions() {
     return sum
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasReal, realTrades, realPositions, totalPnl])
+  // §E1 展示串单点：纸面总盈亏的格式化只算一次——页头回落形态与纸面 Tab 内嵌形态共用，
+  // null（读数不可得）显示"—"，绝不本地兜底重算（那又是两套账的老路）。
+  const paperPnlShown = totalPnl == null ? '—' : `${totalPnl >= 0 ? '+' : ''}¥${totalPnl.toFixed(2)}`
 
   // 预览加减仓后该持仓的数量（加仓=现量+加量；减仓=现量-减量，无效时归零）
   const lotPreviewQty = useMemo(() => {
@@ -255,17 +253,16 @@ export default function Positions() {
     persistCache(holdings, safeBalance)
   }, [holdings, availableBalance])
 
-  // 以当前总盈亏为基准设置偏移量，实现「清零」显示
-  function resetPnl() {
-    let off = totalRealizedPnl
-    for (const h of holdings) {
-      const qty = h.quantity || 1
-      const cost = h.cost_price || 0
-      const cur = h.cur_price || 0
-      off += (cur - cost) * qty
+  // 「清零」按钮（§E1 单轨版）：不再本地记偏移，改调后端 POST /api/holdings/pnl-offset
+  // 由服务端按自己的算式取整入账（append-only 留痕），成功后重新拉取汇总。
+  // 403/网络失败弹窗提示，绝不静默——静默失败会让人以为已校准，回到旧的两套账。
+  async function resetPnl() {
+    try {
+      await api.resetPaperPnlOffset()
+      await load()
+    } catch (e) {
+      showToast(`盈亏校准失败（清零未生效）：${e?.message || e}`, 'error')
     }
-    setPnlOffset(off)
-    localStorage.setItem('pnl_offset', off.toString())
   }
 
   // 加载纸面持仓、资金与已实现盈亏
@@ -282,7 +279,9 @@ export default function Positions() {
         setAvailableBalance(data.available_balance || 0)
         // §H-2（2026-09-22 修复批）服务端回读即权威确认值，同步更新缓存写守卫的基准
         balanceConfirmedRef.current = data.available_balance || 0
-        setTotalRealizedPnl(data.total_realized_pnl || 0)
+        // §E1：total_realized_pnl 不再单独入 state——后端 total_pnl 已含该腿（paperPnlTotals）。
+        setTotalPnl(data.total_pnl == null ? null : data.total_pnl)
+        setPnlOffset(data.pnl_offset || 0)
       }
     } catch (_) {}
   }
@@ -705,10 +704,18 @@ export default function Positions() {
               </>
             ) : (
               <>
-                {/* 纸面持仓页头：总盈亏（含清零按钮）+ 可用资金（可编辑） */}
-                <div className={totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
-                  总盈亏: {totalPnl >= 0 ? '+' : ''}¥{totalPnl.toFixed(2)}
-                  <Button size="small" variant="outline" theme="default" onClick={resetPnl} style={{ marginLeft: 8 }}>清零</Button>
+                {/* 纸面持仓页头：总盈亏（含清零按钮）+ 可用资金（可编辑）。
+                    §E1：数值为后端算好的 total_pnl；null=读数不可得显示"—"（不本地兜底重算）。
+                    清零仅管理员（写端点 admin 守卫，成员点了必 403，入口直接收敛）。
+                    §F1 回落：实盘数据在位时页头让位给实盘盈亏，纸面汇总改在纸面 Tab 内嵌渲染
+                    （testid 两处互斥同值，UAT §E1 展示腿不依赖栈内是否有实盘数据）。 */}
+                <div data-testid="paper-pnl-summary" className={totalPnl == null || totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
+                  总盈亏: {paperPnlShown}
+                  {admin && (
+                    <Button size="small" variant="outline" theme="default" onClick={resetPnl}
+                      title={`点击后按后端算式把总盈亏校准为 0（偏移 ¥${(pnlOffset || 0).toFixed(2)} → 当前总盈亏，入库留痕）`}
+                      style={{ marginLeft: 8 }}>清零</Button>
+                  )}
                 </div>
                 {!editingBalance
                   ? (admin
@@ -724,6 +731,24 @@ export default function Positions() {
 
       <Tabs value={bookTab} onChange={(v) => switchBook(v)}>
         <Tabs.TabPanel value="paper" label="纸面持仓">
+          {/* §E1 可达性补腿（2026-09-26）：实盘数据在位时页头被 §F1 回落让位给实盘盈亏，
+              纸面「总盈亏+清零」若无此处则整页不可达——真实接了 QMT 的用户将永远点不到清零。
+              仅 hasReal 时渲染（与页头回落形态互斥，页面无重复汇总）；数值仍是后端 total_pnl，
+              算式与写端点都不另起炉灶。
+              English: when real-account data is present the page header shows real PnL (§F1);
+              this in-panel row keeps the paper summary and admin reset reachable in that state. */}
+          {hasReal && (
+            <div data-testid="paper-pnl-summary" style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <span className={totalPnl == null || totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
+                <span className="muted" style={{ fontSize: 12, marginRight: 4 }}>纸面</span>
+                总盈亏: {paperPnlShown}
+              </span>
+              {admin && (
+                <Button size="small" variant="outline" theme="default" onClick={resetPnl}
+                  title="点击后按后端算式把纸面总盈亏校准为 0（偏移入库留痕）">清零</Button>
+              )}
+            </div>
+          )}
           {/* 有持仓时渲染表格，无持仓时显示空态引导 */}
           {holdings.length > 0 ? (
             // 持仓表格：支持展开分时图、行点击打开操作面板

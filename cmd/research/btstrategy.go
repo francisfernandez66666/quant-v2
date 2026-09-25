@@ -31,6 +31,9 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 	// English: opt-out for the zero-rule library gate — it must appear literally on the command line.
 	allowEmpty := fs.Bool("allow-empty-library", false,
 		"§LIB-GATE 放行开关：战法库一条启用规则都没加载到时仍照跑（缺省 false=判红；跑线上战法请用 --datadir 指向含 applied_*.json 的目录，别用本开关）")
+	// §B4-PIT（owner 裁决 2026-09-26）：时点股票池默认开——池=起始日已上市且未退市（含退市
+	// 样本，消除幸存者偏差）；--pit=false 是元数据未回填时的显式逃生门，必须写在命令行走位上。
+	pit := fs.Bool("pit", true, "§B4-PIT 时点股票池（默认开）：--pit=false 退回今天在市口径（临时逃生门，数字带幸存者偏差）")
 	fs.Parse(args)
 
 	if *dataDir == "" {
@@ -51,6 +54,7 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 		DataDir:           *dataDir,
 		ThrottleMs:        *throttleMs,
 		AllowEmptyLibrary: *allowEmpty,
+		PointInTime:       pit,
 	}
 	if *quality {
 		sc := store.DefaultQualityScreen()

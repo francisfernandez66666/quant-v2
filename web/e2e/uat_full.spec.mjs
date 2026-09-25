@@ -1563,3 +1563,102 @@ test.describe('修复回归 · 0925EVE 撤单失败明细与第三态人工收�
     }
   })
 })
+
+// ── 修复回归 · §E1 盈亏单轨（owner 裁决 2026-09-26）──
+// 旧账：总盈亏由前端逐持仓自算，手工校准值只写浏览器 localStorage——换设备即丢、全程无痕，
+// 后端 summary 与前端展示是两套账。新轨：算式收进后端 paperPnlTotals 单点，GET /api/holdings
+// 直接下发 total_unrealized_pnl / pnl_offset / total_pnl 三个汇总字段；「清零」改走
+// POST /api/holdings/pnl-offset（admin 守卫）落 pnl_offset_history 只追加留痕。
+// UAT 栈跑的是 bootstrap 构建的**真 Go 引擎**，所以这三条全部走真接口、不碰 mock。
+// 校准值是本用例唯一动过的服务端状态：finally 一律按基线偏移量还原（表只追加，还原＝再追加一条）。
+test.describe('修复回归 · §E1 盈亏单轨 (2026-09-26)', () => {
+  // ① 契约腿：三个后端汇总字段必须在位，且 total_pnl 与展示原料逐分对齐（单轨的机器含义）。
+  test('§E1 契约：GET /api/holdings 下发后端算好的三字段且算式自洽', async ({ page }) => {
+    await page.goto('/#/positions')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const body = await (await page.request.get('/api/holdings', { headers: hdr })).json()
+    expect('total_unrealized_pnl' in body, '响应含浮动盈亏汇总字段').toBe(true)
+    expect('pnl_offset' in body, '响应含显示校准偏移字段').toBe(true)
+    // null 只允许出现在 pnl_offset_error 降级分支；正常栈里 total_pnl 必须是数（读不到≠0）。
+    if (body.total_pnl === null) {
+      expect(body.pnl_offset_error, 'total_pnl=null 必须伴随可见降级文案').toBeTruthy()
+      test.fail(true, 'UAT 栈偏移量读数失败（total_pnl 降级 null），契约腿无从校验单轨算式: ' + body.pnl_offset_error)
+    }
+    expect(typeof body.total_pnl, 'total_pnl 为数值').toBe('number')
+    // 等值（非单向）锁：展示总盈亏 == r2(已实现+浮动-偏移)，容差只留给两次 r2 的半分钱舍入。
+    const recon = body.total_realized_pnl + body.total_unrealized_pnl - body.pnl_offset
+    expect(Math.abs(body.total_pnl - recon), `算式自洽: total=${body.total_pnl} vs 复核=${recon}`).toBeLessThan(0.005)
+    await page.screenshot({ path: `${SHOT}/branch-e1-contract.png` })
+  })
+
+  // ② 展示腿：指定偏移后页头随账（前端只展示），点「清零」归零，**刷新后仍归零**——
+  //    旧版刷新后归零会弹回（校准在本地），这条 reload 断言就是"单轨"的反证位。
+  test('§E1 校准与清零：页头随后端账走，清零+reload 后仍 ¥0.00', async ({ page }) => {
+    await page.goto('/#/positions') // bookTab 缺省即纸面
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const before = await (await page.request.get('/api/holdings', { headers: hdr })).json()
+    // 基线读数不可得（pnl_offset_error 降级）时无从做「恰减 100」等值复核——判红而不是 NaN 假象。
+    expect(typeof before.total_pnl, '基线 total_pnl 必须是数值').toBe('number')
+    // 展示锚点走 testid：页头回落形态（无实盘数据）与纸面 Tab 内嵌形态（有实盘数据）互斥同值，
+    // 本断言腿不依赖本次 UAT 栈里 mock 是否报了实盘持仓。
+    const paperPnl = page.getByTestId('paper-pnl-summary')
+    try {
+      // 校准 +100：后端重算 → total_pnl 恰减 100（证明数是后端算的，不是前端自算的残影）
+      const tune = await page.request.post('/api/holdings/pnl-offset', {
+        headers: hdr, data: { offset: (before.pnl_offset || 0) + 100, note: 'UAT §E1 校准注入' },
+      })
+      expect(tune.status(), '指定偏移校准应 200').toBe(200)
+      const tuned = await (await page.request.get('/api/holdings', { headers: hdr })).json()
+      expect(Math.abs(tuned.total_pnl - (before.total_pnl - 100)), '校准 100 → 总盈亏恰减 100').toBeLessThan(0.005)
+      await page.reload()
+      const tunedShown = `${tuned.total_pnl >= 0 ? '+' : ''}¥${tuned.total_pnl.toFixed(2)}`
+      await expect(paperPnl, 'reload 后页头仍随后端账（+100 偏移在库不在浏览器）').toContainText(`总盈亏: ${tunedShown}`, { timeout: 15000 })
+      // 点「清零」：走后端 reset 分支（服务端按自己算式取整入账），页头即时归零
+      await page.getByRole('button', { name: '清零' }).click()
+      await expect(paperPnl, '清零后显示 +¥0.00').toContainText('总盈亏: +¥0.00', { timeout: 10000 })
+      // 反证位：再刷新一次，归零值必须来自服务端留痕而不是本地状态（旧 localStorage 版这里会弹回）
+      await page.reload()
+      await expect(paperPnl, '二次 reload 后仍 ¥0.00＝校准入库而非浏览器本地').toContainText('总盈亏: +¥0.00', { timeout: 15000 })
+      const after = await (await page.request.get('/api/holdings', { headers: hdr })).json()
+      expect(Math.abs(after.total_pnl), 'API 腿：清零后 total_pnl 归零').toBeLessThan(0.005)
+      await page.screenshot({ path: `${SHOT}/branch-e1-reset.png` })
+    } finally {
+      // 还原基线偏移（append-only：再追一条把 offset 拨回 before 的值，不污染其它用例读数）
+      await page.request.post('/api/holdings/pnl-offset', {
+        headers: hdr, data: { offset: before.pnl_offset || 0, note: 'UAT §E1 还原基线' },
+      }).catch(() => {})
+    }
+  })
+
+  // ③ 权限腿：写端点对普通用户 403 且入口收敛隐藏；同用例里 admin 200 做对照
+  //    （既有反证姿势：防「端点整体挂了也全 403」把权限断言洗成假绿）。
+  test('§E1 权限：tester 清零入口隐藏 + POST 403，admin 同端点 200 对照', async ({ browser }) => {
+    // tester：干净上下文登录（config.use.storageState 是 admin 态，必须显式清空）
+    const ctxT = await browser.newContext({ storageState: { cookies: [], origins: [] } })
+    const pageT = await ctxT.newPage()
+    await pageT.goto('/#/')
+    await pageT.getByPlaceholder('输入账号').fill(USER.u)
+    await pageT.getByPlaceholder('输入密码').fill(USER.p)
+    await pageT.getByPlaceholder('输入密码').press('Enter')
+    await expect(pageT.locator('.app-shell')).toBeVisible({ timeout: 15000 })
+    await pageT.goto('/#/positions')
+    await expect(pageT.getByRole('button', { name: '清零' }), '成员页头不渲染清零入口').toHaveCount(0)
+    const tokT = await pageT.evaluate(() => localStorage.getItem('liangzai_token'))
+    const respT = await pageT.request.post('/api/holdings/pnl-offset', { headers: { Authorization: tokT }, data: { reset: true } })
+    expect(respT.status(), '成员直调写端点必须 403').toBe(403)
+    await pageT.screenshot({ path: `${SHOT}/branch-e1-tester403.png` })
+    await ctxT.close()
+    // admin 对照：同端点同 session 必须 200（newContext 继承 config 的 admin storageState）
+    const ctxA = await browser.newContext()
+    const pageA = await ctxA.newPage()
+    await pageA.goto('/#/positions')
+    const hdrA = { Authorization: await pageA.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const cur = await (await pageA.request.get('/api/holdings', { headers: hdrA })).json()
+    const respA = await pageA.request.post('/api/holdings/pnl-offset', {
+      headers: hdrA, data: { offset: cur.pnl_offset || 0, note: 'UAT §E1 权限对照（原值回写）' },
+    })
+    expect(respA.status(), 'admin 同端点 200＝对照成立，403 不是端点挂死').toBe(200)
+    expect((await respA.json()).status).toBe('ok')
+    await ctxA.close()
+  })
+})

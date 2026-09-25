@@ -12,16 +12,24 @@
 #     真开实盘时运维手工改 broker=xt + 填资金账号（或重跑 setup_windows.ps1）。
 # 编码要点：config.xt.json 必须以 **无 BOM UTF-8** 落盘——网关 json.load 读到 BOM 直接抛错
 # （setup_windows.ps1 同款教训）；本脚本自身由部署侧 ps1_bom 补 BOM，两件事互不影响。
+# §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯）已收编进 service_definitions.ps1 的定义：
+#   - $GatewayDir 缺省（现网网关目录 $SvcGatewayDir，缺失回退旧字面量）；
+#   - listen 绑定面：旧版写 "0.0.0.0:<port>" 与现网形态矛盾——gateway.py:1877-1888 在无
+#     QUANT_GATEWAY_BIND 时会把 0.0.0.0 自动收敛为 127.0.0.1、install_guangzhou.ps1:131-132
+#     已把防火墙 8789 收严 remoteip=127.0.0.1、MIGRATION_GUANGZHOU_ALLINONE §3.5/R2 裁决
+#     移除首尔白名单 ⇒ 现网形态＝仅回环。本脚本改为**如实写回环值**（$SvcGatewayBindLoopback），
+#     不再依赖网关启动时的静默收敛；确需公网监听（历史灾备）显式传 -PublicBind。
 # English: deployment-side idempotent generator for qmt_gateway/config.xt.json (previously only
 # created by the manual setup_windows.ps1 step, so a scripted deploy left the watchdog pointing at
 # a nonexistent config). Existing files are never overwritten.
 param(
-    [string]$GatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway",
-    [string]$TemplatePath = "",      # 留空取 <GatewayDir>\config.xt.template.json
-    [string]$Token = "",             # 网关 Bearer token（留空自动生成 48 位 hex 并打印）
-    [string]$Account = "",           # 东莞证券资金账号（留空=broker 收敛 mock，影子期不死等柜台）
-    [string]$XtPath = "",            # QMT userdata_mini 目录（broker=xt 必需；mock 期可不填）
-    [string]$ProbeConfigPath = ""    # §H8 探针单源路径（留空按常见位置探测）
+    [string]$GatewayDir = "",      # 留空取 §C7 单源 $SvcGatewayDir（缺失回退 C:\qmt\quant-trading-v2\qmt_gateway）
+    [string]$TemplatePath = "",    # 留空取 <GatewayDir>\config.xt.template.json
+    [string]$Token = "",           # 网关 Bearer token（留空自动生成 48 位 hex 并打印）
+    [string]$Account = "",         # 东莞证券资金账号（留空=broker 收敛 mock，影子期不死等柜台）
+    [string]$XtPath = "",          # QMT userdata_mini 目录（broker=xt 必需；mock 期可不填）
+    [string]$ProbeConfigPath = "", # §H8 探针单源路径（留空按常见位置探测）
+    [switch]$PublicBind            # §C7-OPS：显式要求公网监听（旧分离形态灾备；缺省=仅回环）
 )
 $ErrorActionPreference = "Stop"
 
@@ -29,6 +37,18 @@ function Info($m) { Write-Host "[gwcfg] $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "[ ok ] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[warn] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[fail] $m" -ForegroundColor Red; exit 1 }
+
+# §C7-OPS：路径/绑定面单源（缺失回退旧字面量并告警，不阻断——[2b] 部署步要能自救）。
+$svcDefs = $null
+foreach ($cand in @((Join-Path $PSScriptRoot "service_definitions.ps1"),
+                    "C:\opt\quant\qmt-win\service_definitions.ps1")) {
+    if (Test-Path $cand) { . $cand; $svcDefs = $cand; break }
+}
+if (-not $svcDefs) {
+    Warn "service_definitions.ps1 未找到 —— 网关目录/绑定面回退本脚本字面量（§C7 单径脱钩，请补齐部署清单）"
+    $SvcGatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway"
+}
+if (-not $GatewayDir) { $GatewayDir = $SvcGatewayDir }
 
 $cfgPath = Join-Path $GatewayDir "config.xt.json"
 if (Test-Path $cfgPath) {
@@ -78,7 +98,13 @@ $cfg.token          = $Token
 $cfg.report_token   = $Token          # 网关↔引擎回报鉴权同 token（三处一致口径）
 $cfg.account        = $Account
 $cfg.xt_path        = $XtPath
-$cfg.listen         = "0.0.0.0:$gwPort"
+# §C7-OPS：绑定面写现网真实形态（仅回环；依据见文件头注）。-PublicBind 是显式的历史逃生门。
+if ($PublicBind) {
+    Warn "按 -PublicBind 写入公网监听 0.0.0.0:$gwPort —— 与 §C7 单径裁决相反，仅灾备使用，记得同步防火墙白名单"
+    $cfg.listen = "0.0.0.0:$gwPort"
+} else {
+    $cfg.listen = "127.0.0.1:$gwPort"
+}
 if (-not $Account) {
     if ($cfg.broker -ne "mock") {
         Warn "未提供 -Account：broker 由 `"$($cfg.broker)`" 收敛为 mock（影子期网关可存活应答 /health，不接真实柜台）"

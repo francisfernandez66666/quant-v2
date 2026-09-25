@@ -574,11 +574,16 @@ type qmtReportEvent struct {
 	// created_at 实际记成了回报时刻。现在优先取 created_at，缺失才退回 at。
 	// English: §M4 — the gateway sends both `at` and `created_at`; the old envelope only had `at`,
 	// so created_at was dropped and order rows stored the report time as creation time.
-	CreatedAt string               `json:"created_at"`
-	SignalID  string               `json:"signal_id"`
-	Reason    string               `json:"reason"`    // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
-	Fee       float64              `json:"fee"`       // §P2-FEE 20260918 经手费/佣金（尽力透传，缺=0）
-	StampTax  float64              `json:"stamp_tax"` // 印花税（卖方单边，缺=0）
+	CreatedAt string  `json:"created_at"`
+	SignalID  string  `json:"signal_id"`
+	Reason    string  `json:"reason"`    // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
+	Fee       float64 `json:"fee"`       // §P2-FEE 20260918 经手费/佣金（尽力透传，缺=0）
+	StampTax  float64 `json:"stamp_tax"` // 印花税（卖方单边，缺=0）
+	// Positions §0925EVE-W2-A1（2026-09-26）：解码目标 store.RealPosition 本批起携带
+	// can_use_qty（*int，缺键=nil=未知）——网关 broker.py 每行持仓一直发该键，旧结构无 tag
+	// 被 encoding/json 静默丢弃（断腿）。经 ReconcilePositionsForUser 透传落库，
+	// checkT1Sellable 据此柜台值优先判定。English: §A1 — the positions leg now lands:
+	// RealPosition carries can_use_qty (nil when the channel omits it) through this decode.
 	Positions []store.RealPosition `json:"positions"`
 	Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
 	At        string               `json:"at"`

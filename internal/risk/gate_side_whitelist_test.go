@@ -30,7 +30,7 @@ var illegalSides = []string{"buy", "BUY", "SELL", "sell", " 买入", "买入 ", 
 // 且即便全部闸关闭也一样拒（证明它先于闸清单，不依赖任何配置开关）。
 func TestGateUnknownSideFailClosed(t *testing.T) {
 	g := NewGate(gateDB(t), "u_side", nil)
-	cfg := qmtCfg() // 默认零配置：其余闸全关（旧实现下非法方向会被"全部放行"）
+	cfg := qmtCfg() // 默认零配置：其余闸全关（旧实现下非法方向会被"全部放行"）；§A5 常开的跌停卖闸对夹具单 fail-open（无昨收），不影响本用例
 	for _, side := range illegalSides {
 		v := g.CheckLiveOrder(cfg, liveOrder(side))
 		if v.Pass {
@@ -61,7 +61,7 @@ func TestGateUnknownSideDoesNotSkipDirectionalGates(t *testing.T) {
 	g := NewGate(db, "u_side", nil)
 	cfg := qmtCfg()
 	cfg.RiskGate.LimitUpBlockBuy = true    // 涨停拒买闸开
-	cfg.RiskGate.LimitDownBlockSell = true // 跌停拒卖闸开
+	cfg.RiskGate.LimitDownBlockSell = boolPtr(true) // 跌停拒卖闸开
 	today := cntime.In(g.now()).Format("2006-01-02")
 
 	// T+1 场景：当日买入 100 股（未结算不可卖），卖 100 股对合法方向必拦

@@ -286,7 +286,8 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		o.slip = sc // 冠军复核（simulateCombo→backtestStock）同口径
 		var trigs []sweepTrigger
 		for code, kls := range klines {
-		o.applyMinuteScope(ad, tsOfCode[code]) // §MINUTE-K：与 backtestStock 同一口径注入点
+			o.applyMinuteScope(ad, tsOfCode[code]) // §MINUTE-K：与 backtestStock 同一口径注入点
+			o.applyFinaScope(ad, tsOfCode[code])   // §B2：与 backtestStock 同一口径注入点（含兜底兄弟）
 			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code], sc)...)
 		}
 		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })
@@ -621,6 +622,10 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		}
 	}
 
+	// §B2-FINA 收尾读数：扫参的触发预算同样吃了"判定日可见"财报，行数口径与非扫参回放一致，
+	// 引用网格数字的人要能在同一屏看到财务腿的覆盖规模（只回显、不判红）。
+	log.Printf("%s", o.finaSrc.String())
+
 	fmt.Printf("==============================================\n")
 	return nil
 }
@@ -718,6 +723,7 @@ func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data
 		// minuteSrc 为 nil 时 applyMinuteScope 会清空 scope——动量照常走已声明的日线近似，
 		// 其它适配器不实现 minuteMACDScoped、零影响。
 		o.applyMinuteScope(ad, tsOfCode[code])
+		o.applyFinaScope(ad, tsOfCode[code]) // §B2：复核链路同注入（B6 教训：漏一处就串一台）
 		indByDate := industryChg[code]
 		trades := o.backtestStock(code, kls, ad, indByDate)
 		for _, t := range trades {
@@ -1139,6 +1145,10 @@ func defaultPoolConfig(name string) *store.SweepPoolConfig {
 		TpFrom:   tpFrom, TpTo: tpTo, TpStep: tpStep,
 		SlFrom: slFrom, SlTo: slTo, SlStep: slStep,
 		HoldFrom: 2, HoldTo: p.maxHold, HoldStep: 2,
+		// §B3 哑火档标注（只标不改）：因子规则实盘口径分值域 [50,100]（factor.go scoreRule
+		// (total/used+1)/2×100），故网格起点 40 与次档 45 两档对因子规则**恒不过滤**——
+		// 扫参在这两档给出的"更优"只是同一批信号换了名字，不是真放宽了准入。
+		// 形态/内置战法的分值域各异，40/45 对它们有效；owner 裁决 2026-09-26 保持网格不动、逐处标注。
 		ScoreFrom: 40, ScoreTo: 95, ScoreStep: 5,
 		// §Phase3 ATR 动态止损维：默认单档 0=禁用（回退固定百分比止损），
 		// 用户可在 API 配置多档（如 1.5~3.0 步进 0.5）启用动态止损搜索。

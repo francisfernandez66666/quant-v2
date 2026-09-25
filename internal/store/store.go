@@ -1521,9 +1521,14 @@ func (d *DB) StockCodes() ([]string, error) {
 // and not yet delisted (list_date ≤ date < delist_date; empty delist_date = still listed). Date format
 // is YYYYMMDD.
 func (d *DB) UniverseAt(date string) ([]string, error) {
+	// §B4-PIT NULL 口径锁：delist_date 为 NULL（装载行没带过这一列的老 stocks 记录）必须按
+	// "仍在市"处理——SQL 三值逻辑里 `delist_date = '' OR delist_date > ?` 对 NULL 整体为 NULL，
+	// 会把在市的票静默逐出时点池（池悄悄缩水＝比降级更坏的哑故障）。IS NULL 显式收进放行腿。
+	// English: §B4-PIT — a NULL delist_date (legacy rows inserted without the column) must count as
+	// still-listed; the old two-branch predicate evaluated NULL and silently evicted live stocks.
 	rows, err := d.db.Query(`SELECT ts_code FROM stocks
 		WHERE list_date != '' AND list_date <= ?
-		  AND (delist_date = '' OR delist_date > ?)
+		  AND (delist_date IS NULL OR delist_date = '' OR delist_date > ?)
 		ORDER BY ts_code`, date, date)
 	if err != nil {
 		return nil, err
@@ -1538,6 +1543,87 @@ func (d *DB) UniverseAt(date string) ([]string, error) {
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// StockListing §B4-META 一条上市/退市元数据（baostock query_stock_basic 全表逐行）。
+// 日期为 YYYYMMDD；ListDate 空=源侧未给出（不覆盖已落库值），DelistDate 空=仍在市。
+// English: §B4-META one listing row from baostock query_stock_basic (all stocks incl. delisted).
+type StockListing struct {
+	TsCode     string
+	Name       string
+	ListDate   string
+	DelistDate string
+}
+
+// UpsertStockListings §B4-META（2026-09-26）：把上市/退市日期元数据写入 stocks 表，
+// 是 §WS-D D-2 时点股票池（UniverseAt）的数据前提——baostock 装载腿过去把这两列写死成
+// 空串（cmd/dataload/baostock.go bsLoadMeta），防线有代码没粮草。语义：
+// ① ts_code 不在库（退市票不在 query_all_stock 当日名单）→ INSERT OR IGNORE 补骨架行；
+// ② 只在源值非空时覆盖对应日期列（空值不清已有值，避免降级源把真日期抹成空白）；
+// ③ name 仅在库内为空时回填（不改已装载的票名）。
+// English: §B4-META — backfills list_date/delist_date (the fuel UniverseAt was missing);
+// never blanks existing values with empty source data.
+func (d *DB) UpsertStockListings(rows []StockListing) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交成功后 Rollback 为 no-op；失败路径统一回滚
+	skel, err := tx.Prepare(`INSERT OR IGNORE INTO stocks(ts_code, name) VALUES(?, ?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer skel.Close()
+	upd, err := tx.Prepare(`UPDATE stocks SET
+			list_date   = CASE WHEN ? != '' THEN ? ELSE COALESCE(list_date,'') END,
+			delist_date = CASE WHEN ? != '' THEN ? ELSE COALESCE(delist_date,'') END,
+			name        = CASE WHEN COALESCE(name,'') = '' THEN ? ELSE name END
+		WHERE ts_code = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer upd.Close()
+	var n int64
+	for _, r := range rows {
+		if r.TsCode == "" {
+			continue
+		}
+		if _, err := skel.Exec(r.TsCode, r.Name); err != nil {
+			return n, fmt.Errorf("store upsert listing %s: %w", r.TsCode, err)
+		}
+		res, err := upd.Exec(r.ListDate, r.ListDate, r.DelistDate, r.DelistDate, r.Name, r.TsCode)
+		if err != nil {
+			return n, fmt.Errorf("store update listing %s: %w", r.TsCode, err)
+		}
+		c, _ := res.RowsAffected()
+		n += c
+	}
+	if err := tx.Commit(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// StockMetaStats §B4-PIT 覆盖率读数：stocks 表总数 / list_date 已填 / delist_date 已填。
+// 时点股票池判定"防线有没有粮"用——覆盖为 0 时回放必须把降级抬成可见读数而不是静默空池。
+// English: §B4-PIT coverage probe (total / list_date filled / delist_date filled) so the replay
+// can tell "PIT has data" from "PIT would silently return an empty pool".
+type StockMetaStats struct {
+	Total      int // stocks 表行数
+	WithList   int // list_date 非空
+	WithDelist int // delist_date 非空（已退市样本，幸存者偏差的补集）
+}
+
+func (d *DB) StockMetaStats() (StockMetaStats, error) {
+	var s StockMetaStats
+	err := d.db.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN COALESCE(list_date,'') != '' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN COALESCE(delist_date,'') != '' THEN 1 ELSE 0 END), 0)
+		FROM stocks`).Scan(&s.Total, &s.WithList, &s.WithDelist)
+	return s, err
 }
 
 // ReadyStockCount 返回近一年（约 244 个交易日）内有日线数据的股票数。

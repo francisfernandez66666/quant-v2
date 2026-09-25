@@ -498,12 +498,15 @@ func (q QMTConfig) YellowScale() float64 {
 }
 
 // RiskGateConfig §WS-C 机构级风控闸口参数。零值 = 闸全部关闭（现状行为不变，可随时开启、可回滚）。
+// 唯一例外（owner 裁决 2026-09-26）：LimitDownBlockSell 跌停追卖闸为常开默认（nil=开，显式 false 关）。
 // 目标补齐：日内已实现亏损熔断、单票市值集中度、涨停/跌停不可追单、行情新鲜度硬闸——
 // 全部经 RiskGate.CheckLiveOrder 单一权威入口消费，命中即拒单并记录 risk_gates 命中计数。
 // English: §WS-C institutional risk-gate params. Zero-value = all gates off (legacy behavior; each
-// gate can be enabled independently and reverted). Covers: intraday realized-loss circuit breaker,
-// single-stock value concentration, limit-up/down chase blocking, and quote-staleness hard gate —
-// all consumed by the single authoritative RiskGate.CheckLiveOrder entry point, recording hits.
+// gate can be enabled independently and reverted). Sole exception (owner ruling 2026-09-26): the
+// limit-down sell-chase gate is on by default (nil = on, explicit false = off). Covers: intraday
+// realized-loss circuit breaker, single-stock value concentration, limit-up/down chase blocking,
+// and quote-staleness hard gate — all consumed by the single authoritative RiskGate.CheckLiveOrder
+// entry point, recording hits.
 type RiskGateConfig struct {
 	// DayLossLimitPct 日内已实现亏损熔断阈值（%）：0=关（默认）。
 	// 已实现亏损 = Σ今日卖出成交(fill价−成本)×数量；达到阈值 → 熔断当日新买入（卖出/清仓放行）+ P1 告警。
@@ -526,10 +529,15 @@ type RiskGateConfig struct {
 	// English: block chasing a limit-up buy (default off): buy reference price ≥ prevClose×(1+board
 	// limit-up%) → reject.
 	LimitUpBlockBuy bool `json:"limit_up_block_buy"`
-	// LimitDownBlockSell 跌停不可追卖（默认关）：卖出参考价 ≤ 昨收×(1−板感知涨停%) → 拒单。
-	// English: block chasing a limit-down sell (default off): sell reference price ≤ prevClose×(1−board
-	// limit-up%) → reject.
-	LimitDownBlockSell bool `json:"limit_down_block_sell"`
+	// LimitDownBlockSell 跌停不可追卖：**常开**（owner 裁决 2026-09-26「跌停追卖闸是否常开：是」）。
+	// 语义与 EnforceT1 同款 *bool：nil（未配置）→ 默认开；显式 false 才关闭。判定：卖出参考价
+	// ≤ 昨收×(1−板感知涨停%) → 拒单（防在跌停板上割肉追卖）。注意 fail-open 语义不变：
+	// 无昨收（PrevClose≤0）时仍跳过交由柜台判定——所以打分链路必须注入昨收（见
+	// scoring_loop 的 PrevClose 腿），否则本闸形同虚设。
+	// English: block chasing a limit-down sell — ON by default (owner ruling 2026-09-26). Same *bool
+	// convention as EnforceT1: unset = on, explicit false opts out. Fail-open on unknown prevClose
+	// is unchanged, so the scoring loop must carry PrevClose for this gate to have teeth.
+	LimitDownBlockSell *bool `json:"limit_down_block_sell,omitempty"`
 	// MaxOrderAmount 单笔委托金额绝对帽（元，默认 0=关）：本单金额（qty×参考价，缺省回退）
 	// 超过该值 → 拒一切新委托（买卖双向）。定位：手动下单入口（/api/positions/execute）不设
 	// sizing 通道天然限额，胖手误（多打一个 0）唯一封顶手段；自动单同享此帽做双保险。
@@ -564,11 +572,26 @@ func (r RiskGateConfig) CrossCheckEnforce() bool {
 	return r.CrossCheckShadow != nil && !*r.CrossCheckShadow
 }
 
+// LimitDownBlockSellEnabled §A5-常开（owner 裁决 2026-09-26）返回跌停追卖拒单闸是否生效：
+// nil（未配置）→ true 常开；显式布尔按值。判定姿势与 EnforceT1Enabled 同款。
+// English: reports whether the limit-down sell-chase block is active — unset defaults to true
+// (always-on per owner ruling 2026-09-26); an explicit bool wins. Same convention as EnforceT1.
+func (r RiskGateConfig) LimitDownBlockSellEnabled() bool {
+	if r.LimitDownBlockSell == nil {
+		return true
+	}
+	return *r.LimitDownBlockSell
+}
+
 // AnyEnabled 是否开启了至少一道 RiskGate（供 UI/健康展示与短路）。
-// English: AnyEnabled reports whether at least one risk gate is enabled.
+// 注意：跌停追卖闸自 §A5-常开起默认生效，故零值配置下 AnyEnabled 恒为 true——
+// 该值只表示"至少一道闸开"，不再等价于"全部闸关"。
+// English: AnyEnabled reports whether at least one risk gate is enabled. Since §A5-always-on the
+// limit-down gate defaults to on, so zero config now reports true — the flag means "at least one
+// gate active", no longer "all gates off".
 func (r RiskGateConfig) AnyEnabled() bool {
 	return r.DayLossLimitPct > 0 || r.SingleStockValuePct > 0 || r.StaleQuoteMs > 0 ||
-		r.LimitUpBlockBuy || r.LimitDownBlockSell || r.MaxOrderAmount > 0 || r.CrossCheckPct > 0
+		r.LimitUpBlockBuy || r.LimitDownBlockSellEnabled() || r.MaxOrderAmount > 0 || r.CrossCheckPct > 0
 }
 
 // SettleConfig §WS-B 交割单三方对账参数。

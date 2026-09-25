@@ -36,6 +36,59 @@ func bsFull(db *store.DB, c *data.BaostockClient, start, end string) error {
 	return bsRunDaily(db, c, start, end)
 }
 
+// bsMetaDates §B4-META（2026-09-26）：上市/退市元数据回填——baostock query_stock_basic 全表
+// 一次调用（含退市样本），写 stocks.list_date/delist_date。这是 §WS-D D-2 时点股票池
+// （store.UniverseAt / btreplay PointInTime）的数据前提：旧 bsLoadMeta 把两列写死空串，
+// 防线有代码没粮草。语义：默认只更新已在库的票；--with-delisted 时把退市票补成骨架行
+// （日线由后续 daily 断点续拉补齐），供回放池真正含退市样本。
+// English: §B4-META — one-call full listing/delisting metadata backfill (the fuel for the
+// point-in-time universe); with --with-delisted delisted names get skeleton rows too.
+func bsMetaDates(db *store.DB, c *data.BaostockClient, withDelisted bool) error {
+	rows, err := c.AllStockBasic()
+	if err != nil {
+		return fmt.Errorf("stock_basic 全表: %w", err)
+	}
+	existing := make(map[string]bool, len(rows))
+	if codes, err := db.StockCodes(); err == nil {
+		for _, ts := range codes {
+			existing[ts] = true
+		}
+	}
+	listings := make([]store.StockListing, 0, len(rows))
+	total, added := 0, 0
+	for _, r := range rows {
+		// type=1 才是股票（全表里混着指数/基金，其余字段形态不同，直接跳过）。
+		if s := r.S("type"); s != "" && s != "1" {
+			continue
+		}
+		ts := data.BsCodeToTS(r.S("code"))
+		if ts == "" || ts == r.S("code") {
+			continue
+		}
+		l := store.StockListing{
+			TsCode:     ts,
+			Name:       r.S("code_name"),
+			ListDate:   normDate(r.S("ipodate")),
+			DelistDate: normDate(r.S("outdate")),
+		}
+		if !existing[ts] {
+			// 不在库 = 新样本（多为退市票）。未开 --with-delisted 时不加骨架行，
+			// 只回填已在库票的日期——保证默认路径不改变行情装载范围。
+			if !withDelisted || r.S("status") != "0" {
+				continue
+			}
+			added++
+		}
+		listings = append(listings, l)
+		total++
+	}
+	if _, err := db.UpsertStockListings(listings); err != nil {
+		return err
+	}
+	log.Printf("[dataload] §B4-META 上市/退市元数据回填 %d 行（其中新补退市骨架 %d 行，含退市=%v）", total, added, withDelisted)
+	return nil
+}
+
 // bsLoadMeta 装载股票列表 + 交易日历。
 // （bsLoadMeta loads the stock universe and trading calendar.）
 func bsLoadMeta(db *store.DB, c *data.BaostockClient) error {
@@ -59,6 +112,14 @@ func bsLoadMeta(db *store.DB, c *data.BaostockClient) error {
 		return err
 	} else {
 		log.Printf("[dataload] stocks 写入 %d 行", n)
+	}
+
+	// §B4-META：股票列表落库后紧接回填上市/退市元数据（时点股票池 §WS-D D-2 的数据前提）；
+	// 本腿失败只告警不中断行情装载——但降级读数由回放侧 §B4-PIT 覆盖率闸显式抬出，不会静默。
+	// English: §B4-META — metadata backfill rides along with meta load; a failure here is
+	// surfaced later by the replay-side coverage guard, never silently.
+	if err := bsMetaDates(db, c, false); err != nil {
+		log.Printf("[dataload] §B4-META 元数据回填失败（时点池将按降级口径运行）: %v", err)
 	}
 
 	// 交易日历自 2015 年起全量落库：交易时段判定、回测区间对齐都依赖 trade_cal，

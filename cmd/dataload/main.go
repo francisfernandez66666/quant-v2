@@ -57,7 +57,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: dataload [flags] <full|daily|finance|bars ts_code|verify>")
+		log.Fatalf("用法: dataload [flags] <full|daily|meta-dates|finance|bars ts_code|verify>")
 	}
 	cmd := args[0]
 
@@ -102,6 +102,14 @@ func main() {
 		}
 		if err != nil {
 			log.Fatalf("daily 失败: %v", err)
+		}
+	case "meta-dates":
+		// §B4-META 一次性回填上市/退市元数据（baostock stock_basic 全表，单调用非逐票）。
+		// 加 --with-delisted 时同时把退市票补成 stocks 骨架行，之后 daily 断点续拉其历史日线。
+		// English: §B4-META one-shot listing-metadata backfill; --with-delisted adds delisted
+		// skeleton rows so their history enters the point-in-time replay universe.
+		if err := bsMetaDates(db, bsClient, *withDelisted); err != nil {
+			log.Fatalf("meta-dates 失败: %v", err)
 		}
 	case "adjfactor":
 		// 专项补齐复权因子（baostock）：daily 已满但 adj_factor 单独缺失时使用。

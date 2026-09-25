@@ -17,6 +17,7 @@ package risk
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -234,18 +235,37 @@ func (g *Gate) checkBlacklist(cfg config.QMTConfig, o LiveOrder) string {
 // 旧口径只数 持仓−当日买入（均已结算成交），并发双卖（手动双入口或 M8+止损同轮）两笔校验输入相同、
 // 双双放行，合计超过 T+1 可卖量（2026-09-16 实跑 01:16:36 两笔同秒卖单全成交复现）。柜台终裁仍在，
 // 但废单发生在真实交易所、留废单记录；并入在途量后先到者占额度，后到者在网关侧就被拦下。
-// §N-3（2026-09-22 傍晚批）联动：在途项口径由「整笔委托量」改为「未成交余量」，本闸随之改变可卖量，
-// 三项扣减的算式必须逐项读通才算对：
-//   - p.Qty 是**已扣掉当日卖出成交**的账面持仓（ApplyRealFill 卖成交即时减仓，与对账快照同源）；
-//   - bought 是当日买入成交（T+1 锁定，未结算不可卖）；
-//   - openSell 是当日非终态卖单的未成交余量（§N-3 后不再重复计入该单已成交的部分）。
-//     旧整笔口径下 部成 单的成交腿被 p.Qty（已减）与 openSell（仍含）扣两次 → 可卖量虚低，
-//     把合法的手动/补卖退出一起拦死（本条修的是卖出侧，绝不能把 T+1 侧改坏）。
+// §N-3（2026-09-22 傍晚批）联动：在途项口径由「整笔委托量」改为「未成交余量」，三项扣减算式见下。
 //
-// English: §UAT-D4 — sellable deducts today's still-open sell tickets so concurrent sells can't both
-// pass on identical settled-only inputs. §N-3 — those tickets now count at their unfilled remainder,
-// because the settled part is already gone from p.Qty; the old whole-order figure subtracted the same
-// fills twice and locked up legitimate exits.
+// §0925EVE-W2-A1（2026-09-26 批）判定改口径——「柜台 can_use_qty 优先，本地推算作交叉告警」：
+//   - 改前行为：可卖量**只有**本地推算一条腿（p.Qty − 当日买入 − 在途卖未成余量）。柜台每轮
+//     对账快照都携带真实 T+1 可卖量 can_use_qty，但旧 store.RealPosition 无该字段、被
+//     encoding/json 静默丢弃（§0925EVE 全量审计锤实"全仓非测试代码零命中"）——本地看不到
+//     的柜台侧事实（人工在券商端的账外成交、柜台冻结口径、当日买入结算细节）全部缺失，
+//     可卖量偶发虚高，卖单到交易所吃废单。
+//   - 改后行为：持仓行 CanUseQty 可读且 >=0（柜台真值）时，可卖量 = min(柜台值, 本地推算)。
+//     为什么是 min 而不是无条件取柜台值（裁决的资损约束决定）：柜台值**更小**（可卖更少）时
+//     绝不能放行更多卖出——min 在收紧侧完整兑现"柜台优先"；柜台值**更大**时本地仍封顶，
+//     因为本地三项扣减里的在途卖单（§UAT-D4）在柜台快照窗口内不可信地缺席（快照先于本单
+//     受理，并发第二笔若只读柜台值会再次双双放行——正是 09-16 实录形态），且"柜台比本地
+//     乐观"本身意味着两本账有一本错了，未见证据前不放大卖出权限。
+//   - 交叉告警（不静默）：柜台值与本地推算偏差绝对值超过阈值 max(100 股, 持仓×2%) 时以
+//     warn 级走既有 onGate 告警通道（接线方 registry.go 将非 high/low 级别映射为中档推送，
+//     本批不改接线文件，已核该级别可达）。阈值为什么不能是 0：成交回报先于/晚于快照到达的
+//     时序 skew 天然产生整手（100 股=A 股最小交易单位）级瞬时差，0 阈值天天误报；
+//     为什么不能是大绝对值：千手仓位下绝对阈值会吞掉同比例的记账漂移——2% 相对灵敏度
+//     兜住大仓，100 股地板兜住"整手噪声"。告警内容带齐 qty/bought/openSell/counter 四项：
+//     若偏差恰可被在途卖量解释（柜台冻结口径），人看一眼即可排除，宁多报不静默——
+//     本批主题就是"静默失效"。
+//   - 柜台值读不到（CanUseQty=nil：桥通道旧 7 键行、成交回报建的行、存量未对账行）退回
+//     本地推算，现行为原样保留；柜台值为 0（当日新仓全锁）是真值、照常收紧。
+//
+// English: §A1 — the broker-reported T+1 sellable qty (can_use_qty, now persisted) takes
+// precedence in the tightening direction: sellable = min(counter, local estimate), with a
+// warn-level cross-check alert when they diverge beyond max(100 shares, 2% of the position).
+// The local estimate keeps the §UAT-D4 open-sell deduction because a broker snapshot cannot
+// see orders accepted after it was taken; when the counter value is absent, behavior is
+// exactly as before (local only).
 func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 	// 仅卖出方向且开关启用且账本可用时才检查；其余情况跳过。
 	if o.Side != SideSell || !cfg.EnforceT1Enabled() || g.st == nil {
@@ -262,10 +282,38 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 		if sellable < 0 {
 			sellable = 0
 		}
+		basis := "本地推算"
+		// §A1 柜台值优先（收紧方向）+ 交叉告警：nil / 负值都按"读不到"退回本地推算。
+		if p.CanUseQty != nil && *p.CanUseQty >= 0 {
+			counter := *p.CanUseQty
+			localEst := sellable
+			if counter < localEst {
+				sellable = counter // 柜台更小：一律以柜台为准（资损方向，裁决钉死）
+			}
+			basis = fmt.Sprintf("柜台 can_use_qty=%d", counter)
+			// 交叉告警：偏差阈值 max(100 股, 2%×持仓量)，理由见函数头（改前此对比根本不存在，
+			// 因为柜台值从未入账——这条告警就是断腿修复后的"两本账互相守望"腿）。
+			dev := counter - localEst
+			if dev < 0 {
+				dev = -dev
+			}
+			thr := p.Qty / 50
+			if thr < 100 {
+				thr = 100
+			}
+			if dev > thr {
+				content := fmt.Sprintf("%s %s：柜台可卖口径 %d 与本地推算 %d 偏差 %d 股(阈值 %d)，持仓 %d 当日买入 %d 在途卖 %d —— 可卖量已按 min 收紧，偏差请核对本成交链与柜台账外操作",
+					g.userID, o.Code, counter, localEst, dev, thr, p.Qty, bought, openSell)
+				log.Printf("[risk] §A1 T+1 可卖量交叉偏差告警: %s", content)
+				if g.onGate != nil {
+					g.onGate("warn", "T+1 可卖量交叉偏差", content)
+				}
+			}
+		}
 		// 请求量超过可卖量 → 拒单（先到者占额度，后到者在网关侧被拦）。
 		if o.Qty > sellable {
-			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %d < 请求 %d（持仓 %d, 当日买入 %d, 在途卖 %d）",
-				sellable, o.Qty, p.Qty, bought, openSell)
+			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %d < 请求 %d（%s；持仓 %d, 当日买入 %d, 在途卖 %d）",
+				sellable, o.Qty, basis, p.Qty, bought, openSell)
 		}
 	}
 	return ""
@@ -296,10 +344,11 @@ func (g *Gate) checkMaxOrderAmount(cfg config.QMTConfig, o LiveOrder) string {
 	return ""
 }
 
-// checkLimitPrice 涨停不可追买 / 跌停不可追卖（默认关）。板感知阈值取 data.LimitUpPct 唯一权威实现；
-// 无昨收（PrevClose<=0）时 fail-open 跳过（数据缺口不误拦）。
-// English: block chasing a limit-up buy / limit-down sell (off by default). Board-aware threshold from
-// the canonical data.LimitUpPct; fails open when PrevClose is unknown.
+// checkLimitPrice 涨停不可追买（默认关）/ 跌停不可追卖（§A5-常开：默认开，显式 false 才关）。
+// 板感知阈值取 data.LimitUpPct 唯一权威实现；无昨收（PrevClose<=0）时 fail-open 跳过（数据缺口不误拦）。
+// English: block chasing a limit-up buy (off by default) / limit-down sell (on by default since
+// §A5-always-on). Board-aware threshold from the canonical data.LimitUpPct; fails open when
+// PrevClose is unknown.
 func (g *Gate) checkLimitPrice(cfg config.QMTConfig, o LiveOrder) string {
 	// 无昨收或参考价（≤0）时 fail-open：数据缺口不误拦，交由柜台判定。
 	if o.PrevClose <= 0 || o.Price <= 0 {
@@ -315,7 +364,8 @@ func (g *Gate) checkLimitPrice(cfg config.QMTConfig, o LiveOrder) string {
 		}
 	}
 	// 卖出方向：参考价跌至昨收×(1−跌幅) 即视为跌停，拒追卖（防止底部割在跌停板上）。
-	if o.Side == SideSell && cfg.RiskGate.LimitDownBlockSell {
+	// §A5-常开（owner 裁决 2026-09-26）：本闸未配置即生效，仅显式 limit_down_block_sell=false 关闭。
+	if o.Side == SideSell && cfg.RiskGate.LimitDownBlockSellEnabled() {
 		limitDown := o.PrevClose * (1 - pct/100)
 		if o.Price <= limitDown {
 			return fmt.Sprintf("跌停不可追卖: 参考价 %.2f ≤ 跌停价 %.2f（昨收 %.2f −%.1f%%）", o.Price, limitDown, o.PrevClose, pct)

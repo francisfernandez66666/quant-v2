@@ -140,6 +140,22 @@ func (c *BaostockClient) StockBasic(code string) ([]TushareRow, error) {
 	return c.call("stock_basic", map[string]string{"code": code}, strColsStock())
 }
 
+// AllStockBasic §B4-META：不带 code 调 sidecar /stock_basic——baostock
+// query_stock_basic(code="") 返回**全表**（含已退市），列为
+// code/code_name/ipoDate/outDate/type/status（status=0 即退市），一次调用补齐
+// 时点股票池需要的上市/退市元数据。注意这与 StockBasic(单票) 共用同一路由。
+// English: §B4-META — calls /stock_basic without code; baostock returns the FULL table
+// (delisted included) with ipoDate/outDate/status in one call — the fuel for UniverseAt.
+func (c *BaostockClient) AllStockBasic() ([]TushareRow, error) {
+	return c.call("stock_basic", map[string]string{}, strColsStockListing())
+}
+
+// strColsStockListing 全表基础信息里保留字符串的列（日期绝不能被 float 化）。
+// call() 按小写列名比对，故 ipoDate/outDate 以小写键登记。
+func strColsStockListing() map[string]bool {
+	return map[string]bool{"code": true, "code_name": true, "ipodate": true, "outdate": true, "status": true, "type": true}
+}
+
 // StockKline 拉单只股票不复权日线（含换手/停牌/估值/ST），date 升序。
 // （StockKline pulls one stock's unadjusted daily bars incl. turnover/suspension/valuation/ST.）
 func (c *BaostockClient) StockKline(code, start, end string) ([]TushareRow, error) {

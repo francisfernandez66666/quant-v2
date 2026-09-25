@@ -23,6 +23,12 @@ func bsMock(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/all_stock", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("code,code_name,tradeStatus\nsh.600000,浦发银行,1\nsz.000001,平安银行,1\nbj.830000,某北交所股,1\n"))
 	})
+	// §B4-META：/stock_basic 不带 code 即全表（含退市样本 status=0）。
+	mux.HandleFunc("/stock_basic", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("code,code_name,ipoDate,outDate,type,status\n" +
+			"sh.600000,浦发银行,1999-11-10,,1,1\n" +
+			"sh.600625,退市某股,1993-04-05,2021-06-30,1,0\n"))
+	})
 	mux.HandleFunc("/kline", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM,isST\n" +
 			"2020-01-02,sh.600000,10.0,10.5,9.9,10.2,10.0,123400,1250000.5,0.9,1,2.0,8.1,0.9,2.2,1.1,0\n" +
@@ -90,6 +96,25 @@ func TestBaostockAllStock(t *testing.T) {
 	}
 	if BsCodeToTS(rows[2].S("code")) != "830000.BJ" {
 		t.Errorf("BsCodeToTS(bj) 错误: %s", BsCodeToTS(rows[2].S("code")))
+	}
+}
+
+// TestBaostockAllStockBasic §B4-META：全表基础信息解析——退市行（status=0/outDate 非空）
+// 必须在结果里（这正是 all_stock 拿不到的样本），且 ipoDate/outDate 保持日期字符串。
+func TestBaostockAllStockBasic(t *testing.T) {
+	c := NewBaostockClient(bsMock(t).URL)
+	rows, err := c.AllStockBasic()
+	if err != nil {
+		t.Fatalf("AllStockBasic: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("期望 2 行（含 1 行退市），得到 %d", len(rows))
+	}
+	if rows[0].S("ipodate") != "1999-11-10" || rows[0].S("outdate") != "" {
+		t.Errorf("在市行日期异常: %v", rows[0])
+	}
+	if rows[1].S("outdate") != "2021-06-30" || rows[1].S("status") != "0" {
+		t.Errorf("退市行必须原样带出 outDate/status: %v", rows[1])
 	}
 }
 

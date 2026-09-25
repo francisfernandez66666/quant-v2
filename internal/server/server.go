@@ -704,6 +704,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
 	s.mux.HandleFunc("POST /api/holdings", s.adminMiddleware(s.handleFixSetHoldings))
 	s.mux.HandleFunc("POST /api/holdings/balance", s.adminMiddleware(s.handleFixSetBalance)) // §P1-11 窄口径改资金
+	s.mux.HandleFunc("POST /api/holdings/pnl-offset", s.adminMiddleware(s.handleFixPnlOffset)) // §E1 盈亏校准入库留痕（清零按钮的正规后端）
 	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.adminMiddleware(s.handleFixAddHoldingLot))
 	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.adminMiddleware(s.handleFixSetCost))
 	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.adminMiddleware(s.handleFixSellHolding))

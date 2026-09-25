@@ -64,6 +64,13 @@ type ShortPosition struct {
 	Mark         float64   `json:"mark"`         // 最近现价（买回估值价）
 	SignalAt     time.Time `json:"signal_at"`    // 信号时间
 	FilledAt     time.Time `json:"filled_at"`    // 开仓成交时间
+	// §E1 盈亏单轨：随快照下发的**后端算好**的浮动盈亏/浮动收益率——旧版空头卡由前端逐行
+	// 自写公式重算（Paper.jsx「(开仓价−现价)×数量−费用」），与后端 FloatPnl() 是两套账，
+	// 公式一改两侧必然漂移。现前端只展示这两个字段；引擎状态回灌的旧值不作数，
+	// ShortBook/ShortPositions 出口一律即时重算。字段名带 Snap 前缀是语法约束：
+	// 方法 FloatPnl()/FloatPnlPct() 不能与同名字段共存。
+	SnapFloatPnl    float64 `json:"float_pnl"`     // FloatPnl() 的快照值（出口侧重算，勿持久化信任）
+	SnapFloatPnlPct float64 `json:"float_pnl_pct"` // FloatPnlPct() 的快照值（同上）
 }
 
 // MarketValue 融券空头当前买回成本（现价 × 欠券数）。
@@ -118,7 +125,11 @@ func (e *Engine) ShortPositions() []ShortPosition {
 	defer e.mu.Unlock()
 	out := make([]ShortPosition, 0, len(e.shorts))
 	for _, s := range e.shorts {
-		out = append(out, *s)
+		v := *s
+		// §E1：出口侧统一盖快照值（状态回灌的旧 Snap 字段不作数）。
+		v.SnapFloatPnl = round2(s.FloatPnl())
+		v.SnapFloatPnlPct = round2(s.FloatPnlPct())
+		out = append(out, v)
 	}
 	return out
 }
@@ -442,7 +453,11 @@ func (e *Engine) ShortBook() ShortSnapshot {
 	sb := ShortSnapshot{Enabled: e.shortBookEnabledLocked(), Cash: round2(e.shortCash),
 		Equity: round2(e.shortEquityLocked()), Realized: round2(e.shortRealized), MarginUsed: 0, FloatingPnl: 0, FeeAccrued: 0}
 	for _, s := range e.shorts {
-		sb.Positions = append(sb.Positions, *s)
+		v := *s
+		// §E1：逐行浮动盈亏由后端算好随快照下发，前端只展示（浮盈合计仍按未舍入原值累加）。
+		v.SnapFloatPnl = round2(s.FloatPnl())
+		v.SnapFloatPnlPct = round2(s.FloatPnlPct())
+		sb.Positions = append(sb.Positions, v)
 		sb.MarginUsed += s.MarginUsed
 		sb.FloatingPnl += s.FloatPnl()
 		sb.FeeAccrued += s.FeeAccrued

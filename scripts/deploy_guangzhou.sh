@@ -147,6 +147,13 @@ $SSH "powershell -NoProfile -Command \"net stop quant; net stop quant-research; 
 SERVICES_STOPPED=1   # 置位后由 [4/5]/[4/5]-s 拉起，任何提前退出都由 EXIT 兜底补 start
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata | Out-Null\""
 $SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/qmtctl.exe "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
+# §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯ Windows 服务拉起三径单源化）：
+# service_definitions.ps1 是服务/任务定义**单源**，被 6 个运维脚本 dot-source（register_engine_services/
+# register_web_service/ensure_gateway_config/rotate_qmt_token/all_service_watchdog 等）。
+# 必须排在所有引用它的脚本上传**之前**：消费方在 $PSScriptRoot 找不到单源会回退字面量并抬 FATAL/告警，
+# "仓库里有、现网没有"正是 §ENH-5 锤过的教训——漏列部署清单就是它的复发路径。
+ps1_bom deploy/qmt-win/service_definitions.ps1
+$SCP deploy/qmt-win/service_definitions.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 $SCP deploy/qmt-win/register_engine_services.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # §H8(2026-09-22) 探针端口/端点同源配置文件——register 与运维探针（all_service_watchdog/
 # daily_ops_check）都 dot-source 它，必须随 register 同目录上传，缺了 register 会回退字面量并告警。

@@ -50,7 +50,11 @@
 #  15) §SIGNAL-DIST（2026-09-24，第 22 探针 + INFO 观测通道）：当日固化信号按战法分布的读数。
 #      只观测不判资金：红=文件在但解析失败/没有 signals 数组；文件缺失、日期不是今天、
 #      当日零信号都是合法态（详见 PS 段口径注释）。绿时也要回显读数，故走 INFO 通道
-#      （bash 侧只 echo，不进 PASS/FAIL 计数⇒判数仍是 25）。
+#      （bash 侧只 echo，不进 PASS/FAIL 计数⇒判数仍是 26）。
+#
+#  16) §C7-OPS（2026-09-26，第 26 探针）：Windows 服务定义单源文件 service_definitions.ps1 在
+#      现网落盘复核——①在位可读；②内容含三张单源表（NSSM 服务名表/任务名表/nssm 解析器），
+#      防空文件、旧回退副本、scp 截断半份这类"在位但不管用"的假绿（§ENH-5 教训）。
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
@@ -107,7 +111,9 @@ param(
     # §OPS-ALIGN（2026-09-23）：第 19 探针的安全阀态判据读这份落盘脚本的内容（只读，不执行它）。
     [string]$MockDecomScript = "C:\opt\quant\qmt-win\decommission_qmt_mock.ps1",
     [string]$GatewayCfg = "C:\qmt\quant-trading-v2\qmt_gateway\config.xt.json",
-    [string]$GwTokenService = "quant"
+    [string]$GwTokenService = "quant",
+    # §C7-OPS（2026-09-26，第 26 探针）：Windows 服务定义单源文件在现网的落盘位（部署步 [3d] 上传）。
+    [string]$SvcDefsPath = "C:\opt\quant\qmt-win\service_definitions.ps1"
 )
 $ErrorActionPreference = "Continue"
 
@@ -802,9 +808,34 @@ $sgDetail = "today_signals=" + $sgTodayN + " today_strategies=" + $sgTypes.Count
     " top=" + (SgTop $sgTodayByType) +
     " miss=" + $(if ($sgBad.Count) { ($sgBad | Sort-Object -Unique) -join "," } else { "none" })
 # 这条探针的**存在理由就是读数本身**，所以绿的时候也必须把明细打出来（其余探针只在红时回显 detail）。
-# 走独立的 INFO 通道：bash 侧只 echo、不进 PASS/FAIL 计数 ⇒ 红绿语义与 25 条判数都不受影响。
+# 走独立的 INFO 通道：bash 侧只 echo、不进 PASS/FAIL 计数 ⇒ 红绿语义与 26 条判数都不受影响。
 Write-Output ("INFO|signals_today " + $sgDetail)
 Probe "engine:today pinned signals spread across strategies" ($sgBad.Count -eq 0) $sgDetail
+
+# 16)（对应文件头清单第 16 项）§C7-OPS（2026-09-26，第 26 探针）：Windows 服务定义单源文件在位复核。
+# 背景：owner 裁决"三套拉起方式并存"要单源化——6 个运维脚本（register_engine_services /
+#   register_service / ensure_gateway_config / gateway_watchdog / all_service_watchdog /
+#   rotate_qmt_token）改为 dot-source deploy/qmt-win/service_definitions.ps1。§ENH-5 的教训
+#   （"仓库里有、现网没有"）要求部署面独立复核落盘，不能只信 scp 步骤自己打的"完成"。
+# 判据两条互相独立：①文件在位且可读；②**内容认识单源标记**——空文件、旧版回退副本、
+#   被截断的半份文件都不算过（只查 Test-Path 的话，scp 打断留下 0 字节文件照样绿）。
+# 明细全 ASCII（同第 19 探针的 GBK 教训）。
+$svcDefsTxt = ""
+$svcDefsState = "absent"
+$svcDefsMiss = @()
+if (Test-Path -LiteralPath $SvcDefsPath) {
+    try { $svcDefsTxt = [string](Get-Content -LiteralPath $SvcDefsPath -Raw -ErrorAction Stop); $svcDefsState = "present" }
+    catch { $svcDefsState = "unreadable"; $svcDefsMiss += "unreadable" }
+} else { $svcDefsMiss += "file-missing" }
+if ($svcDefsTxt) {
+    # 三个标记各代表单源化的一类定义：NSSM 服务名表 / 任务名表 / nssm 路径解析器。
+    if ($svcDefsTxt -notmatch '\$SvcNssmServices')   { $svcDefsMiss += "no-svc-name-table" }
+    if ($svcDefsTxt -notmatch '\$SvcTaskGatewayEnsure') { $svcDefsMiss += "no-task-name-table" }
+    if ($svcDefsTxt -notmatch 'Resolve-SvcNssm')     { $svcDefsMiss += "no-nssm-resolver" }
+}
+$svcDefsDetail = "path=$SvcDefsPath state=" + $svcDefsState + " bytes=" + $svcDefsTxt.Length +
+    " miss=" + $(if ($svcDefsMiss.Count) { ($svcDefsMiss -join ",") } else { "none" })
+Probe "ops:C7 service_definitions single source in place" ($svcDefsMiss.Count -eq 0) $svcDefsDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -813,7 +844,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
-out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC}" 2>&1 | LC_ALL=C tr -d '\r')
+out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC} -SvcDefsPath ${QMT_WIN_DIR}/service_definitions.ps1" 2>&1 | LC_ALL=C tr -d '\r')
 
 PASS=0
 FAIL=0

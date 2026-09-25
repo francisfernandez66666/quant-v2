@@ -10,7 +10,8 @@
 //     handleFixSnapshot（/api/snapshot 快照）、handleFixHotSnapshot（/api/snapshot/hot 热门快照）、
 //     handleFixStockLookup（/api/stock/lookup 单票查询）、handleFixDepth（/api/depth/{code} 盘口）
 //   - 持仓：handleFixGetHoldings（/api/holdings 持仓列表+盈亏）、handleFixSetHoldings（POST 全量同步）、
-//     handleFixSetBalance（/api/holdings/balance 窄口径改可用资金）、handleFixAddHoldingLot（加仓）、
+//     handleFixSetBalance（/api/holdings/balance 窄口径改可用资金）、handleFixPnlOffset
+//     （POST /api/holdings/pnl-offset §E1 盈亏校准入库留痕）、handleFixAddHoldingLot（加仓）、
 //     handleFixSetCost（改成本）、handleFixSellHolding（减仓）、handleFixCloseHolding（清仓）
 //   - 热点/评分：handleFixSectorHot（/api/sector/hot 热门板块）、handleSectorHotRecords（热点轮次记录）、
 //     handleFixEvaluations（/api/evaluations 多维评分）、handleFixStatus（/api/status 运行状态）、
@@ -47,6 +48,7 @@ import (
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
 
@@ -823,25 +825,106 @@ type fixHolding struct {
 // handleFixGetHoldings 处理 GET /api/holdings 请求，返回当前持仓列表。
 // 从执行日志中筛选状态为"持仓中"的记录，实时拉取最新股价计算盈亏。
 // 同时关联信号数据，标注持仓是否有活跃信号。
+//
+// §E1 盈亏单轨（owner 裁决 2026-09-26）：响应新增 total_unrealized_pnl / pnl_offset / total_pnl
+// 三个**后端算好的**汇总字段——旧版只给原料（各持仓现价/成本/数量 + total_realized_pnl），
+// 总盈亏由前端逐 lots 自算再减 localStorage 里的私有校准值（Positions.jsx 旧 :173），
+// 后端 summary 与前端展示是两套账。现在算式只在 paperPnlTotals 一处，前端只展示；
+// 校准值本身收编进 pnl_offset_history 表（只追加留痕，见 store/pnl_offset.go）。
+// pnl_offset 查库失败时 total_pnl 输出 null + pnl_offset_error 文案：绝不把"读数不可得"
+// 折成 0 校准的假总数（§N-5 姿势），前端据此显示"—"。
 func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 	// 自选股/持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 读取。
 	// §P1-11（2026-09-15）：available_balance 从 real_account 行读取（管理员手动改资金 /
 	// 网关 account 回报共用一表），不再硬编码 0——此前编辑可用资金存不进、刷新即回 0。
 	userID := s.operatorID()
 	acc, _ := s.realDB().GetRealAccount(userID)
+	holdings, realized, unrealized, offset, offErr := s.paperPnlTotals(userID)
+	resp := map[string]interface{}{
+		"holdings":             holdings,
+		"available_balance":    r2(acc.AvailableCash),
+		"total_realized_pnl":   realized,
+		"total_unrealized_pnl": r2(unrealized),
+		"pnl_offset":           r2(offset),
+	}
+	if offErr != nil {
+		resp["total_pnl"] = nil
+		resp["pnl_offset_error"] = "显示偏移量读数失败（总盈亏暂不可得，不代表没有校准记录）: " + offErr.Error()
+	} else {
+		resp["total_pnl"] = r2(realized + unrealized - offset)
+	}
+	writeJSON(w, 200, resp)
+}
+
+// paperPnlTotals §E1 纸面账户盈亏汇总的**唯一算式点**：GET /api/holdings 展示与「清零」端点
+// 共用，杜绝两处各写一遍公式（那正是两套账的诞生方式）。
+// 浮盈按**下发给前端的同一批字段**（r2 舍入后的 cost/cur/quantity）累加——保证前端把列表行
+// 逐行相加与后端汇总**逐分对齐**，"单轨"才有可验证的含义。
+// 返回值 offset 为当前生效的显示校准值；其查库错误单独回传（调用方决定降级展示，不静默折 0）。
+func (s *Server) paperPnlTotals(userID string) (holdings []fixHolding, realized, unrealized, offset float64, offsetErr error) {
 	logs := s.rpt.ListFor("")
-	holdings := make([]fixHolding, 0)
+	holdings = make([]fixHolding, 0)
 	for _, l := range logs {
 		if l.Status != "持仓中" {
 			continue
 		}
 		holdings = append(holdings, s.buildHolding(l, userID))
 	}
-	writeJSON(w, 200, map[string]interface{}{
-		"holdings":           holdings,
-		"available_balance":  r2(acc.AvailableCash),
-		"total_realized_pnl": s.rpt.TotalRealizedPnl(userID),
-	})
+	realized = r2(s.rpt.TotalRealizedPnl(userID))
+	for _, h := range holdings {
+		qty := h.Quantity
+		if qty <= 0 {
+			qty = 1 // 与旧前端自算同款兜底（quantity 缺失按 1），保证改前后读数可比
+		}
+		unrealized += (h.CurPrice - h.CostPrice) * qty
+	}
+	offset, offsetErr = s.realDB().LatestPnlOffset(userID)
+	return holdings, realized, unrealized, offset, offsetErr
+}
+
+// fixPnlOffsetReq 「清零」校准请求（§E1）。二选一：reset=true 由后端按当前总盈亏取整入账
+// （**不信任前端传来的算式结果**，这正是单轨的落点）；或显式 offset 值（带备注留痕）。
+type fixPnlOffsetReq struct {
+	Reset  bool    `json:"reset"`
+	Offset float64 `json:"offset"`
+	Note   string  `json:"note"`
+}
+
+// handleFixPnlOffset 处理 POST /api/holdings/pnl-offset（§E1，admin 守卫）：
+// 把纸面总盈亏校准到 0（reset）或校准到指定偏移，**只追加留痕**（时间/操作账号/备注入库）。
+// 旧版这一步只写 localStorage：换浏览器即丢、全程无痕，"手工校准"因而无法审计。
+func (s *Server) handleFixPnlOffset(w http.ResponseWriter, r *http.Request) {
+	var req fixPnlOffsetReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	userID := s.operatorID()
+	_, realized, unrealized, oldOff, offErr := s.paperPnlTotals(userID)
+	if offErr != nil {
+		writeError(w, 500, "当前偏移量读数失败，拒绝校准（避免把错误读数摞进留痕账）: "+offErr.Error())
+		return
+	}
+	newOff := req.Offset
+	if req.Reset {
+		newOff = r2(realized + unrealized) // 展示总盈亏 = realized+unrealized-newOff = 0
+	}
+	note := strings.TrimSpace(req.Note)
+	if note == "" {
+		if req.Reset {
+			note = fmt.Sprintf("清零（原生效偏移 %.2f，校准前总盈亏 %.2f）", oldOff, r2(realized+unrealized-oldOff))
+		} else {
+			note = "手工指定偏移"
+		}
+	}
+	rec, err := s.realDB().AddPnlOffset(store.PnlOffsetRecord{UserID: userID, Offset: r2(newOff), Note: note})
+	if err != nil {
+		writeError(w, 500, "save pnl offset failed: "+err.Error())
+		return
+	}
+	// 留痕双写：DB 行为主账，opslog 让"有人动过盈亏读数"在日常运维日志里也看得见
+	opslog.Logf("quant", "§E1 纸面盈亏校准：账号 %s 偏移 %.2f → %.2f（%s）", userID, oldOff, rec.Offset, note)
+	writeJSON(w, 200, map[string]interface{}{"status": "ok", "pnl_offset": rec.Offset, "id": rec.ID})
 }
 
 // fixSetBalanceReq 可用资金更新请求体（§P1-11）。

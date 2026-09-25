@@ -1,7 +1,7 @@
 {
   "source": "internal/server/qmt.go qmtReportEvent + internal/store/real_positions.go RealPosition + qmt_gateway/handler.py 实际发出载荷",
-  "updated": "2026-09-23",
-  "notes": "§F2（2026-09-22 修复批）回报方向 golden 契约：与 order_fields.json（下单方向）互补。report_event_fields = 回报信封（qmtReportEvent）反射 JSON tag 集；positions_row_fields = positions 事件行（store.RealPosition）反射集；consumed_by_event = 各事件类型在 handleQMTReport 实际消费的信封字段子集（文档性锁，测试校验其为信封集子集）。§M4（2026-09-22 PM 批）双向化：新增 gateway_emitted_fields = 网关 handler 实际发出的载荷键集（含 _push 补的 user_id/type），Go 侧测试断言『发出集 ⊆ 信封集』——旧契约只反射 Go 一侧，网关常年发的 trade_id/name/created_at 在 Go 没有 tag、被 encoding/json 静默丢弃（丢腿）而测试永远绿。Python 侧 tests/test_report_contract.py 反向断言发出集与 golden 一致。§SIDE-AUTH-2（2026-09-23 夜间批）：trade 事件新增 side_unverified（布尔，仅未命中派发行的成交携带）——网关据此走「待核对」落库不动持仓账，Go 据此留痕（opslog+计数）且不入账；命中派发行的回报不带该键（发出集为两通道并集，键按事实出现）。回归测：internal/server/report_contract_test.go（REPORT_CONTRACT_UPDATE=1 重生成信封/持仓行两面）。",
+  "updated": "2026-09-26",
+  "notes": "§F2（2026-09-22 修复批）回报方向 golden 契约：与 order_fields.json（下单方向）互补。report_event_fields = 回报信封（qmtReportEvent）反射 JSON tag 集；positions_row_fields = positions 事件行（store.RealPosition）反射集；consumed_by_event = 各事件类型在 handleQMTReport 实际消费的信封字段子集（文档性锁，测试校验其为信封集子集）。§M4（2026-09-22 PM 批）双向化：新增 gateway_emitted_fields = 网关 handler 实际发出的载荷键集（含 _push 补的 user_id/type），Go 侧测试断言『发出集 ⊆ 信封集』——旧契约只反射 Go 一侧，网关常年发的 trade_id/name/created_at 在 Go 没有 tag、被 encoding/json 静默丢弃（丢腿）而测试永远绿。Python 侧 tests/test_report_contract.py 反向断言发出集与 golden 一致。§SIDE-AUTH-2（2026-09-23 夜间批）：trade 事件新增 side_unverified（布尔，仅未命中派发行的成交携带）——网关据此走「待核对」落库不动持仓账，Go 据此留痕（opslog+计数）且不入账；命中派发行的回报不带该键（发出集为两通道并集，键按事实出现）。回归测：internal/server/report_contract_test.go（REPORT_CONTRACT_UPDATE=1 重生成信封/持仓行两面）。§0925EVE-W2-A1（2026-09-26 批）：positions 对账行登记 can_use_qty（柜台 T+1 可卖量，网关自 §M5 起每行都发、Go 无 tag 静默丢弃的断腿，现 store.RealPosition.CanUseQty *int 落库并接进 checkT1Sellable）与 open_price（broker.py 同值三路出的第三份冗余键，裁决=登记不清除——三通道映射被 tests/test_channel_position_fields.py AST 锁死一致，且 qmt_bridge*.py 不在本批边界；Go 侧仅接住不消费）。Python 侧契约测试改消费 contract/positions_sample.json 真行采样（样例键集另钉『==XtBroker.query_positions 真实映射产出』行为锁），不再手喂合成行。",
   "report_event_fields": [
     "amount", "asset", "at", "broker", "code", "created_at", "fee", "from",
     "name", "order_id", "positions", "price", "qty", "reason", "side",
@@ -9,8 +9,8 @@
     "type", "user_id"
   ],
   "positions_row_fields": [
-    "amount", "buy_date", "cost_price", "cur_price", "highest_price", "name",
-    "qty", "signal_id", "strategy", "ts_code", "updated_at", "user_id"
+    "amount", "buy_date", "can_use_qty", "cost_price", "cur_price", "highest_price",
+    "name", "open_price", "qty", "signal_id", "strategy", "ts_code", "updated_at", "user_id"
   ],
   "account_asset_keys": ["cash", "frozen_cash", "market_value", "total_asset"],
   "gateway_emitted_fields": {
@@ -29,7 +29,8 @@
     "broker": ["at", "broker", "from", "type", "user_id"]
   },
   "positions_row_emitted_fields": [
-    "amount", "cost_price", "highest_price", "name", "qty", "ts_code", "updated_at", "user_id"
+    "amount", "can_use_qty", "cost_price", "highest_price", "name", "open_price",
+    "qty", "ts_code", "updated_at", "user_id"
   ],
   "consumed_by_event": {
     "trade": ["order_id", "trade_id", "name", "code", "side", "price", "qty", "amount", "traded_at", "signal_id", "fee", "stamp_tax", "side_unverified"],

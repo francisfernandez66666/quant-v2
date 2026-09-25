@@ -123,6 +123,14 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 			sc.End = o.End
 			o.Screen = &sc
 		}
+		// §B4-PIT（owner 裁决 2026-09-26「幸存者偏差开关：开，默认打开」）：payload 不写
+		// point_in_time 键 = nil = 时点池默认生效；仅显式 false 才退回"今天在市"旧口径——
+		// 逃生门存在但必须由入队方写出来，不靠缺省漂移（缺省即裁决）。
+		// English: §B4-PIT — unset payload key keeps the owner-ruled default (PIT on); only an
+		// explicit point_in_time=false opts out.
+		if v, ok := p["point_in_time"].(bool); ok {
+			o.PointInTime = &v
+		}
 		// §P2 参数优化任务：payload kind=optimize → 全库扫参模式（网格系统自动推导）。
 		// English: kind=optimize → cross-library parameter sweep (auto-derived grid).
 		if o.Strategy == "optimize" {

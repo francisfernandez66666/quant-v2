@@ -243,7 +243,13 @@ func (f *FactorStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 // scoreRule 对单条规则打分。
 // 这是因子评分的核心函数，计算每个因子的分位数，然后加权合成复合分。
 //
-// English: scores a stock against a single rule.
+// §B3 口径标注（owner 裁决 2026-09-26「保留三套但各自标注清楚」）：本函数是**口径 C「时序分位×权重」**
+// ——实盘与回放（btreplay 经 ruleEvalAdapter 调同一 Evaluate）真正下单依据的口径：
+// 价量因子取单股自身历史时序分位（与 research/scoring 的 ScoreValue 同定义、各一份实现），
+// 财务因子取最新报告期值按绝对区间 clamp01 近似（无实时截面）。研究侧的预筛（口径 A，ic.CompositeICRange）
+// 与候选超额证据（口径 B，discover.compositeScore）都不是这套算法——三套互不等价，总述见 scoring 包头。
+// English: §B3 label — 口径 C (time-series percentile × weights), the one live/replay actually trades on;
+// not equivalent to research 口径 A (cross-sectional z) / 口径 B (raw weighted sum then z).
 func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries) *strategy.Evaluation {
 	var total, used float64
 	details := make(map[string]float64)
@@ -293,6 +299,10 @@ func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries)
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "nodata",
 			Details: details, Reasons: map[string]string{"factor": "无可用因子"}}
 	}
+	// 分值域 [50,100]（§B3 标注）：pct∈[0,1]，方向修正后每因子贡献为权重非负区间上的凸组合，
+	// total/used∈[0,1]，(total/used+1)/2×100 恒 ≥50（现库权重均非负；若将来引入负权重此域会变宽）。
+	// 后果之一：扫参门槛网格 40/45 两档对因子规则恒不过滤（哑火档），
+	// 见 btreplay/sweep.go defaultPoolConfig 的 ScoreFrom 注释。
 	score := (total/used + 1) / 2 * 100
 	if score < 0 {
 		score = 0

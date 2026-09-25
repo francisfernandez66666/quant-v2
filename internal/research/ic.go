@@ -184,6 +184,13 @@ func ICByDate(panels []*Panel, factorID string, h, minStocks int) []ICRow {
 // 再与前瞻收益做 Spearman 相关。返回逐日 IC 行（供优化器/护栏用）。
 // （CompositeIC computes per-date cross-sectional IC of a weighted factor composite
 // against forward returns; missing factor values contribute 0.）
+//
+// §B3 口径标注（owner 裁决 2026-09-26「保留三套但各自标注清楚」）：本函数是**口径 A「截面 z 后求和」**
+// ——因子发现预筛专用。它与口径 B（discover.compositeScore 原始值加权和，候选超额证据）、
+// 口径 C（scoring 包时序分位×权重，实盘/回放下单）互不等价：这里 IC 高的因子组合，
+// 不代表按实盘机制下单能复现同样排序。中文总述见 scoring 包头的 §B3 三套并存声明。
+// English: §B3 label — this is scoring-口径 A (cross-sectional z then weighted sum), used only by
+// factor-discovery pre-screening; it is NOT equivalent to the live time-series-percentile 口径 C.
 func CompositeIC(panels []*Panel, factors []string, weights map[string]float64, h, minStocks int) []ICRow {
 	return CompositeICRange(panels, factors, weights, h, minStocks, "", "")
 }
@@ -224,7 +231,7 @@ func CompositeICRange(panels []*Panel, factors []string, weights map[string]floa
 				vals[fid][p.Code] = fv[idx]
 			}
 		}
-		// 截面 z 标准化（按 factor 缓存 mean/std）
+		// 截面 z 标准化（按 factor 缓存 mean/std）——§B3 口径 A：逐因子截面 z 后 Σw·z（仅预筛）。
 		type zs struct{ mean, std float64 }
 		zstats := make(map[string]zs, len(factors))
 		for fid, m := range vals {

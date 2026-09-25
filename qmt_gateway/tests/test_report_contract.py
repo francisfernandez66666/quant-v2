@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,9 +28,35 @@ from store import Store  # noqa: E402
 import handler as handler_mod  # noqa: E402
 from handler import ReportHandler  # noqa: E402
 from gateway import Gateway  # noqa: E402
+from broker import XtBroker  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GOLDEN_PATH = os.path.join(_ROOT, "qmt_gateway", "contract", "report_fields.json")
+# §0925EVE-W2-A1（2026-09-26 批）持仓对账「真行采样」文件——本契约锁的输入源不再是手喂合成行。
+SAMPLE_PATH = os.path.join(_ROOT, "qmt_gateway", "contract", "positions_sample.json")
+
+
+def _load_positions_sample():
+    """读取真行采样（rows 至少一行）。样例形态=broker.py 真实 emit 键集，见文件 _meta 诚实口径。"""
+    with open(SAMPLE_PATH, encoding="utf-8") as f:
+        doc = json.load(f)
+    rows = doc.get("rows") or []
+    assert rows, "positions_sample.json 无样例行——契约真行采样锁禁止空输入"
+    return rows
+
+
+def _xt_broker_emit_keys():
+    """跑 XtBroker.query_positions 真实映射代码路径（假 trader 注入假持仓对象），
+    返回一行的真实 emit 键集。用于钉『样例键集 == 网关真实产出键集』——
+    旧契约测试的失守形态正是合成行与 emit 路径无关，加腿（can_use_qty）两侧都是绿。
+    """
+    b = XtBroker.__new__(XtBroker)  # 绕开真实 connect，仅走映射段（同 test_channel_position_fields 先例）
+    b._connected = True
+    b._acc = "A1"
+    pos = types.SimpleNamespace(stock_code="600000.SH", stock_name="浦发银行", volume=500,
+                                can_use_volume=300, open_price=10.6, market_value=5300.0)
+    b._trader = types.SimpleNamespace(query_stock_positions=lambda acc: [pos])
+    return set(b.query_positions()[0].keys())
 
 
 def _new_store():
@@ -163,15 +190,53 @@ class TestGatewayEmitsMatchGolden(unittest.TestCase):
         self.assertEqual(sorted(br.keys()), sorted(self.golden["gateway_emitted_fields"]["broker"]))
 
     def test_positions_row_legs(self):
-        """对账行的发出字段 ⊆ Go RealPosition 反射集（§F2 只锁了 Go 一侧，这里补发出侧）。"""
+        """§0925EVE-W2-A1 真行采样锁（改前形态：本测试手喂 7 键合成行——测的是契约文件
+        自己，网关每行实发的 can_use_qty/open_price 从未进入断言，断腿两侧全绿）。
+        改后：消费 contract/positions_sample.json 的采样真行（形态=broker.py 真实产出键集），
+        经 handler.on_positions **真实上报路径**入 outbox（该路径会为每行追加 user_id），
+        断言上线行键集合 == golden.positions_row_emitted_fields **双向等值**
+        （发出而未登记 → 红；登记而未发出 → 也红），并 ⊆ Go RealPosition 反射集。
+        English: §A1 — the positions-row contract leg now consumes the sampled real broker row
+        through the real on_positions path and asserts emitted keys == golden both ways.
+        """
         h, pushed = _capturing_handler()
-        row = {"ts_code": "600519.SH", "name": "贵州茅台", "qty": 100, "cost_price": 10.0,
-               "amount": 1000.0, "highest_price": 10.0, "updated_at": "2026-09-22T09:30:00+08:00"}
-        payload = self._emit_and_capture(h, pushed, h.on_positions, [dict(row)])
-        emitted = set(payload["positions"][0].keys())
-        self.assertEqual(emitted, set(self.golden["positions_row_emitted_fields"]))
+        rows = [dict(r) for r in _load_positions_sample()]
+        payload = self._emit_and_capture(h, pushed, h.on_positions, rows)
+        for i, row in enumerate(payload["positions"]):
+            emitted = set(row.keys())
+            self.assertEqual(
+                emitted, set(self.golden["positions_row_emitted_fields"]),
+                "第 %d 行采样上线键集与 golden 双向不等（多=%s 少=%s）——新键必须先进 golden，"
+                "登记键必须真实发出（登记但停发=假腿，同样要修）" % (
+                    i,
+                    sorted(emitted - set(self.golden["positions_row_emitted_fields"])),
+                    sorted(set(self.golden["positions_row_emitted_fields"]) - emitted)))
         self.assertTrue(emitted <= set(self.golden["positions_row_fields"]),
                         "对账行发出了 Go 不认的字段：%s" % (emitted - set(self.golden["positions_row_fields"])))
+
+    def test_positions_sample_is_broker_real_emit(self):
+        """§A1 样例合法性锁：采样文件的行键集 == XtBroker.query_positions 真实映射产出的键集
+        （行为面，非 AST 文本）。emit 路径加/删键而不同步样例 → 红；样例凭空虚增键 → 也红。
+        这条锁的存在理由：样例本身若与真实产出脱钩，采样锁会退化成又一份手喂合成行。
+        """
+        real = _xt_broker_emit_keys()
+        for i, row in enumerate(_load_positions_sample()):
+            self.assertEqual(set(row.keys()), real,
+                             "第 %d 行样例键集与 broker.py 真实 emit 键集漂移（多=%s 少=%s）" % (
+                                 i,
+                                 sorted(set(row.keys()) - real),
+                                 sorted(real - set(row.keys()))))
+
+    def test_positions_sample_golden_consistency(self):
+        """§A1 静态面：golden 登记集 == 样例键集 ∪ {user_id}（on_positions 追加腿）。
+        与动态 test_positions_row_legs 互为印证：不跑 handler 也能在纯文件面钉住漂移。
+        """
+        with open(GOLDEN_PATH, encoding="utf-8") as f:
+            golden = json.load(f)
+        for i, row in enumerate(_load_positions_sample()):
+            self.assertEqual(set(row.keys()) | {"user_id"},
+                             set(golden["positions_row_emitted_fields"]),
+                             "第 %d 行样例键集 ∪ {user_id} 与 golden 登记集不等" % i)
 
 
 class TestEveryEmittedLegIsReceived(unittest.TestCase):

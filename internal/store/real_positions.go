@@ -23,11 +23,30 @@ import (
 // RealPosition 实盘持仓行。
 // （RealPosition is one row of the live book.）
 type RealPosition struct {
-	TsCode       string  `json:"ts_code"`       // TS代码
-	Name         string  `json:"name"`          // 名称
-	Qty          int     `json:"qty"`           // 数量
-	CostPrice    float64 `json:"cost_price"`    // 成本价
-	Amount       float64 `json:"amount"`        // 成交额
+	TsCode    string  `json:"ts_code"`    // TS代码
+	Name      string  `json:"name"`       // 名称
+	Qty       int     `json:"qty"`        // 数量
+	CostPrice float64 `json:"cost_price"` // 成本价
+	Amount    float64 `json:"amount"`     // 成交额
+	// CanUseQty §0925EVE-W2-A1（2026-09-26）：柜台回报的 T+1 可卖量（网关 broker.py 每行持仓
+	// 一直携带 can_use_qty，Go 侧无此 tag → encoding/json 静默丢弃，全仓非测试代码零命中，
+	// 卖出可卖量判定只能靠本地成交推算——本批补上这条断腿）。
+	// 为什么用 *int 而不是 int/0 哨兵：0 是柜台**真值**（当日新仓全锁、可卖 0 就是 0），
+	// 而旧桥通道（qmt_bridge.py 行不含该键）与存量旧行是「没读到」——两者混成 0 会让
+	// T+1 闸把「未知」当「不可卖」误拦合法退出，或反向把真 0 当未知放行超卖。
+	// 指针天然三态：nil=未知（落库 NULL），&0=柜台真值 0。改前行为：该字段从不入账。
+	// English: §A1 — broker-side T+1 sellable qty; *int keeps "counter says 0" distinct
+	// from "channel never reported it" (NULL), which an int/0 sentinel would conflate.
+	CanUseQty *int `json:"can_use_qty,omitempty"`
+	// OpenPrice §0925EVE-W2-A1 冗余键**登记**（裁决见 qmt_gateway/contract/positions_sample.json
+	// _meta.redundant_keys）：柜台 open_price，broker.py 同值塞三路出的第三份（另两份是
+	// cost_price/highest_price，均已有真实消费链与守卫）。本批不消费、不参与任何判定，
+	// 存在的唯一理由是契约双向锁「发出集 ⊆ Go 反射集」——不接住就是静默丢腿（§M4 家族）。
+	// 为什么登记而不是清除：三通道字段集被 tests/test_channel_position_fields.py AST 锁死完全
+	// 一致，而 qmt_bridge_strategy.py/qmt_bridge.py 不在本批改动边界内，单边清除必打红对齐锁。
+	// English: §A1 — registered-only redundant key (emitted by all broker channels); kept so
+	// the two-sided contract lock has no silently-dropped leg; never read by any decision.
+	OpenPrice    float64 `json:"open_price"`    // 柜台开仓价（冗余键，仅登记契约，不消费）
 	HighestPrice float64 `json:"highest_price"` // 持仓以来最高价（加仓/格局判定用）
 	Strategy     string  `json:"strategy"`      // 战法
 	SignalID     string  `json:"signal_id"`     // 信号ID
@@ -113,6 +132,28 @@ var realTsCodeRe = regexp.MustCompile(`^[0-9]{6}\.(SH|SZ|BJ)$`)
 // the HTTP layer maps it to 400 via errors.Is.
 var ErrInvalidPositionReport = errors.New("positions 快照字段校验失败")
 
+// ensureCanUseQtyColumn §0925EVE-W2-A1：real_positions.can_use_qty 列的幂等补列（可空 INTEGER）。
+// NULL=未知（存量旧行 / 通道未携带该键），0=柜台真值 0——列级三态正是 RealPosition.CanUseQty
+// 用 *int 的落库承接面，禁止给该列加 DEFAULT 0（会把「没读到」洗成「不可卖」，误拦合法退出）。
+// 为什么惰性补列而不进 store.go 的集中迁移清单：本批改动边界钉死在 real_positions*.go
+// （并行批次活跃于同仓），沿用同包 real_account.go ensureRealAccountTable 的惰性 DDL 先例，
+// 走 hasColumn+ALTER 的既有幂等模式（PRAGMA + 条件 ALTER 均为元数据级操作，成本可忽略）。
+// English: §A1 — idempotent lazy ADD COLUMN for can_use_qty (nullable, deliberately no
+// DEFAULT 0 so NULL/unknown stays distinguishable from a genuine counter zero).
+func (d *DB) ensureCanUseQtyColumn() error {
+	has, err := d.hasColumn("real_positions", "can_use_qty")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := d.db.Exec(`ALTER TABLE real_positions ADD COLUMN can_use_qty INTEGER`); err != nil {
+		return fmt.Errorf("store migrate real_positions add can_use_qty: %w", err)
+	}
+	return nil
+}
+
 // costBasisDropped §N-6（2026-09-22 傍晚批复验，裁决 11=本地含费优先）守卫**留痕**判定：
 // 本轮对账快照的 cost_price 是否会被保护丢弃。它不参与落库——保护由 upsert 里的 CASE 完成，
 // 本函数只负责让保护不再"自身静默"（本批主题是静默失效）。两处口径必须逐项一致：
@@ -159,6 +200,10 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 		opslog.Logf("quant", "持仓对账整批拒收(§F2 字段校验)：%v", err)
 		return 0, err
 	}
+	// §A1：can_use_qty 惰性补列（幂等），旧库首次写入即建列，存量行为 NULL=未知。
+	if err := d.ensureCanUseQtyColumn(); err != nil {
+		return 0, err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
@@ -187,8 +232,8 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				p.TsCode, p.UserID, p.CostPrice, localCost)
 		}
 		_, err := tx.Exec(`INSERT INTO real_positions
-			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, can_use_qty)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				-- §M4（2026-09-22 PM 批）空名快照不得抹空已有名称：券商持仓快照常不带 name，
 				-- 旧实现 excluded.name('') 直覆盖 → 实盘持仓页只剩代码。与同语句 strategy 的
@@ -210,11 +255,16 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
 				updated_at=excluded.updated_at,
 				user_id=excluded.user_id,
+				-- §A1（20260925EVE-W2 批）柜台 T+1 可卖量：新快照携带（非 NULL）一律覆盖（柜台为
+				-- 唯一权威源，裸写与 qty 同理——本地推算不得抬高柜台口径）；未携带（旧桥通道/
+				-- 遗留行，excluded 为 NULL）保留最近一次已知值而非清空成未知——COALESCE(新,旧)。
+				-- 改前行为：该列不存在，柜台值每轮被 encoding/json 静默丢弃。
+				can_use_qty=COALESCE(excluded.can_use_qty, real_positions.can_use_qty),
 				-- signal_id 有意不出现在 SET 列表：本入口无归因来源时保持旧值（与
 				-- ReconcilePositionsForUser 的 COALESCE 非空才覆盖等效，见 §N-6 同族裸写盘点）。
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
-			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
+			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty)
 		if err != nil {
 			return 0, fmt.Errorf("upsert real position %s: %w", p.TsCode, err)
 		}
@@ -310,6 +360,11 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 		opslog.Logf("quant", "持仓对账整批拒收(§F2 字段校验) 用户=%s：%v", userID, err)
 		return 0, err
 	}
+	// §A1：can_use_qty 惰性补列（幂等）——生产主路径（Controller.Reconcile / handleQMTReport
+	// 的 positions 事件）都经此函数，列在此确保后读取侧无需再兜。
+	if err := d.ensureCanUseQtyColumn(); err != nil {
+		return 0, err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
@@ -346,8 +401,8 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 			})
 		}
 		_, err := tx.Exec(`INSERT INTO real_positions
-			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, can_use_qty)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				-- §M4（2026-09-22 PM 批）与 UpsertRealPositions 同口径：空名快照不抹空已有名称。
 				name=COALESCE(NULLIF(excluded.name,''), real_positions.name),
@@ -377,12 +432,18 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
 				signal_id=COALESCE(NULLIF(excluded.signal_id,''), real_positions.signal_id),
 				updated_at=excluded.updated_at, user_id=excluded.user_id,
+				-- §A1（20260925EVE-W2 批）柜台 T+1 可卖量落库（生产对账主路径）：
+				-- 携带即覆盖——can_use_qty 只有柜台知道，本地无权改写（成交回报路径刻意不动该列，
+				-- 理由见 RealPosition.CanUseQty 注释：不模拟柜台口径正是本缺陷的成因）；
+				-- 未携带（excluded 为 NULL，如旧桥通道 qmt_bridge.py 的 7 键行）保留最近一次
+				-- 已知值而非清成未知——COALESCE(新,旧)。改前行为：该列不存在，柜台值整体丢失。
+				can_use_qty=COALESCE(excluded.can_use_qty, real_positions.can_use_qty),
 				-- §M5 只增锚 → §N-7 起本地锚点会由 RaiseRealPositionHigh 持续抬高：这里
 				-- max(本地, 快照) 的只增语义保证快照 open_price（券商口径=开仓价）绝不会把
 				-- 已回写的期间最高价拉回，两条写路径（对账 upsert / 锚点 UPDATE）因此互不覆盖。
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
-			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
+			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty)
 		if err != nil {
 			return 0, fmt.Errorf("reconcile real position %s: %w", p.TsCode, err)
 		}
@@ -430,10 +491,14 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 }
 
 // RealPositions 返回全部实盘持仓（含成本/最高价），供决策层读取。
+// §A1（20260925EVE-W2）：补读 can_use_qty（NULL→CanUseQty=nil=未知），四个持仓读取口同步。
 // （RealPositions returns every live position for the decision layer.）
 func (d *DB) RealPositions() ([]RealPosition, error) {
+	if err := d.ensureCanUseQtyColumn(); err != nil {
+		return nil, err
+	}
 	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions ORDER BY ts_code`)
+		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty FROM real_positions ORDER BY ts_code`)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +507,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 	for rows.Next() {
 		var p RealPosition
 		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID); err != nil {
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -451,10 +516,14 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 }
 
 // RealPositionsForUser §GAP1.10 按账号过滤实盘持仓：返回 user_id 匹配或遗留全局行（user_id=”）。
+// §A1（20260925EVE-W2）：补读 can_use_qty（NULL=nil=未知）。
 // English: §GAP1.10 — positions owned by the account plus legacy global (empty user_id) rows.
 func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
+	if err := d.ensureCanUseQtyColumn(); err != nil {
+		return nil, err
+	}
 	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,'') FROM real_positions
+		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,''), can_use_qty FROM real_positions
 		WHERE user_id = '' OR user_id = ? ORDER BY ts_code`, userID)
 	if err != nil {
 		return nil, err
@@ -464,7 +533,7 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 	for rows.Next() {
 		var p RealPosition
 		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate); err != nil {
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate, &p.CanUseQty); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -474,25 +543,34 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 
 // RealPositionByCode 返回单只实盘持仓（不存在返回 sql.ErrNoRows）。
 // ⚠️ 多账号部署下应使用 RealPositionByCodeForUser；本函数保留以兼容遗留单租户调用。
+// §A1（20260925EVE-W2）：补读 can_use_qty（NULL=nil=未知）。
 // （RealPositionByCode returns one live position, sql.ErrNoRows when absent.）
 func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 	var p RealPosition
+	if err := d.ensureCanUseQtyColumn(); err != nil {
+		return p, err
+	}
 	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions WHERE ts_code=?`, code).
+		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty FROM real_positions WHERE ts_code=?`, code).
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty)
 	return p, err
 }
 
 // RealPositionByCodeForUser §P0-3 按账号返回单只实盘持仓；遗留全局行（user_id=”）对查询账号可见。
+// §A1（20260925EVE-W2）：补读 can_use_qty——本函数是风控闸 checkT1Sellable 的持仓取数口，
+// 柜台 T+1 可卖量自本批起进入卖出判定（改前：CanUseQty 恒 nil，判定全靠本地推算）。
 // English: user-scoped single position lookup; legacy global rows are visible to any caller.
 func (d *DB) RealPositionByCodeForUser(userID, code string) (RealPosition, error) {
 	var p RealPosition
+	if err := d.ensureCanUseQtyColumn(); err != nil {
+		return p, err
+	}
 	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions
+		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty FROM real_positions
 		WHERE ts_code=? AND (user_id = '' OR user_id = ?)`, code, userID).
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty)
 	return p, err
 }
 
@@ -541,6 +619,9 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 				amountWithFee = f.Price*float64(f.Qty) + f.Fee
 				buyCostPerShare = amountWithFee / float64(f.Qty)
 			}
+			// §A1（20260925EVE-W2）：成交回报路径**刻意不写 can_use_qty**——柜台可卖量的唯一权威
+			// 源是对账快照（下一轮 reconcile 落值），本地无权模拟柜台 T+1/冻结口径（"全靠本地
+			// 成交推算"正是本缺陷成因）。此处建行缺列= NULL=未知，闸自动退回本地推算，不误拦。
 			_, err = tx.Exec(`INSERT INTO real_positions
 				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

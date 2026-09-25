@@ -409,7 +409,9 @@ func reverseExtension(panels []*Panel, factors []string, dirs map[string]int, we
 		if len(day) < opts.MinStocks {
 			continue
 		}
-		// 截面 z 标准化（与 CompositeIC 同口径）：z = (sc - mean) / std
+		// 截面 z 标准化：z = (sc - mean) / std。
+		// §B3 订正：旧注释写「与 CompositeIC 同口径」并不准确——这里 z 的是**原始值加权和之后的复合分**
+		// （口径 B），CompositeIC z 的是**逐因子原始值再求和**（口径 A），二者排序不等价。
 		var sum, sum2 float64
 		for _, v := range day {
 			sum += v.sc
@@ -483,6 +485,13 @@ func varianceOf(xs []float64, mean float64) float64 {
 
 // compositeScore 计算单只股票在某日的加权复合分（含方向）。
 // English: computes one stock's weighted composite score on a date (direction applied).
+//
+// §B3 口径标注（owner 裁决 2026-09-26「保留三套但各自标注清楚」）：本函数是**口径 B「原始值加权和、
+// 复合分再截面 z」**——因子值本身不归一，直接 Σ dir·w·v（量纲随因子原始值），随后在调用方
+// （reverseExtension 一线）对当日全体复合分做截面 z、取 Top1/5 与其余的前瞻收益差算超额证据。
+// 这与口径 A（ic.CompositeICRange 逐因子截面 z 后求和）和口径 C（实盘/回放时序分位×权重）都不同：
+// 候选审批页看到的"超额收益"量的是 B 规则的组合，下单执行的是 C 规则，两者不保证同序。
+// 统一会改写历史候选证据，故只标注不改（三套并存总述见 scoring 包头）。
 func compositeScore(p *Panel, factors []string, dirs map[string]int, weights map[string]float64, d string) float64 {
 	idx, ok := p.DateIdx[d]
 	if !ok {

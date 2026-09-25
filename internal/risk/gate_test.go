@@ -41,12 +41,17 @@ func qmtCfg() config.QMTConfig {
 	return c
 }
 
-// TestGateDefaultsAllOff 零配置：所有闸关闭，任意下单放行。
+// TestGateDefaultsAllOff 零配置：除 §A5 常开的跌停追卖闸外其余闸关闭；买单与"无昨收卖单"放行
+// （常开闸对缺数据的单 fail-open，不改变本用例的放行结论，详见 TestGateLimitDownAlwaysOn）。
 func TestGateDefaultsAllOff(t *testing.T) {
 	g := NewGate(gateDB(t), "u_g", nil)
 	v := g.CheckLiveOrder(qmtCfg(), liveOrder(SideBuy))
 	if !v.Pass {
 		t.Fatalf("零配置应全放行, got %+v", v)
+	}
+	// 零配置卖单（夹具 PrevClose=0 未知昨收）：常开闸 fail-open，仍放行
+	if v := g.CheckLiveOrder(qmtCfg(), liveOrder(SideSell)); !v.Pass {
+		t.Fatalf("零配置无昨收卖单应 fail-open 放行, got %+v", v)
 	}
 }
 
@@ -158,7 +163,7 @@ func TestGateLimitUpDown(t *testing.T) {
 	g := NewGate(gateDB(t), "u_g", nil)
 	cfg := qmtCfg()
 	cfg.RiskGate.LimitUpBlockBuy = true
-	cfg.RiskGate.LimitDownBlockSell = true
+	cfg.RiskGate.LimitDownBlockSell = boolPtr(true)
 	// 主板 600000，昨收 10，涨停 10.99（9.9%）；买价 11 ≥ 涨停 → 拦截
 	o := liveOrder(SideBuy)
 	o.PrevClose = 10
@@ -192,6 +197,44 @@ func TestGateLimitUpDown(t *testing.T) {
 	o.Price = 11
 	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
 		t.Fatalf("无昨收应 fail-open, got %+v", v)
+	}
+}
+
+// TestGateLimitDownAlwaysOn §A5-常开（owner 裁决 2026-09-26「跌停追卖闸是否常开：是」）：
+// 零配置（未写 limit_down_block_sell）时本闸必须直接生效——旧语义"默认关、等谁去开"不再成立。
+// 三条断言：① 零配置跌停追卖被拒；② 显式 false 可关（回滚通道保留）；③ 无昨收仍 fail-open
+// （数据缺口不误拦，与开关形态无关）。
+// English: §A5-always-on — with the key unset the limit-down sell block must bite; explicit false
+// still opts out; unknown prevClose still fails open.
+func TestGateLimitDownAlwaysOn(t *testing.T) {
+	g := NewGate(gateDB(t), "u_g", nil)
+	cfg := qmtCfg() // 零配置：LimitDownBlockSell == nil → 常开
+	// ① 主板 600000 昨收 10，跌停 9.00；卖价 9 ≤ 跌停 → 未配置任何开关也应拦截
+	o := liveOrder(SideSell)
+	o.PrevClose = 10
+	o.Price = 9
+	v := g.CheckLiveOrder(cfg, o)
+	if v.Pass {
+		t.Fatalf("§A5 零配置下跌停追卖必须被拒（常开），got %+v", v)
+	}
+	if !strings.Contains(v.Reason, "跌停") {
+		t.Fatalf("拒单原因须落在跌停闸本体（而非别的闸顺带命中）, got %q", v.Reason)
+	}
+	// ② 显式 false 关闭：同场景应放行（回滚通道）
+	cfg.RiskGate.LimitDownBlockSell = boolPtr(false)
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("显式关闭后应放行, got %+v", v)
+	}
+	// ③ 恢复常开 + 无昨收：fail-open 语义不受开关形态影响
+	cfg.RiskGate.LimitDownBlockSell = nil
+	o2 := liveOrder(SideSell)
+	o2.Price = 9 // PrevClose=0（未知）
+	if v := g.CheckLiveOrder(cfg, o2); !v.Pass {
+		t.Fatalf("无昨收应 fail-open 放行, got %+v", v)
+	}
+	// ④ AnyEnabled 短路位：零配置也应报"至少一道闸开"（常开闸的诚实展示）
+	if !(config.RiskGateConfig{}).AnyEnabled() {
+		t.Fatal("§A5 常开后零配置 AnyEnabled 应为 true（展示生效值）")
 	}
 }
 
@@ -645,5 +688,120 @@ func TestGateT1SellableUsesNetOpenSellQty(t *testing.T) {
 	o4.Qty = 1100
 	if v := g.CheckLiveOrder(cfg, o4); v.Pass {
 		t.Fatalf("持仓仅 1000，卖 1100 应被拦, got %+v", v)
+	}
+}
+
+// intPtr 取 int 地址（§A1 夹具：CanUseQty 三态里的"柜台真值"分支）。
+func intPtr(v int) *int { return &v }
+
+// TestGateT1SellableCounterPriority §0925EVE-W2-A1（2026-09-26 批）判定改口径回归：
+// 柜台 can_use_qty 优先（收紧方向绝不放行更多卖出），本地推算作交叉告警，读不到退回本地。
+// 表驱动逐案钉死四态：
+//
+//	① 柜台更小（qty 300 / can_use 100，无当日买入、无在途）：改前可卖 300 放行 150，
+//	  改后拦 150 放 100 —— 资损方向（柜台说可卖更少）一律以柜台为准；
+//	② 交叉偏差告警：①场景偏差 200 > 阈值 max(100, 300×2%)=100 → warn 告警不静默；
+//	③ 柜台更大（can_use 1000 > 本地 300）：不得放行更多（min 封顶，本地在途扣减腿
+//	  在快照窗口内不可替代，§UAT-D4 语义保留），但偏差告警同样要响；
+//	④ 柜台读不到（CanUseQty=nil，桥通道旧行/成交回报建行）：现行为原样保留（回归到
+//	  TestGateT1Sellable / TestGateT1SellableCountsOpenSells 已覆盖，此处只钉"无告警"）；
+//	⑤ 柜台真值 0：任何卖单都拦——0 是可卖量真值，不是"没读到"。
+//	⑥ 柜台可读 + 在途卖单：sellable=min(counter, qty−bought−openSell)，在途腿不因柜台
+//	  优先而丢失（快照先于本单受理，柜台值对窗口内新单不可见）。
+//
+// English: §A1 — counter can_use_qty tightens the sellable estimate (never loosens it),
+// deviations beyond max(100, 2%) raise warn alerts, absent counter values keep legacy behavior.
+func TestGateT1SellableCounterPriority(t *testing.T) {
+	db := gateDB(t)
+	var alerts []string
+	g := NewGate(db, "u_g", func(level, title, content string) {
+		alerts = append(alerts, level+"|"+title+"|"+content)
+	})
+	cfg := qmtCfg() // EnforceT1 默认开
+	today := cntime.In(time.Now()).Format("2006-01-02")
+
+	seed := func(code string, qty, canUse int, withCounter bool) {
+		p := store.RealPosition{TsCode: code, Name: "浦发", Qty: qty, CostPrice: 10, Amount: float64(qty) * 10, HighestPrice: 10}
+		if withCounter {
+			c := canUse
+			p.CanUseQty = &c
+		}
+		if _, err := db.ReconcilePositionsForUser("u_g", []store.RealPosition{p}); err != nil {
+			t.Fatalf("seed position: %v", err)
+		}
+	}
+
+	// ①+② 柜台更小：150 拦、100 放，且偏差告警响。
+	seed("600000.SH", 300, 100, true)
+	o := liveOrder(SideSell)
+	o.Qty = 150
+	if v := g.CheckLiveOrder(cfg, o); v.Pass {
+		t.Fatalf("① 柜台可卖 100 < 请求 150 必须拦（资损方向）, got %+v", v)
+	} else if !strings.Contains(v.Reason, "柜台 can_use_qty=100") {
+		// 拒单文案必须标注口径来源（柜台优先还是本地推算）——排障时第一眼要能分辨。
+		t.Fatalf("① 拒单理由应含柜台口径标注, got %q", v.Reason)
+	}
+	o2 := liveOrder(SideSell)
+	o2.Qty = 100
+	if v := g.CheckLiveOrder(cfg, o2); !v.Pass {
+		t.Fatalf("① 恰好可卖 100 应放行, got %+v", v)
+	}
+	if len(alerts) == 0 {
+		t.Fatalf("② 偏差 200 > 阈值 100 必须告警（不静默）")
+	}
+	if !strings.Contains(alerts[0], "warn|T+1 可卖量交叉偏差") {
+		t.Fatalf("② 告警应为 warn 级交叉偏差, got %q", alerts[0])
+	}
+
+	// ③ 柜台更大：本地推算封顶，但告警照响（两本账互相守望）。
+	alerts = nil
+	seed("600000.SH", 300, 1000, true)
+	o3 := liveOrder(SideSell)
+	o3.Qty = 400
+	if v := g.CheckLiveOrder(cfg, o3); v.Pass {
+		t.Fatalf("③ 本地推算 300 封顶，柜台乐观不得放大卖出权限, got %+v", v)
+	}
+	o3b := liveOrder(SideSell)
+	o3b.Qty = 300
+	if v := g.CheckLiveOrder(cfg, o3b); !v.Pass {
+		t.Fatalf("③ 卖 300（本地=柜台扣在途前口径内）应放行, got %+v", v)
+	}
+	if len(alerts) == 0 || !strings.Contains(alerts[0], "交叉偏差") {
+		t.Fatalf("③ 柜台>本地 同样要触发交叉告警, got %v", alerts)
+	}
+
+	// ④ 柜台读不到（CanUseQty=nil）：退回本地推算，零告警（现行为保留）。
+	// 用另一代码 600001.SH 建行——600000 行已带柜台值且 upsert 的 COALESCE 会保留
+	// 最近一次已知值（store 测试②已钉该语义），无法在此造出"从没读到"态。
+	alerts = nil
+	seed("600001.SH", 300, 0, false)
+	o4 := liveOrder(SideSell)
+	o4.Code = "600001.SH"
+	o4.Qty = 300
+	if v := g.CheckLiveOrder(cfg, o4); !v.Pass {
+		t.Fatalf("④ 无柜台值时应按本地推算放行 300, got %+v", v)
+	}
+	if len(alerts) != 0 {
+		t.Fatalf("④ 无柜台值不得发交叉告警, got %v", alerts)
+	}
+
+	// ⑤ 柜台真值 0：与"没读到"两态分家——0 一律拦。
+	seed("600000.SH", 300, 0, true)
+	o5 := liveOrder(SideSell)
+	o5.Qty = 100
+	if v := g.CheckLiveOrder(cfg, o5); v.Pass {
+		t.Fatalf("⑤ 柜台可卖 0（真值）必须拦, got %+v", v)
+	}
+
+	// ⑥ 柜台可读 + 当日在途卖单：在途扣减腿保留（§UAT-D4）。
+	seed("600000.SH", 300, 300, true)
+	if _, err := db.UpsertRealOrder(store.RealOrder{OrderID: "OS9", SignalID: "SS9", Code: "600000.SH",
+		Side: "卖出", Status: "已报", Price: 10, Qty: 200, CreatedAt: today + "T10:00:00+08:00", UserID: "u_g"}); err != nil {
+		t.Fatalf("seed open sell: %v", err)
+	}
+	o6 := liveOrder(SideSell)
+	o6.Qty = 150
+	if v := g.CheckLiveOrder(cfg, o6); v.Pass {
+		t.Fatalf("⑥ 在途 200 占额度后可卖仅 100，150 必须拦, got %+v", v)
 	}
 }

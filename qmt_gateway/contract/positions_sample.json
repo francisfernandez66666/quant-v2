@@ -1,0 +1,23 @@
+{
+  "_meta": {
+    "section": "§0925EVE-W2-A1（2026-09-26 批）持仓对账「真行采样」——契约测试的输入源",
+    "purpose": "Python 契约测试（tests/test_report_contract.py）消费本文件的样例行，断言经 handler.on_positions 真实上报路径落到 outbox 的行键集合 == golden positions_row_emitted_fields（双向等值）。旧契约测试手喂合成行，测的是契约文件本身而不是柜台真实产出——can_use_qty 断腿（网关每行都发、golden 未登记、Go 无 tag 静默丢弃）就此逃逸。采样锁 + 同文件内的『样例==broker.py 真实映射产出』行为锁，让 emit 侧、样例、golden 三者互相钉死。",
+    "form": "形态=broker.py XtBroker.query_positions 真实产出键集（§M5 字段对齐映射路径逐键构造）；上报入信封时 handler.on_positions 会为每行追加 user_id 一键（golden 登记集含该键，故登记集 = 本样例键集 ∪ {user_id}）。",
+    "provenance": "诚实口径：本机没有生产网关可跑，rows[0] 的**值**按 emit 代码路径逐键构造（键不多不少、类型与 int()/float() 产出一致）；**首条真行须在广州生产机采样后替换 rows[0]**（来源：网关 /state positions 或 outbox positions 事件 dump），键集合不得随替换改变——变了即说明 emit 路径漂移，契约测试会红，按 §A1 流程同步 golden。",
+    "redundant_keys": "裁决=登记（不清除）。理由：① broker.py 与 qmt_bridge_strategy.py 的三处持仓映射（xt 直连 query / 策略桥 query / 策略桥 embed）被 tests/test_channel_position_fields.py 用 AST 锁死键集完全一致，且 qmt_bridge_strategy.py / qmt_bridge.py 不在本批改动边界内——broker.py 单边删 open_price 必打红对齐锁；② open_price/cost_price/highest_price 是柜台 open_price 的一源三路（§M5 通道对齐遗留），后两者已有真实消费链（§N-6 成本守卫 / §M5 只增锚），只有 open_price 键无消费者——故 Go 侧 RealPosition 本批以 OpenPrice 字段**登记接住**（不参与任何判定），杜绝『发出集 ⊆ Go 反射集』锁上的静默丢腿（§M4 家族）。can_use_qty 为新消费腿：store.RealPosition.CanUseQty(*int, NULL=未知) 落库，risk.checkT1Sellable 柜台值优先判定。",
+    "updated": "2026-09-26"
+  },
+  "rows": [
+    {
+      "ts_code": "600000.SH",
+      "name": "浦发银行",
+      "qty": 500,
+      "can_use_qty": 300,
+      "open_price": 10.6,
+      "cost_price": 10.6,
+      "amount": 5300.0,
+      "highest_price": 10.6,
+      "updated_at": "2026-09-26T09:31:02+08:00"
+    }
+  ]
+}

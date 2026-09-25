@@ -14,15 +14,27 @@
 #   读法必须是注册表直读，绝不解析 nssm 的控制台文本——UTF-16+OEM 解码会劈碎每个字符）。
 # 默认 dry-run：不带 -Apply 时只读不写、打印指纹计划。含中文注释 ⇒ 文件必须带单个 UTF-8 BOM
 #   （部署链 ps1_bom 归一；仓库侧同规）。
+#
+# §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯「自证通过≠吃到」修复）：
+#   ① 已收编进 service_definitions.ps1 的定义：$GatewayDir 缺省（现网网关目录）、config.xt.json
+#      路径（网关进程 token 的真源）、nssm.exe 候选位、计划任务名（重启指引）；param 字面量
+#      保留为定义文件缺失时的回退。
+#   ② 写侧②（quant 服务 AppEnvironmentExtra）如实降级为**冗余腿**：网关进程由交互会话
+#      计划任务拉起，不继承 NSSM 服务的 AppEnvironmentExtra；gateway.py :186/:199 的 env 覆盖
+#      读的是网关**自己进程**的环境变量。全仓 grep 证实 Go 侧（quant.exe）从不消费
+#      QUANT_GATEWAY_TOKEN。旧版的"写后读回自证"回读的正是自己写进去的地方 ⇒ 证明不了网关
+#      吃到了什么。写侧照旧保留（防"网关改由带 env 的会话拉起"这一形态回归时缺腿），
+#      但自证移到 §C7-OPS 的 4b 段：直读网关进程真正会读的文件 + 进程启动时间链。
 # 用法（管理员 PowerShell，现网路径）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1            # 预演
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Apply     # 真写
 param(
-    [string]$GatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway",
+    [string]$GatewayDir = "",        # 留空取 §C7 单源 $SvcGatewayDir（缺失回退 C:\qmt\quant-trading-v2\qmt_gateway）
     [string]$ConfigFile = "",        # 留空取 <GatewayDir>\config.xt.json
-    # 携带 QUANT_GATEWAY_TOKEN 的 NSSM 服务（现网=quant；若日后挪到别的服务用 -ServiceName 指过去）。
-    [string]$ServiceName = "quant",
-    [string]$DataDir = "C:\var\lib\quant-trading-v2",   # 只读：报引擎侧现值指纹，供人工步对照
+    # 携带 QUANT_GATEWAY_TOKEN 的 NSSM 服务（现网=quant；§C7-OPS②：这条腿对网关进程只是冗余，
+    # 保留是为兼容"网关 env 由该服务会话继承"的假设形态；若日后挪到别的服务用 -ServiceName 指过去）。
+    [string]$ServiceName = "",       # 留空取 §C7 单源 $SvcNameQuant
+    [string]$DataDir = "",           # 只读：报引擎侧现值指纹，供人工步对照（留空取单源 $SvcDataDir）
     [switch]$DryRun,
     [switch]$Apply
 )
@@ -30,6 +42,7 @@ $ErrorActionPreference = "Stop"
 
 function Info($m) { Write-Host "[rot] $m" }
 function Ok($m)   { Write-Host "[ ok ] $m" }
+function Warn($m) { Write-Host "[warn] $m" }
 function Die($m)  { Write-Host "[fail] $m"; exit 1 }
 # Invoke-Native：$ErrorActionPreference='Stop' 下原生命令的每一行 stderr 都会被 PS5.1 升级为
 # 终止错误（backup_snapshot.ps1 同族教训），nssm 恰好爱往 stderr 写提示 ⇒ 必须包这一层、只信退出码。
@@ -53,14 +66,35 @@ function FpLabel([string]$v) { if (-not "$v") { return "-" }; return "sha256:" +
 if ($Apply -and $DryRun) { Die "-DryRun 与 -Apply 互斥" }
 if (-not $Apply) { $DryRun = $true }   # 缺省即 dry-run（写操作必须显式 -Apply）
 
+# ── §C7-OPS：服务/任务定义单源（网关目录、config.xt.json 真源路径、nssm 候选位、重启任务名）──
+# 缺失时回退本脚本旧字面量并告警（轮换步是运维动作，不因缺配置文件而无法自救；
+# 但 4b 自证段读文件走注册表/文件直读口径，与单源在位与否无关）。
+$svcDefs = $null
+foreach ($cand in @((Join-Path $PSScriptRoot "service_definitions.ps1"),
+                    "C:\opt\quant\qmt-win\service_definitions.ps1")) {
+    if (Test-Path $cand) { . $cand; $svcDefs = $cand; break }
+}
+if (-not $svcDefs) {
+    Warn "service_definitions.ps1 未找到 —— 网关目录/服务名/nssm 位回退本脚本字面量（§C7 单径脱钩，请补齐部署清单）"
+    $SvcGatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway"
+    $SvcNameQuant  = "quant"
+    $SvcDataDir    = "C:\var\lib\quant-trading-v2"
+    $SvcTaskGatewayEnsure = "QMT-Gateway-Ensure"
+    $SvcNssmCandidates = @(
+        "C:\opt\quant\qmt-win\tools\nssm-2.24\win64\nssm.exe",
+        "C:\opt\quant\deploy\qmt-win\tools\nssm-2.24\win64\nssm.exe",
+        "C:\opt\quant\tools\nssm-2.24\win64\nssm.exe"
+    )
+}
+if (-not $GatewayDir) { $GatewayDir = $SvcGatewayDir }
+if (-not $ServiceName) { $ServiceName = $SvcNameQuant }
+if (-not $DataDir) { $DataDir = $SvcDataDir }
+
 if (-not $ConfigFile) { $ConfigFile = Join-Path $GatewayDir "config.xt.json" }
 if (-not (Test-Path $ConfigFile)) { Die "网关配置不存在: $ConfigFile" }
-$nssmCandidates = @(
-    "C:\opt\quant\qmt-win\tools\nssm-2.24\win64\nssm.exe",
-    "C:\opt\quant\deploy\qmt-win\tools\nssm-2.24\win64\nssm.exe",
-    "C:\opt\quant\tools\nssm-2.24\win64\nssm.exe"
-)
-$nssm = $nssmCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+# nssm 候选位来自 §C7 单源（缺失回退块里已复刻同一张表）；解析不到仍判死——
+# env 并集写入没有 nssm 就完不成，禁止裸写 AppEnvironmentExtra。
+$nssm = $SvcNssmCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $nssm) { Die "nssm.exe 不在位（并集写入无法完成，禁止裸写 AppEnvironmentExtra）" }
 if ($Apply) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -72,7 +106,9 @@ if ($Apply) {
 
 # ── 1. 读四源现值指纹（只读；写侧只动 1/2）────────────────────────────────
 $cfg = $null
-try { $cfg = Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json } catch { Die ("config.xt.json 解析失败: " + $_.Exception.Message) }
+# -Encoding UTF8：与 verify 第 20 探针 §TOKEN-BLIND 同口径（无 BOM UTF-8 文件在 PS5.1 缺省
+# GBK 解码会吞引号 ⇒ ConvertFrom-Json 炸 ⇒ 轮换前的现值指纹误读）。
+try { $cfg = Get-Content -Path $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("config.xt.json 解析失败: " + $_.Exception.Message) }
 if ($null -eq $cfg) { Die "config.xt.json 内容为空" }
 Info ("src1 config_file   token=" + (FpLabel([string]$cfg.token)) + " report_token=" + (FpLabel([string]$cfg.report_token)))
 
@@ -111,7 +147,10 @@ function Get-EnvVal([string[]]$pairs, [string]$key) {
 $envPairs = @(Get-ExistingEnvExtra $ServiceName)
 $envToken = Get-EnvVal $envPairs "QUANT_GATEWAY_TOKEN"
 $envReport = Get-EnvVal $envPairs "QUANT_GATEWAY_REPORT_TOKEN"
-$envState = if ($envToken) { "set" } else { "unset(gateway 用文件值)" }
+# §C7-OPS②：如实标注——这条 env 腿对网关进程只是冗余。网关由交互会话计划任务拉起，
+# 不继承 $ServiceName（NSSM 服务）的 AppEnvironmentExtra；quant.exe（Go 侧）全仓 grep
+# 从不消费 QUANT_GATEWAY_TOKEN。gateway.py 的 env 覆盖只认网关自己进程的环境变量。
+$envState = if ($envToken) { "set(对网关=冗余腿，仅该服务自己的进程可见)" } else { "unset(gateway 用文件值)" }
 Info ("src2 svc_env(" + $ServiceName + ") QUANT_GATEWAY_TOKEN=" + (FpLabel $envToken) + " (" + $envState + ") report=" + (FpLabel $envReport) + " read=registry-or-nssm keys=" + $envPairs.Count)
 
 $engToken = ""
@@ -194,16 +233,60 @@ function Set-ServiceEnvExtra([string]$svc, [string[]]$desired) {
 Set-ServiceEnvExtra $ServiceName @("QUANT_GATEWAY_TOKEN=$newToken", "QUANT_GATEWAY_REPORT_TOKEN=$newToken")
 
 # 写后读回自证（同一注册表口径；只比指纹，不比明文、不打明文）。
+# ⚠ §C7-OPS：这只是**冗余腿自身**的写入确认（回读＝自己刚写的地方，证明不了网关吃到）——
+#   网关侧的自证在下面的 4b 段，以 4b 为准。
 $readBack = Get-EnvVal (@(Get-ExistingEnvExtra $ServiceName)) "QUANT_GATEWAY_TOKEN"
 if ((FpLabel $readBack) -ne $newFp) { Die "read-back mismatch: service env 未确认写入（检查 nssm/HKLM 权限）" }
 Ok "read-back confirmed via registry (fingerprint match only, value never printed)"
+
+# ── 4b. §C7-OPS「网关进程实际吃到的值」回读自证（FIX_PLAN_20260925EVE ⑯ 修法主体）────────
+# 旧版只回读自己刚写进 quant 服务 env 的键 ⇒ 那是"自证通过≠吃到"的源头：网关进程真正的
+# 取值链是 交互任务拉起 → gateway.py -c config.xt.json →（自身进程 env 有值才覆盖，否则用文件值）。
+# 所以自证读两级，全部走**运行时真实取值链直读**（文件直读，绝不解析控制台文本——
+# Out-String 120 列折行吞键是 §N-5 锤过的同族坑）：
+#   (a) config.xt.json 落盘值（网关 token 的真源，$SvcGatewayConfigFile 同源）；
+#   (b) 在跑网关进程的启动时刻 vs 配置文件写入时刻（旧进程必然还拿着旧 token）。
+# 任何路径不回显明文，只比 sha256 前 8 位指纹。
+$cfgNow = $null
+try {
+    # -Encoding UTF8 必带：这份文件由 ensure_gateway_config.ps1 以**无 BOM UTF-8** 落盘，
+    # PS 5.1 缺省按 GBK 解会把中文字段尾后的引号吞掉 ⇒ ConvertFrom-Json 炸 ⇒ 假"读不到"
+    # （verify 第 20 探针 §TOKEN-BLIND 的实录教训，读法必须与其对齐）。
+    $cfgNow = Get-Content -Path $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch { Die ("§C7 自证失败：写后重读 " + $ConfigFile + " 解析失败（检查文件是否被并发写坏；回滚副本: " + $bakPath + "）: " + $_.Exception.Message) }
+$fileTokFp = FpLabel([string]$cfgNow.token)
+$fileRepFp = FpLabel([string]$cfgNow.report_token)
+if ($fileTokFp -ne $newFp) { Die ("§C7 自证失败：config.xt.json 的 token 指纹 " + $fileTokFp + " != 新值指纹 " + $newFp + "（写侧①被回滚/并发改写？备份在 " + $bakPath + "）") }
+Ok ("§C7 self-check(a) gateway file source CONFIRMED: " + $ConfigFile + " token_fp=" + $fileTokFp + " report_token_fp=" + $fileRepFp)
+if ($fileRepFp -ne $newFp) {
+    Warn ("§C7 自证告警：report_token 指纹 " + $fileRepFp + " != 新值 " + $newFp + " —— 回报腿不会被网关吃到，检查写侧①（本脚本 token/report 应同值）")
+}
+# (b) 网关进程取值链回读：进程比配置文件旧 ⇒ 它内存里必然是旧 token。
+$gwProcState = "not-running"
+try {
+    foreach ($pr in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction Stop)) {
+        $cl = [string]$pr.CommandLine
+        if ($cl -like '*gateway.py*' -and $cl -like '*qmt_gateway*') {
+            $pStart = $pr.ConvertToDateTime($pr.CreationDate)
+            $cfgWri = (Get-Item -LiteralPath $ConfigFile).LastWriteTime
+            $gwProcState = if ($pStart -lt $cfgWri) { "stale(old token in memory)" } else { "restarted(file value in effect)" }
+            break
+        }
+    }
+} catch { $gwProcState = "proc-read-failed" }
+Info ("§C7 self-check(b) gateway process: " + $gwProcState + " (判据=进程启动时刻 vs " + (Split-Path -Leaf $ConfigFile) + " 写入时刻，纯直读)")
+Info ("§C7 env-leg note: 写侧②(服务 " + $ServiceName + " AppEnvironmentExtra) 对网关进程只是冗余——网关经交互任务 " + $SvcTaskGatewayEnsure + " 拉起，不继承该服务 env；quant.exe 也不消费该键。保留它仅为兼容假定的 env 覆盖形态，自证以 (a)(b) 为准。")
+if ($gwProcState -ne "restarted(file value in effect)") {
+    Warn "§C7 网关进程尚未吃到新值——需要重启/重连：& '$PSScriptRoot\restart_gateway.ps1' 杀掉旧进程，再由单径交互任务拉起（schtasks /Change /TN $SvcTaskGatewayEnsure /Enable ; schtasks /Run /TN $SvcTaskGatewayEnsure）"
+    Warn "§C7 重启后复验：重跑本脚本（dry-run 即可）看 src1 与 self-check(b) 是否为 restarted；最终复核＝verify_deploy_guangzhou.sh 第 20 探针 token_fp_agree"
+}
 
 # ── 5. 人工步清单（本脚本刻意不自动写：3 的权威源是设置页、4 在桥的启动命令里）──────────
 Write-Host ""
 Info "remaining manual steps (both must move to the SAME new token before the next report/order):"
 Info "  [1] web 设置页 -> QMT 配置 rules.qmt.token 改为新 token（权威写入方是设置页，勿手改 config.json）"
 Info "  [2] qmt_bridge.py 启动参数 --token 改新值（或同目录 config.bridge.json）并重启桥"
-Info "  [3] 重启网关进程载入新 config/env（等 QMT-Gateway-Ensure 拉起，或 restart_gateway.ps1）"
+Info "  [3] 重启网关进程载入新 config（§C7 单径：restart_gateway.ps1 杀旧进程 → 交互任务 $SvcTaskGatewayEnsure 拉起；env 腿对网关是冗余，别指望重启服务）"
 Info "  [4] 复核：GZ_IP=... ./scripts/verify_deploy_guangzhou.sh 第 20 探针 token_fp_agree=4/4"
 Info ("  fingerprint to compare everywhere: " + $newFp + " (sha256 first 8 hex; NEVER paste/log the token itself)")
 $newToken = $null

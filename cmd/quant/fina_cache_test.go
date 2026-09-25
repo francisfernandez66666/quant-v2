@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -157,5 +158,65 @@ func TestFinaCacheUnknownDatesPass(t *testing.T) {
 	got := newFinaCache(db).Lookup("002594.SZ")
 	if got == nil || got.Roe != 7.7 {
 		t.Fatalf("日期不可知应按放行处理（§M-7 不误伤），got %+v", got)
+	}
+}
+
+// §B7-PIT（owner 裁决 2026-09-26「实盘财务按公告日对齐：是」）：取数只认"披露日 ≤ 北京今日"
+// 的最新期。缺陷本体：旧实现按 end_date 直接取最后一行、ann_date 只用于陈旧度判断——研究侧
+// 有 ann_date≤当日 的 PIT 对齐、实盘没有，财报季运行侧会早于市场可见时点用数（第三种口径）。
+// 以下三态钉死：未来披露期回退上一期 / 全未来按缺失 / 披露日不可知照常采用。
+// English: §B7-PIT — the live cache may only consume reports whose ann_date is already today-
+// visible; a future-dated row falls back to the prior period, an all-future stock scores as
+// missing, and an unknown ann_date passes (unknowable is never over-ruled).
+
+func TestFinaCachePitFallsBackFuturePeriod(t *testing.T) {
+	today := cntime.DayCompactOf(time.Now())
+	// 手工造一天前刚披露的"当期" + 一天后才会披露的"下期"（后者是提前入库的未来函数）。
+	yesterday := time.Now().AddDate(0, 0, -1).Format("20060102")
+	tomorrow := time.Now().AddDate(0, 0, 1).Format("20060102")
+	db := openFinaDB(t, []map[string]any{
+		{"ts_code": "600000.SH", "end_date": "20260630", "ann_date": yesterday, "roe": 4.4},
+		{"ts_code": "600000.SH", "end_date": "20260930", "ann_date": tomorrow, "roe": 9.9},
+	})
+	got := newFinaCache(db).Lookup("600000.SH")
+	if got == nil {
+		t.Fatalf("回退上一期后不应为 nil（当期 %s 已可见），got nil", yesterday)
+	}
+	if got.EndDate != "20260630" || got.Roe != 4.4 {
+		t.Fatalf("§B7-PIT 必须跳过披露日在未来(%s>%s)的期、回退上一期，got end=%q roe=%.2f",
+			tomorrow, today, got.EndDate, got.Roe)
+	}
+}
+
+func TestFinaCachePitAllFutureScoresMissing(t *testing.T) {
+	// 整只票的期全部"尚未披露"→ 按缺失计入（nil），绝不把未来财报喂进打分。
+	week := time.Now().AddDate(0, 0, 7).Format("20060102")
+	week2 := time.Now().AddDate(0, 0, 14).Format("20060102")
+	db := openFinaDB(t, []map[string]any{
+		{"ts_code": "000001.SZ", "end_date": "20260630", "ann_date": week, "roe": 3.3},
+		{"ts_code": "000001.SZ", "end_date": "20260930", "ann_date": week2, "roe": 5.5},
+	})
+	c := newFinaCache(db)
+	if got := c.Lookup("000001.SZ"); got != nil {
+		t.Fatalf("§B7-PIT 全未来披露的票必须按缺失计入，got %+v", got)
+	}
+	// nil 同样写缓存（与真缺失/停用同语义），5s 循环不得重查刷屏。
+	c.mu.Lock()
+	_, cached := c.cache["000001.SZ"]
+	c.mu.Unlock()
+	if !cached {
+		t.Fatalf("全未来判定应按缺失写缓存（避免每轮重查重报）")
+	}
+}
+
+func TestFinaCachePitUnknownAnnDateStillUsable(t *testing.T) {
+	// 最新期披露日缺失：不可知 ≠ 未来，照常采用（§N-5 姿势——不把数据没支撑的判定做过头）。
+	db := openFinaDB(t, []map[string]any{
+		{"ts_code": "300750.SZ", "end_date": "20260630", "ann_date": "20260829", "roe": 5.5},
+		{"ts_code": "300750.SZ", "end_date": "20260930", "roe": 6.6},
+	})
+	got := newFinaCache(db).Lookup("300750.SZ")
+	if got == nil || got.EndDate != "20260930" || got.Roe != 6.6 {
+		t.Fatalf("§B7-PIT 披露日不可知的最新期不得被误判为未来，got %+v", got)
 	}
 }

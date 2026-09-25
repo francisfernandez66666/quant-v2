@@ -63,3 +63,28 @@ func TestUniverseAtPointInTime(t *testing.T) {
 		t.Fatalf("全量应 4 只, got %v", all)
 	}
 }
+
+// TestUniverseAtNullDelistIsStillListed §B4-PIT NULL 口径锁：装载时没带 delist_date 列的
+// 老 stocks 行（值为 NULL）必须按"仍在市"进池——SQL 三值逻辑下 `delist_date = '' OR
+// delist_date > ?` 对 NULL 整体为 NULL，旧写法会把在市的票静默逐出时点池（池悄悄缩水比
+// 显式降级更坏）。§B2 回放财务输入的 collect 用例实踩后补的这条锁。
+// English: a NULL delist_date (legacy insert without the column) must count as still-listed —
+// the old two-branch predicate yielded NULL and silently evicted live stocks from the PIT universe.
+func TestUniverseAtNullDelistIsStillListed(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.InsertRows("stocks", TableColumns("stocks"), []map[string]any{
+		{"ts_code": "600010.SH", "name": "老行无退市列", "list_date": "20180101"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	codes, err := db.UniverseAt("20190630")
+	if err != nil {
+		t.Fatalf("UniverseAt: %v", err)
+	}
+	for _, c := range codes {
+		if c == "600010.SH" {
+			return // NULL 票在池=放行腿生效
+		}
+	}
+	t.Fatalf("delist_date 为 NULL 的在市票必须进时点池，实得 %v", codes)
+}

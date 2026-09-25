@@ -1225,6 +1225,15 @@ export async function updateHoldingsBalance(availableBalance) {
   return request('/api/holdings/balance', { method: 'POST', data: { available_balance: availableBalance } })
 }
 
+/** §E1（2026-09-26 盈亏单轨）纸面「清零」：后端按自己的算式把显示偏移入账（append-only 留痕） */
+/** §E1: paper "reset to zero" — the backend computes and appends the display offset (audit trail row) */
+// 对应 POST /api/holdings/pnl-offset {"reset":true}；旧版只写 localStorage('pnl_offset')，
+// 换浏览器即丢、无痕迹；现在校准动作本身入库，opslog 同步留痕。返回 {pnl_offset, id}。
+// Maps to POST /api/holdings/pnl-offset; replaces the old localStorage-only calibration.
+export async function resetPaperPnlOffset(note) {
+  return request('/api/holdings/pnl-offset', { method: 'POST', data: { reset: true, note: note || '' } })
+}
+
 /** 增量买入/加仓：追加一笔(价格,数量)，后端按加权平均重算成本与累计数量 */
 /** Incremental buy / add: append a lot (price, quantity); backend recalculates weighted-average cost and total quantity */
 // 对应 POST /api/holdings/{code}/add，返回 { holding: {...} }

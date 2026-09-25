@@ -1060,7 +1060,7 @@ export default function Paper() {
             </StatCard>
             <StatCard label="已计融券利息">¥{fmt(shortBook.fee_accrued)}</StatCard>
           </div>
-          {/* 空头持仓表：欠券数/开仓价/现价/浮动盈亏（空头盈亏=开仓价−现价−费用，按保证金基数计百分比） */}
+          {/* 空头持仓表：欠券数/开仓价/现价/浮动盈亏（§E1：盈亏与百分比均为后端 float_pnl/float_pnl_pct 直读） */}
           {(shortBook.positions || []).length ? (
             <Table rowKey="code" size="small" data={shortBook.positions}
               columns={[
@@ -1071,12 +1071,14 @@ export default function Paper() {
                 { colKey: 'open_price', title: '开仓价', width: 90, cell: ({ row }) => row.open_price?.toFixed(2) },
                 { colKey: 'mark', title: '现价', width: 90, cell: ({ row }) => row.mark?.toFixed(2) },
                 { colKey: 'float', title: '浮动盈亏', width: 130, cell: ({ row }) => {
-                  // 空头浮动盈亏 =（开仓价 − 现价）× 数量 − 累计费用
-                  const pnl = (row.open_price - row.mark) * row.qty - (row.fee_accrued || 0)
-                  const base = row.margin_used > 0 ? row.margin_used : row.open_price * row.qty
+                  // §E1 盈亏单轨：直接展示后端算好的 float_pnl/float_pnl_pct
+                  // （ShortPosition 快照出口侧由 FloatPnl()/FloatPnlPct() 统一重算）。
+                  // 旧版此处前端自写「(开仓价−现价)×数量−费用」是第二套账，公式一改两侧漂移。
+                  const pnl = row.float_pnl ?? 0
+                  const pct = row.float_pnl_pct ?? 0
                   return (
                     <span style={{ color: pnl >= 0 ? UP : DOWN }}>
-                      {(pnl >= 0 ? '+' : '')}¥{fmt(pnl)} <em style={{ fontStyle: 'normal', fontSize: 12 }}>({(pnl / base * 100).toFixed(1)}%)</em>
+                      {(pnl >= 0 ? '+' : '')}¥{fmt(pnl)} <em style={{ fontStyle: 'normal', fontSize: 12 }}>({pct.toFixed(1)}%)</em>
                     </span>
                   )
                 } },

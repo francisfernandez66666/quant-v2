@@ -1170,7 +1170,10 @@ go test -count=1 ./cmd/quant/ -run 'TestFina' 2>&1 | grep -E '^(--- FAIL|FAIL|ok
 go test -count=1 ./internal/notify/ -run 'TestOutbox' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/research/ -run 'TestNoteWindowFailTrace' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # M-7 静态锁：闸必须被 Lookup 实际调用（定义了不调用=死代码假修复）+ 告警键在位。
-grep -q 'const finaStaleMaxDays = 240' cmd/quant/fina_cache.go || { echo "--- FAIL: §M-7 阈值常量丢失"; exit 1; }
+# §B7-PIT（2026-09-26）把 240 这个数收进 strategy_engine.FinaStaleMaxDays 单源（实盘/回放共用
+# 同一谓词），cmd/quant 只留别名引用——阈值判红随迁：数只准出现在 fina_pit.go，别名只准引用。
+grep -q 'const FinaStaleMaxDays = 240' internal/strategy_engine/fina_pit.go || { echo "--- FAIL: §M-7 阈值常量丢失（单源家 fina_pit.go）"; exit 1; }
+grep -q 'const finaStaleMaxDays = strategy_engine.FinaStaleMaxDays' cmd/quant/fina_cache.go || { echo "--- FAIL: §M-7 实盘侧未走单源别名（要么常量回潜要么引用断线）"; exit 1; }
 grep -q 'finaReportStale(fina' cmd/quant/fina_cache.go || { echo "--- FAIL: §M-7 新鲜度闸未被 Lookup 调用（定义了个寂寞）"; exit 1; }
 grep -q 'fina-stale-report' cmd/quant/fina_cache.go || { echo "--- FAIL: §M-7 停用告警 opslog 键丢失"; exit 1; }
 if grep -n 'YYYY-MM-DD，如 2026-06-30' internal/strategy_engine/types.go | grep -q .; then
@@ -3895,6 +3898,140 @@ if [ -z "$EW_ERRS" ]; then
 	echo "ok - §0925EVE-W3 守卫通过（E 交割/网关 7 + F 观测审计 3 + G 审批/第三态 7 + H 自举 4 + I 前端 3 + J 调研层 4）"
 else
 	echo "--- FAIL: §0925EVE-W3 断言不符:${EW_ERRS}"
+	exit 1
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# §100 §0926-W2（2026-09-26 批：owner 第二波裁决 ⑤⑥⑦⑧⑨⑩ + 三、的 E1/C7 两单源化）
+# 一物一锁防复活，七族：
+# ① A5 跌停追卖闸常开（*bool 三态，nil=开；旧 false 缺省形态不得回潜）。
+# ② A1 柜台可卖量证据腿（CanUseQty *int 入账 → checkT1Sellable min(柜台,本地) 收紧；
+#    golden/反射/真行采样三层契约锁 + COALESCE 覆盖腿恰 2 + 补列无 DEFAULT）。
+# ③ B2 回放吃财务（finaProvider 装配 + 三个注入点 + §B2-FINA 收尾读数不静默）。
+# ④ B3 三套打分口径只标注不统一（口径 A/B/C 三处标注 + 扫参哑火档标注 + 假话术墓碑）。
+# ⑤ B4 幸存者偏差缺省开（PITEnabled nil=开 + UniverseAt 的 delist_date IS NULL 放行腿）。
+# ⑥ B7 实盘财务公告日闸（LatestVisibleFina 唯一谓词家 + 实盘/回放两调用点）。
+# ⑦ E1 盈亏单轨（算式只住 paperPnlTotals；校准 append-only 入库、清零服务端自算、
+#    前端 localStorage 校准键判红）。⑧ C7 服务定义单源（部署清单/6 消费脚本/
+#    verify_deploy 第 26 探针/服务名集合等值/旧 nssm 字面量负锁）。
+# ⑨ 元闸（FIX_PLAN ⑨「元验收」兑现）：带 § 的防线函数必须 grep 到**非测试**调用点。
+#    五例逐一过筛：PITEnabled/gateLiveStrategyLibrary/order-confirm 三条活线判红；
+#    NewFailoverBoard 与 AuditRulesDiff 实测**全仓零生产调用**（板块降级链实际由
+#    market.go 的镜像分页腿承担、配置审计由 qmt.go 直写 opslog.Audit）——本批未获
+#    接线裁决，不静默删除也不静默豁免：走 OBS 观测读数，每次门禁都点名，待 owner 裁决。
+# 全部判据都是静态 grep/awk，真实行为回归在 -full 与各包用例（gate_test /
+# real_positions_test / pnl_offset* _test / report_contract_test / test_report_contract.py /
+# h2_positions_balance.test.jsx §E1 段）。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 100 §0926-W2 第二波裁决+A1/A5/B2/B3/B4/B7+E1 盈亏单轨+C7 服务单源+元闸（2026-09-26 owner 裁决批）..."
+GW_ERRS=""
+GW_OBS=""
+gw_chk() { if [ "$2" != "$3" ]; then GW_ERRS="${GW_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+gw_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then GW_ERRS="${GW_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+gw_absent() { if [ "${2:-0}" -ne "0" ]; then GW_ERRS="${GW_ERRS}
+  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+# 非注释命中（§89/静态负锁同族坑：说明注释≠旧写法复活；set -e 下管道 grep 必带 || true）
+gw_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
+	{ grep -nE "$2" "$1" 2>/dev/null || true; } | { grep -Ev '^[0-9]+:[[:space:]]*(//|\*)' || true; } | wc -l | tr -d ' '
+}
+# 函数体（定义行→顶格 `}`）内按**字面子串**计数——绕开 BSD awk -v 对 \(\) 的吞转义坑
+gw_awk_body() { # $1=文件 $2=sig子串 $3=body子串
+	awk -v sig="$2" -v body="$3" 'index($0,sig){f=1} f && $0 ~ /^}$/ {exit} f && index($0,body){c++} END {print c+0}' "$1"
+}
+# 元闸取数口：全仓 Go 里非测试文件、非注释行、非 func 定义行的引用计数
+gw_meta_calls() { # $1=扩展正则
+	{ grep -rnE "$1" --include='*.go' cmd internal 2>/dev/null || true; } | grep -v '_test\.go:' | { grep -vE ':[0-9]+:[[:space:]]*(//|\*)' || true; } | { grep -vE ':[0-9]+:func ' || true; } | wc -l | tr -d ' '
+}
+
+# ── ① A5 跌停追卖闸常开 ──
+gw_chk "A5 三态字段 *bool（nil=常开缺省）" "$(grep -c 'LimitDownBlockSell \*bool' internal/config/config.go || true)" "1"
+gw_chk "A5 判定函数唯一落点" "$(grep -c 'func (r RiskGateConfig) LimitDownBlockSellEnabled() bool' internal/config/config.go || true)" "1"
+gw_chk "A5 nil→true 常开腿在函数体内" "$(gw_awk_body internal/config/config.go 'LimitDownBlockSellEnabled() bool' 'return true')" "1"
+gw_chk "A5 常开回归用例在位" "$(grep -c 'func TestGateLimitDownAlwaysOn' internal/risk/gate_test.go || true)" "1"
+
+# ── ② A1 柜台可卖量证据腿 ──
+gw_chk "A1 RealPosition.CanUseQty 三态字段（*int，NULL=未知）" "$(grep -c 'CanUseQty \*int' internal/store/real_positions.go || true)" "1"
+gw_chk "A1 幂等补列且刻意无 DEFAULT（DEFAULT 0 会把存量行伪造成柜台真值）" "$(gw_code_hits internal/store/real_positions.go 'ALTER TABLE real_positions ADD COLUMN can_use_qty')" "1"
+gw_absent "A1 负锁：补列带 DEFAULT（三态塌成 0=未知被伪造的形态）" "$(grep -c 'ADD COLUMN can_use_qty INTEGER DEFAULT' internal/store/real_positions.go || true)"
+gw_chk "A1 COALESCE(新,旧) 覆盖腿恰 2（两条 upsert 路径都要接柜台值，缺一条=断一条通道）" "$(grep -c 'can_use_qty=COALESCE(excluded.can_use_qty, real_positions.can_use_qty)' internal/store/real_positions.go || true)" "2"
+gw_chk "A1 柜台更小一律收紧（sellable=counter 必须落在 counter<localEst 分支体内）" "$(gw_awk_body internal/risk/gate.go 'if counter < localEst' 'sellable = counter')" "1"
+gw_min "A1 交叉偏差告警腿（warn + onGate 推送）" "$(grep -c 'T+1 可卖量交叉偏差' internal/risk/gate.go || true)" "1"
+gw_chk "A1 反射集 vs golden 持仓行字段锁在位" "$(grep -c 'vs golden.positions_row_fields' internal/server/report_contract_test.go || true)" "1"
+gw_chk "A1 真行采样双测（样例==broker 真实产出、样例==golden 一致）" "$(grep -c 'def test_positions_sample_' qmt_gateway/tests/test_report_contract.py || true)" "2"
+gw_min "A1 采样夹具在位（可卖量断腿的输入源）" "$(test -f qmt_gateway/contract/positions_sample.json && echo 1 || echo 0)" "1"
+
+# ── ③ B2 因子回放喂财务输入 ──
+gw_chk "B2 finaProvider 定义在位" "$(grep -c 'type finaProvider struct' internal/btreplay/fina_input.go || true)" "1"
+gw_chk "B2 扫参注入点恰 2（主扫+复核链，B6 教训：漏一处串一台）" "$(grep -c 'o.applyFinaScope(ad' internal/btreplay/sweep.go || true)" "2"
+gw_chk "B2 回放注入点恰 1" "$(grep -c 'o.applyFinaScope(ad' internal/btreplay/replay.go || true)" "1"
+gw_min "B2-FINA 收尾读数（吃到多少票必须回显，不静默）" "$(grep -c 'B2-FINA' internal/btreplay/replay.go || true)" "2"
+
+# ── ④ B3 三套打分口径：只标注不统一（owner 裁决「保留三套但各自标注清楚」） ──
+gw_min "B3 口径 A 标注（ic.go 截面 z 后求和=预筛）" "$(grep -c '口径 A' internal/research/ic.go || true)" "1"
+gw_min "B3 口径 B 标注（discover.go 原始加权和+复合分截面 z=证据）" "$(grep -c '口径 B' internal/research/discover.go || true)" "1"
+gw_min "B3 口径 C 标注（scoring 包 时序分位×权重=下单）" "$(grep -c '口径 C' internal/research/scoring/scoring.go || true)" "1"
+gw_min "B3 口径 C 标注（factor.scoreRule 实盘/回放同一 Evaluate）" "$(grep -c '口径 C' internal/strategies/factor/factor.go || true)" "1"
+gw_min "B3 哑火档标注（因子分值域 [50,100] ⇒ 扫参 40/45 恒不过滤）" "$(grep -c '哑火' internal/btreplay/sweep.go || true)" "1"
+gw_chk "B3 假话术墓碑在位（旧「三处同口径」声明已改判为不实并留痕）" "$(grep -c '该声明不实' internal/research/scoring/scoring.go || true)" "1"
+
+# ── ⑤ B4 幸存者偏差缺省开（owner 裁决「开，默认打开」） ──
+gw_chk "B4 PITEnabled 定义+调用两腿" "$(grep -c 'PITEnabled()' internal/btreplay/replay.go || true)" "2"
+gw_chk "B4 nil=开语义唯一判定式" "$(grep -c 'return o.PointInTime == nil' internal/btreplay/replay.go || true)" "1"
+gw_chk "B4 UniverseAt 的 delist_date IS NULL 放行腿（NULL 被三值逻辑逐出＝池静默缩水）" "$(grep -c "delist_date IS NULL OR delist_date = ''" internal/store/store.go || true)" "1"
+gw_min "B4 降级读数不静默（poolNote 三态：显式关/起始日空/元数据零覆盖都点名）" "$(grep -c '幸存者偏差在体' internal/btreplay/replay.go || true)" "2"
+
+# ── ⑥ B7 实盘财务公告日闸（owner 裁决「实盘财务按公告日对齐：是」） ──
+gw_chk "B7 唯一谓词家 LatestVisibleFina 定义" "$(grep -c 'func LatestVisibleFina' internal/strategy_engine/fina_pit.go || true)" "1"
+gw_chk "B7 实盘取数腿调用点在位（fina_cache）" "$(gw_code_hits cmd/quant/fina_cache.go 'strategy_engine\.LatestVisibleFina')" "1"
+gw_chk "B7 回放取数腿调用点在位（fina_input 同谓词同口径）" "$(gw_code_hits internal/btreplay/fina_input.go 'strategy_engine\.LatestVisibleFina')" "1"
+gw_chk "B7 滞后上限常量收编（实盘/回放同一 240 天）" "$(grep -c 'const FinaStaleMaxDays = 240' internal/strategy_engine/fina_pit.go || true)" "1"
+
+# ── ⑦ E1 盈亏单轨（owner：「盈亏前端自算与后端两套账…要做」） ──
+gw_chk "E1 校准端点路由注册（admin 收权）" "$(grep -c 'POST /api/holdings/pnl-offset' internal/server/server.go || true)" "1"
+gw_chk "E1 唯一算式家 paperPnlTotals" "$(grep -c 'func (s \*Server) paperPnlTotals' internal/server/handlers_fix.go || true)" "1"
+gw_chk "E1 清零值服务端自算（不信前端算术＝两套账的根子）" "$(gw_code_hits internal/server/handlers_fix.go 'newOff = r2\(realized \+ unrealized\)')" "1"
+gw_chk "E1 偏移读失败抬 total_pnl:null（§N-5 姿势：错误不折进 0）" "$(grep -c 'pnl_offset_error' internal/server/handlers_fix.go || true)" "2"
+gw_min "E1 append-only 校准表（只增不改不删，留痕可回放）" "$(grep -c 'pnl_offset_history' internal/store/pnl_offset.go || true)" "2"
+gw_absent "E1 负锁：校准表出现 UPDATE/DELETE 语句（审计链不许被改写）" "$(grep -cE 'UPDATE pnl_offset_history|DELETE FROM pnl_offset_history' internal/store/pnl_offset.go || true)"
+gw_chk "E1 前端正规通道函数在位" "$(grep -c 'export async function resetPaperPnlOffset' web/src/api/index.js || true)" "1"
+gw_chk "E1 前端调用点（清零按钮走后端，不再写浏览器账）" "$(gw_code_hits web/src/pages/Positions.jsx 'resetPaperPnlOffset')" "1"
+gw_absent "E1 负锁：前端 localStorage 盈亏校准键复活（两套账的存储形态）" "$(gw_code_hits web/src/pages/Positions.jsx 'localStorage\.(getItem|setItem)\(["'"'"']pnl')"
+gw_min "E1 后端回归用例（等值链+admin-only 两条）" "$(grep -c '^func Test' internal/server/pnl_offset_e1_test.go || true)" "2"
+gw_min "E1 store 回归用例（latest-wins+append-only 计数锁）" "$(grep -c '^func Test' internal/store/pnl_offset_test.go || true)" "2"
+gw_min "E1 前端用例段（§E1 describe + 四用例）" "$(grep -c '§E1' web/src/__tests__/h2_positions_balance.test.jsx || true)" "8"
+
+# ── ⑧ C7 Windows 服务拉起单源化（owner：「三套并存的单源化，要做」） ──
+gw_chk "C7 单源文件在位" "$(test -f deploy/qmt-win/service_definitions.ps1 && echo 1 || echo 0)" "1"
+gw_min "C7 部署清单接线（ps1_bom+scp 两腿，§ENH-5「仓库里有、现网没有」同族）" "$(grep -c 'service_definitions.ps1' scripts/deploy_guangzhou.sh || true)" "2"
+gw_chk "C7 消费脚本 dot-source 恰 6 个（三套并存的收编面）" "$(grep -l 'Join-Path \$PSScriptRoot "service_definitions.ps1"' deploy/qmt-win/*.ps1 | wc -l | tr -d ' ')" "6"
+GW_SVCA="$(sed -n 's/^\$SvcName[A-Za-z]*[[:space:]]*=.*else { "\([^"]*\)" }$/\1/p' deploy/qmt-win/service_definitions.ps1 | sort | paste -sd, -)"
+GW_SVCB="$(sed -n 's/.*foreach ($s in @("\(.*\)")).*/\1/p' scripts/verify_deploy_guangzhou.sh | tr -d '"' | tr ',' '\n' | tr -d ' ' | sort | paste -sd, -)"
+gw_chk "C7 服务名集合等值：单源表 vs 部署探针（ defs=${GW_SVCA} probe=${GW_SVCB}）" "$( [ "$GW_SVCA" = "$GW_SVCB" ] && echo eq || echo ne )" "eq"
+gw_chk "C7 verify_deploy 第 26 探针在位" "$(grep -c 'ops:C7 service_definitions single source in place' scripts/verify_deploy_guangzhou.sh || true)" "1"
+gw_chk "C7 verify_deploy 传参腿（SSH 调用把落盘位喂给探针）" "$(grep -c 'SvcDefsPath ${QMT_WIN_DIR}/service_definitions.ps1' scripts/verify_deploy_guangzhou.sh || true)" "1"
+gw_absent "C7 负锁：旧 C:\\qmt\\nssm 硬编码字面量复活（单源候选表之外只准待在注释里）" "$({ grep -n 'qmt\\nssm\\nssm.exe' deploy/qmt-win/*.ps1 2>/dev/null || true; } | grep -v '^deploy/qmt-win/service_definitions.ps1' | { grep -vE ':[0-9]+:[[:space:]]*#' || true; } | wc -l | tr -d ' ')"
+
+# ── ⑨ 元闸：带 § 的防线函数必须有非测试调用点（FIX_PLAN ⑨ 元验收） ──
+gw_min "元闸 PITEnabled（B4 时点池判定）有生产调用" "$(gw_meta_calls 'o\.PITEnabled\(\)')" "1"
+gw_min "元闸 gateLiveStrategyLibrary（§95/C1 零规则闸）有生产调用" "$(gw_meta_calls 'gateLiveStrategyLibrary\(')" "1"
+gw_chk "元闸 order-confirm（C3 第三态出口）路由注册在生产码" "$(gw_code_hits internal/server/server.go 'HandleFunc\("POST /api/qmt/order-confirm"')" "1"
+# 下面两条实测全仓零生产调用（2026-09-26 建闸时锤实）：不判红（本批未获接线裁决），
+# 但每次门禁都点名——防"文档说修了、代码从没接上"的最后一段静默区。owner 裁决后
+# 要么接线（转进上面的判红组），要么按裁决移除，二者必居其一。
+GW_M_FB="$(gw_meta_calls 'NewFailoverBoard\(')"
+GW_M_AD="$(gw_meta_calls 'AuditRulesDiff\(')"
+if [ "$GW_M_FB" = "0" ]; then GW_OBS="${GW_OBS}
+  ○ §WS-D D-1 NewFailoverBoard（板块降级链）：仅测试引用，生产板块路径走 market.go 镜像分页——待 owner 裁决接线/移除"; fi
+if [ "$GW_M_AD" = "0" ]; then GW_OBS="${GW_OBS}
+  ○ AuditRulesDiff（配置变更审计包装器）：仅定义零调用，现网审计由 qmt.go:1170 直写 opslog.Audit——待 owner 裁决统一入口/移除"; fi
+
+if [ -z "$GW_ERRS" ]; then
+	echo "ok - §0926-W2 守卫通过（A5 锁 4 + A1 锁 9 + B2 锁 4 + B3 锁 6 + B4 锁 4 + B7 锁 4 + E1 锁 12 + C7 锁 7 + 元闸 3 判红组）"
+	if [ -n "$GW_OBS" ]; then echo "观察读数（不判红，待裁决项点名）:${GW_OBS}"; fi
+else
+	echo "--- FAIL: §0926-W2 断言不符:${GW_ERRS}"
 	exit 1
 fi
 
