@@ -626,7 +626,16 @@ func (f *Fetcher) StalenessMs(code string) int64 {
 }
 
 // inAuctionWindow 当前是否处于集合竞价注入窗口（9:15-9:26，Asia/Shanghai）。
+// §0925EVE-W3-E（C6）：补上 §CAL-GATE 漏网的第 15 判据——旧实现纯 HHMM 比较，
+// 周末/法定节假日（交易日历休市日）照样在表观窗口内放行，maybeFetchAuction 于是
+// 每天早晨 9:15-9:26 向 hithink 空转发一次全池竞价请求（休市日根本没有竞价）。
+// 与本文件族 trade_time.go 的 14 个时段判据同口径：先过 IsTradingDay 权威闸再比钟面。
+// English: §0925EVE-W3-E — the 15th session gate now joins the CAL-GATE discipline:
+// IsTradingDay first, then the HH:MM window, so closed days no longer fire auction fetches.
 func InAuctionWindow(now time.Time) bool {
+	if !IsTradingDay(now) {
+		return false // 休市日（周末/日历节假日）无集合竞价，窗口判据一律关
+	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= 915 && m <= 926
 }

@@ -1404,3 +1404,162 @@ test.describe('修复回归 · 2026-09-22 傍晚批', () => {
     expect(r.status(), '成员不得触发全局推送通道实弹探测').toBe(403)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// §0925EVE-W3（2026-09-25 全量评价批）：kill-switch 撤单失败明细 + 第三态人工收敛
+// 背景：A2 修复让 HaltAll 把「撤不掉的单」如实带回响应与 UI（此前只 log，操作者看到的是
+// "撤销 0 笔"误以为全撤干净）；G3 把网关第三态（已交通道、结算结果不明）的 curl-only
+// 人工改判收编成「待核对委托」卡。两条链路都依赖 qmt-mock 新增的 admin 注入面
+// （/admin/mock-force-status、/admin/mock-unresolve），Go 层契约单测已各自锁死，
+// 这里补的是「真实栈 + 真实渲染」的端到端腿。
+// 纪律：两用例自造的单/行全部在 finally 收敛（撤单失败残留行回推已报→/api/qmt/cancel；
+// 注入的待核对行用 order-confirm 清空），halted 态兜底复位——同 §UAT-D8 teardown 口径。
+// ─────────────────────────────────────────────────────────────────────
+test.describe('修复回归 · 0925EVE 撤单失败明细与第三态人工收敛', () => {
+  const mockHdr = () => ({ Authorization: `Bearer ${MOCK_TOKEN}`, 'Content-Type': 'application/json' })
+
+  // placeStuckOrder 造一笔「引擎账本=已报、网关侧=已成」的撤单竞态单：
+  // 下单 → 立即强改 mock 终态（不推回报）→ 回读引擎行确证仍是"已报"。
+  // 回读判据不可省（§探针按运行时真实取值链）：mock 1.5s 成交窗口若被回报抢跑，
+  // 引擎行已成、halt 会跳过该单——那时判"没造出形态"重试下一笔，而不是放宽断言。
+  async function placeStuckOrder(page, hdr) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const snap = await (await page.request.get('/api/snapshot?codes=300750', { headers: hdr })).json()
+      const live = Array.isArray(snap) ? (snap[0] && snap[0].price) || 0 : (snap.price || 0)
+      expect(live, '取 300750 实时现价（价格守卫基准）').toBeGreaterThan(0)
+      const exec = await page.request.post('/api/positions/execute', {
+        headers: hdr,
+        data: { code: '300750', side: '买入', action: '建仓', qty: 100, price: live, strategy: 'dragon', client_id: `evea2-${Date.now()}-${attempt}` },
+      })
+      // 白名单口径：strategy 必须内置四形态之一（manual 会被 risk.Gate 兜底拒——2026-09-25 实测）
+      expect(exec.status(), 'live 下单应 200（dragon 在白名单默认全集内）').toBe(200)
+      const oid = (await exec.json()).order_id
+      expect(oid, '下单回网关委托号').toMatch(/^MOCK\d+$/)
+      const f = await page.request.post(`${MOCK_URL}/admin/mock-force-status`, { headers: mockHdr(), data: { order_id: oid, status: '已成' } })
+      expect(f.status(), 'mock 强改成终态应 200').toBe(200)
+      const rows = await (await page.request.get('/api/qmt/orders', { headers: hdr })).json()
+      const row = Array.isArray(rows) ? rows.find((o) => o.order_id === oid) : null
+      if (row && row.status === '已报') return oid
+      // 竞态输了（成交回报先到）：该已成单是自然终态、无需清理，换下一笔重造
+    }
+    throw new Error('3 次尝试都没能造出「引擎行=已报」的撤单失败形态（mock 成交窗口/回报链路异常？）')
+  }
+
+  // convergeStuckOrder 残留收敛：mock 回推"已报"→ 引擎撤单闭环 → 本地行落到已撤。
+  // 不清理会把这笔永远"已报"的单留给 SweepOrders/后续 halt 用例（teardown 污染）。
+  async function convergeStuckOrder(page, hdr, oid) {
+    if (!oid) return
+    await page.request.post(`${MOCK_URL}/admin/mock-force-status`, { headers: mockHdr(), data: { order_id: oid, status: '已报' } })
+    const c = await page.request.post(`/api/qmt/cancel/${oid}`, { headers: hdr, data: {} })
+    expect([200, 404, 409, 502], `残留单收敛调用有明确响应（got ${c.status()}）`).toContain(c.status())
+  }
+
+  // EVE-A2：撤单失败必须出现在 halt 响应 failed[]（带网关原始报错）与 UI warning toast
+  test('EVE-A2：kill-switch 撤单失败 → 响应 failed[] 明细 + UI 点名未撤成笔数与单号', async ({ page }) => {
+    let health = null
+    let lastErr = ''
+    for (let i = 0; i < 3 && !health; i++) { // L1-2 同款三轮探活口径（mock 瞬忙不等于不可用）
+      await page.waitForTimeout(500)
+      health = await page.request.get(`${MOCK_URL}/health`, { timeout: 3000 }).catch((e) => { lastErr = String(e && e.message || e); return null })
+    }
+    if (!health || health.status() !== 200) mockUnavailableOrFail(lastErr || `health 非 200（got ${health && health.status()}）`)
+    await page.goto('/#/quant')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    await page.request.post('/api/qmt/halt', { headers: hdr, data: { halted: false } })
+    let oid = ''
+    try {
+      oid = await placeStuckOrder(page, hdr)
+      // ① API 腿：halt 置位 → failed[] 含本单，reason 带网关 409 原文（不吞、不改写）
+      const halt = await page.request.post('/api/qmt/halt', { headers: hdr, data: { halted: true } })
+      expect(halt.status(), 'halt 置位应 200').toBe(200)
+      const hj = await halt.json()
+      const hit = (hj.failed || []).find((x) => x.order_id === oid)
+      expect(hit, `failed[] 必须含 ${oid}（撤不掉却不点名＝A2 复发）`).toBeTruthy()
+      expect(String(hit.reason), '失败原因透传网关原文（409/not cancellable）').toMatch(/409|not cancellable/)
+      // ② 解除复位后引擎行仍是"已报"（撤不掉的留人工处置，不回写假终态）
+      await page.request.post('/api/qmt/halt', { headers: hdr, data: { halted: false } })
+      const rows2 = await (await page.request.get('/api/qmt/orders', { headers: hdr })).json()
+      const row2 = rows2.find((o) => o.order_id === oid)
+      expect(row2 && row2.status, '撤单失败后本地行保持已报（不虚报已撤）').toBe('已报')
+      // ③ UI 腿：从按钮真正走一遍置位，warning toast 必须点名笔数与单号
+      await page.reload()
+      const card = page.locator('.t-card', { hasText: '链路状态' })
+      const btn = card.getByRole('button', { name: '紧急停止' })
+      await expect(btn, '紧急停止按钮可见').toBeVisible({ timeout: 10000 })
+      await btn.click()
+      const dlg = page.locator('.t-dialog')
+      await expect(dlg, '置位二次确认').toContainText('确认紧急停止', { timeout: 5000 })
+      await dlg.getByRole('button', { name: /确认|确定/ }).first().click()
+      const toast = page.locator('.t-message', { hasText: '笔未撤成' }).first()
+      await expect(toast, 'warning toast 点名「N 笔未撤成」').toBeVisible({ timeout: 10000 })
+      await expect(toast, 'toast 带未撤成单号（操作者当场可决策）').toContainText(oid, { timeout: 5000 })
+      await page.screenshot({ path: `${SHOT}/branch-eve-a2-cancel-fail.png` })
+    } finally {
+      await page.request.post('/api/qmt/halt', { headers: hdr, data: { halted: false } })
+      await convergeStuckOrder(page, hdr, oid)
+    }
+  })
+
+  // EVE-G3：待核对卡四态分离（失败可见≠空态≠列表）+ released/settled 人工收敛全链路
+  test('EVE-G3：待核对委托卡——失败态可见 / 清单渲染 / released+settled 收敛归零', async ({ page }) => {
+    let health = null
+    let lastErr = ''
+    for (let i = 0; i < 3 && !health; i++) {
+      await page.waitForTimeout(500)
+      health = await page.request.get(`${MOCK_URL}/health`, { timeout: 3000 }).catch((e) => { lastErr = String(e && e.message || e); return null })
+    }
+    if (!health || health.status() !== 200) mockUnavailableOrFail(lastErr || `health 非 200（got ${health && health.status()}）`)
+    const SIG_A = 'uat-eve-g3-a' // 已离队（须核柜台）→ UI 腿 released
+    const SIG_B = 'uat-eve-g3-b' // 仍在队列（可自动收敛取证位）→ API 腿 settled
+    try {
+      // ① 失败态：查询接口 502 时卡片必须渲染「查询失败 + 重试」，绝不空清单冒充没问题
+      await page.route('**/api/qmt/pending-review**', (route) => route.fulfill({
+        status: 502, contentType: 'application/json',
+        body: JSON.stringify({ error: '网关待核对清单查询失败: 注入的失败态' }),
+      }))
+      await page.goto('/#/quant')
+      const card = page.locator('.t-card', { hasText: '待核对委托（第三态人工收敛）' })
+      await expect(card, '待核对卡渲染').toBeVisible({ timeout: 15000 })
+      await expect(card, '失败态可见（≠空态断言）').toContainText('待核对清单查询失败', { timeout: 10000 })
+      await expect(card.getByRole('button', { name: '重试' }), '失败态带重试入口').toBeVisible()
+      await page.screenshot({ path: `${SHOT}/branch-eve-g3-failstate.png` })
+      await page.unroute('**/api/qmt/pending-review**')
+      // ② 列表态：注入两行第三态（取证位一真一假），点重试立即回读
+      await page.request.post(`${MOCK_URL}/admin/mock-unresolve`, { headers: mockHdr(), data: { signal_id: SIG_A, code: '600111.SH', side: '买入', qty: 300, dispatch_in_flight: false } })
+      await page.request.post(`${MOCK_URL}/admin/mock-unresolve`, { headers: mockHdr(), data: { signal_id: SIG_B, code: '000001.SZ', side: '卖出', qty: 500, dispatch_in_flight: true } })
+      const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+      const pr = await (await page.request.get('/api/qmt/pending-review', { headers: hdr })).json()
+      expect(pr.unresolved_count, 'API 腿：注入后计数 ≥2').toBeGreaterThanOrEqual(2)
+      await card.getByRole('button', { name: '重试' }).click()
+      await expect(card.getByText(SIG_A), '清单渲染信号锚点 A').toBeVisible({ timeout: 10000 })
+      await expect(card.getByText('已离队·须核柜台'), 'A 行取证位=已离队').toBeVisible()
+      await expect(card.getByText('仍在队列'), 'B 行取证位=仍在队列').toBeVisible()
+      // ③ settled（API 腿）：柜台有此单 → 转正常终态；reload 后清单只剩 A，计数==1
+      //    （收敛顺序刻意 settled 在前、released 收尾：released 走 UI 确认链路，
+      //     confirmPendingOrder 自带 loadPendingReview 即时刷新，空态断言不必等 30s 轮询）
+      const st = await page.request.post('/api/qmt/order-confirm', { headers: hdr, data: { wire_ref: SIG_B, decision: 'settled' } })
+      expect(st.status(), 'settled 应 200').toBe(200)
+      expect((await st.json()).status, '网关回显缺省终态已撤').toBe('已撤')
+      await page.reload()
+      await expect(card.getByText(SIG_A), 'settled 后 A 行仍在').toBeVisible({ timeout: 15000 })
+      await expect(card.getByText(SIG_B), 'B 行已收敛消失').toHaveCount(0)
+      // ④ released（UI 腿）：柜台无此单 → 二次确认 → 成功 toast → 空态断言即时回显
+      await card.getByRole('button', { name: '柜台无此单' }).first().click()
+      const dlg = page.locator('.t-dialog')
+      await expect(dlg, '人工改判二次确认弹窗（含审计提示）').toContainText('记入审计日志', { timeout: 5000 })
+      await dlg.getByRole('button', { name: /确认|确定/ }).first().click()
+      await expect(page.locator('.t-message', { hasText: '已删除待核对占位' }).first(), 'released 成功 toast').toBeVisible({ timeout: 10000 })
+      await expect(card.getByText(SIG_A), '收敛后 A 行消失').toHaveCount(0, { timeout: 10000 })
+      await expect(card.getByText('无待核对委托'), '空态=「确实没有」的可见断言').toBeVisible({ timeout: 10000 })
+      const pr2 = await (await page.request.get('/api/qmt/pending-review', { headers: hdr })).json()
+      expect(pr2.unresolved_count, '两行收敛完毕后 API 计数归零').toBe(0)
+      await page.screenshot({ path: `${SHOT}/branch-eve-g3-empty.png` })
+    } finally {
+      // 兜底清行（中途失败不留残留第三态）：两条腿各试 released（幂等：404 也算已清）
+      const hdr2 = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')).catch(() => '') }
+      for (const sig of [SIG_A, SIG_B]) {
+        await page.request.post('/api/qmt/order-confirm', { headers: hdr2, data: { wire_ref: sig, decision: 'released' } }).catch(() => {})
+      }
+    }
+  })
+})

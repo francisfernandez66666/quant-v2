@@ -62,3 +62,42 @@ func TestAvailableCashThreeStates(t *testing.T) {
 		t.Fatalf("回鲜后快照应 CashStale=false/Cash=5000，got %+v", st)
 	}
 }
+
+// TestAvailableCashBeijingParseOnUTCHost §0925EVE-W3-F（⑰/D2 时间口径收口反证锁）：
+// UpdatedAt 是网关按北京时间写入的墙钟串，新鲜度判据必须用 cntime.Loc 解析。本用例把
+// time.Local 临时伪造成 UTC（模拟容器/云主机宿主时区），再喂 40 分钟前的北京墙钟串：
+//   - 正确实现（cntime.Loc 解析）：判过期 fresh=false；
+//   - 回归实现（time.Local 解析）：北京串被当 UTC 读成「未来 8 小时」，Since 为负恒判
+//     新鲜，过期资金放行 fresh=true——正是 §M12-A fail-close 要拦的 H-4 同族形态。
+// 即：删掉修复本测试必红（反证成立）。夹具不并发跑（包内无 t.Parallel，改全局
+// time.Local 仅此一处，收尾必还原）。
+// English: regression lock — with time.Local faked to UTC (container default), a 40-min-old
+// Beijing wall-clock string must still be judged stale; the old time.Local parse would read it
+// as ~8h in the future and wrongly report fresh=true.
+func TestAvailableCashBeijingParseOnUTCHost(t *testing.T) {
+	original := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = original })
+
+	cfg := config.DefaultQMTConfig()
+	db := testDB(t)
+	ctrl := NewController(guardServer(), db, "u_tzpin", cfg, nil)
+	seed := func(cash float64, age time.Duration) {
+		t.Helper()
+		// 北京时间视角的墙钟串（与网关写入侧 cntime 口径同源）
+		if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_tzpin", AvailableCash: cash,
+			UpdatedAt: time.Now().In(cntime.Loc).Add(-age).Format("2006-01-02 15:04:05")}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	// 40 分钟前的北京串：宿主时区=UTC 下仍须判过期
+	seed(100, 40*time.Minute)
+	if _, fresh := ctrl.AvailableCash(); fresh {
+		t.Fatal("UTC 宿主下 40 分钟前的北京回报被判 fresh=true——时间口径回退到 time.Local（⑰ 回归）")
+	}
+	// 5 分钟前的北京串：正常新鲜
+	seed(200, 5*time.Minute)
+	if cash, fresh := ctrl.AvailableCash(); !fresh || cash != 200 {
+		t.Fatalf("5 分钟内应 (200,true)，got (%v,%v)", cash, fresh)
+	}
+}

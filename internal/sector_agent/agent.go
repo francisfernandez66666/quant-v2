@@ -10,9 +10,10 @@ import (
 	"quant-trading-v2/internal/strategy_engine"
 )
 
-// VerifiedSector 已验证板块，包含方向、评分、RPS 排名、成分股与板块状态（加强/持续/退潮/反弹）。
+// VerifiedSector 已验证板块，包含方向、评分、RPS 排名、成分股与板块状态（加强/持续/退潮/反弹/未知）。
+// 「未知」为 §0925EVE-W3-J（B5）新增：行情腿失败或输入全零时不编造相位，显式降级。
 // （VerifiedSector is a verified sector: direction, score, RPS rank, constituent stocks and sector
-// phase (strengthening/sustaining/retreating/bouncing).）
+// phase (strengthening/sustaining/retreating/bouncing/unknown）.）
 type VerifiedSector struct {
 	// 板块名称
 	Name string `json:"name"`
@@ -26,8 +27,12 @@ type VerifiedSector struct {
 	RPS20 float64 `json:"rps20,omitempty"`
 	// 板块60日RPS（§P1-19 中长期相对强度，补全此前缺失字段）
 	RPS60 float64 `json:"rps60,omitempty"`
-	// 板块状态：加强/持续/退潮/反弹
+	// 板块状态：加强/持续/退潮/反弹/未知（「未知」＝§0925EVE-W3-J B5：无有效输入，不编造）
 	Phase string `json:"phase,omitempty"`
+	// QuoteLegFailed §0925EVE-W3-J（B5）：行情腿（东财）本轮失败的透传标记——
+	// 置真时 ChangePct/Flow 为未回填全零值、Phase 必为「未知」；看板与归因据此区分
+	// 「相位缺失是数据降级」与「相位缺失是没算」。（做法对齐本包 Verify 的成分股失败计数。）
+	QuoteLegFailed bool `json:"quote_leg_failed,omitempty"`
 	// 主力净流入(元)
 	Flow float64 `json:"flow,omitempty"`
 	// 板块当日涨跌幅(%)
@@ -46,10 +51,23 @@ type VerifiedSector struct {
 //   - changePct<0 且 资金净流出 → 退潮
 //   - changePct<0 且 资金净流入 → 反弹
 //
-// （classifyPhase is the sector phase state machine (ported from the open-source sector_rotation rules):
-// changePct>0 & net inflow → strengthening; changePct>0 & net outflow → sustaining;
-// changePct<0 & net outflow → retreating; changePct<0 & net inflow → bouncing.）
-func classifyPhase(changePct, flow float64) string {
+// §0925EVE-W3-J（B5）「无有效输入」不再造假相位：
+//   - quoteLegFailed 为真——行情腿（东财）本轮失败，changePct/flow 是没回填来源的全零值；
+//   - changePct==0 且 flow==0——结构腿全零/东财匹配不到该板块时同样落到这组值。
+//     两种情形都返回显式「未知」。旧实现靠 default 分支兜底，把 (0,0) 判成「反弹」，
+//     双源半残（同花顺结构在、东财行情挂）时相位纯编造，还进 D1 归因与持仓提示的展示面。
+//     default 分支现在只认真正的「跌+流入」组合（changePct<0 且 flow>=0）。
+//
+// （classifyPhase is the sector phase state machine (ported from the open-source sector_rotation
+// rules): changePct>0 & net inflow → strengthening; changePct>0 & net outflow → sustaining;
+// changePct<0 & net outflow → retreating; changePct<0 & net inflow → bouncing.
+// §0925EVE-W3-J: invalid inputs (failed quote leg or the unbackfilled (0,0) zero-value pair)
+// now return an explicit "unknown" instead of being fabricated into "bouncing" by the default arm.）
+func classifyPhase(changePct, flow float64, quoteLegFailed bool) string {
+	// §0925EVE-W3-J（B5）无有效输入 → 显式「未知」，不许编造。
+	if quoteLegFailed || (changePct == 0 && flow == 0) {
+		return "未知"
+	}
 	switch {
 	case changePct > 0 && flow > 0:
 		return "加强"
@@ -105,6 +123,8 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 	verifyFailed := 0 // §M-8/N-6 成分股验证失败计数（见下方注释）
 	for _, s := range sectors {
 		// 组装基础信息：方向/分数/涨跌幅/资金流/涨停数，并按状态机推断板块阶段
+		// §0925EVE-W3-J（B5）：classifyPhase 多带 quoteLegFailed——行情腿失败的全零输入
+		// 现在得到显式「未知」，不再被 default 分支编造成「反弹」。
 		vs := VerifiedSector{
 			Name:       s.Name,
 			Direction:  s.Direction,
@@ -113,7 +133,13 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 			ChangePct:  s.ChangePct,
 			Flow:       s.NetInflow,
 			LimitupCnt: s.LimitupCnt,
-			Phase:      classifyPhase(s.ChangePct, s.NetInflow),
+			Phase:      classifyPhase(s.ChangePct, s.NetInflow, s.QuoteLegFailed),
+			// §0925EVE-W3-J（B5）失败标记透传到产出结构，看板/归因侧可见「这是降级不是没算」
+			QuoteLegFailed: s.QuoteLegFailed,
+		}
+		// §0925EVE-W3-J（B5）相位编造被闸住后留一条可观测日志（对齐本文件 §M-8/N-6 的降级留痕做法）
+		if vs.Phase == "未知" {
+			log.Printf("[sector_agent] 板块 %s 相位无有效输入（行情腿失败=%v，涨跌幅/资金流全零），相位报「未知」不编造反弹", s.Name, s.QuoteLegFailed)
 		}
 
 		// RPS 验证：在 RPS 排名榜中定位该板块，补充排名与 20 日 RPS 强度

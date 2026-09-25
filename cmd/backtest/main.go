@@ -156,7 +156,9 @@ func parseFlags() (*backtestOptions, error) {
 	// §数据源路由装配（§ADJ P0-A 三轮补强）：与 cmd/quant 完全同一条入口 store.ConfigureSource
 	// （路由变量已收为 store 包内私有，各 main 不再自己 set），保证本工具与常驻引擎
 	// 读到同一套复权体系；配置路径就是上面的 cfgPath，不另起一套约定。
-	store.ConfigureSource(cfgMgr.Rules.Data.PrimarySource, cfgMgr.Rules.Data.ThsFactorsReady)
+	// §0925EVE-D1 跟随改动：Manager.Rules/D1 导出字段转私有，本文件全部全局配置读取改走
+	// 加锁访问器 cfgMgr.Get()/RulesD1Snapshot()（回测进程无 Watch，但读口径全仓统一，不留裸字段通道）。
+	store.ConfigureSource(cfgMgr.Get().Data.PrimarySource, cfgMgr.Get().Data.ThsFactorsReady)
 	if *configRaw != "" {
 		log.Printf("[backtest] 已加载全量配置: %s", cfgPath)
 	}
@@ -269,9 +271,9 @@ func (o *backtestOptions) run() error {
 	sAgent := sector_agent.New(scanner, data.NewRPSManager())
 
 	cAgent := combat_agent.New(o.cfgMgr.GetStrategyConfig())
-	cAgent.SetLaodengConfig(&o.cfgMgr.Rules.Laodeng)
-	cAgent.SetPositionDailyDropPct(o.cfgMgr.Rules.Position.DailyDropAlertPct)
-	cAgent.SetATRStop(o.cfgMgr.Rules.Position.ATREnabled, o.cfgMgr.Rules.Position.ATRStopMult)
+	cAgent.SetLaodengConfig(&o.cfgMgr.Get().Laodeng)
+	cAgent.SetPositionDailyDropPct(o.cfgMgr.Get().Position.DailyDropAlertPct)
+	cAgent.SetATRStop(o.cfgMgr.Get().Position.ATREnabled, o.cfgMgr.Get().Position.ATRStopMult)
 	cAgent.SetRunners(combat_agent.NewRunners(o.cfgMgr, matcher))
 
 	rpt := report.New(filepath.Join(o.dataDir, "report.json"))
@@ -288,7 +290,7 @@ func (o *backtestOptions) run() error {
 	eng := engine.New(marketAPI, nAgent, strategyEngine, sAgent, cAgent, agg, rpt,
 		stockTracker, wlMgr, sse, llmClient, thsClient, o.dataDir)
 	eng.SetScanner(scanner)
-	eng.SetEmotionConfig(&o.cfgMgr.Rules.Emotion)
+	eng.SetEmotionConfig(&o.cfgMgr.Get().Emotion)
 	if o.longOff {
 		eng.SetLongEnabled(false)
 	}
@@ -497,12 +499,16 @@ type jsonReport struct {
 
 // writeJSONReport 输出 report.json（全参数 + 每 cycle 指标 + 健康项 + 最终看板）.
 func writeJSONReport(o *backtestOptions, cycles []cycleMetrics, health [][]healthItem, dashboard *display.DashboardData) error {
+	// §0925EVE-D1 跟随改动：rules/d1 快照一次成对取回——RulesD1Snapshot 在单次 RLock 内
+	// 返回两份指针，与 Watch/Load 的指针发布无竞态，也不会取到「半新一旧」的跨版本组合
+	//（旧写法 o.cfgMgr.Rules / o.cfgMgr.D1 是无锁字段裸读，属本缺陷锤实的 race 通道）。
+	rulesSnap, d1Snap := o.cfgMgr.RulesD1Snapshot()
 	report := jsonReport{
 		CapturedAt: time.Now(),
 		Since:      o.since,
 		Cycles:     o.cycles,
-		Params:     o.cfgMgr.Rules,
-		D1:         o.cfgMgr.D1,
+		Params:     rulesSnap,
+		D1:         d1Snap,
 		Watchlist:  o.watchlist,
 		CycleStats: cycles,
 		Health:     health,

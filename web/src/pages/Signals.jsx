@@ -10,7 +10,11 @@ import MinuteView from '../components/MinuteView.jsx'
 import LogModal from '../components/LogModal.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
-import { Loading } from '../ui.jsx'
+// §0925EVE-W3-I（条目㉒/E2）：引入全站统一 confirmDialog——Android WebView 壳默认不弹
+// window.prompt/confirm/alert（被静默忽略），模拟买入流程改走 TDesign Dialog 体例。
+// English: §0925EVE-W3-I — shared TDesign confirmDialog; Android WebView shells silently
+// swallow window.prompt/confirm/alert, so the paper-buy flow moves to the site-wide dialog idiom.
+import { Loading, confirmDialog } from '../ui.jsx'
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
 const FILTERS = [
@@ -101,6 +105,10 @@ export default function Signals() {
   const [tradeTarget, setTradeTarget] = useState({})
   // 待确认交易动作（buy=买入 / ignore=忽略）
   const [tradeAction, setTradeAction] = useState('')
+  // §0925EVE-W3-I（E2）模拟买入弹窗的目标信号（null=关闭）：替代原 window.prompt 逐步问询
+  const [paperTarget, setPaperTarget] = useState(null)
+  // §0925EVE-W3-I（E2）模拟买入弹窗的受控表单：price=买入价文本（留空按实时价）、qty=手数文本
+  const [paperForm, setPaperForm] = useState({ price: '', qty: '1' })
   // §F5 兜底轮询定时器（20s，此前 5s；新信号主要靠 SSE scan 即时刷新）
   const timer = useRef(null)
 
@@ -202,35 +210,48 @@ export default function Signals() {
     }
   }
 
-  // 在模拟盘按指定价格/数量买入该信号个股（弹出 prompt 确认价格与手数）
-  async function paperBuy(s) {
-    const priceStr = window.prompt('输入买入价（元，留空用实时价）：', s.price || s.close || '')
-    const qtyStr = window.prompt('输入买入手数（1 手 = 100 股）：', '1')
-    if (qtyStr === null || priceStr === null) return
+  // §0925EVE-W3-I（条目㉒/E2）在模拟盘按指定价格/数量买入该信号个股。
+  // 旧实现用 window.prompt/window.confirm/window.alert 三连问询，Android WebView 壳对原生
+  // 对话框默认静默忽略（移动壳是真实使用面），流程在手机上直接卡死。改为受控 Dialog +
+  // 输入框：本函数只负责打开弹窗并按原默认值预填（实时价 s.price||s.close、1 手），
+  // 提交流程见 submitPaperBuy；业务口径（手→股 ×100、留空价按实时价）完全不变。
+  // English: §0925EVE-W3-I — paper buy now opens a controlled TDesign Dialog pre-filled with
+  // the same defaults; submission logic lives in submitPaperBuy. WebView shells ignore native prompts.
+  function paperBuy(s) {
+    setPaperTarget(s)
+    setPaperForm({ price: String(s.price || s.close || ''), qty: '1' })
+  }
 
-    // 校验手数与价格合法性
-    const qty = parseInt(qtyStr, 10)
-    const price = parseFloat(priceStr)
+  // §0925EVE-W3-I（E2）模拟买入弹窗「确认」：校验手数 → confirmDialog 二次确认（沿用原确认
+  // 文案）→ 提交后端。失败/非法输入用 MessagePlugin 提示且弹窗保留可修改（旧 alert 后流程即断）。
+  async function submitPaperBuy() {
+    if (!paperTarget) return
+
+    // 校验手数与价格合法性（口径与旧 prompt 版一致：手数必须正整数，价格留空/非法按实时价）
+    const qty = parseInt(paperForm.qty, 10)
+    const price = parseFloat(paperForm.price)
     if (isNaN(qty) || qty <= 0) {
-      window.alert('买入手数无效，请填写正整数')
+      MessagePlugin.error('买入手数无效，请填写正整数')
       return
     }
 
-    // 价格为空按实时价成交，有价格则用指定价格；二次确认后提交
-    if (isNaN(price) || price <= 0) {
-      if (!window.confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手？将按实时价成交。`)) return
-    } else {
-      if (!window.confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手 @${price.toFixed(2)}？`)) return
-    }
+    // 价格为空按实时价成交，有价格则用指定价格；二次确认后才提交（与旧 window.confirm 文案一致）
+    const confirmMsg = (!isNaN(price) && price > 0)
+      ? `确认模拟买入 ${paperTarget.code} ${paperTarget.name || ''} ${qty} 手 @${price.toFixed(2)}？`
+      : `确认模拟买入 ${paperTarget.code} ${paperTarget.name || ''} ${qty} 手？将按实时价成交。`
+    if (!(await confirmDialog(confirmMsg, '模拟买入确认'))) return
+
+    // 关闭输入弹窗（取消/关闭可留弹窗改数值，仅真正提交后收起）
+    setPaperTarget(null)
 
     // 调用后端模拟买入接口：code/name/strategy/price/qty/type/id
-    // §FIX-1(20260919) 手/股单位收敛：prompt 输入的是手数，API qty 契约为股数（引擎按股记账），
+    // §FIX-1(20260919) 手/股单位收敛：表单输入的是手数，API qty 契约为股数（引擎按股记账），
     // 提交前在此唯一换算点 ×100。
     try {
-      await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty * 100, s.strategy_type || '', s.strategy_id || '')
-      window.alert(`已模拟买入 ${s.code} ${qty} 手`)
+      await api.buyPaperPosition(paperTarget.code, paperTarget.name || '', paperTarget.strategy || '', paperTarget.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty * 100, paperTarget.strategy_type || '', paperTarget.strategy_id || '')
+      MessagePlugin.success(`已模拟买入 ${paperTarget.code} ${qty} 手`)
     } catch (e) {
-      window.alert(e.message || '模拟买入失败')
+      MessagePlugin.error(e.message || '模拟买入失败')
     }
   }
 
@@ -544,6 +565,26 @@ export default function Signals() {
         <p>策略: {tradeTarget.strategy}</p>
         <p>总分: {tradeTarget.total_score != null ? tradeTarget.total_score.toFixed(0) : '—'}</p>
         <p>价格: {tradeTarget.price ? '¥' + tradeTarget.price.toFixed(2) : '—'}</p>
+      </Dialog>
+
+      {/* §0925EVE-W3-I（条目㉒/E2）模拟买入受控弹窗：替代 window.prompt 问询价格/手数，
+          默认值与旧 prompt 一致（实时价预填、1 手）；确认后进 submitPaperBuy 校验+二次确认+提交 */}
+      <Dialog visible={!!paperTarget} onClose={() => setPaperTarget(null)} header="模拟买入"
+        onConfirm={submitPaperBuy} confirmBtn="确认" cancelBtn="取消">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 4 }}>标的</div>
+            <div>{paperTarget ? `${paperTarget.code} ${paperTarget.name || ''}` : ''}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 4 }}>买入价（元，留空用实时价）</div>
+            <Input value={paperForm.price} onChange={(v) => setPaperForm((f) => ({ ...f, price: v }))} placeholder="留空按实时价成交" />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 4 }}>买入手数（1 手 = 100 股）</div>
+            <Input value={paperForm.qty} onChange={(v) => setPaperForm((f) => ({ ...f, qty: v }))} placeholder="正整数手数" />
+          </div>
+        </div>
       </Dialog>
 
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />

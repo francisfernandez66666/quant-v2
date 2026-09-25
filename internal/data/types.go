@@ -83,6 +83,16 @@ type SectorInfo struct {
 	Gain2d     float64 `json:"gain_2d"`              // 两日涨幅（%）
 	EventDesc  string  `json:"event_desc,omitempty"` // 事件描述（D1 匹配结果，空时省略）
 	NetInflow  float64 `json:"net_inflow,omitempty"` // 主力净流入（东财口径，元）
+	// QuoteLegFailed §0925EVE-W3-J（B5）：行情腿（东财）本轮取数失败的显式标记。
+	// 背景：GetSectors 里同花顺只提供板块清单**结构**，涨跌幅/净流入/涨停数全靠东财回填；
+	// 东财腿挂掉时结构腿照常返回，这些字段全是零值——旧实现只 log 一行，零值继续往下游流，
+	// 直到 classifyPhase 把 (0,0) 编造成「反弹」假阶段（FIX_PLAN_20260925EVE B5）。
+	// 现在把失败事实随结构一起透传：下游据此报「未知」而不是编造相位。
+	// 参照同文件 §LOW(SPOF) last-known-good 腿的做法——降级必须显式可观测，不许静默吞。
+	// English: QuoteLegFailed marks "this round's EastMoney quote leg failed": the THS structure leg
+	// returns boards whose change%/net-inflow were never backfilled (all zero). Propagated so
+	// downstream reports phase=unknown instead of fabricating one from (0,0).
+	QuoteLegFailed bool `json:"quote_leg_failed,omitempty"`
 }
 
 // EmotionData 市场情绪综合数据。

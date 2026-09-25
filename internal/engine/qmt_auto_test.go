@@ -528,8 +528,8 @@ func TestM8RealDrawdown(t *testing.T) {
 	}
 	// 装配 cfgMgr：M8 启用、阈值 -20%
 	mgr := config.NewManager("")
-	mgr.Rules.RiskCtrl.M8Enabled = true
-	mgr.Rules.RiskCtrl.M8PortfolioDrawdownPct = -20
+	mgr.Get().RiskCtrl.M8Enabled = true
+	mgr.Get().RiskCtrl.M8PortfolioDrawdownPct = -20
 	e.SetCfgMgr(mgr)
 
 	positions := mustPositions(t, db)
@@ -562,7 +562,7 @@ func TestM8RealDrawdown(t *testing.T) {
 	// 未启用 M8：新引擎不触发
 	e2, db2, _, orders2 := newQMTEngine(t, nil)
 	mgr2 := config.NewManager("")
-	mgr2.Rules.RiskCtrl.M8Enabled = false
+	mgr2.Get().RiskCtrl.M8Enabled = false
 	e2.SetCfgMgr(mgr2)
 	if _, err := db2.UpsertRealPositions([]store.RealPosition{
 		{TsCode: "600000.SH", Name: "A", Qty: 1000, CostPrice: 5},
@@ -595,8 +595,8 @@ func mustPositions(t *testing.T, db *store.DB) []store.RealPosition {
 func TestM8PeakResetsWhenFlat(t *testing.T) {
 	e, db, _, orders := newQMTEngine(t, nil)
 	mgr := config.NewManager("")
-	mgr.Rules.RiskCtrl.M8Enabled = true
-	mgr.Rules.RiskCtrl.M8PortfolioDrawdownPct = -20
+	mgr.Get().RiskCtrl.M8Enabled = true
+	mgr.Get().RiskCtrl.M8PortfolioDrawdownPct = -20
 	e.SetCfgMgr(mgr)
 
 	// 空仓调用 → 进程内陈旧峰值归零

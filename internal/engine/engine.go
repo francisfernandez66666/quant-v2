@@ -393,7 +393,7 @@ func (e *Engine) TrimAfterHoursIfDue(now time.Time) {
 	if e.cfgMgr == nil {
 		return
 	}
-	rc := e.cfgMgr.Rules.Runtime
+	rc := e.cfgMgr.Get().Runtime // §0925EVE-D1：全局 rules 快照经加锁访问器取得（原字段裸读与 Watch/Load 发布竞态）
 	// 仅盘后且开关开启时执行；交易时段内不触发。
 	if !rc.TrimAfterHours || data.IsActiveSession(now) {
 		return
@@ -5821,7 +5821,7 @@ func (e *Engine) enhanceFlag(get func(config.EnhanceConfig) bool) bool {
 	if mgr == nil {
 		return false
 	}
-	return get(mgr.Rules.Enhance)
+	return get(mgr.Get().Enhance) // §0925EVE-D1：mgr.Rules 字段裸读改 mgr.Get() 加锁访问器
 }
 
 // applyAgeDecay 新闻时效衰减（§P1.1）：事件年龄按类型半衰期降权。

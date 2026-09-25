@@ -2783,14 +2783,20 @@ grep -q 'fs.IntVar(&o.Count, "count", 5025' "$MK_LOAD" \
 	|| { echo '--- FAIL: §MINUTE-K --count 缺省不再是 5025（上游只有最近 N 根窗口，缺省值就是"能回填多久"的事实）'; exit 1; }
 grep -q 'fs.IntVar(&o.Limit, "limit", 500' "$MK_LOAD" \
 	|| { echo '--- FAIL: §MINUTE-K --limit 缺省不再是 500（清单不设闸＝一次手滑把全市场 2GB 灌进例行回填）'; exit 1; }
-# ④ 回放侧优先分钟 + 注入点两处齐（回放与网格预计算只改一处，网格就会按另一条取数路径选最优）
+# ④ 回放侧优先分钟 + 注入点三处齐（§0925EVE-W3-J/B6 起：backtestStock 的全部入口都必须先装
+#    自己的分钟口径——回放主循环、网格触发预算 2a、冠军复核 simulateCombo。缺一处该入口就按
+#    另一条取数路径选参数/复核；B6 修前复核链沿用 2a 循环 map 末票序列，属跨股串台级缺陷。
+#    判据按文件分计数等值（AI1=1/AI2=2），比总和更抗"乱凑第三处"）
 grep -q 'minuteMACDScale      = 5\|minuteMACDScale = 5' "$MK_REP" \
 	|| { echo '--- FAIL: §MINUTE-K 回放侧分钟周期常量丢了（窗口尺寸 48 根是 5 分钟口径，周期一改即失配）'; exit 1; }
 AI1=$(grep -c 'o.applyMinuteScope(' "$MK_REP" || true)
 AI2=$(grep -c 'o.applyMinuteScope(' internal/btreplay/sweep.go || true)
-AI=$((AI1 + AI2))
-[ "$AI" = "2" ] \
-	|| { echo "--- FAIL: §MINUTE-K 分钟口径注入点不是 2 处（读到 ${AI}；回放 backtestStock 与网格 sweepTriggersOf 必须同源，缺一处网格就是按另一条取数路径选参数）"; exit 1; }
+[ "$AI1" = "1" ] \
+	|| { echo "--- FAIL: §MINUTE-K 回放主循环注入点数不是 1（读到 ${AI1}；backtestStock 前的逐股装口径只能有一处）"; exit 1; }
+[ "$AI2" = "2" ] \
+	|| { echo "--- FAIL: §MINUTE-K sweep.go 注入点数不是 2（读到 ${AI2}；网格 2a 预算与 B6 冠军复核 simulateCombo 必须同源，少一处就是拿别的票的分钟序列选参数/出复核数字）"; exit 1; }
+grep -q 'tsOfCode map\[string\]string' internal/btreplay/sweep.go \
+	|| { echo '--- FAIL: §MINUTE-K simulateCombo/verifyChampion 不再透传 tsOfCode 反查表（B6 逐股重注入的原料，删了第三注入点必退化）'; exit 1; }
 # ⑤ 调度侧接线：任务类型 + 步骤映射 + 紧跟 dataload + 门控 + 参数组装
 grep -q 'TaskMinuteSync' internal/store/research_tasks.go \
 	|| { echo '--- FAIL: §MINUTE-K 夜间分钟任务类型常量没了'; exit 1; }
@@ -3708,6 +3714,187 @@ if [ -z "$CP_ERRS" ]; then
 	echo "ok - §CAND-PUSH 守卫通过（写入口径 5 + 备份先行 4 + 转义链 2 + 预览运行时 4 + 常驻反证 3 组 + 写后复核 3）"
 else
 	echo "--- FAIL: §CAND-PUSH 断言不符:${CP_ERRS}"
+	exit 1
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# §98 §0925EVE-W1（2026-09-25 晚批，owner 令「根据修改文档，开始修代码」——第一波四条）
+# 全量评价批（docs/FIX_PLAN_20260925EVE.md）第一波的落地锁，一物一锁防复活：
+# ① §A2 kill-switch 撤单失败明细：HaltAll 必须返回 HaltAllResult（成功数+失败数组，
+#    Failed 恒非 nil），量规 halt_cancel_fail_count 每轮覆写（含清零供 resolved），
+#    p1 规则+路由+HTTP/SSE 两腿+前端「笔未撤成」回显全在位——旧 `HaltAll() int`
+#    裸计数签名（「降级报成功」在安全闸上的最后残留）钉死为 0 次。
+# ② §B1 财务续传键：季度→期末日必须是显式映射表（0331/0630/0930/1231），旧三元
+#    嵌套（季度序号错放月份位 ⇒ Q3 键 YYYY0331 撞 Q1 真期被永久跳过）负锁为 0；
+#    装载器与夜间验证都必须按报告期打印 distinct 分布（COUNT(*) 单值看不见整季塌方）；
+#    运行时断言四键真值（import 载具跑 report_period，__main__ 有守卫不会误触装载）。
+# ③ §C1 实盘战法库闸（§95/LIB-GATE 回放判红的实盘对偶）：唯一判定点
+#    gateLiveStrategyLibrary 定义+调用在位，not_loaded/no_enabled 两条 p1 规则与
+#    路由四条齐、两份文案严格分家（读库故障 vs 库里没规则），三态+反证四用例。
+# ④ §D1 配置热重载补锁：Rules/D1 已转私有，全局读口径唯一（Get/GetD1Config/
+#    RulesD1Snapshot），Load 发布段 rules+d1 各一次指针替换；负锁（滤注释行，
+#    §静态负锁教训：旧写法说明注释≠旧写法复活）钉住 `m.Rules`/`CfgMgr.Rules.`
+#    活代码零残留；-race 反证用例 TestLoadWatchPublishRace 在位。
+# 本段只跑静态判据 + 一个轻量 import 断言；Go/前端的真实回归由 -full 附加段与
+# 各包 test 文件承担（halt_a2 / registry_library_gate / load_watch_race 三份新用例）。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 98 §0925EVE-W1 第一波四修：A2 kill-switch 失败明细 / B1 财务续传键改映射表+期分布 / C1 实盘战法库三态闸 / D1 配置热重载补锁（2026-09-25 owner 令「根据修改文档开始修代码」）..."
+EV_ERRS=""
+ev_chk() { if [ "$2" != "$3" ]; then EV_ERRS="${EV_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+ev_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then EV_ERRS="${EV_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+ev_absent() { if [ "${2:-0}" -ne "0" ]; then EV_ERRS="${EV_ERRS}
+  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+# 负锁的「注释行不计」helper（§BRIDGE-PATH/§89 同族坑：set -euo pipefail 下
+# 管道里 grep 零命中退 1 会静默中止整轮，两头都要 || true 兜掉）
+ev_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
+	{ grep -nE "$2" "$1" 2>/dev/null || true; } | { grep -Ev '^[0-9]+:[[:space:]]*(//|\*)' || true; } | wc -l | tr -d ' '
+}
+
+# ── ① §A2 kill-switch 撤单失败明细 ──
+ev_chk "HaltAll 结构化返回签名（唯一落点）" "$(grep -c 'func (c \*Controller) HaltAll() HaltAllResult' internal/trading/controller.go || true)" "1"
+ev_absent "旧裸计数签名 HaltAll() int（降级报成功形态不得复活）" "$(grep -c 'HaltAll() int {' internal/trading/controller.go || true)"
+ev_min "量规 halt_cancel_fail_count 覆写腿（含清零供 resolved，≥3 分支）" "$(grep -c 'metrics.SetGauge("halt_cancel_fail_count"' internal/trading/controller.go || true)" "3"
+ev_chk "p1 规则 halt_cancel_failed 在位" "$(grep -c '"halt_cancel_failed"' internal/metrics/alerter.go || true)" "1"
+ev_chk "halt_cancel_failed 路由 RoutePush" "$(grep -Ec '"halt_cancel_failed":[[:space:]]*RoutePush' internal/metrics/alert_routing.go || true)" "1"
+ev_min "HTTP/SSE 腿消费失败明细（qmt.go HaltAllFailure）" "$(grep -c 'HaltAllFailure' internal/server/qmt.go || true)" "2"
+ev_chk "A2 后端用例文件在位" "$(test -f internal/trading/halt_a2_test.go && echo 1 || echo 0)" "1"
+ev_min "A2 用例数（主用例+全成功反证）" "$(grep -c '^func Test' internal/trading/halt_a2_test.go || true)" "2"
+ev_min "前端 Quant 页失败回显文案" "$(grep -c '笔未撤成' web/src/pages/Quant.jsx || true)" "1"
+ev_min "SSE 运维告警腿消费 failed 明细" "$(grep -c '笔未撤成' web/src/utils.js || true)" "1"
+
+# ── ② §B1 财务续传键 ──
+ev_chk "季度→期末日显式映射表（四值字面量唯一落点）" "$(grep -c 'QUARTER_END_MMDD = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}' scripts/load_finance.py || true)" "1"
+ev_absent "旧三元嵌套错键（季度序号进月份位＝Q3 永久跳过的根子）" "$(grep -c '31 if q == 1 else' scripts/load_finance.py || true)"
+ev_min "report_period 定义+调用两腿" "$(grep -c 'report_period(year, q)' scripts/load_finance.py || true)" "1"
+ev_min "装载器尾部按报告期 distinct 分布" "$(grep -c 'COUNT(DISTINCT ts_code)' scripts/load_finance.py || true)" "1"
+ev_min "夜间验证按报告期 distinct 分布（不再只有 COUNT(*)）" "$(grep -c 'COUNT(DISTINCT ts_code)' scripts/verify_nightly.sh || true)" "1"
+# 运行时断言（轻量，不连网不写库）：四键真值，重点锤 Q3==YYYY0930（旧键的坑恰好在这季）
+EV_PYOUT="$(python3 -c '
+import sys
+sys.path.insert(0, "scripts")
+import load_finance as lf
+got = [lf.report_period(2024, q) for q in (1, 2, 3, 4)]
+assert got == ["20240331", "20240630", "20240930", "20241231"], got
+print("PYOK")
+' 2>&1 || true)"
+ev_chk "B1 运行时键断言（q=1..4 → 0331/0630/0930/1231）" "$(printf '%s' "$EV_PYOUT" | grep -c 'PYOK' || true)" "1"
+
+# ── ③ §C1 实盘战法库闸 ──
+ev_chk "闸唯一判定点定义在位" "$(grep -c 'func gateLiveStrategyLibrary' internal/engine/registry.go || true)" "1"
+ev_chk "定义+调用两腿齐（各恰 1）" "$(grep -c 'gateLiveStrategyLibrary(dataDir' internal/engine/registry.go || true)" "2"
+ev_chk "not_loaded 规则在位" "$(grep -c '"live_strategy_library_not_loaded"' internal/metrics/alerter.go || true)" "1"
+ev_chk "no_enabled 规则在位" "$(grep -c '"live_strategy_no_enabled_rules"' internal/metrics/alerter.go || true)" "1"
+ev_chk "not_loaded 路由" "$(grep -Ec '"live_strategy_library_not_loaded":[[:space:]]*RoutePush' internal/metrics/alert_routing.go || true)" "1"
+ev_chk "no_enabled 路由" "$(grep -Ec '"live_strategy_no_enabled_rules":[[:space:]]*RoutePush' internal/metrics/alert_routing.go || true)" "1"
+ev_min "两条告警文案分家：读库故障措辞" "$(grep -c '实盘战法库读取失败' internal/metrics/alerter.go || true)" "1"
+ev_min "两条告警文案分家：零条启用措辞" "$(grep -c '零条启用规则' internal/metrics/alerter.go || true)" "1"
+ev_min "三态+反证用例（not_loaded/no_enabled/OK/skipped）" "$(grep -c '^func Test' internal/engine/registry_library_gate_test.go || true)" "4"
+
+# ── ④ §D1 配置热重载补锁 ──
+ev_chk "全局 rules 唯一加锁读口径 Get()" "$(grep -c 'func (m \*Manager) Get() \*Rules {' internal/config/config.go || true)" "1"
+ev_chk "成对快照 RulesD1Snapshot 在位" "$(grep -c 'func (m \*Manager) RulesD1Snapshot' internal/config/config.go || true)" "1"
+ev_chk "Load 发布段 rules 指针替换恰 1 次" "$(grep -c 'm\.rules = wrapper\.Rules' internal/config/config.go || true)" "1"
+ev_chk "Load 发布段 d1 指针替换恰 1 次" "$(grep -c 'm\.d1 = wrapper\.D1' internal/config/config.go || true)" "1"
+ev_absent "config.go 活代码裸读 m.Rules/m.D1（导出字段已私有化；说明注释行不计）" "$(ev_code_hits internal/config/config.go 'm\.Rules\b|m\.D1\b')"
+EV_D1X="$({ grep -rn 'CfgMgr\.Rules\.\|cfgMgr\.Rules\.' --include='*.go' cmd internal 2>/dev/null || true; } | { grep -Ev ':[0-9]+:[[:space:]]*(//|\*)' || true; } | wc -l | tr -d ' ')"
+ev_absent "全仓活代码仍裸读 CfgMgr.Rules.（一律改走 Get()/GetRulesFor 族）" "$EV_D1X"
+ev_chk "-race 反证用例在位（锤 Watch→Load 发布 vs 三读口径）" "$(grep -c 'func TestLoadWatchPublishRace' internal/config/load_watch_race_test.go || true)" "1"
+
+if [ -z "$EV_ERRS" ]; then
+	echo "ok - §0925EVE-W1 守卫通过（A2 锁 10 + B1 锁 6 含运行时键断言 + C1 锁 9 + D1 锁 7）"
+else
+	echo "--- FAIL: §0925EVE-W1 断言不符:${EV_ERRS}"
+	exit 1
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# §99 §0925EVE-W3（2026-09-25 深夜批，owner 令「做完以后…全部做完 + 部署」）
+# 第三波接线收口十一修（C2/C3/C4/C5/C6/C8 + D2/D3/D4/D5留痕 + E2/E4 + B5/B6 + F1/F2）
+# 的落地锁。一物一锁防复活；全部负向锁带**注释行过滤**（§静态负锁教训：
+# 「旧写法不得复活」的说明注释≠旧写法；JSX 还有 {/*…*/} 第三形态，滤要认三种）。
+#   ① §E 交割/网关客户端：补记归因不再写虚构 "settle:"+day（无归因行走显式前缀）、
+#      SettlementTrade 解码 signal_id、BrokerStatus 双腿（/health 基础 + /admin/status
+#      专取，nil=没读到不许冒充）、InAuctionWindow 补第 15 判据（§96 同口径，
+#      函数体 perl 抽取锤「体内确有 IsTradingDay」而非全文件计数）、order() 4xx 直败。
+#   ② §F 观测/审计：资金新鲜度收口 cntime.Loc（controller.go 活代码 time.Local=0）、
+#      SumFilledQty 出错留痕行在位（仍回 0，补的只是日志）、admin.go 审计行 3→8
+#      （五类特权变更各有一行）。
+#   ③ §G 审批一致 + 第三态出口：Apply 失败保持 proposed 的用例在位；qmt_admin.go/
+#      handlers_qmt_admin.go 两新文件、两路由注册、order-confirm 每次尝试落审计；
+#      前端 API 尾部函数与 Quant「待核对委托」卡在位。
+#   ④ §H UAT 自举：数据目录双口径清理（默认路径/所有权标记，防误删非属主目录）、
+#      引擎指纹验证函数、端口 lsof 清场、409 显式话术。
+#   ⑤ §I 前端：Signals.jsx 原生对话框活代码清零、App.jsx 死分支删除、审批后 refetch。
+#   ⑥ §J 调研层：板块腿失败标记透传到类型层与 sector_agent、classifyPhase 未知态、
+#      simulateCombo 循环体内确有 applyMinuteScope（awk 抽函数体，防 map 串台复活）。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 99 §0925EVE-W3 第三波接线收口：交割归因/BrokerStatus双腿/第15判据/4xx直败/时间口径/留痕/审计/审批一致/第三态面板/自举幂等/前端对话框/板块未知态（2026-09-25 owner 令「全部做完后部署」）..."
+EW_ERRS=""
+ew_chk() { if [ "$2" != "$3" ]; then EW_ERRS="${EW_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+ew_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then EW_ERRS="${EW_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+ew_absent() { if [ "${2:-0}" -ne "0" ]; then EW_ERRS="${EW_ERRS}
+  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+# 注释行过滤：Go 行注释、JS 行注释、块注释起始、JSX {/*、块注释续行 * —— 五种形态都算注释
+ew_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
+	{ grep -nE "$2" "$1" 2>/dev/null || true; } | { grep -Ev '^[0-9]+:[[:space:]]*(//|\{?/\*|\*)' || true; } | wc -l | tr -d ' '
+}
+
+# ── ① §E C5 交割归因 ──
+ew_min "无归因行显式前缀常量（不再虚构 settle:+day）" "$(grep -c 'settleUnattributedPrefix' internal/trading/settlement.go || true)" "2"
+ew_absent "旧虚构归因赋值 SignalID: \"settle:\"（活代码）" "$(ew_code_hits internal/trading/settlement.go 'SignalID: "settle:"')"
+ew_chk "SettlementTrade 解码网关 signal_id" "$(grep -c 'json:"signal_id"' internal/trading/qmt_client.go || true)" "1"
+# ── ① §E C4 BrokerStatus 双腿 ──
+ew_min "BrokerStatus 走 /admin/status 专腿" "$(grep -c '/admin/status' internal/trading/qmt_client.go || true)" "1"
+ew_min "读不到不冒充：AdminStatusOK 三态标记" "$(grep -c 'AdminStatusOK' internal/trading/qmt_client.go || true)" "2"
+# ── ① §E C6 第 15 判据（§96 同口径；函数体抽取，不吃全文件计数） ──
+EW_AUC="$(perl -0777 -ne 'my $c = () = /func InAuctionWindow\(.*?\{.*?IsTradingDay/s; print $c' internal/data/fetcher.go)"
+ew_chk "InAuctionWindow 体内确有 IsTradingDay 闸（§96 漏网第 15 判据收口）" "$EW_AUC" "1"
+# ── ① §E C8 4xx 直败 ──
+ew_min "order() 确定性拒绝分类器（定义+调用）" "$(grep -c 'isDeterministicGatewayRejection' internal/trading/qmt_client.go || true)" "2"
+
+# ── ② §F D2 时间口径 ──
+ew_absent "controller.go 活代码 time.Local（资金新鲜度已收口 cntime.Loc）" "$(ew_code_hits internal/trading/controller.go 'time\.Local')"
+# ── ② §F D3 留痕 ──
+ew_chk "SumFilledQty 出错留痕行在位（0=未知口径保留）" "$(grep -c 'SumFilledQty 查询失败按 0 返回' internal/store/real_positions.go || true)" "1"
+# ── ② §F D4 特权审计 ──
+ew_chk "admin.go 审计行 3→8（五类特权变更补齐）" "$(grep -c 'opslog.Audit' internal/server/admin.go || true)" "8"
+
+# ── ③ §G C2 审批一致 ──
+ew_min "Apply 失败保持 proposed 的用例在位" "$(grep -c 'TestResearchApproveApplyFailureKeepsProposed' internal/server/research_test.go || true)" "1"
+# ── ③ §G C3 第三态出口 ──
+ew_chk "网关管理面 Go 客户端新文件在位" "$(test -f internal/trading/qmt_admin.go && echo 1 || echo 0)" "1"
+ew_chk "两 admin 端点 handler 新文件在位" "$(test -f internal/server/handlers_qmt_admin.go && echo 1 || echo 0)" "1"
+ew_min "pending-review/order-confirm 路由注册" "$(grep -c 'pending-review\|order-confirm' internal/server/server.go || true)" "2"
+ew_min "人工改判每次尝试落审计行" "$(grep -c 'qmt_order_confirm' internal/server/handlers_qmt_admin.go || true)" "1"
+ew_min "前端 API 尾部新函数" "$(grep -c 'qmtPendingReview' web/src/api/index.js || true)" "1"
+ew_min "Quant 页待核对委托卡（含四态文案）" "$(grep -c '待核对委托' web/src/pages/Quant.jsx || true)" "2"
+
+# ── ④ §H UAT 自举幂等 + 身份 ──
+ew_min "数据目录所有权标记（双口径清理防误删）" "$(grep -c 'UAT_MARKER' scripts/uat_bootstrap.sh || true)" "4"
+ew_min "引擎实例指纹验证函数（定义+多次调用）" "$(grep -c 'verify_engine_fingerprint' scripts/uat_bootstrap.sh || true)" "2"
+ew_min "端口清场 lsof 判据" "$(grep -c 'lsof -nP -tiTCP' scripts/uat_bootstrap.sh || true)" "1"
+ew_min "409 已初始化显式话术（不再裸喂 json）" "$(grep -c '409' scripts/uat_bootstrap.sh || true)" "1"
+
+# ── ⑤ §I 前端对话框/死分支/refetch ──
+ew_absent "Signals.jsx 活代码 window.prompt/confirm/alert（WebView 静默吞，改走 TDesign）" "$(ew_code_hits web/src/pages/Signals.jsx 'window\.(prompt|confirm|alert)')"
+ew_absent "App.jsx 恒不命中的 msg.signal 死分支（证据链见删除处注释）" "$(ew_code_hits web/src/App.jsx 'msg\.signal')"
+ew_min "审批/驳回/灰度后统一 refetch（不就地改内存状态）" "$(grep -c 'refetchCandidatesAfterAction' web/src/pages/Research.jsx || true)" "2"
+
+# ── ⑥ §J 板块未知态 + 分钟串台 ──
+ew_min "classifyPhase 吃行情腿失败标记" "$(grep -c 'quoteLegFailed' internal/sector_agent/agent.go || true)" "2"
+ew_min "SectorInfo 透传 QuoteLegFailed（数据层字段）" "$(grep -c 'QuoteLegFailed' internal/data/types.go || true)" "1"
+EW_MS="$(awk '/func .*simulateCombo/{f=1} f&&/applyMinuteScope/{c++} f&&/^}$/{exit} END{print c+0}' internal/btreplay/sweep.go)"
+ew_min "simulateCombo 循环体内确有 applyMinuteScope（map 串台不得复活）" "$EW_MS" "1"
+ew_min "两票互不污染回归用例在位" "$(grep -c 'TestSimulateComboMinuteScopePerStock' internal/btreplay/*_test.go 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')" "1"
+
+if [ -z "$EW_ERRS" ]; then
+	echo "ok - §0925EVE-W3 守卫通过（E 交割/网关 7 + F 观测审计 3 + G 审批/第三态 7 + H 自举 4 + I 前端 3 + J 调研层 4）"
+else
+	echo "--- FAIL: §0925EVE-W3 断言不符:${EW_ERRS}"
 	exit 1
 fi
 

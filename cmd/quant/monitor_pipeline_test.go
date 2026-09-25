@@ -75,7 +75,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 		NShape:       config.NShapeConfig{NPatternScoreThreshold: 0.6, HardStopLoss: -5.0},
 		DragonReturn: config.DragonReturnConfig{StopLossPct: -7.0, TakeProfitPct: 15.0, MaxHoldDays: 20},
 	})
-	cfgMgr.Rules.Laodeng = config.LaodengConfig{Enabled: true, MarketCapMin: 500, PeMax: 15, TurnoverMin: 1.0, TechPenalty: -0.3, WeightScore: 0.15}
+	cfgMgr.Get().Laodeng = config.LaodengConfig{Enabled: true, MarketCapMin: 500, PeMax: 15, TurnoverMin: 1.0, TechPenalty: -0.3, WeightScore: 0.15}
 	cfgMgr.Save()
 
 	origTransport := http.DefaultTransport
@@ -93,7 +93,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 
 	stratCfg := cfgMgr.GetStrategyConfig()
 	cAgent := combat_agent.New(stratCfg)
-	cAgent.SetLaodengConfig(&cfgMgr.Rules.Laodeng)
+	cAgent.SetLaodengConfig(&cfgMgr.Get().Laodeng)
 	cAgent.SetRunners([]combat_agent.StrategyRunner{
 		{Type: strategy.SignalDragon, Strategy: dragon.New(cfgMgr)},
 		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(cfgMgr)},
@@ -186,7 +186,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	t.Log("\n=== STAGE 3 ===")
 	r3 := runStage("3_LaodengScore", func() (bool, string) {
-		cfg := &cfgMgr.Rules.Laodeng
+		cfg := &cfgMgr.Get().Laodeng
 		s1 := strategy.ScoreLaodeng(cfg, 2000, 6, 2.5, "银行")
 		s2 := strategy.ScoreLaodeng(cfg, 800, 30, 3.0, "新能源")
 		s3 := strategy.ScoreLaodeng(cfg, 50, 40, 0.5, "半导体")

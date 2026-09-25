@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 )
 
@@ -14,8 +15,11 @@ func testCfg() config.DisciplineConfig {
 }
 
 // at 构造 2026-09-07 指定时刻（时区一致的夹具）。
+// §0925EVE-W3-F（⑰/D2 收口）：夹具时区从 time.Local 改为 cntime.Loc——probeDiscipline 的
+// 窗口计算本身只做相对比较（换时区不改断言），但本包自此不再残留 time.Local 引用，
+// 杜绝后续有人复用此夹具做绝对时区敏感判断时重新引入宿主时区依赖。
 func at(day, hh, mm int) time.Time {
-	return time.Date(2026, 9, 7, hh, mm, 0, 0, time.Local)
+	return time.Date(2026, 9, 7, hh, mm, 0, 0, cntime.Loc)
 }
 
 // TestProbeStopLossWindow 跌穿止损线 → 进入观察窗；窗结算仍无信号 → 止损离场（不滚动）。

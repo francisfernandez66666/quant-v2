@@ -222,7 +222,11 @@ func (c *Controller) AvailableCash() (float64, bool) {
 		return 0, false // 查询失败同为口径不可得
 	}
 	// 对账数据超过 30 分钟视为过期：带着原值返回 fresh=false，由调用方裁决。
-	updated, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, time.Local)
+	// §0925EVE-W3-F（⑰/D2 时间口径收口）：UpdatedAt 是网关按北京时间写入的墙钟串
+	// （cntime 包声明的全系统唯一时区源），此处必须用 cntime.Loc 解析——此前误用
+	// time.Local，UTC 主机上北京墙钟串会被当作 UTC 时刻读成「未来 8 小时」，
+	// Since 为负恒判新鲜，40 分钟前的过期资金照旧放行 fresh=true（H-4 同族口径漂移）。
+	updated, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc)
 	if perr != nil || time.Since(updated) > 30*time.Minute {
 		return acc.AvailableCash, false
 	}
@@ -727,33 +731,71 @@ func (c *Controller) CancelOrder(orderID string) error {
 	return nil
 }
 
-// HaltAll §R4-1 kill-switch 配套：撤销本地账本中全部"已报"/"部成"未成交委托（非占位行），
-// 返回成功撤销数。占位行（pend:，从未到达网关）不撤——由 MarkRealOrderSendFailed 降级口径处理。
-// English: §R4-1 kill-switch companion — cancels every unfilled 已报/部成 (non-placeholder) order;
-// returns the successfully cancelled count. Placeholders are left to the send-failed demotion path.
-func (c *Controller) HaltAll() int {
+// HaltAllFailure §0925EVE-A2：kill-switch 批量撤单中单笔失败的明细。
+// 为什么要带 order_id+原因：旧实现撤单失败只 log+continue，操作者按下"停止交易"后
+// 只看到一个成功计数——没撤掉的单仍在网关挂着，却对触发者完全不可见（本仓主题「降级报成功」）。
+// English: one per-order cancel failure (order id + reason) surfaced to the caller.
+type HaltAllFailure struct {
+	OrderID string `json:"order_id"` // 撤单失败的委托号；"-"/非单号值表示批量前置环节失败（如清单读取）
+	Reason  string `json:"reason"`   // 失败原因（网关错误文本），供前端逐条展示
+}
+
+// HaltAllResult §0925EVE-A2：HaltAll 的结构化返回。
+// Cancelled 保留旧"成功笔数"语义（HTTP 响应字段名不变，向后兼容）；Failed 是新增的
+// 失败明细数组——恒非 nil（JSON 序列化成 []而非 null），前端据此无条件渲染。
+// English: structured HaltAll result; Cancelled keeps the old meaning, Failed is always
+// non-nil so the JSON contract shows an empty array (not null) on full success.
+type HaltAllResult struct {
+	Cancelled int              `json:"cancelled"` // 成功撤销并推进本地行为"已撤"的笔数
+	Failed    []HaltAllFailure `json:"failed"`    // 撤单失败明细（空数组=全部撤成）
+}
+
+// HaltAll §R4-1 kill-switch 配套：撤销本地账本中全部"已报"/"部成"未成交委托（非占位行）。
+// 占位行（pend:，从未到达网关）不撤——由 MarkRealOrderSendFailed 降级口径处理。
+// §0925EVE-A2：返回值从裸 int（只有成功数）升级为 HaltAllResult——失败笔同样必须到达
+// 操作者眼前（HTTP 响应 + 前端提示 + p1 量规告警三腿），log+continue 只是留痕不是告知。
+// 量规 halt_cancel_fail_count 每轮以 len(Failed) 覆写（含清零）：清零这步不能省，否则
+// 上次置位的失败会一直挂着让告警处于 firing 态、恢复（resolved）永远发不出去。
+// 多账号下各 Controller 覆写同一进程级量规与 settlement_diff_count 同口径（单实盘账户场景，可接受）。
+// English: §R4-1 kill-switch companion — cancels every unfilled 已报/部成 (non-placeholder) order.
+// §0925EVE-A2: returns a structured result (cancelled count + per-order failure list) instead of
+// a bare count, and always overwrites the halt_cancel_fail_count gauge so the alert can resolve.
+func (c *Controller) HaltAll() HaltAllResult {
+	// failed 预分配为空切片：保证 JSON 侧是 [] 而不是 null（前端/门禁都按数组消费）
+	res := HaltAllResult{Failed: make([]HaltAllFailure, 0)}
+	// store==nil：控制器无账本可撤（研究环境/降级装配），按"零撤单零失败"返回，量规同步清零
 	if c.store == nil {
-		return 0
+		metrics.SetGauge("halt_cancel_fail_count", 0)
+		return res
 	}
 	orders, err := c.store.RealOrdersForUser(c.userID)
 	if err != nil {
-		return 0
+		// 清单都读不出来时旧实现静默 return 0——kill-switch 按下后一笔没撤却显示"撤销 0 笔
+		// 成功"，正是本缺陷族里最迷惑的形态。现在记为一条前置失败（OrderID 用占位符 "-"），
+		// 让操作者在响应与告警里看到"为什么连清单都读不到"。
+		log.Printf("[trading] HaltAll 委托清单读取失败(用户=%s): %v", c.userID, err)
+		res.Failed = append(res.Failed, HaltAllFailure{OrderID: "-", Reason: "委托清单读取失败: " + err.Error()})
+		metrics.SetGauge("halt_cancel_fail_count", int64(len(res.Failed)))
+		return res
 	}
-	n := 0
 	for _, o := range orders {
 		// §P1-7 kill-switch 同样覆盖部成，撤销剩余未成交部分。
 		if (o.Status != "已报" && o.Status != "部成") || strings.HasPrefix(o.OrderID, "pend:") {
 			continue
 		}
 		if err := c.execRef().Cancel(o.OrderID); err != nil {
+			// §0925EVE-A2：失败不再只 log——记入明细，随响应回传前端并进 p1 量规。
+			// 本地行状态不动（可能仍"已报"），撤不掉的留给 SweepOrders 闭环/人工处置。
 			log.Printf("[trading] HaltAll 撤单失败 %s: %v", o.OrderID, err)
+			res.Failed = append(res.Failed, HaltAllFailure{OrderID: o.OrderID, Reason: err.Error()})
 			continue
 		}
 		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, o.OrderID, "已撤"); err == nil && ok {
-			n++
+			res.Cancelled++
 		}
 	}
-	return n
+	metrics.SetGauge("halt_cancel_fail_count", int64(len(res.Failed)))
+	return res
 }
 
 // SweepResult 撤单闭环单轮执行摘要。

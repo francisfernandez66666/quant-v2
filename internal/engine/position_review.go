@@ -432,7 +432,7 @@ func (e *Engine) runPositionReview(now time.Time, force bool) (int, error) {
 	// 复盘数量上限：默认 24、配置可改（ReviewMax 已夹到 1..50），超限按优先级截断（实盘优先）。
 	limit := 24
 	if e.cfgMgr != nil {
-		limit = e.cfgMgr.Rules.Runtime.ReviewMax()
+		limit = e.cfgMgr.Get().Runtime.ReviewMax() // §0925EVE-D1：字段裸读改加锁访问器
 	}
 	universe := e.reviewUniverse()
 	if len(universe) > limit {
@@ -573,7 +573,7 @@ func (e *Engine) ReviewPositionsIfDue(now time.Time) {
 	if e.cfgMgr == nil {
 		return
 	}
-	rc := e.cfgMgr.Rules.Runtime
+	rc := e.cfgMgr.Get().Runtime // §0925EVE-D1：字段裸读改加锁访问器（原写法与 Watch/Load 指针发布竞态）
 	if !rc.ReviewOn() || data.IsActiveSession(now) {
 		return
 	}

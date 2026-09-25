@@ -16,19 +16,19 @@ func TestParamsConfigLoad(t *testing.T) {
 		t.Skip("backtest_params.json 不存在")
 	}
 	m := config.NewManager(path)
-	if m.Rules.Emotion.EmoClimaxBoardMin == 0 {
+	if m.Get().Emotion.EmoClimaxBoardMin == 0 {
 		t.Error("emotion_cycle 参数未加载")
 	}
-	if m.Rules.Strategy.Dragon.F1SealWeight == 0 {
+	if m.Get().Strategy.Dragon.F1SealWeight == 0 {
 		t.Error("strategy.dragon 参数未加载")
 	}
-	if m.Rules.Strategy.Momentum.MACDWeight == 0 {
+	if m.Get().Strategy.Momentum.MACDWeight == 0 {
 		t.Error("strategy.momentum 参数未加载")
 	}
-	if m.Rules.Laodeng.MarketCapMin == 0 {
+	if m.Get().Laodeng.MarketCapMin == 0 {
 		t.Error("laodeng 参数未加载")
 	}
-	if len(m.D1.Rules) == 0 {
+	if len(m.GetD1Config().Rules) == 0 { // §0925EVE-D1：D1 字段转私有，经加锁访问器读取
 		t.Error("d1.rules 未加载")
 	}
 }

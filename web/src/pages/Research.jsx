@@ -461,28 +461,40 @@ export default function Research() {
     } catch (_) { return [] }
   }
 
+  // §0925EVE-W3-I（条目 E4b）审批三动作（通过/驳回/灰度）统一收口：接口成功后重新拉取候选
+  // 列表与进度计数（页面既有 loadData/loadProgress），不再就地改 c.status——旧写法只改内存
+  // 对象不触发重渲染，且后端真实落库状态（如 applied/灰度细分）可能与前端硬编码值不一致；
+  // 接口失败时只报错，列表状态保持服务端原样，绝不假改。
+  // English: §0925EVE-W3-I — approve/reject/grayscale now refetch the candidate list + progress via
+  // the page's existing loaders instead of mutating the in-memory status (which never re-rendered
+  // and could diverge from the server); failures leave the list untouched.
+  async function refetchCandidatesAfterAction() {
+    await loadData()
+    await loadProgress()
+  }
+
   // 审批并通过接口应用某条研究候选（写回后端并热更新状态），权限不足时回退
   async function doApprove(c) {
     try {
       await api.approveResearchCandidate(c.id)
-      c.status = 'applied'
       showToast('候选 #' + c.id + ' 已审批并应用', 'success')
+      await refetchCandidatesAfterAction() // §0925EVE-W3-I：refetch 取服务端权威状态
     } catch (e) { showToast('审批失败: ' + (e.message || e), 'error') }
   }
   async function doReject(c) {
   // 驳回某研究候选（调用后端拒绝接口）
     try {
       await api.rejectResearchCandidate(c.id)
-      c.status = 'rejected'
       showToast('候选 #' + c.id + ' 已驳回', 'success')
+      await refetchCandidatesAfterAction() // §0925EVE-W3-I：同上
     } catch (e) { showToast('驳回失败: ' + (e.message || e), 'error') }
   }
   async function doGrayscale(c) {
   // 候选进入灰度观察（§Phase2）：写入灰度库、仅 paper 盘消费，不上实盘 8a/8b
     try {
       await api.grayscaleResearchCandidate(c.id)
-      c.status = 'grayscale'
       showToast('候选 #' + c.id + ' 已进入灰度观察（模拟盘实测）', 'success')
+      await refetchCandidatesAfterAction() // §0925EVE-W3-I：同上
     } catch (e) { showToast('灰度失败: ' + (e.message || e), 'error') }
   }
 

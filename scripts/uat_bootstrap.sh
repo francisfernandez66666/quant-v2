@@ -14,6 +14,24 @@
 #   ./scripts/uat_bootstrap.sh env     # 只打印 E2E_* 环境变量（供手工跑）
 #
 # 端口/账号/数据目录均可经环境变量覆盖（见下方默认值）。
+#
+# §0925EVE-W3-H（2026-09-25 晚实跑锤出，FIX_PLAN_20260925EVE ㉓ F1/F2）——UAT 自举两缺陷：
+#   F1 残留数据目录不幂等：上一轮 .uat-data 里 admin 已初始化时，`POST /setup` 回 409，
+#      旧版把 curl -f 吐出的 HTML 错误体直接喂进 python json 解析器炸 traceback，真因被掩盖。
+#      现口径：开头对"本脚本声明的数据目录"做**有防误删闸的重置**——路径恰为默认
+#      $ROOT/.uat-data、或目录内有本脚本落的所有权标记文件（$UAT_MARKER）才自动清空重建；
+#      两者皆不满足（如 QUANT_DATA_DIR 误指生产盘）一律拒绝清退、打人话报错退出。
+#      错误体也不再裸喂解析器：非 200 先原样打印响应，再退出。
+#   F2 就绪检查不验实例身份：旧版只看 `GET /setup==200` 就算就绪，别的进程占着 18080
+#      （本机僵尸引擎 / quant-binance 同端口史有珠）即"假就绪"打到别人实例。现口径三段：
+#      a) 启动前用 lsof 探 18080/18789/5173 三端口——占用者若不是本脚本上轮 pid 文件记录的
+#         pid（杀旧只按 pid 文件，绝不用 pkill -f 捞人；§PICKILL-SCOPE 教训），直接报错退出
+#         并打印占位者 pid/命令行，绝不静默复用；
+#      b) 引擎就绪判据 =「自家 engine.pid 存活 AND GET /setup 回 JSON initialized:false
+#         AND :$BACKEND_PORT 的监听者 pid == 本实例 pid」。/api/status 的 build_commit 指纹
+#         更强但该端点挂 authMiddleware（server.go:697），初始化前拿不到 token——指纹比对
+#         挪到 setup 成功后与重启后会合执行（verify_engine_fingerprint）；
+#      c) 前端/重启就绪同样带 pid/端口归属校验，超时即红不再静默放行。
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -33,6 +51,11 @@ QMT_TOKEN="${QMT_TOKEN:-uat-secret}"
 PY="${PYTHON:-python3}"
 BACKEND="http://127.0.0.1:${BACKEND_PORT}"
 PIDDIR="$DATA_DIR/pids"
+# §0925EVE-W3-H F1：数据目录所有权标记。目录内有此文件 = 本脚本声明的"一次性 UAT 盘"，
+# 开头可自动 rm -rf 重建；无此文件且路径非默认 .uat-data = 拒绝清理（防 QUANT_DATA_DIR
+# 误指生产/他人数据目录时被无脑删库）。
+DEFAULT_DATA_DIR="$ROOT/.uat-data"
+UAT_MARKER=".uat-managed-by-uat_bootstrap"
 
 log()  { printf '\033[1;36m[uat-boot]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[uat-boot:warn]\033[0m %s\n' "$*" >&2; }
@@ -99,16 +122,80 @@ command -v go >/dev/null   || die "缺 go 工具链"
 command -v node >/dev/null || die "缺 node（vite 前端）"
 command -v "$PY" >/dev/null || die "缺 ${PY}（seed 脚本依赖）"
 
-# ── 1) 干净数据目录 + 构建二进制 ───────────────────────────────────────────
+# §0925EVE-W3-H F2 辅助：端口归属三件套（lsof/ps 判读 + 归属断言）。
+# HAVE_LSOF=0 时端口判据降级放行（只剩 pid 存活 + /setup 身份两级判据），并显式告警
+# 残余风险="别的进程占着同端口应答"无法用监听者归属排除——macOS/Ubuntu 均自带 lsof，
+# 走到降级分支本身就是异常环境，宁可红着提示也不假装全绿。
+HAVE_LSOF=0
+command -v lsof >/dev/null && HAVE_LSOF=1
+# 列出监听某端口的 pid（每行一个；无 lsof 或无监听者时输出空）
+lsof_listeners() { [[ "$HAVE_LSOF" == 1 ]] || return 0; lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null || true; }
+# 某 pid 的命令行摘要（占位者报告用）
+proc_cmd() { ps -p "$1" -o command= 2>/dev/null | cut -c1-200 || echo "<进程已消失>"; }
+# 断言 <pid> 在 <port> 上有监听归属；lsof 缺失时恒真（降级）
+port_owned_by() {
+  [[ "$HAVE_LSOF" == 1 ]] || return 0
+  lsof_listeners "$1" | grep -qx "$2"
+}
+
+# ── 1) 干净数据目录（§0925EVE-W3-H F1：带防误删闸的重置）────────────────────
 log "数据目录：$DATA_DIR"
-rm -rf "$DATA_DIR"
+# 先抢救上一轮 pid 记录（F2-a 用）：rm -rf 之后 PIDDIR 就没了，必须在清理前读。
+# 只认本脚本 pid 文件里的 pid——macOS pkill -f 连 env 一起匹配会误伤同机其它 checkout
+# 的教训见 §PICKILL-SCOPE，这里从根上不给它出场机会。
+OLD_PIDS=""
+if [[ -d "$PIDDIR" ]]; then
+  for pf in "$PIDDIR"/*.pid; do
+    [[ -f "$pf" ]] || continue
+    OLD_PIDS="$OLD_PIDS $(cat "$pf" 2>/dev/null || true)"
+  done
+fi
+if [[ -d "$DATA_DIR" ]]; then
+  if [[ "$DATA_DIR" == "$DEFAULT_DATA_DIR" || -f "$DATA_DIR/$UAT_MARKER" ]]; then
+    # 默认路径或带本脚本所有权标记：确认是 UAT 一次性盘，直接清空重建（幂等，上一轮残留
+    # 不再需要人工处理——旧版"目录还在但 pid 记录已死"就卡在这炸 409）。
+    log "检测到上一轮 UAT 残留（${DATA_DIR}），按本脚本声明的一次性目录口径自动清空重建"
+    rm -rf "$DATA_DIR"
+  else
+    # 非默认路径且无标记文件：脚本没有权限替用户删目录。报错退出打人话，绝不 rm、
+    # 也绝不带着旧初始化态继续跑（旧版正是"不清理硬上"→ POST /setup 409 → 错误体喂
+    # json 解析器炸 traceback 掩盖真因）。
+    die "上一轮 UAT 残留：目标数据目录 $DATA_DIR 非本脚本默认盘（${DEFAULT_DATA_DIR}）且无所有权标记 ${UAT_MARKER}，拒绝自动清理。请先人工确认内容后执行 rm -rf ${DATA_DIR}，或不设 QUANT_DATA_DIR 用默认盘重跑。"
+  fi
+fi
 mkdir -p "$DATA_DIR" "$PIDDIR"
+# 落所有权标记：此后该目录被本脚本认领，下轮开头可安全自动重置
+printf 'uat_bootstrap.sh 声明的一次性 UAT 数据目录（删除无害；勿放生产数据）\n' > "$DATA_DIR/$UAT_MARKER"
+
+# §0925EVE-W3-H F2-a：启动前端口清场。
+# 只回收"本脚本上轮 pid 文件记录的 pid"；其余占位者一律报错退出并打印 pid/命令行，
+# 绝不静默复用（静默复用=打到别人实例上产假绿/假红，09-25 晚两次 409 的真身）。
+for pid in $OLD_PIDS; do
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    log "已回收上轮自举遗留进程 pid=${pid}（依据 $PIDDIR 的 *.pid 记录，非模式匹配）"
+  fi
+done
+if [[ -n "$OLD_PIDS" ]]; then sleep 1; fi   # 给 SIGTERM 一点释放端口的时间
+for spec in "$BACKEND_PORT:引擎" "$MOCK_PORT:qmt-mock" "$FRONT_PORT:vite"; do
+  port="${spec%%:*}"; name="${spec##*:}"
+  pids="$(lsof_listeners "$port")"
+  if [[ -n "$pids" ]]; then
+    for occ in $pids; do
+      die "端口 :${port}（${name} 期望口）仍被非本脚本进程占用 pid=${occ}：$(proc_cmd "$occ")。本脚本不复用/不抢占，请先停掉该进程，或经 UAT_BACKEND_PORT/UAT_MOCK_PORT/UAT_FRONT_PORT 换端口。"
+    done
+  fi
+done
+[[ "$HAVE_LSOF" == 1 ]] || warn "缺 lsof：端口占用探测降级为 pid 存活 + /setup 身份两级判据（残余风险=他人进程占同端口应答不可辨）"
 
 log "构建 quant 引擎与 qmt-mock 假柜台..."
 # §F6（2026-09-22）：与生产部署同款式注入 git 指纹（deploy_guangzhou.sh 步[1/5] / deploy_seoul.sh 步[1/8]
 # 的 LDFLAGS="-X main.buildCommit=..."）。旧版裸 go build → UAT 栈 buildCommit 恒为 unknown，
-# 引擎启动自检（cmd/quant/main.go）走"未注入指纹"告警分支，A7 真栈用例与线上口径脱节。
-LDFLAGS="-X main.buildCommit=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# 引擎启动自检（cmd/quant/main.go）走"未注入指纹"分支，A7 真栈用例与线上口径脱节。
+# §0925EVE-W3-H F2-b：BUILD_COMMIT 同时是就绪后的身份指纹——/api/status.build_commit 必须等于
+# 本值（unknown 时跳过比对并告警），防"打到了别的构建的实例"。
+BUILD_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+LDFLAGS="-X main.buildCommit=${BUILD_COMMIT}"
 ( cd "$ROOT" && go build -ldflags "${LDFLAGS}" -o "$PIDDIR/quant" ./cmd/quant )
 ( cd "$ROOT" && go build -o "$PIDDIR/qmt-mock" ./cmd/qmt-mock )
 
@@ -227,26 +314,78 @@ fi
   > "$DATA_DIR/mock.log" 2>&1 &
 echo $! > "$PIDDIR/mock.pid"
 
-# ── 3) 起 quant 引擎（独立数据目录），等 /setup 可达 ────────────────────────
+# ── 3) 起 quant 引擎（独立数据目录），等"确认是本实例"的就绪 ─────────────────
 log "启动 quant 引擎 (:${BACKEND_PORT})..."
 QUANT_DATA_DIR="$DATA_DIR" QUANT_ADDR=":${BACKEND_PORT}" \
   "$PIDDIR/quant" > "$DATA_DIR/engine.log" 2>&1 &
-echo $! > "$PIDDIR/engine.pid"
+ENGINE_PID=$!
+echo "$ENGINE_PID" > "$PIDDIR/engine.pid"
+# §0925EVE-W3-H F2-b 就绪判据（旧版"GET /setup==200 即就绪"作废）三条同时满足：
+#   ① 自家 engine.pid 存活——进程半路崩（如端口绑定失败）当场红，不用等超时；
+#   ② GET /setup 回**JSON 且 initialized:false**——本脚本刚 rm -rf 重建过数据目录，
+#      健康的本实例此刻必然未初始化；别的已长期运行的实例会回 true，直接锤死"假就绪"
+#      （旧版只看状态码 200，僵尸引擎/quant-binance 同端口应答时打到别人家毫无感知）；
+#   ③ :$BACKEND_PORT 的监听者 pid == ENGINE_PID——响应确认由本进程发出（lsof 缺失时降级跳过）。
+# 注：/api/status 的 build_commit 指纹是更强的第四判据，但该端点挂 authMiddleware
+# （internal/server/server.go:697），此刻尚无 token——指纹比对后置到 setup 成功之后（见步 4 尾）。
+ready=0
 for i in $(seq 1 60); do
-  code="$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' "$BACKEND/setup" 2>/dev/null || true)"
-  [[ "$code" == "200" ]] && break
+  kill -0 "$ENGINE_PID" 2>/dev/null || { cat "$DATA_DIR/engine.log" >&2; die "引擎进程已退出（pid=${ENGINE_PID}），见上方 engine.log"; }
+  setup_probe="$(curl --noproxy '*' -s "$BACKEND/setup" 2>/dev/null || true)"
+  # JSON 解析失败（空串/HTML/别的进程乱吐）一律按未就绪处理，不打 traceback——09-25 晚
+  # 就是 409 错误体被喂进解析器炸出 traceback 掩盖真因。
+  if printf '%s' "$setup_probe" | "$PY" -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("initialized") is False else 1)' 2>/dev/null; then
+    if port_owned_by "$BACKEND_PORT" "$ENGINE_PID"; then
+      ready=1; break
+    fi
+    # /setup 说"未初始化"但监听者不是自家 pid：极小竞态窗口（别人进程刚好也回 false），
+    # 不判死，继续轮询等自家监听就绪；60 轮仍如此则下方超时红。
+  fi
   sleep 1
 done
-[[ "$code" == "200" ]] || { cat "$DATA_DIR/engine.log" >&2; die "引擎未就绪（/setup 非 200）"; }
-log "引擎就绪。"
+[[ "$ready" == 1 ]] || { cat "$DATA_DIR/engine.log" >&2; die "引擎未就绪：60s 内未同时满足「pid=$ENGINE_PID 存活 + /setup 回 initialized:false + :${BACKEND_PORT} 监听归属本 pid」——若日志显示端口绑定失败，多半是他进程占口（见 F2-a 报错口径），最后一次的 /setup 原始响应：${setup_probe:-<空>}"; }
+log "引擎就绪（pid=$ENGINE_PID 身份已核验）。"
 
 # ── 4) seed 账号 + 租户配额 + QMT 配置 ──────────────────────────────────────
 log "初始化 admin 账号 / 创建 tester / 上调租户配额 / 装配 QMT..."
-TOKEN="$(api -X POST "$BACKEND/setup" -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$E2E_USER\",\"password\":\"$E2E_PASS\"}" \
-  | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["token"])')"
-[[ -n "$TOKEN" ]] || die "admin token 获取失败"
+# §0925EVE-W3-H F1：POST /setup 不再 `curl -f | python`——旧写法在 409（已初始化）时把
+# 错误体直接喂进 json 解析器，traceback 刷屏且掩盖"上一轮残留/假就绪"真因。
+# 现口径：状态码与响应体分开捕获；非 200 原样打印响应再打人话退出；200 但解析失败
+# 同样打印原始响应（错误体永远先见天日，再谈解析）。
+setup_http="$(curl --noproxy '*' -s -w '\n%{http_code}' -X POST "$BACKEND/setup" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$E2E_USER\",\"password\":\"$E2E_PASS\"}")"
+setup_code="${setup_http##*$'\n'}"           # 末行 = HTTP 状态码
+setup_body="${setup_http%$'\n'*}"            # 去掉末行 = 原始响应体
+if [[ "$setup_code" != "200" ]]; then
+  if [[ "$setup_code" == "409" ]]; then
+    die "POST /setup 回 409（admin 已初始化）。数据目录本轮已按 F1 重置且就绪判据核验过 initialized:false，此刻 409 只可能是：①打到了别的实例（F2 防线破口，请查 lsof -iTCP:${BACKEND_PORT}）；②竞态抢跑。原始响应：${setup_body}"
+  fi
+  die "POST /setup 失败（HTTP ${setup_code}）。原始响应：${setup_body}"
+fi
+if ! TOKEN="$(printf '%s' "$setup_body" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"; then
+  die "POST /setup 回了 200 但响应解析不出 token（形态非契约？）。原始响应：${setup_body}"
+fi
+[[ -n "$TOKEN" ]] || die "admin token 获取失败（响应 token 为空）。原始响应：${setup_body}"
 echo "$TOKEN" > "$DATA_DIR/admin.token"
+
+# §0925EVE-W3-H F2-b：拿到 token 后补第四身份判据——GET /api/status.build_commit 必须
+# 等于本次 go build 注入的 BUILD_COMMIT（该端点挂 authMiddleware，初始化前探不了，故后置）。
+# unknown 场景（git 不可用/裸构建）无指纹可比，降级告警。
+verify_engine_fingerprint() {
+  local stage="$1" st_probe bc
+  st_probe="$(curl --noproxy '*' -s "$BACKEND/api/status" -H "Authorization: Bearer $TOKEN" 2>/dev/null || true)"
+  bc="$(printf '%s' "$st_probe" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("build_commit",""))' 2>/dev/null || true)"
+  if [[ "$BUILD_COMMIT" == "unknown" ]]; then
+    warn "§0925EVE-W3-H ${stage}：本构建无 git 指纹（BUILD_COMMIT=unknown），build_commit 比对跳过（残余风险=无法辨构建代次，端口归属判据仍生效）"
+    return 0
+  fi
+  if [[ "$bc" != "$BUILD_COMMIT" ]]; then
+    die "§0925EVE-W3-H ${stage}：/api/status.build_commit='${bc:-<空/解析失败>}' ≠ 本实例注入值 '${BUILD_COMMIT}'——打到了别的构建的实例（假就绪），原始响应：${st_probe}"
+  fi
+  log "${stage}：build_commit 指纹比对通过（${BUILD_COMMIT}）。"
+}
+verify_engine_fingerprint "setup 后"
 
 api -X POST "$BACKEND/api/admin/users" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
@@ -330,15 +469,24 @@ print("backdated positions:", n, "files:", len(files))
 PY
 QUANT_DATA_DIR="$DATA_DIR" QUANT_ADDR=":${BACKEND_PORT}" \
   "$PIDDIR/quant" > "$DATA_DIR/engine2.log" 2>&1 &
-echo $! > "$PIDDIR/engine.pid"
+ENGINE_PID=$!
+echo "$ENGINE_PID" > "$PIDDIR/engine.pid"
+# §0925EVE-W3-H F2-b：重启后就绪判据同步升级——此刻系统已初始化（/setup 恒回
+# initialized:true，"未初始化"身份证据作废），改用「pid 存活 + /api/health 200 +
+# 端口监听归属新 pid」三判据，随后再走 build_commit 指纹四判据（verify_engine_fingerprint）。
+ready=0
 for i in $(seq 1 60); do
+  kill -0 "$ENGINE_PID" 2>/dev/null || { cat "$DATA_DIR/engine2.log" >&2; die "引擎重启进程已退出（pid=${ENGINE_PID}），见上方 engine2.log"; }
   code="$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' "$BACKEND/api/health" \
     -H "Authorization: Bearer $TOKEN" 2>/dev/null || true)"
-  [[ "$code" == "200" ]] && break
+  if [[ "$code" == "200" ]] && port_owned_by "$BACKEND_PORT" "$ENGINE_PID"; then
+    ready=1; break
+  fi
   sleep 1
 done
-[[ "$code" == "200" ]] || { cat "$DATA_DIR/engine2.log" >&2; die "引擎重启后 /api/health 未 200"; }
-log "引擎重启就绪。"
+[[ "$ready" == 1 ]] || { cat "$DATA_DIR/engine2.log" >&2; die "引擎重启未就绪：60s 内未同时满足「pid=$ENGINE_PID 存活 + /api/health 200 + :${BACKEND_PORT} 监听归属本 pid」"; }
+verify_engine_fingerprint "重启后"
+log "引擎重启就绪（pid=$ENGINE_PID 身份已核验）。"
 
 # ── 8) 前端依赖 + 起 vite dev ──────────────────────────────────────────────
 if [[ ! -d "$ROOT/web/node_modules" ]]; then
@@ -346,13 +494,51 @@ if [[ ! -d "$ROOT/web/node_modules" ]]; then
   ( cd "$ROOT/web" && npm ci )
 fi
 log "启动 vite dev (:${FRONT_PORT}, 代理→:${BACKEND_PORT})..."
+# §0925EVE 收口补（本机两连锤，macOS bash 3.2）：
+#   ① 不能用 `npx vite`——$! 记的是 npx 包装进程，真监听者是其子 node，收尸打空（§VITE-ORPHAN 兜底）；
+#   ② 也不能用 `( cd web && bin & echo $! )`——bash 3.2 下这个子壳会把端口监听者留作自己的子进程
+#      且自身不随主脚本退出（实录：vite.pid 记成子壳 pid、孤儿子壳攥着 stdout 管道让上层 tail 永不
+#      EOF）。改顶层直起绝对路径本地 bin（shebang `#!/usr/bin/env node` 走 exec，$! 即监听者），
+#      顶层 `&` 挂一个只做 cd+exec 的子壳——exec 让该子壳直接变身为 node 监听者，
+#      $! 即真身、无中间层（vite 无 --root 选项，root 是位置参数，改走 cwd 定位项目根；
+#      且保留 cmdline 与 §VITE-ORPHAN 兜底模式的 `vite --port <port>` 前缀序）。
+#      真值最终以 lsof 反查为准：就绪后反查端口属主、验 cmdline+cwd 归属才落 vite.pid，
+#      拿不到/对不上直接红——身份缺失绝不静默放行（F2-c 口径的另一半）。
 ( cd "$ROOT/web" && VITE_BACKEND_PORT="$BACKEND_PORT" \
-    npx vite --port "$FRONT_PORT" --strictPort > "$DATA_DIR/vite.log" 2>&1 & echo $! > "$PIDDIR/vite.pid" )
+    exec ./node_modules/.bin/vite --port "$FRONT_PORT" --strictPort > "$DATA_DIR/vite.log" 2>&1 ) &
+VITE_BG_PID=$!
+echo "$VITE_BG_PID" > "$PIDDIR/vite.pid"
+# §0925EVE-W3-H F2-c：旧版前端探测循环超时后**静默放行**（无收尾断言），vite 没起来也照跑
+# 全套 e2e 红成雾。现超时即红并附 vite.log；--strictPort 保证端口被占时 vite 自败，
+# 与步 1 前的端口清场（F2-a）互为犄角。
+# §0925EVE 收口补（本机首跑锤出）：探测主机名必须走 localhost 而非 127.0.0.1——
+# macOS 上 node 裸起 vite 默认只绑 [::1]（实测 lsof 只见 IPv6），127.0.0.1 探测 60s
+# 恒不可达＝就绪判据结构性必红；而 Playwright baseURL 就是 http://localhost:5173，
+# 判据与真实消费面对齐（§探针按运行时真实取值链口径）。
+front_ready=0
 for i in $(seq 1 60); do
-  curl --noproxy '*' -fsS "http://127.0.0.1:${FRONT_PORT}" >/dev/null 2>&1 && break
+  if curl --noproxy '*' -fsS "http://localhost:${FRONT_PORT}" >/dev/null 2>&1; then front_ready=1; break; fi
   sleep 1
 done
-log "前端就绪。"
+[[ "$front_ready" == 1 ]] || { cat "$DATA_DIR/vite.log" >&2; die "前端未就绪：60s 内 http://localhost:${FRONT_PORT} 不可达（见上方 vite.log；若为端口占用，对照 F2-a 口径排查占位进程）"; }
+# §0925EVE 收口补：就绪不等于身份核验——vite.pid 必须钉在**真正的端口属主**上，
+# stop 的按 pid 收尸才不会打空。三查：lsof 反查监听 pid → cmdline 含本次 vite 与端口 →
+# cwd 落在本仓库 web/（同机另一 checkout 抢口时 cmdline 形态相同，只有 cwd 能区分）。
+# 任一查不到即红：宁可停机，也不让一个 pid 错位的 vite 逃过下次 stop。
+VITE_LPID="$(lsof -nP -iTCP:"${FRONT_PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+[[ -n "$VITE_LPID" ]] || die "前端就绪但反查不到 :${FRONT_PORT} 监听 pid（lsof 为空）——vite.pid 拒绝登记一个未知属主"
+VITE_LCMD="$(ps -o command= -p "$VITE_LPID" 2>/dev/null || true)"
+case "$VITE_LCMD" in
+  *node_modules/.bin/vite\ --port\ ${FRONT_PORT}*) ;;
+  *) die ":${FRONT_PORT} 监听者不是本次拉起的 vite（cmdline：${VITE_LCMD}）——拒绝把 vite.pid 记到别人头上";;
+esac
+VITE_LCWD="$(lsof -a -p "$VITE_LPID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)"
+case "$VITE_LCWD" in
+  "$ROOT/web"|"$ROOT") ;;
+  *) die ":${FRONT_PORT} 监听者 cwd=${VITE_LCWD} 不属于本仓库（$ROOT/web）——疑似另一份 checkout 占口，拒绝登记";;
+esac
+echo "$VITE_LPID" > "$PIDDIR/vite.pid"
+log "前端就绪（vite.pid=$VITE_LPID 已核验为端口真实属主：cmdline+cwd 双查）。"
 
 # ── 收尾 ───────────────────────────────────────────────────────────────────
 echo

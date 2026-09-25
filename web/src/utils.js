@@ -97,13 +97,22 @@ export function toStr(v) {
 export function sseOpsAlert(msg) {
   if (!msg || typeof msg !== 'object') return null
   switch (msg.type) {
-    case 'qmt_halt':
+    case 'qmt_halt': {
       // halted=true=置位熔断（伴随撤在途单），false=解除；两者都必须让 UI 立刻知道
-      return msg.halted
-        ? { key: 'qmt_halt', title: '量仔 实盘熔断', tone: 'error',
-          body: '实盘已紧急停止，在途委托撤销 ' + (msg.cancelled || 0) + ' 笔' + (msg.time ? '（' + msg.time + '）' : '') }
-        : { key: 'qmt_halt', title: '量仔 实盘恢复', tone: 'success',
+      if (!msg.halted) {
+        return { key: 'qmt_halt', title: '量仔 实盘恢复', tone: 'success',
           body: '熔断已解除，恢复正常下单' + (msg.time ? '（' + msg.time + '）' : '') }
+      }
+      // §0925EVE-A2（2026-09-25）：撤单失败明细随 SSE 一起下发（后端 qmt.go failed 数组）。
+      // 只报"撤销 N 笔"就是把"没撤干净"藏进成功计数里——失败笔仍挂在网关，全局 Toast 必须
+      // 当场点名单号清单，这是操作者不盯页面也能反应的最后一条腿。failed 恒为数组，防御性判一下。
+      const failed = Array.isArray(msg.failed) ? msg.failed : []
+      let body = '实盘已紧急停止，在途委托撤销 ' + (msg.cancelled || 0) + ' 笔' + (msg.time ? '（' + msg.time + '）' : '')
+      if (failed.length) {
+        body += '；' + failed.length + ' 笔未撤成（' + failed.map((f) => (f && f.order_id ? f.order_id : '-')).join('、') + '），仍在途，请立即人工处置'
+      }
+      return { key: 'qmt_halt', title: '量仔 实盘熔断', tone: 'error', body }
+    }
     case 'positions_clear_guard':
       // 守卫触发：空快照试图清空持仓被拒（qmt.go:495-520），资损级安全事件，红色强提醒
       return { key: 'pcg', title: '量仔 持仓清空守卫', tone: 'error',

@@ -946,7 +946,10 @@ export async function fetchQMTOrders() {
 
 /** 实盘 kill-switch：置位/解除人工紧急停止（§R4-1/§U-2；资损级，仅 admin） */
 /** Live kill-switch: engage/release manual emergency halt (admin only) */
-// 对应 POST /api/qmt/halt，body { halted: true|false }，返回 { ok, halted, cancelled }
+// 对应 POST /api/qmt/halt，body { halted: true|false }，返回 { ok, halted, cancelled, failed }
+// §0925EVE-A2：failed 为撤单失败明细数组 [{ order_id, reason }]，恒为数组（全成功时是 []）；
+// 部分失败仍返回 200——停止交易没撤干净不是请求失败，但调用方必须把明细渲染给操作者。
+// English: response now carries cancelled count + non-null failure list so partial halts stay visible.
 export async function qmtHalt(halted) {
   return request('/api/qmt/halt', { method: 'POST', data: { halted } })
 }
@@ -2215,4 +2218,20 @@ export async function rejectOptimization(id) {
  *  对应后端 POST /api/paper/reset（body 原样透传后端，与 resetPaper() 共用同一路由） */
 export async function paperResetV2(body) {
   return request('/api/paper/reset', { method: 'POST', data: body })
+}
+
+/** §0925EVE-W3-G（FIX_PLAN ⑫ C3）第三态「待核对」清单（GET /api/qmt/pending-review，仅 admin）：
+ *  网关 unresolved_orders 的人工核对入口，返回 {ok, orders:[{signal_id,code,side,qty,created_at,
+ *  dispatch_in_flight}], unresolved_count, truncated, active, gateway_ts, failover_enable}。
+ *  失败（网关不可达/未接入）后端如实 502/503 抛错——调用方必须区分「查询失败」与「确实没有」。 */
+export async function qmtPendingReview() {
+  return request('/api/qmt/pending-review')
+}
+
+/** §0925EVE-W3-G 第三态人工确认（POST /api/qmt/order-confirm，仅 admin，后端每次尝试落 opslog 审计）：
+ *  body={wire_ref:"<signal_id>", decision:"released"|"settled", order_id?, status?}
+ *  released=柜台确无此单→删占位解锁（可重下单）；settled=柜台有此单→占位改正常终态（可回填委托号）。
+ *  本操作永不重发订单；网关拒绝（400/404/409）带原因抛错，前端如实回显。 */
+export async function qmtOrderConfirm(body) {
+  return request('/api/qmt/order-confirm', { method: 'POST', data: body })
 }

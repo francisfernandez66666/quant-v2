@@ -117,6 +117,22 @@ describe('sseOpsAlert', () => {
     expect(clr.tone).toBe('success')
     expect(clr.body).toContain('熔断已解除')
   })
+  // §0925EVE-A2（2026-09-25）：撤单失败明细必须进 Toast 文案——"撤销 N 笔"不能冒充全部撤成，
+  // 未撤成的单号要点名给操作者（后端 failed 数组恒存在，这里同时验证缺省/空数组不干扰旧文案）
+  it('qmt_halt 置位带 failed 明细时点明笔数与单号清单', () => {
+    const withFail = sseOpsAlert({ type: 'qmt_halt', halted: true, cancelled: 1, time: '10:00:01',
+      failed: [{ order_id: 'GW-101', reason: 'gateway 409' }, { order_id: 'GW-102', reason: 'timeout' }] })
+    expect(withFail.tone).toBe('error')
+    expect(withFail.body).toContain('2 笔未撤成')
+    expect(withFail.body).toContain('GW-101')
+    expect(withFail.body).toContain('GW-102')
+    expect(withFail.body).toContain('人工处置')
+    // 反证：全成功（failed 为空数组）与旧响应体（无 failed 字段）都不出现失败文案
+    const ok = sseOpsAlert({ type: 'qmt_halt', halted: true, cancelled: 2, time: '10:00:01', failed: [] })
+    expect(ok.body).not.toContain('未撤成')
+    const legacy = sseOpsAlert({ type: 'qmt_halt', halted: true, cancelled: 2, time: '10:00:01' })
+    expect(legacy.body).not.toContain('未撤成')
+  })
   it('positions_clear_guard 带持仓条数强提醒', () => {
     const a = sseOpsAlert({ type: 'positions_clear_guard', held: 3, time: '11:11:11' })
     expect(a.tone).toBe('error')

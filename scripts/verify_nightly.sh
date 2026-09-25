@@ -21,15 +21,26 @@ echo "" | tee -a "$LOG"
 echo "--- [3] quant-research 最近日志 ---" | tee -a "$LOG"
 ssh -o ConnectTimeout=30 "$HOST" "journalctl -u quant-research --since '15:30' --no-pager 2>/dev/null | tail -40" 2>&1 | tee -a "$LOG"
 
-# 4) 候选产出
+# 4) 候选产出 + 财务数据按报告期分布（§0925EVE-B1 升级：只打印 COUNT(*) 发现不了
+#    "整季缺失"——旧续传键把季度序号错放月份位，导致每年 0930 期被永久跳过。
+#    现按 end_date 打印每季 distinct ts_code 数，缺期一眼可见。
+#    注意本仓教训：set -e 下 grep 计数管道必须 || true，勿引入静默中止；此处 python
+#    段同理不做会非零退出的裸 grep。）
 echo "" | tee -a "$LOG"
-echo "--- [4] 候选产出 ---" | tee -a "$LOG"
+echo "--- [4] 候选产出 / 财务报告期分布 ---" | tee -a "$LOG"
 ssh -o ConnectTimeout=30 "$HOST" "python3 -c \"
 import sqlite3
 db=sqlite3.connect('file:/var/lib/quant-trading-v2/trading.db?mode=ro', uri=True, timeout=5)
 c=db.cursor()
 print('候选:', c.execute('SELECT id,kind,status,ir,reason FROM research_candidates ORDER BY id').fetchall())
-print('fina:', c.execute('SELECT COUNT(*) FROM fina_indicator').fetchone()[0])
+print('fina 总行数:', c.execute('SELECT COUNT(*) FROM fina_indicator').fetchone()[0])
+# 按报告期分布：每季 distinct ts_code 数（规模基准取各期最大值，低于基准 80% 打警告）
+dist = c.execute('SELECT end_date, COUNT(DISTINCT ts_code) FROM fina_indicator GROUP BY end_date ORDER BY end_date').fetchall()
+scale = max([n for _, n in dist], default=0)
+print('按报告期 distinct ts_code 分布（基准=%d）:' % scale)
+for ed, n in dist:
+    flag = '  !!警告: 该期显著偏少(疑似被跳过/未装完)' if scale and n < scale * 0.8 else ''
+    print(' ', ed, n, flag)
 db.close()
 \"" 2>&1 | tee -a "$LOG"
 

@@ -169,7 +169,7 @@ func TestRunPositionReviewPipeline(t *testing.T) {
 	e3.reviewDailyK = e.reviewDailyK
 	calls := 0
 	e3.reviewAsk = func(s, u string) (string, error) { calls++; return e.reviewAsk(s, u) }
-	cm := &config.Manager{Rules: &config.Rules{}}
+	cm := config.NewManagerWithRules(&config.Rules{})
 	e3.cfgMgr = cm
 	if n, err := e3.runPositionReview(now, false); err != nil || n != 2 || calls != 1 {
 		t.Fatalf("自动首轮应成功: n=%d calls=%d err=%v", n, calls, err)
@@ -191,23 +191,23 @@ func TestReviewPositionsIfDueGates(t *testing.T) {
 		return e
 	}
 	off := false
-	mOff := &config.Manager{Rules: &config.Rules{}}
-	mOff.Rules.Runtime.ReviewEnabled = &off
+	mOff := config.NewManagerWithRules(&config.Rules{})
+	mOff.Get().Runtime.ReviewEnabled = &off
 	// ① 开关关闭
 	newE(mOff).ReviewPositionsIfDue(time.Date(2026, 9, 14, 16, 0, 0, 0, reviewTestLoc))
 	// ② 盘中（10:00 交易时段）
-	newE(&config.Manager{Rules: &config.Rules{}}).ReviewPositionsIfDue(time.Date(2026, 9, 14, 10, 0, 0, 0, reviewTestLoc))
+	newE(config.NewManagerWithRules(&config.Rules{})).ReviewPositionsIfDue(time.Date(2026, 9, 14, 10, 0, 0, 0, reviewTestLoc))
 	// ③ 收盘后但非交易日（周六 16:00）
-	newE(&config.Manager{Rules: &config.Rules{}}).ReviewPositionsIfDue(time.Date(2026, 9, 12, 16, 0, 0, 0, reviewTestLoc))
+	newE(config.NewManagerWithRules(&config.Rules{})).ReviewPositionsIfDue(time.Date(2026, 9, 12, 16, 0, 0, 0, reviewTestLoc))
 	// ④ 午间休市时刻（12:00 非活跃但早于15点）
-	newE(&config.Manager{Rules: &config.Rules{}}).ReviewPositionsIfDue(time.Date(2026, 9, 14, 12, 0, 0, 0, reviewTestLoc))
+	newE(config.NewManagerWithRules(&config.Rules{})).ReviewPositionsIfDue(time.Date(2026, 9, 14, 12, 0, 0, 0, reviewTestLoc))
 }
 
 // TestReviewPositionsIfDueRunsOnce 门全开时：交易日收盘后触发一次，reviewAsk 被调用且守卫置当日。
 func TestReviewPositionsIfDueRunsOnce(t *testing.T) {
 	ss := newSignalStore("")
 	ss.Upsert([]combat_agent.Signal{sig("600519", "贵州茅台")})
-	e := &Engine{userID: "u", msgStore: data.NewMessageStore(""), signalStore: ss, cfgMgr: &config.Manager{Rules: &config.Rules{}}}
+	e := &Engine{userID: "u", msgStore: data.NewMessageStore(""), signalStore: ss, cfgMgr: config.NewManagerWithRules(&config.Rules{})}
 	e.reviewDailyK = func(string) ([]data.KLine, error) { return makeBars(60, 100, 1, 1e6), nil }
 	calls := 0
 	e.reviewAsk = func(string, string) (string, error) {

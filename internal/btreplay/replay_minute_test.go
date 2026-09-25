@@ -324,3 +324,63 @@ func TestMinuteScopeOnlyHitsMomentum(t *testing.T) {
 		t.Fatalf("无来源时必须清空 scope，实得 src=%v code=%q", mo2.minuteSrc, mo2.minuteCode)
 	}
 }
+
+// TestSimulateComboMinuteScopePerStock §0925EVE-W3-J（B6）冠军复核分钟口径不互相污染。
+//
+// 修前机制（注释留档）：applyMinuteScope 只有 replay.go 主循环与 sweep.go 触发预算循环两个
+// 注入点，verifyChampion→simulateCombo 的循环不经过任何一个——动量适配器带着触发预算循环里
+// map 迭代最后一只票的 minuteCode 做整库复核，所有股票的判档都读"同一只票"的分钟序列，
+// storeMinuteMACD 的 (股,日) 缓存与 §MINUTE-K 覆盖率计数也全记在错票名下。
+//
+// 钉法：两只票（600000.SH / 000001.SZ）各回填 48 根分钟线，先手动把 scope 停在 600000.SH
+// （复现"残留最后一只票"的修前入场态），再跑 simulateCombo。修前：分钟来源的缓存键只会出现
+// 600000.SH|（000001 的判档全部串到 600000 的数据上）；修后：两只票各自的键都必须出现，
+// 即每只票拿的是**自己**的分钟序列。
+func TestSimulateComboMinuteScopePerStock(t *testing.T) {
+	db := newMinuteReplayDB(t)
+	ks := buildMomentumBars(32, 0.3, 1_000_000, 6, 2.2) // backtestStock 判定窗 i=29..len-2
+	tsCodes := []string{"600000.SH", "000001.SZ"}
+	for _, ts := range tsCodes {
+		for i := 29; i < len(ks)-1; i++ {
+			seedMinuteDay(t, db, ts, cntime.DayOf(ks[i].Date), 48)
+		}
+	}
+	src := newStoreMinuteMACD(db, 5, tsCodes)
+	o := &Options{minuteSrc: src}
+	ad := &momentumAdapter{cfg: defaultMomentumCfg()}
+	klines := map[string][]data.KLine{"600000": ks, "000001": ks}
+	tsOfCode := map[string]string{"600000": "600000.SH", "000001": "000001.SZ"}
+
+	// 修前入场态：scope 残留在"最后一只票"（600000.SH）上，复核循环自己不重注入。
+	o.applyMinuteScope(ad, "600000.SH")
+
+	simulateCombo(ad, "momentum", o, klines, tsOfCode, nil, 0, 0, 0, 0)
+
+	// 主锁：000001.SZ 必须以自己的 ts_code 查过库——修前它的每一次判档都带着残留 code
+	// 600000.SH，缓存键里根本不会出现 000001.SZ| 前缀（串台＝两只票共享同一份分钟读数）。
+	var sawA, sawB, hitA, hitB bool
+	for k, e := range src.cache {
+		switch {
+		case strings.HasPrefix(k, "600000.SH|"):
+			sawA = true
+			hitA = hitA || e.ok
+		case strings.HasPrefix(k, "000001.SZ|"):
+			sawB = true
+			hitB = hitB || e.ok
+		default:
+			t.Fatalf("出现了未知股票的分钟缓存键 %q——复核读到了第三只票的序列？", k)
+		}
+	}
+	if !sawA || !sawB {
+		t.Fatalf("分钟口径串台未修复：缓存键应同时覆盖两只票（各自查各自的），实得 sawA=%v sawB=%v（修前只有残留票 600000.SH 的键）", sawA, sawB)
+	}
+	// 反证样例数据有效性：两只票的 48 根窗口都应命中（否则上面的"都出现"可能只是查了个空）。
+	if !hitA || !hitB {
+		t.Fatalf("seed 的分钟窗口应双双可用（样例失效则本锁测不出东西）：hitA=%v hitB=%v", hitA, hitB)
+	}
+	// §MINUTE-K 计数口径：queries＝唯一 (股,日) 键数，至少各票各一天（残留态串台时只会集中在一票）。
+	_, _, queries, _ := src.coverageStats()
+	if queries < 2 {
+		t.Fatalf("覆盖率 queries 计数应分布在两只票上（≥2 个唯一键），实得 %d——计数仍被单票垄断", queries)
+	}
+}

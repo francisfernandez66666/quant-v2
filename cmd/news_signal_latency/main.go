@@ -104,7 +104,8 @@ func main() {
 	// 装配在此是为把"所有可能读复权序列的入口都经同一个写入口、读同一份 config.json"
 	// 变成不变式（历史上正是"引擎装配了、手工工具没装配"造成两套口径）；写入口唯一
 	// （路由变量已收为 store 包内私有）。
-	store.ConfigureSource(cfgMgr.Rules.Data.PrimarySource, cfgMgr.Rules.Data.ThsFactorsReady)
+	// §0925EVE-D1 跟随改动：Manager.Rules/D1 字段转私有，本文件读取改走加锁访问器 cfgMgr.Get()。
+	store.ConfigureSource(cfgMgr.Get().Data.PrimarySource, cfgMgr.Get().Data.ThsFactorsReady)
 
 	// —— 真实行情数据客户端（不注入 mock transport，走真实网络降级链） ——
 	marketAPI := data.NewMarketAPI()
@@ -146,7 +147,7 @@ func main() {
 	if llmCfg := llmcfg.Resolve(cfgMgr, am); len(llmCfg.APIKeys) > 0 {
 		// §UI-AUTHORITATIVE：与引擎同源解析（设置页保存优先于环境变量），延迟工具测出的
 		// 新闻→D1 耗时才代表生产真实链路。
-		llmCfg.Streaming = cfgMgr.Rules.LLM.StreamingEnabled()
+		llmCfg.Streaming = cfgMgr.Get().LLM.StreamingEnabled()
 		scorer := combat_agent.NewD1Scorer(llm.New(llmCfg), loadRawEvents())
 		fmt.Printf("  真实LLM D1批量评分(模型=%s): ", llmCfg.Model)
 		tD1 := time.Now()
@@ -163,7 +164,7 @@ func main() {
 	// —— 阶段3：逐战法评分+信号（生产5s节奏） ——
 	// 新闻就绪锚点：行情+D1 完成后（等同于新闻注入完成）。
 	cAgent := combat_agent.New(cfgMgr.GetStrategyConfig())
-	cAgent.SetLaodengConfig(&cfgMgr.Rules.Laodeng)
+	cAgent.SetLaodengConfig(&cfgMgr.Get().Laodeng)
 	cAgent.SetRunners(combat_agent.NewRunners(cfgMgr, matcher))
 
 	fmt.Printf("=== 阶段3 逐战法评分+信号(生产5s节奏, %d轮) ===\n", *cycles)

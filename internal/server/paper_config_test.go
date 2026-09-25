@@ -23,7 +23,7 @@ func newPaperConfigServer(t *testing.T) *Server {
 	t.Helper()
 	s := &Server{cfg: config.NewManager("")}
 	// paper.json 放进 t.TempDir()：落盘路径随测试结束自动清理，用例间互不污染
-	s.SetPaper(paper.New(paper.ConfigFromRules(s.cfg.Rules.Paper), filepath.Join(t.TempDir(), "paper.json")))
+	s.SetPaper(paper.New(paper.ConfigFromRules(s.cfg.Get().Paper), filepath.Join(t.TempDir(), "paper.json"))) // §0925EVE-D1：字段转私有，读取走加锁访问器
 	return s
 }
 

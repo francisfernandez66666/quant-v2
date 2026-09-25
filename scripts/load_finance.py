@@ -24,6 +24,21 @@ from concurrent.futures import ProcessPoolExecutor
 
 import baostock as bs
 
+# §0925EVE-B1 季度序号 → 报表期末日（月日）映射表。
+# 旧缺陷机制：续传键曾写成 "%d%02d%02d" % (year, q, ...)，把**季度序号 q 错放进月份位**，
+# 生成 Q1→YYYY0131、Q2→YYYY0230、Q3→YYYY0331、Q4→YYYY0430 四个假报告期；而写入腿
+# （INSERT）用的是 baostock 返回的真实 statDate（正确落在 0331/0630/0930/1231）。
+# 四个错键里只有 Q3 的 YYYY0331 恰好等于 Q1 已装载的真实报告期 → exists 命中 →
+# 每个年度的三季报（0930）被永久跳过；其余三季的错键匹配不到任何真实期，只是每次
+# 重查、不改变正确性——所以旧键"只坑 Q3"。现改为显式映射表，注释与实现一致。
+QUARTER_END_MMDD = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}
+
+
+def report_period(year, q):
+    """§0925EVE-B1 断点续传键：年度+季度序号 → 真实报表期末日 YYYYMMDD。
+    与写入腿 baostock statDate 完全对齐：q=1→MM0331、q=2→MM0630、q=3→MM0930、q=4→MM1231。"""
+    return "%d%s" % (year, QUARTER_END_MMDD[q])
+
 
 def norm_date(s):
     """把 baostock 的 YYYY-MM-DD 归一为研究库用的 YYYYMMDD 字符串（报表期末/公告日）。"""
@@ -68,8 +83,9 @@ def load_one(args):
         bs_code = "sh." + code.replace(".SH", "").lower() if code.endswith(".SH") else "sz." + code.replace(".SZ", "").lower()
         for year in range(start_year, end_year + 1):
             for q in range(1, 5):
-                # 报表期末日：Q1=0331, Q2=0630, Q3=0930, Q4=1231
-                stat = "%d%02d%02d" % (year, q, 31 if q == 1 else (30 if q in (2, 4) else 31))
+                # §0925EVE-B1 报表期末日：Q1=0331, Q2=0630, Q3=0930, Q4=1231
+                # （映射表见 QUARTER_END_MMDD；旧实现把季度序号错放月份位，导致 Q3 被永久跳过）
+                stat = report_period(year, q)
                 # 断点续传：该报告期（股票+期末日）已装载则跳过
                 exists = cur.execute(
                     "SELECT 1 FROM fina_indicator WHERE ts_code=? AND end_date=?",
@@ -142,10 +158,25 @@ def main():
             if status != "ok":
                 print("  %s: %s" % (code, status))
     print("完成：%d 只，写入 %d 期" % (done, inserted))
-    # 校验：统计两表行数
+    # 校验（§0925EVE-B1 升级）：除两表总行数外，按报告期（end_date）打印每季 distinct
+    # ts_code 数分布。断点续传键错位会留下"整季缺失"的特征指纹（历史上 0930 期仅 459
+    # 只，其余三季约 2000），只看 COUNT(*) 是发现不了的。
+    # 阈值告警：某期 distinct 数 < 已知装载规模（本期分布最大值）× 0.8 时打印醒目警告。
+    # 脚本内不做硬 fail——重灌进行中某期偏少属正常，只看不动退出码。
     conn = sqlite3.connect(db_path)
     print("fina_indicator 行数:", conn.execute("SELECT COUNT(*) FROM fina_indicator").fetchone()[0])
     print("income 行数:", conn.execute("SELECT COUNT(*) FROM income").fetchone()[0])
+    dist = conn.execute(
+        "SELECT end_date, COUNT(DISTINCT ts_code) FROM fina_indicator "
+        "GROUP BY end_date ORDER BY end_date").fetchall()
+    scale = max((n for _, n in dist), default=0)  # 已知装载规模：取各期 distinct 数最大值
+    print("按报告期 distinct ts_code 分布（fina_indicator，规模基准=%d）：" % scale)
+    for end_date, n in dist:
+        line = "  %s: %d" % (end_date, n)
+        if scale and n < scale * 0.8:
+            # 醒目警告：显著低于基准，疑似该期被跳过 / 尚未装载完
+            line += "  !!! 警告：不足规模基准的 80%%，该报告期可能缺装（基准 %d）!!!" % scale
+        print(line)
     conn.close()
 
 

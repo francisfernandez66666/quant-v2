@@ -207,7 +207,7 @@ func TestNormalizeTsCode(t *testing.T) {
 // （本测试环境无 real book，业务层返回 500 "real book not available"，恰好证明已穿过鉴权）。
 func TestQMTReportAuthzGatewayTokenOnly(t *testing.T) {
 	s, admin := newAdminTestServer(t)
-	s.cfg.Rules.QMT.Token = "gw-secret-123" // 全局 QMT 网关 token（GetRulesFor 对无覆盖账号回落全局）
+	s.cfg.Get().QMT.Token = "gw-secret-123" // 全局 QMT 网关 token（GetRulesFor 对无覆盖账号回落全局）；§0925EVE-D1 字段转私有后经 Get() 取活体
 	handler := s.qmtReportMiddleware(s.handleQMTReport)
 
 	mk := func(token string) int {

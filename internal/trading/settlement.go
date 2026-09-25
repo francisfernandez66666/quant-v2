@@ -33,6 +33,17 @@ const (
 	SettleModeSyncFills  = "sync_fills"  // 券商有本地无 → 补记成交
 )
 
+// settleUnattributedPrefix §0925EVE-W3-E（C5）：无 signal_id 的交割行补记时的专属标记前缀。
+// 语义 =「无归因行」：这条成交来自券商交割单、但来源侧确实给不出归因信号（旧网关行/柜台
+// 手工流水回灌等），它**不是**真实 signal_id，也绝不冒充一个——前缀自成一路，归因/统计侧可
+// 按前缀整体识别并剔除，而不是像旧虚构键 "settle:"+day 那样同日全部成交共用一键、还与真实
+// signal_id 同用普通字符串通道（不可分辨）。历史库中已落库的 "settle:"+day 旧行不自动改写
+// （留痕原则），需要按日清理时另行数据订正。
+// English: §0925EVE-W3-E — explicit "unattributed row" marker prefix for settlement backfills
+// whose gateway row carries no signal_id; deliberately distinguishable from real signal ids
+// (the old fabricated "settle:"+day key was indistinguishable and hijacked attribution).
+const settleUnattributedPrefix = "settle-unattributed:"
+
 // brokerTrade 归一后的券商成交（用于三方比对）。
 // English: normalized broker trade for three-way comparison.
 type brokerTrade struct {
@@ -44,6 +55,9 @@ type brokerTrade struct {
 	OrderID  string // 券商委托号（sync_fills 补记时回填真实委托号，不再置空）
 	TradedAt string // 券商成交时间（补记时回填真实时间，不再用 day+" 00:00:00"）
 	Serial   string // 交割流水号（网关 trade_id）；缺失时不参与匹配（见 factKey）
+	// SignalID §0925EVE-W3-E（C5）：网关交割行的真实归因信号；空串=该行无归因
+	// （旧网关版本/手工柜台流水回灌等来源不带 signal_id），补记时单独标记不冒充。
+	SignalID string
 }
 
 // normalizeSettleDay §H1（2026-09-22 修复批）对账日期口径归一：YYYYMMDD → YYYY-MM-DD。
@@ -113,6 +127,7 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 		bt := brokerTrade{
 			Code: t.TsCode, Side: side, Price: t.Price, Qty: t.Qty,
 			Fee: t.Fee + t.StampTax, OrderID: t.OrderID, TradedAt: t.TradedAt, Serial: t.Serial,
+			SignalID: strings.TrimSpace(t.SignalID), // §0925EVE-W3-E 真实归因随成交一路带到补记腿
 		}
 		k := settleFactKey(bt.Code, bt.Side, bt.Qty, bt.Price)
 		broker[k] = append(broker[k], bt)
@@ -192,10 +207,20 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 			} else if len(tradedAt) == 8 { // 网关只回时间（HH:MM:SS）→ 拼对账日
 				tradedAt = day + " " + tradedAt
 			}
+			// §0925EVE-W3-E（C5）：补记成交的归因键优先沿用网关交割行带来的真实 signal_id
+			// （下单链路 signal_id 是唯一键，交割腿与委托腿天然同源）；确实没有的行打
+			// 「无归因行」专属前缀单独标记——旧实现无条件写虚构 "settle:"+day，把有真实
+			// 归因的成交也顶掉了，战法/信号级盈亏统计里这批补记腿全部错位或落入未知桶。
+			signalID := bt.SignalID
+			if signalID == "" {
+				signalID = settleUnattributedPrefix + day
+				log.Printf("[settle] sync_fills 补记遇无归因行（网关未带 signal_id）：%s %s %d@%.2f 委托=%s → 标记 %q",
+					bt.Code, bt.Side, bt.Qty, bt.Price, bt.OrderID, signalID)
+			}
 			fill := store.RealFill{
 				OrderID: bt.OrderID, Code: bt.Code, Side: bt.Side, Price: bt.Price, Qty: bt.Qty,
 				Amount: bt.Price * float64(bt.Qty), TradedAt: tradedAt,
-				SignalID: "settle:" + day, UserID: c.userID, Fee: bt.Fee, Serial: bt.Serial,
+				SignalID: signalID, UserID: c.userID, Fee: bt.Fee, Serial: bt.Serial,
 			}
 			if err := c.store.ApplySettlementFill(fill); err != nil {
 				log.Printf("[settle] sync_fills 补记失败 %s: %v", m.k, err)

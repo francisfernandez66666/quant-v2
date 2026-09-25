@@ -93,34 +93,37 @@ func Resolve(cfgMgr *config.Manager, authMgr *auth.Manager) llm.Config {
 		}
 	}
 	// ④ 全局 config.json（无运营保存时的旧默认链）
+	// §0925EVE-D1：全局 rules 指针经加锁访问器 Get() 一次取回本地变量再逐字段读——
+	// 原写法 cfgMgr.Rules.X 是导出字段裸读，与 Watch/Load 的指针热替换构成 data race。
+	globalRules := cfgMgr.Get()
 	if llmCfg.APIURL == "" {
-		llmCfg.APIURL = cfgMgr.Rules.LLM.APIURL
+		llmCfg.APIURL = globalRules.LLM.APIURL
 	}
 	if llmCfg.Model == "" {
-		llmCfg.Model = cfgMgr.Rules.LLM.Model
+		llmCfg.Model = globalRules.LLM.Model
 	}
 	if llmCfg.Timeout == 0 {
-		llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
+		llmCfg.Timeout = time.Duration(globalRules.LLM.TimeoutSec) * time.Second
 	}
 	if llmCfg.BatchConcurrency == 0 {
-		llmCfg.BatchConcurrency = cfgMgr.Rules.LLM.BatchConcurrency
+		llmCfg.BatchConcurrency = globalRules.LLM.BatchConcurrency
 	}
 	if llmCfg.ClassifierModel == "" {
-		llmCfg.ClassifierModel = cfgMgr.Rules.LLM.ClassifierModel
+		llmCfg.ClassifierModel = globalRules.LLM.ClassifierModel
 	}
 	// §FIX-7(20260919) 预算/空闲阈值的④级兜底：运营没在设置页保存过这些项时，
 	// 沿用 config.json rules.llm 的同名字段（与超时/并发同一口径的逐级回退链）。
 	if llmCfg.StreamIdleTimeout <= 0 {
-		llmCfg.StreamIdleTimeout = time.Duration(cfgMgr.Rules.LLM.StreamIdleTimeoutSec) * time.Second
+		llmCfg.StreamIdleTimeout = time.Duration(globalRules.LLM.StreamIdleTimeoutSec) * time.Second
 	}
 	if llmCfg.DailyCallBudget <= 0 {
-		llmCfg.DailyCallBudget = cfgMgr.Rules.LLM.DailyCallBudget
+		llmCfg.DailyCallBudget = globalRules.LLM.DailyCallBudget
 	}
 	if llmCfg.DailyTokenBudget <= 0 {
-		llmCfg.DailyTokenBudget = cfgMgr.Rules.LLM.DailyTokenBudget
+		llmCfg.DailyTokenBudget = globalRules.LLM.DailyTokenBudget
 	}
 	if llmCfg.ConsultDailyCalls <= 0 {
-		llmCfg.ConsultDailyCalls = cfgMgr.Rules.LLM.ConsultDailyCalls
+		llmCfg.ConsultDailyCalls = globalRules.LLM.ConsultDailyCalls
 	}
 	// 主 key 兼容字段：日志脱敏等单 key 语义仍指向首把
 	if len(llmCfg.APIKeys) > 0 {

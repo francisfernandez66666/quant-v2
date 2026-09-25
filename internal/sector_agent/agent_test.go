@@ -8,23 +8,57 @@ import (
 	"quant-trading-v2/internal/strategy_engine"
 )
 
-// TestClassifyPhase 板块状态机四象限。
+// TestClassifyPhase 板块状态机四象限 + §0925EVE-W3-J（B5）「无有效输入→未知」。
 func TestClassifyPhase(t *testing.T) {
 	cases := []struct {
 		name string
 		c, f float64
+		fail bool // quoteLegFailed（行情腿失败标记）
 		want string
 	}{
-		{"涨+流入→加强", 2.0, 1e8, "加强"},
-		{"涨+流出→持续", 1.0, -1e8, "持续"},
-		{"跌+流出→退潮", -2.0, -1e8, "退潮"},
-		{"跌+流入→反弹", -1.0, 1e8, "反弹"},
-		{"零涨→反弹(兜底)", 0, 0, "反弹"},
+		{"涨+流入→加强", 2.0, 1e8, false, "加强"},
+		{"涨+流出→持续", 1.0, -1e8, false, "持续"},
+		{"跌+流出→退潮", -2.0, -1e8, false, "退潮"},
+		{"跌+流入→反弹", -1.0, 1e8, false, "反弹"},
+		// §0925EVE-W3-J（B5）：旧实现这两条都被 default 分支编造成「反弹」——
+		// (0,0) 是结构腿全零/未回填的形态，不是"跌+流入"的证据。
+		{"零值对→未知(无有效输入)", 0, 0, false, "未知"},
+		{"零值对+行情腿失败→未知", 0, 0, true, "未知"},
+		{"正常输入不受标记缺席影响(涨+流入仍加强)", 2.0, 1e8, false, "加强"},
+		// 反证：即便数值看着能分档，只要行情腿报了失败，就不许再产相位（防"半残源继续编"）。
+		{"腿失败时即便非零值也未知", 0.0, 1e8, true, "未知"},
 	}
 	for _, tc := range cases {
-		if got := classifyPhase(tc.c, tc.f); got != tc.want {
-			t.Errorf("%s: classifyPhase(%.1f,%.1f)=%s, want %s", tc.name, tc.c, tc.f, got, tc.want)
+		if got := classifyPhase(tc.c, tc.f, tc.fail); got != tc.want {
+			t.Errorf("%s: classifyPhase(%.1f,%.1f,%v)=%s, want %s", tc.name, tc.c, tc.f, tc.fail, got, tc.want)
 		}
+	}
+}
+
+// TestVerifyUnknownPhaseNoFabrication §0925EVE-W3-J（B5）集成面：
+// 双源半残（结构腿在、行情腿挂）的板块过 Verify 必须得「未知」且带失败标记；
+// 正常输入的板块相位不受影响。
+func TestVerifyUnknownPhaseNoFabrication(t *testing.T) {
+	a := New(nil, nil) // scanner=nil：成分股通道空转，不影响相位判定
+	hot := []strategy_engine.SectorHot{
+		{Name: "半导体", Direction: "利好", Score: 0.6, ChangePct: 0, NetInflow: 0, QuoteLegFailed: true},
+		{Name: "人工智能", Direction: "利好", Score: 0.7, ChangePct: 2.5, NetInflow: 3e9},
+	}
+	res := a.Verify(hot)
+	if len(res) != 2 {
+		t.Fatalf("应验证 2 个板块, got %d", len(res))
+	}
+	if res[0].Phase != "未知" {
+		t.Errorf("行情腿失败的全零板块相位应为 未知（不得编造反弹）, got %s", res[0].Phase)
+	}
+	if !res[0].QuoteLegFailed {
+		t.Errorf("失败标记应透传到产出结构, got %v", res[0].QuoteLegFailed)
+	}
+	if res[1].Phase != "加强" {
+		t.Errorf("正常输入相位不受影响，应为 加强, got %s", res[1].Phase)
+	}
+	if res[1].QuoteLegFailed {
+		t.Errorf("正常板块不应带失败标记, got %v", res[1].QuoteLegFailed)
 	}
 }
 

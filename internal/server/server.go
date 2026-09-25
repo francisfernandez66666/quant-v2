@@ -770,6 +770,11 @@ func (s *Server) registerRoutes() {
 	// §QMT-DUAL：网关 active 通道（miniqmt=xt / qmt=queued）读取与切换（仅 admin）
 	s.mux.HandleFunc("GET /api/qmt/broker", s.adminMiddleware(s.handleQMTBroker))
 	s.mux.HandleFunc("POST /api/qmt/broker", s.adminMiddleware(s.handleQMTBrokerSwitch))
+	// §0925EVE-W3-G（FIX_PLAN ⑫ C3）第三态「待核对」人工收敛出口（仅 admin：人工改判
+	// 委托终态是特权动作，每次尝试落 opslog.Audit）：清单透传 + 确认转发网关。
+	// English: admin-only pending-review list and manual order-confirm passthrough.
+	s.mux.HandleFunc("GET /api/qmt/pending-review", s.adminMiddleware(s.handleQMTPendingReview))
+	s.mux.HandleFunc("POST /api/qmt/order-confirm", s.adminMiddleware(s.handleQMTOrderConfirm))
 	// §WS-B：券商交割单三方对账（触发 + 历史查询，仅 admin）
 	s.mux.HandleFunc("POST /api/qmt/settle", s.adminMiddleware(s.handleQMTSettle))
 	s.mux.HandleFunc("GET /api/qmt/settle/history", s.adminMiddleware(s.handleQMTSettleHistory))

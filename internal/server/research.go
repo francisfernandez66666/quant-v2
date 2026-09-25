@@ -206,7 +206,7 @@ func (s *Server) computeResearchProgress(w http.ResponseWriter) map[string]any {
 	// §数据源标识：前端徽标展示「同花顺（新）/ baostock」
 	ds := "baostock"
 	if s.cfg != nil {
-		if ps := s.cfg.Rules.Data.PrimarySource; ps == "hithink" {
+		if ps := s.cfg.Get().Data.PrimarySource; ps == "hithink" { // §0925EVE-D1：字段裸读改加锁访问器
 			ds = "同花顺（新）"
 		}
 	}
@@ -337,49 +337,67 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 	}
 	switch action {
 	case "approve":
-		if err := s.researchDB.UpdateCandidateStatus(id, "approved"); err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
+		// §0925EVE-W3-G（FIX_PLAN ⑪ C2）副作用顺序修正：旧实现先写 approved 再执行 Apply*，
+		// Apply 中途失败（权重 JSON 非法、战法库落盘失败等）候选会永久停在
+		// 「已批准但线上没有」的幽灵态且无 reconcile。现改为 Apply 先行、状态后写：
+		//   ① 任一 Apply* 失败 → 状态一律不动（保持原态，通常是 proposed），500 带回失败原因，
+		//      运维修好数据后可直接重新点审批；
+		//   ② 全部 Apply* 成功后才写 approved；属于可应用类型（weights/factor/pattern）的
+		//      再推进到 applied 终态并热重载；不可应用类型 approved 即终态（与旧行为一致）。
+		// 读码确认的其余副作用顺序问题（如实登记，不掩盖）：
+		//   ③ Apply 成功后、状态写入前失败 → 出现**反向**不一致「线上已生效但状态未推进」。
+		//      该方向是安全侧：规则确实已应用，且重新审批可收敛——ApplyWeights 为整文件覆写、
+		//      ApplyFactorRule/ApplyPatternRule 按 fac_<id>/pat_<id> 键幂等 upsert，重点不产生
+		//      重复条目；旧方向（状态推进了但线上没有）才是会造成误判的危险侧，本批修掉。
+		//   ④ reloadLibraries 无错误返回：热重载失败时状态已是 applied、文件已落盘，
+		//      引擎下次启动/下轮重载自然生效，属可接受弱一致（与旧实现相同，未新增风险）。
+		applied := false // applied=true 表示本候选类型已完成 Apply*，状态应推进到 applied
+		reload := false  // reload=true 表示战法库有变更，需热重载引擎 8a/8b
 		if c.Kind == "weights" {
 			if err := research.ApplyWeights(s.researchDir, c); err != nil {
-				writeError(w, 500, "应用权重失败: "+err.Error())
+				// §0925EVE-W3-G：Apply 失败不改状态，原因带回响应（沿用该 handler 既有 500+error 体例）
+				writeError(w, 500, "应用权重失败(状态未变更，可修复后重新审批): "+err.Error())
 				return
 			}
-			if err := s.researchDB.UpdateCandidateStatus(id, "applied"); err != nil {
-				writeError(w, 500, err.Error())
-				return
-			}
-			log.Printf("[research] 候选 #%d 审批并应用权重", id)
+			applied = true
+			log.Printf("[research] 候选 #%d 应用权重成功（状态随后推进）", id)
 		}
 		// E6：因子战法候选审批 → 追加到战法库 applied_factors.json 并热重载引擎（多战法同时实盘）。
 		// English: E6 — approving a factor candidate appends it to the library applied_factors.json and
 		// hot-reloads the engine (multiple strategies run concurrently).
 		if c.Kind == "factor" {
 			if err := research.ApplyFactorRule(s.researchDir, c); err != nil {
-				writeError(w, 500, "应用因子规则失败: "+err.Error())
+				writeError(w, 500, "应用因子规则失败(状态未变更，可修复后重新审批): "+err.Error())
 				return
 			}
-			if err := s.researchDB.UpdateCandidateStatus(id, "applied"); err != nil {
-				writeError(w, 500, err.Error())
-				return
-			}
-			s.reloadLibraries() // 立即注入 8a/8b，无需重启
-			log.Printf("[research] 候选 #%d 审批并应用因子规则", id)
+			applied = true
+			reload = true
 		}
 		// F3：形态战法候选审批 → 追加到战法库 applied_patterns.json 并热重载引擎（多形态同时实盘）。
 		// English: F3 — approving a pattern candidate appends it to the library and hot-reloads the engine.
 		if c.Kind == "pattern" {
 			if err := research.ApplyPatternRule(s.researchDir, c); err != nil {
-				writeError(w, 500, "应用形态规则失败: "+err.Error())
+				writeError(w, 500, "应用形态规则失败(状态未变更，可修复后重新审批): "+err.Error())
 				return
 			}
+			applied = true
+			reload = true
+		}
+		// §0925EVE-W3-G：全部 Apply* 已成功后才落状态——approved 先写（不可应用类型的终态），
+		// 可应用类型再推进 applied；两步之间失败即 ③ 描述的安全侧反向不一致，重新审批可收敛。
+		if err := s.researchDB.UpdateCandidateStatus(id, "approved"); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		if applied {
 			if err := s.researchDB.UpdateCandidateStatus(id, "applied"); err != nil {
 				writeError(w, 500, err.Error())
 				return
 			}
-			s.reloadLibraries()
-			log.Printf("[research] 候选 #%d 审批并应用形态规则", id)
+			if reload {
+				s.reloadLibraries() // 立即注入 8a/8b，无需重启（见 ④：失败仅弱一致，下次重载生效）
+			}
+			log.Printf("[research] 候选 #%d 审批并应用完成 kind=%s", id, c.Kind)
 		}
 	case "reject":
 		if err := s.researchDB.UpdateCandidateStatus(id, "rejected"); err != nil {

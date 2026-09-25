@@ -21,9 +21,9 @@ func newPaperAdmissionEngine(t *testing.T, strategies, blacklist []string, shado
 	t.Helper()
 	e := &Engine{}
 	cm := config.NewManager("")
-	cm.Rules.Paper.Strategies = strategies
-	cm.Rules.Paper.Blacklist = blacklist
-	cm.Rules.SignalCtl.ShadowBlacklist = &shadow
+	cm.Get().Paper.Strategies = strategies
+	cm.Get().Paper.Blacklist = blacklist
+	cm.Get().SignalCtl.ShadowBlacklist = &shadow
 	e.cfgMgr = cm
 	return e
 }

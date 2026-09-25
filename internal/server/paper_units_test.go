@@ -28,7 +28,7 @@ import (
 func newUnitsPaperServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "paper.json")
-	cfg := paper.ConfigFromRules(config.NewManager("").Rules.Paper)
+	cfg := paper.ConfigFromRules(config.NewManager("").Get().Paper)
 	cfg.Enabled = true
 	cfg.AutoSell = false // 卖出断言不受自动卖出干扰
 	s := &Server{}
@@ -78,7 +78,7 @@ func backdatePaperFills(t *testing.T, s *Server, path string) {
 		t.Fatalf("回写 paper.json 失败: %v", err)
 	}
 	// 重建引擎触发 load()：持仓以隔日 filled_at 恢复
-	rules := config.NewManager("").Rules.Paper
+	rules := config.NewManager("").Get().Paper
 	cfg := paper.ConfigFromRules(rules)
 	cfg.Enabled = true
 	cfg.AutoSell = false

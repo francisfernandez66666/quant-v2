@@ -293,7 +293,7 @@ func (s *Server) handleResearchBacktestToggle(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if r.Method == http.MethodGet {
-		writeJSON(w, 200, map[string]any{"enabled": s.cfg.Rules.Scheduler.Nightly.BacktestEnabled})
+		writeJSON(w, 200, map[string]any{"enabled": s.cfg.Get().Scheduler.Nightly.BacktestEnabled}) // §0925EVE-D1：字段裸读改加锁访问器
 		return
 	}
 	// POST

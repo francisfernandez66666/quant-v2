@@ -542,6 +542,14 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 		log.Printf("东财板块不可用: %v", emErr)
 	}
 
+	// §0925EVE-W3-J（B5）行情腿失败的显式告警：东财是涨跌幅/净流入/涨停数的唯一回填源，
+	// 它挂掉时同花顺结构腿的产出这些字段全为零值。旧实现只留上面一行 log，零值照常往下游流，
+	// 最终被 classifyPhase 的 default 分支编造成「反弹」假相位（双源半残时阶段是伪造的）。
+	// 参照本文件 §LOW(SPOF) last-known-good 腿的显式告警范式：失败事实必须随产出结构一起出门。
+	if emErr != nil {
+		log.Printf("[source] §0925EVE-W3-J 板块行情腿（东财）失败，本轮板块的涨跌幅/净流入/涨停数无回填来源（全零），已在产出上打 QuoteLegFailed 标记，下游相位将报「未知」而非编造")
+	}
+
 	if len(thsSectors) > 0 {
 		if len(s) > 0 {
 			// 合并策略：同花顺提供板块清单结构，东财提供实时行情数据
@@ -580,6 +588,14 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 				}
 			}
 			log.Printf("GetSectors: 同花顺(%d个) + 东财实时(%d个)", len(thsSectors), len(s))
+		}
+		// §0925EVE-W3-J（B5）：行情腿失败 → 结构腿产出的行情字段没有被回填（全零），
+		// 把失败标记打到每一条板块上随结构一起返回——下游（strategy_engine.SectorHot →
+		// sector_agent.classifyPhase）据此把相位报成显式「未知」，不再从 (0,0) 编造「反弹」。
+		if emErr != nil {
+			for i := range thsSectors {
+				thsSectors[i].QuoteLegFailed = true
+			}
 		}
 		dc.mu.Lock()
 		dc.sectorCache = thsSectors

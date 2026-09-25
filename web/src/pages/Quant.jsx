@@ -3,6 +3,8 @@
 // 主要功能：查看广州单机实盘链路状态/熔断；配置总开关、执行模式、委托价格、心跳超时、网关与 Token；
 //          设定最大持仓/单票金额/预算等仓位纪律；按战法开关实盘准入并展示交易流水与归因盈亏。
 //          §U-2（2026-09-14）：链路状态卡内置 kill-switch 紧急停止按钮、当日委托卡支持逐笔撤单、
+//          §0925EVE-W3-G（2026-09-25）：新增「待核对委托」卡——网关第三态人工改判（released/settled）
+//          的产品化出口（GET /api/qmt/pending-review + POST /api/qmt/order-confirm，均 admin+审计）。
 //          日终结算卡一键三方对账并回看差异历史——三者后端早已就绪，本轮补上前端入口。
 //          定时轮询：链路状态/当日委托 10s 一次、交易流水 30s 一次；配置修改提交后待交易时段生效。
 //          §M13（2026-09-22 修复批 K）：权限判定改走 api.isForbidden()（HTTP 状态码），
@@ -139,6 +141,16 @@ export default function Quant() {
   // English: §M-9 — a failed orders fetch sets ordersError so the card shows a retryable
   // error instead of hanging on the loading placeholder forever.
   const [ordersError, setOrdersError] = useState('')
+  // §0925EVE-W3-G（FIX_PLAN ⑫ C3）第三态「待核对委托」面板：网关对「已交给通道、结算结果不明」
+  // 的委托保留「待核对」占位，此前只能 curl 打网关 /admin/status + /admin/order-confirm 收敛。
+  // 三态分离沿用 §M-9 教训：pendingReview==null 且 pendingReviewError 非空 =「查询失败」
+  // （失败态必须可见）；pendingReview 为空数组 =「确实没有待核对单」——两者绝不混渲染。
+  // English: §0925EVE-W3-G — the third-state pending-review panel; read failure and an
+  // genuinely empty list are separate visible states (never an empty array masking an error).
+  const [pendingReview, setPendingReview] = useState(null)
+  const [pendingReviewError, setPendingReviewError] = useState('')
+  const [pendingReviewMeta, setPendingReviewMeta] = useState(null) // {unresolved_count, truncated, gateway_ts}
+  const [confirmBusy, setConfirmBusy] = useState(false)            // 人工改判请求中（防连点双击改判）
   // §SIGNAL_CONTROLLER 信号裁定留痕（实盘/模拟盘两通道 hold/block 与原因，30s 随流水刷新）
   const [verdicts, setVerdicts] = useState([])
   // §F-5（20260917 缺陷修复批）风控闸口状态（下单前 12 道闸的当日命中与开关，30s 随流水刷新）
@@ -148,6 +160,9 @@ export default function Quant() {
   const [settle, setSettle] = useState(null)        // 最近一次对账结果/历史
   const [halted, setHalted] = useState(false)       // kill-switch 当前态（来自 config.halted）
   const ordersTimer = useRef(null)                  // 委托列表轮询定时器
+  // §0925EVE-W3-G 待核对清单轮询定时器（30s：第三态收敛是人工作业，不需要 10s 实时性，
+  // 且每次都要打网关 /admin/status，降频避免给跨网链路加常驻负载）
+  const pendingTimer = useRef(null)
 
   // 战法自定义金额输入（按 strategyId → 金额）
   const [amountsInput, setAmountsInput] = useState({})
@@ -209,7 +224,7 @@ export default function Quant() {
   // 挡不住已在飞的 promise 链；标志位让链上未执行的步骤全部早退（含 StrictMode 双挂载的第二条链）。
   function stopPolling() {
     pollingDeadRef.current = true
-    for (const ref of [stateTimer, ordersTimer, tradesTimer]) {
+    for (const ref of [stateTimer, ordersTimer, tradesTimer, pendingTimer]) {
       if (ref && ref.current) {
         clearInterval(ref.current)
         ref.current = null
@@ -371,7 +386,17 @@ export default function Quant() {
     setKillBusy(true)
     try {
       const r = await api.qmtHalt(engage)
-      MessagePlugin.success(engage ? `已置位紧急停止，同步撤销 ${r && r.cancelled != null ? r.cancelled : 0} 笔在途委托` : '紧急停止已解除')
+      // §0925EVE-A2（2026-09-25）：kill-switch 的响应新增 failed 撤单失败明细数组。
+      // 部分失败后端仍回 200（紧急停止动作本身已生效），但"撤销 N 笔"再也不能冒充
+      // "全部撤干净"——有未撤成的单就换 warning 文案点名笔数与单号清单，操作者当场可决策。
+      // 全成功时后端保证 failed 是空数组（非 null），这里仍防御性判一次，兼容旧版响应体。
+      const failed = engage && r && Array.isArray(r.failed) ? r.failed : []
+      if (failed.length) {
+        const ids = failed.map((f) => (f && f.order_id ? f.order_id : '-')).join('、')
+        MessagePlugin.warning(`已置位紧急停止，同步撤销 ${r.cancelled != null ? r.cancelled : 0} 笔，但 ${failed.length} 笔未撤成（${ids}）——仍在途，请人工处置`)
+      } else {
+        MessagePlugin.success(engage ? `已置位紧急停止，同步撤销 ${r && r.cancelled != null ? r.cancelled : 0} 笔在途委托` : '紧急停止已解除')
+      }
       await loadConfig()
       await loadOrders()
     } catch (e) {
@@ -390,6 +415,54 @@ export default function Quant() {
       await loadOrders()
     } catch (e) {
       MessagePlugin.error('撤单失败：' + (e && e.message ? e.message : e))
+    }
+  }
+
+  // §0925EVE-W3-G 拉取第三态「待核对」清单（透传网关 /admin/status unresolved_orders）。
+  // 失败分流与 loadOrders 的 §M-9 口径一致：403 走 noteForbidden（停轮询落无权限面板）；
+  // 其余失败（502 网关读失败 / 503 未接入）记入 pendingReviewError——**可见的失败态**，
+  // 绝不清空清单冒充「没有待核对单」（清单为空是有资金安全含义的断言）。
+  async function loadPendingReview() {
+    try {
+      const r = await api.qmtPendingReview()
+      if (pollingDeadRef.current) return // §M-6：失效后不回写
+      setPendingReview(Array.isArray(r.orders) ? r.orders : [])
+      setPendingReviewMeta({
+        count: r.unresolved_count != null ? r.unresolved_count : (Array.isArray(r.orders) ? r.orders.length : 0),
+        truncated: !!r.truncated,
+        gateway_ts: r.gateway_ts || '',
+      })
+      setPendingReviewError('') // 成功即清错误态
+    } catch (e) {
+      if (!noteForbidden(e)) {
+        setPendingReviewError(e && e.message ? String(e.message) : '待核对清单查询失败（网络/服务异常）')
+      }
+    }
+  }
+
+  // §0925EVE-W3-G 人工改判一条待核对委托：released=柜台确无此单（删占位解锁）/
+  // settled=柜台有此单（占位改写正常终态）。confirmDialog 二次确认后转发网关；
+  // 后端每次尝试都落 opslog 审计行（特权人工改判），本操作永不重发订单。
+  async function confirmPendingOrder(row, decision) {
+    if (confirmBusy) return
+    const anchor = row.signal_id || '(缺锚点)'
+    const msg = decision === 'released'
+      ? `人工改判「柜台确无此单」→ 删除待核对占位、解锁该信号（不重发任何订单）。\n\n信号: ${anchor}\n委托: ${row.code || '-'} ${row.side || '-'} ${row.qty || 0} 股\n创建: ${row.created_at || '-'}\n\n前提：你已在券商/柜台侧核实该委托不存在。此操作将记入审计日志。确认执行？`
+      : `人工改判「柜台已有此单」→ 待核对占位改写为正常终态（默认已撤，不重发）。\n\n信号: ${anchor}\n委托: ${row.code || '-'} ${row.side || '-'} ${row.qty || 0} 股\n创建: ${row.created_at || '-'}\n\n前提：你已在券商/柜台侧核实该委托存在。此操作将记入审计日志。确认执行？`
+    if (!(await confirmDialog(msg, '待核对委托人工改判'))) return
+    setConfirmBusy(true)
+    try {
+      const r = await api.qmtOrderConfirm({ wire_ref: row.signal_id, decision })
+      MessagePlugin.success(decision === 'released'
+        ? `已删除待核对占位并解锁信号 ${anchor}（可重新下单）`
+        : `占位已转正常终态（${(r && r.status) || '已撤'}），同信号再下单走幂等返回`)
+      await loadPendingReview()
+      await loadOrders() // 委托卡同步刷新：settled 改写的是同一批账本行
+    } catch (e) {
+      // 网关拒绝/传输失败都如实回显（改判没有发生），不静默、不重试
+      MessagePlugin.error('人工改判失败：' + (e && e.message ? e.message : e))
+    } finally {
+      setConfirmBusy(false)
     }
   }
 
@@ -553,6 +626,9 @@ export default function Quant() {
     // §U-2 当日委托随链路状态同频轮询（在途单状态推进/撤单后回显）
     loadOrders()
     ordersTimer.current = setInterval(loadOrders, 10000)
+    // §0925EVE-W3-G 待核对清单 30s 轮询（第三态收敛是人工作业，低频即可；见 pendingTimer 注释）
+    loadPendingReview()
+    pendingTimer.current = setInterval(loadPendingReview, 30000)
     loadSettleHistory()
     loadBroker()
     loadTrades()
@@ -1037,6 +1113,69 @@ export default function Quant() {
     )
   }
 
+  /* §0925EVE-W3-G（FIX_PLAN ⑫ C3）渲染"待核对委托"卡：网关第三态（已交通道、结算结果不明）
+     的人工收敛面板。每行两个处置按钮（柜台无此单=released / 柜台有此单=settled），
+     confirmDialog 二次确认后走 POST /api/qmt/order-confirm（后端落 opslog 审计）。
+     四态渲染严格分离（§M-9 同族口径）：失败态可见 ≠ 空态"确实没有" ≠ 加载 ≠ 有单。 */
+  function renderPendingReviewCard() {
+    const cols = [
+      { colKey: 'signal_id', title: '信号锚点(signal_id)', width: 230, cell: ({ row }) => <span style={{ fontSize: 12, wordBreak: 'break-all' }} title={row.signal_id}>{row.signal_id}</span> },
+      { colKey: 'code', title: '代码', width: 100 },
+      { colKey: 'side', title: '方向', width: 70, cell: ({ row }) => <span style={{ color: row.side === '买入' ? 'var(--app-up)' : 'var(--app-down)' }}>{row.side}</span> },
+      { colKey: 'qty', title: '数量', width: 70 },
+      { colKey: 'created_at', title: '创建时间', width: 130, cell: ({ row }) => <span style={{ fontSize: 12 }}>{(row.created_at || '').replace('T', ' ').slice(5, 19)}</span> },
+      {
+        // 取证位：仍在派发队列 = 桥迟早回报、可能自动收敛；不在 = 只能人工核对柜台后改判
+        colKey: 'dispatch_in_flight', title: '派发队列', width: 110,
+        cell: ({ row }) => (row.dispatch_in_flight
+          ? <Tag size="small" theme="warning">仍在队列</Tag>
+          : <Tag size="small" theme="danger">已离队·须核柜台</Tag>),
+      },
+      {
+        colKey: 'op', title: '人工处置', width: 220,
+        cell: ({ row }) => (
+          <div style={{ display: 'flex', gap: 6 }}>
+            <Button size="xs" variant="outline" theme="danger" disabled={confirmBusy} onClick={() => confirmPendingOrder(row, 'released')}>柜台无此单</Button>
+            <Button size="xs" variant="outline" theme="primary" disabled={confirmBusy} onClick={() => confirmPendingOrder(row, 'settled')}>柜台有此单</Button>
+          </div>
+        ),
+      },
+    ]
+    return (
+      <Card title="待核对委托（第三态人工收敛）" style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>
+          网关对「已交给通道、结算结果不明」的委托保留待核对占位（宁拒不双卖）；须先到券商柜台侧核实，
+          再逐笔人工改判。改判不重发任何订单，每次尝试均记入审计日志。30s 刷新。
+        </div>
+        {pendingReview == null && pendingReviewError ? (
+          // 失败态必须可见：查询失败 ≠ 没有待核对单——绝不空数组冒充（§M-9 委托卡同族教训）
+          <div style={{ color: 'var(--td-warning-color)', fontSize: 13, padding: '6px 2px' }}>
+            ⚠ 待核对清单查询失败：{pendingReviewError}
+            <Button size="xs" variant="outline" theme="warning" style={{ marginLeft: 10 }} onClick={loadPendingReview}>重试</Button>
+          </div>
+        ) : pendingReview == null ? (
+          <div style={{ color: 'var(--app-text-2)', fontSize: 13 }}>加载待核对清单…</div>
+        ) : pendingReview.length ? (
+          <>
+            <Table data={pendingReview} columns={cols} rowKey="signal_id" size="small"
+              pagination={{ pageSize: 10, showJumper: true, total: pendingReview.length }} />
+            {pendingReviewMeta && pendingReviewMeta.truncated && (
+              // 网关单页最多回 20 条：计数>清单长度时明说"仍有未展示行"，防"页面空=风险小"误读
+              <div style={{ marginTop: 6, fontSize: 12, color: 'var(--td-warning-color)' }}>
+                ⚠ 全量待核对 {pendingReviewMeta.count} 笔，本清单仅前 {pendingReview.length} 条（网关单页上限 20），请用 curl /admin/status 核对余量或逐轮处置
+              </div>
+            )}
+          </>
+        ) : (
+          // 空态只在「读成功且确实为 0」时渲染——与上面的失败态互斥
+          <div style={{ padding: '8px 2px', color: 'var(--app-text-2)', fontSize: 13 }}>
+            无待核对委托（网关确认 unresolved=0{pendingReviewMeta && pendingReviewMeta.gateway_ts ? ' · 网关采样 ' + pendingReviewMeta.gateway_ts : ''}）
+          </div>
+        )}
+      </Card>
+    )
+  }
+
   /* §U-2/§WS-B 渲染"日终结算"卡：一键三方对账（券商交割单↔本地账本）+ 最近差异历史。
      report_only 仅比对不落补记；差异非空时后端已 P1 告警。 */
   function renderSettleCard() {
@@ -1098,6 +1237,9 @@ export default function Quant() {
 
       {/* §U-2 当日委托卡：撤单按钮的宿主（order_id 数据源） */}
       {renderOrdersCard()}
+
+      {/* §0925EVE-W3-G 待核对委托卡：第三态人工改判入口（网关 /admin/* 的产品化出口） */}
+      {renderPendingReviewCard()}
 
       {/* 总开关与执行方式卡片：实盘开关、执行模式、委托价格、自动卖出等配置 */}
       <Card title="总开关与执行方式" style={{ marginBottom: 14 }}>

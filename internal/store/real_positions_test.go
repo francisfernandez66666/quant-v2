@@ -2,9 +2,12 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
+	"log"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -131,6 +134,35 @@ func TestSumFilledQtyPrefix(t *testing.T) {
 	}
 	if got := db.SumFilledQty("U2", base); got != 999 {
 		t.Fatalf("SumFilledQty(U2, base) 应 999，got %d", got)
+	}
+}
+
+// TestSumFilledQtyQueryErrorLogged §0925EVE-W3-F（⑱/D3 留痕反证锁）：查询出错分支
+// 仍回 0（「0 比全账诚实」口径不变），但必须打出一行带用户/委托编号上下文的 log——
+// 此前静默回 0，事后复盘无法区分「真 0」与「查询失败」。本用例把 fills 表 DROP 掉
+// 制造真实查询错误，断言：①返回 0；②stderr 日志行含 user/signal/err 关键字段。
+// 删掉出错分支的 log.Printf 本测试必红（反证成立）。
+// English: §D3 regression — on query failure SumFilledQty still returns 0 (declared basis),
+// but now must log one line carrying user/signal context; dropping the table proves both.
+func TestSumFilledQtyQueryErrorLogged(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.db.Exec(`DROP TABLE fills`); err != nil {
+		t.Fatalf("drop fills: %v", err)
+	}
+	// 捕获标准日志（log 包默认写 stderr；测试内重定向到缓冲区）
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	if got := db.SumFilledQty("U_ERR", "sell:600000:止损:2026-09-04"); got != 0 {
+		t.Fatalf("查询失败应维持回 0 口径，got %d", got)
+	}
+	line := buf.String()
+	for _, want := range []string{"SumFilledQty", "U_ERR", "sell:600000:止损:2026-09-04", "no such table"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("出错留痕缺关键字段 %q，实际日志=%q", want, line)
+		}
 	}
 }
 

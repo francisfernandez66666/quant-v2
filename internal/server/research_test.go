@@ -101,6 +101,64 @@ func TestResearchCandidateApproveFlow(t *testing.T) {
 	}
 }
 
+// TestResearchApproveApplyFailureKeepsProposed §0925EVE-W3-G（FIX_PLAN ⑪ C2）回归：
+// Apply* 失败时候选状态必须**不动**（仍 proposed），响应 500 带回失败原因——
+// 旧实现先写 approved 再 Apply，中途失败会永久停在「已批准但线上没有」的幽灵态。
+// 构造方式：weights 候选的 Weights 字段为非法 JSON，ApplyWeights 反序列化即失败。
+// English: regression — when Apply* fails the candidate must stay 'proposed' (never a
+// half-true 'approved'), and the 500 carries the reason; the old order left ghosts.
+func TestResearchApproveApplyFailureKeepsProposed(t *testing.T) {
+	s, db, dir := newTestResearchServer(t)
+	id, err := db.SaveCandidate(&store.Candidate{
+		Kind: "weights", Status: "proposed", Factors: `["EP_ttm"]`,
+		Weights: `这不是合法JSON`, // 触发 ApplyWeights 失败
+		Metric:  0.1, Horizon: 5,
+	})
+	if err != nil || id <= 0 {
+		t.Fatalf("SaveCandidate: id=%d err=%v", id, err)
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/research/candidates/"+itoa(id)+"/approve", nil)
+	req.SetPathValue("id", itoa(id))
+	s.handleResearchApprove(rr, req)
+	if rr.Code != 500 {
+		t.Fatalf("Apply 失败应 500，got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "应用权重失败") {
+		t.Fatalf("失败原因未带回响应: %s", rr.Body.String())
+	}
+	c, err := db.CandidateByID(id)
+	if err != nil {
+		t.Fatalf("CandidateByID: %v", err)
+	}
+	if c.Status != "proposed" {
+		t.Fatalf("Apply 失败后状态=%s，期望保持 proposed（不得假置 approved）", c.Status)
+	}
+	// 反证之一：失败路径不得留下 applied_rules.json（否则「线上没有」的判断就翻案了）
+	if _, err := os.Stat(filepath.Join(dir, "applied_rules.json")); err == nil {
+		t.Fatalf("Apply 失败却落盘了 applied_rules.json，副作用顺序断言失效")
+	}
+	// 反证之二：合法候选在新顺序下仍正常收敛到 applied（防"只测失败分支、成功路径被改坏"）。
+	// store 无按 ID 改写的接口，故另种一条数据合法的同类候选走全流程。
+	id2, err := db.SaveCandidate(&store.Candidate{
+		Kind: "weights", Status: "proposed", Factors: `["EP_ttm"]`,
+		Weights: `{"EP_ttm":1.0}`, Metric: 0.1, Horizon: 5,
+	})
+	if err != nil || id2 <= 0 {
+		t.Fatalf("SaveCandidate(合法候选): id=%d err=%v", id2, err)
+	}
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/research/candidates/"+itoa(id2)+"/approve", nil)
+	req.SetPathValue("id", itoa(id2))
+	s.handleResearchApprove(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("修复后重新审批应 200，got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if c, _ = db.CandidateByID(id2); c.Status != "applied" {
+		t.Fatalf("修复后重新审批状态=%s，期望 applied", c.Status)
+	}
+}
+
 // TestResearchApproveMissingCandidate §FIX-1 回归：对不存在的候选审批/灰度必须返回 404，
 // 绝不能因 (nil, nil) 反模式解引用 panic 再被 recoverMiddleware 吞成 500。
 // English: regression guard — approve/grayscale on a missing candidate must 404, never panic→500.

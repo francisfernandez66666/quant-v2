@@ -115,7 +115,8 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 11 条）。
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 15 条，
+// §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条后同步计数）。
 // English: factory routing table covering all DefaultAlertRules() entries.
 func DefaultAlertRouting() AlertRoutingConfig {
 	return AlertRoutingConfig{
@@ -126,6 +127,15 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			"quote_stale":           RoutePush, // 行情新鲜度降级
 			"uplink_stale":          RoutePush, // 网关→引擎上行回报停摆（§UPDLINK）
 			"sse_broadcast_skipped": RoutePush, // SSE 广播锁超预算丢推送（§UPDLINK 同族）
+			// §0925EVE-A2（2026-09-25）：kill-switch 撤单失败属"此刻正疼"——紧急停止没撤干净的单
+			// 还挂在网关，操作者必须当场知道，不等日汇总。持续破线由评估器 Firing 态去重 +
+			// 下面 30 分钟触发冷却窗挡刷屏；下次 HaltAll 全成功写 0 时成对销案（resolved）。
+			"halt_cancel_failed": RoutePush,
+			// §0925EVE-C1（2026-09-25）：实盘战法库闸两态均属"此刻正疼"——该账号引擎的战法腿此刻
+			// 已 fail-close（零新建议），owner 必须当场知道是"库挂了"还是"库空了"。持续破线由
+			// 评估器 Firing 态去重 + 30 分钟触发冷却窗挡刷屏；下次装配恢复正常写 0 成对销案。
+			"live_strategy_library_not_loaded": RoutePush, // 读库失败腿（区别于下面"库里没规则"腿）
+			"live_strategy_no_enabled_rules":   RoutePush, // 零条启用腿
 			// —— 日汇总：事件型腿已即时推送，指标面只补「量化留痕」，避免双份 ——
 			"settlement_diff": RouteDaily, // 交割单差异（engine/settlement 的 notify 腿已在推）
 			"settle_failed":   RouteDaily, // 三方对账失败（同上：10 分钟节流重试自带播报）

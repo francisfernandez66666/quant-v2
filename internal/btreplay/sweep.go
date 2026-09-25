@@ -286,7 +286,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		o.slip = sc // 冠军复核（simulateCombo→backtestStock）同口径
 		var trigs []sweepTrigger
 		for code, kls := range klines {
-			o.applyMinuteScope(ad, tsOfCode[code]) // §MINUTE-K：与 backtestStock 同一口径注入点
+		o.applyMinuteScope(ad, tsOfCode[code]) // §MINUTE-K：与 backtestStock 同一口径注入点
 			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code], sc)...)
 		}
 		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })
@@ -456,7 +456,10 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		// 网格用统一出场引擎保证梯度有效；复核让落地数字与实盘同口径、两种口径都留档。
 		// §Phase3 ATR 冠军的实盘口径复核仍走固定止损（真实 adapter 的动态 ATR 止损
 		// 位于运行期 ExitContext，网格层以固定比例复现其等价距离，标注在 params.atr_stop_mult）。
-		verify := verifyChampion(ad, kind, o, klines, industryChg,
+		// §0925EVE-W3-J（B6）：复核链路此前不经过任何 applyMinuteScope 注入点，动量适配器
+		// 沿用触发预算循环里 map 最后一只票的分钟序列做全库复核（串台+污染 §MINUTE-K 计数）；
+		// 现在把 tsOfCode 反查表透传下去，simulateCombo 循环体内逐股重注入。
+		verify := verifyChampion(ad, kind, o, klines, tsOfCode, industryChg,
 			best.Trail, best.StopLossPct, best.Hold)
 		atrNote := ""
 		if best.AtrStopMult > 0 {
@@ -693,8 +696,17 @@ func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KL
 // 对每个组合，把参数应用到战法适配器，然后跑全量 backtestStock（真实的入场+出场），
 // 聚合胜率/盈亏比/期望收益等指标。
 // §用户反馈：分战法回测，每个战法用自己的出场逻辑，不搞统一公式。
+//
+// §0925EVE-W3-J（B6）分钟口径逐股重注入修复（修前的串台机制，注释留档）：
+// applyMinuteScope 此前只有两个注入点——replay.go 全量回放主循环（backtestStock 前）与
+// 本文件触发预算 2a 循环（sweepTriggersOf 前）。冠军复核链路 verifyChampion→simulateCombo→
+// backtestStock **不经过任何一个**：适配器上的 minuteCode 停留在 2a 循环 map 迭代里最后一只
+// 票的 ts_code（迭代序随机），复核整库回放时所有股票的动量判档都拿"同一只票"的分钟序列算
+// MACD（跨股串台），且 storeMinuteMACD 的 (股,日) 缓存/覆盖率计数全记在错票名下
+// （§MINUTE-K 读数同步被污染）。修法即下方循环体内逐票调用同一 applyMinuteScope，
+// 与两个既有注入点完全同用法（tsOfCode 反查表还原 ts_code；非动量适配器自动跳过）。
 func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data.KLine,
-	industryChg map[string]map[string]float64, takeProfitPct float64, stopLossPct float64, maxHold int, minScore float64) sweepResult {
+	tsOfCode map[string]string, industryChg map[string]map[string]float64, takeProfitPct float64, stopLossPct float64, maxHold int, minScore float64) sweepResult {
 	// 记录原始参数，组合完成后恢复
 	restore := applyComboParams(ad, takeProfitPct, stopLossPct, maxHold, minScore)
 	res := sweepResult{Name: ad.Name(), Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct, Hold: maxHold, MinScore: minScore}
@@ -702,6 +714,10 @@ func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data
 	var pnls []float64
 	var dates []string
 	for code, kls := range klines {
+		// §0925EVE-W3-J（B6）：每只票进 backtestStock 前把自己的分钟口径装上（修串台）。
+		// minuteSrc 为 nil 时 applyMinuteScope 会清空 scope——动量照常走已声明的日线近似，
+		// 其它适配器不实现 minuteMACDScoped、零影响。
+		o.applyMinuteScope(ad, tsOfCode[code])
 		indByDate := industryChg[code]
 		trades := o.backtestStock(code, kls, ad, indByDate)
 		for _, t := range trades {
@@ -1085,9 +1101,10 @@ func stepRangeF(from, to, step float64) []float64 {
 
 // verifyChampion 冠军实盘口径复核：把冠军参数注入该战法真实 adapter.Exit 后整库回放一遍。
 // 直接复用 simulateCombo（applyComboParams 注入+恢复、backtestStock 走战法原生出场逻辑）。
+// §0925EVE-W3-J（B6）：透传 tsOfCode 供 simulateCombo 循环体内逐股重注入分钟口径。
 func verifyChampion(ad adapter, kind string, o *Options, klines map[string][]data.KLine,
-	industryChg map[string]map[string]float64, tp, sl float64, holdDays int) sweepResult {
-	return simulateCombo(ad, kind, o, klines, industryChg, tp, sl, holdDays, 0)
+	tsOfCode map[string]string, industryChg map[string]map[string]float64, tp, sl float64, holdDays int) sweepResult {
+	return simulateCombo(ad, kind, o, klines, tsOfCode, industryChg, tp, sl, holdDays, 0)
 }
 
 // stepRangeI 整数步进序列（持仓天数维），含起终点；非法输入回退单档。

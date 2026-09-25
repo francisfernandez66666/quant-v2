@@ -145,12 +145,15 @@ func main() {
 	cfgMgr.SetOperatorID(authMgr.AdminID())
 	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
 	cfgMgr.Watch(context.Background(), 60*time.Second)
+	// §0925EVE-D1 跟随改动：本行起 Watch 后台协程可能随时经 Load() 热替换全局 rules/d1
+	// 指针，本文件对全局配置的读取已全部收进加锁访问器 cfgMgr.Get()/GetD1Config()
+	//（原导出字段 Rules/D1 转私有，字段裸读在 -race 下即报 data race）。
 
 	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN + §ADJ P0-A 三轮补强）：
 	// primary_source=hithink 时回测取数优先 ths_ 表。路由开关已收为 store 包内私有，
 	// 这里是**唯一写入口 ConfigureSource**（禁止各 main 自己 set 包级变量），
 	// "hithink" 的大小写匹配语义也只在该函数里实现一次。
-	store.ConfigureSource(cfgMgr.Rules.Data.PrimarySource, cfgMgr.Rules.Data.ThsFactorsReady)
+	store.ConfigureSource(cfgMgr.Get().Data.PrimarySource, cfgMgr.Get().Data.ThsFactorsReady)
 
 	// §GAP3.1 运行时交易日历：后台拉取法定节假日/临时休市日（失败按周末口径兜底，不阻断启动）。
 	data.LoadTradingCalendarAsync()
@@ -228,7 +231,7 @@ func main() {
 	// English: paper trading — virtual fills/net-value/signal-quality stats isolated from the real book.
 	// When enabled, the engine auto-fills buy signals at the live snapshot price; rules.paper in
 	// config.json controls the switch and parameters.
-	paperCfg := cfgMgr.Rules.Paper
+	paperCfg := cfgMgr.Get().Paper
 	// §F-4（20260917 缺陷修复批）装配逻辑收敛到 paper.ConfigFromRules（零值归一口径不变），
 	// 与 POST /api/paper/config 热更新共用同一构建器，消灭"只有重启才生效"的独一份内联。
 	paperEngine := paper.New(paper.ConfigFromRules(paperCfg), filepath.Join(dataDir, "paper.json"))
@@ -345,7 +348,7 @@ func main() {
 	fetcher.SetDataDir(dataDir)
 	fetcher.LoadPersistedSnapshot(dataDir)
 	// §A+B 行情刷新间隔可配置（默认 5s）：降低以缩短"行情变化→信号检测"感知延迟。
-	if sec := cfgMgr.Rules.Runtime.FeedIntervalSec; sec > 0 {
+	if sec := cfgMgr.Get().Runtime.FeedIntervalSec; sec > 0 {
 		fetcher.SetRefreshInterval(time.Duration(sec) * time.Second)
 	}
 	// §WS-G 快照流录制：QUANT_RECORD_STREAM=1 时把每轮 5s 快照追加为 quote_stream.jsonl
@@ -369,17 +372,17 @@ func main() {
 	// Staleness 自然增长，交易熔断判定（/health ok&&broker_connected）不含行情态。
 	// English: §ENH-5 Level-1 quote feed (off by default; production decision machine only).
 	// Failures are silent — the 5s Sina chain keeps running and health trading-gates stay untouched.
-	if cfgMgr.Rules.Runtime.QMTFeedEnabled && cfgMgr.Rules.QMT.GatewayURL != "" {
-		intervalSec := cfgMgr.Rules.Runtime.QMTFeedIntervalSec
+	if cfgMgr.Get().Runtime.QMTFeedEnabled && cfgMgr.Get().QMT.GatewayURL != "" {
+		intervalSec := cfgMgr.Get().Runtime.QMTFeedIntervalSec
 		if intervalSec <= 0 {
 			intervalSec = 3
 		}
-		feedClient := trading.NewQMTClient(cfgMgr.Rules.QMT.GatewayURL, cfgMgr.Rules.QMT.Token, 3*time.Second, 0)
+		feedClient := trading.NewQMTClient(cfgMgr.Get().QMT.GatewayURL, cfgMgr.Get().QMT.Token, 3*time.Second, 0)
 		qmtFeed := data.NewQMTFeed(fetcher, feedClient, time.Duration(intervalSec)*time.Second, 30*time.Second, 1)
 		go qmtFeed.Start()
 		defer qmtFeed.Stop()
-		log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds", cfgMgr.Rules.QMT.GatewayURL, intervalSec)
-	} else if cfgMgr.Rules.Runtime.QMTFeedEnabled {
+		log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds", cfgMgr.Get().QMT.GatewayURL, intervalSec)
+	} else if cfgMgr.Get().Runtime.QMTFeedEnabled {
 		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
 	}
 	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
@@ -419,7 +422,7 @@ func main() {
 
 	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选
 	// English: per-sector constituent coverage (default 20) — widen same-sector leaders into the pool
-	sectorTopN := cfgMgr.Rules.MainSector.SectorConstituentTopN
+	sectorTopN := cfgMgr.Get().MainSector.SectorConstituentTopN
 	if sectorTopN <= 0 {
 		sectorTopN = 20
 	}
@@ -446,13 +449,13 @@ func main() {
 		Fetcher:            fetcher,
 		CfgMgr:             cfgMgr,
 		Coordinator:        dc,                                     // §MARKET_RISK_GATE P0：风险盘口主源协调器（hithink 优先+东财兜底）
-		RiskHithinkPrimary: cfgMgr.Rules.Data.RiskHithinkPrimary(), // 应急回退阀：false 时引擎回落东财直连
+		RiskHithinkPrimary: cfgMgr.Get().Data.RiskHithinkPrimary(), // 应急回退阀：false 时引擎回落东财直连
 		DataDir:            dataDir,
 		Notifier:           notifier,
 		SectorTopN:         sectorTopN,
 		Paper:              paperEngine,
-		D1MaxRetries:       cfgMgr.Rules.LLM.MaxRetryTimes,
-		D1MaxTokens:        cfgMgr.Rules.LLM.D1MaxTokens,
+		D1MaxRetries:       cfgMgr.Get().LLM.MaxRetryTimes,
+		D1MaxTokens:        cfgMgr.Get().LLM.D1MaxTokens,
 		RealStore:          realStore,   // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
 		D1Store:            researchDB,  // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
 		ShadowExec:         isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
@@ -604,7 +607,7 @@ func main() {
 		// §A+B 近实时节拍可配置（默认 5s）：降低以加快信号翻转检出与下单；非交易时段仍休眠。
 		// English: A+B — configurable near-realtime cadence (default 5s); off-hours still hibernated.
 		scoringTick := 5 * time.Second
-		if sec := cfgMgr.Rules.Runtime.ScoringIntervalSec; sec > 0 {
+		if sec := cfgMgr.Get().Runtime.ScoringIntervalSec; sec > 0 {
 			scoringTick = time.Duration(sec) * time.Second
 		}
 		// sleepChunk 分块休眠窗口：将长等待切分为 ≤15 分钟的片段，便于响应信号/退出。

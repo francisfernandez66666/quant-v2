@@ -824,6 +824,12 @@ func (d *DB) SumFilledQty(userID, signalID string) int {
 	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills WHERE user_id=? AND `+
 		fillSignalMatchSQL("signal_id", "traded_at", "?"),
 		userID, signalID, signalID, signalID).Scan(&total); err != nil {
+		// §0925EVE-W3-F（⑱/D3 留痕收口）：查询出错仍回 0——「0 比全账诚实」的声明口径保留
+		// （调用方补卖/重放拿到 0 只会少动不会张冠李戴），但此前**零日志**：真 0（该委托确实
+		// 没成交）与查询失败（成交量未知）在事后复盘里完全无法区分。补一条带用户/委托编号
+		// （编号自带交易日）的 log 行，缺的只是留痕，不改任何返回值语义。
+		log.Printf("[store] SumFilledQty 查询失败按 0 返回（0=未知而非必然真 0）user=%s signal=%s err=%v",
+			userID, signalID, err)
 		return 0
 	}
 	return total

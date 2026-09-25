@@ -45,20 +45,20 @@ func TestManagerLoadSaveRoundTrip(t *testing.T) {
 		t.Fatalf("Set 后应落盘: %v", err)
 	}
 
-	// 用全新管理器从磁盘加载
+	// 用全新管理器从磁盘加载（§0925EVE-D1：rules/d1 字段转私有，断言经加锁访问器读取，语义不变）
 	m2 := NewManager(path)
-	if m2.Rules.Strategy.Dragon.F1SealWeight != 0.5 {
-		t.Errorf("重载后 F1SealWeight 应=0.5, got %.2f", m2.Rules.Strategy.Dragon.F1SealWeight)
+	if m2.Get().Strategy.Dragon.F1SealWeight != 0.5 {
+		t.Errorf("重载后 F1SealWeight 应=0.5, got %.2f", m2.Get().Strategy.Dragon.F1SealWeight)
 	}
-	if len(m2.D1.Rules) != 1 || m2.D1.Rules[0].Direction != "利好" {
-		t.Errorf("重载后 D1 规则丢失: %+v", m2.D1.Rules)
+	if len(m2.GetD1Config().Rules) != 1 || m2.GetD1Config().Rules[0].Direction != "利好" {
+		t.Errorf("重载后 D1 规则丢失: %+v", m2.GetD1Config().Rules)
 	}
 }
 
 // TestManagerMissingFileMissing 指向不存在路径时使用默认值而非崩溃。
 func TestManagerLoadMissingFileUsesDefaults(t *testing.T) {
 	m := NewManager(filepath.Join(t.TempDir(), "nonexistent.json"))
-	if m.Rules == nil {
+	if m.Get() == nil {
 		t.Fatal("缺失文件时应保有默认 Rules")
 	}
 	if m.GetStrategyConfig() == nil {
@@ -108,21 +108,24 @@ func TestRuntimeConfigIntervalDefaults(t *testing.T) {
 	m := NewManager(path)
 
 	// 显式设为 1s 并持久化（深拷贝避免污染共享 DefaultRules）
-	rules := *m.Rules
+	// §0925EVE-D1：指针替换走与 Load 相同的 m.mu 发布口径（虽然是单协程 setup，也不新开裸写通道）
+	rules := *m.Get()
 	rules.Runtime = RuntimeConfig{FeedIntervalSec: 1, ScoringIntervalSec: 1}
-	m.Rules = &rules
+	m.mu.Lock()
+	m.rules = &rules
+	m.mu.Unlock()
 	m.Save()
 	m2 := NewManager(path)
-	if m2.Rules.Runtime.FeedIntervalSec != 1 {
-		t.Errorf("FeedIntervalSec=%d, want 1", m2.Rules.Runtime.FeedIntervalSec)
+	if m2.Get().Runtime.FeedIntervalSec != 1 {
+		t.Errorf("FeedIntervalSec=%d, want 1", m2.Get().Runtime.FeedIntervalSec)
 	}
-	if m2.Rules.Runtime.ScoringIntervalSec != 1 {
-		t.Errorf("ScoringIntervalSec=%d, want 1", m2.Rules.Runtime.ScoringIntervalSec)
+	if m2.Get().Runtime.ScoringIntervalSec != 1 {
+		t.Errorf("ScoringIntervalSec=%d, want 1", m2.Get().Runtime.ScoringIntervalSec)
 	}
 	// 未设置时默认 0（调用方回退 5s）
 	m3 := NewManager(filepath.Join(t.TempDir(), "cfg2.json"))
-	if m3.Rules.Runtime.FeedIntervalSec != 0 || m3.Rules.Runtime.ScoringIntervalSec != 0 {
-		t.Errorf("默认应为 0（回退 5s）, got %d/%d", m3.Rules.Runtime.FeedIntervalSec, m3.Rules.Runtime.ScoringIntervalSec)
+	if m3.Get().Runtime.FeedIntervalSec != 0 || m3.Get().Runtime.ScoringIntervalSec != 0 {
+		t.Errorf("默认应为 0（回退 5s）, got %d/%d", m3.Get().Runtime.FeedIntervalSec, m3.Get().Runtime.ScoringIntervalSec)
 	}
 }
 
@@ -214,8 +217,8 @@ func TestQMTConfigPerAccount(t *testing.T) {
 
 	// 无 store（未接入账号隔离）→ 回退全局 rules.qmt
 	m2 := NewManager(filepath.Join(t.TempDir(), "config2.json"))
-	m2.Rules.QMT = DefaultQMTConfig()
-	m2.Rules.QMT.GatewayURL = "http://127.0.0.1:8888"
+	m2.Get().QMT = DefaultQMTConfig() // §0925EVE-D1：经加锁访问器取活体指针后写（语义同旧字段直写）
+	m2.Get().QMT.GatewayURL = "http://127.0.0.1:8888"
 	if got := m2.GetQMTConfigFor("any"); got == nil || got.GatewayURL != "http://127.0.0.1:8888" {
 		t.Errorf("无 store 应回退全局 rules.qmt, got %+v", got)
 	}
@@ -249,7 +252,7 @@ func TestStoredLLMConfig(t *testing.T) {
 
 // TestNotifyNtfyChannelRoundTrip §HARDENING ntfy 运维告警通道配置键：JSON 序列化往返不丢键，
 // 默认零值=通道关闭（main.go 的 Topic!="" 启用守卫依赖此语义）。
-// 注意：Manager.Rules 是指向包级单例 DefaultRules 的指针（运行时全局单实例语义），
+// 注意：Manager.rules（§0925EVE-D1 转私有）初始指向包级单例 DefaultRules（运行时全局单实例语义），
 // SetNotifyConfig 会污染全局默认——本测试走纯 JSON 往返，不触碰全局状态。
 func TestNotifyNtfyChannelRoundTrip(t *testing.T) {
 	nc := NotifyConfig{

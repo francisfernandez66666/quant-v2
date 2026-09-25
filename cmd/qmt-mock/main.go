@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -93,6 +94,23 @@ type book struct {
 	quoteSource   string
 	tickAgeSec    float64
 	tickTimeFixed int64
+	// unresolved §0925EVE-W3-G：第三态「待核对」占位表（键=signal_id），
+	// 对齐实网关 gateway.py 的 status=待核对 行语义——已交给通道但结算结果不明的委托。
+	// /admin/status 回显该表；/admin/order-confirm 人工收敛（released 删行 / settled 转终态）。
+	// mock 场景下真实下单流程不会自动产生第三态行，由 /admin/mock-unresolve 注入。
+	unresolved map[string]*unresolvedRow
+}
+
+// unresolvedRow 一条第三态待核对占位（字段形状对齐 gateway.py unresolved_orders 行：
+// signal_id/code/side/qty/created_at/dispatch_in_flight）。
+// English: one third-state placeholder row shaped like the real gateway's unresolved_orders entry.
+type unresolvedRow struct {
+	SignalID         string `json:"signal_id"`
+	Code             string `json:"code"`
+	Side             string `json:"side"`
+	Qty              int    `json:"qty"`
+	CreatedAt        string `json:"created_at"`
+	DispatchInFlight bool   `json:"dispatch_in_flight"`
 }
 
 // fillRecord 成交流水行（§P2-14 /settlement 装配源，字段对齐实网关 fills 表）。
@@ -116,13 +134,14 @@ type fillRecord struct {
 // newBook 创建指定资金账号的内存账本（初始化订单/持仓映射与 signal→order 幂等索引）。
 func newBook(account string) *book {
 	return &book{
-		orders:    map[string]*order{},
-		positions: map[string]*pos{},
-		signal:    map[string]string{},
-		account:   account,
-		nextID:    1,
-		cash:      1000000, // §P2-14 默认模拟现金 100 万（-cash 可调）
-		fillMode:  "full",
+		orders:     map[string]*order{},
+		positions:  map[string]*pos{},
+		signal:     map[string]string{},
+		unresolved: map[string]*unresolvedRow{},
+		account:    account,
+		nextID:     1,
+		cash:       1000000, // §P2-14 默认模拟现金 100 万（-cash 可调）
+		fillMode:   "full",
 	}
 }
 
@@ -774,6 +793,143 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 		b.mu.Unlock()
 		log.Printf("[mock] cancelled %s", req.OrderID)
 		push(evtCancel)
+		writeJSON(w, map[string]interface{}{"ok": true})
+	})
+
+	// ── §0925EVE-W3-G 第三态人工收敛契约面（对齐实网关 gateway.py）──
+	// GET /admin/status：观察位 unresolved_orders（最多回 20 条，unresolved_count 为全量计数）
+	// + active 通道 + failover_enable。Go 侧 qmt_admin.go PendingReview() 按此形状解码，
+	// 截断上限 [:20] 与实网关逐字一致，保证「truncated 显式化」链路在 mock 环境同样可测。
+	mux.HandleFunc("/admin/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"ok":false,"err":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		b.mu.Lock()
+		rows := make([]unresolvedRow, 0, len(b.unresolved))
+		for _, u := range b.unresolved {
+			rows = append(rows, *u)
+		}
+		active := b.activeBroker
+		b.mu.Unlock()
+		if active == "" {
+			active = "xt"
+		}
+		// 稳定排序（按 signal_id）：map 遍历序随机，UAT 断言行数/内容需要确定形状。
+		sort.Slice(rows, func(i, j int) bool { return rows[i].SignalID < rows[j].SignalID })
+		total := len(rows)
+		if total > 20 {
+			rows = rows[:20] // 实网关同款截断：for r in unresolved[:20]
+		}
+		writeJSON(w, map[string]interface{}{
+			"ok":                true,
+			"ts":                time.Now().Format(time.RFC3339),
+			"active":            active,
+			"failover_enable":   false,
+			"unresolved_orders": rows,
+			"unresolved_count":  total,
+		})
+	})
+
+	// POST /admin/order-confirm：人工二选一收敛（released=柜台确无此单删占位 /
+	// settled=柜台有此单转终态）。业务拒绝按实网关口径回 4xx + {"ok":false,"err":...}，
+	// Go 侧 adminDo 会把 4xx 体结构化透传，绝不洗成 200。
+	mux.HandleFunc("/admin/order-confirm", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"ok":false,"err":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			SignalID string `json:"signal_id"`
+			Decision string `json:"decision"`
+			OrderID  string `json:"order_id"`
+			Status   string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"ok":false,"err":"bad body"}`, http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.SignalID) == "" {
+			http.Error(w, `{"ok":false,"err":"signal_id required"}`, http.StatusBadRequest)
+			return
+		}
+		if req.Decision != "released" && req.Decision != "settled" {
+			http.Error(w, `{"ok":false,"err":"decision must be released|settled"}`, http.StatusBadRequest)
+			return
+		}
+		b.mu.Lock()
+		u := b.unresolved[req.SignalID]
+		if u == nil {
+			b.mu.Unlock()
+			http.Error(w, `{"ok":false,"err":"no unresolved row for signal_id"}`, http.StatusNotFound)
+			return
+		}
+		delete(b.unresolved, req.SignalID)
+		b.mu.Unlock()
+		if req.Decision == "released" {
+			log.Printf("[mock] order-confirm released %s", req.SignalID)
+			writeJSON(w, map[string]interface{}{"ok": true, "released": true})
+			return
+		}
+		st := req.Status
+		if st == "" {
+			st = "已撤" // 实网关 settled 缺省终态口径
+		}
+		log.Printf("[mock] order-confirm settled %s -> %s (order_id=%s)", req.SignalID, st, req.OrderID)
+		writeJSON(w, map[string]interface{}{"ok": true, "status": st})
+	})
+
+	// POST /admin/mock-unresolve：测试注入面——造一条第三态待核对占位。
+	// 真实流程里第三态由「派发后结算不明」产生，mock 无网络不确定性可复现，
+	// 显式注入让 UAT/E2E 能锤「清单渲染 + 人工收敛」全链路（对齐 §3.1-1 行情注入面先例）。
+	mux.HandleFunc("/admin/mock-unresolve", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"ok":false,"err":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req unresolvedRow
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SignalID == "" {
+			http.Error(w, `{"ok":false,"err":"bad body: signal_id required"}`, http.StatusBadRequest)
+			return
+		}
+		if req.CreatedAt == "" {
+			req.CreatedAt = time.Now().Format(time.RFC3339)
+		}
+		row := req
+		b.mu.Lock()
+		b.unresolved[row.SignalID] = &row
+		b.mu.Unlock()
+		log.Printf("[mock] injected unresolved %s (%s %s %d)", row.SignalID, row.Code, row.Side, row.Qty)
+		writeJSON(w, map[string]interface{}{"ok": true})
+	})
+
+	// POST /admin/mock-force-status：测试注入面——直接改写某笔委托的网关侧状态且**不推回报**。
+	// 专造「引擎账本还认为已报、网关侧已进终态」的撤单竞态形态：此时 kill-switch 撤单
+	// 会得到 409 not cancellable，HaltAllResult.Failed 明细（§0925EVE-A2）由此可测。
+	mux.HandleFunc("/admin/mock-force-status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"ok":false,"err":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			OrderID string `json:"order_id"`
+			Status  string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.OrderID == "" || req.Status == "" {
+			http.Error(w, `{"ok":false,"err":"bad body: order_id/status required"}`, http.StatusBadRequest)
+			return
+		}
+		b.mu.Lock()
+		o := b.orders[req.OrderID]
+		if o != nil {
+			o.Status = req.Status // 只改状态，不推事件——模拟回报丢失/竞态窗口
+		}
+		b.mu.Unlock()
+		if o == nil {
+			http.Error(w, `{"ok":false,"err":"unknown order_id"}`, http.StatusNotFound)
+			return
+		}
+		log.Printf("[mock] forced status %s -> %s (no report pushed)", req.OrderID, req.Status)
 		writeJSON(w, map[string]interface{}{"ok": true})
 	})
 

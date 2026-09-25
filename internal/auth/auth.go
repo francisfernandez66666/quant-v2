@@ -613,9 +613,17 @@ func (m *Manager) save() error {
 	return dataio.AtomicWrite(m.dbPath, dataBytes, 0o600)
 }
 
-// tokenTTL §A3 访问令牌有效期：注册/创建默认 30 天，登录成功滑动续期。
+// tokenTTL §A3 访问令牌有效期：注册/创建默认 30 天。
 // 此前 TokenExp=0 永不过期且明文存 0644 文件——一次泄漏终身有效。
-// （不选"登录轮换新令牌"：会踢掉 APK 等其他已登录设备；滑动续期兼顾安全与多端。）
+// §0925EVE-W3-F（⑳/D5 注释漂移对齐）：原注释宣称「登录成功滑动续期」，与实现不符——
+// ValidateToken 只校验过期、对任何有效令牌都不改 Exp（grep 无续期写路径），**不存在**
+// 按请求滑动。真实语义是「定长 + 登录重签」：每次登录经 issueSession 签发**新**会话，
+// 新令牌自登录时刻起固定 30 天；旧会话到期即失效不续命。效果上常用设备重复登录会各自
+// 拿到新 30 天窗口（多端互不踢线，maxSessions 上限内 FIFO 淘汰），但**长期不登录的设备
+// 到期必掉线**——这正是当初不选「登录轮换新令牌踢旧设备」方案的同一枚硬币。
+// （不选"登录轮换新令牌"：会踢掉 APK 等其他已登录设备。）
+// English: fixed 30-day TTL minted per login (issueSession), NOT sliding on requests —
+// ValidateToken never rewrites Exp; a device that stops logging in expires hard at TTL.
 const tokenTTL = 30 * 24 * time.Hour
 
 // newTokenExpiry 返回新的令牌过期时间戳。

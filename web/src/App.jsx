@@ -316,10 +316,14 @@ export default function App() {
       refreshStatus()
       return
     }
-    if (msg.signal) {
-      showToast('新信号: ' + (msg.signal.code || ''), 'warning')
-      refreshStatus()
-    }
+    // §0925EVE-W3-I（条目 E4a）删除原此处 `if (msg.signal) { showToast('新信号: …'); refreshStatus() }`
+    // 死分支。读码锤实全仓唯一带顶层 signal 字段的 SSE 载荷是放量急拉广播
+    // （internal/trigger/trigger.go:187-190 `{type:"trigger", signal}`），且其 signal.code/signal.msg
+    // 恒非空 → 必被上方 sseOpsAlert（utils.js case 'trigger'）消费并提前 return，永走不到这里；
+    // scan/message/score 载荷均无顶层 signal 字段（engine.go:3462/4783，grep 全仓证毕）。
+    // English: §0925EVE-W3-I — removed the provably-dead `msg.signal` branch: the only SSE payload
+    // carrying a top-level `signal` key is the trigger event, which always has code/msg and is
+    // consumed earlier by sseOpsAlert with an early return.
   }
 
   // 全局认证过期事件回调：提示并安全退出

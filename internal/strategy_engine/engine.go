@@ -1077,6 +1077,9 @@ func enrichSectorData(sectors map[string]*SectorHot, scanner *data.SectorScanner
 		sh.ChangePct = infos[0].ChangePct
 		sh.LimitupCnt = infos[0].LimitupCnt
 		sh.NetInflow = infos[0].NetInflow
+		// §0925EVE-W3-J（B5）：行情腿（东财）失败标记随结构透传给下游 sector_agent——
+		// 置真时上面三个字段是未回填的全零值，相位状态机须报「未知」而非编造「反弹」。
+		sh.QuoteLegFailed = infos[0].QuoteLegFailed
 	}
 }
 

@@ -141,17 +141,17 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 	cfgMgr := config.NewManager(filepath.Join(tmp, "config.json"))
 	// 战法权重：仅激活 Dragon（F1~F4），其余策略权重保持 0，
 	// 保证确定性只产出 dragon 信号，避免多策略同标的触发后的信号去重歧义。
-	cfgMgr.Rules.Strategy.Dragon.F1SealWeight = 0.30
-	cfgMgr.Rules.Strategy.Dragon.F2ResonanceWeight = 0.25
-	cfgMgr.Rules.Strategy.Dragon.F3PremiumWeight = 0.20
-	cfgMgr.Rules.Strategy.Dragon.F4RsWeight = 0.25
+	cfgMgr.Get().Strategy.Dragon.F1SealWeight = 0.30
+	cfgMgr.Get().Strategy.Dragon.F2ResonanceWeight = 0.25
+	cfgMgr.Get().Strategy.Dragon.F3PremiumWeight = 0.20
+	cfgMgr.Get().Strategy.Dragon.F4RsWeight = 0.25
 	// 情绪周期阈值：涨停池 99 家、最高连板 9 → 高潮。
-	cfgMgr.Rules.Emotion.EmoClimaxLimitupMin = 90
-	cfgMgr.Rules.Emotion.EmoClimaxBoardMin = 5
+	cfgMgr.Get().Emotion.EmoClimaxLimitupMin = 90
+	cfgMgr.Get().Emotion.EmoClimaxBoardMin = 5
 
 	sAgent := sector_agent.New(scanner, data.NewRPSManager())
 	cAgent := combat_agent.New(cfgMgr.GetStrategyConfig())
-	cAgent.SetLaodengConfig(&cfgMgr.Rules.Laodeng)
+	cAgent.SetLaodengConfig(&cfgMgr.Get().Laodeng)
 	cAgent.SetRunners([]combat_agent.StrategyRunner{
 		{Type: strategy.SignalDragon, Strategy: dragon.New(cfgMgr)},
 		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(cfgMgr)},
@@ -168,7 +168,7 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 	eng := engine.New(marketAPI, nAgent, strategyEngine, sAgent, cAgent, agg, rpt,
 		stockTracker, wlMgr, sse, llmClient, thsClient, tmp)
 	eng.SetScanner(scanner)
-	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
+	eng.SetEmotionConfig(&cfgMgr.Get().Emotion)
 	// §FIX-10(20260919 批四)：注入 accountsRoot——生产经 registry 恒注入；rig 此前从未设置
 	// （全仓无一处 SetAccountsRoot 用例），而咨询已改为"隔离不可用即拒绝服务"，
 	// 不注入则所有 ConsultLLM 用例会走 503 分支。顺带让 rig 与生产寻址口径一致。
@@ -470,7 +470,7 @@ func TestEndToEndFullPipeline(t *testing.T) {
 			if m["emotion"] == "" {
 				t.Error("SSE emotion 相位缺失")
 			}
-			wantEmo := data.DetectEmotionPhaseV2(fix.LimitUpPool, 0, 0, &rig.cfgMgr.Rules.Emotion)
+			wantEmo := data.DetectEmotionPhaseV2(fix.LimitUpPool, 0, 0, &rig.cfgMgr.Get().Emotion)
 			if m["emotion"] != wantEmo {
 				t.Errorf("SSE emotion=%q, want %q (按 fixture 涨停池判定)", m["emotion"], wantEmo)
 			}

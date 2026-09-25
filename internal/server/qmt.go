@@ -1260,9 +1260,14 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 	cfg.Halted = *req.Halted             // 本次只翻转 halted 字段，其余保持原值
 	s.cfg.SetQMTConfigFor(uid, &cfg)     // 持久化（跨重启保留）
 	// 立即执行 kill-switch：绕过 §QMT-PENDING 开关队列（见 applyKillSwitchNow 注释），
-	// 返回本次同步撤销的在途未成交委托笔数。
-	cancelled := s.applyKillSwitchNow(uid, &cfg, "endpoint")
-	writeJSON(w, 200, map[string]interface{}{"ok": "1", "halted": *req.Halted, "cancelled": cancelled})
+	// 返回本次同步撤销的在途未成交委托笔数与撤单失败明细（§0925EVE-A2）。
+	cancelled, failed := s.applyKillSwitchNow(uid, &cfg, "endpoint")
+	// §0925EVE-A2：部分撤单失败不是请求失败——HTTP 仍 200，但失败明细必须随响应可见
+	// （failed 数组恒非 nil，全成功时是 []）。操作者按下"停止交易"后若只看到成功计数，
+	// 就等于系统宣称"停止已彻底执行"，而实际上还有单挂在网关——正是本仓要消灭的「降级报成功」。
+	// English: §0925EVE-A2 — partial cancel failure is not a request failure (still 200), but the
+	// per-order failure list rides along and is always an array, never null.
+	writeJSON(w, 200, map[string]interface{}{"ok": "1", "halted": *req.Halted, "cancelled": cancelled, "failed": failed})
 }
 
 // applyKillSwitchNow §U-3（2026-09-14 像素级 UAT）：kill-switch 置位/解除的"立即生效"公共执行体，
@@ -1271,26 +1276,32 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 // halted 会滞留到次日开盘才生效——与 fail-stop 语义冲突（UAT 实录：盘后 config 路径置 halted
 // 等待 6s 仍可下单）。kill-switch 属紧急停止，必须绕过队列直接 ctrl.UpdateConfig 同步，
 // 置位时同步 HaltAll 撤销在途未成交委托、SSE 广播、opslog 审计留痕（来源 source 区分端点）。
-// 返回值：本次同步撤销的委托笔数（无控制器/解除时 0）。
+// 返回值：本次同步撤销的委托笔数 + 撤单失败明细（§0925EVE-A2 新增第二返回值；解除/无控制器时
+// 失败明细恒为空数组非 nil，保证 JSON 序列化出 []，前端无需判 null）。
 // English: §U-3 — shared immediate-effect body for the kill switch, used by both the dedicated
 // /api/qmt/halt endpoint and a halted field carried by /api/config/qmt. Normal config edits ride
 // the session-queued hot-sync (so an off-hours halted save would only bite at next open — a
 // fail-stop violation caught in UAT); the kill switch bypasses the queue via ctrl.UpdateConfig,
-// runs HaltAll on engagement, broadcasts SSE and writes the audit trail. Returns cancelled count.
-func (s *Server) applyKillSwitchNow(uid string, cfg *config.QMTConfig, source string) int {
+// runs HaltAll on engagement, broadcasts SSE and writes the audit trail. Returns the cancelled
+// count plus the §0925EVE-A2 per-order failure list (always non-nil).
+func (s *Server) applyKillSwitchNow(uid string, cfg *config.QMTConfig, source string) (int, []trading.HaltAllFailure) {
 	cancelled := 0
+	// 预置空切片：HaltAll 未跑（解除/无控制器）时响应里的 failed 也必须是 []而不是 null
+	failed := make([]trading.HaltAllFailure, 0)
 	ctrl := s.qmtCtrlFor(uid)
 	if ctrl != nil {
 		ctrl.UpdateConfig(*cfg)
 		if cfg.Halted {
-			cancelled = ctrl.HaltAll()
+			res := ctrl.HaltAll()
+			cancelled, failed = res.Cancelled, res.Failed
 		}
 	}
-	log.Printf("[trading] ⚠️ kill-switch %s (用户=%s 来源=%s): 同步撤销未成交委托 %d 笔",
-		map[bool]string{true: "置位——紧急停止一切下单", false: "解除"}[cfg.Halted], uid, source, cancelled)
+	// §0925EVE-A2：日志同样带上失败数——log 留痕与响应回传是两条腿，缺一条就会复盘时查不到当时撤没撤干净
+	log.Printf("[trading] ⚠️ kill-switch %s (用户=%s 来源=%s): 同步撤销未成交委托 %d 笔，撤单失败 %d 笔",
+		map[bool]string{true: "置位——紧急停止一切下单", false: "解除"}[cfg.Halted], uid, source, cancelled, len(failed))
 	// §DAILY_OPSLOG kill-switch 属最高优先级留档事件
-	opslog.Logf("quant", "kill-switch %s 用户=%s 来源=%s 撤销未成交委托=%d",
-		map[bool]string{true: "置位(紧急停止)", false: "解除"}[cfg.Halted], uid, source, cancelled)
+	opslog.Logf("quant", "kill-switch %s 用户=%s 来源=%s 撤销未成交委托=%d 撤单失败=%d",
+		map[bool]string{true: "置位(紧急停止)", false: "解除"}[cfg.Halted], uid, source, cancelled, len(failed))
 	// §WS-F C1 审计：kill-switch 翻转留痕（来源区分专用端点/配置保存）
 	result := "clear"
 	if cfg.Halted {
@@ -1298,14 +1309,16 @@ func (s *Server) applyKillSwitchNow(uid string, cfg *config.QMTConfig, source st
 	}
 	opslog.Audit("kill_switch", uid, "qmt:"+source, result)
 	if s.sse != nil {
+		// §0925EVE-A2：SSE 同样带 failed 明细，全局 Toast（web/src/utils.js sseOpsAlert）即时可见
 		s.sse.BroadcastTo(uid, map[string]interface{}{
 			"type":      "qmt_halt",
 			"halted":    cfg.Halted,
 			"cancelled": cancelled,
+			"failed":    failed,
 			"time":      time.Now().Format("15:04:05"),
 		})
 	}
-	return cancelled
+	return cancelled, failed
 }
 
 // handleQMTSettle §WS-B 交割单三方对账端点（POST /api/qmt/settle，admin 权限）：

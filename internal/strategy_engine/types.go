@@ -27,6 +27,13 @@ type SectorHot struct {
 	Reason     string   `json:"reason"`                // 上榜原因（Listing reason）
 	LeadStocks []string `json:"lead_stocks,omitempty"` // 领涨/领跌股（Leading/lagging stocks）
 	NewsTitles []string `json:"news_titles,omitempty"` // 关联新闻标题（Related news titles）
+	// QuoteLegFailed §0925EVE-W3-J（B5）：板块行情腿（东财）本轮失败的透传标记。
+	// 来源 data.SectorInfo.QuoteLegFailed（enrichSectorData 填充时随结构一起带下来）：
+	// 置真时 ChangePct/NetInflow 是**没有回填来源的全零值**，sector_agent 的相位状态机
+	// 必须据此报「未知」，不得从 (0,0) 编造「反弹」。
+	// English: passthrough of the failed EastMoney quote leg; when true the change%/net-inflow
+	// are unbackfilled zeros and downstream phase classification must say "unknown".
+	QuoteLegFailed bool `json:"quote_leg_failed,omitempty"`
 }
 
 // IndividualStock 个股事件信息，包含方向（利好/利空）。

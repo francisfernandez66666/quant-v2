@@ -24,7 +24,7 @@ func initConfig(t *testing.T) *config.Manager {
 // TestVerifyDeploymentQMTDisabled QMT 关闭时不应告警"executor=Noop"（enabled=false 属设计内状态）。
 func TestVerifyDeploymentQMTDisabled(t *testing.T) {
 	m := initConfig(t)
-	m.Rules.QMT = config.DefaultQMTConfig() // enabled=false
+	m.Get().QMT = config.DefaultQMTConfig() // enabled=false
 	verifyDeployment(m, nil)                // 不应 panic
 }
 
@@ -36,7 +36,7 @@ func TestVerifyDeploymentQMTEnabledNoToken(t *testing.T) {
 	q.Mode = "manual"
 	q.GatewayURL = "http://127.0.0.1:8789"
 	q.Token = ""
-	m.Rules.QMT = q
+	m.Get().QMT = q
 	verifyDeployment(m, nil) // 仅验证不 panic；告警内容经由日志人工核对
 }
 
@@ -50,6 +50,6 @@ func TestVerifyDeploymentLLMKeys(t *testing.T) {
 // TestVerifyDeploymentQMTNil 配置段缺失（GetQMTConfigFor 返回 nil 的等价场景）不 panic。
 func TestVerifyDeploymentQMTNil(t *testing.T) {
 	m := initConfig(t)
-	m.Rules.QMT = config.QMTConfig{} // 零值，缺 gateway_url/token 但 enabled=false
+	m.Get().QMT = config.QMTConfig{} // 零值，缺 gateway_url/token 但 enabled=false
 	verifyDeployment(m, nil)
 }

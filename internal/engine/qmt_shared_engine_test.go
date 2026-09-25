@@ -23,8 +23,8 @@ func TestSharedEngineQueuesQMTConfig(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 	cm := config.NewManager("")
-	cm.Rules.QMT.Enabled = true
-	cm.Rules.QMT.GatewayURL = "http://first-host:8789"
+	cm.Get().QMT.Enabled = true
+	cm.Get().QMT.GatewayURL = "http://first-host:8789"
 
 	// 共享引擎：.userID 为空；QMT 控制器在构建期由 registry 装配（归属首建成员 u_ops）。
 	e := &Engine{}
@@ -32,7 +32,7 @@ func TestSharedEngineQueuesQMTConfig(t *testing.T) {
 	e.cfgMgr = cm
 	e.SetQMTCfgSource("u_ops")
 	// 模拟配置保存（管理员改网关地址后 5s 热同步轮询到达）。
-	cm.Rules.QMT.GatewayURL = "http://new-host:8789"
+	cm.Get().QMT.GatewayURL = "http://new-host:8789"
 
 	e.syncAccountConfig()
 

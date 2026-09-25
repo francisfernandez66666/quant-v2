@@ -88,10 +88,10 @@ func TestResolveBudgetsWired(t *testing.T) {
 	})
 	t.Run("全局config兜底", func(t *testing.T) {
 		cm, am, _ := newHarness(t)
-		cm.Rules.LLM.StreamIdleTimeoutSec = 30
-		cm.Rules.LLM.DailyCallBudget = 100
-		cm.Rules.LLM.DailyTokenBudget = 20000
-		cm.Rules.LLM.ConsultDailyCalls = 5
+		cm.Get().LLM.StreamIdleTimeoutSec = 30
+		cm.Get().LLM.DailyCallBudget = 100
+		cm.Get().LLM.DailyTokenBudget = 20000
+		cm.Get().LLM.ConsultDailyCalls = 5
 		got := Resolve(cm, am)
 		if got.StreamIdleTimeout != 30*time.Second || got.DailyCallBudget != 100 ||
 			got.DailyTokenBudget != 20000 || got.ConsultDailyCalls != 5 {

@@ -96,16 +96,16 @@ func newRehearsalRig(t *testing.T, fix *Fixture, profile *LatencyProfile, metric
 	strategyEngine.SetScanner(scanner)
 
 	cfgMgr := config.NewManager(filepath.Join(tmp, "config.json"))
-	cfgMgr.Rules.Strategy.Dragon.F1SealWeight = 0.30
-	cfgMgr.Rules.Strategy.Dragon.F2ResonanceWeight = 0.25
-	cfgMgr.Rules.Strategy.Dragon.F3PremiumWeight = 0.20
-	cfgMgr.Rules.Strategy.Dragon.F4RsWeight = 0.25
-	cfgMgr.Rules.Emotion.EmoClimaxLimitupMin = 90
-	cfgMgr.Rules.Emotion.EmoClimaxBoardMin = 5
+	cfgMgr.Get().Strategy.Dragon.F1SealWeight = 0.30
+	cfgMgr.Get().Strategy.Dragon.F2ResonanceWeight = 0.25
+	cfgMgr.Get().Strategy.Dragon.F3PremiumWeight = 0.20
+	cfgMgr.Get().Strategy.Dragon.F4RsWeight = 0.25
+	cfgMgr.Get().Emotion.EmoClimaxLimitupMin = 90
+	cfgMgr.Get().Emotion.EmoClimaxBoardMin = 5
 
 	sAgent := sector_agent.New(scanner, data.NewRPSManager())
 	cAgent := combat_agent.New(cfgMgr.GetStrategyConfig())
-	cAgent.SetLaodengConfig(&cfgMgr.Rules.Laodeng)
+	cAgent.SetLaodengConfig(&cfgMgr.Get().Laodeng)
 	cAgent.SetRunners([]combat_agent.StrategyRunner{
 		{Type: strategy.SignalDragon, Strategy: dragon.New(cfgMgr)},
 		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(cfgMgr)},
@@ -122,7 +122,7 @@ func newRehearsalRig(t *testing.T, fix *Fixture, profile *LatencyProfile, metric
 	eng := engine.New(marketAPI, nAgent, strategyEngine, sAgent, cAgent, agg, rpt,
 		stockTracker, wlMgr, sse, llmClient, thsClient, tmp)
 	eng.SetScanner(scanner)
-	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
+	eng.SetEmotionConfig(&cfgMgr.Get().Emotion)
 
 	t.Cleanup(func() { srv.Close() })
 	return &rehearsalRig{eng: eng, calls: calls, metrics: metrics, wl: wlMgr}

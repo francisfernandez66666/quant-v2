@@ -10,8 +10,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors" // §0925EVE-W3-E：errors.As 分类网关 4xx 直败
 	"fmt"
 	"io"
+	"log" // §0925EVE-W3-E：/admin/status 不可达时的读不到留痕告警
 	"net"
 	"net/http"
 	"strings"
@@ -88,7 +90,12 @@ func (c *QMTClient) do(ctx context.Context, method, path string, body any, out a
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("gateway %s %s: HTTP %d: %s", method, path, resp.StatusCode, truncate(string(data), 200))
+		// §0925EVE-W3-E（C8）：非 200 错误从裸 fmt.Errorf 升级为带状态码的类型化错误——
+		// order() 需要区分「网关权威判定直败的 4xx」与「可重试的瞬态（网络错误/5xx/408/429）」，
+		// 字符串里虽然仍带 "HTTP %d"（对外错误文案不变），但判据不许再靠 Contains 猜。
+		// English: §0925EVE-W3-E — non-200 now carries the status code as a typed error so the
+		// retry policy can classify deterministic 4xx rejections without string sniffing.
+		return &gatewayHTTPError{Method: method, Path: path, Status: resp.StatusCode, Body: truncate(string(data), 200)}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -96,6 +103,45 @@ func (c *QMTClient) do(ctx context.Context, method, path string, body any, out a
 		}
 	}
 	return nil
+}
+
+// gatewayHTTPError §0925EVE-W3-E（C8）：网关非 200 响应的类型化错误（携带 HTTP 状态码）。
+// 文案与旧 fmt.Errorf 完全同构（"gateway METHOD PATH: HTTP nnn: body"），下游按
+// strings.Contains 匹配错误文本的旧习惯不受影响；新增的 Status 字段只服务重试分类。
+// English: typed non-200 gateway error carrying the status code; message text unchanged.
+type gatewayHTTPError struct {
+	Method string
+	Path   string
+	Status int
+	Body   string
+}
+
+// Error 实现 error 接口（文案保持与改造前逐字一致）。
+func (e *gatewayHTTPError) Error() string {
+	return fmt.Sprintf("gateway %s %s: HTTP %d: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
+// isDeterministicGatewayRejection §0925EVE-W3-E（C8）：该错误是否为「重试也不会变好」的
+// 网关确定性拒绝。判据按惯例钉死：
+//   - 网络错误/超时/5xx（网关 §G8 兜底异常也是 500 JSON）→ 瞬态，维持现状可重试；
+//   - 408 Request Timeout、429 Too Many Requests → 4xx 里的惯例可重试码（HTTP 语义即
+//     "稍后再试"），不排除出去会把限流场景的瞬态误判为直败；
+//   - 其余 4xx → 网关权威判定直败：§G2 空 signal_id 400、§SIDEGATE-PY 方向非法 400、
+//     §H1 日期口径 400、§CLAIMRELEASE 同信号在途 409……gateway.py 对 4xx 的口径就是
+//     "确定性拒绝、不重试"（见其文件头与文件桥回报分支注释），Go 侧重试只会空转二次请求。
+//
+// English: deterministic 4xx (except 408/429) = gateway authoritative rejection, retrying is
+// pure spinning; network errors and 5xx stay retryable as before.
+func isDeterministicGatewayRejection(err error) bool {
+	var he *gatewayHTTPError
+	if !errors.As(err, &he) {
+		return false // 非 HTTP 状态错误（连接失败/超时/解码失败）：按瞬态留给重试
+	}
+	switch he.Status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false // 惯例"稍后再试"码，不算确定性拒绝
+	}
+	return he.Status >= 400 && he.Status < 500
 }
 
 // truncate 截断超长文本（日志/错误展示用）。
@@ -121,6 +167,14 @@ func (c *QMTClient) PlaceSell(req OrderRequest) (*OrderResult, error) {
 
 // order 统一下单入口（buy/sell），带有限重试。
 // English: unified order entry (buy/sell) with limited retries.
+// §0925EVE-W3-E（C8）重试语义收敛：只对「瞬态」失败重试——网络错误/超时/5xx/408/429；
+// 其余 4xx 是网关的权威确定性拒绝（400 参数非法、409 同 signal_id 在途占位等），
+// 重试只是对同一具必败请求的空转二次投递（旧实现对一切非 200 一律重试 retries 次）。
+// 幂等三层防线（signal_id claim 唯一键 + 派发队列部分唯一索引 + 熔断）仍是防双单的
+// 最后兜底，本改动不触碰它们——只是不再制造无意义的重复窗口。
+// English: §0925EVE-W3-E — only transient failures retry; deterministic 4xx fails fast.
+// The three-layer idempotency defense remains the last line of defense; this only stops the
+// pointless second spin of a doomed request.
 func (c *QMTClient) order(req OrderRequest) (*OrderResult, error) {
 	attempts := c.retries + 1
 	if attempts <= 0 {
@@ -138,6 +192,10 @@ func (c *QMTClient) order(req OrderRequest) (*OrderResult, error) {
 		cancel()
 		if err != nil {
 			lastErr = err
+			// §0925EVE-W3-E：确定性 4xx 直败（错误原样透传，网关 err 文案在 Body 里）。
+			if isDeterministicGatewayRejection(err) {
+				return nil, err
+			}
 			// §ROBUST 线性退避（250ms×序号）：跨网瞬断时紧背靠背重试只会三连败，
 			// 给链路一点喘息；下单幂等由 signal_id 唯一键保证，重试安全。
 			if i+1 < attempts {
@@ -239,13 +297,36 @@ type GatewayBrokerStatus struct {
 	BrokerConnected bool   `json:"broker_connected"`
 	XTConnected     bool   `json:"xt_connected"`
 	QueuedConnected bool   `json:"queued_connected"`
-	FailoverEnable  bool   `json:"failover_enable,omitempty"`
-	Dispatch        any    `json:"dispatch,omitempty"`
+	// FailoverEnable/Dispatch §0925EVE-W3-E（C4）：自动翻转开关与派发队列统计只在网关
+	// GET /admin/status 下发（gateway.py _do_admin_status），/health 从不携带——旧实现从
+	// /health 解析这两个 omitempty 字段，结果 admin 面板双通道可观测面恒空。改读
+	// /admin/status 后 FailoverEnable 用指针三态：nil=该行没读到，false=读到且为关，
+	// 绝不允许「读不到」用零值冒充（§M2 未知不装新鲜的同族口径）。
+	// English: §0925EVE-W3-E — failover_enable/dispatch are only served by /admin/status;
+	// the old /health parser left the admin observability panel permanently empty. A nil
+	// pointer now honestly means "not readable", never a zero-value masquerade.
+	FailoverEnable *bool `json:"failover_enable,omitempty"`
+	Dispatch       any   `json:"dispatch,omitempty"`
+	// AdminStatusOK /admin/status 两键读取是否成功（false=不可达/鉴权失败，见 AdminStatusErr）。
+	AdminStatusOK bool `json:"admin_status_ok"`
+	// AdminStatusErr 读取失败原因（成功时省略）；供前端区分"没有这功能"与"暂时读不到"。
+	AdminStatusErr string `json:"admin_status_error,omitempty"`
 }
 
-// BrokerStatus 查询网关 active 通道与双路径状态（GET /health 字段解析）。
+// BrokerStatus 查询网关 active 通道与双路径状态。
 // §QMT-DUAL：供 admin 切换按钮读取当前执行路径（miniqmt=xt / qmt=queued）。
-// English: reads the gateway's active broker and dual-path liveness from /health.
+// §0925EVE-W3-E（C4）拆两腿取数：
+//   - GET /health：ok/broker/broker_connected/xt_connected/queued_connected 等基础字段，
+//     解析语义原样保留（此腿失败=整个状态查询失败，与旧行为一致，调用方按 ok:false 展示"不可达"）；
+//   - GET /admin/status：failover_enable/dispatch 两键（带既有 Bearer token 机制，do() 统一注入）。
+//     此腿失败**不**拖垮基础读数，但把「读不到」显式标记（AdminStatusOK=false + AdminStatusErr
+//     留痕 + warn 日志），绝不用零值冒充「自动翻转=关/队列=空」——网关侧观察位惯例是
+//     "log + /admin/status 要人去看"，Go 侧对齐为可见的未知态而非静默假绿。
+//
+// English: §0925EVE-W3-E — base liveness still comes from /health (failure = whole call fails,
+// unchanged); failover_enable/dispatch now come from /admin/status with the existing bearer auth.
+// An unreachable /admin/status is surfaced as an explicit "not readable" marker + warn log
+// instead of zero values pretending "failover off / queue empty".
 func (c *QMTClient) BrokerStatus() (*GatewayBrokerStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
@@ -256,6 +337,26 @@ func (c *QMTClient) BrokerStatus() (*GatewayBrokerStatus, error) {
 	// 兼容新老网关：broker_mode 是 broker 的别名，缺省回退 broker
 	if out.Broker == "" {
 		out.Broker = out.BrokerMode
+	}
+	// §0925EVE-W3-E 第二腿：/admin/status 专供双通道可观测两键（网关只在这个端点发）。
+	admCtx, admCancel := context.WithTimeout(context.Background(), c.timeout)
+	defer admCancel()
+	var adm struct {
+		OK             bool `json:"ok"`
+		FailoverEnable bool `json:"failover_enable"`
+		Dispatch       any  `json:"dispatch"`
+	}
+	if err := c.do(admCtx, http.MethodGet, "/admin/status", nil, &adm); err != nil {
+		out.AdminStatusOK = false
+		out.AdminStatusErr = truncate(err.Error(), 200)
+		log.Printf("[qmt] BrokerStatus：/admin/status 不可达，failover_enable/dispatch 读不到（不以待定值冒充）: %v", err)
+		return &out, nil
+	}
+	out.AdminStatusOK = true
+	failover := adm.FailoverEnable
+	out.FailoverEnable = &failover // 指针落值：即使 false 也会序列化出来，与"没读到"区分
+	if adm.Dispatch != nil {
+		out.Dispatch = adm.Dispatch
 	}
 	return &out, nil
 }
@@ -282,6 +383,13 @@ type SettlementTrade struct {
 	StampTax float64 `json:"stamp_tax"` // 印花税
 	Serial   string  `json:"serial"`    // 交割流水号
 	TradedAt string  `json:"traded_at"` // 成交时间
+	// SignalID §0925EVE-W3-E（C5）：网关 /settlement 行一直携带的真实归因信号
+	// （qmt_gateway/store.py settlement_trades 从 fills 表 SELECT signal_id）。旧结构没有该
+	// tag，HTTP 解码时把它静默丢弃，sync_fills 补记只能写虚构键 "settle:"+day——
+	// 交割纠偏出来的成交在盈亏归因（signal_id→战法）里全部错位。补上字段即接通归因链。
+	// English: §0925EVE-W3-E — the gateway settlement rows always carried the real signal_id;
+	// the old struct dropped it, so backfills got fabricated keys and lost strategy attribution.
+	SignalID string `json:"signal_id"`
 }
 
 // SettlementResponse 网关 /settlement 响应（§WS-B）。

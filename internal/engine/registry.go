@@ -26,6 +26,7 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
@@ -763,7 +764,7 @@ func (r *Registry) build(userID string) *Engine {
 	// §P1-C 改用 per-user getter 装配 D1/ATR：引擎按账号指纹隔离后，其首建用户即 owner，
 	// 必须用该账号的覆盖值（而非全局 Rules），否则 build 阶段 D1/ATR 与后续 syncAccountConfig 不一致。
 	posCfg := opts.CfgMgr.GetRulesFor(userID).Position
-	cAgent.SetLaodengConfig(&opts.CfgMgr.Rules.Laodeng)
+	cAgent.SetLaodengConfig(&opts.CfgMgr.Get().Laodeng) // §0925EVE-D1：全局 rules 快照经加锁访问器取得
 	cAgent.SetPositionDailyDropPct(posCfg.DailyDropAlertPct)
 	cAgent.SetD1Config(opts.CfgMgr.GetD1ConfigFor(userID))
 	cAgent.SetATRStop(posCfg.ATREnabled, posCfg.ATRStopMult)
@@ -823,7 +824,7 @@ func (r *Registry) build(userID string) *Engine {
 	e.SetScanner(opts.Scanner)
 	e.SetFetcher(opts.Fetcher)
 	e.SetNotifier(opts.Notifier)
-	e.SetEmotionConfig(&opts.CfgMgr.Rules.Emotion)
+	e.SetEmotionConfig(&opts.CfgMgr.Get().Emotion) // §0925EVE-D1：字段裸读改加锁访问器
 	if opts.SectorTopN > 0 {
 		e.SetSectorConstituentTopN(opts.SectorTopN)
 	}
@@ -963,6 +964,8 @@ func (r *Registry) build(userID string) *Engine {
 // account's strategy config. matcher feeds the N-shape D1 event match (may be nil). dataDir is used to
 // inject the approved factor-strategy rule (E6). heldExit carries the open-position keys that keep a
 // disabled rule's exit overrides alive.
+// §0925EVE-C1：战法库闸判定为 not_loaded / no_enabled 时返回 **nil**（当轮 fail-close 不出新建议，
+// 对偶 §95/LIB-GATE 回放侧判红）；出场覆盖照常入表，不触碰熔断。详见 gateLiveStrategyLibrary。
 func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userID string, dataDir string, heldExit combat_agent.HeldStrategyKeys) []combat_agent.StrategyRunner {
 	runners := buildRunners(cfgMgr, matcher)
 	for i := range runners {
@@ -973,35 +976,24 @@ func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userI
 	// E6：从 applied_factors.json 注入全部**启用**的因子战法规则（战法库，多规则同时实盘）。
 	// English: E6 — inject all **enabled** factor-strategy rules from applied_factors.json (the
 	// strategy library; multiple rules run concurrently).
+	// §0925EVE-C1：读库失败不再只 log 后继续——三态判定交给 gateLiveStrategyLibrary（见该函数注释），
+	// 被闸时本函数返回 nil runner（当轮战法腿不出新建议），旧 log 保留作现场细节。
 	rules, err := research.LoadEnabledFactorRules(dataDir)
 	if err != nil {
 		log.Printf("[registry] 加载因子战法库失败: %v", err)
 	}
-	if len(rules) > 0 {
-		for i := range runners {
-			if fs, ok := runners[i].Strategy.(*factorstrat.FactorStrategy); ok {
-				fs.SetRules(rules)
-				log.Printf("[registry] 因子战法库已启用 %d 条规则", len(rules))
-			}
-		}
-	}
 	// F3：从 applied_patterns.json 注入全部**启用**的形态模板规则（形态战法库，多形态同时实盘）。
 	// English: F3 — inject all **enabled** pattern-template rules from applied_patterns.json (the
 	// pattern library; multiple patterns run concurrently).
-	patterns, err := research.LoadEnabledPatternRules(dataDir)
-	if err != nil {
-		log.Printf("[registry] 加载形态战法库失败: %v", err)
-	}
-	if len(patterns) > 0 {
-		for i := range runners {
-			if ps, ok := runners[i].Strategy.(*patternstrat.PatternStrategy); ok {
-				ps.SetRules(patterns)
-				log.Printf("[registry] 形态战法库已启用 %d 条规则", len(patterns))
-			}
-		}
+	patterns, errP := research.LoadEnabledPatternRules(dataDir)
+	if errP != nil {
+		log.Printf("[registry] 加载形态战法库失败: %v", errP)
 	}
 	// §P2-d 实盘接线：启动装配时同步规则级出场覆盖（扫参审批的止盈/超期对实盘生效）。
-	// English: seed the rule-level exit-override registry at startup assembly.
+	// §0925EVE-C1：这段刻意排在战法库闸**之前**——闸只拦"新建议"这条腿，持仓的出场覆盖
+	// （止盈/超期）属于"资金退路"，即使本轮被 fail-close 也必须照常入表（不熔断方向）。
+	// English: seed the rule-level exit-override registry at startup assembly. This runs BEFORE the
+	// C1 gate because the gate only suppresses new advice; exit overrides for open positions stay live.
 	if fe, e1 := research.ListAppliedFactorRules(dataDir); e1 == nil {
 		pe, e2 := research.ListAppliedPatternRules(dataDir)
 		if e2 == nil {
@@ -1014,7 +1006,132 @@ func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userI
 			combat_agent.SetRuleExitOverrides(fe, pe, heldExit)
 		}
 	}
+	// §0925EVE-C1 战法库闸（§95/LIB-GATE 实盘对偶）：读库失败或零条启用规则 → 当轮不出单。
+	// 返回 nil runner 即 combat_agent 战法腿零信号（SetRunners(nil)），与"静默按 0 条线上战法
+	// 跑完一整轮"告别；三态的量规/告警/日志都在 gateLiveStrategyLibrary 内统一出门。
+	if g := gateLiveStrategyLibrary(dataDir, rules, patterns, err, errP); g == liveLibraryGateNotLoaded || g == liveLibraryGateNoEnabled {
+		return nil
+	}
+	if len(rules) > 0 {
+		for i := range runners {
+			if fs, ok := runners[i].Strategy.(*factorstrat.FactorStrategy); ok {
+				fs.SetRules(rules)
+				log.Printf("[registry] 因子战法库已启用 %d 条规则", len(rules))
+			}
+		}
+	}
+	if len(patterns) > 0 {
+		for i := range runners {
+			if ps, ok := runners[i].Strategy.(*patternstrat.PatternStrategy); ok {
+				ps.SetRules(patterns)
+				log.Printf("[registry] 形态战法库已启用 %d 条规则", len(patterns))
+			}
+		}
+	}
 	return runners
+}
+
+// liveLibraryGate §0925EVE-C1 实盘战法库闸的三态（对偶 §95/LIB-GATE 回放侧判红口）。
+// English: the three states of the live-side strategy-library gate — the counterpart of the
+// §95/LIB-GATE fail-red on the replay side.
+type liveLibraryGate int
+
+const (
+	// liveLibraryGateSkipped 未配置持久化目录（dataDir==""）：读库根本不发生于本次装配，
+	// 闸不表态也不喂量规——防"进程还没装配过任何账号引擎"被误读成"读库失败"（§CB 防误熔同向）。
+	liveLibraryGateSkipped liveLibraryGate = iota
+	// liveLibraryGateOK 正常态：读取成功且至少一条启用规则，照旧注入实盘。
+	liveLibraryGateOK
+	// liveLibraryGateNotLoaded 读库失败态：applied_*.json 存在但不可读/JSON 损坏（注意与
+	// "文件缺失"区分——research 侧把缺文件判为"读取成功、零条目"，落在 NoEnabled 态）。
+	liveLibraryGateNotLoaded
+	// liveLibraryGateNoEnabled 零启用态：读取成功，但因子+形态两侧按实盘口径加载到 0 条启用规则
+	// （库里真没启用规则：没文件/空文件/全停用，对偶回放侧 ruleFileReason 的三档成因）。
+	liveLibraryGateNoEnabled
+)
+
+// String 三态的人读名（日志/测试用）。
+func (g liveLibraryGate) String() string {
+	switch g {
+	case liveLibraryGateSkipped:
+		return "skipped"
+	case liveLibraryGateOK:
+		return "ok"
+	case liveLibraryGateNotLoaded:
+		return "not_loaded"
+	case liveLibraryGateNoEnabled:
+		return "no_enabled"
+	}
+	return "unknown"
+}
+
+// gateLiveStrategyLibrary §0925EVE-C1 实盘腿战法库闸的唯一判定点（§95/LIB-GATE 的对偶）。
+//
+// 背景：§95 批把回放侧改成"战法库零条启用规则即判红"（internal/btreplay/replay.go libraryGate），
+// 但真正下单这条腿（engine.Registry.build → newAccountRunners）读库失败只 log 继续跑、零条启用
+// 不告警——"静默按 0 条线上战法跑完一整轮"在实盘依然可能发生。本函数把实盘读库路径分成三态并
+// 逐态处置：
+//   - 读库失败（errF/errP 任一非 nil）→ NotLoaded：当轮 fail-close 不出单；
+//   - 读取成功但启用规则数==0 → NoEnabled：当轮同样不出单（两种成因的告警文案严格分开）；
+//   - 正常 → OK：照旧。
+//
+// fail-close 的作用面：newAccountRunners 返回 nil → combat_agent.SetRunners(nil) → 战法扫描腿
+// 本轮零信号，即"不出新建议"。**不是**资金熔断（§CB 同向）：不触碰 breaker、不清仓、持仓的
+// 止损/止盈/M8 出场链与规则级出场覆盖（§P2-d/§EXIT-RETAIN，在闸之前照常入表）全部不受影响。
+//
+// 量规接法照仓里现成模式（§CAL-GATE/§ADJ-BASIS 同族：SetGauge + DefaultAlertRules + 路由表）：
+//   - live_strategy_library_load_errors：最近一次装配读库失败的侧数（0/1/2）——只数真读失败，
+//     与"库里没规则"严格分家（两条告警不许混成一条文案的前提）；
+//   - live_strategy_enabled_rules：启用规则数读数（因子+形态合计，对偶回放侧出门的库读数）；
+//   - live_strategy_no_enabled：0/1，仅"读取成功且零条启用"为 1。
+//
+// 三个量规都只在 dataDir!="" 时赋值：未赋值时评估器读到 0，恰好落在"不触发"一侧，不会把
+// "还没装配过引擎"误报成"库挂了"。多账号先后装配是进程级最后写者口径，与 trading_calendar_loaded
+// 等既有量规一致。
+//
+// English: the single fail-close decision for the LIVE trading leg's strategy library — the
+// counterpart of replay-side §95/LIB-GATE. Load errors and a genuinely-empty library are reported
+// through separate gauges/alert wordings; a blocked gate returns nil runners (no new advice this
+// round) without touching breaker or the exit chain for open positions.
+func gateLiveStrategyLibrary(dataDir string, rules []*factorstrat.ActiveRule, patterns []*patternstrat.ActivePattern, errF, errP error) liveLibraryGate {
+	if dataDir == "" {
+		return liveLibraryGateSkipped
+	}
+	errCount := 0
+	if errF != nil {
+		errCount++
+	}
+	if errP != nil {
+		errCount++
+	}
+	enabled := len(rules) + len(patterns)
+
+	state := liveLibraryGateOK
+	switch {
+	case errCount > 0:
+		state = liveLibraryGateNotLoaded
+		enabled = 0 // 读失败侧的规则数不可知，读数如实写 0，成因由 load_errors 量规承载
+	case enabled == 0:
+		state = liveLibraryGateNoEnabled
+	}
+	metrics.SetGauge("live_strategy_library_load_errors", int64(errCount))
+	metrics.SetGauge("live_strategy_enabled_rules", int64(enabled))
+	metrics.SetGauge("live_strategy_no_enabled", boolGauge(state == liveLibraryGateNoEnabled))
+
+	switch state {
+	case liveLibraryGateNotLoaded:
+		// 告警腿：量规已喂，p1 规则 live_strategy_library_not_loaded 由 30s 评估节拍送出（路由 RoutePush）。
+		log.Printf("[registry] §0925EVE-C1 战法库闸=not_loaded：读库失败 %d 侧（因子 %v / 形态 %v），"+
+			"当轮 fail-close 不出新建议（持仓出场不受影响）", errCount, errF, errP)
+	case liveLibraryGateNoEnabled:
+		// 告警腿：p1 规则 live_strategy_no_enabled_rules——文案刻意与上面区分："库里真没启用规则"≠"读库失败"。
+		log.Printf("[registry] §0925EVE-C1 战法库闸=no_enabled：读取成功但零条启用规则（目录 %s 下 "+
+			"applied_factors.json/applied_patterns.json 缺失、为空或全停用），当轮 fail-close 不出新建议", dataDir)
+	case liveLibraryGateOK:
+		log.Printf("[registry] §0925EVE-C1 战法库闸=ok：启用规则 %d 条（因子 %d / 形态 %d）",
+			enabled, len(rules), len(patterns))
+	}
+	return state
 }
 
 // buildRunners 构建四大战法 runner（龙/双响炮/N形/龙回头），统一委托给 combat_agent.NewRunners（C7）。
@@ -1192,7 +1309,7 @@ func (r *Registry) fingerprint(userID string) string {
 	// 组装控制器指纹字段并序列化：策略/长空/盘前跌停/ATR 等配置逐项透传。
 	fp := f{
 		Strategy:  opts.CfgMgr.GetStrategyConfigFor(userID),
-		Laodeng:   &opts.CfgMgr.Rules.Laodeng,
+		Laodeng:   &opts.CfgMgr.Get().Laodeng, // §0925EVE-D1：字段裸读改加锁访问器（快照指针同旧语义）
 		LongShort: opts.CfgMgr.GetLongShortConfigFor(userID),
 		DailyDrop: pos.DailyDropAlertPct,
 		D1Retry:   opts.D1MaxRetries,

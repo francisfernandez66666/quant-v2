@@ -198,6 +198,9 @@ func (s *Server) handleSetUserRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// §0925EVE-W3-F（⑲/D4 特权变更审计补洞）：角色变更是最高危的特权操作之一，
+	// 与 user_create/password_reset 同体例落 opslog 审计行（event=事件名 actor=操作者 target=被改用户 result=变更内容）。
+	opslog.Audit("user_role", userIDFor(r), id, "role="+req.Role)
 	log.Printf("[admin] 用户 %s 角色 → %s", id, req.Role)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -225,6 +228,8 @@ func (s *Server) handleSetUserPerms(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// §0925EVE-W3-F（⑲/D4）：权限位整体覆盖同属特权变更，补审计行（perms 为枚举白名单值，无敏感载荷）。
+	opslog.Audit("user_perms", userIDFor(r), id, fmt.Sprintf("perms=%v", req.Perms))
 	log.Printf("[admin] 用户 %s 权限 → %v", id, req.Perms)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -252,6 +257,7 @@ func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// §0925EVE-W3-F（⑲）：此行为既有体例参照——审计行只记「谁对谁做了什么、结果如何」，不落新密码。
 	opslog.Audit("password_reset", userIDFor(r), id, "ok")
 	log.Printf("[admin] 用户 %s 已重置密码", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -287,6 +293,8 @@ func (s *Server) handleSetUserExpiry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// §0925EVE-W3-F（⑲/D4）：到期时间改动等价于「未来某刻账号失效」，纳入特权变更审计。
+	opslog.Audit("user_expiry", userIDFor(r), id, fmt.Sprintf("expires_days=%d", req.ExpiresDays))
 	log.Printf("[admin] 用户 %s 有效期天数 → %d", id, req.ExpiresDays)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -308,6 +316,8 @@ func (s *Server) handleSetUserEnabled(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// §0925EVE-W3-F（⑲/D4）：启用/禁用直接决定账号可用性，补审计行（result 记录终态）。
+	opslog.Audit("user_enabled", userIDFor(r), id, fmt.Sprintf("enabled=%v", req.Enabled))
 	log.Printf("[admin] 用户 %s enabled=%v", id, req.Enabled)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -324,6 +334,9 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// §0925EVE-W3-F（⑲/D4）：删除是不可逆特权变更（user_cleanup 批量通道本有审计，
+	// 单删通道此前反而无痕），补齐；被删用户名留作事后取证线索。
+	opslog.Audit("user_delete", userIDFor(r), id, "ok")
 	log.Printf("[admin] 已删除用户 %s", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }

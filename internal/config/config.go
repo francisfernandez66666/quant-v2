@@ -1665,10 +1665,18 @@ type LongShortConfig struct {
 // （Manager is the config manager responsible for loading, saving and querying the JSON config file.
 // Global defaults come from the file; each account may store its own override in the KVStore.）
 type Manager struct {
-	// 主规则配置
-	Rules *Rules
+	// §0925EVE-D1（2026-09-25 晚批）：Rules/D1 由导出字段转私有（rules/d1），指针的发布
+	// （Load 热重载 / SetD1Config 族整体替换）与读取统一收进 m.mu 保护的访问器
+	// （Get / GetD1Config / GetRulesFor 等）。旧写法下 Watch 后台协程调 Load() 无锁裸重赋值
+	// m.Rules、m.D1 指针、读方（打分循环、HTTP handler、cmd 装配）同样无锁取值，是锤实的
+	// data race——§CFGSMASH 那轮修的是 Strategy 族热更通道，Load/Watch 这条没进扫描面。
+	// 锁口径沿用 §CFGSMASH 既有约定：m.mu 只保护**指针替换与结构体读写**；跨 goroutine
+	// 长期持有活体指针再逐字段读的通道，热字段一律走拷贝式 getter（GetStrategyConfig 等）。
+	// English: rules/d1 are now unexported and every pointer publish/read goes through
+	// m.mu-protected accessors, closing the Watch(Load) vs readers data race.
+	rules *Rules
 	// D1 事件匹配规则
-	D1    *D1Config
+	d1    *D1Config
 	path  string       // 配置文件路径（全局默认）
 	mu    sync.RWMutex // 保护 store/规则指针的读写锁
 	store KVStore      // per-user 配置存储（可为 nil，表示不支持账号级隔离）
@@ -1682,14 +1690,28 @@ type Manager struct {
 // （NewManager creates a config manager and loads the JSON config from the given path.）
 func NewManager(path string) *Manager {
 	m := &Manager{
-		Rules: DefaultRules,
-		D1:    &D1Config{},
+		rules: DefaultRules,
+		d1:    &D1Config{},
 		path:  path,
 	}
-	normalizeD1(m.D1)
+	normalizeD1(m.d1)
 	m.Load()
-	normalizeD1(m.D1)
+	normalizeD1(m.d1)
 	return m
+}
+
+// NewManagerWithRules 以调用方给定的全局规则快照构造 Manager（D1 用出厂默认）。
+// §0925EVE-D1：rules/d1 转私有后，测试与程序化装配不再直接构造 config.Manager{Rules:...}
+// 字面量，统一经本构造函数注入快照，保证读侧只有一个口径（Get/GetD1Config）。
+// English: builds a Manager from a caller-supplied global rules snapshot — the sanctioned
+// programmatic/test constructor now that the fields are unexported.
+func NewManagerWithRules(rules *Rules) *Manager {
+	if rules == nil {
+		rules = DefaultRules
+	}
+	d1 := &D1Config{}
+	normalizeD1(d1) // 与 NewManager 同口径：空 D1 补出厂规则集
+	return &Manager{rules: rules, d1: d1}
 }
 
 // SetStore 注入 per-user 配置存储（auth.Manager）。
@@ -1758,7 +1780,7 @@ func (m *Manager) storedUserRules(userID string) (*Rules, bool) {
 // userRules 返回指定账号的规则快照（账号级覆盖优先，否则回退系统级键/全局副本）。
 func (m *Manager) userRules(userID string) *Rules {
 	if m.store == nil || userID == "" {
-		return m.Rules
+		return m.Get()
 	}
 	if r, ok := m.storedUserRules(userID); ok {
 		return r
@@ -1772,7 +1794,9 @@ func (m *Manager) userRules(userID string) *Rules {
 		return r
 	}
 	cp := new(Rules)
-	*cp = *m.Rules
+	m.mu.RLock() // §0925EVE-D1：拷贝全局快照须在 RLock 内，与 Load 的指针发布配对
+	*cp = *m.rules
+	m.mu.RUnlock()
 	return cp
 }
 
@@ -1795,14 +1819,22 @@ func (m *Manager) saveUserRules(userID string, r *Rules) {
 }
 
 // Get 返回当前全局规则配置指针。
-// （Get returns a pointer to the current global rules config.）
-func (m *Manager) Get() *Rules { return m.Rules }
+// §0925EVE-D1：本方法是 rules 指针的**唯一全局读口径**（原导出字段 Rules 转私有），
+// RLock 只保证「取到的指针」与 Watch/Load 的指针发布无竞态；返回的仍是活体指针，
+// 跨 goroutine 逐字段读热更新敏感字段请继续走 §CFGSMASH 的拷贝式 getter。
+// English: the single accessor for the global rules pointer, read under RLock so it can
+// never race with hot-reload publication.
+func (m *Manager) Get() *Rules {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rules
+}
 
 // GetRulesFor 返回指定账号的交易规则快照（账号级覆盖优先，否则全局）。
 // English: returns the trading-rules snapshot for a user (per-user override first, else global).
 func (m *Manager) GetRulesFor(userID string) *Rules {
 	if m.store == nil || userID == "" {
-		return m.Rules
+		return m.Get() // §0925EVE-D1：统一走加锁访问器，不再裸读字段
 	}
 	return m.userRules(userID)
 }
@@ -1834,7 +1866,7 @@ func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
 	next.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano) // §中-6 任何服务端写入都推进版本
 	if m.store == nil || oid == "" {
 		m.mu.Lock()
-		m.Rules.Strategy = next
+		m.rules.Strategy = next
 		m.mu.Unlock()
 		m.Save()
 		return
@@ -1869,7 +1901,9 @@ func (m *Manager) ConfigOwnerID(userID string) string {
 func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
 	oid := m.ownerOf(userID)
 	if m.store == nil || oid == "" {
-		m.Rules.LLM = *cfg
+		m.mu.Lock() // §0925EVE-D1：全局回退分支写活体字段补锁（与 §CFGSMASH setter 同口径）
+		m.rules.LLM = *cfg
+		m.mu.Unlock()
 		m.Save()
 		return
 	}
@@ -1904,7 +1938,7 @@ func (m *Manager) StoredLLMConfig(userID string) (*LLMConfig, bool) {
 // account can trade against its own gateway/capital.
 func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
 	if m.store == nil || userID == "" {
-		return &m.Rules.QMT
+		return &m.Get().QMT // §0925EVE-D1：指针经加锁访问器取得，字段地址跟随该快照不变
 	}
 	if r, ok := m.storedUserRules(userID); ok {
 		return &r.QMT
@@ -1914,7 +1948,7 @@ func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
 			return &r.QMT
 		}
 	}
-	return &m.Rules.QMT
+	return &m.Get().QMT
 }
 
 // SetQMTConfigFor 更新指定账号的 QMT 实盘配置并持久化到该账号的规则快照（5s 热加载生效）。
@@ -1925,7 +1959,9 @@ func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
 // (hot-reloaded within 5s). Callers must validate enum/whitelist values — this method only stores.
 func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
 	if m.store == nil || userID == "" {
-		m.Rules.QMT = *cfg
+		m.mu.Lock() // §0925EVE-D1：无 store 全局回退分支写活体字段补锁
+		m.rules.QMT = *cfg
+		m.mu.Unlock()
 		m.Save()
 		return
 	}
@@ -1942,8 +1978,10 @@ func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
 // leaving the rest of rules.paper untouched; the signal controller picks it up on its next feed.
 func (m *Manager) SetPaperStrategyFor(userID string, strategies, blacklist []string) {
 	if m.store == nil || userID == "" {
-		m.Rules.Paper.Strategies = strategies
-		m.Rules.Paper.Blacklist = blacklist
+		m.mu.Lock() // §0925EVE-D1：全局回退分支写活体字段补锁
+		m.rules.Paper.Strategies = strategies
+		m.rules.Paper.Blacklist = blacklist
+		m.mu.Unlock()
 		m.Save()
 		return
 	}
@@ -1963,7 +2001,9 @@ func (m *Manager) SetPaperConfigFor(userID string, mutate func(*PaperConfig)) {
 		return
 	}
 	if m.store == nil || userID == "" {
-		mutate(&m.Rules.Paper)
+		m.mu.Lock() // §0925EVE-D1：全局回退分支的 mutate 持锁执行，与 Save 的 RLock marshal 配对
+		mutate(&m.rules.Paper)
+		m.mu.Unlock()
 		m.Save()
 		return
 	}
@@ -1976,18 +2016,18 @@ func (m *Manager) SetPaperConfigFor(userID string, mutate func(*PaperConfig)) {
 func (m *Manager) GetD1ConfigFor(userID string) *D1Config {
 	oid := m.ownerOf(userID)
 	if m.store == nil || oid == "" {
-		return m.D1
+		return m.GetD1Config() // §0925EVE-D1：统一走加锁访问器
 	}
 	m.mu.RLock()
 	raw, ok := m.store.GetConfig(oid, perUserD1Key)
 	m.mu.RUnlock()
 	if !ok || raw == "" {
-		return m.D1
+		return m.GetD1Config()
 	}
 	var d D1Config
 	if err := json.Unmarshal([]byte(raw), &d); err != nil {
 		log.Printf("[config] 账号 %s D1 配置反序列化失败, 回退全局: %v", oid, err)
-		return m.D1
+		return m.GetD1Config()
 	}
 	normalizeD1(&d)
 	return &d
@@ -1997,7 +2037,9 @@ func (m *Manager) GetD1ConfigFor(userID string) *D1Config {
 func (m *Manager) SetD1ConfigFor(userID string, cfg *D1Config) {
 	oid := m.ownerOf(userID)
 	if m.store == nil || oid == "" {
-		m.D1 = cfg
+		m.mu.Lock() // §0925EVE-D1：D1 指针整体替换是发布动作，必须持锁（与 Load 同口径）
+		m.d1 = cfg
+		m.mu.Unlock()
 		m.Save()
 		return
 	}
@@ -2064,7 +2106,7 @@ func (m *Manager) SetLongShortConfigFor(userID string, c LongShortConfig) {
 func (m *Manager) GetStrategyConfig() *StrategyConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	cp := m.Rules.Strategy
+	cp := m.rules.Strategy
 	return &cp
 }
 
@@ -2074,7 +2116,7 @@ func (m *Manager) GetStrategyConfig() *StrategyConfig {
 func (m *Manager) StrategyConfigSnapshot() StrategyConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.Rules.Strategy
+	return m.rules.Strategy
 }
 
 // ErrStrategyVersionConflict §中-6 乐观锁哨兵：写请求携带的 updated_at 与服务端当前版本
@@ -2096,7 +2138,7 @@ func (m *Manager) SetStrategyConfig(cfg *StrategyConfig) {
 	m.mu.Lock()
 	next := *cfg
 	next.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano) // §中-6 服务端统一盖版本戳
-	m.Rules.Strategy = next
+	m.rules.Strategy = next
 	m.mu.Unlock()
 	m.Save()
 }
@@ -2121,7 +2163,7 @@ func (m *Manager) SetStrategyConfig(cfg *StrategyConfig) {
 func (m *Manager) MergeStrategyConfig(patch map[string]json.RawMessage, baseVersion string) (StrategyConfig, error) {
 	delete(patch, "updated_at") // 版本字段服务端所有：body 值只用于比对，绝不参与 merge
 	m.mu.Lock()
-	cur := m.Rules.Strategy
+	cur := m.rules.Strategy
 	if baseVersion != "" && cur.UpdatedAt != "" && baseVersion != cur.UpdatedAt {
 		m.mu.Unlock()
 		return cur, ErrStrategyVersionConflict
@@ -2157,7 +2199,7 @@ func (m *Manager) MergeStrategyConfig(patch map[string]json.RawMessage, baseVers
 		return cur, fmt.Errorf("策略参数校验失败: %w", err)
 	}
 	next.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	m.Rules.Strategy = next
+	m.rules.Strategy = next
 	m.mu.Unlock()
 	m.Save()
 	return next, nil
@@ -2180,9 +2222,13 @@ func deepMergeAny(dst, src map[string]any) {
 }
 
 // GetD1Config 返回全局 D1 事件匹配规则配置。
-// （GetD1Config returns the global D1 event-matching rules config.）
+// §0925EVE-D1：d1 指针的唯一全局读口径（原导出字段 D1 转私有），RLock 保证与
+// Watch/Load 的指针发布无竞态；返回活体指针，整体替换一律走 SetD1Config 族 setter。
+// （GetD1Config returns the global D1 event-matching rules config under RLock.）
 func (m *Manager) GetD1Config() *D1Config {
-	return m.D1
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.d1
 }
 
 // SetSchedulerConfig 更新全局研究调度器配置（rules.scheduler）并持久化到文件。
@@ -2194,48 +2240,71 @@ func (m *Manager) SetSchedulerConfig(cfg *SchedulerConfig) {
 		return
 	}
 	m.mu.Lock()
-	m.Rules.Scheduler = *cfg
+	m.rules.Scheduler = *cfg
 	m.mu.Unlock()
 	m.Save()
 }
 
 // SetD1Config 更新全局 D1 规则并持久化到文件。
-// （SetD1Config updates the global D1 rules and persists them.）
+// §0925EVE-D1：D1 指针整体替换属于「发布」动作，旧实现无锁赋值与 Watch/Load 的
+// 重载通道同族，现持 Lock 写入（与 Load 的发布段同口径）。
+// （SetD1Config updates the global D1 rules under m.mu and persists them.）
 func (m *Manager) SetD1Config(cfg *D1Config) {
-	m.D1 = cfg
+	m.mu.Lock()
+	m.d1 = cfg
+	m.mu.Unlock()
 	m.Save()
 }
 
 // GetLLMConfig 返回全局 LLM 客户端配置。
+// §0925EVE-D1：rules 指针经加锁访问器 Get() 取得后再取字段地址，语义不变（活体字段指针）。
 // （GetLLMConfig returns the global LLM client config.）
 func (m *Manager) GetLLMConfig() *LLMConfig {
-	return &m.Rules.LLM
+	return &m.Get().LLM
 }
 
 // GetNotifyConfig 返回通知推送配置。
+// §0925EVE-D1：同 GetLLMConfig，指针读取收进 Get()。
 // （GetNotifyConfig returns the notification config.）
 func (m *Manager) GetNotifyConfig() *NotifyConfig {
-	return &m.Rules.Notify
+	return &m.Get().Notify
 }
 
 // SetNotifyConfig 更新通知配置并持久化到文件。
+// §0925EVE-D1：全局活体字段的无锁裸写补持 m.mu（与 §CFGSMASH setter 锁口径对齐，
+// 也与 Save 的 RLock marshal 形成互斥）。
 // （SetNotifyConfig updates the notification config and persists it.）
 func (m *Manager) SetNotifyConfig(cfg *NotifyConfig) {
-	m.Rules.Notify = *cfg
+	m.mu.Lock()
+	m.rules.Notify = *cfg
+	m.mu.Unlock()
 	m.Save()
 }
 
 // SetLLMConfig 更新全局 LLM 配置并持久化到文件。
+// §0925EVE-D1：同 SetNotifyConfig，无锁裸写补锁。
 // （SetLLMConfig updates the global LLM config and persists it.）
 func (m *Manager) SetLLMConfig(cfg *LLMConfig) {
-	m.Rules.LLM = *cfg
+	m.mu.Lock()
+	m.rules.LLM = *cfg
+	m.mu.Unlock()
 	m.Save()
 }
 
 // Load 从配置文件读取并解析 JSON，更新 Rules 和 D1 配置。
 // 文件缺失/不可读时静默保留内存现状（首次启动即用 DefaultRules）；
 // 解析失败仅记日志不清空已有配置；未出现的段不覆盖。
-// （Load reads and parses the JSON config file, updating the Rules and D1 config.）
+// §0925EVE-D1（本缺陷主体）：指针发布段收进**单次 m.mu.Lock 临界区**——rules 与 d1
+// 要么一起保持旧值、要么一起换上本次解析出的新值，不存在「半新一旧」被读到的窗口。
+// 注意边界：wrapper 语义本身允许文件里只写 rules 段或只写 d1 段——此时只有出现的段被
+// 替换，另一个保持旧值，这是**配置语义**使然而非并发破口；「成对一致」保证的是
+// 同一次 Load 内两段发布原子完成。读方若在同一次业务里先后各取一次 Get()/GetD1Config()，
+// 跨两次调用可能被夹入一次新的 Load（各次调用内部无竞态，跨调用不保证成对）；
+// 需要严格成对时用 RulesD1Snapshot 一次取回。
+// English: publishes the reloaded rules/d1 pointers inside ONE m.mu.Lock critical
+// section, so readers holding m.mu (Get/GetD1Config/Save/RulesD1Snapshot) never observe a
+// torn pointer swap. Re-reads of GetD1Config etc. are lock-free field derefs of immutable
+// snapshots: Load only swaps pointers, never mutates the previously published structs.
 func (m *Manager) Load() {
 	data, err := os.ReadFile(m.path)
 	if err != nil {
@@ -2250,13 +2319,27 @@ func (m *Manager) Load() {
 		log.Printf("[config] 解析配置文件失败: %v", err)
 		return
 	}
+	// §0925EVE-D1 发布段：新结构体（json.Unmarshal 私有对象）解析完成后才入锁，锁内只做
+	// 指针赋值，不触发任何回调/IO——与 Get/GetD1Config/Save 的 RLock 读侧严格配对。
+	m.mu.Lock()
 	if wrapper.Rules != nil {
-		m.Rules = wrapper.Rules
+		m.rules = wrapper.Rules
 	}
 	if wrapper.D1 != nil {
-		m.D1 = wrapper.D1
+		m.d1 = wrapper.D1
 	}
+	m.mu.Unlock()
 	log.Printf("[config] 已加载配置文件: %s", m.path)
+}
+
+// RulesD1Snapshot 一次 RLock 同取 rules 与 d1 两份全局快照指针。
+// §0925EVE-D1：供「同一轮判断里必须同时看两份配置」的调用方使用——Load 的发布段是
+// 单临界区，本方法也是，因此返回值对必然来自同一版本（或同为更早版本），不会跨版本混搭。
+// English: returns both global snapshots under a single RLock — guaranteed pair-consistent.
+func (m *Manager) RulesD1Snapshot() (*Rules, *D1Config) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rules, m.d1
 }
 
 // Save 将当前配置序列化为 JSON 并写入文件。
@@ -2272,8 +2355,8 @@ func (m *Manager) Save() {
 		D1    *D1Config `json:"d1"`    // D1 事件匹配规则段
 	}{}
 	m.mu.RLock()
-	wrapper.Rules = m.Rules
-	wrapper.D1 = m.D1
+	wrapper.Rules = m.rules
+	wrapper.D1 = m.d1
 	data, err := json.MarshalIndent(wrapper, "", "  ")
 	m.mu.RUnlock()
 	if err != nil {

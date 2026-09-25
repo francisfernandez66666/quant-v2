@@ -179,7 +179,7 @@ func newTestComponents(t *testing.T) (
 			MaxHoldDays:   20,
 		},
 	})
-	cfgMgr.Rules.Laodeng = config.LaodengConfig{
+	cfgMgr.Get().Laodeng = config.LaodengConfig{
 		Enabled:      true,
 		MarketCapMin: 500,
 		PeMax:        15,
@@ -202,7 +202,7 @@ func newTestComponents(t *testing.T) (
 	sAgent := sector_agent.New(scanner, rpsMgr)
 
 	stratCfg := cfgMgr.GetStrategyConfig()
-	laodengCfg := &cfgMgr.Rules.Laodeng
+	laodengCfg := &cfgMgr.Get().Laodeng
 	cAgent := combat_agent.New(stratCfg)
 	cAgent.SetLaodengConfig(laodengCfg)
 	cAgent.SetRunners(combat_agent.NewRunners(cfgMgr, nil))
@@ -655,7 +655,7 @@ func TestLaodengConfigFromJSON(t *testing.T) {
 	}
 
 	cfgMgr := config.NewManager(cfgPath)
-	ld := cfgMgr.Rules.Laodeng
+	ld := cfgMgr.Get().Laodeng
 	if !ld.Enabled {
 		t.Error("Laodeng 应启用")
 	}
