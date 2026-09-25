@@ -115,7 +115,7 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 10 条）。
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 11 条）。
 // English: factory routing table covering all DefaultAlertRules() entries.
 func DefaultAlertRouting() AlertRoutingConfig {
 	return AlertRoutingConfig{
@@ -129,6 +129,10 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			// —— 日汇总：事件型腿已即时推送，指标面只补「量化留痕」，避免双份 ——
 			"settlement_diff": RouteDaily, // 交割单差异（engine/settlement 的 notify 腿已在推）
 			"settle_failed":   RouteDaily, // 三方对账失败（同上：10 分钟节流重试自带播报）
+			// §CAL-GATE（2026-09-25 D-25-1）：日历未加载属"持续性状态"而非瞬时疼——
+			// 若 API 长期不可用（缺 key），恒触发下推通道会变成每 30 分钟一条的刷屏；
+			// 日汇总既保证 owner 每天看到一次"现在处于 fail-open"，又不淹没其它必推。
+			"trading_calendar_not_loaded": RouteDaily,
 			// —— 日汇总：趋势型/容量型，单条不疼、反复才疼 ——
 			"llm_cooldown":   RouteDaily, // LLM 冷却数
 			"buy_queue_high": RouteDaily, // 买入队列积压

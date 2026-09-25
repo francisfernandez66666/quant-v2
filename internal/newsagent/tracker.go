@@ -65,7 +65,10 @@ func tradingDayStart(now time.Time) time.Time {
 		}
 		// 15:00 落在非交易日（周末/节假日）时继续回退，直至落在交易日
 		// English: keep stepping back while 15:00 falls on a non-trading day (weekend/holiday), until it lands on a trading day
-		if start.Weekday() == time.Saturday || start.Weekday() == time.Sunday {
+		// §CAL-GATE（2026-09-25 D-25-1 同族）：注释一直承诺"节假日也回退"，旧实现却只判周末——
+		// 法定休市日的工作日会被当窗口起点。改走 data.IsTradingDay（周末 + 运行时休市日历），
+		// 与 trade_time.go 全部时段判据同一权威闸口。
+		if !data.IsTradingDay(start) {
 			start = start.AddDate(0, 0, -1)
 			continue
 		}

@@ -3464,4 +3464,130 @@ else
 fi
 
 echo ""
+# ════════════════════════════════════════════════════════════════════════════
+# §96 §CAL-GATE（2026-09-25 缺陷 D-25-1，owner 令「不走法定休市日表这个bug修了」）
+# 锁定四件事：
+# ① 结构锁：internal/data/trade_time.go 全部 14 个时段判据的函数体必须调 IsTradingDay，
+#    且体内不得再出现"星期几"字面量（权威闸口只留 IsTradingDay/TradingDayDate/
+#    AddTradingDays/DurationToNextActiveSession 四处合法位置，逐字计数钉死）；
+# ② 可见性锁：fail-open 是刻意方向 ⇒ 健康读数 TradingCalendarHealth + 两个量规 +
+#    trading_calendar_not_loaded 规则/路由必须都在（§DEADGAUGE 同族的"规则有、赋值没"防线）；
+# ③ 同闸门锁：newsagent 窗口裁剪与 dataload 半根K线回退都改走 data.IsTradingDay，
+#    全仓不许留第二套"只看周末"的交易日写法；
+# ④ 真跑锁：中秋（2026-09-25 恰为周五）形态的注入日历用例必须真跑到且跑绿（数 === RUN 行，
+#    §95 教训：ok 对"没测试可跑"同样成立）。
+# 反证（本轮人工锤，不常驻脚本）：把 CurrentSession 改回周末写法后整段+用例即红。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 96 §CAL-GATE 法定休市日不再被当盘中：14 个时段判据统一走 IsTradingDay + fail-open 可见性（量规/健康读数/告警规则）+ newsagent/dataload 同闸门 + 中秋注入日历用例真跑（2026-09-25 D-25-1，owner 令「这个bug修了」）..."
+CG_TT=internal/data/trade_time.go
+CG_CAL=internal/data/trade_calendar.go
+CG_ENG=internal/engine/scoring_loop.go
+CG_NA=internal/newsagent/tracker.go
+CG_DL=cmd/dataload/baostock.go
+CG_TST=internal/data/trade_time_calendar_test.go
+CG_ERRS=""
+cg_chk() { if [ "$2" != "$3" ]; then CG_ERRS="${CG_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+cg_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then CG_ERRS="${CG_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+
+# ── ① 结构锁 ──
+# 14 个受闸判据（与本批改写的函数清单一一对应；新增时段判据必须进这张清单，否则 ①b 循环不覆盖它）。
+CG_FNS="IsTradeTime IsFullTradingHours IsPreOpen IsMorningHighFreq IsMidFreqWindow IsAfternoonHighFreq IsPreMarket IsPreAfternoon IsAfterMarket IsTradingWindow CurrentSession BeforeOpenTrade IsContinuousTrade NextTradeOpen"
+# ①a 函数体级正锁+体内负锁：逐个抽体检查"有 IsTradingDay、无 Saturday"（比全文件计数强：
+#     把闸口塞进别的函数也骗不过逐体抽取）。抽取用 perl -0777（跨行；§静态负锁教训：macOS BSD
+#     grep 无 -P，多行匹配只有 perl 一条路）。
+#     ⚠ 正则必须自带捕获括号 `(…)`：\Q$n\E 与 \( 都不是捕获组，$1 会静默为空串＝恒假象
+#     （本轮搭锁时实测踩过一次；非空判定由 len 检查兜底）。
+for cgf in $CG_FNS; do
+	if ! perl -0777 -E '
+		my $s = do { local $/; <STDIN> };
+		my $n = $ARGV[0];
+		if ($s =~ /(func \Q$n\E\(.*?\n\})/s) {
+			my $b = $1;
+			exit((length($b) > 20 && $b =~ /IsTradingDay\(/ && $b !~ /Saturday/) ? 0 : 1);
+		}
+		exit 2;
+	' "$cgf" < "$CG_TT"; then
+		CG_ERRS="${CG_ERRS}
+  · 判据 ${cgf} 函数体未过闸（应含 IsTradingDay 且体内无 Saturday）"
+	fi
+done
+CG_CALLS=$(grep -c '!IsTradingDay(' "$CG_TT" || true)
+cg_chk "受闸判据调用点总数（14 个判据各一处）" "$CG_CALLS" "14"
+# ①b 权威闸口自身唯一且不得自我递归。
+CG_DEF=$(grep -c 'func IsTradingDay(' "$CG_TT" || true)
+cg_chk "IsTradingDay 定义唯一" "$CG_DEF" "1"
+CG_SELF=$(perl -0777 -ne 'print /func IsTradingDay\(.*?\n\}/s ? ($& =~ /!IsTradingDay\(/ ? 1 : 0) : 0' "$CG_TT" || true)
+cg_chk "负锁：IsTradingDay 体内不得再调自身" "${CG_SELF:-0}" "0"
+# ①c 等值锁：文件里合法保留的"星期几"字面量必须恰是 3 处 == + 1 处 !=
+#     （TradingDayDate 回退、DurationToNextActiveSession 跳过、IsTradingDay 本体、AddTradingDays 正向）。
+#     多了＝有新判据绕闸手写周末；少了＝有人把日历腿本身也拆了。
+CG_SAT_EQ=$(grep -c 'Weekday() == time.Saturday' "$CG_TT" || true)
+CG_SAT_NE=$(grep -c 'Weekday() != time.Saturday' "$CG_TT" || true)
+cg_chk "合法周末字面量（==）恰 3 处（闸口本体+两处日历腿）" "$CG_SAT_EQ" "3"
+cg_chk "合法周末字面量（!=）恰 1 处（AddTradingDays）" "$CG_SAT_NE" "1"
+CG_WD=$(grep -c 'wd := now.Weekday()' "$CG_TT" || true)
+cg_chk "负锁：旧写法 wd := now.Weekday() 早退不得复活" "$CG_WD" "0"
+CG_14=$(grep -c 'for i := 0; i < 14; i++' "$CG_TT" || true)
+CG_7=$(grep -c 'for i := 0; i < 7; i++' "$CG_TT" || true)
+cg_chk "NextTradeOpen 长假 14 天窗口正锁" "$CG_14" "1"
+cg_chk "负锁：7 天旧窗口不得复活（长假退化返回 0）" "$CG_7" "0"
+
+# ── ② 可见性锁（fail-open 必须被看见） ──
+CG_HDEF=$(grep -c 'func TradingCalendarHealth(' "$CG_CAL" || true)
+CG_HUSE=$(grep -c 'data.TradingCalendarHealth()' "$CG_ENG" || true)
+cg_chk "健康读数函数唯一" "$CG_HDEF" "1"
+cg_chk "健康读数有真实消费者（§DEADGAUGE 教训：诊断函数不许零消费挂死）" "$CG_HUSE" "1"
+CG_WDEF=$(grep -c 'func setCalendarWindow(' "$CG_CAL" || true)
+CG_WUSE=$(grep -c 'setCalendarWindow(minD, maxD)' "$CG_CAL" || true)
+cg_chk "覆盖窗口写入点唯一（仅 API 成功刷新）" "$CG_WUSE" "1"
+cg_chk "覆盖窗口函数唯一" "$CG_WDEF" "1"
+# SetClosedDays 覆盖即旧窗口作废：清窗腿必须在注入函数里（否则缓存/测试注入会顶着上轮 API 的窗口读数）。
+CG_WCLR=$(perl -0777 -ne 'print /func SetClosedDays\(.*?\n\}/s ? ($& =~ /calWindow = ""/ ? 1 : 0) : 0' "$CG_CAL" || true)
+cg_chk "SetClosedDays 内必须清空旧窗口" "${CG_WCLR:-0}" "1"
+CG_G1=$(grep -c 'SetGauge("trading_calendar_loaded"' "$CG_ENG" || true)
+CG_G2=$(grep -c 'SetGauge("today_is_trading_day"' "$CG_ENG" || true)
+CG_BG=$(grep -c 'func boolGauge(' "$CG_ENG" || true)
+cg_chk "量规 trading_calendar_loaded 赋值点唯一" "$CG_G1" "1"
+cg_chk "量规 today_is_trading_day 赋值点唯一" "$CG_G2" "1"
+cg_chk "boolGauge 辅助唯一" "$CG_BG" "1"
+# 规则↔路由↔赋值三腿齐在（赋值腿由 §DEADGAUGE 通用守卫反解 Metric 名兜底，这里锁规则与路由本身）。
+CG_RULE=$(grep -c 'Name: "trading_calendar_not_loaded"' internal/metrics/alerter.go || true)
+CG_ROUTE=$(grep -c '"trading_calendar_not_loaded": RouteDaily' internal/metrics/alert_routing.go || true)
+cg_chk "未加载告警规则唯一" "$CG_RULE" "1"
+cg_chk "告警规则已进路由表（RouteDaily）" "$CG_ROUTE" "1"
+
+# ── ③ 同闸门锁：全仓不许留第二套"只看周末"的交易日写法 ──
+CG_NA1=$(grep -c '!data.IsTradingDay(start)' "$CG_NA" || true)
+CG_NA2=$(grep -c 'time.Saturday' "$CG_NA" || true)
+cg_chk "newsagent 窗口裁剪走统一闸口" "$CG_NA1" "1"
+cg_chk "负锁：tracker.go 不得残留周末字面量" "$CG_NA2" "0"
+CG_DL1=$(grep -c 'for !data.IsTradingDay(yest)' "$CG_DL" || true)
+CG_DL2=$(grep -c 'time.Saturday' "$CG_DL" || true)
+cg_chk "dataload 半根K线回退走统一闸口" "$CG_DL1" "1"
+cg_chk "负锁：baostock.go 不得残留周末字面量" "$CG_DL2" "0"
+# 生产侧（QMT 桥 python）同口径的独立锁在 qmt_gateway/tests/test_trading_calendar.py（pytest 231 覆盖），
+# 此处不做跨语言字面量锁——两侧语义相同但实现独立，锁字面量只会互相绊脚（§95 那次锁的是共享锚点行格式）。
+
+# ── ④ 真跑锁：注入日历的中秋形态用例（2026-09-25 恰为周五＝本缺陷的实录形状） ──
+CG_RUN=$(go test -count=1 ./internal/data/ -run 'TestHolidaySessionPredicates|TestHolidayLongBreakNextTradeOpen|TestNormalTradingDayPredicates|TestCalendarFailOpenDirection|TestTradingCalendarHealth' -v 2>&1 | grep -c '^=== RUN' || true)
+CG_FAIL=$(go test -count=1 ./internal/data/ -run 'TestHolidaySessionPredicates|TestHolidayLongBreakNextTradeOpen|TestNormalTradingDayPredicates|TestCalendarFailOpenDirection|TestTradingCalendarHealth' 2>&1 | grep -cE 'FAIL|no test files' || true)
+cg_min "§CAL-GATE 用例实跑数下限（5 条函数各≥1）" "$CG_RUN" "5"
+cg_chk "§CAL-GATE 用例跑绿" "$CG_FAIL" "0"
+CG_NR=$(go test -count=1 ./internal/newsagent/ -run 'TestTradingDayStart' -v 2>&1 | grep -c '^=== RUN' || true)
+CG_NF=$(go test -count=1 ./internal/newsagent/ -run 'TestTradingDayStart' 2>&1 | grep -cE 'FAIL|no test files' || true)
+cg_min "newsagent 窗口裁剪用例实跑" "$CG_NR" "1"
+cg_chk "newsagent 窗口裁剪用例跑绿" "$CG_NF" "0"
+CG_TST_EXIST=$(test -f "$CG_TST" && echo 1 || echo 0)
+cg_chk "§CAL-GATE 用例文件在位" "$CG_TST_EXIST" "1"
+
+if [ -z "$CG_ERRS" ]; then
+	echo "ok - §CAL-GATE 守卫通过（逐体正/负锁 14×2 + 结构计数 8 + 可见性 10 + 同闸门 4 + 用例实跑 5）"
+else
+	echo "--- FAIL: §CAL-GATE 断言不符:${CG_ERRS}"
+	exit 1
+fi
+
+echo ""
 echo "==> 全部通过"

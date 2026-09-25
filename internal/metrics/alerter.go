@@ -66,6 +66,13 @@ func DefaultAlertRules() []AlertRule {
 		// 报出来的条数不是任何一侧的真值（§DEADGAUGE 的反面形态：值在、但失真）。
 		// 赋值点：internal/research/apply.go markStaleAdjBasisPatterns（含"没有库"清零）。
 		{Name: "applied_pattern_stale_basis", Metric: "applied_pattern_stale_basis_count", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "已应用形态战法复权基线已失效（条件阈值缺历史依据，需重跑寻优+审批）"},
+		// §CAL-GATE（2026-09-25 D-25-1）：交易日历未加载即告警——时段判据的缺省方向是 fail-open
+		// （日历没加载时法定节假日按周末口径当交易日），这方向是刻意的（宁可多跑不漏跑真交易日），
+		// 但"今天其实在 fail-open"必须说出来：D-25-1 的实录就是中秋休市日被整天当盘中出信号。
+		// 赋值点：engine/scoring_loop.go refreshStalenessGauges（每 30s、会话门禁之前，休市日也在喂）。
+		// For=300s：给启动后首个 API 刷新/磁盘缓存读取留重试余量；触发即 p1——引擎对"休市"失明期间
+		// 信号、实盘建议、熔断健康判定全部按盘中口径跑。
+		{Name: "trading_calendar_not_loaded", Metric: "trading_calendar_loaded", Op: "lt", Threshold: 1, For: "300s", Level: "p1", Message: "交易日历未加载：法定节假日正被当交易日（fail-open），休市日会照常出信号，查 hithink 日历接口/磁盘缓存"},
 	}
 }
 

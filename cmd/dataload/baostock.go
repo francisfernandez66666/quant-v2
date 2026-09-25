@@ -175,7 +175,10 @@ func clampEndToLastClosedDay(end string) string {
 		return end // 收盘后：当日 bar 已完整，允许写入
 	}
 	yest := now.AddDate(0, 0, -1)
-	for yest.Weekday() == time.Saturday || yest.Weekday() == time.Sunday {
+	// §CAL-GATE（D-25-1 统一闸口）：回退"上一个已收盘日"走 data.IsTradingDay。
+	// 本 CLI 进程通常没加载日历，此时判据与旧周末写法逐字等价（fail-open 同向）；
+	// 一旦日历在进程内被注入（测试/未来接线），长假回退自动跟着正确，不再留第二套口径。
+	for !data.IsTradingDay(yest) {
 		yest = yest.AddDate(0, 0, -1)
 	}
 	log.Printf("[dataload] 盘中半根K线防线: end %s → %s（收盘后自动补当日）", end, yest.Format("2006-01-02"))

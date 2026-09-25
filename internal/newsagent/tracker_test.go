@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 )
 
@@ -134,6 +135,18 @@ func TestTradingDayStart(t *testing.T) {
 	want = time.Date(2026, 1, 9, 15, 0, 0, 0, time.Local)
 	if !start.Equal(want) {
 		t.Fatalf("期望周一窗口起点 %v, 实际 %v", want, start)
+	}
+
+	// §CAL-GATE（D-25-1）：注释承诺的"节假日也回退"如今走 data.IsTradingDay——
+	// 2026-09-28（周一）10:00 的窗口起点必须跳过 09-26/27 周末 **和 09-25 中秋休市日（周五）**，
+	// 落在 09-24（周四）15:00。旧写法只判周末，会错落在休市日 09-25 15:00。
+	data.SetClosedDays([]string{"20260925"})
+	defer data.SetClosedDays(nil)
+	mon := time.Date(2026, 9, 28, 10, 0, 0, 0, cntime.Loc)
+	start = tradingDayStart(mon)
+	want = time.Date(2026, 9, 24, 15, 0, 0, 0, cntime.Loc)
+	if !start.Equal(want) {
+		t.Fatalf("期望跳过中秋休市日的窗口起点 %v, 实际 %v", want, start)
 	}
 }
 

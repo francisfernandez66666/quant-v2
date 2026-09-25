@@ -23,6 +23,7 @@ var (
 	calMu      sync.RWMutex
 	closedDays = map[string]bool{} // "20060102" → 非周末休市日
 	calLoaded  bool                // 是否至少成功加载过一次
+	calWindow  string              // §CAL-GATE 当前集合的覆盖窗口 "min~max"（仅 API 成功刷新时有值）
 )
 
 // SetClosedDays 注入非周末休市日集合（幂等覆盖）。
@@ -37,6 +38,14 @@ func SetClosedDays(dates []string) {
 		}
 	}
 	calLoaded = true
+	calWindow = "" // 覆盖即旧窗口作废：非 API 来源（缓存/测试注入）没有窗口读数可承诺
+}
+
+// setCalendarWindow 记录本次 API 刷新实际覆盖的交易日窗口（仅 RefreshTradingCalendar 调用）。
+func setCalendarWindow(minD, maxD string) {
+	calMu.Lock()
+	defer calMu.Unlock()
+	calWindow = minD + "~" + maxD
 }
 
 // isClosedDay 查询某 YYYYMMDD 是否为非周末休市日（未加载日历时恒 false=周末口径兜底）。
@@ -58,6 +67,25 @@ func ClosedDayCount() int {
 	calMu.RLock()
 	defer calMu.RUnlock()
 	return len(closedDays)
+}
+
+// TradingCalendarHealth §CAL-GATE：交易日历的健康读数（中文一行，供日志/量规/前端展示）。
+// 背景：isClosedDay 在未加载时恒 false＝**fail-open**（法定节假日被当交易日运行），
+// 这个方向是刻意的（宁可多跑也不漏跑真交易日），但"到底加载没有"必须能被看见——
+// 否则日历拉挂了整个休市日都会被当盘中，且无人知晓（2026-09-25 中秋实录的根因之一）。
+// 读数含：加载状态（含磁盘缓存来源）/ 休市日个数 / 覆盖窗口（仅 API 成功刷新时有值）。
+// English: a single-line Chinese health reading of the trading calendar — load state, closed-day
+// count and the covered window; required because the fail-open fallback is silent by design.
+func TradingCalendarHealth() string {
+	calMu.RLock()
+	defer calMu.RUnlock()
+	if !calLoaded {
+		return "交易日历未加载（fail-open：法定节假日暂按周末口径当交易日）"
+	}
+	if calWindow == "" {
+		return fmt.Sprintf("交易日历已加载（休市日 %d 天，覆盖窗口未知）", len(closedDays))
+	}
+	return fmt.Sprintf("交易日历已加载（休市日 %d 天，覆盖窗口 %s）", len(closedDays), calWindow)
 }
 
 // RefreshTradingCalendar 拉取同花顺交易日历并推导休市日集合。
@@ -109,6 +137,7 @@ func RefreshTradingCalendar() error {
 		}
 	}
 	SetClosedDays(closed)
+	setCalendarWindow(minD, maxD) // §CAL-GATE：健康读数里的覆盖窗口随本次成功刷新落定
 	// §ENH-0(20260919)：拉取成功后原子落盘——下次冷启动即使 hithink 缺 key/停机，
 	// 也能用上次结果，不再退化为"周末口径把法定节假日当交易日"。落盘失败不阻断本次加载。
 	if err := SaveTradingCalendarCache(calendarCacheFilePath(), closed); err != nil {

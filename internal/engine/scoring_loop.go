@@ -1294,4 +1294,29 @@ func (e *Engine) refreshStalenessGauges() {
 		llmCool = int64(c.KeysInCooldown())
 	}
 	metrics.SetGauge("llm_cooldown_count", llmCool)
+
+	// §CAL-GATE（2026-09-25 D-25-1）：交易日历两个量规——休市日判据的"可见性腿"。
+	// 日历缺省方向是 fail-open（未加载时法定节假日被当交易日），所以"加载没有"必须
+	// 是能被告警/看板读到的数：trading_calendar_loaded=0 即"当前所有时段判定只认周末"，
+	// today_is_trading_day 给出今天按当前口径的判定结果（两者组合可直接抓"日历挂了"）。
+	// 赋值在本函数（每 30s、会话门禁之前）——休市日也要喂，否则量规本身会在长假里变陈旧值。
+	metrics.SetGauge("trading_calendar_loaded", boolGauge(data.CalendarLoaded()))
+	metrics.SetGauge("today_is_trading_day", boolGauge(data.IsTradingDay(time.Now())))
+	// 未加载时额外走 opslog 通道打一条人可读的健康行（每 24h 至多一条，不刷屏）：
+	// 量规只有数字，日志里要能直接回答"现在是不是把法定节假日当交易日在跑"。
+	// 注：本行的时间语义是"距上次执行 ≥24h"，若引擎只在盘中时段跑满节拍，
+	// 实际播报间隔 ≥24h——只会更稀不会更密，符合"别淹掉真告警"的口径。
+	if !data.CalendarLoaded() {
+		opslog.OncePer("cal-gate-not-loaded", 24*time.Hour, func() {
+			log.Printf("[cal] %s", data.TradingCalendarHealth())
+		})
+	}
+}
+
+// boolGauge 布尔→量规值（true=1/false=0），§CAL-GATE 起供本文件喂 0/1 型量规。
+func boolGauge(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
 }

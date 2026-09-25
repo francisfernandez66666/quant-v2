@@ -73,10 +73,23 @@ func SetTradeTimeConfig(cfg TradeTimeConfig) {
 }
 
 // IsTradeTime 判断当前是否为交易时段。
+//
+// §CAL-GATE（2026-09-25 缺陷 D-25-1）：本文件所有"现在属于哪个时段"的判据一律先问
+// IsTradingDay（周末 + 运行时交易日历里的法定休市日），**不再各自只判星期几**。
+// 实录：2026-09-25（中秋休市第一天，恰是周五）旧写法把 11:28 判成"早盘"，于是打分循环按
+// 09-24 的旧数据持续出信号、固化进 signals_today.json（44 分钟内 210→460 条"当日信号"），
+// 实盘建议那条腿（含周期对账、超时撤单清扫、按交易日交割对账）也整天按盘中跑。
+// 缺省方向＝**fail-open**：日历没加载成功时 isClosedDay 恒 false，法定节假日会被当交易日
+// （宁可多跑也不漏跑真交易日），因此"日历到底加载没有"必须是能被看见的读数，
+// 见 TradingCalendarHealth 与引擎侧的 trading_calendar_loaded 量规。
+// English: every session predicate in this file first asks IsTradingDay (weekends plus the
+// runtime holiday calendar), so a statutory holiday that falls on a weekday stops being treated
+// as live market hours. Fail-open by design: until the calendar is loaded the system uses
+// weekend-only semantics (never silently skip a real trading day), which is why the load state
+// itself is exported as a health reading rather than staying in a log line.
 func IsTradeTime(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
+	if !IsTradingDay(now) {
 		return false
 	}
 	m := now.Hour()*100 + now.Minute()
@@ -86,17 +99,21 @@ func IsTradeTime(now time.Time) bool {
 // IsFullTradingHours 判断当前是否在完整的交易覆盖范围内。
 func IsFullTradingHours(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE：休市日不是"完整交易时段"
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.FullOpen && m <= defaultTradeTime.FullClose
 }
 
 // IsPreOpen 判断是否为集合竞价时段。
+// §CAL-GATE：此函数旧写法连周末都不判（9:15-9:25 落在周六也算"集合竞价中"），一并收口——
+// 交易所休市日根本没有集合竞价，判真等于让"竞价窗口"的特殊处理在周末空跑。
 func IsPreOpen(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
+	if !IsTradingDay(now) {
+		return false
+	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.PreOpenStart && m < defaultTradeTime.PreOpenEnd
 }
@@ -104,9 +121,8 @@ func IsPreOpen(now time.Time) bool {
 // IsMorningHighFreq 早盘高频率窗口（从集合竞价 9:15 起高频扫描，评分按 70 分起步）。
 func IsMorningHighFreq(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE：休市日不该按高频窗口节奏拉行情
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.FullOpen && m < defaultTradeTime.MorningHighEnd
@@ -115,9 +131,8 @@ func IsMorningHighFreq(now time.Time) bool {
 // IsMidFreqWindow 早盘中频窗口（9:45-10:00，早盘高频扫描的次级节奏）。
 func IsMidFreqWindow(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.MidFreqStart && m < defaultTradeTime.MorningHighEnd
@@ -126,15 +141,16 @@ func IsMidFreqWindow(now time.Time) bool {
 // IsAfternoonHighFreq 午后高频率窗口。
 func IsAfternoonHighFreq(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.AfternoonStart && m < defaultTradeTime.AfternoonEnd
 }
 
 // ScanInterval 根据当前时间返回合适的扫描间隔（秒）。
+// §CAL-GATE：间隔本身按下面的高频/午后窗口取，休市日两处窗口都判假 ⇒ 落到 normalSec
+// （低频），这正是休市日想要的节奏；调用方若还需"根本别扫"，判 IsActiveSession。
 func ScanInterval(now time.Time, highFreqSec, midFreqSec, afternoonFreqSec, normalSec int) int {
 	if IsMorningHighFreq(now) {
 		if IsMidFreqWindow(now) {
@@ -151,9 +167,8 @@ func ScanInterval(now time.Time, highFreqSec, midFreqSec, afternoonFreqSec, norm
 // IsPreMarket 盘前时段 8:30-9:15（可配置）。
 func IsPreMarket(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE：休市日没有盘前，"盘前"里的准备动作（重建池、看板预热）不该被这个窗口挑起
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= 830 && m < defaultTradeTime.FullOpen
@@ -162,20 +177,20 @@ func IsPreMarket(now time.Time) bool {
 // IsPreAfternoon 午盘前时段 11:30-13:00。
 func IsPreAfternoon(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= 1130 && m < defaultTradeTime.AfternoonStart
 }
 
 // IsAfterMarket 盘后时段 15:00-次日8:30。
+// ⚠ 判假不等于"盘后动作全停"：本函数的语义是"某个交易日的盘后窗口"，休市日整天没有当日
+// 盘后。需要"每天无论如何都收一次"的运维动作（备份/清理）请按小时自判，别挂在这个窗口上。
 func IsAfterMarket(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.TradeClose
@@ -232,24 +247,28 @@ func IsActiveSession(now time.Time) bool {
 // IsTradingWindow 交易日交易窗口（开盘 9:15 ~ 收盘 TradeClose，含午休）：研究任务禁止窗口。
 // 与用户约定口径一致——除交易日交易窗口外（盘前凌晨/盘后/周末全天），研究调度一律放行。
 // 直接复用 defaultTradeTime 的 FullOpen/TradeClose 字段，不另设钟点。
+// §CAL-GATE：判"是不是交易日"走 IsTradingDay（周末 + 运行时法定节假日日历），不再手写周末。
+// 法定节假日全天不是"交易窗口"，研究调度应当放行——这正是本函数原实现把
+// 中秋/国庆的工作日全判成禁止窗口、夜间研究三天不跑的根因之一。
 // English: trading-day window [FullOpen, TradeClose) incl. lunch break — the only period where
 // research tasks are blocked; nights, pre-open and weekends are all eligible for research.
 func IsTradingWindow(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false // 周末非交易日：全天允许
+	if !IsTradingDay(now) {
+		return false // 非交易日（周末或法定休市日）：全天允许研究任务跑
 	}
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.FullOpen && m < defaultTradeTime.TradeClose
 }
 
 // CurrentSession 返回当前市场时段。
+// §CAL-GATE：非交易日（周末或法定休市日）一律 SessionClosed——这是本文件其余
+// "时段类"判定的权威闸口：IsActiveSession 只看这里，所以只要休市日正确落到
+// SessionClosed，所有经由 CurrentSession 的消费方都自动获得正确的休市语义。
 func CurrentSession(now time.Time) MarketSession {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	// 周末无交易时段。
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
+	// 非交易日无交易时段（周末 + 运行时法定节假日日历）。
+	if !IsTradingDay(now) {
 		return SessionClosed
 	}
 	// 按 HHMM 分钟数判断所在时段：盘前/早盘/午休/午盘/盘后。
@@ -273,10 +292,13 @@ func CurrentSession(now time.Time) MarketSession {
 // BeforeOpenTrade 判断当前时刻是否处于开盘（默认 9:30）之前。
 // 非交易日返回 true（此时同样不应产生基于实盘数据的交易信号）。
 // 用于盘前压制战法信号：只更新评分，不发布买入/watch 信号。
+// §CAL-GATE：注释里承诺的"非交易日返回 true"过去只覆盖了周末——法定节假日的工作日
+// 会返回 false，于是战法信号在休市日照常被放行。现在判据走 IsTradingDay，
+// 注释与实现首次一致（本函数是信号侧压制盘前买入的入口，必须与日历同口径）。
 func BeforeOpenTrade(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
-		return true
+	if !IsTradingDay(now) {
+		return true // 非交易日（周末或法定休市日）＝视同"尚未开盘"，压制买入信号
 	}
 	return now.Hour()*100+now.Minute() < 930
 }
@@ -291,21 +313,22 @@ func BeforeOpenTrade(now time.Time) bool {
 // the only period where the tick-driven QMT bridge beats reliably.
 func IsContinuousTrade(now time.Time) bool {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	wd := now.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return false
+	if !IsTradingDay(now) {
+		return false // §CAL-GATE 休市日没有连续竞价：桥心跳不可信，绝不在此判失联熔断（§CB 误熔方向）
 	}
 	m := now.Hour()*100 + now.Minute()
 	return (m >= 930 && m < 1130) || (m >= defaultTradeTime.AfternoonStart && m < 1457)
 }
 
 // NextTradeOpen 返回距离下一个交易时段开盘的等待时长。
+// §CAL-GATE：向前跳过的是"非交易日"（周末 + 已加载的休市日），且窗口从 7 天放宽到
+// 14 天——国庆+中秋连休可达 8 天，7 天窗口会在长假里找不到开盘点、退化成 0（立即开跑）。
 func NextTradeOpen(now time.Time) time.Duration {
 	now = cntime.In(now) // §TZ1 北京时区统一
-	// 向后最多 7 天找到下一交易日的开盘时刻；当日未收盘且已开盘则等待 0（立即进入交易时段）。
-	for i := 0; i < 7; i++ {
+	// 向后最多 14 天找到下一交易日的开盘时刻；当日未收盘且已开盘则等待 0（立即进入交易时段）。
+	for i := 0; i < 14; i++ {
 		t := now.AddDate(0, 0, i)
-		if t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+		if !IsTradingDay(t) {
 			continue
 		}
 		openH := defaultTradeTime.TradeOpen / 100
