@@ -3589,5 +3589,127 @@ else
 	exit 1
 fi
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# §97 §CAND-PUSH（2026-09-25，owner 令「重训结果推到云端」）
+# 锁定 scripts/push_candidates_guangzhou.sh 的六条安全口径——这条通道**会写现网研究库**，
+# 所以每一句"只写 proposed / 先备份 / 不覆盖既有行"都必须有锁，而不是只写在头注释里：
+# ① 写入口径锁：远端 INSERT 第三列必须是字面量 'proposed'（状态由远端写死，本机载荷说了不算）；
+#    全脚本对 research_candidates 不得出现 UPDATE/DELETE；INSERT 列首必须是 created_at
+#    （显式 id 进列名＝撞号事故的开端，钉死为 0 次）。
+# ② 备份先行锁：备份必须走 sqlite3 backup API（backup( 调用在位），ps1 里不得出现 Copy-Item
+#    裸拷库文件（WAL 半态备份＝没备）；backup 失败必须能打 ABORT=backup-failed。
+# ③ 转义链锁：ps1 组装后有 LC_ALL=C 非 ASCII 自检；解析远端回传前必须 tr -d '\r'
+#    （09-25 首跑实录：**自己加的 CRLF 被自己的 ASCII 闸判红**——两条锁都在防这一族）。
+# ④ 缺省方向锁：预览模式判定行 CAND_PUSH_PLAN 在位；运行时用离网 SRC_DB 真跑一次预览，
+#    要求 exit 0 且输出**不含** CAND_PUSH_ARMED（ARMED 只在 -Apply 后出现＝"没连生产"可证）。
+# ⑤ 载荷校验锁（含常驻反证）：临时库里混一行 approved ⇒ 预览必须非 0（拒推在任何写入之前）；
+#    空载荷/缺库同样非 0——"0 行也算成功"是 §MINUTE 同款假绿，禁止。
+# ⑥ 写后复核锁：VERIFY 行必须从库里回读 status（不是复述刚写的变量）；等式 total/inserted/dup
+#    的解析与数字校验同在。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 97 §CAND-PUSH 候选推送云端通道：只写 proposed / 备份先行 / 不碰既有行 / 缺省预览零连接 / 写后逐行回读（2026-09-25 owner 令「重训结果推到云端」）..."
+CP_SCR=scripts/push_candidates_guangzhou.sh
+CP_ERRS=""
+cp_chk() { if [ "$2" != "$3" ]; then CP_ERRS="${CP_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+cp_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then CP_ERRS="${CP_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+cp_absent() { if [ "${2:-0}" -ne "0" ]; then CP_ERRS="${CP_ERRS}
+  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+
+
+cp_chk "§CAND-PUSH 脚本在位" "$(test -f "$CP_SCR" && echo 1 || echo 0)" "1"
+# 本脚本开头是 `set -euo pipefail`（§89 钉死）：凡是**预期可能非 0** 的子进程（反证要它失败）
+# 必须先 `|| rc=$?` 收进变量再断言，直跑会让整轮 verify 无 FAIL 无 ok 静默中止（本节首跑实录）。
+CP_SY=0; bash -n "$CP_SCR" 2>/dev/null || CP_SY=$?
+cp_chk "push_candidates 语法自检 bash -n" "$CP_SY" "0"
+
+# ── ① 写入口径 ──
+CP_PROP="$(grep -c "r\['kind'\], 'proposed', r\['factors'\]" "$CP_SCR" || true)"
+cp_chk "远端 INSERT 状态写死 'proposed'（唯一落点）" "$CP_PROP" "1"
+CP_UPD="$(grep -c "UPDATE research_candidates" "$CP_SCR" || true)"
+cp_absent "对候选表的 UPDATE（本通道只增不改）" "$CP_UPD"
+CP_DEL="$(grep -c "DELETE FROM research_candidates" "$CP_SCR" || true)"
+cp_absent "对候选表的 DELETE（本通道只增不删）" "$CP_DEL"
+CP_IDI="$(grep -c "INSERT INTO research_candidates (id" "$CP_SCR" || true)"
+cp_absent "INSERT 显式带 id（防撞号口径）" "$CP_IDI"
+CP_INS="$(grep -c "INSERT INTO research_candidates (created_at,kind,status," "$CP_SCR" || true)"
+cp_chk "INSERT 列集与 store 侧 13 列同构（列首 created_at）" "$CP_INS" "1"
+
+# ── ② 备份先行 ──
+CP_BAK="$(grep -c "src.backup(tgt" "$CP_SCR" || true)"
+cp_min "sqlite3 backup API 调用在位（一致性快照）" "$CP_BAK" "2"
+# 负锁只查 **ps1 体内**有没有裸拷库文件：整文件计数会命中"为什么不用 Copy-Item"这条
+# 说明注释本身（§静态负锁教训：旧写法禁用注释≠旧写法复活）。
+CP_PS1BODY="$(awk '/push_run.ps1" <<.PYEOF\./{f=1;next} f&&/^PYEOF$/{exit} f' "$CP_SCR")"
+CP_CI="$(printf '%s' "$CP_PS1BODY" | grep -c "Copy-Item" || true)"
+cp_absent "ps1 体内裸拷库文件（Copy-Item＝WAL 半态备份）" "$CP_CI"
+CP_AB="$(grep -c "ABORT=backup-failed" "$CP_SCR" || true)"
+cp_min "备份失败的中止判定行在位" "$CP_AB" "1"
+CP_DST="$(grep -c "BACKUP_ERR=dst-exists" "$CP_SCR" || true)"
+cp_min "非 0 字节的同名历史备份拒绝覆盖（dst-exists）" "$CP_DST" "1"
+
+# ── ③ 转义链 ──
+CP_ASCII="$(grep -c "LC_ALL=C grep -n '\[^ -~\]'" "$CP_SCR" || true)"
+cp_min "ps1 组装后的非 ASCII 自检" "$CP_ASCII" "1"
+CP_CR="$(grep -c "tr -d '\\\\r'" "$CP_SCR" || true)"
+cp_min "解析远端回传前去 CR" "$CP_CR" "1"
+
+# ── ④⑤ 运行时：离网预览 + 载荷反证（全部只碰 mktemp 的一次性小库，不连任何生产；
+#     段尾统一 rm，不留跨轮垃圾——本仓纪律：测试数据不落工作树、也不留 /tmp 常驻）──
+CP_TMP="$(mktemp -d /tmp/verify97_XXXXXX)"
+CP_DB="$CP_TMP/src.db"
+sqlite3 "$CP_DB" "CREATE TABLE research_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', factors TEXT, weights TEXT, metric REAL, ic_mean REAL, ir REAL, avg_excess REAL, horizon INTEGER, reason TEXT, guard TEXT DEFAULT 'standard', params TEXT DEFAULT '');"
+sqlite3 "$CP_DB" "INSERT INTO research_candidates (created_at,kind,status,factors,params,horizon,guard,ir) VALUES ('2026-09-25 10:00:00','factor','proposed','[\"T1\"]','{}',5,'strong',0.9),('2026-09-25 11:00:00','factor','proposed','[\"T2\"]','{}',10,'weak',0.5);"
+CP_OUT="$CP_TMP/preview.out"
+CP_PV=0
+GZ_IP=203.0.113.7 SRC_DB="$CP_DB" bash "$CP_SCR" > "$CP_OUT" 2>&1 || CP_PV=$?
+cp_chk "预览模式退出码为 0（离网、不连生产）" "$CP_PV" "0"
+CP_PLAN="$(grep -c 'CAND_PUSH_PLAN' "$CP_OUT" || true)"
+cp_min "预览判定行 CAND_PUSH_PLAN" "$CP_PLAN" "1"
+CP_ARMED="$(grep -c 'CAND_PUSH_ARMED' "$CP_OUT" || true)"
+cp_absent "预览输出里出现 CAND_PUSH_ARMED（ARMED 只准在 -Apply 后）" "$CP_ARMED"
+CP_ROWS="$(grep -c '本机id=' "$CP_OUT" || true)"
+cp_chk "预览清单行数==临时库行数（2）" "$CP_ROWS" "2"
+# 反证 A（常驻）：**显式指定 CAND_IDS** 混进一行 approved ⇒ 必须被本机腿在任何连接之前拒掉
+# （缺省选行只取 proposed，approved 会被静默不选——那是选行口径，不是校验腿；
+#  校验腿钉的是"点名要推的行里混了非 proposed 就整轮拒绝"这条 fail-close）。
+sqlite3 "$CP_DB" "INSERT INTO research_candidates (created_at,kind,status,factors,params,horizon,guard,ir) VALUES ('2026-09-25 12:00:00','factor','approved','[\"T3\"]','{}',5,'strong',0.9);"
+CP_RC=0
+GZ_IP=203.0.113.7 SRC_DB="$CP_DB" CAND_IDS=1,2,3 bash "$CP_SCR" > "$CP_TMP/rej.out" 2>&1 || CP_RC=$?
+cp_chk "点名行混入 approved 后判红（退出码非 0）" "$([ "$CP_RC" -ne 0 ] && echo 1 || echo 0)" "1"
+CP_REJ="$(grep -c '不是 proposed' "$CP_TMP/rej.out" || true)"
+cp_min "拒推原因行（状态校验在导表腿）" "$CP_REJ" "1"
+# 反证 B：来源库不存在 ⇒ 显式失败（绝不"没库＝0 行＝成功"）
+CP_RC=0
+GZ_IP=203.0.113.7 SRC_DB="$CP_TMP/nope.db" bash "$CP_SCR" > "$CP_TMP/nodb.out" 2>&1 || CP_RC=$?
+cp_chk "缺来源库判红（退出码非 0）" "$([ "$CP_RC" -ne 0 ] && echo 1 || echo 0)" "1"
+# 反证 C：空 proposed 集合 ⇒ 空载荷判失败（§MINUTE「0 行不判成功」同族）
+CP_EMPTY="$CP_TMP/empty.db"
+sqlite3 "$CP_EMPTY" "CREATE TABLE research_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', factors TEXT, weights TEXT, metric REAL, ic_mean REAL, ir REAL, avg_excess REAL, horizon INTEGER, reason TEXT, guard TEXT DEFAULT 'standard', params TEXT DEFAULT '');"
+CP_RC=0
+GZ_IP=203.0.113.7 SRC_DB="$CP_EMPTY" bash "$CP_SCR" > "$CP_TMP/empty.out" 2>&1 || CP_RC=$?
+cp_chk "空候选库判红（退出码非 0）" "$([ "$CP_RC" -ne 0 ] && echo 1 || echo 0)" "1"
+CP_E="$(grep -c '载荷为空' "$CP_TMP/empty.out" || true)"
+cp_min "空载荷的显式原因行" "$CP_E" "1"
+
+# ── ⑥ 写后复核 ──
+CP_VERQ="$(grep -c "SELECT status FROM research_candidates WHERE id=?" "$CP_SCR" || true)"
+cp_min "VERIFY 从库里回读 status（不复述刚写的变量）" "$CP_VERQ" "1"
+CP_EQ="$(grep -c 'inserted+dup==total' "$CP_SCR" || true)"
+cp_min "等式复核文案在位（脚本按等式判红）" "$CP_EQ" "1"
+CP_NUM="$(grep -c '\*\[!0-9\]\*' "$CP_SCR" || true)"
+cp_min "远端数字字段先验数字再进算术（非数字一律判红）" "$CP_NUM" "1"
+
+rm -rf "$CP_TMP" 2>/dev/null || true
+
+if [ -z "$CP_ERRS" ]; then
+	echo "ok - §CAND-PUSH 守卫通过（写入口径 5 + 备份先行 4 + 转义链 2 + 预览运行时 4 + 常驻反证 3 组 + 写后复核 3）"
+else
+	echo "--- FAIL: §CAND-PUSH 断言不符:${CP_ERRS}"
+	exit 1
+fi
+
 echo ""
 echo "==> 全部通过"
