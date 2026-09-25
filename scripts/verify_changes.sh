@@ -3035,4 +3035,247 @@ OSUB=$(grep -c 't.Run(' cmd/dataload/minute_sync_test.go || true)
 echo "ok - §MINUTE-OPS 守卫通过（脚本在位+语法 4 + 缺省只预览 6 + ASCII 判据 5 + 计划任务触发锁 6 + 离线实跑 6 + 半态七态联调 14 + 负锁 3 + 运行时实证 2）"
 
 echo ""
+echo "==> 94 §FILL-AMEND-CLI 历史错账改判的正规通道 scripts/amend_fill_guangzhou.sh：缺省只预览（**量出来**的零 POST）+ 动手须 --apply 与 --yes 两个开关 + 令牌只走 stdin + 远端体纯 ASCII + 本地夹具跑通 create→apply→revoke（2026-09-25 owner 令「落笔这件事你来做，全部做完」）..."
+AM_SH=scripts/amend_fill_guangzhou.sh
+AM_SRV_ROUTES=internal/server/server.go
+# ① 在位 / 可执行 / 语法过（这条通道存在的意义就是"不必开浏览器点四下"，所以它自己必须能直接跑）
+{ [ -f "$AM_SH" ] && [ -x "$AM_SH" ]; } \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI $AM_SH 缺失或没有执行位"; exit 1; }
+bash -n "$AM_SH" || { echo "--- FAIL: §FILL-AMEND-CLI $AM_SH 语法不过（bash -n）"; exit 1; }
+# ② 缺省方向＝只预览；写动作要 MODE 与 --yes 两个开关同时给（误敲一个 flag 不能碰到钱账）
+AM_DEF=$(grep -c '^MODE="preview"' "$AM_SH" || true)
+[ "$AM_DEF" = "1" ] \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI MODE 缺省不再是 preview（读到 ${AM_DEF}：缺省即动手＝安全阀失效）"; exit 1; }
+AM_YES_SW=$(grep -c -- '--yes) YES=1' "$AM_SH" || true)
+AM_YES_GUARD=$(grep -c '必须同时给 --yes' "$AM_SH" || true)
+{ [ "$AM_YES_SW" = "1" ] && [ "$AM_YES_GUARD" = "1" ]; } \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 的 --yes 双开关不再唯一（开关=${AM_YES_SW} 守卫=${AM_YES_GUARD}）"; exit 1; }
+# ③ 令牌只走 stdin："$TOKEN" 的每一次展开都只能落在三种形态里——
+#    `printf '%s' "$TOKEN" | …`（送进远端/夹具的标准输入）、泄漏自检的 `grep -aF -- "$TOKEN" "$OUTFILE"`、
+#    以及取到值后的空判 `[ -z "$TOKEN" ]`。出现别的形态（拼进 curl -H / ssh 命令行 / echo）
+#    就等于把管理员凭据打进 ps 与日志——那是本仓口令纪律的一次违例，不是风格问题。
+AM_TOK_BAD=$(grep -nF '"$TOKEN"' "$AM_SH" | grep -v -e 'TOKEN" | ' -e 'TOKEN" "$OUTFILE"' -e '\[ -z "$TOKEN" \]' | wc -l | tr -d ' ' || true)
+[ "${AM_TOK_BAD:-1}" = "0" ] \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 有 ${AM_TOK_BAD} 处令牌变量不在 stdin 腿上（凭据可能进命令行/日志）："; grep -nF '"$TOKEN"' "$AM_SH"; exit 1; }
+# ③′ 反证：上面那条锁自己不是恒绿——造一行"echo 令牌"喂进同一条管道，必须被判出来。
+AM_TOK_PROOF=$(printf '%s\n' '	  echo "$TOKEN" 这是故意造的违例行' \
+	| grep -nF '"$TOKEN"' | grep -v -e 'TOKEN" | ' -e 'TOKEN" "$OUTFILE"' -e '\[ -z "$TOKEN" \]' | wc -l | tr -d ' ' || true)
+[ "${AM_TOK_PROOF:-0}" = "1" ] \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 的令牌形态锁自己失效（反证行被判 ${AM_TOK_PROOF} 处，应为 1：这条锁已经是恒绿摆设）"; exit 1; }
+AM_TOK_PERM=$(grep -c '先 chmod 600' "$AM_SH" || true)
+AM_TOK_TREE=$(grep -c '令牌文件在仓库工作树内' "$AM_SH" || true)
+{ [ "$AM_TOK_PERM" -ge 1 ] && [ "$AM_TOK_TREE" -ge 1 ]; } \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 的令牌门被拆（权限 600 校验=${AM_TOK_PERM}、工作树外校验=${AM_TOK_TREE}：凭据落进工作树就有被 commit 的口子）"; exit 1; }
+# ④ 远端脚本体必须纯 ASCII（掺中文＝GBK 回传乱码＝脚本把"读不到"当"跑过了"）
+#    反证前置：先证明"抽取"这一步真的抽到了两段脚本体（抽不到时非 ASCII 计数恒 0＝锁变摆设）。
+AM_BODY_LINES=$(sed -n '/cat <<PSEOF/,/^PSEOF$/p' "$AM_SH" | wc -l | tr -d ' ' || true)
+{ [ "${AM_BODY_LINES:-0}" -ge 40 ]; } \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 抽不到远端脚本体（读到 ${AM_BODY_LINES} 行，应 ≥40：heredoc 标记被改，下面的 ASCII 锁就成恒绿摆设）"; exit 1; }
+AM_BODY_BAD=$(sed -n '/cat <<PSEOF/,/^PSEOF$/p' "$AM_SH" | LC_ALL=C grep -c '[^ -~]' || true)
+[ "${AM_BODY_BAD:-0}" = "0" ] \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 远端 PowerShell 脚本体掺了 ${AM_BODY_BAD} 行非 ASCII（中文注释/字面量必须挪出 heredoc 或走码位/Base64）"; exit 1; }
+AM_ENC=$(grep -c -- '-EncodedCommand' "$AM_SH" || true)
+# ④′ ASCII 判据自身的反证：BSD grep 没有 -P（PCRE），所以这里用 POSIX 字符范围；
+#     范围写法若在某个平台上不成立，这条反证会立刻红，而不是让 ④ 变成恒绿。
+AM_ASCII_PROOF=$(printf 'a \345\215\226 b\n' | LC_ALL=C grep -c '[^ -~]' || true)
+[ "${AM_ASCII_PROOF:-0}" = "1" ] \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 的 ASCII 判据在本机不成立（含中文样本被判 ${AM_ASCII_PROOF} 行，应为 1：④ 那条锁不可信）"; exit 1; }
+AM_CR=$(grep -c "tr -d '\\\\r'" "$AM_SH" || true)
+{ [ "$AM_ENC" -ge 1 ] && [ "$AM_CR" -ge 1 ]; } \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 的远端执行姿势变了（EncodedCommand=${AM_ENC}、去 CR=${AM_CR}：四层转义与 CRLF 都是实录锤出来的，退回原样必踩）"; exit 1; }
+# ⑤ 不新增任何写能力：只打 HTTP 端点，端点名必须与 server.go 注册行逐字同源（路由改名要立刻红）
+if grep -qE 'sqlite3|UPDATE fills|DELETE FROM fills' "$AM_SH"; then
+	echo '--- FAIL: §FILL-AMEND-CLI 出现直连库或改写成交行的路径（勘误只能是"追加一条决定"，柜台证据不可改写）'; exit 1
+fi
+for amep in '/api/qmt/trades' '/api/qmt/fill-amendments' '/api/qmt/fills/conservation'; do
+	AM_IN_SH=$(grep -cF "$amep" "$AM_SH" || true)
+	AM_IN_SRV=$(grep -cF "$amep" "$AM_SRV_ROUTES" || true)
+	{ [ "$AM_IN_SH" -ge 1 ] && [ "$AM_IN_SRV" -ge 1 ]; } \
+		|| { echo "--- FAIL: §FILL-AMEND-CLI 端点 ${amep} 两侧对不上（脚本 ${AM_IN_SH} 处 / 路由注册 ${AM_IN_SRV} 处：后端改名或脚本自己造口，都会指向不存在的路）"; exit 1; }
+done
+# ⑥ 运行时实证（本地夹具 = 假 admin 服务，只监听 127.0.0.1，不碰生产也不碰任何库文件）：
+#    把 ②③④ 的判据**跑一遍**，尤其是"预览一个 POST 都不发"——静态 grep 证不了这件事。
+AM_TMP=$(mktemp -d)
+cat >"$AM_TMP/stub.py" <<'AMEOF'
+# §FILL-AMEND-CLI 夹具：复刻五个 admin 端点的语义（未鉴权 401 / 同向 400 / 活跃冲突 409），
+# 并把每次 POST 的路径追加进 posts 文件——"预览零 POST"这条断言完全依赖这份记账。
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+tok = open(sys.argv[1]).read().strip()
+posts_path = sys.argv[3]
+FILLS = [{"id": 14, "code": "603468.SH", "side": "买入", "orig_side": "买入", "price": 22.55,
+          "qty": 900, "amount": 20295.0, "traded_at": "2026-09-22 10:08:32", "trade_id": "T14",
+          "amend_key": "t:T14"}]
+AMENDS = []
+
+
+def eff(f):
+    for a in AMENDS:
+        if a["fill_id"] == f["id"] and a["status"] == "applied":
+            return a["new_side"]
+    return f["side"]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def okauth(self):
+        return self.headers.get("Authorization", "") == "Bearer " + tok
+
+    def send(self, code, obj):
+        b = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        if not self.okauth():
+            self.send(401, {"error": "missing authorization token"}); return
+        if self.path.startswith("/api/qmt/trades"):
+            out = [dict(f, side=eff(f)) for f in FILLS]
+            self.send(200, {"ok": "1", "fills": out, "summary": {}}); return
+        if self.path.startswith("/api/qmt/fill-amendments"):
+            self.send(200, {"ok": "1", "amendments": list(AMENDS)}); return
+        if self.path.startswith("/api/qmt/fills/conservation"):
+            # 持仓不变量按"生效方向"重放：603468 记成买入时账上少 900 股（勘误生效即归零）。
+            lines = [{"code": "603468.SH", "replayed_qty": 900, "book_qty": 0, "diff": -900, "note": "stub"}] \
+                if eff(FILLS[0]) == "买入" else []
+            self.send(200, {"ok": "1", "report": {
+                "day": "2026-09-25", "ok": not lines,
+                "applied_amendments": sum(1 for a in AMENDS if a["status"] == "applied"),
+                "position_lines": lines,
+                "cash": {"checked": True, "diff": 0.0, "book_cash": 0.03, "expected_cash": 0.03}}}); return
+        self.send(404, {"error": "no route"})
+
+    def do_POST(self):
+        open(posts_path, "a").write(self.path + "\n")
+        if not self.okauth():
+            self.send(401, {"error": "missing authorization token"}); return
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        try:
+            req = json.loads(raw or b"{}")
+        except Exception:
+            self.send(400, {"error": "bad json"}); return
+        if self.path.endswith("/apply"):
+            aid = int(self.path.split("/")[4])
+            for a in AMENDS:
+                if a["id"] == aid:
+                    if a["status"] != "pending":
+                        self.send(409, {"error": "仅待批准可批准"}); return
+                    a["status"] = "applied"; a["applied_at"] = "2026-09-25 08:00:00"
+                    self.send(200, {"ok": "1", "amendment": a}); return
+            self.send(404, {"error": "not found"}); return
+        if self.path.endswith("/revoke"):
+            aid = int(self.path.split("/")[4])
+            for a in AMENDS:
+                if a["id"] == aid:
+                    a["status"] = "revoked"
+                    self.send(200, {"ok": "1", "amendment": a}); return
+            self.send(404, {"error": "not found"}); return
+        if self.path.endswith("/api/qmt/fill-amendments"):
+            fid, side, reason = req.get("fill_id"), req.get("new_side"), (req.get("reason") or "").strip()
+            if not reason:
+                self.send(400, {"error": "理由必填"}); return
+            if side not in ("买入", "卖出") or side == FILLS[0]["side"]:
+                self.send(400, {"error": "方向非法"}); return
+            for a in AMENDS:
+                if a["fill_id"] == fid and a["status"] != "revoked":
+                    self.send(409, {"error": "已有活跃勘误"}); return
+            AMENDS.append({"id": len(AMENDS) + 1, "fill_id": fid, "code": FILLS[0]["code"], "qty": 900,
+                           "orig_side": FILLS[0]["side"], "new_side": side, "status": "pending",
+                           "operator": "fixture", "created_at": "2026-09-25 08:00:00", "applied_at": ""})
+            self.send(201, {"ok": "1", "amendment": AMENDS[-1]}); return
+        self.send(404, {"error": "no route"})
+
+
+HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
+AMEOF
+printf 'fixture-amend-token-verify-only' >"$AM_TMP/tok"
+chmod 600 "$AM_TMP/tok"
+AM_PORT=$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()')
+python3 "$AM_TMP/stub.py" "$AM_TMP/tok" "$AM_PORT" "$AM_TMP/posts.log" >"$AM_TMP/stub.out" 2>&1 &
+AM_PID=$!
+am_wait=$(python3 - "$AM_PORT" "$AM_TMP/tok" <<'PY' || true
+import sys, time, urllib.request
+port, tokf = sys.argv[1], sys.argv[2]
+tok = open(tokf).read().strip()
+for _ in range(25):
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(
+            "http://127.0.0.1:%s/api/qmt/trades" % port, headers={"Authorization": "Bearer " + tok}))
+        if r.status == 200:
+            print("up"); sys.exit(0)
+    except Exception:
+        time.sleep(0.2)
+print("down"); sys.exit(1)
+PY
+)
+# 夹具自己先自证"未鉴权必 401"：否则后面的"零 POST/改判生效"全都不是在真鉴权下测出来的
+AM_401=$(python3 - "$AM_PORT" <<'PY' || true
+import sys, urllib.error, urllib.request
+try:
+    urllib.request.urlopen("http://127.0.0.1:%s/api/qmt/trades" % sys.argv[1])
+    print("200")
+except urllib.error.HTTPError as e:
+    print(e.code)
+PY
+)
+# 逐条跑用例（结果全部先收下，最后统一判定：任何一条红也保证夹具进程与临时目录被收掉）
+AM_BASE="http://127.0.0.1:${AM_PORT}"
+am_run() { # am_run <令牌文件> <参数...> → 全局 OUT / RC
+	local t="$1"; shift
+	if OUT=$(AMEND_LOCAL_BASE="$AM_BASE" ADMIN_TOKEN_FILE="$t" AMEND_EVIDENCE_DIR="$AM_TMP" "$AM_SH" "$@" 2>&1); then RC=0; else RC=1; fi
+}
+AM_REASON="夹具理由：验证通道，不落生产"
+am_run "$AM_TMP/tok" --fill-id 14 --new-side 卖出 --reason "$AM_REASON";              C1=$RC; O1="$OUT"
+am_run "$AM_TMP/tok" --fill-id 14 --new-side 买入 --reason "$AM_REASON" --apply --yes; C2=$RC; O2="$OUT"
+# 预览 + 同向被拦两条用例跑完，夹具应当一条 POST 都没收到（"缺省只预览"只有在这里才是**量出来**的）
+POSTS_AFTER2=$(cat "$AM_TMP/posts.log" 2>/dev/null | wc -l | tr -d ' ' || true); POSTS_AFTER2=${POSTS_AFTER2:-0}
+am_run "$AM_TMP/tok" --fill-id 14 --new-side 卖出 --reason "$AM_REASON" --apply --yes; C3=$RC; O3="$OUT"
+am_run "$AM_TMP/tok" --fill-id 14 --new-side 卖出 --reason "$AM_REASON" --apply --yes; C4=$RC; O4="$OUT"
+am_run "$AM_TMP/tok" --revoke 1 --yes;                                                C5=$RC; O5="$OUT"
+cp "$AM_TMP/tok" "$AM_TMP/tok_loose" && chmod 644 "$AM_TMP/tok_loose"
+am_run "$AM_TMP/tok_loose" --fill-id 14 --new-side 卖出 --reason "$AM_REASON";         C6=$RC
+am_run "$AM_TMP/no_such_token" --fill-id 14 --new-side 卖出 --reason "$AM_REASON" --apply --yes; C7=$RC; O7="$OUT"
+am_run "$AM_TMP/no_such_token" --fill-id 14 --new-side 卖出 --reason "$AM_REASON";     C8=$RC; O8="$OUT"
+POSTS_TOTAL=$(cat "$AM_TMP/posts.log" 2>/dev/null | wc -l | tr -d ' ' || true); POSTS_TOTAL=${POSTS_TOTAL:-0}
+LEAK=$(grep -rlF 'fixture-amend-token-verify-only' "$AM_TMP" 2>/dev/null | grep -v -e '/tok$' -e '/tok_loose$' | wc -l | tr -d ' ' || true); LEAK=${LEAK:-0}
+kill "$AM_PID" 2>/dev/null || true
+wait "$AM_PID" 2>/dev/null || true
+AM_ERRS=""
+am_chk() { if [ "$2" != "$3" ]; then AM_ERRS="${AM_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+am_chk "夹具未鉴权 401 自证" "$AM_401" "401"
+am_chk "夹具就绪" "$am_wait" "up"
+am_chk "预览退出码" "$C1" "0"
+am_chk "预览打 AMEND_PREVIEW_ONLY" "$(printf '%s' "$O1" | grep -c 'AMEND_PREVIEW_ONLY' || true)" "1"
+am_chk "预览守恒显示改前差异" "$(printf '%s\n' "$O1" | grep -c '^    CONSERVE .*pos_lines=1' || true)" "1"
+am_chk "同向空改判必拦" "$C2" "1"
+am_chk "同向拦在本地（不发 POST）" "$(printf '%s' "$O2" | grep -c '原始方向已经是' || true)" "1"
+am_chk "apply 全链退出码" "$C3" "0"
+am_chk "apply 拿到 applied 回执" "$(printf '%s' "$O3" | grep -c '^    APPLIED id=1 status=applied' || true)" "1"
+am_chk "apply 后守恒归零（改判真的动了读数）" "$(printf '%s' "$O3" | grep -c 'conservation_after=CONSERVE day=2026-09-25 ok=True applied_amend=1 pos_lines=0' || true)" "1"
+am_chk "重复勘误必拦" "$C4" "1"
+am_chk "重复拦在本地（不发 POST）" "$(printf '%s' "$O4" | grep -c '已有活跃勘误' || true)" "1"
+am_chk "revoke 全链退出码" "$C5" "0"
+am_chk "revoke 后守恒翻回改前" "$(printf '%s' "$O5" | grep -c 'conservation_after=CONSERVE day=2026-09-25 ok=False applied_amend=0 pos_lines=1' || true)" "1"
+am_chk "组/其他可读的令牌文件必拒" "$C6" "1"
+am_chk "缺令牌的写模式必非 0（绝不把没做成报成做成）" "$C7" "1"
+am_chk "缺令牌的预览仍按计划打印" "$C8" "0"
+am_chk "缺令牌预览打 AMEND_PLAN_ONLY" "$(printf '%s' "$O8" | grep -c 'AMEND_PLAN_ONLY' || true)" "1"
+# 写动作总共只该有 3 次 POST：create + apply + revoke（预览与两类拦截都必须是 0）
+am_chk "夹具收到的 POST 次数" "$POSTS_TOTAL" "3"
+am_chk "预览+拦截阶段零 POST（第 2 条用例后仍为 0）" "$POSTS_AFTER2" "0"
+am_chk "令牌值出现在留档里（必须 0）" "$LEAK" "0"
+[ -z "$AM_ERRS" ] && { rm -rf "$AM_TMP"; echo "ok - §FILL-AMEND-CLI 守卫通过（脚本在位+语法 2 + 缺省只预览 3 + 令牌门 4（含反证）+ ASCII/转义 5（含两条反证）+ 端点同源 4 + 夹具鉴权 2 + 夹具用例断言 21）"; } \
+	|| { echo "--- FAIL: §FILL-AMEND-CLI 断言不符:${AM_ERRS}"; rm -rf "$AM_TMP"; exit 1; }
+
+echo ""
 echo "==> 全部通过"
