@@ -19,14 +19,14 @@ for a in "$@"; do
   case "$a" in
     -Apply) APPLY=1 ;;
     -Kick)  KICK=1 ;;
-    *) echo "未知参数：$a（只认 -Apply / -Kick）" >&2; exit 1 ;;
+    *) echo "未知参数：${a}（只认 -Apply / -Kick）" >&2; exit 1 ;;
   esac
 done
 
 say() { echo "  $*"; }
 echo "==> 计划"
 say "脚本稳定副本 : $REPO_MAC_DIR/restic_pull_backup.sh → $BIN_DIR/restic_pull_backup.sh"
-say "任务 plist    : $REPO_MAC_DIR/com.quant.backup.plist → $AGENT（先备份旧份）"
+say "任务 plist    : ${REPO_MAC_DIR}/com.quant.backup.plist → ${AGENT}（先备份旧份）"
 say "重载          : launchctl bootout（存在则）→ bootstrap → （-Kick 时）kickstart 补跑一次"
 [ "$APPLY" = "1" ] || { echo "预览模式：本机一个字节没动。动手请加 -Apply。"; exit 0; }
 
