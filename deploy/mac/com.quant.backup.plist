@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- com.quant.backup.plist — Mac 每日备份拉取任务（HARDENING 件1 的 Mac 半边）
      语义：每日 07:00 跑 restic_pull_backup.sh；机器休眠错过则唤醒后立即补跑一次（launchd CalendarInterval 特性）。
-     安装：cp 本文件到 ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.quant.backup.plist
+     安装/升级一律走 ./install_mac_backup_agent.sh -Apply（拷脚本到稳定目录+装 plist+重载，-Kick 补跑一次）。
+     ⚠️ 2026-09-25 实录教训：ProgramArguments 曾直指 Desktop 仓库路径——桌面是 macOS TCC 保护目录，
+     launchd 拉起的 /bin/bash 读不到它：每天 07:00 定时触发、每天 `Operation not permitted`(126) 静默失败，
+     异地副本停在 09-15 十天才被发现（告警代码在脚本体内，脚本没跑＝一声不吭）。
+     脚本稳定副本必须放非保护目录 ~/backups/quant/bin/，仓库版只是源。
      查看：launchctl list | grep com.quant.backup；日志见 ~/backups/quant/pull_backup.log -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -11,7 +15,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/bash</string>
-		<string>/Users/zhangzifei/Desktop/quant-trading-v2/deploy/mac/restic_pull_backup.sh</string>
+		<string>/Users/zhangzifei/backups/quant/bin/restic_pull_backup.sh</string>
 	</array>
 	<key>StartCalendarInterval</key>
 	<dict>

@@ -5,7 +5,9 @@
 #       方向是 Mac→广州出站（复用现成 ssh gz，NAT 无关，无需 Tailscale/远程登录），
 #       传输量=日增量 chunk（首次 ~1.4GB 压缩包，之后每晚几十 MB），restic 自校验完整性。
 # 依赖：ssh 主机别名 gz（~/.ssh/config）、restic（brew）、仓库密码在 macOS 钥匙串 quant-restic-repo-pass。
-# 安装（launchd 每日 07:00；机器睡着则唤醒后补跑）：见 deploy/mac/com.quant.backup.plist。
+# 安装（launchd 每日 07:00；机器睡着则唤醒后补跑）：./install_mac_backup_agent.sh -Apply
+#       （稳定副本在 ~/backups/quant/bin/，launchd 不能直接跑 Desktop 仓库路径——TCC 保护目录，见该脚本头注释）。
+# 升级口径：仓库版是源，改完仓库版重跑 -Apply 同步；直接改稳定副本会下次被覆盖。
 # 失败（快照过期/标记非 ok/copy 失败/check 失败）→ ntfy 告警（备份失败必须有人知道）。
 set -uo pipefail
 
