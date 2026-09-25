@@ -570,14 +570,24 @@ func minuteBarTime(ts string) time.Time {
 }
 
 // coverage 返回整轮观测计数（命中率 = hits/looks），供装配点打日志与近似说明用。
+// 口径：looks＝动量判档被问了几次"这天的 5 分钟 MACD"，hits＝其中答得出（根数够窗口）的次数。
 func (s *storeMinuteMACD) coverage() (looks, hits int, pct float64) {
-	if s == nil {
-		return 0, 0, 0
+	l, h, _, p := s.coverageStats()
+	return l, h, p
+}
+
+// coverageStats 返回全部三个观测计数，供出门文本用。为什么非要多带一个 queries：
+// 2026-09-25 全量重算里两次 all 回放的动量触发数差 2.1×，日线口径下的"判档日"分母也同步漂了约 22%，
+// 只报 hits/looks 分不清"判的次数真变了"还是"缓存命中结构变了"（looks 含缓存命中、queries 只数
+// 真正查库那一次）。两个数一起出门，读者就能判断漂移发生在判档层还是取数层。
+// 观测计数**不参与判红**（纯读数）。
+// English: exposes looks/hits/queries so a coverage shift can be attributed to the judgement layer
+// or the query layer; read-only, never used in a pass/fail decision.
+func (s *storeMinuteMACD) coverageStats() (looks, hits, queries int, pct float64) {
+	if s == nil || s.looks == 0 {
+		return 0, 0, 0, 0
 	}
-	if s.looks == 0 {
-		return 0, 0, 0
-	}
-	return s.looks, s.hits, float64(s.hits) / float64(s.looks) * 100
+	return s.looks, s.hits, s.queries, float64(s.hits) / float64(s.looks) * 100
 }
 
 // Name 战法名（回测报告分组键；与实盘 strategy.SignalMomentum 的显示名同一字面）。
@@ -845,6 +855,18 @@ type Options struct {
 	D1Score   float64 // 外部注入的固定 D1 分（≥0 时使用）
 	Industry  bool    // 是否启用行业过滤/分组
 	DataDir   string  // 战法库目录（applied_factors.json / applied_patterns.json 所在）
+	// AllowEmptyLibrary 显式声明"战法库一条启用规则都没有也要照跑"。缺省 false ⇒ 只要 Strategy
+	// 声明要跑库规则（all|factor|pattern），而库里一条都没加载到，collect 就**直接报错、非 0 退出**，
+	// 不再静默按"0 条线上战法"跑完整轮。（§LIB-GATE 2026-09-25，起因：全量重算时 -strategy all
+	// 未带库副本，日志首行写了 0 条库规则却照常出门一张表，读者把"线上没有战法时动量能拿多少单"
+	// 当成了"线上跑完一轮"的数字——与本仓反复出事的"降级报成功"同型。）
+	// English: opt out of the empty-library hard failure; default off so a replay that claims to
+	// cover the live rule library cannot silently run with zero rules.
+	AllowEmptyLibrary bool
+	// Library 运行期出门事实（collect 装配时写；非配置项）：库目录、目录来源、加载到的因子/形态
+	// 规则条数、零条时的成因。它随报告头一行与排摸产物 JSON 一起出门，让"这轮用的是哪一版战法库"
+	// 跟着数字走，而不是只留在没人读的日志里。
+	Library LibraryLoad
 	// Sweep 非 nil 时进入参数扫参模式（§P2）：全库战法 × 出场/门槛参数网格自动寻优，
 	// 触发一次性预计算 + 逐组合廉价统一出场模拟，产出排名表与 SWEEP_JSON。
 	// English: when set, run the parameter sweep optimizer (see sweep.go).
@@ -931,8 +953,9 @@ func (o *Options) minuteCoverageNote() string {
 	if o.minuteSrc == nil {
 		return "动量 MACD 口径：日线近似（研究库无 minute_klines，未回填）"
 	}
-	looks, hits, pct := o.minuteSrc.coverage()
-	return fmt.Sprintf("动量 MACD 口径：真 5 分钟 %d/%d 判档日（%.1f%%），其余退回日线近似", hits, looks, pct)
+	looks, hits, queries, pct := o.minuteSrc.coverageStats()
+	return fmt.Sprintf("动量 MACD 口径：真 5 分钟 %d/%d 判档日（%.1f%%），其余退回日线近似；查库 %d 次（缓存命中 %d 次）",
+		hits, looks, pct, queries, looks-queries)
 }
 
 // setFallbackPeers 装配兜底互斥的兄弟清单：同一批适配器里**非兜底档**的那些。
@@ -1124,23 +1147,164 @@ func genericReplayExit(ctx *strategy.ExitContext, trailLimit float64, holdLimit 
 	return nil, false
 }
 
+// LibraryLoad 一次回放对「战法库」这条输入的实际读数（§LIB-GATE 出门事实）。
+// 为什么要单独有这一个结构：库里几条规则、这些条数是从哪个目录读来的、读不到时到底为什么读不到，
+// 过去只出现在日志首行的一句话里——而引用数字的人读的是结果表，不是日志。2026-09-25 全量重算就
+// 因此把"这台机器没有线上战法库时动量能拿多少单"（144,420）当成了"线上跑完一轮"的数字（真值
+// 67,925，差 2.1×）。读数随报告头一行与排摸产物 JSON 一起出门，读者拿不到"没带库"这条前提就没法
+// 误用数字。
+// English: what the library input actually resolved to (dir, dir source, rule counts, and — when
+// zero — *why*). Numbers must travel with the premise they were produced under.
+type LibraryLoad struct {
+	Dir      string `json:"dir"`             // 解析后的库目录（空=未指定）
+	DirFrom  string `json:"dir_from"`        // 目录来源：explicit（调用方给的）| env（QUANT_DATA_DIR）| home_default（机器缺省）| unset
+	EntriesF int    `json:"entries_factor"`  // 因子库文件里的条目数（含停用，过滤前）
+	EntriesP int    `json:"entries_pattern"` // 形态库文件里的条目数（含停用，过滤前）
+	// EnabledF/EnabledP＝文件里**标记为启用**的条目数。与 Entries（有没有东西）和 Rules（建成几条
+	// 适配器）三档一起，才把"零条"的四种成因区分开（见 ruleFileReason）。
+	EnabledF int `json:"enabled_factor"`
+	EnabledP int `json:"enabled_pattern"`
+	RulesF   int `json:"factor_rules"`  // 真正建成回放适配器的因子规则数（过滤后）
+	RulesP   int `json:"pattern_rules"` // 真正建成回放适配器的形态规则数（过滤后）
+	// ZeroReason 非空＝本轮声明要跑库规则却一条都没加载到，成因逐字点名（各态不得压成一个"空"），
+	// 并**带侧名前缀**（factor: / pattern:，all 模式两侧都空时两条拼在一起）：
+	// dir_unset / file_missing / file_unreadable / file_blank / no_entries / all_disabled / no_usable_rule。
+	ZeroReason string `json:"zero_reason,omitempty"`
+	// Gate 出门时的门状态：enforced（零条即判红）/ waived（显式放行）/ ok（有条目，门未触发）/
+	// not_applicable（单内置战法回放，本来就不读库）/ candidate_direct_exempt（候选直读，与库无关）。
+	Gate string `json:"gate"`
+}
+
+// String 把读数压成一行可 grep 的出门文本（报告头与夜间任务 result_text 共用一份，不两处各写）。
+func (l LibraryLoad) String() string {
+	if l.ZeroReason != "" {
+		return fmt.Sprintf("战法库读数：dir=%s 来源=%s 因子=%d 形态=%d 成因=%s 门=%s",
+			l.Dir, l.DirFrom, l.RulesF, l.RulesP, l.ZeroReason, l.Gate)
+	}
+	return fmt.Sprintf("战法库读数：dir=%s 来源=%s 因子=%d 形态=%d（文件条目 %d/%d，其中启用 %d/%d）门=%s",
+		l.Dir, l.DirFrom, l.RulesF, l.RulesP, l.EntriesF, l.EntriesP, l.EnabledF, l.EnabledP, l.Gate)
+}
+
+// resolveDirFrom 判定库目录的来源（"读到了什么"必须连"从哪读的"一起出门）。
+// Options.DataDir 由调用方装配，命令行/单子命令的缺省值是空串，故这里只能按"非空即调用方给的"
+// 判第一档，其余两档按环境变量与机器缺省目录逐字比对。
+func resolveDirFrom(dataDir string) string {
+	if dataDir == "" {
+		return "unset"
+	}
+	if env := os.Getenv("QUANT_DATA_DIR"); env != "" && filepath.Clean(env) == filepath.Clean(dataDir) {
+		return "env"
+	}
+	if filepath.Clean(DefaultDataDir()) == filepath.Clean(dataDir) {
+		return "home_default"
+	}
+	return "explicit"
+}
+
+// ruleFileReason 在"一条规则都没加载到"时点名字面成因。四种"空"是**四件不同的事**，修法各异：
+//   - dir_unset / file_missing / file_unreadable：目录没给或指错（研究机上最常见的形态＝根本没带上
+//     线上库副本，正是 2026-09-25 那次数值误用的现场）→ 换目录或走 survey_live_rules.sh 只读副本；
+//   - file_blank：文件存在但零字节（写入被截断／部署链只建了空壳）→ 查落库那一腿；
+//   - no_entries：文件是合法 JSON 数组但里面没条目 → 等审批链产出；
+//   - all_disabled：有条目但全部标记停用 → 有人手工停用了战法，是**业务事实**不是故障；
+//   - no_usable_rule：有启用条目却一条都建不出适配器（条目自身因子集为空＝历史遗留脏数据）→ 修数据。
+//
+// 压成一句"库为空"等于没报：五种情况下该跑的命令完全不同。
+// English: names the literal cause of a zero-rule load; the five cases need different remedies,
+// so they must not collapse into one "empty library" string.
+func ruleFileReason(dataDir, fileName string, entries, enabled, built int) string {
+	if dataDir == "" {
+		return "dir_unset"
+	}
+	st, err := os.Stat(filepath.Join(dataDir, fileName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "file_missing"
+		}
+		return "file_unreadable"
+	}
+	if st.Size() == 0 {
+		return "file_blank"
+	}
+	switch {
+	case entries == 0:
+		return "no_entries"
+	case enabled == 0:
+		return "all_disabled"
+	case built == 0:
+		return "no_usable_rule"
+	}
+	return "unknown" // 到不了：三档读数都非零时门在上一行就放行了。到得了就是读数与装配脱钩，如实报
+}
+
+// libraryGate §LIB-GATE 的唯一判红口：声明要跑库规则却零条即错误，除非显式放行。
+// wantF/wantP 由调用分支决定（all=两侧都要、factor 只要因子、pattern 只要形态），
+// 缺省即红＝**放行必须是显式动作**，与本仓所有运维脚本"缺省只预览"同一方向。
+func (o *Options) libraryGate(ll *LibraryLoad, wantF, wantP bool) error {
+	ll.DirFrom = resolveDirFrom(o.DataDir)
+	if ll.RulesF+ll.RulesP > 0 {
+		ll.Gate = "ok"
+		return nil
+	}
+	// 成因按声明要的两侧各判一次，**各带侧名前缀**拼起来——只跑 factor 时不许被形态库文件缺失带红
+	// （反之亦然）；而 all 模式两侧都空时，去掉前缀去重会把"两侧都判过"这件事抹掉（读者以为只有一侧空）。
+	why := ""
+	if wantF && ll.RulesF == 0 {
+		why = "factor:" + ruleFileReason(o.DataDir, "applied_factors.json", ll.EntriesF, ll.EnabledF, ll.RulesF)
+	}
+	if wantP && ll.RulesP == 0 {
+		r := "pattern:" + ruleFileReason(o.DataDir, "applied_patterns.json", ll.EntriesP, ll.EnabledP, ll.RulesP)
+		if why == "" {
+			why = r
+		} else {
+			why = why + "+" + r
+		}
+	}
+	ll.ZeroReason = why
+	if o.AllowEmptyLibrary {
+		ll.Gate = "waived"
+		return nil
+	}
+	ll.Gate = "enforced"
+	return fmt.Errorf("战法库零条启用规则，回放判红（%s）：目录 %s（来源 %s）下按实盘口径加载到 因子 %d 条 / 形态 %d 条。"+
+		"绝不静默按「0 条线上战法」跑完整轮——那样出门的数字回答的是「线上没有战法时会怎样」，不是「线上跑完一轮」。"+
+		"修法是显式表态：要跑线上战法就 --datadir 指到真有 applied_factors.json/applied_patterns.json 的目录"+
+		"（研究机走 scripts/survey_live_rules.sh 那份只读副本）；确实要在空库上跑就加 --allow-empty-library",
+		why, o.DataDir, ll.DirFrom, ll.RulesF, ll.RulesP)
+}
+
+// libScan loadRuleAdapters 的三档读数：文件里的条目数 / 其中启用数 / 真正建成适配器数。
+// 为什么要三档而不是"成功条数"一个数：判红要说清"为什么零条"，一档分不清"没文件""有文件没条目"
+// "有条目全停用""启用条目自身是脏数据"（见 ruleFileReason）。
+type libScan struct {
+	Entries int
+	Enabled int
+	Built   int
+}
+
 // loadRuleAdapters 从战法库加载规则，每条规则一个 adapter（kind: factor|pattern）。
 // includeDisabled=true 时停用条目也建适配器（strategy-survey 全库排摸用）；
 // 生产回放路径恒传 false = 只加载启用规则，与旧行为一致。
-// English: loads library rules as adapters; when includeDisabled is set, disabled entries are
-// built too (survey-only). Production callers pass false.
-func loadRuleAdapters(kind, dataDir string, includeDisabled bool) ([]adapter, error) {
+// 第二个返回值 libScan 是**过滤前后各档读数**（条目 / 启用 / 建成）：§LIB-GATE 要靠它把"没文件"
+// "文件是空的""有条目但全停用""启用条目自身没带因子集"分成四种成因点名，只回一个切片就得不出区分。
+// English: also returns per-stage counts (entries / enabled / built) so a zero-rule load can be
+// reported with its actual cause instead of a bare "empty library".
+func loadRuleAdapters(kind, dataDir string, includeDisabled bool) ([]adapter, libScan, error) {
 	switch strings.ToLower(kind) {
 	case "factor", "factor_rules", "applied_factors":
 		// §P2-d：直接读库条目以携带规则级出场覆盖（扫参审批后回测立即生效）；
 		// English: read library entries directly so sweep-approved exit overrides apply to replays.
 		entries, err := research.ListAppliedFactorRules(dataDir)
 		if err != nil {
-			return nil, err
+			return nil, libScan{}, err
 		}
+		scan := libScan{Entries: len(entries)}
 		out := make([]adapter, 0, len(entries))
 		for i := range entries {
 			e := &entries[i]
+			if e.Enabled {
+				scan.Enabled++
+			}
 			if (!e.Enabled && !includeDisabled) || len(e.Factors) == 0 {
 				continue
 			}
@@ -1162,16 +1326,21 @@ func loadRuleAdapters(kind, dataDir string, includeDisabled bool) ([]adapter, er
 			}
 			out = append(out, ad)
 		}
-		return out, nil
+		scan.Built = len(out)
+		return out, scan, nil
 	case "pattern", "pattern_rules", "applied_patterns":
 		// §P2-d：同因子分支，直读条目以携带扫参审批的出场覆盖。
 		pentries, perr := research.ListAppliedPatternRules(dataDir)
 		if perr != nil {
-			return nil, perr
+			return nil, libScan{}, perr
 		}
+		pscan := libScan{Entries: len(pentries)}
 		out := make([]adapter, 0, len(pentries))
 		for i := range pentries {
 			e := &pentries[i]
+			if e.Enabled {
+				pscan.Enabled++
+			}
 			if (!e.Enabled && !includeDisabled) || len(e.Conds) == 0 {
 				continue
 			}
@@ -1194,9 +1363,10 @@ func loadRuleAdapters(kind, dataDir string, includeDisabled bool) ([]adapter, er
 			}
 			out = append(out, ad)
 		}
-		return out, nil
+		pscan.Built = len(out)
+		return out, pscan, nil
 	}
-	return nil, fmt.Errorf("未知战法库类型: %s", kind)
+	return nil, libScan{}, fmt.Errorf("未知战法库类型: %s", kind)
 }
 
 // buildAdapters 按 Options 构建回放适配器集合：形态候选直读 / all 全库（库规则+四大内置）/
@@ -1218,6 +1388,10 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 		// 候选直读模式（§8.6-B）：候选 Factors JSON 即 []PatternCond（与 ApplyPatternRule 同映射），
 		// 构造单条规则走与实盘一致的 Evaluate 回放；战法库为空/未审批均不影响。
 		// English: candidate-direct mode — build a single rule from the candidate row and replay it.
+		// 候选直读**不受库门约束**（它回放的是一条未审批候选，与线上战法库有没有内容无关），
+		// 但门状态照样在分支入口就落定——下面的"无条件集跳过"提前返回也要带着它出门，
+		// 否则读者拿到的是一个门状态空白、无从判断与库的关系的读数。
+		o.Library = LibraryLoad{Gate: "candidate_direct_exempt", Dir: o.DataDir, DirFrom: resolveDirFrom(o.DataDir)}
 		c, cerr := db.CandidateByID(o.CandidateID)
 		if cerr != nil {
 			return nil, false, fmt.Errorf("读取候选 #%d 失败: %w", o.CandidateID, cerr)
@@ -1243,13 +1417,27 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 		ads = []adapter{&ruleEvalAdapter{name: rule.Name, ruleID: rule.ID, ps: ps}}
 		log.Printf("候选直读回放：%s 条件=%d", rule.Name, len(rule.Conds))
 	} else if strings.EqualFold(o.Strategy, "all") {
-		fa, ferr := loadRuleAdapters("factor", o.DataDir, o.IncludeDisabled)
+		fa, fsc, ferr := loadRuleAdapters("factor", o.DataDir, o.IncludeDisabled)
 		if ferr != nil {
 			return nil, false, ferr
 		}
-		pa, perr := loadRuleAdapters("pattern", o.DataDir, o.IncludeDisabled)
+		pa, psc, perr := loadRuleAdapters("pattern", o.DataDir, o.IncludeDisabled)
 		if perr != nil {
 			return nil, false, perr
+		}
+		// §LIB-GATE：all 模式声明"跑库规则 + 内置五形态"，库侧读数必须先落进出门事实再过判红门。
+		// 判据用库侧两档之和——**不是**下面拼完内置战法后的 len(ads)：旧代码在 append 之后
+		// 才判 `len(ads)==0`，而 builtins 恒有 5 条，那个分支永远走不到，库空时既不进日志也不报错，
+		// 这正是"静默按零条线上战法跑完整轮"能存在的结构原因。
+		// English: the gate reads the library-side counts, not the post-builtin aggregate — the old
+		// `len(ads)==0` check sat after five builtins were appended and could never fire.
+		o.Library = LibraryLoad{
+			Dir:      o.DataDir,
+			EntriesF: fsc.Entries, EnabledF: fsc.Enabled, RulesF: len(fa),
+			EntriesP: psc.Entries, EnabledP: psc.Enabled, RulesP: len(pa),
+		}
+		if gerr := o.libraryGate(&o.Library, true, true); gerr != nil {
+			return nil, false, gerr
 		}
 		ads = append(fa, pa...)
 		// 四大手写战法 + 动量一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape/momentum）：
@@ -1267,22 +1455,26 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 			}
 			ads = append(ads, ad)
 		}
-		if len(ads) == 0 {
-			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
-			return nil, false, nil
-		}
 		log.Printf("all 回放：%d 条库规则（factor=%d pattern=%d）+ 五形态内置战法（含动量近似回放）",
 			len(fa)+len(pa), len(fa), len(pa))
 	} else if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
-		ra, rerr := loadRuleAdapters(o.Strategy, o.DataDir, o.IncludeDisabled)
+		wantP := strings.EqualFold(o.Strategy, "pattern")
+		ra, sc, rerr := loadRuleAdapters(o.Strategy, o.DataDir, o.IncludeDisabled)
 		if rerr != nil {
 			return nil, false, rerr
 		}
-		ads = ra
-		if len(ads) == 0 {
-			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
-			return nil, false, nil
+		// §LIB-GATE 单侧版：只声明一侧时，另一侧库文件存不存在与本轮回放无关（成因判定由
+		// libraryGate 的 wantF/wantP 参数负责，不许被对侧文件缺失带红）。
+		o.Library = LibraryLoad{Dir: o.DataDir}
+		if wantP {
+			o.Library.EntriesP, o.Library.EnabledP, o.Library.RulesP = sc.Entries, sc.Enabled, len(ra)
+		} else {
+			o.Library.EntriesF, o.Library.EnabledF, o.Library.RulesF = sc.Entries, sc.Enabled, len(ra)
 		}
+		if gerr := o.libraryGate(&o.Library, !wantP, wantP); gerr != nil {
+			return nil, false, gerr
+		}
+		ads = ra
 		log.Printf("战法库已加载 %d 条启用规则", len(ads))
 	} else {
 		needsInd(o.Strategy)
@@ -1291,6 +1483,8 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 			return nil, false, aerr
 		}
 		ads = []adapter{ad}
+		// 单内置战法回放本来就不读库：门状态记 not_applicable，出门时读者一眼看到"这轮与库无关"。
+		o.Library = LibraryLoad{Gate: "not_applicable", Dir: o.DataDir, DirFrom: resolveDirFrom(o.DataDir)}
 	}
 	return ads, useIndustry, nil
 }
@@ -1423,21 +1617,27 @@ func BuiltinDisplayName(id string) string {
 	return ad.Name()
 }
 
-// approxNote 出门文本 = 静态近似说明 + 本轮**实测**的分钟口径覆盖率。
+// approxNote 出门文本 = 静态近似说明 + 本轮**实测**的分钟口径覆盖率 + 本轮**实测**的兜底互斥兄弟集。
 // 为什么必须拼实测值而不是把那句话改写成"已经用真 5 分钟了"：同一句声明在"回填跑完"和
 // "库是空的"两种运行里长得不一样，但报告上看起来一样——本仓反复出事的"降级报成功"形态。
-// 覆盖率读数来自 storeMinuteMACD 的观测计数（不参与判红）。
+// §LIB-GATE 追加兄弟集尺寸：动量是兜底档，兄弟集（同批非兜底档战法，含库规则 fac_*/pat_*）当日
+// 出过信号它就不入场，所以**兄弟越多动量越少**。2026-09-25 两次 all 回放的动量触发数差 2.1×，
+// 根因就在这条判据吃到的战法集合不同（0 条库规则 vs 3 条）。数字出门口径必须自带"当时有几条兄弟"，
+// 否则两张表的动量行会被当成同一件事。覆盖率读数来自 storeMinuteMACD 的观测计数（不参与判红）。
 func (o *Options) approxNote(id string) string {
 	note := ReplayApproxNote(id)
 	if id != "momentum" || note == "" {
 		return note
 	}
+	// 兄弟集实测尺寸（运行期装配，非配置项）：库规则条数 + 内置非兜底档数一起写，读者能反推口径。
+	note += fmt.Sprintf("; sibling set actually loaded this run: %d non-fallback adapter(s) = library {factor=%d pattern=%d} + builtins (%s gate=%s)",
+		len(o.fallbackPeers), o.Library.RulesF, o.Library.RulesP, o.Library.Dir, o.Library.Gate)
 	if o.minuteSrc == nil {
 		return note + "; minute-basis coverage: NONE (research DB has no minute_klines rows -> every judgement day used the daily MACD approximation above)"
 	}
-	looks, hits, pct := o.minuteSrc.coverage()
-	return fmt.Sprintf("%s; minute-basis coverage: %d/%d judgement days used real 5-minute MACD (%.1f%%), the rest fell back to the daily approximation above",
-		note, hits, looks, pct)
+	looks, hits, queries, pct := o.minuteSrc.coverageStats()
+	return fmt.Sprintf("%s; minute-basis coverage: %d/%d judgement days used real 5-minute MACD (%.1f%%, %d DB queries), the rest fell back to the daily approximation above",
+		note, hits, looks, pct, queries)
 }
 
 // ReplayApproxNote 返回某内置战法回放适配器的**近似口径说明**（空串＝无近似/非内置）。
@@ -1510,11 +1710,14 @@ func (o *Options) RunCollect() ([]ReplayStat, error) {
 }
 
 // Run 执行回放回测主流程（汇总报告打印到 stdout，供 worker 解析 result_text）。
+// §LIB-GATE：战法库读数打在报告**第一行**——引用数字的人读的是这份出门文本，不是 stderr 日志；
+// 前提不进 stdout 就等于前提没出门（2026-09-25 那次误用的正是只写在日志首行的一句话）。
 func (o *Options) Run() error {
 	summaries, _, stockCount, err := o.collect()
 	if err != nil {
 		return err
 	}
+	fmt.Printf("%s\n", o.Library.String())
 	printReports(summaries, stockCount)
 	return nil
 }
@@ -1576,6 +1779,9 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 	if berr != nil {
 		return nil, nil, 0, berr
 	}
+	// §LIB-GATE：库读数随日志出门（Run 另外把它打进 stdout 报告首行，survey 打进产物 JSON 的
+	// library 字段——三条出口共用同一个 String()，不各处重写一句话）。
+	log.Printf("§LIB-GATE %s", o.Library.String())
 	// 兜底档战法（动量）在场时装配跨战法互斥清单——没有兜底档时保持 nil，
 	// 其余战法的回放路径一次判断都不会多走。
 	if hasFallbackTier(ads) {

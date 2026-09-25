@@ -909,6 +909,13 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 		// 替代字母序 300 截断，回归验证覆盖真实可用交易标的。
 		// §节流：replay_throttle_ms>0 时逐股 sleep 摊平全量回放对 2核4G 服务器的瞬时
 		// CPU/内存挤压（盘后十几个小时足够，拉长时长换稳定性）。
+		// §LIB-GATE（2026-09-25）：这一腿缺省**不带** allow_empty_library——战法库一条启用规则都没
+		// 加载到时（数据目录里 applied_*.json 缺失/被清空/全停用）当晚任务判红，而不是静默跑完一整轮
+		// 只回显"内置五形态"的数字。那是研究侧 09-25 动量数字差 2.1× 的同型事故：夜间回归验证如果
+		// 吃不到线上战法，它回答的就是"线上没有战法时会怎样"，不是"线上跑完一轮"。
+		// 要显式放行请在 scheduler 配置里补 allow_empty_library 并进 payload，不要靠改判据。
+		// English: the nightly replay is gated — a zero-rule library fails the job instead of
+		// silently producing built-in-only numbers.
 		// English: replays every enabled factor+pattern rule on the quality-screened full universe —
 		// no more maxstocks=300 alphabetical truncation; optional per-stock throttle to flatten
 		// instantaneous load over the long post-close window.

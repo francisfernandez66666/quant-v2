@@ -26,6 +26,11 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 	dataDir := fs.String("datadir", "", "战法库目录 applied_*.json（空=默认数据目录）")
 	quality := fs.Bool("quality", false, "全量回放用质控池替代 StockCodes()（剔 ST/退市/多年亏损/地量股）")
 	throttleMs := fs.Int("throttle-ms", 0, "逐股节流毫秒（>0 时每处理一只股票 sleep，摊平全量回放瞬时负载）")
+	// §LIB-GATE：库零条启用规则缺省即判红；本开关是唯一的正规出口，且必须在命令行走位显式写出来
+	// （研究结论里引用"空库口径"的数字时，这条开关就是那份前提的机器凭证）。
+	// English: opt-out for the zero-rule library gate — it must appear literally on the command line.
+	allowEmpty := fs.Bool("allow-empty-library", false,
+		"§LIB-GATE 放行开关：战法库一条启用规则都没加载到时仍照跑（缺省 false=判红；跑线上战法请用 --datadir 指向含 applied_*.json 的目录，别用本开关）")
 	fs.Parse(args)
 
 	if *dataDir == "" {
@@ -36,15 +41,16 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 	}
 	// 组装回放选项：DB 路径/区间/战法/标的数/D1/行业/节流等，可选叠加质量筛查。
 	o := &btreplay.Options{
-		DBPath:     dbPath,
-		Start:      *start,
-		End:        *end,
-		Strategy:   *strategy,
-		MaxStocks:  *maxStocks,
-		D1Score:    *d1,
-		Industry:   *industry,
-		DataDir:    *dataDir,
-		ThrottleMs: *throttleMs,
+		DBPath:            dbPath,
+		Start:             *start,
+		End:               *end,
+		Strategy:          *strategy,
+		MaxStocks:         *maxStocks,
+		D1Score:           *d1,
+		Industry:          *industry,
+		DataDir:           *dataDir,
+		ThrottleMs:        *throttleMs,
+		AllowEmptyLibrary: *allowEmpty,
 	}
 	if *quality {
 		sc := store.DefaultQualityScreen()

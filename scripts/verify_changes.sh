@@ -52,6 +52,17 @@
 #       两条同口径：缺省只预览（预览一次网都不碰）、动手须显式 -Apply、BatchMode 预探测不挂起、
 #       判据全走纯 ASCII 锚点行（Go 侧新增 MinuteStats.ASCII() 与 MINUTE-SYNC START/PROGRESS/SUMMARY），
 #       日志"没有 SUMMARY"一律判未收尾——半态（进程没了/GBK 把锚点行吞掉半截）绝不读成成功（见 93）
+#   §FILL-AMEND-CLI 历史错账改判的正规通道 scripts/amend_fill_guangzhou.sh：缺省只预览（量出来的零 POST）、
+#       动手须 --apply 与 --yes 两个开关同时给、令牌只走 stdin、远端体纯 ASCII，
+#       并用本地夹具真跑通 create→apply→revoke 与守恒翻转（见 94）
+#   §LIB-GATE 战法库零条启用规则即判红（2026-09-25 缺陷：全量回放没带线上战法库副本时，
+#       会静默按"零条线上战法"跑完一整轮，出门的数字被当成线上口径引用）：
+#       ① 库读数（目录/来源/条目·启用·建成三段计数/零条成因/门状态）随回放报告与排摸产物 JSON 出门；
+#       ② 声明跑库规则却零条即判红，唯一正规出口是命令行 --allow-empty-library（或 payload 同名键），
+#          放行后成因读数仍随行打印——放行不等于抹掉事实；
+#       ③ 死分支负锁（旧代码在追加内置五形态之后才判 len(ads)==0，永远走不到）+ 门测试 + §95；
+#       ④ 研究驱动脚本在开算前打 LIB_PREMISE 逐侧读数，零可用条目直接失败、副本解析不了也失败
+#          （绝不把"取回来的东西坏了"折成"现网没战法"）（见 95）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -3276,6 +3287,181 @@ am_chk "预览+拦截阶段零 POST（第 2 条用例后仍为 0）" "$POSTS_AFT
 am_chk "令牌值出现在留档里（必须 0）" "$LEAK" "0"
 [ -z "$AM_ERRS" ] && { rm -rf "$AM_TMP"; echo "ok - §FILL-AMEND-CLI 守卫通过（脚本在位+语法 2 + 缺省只预览 3 + 令牌门 4（含反证）+ ASCII/转义 5（含两条反证）+ 端点同源 4 + 夹具鉴权 2 + 夹具用例断言 21）"; } \
 	|| { echo "--- FAIL: §FILL-AMEND-CLI 断言不符:${AM_ERRS}"; rm -rf "$AM_TMP"; exit 1; }
+
+echo ""
+echo "==> 95 §LIB-GATE 战法库零条启用规则即判红：库读数随报告/排摸产物出门 + 缺省判红（唯一出口是显式开关）+ 用例 + 研究驱动脚本把前提写在开算之前（2026-09-25 缺陷「全量回放如果没带上线上战法库的副本，会静默按零条线上战法跑完一整轮」，owner 令「按四层改」）..."
+LG_SRC=internal/btreplay/replay.go
+LG_BTS=cmd/research/btstrategy.go
+LG_SVY=cmd/research/survey.go
+LG_TSK=cmd/research/runtask.go
+LG_DRV=scripts/survey_live_rules.sh
+LG_SVT=cmd/research/survey_test.go
+# 运维锚点行的正锁字面量：三处（驱动脚本 grep -E / Go 用例正则 / survey 拼串）必须同源。
+# 这里带 ^ 是脚本与 Go 用例共用的那一串；拼串侧另用 "survey_library gate= 单独锁（见 ③）。
+LG_ERE='^survey_library gate=[a-z_]+ factor_rules=[0-9]+ pattern_rules=[0-9]+ entries=[0-9]+/[0-9]+ enabled=[0-9]+/[0-9]+ dir_from=[a-z_]+ zero_reason='
+LG_ERRS=""
+lg_chk() { if [ "$2" != "$3" ]; then LG_ERRS="${LG_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+lg_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then LG_ERRS="${LG_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+# 子串判据一律用 case 而不是 grep：本段是"运行一次真 CLI"的实证，grep 的退出码在 set -e 下
+# 只会把结论变成"中止"，而 §89 已经为这件事付过一轮学费。
+lg_has() { case $LG_OUT in *"$2"*) echo 1 ;; *) echo 0 ;; esac; }
+
+# ── ① 门的结构锁：判红/放行/正常三种门态各只有一处写入点，且"库侧读数"必须先于内置战法拼装 ──
+LG_FN=$(grep -cF 'func (o *Options) libraryGate(' "$LG_SRC" || true)
+LG_CALL=$(grep -cF 'o.libraryGate(&o.Library' "$LG_SRC" || true)
+LG_RED=$(grep -cF 'll.Gate = "enforced"' "$LG_SRC" || true)
+LG_WAIV=$(grep -cF 'll.Gate = "waived"' "$LG_SRC" || true)
+LG_OKG=$(grep -cF 'll.Gate = "ok"' "$LG_SRC" || true)
+LG_NA=$(grep -cF 'Gate: "not_applicable"' "$LG_SRC" || true)
+LG_CAND=$(grep -cF 'Gate: "candidate_direct_exempt"' "$LG_SRC" || true)
+lg_chk "库门函数唯一" "$LG_FN" "1"
+lg_chk "库门调用点（all + 单侧）" "$LG_CALL" "2"
+lg_chk "判红态写入点唯一" "$LG_RED" "1"
+lg_chk "放行态写入点唯一" "$LG_WAIV" "1"
+lg_chk "正常态写入点唯一" "$LG_OKG" "1"
+lg_chk "单内置战法豁免标注唯一" "$LG_NA" "1"
+lg_chk "候选直读豁免标注唯一" "$LG_CAND" "1"
+# 负锁（本缺陷的结构根因）：all 模式旧代码把"一条规则都没装配"的判断写在**追加内置五形态之后**，
+# 而 builtins 恒有 5 条 ⇒ 那个分支永远走不到，库空时既不报错也不留痕。它一旦被抄回来，
+# 「静默按零条线上战法跑完一轮」就原地复活。
+LG_DEAD=$(grep -cF 'if len(ads) == 0 {' "$LG_SRC" || true)
+lg_chk "负锁：append 内置之后才判空的死分支不得复活" "$LG_DEAD" "0"
+
+# ── ② 零条成因必须齐备：六种成因对应六种完全不同的修法，压成一个"库是空的"就派错工 ──
+LG_MISS=""
+for lgc in dir_unset file_missing file_unreadable file_blank no_entries all_disabled no_usable_rule unknown; do
+	lgcn=$(grep -cF "\"$lgc\"" "$LG_SRC" || true)
+	[ "${lgcn:-0}" -ge 1 ] || LG_MISS="${LG_MISS} ${lgc}"
+done
+[ -z "$LG_MISS" ] || LG_ERRS="${LG_ERRS}
+  · 零条成因缺失:${LG_MISS}"
+
+# ── ③ 出门事实：报告首行 / 日志 / 排摸锚点三条腿，且锚点拼串只准一处（第二处必然漂移） ──
+LG_PUB=$(grep -cF 'fmt.Printf("%s\n", o.Library.String())' "$LG_SRC" || true)
+LG_LOG=$(grep -cF 'log.Printf("§LIB-GATE %s"' "$LG_SRC" || true)
+LG_ADEF=$(grep -cF 'func libraryAnchorLine(' "$LG_SVY" || true)
+LG_AUSE=$(grep -cF 'libraryAnchorLine(art.Library)' "$LG_SVY" || true)
+LG_AFMT=$(grep -cF '"survey_library gate=' "$LG_SVY" || true)
+lg_chk "回放报告首行打库读数" "$LG_PUB" "1"
+lg_chk "日志行打库读数" "$LG_LOG" "1"
+lg_chk "锚点行拼串函数唯一" "$LG_ADEF" "1"
+lg_chk "锚点行两处出口（表头 + 收尾）" "$LG_AUSE" "2"
+lg_chk "锚点字面量只在拼串函数里" "$LG_AFMT" "1"
+# 跨语言同源：驱动脚本与 Go 用例里那串正锁必须逐字符相同（任一侧改格式，另一侧立刻红）。
+LG_ERE_DRV=$(grep -cF "$LG_ERE" "$LG_DRV" || true)
+LG_ERE_TST=$(grep -cF "$LG_ERE" "$LG_SVT" || true)
+lg_chk "运维正锁与驱动脚本同源" "$LG_ERE_DRV" "1"
+lg_chk "运维正锁与 Go 用例同源" "$LG_ERE_TST" "1"
+
+# ── ④ 放行开关的三个出口 + 负锁：仓库内不许有第二处代传 ──
+LG_SW1=$(grep -cF 'fs.Bool("allow-empty-library"' "$LG_BTS" || true)
+LG_SW2=$(grep -cF 'fs.Bool("allow-empty-library"' "$LG_SVY" || true)
+LG_W1=$(grep -cF 'AllowEmptyLibrary: *allowEmpty' "$LG_BTS" || true)
+LG_W2=$(grep -cF 'AllowEmptyLibrary: *allowEmpty' "$LG_SVY" || true)
+LG_W3=$(grep -cF 'AllowEmptyLibrary: payloadBool(p, "allow_empty_library")' "$LG_TSK" || true)
+lg_chk "backtest-strategy 有放行开关" "$LG_SW1" "1"
+lg_chk "strategy-survey 有放行开关" "$LG_SW2" "1"
+lg_chk "backtest-strategy 已接线" "$LG_W1" "1"
+lg_chk "strategy-survey 已接线" "$LG_W2" "1"
+lg_chk "run-task 从 payload 读取" "$LG_W3" "1"
+# 负锁：夜间任务链里不许预置放行（缺省必须走判红）。带引号的键出现一次＝只有 runtask 的读取端；
+# 多出来一处就是某个调度侧开始替 owner 表态了。
+LG_PRESET=$(grep -rn '"allow_empty_library"' --include='*.go' --include='*.json' internal cmd scripts 2>/dev/null | grep -v '_test.go' | grep -v 'runtask.go' | wc -l | tr -d ' ' || true)
+lg_chk "负锁：调度/装配侧不得预置放行键" "${LG_PRESET:-0}" "0"
+
+# ── ⑤ 运行时实证：真二进制 × 六种库形态（门只读代码不算数，读到什么才算数） ──
+LG_TMP=$(mktemp -d /tmp/libgate-XXXXXX)
+LG_DB="$LG_TMP/empty.db"
+: > "$LG_DB"
+mkdir -p "$LG_TMP/nolib" "$LG_TMP/alldis" "$LG_TMP/withlib"
+# 夹具条目形状 = AppliedFactorEntry 的 JSON 契约（weights/directions 是 map 不是数组；
+# adj_basis 必须等于当前口径，否则条目被 §ADJ-BASIS-2 判 stale，成因就成了另一种）。
+lg_entry() {
+	printf '%s\n' '[{"id":"fac_lg","name":"gate-fixture","enabled":'"$1"',"candidate_id":998,"factors":["vol_20d"],"weights":{"vol_20d":1.0},"directions":{"vol_20d":1},"buy_threshold":60,"horizon":5,"ir":1.2,"excess":0.05,"adj_basis":"hfq-forward-fill-1"}]'
+}
+lg_entry false > "$LG_TMP/alldis/applied_factors.json"
+lg_entry true > "$LG_TMP/withlib/applied_factors.json"
+# 形态侧留一份"文件在、内容是空数组"的副本：现网最常见就是这种（从未审批过形态条目），
+# 它和"文件根本没有"是两种成因（no_entries vs file_missing），⑥ 用例正是拿它验证侧名与成因。
+printf '[]\n' > "$LG_TMP/withlib/applied_patterns.json"
+LG_BIN="$LG_TMP/research"
+if ! go build -o "$LG_BIN" ./cmd/research; then
+	echo "--- FAIL: §LIB-GATE 运行时实证的前置构建失败（研究二进制建不出来，下面的六态用例全部没跑）"
+	rm -rf "$LG_TMP"
+	exit 1
+fi
+lg_run() {
+	LG_C=0
+	if LG_OUT=$("$LG_BIN" --db "$LG_DB" backtest-strategy "$@" 2>&1); then
+		LG_C=0
+	else
+		LG_C=$?
+	fi
+}
+lg_run -strategy all -datadir "$LG_TMP/nolib" -start 20260901 -end 20260910 -maxstocks 1
+lg_chk "①空库判红退出码" "$LG_C" "1"
+lg_chk "①空库成因带两侧侧名" "$(lg_has "$LG_OUT" '回放判红（factor:file_missing+pattern:file_missing）')" "1"
+lg_chk "①空库读数回显目录来源" "$(lg_has "$LG_OUT" '来源 explicit')" "1"
+lg_run -strategy all -datadir "$LG_TMP/nolib" -allow-empty-library -start 20260901 -end 20260910 -maxstocks 1
+lg_chk "②显式放行后照跑" "$LG_C" "0"
+lg_chk "②放行后门态=waived" "$(lg_has "$LG_OUT" '门=waived')" "1"
+# 反证（放行不等于抹掉事实）：waived 那一行仍必须带着"其实一条都没加载到"的成因读数。
+lg_chk "②放行后成因仍随读数出门" "$(lg_has "$LG_OUT" '成因=factor:file_missing+pattern:file_missing')" "1"
+lg_run -strategy all -datadir "$LG_TMP/alldis" -start 20260901 -end 20260910 -maxstocks 1
+lg_chk "③全停用判红" "$LG_C" "1"
+lg_chk "③成因=all_disabled" "$(lg_has "$LG_OUT" 'factor:all_disabled')" "1"
+lg_run -strategy all -datadir "$LG_TMP/withlib" -start 20260901 -end 20260910 -maxstocks 1
+lg_chk "④有启用规则即绿" "$LG_C" "0"
+lg_chk "④门态=ok" "$(lg_has "$LG_OUT" '门=ok')" "1"
+lg_chk "④三段读数出门" "$(lg_has "$LG_OUT" '文件条目 1/0')" "1"
+lg_run -strategy momentum -datadir "$LG_TMP/nolib" -start 20260901 -end 20260910 -maxstocks 1
+lg_chk "⑤单内置战法不受库门约束" "$LG_C" "0"
+lg_chk "⑤标注=not_applicable" "$(lg_has "$LG_OUT" '门=not_applicable')" "1"
+lg_run -strategy pattern -datadir "$LG_TMP/withlib" -start 20260901 -end 20260910 -maxstocks 1
+lg_chk "⑥单侧判据判红" "$LG_C" "1"
+lg_chk "⑥只报本侧成因" "$(lg_has "$LG_OUT" '回放判红（pattern:no_entries）')" "1"
+# 反证：本轮没要求因子侧，对侧文件明明有货也不许被拖进成因（把两侧压成一团＝读的人分不清修哪一侧）。
+lg_chk "⑥负锁：单侧判据不得带上对侧" "$(lg_has "$LG_OUT" 'factor:')" "0"
+rm -rf "$LG_TMP"
+
+# ── ⑥ 用例面下限：门测试 + 锚点契约测试必须真跑到（`ok` 对"没测试可跑"同样成立，故数 RUN 行） ──
+LG_GT=$(go test -count=1 ./internal/btreplay/ -run 'TestLibraryGate|TestLibraryReadings|TestDirFromClassification' -v 2>&1 | grep -c '^=== RUN' || true)
+LG_GF=$(go test -count=1 ./internal/btreplay/ -run 'TestLibraryGate|TestLibraryReadings|TestDirFromClassification' 2>&1 | grep -cE 'FAIL|no test files' || true)
+LG_ST=$(go test -count=1 ./cmd/research/ -run 'TestStrategySurveyArtifact|TestLibraryAnchorLineContract' -v 2>&1 | grep -c '^=== RUN' || true)
+LG_SF=$(go test -count=1 ./cmd/research/ -run 'TestStrategySurveyArtifact|TestLibraryAnchorLineContract' 2>&1 | grep -cE 'FAIL|no test files' || true)
+lg_min "btreplay 库门用例数下限" "$LG_GT" "13"
+lg_chk "btreplay 库门用例跑绿" "$LG_GF" "0"
+lg_min "survey 出门/锚点用例下限" "$LG_ST" "2"
+lg_chk "survey 出门/锚点用例跑绿" "$LG_SF" "0"
+
+# ── ⑦ 驱动脚本（第四层）：前提在开算前落纸面，零可用条目直接失败，绝不"跑几十分钟再发现库是空的" ──
+bash -n "$LG_DRV" || { echo "--- FAIL: §LIB-GATE $LG_DRV 语法不过（bash -n）"; exit 1; }
+LG_D_SCAN=$(grep -cF 'lib_scan() {' "$LG_DRV" || true)
+LG_D_PRINT=$(grep -cF 'echo "   LIB_PREMISE $f.json ${SCAN}"' "$LG_DRV" || true)
+LG_D_PARSE=$(grep -cF '副本无法解析' "$LG_DRV" || true)
+LG_D_ZERO=$(grep -cF '没有任何可用战法条目' "$LG_DRV" || true)
+LG_D_APPLIED=$(grep -cF -- '--applied "$RULES_DIR"' "$LG_DRV" || true)
+LG_D_ANCHOR=$(grep -cF 'survey_library gate=' "$LG_DRV" || true)
+lg_chk "前提扫描函数唯一" "$LG_D_SCAN" "1"
+lg_chk "LIB_PREMISE 逐侧打印" "$LG_D_PRINT" "1"
+lg_chk "解析失败不折成空库" "$LG_D_PARSE" "1"
+lg_chk "零可用条目判失败" "$LG_D_ZERO" "1"
+lg_chk "排摸必须显式带 --applied" "$LG_D_APPLIED" "1"
+lg_min "驱动脚本核锚点行" "$LG_D_ANCHOR" "1"
+# 负锁：驱动脚本自己永远不许代传放行（真要跑"空库对照口径"，得由人在命令行上显式表态）。
+LG_D_WAIVE=$(grep -nF -- '--allow-empty-library' "$LG_DRV" | grep -v '^[0-9]*:[[:space:]]*#' | grep -v 'echo ' | wc -l | tr -d ' ' || true)
+lg_chk "负锁：驱动脚本不得代传 --allow-empty-library" "${LG_D_WAIVE:-0}" "0"
+
+if [ -z "$LG_ERRS" ]; then
+	rm -rf "$LG_TMP"
+	echo "ok - §LIB-GATE 守卫通过（门结构 7 + 死分支负锁 1 + 成因齐备 1 + 出门三腿 6 + 跨语言同源 2 + 放行出口 5 + 调度侧预置负锁 1 + 运行时六态实证 17 + 用例下限 4 + 驱动脚本 7）"
+else
+	echo "--- FAIL: §LIB-GATE 断言不符:${LG_ERRS}"
+	rm -rf "$LG_TMP"
+	exit 1
+fi
 
 echo ""
 echo "==> 全部通过"

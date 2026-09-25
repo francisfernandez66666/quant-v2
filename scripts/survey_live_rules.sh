@@ -28,6 +28,11 @@
 #   SURVEY_OUT       产物目录（默认 /tmp/survey_live_rules，每次清空重建）
 # 退出码：0=排摸表已产出；非 0=预探测/拉取/构建/计算任一环节失败（不回退成"看起来成功"，
 #         本仓库 §M8/§N-6 主题即「降级报成功」——这里刻意让失败可见）。
+# §LIB-GATE（2026-09-25）加的两道：① 拉取后先打 `LIB_PREMISE <文件> entries=… enabled=… usable=…`，
+#      两侧 usable 之和为 0 就直接失败（不进几十分钟回放）；副本解析不了也判失败，不折成"空库"。
+#   ② 收尾多核一条 `survey_library gate=… factor_rules=… …` 锚点行——排摸数字必须带着
+#      "这轮吃到了哪些战法"这条前提出门（缺该行同样非 0 退出）。
+#      真要跑"零条线上战法"的对照口径，得显式给 research 传 --allow-empty-library，本脚本**不代传**。
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -76,6 +81,49 @@ if [ "$pulled" = 0 ]; then
   exit 1
 fi
 
+# §LIB-GATE（2026-09-25）前提先落在纸面：拉来的副本里各有几条条目、几条处于启用态，开算之前就打印。
+# 为什么这一步就要：判红门在 btreplay 装配适配器处才响（本脚本此时已经花了拉取+构建的时间），
+# 而"这台机器/这一份副本到底有没有线上战法"正是这批数字最容易被忽略的前提——2026-09-25 那次
+# 动量数字差 2.1× 的根源就在这条前提上。两侧都零条时**直接失败**，不进几十分钟的回放。
+lib_scan() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    raw = open(sys.argv[1], encoding='utf-8').read().strip()
+    d = json.loads(raw) if raw else []
+    if isinstance(d, dict):  # 旧版单对象格式：按一条条目算
+        d = [d]
+    en = sum(1 for e in d if e.get('enabled'))
+    usable = sum(1 for e in d if e.get('enabled') and (e.get('factors') or e.get('conds')))
+    print(f"entries={len(d)} enabled={en} usable={usable}")
+except Exception as exc:  # 读法失败不许伪装成"零条"，那会把"文件坏了"报成"现网没战法"
+    print(f"entries=-1 enabled=-1 usable=-1 err={type(exc).__name__}")
+PY
+}
+ENABLED_TOTAL=0
+for f in applied_factors applied_patterns; do
+  if [ -f "$RULES_DIR/$f.json" ]; then
+    SCAN="$(lib_scan "$RULES_DIR/$f.json" || true)"
+  else
+    SCAN="absent"
+  fi
+  echo "   LIB_PREMISE $f.json ${SCAN}"
+  N="$(printf '%s' "$SCAN" | tr ' ' '\n' | grep '^usable=' | cut -d= -f2 || true)"
+  # usable=-1 = 副本读不出（文件坏了/编码不对），绝不能折成 0 计入"现网没战法"——那是把
+  # "取回来的东西有问题"报成"线上确实没有战法"，两种情形的修法完全相反。
+  if [ "$N" = "-1" ]; then
+    echo "X 拉来的副本无法解析（$f.json：${SCAN}）——判失败，不按空库处理。" >&2
+    exit 1
+  fi
+  case "$N" in ''|*[!0-9]*) N=0 ;; esac
+  ENABLED_TOTAL=$((ENABLED_TOTAL + N))
+done
+if [ "$ENABLED_TOTAL" = 0 ]; then
+  echo "X 拉来的现网副本里没有任何可用战法条目（两侧 usable 之和为 0）：排摸会走进 btreplay 的库判红门。" >&2
+  echo "  先确认现网数据目录里 applied_*.json 的真实内容，再决定是修拉取还是接受"空库口径"（后者需显式 --allow-empty-library，且数字不得当作线上口径引用）。" >&2
+  exit 1
+fi
+
 echo "==> [3/4] 本地构建当前 HEAD 的 research 二进制（新口径）"
 BIN="$SURVEY_OUT/research"
 ( cd "$APP_DIR" && go build -o "$BIN" ./cmd/research )
@@ -111,6 +159,13 @@ for anchor in survey_unhealthy survey_unsurveyable; do
     exit 1
   }
 done
+# §LIB-GATE 第三条锚点：本轮**真正吃到了几条库规则**（gate/读数/成因一体一行，缺字段即判失败）。
+# 这一行是本脚本存在的理由——引用排摸数字的人必须连"吃到了哪些战法"一起拿走。
+grep -E '^survey_library gate=[a-z_]+ factor_rules=[0-9]+ pattern_rules=[0-9]+ entries=[0-9]+/[0-9]+ enabled=[0-9]+/[0-9]+ dir_from=[a-z_]+ zero_reason=' \
+  "$SURVEY_OUT/survey.log" || {
+    echo "X survey.log 里没有 survey_library 锚点行（库读数没出门＝这批数字的前提不可核）" >&2
+    exit 1
+  }
 
 echo
 echo "产物："

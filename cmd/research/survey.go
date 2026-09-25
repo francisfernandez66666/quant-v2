@@ -20,10 +20,11 @@
 // 输出：stdout ASCII 表（本仓库已知坑：PowerShell→SSH→bash 回传 GBK 字节，中文输出在
 // SSH 链路下的 grep 判据全是假绿——表格文本一律 ASCII，中文显示名只进 JSON）
 //   - <out>/strategy_survey.json 机读产物
-//   - 两条 grep 锚点行：survey_unhealthy=<非 ok 条数>、survey_unsurveyable=<白名单在跑但默认回放
+//   - 三条 grep 锚点行：survey_unhealthy=<非 ok 条数>、survey_unsurveyable=<白名单在跑但默认回放
 //     集合量不到的形态战法数>（当前 0：momentum 的判据已于 2026-09-24 按实盘语义重写、真进回放；
 //     此锚点行必须每轮可见——缺适配器与默认停用两种状态由 notes 逐个 ID 标出，新战法进白名单
-//     却没有适配器时它就非零）。
+//     却没有适配器时它就非零）、survey_library=<本轮回放真正吃到的库规则条数与判红门状态>
+//     （§LIB-GATE：表里"没有库规则行"与"这台机器根本没带线上库"必须可区分，见 btreplay.LibraryLoad）。
 //
 // 只读性：排摸对研究库只读。经核，btreplay 回放路径不写任何表
 // （backtest_event_results 断点缓存只属于 internal/backtest 候选事件链路，
@@ -119,6 +120,13 @@ type surveyArtifact struct {
 		MinSpreadPP float64 `json:"min_spread_pp"`
 	} `json:"thresholds"`
 	Records []surveyRecord `json:"records"`
+	// Library §LIB-GATE 出门事实：这一轮回放真正吃到了几条库规则、从哪个目录、按什么来源解析、
+	// 零条时成因是什么、判红门是 enforced / waived / ok。
+	// 为什么放进产物而不是只留在日志里：引用排摸表的人读的是产物，不会去翻 stderr；
+	// 2026-09-25 那次把"本机没带线上库副本"的动量数字当成"线上跑完一轮"（144,420 vs 真值 67,925，
+	// 差 2.1×），前提就只写在日志首行的一句话里。
+	// English: the library premise this run was produced under, shipped inside the artifact itself.
+	Library btreplay.LibraryLoad `json:"library"`
 	// Unhealthy = verdict 非 ok 的条数；同步输出为 stdout 的 survey_unhealthy=<count> 锚点行。
 	Unhealthy int      `json:"unhealthy"`
 	Notes     []string `json:"notes"`
@@ -174,6 +182,10 @@ func cmdStrategySurvey(db *store.DB, dbPath string, args []string) {
 	minSpread := fs.Float64("min-spread", 0.5, "死成分阈值：|分层首末差|（百分点）低于此值判 dead_component")
 	maxStocks := fs.Int("maxstocks", 500, "回放股票池上限（0=全部；--codes 显式池不受此限）")
 	d1 := fs.Float64("d1", 20, "n_shape 的规则 D1 分（与 backtest-strategy 缺省一致，0=不触发）")
+	// §LIB-GATE 与 backtest-strategy 同名同义：排摸数字同样要带"这一轮吃到了几条库规则"的前提，
+	// 所以空库照跑同样是**显式动作**，且会被记进产物的 library.gate=waived（读者看得见）。
+	allowEmpty := fs.Bool("allow-empty-library", false,
+		"§LIB-GATE 放行开关：战法库一条规则都没加载到时仍照跑（缺省 false=判红；产物 library 字段会记 gate=waived）")
 	fs.Parse(args)
 
 	if *end == "" {
@@ -269,6 +281,9 @@ func cmdStrategySurvey(db *store.DB, dbPath string, args []string) {
 		MaxStocks:       *maxStocks,
 		D1Score:         *d1,
 		DataDir:         dataDir,
+		// §LIB-GATE：排摸同样受库判红门约束——排摸表里"库规则一行都没有"与"这台机器根本没带线上库"
+		// 在只看表的人眼里长得一样，而后者会让内置战法（尤其动量）的数字口径整体漂移。
+		AllowEmptyLibrary: *allowEmpty,
 	}
 	if *codesFile != "" {
 		ro.Codes = codes // 显式池时回放与面板装配钉在同一份清单
@@ -367,6 +382,8 @@ func cmdStrategySurvey(db *store.DB, dbPath string, args []string) {
 	art.Window.PoolSize = len(codes)
 	art.Thresholds.MinSpreadPP = *minSpread
 	art.Records = records
+	// §LIB-GATE 前提随产物出门（读数由 btreplay 在装配适配器时写回，排摸与生产回放同一份口径）。
+	art.Library = ro.Library
 	sanitizeArtifact(art)
 	// 盲区显式化：白名单在跑但默认回放集合量不到的形态战法（无适配器的连 records 行都没有；
 	// 有适配器但默认停用的有行、恒 0 笔）。只写成一句 note 的话锚点行 grep 不到它——"没量到"必须
@@ -415,6 +432,29 @@ func cmdStrategySurvey(db *store.DB, dbPath string, args []string) {
 	// 前缀取值，行消失与值为 0 是两回事：前者会被读成"这条链没接"，后者才是"确实没有盲区"。
 	fmt.Printf("survey_unhealthy=%d\n", art.Unhealthy)
 	fmt.Printf("survey_unsurveyable=%d\n", art.Unsurveyable)
+	// §LIB-GATE 第三条锚点：本轮回放真正吃到的库规则条数与门状态。与上面两条同理由——**零也照样打**，
+	// 行消失＝这条链没接上，值为 0＝真的没有库规则，两者对巡检脚本完全不同。
+	// 字段全 ASCII（SSH/GBK 读法约束，见文件头）。
+	fmt.Println(libraryAnchorLine(art.Library))
+}
+
+// libraryAnchorLine §LIB-GATE 出门行的**唯一实现**：表头（第一屏就得看见前提）与结尾锚点（脚本
+// grep）共用同一字符串。同一件事在两处各写一遍是本仓已知的漂移源——改一处忘另一处，巡检脚本会
+// grep 到旧字段名而静默失配。字段全 ASCII（SSH/GBK 读法约束，见 survey.go 文件头）。
+// English: single source for the library-premise line (table header + trailing anchor) so the two
+// can never drift apart.
+func libraryAnchorLine(l btreplay.LibraryLoad) string {
+	return fmt.Sprintf("survey_library gate=%s factor_rules=%d pattern_rules=%d entries=%d/%d enabled=%d/%d dir_from=%s zero_reason=%s",
+		orNone(l.Gate), l.RulesF, l.RulesP, l.EntriesF, l.EntriesP, l.EnabledF, l.EnabledP,
+		orNone(l.DirFrom), orNone(l.ZeroReason))
+}
+
+// orNone 锚点行空值占位：空串在 grep 读法里和"字段没打印"难以区分，统一显式写 none。
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 // unsurveyedNote 盲区锚点的产物说明文本（两种取值都必须自解释，见调用点注释）。
@@ -559,6 +599,9 @@ func printSurveyTable(art *surveyArtifact) {
 	fmt.Printf("basis=%s window=%s..%s h=%d quantiles=%d min_stocks=%d pool=%d min_spread_pp=%.2f\n",
 		art.AdjBasisCurrent, art.Window.Start, art.Window.End, art.Window.Horizon,
 		art.Window.Quantiles, art.Window.MinStocks, art.Window.PoolSize, art.Thresholds.MinSpreadPP)
+	// §LIB-GATE：表头第二行就是"这一张表吃到了几条库规则"。放表头而不是表尾注释，是因为读者从
+	// 第一行就开始比数字；动量是兜底档，兄弟集（含库规则）少一条它的触发数就会变。
+	fmt.Printf("%s\n", libraryAnchorLine(art.Library))
 	fmt.Printf("%-14s %-8s %-6s %-6s %6s %7s %7s %7s %6s %8s %5s %-6s %s\n",
 		"ID", "KIND", "ON", "STALE", "SIGS", "WIN%", "AVG_W%", "AVG_L%", "PF", "EXPR%", "HOLD", "DEAD", "VERDICT")
 	for _, r := range art.Records {

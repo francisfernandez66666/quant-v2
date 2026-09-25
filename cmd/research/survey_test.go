@@ -20,6 +20,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -242,6 +243,34 @@ func TestStrategySurveyArtifact(t *testing.T) {
 		t.Errorf("unhealthy=%d 与非 ok 记录数 %d 不一致", art.Unhealthy, nBad)
 	}
 
+	// §LIB-GATE ①：这批数字的前提（本轮回放到底吃到了几条线上战法）必须随产物出门，
+	// 而且必须是**这一轮真的读出来的**——不是事后补的漂亮字符串。fixture 库里有两条因子条目
+	// （一条停用）且没有形态库文件，所以读数只能是 factor 侧 2/1/2、pattern 侧 0/0/0。
+	// 三个数各管一件事：entries=文件里有几条、enabled=其中启用几条、rules=真建成适配器几条
+	// （排摸带 IncludeDisabled=true，故停用条目也进 rules；生产回放那条链路 rules 只会数启用条目）。
+	if art.Library.Gate != "ok" {
+		t.Errorf("库门状态=%q，期望 ok（有可用规则却报别的＝门自己读错了）", art.Library.Gate)
+	}
+	if art.Library.Dir != dataDir {
+		t.Errorf("库目录=%q，期望回显本轮实际使用的 %q（读者要能核到目录）", art.Library.Dir, dataDir)
+	}
+	if art.Library.EntriesF != 2 || art.Library.EnabledF != 1 || art.Library.RulesF != 2 {
+		t.Errorf("factor 侧三段读数=%d/%d/%d，期望 条目/启用/建成=2/1/2（停用条目在排摸口径里也建适配器）",
+			art.Library.EntriesF, art.Library.EnabledF, art.Library.RulesF)
+	}
+	if art.Library.EntriesP != 0 || art.Library.EnabledP != 0 || art.Library.RulesP != 0 {
+		t.Errorf("pattern 侧三段读数=%d/%d/%d，期望 0/0/0（fixture 没写形态库文件）",
+			art.Library.EntriesP, art.Library.EnabledP, art.Library.RulesP)
+	}
+	// 门=ok 时成因必须留空：把"没成因"写成字符串会让巡检脚本把一轮正常回放读成降级。
+	if art.Library.ZeroReason != "" {
+		t.Errorf("门=ok 时 zero_reason 应为空，得到 %q", art.Library.ZeroReason)
+	}
+	// 锚点行必须与运维脚本的正锁逐字符对得上（脚本按这条 grep 取值，格式漂移＝读不到＝判链没接）。
+	if got := libraryAnchorLine(art.Library); !surveyLibraryAnchorRE.MatchString(got) {
+		t.Errorf("survey_library 锚点行不合运维正则:\n%s", got)
+	}
+
 	// 盲区锚点 §SURVEY-COVERAGE：白名单在跑、但默认回放集合量不到的形态战法必须被计数。
 	// 期望值取 btreplay.UnsurveyedLiveForms() 的**真实差集**而非硬编码数字：锚点的契约是
 	// "产物里的计数等于差集"，差集内容由 btreplay 侧的三份清单（白名单 / 有适配器 / 默认停用）算出。
@@ -386,5 +415,53 @@ func TestSurveyVerdictRule(t *testing.T) {
 			t.Errorf("case %d: verdict(%d,%.2f,%.2f,%v,%v)=%s, want %s",
 				i, c.signals, c.expr, c.prior, c.stale, c.builtin, got, c.want)
 		}
+	}
+}
+
+// surveyLibraryAnchorRE 与 scripts/survey_live_rules.sh 里那条 grep -E 逐字符同源
+// （§95 静态锁两侧必须同时出现这串正则）。为什么要在 Go 侧再存一份：巡检脚本按前缀取值，
+// 格式一漂移脚本只是"读不到"，而读不到在这套纪律里等于"这条链没接"——那是比红更坏的静默。
+var surveyLibraryAnchorRE = regexp.MustCompile(
+	`^survey_library gate=[a-z_]+ factor_rules=[0-9]+ pattern_rules=[0-9]+ entries=[0-9]+/[0-9]+ enabled=[0-9]+/[0-9]+ dir_from=[a-z_]+ zero_reason=`)
+
+// TestLibraryAnchorLineContract 锚点行纯函数单测：三种门态各命中一次，且**零值也要出行**。
+// English: contract test for the survey_library anchor — every gate state emits a line, and
+// an all-zero reading still prints a line (missing line means "not wired", not "zero").
+func TestLibraryAnchorLineContract(t *testing.T) {
+	// ① 正常态：五段读数逐字段等值（不是"含关键字"这种松断言）。
+	got := libraryAnchorLine(btreplay.LibraryLoad{
+		Dir: "/tmp/x", DirFrom: "explicit", EntriesF: 3, EntriesP: 1,
+		EnabledF: 2, EnabledP: 0, RulesF: 2, RulesP: 1, Gate: "ok",
+	})
+	want := "survey_library gate=ok factor_rules=2 pattern_rules=1 entries=3/1 enabled=2/0 dir_from=explicit zero_reason=none"
+	if got != want {
+		t.Errorf("锚点行等值不符\n got: %s\nwant: %s", got, want)
+	}
+	if !surveyLibraryAnchorRE.MatchString(got) {
+		t.Errorf("正常态锚点行不合运维正则: %s", got)
+	}
+	// ② 零值（旧库文件/字段缺失时 JSON 解出的就是它）：必须出行，缺的字段填 none，
+	//    绝不能因为"没数据"就返回空串——空串在打印侧极易被 if 掉。
+	zero := libraryAnchorLine(btreplay.LibraryLoad{})
+	if !surveyLibraryAnchorRE.MatchString(zero) {
+		t.Errorf("零值锚点行不合运维正则: %q（零也照样打这一行是契约）", zero)
+	}
+	if !strings.Contains(zero, "gate=none") || !strings.Contains(zero, "zero_reason=none") {
+		t.Errorf("零值锚点行应把空字段填成 none，得到 %s", zero)
+	}
+	// ③ 判红态：成因原样带上（含 `+` 与 `:`，运维正则的零_reason= 前缀不许被吃掉）。
+	red := libraryAnchorLine(btreplay.LibraryLoad{
+		DirFrom: "unset", Gate: "enforced", ZeroReason: "factor:file_missing+pattern:all_disabled",
+	})
+	if !surveyLibraryAnchorRE.MatchString(red) {
+		t.Errorf("判红态锚点行不合运维正则: %s", red)
+	}
+	if !strings.Contains(red, "zero_reason=factor:file_missing+pattern:all_disabled") {
+		t.Errorf("判红态锚点行丢了成因: %s", red)
+	}
+	// ④ 反证：正则自己不是恒绿——把 dir_from 段摘掉必须不匹配（否则 ①②③ 都在给摆设打分）。
+	broken := strings.Replace(red, " dir_from=unset", "", 1)
+	if surveyLibraryAnchorRE.MatchString(broken) {
+		t.Errorf("运维正则成了摆设：缺 dir_from 段的行仍匹配\n%s", broken)
 	}
 }

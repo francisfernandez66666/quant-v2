@@ -103,6 +103,13 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 			// （夜间 library_replay 由 scheduler 配置 rules.scheduler.replay_throttle_ms 下发）。
 			// English: per-stock throttle (ms) to flatten instantaneous load during full replays.
 			ThrottleMs: payloadIntDef(p, "throttle_ms", 0),
+			// §LIB-GATE：缺省 false＝声明要跑库规则却一条都没加载到时**当场判红**（夜间 library_replay
+			// 与 optimize 都在此路径）。payload allow_empty_library=true 是唯一的正规出口，
+			// 由入队方（调度配置或人工单子）显式写；没有显式表态就静默跑完一整轮，
+			// 是 2026-09-25 把"本机无线上库副本时动量 144,420 单"当成"线上跑完一轮"（真值 67,925）的成因。
+			// English: default false makes a zero-rule library load fatal; the opt-out has to be an
+			// explicit payload key.
+			AllowEmptyLibrary: payloadBool(p, "allow_empty_library"),
 		}
 		// §回测自动增强 A0：payload.backtest → Options.Backtest（入队端只在 enabled 时注入；
 		// 缺字段/解析失败 = nil = 增强前旧行为，向后兼容）。
