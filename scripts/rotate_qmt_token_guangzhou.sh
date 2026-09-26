@@ -13,9 +13,13 @@
 #   ② 密钥纪律优先于便利：**任何模式的回传都先过「40 位以上连续十六进制＝疑似明文口令」闸**，
 #      命中即停手、非 0 退出、原始日志留档但不重复打印；判定行只认 sha256 前 8 位指纹
 #      （rotate_qmt_token.ps1 的既有铁律：只打 FpLabel 绝不打明文，本脚本原样继承）。
-#   ③ -Apply 只动机器可写侧（源1 网关配置文件 + 源2 服务 env 冗余腿）；引擎侧 rules.qmt.token
-#      的权威写入方是设置页、桥侧是 config.bridge.json——**这两条腿本脚本一概不碰**，
-#      成功后原样转述 ps1 的人工步清单，并强调「网关重启必须晚于三侧同值」时序红线。
+#   ③ -Apply（轮换）只动机器可写侧（源1 网关配置文件 + 源2 服务 env 冗余腿）；源3 引擎侧
+#      rules.qmt.token 的权威写入方是设置页、源4 是 config.bridge.json。§0926ROT-ALIGN（owner 令
+#      「我授权你来统一改」）把这两条腿收编成第三个方向 **-Align**：不生成新 token，以源1
+#      （网关鉴权真源）现值为准在服务器本地复制到源3/源4（桥不在位只如实报 absent，落位时
+#      由同一动作补齐）——值全程只在远端函数栈里过，回传仍只有 8 位指纹；写法是锚点原文
+#      外科替换 + 三重拒判（解析不过/提案自证不命中/邻近字段被改动拒写），绝不整文件重排。
+#      两方向成功收尾都原样转述仍欠的人工步，并强调「网关重启必须晚于三侧同值」时序红线。
 #
 # 转义与回传口径（§GBK/§CRLF 两族的合集）：远端只是 `-File 现成ps1 开关`，没有内联拼装；
 # 解析前回传一律 tr -d '\r'（行尾最后字段的 CRLF 坑，09-24 真跑锤过）；ps1 的 DRY-RUN 汇总行
@@ -26,11 +30,13 @@
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh              # 预览（零连接）
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -DryRun      # 远端只读：四源指纹读数
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Apply       # 真轮换（只动源1+源2）
+#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align       # §0926ROT-ALIGN 远端只读：对齐计划（源3/源4 会动什么）
+#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align -Apply # 对齐落地：源1 现值→源3/源4（不生成新 token）
 # 可选环境变量：
 #   GZ_USER      默认 Administrator
 #   ROTATE_PS1   远端 ps1 路径，默认 C:/opt/quant/qmt-win/rotate_qmt_token.ps1（部署清单落点）
-# 退出码：0=预览已打印 / 干跑读数完整 / 轮换且判定行齐；非 0=预探测、路径、执行、判定、
-#         明文闸任一环节失败（显式判红，不把"跑完了"当成功）。
+# 退出码：0=预览已打印 / 干跑读数完整 / 轮换或对齐落地且判定行齐；非 0=预探测、路径、执行、
+#         判定、明文闸任一环节失败（显式判红，不把"跑完了"当成功）。
 set -u
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -39,13 +45,24 @@ GZ_USER="${GZ_USER:-Administrator}"
 ROTATE_PS1="${ROTATE_PS1:-C:/opt/quant/qmt-win/rotate_qmt_token.ps1}"
 
 MODE="preview"
+ALIGN=0
 for a in "$@"; do
   case "$a" in
     -DryRun) [ "$MODE" = "apply" ] && { echo "X -DryRun 与 -Apply 互斥（ps1 同规）。" >&2; exit 2; }; MODE="dryrun" ;;
     -Apply)  [ "$MODE" = "dryrun" ] && { echo "X -DryRun 与 -Apply 互斥（ps1 同规）。" >&2; exit 2; }; MODE="apply" ;;
-    *) echo "X 未知参数：${a}（只认 -DryRun / -Apply，缺省=零连接预览）" >&2; exit 2 ;;
+    -Align)  ALIGN=1 ;;
+    *) echo "X 未知参数：${a}（只认 -DryRun / -Apply / -Align，缺省=零连接预览）" >&2; exit 2 ;;
   esac
 done
+# §0926ROT-ALIGN（owner 令「我授权你来统一改」）：-Align 是对齐轴，与读/写轴正交。
+# 两轴合成四个生效方向（preview/dryrun/apply + aligndry/alignapply）：
+#   -Align          = 远端只读对齐计划（src3/src4 会动什么，逐一列出；ps1 缺省即 dry-run）
+#   -Align -Apply   = 对齐落地（源1 现值复制到源3/源4，**不生成新 token**）
+#   -Align -DryRun  = 同 -Align（显式只读）。-DryRun/-Apply 单独出现仍是原轮换读/写方向。
+# 这里直接折叠进 MODE 单一命名空间（不另设 R_MODE：少一个变量就少一处"哪个才是真模式"的漂移）。
+if [ "$ALIGN" = "1" ]; then
+  if [ "$MODE" = "apply" ]; then MODE="alignapply"; else MODE="aligndry"; fi
+fi
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $HOME/.ssh/id_rsa ${GZ_USER}@${GZ_IP}"
 SCP="scp -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $HOME/.ssh/id_rsa"
@@ -86,13 +103,16 @@ if [ "$MODE" = "preview" ]; then
   echo "  将执行的远端命令（现在**没有**执行）："
   echo "    -DryRun 读四源指纹：powershell -File ${ROTATE_PS1} -DryRun"
   echo "    -Apply  只动源1+源2：powershell -File ${ROTATE_PS1} -Apply"
+  echo "    -Align  只读对齐计划：powershell -File ${ROTATE_PS1} -Align"
+  echo "    -Align -Apply 源1现值→源3/源4（不生成新 token）：powershell -File ${ROTATE_PS1} -Align -Apply"
   echo "  安全口径（ps1 既有铁律，本通道原样继承）："
   echo "    写侧①先落 config.xt.json 时间戳副本再原子写；写侧②服务 env 并集写不整体替换；"
   echo "    全程只打 sha256 前 8 位指纹；回传过本脚本的 40+hex 明文闸。"
-  echo "  -Apply 之后仍欠、且只有 owner 能做的两条腿（时序红线：网关重启必须晚于三侧同值）："
-  echo "    [a] 设置页把 rules.qmt.token 改成新值（新值＝网关机上 config.xt.json 里的 token 字段，"
-  echo "        由 owner 在网关机本地取值粘贴，**绝不经过本对话/日志**）；"
-  echo "    [b] 桥侧 config.bridge.json --token 同步并重启桥。"
+  echo "  轮换（-Apply）之后仍欠的源3/源4 两条腿——§0926ROT-ALIGN 后有一条机器腿："
+  echo "    跑 -Align -Apply 把源1 现值在服务器本地复制到引擎 config.json（rules.qmt.token）"
+  echo "    与在位的 config.bridge.json；设置页仍是源3 的权威写入方，之后若从设置页改值需再对齐一次。"
+  echo "    owner 手工形态依旧可用：[a] 设置页改 rules.qmt.token；[b] 桥侧 config.bridge.json --token 同步。"
+  echo "  时序红线不变：三侧同值之前**不要重启网关进程**。"
   echo "  复核腿：verify_deploy_guangzhou.sh 第 20 探针（token fp agree across readable sources）。"
   exit 0
 fi
@@ -149,9 +169,15 @@ else
   echo "ROTATE_PS1_SYNCED fp=${LOCAL_FP} stale_backup=.stale-${STAMP}"
 fi
 
+# 开关映射按合成后的单一 MODE：ps1 侧 -Align 缺省即 dry-run（-not -Apply ⇒ DryRun=true），
+# 因此 aligndry 只送 -Align、alignapply 送 "-Align -Apply"（-File 后两段开关合法）。
 FLAG=""
-[ "$MODE" = "dryrun" ] && FLAG="-DryRun"
-[ "$MODE" = "apply" ] && FLAG="-Apply"
+case "$MODE" in
+  dryrun)     FLAG="-DryRun" ;;
+  apply)      FLAG="-Apply" ;;
+  aligndry)   FLAG="-Align" ;;
+  alignapply) FLAG="-Align -Apply" ;;
+esac
 
 echo "==> [3/4] 远端执行（${MODE}）"
 run_remote "$FLAG"
@@ -177,6 +203,79 @@ if [ "$MODE" = "dryrun" ]; then
   printf '%s\n' "$LAST_OUT" | grep -E '^\[(rot|ok|warn)\] ' || true
   echo "ROTATE_READOUT ok src1-4=complete applied=0 log=${LOG}"
   echo "ok - 四源指纹读数已回显（只有 sha256 前 8 位；下一步是否 -Apply 按读数与裁决走）"
+  exit 0
+fi
+
+# ── aligndry（-Align 单独/配 -DryRun）：对齐计划读数，四条锚行缺一判红、绝不写 ──
+if [ "$MODE" = "aligndry" ]; then
+  for anchor in '[rot] src1 ' 'align src1 truth fp=' 'align src3 plan ' 'align src4 plan ' 'ALIGN_DRY'; do
+    if ! printf '%s\n' "$LAST_OUT" | grep -qF "$anchor"; then
+      echo "X 对齐计划缺锚点行「${anchor}」——计划读数不完整，判失败（只读方向没读到就停，不带病落地）。" >&2
+      exit 1
+    fi
+  done
+  if [ "$LAST_RC" -ne 0 ]; then
+    echo "X 对齐计划退出码非 0（rc=${LAST_RC}），详见 ${LOG}" >&2
+    exit 1
+  fi
+  printf '%s\n' "$LAST_OUT" | grep -E '^\[ ?(rot|ok|warn) ?\] ' || true
+  echo "ALIGN_READOUT ok plan=complete applied=0 log=${LOG}"
+  echo "ok - 对齐计划已回显（只有指纹；will_write/action 决定 -Align -Apply 会动哪几条腿）"
+  exit 0
+fi
+
+# ── alignapply（-Align -Apply）：源1 现值→源3/源4 落地复核，不生成新 token ──
+if [ "$MODE" = "alignapply" ]; then
+  for anchor in 'align src3 done token_fp=' 'align src4 done ' 'ALIGN_APPLIED'; do
+    if ! printf '%s\n' "$LAST_OUT" | grep -qF "$anchor"; then
+      echo "X 对齐判定行缺失「${anchor}」——源3/源4 写腿（外科替换+回读自证）没有全过，" >&2
+      echo "  按半态处置：不要重启网关，config.json 旁有 .pre-align-* 副本可回滚，详见 ${LOG}。" >&2
+      exit 1
+    fi
+  done
+  if [ "$LAST_RC" -ne 0 ]; then
+    echo "X -Align -Apply 退出码非 0（rc=${LAST_RC}）——判定行虽在也按失败处置，详见 ${LOG}" >&2
+    exit 1
+  fi
+  # 提取腿同轮换口径：先锚 'token_fp=sha256:' 再截到空格（禁裸 hex 抓，09-26 实录自伤教训）。
+  ALIGN3_LINE="$(printf '%s\n' "$LAST_OUT" | grep -m1 'align src3 done token_fp=' || true)"
+  [ -n "$ALIGN3_LINE" ] || { echo "X 取不到 src3 判定行——判失败。" >&2; exit 1; }
+  REST="${ALIGN3_LINE#*token_fp=sha256:}"
+  NEWFP="${REST%% *}"
+  case "$NEWFP" in
+    "")   echo "X src3 判定行里取不到对齐指纹——判据本身不可信，判失败。" >&2; exit 1 ;;
+    [!0-9a-f]*|*[!0-9a-f]*) echo "X 对齐指纹形态异常（${NEWFP}，应为纯小写十六进制）——判失败。" >&2; exit 1 ;;
+  esac
+  BR_LINE="$(printf '%s\n' "$LAST_OUT" | grep -m1 'align src4 done ' || true)"
+  BR_ACT="$(printf '%s' "$BR_LINE" | { grep -oE 'action=[a-z]+' || true; })"
+  printf '%s\n' "$LAST_OUT" | grep -E '^\[ ?(rot|ok|warn) ?\] ' || true
+  echo "ALIGN_APPLIED token_fp=${NEWFP} src4_${BR_ACT:-action=unset}"
+  # 写后自动复跑只读干跑：src3 行必须吃到该指纹（同源复读；src4 absent 时本就无行可复读，
+  # 如实以落地判定行的 action 为准，不假造读数）。
+  echo "==> [4b] 写后复读（远端只读干跑，比对 src3 与对齐指纹）"
+  run_remote "-DryRun"
+  case "$LAST_OUT" in
+    *'[fail]'*) echo "X 写后复读远端判死——详见 ${LOG}。" >&2; exit 1 ;;
+  esac
+  SRC3_LINE="$(printf '%s\n' "$LAST_OUT" | grep -m1 '\[rot\] src3 ' || true)"
+  [ -n "$SRC3_LINE" ] || { echo "X 写后复读拿不到 src3 行——复核没做到，判失败。" >&2; exit 1; }
+  if ! printf '%s' "$SRC3_LINE" | grep -qF "sha256:${NEWFP}"; then
+    echo "X 写后复读 src3 指纹 != 本轮对齐值 sha256:${NEWFP}——引擎配置可能被并发改写/回滚，判失败。" >&2
+    echo "  行内容：${SRC3_LINE}"
+    exit 1
+  fi
+  SRC1_LINE="$(printf '%s\n' "$LAST_OUT" | grep -m1 '\[rot\] src1 ' || true)"
+  if [ -z "$SRC1_LINE" ] || ! printf '%s' "$SRC1_LINE" | grep -qF "sha256:${NEWFP}"; then
+    echo "X 写后复读 src1 指纹 != 对齐指纹——真源在落地后被改动，判失败（先取证再动任何重启）。" >&2
+    echo "  行内容：${SRC1_LINE:-取不到}"
+    exit 1
+  fi
+  echo "ok - 写后复读一致：源1==源3==sha256:${NEWFP}（桥腿 ${BR_ACT:-unknown}，absent=未落位、落位时同法补齐）"
+  echo ""
+  echo "  ── 对齐后的收尾口径 ──"
+  echo "  [1] 设置页此后仍是源3 的权威写入方：若再从设置页改 token，改完必须重跑本通道 -Align -Apply 复对齐；"
+  echo "  [2] 桥落位（config.bridge.json 出现）后重跑一次 -Align -Apply 即补齐源4；"
+  echo "  [3] 时序红线：网关/引擎进程重启必须晚于四侧同值确认——复核腿 verify 第 20 探针 token_fp_agree。"
   exit 0
 fi
 

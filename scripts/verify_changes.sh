@@ -4141,8 +4141,13 @@ fi
 #    （admin_session_token 零引用负锁——轮换写侧全在服务器本地，压根不需要设置页凭据）；
 #    判定行锚点与 ps1 侧**两侧同源**（驱动认的三行＝ps1 真写的三行，改一边即红）。
 # ③ 现网脚本落点路径锁（§ENH-5 形态：仓库里有、现网也必须在那个路径有）。
+# ③ 现网脚本落点路径锁（§ENH-5 形态：仓库里有、现网也必须在那个路径有）。
+# ④ §0926ROT-ALIGN（2026-09-26 owner 令「我授权你来统一改」）：-Align 对齐方向（源1 现值→
+#    源3 引擎 config.json/源4 桥配置，不生成新 token）——新判定名 ALIGN_READOUT/ALIGN_APPLIED
+#    各恰 1、开关映射锁、驱动锚与 ps1 写行两侧同源（含"提案自证"拒判腿），离网两形态
+#    （-Align / -Align -Apply）必须死在预探测且判定名一条都不许出现；判定名与轮换互不借用。
 # 全部判据＝静态 grep -F + 离网一次性真跑（TEST-NET 假 IP，BatchMode 预探测必失败，
-# 零凭据零写入；每跑 ≤10s 超时，整段增时约半分钟）。
+# 零凭据零写入；每跑 ≤10s 超时，整段增时约一分钟）。
 # ════════════════════════════════════════════════════════════════════════════
 echo "==> 102 §QMT-TOKENROT-CLI 网关口令轮换正规通道（2026-09-26 owner 令收编）..."
 RT_ERRS=""
@@ -4158,10 +4163,12 @@ RT_PS1=deploy/qmt-win/rotate_qmt_token.ps1
 RT_SY=0; bash -n "$RT_SCR" 2>/dev/null || RT_SY=$?
 rt_chk "驱动脚本语法自检 bash -n" "$RT_SY" "0"
 # §89 自指锁（09-26 实录：`cmd; rc=$?` 裸跑在 set -euo pipefail 下让整轮 verify 无 FAIL 无 ok
-# 静默中止，exit 2 连红单都不留）：五处预期失败的反证子进程必须全部写成 `|| RT_XX=$?` 收码。
-rt_chk "反证裸跑形态清零（`; 收码` 前缀直连 RT_XX=$ 的写法必须不存在，§89 同族自指）" "$(grep -Ec '; RT_(PV|BG|MX|DR|AP)=[$]' scripts/verify_changes.sh || true)" "0"
-rt_min "五处反证全部 RT_XX=0; 收码起跑（行首锚定 ≥5，PV/BG/MX/DR/AP 各一）" "$(grep -Ec '^RT_(PV|BG|MX|DR|AP)=0; GZ_IP=203' scripts/verify_changes.sh || true)" "5"
-rt_min "五处收码尾巴在位（|| 直连 RT_XX= 计数 ≥5，缺一个即该处会静默杀父）" "$(grep -Ec '[|][|] RT_(PV|BG|MX|DR|AP)=' scripts/verify_changes.sh || true)" "5"
+# 静默中止，exit 2 连红单都不留）：七处预期失败的反证子进程必须全部写成 `|| RT_XX=$?` 收码。
+# ⚠ 本段三行消息串里**绝不许出现反引号**——双引号内反引号＝命令替换，语法坏时 rt_chk 整行静默
+# 不执行（09-26 复演实录：假绿形态），要引用形态一律用「」。
+rt_chk "反证裸跑形态清零（「cmd; RC=$?」直连 RT_XX=$ 的写法必须不存在，§89 同族自指）" "$(grep -Ec '; RT_(PV|BG|MX|DR|AP|AD|AA)=[$]' scripts/verify_changes.sh || true)" "0"
+rt_min "七处反证全部 RT_XX=0; 收码起跑（行首锚定 ≥7，PV/BG/MX/DR/AP/AD/AA 各一）" "$(grep -Ec '^RT_(PV|BG|MX|DR|AP|AD|AA)=0; GZ_IP=203' scripts/verify_changes.sh || true)" "7"
+rt_min "七处收码尾巴在位（|| 直连 RT_XX= 计数 ≥7，缺一个即该处会静默杀父）" "$(grep -Ec '[|][|] RT_(PV|BG|MX|DR|AP|AD|AA)=' scripts/verify_changes.sh || true)" "7"
 
 # ── ② 静态：缺省方向 / 明文闸 / 凭据负锁 / 两侧同源 ──
 rt_chk "缺省零连接预览判定名恰 1（ROTATE_PLAN connect=0）" "$(grep -Fc 'mode=preview connect=0' "$RT_SCR" || true)" "1"
@@ -4181,6 +4188,24 @@ rt_min "ps1 侧判定行「self-check(a) gateway file source CONFIRMED」在位"
 rt_chk "对齐成功判定名恰 1（ROTATE_PS1_SYNCED，只在真覆盖后出现）" "$(grep -Fc 'ROTATE_PS1_SYNCED' "$RT_SCR" || true)" "1"
 rt_min "远端指纹读法走 Get-FileHash（不回显全 64 位，管道内截 12 位前缀）" "$(grep -Fc 'Get-FileHash' "$RT_SCR" || true)" "1"
 rt_min "覆盖前远端必落 .stale 时间戳副本（备份不成就不覆盖）" "$(grep -Fc '.stale-' "$RT_SCR" || true)" "1"
+# ── §0926ROT-ALIGN（owner 令「我授权你来统一改」）：-Align 对齐方向的判定名/映射/两侧同源 ──
+# 对齐＝不生成新 token，把源1 现值在服务器本地补到源3/源4。新判定名各恰 1（与轮换判定名
+# 互不借用——ROTATE_APPLIED 恰 1 的旧锁同时钉住"align 分支没伪装成轮换成功"这一形态）。
+rt_chk "对齐计划判定名恰 1（ALIGN_READOUT ok）" "$(grep -Fc 'ALIGN_READOUT ok' "$RT_SCR" || true)" "1"
+rt_chk "对齐落地判定名恰 1（ALIGN_APPLIED token_fp=）" "$(grep -Fc 'ALIGN_APPLIED token_fp=' "$RT_SCR" || true)" "1"
+rt_min "两轴合成折叠：只读向 aligndry 赋值在位（-Align 缺省必须落在只读向）" "$(grep -Fc 'MODE="aligndry"' "$RT_SCR" || true)" "1"
+rt_min "两轴合成折叠：落地向 alignapply 赋值在位" "$(grep -Fc 'MODE="alignapply"' "$RT_SCR" || true)" "1"
+rt_chk "落地开关映射恰 1（alignapply 只送「-Align -Apply」，禁把 -Apply 单独发给 ps1 触发轮换）" "$(grep -Fc 'FLAG="-Align -Apply"' "$RT_SCR" || true)" "1"
+rt_min "ps1 侧对齐计划判定行「align src3 plan 」在位" "$(grep -Fc 'align src3 plan ' "$RT_PS1" || true)" "1"
+rt_min "ps1 侧对齐计划判定行「align src4 plan 」在位" "$(grep -Fc 'align src4 plan ' "$RT_PS1" || true)" "1"
+rt_min "ps1 侧对齐完成判定行「align src3 done token_fp=」在位" "$(grep -Fc 'align src3 done token_fp=' "$RT_PS1" || true)" "1"
+rt_min "ps1 侧对齐完成判定行「align src4 done 」在位" "$(grep -Fc 'align src4 done ' "$RT_PS1" || true)" "1"
+rt_min "驱动认的 src3 完成锚点在位（两侧同源：驱动锚＝ps1 真写）" "$(grep -Fc 'align src3 done token_fp=' "$RT_SCR" || true)" "2"
+rt_min "驱动认的 src4 完成锚点在位（同上，锚点表+提取腿各一处）" "$(grep -Fc 'align src4 done ' "$RT_SCR" || true)" "2"
+rt_min "ps1 侧对齐写前三重拒判之「提案自证」在位（指纹不命中锚点块即一个字都不写）" "$(grep -Fc '提案自证不过' "$RT_PS1" || true)" "2"
+# 09-26 对齐批实锤的假绿补洞：仓内词法扫描把反斜杠当普通字符，反斜杠贴引号恰好抵平括号照样
+# PASS，但 PS5.1 不认反斜杠转义——现网首跑 ParserError。形态锁：该串在 rotate ps1 出现即红。
+rt_absent "rotate ps1 反斜杠贴双引号形态清零（PS 转义只认反引号，C 形写法＝引号语境翻转炸弹）" "$(grep -Fc '\""' "$RT_PS1" || true)"
 # 09-26 真跑锤实的两处判据修复（两轮 -Apply 都被"写侧成功、自证假红"拦停）：
 # ①NSSM 真存储走 Services\<svc>\Parameters 两级路径；②`return ,$list` 穿 @(func) 落嵌套数组，
 #   调用侧必须 Flatten-EnvPairs 展平——定义 1 + 调用 3（src 读/并集/写回读）＝4 处，少一处即漏网。
@@ -4252,10 +4277,19 @@ rt_absent "离网轮换不许出现写入判定行（写入口径只在远端真
 rt_absent "离网任何一轮都不许出现现网 ps1 的 src 读数行（防「假 IP 连真机」串台）" "$(grep -Fc '[rot] src1' "$RT_TMP/dr.out" || true)"
 rt_absent "离网干跑不许出现对齐同步判定行（预探测拦停，[2b] 不该被走到）" "$(grep -Fc 'ROTATE_PS1_SYNCED' "$RT_TMP/dr.out" || true)"
 rt_absent "离网轮换不许出现对齐同步判定行（同上——没连上就一条都不许写）" "$(grep -Fc 'ROTATE_PS1_SYNCED' "$RT_TMP/ap.out" || true)"
+# §0926ROT-ALIGN 离网反证：-Align 两形态同样必须死在预探测——对齐方向没有"连不上也照样绿"的余地。
+RT_AD=0; GZ_IP=203.0.113.7 bash "$RT_SCR" -Align > "$RT_TMP/ad.out" 2>&1 || RT_AD=$?
+rt_chk "离网 -Align 必须非 0（连不上就绝不自称计划完整）" "$([ "$RT_AD" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+rt_absent "离网 -Align 不许出现 ALIGN_READOUT 判定行" "$(grep -Fc 'ALIGN_READOUT' "$RT_TMP/ad.out" || true)"
+rt_absent "离网 -Align 不许出现现网脚本同步脚印" "$(grep -Fc 'ROTATE_PS1_SYNCED' "$RT_TMP/ad.out" || true)"
+RT_AA=0; GZ_IP=203.0.113.7 bash "$RT_SCR" -Align -Apply > "$RT_TMP/aa.out" 2>&1 || RT_AA=$?
+rt_chk "离网 -Align -Apply 必须非 0（写方向预探测拦停）" "$([ "$RT_AA" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+rt_absent "离网 -Align -Apply 不许出现 ALIGN_APPLIED 写入判定行" "$(grep -Fc 'ALIGN_APPLIED' "$RT_TMP/aa.out" || true)"
+rt_absent "离网 -Align -Apply 不许串到轮换判定名（两方向判定互不借用）" "$(grep -Fc 'ROTATE_APPLIED' "$RT_TMP/aa.out" || true)"
 rm -rf "$RT_TMP"
 
 if [ -z "$RT_ERRS" ]; then
-	echo "ok - §QMT-TOKENROT-CLI 守卫通过（静态锁 21 + 两侧同源 3 + 离网反证 10）"
+	echo "ok - §QMT-TOKENROT-CLI 守卫通过（静态锁含两侧同源锚 35 + 离网反证 18；§0926ROT-ALIGN 后共 53）"
 else
 	echo "--- FAIL: §102 断言不符:${RT_ERRS}"
 	exit 1

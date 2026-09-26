@@ -28,6 +28,8 @@
 # 用法（管理员 PowerShell，现网路径）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1            # 预演
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Apply     # 真写
+#   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align     # §0926ROT-ALIGN 对齐计划（只读，不生成新 token）
+#   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align -Apply  # 对齐落地：源1 现值→源3/源4
 param(
     [string]$GatewayDir = "",        # 留空取 §C7 单源 $SvcGatewayDir（缺失回退 C:\qmt\quant-trading-v2\qmt_gateway）
     [string]$ConfigFile = "",        # 留空取 <GatewayDir>\config.xt.json
@@ -36,7 +38,11 @@ param(
     [string]$ServiceName = "",       # 留空取 §C7 单源 $SvcNameQuant
     [string]$DataDir = "",           # 只读：报引擎侧现值指纹，供人工步对照（留空取单源 $SvcDataDir）
     [switch]$DryRun,
-    [switch]$Apply
+    [switch]$Apply,
+    # §0926ROT-ALIGN（2026-09-26 owner 令「我授权你来统一改」）：对齐模式——不生成新 token，
+    # 以源1（config.xt.json，网关真源）现值为权威，把它复制到源3（引擎 config.json rules.qmt.token）
+    # 与源4（config.bridge.json，如在位）。值只在服务器本地函数栈里过，输出一律指纹。
+    [switch]$Align
 )
 $ErrorActionPreference = "Stop"
 
@@ -182,7 +188,7 @@ if (Test-Path $engPath) {
         if ($ej.rules -and $ej.rules.qmt) { $engToken = [string]$ej.rules.qmt.token }
     } catch { }
 }
-Info ("src3 engine_cfg    rules.qmt.token=" + (FpLabel $engToken) + " (权威写入方＝设置页，本脚本不写)")
+Info ("src3 engine_cfg    rules.qmt.token=" + (FpLabel $engToken) + " (权威写入方＝设置页；-Align 模式本脚本可按源1补齐)")
 
 # ── [诊断] §0926-ROT：env 腿写后读回 mismatch 的结构取证（纯注册表直读、只报计数/键名/读法，
 # 零值外泄）。两个疑点一次拆掉：①NSSM 可能把参数写在 Services\<svc>\Parameters 子键（两份路径
@@ -225,12 +231,125 @@ if (-not $brToken) {
     $bridgeCfg = Join-Path $GatewayDir "config.bridge.json"
     if (Test-Path $bridgeCfg) {
         try {
-            $bjv = (Get-Content -Path $bridgeCfg -Raw | ConvertFrom-Json).token
+            # §0926ROT-ALIGN：补 -Encoding UTF8 与 §TOKEN-BLIND 同口径——无 BOM UTF-8 在 PS5.1
+            # 缺省 GBK 解码会吞引号炸解析，src4 现值被读成空 ⇒ align 把本来同值的桥误判成 write。
+            $bjv = (Get-Content -Path $bridgeCfg -Raw -Encoding UTF8 | ConvertFrom-Json).token
             if ($bjv) { $brToken = [string]$bjv }
         } catch { }
     }
 }
-Info ("src4 bridge        token=" + $(if ($brToken -and $brToken -notmatch '^\(') { FpLabel $brToken } else { ($(if ($brToken) { $brToken } else { "not-found(桥未在跑且无 config.bridge.json)"})) }) + " (人工步，本脚本不写)")
+Info ("src4 bridge        token=" + $(if ($brToken -and $brToken -notmatch '^\(') { FpLabel $brToken } else { ($(if ($brToken) { $brToken } else { "not-found(桥未在跑且无 config.bridge.json)"})) }) + " (人工步原文；-Align 模式可在位时按源1补齐，缺省仍不写)")
+
+# ── 1z. §0926ROT-ALIGN 对齐模式（2026-09-26 owner 令「我授权你来统一改」）────────────────
+# 语义：**不生成新 token**。源1（config.xt.json）是网关鉴权的真源，本模式把它的现值在服务器
+# 本地复制到源3（引擎 config.json 的 rules.qmt.token）与源4（config.bridge.json，如在位）。
+# 明文只在函数栈里过（写入值＝读到的源1值），所有输出仍是 sha256 前 8 位指纹——与轮换同一铁律。
+# 写形选择：引擎 config.json 由 Go 侧序列化维护，结构大且格式敏感 ⇒ **绝不整文件反序列化重排**
+# （PS5.1 ConvertTo-Json 会重排/改数值形态，动没动过的字段都可能变），改为"锚点后的首个
+# token 字段"原文外科替换；写完**重新解析自证**三件事：①rules.qmt.token 指纹==源1；
+# ②锚点块邻近关键字段（gateway_url/price_type/mode）逐值不变（防手术刀切错块）；
+# ③提案文本先过同样断言再落盘——不满足就 Die，一个字节都不写。写前落 .pre-align-<ts> 副本。
+function Set-JsonStringFieldRaw {
+    param([string]$Text, [string]$Anchor, [string]$Field, [string]$Value, [scriptblock]$Check)
+    # Anchor 为 ""（顶层直接找）或如 '"qmt"' 的锚点：只在锚点之后的窗口里找首个 Field 字符串值。
+    # §0926ROT-ALIGN 防撞名：锚点字样可能在文件更早处作为字符串值出现（如 "source": "qmt"）——
+    # 把锚点的**每一处出现**都当候选窗口，切完先过 $Check(解析对象) 才认；全不过＝抛，绝不写。
+    $starts = @()
+    if ($Anchor) {
+        $i = -1
+        while (($i = $Text.IndexOf($Anchor, $i + 1)) -ge 0) { $starts += $i }
+        if ($starts.Count -eq 0) { throw ("anchor not found in text: " + $Anchor) }
+    } else { $starts = @(0) }
+    foreach ($s in $starts) {
+        $head = $Text.Substring(0, $s)
+        $tail = $Text.Substring($s)
+        $m = [regex]::Match($tail, ('"' + $Field + '"\s*:\s*"((?:[^"\\]|\\.)*)"'))
+        if (-not $m.Success) { continue }
+        $cand = $head + $tail.Substring(0, $m.Index) + ('"' + $Field + '":"' + $Value + '"') + $tail.Substring($m.Index + $m.Length)
+        if (-not $Check) { return $cand }
+        $parsed = $null
+        try { $parsed = $cand | ConvertFrom-Json } catch { continue }
+        $okc = $false
+        try { $okc = (& $Check $parsed) -eq $true } catch { $okc = $false }
+        if ($okc) { return $cand }
+    }
+    # ⚠ PS 的转义引号是反引号形（`"），**不是** C 形反斜杠引号——09-26 实录：反斜杠贴引号时
+    # PS5.1 把 \" 解析成「反斜杠+闭引号」，整条 throw 翻转引号语境，函数大括号被吞进字符串，
+    # 仓库侧括号平衡扫描恰好抵平未拦，现网首跑 ParserError 才炸。此形已入 §102 负向锁。
+    throw ('no accepted replace candidate for field "' + $Field + '" after anchor "' + $Anchor + '"（锚点全撞了错误位或字段不存在——停手）')
+}
+if ($Align) {
+    $alignTok = [string]$cfg.token
+    if (-not $alignTok) { Die "align refused: src1 token empty, no truth source to align to" }
+    $alignFp = FpLabel $alignTok
+    Info ("align src1 truth fp=" + $alignFp + " (value never leaves server, never printed)")
+    if ((FpLabel $envToken) -ne $alignFp) {
+        Warn "align src2 svc_env fp != src1（冗余腿，量的是服务 env；本轮不动它——若 src2 应同源请先跑轮换 -Apply 再对齐）"
+    } else {
+        Info "align src2 svc_env same-as-src1 (redundant leg confirmed by fingerprint)"
+    }
+    $wantEng = ((FpLabel $engToken) -ne $alignFp)
+    $bridgePath = Join-Path $GatewayDir "config.bridge.json"
+    $brAction = "absent"
+    if (Test-Path $bridgePath) { $brAction = if ((FpLabel $brToken) -ne $alignFp) { "write" } else { "same" } }
+    Info ("align src3 plan engine_cfg will_write=" + $wantEng + " was=" + (FpLabel $engToken) + " target_fp=" + $alignFp)
+    Info ("align src4 plan bridge action=" + $brAction + " (absent=桥未落位，落位时写源1同值即可)")
+    if ($DryRun) {
+        Info "ALIGN_DRY plan-only above, nothing written. To really align rerun with -Align -Apply."
+        exit 0
+    }
+    $stamp = Get-Date -Format "yyyyMMddHHmmss"
+    # ── 源3：引擎 config.json rules.qmt.token ──
+    if (-not $wantEng) {
+        Ok ("align src3 done token_fp=" + $alignFp + " changed=False (already same as src1)")
+    } else {
+        if (-not (Test-Path $engPath)) { Die ("align src3 refused: engine config not found at " + $engPath) }
+        $engRaw = Get-Content -Path $engPath -Raw -Encoding UTF8
+        $engObj = $null
+        try { $engObj = $engRaw | ConvertFrom-Json } catch { Die ("align src3 refused: config.json 解析失败（" + $_.Exception.Message + "）——结构不可信，一个字节都不写") }
+        if (-not $engObj.rules -or -not $engObj.rules.qmt) { Die "align src3 refused: rules.qmt node missing in config.json（引擎侧结构不猜，停手）" }
+        $engNew = $null
+        try { $engNew = Set-JsonStringFieldRaw -Text $engRaw -Anchor '"qmt"' -Field 'token' -Value $alignTok -Check { param($o) (FpLabel([string]$o.rules.qmt.token)) -eq $alignFp } } catch { Die ("align src3 refused: " + $_.Exception.Message) }
+        $engChk = $null
+        try { $engChk = $engNew | ConvertFrom-Json } catch { Die "align src3 refused: 提案文本解析不过（手术切坏形态，拒写）" }
+        if ((FpLabel([string]$engChk.rules.qmt.token)) -ne $alignFp) { Die "align src3 refused: 提案自证不过——rules.qmt.token 未命中锚点块（切错位置嫌疑）" }
+        foreach ($f in @('gateway_url', 'price_type', 'mode')) {
+            if ([string]$engChk.rules.qmt.$f -ne [string]$engObj.rules.qmt.$f) { Die ("align src3 refused: 字段 " + $f + " 在提案里变了——手术刀不干净，拒写") }
+        }
+        $engBak = $engPath + ".pre-align-" + $stamp
+        Copy-Item -LiteralPath $engPath -Destination $engBak -Force
+        $engTmp = $engPath + ".aligning-" + $stamp
+        [System.IO.File]::WriteAllText($engTmp, $engNew, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $engTmp -Destination $engPath -Force
+        $engNow = (Get-Content -Path $engPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+        if ((FpLabel([string]$engNow.rules.qmt.token)) -ne $alignFp) { Die ("align src3 read-back mismatch（回滚副本: " + $engBak + "）") }
+        Ok ("align src3 done token_fp=" + $alignFp + " changed=True was=" + (FpLabel $engToken) + " read-back confirmed, backup=.pre-align-" + $stamp)
+    }
+    # ── 源4：桥配置如在位则同写（当前现网 absent——落位时由部署步写源1同值）──
+    switch ($brAction) {
+        "same"    { Ok ("align src4 done token_fp=" + $alignFp + " action=same (already aligned)") }
+        "write"   {
+            $brRaw = Get-Content -Path $bridgePath -Raw -Encoding UTF8
+            $brObj = $null
+            try { $brObj = $brRaw | ConvertFrom-Json } catch { Die ("align src4 refused: config.bridge.json 解析失败（" + $_.Exception.Message + "）") }
+            $brNew = $null
+            try { $brNew = Set-JsonStringFieldRaw -Text $brRaw -Anchor "" -Field 'token' -Value $alignTok -Check { param($o) (FpLabel([string]$o.token)) -eq $alignFp } } catch { Die ("align src4 refused: " + $_.Exception.Message) }
+            $brChk = $null
+            try { $brChk = $brNew | ConvertFrom-Json } catch { Die "align src4 refused: 提案文本解析不过" }
+            if ((FpLabel([string]$brChk.token)) -ne $alignFp) { Die "align src4 refused: 提案自证不过——token 字段未命中" }
+            $brBak = $bridgePath + ".pre-align-" + $stamp
+            Copy-Item -LiteralPath $bridgePath -Destination $brBak -Force
+            $brTmp = $bridgePath + ".aligning-" + $stamp
+            [System.IO.File]::WriteAllText($brTmp, $brNew, (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $brTmp -Destination $bridgePath -Force
+            if ((FpLabel([string]((Get-Content -Path $bridgePath -Raw -Encoding UTF8 | ConvertFrom-Json).token))) -ne $alignFp) { Die ("align src4 read-back mismatch（回滚副本: " + $brBak + "）") }
+            Ok ("align src4 done token_fp=" + $alignFp + " action=written read-back confirmed, backup=.pre-align-" + $stamp)
+        }
+        default   { Ok ("align src4 done token_fp=" + $alignFp + " action=absent (bridge not provisioned; write src1 value when it is)") }
+    }
+    Info "ALIGN_APPLIED machine-readable sources unified to src1 truth. Reminder: gateway restart only AFTER this returns 4-source agreement; final check = verify deploy probe 20 token_fp_agree."
+    exit 0
+}
 
 # ── 2. 新 token 与指纹计划 ────────────────────────────────────────────────
 # 任务要求用 [Security.Cryptography.RandomNumberGenerator]（不点名旧 RNGCryptoServiceProvider）。
@@ -328,11 +447,11 @@ if ($gwProcState -ne "restarted(file value in effect)") {
     Warn "§C7 重启后复验：重跑本脚本（dry-run 即可）看 src1 与 self-check(b) 是否为 restarted；最终复核＝verify_deploy_guangzhou.sh 第 20 探针 token_fp_agree"
 }
 
-# ── 5. 人工步清单（本脚本刻意不自动写：3 的权威源是设置页、4 在桥的启动命令里）──────────
+# ── 5. 人工步清单（轮换模式仍不自动写源3/源4；§0926ROT-ALIGN 起，源3 可由 -Align -Apply 按源1补齐，源4 在桥落位时写源1同值）──
 Write-Host ""
 Info "remaining manual steps (both must move to the SAME new token before the next report/order):"
-Info "  [1] web 设置页 -> QMT 配置 rules.qmt.token 改为新 token（权威写入方是设置页，勿手改 config.json）"
-Info "  [2] qmt_bridge.py 启动参数 --token 改新值（或同目录 config.bridge.json）并重启桥"
+Info "  [1] web 设置页 -> QMT 配置 rules.qmt.token 改为新 token（权威写入方是设置页；或跑本脚本 -Align -Apply 由机器按源1补齐，二者取其一勿并行）"
+Info "  [2] qmt_bridge.py 启动参数 --token 改新值（或同目录 config.bridge.json）并重启桥（该文件在位时 -Align 会一并核对/同写）"
 Info "  [3] 重启网关进程载入新 config（§C7 单径：restart_gateway.ps1 杀旧进程 → 交互任务 $SvcTaskGatewayEnsure 拉起；env 腿对网关是冗余，别指望重启服务）"
 Info "  [4] 复核：GZ_IP=... ./scripts/verify_deploy_guangzhou.sh 第 20 探针 token_fp_agree=4/4"
 Info ("  fingerprint to compare everywhere: " + $newFp + " (sha256 first 8 hex; NEVER paste/log the token itself)")
