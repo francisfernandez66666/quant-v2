@@ -56,6 +56,11 @@
 #      现网落盘复核——①在位可读；②内容含三张单源表（NSSM 服务名表/任务名表/nssm 解析器），
 #      防空文件、旧回退副本、scp 截断半份这类"在位但不管用"的假绿（§ENH-5 教训）。
 #
+#  17) §CAL-READOUT（2026-09-26，第 27 探针，owner 令"现网体检加一条日历已加载只读读数"）：
+#      交易日历加载态的磁盘侧只读读数——量规 trading_calendar_loaded 藏在鉴权后的 /api/metrics，
+#      三个正规脚本都不消费它（观察项 #58 的"读数通道缺口"就是这么来的），本探针用日志/缓存两条
+#      免凭据腿补上（判据与读法细节见 PS 段注释；首跑以现网实际读数校准，不预设现网是哪种形态）。
+#
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
 #   GZ_IP=81.71.69.17 COMMIT=beb5b80 ./scripts/verify_deploy_guangzhou.sh   # 显式指定指纹
@@ -836,6 +841,87 @@ if ($svcDefsTxt) {
 $svcDefsDetail = "path=$SvcDefsPath state=" + $svcDefsState + " bytes=" + $svcDefsTxt.Length +
     " miss=" + $(if ($svcDefsMiss.Count) { ($svcDefsMiss -join ",") } else { "none" })
 Probe "ops:C7 service_definitions single source in place" ($svcDefsMiss.Count -eq 0) $svcDefsDetail
+
+# 17) §CAL-READOUT（2026-09-26，第 27 探针，owner 令"现网体检加一条日历已加载只读读数"）：
+# 背景：观察项 #58——要把"休市日照常出信号＝日历 fail-open"定性成可复跑的读数，需要
+#   trading_calendar_loaded 量规的现值；但该量规只在鉴权后的 /api/metrics 里，验证链一直
+#   刻意不带凭据（"只读、不新增凭据"与 signals 探针同姿势），所以改走磁盘侧两条腿。
+# 腿 A 缓存文件 <DataDir>\trading_calendar.json——calendarCacheFilePath()（internal/data/
+#   trade_calendar.go:170）的落盘缓存；QUANT_DATA_DIR 与本脚本 -DataDir 同源（§N-5 注册的
+#   服务 env 即 QUANT_DATA_DIR=$DataDir），冷启动加载器先读它 ⇒ 文件在位＝启动时有可读的日历料。
+#   JSON 键 saved_at/closed_days 纯 ASCII。
+# 腿 B 引擎 stderr 服务日志——Go log.Printf 走 stderr、nssm 落盘采集（10MB 轮转，
+#   prune_logs.ps1 保 20 份）。锚点行三种（全部来自日志打印点，读码钉死）：
+#   · 负线 `... [cal] 交易日历未加载...`（scoring_loop.go:1311，**只在未加载时打**、OncePer 24h）；
+#   · 正线①拉取成功 `... [calendar] ...窗口 20250101~20261231...`（trade_calendar.go:146，
+#     唯一 ASCII 形态 \d{8}~\d{8}）；正线②缓存装载成功 `... [calendar] ...保存于 2026-09-25...`
+#     （trade_calendar.go:227，特征 = [calendar] 行里带 YYYY-MM-DD 日期；失败行不含该形态，
+#     err 文本没有这种日期格式）。
+#   判据只用 ASCII 锚与行首时间戳：现网 PS 5.1 按 ANSI/GBK 解 UTF-8 会把中文打成乱码，
+#   中文永远不做判据（§SIGNAL-DIST 同课）；行首 ts 是 Go logger LstdFlags（main.go:79），
+#   三类行同一时钟，字符串比较＝时间先后，与机器时区无关。
+#   日志路径先读 nssm 服务键注册表 AppStdErr/AppStdout（§N-5 教训：解析控制台文本会踩
+#   UTF-16/NUL 坑，直读注册表拿原生值），读不到再回落 prune_logs.ps1:14 实测位
+#   C:\opt\quant\quant_stderr.log。
+# 只扫活动文件：真未加载时 OncePer 24h 会持续在活动文件补新负线；轮转文件里的旧线分不清
+#   "已恢复"还是"仍没加载"，跨文件拿它做时序证据＝假红机器，故一概不进判据。
+# 判据（刻意不对称，首跑校准）：
+#   红 = 活动文件有 [cal] 负线、且其后再无任一正线（＝此刻仍 fail-open，决定性证据）；
+#   不红 = 日志读不到/路径不存在/只有正线/什么锚线都没有——状态原样写进读数回显。
+#   缓存文件缺失同样不直接判红：现网文件形态首跑前不可知，预判红＝探针出生即自伤
+#   （§probe-premises 口径）；cache= 原样回显，若首跑读数确认"缓存缺失"需处置再按
+#   §SIGNAL-DIST"首跑后收紧"姿势补锁。
+# INFO 恒回显（PASS 也要看得到数，与第 22 探针同通道；bash 侧 INFO 不进 PASS/FAIL 计数）。
+$calCachePath = $DataDir + "\trading_calendar.json"
+$calCacheState = "missing"; $calSavedAt = "na"; $calClosedN = "na"
+if (Test-Path -LiteralPath $calCachePath) {
+    try {
+        $calJson = Get-Content -LiteralPath $calCachePath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $calCacheState = "present"
+        $calSavedAt = ([string]$calJson.saved_at) -replace '[^0-9-]', ''
+        if (-not $calSavedAt) { $calSavedAt = "empty" }
+        if ($null -eq $calJson.closed_days) { $calClosedN = "absent" } else { $calClosedN = ([string](@($calJson.closed_days).Count)) }
+    } catch { $calCacheState = "unreadable" }
+}
+$calLogPath = ""
+try {
+    $calSvcKey = Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\quant" -ErrorAction Stop
+    foreach ($calV in @('AppStdErr', 'AppStdout')) {
+        $calP = [string]$calSvcKey.GetValue($calV, '')
+        if ($calP -and (Test-Path -LiteralPath $calP)) { $calLogPath = $calP; break }
+    }
+} catch { }
+if (-not $calLogPath -and (Test-Path -LiteralPath 'C:\opt\quant\quant_stderr.log')) { $calLogPath = 'C:\opt\quant\quant_stderr.log' }
+$calPosTs = ""; $calPosWin = ""; $calSeedTs = ""; $calNegTs = ""; $calLogState = "nopath"
+if ($calLogPath) {
+    $calLogState = "read"
+    try {
+        foreach ($calLine in (Get-Content -LiteralPath $calLogPath -ErrorAction Stop)) {
+            if ($calLine -notmatch '^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})') { continue }
+            $calTs = $Matches[1]
+            if ($calLine -match '\[cal\]') { $calNegTs = $calTs }
+            elseif ($calLine -match '(\d{8})~(\d{8})') { $calPosTs = $calTs; $calPosWin = $Matches[1] + "~" + $Matches[2] }
+            elseif ($calLine -match '\[calendar\].*20\d\d-\d\d-\d\d') { $calSeedTs = $calTs }
+        }
+    } catch { $calLogState = "unreadable" }
+}
+# 正证据取两种形态里较晚的一条（同一 ts 格式，字符串比较即时间先后）。
+$calGoodTs = $calPosTs
+if ($calSeedTs -and ($calSeedTs -gt $calGoodTs)) { $calGoodTs = $calSeedTs }
+$calBad = ($calNegTs -ne "" -and ($calNegTs -gt $calGoodTs))
+$calVerdict = "no-evidence"
+if ($calPosTs) { $calVerdict = "loaded-api" }
+if ($calSeedTs -and (-not $calPosTs -or $calSeedTs -gt $calPosTs)) { $calVerdict = "loaded-cache" }
+if ($calBad) { $calVerdict = "NOT-LOADED" }
+$calLeaf = "nopath"
+if ($calLogPath) { $calLeaf = [string](Split-Path -Leaf $calLogPath) }
+$calDetail = "verdict=" + $calVerdict + " cache=" + $calCacheState + "," + $calSavedAt + ",n=" + $calClosedN +
+    " log=" + $calLogState + "," + $calLeaf +
+    " pos=" + $(if ($calPosTs) { $calPosTs + " window=" + $calPosWin } else { "none" }) +
+    " seed=" + $(if ($calSeedTs) { $calSeedTs } else { "none" }) +
+    " neg=" + $(if ($calNegTs) { $calNegTs } else { "none" })
+Write-Output ("INFO|cal_readout " + $calDetail)
+Probe "cal: trading calendar not in fail-open (readout in INFO)" (-not $calBad) $calDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，

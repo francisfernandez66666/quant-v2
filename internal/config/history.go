@@ -193,21 +193,32 @@ func RestoreRulesContentCurrent(m *Manager) ([]byte, error) {
 }
 
 // WriteConfigFile 把给定字节原子写入 config.json（回滚恢复用；后续由 config.Watch 热重载生效）。
-// English: atomically writes the given bytes to config.json (used by rollback; the config.Watch
-// hot-reload applies it afterwards).
+// §AUDIT-UNIFY（owner 裁决 2026-09-26「配置变更审计统一走包装」）：这里**不再自带审计行**——
+// 本层拿不到真实操作者（旧版硬编 "admin" 且只有 "ok"、没有字段级 diff），审计统一交回
+// 处理器层经 AuditRulesDiff 单入口落账；写手就是写手，别在写手里藏一本假账。
+// English: atomically writes the given bytes to config.json (used by rollback; config.Watch applies
+// it). Since §AUDIT-UNIFY this helper no longer emits its own audit line — the handler audits via the
+// single entry point AuditRulesDiff with the real actor and a field-level diff.
 func WriteConfigFile(m *Manager, b []byte) error {
 	if m == nil || m.path == "" {
 		return fmt.Errorf("配置路径为空")
 	}
-	if err := fileutil.AtomicWrite(m.path, b, 0o644); err != nil {
-		return err
-	}
-	opslog.Audit("config_rollback", "admin", m.path, "ok")
-	return nil
+	return fileutil.AtomicWrite(m.path, b, 0o644)
 }
 
-// AuditRulesDiff 变更后记 opslog 审计（配合 WS-F C1 审计日志）。
-// English: records a config-change audit line to opslog after a save.
-func AuditRulesDiff(m *Manager, diff string) {
-	opslog.Audit("config_change", "admin", m.path, diff)
+// AuditRulesDiff 是 config.json **变更审计的唯一入口**（§AUDIT-UNIFY，owner 裁决 2026-09-26）。
+// 旧形态硬编 actor="admin"（谁操作都记成 admin，等于没记）且全仓零生产调用——实盘配置那条路
+// 各自直写 opslog、回滚那条路只留了句普通运行日志。现在各条路统一走这里：真实操作者进参、
+// 变更面（target）点名是哪条路（如 "qmt"、"rollback:<快照ts>"）、diff 文本必须是字段级行。
+// 门禁锁：本函数生产调用点 ≥2（元闸判红组成员），opslog.Audit("config_change") 直写不得复活。
+// English: the single entry point for config.json change auditing; takes the real actor, the changed
+// surface, and the field-level diff. Direct opslog.Audit writes on this kind are locked out.
+func AuditRulesDiff(m *Manager, actor, target, diff string) {
+	if m == nil {
+		return
+	}
+	if strings.TrimSpace(actor) == "" {
+		actor = "unknown" // 读数不可得也要留痕，绝不冒充 admin（§N-5 姿势同款）
+	}
+	opslog.Audit("config_change", actor, target, diff)
 }

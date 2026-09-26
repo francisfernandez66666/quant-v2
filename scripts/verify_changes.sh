@@ -2624,12 +2624,14 @@ for fn in SgInc SgTop; do
 	fnc=$(grep -c "^function ${fn}(" "$VD" || true)
 	[ "$fnc" = "1" ] || { echo "--- FAIL: function ${fn} 的定义不是唯一一处（计数=${fnc}，两套计数/格式化实现迟早分叉）"; exit 1; }
 done
-# ⑧ INFO 是观测通道不是判据通道：bash 侧只 echo、不进 PASS/FAIL 计数（判数仍是 25 条）。
+# ⑧ INFO 是观测通道不是判据通道：bash 侧只 echo、不进 PASS/FAIL 计数（判数口径见 verify_deploy 头注）。
 #    一旦有人把 INFO 接成 PASS，绿的数量就会凭空增长，而红绿语义没变——这是最隐蔽的一种假绿。
+#    行数=4：逐文件空态/逐文件明细/当日聚合（§SIGNAL-DIST 原三条）+ 日历读数（§CAL-READOUT，
+#    2026-09-26 owner 令新增第 27 探针的恒回显腿；§101 另有 INFO|cal_readout 在位锁）。
 grep -qF 'INFO\|*) echo' "$VD" \
 	|| { echo '--- FAIL: bash 侧 INFO 分支丢失（观测读数会被当成未知行，或被误接进 PASS/FAIL 计数）'; exit 1; }
 infop=$(grep -c 'Write-Output ("INFO|' "$VD" || true)
-[ "$infop" = "3" ] || { echo "--- FAIL: INFO 观测行数不是 3（逐文件空态/逐文件明细/当日聚合，计数=${infop}）"; exit 1; }
+[ "$infop" = "4" ] || { echo "--- FAIL: INFO 观测行数不是 4（逐文件空态/逐文件明细/当日聚合/日历读数，计数=${infop}）"; exit 1; }
 # ⑨ 负锁：本探针不得用 `| Out-String` 读 JSON 字段（PS 控制台按 120 列折行会劈开值，§N-5 的教训本体；
 #    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
 grep -qF '([string]$sgJson.trading_day)' "$VD" \
@@ -3916,9 +3918,8 @@ fi
 #    verify_deploy 第 26 探针/服务名集合等值/旧 nssm 字面量负锁）。
 # ⑨ 元闸（FIX_PLAN ⑨「元验收」兑现）：带 § 的防线函数必须 grep 到**非测试**调用点。
 #    五例逐一过筛：PITEnabled/gateLiveStrategyLibrary/order-confirm 三条活线判红；
-#    NewFailoverBoard 与 AuditRulesDiff 实测**全仓零生产调用**（板块降级链实际由
-#    market.go 的镜像分页腿承担、配置审计由 qmt.go 直写 opslog.Audit）——本批未获
-#    接线裁决，不静默删除也不静默豁免：走 OBS 观测读数，每次门禁都点名，待 owner 裁决。
+#    NewFailoverBoard 与 AuditRulesDiff 原为 OBS 待裁决（09-26 建闸时实测零生产调用），
+#    同日下午 owner 裁决「移除/统一包装」已实施 ⇒ 两条同批转判红组（见下方 ⑨ 段说明）。
 # 全部判据都是静态 grep/awk，真实行为回归在 -full 与各包用例（gate_test /
 # real_positions_test / pnl_offset* _test / report_contract_test / test_report_contract.py /
 # h2_positions_balance.test.jsx §E1 段）。
@@ -4017,23 +4018,117 @@ gw_absent "C7 负锁：旧 C:\\qmt\\nssm 硬编码字面量复活（单源候选
 gw_min "元闸 PITEnabled（B4 时点池判定）有生产调用" "$(gw_meta_calls 'o\.PITEnabled\(\)')" "1"
 gw_min "元闸 gateLiveStrategyLibrary（§95/C1 零规则闸）有生产调用" "$(gw_meta_calls 'gateLiveStrategyLibrary\(')" "1"
 gw_chk "元闸 order-confirm（C3 第三态出口）路由注册在生产码" "$(gw_code_hits internal/server/server.go 'HandleFunc\("POST /api/qmt/order-confirm"')" "1"
-# 下面两条实测全仓零生产调用（2026-09-26 建闸时锤实）：不判红（本批未获接线裁决），
-# 但每次门禁都点名——防"文档说修了、代码从没接上"的最后一段静默区。owner 裁决后
-# 要么接线（转进上面的判红组），要么按裁决移除，二者必居其一。
-GW_M_FB="$(gw_meta_calls 'NewFailoverBoard\(')"
-GW_M_AD="$(gw_meta_calls 'AuditRulesDiff\(')"
-if [ "$GW_M_FB" = "0" ]; then GW_OBS="${GW_OBS}
-  ○ §WS-D D-1 NewFailoverBoard（板块降级链）：仅测试引用，生产板块路径走 market.go 镜像分页——待 owner 裁决接线/移除"; fi
-if [ "$GW_M_AD" = "0" ]; then GW_OBS="${GW_OBS}
-  ○ AuditRulesDiff（配置变更审计包装器）：仅定义零调用，现网审计由 qmt.go:1170 直写 opslog.Audit——待 owner 裁决统一入口/移除"; fi
+# 2026-09-26 午后 owner 裁决到账，这两条由 OBS 观测读数转进判红组（52453ea 批只留读数，
+# 同日实施批把裁决钉死）：
+#   ① NewFailoverBoard 裁决「移除」——板块降级链零生产调用，函数本体连文件一起删；
+#      锁＝全仓 Go 不再有任何 NewFailoverBoard 定义/引用（死代码不得复活）。
+#   ② AuditRulesDiff 裁决「统一包装」——config.json 变更审计单入口；锁＝生产调用点 ≥2
+#      （qmt 保存路 + 回滚路）+ qmt.go 里 opslog.Audit("config_change" 直写清零。
+gw_absent "元闸 NewFailoverBoard（裁决：移除）不得复活" "$(gw_meta_calls 'NewFailoverBoard\(')"
+gw_min "元闸 AuditRulesDiff（裁决：统一包装）生产调用 ≥2（qmt 保存+回滚两路）" "$(gw_meta_calls 'AuditRulesDiff\(')" "2"
+gw_absent "元闸 负锁：qmt.go opslog.Audit(\"config_change\" 直写复活（绕过单入口）" "$(gw_code_hits internal/server/qmt.go 'opslog\.Audit\("config_change"')"
 
 if [ -z "$GW_ERRS" ]; then
-	echo "ok - §0926-W2 守卫通过（A5 锁 4 + A1 锁 9 + B2 锁 4 + B3 锁 6 + B4 锁 4 + B7 锁 4 + E1 锁 12 + C7 锁 7 + 元闸 3 判红组）"
+	echo "ok - §0926-W2 守卫通过（A5 锁 4 + A1 锁 9 + B2 锁 4 + B3 锁 6 + B4 锁 4 + B7 锁 4 + E1 锁 12 + C7 锁 7 + 元闸 6 判红组，含 09-26 午后两裁决转红）"
 	if [ -n "$GW_OBS" ]; then echo "观察读数（不判红，待裁决项点名）:${GW_OBS}"; fi
 else
 	echo "--- FAIL: §0926-W2 断言不符:${GW_ERRS}"
 	exit 1
 fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# §101 §0926PM（2026-09-26 下午批，owner 令「token 轮换+勘误 / 日历读数 / 二波+三季报重灌 / 门禁+部署」）
+# 一物一锁，三族：
+# ① §FINA-Q3 三季报云端重灌通道（scripts/backfill_fina_q3_guangzhou.sh）：这条通道**会写现网
+#    研究库**，安全口径必须逐条有锁而不是只活在头注释里——远端查询全走 mode=ro（缺省只读可证）、
+#    只补缺失键（对财务三表零 UPDATE 零 DELETE）、双层回滚依据（SNAP_OK 表级快照 + 插入键台账，
+#    台账行数等值锁）、磁盘护栏（ABORT=disk）、写后 MISSING 归零复核；再加两条运行时反证
+#    （离网真跑：正常临时库必须停在 BatchMode 预探测且**任何写入侧判定行都不许出现**；空载荷
+#    必须判红并点名原因，"0 行也算成功"是 §MINUTE 同款假绿）。ps1 体内掺中文会被它自己的
+#    ASCII 闸整轮判红——09-26 建闸首跑实抓一次，静态锁防复发。
+# ② §CAL-READOUT 日历已加载只读读数（verify_deploy 第 27 探针）：判据只认「负线晚于全部正线」
+#    这一条不对称锁；凭据负锁（验证链零 /api/metrics 非注释命中，读数走磁盘两腿）；日志路径
+#    必须先读 nssm 注册表键的 AppStdErr/AppStdout 再回落实测位（§N-5：解析控制台文本必踩坑）。
+# ③ §RESTIC-LOCK Mac 拉取腿陈旧锁自愈：两仓 unlock + 三败中途补一次（03:09 遗留锁拦死 07:00
+#    窗的实录修法）；自愈必须非致命（每行带 || 兜底），且 copy 成败判定语义一字未动。
+# 全部判据是静态 grep + 离网一次性临时库真跑（段尾统一 rm，测试数据不落工作树）。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 101 §0926PM 三季报通道+日历读数探针+restic 自愈（2026-09-26 下午批）..."
+FQ_ERRS=""
+fq_chk() { if [ "$2" != "$3" ]; then FQ_ERRS="${FQ_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+fq_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then FQ_ERRS="${FQ_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+fq_absent() { if [ "${2:-0}" -ne "0" ]; then FQ_ERRS="${FQ_ERRS}
+  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+
+FQ_SCR=scripts/backfill_fina_q3_guangzhou.sh
+FQ_VD=scripts/verify_deploy_guangzhou.sh
+FQ_RS=deploy/mac/restic_pull_backup.sh
+FQ_SY=0; bash -n "$FQ_SCR" 2>/dev/null || FQ_SY=$?
+fq_chk "§FINA-Q3 脚本语法自检 bash -n" "$FQ_SY" "0"
+FQ_SY2=0; bash -n "$FQ_VD" 2>/dev/null || FQ_SY2=$?
+fq_chk "verify_deploy 语法自检 bash -n（第 27 探针插入后）" "$FQ_SY2" "0"
+FQ_SY3=0; bash -n "$FQ_RS" 2>/dev/null || FQ_SY3=$?
+fq_chk "restic 拉取腿语法自检 bash -n" "$FQ_SY3" "0"
+
+# ── ① §FINA-Q3 写入口径（静态） ──
+fq_absent "对财务表的任何 UPDATE（本通道只补缺失键）" "$(grep -cE 'UPDATE (fina_indicator|income|cashflow)' "$FQ_SCR" || true)"
+fq_absent "对财务表的任何 DELETE（回滚只准按台账另行处置）" "$(grep -cE 'DELETE FROM (fina_indicator|income|cashflow)' "$FQ_SCR" || true)"
+fq_min "ro 连接腿在位（本机导出+远端复核+快照读+POST 回读，全走只读连接起步 3 条）" "$(grep -c 'mode=ro' "$FQ_SCR" || true)" "3"
+fq_min "磁盘护栏判红在位（ABORT=disk）" "$(grep -c 'ABORT=disk' "$FQ_SCR" || true)" "1"
+fq_min "表级快照判定行 SNAP_OK（判定+缺行判红两腿）" "$(grep -c 'SNAP_OK' "$FQ_SCR" || true)" "2"
+fq_min "插入键台账按 TAG 落远端 backup_fina（第一层回滚依据）" "$(grep -c 'backup_fina/inserted-' "$FQ_SCR" || true)" "1"
+fq_min "台账行数等值锁在位（行数!=inserted 即判红）" "$(grep -c '台账行数' "$FQ_SCR" || true)" "1"
+fq_min "写后 MISSING 归零复核（口径⑤第二遍）" "$(grep -c 'missing=0' "$FQ_SCR" || true)" "1"
+fq_min "ps1 组装后的非 ASCII 自检（§CAND-PUSH 同闸）" "$(grep -c "LC_ALL=C grep -n '\[^ -~\]'" "$FQ_SCR" || true)" "1"
+fq_min "解析远端回传前去 CR（§CRLF 同课）" "$(grep -c "tr -d '\\\\r'" "$FQ_SCR" || true)" "1"
+FQ_PS1BODY="$(awk '/run.ps1" <<.PSEOF\./{f=1;next} f&&/^PSEOF$/{exit} f' "$FQ_SCR")"
+FQ_PS1CN="$(printf '%s' "$FQ_PS1BODY" | LC_ALL=C grep -c '[^ -~]' || true)"
+fq_absent "编排 ps1 体内掺中文（撞自己的 ASCII 闸＝整轮判红，09-26 实录）" "$FQ_PS1CN"
+
+# ── ①b §FINA-Q3 运行时离网真跑（一次性临时库，绝不连生产；段尾统一 rm）──
+FQ_TMP="$(mktemp -d /tmp/verify101_XXXXXX)"
+sqlite3 "$FQ_TMP/t.db" "CREATE TABLE fina_indicator (ts_code TEXT, end_date TEXT, eps DOUBLE, PRIMARY KEY(ts_code,end_date)); CREATE TABLE income (ts_code TEXT, end_date TEXT, revenue DOUBLE, PRIMARY KEY(ts_code,end_date)); INSERT INTO fina_indicator VALUES ('600000.SH','20250930',1.2),('000001.SZ','20240930',0.8); INSERT INTO income VALUES ('600000.SH','20250930',100.0);"
+FQ_PVOUT="$FQ_TMP/preview.out"
+FQ_PV=0
+GZ_IP=203.0.113.7 LOCAL_DB="$FQ_TMP/t.db" bash "$FQ_SCR" > "$FQ_PVOUT" 2>&1 || FQ_PV=$?
+fq_chk "离网真跑必须停在登录探测（非 0＝连不上生产时绝不自称成功）" "$([ "$FQ_PV" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+fq_min "导表腿先于预探测完成（FINA_LOCAL 判定行回显计划数 3）" "$(grep -c 'FINA_LOCAL rows=3' "$FQ_PVOUT" || true)" "1"
+FQ_WRITE="$(grep -cE 'FINA_BACKFILL_DONE|PS_DONE|SNAP_OK|ABORT=' "$FQ_PVOUT" || true)"
+fq_absent "预览/失败路径出现任何写入侧判定行（写入口径只在 -Apply 远端真跑后出现）" "$FQ_WRITE"
+sqlite3 "$FQ_TMP/e.db" "CREATE TABLE fina_indicator (ts_code TEXT, end_date TEXT); CREATE TABLE income (ts_code TEXT, end_date TEXT);"
+FQ_EM=0
+GZ_IP=203.0.113.7 LOCAL_DB="$FQ_TMP/e.db" bash "$FQ_SCR" > "$FQ_TMP/empty.out" 2>&1 || FQ_EM=$?
+fq_chk "空载荷必须判红（0 行不算成功）" "$([ "$FQ_EM" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+fq_min "空载荷失败原因点名（不许只留退出码）" "$(grep -c '载荷为空' "$FQ_TMP/empty.out" || true)" "1"
+rm -rf "$FQ_TMP"
+
+# ── ② §CAL-READOUT 第 27 探针 ──
+fq_chk "日历探针判据行恰 1（不对称：红＝负线晚于全部正线）" "$(grep -c '\$calBad = (\$calNegTs -ne "" -and (\$calNegTs -gt \$calGoodTs))' "$FQ_VD" || true)" "1"
+fq_chk "日历探针判定名恰 1（Probe 行）" "$(grep -c 'Probe "cal: trading calendar not in fail-open' "$FQ_VD" || true)" "1"
+fq_min "INFO 恒回显通道（绿也要看得到读数，§SIGNAL-DIST 姿势）" "$(grep -c 'INFO|cal_readout' "$FQ_VD" || true)" "1"
+fq_min "日志路径先读 nssm 注册表键 AppStdErr/AppStdout（§N-5）" "$(grep -c "@('AppStdErr', 'AppStdout')" "$FQ_VD" || true)" "1"
+fq_min "注册表读不到时回落 prune_logs 实测位" "$(grep -c 'C:\\opt\\quant\\quant_stderr.log' "$FQ_VD" || true)" "1"
+FQ_METRICS="$({ grep -n '/api/metrics' "$FQ_VD" || true; } | { grep -vE '^[0-9]+:[[:space:]]*#' || true; } | wc -l | tr -d ' ')"
+fq_absent "凭据负锁：非注释行出现 /api/metrics（读数刻意走磁盘两腿，验证链不新增凭据）" "$FQ_METRICS"
+FQ_CALCN="$({ grep -n 'calDetail\|cal_readout\|calBad' "$FQ_VD" || true; } | { grep -vE '^[0-9]+:[[:space:]]*#' || true; } | LC_ALL=C grep -c '[^ -~]' || true)"
+fq_absent "中文判据负锁：cal 判据/明细行掺中文（GBK 回传课）" "$FQ_CALCN"
+fq_min "verdict 四态锚之一 NOT-LOADED 在位" "$(grep -c '"NOT-LOADED"' "$FQ_VD" || true)" "1"
+
+# ── ③ §RESTIC-LOCK 拉取腿陈旧锁自愈 ──
+fq_min "unlock 点名（两仓首清+三败中途补+口径注释，≥6 处）" "$(grep -c 'unlock' "$FQ_RS" || true)" "6"
+FQ_UNLOCK_RAW="$({ grep -E '^[[:space:]]*restic .*unlock' "$FQ_RS" || true; } | { grep -vc '|| ' || true; })"
+fq_absent "unlock 命令行无 || 兜底（自愈必须非致命，真并发锁照样交给 copy 判红）" "$FQ_UNLOCK_RAW"
+fq_chk "copy 成败判定语义一字未动（COPY_OK 判定行恰 1）" "$(grep -c '\[ "\$COPY_OK" = "1" \] || fail' "$FQ_RS" || true)" "1"
+
+if [ -z "$FQ_ERRS" ]; then
+	echo "ok - §0926PM 守卫通过（FINA-Q3 静态锁 11 + 离网反证 5 + 日历探针锁 8 + restic 自愈锁 3）"
+else
+	echo "--- FAIL: §0926PM 断言不符:${FQ_ERRS}"
+	exit 1
+fi
+
 
 echo ""
 echo "==> 全部通过"

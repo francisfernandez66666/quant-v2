@@ -62,10 +62,21 @@ func (s *Server) handleConfigRollback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, err.Error())
 		return
 	}
+	// §AUDIT-UNIFY（owner 裁决 2026-09-26「配置变更审计统一走包装」）：回滚同样是 config.json
+	// 的一次变更，审计走 AuditRulesDiff 单入口——写前先取当前内容算字段级 diff（拿不到不阻断
+	// 回滚本身，diff 记 "unavailable" 留痕，绝不静默）；target 点名 "rollback:<快照ts>"。
+	beforeBytes, beforeErr := config.RestoreRulesContentCurrent(s.cfg)
 	if err := config.WriteConfigFile(s.cfg, b); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
+	d := "unavailable"
+	if beforeErr == nil {
+		if dd, derr := config.DiffRules(beforeBytes, b); derr == nil {
+			d = dd
+		}
+	}
+	config.AuditRulesDiff(s.cfg, userIDFor(r), "rollback:"+req.SnapshotTS, d)
 	log.Printf("[config] 配置回滚到快照 %s（操作者=%s）", req.SnapshotTS, userIDFor(r))
 	writeJSON(w, 200, map[string]string{"status": "ok", "snapshot_ts": req.SnapshotTS})
 }

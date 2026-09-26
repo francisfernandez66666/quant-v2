@@ -1163,11 +1163,13 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 			ctrl.UpdateConfig(cfg)
 		}
 	}
-	// §WS-K 维4 变更 diff → opslog 审计（可下载/前端历史可见）
+	// §WS-K 维4 变更 diff → opslog 审计（可下载/前端历史可见）。
+	// §AUDIT-UNIFY（owner 裁决 2026-09-26）：config_change 一律经 config.AuditRulesDiff 单入口
+	// 落账——真实操作者进参、target 点名变更面（这里是 "qmt"），本处不再直写 opslog.Audit。
 	if beforeBytes != nil {
 		if afterBytes, err := config.RestoreRulesContentCurrent(s.cfg); err == nil {
 			if d, derr := config.DiffRules(beforeBytes, afterBytes); derr == nil && d != "(无变更)" {
-				opslog.Audit("config_change", actor, "qmt", d)
+				config.AuditRulesDiff(s.cfg, actor, "qmt", d)
 			}
 		}
 	}

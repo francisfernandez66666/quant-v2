@@ -58,7 +58,17 @@ PY
 awk "BEGIN{exit !($AGE_H > $FRESH_MAX_HOURS)}" && fail "快照过期 ${AGE_H%.*}h > ${FRESH_MAX_HOURS}h"
 log "快照 OK：ts=$SNAP_TS age=${AGE_H%.*}h"
 
-# 2) restic copy：只拉本地仓库缺失的 pack（真增量）。
+# 2.0) 陈旧锁自愈（§RESTIC-LOCK 客户端腿，与广州侧同姿势）。
+#      copy 的 restic 进程若被外层杀掉（超时/断连），会在源或目标仓库留下排他锁文件；
+#      下一次窗口会对着这把死锁连撞 8 次熔断判失败——2026-09-26 07:00 窗实录：03:09
+#      那次被杀的 no-op copy 在广州中转仓留锁 PID 32000，早晨整窗 8 败全为此锁。
+#      `restic unlock` 只清「主机为本机且 PID 已不存在 / 锁已超时」的锁（restic 自判），
+#      真并发跑着的锁清不掉、copy 照样失败，所以红绿语义不变、失败计数照常。
+log "清理上次遗留的陈旧锁（源+目标两仓）..."
+restic --repo "$REPO_REMOTE" unlock 2>>"$LOG" || log "源仓 unlock 未成（网络/并发占用，交给 copy 重试）"
+restic --repo "$REPO_LOCAL" unlock 2>>"$LOG" || log "目标仓 unlock 未成（同上，交给 copy 重试）"
+
+# 2.1) restic copy：只拉本地仓库缺失的 pack（真增量）。
 #    慢速公网 sftp 偶发抖动会触发 restic 熔断器（circuit breaker）——copy 可断点续传，
 #    已拷 pack 自动跳过，故包一层重试循环把它磨完。
 log "restic copy（拉增量）..."
@@ -69,7 +79,13 @@ for attempt in 1 2 3 4 5 6 7 8; do
     COPY_OK=1
     break
   fi
-  log "copy 第 $attempt 次失败（熔断/网络抖动），45s 后重试..."
+  # 第 3 次仍败大概率又是锁形态（窗口中途别处断线留锁）：中途补一次自愈再进下一轮重试。
+  if [ "$attempt" -eq 3 ]; then
+    log "copy 三败，中途补一次 unlock 自愈 ..."
+    restic --repo "$REPO_REMOTE" unlock 2>>"$LOG" || true
+    restic --repo "$REPO_LOCAL" unlock 2>>"$LOG" || true
+  fi
+  log "copy 第 $attempt 次失败（熔断/网络抖动/锁），45s 后重试..."
   sleep 45
 done
 [ "$COPY_OK" = "1" ] || fail "restic copy 连续 8 次失败"
