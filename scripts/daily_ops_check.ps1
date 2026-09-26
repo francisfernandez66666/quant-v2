@@ -40,7 +40,17 @@ if ($ld) { $ld | Select-Object FullName, LastWriteTime | Format-List | Out-Strin
 Get-CimInstance Win32_Process -Filter "name='quant.exe'" | ForEach-Object { Write-Output ("quant pid=" + $_.ProcessId) }
 # §H8：网关健康口同样取同源变量（配置缺失时本节明确 FAIL，不再回退旧硬编码 URL）
 if ($probeCfg) {
-  try { (Invoke-RestMethod -Uri $ProbeGatewayUrl -TimeoutSec 5) | ConvertTo-Json -Depth 2 } catch { "gateway unreachable" }
+  try {
+    $gwj = Invoke-RestMethod -Uri $ProbeGatewayUrl -TimeoutSec 5
+    $gwj | ConvertTo-Json -Depth 2
+    # §0926E2E-W2D 回报 outbox 冻结观察腿：溢出不再自动删最旧（成交回报是资金事实，宁冻结
+    # 不销毁），深度/水位状态在 /health 可见；收敛只有一条路——人工 outbox_admin.py --keep N --yes。
+    # 旧版网关无该字段记 N/A，不判 FAIL（观察面随本批发版生效，别让校验先于施工红）。
+    if ($null -ne $gwj.outbox_depth) {
+      if ($gwj.outbox_overflow) { Write-Output ("WARN outbox overflow depth=" + $gwj.outbox_depth + "（冻结保留未删：先查上报链路；确认旧回报已在决策端落账后再人工收敛）") }
+      else { Write-Output ("OK   outbox depth=" + $gwj.outbox_depth) }
+    } else { Write-Output 'N/A  网关旧版无 outbox_depth 字段（本批发版后生效）' }
+  } catch { "gateway unreachable" }
 } else {
   Write-Output 'FAIL gateway probe skipped: service_probe_config.ps1 not loaded (§H8)'
 }

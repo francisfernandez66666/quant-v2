@@ -231,11 +231,14 @@ export default function Dashboard() {
   // 页面挂载：加载数据、启动定时刷新、订阅 SSE、监听可见性变化；卸载时清理
   useEffect(() => {
     load()
-    // 主数据每 10s 兜底轮询（实时靠 SSE 事件）
-    timer.current = setInterval(load, 10000)
+    // 主数据兜底轮询（实时靠 SSE 事件）
+    // §0926E2E-17A：10s 高频兜底对齐 §F5 的 60s 统一口径——本页实时性由 scan/message/score
+    // 三类 SSE 事件驱动（下方订阅），轮询只是事件缺位时的安全网，10s 属历史遗留非需求。
+    timer.current = setInterval(load, 60000)
     loadQMT()
-    // QMT 链路状态每 15s 轮询刷新
-    qmtTimer.current = setInterval(loadQMT, 15000)
+    // QMT 链路状态兜底轮询：§0926E2E-17A 同口径由 15s 对齐 60s
+    // （委托/熔断级实时变化另由 Quant 页的 qmt_report/qmt_halt SSE 通道承担）。
+    qmtTimer.current = setInterval(loadQMT, 60000)
     api.connectSSE()
     sseUnsub.current = on(['scan', 'message', 'score'], handleSSE) // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
     visibilityHandler.current = () => {
@@ -245,19 +248,19 @@ export default function Dashboard() {
       } else {
         if (!timer.current) {
           load()
-          // 恢复页面后重启主数据 10s 兜底轮询
-          timer.current = setInterval(load, 10000)
+          // 恢复页面后重启主数据兜底轮询（§0926E2E-17A：60s，与挂载腿同值）
+          timer.current = setInterval(load, 60000)
         }
         if (!qmtTimer.current) {
           loadQMT()
-          // 恢复页面后重启 QMT 15s 轮询
-          qmtTimer.current = setInterval(loadQMT, 15000)
+          // 恢复页面后重启 QMT 兜底轮询（§0926E2E-17A：60s）
+          qmtTimer.current = setInterval(loadQMT, 60000)
         }
       }
     }
     document.addEventListener('visibilitychange', visibilityHandler.current)
     // §M-9（2026-09-22 修复批）三个健康端点不再单独"挂载拉一次 + catch 吞"：
-    // 已并入 load()→loadHealth()，随挂载/10s 轮询/SSE/可见性恢复统一刷新。
+    // 已并入 load()→loadHealth()，随挂载/兜底轮询（§0926E2E-17A 起为 60s）/SSE/可见性恢复统一刷新。
     return () => {
       if (timer.current) clearInterval(timer.current)
       if (qmtTimer.current) clearInterval(qmtTimer.current)

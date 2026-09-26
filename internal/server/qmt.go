@@ -335,6 +335,19 @@ func ctrlTripped(s *Server, userID string) bool {
 // English: §P1-7 client idempotency key pattern (alnum + dash/underscore, ≤64 chars).
 var regClientID = regexp.MustCompile(`^[A-Za-z0-9_\-]{1,64}$`)
 
+// fetchQuoteForOrder §0926E2E-W1C：手动单取实时现价的统一口径——生产走 market.GetRealtimeQuote，
+// 包内测试缝 quoteForOrderFn 注入时优先用缝（伪造"行情链在场但取价失败/成功"两种形态）。
+// English: single quote-fetch entry for the manual-order price sanity check.
+func (s *Server) fetchQuoteForOrder(code string) (*data.StockInfo, error) {
+	if s.quoteForOrderFn != nil {
+		return s.quoteForOrderFn(code)
+	}
+	if s.market == nil {
+		return nil, errors.New("行情源未接入")
+	}
+	return s.market.GetRealtimeQuote(code)
+}
+
 // handleExecuteAction 执行 manual 下单（POST /api/positions/execute）。
 // 请求体：{code, side(必填，只接受 买入/卖出——§SIDE-AUTH-2 起空串也拒), action(加仓/减仓/止盈/止损/清仓),
 // qty, price, strategy, reason}
@@ -358,6 +371,11 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		// §P1-7 限价偏离确认：参考价偏离实时价超 ±15% 时必须显式确认才受理（防手滑输错价
 		// 真金白银成交）。行情不可用时跳过校验（fail-open，与风控闸哲学一致）。
 		ConfirmDeviation bool `json:"confirm_deviation"`
+		// §0926E2E-W1C（2026-09-26 全量审计批）：实时现价**取不到**时的显式确认位。
+		// 旧形态 q==nil 直接跳过 ±15% 偏离校验＝真钱路径上"行情故障=错价可成交"（数据缺口→放行
+		// 家族）；现改为：行情链在场而取价失败 → 必须带 confirm_no_quote=true 才受理，
+		// 且落 opslog 留痕（谁确认的、什么价）。
+		ConfirmNoQuote bool `json:"confirm_no_quote"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -438,9 +456,10 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	//   - 陈旧度未提供（StaleQuoteGuard 恒跳过）。
 	var q *data.StockInfo
 	var staleMs int64 = -1 // -1=无行情（StalenessMs 未知，守卫跳过）；取到行情后置 0（新鲜）
-	if s.market != nil {
-		// best-effort 拉实时行情：失败/无价不阻断下单（fail-open）。
-		if qq, qerr := s.market.GetRealtimeQuote(normalizeTsCode(req.Code)); qerr == nil && qq != nil && qq.Price > 0 {
+	quoteAvailable := s.market != nil || s.quoteForOrderFn != nil // 行情链在场（含测试缝注入）
+	if quoteAvailable {
+		// best-effort 拉实时行情：失败/无价不再静默放行（见下方 §0926E2E-W1C 分支）。
+		if qq, qerr := s.fetchQuoteForOrder(normalizeTsCode(req.Code)); qerr == nil && qq != nil && qq.Price > 0 {
 			q = qq
 		}
 	}
@@ -451,6 +470,21 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 				req.Price, q.Price, dev*100))
 			return
 		}
+	} else if quoteAvailable && !ctrl.Config().Halted {
+		// §0926E2E-W1C（2026-09-26 全量审计批，owner 令按推荐执行）：行情链在场却取不到现价，
+		// 旧行为是**跳过 ±15% 偏离校验直接放行**——真钱路径上"行情故障=手滑错价可成交"，
+		// 与闸1（已实现盈亏吞 0 放水）同族（数据缺口→放行）。现改为显式确认制：
+		// 未带 confirm_no_quote → 400（报错文案带固定前缀，前端据此弹二次确认）；
+		// 带确认 → 受理并落 opslog 留痕（紧急行情故障时操作员仍可下单，留痕可追责）。
+		// halted 短路：kill-switch 置位时本分支让位——PlaceOrder 会以更权威的
+		// "kill-switch engaged"理由拒单，确认闸不得抢走/掩盖紧急停止的拒单文案。
+		if !req.ConfirmNoQuote {
+			log.Printf("[security] 手动单现价不可得被拒（§0926E2E-W1C 需显式确认）用户=%s code=%s price=%.2f", uid, req.Code, req.Price)
+			opslog.Audit("live_order_quote_unavailable", uid, req.Code, fmt.Sprintf("现价不可得，未确认被拒：side=%s qty=%d price=%.2f", side, qty, req.Price))
+			writeError(w, 400, "无法获取实时现价：本次委托价未经价格偏离校验。请核对行情链路后重试；若确认行情确实不可达仍需下单，请在弹窗中确认继续")
+			return
+		}
+		opslog.Audit("live_order_no_quote_confirmed", uid, req.Code, fmt.Sprintf("行情不可用态显式确认下单（跳过价格偏离校验）：side=%s qty=%d price=%.2f", side, qty, req.Price))
 	}
 	// 幂等键构造：客户端 UUID 合法（格式/长度通过）则以 clientID 组键（重试复用同键防重复下单）；
 	// 缺省/非法回退秒级时间戳键（兼容旧客户端，双击跨秒会各自成单——旧行为）。
@@ -1148,7 +1182,17 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		writeError(w, 400, "非法配置: "+verr.Error())
 		return
 	}
-	s.cfg.SetQMTConfigFor(target, &cfg)
+	// §0926E2E-W1B（2026-09-26 全量审计批，owner 令按推荐执行）：持久化失败（含写后复读不匹配）
+	// 即中止回 500——旧行为是 SetQMTConfigFor 吞错后本端点无条件 200"已保存"，磁盘没落、
+	// 重启后 enabled/熔断/预算等安全参数回退旧值，正是 §ROBUST 要消灭的"降级报成功"。
+	// 中止放在落库当步：kill-switch/金额帽等"保存即生效"副作用只在确认落盘后执行，
+	// 避免"运行时已翻转、磁盘回退旧值"的半态。
+	if err := s.cfg.SetQMTConfigFor(target, &cfg); err != nil {
+		log.Printf("[qmt] 配置持久化失败 target=%s operator=%s: %v", target, s.operatorID(), err)
+		opslog.Audit("qmt_config_save_failed", actor, target, err.Error())
+		writeError(w, 500, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
+		return
+	}
 	// §U-3（2026-09-14 像素级 UAT）：本端点其余字段走开关队列（休市不翻转实盘行为，§QMT-PENDING），
 	// 但请求显式携带 halted 属 kill-switch 语义——必须与 /api/qmt/halt 同口径立即生效，
 	// 否则"保存即熔断"会静默滞留到次日开盘（fail-stop 漏洞）。
@@ -1265,7 +1309,13 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)                  // kill-switch 作用于当前登录账号（admin 权限中间件已保证）
 	cfg := *(s.cfg.GetQMTConfigFor(uid)) // 值拷贝：基于当前配置做单字段覆盖，避免读到一半被并发改写
 	cfg.Halted = *req.Halted             // 本次只翻转 halted 字段，其余保持原值
-	s.cfg.SetQMTConfigFor(uid, &cfg)     // 持久化（跨重启保留）
+	// §0926E2E-W1B：kill-switch 状态必须先确认落盘再执行——持久化失败即回 500 且不翻转
+	// 运行时（否则出现"内存已熔断、磁盘没记，重启后自动恢复下单"的危险半态）。
+	if err := s.cfg.SetQMTConfigFor(uid, &cfg); err != nil {
+		log.Printf("[qmt] kill-switch 持久化失败 uid=%s: %v", uid, err)
+		writeError(w, 500, "熔断状态保存失败（未落盘，本次停止/解除未执行）: "+err.Error())
+		return
+	}
 	// 立即执行 kill-switch：绕过 §QMT-PENDING 开关队列（见 applyKillSwitchNow 注释），
 	// 返回本次同步撤销的在途未成交委托笔数与撤单失败明细（§0925EVE-A2）。
 	cancelled, failed := s.applyKillSwitchNow(uid, &cfg, "endpoint")
@@ -1338,7 +1388,11 @@ func (s *Server) handleQMTSettle(w http.ResponseWriter, r *http.Request) {
 		Day  string `json:"day"`
 		Mode string `json:"mode"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// §0926E2E-W1D：settle 同形态收口——畸形 JSON 不再被吞成零值继续改判对账，400 中止。
+	if err := decodeOptJSON(r, &req); err != nil {
+		writeError(w, 400, "invalid request body: "+err.Error())
+		return
+	}
 	if req.Day == "" {
 		req.Day = cntime.In(time.Now()).Format("2006-01-02")
 	}

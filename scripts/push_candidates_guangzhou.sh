@@ -97,7 +97,7 @@ import json, sqlite3, sys
 
 db, out, ids_spec = sys.argv[1], sys.argv[2], sys.argv[3]
 COLS = ('created_at', 'kind', 'status', 'factors', 'weights', 'metric', 'ic_mean',
-        'ir', 'avg_excess', 'horizon', 'reason', 'guard', 'params')
+        'ir', 'avg_excess', 'horizon', 'reason', 'guard', 'params', 'fidelity')
 con = sqlite3.connect('file:%s?mode=ro' % db, uri=True)
 con.row_factory = sqlite3.Row
 try:
@@ -222,7 +222,7 @@ import json, sqlite3, sys
 
 db, payload = sys.argv[1], sys.argv[2]
 COLS = ('created_at', 'kind', 'status', 'factors', 'weights', 'metric', 'ic_mean',
-        'ir', 'avg_excess', 'horizon', 'reason', 'guard', 'params')
+        'ir', 'avg_excess', 'horizon', 'reason', 'guard', 'params', 'fidelity')
 rows = json.load(open(payload, encoding='utf-8'))
 if not rows:
     print('CAND_ERR=empty-payload'); sys.exit(1)
@@ -249,11 +249,11 @@ try:
             continue
         cur = con.execute(
             'INSERT INTO research_candidates (created_at,kind,status,factors,weights,metric,'
-            'ic_mean,ir,avg_excess,horizon,reason,guard,params) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            'ic_mean,ir,avg_excess,horizon,reason,guard,params,fidelity) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (r['created_at'], r['kind'], 'proposed', r['factors'], r.get('weights') or '',
              r.get('metric'), r.get('ic_mean'), r.get('ir'), r.get('avg_excess'),
              r.get('horizon'), r.get('reason') or '', r.get('guard') or 'standard',
-             r.get('params') or ''))
+             r.get('params') or '', r.get('fidelity') or ''))
         nid = cur.lastrowid
         new_ids.append(nid)
         print('PUSHED src=%s new=%s' % (r['id'], nid))

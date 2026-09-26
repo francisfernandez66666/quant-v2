@@ -16,6 +16,7 @@ import (
 	"log"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -24,7 +25,7 @@ import (
 func cmdThsBackfill(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("ths-backfill", flag.ExitOnError)
 	start := fs.String("start", "", "起始交易日 yyyyMMdd（必填）")
-	end := fs.String("end", time.Now().Format("20060102"), "结束交易日 yyyyMMdd（缺省=今日）")
+	end := fs.String("end", cntime.DayCompactOf(time.Now()), "结束交易日 yyyyMMdd（缺省=今日）")
 	sleepMs := fs.Int("sleep-ms", 300, "逐日节流（毫秒），防打爆上游配额")
 	force := fs.Bool("force", false, "已收录日也重拉（默认跳过）")
 	if err := fs.Parse(args); err != nil {

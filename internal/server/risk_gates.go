@@ -31,6 +31,10 @@ func (s *Server) handleRiskGates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switches := map[string]bool{}
+	// §0926E2E-4B：缺配置健康度信号随开关态一起下发——默认关六闸全关＝该账号一条都没配过，
+	// 前端据此在闸口卡亮告警条（保持默认关的裁决不变，只把裸奔状态变得可见）。
+	disabled := []string{}
+	configUnset := false
 	if u := s.operatorID(); u != "" {
 		if ctrl := s.qmtCtrlFor(u); ctrl != nil {
 			rg := ctrl.Config().RiskGate
@@ -43,6 +47,8 @@ func (s *Server) handleRiskGates(w http.ResponseWriter, r *http.Request) {
 			switches["limit_down_block_sell"] = rg.LimitDownBlockSellEnabled()
 			// §AUDIT-PM 2026-09-15 单笔金额绝对帽开关（保存即生效，不走开关队列）
 			switches["max_order_amount"] = rg.MaxOrderAmount > 0
+			disabled = rg.DisabledGates()
+			configUnset = rg.GatesConfigUnset()
 		}
 	}
 	// §F-5（20260917）无命中时 RiskGateDay 返回 nil slice，JSON 序列化成 null，
@@ -52,6 +58,7 @@ func (s *Server) handleRiskGates(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"day": day, "gates": rows, "switches": switches,
+		"disabled_gates": disabled, "gates_config_unset": configUnset,
 		"time": time.Now().Format("15:04:05"),
 	})
 }

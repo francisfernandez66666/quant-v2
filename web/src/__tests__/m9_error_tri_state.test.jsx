@@ -129,8 +129,10 @@ describe('§M-9 三态分离：后端 500 不得伪装成空态/加载态', () =
     expect(sys).toMatch(/流程引擎：新闻抓取–/)
   })
 
-  // E5 Dashboard：健康端点已并入 load() 的 10s 主轮询（修复前只挂载拉一次）
-  it('E5 Dashboard 健康端点随 10s 轮询重复拉取（不再只挂载一次）', async () => {
+  // E5 Dashboard：健康端点已并入 load() 的兜底轮询（修复前只挂载拉一次）。
+  // §0926E2E-17A：主轮询口径由 10s 统一为 §F5 的 60s——本锁随之改按 60s 窗推进，
+  // 「随轮询重复拉取」的语义不变（只挂一次仍必红）。
+  it('E5 Dashboard 健康端点随 60s 兜底轮询重复拉取（不再只挂载一次）', async () => {
     vi.useFakeTimers()
     try {
       const api = await import('../api/index.js')
@@ -138,8 +140,8 @@ describe('§M-9 三态分离：后端 500 不得伪装成空态/加载态', () =
       await act(async () => { await vi.advanceTimersByTimeAsync(50) })
       const first = api.fetchDataSourceHealth.mock.calls.length
       expect(first, '挂载即应拉一次').toBeGreaterThanOrEqual(1)
-      await act(async () => { await vi.advanceTimersByTimeAsync(10500) })
-      expect(api.fetchDataSourceHealth.mock.calls.length, '§M-9：健康端点必须并入 10s 轮询').toBeGreaterThan(first)
+      await act(async () => { await vi.advanceTimersByTimeAsync(60500) })
+      expect(api.fetchDataSourceHealth.mock.calls.length, '§M-9：健康端点必须并入兜底轮询（60s 口径）').toBeGreaterThan(first)
       expect(container).toBeTruthy()
     } finally {
       vi.useRealTimers()

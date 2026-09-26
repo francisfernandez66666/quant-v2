@@ -42,7 +42,11 @@ func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
 		TopN      int    `json:"top_n"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		// §0926E2E-W1D：空体合法（全缺省参数）；畸形 JSON 400 中止，不再静默按零值排队寻优任务。
+		if err := decodeOptJSON(r, &body); err != nil {
+			writeError(w, 400, "invalid request body: "+err.Error())
+			return
+		}
 	}
 	payload := map[string]any{"kind": "optimize"}
 	if body.Objective != "" {

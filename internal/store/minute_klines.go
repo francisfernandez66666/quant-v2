@@ -248,6 +248,22 @@ func (d *DB) MinutePoolUniverse(since string, limit int) ([]string, error) {
 	return nil, fmt.Errorf("分钟回填取池失败（池表可能为空）: %w", err)
 }
 
+// PruneMinuteBars 保留策略删除：删掉 ts 早于 cutoff（北京墙钟串 "YYYY-MM-DD 00:00:00"）的行，
+// 返回删除数。§0926E2E-17B 给分钟表加保留窗口的落点——日增模式每晚只补最近窗口，但整表
+// 只进不出会把研究库越吃越大；回放链（btreplay）读的是当日切片，删旧不影响现行判据。
+// cutoff 形态非法（非 "YYYY-MM-DD " 前缀）时拒绝执行——字典序比较下坏前缀会误删大片。
+// （PruneMinuteBars deletes rows strictly older than cutoff; refuses malformed cutoffs.）
+func (d *DB) PruneMinuteBars(scale int, cutoff string) (int64, error) {
+	if len(cutoff) < 10 || (cutoff[4] != '-' || cutoff[7] != '-') {
+		return 0, fmt.Errorf("store minute_klines: 保留裁剪 cutoff 形态非法（须 YYYY-MM-DD 前缀）: %q", cutoff)
+	}
+	res, err := d.db.Exec(`DELETE FROM minute_klines WHERE scale=? AND ts<?`, scale, cutoff+" 00:00:00")
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // scanMinuteRows 把查询结果行装成 MinuteBar 切片（两处读法共用，避免列序写歪）。
 func scanMinuteRows(rows *sql.Rows) ([]MinuteBar, error) {
 	var out []MinuteBar

@@ -562,13 +562,11 @@ func (f *Fetcher) persistSnapshotMaybe(snapshot *MarketSnapshot) {
 		return
 	}
 	path := filepath.Join(dir, "snapshot_latest.json")
-	tmp := path + ".tmp"
-	if werr := os.WriteFile(tmp, raw, 0644); werr == nil {
-		if rerr := os.Rename(tmp, path); rerr != nil {
-			_ = os.Remove(tmp)
-			log.Printf("[fetcher] 快照落盘失败: %v", rerr)
-		}
-	} else {
+	// §0926E2E-17B：手写 tmp+rename 段改走包内统一原子写（fileutil.AtomicWrite 薄包装）——
+	// 旧写法用固定名 snapshot_latest.json.tmp，quant 与 research 若同目录并发落快照会
+	// 互相踩踏半截文件，且无 fsync，掉电场景 rename 后内容可能未落盘。统一实现＝
+	// CreateTemp 唯一名 + 写后 fsync + rename + 目录 fsync，权限集中在 0644 一处声明。
+	if werr := AtomicWrite(path, raw, 0644); werr != nil {
 		log.Printf("[fetcher] 快照落盘失败: %v", werr)
 	}
 }

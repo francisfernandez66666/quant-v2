@@ -97,12 +97,23 @@ function ProtectedRoute({ admin, perm, checked, children }) {
  * 负责登录态、全局状态轮询、SSE 推送、角色权限、侧边栏与路由渲染。
  * @returns {JSX.Element} 登录页或主布局
  */
+// §0926E2E-13：状态轮询连续失败达到该次数才翻「离线」——单次失败多半是网络/服务端瞬时抖动，
+// 旧实现一次 catch 当场判死，页面「离线」与断联横幅随抖动闪跳（也是 UAT 并发假红的成因之一）。
+const OFFLINE_AFTER_FAILS = 2
+
 export default function App() {
   const navigate = useNavigate()
   const location = useLocation()
   const [loggedIn, setLoggedIn] = useState(false)
   const [account, setAccount] = useState('')
   const [serverOnline, setServerOnline] = useState(false)
+  // §0926E2E-13：断联横幅改由「显式离线判定」驱动——只有连续失败满阈值才置真；
+  // 首轮失败前（含开机尚未成功拉过一次的窗口）横幅不出，避免与下方灰条叠显、
+  // 也把"还没测到"与"测死两次"区分开。
+  const [offlineDeclared, setOfflineDeclared] = useState(false)
+  // §0926E2E-13：轮询「首轮失败但尚未判离线」的灰条提示位——true 表示本轮状态获取失败、
+  // 页面正在展示上一次成功获取的数据（refreshStatus 失败从不清数据，旧数据天然保留）。
+  const [statusStale, setStatusStale] = useState(false)
   const [inTradeTime, setInTradeTime] = useState(null)
   const [activeWindow, setActiveWindow] = useState(null)
   const [signalCount, setSignalCount] = useState(0)
@@ -134,6 +145,8 @@ export default function App() {
   const [loginError, setLoginError] = useState('')
 
   const statusTimer = useRef(null) // 状态轮询定时器句柄
+  // §0926E2E-13：fetchStatus 连续失败计数（ref 不进渲染态，避免无谓重渲）；成功一轮即清零。
+  const statusFails = useRef(0)
   const unsubSSE = useRef(null)     // SSE 取消订阅函数引用
   // §H7（2026-09-22 修复批）auth:expired 闭包死亡：挂载 effect 只注册一次监听器，旧实现的
   // onAuthExpired 直接捕获渲染态 loggedIn——首帧为 false 被永久冻结在闭包里，登录成功
@@ -208,6 +221,11 @@ export default function App() {
   function logout() {
     api.logout()  // 内部会 clearAuth；不 await 以免网络抖动拖住退出体验
     stopPolling()
+    // §0926E2E-13：换账号/回登录页时复位连续失败状态，下个会话从干净计数起步
+    statusFails.current = 0
+    setStatusStale(false)
+    setOfflineDeclared(false)
+    setServerOnline(false)
     setLoggedIn(false)
     setMenuOpen(false)
     setMeChecked(false) // §A5：换账号后对账门重置，下次恢复登录态必须重新过 /api/auth/me
@@ -219,13 +237,29 @@ export default function App() {
   async function refreshStatus() {
     try {
       const st = await api.fetchStatus()
+      // §0926E2E-13：任何一轮成功都复位连续失败计数、灰条与离线判定
+      statusFails.current = 0
+      setStatusStale(false)
+      setOfflineDeclared(false)
       setServerOnline(true)
       setSignalCount(st.signal_count || 0)
       setInTradeTime(st.in_trade_time)
       setActiveWindow(st.active)
       // §A7：APK/页面向导比对——服务器 build_commit 与本地构建指纹不一致即顶栏横幅告警
       setVersionNotice(versionMismatchNotice(APP_BUILD_COMMIT, st.build_commit))
-    } catch (_) { setServerOnline(false); setVersionNotice(null) }
+    } catch (_) {
+      // §0926E2E-13：连续失败满 OFFLINE_AFTER_FAILS 轮才转离线态。首轮失败保持在线并出灰条
+      // （页面数据仍是上次成功结果）；第二连败才判离线、撤版本横幅。
+      statusFails.current += 1
+      if (statusFails.current >= OFFLINE_AFTER_FAILS) {
+        setServerOnline(false)
+        setOfflineDeclared(true)
+        setVersionNotice(null)
+        setStatusStale(false) // 离线态自有琥珀色断联横幅，灰条让位避免双条叠显
+      } else {
+        setStatusStale(true)
+      }
+    }
     // 独立轮询未读消息数：失败不影响主状态展示
     try {
       const alerts = await api.fetchAlerts()
@@ -358,7 +392,15 @@ export default function App() {
 
   // 组件挂载：自动登录、启动轮询、监听认证过期；卸载时清理
   useEffect(() => {
-    checkAuth().then((ok) => { if (ok) startPolling() })
+    // §0926E2E-13b（09-27 Playwright 锁锤出）：dev StrictMode 会把本 effect 跑两遍
+    // （挂载→清理→再挂载）。旧写法第一遍的 checkAuth().then 在清理之后才落地，
+    // 照样 startPolling——启动即连发两轮 fetchStatus（§13 的连续失败计数被双发瞬间打满，
+    // 灰条态在真实浏览器里根本停不住），且第一遍的 60s 定时器句柄被第二遍覆盖后永久泄漏。
+    // 修法：每次挂载带 active 守卫，清理后旧的异步结果不再拉起轮询——一次挂载只许一份轮询。
+    // English: §0926E2E-13b — guard the async auth restore with a per-mount `active` flag so a
+    // cleaned-up (StrictMode first-pass) mount can never start a second polling loop.
+    let active = true
+    checkAuth().then((ok) => { if (ok && active) startPolling() })
     api.fetchPaperState().then(d => setPaperEnabled(!!d.enabled)).catch(() => setPaperEnabled(false))
     // §H7：deps 保持 []（监听器只在挂载注册一次），但注册的是转发壳——
     // 经 authExpiredHandler.current 取最新闭包执行，彻底绕开首帧陈旧闭包；
@@ -368,6 +410,7 @@ export default function App() {
     }
     window.addEventListener('auth:expired', onExpired)
     return () => {
+      active = false // §0926E2E-13b：本挂载作废——在飞的 checkAuth 结果落地时不得再拉轮询
       window.removeEventListener('auth:expired', onExpired)
       stopPolling()
     }
@@ -533,9 +576,20 @@ export default function App() {
             <MarketStatusBar env={marketEnv} />
             {/* §F6 角色提示条：常驻一行说明当前账号/角色/可见入口（UAT 2.1 防误操作困惑） */}
             <RoleBar account={account} isAdmin={canAdmin} canResearch={canResearch} paperEnabled={paperEnabled} />
+           {/* §0926E2E-13 灰条：状态轮询首轮失败（尚未判离线）时的知情提示——
+               页面正展示上次成功获取的数据，60s 后自动重试；连败第二轮才升级为下方断联横幅。
+               English: §0926E2E-13 — gray "stale data" strip after the first failed poll;
+               the amber offline banner only appears on the second consecutive failure. */}
+           {loggedIn && statusStale && (
+             <div style={{ margin: '8px 12px 0', padding: '6px 12px', borderRadius: 6, background: 'rgba(136,136,136,0.10)', border: '1px solid var(--app-border)', color: 'var(--app-muted)', fontSize: 12 }}>
+               ⚠ 网络瞬时抖动：本轮状态获取失败，页面展示的是上一次成功获取的数据，稍后自动重试；连续失败将转为离线提示。
+             </div>
+           )}
            {/* 后端断联横幅：登录态可能因缓存令牌保留，但所有数据接口失败。
-               显式提示用户检查「设置→服务器地址」（留空=使用当前域名），避免误以为"后端没给数据"。 */}
-           {loggedIn && !serverOnline && (
+               显式提示用户检查「设置→服务器地址」（留空=使用当前域名），避免误以为"后端没给数据"。
+               §0926E2E-13：条件由 !serverOnline（单次失败即真）改为 offlineDeclared——
+               只有连续 2 轮 fetchStatus 失败才出横幅，瞬时抖动不再闪断联。 */}
+           {loggedIn && offlineDeclared && (
              // 通栏提示框：仅在登录态且最近一次状态轮询失败时渲染
               <div style={{ margin: '8px 12px 0', padding: '8px 12px', borderRadius: 6, background: 'var(--app-warn-bg)', border: '1px solid var(--app-warn-border)', color: 'var(--app-warn-text)', fontSize: 13 }}>
                ⚠ 无法连接服务器：页面可打开但后端数据未加载。请到「设置 → 服务器连接」确认服务器地址——

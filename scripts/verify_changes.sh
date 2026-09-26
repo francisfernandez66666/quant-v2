@@ -3672,7 +3672,7 @@ cp_min "解析远端回传前去 CR" "$CP_CR" "1"
 #     段尾统一 rm，不留跨轮垃圾——本仓纪律：测试数据不落工作树、也不留 /tmp 常驻）──
 CP_TMP="$(mktemp -d /tmp/verify97_XXXXXX)"
 CP_DB="$CP_TMP/src.db"
-sqlite3 "$CP_DB" "CREATE TABLE research_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', factors TEXT, weights TEXT, metric REAL, ic_mean REAL, ir REAL, avg_excess REAL, horizon INTEGER, reason TEXT, guard TEXT DEFAULT 'standard', params TEXT DEFAULT '');"
+sqlite3 "$CP_DB" "CREATE TABLE research_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', factors TEXT, weights TEXT, metric REAL, ic_mean REAL, ir REAL, avg_excess REAL, horizon INTEGER, reason TEXT, guard TEXT DEFAULT 'standard', params TEXT DEFAULT '', fidelity TEXT DEFAULT '');"
 sqlite3 "$CP_DB" "INSERT INTO research_candidates (created_at,kind,status,factors,params,horizon,guard,ir) VALUES ('2026-09-25 10:00:00','factor','proposed','[\"T1\"]','{}',5,'strong',0.9),('2026-09-25 11:00:00','factor','proposed','[\"T2\"]','{}',10,'weak',0.5);"
 CP_OUT="$CP_TMP/preview.out"
 CP_PV=0
@@ -3699,7 +3699,10 @@ GZ_IP=203.0.113.7 SRC_DB="$CP_TMP/nope.db" bash "$CP_SCR" > "$CP_TMP/nodb.out" 2
 cp_chk "缺来源库判红（退出码非 0）" "$([ "$CP_RC" -ne 0 ] && echo 1 || echo 0)" "1"
 # 反证 C：空 proposed 集合 ⇒ 空载荷判失败（§MINUTE「0 行不判成功」同族）
 CP_EMPTY="$CP_TMP/empty.db"
-sqlite3 "$CP_EMPTY" "CREATE TABLE research_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', factors TEXT, weights TEXT, metric REAL, ic_mean REAL, ir REAL, avg_excess REAL, horizon INTEGER, reason TEXT, guard TEXT DEFAULT 'standard', params TEXT DEFAULT '');"
+# §0926E2E-12A 同日同步：导出腿列集合已含 fidelity（保真水印随候选走），
+# 空载荷夹具建表口径必须与 CP_DB 主夹具逐列一致——少一列会让导出 SELECT 先于
+# "载荷为空"判语崩在 no such column 上，本锁读到的原因行归 0（2026-09-27 全量跑锤出）。
+sqlite3 "$CP_EMPTY" "CREATE TABLE research_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', factors TEXT, weights TEXT, metric REAL, ic_mean REAL, ir REAL, avg_excess REAL, horizon INTEGER, reason TEXT, guard TEXT DEFAULT 'standard', params TEXT DEFAULT '', fidelity TEXT DEFAULT '');"
 CP_RC=0
 GZ_IP=203.0.113.7 SRC_DB="$CP_EMPTY" bash "$CP_SCR" > "$CP_TMP/empty.out" 2>&1 || CP_RC=$?
 cp_chk "空候选库判红（退出码非 0）" "$([ "$CP_RC" -ne 0 ] && echo 1 || echo 0)" "1"
@@ -4007,7 +4010,9 @@ gw_min "E1 前端用例段（§E1 describe + 四用例）" "$(grep -c '§E1' web
 # ── ⑧ C7 Windows 服务拉起单源化（owner：「三套并存的单源化，要做」） ──
 gw_chk "C7 单源文件在位" "$(test -f deploy/qmt-win/service_definitions.ps1 && echo 1 || echo 0)" "1"
 gw_min "C7 部署清单接线（ps1_bom+scp 两腿，§ENH-5「仓库里有、现网没有」同族）" "$(grep -c 'service_definitions.ps1' scripts/deploy_guangzhou.sh || true)" "2"
-gw_chk "C7 消费脚本 dot-source 恰 6 个（三套并存的收编面）" "$(grep -l 'Join-Path \$PSScriptRoot "service_definitions.ps1"' deploy/qmt-win/*.ps1 | wc -l | tr -d ' ')" "6"
+# §0926E2E-W2C 同日同步：6→7——备份脚本接入单源取 $SvcGatewayConfigFile（密钥备份腿），
+# 合法新增消费者，按「观测计数锁新增腿须同日同步」口径改判数（2026-09-27 预演读数 7）。
+gw_chk "C7 消费脚本 dot-source 恰 7 个（三套并存的收编面+§0926E2E-W2C 备份腿）" "$(grep -l 'Join-Path \$PSScriptRoot "service_definitions.ps1"' deploy/qmt-win/*.ps1 | wc -l | tr -d ' ')" "7"
 GW_SVCA="$(sed -n 's/^\$SvcName[A-Za-z]*[[:space:]]*=.*else { "\([^"]*\)" }$/\1/p' deploy/qmt-win/service_definitions.ps1 | sort | paste -sd, -)"
 GW_SVCB="$(sed -n 's/.*foreach ($s in @("\(.*\)")).*/\1/p' scripts/verify_deploy_guangzhou.sh | tr -d '"' | tr ',' '\n' | tr -d ' ' | sort | paste -sd, -)"
 gw_chk "C7 服务名集合等值：单源表 vs 部署探针（ defs=${GW_SVCA} probe=${GW_SVCB}）" "$( [ "$GW_SVCA" = "$GW_SVCB" ] && echo eq || echo ne )" "eq"
@@ -4325,6 +4330,112 @@ if [ -z "$RT_ERRS" ]; then
 	echo "ok - §QMT-TOKENROT-CLI 守卫通过（静态锁含两侧同源锚 46 + 离网反证 18；§0926ROT-SRC5 账号快照腿后共 64）"
 else
 	echo "--- FAIL: §102 断言不符:${RT_ERRS}"
+	exit 1
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# §103 §0926E2E（2026-09-26 晚~09-27 全量审计修复批，owner 令「全部按推荐选项执行」）：
+# 一~四波+矩阵补位的机器锁段。设计口径：
+# ① 锁「吞错放水」家族的复发面（error 被 `_` 丢弃、伪造中性值、死开关回潮），
+#    全部按运行时真实取值链选锚（记忆 [[probe-premises-from-value-chain]]）；
+# ② 负向锁避说明注释误伤（记忆 [[static-negative-locks]]）：OptimizeAutoApply 的
+#    删除说明注释本身含该词 → 负锁只打「字段定义形态」（行首空白+标识符），注释行
+#    以 // 开头天然不中；1500 伪造锁打赋值形态 `pCount = 1500` 而非裸 1500；
+# ③ 新锁全部计数先预演后入段（§GATE-COUNT-LOCK 教训，2026-09-27 预演记录：
+#    gate.go 吞错形态 0/正向 1、market.go 1500 形态 0、server 非测试 _=json 0、
+#    W1B 锚 config 11/qmt 2、SETUP_TOKEN 面 7 文件、截止等值串 1、expires_at 1、
+#    W2C 1/W2D 2、16 回潮 0、11A 4、4B 4、3A 1、OFFLINE=2 处 1、17c 1、17A-Dash 5、
+#    17B-fetcher 1、17D-Quant 2、mock 三路由 1/1/1、relax 默认 false 1、queued 直读 1、
+#    apk-smoke 1/EMBED 锁 1、persist/hotSwap false 1、StartWeeklyLLMProbe 接线 1）；
+# ④ 行为用例不在此段（go/pytest/vitest/Playwright 四套各自已带），本段只防静态回潮。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 103 §0926E2E 全量审计修复批（一~四波+矩阵补位静态锁 33 条（含 §0926E2E-13b 双发守卫三枚，09-27 增））..."
+E2E_ERRS=""
+# e2e_eq <名> <期望> <实得>：等值锁；e2e_ge <名> <下限> <实得>：存在性下限锁
+# （≥ 用于"注释/锚点条数会随后续施工增加"的观测，防单向等值把后人合法加注释判红）。
+e2e_eq() {
+	if [ "$2" != "$3" ]; then E2E_ERRS="${E2E_ERRS}
+  - $1: 期望=$2 实得=$3"; fi
+	return 0
+}
+e2e_ge() {
+	if [ "$3" -lt "$2" ]; then E2E_ERRS="${E2E_ERRS}
+  - $1: 下限=$2 实得=$3"; fi
+	return 0
+}
+# ec <file> <fixed-pattern>：grep -Fc 计数（无匹配 exit 1 → || true 归 0，set -e 雷区记忆）
+ec() { grep -Fc -- "$2" "$1" 2>/dev/null || true; }
+ecn() { grep -Ec -- "$2" "$1" 2>/dev/null || true; }
+
+# —— 一波「吞错放水」——
+e2e_eq "1-A gate.go TodayRealizedPnl 调用点禁「, _」吞错形态（负锁）" \
+	"$(grep -F 'TodayRealizedPnl(' internal/risk/gate.go | grep -c ', _' || true)" "0"
+e2e_eq "1-A gate.go 承接 err 的正向调用恰 1 处" \
+	"$(ec internal/risk/gate.go 'pnl, err := g.st.TodayRealizedPnl')" "1"
+e2e_eq "1-B W1B 锚 config.go 恰 11（新增 W1B 腿需同日同步本计数）" "$(ecn internal/config/config.go '0926E2E-W1B')" "11"
+e2e_eq "1-B W1B 锚 qmt.go 恰 2（同上）" "$(ecn internal/server/qmt.go '0926E2E-W1B')" "2"
+e2e_eq "1-C/1-D internal/server 非测试文件「_ = json.NewDecoder」清零（负锁；测试读体豁免）" \
+	"$(grep -rl '_ = json.NewDecoder' internal/server --include='*.go' 2>/dev/null | grep -v _test.go | wc -l | tr -d ' ')" "0"
+e2e_eq "1-4 GetIndexData 伪造 1500 涨跌家数不得回潮（负锁，按赋值形态）" \
+	"$(ec internal/data/market.go 'pCount = 1500')" "0"
+e2e_ge "1-4 market.go 真弃权声明锚 ≥1" "1" "$(ecn internal/data/market.go '0926E2E-14')"
+
+# —— 二波「暴露面封堵」——
+e2e_ge "2-A SETUP_TOKEN 部署面覆盖文件数 ≥7（service/广州/汉城/注册/备份/verify）" \
+	"7" "$(git grep -l SETUP_TOKEN -- deploy dist-guangzhou scripts 2>/dev/null | wc -l | tr -d ' ')"
+e2e_eq "2-B SSE query-token 退役截止常量恰 1（2026-10-15 CST 等值串）" \
+	"$(ec internal/server/sse.go 'time.Date(2026, 10, 15, 0, 0, 0, 0, time.FixedZone("CST", 8*3600))')" "1"
+e2e_eq "2-B 登录响应下发 sse_query_token_expires_at 提示恰 1" \
+	"$(ec internal/server/server.go 'sse_query_token_expires_at')" "1"
+e2e_ge "2-C 网关密钥文件权限自检锚 gateway.py ≥1" "1" "$(ecn qmt_gateway/gateway.py '0926E2E-W2C')"
+e2e_ge "2-D outbox 冻结删除锚 store.py ≥1" "1" "$(ecn qmt_gateway/store.py '0926E2E-W2D')"
+
+# —— 三波「口径裁决」——
+e2e_eq "16 OptimizeAutoApply 字段定义不得回潮（行首形态负锁，说明注释豁免）" \
+	"$(grep -Ec '^[[:space:]]*OptimizeAutoApply' internal/config/config.go || true)" "0"
+e2e_ge "11A confirmedReplay 新鲜度闸函数在位（sell.go ≥1）" "1" "$(ec internal/signalctl/sell.go 'sellConfirmedStale')"
+e2e_ge "4B 六闸默认关清单在位（config.go defaultOffGateEntries ≥1）" "1" "$(ec internal/config/config.go 'defaultOffGateEntries')"
+e2e_eq "3A 白名单只约束自动信号通道口径声明在位（gate.go 恰 1）" "$(ecn internal/risk/gate.go '0926E2E-3A')" "1"
+
+# —— 四波「体验/卫生」——
+e2e_eq "13 前端离线判定阈值等值锁（连续 2 次失败才翻离线，App.jsx 恰 1）" \
+	"$(ec web/src/App.jsx 'const OFFLINE_AFTER_FAILS = 2')" "1"
+# §0926E2E-13b（09-27 Playwright 双发事故）：StrictMode 双挂载下旧挂载的异步 checkAuth
+# 结果不得再拉起轮询（active 守卫三形态各恰 1），且 w13 spec 已改按时间窗设卡。
+# 预演读数（09-27 grep -Fc）：'if (ok && active) startPolling()'=1、'active = false'腿=1、
+# 'WINDOW_START_MS = 55000'=1。
+e2e_eq "13b 挂载轮询 active 守卫调用点恰 1（摘守卫=启动连发双轮询，§13 计数被打满）" \
+	"$(ec web/src/App.jsx 'if (ok && active) startPolling()')" "1"
+e2e_eq "13b 卸载清理置 active=false 恰 1（守卫的另一半，缺它=只写不用）" \
+	"$(ec web/src/App.jsx 'active = false // §0926E2E-13b')" "1"
+e2e_eq "13b w13 Playwright 时间窗判据在位（按请求计数会拨到 Dashboard 首发）" \
+	"$(ec web/e2e/w13_offline_debounce.spec.mjs 'WINDOW_START_MS = 55000')" "1"
+e2e_eq "17c e2e 凭据缺失 test.fail 快锁在位（auth.setup.mjs 恰 1）" \
+	"$(ec web/e2e/auth.setup.mjs '§0926E2E-17c：E2E_USER/E2E_PASS 未注入')" "1"
+e2e_ge "17a Dashboard 轮询 60s 对齐锚 ≥2（两处高频轮收编）" "2" "$(ecn web/src/pages/Dashboard.jsx '0926E2E-17A')"
+e2e_ge "17b fetcher 快照 AtomicWrite 锚 ≥1" "1" "$(ecn internal/data/fetcher.go '0926E2E-17B')"
+e2e_ge "17d 成员 admin 入口灰化锚 Quant.jsx ≥1" "1" "$(ecn web/src/pages/Quant.jsx '0926E2E-17d')"
+
+# —— 矩阵补位 MX1/MX2/MX3 ——
+e2e_eq "MX1 mock 派发取单腿恰 1" "$(ec cmd/qmt-mock/main.go '"/dispatch/pending"')" "1"
+e2e_eq "MX1 mock 派发结算腿恰 1" "$(ec cmd/qmt-mock/main.go '"/dispatch/result"')" "1"
+e2e_eq "MX1 mock 操作员注入腿恰 1" "$(ec cmd/qmt-mock/main.go '"/dispatch/enqueue"')" "1"
+e2e_eq "MX1 mock 订单闸默认严格（-relax-order-check 缺省 false 恰 1）" \
+	"$(ec cmd/qmt-mock/main.go 'flag.Bool("relax-order-check", false')" "1"
+e2e_eq "MX1 mock /cancel 临界区直读 activeBroker 防自死锁形态恰 1（b.active() 会二次加锁）" \
+	"$(ec cmd/qmt-mock/main.go 'b.activeBroker == "queued"')" "1"
+e2e_eq "MX2 nightly apk-smoke job 在位恰 1" "$(ec .github/workflows/nightly-e2e.yml 'apk-smoke:')" "1"
+e2e_eq "MX2 内嵌指纹==checkout SHA 等值锁在位恰 1" \
+	"$(ec .github/workflows/nightly-e2e.yml 'test "$EMBED" = "$HEAD_SHA"')" "1"
+e2e_eq "MX3 周度探测必须走只读腿（persist=false+hotSwap=false 等值恰 1）" \
+	"$(ec internal/server/llm_weekly_probe.go 'false /*persist*/, false /*hotSwap*/')" "1"
+e2e_eq "MX3 周度例行已接线（cmd/quant/main.go StartWeeklyLLMProbe 恰 1）" \
+	"$(ecn cmd/quant/main.go 'StartWeeklyLLMProbe')" "1"
+
+if [ -z "$E2E_ERRS" ]; then
+	echo "ok - §0926E2E 守卫通过（静态锁 33 条：吞错收口 7 + 暴露面 5 + 裁决口径 4 + 体验卫生 8 + 矩阵补位 9）"
+else
+	echo "--- FAIL: §103 断言不符:${E2E_ERRS}"
 	exit 1
 fi
 

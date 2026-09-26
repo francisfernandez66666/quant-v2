@@ -162,6 +162,32 @@ try {
         if (Test-Path $p) { Copy-Item $p (Join-Path $stateDir $f) -Force }
     }
 
+    # 3c) §0926E2E-W2C（2026-09-26 二波）落盘密钥备份补两条腿（restic 面，owner 裁决清单）：
+    #   ① C:\etc\quant.env —— §N-5 密钥解析腿②；§0926E2E-W2A 起还装 SETUP_TOKEN。丢了＝
+    #      /setup 守卫令牌与 HITHINK 等 env-only 键的唯一磁盘副本消失（口令轮换 §0926ROT 的
+    #      教训正是"钥匙快照没有备份，恢复只能靠五源比对"）。
+    #   ② 网关 config.xt.json —— 明文 token+资金账号真源（$SvcGatewayConfigFile 单源，勿再各写各的）。
+    #   落 <SnapRoot>\secrets\，缺失打 WARN 不判红（mock/影子机可能没有）；nightly restic 的对象
+    #   本来就是 $SnapRoot 整目录，文件进这里即随快照入仓，无需动 restic 清单。
+    #   ⚠ 安全边界：quant-snapshot 目录本身含明文密钥——它此前已装着 auth.json/config.json，
+    #   泄露面没有扩大；快照根的 NTFS ACL 收敛与 restic 仓加密是既有纪律，不变。
+    $secDir = Join-Path $SnapRoot "secrets"
+    New-Item -ItemType Directory -Force -Path $secDir | Out-Null
+    $gwCfgFile = "C:\qmt\quant-trading-v2\qmt_gateway\config.xt.json"   # 回退字面量＝$SvcGatewayConfigFile 现值
+    $svcDefs = Join-Path $PSScriptRoot "service_definitions.ps1"
+    if (Test-Path $svcDefs) { . $svcDefs; if ($SvcGatewayConfigFile) { $gwCfgFile = $SvcGatewayConfigFile } }
+    $secPairs = @(
+        @("C:\etc\quant.env", "quant.env"),
+        @($gwCfgFile, "config.xt.json")
+    )
+    foreach ($pair in $secPairs) {
+        if (Test-Path $pair[0]) {
+            Copy-Item $pair[0] (Join-Path $secDir $pair[1]) -Force
+        } else {
+            Log ("WARN secrets backup leg absent: " + $pair[0] + "（首次部署/mock 机属正常；现网机出现此行需排查）")
+        }
+    }
+
     # 3b) §P0-B: mirror the whole per-account directory into <SnapRoot>/accounts (same layout as
     #     scripts/backup.sh's ${DEST}/accounts, so one restore drill can assert both machines).
     #     robocopy /MIR instead of Copy-Item -Recurse: Copy-Item nests the source when the

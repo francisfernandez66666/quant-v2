@@ -797,8 +797,11 @@ class Store:
             self._conn.commit()
 
     def outbox_trim(self, cap):
-        """超上限删最旧（首尔长期失联的极端保护）。返回删除条数；positions 每 60s 一条，
-        cap=20000 约两周量。English: drops oldest rows past cap; returns deleted count."""
+        """按"保留最新 cap 行"删最旧，返回删除条数。
+        ⚠ §0926E2E-W2D（2026-09-26）：运行时 _push 溢出路径**不再调用本方法**（旧"自动删最旧"
+        会静默销毁最早的成交回报）。唯一合法调用方＝人工 CLI outbox_admin.py（带 --yes）。
+        cap=20000 约两周量（positions 每 60s 一条）。English: keeps newest `cap` rows,
+        deletes oldest; manual CLI only since §0926E2E-W2D."""
         with self._lock:
             n = self._conn.execute("SELECT COUNT(*) AS c FROM outbox").fetchone()["c"]
             if n <= cap:

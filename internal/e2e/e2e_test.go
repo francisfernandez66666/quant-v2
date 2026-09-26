@@ -689,8 +689,15 @@ func TestEndToEndFullPipeline(t *testing.T) {
 		if row := rig.market.GetStockIndustry("300750"); row == fix.Regions["300750"] {
 			t.Errorf("GetStockIndustry 误取地域板块 f128=%q（应取 f127 行业）", row)
 		}
-		if idx, _, up, down, err := rig.market.GetIndexData(); err != nil || idx <= 0 || up <= 0 || down <= 0 {
-			t.Errorf("指数行情应解析: idx=%.2f up=%d down=%d err=%v", idx, up, down, err)
+		idx, _, up, down, idxErr := rig.market.GetIndexData()
+		if idxErr != nil || idx <= 0 {
+			t.Errorf("指数行情应解析: idx=%.2f err=%v", idx, idxErr)
+		}
+		// §0926E2E-14 负锁：fixture 的 fflow/kline 路径只回个股资金流载荷（顶层无 f62/f63），
+		// 指数接口的涨跌家数在此必须弃权 0/0——旧伪造实现会在这里冒出 1500/1500 假实测值，
+		// 让"up>0&&down>0"式的验收以假数据通过（该旧断言正是本批删除的对象）。
+		if idxErr == nil && idx > 0 && (up != 0 || down != 0) {
+			t.Errorf("§0926E2E-14：mock 概况腿无 f62/f63，涨跌家数应弃权 0/0，得到 %d/%d", up, down)
 		}
 
 		// 东财个股资金流（emMoneyFlow fflow）

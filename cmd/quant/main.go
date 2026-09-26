@@ -591,6 +591,13 @@ func main() {
 	ctx := context.Background()
 	log.Println("quant-trading-v2 已启动")
 
+	// §0926E2E-MX3（2026-09-27 四波·矩阵补位#3）LLM 真实池周度例行探测：
+	// 北京每周日 10:00 后对当前生效配置跑一次只读 force 探测，成败都落 opslog（llm_probe
+	// 分类），池失效另推中级别告警——把此前"只在排障时手工跑 probe_llm.sh"的观察项
+	// 收编成引擎自身例行。协程随 ctx 退出；探测路径与 /api/config/llm/probe 完全同源，
+	// 绝不改运行时/落库（声明与实现见 internal/server/llm_weekly_probe.go 文件头三铁律）。
+	srv.StartWeeklyLLMProbe(ctx)
+
 	// 近实时 8a/8b 打分循环：5s 节奏，驱动所有已创建的账号引擎（共享引擎去重）。
 	// 各账号引擎内部按各自配置打分，持仓+自选持续打分 + 状态翻转信号。
 	// English: near-realtime 8a/8b scoring loop at a 5s cadence, driving every created account

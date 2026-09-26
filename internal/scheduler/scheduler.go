@@ -38,11 +38,13 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 )
 
@@ -81,6 +83,9 @@ type Scheduler struct {
 	alertFn func(title, content string)
 	// §M15 夜链入队测试缝：非 nil 时替代真实 EnqueueResearchTask（单测注入指定序位失败）。
 	nightlyEnqueueOverride func(t *store.ResearchTask) (int64, error)
+	// §0926E2E-15 tick panic 隔离累计计数（atomic 独立于 mu）：随 scheduler_status.json
+	// 对外可见，opslog/服务日志各留现场——"服务活着但夜链不推进"可直接归因到轮次 panic 数。
+	tickPanics atomic.Int64
 	// §M14 留痕观察测试缝：非 nil 时收到每一次 recordStepState 的 (step, status, errMsg)。
 	// 生产恒 nil；单测用它锁定熔断挂起 needs_attention 留痕确实落过状态上报——
 	// LastStatus 是「最近一次覆盖式」全局字段，后台排水跑完任何下一个任务就会把它冲掉，
@@ -175,11 +180,38 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// tick 单次调度检查：读配置 → 会话分派（盘后门控在 workerTick 内统一执行）。
+// tick 单次调度检查入口（§0926E2E-15  panic 隔离壳）。
+// 旧行为：tick 体内任一腿 panic 直接把 researchd 进程崩掉，唯一自愈是看门狗冷重启——
+// 归因面上只剩"服务莫名重启"，panic 现场无日志、无审计行、无计数。
+// 现行为：panic → 服务日志打全栈 + opslog 留一行审计 + tickPanics 计数（并随
+// scheduler_status.json 快照对外可见）+ 有告警回调则高优报一次；本轮作废，
+// 30s 后下一轮照常，调度循环不再被单次 panic 打死。
+// English: §0926E2E-15 — tick is wrapped in recover: a panic is logged with stack, counted
+// (opslog + status snapshot) and alerted instead of crashing the daemon; the 30s loop survives.
+func (s *Scheduler) tick() {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		n := s.tickPanics.Add(1)
+		log.Printf("[scheduler] §0926E2E-15 tick panic 已隔离（累计第 %d 次）：%v\n%s", n, r, debug.Stack())
+		opslog.Logf("research", "§0926E2E-15 调度 tick panic 隔离 #%d：%v（本轮作废，下轮 30s 照常；全栈见服务日志）", n, r)
+		s.mu.Lock()
+		fn := s.alertFn
+		s.mu.Unlock()
+		if fn != nil {
+			fn("调度 tick panic 隔离", fmt.Sprintf("第 %d 次 tick panic 已隔离，进程未退出；原因：%v。请查服务日志栈与 opslog。", n, r))
+		}
+	}()
+	s.tickInner()
+}
+
+// tickInner 调度检查真实主体（原 tick 函数体，§0926E2E-15 收进隔离壳之下，逻辑零改动）。
 // 每次检查结束都写一份可见性快照（scheduler_status.json），让前端/API 能直接回答
 // "为何卡排队"，不再依赖翻 researchd 原始日志。English: every tick also writes a
 // visibility snapshot so the UI can explain why tasks are queued without server logs.
-func (s *Scheduler) tick() {
+func (s *Scheduler) tickInner() {
 	cfg := config.LoadSchedulerConfig(s.cfgPath)
 	// §数据源路由装配（热生效，§HITHINK_DATA_SOURCE_PLAN + §ADJ P0-A 三轮补强）：
 	// primary_source=hithink 时回测取数优先 ths_ 表；复权门禁独立开关——两者都通过前
@@ -217,6 +249,8 @@ type SchedulerStatus struct {
 	Busy            bool   `json:"busy"`                // 是否有任务在跑（唯一槽位占用）
 	BusyTask        string `json:"busy_task,omitempty"` // 当前运行任务（#id(type)）
 	Reason          string `json:"reason"`              // 人类可读的"当前为何未出队"原因
+	// §0926E2E-15：tick panic 累计隔离次数（0 时整字段省略，不给既有消费方加噪声）。
+	TickPanics int64 `json:"tick_panics,omitempty"`
 }
 
 // writeStatus 把调度可见性快照落盘（scheduler_status.json），供 quant API 读取后前端展示。
@@ -241,6 +275,7 @@ func (s *Scheduler) writeStatus(cfg config.SchedulerConfig, now time.Time) {
 		MemGateOpen:     memGateOpen(cfg),
 		Busy:            busy,
 		BusyTask:        busyTask,
+		TickPanics:      s.tickPanics.Load(), // §0926E2E-15 panic 隔离计数随快照对外可见
 	}
 	switch {
 	case !cfg.Enabled:

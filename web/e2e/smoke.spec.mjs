@@ -5,12 +5,20 @@
 // Credentials come from env (never hardcoded); asserts "renders, no white screen", not deep behavior.
 import { test, expect } from '@playwright/test'
 
-const USER = process.env.E2E_USER || ''
-const PASS = process.env.E2E_PASS || ''
+// §0926E2E-17c：凭据缺省不再回退空串（空串 fill 后失败形态离"忘了传环境变量"隔一层）；
+// 且登录页若已带 .t-menu 说明复用了外部残留 storageState——那等于没测本栈登录链路，同样显式失败。
+// English: §0926E2E-17c — credentials are mandatory (fail fast), and a pre-logged session from a
+// foreign storageState is rejected instead of being silently reused.
+const USER = process.env.E2E_USER
+const PASS = process.env.E2E_PASS
 
 async function login(page) {
+  if (!USER || !PASS) {
+    test.fail(true, '§0926E2E-17c：E2E_USER/E2E_PASS 未注入——请用 scripts/uat_bootstrap.sh 正规通道')
+    return
+  }
   await page.goto('/#/')
-  // 已登录（存在侧栏菜单）则跳过登录表单
+  // 已登录（存在侧栏菜单）：冒烟允许复用**本通道自己预置**的会话，但凭据在位时正常续跑
   if (await page.locator('.app-shell .t-menu').count() > 0) return
   const acct = page.getByPlaceholder('输入账号')
   const pwd = page.getByPlaceholder('输入密码')

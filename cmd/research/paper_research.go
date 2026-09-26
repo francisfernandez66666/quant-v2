@@ -11,6 +11,7 @@ import (
 	"log"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
@@ -41,7 +42,7 @@ func cmdPaperResearch(db *store.DB, args []string) {
 	// English: Phase-4 sentiment context — the emotion-phase histogram over the last ~30 trading days.
 	phaseHist := research.EmotionPhaseHist(nil, nil)
 	if rangeFrom := time.Now().AddDate(0, 0, -45).Format("20060102"); true {
-		if emo, eerr := db.EmotionStatsRange(rangeFrom, time.Now().Format("20060102")); eerr == nil && len(emo) > 0 {
+		if emo, eerr := db.EmotionStatsRange(rangeFrom, cntime.DayCompactOf(time.Now())); eerr == nil && len(emo) > 0 {
 			phaseHist = research.EmotionPhaseHist(emo, nil)
 		}
 	}

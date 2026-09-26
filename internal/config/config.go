@@ -594,6 +594,55 @@ func (r RiskGateConfig) AnyEnabled() bool {
 		r.LimitUpBlockBuy || r.LimitDownBlockSellEnabled() || r.MaxOrderAmount > 0 || r.CrossCheckPct > 0
 }
 
+// defaultOffGateEntries §0926E2E-4B（2026-09-26 全量评价批，裁决=选项B）：六道"出厂默认关"
+// 风控闸的键名与判定闭包（键名与 /api/risk/gates 的 switches 口径逐一对齐，前端按键取中文名）。
+// 跌停追卖闸不列入默认关组——§A5-常开起其未配置即生效，"没配置"≠"没防守"。
+// English: the six factory-default-closed gates (key + closed-predicate); the limit-down gate is
+// excluded because since §A5 it is always-on unless explicitly disabled.
+var defaultOffGateEntries = []struct {
+	Key    string
+	Closed func(r RiskGateConfig) bool
+}{
+	{"day_loss", func(r RiskGateConfig) bool { return r.DayLossLimitPct <= 0 }},
+	{"concentration", func(r RiskGateConfig) bool { return r.SingleStockValuePct <= 0 }},
+	{"stale_quote", func(r RiskGateConfig) bool { return r.StaleQuoteMs <= 0 }},
+	{"limit_up_block_buy", func(r RiskGateConfig) bool { return !r.LimitUpBlockBuy }},
+	{"max_order_amount", func(r RiskGateConfig) bool { return r.MaxOrderAmount <= 0 }},
+	{"cross_check", func(r RiskGateConfig) bool { return r.CrossCheckPct <= 0 }},
+}
+
+// DisabledGates 返回当前**关闭**的风控闸键名（默认关六闸按现值判定；跌停追卖闸仅在显式
+// 配 false 时计入——未配置=常开不算关）。供 /api/risk/gates 数据面与"缺配置"告警卡消费。
+// English: lists currently-closed risk-gate keys; the limit-down gate only appears when explicitly
+// disabled (unset means always-on per §A5).
+func (r RiskGateConfig) DisabledGates() []string {
+	out := []string{}
+	for _, e := range defaultOffGateEntries {
+		if e.Closed(r) {
+			out = append(out, e.Key)
+		}
+	}
+	if !r.LimitDownBlockSellEnabled() {
+		out = append(out, "limit_down_block_sell")
+	}
+	return out
+}
+
+// GatesConfigUnset 六道默认关闸是否**全部仍处默认关**（= 该账号一条都没配过风控闸）。
+// §0926E2E-4B 的健康度信号：保持"默认关"出厂语义不动（开闸会在存量账号上产生新拒单，
+// 风险>收益，owner 裁决），但把"裸奔"状态从无人可见变成一屏告警——前端据此亮黄条，
+// 开闸建议见 docs/RUNBOOK_QMT_DAILY.md §4.3。
+// English: true when all six default-closed gates are still closed — the account never configured
+// any of them. Kept default-closed by owner ruling; surfaced as a UI health warning instead.
+func (r RiskGateConfig) GatesConfigUnset() bool {
+	for _, e := range defaultOffGateEntries {
+		if !e.Closed(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // SettleConfig §WS-B 交割单三方对账参数。
 // English: §WS-B settlement params.
 type SettleConfig struct {
@@ -730,8 +779,11 @@ type DataConfig struct {
 	ThsFactorsReady bool `json:"ths_factors_ready"`
 	// 夜间链自动追加全库寻优步骤（默认 false=推荐制手动触发）
 	OptimizeEnabled bool `json:"optimize_enabled"`
-	// 择优结果自动应用（默认 false=推荐制需人工审批）
-	OptimizeAutoApply bool `json:"optimize_auto_apply"`
+	// （已删除 §0926E2E-16）原 OptimizeAutoApply `json:"optimize_auto_apply"`：定义后全仓
+	// 零读取点的死开关——注释承诺"择优自动应用"从未接线。删除而非实装：owner 既有裁决是
+	// "研究→实盘必过人工审批"，实装等于新开自动通道（危险方向）。旧 config.json 里若仍带
+	// optimize_auto_apply 键，encoding/json 对未知键静默忽略（全仓无 DisallowUnknownFields），
+	// 读取不报错、值无处生效——与死开关时期的真实行为逐字一致。
 	// RiskSourceHithink 风险因子盘口主源开关（§MARKET_RISK_GATE P0）：
 	// nil 或 true = 涨停/跌停/炸板池与涨跌家数以同花顺（新）hithink 为主源、东财兜底；
 	// 显式 false = 应急回退阀，全部改走旧的东财直连（行为与本方案前一致）。
@@ -1823,22 +1875,48 @@ func (m *Manager) userRules(userID string) *Rules {
 	return cp
 }
 
-// saveUserRules 将账号规则快照持久化到 KVStore。
-// （saveUserRules persists an account's rules snapshot to the KVStore.）
-func (m *Manager) saveUserRules(userID string, r *Rules) {
+// setConfigVerifiedLocked §0926E2E-W1B（2026-09-26 全量审计批，owner 令按推荐执行）：
+// 账号级 KV 持久化的**统一自证出口**——SetConfig 写完立刻 GetConfig 复读并逐字节比对，
+// 写失败或复读不匹配一律返回 error。背景：旧 saveUserRules/SetD1/SetLongShort 三处都是
+// "SetConfig 出错只 log 照回 200"，前端显示"已保存"、磁盘没落——正是 §ROBUST 明令消灭的
+// "降级报成功"家族；口径仿 §0926ROT 写后复读自证。
+// 锁纪律：调用方必须已持有 m.mu 写锁（SetConfig/GetConfig 都走 store 自身互斥，
+// 且经 m.mu 与读路径 RLock 互斥；本函数绝不再取 m.mu，防自死锁）。
+// English: single verified-write exit for per-user KV persistence — re-read and
+// byte-compare right after SetConfig; any mismatch is an error (killing the
+// "swallow failure, still answer 200" family). Caller must already hold m.mu.
+func (m *Manager) setConfigVerifiedLocked(userID, key string, data []byte) error {
+	if err := m.store.SetConfig(userID, key, string(data)); err != nil {
+		return fmt.Errorf("持久化失败: %w", err)
+	}
+	raw, ok := m.store.GetConfig(userID, key)
+	if !ok {
+		return fmt.Errorf("写后复读缺失该键（key=%s）", key)
+	}
+	if raw != string(data) {
+		return fmt.Errorf("写后复读与写入不一致（key=%s，写入 %d 字节/复读 %d 字节）", key, len(data), len(raw))
+	}
+	return nil
+}
+
+// saveUserRules 将账号规则快照持久化到 KVStore，并做写后复读自证（§0926E2E-W1B 起返回 error：
+// 序列化失败/落库失败/复读不匹配都不再吞错，调用方必须把失败如实透出到 HTTP 500）。
+// （saveUserRules persists an account's rules snapshot to the KVStore with read-back verification;
+// since §0926E2E-W1B it returns error instead of logging-and-forgetting.）
+func (m *Manager) saveUserRules(userID string, r *Rules) error {
 	if m.store == nil || userID == "" {
-		return
+		return nil
 	}
 	data, err := json.Marshal(r)
 	if err != nil {
-		log.Printf("[config] 账号 %s 配置序列化失败: %v", userID, err)
-		return
+		return fmt.Errorf("账号 %s 配置序列化失败: %w", userID, err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.store.SetConfig(userID, perUserKey, string(data)); err != nil {
-		log.Printf("[config] 账号 %s 配置保存失败: %v", userID, err)
+	if err := m.setConfigVerifiedLocked(userID, perUserKey, data); err != nil {
+		return fmt.Errorf("账号 %s 配置%w", userID, err)
 	}
+	return nil
 }
 
 // Get 返回当前全局规则配置指针。
@@ -1880,9 +1958,10 @@ func (m *Manager) GetStrategyConfigFor(userID string) *StrategyConfig {
 // 全量替换语义暂保留（见 N-4 报告的同族漏网清单），但不再是无锁裸写。
 // English: per-owner full-replace writer; the no-store fallback branch now takes m.mu (it was an
 // unguarded cross-goroutine write) and stamps the mid-6 version.
-func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
+// §0926E2E-W1B：返回 error（持久化失败如实透出，HTTP 端点据此回 500）。
+func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) error {
 	if cfg == nil {
-		return
+		return fmt.Errorf("策略配置为空，未保存")
 	}
 	oid := m.ownerOf(userID)
 	next := *cfg
@@ -1891,12 +1970,11 @@ func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
 		m.mu.Lock()
 		m.rules.Strategy = next
 		m.mu.Unlock()
-		m.Save()
-		return
+		return m.Save()
 	}
 	r := m.userRules(oid)
 	r.Strategy = next
-	m.saveUserRules(oid, r)
+	return m.saveUserRules(oid, r)
 }
 
 // GetLLMConfigFor 返回运营数据归属账号（管理员）的 LLM 配置（运营配置系统级共享）。
@@ -1921,18 +1999,18 @@ func (m *Manager) ConfigOwnerID(userID string) string {
 }
 
 // SetLLMConfigFor 更新运营数据归属账号（管理员）的 LLM 配置并持久化（系统级共享）。
-func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
+// §0926E2E-W1B：返回 error（持久化失败/写后复读不匹配如实透出）。
+func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) error {
 	oid := m.ownerOf(userID)
 	if m.store == nil || oid == "" {
 		m.mu.Lock() // §0925EVE-D1：全局回退分支写活体字段补锁（与 §CFGSMASH setter 同口径）
 		m.rules.LLM = *cfg
 		m.mu.Unlock()
-		m.Save()
-		return
+		return m.Save()
 	}
 	r := m.userRules(oid)
 	r.LLM = *cfg
-	m.saveUserRules(oid, r)
+	return m.saveUserRules(oid, r)
 }
 
 // StoredLLMConfig 返回该账号（解析到运营归属账号）是否显式保存过 LLM 配置及其快照。
@@ -1980,17 +2058,19 @@ func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
 // 调用方负责校验取值合法性（mode/price_type 枚举、白名单过滤等），这里只做落库。
 // English: persists an account's QMT live-trading config to that account's rules snapshot
 // (hot-reloaded within 5s). Callers must validate enum/whitelist values — this method only stores.
-func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
+// §0926E2E-W1B：返回 error（含写后复读自证），applySetQMTConfig 据此回 500——
+// 旧行为"写失败只 log 照回 200"会让安全参数（enabled/熔断/预算）磁盘没落而前端显示已保存，
+// 重启即回退旧值。
+func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) error {
 	if m.store == nil || userID == "" {
 		m.mu.Lock() // §0925EVE-D1：无 store 全局回退分支写活体字段补锁
 		m.rules.QMT = *cfg
 		m.mu.Unlock()
-		m.Save()
-		return
+		return m.Save()
 	}
 	r := m.userRules(userID)
 	r.QMT = *cfg
-	m.saveUserRules(userID, r)
+	return m.saveUserRules(userID, r)
 }
 
 // SetPaperStrategyFor 更新指定账号的模拟盘战法准入配置（§SIGNAL_CONTROLLER P3：
@@ -1999,19 +2079,19 @@ func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
 // 调用方负责白名单条目合法性校验（knownStrategyIDSet），这里只做落库。
 // English: persists an account's paper-side strategy admission (whitelist + code blacklist),
 // leaving the rest of rules.paper untouched; the signal controller picks it up on its next feed.
-func (m *Manager) SetPaperStrategyFor(userID string, strategies, blacklist []string) {
+// §0926E2E-W1B：返回 error（持久化失败如实透出）。
+func (m *Manager) SetPaperStrategyFor(userID string, strategies, blacklist []string) error {
 	if m.store == nil || userID == "" {
 		m.mu.Lock() // §0925EVE-D1：全局回退分支写活体字段补锁
 		m.rules.Paper.Strategies = strategies
 		m.rules.Paper.Blacklist = blacklist
 		m.mu.Unlock()
-		m.Save()
-		return
+		return m.Save()
 	}
 	r := m.userRules(userID)
 	r.Paper.Strategies = strategies
 	r.Paper.Blacklist = blacklist
-	m.saveUserRules(userID, r)
+	return m.saveUserRules(userID, r)
 }
 
 // SetPaperConfigFor §F-4（20260917 缺陷修复批）：按回调局部更新指定账号的 rules.paper
@@ -2019,20 +2099,20 @@ func (m *Manager) SetPaperStrategyFor(userID string, strategies, blacklist []str
 // （走 SetPaperStrategyFor，语义已独立）。store 缺席时落全局快照（测试/单文件部署）。
 // English: §F-4 — mutator-style partial update of an account's rules.paper (master switch,
 // auto-sell, sizing, short-side params); strategies/blacklist keep their dedicated setter.
-func (m *Manager) SetPaperConfigFor(userID string, mutate func(*PaperConfig)) {
+// §0926E2E-W1B：返回 error（持久化失败/写后复读不匹配如实透出）。
+func (m *Manager) SetPaperConfigFor(userID string, mutate func(*PaperConfig)) error {
 	if mutate == nil {
-		return
+		return nil
 	}
 	if m.store == nil || userID == "" {
 		m.mu.Lock() // §0925EVE-D1：全局回退分支的 mutate 持锁执行，与 Save 的 RLock marshal 配对
 		mutate(&m.rules.Paper)
 		m.mu.Unlock()
-		m.Save()
-		return
+		return m.Save()
 	}
 	r := m.userRules(userID)
 	mutate(&r.Paper)
-	m.saveUserRules(userID, r)
+	return m.saveUserRules(userID, r)
 }
 
 // GetD1ConfigFor 返回运营数据归属账号（管理员）的 D1 事件匹配规则（运营配置系统级共享）。
@@ -2057,25 +2137,26 @@ func (m *Manager) GetD1ConfigFor(userID string) *D1Config {
 }
 
 // SetD1ConfigFor 更新运营数据归属账号（管理员）的 D1 规则并持久化（系统级共享）。
-func (m *Manager) SetD1ConfigFor(userID string, cfg *D1Config) {
+// §0926E2E-W1B：返回 error，且落库走 setConfigVerifiedLocked 写后复读自证（旧写法 SetConfig
+// 出错只 log 照回 200，属"降级报成功"家族）。
+func (m *Manager) SetD1ConfigFor(userID string, cfg *D1Config) error {
 	oid := m.ownerOf(userID)
 	if m.store == nil || oid == "" {
 		m.mu.Lock() // §0925EVE-D1：D1 指针整体替换是发布动作，必须持锁（与 Load 同口径）
 		m.d1 = cfg
 		m.mu.Unlock()
-		m.Save()
-		return
+		return m.Save()
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
-		log.Printf("[config] 账号 %s D1 配置序列化失败: %v", oid, err)
-		return
+		return fmt.Errorf("账号 %s D1 配置序列化失败: %w", oid, err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.store.SetConfig(oid, perUserD1Key, string(data)); err != nil {
-		log.Printf("[config] 账号 %s D1 配置保存失败: %v", oid, err)
+	if err := m.setConfigVerifiedLocked(oid, perUserD1Key, data); err != nil {
+		return fmt.Errorf("账号 %s D1 配置%w", oid, err)
 	}
+	return nil
 }
 
 // GetLongShortConfigFor 返回运营数据归属账号（管理员）的做多/做空开关（运营配置系统级共享，
@@ -2101,21 +2182,22 @@ func (m *Manager) GetLongShortConfigFor(userID string) LongShortConfig {
 }
 
 // SetLongShortConfigFor 更新运营数据归属账号（管理员）的做多/做空开关并持久化（系统级共享）。
-func (m *Manager) SetLongShortConfigFor(userID string, c LongShortConfig) {
+// §0926E2E-W1B：返回 error，且落库走 setConfigVerifiedLocked 写后复读自证。
+func (m *Manager) SetLongShortConfigFor(userID string, c LongShortConfig) error {
 	oid := m.ownerOf(userID)
 	if m.store == nil || oid == "" {
-		return
+		return nil
 	}
 	data, err := json.Marshal(c)
 	if err != nil {
-		log.Printf("[config] 账号 %s 做多/做空配置序列化失败: %v", oid, err)
-		return
+		return fmt.Errorf("账号 %s 做多/做空配置序列化失败: %w", oid, err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.store.SetConfig(oid, perUserLongShortKey, string(data)); err != nil {
-		log.Printf("[config] 账号 %s 做多/做空配置保存失败: %v", oid, err)
+	if err := m.setConfigVerifiedLocked(oid, perUserLongShortKey, data); err != nil {
+		return fmt.Errorf("账号 %s 做多/做空配置%w", oid, err)
 	}
+	return nil
 }
 
 // GetStrategyConfig 返回全局策略参数配置（无账号隔离时使用）。
@@ -2372,7 +2454,10 @@ func (m *Manager) RulesD1Snapshot() (*Rules, *D1Config) {
 // 此处取 RLock 无重入死锁风险；磁盘 IO 留在锁外，读路径（打分循环）不被写盘拖住。
 // English: marshalling now runs under RLock (it walks the live Rules tree); the atomic file
 // write stays outside the lock. All existing call sites already release the lock before Save.
-func (m *Manager) Save() {
+// §0926E2E-W1B：返回 error（序列化/原子写失败如实透出；旧写法只 log，全局回退分支的
+// HTTP 保存路径同样"降级报成功"）。既有语句式调用点（cmd/测试/内部程序化入口）忽略
+// 返回值在 Go 里合法，行为不变；HTTP 端点侧已逐个接错。
+func (m *Manager) Save() error {
 	wrapper := struct {
 		Rules *Rules    `json:"rules"` // 全局规则配置段
 		D1    *D1Config `json:"d1"`    // D1 事件匹配规则段
@@ -2384,15 +2469,16 @@ func (m *Manager) Save() {
 	m.mu.RUnlock()
 	if err != nil {
 		log.Printf("[config] 序列化失败: %v", err)
-		return
+		return fmt.Errorf("配置序列化失败: %w", err)
 	}
 	// §W3-c 统一原子写（fsync+唯一临时名）：config.json 由 quant 与 researchd 双进程写，
 	// 固定 .tmp 名会互相踩踏；截断则全部账号配置回退默认。
 	if err := fileutil.AtomicWrite(m.path, data, 0644); err != nil {
 		log.Printf("[config] 写入失败: %v", err)
-		return
+		return fmt.Errorf("配置文件写入失败: %w", err)
 	}
 	log.Printf("[config] 已保存配置文件: %s", m.path)
+	return nil
 }
 
 // Watch §P1-6 配置热重载：轮询配置文件（默认 30s），内容变更（sha256 比对）时自动调用 Load()

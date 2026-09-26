@@ -153,7 +153,8 @@ func (d *DB) migrate() error {
 			horizon INTEGER,
 			reason TEXT,
 			guard TEXT DEFAULT 'standard',
-			params TEXT DEFAULT ''
+			params TEXT DEFAULT '',
+			fidelity TEXT DEFAULT ''
 		)`,
 		// 参数扫参结果（§P2-c）：optimize 任务 TOP-N 排名，审批后转规则级参数覆盖。
 		// English: parameter-sweep rankings per task; approvals become rule-level overrides.
@@ -646,6 +647,9 @@ func (d *DB) migrate() error {
 		// §2026-09-05 多轮发现/护栏分级：候选护栏档位 + 参数快照（精确复现审批时的战法）
 		{"research_candidates", "guard", "ALTER TABLE research_candidates ADD COLUMN guard TEXT DEFAULT 'standard'"},
 		{"research_candidates", "params", "ALTER TABLE research_candidates ADD COLUMN params TEXT DEFAULT ''"},
+		// §0926E2E-12A 输入保真水印：候选由日K近似回放产出（尾盘门控结构性不可触发、交易分钟数
+		// 本地口径），回放报告是审批依据——保真边界必须进数据结构而非只写在文档里。
+		{"research_candidates", "fidelity", "ALTER TABLE research_candidates ADD COLUMN fidelity TEXT DEFAULT ''"},
 		// §WS-A/WS-B 实盘账本扩充：
 		//  fills 手续费/印花税/交割流水号（券商交割单三方对账 + 盈亏含成本口径）
 		{"fills", "fee", "ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0"},

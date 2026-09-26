@@ -145,5 +145,8 @@ try{
     Ok "引擎 /setup 可达"
 }catch{ Warn "引擎 /setup 失败：$($_.Exception.Message)" }
 
-Ok "切流完成。下一步：浏览器开 http://<本机公网IP>:8080/setup 建管理员；首尔侧把该账号 qmt.enabled 置 false。"
+Ok "切流完成。下一步：初始化管理员。§0926E2E-W2A 起引擎服务已注入 SETUP_TOKEN（注册步生成/取自 C:\etc\quant.env），POST /setup 必须携带 X-Setup-Token，取值并发起："
+Ok '  $tok = (Select-String -Path C:\etc\quant.env -Pattern "^SETUP_TOKEN=").Line.Split("=",2)[1]'
+Ok '  Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8081/setup -Headers @{"X-Setup-Token"=$tok} -ContentType "application/json" -Body (ConvertTo-Json @{username="admin";password="<改成强口令>"})'
+Ok "（8081=引擎本机口；经 Caddy :8080 亦可，只要反代放通 /setup。另需首尔侧把该账号 qmt.enabled 置 false。）"
 Ok "回滚命令：powershell -ep bypass -File install_guangzhou.ps1 -Rollback"

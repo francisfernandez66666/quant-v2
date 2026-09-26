@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -248,10 +249,10 @@ func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag stri
 	}
 	tradeDate := dateFlag
 	if tradeDate == "" {
-		tradeDate = time.Now().Format("20060102")
+		tradeDate = cntime.DayCompactOf(time.Now())
 	}
 	// 连板天梯为当日快照接口（无历史参数），仅在同步"今日"时追加。
-	if tradeDate == time.Now().Format("20060102") {
+	if tradeDate == cntime.DayCompactOf(time.Now()) {
 		lad, lerr := client.LimitUpLadderEntries()
 		if lerr != nil {
 			log.Fatalf("连板天梯拉取失败: %v", lerr)
@@ -279,7 +280,7 @@ func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag stri
 func syncPoolsForDate(client *data.HithinkClient, db *store.DB, dateFlag string) (int64, error) {
 	tradeDate := dateFlag
 	if tradeDate == "" {
-		tradeDate = time.Now().Format("20060102")
+		tradeDate = cntime.DayCompactOf(time.Now())
 	}
 	var dateMs int64
 	if t, err := time.ParseInLocation("20060102", tradeDate, time.Local); err == nil {
@@ -341,7 +342,7 @@ func cmdHithinkSyncAnomaly(client *data.HithinkClient, db *store.DB, since strin
 	if err != nil {
 		log.Fatalf("异动列表拉取失败: %v", err)
 	}
-	tradeDate := time.Now().Format("20060102")
+	tradeDate := cntime.DayCompactOf(time.Now())
 	// row 异动公告行：代码/名称/标签/正文 + 关键词。
 	type row struct {
 		code, name, tag, content string
@@ -400,7 +401,7 @@ func cmdHithinkSyncValuations(client *data.HithinkClient, db *store.DB) error {
 	if cerr != nil {
 		log.Fatalf("读标的清单失败: %v", cerr)
 	}
-	tradeDate := time.Now().Format("20060102")
+	tradeDate := cntime.DayCompactOf(time.Now())
 	total := 0
 	failed := 0
 	batches := 0

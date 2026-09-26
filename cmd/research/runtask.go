@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/btreplay"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
 )
@@ -233,7 +234,7 @@ func payloadIntDef(p map[string]any, key string, def int) int {
 }
 
 // today 当前日期 YYYYMMDD（researchd 已固定 Asia/Shanghai 时区，海外主机不偏移）。
-func today() string { return time.Now().Format("20060102") }
+func today() string { return cntime.DayCompactOf(time.Now()) }
 
 // dataDirOf 从库路径推导数据目录（applied_*.json 所在，与 QUANT_DATA_DIR 约定一致）。
 func dataDirOf(dbPath string) string {

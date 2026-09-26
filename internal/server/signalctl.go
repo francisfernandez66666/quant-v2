@@ -136,7 +136,12 @@ func (s *Server) handleSetPaperStrategies(w http.ResponseWriter, r *http.Request
 		}
 		curBL = out
 	}
-	s.cfg.SetPaperStrategyFor(uid, cur, curBL)
+	// §0926E2E-W1B：持久化失败（含写后复读不匹配）即中止回 500，不热同步未落盘的白名单。
+	if err := s.cfg.SetPaperStrategyFor(uid, cur, curBL); err != nil {
+		log.Printf("[signalctl] 账号 %s 模拟盘战法白名单保存失败: %v", uid, err)
+		writeError(w, 500, "战法白名单保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
+		return
+	}
 	// 资金池模板热同步：动量显式列名才开池（分仓守恒在 SetStrategyPools 内处理）。
 	if s.registry != nil {
 		s.registry.SetPaperPools(ActivePaperPoolTypes(s.researchDir, s.paperStrategiesForOperator()))

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/backtest"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/factor"
@@ -128,6 +129,8 @@ func cmdOptimize(db *store.DB, args []string) {
 		Kind: "weights", Status: status, Factors: string(fj), Weights: string(wj),
 		Metric: res.IR, ICMean: res.ICMean, IR: res.IR, AvgExcess: avgExcess,
 		Horizon: *h, Reason: res.Reason,
+		// §0926E2E-12A：权重发现的评价输入是日K回放 → 水印终身随行（审批依据自带保真边界）。
+		Fidelity: store.FidelityDailyKApprox,
 	})
 	if err != nil {
 		log.Fatalf("保存候选失败: %v", err)
@@ -281,6 +284,8 @@ func cmdScanDepth(db *store.DB, args []string) {
 		Kind: "depth", Status: "proposed", Factors: string(fj), Weights: string(wj),
 		Metric: float64(nSupport + nResist), ICMean: float64(nSupport), IR: float64(nResist),
 		Reason: reason,
+		// 有意不打 §0926E2E-12A 保真水印：盘口扫描证据是逐笔委托实测计数，不吃日K回放输入，
+		// 给它盖"近似输入"章属于说谎式保守（水印只在真有分叉的链路上打）。
 	})
 	if err != nil {
 		log.Fatalf("保存候选失败: %v", err)
@@ -569,7 +574,7 @@ func defaultFactorPool() string {
 func cmdDiscoverFactors(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("discover-factors", flag.ExitOnError)
 	start := fs.String("start", "20200101", "起始日期 YYYYMMDD")
-	end := fs.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
+	end := fs.String("end", cntime.DayCompactOf(time.Now()), "结束日期 YYYYMMDD")
 	h := fs.Int("h", 5, "前瞻天数")
 	minStocks := fs.Int("min-stocks", 10, "每日最小样本")
 	maxFactors := fs.Int("max-factors", 8, "组合最大因子数")
@@ -791,6 +796,8 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 			// 与 reason 打架（生产 #1：IR=-0.501 vs reason 样本内=0.553）。
 			Metric: res.InsampleIR, ICMean: res.ICMean, IR: res.InsampleIR,
 			Horizon: *h, Reason: reason,
+			// §0926E2E-12A 输入保真水印：因子评价全程吃日K近似回放输入。
+			Fidelity: store.FidelityDailyKApprox,
 		})
 		if err != nil {
 			log.Fatalf("保存候选失败: %v", err)
@@ -972,7 +979,7 @@ func candidateAgeDays(createdAt string) float64 {
 func cmdDiscoverPatterns(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("discover-patterns", flag.ExitOnError)
 	start := fs.String("start", "20200101", "起始日期 YYYYMMDD")
-	end := fs.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
+	end := fs.String("end", cntime.DayCompactOf(time.Now()), "结束日期 YYYYMMDD")
 	h := fs.Int("h", 5, "前瞻天数")
 	minTrigger := fs.Int("min-trigger", 20, "最小触发次数")
 	minExcess := fs.Float64("min-excess", 0.01, "护栏最小平均超额")
@@ -1051,6 +1058,8 @@ func cmdDiscoverPatterns(db *store.DB, args []string) {
 			Factors: string(condsJSON), Weights: "{}",
 			Metric: p.Excess, AvgExcess: p.Excess, IR: 0,
 			Horizon: *h, Reason: reason,
+			// §0926E2E-12A 输入保真水印：形态发现同样吃日K近似（尾盘 14:57 门控在此口径不可触发）。
+			Fidelity: store.FidelityDailyKApprox,
 		})
 		if err != nil {
 			log.Fatalf("保存候选失败: %v", err)
@@ -1075,7 +1084,7 @@ func cmdDiscoverPatterns(db *store.DB, args []string) {
 func cmdBacktestCandidate(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("backtest", flag.ExitOnError)
 	start := fs.String("start", "20200101", "起始日期 YYYYMMDD")
-	end := fs.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
+	end := fs.String("end", cntime.DayCompactOf(time.Now()), "结束日期 YYYYMMDD")
 	h := fs.Int("h", 5, "前瞻天数")
 	id := fs.Int64("id", 0, "候选 ID（0=按 since/最新一条 proposed factor 候选）")
 	since := fs.String("since", "", "只回填此日(YYYYMMDD)以来创建的 proposed factor 候选（A2 配对回测）")

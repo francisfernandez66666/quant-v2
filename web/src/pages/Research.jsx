@@ -1273,6 +1273,13 @@ export default function Research() {
     return (
       // 卡片标题行：候选编号 + 类型/状态/风控标签 + 创建时间
       <Card key={c.id} style={{ marginBottom: 12 }} title={<span>#{c.id} <Tag theme="primary">{kindLabel(c.kind)}</Tag> <Tag theme={c.status === 'proposed' ? 'warning' : 'success'}>{statusLabel(c.status)}</Tag> {c.guard && c.guard !== 'standard' && <Tag theme={guardMeta(c.guard).theme}>{guardMeta(c.guard).label}</Tag>} <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>{c.created_at}</span></span>}>
+        {/* §0926E2E-12A 输入保真水印：候选自带近似输入声明时置顶展示（后端 fidelity 字段，
+            生成端只给真吃日K回放输入的候选打章）——审批依据先说清自己的边界。 */}
+        {c.fidelity ? (
+          <div style={{ background: 'rgba(227,119,0,0.10)', border: '1px solid rgba(227,119,0,0.4)', borderRadius: 4, padding: '6px 10px', margin: '2px 0 10px', fontSize: 12, color: 'var(--app-text-1)' }}>
+            输入保真：{c.fidelity}
+          </div>
+        ) : null}
         {c.kind === 'factor' ? (
            // 因子战法分支：解释玩法与电脑验证结论
            <div>

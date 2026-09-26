@@ -48,6 +48,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -156,6 +157,11 @@ type Server struct {
 	// 拆分，避免夜间研究大批量写入与实时实盘对账/心跳同文件争锁，并便于独立备份。
 	// 为空时 realDB() 回退 researchDB，保证旧部署（实盘账本仍在 trading.db）向后兼容。
 	liveDB *store.DB
+
+	// quoteForOrderFn §0926E2E-W1C 测试缝（包内注入，生产恒 nil 走 market.GetRealtimeQuote）：
+	// 手动单行情链在场性的注入点——market 是具体类型 *data.MarketAPI 无法伪造取价失败，
+	// 用例只需要证明"取不到价→400、显式确认→受理"这一条语义。
+	quoteForOrderFn func(code string) (*data.StockInfo, error)
 
 	cacheDir string // 看板快照落盘目录（休市/重启后前端仍可读取最近一次有效数据）
 	// §A7（20260918 审计批）buildCommit：构建期 -ldflags 注入的 git 短指纹，经 SetBuildCommit
@@ -1143,6 +1149,34 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// decodeOptJSON §0926E2E-W1C/D（2026-09-26 全量审计批）"请求体可选"端点的统一解码口径：
+//   - 空请求体（io.EOF，老客户端/curl 裸发）→ 返回 nil，字段维持零值语义（合法形态）；
+//   - 非法 JSON（语法错/类型错）→ 返回 error，调用方必须 400 中止。
+//
+// 缺陷原文：清理账号/清盘/settle 等破坏性动作此前写 `_ = Decode(&req)`——畸形 JSON 被
+// 解析成零值继续执行（想 dry_run=true 预览的调用因手滑坏了一个括号，直接收到"清理完成"）。
+// "可选"只豁免"不带"，绝不豁免"带坏了"。
+// English: optional-body JSON decode — empty body keeps zero-value semantics, malformed
+// body is an error the handler must surface as 400 (destructive actions must never run on
+// silently-zeroed params).
+func decodeOptJSON(r *http.Request, v any) error {
+	err := json.NewDecoder(r.Body).Decode(v)
+	if errors.Is(err, io.EOF) {
+		return nil // 空体=未携带，属合法形态
+	}
+	return err
+}
+
+// auditActorID §0926E2E-W1D：审计主体的 nil-safe 取法。userFromContext 在上下文缺位时
+// 返回 nil，旧写法链上 `.ID` 即 panic——中间件形态理论上保证可达性，但防未来挂错中间件
+// 时把"记不下主体"升级成"整条请求 500 panic"。
+func auditActorID(r *http.Request) string {
+	if u := userFromContext(r); u != nil {
+		return u.ID
+	}
+	return ""
+}
+
 // ── Auth handlers ──
 
 // handleRegister 处理 POST /auth/register：创建用户并返回 token 与用户 ID。
@@ -1202,6 +1236,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"account": user.Username,
 		"role":    user.Role,
 		"perms":   user.Perms,
+		// §0926E2E-W2B：SSE `?token=` 遗留通道退役预告——旧客户端（APK）登录即拿到退役日期，
+		// 截止前留有一个版本周期的升级窗口（web 端自 §WS-F C4a 起已走票据、与此无关）。
+		// 只加字段不改任何既有键，宽松解码的老客户端不受影响。
+		"sse_query_token_expires_at": sseQueryTokenDeadline.Format(time.RFC3339),
 	})
 }
 
@@ -1677,7 +1715,13 @@ func (s *Server) handleLongToggle(w http.ResponseWriter, r *http.Request) {
 	if s.cfg != nil {
 		cur := s.cfg.GetLongShortConfigFor(userID)
 		cur.LongEnabled = req.Enabled
-		s.cfg.SetLongShortConfigFor(userID, cur)
+		// §0926E2E-W1B：持久化失败即中止并回 500——不翻运行时开关，避免"内存已开、磁盘没落、
+		// 前端显示成功"的半态（重启回退旧值=静默降级）。
+		if err := s.cfg.SetLongShortConfigFor(userID, cur); err != nil {
+			log.Printf("[server] 账号 %s 做多开关保存失败: %v", userID, err)
+			writeError(w, 500, "开关未保存（未落盘，本次不生效）: "+err.Error())
+			return
+		}
 	}
 	if c := s.ctrlFor(userID); c != nil {
 		c.SetLongEnabled(req.Enabled)
@@ -1707,7 +1751,12 @@ func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 	if s.cfg != nil {
 		cur := s.cfg.GetLongShortConfigFor(userID)
 		cur.ShortEnabled = req.Enabled
-		s.cfg.SetLongShortConfigFor(userID, cur)
+		// §0926E2E-W1B：持久化失败即中止并回 500（与做多开关腿同口径，防"内存已开磁盘没落"半态）。
+		if err := s.cfg.SetLongShortConfigFor(userID, cur); err != nil {
+			log.Printf("[server] 账号 %s 做空开关保存失败: %v", userID, err)
+			writeError(w, 500, "开关未保存（未落盘，本次不生效）: "+err.Error())
+			return
+		}
 	}
 	if c := s.ctrlFor(userID); c != nil {
 		c.SetShortEnabled(req.Enabled)

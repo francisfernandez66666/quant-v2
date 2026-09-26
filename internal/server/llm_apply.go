@@ -6,7 +6,6 @@
 package server
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
 	"strconv"
@@ -409,7 +408,11 @@ func (s *Server) persistLLMSnapshot(uid string, cand llmSnapshot) error {
 	next.BatchConcurrency = cand.BatchConcurrency
 	next.ClassifierModel = cand.ClassifierModel
 	next.D1MaxTokens = cand.D1MaxTokens
-	s.cfg.SetLLMConfigFor(uid, &next)
+	// §0926E2E-W1B：SetLLMConfigFor 起返回 error（含写后复读自证），此处如实上抛——
+	// 调用方已有"运行时已生效但落库失败"的如实回告分支，过去因 setter 吞错该分支永不触发。
+	if err := s.cfg.SetLLMConfigFor(uid, &next); err != nil {
+		return err
+	}
 
 	if len(cand.Keys) == 0 {
 		return nil
@@ -560,8 +563,11 @@ func (s *Server) handleProbeLLMConfig(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
 	var req setLLMConfigReq
 	if r.Body != nil {
-		// 允许空体：探测当前生效配置。
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		// 允许空体：探测当前生效配置。§0926E2E-W1D：畸形 JSON 不再吞成"探测当前"，400 中止。
+		if err := decodeOptJSON(r, &req); err != nil {
+			writeError(w, 400, "invalid request body: "+err.Error())
+			return
+		}
 	}
 	probeOnly := req.APIURL == "" && req.Model == "" && len(req.APIKeys) == 0 && req.APIKey == ""
 	if probeOnly {

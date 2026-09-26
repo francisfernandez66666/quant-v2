@@ -4,7 +4,7 @@
 // 建议回看：实盘持仓「建议」列由 SSE real_advice 实时推送 + 挂载 REST 回填（§F-6）点亮。
 // 纯 TDesign 组件（Tabs / TabPanel / Card / Table / Dialog / Form / Input / InputNumber / Button / Tag），无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
-import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin } from 'tdesign-react'
+import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin, DialogPlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
@@ -516,6 +516,10 @@ export default function Positions() {
     setRealFormStrategy('')
   }
   // 提交实盘买入/卖出/止盈/清仓委托
+  // §0926E2E-W1C（后端同步改造）：现价不可得时后端不再静默放行价格校验，而是 400 要求
+  // 显式确认（confirm_no_quote）。这里承接该形态：报"无法获取实时现价"→ 弹二次确认，
+  // 用户点「仍要下单」后带确认位**复用同一 client_id** 重发（幂等双保险：即便首请求
+  // 已到达柜台，重试也只会命中幂等键返回 duplicate，不会重复下单）。
   async function confirmRealAction() {
     const a = realAction
     if (!a) return
@@ -529,23 +533,54 @@ export default function Positions() {
       return
     }
     setRealSubmitting(true)
-    // 构造实盘下单请求参数并提交
-    try {
-      const res = await api.executeRealAction({
-        code: a.pos.ts_code,
-        side: sell ? '卖出' : '买入',
-        action: realActionLabel(a.dir),
-        qty,
-        price,
-        strategy: realFormStrategy,
-        reason: 'manual:' + a.dir,
-      })
+    // 一次确认生成一次幂等键（§P2-15），行情确认重试复用同一键
+    const clientID = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : undefined
+    const base = {
+      code: a.pos.ts_code,
+      side: sell ? '卖出' : '买入',
+      action: realActionLabel(a.dir),
+      qty,
+      price,
+      strategy: realFormStrategy,
+      reason: 'manual:' + a.dir,
+      client_id: clientID,
+    }
+    // 真正提交并处理成功收尾（成功提示+关弹窗+延迟刷新等回报）
+    async function submit(payload) {
+      const res = await api.executeRealAction(payload)
       MessagePlugin.success((sell ? '卖出' : '买入') + '委托已提交 ' + a.pos.ts_code + ' ' + qty + ' 股' + (res.order_id ? '（单号 ' + res.order_id + '）' : ''))
       setRealAction(null)
       // 委托提交后 2s 刷新实盘持仓，等待网关回报
       setTimeout(loadReal, 2000)
-    } catch (e) { MessagePlugin.error('下单失败: ' + (e.message || '')) }
-    finally { setRealSubmitting(false) }
+    }
+    // 行情不可得的二次确认：Promise 化 DialogPlugin（确认=resolve 继续重发；取消/关闭=reject 静默收尾）
+    function confirmNoQuote() {
+      return new Promise((resolve, reject) => {
+        DialogPlugin.confirm({
+          header: '无法获取实时现价',
+          body: `行情链路故障，委托价 ${price} 无法与现价核对偏离。请再次核对价格与方向；确需在此状态下下单（如紧急止损），点「仍要下单」，该操作会写入审计留痕。`,
+          confirmBtn: '仍要下单',
+          cancelBtn: '取消',
+          onConfirm: () => { resolve() },
+          onClose: () => { reject(new Error('__no_quote_cancel__')) },
+        })
+      })
+    }
+    try {
+      try {
+        await submit(base)
+      } catch (e) {
+        const msg = String((e && e.message) || '')
+        if (!msg.includes('无法获取实时现价')) throw e
+        await confirmNoQuote()
+        await submit({ ...base, confirm_no_quote: true })
+      }
+    } catch (e) {
+      const msg = String((e && e.message) || '')
+      // 用户主动取消二次确认：静默收场（未下单，无需报错恐吓）
+      if (msg.includes('__no_quote_cancel__')) MessagePlugin.info('已取消，未提交委托')
+      else MessagePlugin.error('下单失败: ' + msg)
+    } finally { setRealSubmitting(false) }
   }
 
   // 展开/收起指定代码的分时图（维护已展开代码集合）

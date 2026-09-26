@@ -13,6 +13,8 @@
 #   LLM_API_URL       LLM API 地址（可选，默认 https://api.siliconflow.cn/v1/chat/completions）
 #   LLM_MODEL         LLM 模型名（可选，默认 THUDM/GLM-Z1-9B-0414）
 #   HITHINK_FINANCE_API_KEY  同花顺数据密钥（可选，§ENH-0：交易日历/行情主源，强烈建议提供）
+#   SETUP_TOKEN       /setup 抢跑守卫令牌（§0926E2E-W2A：可选；留空且服务器也无现值时自动生成
+#                     并追加写入 /etc/quant.env（0600），全程不回显值）
 #   DEPLOY_DIR        服务器代码目录（默认 /opt/quant）
 #   QUANT_DATA_DIR    服务器数据目录（默认 /var/lib/quant-trading-v2）
 
@@ -27,6 +29,10 @@ LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn/v1/chat/completions}"
 LLM_MODEL="${LLM_MODEL:-THUDM/GLM-Z1-9B-0414}"
 # §ENH-0(2026-09-19)：hithink 密钥（交易日历/行情主源），可选；缺省时日历按周末口径兜底。
 HITHINK_FINANCE_API_KEY="${HITHINK_FINANCE_API_KEY:-}"
+# §0926E2E-W2A：/setup 首次初始化守卫令牌（Go 侧 §P1-5 "非空即强制"）。可选传入；
+# 不传则复用服务器 /etc/quant.env 现值，服务器也没有就 openssl 随机生成——三条路必有一条，
+# 该键在首尔部署面**恒在位**（缺陷 6 收口：守卫代码在、部署面零命中＝从未生效）。
+SETUP_TOKEN="${SETUP_TOKEN:-}"
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/quant}"
 QUANT_DATA_DIR="${QUANT_DATA_DIR:-/var/lib/quant-trading-v2}"
 
@@ -149,6 +155,27 @@ EOF
     $SSH "sudo chmod 600 /etc/quant.env"
 else
     echo "      LLM/hithink key 均未提供，保留服务器现有 /etc/quant.env（云端后台配置）"
+fi
+
+# ── 4b. §0926E2E-W2A：SETUP_TOKEN 恒在位（只追加/只改该行，不整文件重写）──
+# 上面 [4/8] 的 tee 是全量覆盖语义（只保它认识的键），这里对 SETUP_TOKEN 单独做增量维护，
+# 值绝不打到本脚本输出/部署日志——需要取值时用提示里的 ssh 命令现场读。
+# 教训沿用：set -e 下 grep 无命中返回 1，取值管道必须 `|| true` 兜住。
+EXISTING_SETUP_TOKEN=$($SSH "sudo grep -m1 '^SETUP_TOKEN=' /etc/quant.env 2>/dev/null | cut -d= -f2 | tr -d '\r\n'" || true)
+if [ -z "$SETUP_TOKEN" ] && [ -n "$EXISTING_SETUP_TOKEN" ]; then
+    echo "      SETUP_TOKEN: 复用服务器现值（/setup 守卫已处于开启态，不动它）"
+elif [ -z "$SETUP_TOKEN" ]; then
+    SETUP_TOKEN=$(openssl rand -hex 24)
+    printf 'SETUP_TOKEN=%s\n' "$SETUP_TOKEN" | $SSH "sudo tee -a /etc/quant.env >/dev/null && sudo chmod 600 /etc/quant.env"
+    echo "      SETUP_TOKEN: 已随机生成并追加进 /etc/quant.env（0600，值不回显）"
+    echo "      取值（初始化管理员时用）: $SSH \"sudo grep SETUP_TOKEN /etc/quant.env\""
+elif [ -n "$EXISTING_SETUP_TOKEN" ]; then
+    # 显式传参与现值不同：按新值替换（口令轮换语义），只动这一行
+    $SSH "sudo sed -i 's/^SETUP_TOKEN=.*/SETUP_TOKEN=$SETUP_TOKEN/' /etc/quant.env && sudo chmod 600 /etc/quant.env"
+    echo "      SETUP_TOKEN: 已按传入参数更新 /etc/quant.env 该行"
+else
+    printf 'SETUP_TOKEN=%s\n' "$SETUP_TOKEN" | $SSH "sudo tee -a /etc/quant.env >/dev/null && sudo chmod 600 /etc/quant.env"
+    echo "      SETUP_TOKEN: 已按传入参数追加写入 /etc/quant.env（0600）"
 fi
 
 # ── 5. 域名占位符替换 + 安装 Caddy ──

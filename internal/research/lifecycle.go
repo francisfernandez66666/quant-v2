@@ -345,6 +345,8 @@ func PromotionCandidates(db *store.DB, gs *grayscaleFile, verds []GrayscaleVerdi
 			Kind: v.Kind, Status: store.CandProposed, Guard: "promotion",
 			Factors: factorsJSON, Weights: weightsJSON, Params: string(params),
 			Metric: v.IR, IR: v.IR, Reason: reason,
+			// 有意不打 §0926E2E-12A 保真水印：晋升依据是灰度期实/模拟盘观测统计，
+			// 不是日K回放结论（水印按证据来源打，不按祖先候选打）。
 		})
 		if err != nil {
 			return ids, err

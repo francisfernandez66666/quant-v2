@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"quant-trading-v2/internal/config"
@@ -16,7 +17,8 @@ import (
 // 动量有显式开关位）；POST 白名单+黑名单落库后 GET 回读一致；未知战法拒绝。
 // 裁定端点无引擎时返回空列表（200 形状稳定，前端零判空）。
 func TestPaperStrategiesEndpoints(t *testing.T) {
-	s := &Server{cfg: config.NewManager("")}
+	// §0926E2E-W1B：给配置管理器真实可写的落盘路径（旧 NewManager("") 的 Save 恒失败被吞错掩盖）。
+	s := &Server{cfg: config.NewManager(filepath.Join(t.TempDir(), "config.json"))}
 
 	// GET 初始：空白名单（默认全集语义）+ shadow 默认开
 	rr := httptest.NewRecorder()

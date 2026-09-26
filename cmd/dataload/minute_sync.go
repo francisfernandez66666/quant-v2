@@ -2,7 +2,7 @@
 //
 // 子命令：dataload minute-sync [--scale 5] [--count 5025] [--codes 文件] [--since YYYYMMDD]
 //
-//	[--limit 500] [--incremental] [--max-fail-pct 10]
+//	[--limit 500] [--incremental] [--max-fail-pct 10] [--keep-days 180]
 //
 //	（--codes 写在子命令**之前**也认：dataload --db x --codes 清单 minute-sync —— 全局 flag 与
 //	子 flag 同源一个文件，不会因为 Go flag 包在子命令处停解析就把用户给的清单丢掉。）
@@ -25,6 +25,9 @@
 //	· 逐票失败只计数不中断（一两只票上游抽风不该让整轮回填作废），但失败率超过 --max-fail-pct
 //	  判成本轮失败（退出码非 0），因为那种形态通常是封 IP/接口改版，不是偶发；
 //	· 库里最终 0 行 ⇒ 直接失败退出（"跑完了但没有数据"绝不能算成功）；
+//	· §0926E2E-17B 保留窗口：日增模式成功后按 --keep-days（缺省 180，0=关闭）删除更早的分钟行，
+//	  整表不再只进不出；裁剪失败只告警不翻转本轮成功（数据已落库，旧行滞留属卫生问题而非装载失败），
+//	  删除数有纯 ASCII 锚点行 `MINUTE-SYNC PRUNE deleted=...`；
 //	· 打印 rows/codes/span/avg_bars_per_code_day：平均根数明显低于 48 就说明窗口被上游截断，
 //	  读者一眼看得见，而不是拿到一个"看起来成功"的数字。
 //	· §MINUTE-OPS：上面那句是给人看的，同一段读数另有一条**纯 ASCII 锚点行**出门
@@ -43,6 +46,7 @@ import (
 	"log"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -57,6 +61,7 @@ type minuteSyncOpts struct {
 	Limit       int    // 池清单截断（防手滑把全市场灌进来）
 	Incremental bool   // true=只补库里已有的票（日增），false=回填
 	MaxFailPct  int    // 失败率上限（百分比），超过则整轮判失败
+	KeepDays    int    // §0926E2E-17B 保留天数（仅日增模式成功后裁剪；0=关闭）
 }
 
 // minuteFetcher 取数抽象（真实实现 = *data.DataCoordinator 的 GetUnadjustedMinuteKLine）。
@@ -130,8 +135,28 @@ func runMinuteSync(db *store.DB, dc minuteFetcher, o minuteSyncOpts, now time.Ti
 		log.Printf("%s fail_pct=%.1f max_fail_pct=%d", minuteSummaryLine(st, written, failed, int64(len(codes)), 1, "fail_rate"), pct, o.MaxFailPct)
 		return written, fmt.Errorf("minute-sync: 失败率 %.1f%% 超过上限 %d%%（多为封 IP/接口改版，不是偶发），本轮判失败", pct, o.MaxFailPct)
 	}
+	// §0926E2E-17B 保留窗口：只在日增模式成功后裁剪（回填首轮不清着自己喂进来的历史窗口），
+	// 失败只告警——本轮落库已成功，旧行滞留是卫生问题，不该翻转成装载失败。
+	if o.Incremental && o.KeepDays > 0 {
+		pruneMinuteRetention(db, o.Scale, o.KeepDays, now)
+	}
 	log.Printf("%s", minuteSummaryLine(st, written, failed, int64(len(codes)), 0, ""))
 	return written, nil
+}
+
+// pruneMinuteRetention 执行一轮按天保留裁剪并打运维锚点行（§0926E2E-17B）。
+// cutoff 走 cntime 北京日口径——本表 ts 是北京时间墙钟串，用宿主机本地日期算裁剪线，
+// 在非 +8 时区的机器上会差出一天的保留量。
+func pruneMinuteRetention(db *store.DB, scale, keepDays int, now time.Time) {
+	cutoff := cntime.In(now).AddDate(0, 0, -keepDays).Format("2006-01-02")
+	deleted, err := db.PruneMinuteBars(scale, cutoff)
+	if err != nil {
+		log.Printf("[minute-sync] §0926E2E-17B 保留裁剪失败（不影响本轮落库成功）: %v", err)
+		log.Printf("MINUTE-SYNC PRUNE deleted=0 cutoff=%s keep_days=%d exit=1 reason=prune_error", cutoff, keepDays)
+		return
+	}
+	log.Printf("[minute-sync] §0926E2E-17B 保留裁剪：删除 %s 之前 %d 行（keep_days=%d）", cutoff, deleted, keepDays)
+	log.Printf("MINUTE-SYNC PRUNE deleted=%d cutoff=%s keep_days=%d exit=0", deleted, cutoff, keepDays)
 }
 
 // minuteProgressEvery 进度锚点行的节拍（只数）：500 只清单 → 10 行进度，日志不被刷爆，
@@ -183,7 +208,7 @@ func minuteTargetCodes(db *store.DB, o minuteSyncOpts) ([]string, error) {
 	}
 	since := o.Since
 	if since == "" {
-		since = time.Now().AddDate(0, 0, -90).Format("20060102") // 缺省近 90 日历日的池
+		since = cntime.DayCompactOf(time.Now().AddDate(0, 0, -90)) // 缺省近 90 日历日的池
 	}
 	return db.MinutePoolUniverse(since, o.Limit)
 }
@@ -237,6 +262,7 @@ func parseMinuteFlags(args []string) (minuteSyncOpts, error) {
 	fs.IntVar(&o.Limit, "limit", 500, "池清单只数上限（仅回填生效）")
 	fs.BoolVar(&o.Incremental, "incremental", false, "只补库里已有的票（收盘后日增）")
 	fs.IntVar(&o.MaxFailPct, "max-fail-pct", 10, "失败率上限（百分比），超过则整轮判失败")
+	fs.IntVar(&o.KeepDays, "keep-days", 180, "§0926E2E-17B 保留天数（仅 --incremental 成功后裁剪，0=关闭）")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}

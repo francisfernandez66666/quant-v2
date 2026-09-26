@@ -25,6 +25,16 @@ const sseTicketTTL = 60 * time.Second
 // sseTicketMaxLive 同时存活的票据上限：超过后新票挤出最旧票（防票据池内存放大）。
 const sseTicketMaxLive = 1024
 
+// sseQueryTokenDeadline —— §0926E2E-W2B（2026-09-26 二波）：`?token=` 遗留建链通道的退役截止。
+// 缺陷背景（全量审计缺陷 9）：票据通道（§WS-F C4a，§M5 起 TTL 内可复用）早已是主路，但
+// handleFixSSE 的长期 token query 回退分支**永不过期**——长期凭证一旦经 Caddy access log /
+// 浏览器历史 / 分享链接泄漏即可无限期订阅该账号事件流。退场计划：到点（Asia/Shanghai
+// 2026-10-15 00:00，固定时区不随服务器 TZ 漂移）后 query token 一律 401，只留票据通道；
+// 登录响应同时下发 sse_query_token_expires_at，旧客户端（APK）升级前有一整个版本周期的提示。
+// 为何 var 而非 const：时钟闸的"截止前放行/截止后拒绝"两侧都必须可测（测试注入过去/未来值），
+// 这与"零值=已过期"的危险形态相对——所以门禁另锁该常量非零（scripts/verify_changes.sh §0926E2E 段）。
+var sseQueryTokenDeadline = time.Date(2026, 10, 15, 0, 0, 0, 0, time.FixedZone("CST", 8*3600))
+
 // sseTicket 短时效 SSE 建链票据：绑定签发用户，60s 后过期；§M5 起 TTL 内可复用
 // （浏览器原生重连会原样重发同一 URL，一次性票会让重连必然 401，补发通道被掐死）。
 // A short-lived SSE connect ticket bound to the minting user; reusable within the 60s TTL (§M5).

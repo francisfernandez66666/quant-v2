@@ -177,6 +177,23 @@ def load_config(path):
     """
     cfg = dict(DEFAULT_CONFIG)
     if path and os.path.exists(path):
+        # §0926E2E-W2C（2026-09-26 二波）落盘密钥权限自检：config.xt.json 含明文 token+资金账号，
+        # 权限宽于 0600（组/其他可读）时启动打 warning——与 QUANT_GATEWAY_TOKEN 明文回退告警
+        # （本函数下方）同族，只吵不改：拒启动会让现网在无人值守重启时直接断链，处置权在人。
+        # 口径按运行时真实取值链（§探针纪律）：**只在 POSIX 判定**——Windows 的 st_mode 恒报
+        # 0o666（NTFS ACL 与 stat 是两套体系），拿它判宽严是"永久性假红"；Windows 侧的收敛
+        # 责任在生成端 ensure_gateway_config.ps1（icacls 收敛），不在这里。
+        try:
+            if os.name == "posix":
+                import stat as _stat
+                mode = _stat.S_IMODE(os.stat(path).st_mode)
+                if mode & 0o077:
+                    log.warning(
+                        "[gateway] 配置文件 %s 权限 %03o 宽于 0600：同机其他账号可读到明文 token，"
+                        "请 chmod 600 收敛", path, mode
+                    )
+        except OSError as e:  # stat 失败（竞态删除等）只跳过自检，不影响启动
+            log.warning("[gateway] 配置文件权限自检跳过（stat 失败）: %s", e)
         with open(path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
         cfg.update(user_cfg)
@@ -986,6 +1003,17 @@ class Gateway:
         # xtdata 断连绝不参与交易熔断判定（计划铁律：行情面不得污染 §GAP2-W1 fail-closed 面）
         payload["feed_connected"] = self.feed.is_connected()
         payload["feed_age_sec"] = self.feed.age_sec()
+        # §0926E2E-W2D：回报 outbox 观察面。溢出语义已从"删最旧"改为"冻结+只吵"，
+        # 深度必须可见（daily_ops_check/看门狗按 outbox_overflow 排人），人工收敛走
+        # outbox_admin.py --yes。读库失败记 -1 本身即观察信号，绝不让 /health 因它 500。
+        try:
+            depth = self.handler.store.outbox_count()
+            payload["outbox_depth"] = int(depth)
+            payload["outbox_overflow"] = bool(depth > self.handler._max_outbox)
+        except Exception as e:  # noqa: BLE001
+            payload["outbox_depth"] = -1
+            payload["outbox_overflow"] = False
+            log.warning("[gateway] /health outbox_depth 读取失败: %s", e)
         return payload
 
     def _do_dispatch_pending(self):

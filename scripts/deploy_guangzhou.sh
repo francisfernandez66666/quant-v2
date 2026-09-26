@@ -30,6 +30,10 @@
 #                    需抄存并同步到引擎 rules.qmt.token；已存在的 config.xt.json 不会被覆盖）
 #   GATEWAY_ACCOUNT  §M7c 东莞证券资金账号（留空 → broker=mock 影子期存活，不接真实柜台）
 #   XT_USERDATA_PATH §M7c QMT userdata_mini 目录（broker=xt 时必需）
+#   SETUP_TOKEN      §0926E2E-W2A /setup 抢跑守卫令牌（可选）。无论传不传，注册步
+#                    register_engine_services.ps1 都保底让它在位：未传→取 C:\etc\quant.env
+#                    现值→再无则随机生成并追加落盘（ACL 收敛，值不回显），并注入 quant 服务
+#                    env；第 15 号部署探针独立复核键名在位（缺键判红）。
 #   QMT_MOCK_DECOMMISSION 置 1 才执行步 [3d]（退役 C:\qmt\uat 残留 qmt-mock.exe / :8799，默认关）
 
 set -euo pipefail
@@ -49,6 +53,9 @@ DEPLOY_DIR="${DEPLOY_DIR:-C:/opt/quant}"
 DATA_DIR="${DATA_DIR:-C:/var/lib/quant-trading-v2}"
 QMT_GATEWAY_DIR="${QMT_GATEWAY_DIR:-C:/qmt/quant-trading-v2/qmt_gateway}"
 MINIQMT_PATH="${MINIQMT_PATH:-C:/Program Files (x86)/东莞证券QMT实盘交易端/bin.x64/XtItClient.exe}"
+# §0926E2E-W2A：/setup 抢跑守卫令牌（可选显式传入）。不传≠不配——注册步自己保底：
+# 先取 C:\etc\quant.env 现值，再没有就随机生成并追加落盘（值不回显）。
+SETUP_TOKEN="${SETUP_TOKEN:-}"
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_DIR"
@@ -427,6 +434,10 @@ else
   REMOTE_ARGS="-QuantExe '${DEPLOY_DIR}/quant.exe' -ResearchExe '${DEPLOY_DIR}/researchd.exe' -PydataVenv '${DEPLOY_DIR}/venv' -QmtctlExe '${DEPLOY_DIR}/qmtctl.exe' -MiniQmtPath '${MINIQMT_PATH}' -DataDir '${DATA_DIR}'"
   if [ -n "$LLM_API_KEY" ]; then
     REMOTE_ARGS="$REMOTE_ARGS -LLMApiKey '$LLM_API_KEY' -LLMApiURL '$LLM_API_URL' -LLMModel '$LLM_MODEL'"
+  fi
+  # §0926E2E-W2A：显式给了就透传（注册步四源优先级里它是最高一档）；没给则注册步自保底。
+  if [ -n "$SETUP_TOKEN" ]; then
+    REMOTE_ARGS="$REMOTE_ARGS -SetupToken '$SETUP_TOKEN'"
   fi
   ps1_bom deploy/qmt-win/register_engine_services.ps1
   $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/register_engine_services.ps1 $REMOTE_ARGS"

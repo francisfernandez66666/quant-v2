@@ -327,6 +327,15 @@ func applyFallbacks(fix *e2e.Fixture, api *data.MarketAPI, sinaQuotes map[string
 		fix.UpCount = 1800
 		fix.DownCount = 2800
 	}
+	// §0926E2E-14：GetIndexData 的涨跌家数改为真实弃权（概况腿失败回 0/0）后，捕获日
+	// 该腿断链会把 0/0 记进 fixture。fixture 的职责是"自洽可复现的合成快照"（与本文件
+	// 既有确定性兜底同一口径），此处补显式合成值并打日志，与真实链路语义无关——
+	// 生产侧涨跌家数消费者早已迁到 GetBreadth（BREADTH-FAKE 20260920），不吃这条链。
+	if fix.UpCount <= 0 || fix.DownCount <= 0 {
+		fix.UpCount = 1800
+		fix.DownCount = 2800
+		log.Printf("fallback: 涨跌家数合成 1800/2800（捕获链路弃权，§0926E2E-14 口径）")
+	}
 
 	// 行情覆盖：确定性涨跌幅驱动场景路由（真实新浪价每天变化，测试需可复现）。
 	// 宁德+2.9% 个股利好(涨)；恒瑞-1.5% 利好不涨→预期差；茅台-3.5% 利空兑现。

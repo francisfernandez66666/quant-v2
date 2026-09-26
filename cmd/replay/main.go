@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/backtest"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/store"
 )
 
@@ -32,7 +33,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	dbPath := flag.String("db", defaultDB, "研究 SQLite 库路径")
 	start := flag.String("start", "20200101", "起始日期 YYYYMMDD")
-	end := flag.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
+	end := flag.String("end", cntime.DayCompactOf(time.Now()), "结束日期 YYYYMMDD")
 	horizon := flag.String("horizon", "1,5,10", "前瞻天数，逗号分隔")
 	minLimitUps := flag.Int("min-limit-ups", 3, "触发事件的行业涨停家数下限")
 	maxPerDay := flag.Int("max-per-day", 3, "每日最多事件数")

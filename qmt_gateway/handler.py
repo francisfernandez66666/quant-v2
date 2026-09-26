@@ -162,7 +162,9 @@ class ReportHandler:
         :param report_url: 首尔回报接收地址（引擎 /api/qmt/report）。
         :param report_token: 回报鉴权 token（与首尔侧配置一致）。
         :param user_id: 多账号归属标识（§P1-9），回报/落库统一携带。
-        :param max_outbox: outbox 落库行数上限，超限裁剪最旧。
+        :param max_outbox: outbox 落库行数**告警水位**——§0926E2E-W2D 起超限只告警冻结、
+            不自动删除（旧语义"裁剪最旧"会静默销毁最早的成交回报，资金事实不可再生）。
+            人工收敛：python outbox_admin.py --store <db> --keep N --yes。
         English: builds the report handler — persists events to the local store and
         pushes them to the decision-side /api/qmt/report via a durable outbox.
         """
@@ -180,13 +182,16 @@ class ReportHandler:
         # 账户总值 106k、可用资金 84.8，positions 快照空 → 09:17 全账本被清空）。
         self._last_asset = None
         # §ROBUST outbox 改为 store 持久化队列（崩溃/重启续发，不丢回报）；
-        # _pending 仅作 sender 唤醒信号。max_outbox 转义为落库行数上限。
+        # _pending 仅作 sender 唤醒信号。max_outbox 是落库行数告警水位（§0926E2E-W2D：只吵不删）。
         self._outbox_cv = threading.Condition()
         self._pending = 0
         self._stop = threading.Event()
         self._sender_thread = None
         self._heartbeat_thread = None
         self._max_outbox = max_outbox
+        # §0926E2E-W2D 告警节拍态：跨水位的瞬间报一条，之后每加深 50 行追一条，回到水位下复位
+        # （每次入队都刷屏会把真告警淹死；一条不回则恢复后没人知道曾溢出过）。
+        self._outbox_over = False
 
     def start_sender(self):
         """启动后台回报发送线程 + 上行心跳线程（幂等，重复调用直接返回）。
@@ -587,19 +592,30 @@ class ReportHandler:
     def _push(self, payload):
         """把回报入 outbox 持久化队列并唤醒发送线程（先落库后发送，崩溃/重启不丢回报）。
 
-        未配置 report_url 时直接丢弃（本地联调场景）；超 max_outbox 上限裁剪最旧
-        （极端保护）。English: enqueues a report into the durable outbox and wakes the
-        sender; dropped locally when no report_url is configured, trimmed when overflowing.
+        未配置 report_url 时直接丢弃（本地联调场景）；超 max_outbox 上限**只告警不删除**
+        （§0926E2E-W2D，2026-09-26 二波：旧实现溢出静默删最旧=断线期间最早的成交回报
+        永久消失且无人知晓——决策端账本与柜台从此对不平。事件是资金事实，宁冻结不销毁；
+        深度经 /health outbox_depth 暴露给日常核查，人工收敛走 outbox_admin.py --yes）。
+        English: enqueues into the durable outbox and wakes the sender; dropped locally
+        only when no report_url is configured; overflow is alert-only (freeze, never auto-delete).
         """
         # 未配置上报地址则直接丢弃（本地联调场景）
         if not self.report_url:
             return
         payload["user_id"] = self.user_id
-        # §ROBUST 先落库后发送：崩溃/重启不丢回报；超上限删最旧（极端保护）
+        # §ROBUST 先落库后发送：崩溃/重启不丢回报
         self.store.outbox_enqueue(payload)
-        dropped = self.store.outbox_trim(self._max_outbox)
-        if dropped:
-            log.error("[handler] durable outbox overflow, dropped %d oldest events", dropped)
+        # §0926E2E-W2D 冻结语义：超限只吵（跨阈值即时告警 + 每加深 50 行追一条），绝不删。
+        depth = self.store.outbox_count()
+        if depth > self._max_outbox:
+            if not self._outbox_over:
+                self._outbox_over = True
+                log.error("[handler] durable outbox 超水位 depth=%d > cap=%d：冻结保留不删（§0926E2E-W2D），"
+                          "请排查上报链路；确认可丢后用 outbox_admin.py --yes 人工收敛", depth, self._max_outbox)
+            elif (depth - self._max_outbox) % 50 == 0:
+                log.error("[handler] durable outbox 仍在加深 depth=%d（cap=%d，§0926E2E-W2D 冻结中）", depth, self._max_outbox)
+        else:
+            self._outbox_over = False
         with self._outbox_cv:
             self._pending += 1
             self._outbox_cv.notify_all()

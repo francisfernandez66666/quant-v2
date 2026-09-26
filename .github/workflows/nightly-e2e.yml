@@ -14,8 +14,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 唯一 job：拉起"qmt-mock 柜台 + quant 引擎 + vite 前端"三件套后跑 Playwright 全量 spec。
+  # 全栈 e2e job：拉起"qmt-mock 柜台 + quant 引擎 + vite 前端"三件套后跑 Playwright 全量 spec。
   # 40 分钟超时兜底：Playwright 卡死/等待期重试风暴时不至于烧满 runner 计费时长。
+  # （§0926E2E-MX2 起本文件另有并行的 apk-smoke job，见文件末尾。）
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -244,4 +245,116 @@ jobs:
             engine.log
             engine2.log
             vite.log
+          if-no-files-found: ignore
+
+  # §0926E2E-MX2（矩阵补位 #2，2026-09-27）：APK 冒烟进 nightly。
+  # 此前手机薄壳的整条产物链（前端 dist → assets 内嵌 → Gradle 打包）只在手工
+  # scripts/build_apk.sh 时被动验一次，手机壳打不响/内嵌指纹漂移只能等装机才发现。
+  # 本 job 把"无设备可验"的冒烟腿收编：assembleDebug 成功 + 清单版本指纹与
+  # build.gradle.kts 双向等值 + 内嵌前端文件数一致 + APK 内嵌 BUILD_COMMIT == 本 checkout HEAD。
+  # 「登录→首页」腿需要真机/模拟器：标准 ubuntu runner 的 KVM 可用性不保证、
+  # 模拟器冷启动与 40 分钟超时预算冲突（可行性结论见 FIX_PLAN 矩阵段），故不排本 job。
+  # 依赖翻动（Gradle 首次拉包）若致假红，先读报错归属再处理，禁止 continue-on-error 掩盖。
+  apk-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # runner 在境外：走官方 google()/mavenCentral（境内阿里云镜像对境外 runner 反而慢且抖），
+      # 与本地 build_apk.sh 的国内默认相反——该开关 settings.gradle.kts 已内建。
+      QUANT_USE_OFFICIAL_REPOS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # AGP 8.x 要求 JDK 17；与 build_apk.sh 的 JAVA_HOME 口径一致
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Node 20 与 e2e job 同版本：前端产物指纹链要求构建口径一致
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Gradle 缓存（wrapper 发行包 + 依赖包）：key 带 run_id 保证每次快照新写，
+      # restore-keys 命中上一次构建，省掉首拉 8.9 发行包与 AGP 依赖的分钟级开销
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ github.run_id }}
+          restore-keys: gradle-
+
+      - name: Build web dist
+        working-directory: web
+        run: npm ci && npm run build
+
+      # 内嵌资产 = 本地 build_apk.sh 同款口径：整棵 dist 拷进 assets/ 根。
+      # 两个哨兵文件缺失即判红不 skip（FIX-8「永远 skip 的分支藏 P0」教训）。
+      - name: Embed frontend into assets
+        run: |
+          rm -rf mobile/app/src/main/assets
+          mkdir -p mobile/app/src/main/assets
+          cp -R web/dist/. mobile/app/src/main/assets/
+          test -s mobile/app/src/main/assets/index.html
+          test -s mobile/app/src/main/assets/BUILD_COMMIT
+
+      - name: Assemble debug APK
+        working-directory: mobile
+        # local.properties 在 .gitignore 内（本机口径写死 macOS 路径），CI 里按
+        # runner 预装的 ANDROID_HOME 现生成；licenses 兜底接受（镜像通常已预接受，
+        # sdkmanager 不在位则跳过——缺平台时 Gradle 自动下载会自行报清晰错误）。
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
+          ./gradlew --no-daemon assembleDebug
+
+      # 版本指纹 + 内嵌完整性：全部取"运行时真实产物"读数，不做放宽——
+      # badging 的 versionName/versionCode 与 build.gradle.kts 声明做双向等值锁
+      # （改声明不改产物、或产物漂移，两个方向都判红）；
+      # APK 内 assets/ 文件数与打包前目录文件数一致（少文件＝资源收缩把内嵌前端吃掉）；
+      # APK 内嵌 BUILD_COMMIT 与本 checkout 短 SHA 一致（§A7-B 漂移自检的 CI 版）。
+      - name: Verify APK fingerprint + assets integrity
+        working-directory: mobile
+        run: |
+          set -e
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt | sort -V | tail -1)
+          "$AAPT" dump badging "$APK" > "$RUNNER_TEMP/badging.txt"
+          grep -q "package: name='com.liangzai.quant'" "$RUNNER_TEMP/badging.txt"
+          GV=$(grep -m1 'versionName = ' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
+          GVC=$(grep -m1 'versionCode = ' app/build.gradle.kts | sed 's/.*versionCode = \([0-9]*\).*/\1/')
+          AV=$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" "$RUNNER_TEMP/badging.txt" | head -1)
+          AVC=$(sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" "$RUNNER_TEMP/badging.txt" | head -1)
+          echo "manifest: versionName=$AV versionCode=$AVC / gradle 声明: $GV / $GVC"
+          test "$AV" = "$GV"
+          test "$AVC" = "$GVC"
+          INSIDE=$(unzip -l "$APK" | grep -c ' assets/' || true)
+          OUTSIDE=$(find app/src/main/assets -type f | wc -l | tr -d ' ')
+          echo "APK 内 assets 条目=$INSIDE 打包前目录文件=$OUTSIDE"
+          test "$INSIDE" -eq "$OUTSIDE"
+          unzip -l "$APK" | grep -q 'assets/index.html'
+          EMBED=$(unzip -p "$APK" assets/BUILD_COMMIT | tr -d '\r\n')
+          HEAD_SHA=$(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)
+          echo "APK 内嵌指纹=$EMBED checkout=$HEAD_SHA"
+          test "$EMBED" = "$HEAD_SHA"
+
+      # 仅失败时留证：APK + badging 原文（次日取证不用重跑构建）
+      - name: Upload smoke evidence（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-smoke-report
+          path: |
+            mobile/app/build/outputs/apk/debug/app-debug.apk
+            ${{ runner.temp }}/badging.txt
           if-no-files-found: ignore

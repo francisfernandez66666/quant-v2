@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 )
 
@@ -133,6 +134,8 @@ type sellState struct {
 	// ConfirmedAction 确认时固化的处置动作（close/trim）。重放必须与首结论逐字节一致——
 	// 旧实现按当前价重算 trim/close，价格更深会把半平翻成全平，执行层幂等语义被破坏。
 	ConfirmedAction string
+	// ConfirmedAt 结论确认发生的时刻——§0926E2E-11A 重放新鲜度闸的判据（只重放确认当日）。
+	ConfirmedAt time.Time
 	HighPrice       float64
 	Extends         int // 已延持次数（留痕用，不设上限：信号持续=按设计拿着，深破线兜底）
 }
@@ -321,8 +324,21 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	evi := evidenceSuffix(in.Evidence)
 
 	// ① 已确认处置：每轮重放同一处置单（执行层日级幂等兜底），理由含最新证据。
+	// §0926E2E-11A（2026-09-26 全量评价批，裁决=A+B）确认时刻新鲜度闸：只重放**北京当日历日**
+	// 确认的结论。真实风险形态=同进程 sell_unified_mode shadow→on 热切换时，shadow 期已
+	// Confirmed 的同键状态被直接当成 live 处置单执行（sellStates 纯内存、重启即清，跨进程
+	// 无此窗口）；跨日同理——今天的价不该为昨天的判断背书。过期结论不重放也不清除留裸，
+	// 而是复位状态机、本轮起按最新价格重裁（HighPrice 利润锚保留）。
+	// English: replay only same-Beijing-day confirmations; a stale confirmed state (e.g. left over
+	// from shadow mode before a hot switch to on, or from a previous day) is reset and re-adjudicated.
 	if st.Settled && st.Confirmed {
-		return st, confirmedReplay(st, in.Code, pnl, now, p, evi), ""
+		if sellConfirmedStale(st.ConfirmedAt, now) {
+			st.Settled, st.Confirmed = false, false
+			st.ConfirmedAt, st.ConfirmedAction = time.Time{}, ""
+			st.Line, st.FirstTouch, st.SettleStart, st.Extends = SellLineNone, time.Time{}, time.Time{}, 0
+		} else {
+			return st, confirmedReplay(st, in.Code, pnl, now, p, evi), ""
+		}
 	}
 
 	// ② 本轮命中判定线（含延持期间的利空即时硬清与深破升级——状态机在延持期持续运转，
@@ -336,7 +352,7 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 			// 语义①：触止损线 + 双源验证利空 → 当轮直接硬清，不等窗（首触/窗内/延持期均即时）。
 			st.Line = firstOf(st.Line, SellLineStopLoss)
 			st.Settled, st.Confirmed = true, true
-			st.ConfirmedAction = SellActionClose
+			st.ConfirmedAt, st.ConfirmedAction = now, SellActionClose
 			return st, &SellDisposal{Code: in.Code, Action: SellActionClose, Line: st.Line, PnlPct: pnl, At: now,
 				Reason: "触止损线且利空双源验证，即时硬清" + evi}, ""
 		}
@@ -381,6 +397,7 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	if line == SellLineDeepBreach {
 		st.Line = SellLineDeepBreach
 		st.Settled, st.Confirmed = false, false
+		st.ConfirmedAt, st.ConfirmedAction = time.Time{}, "" // 旧结论作废连时间戳一起清（防"未确认态带确认时刻"畸形）
 	}
 
 	// ④ 未到结算点：窗内等待。
@@ -391,7 +408,7 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	// ⑤ 窗结算。深破无条件全清（边界④，不看任何信号）。
 	if st.Line == SellLineDeepBreach {
 		st.Settled, st.Confirmed = true, true
-		st.ConfirmedAction = SellActionClose
+		st.ConfirmedAt, st.ConfirmedAction = now, SellActionClose
 		return st, &SellDisposal{Code: in.Code, Action: SellActionClose, Line: st.Line, PnlPct: pnl, At: now,
 			Reason: "深破窗结算，无条件全平离场" + evi}, ""
 	}
@@ -414,11 +431,25 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 		d.Reason = "止损窗结算无信号，止损离场" + evi
 	}
 	st.ConfirmedAction = d.Action // 固化动作，后续重放逐字一致
+	st.ConfirmedAt = now          // §0926E2E-11A：确认时刻落戳，重放新鲜度闸的判据
 	return st, d, ""
 }
 
+// sellConfirmedStale §0926E2E-11A 重放新鲜度判定：确认时刻与本轮时刻是否已跨**北京日历日**。
+// ConfirmedAt 零值一律按过期处理——那是新鲜度闸上线前遗留的无时间戳状态（或测试直插），
+// 宁可重裁也不为来历不明的结论放行执行；生产路径每次确认都写 now，不会踩到零值。
+// English: true when the confirmation is from a different Beijing calendar day (or carries no
+// timestamp at all — treated as stale, re-adjudicate rather than execute an undated verdict).
+func sellConfirmedStale(at, now time.Time) bool {
+	if at.IsZero() {
+		return true
+	}
+	return cntime.DayOf(at) != cntime.DayOf(now)
+}
+
 // confirmedReplay 重放已确认处置：动作取确认时固化的 ConfirmedAction（价格再深也不改写
-// trim→close），理由仅按当前盈亏快照刷新文案。
+// trim→close），理由仅按当前盈亏快照刷新文案。调用前置条件=① 处的当日新鲜度闸已放行
+// （sellConfirmedStale=false），此处不再判过期。
 func confirmedReplay(st *sellState, code string, pnl float64, now time.Time, p sellParams, evi string) *SellDisposal {
 	action := st.ConfirmedAction
 	if action == "" { // 兜底：存量状态无固化动作时按线型回退

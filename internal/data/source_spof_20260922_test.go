@@ -47,8 +47,10 @@ func TestGetIndexDataLastKnownGoodFallback(t *testing.T) {
 	if err != nil || idx != 3125.0 {
 		t.Fatalf("成功轮应取回指数点位，得到 idx=%v err=%v", idx, err)
 	}
-	if up <= 0 || down <= 0 {
-		t.Fatalf("涨跌家数应有值（真实或中性回退），得到 %d/%d", up, down)
+	if up != 0 || down != 0 {
+		// §0926E2E-14 负锁：spofOK 对概况子请求回的是指数 JSON（无 f62/f63），涨跌家数
+		// 必须弃权 0/0——旧伪造实现会在这里冒出 1500/1500 假实测值让断言以假数据通过。
+		t.Fatalf("§0926E2E-14：概况无 f62/f63 时应回 0/0 弃权（不得伪造中性默认），得到 %d/%d", up, down)
 	}
 
 	// 失败轮（窗口内）：回退上一份真实值，而非错误——旧实现此处直接 error（SPOF 无兜底）。

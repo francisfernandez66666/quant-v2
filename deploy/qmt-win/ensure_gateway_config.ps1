@@ -117,7 +117,12 @@ if (-not $Account) {
 $json = $cfg | ConvertTo-Json -Depth 4
 # 无 BOM UTF-8 落盘（网关 json.load 不容 BOM）
 [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-Ok "已生成 $cfgPath (broker=$($cfg.broker), listen=$($cfg.listen))"
+# §0926E2E-W2C（2026-09-26 二波）：新生成的 config.xt.json 含明文 token+资金账号，NTFS ACL
+# 立刻收敛到 Administrators+SYSTEM（对位 *nix chmod 600 与 restic-pass.txt/C:\etc\quant.env 口径）。
+# 只动"本步新生成"这一份——已存在的文件可能被网关服务账号读取，强收 ACL 会砸现网运行态，
+# 收敛既有文件的权限属运维动作（icacls 现值先看再改），不塞在生成脚本里顺手做。
+icacls $cfgPath /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
+Ok "已生成 $cfgPath (broker=$($cfg.broker), listen=$($cfg.listen))，ACL 已收敛（Administrators+SYSTEM）"
 
 Write-Host ""
 Info "token 需与引擎侧 rules.qmt.token 一致（三处一致：token / report_token / 引擎账号配置）："

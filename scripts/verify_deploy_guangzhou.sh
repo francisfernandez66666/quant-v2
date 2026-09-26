@@ -252,7 +252,9 @@ Probe "engine:/api/qmt/fills/conservation unauth=401" ($code -eq "401") ("got=" 
 #   把刚写进去的 QUANT_DATA_DIR/QUANT_ADDR/HITHINK 全判成"缺键"并 `exit 1` 中断部署（[5/5] 健康
 #   检查与 [6/6] 都没跑到），而本探针判绿——两侧口径不一致就是因为探针只查 1 个键、且 HITHINK
 #   走了机器级兜底，掩盖了解析缺陷。所以这里扩到同集：**解析错必红、注册错也必红**，不再一侧独绿。
-$envNeed = @("TZ", "QUANT_DATA_DIR", "QUANT_ADDR", "HITHINK_FINANCE_API_KEY")
+# §0926E2E-W2A 起集合含 SETUP_TOKEN（/setup 抢跑守卫令牌）：注册步保底注入，探针独立复核——
+#   校验面不得依附施工面（§M7 同族）。现网补判红一项属预期：需重跑一次注册步注入后转绿。
+$envNeed = @("TZ", "QUANT_DATA_DIR", "QUANT_ADDR", "HITHINK_FINANCE_API_KEY", "SETUP_TOKEN")
 # nssm.exe 的三个可能安装位（现网 = 第一个；备份任务/手工安装可能落在后两个）。
 $nssmCandidates = @(
     "C:\opt\quant\qmt-win\tools\nssm-2.24\win64\nssm.exe",       # deploy_guangzhou.sh 上传位（现网）

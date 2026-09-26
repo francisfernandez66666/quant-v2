@@ -560,7 +560,12 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 		MaxPositions   int     `json:"max_positions"`   // 可选持仓上限（注入模式 >=0 生效；清盘模式 >0 生效）
 		ResetTo        float64 `json:"reset_to"`        // §反馈修复：清盘时显式指定重置后的初始资金
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req) // 请求体可选：三种语义见下方分支（缺省/注入/清盘）
+	// §0926E2E-W1D：清盘/注入是破坏性动作——畸形 JSON 不再吞成零值走默认清盘分支，400 中止。
+	// 空体仍合法（三种语义见下方分支：缺省/注入/清盘）。
+	if err := decodeOptJSON(r, &req); err != nil {
+		writeError(w, 400, "invalid request body: "+err.Error())
+		return
+	}
 	if req.InitialCapital > 0 {
 		// 注入资金：增量加现金，保留持仓/净值/成交
 		pe.Deposit(req.InitialCapital)

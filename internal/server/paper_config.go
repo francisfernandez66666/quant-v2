@@ -110,7 +110,9 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// 局部落库：只覆盖本次显式携带的指针字段，未传字段保持原值（与 /api/config/qmt 同契约）。
 	// SetPaperConfigFor 原子更新该账号 rules.paper 并持久化到 config.json。
-	s.cfg.SetPaperConfigFor(uid, func(p *config.PaperConfig) {
+	// §0926E2E-W1B：持久化失败（含写后复读不匹配）即中止回 500——不再带着未落盘的配置继续热同步，
+	// 避免"前端显示已保存、重启回退旧值"的静默降级。
+	if err := s.cfg.SetPaperConfigFor(uid, func(p *config.PaperConfig) {
 		if req.Enabled != nil { // 总开关：立即决定引擎是否继续接收信号/撮合
 			p.Enabled = *req.Enabled
 		}
@@ -132,7 +134,11 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 		if req.ShortCapital != nil { // 做空池预算（0=整侧关闭）
 			p.ShortCapital = *req.ShortCapital
 		}
-	})
+	}); err != nil {
+		log.Printf("[paper] 账号 %s 模拟盘配置保存失败: %v", uid, err)
+		writeError(w, http.StatusInternalServerError, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
+		return
+	}
 	// 热同步：以落库后的账号规则重建引擎配置（装配口径与 main.go 完全一致）。
 	// ConfigFromRules 会把 AutoSell/ShortEnabled 的 nil 归一为默认值，得到引擎可直接消费的 Config。
 	pc := paper.Config{}

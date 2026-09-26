@@ -28,7 +28,19 @@ type Candidate struct {
 	Guard string `json:"guard"`
 	// Params §C4 参数快照：{start,end,h,variant,top_n,min_ir,min_days,…} JSON，精确复现审批时的战法。
 	Params string `json:"params"`
+	// Fidelity §0926E2E-12A 输入保真水印：该候选的评估输入与实盘口径的已知分叉（人读文案，
+	// 生成端统一取 FidelityDailyKApprox 常量）。回放结论是审批依据，"近似"必须进数据结构
+	// 随候选终身流转（列表/详情/云端推送），而不是躺在文档里等审批人自己去翻。
+	// English: input-fidelity watermark — the known divergence between the replay input and
+	// live semantics, shipped inside the candidate record instead of only in docs.
+	Fidelity string `json:"fidelity"`
 }
+
+// FidelityDailyKApprox 标准水印文案（生成端唯一出处）。
+// §0926E2E-12 二复核定性：genericReplayExit 与实盘共用同一出口，分叉在输入侧——
+// 日K近似下 n_shape 尾盘 14:57 门控结构性无法触发（replay.go 注释自认），
+// tradingMinutesElapsed 为回放侧本地副本。
+const FidelityDailyKApprox = "近似输入：日K回放。尾盘 14:57 门控在日K口径下结构性无法触发；交易分钟数为回放侧本地近似。回放结论≠实盘预期，审批需人工核对边界。"
 
 // 候选常见状态。
 const (
@@ -42,13 +54,13 @@ const (
 // candidateCols 候选行的通用列（Guard/Params 追加在 reason 之后，与表结构一一对应）。
 const candidateCols = `id, created_at, kind, status, factors, weights,
 		COALESCE(metric,0), COALESCE(ic_mean,0), COALESCE(ir,0), COALESCE(avg_excess,0),
-		COALESCE(horizon,0), COALESCE(reason,''), COALESCE(guard,''), COALESCE(params,'')`
+		COALESCE(horizon,0), COALESCE(reason,''), COALESCE(guard,''), COALESCE(params,''), COALESCE(fidelity,'')`
 
 // scanCandidate 把候选行扫描进 Candidate（字段顺序与 candidateCols 严格一致）。
 func scanCandidate(sc interface{ Scan(...any) error }) (*Candidate, error) {
 	var c Candidate
 	if err := sc.Scan(&c.ID, &c.CreatedAt, &c.Kind, &c.Status, &c.Factors, &c.Weights,
-		&c.Metric, &c.ICMean, &c.IR, &c.AvgExcess, &c.Horizon, &c.Reason, &c.Guard, &c.Params); err != nil {
+		&c.Metric, &c.ICMean, &c.IR, &c.AvgExcess, &c.Horizon, &c.Reason, &c.Guard, &c.Params, &c.Fidelity); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -89,10 +101,10 @@ func (d *DB) SaveCandidate(c *Candidate) (int64, error) {
 		c.Guard = "standard"
 	}
 	res, err := d.db.Exec(`INSERT INTO research_candidates
-		(created_at, kind, status, factors, weights, metric, ic_mean, ir, avg_excess, horizon, reason, guard, params)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(created_at, kind, status, factors, weights, metric, ic_mean, ir, avg_excess, horizon, reason, guard, params, fidelity)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		c.CreatedAt, c.Kind, c.Status, c.Factors, c.Weights,
-		c.Metric, c.ICMean, c.IR, c.AvgExcess, c.Horizon, c.Reason, c.Guard, c.Params)
+		c.Metric, c.ICMean, c.IR, c.AvgExcess, c.Horizon, c.Reason, c.Guard, c.Params, c.Fidelity)
 	if err != nil {
 		return 0, err
 	}

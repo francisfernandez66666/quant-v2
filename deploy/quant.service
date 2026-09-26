@@ -46,6 +46,9 @@ Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
 # 敏感项从 /etc/quant.env 注入：LLM_API_KEY / LLM_API_URL / LLM_MODEL / TUSHARE_TOKEN
 #   / HITHINK_FINANCE_API_KEY（§ENH-0 2026-09-19：交易日历+行情主源密钥，缺省时日历按
 #   周末口径兜底、法定节假日会误判为交易日，强烈建议配置；scripts/deploy_seoul.sh 可写入）
+#   / SETUP_TOKEN（§0926E2E-W2A 2026-09-26：/setup 首次初始化抢跑守卫。Go 侧 §P1-5 语义为
+#   "非空即强制"——POST /setup 必须带匹配的 X-Setup-Token/setup_token，否则 401。缺省不配＝
+#   未初始化窗口对任何能触达端口的人敞开，部署脚本现起保底生成并追加写入本文件（0600））
 # 未提供该文件时下方内容被忽略（EnvironmentFile 文件缺失不报错）
 EnvironmentFile=-/etc/quant.env
 

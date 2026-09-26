@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -48,7 +49,7 @@ func main() {
 	pyurl := flag.String("pyurl", "http://127.0.0.1:8787", "baostock sidecar 地址")
 	token := flag.String("token", "", "Tushare Pro token（仅 tushare 需要）")
 	start := flag.String("start", "20200101", "起始日期 YYYYMMDD")
-	end := flag.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
+	end := flag.String("end", cntime.DayCompactOf(time.Now()), "结束日期 YYYYMMDD")
 	codesFile := flag.String("codes", "", "研究池清单文件（每行一个 ts_code）：finance / adjfactor / minute-sync 共用")
 	finStart := flag.Int("fin-start", 2020, "财务起始年份")
 	finEnd := flag.Int("fin-end", time.Now().Year(), "财务结束年份")
@@ -237,7 +238,7 @@ func loadMeta(db *store.DB, token string, withDelisted bool) error {
 	}
 
 	// 交易日历拉 2015-至今（含 2020 前的校准区间，供热手/校准回测使用）
-	cal, err := c.TradeCal("20150101", time.Now().Format("20060102"))
+	cal, err := c.TradeCal("20150101", cntime.DayCompactOf(time.Now()))
 	if err != nil {
 		return err
 	}

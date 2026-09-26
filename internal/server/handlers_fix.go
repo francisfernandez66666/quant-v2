@@ -2255,7 +2255,7 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 //     频控放在 notifier 判空之前——noop 路径同样计数限流，语义统一、不给探测外的刷屏留缝。
 //  3. 每次调用（受理/限流拒绝均算）写 opslog 审计：出了告警风暴时能回答"谁在什么时候打的"。
 func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
-	actor := userFromContext(r).ID
+	actor := auditActorID(r) // §0926E2E-W1D：nil-safe（旧链式 .ID 在中间件挂错形态下会 panic 整条请求）
 	// ② 频控：进程内最小间隔 60s，未到间隔直接拒绝，不触任何通道。
 	const notifyTestMinInterval = 60 * time.Second
 	s.notifyTestMu.Lock()
@@ -2334,8 +2334,10 @@ func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 	// §WS-F C4a 鉴权：优先短时效票据（推荐，URL 不留长期 token；§M5 起 TTL 内可复用，
 	// 原生重连不再必然 401）；兼容旧客户端 token query 回退。无票据亦无 token → 401；
 	// 票据过期/伪造 → 401。
+	// §0926E2E-W2B：token query 回退带**退役截止**（sseQueryTokenDeadline，2026-10-15 CST）——
+	// 长期凭证进 URL 的形态不能无限期存在，到期后该分支只拒不鉴。
 	// English: SSE auth prefers the 60s ticket (reusable within its TTL since §M5, so native
-	// reconnect works); legacy token query still works as a fallback.
+	// reconnect works); legacy token query fallback still works until the §0926E2E-W2B deadline.
 	userID := ""
 	if tk := r.URL.Query().Get("ticket"); tk != "" {
 		s.sweepSSETickets()
@@ -2347,6 +2349,15 @@ func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else if tokenStr := r.URL.Query().Get("token"); tokenStr != "" {
+		// §0926E2E-W2B 退场闸：过截止点后**不再走 ValidateToken**——即便手里是有效长期凭证也 401。
+		// 每次命中打 [security] 告警日志（带截止日与 IP）：退役若误伤未升级客户端，日志是
+		// 唯一的取证面；owner 按该日志确认零残留前不得再放宽（宁缺勿滥的收口纪律）。
+		if !sseQueryTokenDeadline.After(time.Now()) {
+			log.Printf("[security] SSE 遗留 ?token= 通道已到期退役（deadline=%s）：ip=%s 仍在使用，请升级客户端改走 /api/events/ticket",
+				sseQueryTokenDeadline.Format("2006-01-02 15:04:05 MST"), clientIP(r))
+			writeError(w, 401, "token query channel retired; use POST /api/events/ticket")
+			return
+		}
 		if u := s.auth.ValidateToken(tokenStr); u != nil {
 			userID = u.ID
 		} else {

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
 
@@ -47,11 +48,23 @@ func openDayBarsDB(t *testing.T) *store.DB {
 	return db
 }
 
-// dayBarsTestDates 最近 5 个日历日（升序，均早于今天，避免把周末当成今日 bar）。
+// dayBarsTestDates 最近 5 个**交易日**（严格早于今日，升序）。
+// §0926E2E-W4H（2026-09-27 五腿全量锤出周末结构性假红）：旧实现取"最近 5 个日历日"，
+// 而提供方 Lookup 的查询上界是 data.TradingDayDate(now)（最近交易日）——窗口里一旦
+// 含周末/法定休市日，那几天 seeded 行会被 end 裁掉（周日跑 n=4、周一跑 n=3），
+// 与"兜底链丢当日行/昨收锚判据依赖连续交易日轴"的本文件头注释自相矛盾。
+// 日期轴必须与提供方同走交易日历真值（判据按运行时真实取值链），不靠"跑测日恰好在周内"。
 func dayBarsTestDates() []string {
 	out := make([]string, 0, 5)
-	for i := 5; i >= 1; i-- {
-		out = append(out, time.Now().AddDate(0, 0, -i).Format("20060102"))
+	// 从昨天起回溯（"早于今日"语义保留：不把未收盘的当日行当库内历史），只收交易日。
+	for t := time.Now().AddDate(0, 0, -1); len(out) < 5; t = t.AddDate(0, 0, -1) {
+		if !data.IsTradingDay(t) {
+			continue
+		}
+		out = append(out, t.Format("20060102"))
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out
 }

@@ -100,6 +100,11 @@ type Gate struct {
 	// English: §XCHECK independent cross-check price source (nil = gate skipped), wired from the
 	// data coordinator so the reference price is verified against a different multi-source chain.
 	crossPrice func(code string) (float64, error)
+	// realizedPnlFn §0926E2E-W1A 测试缝（包内注入，生产为 nil 走 st.TodayRealizedPnl）：
+	// 注入点选在"闸读盈亏"而不是造假 DB——store.DB 是具体类型且无裸 SQL 出口，
+	// 用例只需要证明"查询报错→拒单、报数→照常"这一条语义。
+	// English: package-internal test seam for the realized-PnL read (nil = use st).
+	realizedPnlFn func(userID, day string) (float64, error)
 }
 
 // NewGate 创建风控闸。onGate 可空（命中时告警回调；新闸默认高优告警，存量守卫不告警）。
@@ -513,8 +518,12 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 // signalctl.AdmitStrategy——与信号控制器 live 通道同一成员资格规则（规范键 StrategyType 优先、
 // 空白名单=内置四形态+库规则默认全集、动量/未知来源必须显式列名），作为下单前最后防线保留
 // （正常路径信号已在控制器裁定时被拦，走到这里说明调用方绕过了编排——仍需兜底）。
-// English: delegates the strategy-membership check to signalctl.AdmitStrategy — single shared
-// rule, kept here as a last-line guard for paths that bypass the orchestrator's admission.
+// §0926E2E-3A 口径显式声明（2026-09-26 全量评价批裁决=选项A）：白名单**只约束自动信号通道**。
+// Strategy=="" 的放行不是漏网而是编排设计——手动单没有"战法"概念，天然不在成员资格域内；
+// 对手动单的风控由其余各闸兜底（单笔金额帽/单日累计/单票集中度/持仓数上限/黑名单），
+// 改道"手动单打 strategy=手动 标再纳入白名单"被否：改 UI+契约、需回归手动全链，收益不抵风险。
+// English: the whitelist governs the automatic-signal channel only; manual orders carry no strategy
+// by design and stay covered by the remaining hard gates (amount caps / concentration / position count).
 func (g *Gate) checkWhitelist(cfg config.QMTConfig, o LiveOrder) string {
 	// 仅买方向且带战法标识时检查；卖出不受限（退出通道必须保留）。
 	if o.Side != SideBuy || o.Strategy == "" {
@@ -663,7 +672,18 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 			for _, p := range pos {
 				held += p.CostPrice * float64(p.Qty)
 			}
-			pnl, _ := g.st.TodayRealizedPnl(g.userID, today) // fail-open：数据缺口不放大额度，取 0 保守
+			// §0926E2E-W1A（2026-09-26 全量审计批，owner 令按推荐执行）：已实现盈亏查询出错**不再吞成 0**。
+			// 旧写法注释称"取 0 保守"，实际方向恰好相反——当日亏损被吞掉时 avail 被抬高，
+			// 数据缺口变成了放水口子；本分支开头 positions 读错已是"拒单"口径，pnl 对齐同族语义：
+			// 算不清就不放行（fail-close）。
+			pnlSrc := g.st.TodayRealizedPnl
+			if g.realizedPnlFn != nil {
+				pnlSrc = g.realizedPnlFn // 测试缝（见结构体字段注释，生产不装配）
+			}
+			pnl, pnlErr := pnlSrc(g.userID, today)
+			if pnlErr != nil {
+				return fmt.Sprintf("已实现盈亏不可得（近似资金闸保守拒买，§0926E2E-W1A）: %v", pnlErr)
+			}
 			avail := cfg.InitialCapital - held - frozen + pnl
 			// 再扣固定/比例保留现金后与本次金额比较。
 			avail -= cfg.Money.EffectiveReserve(avail)

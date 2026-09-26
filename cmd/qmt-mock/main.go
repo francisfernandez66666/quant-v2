@@ -50,6 +50,7 @@ type order struct {
 	Qty       int     `json:"qty"`        // 委托数量（股）
 	Amount    float64 `json:"amount"`     // 委托金额（Price×Qty）
 	Status    string  `json:"status"`     // 已报/已成/已撤
+	QtyFilled int     `json:"qty_filled"` // §0926E2E-MX1 桥成交腿累计已成交量（部成→已成判定；xt 直发路径不消费）
 	CreatedAt string  `json:"created_at"` // 委托创建时间（RFC3339）
 }
 
@@ -99,6 +100,38 @@ type book struct {
 	// /admin/status 回显该表；/admin/order-confirm 人工收敛（released 删行 / settled 转终态）。
 	// mock 场景下真实下单流程不会自动产生第三态行，由 /admin/mock-unresolve 注入。
 	unresolved map[string]*unresolvedRow
+	// ── §0926E2E-MX1（2026-09-27 四波·矩阵补位#1）派发队列（QMT 桥通道镜像）──
+	// 真实 qmt_gateway 的兜底通道：active=queued 时 /order /cancel 都不直接执行，而是写入
+	// dispatch 队列表；客户端内置策略桥（qmt_bridge.py）经 GET /dispatch/pending 原子取单
+	// （pending→inflight 防并发双执行）、POST /dispatch/result 回报结果，网关按 handler 协议
+	// 结算推进状态。mock 此前 /dispatch 三腿整体缺失（REVIEW_20260926E2E 矩阵缺口 #1），
+	// 桥通道在盘内 UAT / Go 级用例完全测不到。字段形状逐一对齐 store.py dispatch 表
+	// （seq="seq:%d"，status: pending/inflight/done）。
+	dispatch     []dispatchItem // 只追加；结算按下标就地改状态（全程 b.mu 保护）
+	nextDispatch int            // 派发 seq 自增计数器（从 1 起）
+	// 严格校验开关（§0926E2E-MX1 第二项）：默认与实网关同口径——买入按板块整手规则拒非整手
+	// （gateway.py lot_rule）、max_order_amount>0 时买卖双向金额帽（§A1）；
+	// -relax-order-check 显式放宽（旧 mock 行为，联调造非整手小单专用）。
+	relaxOrderCheck bool      // true=跳过整手/金额帽校验
+	maxOrderAmount  float64   // 金额帽（0=关闭，同实网关 cfg.max_order_amount 默认）
+	bridgeBeat      time.Time // 桥心跳最后上报时刻（/dispatch/result type=heartbeat 落点，bridge_state.last_heartbeat 同形）
+}
+
+// dispatchItem 一条派发队列项（§0926E2E-MX1，列形状对齐 store.py dispatch 表）。
+// English: one dispatch queue entry mirroring the real gateway's dispatch table columns.
+type dispatchItem struct {
+	Seq       string                 `json:"seq"`       // 不透明引用 "seq:<n>"（网关侧主键）
+	SignalID  string                 `json:"signal_id"` // 幂等锚（order 行非空）
+	Kind      string                 `json:"kind"`      // order / cancel / diag
+	Code      string                 `json:"code"`
+	Side      string                 `json:"side"`
+	Price     float64                `json:"price"`
+	Qty       int                    `json:"qty"`
+	Strategy  string                 `json:"strategy"`
+	Status    string                 `json:"status"`           // pending / inflight / done
+	OrderID   string                 `json:"order_id"`         // cancel 目标 / 成交回报回填的委托引用
+	CreatedAt string                 `json:"created_at"`       // RFC3339
+	Result    map[string]interface{} `json:"result,omitempty"` // done 后的结算结果（settle 合并写回形态）
 }
 
 // unresolvedRow 一条第三态待核对占位（字段形状对齐 gateway.py unresolved_orders 行：
@@ -142,6 +175,8 @@ func newBook(account string) *book {
 		nextID:     1,
 		cash:       1000000, // §P2-14 默认模拟现金 100 万（-cash 可调）
 		fillMode:   "full",
+		// §0926E2E-MX1 派发队列起步 seq=1（"seq:%d" 与实网关 store.py 的 rowid 派生口径同形）
+		nextDispatch: 1,
 	}
 }
 
@@ -322,7 +357,19 @@ func main() {
 	quoteSource := flag.String("quote-source", "", "§3.1-1 /quotes 响应体回显的 quote_source（空=不带该字段）")
 	quoteTickAge := flag.Float64("quote-tick-age-sec", 0, "§3.1-1 tickTime 回拨秒数（>0 造『超龄 tick』形态，供引擎 30s maxAge 闸回归）")
 	quoteTickTime := flag.Int64("quote-tick-time-ms", 0, "§3.1-1 绝对 tickTime 毫秒时间戳（>0 时优先于 -quote-tick-age-sec）")
+	// §0926E2E-MX1（2026-09-27 四波·矩阵补位）下单校验开关：默认与实网关同口径（买入整手 + 金额帽），
+	// 联调要造非整手小单显式开 -relax-order-check 回到旧 mock 宽松行为。
+	relaxOrderCheck := flag.Bool("relax-order-check", false, "§0926E2E-MX1 放宽整手/金额帽校验（仅本机联调；默认与实网关一致）")
+	maxOrderAmount := flag.Float64("max-order-amount", 0, "§0926E2E-MX1 网关侧金额帽（0=关闭，同实网关 max_order_amount 默认）")
 	flag.Parse()
+
+	// §0926E2E-W2C（2026-09-26 二波）默认口令告警一行：mock 网关历史上 -token 缺省即静默用
+	// "mock-secret"，若被误挂到可达网络等于无鉴权下单口（真网关的 token 泄露告警族同口径收编）。
+	// 只 warn 不拒启：UAT/自举大量以默认口令起 mock，拒启会把测试链全打断——处置权在人不在闸。
+	if *token == "mock-secret" {
+		log.Printf("[mock] WARN §0926E2E-W2C 正在使用默认口令 mock-secret：仅限本机 UAT/影子链路，" +
+			"严禁暴露到可达网络；对外一律显式 -token 传随机值")
+	}
 
 	// 内存账本在启动期一次性定型：初始现金、成交模式（非法值退回 full 并打日志）、
 	// 预置持仓与回报推送 token；之后所有 HTTP 处理与后台成交回调共享这一份状态。
@@ -337,6 +384,16 @@ func main() {
 	b.quoteSource = strings.TrimSpace(*quoteSource)
 	b.tickAgeSec = *quoteTickAge
 	b.tickTimeFixed = *quoteTickTime
+	// §0926E2E-MX1 校验开关落地（启动期一次性写、只读消费，与行情注入面同法）。
+	b.relaxOrderCheck = *relaxOrderCheck
+	b.maxOrderAmount = *maxOrderAmount
+	if b.relaxOrderCheck {
+		log.Printf("[mock] WARN §0926E2E-MX1 整手/金额帽校验已放宽（-relax-order-check）：仅限本机联调，" +
+			"与实网关拒单口径不再一致")
+	}
+	if b.maxOrderAmount > 0 {
+		log.Printf("[mock] §0926E2E-MX1 金额帽已启用: %.2f 元/笔（买卖双向）", b.maxOrderAmount)
+	}
 	if b.quoteSource != "" || b.tickAgeSec > 0 || b.tickTimeFixed > 0 {
 		log.Printf("[mock] §3.1-1 行情注入面已开启: quote_source=%q tick_age_sec=%v tick_time_ms=%d",
 			b.quoteSource, b.tickAgeSec, b.tickTimeFixed)
@@ -423,6 +480,128 @@ func orderEvent(o *order, status string) map[string]interface{} {
 	}
 }
 
+// simulateFill §0926E2E-MX1 成交推进器（原内联于 /order 的 go func，抽为包级函数供
+// 桥通道复用——xt 直发与 queued 派发结算后走同一台"柜台"，成交语义不分叉）。
+// §P2-14：按 fill-mode 分档——
+//
+//	full（默认）：已报→已成+trade；
+//	partial：已报→部成+半笔 trade→已成+余笔 trade（对齐实网关"按累计量合成状态"）；
+//	reject：受理后柜台废单（推 order 废单事件，status=废单，无成交）——
+//	        引擎拒因链路此前在 mock 环境完全测不到。
+//
+// chaos（可选）：先推 trade 再推 order 已成，回归引擎单调状态机的乱序守卫。
+// positions/account：每笔成交后推快照对账事件（清算 Guard/资金闸的 mock 覆盖）。
+func simulateFill(b *book, o *order, delay time.Duration, push func(map[string]interface{}), chaos bool) {
+	time.Sleep(delay)
+	// §U-4 撤单竞态守卫：真实柜台里"已撤委托绝不会再成交"。旧 mock 延时到点无条件
+	// applyFill 并把状态强改"已成"，撤单窗口内的单被回填成交→幻影成交流入持仓
+	// （实测 MOCK000002 撤单仍持仓）。现成交前先判状态，非"已报"即跳过。
+	b.mu.Lock()
+	if o.Status != "已报" {
+		cur := o.Status
+		b.mu.Unlock()
+		log.Printf("[mock] skip fill: order %s already %s (not 已报)", o.OrderID, cur)
+		return
+	}
+	pushFills := func(fillQty int) bool {
+		o2 := *o
+		o2.Qty = fillQty
+		fr, okFill := b.applyFill(&o2, o.Price)
+		if !okFill {
+			// §UAT-D5：入账失败（持仓不足）= 柜台废单——推 废单 终态事件（带拒因），
+			// 委托不再永挂"已报"等超时撤；引擎侧走真实拒因链路（重报禁用/告警）。
+			b.mu.Lock()
+			held := 0
+			if p := b.positions[o.Code]; p != nil {
+				held = p.Qty
+			}
+			o.Status = "废单"
+			rej := orderEvent(o, "废单")
+			rej["reason"] = fmt.Sprintf("mock 柜台废单: 卖量 %d 超过持仓 %d（证券不足）", fillQty, held)
+			b.mu.Unlock()
+			log.Printf("[mock] reject %s: sell %d > held %d", o.OrderID, fillQty, held)
+			push(rej)
+			return false
+		}
+		trade := map[string]interface{}{
+			"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
+			"price": o.Price, "qty": fillQty, "amount": float64(fillQty) * o.Price,
+			"traded_at": fr.TradedAt, "signal_id": o.SignalID, "trade_id": fr.Serial,
+			// §P2-FEE 20260918：回报带费用腿（与 /settlement 同源，Go 侧落本地 fills.fee）
+			"fee": fr.Fee, "stamp_tax": fr.StampTax,
+		}
+		ord := orderEvent(o, o.Status)
+		if chaos {
+			push(trade)
+			push(ord)
+		} else {
+			push(ord)
+			push(trade)
+		}
+		return true
+	}
+	switch b.fillMode {
+	case "reject":
+		o.Status = "废单"
+		evt := orderEvent(o, "废单")
+		evt["reason"] = "mock reject mode: 模拟柜台废单（fill-mode=reject）"
+		b.mu.Unlock()
+		log.Printf("[mock] reject %s (fill-mode=reject)", o.OrderID)
+		push(evt)
+		return
+	case "partial":
+		if o.Qty >= 200 {
+			half := o.Qty / 2 / 100 * 100
+			if half > 0 && half < o.Qty {
+				o.Status = "部成"
+				b.mu.Unlock()
+				if !pushFills(half) {
+					return // §UAT-D5 首笔即废单：不再推进余量
+				}
+				time.Sleep(200 * time.Millisecond)
+				b.mu.Lock()
+				o.Status = "已成"
+				b.mu.Unlock()
+				if !pushFills(o.Qty - half) {
+					return
+				}
+				pushBookSnapshot(b, push)
+				return
+			}
+		}
+		o.Status = "已成"
+		b.mu.Unlock()
+		pushFills(o.Qty)
+		pushBookSnapshot(b, push)
+		return
+	default: // full
+		o.Status = "已成"
+		b.mu.Unlock()
+		pushFills(o.Qty)
+		pushBookSnapshot(b, push)
+	}
+}
+
+// active §0926E2E-MX1 读取当前 active 通道（空串按 xt 兜底，与 /health 回显同口径）。
+func (b *book) active() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeBroker == "" {
+		return "xt"
+	}
+	return b.activeBroker
+}
+
+// jsonString 把任意字符串编码为 JSON 字符串字面量（含引号转义），供 http.Error 手工拼
+// {"ok":false,"err":...} 时安全嵌入含引号/中文的拒因，避免手写转义漏掉破坏 JSON。
+func jsonString(s string) string {
+	bb, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(bb)
+}
+
 // sideCN §P2-14 方向归一（对齐实网关 normalizeSide / 引擎 normalizeReportSide 口径）：
 // buy/b/买入 → 买入，sell/s/卖出 → 卖出；未知原样返回（成交按未知方向 no-op 不记账）。
 // 旧 mock 不归一，测试/联调传 "buy" 时 applyFill 走卖分支 no-op，成交事件与账本脱节。
@@ -434,6 +613,155 @@ func sideCN(s string) string {
 		return "卖出"
 	}
 	return s
+}
+
+// lotRule §0926E2E-MX1 分板块申报单位（逐条镜像 gateway.py:229 lot_rule，含 §修复T4 拆分口径）：
+// 科创板(68 开头) 最低 200 股 1 股递增；创业板(30)/北交所(92、8/4 开头) 最低 100 股 1 股递增；
+// 主板/其他 100 股整手。卖方向由调用方放宽（零股清仓交易所允许）。
+// English: board lot rules mirrored from the real gateway's lot_rule (buy-side申报单位).
+func lotRule(code string) (int, int) {
+	digits := ""
+	for _, ch := range code {
+		if ch < '0' || ch > '9' {
+			break
+		}
+		digits += string(ch)
+	}
+	head := digits
+	if len(head) > 6 {
+		head = head[:6]
+	}
+	switch {
+	case strings.HasPrefix(head, "68"):
+		return 200, 1 // 科创板：最低 200 股、1 股递增
+	case strings.HasPrefix(head, "30"):
+		return 100, 1 // 创业板 300/301：最低 100 股、1 股递增
+	case strings.HasPrefix(head, "92") || strings.HasPrefix(head, "8") || strings.HasPrefix(head, "4"):
+		return 100, 1 // 北交所（920/83/87/43 等）：最低 100 股、1 股递增
+	}
+	return 100, 100 // 主板/其他：100 股整手
+}
+
+// orderGateReject §0926E2E-MX1 下单严格校验（默认与实网关 _do_order 同口径）：
+// 买入整手规则 + 金额帽（amount 缺失回退 qty×price，买卖双向，同 §A1）。
+// 返回 (HTTP 状态码, 错误信息)；通过时返回 (0,"")。-relax-order-check 时整体跳过（回旧行为）。
+// English: buy-side board-lot + two-sided amount cap, same semantics as the real gateway;
+// skipped only when the explicit relaxation flag is on.
+func (b *book) orderGateReject(code, side string, qty int, price, amount float64) (int, string) {
+	if b.relaxOrderCheck {
+		return 0, ""
+	}
+	if side == "买入" {
+		minQty, step := lotRule(code)
+		if qty < minQty || ((qty-minQty)%step) != 0 {
+			return http.StatusBadRequest, fmt.Sprintf("qty violates board lot rule (%s: min %d step %d)", code, minQty, step)
+		}
+	}
+	if b.maxOrderAmount > 0 {
+		amt := amount
+		if amt <= 0 {
+			amt = float64(qty) * price
+		}
+		if amt > b.maxOrderAmount {
+			return http.StatusBadRequest, fmt.Sprintf("amount %.2f exceeds gateway cap %.2f", amt, b.maxOrderAmount)
+		}
+	}
+	return 0, ""
+}
+
+// dispatchEnqueueOrder §0926E2E-MX1 下单入派发队列（active=queued 路径）。
+// 幂等双防线镜像实网关 store.dispatch_enqueue_order 的 §CLAIMRELEASE 口径：
+//
+//	① 调用方（/order）的 signal→order 幂等索引先挡常规重复；
+//	② 本函数在 b.mu 临界区内再查同 signal_id 的在途（pending/inflight）order 行——
+//	   挡掉「占位被释放后重试二次入队＝双买双卖」这条 N-8 实证路径（mock 里以 HTTP 直连复现）。
+//	   两者都在同一把锁内完成判重+写入（SQLite 单写者语义的 mock 等价物）。
+//
+// English: enqueue an order for the bridge channel, with the §CLAIMRELEASE duplicate guard
+// (in-flight same-signal rows are rejected instead of silently double-queued).
+func (b *book) dispatchEnqueueOrder(signalID, code, side, strategy string, price float64, qty int) (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if signalID != "" {
+		for i := range b.dispatch {
+			d := &b.dispatch[i]
+			if d.Kind == "order" && d.SignalID == signalID && (d.Status == "pending" || d.Status == "inflight") {
+				return "", fmt.Errorf("signal_id %s 已有在途派发单（%s），拒绝重复入队（§0926E2E-MX1 镜像 §CLAIMRELEASE）", signalID, d.Status)
+			}
+		}
+	}
+	seq := fmt.Sprintf("seq:%d", b.nextDispatch)
+	b.nextDispatch++
+	b.dispatch = append(b.dispatch, dispatchItem{
+		Seq: seq, SignalID: signalID, Kind: "order", Code: code, Side: side,
+		Price: price, Qty: qty, Strategy: strategy, Status: "pending",
+		CreatedAt: time.Now().Format(time.RFC3339),
+	})
+	return seq, nil
+}
+
+// dispatchEnqueueGeneric §0926E2E-MX1 cancel/diag 类派发项入队（不参与 signal 幂等判定，
+// 与实网关 dispatch_enqueue_cancel/dispatch_enqueue_diag 语义一致：撤单/诊断行按原样入队）。
+func (b *book) dispatchEnqueueGeneric(kind, signalID, orderID, code, side string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	seq := fmt.Sprintf("seq:%d", b.nextDispatch)
+	b.nextDispatch++
+	b.dispatch = append(b.dispatch, dispatchItem{
+		Seq: seq, SignalID: signalID, Kind: kind, Code: code, Side: side,
+		OrderID: orderID, Status: "pending", CreatedAt: time.Now().Format(time.RFC3339),
+	})
+	return seq
+}
+
+// dispatchTake §0926E2E-MX1 取单：原子把 pending 标记 inflight 并返回取单时的行快照
+// （对齐 store.dispatch_pending——返回的是 pending 形态的 dict，状态推进发生在同一临界区）。
+func (b *book) dispatchTake(limit int) []dispatchItem {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]dispatchItem, 0, limit)
+	n := 0
+	for i := range b.dispatch {
+		d := &b.dispatch[i]
+		if d.Status != "pending" {
+			continue
+		}
+		if limit > 0 && n >= limit {
+			break
+		}
+		d.Status = "inflight"
+		out = append(out, *d)
+		n++
+	}
+	return out
+}
+
+// dispatchSettle §0926E2E-MX1 结算派发项：status=done，result 合并写回，order_id 回填
+// （镜像 store.dispatch_set_result）。找不到 seq 返回 false（HTTP 层映射 404）。
+func (b *book) dispatchSettle(seq string, result map[string]interface{}) (dispatchItem, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.dispatch {
+		d := &b.dispatch[i]
+		if d.Seq != seq {
+			continue
+		}
+		merged := map[string]interface{}{}
+		for k, v := range d.Result {
+			merged[k] = v
+		}
+		for k, v := range result {
+			merged[k] = v
+		}
+		d.Result = merged
+		d.Status = "done"
+		if oid, ok := merged["order_id"].(string); ok && oid != "" {
+			d.OrderID = oid
+		}
+		cp := *d
+		return cp, true
+	}
+	return dispatchItem{}, false
 }
 
 // buildHandler 组装 mock 网关的 HTTP 面（/health /state /order /cancel /settlement + Bearer 中间件）。
@@ -601,6 +929,13 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			return
 		}
 		req.Side = sideCN(req.Side)
+		// §0926E2E-MX1 严格校验（默认与实网关 _do_order 同口径）：买入整手规则 + 金额帽。
+		// 拒单发生在幂等占位之前，不消耗 signal_id（实网关同款次序：首尔可安全修正后重试）。
+		// 联调要造非整手小单请显式起 -relax-order-check（回旧 mock 行为），不默认放宽。
+		if code, msg := b.orderGateReject(req.Code, req.Side, req.Qty, req.Price, req.Amount); code != 0 {
+			http.Error(w, `{"ok":false,"err":`+jsonString(msg)+`}`, code)
+			return
+		}
 		// signal_id 幂等：同 signal_id 已受理 → 返回原 order_id（不重复下单，与实网关语义一致）
 		if req.SignalID != "" {
 			b.mu.Lock()
@@ -611,6 +946,26 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 				return
 			}
 			b.mu.Unlock()
+		}
+		// §0926E2E-MX1 桥通道分流（active=queued）：不直接执行、不推"已报"，整笔写入派发队列
+		// 等"桥"取单——与实网关 QueuedBroker.place_order「入队即 return True」契约同形
+		// （§CLAIMRELEASE：入队后不可撤回，后续结算失败也不撤行）。回单引用为 seq:<n>。
+		if b.active() == "queued" {
+			seq, err := b.dispatchEnqueueOrder(req.SignalID, req.Code, req.Side, req.Strategy, req.Price, req.Qty)
+			if err != nil {
+				// 队列纵深防线拦下（同 sid 在途行）：按实网关口径回 500（已入队是既成事实，
+				// 不释放上层幂等锚——这里 mock 的锚即 signal 索引，保持不写入）
+				http.Error(w, `{"ok":false,"err":`+jsonString(err.Error())+`}`, http.StatusInternalServerError)
+				return
+			}
+			if req.SignalID != "" {
+				b.mu.Lock()
+				b.signal[req.SignalID] = seq // 占位引用先挂 seq，order_result 结算后回填真实委托号
+				b.mu.Unlock()
+			}
+			log.Printf("[mock] queued 通道入队 %s %s %d@%.2f seq=%s", req.Side, req.Code, req.Qty, req.Price, seq)
+			writeJSON(w, map[string]interface{}{"ok": true, "order_id": seq})
+			return
 		}
 		orderID := b.nextOrderID()
 		o := &order{
@@ -632,103 +987,8 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 		// 引擎侧据此把委托生命周期纳入单调状态机观测（占位行幂等，不会误覆盖）。
 		push(orderEvent(o, "已报"))
 
-		// 延时模拟成交并回报。§P2-14：按 fill-mode 分档——
-		//   full（默认）：已报→已成+trade；
-		//   partial：已报→部成+半笔 trade→已成+余笔 trade（对齐实网关"按累计量合成状态"）；
-		//   reject：受理后柜台废单（推 order 废单事件，status=废单，无成交）——
-		//           引擎拒因链路此前在 mock 环境完全测不到。
-		// chaos（可选）：先推 trade 再推 order 已成，回归引擎单调状态机的乱序守卫。
-		// positions/account：每笔成交后推快照对账事件（清算 Guard/资金闸的 mock 覆盖）。
-		go func(o *order) {
-			time.Sleep(delay)
-			// §U-4 撤单竞态守卫：真实柜台里"已撤委托绝不会再成交"。旧 mock 延时到点无条件
-			// applyFill 并把状态强改"已成"，撤单窗口内的单被回填成交→幻影成交流入持仓
-			// （实测 MOCK000002 撤单仍持仓）。现成交前先判状态，非"已报"即跳过。
-			b.mu.Lock()
-			if o.Status != "已报" {
-				cur := o.Status
-				b.mu.Unlock()
-				log.Printf("[mock] skip fill: order %s already %s (not 已报)", o.OrderID, cur)
-				return
-			}
-			pushFills := func(fillQty int) bool {
-				o2 := *o
-				o2.Qty = fillQty
-				fr, okFill := b.applyFill(&o2, o.Price)
-				if !okFill {
-					// §UAT-D5：入账失败（持仓不足）= 柜台废单——推 废单 终态事件（带拒因），
-					// 委托不再永挂"已报"等超时撤；引擎侧走真实拒因链路（重报禁用/告警）。
-					b.mu.Lock()
-					held := 0
-					if p := b.positions[o.Code]; p != nil {
-						held = p.Qty
-					}
-					o.Status = "废单"
-					rej := orderEvent(o, "废单")
-					rej["reason"] = fmt.Sprintf("mock 柜台废单: 卖量 %d 超过持仓 %d（证券不足）", fillQty, held)
-					b.mu.Unlock()
-					log.Printf("[mock] reject %s: sell %d > held %d", o.OrderID, fillQty, held)
-					push(rej)
-					return false
-				}
-				trade := map[string]interface{}{
-					"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
-					"price": o.Price, "qty": fillQty, "amount": float64(fillQty) * o.Price,
-					"traded_at": fr.TradedAt, "signal_id": o.SignalID, "trade_id": fr.Serial,
-					// §P2-FEE 20260918：回报带费用腿（与 /settlement 同源，Go 侧落本地 fills.fee）
-					"fee": fr.Fee, "stamp_tax": fr.StampTax,
-				}
-				ord := orderEvent(o, o.Status)
-				if chaos {
-					push(trade)
-					push(ord)
-				} else {
-					push(ord)
-					push(trade)
-				}
-				return true
-			}
-			switch b.fillMode {
-			case "reject":
-				o.Status = "废单"
-				evt := orderEvent(o, "废单")
-				evt["reason"] = "mock reject mode: 模拟柜台废单（fill-mode=reject）"
-				b.mu.Unlock()
-				log.Printf("[mock] reject %s (fill-mode=reject)", o.OrderID)
-				push(evt)
-				return
-			case "partial":
-				if o.Qty >= 200 {
-					half := o.Qty / 2 / 100 * 100
-					if half > 0 && half < o.Qty {
-						o.Status = "部成"
-						b.mu.Unlock()
-						if !pushFills(half) {
-							return // §UAT-D5 首笔即废单：不再推进余量
-						}
-						time.Sleep(200 * time.Millisecond)
-						b.mu.Lock()
-						o.Status = "已成"
-						b.mu.Unlock()
-						if !pushFills(o.Qty - half) {
-							return
-						}
-						pushBookSnapshot(b, push)
-						return
-					}
-				}
-				o.Status = "已成"
-				b.mu.Unlock()
-				pushFills(o.Qty)
-				pushBookSnapshot(b, push)
-				return
-			default: // full
-				o.Status = "已成"
-				b.mu.Unlock()
-				pushFills(o.Qty)
-				pushBookSnapshot(b, push)
-			}
-		}(o)
+		// 延时模拟成交并回报（full/partial/reject 分档与 chaos 乱序语义见 simulateFill）。
+		go simulateFill(b, o, delay, push, chaos)
 
 		writeJSON(w, map[string]interface{}{"ok": true, "order_id": orderID})
 	})
@@ -788,12 +1048,256 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			http.Error(w, `{"ok":false,"err":"order not cancellable (status=`+cur+`)"}`, http.StatusConflict)
 			return
 		}
+		// §0926E2E-MX1 桥通道分流（active=queued）：撤单同样入派发队列等桥执行，
+		// 状态推进延后到 cancel_result 回报（实网关 QueuedBroker.cancel 同语义：受理≠已撤）。
+		// 注意：此处已在 b.mu 临界区内（o 在锁下取出），只能直读 activeBroker 字段，
+		// 绝不可调 b.active()——那会对非重入锁二次加锁自死锁（本仓死锁 dump 实证）。
+		if b.activeBroker == "queued" {
+			o.Status = "撤单中" // 中间态：撤单已入队，simulateFill 的状态守卫会拒绝再成交（防幻影成交）
+			evtPending := orderEvent(o, "已报")
+			evtPending["reason"] = "撤单请求已入派发队列，待桥回报结算"
+			b.mu.Unlock()
+			seq := b.dispatchEnqueueGeneric("cancel", o.SignalID, o.OrderID, o.Code, o.Side)
+			log.Printf("[mock] queued 通道撤单入队 %s seq=%s", o.OrderID, seq)
+			push(evtPending)
+			writeJSON(w, map[string]interface{}{"ok": true, "seq": seq})
+			return
+		}
 		o.Status = "已撤"
 		evtCancel := orderEvent(o, "已撤")
 		b.mu.Unlock()
 		log.Printf("[mock] cancelled %s", req.OrderID)
 		push(evtCancel)
 		writeJSON(w, map[string]interface{}{"ok": true})
+	})
+
+	// ── §0926E2E-MX1（2026-09-27 四波·矩阵补位#1）派发队列三腿（镜像 qmt_gateway 桥通道契约）──
+	// 真实链路：Go/量仔 → 网关 /order（active=queued 入队）→ 策略桥 qmt_bridge.py 经
+	// GET /dispatch/pending 取单（原子 pending→inflight 防并发双执行）→ 柜台执行 →
+	// POST /dispatch/result 回报 → 网关按 handler 协议推首尔。mock 三腿逐端点镜像该契约，
+	// 让「取单→回报→状态推进」全生命周期在 Go 级用例/盘内 UAT 可回归（缺口定性见
+	// REVIEW_20260926E2E 矩阵 #1：此前 mock 零 /dispatch 面，桥通道整条兜底路径测不到）。
+
+	// GET /dispatch/pending 桥取单：原子取 pending（≤50）并标记 inflight。
+	mux.HandleFunc("/dispatch/pending", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"ok":false,"err":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		items := b.dispatchTake(50)
+		writeJSON(w, map[string]interface{}{"ok": true, "items": items})
+	})
+
+	// POST /dispatch/result 桥回报结算（事件类型集与 gateway._do_dispatch_result 逐一对齐：
+	// heartbeat/positions/account/order_result/cancel_result/trade/diag；未知类型 400 不静默吞）。
+	mux.HandleFunc("/dispatch/result", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"ok":false,"err":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req map[string]interface{}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, `{"ok":false,"err":"bad body"}`, http.StatusBadRequest)
+			return
+		}
+		etype, _ := req["type"].(string)
+		seq, _ := req["seq"].(string)
+		strField := func(k string) string { v, _ := req[k].(string); return v }
+		switch etype {
+		case "heartbeat":
+			// 桥心跳（bridge_state.last_heartbeat 同形观察位）：只记录，不落账。
+			b.mu.Lock()
+			b.bridgeBeat = time.Now()
+			b.mu.Unlock()
+			writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+			return
+		case "positions":
+			// 桥侧持仓快照：原样转发首尔（实网关 handler.on_positions 同语义——快照回报
+			// 是清算 Guard/对账的权威腿，mock 账本不反向覆盖快照内容）。
+			push(map[string]interface{}{"type": "positions", "positions": req["positions"],
+				"at": time.Now().Format(time.RFC3339)})
+			writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+			return
+		case "account":
+			push(map[string]interface{}{"type": "account", "asset": req["asset"],
+				"at": time.Now().Format(time.RFC3339)})
+			writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+			return
+		case "order_result":
+			// 下单结果：ok→建委托行推"已报"并挂上成交推进器（xt/queued 共用 simulateFill，
+			// 柜台语义不分叉）；失败→"已废"终态 + 拒因（状态字面量对齐实网关 _apply_order_result）。
+			okFlag, _ := req["ok"].(bool)
+			orderID := strField("order_id")
+			errMsg := strField("err")
+			row, found := b.dispatchSettle(seq, map[string]interface{}{
+				"ok": okFlag, "order_id": orderID, "err": errMsg, "confirmed": true,
+			})
+			if !found {
+				http.Error(w, `{"ok":false,"err":"unknown seq: `+seq+`"}`, http.StatusNotFound)
+				return
+			}
+			if !okFlag {
+				o := &order{OrderID: orderID, SignalID: row.SignalID, Code: row.Code, Side: row.Side,
+					Strategy: row.Strategy, Price: row.Price, Qty: row.Qty, Status: "已废",
+					CreatedAt: row.CreatedAt}
+				if o.OrderID == "" {
+					o.OrderID = seq
+				}
+				b.mu.Lock()
+				b.orders[o.OrderID] = o
+				if row.SignalID != "" {
+					b.signal[row.SignalID] = o.OrderID
+				}
+				b.mu.Unlock()
+				evt := orderEvent(o, "已废")
+				evt["reason"] = errMsg
+				push(evt)
+				log.Printf("[mock] dispatch order_result 已废 seq=%s signal=%s err=%s", seq, row.SignalID, errMsg)
+				writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+				return
+			}
+			if orderID == "" {
+				orderID = b.nextOrderID()
+			}
+			o := &order{OrderID: orderID, SignalID: row.SignalID, Code: row.Code, Strategy: row.Strategy,
+				Side: row.Side, Price: row.Price, Qty: row.Qty, Status: "已报", CreatedAt: row.CreatedAt}
+			b.mu.Lock()
+			b.orders[orderID] = o
+			if row.SignalID != "" {
+				b.signal[row.SignalID] = orderID // seq 占位引用回填为真实委托号（对齐实网关回填 order_id 列）
+			}
+			b.mu.Unlock()
+			push(orderEvent(o, "已报"))
+			go simulateFill(b, o, delay, push, chaos)
+			log.Printf("[mock] dispatch order_result 已报 seq=%s order=%s signal=%s", seq, orderID, row.SignalID)
+			writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+			return
+		case "cancel_result":
+			// 撤单结果：ok→已撤；失败→如实回推"已报"（撤单未生效，委托仍可成交）+ 拒因，
+			// 与实网关 _apply_cancel_result 的 on_order 两分支同口径。
+			okFlag, _ := req["ok"].(bool)
+			errMsg := strField("err")
+			row, found := b.dispatchSettle(seq, map[string]interface{}{"ok": okFlag, "err": errMsg})
+			if !found {
+				http.Error(w, `{"ok":false,"err":"unknown seq: `+seq+`"}`, http.StatusNotFound)
+				return
+			}
+			b.mu.Lock()
+			o := b.orders[row.OrderID]
+			var evt map[string]interface{}
+			if o != nil {
+				if okFlag {
+					o.Status = "已撤"
+				} else if o.Status == "撤单中" {
+					o.Status = "已报" // 撤单失败回到可成交态
+				}
+				evt = orderEvent(o, o.Status)
+				if !okFlag {
+					evt["status"] = "已报" // 实网关口径：失败回"已报"而非中间态字面量
+					evt["reason"] = errMsg
+				}
+			}
+			b.mu.Unlock()
+			if evt != nil {
+				push(evt)
+			}
+			log.Printf("[mock] dispatch cancel_result seq=%s ok=%v target=%s", seq, okFlag, row.OrderID)
+			writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+			return
+		case "trade":
+			// 桥成交回报（DEAL 轮询腿）：对指定委托做人工成交推进——测试专用面，
+			// 与 order_result 自动挂的 simulateFill 二选一驱动（终态委托重复成交被状态守卫拒绝）。
+			orderID := strField("order_id")
+			b.mu.Lock()
+			o := b.orders[orderID]
+			b.mu.Unlock()
+			if o == nil {
+				http.Error(w, `{"ok":false,"err":"unknown order_id"}`, http.StatusNotFound)
+				return
+			}
+			qtyF, _ := req["qty"].(float64)
+			fillQty := int(qtyF)
+			priceF, _ := req["price"].(float64)
+			if priceF <= 0 {
+				priceF = o.Price
+			}
+			b.mu.Lock()
+			if o.Status != "已报" && o.Status != "部成" {
+				cur := o.Status
+				b.mu.Unlock()
+				log.Printf("[mock] dispatch trade skip: %s already %s", orderID, cur)
+				writeJSON(w, map[string]interface{}{"ok": true, "err": "", "skipped": cur})
+				return
+			}
+			if fillQty <= 0 || fillQty > o.Qty {
+				fillQty = o.Qty
+			}
+			o.QtyFilled += fillQty
+			if o.QtyFilled >= o.Qty {
+				o.Status = "已成"
+			} else {
+				o.Status = "部成"
+			}
+			b.mu.Unlock()
+			o2 := *o
+			o2.Qty = fillQty
+			fr, okFill := b.applyFill(&o2, priceF)
+			if !okFill {
+				http.Error(w, `{"ok":false,"err":"trade rejected: insufficient position (mock)"}`, http.StatusBadRequest)
+				return
+			}
+			push(map[string]interface{}{
+				"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
+				"price": priceF, "qty": fillQty, "amount": float64(fillQty) * priceF,
+				"traded_at": fr.TradedAt, "signal_id": o.SignalID, "trade_id": fr.Serial,
+				"fee": fr.Fee, "stamp_tax": fr.StampTax,
+			})
+			push(orderEvent(o, o.Status))
+			pushBookSnapshot(b, push)
+			writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+			return
+		case "diag":
+			// 诊断回报（交易明细 dump）：结算落 result，日志留痕（截断防刷屏，同实网关）。
+			row, found := b.dispatchSettle(seq, map[string]interface{}{"ok": true, "diag": req["dump"]})
+			if !found {
+				http.Error(w, `{"ok":false,"err":"unknown seq: `+seq+`"}`, http.StatusNotFound)
+				return
+			}
+			dumpJSON, _ := json.Marshal(row.Result)
+			log.Printf("[mock] dispatch diag report seq=%s result=%s", seq, truncate(string(dumpJSON), 500))
+			writeJSON(w, map[string]interface{}{"ok": true, "err": ""})
+			return
+		default:
+			http.Error(w, `{"ok":false,"err":"unknown dispatch result type: `+etype+`"}`, http.StatusBadRequest)
+			return
+		}
+	})
+
+	// POST /dispatch/enqueue 运维注入面：仅 kind=diag（对齐实网关 _do_dispatch_enqueue——
+	// 下单/撤单只能经各自的正规端点进队列，运维口不开注单后门）。
+	mux.HandleFunc("/dispatch/enqueue", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"ok":false,"err":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Kind     string `json:"kind"`
+			SignalID string `json:"signal_id"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			http.Error(w, `{"ok":false,"err":"bad body"}`, http.StatusBadRequest)
+			return
+		}
+		if req.Kind != "diag" {
+			http.Error(w, `{"ok":false,"err":"kind must be diag"}`, http.StatusBadRequest)
+			return
+		}
+		sid := strings.TrimSpace(req.SignalID)
+		if sid == "" {
+			sid = fmt.Sprintf("DIAG-%d", time.Now().Unix())
+		}
+		seq := b.dispatchEnqueueGeneric("diag", sid, "", "", "")
+		writeJSON(w, map[string]interface{}{"ok": true, "seq": seq})
 	})
 
 	// ── §0925EVE-W3-G 第三态人工收敛契约面（对齐实网关 gateway.py）──

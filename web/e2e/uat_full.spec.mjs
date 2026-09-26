@@ -14,9 +14,23 @@ import { test, expect } from '@playwright/test'
 import { loadQuoteSources } from './quote_sources.mjs'
 
 // 两套账号凭据（admin=超管，tester=普通用户）与像素截图输出目录
-const ADMIN = { u: process.env.E2E_USER || 'admin', p: process.env.E2E_PASS || '' }
-const USER = { u: process.env.E2E_USER2 || 'tester', p: process.env.E2E_PASS2 || ADMIN.p }
+// §0926E2E-17c：凭据一律环境变量注入，缺省**不再回退 'admin'/'tester'/空串**——
+// 缺凭据时每条用例开局即显式判红（test.fail 在 beforeEach 里触发），而不是拿空密码
+// 打登录表单再以一种看不出根因的失败收尾（本仓"降级不许报成功"主题的镜像面：静默兜底＝假绿温床）。
+// English: §0926E2E-17c — no hardcoded/default credentials; missing env creds fail every test
+// explicitly in beforeEach instead of falling back to 'admin'/'tester'/''.
+const ADMIN = { u: process.env.E2E_USER, p: process.env.E2E_PASS }
+const USER = { u: process.env.E2E_USER2, p: process.env.E2E_PASS2 }
 const SHOT = 'test-results/uat-pixels'
+
+test.beforeEach(async () => {
+  const missing = []
+  if (!ADMIN.u || !ADMIN.p) missing.push('E2E_USER/E2E_PASS')
+  if (!USER.u || !USER.p) missing.push('E2E_USER2/E2E_PASS2')
+  if (missing.length > 0) {
+    test.fail(true, `§0926E2E-17c：凭据缺失（${missing.join('、')}）——Playwright 只准经 scripts/uat_bootstrap.sh 正规通道起`)
+  }
+})
 
 // §UAT-PORTS（2026-09-23）：假柜台地址/口令一律走环境变量，禁止在用例里硬编 18789。
 // 为什么是缺陷而不只是不便：本机可能同时存在多份 checkout（各拉一套 UAT 栈），默认端口先到先得，
@@ -945,7 +959,7 @@ test.describe('修复回归 · GAP_VERIFY_20260917 D 批', () => {
   // 本用例改钉新语义：伪造角色 + 成员 token → 落 403，页面本体（服务器连接卡）不渲染。
   test('D-3 tester：Settings 无配置历史卡', async ({ page, context }) => {
     // 用 tester 凭据现登（不动共享 storageState 会话）
-    const resp = await context.request.post('/api/auth/login', { data: { username: process.env.E2E_USER2 || 'tester', password: process.env.E2E_PASS2 || '' } })
+    const resp = await context.request.post('/api/auth/login', { data: { username: USER.u, password: USER.p } }) // §0926E2E-17c 无回退凭据
     expect(resp.ok(), 'tester 登录').toBe(true)
     const t = (await resp.json()).token
     const p2 = await context.newPage()
@@ -1234,7 +1248,7 @@ test.describe('修复回归 · §3.1-1/§M1 quote_source 契约单源化', () =>
 // 顺带把 §M13 的判定口径钉住：两类端点 403 文案语言不同 → 前端只能按状态码判权限，
 // 不得按文案 indexOf('无权限') 匹配（英文 403 会漏判）。
 // ─────────────────────────────────────────────────────────────────────────────
-const USER2 = { u: process.env.E2E_USER2 || 'tester', p: process.env.E2E_PASS2 || '' }
+const USER2 = { u: USER.u, p: USER.p } // §0926E2E-17c：同一份 env 凭据，不再各自兜底 'tester'/''
 let testerToken = null // 模块级缓存：全 spec 只登录一次，避后端 login 5/min 匿名频控
 
 // loginTester 用 tester 凭据换 token（复用已缓存的，避免多用例连打登录被频控成 429 假红）。
@@ -1399,7 +1413,7 @@ test.describe('修复回归 · 2026-09-22 傍晚批', () => {
   // §N-2：推送实弹探测端点收权 admin——普通成员必须 403（旧形态 authMiddleware 即放行）。
   // 不打 admin 那一次：本端点会向真实通道发 LevelHigh 消息，UAT 里没必要给 owner 手机发消息。
   test('N-2：成员 POST /api/notify-test 被 403 拦在全局推送通道之外', async ({ request }) => {
-    const member = await tokenOf(request, process.env.E2E_USER2 || 'tester', USER.p)
+    const member = await tokenOf(request, USER.u, USER.p) // §0926E2E-17c：env 单一来源
     const r = await request.post(API + '/api/notify-test', { headers: member, data: {} })
     expect(r.status(), '成员不得触发全局推送通道实弹探测').toBe(403)
   })
@@ -1427,13 +1441,19 @@ test.describe('修复回归 · 0925EVE 撤单失败明细与第三态人工收�
       const snap = await (await page.request.get('/api/snapshot?codes=300750', { headers: hdr })).json()
       const live = Array.isArray(snap) ? (snap[0] && snap[0].price) || 0 : (snap.price || 0)
       expect(live, '取 300750 实时现价（价格守卫基准）').toBeGreaterThan(0)
-      const exec = await page.request.post('/api/positions/execute', {
-        headers: hdr,
-        data: { code: '300750', side: '买入', action: '建仓', qty: 100, price: live, strategy: 'dragon', client_id: `evea2-${Date.now()}-${attempt}` },
-      })
+      const body = { code: '300750', side: '买入', action: '建仓', qty: 100, price: live, strategy: 'dragon', client_id: `evea2-${Date.now()}-${attempt}` }
+      let exec = await page.request.post('/api/positions/execute', { headers: hdr, data: body })
+      let txt = await exec.text()
+      // §0926E2E-W1C：UAT 盘外行情链取不到实时现价时，后端不再静默放行偏离校验，而是 400
+      // 要求显式确认（confirm_no_quote）。本用例直连 API 模拟"真实栈+操作员在 UI 弹窗点了
+      // 仍要下单"的形态：识别固定前缀后带确认位重发（复用同一 client_id，幂等不双单）。
+      if (exec.status() === 400 && txt.includes('无法获取实时现价')) {
+        exec = await page.request.post('/api/positions/execute', { headers: hdr, data: { ...body, confirm_no_quote: true } })
+        txt = await exec.text()
+      }
       // 白名单口径：strategy 必须内置四形态之一（manual 会被 risk.Gate 兜底拒——2026-09-25 实测）
-      expect(exec.status(), 'live 下单应 200（dragon 在白名单默认全集内）').toBe(200)
-      const oid = (await exec.json()).order_id
+      expect(exec.status(), `live 下单应 200（dragon 在白名单默认全集内）body=${txt}`).toBe(200)
+      const oid = JSON.parse(txt).order_id
       expect(oid, '下单回网关委托号').toMatch(/^MOCK\d+$/)
       const f = await page.request.post(`${MOCK_URL}/admin/mock-force-status`, { headers: mockHdr(), data: { order_id: oid, status: '已成' } })
       expect(f.status(), 'mock 强改成终态应 200').toBe(200)
@@ -1719,5 +1739,68 @@ test.describe('修复回归 · §AUDIT-UNIFY 配置历史与回滚 (2026-09-26)'
     const hdrA = { Authorization: await pageA.evaluate(() => localStorage.getItem('liangzai_token')) }
     expect((await pageA.request.get('/api/config/history', { headers: hdrA })).status(), 'admin 对照 200').toBe(200)
     await ctxA.close()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// §0926E2E-MX1（2026-09-27 四波·矩阵补位#1）：mock 派发队列（QMT 桥通道）盘内契约腿
+// 背景：真实网关的兜底通道「入队→桥取单→回报→结算」此前在 mock/UAT 里整体缺席
+// （REVIEW_20260926E2E 矩阵缺口 #1）。Go 级用例（cmd/qmt-mock/main_dispatch_test.go）
+// 已把全生命周期锤死；这条盘内腿证明的是「真实栈里这三条 HTTP 端点拨得通、形状对、
+// 负锁在位」。纪律：用例只走到取单为止，绝不结算回报——order_result 一旦 ok=true
+// 会经 mock 推已报/已成到引擎，给共享账本留一笔测试单（跨文件污染）。清理：active
+// 通道在 finally 必回 xt，窗口内引擎正常下单仍走 xt 直发不受影响。
+// ─────────────────────────────────────────────────────────────────────
+test.describe('矩阵补位 · 0926E2E-MX1 mock 派发队列桥腿', () => {
+  test('MX1-1：queued 受理回 seq → /dispatch/pending 原子取单 → unknown seq 404/非 diag 注入 400/裸访问 401/heartbeat 200', async ({ page }) => {
+    const mhdr = () => ({ Authorization: `Bearer ${MOCK_TOKEN}`, 'Content-Type': 'application/json' })
+    let health = null
+    let lastErr = ''
+    for (let i = 0; i < 3 && !health; i++) { // L1-2 同款三轮探活（mock 瞬忙不等于不可用）
+      await page.waitForTimeout(500)
+      health = await page.request.get(`${MOCK_URL}/health`, { timeout: 3000 }).catch((e) => { lastErr = String((e && e.message) || e); return null })
+    }
+    if (!health || health.status() !== 200) mockUnavailableOrFail(lastErr || `health 非 200（got ${health && health.status()}）`)
+    await page.goto('/#/quant')
+    const ehdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const sid = `mx1-e2e-${Date.now()}`
+    let switched = false
+    try {
+      const sw = await page.request.post(`${MOCK_URL}/admin/broker`, { headers: mhdr(), data: { broker: 'queued' } })
+      expect(sw.status(), '切换 active 到 queued 应 200').toBe(200)
+      switched = true
+      // ① queued 受理：回派发引用 seq:<n>，且引擎侧不得出现任何该行（入队≠已报，提前推进＝假成功）
+      const o = await page.request.post(`${MOCK_URL}/order`, { headers: mhdr(), data: { signal_id: sid, code: '600519.SH', side: '买入', price: 10, qty: 100 } })
+      expect(o.status(), 'queued 下单应 200 受理').toBe(200)
+      const oj = await o.json()
+      expect(String(oj.order_id), 'queued 受理必须回 seq:<n>（实网关 QueuedBroker 契约同形）').toMatch(/^seq:\d+$/)
+      const engRows = await (await page.request.get('/api/qmt/orders', { headers: ehdr })).json()
+      expect((Array.isArray(engRows) ? engRows : []).find((x) => x.signal_id === sid),
+        '桥队列在途单引擎必须不可见（回报未发生）').toBeFalsy()
+      // ② 取单：能拨到本笔、kind=order；二次取单不得重放（pending→inflight 原子标记）
+      const p1 = await page.request.get(`${MOCK_URL}/dispatch/pending`, { headers: mhdr() })
+      expect(p1.status(), '取单应 200').toBe(200)
+      const item = ((await p1.json()).items || []).find((x) => x.signal_id === sid)
+      expect(item, '派发的 order 项必须可被桥侧取到').toBeTruthy()
+      expect(item.kind, '取到的项应为 order').toBe('order')
+      const p2 = await page.request.get(`${MOCK_URL}/dispatch/pending`, { headers: mhdr() })
+      expect(((await p2.json()).items || []).find((x) => x.signal_id === sid),
+        '同一项二次取单不得复现（并发双执行防线）').toBeFalsy()
+      // ③ 契约负锁：未知 seq 结算 404、运维口非 diag 注单 400、无鉴权裸访问 401
+      const nf = await page.request.post(`${MOCK_URL}/dispatch/result`, { headers: mhdr(), data: { type: 'order_result', seq: 'seq:99999999', ok: true } })
+      expect(nf.status(), 'unknown seq 必须 404').toBe(404)
+      const bd = await page.request.post(`${MOCK_URL}/dispatch/enqueue`, { headers: mhdr(), data: { kind: 'order', signal_id: 'backdoor' } })
+      expect(bd.status(), '运维注入口只许 diag，order 注入必须 400').toBe(400)
+      const noauth = await page.request.get(`${MOCK_URL}/dispatch/pending`)
+      expect(noauth.status(), '/dispatch 裸访问必须 401（无鉴权取单口＝把桥位让给访客）').toBe(401)
+      // ④ heartbeat 腿（无账本副作用，可安全打通）
+      const hb = await page.request.post(`${MOCK_URL}/dispatch/result`, { headers: mhdr(), data: { type: 'heartbeat' } })
+      expect(hb.status(), '桥心跳应 200 ok').toBe(200)
+    } finally {
+      if (switched) {
+        const back = await page.request.post(`${MOCK_URL}/admin/broker`, { headers: mhdr(), data: { broker: 'xt' } })
+        expect(back.status(), '复位 active 通道到 xt 必须 200').toBe(200)
+      }
+    }
   })
 })

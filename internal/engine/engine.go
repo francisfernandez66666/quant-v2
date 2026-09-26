@@ -2791,12 +2791,15 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 	// 大盘实测块（2026-09-16 补）：上证点位+全市场涨跌家数——用户口语里的"普涨/普跌"
 	// 从此有实测依据，模型不必再说"我没有今天大盘的数据"。
 	// §修复 BREADTH-FAKE(20260920)：涨跌家数改走 GetBreadth（真实弃权语义）。GetIndexData 在
-	// 接口失败时会**伪造 1500/1500 中性值**（该函数注释已声明此设计，风险因子侧正是为此另立
+	// 当时接口失败时会**伪造 1500/1500 中性值**（该函数注释已声明此设计，风险因子侧正是为此另立
 	// GetBreadth），而本块开头已声明"仅可引用下列提供的数据"——把伪造值当"大盘实测"喂给模型，
 	// 等于诱导它据假数据下"涨跌基本持平"的结论（实测 2026-09-20 东财不可达时即输出 1500/1500）。
 	// 取不到就整段不写（宁缺勿假），与全仓 GetBreadth 的口径一致。
-	// English: breadth now goes through GetBreadth (true abstention). GetIndexData deliberately
-	// fabricates a neutral 1500/1500 when its endpoint fails, and feeding that to the model as
+	// §0926E2E-14 注：GetIndexData 的伪造默认已按本口径彻底删除（失败回 0/0 弃权），
+	// 本块维持"指数点位走 GetIndexData、涨跌家数单独走 GetBreadth"的分层不变。
+	// English: breadth now goes through GetBreadth (true abstention). GetIndexData used to
+	// deliberately fabricate a neutral 1500/1500 when its endpoint failed (removed by
+	// §0926E2E-14), and feeding that to the model as
 	// "measured market breadth" would make it reason from a fake number; when unavailable we emit
 	// no breadth clause at all instead.
 	if e.marketAPI != nil {

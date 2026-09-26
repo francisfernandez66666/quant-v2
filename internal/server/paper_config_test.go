@@ -21,7 +21,9 @@ import (
 // 用真实 paper.Engine 而非桩，才能验证"端点热更 → 引擎 Enabled() 即时生效"的联动。
 func newPaperConfigServer(t *testing.T) *Server {
 	t.Helper()
-	s := &Server{cfg: config.NewManager("")}
+	// §0926E2E-W1B：路径必须真实可写——旧写法 NewManager("") 让 Save() 的原子写一直失败
+	//（rename ./...tmp 不存在），端点却因吞错照回 200＝假绿；错误链接通后该形态当场红。
+	s := &Server{cfg: config.NewManager(filepath.Join(t.TempDir(), "config.json"))}
 	// paper.json 放进 t.TempDir()：落盘路径随测试结束自动清理，用例间互不污染
 	s.SetPaper(paper.New(paper.ConfigFromRules(s.cfg.Get().Paper), filepath.Join(t.TempDir(), "paper.json"))) // §0925EVE-D1：字段转私有，读取走加锁访问器
 	return s

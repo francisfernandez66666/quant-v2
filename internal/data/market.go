@@ -2194,9 +2194,14 @@ func shortDate(s string) string {
 // 整链原本无任何兜底、直接回 error。现补上：①成功轮次写 LKG 缓存；②失败轮次若 LKG 在
 // indexLKGMaxAge 窗口内，回退上一份真实值并打「陈旧回退」告警（真实但旧 > 整段空白，
 // 且告警可见不构成静默降级报成功）；③无 LKG 或超窗仍回 error，下游按缺失降级/弃权。
+// §0926E2E-14 口径补充：涨跌家数两列自本批起为真实弃权——概况子请求失败时回 0/0
+// （不再伪造 1500/1500 中性值）；err==nil 仅代表指数点位链路成功，不代表涨跌有数。
 // English: public entry with a §LOW(SPOF) last-known-good fallback: successes refresh the
 // cache; failures within indexLKGMaxAge serve the stale-but-real value with a loud warning;
 // without cache (or too old) the error still propagates for downstream abstention.
+// §0926E2E-14: breadth columns use TRUE abstention — 0/0 when the sub-request fails
+// (the old fabricated 1500/1500 neutral default is removed); a nil error only certifies
+// the index-price leg, never that up/down counts are present.
 func (m *MarketAPI) GetIndexData() (indexPrice float64, ma20 float64, upCount, downCount int, err error) {
 	indexPrice, ma20, upCount, downCount, err = m.getEastMoneyIndexData()
 	if err == nil {
@@ -2265,8 +2270,13 @@ func (m *MarketAPI) getEastMoneyIndexData() (indexPrice float64, ma20 float64, u
 	}
 
 	// 获取涨跌家数（使用东方财富市场概况接口）
-	upCount = 1500
-	downCount = 1500
+	// §0926E2E-14：删除 1500/1500 伪造中性默认——旧实现在概况子请求失败/返回非正时把
+	// "取不到数"包装成"涨跌各半"的假实测值（历史上正是为此另立了 GetBreadth，
+	// 引擎侧 BREADTH-FAKE(20260920) 也绕开了本函数取涨跌）。现语义＝真实弃权：
+	// 任何失败/非正一律保持 0/0；err 仍只反映指数主体取数结果，需要"必须有涨跌家数"
+	// 的调用方必须走 GetBreadth（其 err 非空即弃权信号）。
+	// English: §0926E2E-14 — the fabricated neutral 1500/1500 is removed; breadth is now TRUE
+	// abstention (0/0 on any failure or non-positive value), matching GetBreadth's semantics.
 	marketURL := "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=1.000001&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
 	EastMoneyLimiter.Wait()
 	mResp, mErr := m.getWithHeaders(marketURL, emReferer)
@@ -2294,13 +2304,14 @@ func (m *MarketAPI) getEastMoneyIndexData() (indexPrice float64, ma20 float64, u
 }
 
 // GetBreadth 仅取全市场涨/跌家数（东财市场概况 f62/f63），带**真实弃权**语义：
-// 与 GetIndexData 不同——后者在接口失败时伪造 1500/1500 中性值，而风险因子判定绝不能把
-// "取数失败"当成"涨跌各半"，故本方法在 HTTP/解析失败或返回非正时一律 err!=nil（valid=false），
-// 由上层降级到同花顺全市场统计或弃权不参与判定。
-// English: GetBreadth fetches only market-wide up/down counts with TRUE abstention — unlike
-// GetIndexData, which fakes a neutral 1500/1500 on failure, the risk-factor path must never treat
-// "fetch failed" as "half up / half down". So any HTTP/parse failure or non-positive value returns
-// err != nil, letting callers fall back to THS full-market stats or abstain entirely.
+// 任何 HTTP/解析失败或返回非正一律 err!=nil（valid=false），由上层降级到同花顺全市场
+// 统计或弃权不参与判定。§0926E2E-14 起 GetIndexData 的涨跌家数也已改为弃权 0/0，
+// 与本方法语义统一（旧版它伪造 1500/1500，是当年另立本方法的原因，现已消除）。
+// English: GetBreadth fetches only market-wide up/down counts with TRUE abstention — any
+// HTTP/parse failure or non-positive value returns err != nil, letting callers fall back to
+// THS full-market stats or abstain entirely. Since §0926E2E-14 GetIndexData's breadth columns
+// abstain (0/0) too, converging on the same semantics (its old fabricated 1500/1500 default —
+// the very reason this method existed — is gone).
 func (m *MarketAPI) GetBreadth() (up, down int, err error) {
 	marketURL := "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=1.000001&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
 	EastMoneyLimiter.Wait()

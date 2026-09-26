@@ -44,6 +44,10 @@ param(
     [string]$LLMApiURL = "https://api.siliconflow.cn/v1/chat/completions",
     [string]$LLMModel = "THUDM/GLM-Z1-9B-0414",
     [string]$HithinkApiKey = "",
+    # §0926E2E-W2A（2026-09-26 二波）：/setup 抢跑守卫令牌（SETUP_TOKEN）。Go 侧守卫 §P1-5
+    # 一直存在但部署面零命中＝现网从未开启，首次初始化窗口对匿名者全敞开。本注册步现在
+    # 保底注入：显式参数 > 密钥文件 > 机器级环境变量 > 现场随机生成并落盘密钥文件（不回显值）。
+    [string]$SetupToken = "",
     # §N-5 磁盘密钥文件（KEY=VALUE，一行一键，# 起注释）——Windows 侧的 /etc/quant.env 对位物，
     # 口径见 PROJECT_DOCUMENT.md「LLM_API_KEY 不传则保留服务器现有 C:\etc\quant.env」。
     # 文件里放 LLM_API_KEY / LLM_API_URL / LLM_MODEL / HITHINK_FINANCE_API_KEY 四键即可；
@@ -144,6 +148,33 @@ $LLMApiKeyResolved  = Resolve-Secret 'LLM_API_KEY'               $LLMApiKey     
 $LLMApiURLResolved  = Resolve-Secret 'LLM_API_URL'               $LLMApiURL     ($PSBoundParameters.ContainsKey('LLMApiURL'))
 $LLMModelResolved   = Resolve-Secret 'LLM_MODEL'                 $LLMModel      ($PSBoundParameters.ContainsKey('LLMModel'))
 $HithinkResolved    = Resolve-Secret 'HITHINK_FINANCE_API_KEY'   $HithinkApiKey ($PSBoundParameters.ContainsKey('HithinkApiKey'))
+
+# §0926E2E-W2A：SETUP_TOKEN 保底解析（与 §N-5 四源优先级同款），一条都没有时现场随机生成
+# 并**追加落盘**到密钥文件（不重写整文件——保留操作人手工维护的其他键）。生成即永久：
+# 下一次重跑注册会从密钥文件读回同一把，不会悄悄换令牌把已初始化的守卫口径改掉。
+# 安全铁律沿用本脚本口径：任何日志路径不回显令牌值，只报键名与存放位置。
+$SetupTokenResolved = Resolve-Secret 'SETUP_TOKEN'               $SetupToken    ($PSBoundParameters.ContainsKey('SetupToken'))
+if (-not $SetupTokenResolved) {
+    $stRng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    $stBuf = New-Object byte[] 24
+    $stRng.GetBytes($stBuf)
+    $SetupTokenResolved = (($stBuf | ForEach-Object { $_.ToString("x2") }) -join "")
+    try {
+        $stDir = Split-Path -Parent $SecretFile
+        if ($stDir -and -not (Test-Path $stDir)) { New-Item -Path $stDir -ItemType Directory -Force | Out-Null }
+        $stFileExisted = Test-Path $SecretFile
+        Add-Content -Path $SecretFile -Value "SETUP_TOKEN=$SetupTokenResolved" -Encoding UTF8
+        if (-not $stFileExisted) {
+            # 新建的密钥文件含明文令牌：NTFS ACL 立刻收敛到 Administrators+SYSTEM（对位 restic-pass.txt 口径）
+            icacls $SecretFile /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
+        }
+        Info "SETUP_TOKEN 已生成并落盘 $SecretFile（值不回显；取用：(Select-String -Path $SecretFile -Pattern '^SETUP_TOKEN=').Line.Split('=',2)[1]）"
+    } catch {
+        Die "SETUP_TOKEN 落盘失败：$($_.Exception.Message) —— 拒绝继续（不落盘则下次重跑会换令牌，且服务 env 注入无从取值；§0926E2E-W2A）"
+    }
+} else {
+    Info "SETUP_TOKEN 已从参数/密钥文件/机器级环境变量取到（值不回显）"
+}
 
 # §ENH-0(2026-09-19)：统一构造服务级环境变量。此前 LLM 三元组之外的密钥（尤其
 # HITHINK_FINANCE_API_KEY=交易日历/行情主源）从不注入，quant 生产进程一直缺它。
@@ -293,7 +324,7 @@ Register-NssmService $SvcNameQuant $QuantExe @() "NORMAL_PRIORITY_CLASS"
 # AppEnvironmentExtra 是整体替换语义，所以旧注释要求"必须带全量再叠 QUANT_ADDR"，
 # 而"全量"取决于本次命令行传了哪些密钥 → 少传即少删。现改走 Set-ServiceEnvExtra：
 # 先 nssm get 读回现值做并集，再一次性写回，QUANT_ADDR 只是叠加的一个键，**不再有删东西的能力**。
-Set-ServiceEnvExtra $SvcNameQuant ((Get-BaseEnvExtra) + @("QUANT_ADDR=127.0.0.1:$ProbeQuantPort"))
+Set-ServiceEnvExtra $SvcNameQuant ((Get-BaseEnvExtra) + @("QUANT_ADDR=127.0.0.1:$ProbeQuantPort", "SETUP_TOKEN=$SetupTokenResolved"))
 if (-not $HithinkResolved) {
     Warn "HITHINK_FINANCE_API_KEY 三处来源（参数/密钥文件/机器级环境变量）都没取到：交易日历将按周末口径兜底（法定节假日会误判为交易日），尾部键名断言会判红"
 }
@@ -369,8 +400,11 @@ if (Test-Path $prune) {
 #   所以 LLM 只断言「有可用来源」：env 键名在位 **或** auth.json 里存在非空 llm_api_key(s)。
 #   HITHINK_FINANCE_API_KEY 不同——它**只有 env 这一条路**（internal/data/hithink.go:29 只认环境变量），
 #   机器级环境变量也算（NSSM 服务继承机器级），故仍是硬要求。
+# §0926E2E-W2A：SETUP_TOKEN 进 quant 硬键不会造出"永久性假红"——它就是本脚本自己保底注入的
+#   （上一段：四源取不到即随机生成+落盘密钥文件），断言红了只可能意味着写入路径断了。
+#   quant-research 不服务 /setup，故不进它的必需键（把不该有的键写成要求＝自造假红，同上口径）。
 $envRequired = @{
-    "quant"          = @("TZ", "QUANT_DATA_DIR", "QUANT_ADDR", "HITHINK_FINANCE_API_KEY")
+    "quant"          = @("TZ", "QUANT_DATA_DIR", "QUANT_ADDR", "HITHINK_FINANCE_API_KEY", "SETUP_TOKEN")
     "quant-research" = @("TZ", "QUANT_DATA_DIR", "HITHINK_FINANCE_API_KEY")
 }
 # 判断 LLM 密钥是否已在权威源（①设置页保存）里落好：只看 configs[].key/value 是否为空，
@@ -416,6 +450,6 @@ if ($envMissing.Count -gt 0) {
           "验证命令（只看键名）：& `"$nssm`" get quant AppEnvironmentExtra")
     exit 1
 }
-Ok "服务 env 键名断言通过：quant 4 硬键 + quant-research 3 硬键在位，LLM 来源已确认（全程未回显任何值）"
+Ok "服务 env 键名断言通过：quant 5 硬键 + quant-research 3 硬键在位，LLM 来源已确认（全程未回显任何值）"
 
 Ok "engine services registered. Verify: Get-Service $SvcNameQuant,$SvcNameResearch,$SvcNamePydata ; schtasks /Query /TN $SvcTaskQmtctl ; 网关守护腿见 service_definitions.ps1（$SvcTaskGatewayEnsure/$SvcTaskGatewayLogon，register_service.ps1 注册）"

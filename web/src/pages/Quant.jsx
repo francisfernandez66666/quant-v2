@@ -6,7 +6,10 @@
 //          §0925EVE-W3-G（2026-09-25）：新增「待核对委托」卡——网关第三态人工改判（released/settled）
 //          的产品化出口（GET /api/qmt/pending-review + POST /api/qmt/order-confirm，均 admin+审计）。
 //          日终结算卡一键三方对账并回看差异历史——三者后端早已就绪，本轮补上前端入口。
-//          定时轮询：链路状态/当日委托 10s 一次、交易流水 30s 一次；配置修改提交后待交易时段生效。
+//          刷新策略（§0926E2E-17A 收编）：SSE 事件（qmt_report/real_order/qmt_halt/
+//          settlement_diff/positions_clear_guard）驱动即时刷新 + 四类定时器 60s 兜底轮询
+//          （对齐 §F5 统一口径，替代原 链路状态/当日委托 10s、交易流水 30s 高频轮）；
+//          配置修改提交后待交易时段生效。
 //          §M13（2026-09-22 修复批 K）：权限判定改走 api.isForbidden()（HTTP 状态码），
 //          且任一 admin 端点回 403 时立即停掉全部轮询定时器——成员停在本页不再持续刷 403 灌 opslog。
 // 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
@@ -15,6 +18,8 @@ import ToggleSw from '../components/ToggleSw'
 import FillAmendPanel from '../components/FillAmendPanel'
 import { Card, Form, Input, Button, Tag, Table, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
+// §0926E2E-17A：接入 §F5 事件总线，实盘链路 SSE 事件驱动本页即时刷新
+import { on as sseOn } from '../sseBus.js'
 import { confirmDialog } from '../ui.jsx'
 import { fmtCNY2 } from '../utils'
 import { verdictDisplay } from './quantVerdicts.js'
@@ -180,6 +185,8 @@ export default function Quant() {
 
   const stateTimer = useRef(null)  // 链路状态轮询定时器
   const tradesTimer = useRef(null) // 交易流水轮询定时器
+  // §0926E2E-17A：实盘链路 SSE 事件的取消订阅句柄（挂载注册、stopPolling/卸载回收）
+  const sseQmtUnsub = useRef(null)
 
   // §M-6（2026-09-22 修复批）轮询/在飞链失效标志：stopPolling() 过去只 clearInterval，
   // 管不住已经跑在半路的 promise 链——Quant.jsx loadTrades 是「trades → verdicts → risk/gates」
@@ -230,6 +237,9 @@ export default function Quant() {
         ref.current = null
       }
     }
+    // §0926E2E-17A：SSE 事件刷新同样是取数触发源——止血（403/卸载）时必须一并退订，
+    // 否则成员账号仍会因服务端事件回调去拉 admin 端点，绕开 §M13 的止血语义。
+    if (sseQmtUnsub.current) { sseQmtUnsub.current(); sseQmtUnsub.current = null }
   }
   // noteForbidden §M13/§A5：任一 admin 端点回 403 即认定当前会话无权限——停轮询 + 落无权限面板。
   // 判定一律走 api.isForbidden(e)（HTTP 状态码），不再用 e.message.indexOf('无权限')：
@@ -520,6 +530,9 @@ export default function Quant() {
   // 失败时除提示外，还回滚到后端真实配置——否则界面显示与实际不一致，
   // 刷新/切tab重新挂载后配置"跳回"，造成开关丢了的现象。
   async function patch(fields, okTip) {
+    // §0926E2E-17d：成员会话（forbidden 已由 403 锤实）不再向 admin 写端点发起保存——
+    // 控件同步已灰化，这里是逻辑层的第二道闸（防键盘可达/将来漏标的调用点）。
+    if (forbidden) { MessagePlugin.warning(ADMIN_ONLY_HINT); return }
     setSaving(true)
     try {
       await api.updateQMTConfig(fields)
@@ -601,8 +614,9 @@ export default function Quant() {
     )
   }
 
-  // 挂载副作用：依赖数组 []——仅在首次挂载执行一次，后续刷新全部由下方定时器驱动
-  // （链路状态/委托 10s、流水 30s）；卸载时统一清除定时器，避免内存泄漏与重复请求。
+  // 挂载副作用：依赖数组 []——仅在首次挂载执行一次，后续刷新由下方兜底定时器 + SSE 事件
+  // 双通道驱动（四类定时器 60s 兜底、qmt_report 等事件即时刷新，§0926E2E-17A）；
+  // 卸载时统一清除，避免内存泄漏与重复请求。
   // 配置加载失败在调用处 catch 提示，不阻塞轮询。
   // §M13 补充：forbidden 语义由 noteForbidden() 在任一 admin 端点回 403 时触发——
   // 它会调用与卸载清理同一个 stopPolling()，所以"成员停在页面被 403 灌 opslog"这条路被掐断；
@@ -621,19 +635,30 @@ export default function Quant() {
     // halts polling; any non-403 error still degrades silently and cannot fake "forbidden".
     api.fetchShortStatus().then((r) => { if (!pollingDeadRef.current) setShortEnabled(!!r.short_enabled) }).catch((e) => { noteForbidden(e) })
     api.fetchPaperState().then((r) => { if (!pollingDeadRef.current) setShortPoolOn(!!(r.short_book && r.short_book.enabled)) }).catch((e) => { noteForbidden(e) })
-    // 链路状态每 10s 轮询一次（心跳/延迟/熔断实时性要求高）
-    stateTimer.current = setInterval(loadState, 10000)
-    // §U-2 当日委托随链路状态同频轮询（在途单状态推进/撤单后回显）
+    // 链路状态兜底轮询：§0926E2E-17A 由 10s 对齐 §F5 的 60s 统一口径；
+    // 心跳/熔断的实时诉求由下方 qmt_halt/qmt_report 等 SSE 事件即时刷新承接，不再靠高频轮。
+    stateTimer.current = setInterval(loadState, 60000)
+    // §U-2 当日委托：同口径 10s→60s 兜底；在途单状态推进的即时性走 SSE qmt_report/real_order。
     loadOrders()
-    ordersTimer.current = setInterval(loadOrders, 10000)
-    // §0925EVE-W3-G 待核对清单 30s 轮询（第三态收敛是人工作业，低频即可；见 pendingTimer 注释）
+    ordersTimer.current = setInterval(loadOrders, 60000)
+    // §0925EVE-W3-G 待核对清单：30s→60s（第三态人工改判本属低频作业，§0926E2E-17A 统一口径）
     loadPendingReview()
-    pendingTimer.current = setInterval(loadPendingReview, 30000)
+    pendingTimer.current = setInterval(loadPendingReview, 60000)
     loadSettleHistory()
     loadBroker()
     loadTrades()
-    // 交易流水每 30s 轮询一次（成交频率低，降低刷新压力）
-    tradesTimer.current = setInterval(loadTrades, 30000)
+    // 交易流水兜底轮询：30s→60s；成交回报到达即经 SSE qmt_report 刷新
+    tradesTimer.current = setInterval(loadTrades, 60000)
+    // §0926E2E-17A：订阅实盘链路 SSE 事件（internal/server/qmt.go 早已对当前账号定向广播，
+    // 前端此前零消费，只能靠 10s 轮询间接感知——与 §UAT-D1 收敛资损事件同族，这次补数据面）。
+    // 任一大类回报/熔断/对账差异/清空守卫事件到达：四路数据一起刷（低频事件，代价可忽略）。
+    sseQmtUnsub.current = sseOn(
+      ['qmt_report', 'real_order', 'qmt_halt', 'settlement_diff', 'positions_clear_guard'],
+      () => {
+        if (pollingDeadRef.current) return // §M13 止血后事件回调也不得再拉 admin 端点
+        loadState(); loadOrders(); loadPendingReview(); loadTrades()
+      },
+    )
     loadConfig().catch((e) => MessagePlugin.error('加载实盘配置失败：' + (e && e.message ? e.message : e)))
     // 卸载时清除定时器，防止内存泄漏与重复请求（§M13：与 forbidden 停用共用同一清理函数）
     return () => { stopPolling() }
@@ -648,6 +673,18 @@ export default function Quant() {
     background: active ? 'var(--td-brand-color)' : 'transparent',
     fontWeight: active ? 600 : 400,
   })
+
+  // §0926E2E-17d 成员可见 admin 入口灰化：本页写侧端点全在 adminMiddleware 下，
+  // 成员会话（noteForbidden 已被任一 403 置位 forbidden）此前仍能看到可点的开关与保存按钮——
+  // 点了必 403（§M13 会止血，但"能点却必失败"本身就是缺陷，审计报告 §五-17 灰化条点名）。
+  // 灰化≠删除：入口尺寸原样保留（读面板照常），只是按已锤实的 403 证据禁用并给出 tooltip 原因；
+  // 管理员会话 forbidden 恒 false，一切行为与改前逐字节一致。
+  const ADMIN_ONLY_HINT = '仅管理员可操作：当前账号对这些端点无权限（403）'
+  const forbiddenHintProps = forbidden
+    ? { disabled: true, title: ADMIN_ONLY_HINT, style: { opacity: 0.5, cursor: 'not-allowed' } }
+    : {}
+  // segBtnForbidden 给分段切换（span 形态按钮）用的样式补丁：禁指针+半透明，onClick 侧另有早退守卫。
+  const segBtnForbiddenPatch = forbidden ? { pointerEvents: 'none', opacity: 0.5 } : {}
 
   // 分战法盈亏表列定义：realized_pnl 按涨跌配色渲染
   const byStrategyColumns = [
@@ -705,7 +742,7 @@ export default function Quant() {
         {syncing ? (
           <span style={{ fontSize: 13, color: 'var(--app-muted-2)' }}>同步中…</span>
         ) : (
-          <ToggleSw checked={form.enabled} onChange={(v) => { setFormUser({ ...form, enabled: v }); saveSwitches(v) }} />
+          <ToggleSw checked={form.enabled} disabled={forbidden} onChange={(v) => { setFormUser({ ...form, enabled: v }); saveSwitches(v) }} />
         )}
         {/* 同步状态指示：红=加载失败（当前展示本地缓存），绿=已同步服务器 */}
         <span style={{ color: loadErr ? 'var(--app-up)' : 'var(--app-down)', fontSize: 11, marginLeft: 10 }}>
@@ -719,23 +756,23 @@ export default function Quant() {
     // 执行模式：手动确认（每单前端确认）或全自动（信号直接下单）
     const execMode = (
       <Form.FormItem label="执行模式">
-        <span style={segBtn(form.mode === 'manual')} onClick={() => saveMode('manual')}>手动确认</span>
-        <span style={segBtn(form.mode === 'auto')} onClick={() => saveMode('auto')}>全自动</span>
+        <span style={{ ...segBtn(form.mode === 'manual'), ...segBtnForbiddenPatch }} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => saveMode('manual')}>手动确认</span>
+        <span style={{ ...segBtn(form.mode === 'auto'), ...segBtnForbiddenPatch }} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => saveMode('auto')}>全自动</span>
         <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存；手动=每单前端确认；自动=信号直接下单</span>
       </Form.FormItem>
     )
     // 委托价格：对手价（市价）或限价
     const priceType = (
       <Form.FormItem label="委托价格">
-        <span style={segBtn(form.price_type === 'market')} onClick={() => savePriceType('market')}>对手价</span>
-        <span style={segBtn(form.price_type === 'limit')} onClick={() => savePriceType('limit')}>限价</span>
+        <span style={{ ...segBtn(form.price_type === 'market'), ...segBtnForbiddenPatch }} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => savePriceType('market')}>对手价</span>
+        <span style={{ ...segBtn(form.price_type === 'limit'), ...segBtnForbiddenPatch }} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => savePriceType('limit')}>限价</span>
         <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存</span>
       </Form.FormItem>
     )
     // 自动卖出：自动模式下止损/清仓级建议自动全仓卖出
     const autoSell = (
       <Form.FormItem label="自动卖出">
-        <ToggleSw checked={form.auto_sell} onChange={(v) => { setFormUser({ ...form, auto_sell: v }); saveAutoSell(v) }} />
+        <ToggleSw checked={form.auto_sell} disabled={forbidden} onChange={(v) => { setFormUser({ ...form, auto_sell: v }); saveAutoSell(v) }} />
         <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>自动模式下止损/清仓级建议自动全仓卖出；止盈/减仓保持提醒</span>
       </Form.FormItem>
     )
@@ -785,7 +822,7 @@ export default function Quant() {
     // 保存按钮
     const saveBtn = (
       <Form.FormItem>
-        <Button theme="primary" onClick={saveExec} loading={saving}>保存网关参数</Button>
+        <Button theme="primary" onClick={saveExec} loading={saving} {...forbiddenHintProps}>保存网关参数</Button>
       </Form.FormItem>
     )
     return (
@@ -967,7 +1004,7 @@ export default function Quant() {
     if (!state) {
       return (
         <Card title="链路状态" style={{ marginBottom: 14 }}>
-          <span style={{ fontSize: 13, color: 'var(--app-muted-2)' }}>链路状态加载中…（每 10s 轮询）</span>
+          <span style={{ fontSize: 13, color: 'var(--app-muted-2)' }}>链路状态加载中…（§0926E2E-17A：SSE 事件驱动 + 60s 兜底轮询）</span>
         </Card>
       )
     }
@@ -1017,8 +1054,8 @@ export default function Quant() {
       <span style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
         <Tag theme={active === 'xt' ? 'primary' : 'default'}>miniQMT兼容{broker && broker.xt_connected ? ' ●' : ' ○'}</Tag>
         <Tag theme={active === 'queued' ? 'primary' : 'default'}>QMT桥兜底{broker && broker.queued_connected ? ' ●' : ' ○'}</Tag>
-        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'xt'} onClick={() => switchBrokerTo('xt')}>切到 miniQMT</Button>
-        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'queued'} onClick={() => switchBrokerTo('queued')}>切到 QMT桥</Button>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'xt' || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => switchBrokerTo('xt')}>切到 miniQMT</Button>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'queued' || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => switchBrokerTo('queued')}>切到 QMT桥</Button>
         <span style={{ color: 'var(--app-text-2)' }}>当前：{active === 'queued' ? 'QMT桥兜底' : 'miniQMT兼容'}</span>
       </span>
     )
@@ -1049,8 +1086,10 @@ export default function Quant() {
             size="xs" variant="outline"
             theme={halted ? 'success' : 'danger'}
             loading={killBusy}
+            disabled={forbidden}
+            title={forbidden ? ADMIN_ONLY_HINT : undefined}
             onClick={toggleKillSwitch}
-            style={{ marginLeft: 10 }}
+            style={{ marginLeft: 10, ...(forbidden ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
           >
             {halted ? '解除停止' : '紧急停止'}
           </Button>
@@ -1087,7 +1126,7 @@ export default function Quant() {
         // 操作列：仅在可撤状态（CANCELABLE）显示撤单按钮，终态显示占位"—"
         colKey: 'op', title: '操作', width: 90,
         cell: ({ row }) => (CANCELABLE.has(row.status)
-          ? <Button size="xs" variant="outline" theme="danger" onClick={() => cancelOrder(row.order_id)}>撤单</Button>
+          ? <Button size="xs" variant="outline" theme="danger" disabled={forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => cancelOrder(row.order_id)}>撤单</Button>
           : <span style={{ color: 'var(--app-muted-2)', fontSize: 12 }}>—</span>),
       },
     ]
@@ -1135,8 +1174,8 @@ export default function Quant() {
         colKey: 'op', title: '人工处置', width: 220,
         cell: ({ row }) => (
           <div style={{ display: 'flex', gap: 6 }}>
-            <Button size="xs" variant="outline" theme="danger" disabled={confirmBusy} onClick={() => confirmPendingOrder(row, 'released')}>柜台无此单</Button>
-            <Button size="xs" variant="outline" theme="primary" disabled={confirmBusy} onClick={() => confirmPendingOrder(row, 'settled')}>柜台有此单</Button>
+            <Button size="xs" variant="outline" theme="danger" disabled={confirmBusy || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => confirmPendingOrder(row, 'released')}>柜台无此单</Button>
+            <Button size="xs" variant="outline" theme="primary" disabled={confirmBusy || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => confirmPendingOrder(row, 'settled')}>柜台有此单</Button>
           </div>
         ),
       },
@@ -1183,7 +1222,7 @@ export default function Quant() {
     return (
       <Card title="日终结算对账" style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
-          <Button size="small" theme="primary" variant="outline" loading={settleBusy} onClick={() => runSettle('report_only')}>立即对账</Button>
+          <Button size="small" theme="primary" variant="outline" loading={settleBusy} disabled={forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => runSettle('report_only')}>立即对账</Button>
           <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>拉券商交割单与本地委托/成交三方比对，差异自动 P1 告警（休市/盘后运行最佳）</span>
         </div>
         {/* 最近一次对账结果摘要：本地缺失/多余/不符笔数 + 费用差与现金差 */}
@@ -1250,7 +1289,7 @@ export default function Quant() {
       <Card title="仓位纪律" style={{ marginBottom: 14 }}>
         {renderPositionDiscipline()}
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
-          <Button theme="primary" onClick={saveCaps} loading={saving}>保存仓位纪律</Button>
+          <Button theme="primary" onClick={saveCaps} loading={saving} {...forbiddenHintProps}>保存仓位纪律</Button>
         </div>
       </Card>
 
@@ -1260,7 +1299,7 @@ export default function Quant() {
         {renderStrategyGroups()}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'flex-end', marginTop: 10 }}>
           <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>{strategyHint} · 仓位留空/0 = 使用全局单票金额</span>
-          <Button theme="primary" disabled={!strategyDirty || saving} onClick={saveStrategies}>
+          <Button theme="primary" disabled={!strategyDirty || saving || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={saveStrategies}>
             {saving ? '保存中…' : (strategyDirty ? '保存战法开关 *' : '已同步')}
           </Button>
         </div>
@@ -1304,6 +1343,15 @@ export default function Quant() {
           <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 8 }}>
             下单前最后防线（ST/黑名单/单笔帽/T+1/涨跌停/陈旧价/日亏/集中度/买法纪律/战法准入/持仓数）当日命中记录 · {riskGates.day} {riskGates.time}
           </div>
+          {/* §0926E2E-4B 缺配置告警条：六闸默认关是 owner 裁决（出厂开闸会在存量账号产生新拒单），
+              但"一条都没配"的裸奔状态必须一屏可见。只信后端 gates_config_unset（生效配置判定），
+              不在前端复制判定逻辑（口径漂移先例：白名单显示名比对失配）。 */}
+          {riskGates.gates_config_unset && (
+            <div style={{ background: 'rgba(227,119,0,0.12)', border: '1px solid rgba(227,119,0,0.45)', color: 'var(--app-text-1)', borderRadius: 4, padding: '8px 10px', marginBottom: 8, fontSize: 12 }}>
+              ⚠ 该账号六道默认关风控闸（日亏熔断/单票集中度/陈旧价/涨停追买/单笔金额帽/价格复核）全部未配置——
+              新委托只受常开硬闸（跌停追卖/黑名单/笔数预算等）约束。建议按 docs/RUNBOOK_QMT_DAILY.md §4.3 评估开闸；保持默认关同样是有效决策，此条仅确认你知情。
+            </div>
+          )}
           {/* 闸口开关状态标签组：any_enabled 为主开关（蓝/灰），其余开=绿、关=灰 */}
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
             {Object.entries(riskGates.switches || {}).map(([k, v]) => (

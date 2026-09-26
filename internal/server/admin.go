@@ -77,7 +77,13 @@ func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DryRun bool `json:"dry_run"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// §0926E2E-W1D：旧写法 `_ = Decode(&req)` 把畸形 JSON 解析成零值继续**删号**——
+	// 想带 dry_run:true 预览的调用只要请求体坏一个括号，就静默变成真实批量删除。
+	// 现口径：空体=合法缺省（dry_run=false）；非法 JSON→400 中止。
+	if err := decodeOptJSON(r, &req); err != nil {
+		writeError(w, 400, "invalid request body: "+err.Error())
+		return
+	}
 	now := time.Now().Unix()
 	type cleaned struct {
 		ID       string `json:"id"`
@@ -111,7 +117,7 @@ func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, cleaned{ID: u.ID, Username: u.Username, Reason: reason})
 	}
-	opslog.Audit("user_cleanup", userFromContext(r).ID, "users", fmt.Sprintf("dry_run=%v count=%d", req.DryRun, len(out)))
+	opslog.Audit("user_cleanup", auditActorID(r), "users", fmt.Sprintf("dry_run=%v count=%d", req.DryRun, len(out))) // §0926E2E-W1D：nil-safe 取主体
 	writeJSON(w, 200, map[string]interface{}{"deleted": out, "count": len(out), "dry_run": req.DryRun})
 }
 
@@ -379,7 +385,12 @@ func (s *Server) handleAdminSetStrategyConfig(w http.ResponseWriter, r *http.Req
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.cfg.SetStrategyConfigFor(id, &cfg)
+	// §0926E2E-W1B：持久化失败（含写后复读不匹配）如实回 500，不再"只 log 照回 200"。
+	if err := s.cfg.SetStrategyConfigFor(id, &cfg); err != nil {
+		log.Printf("[admin] 用户 %s 战法参数保存失败: %v", id, err)
+		writeError(w, 500, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
+		return
+	}
 	log.Printf("[admin] 用户 %s 战法参数已保存", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -416,7 +427,12 @@ func (s *Server) handleAdminSetD1Config(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.cfg.SetD1ConfigFor(id, &cfg)
+	// §0926E2E-W1B：持久化失败（含写后复读不匹配）如实回 500。
+	if err := s.cfg.SetD1ConfigFor(id, &cfg); err != nil {
+		log.Printf("[admin] 用户 %s D1 规则保存失败: %v", id, err)
+		writeError(w, 500, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
+		return
+	}
 	log.Printf("[admin] 用户 %s D1 规则已保存", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -453,7 +469,12 @@ func (s *Server) handleAdminSetLongShortConfig(w http.ResponseWriter, r *http.Re
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.cfg.SetLongShortConfigFor(id, cfg)
+	// §0926E2E-W1B：持久化失败（含写后复读不匹配）如实回 500。
+	if err := s.cfg.SetLongShortConfigFor(id, cfg); err != nil {
+		log.Printf("[admin] 用户 %s 做多/做空开关保存失败: %v", id, err)
+		writeError(w, 500, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
+		return
+	}
 	log.Printf("[admin] 用户 %s 做多/做空开关已保存", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
