@@ -4130,5 +4130,136 @@ else
 fi
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# §102 §QMT-TOKENROT-CLI（2026-09-26，owner 令「门禁和规则摸牌后，你来补上网关口令令牌」）：
+# 轮换从「等 owner 手跑」收编成 Mac 侧正规通道 scripts/rotate_qmt_token_guangzhou.sh。
+# 这条通道**会写现网鉴权面**（源1 网关配置文件 + 源2 服务 env 冗余腿），三条口径逐条有锁：
+# ① 缺省零连接预览（离网真跑必须 exit 0 且回显 ROTATE_PLAN——连不上生产也照样出计划，
+#    与 §101「连不上必停」互为镜像：预览本来就不该连）；-Bogus/双开关必须退 2；
+#    离网 -DryRun/-Apply 必须非 0 停在预探测，**任何判定行都不许出现**（假绿反证）。
+# ② 密钥纪律成码：驱动内必须有 40+hex 明文闸（固定串锁），且**不骑 admin 会话**
+#    （admin_session_token 零引用负锁——轮换写侧全在服务器本地，压根不需要设置页凭据）；
+#    判定行锚点与 ps1 侧**两侧同源**（驱动认的三行＝ps1 真写的三行，改一边即红）。
+# ③ 现网脚本落点路径锁（§ENH-5 形态：仓库里有、现网也必须在那个路径有）。
+# 全部判据＝静态 grep -F + 离网一次性真跑（TEST-NET 假 IP，BatchMode 预探测必失败，
+# 零凭据零写入；每跑 ≤10s 超时，整段增时约半分钟）。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 102 §QMT-TOKENROT-CLI 网关口令轮换正规通道（2026-09-26 owner 令收编）..."
+RT_ERRS=""
+rt_chk() { if [ "$2" != "$3" ]; then RT_ERRS="${RT_ERRS}
+  · $1（读到 ${2}，应为 ${3}）"; fi; }
+rt_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then RT_ERRS="${RT_ERRS}
+  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+rt_absent() { if [ "${2:-0}" -ne "0" ]; then RT_ERRS="${RT_ERRS}
+  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+
+RT_SCR=scripts/rotate_qmt_token_guangzhou.sh
+RT_PS1=deploy/qmt-win/rotate_qmt_token.ps1
+RT_SY=0; bash -n "$RT_SCR" 2>/dev/null || RT_SY=$?
+rt_chk "驱动脚本语法自检 bash -n" "$RT_SY" "0"
+# §89 自指锁（09-26 实录：`cmd; rc=$?` 裸跑在 set -euo pipefail 下让整轮 verify 无 FAIL 无 ok
+# 静默中止，exit 2 连红单都不留）：五处预期失败的反证子进程必须全部写成 `|| RT_XX=$?` 收码。
+rt_chk "反证裸跑形态清零（`; 收码` 前缀直连 RT_XX=$ 的写法必须不存在，§89 同族自指）" "$(grep -Ec '; RT_(PV|BG|MX|DR|AP)=[$]' scripts/verify_changes.sh || true)" "0"
+rt_min "五处反证全部 RT_XX=0; 收码起跑（行首锚定 ≥5，PV/BG/MX/DR/AP 各一）" "$(grep -Ec '^RT_(PV|BG|MX|DR|AP)=0; GZ_IP=203' scripts/verify_changes.sh || true)" "5"
+rt_min "五处收码尾巴在位（|| 直连 RT_XX= 计数 ≥5，缺一个即该处会静默杀父）" "$(grep -Ec '[|][|] RT_(PV|BG|MX|DR|AP)=' scripts/verify_changes.sh || true)" "5"
+
+# ── ② 静态：缺省方向 / 明文闸 / 凭据负锁 / 两侧同源 ──
+rt_chk "缺省零连接预览判定名恰 1（ROTATE_PLAN connect=0）" "$(grep -Fc 'mode=preview connect=0' "$RT_SCR" || true)" "1"
+rt_chk "干跑成功判定名恰 1（ROTATE_READOUT）" "$(grep -Fc 'ROTATE_READOUT ok' "$RT_SCR" || true)" "1"
+rt_chk "轮换成功判定名恰 1（ROTATE_APPLIED）" "$(grep -Fc 'ROTATE_APPLIED token_fp=' "$RT_SCR" || true)" "1"
+rt_chk "40+hex 明文闸固定串在位恰 1（值不该到过打印层，出现即停手 exit 4）" "$(grep -Fc '[0-9a-f]{40,}' "$RT_SCR" || true)" "1"
+rt_absent "驱动不骑 admin 会话（admin_session_token 零引用——轮换写侧走服务器本地，不新增凭据面）" "$(grep -Fc 'admin_session_token' "$RT_SCR" || true)"
+rt_absent "驱动不自读网关配置文件内容（Get-Content 零命中——值只在 ps1 函数栈里过）" "$(grep -Fc 'Get-Content' "$RT_SCR" || true)"
+rt_chk "现网脚本落点路径锁（deploy 清单同一落点，§ENH-5 防"仓库有现网没"）" "$(grep -Fc 'ROTATE_PS1:-C:/opt/quant/qmt-win/rotate_qmt_token.ps1' "$RT_SCR" || true)" "1"
+rt_min "解析远端回传前去 CR（§CRLF 同课，≥2 处）" "$(grep -c "tr -d '\\\\r'" "$RT_SCR" || true)" "2"
+# 两侧同源：驱动认的三条判定行必须真是 ps1 写出来的那三行（改 ps1 文案不同步驱动＝红）。
+rt_min "ps1 侧判定行「config_file written token_fp=」在位" "$(grep -Fc 'config_file written token_fp=' "$RT_PS1" || true)" "1"
+rt_min "ps1 侧判定行「read-back confirmed」在位" "$(grep -Fc 'read-back confirmed' "$RT_PS1" || true)" "1"
+rt_min "ps1 侧判定行「self-check(a) gateway file source CONFIRMED」在位" "$(grep -Fc 'self-check(a) gateway file source CONFIRMED' "$RT_PS1" || true)" "1"
+# [2b] 现网脚本对齐腿（2026-09-26 实录：`-s` 部署不重传 ps1，现网停在带语法坏行的旧版，
+# 干跑首跑远端 ParserError 才暴露）——通道必须先比对再执行，判据三处同源锁：
+rt_chk "对齐成功判定名恰 1（ROTATE_PS1_SYNCED，只在真覆盖后出现）" "$(grep -Fc 'ROTATE_PS1_SYNCED' "$RT_SCR" || true)" "1"
+rt_min "远端指纹读法走 Get-FileHash（不回显全 64 位，管道内截 12 位前缀）" "$(grep -Fc 'Get-FileHash' "$RT_SCR" || true)" "1"
+rt_min "覆盖前远端必落 .stale 时间戳副本（备份不成就不覆盖）" "$(grep -Fc '.stale-' "$RT_SCR" || true)" "1"
+# 09-26 真跑锤实的两处判据修复（两轮 -Apply 都被"写侧成功、自证假红"拦停）：
+# ①NSSM 真存储走 Services\<svc>\Parameters 两级路径；②`return ,$list` 穿 @(func) 落嵌套数组，
+#   调用侧必须 Flatten-EnvPairs 展平——定义 1 + 调用 3（src 读/并集/写回读）＝4 处，少一处即漏网。
+RT_REG=deploy/qmt-win/register_engine_services.ps1
+rt_chk "rotate ps1 Flatten-EnvPairs 在位恰 4（定义+三调用点全展平，漏一个＝§N-5 并集洗键复发）" "$(grep -Fc 'Flatten-EnvPairs' "$RT_PS1" || true)" "4"
+rt_chk "rotate ps1 读法覆盖 Parameters 真存储路径恰 2（函数+诊断各一处）" "$(grep -Fc '"\Parameters"' "$RT_PS1" || true)" "2"
+rt_min "register ps1 同步同款展平（定义+两调用点 ≥3，否则重跑注册会静默丢现值键）" "$(grep -Fc 'Flatten-EnvPairs' "$RT_REG" || true)" "3"
+rt_min "register ps1 读法同步覆盖 Parameters 路径（≥1）" "$(grep -Fc '"\Parameters"' "$RT_REG" || true)" "1"
+# ③括号/花括号平衡机器锁：09-23 写下的 186 行坏语法潜伏三天、现网首跑才 ParserError——
+# 仓内没有真 PS 解析器，用反引号/引号/注释感知的词法扫描顶替，两份 ps1 必须归零且无下溢。
+RT_BAL="$(python3 - "$RT_PS1" "$RT_REG" <<'PY'
+import sys
+ok = True
+for path in sys.argv[1:]:
+    src = open(path, encoding='utf-8-sig').read()
+    i, n = 0, len(src)
+    dp = db = 0; under = 0
+    while i < n:
+        c = src[i]
+        if c == '#':
+            j = src.find('\n', i); i = n if j < 0 else j; continue
+        if c == "'":
+            j = i + 1
+            while j < n and src[j] != "'": j += 1
+            i = j + 1; continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if src[j] == '`': j += 2; continue
+                if src[j] == '"': break
+                j += 1
+            i = j + 1; continue
+        if c == '`': i += 2; continue
+        if c == '$' and i + 1 < n and src[i+1] == '(': dp += 1; i += 2; continue
+        if c == '(': dp += 1
+        elif c == ')':
+            dp -= 1
+            if dp < 0: under = 1
+        elif c == '{': db += 1
+        elif c == '}':
+            db -= 1
+            if db < 0: under = 1
+        i += 1
+    if dp != 0 or db != 0 or under: ok = False
+print('PASS' if ok else 'FAIL')
+PY
+)" 2>/dev/null || RT_BAL="FAIL"
+rt_chk "两份 ps1 括号平衡词法扫描（防 09-23 潜伏坏行复发：仓内无 PS 解析器，首跑=现网炸）" "$RT_BAL" "PASS"
+
+# ── ① 离网真跑反证（TEST-NET 假 IP，绝不触生产）──
+# ⚠ §89 同族坑实录（09-26 首跑）：本脚本开头开着 `set -euo pipefail`，`cmd; rc=$?` 形态在
+#    cmd 预期非 0（反证要它失败）时会先杀死父 shell——整轮 verify 无 FAIL 无 ok 静默中止。
+#    正解＝`rc=0; cmd || rc=$?`（成功时 rc 保持 0，失败时收码断言）。
+RT_TMP="$(mktemp -d /tmp/verify102_XXXXXX)"
+RT_PV=0; GZ_IP=203.0.113.7 bash "$RT_SCR" > "$RT_TMP/plan.out" 2>&1 || RT_PV=$?
+rt_chk "缺省预览离网必须 exit 0（预览态不连生产是设计，不是没测到）" "$RT_PV" "0"
+rt_chk "预览回显计划判定行" "$(grep -Fc 'ROTATE_PLAN mode=preview connect=0' "$RT_TMP/plan.out" || true)" "1"
+rt_absent "预览态不得出现任何连接脚印（通道可用＝连过了）" "$(grep -Fc '通道可用' "$RT_TMP/plan.out" || true)"
+RT_BG=0; GZ_IP=203.0.113.7 bash "$RT_SCR" -Bogus > "$RT_TMP/bogus.out" 2>&1 || RT_BG=$?
+rt_chk "未知参数必须退 2（缺省方向不靠猜）" "$RT_BG" "2"
+RT_MX=0; GZ_IP=203.0.113.7 bash "$RT_SCR" -DryRun -Apply >/dev/null 2>&1 || RT_MX=$?
+rt_chk "双开关互斥必须退 2（与 ps1 同规）" "$RT_MX" "2"
+RT_DR=0; GZ_IP=203.0.113.7 bash "$RT_SCR" -DryRun > "$RT_TMP/dr.out" 2>&1 || RT_DR=$?
+rt_chk "离网干跑必须非 0（连不上就绝不自称读数完整）" "$([ "$RT_DR" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+rt_absent "离网干跑不许出现任何读数判定行" "$(grep -Fc 'ROTATE_READOUT' "$RT_TMP/dr.out" || true)"
+RT_AP=0; GZ_IP=203.0.113.7 bash "$RT_SCR" -Apply > "$RT_TMP/ap.out" 2>&1 || RT_AP=$?
+rt_chk "离网轮换必须非 0（预探测拦停）" "$([ "$RT_AP" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+rt_absent "离网轮换不许出现写入判定行（写入口径只在远端真跑后出现）" "$(grep -Fc 'ROTATE_APPLIED' "$RT_TMP/ap.out" || true)"
+rt_absent "离网任何一轮都不许出现现网 ps1 的 src 读数行（防「假 IP 连真机」串台）" "$(grep -Fc '[rot] src1' "$RT_TMP/dr.out" || true)"
+rt_absent "离网干跑不许出现对齐同步判定行（预探测拦停，[2b] 不该被走到）" "$(grep -Fc 'ROTATE_PS1_SYNCED' "$RT_TMP/dr.out" || true)"
+rt_absent "离网轮换不许出现对齐同步判定行（同上——没连上就一条都不许写）" "$(grep -Fc 'ROTATE_PS1_SYNCED' "$RT_TMP/ap.out" || true)"
+rm -rf "$RT_TMP"
+
+if [ -z "$RT_ERRS" ]; then
+	echo "ok - §QMT-TOKENROT-CLI 守卫通过（静态锁 21 + 两侧同源 3 + 离网反证 10）"
+else
+	echo "--- FAIL: §102 断言不符:${RT_ERRS}"
+	exit 1
+fi
+
 echo ""
 echo "==> 全部通过"

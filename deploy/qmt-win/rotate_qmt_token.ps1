@@ -116,15 +116,26 @@ Info ("src1 config_file   token=" + (FpLabel([string]$cfg.token)) + " report_tok
 # 形状复刻 register_engine_services.ps1:Get-ExistingEnvExtra —— 唯一允许的 env 读取口径。
 function Get-ExistingEnvExtra([string]$svc) {
     $list = @()
-    try {
-        $key = Get-Item -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svc) -ErrorAction Stop
-        $vals = $key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-        foreach ($v in @($vals)) {
-            $t = ("$v").Trim()
-            if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $list += $t }
-        }
-    } catch { $list = @() }
-    if ($list.Count -gt 0) { return ,$list }
+    # §0926-ROT 实锤（09-26 休市日轮换实录）：本机 NSSM 把 AppEnvironmentExtra 存在
+    # Services\<svc>\Parameters 子键，Services\<svc> 本级读恒空——旧版只读本级，写后回读
+    # 跌进 nssm 文本兜底、条目被空格并成一行，指纹必然对不上（明明写成功却判红的假红）。
+    # 修法=按运行时真实取值链直读两级路径（本级在前保持兼容，Parameters 补上），仍只收 KEY= 形。
+    foreach ($rk in @(("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svc),
+                      ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svc + "\Parameters"))) {
+        try {
+            $key = Get-Item -LiteralPath $rk -ErrorAction Stop
+            $vals = $key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            foreach ($v in @($vals)) {
+                $t = ("$v").Trim()
+                if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=' -and -not ($list -contains $t)) { $list += $t }
+            }
+        } catch { }
+    }
+    if ($list.Count -gt 0) {
+        Info ("envfn direct n=" + $list.Count + " keys=" + (($list | ForEach-Object { $_.Substring(0, $_.IndexOf('=')) }) -join ","))
+        return ,$list
+    }
+    Info "envfn direct EMPTY -> nssm-text fallback"
     # 兜底：仅当注册表读不到才走 nssm 文本（先按 ≥2 连续 NUL 认条目边界，再清单 NUL——顺序反了
     # 就会把 UTF-16 解码残留的每字符劈开，09-23 实录已锤死）。
     $r = Invoke-Native -Exe $nssm -CmdArgs @("get", $svc, "AppEnvironmentExtra")
@@ -144,7 +155,17 @@ function Get-EnvVal([string[]]$pairs, [string]$key) {
     }
     return ""
 }
-$envPairs = @(Get-ExistingEnvExtra $ServiceName)
+# §0926-ROT 调用侧展平（09-26 休市日轮换实录）：函数内 `envfn direct n=2` 打印的是**函数栈里**
+# 的真实形态，穿到调用方 `@(func)` 后在本机 PS 5.1 上落回单元素嵌套数组（.Count=1，
+# ("$整串") 字符串化后取 '=' 得"全并串"）——写侧两条干净的 64 位条目就这样被自证读成假红，
+# 两轮 -Apply 全被读回腿拦停。修法不赌管道解卷语义：foreach **语句**逐层剥（嵌套形态下
+# $raw 的唯一元素就是 string[]，@($x) 再展开），两种落地形态一律收敛成一维 KEY= 串数组。
+function Flatten-EnvPairs($raw) {
+    $flat = @()
+    foreach ($x in @($raw)) { foreach ($y in @($x)) { $t = ("$y").Trim(); if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $flat += $t } } }
+    return $flat
+}
+$envPairs = Flatten-EnvPairs @(Get-ExistingEnvExtra $ServiceName)
 $envToken = Get-EnvVal $envPairs "QUANT_GATEWAY_TOKEN"
 $envReport = Get-EnvVal $envPairs "QUANT_GATEWAY_REPORT_TOKEN"
 # §C7-OPS②：如实标注——这条 env 腿对网关进程只是冗余。网关由交互会话计划任务拉起，
@@ -162,6 +183,32 @@ if (Test-Path $engPath) {
     } catch { }
 }
 Info ("src3 engine_cfg    rules.qmt.token=" + (FpLabel $engToken) + " (权威写入方＝设置页，本脚本不写)")
+
+# ── [诊断] §0926-ROT：env 腿写后读回 mismatch 的结构取证（纯注册表直读、只报计数/键名/读法，
+# 零值外泄）。两个疑点一次拆掉：①NSSM 可能把参数写在 Services\<svc>\Parameters 子键（两份路径
+# 哪份有值、各几条）；②REG_MULTI_SZ 的条目劈分实况（几条能过 KEY= 形、几条过不了）。
+# 这腿对网关本是冗余（§C7-OPS②），但写侧"自证读不到"和"真没写"必须区分开——判据本身先可信。
+foreach ($diagPath in @(("HKLM:\SYSTEM\CurrentControlSet\Services\" + $ServiceName),
+                        ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $ServiceName + "\Parameters"))) {
+    $dv = $null; $dErr = ""
+    try {
+        $dk = Get-Item -LiteralPath $diagPath -ErrorAction Stop
+        $dv = $dk.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } catch { $dErr = $_.Exception.GetType().Name }
+    $dRaw = if ($null -eq $dv) { 0 } elseif ($dv -is [string[]]) { @($dv).Count } else { 1 }
+    $dMatched = @()
+    foreach ($e in @($dv)) { $t = ("$e").Trim(); if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $dMatched += $t.Substring(0, $t.IndexOf('=')) } }
+    Info ("envdiag path=" + $diagPath + " exists=" + (Test-Path $diagPath) + " entries=" + $dRaw + " matchedkeys=" + (($dMatched | Sort-Object) -join ",") + " err=" + $dErr)
+    # 逐条目形状（键名+值长度是元数据，可打；值本体绝不打——09-26 实录：union 读错路径把
+    # 现值并丢了，必须看清每条边界才能定修法）。
+    $di = 0
+    foreach ($e in $(if ($null -eq $dv) { @() } else { @($dv) })) {
+        $t = ("$e").Trim(); $eqi = $t.IndexOf('=')
+        $nm = if ($eqi -gt 0 -and $t.Substring(0, $eqi) -match '^[A-Za-z_][A-Za-z0-9_]*$') { $t.Substring(0, $eqi) } else { "(unnamed:" + $t.Substring(0, [Math]::Min(3, $t.Length)) + ")" }
+        Info ("envdiag entry[" + $di + "] key=" + $nm + " vlen=" + [Math]::Max(0, $t.Length - $eqi - 1))
+        $di++
+    }
+}
 
 $brToken = ""
 try {
@@ -183,7 +230,7 @@ if (-not $brToken) {
         } catch { }
     }
 }
-Info ("src4 bridge        token=" + $(if ($brToken -and $brToken -notmatch '^\(') { FpLabel $brToken } else { ($(if ($brToken) { $brToken } else { "not-found(桥未在跑且无 config.bridge.json)")) }) + " (人工步，本脚本不写)")
+Info ("src4 bridge        token=" + $(if ($brToken -and $brToken -notmatch '^\(') { FpLabel $brToken } else { ($(if ($brToken) { $brToken } else { "not-found(桥未在跑且无 config.bridge.json)"})) }) + " (人工步，本脚本不写)")
 
 # ── 2. 新 token 与指纹计划 ────────────────────────────────────────────────
 # 任务要求用 [Security.Cryptography.RandomNumberGenerator]（不点名旧 RNGCryptoServiceProvider）。
@@ -215,7 +262,7 @@ Ok ("config_file written token_fp=" + $newFp + " report_token_fp=" + $newFp)
 function Set-ServiceEnvExtra([string]$svc, [string[]]$desired) {
     $order = New-Object 'System.Collections.Generic.List[string]'
     $map = New-Object 'System.Collections.Generic.Dictionary[string,string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($kv in (@(Get-ExistingEnvExtra $svc) + @($desired))) {
+    foreach ($kv in ((Flatten-EnvPairs @(Get-ExistingEnvExtra $svc)) + @($desired))) {
         if (-not $kv) { continue }
         $i = $kv.IndexOf('=')
         if ($i -lt 1) { continue }
@@ -235,7 +282,7 @@ Set-ServiceEnvExtra $ServiceName @("QUANT_GATEWAY_TOKEN=$newToken", "QUANT_GATEW
 # 写后读回自证（同一注册表口径；只比指纹，不比明文、不打明文）。
 # ⚠ §C7-OPS：这只是**冗余腿自身**的写入确认（回读＝自己刚写的地方，证明不了网关吃到）——
 #   网关侧的自证在下面的 4b 段，以 4b 为准。
-$readBack = Get-EnvVal (@(Get-ExistingEnvExtra $ServiceName)) "QUANT_GATEWAY_TOKEN"
+$readBack = Get-EnvVal (Flatten-EnvPairs @(Get-ExistingEnvExtra $ServiceName)) "QUANT_GATEWAY_TOKEN"
 if ((FpLabel $readBack) -ne $newFp) { Die "read-back mismatch: service env 未确认写入（检查 nssm/HKLM 权限）" }
 Ok "read-back confirmed via registry (fingerprint match only, value never printed)"
 

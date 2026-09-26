@@ -175,15 +175,22 @@ function Get-BaseEnvExtra {
 #   nssm get 仅留作注册表不可用时的兜底，且必须先"≥2 连续 NUL 视作条目分隔"再清单 NUL。
 function Get-ExistingEnvExtra([string]$svc) {
     $list = @()
-    try {
-        $key = Get-Item -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svc) -ErrorAction Stop
-        # DoNotExpandEnvironmentNames：值里若有 %VAR% 必须原样读回，否则写回时会被展开成固化值（静默改语义）。
-        $vals = $key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-        foreach ($v in @($vals)) {
-            $t = ("$v").Trim()
-            if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $list += $t }
-        }
-    } catch { $list = @() }
+    # §0926-ROT 同修（2026-09-26 轮换实录）：本机 NSSM 实际把 AppEnvironmentExtra 落在
+    # Services\<svc>\Parameters 子键（Services\<svc> 本级读恒空）。只读本级 ⇒ 并集写看不见
+    # 已存在的键（比如轮换刚写入的 QUANT_GATEWAY_*），重跑注册就会把它们静默删掉——
+    # 正是 §N-5 锤过的"少读一条＝删一键"借道复发。读法改成两级路径都收、按出现序去重。
+    foreach ($rk in @(("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svc),
+                      ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svc + "\Parameters"))) {
+        try {
+            $key = Get-Item -LiteralPath $rk -ErrorAction Stop
+            # DoNotExpandEnvironmentNames：值里若有 %VAR% 必须原样读回，否则写回时会被展开成固化值（静默改语义）。
+            $vals = $key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            foreach ($v in @($vals)) {
+                $t = ("$v").Trim()
+                if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=' -and -not ($list -contains $t)) { $list += $t }
+            }
+        } catch { }
+    }
     if ($list.Count -gt 0) { return ,$list }
     # 兜底：注册表读不到（极少见：服务名不符/权限）时才走 nssm 文本。
     $eapPrev = $ErrorActionPreference
@@ -202,6 +209,14 @@ function Get-ExistingEnvExtra([string]$svc) {
     }
     return ,$list
 }
+# §0926-ROT 同款展平（与 rotate_qmt_token.ps1 同批同因）：`return ,$list` 穿进 `@(func)` 会落成
+# 单元素嵌套数组——foreach 首元素拿到的是 string[]，IndexOf('=') 走 Array.IndexOf 恒 -1，
+# 现值键全被静默丢弃（union 写退化回"只写手头这份"，正是 §N-5 要根除的形态；尾部断言同理误报缺键）。
+function Flatten-EnvPairs($raw) {
+    $flat = @()
+    foreach ($x in @($raw)) { foreach ($y in @($x)) { $t = ("$y").Trim(); if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $flat += $t } } }
+    return $flat
+}
 
 # 服务级 env 的唯一写入点（verify 第 62 号锁的口径：AppEnvironmentExtra 的 set 必须经这里，
 # 且实参必须来自 Get-BaseEnvExtra）。并集语义：现值先入表，本脚本给出的键覆盖同名键，
@@ -211,7 +226,7 @@ function Get-ExistingEnvExtra([string]$svc) {
 function Set-ServiceEnvExtra([string]$svc, [string[]]$desired) {
     $order = New-Object 'System.Collections.Generic.List[string]'
     $map = New-Object 'System.Collections.Generic.Dictionary[string,string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($kv in (@(Get-ExistingEnvExtra $svc) + @($desired))) {
+    foreach ($kv in ((Flatten-EnvPairs @(Get-ExistingEnvExtra $svc)) + @($desired))) {
         if (-not $kv) { continue }
         $i = $kv.IndexOf('=')
         if ($i -lt 1) { continue }
@@ -376,7 +391,7 @@ function Test-LlmSavedInAuthJson([string]$path) {
 $envMissing = @()
 foreach ($svc in ($envRequired.Keys | Sort-Object)) {
     $have = New-Object 'System.Collections.Generic.Dictionary[string,byte]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($kv in (Get-ExistingEnvExtra $svc)) {
+    foreach ($kv in (Flatten-EnvPairs (Get-ExistingEnvExtra $svc))) {
         $i = $kv.IndexOf("=")
         if ($i -gt 0) { $have[$kv.Substring(0, $i)] = 1 }   # 只留键名，值就地丢弃
     }
