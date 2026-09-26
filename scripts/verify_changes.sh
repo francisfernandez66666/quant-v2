@@ -4160,6 +4160,13 @@ fi
 #    源3 引擎 config.json/源4 桥配置，不生成新 token）——新判定名 ALIGN_READOUT/ALIGN_APPLIED
 #    各恰 1、开关映射锁、驱动锚与 ps1 写行两侧同源（含"提案自证"拒判腿），离网两形态
 #    （-Align / -Align -Apply）必须死在预探测且判定名一条都不许出现；判定名与轮换互不借用。
+# ⑤ §0926ROT-SRC5（2026-09-26 深夜发版实录）：-Align 补源5＝auth.json 账号级快照
+#    （configs[]→quant_config_json_v1→.qmt.token，GetQMTConfigFor 的账号覆盖层——09-26 实录：
+#    只对齐源3 时 verify ③b 腿仍红 engineAuth 分歧＝真实下单链拿旧口令）。三态判定行
+#    （absent/same/write）+ 计划/拒判/复读锚点两侧同源；写后复读 src5 残留非对齐指纹必拦停；
+#    同腿修 verify 第 20 探针 env 读法（Services\<svc> 单级 → +\Parameters 两级直读，
+#    §0926-ROT 同款失明——旧读法把"有键"恒记 key-absent，env 源从未参与对账）。
+#    生效前提写进 ps1/驱动收尾口径：auth store 启动时载入，src5 写过必须重启 quant。
 # 全部判据＝静态 grep -F + 离网一次性真跑（TEST-NET 假 IP，BatchMode 预探测必失败，
 # 零凭据零写入；每跑 ≤10s 超时，整段增时约一分钟）。
 # ════════════════════════════════════════════════════════════════════════════
@@ -4216,6 +4223,18 @@ rt_min "ps1 侧对齐完成判定行「align src3 done token_fp=」在位" "$(gr
 rt_min "ps1 侧对齐完成判定行「align src4 done 」在位" "$(grep -Fc 'align src4 done ' "$RT_PS1" || true)" "1"
 rt_min "驱动认的 src3 完成锚点在位（两侧同源：驱动锚＝ps1 真写）" "$(grep -Fc 'align src3 done token_fp=' "$RT_SCR" || true)" "2"
 rt_min "驱动认的 src4 完成锚点在位（同上，锚点表+提取腿各一处）" "$(grep -Fc 'align src4 done ' "$RT_SCR" || true)" "2"
+# ── §0926ROT-SRC5 锁组（09-26 深夜实录：账号快照是 GetQMTConfigFor 的账号覆盖层，漏了它
+#    等于没对齐——计数全部先预演读数再入段，形态与 src3/src4 锁同族）──
+rt_chk "ps1 侧 src5 读侧回显三形态在位（read/parse-error/no-file 各恰 1，失明必现形）" "$(grep -Fc 'src5 auth_snap' "$RT_PS1" || true)" "3"
+rt_min "ps1 侧对齐计划判定行「align src5 plan 」在位" "$(grep -Fc 'align src5 plan ' "$RT_PS1" || true)" "1"
+rt_chk "ps1 侧 src5 完成判定三态在位（absent/same/write 各一条 done 行，恰 3）" "$(grep -Fc 'align src5 done token_fp=' "$RT_PS1" || true)" "3"
+rt_min "ps1 侧 src5 写侧拒判族在位（提案解析/字节差/条数/指纹未命中全过才落盘，≥8）" "$(grep -Fc 'align src5 refused' "$RT_PS1" || true)" "8"
+rt_min "ps1 侧 src5 写后复读自证在位（parse/指纹/条数三查，≥3）" "$(grep -Fc 'align src5 read-back' "$RT_PS1" || true)" "3"
+rt_min "驱动认的 src5 完成锚点在位（锚点表+提取腿各一处，两侧同源）" "$(grep -Fc 'align src5 done ' "$RT_SCR" || true)" "2"
+rt_min "驱动 aligndry 计划锚含 src5（计划读数不完整即停）" "$(grep -Fc 'align src5 plan ' "$RT_SCR" || true)" "1"
+rt_min "驱动写后复读 src5 腿在位（取值+判读≥4 处，残留非对齐指纹必拦停）" "$(grep -Fc 'SRC5_LINE' "$RT_SCR" || true)" "4"
+rt_min "驱动干跑五源锚行在位（'[rot] src5 ' 进锚点表）" "$(grep -Fc "[rot] src5 " "$RT_SCR" || true)" "1"
+rt_min "verify 第 20 探针 env 腿两级读法在位（both-paths-unreadable 自证串恰 1）" "$(grep -Fc 'both-paths-unreadable' scripts/verify_deploy_guangzhou.sh || true)" "1"
 rt_min "ps1 侧对齐写前三重拒判之「提案自证」在位（指纹不命中锚点块即一个字都不写）" "$(grep -Fc '提案自证不过' "$RT_PS1" || true)" "2"
 # 09-26 对齐批实锤的假绿补洞：仓内词法扫描把反斜杠当普通字符，反斜杠贴引号恰好抵平括号照样
 # PASS，但 PS5.1 不认反斜杠转义——现网首跑 ParserError。形态锁：该串在 rotate ps1 出现即红。
@@ -4303,7 +4322,7 @@ rt_absent "离网 -Align -Apply 不许串到轮换判定名（两方向判定互
 rm -rf "$RT_TMP"
 
 if [ -z "$RT_ERRS" ]; then
-	echo "ok - §QMT-TOKENROT-CLI 守卫通过（静态锁含两侧同源锚 35 + 离网反证 18；§0926ROT-ALIGN 后共 53）"
+	echo "ok - §QMT-TOKENROT-CLI 守卫通过（静态锁含两侧同源锚 46 + 离网反证 18；§0926ROT-SRC5 账号快照腿后共 64）"
 else
 	echo "--- FAIL: §102 断言不符:${RT_ERRS}"
 	exit 1

@@ -547,9 +547,24 @@ if (Test-Path $GatewayCfg) {
     } catch { $tk1 = "unknown"; $tk1Why = "(" + $_.Exception.GetType().Name + ")" }
 } else { $tk1 = "no-file" }
 $tk2 = "unknown"; $tk2r = ""; $tk2Why = ""
-try {
-    $tk2Key = Get-Item -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $GwTokenService) -ErrorAction Stop
-    $tk2Vals = @($tk2Key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))
+# §0926ROT-SRC5 同日修读法（09-26 发版实录）：本机 NSSM 把 AppEnvironmentExtra 落在
+# Services\<svc>\Parameters 子键（§0926-ROT 在 rotate/register 两份 ps1 已锤实并修复），
+# 本探针 env 腿旧读法仍只看本级 ⇒ 服务明明有键却恒记 key-absent——按本探针口径 key-absent
+# 不判红，但 env 这条可比对源从未真正参与对账（探针失明同族 §TOKEN-BLIND）。
+# 修法与两份 ps1 同口径：两级路径直读合并（本级在前保持兼容），绝不解析 nssm 控制台文本。
+$tk2Vals = @()
+$tk2MissN = 0
+foreach ($tk2p in @(("HKLM:\SYSTEM\CurrentControlSet\Services\" + $GwTokenService),
+                    ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $GwTokenService + "\Parameters"))) {
+    try {
+        $tk2Key = Get-Item -LiteralPath $tk2p -ErrorAction Stop
+        $tk2RawV = $tk2Key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        foreach ($tv2 in @($tk2RawV)) { $s2 = ("$tv2").Trim(); if ($s2 -match '^[A-Za-z_][A-Za-z0-9_]*=') { $tk2Vals += $s2 } }
+    } catch { $tk2MissN++ }
+}
+if ($tk2Vals.Count -eq 0 -and $tk2MissN -eq 2) {
+    $tk2 = "unknown"; $tk2Why = "(both-paths-unreadable)"   # 两级都摸不到＝读法失明，如实标注
+} else {
     $tk2Tok = ""; $tk2Rep = ""
     foreach ($kv2 in $tk2Vals) {
         $t2 = ("$kv2").Trim()
@@ -558,7 +573,7 @@ try {
     }
     $tk2 = TokFp $tk2Tok; if (-not $tk2) { $tk2 = "key-absent" }   # 注册表读到了、只是没设这个键（合法态，网关回退文件值）
     $tk2r = TokFp $tk2Rep
-} catch { $tk2 = "unknown"; $tk2Why = "(" + $_.Exception.GetType().Name + ")" }
+}
 $tk3 = "unknown"; $tk3Why = ""
 $tk3Path = $DataDir + "\config.json"
 if (Test-Path $tk3Path) {

@@ -1,10 +1,15 @@
 ﻿# rotate_qmt_token.ps1 — §QMT-TOKENROT（2026-09-23）：QMT 网关 token 可轮换 + 指纹可比对。
-# 背景：网关鉴权 token 同时活在最多四个地方，必须一起动，而今天没有任何东西检查它们一致：
+# 背景：网关鉴权 token 同时活在最多五个地方，必须一起动，而今天没有任何东西检查它们一致：
 #   1) 网关配置文件 config.xt.json 的 token / report_token（ensure_gateway_config.ps1 生成）；
 #   2) 进程环境变量**覆盖文件**：QUANT_GATEWAY_TOKEN / QUANT_GATEWAY_REPORT_TOKEN
 #      （qmt_gateway/gateway.py :186/:199；经 NSSM 服务 AppEnvironmentExtra 落盘）；
 #   3) 引擎侧 $QUANT_DATA_DIR\config.json 的 rules.qmt.token（权威写入方＝web 设置页）；
-#   4) 桥客户端 qmt_bridge.py --token（或同目录 config.bridge.json 的 token）。
+#   4) 桥客户端 qmt_bridge.py --token（或同目录 config.bridge.json 的 token）；
+#   5) §0926ROT-SRC5（2026-09-26 发版实录补腿）：引擎账号级快照 $QUANT_DATA_DIR\auth.json 的
+#      configs[]（key=quant_config_json_v1）里 value（整棵 Rules 的 JSON 串）中 .qmt.token——
+#      GetQMTConfigFor 的优先级是「账号自身覆盖→运营覆盖→全局」，快照不改则真实下单永远拿旧
+#      口令（09-26 实录：轮换+对齐后 verify 第 20 探针仍红 engineAuth 分歧＝周一开盘链路无凭据）。
+#      注意：auth store 是引擎启动时载入内存（auth.go m.db），改完文件必须重启 quant 服务才吃到。
 # 本脚本自动化 1+2（机器可写侧），3+4 是人工步——结束时打印清单。一致性由
 #   scripts/verify_deploy_guangzhou.sh 第 20 探针（token 指纹分歧检测）事后复核。
 # 安全铁律（§N-5 同口径）：**任何路径都不得打印 token 明文**——只打印
@@ -29,7 +34,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1            # 预演
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Apply     # 真写
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align     # §0926ROT-ALIGN 对齐计划（只读，不生成新 token）
-#   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align -Apply  # 对齐落地：源1 现值→源3/源4
+#   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align -Apply  # 对齐落地：源1 现值→源3/源4/源5
 param(
     [string]$GatewayDir = "",        # 留空取 §C7 单源 $SvcGatewayDir（缺失回退 C:\qmt\quant-trading-v2\qmt_gateway）
     [string]$ConfigFile = "",        # 留空取 <GatewayDir>\config.xt.json
@@ -40,8 +45,9 @@ param(
     [switch]$DryRun,
     [switch]$Apply,
     # §0926ROT-ALIGN（2026-09-26 owner 令「我授权你来统一改」）：对齐模式——不生成新 token，
-    # 以源1（config.xt.json，网关真源）现值为权威，把它复制到源3（引擎 config.json rules.qmt.token）
-    # 与源4（config.bridge.json，如在位）。值只在服务器本地函数栈里过，输出一律指纹。
+    # 以源1（config.xt.json，网关真源）现值为权威，把它复制到源3（引擎 config.json rules.qmt.token）、
+    # 源4（config.bridge.json，如在位）与源5（auth.json 账号快照 .qmt.token，§0926ROT-SRC5）。
+    # 值只在服务器本地函数栈里过，输出一律指纹。
     [switch]$Align
 )
 $ErrorActionPreference = "Stop"
@@ -188,7 +194,7 @@ if (Test-Path $engPath) {
         if ($ej.rules -and $ej.rules.qmt) { $engToken = [string]$ej.rules.qmt.token }
     } catch { }
 }
-Info ("src3 engine_cfg    rules.qmt.token=" + (FpLabel $engToken) + " (权威写入方＝设置页；-Align 模式本脚本可按源1补齐)")
+Info ("src3 engine_cfg    rules.qmt.token=" + (FpLabel $engToken) + " (权威写入方＝设置页；-Align 模式本脚本可按源1补齐，热加载 5s 吃到)")
 
 # ── [诊断] §0926-ROT：env 腿写后读回 mismatch 的结构取证（纯注册表直读、只报计数/键名/读法，
 # 零值外泄）。两个疑点一次拆掉：①NSSM 可能把参数写在 Services\<svc>\Parameters 子键（两份路径
@@ -239,6 +245,37 @@ if (-not $brToken) {
     }
 }
 Info ("src4 bridge        token=" + $(if ($brToken -and $brToken -notmatch '^\(') { FpLabel $brToken } else { ($(if ($brToken) { $brToken } else { "not-found(桥未在跑且无 config.bridge.json)"})) }) + " (人工步原文；-Align 模式可在位时按源1补齐，缺省仍不写)")
+
+# ── 源5 读侧（§0926ROT-SRC5，2026-09-26 发版实录补腿）：引擎账号级快照 ──────────────────
+# auth.json 的 configs[] 里 key=quant_config_json_v1 的 value 是整棵 Rules 的 JSON 字符串，
+# 其中 .qmt.token 才是引擎对该账号真实下单用的口令（GetQMTConfigFor：账号覆盖→运营覆盖→全局，
+# internal/config/config.go:1962）。09-26 实录：轮换+src3 对齐后 verify 第 20 探针仍红
+# engineAuth=旧fp——快照这一腿不在轮换/对齐覆盖面里 ⇒ 周一开盘链路会拿旧口令敲新网关（401）。
+# 读法与 verify ③b 腿同型：逐条解析 value，只收非空 token；明文只进本地数组供写侧替换，打印一律指纹。
+$authPath = Join-Path $DataDir "auth.json"
+$authSnapVals = @()   # 各快照 token 原值（函数栈内；绝不回显）
+$authParseErr = $false
+if (Test-Path $authPath) {
+    $authObj = $null
+    try { $authObj = Get-Content -Path $authPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $authObj = $null }
+    if ($null -eq $authObj) {
+        $authParseErr = $true   # 读侧如实标失明；写侧遇此形态直接拒判（结构不可信一个字都不写）
+        Info "src5 auth_snap     parse-error (auth.json 解析失败——读侧失明已标注，-Align 将拒写)"
+    } else {
+        foreach ($ac in @($authObj.configs)) {
+            if ($null -eq $ac) { continue }
+            if ([string]$ac.key -ne 'quant_config_json_v1') { continue }
+            if (-not ("$($ac.value)").Trim()) { continue }
+            $ar = $null
+            try { $ar = "$($ac.value)" | ConvertFrom-Json } catch { $ar = $null }
+            if ($null -eq $ar) { continue }
+            $at = [string]$ar.qmt.token
+            if ($at) { $authSnapVals += $at }
+        }
+        $authFps = @($authSnapVals | ForEach-Object { FpLabel $_ } | Sort-Object -Unique)
+        Info ("src5 auth_snap     n=" + @($authSnapVals).Count + " tokens=" + $(if ($authFps.Count) { $authFps -join "," } else { "none" }) + " (引擎按账号取令牌的权威源；-Align 按源1补齐，改后需重启 quant 服务方吃到——auth store 启动时载入)")
+    }
+} else { Info "src5 auth_snap     no-file (auth.json 不在位——读侧如实标注，-Align 不判红)" }
 
 # ── 1z. §0926ROT-ALIGN 对齐模式（2026-09-26 owner 令「我授权你来统一改」）────────────────
 # 语义：**不生成新 token**。源1（config.xt.json）是网关鉴权的真源，本模式把它的现值在服务器
@@ -294,6 +331,16 @@ if ($Align) {
     if (Test-Path $bridgePath) { $brAction = if ((FpLabel $brToken) -ne $alignFp) { "write" } else { "same" } }
     Info ("align src3 plan engine_cfg will_write=" + $wantEng + " was=" + (FpLabel $engToken) + " target_fp=" + $alignFp)
     Info ("align src4 plan bridge action=" + $brAction + " (absent=桥未落位，落位时写源1同值即可)")
+    # 源5 计划（§0926ROT-SRC5）：快照里任何与源1不同指纹的 token 都是"待刷"值；
+    # 文件在位却解析失败＝结构不可信，计划阶段直接拒判（一个字都不写），不许带病落地。
+    $authStaleVals = @()
+    foreach ($av in ($authSnapVals | Sort-Object -Unique)) { if ((FpLabel $av) -ne $alignFp) { $authStaleVals += $av } }
+    $authAction5 = "same"
+    if ($authParseErr) { $authAction5 = "parse-error" }
+    elseif (@($authSnapVals).Count -eq 0) { $authAction5 = "absent" }
+    elseif ($authStaleVals.Count -gt 0) { $authAction5 = "write" }
+    Info ("align src5 plan auth_snapshots action=" + $authAction5 + " n=" + @($authSnapVals).Count + " stale_kinds=" + @($authStaleVals).Count + " target_fp=" + $alignFp)
+    if ($authAction5 -eq "parse-error") { Die "align src5 refused: auth.json 解析失败——结构不可信，一个字节都不写（读侧失明已标注）" }
     if ($DryRun) {
         Info "ALIGN_DRY plan-only above, nothing written. To really align rerun with -Align -Apply."
         exit 0
@@ -347,7 +394,71 @@ if ($Align) {
         }
         default   { Ok ("align src4 done token_fp=" + $alignFp + " action=absent (bridge not provisioned; write src1 value when it is)") }
     }
-    Info "ALIGN_APPLIED machine-readable sources unified to src1 truth. Reminder: gateway restart only AFTER this returns 4-source agreement; final check = verify deploy probe 20 token_fp_agree."
+    # ── 源5：auth.json 账号快照（§0926ROT-SRC5 写侧，2026-09-26 发版实录补腿）───────────
+    # 写形选择与源3 同 posture 但更简单：快照 value 是字符串化 JSON（内层引号全部转义），
+    # PS 反序列化重排会把整文件字段格式洗掉 ⇒ 一律**原文精确替换旧值**：token 是高熵字面量，
+    # 整文本 Replace 无误撞面；替换后仍三重自证——①提案可解析；②提案里带 token 的快照条数
+    # 不变且每条指纹命中源1；③字节差=计划预测量（出现计划外命中即拒写）。全过才落
+    # .pre-align 副本+原子写+复读自证。生效前提：auth store 启动时载入内存 ⇒ 必须重启 quant。
+    switch ($authAction5) {
+        "absent" { Ok ("align src5 done token_fp=" + $alignFp + " action=absent (auth.json 不在位或无带 token 快照)") }
+        "same"   { Ok ("align src5 done token_fp=" + $alignFp + " action=same (全部快照已与源1同值)") }
+        "write"  {
+            if (-not (Test-Path $authPath)) { Die ("align src5 refused: auth.json not found at " + $authPath + "（快照计数>0 而文件消失＝竞态形态，停手）") }
+            $authRaw5 = Get-Content -Path $authPath -Raw -Encoding UTF8
+            $authProp = $authRaw5
+            $authDeltaPlan = 0
+            foreach ($ov in ($authStaleVals | Sort-Object -Unique)) {
+                $oc = ([regex]::Matches($authRaw5, [regex]::Escape($ov))).Count
+                if ($oc -lt 1) { Die "align src5 refused: 旧值在原文中不出现（读写链不一致，拒写）" }
+                $authDeltaPlan += $oc * ($alignTok.Length - $ov.Length)
+                $authProp = $authProp.Replace($ov, $alignTok)
+            }
+            $authChkObj = $null
+            try { $authChkObj = $authProp | ConvertFrom-Json } catch { Die "align src5 refused: 提案文本解析不过（手术切坏形态，拒写）" }
+            if (($authProp.Length - $authRaw5.Length) -ne $authDeltaPlan) { Die "align src5 refused: 提案字节差与预测量不符（存在计划外命中，停手）" }
+            $chkN5 = 0
+            foreach ($cc in @($authChkObj.configs)) {
+                if ($null -eq $cc) { continue }
+                if ([string]$cc.key -ne 'quant_config_json_v1') { continue }
+                if (-not ("$($cc.value)").Trim()) { continue }
+                $cv = $null
+                try { $cv = "$($cc.value)" | ConvertFrom-Json } catch { $cv = $null }
+                if ($null -eq $cv) { continue }
+                $ct = [string]$cv.qmt.token
+                if ($ct) {
+                    $chkN5++
+                    if ((FpLabel $ct) -ne $alignFp) { Die ("align src5 refused: 账号 " + [string]$cc.user_id + " 快照 token 在提案中仍未命中源1（手术刀不干净，拒写）") }
+                }
+            }
+            if ($chkN5 -ne @($authSnapVals).Count) { Die ("align src5 refused: 提案中 token 快照条数变了（" + $chkN5 + " != " + @($authSnapVals).Count + "）") }
+            $authBak5 = $authPath + ".pre-align-" + $stamp
+            Copy-Item -LiteralPath $authPath -Destination $authBak5 -Force
+            $authTmp5 = $authPath + ".aligning-" + $stamp
+            [System.IO.File]::WriteAllText($authTmp5, $authProp, (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $authTmp5 -Destination $authPath -Force
+            $authNow5 = $null
+            try { $authNow5 = Get-Content -Path $authPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("align src5 read-back parse failed（回滚副本: " + $authBak5 + "）") }
+            $rbN5 = 0
+            foreach ($rc in @($authNow5.configs)) {
+                if ($null -eq $rc) { continue }
+                if ([string]$rc.key -ne 'quant_config_json_v1') { continue }
+                if (-not ("$($rc.value)").Trim()) { continue }
+                $rv = $null
+                try { $rv = "$($rc.value)" | ConvertFrom-Json } catch { $rv = $null }
+                if ($null -eq $rv) { continue }
+                $rt = [string]$rv.qmt.token
+                if ($rt) {
+                    $rbN5++
+                    if ((FpLabel $rt) -ne $alignFp) { Die ("align src5 read-back mismatch（回滚副本: " + $authBak5 + "）") }
+                }
+            }
+            if ($rbN5 -ne @($authSnapVals).Count) { Die ("align src5 read-back count mismatch（回滚副本: " + $authBak5 + "）") }
+            Ok ("align src5 done token_fp=" + $alignFp + " action=written read-back confirmed, backup=.pre-align-" + $stamp + " (提醒：auth store 启动时载入，重启 quant 服务后方吃到新快照)")
+        }
+        default { Die ("align src5 refused: unknown action=" + $authAction5) }
+    }
+    Info "ALIGN_APPLIED machine-readable sources unified to src1 truth. Reminder: gateway restart only AFTER this returns 5-source agreement; final check = verify deploy probe 20 token_fp_agree; src5 written => restart quant service (auth store loads at startup)."
     exit 0
 }
 
