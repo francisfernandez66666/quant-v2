@@ -61,6 +61,12 @@
 #      三个正规脚本都不消费它（观察项 #58 的"读数通道缺口"就是这么来的），本探针用日志/缓存两条
 #      免凭据腿补上（判据与读法细节见 PS 段注释；首跑以现网实际读数校准，不预设现网是哪种形态）。
 #
+#  18) §A5-CURRENT（2026-09-26 深夜批，第 28 探针，判数 27→28）：跌停追卖常开闸的现网实际生效值
+#      只读读数——owner 裁决「limit_down_block_sell 常开」的部署前提是云端 config.json 不留显式
+#      false，此前该值无免凭据取证通道（排摸脚本按设计不读 config.json，配置端点要管理令牌）。
+#      生效路径结构化读数（rules.qmt.risk_gate）+ 全文裸扫第二腿（键位漂移只点名不判红，Go 不
+#      消费死键）；不对称判据：红=生效路径显式 false，其余态全绿并走 INFO 回显。细节见 PS 段。
+#
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
 #   GZ_IP=81.71.69.17 COMMIT=beb5b80 ./scripts/verify_deploy_guangzhou.sh   # 显式指定指纹
@@ -922,6 +928,41 @@ $calDetail = "verdict=" + $calVerdict + " cache=" + $calCacheState + "," + $calS
     " neg=" + $(if ($calNegTs) { $calNegTs } else { "none" })
 Write-Output ("INFO|cal_readout " + $calDetail)
 Probe "cal: trading calendar not in fail-open (readout in INFO)" (-not $calBad) $calDetail
+
+# 18) §A5-CURRENT（2026-09-26 深夜批，第 28 探针）：跌停追卖常开闸（owner 裁决 2026-09-26
+#     「limit_down_block_sell 常开＝是」，nil=开、显式 false=关）在现网 config.json 的**实际生效值**。
+# 背景：该裁决的部署前提「云端 config.json 不得留 false」此前无取证通道——排摸脚本按设计只认
+#     两份战法 JSON、不读 config.json；配置 GET 端点走管理会话令牌（本机令牌不在位，属 owner 输入）。
+#     本探针走验证链自有一条免凭据腿：scp 上传的 ps1 在服务器侧只读 config.json（第 15/27 探针
+#     同款通道，零写入、零凭据、值本身是布尔不涉密）。
+# 生效路径唯一（读码锤定）：Go wrapper 只认 {"rules","d1"} 两段，risk_gate 只挂在 rules.qmt 下
+#     （config.go 唯一 json tag `risk_gate`），所以**结构化读数 rules.qmt.risk_gate.limit_down_block_sell
+#     才是真生效值**。裸扫 `"limit_down_block_sell"..."false"` 只做第二条腿：键位漂移（§ROOTQMT
+#     根级死键同族形态）出现在生效路径之外时**不判红**（Go 不消费死键，判红即假红），但原样进
+#     INFO 点名——死键意味着有人写了个不生效的开关，那正是要人来清理的形态。
+# 判据（刻意不对称，与 §CAL-READOUT 同姿势）：
+#     红 = 生效路径显式 false（常开裁决被现网数据静默推翻，决定性证据）；
+#     不红 = 文件缺失/解析失败/键 absent/true——状态全部原样写进读数回显，首跑不预设现网形态。
+# INFO 恒回显（绿也要看得到数；bash 侧 INFO 不进 PASS/FAIL 计数⇒判数 27→28 只 +1）。
+$ldCfgPath = $DataDir + "\config.json"
+$ldState = "missing"; $ldVal = "absent"; $ldKeyN = 0; $ldFalseN = 0
+if (Test-Path -LiteralPath $ldCfgPath) {
+    try {
+        $ldRaw = Get-Content -LiteralPath $ldCfgPath -Raw -ErrorAction Stop
+        $ldState = "read"
+        $ldJson = $ldRaw | ConvertFrom-Json
+        # PS 对不存在属性返回 $null（ErrorActionPreference=Continue），缺键与显式 null 同为 absent 态。
+        $ldv = $ldJson.rules.qmt.risk_gate.limit_down_block_sell
+        if ($null -eq $ldv) { $ldVal = "absent" } elseif ([string]$ldv -eq "True") { $ldVal = "true" } else { $ldVal = "false" }
+        $ldKeyN = ([regex]::Matches($ldRaw, '"limit_down_block_sell"')).Count
+        $ldFalseN = ([regex]::Matches($ldRaw, '"limit_down_block_sell"\s*:\s*false')).Count
+    } catch { $ldState = "unreadable" }
+}
+$ldBad = ($ldVal -eq "false")
+$ldDetail = "state=" + $ldState + " effective=" + $ldVal + " keys=" + $ldKeyN + " falsepat=" + $ldFalseN +
+    " path=rules.qmt.risk_gate.limit_down_block_sell"
+Write-Output ("INFO|limitdown_readout " + $ldDetail)
+Probe "cfg: limit-down sell-chase gate not disabled by live config (readout in INFO)" (-not $ldBad) $ldDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，

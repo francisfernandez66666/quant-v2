@@ -2626,12 +2626,13 @@ for fn in SgInc SgTop; do
 done
 # ⑧ INFO 是观测通道不是判据通道：bash 侧只 echo、不进 PASS/FAIL 计数（判数口径见 verify_deploy 头注）。
 #    一旦有人把 INFO 接成 PASS，绿的数量就会凭空增长，而红绿语义没变——这是最隐蔽的一种假绿。
-#    行数=4：逐文件空态/逐文件明细/当日聚合（§SIGNAL-DIST 原三条）+ 日历读数（§CAL-READOUT，
-#    2026-09-26 owner 令新增第 27 探针的恒回显腿；§101 另有 INFO|cal_readout 在位锁）。
+#    行数=5：逐文件空态/逐文件明细/当日聚合（§SIGNAL-DIST 原三条）+ 日历读数（§CAL-READOUT，
+#    2026-09-26 owner 令新增第 27 探针的恒回显腿；§101 另有 INFO|cal_readout 在位锁）
+#    + 跌停闸现值读数（§A5-CURRENT，2026-09-26 深夜批第 28 探针；§101 ②b 有专属锁）。
 grep -qF 'INFO\|*) echo' "$VD" \
 	|| { echo '--- FAIL: bash 侧 INFO 分支丢失（观测读数会被当成未知行，或被误接进 PASS/FAIL 计数）'; exit 1; }
 infop=$(grep -c 'Write-Output ("INFO|' "$VD" || true)
-[ "$infop" = "4" ] || { echo "--- FAIL: INFO 观测行数不是 4（逐文件空态/逐文件明细/当日聚合/日历读数，计数=${infop}）"; exit 1; }
+[ "$infop" = "5" ] || { echo "--- FAIL: INFO 观测行数不是 5（逐文件空态/逐文件明细/当日聚合/日历读数/跌停闸现值，计数=${infop}）"; exit 1; }
 # ⑨ 负锁：本探针不得用 `| Out-String` 读 JSON 字段（PS 控制台按 120 列折行会劈开值，§N-5 的教训本体；
 #    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
 grep -qF '([string]$sgJson.trading_day)' "$VD" \
@@ -4038,7 +4039,7 @@ fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # §101 §0926PM（2026-09-26 下午批，owner 令「token 轮换+勘误 / 日历读数 / 二波+三季报重灌 / 门禁+部署」）
-# 一物一锁，三族：
+# 一物一锁，四族（②b 为 09-26 深夜收口批并入）：
 # ① §FINA-Q3 三季报云端重灌通道（scripts/backfill_fina_q3_guangzhou.sh）：这条通道**会写现网
 #    研究库**，安全口径必须逐条有锁而不是只活在头注释里——远端查询全走 mode=ro（缺省只读可证）、
 #    只补缺失键（对财务三表零 UPDATE 零 DELETE）、双层回滚依据（SNAP_OK 表级快照 + 插入键台账，
@@ -4049,11 +4050,15 @@ fi
 # ② §CAL-READOUT 日历已加载只读读数（verify_deploy 第 27 探针）：判据只认「负线晚于全部正线」
 #    这一条不对称锁；凭据负锁（验证链零 /api/metrics 非注释命中，读数走磁盘两腿）；日志路径
 #    必须先读 nssm 注册表键的 AppStdErr/AppStdout 再回落实测位（§N-5：解析控制台文本必踩坑）。
+# ②b §A5-CURRENT 跌停追卖闸现网生效值（verify_deploy 第 28 探针，09-26 深夜收口批）：
+#    常开裁决的部署前提「config.json 不得留 false」的免凭据取证腿——生效路径单点读法锁
+#    （rules.qmt.risk_gate 恰 1 处）、不对称判据锁（唯一红线＝显式 false，死键/缺文件不判红）、
+#    裸扫第二腿字面锁、INFO 恒回显锁、判据行中文负锁（GBK 回传课）。
 # ③ §RESTIC-LOCK Mac 拉取腿陈旧锁自愈：两仓 unlock + 三败中途补一次（03:09 遗留锁拦死 07:00
 #    窗的实录修法）；自愈必须非致命（每行带 || 兜底），且 copy 成败判定语义一字未动。
 # 全部判据是静态 grep + 离网一次性临时库真跑（段尾统一 rm，测试数据不落工作树）。
 # ════════════════════════════════════════════════════════════════════════════
-echo "==> 101 §0926PM 三季报通道+日历读数探针+restic 自愈（2026-09-26 下午批）..."
+echo "==> 101 §0926PM 三季报通道+日历读数探针+跌停闸现值探针+restic 自愈（2026-09-26 下午批）..."
 FQ_ERRS=""
 fq_chk() { if [ "$2" != "$3" ]; then FQ_ERRS="${FQ_ERRS}
   · $1（读到 ${2}，应为 ${3}）"; fi; }
@@ -4068,7 +4073,7 @@ FQ_RS=deploy/mac/restic_pull_backup.sh
 FQ_SY=0; bash -n "$FQ_SCR" 2>/dev/null || FQ_SY=$?
 fq_chk "§FINA-Q3 脚本语法自检 bash -n" "$FQ_SY" "0"
 FQ_SY2=0; bash -n "$FQ_VD" 2>/dev/null || FQ_SY2=$?
-fq_chk "verify_deploy 语法自检 bash -n（第 27 探针插入后）" "$FQ_SY2" "0"
+fq_chk "verify_deploy 语法自检 bash -n（第 28 探针插入后）" "$FQ_SY2" "0"
 FQ_SY3=0; bash -n "$FQ_RS" 2>/dev/null || FQ_SY3=$?
 fq_chk "restic 拉取腿语法自检 bash -n" "$FQ_SY3" "0"
 
@@ -4116,6 +4121,15 @@ FQ_CALCN="$({ grep -n 'calDetail\|cal_readout\|calBad' "$FQ_VD" || true; } | { g
 fq_absent "中文判据负锁：cal 判据/明细行掺中文（GBK 回传课）" "$FQ_CALCN"
 fq_min "verdict 四态锚之一 NOT-LOADED 在位" "$(grep -c '"NOT-LOADED"' "$FQ_VD" || true)" "1"
 
+# ── ②b §A5-CURRENT 第 28 探针（09-26 深夜收口批：跌停追卖常开闸现网生效值补核，零凭据） ──
+fq_chk "limitdown 判据赋值恰 1（唯一红线＝生效路径显式 false；死键/缺文件不判红的不对称钉死）" "$(grep -c '\$ldBad = (\$ldVal -eq "false")' "$FQ_VD" || true)" "1"
+fq_chk "limitdown Probe 行恰 1" "$(grep -c 'Probe "cfg: limit-down sell-chase gate' "$FQ_VD" || true)" "1"
+fq_min "limitdown INFO 恒回显通道（绿也要看得到现值）" "$(grep -c 'INFO|limitdown_readout' "$FQ_VD" || true)" "1"
+fq_chk "裸扫第二腿字面在位（键位漂移检测的正则恰 1 处使用）" "$(grep -cF '"limit_down_block_sell"\s*:\s*false' "$FQ_VD" || true)" "1"
+fq_chk "生效路径读法单点（rules.qmt.risk_gate 取数行恰 1，防第二处读法漂移）" "$(grep -c '$ldJson.rules.qmt.risk_gate.limit_down_block_sell' "$FQ_VD" || true)" "1"
+FQ_LDCN="$({ grep -n 'ldBad\|ldDetail\|limitdown_readout\|ldVal' "$FQ_VD" || true; } | { grep -vE '^[0-9]+:[[:space:]]*#' || true; } | LC_ALL=C grep -c '[^ -~]' || true)"
+fq_absent "中文判据负锁：limitdown 判据/明细行掺中文（GBK 回传课）" "$FQ_LDCN"
+
 # ── ③ §RESTIC-LOCK 拉取腿陈旧锁自愈 ──
 fq_min "unlock 点名（两仓首清+三败中途补+口径注释，≥6 处）" "$(grep -c 'unlock' "$FQ_RS" || true)" "6"
 FQ_UNLOCK_RAW="$({ grep -E '^[[:space:]]*restic .*unlock' "$FQ_RS" || true; } | { grep -vc '|| ' || true; })"
@@ -4123,7 +4137,7 @@ fq_absent "unlock 命令行无 || 兜底（自愈必须非致命，真并发锁�
 fq_chk "copy 成败判定语义一字未动（COPY_OK 判定行恰 1）" "$(grep -c '\[ "\$COPY_OK" = "1" \] || fail' "$FQ_RS" || true)" "1"
 
 if [ -z "$FQ_ERRS" ]; then
-	echo "ok - §0926PM 守卫通过（FINA-Q3 静态锁 11 + 离网反证 5 + 日历探针锁 8 + restic 自愈锁 3）"
+	echo "ok - §0926PM 守卫通过（FINA-Q3 静态锁 11 + 离网反证 5 + 日历探针锁 8 + 跌停闸现值探针锁 6 + restic 自愈锁 3）"
 else
 	echo "--- FAIL: §0926PM 断言不符:${FQ_ERRS}"
 	exit 1

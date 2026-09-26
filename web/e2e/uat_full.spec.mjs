@@ -1662,3 +1662,62 @@ test.describe('修复回归 · §E1 盈亏单轨 (2026-09-26)', () => {
     await ctxA.close()
   })
 })
+
+// ── 修复回归 · §AUDIT-UNIFY 配置历史与回滚接线（元闸裁决②，2026-09-26）──
+// 旧账：AuditRulesDiff 定义了但零调用——配置审计各写路径各自直写 opslog（actor 真实）或
+// 干脆不写（回滚路只留普通运行日志，日志轮转即丢、审计页不可见）。裁决「统一走包装」后，
+// qmt 保存路+回滚路都改走 AuditRulesDiff(m, actor, target, diff) 单入口，WriteConfigFile 层
+// 不再自带假审计。行为级断言（POST rollback → opslog 真落 config_change 行）在 Go 测试
+// TestConfigHistoryAndRollbackEndpoints；本处补的是 **HTTP 接线与权限面**——端点在位、
+// 快照/diff 读法可用、不存在的快照必须显式 404（绝不静默成功）、成员两个端点都 403。
+test.describe('修复回归 · §AUDIT-UNIFY 配置历史与回滚 (2026-09-26)', () => {
+  // ① 契约腿：历史列表 200+数组形；?diff= 指到不存在的快照必须显式 404（读法不吃哑弹）。
+  test('§AUDIT-UNIFY 契约：history 下发 snapshots 数组，diff 缺快照显式 404', async ({ page }) => {
+    await page.goto('/#/settings')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const resp = await page.request.get('/api/config/history', { headers: hdr })
+    expect(resp.status(), 'admin GET 历史端点应 200').toBe(200)
+    const body = await resp.json()
+    expect(Array.isArray(body.snapshots), 'snapshots 必须是数组（无快照时为空组，不报错）').toBe(true)
+    const diff = await page.request.get('/api/config/history?diff=00000000_000000.000000000', { headers: hdr })
+    expect(diff.status(), '不存在的快照做 diff 必须 404，不能 200 空对比').toBe(404)
+  })
+
+  // ② 回滚负例腿：缺参 400、假快照 404——写端点的失败必须显式（§N-5 姿势），
+  //    且不真回滚任何现网/UAT 配置（本用例零状态变更，无需还原腿）。
+  test('§AUDIT-UNIFY 回滚负例：缺 snapshot_ts 400、不存在快照 404', async ({ page }) => {
+    await page.goto('/#/settings')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const noTs = await page.request.post('/api/config/rollback', { headers: hdr, data: {} })
+    expect(noTs.status(), '缺 snapshot_ts 必须 400').toBe(400)
+    const fake = await page.request.post('/api/config/rollback', { headers: hdr, data: { snapshot_ts: '00000000_000000.000000000' } })
+    expect(fake.status(), '不存在的快照回滚必须 404（绝不静默"成功"）').toBe(404)
+    // 反证位：两次负例后配置面没被动过——qmt 配置段读回仍是 200（回滚端点挂而不写也要绿）。
+    const cur = await page.request.get('/api/config/qmt', { headers: hdr })
+    expect(cur.status(), '负例不得波及配置读取面').toBe(200)
+  })
+
+  // ③ 权限腿：tester 对读/写两端点都 403；admin 同 session 200 对照
+  //    （防「端点整体挂了也全 403」把权限断言洗成假绿，与 §E1 权限腿同款反证姿势）。
+  test('§AUDIT-UNIFY 权限：tester 读/回滚均 403，admin 200 对照', async ({ browser }) => {
+    const ctxT = await browser.newContext({ storageState: { cookies: [], origins: [] } })
+    const pageT = await ctxT.newPage()
+    await pageT.goto('/#/')
+    await pageT.getByPlaceholder('输入账号').fill(USER.u)
+    await pageT.getByPlaceholder('输入密码').fill(USER.p)
+    await pageT.getByPlaceholder('输入密码').press('Enter')
+    await expect(pageT.locator('.app-shell')).toBeVisible({ timeout: 15000 })
+    const tokT = await pageT.evaluate(() => localStorage.getItem('liangzai_token'))
+    const hdrT = { Authorization: tokT }
+    expect((await pageT.request.get('/api/config/history', { headers: hdrT })).status(), '成员读配置历史必须 403').toBe(403)
+    const rb = await pageT.request.post('/api/config/rollback', { headers: hdrT, data: { snapshot_ts: 'x' } })
+    expect(rb.status(), '成员直调回滚必须 403').toBe(403)
+    await ctxT.close()
+    const ctxA = await browser.newContext()
+    const pageA = await ctxA.newPage()
+    await pageA.goto('/#/settings')
+    const hdrA = { Authorization: await pageA.evaluate(() => localStorage.getItem('liangzai_token')) }
+    expect((await pageA.request.get('/api/config/history', { headers: hdrA })).status(), 'admin 对照 200').toBe(200)
+    await ctxA.close()
+  })
+})
