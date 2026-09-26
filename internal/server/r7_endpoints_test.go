@@ -17,10 +17,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/metrics"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 )
 
@@ -114,7 +116,14 @@ func TestConfigHistoryAndRollbackEndpoints(t *testing.T) {
 		t.Errorf("diff 应含 price_type 变更行, got %q", diffResp.Diff)
 	}
 
-	// 4) 回滚 v1 → config.json 恢复 v1 内容
+	// 4) 回滚 v1 → config.json 恢复 v1 内容。
+	// 4a) §0926PM 元闸裁决②（AuditRulesDiff 统一包装）配套行为用例前置：把 opslog
+	// 重定向到临时目录，回滚审计必须是可复核的真实落盘行——修前本路只写普通运行日志
+	// （轮转即丢、审计页不可见，"配置改错→回滚恢复→时间线上看不出有人动过配置"的证据洞）。
+	// English: rollback now writes a structured config_change audit line through the unified
+	// AuditRulesDiff entry; this asserts the real file line (actor + rollback:<ts> + field diff).
+	logDir := filepath.Join(t.TempDir(), "opslog")
+	opslog.Init(logDir, 0)
 	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/rollback", `{"snapshot_ts":"`+ts1+`"}`))
 	if rr.Code != 200 {
 		t.Fatalf("rollback → %d body=%s", rr.Code, rr.Body.String())
@@ -125,6 +134,21 @@ func TestConfigHistoryAndRollbackEndpoints(t *testing.T) {
 	}
 	if strings.Contains(string(cur), `"enabled":true`) {
 		t.Errorf("回滚后应为 v1（enabled=false）, got %s", string(cur))
+	}
+	// 4b) 审计行断言：event=config_change、actor=真实操作者（非冒充）、target 点名回滚来源
+	// 快照、result 携带字段级 diff（不是空 ok 一笔带过）。
+	auditPath := filepath.Join(logDir, "audit-"+time.Now().Format("20060102")+".log")
+	auditData, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("读回滚审计文件失败（回滚留痕断腿）: %v", err)
+	}
+	auditLine := string(auditData)
+	wantAudit := "event=config_change actor=" + admin.ID + " target=rollback:" + ts1
+	if !strings.Contains(auditLine, wantAudit) {
+		t.Fatalf("审计文件缺行 %q，实际内容=\n%s", wantAudit, auditLine)
+	}
+	if !strings.Contains(auditLine, "price_type") {
+		t.Errorf("回滚审计 result 应含字段级 diff（price_type 变更行），实际=\n%s", auditLine)
 	}
 
 	// 5) 非法入参：缺 snapshot_ts → 400；不存在的快照 → 404
