@@ -180,6 +180,12 @@ $SCP deploy/qmt-win/decommission_qmt_mock.ps1 deploy/qmt-win/rotate_qmt_token.ps
      "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # baostock sidecar
 $SCP cmd/pydata/server.py cmd/pydata/requirements.txt "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/pydata/"
+# §0927KA（2026-09-27 部署实录）：dataload_keepalive.py（17:10 盘后保活计划任务的执行体）
+# 历史上是手工安装、一直不在本清单——§M6-②（09-22 交易日历 target 根治）因此从未到过现网，
+# 现网 09-26 假日拿旧「工作日近似」推出幻觉 target=20260925，空转 7+ 轮并锁死 dataload.exe，
+# 直接掐死当晚第一次部署的 scp 上传段（"dest open Failure"）。同族教训：§ENH-5 quote_feed.py
+# 漏列、§P0-B 备份链漏列——新增/修复的现网执行体文件必须当场入清单，"仓库里有"≠"现网在跑"。
+$SCP scripts/dataload_keepalive.py "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
 
 # ── 2b. 同步 qmt_gateway Python 网关（§QMT-DUAL：含 qmt_bridge.py 策略桥；
 #      §CB-TICKWINDOW 2026-09-21 起 qmt_bridge_strategy.py 也入列——曾因不在清单，

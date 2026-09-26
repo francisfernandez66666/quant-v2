@@ -194,6 +194,84 @@ class TestTradeCalendarFallback(TempDbCase):
             self.assertIn("回退工作日近似", f.read())  # 显式留痕，取证可查
 
 
+# §0927KA（2026-09-27 部署实录）：现网 trade_cal 停在 20260818 无人再刷（本次事故里
+# 第一源恒过旧、全靠降级腿）——pydata 降级取到日历后必须把窗口行回写自愈 trade_cal。
+class TestCalendarSelfHeal(TempDbCase):
+    def test_pydata_window_upserted_back_into_trade_cal(self):
+        """临时库无 trade_cal 表 + pydata 可用 → target 正确到节前交易日，
+        且同批日历行（含休市日 0/开市日 1）落库、表被顺手建出来。"""
+        cal_csv = ("calendar_date,is_open\n"
+                   "2026-09-24,1\n2026-09-25,0\n2026-09-26,0\n")  # 中秋三连休的真实形态
+        with mock.patch("urllib.request.urlopen") as u:
+            u.return_value.read.return_value = cal_csv.encode("utf-8")
+            got = k.last_trade_date(today=datetime.date(2026, 9, 26))
+        self.assertEqual(got, "20260924")
+        c = sqlite3.connect(self.db_path)
+        rows = dict(c.execute("SELECT cal_date, is_open FROM trade_cal").fetchall())
+        c.close()
+        self.assertEqual(rows, {"20260924": 1, "20260925": 0, "20260926": 0})
+        with open(k.LOG, encoding="utf-8") as f:
+            self.assertIn("self-heal", f.read())  # 回写留痕可取证
+
+    def test_self_heal_write_failure_never_breaks_target(self):
+        """回写腿故障（这里用「DB 路径改指目录」令 connect 后 commit 必抛）不得影响
+        target 推导与返回——自愈是顺路福利，不是主流程前置。"""
+        cal_csv = "calendar_date,is_open\n2026-09-24,1\n"
+        orig_db = k.DB
+        k.DB = tempfile.mkdtemp()  # 目录当库文件用：sqlite 打开即抛，触发 except 分支
+        try:
+            with mock.patch("urllib.request.urlopen") as u:
+                u.return_value.read.return_value = cal_csv.encode("utf-8")
+                got = k.last_trade_date(today=datetime.date(2026, 9, 25))
+        finally:
+            k.DB = orig_db
+        self.assertEqual(got, "20260924")
+
+
+# §0927KA 空转放大器收口：09-26 实录里幻觉 target 令 8 轮×1.5h 全部拉齐落空，
+# 整夜锁死 dataload.exe（挡掉一次部署）。修法=与目标无关的「连续两轮三表读数零变化」
+# 早停（rc 仍 1，日志留痕），保证未来任何 target 失真最多烧两轮。
+class TestNoProgressAbort(TempDbCase):
+    def test_phantom_target_stops_after_two_no_progress_rounds(self):
+        calls = []
+        with mock.patch.object(k, "latest", lambda t, col="trade_date": "20260924"), \
+             mock.patch.object(k, "run", lambda cmd, **kw: calls.append(cmd) or (0, "累计 0 行")), \
+             mock.patch.object(k, "fetch_index", lambda s, e: (0, 0)), \
+             mock.patch.object(k, "last_trade_date", lambda: "20260925"), \
+             mock.patch.object(k.time, "sleep", lambda s: None):
+            rc = k.main()
+        self.assertEqual(rc, 1)
+        # 每轮 run 三连（daily/pools/daily-k-10d），2 轮即停＝6 次调用（旧形态 8 轮＝24 次）。
+        self.assertEqual(len(calls), 6)
+        with open(k.LOG, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("no progress 2 rounds — abort early", text)
+
+    def test_progress_resets_no_progress_counter(self):
+        """反向保护：只要表读数在推进（真缺数的正常补数形态），早停不得误伤——
+        模拟每轮都有进展的长补数，8 轮全部执行（未误早停）、耗尽后仍 rc=1。"""
+        state = {"n": 0}
+        def fake_latest(t, col="trade_date"):
+            # 读数按真实日期轴单调前移（避免拼出 "20260932" 类假日期）
+            d = datetime.date(2026, 9, 24) + datetime.timedelta(days=state["n"])
+            return d.strftime("%Y%m%d")
+        def advance(*a, **kw):
+            state["n"] += 1  # 每个外部调用都令读数前移 → 轮轮有进展
+            return (0, "mocked")
+        with mock.patch.object(k, "latest", fake_latest), \
+             mock.patch.object(k, "run", advance), \
+             mock.patch.object(k, "fetch_index", lambda s, e: advance()[:0] or (0, 0)), \
+             mock.patch.object(k, "last_trade_date", lambda: "20261231"), \
+             mock.patch.object(k.time, "sleep", lambda s: None):
+            rc = k.main()
+        self.assertEqual(rc, 1)      # 目标日永追不上 → 8 轮耗尽仍非零
+        self.assertGreaterEqual(state["n"], 8)  # 8 轮全部执行过（未误早停）
+        with open(k.LOG, encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotIn("abort early", text)   # 负向锁：有进展时早停不得出手
+        self.assertIn("after 8 rounds", text)   # 走的是旧的耗尽路径
+
+
 # latest 查询单测：空表/缺表安全弃权，有行取最大交易日。
 class TestLatestFreshness(TempDbCase):
     def test_max_and_missing_table(self):

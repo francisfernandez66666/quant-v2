@@ -4349,7 +4349,7 @@ fi
 #    apk-smoke 1/EMBED 锁 1、persist/hotSwap false 1、StartWeeklyLLMProbe 接线 1）；
 # ④ 行为用例不在此段（go/pytest/vitest/Playwright 四套各自已带），本段只防静态回潮。
 # ════════════════════════════════════════════════════════════════════════════
-echo "==> 103 §0926E2E 全量审计修复批（一~四波+矩阵补位静态锁 33 条（含 §0926E2E-13b 双发守卫三枚，09-27 增））..."
+echo "==> 103 §0926E2E 全量审计修复批（一~四波+矩阵补位+§0927KA 保活加固静态锁 36 条（含 §0926E2E-13b 双发守卫三枚，09-27 增））..."
 E2E_ERRS=""
 # e2e_eq <名> <期望> <实得>：等值锁；e2e_ge <名> <下限> <实得>：存在性下限锁
 # （≥ 用于"注释/锚点条数会随后续施工增加"的观测，防单向等值把后人合法加注释判红）。
@@ -4432,8 +4432,17 @@ e2e_eq "MX3 周度探测必须走只读腿（persist=false+hotSwap=false 等值�
 e2e_eq "MX3 周度例行已接线（cmd/quant/main.go StartWeeklyLLMProbe 恰 1）" \
 	"$(ecn cmd/quant/main.go 'StartWeeklyLLMProbe')" "1"
 
+# —— §0927KA 保活日历加固（09-27 部署实录：现网旧版工作日近似推幻觉 target 空转过夜挡部署）——
+# 预演读数（09-27 grep -Fc）：部署清单 'scripts/dataload_keepalive.py'=1、
+# keepalive 源 '0927KA' 锚=10、'abort early'=1。
+e2e_eq "KA 部署清单必须带 dataload_keepalive.py（漏列=§M6/§0927KA 修复永不到现网，09-26 实录本体）" \
+	"$(ec scripts/deploy_guangzhou.sh 'scripts/dataload_keepalive.py')" "1"
+e2e_ge "KA keepalive 源 §0927KA 加固锚（日历自愈回写+无进展早停）≥8" "8" "$(ecn scripts/dataload_keepalive.py '0927KA')"
+e2e_eq "KA 无进展早停日志锚在位恰 1（幻觉 target 最多烧两轮的保险丝）" \
+	"$(ec scripts/dataload_keepalive.py 'abort early')" "1"
+
 if [ -z "$E2E_ERRS" ]; then
-	echo "ok - §0926E2E 守卫通过（静态锁 33 条：吞错收口 7 + 暴露面 5 + 裁决口径 4 + 体验卫生 8 + 矩阵补位 9）"
+	echo "ok - §0926E2E 守卫通过（静态锁 36 条：吞错收口 7 + 暴露面 5 + 裁决口径 4 + 体验卫生 8 + 矩阵补位 9 + 保活加固 3）"
 else
 	echo "--- FAIL: §103 断言不符:${E2E_ERRS}"
 	exit 1

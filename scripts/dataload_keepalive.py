@@ -7,7 +7,8 @@
 #   2. 缺则补：baostock 日线增量 → 指数日线 → hithink 涨停池（当日）
 #      → hithink daily-k-10d（ths_daily 主源增量）；
 #   3. 幂等（全部 INSERT OR REPLACE / upsert），未拉齐则 10 分钟一轮至多 8 轮后退出，
-#      次日计划任务兜底。
+#      次日计划任务兜底；§0927KA 加无进展早停——连续两轮三表读数零变化即收手
+#      （09-26 实录：target 幻觉成休市日时 8 轮＝12h 空烧配额并锁死 dataload.exe）。
 #
 # §M6（2026-09-22 修复批）两处根治：
 #   ① 指数日线表头键名：pydata sidecar 的 CSV 表头契约（cmd/pydata/server.py _INDEX_FIELDS）
@@ -119,10 +120,17 @@ def _calendar_latest_open(today):
 
 # §M6-② 第二数据源：pydata sidecar /trade_days（baostock 交易日历，CSV calendar_date,is_open；
 # 日期可能带杠也可能不带，统一归一 YYYYMMDD；is_open 非 "1" 视为休市）。
+# §0927KA（2026-09-27 部署实录加固）：本函数顺手把拉到的日历行 INSERT OR REPLACE 回写
+# trade_cal（自愈）——现网实证该表停在 20260818 再无人刷新，第一数据源长期过旧全靠降级；
+# 回写后 trade_cal 每晚随保活自动维持近 45 天窗，降级链退化为真兜底。回写失败只留痕，
+# 绝不影响 target 推导本身（写库竞态/表锁死不得把保活打挂）。
+# （English: this fallback also self-heals trade_cal with the fetched window, so the
+# first calendar source no longer rots; persistence errors never affect target resolution.）
 def _pydata_latest_open(today):
     start = (today - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     best = ""
+    rows = []  # §0927KA 自愈素材：(归一日期, is_open int)
     try:
         url = "%s/trade_days?start=%s&end=%s" % (PYDATA, start, end)
         text = urllib.request.urlopen(url, timeout=10).read().decode("utf-8", "replace")
@@ -130,11 +138,27 @@ def _pydata_latest_open(today):
             return ""
         for r in csv.DictReader(_io.StringIO(text)):
             d = str(r.get("calendar_date", "")).replace("-", "")
-            if _valid_yyyymmdd(d) and str(r.get("is_open", "")).strip() in ("1", "1.0") and d > best:
+            if not _valid_yyyymmdd(d):
+                continue
+            op = str(r.get("is_open", "")).strip() in ("1", "1.0")
+            rows.append((d, 1 if op else 0))
+            if op and d > best:
                 best = d
     except Exception as e:
         log("pydata trade_days err (fallback to weekday approx): %r" % e)
         return ""
+    # §0927KA 回写 trade_cal（骨架与 internal/store/store.go 建表语句逐字同形）。
+    try:
+        if rows:
+            c = sqlite3.connect(DB, timeout=30)
+            c.execute("CREATE TABLE IF NOT EXISTS trade_cal ("
+                      "cal_date TEXT PRIMARY KEY, is_open INTEGER)")
+            c.executemany("INSERT OR REPLACE INTO trade_cal (cal_date, is_open) VALUES (?,?)", rows)
+            c.commit()
+            c.close()
+            log("§0927KA trade_cal self-heal: upserted %d calendar rows" % len(rows))
+    except Exception as e:
+        log("§0927KA trade_cal self-heal err (target derivation unaffected): %r" % e)
     return best
 
 
@@ -254,19 +278,42 @@ def one_round(target):
     return ok
 
 
+# §0927KA 无进展早停快照：三张核心表的最新交易日元组（与 one_round 判定表同集合）。
+# 09-26 实录：target 被误推导成休市日（幻觉目标）时，每轮 1.5h 的日线补数永远追不平，
+# 8 轮＝约 12h 空烧 baostock 配额并锁死 dataload.exe（挡掉一次生产部署）。幻觉来源修不尽，
+# 用「连续两轮三表读数零变化」这一与目标无关的信号兜住失控放大面：真缺数据必然伴随读数
+# 变化或新行写入，零进展连踩两轮即收手，留 rc=1 与日志明细供次日人工/自动复核。
+def _core_snap():
+    return tuple(latest(t) for t in ("daily", "index_daily", "ths_limit_up_daily"))
+
+
 # 保活主流程：取最新交易日并对数据加载链路做一轮心跳检查/补数。
 def main():
     log("keepalive run start pid=%d" % os.getpid())
     target = last_trade_date()
     done = False
+    last_snap = _core_snap()   # §0927KA 首轮进场前的基线快照
+    no_progress = 0             # §0927KA 连续零进展轮数（见 _core_snap 注释）
     for rnd in range(8):
         if one_round(target):
             log("all fresh up to %s (round %d) — exit" % (target, rnd + 1))
             done = True
             break
+        snap = _core_snap()
+        if snap == last_snap:
+            no_progress += 1
+            log("no progress (snap unchanged %s) round %d" % ("/".join(snap or ()), rnd + 1))
+            if no_progress >= 2:
+                # §0927KA 早停：target 很可能是幻觉（休市日误判/日历源同时失真），
+                # 继续跑只会空烧配额并锁 exe——明日的保活轮次与人工处置是正解。
+                log("no progress 2 rounds — abort early (target %s suspect, calendar sources stale?)" % target)
+                break
+        else:
+            no_progress = 0
+        last_snap = snap
         time.sleep(600)
     if not done:
-        log("gave up for %s after 8 rounds; next daily run will retry" % target)
+        log("gave up for %s after %d rounds; next daily run will retry" % (target, rnd + 1))
     return 0 if done else 1
 
 
