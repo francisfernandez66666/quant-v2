@@ -237,7 +237,9 @@ func TestFillAmendmentRealizedPnlUsesEffectiveSide(t *testing.T) {
 	if err != nil || p.Qty <= 0 {
 		t.Fatalf("position book: %v %+v", err, p)
 	}
-	want := (22.55 - p.CostPrice) * 900
+	// §0927AUDIT-D1（2026-09-27 修复批）：熔断闸口径与 trades 重放同步扣卖出腿费用——
+	// 本夹具卖出腿 Fee=5、StampTax=10.15，want 必须一并减掉，此断言同时钉死新口径。
+	want := (22.55-p.CostPrice)*900 - mis.Fee - mis.StampTax
 	pnl, err := db.TodayRealizedPnl("u_amend", amendDay)
 	if err != nil {
 		t.Fatalf("pnl: %v", err)

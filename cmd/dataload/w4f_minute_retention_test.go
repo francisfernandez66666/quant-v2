@@ -4,6 +4,7 @@
 //  2. 回填模式**不裁剪**（回填自己喂进来的就是历史窗口，边灌边删等于自残）；
 //  3. keep-days=0 关闭裁剪（显式口径，不是"忘了配"造成的静默全删）；
 //  4. 裁剪失败不翻转本轮落库成功（卫生问题 ≠ 装载失败），锚点行仍出门。
+//
 // store.PruneMinuteBars 自身边界（严格早于 cutoff、形态非法拒删）在 internal/store 侧另有锁。
 // English: §0926E2E-17B minute-bar retention tests — incremental runs prune, backfill never
 // prunes, keep-days=0 disables, prune errors don't flip sync success; store-level boundary

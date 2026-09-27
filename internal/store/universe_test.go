@@ -65,12 +65,14 @@ func TestUniverseAtPointInTime(t *testing.T) {
 }
 
 // TestUniverseAtNullDelistIsStillListed §B4-PIT NULL 口径锁：装载时没带 delist_date 列的
-// 老 stocks 行（值为 NULL）必须按"仍在市"进池——SQL 三值逻辑下 `delist_date = '' OR
-// delist_date > ?` 对 NULL 整体为 NULL，旧写法会把在市的票静默逐出时点池（池悄悄缩水比
+// 老 stocks 行（值为 NULL）必须按"仍在市"进池——SQL 三值逻辑下 `delist_date = <空串字面量> OR
+// delist_date > ?` 对 NULL 整体为 NULL（空串字面量的原文见函数体注释，防 gofmt doc 规范化
+// 吃掉相邻单引号），旧写法会把在市的票静默逐出时点池（池悄悄缩水比
 // 显式降级更坏）。§B2 回放财务输入的 collect 用例实踩后补的这条锁。
 // English: a NULL delist_date (legacy insert without the column) must count as still-listed —
 // the old two-branch predicate yielded NULL and silently evicted live stocks from the PIT universe.
 func TestUniverseAtNullDelistIsStillListed(t *testing.T) {
+	// SQL 原文（universe 谓词，放函数体防 doc 规范化吃掉相邻单引号）：delist_date = '' OR delist_date > ?
 	db := testDB(t)
 	if _, err := db.InsertRows("stocks", TableColumns("stocks"), []map[string]any{
 		{"ts_code": "600010.SH", "name": "老行无退市列", "list_date": "20180101"},

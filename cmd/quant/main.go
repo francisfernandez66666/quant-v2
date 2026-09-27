@@ -15,8 +15,9 @@
 //     交易日滚动清空、盘后复盘、监控池同步；
 //     - 主循环（main for-loop）：按市场时段（盘前/午前/盘中）异步驱动顶层编排
 //     引擎，盘前"跑完即排下一轮"，盘中用自适应等待（新新闻到达或超时兜底）。
-//  4. 信号处理与优雅停机：捕获 SIGTERM/SIGINT，先关 HTTP、停触发引擎与采集器、
-//     停新闻代理，再退出，保证状态文件完整落盘（不再走 defer 链）。
+//  4. 信号处理与优雅停机：捕获 SIGTERM/SIGINT，先关 HTTP、停触发引擎，再取消根 ctx
+//     让主循环退出、main 自然 return，defer 链（采集器/行情馈线/新闻代理 Stop 与句柄
+//     关闭）统一收尾落盘（§0927AUDIT-D4：不再走 os.Exit 跳过 defer）。
 //  5. 辅助函数：部署自检（verifyDeployment）、时段追回起点计算（sinceForSession）、
 //     数据目录解析（getDataDir）、端口绑定（pickListener）、密钥脱敏（redact）等。
 //
@@ -114,6 +115,17 @@ func main() {
 	}
 	if !authMgr.IsInitialized() {
 		log.Printf("全新部署：请打开 http://<host>:8080/setup 创建管理员账号（不再提供默认口令 admin/admin123）")
+		// §0927AUDIT-D2（2026-09-28 修复批）：Go 侧 §P1-5 语义是"SETUP_TOKEN 非空才强制"
+		// （w2a 反证用例 TestW2aUnsetTokenKeepsOpen 钉死未配置不得拦，不能改 fail-close）。
+		// 部署腿已由 §0926E2E-W2A 收编（广州 deploy_guangzhou.sh / Windows
+		// register_engine_services.ps1 都保底生成并注入），本批补的是**可见性**：
+		// 库未初始化且令牌缺省＝"任何能触达端口的人可抢跑建号"的敞开窗口，
+		// 旧实现只打一行温和提示，现升级为醒目告警 + opslog 留痕（巡检可取证）。
+		if os.Getenv("SETUP_TOKEN") == "" {
+			log.Printf("[main] ⚠⚠ P1 告警：数据库未初始化且 SETUP_TOKEN 未配置——POST /setup 处于无令牌敞开窗口。" +
+				"请尽快完成初始化，或在 /etc/quant.env（Windows 密钥文件）配置 SETUP_TOKEN 后重启。§0927AUDIT-D2")
+			opslog.Logf("quant", "SETUP 敞开窗口告警：未初始化且 SETUP_TOKEN 缺省（§P1-5 fail-open 语义，部署腿见 §0926E2E-W2A）")
+		}
 	}
 
 	// 行情客户端：东财行情 API + 同花顺板块出口（板块列表/涨跌幅/主力净流入）
@@ -570,6 +582,16 @@ func main() {
 	// loops, then let deferred writers flush, avoiding half-written JSON files.
 	stop := make(chan os.Signal, 2)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+
+	// §0927AUDIT-D4（2026-09-28 修复批）：根 ctx 升级为可取消，退出裁定权收归它——
+	// 旧实现停机 goroutine 末尾 os.Exit(0)（§W3-c 只把 fetcher/nAgent 的 Stop 提到
+	// Exit 前，其余 defer（打分循环取消、行情馈线停、状态文件句柄关闭等）仍被跳过）。
+	// 现在停机 goroutine 只做「关 HTTP + 取消根 ctx」，主循环 select ctx.Done() 退出、
+	// main 自然 return、defer 链按 LIFO 统一收尾——信号路径与正常退出走同一段收尾代码，
+	// Stop 调用点也从「goroutine+defer 两处」收敛回 defer 一处（消除双 Stop 隐患）。
+	ctx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+
 	go func() {
 		<-stop
 		log.Println("[main] 收到退出信号，正在优雅停机…")
@@ -577,18 +599,10 @@ func main() {
 		defer cancel()
 		_ = hs.Shutdown(shutdownCtx)
 		trigCancel()
-		// §W3-c 根修：旧实现此处 os.Exit(0) 直接跳过 main 的全部 defer——
-		// nAgent.Stop/fetcher.Stop 永不执行（注释宣称"最终落盘"与实现相反），
-		// 非原子写状态文件可能被拦腰截断。改为显式执行关键 Stop 后再退出，
-		// 与 defer 链语义对齐（scoreLoopCancel 等由 ctx 派生自动生效）。
-		fetcher.Stop()
-		nAgent.Stop()
-		log.Println("[main] 优雅停机完成")
-		os.Exit(0)
+		cancelRoot() // 主循环/自适应等待随根 ctx 退出；落盘收尾由 main 的 defer 链统一执行
+		log.Println("[main] 退出信号已广播（根 ctx 取消），主循环与 defer 链收尾中…")
 	}()
 
-	// 主循环根 ctx：驱动引擎异步 run 上下文（随进程生命周期存活，不做取消）。
-	ctx := context.Background()
 	log.Println("quant-trading-v2 已启动")
 
 	// §0926E2E-MX3（2026-09-27 四波·矩阵补位#3）LLM 真实池周度例行探测：
@@ -673,7 +687,15 @@ func main() {
 	// 盘前（8:30-9:15）"跑完即排下一轮"：等待异步引擎完成后立即触发下一轮，最大化新闻归因轮次，
 	// 让昨夜晚间新闻在开盘前尽可能完成 LLM 归因（配合未归因队列失败重试）；
 	// 其他时段按 5 分钟节奏推进，asyncBusy 忙锁防并发重入。
+mainLoop:
 	for {
+		// §0927AUDIT-D4（2026-09-28 修复批）：每轮开头先核根 ctx——收到退出信号（cancelRoot）
+		// 即跳出主循环，main 自然 return 走 defer 链收尾；退出不再依赖停机 goroutine 里的 os.Exit。
+		select {
+		case <-ctx.Done():
+			break mainLoop
+		default:
+		}
 		now := time.Now()
 		session := data.CurrentSession(now)
 		since, ok := sinceForSession(session, now)
@@ -682,7 +704,10 @@ func main() {
 			engines := registry.All()
 			if len(engines) == 0 {
 				// 尚无账号登录/懒加载引擎，跳过本轮（等服务有账号时再驱动）
-				time.Sleep(5 * time.Minute)
+				// §0927AUDIT-D4：5 分钟心跳改根 ctx 感知——停机时不必等下一轮，直接退出。
+				if !sleepOrStop(ctx, 5*time.Minute) {
+					break mainLoop
+				}
 				continue
 			}
 			if session == data.SessionPreMarket {
@@ -707,7 +732,13 @@ func main() {
 					if allIdle {
 						break
 					}
-					time.Sleep(500 * time.Millisecond)
+					// §0927AUDIT-D4：盘前轮询同样 ctx 感知——停机时不等引擎空闲
+					// （在途 LLM 归因轮可达分钟级），直接交棒主循环出口。
+					select {
+					case <-ctx.Done():
+						break mainLoop
+					case <-time.After(500 * time.Millisecond):
+					}
 				}
 				continue // 立即下一轮，不 sleep 5min
 			} else {
@@ -734,7 +765,31 @@ func main() {
 		} else {
 			log.Printf("[main] Session=%s 非处理时段, 跳过本轮", session)
 		}
-		time.Sleep(5 * time.Minute)
+		// §0927AUDIT-D4：轮间 5 分钟心跳可被退出信号提前叫醒（旧 os.Exit 秒杀，
+		// 改正规收尾后若不叫醒，SIGTERM 最坏要多睡 5 分钟才走 defer）。
+		if !sleepOrStop(ctx, 5*time.Minute) {
+			break mainLoop
+		}
+	}
+	// §0927AUDIT-D4：走到这里＝主循环已退出（唯一正常路径是根 ctx 被停机 goroutine 取消）。
+	// main 返回后 defer 链按 LIFO 执行（打分循环取消 → 采集器/行情馈线/新闻代理 Stop、
+	// 状态文件句柄关闭），这正是旧实现 os.Exit(0) 一直跳过的那段收尾。
+	log.Println("[main] 主循环已退出，进入 defer 链收尾（优雅停机）")
+}
+
+// sleepOrStop §0927AUDIT-D4（2026-09-28 修复批）：可被根 ctx 提前叫醒的睡眠。
+// 返回 false＝ctx 已取消（调用方应立即退出主循环，交给 defer 链收尾）；
+// 返回 true＝睡满 d 自然醒来。旧实现各处裸 time.Sleep 在 os.Exit 时代无所谓
+// （进程反正被秒杀），改正规退出后若不叫醒，SIGTERM 最坏要拖满一个心跳周期才走。
+// English: ctx-aware sleep for the main loop heartbeat; false means "quit now".
+func sleepOrStop(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 

@@ -69,6 +69,7 @@ func TestAvailableCashThreeStates(t *testing.T) {
 //   - 正确实现（cntime.Loc 解析）：判过期 fresh=false；
 //   - 回归实现（time.Local 解析）：北京串被当 UTC 读成「未来 8 小时」，Since 为负恒判
 //     新鲜，过期资金放行 fresh=true——正是 §M12-A fail-close 要拦的 H-4 同族形态。
+//
 // 即：删掉修复本测试必红（反证成立）。夹具不并发跑（包内无 t.Parallel，改全局
 // time.Local 仅此一处，收尾必还原）。
 // English: regression lock — with time.Local faked to UTC (container default), a 40-min-old

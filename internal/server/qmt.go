@@ -455,7 +455,7 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	//   - 限价偏离市价 ±20% 也直发（手滑输错价 = 真金白银）；
 	//   - 陈旧度未提供（StaleQuoteGuard 恒跳过）。
 	var q *data.StockInfo
-	var staleMs int64 = -1 // -1=无行情（StalenessMs 未知，守卫跳过）；取到行情后置 0（新鲜）
+	var staleMs int64 = -1                                        // -1=无行情（StalenessMs 未知，守卫跳过）；取到行情后置 0（新鲜）
 	quoteAvailable := s.market != nil || s.quoteForOrderFn != nil // 行情链在场（含测试缝注入）
 	if quoteAvailable {
 		// best-effort 拉实时行情：失败/无价不再静默放行（见下方 §0926E2E-W1C 分支）。

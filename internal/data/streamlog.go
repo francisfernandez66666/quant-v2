@@ -30,8 +30,8 @@ const streamLogKeepDays = 30
 // Beijing day archives the previous content as quote_stream-YYYYMMDD.jsonl and starts fresh.
 type StreamLog struct {
 	mu    sync.Mutex
-	path  string     // 当前活动文件路径（轮转后仍是它）
-	day   string     // 活动文件所属北京日期 YYYYMMDD
+	path  string // 当前活动文件路径（轮转后仍是它）
+	day   string // 活动文件所属北京日期 YYYYMMDD
 	f     *os.File
 	w     *bufio.Writer
 	tick  int

@@ -1066,7 +1066,23 @@ echo "==> 51 §UX-TRUTH 前端错误呈现层与移动壳推送定向（2026-09-
 # 主题=「失败绝不伪装成空态/成功」：保存失败要回滚+真 toast、脏余额不进 localStorage、
 # 403 止血必须覆盖在飞轮询链尾、四个页面的首屏失败要有错误态、推送别名按账号派生、
 # 空 apk_url 不能只剩「退出」。
-( cd web && npm test -- h2_positions_balance m9_error_tri_state m13_forbidden_poll ) 2>&1 | grep -E 'Test Files|passed|failed'
+# §0927AUDIT 门禁自修（2026-09-28 实录）：旧写法把 vitest 直接管道进 grep，pipefail 下
+# 真红时脚本**裸死**——只留下被 grep 过滤后的汇总行，连 "--- FAIL" 归属都没有（本轮
+# 51 段首跑即撞冷启动假红，排查全靠人工复现）。改为先收全文再判红，✕ 行随段输出。
+# §0927AUDIT 二修（2026-09-28 凌晨，同段连续两轮门禁内假红 × 门禁外必绿）：
+#  ① --no-file-parallelism：三文件各拖一份 TDesign+React 重组件，并行 worker 冷 transform
+#     同时挤满核心时，用例内 5s 级 DOM 轮询被拖挂出假红（三例独立/冷缓存复跑全绿，红项
+#     只在门禁全量语境复现＝负载产物）；串行跑只动调度不动任何断言阈值（D5 教训：不放宽
+#     阈值来掩盖基建脆弱）。
+#  ② 判红时改输出「Failed Tests」全段（旧 ✕ 行筛选看不到 AssertionError/Unable to find 正文，
+#     两次假红都只能靠人工复现定位，违反"红项当场可读"排障纪律）。
+UX_VITEST=$( cd web && npm test -- h2_positions_balance m9_error_tri_state m13_forbidden_poll --no-file-parallelism 2>&1 || true )
+printf '%s\n' "$UX_VITEST" | grep -E 'Test Files|Tests +[0-9]' || true
+if printf '%s\n' "$UX_VITEST" | /usr/bin/grep -qE '[1-9][0-9]* (failed|error)'; then
+	echo "--- FAIL: §51 §UX-TRUTH 前端行为锁（h2/m9/m13 三文件）判红，失败全段如下："
+	printf '%s\n' "$UX_VITEST" | sed -n '/Failed Tests/,$p' | head -80
+	exit 1
+fi
 grep -q "import { showToast } from '../ui.jsx'" web/src/pages/Positions.jsx || { echo "--- FAIL: showToast 导入再次缺失（H-2 失败分支 ReferenceError 复活）"; exit 1; }
 grep -q 'balancePendingRef' web/src/pages/Positions.jsx || { echo "--- FAIL: 脏余额不入缓存守卫丢失（H-2 第三腿）"; exit 1; }
 grep -q 'pollingDeadRef' web/src/pages/Quant.jsx || { echo "--- FAIL: 在飞轮询链止血标志丢失（M-6：stopPolling 管不住链尾 /api/risk/gates）"; exit 1; }
@@ -4447,6 +4463,87 @@ else
 	echo "--- FAIL: §103 断言不符:${E2E_ERRS}"
 	exit 1
 fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# §104 §0927AUDIT-D3（2026-09-28 修复批）：本地门禁与 CI 的 gofmt 口径对齐。
+# 背景：CI 第一道就是 `gofmt -l internal cmd`（ci.yml:36-42），而本门禁 103 段
+#   历史全文从不提 gofmt ⇒「本地全绿 / CI 红」漂移。09-27 全栈字节级 UAT 报告 D3
+#   锤实现行时点：HEAD 树上 13 个文件被 gofmt 判违规（含 server.go/qmt.go 本体）。
+# 本批已把 13 文件全部 gofmt -w 清零；过程中锤到一个工具族新知识：**gofmt 的 doc
+#   注释规范化会把相邻两个单引号（SQL 空串字面量 `''`）改写成单个右双引号 ”**，
+#   函数体内的普通行注释不受影响——doc 注释里要写 SQL 空串原文时，把字面量挪进
+#   函数体注释（见 pnl_offset_test.go / universe_test.go 的留痕写法）。
+# 预演读数（09-28）：清理后 `gofmt -l internal cmd` 输出 0 行（先预演后入段纪律）。
+# §89 自指锁同口径：管道失败不吞退出码，`|| true` 兜住赋值。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 104 §0927AUDIT-D3 gofmt 与 CI 同段（gofmt -l internal cmd 必须为空）..."
+GOFMT_DIRTY=$(gofmt -l internal cmd 2>/dev/null || true)
+if [ -n "$GOFMT_DIRTY" ]; then
+	echo "--- FAIL: §104 以下文件未过 gofmt（CI 第一道必红，本地绿≠真绿）："
+	printf '%s\n' "$GOFMT_DIRTY" | sed 's/^/  /'
+	exit 1
+fi
+echo "ok - §0927AUDIT-D3 守卫通过（gofmt -l 0 文件，与 ci.yml:36-42 同口径）"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §105 §0927AUDIT 修复批专项静态锁（2026-09-28 凌晨批：D1/D2/D4/D5 + 独立 UAT 脚本自纠 + 门禁自修）
+# 主题：把「审计报告锤实、本批落码」的六处关键口径钉成机器锁，防回潮。
+# 预演读数（09-28 00:3x，先预演后入段）：费用腿公式行=1；-509 期望=1；main.go 真实
+# os.Exit 调用行=0（6 处全在注释）；sleepOrStop 行=4；mainLoop: 标签=1；testTimeout:
+# 60000 行=1；indep 脚本自纠锚=1；” 字符在两个受害测试文件=0/0。
+# §89 纪律：计数型 grep 赋值一律 `|| true` 兜住（0 命中时 grep -c 退出码 1，pipefail 下会把
+# "全绿" 变 "裸死"）；行为腿先收全文再判红，红项当场可读。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 105 §0927AUDIT D1/D2/D4/D5 修复批专项静态锁 + 独立UAT脚本自纠 + gofmt-”防回潮（2026-09-28）..."
+
+# —— 行为腿：D1 已实现盈亏扣费回归（含方向锁用例，秒级）——
+RP=$(go test -count=1 ./internal/store/ -run 'TestTodayRealizedPnl' 2>&1 || true)
+if printf '%s\n' "$RP" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+	echo "--- FAIL: §105 D1 行为腿判红（TodayRealizedPnl 扣费回归），全文如下："
+	printf '%s\n' "$RP" | head -40
+	exit 1
+fi
+printf '%s\n' "$RP" | grep -E '^ok' || { echo "--- FAIL: §105 D1 行为腿没跑到（无 ok 行＝用例可能被改名/删除）"; exit 1; }
+
+# —— D1 公式锚：卖出腿费用必须从已实现盈亏里扣（费用不入账＝熔断闸系统性低估亏损）——
+grep -q -- "- f.Fee - f.StampTax" internal/store/risk_gates.go \
+	|| { echo "--- FAIL: §105 D1 费用腿公式锚丢失（TodayRealizedPnl 回到未扣费口径）"; exit 1; }
+grep -q "const want = -509" internal/store/realized_pnl_fee_test.go \
+	|| { echo "--- FAIL: §105 D1 含费期望值 -509 锚丢失（方向锁被放宽＝假绿温床）"; exit 1; }
+
+# —— D4 优雅停机锚：main.go 不得复活真实 os.Exit 调用（旧缺陷=跳过 defer 链丢数据）——
+MAIN_EXIT=$(grep -cE '^[[:space:]]*os\.Exit\(' cmd/quant/main.go || true)
+[ "${MAIN_EXIT:-0}" = "0" ] || { echo "--- FAIL: §105 D4 os.Exit 真实调用复活（got=${MAIN_EXIT}，预期 0——收尾必须走 defer 链自然 return）"; exit 1; }
+SLEEP_STOP=$(grep -c "sleepOrStop" cmd/quant/main.go || true)
+[ "$SLEEP_STOP" = "4" ] || { echo "--- FAIL: §105 D4 sleepOrStop 锚计数漂移（got=$SLEEP_STOP 预演=4：定义+注释+两处心跳；信号可能又打不进睡眠）"; exit 1; }
+grep -q "mainLoop:" cmd/quant/main.go \
+	|| { echo "--- FAIL: §105 D4 mainLoop 标签丢失（退出信号无法跳出外层轮询循环）"; exit 1; }
+
+# —— D2 启动告警锚：敞开窗口显式留痕不得拆（fail-open 语义保留，但必须让运维看得见）——
+grep -q "POST /setup 处于无令牌敞开窗口" cmd/quant/main.go \
+	|| { echo "--- FAIL: §105 D2 SETUP_TOKEN 敞开窗口启动告警丢失（fail-open 由设计变回设计+隐身）"; exit 1; }
+
+# —— D5 超时收敛锚：60s 对冷 transform 是必要水位，回缩会复现「基建脆弱冒充产品缺陷」——
+grep -q "testTimeout: 60000" web/vitest.config.js \
+	|| { echo "--- FAIL: §105 D5 vitest testTimeout 回离 60000（冷 transform 39.6s 实录在前）"; exit 1; }
+
+# —— 独立 UAT 脚本自纠锚：构建指纹不一致必须计 FAIL（旧 else 分支 INFO+PASS 结构上永不为红）——
+grep -q "build_commit 与 git HEAD 不一致" tools/indep_byte_uat.sh \
+	|| { echo "--- FAIL: §105 独立 UAT 指纹对拍又回到永不为绿即通过的假检查"; exit 1; }
+
+# —— §51 门禁自修锚：三文件行为锁必须串行跑（并行冷 transform 挤满核心×2 轮门禁内假红）——
+grep -q -- "--no-file-parallelism" scripts/verify_changes.sh \
+	|| { echo "--- FAIL: §105 §51 串行调度锚丢失（并行三 jsdom 重组件文件=负载假红温床）"; exit 1; }
+
+# —— gofmt-”防回潮负锁：doc 注释里的 SQL 空串 '' 会被 gofmt 洗成单个右双引号 ”（本批实录炸过
+#    pnl_offset_test.go / universe_test.go 三处）；字面量已挪进函数体注释，两文件不得再出现 ”。
+#    预演读数=0/0；等值锁而非「≤」——一旦出现即说明有人又把 SQL 原文写回 doc 注释。——
+for f in internal/store/pnl_offset_test.go internal/store/universe_test.go; do
+	DQ=$(grep -c '”' "$f" || true)
+	[ "${DQ:-0}" = "0" ] || { echo "--- FAIL: §105 gofmt ” 腐蚀现身 ${f}（got=$DQ 预演=0——SQL 空串原文别写进 doc 注释，见 §104 说明）"; exit 1; }
+done
+
+echo "ok - §0927AUDIT 修复批守卫通过（行为腿 1 组 + 静态锁 10 道 + 负锁 2 枚）"
 
 echo ""
 echo "==> 全部通过"

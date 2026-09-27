@@ -2,6 +2,7 @@
 //  1. 严格早于 cutoff 才删：cutoff 当日 00:00:00 起的行必须留存（保留窗口按"整天"算）；
 //  2. 只裁目标 scale：日后若加 15/30/60 分钟周期，5 的裁剪不得波及别的 scale；
 //  3. cutoff 形态非法直接拒执行——字典序下坏前缀（如 "2026/01/01"）会误删大片，宁可不动。
+//
 // English: boundary locks for PruneMinuteBars — strictly-older rows only, per-scale, and
 // malformed cutoff rejection (lexicographic compare would mass-delete with a bad prefix).
 package store

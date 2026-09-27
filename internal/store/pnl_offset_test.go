@@ -1,6 +1,6 @@
 // pnl_offset_test.go — §E1 盈亏单轨：纸面「清零」校准记录入库的存储层单测。
 // 锁三件事：① 当前生效值=最新一行（append-only，不覆盖历史）；② 空表按 0（从未校准）
-// 而不是报错；③ 遗留全局行（user_id=''）能被任意账号读到（与 real_account 兜底同姿势）。
+// 而不是报错；③ 遗留全局行（user_id 为空串）能被任意账号读到（与 real_account 兜底同姿势）。
 // English: §E1 store tests — latest-wins offset semantics, empty-table = 0, legacy global row fallback.
 package store
 
@@ -31,9 +31,11 @@ func TestPnlOffsetLatestWins(t *testing.T) {
 	}
 }
 
-// TestPnlOffsetLegacyGlobalRow 遗留全局行（user_id=''）对任意账号可见——
-// 与 GetRealAccount 的「user_id = ? OR user_id = ''」兜底同款，避免收编前的手工账凭空失效。
+// TestPnlOffsetLegacyGlobalRow 遗留全局行（user_id 为空串）对任意账号可见——
+// 与 GetRealAccount 的空串兜底同款（SQL 原文钉在函数体注释里，防 gofmt doc 规范化吃掉相邻单引号），
+// 避免收编前的手工账凭空失效。
 func TestPnlOffsetLegacyGlobalRow(t *testing.T) {
+	// SQL 原文：user_id = ? OR user_id = ''
 	db := testDB(t)
 	if _, err := db.AddPnlOffset(PnlOffsetRecord{UserID: "", Offset: 66, Note: "全局行"}); err != nil {
 		t.Fatalf("全局行入账失败: %v", err)

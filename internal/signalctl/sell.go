@@ -136,8 +136,8 @@ type sellState struct {
 	ConfirmedAction string
 	// ConfirmedAt 结论确认发生的时刻——§0926E2E-11A 重放新鲜度闸的判据（只重放确认当日）。
 	ConfirmedAt time.Time
-	HighPrice       float64
-	Extends         int // 已延持次数（留痕用，不设上限：信号持续=按设计拿着，深破线兜底）
+	HighPrice   float64
+	Extends     int // 已延持次数（留痕用，不设上限：信号持续=按设计拿着，深破线兜底）
 }
 
 // sellKey 卖出状态键：(通道, 账号, 代码)——与买入探针同构，live/paper 天然隔离。

@@ -60,7 +60,7 @@ func TestGateUnknownSideDoesNotSkipDirectionalGates(t *testing.T) {
 	db := gateDB(t)
 	g := NewGate(db, "u_side", nil)
 	cfg := qmtCfg()
-	cfg.RiskGate.LimitUpBlockBuy = true    // 涨停拒买闸开
+	cfg.RiskGate.LimitUpBlockBuy = true             // 涨停拒买闸开
 	cfg.RiskGate.LimitDownBlockSell = boolPtr(true) // 跌停拒卖闸开
 	today := cntime.In(g.now()).Format("2006-01-02")
 

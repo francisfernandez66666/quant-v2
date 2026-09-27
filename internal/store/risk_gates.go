@@ -144,7 +144,7 @@ func (d *DB) SumSellFilledAmountByDay(userID, day string) (float64, error) {
 }
 
 // TodayRealizedPnl 日内已实现盈亏（元，正=盈利，负=亏损）：
-// Σ 今日卖出成交 (fillPrice − 成本) × 数量。成本取该 code 当前持仓 CostPrice（已清仓则回落
+// Σ 今日卖出成交 [(fillPrice − 成本) × 数量 − 卖出腿费用(Fee+StampTax)]。成本取该 code 当前持仓 CostPrice（已清仓则回落
 // 到今日买入均价兜底）；成本不可知（无持仓且无买入成交）时该笔 fail-open 不计入——
 // 熔断闸宁可漏计也不因数据缺口误熔断。English: intraday realized P&L in yuan — Σ today's sell fills
 // (fillPrice − cost) × qty; cost = the current position's CostPrice, falling back to today's average
@@ -164,7 +164,15 @@ func (d *DB) TodayRealizedPnl(userID, day string) (float64, error) {
 		if cost <= 0 {
 			continue // fail-open：成本不可知不计入
 		}
-		pnl += (f.Price - cost) * float64(f.Qty)
+		// §0927AUDIT-D1（2026-09-27 修复批）：卖出腿费用（佣金+印花税）必须从已实现盈亏中
+		// 扣除——/api/qmt/trades 的重放腿（qmt.go sellPnl）自 §F1 起就扣，而本函数旧实现只算
+		// 价差×量：同一笔卖出两个读数点的数不同，违反 settlement.go 对 ListFillsByDay
+		// 「熔断闸与 trades 必须是同一个数」的不变量声明，且闸看到的亏损系统性偏小
+		// （少扣的费用＝低估的亏损）。买入腿费用不在此扣：ApplyRealFill 已把佣金摊进
+		// 持仓成本（§F1），CostPrice 口径本身含费。
+		// English: deduct the sell-side fee and stamp tax so this reader matches the trades
+		// replay leg exactly (the day-loss breaker must see the same number the fills page shows).
+		pnl += (f.Price-cost)*float64(f.Qty) - f.Fee - f.StampTax
 	}
 	return pnl, nil
 }
