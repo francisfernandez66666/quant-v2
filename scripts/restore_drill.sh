@@ -2,7 +2,8 @@
 # restore_drill.sh — §WS-A A1 备份恢复演练（RPO/RTO 验证）。
 # 取最近一次备份产物，恢复到隔离的演练目录，断言：
 #   1) live.db / trading.db 均存在且 PRAGMA integrity_check=ok
-#   2) live.db 实盘账本四表（real_positions/orders/fills/real_account）可读且非零规模
+#   2) live.db 实盘账本四表（real_positions/orders/fills/real_account）**查询不报错**
+#      （REQUIRE_NONEMPTY=1 时再要求行数>0；默认不判，理由见下面环境变量段）
 #   3) auth.json / config.json 存在且权限 0600
 #   4) accounts/ 目录非空（多账号数据完好）
 # 演练不触碰生产数据目录（只读源 + 独立目标）。失败返回非零（供 nightly/CI 告警）。
@@ -20,6 +21,20 @@
 #   DRILL_DIR    演练恢复目标目录（默认 /tmp/quant-restore-drill，用后即删）
 #   ARTIFACT     产物布局：auto（默认）| mac | guangzhou —— 自动判定歧义时人工指定
 #   SNAP_MAX_AGE_HOURS 广州 SNAPSHOT_OK 新鲜度上限（默认 30，>26h 的 Mac 拉取器守卫留余量）
+#   REQUIRE_SQLITE       缺 sqlite3 时是否判红（默认 1=判红；0 才允许跳过完整性腿）
+#   REQUIRE_NONEMPTY     默认 0：四表只断「可读」（查询报错即红）；置 1 则再断「行数>0」。
+#                        为什么默认不数非零：真实新账号的 fills 可以合法为 0（还没成交过），
+#                        把它硬判红等于每次演练都红，然后被人关掉——那比不判更糟。
+#   DRILL_RECORD         默认空=不落档；给路径则每次演练**追加一行 JSON 读数**
+#                        （时间/布局/产物/四表行数/结果），供定时腿回看"演练到底跑没跑过"。
+#
+# §0929OPS-⑪-5（2026-09-29 全量审计批）两处"演练自己骗自己"收口：
+#   ① 原先三处 sqlite3 判断都是 `if command -v sqlite3 …`，机器上没装 sqlite3 时**整段静默跳过**，
+#      脚本照样打「✅ 全部通过」——这正是本仓锤过的「降级链兜住死分支」形态（产物能打开不算验收，
+#      须知道产物由哪条路径产出）。现改为 fail-closed：缺 sqlite3 直接判红，除非显式 REQUIRE_SQLITE=0。
+#   ② 文件头一直承诺四表"可读且非零规模"，代码里却只 echo 行数、连查询失败（N=ERR）都不判红
+#      （文档与实现不一致＝读文档的人以为有这道闸）。现按承诺落成"可读"硬断言，"非零"留给
+#      REQUIRE_NONEMPTY 开关，并把口径写回头部，不再留空头承诺。
 #
 # English: §WS-A A1 restore drill — picks the newest backup artifact, restores into an isolated dir,
 # and asserts DB integrity + core book tables + key JSONs + accounts/. Understands BOTH the Mac
@@ -34,6 +49,53 @@ BACKUP_DIR="${BACKUP_DIR:-${DATA_DIR}/backups}"
 DRILL_DIR="${DRILL_DIR:-/tmp/quant-restore-drill}"
 ARTIFACT="${ARTIFACT:-auto}"
 SNAP_MAX_AGE_HOURS="${SNAP_MAX_AGE_HOURS:-30}"
+REQUIRE_SQLITE="${REQUIRE_SQLITE:-1}"
+REQUIRE_NONEMPTY="${REQUIRE_NONEMPTY:-0}"
+DRILL_RECORD="${DRILL_RECORD:-}"
+
+# sqlite3 是这条链的主闸（integrity_check + 四表可读全靠它），fail-closed 单点判定：
+# 缺失即红，而不是"后面三处 if 都不进、最后打一条全部通过"。
+# 这里只置位，真正判红放在 fail() 定义之后（要留档就得等落档函数就绪）。
+HAS_SQLITE=0
+if command -v sqlite3 >/dev/null 2>&1; then
+    HAS_SQLITE=1
+fi
+
+# 演练读数收集（供 DRILL_RECORD 落档）：各段往里塞「键<TAB>值」，收尾拼成一行 JSON。
+# 用临时文件而不是变量，是因为 set -eu 下中途 fail() 直接 exit 1，失败那次也要留下"跑到哪崩了"。
+STATS_FILE="$(mktemp 2>/dev/null || echo /tmp/quant-restore-drill-stats.$$)"
+: > "$STATS_FILE"
+stat_put() {
+    printf '%s\t%s\n' "$1" "$2" >> "$STATS_FILE"
+}
+# 纯 bash 拼 JSON（不依赖 python：演练环境可能就是台没装 python3 的机器，留痕腿不能反过来
+# 把判据腿拖下水）。落档不可写只打警告、不改演练结果——DRILL_RECORD 是留痕不是判据。
+write_record() {
+    local res="$1"
+    [ -n "$DRILL_RECORD" ] || return 0
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$(dirname "$DRILL_RECORD")" 2>/dev/null || true
+    {
+        printf '{"ts":"%s","result":"%s","layout":"%s","artifact":"%s"' "$ts" "$res" "${LAYOUT:-unknown}" "${LATEST:-none}"
+        while IFS=$'\t' read -r k v; do
+            [ -n "$k" ] || continue
+            printf ',"%s":"%s"' "$k" "$v"
+        done < "$STATS_FILE"
+        printf '}\n'
+    } >> "$DRILL_RECORD" 2>/dev/null || echo "[restore-drill] 警告: 落档失败（$DRILL_RECORD 不可写），判据结果不受影响"
+}
+
+# 统一失败出口（定义早于任何判定，保证每次红都留得下一行读数）：
+# 报错文案先剥掉双引号/反斜杠——落档是一行 JSON，带引号的中文文案会把 JSON 撑裂，
+# 而「记录写坏」绝不能反过来把演练结果改成看不出红绿。
+fail() {
+    echo "[restore-drill] 失败: $1"
+    stat_put "error" "$(printf '%s' "$1" | tr -d '\"\\')"
+    write_record "fail"
+    rm -f "$STATS_FILE"
+    exit 1
+}
 
 LATEST=$(ls -1dt "${BACKUP_DIR}"/20* 2>/dev/null | head -1 || true)
 if [ -z "$LATEST" ]; then
@@ -42,8 +104,9 @@ if [ -z "$LATEST" ]; then
     if [ -f "${BACKUP_DIR}/SNAPSHOT_OK" ]; then
         LATEST="$BACKUP_DIR"
     else
-        echo "[restore-drill] 失败: 未找到任何备份目录（${BACKUP_DIR}/20*，也不是广州快照根）"
-        exit 1
+        # 走统一失败出口而不是裸 exit：「一次演练压根没找到产物」是最该留档的那种红
+        #（定时腿看的就是这个——产物目录空了说明备份链断了，而人不会每天盯 stdout）。
+        fail "未找到任何备份目录（${BACKUP_DIR}/20*，也不是广州快照根）"
     fi
 fi
 echo "[restore-drill] 最近备份: ${LATEST}"
@@ -51,10 +114,11 @@ echo "[restore-drill] 最近备份: ${LATEST}"
 rm -rf "$DRILL_DIR"
 mkdir -p "$DRILL_DIR"
 
-fail() {
-    echo "[restore-drill] 失败: $1"
-    exit 1
-}
+# 缺 sqlite3 的 fail-closed 判定（§0929OPS-⑪-5）：原先三处 `if command -v sqlite3` 会把
+# 完整性腿整段静默跳过、最后照样打「✅ 全部通过」，这里抬成硬判红，跳过必须显式表态。
+if [ "$HAS_SQLITE" != "1" ] && [ "$REQUIRE_SQLITE" = "1" ]; then
+    fail "本机缺 sqlite3，完整性与账本两条腿无法执行（REQUIRE_SQLITE 默认 1＝不默认通过；确要跳过请显式 REQUIRE_SQLITE=0）"
+fi
 
 # ── 产物布局判定（§P0-B）──────────────────────────────────────────────────────
 # 判据（按可靠性排序，命中即停）：
@@ -119,18 +183,28 @@ fi
 # 1) SQLite 完整性 + 核心表
 for DB in live.db trading.db; do
     [ -f "${LATEST}/${DB}" ] || fail "${DB} 不存在于备份"
-    if command -v sqlite3 >/dev/null 2>&1; then
+    stat_put "$DB.bytes" "$(wc -c < "${LATEST}/${DB}" | tr -d ' ')"
+    if [ "$HAS_SQLITE" = "1" ]; then
         OK=$(sqlite3 "${LATEST}/${DB}" "PRAGMA integrity_check;" | head -1)
         [ "$OK" = "ok" ] || fail "${DB} integrity_check=${OK}"
+        stat_put "$DB.integrity" "$OK"
         echo "[restore-drill] ${DB} integrity_check=ok"
+    else
+        echo "[restore-drill] 警告: REQUIRE_SQLITE=0，跳过 ${DB} integrity_check（这条腿本次没有执行）"
     fi
 done
 
-# 2) 实盘账本四表可读
-if command -v sqlite3 >/dev/null 2>&1; then
+# 2) 实盘账本四表可读（§0929OPS-⑪-5：查询失败从"只 echo 一行 ERR"抬成硬判红——
+#    表不在了演练还全绿，等于演练只验了文件能打开）。行数按 REQUIRE_NONEMPTY 决定是否再数。
+if [ "$HAS_SQLITE" = "1" ]; then
     for T in real_positions orders fills real_account; do
         N=$(sqlite3 "${LATEST}/live.db" "SELECT COUNT(*) FROM ${T};" 2>/dev/null || echo "ERR")
+        [ "$N" != "ERR" ] || fail "live.db.${T} 查询失败（表不存在或库不可读，布局=${LAYOUT}）"
         echo "[restore-drill] live.db.${T} rows=${N}"
+        stat_put "rows.$T" "$N"
+        if [ "$REQUIRE_NONEMPTY" = "1" ]; then
+            [ "$N" -gt 0 ] || fail "live.db.${T} 行数为 0（REQUIRE_NONEMPTY=1）"
+        fi
     done
 fi
 
@@ -138,6 +212,7 @@ fi
 for f in auth.json config.json; do
     [ -f "${JSON_DIR}/${f}" ] || fail "${f} 缺失（布局=${LAYOUT}，找的是 ${JSON_DIR}/${f}）"
     [ -s "${JSON_DIR}/${f}" ] || fail "${f} 是 0 字节（布局=${LAYOUT}）——空文件也算「存在」的话，演练就是自欺"
+    stat_put "$f.bytes" "$(wc -c < "${JSON_DIR}/${f}" | tr -d ' ')"
     if [ "$LAYOUT" = "mac" ]; then
         # 只有 Mac 侧 backup.sh 用 install -m 600 落盘，权限断言对它有意义；
         # 广州是 Windows 快照经 restic 拉回，POSIX 位不承载原机 ACL，断言它会误红。
@@ -174,11 +249,15 @@ fi
 
 # 试恢复一个库到演练目录并再查完整性（模拟真实恢复路径）
 cp "${LATEST}/live.db" "${DRILL_DIR}/live.db"
-if command -v sqlite3 >/dev/null 2>&1; then
+if [ "$HAS_SQLITE" = "1" ]; then
     OK=$(sqlite3 "${DRILL_DIR}/live.db" "PRAGMA integrity_check;" | head -1)
     [ "$OK" = "ok" ] || fail "演练恢复后的 live.db integrity_check=${OK}"
+    stat_put "restored.integrity" "$OK"
     echo "[restore-drill] 演练恢复 live.db 通过（integrity_check=ok）"
 fi
 
 rm -rf "$DRILL_DIR"
+stat_put "accounts.dirs" "${CNT:-0}"
+write_record "pass"
+rm -f "$STATS_FILE"
 echo "[restore-drill] ✅ 全部通过（备份可恢复，布局=${LAYOUT}）"

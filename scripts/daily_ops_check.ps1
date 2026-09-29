@@ -1,6 +1,21 @@
 ﻿# daily_ops_check.ps1 - restore killer task + verify all 5 services + researchd activity (UTF-8 BOM, §H8 起改带 BOM 中文注释)
 "=== 1) QMT-Ensure-Running restore ==="
-& powershell -NoProfile -ExecutionPolicy Bypass -File C:\qmt\enable_ensure.ps1
+# §0929OPS-⑪-1：enable_ensure.ps1 过去硬写盘根 C:\qmt\，而它随部署落在 $PSScriptRoot 同目录
+# （DEPLOY_DIR/scripts），于是"日检第 1 节"会在现网指向一个不存在的文件——PowerShell 对
+# -File 不存在只报一行错就继续，日检照样往下跑＝**第 1 节静默空转**。现在按三态解析：
+# 同目录 → 盘根旧位 → 都没有就整节 FAIL 并说清该跑哪条部署。绝不带着不存在的路径继续。
+# English: resolve enable_ensure.ps1 from $PSScriptRoot first, then the legacy C:\qmt\ copy,
+# and fail loudly when neither exists instead of silently skipping the restore step.
+$ensureScript = @(
+    (Join-Path $PSScriptRoot 'enable_ensure.ps1'),
+    'C:\qmt\enable_ensure.ps1'
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $ensureScript) {
+  Write-Output 'FAIL enable_ensure.ps1 未找到（$PSScriptRoot 与 C:\qmt\ 两个位置都无）：QMT-Ensure-Running 未被恢复，请先确认部署清单 §0929OPS 已下发 scripts/enable_ensure.ps1'
+} else {
+  Write-Output ("using enable_ensure: " + $ensureScript)
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $ensureScript
+}
 
 "=== 2) services health ==="
 Get-Service quant,quant-research,pydata,quant-web,quant-gateway -ErrorAction SilentlyContinue |
@@ -12,6 +27,10 @@ Get-Service quant,quant-research,pydata,quant-web,quant-gateway -ErrorAction Sil
 # quant-web 探引擎 :8081 的 `/`（引擎无根路由；前端静态口是 Caddy :8080）、pydata 探无路由的 /pydata_status（404 误报）。
 # 配置找不到就整节 FAIL——绝不带着旧硬编码值继续假报警。
 $probeCfg = @(
+    # §0929OPS-⑪-1 补第一条候选：随部署落位是 DEPLOY_DIR/qmt-win（本脚本在 DEPLOY_DIR/scripts），
+    # 旧两条分别覆盖"仓库目录树内手工跑"与"C:\qmt\quant-trading-v2 那套老检出"，都命中不到
+    # 正规发版位置 ⇒ 三节探针整节 FAIL、五节网关检查也跳过（现网实录的"日检全红其实是找不到配置"）。
+    (Join-Path $PSScriptRoot '..\qmt-win\service_probe_config.ps1'),
     (Join-Path $PSScriptRoot '..\deploy\qmt-win\service_probe_config.ps1'),
     'C:\qmt\quant-trading-v2\deploy\qmt-win\service_probe_config.ps1'
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1

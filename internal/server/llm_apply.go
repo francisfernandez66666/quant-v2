@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/opslog"
 )
 
 // ── LLM 配置热更新：单一实现 + 前置校验 + 可回滚 ──────────────────────────────
@@ -399,6 +400,12 @@ func (s *Server) applyLLMSnapshot(uid string, cand llmSnapshot, force, persist, 
 // 数值/开关字段从上一份配置**拷贝后再覆盖**（而不是整struct重写）：LLMConfig 里还有
 // MaxRetryTimes 等本接口不管理的字段，整struct重写会把它们静默清零。
 func (s *Server) persistLLMSnapshot(uid string, cand llmSnapshot) error {
+	// §0929CFG-HIST（P1-2）：LLM 配置住在账号级主配置文档里，此前这条通道改坏了既没有写前快照
+	// 也没有字段级留痕（全仓只有实盘配置那条通道真快照）。收在 persistLLMSnapshot 而不是三个
+	// HTTP 入口，是因为设置页/管理端/咨询页本就共用这个落库收口——一处包装即三处齐，
+	// 也正对应本文件反复强调的"同一件事两处各写一遍，迟早有一处漏"。
+	// 快照失败不阻断保存（供应商抖动时运维必须还能换 key），但必须留证据——见 snapshotConfigWrite。
+	trace := s.snapshotConfigWrite(uid, uid, "llm")
 	prev := *s.cfg.GetLLMConfigFor(uid) // 取值拷贝（见 GetLLMConfigFor 的别名警告）
 	next := prev
 	next.APIURL = cand.APIURL
@@ -413,14 +420,20 @@ func (s *Server) persistLLMSnapshot(uid string, cand llmSnapshot) error {
 	if err := s.cfg.SetLLMConfigFor(uid, &next); err != nil {
 		return err
 	}
+	// §0929CFG-HIST：配置文档的字段级 diff 走统一审计入口（敏感字段名只报长度不报值，
+	// 见 config.diffJSON 的 §0929CFG-SECRET）；密钥池那条腿**只记把数不记内容**——
+	// 把密钥本身写进 opslog 等于为了留痕再造一处泄露。
+	trace.audit(s)
 
 	if len(cand.Keys) == 0 {
+		opslog.Audit("config_llm_keys", uid, "llm(keys)", trace.detail()+" keys_unchanged=true")
 		return nil
 	}
 	// 多 key 池（新形态）
 	if err := s.auth.SetConfig(uid, "llm_api_keys", strings.Join(cand.Keys, ",")); err != nil {
 		return err
 	}
+	opslog.Audit("config_llm_keys", uid, "llm(keys)", trace.detail()+" keys="+strconv.Itoa(len(cand.Keys)))
 	// 旧版单 key 字段同步为首把：两个读取口径（llmcfg.Resolve 的 plural→singular 回退链）
 	// 必须同值，否则库里会留着一把早已轮换掉的旧 key，成为"看不见的第三把"。
 	return s.auth.SetConfig(uid, "llm_api_key", cand.Keys[0])

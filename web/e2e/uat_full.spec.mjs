@@ -1804,3 +1804,120 @@ test.describe('矩阵补位 · 0926E2E-MX1 mock 派发队列桥腿', () => {
     }
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// §0929POS-SAVE（2026-09-29 全量审计批 P1-4 + 本轮读码新撞缺陷）浏览器级三条腿
+// vitest 侧（web/src/__tests__/h_0929pos_save.test.jsx）已经把 saveHoldings 的四点改口径钉住
+// ——显式传表、返回布尔、脏值不落缓存、失败 toast；但那是 jsdom 里的**函数级**证据。
+// 本段证明的是浏览器真链路里三件函数级看不到的事：
+//   ① 真实 React 渲染周期下，「setHoldings(下一份表) → 立刻保存」这条调用序**真的把新增行发出去了**
+//      （旧闭包形态在 jsdom 单测里同样能过，因为它喂的是已经改好的 state；只有在真组件里
+//       走真 setState 才暴露"载荷＝改动前那份表"）；
+//   ② 后端 500 时用户**看得见**红 toast、弹窗不关、行上留「未落库」标记（旧空 catch 全静默）；
+//   ③ 失败后原地重试不产生重复代码行（full-replace 载荷里的重复 code 是给后端的模糊语义）。
+// 零污染纪律：三条腿都用 page.route 拦 POST /api/holdings 自行回执，**一次都不写真库**
+// （成功腿回服务端同款 {status:'ok',ignored_fields:[]} 形状），因此不需要 finally 还原持仓；
+// GET /api/holdings 不拦，页面初始数据仍来自真实 UAT 栈，避免"整页空态"把断言喂成假绿。
+// English: §0929POS-SAVE browser legs — payload really carries the added row, failure is visible,
+// and retry does not duplicate the code. All three intercept the write, so the ledger is untouched.
+// ─────────────────────────────────────────────────────────────────────
+test.describe('修复回归 · §0929POS-SAVE 持仓整表写浏览器腿 (2026-09-29)', () => {
+  // 本段共用的测试代码：UAT 栈里不存在的六位代码，避免与既有手动持仓行相撞
+  const POS_CODE = '900099'
+
+  // 拦截整表写并记录每一次载荷；fulfill 决定成功/失败态。返回 payloads 数组供断言。
+  // 只拦 POST（GET 放行到真后端），且 fulfill 用与 handlers_fix.go:1197 同款的回执形状。
+  async function interceptHoldingsWrite(page, mode) {
+    const payloads = []
+    await page.route('**/api/holdings', async (route) => {
+      const req = route.request()
+      if (req.method() !== 'POST') { await route.fallback(); return }
+      let body = {}
+      try { body = JSON.parse(req.postData() || '{}') } catch (_) { body = { __unparsable: req.postData() } }
+      payloads.push(body)
+      if (mode === 'fail') {
+        await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'simulated write failure' }) })
+        return
+      }
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'ok', ignored_fields: [] }) })
+    })
+    return payloads
+  }
+
+  // 打开「新增持仓」弹窗并填一行（代码/成本价/持股数）；返回该弹窗定位器
+  async function fillAddDialog(page, qty) {
+    await page.getByRole('button', { name: /新增持仓/ }).click()
+    const dlg = page.locator('.t-dialog')
+    await expect(dlg, '新增持仓弹窗应打开').toBeVisible()
+    await dlg.getByPlaceholder('输入代码').fill(POS_CODE)
+    await dlg.getByPlaceholder('成本价').fill('10.5')
+    await dlg.getByPlaceholder('持股数量').fill(String(qty))
+    return dlg
+  }
+
+  // POS-1 载荷腿：新增行必须出现在整表载荷里，且数量＝界面填的那份。
+  // 反证方向：把 saveHoldings 的调用序退回「setHoldings 后不传参读闭包」，
+  // 这条必红（载荷里没有 900099，或数量是旧值）——旧缺陷正是这么丢的。
+  test('POS-1：新增持仓行的代码与股数真的进了整表载荷（旧闭包读旧表＝改动丢失）', async ({ page }) => {
+    await page.goto('/#/positions')
+    await page.waitForTimeout(2000)
+    const errs = watch(page)
+    const payloads = await interceptHoldingsWrite(page, 'ok')
+    const dlg = await fillAddDialog(page, 300)
+    await dlg.getByRole('button', { name: /确定/ }).click()
+    await expect.poll(() => payloads.length, '整表写请求必须发出一次').toBe(1)
+    const sent = (payloads[0].holdings || []).find((h) => h.code === POS_CODE)
+    expect(sent, `载荷里必须有本次新增的 ${POS_CODE}（旧形态发的是改动前那份表）`).toBeTruthy()
+    expect(sent.quantity, '上行股数必须等于界面填写值').toBe(300)
+    expect(sent.cost_price, '上行成本价必须等于界面填写值').toBe(10.5)
+    // §P1-5 死载荷收口：整表写不再上行 available_balance（后端在该端点显式丢弃它）
+    expect(payloads[0].available_balance === undefined,
+      'POST /api/holdings 载荷不得再带 available_balance（后端丢弃＝假契约）').toBe(true)
+    await expect(dlg, '保存成功弹窗应关闭').toBeHidden({ timeout: 8000 })
+    const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+    expect(fatal, '整表写链路无未捕获 JS 错误: ' + fatal.join('|')).toHaveLength(0)
+    await page.screenshot({ path: `${SHOT}/pos-0929-save-ok.png` })
+  })
+
+  // POS-2 失败可见腿：后端 500 ⇒ 红 toast + 弹窗保持打开 + 行标脏（旧空 catch 三样全静默）。
+  // toast 断言按 §FIX-8 纪律锁主题类与文案，不看"有没有 toast 飘出来"。
+  test('POS-2：保存失败必须可见（红 toast+弹窗不关+未落库标记），旧空 catch 静默即红', async ({ page }) => {
+    await page.goto('/#/positions')
+    await page.waitForTimeout(2000)
+    const errs = watch(page)
+    const payloads = await interceptHoldingsWrite(page, 'fail')
+    const dlg = await fillAddDialog(page, 400)
+    await dlg.getByRole('button', { name: /确定/ }).click()
+    await expect(page.locator('.t-message.t-is-error').first(),
+      '失败必须有红 toast（后端未落库口径写进文案）').toContainText('持仓保存失败（后端未落库', { timeout: 8000 })
+    await expect(dlg, '保存失败时弹窗不得关闭（用户填的东西不能丢）').toBeVisible()
+    await expect(page.locator('[data-testid="paper-dirty-count"]'),
+      '未落库计数标记必须出现').toBeVisible({ timeout: 8000 })
+    expect(payloads.length, '本次确实拨过一次整表写').toBe(1)
+    // 本用例的 500 是我方拦截自造的，不算产品缺陷；只核未捕获 JS 错误
+    const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+    expect(fatal, '失败分支不得抛未捕获错误: ' + fatal.join('|')).toHaveLength(0)
+    await page.screenshot({ path: `${SHOT}/pos-0929-save-fail.png` })
+  })
+
+  // POS-3 重试去重腿：失败后弹窗留着、界面已有一条乐观行；用户再点一次「确定」
+  // ⇒ 表格与载荷都**只允许一条**该代码（旧写法 [ ...holdings, item] 会追加成两条，
+  //   full-replace 语义下等于让后端"两次更新同一条记录"）。
+  test('POS-3：保存失败后原地重试不得重复同一代码行', async ({ page }) => {
+    await page.goto('/#/positions')
+    await page.waitForTimeout(2000)
+    const payloads = await interceptHoldingsWrite(page, 'fail')
+    const dlg = await fillAddDialog(page, 500)
+    await dlg.getByRole('button', { name: /确定/ }).click()
+    await expect.poll(() => payloads.length, '第一次整表写已发出').toBe(1)
+    await expect(page.locator('.t-message.t-is-error').first(), '第一次失败提示').toBeVisible({ timeout: 8000 })
+    // 第二次点「确定」＝重试路径（弹窗从未关闭，代码输入框此时是 disabled 态的同一值）
+    await dlg.getByRole('button', { name: /确定/ }).click()
+    await expect.poll(() => payloads.length, '重试再发一次整表写').toBe(2)
+    const second = (payloads[1].holdings || []).filter((h) => h.code === POS_CODE)
+    expect(second.length, `重试载荷里 ${POS_CODE} 只能出现一次（出现两次＝给 full-replace 留模糊语义）`).toBe(1)
+    const rows = page.locator('.t-table__body tr').filter({ hasText: POS_CODE })
+    expect(await rows.count(), '表格不得同时留着同一代码的两行').toBe(1)
+    await page.screenshot({ path: `${SHOT}/pos-0929-save-retry.png` })
+  })
+})

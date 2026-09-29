@@ -58,7 +58,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: dataload [flags] <full|daily|meta-dates|finance|bars ts_code|verify>")
+		log.Fatalf("用法: dataload [flags] <full|daily|meta-dates|finance|bars ts_code|verify|amount-check>")
 	}
 	cmd := args[0]
 
@@ -81,8 +81,17 @@ func main() {
 
 	bsClient := data.NewBaostockClient(*pyurl)
 
-	// 子命令分发：每个子命令都按 --provider 二选一（tushare 直连 / baostock 经 Python 网关），
-	// 两条实现落库口径一致，切换数据源不改变下游语义。
+	// 子命令分发：每个子命令都按 --provider 二选一（tushare 直连 / baostock 经 Python 网关）。
+	// §0929SCALE-⑩ 更正本块旧声明：原文声称"两条实现落库口径相同、切换数据源不改变下游语义"，
+	// **这句是错的**——baostock 的 amount 是元、tushare 的 daily/index_daily amount 是千元，
+	// 两条腿原样落库会让同一张表混两套量纲（差 1000 倍且无任何报错）。
+	// 用词说明：这里刻意写成"口径相同"而不是原句的措辞，门禁 §106 的负锁按原句字面拦停
+	// （任何"两腿口径已一致、无需换算"的声明重新出现都会红），本段更正不该把红锁触发。
+	// 现在的口径是：两条腿的 amount 都必须在**写侧归一为元**（tushare 腿见
+	// internal/data.NormalizeTushareAmount，本文件 loadIndex/loadByDate 两处调用），
+	// 落库后由 store.ProbeDailyAmountScale 抽检自证（amount-check 子命令）。
+	// English: the two providers are NOT caliber-identical by default — tushare's amount is
+	// normalized to CNY on the write side before it can share a table with baostock's.
 	switch cmd {
 	case "full":
 		var err error
@@ -188,6 +197,11 @@ func main() {
 			log.Fatalf("minute-sync 失败: %v", err)
 		}
 		log.Printf("[minute-sync] 完成，本轮写入 %d 行", written)
+	case "amount-check":
+		// §0929SCALE-⑩ 独立量纲腿：与 --provider 无关（它读的是库，不是上游），
+		// 因此不需要 token；判红退 1，供夜间校验/部署后验收拦停。见 amount_check.go 文件头。
+		cmdAmountCheck(db, args[1:])
+		return
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}
@@ -259,7 +273,12 @@ func loadIndex(db *store.DB, token, start, end string) error {
 		if err != nil {
 			return fmt.Errorf("%s: %v", code, err)
 		}
-		n, err := db.InsertRows("index_daily", store.TableColumns("index_daily"), toMaps(rows))
+		// §0929SCALE-⑩ 指数日线的 amount 同样是千元口径，与 daily 共用一条写侧归一。
+		// 注意：指数没有"股数"概念，归一后 amount/(vol×100) 不再落在 [1,500] 元的均价带内，
+		// 所以抽检探针只抽 daily（index_daily 不参与判据），这里归一是为了与 baostock 腿同口径。
+		recs := toMaps(rows)
+		scaleHint("index_daily", data.NormalizeTushareAmount("index_daily", recs), len(recs))
+		n, err := db.InsertRows("index_daily", store.TableColumns("index_daily"), recs)
 		if err != nil {
 			return err
 		}
@@ -314,6 +333,8 @@ func runDaily(db *store.DB, token, start, end string) error {
 			return fmt.Errorf("%s: %v", t.table, err)
 		}
 	}
+	// §0929SCALE-⑩ 收尾量纲自检（写侧归一之后的机器自证；判红只 WARN，见 amount_check.go）。
+	checkLoadedAmountScale(db)
 	return nil
 }
 
@@ -332,7 +353,12 @@ func loadByDate(db *store.DB, c *data.TushareClient, table string, fetch func(st
 			return fmt.Errorf("%s@%s: %v", table, d, err)
 		}
 		if len(rows) > 0 {
-			n, err := db.InsertRows(table, cols, toMaps(rows))
+			// §0929SCALE-⑩ 写侧归一：tushare 的 daily/index_daily amount 是千元，落库契约是元。
+			// 换算点必须紧跟在这里、InsertRows 之前，且不在任何重试循环里二次进入
+			// （断点续传按日期整批重拉重写，天然幂等）。白名单外的表原样通过。
+			recs := toMaps(rows)
+			scaleHint(table, data.NormalizeTushareAmount(table, recs), len(recs))
+			n, err := db.InsertRows(table, cols, recs)
 			if err != nil {
 				return fmt.Errorf("%s@%s: %v", table, d, err)
 			}

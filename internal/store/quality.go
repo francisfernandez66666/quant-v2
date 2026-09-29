@@ -6,6 +6,7 @@ package store
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -136,6 +137,28 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 		rows.Close()
 	}
 
+	// §0929SCALE-⑩ 量纲换算系数：MinAvgAmount 的阈值口径是"元"（默认 3e7＝3000 万），
+	// 而下面比较用的是 `AVG(amount)` —— 库里若存在千元口径行（tushare 装载腿的历史形态），
+	// 这一条会把整池股票**全部剔掉且不报错**。系数由与落库抽检同一把尺子决定
+	// （ProbeDailyAmountScale），只有"整日都是千元"才抬 1000，混源/双重换算不猜系数、只报警。
+	// English: §0929SCALE-⑩ — the liquidity threshold is in CNY, so scale the read side by the
+	// probe's verdict instead of trusting the loader's comment.
+	amountFactor := 1.0
+	if s.MinAvgAmount > 0 {
+		f, pr, err := d.AmountCaliberFactor(end)
+		if err != nil {
+			// 抽检自身失败不拦筛选（与 §ADJ-BASIS 同姿势：降级但要留 P1 噪声，不许静默）。
+			log.Printf("[store] WARN §0929SCALE 量纲抽检读取失败，流动性阈值按元口径原样判（可能整批剔票）：%v", err)
+		} else {
+			amountFactor = f
+			if pr.Red() {
+				log.Printf("[store] WARN §0929SCALE 成交额量纲抽检判红 verdict=%s rows=%d median=%.4f：%s；"+
+					"本次质控系数=%.0f（混源与双重换算没有安全的标量系数，须先修数据再筛池）",
+					pr.Verdict, pr.Rows, pr.MedianRatio, pr.Reason, amountFactor)
+			}
+		}
+	}
+
 	// 股票池主查询：前面命中的条件按顺序拼成 WHERE，参数与占位符一一对应，
 	// 排除退市股时把区间末作为「上市截止日期」传进去。
 	sql := `SELECT s.ts_code FROM stocks s`
@@ -173,7 +196,7 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 			if s.MinRecentBars > 0 && l.Bars < s.MinRecentBars {
 				continue
 			}
-			if s.MinAvgAmount > 0 && l.Amt < s.MinAvgAmount {
+			if s.MinAvgAmount > 0 && l.Amt*amountFactor < s.MinAvgAmount {
 				continue
 			}
 		}

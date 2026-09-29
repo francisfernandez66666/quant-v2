@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1919,6 +1920,50 @@ func (m *Manager) saveUserRules(userID string, r *Rules) error {
 	return nil
 }
 
+// AccountKVRaw 返回账号级 KV 里某个配置键的**原始字节**与其是否存在
+// （§0929CFG-HIST：账号级配置的写前快照/字段级 diff 必须拿原始文档，不能拿反序列化再
+// 序列化过的副本——那样"快照"与"当前值"会因字段顺序/缺省省略而产生一堆假差异行）。
+// English: raw bytes of one account-level KV config document (for snapshot/diff), so the two
+// compared sides are byte-homomorphic rather than re-serialized copies.
+func (m *Manager) AccountKVRaw(userID, key string) ([]byte, bool) {
+	if m.store == nil || userID == "" || key == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(userID, key)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return nil, false
+	}
+	return []byte(raw), true
+}
+
+// SetAccountKVRaw 原样写入账号级某个配置键（回滚恢复专用），带写后复读自证。
+// 与 saveUserRules / SetD1ConfigFor 的区别只在"不再序列化"：回滚必须把快照字节原样放回，
+// 否则回滚本身就成了一次改写。写失败/复读不匹配一律返回 error 透出（同 §0926E2E-W1B 口径）。
+// English: writes exact bytes into one account KV slot with read-back verification — used by
+// rollback, where re-serializing would itself be a mutation.
+func (m *Manager) SetAccountKVRaw(userID, key string, data []byte) error {
+	if m.store == nil {
+		return fmt.Errorf("账号级配置存储不可用")
+	}
+	if userID == "" || key == "" {
+		return fmt.Errorf("需要账号与配置键")
+	}
+	// 先验 JSON 合法：回滚载荷来自磁盘，坏文件不该把该键整键写坏
+	// （读侧解析失败会静默回退全局，用户看到的是"回滚没生效"而不是"回滚失败"）。
+	var probe any
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return fmt.Errorf("快照内容不是合法 JSON: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.setConfigVerifiedLocked(userID, key, data); err != nil {
+		return fmt.Errorf("账号 %s 配置键 %s 回滚%w", userID, key, err)
+	}
+	return nil
+}
+
 // Get 返回当前全局规则配置指针。
 // §0925EVE-D1：本方法是 rules 指针的**唯一全局读口径**（原导出字段 Rules 转私有），
 // RLock 只保证「取到的指针」与 Watch/Load 的指针发布无竞态；返回的仍是活体指针，
@@ -2338,16 +2383,20 @@ func (m *Manager) GetD1Config() *D1Config {
 
 // SetSchedulerConfig 更新全局研究调度器配置（rules.scheduler）并持久化到文件。
 // 用于前端"全量回测全局开关"等调度选项的读写。
-// English: updates the global research-scheduler config (rules.scheduler) and persists it, used by the
-// frontend "full-backtest global toggle" and other scheduler options.
-func (m *Manager) SetSchedulerConfig(cfg *SchedulerConfig) {
+// §0929CFG-D1：起返回 error（同 §0926E2E-W1B 对 Strategy/D1 两条 setter 的收口口径）——
+// 旧写法把 Save 的错误吞掉，调用方与用户都只能看见"已保存"，磁盘上到底落没落无人知晓。
+// 调用方作为语句调用（不接返回值）在 Go 里合法，因此既有测试与脚本无需改动即可编译，
+// 但**新增**调用方必须像 HTTP 层那样把失败如实透出，别把这条 error 再吞一遍。
+// English: updates the global scheduler config and persists it; since §0929CFG-D1 the persistence
+// error is surfaced instead of swallowed (the caller must answer 500 on failure).
+func (m *Manager) SetSchedulerConfig(cfg *SchedulerConfig) error {
 	if cfg == nil {
-		return
+		return fmt.Errorf("调度配置为空，未保存")
 	}
 	m.mu.Lock()
 	m.rules.Scheduler = *cfg
 	m.mu.Unlock()
-	m.Save()
+	return m.Save()
 }
 
 // SetD1Config 更新全局 D1 规则并持久化到文件。
@@ -2359,6 +2408,249 @@ func (m *Manager) SetD1Config(cfg *D1Config) {
 	m.d1 = cfg
 	m.mu.Unlock()
 	m.Save()
+}
+
+// MergeD1Config §0929CFG-D1（09-29 全量审计批 P1-1，owner 令照推荐项执行）：
+// D1 规则通道的**稀疏 merge**——「没传=保留旧值」，与 §N-4/§CFGSMASH 的战法参数通道同族同口径。
+//
+// 为什么必须有这一条：旧 handleSetD1Config 把 body 解成强类型 config.D1Config 后交
+// SetD1Config 整体指针替换，而解码器没开 DisallowUnknownFields（全仓该调用为 0 处）⇒
+// 一份只含未知键的补丁会把已配置的规则与权重全部折叠成零值再落盘。本轮在正规 UAT 栈实测复现：
+// 先写一份真配置，再发 {"totally_unknown_key":1} → HTTP 200 ok，读回 {"rules": null}
+// （证据日志 /tmp/probe3_0929.log）。这次事故 09-22 傍晚在战法阈值上锤过一次并已修，
+// D1 这条通道当时留在了事故之前的语义上。
+//
+// 语义边界（钉死在这里，别在调用方各解一遍）：
+//   - 未知顶层键**不参与** merge，只作为 ignored_keys 回报给调用方（拼错键名不再等于清零）；
+//   - 显式传某个键一定更新该键（要关加成请明写 boost_weight:0）；merge 后**不跑** normalizeD1，
+//     否则"明写 0"会被出厂默认顶掉，与本文件 §N-4 的口径一致；
+//   - rules 是数组：整键替换（不做元素级合并）——规则集是一份清单，合并语义会造出重复规则；
+//   - 合并结果回 typed struct 失败＝400 级错误，旧配置原样保留、一个字节都不落盘。
+//
+// English: sparse merge for the D1 rules channel (§0929CFG-D1). Absent keys keep the stored value;
+// unknown keys are reported as ignored instead of zeroing the whole document; no normalizeD1 run
+// after merge so an explicit zero stays zero; arrays replace wholesale.
+func (m *Manager) MergeD1Config(patch map[string]json.RawMessage) (next D1Config, ignored []string, err error) {
+	// 取当前值（RLock 内拷贝，与 Load 的指针发布互斥）
+	m.mu.RLock()
+	cur := D1Config{}
+	if m.d1 != nil {
+		cur = *m.d1
+	}
+	m.mu.RUnlock()
+
+	// ① 当前值 → map 基底（json round-trip，保证与 patch 同域可递归合并）
+	raw, err := json.Marshal(cur)
+	if err != nil {
+		return cur, nil, fmt.Errorf("当前 D1 配置序列化异常: %w", err)
+	}
+	mergedRaw, ignored, err := mergeRawWithPatch(raw, patch, knownD1TopLevelKeys())
+	if err != nil {
+		return cur, ignored, err
+	}
+	if err := json.Unmarshal(mergedRaw, &next); err != nil {
+		return cur, ignored, fmt.Errorf("D1 规则校验失败: %w", err)
+	}
+	// ② 持锁整体替换 + 落盘（SetD1Config 旧实现吞 Save 错误，这里如实透出）
+	m.mu.Lock()
+	m.d1 = &next
+	m.mu.Unlock()
+	if err := m.Save(); err != nil {
+		return next, ignored, fmt.Errorf("D1 配置持久化失败: %w", err)
+	}
+	return next, ignored, nil
+}
+
+// mergeRawWithPatch 稀疏合并的共用内核：基准 JSON 文档 + 「顶层键→原始补丁」→ 合并后的 JSON 文档，
+// 外加被判定为未知的键清单。战法参数、D1 两族 merge 都走这里，避免同一套"未知键/非法 JSON/
+// 递归合并"的规则在两处各自演化（§N-4 之后每一次新增 merge 通道都必须经这个内核）。
+// 未知键只登记不合并；已知键的 JSON 非法立即报错（不吞、不带病落盘）；数组整键替换。
+// English: the shared sparse-merge kernel (base document + top-level raw patch → merged document
+// plus the list of unknown keys); every merge channel must go through it.
+func mergeRawWithPatch(baseRaw []byte, patch map[string]json.RawMessage, known map[string]bool) ([]byte, []string, error) {
+	baseMap := map[string]any{}
+	if err := json.Unmarshal(baseRaw, &baseMap); err != nil {
+		return nil, nil, fmt.Errorf("基准配置解析异常: %w", err)
+	}
+	var ignored []string
+	patchMap := make(map[string]any, len(patch))
+	for k, v := range patch {
+		if known != nil {
+			if _, ok := known[k]; !ok {
+				ignored = append(ignored, k)
+				continue
+			}
+		}
+		var av any
+		if err := json.Unmarshal(v, &av); err != nil {
+			return nil, sortedStrings(ignored), fmt.Errorf("字段 %s 不是合法 JSON: %w", k, err)
+		}
+		patchMap[k] = av
+	}
+	sort.Strings(ignored)
+	deepMergeAny(baseMap, patchMap)
+	out, err := json.Marshal(baseMap)
+	if err != nil {
+		return nil, ignored, fmt.Errorf("合并结果序列化失败: %w", err)
+	}
+	return out, ignored, nil
+}
+
+// D1WriteTargetFor 判定"这次 D1 写入应该落哪本账"（§0929CFG-D1 写读同源收口）。
+// 运行时读侧 GetD1ConfigFor 的优先级是：**账号级 perUserD1Key 覆盖 → 全局 m.d1**。
+// 旧写通道 POST /api/config/d1 无条件写全局，于是只要该账号存在过任何一次账号级 D1 覆盖
+// （由 /api/admin/users/{id}/config/d1 那条代配通道创建），设置页保存就成了
+// "界面照常显示已保存、引擎照旧吃旧副本"的静默空写——这正是 09-26 网关口令五源里
+// 「只洗到全局、账号覆盖层留旧值」的同族形态，区别是那次是钥匙、这次是打分规则。
+// 本函数把这个优先级显式化：写侧按读侧的落点走，两侧不可能再分叉。
+// 返回 key=="" 表示落全局文件（现有行为），否则返回该账号级 KV 键。
+// English: resolves where a D1 write must land so the writer and the engine's reader can never
+// diverge again (account override present => write the override, else the global file).
+func (m *Manager) D1WriteTargetFor(userID string) (oid string, key string) {
+	oid = m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return oid, "" // 无账号级存储：本来就只有全局这一本账
+	}
+	if _, ok := m.AccountKVRaw(oid, perUserD1Key); ok {
+		return oid, perUserD1Key
+	}
+	return oid, ""
+}
+
+// MergeD1ConfigScoped 按 D1WriteTargetFor 判定的落点做稀疏 merge，并回报本次真实落点。
+// target 取值为 "global" 或 "account"，供 HTTP 层写审计与前端如实展示（绝不回报一个没写过的地方）。
+// §0929CFG-D1：账号级分支的合并基准是**该键的原始 JSON**（含历史遗留的未知字段，原样保留），
+// 全局级分支复用 MergeD1Config 的 typed 口径。
+// English: sparse-merges D1 into whichever document the runtime actually reads, and reports
+// which one that was — so a write can never silently land where nobody reads.
+func (m *Manager) MergeD1ConfigScoped(userID string, patch map[string]json.RawMessage) (next D1Config, ignored []string, target string, err error) {
+	oid, key := m.D1WriteTargetFor(userID)
+	if key == "" {
+		merged, ign, merr := m.MergeD1Config(patch)
+		if merr != nil {
+			return merged, ign, "global", merr
+		}
+		return merged, ign, "global", nil
+	}
+	base, _ := m.AccountKVRaw(oid, key)
+	mergedRaw, ign, merr := mergeRawWithPatch(base, patch, knownD1TopLevelKeys())
+	if merr != nil {
+		var cur D1Config
+		_ = json.Unmarshal(base, &cur)
+		return cur, ign, "account", merr
+	}
+	var parsed D1Config
+	if err := json.Unmarshal(mergedRaw, &parsed); err != nil {
+		return D1Config{}, ign, "account", fmt.Errorf("D1 规则校验失败: %w", err)
+	}
+	m.mu.Lock()
+	perr := m.setConfigVerifiedLocked(oid, key, mergedRaw)
+	m.mu.Unlock()
+	if perr != nil {
+		return parsed, ign, "account", fmt.Errorf("账号 %s D1 配置%w", oid, perr)
+	}
+	return parsed, ign, "account", nil
+}
+
+// MergeD1ConfigForAccount §0929CFG-D1：管理员**指名某账号**代配 D1 时的稀疏合并通道。
+// 落点仍经 ownerOf 归并到运营数据归属账号（与读侧 GetD1ConfigFor 完全同口径）——这不是简化，
+// 而是本系统的既有设计：量化/LLM/D1 这类运营配置**系统级共享**，"代配某个成员"实际写的是
+// 归属账号那份。若这里按传入 id 原样写键，就会造出一把"没有任何读腿会去读"的死配置，
+// 而界面照样回 200（正是 §0929CFG-D1 要消灭的写读分叉形态）。
+// 该归属账号尚无 D1 覆盖时，以"它当前生效的那份"为基准建立覆盖：这既保留了旧实现"写账号键"
+// 的落点，又消灭了同一个抹平形态（旧实现同样是 typed 解码后整份替换，一个未知键就把规则清零）。
+// created 回报本次是否新建了覆盖，供审计与前端如实说明"从此全局改动影响不到这份配置"。
+// English: sparse merge for the account slot named by an admin proxy edit; the destination still
+// resolves through ownerOf because operational config is system-shared — writing the raw caller id
+// would create a document no reader ever consults.
+func (m *Manager) MergeD1ConfigForAccount(accountID string, patch map[string]json.RawMessage) (next D1Config, ignored []string, created bool, err error) {
+	oid := m.ownerOf(accountID)
+	if m.store == nil || oid == "" {
+		return D1Config{}, nil, false, fmt.Errorf("账号级配置存储不可用，无法代配 D1")
+	}
+	base, existed := m.AccountKVRaw(oid, perUserD1Key)
+	if !existed {
+		// 无覆盖：基准取该账号当前生效值（走读侧同一口径），保证"只改传进来的键"成立。
+		base, err = m.effectiveAccountValue(oid, perUserD1Key)
+		if err != nil {
+			return D1Config{}, nil, false, err
+		}
+	}
+	mergedRaw, ign, merr := mergeRawWithPatch(base, patch, knownD1TopLevelKeys())
+	if merr != nil {
+		var cur D1Config
+		_ = json.Unmarshal(base, &cur)
+		return cur, ign, false, merr
+	}
+	if err := json.Unmarshal(mergedRaw, &next); err != nil {
+		return D1Config{}, ign, false, fmt.Errorf("D1 规则校验失败: %w", err)
+	}
+	m.mu.Lock()
+	perr := m.setConfigVerifiedLocked(oid, perUserD1Key, mergedRaw)
+	m.mu.Unlock()
+	if perr != nil {
+		return next, ign, false, fmt.Errorf("账号 %s D1 配置%w", oid, perr)
+	}
+	return next, ign, !existed, nil
+}
+
+// GetD1EffectiveSource 回报当前生效的 D1 来自哪本账（"global"/"account"），供 GET 侧如实回显。
+// §0929CFG-D1：设置页拿到这个字段才能区分"我改的这份就是引擎吃的那份"和"引擎吃的是账号副本"，
+// 也给了运维一条不用翻 auth.json 就能自证接线的读腿。
+// English: which ledger the runtime D1 currently resolves from, surfaced on the GET side.
+func (m *Manager) GetD1EffectiveSource(userID string) string {
+	_, key := m.D1WriteTargetFor(userID)
+	if key != "" {
+		return "account"
+	}
+	return "global"
+}
+
+// knownD1TopLevelKeys 返回 D1Config 的顶层 JSON 键集合（稀疏 merge 的白名单）。
+// 与结构体 tag 手工对齐是刻意的：宁可这里漏一个键（merge 会把它报成 ignored、调用方当场发现），
+// 也不要靠反射把 omitempty 的缺省语义卷进白名单判定。改 D1Config 字段必须同步改这张表
+// ——本批门禁有一条两侧键集合等值锁兜住漂移。
+// English: the whitelist of top-level D1 keys, kept in sync with the struct tags by a gate lock.
+func knownD1TopLevelKeys() map[string]bool {
+	return map[string]bool{
+		"rules":           true,
+		"boost_weight":    true,
+		"boost_threshold": true,
+	}
+}
+
+// sortedStrings 返回升序副本（错误路径上也要给调用方稳定顺序，便于逐字节断言）。
+// English: ascending copy — stable ordering matters on the error path too.
+func sortedStrings(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+// HasD1Override 报告该账号是否存在**账号级 D1 覆盖**（即"全局改动已经影响不到这个账号"）。
+// §0929CFG-D1：这个布尔值必须能在 HTTP 侧读到——代配通道一旦建立覆盖，设置页后续所有全局改动
+// 对该账号都不再生效，而这在旧形态下只体现在 auth.json 里多了一个键，界面上完全看不出来。
+// English: whether the account has its own D1 override (i.e. global edits no longer reach it).
+func (m *Manager) HasD1Override(userID string) bool {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return false
+	}
+	_, ok := m.AccountKVRaw(oid, perUserD1Key)
+	return ok
+}
+
+// HasAccountOverrideFor 报告该账号在 KV 里是否**已有**某个配置键的独立覆盖
+// （§0929CFG-HIST：回滚端点要据此如实回报"本次是否新建了覆盖"——新建覆盖意味着此后
+// 全局改动不再自动影响这个账号，这个副作用必须可见，不能等人事后翻 auth.json 才发现）。
+// English: whether an account already has its own override for a KV key (rollback reports the
+// side effect of creating one).
+func (m *Manager) HasAccountOverrideFor(userID, key string) bool {
+	if m.store == nil || userID == "" || key == "" {
+		return false
+	}
+	_, ok := m.AccountKVRaw(userID, key)
+	return ok
 }
 
 // GetLLMConfig 返回全局 LLM 客户端配置。

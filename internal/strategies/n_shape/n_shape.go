@@ -185,6 +185,14 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		meta[k] = v
 	}
 
+	// §0929DIM 四维**理由文本**同样要越过「战法→信号」边界：EvaluateWave 已经把
+	// d1~d4 的中文描述（事件标签、竞价/量能档位、回调形态、承接力度）算进 eval.Reasons，
+	// 此前这里只搬了分值，文本随 Evaluation 对象一起被丢弃，前端 d3_desc/d4_desc 恒空。
+	// 拷贝而非共享引用：理由必须定格在触发那一刻，不随后续重评变化。
+	// English: §0929DIM — carry the per-dimension reason text across the strategy→signal boundary too;
+	// previously only the scores were copied, so the frontend's d3_desc/d4_desc stayed empty.
+	reasons := strategy.CopyReasons(eval.Reasons)
+
 	// 组装信号：动作与优先级已由上面的形态分档和一突提档逻辑定完，
 	// Reason 只带形态级别串，各维分数经 Meta 透传给前端与复盘。
 	return &strategy.Signal{
@@ -194,6 +202,7 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		Reason:     eval.Level,
 		Type:       strategy.SignalNShape,
 		Meta:       meta,
+		Reasons:    reasons,
 	}, nil
 }
 

@@ -1335,6 +1335,12 @@ export default function Paper() {
                           </tr>
                         </thead>
                         <tbody>
+                          {/* §0929GATE-CONTRACT（FIX_PLAN_20260929 ⑨-3）这里的 a.xxx ?? a.Xxx 两态兜底
+                              不是防御性冗余，而是契约本身：报告正文的 attribution 是原样透传容器
+                              （store.PaperAttribution 无 json tag ⇒ PascalCase），而同族报告的其他键是
+                              snake_case。删掉任一态都会让另一代报告行整列显示 undefined。
+                              English: both key forms are read on purpose — this container's keys follow
+                              the producing side (PascalCase) while the rest of the report is snake_case. */}
                           {s.attribution.map((a, i) => (
                             <tr key={i} style={{ borderBottom: '1px solid #eee' }}>
                               <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{a.user_id || a.UserID}</td>

@@ -372,9 +372,15 @@ func cmdLifecycleEval(db *store.DB, dataDir string, args []string) {
 
 // cmdLifecycle §GAP-P1 20260915：夜间链完整生命周期任务——先实盘衰退自动降级
 // （EvaluateDemote 落地通道），再灰度晋升评估（复用 cmdLifecycleEval 内核）。
-// 降级即时生效（Enabled=false 后注入器下一轮不再产信号），晋升仍走人工审批流。
+// 降级生效口径（§0929LIB-WATCH 校正，09-29 全量审计批 P1-3）：本任务只把库文件里的
+// Enabled 置 false，**不直接作用于正在跑的引擎**（研究进程与引擎进程不同体）；运行中的引擎
+// 由 quant 侧的战法库版本戳轮询在下一轮（≤60s）读到新指纹后热注入，引擎重启或前端点一次
+// 重载同样生效。旧注释写的"注入器下一轮不再产信号"与调用图不符，已改成事实描述。
+// 晋升仍走人工审批流。
 // English: nightly full lifecycle task — first auto-demote declining applied strategies via
-// EvaluateDemote, then run grayscale promotion evaluation (promotion still requires human approval).
+// EvaluateDemote, then run grayscale promotion evaluation (promotion still requires human
+// approval). Demotion only edits the library files here; running engines pick it up through the
+// quant-side library fingerprint poller (≤60s), an engine restart, or a manual reload.
 func cmdLifecycle(db *store.DB, dataDir string, args []string) {
 	fs := flag.NewFlagSet("lifecycle", flag.ExitOnError)
 	paperPath := fs.String("paper", "", "paper.json 路径（缺省 dataDir/paper.json）")

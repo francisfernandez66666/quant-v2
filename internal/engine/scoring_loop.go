@@ -1302,6 +1302,16 @@ func (e *Engine) refreshStalenessGauges() {
 	// 赋值在本函数（每 30s、会话门禁之前）——休市日也要喂，否则量规本身会在长假里变陈旧值。
 	metrics.SetGauge("trading_calendar_loaded", boolGauge(data.CalendarLoaded()))
 	metrics.SetGauge("today_is_trading_day", boolGauge(data.IsTradingDay(time.Now())))
+	// §0929HB-1/-2（2026-09-29 全量审计批 ⑪-4）：两条"应有值缺失"型业务心跳的喂数点。
+	// 都放在本函数（每 30s、会话门禁之前、休市日也喂）——原有告警全是"越界才报"型，
+	// "引擎活着、监控绿着、当日一条信号都没有 / 有卖出却零已实现盈亏"这类静默失效没人管。
+	// 计时/取数细节与口径见 internal/engine/heartbeat.go、internal/trading/heartbeat.go。
+	e.feedSignalHeartbeatGauge(time.Now())
+	if c := e.QMTController(); c != nil {
+		if snap := c.Snapshot(); snap.Enabled {
+			c.RefreshRealizedPnlHeartbeat(time.Now())
+		}
+	}
 	// 未加载时额外走 opslog 通道打一条人可读的健康行（每 24h 至多一条，不刷屏）：
 	// 量规只有数字，日志里要能直接回答"现在是不是把法定节假日当交易日在跑"。
 	// 注：本行的时间语义是"距上次执行 ≥24h"，若引擎只在盘中时段跑满节拍，

@@ -511,11 +511,17 @@ func (a *Agent) SetShortRunners(runners []StrategyRunner) {
 //   - dataDir: 数据目录路径，包含 applied_factors.json 文件
 //
 // 注意：若因子 runner 不存在则忽略，不会影响其他战法。
-func (a *Agent) ReloadFactorRules(dataDir string) {
+// §0929LIB-WATCH（09-29 全量审计批 P1-3）：起返回 error——库文件读/解析失败过去只 log 一行
+// 就 return，调用方（server 的热重载与新的版本戳轮询）无法区分"重载成功"与"库已经坏了"，
+// 于是"降级即时生效"这句话在失败时是假的（§ROBUST 降级报成功族）。读库失败必须上抛，
+// 由上层决定是否推进版本戳（不推进＝下轮重试，绝不把坏库认成新库）。
+// English: reloads enabled factor rules; returns the load error so callers can tell a corrupt
+// library from a successful reload instead of trusting a silent log line.
+func (a *Agent) ReloadFactorRules(dataDir string) error {
 	rules, err := research.LoadEnabledFactorRules(dataDir)
 	if err != nil {
 		log.Printf("[combat_agent] 重载因子战法库失败: %v", err)
-		return
+		return fmt.Errorf("因子战法库重载失败: %w", err)
 	}
 	a.mu.Lock()
 	for i := range a.runners {
@@ -526,6 +532,7 @@ func (a *Agent) ReloadFactorRules(dataDir string) {
 	}
 	a.mu.Unlock()
 	a.refreshExitOverrides(dataDir) // §P2-d：同步重建规则级出场覆盖（含形态库，避免单侧刷新互相覆盖）
+	return nil
 }
 
 // FactorStats 返回因子 runner 的各规则运行统计（效果监测）。
@@ -560,11 +567,14 @@ func (a *Agent) RecordFactorForwardReturn(ruleID string, ret float64) {
 // ReloadPatternRules 从形态战法库 applied_patterns.json 重载全部启用规则并注入形态 runner（热生效）。
 // 参数：
 //   - dataDir: 数据目录路径，包含 applied_patterns.json 文件
-func (a *Agent) ReloadPatternRules(dataDir string) {
+//
+// §0929LIB-WATCH：与因子腿同口径返回 error（库读失败不得被一行日志吞掉）。
+// English: reloads enabled pattern rules and surfaces the load error to the caller.
+func (a *Agent) ReloadPatternRules(dataDir string) error {
 	rules, err := research.LoadEnabledPatternRules(dataDir)
 	if err != nil {
 		log.Printf("[combat_agent] 重载形态战法库失败: %v", err)
-		return
+		return fmt.Errorf("形态战法库重载失败: %w", err)
 	}
 	a.mu.Lock()
 	for i := range a.runners {
@@ -575,6 +585,7 @@ func (a *Agent) ReloadPatternRules(dataDir string) {
 	}
 	a.mu.Unlock()
 	a.refreshExitOverrides(dataDir)
+	return nil
 }
 
 // refreshExitOverrides 重建规则级出场覆盖注册表（§P2-d 实盘接线）。
@@ -1184,6 +1195,9 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			Sector:       sectorName,
 			GeneratedAt:  now,
 			Meta:         sig.Meta,
+			// §0929DIM 各维度理由文本过「战法→信号」边界的落点：与 Meta 同批拷贝，
+			// 前端 d1_desc~d4_desc 由此而来（此前只有分数过界，说明整列空白）。
+			Reasons: sig.Reasons,
 		})
 	}
 	// 动量分已在循环前计算并写入下方 sc（保持 8a/8b 打分量输出一致）
@@ -1903,6 +1917,9 @@ func (a *Agent) evalShort(input *ScanInput, runners []StrategyRunner, code strin
 			Sector:       sectorName,
 			GeneratedAt:  now,
 			Meta:         sig.Meta,
+			// §0929DIM 做空腿同样带走维度理由：做多/做空两路只在这里有一次差异，
+			// 漏拷其中一路会让做空信号的 D 列空白（与做多"看起来更好"的假象）。
+			Reasons: sig.Reasons,
 		})
 	}
 	if len(sigs) > 0 {

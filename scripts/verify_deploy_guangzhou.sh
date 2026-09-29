@@ -67,6 +67,16 @@
 #      生效路径结构化读数（rules.qmt.risk_gate）+ 全文裸扫第二腿（键位漂移只点名不判红，Go 不
 #      消费死键）；不对称判据：红=生效路径显式 false，其余态全绿并走 INFO 回显。细节见 PS 段。
 #
+#  19) §0929OPS-⑪-1（2026-09-29，第 29 探针，判数 28→29）：运维面五个执行体在位 + 内容标记复核
+#      （register_service / all_service_watchdog / daily_ops_check / enable_ensure / outbox_admin）。
+#      共同点：告警与日检文案指示人去跑它们，却长期不在部署清单里＝靠手工拷贝。
+#      §ENH-5/§P0-B/§0927KA 三条判例同族根因＝「仓库里有」被当成「现网在跑」；本批入清单后
+#      由这条独立复核落盘，判据两条：文件在位 + 内容认识各自的标记（0 字节半份、旧回退副本不绿）。
+#  20) §0929SCALE-⑩（2026-09-29，第 30 探针，判数 29→30）：daily.amount 量纲只读抽检，走
+#      dataload.exe amount-check（纯 SELECT 零写入、免凭据，与第 15/27 探针同一条只读通道）。
+#      红＝千元/双重换算/混源/读取失败；库里没数不判红（表未装由新鲜度腿负责，重复判红会把
+#      「还没装」冒充成「量纲错了」）。中位均价读数恒走 INFO，绿也要看得到数。
+#
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
 #   GZ_IP=81.71.69.17 COMMIT=beb5b80 ./scripts/verify_deploy_guangzhou.sh   # 显式指定指纹
@@ -74,6 +84,8 @@
 # 参数（环境变量）：GZ_IP（必填）/ GZ_USER / COMMIT（默认本地 HEAD）/ DEPLOY_DIR / 端口三项
 #   / 第 19-20 探针可调项：MOCK_UAT_DIR / MOCK_PORT / QMT_WIN_DIR（退役 .ps1 落盘目录，第 19 探针
 #   的安全阀态判据要读它）/ GW_CFG / GW_TOKEN_SVC（默认=现网路径）
+#   / 第 29 探针新增可调项：OPS_SCRIPTS_DIR（日检两件套落盘目录，默认 DEPLOY_DIR/scripts）
+#     / GW_PY_DIR（网关 python 目录，默认取 GW_CFG 父目录——两处字面量必漂移，故推导不写死）
 set -uo pipefail
 
 : "${GZ_IP:?请设置 GZ_IP（广州服务器公网 IP）}"
@@ -90,6 +102,11 @@ MOCK_PORT="${MOCK_PORT:-8799}"                             # §QMT-MOCK-DECOM �
 # 故需知道它现网落在哪——就是部署步上传的 ${DEPLOY_DIR}/qmt-win/（与 deploy_guangzhou.sh [3d] 同路径）。
 QMT_WIN_DIR="${QMT_WIN_DIR:-${DEPLOY_DIR}/qmt-win}"        # §QMT-MOCK-DECOM 第 19 探针：运维 .ps1 落盘目录
 GW_CFG="${GW_CFG:-C:/qmt/quant-trading-v2/qmt_gateway/config.xt.json}"   # §QMT-TOKENROT 第 20 探针：网关配置文件
+# §0929OPS-⑪-1（2026-09-29）：第 29/30 探针的落盘位与只读抽检入口。
+# 网关 python 目录从 GW_CFG 的父目录推导——**不再写第二份字面路径**（§H8 单源化的同族姿势：
+# 两处字面量必然漂移，漂移后的探针查的是一个现网不存在的位置，等于没查）。
+GW_PY_DIR="${GW_PY_DIR:-$(dirname "$GW_CFG")}"
+OPS_SCRIPTS_DIR="${OPS_SCRIPTS_DIR:-${DEPLOY_DIR}/scripts}"               # 第 29 探针：日检两件套落盘目录
 GW_TOKEN_SVC="${GW_TOKEN_SVC:-quant}"                      # §QMT-TOKENROT 第 20 探针：QUANT_GATEWAY_TOKEN 所在 NSSM 服务
 ENGINE_PORT="${ENGINE_PORT:-8081}"
 WEB_PORT="${WEB_PORT:-8080}"
@@ -124,7 +141,14 @@ param(
     [string]$GatewayCfg = "C:\qmt\quant-trading-v2\qmt_gateway\config.xt.json",
     [string]$GwTokenService = "quant",
     # §C7-OPS（2026-09-26，第 26 探针）：Windows 服务定义单源文件在现网的落盘位（部署步 [3d] 上传）。
-    [string]$SvcDefsPath = "C:\opt\quant\qmt-win\service_definitions.ps1"
+    [string]$SvcDefsPath = "C:\opt\quant\qmt-win\service_definitions.ps1",
+    # §0929OPS-⑪-1（2026-09-29，第 29 探针）：五个运维执行体的落盘目录 + 二进制目录。
+    # 前三个与 deploy_guangzhou.sh 的 scp 目标同源（qmt-win / scripts / 网关 python 目录），
+    # DeployDir 供第 30 探针定位 dataload.exe——四个值都由 bash 侧显式传入，这里只留兜底默认。
+    [string]$OpsWinDir = "C:\opt\quant\qmt-win",
+    [string]$OpsScriptsDir = "C:\opt\quant\scripts",
+    [string]$GwPyDir = "C:\qmt\quant-trading-v2\qmt_gateway",
+    [string]$DeployDir = "C:\opt\quant"
 )
 $ErrorActionPreference = "Continue"
 
@@ -980,6 +1004,58 @@ $ldDetail = "state=" + $ldState + " effective=" + $ldVal + " keys=" + $ldKeyN + 
     " path=rules.qmt.risk_gate.limit_down_block_sell"
 Write-Output ("INFO|limitdown_readout " + $ldDetail)
 Probe "cfg: limit-down sell-chase gate not disabled by live config (readout in INFO)" (-not $ldBad) $ldDetail
+
+# 19) §0929OPS-⑪-1（2026-09-29，第 29 探针，判数 28→29）：运维面五个执行体在位复核。
+# 背景：这五个都是**现网指示会去执行的对象**（告警文案让人跑 outbox_admin.py --yes；日检第 1 节
+#   调 enable_ensure.ps1；看门狗/注册计划任务跑 watchdog 与 register_service），却长期靠手工拷贝、
+#   不在部署清单里。§ENH-5/§P0-B/§0927KA 三条同族判例的共同根因是同一个：
+#   **「仓库里有」被当成「现网在跑」**。本批已把它们收编进 deploy_guangzhou.sh，
+#   这条探针负责在发版后独立复核落盘，而不是只信 scp 自己打的"完成"。
+# 判据两条互相独立（第 26 探针同款姿势）：①文件在位；②**内容认识各自的标记**——
+#   scp 打断留下的 0 字节半份文件、旧版回退副本都不算过，只查 Test-Path 会照样绿。
+# 明细全 ASCII（GBK 教训：现网 PS5.1 输出中文会撕裂字面量，见第 19 探针原判例）。
+$opsManifest = @(
+    @{ P = ($OpsWinDir + "\register_service.ps1");     M = "QMT-Gateway" },
+    @{ P = ($OpsWinDir + "\all_service_watchdog.ps1");  M = "service_probe_config" },
+    @{ P = ($OpsScriptsDir + "\daily_ops_check.ps1");   M = "enable_ensure" },
+    @{ P = ($OpsScriptsDir + "\enable_ensure.ps1");     M = "QMT-Ensure-Running" },
+    @{ P = ($GwPyDir + "\outbox_admin.py");             M = "def main" }
+)
+$opsMiss = @()
+$opsRead = @()
+foreach ($f in $opsManifest) {
+    $txt = ""
+    if (Test-Path -LiteralPath $f.P) {
+        try { $txt = [string](Get-Content -LiteralPath $f.P -Raw -ErrorAction Stop) } catch { $txt = "" }
+    }
+    if (-not $txt) { $opsMiss += ($f.P + ":absent-or-empty"); $opsRead += (($f.P | Split-Path -Leaf) + "=absent"); continue }
+    if ($txt -notmatch [regex]::Escape($f.M)) { $opsMiss += ($f.P + ":no-marker(" + $f.M + ")") }
+    $opsRead += (($f.P | Split-Path -Leaf) + "=" + $txt.Length)
+}
+$opsDetail = "bytes[" + ($opsRead -join ",") + "] miss=" + $(if ($opsMiss.Count) { ($opsMiss -join ";") } else { "none" })
+Probe "ops:0929 five live-executable ops files in place with content markers" ($opsMiss.Count -eq 0) $opsDetail
+
+# 20) §0929SCALE-⑩（2026-09-29，第 30 探针，判数 29→30）：研究库成交额量纲抽检（只读，零写入）。
+# 背景：daily.amount 有"元/千元"两套口径的历史缝（tushare 腿原样落千元）。本批把换算钉在写侧，
+#   并在 store 侧抽出一个抽检探针；现网这一条走 dataload.exe amount-check——**它只跑 SELECT**，
+#   不碰任何写路径，与第 15/27 探针同一条免凭据只读通道。
+# 判据：退出码 0（ok 或 no-data）算绿；1（千元/双重换算/混源）算红；2（读取失败）算红并带 stderr 摘要。
+#   no-data 不判红是刻意的：库里可能只有 ths_daily 一条腿有数，日线空由新鲜度腿负责报警，
+#   这里重复判红只会把"表还没装"冒充成"量纲错了"。
+# 读数恒进 INFO（绿也要看得到中位均价，第一次跑就能看出库里到底是哪套口径）。
+$scaleOut = ""
+$scaleRc = -1
+if (Test-Path -LiteralPath ($DeployDir + "\dataload.exe")) {
+    try {
+        $scaleRaw = & ($DeployDir + "\dataload.exe") "--db" ($DataDir + "\trading.db") "amount-check" "--json" 2>&1
+        $scaleRc = $LASTEXITCODE
+        $scaleOut = ($scaleRaw -join " ")
+    } catch { $scaleRc = 2; $scaleOut = "invoke-failed: " + $_.Exception.Message }
+} else { $scaleRc = 2; $scaleOut = "dataload.exe missing at " + $DeployDir }
+$scaleBad = ($scaleRc -ne 0)
+$scaleDetail = "rc=" + $scaleRc + " out=" + $scaleOut
+Write-Output ("INFO|amount_scale_readout " + $scaleDetail)
+Probe "data: daily amount caliber probe green (readout in INFO)" (-not $scaleBad) $scaleDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -988,7 +1064,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
-out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC} -SvcDefsPath ${QMT_WIN_DIR}/service_definitions.ps1" 2>&1 | LC_ALL=C tr -d '\r')
+out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC} -SvcDefsPath ${QMT_WIN_DIR}/service_definitions.ps1 -OpsWinDir ${QMT_WIN_DIR} -OpsScriptsDir ${OPS_SCRIPTS_DIR} -GwPyDir ${GW_PY_DIR} -DeployDir ${DEPLOY_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
 
 PASS=0
 FAIL=0

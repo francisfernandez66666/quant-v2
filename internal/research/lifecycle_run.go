@@ -1,8 +1,16 @@
 // lifecycle_run.go §GAP-P1 20260915：EvaluateDemote 夜间链落地——把「已应用战法的逐日滚动
 // 归因指标」从 paper.json 规则池成交聚合出来喂给 EvaluateDemote，连续衰退 → 自动禁用该战法
-// （applied_factors/applied_patterns 的 Enabled=false，注入器即时生效），留审计日志。
+// （applied_factors/applied_patterns 的 Enabled=false），留审计日志。
+// §0929LIB-WATCH 口径校正（09-29 全量审计批 P1-3）：本文件头旧版把上面这件事写成"注入器即时
+// 生效"，而事实是**本进程不持有引擎**——这里只改库文件，正在跑的引擎要等 quant 侧的战法库
+// 版本戳轮询（internal/server/library_watch.go，≤60s 一轮）读到新库才注入，引擎进程重启或
+// 人工点一次重载同样能生效。错误声明正是这条缝（"研究判了死刑、实盘照旧下单"）一直没被
+// 怀疑的原因，故改成事实描述。
 // English: nightly wiring of EvaluateDemote — aggregates per-rule daily rolling stats from the
 // paper pools, runs the decline evaluator, and auto-disables demoted strategies in the library.
+// Note (corrected in §0929LIB-WATCH): this process holds no engine, so it only edits the library
+// files; running engines pick the change up via the quant-side library fingerprint poller
+// (internal/server/library_watch.go, ≤60s per round), a restart, or a manual reload.
 package research
 
 import (

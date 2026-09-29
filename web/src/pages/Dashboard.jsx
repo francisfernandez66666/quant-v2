@@ -164,7 +164,14 @@ export default function Dashboard() {
 
   // 加载实盘/QMT 状态（接口异常不阻断整页）
   // §M-10：15s 轮询与可见性恢复触发可交错，旧响应后到不得覆盖新快照。
+  // §0929GATE-403：GET /api/qmt/state 在 adminMiddleware 下（server.go:776），成员账号
+  // 每 60s 兜底轮询 + 可见性恢复都会固定吃一条 403（catch 吞掉后什么也不显示）。
+  // 判据只写在这一个入口——四个调用点（挂载/定时器/恢复/定时器重建）全走它，
+  // 不在定时器里各写一份，避免"有时拉有时不拉"的哑故障形态。
+  // English: §0929GATE-403 — members no longer dial the admin-only QMT state endpoint;
+  // the local role cache only decides whether to send, the backend remains the sole authority.
   async function loadQMT() {
+    if (!api.isAdmin()) return
     const token = qmtGuard.current.begin()
     try {
       const st = await api.fetchQMTState()

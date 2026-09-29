@@ -1209,10 +1209,13 @@ export async function resetPaper(initialCapital, maxPositions) {
   return request('/api/paper/reset', { method: 'POST', data })
 }
 
-/** 更新持仓数据（含可用资金） */
-/** Update holdings data (including available cash) */
-// 对应 POST /api/holdings，data 为完整持仓快照，整体覆盖保存
-// Maps to POST /api/holdings; data is a full holdings snapshot saved as an overwrite
+/** 更新持仓数据（仅持仓整表；可用资金不走这里） */
+/** Full-table holdings sync only — available cash never travels on this endpoint */
+// 对应 POST /api/holdings，data.holdings 为完整持仓快照，整体覆盖保存（后端会把没出现在
+// 载荷里的本账号手动持仓删档）。
+// §0929CONTRACT-IGNORED：旧注释写"含可用资金"是假的——该端点从来不消费 available_balance
+// （§P1-11 起资金只认 /api/holdings/balance），现在带上它后端会在响应 ignored_fields 里点名。
+// Maps to POST /api/holdings; the legacy available_balance field is echoed back as ignored.
 export async function updateHoldings(data) {
   return request('/api/holdings', { method: 'POST', data })
 }
@@ -1372,6 +1375,25 @@ export async function fetchIPOCalendar() {
 // 个股速查：行情快照（抽屉头部数据源）
 export async function fetchStockLookup(code) {
   return request('/api/stock/lookup?code=' + encodeURIComponent(code))
+}
+
+/**
+ * 批量查询「代码→股票名」旁证（只读本地股票池表，不打行情上游）
+ * Batch lookup of code→stock name from the local universe table (no upstream quote call).
+ * §0929FILL-NAME（FIX_PLAN_20260929 ⑦）：实盘成交簿 fills 没有 name 列，「交易流水」页此前只能看代码，
+ * 人工核对柜台回单要拿代码去反查名字。这里补的是**展示旁证**：
+ * 名称永不参与幂等锚（(order_id,traded_at,price,qty)+trade_id）、账目计算与勘误定位。
+ * 返回 { names: { '600000.SH': '浦发银行' } }——查不到的代码**没有键**，调用侧据此显示「—」，
+ * 不许把缺键当空串（空串会让单元格变成"看起来像名字"的空白）。
+ * @param {string[]} codes - 股票代码数组（后端单次上限 200 个）
+ * 对应后端 GET /api/stock/names?codes=a,b,c
+ */
+// 代码→股票名批量旁证（成交流水名称列）
+export async function fetchStockNames(codes) {
+  const list = (Array.isArray(codes) ? codes : []).filter((c) => c && String(c).trim())
+  // 空集合直接给空结果：一个请求都不发（首屏无成交时不该为名称列打后端）
+  if (list.length === 0) return Promise.resolve({ names: {} })
+  return request('/api/stock/names?codes=' + encodeURIComponent(list.join(',')))
 }
 
 // ── 资讯 ──

@@ -51,8 +51,13 @@ func cmdPaperResearch(db *store.DB, args []string) {
 		"generated_at": time.Now().Format("2006-01-02 15:04:05"),
 		"trades":       summaries,
 		"daily":        daily,
-		"attribution":  attrib,
-		"emotion":      phaseHist,
+		// §0929GATE-CONTRACT（FIX_PLAN_20260929 ⑨-3）attribution 是**原样透传容器**：
+		// []store.PaperAttribution 无 json tag，落进报告正文的键名即 Go 字段名（UserID/BuyCount…），
+		// 与本文件其余 snake_case 键不同族。契约登记在 store.PaperAttribution 的注释上，
+		// 读侧（Paper.jsx 归因表）按两态兜底。改这里（例如补 tag）＝翻转历史报告行的读法，
+		// 必须连带重灌历史正文再把前端收成单态，不要单点动手。
+		"attribution": attrib,
+		"emotion":     phaseHist,
 	}
 	// 战法池标签映射（与 paper.StrategyPools 展示一致）
 	labels := map[string]string{"dragon": "龙头", "double_bump": "双板", "n_shape": "N形", "dragon_return": "龙回头", "factor": "波动突破", "pattern": "形态"}

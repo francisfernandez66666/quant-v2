@@ -335,6 +335,9 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 		writeError(w, 404, "候选不存在")
 		return
 	}
+	// §0929LIB-WATCH：战法库已落盘但没能注入运行引擎时的失败原因（在末尾响应里如实回报，
+	// 审批"通过"不等于实盘"换上了"；版本戳轮询会在库重新可读后自动重试）。
+	var reloadErr error
 	switch action {
 	case "approve":
 		// §0925EVE-W3-G（FIX_PLAN ⑪ C2）副作用顺序修正：旧实现先写 approved 再执行 Apply*，
@@ -349,8 +352,9 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 		//      该方向是安全侧：规则确实已应用，且重新审批可收敛——ApplyWeights 为整文件覆写、
 		//      ApplyFactorRule/ApplyPatternRule 按 fac_<id>/pat_<id> 键幂等 upsert，重点不产生
 		//      重复条目；旧方向（状态推进了但线上没有）才是会造成误判的危险侧，本批修掉。
-		//   ④ reloadLibraries 无错误返回：热重载失败时状态已是 applied、文件已落盘，
-		//      引擎下次启动/下轮重载自然生效，属可接受弱一致（与旧实现相同，未新增风险）。
+		//   ④ 热重载现在有错误返回（§0929LIB-WATCH）：库已落盘但注入失败时，状态仍是 applied、
+		//      文件也已生效于下一次引擎启动；响应带 reload_error 如实回告，同时版本戳轮询会在
+		//      库重新可读后自动注入。旧口径"失败仅弱一致、无人可见"不再成立。
 		applied := false // applied=true 表示本候选类型已完成 Apply*，状态应推进到 applied
 		reload := false  // reload=true 表示战法库有变更，需热重载引擎 8a/8b
 		if c.Kind == "weights" {
@@ -395,7 +399,7 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 				return
 			}
 			if reload {
-				s.reloadLibraries() // 立即注入 8a/8b，无需重启（见 ④：失败仅弱一致，下次重载生效）
+				reloadErr = s.reloadLibraries() // 立即注入 8a/8b，无需重启（失败原因见响应 reload_error）
 			}
 			log.Printf("[research] 候选 #%d 审批并应用完成 kind=%s", id, c.Kind)
 		}
@@ -436,7 +440,9 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 		}
 		log.Printf("[research] 候选 #%d 进入灰度观察（paper 盘，B 组对照）", id)
 	}
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	// §0929LIB-WATCH：字段形状稳定——reload_error 恒在（成功为空串），前端可无条件判
+	// "这次审批有没有真的把战法换到运行中的引擎上"。
+	writeJSON(w, 200, map[string]string{"status": "ok", "reload_error": errText(reloadErr)})
 }
 
 // handleStrategySnapshots §WS-H C2：GET /api/research/strategies/snapshots —— 列出历史参数快照

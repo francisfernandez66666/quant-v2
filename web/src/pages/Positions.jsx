@@ -55,6 +55,35 @@ export default function Positions() {
   // 在途期间 persistCache 一律用确认值，乐观值/回滚前的脏值绝不进缓存。
   const balancePendingRef = useRef(false)
   const balanceConfirmedRef = useRef(cache.balance)
+  // §0929POS-SAVE（09-29 全量审计批 P1-4）持仓腿照余额腿同姿势收口：
+  // 旧 saveHoldings() 的 catch 是空实现、调用点不判成败、persistCache 无条件写——
+  // 一次网络抖动＝后端没存住、页面显示已改、脏值活到下次刷新（:262 那句"绝不静默"的注释
+  // 与代码口径相反，本轮按代码改注释）。余额腿在 §H-2 已修成正确形态，持仓腿是同族没一起收编。
+  // 第二个更硬的坑（本轮读码撞出、报告未列）：旧 saveHoldings() 不带参数、内部读闭包里的
+  // holdings，而调用点 confirmAdd 是「setHoldings(下一份表) → 立刻 await saveHoldings()」——
+  // React 的状态更新要等下一次渲染才可见，闭包里读到的仍是**改动前**那份表；POST /api/holdings
+  // 又是 full-replace 语义（后端 :1104 会把没出现在载荷里的本账号手动持仓直接删档），
+  // 于是新增/编辑永远传不上去，60s 轮询（:646）再把界面打回服务端现值＝用户改动静默丢失。
+  // 现在整表写只认**显式传入的下一份表**，闭包值不再作为写出口径（同锁见
+  // __tests__/h_0929pos_save.test.jsx 的"未传参必红"反证）。
+  // 三个量的分工：holdingsPendingRef＝整表写在途；holdingsConfirmedRef＝服务端确认过的那份
+  // （缓存写的兜底基准）；dirtyCodesRef＋同名 state＝界面上尚未落库的代码集合
+  // （ref 供轮询/写入口做判据，state 供表格渲染脏标记；size>0 即整表处于未落库态，
+  // 不再另设 holdingsDirtyRef——同一事实留两个来源迟早分叉）。
+  // English: §0929POS-SAVE — the holdings leg adopts the balance leg's guard trio. A second,
+  // harder bug found while reading code (not in the audit report): the old parameterless
+  // saveHoldings() transmitted the closure's pre-edit holdings, while POST /api/holdings is
+  // full-replace and deletes any manual position absent from the payload — so every add/edit was
+  // silently dropped and the 60s poll reverted the UI. Writes now take the intended table
+  // explicitly; dirty codes are tracked in a ref (logic) plus state (rendering).
+  const holdingsPendingRef = useRef(false)
+  const holdingsConfirmedRef = useRef(cache.holdings)
+  const dirtyCodesRef = useRef(new Set())
+  // 脏行代码集合：dirtyCodesRef 供逻辑判据、dirtyCodes 供表格渲染（变更只经 setDirtyCodes 单入口）
+  const [dirtyCodes, setDirtyCodesState] = useState(new Set())
+  // §0929POS-SAVE：纸面持仓的服务端读数是否不可得（load 失败）。旧写法空 catch 直接不提，
+  // 页面继续显示本地缓存却没有任何"这不是服务端现值"的交代。
+  const [serverReadingStale, setServerReadingStale] = useState(false)
   // 新增/编辑持仓弹窗显隐
   const [showAdd, setShowAdd] = useState(false)
   // §E1 盈亏单轨（owner 裁决 2026-09-26）：显示偏移量不再存 localStorage（旧 'pnl_offset' 键
@@ -244,13 +273,17 @@ export default function Positions() {
   // 持仓与资金变动时持久化到 localStorage，供下次进入恢复
   // §H-2（2026-09-22 修复批）缓存写入口加守卫：可用资金保存请求在途时，乐观新值不落缓存，
   // 改按「服务端确认值」持久化——失败回滚后缓存里也绝不会残留错误余额（跨刷新污染根断）；
-  // 持仓变化仍照常随写。
-  // English: §H-2 — while a balance save is in flight the optimistic value is never written to
-  // the localStorage cache; the last server-confirmed balance is persisted instead, so a failed
-  // save can no longer poison pos_cache_v1 across refreshes.
+  // §0929POS-SAVE 同口径补到持仓腿：整表写在途或存在未落库脏行时，缓存写的是**服务端确认过
+  // 的那份表**（旧值），绝不把还没存进后端的乐观行带到下次刷新——那是同一族"界面说存了、
+  // 后端说没有"的跨刷新污染。落库成功后由 saveHoldings 自己补写一次权威值。
+  // English: §H-2/§0929POS-SAVE — while a balance or full-table holdings write is in flight (or
+  // any row is still dirty) the cache persists the server-confirmed snapshot, never the optimistic
+  // value; a successful write persists the new authoritative table itself.
   useEffect(() => {
     const safeBalance = balancePendingRef.current ? balanceConfirmedRef.current : availableBalance
-    persistCache(holdings, safeBalance)
+    const holdingsDirty = dirtyCodesRef.current.size > 0
+    const safeHoldings = holdingsPendingRef.current || holdingsDirty ? holdingsConfirmedRef.current : holdings
+    persistCache(safeHoldings, safeBalance)
   }, [holdings, availableBalance])
 
   // 「清零」按钮（§E1 单轨版）：不再本地记偏移，改调后端 POST /api/holdings/pnl-offset
@@ -266,6 +299,15 @@ export default function Positions() {
   }
 
   // 加载纸面持仓、资金与已实现盈亏
+  // §0929POS-SAVE 两处收口：① 空 catch 不再静默——读数拿不到时置 serverReadingStale，
+  // 页头显式挂「服务端读数不可得」徽标（旧写法页面继续显示本地缓存、零提示，
+  // 用户会把缓存现值当成服务端现值）；② 存在未落库脏行时**不整表覆盖**用户看到的
+  // 那一行（服务端根本没有它 / 还是旧值），其余行照常按权威值刷新，避免一次轮询
+  // 把失败的那笔编辑从界面上抹掉。脏行判据取 dirtyCodesRef（ref 不是 state：
+  // 轮询回调持有的是挂载时的闭包，读 state 会读到过期集合）。
+  // English: §0929POS-SAVE — the load path no longer swallows failures (a header badge marks the
+  // reading as server-unavailable), and rows still pending a successful write are kept as shown
+  // while every other row refreshes from the authoritative payload.
   async function load() {
     const token = paperGuard.current.begin() // §M-10 本轮代号
     try {
@@ -275,23 +317,80 @@ export default function Positions() {
       const data = await api.fetchHoldings()
       if (paperGuard.current.isStale(token)) return
       if (data) {
-        setHoldings(data.holdings || [])
+        setHoldings(mergeOverDirtyRows(data.holdings || []))
         setAvailableBalance(data.available_balance || 0)
         // §H-2（2026-09-22 修复批）服务端回读即权威确认值，同步更新缓存写守卫的基准
         balanceConfirmedRef.current = data.available_balance || 0
+        // §0929POS-SAVE 同理：这一包的持仓列表就是"服务端确认过的那份"，
+        // 但脏行不在其中（那是尚未落库的本地编辑），确认基准必须与之同构，
+        // 否则下一次缓存写入会把脏行连同旧值一起当成权威值落盘。
+        holdingsConfirmedRef.current = mergeOverDirtyRows(data.holdings || [])
         // §E1：total_realized_pnl 不再单独入 state——后端 total_pnl 已含该腿（paperPnlTotals）。
         setTotalPnl(data.total_pnl == null ? null : data.total_pnl)
         setPnlOffset(data.pnl_offset || 0)
+        setServerReadingStale(false)
       }
-    } catch (_) {}
+    } catch (_) {
+      // 不弹 toast：这条是 60s 轮询，持续故障时会每分钟刷一条；页头徽标常驻更合适。
+      setServerReadingStale(true)
+    }
   }
 
-  // 将当前持仓与资金同步到后端
-  async function saveHoldings() {
+  // §0929POS-SAVE 轮询合并腿：以服务端权威列表为底，把仍在脏状态的行换回界面当前值。
+  // 两条分支都要走到（各有专测）：服务端已有该股（编辑未落库→保留本地值）、
+  // 服务端还没有该股（新增未落库→把本地行补回列表尾部，否则该行从界面上消失）。
+  // English: overlay still-dirty rows on top of the authoritative list, covering both the
+  // "server has it but older" and "server does not have it yet" shapes.
+  function mergeOverDirtyRows(serverList) {
+    // 快速路径也返回**新数组**而不是 serverList 本体（§0929POS-SAVE 写 T3 时撞出来的新依赖，
+    // 静态锁 T7 钉住）：fetchHoldings 的数组若直接当界面状态，服务端对象就留在了 state 里，
+    // 而 confirmAdd 是从 `holdings` 复制出下一份表的（不像 editHoldingQty 走 JSON 拷贝），
+    // 之后任何就地改写都会连着改到"服务端读数基线"——正是本批要消灭的载荷与显示分叉。
+    if (dirtyCodesRef.current.size === 0) return serverList.slice()
+    const out = serverList.map((h) => (dirtyCodesRef.current.has(h.code) ? holdings.find((x) => x.code === h.code) || h : h))
+    const onServer = new Set(serverList.map((h) => h.code))
+    for (const h of holdings) {
+      if (dirtyCodesRef.current.has(h.code) && !onServer.has(h.code)) out.push(h)
+    }
+    return out
+  }
+
+  // §0929POS-SAVE 脏标记单写入口：ref（判据）与 state（渲染）同源变更，不留分叉窗口
+  // English: single mutator so the logic ref and the rendering state always move together
+  function setDirtyCodes(codes) {
+    const next = new Set(codes)
+    dirtyCodesRef.current = next
+    setDirtyCodesState(next)
+  }
+
+  // 将当前持仓整表同步到后端（POST /api/holdings，full-replace 语义）
+  // §0929POS-SAVE 四点改口径（旧实现：无参读闭包 holdings + 空 catch + 无条件写缓存）：
+  // ① 待传表由调用方**显式传入**，杜绝把"改动前那份"当成本次要保存的内容；
+  // ② 返回布尔，调用点据此决定弹窗是否关闭（失败时绝不假装保存成功）；
+  // ③ 在途期间缓存写走 holdingsPendingRef 守卫，成功才推进 holdingsConfirmedRef 并补写缓存；
+  // ④ 失败弹 toast 并把本次涉及的代码标脏（行上带「未落库」标记），脏值不进 pos_cache_v1。
+  // 不再随载荷上行 available_balance：§P1-11 起资金只能走 /api/holdings/balance 窄口径，
+  // 后端在本端点显式丢弃该字段（旧载荷带它是"字段存在但无效"的假契约）。
+  // English: §0929POS-SAVE — the full-table write takes the intended list explicitly, returns
+  // success/failure, guards the localStorage cache with the in-flight flag, advances the confirmed
+  // baseline only on success, and on failure raises a toast plus per-row dirty marks. The balance
+  // field is no longer transmitted here because this endpoint drops it by design (§P1-11).
+  async function saveHoldings(nextList, dirtyKey) {
+    const list = (nextList || []).map(({ lots, ...rest }) => rest)
+    holdingsPendingRef.current = true
     try {
-      const list = holdings.map(({ lots, ...rest }) => rest)
-      await api.updateHoldings({ holdings: list, available_balance: availableBalance })
-    } catch (_) {}
+      await api.updateHoldings({ holdings: list })
+      holdingsConfirmedRef.current = nextList || []
+      if (dirtyKey) setDirtyCodes([...dirtyCodesRef.current].filter((c) => c !== dirtyKey))
+      persistCache(holdingsConfirmedRef.current, balanceConfirmedRef.current)
+      return true
+    } catch (e) {
+      if (dirtyKey) setDirtyCodes([...dirtyCodesRef.current, dirtyKey])
+      showToast(`持仓保存失败（后端未落库，页面显示的是未保存的修改）：${e && e.message ? e.message : e}`, 'error')
+      return false
+    } finally {
+      holdingsPendingRef.current = false
+    }
   }
 
   // 根据输入代码查询股票名称与现价
@@ -311,6 +410,14 @@ export default function Positions() {
   }
 
   // 确认新增或编辑持仓，并同步后端
+  // §0929POS-SAVE：本函数原先是 setHoldings(...) 之后直接 await saveHoldings()，
+  // 而 saveHoldings 读的是闭包里的旧 holdings（full-replace 端点于是把"改动前那份表"
+  // 当成用户要保存的内容发出去，新增行从未上行、编辑行从未更新）。
+  // 现在改成先纯函数算出 next 表，再"界面与后端同传一份"：setHoldings(next) 与
+  // saveHoldings(next) 用的是同一个值，界面显示与请求载荷不可能分叉；
+  // 保存失败时弹窗保持打开（用户填的东西不丢），行上留「未落库」脏标记。
+  // English: §0929POS-SAVE — compute the next table once and feed the identical value to both
+  // the UI and the backend, and keep the dialog open when the write fails.
   async function confirmAdd() {
     const code = formCode.trim()
     if (!code || !formCost || !formQty) { MessagePlugin.warning('请填写完整信息'); return }
@@ -326,18 +433,27 @@ export default function Positions() {
       stop_loss_pct: formSl || 5,
     }
     // 编辑模式：替换原持仓的数量/成本/止盈止损；新增模式：追加到列表末尾
+    let next
     if (editingIdx >= 0) {
-      setHoldings((prev) => {
-        const next = [...prev]
-        const cur = next[editingIdx]
-        next[editingIdx] = { ...cur, quantity: formQty, cost_price: formCost, take_profit_pct: formTp, stop_loss_pct: formSl }
-        return next
-      })
+      const cur = holdings[editingIdx]
+      next = [...holdings]
+      next[editingIdx] = { ...cur, quantity: formQty, cost_price: formCost, take_profit_pct: formTp, stop_loss_pct: formSl }
     } else {
-      setHoldings((prev) => [...prev, item])
+      // §0929POS-SAVE 重试去重：同一代码已有行时按位置替换，不再追加。
+      // 触发场景就是本批新增的那条失败恢复路径——上一次整表写失败后弹窗保持打开、
+      // 界面上已经留着这条乐观行，用户直接再点一次「确定」。旧写法走 [...holdings, item]
+      // 会让同一代码在表和载荷里各出现两次（后端按 code 归一只存一条，界面却显示两行），
+      // 而 full-replace 载荷里的重复代码本身就是给后端留"两次更新同一条记录"的模糊语义。
+      // English: §0929POS-SAVE — on retry after a failed write the optimistic row is already in
+      // the table, so an "add" of the same code must replace it in place instead of appending a
+      // duplicate code into a full-replace payload.
+      const at = holdings.findIndex((x) => x.code === code)
+      next = at >= 0 ? [...holdings.slice(0, at), item, ...holdings.slice(at + 1)] : [...holdings, item]
     }
-    // 同步后端、关闭弹窗、重置表单
-    await saveHoldings()
+    setHoldings(next)
+    // 同步后端；失败则保留弹窗与脏标记，成功才关窗重置表单
+    const ok = await saveHoldings(next, code)
+    if (!ok) return
     setShowAdd(false)
     setEditingIdx(-1)
     resetForm()
@@ -647,9 +763,14 @@ export default function Positions() {
     })
     // §F-6（20260917 缺陷修复批）挂载 REST 回填：SSE 断线超补发窗/页面重载后，
     // 先用服务端留存的最近一轮建议点亮"建议"列，后续仍由 SSE 实时覆盖。
-    api.fetchRealAdvice().then((r) => {
-      if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices)
-    }).catch(() => {})
+    // §0929GATE-403：这条此前是本页唯一没走 admin 预过滤的实盘读——GET /api/positions/advice
+    // 在 adminMiddleware 下（server.go:772），成员一挂载就吃一条 403 并被 catch 静默吞掉
+    // （既灌 opslog 又让人不知道发生了什么）。与 loadReal() 的 §PERM-GATE 同口径早退。
+    if (admin) {
+      api.fetchRealAdvice().then((r) => {
+        if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices)
+      }).catch(() => {})
+    }
     // 卸载时清理：纸面轮询/实盘轮询/SSE订阅
     return () => {
       if (timer.current) clearInterval(timer.current)
@@ -663,7 +784,13 @@ export default function Positions() {
   // 信号标记、N形/龙头/动量评分、止盈止损、移动止盈、分时与操作按钮
   const paperColumns = [
     { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
-    { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name}</span> },
+    // §0929POS-SAVE：脏行（整表写失败后仍未落库）在名称列挂「未落库」标记。
+    // 为什么挂在名称列：它是首屏必视列，且行内没有任何其他标记会与之抢位；
+    // 只在这一列出现，避免同一事实在多列重复渲染后各自漂移。
+    // English: rows whose last full-table write failed carry a "not persisted" tag in the name column.
+    { colKey: 'name', title: '名称', width: 110, cell: ({ row }) => (dirtyCodes.has(row.code)
+      ? <span><span style={{ color: 'var(--app-faint)' }}>{row.name}</span> <Tag theme="warning" size="small">未落库</Tag></span>
+      : <span style={{ color: 'var(--app-faint)' }}>{row.name}</span>) },
     { colKey: 'quantity', title: '数量', width: 70, sorter: (a, b) => (a.quantity || 0) - (b.quantity || 0), cell: ({ row }) => row.quantity },
     { colKey: 'cost_price', title: '成本价', width: 80, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(2) : '-') },
     { colKey: 'cur_price', title: '现价', width: 80, sorter: (a, b) => (a.cur_price || 0) - (b.cur_price || 0), cell: ({ row }) => (row.cur_price != null ? '¥' + Number(row.cur_price).toFixed(2) : '-') },
@@ -758,6 +885,23 @@ export default function Positions() {
                     : <div>可用资金: ¥{availableBalance.toFixed(2)}</div>)
                   : <InputNumber value={balanceInputVal} min={0} step={0.01} onBlur={editBalanceSave} onEnter={editBalanceSave} onChange={(v) => setBalanceInputVal(Number(v) || 0)} style={{ width: 160 }} autoFocus />}
               </>
+            )}
+            {/* §0929POS-SAVE 页头两枚状态徽标（放在三元之外：实盘数据在位与否都要看得见）。
+                ① serverReadingStale：/api/holdings 读数拿不到时页面显示的其实是
+                   pos_cache_v1 的本地缓存值，旧写法零提示（空 catch），这里必须说清
+                   "这不是服务端现值"；② dirtyCodes.size：整表写失败后仍有未落库行，
+                   配合行上的「未落库」标记给出总笔数。
+                English: two header status badges — "server reading unavailable" (what you see is
+                the local cache) and "N changes not persisted". */}
+            {serverReadingStale && (
+              <Tag data-testid="paper-reading-stale" theme="danger" size="small" title="最近一次持仓/资金读数拉取失败，页面显示的是本地缓存值">
+                服务端读数不可得
+              </Tag>
+            )}
+            {dirtyCodes.size > 0 && (
+              <Tag data-testid="paper-dirty-count" theme="warning" size="small" title="这些持仓的修改没有保存进后端，请联网后重新提交">
+                {dirtyCodes.size} 项未落库
+              </Tag>
             )}
             {admin && <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>}
           </div>

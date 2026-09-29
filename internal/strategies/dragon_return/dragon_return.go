@@ -48,6 +48,7 @@
 package dragon_return
 
 import (
+	"fmt"
 	"time"
 
 	"quant-trading-v2/internal/config"
@@ -226,6 +227,16 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 			"ma5":            sd.MA5,
 			"ma10":           sd.MA10,
 			"ma20":           sd.MA20,
+		},
+		// §0929DIM 四因子理由：把各维打分依据的原始量（首涨/回调幅度与天数/缩量比/均线）
+		// 写成一句话随信号过界。这些量本来就在 StockData 上，此前只有分数进了 Details。
+		// English: §0929DIM — the raw quantities behind each factor (first-leg gain, pullback depth/days,
+		// volume shrink ratio, MAs) already live on StockData; only their scores used to cross the boundary.
+		Reasons: map[string]string{
+			"dragon_score":   fmt.Sprintf("板块Top2=%v 首涨%.0f%% RPS20=%.0f", sd.IsSectorTop2, sd.FirstRisePct*100, sd.SectorRPS20),
+			"pullback_score": fmt.Sprintf("回调%.0f%%/%d日/缩量%.0f%%", sd.PullbackPct*100, sd.PullbackDays, sd.VolumeRatio*100),
+			"duck_score":     fmt.Sprintf("鸭头(MA5 %.2f/MA10 %.2f/MA20 %.2f)", sd.MA5, sd.MA10, sd.MA20),
+			"confirm_score":  fmt.Sprintf("确认(现价%.2f/MA5 %.2f/量比%.2f)", sd.CurrentPrice, sd.MA5, sd.VolumeRatio),
 		},
 	}, nil
 }
@@ -521,6 +532,7 @@ func (d *DragonReturnStrategy) GenerateSignal(code string, eval *strategy.Evalua
 
 	// 组装信号：Meta 直接挂评分明细（四因子分原样透传给前端与回放），
 	// Timestamp 取秒级 Unix 时间，与其它战法的信号口径保持一致。
+	// §0929DIM Reasons 同样过界——Meta 给的是分数，Reasons 给的是"这个分数凭什么"。
 	return &strategy.Signal{
 		Code:       code,
 		Type:       strategy.SignalType("dragon_return"),
@@ -529,5 +541,6 @@ func (d *DragonReturnStrategy) GenerateSignal(code string, eval *strategy.Evalua
 		Confidence: eval.Confidence,
 		Timestamp:  time.Now().Unix(),
 		Meta:       eval.Details,
+		Reasons:    strategy.CopyReasons(eval.Reasons),
 	}, nil
 }

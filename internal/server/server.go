@@ -117,13 +117,17 @@ type EngineController interface {
 	// 返回墓碑条数；strategy 为空忽略该 code 当日全部。
 	IgnoreSignal(code, strategy string) int
 	// 战法库（因子战法）：热重载 / 运行统计 / 前向收益记录（效果监测）。
-	// English: factor-strategy library: hot-reload / run stats / forward-return recording (monitoring).
-	ReloadFactorRules(dataDir string)
+	// §0929LIB-WATCH：热重载起返回 error——版本戳轮询必须能区分"库换上了"与"库读坏了"，
+	// 失败时不推进版本戳、下轮重试并告警（过去无返回，失败只留一行日志＝"降级报成功"）。
+	// English: factor-strategy library: hot-reload (now error-returning) / run stats /
+	// forward-return recording (monitoring).
+	ReloadFactorRules(dataDir string) error
 	FactorStats() []factorstrat.ActiveRule
 	RecordFactorForwardReturn(ruleID string, ret float64)
 	// 战法库（形态战法）：热重载 / 运行统计 / 前向收益记录（效果监测）。
-	// English: pattern-strategy library: hot-reload / run stats / forward-return recording (monitoring).
-	ReloadPatternRules(dataDir string)
+	// English: pattern-strategy library: hot-reload (error-returning) / run stats /
+	// forward-return recording (monitoring).
+	ReloadPatternRules(dataDir string) error
 	PatternStats() []patternstrat.ActivePattern
 	RecordPatternForwardReturn(ruleID string, ret float64)
 	// QMTController 返回实盘交易执行控制器（AUTO_TRADING_PLAN M1；可为 nil = 未接入）。
@@ -722,6 +726,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/evaluations", s.authMiddleware(s.handleFixEvaluations))
 	s.mux.HandleFunc("GET /api/ipo/calendar", s.authMiddleware(s.handleFixIPOCalendar))
 	s.mux.HandleFunc("GET /api/stock/lookup", s.authMiddleware(s.handleFixStockLookup))
+	// §0929FILL-NAME 代码→股票名批量旁证（交易流水页名称列；只读本地 stocks 表，不打行情上游）。
+	s.mux.HandleFunc("GET /api/stock/names", s.authMiddleware(s.handleFixStockNames))
 	s.mux.HandleFunc("GET /api/depth/{code}", s.authMiddleware(s.handleFixDepth))
 	s.mux.HandleFunc("GET /api/news", s.authMiddleware(s.handleFixNews))
 	// §H3（2026-09-22 修复批）成员越权写全局收口：showall 开关与 reanalyze 补推都落在
@@ -1713,6 +1719,10 @@ func (s *Server) handleLongToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := s.operatorID()
 	if s.cfg != nil {
+		// §0929CFG-HIST：多空开关住在独立 KV 键（perUserLongShortKey）上，此前这条通道改坏了
+		// 既无写前快照也无字段级审计——开关直接决定引擎收不收信号、做不做空，属于会影响下单方向的
+		// 配置面，"谁在什么时候翻的"必须可回溯。
+		trace := s.snapshotConfigWrite(userIDFor(r), userID, "longshort")
 		cur := s.cfg.GetLongShortConfigFor(userID)
 		cur.LongEnabled = req.Enabled
 		// §0926E2E-W1B：持久化失败即中止并回 500——不翻运行时开关，避免"内存已开、磁盘没落、
@@ -1722,6 +1732,7 @@ func (s *Server) handleLongToggle(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, "开关未保存（未落盘，本次不生效）: "+err.Error())
 			return
 		}
+		trace.audit(s)
 	}
 	if c := s.ctrlFor(userID); c != nil {
 		c.SetLongEnabled(req.Enabled)
@@ -1749,6 +1760,8 @@ func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := s.operatorID()
 	if s.cfg != nil {
+		// §0929CFG-HIST：与做多开关腿同姿势——写前快照 + 写后字段级审计（同一本账：perUserLongShortKey）。
+		trace := s.snapshotConfigWrite(userIDFor(r), userID, "longshort")
 		cur := s.cfg.GetLongShortConfigFor(userID)
 		cur.ShortEnabled = req.Enabled
 		// §0926E2E-W1B：持久化失败即中止并回 500（与做多开关腿同口径，防"内存已开磁盘没落"半态）。
@@ -1757,6 +1770,7 @@ func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, "开关未保存（未落盘，本次不生效）: "+err.Error())
 			return
 		}
+		trace.audit(s)
 	}
 	if c := s.ctrlFor(userID); c != nil {
 		c.SetShortEnabled(req.Enabled)
@@ -2082,6 +2096,10 @@ func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request)
 			baseVersion = v
 		}
 	}
+	// §0929CFG-HIST（P1-2）：战法参数落的是账号级配置文档，此前**全仓只有实盘配置那条通道**
+	// 真的做写前快照（config.SnapshotRules 唯一生产调用点在 qmt.go），本通道改坏了只能手工重敲、
+	// 且没有任何证据说明是谁在什么时候改的。现在经统一入口落账号账。
+	trace := s.snapshotConfigWrite(userIDFor(r), userIDFor(r), "strategy")
 	merged, err := s.cfg.MergeStrategyConfig(body, baseVersion)
 	if errors.Is(err, config.ErrStrategyVersionConflict) {
 		// 后写不覆盖前写：回 409 让管理员重载后再改（静默覆盖=两个人互相"改没了"）。
@@ -2100,26 +2118,105 @@ func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request)
 	for k := range body {
 		keys = append(keys, k)
 	}
-	opslog.Audit("config_strategy_merge", userIDFor(r), "strategy", fmt.Sprintf("keys=%v version=%s", keys, merged.UpdatedAt))
+	opslog.Audit("config_strategy_merge", userIDFor(r), "strategy", fmt.Sprintf("keys=%v version=%s %s", keys, merged.UpdatedAt, trace.detail()))
+	// §0929CFG-HIST：字段级 diff 审计（与实盘配置那条通道同一单入口），target 点名落的是账号账。
+	trace.audit(s)
 	writeJSON(w, 200, map[string]string{"status": "ok", "updated_at": merged.UpdatedAt})
 }
 
 // ── D1 规则配置 ──
 
 // handleGetD1Config 处理 GET /api/config/d1：返回全局 D1 规则配置（战法一致）。
+// §0929CFG-D1：额外回报 effective_source（global|account）——引擎打分读的是
+// GetD1ConfigFor(账号)，账号级覆盖存在时它会盖过这里显示的全局值。没有这个字段，
+// 运维就无法区分"页面上的值就是运行时吃的值"，只能去翻 auth.json（分类器还会拦）。
+// 结构体原有字段一个不动，只在顶层加这一个键，老调用方按未知键忽略即可。
+// English: also reports which ledger the runtime actually resolves D1 from (global vs the
+// operator account's override), so the write channel's wiring is self-provable.
 func (s *Server) handleGetD1Config(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, s.cfg.GetD1Config())
+	view := map[string]interface{}{}
+	if b, err := json.Marshal(s.cfg.GetD1Config()); err == nil {
+		_ = json.Unmarshal(b, &view)
+	}
+	view["effective_source"] = s.cfg.GetD1EffectiveSource(requestUserID(r))
+	writeJSON(w, 200, view)
 }
 
-// handleSetD1Config 处理 POST /api/config/d1：保存全局 D1 规则配置。
+// handleSetD1Config 处理 POST /api/config/d1：稀疏 merge 保存全局 D1 规则配置。
+//
+// §0929CFG-D1（09-29 全量审计批 P1-1，owner 令照推荐项执行）对外语义变更：
+// 旧实现把 body 解成强类型 config.D1Config 后整体指针替换，而解码器没开
+// DisallowUnknownFields ⇒ 一份只含未知键的补丁（拼错的键名、发错前缀的脚本）会把已配置的
+// 规则与权重全部折叠成零值落盘，且既无写前快照也无审计。本轮在正规 UAT 栈实测复现过：
+// 先写一份真配置，再发 {"totally_unknown_key":1} → HTTP 200 ok，读回 {"rules": null}
+// （证据日志 /tmp/probe3_0929.log）。这与 §N-4（2026-09-22 傍晚 §CFGSMASH）战法阈值被整份
+// 抹平是同一次事故的两个现场，当时只修了战法那一条通道。
+//
+// 现在的口径（与战法参数通道同族）：
+//   - **没传=保留旧值**的稀疏 merge；未知键不参与合并、只如实回报 ignored_keys（不再静默吞）；
+//   - 显式传某个键一定更新该键（要关加成请明写 boost_weight:0）；
+//   - 写前先经 s.snapshotConfigWrite（内部即 config.SnapshotBeforeWrite 单入口）落快照——
+//     落哪本账由运行时读侧决定（见 effective 字段）；
+//   - 写后走 trace.audit（内部即 config.AuditConfigWrite 单入口）记字段级 diff 审计（真实操作者进参）；
+//   - 持久化失败如实回 500（同 §0926E2E-W1B，绝不再"降级报成功"）。
+//
+// §0929CFG-D1 写读同源收口（本轮读码新发现的同族缝）：引擎打分读的是
+// GetD1ConfigFor(账号)，其优先级是**账号级 D1 覆盖 → 全局**；而这条通道旧写法无条件写全局。
+// 一旦该账号存在任何一次账号级 D1 覆盖（由 /api/admin/users/{id}/config/d1 代配通道创建），
+// 设置页的保存就变成"界面照常、引擎照旧吃旧副本"的静默空写。现在写侧跟着读侧的落点走，
+// 并在响应里回报 effective_source（global|account）——这条通道自此可被自证接线。
+// English: §0929CFG-D1 — sparse merge (absent keys keep stored values, unknown keys are reported
+// instead of zeroing everything), a pre-write snapshot into whichever ledger the runtime reads from,
+// a field-level audit diff, and honest 500s on persistence failure.
 func (s *Server) handleSetD1Config(w http.ResponseWriter, r *http.Request) {
-	var cfg config.D1Config
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	// 先解成「顶层键→原始 JSON」而不是 typed struct：typed 解码会把缺失键折叠成零值，
+	// 正是本缺陷的成因；RawMessage 保留了"键到底出现过没有"这一稀疏 merge 的唯一判据。
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.cfg.SetD1Config(&cfg)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	uid := userIDFor(r)
+	// 写前快照：目标账本由读侧优先级决定；快照失败不阻断保存，但必须留证据（见函数注释）。
+	trace := s.snapshotConfigWrite(uid, uid, "d1")
+	merged, ignored, mergeTarget, err := s.cfg.MergeD1ConfigScoped(uid, body)
+	if err != nil {
+		// 未落盘：把失败如实透出，前端与脚本都能立刻知道"这次没改成功"。
+		writeError(w, 400, err.Error())
+		return
+	}
+	if mergeTarget != targetSnapshotTarget(trace.ledger) {
+		// 快照落点与写入落点必须同一次判定得出；不一致说明读侧优先级在两步之间变了（并发代配）。
+		// 不阻断（写已成功），但要留一条 P1 让这条罕见路径不会靠"看起来没事"藏起来。
+		log.Printf("[P1][config] D1 快照落点 %s 与写入落点 %s 不一致（账号=%s）", trace.ledger, mergeTarget, uid)
+	}
+	keys := make([]string, 0, len(body))
+	for k := range body {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	// 操作留痕：写了哪些键、哪些键因未知被忽略、落到哪本账、快照名。
+	opslog.Audit("config_d1_merge", uid, "d1("+mergeTarget+")",
+		fmt.Sprintf("keys=%v ignored=%v snapshot=%s", keys, ignored, trace.name))
+	trace.audit(s)
+	writeJSON(w, 200, map[string]interface{}{
+		"status":           "ok",
+		"ignored_keys":     ignored,
+		"effective_source": mergeTarget,
+		// 合并后的真实生效条数：让调用方一次请求就能自证"规则还在、不是空的那份"
+		// （旧形态下唯一能发现被抹平的办法是等下一次开盘按空规则跑）。
+		"rules_count": len(merged.Rules),
+	})
+}
+
+// targetSnapshotTarget 把快照目标描述归一成写侧目标描述（两者来自同一次作用域解析，
+// 这里只做字面对齐：快照侧写 "account:d1"/"account:rules"/"global"，写侧回报 "account"/"global"）。
+// English: normalizes the snapshot target wording against the write-side wording.
+func targetSnapshotTarget(target string) string {
+	if strings.HasPrefix(target, "account") {
+		return "account"
+	}
+	return "global"
 }
 
 // ── LLM 配置 ──

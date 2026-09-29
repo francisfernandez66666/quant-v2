@@ -31,6 +31,9 @@ vi.mock('../ui.jsx', async (importOriginal) => {
 // Quant 页只读拉取 mock（口径与 uat_fixes_u2_u5 一致：挂载态不触发任何真实写操作）
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
+  // §0929GATE-403：整页 mock 补齐 Quant 的角色判据；本文件两条用例都验证**管理员**点紧急停止
+  // 后的撤单结果回显，成员预过滤会让按钮根本不存在（断言落空而不是修好了缺陷）。
+  isAdmin: () => true,
   isForbidden: (e) => !!(e && e.status === 403),
   fetchQMTConfig: vi.fn(async () => ({
     enabled: true, mode: 'manual', price_type: 'market', auto_sell: false, halted: false,

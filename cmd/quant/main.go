@@ -612,6 +612,16 @@ func main() {
 	// 绝不改运行时/落库（声明与实现见 internal/server/llm_weekly_probe.go 文件头三铁律）。
 	srv.StartWeeklyLLMProbe(ctx)
 
+	// §0929LIB-WATCH（09-29 全量审计批 P1-3）战法库版本戳轮询：夜间研究是**独立进程**
+	// （cmd/research），它把失效战法在 applied_factors.json/applied_patterns.json 里置
+	// Enabled=false 后，本进程的引擎过去完全不知道——runner 只在建引擎时读盘，注册表内没有
+	// 失效入口，重建入口 reloadLibraries 只由前端 HTTP 触发。结果是一条"该停"的战法可以
+	// 在整个交易日内继续出信号、继续下单，直到重启或有人手工点一次重载。
+	// 现在每分钟比一次两库内容指纹，变了才对**全部引擎**热注入（成功才推进锚，失败保持旧锚
+	// 下轮重试并推高别告警）；库没变时不动引擎、不动模拟盘分仓模板，避免高频抖动。
+	// 声明与实现的对照口径见 internal/server/library_watch.go 文件头（三条安全边界）。
+	srv.StartLibraryWatcher(ctx)
+
 	// 近实时 8a/8b 打分循环：5s 节奏，驱动所有已创建的账号引擎（共享引擎去重）。
 	// 各账号引擎内部按各自配置打分，持仓+自选持续打分 + 状态翻转信号。
 	// English: near-realtime 8a/8b scoring loop at a 5s cadence, driving every created account

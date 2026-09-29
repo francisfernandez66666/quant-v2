@@ -2642,13 +2642,16 @@ for fn in SgInc SgTop; do
 done
 # ⑧ INFO 是观测通道不是判据通道：bash 侧只 echo、不进 PASS/FAIL 计数（判数口径见 verify_deploy 头注）。
 #    一旦有人把 INFO 接成 PASS，绿的数量就会凭空增长，而红绿语义没变——这是最隐蔽的一种假绿。
-#    行数=5：逐文件空态/逐文件明细/当日聚合（§SIGNAL-DIST 原三条）+ 日历读数（§CAL-READOUT，
+#    行数=5→6：逐文件空态/逐文件明细/当日聚合（§SIGNAL-DIST 原三条）+ 日历读数（§CAL-READOUT，
 #    2026-09-26 owner 令新增第 27 探针的恒回显腿；§101 另有 INFO|cal_readout 在位锁）
-#    + 跌停闸现值读数（§A5-CURRENT，2026-09-26 深夜批第 28 探针；§101 ②b 有专属锁）。
+#    + 跌停闸现值读数（§A5-CURRENT，2026-09-26 深夜批第 28 探针；§101 ②b 有专属锁）
+#    + 成交额量纲抽检读数（§0929SCALE-⑩，2026-09-29 批第 30 探针；§106 有 INFO|amount_scale_readout 在位锁）。
+#    本仓纪律：**新增 INFO 腿必须与这条计数锁同日同步**（09-26 的 4→5、09-29 的 5→6 都是这么走的），
+#    否则计数锁会在别人加观测腿时判红——那是好事，前提是红项能一眼看出该同步哪一条，故枚举必须写全。
 grep -qF 'INFO\|*) echo' "$VD" \
 	|| { echo '--- FAIL: bash 侧 INFO 分支丢失（观测读数会被当成未知行，或被误接进 PASS/FAIL 计数）'; exit 1; }
 infop=$(grep -c 'Write-Output ("INFO|' "$VD" || true)
-[ "$infop" = "5" ] || { echo "--- FAIL: INFO 观测行数不是 5（逐文件空态/逐文件明细/当日聚合/日历读数/跌停闸现值，计数=${infop}）"; exit 1; }
+[ "$infop" = "6" ] || { echo "--- FAIL: INFO 观测行数不是 6（逐文件空态/逐文件明细/当日聚合/日历读数/跌停闸现值/成交额量纲抽检，计数=${infop}）"; exit 1; }
 # ⑨ 负锁：本探针不得用 `| Out-String` 读 JSON 字段（PS 控制台按 120 列折行会劈开值，§N-5 的教训本体；
 #    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
 grep -qF '([string]$sgJson.trading_day)' "$VD" \
@@ -3845,7 +3848,7 @@ fi
 #      函数体 perl 抽取锤「体内确有 IsTradingDay」而非全文件计数）、order() 4xx 直败。
 #   ② §F 观测/审计：资金新鲜度收口 cntime.Loc（controller.go 活代码 time.Local=0）、
 #      SumFilledQty 出错留痕行在位（仍回 0，补的只是日志）、admin.go 审计行 3→8
-#      （五类特权变更各有一行）。
+#      （五类特权变更各有一行；09-29 §0929D1 写通道再加两行 ⇒ 本段该锁现为 10，见本段 ② §F D4 处说明）。
 #   ③ §G 审批一致 + 第三态出口：Apply 失败保持 proposed 的用例在位；qmt_admin.go/
 #      handlers_qmt_admin.go 两新文件、两路由注册、order-confirm 每次尝试落审计；
 #      前端 API 尾部函数与 Quant「待核对委托」卡在位。
@@ -3886,7 +3889,11 @@ ew_absent "controller.go 活代码 time.Local（资金新鲜度已收口 cntime.
 # ── ② §F D3 留痕 ──
 ew_chk "SumFilledQty 出错留痕行在位（0=未知口径保留）" "$(grep -c 'SumFilledQty 查询失败按 0 返回' internal/store/real_positions.go || true)" "1"
 # ── ② §F D4 特权审计 ──
-ew_chk "admin.go 审计行 3→8（五类特权变更补齐）" "$(grep -c 'opslog.Audit' internal/server/admin.go || true)" "8"
+# 计数口径同日同步（本仓纪律，同 §88 INFO 行）：8 行＝09-25 批五类特权变更；
+# 10 行＝09-29 §0929D1 稀疏 merge 写通道再加两行（config_d1_merge 变更留痕 +
+# config_snapshot_failed 快照失败留痕——快照没落成也必须有痕迹，否则"改过什么"永远查不到）。
+# 新增审计行必须同日同步这条数，并在 §106 逐名钉住动作名，防"少一行＝静默无痕"。
+ew_chk "admin.go 审计行 8→10（09-25 五类特权变更 8 + §0929D1 写通道留痕 2）" "$(grep -c 'opslog.Audit' internal/server/admin.go || true)" "10"
 
 # ── ③ §G C2 审批一致 ──
 ew_min "Apply 失败保持 proposed 的用例在位" "$(grep -c 'TestResearchApproveApplyFailureKeepsProposed' internal/server/research_test.go || true)" "1"
@@ -4364,14 +4371,27 @@ fi
 #    17B-fetcher 1、17D-Quant 2、mock 三路由 1/1/1、relax 默认 false 1、queued 直读 1、
 #    apk-smoke 1/EMBED 锁 1、persist/hotSwap false 1、StartWeeklyLLMProbe 接线 1）；
 # ④ 行为用例不在此段（go/pytest/vitest/Playwright 四套各自已带），本段只防静态回潮。
+# ⑤ 同日两次同步实录（09-29 15:0x，全量门禁 E 轮在本段判红）：
+#    「1-B W1B 锚 config.go」预演 11，现读到 13 —— 本批 ① D1 落码时在 config.go 写了两条 setter
+#    注释、按同口径交叉引用了 §0926E2E-W1B 这个锚名，锚计数把交叉引用一并数进去。这是今日第三例
+#    「加了一条腿/一句引用，计数锁没跟着同步」（前两例＝§88 INFO 观测行 5→6、§99 admin 审计行 8→10），
+#    且本例是锁**按设计应该红**的那一类：它证明这条锚计数确实咬在文件内容上。处置＝11→13 同步并在
+#    FAIL 文案点名两行来源（不回退阈值、不放宽成 ≥）。
+#    同轮附带修正：e2e_eq 的判红文案把两个数打反（$2 实读被打成「期望」、$3 预演被打成「实得」），
+#    本段全部等值调用按「先读数、后预演值」传参，故文案改印「实读=/应=」——读反一次就够，
+#    会把下一个人往「把阈值改成实读数以外」的方向同步。
 # ════════════════════════════════════════════════════════════════════════════
 echo "==> 103 §0926E2E 全量审计修复批（一~四波+矩阵补位+§0927KA 保活加固静态锁 36 条（含 §0926E2E-13b 双发守卫三枚，09-27 增））..."
 E2E_ERRS=""
-# e2e_eq <名> <期望> <实得>：等值锁；e2e_ge <名> <下限> <实得>：存在性下限锁
-# （≥ 用于"注释/锚点条数会随后续施工增加"的观测，防单向等值把后人合法加注释判红）。
+# e2e_eq <名> <实得> <期望>：等值锁（本段全部调用按「先读数值、后写预演值」传参）；
+# e2e_ge <名> <下限> <实得>：存在性下限锁（先阈值后读数）。
+# （≥ 用于"注释/锚点条数会随后续施工增加"的观测，防单向等值把后人合法加注释判红。）
+# 09-29 实录修文案：旧消息把 $2 打成「期望」、$3 打成「实得」，与等值锁的传参顺序正好相反，
+# 判红时读到的"期望=13 实得=11"其实是"实读 13、应为 11"——把口径写反的锁文案会让人往错误方向
+# 同步计数（本仓教训：判据文案必须与传参实序同形），故等值锁改印「实读=/应=」。
 e2e_eq() {
 	if [ "$2" != "$3" ]; then E2E_ERRS="${E2E_ERRS}
-  - $1: 期望=$2 实得=$3"; fi
+  - $1: 实读=$2 应=$3"; fi
 	return 0
 }
 e2e_ge() {
@@ -4388,7 +4408,7 @@ e2e_eq "1-A gate.go TodayRealizedPnl 调用点禁「, _」吞错形态（负锁�
 	"$(grep -F 'TodayRealizedPnl(' internal/risk/gate.go | grep -c ', _' || true)" "0"
 e2e_eq "1-A gate.go 承接 err 的正向调用恰 1 处" \
 	"$(ec internal/risk/gate.go 'pnl, err := g.st.TodayRealizedPnl')" "1"
-e2e_eq "1-B W1B 锚 config.go 恰 11（新增 W1B 腿需同日同步本计数）" "$(ecn internal/config/config.go '0926E2E-W1B')" "11"
+e2e_eq "1-B W1B 锚 config.go 恰 13（09-29 §0929CFG-D1 两条 setter 注释按同口径交叉引用该锚 ⇒ 11→13 同日同步；新增 W1B 腿须再同步本计数）" "$(ecn internal/config/config.go '0926E2E-W1B')" "13"
 e2e_eq "1-B W1B 锚 qmt.go 恰 2（同上）" "$(ecn internal/server/qmt.go '0926E2E-W1B')" "2"
 e2e_eq "1-C/1-D internal/server 非测试文件「_ = json.NewDecoder」清零（负锁；测试读体豁免）" \
 	"$(grep -rl '_ = json.NewDecoder' internal/server --include='*.go' 2>/dev/null | grep -v _test.go | wc -l | tr -d ' ')" "0"
@@ -4544,6 +4564,242 @@ for f in internal/store/pnl_offset_test.go internal/store/universe_test.go; do
 done
 
 echo "ok - §0927AUDIT 修复批守卫通过（行为腿 1 组 + 静态锁 10 道 + 负锁 2 枚）"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §106 §0929 批专项静态锁（2026-09-29 盘中批：⑩ 成交额量纲 + ⑪ 运维面四条）
+# 主题：本批交付的是「校验面/口径面」而不是新功能——最怕的就是**锁自己失效**：
+#   ⑩ 换算只在一个调用点接上、另一个数据入口静默漏（历史缺陷：只有主链路换算）；
+#   ⑪-1 五个现网执行体不入清单 ⇒ 下次改网关运维面等于改了个没人上传的文件（§P0-B/§ENH-5/§0927KA 三连判例）；
+#   ⑪-2 夜间验收脚本的阈值若只写在 bash 侧、没透传进 PS/python，则 CAND_MAX_AGE_DAYS 这类
+#        环境变量是惰性的 ⇒ 预览说的是一套、实跑判的是另一套（本批首版就踩了这条，见下面等值锁）；
+#   ⑪-4 告警三件套（量规赋值点 / DefaultAlertRules / alert_routing 路由表）漏任一条就是死规则或裸量规；
+#   ⑪-5 恢复演练的 sqlite3 能力判定回到「多处 if 静默跳过」，演练会重新变成自证。
+# 预演读数（09-29 12:5x，先预演后入段，逐条实测）：main.go 换算调用点=2；dataload amount-check
+# 子命令=1；quality.go AmountCaliberFactor=1；cmd/dataload 内「落库口径一致」=0；
+# verify_deploy 行首 Probe=25、amount-check=3；夜间脚本 ActiveMax/TaskAgeHours/CandAgeDays 各=4、
+# --active-max/--task-age-hours/--cand-age-days 各=3、mode=ro=2、PASS<7 守卫=1、字面 IPv4=0；
+# 心跳三规则 alerter/routing 各=1、三个量规的字面赋值点「SetGauge("<键名>"」各=2、
+# scoring_loop 接线各=1、library_watch 接线=2；
+# restore_drill REQUIRE_SQLITE 默认=1、行首 if command -v sqlite3 判定=1（单点）、落档键=7。
+# 锁实现说明：eq106 一律「实际读数 == 预演读数」的等值锁，不用「≥」单向阈值（本仓教训：
+# 单向锁等于把口径推向任意远）；计数用 grep -c（按行计），改文案前先重跑预演再改本段数字。
+# 中文引号说明：本段所有断言消息里的代码形态用「」，不放真反引号也不放 ASCII 双引号
+# （§102 那次命令替换自爆的同族雷）。
+# 反证记录（09-29 13:1x，/tmp/sec106_counterproof.sh 在镜像里逐条破坏，主仓零改动）：
+# 28 枚破坏全部 RED-AS-EXPECTED、NOOP=0、MIRROR_LEFTOVERS=0。首轮跑出 6 条 STAYED-GREEN，
+# 根因全部是「标识符锁被子串命中」——把 NormalizeTushareAmount / library_stale_days /
+# TestNormalizeThenLoadThenProbe 改名成 *_v2 后，裸标识符模式照样匹配。故本段凡涉及函数名、
+# 规则名、量规键名、用例名，一律换成带引号/带字段名的锚（Name: "x"、"x":）或整词锁 word106，
+# 并补钉 4 条「-run 正则下改名即静默不跑」的反证用例名锁（静态锁 54→58）。
+# 二次反证记录（09-29 14:0x，§69 全量门禁判红实录逼出的口径修正）：本批首版把三个量规键名立成
+# const 别名再 SetGauge(别名,)，§106 的键名等值锁照样绿，而通用守卫 §DEADGAUGE 按字面量扫赋值点，
+# 三条心跳当场判「有规则无赋值点、永不触发」⇒ 键名锁换成与守卫同形的「SetGauge("<键名>"」等值锁
+# （各=2 行：写 0 收案 + 写真实读数），并补 3 枚别名ban负锁（静态锁 58→61、负锁 2→5 枚）。
+# 教训落档：锁的形态必须与它要保护的判据同形，否则锁绿着放死规则过去。
+# 同日二次收口（09-29 14:3x，全量门禁 D 轮在 §88 判红的实录）：本批给 verify_deploy 加了第 30 探针
+# 的 INFO 恒回显腿，而 §88 的「INFO 观测行数」计数锁仍写死 5 ⇒ 门禁当场判红（**这是这条锁应该做的事**，
+# 红项指向"新增观测腿没同步计数锁"）。现按本仓纪律同日同步：§88 计数 5→6 并把六条腿逐名枚举进 FAIL
+# 文案；§106 补一枚 INFO|amount_scale_readout 在位锁（与 §101 的 cal_readout / limitdown_readout 同姿势，
+# 摘掉回显腿＝量纲只在红的时候才留痕，观察面退回自证），静态锁 61→62。
+# 同日三次扩段（09-29 14:4x，§99 判红后补）：全量门禁在 §99「admin.go 审计行数＝8」判红——本批 ① D1
+# 稀疏 merge 写通道加了 2 行特权变更留痕（config_d1_merge / config_snapshot_failed）⇒ 计数 8→10 同日同步，
+# FAIL 文案写清两行来源。另补测试资产登记锁 4 道（Playwright 三条 POS 腿 + 共用拦截 helper + 两个审计动作名），
+# 静态锁 62→66；预演读数：test('POS- =3、interceptHoldingsWrite( =4、两个动作名各=1。
+# 三次扩段反证实测（/tmp/cp106/run_cp_reg.py，镜像破坏、主仓零改动、LEFTOVERS=0）：首轮 6 枚破坏里
+# R2「helper 整体改名 interceptHoldingsWrite→interceptHoldingsWriteV2」**STAYED-GREEN**——裸标识符模式
+# 被改名后的子串命中，与本轮 §106 首版标识符锁同一族雷（本仓教训第 N 次复现）。故该锁换成带调用
+# 形态的「interceptHoldingsWrite(」（定义行与三条调用行都含左括号，改名加后缀即 0 命中），
+# 换锁后 R2 单独把 helper 改名 ⇒ 等值锁 64 判红。其余 R1/R3/R4/R5/R6 全部 RED-AS-EXPECTED，NOOP=0。
+# 反证归属纪律同步落档：harness 的变异基线必须从主仓真值读，不能读镜像——首轮 R2 撞 R1 的红、
+# R4 撞 R3 的红，就是这个串台把「上一条破坏的残留」冒充成「本条锁咬住了」。
+# 二次反证实测（/tmp/cp106/run_counterproof.py + A' 组，镜像破坏、主仓零改动、LEFTOVERS=0）：
+#   B 组（摘掉「写 0 收案」赋值点，等值锁 2→1）三枚全 RED-AS-EXPECTED；
+#   A 组（键名整体改回 const 别名＋赋值点用别名）三枚先撞赋值点等值锁判红，且同镜像里量到
+#     「旧键名字符串锁」的读数仍＝预演值 2＝**旧锁对这一破坏完全失明**（这条数字就是换锁形的证据）；
+#   A' 组（只追加一条未使用的别名声明，赋值点字面量仍=2）⇒ 等值锁保持绿、三枚 ban 负锁
+#     各自单独判红（负锁 42/43/44），证明负锁自身在咬而不是搭等值锁的红。NOOP=0。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 106 §0929 数据量纲 ⑩ + 运维面 ⑪ 专项静态锁与行为腿（2026-09-29 批）..."
+
+CNT106=0
+# has106：存在性锁（模式必须出现在文件里）。
+has106() {
+	CNT106=$((CNT106 + 1))
+	grep -q -- "$2" "$1" || { echo "--- FAIL: §106 锁 ${CNT106}（$3）：${1} 缺「$2」"; exit 1; }
+}
+# eq106：等值锁（grep -c 实际读数必须逐字等于预演读数）。
+eq106() {
+	CNT106=$((CNT106 + 1))
+	local got
+	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §106 等值锁 ${CNT106}（$4）：${1} 模式「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+# absent106：负锁（该形态在文件里的行数必须为 0＝回归即红）。
+absent106() {
+	CNT106=$((CNT106 + 1))
+	local got
+	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §106 负锁 ${CNT106}（$3）：${1} 又出现「$2」got=${got}"; exit 1; }
+}
+# word106：标识符存在锁（整词匹配，且必须恰好 1 行）。为什么不用 has106：反证实测「把函数改名成
+# XXX_v2」时子串仍然命中，存在性锁会放过去（STAYED-GREEN 实录 6 条）。整词 + 计数等值才是锁。
+word106() {
+	CNT106=$((CNT106 + 1))
+	local got
+	got=$(grep -cw -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "1" ] || { echo "--- FAIL: §106 整词锁 ${CNT106}（$3）：${1} 形态「$2」got=${got:-0} 预演=1"; exit 1; }
+}
+
+# ── ⑩ 成交额量纲：写侧换算调用点、抽检子命令、quality 自适应、幻觉文案不得复活 ──
+eq106 internal/data/amountscale.go 'func NormalizeTushareAmount(table string' 1 '⑩ 归一函数签名在位且只有一处定义'
+eq106 cmd/dataload/main.go 'data\.NormalizeTushareAmount(' 2 '⑩ 写侧换算调用点数（index_daily 腿 + 通用表腿各一处，摘掉任一条＝那入口回到千元落库）'
+has106 cmd/dataload/amount_check.go '"amount-check"' '⑩ 只读抽检子命令在位'
+eq106 internal/store/quality.go 'd\.AmountCaliberFactor(' 1 '⑩ 筛池按量纲自适应的调用点在位（摘掉＝池子按错量纲筛）'
+absent106 cmd/dataload/main.go '落库口径一致' '⑩ 旧「落库口径一致」幻觉文案不得复活（该注释断言过一件没发生的事）'
+word106 cmd/dataload/amount_scale_crosscheck_test.go 'func TestNormalizeThenLoadThenProbe' '⑩ 贯通用例在位（-run 正则会「匹配不到也算 ok」，用例名必须逐名钉住）'
+word106 internal/store/amount_scale_probe_test.go 'func TestProbeDailyAmountScaleMixed' '⑩ 混源判红用例在位'
+
+# ── ⑪-1 部署清单：五个现网执行体必须逐名入清单（漏一个＝改了个没人上传的文件）──
+for f in outbox_admin.py register_service.ps1 all_service_watchdog.ps1 daily_ops_check.ps1 enable_ensure.ps1; do
+	has106 scripts/deploy_guangzhou.sh "$f" "⑪-1 部署清单含 ${f}"
+done
+eq106 scripts/verify_deploy_guangzhou.sh '第 29 探针' 5 '⑪-1 第 29 探针五处同源（头部清单/可调项说明/变量定义/param 注释/正文段）'
+eq106 scripts/verify_deploy_guangzhou.sh '第 30 探针' 3 '⑩ 第 30 探针三处同源（头部清单/param 注释/正文段）'
+eq106 scripts/verify_deploy_guangzhou.sh '^Probe ' 25 '⑩⑪ 后 PS 侧行首探针语句数（新增探针须先重跑预演再改这里的数）'
+eq106 scripts/verify_deploy_guangzhou.sh 'amount-check' 3 '⑩ 现网只读抽检调用链（注释 2 处 + 实调用 1 处）'
+# INFO 恒回显在位锁：绿也要看得到抽检读数（摘掉这条＝量纲只在红的时候才留痕，观察面退回自证）。
+# 与 §101 的 INFO|cal_readout / INFO|limitdown_readout 两把同姿势；摘掉即 §88 计数锁同时判红。
+has106 scripts/verify_deploy_guangzhou.sh 'INFO|amount_scale_readout' '⑩ 第 30 探针 INFO 恒回显腿在位'
+has106 scripts/verify_deploy_guangzhou.sh 'daily_ops_check' '⑪-1 第 29 探针逐文件标记锁在位'
+
+# ── ⑪-2 夜间验收：七腿齐备、只读通道、半态守卫、阈值真透传 ──
+VNG=scripts/verify_nightly_guangzhou.sh
+has106 "$VNG" 'Probe "svc:' '⑪-2 腿 1 服务态'
+has106 "$VNG" 'Probe "hb:' '⑪-2 腿 2 调度心跳'
+has106 "$VNG" 'Probe "mem:' '⑪-2 腿 3 进程内存'
+has106 "$VNG" 'Probe "scale:' '⑪-2 腿 4 量纲抽检'
+has106 "$VNG" 'queue:research task queue' '⑪-2 腿 5 队列'
+has106 "$VNG" 'cand:nightly research produced' '⑪-2 腿 6 候选产出'
+has106 "$VNG" 'fina:financial indicator table loaded' '⑪-2 腿 7 财务覆盖'
+has106 "$VNG" 'mode=ro' '⑪-2 只读通道（file:…?mode=ro，演练/校验绝不写现网库）'
+eq106 "$VNG" 'PASS" -lt 7' 1 '⑪-2 半态守卫（腿数不足 7 必红，绝不把「没跑出来」当成功）'
+# 阈值透传三连：bash 侧变量 → PS param 声明 → python 形参。少任何一环，该环境变量就是惰性的
+# （本批首版就是这样：预览里带阈值、实跑里没带，判据悄悄按默认值走）。
+for th in ActiveMax TaskAgeHours CandAgeDays; do
+	eq106 "$VNG" "$th" 4 "⑪-2 阈值 ${th} 四处同源（bash 变量行/PS 调用行/param 声明/兜底默认）"
+done
+for py in active-max task-age-hours cand-age-days; do
+	CNT106=$((CNT106 + 1))
+	got=$(grep -c -- "--$py" "$VNG" 2>/dev/null || true)
+	[ "${got:-0}" = "3" ] || { echo "--- FAIL: §106 等值锁 ${CNT106}（⑪-2 python 形参 --${py} 三处同源：RUN_PY 预览/PS 实调用/argparse）got=${got:-0} 预演=3＝阈值没真透传"; exit 1; }
+done
+
+# ── ⑪-4 心跳三件套：量规键名 / 规则 / 路由 / 接线，四者缺一即死规则或裸量规 ──
+# 全部用「Name: "x"」「"x":」这类带引号/带字段名的锚：反证实测过只写裸标识符时，
+# 把规则改名成 x_v2 仍是子串命中，等值锁会放过去（同批 STAYED-GREEN 6 条的根因）。
+for r in signal_zero_in_session realized_pnl_zero_with_sells library_stale_days; do
+	eq106 internal/metrics/alerter.go "Name: \"$r\"" 1 "⑪-4 规则 ${r} 在 DefaultAlertRules 注册（恰一条）"
+	eq106 internal/metrics/alert_routing.go "\"$r\":" 1 "⑪-4 规则 ${r} 在路由表有条目（缺＝走默认路由，owner 改路由时会被漏掉）"
+done
+# 量规**赋值点**用 §69 通用守卫同一字面形态（SetGauge("<键名>"）逐文件数两条：0 写 0、1 写真实读数。
+# 为什么不是"键名字符串在文件里出现一次"：09-29 全量门禁 §69 判红实录——本批最初把三个键名立成
+# const 别名再 SetGauge(别名,)，§106 这条键名锁照样绿（别名声明那行命中），而 §DEADGAUGE 的通用
+# 守卫按字面量扫赋值点，三条心跳当场被判"有规则无赋值点、永不触发"。**锁的形态必须和它要保护的
+# 判据同形**，否则锁绿着把死规则放过去。别名同时用负锁钉死，不许回潜。
+eq106 internal/engine/heartbeat.go 'SetGauge("signal_zero_session_sec"' 2 '⑪-4 零信号量规赋值点两处（收案写 0 + 计时写真实值）'
+eq106 internal/trading/heartbeat.go 'SetGauge("realized_pnl_zero_with_sells"' 2 '⑪-4 已实现恒 0 量规赋值点两处'
+eq106 internal/server/library_staleness.go 'SetGauge("library_stale_days"' 2 '⑪-4 库陈旧量规赋值点两处'
+absent106 internal/engine/heartbeat.go 'signalHeartbeatGaugeName' '⑪-4 键名 const 别名不得复活（别名＝§69 守卫失明）'
+absent106 internal/trading/heartbeat.go 'realizedPnlHeartbeatGaugeName' '⑪-4 同上（已实现心跳）'
+absent106 internal/server/library_staleness.go 'libraryStalenessGaugeName' '⑪-4 同上（库陈旧）'
+eq106 internal/engine/scoring_loop.go 'feedSignalHeartbeatGauge' 1 '⑪-4 零信号心跳接线（周期喂数点）'
+eq106 internal/engine/scoring_loop.go 'RefreshRealizedPnlHeartbeat' 1 '⑪-4 已实现心跳接线（只在实盘态喂）'
+eq106 internal/server/library_watch.go 'refreshLibraryStalenessGauge' 2 '⑪-4 库陈旧接线（启动一次+每轮一次）'
+# 反证用例名锁（整词等值）：行为腿的 -run 正则会「匹配不到也算 ok」，用例名必须在源文件逐名在位。
+word106 internal/engine/heartbeat_test.go 'func TestFeedSignalHeartbeatZeroAndPinnedPair' '⑪-4 零信号成对反证用例在位'
+word106 internal/engine/heartbeat_test.go 'func TestFeedSignalHeartbeatNonLiveDoesNotWrite' '⑪-4 非实盘不落笔（反掩蔽）用例在位'
+word106 internal/trading/heartbeat_test.go 'func TestRefreshRealizedPnlHeartbeatFeedsGaugePair' '⑪-4 已实现心跳成对反证用例在位'
+word106 internal/server/library_staleness_test.go 'func TestRefreshLibraryStalenessGaugeEndToEnd' '⑪-4 库陈旧端到端用例在位'
+word106 internal/store/realized_pnl_heartbeat_test.go 'func TestCountSellFillsDayAndUserBoundary' '⑪-4 卖出笔数三道边界用例在位'
+# 反证腿名逐条钉：-run 用「A|B|C」正则，改名后其余用例照样跑、包照样回 ok，
+# 被摘掉的恰好是那条反证（本批反证实测 STAYED-GREEN 的根因）。
+word106 internal/trading/heartbeat_test.go 'func TestRefreshRealizedPnlHeartbeatNonLiveDoesNotWrite' '⑪-4 实盘心跳非实盘不落笔用例在位'
+word106 internal/engine/heartbeat_test.go 'func TestSignalHeartbeatRuleRegisteredAndKeyAligned' '⑪-4 零信号三件套对齐用例在位'
+word106 internal/trading/heartbeat_test.go 'func TestRealizedPnlHeartbeatRuleKeyAligned' '⑪-4 已实现心跳三件套对齐用例在位'
+word106 internal/server/library_staleness_test.go 'func TestLibraryStaleRuleRegisteredAndRouted' '⑪-4 库陈旧规则与路由归属用例在位'
+
+# ── ⑪-5 恢复演练：能力判定单点 fail-closed，不得回到「多处 if 静默跳过然后全绿」──
+# 负锁：现网入口只认 GZ_IP 环境变量，脚本里不许内嵌字面公网 IP（本仓纪律：部署/校验命令与
+# 文档都不写字面生产 IP，避免它随聊天与终端历史外溢）。
+CNT106=$((CNT106 + 1))
+IPHITS=$(grep -Ec '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' "$VNG" || true)
+[ "${IPHITS:-0}" = "0" ] || { echo "--- FAIL: §106 负锁 ${CNT106}（⑪-2 夜间验收脚本内嵌字面 IP，入口应只有 GZ_IP）got=${IPHITS}"; exit 1; }
+
+RD=scripts/restore_drill.sh
+eq106 "$RD" 'REQUIRE_SQLITE:-1' 1 '⑪-5 缺 sqlite3 默认判红（显式 REQUIRE_SQLITE=0 才允许跳过）'
+eq106 "$RD" '^[[:space:]]*if command -v sqlite3 >' 1 '⑪-5 sqlite3 能力判定单点化（回到 3 处＝演练又变自证）'
+has106 "$RD" '查询失败（表不存在或库不可读' '⑪-5 账本四表可读硬判红（旧版只 echo ERR 仍全绿）'
+has106 "$RD" 'DRILL_RECORD' '⑪-5 演练读数留档腿（失败也留一行，定时腿才看得见红过）'
+
+# ── 测试资产登记锁（09-29 本批自己的自动化腿入锁；④ 前端持仓写 + ① D1 写通道留痕）──
+# 为什么单独钉这一组：本轮全量门禁两次判红（§88 INFO 观测行数、§99 admin 审计行数）根因是同一族
+# ——「新增一条腿，计数锁没跟着同步」。而**测试腿**静默消失比观测腿更常见：改个名、注释掉、
+# 被 -run 正则吃不到，用例数都会变少而没人红。所以这里钉的是"腿的数量与形状"，不是"腿绿不绿"。
+# 三条 Playwright 浏览器腿按 test('POS- 前缀等值锁 3；共用拦截 helper 恰 4 行（定义 1 + 三条腿各调 1），
+# 谁把某条腿改成真写现网库（去掉拦截），计数立刻掉到 3 当场判红——零写入纪律由此变成可机检的约束。
+eq106 web/e2e/uat_full.spec.mjs "test('POS-" 3 '④ 持仓整表写浏览器腿三条在位（载荷腿/失败可见腿/重试去重腿）'
+eq106 web/e2e/uat_full.spec.mjs 'interceptHoldingsWrite(' 4 '④ 三条腿共用零写入拦截 helper（定义 1 + 调用 3）'
+# ① D1 写通道的两行审计**动作名**逐名钉住：§99 那条只数总行数（8→10），动作名被改掉＝留痕语义丢了
+# 而计数照旧，事后查"谁改了配置"就查不到那本账；故按带引号的字面量各钉一枚。
+eq106 internal/server/admin.go '"config_d1_merge"' 1 '① D1 稀疏 merge 变更留痕动作名在位（改名＝审计账断腿）'
+eq106 internal/server/admin.go '"config_snapshot_failed"' 1 '① D1 快照失败留痕动作名在位（快照没落成也要有痕）'
+
+echo "ok - §106 静态锁 ${CNT106} 道通过（含负锁 5 枚 + 阈值透传等值锁 6 道 + 测试资产登记锁 4 道）"
+
+# ── 行为腿：五组用例 + 两条脚本离线自证（先收全文再判红，红项当场可读）──
+leg106() { # $1=说明 $2=包 $3=-run 正则
+	local out
+	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
+	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+		echo "--- FAIL: §106 行为腿判红（$1），全文如下："
+		printf '%s\n' "$out" | head -40
+		exit 1
+	fi
+	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+		echo "--- FAIL: §106 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
+		exit 1
+	}
+	echo "ok - §106 行为腿 $1"
+}
+# 三件套等值闸：路由表条目数 == DefaultAlertRules 条数（本批 15→18 必须两侧同批动）
+leg106 'metrics 路由覆盖全规则（18 条）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
+leg106 'engine 零信号心跳（判据/成对反证/非实盘不落笔/接线）' ./internal/engine/ \
+	'TestSignalHeartbeatAgePredicate|TestFeedSignalHeartbeatZeroAndPinnedPair|TestFeedSignalHeartbeatNonLiveDoesNotWrite|TestSignalHeartbeatRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
+leg106 'trading 已实现盈亏心跳（配对/孤儿卖出/非实盘不落笔/键名对齐）' ./internal/trading/ \
+	'TestRealizedPnlHeartbeatMatchedTriple|TestRefreshRealizedPnlHeartbeatFeedsGaugePair|TestRefreshRealizedPnlHeartbeatNonLiveDoesNotWrite|TestRealizedPnlHeartbeatRuleKeyAligned'
+leg106 'store 卖出笔数口径（日界+账号+方向三道边界/容差）' ./internal/store/ \
+	'TestCountSellFillsDayAndUserBoundary|TestRealizedPnlHeartbeatToleranceBoundary'
+leg106 'server 战法库陈旧（纯函数/端到端/规则与路由归属）' ./internal/server/ \
+	'TestLibraryStalenessDaysPredicate|TestRefreshLibraryStalenessGaugeEndToEnd|TestLibraryStaleRuleRegisteredAndRouted'
+# ⑩ 量纲：写侧归一 + 链路贯通（tushare 形态经归一后落库真值）+ 现网抽检子命令
+leg106 'data 成交额量纲归一（含白名单/坏单元格不误 0）' ./internal/data/ 'TestNormalizeTushareAmount'
+leg106 'dataload 量纲交叉核对（常量单源 + 归一→InsertRows→抽检读数一致）' ./cmd/dataload/ \
+	'TestAmountScaleConstantsAgree|TestNormalizeThenLoadThenProbe'
+leg106 'store 量纲抽检与筛池自适应' ./internal/store/ \
+	'TestTushareAmountScaleMatchesStoreConst|TestProbeDailyAmountScale|TestAmountCaliberFactor|TestScreenedCodesAmountCaliber'
+
+# 夜间脚本离线自证：语法 + -Preview 必须零 SSH（预览与实跑同一条命令串，缺一环就是假绿温床）
+bash -n scripts/verify_nightly_guangzhou.sh || { echo "--- FAIL: §106 夜间验收脚本语法不过"; exit 1; }
+PV=$(GZ_IP=127.0.0.1 ./scripts/verify_nightly_guangzhou.sh -Preview 2>&1 || true)
+printf '%s\n' "$PV" | grep -q -- '-ActiveMax' \
+	|| { echo "--- FAIL: §106 夜间验收 -Preview 未透传阈值（预览里看不到阈值＝实跑也带不上）"; exit 1; }
+printf '%s\n' "$PV" | grep -q 'C:/var/lib/quant-trading-v2' \
+	|| { echo "--- FAIL: §106 夜间验收 -Preview 的 -DataDir 指错（应指数据目录而非部署目录——心跳文件与库都在数据目录）"; exit 1; }
+bash -n scripts/restore_drill.sh || { echo "--- FAIL: §106 恢复演练脚本语法不过"; exit 1; }
+echo "ok - §106 行为腿 8 组 + 离线自证 4 条通过"
+
+echo ""
+echo "==> 全部通过"
 
 echo ""
 echo "==> 全部通过"

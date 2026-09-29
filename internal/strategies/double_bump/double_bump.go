@@ -39,6 +39,7 @@
 package double_bump
 
 import (
+	"fmt"
 	"log"
 	"math"
 
@@ -263,8 +264,20 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		level = "brief"
 	}
 
+	// 今日量相对均量的倍数：评分用的是"第一波之后任一根"放量，这里报的是**当日**倍数，
+	// 供前端 D1 列解释量能分是满票还是空票；avgVol 为 0（停牌/无成交的历史窗口）时不给假倍数。
+	// English: today's volume vs. the lookback average (0 when the average itself is unavailable).
+	lastVolRatio := 0.0
+	if avgVol > 0 {
+		lastVolRatio = kLines[n-1].Volume / avgVol
+	}
+
 	// 回传评分结果：三个因子分与回调深度原始值放 Details，
 	// Confidence 直接用总分折算，供下游 GenerateSignal 判优先级。
+	// §0929DIM Reasons 与 Details 同键，把每维的判定原值（今日量/均量倍数、当日振幅、
+	// MA5 与 MA10 的相对位置）写成一句话带过信号边界——这些量评分时都已算过。
+	// English: §0929DIM — Reasons mirrors the Details keys and words each factor's raw evidence
+	// (today's volume vs. the 20-day average, intraday amplitude, MA5 vs. MA10 position).
 	return &strategy.Evaluation{
 		TotalScore: total,
 		Details: map[string]float64{
@@ -273,9 +286,30 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 			"ma_score":     maScore,
 			"adjust_depth": adjustDepth,
 		},
+		Reasons: map[string]string{
+			"vol_score":    fmt.Sprintf("今量%.1f倍均量(需≥%.1f)", lastVolRatio, dbc.SecondBreakVolumeMultiple),
+			"adjust_score": fmt.Sprintf("振幅%.1f%%(<%.1f%%算窄幅)", adjustDepth, dbc.AdjustVolRatioMax*2),
+			"ma_score":     doubleBumpMaDesc(ma5, ma10, kLines[n-1].Close),
+			"adjust_depth": fmt.Sprintf("当日振幅%.1f%%", adjustDepth),
+		},
 		Pass:       pass,
 		Level:      level,
 		Confidence: total / 100.0,
+	}
+}
+
+// doubleBumpMaDesc 生成均线维度的理由文本（§0929DIM）：按评分同款判据说清
+// 是"多头排列且站稳 MA5"、"仅多头排列"还是"均线未多头"，并带上 MA5/MA10 原值。
+// （doubleBumpMaDesc words the MA-trend dimension with the same test the score uses, plus the raw
+// MA5/MA10 values.）
+func doubleBumpMaDesc(ma5, ma10, close float64) string {
+	switch {
+	case ma5 <= ma10:
+		return fmt.Sprintf("均线未多头(MA5%.2f≤MA10%.2f)", ma5, ma10)
+	case close > ma5:
+		return fmt.Sprintf("多头排列且站稳MA5(%.2f/%.2f)", ma5, ma10)
+	default:
+		return fmt.Sprintf("多头排列未站稳MA5(收盘%.2f)", close)
 	}
 }
 
@@ -350,6 +384,8 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 		Confidence: eval.Confidence,
 		Reason:     eval.Level,
 		Meta:       meta,
+		// §0929DIM 维度理由与分值同进同出，前端 D 列不再只剩数字
+		Reasons: strategy.CopyReasons(eval.Reasons),
 	}, nil
 }
 

@@ -20,7 +20,8 @@
 //   - 自选股：handleFixGetWatchlist / handleFixAddWatchlist / handleFixRemoveWatchlist
 //   - 操作/QMT：handleFixAction（/api/action 手动指令；qmt.enabled+manual=admin 实盘下单，
 //     否则 noop stub）、handleFixNotifyTest（通知测试）
-//   - 推流：handleSSETicket（签发 60s 一次性建链票据）、handleFixSSE（/api/events SSE 长连接，含
+//   - 推流：handleSSETicket（签发 60s TTL 建链票据，§M5 起 TTL 内**可复用**——旧文案写"一次性"
+//     会让下一次重连语义被误读，见 sse.go:38 的票结构说明）、handleFixSSE（/api/events SSE 长连接，含
 //     票据/token 双通道鉴权、断线续传、15s 心跳）
 //   - 消息中心：handleFixAlerts（/api/alerts）、handleClearAlerts、handleDeleteAlert
 //
@@ -98,10 +99,10 @@ type fixSignal struct {
 	D2           float64 `json:"d2"`                  // 维度2 评分
 	D3           float64 `json:"d3"`                  // 维度3 评分
 	D4           float64 `json:"d4"`                  // 维度4 评分
-	D1Desc       string  `json:"d1_desc"`             // 维度1 说明（触发理由）
-	D2Desc       string  `json:"d2_desc"`             // 维度2 说明（所属板块）
-	D3Desc       string  `json:"d3_desc"`             // 维度3 说明
-	D4Desc       string  `json:"d4_desc"`             // 维度4 说明
+	D1Desc       string  `json:"d1_desc"`             // 维度1 说明（§0929DIM 优先战法理由，无则退回信号 Reason）
+	D2Desc       string  `json:"d2_desc"`             // 维度2 说明（§0929DIM 优先战法理由，无则退回所属板块）
+	D3Desc       string  `json:"d3_desc"`             // 维度3 说明（§0929DIM 战法理由，此前恒空）
+	D4Desc       string  `json:"d4_desc"`             // 维度4 说明（§0929DIM 战法理由，此前恒空）
 	SignalActive bool    `json:"signal_active"`       // 信号是否活跃
 
 	// §FIX-0921 信号产生时间（2026-09-01 用户需求）：信号页新增「产生时间」列。
@@ -150,6 +151,11 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 	for _, s := range signals {
 		// 信号→前端 fixSignal 组装：含 D1~D4 维度分、可开仓判定（置信度≥0.7 且 buy）。
 		d1, d2, d3, d4 := dimScores(s)
+		// §0929DIM 四维理由文本与四维分数同源取值（同一套战法→维度键映射），
+		// 前端 D1~D4 每格都是"分数 + 这个分数的依据"。
+		// English: §0929DIM — the four dimension descriptions are read with the same per-strategy key
+		// mapping as the four scores, so each frontend cell shows the score plus its evidence.
+		r1, r2, r3, r4 := dimDescs(s)
 		fs := fixSignal{
 			Code:         s.Code,
 			Name:         s.Name,
@@ -163,12 +169,17 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			Price:        s.Price,
 			CanOpen:      s.Confidence >= 0.7 && s.Action == "buy",
 			// D1~D4 维度评分、D1 阻断信息与事件标题、盘口因素。
-			D1:           d1,
-			D2:           d2,
-			D3:           d3,
-			D4:           d4,
-			D1Desc:       s.Reason,
-			D2Desc:       s.Sector,
+			D1: d1,
+			D2: d2,
+			D3: d3,
+			D4: d4,
+			// D1~D4 说明（§0929DIM）：优先用战法算出的维度理由；
+			// D1 无理由时退回信号 Reason（历史上 D1 列就是它），D2 无理由时退回板块名，
+			// 保证未接入理由通道的战法（做空/因子/形态）显示不降级。
+			D1Desc:       firstNonEmptyStr(r1, s.Reason),
+			D2Desc:       firstNonEmptyStr(r2, s.Sector),
+			D3Desc:       r3,
+			D4Desc:       r4,
 			SignalActive: true,
 			D1Score:      s.D1Score,
 			D1Blocked:    s.D1Blocked,
@@ -180,6 +191,46 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 		out = append(out, fs)
 	}
 	return out
+}
+
+// firstNonEmptyStr 返回第一个非空串（全空则返回空串）。
+// §0929DIM 用于"新口径优先、旧口径兜底"的维度说明取数，避免把没有接入理由通道的
+// 战法的说明列直接清零。（firstNonEmptyStr picks the first non-empty string; used by §0929DIM so
+// strategies without the reason channel keep their previous D1/D2 text.）
+func firstNonEmptyStr(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// dimDescs 按战法类型把 Reasons 里的维度理由映射到统一的 d1~d4 说明（前端 d1_desc~d4_desc）。
+// 键映射必须与 dimScores **逐分支一致**——分数与理由读同一维，否则 D2 格会出现
+// "N形的强度分 + 龙头的板块话术"这种跨维错配。
+// 单键战法（因子/形态/做空系）只写了 "factor"/"pattern" 这类总述，没有四维键，
+// 这里返回空串让调用方走兜底（D1=Reason、D2=Sector）。
+// English: dimDescs maps per-strategy Reasons keys onto the unified d1~d4 descriptions. The mapping must
+// match dimScores branch-for-branch, otherwise a cell pairs one strategy's score with another's text.
+// Single-key strategies (factor/pattern/bear tactics) have no four-dimension text, so they fall back to
+// Reason/Sector in the caller.
+func dimDescs(s combat_agent.Signal) (string, string, string, string) {
+	reasons := s.Reasons
+	if len(reasons) == 0 {
+		return "", "", "", ""
+	}
+	switch s.StrategyType {
+	case "dragon":
+		return reasons["f1_seal"], reasons["f2_resonance"], reasons["f3_premium"], reasons["f4_rs"]
+	case "double_bump":
+		return reasons["vol_score"], reasons["adjust_score"], reasons["ma_score"], reasons["adjust_depth"]
+	case "dragon_return":
+		return reasons["dragon_score"], reasons["pullback_score"], reasons["duck_score"], reasons["confirm_score"]
+	default:
+		// n_shape 原生用 d1/d2/d3/d4；其余战法无四维键 ⇒ 空串走兜底。
+		return reasons["d1"], reasons["d2"], reasons["d3"], reasons["d4"]
+	}
 }
 
 // dimScores 按战法类型把 Meta 里的维度评分映射到统一的 d1/d2/d3/d4（前端 D1~D4 列）。
@@ -1037,19 +1088,38 @@ func holdingLots(l report.ExecLog) []report.Lot {
 	return []report.Lot{{Price: l.EntryPrice, Quantity: qty, At: l.EntryAt}}
 }
 
-// fixSetHoldingsReq 手动设置持仓的请求结构体：待同步的持仓列表 + 可用资金。
+// fixSetHoldingsReq 手动设置持仓的请求结构体：待同步的持仓列表是本端点唯一有效载荷。
+// available_balance 是**历史遗留字段**：§P1-11 之前改资金只能整表 POST /api/holdings，
+// 而该端点从来没消费过它（full-replace 语义下顺手把资金也"同步"过去尤其危险）；
+// 现在资金只认 POST /api/holdings/balance 窄口径。
+// 该键**不进这个结构体**：一旦出现，typed 解码就会把"传了零值"和"没传"混成一类，
+// 而本批要的恰恰是区分两者（判据来自处理器里的原始键集合，见 handleFixSetHoldings 注释）；
+// 上送它的旧客户端不会报错——未声明的顶层键在 encoding/json 默认口径下直接被忽略，
+// 但会在响应 ignored_fields 里被点名，"传了没生效"从读代码才知道变成可发现。
+// English: available_balance is deliberately NOT a struct field — the handler inspects the raw
+// top-level key set so it can tell "absent" from "sent as zero" and echo it back as ignored.
 type fixSetHoldingsReq struct {
-	Holdings         []fixHolding `json:"holdings"`          // 待同步的持仓列表
-	AvailableBalance float64      `json:"available_balance"` // 可用资金
+	Holdings []fixHolding `json:"holdings"` // 待同步的持仓列表（本端点唯一有效载荷）
 }
 
 // handleFixSetHoldings 处理 POST /api/holdings 请求，手动设置/同步持仓信息。
 // 逻辑：遍历请求中的持仓列表 → 创建或更新执行日志 → 删除已不在列表中的手动持仓。
 func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
-	var req fixSetHoldingsReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// §0929CONTRACT-IGNORED：先解成「顶层键→原始 JSON」再解持仓列表。
+	// 为什么要两步：typed 解码会把"没上送这个键"和"上送了零值"折叠成同一个结果，
+	// 而 ignored_fields 回执要的恰恰是**键有没有出现过**（与 §D1 写通道同一条读法，
+	// 也与 admin.go:451 / server.go:2083 的稀疏 merge 判据同构）。
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
+	}
+	var req fixSetHoldingsReq
+	if raw, ok := body["holdings"]; ok {
+		if err := json.Unmarshal(raw, &req.Holdings); err != nil {
+			writeError(w, 400, "invalid request body")
+			return
+		}
 	}
 	// 自选股/持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 写入与隔离。
 	uid := s.operatorID()
@@ -1058,7 +1128,14 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 	if uid != "" {
 		fixSuffix = "_" + uid + "_fix"
 	}
-	_ = req.AvailableBalance
+	// available_balance 在本端点**从来不被消费**（旧写法只有一行 `_ = req.AvailableBalance`，
+	// 契约面上看不出来"这个字段传了没用"，前端注释还长期写着"含可用资金"）。
+	// 现在把它显式丢掉并在响应里回执，调用方可程序化发现自己那笔资金改动没生效——
+	// 资金只认 POST /api/holdings/balance 窄口径（§P1-11）。
+	ignoredFields := []string{}
+	if _, has := body["available_balance"]; has {
+		ignoredFields = append(ignoredFields, "available_balance")
+	}
 	for _, h := range req.Holdings {
 		// 定位持仓：优先手动 _fix；无 _fix 时回退到同代码的现有持仓（兼容信号创建的持仓，避免重复建档）
 		id := h.Code + fixSuffix
@@ -1116,7 +1193,8 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	// 回执本次被丢弃的字段：让"传了但没生效"在契约上是**可发现**的，而不是靠人读代码。
+	writeJSON(w, 200, map[string]any{"status": "ok", "ignored_fields": ignoredFields})
 }
 
 // addHoldingLotReq 加仓请求体：加仓价格与数量。
@@ -1751,6 +1829,61 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 		"name":  info.Name,
 		"price": info.Price,
 	})
+}
+
+// handleFixStockNames 处理 GET /api/stock/names 请求：按 ?codes=a,b,c 批量返回代码→股票名。
+//
+// §0929FILL-NAME（FIX_PLAN_20260929 ⑦）：这是给「交易流水」页补的**只读旁证**通道。
+// 实盘成交簿 fills 没有 name 列（见 internal/store/stock_names.go 文件头的完整交代），
+// 本端点从本地 stocks 表（tushare stock_basic 落库）查名字，零网络、零迁移、零账本改动。
+// 三条刻意的设计：
+//
+//	① 只走研究/实盘库的 stocks 表，绝不为了补名字去打行情上游——
+//	   为 100 行展示数据制造 100 次外呼，正是本仓反复出事的「旁证拖垮主链路」形态；
+//	② 查不到的代码**不出现在返回 map 里**（前端据此显示「—」），不给空串、不猜；
+//	③ 查询失败如实 500 并落日志，不返回 200+空 map 把降级粉饰成「这个市场没有名字」。
+//
+// 名称在本系统全程只是展示旁证：不参与幂等锚（(order_id,traded_at,price,qty)+trade_id）、
+// 不参与账目计算、不参与勘误定位——锚点里出现 name 会被 store 侧负锁钉红。
+//
+// English: read-only code→name side-evidence for the fills table, served from the local
+// stocks table (no upstream quote calls). Unknown codes are simply absent from the map so the
+// UI can render an honest "—"; a query failure is reported as 500 instead of a 200 with an
+// empty map. Names never take part in the idempotency anchor or any accounting computation.
+func (s *Server) handleFixStockNames(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.URL.Query().Get("codes"))
+	// 空参数＝合法的空集合（首屏没有成交行时前端就不会发请求，走到这里说明是显式问询）。
+	names := map[string]string{}
+	if raw == "" {
+		writeJSON(w, 200, map[string]interface{}{"names": names})
+		return
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) > store.MaxStockNamesPerQuery {
+		writeError(w, 400, "codes 数量超限（单次最多 "+strconv.Itoa(store.MaxStockNamesPerQuery)+" 个）")
+		return
+	}
+	// 取库优先级：研究库 trading.db（stocks 由 dataload 灌）→ 实盘库 live.db（§OPT-3 拆分后
+	// 旧部署仍可能把 stocks 留在单库）。两处都没有即如实返回空集合。
+	db := s.researchDB
+	if db == nil {
+		db = s.liveDB
+	}
+	if db == nil {
+		log.Printf("[server] /api/stock/names 无可用数据库，名称旁证降级为空集合")
+		writeJSON(w, 200, map[string]interface{}{"names": names})
+		return
+	}
+	got, err := db.StockNamesByCodes(parts)
+	if err != nil {
+		log.Printf("[server] /api/stock/names 查询失败: %v", err)
+		writeError(w, 500, "股票名查询失败")
+		return
+	}
+	for k, v := range got {
+		names[k] = v
+	}
+	writeJSON(w, 200, map[string]interface{}{"names": names})
 }
 
 // handleFixDepth 处理 GET /api/depth/{code} 请求，返回个股盘口快照与派生因子。

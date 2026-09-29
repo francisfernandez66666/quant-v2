@@ -97,6 +97,12 @@ describe('§H-2 Positions 保存可用资金失败（toast + 回滚 + 缓存不�
     cleanup()
     // TDesign MessagePlugin 的 toast 挂在 document.body（不经 React 容器），
     // cleanup 不会带走——上一条用例的失败 toast 会残影进本条断言，先物理清场。
+    // ⚠ 已知自伤形态（09-29 实录，见 h_0929pos_save.test.jsx 文件头的同族说明）：每条 toast 是
+    //   body 上的独立 React root，手工摘走容器后它自己的 3s 自动关窗到点时 React 再 removeChild
+    //   会抛 NotFoundError（用例全过、进程非零退出那种"1 unhandled error"）。本文件 7 条用例实测
+    //   5/5 稳定不复现（toast 量少、时序不撞），故本轮**只登记不当场改造**：要改造就得把
+    //   L126/L147/L219 三处 DOM 文案断言整体搬到替身记账上（含 147 那条"不得出现"的负锁），
+    //   半改会让负锁退化成恒真。若哪天本文件在门禁里随机报 unhandled，按那条路径改。
     document.querySelectorAll('.t-message').forEach((n) => n.remove())
     localStorage.clear()
     state.balance = 100

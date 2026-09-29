@@ -136,6 +136,11 @@ type Engine struct {
 	signalStore   *signalStore             // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
 	// English: pinned per-day signal store (latest Pass per code@strategy, restored across restarts)
 	storeDay string // §修复 P2#23：signalStore/signalRecords 已加载的交易日（YYYMMDD），跨日即清空避免昨日信号残留
+	// §0929HB-1（2026-09-29 全量审计批 ⑪-4）：零固化信号心跳的计时锚（e.mu 保护，只在
+	// feedSignalHeartbeatGauge 内读写）。锚=当日首轮「盘中且实盘」评估时刻，跨交易日重开。
+	// English: anchor for the zero-pinned-signal heartbeat clock (per trading day, e.mu guarded).
+	hbSignalDay string
+	hbSignalAt  time.Time
 
 	msgStore      *data.MessageStore            // 消息中心持久化存储
 	consultStore  *data.ConsultStore            // 股票咨询对话持久化存储（跨交易日清空；accountsRoot 未注入时的共享回退）
@@ -420,15 +425,18 @@ func (e *Engine) TrimAfterHoursIfDue(now time.Time) {
 
 // ReloadFactorRules 从战法库 applied_factors.json 重载全部启用规则并注入因子 runner（热生效）。
 // 战法库启用/禁用/删除/审批后由 server 调用，无需重启。
-// English: reloads all enabled rules from the strategy library and injects them into the factor
-// runner (hot-applied). Called by the server after library mutations; no restart needed.
-func (e *Engine) ReloadFactorRules(dataDir string) {
+// §0929LIB-WATCH：error 透传（库读失败由调用方决定告警与是否推进版本戳）；
+// 引擎没有战法代理时返回 nil——那是"该引擎不跑战法库"的正常态，不是失败（避免轮询误告警风暴）。
+// English: reloads the factor library and forwards the load error; a nil agent means this engine
+// simply doesn't consume the library, which is not a failure.
+func (e *Engine) ReloadFactorRules(dataDir string) error {
 	e.mu.RLock()
 	ca := e.combatAgent
 	e.mu.RUnlock()
 	if ca != nil {
-		ca.ReloadFactorRules(dataDir)
+		return ca.ReloadFactorRules(dataDir)
 	}
+	return nil
 }
 
 // FactorStats 返回因子 runner 的各规则运行统计（效果监测）。
@@ -455,14 +463,16 @@ func (e *Engine) RecordFactorForwardReturn(ruleID string, ret float64) {
 }
 
 // ReloadPatternRules 从形态战法库 applied_patterns.json 重载全部启用规则并注入形态 runner（热生效）。
-// English: reloads all enabled rules from the pattern library and injects them (hot-applied).
-func (e *Engine) ReloadPatternRules(dataDir string) {
+// §0929LIB-WATCH：error 透传，判定口径与因子腿一致。
+// English: reloads the pattern library and forwards the load error.
+func (e *Engine) ReloadPatternRules(dataDir string) error {
 	e.mu.RLock()
 	ca := e.combatAgent
 	e.mu.RUnlock()
 	if ca != nil {
-		ca.ReloadPatternRules(dataDir)
+		return ca.ReloadPatternRules(dataDir)
 	}
+	return nil
 }
 
 // PatternStats 返回形态 runner 的各规则运行统计（效果监测）。

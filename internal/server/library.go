@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy"
@@ -218,8 +220,11 @@ func (s *Server) handleResearchLibraryToggle(action string) http.HandlerFunc {
 			writeError(w, 404, err.Error())
 			return
 		}
-		s.reloadLibraries()
-		writeJSON(w, 200, map[string]any{"status": "ok", "id": id, "enabled": enabled})
+		// §0929LIB-WATCH：库文件的持久化成败已在上面判定；这里额外回报"有没有真注入运行引擎"。
+		// 失败仍是 200（改动已落盘，回 5xx 会让前端以为没保存），但必须带 reload_error 如实回告，
+		// 且版本戳轮询会自行重试——绝不重演"文件改了、引擎不知道、响应说 ok"。
+		reloadErr := s.reloadLibraries()
+		writeJSON(w, 200, map[string]any{"status": "ok", "id": id, "enabled": enabled, "reload_error": errText(reloadErr)})
 	}
 }
 
@@ -243,8 +248,8 @@ func (s *Server) handleResearchLibraryDelete(w http.ResponseWriter, r *http.Requ
 		writeError(w, 404, err.Error())
 		return
 	}
-	s.reloadLibraries()
-	writeJSON(w, 200, map[string]any{"status": "ok", "id": id})
+	reloadErr := s.reloadLibraries() // §0929LIB-WATCH：删除后未注入引擎要如实回报
+	writeJSON(w, 200, map[string]any{"status": "ok", "id": id, "reload_error": errText(reloadErr)})
 }
 
 // handleResearchLibraryRename 处理 POST /api/research/library/{id}/rename：重命名某条已应用战法。
@@ -273,8 +278,8 @@ func (s *Server) handleResearchLibraryRename(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// 重命名后刷新引擎（信号名/去重键跟随新名）
-	s.reloadLibraries()
-	writeJSON(w, 200, map[string]any{"status": "ok", "id": id, "name": body.Name})
+	reloadErr := s.reloadLibraries() // §0929LIB-WATCH：未注入引擎时如实回报，不静默 ok
+	writeJSON(w, 200, map[string]any{"status": "ok", "id": id, "name": body.Name, "reload_error": errText(reloadErr)})
 }
 
 // isPatternID 判断战法库 ID 是否为形态战法（pat_ 前缀），否则按因子战法处理。
@@ -304,28 +309,142 @@ func (s *Server) handleResearchBacktestToggle(w http.ResponseWriter, r *http.Req
 		writeError(w, 400, "无效请求体")
 		return
 	}
-	cfg := s.cfg.Get()
-	cfg.Scheduler.Nightly.BacktestEnabled = body.Enabled
-	s.cfg.SetSchedulerConfig(&cfg.Scheduler)
+	// §0929CFG-HIST：调度配置属全局文件这本账，纳入统一的写前快照/写后 diff 审计入口。
+	// 旧写法是 `cfg := s.cfg.Get()` 后**直接改活体指针的字段**再传回 setter——那等于在
+	// 不持 m.mu 的情况下改全局结构体，与 §0925EVE-D1 锤实的 Watch/Load 竞态同族；
+	// 现在先拷贝一份，只在拷贝上改，写入经 setter 持锁完成。
+	trace := s.snapshotConfigWrite(userIDFor(r), userIDFor(r), "scheduler")
+	cur := s.cfg.Get()
+	next := cur.Scheduler // 值拷贝：只改这一个开关，其余调度字段原样带过去
+	next.Nightly.BacktestEnabled = body.Enabled
+	if err := s.cfg.SetSchedulerConfig(&next); err != nil {
+		// 未落盘如实回 500（旧写法吞掉 Save 错误、照样回 200，属"降级报成功"家族）。
+		writeError(w, 500, "调度配置保存失败（本次开关不会在重启后保留）: "+err.Error())
+		return
+	}
+	opslog.Audit("config_scheduler_write", userIDFor(r), "scheduler("+trace.ledger+")",
+		fmt.Sprintf("backtest_enabled=%v %s", body.Enabled, trace.detail()))
+	trace.audit(s)
 	writeJSON(w, 200, map[string]any{"enabled": body.Enabled})
 }
 
 // reloadLibraries 对注册表内全部引擎热重载因子+形态战法库（启用/禁用/删除/重命名后立即生效），
 // 并按最新启用战法集合同步模拟盘资金池（新增/停用战法后分仓随之更新）。
-// English: hot-reloads the factor and pattern libraries on every engine in the registry (immediately
-// effective after enable/disable/delete/rename) and syncs the paper strategy pools to the current
-// enabled set (pools follow strategy add/disable changes).
-func (s *Server) reloadLibraries() {
-	if s.registry == nil {
-		return
+//
+// §0929LIB-WATCH（09-29 全量审计批 P1-3）起返回 error，并新增一道"先读后切"闸门：
+// 库文件读不出来（JSON 损坏、权限、磁盘）时**直接返回错误，不动引擎、不重建资金池**。
+// 为什么闸门重要：ActivePaperPoolTypes/LibraryLabelResolver 内部把读库错误吞成"空列表"，
+// 一次坏读过去会把模拟盘分仓集合缩没、把显示名退回 ID——比"战法没更新"更糟，因为它
+// 看起来像"按最新库重建过了"。现在坏读=整次重载作废并如实告警，运行中的引擎保持上一份好库。
+// 告警走既有推送腿（LevelHigh）+ opslog 审计行，调用方（HTTP 与版本戳轮询）都拿得到错误。
+//
+// English: hot-reloads both libraries on every registry engine and re-syncs the paper pools.
+// Since §0929LIB-WATCH it returns an error and gates on a successful library read first: a
+// corrupt/unreadable library aborts the reload (engines keep the last good set, pools are not
+// silently shrunk to empty) and raises a high-level alert plus an audit line.
+func (s *Server) reloadLibraries() error {
+	// 闸门：先自读一遍两库。文件缺失不算失败（读侧返回空列表），只有真读不动/解析不动才中止。
+	var loadErrs []string
+	if _, err := research.LoadEnabledFactorRules(s.researchDir); err != nil {
+		loadErrs = append(loadErrs, "因子库: "+err.Error())
 	}
-	for _, c := range s.registry.AllControllers() {
-		c.ReloadFactorRules(s.researchDir)
-		c.ReloadPatternRules(s.researchDir)
+	if _, err := research.LoadEnabledPatternRules(s.researchDir); err != nil {
+		loadErrs = append(loadErrs, "形态库: "+err.Error())
+	}
+	if len(loadErrs) > 0 {
+		msg := strings.Join(loadErrs, "；")
+		s.alertLibraryReloadFailure("库读取失败，本次重载整次作废（引擎保持上一份好库、资金池未重建）: " + msg)
+		return fmt.Errorf("战法库重载失败: %s", msg)
+	}
+	// 取本次要注入的引擎集合：注册表模式覆盖全部账号引擎；
+	// 单引擎模式（registry 未注入，旧部署形态）仍走 s.ctrl 这条腿——旧 reloadRulesByKind
+	// 就是靠它生效的，重构时不能把它悄悄丢掉（否则单引擎部署从此不再热重载）。
+	ctrls := s.engineControllersForLibraryReload()
+	// 逐引擎热替换；单个引擎失败不阻断其他引擎，但整次调用按失败上抛（版本戳不推进、下轮重试）。
+	var engErrs []string
+	for _, c := range ctrls {
+		if c == nil {
+			continue // AllControllers 可能含 nil 值（*Engine 转 interface 的经典陷阱，反射判空在此收口）
+		}
+		if err := c.ReloadFactorRules(s.researchDir); err != nil {
+			engErrs = append(engErrs, "因子: "+err.Error())
+		}
+		if err := c.ReloadPatternRules(s.researchDir); err != nil {
+			engErrs = append(engErrs, "形态: "+err.Error())
+		}
+	}
+	if len(engErrs) > 0 {
+		msg := strings.Join(dedupeStrings(engErrs), "；")
+		s.alertLibraryReloadFailure("引擎热替换失败（资金池未重建）: " + msg)
+		return fmt.Errorf("战法库热替换失败: %s", msg)
+	}
+	if s.registry == nil {
+		return nil // 无注册表＝没有分仓模板可同步（单引擎模式的池由各自路径维护）
 	}
 	s.registry.SetPaperPools(ActivePaperPoolTypes(s.researchDir, s.paperStrategiesForOperator()))
 	// §C 规则池显示名同步（改名/新增后前端分仓条立即用新名字）
 	s.registry.SetPaperLabelResolver(LibraryLabelResolver(s.researchDir))
+	return nil
+}
+
+// engineControllersForLibraryReload 列出本次战法库重载要覆盖的引擎：
+// 注册表模式取全部账号引擎，单引擎（旧）模式取 s.ctrl。
+// English: the engine set a library reload must cover — every registry engine, or the legacy
+// single controller when no registry is wired.
+func (s *Server) engineControllersForLibraryReload() []EngineController {
+	if s.registry != nil {
+		return s.registry.AllControllers()
+	}
+	if s.ctrl != nil {
+		return []EngineController{s.ctrl}
+	}
+	return nil
+}
+
+// alertLibraryReloadFailure 战法库重载失败的统一留痕：[P1] 日志 + opslog 审计 + 高级别推送。
+// 级别取 LevelHigh 的理由：这条缝失败的直接后果是"研究面判了死刑、实盘照旧下单"，
+// 属于下单行为差异，必须到人；轮询侧每轮重试都会推一次，所以调用方只在真失败时进来。
+// English: single failure trail for library reloads — P1 log, audit line and a high push,
+// because a missed reload means live trading keeps running a strategy research has disabled.
+func (s *Server) alertLibraryReloadFailure(reason string) {
+	log.Printf("[P1][library] 战法库热重载失败 dir=%s: %s", s.researchDir, reason)
+	opslog.Audit("library_reload_failed", "system", s.researchDir, reason)
+	if s.notifier != nil {
+		s.notifier.Push(notify.Message{
+			Level: notify.LevelHigh,
+			Title: "战法库热重载失败",
+			Content: "战法库变更未能注入运行中的引擎：" + reason +
+				"。在修复前，正在跑的引擎仍按上一份战法库出信号（夜间降级不会生效）。" +
+				"请检查 " + s.researchDir + "/applied_factors.json 与 applied_patterns.json 是否可读、JSON 是否完整，" +
+				"修好后版本戳轮询会自动重试，也可在前端点一次重载。",
+		})
+	}
+}
+
+// dedupeStrings 保序去重（多个引擎对同一坏库报的是同一句错误，审计里只留一条）。
+// English: order-preserving string dedup (many engines repeat the same load error).
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+// errText 把 error 转成响应字段用的字符串（nil → 空串）。
+// 响应里带空串而不是省略键，前端可以无条件读 `reload_error` 判"这次有没有即时生效"，
+// 不必处理字段缺失与字段为空的两种形态（§WS-E 下行契约口径：字段形状稳定）。
+// English: error→string for response fields (nil → ""), keeping the field shape stable.
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // paperStrategiesForOperator 读取运营账号（管理员）的模拟盘战法白名单（rules.paper.strategies）——

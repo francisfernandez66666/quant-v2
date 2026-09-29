@@ -12,6 +12,9 @@ vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
   // §M13：补齐 mock 缺失导出（与 api/index.js 真实实现一致，仅按状态码判定，不改变本文件既有断言）。
   isForbidden: (e) => !!(e && e.status === 403),
+  // §0929GATE-403：同族补齐——Quant 渲染期即读角色判据，缺这个导出会抛 "No isAdmin export"；
+  // 本文件的紧急停止/撤单/对账三件套入口都是管理员会话才存在的 UI，故按 admin 建模。
+  isAdmin: () => true,
   fetchQMTConfig: vi.fn(async () => ({
     enabled: true, mode: 'manual', price_type: 'market', auto_sell: false, halted: false,
     gateway_url: 'http://127.0.0.1:18789', token_masked: '****',

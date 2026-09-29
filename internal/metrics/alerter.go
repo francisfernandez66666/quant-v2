@@ -87,6 +87,26 @@ func DefaultAlertRules() []AlertRule {
 		// For=0s：装配事件是离散事实（这一次读失败/零条就是发生了），不存在需要持续观察的毛刺。
 		{Name: "live_strategy_library_not_loaded", Metric: "live_strategy_library_load_errors", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "实盘战法库读取失败（当轮已 fail-close 不出新建议，未熔断资金）：applied_factors.json/applied_patterns.json 存在但不可读/损坏，查数据目录挂载与文件权限——这是读库故障，不是库里没规则"},
 		{Name: "live_strategy_no_enabled_rules", Metric: "live_strategy_no_enabled", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "实盘战法库读取成功但零条启用规则（当轮已 fail-close 不出新建议，未熔断资金）：库里真没有启用的因子/形态战法（缺失/为空/全停用），查战法库启用状态——这不是读库故障"},
+		// §0929HB-1/-2/-3（2026-09-29 全量审计批 ⑪-4）：三条「应有值缺失」型业务心跳。
+		// 上面全部规则都是"越界才报"型，而本系统最危险的静默失效形态是"该有的数没了"：
+		// 引擎每 30s 照常打分、进程应答正常、外部三条探针全绿，决策面却整天空转。
+		// 三条都是量规+规则+路由三件套（§DEADGAUGE 纪律：注册规则必须有赋值点，
+		// 键名与写端严格同源，heartbeat_lock_test.go 钉这条）；赋值点分别在
+		// internal/engine/heartbeat.go、internal/trading/heartbeat.go、
+		// internal/server/library_staleness.go（各文件头写明口径与不这样判的理由）。
+		//
+		// HB-1 盘中零固化信号：量规本身就是"当日盘中零信号的秒数"（非盘中/非实盘写 0），
+		// 阈值 1800s=30 分钟。For=60s 只防单轮毛刺，不再叠加计时义务（时长已在写侧算好，
+		// 这里再 For 300s 会把告警推迟到 35 分钟，读起来像阈值是 35 分钟）。
+		{Name: "signal_zero_in_session", Metric: "signal_zero_session_sec", Op: "gt", Threshold: 1800, For: "60s", Level: "p1", Message: "交易日盘中已 30 分钟零固化信号：战法扫描/行情源/库任一环节静默断都会长这样（引擎日志看着完全正常）。看板核对当日信号批次与战法库读数，先确认扫描有没有在跑"},
+		// HB-2 有卖出但已实现盈亏恒为 0：0/1 量规，与日内亏损熔断闸读同一个函数
+		// （§0927AUDIT-D1 修的就是"同一量在两个读数点各写一遍公式"）。持续 300s 才报——
+		// 卖出刚入账、成本尚未摊平时会短暂为 0，属正常过渡态。
+		{Name: "realized_pnl_zero_with_sells", Metric: "realized_pnl_zero_with_sells", Op: "gt", Threshold: 0, For: "300s", Level: "p2", Message: "当日有卖出成交但已实现盈亏恒为 0：日内亏损熔断闸与成交页此刻同时看不到亏损（成本取不到或卖出腿方向/费用没入账），查成本口径与卖出腿费用入账"},
+		// HB-3 已应用战法库陈旧：量规是"两份库文件较近一次 mtime 距今的天数"（两份都缺写 0，
+		// 那种成因归上面的 no_enabled 那条 p1，文案严格分家）。阈值 14 日历日=夜间寻优/审批链
+		// 停摆两周；变更本身由 §0929LIB-WATCH 的热加载+审计行负责，这条只补"长期没有变更"。
+		{Name: "library_stale_days", Metric: "library_stale_days", Op: "gt", Threshold: 14, For: "0s", Level: "p2", Message: "已应用战法库 14 天以上未更新：夜间寻优/审批链可能整段停摆，引擎仍在按旧规则出信号（§0929LIB-WATCH 只在库真的变了才动，看不见「一直没变」）；查 quant-research 夜间任务与候选审批队列"},
 	}
 }
 

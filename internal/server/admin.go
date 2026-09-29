@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -385,12 +386,16 @@ func (s *Server) handleAdminSetStrategyConfig(w http.ResponseWriter, r *http.Req
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	// §0929CFG-HIST：管理员代配战法参数落的是**该账号归属运营者的配置文档**，此前既无写前快照
+	// 也无字段级审计——代配比本人修改更需要留痕（操作者≠账号本人，actor 与 uid 必须分开记）。
+	trace := s.snapshotConfigWrite(userIDFor(r), id, "strategy")
 	// §0926E2E-W1B：持久化失败（含写后复读不匹配）如实回 500，不再"只 log 照回 200"。
 	if err := s.cfg.SetStrategyConfigFor(id, &cfg); err != nil {
 		log.Printf("[admin] 用户 %s 战法参数保存失败: %v", id, err)
 		writeError(w, 500, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
 		return
 	}
+	trace.audit(s)
 	log.Printf("[admin] 用户 %s 战法参数已保存", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -407,11 +412,31 @@ func (s *Server) handleAdminGetD1Config(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 503, "配置未接入")
 		return
 	}
-	writeJSON(w, 200, s.cfg.GetD1ConfigFor(id))
+	// §0929CFG-D1：回显"这份值到底从哪本账来"。has_override=true 意味着该归属账号有独立 D1
+	// 副本、设置页改全局对它不再生效——这个状态过去只存在于 auth.json 的一个键里，界面读不到，
+	// 于是"改了不生效"只能靠人猜。原有字段一个不动，只在顶层加这一个布尔。
+	view := map[string]interface{}{}
+	if b, err := json.Marshal(s.cfg.GetD1ConfigFor(id)); err == nil {
+		_ = json.Unmarshal(b, &view)
+	}
+	view["has_override"] = s.cfg.HasD1Override(id)
+	writeJSON(w, 200, view)
 }
 
 // handleAdminSetD1Config 处理 POST /api/admin/users/{id}/config/d1。
-// English: handles POST /api/admin/users/{id}/config/d1.
+//
+// §0929CFG-D1（P1-1 的同族第二条现场）：旧实现与设置页那条通道一样，把 body 解成强类型
+// config.D1Config 后整份替换该账号的 D1 覆盖 ⇒ 一个未知键（或前端漏传一个键）就把该账号的
+// 规则与权重清零落库。现改为**指名账号的稀疏 merge**（没传=保留旧值，未知键只回报不合并），
+// 并补上写前快照 + 字段级 diff 审计。
+// 这条通道还有一个别处没有的副作用：**它会为该账号建立 D1 覆盖**，而运行时读侧
+// GetD1ConfigFor 的优先级是"账号覆盖 → 全局"——覆盖一旦存在，设置页改的全局值就被永久遮住。
+// 现在写侧跟着读侧落点走（见 handleSetD1Config 的 MergeD1ConfigScoped），两侧不再分叉；
+// 本函数额外回报 created_override，让调用方知道"从此这个账号有独立副本、全局改动影响不到它"。
+// English: §0929CFG-D1 — sparse merge for a named account's D1 override, with a pre-write
+// snapshot and field-level audit; reports whether this call created the override that shadows
+// the global value, because that is exactly the state that used to silently desynchronize the
+// settings page from the engine.
 func (s *Server) handleAdminSetD1Config(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
@@ -422,19 +447,45 @@ func (s *Server) handleAdminSetD1Config(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 503, "配置未接入")
 		return
 	}
-	var cfg config.D1Config
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	// 解成「顶层键→原始 JSON」：typed 解码会把缺失键折叠成零值，正是本缺陷的成因。
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	// §0926E2E-W1B：持久化失败（含写后复读不匹配）如实回 500。
-	if err := s.cfg.SetD1ConfigFor(id, &cfg); err != nil {
-		log.Printf("[admin] 用户 %s D1 规则保存失败: %v", id, err)
-		writeError(w, 500, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
+	actor := userIDFor(r)
+	key := config.KVKeyD1()
+	// 快照/diff 的落点必须与写入落点是**同一本账**：运营配置系统级共享，所以这里取
+	// ConfigOwnerID(id)（归属账号）而不是原始 id——按 id 记历史会给出一本没人读的假账。
+	oid := s.cfg.ConfigOwnerID(id)
+	// 写前快照（账号账，落点就是本通道要写的键）+ 取 diff 的"旧的一侧"。
+	snapName, snapErr := config.SnapshotAccountKey(s.cfg, oid, key)
+	if snapErr != nil {
+		log.Printf("[P1][config] 代配 D1 写前快照失败（归属账号 %s 本次变更不可回滚，写入照常执行）: %v", oid, snapErr)
+		opslog.Audit("config_snapshot_failed", actor, "d1:"+oid, snapErr.Error())
+	}
+	beforeBytes, _ := config.EffectiveAccountDoc(s.cfg, oid, key)
+	merged, ignored, created, err := s.cfg.MergeD1ConfigForAccount(id, body)
+	if err != nil {
+		// 未落盘：如实回告，绝不"报错也照回 200"（§ROBUST 降级报成功族）。
+		writeError(w, 400, err.Error())
 		return
 	}
-	log.Printf("[admin] 用户 %s D1 规则已保存", id)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	keys := make([]string, 0, len(body))
+	for k := range body {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	opslog.Audit("config_d1_merge", actor, "d1(account:"+oid+")",
+		fmt.Sprintf("keys=%v ignored=%v snapshot=%s created_override=%v rules=%d target_account=%s", keys, ignored, snapName, created, len(merged.Rules), id))
+	config.AuditAccountWrite(s.cfg, actor, oid, key, beforeBytes)
+	log.Printf("[admin] 用户 %s D1 规则已保存（代配者=%s，落点归属=%s，新建覆盖=%v）", id, actor, oid, created)
+	writeJSON(w, 200, map[string]interface{}{
+		"status":           "ok",
+		"ignored_keys":     ignored,
+		"created_override": created,
+		"rules_count":      len(merged.Rules),
+	})
 }
 
 // handleAdminGetLongShortConfig 处理 GET /api/admin/users/{id}/config/longshort。
@@ -469,12 +520,15 @@ func (s *Server) handleAdminSetLongShortConfig(w http.ResponseWriter, r *http.Re
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	// §0929CFG-HIST：多空开关落独立 KV 键（account:longshort 这本账），代配同样要快照+审计。
+	trace := s.snapshotConfigWrite(userIDFor(r), id, "longshort")
 	// §0926E2E-W1B：持久化失败（含写后复读不匹配）如实回 500。
 	if err := s.cfg.SetLongShortConfigFor(id, cfg); err != nil {
 		log.Printf("[admin] 用户 %s 做多/做空开关保存失败: %v", id, err)
 		writeError(w, 500, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
 		return
 	}
+	trace.audit(s)
 	log.Printf("[admin] 用户 %s 做多/做空开关已保存", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }

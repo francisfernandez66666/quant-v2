@@ -213,6 +213,9 @@ func bsRunDaily(db *store.DB, c *data.BaostockClient, start, end string) error {
 	}
 	log.Printf("[dataload] 行情类完成：%d 只，累计 %d 行，跳过 %d，耗时 %v",
 		len(codes), inserted, skipped, time.Since(tStart).Round(time.Second))
+	// §0929SCALE-⑩ baostock 腿原样落"元"，不做换算；但收尾同样要抽检自证——
+	// 判据读的是库，与来源无关，这条腿同样会被历史混源污染。只 WARN 不改判装载结果。
+	checkLoadedAmountScale(db)
 	return nil
 }
 

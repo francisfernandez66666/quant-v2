@@ -108,6 +108,9 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "short_capital 不能为负")
 		return
 	}
+	// §0929CFG-HIST：模拟盘账户级参数住在账号级主配置文档（rules.paper）里，此前这条通道
+	// 改坏了没有写前快照也没有字段级审计——初始资金/做空预算/总开关都是会影响撮合结果的量。
+	trace := s.snapshotConfigWrite(userIDFor(r), uid, "paper")
 	// 局部落库：只覆盖本次显式携带的指针字段，未传字段保持原值（与 /api/config/qmt 同契约）。
 	// SetPaperConfigFor 原子更新该账号 rules.paper 并持久化到 config.json。
 	// §0926E2E-W1B：持久化失败（含写后复读不匹配）即中止回 500——不再带着未落盘的配置继续热同步，
@@ -139,6 +142,8 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "配置保存失败（未落盘，本次修改不会在重启后保留）: "+err.Error())
 		return
 	}
+	trace.audit(s) // §0929CFG-HIST：落盘成功后记字段级 diff（未落盘的变更不留"已变更"假账）
+	log.Printf("[paper] 账号 %s 模拟盘配置已保存 %s", uid, trace.detail())
 	// 热同步：以落库后的账号规则重建引擎配置（装配口径与 main.go 完全一致）。
 	// ConfigFromRules 会把 AutoSell/ShortEnabled 的 nil 归一为默认值，得到引擎可直接消费的 Config。
 	pc := paper.Config{}

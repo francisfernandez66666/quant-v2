@@ -40,6 +40,7 @@
 package dragon
 
 import (
+	"fmt"
 	"math"
 
 	"quant-trading-v2/internal/config"
@@ -183,13 +184,16 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	}
 
 	// F4: RS强度 — 近5日趋势涨幅（F4: RS strength — 5-day trend gain）
+	// trend5 提到外层声明：§0929DIM 要把它写进 f4_rs 的维度理由文本，
+	// 让前端 D4 列能显示"5日+X%"而不只是一个分数。
 	f4 := 0.0
+	trend5 := 0.0
 	if len(kLines) >= 5 {
-		trend := (kLines[len(kLines)-1].Close - kLines[len(kLines)-5].Close) / kLines[len(kLines)-5].Close * 100
+		trend5 = (kLines[len(kLines)-1].Close - kLines[len(kLines)-5].Close) / kLines[len(kLines)-5].Close * 100
 		// 5日涨幅 >10% → 满分；>5% → 半值（5-day gain >10% → full marks, >5% → half）
-		if trend > 10 {
+		if trend5 > 10 {
 			f4 = dc.F4RsWeight * 100
-		} else if trend > 5 {
+		} else if trend5 > 5 {
 			f4 = dc.F4RsWeight * 100 * 0.5
 		}
 	}
@@ -209,6 +213,11 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 
 	// 回传评分结果：四因子（封单/共振/溢价/相对强度）各自留分在 Details，
 	// 便于前端拆条展示，也便于复盘时定位是哪一维把龙头判定抬过门槛。
+	// §0929DIM Reasons 与 Details 同键，把每维的**判定依据原值**写成一句话（涨幅贴板阈值、
+	// 板块最强涨幅、5日趋势等），这些量本来就在评分现场算过，此前只留了分数没留话。
+	// English: §0929DIM — Reasons mirrors Details' keys and states each factor's raw evidence
+	// (gain vs. the board's limit threshold, strongest sector gain, 5-day trend); these values were
+	// already computed at scoring time but never carried to the UI.
 	return &strategy.Evaluation{
 		TotalScore: total,
 		Details: map[string]float64{
@@ -217,9 +226,53 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 			"f3_premium":   f3,
 			"f4_rs":        f4,
 		},
+		Reasons: map[string]string{
+			"f1_seal":      dragonSealDesc(si.ChangePct, limitPct),
+			"f2_resonance": dragonSectorDesc(bestSector),
+			"f3_premium":   dragonPremiumDesc(si.ChangePct, bestSector),
+			"f4_rs":        fmt.Sprintf("5日趋势%+.1f%%", trend5),
+		},
 		Pass:       pass,
 		Level:      level,
 		Confidence: total / 100.0,
+	}
+}
+
+// dragonSealDesc 生成 F1 封板质量的维度理由（§0929DIM）。
+// 判据与上面 f1 打分严格同源：涨幅是否贴近该板块涨停阈值（主板≈9.9、双创≈19.9、北交所≈29.9），
+// 达标就报出"涨幅/阈值"两个原值，未达标如实写未贴板——不复用评分结果反推文案。
+// （dragonSealDesc words the F1 seal check using the same inputs as the score itself: today's gain
+// against the board's limit-up threshold, reporting both raw values when sealed.)
+func dragonSealDesc(changePct, limitPct float64) string {
+	if changePct > limitPct-0.5 {
+		return fmt.Sprintf("涨幅%.1f%%贴板(阈%.1f%%)", changePct, limitPct)
+	}
+	return fmt.Sprintf("涨幅%.1f%%未贴板(阈%.1f%%)", changePct, limitPct)
+}
+
+// dragonSectorDesc 生成 F2 板块共振的维度理由（§0929DIM）：直接报板块最强涨幅档位。
+// （dragonSectorDesc words the F2 resonance check from the strongest sector gain.)
+func dragonSectorDesc(bestSector float64) string {
+	switch {
+	case bestSector > 3:
+		return fmt.Sprintf("板块共振%.1f%%", bestSector)
+	case bestSector > 1:
+		return fmt.Sprintf("板块偏弱%.1f%%", bestSector)
+	default:
+		return fmt.Sprintf("板块无共振%.1f%%", bestSector)
+	}
+}
+
+// dragonPremiumDesc 生成 F3 溢价率的维度理由（§0929DIM）：个股涨幅相对最强板块的位置。
+// （dragonPremiumDesc words the F3 premium check: stock gain relative to the strongest sector.)
+func dragonPremiumDesc(changePct, bestSector float64) string {
+	switch {
+	case bestSector > 0 && changePct > bestSector+2:
+		return fmt.Sprintf("超板块%.1fpp辨识度高", changePct-bestSector)
+	case changePct > 5:
+		return fmt.Sprintf("自身涨%.1f%%未超板块", changePct)
+	default:
+		return fmt.Sprintf("自身涨%.1f%%无溢价", changePct)
 	}
 }
 
@@ -267,6 +320,8 @@ func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		Confidence: eval.Confidence,
 		Reason:     eval.Level,
 		Meta:       meta,
+		// §0929DIM F1~F4 的判定依据文本随信号一起过界，前端 D 列才有话可显示
+		Reasons: strategy.CopyReasons(eval.Reasons),
 	}, nil
 }
 

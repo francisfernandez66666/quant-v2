@@ -80,7 +80,16 @@ type Signal struct {
 	Confidence float64            `json:"confidence"`     // 置信度 0.0~1.0（Confidence 0.0~1.0）
 	Timestamp  int64              `json:"timestamp"`      // 生成时间戳（Generation timestamp）
 	Meta       map[string]float64 `json:"meta,omitempty"` // 分数明细（Score breakdown）
-	Reasons    map[string]string  `json:"-"`              // 各维度理由（不入JSON）（Per-dimension reasons, excluded from JSON）
+	// Reasons 各维度理由文本，键与 Meta 的维度键对应（d1/f1_seal/vol_score/…）。
+	// §0929DIM：本字段是「战法评分→信号」边界上**理由文本的唯一载体**——
+	// GenerateSignal 必须把 eval.Reasons 带过来，CombatAgent 再拷进 combat_agent.Signal.Reasons，
+	// 前端才能把 d1_desc~d4_desc 显示出来。历史上这一拷贝缺失，文本在边界被静默丢弃。
+	// 类型仍标 json:"-"：策略信号只在进程内流转，落库/下发由 combat_agent.Signal 负责。
+	// English: per-dimension reason text keyed like Meta. §0929DIM — this is the only carrier of reason
+	// text across the strategy→signal boundary: GenerateSignal must copy eval.Reasons in and the
+	// CombatAgent must copy it onto combat_agent.Signal.Reasons, otherwise the frontend's d1_desc~d4_desc
+	// render empty. Stays json:"-" since strategy signals only travel in-process.
+	Reasons map[string]string `json:"-"`
 	// StrategyName 可选：覆盖默认的战法名（string(runner.Type)）。
 	// 用于同一战法类型下有多个独立规则时区分信号（如多因子战法各规则），使消息中心去重键互不冲突。
 	// English: optional override for the default strategy name (string(runner.Type)). Used when a single
@@ -112,6 +121,25 @@ type Evaluation struct {
 	Level      string             `json:"level"`       // 信号级别(full_chain/fail/nodata)（Signal level: full_chain/fail/nodata）
 	Confidence float64            `json:"confidence"`  // 置信度（Confidence）
 	Reasons    map[string]string  `json:"reasons"`     // 各维度理由（Per-dimension reasons）
+}
+
+// CopyReasons 复制维度理由表，供各战法 GenerateSignal 把 eval.Reasons 带进信号（§0929DIM）。
+// 为什么要有这个函数而不是让战法直接把 eval.Reasons 的引用挂到信号上：
+// 评分对象在部分战法里会被复用/改写（如 N形 的状态机、战法库的热加载重评），
+// 信号一旦与评分共享同一张 map，后续改写会顺着引用把**已发出信号的理由**改掉——
+// 复盘时看到的理由就不再是触发那一刻的理由。空输入返回 nil（而不是空 map），
+// 让下游的 omitempty 与"无理由"判断保持同一口径。
+// （CopyReasons clones the dimension-reason map so a signal never shares it with the evaluation object
+// that produced it; a nil input yields nil so omitempty and "no reason" stay consistent downstream.）
+func CopyReasons(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // ExitContext 止盈止损评估的上下文参数。

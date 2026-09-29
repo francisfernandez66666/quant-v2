@@ -15,7 +15,6 @@ import (
 	"hash/fnv"
 	"log"
 	"net/http"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -215,12 +214,18 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	_ = s.researchDB.UpdateOptimizationStatus(id, "approved")
-	s.reloadRulesByKind(row.StrategyKind) // 热重载对应库文件，实盘即时生效
+	reloadErr := s.reloadRulesByKind(row.StrategyKind) // 热重载对应库文件，实盘即时生效（§0929LIB-WATCH：可失败）
 	// §A2 库规则行同样把门槛下发 factor/pattern 池纪律（模拟盘入场同步过滤）
 	s.applyPoolMinScore(requestUserID(r), row)
 	// §RFIX-3 应用守卫：阈值覆盖 + 候选预期触发=0 → 响应带非阻断 warning（审批人决策）。
+	// §0929LIB-WATCH：库已落盘但没能注入运行引擎时，同一个 warning 字段如实追加一句
+	//（审批"通过"了不等于实盘"换上了"；版本戳轮询会在库可读后自动重试）。
+	warn := thresholdOverrideWarning(s.researchDB, row.StrategyKind, p.MinScore)
+	if reloadErr != nil {
+		warn = strings.TrimSpace(warn + " 战法库未能注入运行中的引擎: " + reloadErr.Error())
+	}
 	writeJSON(w, 200, map[string]any{"status": "approved", "id": id,
-		"warning": thresholdOverrideWarning(s.researchDB, row.StrategyKind, p.MinScore)})
+		"warning": warn})
 }
 
 // thresholdOverrideWarning §RFIX-3 阈值覆盖守卫提示：扫参审批把因子战法 buy_threshold
@@ -287,33 +292,19 @@ func (s *Server) handleOptimizationReject(w http.ResponseWriter, r *http.Request
 }
 
 // reloadRulesByKind 按规则 ID 前缀热重载对应的战法库（审批后实盘即时生效）。
-func (s *Server) reloadRulesByKind(kind string) {
-	// 取第一个可用引擎（注册表模式或单引擎模式均可）。
-	// 注意：ctrlFor("") 在注册表模式下会返回带 nil 值的接口（Go 经典陷阱），
-	// 所以改用 AllControllers 取第一个非 nil 引擎。
-	var c EngineController
-	if s.registry != nil {
-		for _, cc := range s.registry.AllControllers() {
-			if cc != nil {
-				c = cc
-				break
-			}
-		}
-	} else {
-		c = s.ctrl
+// §0929LIB-WATCH 两处收紧（本轮读码新发现的同族缝，与 P1-3 同根）：
+//  1. 旧实现只取**第一个**非 nil 引擎做热重载——注册表模式下其余账号的引擎继续吃旧库，
+//     "审批后即时生效"只对第一个账号成立；现委托 reloadLibraries 对全部引擎生效。
+//  2. 起返回 error：库读坏时不再"只 log 一下"，调用方把失败如实并进审批响应的 warning。
+//
+// English: reloads the touched library for **all** engines (it used to hit only the first engine)
+// and returns the error so the approval response can report "saved but not injected".
+func (s *Server) reloadRulesByKind(kind string) error {
+	isRule := len(kind) >= 4 && (kind[:4] == "fac_" || kind[:4] == "pat_")
+	if !isRule {
+		return nil // 内置战法等非库规则：没有库文件要注入，无事可做
 	}
-	if c == nil {
-		return
-	}
-	// 二次防护：反射检查底层值是否非 nil，避免 *Engine 转 interface 的非 nil 陷阱。
-	if reflect.ValueOf(c).Kind() == reflect.Ptr && reflect.ValueOf(c).IsNil() {
-		return
-	}
-	if len(kind) >= 4 && kind[:4] == "fac_" {
-		c.ReloadFactorRules(s.researchDir)
-	} else if len(kind) >= 4 && kind[:4] == "pat_" {
-		c.ReloadPatternRules(s.researchDir)
-	}
+	return s.reloadLibraries()
 }
 
 // applyBuiltinOptParams 内置战法的一键应用（§P2 反馈升级版）：四个手写战法全部支持——

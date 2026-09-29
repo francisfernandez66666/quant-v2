@@ -12,6 +12,9 @@ import { settle } from './settle.js'
 // 整页 API mock：挂载态仅走只读拉取，返回合法字段（不触发任何写操作）。
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
+  // §0929GATE-403：整页 mock 必须补齐 Quant 新读的角色判据——本文件全部用例都是**管理员会话**
+  // （断言的是实盘链路卡/配置回填），预过滤把 admin 也拦下会让整页落进无权限面板、断言全落空。
+  isAdmin: () => true,
   // §M13：补齐 mock 缺失导出（与 api/index.js 真实实现一致，仅按状态码判定，不改变本文件既有断言）。
   isForbidden: (e) => !!(e && e.status === 403),
   fetchQMTConfig: vi.fn(async () => ({

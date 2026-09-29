@@ -48,7 +48,13 @@ vi.mock('../api/index.js', async (orig) => {
 import MsgCenter from '../pages/MsgCenter.jsx'
 
 describe('§DAILY_REVIEW MsgCenter 复盘渲染', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // §0929GATE-403：GET /api/metrics/alerts 在 adminMiddleware 下（server.go:617），
+    // 本页 load() 现按角色预过滤——本文件测的是"复盘消息能渲染"，属管理员会话形态，
+    // 不写这行就会落到「系统提醒未拉取」分支，把预过滤误报成复盘功能回归。
+    localStorage.setItem('liangzai_role', 'admin')
+  })
 
   it('渲染复盘消息卡：倾向 Tag + 标题 + 量化事实正文', async () => {
     render(<MsgCenter />)

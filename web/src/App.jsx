@@ -261,10 +261,20 @@ export default function App() {
       }
     }
     // 独立轮询未读消息数：失败不影响主状态展示
-    try {
-      const alerts = await api.fetchAlerts()
-      setAlertCount(alerts?.length || 0)
-    } catch (_) {}
+    // §0929GATE-403：GET /api/metrics/alerts 在 adminMiddleware 下（server.go:617），成员账号
+    // 每一轮全局状态轮询都固定发一条注定 403 的请求（catch 吞掉后角标恒 0，与预过滤后的
+    // 表现完全一致）。这是全站唯一的"后台常驻"越权源——不在任何页面上也会持续灌 opslog，
+    // 所以止血必须做在这里，而不是等各页面自己处理。
+    // English: §0929GATE-403 — the always-on header poll no longer dials the admin-only alerts
+    // endpoint for members; the badge stays 0 exactly as it did behind the swallowed 403.
+    if (api.isAdmin()) {
+      try {
+        const alerts = await api.fetchAlerts()
+        setAlertCount(alerts?.length || 0)
+      } catch (_) {}
+    } else {
+      setAlertCount(0)
+    }
     // 独立轮询做空开关状态：与服务端保持一致
     try {
       const ss = await api.fetchShortStatus()

@@ -1009,11 +1009,15 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 // English: merges and persists a QMT config patch for the target account — shared by the operator
 // endpoint and the admin per-account endpoint so validation/save semantics stay identical.
 func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, req setQMTConfigReq) {
-	// §WS-K 维4 保存前快照上一版 config.json（全局无 store 路径；best-effort，失败仅告警不阻断）。
-	// beforeBytes 留作之后 diff 审计用；快照文件供回滚/追溯。
-	// English: WS-K 维4 — snapshot the previous config.json before saving (best-effort).
-	beforeBytes, _ := config.RestoreRulesContentCurrent(s.cfg)
-	_, _ = config.SnapshotRules(s.cfg)
+	// §0929CFG-HIST（2026-09-29 全量审计批，owner 令按推荐执行）：写前快照改走
+	// config.SnapshotBeforeWrite 单入口。本通道的落库函数 SetQMTConfigFor 在 store 在场时写的是
+	// **账号级主配置文档**，旧实现却固定快照全局 config.json、写后 diff 也比的是全局文档，
+	// 于是账号文档里的 enabled/熔断/预算等安全参数既没被快照（回滚回不到这次变更），
+	// DiffRules 又恒等于"(无变更)"把审计行整条压掉——留下的是一条**假记录**。
+	// 快照失败不阻断保存（磁盘抖动时运维必须还能改配置），但必须把"本次无快照"如实记成告警。
+	// English: snapshot the document this channel actually writes (the per-account rules document when
+	// a store exists) via the single pre-write entry point; failures are logged and never block the save.
+	trace := s.snapshotConfigWrite(actor, target, "qmt")
 	// 以目标账号当前配置为基线做局部合并（值拷贝，改完一次性写回）。
 	cfg := *(s.cfg.GetQMTConfigFor(target))
 
@@ -1208,23 +1212,22 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		}
 	}
 	// §WS-K 维4 变更 diff → opslog 审计（可下载/前端历史可见）。
-	// §AUDIT-UNIFY（owner 裁决 2026-09-26）：config_change 一律经 config.AuditRulesDiff 单入口
-	// 落账——真实操作者进参、target 点名变更面（这里是 "qmt"），本处不再直写 opslog.Audit。
-	if beforeBytes != nil {
-		if afterBytes, err := config.RestoreRulesContentCurrent(s.cfg); err == nil {
-			if d, derr := config.DiffRules(beforeBytes, afterBytes); derr == nil && d != "(无变更)" {
-				config.AuditRulesDiff(s.cfg, actor, "qmt", d)
-			}
-		}
-	}
+	// §AUDIT-UNIFY（owner 裁决 2026-09-26）+ §0929CFG-HIST：一律经 config.AuditConfigWrite
+	// 单入口落账——真实操作者进参、变更面点名（落账后形如 "qmt(account:rules)"）、diff 两侧
+	// 同账同构。旧形态在这里用 RestoreRulesContentCurrent 自取"写后内容"再手工 diff，并带一条
+	// `d != "(无变更)"` 判据：由于比的是全局账而写的是账号账，diff 永远是"(无变更)"，
+	// 审计行被那条判据永久吞掉（静默改配置不留痕）。现在无变更也照样留一行，
+	// 因为"这条通道有真在跑"本身就是需要证据的验收项。
+	trace.audit(s)
 	// §WS-F C1 审计：QMT 配置变更留痕（enabled 翻转为"上线/下线"，其余为"hot_reload"）。
 	// 事件名映射：本次携带 enabled 字段时按落库后的 cfg.Enabled 定为上线(qmt_go_live)/
 	// 下线(qmt_shutdown)；未携带则统一记热更新。
+	// §0929CFG-HIST：details 带上本笔落的是哪本账与写前快照名，出问题时可直接按 ts 回滚。
 	event := "qmt_config_hot_reload"
 	if req.Enabled != nil {
 		event = map[bool]string{true: "qmt_go_live", false: "qmt_shutdown"}[cfg.Enabled]
 	}
-	opslog.Audit(event, actor, target, "ok")
+	opslog.Audit(event, actor, target, trace.detail())
 	// 诊断日志：记录每次保存的真实账号、目标 enabled 与落盘后回读值，确认是否真正写盘。
 	// saved 是落库后回读值（持久化配置，立即生效口径）；ctrlEnabled 是控制器当前 applied 值
 	// （§QMT-PENDING 延迟到下一交易时段才翻转）。两者在休市期间本就不同——区分它俩可避免把
@@ -1306,7 +1309,10 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body: 需要 {\"halted\": true|false}")
 		return
 	}
-	uid := userIDFor(r)                  // kill-switch 作用于当前登录账号（admin 权限中间件已保证）
+	uid := userIDFor(r) // kill-switch 作用于当前登录账号（admin 权限中间件已保证）
+	// §0929CFG-HIST：halted 的持久化落点是账号级配置文档（与 /api/config/qmt 同一本账），
+	// 这条专用通道此前没有写前快照——紧急停止恰恰是最需要"改前是什么、谁改的"证据的一笔。
+	trace := s.snapshotConfigWrite(uid, uid, "qmt")
 	cfg := *(s.cfg.GetQMTConfigFor(uid)) // 值拷贝：基于当前配置做单字段覆盖，避免读到一半被并发改写
 	cfg.Halted = *req.Halted             // 本次只翻转 halted 字段，其余保持原值
 	// §0926E2E-W1B：kill-switch 状态必须先确认落盘再执行——持久化失败即回 500 且不翻转
@@ -1316,6 +1322,7 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "熔断状态保存失败（未落盘，本次停止/解除未执行）: "+err.Error())
 		return
 	}
+	trace.audit(s) // 落盘成功才记"已变更"，字段级 diff 里能看到 halted 旧→新
 	// 立即执行 kill-switch：绕过 §QMT-PENDING 开关队列（见 applyKillSwitchNow 注释），
 	// 返回本次同步撤销的在途未成交委托笔数与撤单失败明细（§0925EVE-A2）。
 	cancelled, failed := s.applyKillSwitchNow(uid, &cfg, "endpoint")

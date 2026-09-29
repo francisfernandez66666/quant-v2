@@ -152,7 +152,7 @@ echo "[2/5] 上传二进制/脚本到 $DEPLOY_DIR ..."
 # 先显式停服释放文件锁——服务重启本就属于本次部署语义（步 [4/5] 注册即拉起）。
 $SSH "powershell -NoProfile -Command \"net stop quant; net stop quant-research; exit 0\"" >/dev/null 2>&1 || true
 SERVICES_STOPPED=1   # 置位后由 [4/5]/[4/5]-s 拉起，任何提前退出都由 EXIT 兜底补 start
-$SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata | Out-Null\""
+$SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata, ${DEPLOY_DIR}/scripts | Out-Null\""
 $SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/qmtctl.exe "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
 # §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯ Windows 服务拉起三径单源化）：
 # service_definitions.ps1 是服务/任务定义**单源**，被 6 个运维脚本 dot-source（register_engine_services/
@@ -178,6 +178,29 @@ ps1_bom deploy/qmt-win/decommission_qmt_mock.ps1
 ps1_bom deploy/qmt-win/rotate_qmt_token.ps1
 $SCP deploy/qmt-win/decommission_qmt_mock.ps1 deploy/qmt-win/rotate_qmt_token.ps1 \
      "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+# §0929OPS-⑪-1（FIX_PLAN_20260929 P2-5）运维面执行体收编：
+# 这批文件都是**现网指示会去执行的对象**，却长期靠手工拷贝、不在本清单——
+# 同族判例三条都已锤过（§P0-B 备份链漏列⇒实盘四本账无灾备、§ENH-5 quote_feed.py 漏列⇒网关
+# ImportError、§0927KA dataload_keepalive.py 漏列⇒假日空转 7+ 轮并锁死 dataload.exe 掐死部署 scp）。
+#   ① deploy/qmt-win/register_service.ps1     —— 网关注册为「交互会话计划任务」（勿用 NSSM）；
+#   ② deploy/qmt-win/all_service_watchdog.ps1 —— 五服务巡检 + 异常退避重启（计划任务执行体）；
+#   ③ scripts/daily_ops_check.ps1             —— 日检（QMT-Ensure-Restore-0840 之后的人工/计划任务腿）；
+#   ④ scripts/enable_ensure.ps1               —— ③ 第 1 节直接调用的对象（旧版硬路径 C:\qmt\，
+#      现随 ③ 同目录下发并按 $PSScriptRoot 解析，见该脚本内的三态解析）。
+# 语义：**只上传不自动执行**（与 rotate_qmt_token.ps1 同姿势）——这四个动作碰 schtasks/NSSM/服务重启，
+# 属高危面，绝不随部署自动发生；注册请照 RUNBOOK 择窗手跑。
+# English: the four ops executables the live host is told to run are now part of the deploy manifest,
+# uploaded but never auto-executed (schtasks/NSSM surface stays a human-window action).
+ps1_bom deploy/qmt-win/register_service.ps1
+ps1_bom deploy/qmt-win/all_service_watchdog.ps1
+ps1_bom scripts/daily_ops_check.ps1
+# enable_ensure.ps1 是纯 ASCII 源（文件头自述），不加 BOM 也能被 PS5.1 正确解析；
+# 这里刻意**不做 ps1_bom**：它由计划任务按命令行调用，改字节序属于无收益的现网漂移面。
+$SCP deploy/qmt-win/register_service.ps1 deploy/qmt-win/all_service_watchdog.ps1 \
+     "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+$SCP scripts/daily_ops_check.ps1 scripts/enable_ensure.ps1 \
+     "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/scripts/"
+
 # baostock sidecar
 $SCP cmd/pydata/server.py cmd/pydata/requirements.txt "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/pydata/"
 # §0927KA（2026-09-27 部署实录）：dataload_keepalive.py（17:10 盘后保活计划任务的执行体）
@@ -190,6 +213,9 @@ $SCP scripts/dataload_keepalive.py "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
 # ── 2b. 同步 qmt_gateway Python 网关（§QMT-DUAL：含 qmt_bridge.py 策略桥；
 #      §CB-TICKWINDOW 2026-09-21 起 qmt_bridge_strategy.py 也入列——曾因不在清单，
 #      现网策略文件停在 9/18 手工拷贝，桥侧修复不会随部署下发）──
+# §0929OPS-⑪-1：outbox_admin.py 补入列。它不是服务启动依赖，而是**告警文案直接指示运维去执行的
+# 收敛入口**（handler.py:167/598/614：outbox 溢出后"确认可丢后用 outbox_admin.py --yes 人工收敛"），
+# 不在清单＝告警把人指到一个现网不存在的文件上，只能盲操作（同 §ENH-5 族）。
 echo "[2b/5] 同步 qmt_gateway 到 $QMT_GATEWAY_DIR ..."
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $QMT_GATEWAY_DIR | Out-Null\""
 $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
@@ -197,6 +223,7 @@ $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
      qmt_gateway/qmt_bridge_strategy.py \
      qmt_gateway/trading_calendar.py \
      qmt_gateway/quote_feed.py \
+     qmt_gateway/outbox_admin.py \
      qmt_gateway/config.bridge.example.json \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
 # §M7c（2026-09-22 修复批）config.xt.json 收编：gateway_watchdog.ps1 依赖的

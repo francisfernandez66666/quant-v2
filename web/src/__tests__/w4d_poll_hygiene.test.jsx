@@ -74,6 +74,10 @@ describe('§0926E2E-17A 轮询统一（SSE 事件驱动 + 60s 兜底）', () => 
   beforeEach(async () => {
     cleanup()
     localStorage.clear()
+    // §0929GATE-403：P1/P2 测的都是 **admin 会话**的取数链（P2 的 403 止血正是"缓存说 admin、
+    // 服务端仍拒"这一残余形态——预过滤拦不住它，所以 §M13 那条腿必须继续在 admin 角色下跑）。
+    // 不写这行则挂载即被预过滤挡下，四路端点首屏一次都不发，本文件的增量断言会空转成假绿。
+    localStorage.setItem('liangzai_role', 'admin')
     resetBus()
     vi.useFakeTimers()
     const api = await stubs()

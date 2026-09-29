@@ -115,8 +115,9 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 15 条，
-// §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条后同步计数）。
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 18 条，
+// §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条、§0929HB-1/-2/-3
+// 加入三条"应有值缺失"型业务心跳后同步计数；alert_routing_test 有等值锁，漏一条即判红）。
 // English: factory routing table covering all DefaultAlertRules() entries.
 func DefaultAlertRouting() AlertRoutingConfig {
 	return AlertRoutingConfig{
@@ -127,6 +128,12 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			"quote_stale":           RoutePush, // 行情新鲜度降级
 			"uplink_stale":          RoutePush, // 网关→引擎上行回报停摆（§UPDLINK）
 			"sse_broadcast_skipped": RoutePush, // SSE 广播锁超预算丢推送（§UPDLINK 同族）
+			// §0929HB-1/-2（2026-09-29 全量审计批 ⑪-4）：两条"缺失型"心跳都属"今天就要处理"——
+			// 零固化信号意味着当天决策面空转（收盘再知道已经晚了），已实现盈亏恒 0 意味着
+			// 亏损熔断闸当天放水。持续破线由评估器 Firing 态去重 + 30 分钟冷却窗挡刷屏，
+			// 写回 0 时成对销案（resolved）。
+			"signal_zero_in_session":       RoutePush,
+			"realized_pnl_zero_with_sells": RoutePush,
 			// §0925EVE-A2（2026-09-25）：kill-switch 撤单失败属"此刻正疼"——紧急停止没撤干净的单
 			// 还挂在网关，操作者必须当场知道，不等日汇总。持续破线由评估器 Firing 态去重 +
 			// 下面 30 分钟触发冷却窗挡刷屏；下次 HaltAll 全成功写 0 时成对销案（resolved）。
@@ -146,6 +153,11 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			// —— 日汇总：趋势型/容量型，单条不疼、反复才疼 ——
 			"llm_cooldown":   RouteDaily, // LLM 冷却数
 			"buy_queue_high": RouteDaily, // 买入队列积压
+			// §0929HB-3（2026-09-29 全量审计批 ⑪-4）：战法库陈旧是"库多久没动过"的天尺度状态，
+			// 破线后每 30s 评估都会持续成立——走必推会每 30 分钟一条刷满推送；
+			// 日汇总保证 owner 每天看到一次"夜间研究链没产出"，与 trading_calendar_not_loaded
+			// 同一条纪律（§CAL-GATE 的判例）。
+			"library_stale_days": RouteDaily,
 			// —— 必推：§ADJ-BASIS-2 战法参数基线失效（不推就是"owner 永远不知道这批权重的历史依据没了"）——
 			"applied_factor_stale_basis":  RoutePush,
 			"applied_pattern_stale_basis": RoutePush, // §ADJ-BASIS-2P 形态侧同规

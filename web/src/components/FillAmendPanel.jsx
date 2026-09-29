@@ -1,7 +1,10 @@
 // ── 成交勘误面板 FillAmendPanel.jsx（§FILL-AMEND 2026-09-23）──
-// 页面位置：量化交易页「交易流水与整体盈亏」卡片下方，仅 admin 可见（上层 Quant.jsx 已按
-//          adminMiddleware 的 403 渲染无权限面板，本组件不再做客户端角色判断——
-//          角色判定的唯一事实源在后端，前端复制一套判定迟早和后端漂移）。
+// 页面位置：量化交易页「交易流水与整体盈亏」卡片下方，仅 admin 可见。
+//          角色判据不在本组件里读：上层 Quant.jsx 按 §0929GATE-403 把结论作为 canQuery 传进来，
+//          本组件据此决定「要不要拨 /api/qmt/fill-amendments 与 /api/qmt/fill-conservation」，
+//          自己绝不查本地角色缓存——前端每多一处自行判定就多一处会和后端漂移的地方。
+//          canQuery=false 时是**未拉取**（一条请求都没发），不是"拉了被拒"，文案按这个口径写，
+//          免得成员看到一片 ⚠ 加载失败。
 //
 // 三件事：
 //  1. 逐笔改判对话框：由成交行的「改判」按钮打开（target 属性传进来），只提交
@@ -40,8 +43,11 @@ const SIDE_OPTIONS = [
  * @param {Object} target         要改判的成交行（null=对话框关闭）
  * @param {Function} onCloseTarget 关闭改判对话框
  * @param {Function} onChanged    勘误状态变化后回调（让上层刷新流水/盈亏表，批准后数字会动）
+ * @param {boolean} canQuery      §0929GATE-403：上层传入的"当前会话可否读实盘勘误"结论。
+ *                                默认 true 保持本组件独立可测（既有 fill_amend_ui 用例全部按 admin 语义跑）；
+ *                                Quant 页传 false 时台账与自检一律不发请求，只渲染「未拉取」。
  */
-export default function FillAmendPanel({ fills = [], target = null, onCloseTarget, onChanged }) {
+export default function FillAmendPanel({ fills = [], target = null, onCloseTarget, onChanged, canQuery = true }) {
   const [rows, setRows] = useState([])
   const [statusFilter, setStatusFilter] = useState('')
   const [loadErr, setLoadErr] = useState('')
@@ -59,6 +65,13 @@ export default function FillAmendPanel({ fills = [], target = null, onCloseTarge
   const [consErr, setConsErr] = useState('')
 
   const loadLedger = useCallback(async () => {
+    // §0929GATE-403 预过滤：canQuery=false 时这条链路一条请求都不发（不是发了被拒）。
+    // 刻意把 rows/loadErr 一起清干净——留着上一轮的失败文案会让「未拉取」显示成「加载失败」。
+    if (!canQuery) {
+      setRows([])
+      setLoadErr('')
+      return
+    }
     try {
       const r = await api.fetchFillAmendments(statusFilter)
       setRows(Array.isArray(r && r.amendments) ? r.amendments : [])
@@ -67,8 +80,10 @@ export default function FillAmendPanel({ fills = [], target = null, onCloseTarge
       // 错误文案原样透出：403（会话不是 admin）与 500（库异常）对运维是两件完全不同的事
       setLoadErr((e && e.message) || '勘误台账加载失败')
     }
-  }, [statusFilter])
+  }, [statusFilter, canQuery])
 
+  // loadLedger 的身份随 statusFilter / canQuery 变化，effect 依赖它即覆盖两种重拉时机：
+  // 换筛选条件、以及「刷新身份并重试」把 canQuery 由 false 翻成 true（后者此前不会自动补拉）。
   useEffect(() => { loadLedger() }, [loadLedger])
 
   // 切换改判目标时重置表单：默认方向取"生效方向的反面"（改判的语义就是把这笔翻过来），
@@ -139,6 +154,9 @@ export default function FillAmendPanel({ fills = [], target = null, onCloseTarge
   }
 
   async function runConservation() {
+    // §0929GATE-403：按钮已按 canQuery 禁用，这里是逻辑层第二道闸（防键盘可达/将来漏标调用点），
+    // 与 Quant.jsx patch() 里 forbidden 的二次闸同形。
+    if (!canQuery) { showToast('当前账号为普通用户，实盘守恒自检不开放', 'warning'); return }
     setConsBusy(true)
     setConsErr('')
     try {
@@ -209,7 +227,9 @@ export default function FillAmendPanel({ fills = [], target = null, onCloseTarge
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
         <span style={{ fontSize: 12, color: 'var(--app-text-2)' }}>
-          勘误台账 {rows.length} 条{amendedVisible ? ` · 当前流水可见 ${amendedVisible} 笔已带改判` : ''}
+          {canQuery
+            ? `勘误台账 ${rows.length} 条${amendedVisible ? ` · 当前流水可见 ${amendedVisible} 笔已带改判` : ''}`
+            : '勘误台账 未拉取（普通用户会话，未发起请求）'}
         </span>
         <Select
           size="small" value={statusFilter} onChange={setStatusFilter} style={{ width: 140 }}
@@ -220,11 +240,18 @@ export default function FillAmendPanel({ fills = [], target = null, onCloseTarge
             { value: 'revoked', label: '只看已撤销' },
           ]}
         />
-        <Button size="small" variant="outline" onClick={loadLedger}>刷新</Button>
+        <Button size="small" variant="outline" disabled={!canQuery}
+          title={canQuery ? '' : '仅管理员可查询：当前账号对这些端点无权限（403）'}
+          onClick={loadLedger}>刷新</Button>
         {loadErr && <span style={{ fontSize: 12, color: 'var(--app-up)' }}>⚠ {loadErr}</span>}
       </div>
 
-      {rows.length ? (
+      {!canQuery ? (
+        <div style={{ color: 'var(--app-text-2)', fontSize: 12, marginBottom: 4 }}>
+          当前登录账号为普通用户，实盘成交勘误台账不开放。这里显示的是「未拉取」而非「加载失败」：
+          前端按角色跳过了注定被后端拒绝的请求，后端仍是权限的唯一裁决方。
+        </div>
+      ) : rows.length ? (
         <Table data={rows} columns={ledgerColumns} rowKey="id" size="small"
           pagination={{ pageSize: 8, total: rows.length }} />
       ) : (
@@ -238,7 +265,10 @@ export default function FillAmendPanel({ fills = [], target = null, onCloseTarge
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 13, fontWeight: 700 }}>账本守恒自检</span>
           <Input size="small" value={consDay} onChange={setConsDay} placeholder="YYYY-MM-DD（留空=今日）" style={{ width: 190 }} />
-          <Button size="small" theme="primary" variant="outline" loading={consBusy} onClick={runConservation}>只读自检</Button>
+          <Button size="small" theme="primary" variant="outline" loading={consBusy}
+            disabled={!canQuery}
+            title={canQuery ? '' : '仅管理员可查询：当前账号对这些端点无权限（403）'}
+            onClick={runConservation}>只读自检</Button>
           <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>
             比对「成交簿重放」与「实盘持仓/现金账」；历史错账不会因改判自动平账，此处只列差异线索
           </span>

@@ -170,22 +170,32 @@ export default function Consult() {
   useEffect(() => {
     ;(async () => {
       // 探测 LLM 配置状态：有 API Key 或自定义 API 地址即视为已配置
-      try {
-        const cfg = await api.fetchLLMConfig()
-        if (cfg) {
-          setCfgApiUrl(cfg.api_url || '')
-          setCfgModel(cfg.model || '')
-          setLlmConfigured(!!(cfg.api_keys && cfg.api_keys.length) || !!cfg.api_url)
-        } else {
-          setLlmConfigured(false)
-        }
-      } catch (e) {
-        // §FIX-7(a)(20260919)：403=无权限查看（管理员统一配置），不是"未配置"。
-        if (api.isForbidden(e)) {
-          setLlmGated(true)
-          setLlmConfigured(true) // 不弹可编辑卡；咨询是否可用以实际发送结果为准
-        } else {
-          setLlmConfigured(false)
+      // §0929GATE-403：GET /api/config/llm 是 admin-only（server.go:642）。成员会话此前
+      // 每次进咨询页都固定发一条注定 403 的请求，再由下方 catch 翻译成 llmGated——
+      // 结论一样、代价是 opslog 多一条越权记录 + 网络多一个来回。现在直接落到同一状态：
+      // 与 403 分支逐字段一致（llmGated=true / llmConfigured=true），后端仍是唯一裁决，
+      // 真正发咨询时用的运营 key 由服务端选取，跟这条只读探测无关。
+      if (!admin) {
+        setLlmGated(true)
+        setLlmConfigured(true) // 不弹可编辑卡；咨询是否可用以实际发送结果为准
+      } else {
+        try {
+          const cfg = await api.fetchLLMConfig()
+          if (cfg) {
+            setCfgApiUrl(cfg.api_url || '')
+            setCfgModel(cfg.model || '')
+            setLlmConfigured(!!(cfg.api_keys && cfg.api_keys.length) || !!cfg.api_url)
+          } else {
+            setLlmConfigured(false)
+          }
+        } catch (e) {
+          // §FIX-7(a)(20260919)：403=无权限查看（管理员统一配置），不是"未配置"。
+          if (api.isForbidden(e)) {
+            setLlmGated(true)
+            setLlmConfigured(true) // 不弹可编辑卡；咨询是否可用以实际发送结果为准
+          } else {
+            setLlmConfigured(false)
+          }
         }
       }
       await loadProMode()

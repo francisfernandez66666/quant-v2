@@ -17,7 +17,7 @@
 //
 // 注：本文件只新增，不改写第一批既有测试（quant.test.jsx / perm_gate.test.jsx 等）的行为。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, act } from '@testing-library/react'
+import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -47,6 +47,14 @@ const { OK_PAYLOADS } = vi.hoisted(() => ({
     fetchQMTTrades: () => ({}),
     fetchQMTBroker: () => ({ ok: true, broker: 'xt', broker_connected: true }),
     fetchQMTSettleHistory: () => ({ diffs: [] }),
+    // §0929GATE-403：补齐 Quant 首屏余下两条 admin 只读（待核对清单、勘误台账），
+    // 让 denyAll 覆盖到它们、并让 L8 能按调用数逐枚证明"成员态一条都没发"。
+    qmtPendingReview: () => ({ orders: [], unresolved_count: 0 }),
+    fetchFillAmendments: () => ({ amendments: [] }),
+    // §0929FILL-NAME：名称旁证列的批量读（auth 面，成员也可读，不参与预过滤计数断言）
+    fetchStockNames: () => ({ names: {} }),
+    // §0929GATE-403「刷新身份并重试」的角色重确认腿
+    refreshMe: () => ({ role: 'admin' }),
     fetchRiskGates: () => ({ gates: [], switches: {} }),
     fetchShortStatus: () => ({ short_enabled: false }),
     fetchPaperState: () => ({ enabled: false, is_admin: true, short_book: { enabled: false } }),
@@ -57,6 +65,8 @@ const { OK_PAYLOADS } = vi.hoisted(() => ({
     fetchPaperStrategies: () => ({ strategies: [], known_strategies: [], blacklist: [] }),
     fetchPaperConfig: () => ({ enabled: false, engine_enabled: false, auto_sell: false }),
     fetchSignalVerdicts: () => ({ verdicts: [] }),
+    // §0929GATE-403：消息中心未读提醒（L12 用它证明"成员态一条都不拨"）
+    fetchAlerts: () => [],
   },
 }))
 
@@ -119,6 +129,11 @@ describe('§M13 前端权限一致性（403 停轮询 + 状态码判定）', () 
   beforeEach(async () => {
     cleanup()
     localStorage.clear()
+    // §0929GATE-403 起，成员会话在挂载期就被预过滤挡下（一条 admin 请求都不发），
+    // 本文件的 L1/L2 测的是**另一条仍然成立的路**：本地缓存说"我是 admin"、服务端却回 403
+    // （角色刚被下调 / 缓存与权威值漂移）。这正是 §M13 止血不可替代的原因，
+    // 所以这些用例必须以 admin 角色挂载，让首屏真的发出请求，才能验到"403 后停止轮询"。
+    localStorage.setItem('liangzai_role', 'admin')
     vi.useFakeTimers()
     await resetStubs()
   })
@@ -237,6 +252,9 @@ describe('§M-6 在飞链止血（链尾不漏发 + 挂载壳端点 403/非 403 
   beforeEach(async () => {
     cleanup()
     localStorage.clear()
+    // 同上（§0929GATE-403）：L5/L6 验的是"请求已发出、403 在半路落地"的止血窗口，
+    // 必须让首屏真的发得出请求，故按 admin 角色挂载。
+    localStorage.setItem('liangzai_role', 'admin')
     vi.useFakeTimers()
     await resetStubs()
   })
@@ -311,5 +329,134 @@ describe('§M-6 在飞链止血（链尾不漏发 + 挂载壳端点 403/非 403 
     // 壳端点 catch 不得再回退成吞错（catch(()=>{}) 形态）
     expect(src).toMatch(/fetchShortStatus\(\)[\s\S]{0,200}?catch\(\(e\) => \{ noteForbidden\(e\)/)
     expect(src).toMatch(/fetchPaperState\(\)[\s\S]{0,200}?catch\(\(e\) => \{ noteForbidden\(e\)/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §0929GATE-403（FIX_PLAN_20260929 ⑨-1）成员首屏 403 风暴预过滤
+//
+// 缺陷原文：成员停在 /api/quant 首屏连吃 9 条 403（state/orders/trades/broker/settle-history/
+// pending-review/config/qmt/risk-gates/fill-amendments），另在 /api/dashboard 吃 /api/qmt/state、
+// /api/positions 吃 /api/positions/advice、/api/consult 吃 /api/config/llm、/api/msgcenter 吃
+// /api/metrics/alerts，且 App 的全局状态轮询每一轮都在后台重放最后一条。
+// 后端判得对，缺的是前端"明知必拒还照样拨"。
+//
+// 三把锁（含两把反证）：
+//  L8  成员态：admin 只读一条都不发（含 120s 后仍零增长），但成员可读的壳端点照常拉
+//      ——预过滤不许被写成"成员整页瞎掉"；
+//  L9  「刷新身份并重试」反证：服务器仍回 member 时，点了也**不会**解除预过滤（前端不自授权限）；
+//  L10 「刷新身份并重试」正证：服务器回 admin 即拉起取数链（缓存旧值不得把人永久锁在门外）；
+//  L11 静态锁：五处判据入口（Quant 单入口 / FillAmendPanel 收 canQuery / Dashboard / MsgCenter / App）
+//      的接线必须都在，防"只修了 Quant 一页"的半截收口回潮。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发不发，后端仍是唯一裁决）', () => {
+  // 成员只读不到的那批：与 Quant.jsx startAdminReads 的取数面一一对应
+  const ADMIN_READS = [
+    'fetchQMTConfig', 'fetchQMTState', 'fetchQMTOrders', 'fetchQMTTrades', 'fetchQMTBroker',
+    'fetchQMTSettleHistory', 'qmtPendingReview', 'fetchFillAmendments', 'fetchRiskGates',
+  ]
+
+  beforeEach(async () => {
+    cleanup()
+    localStorage.clear()
+    // 成员会话：isAdmin 走真实实现（读 liangzai_role），缺省即 'user'
+    localStorage.setItem('liangzai_role', 'user')
+    vi.useFakeTimers()
+    await resetStubs()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    cleanup()
+  })
+
+  // L8：成员挂载 → admin 只读零请求 + 无权限面板在场 + 成员可读端点照常
+  it('L8 成员态：admin 只读一次都不发，壳端点仍照常拉（预过滤不等于整页失明）', async () => {
+    const api = await import('../api/index.js')
+    render(<Quant />)
+    await settle()
+    await flushMicrotasks()
+    expect(screen.getByText(/无权限访问量化交易/), '成员态应落无权限面板').toBeInTheDocument()
+    for (const name of ADMIN_READS) {
+      expect(api[name].mock.calls.length, `§0929GATE-403：成员态不得拨 ${name}`).toBe(0)
+    }
+    // 成员可读的两条壳端点必须照常发出（这两条挂在 authMiddleware 下，不在预过滤范围内）
+    expect(api.fetchShortStatus.mock.calls.length, 'fetchShortStatus 成员可读，不得被误伤').toBeGreaterThan(0)
+    expect(api.fetchPaperState.mock.calls.length, 'fetchPaperState 成员可读，不得被误伤').toBeGreaterThan(0)
+    // 120s 兜底轮询窗口内仍然零请求：预过滤是"根本没起定时器"，不是"起后被 403 停掉"
+    await act(async () => { await vi.advanceTimersByTimeAsync(120000) })
+    await flushMicrotasks()
+    for (const name of ADMIN_READS) {
+      expect(api[name].mock.calls.length, `§0929GATE-403：推进 120s 后 ${name} 仍不得有请求`).toBe(0)
+    }
+  })
+
+  // L9：反证——服务器仍确认是 member 时，点「刷新身份并重试」不得解除预过滤
+  it('L9 重试反证：服务器仍回 member 时零请求（本地缓存不能自我授权）', async () => {
+    const api = await import('../api/index.js')
+    api.refreshMe.mockImplementation(async () => ({ role: 'user' }))
+    render(<Quant />)
+    await settle()
+    await flushMicrotasks()
+    fireEvent.click(screen.getByText('刷新身份并重试'))
+    await settle()
+    await flushMicrotasks()
+    expect(api.refreshMe.mock.calls.length, '重试应向服务器重确认角色').toBeGreaterThan(0)
+    for (const name of ADMIN_READS) {
+      expect(api[name].mock.calls.length, `§0929GATE-403：仍为 member 时 ${name} 不得被点亮`).toBe(0)
+    }
+    expect(screen.getByText(/无权限访问量化交易/), '服务器未升权 → 面板保持').toBeInTheDocument()
+  })
+
+  // L10：正证——服务器回 admin（本地缓存是旧值）即拉起取数链，含勘误台账
+  it('L10 重试正证：服务器确认 admin 后解除预过滤并拉起取数链', async () => {
+    const api = await import('../api/index.js')
+    // 与真实 refreshMe 的写侧契约同形：重确认成功后把角色写回本地缓存（否则页面判据不会翻转）
+    api.refreshMe.mockImplementation(async () => {
+      localStorage.setItem('liangzai_role', 'admin')
+      return { role: 'admin' }
+    })
+    render(<Quant />)
+    await settle()
+    await flushMicrotasks()
+    for (const name of ADMIN_READS) {
+      expect(api[name].mock.calls.length, `前置：成员态 ${name} 应为零`).toBe(0)
+    }
+    fireEvent.click(screen.getByText('刷新身份并重试'))
+    await settle()
+    await flushMicrotasks()
+    expect(screen.queryByText(/无权限访问量化交易/), '升权后面板应撤除').not.toBeInTheDocument()
+    expect(api.fetchQMTState.mock.calls.length, '升权后应立刻拉起链路状态').toBeGreaterThan(0)
+    expect(api.fetchQMTConfig.mock.calls.length, '升权后应立刻拉起实盘配置').toBeGreaterThan(0)
+    expect(api.fetchFillAmendments.mock.calls.length, '升权后勘误台账才开拨').toBeGreaterThan(0)
+  })
+
+  // L11：静态锁——五处预过滤接线必须都在（防"只修一页"与"判据散落多处"两种回潮）
+  it('L11 静态锁：五页预过滤接线齐备，且 Quant 判据只有单入口', () => {
+    const stripComments = (src) => src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+    const read = (rel) => stripComments(fs.readFileSync(path.join(HERE, '..', rel), 'utf8'))
+    const quant = read('pages/Quant.jsx')
+    // ① 单入口：角色判据只在 adminReadsAllowed 里出现一次，挂载与 SSE 回调都调它
+    expect(quant).toMatch(/function adminReadsAllowed\(\) \{\s*return api\.isAdmin\(\)/)
+    expect(quant).toMatch(/if \(adminReadsAllowed\(\)\) \{\s*startAdminReads\(\)/)
+    expect(quant.match(/api\.isAdmin\(\)/g) || [], 'Quant.jsx 里 api.isAdmin() 只该有一处（判据单入口）').toHaveLength(1)
+    // ② 出口：重试走服务器重确认，不是本地改角色
+    expect(quant).toMatch(/await api\.refreshMe\(\)/)
+    // ③ FillAmendPanel 收上层结论，自己不读角色
+    const amend = read('components/FillAmendPanel.jsx')
+    expect(amend).toMatch(/canQuery = true/)
+    expect(amend).toMatch(/if \(!canQuery\) \{\s*setRows\(\[\]\)/)
+    expect(amend.match(/api\.isAdmin\(\)/g) || [], 'FillAmendPanel 不得自行读角色缓存').toHaveLength(0)
+    expect(quant).toMatch(/canQuery=\{adminReadsAllowed\(\)\}/)
+    // ④ 其余三页 + App 全局轮询的早退接线
+    expect(read('pages/Dashboard.jsx')).toMatch(/async function loadQMT\(\) \{\s*if \(!api\.isAdmin\(\)\) return/)
+    expect(read('pages/MsgCenter.jsx')).toMatch(/async function load\(\) \{\s*if \(!admin\) \{/)
+    expect(read('pages/Consult.jsx')).toMatch(/if \(!admin\) \{\s*setLlmGated\(true\)/)
+    expect(read('App.jsx')).toMatch(/if \(api\.isAdmin\(\)\) \{\s*try \{\s*const alerts = await api\.fetchAlerts\(\)/)
+    // ⑤ Positions：实盘建议回填并入既有 §PERM-GATE 的 admin 早退
+    const pos = read('pages/Positions.jsx')
+    expect(pos).toMatch(/if \(!admin\) return \/\/ §PERM-GATE/)
+    expect(pos).toMatch(/if \(admin\) \{\s*api\.fetchRealAdvice\(\)/)
   })
 })

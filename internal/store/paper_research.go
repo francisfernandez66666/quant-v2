@@ -142,12 +142,25 @@ func (d *DB) PaperDailyAll() ([]PaperDailyRecord, error) {
 // PaperAttribution 归因喂回（§Phase4）：按 用户+战法 分组统计盘中信号→成交的
 // 承接质量（笔数/成交额/平均滑点/平均延迟），并把每战法当日最新净值差还原为增量收益。
 // 供研究侧判断：哪些战法信号的成交兑现好（滑点小、成交快），喂回优化排序与失败聚类。
+//
+// §0929GATE-CONTRACT（FIX_PLAN_20260929 ⑨-3）**刻意不加 json tag，这是登记过的债、不是漏写**：
+// 本结构体的唯一去处是被 cmd/research/paper_research.go 原样塞进夜间研究报告的
+// `summary.attribution` 数组，再由 GET /api/research/paper-reports 把报告正文解回对象透出，
+// 因此 HTTP 键名是 Go 字段名原样（UserID/Strategy/Count/BuyCount/SellCount/AvgSlippage/AvgLatency），
+// 与全仓 snake_case 契约**不同族**。读侧（web/src/pages/Paper.jsx 归因表）按
+// `a.buy_count ?? a.BuyCount` 两态兜底，所以现在不是断链。
+// 为什么不在这里补 tag：加了 tag 会让**历史报告行**的读法当场翻转
+// （库里存的正文已按 PascalCase 落盘，改了 tag 只影响新报告，新旧两代报告在同一张表里共存），
+// 收口必须连"历史正文重灌/前端兜底收成单态"一起做，属独立批次。
+// 对新消费者的硬要求（这条注释就是契约）：新增读 attribution 的代码**必须两态都读**，
+// 按 snake_case 单态读会静默拿到 undefined（不是报错，是最难查的形态）。
 // English: PaperAttribution (Phase 4) — groups signal-to-fill quality by user+strategy (count/amount/
 // avg slippage/avg latency) plus the latest realized delta per strategy, so the research side can rank
 // which strategy signals fill well (low slippage, fast fills) and feed that back into optimization and
-// failure clustering.
+// failure clustering. This struct deliberately carries no json tags: it is a pass-through container whose
+// keys follow the producing side (PascalCase), which is why the reader must accept both key forms.
 type PaperAttribution struct {
-	UserID, Strategy string  // 用户 + 战法
+	UserID, Strategy string  // 用户 + 战法（透出键名＝字段名，§0929GATE-CONTRACT 见上方注释）
 	Count            int     // 成交笔数
 	TotalAmount      float64 // 成交额
 	AvgSlippage      float64 // 平均滑点 %

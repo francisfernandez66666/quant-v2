@@ -4,12 +4,15 @@
 // 但面板下方的实盘开关/保存按钮/紧急停止/撤单/待核对改判等入口照旧可点——"能点却必 403"
 // 本身就是审计报告点名的体验缺陷（§五-17 灰化条）。
 //
-// 三把锁：
-//  G1 成员态（403 → forbidden）：写控件一律 disabled + tooltip 原因；点击「保存网关参数」
-//     不得向 updateQMTConfig 发任何请求（逻辑层 patch 守卫兜底，双闸同锁）。
-//  G2 管理员态反证：同一批控件必须 enabled——灰化只属于已锤实的 403 会话，
+// 四把锁：
+//  G1 成员态（§0929GATE-403 预过滤 → forbidden）：写控件一律 disabled + tooltip 原因；点击「保存网关参数」
+//     不得向 updateQMTConfig 发任何请求（逻辑层 patch 守卫兜底，双闸同锁）；
+//     并加锁"成员态连一条 admin 只读都没拨"（本批 §0929GATE-403 的行为腿）。
+//  G2 管理员态反证：同一批控件必须 enabled——灰化只属于无权限会话，
 //     防"把成员体验修成管理员功能残废"的单向闸（等值锁，非单向锁）。
 //  G3 静态锁：forbiddenHintProps/ADMIN_ONLY_HINT 必须真实存在于 Quant.jsx（防回潮）。
+//  角色改由 localStorage(liangzai_role) 驱动（isAdmin 走真实实现）：§0929GATE-403 之后
+//  "成员态"不再需要构造 403 响应就能到达，403 止血路径改由 m13_forbidden_poll 以 admin 角色覆盖。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
 import fs from 'node:fs'
@@ -69,6 +72,11 @@ function rootOfText(text) {
   return el.closest('div[type="button"], button') || el.parentElement
 }
 
+// §0929GATE-403：成员/admin 两种会话形态改由本地角色缓存驱动（isAdmin 走 importActual 的真实现），
+// 不再靠"把首屏端点全切成 403"来制造 forbidden——那样造出来的是"缓存 admin 而服务端拒绝"的
+// 残余形态（那是 m13_forbidden_poll 的职责）。这里要测的既然是两种账号，就按两种角色挂载。
+function setRole(role) { localStorage.setItem('liangzai_role', role) }
+
 describe('§0926E2E-17d 成员可见 admin 入口灰化', () => {
   beforeEach(async () => {
     cleanup()
@@ -79,8 +87,9 @@ describe('§0926E2E-17d 成员可见 admin 入口灰化', () => {
     for (const fn of Object.values(api)) {
       if (typeof fn?.mockClear === 'function') fn.mockClear()
     }
-    // mockClear 不清实现：G1 在 fetchQMTState 上抛过 403，须逐例复位回默认载荷，
-    // 否则 G2 会继承上一条的"毒实现"落进无权限面板（同文件用例互染的自伤形态）。
+    // mockClear 不清实现：逐例复位回默认载荷，否则后一条会继承前一条改过的 mockImplementation
+    // （同文件用例互染的自伤形态）。角色不在此复位：localStorage.clear() 已把它打回缺省 member，
+    // 各用例按自己要测的会话形态显式 setRole。
     for (const [name, make] of Object.entries(OK_PAYLOADS)) {
       if (typeof api[name]?.mockImplementation === 'function') {
         api[name].mockImplementation(async () => (typeof make === 'function' && make._isMockFunction ? {} : make()))
@@ -93,14 +102,19 @@ describe('§0926E2E-17d 成员可见 admin 入口灰化', () => {
     resetBus()
   })
 
-  // G1：403 会话 → 面板 + 可见写控件全灰 + 点击不发出任何保存请求 + 开关灰化
+  // G1：成员会话（§0929GATE-403 预过滤）→ 面板 + 可见写控件全灰 + 点击不发出任何保存请求
+  //     + admin 只读一条都不拨（本批新增的行为腿；此前"成员态"要靠人为 403 才到达）
   it('G1 成员态：可见写入口 disabled+tooltip，点击「保存网关参数」零请求', async () => {
     const api = await stubs()
-    const ZH403 = Object.assign(new Error('无权限'), { status: 403 })
-    api.fetchQMTState.mockImplementation(async () => { throw ZH403 })
+    setRole('user')
     render(<Quant />)
     await settle()
     expect(screen.getByText(/无权限访问量化交易/), '前置：无权限面板').toBeInTheDocument()
+    // §0929GATE-403 行为腿：成员态下这些 admin 只读一次都没发（预过滤生效，而不是发了才被拒）
+    for (const name of ['fetchQMTState', 'fetchQMTOrders', 'fetchQMTTrades', 'fetchQMTBroker',
+      'fetchQMTSettleHistory', 'fetchQMTConfig']) {
+      expect(api[name].mock.calls.length, `§0929GATE-403：成员态不得拨 ${name}`).toBe(0)
+    }
     api.updateQMTConfig.mockClear()
     // 成员态下确定在 DOM 的三枚写按钮（其余受 state 加载闸控制，走 G1b 静态腿）
     for (const label of ['保存网关参数', '保存仓位纪律', '已同步']) {
@@ -146,9 +160,17 @@ describe('§0926E2E-17d 成员可见 admin 入口灰化', () => {
 
   // G2：管理员态反证——同一批控件必须可用（灰化不得误伤 admin）
   it('G2 admin 态反证：同一批写控件全部 enabled', async () => {
+    // §0929GATE-403 的等值反证：预过滤只属于成员会话。这里必须以 admin 角色挂载，
+    // 否则页面走的是"按角色跳过取数"分支，写控件被 forbidden 灰化——那条红会被误读成
+    // "灰化逻辑坏了"，而真实成因是本批新加的预过滤（同文件 G1 就是它的正证）。
+    setRole('admin')
     render(<Quant />)
     await settle()
     expect(screen.queryByText(/无权限访问量化交易/), '前置：admin 正常态').not.toBeInTheDocument()
+    // 反向确认预过滤没有把 admin 一起拦掉：首屏确实拉过实盘配置与链路状态
+    const api = await stubs()
+    expect(api.fetchQMTConfig.mock.calls.length, 'admin 态必须照常拉 /api/config/qmt').toBeGreaterThan(0)
+    expect(api.fetchQMTState.mock.calls.length, 'admin 态必须照常拉 /api/qmt/state').toBeGreaterThan(0)
     for (const label of ['保存网关参数', '保存仓位纪律']) {
       const btn = rootOfText(label)
       expect(btn.hasAttribute('disabled'), `admin 态「${label}」不得被灰化（§0926E2E-17d 等值锁）`).toBe(false)

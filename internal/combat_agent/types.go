@@ -132,6 +132,7 @@ type StockScores struct {
 //   - D1Reason: D1 事件分析理由（LLM）
 //   - D1Event: D1 关联事件名称
 //   - Meta: 策略评分明细，供前端展示真实维度分
+//   - Reasons: 策略各维度理由文本（§0929DIM，与 Meta 同键，供前端 d1_desc~d4_desc）
 //   - DepthFactors: 盘口派生因子，供战法读取买卖压力/封单量
 type Signal struct {
 	ID        string `json:"id"`                   // 信号唯一标识
@@ -185,6 +186,20 @@ type Signal struct {
 	// English: per-dimension score breakdown (keys d1/d2/d3/d4...) copied verbatim from
 	// strategy.Signal.Meta, so the frontend shows real dimension scores instead of the total.
 	Meta map[string]float64 `json:"meta,omitempty"`
+
+	// §0929DIM 各维度**理由文本**（key 与各战法原生维度键一致：N形 d1/d2/d3/d4、
+	// 龙头 f1_seal/f2_resonance/f3_premium/f4_rs、双响炮 vol_score/adjust_score/ma_score/adjust_depth、
+	// 龙回头 dragon_score/pullback_score/duck_score/confirm_score）。
+	// 背景：战法在 Evaluate 阶段就算好了这些描述（例如 N形的"事件:重组,竞价强/放量"），
+	// 但此前只有**分值**经 Meta 越过了「战法→信号」这条边界，文本被整段丢弃——
+	// 前端 D1~D4 四列只剩数字，说明列恒空，复盘时看不出这一维是被什么条件抬过门槛的。
+	// 本字段就是文本的运输通道：由 strategy.Signal.Reasons 原样拷贝，
+	// 服务端 toFixSignals 按与 dimScores 相同的键映射落成 d1_desc~d4_desc。
+	// English: per-dimension **reason text** bridging the strategy→signal boundary. Scores used to cross
+	// it (via Meta) while the descriptions were dropped, so the frontend's D1~D4 columns rendered bare
+	// numbers. Keys match each strategy's native dimension keys; the server maps them onto d1_desc~d4_desc
+	// with the same switch dimScores uses.
+	Reasons map[string]string `json:"reasons,omitempty"`
 
 	// DepthFactors 盘口派生因子（免费源五档，Level-2 可扩十档）：供战法读取买卖压力/封单量。
 	// 仅当数据可用时填充（omitempty），缺失为零值——战法应容忍因子缺失。

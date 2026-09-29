@@ -73,6 +73,19 @@ function pnlColor(v) {
   return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
 }
 
+// §0929FILL-NAME 成交流水名称列的两个常量（放模块作用域：负锁要能在不挂载组件的情况下读死口径）
+// FILL_NAME_BATCH 单批问后端的代码数上限（后端 /api/stock/names 同值拒超限；
+// 流水最多 100 笔去重后远小于此，留上限只为防"以后有人把别的清单也塞进来"）。
+const FILL_NAME_BATCH = 200
+// fillNameKey 名称映射的唯一键形态：去空白 + 大写归一。
+// 写入侧（问完后端合并进 map）与读取侧（表格单元格取数）必须走同一个函数——
+// 两处各写一份归一化，迟早一份大写一份小写，名称列就变成"有时有名有时没名"的哑故障。
+// English: the single normalization used by both the write and read side of the name map;
+// two hand-written variants would silently desynchronize and make the column flicker.
+function fillNameKey(code) {
+  return String(code || '').trim().toUpperCase()
+}
+
 
 /**
  * 量化交易主页面组件。
@@ -132,6 +145,13 @@ export default function Quant() {
   const [saving, setSaving] = useState(false)
   // 交易流水数据（summary 汇总 + by_strategy 分战法 + fills 成交明细），30s 轮询刷新
   const [trades, setTrades] = useState(null)
+  // §0929FILL-NAME 成交流水的「名称」旁证映射 {代码(大写)→股票名}。
+  // 账本里没有这个名字（fills 表无 name 列），它是前端按代码向本地股票池表问出来的**展示旁证**：
+  // 只进单元格渲染，绝不进提交体、锚点或任何账目计算（幂等锚仍是 (order_id,traded_at,price,qty)+trade_id）。
+  const [fillNames, setFillNames] = useState({})
+  // 已经问过的代码集合（含"问过但库里没名字"的）：代码→名称在本系统内是稳定事实，
+  // 问过就不再重复问，防 60s 轮询把同一批代码反复打后端。
+  const fillNameTriedRef = useRef(null)
   // §FILL-AMEND（2026-09-23）逐笔改判的目标成交行（null=对话框关闭）。
   // 状态放在本页、面板组件持有提交/台账/守恒的全部动作：流水表要点「改判」才能把行传进对话框，
   // 而台账与账目重算的刷新又得回过来调 loadTrades——两边都需要一个共同持有者。
@@ -177,6 +197,8 @@ export default function Quant() {
   // 后端鉴权拒绝（403）：量化交易仅管理员可访问，后端据此决定，前端只负责展示。
   // English: backend denied (403) — quant trading is admin-only; the frontend just renders the denial.
   const [forbidden, setForbidden] = useState(false)
+  // §0929GATE-403：「刷新身份并重试」按钮的在途态（只防连点重复请求，不参与权限判定）。
+  const [retryBusy, setRetryBusy] = useState(false)
   // 是否已从服务器同步完成：首屏先显示「同步中」占位，避免把本地缓存的旧值
   // 误当成服务器真实状态（用户反馈「开关刷新后变回关闭」多源于此闪烁）。
   // English: whether config has synced from server; show a placeholder first paint
@@ -254,6 +276,83 @@ export default function Quant() {
     stopPolling()
     setForbidden(true)
     return true
+  }
+
+  // ── §0929GATE-403（FIX_PLAN_20260929 ⑨-1）成员首屏 403 风暴预过滤 ──────────────
+  // 锤实的现状：成员停在「实盘交易」页首屏连吃 9 条 403——/api/qmt/state、/api/qmt/orders、
+  // /api/qmt/trades、/api/qmt/broker、/api/qmt/settle/history、/api/qmt/pending-review、
+  // /api/config/qmt、/api/risk/gates、/api/qmt/fill-amendments(+conservation)。
+  // 后端判得**对**（实盘面本就不对普通用户开放），缺的是前端明知道会被拒还照样拨：
+  // 既脏了 opslog（§M13 当年正是为这条上止血），又让成员看到一片"加载失败"而不是一句"无权"。
+  //
+  // 判据来源＝/api/auth/me 写进本地缓存的角色（App 每次登录/刷新都会写 api.refreshMe()）。
+  // 两条刻意边界，防把这条"减负"改成"新故障"：
+  //   ① **后端仍是唯一裁决**。本地缓存只决定"要不要发这个请求"，不决定权限本身；
+  //      因此无权限面板上保留「刷新身份并重试」出口——refreshMe 后若已升为管理员，
+  //      本页照常加载。否则"角色刚被提升、缓存仍是旧值"会把管理员永久锁在门外。
+  //   ② **只预过滤只读端点**。写端点（保存/撤单/勘误/开关）一处不动，它们的入口早由
+  //      §0926E2E-17d 灰化处理，尺寸与判据都留在那条锁里。
+  //
+  // English: members no longer dial the admin-only read endpoints they will be refused by;
+  // the backend stays the sole authority (the local role cache only gates whether we send),
+  // which is why the denial panel keeps a "refresh identity and retry" escape hatch, and why
+  // write-side entries are untouched (already greyed out by §0926E2E-17d).
+  function adminReadsAllowed() {
+    return api.isAdmin()
+  }
+
+  // startAdminReads 拉起本页全部 admin-only 只读链路：首轮取数 + 60s 兜底轮询 + SSE 事件即时刷新。
+  // 幂等：先 stopPolling 再重建，「刷新身份并重试」重复点击不会叠出两套定时器（§M13 同族）。
+  function startAdminReads() {
+    stopPolling()
+    pollingDeadRef.current = false
+    loadState()
+    stateTimer.current = setInterval(loadState, 60000)
+    // §U-2 当日委托：60s 兜底；在途单状态推进的即时性走 SSE qmt_report/real_order。
+    loadOrders()
+    ordersTimer.current = setInterval(loadOrders, 60000)
+    // §0925EVE-W3-G 待核对清单：60s（第三态人工改判本属低频作业，§0926E2E-17A 统一口径）
+    loadPendingReview()
+    pendingTimer.current = setInterval(loadPendingReview, 60000)
+    loadSettleHistory()
+    loadBroker()
+    loadTrades()
+    // 交易流水兜底轮询：60s；成交回报到达即经 SSE qmt_report 刷新
+    tradesTimer.current = setInterval(loadTrades, 60000)
+    // §0926E2E-17A：订阅实盘链路 SSE 事件（后端早已对当前账号定向广播）。
+    // 回调里再核一次角色：成员会话即便收到事件也不得借回调去拉 admin 端点。
+    sseQmtUnsub.current = sseOn(
+      ['qmt_report', 'real_order', 'qmt_halt', 'settlement_diff', 'positions_clear_guard'],
+      () => {
+        if (pollingDeadRef.current || !adminReadsAllowed()) return // §M13/§0929GATE-403
+        loadState(); loadOrders(); loadPendingReview(); loadTrades()
+      },
+    )
+    loadConfig().catch((e) => {
+      // §0929GATE-403：403 走止血分流（不弹"加载失败"误导成员），其余错误照旧 toast
+      if (!noteForbidden(e)) MessagePlugin.error('加载实盘配置失败：' + (e && e.message ? e.message : e))
+    })
+  }
+
+  // retryAsAdmin 「刷新身份并重试」：向服务器重新确认角色（缓存可能是旧值），升管理员即拉起取数链。
+  // 这里刻意不"乐观地点亮页面"——只有 /api/auth/me 真回 admin 才解除预过滤。
+  async function retryAsAdmin() {
+    if (retryBusy) return
+    setRetryBusy(true)
+    try {
+      const me = await api.refreshMe()
+      if (me && me.role === 'admin') {
+        setForbidden(false)
+        startAdminReads()
+        MessagePlugin.success('身份已刷新为管理员，正在加载实盘数据')
+      } else {
+        MessagePlugin.warning('服务器确认当前账号仍为普通用户，实盘数据不开放')
+      }
+    } catch (e) {
+      MessagePlugin.error('身份刷新失败：' + (e && e.message ? e.message : e))
+    } finally {
+      setRetryBusy(false)
+    }
   }
 
   // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启。
@@ -336,6 +435,8 @@ export default function Quant() {
       const t = await api.fetchQMTTrades()
       if (pollingDeadRef.current) return // §M-6 上一步 await 期间 403 落地 → 链尾禁发
       if (t && t.summary) setTrades(t)
+      // §0929FILL-NAME 流水到账后按代码补名称旁证（fire-and-forget：名称列不许拖慢流水渲染）
+      resolveFillNames(((t && t.fills) || []).map((f) => f && f.code))
     } catch (e) {
       noteForbidden(e) // §M13：403 即停轮询（此端点在 adminMiddleware 下）
       if (pollingDeadRef.current) return
@@ -354,6 +455,48 @@ export default function Quant() {
       if (pollingDeadRef.current) return // §M-6：链尾响应落地时已失效则不再回写 state
       if (g && Array.isArray(g.gates)) setRiskGates(g)
     } catch (e) { noteForbidden(e) }
+  }
+
+  // §0929FILL-NAME 按成交代码补「名称」旁证映射（只问没问过的代码，一批一次请求）。
+  // 三条纪律：
+  //   ① 问过即记档（含"库里没有名字"的代码）——代码→名称在本系统内是稳定事实，
+  //      60s 轮询不许反复为同一批代码打后端；
+  //   ② 查询失败**静默**降级：名称列继续显示「—」，不弹窗、不调 noteForbidden、不停轮询。
+  //      这条是展示旁证，它的故障不许牵动实盘主链路的数据面（§M13 的止血只认真权限信号）；
+  //   ③ 返回的名称只合并进渲染用的 map，绝不写进任何提交体/定位锚（勘误入口仍只带 fill_id）。
+  // English: side-evidence name resolution — ask once per code, degrade silently, and never let
+  // the resolved names leak into any submit body or identity anchor.
+  async function resolveFillNames(codes) {
+    if (!fillNameTriedRef.current) fillNameTriedRef.current = new Set()
+    const tried = fillNameTriedRef.current
+    // 归一 + 去重 + 剔除问过的（fillNameKey 是写入/读取共用的唯一形态）
+    const fresh = []
+    const seen = new Set()
+    for (const c of codes) {
+      const key = fillNameKey(c)
+      if (!key || tried.has(key) || seen.has(key)) continue
+      seen.add(key)
+      fresh.push(key)
+    }
+    if (fresh.length === 0) return
+    // 单批上限：只把**真正发出去**的代码记档，超限的留到下一轮（记档而未发＝名称永久失踪）
+    const batch = fresh.slice(0, FILL_NAME_BATCH)
+    batch.forEach((k) => tried.add(k))
+    try {
+      const res = await api.fetchStockNames(batch)
+      if (pollingDeadRef.current) return // 卸载/止血后不回写 state（§M-6 同口径）
+      const map = res && res.names ? res.names : {}
+      const merged = {}
+      Object.keys(map).forEach((k) => {
+        const key = fillNameKey(k)
+        const v = map[k]
+        if (key && v) merged[key] = v
+      })
+      if (Object.keys(merged).length === 0) return
+      setFillNames((prev) => ({ ...prev, ...merged }))
+    } catch (_) {
+      // 旁证通道故障：名称列保持「—」，主链路数据照常展示（见上方纪律②）
+    }
   }
 
   // 拉取链路运行状态（心跳/延迟/熔断等）
@@ -626,40 +769,23 @@ export default function Quant() {
     // mount→cleanup→remount 同实例跑一遍，cleanup 走 stopPolling 把 pollingDeadRef 置了 true；
     // 第二次挂载必须在这里复位，否则整页轮询被自己的止血标志锁死。
     pollingDeadRef.current = false
-    loadState()
     // §SHORT-4 做空开关与融券池状态探测（开关与模拟盘 short_book.enabled）
     // §M-6（2026-09-22 修复批）：两个挂载期拉取的 catch(()=>{}) 改为参与 noteForbidden 判定——
     // 403 是权限信号（应停轮询落无权限面板），旧实现直接吞掉；非 403（500/503）仍静默降级，
     // noteForbidden 内按状态码分流，绝不会被服务异常误判成无权限。
     // English: §M-6 — the swallowed catches now feed noteForbidden (status-code based), so a 403
     // halts polling; any non-403 error still degrades silently and cannot fake "forbidden".
+    // 这两条挂在 authMiddleware 下（成员同样可读），因此**不参与** §0929GATE-403 的预过滤。
     api.fetchShortStatus().then((r) => { if (!pollingDeadRef.current) setShortEnabled(!!r.short_enabled) }).catch((e) => { noteForbidden(e) })
     api.fetchPaperState().then((r) => { if (!pollingDeadRef.current) setShortPoolOn(!!(r.short_book && r.short_book.enabled)) }).catch((e) => { noteForbidden(e) })
-    // 链路状态兜底轮询：§0926E2E-17A 由 10s 对齐 §F5 的 60s 统一口径；
-    // 心跳/熔断的实时诉求由下方 qmt_halt/qmt_report 等 SSE 事件即时刷新承接，不再靠高频轮。
-    stateTimer.current = setInterval(loadState, 60000)
-    // §U-2 当日委托：同口径 10s→60s 兜底；在途单状态推进的即时性走 SSE qmt_report/real_order。
-    loadOrders()
-    ordersTimer.current = setInterval(loadOrders, 60000)
-    // §0925EVE-W3-G 待核对清单：30s→60s（第三态人工改判本属低频作业，§0926E2E-17A 统一口径）
-    loadPendingReview()
-    pendingTimer.current = setInterval(loadPendingReview, 60000)
-    loadSettleHistory()
-    loadBroker()
-    loadTrades()
-    // 交易流水兜底轮询：30s→60s；成交回报到达即经 SSE qmt_report 刷新
-    tradesTimer.current = setInterval(loadTrades, 60000)
-    // §0926E2E-17A：订阅实盘链路 SSE 事件（internal/server/qmt.go 早已对当前账号定向广播，
-    // 前端此前零消费，只能靠 10s 轮询间接感知——与 §UAT-D1 收敛资损事件同族，这次补数据面）。
-    // 任一大类回报/熔断/对账差异/清空守卫事件到达：四路数据一起刷（低频事件，代价可忽略）。
-    sseQmtUnsub.current = sseOn(
-      ['qmt_report', 'real_order', 'qmt_halt', 'settlement_diff', 'positions_clear_guard'],
-      () => {
-        if (pollingDeadRef.current) return // §M13 止血后事件回调也不得再拉 admin 端点
-        loadState(); loadOrders(); loadPendingReview(); loadTrades()
-      },
-    )
-    loadConfig().catch((e) => MessagePlugin.error('加载实盘配置失败：' + (e && e.message ? e.message : e)))
+    // §0929GATE-403：admin-only 只读链路按角色决定是否拉起（成员直接落无权限面板，零请求）。
+    // 判据只有这一个入口（startAdminReads），不在定时器回调里各写一份——两处判据分叉
+    // 就是"有时加载有时不加载"的哑故障形态。
+    if (adminReadsAllowed()) {
+      startAdminReads()
+    } else {
+      setForbidden(true)
+    }
     // 卸载时清除定时器，防止内存泄漏与重复请求（§M13：与 forbidden 停用共用同一清理函数）
     return () => { stopPolling() }
   }, [])
@@ -706,6 +832,17 @@ export default function Quant() {
   const fillsColumns = [
     { colKey: 'time', title: '时间', width: 130, cell: ({ row }) => (row.traded_at || '').replace('T', ' ').slice(5, 19) },
     { colKey: 'code', title: '代码', width: 90 },
+    // §0929FILL-NAME 名称列：账本（fills 表）本就没有股票名，这一列是前端按代码向本地股票池
+    // 表问出来的**展示旁证**，只为让人工核对柜台回单时不必再拿代码反查名字。
+    // 三条硬边界（与 store 侧负锁同源，改一处必须同时改另一处）：
+    //   ① 名称不参与幂等锚（(order_id,traded_at,price,qty)+trade_id）——券商名称是自由文本，
+    //      当锚用就会重演 §M4：同笔回报因两处名字不一致而判不出重复，账上多记一笔；
+    //   ② 不参与任何金额/方向计算，也不进勘误提交体（提交仍只带 fill_id，锚由服务端从原始行读出）；
+    //   ③ 查不到就显示「—」，不给空串、不猜——「没有名字」和"系统藏了名字"必须长得不一样。
+    {
+      colKey: 'name', title: '名称', width: 100,
+      cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{fillNames[fillNameKey(row.code)] || '—'}</span>,
+    },
     {
       colKey: 'side', title: '方向', width: 120,
       cell: ({ row }) => (
@@ -1267,7 +1404,19 @@ export default function Quant() {
       {/* 无权限访问提示：普通用户无法操作量化交易页面 */}
       {forbidden && (
         <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
-          🔒 无权限访问量化交易：当前登录「{api.getAccount() || '未知'}」为普通用户，该页面仅管理员账号可操作。请使用管理员账号（用户名 admin）登录后再进行管理。
+          {/* §0929GATE-403：首句「无权限访问量化交易」是既有验收锚（Playwright uat_full 的 tester 腿 +
+              m13/w4d/w5a 三组 vitest 锁都按它定位），改写会把已收口的链路判成回归；
+              新增的「实盘数据未拉取」后半句才说清这次的语义变化——预过滤后成员会话一条 admin
+              请求都没发过，这里既不是"加载失败"也不是一次真实的 403 往返。 */}
+          <div>🔒 无权限访问量化交易：实盘数据未拉取。当前登录「{api.getAccount() || '未知'}」为普通用户，
+            该页面仅管理员账号可见；本页已按角色跳过实盘只读接口（未发出注定被 403 的请求，也不再刷"加载失败"）。</div>
+          {/* 出口一：角色缓存可能是旧值（刚被提升/刚换登录），向后端重确认后照常加载——
+              后端仍是唯一裁决，这里只是让本地预过滤有可撤销的余地，不是前端自授权限。
+            出口二：换管理员账号，原文案保留该指引。 */}
+          <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <Button size="small" variant="outline" loading={retryBusy} onClick={retryAsAdmin}>刷新身份并重试</Button>
+            <span style={{ fontSize: 12, color: 'var(--app-text-2)' }}>若刚被提升为管理员可点左侧按钮；否则请使用管理员账号（用户名 admin）登录后再进行管理。</span>
+          </div>
         </div>
       )}
 
@@ -1391,7 +1540,7 @@ export default function Quant() {
             ) : (
               <div style={{ padding: '8px 2px', color: 'var(--app-text-2)', fontSize: 13 }}>暂无成交——实盘成交后此处出现按战法归因的盈亏统计（飞轮回流数据源）</div>
             )}
-            {/* 成交流水明细表：时间、代码、方向、价格、数量、金额、战法 */}
+            {/* 成交流水明细表：时间、代码、名称（§0929FILL-NAME 前端旁证）、方向、价格、数量、金额、战法 */}
             {(trades.fills || []).length ? (
               <Table data={trades.fills} columns={fillsColumns} rowKey="order_id" size="small"
                 // §FIX-20260902 补 total=长度：tdesign 未传 total 时分页默认 0 → 页脚「共 0 条」且无法翻页
@@ -1403,9 +1552,12 @@ export default function Quant() {
         )}
       </Card>
 
-      {/* §FILL-AMEND（2026-09-23）成交勘误台账 + 账本守恒自检（均 admin-only，随本页 403 面板一起拦住） */}
+      {/* §FILL-AMEND（2026-09-23）成交勘误台账 + 账本守恒自检（均 admin-only）。
+          §0929GATE-403：这两个端点此前由本面板无条件挂载即拨，成员即使看到无权限面板也会先吃两条 403；
+          现按 adminReadsAllowed() 传结论，判据仍只有那一个入口，组件内不再自行查角色。 */}
       <FillAmendPanel fills={(trades && trades.fills) || []} target={amendTarget}
-        onCloseTarget={() => setAmendTarget(null)} onChanged={loadTrades} />
+        onCloseTarget={() => setAmendTarget(null)} onChanged={loadTrades}
+        canQuery={adminReadsAllowed()} />
 
       {/* §U-2/§WS-B 日终结算对账卡（三方比对 + 差异历史） */}
       {renderSettleCard()}
