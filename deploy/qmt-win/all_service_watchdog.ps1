@@ -1,4 +1,4 @@
-# all_service_watchdog.ps1 — 广州执行机全服务守护（§WS-J 维3）
+﻿# all_service_watchdog.ps1 — 广州执行机全服务守护（§WS-J 维3）
 # 职责：巡检 §C7 单一守护清单（NSSM 四服务 quant/quant-research/pydata/quant-web
 #       ＋ qmt_gateway 交互任务腿）健康端点，异常自动恢复（退避 3 次 / 10 分钟）；
 #       单实例保障（按 ParentProcessId 定位"亲儿子"，清除孤儿/双实例）；心跳探针落 opslog + 日志。

@@ -1603,7 +1603,18 @@ grep -q 'ps1_bom deploy/qmt-win/register_backup_task.ps1' scripts/deploy_guangzh
 # 仓库**字节**也必须已经是单 BOM：只锁"部署脚本会调 ps1_bom"锁不住本批实际发生的事——
 # Write/Edit 工具重写 ps1 会把 BOM 静默剥掉（register_backup_task.ps1 就复犯过一次），而部署链
 # 上传前会补回来，于是现网正常、仓库里的文件却是坏的：走 RUNBOOK §2 手工安装 = 首跑 ParserError。
-for ps1 in deploy/qmt-win/backup_snapshot.ps1 deploy/qmt-win/register_backup_task.ps1; do
+# 09-29 再复犯一次并锤实"硬编码清单"本身就是漏检成因：本段原来只点名 2 个文件，
+# deploy/qmt-win/all_service_watchdog.ps1 自 §C7 入库起仓库字节就无 BOM，每次部署由 ps1_bom 在
+# 工作区悄悄补上（git status 只见 1 字节 M），现网一直正常、仓库里那份照 RUNBOOK 手跑必 ParserError。
+# ⇒ 目标清单改为**从部署脚本派生**（凡 `ps1_bom <path>.ps1` 都进锁面），新增归一目标自动被覆盖。
+bomTargets=$(grep -oE 'ps1_bom [^ ]+\.ps1' scripts/deploy_guangzhou.sh | awk '{print $2}' | sort -u || true)
+# 派生式空清单＝本段全体退化成绿灯（§"TOTAL 0 in 0 files"双关同族）⇒ 先钉住清单非空且下限达标。
+nBomTargets=$(printf '%s\n' "$bomTargets" | grep -c . || true)
+[ "$nBomTargets" -ge 15 ] \
+	|| { echo "--- FAIL: 部署侧 ps1_bom 目标派生为空/过少（实得 ${nBomTargets}，应≥15）——派生清单失效，BOM 自检退化成恒绿"; exit 1; }
+for ps1 in $bomTargets; do
+	[ -f "$ps1" ] \
+		|| { echo "--- FAIL: 部署脚本对不存在的文件做 ps1_bom 归一（${ps1}）——上传步骤会把失败推到现网"; exit 1; }
 	python3 - "$ps1" <<'PY' || { echo "--- FAIL: $ps1 仓库字节 BOM 不合规（手工安装路径首跑必炸）"; exit 1; }
 import sys
 d = open(sys.argv[1], 'rb').read()
@@ -1663,7 +1674,7 @@ if grep -nE '& \$Restic [a-z]+ .*2>&1 \| ForEach-Object' deploy/qmt-win/backup_s
 # 负锁④：首跑必须是显式开关触发的运维动作，不得变成每次部署自动搬 GB 级快照。
 grep -qF 'LIVEBACKUP_FIRST_RUN:-0' scripts/deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 部署步 [2e] 首跑开关失去默认关闭语义（每次部署自动 GB 级快照+restic 写入）"; exit 1; }
-echo "ok - §LIVEBACKUP-DEPLOY 专项守卫通过（清单正锁 3 + 同源锁 2 + 探针锁 3 + 锁面正锁 2 + restic 自愈形状锁 5 + 负锁 4）"
+echo "ok - §LIVEBACKUP-DEPLOY 专项守卫通过（清单正锁 3 + 同源锁 2 + 探针锁 3 + 锁面正锁 2 + restic 自愈形状锁 5 + 负锁 4 + 仓库字节 BOM 同源锁：派生目标逐文件自检 + 空清单正锁 1）"
 
 # ── 71. §ADJ-BASIS 复权口径进断点键（2026-09-23 本机 A/B 锤实的"重算覆盖"前置缺陷）──
 # resume_key 原本只含 区间/参数/股票池，**不含数值口径**。于是 §ADJ（因子前向填充）这种
