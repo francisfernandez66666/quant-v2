@@ -107,6 +107,14 @@ func DefaultAlertRules() []AlertRule {
 		// 那种成因归上面的 no_enabled 那条 p1，文案严格分家）。阈值 14 日历日=夜间寻优/审批链
 		// 停摆两周；变更本身由 §0929LIB-WATCH 的热加载+审计行负责，这条只补"长期没有变更"。
 		{Name: "library_stale_days", Metric: "library_stale_days", Op: "gt", Threshold: 14, For: "0s", Level: "p2", Message: "已应用战法库 14 天以上未更新：夜间寻优/审批链可能整段停摆，引擎仍在按旧规则出信号（§0929LIB-WATCH 只在库真的变了才动，看不见「一直没变」）；查 quant-research 夜间任务与候选审批队列"},
+		// HB-4 休市日仍有当日新固化信号（§0929HB-4，与 HB-1 反向）：量规是"今天不是交易日、
+		// 但 GeneratedAt 落在今天的固化信号条数"（交易日恒写 0，见 internal/engine/heartbeat.go
+		// closedDayPinnedCount）。现场成因＝09-25 中秋休市当日固化数 470→481：休市判定
+		// fail-open（日历未加载/行情源仍在供数）时引擎照旧扫描，而新信号会落进**上一交易日那一桶**
+		// （TradingDayDate 回退），界面上完全看不出"休市日在出信号"。
+		// 阈值取 gt 0 而不是"多少条才算"：休市日的正确读数只有一个值——0。For=600s 只防
+		// 一轮毛刺/重启回填竞态，不改变"任何一条都是异常"的口径。
+		{Name: "signal_pinned_on_closed_day", Metric: "signal_closed_day_pinned", Op: "gt", Threshold: 0, For: "600s", Level: "p2", Message: "休市日仍有当日新固化信号：日历判定 fail-open 或行情源仍在供数，引擎在不是交易日的那天照常扫描出信号（新信号会并进上一交易日那一桶，前端看不出来）。查 trading_calendar_loaded 是否为 0、行情源休市闸门；09-25 中秋 470→481 即此形态"},
 	}
 }
 

@@ -76,6 +76,15 @@
 #      dataload.exe amount-check（纯 SELECT 零写入、免凭据，与第 15/27 探针同一条只读通道）。
 #      红＝千元/双重换算/混源/读取失败；库里没数不判红（表未装由新鲜度腿负责，重复判红会把
 #      「还没装」冒充成「量纲错了」）。中位均价读数恒走 INFO，绿也要看得到数。
+#  21) §0929SECKEY-A（2026-09-29，第 31 探针，判数 30→31）：灾备快照面权限收敛复核。
+#      RUNBOOK 长期声称"快照目录只留 Administrator 可读"，09-29 实测是**文档幻觉**——快照根与
+#      restic 中转仓都带继承来的 BUILTIN\Users RX/AD/WD，本机任意账号能读走快照 secrets\ 里的
+#      明文网关口令、还能伪造 SNAPSHOT_OK。本批新增 harden_snapshot_acl.ps1（缺省预览 / -Apply
+#      才动手 / 先存 icacls /save 回滚凭证 / 改完真拨一次读写自测），这条探针按 **SID** 复核
+#      白名单（SYSTEM + Administrators）之外一条都不许留：明细全 ASCII，中文明细经 ssh 回传是
+#      GBK 乱码（第 19 探针判例）；孤儿 ACE 计入白名单外；三处目标全不存在判红（无对象可查＝探针
+#      失明，与 §70 派生空清单正锁同族）；Get-Acl 失败判红（读不到不等于安全）。
+#      两处路径**从 backup_snapshot.ps1 派生**（§H8：两处字面量必然漂移），派生为空当场拒绝启动。
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
@@ -86,6 +95,8 @@
 #   的安全阀态判据要读它）/ GW_CFG / GW_TOKEN_SVC（默认=现网路径）
 #   / 第 29 探针新增可调项：OPS_SCRIPTS_DIR（日检两件套落盘目录，默认 DEPLOY_DIR/scripts）
 #     / GW_PY_DIR（网关 python 目录，默认取 GW_CFG 父目录——两处字面量必漂移，故推导不写死）
+#   / 第 31 探针新增可调项：RESTIC_REPO_DIR / RESTIC_PASS_FILE（默认从 backup_snapshot.ps1 的
+#     $RepoDir / $Pass 赋值行派生并转正斜杠；派生读不到则本脚本当场 exit 1，不拿空路径去查权限）
 set -uo pipefail
 
 : "${GZ_IP:?请设置 GZ_IP（广州服务器公网 IP）}"
@@ -108,6 +119,21 @@ GW_CFG="${GW_CFG:-C:/qmt/quant-trading-v2/qmt_gateway/config.xt.json}"   # §QMT
 GW_PY_DIR="${GW_PY_DIR:-$(dirname "$GW_CFG")}"
 OPS_SCRIPTS_DIR="${OPS_SCRIPTS_DIR:-${DEPLOY_DIR}/scripts}"               # 第 29 探针：日检两件套落盘目录
 GW_TOKEN_SVC="${GW_TOKEN_SVC:-quant}"                      # §QMT-TOKENROT 第 20 探针：QUANT_GATEWAY_TOKEN 所在 NSSM 服务
+# §0929SECKEY-A（第 31 探针）：restic 中转仓 + 口令文件的现网路径**从备份脚本派生**，
+# 不在这里抄第二遍字面量（§H8 同族姿势：两处字面量必然漂移，漂移后探针查的是不存在的位置）。
+# backup_snapshot.ps1 是这三处的权威源（它才是每晚写这些目录的人），派生为空即拒绝继续——
+# 宁可这条命令当场失败，也不要拿着空路径去 Get-Acl 然后报"全绿"。
+_snap_src="${APP_DIR}/deploy/qmt-win/backup_snapshot.ps1"
+# 逐行取「`$RepoDir = "…"`」的引号内字面量（bash 3.2 下 heredoc 套命令替换有解析坑，故用 grep/sed）。
+RESTIC_REPO_DIR_FROM_SNAP=$(grep -E '^[[:space:]]*\$RepoDir[[:space:]]*=' "$_snap_src" 2>/dev/null | head -1 | awk -F'"' '{print $2}' | tr '\\' '/' || true)
+RESTIC_PASS_FILE_FROM_SNAP=$(grep -E '^[[:space:]]*\$Pass[[:space:]]*=' "$_snap_src" 2>/dev/null | head -1 | awk -F'"' '{print $2}' | tr '\\' '/' || true)
+RESTIC_REPO_DIR="${RESTIC_REPO_DIR:-${RESTIC_REPO_DIR_FROM_SNAP}}"
+RESTIC_PASS_FILE="${RESTIC_PASS_FILE:-${RESTIC_PASS_FILE_FROM_SNAP}}"
+if [ -z "$RESTIC_REPO_DIR" ] || [ -z "$RESTIC_PASS_FILE" ]; then
+  echo "X 第 31 探针的路径派生失败：备份脚本里的 RepoDir / Pass 变量赋值行读不到（源文件：${_snap_src}）——" >&2
+  echo "  宁停不错：拿空路径去 Get-Acl 会把'探针失明'报成全绿。改动备份脚本变量名时同步改这里的 grep 模式。" >&2
+  exit 1
+fi
 ENGINE_PORT="${ENGINE_PORT:-8081}"
 WEB_PORT="${WEB_PORT:-8080}"
 GW_PORT="${GW_PORT:-8789}"
@@ -148,6 +174,11 @@ param(
     [string]$OpsWinDir = "C:\opt\quant\qmt-win",
     [string]$OpsScriptsDir = "C:\opt\quant\scripts",
     [string]$GwPyDir = "C:\qmt\quant-trading-v2\qmt_gateway",
+    # §0929SECKEY-A（2026-09-29，第 31 探针）：restic 中转仓与口令文件的现网路径。
+    # 三处字面量（本默认值 / backup_snapshot.ps1 的 $RepoDir,$Pass / harden_snapshot_acl.ps1 的
+    # $RepoDir,$PassFile）由 verify_changes.sh §106 等值锁钉死——探针查一个不存在的位置等于没查。
+    [string]$ResticRepoDir = "C:\var\lib\quant-restic-repo",
+    [string]$ResticPassFile = "C:\opt\quant\tools\restic-pass.txt",
     [string]$DeployDir = "C:\opt\quant"
 )
 $ErrorActionPreference = "Continue"
@@ -1056,6 +1087,59 @@ $scaleBad = ($scaleRc -ne 0)
 $scaleDetail = "rc=" + $scaleRc + " out=" + $scaleOut
 Write-Output ("INFO|amount_scale_readout " + $scaleDetail)
 Probe "data: daily amount caliber probe green (readout in INFO)" (-not $scaleBad) $scaleDetail
+
+# 21) §0929SECKEY-A（2026-09-29，第 31 探针，判数 30→31）：灾备快照与口令文件的权限面复核。
+# 为什么这条探针必须存在（现网实测锤实，不是推测）：RUNBOOK 一直写着灾备的补偿措施之一是
+#   "快照目录只留 Administrator 可读"，而 09-29 用 icacls 读现值——快照根与 restic 中转仓都带着
+#   继承来的 `BUILTIN\Users:(RX)` + `(AD)/(WD)`，即本机任意账号能读走快照里的明文网关口令
+#   （auth.json/config.json 在快照 secrets\ 下），还能往快照根写文件（伪造 SNAPSHOT_OK）。
+#   这句话是**文档幻觉**（§BOM-REPO/§ENH-5 同族：写在文档里的补偿措施没落地也没人判红）。
+#   本批把收敛做成 harden_snapshot_acl.ps1（缺省预览、-Apply 才动手、先存 icacls /save 回滚凭证、
+#   改完真拨一次读+写自测），这条探针负责在每次发版后独立复核"还裸着"这件事，而不是靠人记得跑。
+# 判据形状：白名单外 ACE 数 == 0（白名单＝SYSTEM + BUILTIN\Administrators，与收敛脚本同源）。
+#   ① 按 **SID** 判定，绝不解析 icacls 的文本账号名——中文名按控制台码页回传会变 GBK 乱码、
+#      且 "Administrators" 在中文系统显示本地化名（第 19 探针判例）；明细因此只含 ASCII 的 S-1-5-*。
+#   ② 孤儿 ACE（Translate 失败）标 UNTRANSLATABLE 计入白名单外：它同样是一条访问许可，
+#      当成不存在就是自证绿。
+#   ③ 目标三处**全都不存在**判红而不是绿（"无对象可查"＝探针失明，与 §70 派生空清单正锁同族）；
+#      单处缺失不判红——口令文件/中转仓只在启用 restic relay 的机器上有，缺失由第 16 探针那侧管。
+#   ④ Get-Acl 失败算红（读不到权限不等于权限安全）。
+# 与第 22 探针一样：绿时走 INFO 回显每处的 SID 与白名单外条数，红时明细进 FAIL。
+$aclAllowed = @("S-1-5-18", "S-1-5-32-544")
+$aclTargets = @(
+    @{ L = "snap_root";   P = $SnapDir },
+    @{ L = "restic_repo"; P = $ResticRepoDir },
+    @{ L = "restic_pass"; P = $ResticPassFile }
+)
+$aclOutside = 0
+$aclChecked = 0
+$aclParts = @()
+foreach ($t in $aclTargets) {
+    if (-not (Test-Path -LiteralPath $t.P)) { $aclParts += ($t.L + "=absent"); continue }
+    $aclChecked += 1
+    try {
+        $acl = Get-Acl -LiteralPath $t.P -ErrorAction Stop
+        $sids = @()
+        foreach ($ace in $acl.Access) {
+            try { $sids += $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+            catch { $sids += ("UNTRANSLATABLE:" + ($ace.IdentityReference.Value -replace '[^\x21-\x7E]', '?')) }
+        }
+        $sids = @($sids | Sort-Object -Unique)
+    } catch {
+        $aclOutside += 1
+        $aclParts += ($t.L + "=getacl-failed")
+        continue
+    }
+    $out = @($sids | Where-Object { $aclAllowed -notcontains $_ })
+    $aclOutside += $out.Count
+    # 明细里只放 SID（ASCII）：白名单外那些逐条点名，其余折叠成 allowed 计数，避免长行。
+    $desc = $t.L + "=outside[" + (($out | ForEach-Object { $_ -replace 'UNTRANSLATABLE:.*', 'orphan-ace' }) -join ";") + "] sids=" + $sids.Count
+    $aclParts += ($desc -replace '[^\x20-\x7E]', '')
+}
+$aclDetail = "checked=" + $aclChecked + " outside=" + $aclOutside + " " + ($aclParts -join " ")
+Write-Output ("INFO|snapshot_acl_readout " + $aclDetail)
+$aclBad = ($aclOutside -gt 0 -or $aclChecked -eq 0)
+Probe "sec: snapshot/restic dirs expose no ACE outside SYSTEM+Administrators" (-not $aclBad) $aclDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -1064,7 +1148,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
-out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC} -SvcDefsPath ${QMT_WIN_DIR}/service_definitions.ps1 -OpsWinDir ${QMT_WIN_DIR} -OpsScriptsDir ${OPS_SCRIPTS_DIR} -GwPyDir ${GW_PY_DIR} -DeployDir ${DEPLOY_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
+out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC} -SvcDefsPath ${QMT_WIN_DIR}/service_definitions.ps1 -OpsWinDir ${QMT_WIN_DIR} -OpsScriptsDir ${OPS_SCRIPTS_DIR} -GwPyDir ${GW_PY_DIR} -ResticRepoDir ${RESTIC_REPO_DIR} -ResticPassFile ${RESTIC_PASS_FILE} -DeployDir ${DEPLOY_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
 
 PASS=0
 FAIL=0

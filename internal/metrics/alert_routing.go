@@ -115,9 +115,10 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 18 条，
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 19 条，
 // §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条、§0929HB-1/-2/-3
-// 加入三条"应有值缺失"型业务心跳后同步计数；alert_routing_test 有等值锁，漏一条即判红）。
+// 加入三条"应有值缺失"型业务心跳、§0929HB-4 加入休市日增量型心跳后同步计数；
+// alert_routing_test 有等值锁（路由条数 == 规则条数），漏一条即判红）。
 // English: factory routing table covering all DefaultAlertRules() entries.
 func DefaultAlertRouting() AlertRoutingConfig {
 	return AlertRoutingConfig{
@@ -158,6 +159,11 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			// 日汇总保证 owner 每天看到一次"夜间研究链没产出"，与 trading_calendar_not_loaded
 			// 同一条纪律（§CAL-GATE 的判例）。
 			"library_stale_days": RouteDaily,
+			// §0929HB-4（2026-09-29 晚批）：休市日仍有当日新固化信号。与 HB-3 同一条纪律——
+			// 这是**持续状态**而非瞬时疼：日历 fail-open 时整个休市日每 30s 都成立，走必推就是
+			// 每 30 分钟一条刷满长假。而且休市日网关不下单，异常不会当场变成钱损，
+			// 属于"当天要知道、不必当天几点都知道"。与 trading_calendar_not_loaded 同路由。
+			"signal_pinned_on_closed_day": RouteDaily,
 			// —— 必推：§ADJ-BASIS-2 战法参数基线失效（不推就是"owner 永远不知道这批权重的历史依据没了"）——
 			"applied_factor_stale_basis":  RoutePush,
 			"applied_pattern_stale_basis": RoutePush, // §ADJ-BASIS-2P 形态侧同规

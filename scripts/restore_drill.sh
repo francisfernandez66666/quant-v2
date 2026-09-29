@@ -227,14 +227,57 @@ done
 if [ -d "${LATEST}/accounts" ]; then
     CNT=$(find "${LATEST}/accounts" -mindepth 1 -maxdepth 1 | wc -l)
     [ "$CNT" -gt 0 ] || fail "accounts/ 为空"
-    # 广州产物再深一层：每个账号目录里至少要有 paper.json（模拟盘账本，registry.go:164）
+    # 广州产物再深一层（§0929DRILL-C，2026-09-29 恢复演练**首次挂调度真跑**锤实的假红判据）。
+    #   原判据是"每个账号目录都必须有 paper.json"，而现网实测的账号布局不是这个形状：
+    #     accounts/ 下 4 个账号目录，只有主账号 u_1785377969825355000 有 paper.json
+    #     （直属 13 个文件 + verdicts/ 8 个逐日 jsonl），u_1787204584289250058 只有 1 个
+    #     messages.json，另两个账号目录**在生产机上就是空的**（09-29 现网 Group-Object 实测
+    #     files=0，注册过但从没写过 per-user 文件）。
+    #   ⇒ 两条硬判据（"每账号有 paper.json"、"每账号目录非空"）都把合法生产形态判成红，
+    #     恢复演练因此在**健康的备份链上也永远过不了**（和上面那条 30h 新鲜度同批暴露）。
+    #     这正是"判据写得很完整、一次都没真跑过"的代价：它到底在验什么，只有真拨一次才知道。
+    #   重写后按"这条断言本来要防的失效形态"落四条，各自只防一件事、都不靠猜生产形态：
+    #     ① 产物里 accounts/ 递归文件数必须 > 0——生产侧 backup_snapshot.ps1:205 本来就
+    #        "镜像出 0 文件即抛错"，产物里却是 0 只可能是拷贝链路说谎；
+    #     ② 等值锁：产物递归文件数必须**等于**同一份 SNAPSHOT_OK 里的 accounts_files。
+    #        标记计的就是**落盘后的镜像目录**（$acctDst），所以这两个数同源可比；
+    #        撕裂/半途恢复会少文件，这一条会当场红，而①只会看到"非空"放过它；
+    #     ③ 至少有一个 paper.json——模拟盘账本确实在备份对象里；全体消失才是真事故。
+    #        （不要求"每个账号都有"：那等于要求每个账号都做过纸面交易。）
+    #     ④ 每个账号目录逐条打 INFO（含文件数与是否空目录）——空目录不判红，但也不隐身；
+    #        哪天主账号的 paper.json 掉了，③当场红、④的读数直接指认掉在哪个账号上。
     if [ "$LAYOUT" = "guangzhou" ]; then
-        MISSING=0
+        ART_ACCT_FILES=$(find "${LATEST}/accounts" -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+        ART_ACCT_FILES="${ART_ACCT_FILES:-0}"
+        [ "$ART_ACCT_FILES" -gt 0 ] || fail "产物里 accounts/ 一个文件都没有（生产侧镜像出 0 文件本会抛错，这里却是空＝拷贝链路没跑通）"
+        MARK_ACCT="$(printf '%s' "${MARK:-}" | sed -n 's/.*"accounts_files":\([0-9]\{1,\}\).*/\1/p')"
+        if [ -n "$MARK_ACCT" ]; then
+            [ "$ART_ACCT_FILES" -eq "$MARK_ACCT" ] || fail "产物 accounts/ 文件数=${ART_ACCT_FILES} ≠ SNAPSHOT_OK.accounts_files=${MARK_ACCT}（同源两个数不等＝恢复出来的账号状态不完整）"
+            echo "[restore-drill] accounts/ 文件数=${ART_ACCT_FILES} 与 SNAPSHOT_OK.accounts_files 等值"
+        else
+            echo "[restore-drill] 警告: SNAPSHOT_OK 无 accounts_files 字段（旧版标记），等值腿跳过、非空腿照常"
+        fi
+        PAPER_TOTAL=0
         for d in "${LATEST}"/accounts/*/; do
             [ -d "$d" ] || continue
-            [ -f "${d}paper.json" ] || { echo "[restore-drill] 失败: $(basename "$d") 缺 paper.json"; MISSING=1; }
+            NAME="$(basename "$d")"
+            NF=$(find "$d" -mindepth 1 -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+            NF="${NF:-0}"
+            if [ "$NF" = "0" ]; then
+                # 这里必须写 if：本脚本是 `set -eu`，`[ ... ] && echo` 在条件为假时整条列表返回
+                # 非零，会把"这个账号目录非空"变成"脚本当场退出"（本文件上面 JSON_DIR 那段同款雷）。
+                echo "[restore-drill] INFO accounts/${NAME} 空目录（现网同形，注册后未写 per-user 文件）"
+            fi
+            if [ -f "${d}paper.json" ]; then
+                PB=$(wc -c < "${d}paper.json" | tr -d '[:space:]')
+                echo "[restore-drill] INFO accounts/${NAME} paper.json bytes=${PB} files=${NF}"
+                PAPER_TOTAL=$((PAPER_TOTAL + 1))
+            else
+                echo "[restore-drill] INFO accounts/${NAME} 无 paper.json（该账号没有模拟盘账本，属正常形态）files=${NF}"
+            fi
         done
-        [ "$MISSING" = "0" ] || fail "accounts/ 结构不完整（目录在、per-user 账本文件不在）"
+        [ "$PAPER_TOTAL" -gt 0 ] || fail "accounts/ 里一个 paper.json 都没有（模拟盘账本整条链不在备份对象里，这才是真事故）"
+        echo "[restore-drill] accounts/ 结构=${CNT} 个账号目录、文件总数=${ART_ACCT_FILES}、paper.json 在位数=${PAPER_TOTAL}"
     fi
     echo "[restore-drill] accounts/ 子目录数=${CNT}"
 else

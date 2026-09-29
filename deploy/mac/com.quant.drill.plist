@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- com.quant.drill.plist — Mac 每周恢复演练任务（§0929DRILL，2026-09-29 新增调度）。
+     语义：每周日 09:00 跑 run_drill_weekly.sh（它再调 verify_restore.sh → restore_drill.sh）：
+       restic check（仓库结构）+ 整份快照真恢复 + 四表可读 + 隔离副本读写往返 + config 层级，
+       每次结果追加一行 JSON 到 ~/backups/quant/drill_record.jsonl（失败也写）。
+     为什么排周日 09:00：备份拉取腿 com.quant.backup 每天 07:00 与 10:30 两个时点跑（§0929DRILL-B
+       加了 10:30 那一档），且周日 07:00 那次还会做 restic check；演练若与它们同窗会抢同一个本地
+       仓库的排他锁（§RESTIC-LOCK 2026-09-26 实录：一把遗留锁让早晨整窗 copy 连败 8 次）。
+       演练封顶 40 分钟（run_drill_weekly.sh 的 DRILL_TIMEOUT_SEC=2400）⇒ 09:00 起跑最晚 09:40 收工，
+       与 10:30 那档之间留着 50 分钟余量；阈值都放在薄壳脚本里，plist 只管"拉起哪个脚本"。
+     安装/升级一律走 ./install_mac_drill_agent.sh -Apply（拷稳定副本**镜像树**+装 plist+重载；
+       -Kick 立即补跑一次验证通道活）。
+     ⚠️ 与 com.quant.backup 同一条 TCC 教训：ProgramArguments 绝不指 Desktop 仓库路径——
+       桌面是 macOS 保护目录，launchd 拉起的 /bin/bash 读不到它，会"每天定时、每天静默失败(126)"。
+       稳定副本在 ~/backups/quant/drill/，且必须是 deploy/mac/ + scripts/ 两级镜像
+       （verify_restore.sh 按 ../.. 反推仓库根去找 restore_drill.sh，拍平即找不到）。
+     查看：launchctl list | grep com.quant.drill；日志 ~/backups/quant/drill_weekly.log；
+       新鲜度反查：grep -c . ~/backups/quant/drill_record.jsonl（有记录才叫真跑过）。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.quant.drill</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/zhangzifei/backups/quant/drill/run_drill_weekly.sh</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Weekday</key>
+		<integer>0</integer>
+		<key>Hour</key>
+		<integer>9</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/zhangzifei/backups/quant/drill_launchd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/zhangzifei/backups/quant/drill_launchd.err</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/Users/zhangzifei</string>
+	</dict>
+</dict>
+</plist>

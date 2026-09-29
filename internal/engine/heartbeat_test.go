@@ -32,31 +32,65 @@ var (
 	hbAnchor = time.Date(2026, 9, 29, 10, 0, 0, 0, cntime.Loc)
 	hbLater  = hbAnchor.Add(31 * time.Minute)
 	hbClosed = time.Date(2026, 9, 29, 20, 0, 0, 0, cntime.Loc) // 盘后：必须收案写 0
+	// hbSaturday＝2026-09-26（周六）盘中 10:31：**钟点在盘中、日历上不是交易日**。
+	// 这一支是 §0929HB-1 自己埋的雷（IsActiveSession 只看钟点），补成用例钉住：
+	// 摘掉 signalHeartbeatAge 的 tradingDay 判据，TestSignalHeartbeatSaturdayIsNotAFault 当场红。
+	hbSaturday = time.Date(2026, 9, 26, 10, 31, 0, 0, cntime.Loc)
+	// hbFriday＝同一天的"昨天"，用来造"休市日看到的是上一交易日回填的老信号"这种合法态。
+	hbFriday = hbSaturday.AddDate(0, 0, -1)
 )
 
-// TestSignalHeartbeatAgePredicate 纯函数判据表：七支各自独立，覆盖计时/不计时全部入口条件。
+// TestSignalHeartbeatAgePredicate 纯函数判据表：九支各自独立，覆盖计时/不计时全部入口条件。
 func TestSignalHeartbeatAgePredicate(t *testing.T) {
 	cases := []struct {
-		name    string
-		now     time.Time
-		anchor  time.Time
-		session bool
-		live    bool
-		pinned  int
-		want    int64
+		name       string
+		now        time.Time
+		anchor     time.Time
+		session    bool
+		tradingDay bool
+		live       bool
+		pinned     int
+		want       int64
 	}{
-		{"盘中零信号 31 分钟", hbLater, hbAnchor, true, true, 0, 1860},
-		{"盘中刚建锚（时长 0）", hbAnchor, hbAnchor, true, true, 0, 0},
-		{"已有固化信号必须归零", hbLater, hbAnchor, true, true, 3, 0},
-		{"非实盘不计时", hbLater, hbAnchor, true, false, 0, 0},
-		{"非盘中不计时", hbLater, hbAnchor, false, true, 0, 0},
-		{"锚未建立（零值时间）", hbLater, time.Time{}, true, true, 0, 0},
-		{"时钟回拨不倒计", hbAnchor, hbLater, true, true, 0, 0},
+		{"盘中零信号 31 分钟", hbLater, hbAnchor, true, true, true, 0, 1860},
+		{"盘中刚建锚（时长 0）", hbAnchor, hbAnchor, true, true, true, 0, 0},
+		{"已有固化信号必须归零", hbLater, hbAnchor, true, true, true, 3, 0},
+		{"非实盘不计时", hbLater, hbAnchor, true, true, false, 0, 0},
+		{"非盘中不计时", hbLater, hbAnchor, false, true, true, 0, 0},
+		{"休市日不计时", hbSaturday, hbSaturday.Add(-31 * time.Minute), true, false, true, 0, 0},
+		{"锚未建立（零值时间）", hbLater, time.Time{}, true, true, true, 0, 0},
+		{"时钟回拨不倒计", hbAnchor, hbLater, true, true, true, 0, 0},
 	}
 	for _, c := range cases {
-		if got := signalHeartbeatAge(c.now, c.anchor, c.session, c.live, c.pinned); got != c.want {
+		if got := signalHeartbeatAge(c.now, c.anchor, c.session, c.tradingDay, c.live, c.pinned); got != c.want {
 			t.Errorf("%s: signalHeartbeatAge=%d 期望 %d", c.name, got, c.want)
 		}
+	}
+}
+
+// TestClosedDayPinnedCountPair 反证对：同一批信号，**休市日**只数"今天生成的"，
+// 交易日恒 0；跨日回填（GeneratedAt 是上一个交易日）与零值时刻都不计。
+// 四支各自摘掉一条判据都会红：tradingDay 短路、同日判定、IsZero 跳过。
+func TestClosedDayPinnedCountPair(t *testing.T) {
+	sigs := []combat_agent.Signal{
+		{Code: "600001.SH", Strategy: "dragon", GeneratedAt: hbSaturday},                      // 休市日当天新增 ⇒ 计
+		{Code: "600002.SH", Strategy: "dragon", GeneratedAt: hbSaturday.Add(2 * time.Minute)}, // 同上 ⇒ 计
+		{Code: "600003.SH", Strategy: "dragon", GeneratedAt: hbFriday.Add(10 * time.Hour)},    // 上一交易日老信号 ⇒ 不计
+		{Code: "600004.SH", Strategy: "dragon"},                                               // 无生成时刻 ⇒ 不计（不伪造红）
+	}
+	if got := closedDayPinnedCount(hbSaturday, false, sigs); got != 2 {
+		t.Fatalf("休市日应只数当天新增的 2 条，got %d", got)
+	}
+	// 反证 A：同一天换成交易日口径（tradingDay=true）⇒ 必须恰好 0（交易日出信号是本分）。
+	if got := closedDayPinnedCount(hbSaturday, true, sigs); got != 0 {
+		t.Fatalf("交易日恒 0，got %d", got)
+	}
+	// 反证 B：摘掉"同一天"判据就会把 3 条都算进来 ⇒ 这里单独钉跨日那一支。
+	if got := closedDayPinnedCount(hbSaturday, false, sigs[:1]); got != 1 {
+		t.Fatalf("单条当天新增应为 1，got %d", got)
+	}
+	if got := closedDayPinnedCount(hbSaturday, false, sigs[2:]); got != 0 {
+		t.Fatalf("老信号+无时刻都必须不计，got %d", got)
 	}
 }
 
@@ -159,5 +193,92 @@ func TestRefreshStalenessFeedsSignalHeartbeat(t *testing.T) {
 		if v, _ := metrics.GetGauge("signal_zero_session_sec"); v != 0 {
 			t.Fatalf("盘外跑一轮必须收案为 0，got %d", v)
 		}
+	}
+	// §0929HB-4 接线腿：同一次刷新必须也把休市日增量键喂过（缺这条＝新规则出生即死规则）。
+	if _, ok := metrics.GetGauge("signal_closed_day_pinned"); !ok {
+		t.Fatalf("refreshStalenessGauges 未喂 %s（§DEADGAUGE：有规则无赋值点）", "signal_closed_day_pinned")
+	}
+}
+
+// hbEnginePinnedAt 造一台实盘引擎，固化信号全部带同一个 GeneratedAt（跨日回填/当天新增两种态都靠它造）。
+func hbEnginePinnedAt(t *testing.T, pinned int, at time.Time) *Engine {
+	t.Helper()
+	e := hbEngineWithLive(t, true, pinned)
+	if pinned > 0 {
+		e.mu.Lock()
+		for k, s := range e.signalStore.byKey {
+			s.GeneratedAt = at
+			e.signalStore.byKey[k] = s
+		}
+		e.mu.Unlock()
+	}
+	return e
+}
+
+// TestSignalHeartbeatSaturdayIsNotAFault 钉死 §0929HB-1 自己埋的那颗雷：
+// 周六 10:31 钟点在盘中、实盘开关开着、当日零信号——旧实现会报 1860 秒并推 p1，
+// 于是**每个周末都有一条假故障**（造假告警的代价是两周后真告警一起被关掉）。
+// 同一时刻的休市日增量键还必须被写 0（不是"没写"）：交易日/休市日两种态都得留下读数。
+func TestSignalHeartbeatSaturdayIsNotAFault(t *testing.T) {
+	if data.IsTradingDay(hbSaturday) {
+		t.Skipf("运行环境的日历把 %s 判成交易日（节假日日历把周六补班日认成交易日？）——本用例前提不成立", hbSaturday.Format("2006-01-02"))
+	}
+	metrics.SetGauge("signal_zero_session_sec", 1860) // 哨兵：模拟"上午真报过一次"
+	e := hbEnginePinnedAt(t, 0, time.Time{})
+	e.feedSignalHeartbeatGauge(hbSaturday.Add(-31 * time.Minute)) // 先建锚（同日首轮）
+	e.feedSignalHeartbeatGauge(hbSaturday)                        // 31 分钟后第二轮
+	if v, _ := metrics.GetGauge("signal_zero_session_sec"); v != 0 {
+		t.Fatalf("休市日必须收案写 0（got %d）：只看钟点计时会在每个周末造一条假 p1", v)
+	}
+	if v, _ := metrics.GetGauge("signal_closed_day_pinned"); v != 0 {
+		t.Fatalf("休市日零新增时增量键应为 0，got %d", v)
+	}
+	// 反证对：同一台引擎、同一休市日，只是把 2 条信号的生成时刻挪到"今天"⇒ 增量键必须变成 2。
+	e2 := hbEnginePinnedAt(t, 2, hbSaturday)
+	e2.feedSignalHeartbeatGauge(hbSaturday)
+	if v, _ := metrics.GetGauge("signal_closed_day_pinned"); v != 2 {
+		t.Fatalf("休市日当天新增 2 条必须报 2（got %d）：这条不报数＝§CAL-GATE 残留面又隐身了", v)
+	}
+	// 同日但落在**上一交易日**的回填（重启后从磁盘读回来的老批次）：不得算成今天新增。
+	e3 := hbEnginePinnedAt(t, 3, hbFriday)
+	e3.feedSignalHeartbeatGauge(hbSaturday)
+	if v, _ := metrics.GetGauge("signal_closed_day_pinned"); v != 0 {
+		t.Fatalf("跨日回填（GeneratedAt=上一交易日）不得冒充休市日新增，got %d", v)
+	}
+	// 交易日反向腿：同一批"今天生成"的信号在交易日必须让增量键写 0（交易日出信号是本分）。
+	metrics.SetGauge("signal_closed_day_pinned", 9)
+	e4 := hbEnginePinnedAt(t, 2, hbLater)
+	e4.feedSignalHeartbeatGauge(hbLater)
+	if v, _ := metrics.GetGauge("signal_closed_day_pinned"); v != 0 {
+		t.Fatalf("交易日必须写 0（got %d），否则哨兵值会冒充成休市日异常", v)
+	}
+}
+
+// TestSignalClosedDayRuleRegisteredAndKeyAligned 新规则登记面等值锁：名称/键名/等级/阈值/For
+// 五项都等于交付真值（"至少有一条"式单向锁放得过阈值漂移）。
+func TestSignalClosedDayRuleRegisteredAndKeyAligned(t *testing.T) {
+	var found metrics.AlertRule
+	n := 0
+	for _, r := range metrics.DefaultAlertRules() {
+		if r.Name == "signal_pinned_on_closed_day" {
+			found = r
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("规则 signal_pinned_on_closed_day 命中 %d 条（应为 1，重复登记会双推）", n)
+	}
+	if found.Metric != "signal_closed_day_pinned" {
+		t.Fatalf("规则读的键 %q ≠ 写端落的键 %q（§DEADGAUGE：键名漂移＝规则恒不触发）", found.Metric, "signal_closed_day_pinned")
+	}
+	if found.Level != "p2" || found.Op != "gt" || found.Threshold != 0 {
+		t.Fatalf("规则口径漂移：level=%s op=%s threshold=%.0f（期望 p2/gt/0——休市日的正确读数只有一个值）", found.Level, found.Op, found.Threshold)
+	}
+	if found.For != "600s" {
+		t.Fatalf("For=%q（期望 600s：只防一轮毛刺/重启回填竞态，不再叠加计时义务）", found.For)
+	}
+	routes := metrics.DefaultAlertRouting()
+	if got := routes.Routes["signal_pinned_on_closed_day"]; got != metrics.RouteDaily {
+		t.Fatalf("signal_pinned_on_closed_day 必须 RouteDaily（got %v）：休市日全程破线，走必推会刷满长假", got)
 	}
 }

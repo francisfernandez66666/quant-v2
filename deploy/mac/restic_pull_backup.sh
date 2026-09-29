@@ -99,6 +99,68 @@ restic -r "$REPO_LOCAL" forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 -
 DOW="$(date +%u)"
 [ "$DOW" = "7" ] && { log "restic check（周日）..."; restic -r "$REPO_LOCAL" check 2>>"$LOG" || alert "quant 备份仓库自检失败" "restic check 报错，看 $LOG" high; }
 
+# 4.5) 定时任务新鲜度反查（§0929DRILL + §0929NIGHTLY 的"死调度探测器"）。
+# 存在理由：09-16~09-25 那次异地备份断更 10 天，坏的不是判据而是**没人触发判据**——
+#   脚本体内的告警代码在脚本没跑的时候一行都不会执行。恢复演练（com.quant.drill）和
+#   夜间验收（com.quant.nightly）都是 09-29 才挂上调度的新任务，同一种失效形态它们一定会
+#   再犯一次，而它们的产物（两个 *_record.jsonl）此前没有任何人在看。
+#   本条把"某个定时任务多久没留下读数了"挂在**每天必然跑成的这条腿上**：拉取腿天天执行
+#   （07:00 + 10:30 两个时点），顺手读一眼留档的最新时间戳，超龄就推 ntfy。
+# 取向：**只告警不改退出码**。拉取腿自身成败与那两个调度是两件事，把后者做成前者的红，
+#   等于让"备份没坏"跟着一起吵，两周后就会被人为忽略（刷屏⇒关通知，本仓同族教训）。
+#   读数无论超龄与否都打一行 log（绿也要看得到数，§SIGNAL-DIST 口径）。
+# ⚠ 两个任务共用**一个**判读函数（record_freshness），不写两份近乎一样的解析：
+#   本批反复锤的主题就是"同一套判据两处分叉"，两份 20 行的时间戳解析一定会漂移，
+#   而漂移之后坏的那一份会安静地不再判红（§0929DRILL-A 那条 --last 假红就是这种形态）。
+record_freshness() {
+  local label="$1" rec="$2" max_days="$3" hint="$4"
+  local last ts res age
+  if [ ! -s "$rec" ]; then
+    # 留档文件不存在＝这个探测器自己的前提没落地（launchd 没装 / 第一次还没跑），必须吵而不是沉默。
+    log "${label} freshness=NO-RECORD（${rec} 不存在或为空）"
+    alert "quant ${label} 从未留下记录" "留档文件不存在：${rec}。安装：${hint}" medium
+    return 0
+  fi
+  last="$(tail -1 "$rec" 2>/dev/null || true)"
+  ts="$(printf '%s' "$last" | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+  res="$(printf '%s' "$last" | sed -n 's/.*"result":"\([^"]*\)".*/\1/p')"
+  age="$(python3 - "$ts" <<'PYAGE' 2>/dev/null || echo unparsable
+import sys,datetime
+# 只取前 19 位并按 %Y-%m-%dT%H:%M:%S 解析、**不把 Z 放进格式串**：
+#   留档时间戳是 date -u 产的 UTC 串（尾部有 Z），而 strftime 格式里写死 Z 时
+#   截到 19 位就已经没有 Z 可对上——首版就是这么错的（ValueError⇒走 || echo 9999 兜底
+#   ⇒每天推一条"演练调度疑似死了"的假告警，两周后通知被关掉，探测器自己变成噪声源）。
+#   解析失败必须显式判成"这一腿没有读数"（哨兵取 unparsable 而不是一个大数——
+#   真等了那么久的留档本来就该判超龄，让两种情况共用一个数就是把"读不出"冒充成"读数"）。
+t=datetime.datetime.strptime(sys.argv[1][:19],"%Y-%m-%dT%H:%M:%S")
+print((datetime.datetime.utcnow()-t).total_seconds()/86400)
+PYAGE
+)"
+  if [ "$age" = "unparsable" ]; then
+    # 留档存在但最新一行解析不出时间＝探测器读法坏了：如实报"读不出"，不报"超龄"。
+    log "${label} freshness=UNPARSABLE（record=${rec} line=${last:-?}）——判读法坏了而不是调度死了"
+    alert "quant ${label} 新鲜度探针读不出时间戳" "留档最新一行没有可解析的 ts 字段：${rec}。这条探测器的判据已失效，请先修读法再谈调度。" medium
+    return 0
+  fi
+  log "${label} freshness=${age%.*}d last_result=${res:-?} max=${max_days}d record=${rec}"
+  if awk "BEGIN{exit !($age > $max_days)}" 2>/dev/null; then
+    alert "quant ${label} 调度疑似死了" "最近一次留档已 ${age%.*} 天（>${max_days} 天）。查：launchctl list | grep ${label}、安装：${hint}" medium
+  fi
+  return 0
+}
+
+# 演练：每周日 09:00 一次 ⇒ 7 天 + 2 天余量。
+record_freshness "drill(com.quant.drill)" \
+  "${DRILL_RECORD:-$HOME/backups/quant/drill_record.jsonl}" \
+  "${DRILL_MAX_AGE_DAYS:-9}" \
+  "./deploy/mac/install_mac_drill_agent.sh -Apply -Kick（每周日 09:00 跑 verify_restore.sh，每次一行 JSON 读数）"
+
+# 夜间验收：每天 09:20 一次 ⇒ 2 天余量（周日机器睡着错过一次，第二天唤醒补跑就不该吵）。
+record_freshness "nightly(com.quant.nightly)" \
+  "${NIGHTLY_RECORD:-$HOME/backups/quant/nightly_record.jsonl}" \
+  "${NIGHTLY_MAX_AGE_DAYS:-2}" \
+  "./deploy/mac/install_mac_nightly_agent.sh -Apply -Kick（每日 09:20 跑广州夜间研究七腿验收，每次一行 JSON 读数）"
+
 log "=== 备份成功 ==="
 SNAPS="$(restic -r "$REPO_LOCAL" snapshots --short 2>/dev/null | tail -1)"
 alert "quant 异地备份完成" "Mac 仓库最新快照: $SNAPS" low

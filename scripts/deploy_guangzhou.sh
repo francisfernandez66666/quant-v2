@@ -347,7 +347,14 @@ BACKUP_DIR="${DEPLOY_DIR}/deploy/qmt-win"
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $BACKUP_DIR | Out-Null\""
 ps1_bom deploy/qmt-win/backup_snapshot.ps1
 ps1_bom deploy/qmt-win/register_backup_task.ps1
+# §0929SECKEY-A：快照/口令权限收敛器随本步下发，但**不在部署链里执行**（与 §0929⑪-1 同姿势：
+#   运维执行体入清单只解决"仓库改了现网拿不到"，真收敛属现网手工动作，要人在场看回滚凭证）。
+#   为什么必须进清单：09-23 §P0-B 的教训正是"修好的脚本躺在仓库、现网跑旧版"；权限面同理——
+#   若这个脚本只能靠人从仓库复制粘贴上机，它就会和 backup_snapshot.ps1 不同源，收敛一次后
+#   下次快照新增目录又回到裸态。判红由 verify 第 31 探针负责（白名单外 ACE 存在即红）。
+ps1_bom deploy/qmt-win/harden_snapshot_acl.ps1
 $SCP deploy/qmt-win/backup_snapshot.ps1 deploy/qmt-win/backup_snap.py deploy/qmt-win/register_backup_task.ps1 \
+     deploy/qmt-win/harden_snapshot_acl.ps1 \
      "${GZ_USER}@${GZ_IP}:${BACKUP_DIR}/"
 $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${BACKUP_DIR}/register_backup_task.ps1 -ScriptPath ${BACKUP_DIR}/backup_snapshot.ps1" \
   || echo "  [!] 快照计划任务注册未通过（退出码非 0）——前后端发布不受影响，但 §P0-B 灾备尚未生效：按 RUNBOOK_LIVEBACKUP.md §2 处理后重跑本步即可"

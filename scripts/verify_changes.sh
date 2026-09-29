@@ -2653,16 +2653,17 @@ for fn in SgInc SgTop; do
 done
 # ⑧ INFO 是观测通道不是判据通道：bash 侧只 echo、不进 PASS/FAIL 计数（判数口径见 verify_deploy 头注）。
 #    一旦有人把 INFO 接成 PASS，绿的数量就会凭空增长，而红绿语义没变——这是最隐蔽的一种假绿。
-#    行数=5→6：逐文件空态/逐文件明细/当日聚合（§SIGNAL-DIST 原三条）+ 日历读数（§CAL-READOUT，
+#    行数=5→6→7：逐文件空态/逐文件明细/当日聚合（§SIGNAL-DIST 原三条）+ 日历读数（§CAL-READOUT，
 #    2026-09-26 owner 令新增第 27 探针的恒回显腿；§101 另有 INFO|cal_readout 在位锁）
 #    + 跌停闸现值读数（§A5-CURRENT，2026-09-26 深夜批第 28 探针；§101 ②b 有专属锁）
-#    + 成交额量纲抽检读数（§0929SCALE-⑩，2026-09-29 批第 30 探针；§106 有 INFO|amount_scale_readout 在位锁）。
-#    本仓纪律：**新增 INFO 腿必须与这条计数锁同日同步**（09-26 的 4→5、09-29 的 5→6 都是这么走的），
+#    + 成交额量纲抽检读数（§0929SCALE-⑩，2026-09-29 批第 30 探针；§106 有 INFO|amount_scale_readout 在位锁）
+#    + 快照目录 ACL 读数（§0929OPS-⑪-3，2026-09-29 深夜批第 31 探针；§107 有 INFO|snapshot_acl_readout 在位锁）。
+#    本仓纪律：**新增 INFO 腿必须与这条计数锁同日同步**（09-26 的 4→5、09-29 的 5→6、同日晚的 6→7 都是这么走的），
 #    否则计数锁会在别人加观测腿时判红——那是好事，前提是红项能一眼看出该同步哪一条，故枚举必须写全。
 grep -qF 'INFO\|*) echo' "$VD" \
 	|| { echo '--- FAIL: bash 侧 INFO 分支丢失（观测读数会被当成未知行，或被误接进 PASS/FAIL 计数）'; exit 1; }
 infop=$(grep -c 'Write-Output ("INFO|' "$VD" || true)
-[ "$infop" = "6" ] || { echo "--- FAIL: INFO 观测行数不是 6（逐文件空态/逐文件明细/当日聚合/日历读数/跌停闸现值/成交额量纲抽检，计数=${infop}）"; exit 1; }
+[ "$infop" = "7" ] || { echo "--- FAIL: INFO 观测行数不是 7（逐文件空态/逐文件明细/当日聚合/日历读数/跌停闸现值/成交额量纲抽检/快照 ACL 读数，计数=${infop}）"; exit 1; }
 # ⑨ 负锁：本探针不得用 `| Out-String` 读 JSON 字段（PS 控制台按 120 列折行会劈开值，§N-5 的教训本体；
 #    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
 grep -qF '([string]$sgJson.trading_day)' "$VD" \
@@ -4676,7 +4677,7 @@ for f in outbox_admin.py register_service.ps1 all_service_watchdog.ps1 daily_ops
 done
 eq106 scripts/verify_deploy_guangzhou.sh '第 29 探针' 5 '⑪-1 第 29 探针五处同源（头部清单/可调项说明/变量定义/param 注释/正文段）'
 eq106 scripts/verify_deploy_guangzhou.sh '第 30 探针' 3 '⑩ 第 30 探针三处同源（头部清单/param 注释/正文段）'
-eq106 scripts/verify_deploy_guangzhou.sh '^Probe ' 25 '⑩⑪ 后 PS 侧行首探针语句数（新增探针须先重跑预演再改这里的数）'
+eq106 scripts/verify_deploy_guangzhou.sh '^Probe ' 26 '⑩⑪＋§107 后 PS 侧行首探针语句数（第 31 探针快照 ACL 入列 25→26；新增探针须先重跑预演再改这里的数）'
 eq106 scripts/verify_deploy_guangzhou.sh 'amount-check' 3 '⑩ 现网只读抽检调用链（注释 2 处 + 实调用 1 处）'
 # INFO 恒回显在位锁：绿也要看得到抽检读数（摘掉这条＝量纲只在红的时候才留痕，观察面退回自证）。
 # 与 §101 的 INFO|cal_readout / INFO|limitdown_readout 两把同姿势；摘掉即 §88 计数锁同时判红。
@@ -4782,8 +4783,8 @@ leg106() { # $1=说明 $2=包 $3=-run 正则
 	}
 	echo "ok - §106 行为腿 $1"
 }
-# 三件套等值闸：路由表条目数 == DefaultAlertRules 条数（本批 15→18 必须两侧同批动）
-leg106 'metrics 路由覆盖全规则（18 条）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
+# 三件套等值闸：路由表条目数 == DefaultAlertRules 条数（本批 15→18，§107 再 +1＝19，两侧同批动）
+leg106 'metrics 路由覆盖全规则（19 条）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
 leg106 'engine 零信号心跳（判据/成对反证/非实盘不落笔/接线）' ./internal/engine/ \
 	'TestSignalHeartbeatAgePredicate|TestFeedSignalHeartbeatZeroAndPinnedPair|TestFeedSignalHeartbeatNonLiveDoesNotWrite|TestSignalHeartbeatRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
 leg106 'trading 已实现盈亏心跳（配对/孤儿卖出/非实盘不落笔/键名对齐）' ./internal/trading/ \
@@ -4809,8 +4810,410 @@ printf '%s\n' "$PV" | grep -q 'C:/var/lib/quant-trading-v2' \
 bash -n scripts/restore_drill.sh || { echo "--- FAIL: §106 恢复演练脚本语法不过"; exit 1; }
 echo "ok - §106 行为腿 8 组 + 离线自证 4 条通过"
 
-echo ""
-echo "==> 全部通过"
+# ════════════════════════════════════════════════════════════════════════════
+# §107 §0929 晚批：恢复演练**首次挂调度真跑**锤实的三条缺陷（DRILL-A/B/C）+ 两条
+#     「有脚本无调度」收编（演练本体 / 夜间验收）+ 休市日增量心跳 + 快照目录权限收敛
+#
+# 这一段的主题不是"新功能没锁"，而是**三条写得看起来很完整的判据，一次都没真跑过**：
+#   DRILL-A（读法坏）：verify_restore.sh 用 restic snapshots --json --last 1 取最新快照。
+#     本机 restic 0.19.1 把 --last 判废弃、并把它后面的 "1" 当成**快照 ID 前缀**去过滤
+#     ⇒ 恒返回空数组且 rc=0 ⇒ 演练永远报"仓库里没有快照"。修法是不过滤、按 time 自己排序，
+#     并且**不赌 --latest**（那只在更新版本有，两个都在外部命令上赌版本＝下次升级再坏一次）。
+#   DRILL-B（顺序坏）：backup_snapshot.ps1 原先把 SNAPSHOT_OK 写在 restic backup **之后**
+#     ⇒ 每一份快照装的都是**上一夜**的标记 ⇒ 异地那份的自我描述恒定晚一个世代，
+#     新鲜度判据在完全健康的备份链上也必然超龄（09-29 23:45 实跑读数 age=66h > 54h 就是它）。
+#     同批把阈值按布局分流（目录模式 30h / restic 模式 54h，restic 多容忍一个标记世代），
+#     并给 Mac 拉取腿加第二个时点 10:30（广州实际收工在 05:20~08:19 之间浮动，07:00 那次常赶上）。
+#   DRILL-C（断言坏）：restore_drill.sh 要求"每个账号目录都有 paper.json"。现网实测是
+#     4 个账号目录、只有主账号有 paper.json、另有两个是空目录——paper.json 是"这个账号做过
+#     纸面交易"的**结果**，不是"账号存在"的凭证。重写为四条各防一件事：递归文件数>0、
+#     与 SNAPSHOT_OK.accounts_files **等值**、至少一个 paper.json、其余逐账号打 INFO。
+#   外加本批新装的两条定时腿（演练/夜间验收）与"死调度探测器"（record_freshness 单实现两消费者）。
+#   锁面预演时又锤出一条**前提缺陷**（DRILL-D，见下面别名那组锁）：ssh -G 对未配置的别名
+#   不会失败，它把别名本身当 hostname 原样回显 ⇒ "派生不出主机名就判红"恒不触发。
+#
+# 预演读数（09-29 23:5x ~ 09-30 00:1x，逐条实测后才入段）：
+#   verify_restore.sh 执行行 --last=0、snapshots --json 取法=1、按 time 排序=2、short_snapshot_id=2；
+#   backup_snapshot.ps1 SNAPSHOT_OK 落盘=2、成功标记行 284 < restic backup 行 286；
+#   阈值三处：30/54 分流=1、透传给演练=1、演练默认 30=1；
+#   com.quant.backup.plist Hour=2（7/10 各 1）、安装器 HOUR_LINES 锁=3；
+#   restore_drill.sh accounts_files=5、PAPER_TOTAL=4、旧 MISSING 形态=0；
+#   restic_pull_backup.sh record_freshness 定义=1 调用=2、两个 *_MAX_AGE_DAYS 各=1；
+#   run_nightly_verify.sh alias_declared 定义=1、预览腿=1、实跑腿=1、两条判红文案各=1；
+#   心跳四件套：规则名=1、路由=1、SetGauge 字面赋值点=2、接线=1、const 别名=0；
+#   deploy_guangzhou.sh harden_snapshot_acl=2（BOM 归一 + 上传清单，无 -File 执行行）、
+#   verify_deploy 第 31 探针=6、INFO|snapshot_acl_readout=1、加固器 Protect-Dir/Protect-Pass 各=2、
+#   ACL_RESULT ok=true=2 / ok=false=1、[switch]$Apply=1；
+#   口令脚本 PASS_VALUE=5、执行态 chmod 600=2（另有 1 处命中在说明注释里，故等值锁锚行首并配
+#   umask 077=1 那枚独立锁；上一版把注释也算进"三处收口"，反证时才暴露：计数里混注释的等值锁
+#   删掉真 chmod 仍能靠注释凑数，且文案谎称"含目录收口"而目录侧其实是 umask）、echo 口令值=0；
+#   deploy/mac 全部 .sh/.plist 的字面 IPv4=0；plist 模板派生数=3。
+# 逐枚镜像反证（09-30 00:2x~00:5x，harness=/tmp/cp107/run_counterproof.py，主仓零改动）：
+#   **57 枚破坏全部 RED 且 FAIL 编号与本枚指定的锁编号逐一对上（NOT-AS-EXPECTED=0，跑完复位自检 GREEN）**
+#   ——覆盖静态锁 1~55 全面（含 19 的两形态：安装器改名 / plist 指到仓里没有的被调脚本；
+#   55 的两形态：glob 失效使待扫清单=1 / 调度链塞字面 IP）。反证过程又锤出三枚 harness 自身的雷，
+#   记下来是因为它们与本仓的假绿形态同源，下一批写 harness 时一定会再踩：
+#     ① **按文件清单复原镜像 ≠ 复位**：v1 用「reset_file 逐文件从主仓 cp 回来」清场，可改名/挪走类
+#        破坏（把三个 plist 改成 *.moved、把安装器改名）根本不在清单的覆盖面上，残留一路冒充后面
+#        20 枚的归属（全报成"派生正锁 18 咬住了"，实际是上一枚的残渣）。v2 改成**每枚之前整体重建
+#        镜像**，并在最后跑一次复位自检——复位不自证绿，这一轮结果就作废。
+#     ② **首红即退 ⇒ 破坏必须挑"本枚独有"的形态**：往 deploy 链里追加一条 `-File …harden_snapshot_acl`
+#        确实该红，但它先撞在"两处同源"计数锁（40）上，归属就错了；同样把口令脚本的 chmod 从注释里
+#        改红也算不到执行态那两枚上。改成**整行替换 / 锚在行首**，让前一枚保持绿。
+#     ③ **改名式破坏若保留原锚前缀＝恒绿**：`dimNaMode`→`dimNaModeV2` 在子串计数的等值锁下毫无变化
+#        （这一枚第一轮就是 STAYED-GREEN）；`snapshots --json`→`snapshots --json=1` 同形。判据锁的
+#        锚是"连续子串"，破坏也必须打断这段连续子串才叫反证（与 §标识符锁被子串命中 同族）。
+#     ④ 顺带把一枚**锁面自身**的缺陷改了：`chmod 600` 等值锁原写 3 处，第三处命中其实是文件头注释，
+#        而文案谎称"含目录收口"（目录侧其实是 `umask 077`）。改为行首锚 2 处 + `umask 077` 独立一枚，
+#        两段各防一件事；这属于"计数锚里混注释"的通用形态，别处新增计数锁前先确认命中行全是执行态。
+#   还有两枚是**破坏方自己写错**（不是锁失明）：plist 时点块定位一开始按"文件里第一次出现
+#   StartCalendarInterval"找，命中的是文件头注释 ⇒ 把 ProgramArguments 数组当成了时点数组，恒找不到
+#   Hour=10 那块（反证 harness 与门禁共享同一个"注释混进锚"的雷）。
+# 同步项（本批把「加一条腿必须同日同步计数锁」这条纪律又走了一遍，三处）：
+#   §106 行首 Probe 25→26（第 31 探针入列）、§106 行为腿文案「路由覆盖全规则（18 条）」→19 条
+#   （休市日心跳是第 19 条规则，两侧同批动）、§88 INFO 观测行 6→7（快照 ACL 读数腿）。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 107 §0929 恢复演练三条真缺陷 + 定时腿收编 + 休市日心跳 + 快照权限 静态锁与行为腿..."
+
+CNT107=0
+has107() {
+	CNT107=$((CNT107 + 1))
+	grep -q -- "$2" "$1" || { echo "--- FAIL: §107 锁 ${CNT107}（$3）：${1} 缺「$2」"; exit 1; }
+}
+eq107() {
+	CNT107=$((CNT107 + 1))
+	local got
+	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §107 等值锁 ${CNT107}（$4）：${1} 模式「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+absent107() {
+	CNT107=$((CNT107 + 1))
+	local got
+	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §107 负锁 ${CNT107}（$3）：${1} 又出现「$2」got=${got}"; exit 1; }
+}
+# absent_code107：只在**执行行**上判红的负锁。为什么不能沿用 absent107：本批 --last 这一条
+# 恰恰要求注释里**保留**踩坑原文（含 restic 的报错行），否则下一个人"顺手加回来"时没有证据。
+# 说明注释命中负锁＝误伤（本仓教训），所以先剥掉以 # 开头的行再计数。
+absent_code107() {
+	CNT107=$((CNT107 + 1))
+	local got
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -c -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §107 执行行负锁 ${CNT107}（$3）：${1} 的非注释行里出现「$2」got=${got}（注释里保留成因是允许的，执行行不行）"; exit 1; }
+}
+# line_before107：先后顺序锁。本批 DRILL-B 的整个成因就是"两行语句的相对顺序"，
+# 用存在性锁（两段都在文件里）对此完全失明——把它们换个位置照样全绿。
+line_before107() { # $1=文件 $2=应在前的模式 $3=应在后的模式 $4=说明
+	CNT107=$((CNT107 + 1))
+	local a b
+	a=$(grep -n -- "$2" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	b=$(grep -n -- "$3" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	{ [ -n "$a" ] && [ -n "$b" ]; } || { echo "--- FAIL: §107 先后锁 ${CNT107}（$4）：${1} 里两段的锚点没都找到 first=${a:-?} second=${b:-?}"; exit 1; }
+	[ "$a" -lt "$b" ] || { echo "--- FAIL: §107 先后锁 ${CNT107}（$4）：${1} 里「$2」在第 ${a} 行、已不早于「$3」第 ${b} 行（顺序一倒，每份快照装的标记就都是上一夜的）"; exit 1; }
+}
+
+VR=deploy/mac/verify_restore.sh
+RD=scripts/restore_drill.sh
+BS=deploy/qmt-win/backup_snapshot.ps1
+PB=deploy/mac/com.quant.backup.plist
+PN=deploy/mac/com.quant.nightly.plist
+PD=deploy/mac/com.quant.drill.plist
+RN=deploy/mac/run_nightly_verify.sh
+RW=deploy/mac/run_drill_weekly.sh
+RP=deploy/mac/restic_pull_backup.sh
+
+# ── DRILL-A：restic 快照读法（不得回到在外部命令上赌版本标志）──
+absent_code107 "$VR" '--last' 'DRILL-A --last/--latest 都不得出现在执行行（0.19.1 把 --last 改写成 ID 前缀过滤⇒恒空且 rc=0；--latest 未在本机验证过，取向是不赌版本）'
+eq107 "$VR" 'restic -r "$REPO" snapshots --json' 1 'DRILL-A 取快照的形态：不过滤、整份 JSON 自己排（摘掉＝退回按标志过滤）'
+eq107 "$VR" 'key=lambda s: s.get("time","")' 2 'DRILL-A 按 time 排序取最新（id 腿 + ts 腿各一处，少一处＝两腿读的不是同一份快照）'
+eq107 "$VR" 'short_snapshot_id' 2 'DRILL-A 短 ID 优先、缺失回退完整 ID（成因注释 1 + 代码 1）'
+
+# ── DRILL-B：标记必须在打包之前落盘 + 阈值按布局分流 + 拉取腿双时点 ──
+line_before107 "$BS" '$marker | ConvertTo-Json' 'Invoke-Restic @("backup"' 'DRILL-B 成功标记写在 restic backup **之前**（这条是"快照自我描述晚一个世代"的唯一成因）'
+eq107 "$BS" 'Set-Content -Path (Join-Path $SnapRoot "SNAPSHOT_OK")' 2 'DRILL-B SNAPSHOT_OK 两个落笔点（成功 ok:true / 失败 ok:false，少一个就有一侧没人写标记）'
+eq107 "$VR" 'echo 30 || echo 54' 1 'DRILL-B 阈值按布局分流在位（目录模式 30h / restic 模式 54h；写死一个数＝另一模式永远错判）'
+eq107 "$VR" 'SNAP_MAX_AGE_HOURS="$SNAP_MAX_AGE_HOURS"' 1 'DRILL-B 阈值真的透传给 restore_drill.sh（09-29 23:45 实测：透传缺失时演练按默认 30h 判，读数冒充 54h）'
+eq107 "$RD" '${SNAP_MAX_AGE_HOURS:-30}' 1 'DRILL-B 演练侧默认值同源 30h（改一侧不改另一侧＝手工跑与定时跑两套口径）'
+eq107 "$PB" '<key>Hour</key>' 2 'DRILL-B 拉取腿双时点（07:00 + 10:30；广州实际收工 05:20~08:19 浮动，单时点会整代赶不上）'
+eq107 "$PB" '<integer>7</integer>' 1 'DRILL-B 第一个时点 07 在位且只一次'
+eq107 "$PB" '<integer>10</integer>' 1 'DRILL-B 第二个时点 10 在位且只一次（半改模板＝只加一个 Hour 时这里掉到 0）'
+eq107 deploy/mac/install_mac_backup_agent.sh 'HOUR_LINES' 3 'DRILL-B 安装器自带双时点前置锁（漏装＝plist 改坏也照样装上去）'
+
+# ── DRILL-C：accounts 断言按"要防的失效形态"重写，旧"每账号都有 paper.json"不得复活 ──
+eq107 "$RD" 'accounts_files' 5 'DRILL-C 等值腿的字段五处同源（说明/取产物数/取标记数/判红/回显/旧标记兜底）'
+eq107 "$RD" 'PAPER_TOTAL' 4 'DRILL-C "至少一个 paper.json"在位数腿（累加/判红/回显 + 初值）'
+has107 "$RD" '属正常形态' 'DRILL-C 无 paper.json 的账号打 INFO 而不是判红（不隐身，但也不误伤合法生产形态）'
+absent107 "$RD" 'MISSING' 'DRILL-C 旧"每账号缺 paper.json 即红"形态不得复活（现网实测 4 个账号只有 1 个有，那条断言在健康备份链上永远红）'
+
+# ── 定时腿派生锁：deploy/mac 下每个 launchd 模板都必须有同名安装器 + 仓内被调脚本 ──
+# 为什么用派生而不是写死三个文件名（§BOM-REPO-DERIVE 的教训直接搬过来）：
+#   上一批的仓库字节 BOM 锁就是因为"锁面=硬编码清单"，漏了 watchdog 那个文件整整一天，
+#   而现网被部署链就地补好了、git status 只显示 1 字节 M 被当噪声。清单式锁对**下一个**
+#   新增任务天生失明，所以这里从目录派生全集，并钉一枚"派生清单过短即红"的正锁。
+CNT107=$((CNT107 + 1))
+PLIST_N=$(ls -1 deploy/mac/com.quant.*.plist 2>/dev/null | wc -l | tr -d '[:space:]')
+[ "${PLIST_N:-0}" -ge 3 ] || { echo "--- FAIL: §107 派生正锁 ${CNT107}（deploy/mac 下 launchd 模板派生数=${PLIST_N}，<3＝派生模式失效或模板被挪走，下面这个循环会退化成恒绿空转）"; exit 1; }
+PAIR_MISS=""
+for p in deploy/mac/com.quant.*.plist; do
+	SHORT="$(basename "$p" .plist)"
+	SHORT="${SHORT#com.quant.}"
+	[ -f "deploy/mac/install_mac_${SHORT}_agent.sh" ] || PAIR_MISS="${PAIR_MISS} ${SHORT}(缺同名安装器)"
+	# plist 的 ProgramArguments 指的是**稳定副本**路径，这里只取脚本名回仓核对文件在不在；
+	# 副本没装是安装期的事，模板指向一个仓里都不存在的脚本才是设计期就该拦下的错。
+	SCRIPT_NAME="$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/p' "$p" | grep -o '[A-Za-z0-9_]*\.sh' | tail -1)"
+	[ -n "$SCRIPT_NAME" ] || PAIR_MISS="${PAIR_MISS} ${SHORT}(ProgramArguments 里找不到 .sh)"
+	[ -f "deploy/mac/${SCRIPT_NAME}" ] || PAIR_MISS="${PAIR_MISS} ${SHORT}(被调脚本 ${SCRIPT_NAME} 不在仓里)"
+done
+CNT107=$((CNT107 + 1))
+[ -z "$PAIR_MISS" ] || { echo "--- FAIL: §107 调度件配对锁 ${CNT107}：${PAIR_MISS}"; exit 1; }
+
+# ── 死调度探测器：一个判读函数、两个消费者（演练 + 夜间验收），不得写回两份近乎一样的解析 ──
+eq107 "$RP" 'record_freshness()' 1 '探测器定义唯一（两份并存的结局是只修一份，另一份继续读旧键名）'
+eq107 "$RP" '^record_freshness ' 2 '消费者恰好两个（drill / nightly；掉一个＝那条调度重新没人反查新鲜度）'
+eq107 "$RP" 'DRILL_MAX_AGE_DAYS' 1 '演练超龄阈值只在调用点出现一次（9 天＝周日一次 + 两天余量）'
+eq107 "$RP" 'NIGHTLY_MAX_AGE_DAYS' 1 '夜间验收超龄阈值只在调用点出现一次（2 天＝天天跑 + 一天余量）'
+
+# ── DRILL-D：别名前提（ssh -G 对未配置别名把别名本身当 hostname 回显 ⇒ "非空即通过"恒真）──
+eq107 "$RN" 'alias_declared()' 1 '别名点名判据单实现（预览腿与实跑腿共用，不许一个有一个没有）'
+eq107 "$RN" 'alias_declared ||' 1 '预览分支调用点名判据（安装期自检就拦下"别名压根不存在"）'
+eq107 "$RN" 'if ! alias_declared' 1 '定时分支调用点名判据（不拦＝每天拉起一次然后红在连接阶段）'
+eq107 "$RN" 'PREVIEW-FAIL alias-not-declared' 1 '预览分支判红文案（ASCII 锚，与 -Preview 协议同形）'
+eq107 "$RN" 'FAIL reason=alias-not-declared' 1 '定时分支判红文案（START 之前的 FAIL 也必须留档，否则探测器看不到这次跑过）'
+# 派生行在位 + **顺序**锁：点名判据必须在 ssh -G 派生之前。为什么不是负锁"不许有 ssh -G 派生"：
+# 派生本身是对的（仓库不许出现字面 IP），坏只坏在把"非空"当前提；把这两行的顺序倒回来，
+# 别名压根不存在时派生值仍是别名本身（非空），第二道判据看不出任何问题。
+eq107 "$RN" 'GZ_HOST="$(ssh -G' 1 'DRILL-D 派生腿在位且只一条（多条＝有人加回落路径）'
+line_before107 "$RN" 'if ! alias_declared' 'GZ_HOST="$(ssh -G' 'DRILL-D 点名判据先于派生（倒序＝自证绿复活）'
+
+# ── 休市日增量心跳（第 19 条规则）：三件套 + 接线 + 别名 ban，形态与 §DEADGAUGE 同形 ──
+eq107 internal/metrics/alerter.go 'Name: "signal_pinned_on_closed_day"' 1 '规则注册恰一条（重复登记会双推）'
+eq107 internal/metrics/alert_routing.go '"signal_pinned_on_closed_day":' 1 '路由表有条目（缺＝走默认路由，owner 改路由时被漏掉；本条必须 RouteDaily，长假全程破线走必推会刷满）'
+eq107 internal/engine/heartbeat.go 'SetGauge("signal_closed_day_pinned"' 2 '量规字面赋值点两处（休市日收案写 0 + 写真实读数），与 §69 通用守卫同形'
+absent107 internal/engine/heartbeat.go 'closedDayPinnedGaugeName' '键名 const 别名不得复活（别名＝§69 守卫失明，09-29 14:0x 判红实录）'
+eq107 internal/engine/heartbeat.go 'feedClosedDayPinnedGauge(now time.Time, tradingDay bool) {' 1 '喂数函数定义唯一（签名整串作锚：形参里有指针类型 *Engine，BRE 的 * 是量词，直接写 (e *Engine) 会恒 0 命中＝锁自己踩雷）'
+eq107 internal/engine/heartbeat.go 'e.feedClosedDayPinnedGauge(now, tradingDay)' 1 '接线在位（定义没接＝量规恒 0、规则恒不触发，而 §69 只看赋值点字符串看不见这件事）'
+word107() {
+	CNT107=$((CNT107 + 1))
+	local got
+	got=$(grep -cw -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "1" ] || { echo "--- FAIL: §107 整词锁 ${CNT107}（$3）：${1} 形态「$2」got=${got:-0} 预演=1"; exit 1; }
+}
+word107 internal/engine/heartbeat_test.go 'func TestClosedDayPinnedCountPair' '休市/开市成对反证用例在位'
+word107 internal/engine/heartbeat_test.go 'func TestSignalHeartbeatSaturdayIsNotAFault' '周六不该判故障的用例在位（反向误伤形态）'
+word107 internal/engine/heartbeat_test.go 'func TestSignalClosedDayRuleRegisteredAndKeyAligned' '休市日心跳三件套对齐用例在位'
+
+# ── 快照目录权限收敛 + restic 口令离线副本（⑪-3 的落码腿）──
+eq107 scripts/deploy_guangzhou.sh 'harden_snapshot_acl' 2 '加固器两处同源（BOM 归一 + 上传清单）＝只下发不自动执行'
+absent_code107 scripts/deploy_guangzhou.sh '\-File .*harden_snapshot_acl' '部署链不得自动执行加固器（ACL 收敛属于现网特权变更，必须 owner 当面跑预演看读数再 -Apply）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 '\[switch\]\$Apply' 1 '缺省只读预演（不带 -Apply 一个字节不改，与 rotate_qmt_token/decommission 家族同姿势）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'Protect-Dir' 2 '目录收敛实现（定义 + 调用）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'Protect-Pass' 2 '口令文件收敛实现（定义 + 调用）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'ACL_RESULT|ok=false' 1 '预演读数能判红（现网实测 outside>0 时这条命令必红；只回显数不判红就是"永远绿"的观测行）'
+eq107 scripts/verify_deploy_guangzhou.sh '第 31 探针' 6 '第 31 探针六处同源（头部清单/可调项/变量定义/param 注释/正文段/结果段）'
+has107 scripts/verify_deploy_guangzhou.sh 'INFO|snapshot_acl_readout' 'ACL 读数恒回显腿在位（绿也要看得到现网到底放开了哪些 SID）'
+eq107 scripts/backup_restic_pass_offline.sh 'PASS_VALUE' 5 '口令值只在"取一次→算指纹→落盘"链路里出现（多出的一行＝某处把它送进了输出）'
+absent_code107 scripts/backup_restic_pass_offline.sh 'echo.*PASS_VALUE' '绝不回显口令明文（本仓纪律：凭据只报长度与指纹）'
+eq107 scripts/backup_restic_pass_offline.sh '^chmod 600 ' 2 '离线副本两处执行态 chmod 600（临时文件 / 目标文件）。为什么锚在**行首**并写 2 而不是 3：本行上一版写的是「chmod 600」计数 3，第三处命中其实是文件头那句说明注释——计数锚里混注释＝有人删掉真 chmod 而注释还在时会误判，而注释本来就不该收进"执行处数"的等值里（本仓锁形要与判据同形）。目录侧不收口而是靠 umask 077（下面那枚锁管），所以文案不再谎称"三处 600 含目录"。'
+has107 scripts/backup_restic_pass_offline.sh 'umask 077' '落盘前的 umask 收口在位（离线副本目录权限靠这一条，不靠 chmod 600）'
+
+# ── 前端两格（因子/形态「不适用」+ 亚单位不再取整）与本批测试资产登记 ──
+eq107 web/src/pages/Signals.jsx '不适用' 7 '标注文案七处同源（判定注释/前置说明/口径注释/渲染与说明文本；改名＝说明与渲染不再同源）'
+eq107 web/src/pages/Signals.jsx 'dimNaMode' 2 '「两维同缺才算无四维」判定：定义 + 渲染各一处（单缺也标注＝把真四维漏键当不适用）'
+eq107 web/src/__tests__/signals_dim_cells_0929.test.jsx "it('H" 6 '本批前端六条腿逐名前缀在位（H1 取整反证 / H2 判定 / H3 旧口径必红 / H4-H6 挂载态）'
+
+# ── 新定时腿不得内嵌字面公网 IP（派生清单，与 §106 同族纪律）──
+CNT107=$((CNT107 + 1))
+IP_SCAN_N=0
+IP_HITS=0
+for f in deploy/mac/*.sh deploy/mac/com.quant.*.plist; do
+	IP_SCAN_N=$((IP_SCAN_N + 1))
+	IP_HITS=$((IP_HITS + $(grep -Ec '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' "$f" 2>/dev/null || true)))
+done
+[ "$IP_SCAN_N" -ge 10 ] || { echo "--- FAIL: §107 派生正锁 ${CNT107}（deploy/mac 待扫文件数=${IP_SCAN_N}，<10＝派生 glob 失效，这组锁会静默空转）"; exit 1; }
+[ "${IP_HITS:-0}" = "0" ] || { echo "--- FAIL: §107 负锁 ${CNT107}（Mac 侧调度链内嵌字面 IPv4，出口应只有 ssh 别名 gz）got=${IP_HITS} 扫描文件数=${IP_SCAN_N}"; exit 1; }
+
+echo "ok - §107 静态锁 ${CNT107} 道通过（含执行行负锁 3 枚 + 键名/形态负锁 3 枚 + 先后顺序锁 1 枚 + 派生正锁 2 枚 + 调度配对派生锁 1 枚）"
+
+# ── 行为腿（全部离线，零写入、零外呼）────────────────────────────────────────
+# 为什么这一段必须有**假产物**腿：DRILL-A/B/C 三条全都是"脚本写得完整但从没真跑过"，
+# 而静态锁只能证明字形在位，证明不了判据**按预期红/绿**。四条子腿各自摘掉一条硬判据必红，
+# 且正腿 (a) 用的是现网实测形状（4 个账号目录、1 个有 paper.json、2 个空目录）——
+# 这条子腿就是"恢复演练在健康备份链上被误判成红"那个形态的反证。
+FXROOT=$(mktemp -d /tmp/sec107_drill_XXXXXX)
+SNAP="$FXROOT/snap"
+mkdir -p "$SNAP/state" "$SNAP/accounts/u_main" "$SNAP/accounts/u_empty"
+python3 - "$SNAP/live.db" "$SNAP/trading.db" <<'PYFX'
+import sqlite3, sys
+# 四表各插一行：REQUIRE_NONEMPTY 默认 1，空表会被判红（那是对的），假产物就要供得上这条判据
+for p in sys.argv[1:]:
+    con = sqlite3.connect(p)
+    for t in ("real_positions", "orders", "fills", "real_account"):
+        con.execute("CREATE TABLE IF NOT EXISTS %s (id INTEGER)" % t)
+        con.execute("INSERT INTO %s VALUES (1)" % t)
+    con.commit()
+    con.close()
+PYFX
+[ -f "$SNAP/live.db" ] || { echo "--- FAIL: §107 行为腿搭建失败（python3 造不出 sqlite 假库，后面的判据无从谈起）"; exit 1; }
+printf '{"a":1}\n' > "$SNAP/state/auth.json"
+printf '{"rules":{}}\n' > "$SNAP/state/config.json"
+printf '{"x":1}\n' > "$SNAP/accounts/u_main/paper.json"
+printf '{}\n' > "$SNAP/accounts/u_main/messages.json"
+
+# 标记写入：$1=ts $2=accounts_files（ts 用**本机本地时间**，与 backup_snapshot.ps1 的 Get-Date 同口径；
+# 这里要是混进 UTC 串，本地 CST+8 会把年龄多算 8 小时，超龄腿就会以错的原因判红）
+fx_marker() {
+	printf '{"ok":true,"ts":"%s","dbs":{"live.db":123,"trading.db":45},"accounts_files":%s}' "$1" "$2" > "$SNAP/SNAPSHOT_OK"
+}
+fx_run() {
+	BACKUP_DIR="$SNAP" DRILL_DIR="$FXROOT/drill" ARTIFACT=guangzhou SNAP_MAX_AGE_HOURS=30 \
+		DRILL_RECORD="$FXROOT/record.jsonl" /bin/bash "$RD" >"$FXROOT/out.log" 2>&1
+	echo "$?"
+}
+TS_NOW=$(python3 -c 'import datetime;print(datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))')
+TS_OLD=$(python3 -c 'import datetime;print((datetime.datetime.now()-datetime.timedelta(hours=31)).strftime("%Y-%m-%dT%H:%M:%S"))')
+
+# (a) 正腿：现网同形 + 新鲜 + 计数一致 ⇒ 必须绿
+fx_marker "$TS_NOW" 2
+rc=$(fx_run)
+[ "$rc" = "0" ] || { echo "--- FAIL: §107 行为腿 a（现网同形的健康产物被判红 rc=${rc}，正是 DRILL-C 那个误伤形态复活了）"; tail -12 "$FXROOT/out.log"; exit 1; }
+echo "ok - §107 行为腿 a（假广州产物：1 个 paper.json + 空账号目录 + 计数等值 ⇒ 演练全绿）"
+# (b) 新鲜度腿：ts 超 31h > 阈值 30h ⇒ 必须红，且红在超龄这条上
+fx_marker "$TS_OLD" 2
+rc=$(fx_run)
+[ "$rc" != "0" ] || { echo "--- FAIL: §107 行为腿 b（31h 前的标记在 30h 阈值下仍判绿＝新鲜度腿恒绿）"; exit 1; }
+grep -q '广州快照过期' "$FXROOT/out.log" \
+	|| { echo "--- FAIL: §107 行为腿 b（红了但不是因为超龄，说明判据被别的腿先咬住，这条反证不可信）"; tail -6 "$FXROOT/out.log"; exit 1; }
+echo "ok - §107 行为腿 b（超龄标记 ⇒ 判红且红在新鲜度这条上）"
+# (c) 等值腿：标记说 99、产物实际 2 ⇒ 必须红（DRILL-C 重写后的②：半途/撕裂恢复会少文件而"非空"看不见）
+fx_marker "$TS_NOW" 99
+rc=$(fx_run)
+[ "$rc" != "0" ] || { echo "--- FAIL: §107 行为腿 c（accounts_files 与产物数不等仍放行＝等值腿是摆设）"; exit 1; }
+grep -q '≠ SNAPSHOT_OK.accounts_files' "$FXROOT/out.log" \
+	|| { echo "--- FAIL: §107 行为腿 c（红了但不是等值这条）"; tail -6 "$FXROOT/out.log"; exit 1; }
+echo "ok - §107 行为腿 c（标记与产物账号文件数撕裂 ⇒ 判红）"
+# (d) paper 在位腿：全体账号都没有 paper.json ⇒ 必须红（此时"非空"与"等值"两条都放行，红只能来自③）
+rm -f "$SNAP/accounts/u_main/paper.json"
+printf '{}\n' > "$SNAP/accounts/u_main/other.json"
+fx_marker "$TS_NOW" 2
+rc=$(fx_run)
+[ "$rc" != "0" ] || { echo "--- FAIL: §107 行为腿 d（模拟盘账本整条消失仍放行＝③没接上）"; exit 1; }
+grep -q '一个 paper.json 都没有' "$FXROOT/out.log" \
+	|| { echo "--- FAIL: §107 行为腿 d（红了但不是 paper 在位这条）"; tail -6 "$FXROOT/out.log"; exit 1; }
+echo "ok - §107 行为腿 d（paper.json 全体消失 ⇒ 判红）"
+# 留档腿：四次跑（含三次红）都要各写一行——定时链反查的就是这个文件
+FX_REC=$(grep -c . "$FXROOT/record.jsonl" 2>/dev/null || true)
+CNT107=$((CNT107 + 1))
+[ "${FX_REC:-0}" -ge 4 ] || { echo "--- FAIL: §107 留档锁 ${CNT107}（四次演练只留了 ${FX_REC:-0} 行；失败不留档＝死调度探测器看不到红过）"; exit 1; }
+echo "ok - §107 留档锁（四次跑各留一行，读数=${FX_REC}）"
+
+# (e) plist 结构腿：用 plistlib 读**运行时真值**，而不是 grep 字形（三张模板各自的
+#   Label / 稳定副本路径 / 时点都在这里核；Desktop 指进 ProgramArguments 会撞上
+#   launchd 的 TCC 静默失败形态，那是"每天定时、每天失败(126)"的成因，必须当场拦）。
+CNT107=$((CNT107 + 1))
+python3 - "$PN" "$PD" "$PB" <<'PYPL' || { echo "--- FAIL: §107 行为腿 e（三张 launchd 模板的结构判据没过，见上方逐条原因）"; exit 1; }
+import plistlib, sys
+bad = []
+want = {
+    "com.quant.nightly": ({"Hour": 9, "Minute": 20}, "run_nightly_verify.sh"),
+    "com.quant.drill": ({"Weekday": 0, "Hour": 9, "Minute": 0}, "run_drill_weekly.sh"),
+    "com.quant.backup": ([{"Hour": 7, "Minute": 0}, {"Hour": 10, "Minute": 30}], "restic_pull_backup.sh"),
+}
+for path in sys.argv[1:]:
+    with open(path, "rb") as f:
+        d = plistlib.load(f)
+    label = d.get("Label")
+    if label not in want:
+        bad.append(f"{path}: Label={label} 不在预期三张之内")
+        continue
+    sched, script = want[label]
+    args = d.get("ProgramArguments") or []
+    if len(args) != 2 or args[0] != "/bin/bash" or not str(args[1]).endswith("/" + script):
+        bad.append(f"{label}: ProgramArguments={args}（应为 /bin/bash + 稳定副本/{script}）")
+    if "Desktop" in " ".join(str(a) for a in args):
+        bad.append(f"{label}: 稳定副本指到 Desktop（launchd 读不到 TCC 保护目录，会每天静默失败 126）")
+    if str(args[1]).find("/backups/quant/") < 0:
+        bad.append(f"{label}: 副本不在 ~/backups/quant/ 下（定时腿必须走非保护目录）")
+    got = d.get("StartCalendarInterval")
+    if got != sched:
+        bad.append(f"{label}: 时点={got} 预期={sched}（backup 的双时点是 DRILL-B 收口 07:00 赶不上广州收工那条）")
+if bad:
+    for b in bad:
+        print("   " + b)
+    sys.exit(1)
+print("   plist 三张结构核对通过（Label/副本路径/时点均为运行时真值）")
+PYPL
+echo "ok - §107 行为腿 e（三张 launchd 模板结构 + 时点 + 非桌面副本）"
+
+# (f) 镜像树两半锁：演练与夜间两条定时腿都是"薄壳 + 被调脚本"两份，只装一半就是
+#   装上去一个永远找不到判据的任务（而定时触发的失败是静默的，只有日志里一行 FAIL）。
+MIRROR=$(mktemp -d /tmp/sec107_mirror_XXXXXX)
+mkdir -p "$MIRROR/scripts"
+cp "$RW" "$MIRROR/run_drill_weekly.sh"
+cp "$RN" "$MIRROR/run_nightly_verify.sh"
+cp "$RD" "$MIRROR/scripts/restore_drill.sh"
+mkdir -p "$MIRROR/deploy/mac" && cp "$VR" "$MIRROR/deploy/mac/verify_restore.sh"
+# 演练薄壳：镜像树缺 scripts/restore_drill.sh ⇒ 必须 rc=1 且红在 halved-mirror-tree 这条上
+rm -f "$MIRROR/scripts/restore_drill.sh"
+HOME="$MIRROR/home" LOG_DIR="$MIRROR/log" DRILL_RECORD="$MIRROR/rec.jsonl" \
+	/bin/bash "$MIRROR/run_drill_weekly.sh" >"$MIRROR/drill_half.log" 2>&1 && rc=0 || rc=$?
+[ "$rc" != "0" ] || { echo "--- FAIL: §107 行为腿 f（演练镜像树少一半还判绿＝稳定副本拍平没人拦）"; exit 1; }
+grep -q 'halved-mirror-tree' "$MIRROR/drill_half.log" \
+	|| { echo "--- FAIL: §107 行为腿 f（红了但不是「少一半」这条，说明拦下它的是别的原因）"; tail -6 "$MIRROR/drill_half.log"; exit 1; }
+echo "ok - §107 行为腿 f（演练镜像树缺一半 ⇒ 安装期/首跑即拦下）"
+# 夜间薄壳：预览分支缺被调脚本 ⇒ PREVIEW-FAIL missing-target，且**不写日志与留档**
+mkdir -p "$MIRROR/n2"
+cp "$RN" "$MIRROR/n2/run_nightly_verify.sh"
+"$MIRROR/n2/run_nightly_verify.sh" -Preview >"$MIRROR/nightly_half.log" 2>&1 && rc=0 || rc=$?
+[ "$rc" != "0" ] || { echo "--- FAIL: §107 行为腿 f2（夜间薄壳找不到被调脚本还能 rc=0）"; exit 1; }
+grep -q 'PREVIEW-FAIL missing-target' "$MIRROR/nightly_half.log" \
+	|| { echo "--- FAIL: §107 行为腿 f2（红了但不是 missing-target 这条）"; tail -6 "$MIRROR/nightly_half.log"; exit 1; }
+[ ! -f "$MIRROR/log/nightly_verify.log" ] || { echo "--- FAIL: §107 行为腿 f2（-Preview 写了日志——预览不该留下任何「今天跑过」的痕迹）"; exit 1; }
+echo "ok - §107 行为腿 f2（夜间薄壳缺被调脚本 ⇒ 预览判红且不落日志）"
+
+# (g) DRILL-D 别名前提腿：用**不存在的别名**跑预览 ⇒ 必须红在 alias-not-declared 上。
+#     这条腿的存在本身就是证据：旧写法（只看 ssh -G 非空）在这个输入下会**恒绿**
+#     ——ssh 把别名本身当 hostname 回显。这里不发任何网络请求（预览分支只打印命令）。
+cp scripts/verify_nightly_guangzhou.sh "$MIRROR/scripts/verify_nightly_guangzhou.sh"
+SSH_ALIAS=qzzz-not-a-real-alias "$MIRROR/run_nightly_verify.sh" -Preview >"$MIRROR/alias_leg.log" 2>&1 && rc=0 || rc=$?
+[ "$rc" != "0" ] || { echo "--- FAIL: §107 行为腿 g（未配置的别名通过预览＝DRILL-D 那条自证绿没修掉）"; exit 1; }
+grep -q 'PREVIEW-FAIL alias-not-declared' "$MIRROR/alias_leg.log" \
+	|| { echo "--- FAIL: §107 行为腿 g（红了但不是别名点名这条；若是 host-derive-empty 说明 ssh 行为变了，要重读成因）"; tail -6 "$MIRROR/alias_leg.log"; exit 1; }
+# 反向自证（这条就是"为什么必须点名"的数字证据）：未配置别名时 ssh -G 确实**返回非空**
+ECHO_HOST="$(ssh -G qzzz-not-a-real-alias 2>/dev/null | awk '/^hostname /{print $2; exit}')"
+[ -n "$ECHO_HOST" ] || { echo "--- FAIL: §107 行为腿 g 的前提说明失效（本机 ssh -G 对未配置别名不再回显主机名：说明成因已变，请重读本段并按新行为调整判据，别把这条直接删掉）"; exit 1; }
+echo "ok - §107 行为腿 g（未配置别名 ⇒ 点名判据拦下，且实测 ssh -G 对假别名仍回显非空主机名＝旧写法恒绿的证据）"
+rm -rf "$MIRROR" "$FXROOT"
+
+# (h) 语法腿：本批改过的 7 个 shell 件 + 2 个新件全部过 bash -n（派生清单，不写死文件名）
+CNT107=$((CNT107 + 1))
+SYN_N=0
+for f in deploy/mac/*.sh scripts/restore_drill.sh scripts/verify_nightly_guangzhou.sh; do
+	SYN_N=$((SYN_N + 1))
+	bash -n "$f" || { echo "--- FAIL: §107 语法锁 ${CNT107}（$f 语法不过，已扫 ${SYN_N} 个）"; exit 1; }
+done
+[ "$SYN_N" -ge 9 ] || { echo "--- FAIL: §107 派生正锁 ${CNT107}（语法腿只扫到 ${SYN_N} 个文件，glob 失效＝整段空转）"; exit 1; }
+echo "ok - §107 语法锁（派生扫到 ${SYN_N} 个 shell 件，全部 bash -n 通过）"
+
+# (i) Go 行为腿：休市日心跳纯函数 + 三件套对齐 + 接线
+#     （路由表↔规则表的等值闸 §106 已经跑过一条 leg106，同一条 go test 不在这里跑第二遍——
+#       门禁后半段本来就慢，重复跑只会把"哪条腿红了"变成两行同样的红）
+leg107() { # $1=说明 $2=包 $3=-run 正则
+	local out
+	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
+	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+		echo "--- FAIL: §107 行为腿判红（$1），全文如下："
+		printf '%s\n' "$out" | head -40
+		exit 1
+	fi
+	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+		echo "--- FAIL: §107 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
+		exit 1
+	}
+	echo "ok - §107 行为腿 $1"
+}
+leg107 'engine 休市日增量心跳（成对反证/周六不误伤/三件套对齐/接线）' ./internal/engine/ \
+	'TestClosedDayPinnedCountPair|TestSignalHeartbeatSaturdayIsNotAFault|TestSignalClosedDayRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
+echo "ok - §107 行为腿 9 组 + 派生/留档锁通过"
 
 echo ""
 echo "==> 全部通过"

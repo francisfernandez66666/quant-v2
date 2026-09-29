@@ -40,6 +40,36 @@ function d1Tag(s) {
   return [base, score, blocked].filter(Boolean).join('')
 }
 
+// §0929DIM2 四维格数值显示口径（owner 裁决：因子/形态战法本来没有四维，界面不撒谎也不隐藏）。
+// 为什么不是"换成因子名"：因子名/阈值/样本量根本没随信号下发，换成它们是空头承诺；
+// 为什么不是"整列隐藏"：D1~D4 在表里是**一个合并列**，隐藏会连坐四个真有四维的战法。
+// 这里只修两处真实误导：
+//   ① 过去四格一律 toFixed(0)——因子/形态格里的数是**原始强度值**（常落在 0~1），
+//      0.62 会被显示成 "0"，看上去像"这个维度 0 分"，比空着更坏（0 是个假事实）；
+//   ② 绝对值 ≤1 且非整数时按两位小数原样显示，整数（真四维分）保持取整不变。
+// English: dimension cells used to render every value with toFixed(0); factor/pattern cells carry raw
+// strength values around 0~1, so 0.62 displayed as "0" — a false zero. Sub-unit non-integers now keep
+// two decimals; real integer scores are unchanged.
+export function dimValueText(v) {
+  if (v == null) return '—'
+  if (Math.abs(v) <= 1 && !Number.isInteger(v)) return v.toFixed(2)
+  return v.toFixed(0)
+}
+
+// 该行的 D3/D4 是否属于"这个战法不出四维"（单键总述战法：因子/形态/做空系）。
+// 判据刻意取**说明文本**而不是战法名：战法名白名单会随新战法漂移，而"后端没给这两维依据"
+// 正是界面要如实说出来的那件事。D3、D4 同时无依据才算该战法无四维，只缺一格按缺依据处理，
+// 避免把"真四维战法漏了一个键"也打上"不适用"。
+// 另加一条前置：这一维**真有数字**才谈得上"不适用"——两个格子都没数（d3/d4 缺失）时打标注
+// 等于替用户猜战法类型，那属于"判据挑了不修也恒不命中的输入"同一个坑，直接不标。
+// English: no-four-dimension mode is decided by missing evidence text on BOTH d3 and d4 (not by a
+// strategy-name whitelist, which drifts); a single missing key on a real 4-dim tactic is not "不适用".
+// Rows carrying no number at all in these two cells are excluded — annotating them would be guessing.
+export function dimNaMode(row) {
+  if (!row || row.d3 == null || row.d4 == null) return false
+  return !row.d3_desc && !row.d4_desc
+}
+
 // 涨跌配色（红涨绿跌）
 function chgColor(v) {
   return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
@@ -379,31 +409,43 @@ export default function Signals() {
     },
 
     // D1-D4 维度评分列：四色标签（红/黄/蓝/绿）展示各维度分数与描述
+    // §0929DIM2：数值口径走 dimValueText（不再把 0~1 的原始强度值取整成 0），
+    // 单键总述战法（因子/形态/做空系）的 D3/D4 明确标注「不适用」并说明格子里是什么。
     {
       colKey: 'detail', title: 'D1/D2/D3/D4', minWidth: 220,
-      cell: ({ row }) => (
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-          {/* D1 事件维度（红） */}
-          <span title={'D1事件: ' + (row.d1_reason || row.d1_event || '无事件') + (row.d1_blocked ? '（负面拦截）' : '')}
-            style={{ color: 'var(--app-up)', background: 'rgba(227,77,89,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
-            {row.d1_score && (row.d1_reason || row.d1_event)
-              ? <em style={{ fontStyle: 'normal' }}>{d1Tag(row)}</em>
-              : (row.d1 != null ? row.d1.toFixed(0) : '—')}
-          </span>
-          {/* D2 龙头/动量维度（黄） */}
-          <span title={'D2: ' + (row.d2_desc || '')} style={{ color: 'var(--td-warning-color)', background: 'rgba(250,173,20,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
-            {row.d2 != null ? row.d2.toFixed(0) : '—'}{row.d2_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d2_desc)}</em>}
-          </span>
-          {/* D3 N形/结构维度（蓝） */}
-          <span title={'D3: ' + (row.d3_desc || '')} style={{ color: 'var(--app-accent)', background: 'rgba(79,195,247,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
-            {row.d3 != null ? row.d3.toFixed(0) : '—'}{row.d3_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d3_desc)}</em>}
-          </span>
-          {/* D4 基本面/回踩维度（绿） */}
-          <span title={'D4: ' + (row.d4_desc || '')} style={{ color: 'var(--app-down)', background: 'rgba(0,168,112,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
-            {row.d4 != null ? row.d4.toFixed(0) : '—'}{row.d4_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d4_desc)}</em>}
-          </span>
-        </div>
-      ),
+      cell: ({ row }) => {
+        const na = dimNaMode(row)
+        // 「不适用」只说明"这一维没有依据文本"，格子里那个数仍然如实留着（它对战法内部排序有意义，
+        // 抹掉会让这一行看起来像缺数据）。
+        const naTag = (
+          <em style={{ fontStyle: 'normal', color: 'var(--td-text-color-placeholder)' }}>不适用</em>
+        )
+        return (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+            {/* D1 事件维度（红） */}
+            <span title={'D1事件: ' + (row.d1_reason || row.d1_event || '无事件') + (row.d1_blocked ? '（负面拦截）' : '')}
+              style={{ color: 'var(--app-up)', background: 'rgba(227,77,89,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+              {row.d1_score && (row.d1_reason || row.d1_event)
+                ? <em style={{ fontStyle: 'normal' }}>{d1Tag(row)}</em>
+                : dimValueText(row.d1)}
+            </span>
+            {/* D2 龙头/动量维度（黄）：无依据文本时后端兜底板块名，故不打「不适用」 */}
+            <span title={'D2: ' + (row.d2_desc || '')} style={{ color: 'var(--td-warning-color)', background: 'rgba(250,173,20,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+              {dimValueText(row.d2)}{row.d2_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d2_desc)}</em>}
+            </span>
+            {/* D3 N形/结构维度（蓝） */}
+            <span title={na ? 'D3: 该战法不出四维评分，这里是它自己的原始强度值（无维度依据）' : 'D3: ' + (row.d3_desc || '')}
+              style={{ color: 'var(--app-accent)', background: 'rgba(79,195,247,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+              {dimValueText(row.d3)}{row.d3_desc ? <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d3_desc)}</em> : (na ? naTag : null)}
+            </span>
+            {/* D4 基本面/回踩维度（绿） */}
+            <span title={na ? 'D4: 该战法不出四维评分，这里是它自己的原始强度值（无维度依据）' : 'D4: ' + (row.d4_desc || '')}
+              style={{ color: 'var(--app-down)', background: 'rgba(0,168,112,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+              {dimValueText(row.d4)}{row.d4_desc ? <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d4_desc)}</em> : (na ? naTag : null)}
+            </span>
+          </div>
+        )
+      },
     },
 
     // 分时展开按钮列：点击展开/收起该信号个股的分时图

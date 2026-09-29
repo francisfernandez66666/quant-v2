@@ -152,6 +152,52 @@ check("L4.localStorage token 风险注释在位（§M12c 台账）", "§M12c" in
 
 for line in sorted(set()):
     pass  # no-op placeholder（保持尾部结构清晰）
+
+# ── L6 §0929 晚批：Mac 侧恢复/验收定时件 + 广州快照权限加固器的接线 ──────────────
+# 这一组锁的由来与 L3 同族：**执行体写好了但不在任何清单/调度上**，等于改了个没人跑的文件。
+# 09-29 一天里这条族被锤中两次（恢复演练本体、夜间验收），所以把"谁上传、谁定时跑、
+# 跑的是哪份副本"写成静态断言，而不是等下一次演练去发现"稳定副本只拷了一半"。
+hard = rd("deploy/qmt-win/harden_snapshot_acl.ps1")
+check("L6.deploy 清单收编快照 ACL 加固器（§0929OPS-⑪-3，只下发不自动执行）",
+      "harden_snapshot_acl.ps1" in dep
+      and not any(("harden_snapshot_acl" in ln and "-File" in ln) for ln in dep.splitlines()))
+check("L6.加固器缺省只读预演（[switch]$Apply 是唯一写闸）", "[switch]$Apply" in hard)
+check("L6.加固器预演能判红（outside>0 即 exit 1，不写永远绿的观测行）",
+      "ACL_RESULT|ok=false" in hard and "outsideTotal -gt 0" in hard)
+mac_pull = rd("deploy/mac/restic_pull_backup.sh")
+check("L6.死调度探测器单实现双消费者（record_freshness 定义 1 次、调用 2 次）",
+      mac_pull.count("record_freshness()") == 1 and len(re.findall(r"^record_freshness ", mac_pull, re.M)) == 2)
+check("L6.演练新鲜度阈值与夜间阈值各在位一次（9d/2d，两个数写一起就会互相掩盖）",
+      "DRILL_MAX_AGE_DAYS" in mac_pull and "NIGHTLY_MAX_AGE_DAYS" in mac_pull)
+vr = rd("deploy/mac/verify_restore.sh")
+check("L6.恢复演练不再赌 restic --last/--latest（0.19.1 把它当 ID 前缀过滤⇒恒空且 rc=0）",
+      not any("--last" in ln for ln in vr.splitlines() if not ln.strip().startswith("#")))
+check("L6.演练阈值按布局分流且真透传给 restore_drill（30h 目录 / 54h restic）",
+      'echo 30 || echo 54' in vr and 'SNAP_MAX_AGE_HOURS="$SNAP_MAX_AGE_HOURS"' in vr)
+bs = rd("deploy/qmt-win/backup_snapshot.ps1")
+i_mark = bs.find("$marker | ConvertTo-Json")
+i_bku = bs.find('Invoke-Restic @("backup"')
+check("L6.快照标记写在 restic 打包**之前**（倒序＝每份快照装的都是上一夜标记，异地永远超龄）",
+      i_mark >= 0 and i_bku >= 0 and i_mark < i_bku, f"marker={i_mark} backup={i_bku}")
+rd_drill = rd("scripts/restore_drill.sh")
+check("L6.演练 accounts 断言按失效形态重写（等值 + 至少一个 paper.json），旧'每账号都有'不得复活",
+      "accounts_files" in rd_drill and "MISSING" not in rd_drill)
+# plist ↔ 安装器配对：模板指的稳定副本脚本必须能在仓里找到，且不许指桌面（launchd TCC 静默 126）
+import glob as _glob
+plists = sorted(_glob.glob(os.path.join(root, "deploy/mac/com.quant.*.plist")))
+check("L6.launchd 模板派生非空（<3＝派生 glob 失效，配对锁会静默空转）", len(plists) >= 3,
+      f"count={len(plists)}")
+for pp in plists:
+    txt = open(pp, encoding="utf-8").read()
+    stem = os.path.basename(pp)[len("com.quant."):-len(".plist")]
+    short = os.path.relpath(pp, os.path.join(root, "deploy/mac"))
+    args_block = txt.split("<key>ProgramArguments</key>")
+    check(f"L6.{stem} 安装器同名在位", os.path.exists(os.path.join(root, f"deploy/mac/install_mac_{stem}_agent.sh")))
+    check(f"L6.{stem} ProgramArguments 不指桌面且指稳定副本",
+          len(args_block) == 2 and "Desktop" not in args_block[1] and "/backups/quant/" in args_block[1])
+rn = rd("deploy/mac/run_nightly_verify.sh")
+check("L6.夜间薄壳的别名点名判据在位且先于 ssh -G 派生（未配置别名时 ssh 会把别名本身当 hostname 回显）",
+      "alias_declared" in rn and rn.find("if ! alias_declared") < rn.find('GZ_HOST="$(ssh -G'))
 sys.exit(1 if fails else 0)
 PY
 )"

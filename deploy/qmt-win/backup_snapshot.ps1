@@ -258,16 +258,20 @@ try {
         if ($r2.code -ne 0) { throw ($label + " retry exit=" + $r2.code + ": " + ($r2.out -join ' ')) }
         return $r2
     }
-    Invoke-Restic @("backup", "-r", $RepoDir, $SnapRoot, "--tag", "nightly") "restic-backup" | Out-Null
-    # Transient relay retention (Mac keeps the long history): 3 days + 2 weeks.
-    Invoke-Restic @("forget", "--repo", $RepoDir, "--keep-daily", "3", "--keep-weekly", "2", "--prune") "restic-forget" | Out-Null
-    Remove-Item Env:RESTIC_PASSWORD_FILE
-
-    # 6) Marker for the Mac puller: freshness + per-db size + integrity + accounts file count.
-    #    db_bytes stays trading.db for backward compatibility (restic_pull_backup.sh today only
-    #    greps "ok":true); the dbs map makes "which databases actually got snapshotted, how big"
-    #    machine-checkable from the artifact itself — so the §P0-B cross-machine set equality can
-    #    be verified on the *product*, not only on the two scripts.
+    # 5b) Marker for the Mac puller: freshness + per-db size + integrity + accounts file count.
+    #     db_bytes stays trading.db for backward compatibility (restic_pull_backup.sh today only
+    #     greps "ok":true); the dbs map makes "which databases actually got snapshotted, how big"
+    #     machine-checkable from the artifact itself — so the §P0-B cross-machine set equality can
+    #     be verified on the *product*, not only on the two scripts.
+    #     §0929DRILL-B（2026-09-29 恢复演练**首次真挂调度真跑一次**锤实的顺序缺陷）：
+    #       这一段原本在 restic 之后，于是每一份快照里装的 SNAPSHOT_OK 都是**上一夜**那一份——
+    #       实录＝Mac 异地仓最新快照 e29aff27 的生成时间是 2026-09-28T05:18:45，它内部的标记 ts
+    #       却是 2026-09-27T05:26:35（正好差一代 24h）。后果不是"少一条日志"而是
+    #       **恢复演练在健康的备份链上也永远判红**：scripts/restore_drill.sh 的新鲜度判据读的是
+    #       产物内部的标记（默认 30 小时），周日 09:00 演练时它看到的是"前天"的标记（约 50~62h）。
+    #       这条从 §WS-A 写下演练脚本起就存在，只有把演练挂上调度才会暴露（有脚本无调度同族）。
+    #       顺序调换后标记与它所在的快照同源；restic 环节真失败时下方 catch 仍会把标记改写成
+    #       ok:false，所以"标记说 ok 而仓库里没有对应快照"这一态并不会因此新增。
     $marker = [ordered]@{
         ok          = $true
         ts          = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
@@ -278,6 +282,15 @@ try {
         repo        = "C:/var/lib/quant-restic-repo"
     }
     ($marker | ConvertTo-Json -Compress) | Set-Content -Path (Join-Path $SnapRoot "SNAPSHOT_OK") -Encoding ascii -NoNewline
+
+    Invoke-Restic @("backup", "-r", $RepoDir, $SnapRoot, "--tag", "nightly") "restic-backup" | Out-Null
+    # Transient relay retention (Mac keeps the long history): 3 days + 2 weeks.
+    Invoke-Restic @("forget", "--repo", $RepoDir, "--keep-daily", "3", "--keep-weekly", "2", "--prune") "restic-forget" | Out-Null
+    Remove-Item Env:RESTIC_PASSWORD_FILE
+
+    # （§0929DRILL-B：标记的写入已上移到 5b)「restic backup 之前」，这里只留收尾日志。
+    #   原来这一段在 restic 之后 ⇒ 快照里装的永远是**上一夜**的标记，恢复演练读产物内标记判新鲜度
+    #   就必然慢一代（详见 5b) 段注释）。**不要再把 5b) 那段搬回来。**）
     Log ("=== snapshot+restic done dbs=" + (($dbBytes.Keys | Sort-Object) -join ","))
     # 释锁在两个出口各写一次，不用 finally：`try 内 exit` 是否跑 finally 在 PS 各版本语义不一，
     # 而本文件没有 pwsh 可实跑验证——留一个"跑成功却不释锁"的锁，最坏会让下一夜白拒一次。
