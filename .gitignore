@@ -115,3 +115,6 @@ web/.auth/
 
 # 文件桥测试/运行期命令中转文件（qmt_gateway 测试在 cwd 落盘，非仓库资产）
 qmt_gateway/bridge_cmd.json
+
+# 静态资源（web/public/ 下的图片由构建产出，需入库；其余 png/jpg 不入库）
+!web/public/

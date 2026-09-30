@@ -175,8 +175,10 @@
 #   dataload 盘后保活：target 工作日回退、缺表安全弃权、三表全新鲜零调用短路、
 #   日线落后触发补数且池未到位不判成（unittest 4 组）
 #
-# §备案合规 + 生命周期接线（2026-09-15 §ICP + §GAP-P1）专项（见 8/8）：
+# §备案合规 + 生命周期接线（2026-09-15 §ICP + §GAP-P1；2026-09-30 增 §POLICE 公安备案）专项（见 8/8）：
 #   ICP 页脚       ：备案号常量（沪ICP备2026045551）+ 工信部外链 vitest；登录页/仪表盘两入口挂同一组件
+#   公安备案页脚    ：备案号常量（沪公网安备31011302009737号）+ beian.mps.gov.cn 查询页深链（号码数字派生，
+#                   不留第二处字面量）+ 本地托管警徽资源在位；vitest 与 Playwright 两条腿各自登记
 #   衰退降级接线  ：PoolDailyStats 分池逐日聚合（strategy_type 池键修复）+ DemoteAppliedRules
 #                  禁用落库/dry-run/无观测保守 keep（TestPoolDailyStats|TestDemoteAppliedRules 3 组）
 #                  + stepTask lifecycle 映射与默认 Steps 含 lifecycle（TestLifecycleStepMapped）
@@ -271,10 +273,20 @@ go test -count=1 ./cmd/research/ -run 'TestRiskBackfill' 2>&1 \
 py_tests qmt_gateway/tests/test_dataload_keepalive.py 2>&1 \
 	| grep -E "passed|failed|error|Ran [0-9]+ test|OK"
 
-echo "==> 8/8 备案合规 + 生命周期接线专项（2026-09-15 §ICP + §GAP-P1）..."
+echo "==> 8/8 备案合规 + 生命周期接线专项（2026-09-15 §ICP + §GAP-P1；2026-09-30 增 §POLICE）..."
 # ICP 备案号合规文案守护：常量改动即失败（管局备案文案，变更需先核对备案回执）
 grep -q '沪ICP备2026045551' web/src/components/IcpFooter.jsx && grep -q 'beian.miit.gov.cn' web/src/components/IcpFooter.jsx \
 	&& echo "ok - icp 备案常量在位" || { echo "FAIL - icp 备案常量缺失"; exit 1; }
+# 公安备案（2026-09-30 通过）文案守护：备案号 + 平台外链 + 本地警徽资源三件齐备才算在位
+grep -q '沪公网安备31011302009737号' web/src/components/IcpFooter.jsx && grep -q 'beian.mps.gov.cn' web/src/components/IcpFooter.jsx \
+	&& [ -s web/public/police-emblem.png ] \
+	&& echo "ok - 公安备案常量与警徽资源在位" || { echo "FAIL - 公安备案常量或警徽资源缺失"; exit 1; }
+# 深链同源锁：查询页的 code 参数必须由备案号派生（写死第二处号码＝改了号却仍跳旧记录，且不会有任何报错）
+grep -q 'code=${POLICE_CODE}' web/src/components/IcpFooter.jsx \
+	&& echo "ok - 公安备案深链由号码派生（无第二处字面量）" || { echo "FAIL - 公安备案深链未由 POLICE_CODE 派生"; exit 1; }
+# 验收腿登记锁：vitest 与 Playwright 两条腿都要真断言公安备案链接，只改组件不改腿＝合规没有验收
+grep -q 'police-link' web/src/__tests__/icp_footer.test.jsx && grep -q 'police-link' web/e2e/icp_check.spec.mjs \
+	&& echo "ok - 公安备案验收腿已登记（vitest + Playwright）" || { echo "FAIL - 公安备案验收腿缺失"; exit 1; }
 ( cd web && npm test -- icp_footer ) 2>&1 | grep -E 'Test Files|passed|failed'
 go test -count=1 ./internal/research/ -run 'TestPoolDailyStats|TestDemoteAppliedRules' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
