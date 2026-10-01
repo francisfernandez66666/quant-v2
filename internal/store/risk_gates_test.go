@@ -180,3 +180,43 @@ func TestCountBuyFilledOrdersByDayIgnoresUnfilledOrders(t *testing.T) {
 		t.Fatalf("2 笔已报未成交的报单不应占用笔数额度, got %d", got)
 	}
 }
+
+// TestSumBuyFilledAmountByDayForStrategy 按战法聚合已成交买入金额：signal_id 标准格式中的
+// stratKey（如 dragon/momentum/fac_1）用冒号边界精确匹配，短名不撞长名前缀。
+func TestSumBuyFilledAmountByDayForStrategy(t *testing.T) {
+	db := newRiskTestDB(t)
+	fills := []RealFill{
+		func() RealFill { f := fill("OA", "", "600001.SH", "买入", "2026-09-18 09:31:00"); f.SignalID = "buy:600001.SH:dragon_return:2026-09-18"; return f }(),
+		func() RealFill { f := fill("OB", "", "600002.SH", "买入", "2026-09-18 10:00:00"); f.SignalID = "buy:600002.SH:dragon_return:2026-09-18"; return f }(),
+		func() RealFill { f := fill("OC", "", "600003.SH", "买入", "2026-09-18 10:30:00"); f.SignalID = "buy:600003.SH:dragon:2026-09-18"; return f }(),
+		func() RealFill { f := fill("OD", "", "600004.SH", "买入", "2026-09-18 11:00:00"); f.SignalID = "buy:600004.SH:momentum:2026-09-18"; return f }(),
+		func() RealFill { f := fill("OE", "", "600005.SH", "买入", "2026-09-18 11:30:00"); f.SignalID = "buy:600005.SH:fac_1:2026-09-18"; return f }(),
+		func() RealFill { f := fill("OF", "", "600001.SH", "卖出", "2026-09-18 12:00:00"); f.SignalID = "sell:600001.SH:dragon:2026-09-18"; return f }(),
+	}
+	for i, f := range fills {
+		if err := db.ApplyRealFill(f); err != nil {
+			t.Fatalf("ApplyRealFill #%d: %v", i, err)
+		}
+	}
+	// 验证各战法归集金额正确（默认 amount=1000/笔）
+	got, _ := db.SumBuyFilledAmountByDayForStrategy("u_rg", "2026-09-18", "dragon_return")
+	if got != 2000 {
+		t.Fatalf("dragon_return expected=2000 got=%.0f", got)
+	}
+	got, _ = db.SumBuyFilledAmountByDayForStrategy("u_rg", "2026-09-18", "dragon")
+	if got != 1000 {
+		t.Fatalf("dragon expected=1000 got=%.0f", got)
+	}
+	got, _ = db.SumBuyFilledAmountByDayForStrategy("u_rg", "2026-09-18", "momentum")
+	if got != 1000 {
+		t.Fatalf("momentum expected=1000 got=%.0f", got)
+	}
+	got, _ = db.SumBuyFilledAmountByDayForStrategy("u_rg", "2026-09-18", "fac_1")
+	if got != 1000 {
+		t.Fatalf("fac_1 expected=1000 got=%.0f", got)
+	}
+	got, _ = db.SumBuyFilledAmountByDayForStrategy("u_rg", "2026-09-18", "pat_1")
+	if got != 0 {
+		t.Fatalf("pat_1 (no fills) expected=0 got=%.0f", got)
+	}
+}

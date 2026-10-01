@@ -645,6 +645,24 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 				filledAmt, frozen, sellProceeds, occupied, amount, cfg.DailyBudgetAmount)
 		}
 	}
+	// §STRATEGY_ALLOC 子闸 2b：每战法单日预算（可选；按 LiveOrder.StrategyID 精确匹配已成交金额）。
+	// 与全局闸2 正交——后者控"今天总共能花多少"，本闸控"每个战法今天最多能花多少"。
+	// 注意：仅对比已成交金额（filled），不对比 frozen 在途冻结（LocalBuyFrozen 无 strategy 维度）；
+	// 总冻结已由全局闸2保护，此处作为叠加守卫足够保守。
+	if cfg.StrategyAllocs != nil {
+		stratKey := resolveStratKeyForGate(o)
+		alloc, hasAlloc := strategyAllocFor(cfg, stratKey)
+		if hasAlloc && alloc > 0 {
+			filledByStrat, sErr := g.st.SumBuyFilledAmountByDayForStrategy(g.userID, today, stratKey)
+			if sErr != nil {
+				return fmt.Sprintf("查询战法资金分配: %v", sErr)
+			}
+			if filledByStrat+amount > alloc {
+				return fmt.Sprintf("战法[%s] 日预算不足: 今日已成交 %.0f + 本次 %.0f > 分配预算 %.0f",
+				stratKey, filledByStrat, amount, alloc)
+			}
+		}
+	}
 	// 闸3：近似可用资金闸（依赖 InitialCapital 配置；无本金口径时跳过）。
 	if cfg.InitialCapital > 0 {
 		// 券商账户快照 10 分钟内视为新鲜；新鲜时直接用券商口径，跳过本地近似估算。
@@ -747,4 +765,23 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 		}
 	}
 	return ""
+}
+
+// resolveStratKeyForGate 从 LiveOrder 派生 StrategyAllocs 匹配键。
+// 优先用 StrategyID（fac_1/pat_2），回退到显示名（如 "龙头"）。
+func resolveStratKeyForGate(o LiveOrder) string {
+	if o.StrategyID != "" {
+		return o.StrategyID
+	}
+	return o.Strategy
+}
+
+// strategyAllocFor 从 QMTConfig.StrategyAllocs 中查找指定策略的日预算。
+// 先按 exact key 查找，若未命中则空值=false（不限制）。
+func strategyAllocFor(cfg config.QMTConfig, key string) (float64, bool) {
+	if cfg.StrategyAllocs == nil {
+		return 0, false
+	}
+	v, ok := cfg.StrategyAllocs[key]
+	return v, ok && v > 0
 }

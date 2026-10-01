@@ -478,6 +478,18 @@ type QMTConfig struct {
 	// of the signal-side tier (P3, default on): this is the money path, so it stays conservative by default.
 	// 自动买谨慎层开关
 	AutoRiskCaution *bool `json:"auto_risk_caution,omitempty"`
+	// StrategyAllocs 每战法每日资金分配（元）：键=战法 ID / 战法名，
+	// 值=该战法单日可花费的最高预算额。未配置或 =0 时不限制该战法。
+	// Σallocs 不需要等于任何总额——总预算仍由 DailyBudgetAmount 控制；
+	// StrategyAllocs 只是"切蛋糕"：每个战法单独封顶，超出当日已花+本次即拒绝。
+	// 策略匹配顺序：先按 StrategyID（如 fac_1），回退到显示名（如 "龙头"）。
+	// 与 StrategyAmounts 正交：后者管"每次买多少"，前者管"今天这个战法最多能花多少"。
+	// English: per-strategy daily budget allocation (yuan); key=strategy ID/name, value=daily max
+	// spend for that strategy. Missing or zero means no cap (falls back to global). The sum of
+	// allocations does not need to equal any total — the overall budget is still controlled by
+	// DailyBudgetAmount. StrategyAllocs slices the cake: each strategy gets its own ceiling; if
+	// today's filled amount + this order exceeds the allocation, the buy is rejected.
+	StrategyAllocs map[string]float64 `json:"strategy_allocs,omitempty"`
 	// YellowPosScale Yellow 档买入金额缩放系数（默认 0.35，对齐状态机 range 档；0=用默认）。
 	// 实际系数优先取状态机 MaxPosPct（>0 时），否则回退本值。
 	// YellowPosScale buy-amount scale on Yellow (default 0.35, aligned with the range tier; the live

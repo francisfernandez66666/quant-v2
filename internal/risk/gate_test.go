@@ -805,3 +805,89 @@ func TestGateT1SellableCounterPriority(t *testing.T) {
 		t.Fatalf("⑥ 在途 200 占额度后可卖仅 100，150 必须拦, got %+v", v)
 	}
 }
+
+// TestGateBuyDisciplineSubGate2b 子闸2b：每战法日预算检查。
+// 核心语义：cfg.StrategyAllocs 设置各战法当日上限，超出后拒绝新买入；无配置或 =0 时不限制。
+func TestGateBuyDisciplineSubGate2b(t *testing.T) {
+	today := cntime.In(time.Now()).Format("2006-01-02")
+	date := today // trading day for signal IDs (YYYY-MM-DD)
+	db := gateDB(t)
+	g := NewGate(db, "u_sg2b", func(level, title, _ string) {})
+
+
+	// 种子数据：龙回头法一笔 1000 元成交，龙头法一笔 1000 元成交（均归属 u_sg2b）
+	for _, f := range []store.RealFill{
+		{OrderID: "O-DR1", Code: "600001.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:31:00", SignalID: "buy:600001.SH:dragon_return:" + date, UserID: "u_sg2b"},
+		{OrderID: "O-DR2", Code: "600002.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:32:00", SignalID: "buy:600002.SH:dragon:" + date, UserID: "u_sg2b"},
+	} {
+		if err := db.ApplyRealFill(f); err != nil {
+			t.Fatalf("ApplyRealFill seed: %v", err)
+		}
+	}
+
+	cfg := qmtCfg()
+	cfg.MaxPositions = 10 // 留足仓位空间
+	cfg.DailyBudgetAmount = 500000 // 全局预算足够大，不影响测试
+	// §WS-M seed real account so approximate cash gate does NOT block.
+	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_sg2b", AvailableCash: 500000, UpdatedAt: cntime.In(time.Now()).Format("2006-01-02 15:04:05")}); err != nil {
+		t.Fatalf("seed real account: %v", err)
+	}
+
+	// ① dragon 分配 2000 → 今日已有 1000，本次 500 → 1500 ≤ 2000 放行
+	cfg.StrategyAllocs = map[string]float64{"dragon": 2000}
+	o1 := liveOrder(SideBuy)
+	o1.StrategyID = "dragon"
+	o1.Amount = 500
+	v := g.CheckLiveOrder(cfg, o1)
+	if !v.Pass {
+		t.Fatalf("① 应为 PASS（alloc=2000, filled=1000, amount=500）, got %+v", v)
+	}
+
+	// ② dragon 分配 1500 → 1000+600=1600 > 1500 拒单
+	cfg.StrategyAllocs = map[string]float64{"dragon": 1500}
+	o2 := liveOrder(SideBuy)
+	o2.StrategyID = "dragon"
+	o2.Amount = 600
+	v = g.CheckLiveOrder(cfg, o2)
+	if v.Pass {
+		t.Fatalf("② 应为 FAIL（alloc=1500, filled=1000, amount=600→1600>1500）")
+	}
+	if !strings.Contains(v.Reason, "战法[dragon] 日预算不足") {
+		t.Fatalf("拒单理由应含策略名和日预算，got: %q", v.Reason)
+	}
+
+	// ③ momentum 未设分配 → 不限制（将龙头加入白名单以免 signalctl AdmitStrategy 拦截非内置键）
+	cfg.StrategyAllocs = map[string]float64{"dragon": 1500} // 只有 dragon 有设置
+	cfg.Strategies = []string{"龙头"}                       // 放行 liveOrder 默认显示名
+	o3 := liveOrder(SideBuy)
+	o3.StrategyID = "momentum"
+	o3.Amount = 99999
+	v = g.CheckLiveOrder(cfg, o3)
+	if !v.Pass {
+		t.Fatalf("③ momentum 无分配应放行, got %+v", v)
+	}
+
+	// ④ StrategyName 回退路径：用显示名而非 ID（需将"龙头"加入白名单，避免 signalctl AdmitStrategy 拦截）
+	cfg.StrategyAllocs = map[string]float64{"双响炮": 3000}
+	cfg.Strategies = nil // 空白名单走内置键判定
+	o4 := liveOrder(SideBuy)
+	o4.StrategyID = ""
+	o4.Strategy = "双响炮"
+	o4.Amount = 1000
+	v = g.CheckLiveOrder(cfg, o4)
+	if !v.Pass {
+		t.Fatalf("④ 显示名回退也应通过, got %+v", v)
+	}
+
+	// ⑤ fac_1 factor 战法精确匹配，不撞 fac_10（fac_ 前缀在 AdmitStrategy 空白名单下自动放行）
+	cfg.StrategyAllocs = map[string]float64{"fac_1": 5000, "fac_10": 5000}
+	cfg.Strategies = nil // 走内置键 + fac_/pat_ 前缀自动放行逻辑
+	// fac_1 无填充 → 放行
+	o5 := liveOrder(SideBuy)
+	o5.StrategyID = "fac_1"
+	o5.Amount = 1000
+	v = g.CheckLiveOrder(cfg, o5)
+	if !v.Pass {
+		t.Fatalf("⑤ fac_1 无填充应放行, got %+v", v)
+	}
+}

@@ -191,6 +191,8 @@ export default function Quant() {
 
   // 战法自定义金额输入（按 strategyId → 金额）
   const [amountsInput, setAmountsInput] = useState({})
+  // 战法日预算分配（按 strategyId → 元/日）
+  const [allocInput, setAllocInput] = useState({})
   // 配置加载失败提示：加载失败时表单停留在本地缓存值，若无提示用户会误把
   // 缓存当成服务器真实状态，误以为"开关被自动关闭"。显式告警消除歧义。
   const [loadErr, setLoadErr] = useState('')
@@ -409,6 +411,12 @@ export default function Quant() {
       const ai = {}
       list.forEach((v) => { ai[v.id] = sa[v.id] ?? '' })
       setAmountsInput(ai)
+
+      // 初始化战法日预算分配：从配置读取，未设置的留空
+      const alloc = c.strategy_allocs || {}
+      const aloc = {}
+      list.forEach((v) => { aloc[v.id] = alloc[v.id] ?? '' })
+      setAllocInput(aloc)
       setStrategyDirty(false)
       setSyncing(false)
     } catch (e) {
@@ -743,7 +751,7 @@ export default function Quant() {
     }, '仓位纪律已保存')
   }
 
-  // 保存战法白名单与自定义金额：全部开启时传空数组表示不设白名单（含因子/形态战法）
+  // 保存战法白名单与自定义金额/预算：全部开启时传空数组表示不设白名单（含因子/形态战法）
   async function saveStrategies() {
     const values = strategyList.filter((s) => strategyOn[s.id]).map((s) => s.id)
     const amounts = {}
@@ -751,9 +759,14 @@ export default function Quant() {
       const n = parseFloat(amountsInput[v.id])
       if (!Number.isNaN(n) && n > 0) amounts[v.id] = n
     }
+    const allocs = {}
+    for (const v of strategyList) {
+      const a = parseFloat(allocInput[v.id])
+      if (!Number.isNaN(a) && a > 0) allocs[v.id] = a
+    }
     return patch(
-      { strategies: allStrategyOn ? [] : values, strategy_amounts: amounts },
-      '战法开关与仓位已保存',
+      { strategies: allStrategyOn ? [] : values, strategy_amounts: amounts, strategy_allocs: allocs },
+      '战法开关、仓位与资金分配已保存',
     )
   }
 
@@ -1054,7 +1067,7 @@ export default function Quant() {
           {grp.label}
         </div>
       )
-      // 渲染单个战法项：名称+ID、自定义金额输入、准入开关
+      // 渲染单个战法项：名称+ID、自定义金额输入、日预算分配输入、准入开关
       function renderItem(s) {
         return (
           <div key={s.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '9px 4px', borderBottom: '1px solid #ededed' }}>
@@ -1063,11 +1076,14 @@ export default function Quant() {
               <div style={{ fontSize: 13, color: 'var(--app-text)' }}>{s.name}</div>
               <div style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--app-text-2)', marginTop: 2 }}>{s.id}</div>
             </div>
-            {/* 金额输入+开关：自定义单次金额，开关控制准入状态 */}
+            {/* 金额输入+日预算分配输入+开关：单次金额、日预算上限、开关控制准入状态 */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, justifyContent: 'flex-end' }}>
-              <Input style={{ width: 100 }} type="number" min={0} step={500} value={amountsInput[s.id] ?? ''} placeholder="全局"
+              <Input style={{ width: 80 }} type="number" min={0} step={500} value={amountsInput[s.id] ?? ''} placeholder="全局"
                 onChange={(v) => setAmountsInput({ ...amountsInput, [s.id]: v })} />
-              <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>元/次</span>
+              <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>元/次</span>
+              <Input style={{ width: 80 }} type="number" min={0} step={1000} value={allocInput[s.id] ?? ''} placeholder="不限"
+                onChange={(v) => setAllocInput({ ...allocInput, [s.id]: v })} />
+              <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>元/日</span>
               <ToggleSw checked={!!strategyOn[s.id]} onChange={(v) => { setStrategyOn({ ...strategyOn, [s.id]: v }); markStrategyDirty() }} />
             </div>
           </div>

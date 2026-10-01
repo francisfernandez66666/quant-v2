@@ -126,6 +126,22 @@ func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
 	return s, err
 }
 
+// SumBuyFilledAmountByDayForStrategy 当日指定战法的已成交买入金额（元）。
+//
+// 基于 fills_effective 视图，从 signal_id 提取战法 key。用冒号边界精确匹配——":stratKey:" 确保
+// 策略名出现在完整字段位置（前后均有冒号），避免短名误碰长名前缀（dragon 不撞 dragon_return）。
+// 因系统已从 §GAP2-W1 起统一使用结构化 signal_id（"buy:CODE:stratKey:DATE"），旧格式不再维护。
+// strategyKey 参数来自 LiveOrder.StrategyID（优先，如 fac_1/pat_2）或 LiveOrder.Strategy（显示名）。
+// §STRATEGY_ALLOC：配合风控闸子闸 2b 做每战法日预算检查。
+func (d *DB) SumBuyFilledAmountByDayForStrategy(userID, day, strategyKey string) (float64, error) {
+	var s float64
+	p := `%:` + strategyKey + `:%`
+	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
+		FROM fills_effective WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?
+			AND signal_id LIKE ?`, userID, day, p).Scan(&s)
+	return s, err
+}
+
 // SumSellFilledAmountByDay 当日卖出成交回款（元）：Σ 卖出 fills 金额（amount 优先，旧数据回落
 // price×qty）。冻结账的「回款」半边：卖出即回血——预算闸用回款对冲当日买入占用（上限钳到 0，
 // 不因清旧仓放大当日预算），近似资金闸经「持仓成本回落 + 已实现盈亏」两条路体现同一笔回款。

@@ -952,6 +952,7 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		"initial_capital":     cfg.InitialCapital,
 		"strategies":          cfg.Strategies,
 		"strategy_amounts":    cfg.StrategyAmounts,
+		"strategy_allocs":     cfg.StrategyAllocs,
 		"daily_max_buys":      cfg.DailyMaxBuys,
 		"daily_budget_amount": cfg.DailyBudgetAmount,
 		"auto_sell":           cfg.AutoSell,
@@ -978,6 +979,7 @@ type setQMTConfigReq struct {
 	InitialCapital    *float64            `json:"initial_capital"`     // 初始资金
 	Strategies        *[]string           `json:"strategies"`          // 启用战法列表
 	StrategyAmounts   *map[string]float64 `json:"strategy_amounts"`    // 各战法分配资金
+	StrategyAllocs    *map[string]float64 `json:"strategy_allocs"`     // 各战法日预算
 	DailyMaxBuys      *int                `json:"daily_max_buys"`      // 每日最大买入笔数（按当日已成交计，2026-09-18 口径修正）
 	DailyBudgetAmount *float64            `json:"daily_budget_amount"` // 每日买入预算
 	AutoSell          *bool               `json:"auto_sell"`           // 是否自动卖出
@@ -1178,6 +1180,29 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 			}
 		}
 		cfg.StrategyAmounts = out
+	}
+	if req.StrategyAllocs != nil {
+		// 各战法日预算覆盖：key 同样必须在白名单集合内；金额范围 0-10,000,000。
+		out := map[string]float64{}
+		knownSet := s.knownStrategyIDSet()
+		for k, v := range *req.StrategyAllocs {
+			k = strings.TrimSpace(k)
+			if k == "" {
+				continue // 空 key 忽略
+			}
+			if !knownSet[k] {
+				writeError(w, 400, "未知战法: "+k)
+				return
+			}
+			if v < 0 || v > 10000000 {
+				writeError(w, 400, "战法日预算超出范围（0-10000000）: "+k)
+				return
+			}
+			if v > 0 { // 0/负数=清除该战法覆盖，回落全局预算
+				out[k] = v
+			}
+		}
+		cfg.StrategyAllocs = out
 	}
 
 	// §WS-K 维4 保存前 schema 校验：非法配置返回 400，不再静默排队/落库。
