@@ -186,9 +186,240 @@
 # 用法:
 #   ./scripts/verify_changes.sh                # 编译 + 全部专项（12 个历史专项 + 今日 3 个：方向权威化/笔数成交口径/LLM 热更新）
 #   ./scripts/verify_changes.sh -full          # 再连相关全量单测 + QMT 网关 py 全量 + 前端 vitest 一起跑
+#   ./scripts/verify_changes.sh -collect       # §P2-L（2026-10-07）收集模式：跑完**全部**段、
+#       # 收集所有 FAIL 再退。默认模式第一条红就把整轮带走（10-06 实录：§104 红 ⇒ §105–107 零读数），
+#       # 于是"改了代码却从没验过专项锁"这件事被机制本身埋掉。-collect 与 -full 可叠加。
+#       # 末尾打印 PASS/FAIL/SKIP/SILENT 四桶计数，并钉「四桶之和 == 派生总段数」等值锁。
 #
 # 说明：本机通常没有 pytest，脚本内 py_tests() 会自动退回标准库 unittest（CI 仍走 pytest）。
 set -euo pipefail
+
+# >>> GATE-COLLECT-DRIVER
+# ════════════════════════════════════════════════════════════════════════════
+# §P2-L（2026-10-07 修复批 波 4）`-collect` 收集模式驱动
+#
+# 缺陷本体：本脚本在 `set -euo pipefail` 下顺序跑 108 段，**第一条红就把整轮带走**，后面的段
+# 一行都不跑。10-06 实录：§104 gofmt 判红 ⇒ §105–107 当轮零读数，而"改了 Go 文件、专项锁却从没
+# 验过"这件事正是被这个机制埋掉的（报告里 P1-C 与 P2-L 是同一条因果链的两端）。
+# owner 裁决：加 `-collect`＝跑完全部段、收集所有 FAIL、末尾统一报数并以非零退出；
+# **默认模式语义一字不改**（首红即退仍是默认，避免动 100+ 段的退出契约）。
+#
+# 实现姿势——为什么是"文本级装配"而不是"每段包一个函数"：段体里到处是 `exit 1`、`$1`（§15 判
+# -full）、跨段变量交接（§107→§110）与 `set -e` 隐式语义；函数化会同时改掉这三样，
+# 风险远大于收益。所以一遍只跑"从某段起到文件尾"的**尾体**：由 scripts/gate_sections.py 把
+# 「前言里的函数定义 + 前置段 helper + 带 GATE-SECTION-START 标记的尾体」装成临时脚本再执行，
+# 仓库里的段体一个字都不动。全绿时整轮只跑一遍（与默认模式同成本），有 N 条红才跑 N+1 遍。
+#
+# 四种失效形态与各自的接法（本段 §111 逐枚配反证）：
+#   ① 装配坏了 ⇒ "根本没跑"被读成"跑过了、全绿"：每遍分类若**一个段标记都没有**记 EMPTY，
+#      当场判红并停轮；另有 `gate_sections.py check` 钉"前言除 set/cd/本标记区/顶格函数外
+#      不许有副作用语句"——前言里的普通语句不会被搬进内层脚本，少搬一句就是安静地少做一次检查。
+#   ② 段内静默退出（没判红、后面也没有别的段开始、日志里也没有收尾标记）：单列 SILENT 桶，
+#      **绝不折算成 PASS**。把"没验过"说成"验过了"正是本枚改造要消灭的形状。
+#   ③ 后段依赖前段产物：段体用 `gate_need <段号> <判据 1/0> <为什么依赖>` 声明。collect 下打
+#      `GATE-SKIP <n> · 原因` 并 exit 0（本遍到此为止，下遍从后一段起），默认模式仍判红——
+#      默认模式下走不到这里，走到就说明依赖被挪走/删掉了，必须现形。汇总里 SKIP 且 FAIL=0
+#      同样非零退出（依赖没满足却没有一条红＝依赖声明本身坏了）。
+#   ④ 某遍把仓库工作树改脏、后面的段读的是脏树：每遍跑完对 `git status --porcelain` 做差分，
+#      有漂移即整轮判红（门禁只读，写树＝读数归属不再可信）。自检夹具可用
+#      GATE_COLLECT_ALLOW_DRIFT=1 显式豁免（只在镜像里用，仓库内没有任何段会走到这条路）。
+#
+# 等值锁（H2，不许把红洗成绿）：末尾打印 PASS_SECTIONS / FAIL_SECTIONS / SKIP_SECTIONS /
+# SILENT_SECTIONS / TOTAL_SECTIONS 五个数，且四桶之和必须等于**派生**总段数；缺一段、重一段都红。
+# 总段数从 `gate_sections.py sections` 派生，不写死数字——写死的那份锁对下一个新增段天生失明
+# （§BOM-REPO-DERIVE、§DEADGAUGE 同族教训）。
+#
+# 收尾歧义锁：整轮四桶全绿、日志里却出现过 `^--- FAIL` 行 ⇒ GATE_AMBIGUOUS 判红。
+# "报绿却印着红字"意味着某段的退出码没代表它的判据（或有人在绿段里打印了判红文案），两种都要现形。
+# ════════════════════════════════════════════════════════════════════════════
+
+# 路径三件套。**本驱动块必须待在 `cd "$(dirname "$0")/.."` 之前**：`$0` 可能是相对形式
+# （`./scripts/x.sh`、也可能在脚本自己的目录里直接 `bash x.sh`），前言那句 cd 一旦跑过，
+# `$0` 的相对基准就变了——本仓 2026-10-07 夹具第一轮实跑就是被这个咬到的：镜像里 `bash fixture.sh`
+# 从 gate/ 目录起，cd 之后 `dirname $0`="." 指的是仓根，于是装配器路径算成了上一层的兄弟目录。
+# 现在按"调用时的 $PWD + $0"定死绝对路径，cd 前后都无所谓，镜像和真仓同一套解析。
+case "$0" in
+	/*) GATE_SELF_RAW="$0" ;;
+	*) GATE_SELF_RAW="$PWD/$0" ;;
+esac
+GATE_SELF_ABS="$(cd "$(dirname "$GATE_SELF_RAW")" && pwd)/$(basename "$GATE_SELF_RAW")"
+GATE_ROOT_ABS="$(cd "$(dirname "$GATE_SELF_ABS")/.." && pwd)"
+GATE_SECTIONS_PY="$GATE_ROOT_ABS/scripts/gate_sections.py"
+
+# 最多跑几遍：每跑一遍就是"从某个红段起到文件尾"，红得越早、后面越贵。上限是防失控的兜底
+# （正常情况下红段数量远小于它）；越限时没拿到读数的段由汇总的 MISSING 面显式现形，不当绿。
+GATE_COLLECT_MAX_PASSES="${GATE_COLLECT_MAX_PASSES:-60}"
+
+GATE_ARG_COLLECT=0
+GATE_ARG_INNER=""
+for _gate_arg in "$@"; do
+	# 必须用 `if` 而不是 `[ x = y ] && VAR=1`：条件为假时整个赋值语句返回 1，`set -e` 下前言当场
+	# 裸死（§89 自指锁抓的就是这一族的第三种写法：末句条件语句＝静默退出、零读数）。
+	if [ "$_gate_arg" = "-collect" ]; then GATE_ARG_COLLECT=1; fi
+	if [ "$_gate_arg" = "-full" ]; then GATE_ARG_INNER="-full"; fi
+done
+
+# gate_kv <cls 文件> <键名> —— 从分类结果里取一个键值（制表符分列）。
+# 写成函数而不是每处 awk：四桶判定要读五六个键，散着写迟早有一处拼错键名（拼错＝空串＝假绿）。
+gate_kv() {
+	awk -F'\t' -v k="$2" '$1 == k {print $2}' "$1" | head -1
+}
+
+# gate_need <段号> <判据是否为真（1/0）> <为什么本段依赖前段产物>
+#
+# 用在哪：本脚本里有三处真实的跨段产物依赖（§91 的 MK_LOAD 给 §92 用、§107 的 IP 扫描读数给 §110 用，
+# 另外 §20 的 dg 已被 §23 改成自带定义）。前两处里"文件路径变量"已改成各段自带定义（那种依赖没有
+# 语义，纯粹是省一次打字，不该换来一个 SKIP）；只有 §107→§110 是**语义依赖**——§110 故意不自己再扫
+# 一遍字面公网 IP，就是要继承 §107 的扫描读数，所以它必须走 gate_need。
+#
+# 判据写成"1/0 字符串"而不是命令退出码：调用点要的是"变量在不在位"这种可回显的读数，
+# `[ -n "${X+set}" ]` 直接塞进 $2 会让 FAIL 文案里看不到实际值。
+gate_need() {
+	local sid="$1" ok="$2" reason="$3"
+	if [ "$ok" = "1" ]; then return 0; fi
+	if [ "${GATE_COLLECT_INNER:-0}" = "1" ]; then
+		echo "GATE-SKIP ${sid} · ${reason}"
+		exit 0
+	fi
+	echo "--- FAIL: §${sid} 前置依赖不成立：${reason}"
+	echo "    （默认模式首红即退时本段根本走不到；走到了就说明依赖被挪到后头或整条删掉了，必须现形）"
+	exit 1
+}
+
+gate_collect_main() {
+	local work idx start rc nxt done_flag empty over_cap final drift amb
+	local fails silencs skips passn total bal skipmark
+	final=0
+	over_cap=0
+	idx=0
+	work=$(mktemp -d /tmp/gate-collect-XXXXXX 2>/dev/null || true)
+	if [ -z "$work" ] || [ ! -d "$work" ]; then
+		echo "--- FAIL: §P2-L -collect 连临时工作目录都建不出来（各遍日志与分类都要落盘，落不了盘就没有汇总读数）"
+		return 1
+	fi
+	if [ ! -f "$GATE_SECTIONS_PY" ]; then
+		echo "--- FAIL: §P2-L -collect 找不到装配器 ${GATE_SECTIONS_PY}（没有它就等于"随机挑几段跑一下"，读数没有意义）"
+		return 1
+	fi
+	echo "==> [collect] 工作目录 ${work}（每遍：inner_<n>.sh / log_<n>.txt / cls_<n>.txt）"
+	# 跑前工作树指纹；`|| true` 是必需的——不是 git 仓库时 git 返回非零，pipefail 下会把前言打死。
+	git -C "$GATE_ROOT_ABS" status --porcelain 2>/dev/null | sort > "$work/tree.before" || true
+
+	start=$(python3 "$GATE_SECTIONS_PY" sections "$GATE_SELF_ABS" 2> "$work/sections.err" | awk -F'\t' '$1 ~ /^[0-9]+$/ {print $1; exit}') || start=""
+	if [ -z "$start" ]; then
+		echo "--- FAIL: §P2-L -collect 派生不出段清单（首段都没有＝装配器与脚本格式脱节）：$(head -1 "$work/sections.err" 2>/dev/null)"
+		return 1
+	fi
+	echo "==> [collect] 派生段清单首段=§${start}，总段数=$(python3 "$GATE_SECTIONS_PY" sections "$GATE_SELF_ABS" 2>/dev/null | awk -F'\t' '$1=="TOTAL"{print $2}')"
+
+	while : ; do
+		idx=$((idx + 1))
+		if [ "$idx" -gt "$GATE_COLLECT_MAX_PASSES" ]; then
+			echo "--- FAIL: §P2-L 遍数超过上限 GATE_COLLECT_MAX_PASSES=${GATE_COLLECT_MAX_PASSES}，停轮（未拿到读数的段由下面 MISSING 面点名）"
+			over_cap=1
+			final=1
+			break
+		fi
+		rc=0
+		python3 "$GATE_SECTIONS_PY" emit "$GATE_SELF_ABS" "$start" "$work/inner_$idx.sh" "$GATE_ROOT_ABS" 2> "$work/emit.err" || rc=$?
+		if [ "$rc" != "0" ]; then
+			echo "--- FAIL: §P2-L 第 $idx 遍装配失败（起点 §${start}）：$(head -1 "$work/emit.err" 2>/dev/null)"
+			final=1
+			break
+		fi
+		rc=0
+		GATE_COLLECT_INNER=1 bash "$work/inner_$idx.sh" $GATE_ARG_INNER > "$work/log_$idx.txt" 2>&1 || rc=$?
+		if ! python3 "$GATE_SECTIONS_PY" classify "$GATE_SELF_ABS" "$work/log_$idx.txt" "$rc" > "$work/cls_$idx.txt"; then
+			echo "--- FAIL: §P2-L 第 $idx 遍分类失败（分类器读不懂自己的标记＝汇总会静默少一段）"
+			final=1
+			break
+		fi
+		empty=$(gate_kv "$work/cls_$idx.txt" EMPTY)
+		done_flag=$(gate_kv "$work/cls_$idx.txt" DONE)
+		nxt=$(gate_kv "$work/cls_$idx.txt" NEXT)
+		passn=$(gate_kv "$work/cls_$idx.txt" STARTED)
+		if [ "$empty" = "1" ]; then
+			echo "--- FAIL: §P2-L 第 $idx 遍（起点 §${start}）一个段标记都没有 ⇒ 装配坏了，$work/log_$idx.txt 里跑的不是段体"
+			echo "    这是收集模式最坏的失效形态：什么都没跑却可能被汇总读成'全绿'。停轮。"
+			tail -n 20 "$work/log_$idx.txt" 2>/dev/null | sed 's/^/    | /' || true
+			final=1
+			break
+		fi
+		echo "==> [collect] pass #$idx 起点 §$start 跑过段：$passn ⇒ rc=$rc done=$done_flag 下一段起点=${nxt:-（无）}"
+		if [ "$rc" != "0" ]; then
+			echo "    —— 本遍判红段 §$(gate_kv "$work/cls_$idx.txt" FAIL) 的日志尾部（全文：$work/log_$idx.txt）："
+			tail -n 40 "$work/log_$idx.txt" 2>/dev/null | sed 's/^/    | /' || true
+		fi
+		# SKIP 的原文也要照抄到 stdout：段是"自己声明依赖不成立"才跳的，那句成因只有段体知道。
+		# 汇总里的 SKIP_REASON 是从 cls 文件里重排出来的，读的是同一个标记；这里把原文一并回显，
+		# 现网才不至于"知道少了一段、却不知道那段到底写了什么"（§111 行为腿断的就是这行原文）。
+		skipmark=$(gate_kv "$work/cls_$idx.txt" SKIP)
+		if [ -n "$skipmark" ]; then
+			echo "    —— 本遍记 SKIP（成因由段自己声明，原文照抄）："
+			grep -F 'GATE-SKIP ' "$work/log_$idx.txt" 2>/dev/null | sed 's/^/    | /' || true
+		fi
+		git -C "$GATE_ROOT_ABS" status --porcelain 2>/dev/null | sort > "$work/tree.$idx" || true
+		drift=$(diff "$work/tree.before" "$work/tree.$idx" 2>/dev/null | grep -c '^[<>]' || true)
+		if [ "${drift:-0}" != "0" ] && [ "${GATE_COLLECT_ALLOW_DRIFT:-0}" != "1" ]; then
+			echo "--- FAIL: §P2-L 第 $idx 遍把仓库工作树改动了 ${drift} 行（门禁只读；后面的段读的是脏树，读数归属不再可信）"
+			diff "$work/tree.before" "$work/tree.$idx" 2>/dev/null | sed 's/^/    | /' || true
+			final=1
+		fi
+		if [ "$done_flag" = "1" ]; then break; fi
+		if [ -z "$nxt" ]; then break; fi
+		start="$nxt"
+	done
+
+	git -C "$GATE_ROOT_ABS" status --porcelain 2>/dev/null | sort > "$work/tree.after" || true
+	if ! python3 "$GATE_SECTIONS_PY" summary "$GATE_SELF_ABS" "$work" > "$work/summary.txt"; then
+		echo "--- FAIL: §P2-L 汇总失败（装配器 summary 子命令报错）"
+		return 1
+	fi
+	echo "==> [collect] 汇总（H2 等值锁：四桶之和必须等于派生总段数）"
+	awk -F'\t' 'NF>=2 {print $1"="$2}' "$work/summary.txt"
+	fails=$(awk -F'\t' '$1=="FAIL_SECTIONS"{print $2}' "$work/summary.txt")
+	silencs=$(awk -F'\t' '$1=="SILENT_SECTIONS"{print $2}' "$work/summary.txt")
+	skips=$(awk -F'\t' '$1=="SKIP_SECTIONS"{print $2}' "$work/summary.txt")
+	total=$(awk -F'\t' '$1=="TOTAL_SECTIONS"{print $2}' "$work/summary.txt")
+	bal=$(awk -F'\t' '$1=="BALANCE"{print $2}' "$work/summary.txt")
+	# 四桶键名缺失也要当红：空串进 `-eq` 会报 shell 错，所以先归零再比。
+	: "${fails:=0}" "${silencs:=0}" "${skips:=0}" "${total:=0}"
+	if [ "$bal" != "OK" ]; then
+		echo "--- FAIL: §P2-L 分桶不闭合（${bal}）：四桶 PASS/FAIL/SKIP/SILENT 之和必须等于派生总段数 ${total}，"
+		echo "    缺的那段/重的那段由上面 MISSING/DUPLICATE 点名——把'没跑到'折进'跑过了'就是本枚改造要防的形状"
+		final=1
+	fi
+	if [ "${fails:-0}" != "0" ] || [ "${silencs:-0}" != "0" ]; then final=1; fi
+	if [ "${skips:-0}" != "0" ] && [ "${fails:-0}" = "0" ] && [ "${silencs:-0}" = "0" ]; then
+		echo "--- FAIL: §P2-L 有段被记 SKIP 却没有任何 FAIL/SILENT ⇒ 依赖声明本身坏了（前段全绿时本段凭什么没跑到）"
+		final=1
+	fi
+	if [ "$over_cap" = "0" ] && [ "${fails:-0}" = "0" ] && [ "${silencs:-0}" = "0" ]; then
+		amb=$(cat "$work"/log_*.txt 2>/dev/null | grep -c '^--- FAIL' || true)
+		if [ "${amb:-0}" != "0" ]; then
+			echo "--- FAIL: §P2-L 收尾歧义：四桶全绿却出现 ${amb} 行 '--- FAIL' 文案 ⇒ 某段的退出码没代表它的判据"
+			final=1
+		fi
+	fi
+	if [ "${drift:-0}" != "0" ] && [ "${GATE_COLLECT_ALLOW_DRIFT:-0}" != "1" ]; then final=1; fi
+	if [ "$final" = "0" ]; then
+		echo "==> [collect] 全部 $total 段都有读数且无红：四桶闭合（PASS=全部，FAIL/SKIP/SILENT=0），耗时遍数 $idx"
+	else
+		echo "==> [collect] 本批 FAIL/SILENT/SKIP 段号见上面 FAIL_IDS/SILENT_IDS/SKIP_IDS；原始日志目录 $work"
+	fi
+	# 三个键各占一行、行首即键名：汇总消费方（含 §111 的镜像腿）按 `^KEY=` 取值，
+	# 挤在同一行里就成了"只有第一个键取得到"——同一个坏法在 summary 侧靠 awk 分行规避，这里手动分行是把它对齐。
+	echo "GATE_COLLECT_RC=${final}"
+	echo "PASSES=${idx}"
+	echo "WORK=${work}"
+	return "$final"
+}
+
+if [ "$GATE_ARG_COLLECT" = "1" ]; then
+	gate_collect_main
+	exit $?
+fi
+# <<< GATE-COLLECT-DRIVER
 cd "$(dirname "$0")/.."
 
 # py_tests <目标文件或目录> [-k 过滤表达式]
@@ -224,6 +455,7 @@ py_tests() {
 		( cd "$(dirname "$target")/.." && python3 -m unittest "$pkg.$base" $kstr -v )
 	fi
 }
+
 
 echo "==> 1/8 编译检查..."
 go build ./...
@@ -552,6 +784,11 @@ go test -count=1 ./internal/store/ -run 'TestCandidateByID_NotFoundReturnsErr' 2
 go test -count=1 ./internal/server/ -run 'TestResearchApproveMissingCandidate' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 
 echo "==> 23/23 §A7-B/§A7-C 部署健壮性专项（2026-09-20：前端产物指纹 + 停服兜底 + shell 变量名吞噬）..."
+# §P2-L（2026-10-07 波 4）：本段原来用 §20 定义的 `$dg`。纯路径变量跨段引用在收集模式下会变成
+# "前段判红 ⇒ 本段读到空串 ⇒ grep 报错被判红"，那条红会被归属成本段的缺陷，而真正坏的是 §20。
+# 修法选"本段自带定义"而不是 gate_need：路径变量没有任何语义依赖，省一次打字不值得换来一个 SKIP，
+# 更不值得让一个绿段在前段红的时候被记成 SKIP（那会让"到底哪些段有真依赖"这件事失去唯一读数面）。
+dg=scripts/deploy_guangzhou.sh
 # ① §A7-B 产物指纹必须落盘：只有 dist/BUILD_COMMIT 才能让部署脚本在**上传前**判定
 #    "这个前端是哪一版"（注入 JS 的那份被压缩混淆，只能猜）。缺它则「先 build 后 commit」
 #    导致的漂移无法被自动拦住（2026-09-20 两次踩中，用户端报版本不一致横幅）。
@@ -2901,6 +3138,10 @@ echo "==> 92 §MINUTE-K-CHAIN 分钟链两修：代码形态归一 + 装载器�
 #      改绑新增的 GetUnadjustedMinuteKLine（三腿之外宁可计成失败），实盘看当日分时的 GetMinuteKLine
 #      保留末腿不动（当日 bars 前复权＝不复权，摘掉它等于把实盘兜底也削了）。
 MK_SRC=internal/data/source.go
+# §P2-L（2026-10-07 波 4）：本段用 `"$MK_LOAD"` 做静态 grep，而它原来只在 §91 定义。
+# 收集模式下 §91 判红时本段会读到空串 ⇒ `grep -c '…' ""` 报错 ⇒ 归属变成"§92 缺陷"，
+# 而真正坏的是 §91。路径变量没有语义依赖，直接本段自带定义（理由同 §23 的 dg）。
+MK_LOAD=cmd/dataload/minute_sync.go
 MK_SRC_TEST=internal/data/source_minute_chain_test.go
 # ① 归一必须发生在分钟链函数体内（写在别的函数里等于没写）
 awk '/^func \(dc \*DataCoordinator\) minuteKLineChain\(/{f=1} f{print} f && /^}$/{exit}' "$MK_SRC" | grep -q 'code := normalizeCode(rawCode)' \
@@ -5842,6 +6083,23 @@ ln110() { # $1=文件 $2=整串 → 首个命中行号（0＝没有）；顺序�
 	printf '%s' "${n:-0}"
 }
 
+# gate_clip <上限字符数> <串> —— 按**字符**截断读数回显，且结果与 LC_CTYPE 无关（§P2-M）。
+#
+# 为什么要有这么一枚（2026-10-07 整轮 -collect 第一轮实跑逼出来的）：
+# 回显别人给的读数时必须截短，旧写法是 bash 切片 `${got:0:92}`。bash 3.2 的这个切片**跟随
+# 当前字符类**：本机 `LANG=""`、`LC_CTYPE="C"` 时它按**字节**切（同一句在 UTF-8 locale 下按字符切，
+# 所以单跑 §110 从来看不见这个坏法——只有整轮把日志喂给分类器时才炸）。中文是三字节，
+# 按字节切就会正好劈开一个字符，日志里落下一个非法 UTF-8 字节。
+# 后果不在那一行好看与否：收集模式的分类器读的正是这份日志，严格解码时**一个坏字节**把整遍
+# 分类打挂，汇总于是读成 `BALANCE=MISSING:1,2,…,111`——那一轮真实情况是 109 段全绿跑完、
+# 日志里没有任何 `--- FAIL`，却被报成"整轮没有结论"。显示层的截断把验证层的结论抹掉了，
+# 这比任何一段的红都更坏。修法分两侧：分类器读日志改容错解码（别人的字节不该由我定质量），
+# 自己写日志这一侧改**按字符**截断（不靠 locale 赌运气）；§111 的 L10/L11 两腿把这两侧各自
+# 配了反证（把容错退回严格、把截断退回 `${x:0:N}`，缺陷必须在同一个输入上复现）。
+gate_clip() { # $1=上限字符数 $2=串（可含中文/半截字节）
+	printf '%s' "${2-}" | python3 -c 'import sys; s = sys.stdin.buffer.read().decode("utf-8", "replace"); n = int(sys.argv[1]); sys.stdout.write(s[:n])' "${1-92}"
+}
+
 # ── ① Mac 侧：主题取用单实现 + 两个消费腿 + 空主题不假称网络抖动 ──
 eq110 deploy/mac/ntfy_topic.sh 'ntfy_topic_resolve() {' 1 '主题取用的唯一实现（第二处＝各脚本自己再拼一遍 security 命令，轮换时必漏一处）'
 eq110 deploy/mac/ntfy_topic.sh 'ntfy_topic_report() {' 1 '只报长度与指纹前 8 位的回显器在位（不回显明文这条铁律的落点）'
@@ -5868,16 +6126,6 @@ for f in deploy/mac/*; do
 	HEX_HITS=$((HEX_HITS + $(grep -Ec '[0-9a-f]{32}' "$f" 2>/dev/null || true)))
 done
 [ "${HEX_HITS:-0}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（deploy/mac 里出现 32 位十六进制串 ${HEX_HITS} 处＝ntfy 主题/口令回流；主题＝凭据，已知值只准走钥匙串或参数）"; exit 1; }
-# 字面公网 IP 这一条**不自己再扫一遍**：读 §107 那条派生扫描的读数（IP_HITS / IP_SCAN_N）。
-# 为什么接而不是重写：两把锁各写一遍同一判据，将来只会有一被改、另一继续用旧口径——
-# 而"旧口径还绿"比"红着"更危险（§0929DRILL 的 record_freshness 单实现同族）。
-# 交接锁本身要断"上游真跑过"：变量未定义＝§107 那段被删或挪到了本段之后，那这行负锁就是
-# 一句从没执行过的字面承诺（正向腿恒真的最典型形态）。
-CNT110=$((CNT110 + 1))
-[ -n "${IP_HITS+set}" ] || { echo "--- FAIL: §110 交接锁 ${CNT110}（IP_HITS 未定义＝§107 的派生 IP 扫描没在本段之前跑，'Mac 侧不许内嵌字面公网 IP'退化成注释）"; exit 1; }
-[ "${IP_HITS:-1}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（沿用 §107 扫描读数：deploy/mac 里出现字面公网 IPv4 ${IP_HITS} 处，出口只应是 ssh 别名 gz 或运行期参数）"; exit 1; }
-CNT110=$((CNT110 + 1))
-[ "${IP_SCAN_N:-0}" -ge 13 ] || { echo "--- FAIL: §110 交接正锁 ${CNT110}（§107 的待扫文件数=${IP_SCAN_N}，<13＝那条 glob 已被人改窄，本段继承的是空扫描）"; exit 1; }
 # §107 的 glob 必须真的含 .js——P1-E 的直接教训：扩文件面这件事只有写在 glob 里才算数。
 # 预演读数=2 而不是 1：本枚锁自身的参数里就带着这串 glob（写锁的人没法不写被锁的串），
 # 于是"真代码行 + 这条锁"各命中一次。将来出现 3 处只有两种可能——有人在说明文字里抄了整串
@@ -6065,7 +6313,7 @@ f3_expect_f2_red() { # $1=标签 $2=期望的 F2-FAIL 点名片段 $3=defs $4=re
 	[ "$rcF3" != "0" ] || { echo "--- FAIL: §110 F3 ${1}：镜像破坏后 F2 判据仍然 0 退出（这条等值锁是恒绿的装饰）"; exit 1; }
 	printf '%s' "$out" | grep -qF 'F2-FAIL' || { echo "--- FAIL: §110 F3 ${1}：非零退出但不是判据自己点名（说明镜像坏了而不是锁红了）：$(printf '%s' "$out" | tail -2)"; exit 1; }
 	printf '%s' "$out" | grep -qF -- "$2" || { echo "--- FAIL: §110 F3 ${1}：红的归属不对（期望点名「$2」，实得尾部：$(printf '%s' "$out" | tail -1)）——本枚破坏必须只有这一枚能造成这个红"; exit 1; }
-	echo "ok - §110 F3 ${1} => $(printf '%s' "$out" | grep -F 'F2-FAIL' | head -1 | cut -c1-96)"
+	echo "ok - §110 F3 ${1} => $(gate_clip 96 "$(printf '%s' "$out" | grep -F 'F2-FAIL' | head -1)")"
 }
 
 # a) 删 roster 里的 keepalive（＝"注册体/名单只有一份"里那份名单少一项）⇒ 集合关系破 + 少出点名
@@ -6146,7 +6394,7 @@ leg110() { # $1=用例名 $2=期望 PASS|FAIL $3=FAIL 明细必须点名串 $4=�
 	if [ "$2" = "FAIL" ] && [ -n "$3" ] && ! printf '%s' "$got" | grep -qF -- "$3"; then
 		echo "--- FAIL: §110 F1 ${1}：判红了却没点名 '$3'（红必须说清是哪个任务、因为什么，否则现网还得人工拆读数）"; exit 1;
 	fi
-	echo "ok - §110 F1 ${1} => ${got:0:92}"
+	echo "ok - §110 F1 ${1} => $(gate_clip 92 "$got")"
 }
 
 KA110_OK='TASK|QMT-Gateway-Ensure|present=1|rule=2|age_h=0.3|state=present+lastrun|enabled=True|action=wscript.exe //B C:\opt\quant\qmt-win\run_qmt_ensure.vbs'
@@ -6297,7 +6545,7 @@ cp deploy/mac/restic_pull_backup.sh "$W3T/binonly/"
 rc110=0
 HOME="$W3T/home1" PATH="$W3T/bin:$PATH" bash "$W3T/binonly/restic_pull_backup.sh" >"$W3T/o1" 2>"$W3T/e1" || rc110=$?
 [ "$rc110" = "1" ] || { echo "--- FAIL: §110 F3-3 缺 lib 时退出码=${rc110}（应为 1；launchd 只看退出码，退 0＝「每天定时、每天没告警」）"; exit 1; }
-grep -qF 'FATAL' "$W3T/e1" || { echo "--- FAIL: §110 F3-3 缺 lib 时没打 FATAL（stderr：$(head -c 160 "$W3T/e1")）"; exit 1; }
+grep -qF 'FATAL' "$W3T/e1" || { echo "--- FAIL: §110 F3-3 缺 lib 时没打 FATAL（stderr：$(gate_clip 160 "$(head -1 "$W3T/e1")")）"; exit 1; }
 [ -z "$(ls -A "$W3T/home1" 2>/dev/null || true)" ] || { echo "--- FAIL: §110 F3-3 缺 lib 的 FATAL 之前已动过 HOME（日志目录被建出来＝先落盘后校验，顺序错）"; exit 1; }
 echo "ok - §110 F3-3 缺 ntfy_topic.sh 当场 FATAL rc=1 且 HOME 一个字节没动"
 
@@ -6374,7 +6622,858 @@ echo "ok - §110 F3-6 kuma 必传参数四腿（缺一个也要点名、形状�
 rm -rf "$W3T" "$W3F"
 # 段尾总结把 CNT110 打出来：门禁段数与判定点数都是**要对外报的数**，
 # 让日志自己带读数，比事后靠记忆写"约 60 道"诚实（§GATE-COUNT-LOCK 同一诉求）。
+# 字面公网 IP 这一条**不自己再扫一遍**：读 §107 那条派生扫描的读数（IP_HITS / IP_SCAN_N）。
+# 为什么接而不是重写：两把锁各写一遍同一判据，将来只会有一被改、另一继续用旧口径——
+# 而"旧口径还绿"比"红着"更危险（§0929DRILL 的 record_freshness 单实现同族）。
+# §P2-L（2026-10-07 波 4）交接断言：位置从段中挪到段尾，判据从「判红」改成走 gate_need。
+# 为什么挪位置：本段四十多道判定点里只有这一条依赖 §107。收集模式下若在段中就 exit，
+# 后面的锁一条都不跑——那正好把"前段坏了、后段还能不能查出别的"这件事一起抹掉。
+# 为什么改走 gate_need：§107 判红时 IP_HITS 未定义，这条断言的成因是"§107 没跑完"，
+# 不是"§110 坏了"。把它记成 SKIP-BY-DEPENDENCY，汇总里 FAIL 与 SKIP 两个数才各说各的事
+# （H3 钉的就是这个形状：依赖腿不许冒充 PASS）。
+CNT110=$((CNT110 + 1))
+IP110_HAS=0
+if [ -n "${IP_HITS+set}" ]; then IP110_HAS=1; fi
+gate_need 110 "$IP110_HAS" '§107 的派生 IP 扫描没在本段之前跑完（IP_HITS 未定义＝「Mac 侧不许内嵌字面公网 IP」退化成一句从没执行过的承诺）'
+[ "${IP_HITS:-1}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（沿用 §107 扫描读数：deploy/mac 里出现字面公网 IPv4 ${IP_HITS} 处，出口只应是 ssh 别名 gz 或运行期参数）"; exit 1; }
+CNT110=$((CNT110 + 1))
+[ "${IP_SCAN_N:-0}" -ge 13 ] || { echo "--- FAIL: §110 交接正锁 ${CNT110}（§107 的待扫文件数=${IP_SCAN_N}，<13＝那条 glob 已被人改窄，本段继承的是空扫描）"; exit 1; }
+echo "ok - §110 交接锁：沿用 §107 派生扫描读数（待扫文件 ${IP_SCAN_N} 个 / 字面公网 IP ${IP_HITS} 处）"
 echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十三腿与摘锁反证七枚 + F3 Mac 侧五组与 kuma 必传腿，累计判定点 ${CNT110}"
 
+echo "==> 111 §P2-L/§P2-K/§P2-M 门禁体系自身（波 4）：收集模式驱动 + 装配器 + 编码口径 + DNS 注入点——静态锁、镜像行为腿与五枚「本批真踩过的坑」的反证..."
+
+# 本段守的是**验证机制自己**，不是业务代码。三件事各自的历史成因：
+#
+#  ① P2-L 收集模式（owner 裁决 ①：默认首红即退语义不变，另加 `-collect`）：
+#     10-06 实录里 §104 gofmt 判红把 §105–107 整段带走，"改了 Go 文件、专项锁却从没验过"这件事
+#     正是被机制本身埋掉的。但收集模式的新风险是**它自己会撒谎**：装配坏了一段都没跑，
+#     汇总若只数「有没有 FAIL」，就会把「没验过」读成「验过了」——比首红即退更危险。
+#     所以下面几枚腿全部围绕「读数归属」而不是「跑通了没」：EMPTY（L8）/ SILENT（L1）/ SKIP（L1·L5）/
+#     收尾歧义（L6）/ 工作树漂移（L7）五种形状各自必红，外加「四桶之和 == 派生总段数」的等值锁（H2）
+#     与「默认模式仍首红即退」的语义锁（L2）。
+#  ② P2-K DNS 注入点：矩阵的一条正例真拨 api.siliconflow.cn，断网判红、一分钟后单跑 PASS 17.99s。
+#     修法留了一个**默认值就是 net.LookupIP** 的注入点，测试装确定性答案。于是"生产路径没变"
+#     这件事必须锁死：非测试代码里 DNS 解析调用恰好一处（就是注入点默认值），否则「改回直调」是静默的。
+#  ③ P1-C 自证清单（G3）：069c380 的提交说明只写了「go build + 四包 PASS」，缺整轮门禁读数，
+#     于是「没跑全量门禁」与「跑了但没写」在事后看不出区别。首犯 WARN、连续两批缺即红。
+#     同一条 P1-C 还留了个更阴的口子：§104 的 `gofmt -l internal cmd 2>/dev/null || true` 在 gofmt
+#     根本不在 PATH 的机器上会给出**空串**，那枚「必须为空」的等值锁于是恒绿。所以计划里的 G2
+#     不落在 §104 段内（那里只有判据自己），而是作为对照腿落在本段（下面 ⑥ 组）：镜像里写歪一个
+#     文件必须被抓到、gofmt -w 复位之后必须变空——两个方向都测，才叫对照。
+#
+#  ④ 计划里的 I3「全仓 _test.go 真实公网域名命中=0」**没有按原样落码**，理由按本仓纪律必须落纸：
+#     判据的射程在派生阶段就不是"测试代码"——工具缓存目录 .qoder/ 下躺着 984 个 _test.go（不在版本控制里，
+#     却会被 `**/_test.go` 的 glob 一并扫进），而仓库正文里的 api.siliconflow.cn、eastmoney、10jqka、ntfy.sh
+#     这些域名字面量是**数据**（配置默认值、告警主题、文档），不是出呼点。本轮实测的分面是：受版本控制的
+#     418 个 `_test.go` 里有 200 处域名字面量命中（剔掉 example.com 这类夹具域名仍剩 171 处，铺在 33 个文件上），
+#     `.qoder/` 工具缓存里另有 984 个同名文件。照原文写死"命中=0"会把这一百多处数据命中一起判红，
+#     收场的写法只能是"再加一份域名白名单"——白名单就是第二本账（§BOM-REPO-DERIVE 的教训：
+#     清单式锁对下一个新增项天生失明）。于是换成锁**能不能出呼**而不是锁**字符串在不在**：
+#     注入点默认值等值锁（下面 ④ 那三枚）+ 黑洞代理行为腿 I1 + 退回直调必红 I2。
+#     I1 把 HTTP_PROXY/HTTPS_PROXY 指到 127.0.0.1:1 再跑整包，只要还有一条腿真出呼、真解析，它就红。
+#  ⑤ P2-M 分类器读日志的编码口径（本批第二轮实跑逼出来的，见下面 ②b/②c 两组锁与 L10/L11/R4 三条腿）：
+#     `-collect` 第一轮（10-07 04:39）109 段全绿、日志里零条 `--- FAIL`，汇总却报 `BALANCE=MISSING:1,2,…,111`。
+#     根因是 §110 的一条中文读数被 `LC_ALL=C` 下的 bash 切片 `${got:0:92}` 按**字节**劈开，日志里落下
+#     一个孤立的 0xe6，分类器严格解码当场抛异常。显示层的一次截断把验证层的整轮结论抹掉了——
+#     这是收集模式自己的一种撒谎形态，所以它必须和 EMPTY/SILENT 那四种同批立起来。
+#
+# 反证为什么只做五枚（R1/R2/R3/R4/I2）而不是把每枚静态锁各破一次：这五枚是**本批开发过程中真的坏过、
+# 并且真的被夹具抓到**的形态（前言函数被排除出收集面、SKIP 桶按逗号切、主动跳过的段被归进 SILENT、
+# 分类器读日志退回严格解码、调用点退回裸 DNS）。把它们写成「退回旧实现必须在同一个夹具上复现缺陷」的腿，比再补十枚同族文案锁有用：
+# 前者证明判据有牙，后者只证明字符串在位（§P1-A 教训：锁了形状没锁可达性）。
+CNT111=0
+GS111=scripts/verify_changes.sh
+GPY111=scripts/gate_sections.py
+SRV111=internal/server/server.go
+RPY111="$PWD/$GPY111"
+W111="$(mktemp -d /tmp/p2l-XXXXXX 2>/dev/null || true)"
+[ -n "$W111" ] || { echo "--- FAIL: §111 建不出镜像目录，收集模式的十条镜像行为腿（L1/L2/L4–L11，L3 的三枚等值锁在 L1 里以 H1/H2/H3 落地）全部无法跑（宁可红，不许跳）"; exit 1; }
+# 等值锁的读数面是「§111 之前的门禁正文」，不是整份脚本。为什么必须切：本段的一百来道锁
+# 逐个把被判的字符串抄在自己的参数里（写锁的人没法不抄），拿整份文件去数「恰好一处」，
+# 数到的是"定义一次 + 本段抄了 N 次"，预演读数被迫写成 6、12 这种数——那就不再是"只有一处"，
+# 而是"没人再抄第二遍"，锁的含义被自己的文案稀释。切开后：定义面（真代码）照常判，
+# 本段自己的引用不参与，负锁也不必再给"注释里提到"留豁免。
+HDR111_LN=$(grep -nF 'echo "==> 111 ' "$GS111" 2>/dev/null | head -1 | cut -d: -f1 || true)
+case "$HDR111_LN" in
+''|*[!0-9]*) echo "--- FAIL: §111 读数面锁：在门禁里找不到本段的段头（或段头写法被改），切片没有右边界——宁可红，不许拿整份文件凑数"; exit 1 ;;
+esac
+GB111="$W111/gate_before_111.txt"
+sed -n "1,$((HDR111_LN - 1))p" "$GS111" > "$GB111"
+
+eq111() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT111=$((CNT111 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §111 整串等值锁 ${CNT111}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+neg111() { # $1=文件 $2=整串 $3=说明 → 应彻底没有
+	CNT111=$((CNT111 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §111 负锁 ${CNT111}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+}
+min111() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
+	CNT111=$((CNT111 + 1))
+	[ "${2:-0}" -ge "$3" ] || { echo "--- FAIL: §111 派生正锁 ${CNT111}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+}
+ln111() { # $1=文件 $2=整串 → 首个命中行号（0＝没有）；顺序锁用
+	local n
+	n=$(grep -nF -- "$2" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	printf '%s' "${n:-0}"
+}
+kv111() { # $1=键 $2=整段输出 → 驱动回显的是 KEY=VALUE 形态（不是制表列），这里按 = 取
+	printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1
+}
+code_hits111() { # $1=文件 $2=扩展正则 → 非注释命中行数（与 §110 的网关命中计数同一把尺子）
+	{ grep -nE "$2" "$1" 2>/dev/null || true; } | { grep -Ev '^[0-9]+:[[:space:]]*(//|\*)' || true; } | wc -l | tr -d ' '
+}
+
+# ── ① 驱动块与装配器的形状（静态锁）──
+eq111 "$GB111" '# >>> GATE-COLLECT-DRIVER' 1 '驱动块起始标记恰好一处（两处＝前言里抄了第二份驱动，两遍装配互踩）'
+eq111 "$GB111" '# <<< GATE-COLLECT-DRIVER' 1 '驱动块结束标记恰好一处（与上枚成对；gate_sections.py 的 check 靠这对标记才放行前言里的语句）'
+eq111 "$GPY111" 'DRIVER_BEGIN = "# >>> GATE-COLLECT-DRIVER"' 1 '装配器认识的起始标记与门禁写的字面一致（不同步＝check 要么把驱动语句当副作用判红，要么整段失去保护）'
+eq111 "$GPY111" 'DRIVER_END = "# <<< GATE-COLLECT-DRIVER"' 1 '装配器认识的结束标记同上'
+eq111 "$GB111" 'GATE_SELF_RAW="$PWD/$0"' 1 '相对形式的 $0 按调用时的 PWD 定死（case 的 `*)` 分支；缺了它＝cd 之后基准漂移、装配器路径算到上一层兄弟目录，L9 行为腿演示的就是这个坏法）'
+eq111 "$GB111" 'GATE_SELF_RAW="$0" ;;' 1 '绝对形式的分支照旧直取 $0（两枚分开数：两个分支本就是两种形状，合成一个计数会把「少了一个分支」读成「多了一处引用」）'
+CNT111=$((CNT111 + 1))
+L_DRV=$(ln111 "$GB111" '# >>> GATE-COLLECT-DRIVER')
+L_CD111=$(ln111 "$GB111" 'cd "$(dirname "$0")/.."')
+if [ "$L_DRV" -le 0 ] || [ "$L_CD111" -le 0 ] || [ "$L_DRV" -ge "$L_CD111" ]; then
+	echo "--- FAIL: §111 顺序锁 ${CNT111}（驱动块必须待在前言 cd **之前**：实得 L_DRV=$L_DRV L_CD=${L_CD111}）"
+	echo "    cd 之后 \$0 的相对基准就变了，装配器路径会算到上一层兄弟目录——L9 行为腿演示的就是这个坏法"
+	exit 1
+fi
+eq111 "$GB111" 'if [ "$_gate_arg" = "-collect" ]; then GATE_ARG_COLLECT=1; fi' 1 '参数扫描写成 if（`[ x ] && y` 在条件为假时整条语句返回 1，set -e 下前言当场裸死＝零读数，正是 §89 自指锁那一族）'
+neg111 "$GB111" '[ "$_gate_arg" = "-collect" ] &&' '上一条的旧写法不许复活'
+eq111 "$GB111" 'GATE_COLLECT_INNER=1 bash "$work/inner_$idx.sh" $GATE_ARG_INNER' 1 '内层脚本必须带 GATE_COLLECT_INNER 起（gate_need 的 SKIP 分支与递归防护都读这把键）'
+eq111 "$GB111" 'echo "GATE-SKIP ${sid} · ${reason}"' 1 'gate_need 的 SKIP 标记格式与装配器 SKIP_RE 严格对齐（对不上＝跳过被读成 SILENT，成因归属就错了）'
+eq111 "$GB111" '本遍记 SKIP（成因由段自己声明，原文照抄）' 1 '驱动把内层日志里的 GATE-SKIP 原文回显到 stdout（只留在 log 文件里的话，现网拿到的汇总就只剩「少了一段」，看不出那段自己写了什么；§111 L1 断言的正是这份可见性）'
+eq111 "$GPY111" 'SKIP_RE = re.compile(r'"'"'^GATE-SKIP (\d+) · (.*)$'"'"')' 1 '解析侧的字面量与上枚成对'
+eq111 "$GB111" 'GATE_COLLECT_MAX_PASSES="${GATE_COLLECT_MAX_PASSES:-60}"' 1 '遍数上限的赋值恰好一处（每遍是「从红段跑到文件尾」，红得越早后面越贵；越限时未读到的段由 MISSING 面点名，不当绿）'
+eq111 "$GB111" 'echo "WORK=${work}"' 1 '收尾三个读数各占一行、行首即键名（镜像腿就是这样取 WORK 去复跑 summary 的；挤成一行时只有第一个键能被 `^KEY=` 取到，其余两个在消费方读成空串＝反证空过）'
+
+# ── ② 装配器：六个子命令在位 + 本批真坏过的两处判据 ──
+eq111 "$GPY111" 'def cmd_sections(gate):' 1 '子命令 sections（派生段清单＝一切等值锁的分母）'
+eq111 "$GPY111" 'def cmd_helpers(gate):' 1 '子命令 helpers（跨段 helper 依赖派生）'
+eq111 "$GPY111" 'def cmd_emit(gate, start_id, out_path, root):' 1 '子命令 emit（尾体装配）'
+eq111 "$GPY111" 'def cmd_classify(gate, log_path, rc):' 1 '子命令 classify（单遍四桶归属）'
+eq111 "$GPY111" 'def cmd_summary(gate, work_dir):' 1 '子命令 summary（跨遍汇总 + 等值锁）'
+eq111 "$GPY111" 'def cmd_check(gate):' 1 '子命令 check（前言副作用自检＝emit 的正确性前提）'
+eq111 "$GPY111" 'if mask[i] or i < prologue_end:' 0 '前言函数不许被排除出收集面（R1 反证腿就是把这行写回来，看搬运腿会不会立刻归零）'
+eq111 "$GPY111" 'elif started[-1] in skipped:' 1 '主动跳过的段归 SKIP 桶、不折算 SILENT（R3 反证腿破的就是这一条）'
+eq111 "$GPY111" 'for key in ("PASS", "FAIL", "SILENT"):' 1 'PASS/FAIL/SILENT 按逗号切、SKIP 单独按分号切（R2 反证腿破的就是这一条）'
+neg111 "$GPY111" 'for key in buckets:' '四桶同解的旧写法（SKIP 值是「id·原因」，逗号切不动 ⇒ 汇总凭空少一段）'
+eq111 "$GPY111" 'print("PASS_IDS\t%s"' 1 'PASS 段号也要点名：只给四个计数时，"同一段既在 PASS 又在 SKIP"这类重复看不出来'
+
+# ── ②b §P2-M：分类器读日志的编码口径（整轮 -collect 第一轮实跑逼出来的那条）──
+# 04:39 那轮的真实形态：109 段全绿跑完、日志里一条 `--- FAIL` 都没有，却因为**一个字节**
+# （§110 的一条中文读数被 LC_CTYPE=C 的 bash 切片按字节劈开，见下面 ⑤ 组）解码失败，
+# 分类器非零退出 ⇒ 汇总读成 `BALANCE=MISSING:1,2,…,111`。"全都验过"被报成"谁都没验"，
+# 与本枚改造要消灭的形态同形、方向相反 ⇒ 这一组锁守的是收集模式自己的结论面。
+eq111 "$GPY111" 'def read_lines(path, errors=None):' 1 '读文本的默认口径＝严格（errors=None），容错必须由调用点显式声明——不显式就等于偷偷全放开'
+neg111 "$GPY111" 'def read_lines(path):' '旧签名（没有 errors 形参＝日志与源码一个口径，正是打挂整轮那份）不许复活'
+eq111 "$GPY111" 'with open(path, encoding="utf-8", errors=errors) as fh:' 1 'errors 真的透传进了 open（只在 docstring 里讲道理＝零判据；这一串只出现在唯一的读文件处）'
+eq111 "$GPY111" 'log = read_lines(log_path, errors="replace")' 1 '只有**段日志**这一入口容错：日志是别人写的字节（go test/pytest/ssh 回来的 PS 读数），一个坏字节不该把整遍结论抹掉'
+eq111 "$GPY111" 'lines = read_lines(gate)' 6 '其余六个入口（sections/helpers/emit/classify/summary/check）读**门禁源码**一律严格：源文件里有非法字节＝解析器读的不是人们以为在看的那份脚本，派生读数全部作废比假装能读更安全'
+
+# ── ②c §P2-M：门禁自己的日志面不许按字节截断 ──
+# 三把尺子都是「代码行」锚（`^[[:space:]]*[^#]`）而不是全文计数：本段上面那份说明注释里
+# 抄了旧写法 `${got:0:92}` 作为成因描述，按全文计数就会把这枚锁自己判红（§0929DRILL 同族：
+# 负向 grep 误伤说明注释）。要禁的是**执行态**，不是提它。
+eq111 "$GB111" 'gate_clip() {' 1 '按字符截断的单实现（三处回显共用；写第三份切片就是第二本账）'
+eq111 "$GB111" 'echo "ok - §110 F1 ${1} => $(gate_clip 92 "$got")"' 1 'F1 十二腿的读数回显走 gate_clip（就是 04:39 那轮劈坏一个汉字的那一行）'
+CNT111=$((CNT111 + 1))
+for _p in '^[[:space:]]*[^#].*head -c ' '^[[:space:]]*[^#].*cut -c' '^[[:space:]]*[^#].*\$\{[A-Za-z_][A-Za-z0-9_]*:0:[0-9]+\}'; do
+	_n=$(code_hits111 "$GB111" "$_p")
+	if [ "${_n:-0}" != "0" ]; then
+		echo "--- FAIL: §111 负锁 ${CNT111}（门禁正文里又出现按字节截断「${_p}」，实得 ${_n} 处）"
+		echo "    按字节截断会在三字节汉字中间落一个非法 UTF-8 字节，而这份输出正是收集模式分类器的输入；上面 ②b 的容错只兜底，不授权这里继续写坏字节"
+		exit 1
+	fi
+done
+
+# ── ③ 跨段产物：语义依赖走 gate_need，纯路径变量各段自带 ──
+eq111 "$GB111" 'dg=scripts/deploy_guangzhou.sh' 2 '§20 与 §23 各定义一次（路径变量没有语义依赖，不值得换来一个 SKIP；收集模式下读到空串会让假红挂在 §23 名下）'
+eq111 "$GB111" 'MK_LOAD=cmd/dataload/minute_sync.go' 2 '§91 与 §92 各定义一次（同上）'
+eq111 "$GB111" 'gate_need 110 "$IP110_HAS"' 1 '§110 沿用 §107 扫描读数这件事做成显式依赖声明（不声明＝前段红时本段读空值判红，归属说的是假话）'
+CNT111=$((CNT111 + 1))
+L_S110=$(ln111 "$GB111" 'echo "==> 110')
+L_NEED110=$(ln111 "$GB111" 'gate_need 110 "$IP110_HAS"')
+L_END110=$(ln111 "$GB111" 'echo "ok - §110 全段通过')
+if [ "$L_S110" -le 0 ] || [ "$L_NEED110" -le 0 ] || [ "$L_END110" -le 0 ] || [ "$L_NEED110" -le "$L_S110" ] || [ "$L_NEED110" -ge "$L_END110" ]; then
+	echo "--- FAIL: §111 顺序锁 ${CNT111}（gate_need 110 必须落在 §110 段内且贴近段尾：段头=$L_S110 依赖=$L_NEED110 段尾=${L_END110}）"
+	echo "    放在段中＝前段一红，本段后面四十来道判定一条都不跑，收集模式反而比默认模式少给读数"
+	exit 1
+fi
+
+# ── ④ P2-K：解析入口只有一处，且默认值就是真实 DNS ──
+eq111 "$SRV111" 'var llmURLResolver = net.LookupIP' 1 '注入点的默认值＝真实解析（"生产语义一字未变"这条的落点）'
+eq111 "$SRV111" 'ips, err := llmURLResolver(host)' 1 '闸口走注入点（改回裸 net.LookupIP 时这条与下面的等值计数一起红）'
+eq111 "$SRV111" 'if len(ips) == 0 {' 1 '零地址也拒的 fail-closed 守卫（旧实现里「解析成功但零条」等于放行）'
+CNT111=$((CNT111 + 1))
+LOOKUP_CODE=$(code_hits111 "$SRV111" 'net\.LookupIP')
+if [ "${LOOKUP_CODE:-0}" != "1" ]; then
+	echo "--- FAIL: §111 等值锁 ${CNT111}（server.go 非注释行里 net.LookupIP 应恰好 1 处＝注入点默认值；实得 ${LOOKUP_CODE}）"
+	echo "    第二处直调就是「矩阵又回到测这台机器能不能解析」，10-05 那条断网假红会原样复活"
+	exit 1
+fi
+CNT111=$((CNT111 + 1))
+SEAM_TEST_N=$(ls internal/server/llm_dns_seam_test.go 2>/dev/null | wc -l | tr -d ' ')
+if [ "${SEAM_TEST_N:-0}" != "1" ]; then
+	echo "--- FAIL: §111 文件在位锁 ${CNT111}（llm_dns_seam_test.go 不在位＝SSRF 的三条分支重新变成「只有真 DNS 才走得到」的死支）"
+	exit 1
+fi
+
+# ── 镜像夹具：抽真驱动块 + 合成段体，跑六种失效形态 ──
+p2l_body() { # $1=变体 $2=输出文件
+	case "$1" in
+	two_red) cat > "$2" <<'P2LB_ONE'
+echo "==> 1 生产者段..."
+PRODUCER_VAR=set-by-section-1
+echo "ok - fixture s1"
+
+echo "==> 2 判红段..."
+echo "--- FAIL: fixture s2 deliberate red"
+exit 1
+
+echo "==> 3 绿段..."
+echo "ok - fixture s3"
+
+echo "==> 4 依赖段（消费 §1 写的 PRODUCER_VAR）..."
+P4=0
+if [ -n "${PRODUCER_VAR+set}" ]; then P4=1; fi
+gate_need 4 "$P4" 'fixture：PRODUCER_VAR 由 §1 写入，未定义＝生产者没跑完'
+echo "ok - fixture s4"
+
+echo "==> 5 heredoc 诱饵 + 判红段..."
+cat > "$PWD/.decoy.out" <<'P2LDECOY'
+echo "==> 999 这一段在 heredoc 正文里，解析器不许把它当成真段头"
+exit 1
+P2LDECOY
+echo "--- FAIL: fixture s5 deliberate red"
+exit 1
+
+echo "==> 6 静默退出段（既不判红、也不往下走、日志里也没有收尾标记）..."
+echo "ok - fixture s6 partial"
+exit 0
+
+echo "==> 7 末段..."
+echo "ok - fixture s7"
+
+echo ""
+echo "==> 全部通过"
+P2LB_ONE
+;;
+all_green) cat > "$2" <<'P2LB_TWO'
+echo "==> 1 绿段..."
+G1=1
+echo "ok - fixture g1"
+
+echo "==> 2 绿段..."
+echo "ok - fixture g2"
+
+echo "==> 3 依赖段（生产者就是 §1，同一遍里跑到）..."
+P3=0
+if [ -n "${G1+set}" ]; then P3=1; fi
+gate_need 3 "$P3" 'fixture：G1 由 §1 写入'
+echo "ok - fixture g3"
+
+echo "==> 4 末段..."
+echo "ok - fixture g4"
+
+echo ""
+echo "==> 全部通过"
+P2LB_TWO
+;;
+skip_only) cat > "$2" <<'P2LB_THREE'
+echo "==> 1 绿段（不写任何产物）..."
+echo "ok - fixture k1"
+
+echo "==> 2 依赖段（生产者根本不存在，可前面一条红都没有）..."
+P2=0
+if [ -n "${NEVER_SET_VAR+set}" ]; then P2=1; fi
+gate_need 2 "$P2" 'fixture：依赖声明本身写错了（生产者不存在）'
+echo "ok - fixture k2"
+
+echo "==> 3 末段..."
+echo "ok - fixture k3"
+
+echo ""
+echo "==> 全部通过"
+P2LB_THREE
+;;
+ambiguous) cat > "$2" <<'P2LB_FOUR'
+echo "==> 1 绿段却打印判红文案..."
+echo "--- FAIL: fixture prints a FAIL line and still exits 0"
+echo "ok - fixture a1"
+
+echo "==> 2 末段..."
+echo "ok - fixture a2"
+
+echo ""
+echo "==> 全部通过"
+P2LB_FOUR
+;;
+drift) cat > "$2" <<'P2LB_FIVE'
+echo "==> 1 把工作树改脏的段..."
+touch "$PWD/p2l_drift_file"
+echo "ok - fixture d1"
+
+echo "==> 2 末段..."
+echo "ok - fixture d2"
+
+echo ""
+echo "==> 全部通过"
+P2LB_FIVE
+;;
+order_bad) cat > "$2" <<'P2LB_SIX'
+echo "==> 1 任意段..."
+echo "ok - fixture o1"
+
+echo ""
+echo "==> 全部通过"
+P2LB_SIX
+;;
+esac
+}
+
+p2l_make() { # $1=场景名 $2=段体文件 $3=非空则用「坏装配器」替身
+	local d="$W111/$1"
+	mkdir -p "$d/scripts" "$d/gate"
+	if [ -n "${3:-}" ]; then
+		cat > "$d/scripts/gate_sections.py" <<'P2LFAKE'
+# §P2-L 反证夹具：只替 emit 写一个「没有段标记」的内层脚本，其余子命令原样转给真装配器。
+# 验的是驱动对「装配坏了」的反应。真实坏法可能是 python 抛异常，也可能是更阴的
+# "正常退出、却产出空脚本"——后者只有这种替身造得出来。
+import os
+import runpy
+import sys
+
+REAL = os.environ["P2L_REAL_PY"]
+a = sys.argv[1:]
+if a and a[0] == "emit":
+    with open(a[2], "w", encoding="utf-8") as fh:
+        fh.write('#!/usr/bin/env bash\nset -euo pipefail\ncd "%s"\necho "assembler produced no section markers"\n' % a[3])
+    os.chmod(a[2], 0o755)
+    sys.exit(0)
+sys.argv = ["gate_sections.py"] + a
+runpy.run_path(REAL, run_name="__main__")
+P2LFAKE
+	else
+		ln -sf "$RPY111" "$d/scripts/gate_sections.py"
+	fi
+	printf '%s\n' '.decoy.out' > "$d/.gitignore"
+	git init -q "$d" 2>/dev/null || true
+	{
+		printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+		if [ "$1" = "order_bad" ]; then
+			printf '%s\n' 'cd "$(dirname "$0")/.."'
+			sed -n '/# >>> GATE-COLLECT-DRIVER/,/# <<< GATE-COLLECT-DRIVER/p' "$GB111"
+		else
+			sed -n '/# >>> GATE-COLLECT-DRIVER/,/# <<< GATE-COLLECT-DRIVER/p' "$GB111"
+			printf '%s\n' 'cd "$(dirname "$0")/.."'
+		fi
+		cat "$2"
+	} > "$d/gate/fixture.sh"
+	chmod +x "$d/gate/fixture.sh"
+	printf '%s' "$d"
+}
+
+p2l_scene() { # $1=变体名 → 打印场景目录
+	p2l_body "$1" "$W111/body_$1.txt"
+	p2l_make "$1" "$W111/body_$1.txt"
+}
+
+OUT111=""
+RC111=0
+p2l_run() { # $1=场景目录 $2=附加环境变量串（可空）→ 置全局 OUT111 / RC111
+	local d="$1" extra="${2:-}" rc=0
+	RC111=0
+	if [ -n "$extra" ]; then
+		OUT111="$(cd "$d/gate" && env $extra bash fixture.sh -collect 2>&1)" || rc=$?
+	else
+		OUT111="$(cd "$d/gate" && bash fixture.sh -collect 2>&1)" || rc=$?
+	fi
+	RC111=$rc
+}
+
+# · L1（H1+H2+H3 一夹具四读）：双红 + heredoc 诱饵 + 依赖 + 静默退出
+CNT111=$((CNT111 + 1))
+D111="$(p2l_scene two_red)"
+# R2/R3 两枚反证直接调装配器的 summary/classify：它们的输入是**镜像自己的**段清单（7 段），
+# 不是真门禁的 109 段——拿真门禁去分桶，镜像的 7 段会剩 102 段 MISSING，读数与反证目标无关。
+FIXGATE111="$D111/gate/fixture.sh"
+p2l_run "$D111"
+WORK2RED=$(kv111 WORK "$OUT111")
+if [ "$RC111" = "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（两处刻意判红的镜像在 -collect 下整体 0 退出＝收集模式把红洗成了绿）"
+	exit 1
+fi
+FIDs=$(kv111 FAIL_IDS "$OUT111")
+PIDs=$(kv111 PASS_IDS "$OUT111")
+SIDs=$(kv111 SKIP_IDS "$OUT111")
+ZIDs=$(kv111 SILENT_IDS "$OUT111")
+TOT=$(kv111 TOTAL_SECTIONS "$OUT111")
+if [ "$FIDs" != "2,5" ]; then
+	echo "--- FAIL: §111 行为腿 H1 ${CNT111}（FAIL_IDS 应同时含两处红＝2,5，实得「${FIDs}」；只报第一处就是被改造掉的旧机制复活）"
+	exit 1
+fi
+if [ "$TOT" != "7" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（派生总段数应 7，实得 ${TOT}＝heredoc 正文里那行假段头（==> 999）被当成了真段，或段头正则读不到真段）"
+	exit 1
+fi
+CNT111=$((CNT111 + 1))
+PSUM=$(kv111 PASS_SECTIONS "$OUT111")
+FSUM=$(kv111 FAIL_SECTIONS "$OUT111")
+SSUM=$(kv111 SKIP_SECTIONS "$OUT111")
+ZSUM=$(kv111 SILENT_SECTIONS "$OUT111")
+BAL=$(kv111 BALANCE "$OUT111")
+if [ "$((PSUM + FSUM + SSUM + ZSUM))" != "$TOT" ] || [ "$BAL" != "OK" ]; then
+	echo "--- FAIL: §111 等值锁 H2 ${CNT111}（四桶 $PSUM+$FSUM+$SSUM+$ZSUM=$((PSUM + FSUM + SSUM + ZSUM)) 必须等于派生总段数 ${TOT}，BALANCE=${BAL}）"
+	exit 1
+fi
+if [ "$SIDs" != "4" ]; then
+	echo "--- FAIL: §111 行为腿 H3 ${CNT111}（§4 依赖 §1 的产物、本遍没跑到 ⇒ 必须记 SKIP，实得 SKIP_IDS=「${SIDs}」）"
+	exit 1
+fi
+case ",$PIDs," in
+*,4,*) echo "--- FAIL: §111 行为腿 H3 ${CNT111}（§4 同时出现在 PASS_IDS（${PIDs}）＝依赖没满足的段被算成通过，正是收集模式最该防的形状）"; exit 1 ;;
+esac
+case ",$ZIDs," in
+*,4,*) echo "--- FAIL: §111 行为腿 ${CNT111}（§4 被记成 SILENT（${ZIDs}）＝SKIP_RE 与 gate_need 的标记格式对不上；跳过与静默是两种成因、两种修法，混桶会让人去改错的那一处）"; exit 1 ;;
+esac
+if [ "$ZIDs" != "6" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（§6 静默退出应记 SILENT，实得「${ZIDs}」＝「没验过」被折进了 PASS 或 SKIP）"
+	exit 1
+fi
+printf '%s' "$OUT111" | grep -qF 'GATE-SKIP 4 · fixture' || { echo "--- FAIL: §111 行为腿 ${CNT111}（日志里没有 GATE-SKIP 标记原文＝SKIP 是从别处推出来的，不是段自己声明的）"; exit 1; }
+printf '%s' "$OUT111" | grep -qF 'SKIP_REASON=4·fixture' || { echo "--- FAIL: §111 行为腿 ${CNT111}（汇总没回显 SKIP 成因：现网只看得到「少了一段」，看不出为什么少）"; exit 1; }
+echo "ok - §111 L1（H1 双红同报 $FIDs · H2 四桶 $PSUM/$FSUM/$SSUM/$ZSUM 对 $TOT 闭合 · H3 依赖腿记 SKIP 不进 PASS · 静默退出记 SILENT）"
+
+# · L2（owner 裁决 ①）：默认模式同夹具只报第一处就退
+CNT111=$((CNT111 + 1))
+rc111=0
+DEF111="$(cd "$D111/gate" && bash fixture.sh 2>&1)" || rc111=$?
+if [ "$rc111" = "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（不带 -collect 时镜像第一处红居然继续往下跑＝改动落到了公共前言，默认语义被动过）"
+	exit 1
+fi
+printf '%s' "$DEF111" | grep -qF 'fixture s2 deliberate red' || { echo "--- FAIL: §111 行为腿 ${CNT111}（默认模式没报第一处红，报的是别的东西：$(printf '%s' "$DEF111" | tail -1)）"; exit 1; }
+if printf '%s' "$DEF111" | grep -qF 'fixture s5'; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（默认模式跑到了第二处红＝首红即退被改掉，全仓所有 `verify_changes.sh` 调用点的行为跟着一起变）"
+	exit 1
+fi
+echo "ok - §111 L2（默认模式 rc=${rc111}，只报 §2；§5 只有 -collect 才捞得出来）"
+
+# · L4：全绿镜像 ⇒ 整体 0 退出、四桶全在 PASS、收尾歧义不触发
+CNT111=$((CNT111 + 1))
+D411="$(p2l_scene all_green)"
+p2l_run "$D411"
+if [ "$RC111" != "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（全绿镜像非 0 退出：$(printf '%s' "$OUT111" | tail -2 | tr '\n' ' ')）——收集模式自己红，谁还敢信它给的绿"
+	exit 1
+fi
+if [ "$(kv111 FAIL_SECTIONS "$OUT111")" != "0" ] || [ "$(kv111 PASS_SECTIONS "$OUT111")" != "$(kv111 TOTAL_SECTIONS "$OUT111")" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（全绿时 FAIL 必须 0、PASS 必须等于总段数；实得 FAIL=$(kv111 FAIL_SECTIONS "$OUT111") PASS=$(kv111 PASS_SECTIONS "$OUT111") TOTAL=$(kv111 TOTAL_SECTIONS "$OUT111")）"
+	exit 1
+fi
+echo "ok - §111 L4（全绿 $(kv111 PASS_SECTIONS "$OUT111")/$(kv111 TOTAL_SECTIONS "$OUT111") 段、rc=0）"
+
+# · L5：只有 SKIP、一条红都没有 ⇒ 必须判红（否则「什么都没验」可以穿着绿衣服出场）
+CNT111=$((CNT111 + 1))
+D511="$(p2l_scene skip_only)"
+p2l_run "$D511"
+if [ "$RC111" = "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（有段被 SKIP 而 FAIL/SILENT 全 0，整体却 0 退出）"
+	exit 1
+fi
+printf '%s' "$OUT111" | grep -qF '有段被记 SKIP 却没有任何 FAIL/SILENT' || { echo "--- FAIL: §111 行为腿 ${CNT111}（非零退出不是这条原因拦的，归属必须写清楚：$(printf '%s' "$OUT111" | tail -2 | tr '\n' ' ')）"; exit 1; }
+echo "ok - §111 L5（SKIP-without-FAIL 判红，成因文案在位）"
+
+# · L6：绿段里打印 `--- FAIL` 却 0 退出 ⇒ 收尾歧义判红
+CNT111=$((CNT111 + 1))
+D611="$(p2l_scene ambiguous)"
+p2l_run "$D611"
+if [ "$RC111" = "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（四桶全绿却印着 --- FAIL 文案，收集模式没判歧义＝某段的退出码不代表它的判据）"
+	exit 1
+fi
+printf '%s' "$OUT111" | grep -qF '收尾歧义' || { echo "--- FAIL: §111 行为腿 ${CNT111}（非零退出没走歧义分支：$(printf '%s' "$OUT111" | tail -2 | tr '\n' ' ')）"; exit 1; }
+echo "ok - §111 L6（收尾歧义判红）"
+
+# · L7：某遍把工作树改脏 ⇒ 判红（后面的段读的是脏树，读数归属不再可信）
+CNT111=$((CNT111 + 1))
+D711="$(p2l_scene drift)"
+p2l_run "$D711"
+if [ "$RC111" = "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（镜像段往仓根写了文件，工作树漂移却没判红＝收集模式继续跑后面的段时读的是被改过的树）"
+	exit 1
+fi
+printf '%s' "$OUT111" | grep -qF '把仓库工作树改动' || { echo "--- FAIL: §111 行为腿 ${CNT111}（非零退出不是漂移分支判的：$(printf '%s' "$OUT111" | tail -2 | tr '\n' ' ')）"; exit 1; }
+echo "ok - §111 L7（工作树漂移判红）"
+
+# · L8：装配坏了（emit 产出的脚本没有段标记）⇒ EMPTY 判红，绝不当"跑过了、全绿"
+CNT111=$((CNT111 + 1))
+p2l_body all_green "$W111/body_empty.txt"
+D811="$(p2l_make empty_asm "$W111/body_empty.txt" fake)"
+rc111=0
+OUT111="$(cd "$D811/gate" && P2L_REAL_PY="$RPY111" bash fixture.sh -collect 2>&1)" || rc111=$?
+if [ "$rc111" = "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（内层脚本一个段标记都没有却整体 0 退出——本枚改造要消灭的头号形态复辟）"
+	exit 1
+fi
+printf '%s' "$OUT111" | grep -qF '一个段标记都没有' || { echo "--- FAIL: §111 行为腿 ${CNT111}（非零退出没走 EMPTY 分支：$(printf '%s' "$OUT111" | tail -2 | tr '\n' ' ')）"; exit 1; }
+echo "ok - §111 L8（EMPTY 判红）"
+
+# · L9：驱动块放在 cd 之后（本批真踩过的那次）⇒ 装配器路径算错、当场判红
+CNT111=$((CNT111 + 1))
+D911="$(p2l_scene order_bad)"
+p2l_run "$D911"
+if [ "$RC111" = "0" ]; then
+	echo "--- FAIL: §111 行为腿 ${CNT111}（驱动块在 cd 之后还能正常工作＝上面那枚顺序锁成了摆设）"
+	exit 1
+fi
+printf '%s' "$OUT111" | grep -qF '找不到装配器' || { echo "--- FAIL: §111 行为腿 ${CNT111}（非零退出没走「装配器不在位」分支，顺序坏法的读数不可归属）"; exit 1; }
+echo "ok - §111 L9（顺序坏法当场现形）"
+
+# ── R1/R2/R3：把本批真改坏过的三处退回旧实现，缺陷必须在同一个夹具上复现 ──
+CNT111=$((CNT111 + 1))
+IN111="$W111/inner_104.sh"
+prelude111() { # $1=内层脚本 $2=段号 → 只回显"前置搬运区"（尾体第一行段标记之前）
+	local f="$1" sid="$2" cut_ln
+	cut_ln=$(grep -nF "echo \"GATE-SECTION-START ${sid}\"" "$f" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	case "$cut_ln" in
+	''|*[!0-9]*) cat "$f" ;;
+	*) sed -n "1,$((cut_ln - 1))p" "$f" ;;
+	esac
+}
+# 为什么只量前置区：内层脚本的尾体是"从 104 段起到文件尾"，本段（111）自己的锁文案就在尾体里，
+# 而文案里正抄着 `py_tests() {` 这三串——拿整份内层脚本数"恰好一处"，数到的是"搬运一次 + 本段抄两处"，
+# 与 §111 开头的切片同一个道理（切片在 GB111，这里在 prelude）。判据要量的是**前置区搬没搬**，别的都不算。
+EMIT104_RC=0
+python3 "$GPY111" emit "$GS111" 104 "$IN111" "$PWD" 2>"$W111/emit_104.err" || EMIT104_RC=$?
+if [ "$EMIT104_RC" != "0" ] || [ ! -s "$IN111" ]; then
+	echo "--- FAIL: §111 装配搬运腿 ${CNT111}（emit 104 没产出内层脚本：rc=${EMIT104_RC}、产物非空=$([ -s "$IN111" ] && echo yes || echo no)、装配器首行=$(head -1 "$W111/emit_104.err" 2>/dev/null)）"
+	echo "    这一腿的输入全部来自 emit 的产物；产物没有就直接判红，而不是拿着空文件去比计数——空文件会报成「函数没搬」，归属说假话（本批 04:1x 实录：删掉搬运注释时把 emit 调用一起删了，整腿只剩 cat: No such file 的裸错，集齐两轮才定位到）"
+	exit 1
+fi
+PRE104="$W111/prelude_104.txt"
+prelude111 "$IN111" 104 > "$PRE104"
+N_PYTEST=$(grep -cF 'py_tests() {' "$PRE104" 2>/dev/null || true)
+N_NEED=$(grep -cF 'gate_need() {' "$PRE104" 2>/dev/null || true)
+N_GW=$(grep -cF 'gw_code_hits() {' "$PRE104" 2>/dev/null || true)
+if [ "${N_PYTEST:-0}" != "1" ] || [ "${N_NEED:-0}" != "1" ] || [ "${N_GW:-0}" != "1" ]; then
+	echo "--- FAIL: §111 装配搬运腿 ${CNT111}（§104 内层脚本的**前置搬运区**里 py_tests=${N_PYTEST} gate_need=${N_NEED} gw_code_hits=${N_GW}，应各 1）"
+	echo "    少搬一个函数＝那段在收集模式里报 command not found，读数写着「§N 缺陷」，而真正坏的是装配器"
+	exit 1
+fi
+python3 - "$GPY111" "$W111/gs_r1.py" <<'P2LR1'
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+old = "        if mask[i]:\n            continue\n        fm = FUNC_RE.match(line)"
+new = "        if mask[i] or i < prologue_end:\n            continue\n        fm = FUNC_RE.match(line)"
+if src.count(old) != 1:
+    raise SystemExit("R1 反证：目标锚不唯一（%d 处）——这枚反证作废而不是勉强通过" % src.count(old))
+pathlib.Path(sys.argv[2]).write_text(src.replace(old, new), encoding="utf-8")
+P2LR1
+EMITR1_RC=0
+python3 "$W111/gs_r1.py" emit "$GS111" 104 "$W111/inner_r1.sh" "$PWD" 2>"$W111/emit_r1.err" || EMITR1_RC=$?
+if [ "$EMITR1_RC" != "0" ] || [ ! -s "$W111/inner_r1.sh" ]; then
+	echo "--- FAIL: §111 反证 R1 ${CNT111}（旧装配器连内层脚本都没产出（rc=${EMITR1_RC}、首行=$(head -1 "$W111/emit_r1.err" 2>/dev/null)））"
+	echo "    R1 的正判据是「旧装配器搬 0 处」，而「文件根本不存在」也会读到 0——不先断产物在位，这枚反证会在装配器彻底坏掉时**假绿**"
+	exit 1
+fi
+PRE_R1="$W111/prelude_r1.txt"
+prelude111 "$W111/inner_r1.sh" 104 > "$PRE_R1"
+BAD_PYTEST=$(grep -cF 'py_tests() {' "$PRE_R1" 2>/dev/null || true)
+if [ "${BAD_PYTEST:-0}" != "0" ]; then
+	echo "--- FAIL: §111 反证 R1 ${CNT111}（退回「前言函数排除」后内层脚本仍有 py_tests ${BAD_PYTEST} 处＝上面那枚搬运腿压根没在测装配器，只测了个字符串）"
+	exit 1
+fi
+echo "ok - §111 R1（现实现搬 1 处 / 退回旧实现搬 0 处：这枚锁真的在管「前言函数搬不搬」）"
+
+CNT111=$((CNT111 + 1))
+if [ -z "$WORK2RED" ]; then
+	echo "--- FAIL: §111 反证 R2 ${CNT111}（拿不到 two_red 的工作目录，R2/R3 只能空过——空过的反证等于没有反证）"
+	exit 1
+fi
+python3 - "$GPY111" "$W111/gs_r2.py" <<'P2LR2'
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+# 退回本批第一轮实跑的那个形状：四桶同用逗号切，且分号循环只填 skip_reason、不填桶。
+pairs = [
+    ('        for key in ("PASS", "FAIL", "SILENT"):', '        for key in buckets:'),
+    ('                    buckets["SKIP"].append(int(sid))\n', ''),
+    ('            elif chunk.strip().isdigit():\n                buckets["SKIP"].append(int(chunk))\n', ''),
+]
+out = src
+for old, new in pairs:
+    if out.count(old) != 1:
+        raise SystemExit("R2 反证：目标锚不唯一（%r 出现 %d 次）" % (old, out.count(old)))
+    out = out.replace(old, new)
+pathlib.Path(sys.argv[2]).write_text(out, encoding="utf-8")
+P2LR2
+BAD_SUM="$W111/summary_r2.txt"
+python3 "$W111/gs_r2.py" summary "$FIXGATE111" "$WORK2RED" > "$BAD_SUM" 2>/dev/null || true
+BAD_SKIP=$(sed -n 's/^SKIP_SECTIONS\t//p' "$BAD_SUM")
+BAD_BAL=$(sed -n 's/^BALANCE\t//p' "$BAD_SUM")
+if [ "${BAD_SKIP:-1}" != "0" ]; then
+	echo "--- FAIL: §111 反证 R2 ${CNT111}（旧写法下 SKIP_SECTIONS 仍然是 ${BAD_SKIP}＝这条桶压根没被「逗号切」影响，正向腿是蒙对的）"
+	exit 1
+fi
+case "$BAD_BAL" in
+MISSING:4*) ;;
+*) echo "--- FAIL: §111 反证 R2 ${CNT111}（旧写法应把 §4 凭空丢掉并报 MISSING:4，实得 BALANCE=${BAD_BAL}）"; exit 1 ;;
+esac
+CNT111=$((CNT111 + 1))
+GOOD_RUN="$W111/good_summary.txt"
+python3 "$GPY111" summary "$FIXGATE111" "$WORK2RED" > "$GOOD_RUN" 2>/dev/null || true
+GOOD_SKIP=$(sed -n 's/^SKIP_SECTIONS\t//p' "$GOOD_RUN")
+GOOD_BAL=$(sed -n 's/^BALANCE\t//p' "$GOOD_RUN")
+if [ "${GOOD_SKIP:-0}" != "1" ] || [ "$GOOD_BAL" != "OK" ]; then
+	echo "--- FAIL: §111 汇总腿 ${CNT111}（真装配器在 two_red 上报 SKIP=$GOOD_SKIP BALANCE=${GOOD_BAL}，应为 1/OK）"
+	exit 1
+fi
+echo "ok - §111 R2（旧写法 SKIP=0 且 BALANCE=${BAD_BAL}；现实现 SKIP=1 且闭合）"
+
+CNT111=$((CNT111 + 1))
+python3 - "$GPY111" "$W111/gs_r3.py" <<'P2LR3'
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+old = "        elif started[-1] in skipped:\n"
+if src.count(old) != 1:
+    raise SystemExit("R3 反证：目标锚不唯一（%d 处）" % src.count(old))
+head, rest = src.split(old, 1)
+tail = rest.split("        elif not done:", 1)
+if len(tail) != 2:
+    raise SystemExit("R3 反证：找不到紧随其后的 `elif not done:`，退回旧实现的形状不确定")
+pathlib.Path(sys.argv[2]).write_text(head + "        elif not done:" + tail[1], encoding="utf-8")
+P2LR3
+LOG2="$WORK2RED/log_2.txt"
+if [ ! -f "$LOG2" ]; then
+	echo "--- FAIL: §111 反证 R3 ${CNT111}（two_red 第 2 遍日志不在位，R3 没有输入）"
+	exit 1
+fi
+BAD_CLS=$(python3 "$W111/gs_r3.py" classify "$FIXGATE111" "$LOG2" 0 2>/dev/null | sed -n 's/^SILENT\t//p')
+GOOD_CLS=$(python3 "$GPY111" classify "$FIXGATE111" "$LOG2" 0 2>/dev/null | sed -n 's/^SILENT\t//p')
+if [ "${BAD_CLS:-}" != "4" ]; then
+	echo "--- FAIL: §111 反证 R3 ${CNT111}（去掉 skip 归属分支后 §4 没被判成 SILENT，实得「${BAD_CLS}」＝那条分支本来就没起作用，正向腿是蒙的）"
+	exit 1
+fi
+if [ "${GOOD_CLS:-x}" = "4" ]; then
+	echo "--- FAIL: §111 分类腿 ${CNT111}（现实现仍把主动跳过的段记成 SILENT：跳过与静默两种成因混在一桶，修法会跟着错）"
+	exit 1
+fi
+echo "ok - §111 R3（旧实现把跳过的段读成 SILENT；现实现读成 SKIP）"
+
+# ── ⑤ §P2-M 的两条行为腿 + 一枚反证：分类器读日志的编码口径、gate_clip 的按字符截断 ──
+#
+# 这一组是本轮自己踩出来的：整轮 `-full -collect` 第一轮（04:39）跑完 109 段全绿、日志里一条
+# `--- FAIL` 都没有，却因为 §110 回显里一个被劈开的汉字（position 162180 的 0xe6）把分类器打挂，
+# 汇总于是报 `BALANCE=MISSING:1,2,…,111`。所以这两条腿断言的不是"段会不会红"，而是
+# **"结论会不会因为一个字节的编码质量而整批消失"**——收集模式最怕的就是这个。
+#
+# L10 的输入是**合成**的而不是那份 /tmp 日志：现网复跑不能依赖上一轮留下的临时目录，
+# 半个多字节字符直接按字节写出来（`\xe6` 孤尾＝真实现落下的形状），这样这条腿在任何机器、
+# 任何 locale 下都拿得到同一个输入。
+CNT111=$((CNT111 + 1))
+BADLOG="$W111/p2m_bad.log"
+python3 - "$BADLOG" <<'P2MB' || { echo "--- FAIL: §111 行为腿 L10 ${CNT111}（合成不了含半截多字节字符的日志＝L10 没有输入，空过的行为腿等于没有行为腿）"; exit 1; }
+import sys
+# 三条段标记 + 收尾标记，其中第二条正文结尾故意留一个孤立的 0xe6（三字节汉字的第一个字节）。
+body = (
+    b"GATE-SECTION-START 1\n"
+    b"ok - fixture m1\n"
+    b"GATE-SECTION-START 2\n"
+    b"ok - \xe4\xb8\xad\xe6\x96\x87\xe8\xaf\xbb\xe6\x95\xb0\xe5\x8d\n"
+    b"GATE-SECTION-START 3\n"
+    b"ok - fixture m3\n"
+    b"\n"
+    b"==> \xe5\x85\xa8\xe9\x83\xa8\xe9\x80\x9a\xe8\xbf\x87\n"
+)
+open(sys.argv[1], "wb").write(body)
+try:
+    body.decode("utf-8")
+    raise SystemExit("输入自己不非法＝这枚反证从一开始就没有被测对象")
+except UnicodeDecodeError:
+    pass
+P2MB
+rc111=0
+L10OUT="$(python3 "$GPY111" classify "$GS111" "$BADLOG" 0 2>&1)" || rc111=$?
+if [ "$rc111" != "0" ]; then
+	echo "--- FAIL: §111 行为腿 L10 ${CNT111}（分类器被一个坏字节打挂＝收集模式把自己的结论弄丢了，04:39 那轮就是这个读数）：$(printf '%s' "$L10OUT" | tail -2 | tr '\n' ' ')"
+	exit 1
+fi
+L10STARTED=$(printf '%s\n' "$L10OUT" | sed -n 's/^STARTED\t//p')
+L10PASS=$(printf '%s\n' "$L10OUT" | sed -n 's/^PASS\t//p')
+L10EMPTY=$(printf '%s\n' "$L10OUT" | sed -n 's/^EMPTY\t//p')
+L10DONE=$(printf '%s\n' "$L10OUT" | sed -n 's/^DONE\t//p')
+if [ "$L10STARTED" != "1,2,3" ] || [ "$L10PASS" != "1,2,3" ]; then
+	echo "--- FAIL: §111 行为腿 L10 ${CNT111}（坏字节改变了段归属：STARTED=「${L10STARTED}」PASS=「${L10PASS}」，应为 1,2,3／1,2,3——容错解码只许换掉那一个字符，不许动判据依赖的 ASCII 结构）"
+	exit 1
+fi
+[ "$L10EMPTY" = "0" ] || { echo "--- FAIL: §111 行为腿 L10 ${CNT111}（EMPTY=${L10EMPTY}：段标记明明在位却被读成「一个段都没有」，汇总会走 MISSING 面把整轮抹掉）"; exit 1; }
+[ "$L10DONE" = "1" ] || { echo "--- FAIL: §111 行为腿 L10 ${CNT111}（收尾标记读不到（DONE=${L10DONE}）：半截中文所在的行之后就没有结论了，本遍会被判 SILENT）"; exit 1; }
+echo "ok - §111 L10（含孤立 0xe6 的日志照样分出三桶 STARTED/PASS=1,2,3、EMPTY=0、DONE=1：一个坏字节不再能抹掉整轮结论）"
+
+# R4：把容错那行退回严格——同一个输入必须复现"整遍报废"，否则上面 L10 是蒙绿的。
+CNT111=$((CNT111 + 1))
+python3 - "$GPY111" "$W111/gs_r4.py" <<'P2MR4'
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+old = 'log = read_lines(log_path, errors="replace")'
+new = "log = read_lines(log_path)"
+if src.count(old) != 1:
+    raise SystemExit("R4 反证：目标锚不唯一（%d 处）——这枚反证作废而不是勉强通过" % src.count(old))
+pathlib.Path(sys.argv[2]).write_text(src.replace(old, new), encoding="utf-8")
+P2MR4
+rc111=0
+R4OUT="$(python3 "$W111/gs_r4.py" classify "$GS111" "$BADLOG" 0 2>&1)" || rc111=$?
+if [ "$rc111" = "0" ]; then
+	echo "--- FAIL: §111 反证 R4 ${CNT111}（退回严格解码后分类器仍然 0 退出＝L10 那行容错根本不是必需的，这组锁只剩形状）"
+	exit 1
+fi
+printf '%s' "$R4OUT" | grep -qF 'UnicodeDecodeError' || { echo "--- FAIL: §111 反证 R4 ${CNT111}（非零退出却没死在解码上，说明坏法是别的东西，L10 与 R4 不是同一条因果链：$(printf '%s' "$R4OUT" | tail -2 | tr '\n' ' ')）"; exit 1; }
+if printf '%s' "$R4OUT" | grep -qF 'STARTED'; then
+	echo "--- FAIL: §111 反证 R4 ${CNT111}（严格解码下仍然给出了 STARTED＝容错与严格在分类器里根本没有区别）"
+	exit 1
+fi
+echo "ok - §111 R4（同一份输入退回严格解码：UnicodeDecodeError、零键值输出＝04:39 那轮「109 段全 MISSING」的真实成因被复现）"
+
+# L11：gate_clip 必须在 LC_ALL=C 下仍按**字符**截断。
+# 抽的是仓库里那一份定义而不是在测试里重写一遍：重写就变成"测我自己抄的那份"，
+# 与 §110 真正回显时用的实现脱钩（同族：判据按运行时真实取值链，不按注释里的描述）。
+CNT111=$((CNT111 + 1))
+GC_DEF_LN=$(ln111 "$GS111" 'gate_clip() {')
+if [ "$GC_DEF_LN" -le 0 ]; then
+	echo "--- FAIL: §111 行为腿 L11 ${CNT111}（门禁里找不到 gate_clip 的定义行＝②c 那枚单实现锁与这条腿量的不是同一个东西）"
+	exit 1
+fi
+awk -v n="$GC_DEF_LN" 'NR>=n{print; if ($0=="}") exit}' "$GS111" > "$W111/gc.sh"
+grep -qF 'gate_clip() {' "$W111/gc.sh" || { echo "--- FAIL: §111 行为腿 L11 ${CNT111}（抽函数体抽出来是空的：拿空文件 source 之后再跑这条腿，恒绿）"; exit 1; }
+[ "$(tail -1 "$W111/gc.sh")" = "}" ] || { echo "--- FAIL: §111 行为腿 L11 ${CNT111}（抽到的不是完整函数（末行不是顶格 `}`）：截半的函数体 source 会炸，读数归属就不在这条腿上了）"; exit 1; }
+# 就是 04:39 那轮被劈坏的那条读数原文（§110 leg110 的 g 腿）。
+GOT110='FAIL|ops:scheduled-task roster in place + periodic tasks fresh|no-task-readings（PS 侧一段都没回传，判据失明而不是"全部健康"）'
+LC_ALL=C bash -c 'source "$0"; gate_clip 92 "$1"' "$W111/gc.sh" "$GOT110" > "$W111/clip_new.out"
+LC_ALL=C bash -c 'printf %s "${1:0:92}"' x "$GOT110" > "$W111/clip_old.out"
+rc111=0
+CLIP_READ="$(python3 - "$W111/clip_new.out" "$W111/clip_old.out" <<'P2MC'
+import sys
+
+new = open(sys.argv[1], "rb").read()
+old = open(sys.argv[2], "rb").read()
+try:
+    t = new.decode("utf-8")
+except UnicodeDecodeError as exc:
+    raise SystemExit("BADNEW 现写法自己就落下非法字节（%s）" % exc)
+if len(t) != 92:
+    raise SystemExit("BADLEN 现写法截出 %d 个字符，应 92（上限写坏了＝同一把尺子量不出同一件事）" % len(t))
+if len(new) <= 92:
+    raise SystemExit("BADBYTES 现写法输出只有 %d 字节＝它还是在按字节切，中文全被当成一字节" % len(new))
+try:
+    old.decode("utf-8")
+except UnicodeDecodeError:
+    sys.exit(0)
+raise SystemExit("BADOLD 旧写法（LC_ALL=C 下的 ${x:0:92}）这次没劈坏字符＝反证失去被测对象，"
+                 "这条腿的绿不能算数（换输入或换 locale 都会造成这种假象，所以 L11 强制 LC_ALL=C 跑）")
+P2MC
+)" || rc111=$?
+if [ "$rc111" != "0" ]; then
+	echo "--- FAIL: §111 行为腿 L11 ${CNT111}（截断口径不符：${CLIP_READ}）"
+	exit 1
+fi
+echo "ok - §111 L11（LC_ALL=C 下 gate_clip 输出 $(wc -c < "$W111/clip_new.out" | tr -d ' ') 字节／恰好 92 字符且严格可解码；同一输入旧写法落下非法字节——04:39 那个字节正是从这一行进到分类器的）"
+
+# ── P2-K 的 I1/I2：断网形态与"改回直调必红" ──
+CNT111=$((CNT111 + 1))
+rc111=0
+I111="$(HTTP_PROXY=http://127.0.0.1:1 HTTPS_PROXY=http://127.0.0.1:1 NO_PROXY= go test -count=1 -v ./internal/server/ -run 'TestLLMURLResolverSeamIsHermetic|TestValidatePublicURL|TestSetLLMConfigRejectsReservedAddressThroughHTTP|TestSetLLMConfigResolvesUnresolvableHostThroughHTTP' 2>&1)" || rc111=$?
+if [ "$rc111" != "0" ]; then
+	echo "--- FAIL: §111 行为腿 I1 ${CNT111}（黑洞代理下解析腿判红＝那条腿还在真出呼，红来自环境而不是被测代码；10-05 实录「断网判红、单跑 PASS 17.99s」就是这一形态）：$(printf '%s' "$I111" | tail -3 | tr '\n' ' ')"
+	exit 1
+fi
+printf '%s' "$I111" | grep -qE '^ok' || { echo "--- FAIL: §111 行为腿 I1 ${CNT111}（0 退出却没有 ok 行——十有八九是被测用例一条都没匹配上，判据空转）"; exit 1; }
+# 数**顶格** `--- PASS`（顶层用例）而不是任意 PASS 行：go test 不带 -v 时，`-run` 的正则哪怕一条用例
+# 都没匹配上，也照样打 `ok  ...  [no tests to run]` 并以 0 退出——只看 `^ok` 的判据会把它读成"全绿"，
+# 于是"注入点被删、用例集体改名"这种坏法在这条腿上表现为一枚漂亮的绿（0929 那批"判据空转"同族）。
+I1PASS=$(printf '%s' "$I111" | grep -cE '^--- PASS' || true)
+min111 '黑洞代理下真跑到的顶层用例数（应≥6：注入点在位性/预留地址归属/解析成功与失败四例/两条 HTTP 腿）' "$I1PASS" "6"
+echo "ok - §111 I1（黑洞代理下解析腿全绿：顶层用例 ${I1PASS} 条真跑到）"
+
+CNT111=$((CNT111 + 1))
+mkdir -p "$W111/i2"
+sed -e 's/ips, err := llmURLResolver(host)/ips, err := net.LookupIP(host)/' "$SRV111" > "$W111/i2/server.go"
+BAD_CALL=$(grep -cF 'llmURLResolver(host)' "$W111/i2/server.go" 2>/dev/null || true)
+GOOD_CALL=$(grep -cF 'llmURLResolver(host)' "$SRV111" 2>/dev/null || true)
+if [ "${BAD_CALL:-1}" != "0" ] || [ "${GOOD_CALL:-0}" != "1" ]; then
+	echo "--- FAIL: §111 反证 I2 ${CNT111}（镜像里 llmURLResolver(host)=${BAD_CALL}（应 0）、真文件=${GOOD_CALL}（应 1）：这一对读数是「改回直调必红」的唯一证据，任一不符都说明锁只剩形状）"
+	exit 1
+fi
+BAD_LOOK=$(code_hits111 "$W111/i2/server.go" 'net\.LookupIP')
+if [ "${BAD_LOOK:-0}" != "2" ]; then
+	echo "--- FAIL: §111 反证 I2 ${CNT111}（退回直调后非注释行 net.LookupIP 应为 2 处＝注入点默认值 + 被改坏的调用点，实得 ${BAD_LOOK}：等值锁与这枚反证用的不是同一把尺子）"
+	exit 1
+fi
+echo "ok - §111 I2（真文件 1 处注入调用 / 镜像退回直调 0 处注入调用且 DNS 直调 2 处：上面那枚等值锁的坏法可复现）"
+
+# ── ⑥ §P1-C 的 G2：gofmt 锁的正向对照（证明 §104 那条「输出为空」是判据，不是命令坏了）──
+#
+# 为什么这条腿值得立：§104 的写法是 `GOFMT_DIRTY=$(gofmt -l internal cmd 2>/dev/null || true)`。
+# 命令不在 PATH、go 环境坏了、或者哪天把目录名写成一个不存在的目录，它都会**安静地给出空串**，
+# 于是「必须为空」那枚等值锁退化成恒绿装饰——而 10-05 那条「HEAD 自带未格式化文件入库」的缺陷
+# 恰恰是靠它拦的。单向的「为空」必须配一个「写歪了一定抓得到」的对照（等值锁非单向锁）。
+CNT111=$((CNT111 + 1))
+command -v gofmt >/dev/null 2>&1 || { echo "--- FAIL: §111 行为腿 G2 ${CNT111}（PATH 里没有 gofmt：§104 在这台机器上永远绿，而它的绿什么都不证明）"; exit 1; }
+mkdir -p "$W111/g2"
+printf 'package p\n\nfunc F() int {\n        return 1\n}\n' > "$W111/g2/g2.go"
+gofmt -l "$W111/g2" > "$W111/g2_dirty.txt" 2>/dev/null || true
+grep -qF 'g2.go' "$W111/g2_dirty.txt" || {
+	echo "--- FAIL: §111 行为腿 G2 ${CNT111}（镜像里故意用空格缩进的 Go 文件没被 gofmt -l 点名：§104 那枚「输出必须为空」失去对照，它的绿不再等于「格式干净」）"
+	echo "    实得：$(tr '\n' ' ' < "$W111/g2_dirty.txt")"
+	exit 1
+}
+# 复位后再测一次同一目录必须变空：只看「抓到过一次」不够——残留或文件名巧合都能造出那一次抓到。
+gofmt -w "$W111/g2/g2.go" 2>/dev/null || true
+G2_CLEAN=$(gofmt -l "$W111/g2" 2>/dev/null || true)
+[ -z "$G2_CLEAN" ] || { echo "--- FAIL: §111 行为腿 G2 ${CNT111}（gofmt -w 之后镜像仍有未格式化文件「${G2_CLEAN}」＝这枚对照不可复现，正向那次的归属就不可信）"; exit 1; }
+echo "ok - §111 G2（写歪必被抓、复位后必空：§104 的空输出是判据而不是命令缺失的副产品）"
+
+# ── G3：批验证口令的自证清单（判据从 git log 派生，不写死提交号）──
+CNT111=$((CNT111 + 1))
+MSG111=$(git log -1 --format=%B 2>/dev/null || true)
+PREV111=$(git log -1 --skip=1 --format=%B 2>/dev/null || true)
+HAS_HEAD=0
+if printf '%s' "$MSG111" | grep -qE '(GATE|VERIFY)_EXIT=[0-9]+'; then HAS_HEAD=1; fi
+HAS_PREV=0
+if printf '%s' "$PREV111" | grep -qE '(GATE|VERIFY)_EXIT=[0-9]+'; then HAS_PREV=1; fi
+if [ "$HAS_HEAD" = "0" ] && [ "$HAS_PREV" = "0" ]; then
+	echo "--- FAIL: §111 自证清单锁 ${CNT111}（连续两批提交说明都没有整轮门禁读数 GATE_EXIT=/VERIFY_EXIT= ⇒「没跑全量门禁」和「跑了但没写」在事后看不出区别，069c380 那次就是这么把 §105–107 埋掉的）"
+	exit 1
+elif [ "$HAS_HEAD" = "0" ]; then
+	echo "观察读数（不判红，G3 首犯只提醒）：HEAD 提交说明缺整轮门禁读数（GATE_EXIT=/VERIFY_EXIT=），上一批有 ⇒ 连续两批缺即红"
+fi
+echo "ok - §111 G3（HEAD 有读数=$HAS_HEAD / 上一批有读数=${HAS_PREV}）"
+
+# ── 派生面正锁：装配器读得出段清单与跨段依赖（它自己的两个分母）──
+CNT111=$((CNT111 + 1))
+SEC_N=$(python3 "$GPY111" sections "$GS111" 2>/dev/null | awk -F'\t' '$1=="TOTAL"{print $2}')
+HELP_N=$(python3 "$GPY111" helpers "$GS111" 2>/dev/null | sed -n 's/^HELPDERIVED\t//p')
+CHK_OUT=$(python3 "$GPY111" check "$GS111" 2>&1 || true)
+min111 '门禁派生段数应 ≥108（收集模式的分母；解析器与脚本格式脱节时会读出很小的数甚至 0，那比红更危险——它把「没跑到」报成「跑完了」）' "$SEC_N" "108"
+min111 '跨段 helper 依赖应派生出 ≥3 条（gw_* 三件＋§110 那枚按字符截断的 helper——它在 111 段里只以"被锁判的字符串"形态出现，装配器按词命中就把它搬进前置区，多搬一枚纯函数无害，少搬才是事）：派生为 0＝搬运腿空转，内层脚本会安静地少搬函数' "$HELP_N" "3"
+printf '%s' "$CHK_OUT" | grep -qE 'CHECK[[:space:]]+OK' || { echo "--- FAIL: §111 自检腿 ${CNT111}（gate_sections.py check 没报 OK：$(printf '%s' "$CHK_OUT" | tail -2 | tr '\n' ' ')）——前言里出现了非函数副作用语句，内层脚本会少搬那一句）"; exit 1; }
+echo "ok - §111 派生面（段数=$SEC_N 跨段 helper=$HELP_N check=OK）"
+
+rm -rf "$W111"
+echo "ok - §111 全段通过：收集模式静态锁 + 十条镜像行为腿（L1 内含 H1/H2/H3 三枚等值锁，另含 SKIP/SILENT 归属；L2 默认模式语义不变；L4 全绿闭合；L5 SKIP-without-FAIL；L6 收尾歧义；L7 工作树漂移；L8 EMPTY；L9 搬运顺序；L10 日志编码容错；L11 按字符截断）+ 五枚退回旧实现的反证（R1/R2/R3/R4/I2）+ P2-K 注入点等值锁与黑洞代理腿 I1 + G2 gofmt 对照 + G3 自证清单 + 派生面正锁，累计判定点 ${CNT111}"
 echo ""
 echo "==> 全部通过"

@@ -2405,7 +2405,26 @@ func validateGatewayURL(raw string) error {
 	return nil
 }
 
-// validatePublicURL §GAP2-W2 外呼 URL 校验（scrm P1-f 同源思路）：
+// llmURLResolver §P2-K（2026-10-07 修复批 波 4）：外呼地址解析的**注入点**，默认就是真实 DNS。
+//
+// 为什么留这个点（和它顺手补上的东西）：
+//  1. validatePublicURL 以前直接 `net.LookupIP`，于是"矩阵里的一条正例"实际钉的是**这台机器能不能解析
+//     example.com / api.siliconflow.cn**。10-05 全量审计实录：断网时 `lookup api.siliconflow.cn: no such
+//     host` 判红，一分钟后单跑 PASS 17.99s——判红来自环境而不是来自被测代码，这种红会把真缺陷埋掉
+//     （本仓的"离线自证"纪律针对的正是它）。
+//  2. 更要紧的是：这个点让 SSRF 判据**第一次可测**。以前"拒绝内网/保留地址""解析失败即拒"两条分支
+//     在测试里根本走不到（要走到就得真解析出一个内网地址），于是安全阀只有形状、没有行为证据。
+//     现在用例注入 127.0.0.1 / 169.254.169.254 / 解析错误三种结果，断的是拒绝文案的**归属**：
+//     有人把代码改回直调 net.LookupIP，注入立刻失效、归属随之改变，用例当场判红（判据不会自我安慰）。
+//
+// 生产路径不做任何替换（与 llmProber 同一姿势：注入点只在测试里被赋值）。
+// 并发口径：包内用例不用 t.Parallel、同包内顺序执行，因此这里不加锁——与 llmProber 一致。
+// English: seam for host resolution used by validatePublicURL; production keeps net.LookupIP.
+// Tests inject deterministic answers so the matrix never depends on this machine's DNS, and the
+// SSRF branches (private/link-local/unresolvable) become reachable and attributable.
+var llmURLResolver = net.LookupIP
+
+// validatePublicURL §GAP2-W2 外呼地址校验（scrm P1-f 同源思路）：
 // 仅允许 http/https；域名解析后逐 IP 拒绝环回/私网/链路本地(含云元数据)/未指定/组播，
 // 解析失败一律拒绝（fail-closed）。用于 LLM api_url 与通知 webhook 等服务器外呼地址。
 // English: validates an outbound URL: http(s) only, and every resolved IP must not be
@@ -2422,9 +2441,19 @@ func validatePublicURL(raw string) error {
 	if host == "" {
 		return fmt.Errorf("缺少主机名")
 	}
-	ips, err := net.LookupIP(host)
+	// §P2-K：走注入点，不走裸 net.LookupIP（生产默认值就是它，语义一字未变）。
+	ips, err := llmURLResolver(host)
 	if err != nil {
 		return fmt.Errorf("主机解析失败: %v", err)
+	}
+	// §P2-K 补的 fail-closed 洞：`err == nil 且 零条地址` 在旧实现里等于**放行**——下面的 for 循环
+	// 一次都不走，函数直接返回 nil，于是「什么都没查到」被当成「查过了、干净」。真实世界确实会出这种
+	// 结果（只有 AAAA 无 A 记录、上游解析库返回空集），而这一条正是安全阀最阴的失效形态：
+	// 不报错、不判红、静默允许任意外呼地址。现在与解析失败同口径拒绝。
+	// English: an empty answer set is treated exactly like a resolution failure (refuse), because
+	// the per-IP loop below would otherwise let the URL through without checking anything.
+	if len(ips) == 0 {
+		return fmt.Errorf("主机解析失败: %s 无可用地址（空结果按不通过处理，不当作已核验）", host)
 	}
 	for _, ip := range ips {
 		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||

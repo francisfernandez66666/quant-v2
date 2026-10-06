@@ -33,17 +33,28 @@ const htmlLoginPage = `<!DOCTYPE html><html lang="zh"><head><meta charSet="utf-8
 // evidence, an unverifiable config is adopted with an explicit warning, and there is always a
 // rollback point. Verification never touches the disk unless we actually switched.
 
-// TestMain 给整个包安装"确定性探测"。
+// TestMain 给整个包安装"确定性探测"+"确定性解析"。
 //
 // 本包用例专注验证**决策链**（探测结论 → 是否切换/落库/拒绝），而探测本身的分类正确性
 // 由 internal/llm/probe_test.go 用 httptest 真实验证（那里有真 HTTP）。
 // 不装的话，既有用例里 api_url 指向 example.com 会让每次保存都真的出网：慢、不确定、
 // 无网环境下还会假失败。
+//
+// §P2-K（2026-10-07 修复批 波 4）同一处置收到解析腿：prepareLLMCandidate 的 SSRF 校验要
+// 先把主机名解析成 IP 才能判「是不是内网」，于是不装解析桩时，**正例路径的绿挂在这台机器的
+// DNS 上**（10-05 实录：`lookup api.siliconflow.cn: no such host` 判红、一分钟后单跑 PASS）。
+// 装上之后域名一律解析到 hermetic 公网夹具地址，而内网/保留地址的拒绝只能由用例自己注入
+// ——安全阀的两条分支第一次既可达又可归属（见 llm_dns_seam_test.go）。
+// English: TestMain installs both the deterministic prober and the deterministic resolver, so the
+// matrix is offline-reproducible and the SSRF branches become testable.
 func TestMain(m *testing.M) {
 	orig := llmProber
+	origResolver := llmURLResolver
 	llmProber = stubProbe()
+	llmURLResolver = hermeticResolver
 	code := m.Run()
 	llmProber = orig
+	llmURLResolver = origResolver
 	os.Exit(code)
 }
 
@@ -150,10 +161,15 @@ const goodKey = "sk-live-good-key"
 
 // 测试地址统一挂在 example.com 下、用不同**路径**区分场景。
 //
-// 为什么不能各用一个自定义域名：prepareLLMCandidate 会走 validatePublicURL 做真实 DNS +
-// 保留地址校验（SSRF 面收口），`*.example` 这类保留域名解析不了会直接 400；
-// 而 127.0.0.1（httptest）又会被"禁止指向内网"拦下（见 TestHotUpdateUsesRealProberAgainstUpstream
-// 为何直接构造快照而不是走 HTTP 入口）。
+// 为什么不用各家的真实域名：prepareLLMCandidate 会走 validatePublicURL 做 SSRF 校验，而这条
+// 校验要**先解析主机名**。§P2-K 之前这里是"真实 DNS + 保留地址校验"，于是正例路径的绿挂在
+// 这台机器的解析能力上（10-05 实录：api.siliconflow.cn 解析不了判红、一分钟后单跑 PASS）；
+// 现在解析腿由 TestMain 的 hermeticResolver 供值，域名一律给同一个公网夹具地址，
+// 所以地址选谁只影响可读性、不影响结论——仍统一用 example.com（RFC 2606 保留域，
+// 即使桩被误删也不会真的拨到某个供应商）。
+// 反过来，127.0.0.1（httptest）依旧会被"禁止指向内网"拦下——那是**判据本身**，
+// 不是环境噪声，所以要验真实供应商形态的用例仍按 TestHotUpdateUsesRealProberAgainstUpstream
+// 的做法直接构造快照而不是走 HTTP 入口。
 const goodURL = "https://example.com/prov-good/v1/chat/completions"
 
 // seedGoodLLM 先落一份"已验证可用"的配置（作为后续"不得被动摇"的现状）。
@@ -177,7 +193,7 @@ func TestHotUpdateVerifiedConfigSwapsAndPersists(t *testing.T) {
 	stubProbeWith(t)
 
 	rr := postLLM(t, s, admin, "/api/config/llm",
-		`{"api_keys":["sk-brand-new"],"api_url":"https://api.siliconflow.cn/v1/chat/completions","model":"m-new"}`)
+		`{"api_keys":["sk-brand-new"],"api_url":"https://example.com/prov-brand-new/v1/chat/completions","model":"m-new"}`)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
