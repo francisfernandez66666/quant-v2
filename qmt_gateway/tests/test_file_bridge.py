@@ -116,8 +116,16 @@ class TestFileBridge(unittest.TestCase):
     def _seed_600580(gw, qty=800, price=25.0):
         """先用一笔正常买入成交建出 600580.SH 底仓（复刻事故账户形态）。
 
-        必须走成交回报而非直接写库：卖出成交在无底仓时不会落 fills（apply_fill 的
-        "卖出空仓 = no-op" 语义），底仓是让本用例能观测到 fills.side 的前提。
+        为什么走成交回报而不是直接写库：本用例要同时断言 fills.side 与**持仓账**，直接写库会
+        绕过 apply_fill 的方向归一与判重，测到的就不是生产那条腿。
+        §SELLFILL-DECOUPLE（2026-10-06 修复批 波 2）改了本函数原注释里的前提：旧文写「卖出成交
+        在无底仓时不会落 fills（apply_fill 的"卖出空仓 = no-op"语义），底仓是让本用例能观测到
+        fills.side 的前提」——那是把一个缺陷当成了设计（P1-B：无底仓的卖出整笔流水消失，
+        /settlement 只见券商有、本地缺）。现在无底仓的卖出也照落流水，本用例仍然先建底仓，
+        但理由换成「要断言减仓后的持仓行」，不再是「否则 fills 里查不到这行」。
+        English: seeding a base position is still needed here, but for a different reason than the
+        old comment claimed — that comment mistook the P1-B defect (sell fills without a base
+        position were never journaled) for intended semantics.
         """
         gw.handler._push = lambda p: None
         gw.handler.on_trade({"order_id": "EXC-BUY", "code": "600580.SH", "side": "买入",

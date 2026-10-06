@@ -332,8 +332,9 @@ class ReportHandler:
 
         就地修改并返回 ev：
           - 命中派发行且其 side 非空 → `ev["side"]` 以派行为准（不匹配则 warning 留痕，与
-            `gateway._apply_trade` 同口径），并尽力回填 code（空代码会让 apply_fill 把卖出判成
-            "无底仓 no-op" 而静默漏账）；
+            `gateway._apply_trade` 同口径），并尽力回填 code——空代码查不到持仓行，这笔卖出的
+            **减仓**就不会发生（§SELLFILL-DECOUPLE 2026-10-06 波 2 之后，流水本身已经无条件落，
+            旧文说的"卖出被判成无底仓 no-op 而静默漏账"只剩持仓这一半）；
           - 未命中 / 派发行方向为空 → `ev["side_unverified"]=True`。
         绝不"猜一个方向"充数：柜台枚举跨构建漂移过两次（2026-08-31、2026-09-14 实锤判反），
         猜错＝主动把卖出说成买入。

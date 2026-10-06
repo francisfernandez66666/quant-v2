@@ -508,8 +508,25 @@ class Bridge:
             tid = t.get("trade_id", "")
             if tid and tid in self._seen_trades:
                 continue
+            # §SELLFILL-RETRY（2026-10-06 修复批 波 2，owner 裁决 3「两桥补偿口径对齐：HTTP 桥
+            # 加 outbox/重推」）：只有网关**真的收下了**这笔回报（_post 返回非 0 状态码）才把 tid
+            # 记成"已上报"。旧实现在发送**之前**就 add，于是网关重启/网络抖动窗口里的成交在 HTTP
+            # 桥上永久消失——本桥每笔 tid 只上报一次、零重发，而策略桥每轮重推全量 DEAL
+            # （qmt_bridge_strategy.py 的 trades snapshot 腿），漏记会不会自愈完全取决于走哪条桥。
+            # 现在失败不记 ⇒ 下一轮 query_trades 仍会查到同一行、再推一次＝与策略桥同语义，
+            # 且这里的"重推"由柜台真实数据兜着（比内存队列更硬：桥进程重启也不丢）。
+            # 重复回报不会双计：store.apply_fill 有 (order_id,side,price,qty)+时间窗判重
+            # 与 trade_id 锚，网关侧另有成交入账幂等。
+            # English: mark the trade as reported only after the gateway accepted it; a failed POST
+            # leaves the tid unseen so the next poll re-reports it (same semantics as the strategy
+            # bridge's full DEAL snapshot each round, and backed by the counter's own data rather
+            # than an in-memory queue). Duplicates are absorbed by apply_fill's dedup window.
+            status, _ = self._post("/dispatch/result", {"type": "trade", **t})
+            if status == 0:
+                log.warning("[bridge] §SELLFILL-RETRY trade 上报未送达，保留下轮重推: tid=%s code=%s "
+                            "oid=%s", tid or "-", t.get("code", ""), t.get("order_id", ""))
+                continue
             self._seen_trades.add(tid)
-            self._post("/dispatch/result", {"type": "trade", **t})
 
     # ── 常驻循环 ──
     def run_forever(self):

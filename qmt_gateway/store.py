@@ -586,6 +586,13 @@ class Store:
 
         返回 (position_dict|None, is_duplicate:bool)。重复回报不改动持仓、不重复入 fills。
 
+        §SELLFILL-DECOUPLE（2026-10-06 修复批 波 2）：**fills 流水无条件落**是本函数的第一职责。
+        旧实现把"卖不出底仓"当成立即 return 的理由，让流水与成本核算耦合在一起——查不到持仓行时
+        整笔卖出在账本上凭空消失（详见下方卖出分支注释）。现在持仓缺行只让本笔**不动持仓账**，
+        流水照落，返回的 position 仍是 None（None＝"这个 code 当前无持仓"，不是"这笔没发生"）。
+        English: the fills journal is unconditional — a missing position row now yields
+        (None, False) *after* the trade has been journaled, never before.
+
         §SIDE-AUTH-2（2026-09-23 夜间批）：f 带 side_unverified（成交方向未获派发行证实，
         只是桥/柜台枚举猜测）时，本笔**绝不改动持仓账**——fills 行仍要落（可复核证据：
         代码/价格/数量/成交号/信号/时间/费用全保留），但 side 落第三态字面量 UNRESOLVED_STATUS
@@ -645,18 +652,41 @@ class Store:
                     )
             else:
                 if row is None:
-                    return None, False
-                remain = row["qty"] - f["qty"]
-                if remain <= 0:
-                    self._conn.execute(
-                        "DELETE FROM real_positions WHERE ts_code = ?", (f["code"],)
-                    )
+                    # §SELLFILL-DECOUPLE（2026-10-06 修复批 波 2 / P1-B）记账与成本核算解耦。
+                    # 旧实现在这里 `return None, False`，而这个 return 位于下方 INSERT INTO fills
+                    # **之前** ⇒「查不到持仓行」的卖出成交在网关账本上根本不存在——不是"成本算不出"，
+                    # 是"流水没落"。触发条件不需要任何异常：重启后持仓空窗、柜台侧手动卖过而本地无行、
+                    # 交割单补记路径。下游三条腿全指望这行流水：
+                    #   · Go /settlement 三方对账——券商有、本地 fills 缺 ⇒ 资金事实悬空，而且这条
+                    #     系统性缺行会把真差异淹没在同一条噪声里（对账变成"每次都有一堆差"）；
+                    #   · SumSellFilledAmountByDay——少算回款 ⇒ 当日预算被占满后无法释放
+                    #     （与 09-22 那笔"卖出记成买入 → 回款 0 → 预算占满"错账同族后果）；
+                    #   · 已实现盈亏/胜率——行都不在，连"该不该计"都问不到。
+                    # 现在持仓缺行只影响「本笔不动持仓账」这一件事（不建空仓行、不写幽灵成本），
+                    # 流水照落。成本不可知态**不写 0、也不加第二本成本账**：fills 表本来就没有成本列，
+                    # 成本的可知性由持仓行决定而不是由流水决定（Go 侧 costBasisFor＝无持仓且无当日
+                    # 买入 ⇒ 该笔 fail-open 不计入 TodayRealizedPnl，这条口径一字未动）。把"没有成本"
+                    # 翻译成一个 0 值字段＝下游把 0 当真实成本，比缺失更坏。
+                    # English: journal the sell fill unconditionally — a missing position row now only
+                    # means "don't mutate the position book", it no longer swallows the trade ledger.
+                    # Cost stays unknowable-by-absence: there is no cost column to fake with 0, and the
+                    # Go reader already fails open when cost is unanswerable.
+                    log.warning("[store] §SELLFILL-DECOUPLE 卖出成交无底仓：流水照落、持仓不动 "
+                                "code=%s qty=%s price=%s trade_id=%s",
+                                f.get("code", ""), f.get("qty", 0), f.get("price", 0.0),
+                                str(f.get("trade_id", "") or "") or "-")
                 else:
-                    self._conn.execute(
-                        """UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=?
-                            WHERE ts_code=?""",
-                        (remain, remain * f["price"], f.get("traded_at", ""), f.get("user_id", ""), f["code"]),
-                    )
+                    remain = row["qty"] - f["qty"]
+                    if remain <= 0:
+                        self._conn.execute(
+                            "DELETE FROM real_positions WHERE ts_code = ?", (f["code"],)
+                        )
+                    else:
+                        self._conn.execute(
+                            """UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=?
+                                WHERE ts_code=?""",
+                            (remain, remain * f["price"], f.get("traded_at", ""), f.get("user_id", ""), f["code"]),
+                        )
             # §P2-FEE 20260918：费用腿随成交同笔入账（回报缺费用字段时落 0，兼容旧通道）
             self._conn.execute(
                 """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, trade_id, fee, stamp_tax)

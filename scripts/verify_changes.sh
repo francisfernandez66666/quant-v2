@@ -3012,6 +3012,15 @@ OPS_PLAN=$(GZ_IP=127.0.0.1 "$OPS_SH" 2>&1 || true)
 printf '%s\n' "$OPS_PLAN" | grep -q 'MINUTE_OPS_PLAN' \
 	|| { echo '--- FAIL: §MINUTE-OPS 回填脚本预览模式没打 MINUTE_OPS_PLAN（同上）'; exit 1; }
 # 动手分支必须"先本机自检、再连生产"，且连不上就判红（绝不落到可能挂起的密码认证）
+# ⚠ 本枚锁有一条**提交顺序依赖**（2026-10-07 波 2 实录，别把它当成代码坏了）：落位脚本 :89 的
+#    未提交守卫查的就是 BRIDGE_SRC=qmt_gateway/qmt_bridge_strategy.py，于是**凡本批改过桥策略文件**
+#    （哪怕只加注释），预提交跑 -full 时这条必红——它在 -Apply 之前就 exit 1，ARMED 那行压根不打印。
+#    本轮实测：VERIFY_EXIT=1、唯一 FAIL 停在本枚；把桥文件提交后 clean tree 复跑即绿。
+#    这不是判据错（守卫本来就是"半成品不许进实盘加载位"），但它是 P2-L 那一族「锁读的是工作区
+#    状态而不是提交态」的实例：门禁在**未提交**树上自证，读到的永远是"下一版之前的世界"。
+#    因此本枚不做放宽（改安全阀方向＝拿验证便利换资金安全）；正确处置是按上面的顺序跑，
+#    真正的修法收进波 4 的 -collect：把这类"前置条件不满足"计成 SKIP-PRECONDITION 而不是 FAIL，
+#    并在末尾计数里单列（判据缺失要显形，不许静悄悄少跑一段）。
 BR_ARM=$(GZ_IP=127.0.0.1 "$BR_SH" -Apply 2>&1 || true)
 { printf '%s\n' "$BR_ARM" | grep -q 'BRIDGE_PLACE_ARMED' && printf '%s\n' "$BR_ARM" | grep -q 'BatchMode'; } \
 	|| { echo '--- FAIL: §MINUTE-OPS 落位脚本的 -Apply 分支不再「先 ASCII 自检后 BatchMode 预探测」（ARMED/预探测判红缺一：要么自检被绕过，要么会挂起）'; exit 1; }
@@ -5473,6 +5482,324 @@ leg108 'store 战法账本三腿（聚合口径只数买入/当日/本账号、2
 	'TestSumBuyFilledAmountByDayForStrategy|TestStrategySignalIDTruncationMatch|TestLocalBuyFrozenByStrategy'
 
 echo "ok - §108 静态锁 ${CNT108} 道 + 键空间派生腿 + Go 行为腿 3 组通过"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §SELLFILL-DECOUPLE（2026-10-06 修复批 波 2 / 审计报告 P1-B + owner 裁决 3）：
+# 网关「无底仓的卖出」曾经连流水都不落——记账与成本核算被写在同一个 return 上
+#
+# 缺陷本体（qmt_gateway/store.py::apply_fill 卖出分支）：旧实现是
+#     else:
+#         if row is None:
+#             return None, False        ← 这一行在 INSERT INTO fills **之前**
+# 于是"查不到持仓行"的卖出成交在网关账本上**根本不存在**。这不是"成本算不出"，是"流水没落"，
+# 两者被同一个 return 绑死了。触发条件不需要任何异常，三条都是日常形态：网关重启后的持仓空窗、
+# 柜台侧手工卖出而本地无行、交割单补记路径。三条下游腿全指望这一行：
+#   · Go /settlement 三方对账：券商有成交、本地 fills 缺行 ⇒ 资金事实悬空，而且这条**系统性**
+#     缺行会把真差异淹成"每次都有一堆差"的对账噪声（对账失去判别力比报错更危险）；
+#   · store.SumSellFilledAmountByDay：少算当日回款 ⇒ 预算被占满后无法释放，与 09-22
+#     「卖出记成买入 → 回款 0 → 当日预算占满」错账同族后果；
+#   · TodayRealizedPnl / 胜率统计：行都不在，连"该不该计这笔"都问不到。
+#
+# 修法＝**记账与成本核算解耦**：fills 流水无条件落（写点仍在函数尾部、单一处），持仓缺行只影响
+# "本笔不动持仓账"这一件事（不建空仓行、不做幽灵成本）。返回值的 None 语义由此澄清：
+# None＝"这个 code 当前无持仓"，不是"这笔没发生"。
+#   成本不可知态**不写 0、也不加第二本成本账**：修复计划原文写的是"断言 fills 成本字段 IS NULL"，
+#   实测锤实后发现 **fills 表根本没有成本列**（order_id/code/side/price/qty/amount/traded_at/
+#   signal_id/user_id/trade_id/fee/stamp_tax）——所以 E5 按真形态改写成两条更硬的断言：
+#   ① PRAGMA 里不许出现任何含 cost 的列（列不存在＝"不可知"的正确表达，将来真有人加列这条腿
+#   立刻红并要求重新表态）；② 无底仓卖出不得建持仓行。把"没有成本"翻译成一个 0 值字段＝下游把
+#   0 当真实成本，比缺失更坏（Go 侧 costBasisFor 无持仓且无当日买入 ⇒ 该笔 fail-open 不计入
+#   TodayRealizedPnl，这条口径本批一字未动，只补了一条断言防止有人"顺手"改成按 0 成本算——
+#   那会把一次数据缺口直接推成熔断信号）。
+#   同族的旧口径书写也要一起改，否则会留下"注释把缺陷当设计"的第二代误导：
+#   gateway.py 代码回填处（旧文"否则 apply_fill 会拿空代码查持仓、卖出被判为『无底仓 no-op』
+#   而静默漏账"——现在流水已无条件落，欠的从"流水"变成"减仓"）、handler._vouch_trade_side 的
+#   docstring、tests/test_file_bridge.py::_seed_600580 的建底仓理由（那条注释原本拿缺陷当夹具前提）。
+#
+# owner 裁决 3（两桥补偿口径对齐，选"HTTP 桥加 outbox/重推"那一支）：
+#   qmt_bridge.py::_report_new_trades 旧形态是先 `self._seen_trades.add(tid)` 再 `_post`，
+#   每笔 tid 一生只推一次、且"已上报"在送达前就写下 ⇒ 网关重启/网络抖动窗口里的成交在 HTTP 桥上
+#   永久消失；而策略桥每轮重推全量 DEAL（柜台是权威源，漏记会自愈）。同一条成交会不会丢取决于
+#   走哪条桥＝口径分裂。现在改成"status==0（未送达）⇒ 不记 tid、warning 留痕、continue 下轮重推"，
+#   与策略桥同语义，并且比内存队列更硬（桥进程重启也不丢，事实来自柜台查询）。
+#   4xx 属于"网关收到并明确拒了"（如 §REJECT 身份锚皆空），不算漏记面 ⇒ 照旧记账，避免每轮刷告警。
+#   策略桥侧补一段**口径声明注释**（该文件强制纯 ASCII——GBK 沙箱，门禁 §C 已有非 ASCII 字节守卫，
+#   所以这段注释是英文的，中文会乱码）。
+#
+# 判据分三类（本段三类各有存在必要，互相不能替代）：
+#   ① 静态整串锁（eq109，grep -cF）：钉"写点唯一 / 消费点唯一 / 留痕在位 / 旧口径串不得回流"。
+#     用 -cF 不用 BRE（§108 的教训：`[store]`、`**t` 在 BRE 下语义被改写，恒 0 命中或正则报错）。
+#   ② python 结构腿（PY109）：钉**形态**而不是字符串——"无底仓分支与流水写点之间零出口"、
+#     "发送 < 未送达守卫 < 记 tid"。静态串锁挡不住"把 INSERT 挪进 else 分支"这类形态破坏
+#     （串还在、顺序还在、语义已经反了），这一类破坏只有按行区间取的判据能咬住。
+#   ③ 行为腿：pytest 15 条（E1/E3/E4/E5/E5b + 入口腿 + HTTP 桥补偿四态）+ Go 3 条
+#     （无底仓卖出的**读取侧**对照：流水可见、回款计入、成本不可知时盈亏 fail-open、重放幂等）。
+#     Go 腿的存在理由：缺陷在 Python，但后果由 Go 读；两本账（网关 SQLite 与引擎 SQLite 视图）
+#     必须对同一笔事实给同一个数，只补 Python 侧断言＝修了一侧、另一侧靠巧合。
+#
+# 预演读数（2026-10-07，逐条实测后才入段）：
+#   静态：store.py `def apply_fill(self, f):`=1、fills 写点整串=1、无底仓留痕 log.warning=1、
+#     docstring 新口径串=1；handler.py `pos, is_dup = self.store.apply_fill(ev)`=1（唯一消费点）；
+#     gateway.py 新口径 prose=1、旧 prose 串「同样以派发项为准——否则」=0（成因引用用『』不同形）；
+#     qmt_bridge.py 发送腿=1、`if status == 0:`=1、`self._seen_trades.add(tid)`=1；
+#     qmt_bridge_strategy.py 口径声明注释=1、该文件非 ASCII 字节=0（沿用 §C 既有守卫，不重复实现）；
+#   结构腿：apply_fill 体内（docstring 之后起算）return=2（判重@15 + 收尾@100）、无底仓分支@24、
+#     留痕@68、fills 唯一写点@86 ⇒ 分支与写点之间零出口；_report_new_trades 发送@24 <
+#     未送达守卫@25（continue@28）< 记 tid@29；
+#   测试资产：pytest 文件 `^    def test_`=15（与实跑 collected 15 passed 等值）、
+#     Go `^func TestOrphanSell`=3（实跑 ok）。
+#
+# 逐枚反证（同批实跑，harness＝/tmp/cp109/run_static.py；镜像整体重建、主仓零改动）：
+# 实得读数＝**8 枚全部 RED 且 FAIL 归属串与本枚指定串逐字对上，NOT-AS-EXPECTED=0，复位自检 rc=0**，
+# 预检（8 枚锚串在 pristine 主仓文件里全部命中）通过。每枚破坏与其咬住的锁：
+#   P1 留痕之后补一条 return（＝恢复「卖不出底仓立即返回」，**静态锚全留在位**）⇒ 红在 ② 结构腿
+#     「无底仓卖出分支与流水写点之间有 return」；这一枚是特意设计成"串锁看不见、只有区间判据看得见"，
+#     用来证明 ② 不是 ① 的重复。
+#   P2 在持仓分支里再开第二个 fills 写点（「无条件」退化成「有条件」）⇒ 红在 ① 写点唯一（文案
+#     「fills 写点唯一且字段全量」），② only_one 同红。
+#   P3 把 docstring 里那句旧文 `return None, False` 搬进执行体 ⇒ 红在 ② 「执行体内 return 语句 3 处」。
+#   P4 HTTP 桥把 `self._seen_trades.add(tid)` 挪回 _post 之前（＝裁决 3 要对齐掉的那条旧形态）⇒ 红在
+#     ② 「HTTP 桥补偿顺序错位」；静态锚还在位，**旧形态唯一可判的锁就是这一枚**。
+#   P5 摘掉未送达守卫（发送状态不再参与处置）⇒ 红在 ① 「未送达守卫在位」。
+#   P6 无底仓分支静默吞掉（留痕整段摘除）⇒ 红在 ① 「无底仓卖出的留痕腿在位」。
+#   P7 删一条 pytest 腿（改名必须打断 test_ 前缀，否则子串命中判绿）⇒ 红在 ③ 测试资产登记「15→14」。
+#   P8 给 fills 表加一列 cost_price（E5 的前提变了）⇒ 红在 ③ 「§109 pytest 行为腿判红」，
+#     由行为腿逼着人重新表态，而不是让静态锁悄悄放过一个语义变化。
+#   过程锤出四条 harness/锁形纪律（都写进本段，别留给下一个跑批的人）：
+#     · **锁序抢归属**：结构腿原形是「先数 return 总数、后判分支到写点之间零出口」，于是 P1 被计数锁
+#       先吞掉、打印成 P3 的文案——同一把尺子上的两道检查会互相抢归属，**判据顺序本身是归属的一部分**
+#       ⇒ 重排成 区间判据 → 留痕位置 → 总数 → 判重位置，P1/P3 才各自红在本枚；
+#     · **计数锚混 docstring**：apply_fill 的 docstring 里有"旧实现把卖不出底仓当成立即 return 的
+#       理由"这句话，按整行文本数 return 会数到 3≠2（§0929DRILL「计数锚混注释」同族的新藏处——
+#       这次藏的是三引号文档串，不是 # 行）⇒ 结构腿必须先跳过 docstring 再判执行体；
+#     · **切片错位**：跳 docstring 时按 `len(quote)` 切起始行，会削掉缩进的前三个空格而不是引号，
+#       于是"闭合"在 docstring 第一行就成立（实测 code_start 返回 2），整段文档被当执行体 ⇒
+#       必须先 lstrip() 再切。两个都是"判据看着严格、其实在读说明文字"的形态；
+#     · **跨行锚块禁止手敲**：harness 首版在 Python 里手写那段 4 行的 log.warning 整块，第二行少一个
+#       空格（32→31 列）⇒ P1/P2/P6 三枚破坏全部施加不上，预检报 PRE-FAIL（差点被当成"锁失明"）
+#       ⇒ 改成运行时从主仓 pristine 文件按边界取块（起始锚行 → 第一条以 `")` 收尾的行），并要求
+#       命中数恰为 1，不唯一就停。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 109 §SELLFILL-DECOUPLE 卖出流水与成本核算解耦（含两桥上报告警口径对齐）静态锁 + 结构腿 + 行为腿..."
+
+CNT109=0
+# eq109 与 §108 的 eq108 同形（grep -cF 整串），但**有意各写一份**而不是抽公共 helper：
+# 两段的锚串语言不同（一段全 Go/JSX、一段全 Python），合并只会让下一次"某一侧要放宽"时
+# 两侧一起被放宽。等值语义（整串、整文件计数、红在文案里点名文件与预演读数）保持一致。
+eq109() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT109=$((CNT109 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §109 整串等值锁 ${CNT109}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+
+# ── ① Python 侧：写点唯一 / 消费点唯一 / 留痕在位 / 旧口径书写不得回流 ──
+eq109 qmt_gateway/store.py 'def apply_fill(self, f):' 1 'apply_fill 只有一个实现（第二份＝又开了一条不走"流水无条件落"的入账路径）'
+eq109 qmt_gateway/store.py 'INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, trade_id, fee, stamp_tax)' 1 'fills 写点唯一且字段全量（写点若复制进持仓分支，"无条件"就变成有条件）'
+eq109 qmt_gateway/store.py 'log.warning("[store] §SELLFILL-DECOUPLE 卖出成交无底仓' 1 '无底仓卖出的留痕腿在位（该分支现在只做两件事：留痕 + 不动持仓）'
+eq109 qmt_gateway/store.py '§SELLFILL-DECOUPLE（2026-10-06 修复批 波 2）：**fills 流水无条件落**是本函数的第一职责' 1 'docstring 按新口径写（None＝当前无持仓，不是这笔没发生）'
+eq109 qmt_gateway/handler.py 'pos, is_dup = self.store.apply_fill(ev)' 1 '入库入口唯一消费点（第二条 apply_fill 调用腿＝绕开了判重与留痕口径）'
+eq109 qmt_gateway/gateway.py '§SELLFILL-DECOUPLE（2026-10-06 修复批 波 2）改了这条理由' 1 '代码回填处的成因改写留在文件里（旧注释拿缺陷当设计前提，是最容易复犯的二代误导）'
+eq109 qmt_gateway/gateway.py '同样以派发项为准——否则' 0 '旧口径整串不得作为现口径回流（引用旧文一律带『』引号，与本串不同形）'
+# ── ① 之二：两桥上报告警口径（E6 的静态面；行为面在 pytest，顺序面在结构腿）──
+eq109 qmt_gateway/qmt_bridge.py 'status, _ = self._post("/dispatch/result", {"type": "trade", **t})' 1 '成交上报取回状态码（不取回就没法判"未送达"，裁决 3 的第一前提）'
+eq109 qmt_gateway/qmt_bridge.py 'if status == 0:' 1 '未送达守卫在位（0＝urllib 异常分支，与"网关明确拒绝"的 4xx 必须分开处置）'
+eq109 qmt_gateway/qmt_bridge.py 'self._seen_trades.add(tid)' 1 '已上报记账点唯一（第二处＝有人又在发送前偷偷记了一笔）'
+eq109 qmt_gateway/qmt_bridge_strategy.py 'SELLFILL-RETRY reporting-compensation contract' 1 '策略桥的补偿口径声明在位（该文件强制纯 ASCII，故注释为英文；见门禁 §C 非 ASCII 字节守卫）'
+# ── ① 之三：测试资产登记（删腿/改名必须在这里红，而不是静默少测）──
+eq109 qmt_gateway/tests/test_sell_fill_decouple.py '§SELLFILL-DECOUPLE（2026-10-06 修复批 波 2 / P1-B）' 1 'pytest 腿文件的成因头注在位（新锁与被测文件必须互指，否则下一个跑批的人找不到被测面）'
+eq109 qmt_gateway/qmt_bridge.py '§SELLFILL-RETRY' 2 '本波标签同时出现在成因注释与**运行时告警文案**里（现网日志要能按这个串反查口径，只写在注释里等于线上看不见）'
+eq109 internal/store/sell_fill_decouple_test.go '§SELLFILL-DECOUPLE（2026-10-06 修复批 波 2 / P1-B）Go 读取侧回归' 1 'Go 侧读取回归的成因头注在位（跨语言两本账同一事实的书面依据）'
+
+PYTEST_LEGS=$(grep -c '^    def test_' qmt_gateway/tests/test_sell_fill_decouple.py || true)
+CNT109=$((CNT109 + 1))
+[ "${PYTEST_LEGS:-0}" = "15" ] || { echo "--- FAIL: §109 测试资产登记锁 ${CNT109}（pytest 腿数应为 15（E1 无底仓落库 / E3 三条幂等 / E4 两条持仓 / E5 四条不可知态 / 入口腿 / HTTP 桥补偿四态），实得 ${PYTEST_LEGS}：少一条＝有一个形态不再被覆盖）"; exit 1; }
+GO_LEGS=$(grep -c '^func TestOrphanSell' internal/store/sell_fill_decouple_test.go || true)
+CNT109=$((CNT109 + 1))
+[ "${GO_LEGS:-0}" = "3" ] || { echo "--- FAIL: §109 测试资产登记锁 ${CNT109}（Go 读取侧腿数应为 3（流水可见 / 回款计入而盈亏 fail-open / 重放幂等），实得 ${GO_LEGS}）"; exit 1; }
+
+# ── ② 结构腿：钉形态而不是钉字符串（把 INSERT 挪进分支、把 add 挪回 _post 之前，都在这里红）──
+python3 - <<'PY109' || { echo "--- FAIL: §109 结构腿判红（上面已打印 apply_fill 与 _report_new_trades 的行区间读数，以及破线的那一条）"; exit 1; }
+# -*- coding: utf-8 -*-
+# §SELLFILL-DECOUPLE 结构判据：流水写点与持仓分支之间"零出口"、HTTP 桥"送达才记 tid"。
+# 静态整串锁挡不住形态破坏（串还在、顺序还在、语义已反），这一类只有按行区间取的判据能咬住。
+import re
+import sys
+
+STORE = "qmt_gateway/store.py"
+BRIDGE = "qmt_gateway/qmt_bridge.py"
+
+
+def die(msg):
+    print("   " + msg)
+    sys.exit(1)
+
+
+def read_lines(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().split("\n")
+    except OSError as e:
+        die("锚点文件读不到：%s（%s）——本腿依赖这两个文件的形态，路径搬了要跟着改，不许把判据放宽" % (path, e))
+
+
+def is_code(line):
+    """非空且不是整行注释（本腿只在函数执行体里跑，docstring 已由 code_start 整段跳过）。"""
+    s = line.strip()
+    return bool(s) and not s.startswith("#")
+
+
+def region(lines, sig_re, label):
+    """按签名行取函数体 [start, end)：end = 同缩进或更浅缩进的下一个 def/class/装饰器。"""
+    hits = [i for i, ln in enumerate(lines) if re.match(sig_re, ln)]
+    if len(hits) != 1:
+        die("%s 的签名锚点命中 %d 处（预演=1）：签名换了形 ⇒ 本腿会退化成扫全文，必须停下来人肉重读"
+            % (label, len(hits)))
+    start = hits[0]
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        ln = lines[j]
+        if not ln.strip():
+            continue
+        cur = len(ln) - len(ln.lstrip())
+        if cur <= indent and re.match(r"^\s*(def |class |@)", ln):
+            end = j
+            break
+    return start, end
+
+
+def code_start(lines, lo, hi):
+    """跳过函数 docstring，返回第一条真代码行的下标。
+
+    为什么必须有这一步（本段预演实测锤出来的两条之一）：apply_fill 的 docstring 里写着
+    "旧实现把卖不出底仓当成立即 return 的理由"，按整行文本数 return 会数到 3≠2 ——
+    说明注释混进计数锚＝§0929DRILL「计数锚混注释」的同族新藏处（这次藏的是三引号文档串）。
+    """
+    i = lo
+    while i < hi and not lines[i].strip():
+        i += 1
+    if i < hi and re.match(r'^\s*("""|\'\'\')', lines[i]):
+        quote = '"""' if lines[i].strip().startswith('"""') else "'''"
+        j = i
+        while j < hi:
+            # 切片必须先 lstrip()：起始行是「8 空格 + """」，按 len(quote) 切会削掉三个空格、
+            # 留下引号本体，于是"闭合"判定在 docstring 第一行就成立（实测 code_start 返回 2），
+            # 整段文档被当成执行体——这是"判据看着严格、其实在读说明文字"的形态。
+            tail = lines[j].lstrip()[len(quote):] if j == i else lines[j]
+            if quote in tail:
+                return j + 1
+            j += 1
+        return hi
+    return i
+
+
+def only_one(body, needle, label):
+    idxs = [i for i, ln in enumerate(body) if needle in ln]
+    if len(idxs) != 1:
+        die("%s：函数体内找到 %d 处「%s」（预演=1）——形态变了，本腿的区间判据不再成立，"
+            "必须回来重读而不是把期望数改成实得数" % (label, len(idxs), needle))
+    return idxs[0]
+
+
+# ── ① store.apply_fill：持仓分支与流水写点之间不许有出口 ──
+lines = read_lines(STORE)
+s_start, s_end = region(lines, r"^\s*def apply_fill\(self, f\):\s*$", "store.apply_fill")
+full = lines[s_start:s_end]
+body = full[code_start(full, 1, len(full)):]
+
+# 判据顺序有意为之（§109 反证 P1 与 P3 的归属全靠这个顺序）：先判"分支与写点之间有没有出口"
+# （P1：留痕之后补 return＝P1-B 的复活形态），再判"出口总数恰为 2"（P3：在函数体顶部塞一条假
+# 出口，它不在区间内，只有计数能咬住）。两步颠倒过来的话，P1 会被计数锁先拦掉，那枚反证就变成
+# "红是红了，但不是本枚的功劳"——归属核对失败（§108「每枚破坏必须本枚独有」的同族新形态：
+# 这次不是锚串重叠，是**同一把尺子的两道检查重叠**）。
+buy_branch = only_one(body, 'elif fill_side == "买入":', "买入分支锚")
+sell_none = next((i for i in range(buy_branch + 1, len(body))
+                  if is_code(body[i]) and "if row is None:" in body[i]), None)
+if sell_none is None:
+    die("买入分支之后找不到 `if row is None:`（无底仓卖出分支的锚点）⇒ 分支结构被改写，"
+        "本腿无法定位『持仓缺行』那一支，必须回来重读键空间之外的这条记账口径")
+ins = only_one(body, "INSERT INTO fills(order_id", "fills 唯一写入点")
+warn = only_one(body, 'log.warning("[store] §SELLFILL-DECOUPLE 卖出成交无底仓', "无底仓留痕腿")
+
+if not (sell_none < ins):
+    die("INSERT INTO fills 落在 `if row is None:` **之前**（写点@%d vs 分支@%d）：写点被挪进/挪到"
+        "持仓分支一侧＝流水不再无条件落" % (ins, sell_none))
+# 出口总数恰为 2（判重早退 + 收尾返回）放在区间判据之后，见上面那段说明。
+rets = [i for i, ln in enumerate(body) if is_code(ln) and re.search(r"\breturn\b", ln)]
+between = [i for i in rets if sell_none < i < ins]
+if between:
+    die("无底仓卖出分支与流水写点之间有 return（体内第 %s 行）＝E2 破坏的形态："
+        "『查不到持仓行』又被当成立即返回的理由，整笔卖出流水消失" % between)
+if len(rets) != 2:
+    die("store.apply_fill 执行体内 return 语句 %d 处（预演=2：判重早退 + 收尾返回）。"
+        "少一处＝判重出口没了（重放会二次落库）；多一处＝无底仓卖出又长出提前 return，"
+        "正是 P1-B 的复活形态（整笔流水被吞）" % len(rets))
+if not (sell_none < warn < ins):
+    die("无底仓分支的留痕 log.warning 不在分支与写点之间（warn@%d，分支@%d，写点@%d）："
+        "该分支现在只做两件事——留痕 + 不动持仓；缺一条就说明有人把它改回早退或改成静默吞掉"
+        % (warn, sell_none, ins))
+dedup_ret = rets[0]
+if not (dedup_ret < sell_none):
+    die("判重出口不在无底仓分支之前（%d vs %d）：判重位置挪了，重放路径与本腿的区间判据都要重新读"
+        % (dedup_ret, sell_none))
+print("   store.apply_fill：体内 return=%d（判重@%d + 收尾@%d）、无底仓分支@%d、留痕@%d、"
+      "fills 唯一写点@%d ⇒ 分支与写点之间零出口"
+      % (len(rets), dedup_ret, rets[-1], sell_none, warn, ins))
+
+# ── ② qmt_bridge._report_new_trades：送达才记 tid（顺序锁，owner 裁决 3）──
+blines = read_lines(BRIDGE)
+b_start, b_end = region(blines, r"^\s*def _report_new_trades\(self\):\s*$", "Bridge._report_new_trades")
+bfull = blines[b_start:b_end]
+bbody = bfull[code_start(bfull, 1, len(bfull)):]
+post = only_one(bbody, 'status, _ = self._post("/dispatch/result", {"type": "trade", **t})', "上报发送腿")
+add = only_one(bbody, "self._seen_trades.add(tid)", "已上报记账腿")
+guard = only_one(bbody, "if status == 0:", "未送达守卫腿")
+if not (post < guard < add):
+    die("HTTP 桥补偿顺序错位：发送@%d / 未送达守卫@%d / 记 tid@%d 必须严格递增。"
+        "记在发送之前＝每笔只推一次且失败即永久消失（漏记不自愈，正是裁决 3 要对齐掉的那条）"
+        % (post, guard, add))
+skips = [i for i, ln in enumerate(bbody) if is_code(ln) and "continue" in ln and post < i < add]
+if len(skips) != 1:
+    die("发送与记账之间缺少『未送达就跳过本轮』的 continue（实得 %d 处）："
+        "守卫写了却不生效＝status==0 也会把 tid 记成已上报" % len(skips))
+print("   qmt_bridge._report_new_trades：发送@%d < 未送达守卫@%d（continue@%d）< 记 tid@%d "
+      "⇒ 未送达不记、下轮重推" % (post, guard, skips[0], add))
+PY109
+echo "ok - §109 结构腿（流水写点零出口 + 送达才记顺序锁）"
+
+# ── ③ 行为腿：pytest 15 条（Python 写侧 + 入口 + HTTP 桥补偿）+ Go 3 条（读取侧对照）──
+py_out=$(py_tests qmt_gateway/tests/test_sell_fill_decouple.py 2>&1 || true)
+if printf '%s\n' "$py_out" | /usr/bin/grep -qE 'FAILED|ERROR|ModuleNotFound|No such file'; then
+	echo "--- FAIL: §109 pytest 行为腿判红（§SELLFILL-DECOUPLE 15 条），尾部如下："
+	printf '%s\n' "$py_out" | tail -30
+	exit 1
+fi
+printf '%s\n' "$py_out" | /usr/bin/grep -qE '15 (passed|tests)' || {
+	echo "--- FAIL: §109 pytest 行为腿没跑到 15 条（尾部如下；14 条＝有腿被删或改名，0 条＝导入/语法坏了）"
+	printf '%s\n' "$py_out" | tail -20
+	exit 1
+}
+echo "ok - §109 pytest 行为腿（无底仓卖出流水 / 幂等锚 / 持仓腿 / 成本不可知态 / 入口腿 / 两桥补偿四态）"
+
+leg109() { # $1=说明 $2=包 $3=-run 正则
+	local out
+	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
+	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+		echo "--- FAIL: §109 Go 行为腿判红（$1），全文如下："
+		printf '%s\n' "$out" | head -40
+		exit 1
+	fi
+	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+		echo "--- FAIL: §109 Go 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
+		exit 1
+	}
+	echo "ok - §109 Go 行为腿 $1"
+}
+leg109 'store 无底仓卖出读取侧三腿（流水经 fills_effective 可见、回款计入而盈亏按成本不可知 fail-open、trade_id 重放幂等）' ./internal/store/ \
+	'TestOrphanSellJournaledAndVisible|TestOrphanSellCountsProceedsButNotPnl|TestOrphanSellReplayStaysOneRow'
+
+echo "ok - §109 静态锁 ${CNT109} 道 + 结构腿 + 行为腿（pytest 15 / Go 3）通过"
 
 echo ""
 echo "==> 全部通过"

@@ -1307,6 +1307,18 @@ def _bridge_tick():
         except Exception as e:
             _trace("asset snapshot error: " + repr(e))
         try:
+            # SELLFILL-RETRY reporting-compensation contract (fix batch 2026-10-06 wave 2,
+            # aligned with qmt_bridge.py::_report_new_trades). This bridge compensates by
+            # re-reporting the FULL DEAL snapshot every tick: _report() only _trace()s a failed
+            # file write and does not retry, yet no fact is lost, because the counter's DEAL list
+            # is the authoritative source and the next query_trades() returns the same row again.
+            # Duplicates are absorbed by the gateway store.apply_fill dedup
+            # ((order_id,side,price,qty) + time window, plus the trade_id anchor).
+            # The old HTTP bridge was the opposite: one POST per trade_id, marked as reported
+            # BEFORE sending, so anything lost in a gateway restart / network blip vanished
+            # forever. Wave 2 changed it to "mark only when delivered", so whether a missed
+            # report self-heals no longer depends on which bridge is in use.
+            # NOTE: this file must stay pure ASCII (it runs inside the QMT GBK sandbox).
             for trow in adapter.query_trades():
                 _report({"type": "trade", **trow})
         except Exception as e:

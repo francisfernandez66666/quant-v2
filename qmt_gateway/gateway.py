@@ -1247,8 +1247,15 @@ class Gateway:
                 drow = _drow
         if drow:
             # 代码回填（与方向同源的权威性）：带 signal_id 的回报不再走上面的归因分支，
-            # 若其 code 缺失，同样以派发项为准——否则 apply_fill 会拿空代码查持仓、
-            # 卖出被判为"无底仓 no-op"而静默漏账。
+            # 若其 code 缺失，同样以派发项为准。
+            # §SELLFILL-DECOUPLE（2026-10-06 修复批 波 2）改了这条理由：旧文写"否则 apply_fill
+            # 会拿空代码查持仓、卖出被判为『无底仓 no-op』而静默漏账"——那半句现在不成立了
+            # （无持仓的卖出也已无条件落 fills，见 store.apply_fill）。但回填**照旧必需**，
+            # 欠的从"流水"变成"减仓"：空代码查不到持仓行 ⇒ 这笔真实卖出的股票没从本地账扣掉，
+            # 本地持仓比真实仓位重，下一轮就会按并不存在的量挂卖出单。
+            # English: code backfill stays mandatory, only the reason changed — an empty code no
+            # longer loses the fills journal (that was the §SELLFILL-DECOUPLE defect), it now loses
+            # the position *reduction*, leaving the local book heavier than the real position.
             if not req.get("code"):
                 req["code"] = drow.get("code", "")
             auth = str(drow.get("side", "") or "")
