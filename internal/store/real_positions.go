@@ -775,9 +775,45 @@ func (d *DB) BuyableQtyForUserSell(userID, tsCode, day string) int {
 // cross-day stale 已报/部成 buys no longer freeze the daily budget forever; query errors surface
 // to the caller (fail-closed) instead of silently returning 0.
 func (d *DB) LocalBuyFrozen(userID, day string) (float64, error) {
-	rows, err := d.db.Query(`SELECT signal_id, status, price, qty FROM orders
+	return d.localBuyFrozen(userID, day, "")
+}
+
+// LocalBuyFrozenByStrategy §STRATEGY-FIX（2026-10-06 波 1）某账号当日**指定战法**的在途冻结金额：
+// 与 LocalBuyFrozen 同一本账、同一状态口径（已报＝全额、部成＝未成交余量、其余不计、
+// 按 created_at 前 10 位限当日），只是额外用 signalIDHasStrategySQL 把委托行限定到某个战法键。
+//
+// 为什么要它：§STRATEGY_ALLOC 子闸 2b 原先只比「该战法今日已成交」，注释写着「LocalBuyFrozen
+// 无 strategy 维度，总冻结已由全局闸 2 保护，此处作为叠加守卫足够保守」——那句话是幻觉注释
+// （全局闸只保总量，同战法连发时子闸对本战法在途的 0 元穿透毫无感知，可以一路把单个战法
+// 的预算穿透到全局闸才停）。现在子闸按 `已成交 + 本战法在途冻结` 判定，穿透闭合。
+//
+// 不做卖出回款对冲（与全局闸 2 有意不同）：实盘自动卖出的幂等键是
+// `sell:<码>:<类别>:<日>`（类别＝止损/止盈/减仓，见 engine.realSellSignalID），**不带战法键**，
+// 因此「这个战法今天回血多少」在账本上根本问不出来；硬凑一个近似口径只会把
+// 「保守」换成「假精确」。方向上本子闸比全局闸更紧（毛花而非净额），是刻意的。
+// English: per-strategy in-flight freeze — same ledger and status semantics as LocalBuyFrozen,
+// narrowed to one strategy key via the shared colon-segment predicate. Sell proceeds are
+// deliberately NOT netted here (unlike the global budget gate) because sell idempotency keys carry
+// a reason class rather than a strategy key, so per-strategy replenishment is unanswerable from the
+// ledger; the sub-gate stays intentionally tighter (gross, not net) instead of falsely precise.
+func (d *DB) LocalBuyFrozenByStrategy(userID, day, strategyKey string) (float64, error) {
+	return d.localBuyFrozen(userID, day, strategyKey)
+}
+
+// localBuyFrozen 冻结账的唯一实现（strategyKey 为空＝不限战法）。
+// 两把公开口径共用一份 SQL 与一段行处理，避免「改了全局那本账、战法那本账忘了改」。
+// English: the single implementation behind both public entry points; an empty strategy key means
+// "all strategies" (the global ledger).
+func (d *DB) localBuyFrozen(userID, day, strategyKey string) (float64, error) {
+	q := `SELECT signal_id, status, price, qty FROM orders
 		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')
-		AND substr(created_at,1,10)=?`, userID, day)
+		AND substr(created_at,1,10)=?`
+	args := []interface{}{userID, day}
+	if strategyKey != "" {
+		q += ` AND ` + signalIDHasStrategySQL("signal_id")
+		args = append(args, strategyKey)
+	}
+	rows, err := d.db.Query(q, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -880,6 +916,37 @@ func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 func fillSignalMatchSQL(fillsID, fillsTradedAt, orderExpr string) string {
 	return fmt.Sprintf("(%s <> '' AND (%s LIKE %s||'%%' OR (%s LIKE %s||'%%' AND instr(%s, replace(substr(%s,1,10),'-','')) > 0)))",
 		fillsID, fillsID, orderExpr, orderExpr, fillsID, orderExpr, fillsTradedAt)
+}
+
+// signalIDHasStrategySQL §STRATEGY-FIX（2026-10-06 波 1）：判断一条 signal_id 里是否含有指定
+// **战法键**的单一事实源谓词构造器——fills 侧的「按战法聚合已成交金额」（risk_gates.go
+// SumBuyFilledAmountByDayForStrategy）与 orders 侧的「按战法派生在途冻结」
+// （LocalBuyFrozenByStrategy）共用同一把谓词，杜绝两本账各写一份匹配口径而漂移。
+//
+// 为什么不能用旧写法 `LIKE '%:'||key||':%'`（两侧都要冒号）：
+//   - 柜台的 userOrderId 槽只有 24 字符，成交回报回来的编号会被截断——
+//     `buy:603468:dragon_return:20261005` 共 33 字符，截 24 恰为 `buy:603468:dragon_return`，
+//     **尾冒号连同日期一起被吃掉**。于是龙回头这一路即使把子闸取键的键空间修好了
+//     （§STRATEGY_ALLOC 的 P1-A），聚合腿仍恒为 0＝预算闸对这一个战法依然失明。
+//     截断的既有事实与双向匹配的必要见上方 §SIGID-TRUNC 注释（现网实录同族）。
+//   - 只放宽成「前冒号 + 键」也不行：dragon 会撞进 dragon_return 的前缀里（少一个尾边界
+//     就等于把「段相等」降级成「前缀包含」，两笔不同的钱会记到同一个战法头上）。
+//
+// 口径：把整串按冒号切段做**整段相等**判断——给 signal_id 前后各补一个冒号，再在其中找
+// `:key:` 这个带两侧边界的子串。被截断的行补上尾冒号后恰好成为完整一段，完整行本来就有
+// 尾冒号，两种形态一次覆盖，且战法键之间不可能互撞。
+// 为什么用 instr 而不是 LIKE：本仓战法键普遍含下划线（fac_1 / dragon_return / n_shape），
+// LIKE 的 `_` 是单字符通配符，会放行 `faxx1` 这类异段；instr 是纯子串比较、无通配语义。
+// 跨日不会张冠李戴：本谓词只回答「这一段是不是这个战法」，日期由调用方各自的
+// traded_at / created_at 条件独立约束——fills 行读自己的 traded_at（不经被截断的编号），
+// 这一点与 fillSignalMatchSQL 反向腿必须额外钉交易日的处境不同（那里编号本身是判据）。
+// English: single-source predicate "does this signal_id carry strategy key K", expressed as a
+// colon-segment equality via instr (never LIKE, since keys contain '_' which LIKE treats as a
+// one-char wildcard). Wrapping the value in colons makes the counter's 24-char truncation land as
+// a complete segment, so the truncated and the full form match with one predicate while
+// dragon can never collide with dragon_return. The date scoping stays the caller's job.
+func signalIDHasStrategySQL(signalIDExpr string) string {
+	return fmt.Sprintf("instr(':' || COALESCE(%s, '') || ':', ':' || ? || ':') > 0", signalIDExpr)
 }
 
 // SumFilledQty 汇总某账号某 signal_id 前缀的累计成交数量（按 (user_id, signal_id) 过滤）。

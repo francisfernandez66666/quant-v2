@@ -105,6 +105,16 @@ type Gate struct {
 	// 用例只需要证明"查询报错→拒单、报数→照常"这一条语义。
 	// English: package-internal test seam for the realized-PnL read (nil = use st).
 	realizedPnlFn func(userID, day string) (float64, error)
+	// stratFilledFn / stratFrozenFn §STRATEGY-FIX（2026-10-06 波 1）测试缝（包内注入，生产为 nil 走 st）：
+	// 战法维两本账的「查询报错 → 子闸 fail-closed 拒单」分支用关库跑不到——checkBuyDiscipline
+	// 开头先把全局三本账（已成交/在途/卖出回款）读掉，库一关就红在 "read buy fills"，
+	// 永远走不到子闸 2b。而「在途冻结那一条会报错吗」恰恰是本批新加的账，必须有真反证，
+	// 所以沿用 realizedPnlFn 的同一种缝：注入点选在闸读数这一步，不造假 DB。
+	// English: package-internal test seams for the two per-strategy ledgers (nil = use st), same
+	// shape as realizedPnlFn — closing the whole DB trips the global ledgers before sub-gate 2b runs.
+	stratFilledFn func(userID, day, strategyKey string) (float64, error)
+	// stratFrozenFn 战法维在途冻结读数（见上一字段注释）。
+	stratFrozenFn func(userID, day, strategyKey string) (float64, error)
 }
 
 // NewGate 创建风控闸。onGate 可空（命中时告警回调；新闸默认高优告警，存量守卫不告警）。
@@ -645,21 +655,38 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 				filledAmt, frozen, sellProceeds, occupied, amount, cfg.DailyBudgetAmount)
 		}
 	}
-	// §STRATEGY_ALLOC 子闸 2b：每战法单日预算（可选；按 LiveOrder.StrategyID 精确匹配已成交金额）。
+	// §STRATEGY_ALLOC 子闸 2b：每战法单日预算（可选）。
 	// 与全局闸2 正交——后者控"今天总共能花多少"，本闸控"每个战法今天最多能花多少"。
-	// 注意：仅对比已成交金额（filled），不对比 frozen 在途冻结（LocalBuyFrozen 无 strategy 维度）；
-	// 总冻结已由全局闸2保护，此处作为叠加守卫足够保守。
+	//
+	// §STRATEGY-FIX（2026-10-06 波 1）两处修正：
+	//   ① 取键改由 resolveStratKeyForGate 委托 signalctl.StrategyKeyOf。旧实现在此注释里写
+	//      「按 LiveOrder.StrategyID 精确匹配」，而内置战法的 StrategyID 恒为空串、回退成显示名，
+	//      对五个内置战法**恒不命中**＝本闸形同虚设（详见该函数注释里的完整取值链）。
+	//   ② 判定口径从「只比已成交」改成「已成交 + 本战法在途冻结」。旧注释写着
+	//      「LocalBuyFrozen 无 strategy 维度……此处作为叠加守卫足够保守」——那是幻觉注释：
+	//      全局闸 2 只保总量，同一战法连发时本闸对本战法的在途一分钱都不感知，
+	//      可以一路穿透到全局闸才停（"足够保守"的前提并不存在）。战法维度的在途账
+	//      已由 store.LocalBuyFrozenByStrategy 补上，本处经 g.stratFrozenAmount 消费它
+	//      （测试缝优先，见结构体字段注释）。
+	//      与全局闸 2 的有意差异：本子闸**不做卖出回款对冲**——实盘卖出的幂等键带的是
+	//      类别（止损/止盈/减仓）而不是战法键，「这个战法今天回血多少」在账本上问不出来，
+	//      硬凑近似只会把保守换成假精确。方向上本子闸因此比全局闸更紧（毛花口径）。
+	// 查询错误一律按拒绝放行处理（fail-closed），与相邻三本账（filled/frozen/proceeds）同姿势。
 	if cfg.StrategyAllocs != nil {
 		stratKey := resolveStratKeyForGate(o)
 		alloc, hasAlloc := strategyAllocFor(cfg, stratKey)
 		if hasAlloc && alloc > 0 {
-			filledByStrat, sErr := g.st.SumBuyFilledAmountByDayForStrategy(g.userID, today, stratKey)
+			filledByStrat, sErr := g.stratFilledAmount(today, stratKey)
 			if sErr != nil {
 				return fmt.Sprintf("查询战法资金分配: %v", sErr)
 			}
-			if filledByStrat+amount > alloc {
-				return fmt.Sprintf("战法[%s] 日预算不足: 今日已成交 %.0f + 本次 %.0f > 分配预算 %.0f",
-				stratKey, filledByStrat, amount, alloc)
+			frozenByStrat, fErr := g.stratFrozenAmount(today, stratKey)
+			if fErr != nil {
+				return fmt.Sprintf("查询战法在途冻结: %v", fErr)
+			}
+			if filledByStrat+frozenByStrat+amount > alloc {
+				return fmt.Sprintf("战法[%s] 日预算不足: 今日已成交 %.0f + 在途冻结 %.0f + 本次 %.0f > 分配预算 %.0f（本子闸不做卖出回款对冲，口径较全局预算闸偏紧）",
+					stratKey, filledByStrat, frozenByStrat, amount, alloc)
 			}
 		}
 	}
@@ -767,21 +794,65 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	return ""
 }
 
-// resolveStratKeyForGate 从 LiveOrder 派生 StrategyAllocs 匹配键。
-// 优先用 StrategyID（fac_1/pat_2），回退到显示名（如 "龙头"）。
+// resolveStratKeyForGate 从 LiveOrder 派生 StrategyAllocs 匹配键与战法账本查询键。
+//
+// §STRATEGY-FIX（2026-10-06 波 1）：本函数原先自写两行优先级「StrategyID 非空则用它，否则回退
+// 显示名 Strategy」——那一行回退腿就是「战法日预算闸对五个内置战法恒不触发」的精确落点：
+//   - 配置侧只收规范 ID（server/qmt.go knownStrategyList 白名单校验，非白名单键直接 400），
+//     所以显示名「龙头」作为键**根本存不进 StrategyAllocs**；
+//   - 下单侧内置信号的 StrategyID 恒为空串（combat_agent/agent.go 只有库规则才填 ID），
+//     于是内置五战法一律落到回退腿、拿显示名去查规范键的表 ⇒ hasAlloc 恒 false ⇒ 子闸恒不触发；
+//   - 而被跳过的 o.StrategyType 恰恰就是规范键本身（dragon/double_bump/…，引擎
+//     engine.go 构造 OrderRequest 时已填、控制器 controller.go 已全量透传到 LiveOrder）。
+//
+// 修法不是「在本函数里再排一次优先级」，而是**取消本地优先级**：三把闸（本函数取键、
+// engine.go 的买入幂等键、signalctl 的准入探针）从 §C6 起就约定同源于
+// signalctl.StrategyKeyOf（StrategyType → StrategyID → 显示名归一映射），本函数此前是
+// 该约定的第四处「另写一份」，所以才会出现「幂等键认得 dragon、预算闸只认得 龙头」的分叉。
+// 现委托同一函数：以后 StrategyKeyOf 的优先级怎么改，三处一起漂，永不再分叉。
+// 本包已 import signalctl 与 combat_agent（见文件头 import 块），委托不引入新依赖。
+// English: delegate to signalctl.StrategyKeyOf — the same single source the buy idempotency key
+// (engine.go) and the admission probe already share since §C6. The old local two-line priority
+// (StrategyID else display name) skipped StrategyType, which is exactly the canonical key live orders
+// carry, so per-strategy budgets silently never matched for all five built-in strategies.
 func resolveStratKeyForGate(o LiveOrder) string {
-	if o.StrategyID != "" {
-		return o.StrategyID
-	}
-	return o.Strategy
+	return signalctl.StrategyKeyOf(combat_agent.Signal{
+		StrategyType: o.StrategyType,
+		StrategyID:   o.StrategyID,
+		Strategy:     o.Strategy,
+	})
 }
 
 // strategyAllocFor 从 QMTConfig.StrategyAllocs 中查找指定策略的日预算。
 // 先按 exact key 查找，若未命中则空值=false（不限制）。
+// 键空间由调用方（resolveStratKeyForGate → signalctl.StrategyKeyOf）与配置写入侧
+// （server/qmt.go 白名单校验）共同钉死为规范 ID；本函数刻意不做任何回退——
+// 「查不到就不限」是本闸的 fail-open 边界，加隐式模糊匹配只会让配置写错变成静默放水。
 func strategyAllocFor(cfg config.QMTConfig, key string) (float64, bool) {
 	if cfg.StrategyAllocs == nil {
 		return 0, false
 	}
 	v, ok := cfg.StrategyAllocs[key]
 	return v, ok && v > 0
+}
+
+// stratFilledAmount 读本战法「今日已成交」金额（子闸 2b 的第一本账）。
+// 生产走 store.SumBuyFilledAmountByDayForStrategy；g.stratFilledFn 非空时走注入值——
+// 那把缝只为把「查询报错 → fail-closed 拒单」这条分支跑成真反证（原因见结构体字段注释）。
+// English: per-strategy filled ledger read (nil seam = call store).
+func (g *Gate) stratFilledAmount(today, stratKey string) (float64, error) {
+	if g.stratFilledFn != nil {
+		return g.stratFilledFn(g.userID, today, stratKey)
+	}
+	return g.st.SumBuyFilledAmountByDayForStrategy(g.userID, today, stratKey)
+}
+
+// stratFrozenAmount 读本战法「今日在途冻结」金额（子闸 2b 的第二本账，§STRATEGY-FIX 波 1 新增）。
+// 与 stratFilledAmount 同一把缝、同一姿势；两本账在 store 侧共用 signalIDHasStrategySQL 一个谓词。
+// English: per-strategy in-flight freeze read (nil seam = call store).
+func (g *Gate) stratFrozenAmount(today, stratKey string) (float64, error) {
+	if g.stratFrozenFn != nil {
+		return g.stratFrozenFn(g.userID, today, stratKey)
+	}
+	return g.st.LocalBuyFrozenByStrategy(g.userID, today, stratKey)
 }

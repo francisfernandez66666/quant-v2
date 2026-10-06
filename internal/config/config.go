@@ -478,17 +478,29 @@ type QMTConfig struct {
 	// of the signal-side tier (P3, default on): this is the money path, so it stays conservative by default.
 	// 自动买谨慎层开关
 	AutoRiskCaution *bool `json:"auto_risk_caution,omitempty"`
-	// StrategyAllocs 每战法每日资金分配（元）：键=战法 ID / 战法名，
+	// StrategyAllocs 每战法每日资金分配（元）：键=**规范战法 ID**（内置五件套 dragon /
+	// double_bump / n_shape / dragon_return / momentum，与战法库已启用规则的 fac_*/pat_* ID），
 	// 值=该战法单日可花费的最高预算额。未配置或 =0 时不限制该战法。
 	// Σallocs 不需要等于任何总额——总预算仍由 DailyBudgetAmount 控制；
-	// StrategyAllocs 只是"切蛋糕"：每个战法单独封顶，超出当日已花+本次即拒绝。
-	// 策略匹配顺序：先按 StrategyID（如 fac_1），回退到显示名（如 "龙头"）。
+	// StrategyAllocs 只是"切蛋糕"：每个战法单独封顶，超出「当日该战法已成交 + 在途冻结 + 本次」即拒绝。
+	//
+	// §STRATEGY-FIX（2026-10-06 波 1）铲掉两条与实现不符的口径：
+	//   - 旧注释写「键=战法 ID / 战法名」并列出「匹配顺序：先按 StrategyID，回退到显示名」——
+	//     显示名那一支**从来就不是一条可用路径**：写入侧按 knownStrategyIDSet 白名单校验，
+	//     非规范 ID 的键（含任何中文显示名）直接 400，配置里存不出来；而匹配侧拿显示名去查
+	//     规范键的表必然恒不命中。两支合起来的实际效果是「五个内置战法的日预算恒不触发」，
+	//     而这条注释是该错误口径的出处之一（幻觉注释族）。
+	//   - 现取键单点：signalctl.StrategyKeyOf（规范 ID → 库规则 ID → 显示名**归一映射**到规范键），
+	//     与买入幂等键、实盘准入探针同源（§C6 约定的第三处收编）。
+	//     "显示名"仍可作为订单字段出现，但它只作为**映射输入**，不再作为存储键。
 	// 与 StrategyAmounts 正交：后者管"每次买多少"，前者管"今天这个战法最多能花多少"。
-	// English: per-strategy daily budget allocation (yuan); key=strategy ID/name, value=daily max
-	// spend for that strategy. Missing or zero means no cap (falls back to global). The sum of
-	// allocations does not need to equal any total — the overall budget is still controlled by
-	// DailyBudgetAmount. StrategyAllocs slices the cake: each strategy gets its own ceiling; if
-	// today's filled amount + this order exceeds the allocation, the buy is rejected.
+	// English: per-strategy daily budget allocation in yuan; key = the CANONICAL strategy id (five
+	// built-ins plus enabled fac_*/pat_* library rules), value = that strategy's max spend for the
+	// day. Missing or zero means no cap. The old "id or display name" wording was wrong twice over:
+	// the write path rejects non-canonical keys with a 400, so a display name can never be stored,
+	// while the match path looked the display name up in the canonical table — which together made
+	// the gate silently inert for all five built-in strategies. Lookup now derives from
+	// signalctl.StrategyKeyOf, the same single source as the buy idempotency key and the admission probe.
 	StrategyAllocs map[string]float64 `json:"strategy_allocs,omitempty"`
 	// YellowPosScale Yellow 档买入金额缩放系数（默认 0.35，对齐状态机 range 档；0=用默认）。
 	// 实际系数优先取状态机 MaxPosPct（>0 时），否则回退本值。

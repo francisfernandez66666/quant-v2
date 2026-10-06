@@ -709,8 +709,13 @@ echo "==> 28 §C1/§C1b 冻结账日期过滤 + 跨日陈旧买单无条件清�
 go test -count=1 ./internal/store/ -run 'TestLocalBuyFrozenDayFilter|TestSweepStaleBuyOrders' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/risk/ -run 'TestGateBuyDisciplineFailClosedOnReadError' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/trading/ -run 'TestSweepOrdersStaleBuyUnconditional' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-# A 静态锁①：LocalBuyFrozen 的 SQL 必须含当日日期过滤（缺了就是 C1 原缺陷复活）
-grep -A6 'func (d \*DB) LocalBuyFrozen' internal/store/real_positions.go | grep -q "substr(created_at,1,10)=?" || { echo "--- FAIL: LocalBuyFrozen 日期过滤丢失（§C1 回归）"; exit 1; }
+# A 静态锁①：冻结账的 SQL 必须含当日日期过滤（缺了就是 C1 原缺陷复活）
+#   §STRATEGY-FIX（2026-10-06 波 1）换形说明：本批把公开口径拆成 LocalBuyFrozen /
+#   LocalBuyFrozenByStrategy 两个薄壳 + 唯一实现 localBuyFrozen（两本账共用一份 SQL，防止
+#   "改了全局那本、战法那本忘改"）。锚点因此从 `LocalBuyFrozen` 挪到 localBuyFrozen——
+#   薄壳体内本来就没有 SQL，照旧名点这条锁会在**健康代码**上恒红（§0929DRILL-C 同族：
+#   判据按想象中的代码形状写、而不是按要防的失效形态写）。日期过滤这条不变量一字未改。
+grep -A6 'func (d \*DB) localBuyFrozen' internal/store/real_positions.go | grep -q "substr(created_at,1,10)=?" || { echo "--- FAIL: LocalBuyFrozen 日期过滤丢失（§C1 回归）"; exit 1; }
 # A 静态锁②（负向）：gate 侧不得回到单值吞错形态 `frozen := g.st.LocalBuyFrozen(...)`
 if grep -q 'frozen := g.st.LocalBuyFrozen' internal/risk/gate.go; then echo "--- FAIL: 冻结账读取错误被吞回单值形态（§C1 fail-open 复活）"; exit 1; fi
 # C 静态锁③：跨日清扫必须接在 SweepOrders 早退之前（引用 + 独立节流戳同时在位）
@@ -5226,6 +5231,248 @@ leg107() { # $1=说明 $2=包 $3=-run 正则
 leg107 'engine 休市日增量心跳（成对反证/周六不误伤/三件套对齐/接线）' ./internal/engine/ \
 	'TestClosedDayPinnedCountPair|TestSignalHeartbeatSaturdayIsNotAFault|TestSignalClosedDayRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
 echo "ok - §107 行为腿 9 组 + 派生/留档锁通过"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §108 §STRATEGY-FIX（2026-10-06 修复批 波 1）：战法日预算子闸对五个内置战法**恒不触发**
+#
+# owner 在设置页填了「龙头 = 20 万」，系统一分钱都不拦。三条根因串在同一条链上，只修任一条
+# 都还是漏的，所以三条各配自己的锁（本段三类判据：键空间派生腿 / 执行行静态锁 / Go 行为腿）：
+#   根因①（键空间分叉＝整条子闸形同虚设）：子闸取键在 gate.go 里另写了一份两行优先级
+#     「StrategyID 非空用它，否则回退显示名 Strategy」，而内置五战法的 StrategyID 在生产里恒为空串
+#     （combat_agent 只给战法库规则填 ID）⇒ 子闸拿到的是「龙头」；配置写入侧 server/qmt.go 的
+#     knownStrategyIDSet 只收规范 ID，非白名单键直接 400 ⇒「龙头」根本存不进 StrategyAllocs。
+#     两侧永不相交 ⇒ 五个内置战法的日预算一个都命中不了，只有 fac_*/pat_* 碰巧命中。
+#     而被跳过的那条 o.StrategyType 恰恰就是规范键本身（engine.go 构造 OrderRequest 时已填、
+#     controller.go 全量透传到 LiveOrder）。修法不是"再补一层回退"，而是**取消本地写法**：委托
+#     signalctl.StrategyKeyOf——买入幂等键（engine.go）、准入判定（AdmitStrategy）、探针三处从 §C6
+#     起就同源，子闸是第四把、也是唯一一把自己写的。以后优先级怎么改，四处一起漂，永不再分叉。
+#   根因②（聚合谓词被柜台截断吃掉）：userOrderId 被截到 24 字符，
+#     `buy:603468:dragon_return:20261005`(33) → `buy:603468:dragon_return`，尾冒号连同日期一起没了，
+#     旧谓词 `LIKE '%:'||key||':%'` 要求键两侧都有冒号 ⇒ 该战法"今日已成交"恒读 0；
+#     另外 LIKE 里 `_` 是单字符通配符，fac_1 能冒充 faxx1（串账方向还不一定）。
+#     修法：单点 store.signalIDHasStrategySQL 用 `instr(':'||signal_id||':', ':'||?||':') > 0`
+#     （先把被匹配串补上冒号边，再做整段相等，无通配语义），**两本账共用**（已成交聚合 + 战法维
+#     在途冻结）。历史行不回填：编号是事实主键，判重索引与勘误台账都挂在它上面（§SIGID-TRUNC 同口径）。
+#   根因③（在途冻结不进判定＝同战法连发可穿透）：旧子闸只比"已成交"，注释却写着
+#     「LocalBuyFrozen 无 strategy 维度……此处作为叠加守卫足够保守」——那是幻觉注释：全局闸 2 只保
+#     总量，本闸对本战法的在途一分钱都不感知，连发能一路穿透到全局闸才停（"足够保守"的前提不存在）。
+#     补 store.LocalBuyFrozenByStrategy（同一把谓词）后判定式改成 已成交 + 在途 + 本次。
+#     有意比全局闸 2 紧：**不做卖出回款对冲**——实盘卖出的幂等键带的是类别（止损/止盈/减仓）而不是
+#     战法键，「这个战法今天回血多少」在账本上问不出来，硬凑近似是把保守换成假精确；
+#     所以拦截理由明说「口径较全局预算闸偏紧」，别让它看起来像精确账。
+#   根因③之二（新账的读失败分支"看着有测试其实跑不到"）：战法维两本账的 fail-closed 用关库跑不出来
+#     ——checkBuyDiscipline 一进门先把全局三本账读掉，库一关就红在 "read buy fills"，子闸 2b 根本走不到。
+#     故按 §0926E2E-W1A 的 realizedPnlFn 同一种缝注入读数错误，两条分支各测一次，并且断言理由点名
+#     是**哪一本账**失败——红在别处也算过的话，这条用例就是空的。
+#
+# 键空间可达性用 python 腿**派生**判定（不写死清单，写死清单＝下一个新增战法天生在锁外，§BOM-REPO-DERIVE）：
+#   K = server/qmt.go 内置白名单里 Kind:"form" 的 ID 全集（配置可写侧；fac_*/pat_* 由战法库运行时
+#       注入，静态不可派生，故本腿只判内置侧 + 前缀约定由配置写入校验兜着）；
+#   P = signalctl.StrategyKeyOf 函数体内所有字面 return（生产可产生侧）；
+#   S = combat_agent/adapter.go 里"多个 *X.Strategy 并进同一个 case、下一行注释点名做空"的那一行（做空族分组点）；
+#   判定 K ∪ S == P 且 K ∩ S == ∅，双向都有意义：
+#     · P\(K∪S) 非空 ⇒ 生产会产出这个键，而配置侧填不进去 ⇒ 该战法日预算**永远配不出来**＝根因①复活；
+#     · K\P 非空 ⇒ 配置能填、子闸永远产不出该键＝同一种死的另一面；
+#     · K∩S 非空 ⇒ 做空族进了实盘买入白名单，那是"键空间口径要重写"的提醒而不是回归（红在文案里写明）。
+#   另钉四枚前提锁：|K|>=5、|P|>=9、|S|==4、分组行必须**恰好一条**——grep/正则一失效集合就变空，
+#   而"空集 ⊆ 任何集合"恒绿，整段会退化成一行都不判的自证绿。
+#
+# 预演读数（2026-10-06，逐条实测后才入段）：
+#   派生腿：K=5（double_bump dragon dragon_return momentum n_shape）、P=9（K 五键 + 做空四键）、
+#     S=4（break_down good_news_fade high_churn leader_decay）、K∪S==P（9==9）、K∩S=∅；
+#   执行行静态锁：gate.go 委托式=1、`stratKey := resolveStratKeyForGate(o)`=1、判定式含在途=1、
+#     两本账读数腿各=1、`return fmt.Sprintf("查询战法在途冻结: %v", fErr)`=1、
+#     resolveStratKeyForGate 函数体内 `signalctl.StrategyKeyOf`=1 且 `== ""`=0、
+#     `o.StrategyID != ""`=0、旧幻觉注释非注释命中=0；
+#   谓词单源：real_positions.go 非注释命中 2（定义 1 + 在途账消费 1）、risk_gates.go 消费 1、
+#     `instr(':' ||`=1、全仓非测试非注释 `LIKE '%:`=0；
+#   配置侧：qmt.go `knownSet := s.knownStrategyIDSet()`=3（Strategies/StrategyAmounts/StrategyAllocs 三张表
+#     共用同一份派生集合）、`set[k.ID] = true`=1、config.go 新口径注释「键=**规范战法 ID**」=1、
+#     旧口径串「（如 "龙头"）」=0；
+#   前端第三把写键的手：Quant.jsx `allocInput[v.id]`=1、`allocInput[v.name]`=0（键只能用规范 ID，
+#     显示名进不了配置写入校验）；
+#   在途账委托面：real_positions.go `return d.localBuyFrozen(`=2（两个公开口径都是薄壳）、
+#     `func (d *DB) localBuyFrozen(userID, day, strategyKey string) (float64, error) {` 非注释命中=1。
+# 逐枚反证（同批跑，harness=/tmp/cp108/run_static.py 与 run_counterproof.py，镜像=/tmp/mirror108 整体重建，主仓零改动）：
+#   静态锁 24 道**逐枚**配破坏（24 发，不做"挑几枚代表性的"——没反证的那枚就是没验证过的锁），
+#   行为/派生腿 10 发（K1~K6 键空间派生 + G1~G4 Go 行为）：34 发全部 RED，且 FAIL 文案里的锁编号
+#   与本枚指定编号逐一对上（NOT-AS-EXPECTED=0），跑完复位自检 GREEN。
+#   harness 自身也踩过一次同族坑：归属核对原写 `expect in out` 且 expect=「锁 1」，而 "锁 1" 是
+#   "锁 12（" 的子串 ⇒ 12~24 里任何一枚红都会冒充锁 1 通过＝反证白跑。已改成带括号的整串「锁 N（」
+#   （§标识符锁被子串命中 的第六种形态：这次命中的是反证 harness 本身，不是被测代码）。
+#   反证还当场锤出**别段**一处锁形失效：§28 的 §C1 日期过滤锁锚在 `func (d *DB) LocalBuyFrozen`
+#   的体内 -A6，而本批把该公开口径拆成薄壳（SQL 挪进唯一实现）⇒ 这条锁在健康代码上恒红
+#   （首轮 -full 就是在 §28 停住的）。已把锚点挪到 localBuyFrozen 并把不变量原样保留，
+#   §0929DRILL-C 同族：判据要按「要防的失效形态」写，不按「想象中的代码形状」写。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 108 §STRATEGY-FIX 战法日预算子闸三条根因（键空间同源 / 截断聚合 / 在途冻结）静态锁与行为腿..."
+
+CNT108=0
+# eq108 用 **grep -cF（整串）**而不是上一段沿用的 `grep -c --`（BRE）：本段锚串里有
+#   `allocInput[v.id]`、`set[k.ID] = true`、`键=**规范战法 ID**` 三类，BRE 语义下
+#   `[v.id]` 是字符类（匹配单个字符，整串恒 0 命中）、`**` 是量词（ BSD grep 直接报
+#   "repetition-operator operand invalid"）——照抄上一段的 helper 会得到"预演读的是 -F 口径、
+#   门禁跑的是 BRE 口径"的两套数，锁要么恒红要么恒绿（§标识符锁被子串命中 的同族新形态：
+#   这次不是子串，是元字符把锚串本身改了语义）。反过来说，需要正则的判据一律走 code_eq108（ERE 且括号转义）。
+eq108() { # $1=文件 $2=整串 $3=预演读数 $4=说明（整文件计数，含注释——用于"新口径注释必须在位"这类正面断言）
+	CNT108=$((CNT108 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §108 整串等值锁 ${CNT108}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+# 执行行等值/负锁：复用 §95 的 gw_code_hits（同一个判读实现两处消费，不再抄一份第二把尺子——
+# 两份并存的结局是只修一份、另一份继续按旧口径读数，本仓 §107 刚记过这一族）。
+code_eq108() { # $1=文件 $2=ERE $3=期望非注释命中数 $4=说明
+	local got
+	got=$(gw_code_hits "$1" "$2")
+	CNT108=$((CNT108 + 1))
+	[ "$got" = "$3" ] || { echo "--- FAIL: §108 执行行锁 ${CNT108}（$4）：${1} 模式「$2」非注释命中=${got} 预演=$3"; exit 1; }
+}
+
+# ── 根因①：取键必须委托同源，本地优先级不得复活 ──
+eq108 internal/risk/gate.go 'return signalctl.StrategyKeyOf(combat_agent.Signal{' 1 '取键委托式在位且唯一（子闸与幂等键/准入同一把尺子）'
+code_eq108 internal/risk/gate.go 'stratKey := resolveStratKeyForGate\(o\)' 1 '子闸真的消费委托结果（定义了不接＝键恒空、hasAlloc 恒 false，只看赋值点的守卫看不见这件事）'
+code_eq108 internal/risk/gate.go 'o\.StrategyID != ""' 0 '本地两行优先级（StrategyID 非空否则回退显示名）不得复活＝根因①'
+code_eq108 internal/risk/gate.go '此处作为叠加守卫足够保守' 0 '幻觉注释不得留在执行行上（成因原文只准出现在注释里，见上一条注释块）'
+# 函数体级判据：resolveStratKeyForGate 内除了委托调用不许有别的选择逻辑（复用 §95 的 gw_awk_body）。
+BODY_KEYS=$(gw_awk_body internal/risk/gate.go 'func resolveStratKeyForGate' 'signalctl.StrategyKeyOf')
+CNT108=$((CNT108 + 1))
+[ "$BODY_KEYS" = "1" ] || { echo "--- FAIL: §108 函数体锁 ${CNT108}（取键函数体内委托次数应为 1，实得 ${BODY_KEYS}；0＝退回本地写法，>1＝又分叉）"; exit 1; }
+BODY_FALLBACK=$(gw_awk_body internal/risk/gate.go 'func resolveStratKeyForGate' '== ""')
+CNT108=$((CNT108 + 1))
+[ "$BODY_FALLBACK" = "0" ] || { echo "--- FAIL: §108 函数体锁 ${CNT108}（取键函数体内出现「== \"\"」回退腿 ${BODY_FALLBACK} 处＝本地优先级回来了，这正是五个内置战法恒不命中的落点）"; exit 1; }
+
+# ── 根因②：整段冒号谓词单源，两本账共用，旧 LIKE 口径禁止复活 ──
+eq108 internal/store/real_positions.go 'func signalIDHasStrategySQL(signalIDExpr string) string {' 1 '谓词定义唯一'
+code_eq108 internal/store/real_positions.go 'signalIDHasStrategySQL\(' 2 '定义 1 + 战法维在途账消费 1（出现第 3 处＝又开了一本新账，回来把口径写清楚）'
+code_eq108 internal/store/risk_gates.go 'signalIDHasStrategySQL\(' 1 '已成交聚合消费同一把谓词（两本账各自实现＝两把尺子，§C6 同族）'
+eq108 internal/store/real_positions.go "instr(':' ||" 1 '冒号补边整段匹配只写在单源函数里（第二处手写 instr＝单源失效）'
+PRED_LIKE=$(gw_meta_calls "LIKE '%:")
+CNT108=$((CNT108 + 1))
+[ "$PRED_LIKE" = "0" ] || { echo "--- FAIL: §108 全仓执行行负锁 ${CNT108}（非测试 Go 代码里又出现按两侧冒号的 LIKE 匹配 ${PRED_LIKE} 处：柜台 24 字符截断行必然读 0，且 _ 通配会串账）"; exit 1; }
+
+# ── 根因③：在途冻结进了判定式，且两条读失败分支各自 fail-closed ──
+code_eq108 internal/risk/gate.go 'filledByStrat\+frozenByStrat\+amount > alloc' 1 '判定式含在途冻结项（只比已成交＝同战法连发可穿透）'
+code_eq108 internal/risk/gate.go 'g\.stratFilledAmount\(today, stratKey\)' 1 '战法已成交账读数腿'
+code_eq108 internal/risk/gate.go 'g\.stratFrozenAmount\(today, stratKey\)' 1 '战法在途冻结账读数腿（新账必须真被消费，定义了不接＝恒 0）'
+code_eq108 internal/risk/gate.go 'return fmt\.Sprintf\("查询战法在途冻结: %v", fErr\)' 1 '在途账读失败即拒单（吞成 0＝DB 故障期间该战法不限额）'
+code_eq108 internal/risk/gate.go 'stratFrozenFn func\(userID, day, strategyKey string\) \(float64, error\)' 1 '测试缝字段在位（没有它，上面那条分支在关库用例里永远走不到＝"有测试"是空的）'
+
+# ── 配置侧与前端：键空间的另外两只手 ──
+eq108 internal/server/qmt.go 'knownSet := s.knownStrategyIDSet()' 3 '白名单/每次买多少/今天最多花多少三张表共用同一份派生集合（少一处＝那张表自己定义"什么键合法"）'
+eq108 internal/server/qmt.go 'set[k.ID] = true' 1 '校验集合由 knownStrategyList 派生，不另写一份清单'
+eq108 internal/config/config.go '键=**规范战法 ID**' 1 'StrategyAllocs 注释按真口径写（旧注释「先按 StrategyID、回退到显示名」正是根因①的**书写来源**）'
+eq108 internal/config/config.go '（如 "龙头"）' 0 '旧口径整串不得作为现口径留在文件里（成因引用带「」引号，与本串不同形）'
+eq108 web/src/pages/Quant.jsx 'allocInput[v.id]' 1 '前端日预算输入框按规范 ID 建键（与白名单同一份列表）'
+code_eq108 web/src/pages/Quant.jsx 'allocInput\[v\.name\]' 0 '不许拿显示名当键（后端写入校验对未知键直接 400，用户会看到"保存成功但明天又没了"）'
+
+# ── 根因③之补充：两本在途账必须共用**一份**实现（拆成两个公开口径只是外壳）──
+#   本批把 LocalBuyFrozen 拆成「全局薄壳 + 战法薄壳 + 唯一实现 localBuyFrozen」。拆开的风险不是
+#   多两个函数名，而是**日后有人把 SQL 内联回某个薄壳**——那时两本账立刻分叉（改一处漏一处，
+#   §C6 单源族反复踩的那条），而全局薄壳看起来仍然完全正常。
+eq108 internal/store/real_positions.go 'return d.localBuyFrozen(' 2 '两个公开口径都只做委托（少一处＝有人把 SQL 内联回了薄壳，两本账开始各长各的）'
+code_eq108 internal/store/real_positions.go 'func \(d \*DB\) localBuyFrozen\(userID, day, strategyKey string\) \(float64, error\) \{' 1 '唯一实现只有一份（出现第二份＝两把尺子回来了）'
+
+# ── 键空间可达性派生腿（A1/A2：三集合各自派生 + 双向等值 + 空/歧义即红）──
+python3 - internal/server/qmt.go internal/signalctl/signalctl.go internal/combat_agent/adapter.go <<'PYKEY108' || { echo "--- FAIL: §108 键空间派生腿判红（上面已打印 K/P/S 三个集合的实得元素与个数，以及破线的那一条）"; exit 1; }
+# -*- coding: utf-8 -*-
+# §STRATEGY-FIX 波 1：战法日预算子闸的键空间可达性（派生式，不写死清单）。
+import re
+import sys
+
+Q, S, A = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def die(msg):
+    print("   " + msg)
+    sys.exit(1)
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as e:
+        die("锚点文件读不到：%s（%s）——本腿的派生依赖这三个文件，路径搬了要跟着改，不许把判据放宽" % (path, e))
+
+
+qmt, sig, ada = read(Q), read(S), read(A)
+
+# K：配置写入侧允许的键 = 内置白名单里 Kind:"form" 的 ID
+K = set(re.findall(r'\{ID:\s*"([a-z0-9_]+)",\s*Name:\s*"[^"]*",\s*Kind:\s*"form"\}', qmt))
+# P：生产可产生的规范键 = StrategyKeyOf 函数体内所有字面 return
+m = re.search(r'^func StrategyKeyOf\(sig combat_agent\.Signal\) string \{\n(.*?)^\}\n', sig, re.M | re.S)
+if not m:
+    die("锚点失效：%s 里没解析到 StrategyKeyOf 函数体（签名或收尾大括号形态变了 ⇒ P 会退化成空集合，"
+        "而空集合 ⊆ 任何集合恒绿，本腿就白跑了）" % S)
+P = set(re.findall(r'\breturn\s+"([a-z0-9_]+)"', m.group(1)))
+# S：做空族分组点 = 同一 case 行并了多个 *X.Strategy、下一行注释点名做空（分组只应有一处）
+lines = ada.split("\n")
+groups = [ln for i, ln in enumerate(lines)
+          if ln.startswith("\tcase ") and ln.count(".Strategy") >= 2
+          and i + 1 < len(lines) and "做空" in lines[i + 1]]
+if len(groups) != 1:
+    die("锚点歧义：%s 里符合「同一 case 分组多个 *X.Strategy + 下一行注释点名做空」的行有 %d 条（预演=1）。"
+        "分组点挪走了 ⇒ 派生不出做空族集合，本腿必须停下来让人重读键空间口径" % (A, len(groups)))
+SHORT = set(re.findall(r'\*([a-z_]+)\.Strategy', groups[0]))
+
+print("   K（配置可写侧，来自 %s 内置白名单 Kind=form）= %d 个：%s" % (Q, len(K), " ".join(sorted(K))))
+print("   P（生产可产生侧，来自 %s StrategyKeyOf 字面 return）= %d 个：%s" % (S, len(P), " ".join(sorted(P))))
+print("   S（做空族分组，来自 %s 同一 case 行）= %d 个：%s" % (A, len(SHORT), " ".join(sorted(SHORT))))
+
+bad = []
+# 空转正/过短即红：三集合各自的下限（正则一失效集合就变空，"空 ⊆ 任何"恒绿）
+if len(K) < 5:
+    bad.append("|K|=%d < 5：内置白名单派生断了（K 是配置可写侧全集，五个内置战法一个都不能少）" % len(K))
+if len(P) < 9:
+    bad.append("|P|=%d < 9：StrategyKeyOf 字面键派生断了（预演 9 = 五内置 + 四做空）" % len(P))
+if len(SHORT) != 4:
+    bad.append("|S|=%d ≠ 4：做空族分组行数变了（多了＝有键被当豁免项从检查里漏掉；少了＝分组锚没咬住）" % len(SHORT))
+
+miss_prod = sorted(K - P)         # 配置能填、子闸永远产不出这个键
+miss_cfg = sorted(P - K - SHORT)  # 子闸会产出、配置侧却填不进去的键（豁免集合之外）
+overlap = sorted(K & SHORT)
+if miss_prod:
+    bad.append("K\\P 非空 %s：白名单里的键 StrategyKeyOf 产不出来 ⇒ 给该战法配的日预算永远查不到（根因①的另一面）" % miss_prod)
+if miss_cfg:
+    bad.append("P\\(K∪S) 非空 %s：生产会产出这些键，而配置写入侧对未知键直接 400 ⇒ 它们的日预算**永远配不出来**"
+               "＝子闸对该战法恒不触发（根因①的复活形态）" % miss_cfg)
+if overlap:
+    bad.append("K∩S 非空 %s：做空族进了实盘买入白名单 ⇒ 要么键空间口径变了、要么豁免集合该重划，"
+               "必须回来重读本段并按新口径调整（这不是回归，是提醒）" % overlap)
+
+if bad:
+    for b in bad:
+        print("   " + b)
+    sys.exit(1)
+print("   键空间可达性等值判定通过：K∪S == P（%d == %d）、K∩S == ∅ ⇒ 子闸取键与配置写入侧同源可达"
+      % (len(K | SHORT), len(P)))
+PYKEY108
+echo "ok - §108 键空间可达性派生腿（K∪S==P 双向等值 + 四枚前提锁）"
+
+# ── Go 行为腿（B1~B7：拦/放成对、五个内置逐个、显示名手工单、24 字符截断、在途穿透与串账、两条 fail-closed）──
+leg108() { # $1=说明 $2=包 $3=-run 正则
+	local out
+	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
+	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+		echo "--- FAIL: §108 行为腿判红（$1），全文如下："
+		printf '%s\n' "$out" | head -40
+		exit 1
+	fi
+	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+		echo "--- FAIL: §108 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
+		exit 1
+	}
+	echo "ok - §108 行为腿 $1"
+}
+leg108 'risk 子闸 2b（生产键形拦/放成对、显示名手工单、截断成交计入、五内置逐个、fac/pat 互不串账、在途冻结穿透与别战法不占额）' ./internal/risk/ \
+	'TestGateBuyDisciplineSubGate2b'
+leg108 'risk 子闸 2b 两条读失败 fail-closed（测试缝注入，红在别处不算通过）' ./internal/risk/ \
+	'TestGateBuyDisciplineSubGate2bFailClosed'
+leg108 'store 战法账本三腿（聚合口径只数买入/当日/本账号、24 字符截断匹配、战法维在途冻结与全局账等值）' ./internal/store/ \
+	'TestSumBuyFilledAmountByDayForStrategy|TestStrategySignalIDTruncationMatch|TestLocalBuyFrozenByStrategy'
+
+echo "ok - §108 静态锁 ${CNT108} 道 + 键空间派生腿 + Go 行为腿 3 组通过"
 
 echo ""
 echo "==> 全部通过"

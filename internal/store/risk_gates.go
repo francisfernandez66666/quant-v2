@@ -128,17 +128,29 @@ func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
 
 // SumBuyFilledAmountByDayForStrategy 当日指定战法的已成交买入金额（元）。
 //
-// 基于 fills_effective 视图，从 signal_id 提取战法 key。用冒号边界精确匹配——":stratKey:" 确保
-// 策略名出现在完整字段位置（前后均有冒号），避免短名误碰长名前缀（dragon 不撞 dragon_return）。
+// 基于 fills_effective 视图，从 signal_id 提取战法 key，用 signalIDHasStrategySQL（real_positions.go）
+// 做**冒号分段整段相等**判断——该谓词是本仓「按战法键匹配 signal_id」的单一事实源，与 orders 侧的
+// LocalBuyFrozenByStrategy 共用一份实现。
+//
+// §STRATEGY-FIX（2026-10-06 波 1）为什么不再是 `LIKE '%:'||key||':%'`：
+//   - 柜台 userOrderId 只有 24 字符，`buy:603468:dragon_return:20261005`（33 字符）截断后剩
+//     `buy:603468:dragon_return`——尾冒号被吃掉，旧写法对龙回头的成交**恒不命中**，
+//     于是该战法的日预算即使键空间修对了也永远读到 0（现网截断实录见 fillSignalMatchSQL 头注）。
+//   - 旧注释还把键的来源写成「LiveOrder.StrategyID 或 Strategy（显示名）」——显示名那一支在
+//     生产根本进不了配置（服务端按规范 ID 白名单校验，非白名单键直接 400），属于
+//     「按想象中的键空间写判据」。现两键统一由 signalctl.StrategyKeyOf 派生（见 risk 包
+//     resolveStratKeyForGate），本函数只接受规范键。
+//
 // 因系统已从 §GAP2-W1 起统一使用结构化 signal_id（"buy:CODE:stratKey:DATE"），旧格式不再维护。
-// strategyKey 参数来自 LiveOrder.StrategyID（优先，如 fac_1/pat_2）或 LiveOrder.Strategy（显示名）。
 // §STRATEGY_ALLOC：配合风控闸子闸 2b 做每战法日预算检查。
+// English: per-strategy filled buy amount for one day, matched through the single colon-segment
+// predicate shared with the frozen ledger — truncation-safe (the counter cuts ids at 24 chars, which
+// used to make dragon_return read exactly 0) and canonical-key-only.
 func (d *DB) SumBuyFilledAmountByDayForStrategy(userID, day, strategyKey string) (float64, error) {
 	var s float64
-	p := `%:` + strategyKey + `:%`
 	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
 		FROM fills_effective WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?
-			AND signal_id LIKE ?`, userID, day, p).Scan(&s)
+			AND `+signalIDHasStrategySQL("signal_id"), userID, day, strategyKey).Scan(&s)
 	return s, err
 }
 

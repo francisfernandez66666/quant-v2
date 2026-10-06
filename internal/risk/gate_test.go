@@ -4,6 +4,7 @@ package risk
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -806,19 +807,34 @@ func TestGateT1SellableCounterPriority(t *testing.T) {
 	}
 }
 
-// TestGateBuyDisciplineSubGate2b 子闸2b：每战法日预算检查。
-// 核心语义：cfg.StrategyAllocs 设置各战法当日上限，超出后拒绝新买入；无配置或 =0 时不限制。
+// TestGateBuyDisciplineSubGate2b 子闸2b：每战法日预算检查（§STRATEGY_ALLOC + §STRATEGY-FIX 波 1）。
+//
+// 核心语义：cfg.StrategyAllocs 设置各战法当日上限，「该战法今日已成交 + 该战法在途冻结 + 本次」
+// 超上限即拒单；无配置或 =0 时不限制。
+//
+// §STRATEGY-FIX（2026-10-06 波 1）对本文件测试纪律的修正——**夹具必须喂生产真键形**：
+//   - 旧①②腿把规范 ID "dragon" 塞进 o.StrategyID，而生产内置信号的 StrategyID 恒为空串
+//     （只有战法库规则才填 fac_*/pat_*），规范 ID 落在 o.StrategyType 上；
+//   - 旧④腿拿显示名"双响炮"当 alloc 键，而服务端 knownStrategyList 白名单会把它 400 掉，
+//     生产配置里根本存不出这个键；
+//     ⇒ 两腿测的都是生产不存在的键空间，于是「子闸对五个内置战法恒不触发」带着满绿测试入库。
+//     现按形补腿：①内置真键形放行 / ②超线必拦 / ②b 只有显示名的手工单（归一映射腿）/
+//     ②c 柜台截断成交仍计入 / ③表驱动覆盖五个内置战法（拦+成对反证放）/
+//     ⑤fac_1 与 fac_10 账目不互撞 / ⑥本战法在途冻结计入 / ⑦别的战法在途不占本战法额度。
 func TestGateBuyDisciplineSubGate2b(t *testing.T) {
 	today := cntime.In(time.Now()).Format("2006-01-02")
-	date := today // trading day for signal IDs (YYYY-MM-DD)
+	date := strings.ReplaceAll(today, "-", "") // 生产幂等键里的交易日口径（YYYYMMDD）
 	db := gateDB(t)
 	g := NewGate(db, "u_sg2b", func(level, title, _ string) {})
 
-
-	// 种子数据：龙回头法一笔 1000 元成交，龙头法一笔 1000 元成交（均归属 u_sg2b）
+	// 种子成交：龙回头（**柜台 24 字符截断形态**，见④腿）与龙头各一笔 1000 元，均归属 u_sg2b。
+	truncDR := "buy:600003:" + "dragon_return" // 恰 24 字符：尾冒号连同日期一起被柜台吃掉
+	if len(truncDR) != 24 {
+		t.Fatalf("④型腿前提被破坏：截断键形应为 24 字符，实得 %d（%q）", len(truncDR), truncDR)
+	}
 	for _, f := range []store.RealFill{
-		{OrderID: "O-DR1", Code: "600001.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:31:00", SignalID: "buy:600001.SH:dragon_return:" + date, UserID: "u_sg2b"},
-		{OrderID: "O-DR2", Code: "600002.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:32:00", SignalID: "buy:600002.SH:dragon:" + date, UserID: "u_sg2b"},
+		{OrderID: "O-DR1", Code: "600003.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:31:00", SignalID: truncDR, UserID: "u_sg2b"},
+		{OrderID: "O-DR2", Code: "600002.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:32:00", SignalID: "buy:600002:dragon:" + date, UserID: "u_sg2b"},
 	} {
 		if err := db.ApplyRealFill(f); err != nil {
 			t.Fatalf("ApplyRealFill seed: %v", err)
@@ -826,68 +842,221 @@ func TestGateBuyDisciplineSubGate2b(t *testing.T) {
 	}
 
 	cfg := qmtCfg()
-	cfg.MaxPositions = 10 // 留足仓位空间
+	cfg.MaxPositions = 10          // 留足仓位空间
 	cfg.DailyBudgetAmount = 500000 // 全局预算足够大，不影响测试
 	// §WS-M seed real account so approximate cash gate does NOT block.
 	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_sg2b", AvailableCash: 500000, UpdatedAt: cntime.In(time.Now()).Format("2006-01-02 15:04:05")}); err != nil {
 		t.Fatalf("seed real account: %v", err)
 	}
 
-	// ① dragon 分配 2000 → 今日已有 1000，本次 500 → 1500 ≤ 2000 放行
+	// ① 生产真键形（内置信号：StrategyID 空、规范 ID 在 StrategyType 上、显示名在 Strategy 上）：
+	//    dragon 分配 2000 → 今日已成交 1000 + 本次 500 ≤ 2000 放行。
+	cfg.Strategies = []string{"dragon"}
 	cfg.StrategyAllocs = map[string]float64{"dragon": 2000}
 	o1 := liveOrder(SideBuy)
-	o1.StrategyID = "dragon"
-	o1.Amount = 500
-	v := g.CheckLiveOrder(cfg, o1)
-	if !v.Pass {
-		t.Fatalf("① 应为 PASS（alloc=2000, filled=1000, amount=500）, got %+v", v)
+	o1.StrategyID, o1.StrategyType, o1.Strategy = "", "dragon", "龙头"
+	o1.Code, o1.SignalID, o1.Amount = "600010.SH", "buy:600010:dragon:"+date, 500
+	if v := g.CheckLiveOrder(cfg, o1); !v.Pass {
+		t.Fatalf("① 应为 PASS（alloc=2000, filled=1000, frozen=0, amount=500）, got %+v", v)
 	}
 
-	// ② dragon 分配 1500 → 1000+600=1600 > 1500 拒单
+	// ② 同形但超线：alloc 1500 → 1000+500 已成交 + 本次 600 > 1500 拒单，理由带规范键名。
 	cfg.StrategyAllocs = map[string]float64{"dragon": 1500}
-	o2 := liveOrder(SideBuy)
-	o2.StrategyID = "dragon"
+	o2 := o1
 	o2.Amount = 600
-	v = g.CheckLiveOrder(cfg, o2)
+	o2.Code, o2.SignalID = "600011.SH", "buy:600011:dragon:"+date
+	v := g.CheckLiveOrder(cfg, o2)
 	if v.Pass {
 		t.Fatalf("② 应为 FAIL（alloc=1500, filled=1000, amount=600→1600>1500）")
 	}
 	if !strings.Contains(v.Reason, "战法[dragon] 日预算不足") {
-		t.Fatalf("拒单理由应含策略名和日预算，got: %q", v.Reason)
+		t.Fatalf("拒单理由应含规范键名与日预算，got: %q", v.Reason)
 	}
 
-	// ③ momentum 未设分配 → 不限制（将龙头加入白名单以免 signalctl AdmitStrategy 拦截非内置键）
-	cfg.StrategyAllocs = map[string]float64{"dragon": 1500} // 只有 dragon 有设置
-	cfg.Strategies = []string{"龙头"}                       // 放行 liveOrder 默认显示名
-	o3 := liveOrder(SideBuy)
-	o3.StrategyID = "momentum"
-	o3.Amount = 99999
-	v = g.CheckLiveOrder(cfg, o3)
-	if !v.Pass {
-		t.Fatalf("③ momentum 无分配应放行, got %+v", v)
+	// ②b 手工单形态（引擎字段全空、只有显示名）：显示名经 StrategyKeyOf 归一后仍必须命中规范键。
+	//     旧实现在这一支回退成「拿显示名查规范键的表」⇒ 恒不命中；现在两支收敛到同一把键。
+	cfg.StrategyAllocs = map[string]float64{"dragon": 1500}
+	o2b := liveOrder(SideBuy)
+	o2b.StrategyID, o2b.StrategyType, o2b.Strategy = "", "", "龙头"
+	o2b.Code, o2b.SignalID, o2b.Amount = "600012.SH", "buy:600012:dragon:"+date, 600
+	if v := g.CheckLiveOrder(cfg, o2b); v.Pass {
+		t.Fatalf("②b 只有显示名的手工单也必须被 dragon 预算拦住（归一映射腿），got %+v", v)
 	}
 
-	// ④ StrategyName 回退路径：用显示名而非 ID（需将"龙头"加入白名单，避免 signalctl AdmitStrategy 拦截）
-	cfg.StrategyAllocs = map[string]float64{"双响炮": 3000}
-	cfg.Strategies = nil // 空白名单走内置键判定
-	o4 := liveOrder(SideBuy)
-	o4.StrategyID = ""
-	o4.Strategy = "双响炮"
-	o4.Amount = 1000
-	v = g.CheckLiveOrder(cfg, o4)
-	if !v.Pass {
-		t.Fatalf("④ 显示名回退也应通过, got %+v", v)
+	// ②c 截断成交仍要认得：种子里的 dragon_return 成交行是柜台截断形态（无尾冒号、无日期）。
+	//     旧聚合口径 `LIKE '%:key:%'` 对该行恒不命中 ⇒ 即使③修好了键空间，龙回头这一路的
+	//     日预算仍然失明；现谓词按冒号分段做整段相等（store.signalIDHasStrategySQL）。
+	//     本腿必须跑在③的循环种子之前：此刻该战法的已成交只有这一笔 1000，理由里的数字
+	//     才是"截断行被计入"的直接证据（循环会累加上别的行，之后就问不出这个数了）。
+	cfg.Strategies = []string{"dragon_return"}
+	cfg.StrategyAllocs = map[string]float64{"dragon_return": 1500}
+	o2c := liveOrder(SideBuy)
+	o2c.StrategyID, o2c.StrategyType, o2c.Strategy = "", "dragon_return", "龙回头"
+	o2c.Code, o2c.SignalID, o2c.Amount = "600020.SH", "buy:600020:dragon_return:"+date, 600
+	v = g.CheckLiveOrder(cfg, o2c)
+	if v.Pass {
+		t.Fatalf("②c 柜台截断形态的成交必须计入 dragon_return 预算（1000 已成交 + 600 > 1500），漏计即该战法日预算恒 0")
+	}
+	if !strings.Contains(v.Reason, "已成交 1000") {
+		t.Fatalf("②c 理由里的已成交额应为 1000（截断行被计入），got %q", v.Reason)
 	}
 
-	// ⑤ fac_1 factor 战法精确匹配，不撞 fac_10（fac_ 前缀在 AdmitStrategy 空白名单下自动放行）
-	cfg.StrategyAllocs = map[string]float64{"fac_1": 5000, "fac_10": 5000}
-	cfg.Strategies = nil // 走内置键 + fac_/pat_ 前缀自动放行逻辑
-	// fac_1 无填充 → 放行
+	// ③ 表驱动：五个内置战法逐个跑①型形态（alloc 取「该行实际已成交 + 500」，本次 600 ⇒ 必拦；
+	//    再把 alloc 抬到 +700 ⇒ 必放行），任一漏拦即红。
+	//    旧测试只测了 dragon 一键（还喂错字段），其余四个内置战法从入库起就没被这条闸咬过。
+	builtins := []struct{ canon, display string }{
+		{"dragon", "龙头"}, {"double_bump", "双响炮"}, {"n_shape", "N形"},
+		{"dragon_return", "龙回头"}, {"momentum", "动量"},
+	}
+	for i, b := range builtins {
+		code := fmt.Sprintf("6001%02d.SH", i) // 逐行换码，避开仓位/集中度闸互相干扰
+		pure := strings.Split(code, ".")[0]
+		if err := db.ApplyRealFill(store.RealFill{OrderID: "O-B" + pure, Code: code, Side: "买入",
+			Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 10:00:00",
+			SignalID: "buy:" + pure + ":" + b.canon + ":" + date, UserID: "u_sg2b"}); err != nil {
+			t.Fatalf("③ seed %s: %v", b.canon, err)
+		}
+		cfg.Strategies = []string{b.canon} // 生产白名单存的也是规范 ID
+		// 基准线从账本里问出来（本用例的成交种子会随循环累加，写死 1000 会让后跑的行莫名其妙）。
+		filledRow, ferr := db.SumBuyFilledAmountByDayForStrategy("u_sg2b", today, b.canon)
+		if ferr != nil {
+			t.Fatalf("③ read filled %s: %v", b.canon, ferr)
+		}
+		if filledRow <= 0 {
+			t.Fatalf("③ %s 的成交种子没落账（filled=0 ⇒ 本行的拦与放都不成立，等于没测）", b.canon)
+		}
+		ob := liveOrder(SideBuy)
+		ob.StrategyID, ob.StrategyType, ob.Strategy = "", b.canon, b.display
+		ob.Code, ob.SignalID, ob.Amount = code, "buy:"+pure+":"+b.canon+":"+date, 600
+		// 必拦：alloc = 已成交 + 500 < 已成交 + 本次 600。
+		cfg.StrategyAllocs = map[string]float64{b.canon: filledRow + 500}
+		if v := g.CheckLiveOrder(cfg, ob); v.Pass {
+			t.Fatalf("③ 内置战法 %s（显示名 %s）alloc=%.0f、已成交 %.0f、本次 600 必须拦，漏拦即子闸对该战法恒不触发", b.canon, b.display, filledRow+500, filledRow)
+		}
+		// 成对反证：同形把 alloc 抬到 已成交 + 700 必须放行（防"恒拦"假绿）。
+		cfg.StrategyAllocs = map[string]float64{b.canon: filledRow + 700}
+		if v := g.CheckLiveOrder(cfg, ob); !v.Pass {
+			t.Fatalf("③反 %s alloc=%.0f ≥ 已成交 %.0f + 本次 600 应放行, got %+v", b.canon, filledRow+700, filledRow, v)
+		}
+	}
+
+	// ⑤ 库规则键不互撞：fac_1 与 fac_10 各自记账（旧 LIKE 口径靠两侧冒号勉强能分，
+	//    新口径靠整段相等分得更死——_ 通配符这条在 instr 下不存在）。
+	for _, f := range []store.RealFill{
+		{OrderID: "O-F1", Code: "600030.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 10:30:00", SignalID: "buy:600030:fac_1:" + date, UserID: "u_sg2b"},
+		{OrderID: "O-F10", Code: "600031.SH", Side: "买入", Price: 10, Qty: 500, Amount: 5000, TradedAt: today + " 10:31:00", SignalID: "buy:600031:fac_10:" + date, UserID: "u_sg2b"},
+	} {
+		if err := db.ApplyRealFill(f); err != nil {
+			t.Fatalf("⑤ seed: %v", err)
+		}
+	}
+	cfg.Strategies = nil // 空白名单：fac_/pat_ 前缀自动放行（生产"全部开启"存量语义）
+	cfg.StrategyAllocs = map[string]float64{"fac_1": 1500, "fac_10": 6000}
 	o5 := liveOrder(SideBuy)
-	o5.StrategyID = "fac_1"
-	o5.Amount = 1000
-	v = g.CheckLiveOrder(cfg, o5)
-	if !v.Pass {
-		t.Fatalf("⑤ fac_1 无填充应放行, got %+v", v)
+	o5.StrategyID, o5.StrategyType, o5.Strategy = "fac_1", "fac_1", "因子1"
+	o5.Code, o5.SignalID, o5.Amount = "600032.SH", "buy:600032:fac_1:"+date, 600
+	if v := g.CheckLiveOrder(cfg, o5); v.Pass {
+		t.Fatalf("⑤ fac_1 已成交 1000 + 600 > 1500 必须拦, got %+v", v)
+	}
+	o5b := o5
+	o5b.StrategyID, o5b.StrategyType, o5b.Strategy = "fac_10", "fac_10", "因子10"
+	o5b.Code, o5b.SignalID, o5b.Amount = "600033.SH", "buy:600033:fac_10:"+date, 600
+	if v := g.CheckLiveOrder(cfg, o5b); !v.Pass {
+		t.Fatalf("⑤反 fac_10 已成交 5000 + 600 ≤ 6000 应放行（fac_1 的账不得串到 fac_10 头上）, got %+v", v)
+	}
+
+	// ⑥ 在途冻结计入（P2-D）：本战法已成交 0、在途挂单 900、本次 200、alloc 1000 ⇒ 必须拦。
+	//    旧子闸只看已成交 ⇒ 同战法连发可一路穿透到全局闸才停。
+	if _, err := db.UpsertRealOrder(store.RealOrder{OrderID: "O-FZ1", SignalID: "buy:600040:pat_9:" + date,
+		Code: "600040.SH", Side: "买入", Status: "已报", Price: 9, Qty: 100,
+		CreatedAt: today + "T11:00:00+08:00", UserID: "u_sg2b"}); err != nil {
+		t.Fatalf("⑥ seed 在途买单: %v", err)
+	}
+	cfg.StrategyAllocs = map[string]float64{"pat_9": 1000}
+	o6 := liveOrder(SideBuy)
+	o6.StrategyID, o6.StrategyType, o6.Strategy = "pat_9", "pat_9", "形态9"
+	o6.Code, o6.SignalID, o6.Amount = "600041.SH", "buy:600041:pat_9:"+date, 200
+	// 注意本腿要复用外层 v：下面的"理由里必须写着在途冻结 900"读的是同一次裁定，
+	// 若在此写成 `if v := ...` 会把 v 遮蔽成本腿的局部变量，第二条断言就去读②c 的旧裁定（假绿）。
+	v = g.CheckLiveOrder(cfg, o6)
+	if v.Pass {
+		t.Fatalf("⑥ 在途冻结 900 + 本次 200 > alloc 1000 必须拦（子闸只比已成交＝可穿透）, got %+v", v)
+	}
+	if !strings.Contains(v.Reason, "在途冻结 900") {
+		t.Fatalf("⑥ 理由应显示在途冻结 900，got %q", v.Reason)
+	}
+
+	// ⑦ 别的战法在途不占本战法额度（防"过度收紧/串账"）：同一张在途单属于 pat_9，
+	//    本单走 pat_8 ⇒ 只有本次 200，alloc 1000 应放行。
+	cfg.StrategyAllocs = map[string]float64{"pat_8": 1000}
+	o7 := o6
+	o7.StrategyID, o7.StrategyType, o7.Strategy = "pat_8", "pat_8", "形态8"
+	o7.Code, o7.SignalID = "600042.SH", "buy:600042:pat_8:"+date
+	if v := g.CheckLiveOrder(cfg, o7); !v.Pass {
+		t.Fatalf("⑦ pat_9 的在途不得占 pat_8 的额度, got %+v", v)
+	}
+}
+
+// TestGateBuyDisciplineSubGate2bFailClosed 战法维两本账读失败必须 fail-closed 拒单。
+//
+// 这条用例存在的理由是「为什么不用关库跑」：checkBuyDiscipline 一进门先把**全局**三本账
+// （已成交/在途冻结/卖出回款）读掉，库一关就红在 "read buy fills"，子闸 2b 根本走不到——
+// 于是 §C1 那条 fail-closed 纪律在子闸上是**没被测过**的。本批给子闸补了在途冻结账，
+// 若沿用关库写法，看起来"有 fail-closed 用例"，实际两条新分支一行都没被执行。
+// 所以按 realizedPnlFn 的同一种缝注入读数错误（见 Gate 结构体字段注释），两条分支各测一次，
+// 并且断言理由里点名是哪一本账——否则「红在别处」也会被判成通过（同 §107 行为腿 f 的归属判据）。
+//
+// English: the two per-strategy ledger reads must fail closed; injected via seams because closing
+// the DB trips the global ledgers before sub-gate 2b is reached.
+func TestGateBuyDisciplineSubGate2bFailClosed(t *testing.T) {
+	today := cntime.In(time.Now()).Format("2006-01-02")
+	date := strings.ReplaceAll(today, "-", "")
+	db := gateDB(t)
+	g := NewGate(db, "u_s2bfc", func(level, title, _ string) {})
+	cfg := qmtCfg()
+	cfg.MaxPositions = 10
+	cfg.DailyBudgetAmount = 500000 // 全局预算足够大，保证拦下来的一定是子闸
+	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_s2bfc", AvailableCash: 500000,
+		UpdatedAt: cntime.In(time.Now()).Format("2006-01-02 15:04:05")}); err != nil {
+		t.Fatalf("seed real account: %v", err)
+	}
+	cfg.Strategies = []string{"dragon"}
+	cfg.StrategyAllocs = map[string]float64{"dragon": 1000}
+	o := liveOrder(SideBuy)
+	o.StrategyID, o.StrategyType, o.Strategy = "", "dragon", "龙头"
+	o.Code, o.SignalID, o.Amount = "600050.SH", "buy:600050:dragon:"+date, 300
+
+	// 健康库：300 ≤ 1000 放行（先证明后面两次红是注入造成的，不是夹具本身恒拦）。
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("健康库 alloc=1000、本次 300 应放行, got %+v", v)
+	}
+
+	// ① 已成交账读失败 ⇒ 拒单，且理由点名「查询战法资金分配」。
+	g.stratFilledFn = func(_, _, _ string) (float64, error) { return 0, errors.New("注入：fills 查询失败") }
+	v := g.CheckLiveOrder(cfg, o)
+	if v.Pass {
+		t.Fatal("战法已成交账读失败时必须拒单（fail-closed），不得按 0 放行")
+	}
+	if !strings.Contains(v.Reason, "查询战法资金分配") {
+		t.Fatalf("理由须点明是战法已成交账失败（红在别处＝本分支没被走到）, got %q", v.Reason)
+	}
+
+	// ② 在途冻结账读失败 ⇒ 同样拒单，理由点名「查询战法在途冻结」。
+	//    这一支就是旧注释「LocalBuyFrozen 无 strategy 维度……足够保守」掩盖的那本账：
+	//    旧代码里没有这次查询，所以旧实现连"读失败"这个状态都不存在。
+	g.stratFilledFn = nil
+	g.stratFrozenFn = func(_, _, _ string) (float64, error) { return 0, errors.New("注入：orders 在途查询失败") }
+	v = g.CheckLiveOrder(cfg, o)
+	if v.Pass {
+		t.Fatal("战法在途冻结账读失败时必须拒单（§C1 同姿势）")
+	}
+	if !strings.Contains(v.Reason, "查询战法在途冻结") {
+		t.Fatalf("理由须点明是战法在途冻结账失败, got %q", v.Reason)
+	}
+
+	// ③ 摘掉缝（回到生产读数路径）后必须恢复放行——证明两条注入分支确实只在读数处生效。
+	g.stratFrozenFn = nil
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("复位后应放行, got %+v", v)
 	}
 }

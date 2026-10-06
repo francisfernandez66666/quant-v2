@@ -186,12 +186,36 @@ func TestCountBuyFilledOrdersByDayIgnoresUnfilledOrders(t *testing.T) {
 func TestSumBuyFilledAmountByDayForStrategy(t *testing.T) {
 	db := newRiskTestDB(t)
 	fills := []RealFill{
-		func() RealFill { f := fill("OA", "", "600001.SH", "买入", "2026-09-18 09:31:00"); f.SignalID = "buy:600001.SH:dragon_return:2026-09-18"; return f }(),
-		func() RealFill { f := fill("OB", "", "600002.SH", "买入", "2026-09-18 10:00:00"); f.SignalID = "buy:600002.SH:dragon_return:2026-09-18"; return f }(),
-		func() RealFill { f := fill("OC", "", "600003.SH", "买入", "2026-09-18 10:30:00"); f.SignalID = "buy:600003.SH:dragon:2026-09-18"; return f }(),
-		func() RealFill { f := fill("OD", "", "600004.SH", "买入", "2026-09-18 11:00:00"); f.SignalID = "buy:600004.SH:momentum:2026-09-18"; return f }(),
-		func() RealFill { f := fill("OE", "", "600005.SH", "买入", "2026-09-18 11:30:00"); f.SignalID = "buy:600005.SH:fac_1:2026-09-18"; return f }(),
-		func() RealFill { f := fill("OF", "", "600001.SH", "卖出", "2026-09-18 12:00:00"); f.SignalID = "sell:600001.SH:dragon:2026-09-18"; return f }(),
+		func() RealFill {
+			f := fill("OA", "", "600001.SH", "买入", "2026-09-18 09:31:00")
+			f.SignalID = "buy:600001.SH:dragon_return:2026-09-18"
+			return f
+		}(),
+		func() RealFill {
+			f := fill("OB", "", "600002.SH", "买入", "2026-09-18 10:00:00")
+			f.SignalID = "buy:600002.SH:dragon_return:2026-09-18"
+			return f
+		}(),
+		func() RealFill {
+			f := fill("OC", "", "600003.SH", "买入", "2026-09-18 10:30:00")
+			f.SignalID = "buy:600003.SH:dragon:2026-09-18"
+			return f
+		}(),
+		func() RealFill {
+			f := fill("OD", "", "600004.SH", "买入", "2026-09-18 11:00:00")
+			f.SignalID = "buy:600004.SH:momentum:2026-09-18"
+			return f
+		}(),
+		func() RealFill {
+			f := fill("OE", "", "600005.SH", "买入", "2026-09-18 11:30:00")
+			f.SignalID = "buy:600005.SH:fac_1:2026-09-18"
+			return f
+		}(),
+		func() RealFill {
+			f := fill("OF", "", "600001.SH", "卖出", "2026-09-18 12:00:00")
+			f.SignalID = "sell:600001.SH:dragon:2026-09-18"
+			return f
+		}(),
 	}
 	for i, f := range fills {
 		if err := db.ApplyRealFill(f); err != nil {
@@ -218,5 +242,125 @@ func TestSumBuyFilledAmountByDayForStrategy(t *testing.T) {
 	got, _ = db.SumBuyFilledAmountByDayForStrategy("u_rg", "2026-09-18", "pat_1")
 	if got != 0 {
 		t.Fatalf("pat_1 (no fills) expected=0 got=%.0f", got)
+	}
+}
+
+// TestStrategySignalIDTruncationMatch §STRATEGY-FIX（2026-10-06 波 1）战法键匹配谓词的三条口径：
+// 柜台 24 字符截断仍要认得、跨日不得张冠李戴、下划线不得当通配符。
+// 旧实现是 `signal_id LIKE '%:'||key||':%'`（要求键两侧都有冒号），三种情形里有两种判错：
+//   - 截断行 `buy:600001:dragon_return`（编号共 33 字符、柜台只回前 24 位，尾冒号连日期一起被吃掉）
+//     恒不命中 ⇒ 龙回头这一路的战法日预算恒读 0（即便键空间修好了也仍失明）；
+//   - LIKE 的 `_` 是单字符通配符 ⇒ 键 fac_1 会顺带命中 faxx1 这类异段，把别人的钱记到本战法头上。
+//
+// English: the colon-segment matcher must survive the counter's 24-char truncation, must scope by
+// the fill's own trade date, and must not treat the underscore inside strategy keys as a LIKE wildcard.
+func TestStrategySignalIDTruncationMatch(t *testing.T) {
+	db := newRiskTestDB(t)
+	const day = "2026-09-18"
+	truncDR := "buy:600001:dragon_return" // 恰好 24 字符：柜台上限处正落在键名末尾
+	if len(truncDR) != 24 {
+		t.Fatalf("截断腿前提被破坏：该形态应恰为 24 字符，实得 %d（%q）", len(truncDR), truncDR)
+	}
+	truncFac := "buy:603468:fac_1:2026092" // 现网实录形态（§SIGID-TRUNC）：日期被切掉两位
+	if len(truncFac) != 24 {
+		t.Fatalf("截断腿前提被破坏：现网实录形态应恰为 24 字符，实得 %d（%q）", len(truncFac), truncFac)
+	}
+	seeds := []struct {
+		orderID, code, signalID, tradedAt string
+	}{
+		{"TA", "600001.SH", truncDR, day + " 09:31:00"},                           // 截断·尾冒号被吃
+		{"TB", "603468.SH", truncFac, day + " 09:32:00"},                          // 截断·日期残缺
+		{"TC", "600002.SH", "buy:600002:dragon:" + "20260918", day + " 09:33:00"}, // 完整
+		{"TD", "600003.SH", "buy:600003:faxx1:" + "20260918", day + " 09:34:00"},  // 下划线通配陷阱
+		{"TE", "600004.SH", truncDR, "2026-09-17 09:31:00"},                       // 前一日的截断行（同前缀，跨日不得混入）
+	}
+	for _, s := range seeds {
+		f := fill(s.orderID, "", s.code, "买入", s.tradedAt)
+		f.SignalID = s.signalID
+		if err := db.ApplyRealFill(f); err != nil {
+			t.Fatalf("ApplyRealFill %s: %v", s.orderID, err)
+		}
+	}
+	cases := []struct {
+		key  string
+		want float64
+		why  string
+	}{
+		{"dragon_return", 1000, "截断行必须计入，且前一日的同前缀行不得混入（跨日靠 traded_at 独立约束）"},
+		{"fac_1", 1000, "日期残缺的截断行必须计入，且不得顺带命中 faxx1（LIKE 的 _ 是通配符，instr 不是）"},
+		{"faxx1", 1000, "异段自成一键，不得被 fac_1 吸走"},
+		{"dragon", 1000, "短键不得把 dragon_return 的钱并进来（旧口径靠两侧冒号勉强挡住，新口径靠整段相等挡死）"},
+		{"momentum", 0, "无成交的战法必须读 0（防「键没命中」被当成「命中了个空账」）"},
+	}
+	for _, c := range cases {
+		got, err := db.SumBuyFilledAmountByDayForStrategy("u_rg", day, c.key)
+		if err != nil {
+			t.Fatalf("Sum %s: %v", c.key, err)
+		}
+		if got != c.want {
+			t.Fatalf("key=%s expected=%.0f got=%.0f（%s）", c.key, c.want, got, c.why)
+		}
+	}
+}
+
+// TestLocalBuyFrozenByStrategy §STRATEGY-FIX（2026-10-06 波 1）战法维度的在途冻结账：
+// §STRATEGY_ALLOC 子闸 2b 的「已成交 + 在途」口径数据源。三条语义各自钉死：
+// 只算本战法、只算当日未成交余量、空键＝不限战法且必须与全局那本账加得起来。
+// English: per-strategy in-flight freeze — restricted to the key's own orders and the given day,
+// and the empty key must behave exactly as the global ledger (so the two books reconcile).
+func TestLocalBuyFrozenByStrategy(t *testing.T) {
+	db := newRiskTestDB(t)
+	const day = "2026-09-18"
+	orders := []RealOrder{
+		{OrderID: "FZ1", SignalID: "buy:600010:pat_9:20260918", Code: "600010.SH", Side: "买入", Status: "已报", Price: 9, Qty: 100, CreatedAt: day + "T10:00:00+08:00", UserID: "u_rg"},
+		{OrderID: "FZ2", SignalID: "buy:600011:dragon:20260918", Code: "600011.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: day + "T10:01:00+08:00", UserID: "u_rg"},
+		{OrderID: "FZ3", SignalID: "buy:600012:pat_9:20260918", Code: "600012.SH", Side: "买入", Status: "已成", Price: 10, Qty: 100, CreatedAt: day + "T10:02:00+08:00", UserID: "u_rg"},
+		{OrderID: "FZ4", SignalID: "buy:600013:pat_9:20260917", Code: "600013.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-17T10:03:00+08:00", UserID: "u_rg"},
+		{OrderID: "FZ5", SignalID: "buy:600014:pat_9x:20260918", Code: "600014.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: day + "T10:04:00+08:00", UserID: "u_rg"},
+	}
+	for _, o := range orders {
+		if _, err := db.UpsertRealOrder(o); err != nil {
+			t.Fatalf("UpsertRealOrder %s: %v", o.OrderID, err)
+		}
+	}
+	got, err := db.LocalBuyFrozenByStrategy("u_rg", day, "pat_9")
+	if err != nil {
+		t.Fatalf("frozen pat_9: %v", err)
+	}
+	if got != 900 {
+		t.Fatalf("pat_9 在途应仅 FZ1 的 900（FZ3 已成/跨日 FZ4/pat_9x FZ5 都不算），got %.0f", got)
+	}
+	if got, _ := db.LocalBuyFrozenByStrategy("u_rg", day, "dragon"); got != 1000 {
+		t.Fatalf("dragon 在途应 1000（FZ2），got %.0f", got)
+	}
+	if got, _ := db.LocalBuyFrozenByStrategy("u_rg", day, "momentum"); got != 0 {
+		t.Fatalf("无在途单的战法必须 0，got %.0f", got)
+	}
+	total, err := db.LocalBuyFrozen("u_rg", day)
+	if err != nil {
+		t.Fatalf("frozen total: %v", err)
+	}
+	if total != 2900 {
+		t.Fatalf("全局在途应为 900(FZ1)+1000(FZ2)+1000(FZ5)=2900（已成 FZ3、跨日 FZ4 不算），got %.0f", total)
+	}
+	// 空键＝不限战法：与全局那本账等值（两本账共用一份实现，这条等值就是"没各写一份"的证据）。
+	empty, err := db.LocalBuyFrozenByStrategy("u_rg", day, "")
+	if err != nil {
+		t.Fatalf("frozen empty key: %v", err)
+	}
+	if empty != total {
+		t.Fatalf("空键必须等于全局在途（%.0f），got %.0f——空串被当成过滤器＝子闸静默读到 0", total, empty)
+	}
+	// 各战法分项之和必须等于全局（防"漏一个战法键"造成两本账悄悄分叉）。
+	sum := 0.0
+	for _, k := range []string{"pat_9", "dragon", "pat_9x"} {
+		v, err := db.LocalBuyFrozenByStrategy("u_rg", day, k)
+		if err != nil {
+			t.Fatalf("frozen %s: %v", k, err)
+		}
+		sum += v
+	}
+	if sum != total {
+		t.Fatalf("分项之和 %.0f 必须等于全局 %.0f（少一个键就是子闸对那笔在途无感知）", sum, total)
 	}
 }
