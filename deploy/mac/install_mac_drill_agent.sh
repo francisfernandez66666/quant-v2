@@ -43,6 +43,11 @@ echo "==> 计划"
 say "稳定副本 : ${REPO_MAC_DIR}/run_drill_weekly.sh → ${DRILL_HOME}/run_drill_weekly.sh"
 say "           ${REPO_MAC_DIR}/verify_restore.sh   → ${DRILL_HOME}/deploy/mac/verify_restore.sh"
 say "           ${REPO_ROOT}/scripts/restore_drill.sh → ${DRILL_HOME}/scripts/restore_drill.sh"
+# §KUMA-SECREDTO（2026-10-07 波 3）：ntfy 主题的缺省值已从仓库拿掉（主题＝凭据，旧值已进 git 历史），
+#   verify_restore.sh 现在 source **同目录**的 ntfy_topic.sh 取主题。镜像树少拷这一个文件，
+#   演练一启动就 FATAL 退出——这是「加了一条依赖却没同步到拷贝清单」的同族形态（清单式锁第三次复发），
+#   所以这里 say/cp/chmod/存在性自检四件一起加，缺一件都会在周日 09:00 才第一次现形。
+say "           ${REPO_MAC_DIR}/ntfy_topic.sh       → ${DRILL_HOME}/deploy/mac/ntfy_topic.sh（告警主题取用单实现）"
 say "任务 plist : ${REPO_MAC_DIR}/com.quant.drill.plist → ${AGENT}（先备份旧份）"
 say "调度       : 每周日 09:00（避开 07:00 的备份拉取腿；错过则唤醒后补跑）"
 say "留档       : \$DRILL_RECORD 默认 ~/backups/quant/drill_record.jsonl（每次一行 JSON，失败也算）"
@@ -56,21 +61,45 @@ security find-generic-password -a "$USER" -s quant-restic-repo-pass >/dev/null 2
 [ -x /usr/bin/sqlite3 ] || command -v sqlite3 >/dev/null 2>&1 \
   || { echo "X 缺 sqlite3 CLI：restore_drill.sh 的 REQUIRE_SQLITE 默认 1，缺了必判红（不降级通过）" >&2; exit 1; }
 [ -f "${REPO_ROOT}/scripts/restore_drill.sh" ] || { echo "X 仓库里找不到 scripts/restore_drill.sh" >&2; exit 1; }
+# §KUMA-SECREDTO：告警主题取不到（env NTFY_TOPIC 未给且钥匙串 quant-ntfy-topic 为空）就**拒绝安装**。
+#   理由与备份安装器同一条：演练的价值在「坏了有人知道」。这里必须讲清运行期兜底在哪，
+#   不然会误以为"缺 lib 只是少一条推送"：
+#     verify_restore.sh 查不到同目录 ntfy_topic.sh 是 **FATAL 早退**（早于 alert()、也早于
+#     DRILL_RECORD 落笔），所以这一腿当场既推不出、也留不下读数；
+#     兜住它的是拉取腿的 record_freshness("drill")——留档不存在或超 9 天即推
+#     "quant drill(com.quant.drill) 调度疑似死了"（§0929DRILL 的死调度探测器）。
+#   也就是说缺 lib 的后果=周日腿整体静默、要靠次日拉取腿的一条超龄告警才现形。既然装上去
+#   就是这个形态，那就拦在装机期，让 owner 当场看到"主题取不到"这条更准的因。
+# shellcheck source=ntfy_topic.sh
+. "${REPO_MAC_DIR}/ntfy_topic.sh"
+if ! ntfy_topic_report drill-installer-preflight; then
+  echo "X 取不到 ntfy 主题（env NTFY_TOPIC 未给，钥匙串 ${NTFY_KEYCHAIN_ITEM:-quant-ntfy-topic} 也没有）。" >&2
+  echo "  先落一次口令：security add-generic-password -a \"\$USER\" -s ${NTFY_KEYCHAIN_ITEM:-quant-ntfy-topic} -w" >&2
+  echo "  （旧值从 git 历史迁出可用 deploy/mac/migrate_ntfy_topic_to_keychain.sh -Apply，它只报长度与指纹；" >&2
+  echo "    注意旧值已进过仓库，正式口径是按已泄露处理→在 ntfy 侧建新主题后 --from-stdin 写进钥匙串）" >&2
+  exit 1
+fi
 
 mkdir -p "${DRILL_HOME}/deploy/mac" "${DRILL_HOME}/scripts"
-# 三个文件落在**两个不同层级**，不能一次循环搞定：
+# 四个文件落在**两个不同层级**，不能一次循环搞定：
 #   run_drill_weekly.sh → 稳定根（plist 直接指它）；
-#   verify_restore.sh   → deploy/mac/ 子层（它按 `$(dirname $0)/../..` 反推仓库根）；
+#   verify_restore.sh / ntfy_topic.sh → deploy/mac/ 子层（前者按 `$(dirname $0)/../..` 反推仓库根、
+#     并按**同目录**source 后者，所以后者必须跟着进 deploy/mac/ 而不是稳定根）；
 #   restore_drill.sh    → scripts/ 子层（就是上面那个反推的落点）。
 cp "${REPO_MAC_DIR}/run_drill_weekly.sh" "${DRILL_HOME}/run_drill_weekly.sh"
 cp "${REPO_MAC_DIR}/verify_restore.sh" "${DRILL_HOME}/deploy/mac/verify_restore.sh"
+cp "${REPO_MAC_DIR}/ntfy_topic.sh" "${DRILL_HOME}/deploy/mac/ntfy_topic.sh"
 cp "${REPO_ROOT}/scripts/restore_drill.sh" "${DRILL_HOME}/scripts/restore_drill.sh"
 chmod +x "${DRILL_HOME}/run_drill_weekly.sh" "${DRILL_HOME}/deploy/mac/verify_restore.sh" \
+         "${DRILL_HOME}/deploy/mac/ntfy_topic.sh" \
          "${DRILL_HOME}/scripts/restore_drill.sh"
 
 # 装完当场自证镜像树完整（缺哪一半都拒绝重载任务）：这里断的是**稳定副本**，不是仓库源。
 [ -f "${DRILL_HOME}/run_drill_weekly.sh" ] || { echo "X 稳定副本缺 run_drill_weekly.sh" >&2; exit 1; }
 [ -f "${DRILL_HOME}/deploy/mac/verify_restore.sh" ] || { echo "X 稳定副本缺 deploy/mac/verify_restore.sh" >&2; exit 1; }
+[ -f "${DRILL_HOME}/deploy/mac/ntfy_topic.sh" ] \
+  || { echo "X 稳定副本缺 deploy/mac/ntfy_topic.sh（verify_restore.sh 在镜像里 source 的就是这一份；" >&2
+       echo "    少它＝演练一启动就 FATAL，周日腿整体静默）" >&2; exit 1; }
 [ -f "${DRILL_HOME}/scripts/restore_drill.sh" ] || { echo "X 稳定副本缺 scripts/restore_drill.sh（镜像树被拍平＝演练找不到断言脚本）" >&2; exit 1; }
 
 # plist 的 ProgramArguments 必须指稳定根里的那份；仓库模板里就是稳定路径，直接拷并先校验。

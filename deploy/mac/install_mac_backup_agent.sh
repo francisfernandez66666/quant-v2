@@ -26,6 +26,10 @@ done
 say() { echo "  $*"; }
 echo "==> 计划"
 say "脚本稳定副本 : $REPO_MAC_DIR/restic_pull_backup.sh → $BIN_DIR/restic_pull_backup.sh"
+# §KUMA-SECREDTO（2026-10-07 波 3）：取 ntfy 主题的实现拆成单文件后，"少拷一个文件"就变成了
+# "备份代理装上但告警通道是断的"——而现象上和"今晚没失败"完全一样。所以它跟着一起进稳定副本，
+# 并且下面有一枚"拷不到就拒绝安装"的配对锁（同 §0929DRILL 的三件套配对派生锁一个姿势）。
+say "告警主题口径 : $REPO_MAC_DIR/ntfy_topic.sh → $BIN_DIR/ntfy_topic.sh（restic_pull_backup.sh source 它）"
 say "任务 plist    : ${REPO_MAC_DIR}/com.quant.backup.plist → ${AGENT}（先备份旧份）"
 say "调度          : 每日 07:00 + 10:30 两个时点（§0929DRILL-B：广州快照收工在 05:20~08:19 浮动，"
 say "                单靠 07:00 会系统性只拉到前一天那份；10:30 同时兼作 sftp 熔断后的补跑窗口）"
@@ -38,10 +42,26 @@ awk '/^Host[ \t]/{for(i=2;i<=NF;i++) if($i=="gz") f=1} END{exit !f}' "$HOME/.ssh
   || { echo "X ~/.ssh/config 的 Host 行里没有 gz 别名（拉取腿靠它出站连广州）" >&2; exit 1; }
 security find-generic-password -a "$USER" -s quant-restic-repo-pass >/dev/null 2>&1 \
   || { echo "X 钥匙串缺 quant-restic-repo-pass（本脚本只查存在性，不读取口令值）" >&2; exit 1; }
+# §KUMA-SECREDTO：仓库里不再有主题缺省值 ⇒ 装之前必须能取到（env NTFY_TOPIC 或钥匙串
+# quant-ntfy-topic）。取不到就**拒绝安装**：装一个"失败也喊不出声"的备份代理，比不装更危险，
+# 而它恰好是 09-16~09-25 那 10 天静默断更最难被发现的那一环。
+# shellcheck source=ntfy_topic.sh
+. "$REPO_MAC_DIR/ntfy_topic.sh"
+if ! ntfy_topic_report backup-installer-preflight; then
+  echo "X 取不到 ntfy 主题（env NTFY_TOPIC 未给，钥匙串 ${NTFY_KEYCHAIN_ITEM:-quant-ntfy-topic} 也没有）。" >&2
+  echo "  先落一次口令：security add-generic-password -a \"\$USER\" -s ${NTFY_KEYCHAIN_ITEM:-quant-ntfy-topic} -w" >&2
+  echo "  （从仓库历史迁出的那份旧值可用 deploy/mac/migrate_ntfy_topic_to_keychain.sh -Apply 代取，它只报长度与指纹）" >&2
+  exit 1
+fi
 
 mkdir -p "$BIN_DIR"
 cp "$REPO_MAC_DIR/restic_pull_backup.sh" "$BIN_DIR/restic_pull_backup.sh"
 chmod +x "$BIN_DIR/restic_pull_backup.sh"
+# 单实现文件必须同批落位：漏拷＝稳定副本里的拉取腿一启动就 FATAL（它查不到 ntfy_topic.sh 会拒跑），
+# 而 launchd 只看退出码，现象仍是"每天定时、每天静默失败"——正是本脚本要根除的那个形态。
+cp "$REPO_MAC_DIR/ntfy_topic.sh" "$BIN_DIR/ntfy_topic.sh"
+chmod +x "$BIN_DIR/ntfy_topic.sh"
+[ -f "$BIN_DIR/ntfy_topic.sh" ] || { echo "X ntfy_topic.sh 没落进 ${BIN_DIR}（拒绝在告警口径缺失的状态下继续安装）" >&2; exit 1; }
 
 # plist 的 ProgramArguments 必须指稳定副本；仓库模板里就是稳定路径，直接拷。
 if ! grep -q "$BIN_DIR/restic_pull_backup.sh" "$REPO_MAC_DIR/com.quant.backup.plist"; then

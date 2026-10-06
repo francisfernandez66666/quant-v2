@@ -1140,6 +1140,90 @@ $aclDetail = "checked=" + $aclChecked + " outside=" + $aclOutside + " " + ($aclP
 Write-Output ("INFO|snapshot_acl_readout " + $aclDetail)
 $aclBad = ($aclOutside -gt 0 -or $aclChecked -eq 0)
 Probe "sec: snapshot/restic dirs expose no ACE outside SYSTEM+Administrators" (-not $aclBad) $aclDetail
+
+# 18) §KA-TASKREG（2026-10-07 修复批 波 3，第 32 探针）：Windows 计划任务**全集**在位 +
+#     周期任务上次运行新鲜度。
+# 存在理由（§AUDIT_20261005 P1-D，本机读码锤实）：17:10 盘后保活任务 QMT-Dataload-KeepAlive
+#   的执行体 scripts/dataload_keepalive.py 自 §0927KA 起在部署 scp 清单里，而**任务本体从来没有
+#   注册体、部署面也没有"任务在位"判据**——它是 2026-09-16 手工 schtasks 出来的（RUNBOOK §1 记的
+#   正是那次手工修）。本探针是三段修法的第三段：①任务名单/阈值单源＝service_definitions.ps1 的
+#   $SvcTaskRoster + $SvcTaskFreshRules + $SvcTaskInPlaceOnly；②注册体＝register_engine_services.ps1
+#   §6b（缺省只预演、-RegisterKeepaliveTask 才动手）；③本探针。
+# 输出协议：每任务一行 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|action=..`，
+#   **只有读数、没有判词**；红绿由 bash 侧 judge_task_roster() 判（见本文件下方）。
+#   为什么判读不放 PS：本机没有 PowerShell，判据写在 PS 就是"从没真跑过的判据"——§0929DRILL 四条
+#   缺陷的共同根因正是"脚本写得完整但从没真跑"，DRILL-A 那条 --last 假红就是没跑过的读法。
+#   放 bash 之后，门禁 §110 可以喂七种合成读数逐条验红绿，全程离线、零外呼。
+# 全集怎么来（关键取向）：**不写第二份名单**，点源单源文件后遍历 $SvcTaskRoster。写死名单＝
+#   §BOM-REPO-DERIVE / §107 派生正锁点名的同一个形态：清单式锁对下一个新增任务天生失明，
+#   而"新增任务"恰恰是本批要防的那件事。
+#   点源失败 / 名单为空 / 名单里有空项 ⇒ 各出一条**坏读数行**交给 bash 判红（探针看不见要查的
+#   对象＝探针失明，与 §70 空清单正锁同族）。
+# 阈值不在这里写：rule 字段直接回显单源里的 MaxAgeHours，bash 只做"age 与 rule 比大小"——
+#   于是"阈值改一处、探针跟着漏改"这类面天然为零（§P0-B 的 30h 同源同口径）。
+# rule=inplace 的任务是 ONLOGON / ONSTART 触发（QMT-Gateway-Logon / quant-all-wd）：它们的上次
+#   运行时间由"有没有人登录、机器有没有重启"决定，不由时钟决定，拿来判新鲜度＝在一台可以连续
+#   数周不重立的机器上造**结构性必红**（§107 DRILL-C：永远红的锁的结局是所有人学会忽略它）。
+# enabled 读数：CHECKLIST 的止损动作是先 `/change /disable` 再杀进程，所以"任务在位但被禁用"是
+#   一个真实存在的中间态；周期任务禁用即判红（守护不该长期停着），仅查在位的不判。
+# action 字段：只回显任务动作行（可执行文件 + 参数，纯 ASCII 路径，截 160 字符，不含任何凭据）。
+#   用途是让"现网存的那条命令"与"注册体将要写入的那条"能当面比对——09-16 的根因就写在这行里
+#   （裸 `python` ⇒ SYSTEM 的 PATH 找不到 ⇒ 每天触发每天 127、日志一行不写），只查在位看不见它坏。
+$krDefsOk = $false
+if (Test-Path -LiteralPath $SvcDefsPath) {
+    try { . $SvcDefsPath; $krDefsOk = $true } catch { $krDefsOk = $false }
+}
+if (-not $krDefsOk) {
+    Write-Output "TASK|__service_definitions__|present=0|rule=none|age_h=na|state=defs-unreadable|enabled=na|action="
+} elseif (-not $SvcTaskRoster -or @($SvcTaskRoster).Count -lt 1) {
+    Write-Output "TASK|__task_roster__|present=0|rule=none|age_h=na|state=roster-empty|enabled=na|action="
+} else {
+    foreach ($krName in @($SvcTaskRoster)) {
+        if (-not $krName) {
+            Write-Output "TASK|__roster-item__|present=0|rule=none|age_h=na|state=item-empty|enabled=na|action="
+            continue
+        }
+        # 规则解析三态：命中一条＝小时数；命中多条＝同名重复（编辑事故，判红）；
+        # 零命中但在"仅查在位"表里＝inplace；零命中又不在那张表＝none＝新任务没定规则，判红逼出
+        # 第二处刻意的决定（"它到底该多久跑一次"），而不是让探针默认放行。
+        $krRuleTxt = "none"
+        $krHits = @()
+        if ($SvcTaskFreshRules) { $krHits = @($SvcTaskFreshRules | Where-Object { $_.Name -eq $krName }) }
+        if ($krHits.Count -gt 1) { $krRuleTxt = "duplicated" }
+        elseif ($krHits.Count -eq 1) { $krRuleTxt = [string]$krHits[0].MaxAgeHours }
+        elseif ($SvcTaskInPlaceOnly -and (@($SvcTaskInPlaceOnly) -contains $krName)) { $krRuleTxt = "inplace" }
+        $krPresent = "0"; $krAge = "na"; $krState = "absent"; $krEnabled = "na"; $krAction = ""
+        schtasks /Query /TN $krName 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $krPresent = "1"; $krState = "present"
+            try {
+                $krInfo = Get-ScheduledTaskInfo -TaskName $krName -ErrorAction Stop
+                if ($krInfo.PSObject.Properties['Enabled']) { $krEnabled = [string]$krInfo.Enabled }
+                if ($krInfo.LastRunTime -and $krInfo.LastRunTime.Year -gt 1900) {
+                    $krAge = [string]([math]::Round(((Get-Date) - $krInfo.LastRunTime).TotalHours, 1))
+                    $krState = "present+lastrun"
+                } else { $krAge = "never"; $krState = "never-run" }
+            } catch { $krState = "info-unreadable"; $krAge = "na"; $krEnabled = "na" }
+            try {
+                $krTask = Get-ScheduledTask -TaskName $krName -ErrorAction Stop
+                $krParts = @()
+                foreach ($krA in @($krTask.Actions)) {
+                    if ($krA.Execute) {
+                        $krOne = [string]$krA.Execute
+                        if ($krA.Arguments) { $krOne = $krOne + " " + [string]$krA.Arguments }
+                        $krParts += $krOne
+                    }
+                }
+                # 多动作行全量拼接：不做"取第一条"的乐观截断——截断会让人以为看见了现网全貌。
+                $krAction = ($krParts -join " || ")
+            } catch { $krAction = "action-unreadable" }
+        }
+        $krAction = ($krAction -replace '[^\x20-\x7E]', '')
+        if ($krAction.Length -gt 160) { $krAction = $krAction.Substring(0, 160) }
+        Write-Output ("TASK|" + $krName + "|present=" + $krPresent + "|rule=" + $krRuleTxt +
+            "|age_h=" + $krAge + "|state=" + $krState + "|enabled=" + $krEnabled + "|action=" + $krAction)
+    }
+}
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -1147,8 +1231,115 @@ PSEOF
 printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PROBES"
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
+# ── §KA-TASKREG 第 32 探针的判读（第 32 探针／bash 侧，2026-10-07 波 3）───────────────────
+# 输入：PS 回传的 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|action=..` 行；
+# 输出：每任务一行 INFO|（绿也要看得到数）+ **恰好一行** PASS| 或 FAIL|。
+# 为什么判读在 bash 而不在 PS：本机没有 PowerShell，判据写在 PS 就永远只能是"从没真跑过的判据"
+#   （§0929DRILL 四条缺陷的共同根因）。写成纯 bash 之后，门禁 §110 能直接喂七种合成读数逐条验
+#   红绿（在位新鲜／过期／缺任务／未定规则／读不到上次运行／仅查在位／整段无读数），零网络。
+# 解析口径三条，每条都是踩过的坑：
+#   ① 按 `|key=` 前缀剥字段而不是按位置 split——action= 里可能有 `|`（多动作行拼接），
+#      按位置取会把动作行的后半当成 enabled/present 读，整行错位还看不出错位；
+#   ② 比较走 awk 一次退出码判断，不在 bash 里做浮点（bash 算术只认整数，
+#      "12.3 > 30" 这种读分会静默语法错）；
+#   ③ 计数只数 `TASK|` 开头的行，汇总行自己不再产生 TASK| 前缀——否则"统计 FAIL 行数"这类
+#      下游读法会把我自己打印的那行 PASS/FAIL 也数进去（§107 同族：观测面选错账本）。
+judge_task_roster() {
+	local line name pres rule age state en act
+	local n=0 absent="" stale="" norule="" unread="" disabled=""
+	while IFS= read -r line; do
+		case "$line" in
+		TASK\|*) ;;
+		*) continue ;;
+		esac
+		name="${line#TASK|}"
+		name="${name%%|*}"
+		pres="$(printf '%s' "$line" | sed -n 's/.*|present=\([^|]*\).*/\1/p')"
+		rule="$(printf '%s' "$line" | sed -n 's/.*|rule=\([^|]*\).*/\1/p')"
+		age="$(printf '%s' "$line" | sed -n 's/.*|age_h=\([^|]*\).*/\1/p')"
+		state="$(printf '%s' "$line" | sed -n 's/.*|state=\([^|]*\).*/\1/p')"
+		en="$(printf '%s' "$line" | sed -n 's/.*|enabled=\([^|]*\).*/\1/p')"
+		act="${line#*|action=}"
+		if [ "$act" = "$line" ]; then act=""; fi
+		n=$((n + 1))
+		if [ "$name" = "__service_definitions__" ] || [ "$name" = "__task_roster__" ] || [ "$name" = "__roster-item__" ]; then
+			echo "INFO|ops:task_roster ${name} state=${state:-?}（单源没读到＝第 32 探针没有可查对象，判红而不是放行）"
+			norule="${norule} ${name}:${state:-defs}"
+			continue
+		fi
+		if [ "$pres" != "1" ]; then
+			absent="${absent} ${name}(state=${state:-?})"
+			echo "INFO|ops:task_roster name=${name} present=0 state=${state:-?}"
+			continue
+		fi
+		if [ "$rule" = "inplace" ]; then
+			# ONLOGON/ONSTART：只查在位，不拿"上次运行时间"当健康度（结构上不由时钟决定）。
+			echo "INFO|ops:task_roster name=${name} present=1 rule=inplace(不判新鲜度) enabled=${en:-na} action=${act}"
+			continue
+		fi
+		case "$rule" in
+		'' | *[!0-9]*)
+			# 既不是数字也不是 inplace＝规则没定／同名重复（PS 侧回显 none|duplicated）：
+			# 新加了任务却没定"该多久跑一次"，判红逼出第二处刻意的决定，而不是默认放行。
+			norule="${norule} ${name}(rule=${rule:-empty})"
+			echo "INFO|ops:task_roster name=${name} present=1 rule=${rule:-empty} => no-freshness-rule"
+			continue
+			;;
+		esac
+		case "$age" in
+		'' | na | never | *[!0-9.]*)
+			# 负 age 落在这里（`-` 不是 [0-9.]）但**不能和"读不出"混成一个标签**：
+			# 一台时钟快了几天的机器会用"未来时间"把停更的任务洗成常绿，这条必须单独点名。
+			local why="unreadable-or-never-run"
+			case "$age" in -*) why="clock-skew" ;; esac
+			unread="${unread} ${name}(age=${age:-empty};${why};state=${state:-?})"
+			echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=${age:-empty} => ${why}"
+			continue
+			;;
+		esac
+		if awk "BEGIN{exit !($age > $rule)}" 2>/dev/null; then
+			stale="${stale} ${name}(age=${age}h>rule=${rule}h)"
+		fi
+		if [ "$en" = "False" ]; then
+			# 周期守护被 /disable 着长期停着＝现网止损动作忘了复原（CHECKLIST 的 disable 是临时的）。
+			disabled="${disabled} ${name}"
+		fi
+		echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=${age}h enabled=${en:-na} action=${act}"
+	done
+	# 正锁：一条读数都没有＝PS 那一段整个没走到（被前面的异常吞掉、或 heredoc 里被误删）。
+	# "没读数"绝不能算绿，也不能只打一行 INFO 就过去（§70 派生空清单正锁同族）。
+	if [ "$n" -eq 0 ]; then
+		echo "FAIL|ops:scheduled-task roster in place + periodic tasks fresh|no-task-readings（PS 侧一段都没回传，判据失明而不是"全部健康"）"
+		return 0
+	fi
+	local bad=""
+	[ -n "$absent" ] && bad="${bad} absent=${absent}"
+	[ -n "$stale" ] && bad="${bad} stale=${stale}"
+	[ -n "$norule" ] && bad="${bad} no-freshness-rule=${norule}"
+	[ -n "$unread" ] && bad="${bad} last-run-unreadable=${unread}"
+	[ -n "$disabled" ] && bad="${bad} disabled=${disabled}"
+	if [ -n "$bad" ]; then
+		echo "FAIL|ops:scheduled-task roster in place + periodic tasks fresh|${bad}"
+	else
+		echo "PASS|ops:scheduled-task roster in place + periodic tasks fresh"
+	fi
+	return 0
+}
+
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
 out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC} -SvcDefsPath ${QMT_WIN_DIR}/service_definitions.ps1 -OpsWinDir ${QMT_WIN_DIR} -OpsScriptsDir ${OPS_SCRIPTS_DIR} -GwPyDir ${GW_PY_DIR} -ResticRepoDir ${RESTIC_REPO_DIR} -ResticPassFile ${RESTIC_PASS_FILE} -DeployDir ${DEPLOY_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
+
+# 第 32 探针的读数行先摘出来判读（TASK| 不是 PASS/FAIL/INFO 三种协议行之一，
+# 直接丢进下面的计数循环会落进 case 的三个分支之外被**静默丢弃**——那正是要防的"探针跑了
+# 但没人判"）。判读函数只产出一行 PASS/FAIL + 若干 INFO，再并回原流，判数因此恰好 +1。
+TASK_LINES=$(printf '%s
+' "$out" | grep '^TASK|' || true)
+out=$(printf '%s
+' "$out" | grep -v '^TASK|' || true)
+VERDICT=$(printf '%s
+' "$TASK_LINES" | judge_task_roster)
+out="${out}
+${VERDICT}"
 
 PASS=0
 FAIL=0

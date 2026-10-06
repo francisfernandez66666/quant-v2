@@ -1,4 +1,4 @@
-﻿# register_engine_services.ps1 - Guangzhou all-in-one: register engine Windows services (NSSM) + qmtctl task scheduler.
+﻿gister_engine_services.ps1 - Guangzhou all-in-one: register engine Windows services (NSSM) + qmtctl task scheduler.
 # Usage (admin PowerShell):
 #   powershell -ExecutionPolicy Bypass -File register_engine_services.ps1 `
 #       -QuantExe C:\opt\quant\quant.exe -ResearchExe C:\opt\quant\researchd.exe `
@@ -54,6 +54,14 @@ param(
     # 它含明文密钥，**NTFS ACL 必须收敛到 Administrators**（同 C:\opt\quant\tools\restic-pass.txt 的口径），
     # 且本脚本永不打印它的内容——只打印键名与"取到了几个键"。
     [string]$SecretFile = "C:\etc\quant.env",
+    # §KA-TASKREG（2026-10-07 波 3）：17:10 盘后保活计划任务的**注册开关**。
+    #   缺省不开＝本步只打印预演读数（现网现有任务的动作行 + 将要写入的动作行），一个字节都不动。
+    #   为什么不像 qmtctl/日志清理那样直接 /Create /F：那两个任务从建起就归本脚本管，
+    #   而 QMT-Dataload-KeepAlive 是 09-16 手工 schtasks 出来的（RUNBOOK §1），动作行的具体形态
+    #   （有无 cmd 重定向、python 路径是否 312）本仓无从证实——用 /F 覆盖一份**看不见**的现网配置
+    #   正是 09-16 根因（裸 python ⇒ 天天 127 静默失败）的复刻风险。
+    #   所以按 §0929OPS-⑪ 运维脚本纪律：预演读数给 owner 当面看过，再带开关执行。
+    [switch]$RegisterKeepaliveTask,
     [string]$NSSMUrl = "https://nssm.cc/release/nssm-2.24.zip"
 )
 $ErrorActionPreference = "Stop"
@@ -94,6 +102,13 @@ if (Test-Path $svcDefsFile) {
     $SvcTaskQmtctl = "QMT-Ensure-Running"; $SvcTaskLogPrune = "Quant-Log-Prune"
     $SvcQmtctlIntervalMin = 10
     $SvcTaskGatewayEnsure = "QMT-Gateway-Ensure"; $SvcTaskGatewayLogon = "QMT-Gateway-Logon"
+    # §KA-TASKREG 同族回退：缺了这三行，下面注册步会拿 $null 当任务名/路径（schtasks 报参数错
+    # 是好事，更坏的是它把 /TN "" 当成"当前目录同名任务"）。回退字面量与单源同值，由 §110 等值锁钉。
+    $SvcTaskDataloadKeepAlive = "QMT-Dataload-KeepAlive"
+    $SvcKeepaliveDailyAt = "17:10"
+    $SvcKeepalivePythonExe = "C:\Python312\python.exe"
+    $SvcKeepaliveScript = "C:\opt\quant\dataload_keepalive.py"
+    $SvcKeepaliveLog = "C:\opt\quant\dataload_keepalive.log"
 }
 
 # ── §N-5(2026-09-23 晚批) 密钥解析：参数缺省时从磁盘密钥文件 / 机器级环境变量取，绝不"缺省即跳过" ──
@@ -384,6 +399,100 @@ if (Test-Path $prune) {
     Warn "missing $prune - skip log-prune task（researchd/quant_stderr 轮转日志不会自动清理）"
 }
 
+# ── 6b. §KA-TASKREG（2026-10-07 修复批 波 3）：17:10 盘后保活任务，先给预演读数、开关在位才动手 ──
+# 三段修法之二（另两段＝service_definitions.ps1 的 $SvcTaskRoster/$SvcTaskFreshRules 单源，
+#   以及 verify_deploy_guangzhou.sh 第 32 探针的"全集在位 + 周期任务新鲜"双判）：
+#   scripts/dataload_keepalive.py 从 §0927KA 起就在部署 scp 清单里，**任务本体却一直是
+#   2026-09-16 手工 schtasks /Create 出来的**（RUNBOOK §1 记着那次的根因与修法）。⇒ 本段把
+#   注册动作收进正规入口，换机/误删从此可复原；而"不动现网"这一步由 -RegisterKeepaliveTask
+#   开关守住——本仓纪律 §0929OPS-⑪：schtasks /Create 属现网特权变更，只上传不自动执行。
+# 预演打印三条并排（这就是 owner 当面要看的东西）：
+#   ①任务在位态：只用 `schtasks /Query` 的**退出码**判断，绝不 grep 状态中文文案——
+#     那套文案随码页变（现网 GBK 下"就绪"两字都不一定是那两个字节），
+#     拿它当判据就是 §Never parse child console text 那一族；
+#   ②现网动作行：走 Get-ScheduledTask 的 Actions 属性（Execute + Arguments）取，
+#     不走 `schtasks /Query /V /FO CSV`——CSV 表头是本地化中文、值里带制表符还要过 GBK，
+#     一次读取要踩三个坑；cmdlet 给对象属性，直接取；
+#   ③本脚本将要写入的动作行。三条印出来才能让人判断"覆盖"是不是安全动作。
+# 前提缺失即**不创建、不覆盖**（计入 $kaMissing 走非零退出）：python 绝对路径或脚本落盘文件
+#   任一不在，就是 09-16 的失效形态本身（任务在位、每天触发、执行体起不来、日志一行不写）。
+#   用一条注定 127 的动作行去覆盖可能还能用的旧动作行＝把已知根因换个数字复刻一遍。
+# /TR 里带 cmd 重定向是**照现网形态抄**（RUNBOOK §1：脚本 log() 之所以要加固，正是因为
+#   cmd 重定向会独占同名日志句柄，脚本再 open 同一文件必报 Errno 13）。不另起新形态。
+$kaMissing = @()
+$kaTr = 'cmd /c "' + $SvcKeepalivePythonExe + '" ' + $SvcKeepaliveScript + ' >> ' + $SvcKeepaliveLog + ' 2>&1'
+$kaState = "absent"
+$kaExistingAction = ""
+schtasks /Query /TN $SvcTaskDataloadKeepAlive 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    $kaState = "present"
+    try {
+        $kaObj = Get-ScheduledTask -TaskName $SvcTaskDataloadKeepAlive -ErrorAction Stop
+        foreach ($kaA in $kaObj.Actions) {
+            if ($kaA.Execute) {
+                $kaOne = [string]$kaA.Execute
+                if ($kaA.Arguments) { $kaOne = $kaOne + " " + [string]$kaA.Arguments }
+                if ($kaExistingAction) { $kaExistingAction = $kaExistingAction + " || " + $kaOne }
+                else { $kaExistingAction = $kaOne }
+            }
+        }
+        # 多动作行是合法态但极少见（手工建的一般就一条）；这里全量拼接回显，不做"取第一条"的
+        # 乐观截断——截断会让人以为看见了现网全貌，而实际只看见一段。
+    } catch {
+        $kaExistingAction = "unreadable:" + $_.Exception.GetType().Name
+    }
+}
+$kaPyOk = Test-Path -LiteralPath $SvcKeepalivePythonExe
+$kaScriptOk = Test-Path -LiteralPath $SvcKeepaliveScript
+if (-not $kaPyOk)  { $kaMissing += "keepalive:python-exe-missing" }
+if (-not $kaScriptOk) { $kaMissing += "keepalive:script-missing(查 deploy_guangzhou.sh 的 dataload_keepalive.py 上传腿)" }
+Info ("KA_TASK name=" + $SvcTaskDataloadKeepAlive + " state=" + $kaState +
+      " schedule=daily@" + $SvcKeepaliveDailyAt + " ru=SYSTEM" +
+      " python_exists=" + $kaPyOk + " script_exists=" + $kaScriptOk +
+      " switch=" + $(if ($RegisterKeepaliveTask) { "on" } else { "off(仅预演)" }))
+Info ("  existing_action=" + $(if ($kaExistingAction) { $kaExistingAction } else { "-" }))
+Info ("  proposed_action=" + $kaTr)
+if ($RegisterKeepaliveTask) {
+    if ($kaMissing.Count -gt 0) {
+        Warn ("带 -RegisterKeepaliveTask 但前提缺失，**不创建也不覆盖** -> " + ($kaMissing -join ","))
+    } else {
+        # /RL HIGHEST 与 MultipleInstancesPolicy=IgnoreNew：后者是 schtasks 的缺省策略，
+        # 现网靠它保证"手工触发一次即等价当日收工、17:10 不会双开"（RUNBOOK §运维坑位②），
+        # 所以这里不显式改它，保持与既有任务一致。
+        schtasks /Create /F /SC DAILY /ST $SvcKeepaliveDailyAt /TN $SvcTaskDataloadKeepAlive /TR $kaTr /RU SYSTEM /RL HIGHEST | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Warn ("schtasks /Create 失败 rc=" + $LASTEXITCODE + "（任务名 " + $SvcTaskDataloadKeepAlive +
+                  "；需管理员会话，且 /TR 上限 259 字符）")
+            $kaMissing += "keepalive:create-failed"
+        } else {
+            Ok ("task " + $SvcTaskDataloadKeepAlive + " created (daily " + $SvcKeepaliveDailyAt + ", SYSTEM)")
+            # 装完**真读一次**（§装入口必须真拨一次）：回读动作行与 proposed 归一化比对，
+            # 不一致就是 schtasks 把 /TR 改写过了（引号/转义/截断都属这一族），当场点名而不是
+            # 等 17:10 才发现任务里存的是一条起不来的命令。
+            $kaAfter = ""
+            try {
+                $kaObj2 = Get-ScheduledTask -TaskName $SvcTaskDataloadKeepAlive -ErrorAction Stop
+                foreach ($kaB in $kaObj2.Actions) {
+                    if ($kaB.Execute) {
+                        $kaOne2 = [string]$kaB.Execute
+                        if ($kaB.Arguments) { $kaOne2 = $kaOne2 + " " + [string]$kaB.Arguments }
+                        if ($kaAfter) { $kaAfter = $kaAfter + " || " + $kaOne2 } else { $kaAfter = $kaOne2 }
+                    }
+                }
+            } catch { $kaAfter = "unreadable:" + $_.Exception.GetType().Name }
+            $kaNorm = { param($x) (($x -replace '"', '') -replace '\s+', ' ').Trim() }
+            if ((& $kaNorm $kaAfter) -ne (& $kaNorm $kaTr)) {
+                Warn ("回读动作行与写入值不一致（schtasks 改写/截断？）read=" + $kaAfter)
+                $kaMissing += "keepalive:readback-mismatch"
+            } else {
+                Ok "readback ok（现网存的动作行＝预演打印的那条，未回显任何凭据）"
+            }
+        }
+    }
+} else {
+    Info ("SKIP-CREATE 缺省只预演（§0929OPS-⑪ 现网特权变更须 owner 当面看读数）：确认无误后加 -RegisterKeepaliveTask 重跑")
+}
+
 # ── 7. §N-5 收尾：服务运行环境键名存在性断言（缺键即 Warn + 非零退出，降级不得报成功）────
 # 硬规矩：**只断言键名、绝不回显值**——本段以及它调用的 Get-ExistingEnvExtra 的输出里
 #   任何时候出现密钥明文都算事故。所以这里比对的集合只有键名，Warn 也只拼键名。
@@ -452,4 +561,14 @@ if ($envMissing.Count -gt 0) {
 }
 Ok "服务 env 键名断言通过：quant 5 硬键 + quant-research 3 硬键在位，LLM 来源已确认（全程未回显任何值）"
 
+# §KA-TASKREG 收尾：创建失败 / 前提缺失 / 回读不一致都是**真缺**，非零退出（与上面 §N-5
+#   同一条"降级不得报成功"——旧版最坏处不是没 Warn，而是 Warn 完照样打印 "registered"，
+#   部署链 $? 全绿而那条腿其实没起来）。
+#   但"开关未开"**不是**缺：那是本步的缺省态，把它判红会让每一次常规服务注册都红，
+#   两次之后没人再看这条输出（§107 DRILL-C 同族教训）。
+if ($kaMissing.Count -gt 0) {
+    Warn ("§KA-TASKREG 部署判失败 -> " + ($kaMissing -join ", ") +
+          "；排查：python 绝对路径/脚本落盘位/是否管理员会话（详见上方 KA_TASK 三行读数）")
+    exit 1
+}
 Ok "engine services registered. Verify: Get-Service $SvcNameQuant,$SvcNameResearch,$SvcNamePydata ; schtasks /Query /TN $SvcTaskQmtctl ; 网关守护腿见 service_definitions.ps1（$SvcTaskGatewayEnsure/$SvcTaskGatewayLogon，register_service.ps1 注册）"

@@ -5048,15 +5048,23 @@ eq107 web/src/pages/Signals.jsx 'dimNaMode' 2 '「两维同缺才算无四维」
 eq107 web/src/__tests__/signals_dim_cells_0929.test.jsx "it('H" 6 '本批前端六条腿逐名前缀在位（H1 取整反证 / H2 判定 / H3 旧口径必红 / H4-H6 挂载态）'
 
 # ── 新定时腿不得内嵌字面公网 IP（派生清单，与 §106 同族纪律）──
+# §KUMA-SECREDTO（2026-10-07 波 3）把文件面从 `*.sh + plist` 扩到 **`*.js`**：
+#   原来这组 glob 压根不含 .js，于是 kuma_seed.js 里那份字面公网 IP 与那份 32-hex ntfy 主题
+#   一路躲过全部守卫——**清单式锁的射程由清单决定**，这是同族第三次（§BOM-REPO → §BOM-REPO-DERIVE → 本次）。
+#   本段的 IP 扫描读数（IP_SCAN_N / IP_HITS）同时交给 §110 消费：§110 不再自己写第二遍扫描，
+#   两把锁各自扫一遍的结局就是"改一处漏一处"（§0929DRILL 判据函数单实现同族）。
+#   回环 127.x 从计数里剥掉：它不是"出口地址"而是本机地址，把 kuma 的 http://127.0.0.1:3001
+#   当公网 IP 判红，就是把锁磨到人人绕道（§107 DRILL-C 教训：健康现网上永远红的锁＝自毁信誉）。
 CNT107=$((CNT107 + 1))
 IP_SCAN_N=0
 IP_HITS=0
-for f in deploy/mac/*.sh deploy/mac/com.quant.*.plist; do
+for f in deploy/mac/*.sh deploy/mac/*.js deploy/mac/com.quant.*.plist; do
 	IP_SCAN_N=$((IP_SCAN_N + 1))
-	IP_HITS=$((IP_HITS + $(grep -Ec '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' "$f" 2>/dev/null || true)))
+	# grep -oE 逐个抓四段点分十进制再滤掉 127. 前缀：用 -c 数行会把"一行两个地址"数成一个。
+	IP_HITS=$((IP_HITS + $(grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' "$f" 2>/dev/null | grep -vc '^127\.' || true)))
 done
-[ "$IP_SCAN_N" -ge 10 ] || { echo "--- FAIL: §107 派生正锁 ${CNT107}（deploy/mac 待扫文件数=${IP_SCAN_N}，<10＝派生 glob 失效，这组锁会静默空转）"; exit 1; }
-[ "${IP_HITS:-0}" = "0" ] || { echo "--- FAIL: §107 负锁 ${CNT107}（Mac 侧调度链内嵌字面 IPv4，出口应只有 ssh 别名 gz）got=${IP_HITS} 扫描文件数=${IP_SCAN_N}"; exit 1; }
+[ "$IP_SCAN_N" -ge 13 ] || { echo "--- FAIL: §107 派生正锁 ${CNT107}（deploy/mac 待扫文件数=${IP_SCAN_N}，<13＝派生 glob 失效，这组锁会静默空转）"; exit 1; }
+[ "${IP_HITS:-0}" = "0" ] || { echo "--- FAIL: §107 负锁 ${CNT107}（Mac 侧链里内嵌字面公网 IPv4，出口应只有 ssh 别名 gz 或运行期参数）got=${IP_HITS} 扫描文件数=${IP_SCAN_N}"; exit 1; }
 
 echo "ok - §107 静态锁 ${CNT107} 道通过（含执行行负锁 3 枚 + 键名/形态负锁 3 枚 + 先后顺序锁 1 枚 + 派生正锁 2 枚 + 调度配对派生锁 1 枚）"
 
@@ -5800,6 +5808,573 @@ leg109 'store 无底仓卖出读取侧三腿（流水经 fills_effective 可见�
 	'TestOrphanSellJournaledAndVisible|TestOrphanSellCountsProceedsButNotPnl|TestOrphanSellReplayStaysOneRow'
 
 echo "ok - §109 静态锁 ${CNT109} 道 + 结构腿 + 行为腿（pytest 15 / Go 3）通过"
+
+echo "==> 110 §KA-TASKREG + §KUMA-SECREDTO 计划任务全集探针 + 监控凭据出仓：静态锁 + 派生等值 + 判读函数十二腿 + 反证矩阵..."
+
+# §KA-TASKREG（2026-10-07 修复批 波 3，§AUDIT_20261005 P1-D + P1-E）本段守两件事：
+#   ① 「有脚本无调度」第 N 次同族的**三段闭环**：任务名单/阈值单源（service_definitions.ps1）
+#      + 注册体（register_engine_services.ps1 §6b，缺省只预演）+ 部署面在位/新鲜双判
+#      （verify_deploy_guangzhou.sh 第 32 探针）。三段缺一段就回到同一个形态——
+#      09-16 那次 keepalive 手工建、09-26 那次备份脚本手工装、09-29 那两条"有脚本无 launchd"，
+#      每一次都是判据写得很完整而没人/没钟去触发它。
+#   ② 监控告警凭据出仓（ntfy 主题＝凭据，旧值已进 git 历史⇒按已泄露处理）：
+#      仓库里不许再有 32-hex 主题与字面公网 IP，取值走 ntfy_topic.sh 单实现，
+#      kuma_seed.js 的两个值改必传参数、缺参非零退出。
+# 本段的锁形为什么是"派生"而不是"名单"：P1-E 的根因就是清单式锁的射程由清单决定——
+#   §107 那把"新增腿不许内嵌字面公网 IP"的负锁从 `deploy/mac/*.sh + plist` 派生，
+#   `.js` 压根不在射程里，于是 kuma_seed.js 里那条字面 IP 与那份 32-hex 主题一路躲过全部守卫。
+#   同族第三次（§BOM-REPO → §BOM-REPO-DERIVE → 本次）。所以 ② 的文件面改成从目录本身派生，
+#   并钉一枚"待扫文件数过少即红"的正锁；① 的任务面改成从 service_definitions.ps1 派生集合，
+#   双向等值而不是写死七个名字。
+# 判读函数放 bash 的行为腿（B1）是本段最有价值的一条：本机没有 PowerShell，PS 里的判据永远
+#   只能靠"字符串在位"自证；把红绿判断做成纯 bash 函数后，它能被喂合成读数逐条验红/验绿，
+#   还能摘锁反证。§0929DRILL 四条缺陷的共同根因正是"判据从没真跑过"。
+CNT110=0
+eq110() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT110=$((CNT110 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §110 整串等值锁 ${CNT110}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+ln110() { # $1=文件 $2=整串 → 首个命中行号（0＝没有）；顺序锁用
+	local n
+	n=$(grep -nF -- "$2" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	printf '%s' "${n:-0}"
+}
+
+# ── ① Mac 侧：主题取用单实现 + 两个消费腿 + 空主题不假称网络抖动 ──
+eq110 deploy/mac/ntfy_topic.sh 'ntfy_topic_resolve() {' 1 '主题取用的唯一实现（第二处＝各脚本自己再拼一遍 security 命令，轮换时必漏一处）'
+eq110 deploy/mac/ntfy_topic.sh 'ntfy_topic_report() {' 1 '只报长度与指纹前 8 位的回显器在位（不回显明文这条铁律的落点）'
+eq110 deploy/mac/restic_pull_backup.sh 'NTFY_LIB=' 1 '拉取腿按**同目录**定位 lib（镜像树少拷它就必须拒跑，而不是静默不推）'
+eq110 deploy/mac/restic_pull_backup.sh '. "$NTFY_LIB"' 1 '拉取腿 source 单实现'
+eq110 deploy/mac/verify_restore.sh 'NTFY_LIB=' 1 '演练腿同一条定位口径'
+eq110 deploy/mac/verify_restore.sh '. "$NTFY_LIB"' 1 '演练腿 source 单实现'
+eq110 deploy/mac/restic_pull_backup.sh 'ALERT-NOT-SENT' 1 '空主题走"没发出去"的显式留痕（旧版打到 ntfy.sh 根路径吃 404、却写"网络？"＝把配置缺失伪装成网络抖动）'
+eq110 deploy/mac/verify_restore.sh 'ALERT-NOT-SENT' 1 '演练腿同一条留痕（两个消费者的失败语义必须一致）'
+eq110 deploy/mac/install_mac_backup_agent.sh '$BIN_DIR/ntfy_topic.sh' 4 '拉取腿安装器四件在位（计划回显/cp/chmod/落位自检）：lib 不落进稳定副本＝每晚 FATAL 静默'
+eq110 deploy/mac/install_mac_drill_agent.sh '${DRILL_HOME}/deploy/mac/ntfy_topic.sh' 4 '演练安装器四件在位（镜像树少这一个文件，周日演练当场 FATAL）'
+CNT110=$((CNT110 + 1))
+KCFetch=$(grep -rc -- '-s "${NTFY_KEYCHAIN_ITEM' deploy/mac 2>/dev/null | grep -v ':0$' | wc -l | tr -d ' ' || true)  # 末尾 || true 是被 §89 门禁自锁逼出来的（09-24 实录：未加固的计数赋值零命中会静默中止整轮 verify；本枚入段后 §89 当场把它拦下，说明那条锁是活的）
+[ "${KCFetch:-0}" = "1" ] || { echo "--- FAIL: §110 单实现正锁 ${CNT110}（钥匙串取主题的表达式只允许出现在 ntfy_topic.sh，实得有 ${KCFetch} 个文件在各自拼 security 命令）"; exit 1; }
+
+# ── ② 文件面派生负锁（§107 清单式锁的替身：从目录本身派生，不再按文件类型点名）──
+CNT110=$((CNT110 + 1))
+MAC_FILES=$(ls deploy/mac | wc -l | tr -d ' ')
+[ "${MAC_FILES:-0}" -ge 13 ] || { echo "--- FAIL: §110 派生正锁 ${CNT110}（deploy/mac 待扫文件数=${MAC_FILES}，<13＝目录读法坏了，这组凭据负锁会静默空转）"; exit 1; }
+CNT110=$((CNT110 + 1))
+HEX_HITS=0
+for f in deploy/mac/*; do
+	[ -f "$f" ] || continue
+	HEX_HITS=$((HEX_HITS + $(grep -Ec '[0-9a-f]{32}' "$f" 2>/dev/null || true)))
+done
+[ "${HEX_HITS:-0}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（deploy/mac 里出现 32 位十六进制串 ${HEX_HITS} 处＝ntfy 主题/口令回流；主题＝凭据，已知值只准走钥匙串或参数）"; exit 1; }
+# 字面公网 IP 这一条**不自己再扫一遍**：读 §107 那条派生扫描的读数（IP_HITS / IP_SCAN_N）。
+# 为什么接而不是重写：两把锁各写一遍同一判据，将来只会有一被改、另一继续用旧口径——
+# 而"旧口径还绿"比"红着"更危险（§0929DRILL 的 record_freshness 单实现同族）。
+# 交接锁本身要断"上游真跑过"：变量未定义＝§107 那段被删或挪到了本段之后，那这行负锁就是
+# 一句从没执行过的字面承诺（正向腿恒真的最典型形态）。
+CNT110=$((CNT110 + 1))
+[ -n "${IP_HITS+set}" ] || { echo "--- FAIL: §110 交接锁 ${CNT110}（IP_HITS 未定义＝§107 的派生 IP 扫描没在本段之前跑，'Mac 侧不许内嵌字面公网 IP'退化成注释）"; exit 1; }
+[ "${IP_HITS:-1}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（沿用 §107 扫描读数：deploy/mac 里出现字面公网 IPv4 ${IP_HITS} 处，出口只应是 ssh 别名 gz 或运行期参数）"; exit 1; }
+CNT110=$((CNT110 + 1))
+[ "${IP_SCAN_N:-0}" -ge 13 ] || { echo "--- FAIL: §110 交接正锁 ${CNT110}（§107 的待扫文件数=${IP_SCAN_N}，<13＝那条 glob 已被人改窄，本段继承的是空扫描）"; exit 1; }
+# §107 的 glob 必须真的含 .js——P1-E 的直接教训：扩文件面这件事只有写在 glob 里才算数。
+# 预演读数=2 而不是 1：本枚锁自身的参数里就带着这串 glob（写锁的人没法不写被锁的串），
+# 于是"真代码行 + 这条锁"各命中一次。将来出现 3 处只有两种可能——有人在说明文字里抄了整串
+# （刻意改锁要重跑预演）或 glob 被抄了第二份（正是本仓要根因的第二本账）。
+eq110 scripts/verify_changes.sh 'for f in deploy/mac/*.sh deploy/mac/*.js deploy/mac/com.quant.*.plist; do' 2 '§107 的派生扫描 glob 含 .js（不含＝kuma_seed.js 那类文件又回到锁外；命中数含本枚锁自身）'
+
+# ── ③ kuma_seed.js：两个值改必传参数，且**校验排在 require 之前** ──
+eq110 deploy/mac/kuma_seed.js '缺少必传参数' 1 '缺参点名文案在位'
+eq110 deploy/mac/kuma_seed.js 'process.exit(2)' 2 '两个校验出口各一处（缺参 / IP 形状不符）'
+CNT110=$((CNT110 + 1))
+V110=$(ln110 deploy/mac/kuma_seed.js '缺少必传参数')
+V110B=$(ln110 deploy/mac/kuma_seed.js 'const { io } = require("socket.io-client")')
+[ "$V110" -gt 0 ] && [ "$V110B" -gt 0 ] && [ "$V110" -lt "$V110B" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（参数校验@${V110} 必须早于 require@${V110B}：校验排在 require 之后时，仓库目录里直接跑必撞 MODULE_NOT_FOUND，'缺参必非零退出'会被一个不相干的意外满足＝判据的失败原因不是我以为的原因）"; exit 1; }
+
+# ── ④ 广州面：任务名单/阈值单源 + 注册体在开关之后 + 探针按派生集合走 ──
+eq110 deploy/qmt-win/service_definitions.ps1 '$SvcTaskDataloadKeepAlive = "QMT-Dataload-KeepAlive"' 1 'keepalive 任务名进单源（现网名，RUNBOOK §1）'
+eq110 deploy/qmt-win/service_definitions.ps1 '$SvcTaskRoster = @(' 1 '任务全集容器在位（第 32 探针按它遍历，不再各写各的名单）'
+eq110 deploy/qmt-win/service_definitions.ps1 '$SvcTaskFreshRules = @(' 1 '新鲜度规则容器在位（阈值全仓唯一一份）'
+eq110 deploy/qmt-win/service_definitions.ps1 '$SvcTaskInPlaceOnly = @(' 1 '"仅查在位"名单在位（ONLOGON/ONSTART 不拿上次运行时间判健康度）'
+eq110 deploy/qmt-win/register_engine_services.ps1 '[switch]$RegisterKeepaliveTask' 1 '注册开关在位（§0929OPS-⑪：schtasks /Create 属现网特权变更，只上传不自动执行）'
+eq110 deploy/qmt-win/register_engine_services.ps1 'SKIP-CREATE 缺省只预演' 1 '缺省态打印预演而不是动手'
+eq110 deploy/qmt-win/register_engine_services.ps1 'schtasks /Create /F /SC DAILY /ST $SvcKeepaliveDailyAt' 1 '注册语句唯一且阈值/时点取单源变量（写死小时数＝与单源脱钩的第二本账）'
+eq110 deploy/qmt-win/register_engine_services.ps1 'KA_TASK name=' 1 '预演读数行在位（绿也要看得到现网到底存着哪条动作行）'
+CNT110=$((CNT110 + 1))
+SW110=$(ln110 deploy/qmt-win/register_engine_services.ps1 'if ($RegisterKeepaliveTask) {')
+CR110=$(ln110 deploy/qmt-win/register_engine_services.ps1 'schtasks /Create /F /SC DAILY /ST $SvcKeepaliveDailyAt')
+[ "$SW110" -gt 0 ] && [ "$CR110" -gt 0 ] && [ "$SW110" -lt "$CR110" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（开关判断@${SW110} 必须早于 /Create@${CR110}：倒序＝重跑注册脚本就顺手改了现网任务，'只上传不自动执行'这条纪律被代码自己破掉）"; exit 1; }
+eq110 scripts/verify_deploy_guangzhou.sh 'ops:scheduled-task roster in place + periodic tasks fresh' 3 '第 32 探针判定名三处同源（PASS 行 / FAIL 行 / 无读数正锁行；改名＝现网明细与门禁文案脱钩）'
+eq110 scripts/verify_deploy_guangzhou.sh 'judge_task_roster' 3 '判读函数三处（注释指涉 / 定义 / 调用点）——定义没被调用＝读数没人判、探针恒绿'
+eq110 scripts/verify_deploy_guangzhou.sh '$SvcTaskRoster' 4 '探针遍历单源集合的四处在位（elseif 空集合判定 + foreach + 两处注释）'
+CNT110=$((CNT110 + 1))
+sed -n '/^judge_task_roster()/,/^}/p' scripts/verify_deploy_guangzhou.sh > /tmp/w3_jtr_region_110.sh
+AWKRULE=$(grep -cF -- '$age > $rule' /tmp/w3_jtr_region_110.sh || true)
+HARDAGE=$(grep -cE '\$age > [0-9]' /tmp/w3_jtr_region_110.sh || true)
+[ "${AWKRULE:-0}" = "1" ] || { echo "--- FAIL: §110 阈值同源锁 ${CNT110}（判读区里那条 awk 年龄比较不再和读数带回的阈值比，实得 ${AWKRULE}＝0 或 >1；阈值必须是 $SvcTaskFreshRules 里那份，bash 侧不许存常量副本）。顺带一条自伤记录：这行原本把整串「dollar 变量名」抄进 FAIL 文案，全角括号紧跟变量名会被本仓 §23 的变量吞噬守卫判红——文案里引用代码要写成不邻接的说明，别反过来让守卫红在自己的话术上"; exit 1; }
+[ "${HARDAGE:-0}" = "0" ] || { echo "--- FAIL: §110 阈值同源负锁 ${CNT110}（判读区里出现写死小时数 ${HARDAGE} 处＝阈值第二本账，改单源不会带动探针，反过来探针会长期用旧阈值判红）"; exit 1; }
+CNT110=$((CNT110 + 1))
+TASKNAME_IN_PROBE=$(grep -vE '^[[:space:]]*#' scripts/verify_deploy_guangzhou.sh | grep -cF 'QMT-Dataload-KeepAlive' || true)
+[ "${TASKNAME_IN_PROBE:-0}" = "0" ] || { echo "--- FAIL: §110 派生正锁 ${CNT110}（探针代码行里出现字面任务名 ${TASKNAME_IN_PROBE} 处＝名单被抄了第二份，新增任务会躲过探针——本批要根除的正是清单式锁）"; exit 1; }
+echo "ok - §110 静态锁 ${CNT110} 道通过（含单实现正锁 1 + 文件面派生负锁 2 + 顺序锁 2 + 阈值/名单同源 3）"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# F2 派生集合双向等值腿（"任务名单只有一份"这条主张用机器验，而不是用注释主张）
+# ──────────────────────────────────────────────────────────────────────────────
+# 为什么单列一条 python 腿而不是再加几枚 eq110：eq 锁只能钉"某串出现 N 次"，钉不住**集合关系**——
+#   roster 与 rules∪inplace 是否等值、rules 与 inplace 是否互斥、注册脚本的回退字面量与单源是否同值。
+#   把这些关系写成硬编码清单就又回到 P1-E 的根因（清单式锁的射程由清单决定）。
+#   这里从两个文件各自解析出集合再比，并把读到的东西打印出来，红了能直接看是哪条关系破的。
+# F2/F3 共用一棵临时树：F3 的镜像反证必须跑**同一份** python 判据（复制第二实现＝两条腿各判各的，
+# 正是本批要根除的"名单抄第二份"形态），所以先把判据落成文件，正腿与反腿只差 argv 指向主仓还是镜像。
+CNT110=$((CNT110 + 1))
+W3F="$(mktemp -d 2>/dev/null || true)"
+[ -n "$W3F" ] && [ -d "$W3F" ] || { echo "--- FAIL: §110 F2 连临时目录都建不出来（下面的镜像反证全部无从谈起）"; exit 1; }
+mkdir -p "$W3F/mir"
+cat > "$W3F/f2.py" <<'PY110F2'
+import re, sys
+
+defs_path, reg_path = sys.argv[1], sys.argv[2]
+defs = open(defs_path, encoding="utf-8-sig").read()
+reg = open(reg_path, encoding="utf-8").read()
+
+
+def block(text, head):
+    """取 `@(` 容器里的内容；容器以单独一行的 `)` 收尾（写法变了就解析不到，宁可判红）。"""
+    m = re.search(re.escape(head) + r"\s*=\s*@\((.*?)\n\s*\)", text, re.S)
+    if not m:
+        raise SystemExit("F2-FAIL: 容器 %s 解析不到（写法变了＝这条腿瞎了）" % head)
+    return m.group(1)
+
+
+roster = re.findall(r"\$SvcTask\w+", block(defs, "$SvcTaskRoster"))
+rules_blk = block(defs, "$SvcTaskFreshRules")
+pairs = re.findall(r"Name\s*=\s*(\$SvcTask\w+)\s*;?\s*MaxAgeHours\s*=\s*([0-9]+)", rules_blk)
+inplace = re.findall(r"\$SvcTask\w+", block(defs, "$SvcTaskInPlaceOnly"))
+ps_rows = len([l for l in rules_blk.splitlines() if l.strip().startswith("[pscustomobject")])
+
+print("F2 读数: roster=%d rules=%d(inplace=%d)" % (len(roster), ps_rows, len(inplace)))
+print("F2 名单: roster=%s" % ",".join(roster))
+print("F2 名单: inplace=%s" % ",".join(inplace))
+
+if ps_rows != len(pairs):
+    raise SystemExit("F2-FAIL: $SvcTaskFreshRules 的 pscustomobject 行数与 Name/MaxAgeHours 配对数不等"
+                     "（%d vs %d）＝有行的阈值没被读到，探针会拿空阈值判健康" % (ps_rows, len(pairs)))
+if len(roster) != len(set(roster)):
+    raise SystemExit("F2-FAIL: $SvcTaskRoster 有重复项：%s" % roster)
+rules_names = [n for n, _ in pairs]
+if set(roster) != set(rules_names) | set(inplace):
+    raise SystemExit("F2-FAIL: 集合关系破了——roster 比 rules∪inplace 多出=%s 少出=%s"
+                     "（新加任务却没定判法＝探针少查一个，正是本批要根除的形态）"
+                     % (sorted(set(roster) - (set(rules_names) | set(inplace))),
+                        sorted((set(rules_names) | set(inplace)) - set(roster))))
+both = sorted(set(rules_names) & set(inplace))
+if both:
+    raise SystemExit("F2-FAIL: 同一任务既在新鲜度表又在仅查在位表：%s（两本账必有一本先过时）" % both)
+for name, hours in pairs:
+    if int(hours) <= 0:
+        raise SystemExit("F2-FAIL: %s 的 MaxAgeHours=%s（<=0＝任何读数都判红，健康现网永远红）" % (name, hours))
+ka = "$SvcTaskDataloadKeepAlive"
+if ka not in roster:
+    raise SystemExit("F2-FAIL: roster 里没有 %s（第 32 探针不查它＝回到『有脚本无调度还没人判红』）" % ka)
+if ka not in rules_names:
+    raise SystemExit("F2-FAIL: %s 不在新鲜度表里（每日 17:10 的任务停更三天也不会红）" % ka)
+
+# 注册脚本的**回退字面量**必须与单源同值：回退块是 dot-source 失败时的备胎，写歪一次
+# ＝用备用路径建出来的任务名与探针查的名字对不上（两边各自都"绿"）。
+# 不按行首锚：回退块里一行放多个赋值（`$a = "x"; $b = "y"`），行首锚会漏掉后半串——
+# 漏掉的正是探针要查的名字，于是"回退与单源脱钩"这条锁对它们结构性失明（同族：锚点太窄＝假绿）。
+raw = re.findall(r'(\$Svc(?:Task|Keepalive|Name)\w+)\s*=\s*"([^"]*)"', reg)
+fb = {}
+for k, v in raw:
+    if k in fb and fb[k] != v:
+        raise SystemExit("F2-FAIL: 注册脚本里 %s 被赋成两个不同的字面量（%s / %s）——同名两值，谁覆盖谁看执行顺序" % (k, fb[k], v))
+    fb[k] = v
+if len(fb) < 10:
+    raise SystemExit("F2-FAIL: 注册脚本回退字面量解析到 %d 个（<10＝回退块写法变了或被漏掉一批，等值锁形同虚设）" % len(fb))
+print("F2 回退: %s" % ",".join(sorted(fb)))
+for var, lit in sorted(fb.items()):
+    m = re.search(r'(?m)^\s*%s\s*=\s*(.*)$' % re.escape(var), defs)
+    if not m:
+        raise SystemExit("F2-FAIL: 注册脚本回退了单源里根本没有的量 %s（备胎自创名字＝第二本账的起点）" % var)
+    rhs = m.group(1)
+    sm = re.match(r'^\s*if\s*\(.*\)\s*\{.*?\}\s*else\s*\{\s*"([^"]*)"\s*\}', rhs)
+    dm = re.search(r'"([^"]*)"', rhs)
+    want = sm.group(1) if sm else (dm.group(1) if dm else None)
+    if want is None:
+        raise SystemExit("F2-FAIL: 单源里 %s 的字面量解析不到（rhs=%s）" % (var, rhs[:60]))
+    if want != lit:
+        raise SystemExit("F2-FAIL: %s 回退字面量与单源不同值（register=「%s」 defs=「%s」）" % (var, lit, want))
+print("F2 ok - roster=%d = rules(%d)+inplace(%d) 且互斥；回退字面量 %d 个逐项与单源等值"
+      % (len(roster), len(rules_names), len(inplace), len(fb)))
+PY110F2
+python3 "$W3F/f2.py" deploy/qmt-win/service_definitions.ps1 deploy/qmt-win/register_engine_services.ps1 \
+	|| { echo "--- FAIL: §110 F2 派生集合等值腿判红（上面已打印四个集合的实得元素，先看哪一条关系破了）"; exit 1; }
+echo "ok - §110 F2 派生集合双向等值腿通过（roster/rules/inplace 三容器 + 注册回退字面量）"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# F3 双向镜像反证（FIX_PLAN §5.5 F3：删注册体一条 ⇒ 红，删覆盖侧一条 ⇒ 红，两个方向都要验）
+# ──────────────────────────────────────────────────────────────────────────────
+# 探针侧的"名单抄第二份"不是靠 python 集合腿证的（第 32 探针按单源集合遍历，压根没有 per-task 条目可删），
+# 它靠的是同段那两枚派生锁：单源引用计数等值 + 探针代码行零字面任务名。这两枚也各有镜像反证（c/d 两条腿）。
+# ★ 每枚破坏都从主仓**整体重建**镜像目录再改（纪律：复位≠按文件清单复原——上一枚改剩的文件会冒充本枚的归属），
+#   且破坏串是整串替换、不留原锚前缀（改名式破坏 `...KeepAlive` → `...KeepAliveX`，子串命中会让反证恒绿）。
+f3_rebuild() { # 重建一份"与主仓逐字节相同"的镜像（两个 ps1 + 部署探针），返回其目录
+	local d="$W3F/mir/$1"
+	rm -rf "$d"
+	mkdir -p "$d"
+	cp deploy/qmt-win/service_definitions.ps1 "$d/service_definitions.ps1"
+	cp deploy/qmt-win/register_engine_services.ps1 "$d/register_engine_services.ps1"
+	cp scripts/verify_deploy_guangzhou.sh "$d/verify_deploy_guangzhou.sh"
+	echo "$d"
+}
+
+f3_sub() { # $1=文件 $2=原串（必须恰好命中一次）$3=替换串；命中数≠1 直接把这条反证判红
+	local n
+	n=$(python3 -c 'import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(p, encoding="utf-8-sig").read()
+c = t.count(old)
+if c != 1:
+    sys.stderr.write("HIT=%d\n" % c)
+    raise SystemExit(1)
+open(p, "w", encoding="utf-8").write(t.replace(old, new))' "$1" "$2" "$3" 2>&1) || {
+		echo "--- FAIL: §110 F3 破坏点没落在预期的唯一位置（原串命中数≠1：${n}）——反证若改不到东西，『必红』就成了自证"; exit 1; }
+}
+
+f3_drop_line() { # $1=文件 $2=扩展正则（必须恰好命中一行）；删掉该行
+	local n
+	n=$(python3 -c 'import sys, re
+p, pat = sys.argv[1], sys.argv[2]
+lines = open(p, encoding="utf-8-sig").read().splitlines(True)
+hit = [i for i, l in enumerate(lines) if re.search(pat, l)]
+if len(hit) != 1:
+    sys.stderr.write("HIT=%d\n" % len(hit))
+    raise SystemExit(1)
+del lines[hit[0]]
+open(p, "w", encoding="utf-8").write("".join(lines))' "$1" "$2" 2>&1) || {
+		echo "--- FAIL: §110 F3 删行锚没命中唯一行（${n}）——锚写歪的反证等于没反证"; exit 1; }
+}
+
+f3_expect_f2_red() { # $1=标签 $2=期望的 F2-FAIL 点名片段 $3=defs $4=reg
+	local out rcF3
+	CNT110=$((CNT110 + 1))
+	rcF3=0
+	out="$(python3 "$W3F/f2.py" "$3" "$4" 2>&1)" || rcF3=$?
+	[ "$rcF3" != "0" ] || { echo "--- FAIL: §110 F3 ${1}：镜像破坏后 F2 判据仍然 0 退出（这条等值锁是恒绿的装饰）"; exit 1; }
+	printf '%s' "$out" | grep -qF 'F2-FAIL' || { echo "--- FAIL: §110 F3 ${1}：非零退出但不是判据自己点名（说明镜像坏了而不是锁红了）：$(printf '%s' "$out" | tail -2)"; exit 1; }
+	printf '%s' "$out" | grep -qF -- "$2" || { echo "--- FAIL: §110 F3 ${1}：红的归属不对（期望点名「$2」，实得尾部：$(printf '%s' "$out" | tail -1)）——本枚破坏必须只有这一枚能造成这个红"; exit 1; }
+	echo "ok - §110 F3 ${1} => $(printf '%s' "$out" | grep -F 'F2-FAIL' | head -1 | cut -c1-96)"
+}
+
+# a) 删 roster 里的 keepalive（＝"注册体/名单只有一份"里那份名单少一项）⇒ 集合关系破 + 少出点名
+D110="$(f3_rebuild a)"
+f3_drop_line "$D110/service_definitions.ps1" '^\s*\$SvcTaskDataloadKeepAlive\s*$'
+f3_expect_f2_red 'a 删 roster 一项 ⇒ 集合等值必红' "少出=['\$SvcTaskDataloadKeepAlive']" \
+	"$D110/service_definitions.ps1" "$D110/register_engine_services.ps1"
+
+# b) 删新鲜度规则里那一行（＝任务在名单里却没人规定它该多久跑一次）⇒ 同一枚锁、多出点名
+D110="$(f3_rebuild b)"
+f3_drop_line "$D110/service_definitions.ps1" 'Name = \$SvcTaskDataloadKeepAlive'
+f3_expect_f2_red 'b 删新鲜度规则一项 ⇒ 集合等值必红' "多出=['\$SvcTaskDataloadKeepAlive']" \
+	"$D110/service_definitions.ps1" "$D110/register_engine_services.ps1"
+
+# c) 改注册脚本的回退字面量（＝dot-source 失败时备胎自创名字，探针查的名字与建出来的对不上）
+D110="$(f3_rebuild c)"
+f3_sub "$D110/register_engine_services.ps1" '$SvcTaskDataloadKeepAlive = "QMT-Dataload-KeepAlive"' \
+	'$SvcTaskDataloadKeepAlive = "QMT-Dataload-KeepAliveX"'
+f3_expect_f2_red 'c 回退字面量与单源不同值 ⇒ 等值必红' '回退字面量与单源不同值' \
+	"$D110/service_definitions.ps1" "$D110/register_engine_services.ps1"
+
+# d) 探针侧两枚派生锁各自反证：单源引用少一处 / 代码行里出现字面任务名（两枚破坏各建一份镜像，
+#    绝不共享锚——共享锚会让"是哪枚锁红"串味，纪律 4）
+CNT110=$((CNT110 + 1))
+D110="$(f3_rebuild d)"
+f3_sub "$D110/verify_deploy_guangzhou.sh" 'foreach ($krName in @($SvcTaskRoster)) {' \
+	'foreach ($krName in @($rosterCopiedIntoProbe)) {'
+ROSTER_REF_MIRROR=$(grep -cF '$SvcTaskRoster' "$D110/verify_deploy_guangzhou.sh" || true)
+[ "${ROSTER_REF_MIRROR:-0}" != "4" ] || { echo "--- FAIL: §110 F3 d：探针不再遍历单源集合后，引用计数仍是 4（那枚等值锁看不见这件事发生了）"; exit 1; }
+echo "ok - §110 F3 d 探针摘掉单源遍历 ⇒ 引用计数等值锁脱离（镜像实得 ${ROSTER_REF_MIRROR}，主仓应 4）"
+CNT110=$((CNT110 + 1))
+D110="$(f3_rebuild e)"
+f3_sub "$D110/verify_deploy_guangzhou.sh" 'foreach ($krName in @($SvcTaskRoster)) {' \
+	'foreach ($krName in @($SvcTaskRoster)) {
+    $expectedTaskName = "QMT-Dataload-KeepAlive"'
+NAME_IN_MIRROR=$(grep -vE '^[[:space:]]*#' "$D110/verify_deploy_guangzhou.sh" | grep -cF 'QMT-Dataload-KeepAlive' || true)
+[ "${NAME_IN_MIRROR:-0}" != "0" ] || { echo "--- FAIL: §110 F3 e：名单被抄了第二份，零字面任务名负锁却仍读 0（恒绿装饰）"; exit 1; }
+echo "ok - §110 F3 e 抄第二份名单 ⇒ 零字面任务名负锁脱离（镜像实得 ${NAME_IN_MIRROR}，主仓应 0）"
+# 复位自检：镜像全量重建后必须回到与主仓同一读数（跑完整轮反证后主仓文件本就不该被动过）
+CNT110=$((CNT110 + 1))
+python3 "$W3F/f2.py" deploy/qmt-win/service_definitions.ps1 deploy/qmt-win/register_engine_services.ps1 >/dev/null \
+	|| { echo "--- FAIL: §110 F3 复位自检红（反证跑完主仓判据不再通过＝镜像改动串回了主仓，纪律 3 那一条）"; exit 1; }
+if git status --porcelain -- deploy/qmt-win scripts/verify_deploy_guangzhou.sh | grep -qE '^\?\?'; then
+	echo "--- FAIL: §110 F3 反证在主仓目录留了新文件（镜像必须只长在临时树里）"; exit 1
+fi
+echo "ok - §110 F3 双向镜像反证通过（roster/规则/回退字面量三枚走同一份 python 判据 + 探针侧两枚走同一份锁本体）"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# F1 判读函数行为腿：十二合成读数 + 七枚摘锁反证
+#   （§KA-TASKREG 把红绿判断从 PowerShell 搬到 bash 的全部理由，就是这一段能在本机真跑）
+# ──────────────────────────────────────────────────────────────────────────────
+CNT110=$((CNT110 + 1))
+W3T="$(mktemp -d 2>/dev/null || true)"
+[ -n "$W3T" ] && [ -d "$W3T" ] || { echo "--- FAIL: §110 F1 连临时目录都建不出来（后面的合成腿全部无从谈起）"; exit 1; }
+mkdir -p "$W3T/bin"
+sed -n '/^judge_task_roster()/,/^}/p' scripts/verify_deploy_guangzhou.sh > "$W3T/fn.sh"
+[ -s "$W3T/fn.sh" ] || { echo "--- FAIL: §110 F1 搭建失败（judge_task_roster 抽不出来，改名/挪位＝这条腿在验一个不存在的东西）"; exit 1; }
+grep -q '^judge_task_roster()' "$W3T/fn.sh" || { echo "--- FAIL: §110 F1 抽出区间首锚不是函数声明（sed 范围切歪了）"; exit 1; }
+[ "$(tail -n 1 "$W3T/fn.sh")" = "}" ] || { echo "--- FAIL: §110 F1 抽出区间末行不是 }（多切/少切）"; exit 1; }
+cat > "$W3T/run.sh" <<'RUN110'
+#!/bin/bash
+# 把合成读数喂给判读函数，只取它的判决行（PASS|/FAIL|）。$1=函数文件 $2=读数（可多行）
+set -uo pipefail
+# shellcheck source=/dev/null
+. "$1"
+printf '%s\n' "$2" | judge_task_roster | grep -E '^(PASS|FAIL)\|' | head -1
+RUN110
+chmod +x "$W3T/run.sh"
+
+leg110() { # $1=用例名 $2=期望 PASS|FAIL $3=FAIL 明细必须点名串 $4=读数
+	local got
+	CNT110=$((CNT110 + 1))
+	got="$(bash "$W3T/run.sh" "$W3T/fn.sh" "$4" || true)"
+	[ "$(printf '%s\n' "$got" | grep -cE '^(PASS|FAIL)\|' || true)" = "1" ] || {
+		echo "--- FAIL: §110 F1 ${1}：判决行数≠1（一次判读必须给出恰好一条结论；两条＝两本账，零条＝没人判）"; exit 1; }
+	[ "${got%%|*}" = "$2" ] || {
+		echo "--- FAIL: §110 F1 ${1}：期望 $2 实得 ${got%%|*} :: ${got}"; exit 1; }
+	if [ "$2" = "FAIL" ] && [ -n "$3" ] && ! printf '%s' "$got" | grep -qF -- "$3"; then
+		echo "--- FAIL: §110 F1 ${1}：判红了却没点名 '$3'（红必须说清是哪个任务、因为什么，否则现网还得人工拆读数）"; exit 1;
+	fi
+	echo "ok - §110 F1 ${1} => ${got:0:92}"
+}
+
+KA110_OK='TASK|QMT-Gateway-Ensure|present=1|rule=2|age_h=0.3|state=present+lastrun|enabled=True|action=wscript.exe //B C:\opt\quant\qmt-win\run_qmt_ensure.vbs'
+leg110 'a 周期任务在位且新鲜判绿' PASS "" "$KA110_OK"
+leg110 'b 超龄判红并点名 stale' FAIL "stale=" 'TASK|quant-backup-snap|present=1|rule=30|age_h=72.5|state=present+lastrun|enabled=True|action=powershell -File backup_snapshot.ps1'
+leg110 'c keepalive 不在位判红并点名 absent' FAIL "absent=" 'TASK|QMT-Dataload-KeepAlive|present=0|rule=30|age_h=na|state=absent|enabled=na|action='
+leg110 'c2 缺席且时间字段新鲜：仍报 absent 不报 stale（归属优先级＝缺席比新鲜度更根本）' FAIL "absent=" 'TASK|QMT-Dataload-KeepAlive|present=0|rule=30|age_h=1.0|state=present+lastrun|enabled=True|action=x'
+leg110 'd 新任务没定阈值判红（不许默认放行）' FAIL "no-freshness-rule=" 'TASK|Quant-New-Thing|present=1|rule=none|age_h=1.0|state=present+lastrun|enabled=True|action=x'
+leg110 'e 上次运行时间读不出判红（本机验不了 PS 权限，取向是 fail-closed：读不到就红）' FAIL "last-run-unreadable=" 'TASK|quant-all-wd|present=1|rule=2|age_h=na|state=info-unreadable|enabled=na|action='
+leg110 'f ONLOGON 仅查在位：没有"上次运行时间"这个概念也不算病' PASS "" 'TASK|QMT-Gateway-Logon|present=1|rule=inplace|age_h=na|state=present+lastrun|enabled=True|action=powershell -File start_gateway.ps1'
+leg110 'g 整段零读数判红（判据失明≠全部健康）' FAIL "no-task-readings" ""
+leg110 'h 负 age 单独点名 clock-skew（不许与"读不出"混成一个标签）' FAIL "clock-skew" 'TASK|Quant-Log-Prune|present=1|rule=30|age_h=-40.2|state=present+lastrun|enabled=True|action=x'
+leg110 'i 周期任务被禁用判红（现网 /disable 是临时的，长期停着必须吵）' FAIL "disabled=" 'TASK|QMT-Ensure-Running|present=1|rule=4|age_h=0.5|state=present+lastrun|enabled=False|action=x'
+leg110 'j 动作行含竖线不劈字段' PASS "" 'TASK|QMT-Dataload-KeepAlive|present=1|rule=30|age_h=3.5|state=present+lastrun|enabled=True|action=cmd /c a.py || cmd /c b.py'
+leg110 'k 单源 dot-source 失败走 defs-unreadable 且判红' FAIL "no-freshness-rule=" 'TASK|__service_definitions__|present=0|rule=none|age_h=na|state=defs-unreadable|enabled=na|action='
+leg110 'l 多任务里一枚超龄即整探针红（其余绿不掩盖它）' FAIL "stale=" "$(printf '%s\n%s' "$KA110_OK" 'TASK|quant-backup-snap|present=1|rule=30|age_h=99.9|state=present+lastrun|enabled=True|action=y')"
+
+mut110() { # 摘锁反证：$1=标签 $2=原串（必须恰好出现一次）$3=替换串 $4=读数 $5=摘锁后期望判决
+	local got
+	CNT110=$((CNT110 + 1))
+	python3 - "$W3T/fn.sh" "$W3T/fn_mut.sh" "$2" "$3" <<'PY110MUT' || { echo "--- FAIL: §110 反证 ${1}：变异没落地（原串出现次数≠1，破坏打偏或已被改写）"; exit 1; }
+import sys
+src, out, old, new = sys.argv[1:5]
+t = open(src, encoding="utf-8").read()
+n = t.count(old)
+if n != 1:
+    sys.stderr.write("MUT-NOT-LANDED: 原串在判读函数里出现 %d 次（要求恰好 1 次）\n" % n)
+    sys.exit(3)
+open(out, "w", encoding="utf-8").write(t.replace(old, new))
+print("MUT_APPLIED")
+PY110MUT
+	got="$(bash "$W3T/run.sh" "$W3T/fn_mut.sh" "$4" || true)"
+	[ "${got%%|*}" = "$5" ] || {
+		echo "--- FAIL: §110 反证 ${1}：摘锁后期望 $5 实得 ${got%%|*}（${got}）——说明该判据本来就没起作用，正向腿是蒙对的"; exit 1; }
+	echo "ok - §110 反证 ${1}（摘锁 => ${5}）"
+}
+# 正向七枚：每条摘掉一处判据，对应合成读数必须从红转绿——这证明那条绿是这条判据给的。
+mut110 'M1 摘"零读数判红"正锁 ⇒ g 转绿' '[ "$n" -eq 0 ]' '[ "$n" -eq 99999 ]' "" PASS
+mut110 'M2 摘超龄比较 ⇒ b 转绿' 'exit !($age > $rule)' 'exit 1' 'TASK|quant-backup-snap|present=1|rule=30|age_h=72.5|state=present+lastrun|enabled=True|action=powershell -File backup_snapshot.ps1' PASS
+# M3 的读数刻意选"缺席但时间字段新鲜"那种（age=1.0h、rule=30）：如果用 c 那条（age=na）做反证，
+# 摘掉在位判定后它会被下游"读不出上次运行"接住、照样红，于是这条反证报的是"锁没起作用"，
+# 而真相是"红有两条独立来源"——反证读数必须只让被摘的那一条判据负责，否则测的是归属而不是效果。
+mut110 'M3 摘在位判定 ⇒ 缺席且时间新鲜的任务转绿（本探针的立身之本）' '[ "$pres" != "1" ]' '[ "1" != "1" ]' 'TASK|QMT-Dataload-KeepAlive|present=0|rule=30|age_h=1.0|state=present+lastrun|enabled=True|action=x' PASS
+mut110 'M4 摘"没定阈值判红" ⇒ d 转绿（漏定阈值将静默通过）' '[ -n "$norule" ] && bad="${bad} no-freshness-rule=${norule}"' '[ -n "" ] && bad="$bad"' 'TASK|Quant-New-Thing|present=1|rule=none|age_h=1.0|state=present+lastrun|enabled=True|action=x' PASS
+mut110 'M5 摘"读不出上次运行判红" ⇒ e 转绿（fail-closed 退成 fail-open）' '[ -n "$unread" ] && bad="${bad} last-run-unreadable=${unread}"' '[ -n "" ] && bad="$bad"' 'TASK|quant-all-wd|present=1|rule=2|age_h=na|state=info-unreadable|enabled=na|action=' PASS
+mut110 'M6 摘禁用判定 ⇒ i 转绿' '[ -n "$disabled" ] && bad="${bad} disabled=${disabled}"' '[ -n "" ] && bad="$bad"' 'TASK|QMT-Ensure-Running|present=1|rule=4|age_h=0.5|state=present+lastrun|enabled=False|action=x' PASS
+# M7 方向相反，也最容易写错：摘掉"仅查在位"的提前放行，f 必须**转红**。
+# 它证的是 §107 DRILL-C 那一课——ONLOGON/ONSTART 任务的上次运行时间不由时钟决定，
+# 拿它当健康度判据会在健康现网上永远红，而"永远红的锁"教出来的是所有人忽略红。
+mut110 'M7 摘 rule=inplace 提前放行 ⇒ f 转红（这条保护是有意加的，不是漏判）' '[ "$rule" = "inplace" ]' '[ "$rule" = "zz-never-match" ]' 'TASK|QMT-Gateway-Logon|present=1|rule=inplace|age_h=na|state=present+lastrun|enabled=True|action=powershell -File start_gateway.ps1' FAIL
+rm -f "$W3T/fn_mut.sh"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# F3 Mac 侧行为腿：单实现三态 / 空主题不请求 / 缺 lib 拒跑 / 安装器零改动 / 迁移器不回 argv
+# ──────────────────────────────────────────────────────────────────────────────
+# fake security 桩 + 假钥匙串状态文件：这三条腿全程只碰 $W3T，**本机真实钥匙串零接触**
+# （写钥匙串属本地凭据变更，不在本批自动执行面内；桩把收到的命令行整串记进 SEC_LOG，
+#   供"值不许进 argv"这条断言读——argv 同机任何进程 ps 可见，等于把凭据从 git 历史搬到运行期明文）。
+cat > "$W3T/bin/security" <<'SHIM110'
+#!/bin/bash
+# 假钥匙串桩：状态存 $FAKE_KC。find -w 打印值（无值 rc=1）；add 认两种形态（-w 带值＝argv、
+# -w 不带值＝从 stdin 读），这样门禁才能分别断言"走的是哪条"，而不是只看结果对不对。
+mode=""
+for a in "$@"; do case "$a" in find-generic-password) mode=find ;; add-generic-password) mode=add ;; esac; done
+[ -n "${SEC_LOG:-}" ] && printf 'CALL: %s\n' "$*" >> "$SEC_LOG"
+if [ "$mode" = "find" ]; then
+	[ -s "${FAKE_KC:-/nonexistent}" ] || exit 1
+	cat "$FAKE_KC"
+	exit 0
+fi
+if [ "$mode" = "add" ]; then
+	prev=""
+	for a in "$@"; do
+		if [ "$prev" = "-w" ] && [ -n "$a" ]; then printf '%s' "$a" > "${FAKE_KC:-/dev/null}"; exit 0; fi
+		prev="$a"
+	done
+	printf '%s' "$(head -n 1 | tr -d '\r\n')" > "${FAKE_KC:-/dev/null}"
+fi
+exit 0
+SHIM110
+chmod +x "$W3T/bin/security"
+# 桩自己也要 bash -n：heredoc 里的内容对**外层脚本**的 bash -n 是不可见的（它是数据不是代码），
+# 桩一有语法错就会以"取不到主题"的形态把三条腿判红——那正好是"判据的失败原因不是我以为的原因"
+# 那一族（本批在 kuma_seed.js 上刚踩过一次：MODULE_NOT_FOUND 冒充了 SEED_FAIL）。
+bash -n "$W3T/bin/security" || { echo "--- FAIL: §110 F3 桩脚本本身语法不过（先修桩，红的是桩不是判据）"; exit 1; }
+TOK110='gatetok-preview-7f3'   # 刻意不是 32-hex：本仓有"仓库内不许出现 32 位十六进制"负锁，桩值不能自己踩线
+KC110="$W3T/fake_kc"
+: > "$KC110"
+
+# F3-1 主题单实现三态（env 优先 / 钥匙串兜底 / 皆则 rc=1 且 stdout 空）+ report 不回显明文
+CNT110=$((CNT110 + 1))
+out110="$(PATH="$W3T/bin:$PATH" NTFY_TOPIC="$TOK110" bash -c '. deploy/mac/ntfy_topic.sh; ntfy_topic_resolve' || true)"
+[ "$out110" = "$TOK110" ] || { echo "--- FAIL: §110 F3-1 env 腿取不到主题（got='${out110}'）——resolve 的优先级是 env 先，不认 env 就是安装器白给"; exit 1; }
+out110="$(PATH="$W3T/bin:$PATH" NTFY_TOPIC="$TOK110" bash -c '. deploy/mac/ntfy_topic.sh; ntfy_topic_report leg1' || true)"
+printf '%s' "$out110" | grep -qF "topic_len=${#TOK110}" || { echo "--- FAIL: §110 F3-1 report 没报长度（got='${out110}'）——排查时无法判断两处是不是同一份值"; exit 1; }
+if printf '%s' "$out110" | grep -qF -- "$TOK110"; then echo "--- FAIL: §110 F3-1 report 把主题明文打出来了（'只报长度与指纹'这条铁律的落点就是 report，破了它全废）"; exit 1; fi
+printf '%s' "$TOK110" > "$KC110"
+out110="$(PATH="$W3T/bin:$PATH" FAKE_KC="$KC110" bash -c 'unset NTFY_TOPIC; . deploy/mac/ntfy_topic.sh; ntfy_topic_resolve' || true)"
+[ "$out110" = "$TOK110" ] || { echo "--- FAIL: §110 F3-1 钥匙串腿取不到主题（got='${out110}'）——launchd 常驻形态没有 env，正式来源就是钥匙串"; exit 1; }
+: > "$KC110"
+out110="$(PATH="$W3T/bin:$PATH" FAKE_KC="$KC110" bash -c 'unset NTFY_TOPIC; . deploy/mac/ntfy_topic.sh; ntfy_topic_resolve' || true)"
+[ -z "$out110" ] || { echo "--- FAIL: §110 F3-1 无主题时 resolve 应 stdout 空（got='${out110}'）"; exit 1; }
+PATH="$W3T/bin:$PATH" FAKE_KC="$KC110" bash -c 'unset NTFY_TOPIC; . deploy/mac/ntfy_topic.sh; ntfy_topic_resolve >/dev/null' && { echo "--- FAIL: §110 F3-1 无主题时 resolve 必须非零退出（调用方靠 rc 决定走 ALERT-NOT-SENT）"; exit 1; }
+out110="$(PATH="$W3T/bin:$PATH" FAKE_KC="$KC110" bash -c 'unset NTFY_TOPIC; . deploy/mac/ntfy_topic.sh; ntfy_topic_report leg2 || true' || true)"
+printf '%s' "$out110" | grep -qF 'topic=ABSENT' || { echo "--- FAIL: §110 F3-1 report 缺 ABSENT 文案（got='${out110}'）——「没配」必须与「配了但值为空」可区分"; exit 1; }
+echo "ok - §110 F3-1 主题单实现三态（env/钥匙串/皆无）+ report 不回显明文"
+
+# F3-2 空主题不请求 ntfy：alert() 走 ALERT-NOT-SENT，一次 curl 都不发；有主题则必须真发
+CNT110=$((CNT110 + 1))
+sed -n '/^alert() {/,/^}/p' deploy/mac/restic_pull_backup.sh > "$W3T/alert.sh"
+grep -q '^alert() {' "$W3T/alert.sh" || { echo "--- FAIL: §110 F3-2 alert() 抽不出来（sed 锚点与文件脱钩＝这条腿在验空气）"; exit 1; }
+cat > "$W3T/alert_run.sh" <<'AR110'
+#!/bin/bash
+# 在隔离环境里跑拉取腿的 alert()：log 走 stdout、curl 走**标记文件**，$1=alert 函数文件
+# $2=主题 $3=标题 $4=正文 $5=标记文件路径。
+# 为什么 curl 桩不能 echo 到 stdout：真 alert() 里那句是 `curl ... >/dev/null 2>&1`，
+# 用 stdout 打点会被它自己的重定向吞掉 ⇒ 出现"有主题时没调 curl"的假红（本批实测踩过：
+# 判据的红必须来自被测代码，不能来自观测面选错）。
+set -uo pipefail
+log() { echo "LOG:$*"; }
+# 桩里不能直接写 "$5"：函数被调用时 $n 会被换成**函数自己的**参数（curl 的第 5 个参数是 URL，
+# 不是标记文件路径）——先在外层把路径落成全局量，桩体只读全局量。
+CURL_MARK="$5"
+curl() { printf '%s\n' "$*" > "$CURL_MARK"; return 0; }
+# shellcheck source=/dev/null
+. "$1"
+NTFY_URL="https://ntfy.invalid"
+NTFY_TOPIC="$2"
+alert "$3" "$4" high
+AR110
+rm -f "$W3T/curl.mark"
+out110="$(bash "$W3T/alert_run.sh" "$W3T/alert.sh" "" "quant 备份失败" "restic copy 失败" "$W3T/curl.mark" 2>&1 || true)"
+[ "$(printf '%s\n' "$out110" | grep -c 'ALERT-NOT-SENT' || true)" = "1" ] || { echo "--- FAIL: §110 F3-2 空主题没有恰好一行 ALERT-NOT-SENT（got 见下）：$(printf '%s' "$out110" | head -3)"; exit 1; }
+[ -e "$W3T/curl.mark" ] && { echo "--- FAIL: §110 F3-2 空主题仍然请求了 ntfy（打到根路径吃 404，再把原因写成「网络？」＝把配置缺失伪装成网络抖动）"; exit 1; }
+printf '%s' "$out110" | grep -qF '网络？' && { echo "--- FAIL: §110 F3-2 空主题分支出现「网络？」文案（没发请求就不该甩锅网络）"; exit 1; }
+printf '%s' "$out110" | grep -qF 'restic copy 失败' || { echo "--- FAIL: §110 F3-2 空主题没把正文整条落日志（发不出去时日志是唯一证据面）"; exit 1; }
+rm -f "$W3T/curl.mark"
+out110="$(bash "$W3T/alert_run.sh" "$W3T/alert.sh" "$TOK110" t b "$W3T/curl.mark" 2>&1 || true)"
+[ -e "$W3T/curl.mark" ] || { echo "--- FAIL: §110 F3-2 有主题时没调 curl＝整条 alert 是死支，上一条空主题分支的绿一并作废"; exit 1; }
+grep -qF "https://ntfy.invalid/$TOK110" "$W3T/curl.mark" || { echo "--- FAIL: §110 F3-2 curl 的 URL 里没带主题（发不到那个主题＝没有告警）：$(tail -1 "$W3T/curl.mark")"; exit 1; }
+if printf '%s' "$out110" | grep -qF 'ALERT-NOT-SENT'; then echo "--- FAIL: §110 F3-2 有主题却走了 ALERT-NOT-SENT（两个分支的判据串了）"; exit 1; fi
+echo "ok - §110 F3-2 空主题不请求（恰好一行留痕）+ 有主题真走到 curl 且 URL 带主题"
+
+# F3-3 缺 ntfy_topic.sh 必须当场拒跑（镜像树少拷它＝拉取腿 FATAL，而不是静默不推）
+CNT110=$((CNT110 + 1))
+mkdir -p "$W3T/binonly" "$W3T/home1"
+cp deploy/mac/restic_pull_backup.sh "$W3T/binonly/"
+rc110=0
+HOME="$W3T/home1" PATH="$W3T/bin:$PATH" bash "$W3T/binonly/restic_pull_backup.sh" >"$W3T/o1" 2>"$W3T/e1" || rc110=$?
+[ "$rc110" = "1" ] || { echo "--- FAIL: §110 F3-3 缺 lib 时退出码=${rc110}（应为 1；launchd 只看退出码，退 0＝「每天定时、每天没告警」）"; exit 1; }
+grep -qF 'FATAL' "$W3T/e1" || { echo "--- FAIL: §110 F3-3 缺 lib 时没打 FATAL（stderr：$(head -c 160 "$W3T/e1")）"; exit 1; }
+[ -z "$(ls -A "$W3T/home1" 2>/dev/null || true)" ] || { echo "--- FAIL: §110 F3-3 缺 lib 的 FATAL 之前已动过 HOME（日志目录被建出来＝先落盘后校验，顺序错）"; exit 1; }
+echo "ok - §110 F3-3 缺 ntfy_topic.sh 当场 FATAL rc=1 且 HOME 一个字节没动"
+
+# F3-4 三个 Mac 安装器缺省只预览：跑真仓库文件、HOME 指空目录，退出码 0 且该目录保持为空
+#   （"现网特权变更只上传不自动执行"在 Mac 侧的同一条款：门禁要证明不带 -Apply 确实没副作用，
+#     而不是读一句注释相信它——§0929DRILL 的反证纪律同样适用于"零改动"这种主张。）
+CNT110=$((CNT110 + 1))
+for inst in install_mac_backup_agent install_mac_drill_agent install_mac_nightly_agent; do
+	CNT110=$((CNT110 + 1))
+	d="$W3T/home_${inst}"
+	mkdir -p "$d"
+	HOME="$d" PATH="$W3T/bin:$PATH" bash "deploy/mac/${inst}.sh" >"$W3T/o_${inst}" 2>&1 || {
+		echo "--- FAIL: §110 F3-4 ${inst}.sh 无 -Apply 却非零退出（预览模式必须跑完并打印将做什么）：$(tail -3 "$W3T/o_${inst}")"; exit 1; }
+	grep -qF '预览模式：本机一个字节没动' "$W3T/o_${inst}" || { echo "--- FAIL: §110 F3-4 ${inst}.sh 缺省态不再打印预览早退文案（＝它可能已经在动手）"; exit 1; }
+	[ -z "$(ls -A "$d" 2>/dev/null || true)" ] || { echo "--- FAIL: §110 F3-4 ${inst}.sh 预览模式在 HOME 里留了东西：$(ls -A "$d" | head -3)"; exit 1; }
+done
+echo "ok - §110 F3-4 三个安装器缺省预览零改动（backup/drill/nightly）"
+
+# F3-5 迁移器：预览零写 + -Apply 的值只走 stdin（argv 脚印干净）+ 写后读回兜底是活的
+CNT110=$((CNT110 + 1))
+: > "$W3T/sec.log"
+: > "$KC110"
+out110="$(NTFY_INPUT_TOKEN="$TOK110" PATH="$W3T/bin:$PATH" SEC_LOG="$W3T/sec.log" FAKE_KC="$KC110" \
+	bash -c 'unset NTFY_TOPIC; printf "%s" "$NTFY_INPUT_TOKEN" | ./deploy/mac/migrate_ntfy_topic_to_keychain.sh --from-stdin' 2>&1 || true)"
+printf '%s' "$out110" | grep -qF 'MIGRATE_NTFY_PLAN' || { echo "--- FAIL: §110 F3-5 缺省态没进预览分支：$(printf '%s' "$out110" | tail -3)"; exit 1; }
+grep -qF 'add-generic-password' "$W3T/sec.log" && { echo "--- FAIL: §110 F3-5 预览模式真调了写钥匙串（桩里留了脚印）"; exit 1; }
+[ ! -s "$KC110" ] || { echo "--- FAIL: §110 F3-5 预览模式写了假钥匙串状态文件"; exit 1; }
+out110="$(NTFY_INPUT_TOKEN="$TOK110" PATH="$W3T/bin:$PATH" SEC_LOG="$W3T/sec.log" FAKE_KC="$KC110" \
+	bash -c 'unset NTFY_TOPIC; printf "%s" "$NTFY_INPUT_TOKEN" | ./deploy/mac/migrate_ntfy_topic_to_keychain.sh --from-stdin -Apply' 2>&1 || true)"
+printf '%s' "$out110" | grep -qF 'MIGRATE_NTFY_DONE' || { echo "--- FAIL: §110 F3-5 -Apply 没走完（写后读回比指纹这条兜底没过）：$(printf '%s' "$out110" | tail -3)"; exit 1; }
+[ "$(cat "$KC110")" = "$TOK110" ] || { echo "--- FAIL: §110 F3-5 桩里存下的值与输入不符（got='$(cat "$KC110")'）"; exit 1; }
+grep -F "$TOK110" "$W3T/sec.log" && { echo "--- FAIL: §110 F3-5 主题值出现在 security 的 argv 脚印里（-w 必须不带值、从 stdin 读）"; exit 1; }
+grep -qF 'add-generic-password' "$W3T/sec.log" || { echo "--- FAIL: §110 F3-5 -Apply 却没走到写入口（那 DONE 是从哪来的？）"; exit 1; }
+printf '%s' "$out110" | grep -qE '[0-9a-f]{32}' && { echo "--- FAIL: §110 F3-5 迁移器输出里出现 32-hex（只准报长度与指纹前 8 位）"; exit 1; }
+echo "ok - §110 F3-5 迁移器预览零写 + -Apply 值只走 stdin（argv 干净）+ 写后读回一致"
+
+# F3-6（＝FIX_PLAN §5.5 的 F5）kuma_seed.js 必传参数**行为腿**：断言退出码，不断言播种结果。
+#
+# 为什么这一段是本轮补的而不是波 3 一开始就写：③ 那组静态锁只钉了"校验文案在位 + process.exit(2) 两处
+# + 校验排在 require 之前"，**形状对但不一定走得到**（§P1-A 同族：锁了形状没锁可达性）。
+# 文件头注释自己已经写着"门禁 §110 的 F5 腿"，注释先于实现落纸＝注释在替代码撒谎（§0929 ⑩ 那条
+# 「铲掉落库口径一致的幻觉注释」是同一件事）。
+# ★ 四条腿都不执行播种体：合法参数那条**要求**卡在模块解析上（仓库根解析不到 socket.io-client），
+#   于是"校验块已过"与"绝不连 kuma、绝不动钥匙串"同时成立；哪天根目录能解析到该模块，这条会点名红，
+#   处置是显式换成隔离环境跑，而不是把断言改成"能连上就算绿"。
+CNT110=$((CNT110 + 1))
+mkdir -p "$W3T/empty_node_modules"
+rc110=0
+out110="$(node deploy/mac/kuma_seed.js 2>&1)" || rc110=$?
+[ "$rc110" != "0" ] || { echo "--- FAIL: §110 F3-6 不传任何参数居然 0 退出（缺省值出仓后，缺参必须吵）"; exit 1; }
+[ "$rc110" = "2" ] || { echo "--- FAIL: §110 F3-6 缺参退出码=${rc110}（应为 2＝校验块的专用码；换成 1 就是 MODULE_NOT_FOUND 那类意外冒充成功）"; exit 1; }
+printf '%s' "$out110" | grep -qF '缺少必传参数' || { echo "--- FAIL: §110 F3-6 缺参没点名（退出非零但没有可读成因＝现网只能靠猜）：$(printf '%s' "$out110" | head -2)"; exit 1; }
+printf '%s' "$out110" | grep -qF 'ntfy_topic(argv[2])' || { echo "--- FAIL: §110 F3-6 缺参文案没点名 argv[2]（只报『缺参数』不报缺哪个）"; exit 1; }
+printf '%s' "$out110" | grep -qE '[0-9a-f]{32}' && { echo "--- FAIL: §110 F3-6 缺参输出里出现 32-hex（校验块不该把任何凭据形状的值打出来）"; exit 1; }
+rc110=0
+out110="$(node deploy/mac/kuma_seed.js "$TOK110" 2>&1)" || rc110=$?
+[ "$rc110" = "2" ] || { echo "--- FAIL: §110 F3-6 只缺第二个参数时退出码=${rc110}（应为 2）"; exit 1; }
+printf '%s' "$out110" | grep -qF 'gz_public_ip(argv[3])' || { echo "--- FAIL: §110 F3-6 只缺 argv[3] 却没点名它（缺参点名不精确＝两个缺参用例读起来一模一样）"; exit 1; }
+printf '%s' "$out110" | grep -qF 'ntfy_topic(argv[2])' && { echo "--- FAIL: §110 F3-6 已给主题却仍报缺 argv[2]（校验条件写反）"; exit 1; }
+printf '%s' "$out110" | grep -qF -- "$TOK110" && { echo "--- FAIL: §110 F3-6 缺参文案把主题值回显了（主题＝凭据，只准报参数名）"; exit 1; }
+rc110=0
+out110="$(node deploy/mac/kuma_seed.js "$TOK110" "1.2.3" 2>&1)" || rc110=$?
+[ "$rc110" = "2" ] || { echo "--- FAIL: §110 F3-6 IP 形状不符时退出码=${rc110}（应为 2＝校验块的第二个出口）"; exit 1; }
+printf '%s' "$out110" | grep -qF '不是四段点分十进制' || { echo "--- FAIL: §110 F3-6 IP 形状校验出口没走到（两个出口只验了一个＝另一半可以随便写坏）：$(printf '%s' "$out110" | head -2)"; exit 1; }
+printf '%s' "$out110" | grep -qF '1.2.3' && { echo "--- FAIL: §110 F3-6 形状不符时回显了传入值（文案自己写着『不回显值』）"; exit 1; }
+rc110=0
+out110="$(NODE_PATH="$W3T/empty_node_modules" node deploy/mac/kuma_seed.js "$TOK110" 127.0.0.1 2>&1)" || rc110=$?
+[ "$rc110" != "0" ] || { echo "--- FAIL: §110 F3-6 合法参数居然跑完并 0 退出（门禁里绝不该真播种监控项，这条红的下一步是查它连了谁）"; exit 1; }
+printf '%s' "$out110" | grep -qF 'Cannot find module' \
+	|| { echo "--- FAIL: §110 F3-6 合法参数没卡在模块解析上（实得尾部：$(printf '%s' "$out110" | tail -2)）——要么校验块之后的代码结构变了，要么根目录忽然能解析到 socket.io-client（那就必须在隔离环境跑，不能改断言成『连得上就算绿』）"; exit 1; }
+printf '%s' "$out110" | grep -qF '缺少必传参数' && { echo "--- FAIL: §110 F3-6 参数齐全仍走缺参分支（校验条件写坏，现网会『配了值却说没配』）"; exit 1; }
+printf '%s' "$out110" | grep -qF -- "$TOK110" && { echo "--- FAIL: §110 F3-6 运行输出里回显了主题明文"; exit 1; }
+echo "ok - §110 F3-6 kuma 必传参数四腿（缺一个也要点名、形状出口在位、合法参数卡在依赖解析上且零回显）"
+rm -rf "$W3T" "$W3F"
+# 段尾总结把 CNT110 打出来：门禁段数与判定点数都是**要对外报的数**，
+# 让日志自己带读数，比事后靠记忆写"约 60 道"诚实（§GATE-COUNT-LOCK 同一诉求）。
+echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十三腿与摘锁反证七枚 + F3 Mac 侧五组与 kuma 必传腿，累计判定点 ${CNT110}"
 
 echo ""
 echo "==> 全部通过"

@@ -68,7 +68,20 @@ DRILL_RECORD="${DRILL_RECORD:-$HOME/backups/quant/drill_record.jsonl}"
 SNAP_MAX_AGE_HOURS="${SNAP_MAX_AGE_HOURS:-$( [ -n "$RESTORE_DIR" ] && echo 30 || echo 54 )}"
 
 NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
-NTFY_TOPIC="${NTFY_TOPIC:-5fc177ea37320815462af122b5218849}"
+# §KUMA-SECREDTO（2026-10-07 修复批 波 3）：主题缺省值从仓库里拿掉（ntfy 主题＝凭据，
+# 这个串已在 git 历史里 ⇒ 按已泄露处理，轮换是 owner 的现网动作）。取值走 ntfy_topic.sh
+# 单实现（env NTFY_TOPIC > 钥匙串 quant-ntfy-topic），与 restic_pull_backup.sh 同一个来源——
+# 两个文件以前各抄一份同一个字面量，正是"改一处漏两处"的温床。
+# 注意：演练是从 ~/backups/quant/drill 的**镜像树**里跑本文件的（run_drill_weekly.sh:15 说明
+# 为什么必须保持 deploy/… + scripts/… 的目录形状），所以 ntfy_topic.sh 必须一起进镜像。
+# shellcheck source=ntfy_topic.sh
+NTFY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ntfy_topic.sh"
+if [ ! -f "$NTFY_LIB" ]; then
+    echo "[verify-restore] FATAL: 缺 ${NTFY_LIB}——演练的告警通道不能靠猜，镜像树必须带上 ntfy_topic.sh" >&2
+    exit 1
+fi
+. "$NTFY_LIB"
+NTFY_TOPIC="$(ntfy_topic_resolve || true)"
 ALERT="${ALERT:-1}"
 
 APP_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -84,6 +97,12 @@ log() { echo "[verify-restore] $*"; }
 alert() {
     local title="$1" body="$2"
     [ "$ALERT" = "1" ] || return 0
+    if [ -z "$NTFY_TOPIC" ]; then
+        # 没主题就不发请求（打到 ntfy.sh 根路径回 404，却报"发送失败"＝把配置缺失伪装成网络抖动），
+        # 但正文必须整条落日志：演练失败如果既推不出去又看不见，等价于演练没做。
+        log "ALERT-NOT-SENT reason=no-topic title=$title body=$body"
+        return 0
+    fi
     curl -fs -H "Title: $title" -H "Priority: high" -H "Tags: warning" \
          -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1 || log "ntfy 发送失败（不改变本脚本退出码）"
 }

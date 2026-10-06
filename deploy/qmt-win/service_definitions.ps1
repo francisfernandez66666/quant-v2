@@ -1,4 +1,4 @@
-﻿# service_definitions.ps1 — §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯）Windows 部署
+﻿service_definitions.ps1 — §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯）Windows 部署
 # 「服务/任务定义」唯一来源（dot-source 配置片段，样式承袭 §H8 service_probe_config.ps1）。
 #
 # 消费方：all_service_watchdog.ps1、gateway_watchdog.ps1、register_engine_services.ps1、
@@ -68,6 +68,64 @@ $SvcQmtctlIntervalMin   = 10
 $SvcTaskLogPrune        = "Quant-Log-Prune"        # 日志清理（每日 07:30）
 $SvcTaskAllWatchdog     = "quant-all-wd"           # 全服务 watchdog（RUNBOOK_QMT_DAILY.md:19 在跑）
 $SvcTaskBackupSnap      = "quant-backup-snap"      # 夜间快照（deploy_guangzhou.sh [6/6] 触发位）
+
+# ── §KA-TASKREG（2026-10-07 修复批 波 3）：17:10 盘后保活任务的注册入口 + 任务全集单源 ──────
+# 缺陷本体（§AUDIT_20261005 P1-D，本机读码锤实，全程未触生产）：
+#   scripts/dataload_keepalive.py 是 daily / index_daily / ths_limit_up_daily 三表的盘后补数执行体，
+#   §0927KA 已把它收进 deploy_guangzhou.sh 的 scp 清单（**脚本面**到位了），但**计划任务本身
+#   从来没有注册体**：register_engine_services.ps1 只创建 QMT-Ensure-Running 与 Quant-Log-Prune
+#   两个任务，本文件此前的任务表也没有这一项——现网那个 QMT-Dataload-KeepAlive 是 2026-09-16
+#   手工 schtasks /Create 出来的（RUNBOOK §1 记录的正是那次手工修，含"裸 python 必 127 静默失败"
+#   这个根因）。⇒ 三条后果：① 换机/重建现网时这条腿不会自己回来；② 任务被误删后无脚本可复原；
+#   ③ 部署面也没有"任务在位"判据，所以"脚本每晚都在、日线却停更"只能靠人肉发现。
+#   这是本仓第 N 次「有脚本无调度」同族（§ENH-5 网关 py 漏清单、§P0-B 备份脚本手工安装、
+#   §0927KA keepalive 不在清单、§0929DRILL 演练/夜间验收"有脚本无 launchd"），
+#   每一次的形态都一样：判据写得很完整，只是没有钟去触发它，于是纸面上永远成立。
+# 修法三段（缺一段就回到同一个形态）：
+#   ① 本节＝任务名 / 触发时点 / 执行体路径的单源；
+#   ② register_engine_services.ps1 §KA-TASKREG＝注册体（本仓纪律 §0929OPS-⑪：运维脚本**只上传
+#      不自动执行**，schtasks /Create 属现网特权变更，必须 owner 当面看预演读数后执行）；
+#   ③ verify_deploy_guangzhou.sh 第 32 探针＝按 $SvcTaskRoster 逐个查"在位"+ 周期任务查
+#      "上次运行新鲜度"。PS 侧只回 ASCII 读数、判读函数在 bash 里单实现——理由是**本机没有
+#      PowerShell**，判读放 PS 就永远无法离线自证三态（绿/过期红/缺任务红）。
+$SvcTaskDataloadKeepAlive = "QMT-Dataload-KeepAlive"   # 现网名（RUNBOOK §1），/ru SYSTEM
+$SvcKeepaliveDailyAt      = "17:10"                    # 每日盘后；脚本自身幂等（三表拉齐即退出）
+# ⚠ 绝对路径不是风格问题：09-16 断供 5 日的根因就是任务动作行写了裸 `python`，
+#   而 SYSTEM 账号的 PATH 里没有 python ⇒ 每天触发、每天退出码 127、日志一行不写、无人知晓。
+$SvcKeepalivePythonExe    = "C:\Python312\python.exe"
+$SvcKeepaliveScript       = "C:\opt\quant\dataload_keepalive.py"   # deploy_guangzhou.sh:211 的落盘位
+$SvcKeepaliveLog          = "C:\opt\quant\dataload_keepalive.log"  # 脚本 log() 与 cmd 重定向同名（已加固）
+
+# ── 任务全集（部署面"这台机器该有哪些计划任务"的唯一答案）──────────────────────────────
+# 第 32 探针按这个集合逐个查，不再在各脚本里各写各的名单；
+# 新增任务只改这里一处，探针自动覆盖（清单式锁会漏下一个新增项，§BOM-REPO-DERIVE / §107
+# 派生正锁两条同族教训：能派生的就不要写死）。
+$SvcTaskRoster = @(
+    $SvcTaskGatewayEnsure,
+    $SvcTaskGatewayLogon,
+    $SvcTaskQmtctl,
+    $SvcTaskLogPrune,
+    $SvcTaskAllWatchdog,
+    $SvcTaskBackupSnap,
+    $SvcTaskDataloadKeepAlive
+)
+
+# ── 新鲜度规则（阈值按**触发周期**定，全仓只此一份）───────────────────────────────────
+# 为什么用 pscustomobject 数组而不是 hashtable 字面量：`@{ $var = 2 }` 的键求值在 PS5.1 上
+# 是可用的但可读性差、且拼错变量名会静默造出一个空键（探针查不到规则⇒要么恒红要么恒绿）。
+# 数组形状让"任务名"与"该多久跑一次"成对出现，加一条就写一行。
+$SvcTaskFreshRules = @(
+    [pscustomobject]@{ Name = $SvcTaskGatewayEnsure;     MaxAgeHours = 2 },   # 每 5 分钟 ⇒ 2h＝24 个周期没跑
+    [pscustomobject]@{ Name = $SvcTaskQmtctl;            MaxAgeHours = 4 },   # 每 10 分钟 ⇒ 4h＝24 个周期
+    [pscustomobject]@{ Name = $SvcTaskLogPrune;          MaxAgeHours = 30 },  # 每日 07:30 ⇒ 一天 + 余量
+    [pscustomobject]@{ Name = $SvcTaskBackupSnap;        MaxAgeHours = 30 },  # 每日 04:00 ⇒ 与 §P0-B 标记阈值同数
+    [pscustomobject]@{ Name = $SvcTaskDataloadKeepAlive; MaxAgeHours = 30 }   # 每日 17:10 ⇒ 一天 + 余量
+)
+# 非周期触发（ONLOGON / ONSTART）的任务**不进** $SvcTaskFreshRules：它们的上次运行时间由
+# "有没有人登录 / 机器有没有重启"决定，不由时钟决定。拿它判新鲜度＝在一台可以连续运行数周
+# 不重立的服务器上造出**结构性必红**（§107 DRILL-C 的教训：一条在健康现网上永远红的锁，
+# 结局是所有人学会忽略它，真正的红也就没人看了）。
+$SvcTaskInPlaceOnly = @($SvcTaskGatewayLogon, $SvcTaskAllWatchdog)
 
 # ── nssm.exe 落位（verify_deploy_guangzhou.sh:241 注释直陈：现网＝第一个）───────────
 $SvcNssmCandidates = @(

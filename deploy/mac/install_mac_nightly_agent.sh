@@ -56,6 +56,11 @@ DERIVED_HOST="$(ssh -G gz 2>/dev/null | awk '/^hostname /{print $2; exit}')"
 [ -n "$DERIVED_HOST" ] || { echo "X ssh -G gz 展开不出 hostname（别名不可用，拒绝装一个永远派生不到主机的任务）" >&2; exit 1; }
 
 mkdir -p "${NIGHTLY_HOME}/scripts"
+# 为什么这里**不**拷 deploy/mac/ntfy_topic.sh（drill/backup 两个安装器拷）：实测本链两个文件
+# （run_nightly_verify.sh + scripts/verify_nightly_guangzhou.sh）里 ntfy 相关代码为零——七腿的失败
+# 只走 stdout/退出码，薄壳自己也不推。凭据口径出仓后（§KUMA-SECREDTO）「少拷一个 lib」会变成
+# 启动即 FATAL，所以拷贝清单必须按**谁真的 source 它**来定，不能按"兄弟安装器都有"照抄。
+# 将来若给夜间验收加推送，把 lib 一起带上并在门禁 §110 的文件面派生锁里同步。
 cp "${REPO_MAC_DIR}/run_nightly_verify.sh" "${NIGHTLY_HOME}/run_nightly_verify.sh"
 cp "${REPO_ROOT}/scripts/verify_nightly_guangzhou.sh" "${NIGHTLY_HOME}/scripts/verify_nightly_guangzhou.sh"
 chmod +x "${NIGHTLY_HOME}/run_nightly_verify.sh" "${NIGHTLY_HOME}/scripts/verify_nightly_guangzhou.sh"

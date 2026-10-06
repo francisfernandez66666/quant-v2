@@ -16,18 +16,44 @@ REPO_REMOTE="sftp:${SSH_HOST}:C:/var/lib/quant-restic-repo"   # 广州中转仓�
 REPO_LOCAL="$HOME/backups/quant/restic"                        # Mac 异地仓库（restic copy 目标）
 KEYCHAIN_ITEM="quant-restic-repo-pass"
 NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
-NTFY_TOPIC="${NTFY_TOPIC:-5fc177ea37320815462af122b5218849}"
+# §KUMA-SECREDTO（2026-10-07 修复批 波 3）：主题不再在仓库里写缺省值。
+# 为什么：ntfy 的口径是「知道主题就能往那个主题发帖」⇒ 主题串就是凭据；这个 32-hex 以前同时
+# 写在本文件、verify_restore.sh、kuma_seed.js 三处（三份并存的必然结局＝改一处漏两处），
+# 而且已经进过 git 历史——**改文件洗不掉历史**，所以它按「已泄露」处理（轮换属 owner 当面看
+# 预演的现网动作，不在本批自动执行面内）。仓库侧现在只留取用口径：值走 ntfy_topic.sh 单实现
+# （env NTFY_TOPIC 优先，其次 macOS 钥匙串 quant-ntfy-topic，与 restic 仓库密码同一条通道）。
+# shellcheck source=ntfy_topic.sh
+NTFY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ntfy_topic.sh"
+if [ ! -f "$NTFY_LIB" ]; then
+	# 取不到"取主题的代码"不是可以降级的状态：这个脚本的失败全靠 ntfy 通知到人，
+	# 静默继续跑等于把备份链的报警器拆了还不自知（§N-6/§M2「降级不得报成功」同族）。
+	echo "FATAL: 缺 ${NTFY_LIB}——ntfy_topic.sh 必须和本脚本一起拷进稳定副本目录（见 install_mac_backup_agent.sh）" >&2
+	exit 1
+fi
+. "$NTFY_LIB"
+NTFY_TOPIC="$(ntfy_topic_resolve || true)"
 FRESH_MAX_HOURS="${FRESH_MAX_HOURS:-26}"                       # 快照超过 26h 未更新视为广州侧失败
 LOG="$HOME/backups/quant/pull_backup.log"
 
 mkdir -p "$(dirname "$LOG")"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
 
+# 取不到主题＝告警通道断了。这条必须在日志里吵一次（不回显值，只报长度/指纹），
+# 否则「今晚备份失败」和「今晚没人能收到失败通知」在现象上完全一样。
+[ -n "$NTFY_TOPIC" ] || log "WARN: ntfy 主题未配置（env NTFY_TOPIC 与钥匙串 quant-ntfy-topic 皆空）⇒ 本任务告警只落日志不推送：$(ntfy_topic_report restic-pull)"
+
 alert() {  # 关键事件推 ntfy
   local title="$1" body="$2" pri="${3:-high}"
+  if [ -z "$NTFY_TOPIC" ]; then
+    # 无主题时**不发请求**：打到 https://ntfy.sh/（根路径）只会回 404，而日志里写"网络？"
+    # 会把「配置缺失」伪装成「网络抖动」——下一次真断网时没人再信这条（§0929DRILL-A 假红同族）。
+    # 正文整条落日志：告警发不出去时，日志就是唯一证据面，不能只留一句"发送失败"。
+    log "ALERT-NOT-SENT reason=no-topic title=$title body=$body"
+    return 0
+  fi
   curl -fs -H "Title: $title" -H "Priority: $pri" -H "Tags: package" \
        -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1 \
-    || log "ntfy 告警发送失败（网络？）"
+    || log "ntfy 告警发送失败（网络？启动行的 topic_fp 可判断配的是哪一份）"
 }
 
 fail() { log "ERROR: $*"; alert "quant 备份失败" "$*" high; exit 1; }
