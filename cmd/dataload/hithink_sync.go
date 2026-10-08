@@ -6,6 +6,9 @@
 //	dataload hithink-sync --kind daily-k --since 20230801 # 存量窗口导入（过滤 10 年全量 dump）
 //
 // 流程：取 S3 预签名链接（5 分钟有效）→ 落盘 parquet → 流式解析逐行回调 → 批量幂等 upsert ths_daily。
+//
+// §W7-D（2026-10-09）：日 K 导入收尾多一步 ths_daily 成交额量纲抽检（与 daily 同一把尺子），
+// 该表的 amount 口径从此由读数担保而不是注释担保；判红不改判导入结果（详见 cmdHithinkSync 函数头）。
 package main
 
 import (
@@ -31,6 +34,21 @@ func defaultHithinkTmpPath() string {
 }
 
 // cmdHithinkSync 执行一次同花顺（新）日K同步。
+//
+// §W7-D（2026-10-09 波 7）ths_daily.amount 的口径声明与它的机器保证：
+//   - 写侧：parquet 的 `turnover` 列**原样**写入 ths_daily.amount，一条换算都没有。
+//     依据是同花顺 API 同名字段的既有口径（internal/data/hithink.go 的
+//     `Turnover float64 // 成交额（元）`）；该 dump 列在本仓 schema 注释里曾同时写着
+//     "换手率（%）"与"成交额/换手率"（internal/data/hithink_dump.go，本批已改），
+//     两处注释互相矛盾时不能挑一个当事实，所以这条口径改由读数担保。
+//   - 读数：日 K 导入收尾调 `checkThsAmountScale`（判定体与 daily 完全同一个：
+//     均价 = amount/(vol×100) 落在 [1,500] 元带），现网另有一条独立腿
+//     `dataload amount-check --table ths_daily`（verify 第 30 探针）。
+//     读数判千元/超带/混源 ⇒ P1 日志 + 探针判红，由人决定要不要在写侧加换算；
+//   - 为什么不给它配写侧归一：data.AmountScaledTables 是"上游单位已核实为千元"的换算白名单
+//     （tushare 日线家族），ths_daily 没有这份核实记录；THS dump 从未在本仓留下抽样实录。
+//     把一个猜测的 ×1000 写进库里，比"注释矛盾"更难回滚——历史行没有版本标记可辨。
+//     两张集合为什么分开，见 internal/store/amount_scale_probe.go 的 AmountProbedTables 注释。
 func cmdHithinkSync(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("hithink-sync", flag.ExitOnError)
 	kind := fs.String("kind", string(data.HithinkDumpDailyK10d), "种类: daily-k-10d|daily-k|adjustment-factors|pools|anomaly")
@@ -92,6 +110,8 @@ func cmdHithinkSync(db *store.DB, args []string) {
 			Open: row.Open, High: row.High, Low: row.Low, Close: row.Close,
 			// 单位归一：THS 成交量单位为股，baostock 为手（1手=100股）——
 			// ÷100 对齐存量口径（2026-08-24 双源对账实录：平安银行 106,085,094 股 vs 1,060,851 手）。
+			// §W7-D：amount 这一列原样落库、不做换算，且这个"不做"由收尾抽检证明
+			// （口径声明与禁止 ×1000 的理由见本文件 cmdHithinkSync 函数头注释）。
 			Vol: row.Volume / 100, Amount: row.Turnover,
 		})
 		if len(batch) >= *batchSize {
@@ -117,6 +137,9 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	count, _ := db.ThsDailyCount(*since)
 	log.Printf("[hithink] 同步完成：解析 %d 行，入库影响 %d 行；ths_daily(since=%s) 共 %d 行，最新交易日 %s",
 		total, imported, *since, count, maxDate)
+	// §W7-D：导入成功后抽一次 ths_daily 的成交额量纲读数（只报不改判，理由见函数头与
+	// checkThsAmountScale）。放在这里而不是每个 kind 分支：只有日 K 这条腿写 amount。
+	checkThsAmountScale(db)
 }
 
 // cmdHithinkSyncAdjFactors 复权因子同步：全量事件 dump → 窗口内事件换算累计 hfq 因子

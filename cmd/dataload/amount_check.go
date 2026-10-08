@@ -8,9 +8,12 @@
 //  2. `checkLoadedAmountScale` —— 日线装载（tushare 腿）收尾自动抽最近一个已落交易日，
 //     判红只打 WARN：数据已经写进去了、装载也确实成功，把成功改判失败会让断点续传
 //     误以为"那天没拉"从而重复整批重写，风险大于收益；红要由**独立腿**去拦停。
+//  3. `checkThsAmountScale` —— §W7-D 给同花顺日 K dump 加的第三条入口（表＝ths_daily），
+//     与 2 同一取向、同一个判定体（checkAmountScaleOn），因为该表的 amount 口径此前
+//     只有互相矛盾的注释担保。
 //
 // English: §0929SCALE-⑩ — the loader-side wiring of the post-load caliber probe:
-// a standalone `amount-check` subcommand plus a non-fatal self-check after daily loads.
+// a standalone `amount-check` subcommand plus non-fatal self-checks after daily and THS loads.
 package main
 
 import (
@@ -18,25 +21,28 @@ import (
 	"flag"
 	"log"
 	"os"
-	"time"
 
-	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/store"
 )
 
-// cmdAmountCheck 实现 `dataload amount-check`：抽样判定 daily.amount 是元还是千元口径。
+// cmdAmountCheck 实现 `dataload amount-check`：抽样判定指定日线表的 amount 是元还是千元口径。
 // 参数取自子命令自身 flag 集（与全局 --db/--provider 共存，写在子命令后即可覆盖）。
 // 退出码语义钉死：0＝口径正常或无数据（无数据由新鲜度腿负责报警，这里不重复判红），
 // 1＝判红（千元/双重换算/混源），2＝读取失败。
-// English: `dataload amount-check` — exit 0 ok, 1 caliber failure, 2 probe error.
+// §W7-D（2026-10-09）：新增 --table，取值只能是 store.AmountProbedTables 的键（daily 默认，
+// 保持既有第 30 探针与夜间腿的调用形态零改动；ths_daily 是本次新加的读数面）。
+// 为什么 --table 非法值回 2 而不是 1：1 是"库里量纲错了"的语义，把它借给"命令行打错"会让
+// 现网看到一条根本不存在的数据故障。
+// English: `dataload amount-check` — exit 0 ok, 1 caliber failure, 2 probe/argument error.
 func cmdAmountCheck(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("amount-check", flag.ExitOnError)
+	table := fs.String("table", "daily", "抽检表名（只能是 internal/store.AmountProbedTables 的键）")
 	date := fs.String("date", "", "抽检交易日 YYYYMMDD（空＝表内最近交易日）")
 	rows := fs.Int("rows", 800, "抽样上限（按 ts_code 升序，确定性取样）")
 	asJSON := fs.Bool("json", false, "以 JSON 输出读数（供脚本读 verdict，不再解析日志行）")
 	_ = fs.Parse(args)
 
-	p, err := db.ProbeDailyAmountScale(*date, *rows)
+	p, err := db.ProbeAmountScale(*table, *date, *rows)
 	if err != nil {
 		log.Printf("[amount-check] 抽检失败: %v", err)
 		os.Exit(2)
@@ -52,34 +58,54 @@ func cmdAmountCheck(db *store.DB, args []string) {
 			p.Table, p.Date, p.Rows, p.WantRows, p.Low, p.Normal, p.High, p.MedianRatio, p.Verdict, p.Reason)
 	}
 	if p.Red() {
-		// 判红文案要点名"后果"：只说单位不对，值班的人不知道该不该停池。
-		log.Printf("[amount-check][P1] 成交额量纲判红：%s ⇒ 股池流动性质控（阈值按元）与回放成本模型会整体失真，"+
-			"且不会有任何上游报错。先核对装载腿是否绕过写侧归一（internal/data/amountscale.go）。", p.Reason)
+		// 判红文案要点名"后果"与"下一步查哪一处"：只说单位不对，值班的人不知道该不该停池。
+		// 表名必须进文案——现网两条腿（daily / ths_daily）的修法完全不同：daily 是写侧漏了归一，
+		// ths_daily 是上游列口径与注释不一致，而换算白名单里没有它（见 §W7-D）。
+		log.Printf("[amount-check][P1] 成交额量纲判红（表=%s）：%s ⇒ 股池流动性质控（阈值按元）与回放成本模型会整体失真，"+
+			"且不会有任何上游报错。daily/index_daily 先核对写侧归一（internal/data/amountscale.go 的 AmountScaledTables）；"+
+			"ths_daily 先核对 THS dump 的 turnover 列口径（internal/data/hithink_dump.go）——该表只在抽检集合里，"+
+			"不在换算白名单里，读数判红也不许顺手乘 1000。", p.Table, p.Reason)
 		os.Exit(1)
 	}
-	log.Printf("[amount-check] 口径校验通过（%s）", p.Verdict)
+	log.Printf("[amount-check] 口径校验通过（表=%s %s）", p.Table, p.Verdict)
 }
 
-// checkLoadedAmountScale 在日线装载收尾抽最近一个已落交易日，判红只 WARN、不改判装载结果。
+// checkLoadedAmountScale 在日线装载（tushare/baostock 腿）收尾抽 daily 表最近一个已落交易日。
 // 语义依据见文件头：断点续传按日期整批重写，把成功改成失败会诱发重复写盘；
 // 需要拦停的场景请拨 `amount-check` 独立腿。
 // English: post-load self-check — warns on a bad caliber, never fails a successful load.
-func checkLoadedAmountScale(db *store.DB) {
-	// 兜底窗口给最近 30 天：库里最新日期就在其中，取不到则 probe 自然回 no-data。
-	from := cntime.DayCompactOf(time.Now().AddDate(0, 0, -30))
-	p, err := db.ProbeDailyAmountScale("", 0)
+func checkLoadedAmountScale(db *store.DB) { checkAmountScaleOn(db, "daily") }
+
+// checkThsAmountScale 是 §W7-D 给同花顺日 K dump 加的同一条自检（表＝ths_daily）。
+// 为什么这条腿比注释重要：THS dump 的 turnover 列在本仓两处注释里口径不一致
+// （internal/data/hithink_dump.go 曾同时写"换手率（%）"与"成交额/换手率"），
+// 而 cmd/dataload/hithink_sync.go 把它直写进 ths_daily.amount。注释互相矛盾时，
+// 唯一可信的是读数：均价 = amount/(vol×100) 落在 [1,500] 元带 ⇒ 元口径成立；
+// 若整体 <1 元 ⇒ 要么千元、要么这列根本不是成交额（换手率量级），两种都必须人来看。
+// 判红同样只打 P1 不改判导入结果（与 daily 腿同一取向）。
+// English: §W7-D — run the same caliber self-check against ths_daily after a THS dump import.
+func checkThsAmountScale(db *store.DB) { checkAmountScaleOn(db, "ths_daily") }
+
+// checkAmountScaleOn 是两条装载自检的唯一实现（抽指定表、只报不改判）。
+// 两份判定体的结局是修一处漏一处，因此 daily 与 ths_daily 都只走这里。
+// English: the single body behind both post-import caliber self-checks.
+func checkAmountScaleOn(db *store.DB, table string) {
+	p, err := db.ProbeAmountScale(table, "", 0)
 	if err != nil {
-		log.Printf("[dataload][WARN] §0929SCALE 收尾量纲抽检未跑成（不影响已落库数据）：%v", err)
+		log.Printf("[dataload][WARN] §0929SCALE 收尾量纲抽检未跑成（表=%s，不影响已落库数据）：%v", table, err)
 		return
 	}
 	switch {
 	case p.Red():
-		log.Printf("[dataload][P1] §0929SCALE 量纲抽检判红：%s（取样窗口自 %s 起，%d 行）⇒ 请立即人工核对装载腿与历史混源",
-			p.Reason, from, p.Rows)
+		// 文案里的取样日期取 probe 实际抽到的那天：旧版打的是"最近 30 天窗口起点"，
+		// 而 probe 用的是表内最近交易日——日志说的和做的不是同一个日子（§W7 卫生顺手改掉）。
+		log.Printf("[dataload][P1] §0929SCALE 量纲抽检判红（表=%s）：%s（实抽 %s，%d 行）⇒ 请立即人工核对装载腿与历史混源",
+			table, p.Reason, p.Date, p.Rows)
 	case p.Verdict == store.AmountScaleNoData:
-		log.Printf("[dataload] §0929SCALE 量纲抽检无样本（daily 表空或日期异常），跳过")
+		log.Printf("[dataload] §0929SCALE 量纲抽检无样本（表=%s 为空或日期异常），跳过", table)
 	default:
-		log.Printf("[dataload] §0929SCALE 量纲抽检通过：%s 中位日均价 %.2f 元（取样 %d 行）", p.Date, p.MedianRatio, p.Rows)
+		log.Printf("[dataload] §0929SCALE 量纲抽检通过：表=%s %s 中位日均价 %.2f 元（取样 %d 行，日=%s）",
+			table, p.Verdict, p.MedianRatio, p.Rows, p.Date)
 	}
 }
 

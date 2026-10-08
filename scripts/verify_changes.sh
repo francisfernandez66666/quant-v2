@@ -4812,7 +4812,7 @@ echo "ok - §0927AUDIT-D3 守卫通过（gofmt -l 0 文件，与 ci.yml:36-42 �
 # §89 纪律：计数型 grep 赋值一律 `|| true` 兜住（0 命中时 grep -c 退出码 1，pipefail 下会把
 # "全绿" 变 "裸死"）；行为腿先收全文再判红，红项当场可读。
 # ════════════════════════════════════════════════════════════════════════════
-echo "==> 105 §0927AUDIT D1/D2/D4/D5 修复批专项静态锁 + 独立UAT脚本自纠 + gofmt-”防回潮（2026-09-28）..."
+echo "==> 105 §0927AUDIT D1/D2/D4/D5 修复批专项静态锁 + 独立UAT脚本自纠 + gofmt-”防回潮（2026-09-28；D4 那条在 2026-10-06 波 7 由「main.go 不许出现 os.Exit 字面量」改写成「os.Exit 的行号必须落在 main 外壳内且恰好一条」＋三枚位置反证，成因见 D4 段注释）..."
 
 # —— 行为腿：D1 已实现盈亏扣费回归（含方向锁用例，秒级）——
 RP=$(go test -count=1 ./internal/store/ -run 'TestTodayRealizedPnl' 2>&1 || true)
@@ -4829,9 +4829,58 @@ grep -q -- "- f.Fee - f.StampTax" internal/store/risk_gates.go \
 grep -q "const want = -509" internal/store/realized_pnl_fee_test.go \
 	|| { echo "--- FAIL: §105 D1 含费期望值 -509 锚丢失（方向锁被放宽＝假绿温床）"; exit 1; }
 
-# —— D4 优雅停机锚：main.go 不得复活真实 os.Exit 调用（旧缺陷=跳过 defer 链丢数据）——
-MAIN_EXIT=$(grep -cE '^[[:space:]]*os\.Exit\(' cmd/quant/main.go || true)
-[ "${MAIN_EXIT:-0}" = "0" ] || { echo "--- FAIL: §105 D4 os.Exit 真实调用复活（got=${MAIN_EXIT}，预期 0——收尾必须走 defer 链自然 return）"; exit 1; }
+# —— D4 优雅停机锚（判据形态在 2026-10-06 波 7 改写过一次，成因写在下面，别再改回去）——
+#   原锁是「cmd/quant/main.go 里不得出现 os.Exit 字面量」，那是把「收尾不被跳过」错抄成「文件里
+#   没这个词」：§W7-FATAL 为了消掉启动期三处 log.Fatalf（它们在 defer 链**之外**终结进程），把进程
+#   体搬进 run() int，退出码必须由 main 的进程外壳交给 os.Exit——run 里 return 只回到外壳，
+#   不交退出码就等于把 fail-fast 悄悄降级成「退出码 0」。于是**合法形态**里也会出现一条 os.Exit，
+#   旧锁照字面判红（10-09 门禁 -full 实跑 §105 首红就是这一条）。
+#   真判据是位置而不是字面量：os.Exit 只允许出现在 func main() 外壳内、且恰好一条；
+#   run()（以及以后任何别的函数）体内一条都不许有——这三条合起来才等价于「旧缺陷不再复活」。
+D4_READ=$(awk '/^func main\(\)/{inmain=1} /^func run\(\) int/{inmain=0; inrun=1}
+	/^[ \t]*os\.Exit\(/{if(inmain)m++; else o++} END{printf "in_main=%d outside=%d", m+0, o+0}' cmd/quant/main.go)
+[ "${D4_READ}" = "in_main=1 outside=0" ] \
+	|| { echo "--- FAIL: §105 D4 退出姿势读数漂移（实读=${D4_READ} 应=in_main=1 outside=0：外壳那条 os.Exit 是交出退出码的唯一通路，跑到 0＝fail-fast 被吞成 0，跑到 2＝又长出第二条；outside≥1＝在 run 的 defer 链之外终结进程，正是旧缺陷本体）"; exit 1; }
+echo "ok - §105 D4 退出姿势（进程体在 run、退出码由 main 外壳交 os.Exit，实读 ${D4_READ}）"
+
+# D4 反证三枚（§111「等值锁非单向锁」同族）：只断「读数不许漂」不够，必须证明这把尺子在
+# 三种坏法下各自翻转；全程在 /tmp 副本上做，仓库文件零改动。
+D4W=$(mktemp -d /tmp/d4rev-XXXXXX 2>/dev/null || true)
+[ -n "${D4W:-}" ] && [ -d "$D4W" ] || { echo "--- FAIL: §105 D4 反证的临时目录建不出来（建不出来就没有副本树，破坏只能落在真文件上）"; exit 1; }
+d4_read() { awk '/^func main\(\)/{inmain=1} /^func run\(\) int/{inmain=0; inrun=1}
+	/^[ \t]*os\.Exit\(/{if(inmain)m++; else o++} END{printf "in_main=%d outside=%d", m+0, o+0}' "$1"; }
+d4_probe() { # $1=编号 $2=old 整串 $3=new 整串 $4=期望读数 $5=说明
+	local id="$1" old="$2" new="$3" want="$4" why="$5" n got
+	cp cmd/quant/main.go "$D4W/$id.go" || { echo "--- FAIL: §105 D4 反证 ${id} 取不到副本"; exit 1; }
+	n=$(python3 - "$D4W/$id.go" "$old" "$new" <<'PYD4'
+import sys
+# 整串替换并打印落地数（0＝靶串没命中、>1＝破坏面比本枚射程大，两种都要红，与 §114 mutate.py 同纪律）
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PYD4
+)
+	[ "${n:-0}" = "1" ] || { echo "--- FAIL: §105 D4 反证 ${id} 变异落地数=${n}（应恰好 1）：${why}"; rm -rf "$D4W"; exit 1; }
+	got=$(d4_read "$D4W/$id.go")
+	[ "${got}" = "${want}" ] \
+		|| { echo "--- FAIL: §105 D4 反证 ${id} 读数没按预期翻转（破坏后应=${want} 实得=${got}）：${why}"; rm -rf "$D4W"; exit 1; }
+	echo "ok - §105 D4 反证 ${id}（${why}）：读数 in_main=1 outside=0 → ${got}"
+}
+d4_probe R1 $'\tlog.SetFlags(log.LstdFlags | log.Lshortfile)' \
+	$'\tlog.SetFlags(log.LstdFlags | log.Lshortfile)\n\tos.Exit(1)' \
+	'in_main=1 outside=1' \
+	'把 os.Exit 长回进程体里（defer 链还没展开就终结进程＝旧缺陷本体），outside 必须现形'
+d4_probe R2 $'\tif code := run(); code != 0 {\n\t\tos.Exit(code)\n\t}' \
+	$'\tif code := run(); code != 0 {\n\t\tos.Exit(code)\n\t\tos.Exit(code)\n\t}' \
+	'in_main=2 outside=0' \
+	'外壳里再长出第二条退出姿势时，等值计数锁必须红（≤1 的单向锁在这里会放过）'
+d4_probe R3 $'\t\tos.Exit(code)' '\t\t_ = code' \
+	'in_main=0 outside=0' \
+	'把外壳那条 os.Exit 摘掉＝启动期 fail-fast 的退出码被静默吞成 0，等值锁的另一半（不许为 0）在这里生效'
+rm -rf "$D4W"
 SLEEP_STOP=$(grep -c "sleepOrStop" cmd/quant/main.go || true)
 [ "$SLEEP_STOP" = "4" ] || { echo "--- FAIL: §105 D4 sleepOrStop 锚计数漂移（got=$SLEEP_STOP 预演=4：定义+注释+两处心跳；信号可能又打不进睡眠）"; exit 1; }
 grep -q "mainLoop:" cmd/quant/main.go \
@@ -4903,6 +4952,11 @@ echo "ok - §0927AUDIT 修复批守卫通过（行为腿 1 组 + 静态锁 10 �
 # 稀疏 merge 写通道加了 2 行特权变更留痕（config_d1_merge / config_snapshot_failed）⇒ 计数 8→10 同日同步，
 # FAIL 文案写清两行来源。另补测试资产登记锁 4 道（Playwright 三条 POS 腿 + 共用拦截 helper + 两个审计动作名），
 # 静态锁 62→66；预演读数：test('POS- =3、interceptHoldingsWrite( =4、两个动作名各=1。
+# §W7-D 同日同步（2026-10-09 波 7）：第 30 探针与夜间 scale 腿各扩出 **ths_daily** 一张表
+# （amount-check --table ths_daily），verify_deploy 的 amount-check 计数 3→4（注释 2 + 实调用 2），
+# 上面那行等值锁按新数改；两张表合并成**一腿一 PASS**，所以本段的 `^Probe `=26、§88 的 INFO 观测行=7、
+# 夜间 `PASS" -lt 7` 与七腿齐备锁全部不改——改的是判据覆盖面，不是判数；判数若跟着动，
+# 就等于把"新增第 8 条腿"这件没发生的事写进半态守卫。ths_daily 自身的静态锁与行为腿在 §114。
 # 三次扩段反证实测（/tmp/cp106/run_cp_reg.py，镜像破坏、主仓零改动、LEFTOVERS=0）：首轮 6 枚破坏里
 # R2「helper 整体改名 interceptHoldingsWrite→interceptHoldingsWriteV2」**STAYED-GREEN**——裸标识符模式
 # 被改名后的子串命中，与本轮 §106 首版标识符锁同一族雷（本仓教训第 N 次复现）。故该锁换成带调用
@@ -4964,7 +5018,7 @@ done
 eq106 scripts/verify_deploy_guangzhou.sh '第 29 探针' 5 '⑪-1 第 29 探针五处同源（头部清单/可调项说明/变量定义/param 注释/正文段）'
 eq106 scripts/verify_deploy_guangzhou.sh '第 30 探针' 3 '⑩ 第 30 探针三处同源（头部清单/param 注释/正文段）'
 eq106 scripts/verify_deploy_guangzhou.sh '^Probe ' 26 '⑩⑪＋§107 后 PS 侧行首探针语句数（第 31 探针快照 ACL 入列 25→26；新增探针须先重跑预演再改这里的数）'
-eq106 scripts/verify_deploy_guangzhou.sh 'amount-check' 3 '⑩ 现网只读抽检调用链（注释 2 处 + 实调用 1 处）'
+eq106 scripts/verify_deploy_guangzhou.sh 'amount-check' 4 '⑩ 现网只读抽检调用链（注释 2 处 + 实调用 2 处：§W7-D 起 daily 腿与 ths_daily 腿各一条，2026-10-09 同步 3→4）'
 # INFO 恒回显在位锁：绿也要看得到抽检读数（摘掉这条＝量纲只在红的时候才留痕，观察面退回自证）。
 # 与 §101 的 INFO|cal_readout / INFO|limitdown_readout 两把同姿势；摘掉即 §88 计数锁同时判红。
 has106 scripts/verify_deploy_guangzhou.sh 'INFO|amount_scale_readout' '⑩ 第 30 探针 INFO 恒回显腿在位'
@@ -5070,7 +5124,14 @@ leg106() { # $1=说明 $2=包 $3=-run 正则
 	echo "ok - §106 行为腿 $1"
 }
 # 三件套等值闸：路由表条目数 == DefaultAlertRules 条数（本批 15→18，§107 再 +1＝19，两侧同批动）
-leg106 'metrics 路由覆盖全规则（19 条）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
+# §W7-COUNT-SYNC（2026-10-09 波 7）：现**实数 20**（必推 12 / 日汇总 8，两个集合名字逐一对齐）。
+#   多出来的那一条是波 5 §P2-E 的 settlement_not_verified——它入表时只加了路由条目和规则注册，
+#   没动这里的文案，于是「（19 条）」在本批之前一直是**过时读数**（同 §0929「加腿没同步计数」家族）。
+#   取向：文案里的数字不是判据（判据是 TestRoutingCoversAllDefaultRules 里的等值比较，它按
+#   len(DefaultAlertRules()) 派生，加一条规则不需要改测试），所以这里只做**说明同步**；
+#   真正的锁面是 §114 里那枚「说明里的条数必须等于源码派生条数」的等值锁——下次再加规则却忘了
+#   同步文案时，红的是这枚锁而不是读者的眼睛。
+leg106 'metrics 路由覆盖全规则（20 条：必推 12 / 日汇总 8）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
 leg106 'engine 零信号心跳（判据/成对反证/非实盘不落笔/接线）' ./internal/engine/ \
 	'TestSignalHeartbeatAgePredicate|TestFeedSignalHeartbeatZeroAndPinnedPair|TestFeedSignalHeartbeatNonLiveDoesNotWrite|TestSignalHeartbeatRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
 leg106 'trading 已实现盈亏心跳（配对/孤儿卖出/非实盘不落笔/键名对齐）' ./internal/trading/ \
@@ -8914,6 +8975,993 @@ CNT113=$((CNT113 + 1))
 [ "$SUMH113" = "$((CNT113 - 1))" ] || { echo "--- FAIL: §113 分组求和自证锁 ${CNT113}（十组快照之和 ${SUMH113} != 累计判定点扣本锁 $((CNT113 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
 rm -rf "$W113"
 echo "ok - §113 全段通过：① 单实现扫描器与两消费者接线 ${H1_N} 道 + ② 扫描器读数逐键（N1/N2/P14/P15/M3/P1）${H2_N} 道 + ③ D1 通道两端接线 ${H3_N} 道 + ④ 涨跌令牌等值与着色单出口 ${H4_N} 道 + ⑤ 缺数渲染三态 ${H5_N} 道 + ⑥ 抽屉三层优先与冻结标注 ${H6_N} 道 + ⑦ 守卫接线与假绿形态负锁 ${H7_N} 道 + ⑧ 台账接入面派生对账（逐页 ${BANNER113} 枚）${H8_N} 道 + ⑨ 行为腿（派生清单 ${W6N113} 个文件 / ${W6T_N113} 条用例）${H9_N} 道 + ⑩ 镜像基线自证与 ${DYS113_N} 枚反证 V1–V${DYS113_N} ${H10_N} 道，累计判定点 ${CNT113}（其中十组快照之和 ${SUMH113}，另有 1 道就是求和自证锁本身）"
+echo ""
+
+echo "==> 114 §W7-A…§W7-G 波 7 低危卫生（2026-10-06 修复批）：窗口判据真接线、启动退出姿势、状态映射 fail-closed、量纲抽检两表分离、路由器落盘、守卫文案分诊、兜底可见——静态锁 + 五组行为腿 + 九枚镜像反证..."
+
+# 本段守波 7 的七条（10-06 修复批按 docs/FIX_PLAN_20261006.md 波 7 落码，10-09 收尾）。
+# 波 7 的标题是「低危卫生」，但它守的东西一类是**资金谓词**、一类是**承诺与实现分家**：
+#
+#  ① §W7-A trigger.Config.Sec 定义了、注释按它调、代码里没有窗口。旧 tickState 只存「上一帧」
+#     四个标量，所谓「窗口内秒均涨幅」实际是相邻两帧差分（5s 一帧，间隔 ≤60s 都照算——断流十分钟
+#     恢复后第一帧会把 600 秒摊成分母）。owner 裁决⑥按「实装优先禁删除」把 Sec 接进窗口计算，
+#     不是把注释改掉。本组的判据形状是「分母必须是窗口起点到当前帧的真实跨度」+「Sec 必须出现在
+#     剪窗表达式里」，并把旧形态（prevPrice / dt 分母）钉成负锁——注释里那句「窗口」如果代码没接，
+#     调 Sec 的人永远在调一个不存在的旋钮。
+#  ② §W7-B cmd/quant 的启动期 log.Fatalf 在 defer 链**之外**终结进程：§0927AUDIT-D4 已经把停机
+#     路径的 os.Exit(0) 换成「return → defer」，启动路径留着同一个洞（采集器/行情馈线/新闻代理的
+#     Stop、状态文件句柄 Close 全被跳过）。改法是把进程体搬进 run() int，main 只按退出码 os.Exit。
+#     fail-fast 语义一条没减（端口占用/staging 残留生产配置照拒），变的是退出姿势。判据取「代码行
+#     里 log.Fatalf 命中数为 0」——这三处 Fatalf 在说明注释里都还要出现（解释改了什么），
+#     拿全文 grep 数会红在自己的话术上，所以统一走 §113 那把 codeOnly 尺子（第三消费者）。
+#  ③ §W7-C 网关把「读不懂的委托状态码」统一伪造成「已报」。这不是保守而是伪造：已报在决策侧是
+#     三本资金账的**入口谓词**（买入冻结 / 跨日降废 / 在途卖量按精确中文串匹配），于是一条柜台从未
+#     确认的回报会先占住当日买入预算、再在跨日被写成终态「废单」。现改 fail-closed：未登记/缺失/
+#     非数字一律「未知(原始值)」，并计数落到处理器属性上、由 /admin/status 的 unknown_status 段回显
+#     （「未知…」不进资金账 ≠ 不用管，而是必须有人看见）。判据形状＝前缀常量的**单实现 + 三消费者**
+#     （映射、计数、观察位）等值，加一枚「旧 fail-open 那一行」的行尾锚负锁——它在 _status 的
+#     文档串里作为「缺陷原文」被引用，全文 grep 会把说明当实现（§107 预演实录同族）。
+#  ④ §W7-D ths_daily.amount 的口径此前由**互相矛盾的两处注释**担保（同一列一处写「换手率（%）」、
+#     一处写「成交额/换手率」），而同花顺日 K 导入把该列原样写进 amount。取向：注释矛盾时不能挑一个
+#     当事实，改由读数担保——抽检尺子从「只量 daily」抬成按 store.AmountProbedTables 量多表，
+#     与 daily 同一个判定体、同一组带宽；同时把它**挡在写侧换算白名单外**（data.AmountScaledTables
+#     只收上游单位核实过的表，THS 没有核实记录，把猜测的 ×1000 写进库里比矛盾注释更难回滚）。
+#     本组锁面因此是**两个集合的分离**：可抽检 ≠ 可自动换算；ths_daily 必须在抽检集合、必须在
+#     换算白名单之外。两条现网腿（第 30 探针 + 夜间 scale 腿）同步加宽到两张表，但**判数不动**
+#     （七腿齐备与 `PASS -lt 7` 由 §106 单实现守着，本段只断它没被抬成第 8 腿）。
+#  ⑤ §W7-E 告警路由器头注释一直写着「进程停机则重启后首个 tick 补发（按记录的日期标注）」，
+#     而 day/daily/pendingR/announced 四份状态全在内存——那句承诺是空的：停机跨过日切就把那一天
+#     永久吞掉；更糟的是 announced 丢了之后，重启再收到 recover 会被当「没报过」吞掉销案，
+#     那条 p1 从此只有开没有销。owner 裁决②要求做持久化。落点选择上偏离了修复单原文的
+#     「sqlite/opslog」：metrics 是被 notify 的兄弟层共用的度量面，引 store 会把指标评估焊死在
+#     推送/落库实现上（还带来 engine→metrics→store→engine 的注入环风险），故照 notify/outbox.go
+#     的同形姿势走 dataDir 下的 JSON + fileutil.AtomicWrite，失败可见只借 opslog 叶节点的 DayOnce。
+#     这一条最重要的判据是**注释-实现等值**：声称「重启后补发」的次数 ≥1 ⇒ 装配期必须有
+#     SetAlertRouterStatePath 的调用点（缺即红）。落盘写在 Route 内部而不是交给调用方「记得调」，
+#     且用整份快照的字节比较决定要不要写——脏标记要在四个变更点各记一次，漏一个就静默丢；
+#     文件 IO 一律在 mu 之外（多账号引擎共用这一个进程单例，落盘由 saveMu 串成单写者）。
+#  ⑥ §W7-F place_qmt_bridge 的「本机源文件必须与 HEAD 一致」守卫原先只看 `git diff --quiet` 的
+#     退出码非 0，把三种失效形态压成一句「有未提交改动」：0=无差异、1=确有改动、≥2=问不成，
+#     再加上「根本不是仓库」和「文件没进版本控制」两种特例。后果不是安全阀失效（三种都 exit 1），
+#     而是**读数撒谎**：git 坏掉的机器（safe.directory / index.lock 残留 / 拷树没 git init）会让人
+#     去提交一个并不存在的改动，而未纳管的文件在旧写法里 rc=0 直接放行——那才是这条守卫原本要挡的。
+#     判据取三态文案各恰一枚 + 前提判据早于派生判据的**顺序锁**（顺序倒过来＝拿问不成的读数当前提）。
+#  ⑦ §W7-G 持仓页实盘总盈亏在网关成交汇总未回来时按持仓浮动本地兜底。owner 裁决③：不删兜底，
+#     把口径说清 + 让兜底可见。身份判据必须与兜底分支**同一个条件**派生（两枚就会分家：数还是兜底
+#     数、标记却亮在权威值上），标记文案要点名两条口径之差（否则标记只是装饰，而这条缺陷的本体
+#     就是「看不出这是哪个口径」）。
+#
+#  ★ 本段与 §113 共用同一把剥注释尺子（scripts/fe_contract_scan.mjs 的 codeOnly），门禁内不出现
+#     第二把；Go/Python/JS 的「代码行 vs 说明文字」判据一律走它。
+#  ★ 反证九枚 V1–V9 全在 /tmp 镜像树上做（Go 树用软链 + 只把被改包实体化，Python/web 各建副本），
+#     镜像先做**基线自证**：五组测试在镜像里各自全绿——镜像不可信时，任何「破坏后变红」
+#     都不构成证据（§112/§113 同族）。每枚变异落地数必须恰好 1，归属串必须是基线里不存在的串，
+#     并断「本枚独有的那条用例红、别的那条仍绿」，否则一枚破坏会洗出九枚红、读不出归属。
+#
+#  English: §114 locks wave 7 (low-severity hygiene that touches money predicates). Sec now bounds a
+#  real window; startup aborts return an exit code so the defer chain unwinds; unreadable order status
+#  codes fail closed to 未知(raw) and become visible on /admin/status; the amount-caliber probe covers
+#  daily AND ths_daily while ths_daily stays outside the conversion whitelist; the alert router's
+#  "replay after restart" promise is backed by a journaled state rehydrated at assembly time; the
+#  bridge placement guard distinguishes "repo unreadable" from "real uncommitted changes"; the
+#  positions fallback announces its caliber. Nine /tmp-mirror reversals prove the locks bite.
+CNT114=0
+REPO114="$PWD"
+TRG114=internal/trigger/trigger.go
+TRGT114=internal/trigger/trigger_test.go
+MAIN114=cmd/quant/main.go
+STG114=cmd/quant/staging_test.go
+HND114=qmt_gateway/handler.py
+GWY114=qmt_gateway/gateway.py
+PYP114=qmt_gateway/tests/test_xt_mapping.py
+PBP114=internal/store/amount_scale_probe.go
+AML114=cmd/dataload/amount_check.go
+ASY114=cmd/dataload/hithink_sync.go
+ASW114=internal/data/amountscale.go
+ADP114=internal/data/hithink_dump.go
+VDP114=scripts/verify_deploy_guangzhou.sh
+VNG114=scripts/verify_nightly_guangzhou.sh
+RTG114=internal/metrics/alert_routing.go
+RST114=internal/metrics/alert_router_state.go
+RSTT114=internal/metrics/alert_router_state_test.go
+ART114=internal/metrics/alert_routing_test.go
+BRG114=scripts/place_qmt_bridge.sh
+POS114=web/src/pages/Positions.jsx
+PGT114=web/src/__tests__/w7g_positions_pnl_fallback.test.jsx
+GS114=scripts/verify_changes.sh
+W114="$(mktemp -d /tmp/w7gate-XXXXXX 2>/dev/null || true)"
+[ -n "$W114" ] || { echo "--- FAIL: §114 建不出镜像目录，五组行为腿与九枚反证无法跑（宁可红，不许跳）"; exit 1; }
+
+eq114() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT114=$((CNT114 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §114 整串等值锁 ${CNT114}（$4）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+neg114() { # $1=文件 $2=整串 $3=说明 → 彻底没有
+	CNT114=$((CNT114 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §114 负锁 ${CNT114}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+}
+re114() { # $1=文件 $2=ERE $3=预演 $4=说明 → 按「整行形状」数，用于缩进级语句形态锁
+	CNT114=$((CNT114 + 1))
+	local got
+	got=$(grep -cE -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §114 行形等值锁 ${CNT114}（$4）：${1} 行形「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+min114() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
+	CNT114=$((CNT114 + 1))
+	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §114 派生正锁 ${CNT114}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+}
+# code114：剥注释只此一把尺子（scripts/fe_contract_scan.mjs 的 codeOnly，§113 是它的第一个消费者，
+# 本段是第三个）。Go/Python/JSX 的「代码行 vs 说明文字」判据全部经它——波 7 的三处负锁
+# （log.Fatalf / prevPrice / m.get(...已报)）的靶串都同时出现在解释性注释里，
+# 拿原文数会红在话术上，或者反过来「删掉真代码、注释还写着」时恒绿。
+code114() { # $1=**仓库根相对**路径 → 纯代码文本
+	REL114="$1" node --input-type=module -e '
+const { codeOnly } = await import("./scripts/fe_contract_scan.mjs")
+const fs = await import("node:fs")
+const raw = fs.readFileSync(process.env.REL114, "utf8")
+const code = codeOnly(raw)
+if (code.length > raw.length) {
+  process.stderr.write("codeOnly-长过了原文：" + process.env.REL114 + "\n")
+  process.exit(3)
+}
+process.stdout.write(code)
+' 2>&1
+}
+codeline114() { # $1=rel $2=整串 → 该串在代码行里出现的行数（尺子坏了就报错，不静默回 0）
+	REL114="$1" PAT114="$2" node --input-type=module -e '
+const { codeOnly } = await import("./scripts/fe_contract_scan.mjs")
+const fs = await import("node:fs")
+const code = codeOnly(fs.readFileSync(process.env.REL114, "utf8"))
+const n = code.split("\n").filter((l) => l.includes(process.env.PAT114)).length
+process.stdout.write(String(n))
+' 2>&1
+}
+eqc114() { # $1=rel $2=整串 $3=预演 $4=说明 → 代码行等值
+	local got
+	got=$(codeline114 "$1" "$2")
+	CNT114=$((CNT114 + 1))
+	case "$got" in
+	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	esac
+	[ "$got" = "$3" ] || { echo "--- FAIL: §114 代码行等值锁 ${CNT114}（$4）：${1} 的代码行「${2}」got=${got} 预演=${3}"; exit 1; }
+}
+negc114() { # $1=rel $2=整串 $3=说明 → 代码行彻底没有
+	local got
+	got=$(codeline114 "$1" "$2")
+	CNT114=$((CNT114 + 1))
+	case "$got" in
+	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	esac
+	[ "$got" = "0" ] || { echo "--- FAIL: §114 代码行负锁 ${CNT114}（$3）：${1} 的代码行又出现「${2}」got=${got}"; exit 1; }
+}
+minc114() { # $1=rel $2=整串 $3=应≥ $4=说明 → 代码行命中下界（派生面缩水即红）
+	local got
+	got=$(codeline114 "$1" "$2")
+	CNT114=$((CNT114 + 1))
+	case "$got" in
+	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	esac
+	[ "${got:-0}" -ge "$3" ] || { echo "--- FAIL: §114 代码行派生正锁 ${CNT114}（$4）：${1} 的代码行「${2}」实得=${got:-0} 应≥${3}"; exit 1; }
+}
+# 尺子自身的夹具自检（两枚）：先证明 codeOnly 在本仓真跑得动、并且真的在剥注释。
+# 少了这两枚，「代码行 log.Fatalf=0」既可能是"改干净了"也可能是"尺子安静地没出数"。
+CNT114=$((CNT114 + 1))
+_CODE_OK=$(code114 "$MAIN114")
+printf '%s\n' "$_CODE_OK" | grep -qF -- 'func run() int' \
+	|| { echo "--- FAIL: §114 剥注释尺子在 cmd/quant/main.go 上读不到「func run() int」（尺子坏了，本段全部代码行锁的读数不可信）：$(printf '%s\n' "$_CODE_OK" | head -3)"; exit 1; }
+CNT114=$((CNT114 + 1))
+if printf '%s\n' "$_CODE_OK" | grep -qF -- 'log.Fatalf'; then
+	echo "--- FAIL: §114 尺子自检：main.go 的代码行里仍有 log.Fatalf（要么启动期又长出一条退出分支，要么 codeOnly 没剥掉注释而本段的负锁全是假的）"
+	exit 1
+fi
+PREV114=0
+J1_N=0; J2_N=0; J3_N=0; J4_N=0; J5_N=0; J6_N=0; J7_N=0; J8_N=0; J9_N=0; J10_N=0
+SNAP114() { # $1=组号 → 记下本组新增判定点数（收尾 ok 行的「① 组 N 道」由这里派生，不是手写清单）
+	printf -v "J$1_N" '%s' "$((CNT114 - PREV114))"
+	PREV114=$CNT114
+}
+
+# ── ① §W7-A trigger：Sec 真接进窗口，差分分母＝窗口跨度 ──
+eq114 "$TRG114" "st.win = append(st.win, sample{at: now, price: si.Price, amt: si.Amount, turn: si.Turnover})" 1 '采样入窗（每帧进窗口，不是只留上一帧）'
+eq114 "$TRG114" 'cutoff := now.Add(-time.Duration(e.cfg.Sec) * time.Second)' 1 '缺陷本体这条：Sec 必须出现在剪窗表达式里（旧形态下 Sec 只在默认值/兜底/启动日志三处，没人读它）'
+eq114 "$TRG114" 'if e.cfg.Sec > 0 && len(st.win) > 2 {' 1 '剪窗下限守卫：至少留两帧（剪成一帧＝退回「永不判定」，把"定义未接"换成"定义把判定打死"同样不可接受）'
+eq114 "$TRG114" 'base := st.win[0]' 1 '差分基准＝窗口起点'
+eq114 "$TRG114" 'elapsed := now.Sub(base.at).Seconds()' 1 '分母＝窗口起点到当前帧的真实跨度（不是相邻两帧的间隔）'
+neg114 "$TRG114" 'st.prevPrice' '旧的「上一帧」四标量禁止复活（复活＝Sec 又变回没人读的数字）'
+neg114 "$TRG114" 'dt := now.Sub(st.lastAt).Seconds()' '旧的相邻帧间隔当分母（断流十分钟后恢复，第一帧会把 600 秒摊成「秒均」）'
+eq114 "$TRG114" 'if gap := now.Sub(st.lastAt).Seconds(); gap <= 0 || gap > 60 {' 1 '断流判定现在只负责整窗重置，不再决定分母'
+eq114 "$TRG114" 'func (e *Engine) windowSpan(code string) float64 {' 1 '窗口跨度的自证出口（测试按它断「跨度≤Sec」，不靠返回值猜窗口）'
+minc114 "$TRG114" 'cfg.Sec' 2 'Sec 的代码行消费点至少两处（剪窗 + 兜底/默认值参与计算；只剩一处＝接线被摘，本组头三条会一起红）'
+eqc114 "$TRGT114" 'e.windowSpan(' 4 '四条用例真读了自证出口（0＝用例改成只看返回值，窗口跨度就没人断）'
+eq114 "$TRGT114" 'func TestWindowBoundedBySec(t *testing.T) {' 1 'Sec 界定窗口的正腿'
+eq114 "$TRGT114" 'func TestWiderSecKeepsOlderBase(t *testing.T) {' 1 '反向腿：Sec 调大要留更旧的基准（只有一条腿时，"永远剪到两帧"也能绿）'
+eq114 "$TRGT114" 'func TestGapResetsWindow(t *testing.T) {' 1 '断流整窗重置'
+eq114 "$TRGT114" 'func TestNegativeCumulativeResetsWindow(t *testing.T) {' 1 '累计量倒退（数据源回补/重排）整窗重置——负差分摊成「秒均」是另一种伪造'
+SNAP114 1
+
+# ── ② §W7-B cmd/quant：启动期 fail-fast 也走 defer 收尾链 ──
+eq114 "$MAIN114" 'if code := run(); code != 0 {' 1 'main 只剩进程外壳：退出码交给 os.Exit，收尾交给 run 的 defer 链'
+eq114 "$MAIN114" 'func run() int {' 1 '进程体在 run 里（写在 main 里就没法 return）'
+eqc114 "$MAIN114" 'log.Fatalf' 0 '代码行里一条启动期 Fatalf 都不许留（§0927AUDIT-D4 修了停机路径，本条补启动路径；这三处 Fatalf 仍出现在说明注释里，所以判据必须在代码行上）'
+eqc114 "$MAIN114" 'return 1' 3 '启动期 fail-fast 三处 return 1（认证库初始化 / staging 守卫 / 端口占用）——少于 3＝某条 fail-fast 被软化成"继续启动"'
+eqc114 "$MAIN114" 'return 0' 1 '正常路径 return 0（两条路共用同一段 defer 收尾，退出码只决定外壳要不要 os.Exit）'
+eq114 "$MAIN114" 'func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) error {' 1 '自检函数改为交 error（原来直接 Fatalf，调用点看不见拒绝原因）'
+eq114 "$MAIN114" 'if err := verifyDeployment(cfgMgr, authMgr); err != nil {' 1 '调用点接住拒绝并 return 1（定义没接＝§DEADGAUGE「定义未接」同族）'
+# 「裸调用禁止复活」由两枚代码行计数合起来守：整串 verifyDeployment(cfgMgr, authMgr) 在代码行里
+# 恰一枚，而这一枚就是接 error 的那枚 ⇒ 不可能再有第三处丢弃返回值的调用形态。
+# （不用带换行的整串负锁：那会把「grep 命中 0」和「文件读不到」混成同一个绿，set -e 下还只报个行号）
+eqc114 "$MAIN114" 'verifyDeployment(cfgMgr, authMgr)' 1 '调用点总数恰一枚（多于 1＝又长出一处不接返回值的调用）'
+eq114 "$STG114" 'func TestStagingFailFastRefusesRealGateway(t *testing.T) {' 1 'staging 拒绝语义的正腿（裁决⑥/§WS-G 的语义没动，只改退出姿势）'
+eq114 "$STG114" 'func TestNonStagingNeverRefused(t *testing.T) {' 1 '反向腿：非 staging 不许被这条守卫拒掉（否则"修好 defer 链"会把生产进程改成起不来）'
+eq114 "$STG114" 'func TestStagingAllowedWhenDisabled(t *testing.T) {' 1 'staging 且 enabled=false 必须放行（守卫射程的第三条边界）'
+SNAP114 2
+
+# ── ③ §W7-C 网关状态映射：fail-closed + 三消费者共用一个前缀 + 观察位 ──
+eq114 "$HND114" 'UNKNOWN_STATUS_PREFIX = "未知"' 1 '前缀单实现（映射、计数、观察位三处判的是同一个串，写三遍字面「未知」的结局是改一处漏两处）'
+eq114 "$HND114" 'XT_STATUS_CODES = {' 1 '状态码登记表提到模块级（测试与映射共用一份）'
+eq114 "$HND114" 'if status.startswith(UNKNOWN_STATUS_PREFIX):' 1 '消费者一：映射失败在 on_stock_order 上计数（不只是写进日志等人翻）'
+eq114 "$HND114" 'return "%s(缺失)" % UNKNOWN_STATUS_PREFIX' 1 '属性缺失/空串的落点——旧实现正是从这里滑进「已报」（getattr 缺省就是空串）'
+eq114 "$HND114" 'return "%s(%s)" % (UNKNOWN_STATUS_PREFIX, raw)' 2 '未登记码与非数字码两条落点（原始值留在串里，现网才知道该补哪个码）'
+re114 "$HND114" '^[[:space:]]*return m\.get\(' 0 '旧 fail-open 那一行禁止复活（按整行形状数而不是裸短语：文档串里两处「缺陷原文」引用了同一段代码，全文 grep 会把说明当实现，反过来删掉引用又会让这条锁恒绿）'
+eq114 "$GWY114" 'payload["unknown_status"] = {' 1 '消费者三：/admin/status 的观察位（「未知…」不进三本资金账，total>0 是"柜台有一种我们读不懂的状态码"的唯一现网信号）'
+eq114 "$GWY114" '"total": int(getattr(self.handler, "unknown_status_total", 0) or 0)' 1 '观察位读的就是计数属性（键名与 handler 属性等值，分家时现网读数恒 0）'
+eq114 "$GWY114" '"last": str(getattr(self.handler, "last_unknown_status", "") or "")' 1 '最后一次原始值（补表要看它）'
+eq114 "$PYP114" 'def test_unknown_never_impersonates_known(self):' 1 '主断言：读不懂的码不得冒充任何已知态'
+eq114 "$PYP114" 'known = set(handler_mod.XT_STATUS_CODES.values())' 1 '已知态集合从模块派生（写死一份清单的话，表里加了码测试照样绿）'
+eq114 "$PYP114" 'self.assertEqual(set(cases.keys()), set(handler_mod.XT_STATUS_CODES.keys()),' 1 '等值锁非单向锁：字面真值与运行时表双向对账（只逐码断言时，表里**多**一个码没人看得见）'
+eq114 "$PYP114" 'def test_known_codes_do_not_count(self):' 1 '反向腿：已登记码（含 50「已报」真值）不得计数，否则现网正常单把告警刷满'
+eq114 "$PYP114" 'def test_broker_unknown_255_counts(self):' 1 '柜台自带的 255「未知」同样计数——它与映射失败的处置一样：不进三本账、必须有人看'
+SNAP114 3
+
+# ── ④ §W7-D 量纲：一把尺子量两张表，两个集合各管各的 ──
+eq114 "$PBP114" 'var AmountProbedTables = map[string]float64{' 1 '抽检集合单实现（键同时是 SQL 标识符白名单，表名不许外部传串清洗）'
+PROBED114=$(grep -cE '^\s+"[a-z0-9_]+": +100\.0,$' "$PBP114" || true)
+min114 '抽检集合条目数派生异常（读到 0＝正则坏了，本组下面几枚等值全部不可信）' "$PROBED114" 2
+eq114 "$ASW114" 'var AmountScaledTables = map[string]bool{' 1 '写侧换算白名单仍是那份（§0929SCALE-⑩ 的产物，本批没动它的内容）'
+neg114 "$ASW114" '"ths_daily": true,' 'ths_daily 不许进换算白名单：THS 侧没有单位核实记录，把猜测的 ×1000 写进库里比矛盾注释更难回滚（可抽检 ≠ 可自动换算，这正是两个集合分开放的理由）'
+eq114 "$PBP114" 'func (d *DB) ProbeAmountScale(table, date string, maxRows int) (AmountScaleProbe, error) {' 1 '判定体单实现（daily 与 ths_daily 共用一把尺子）'
+eq114 "$PBP114" 'return d.ProbeAmountScale("daily", date, maxRows)' 1 '旧的 ProbeDailyAmountScale 退成薄封装（三个既有消费者零改动），而不是留第二份判定体'
+eq114 "$PBP114" 'sharesPerUnit, ok := AmountProbedTables[table]' 1 '倍率只从集合取（第二处判表名＝白名单形同虚设）'
+eq114 "$AML114" 'func checkAmountScaleOn(db *store.DB, table string) {' 1 '两条装载自检的唯一实现（两份的结局是修一处漏一处）'
+eq114 "$AML114" 'func checkLoadedAmountScale(db *store.DB) { checkAmountScaleOn(db, "daily") }' 1 '日线装载腿'
+eq114 "$AML114" 'func checkThsAmountScale(db *store.DB) { checkAmountScaleOn(db, "ths_daily") }' 1 '同花顺日 K 腿（本批新增的读数面）'
+eq114 "$ASY114" 'checkThsAmountScale(db)' 1 '导入收尾真的调它（定义没接＝ths_daily 的口径仍然只有注释在担保）'
+eq114 "$AML114" 'table := fs.String("table", "daily"' 1 '--table 缺省 daily：第 30 探针与夜间腿的既有调用形态零改动'
+eq114 "$AML114" 'p, err := db.ProbeAmountScale(*table, *date, *rows)' 1 '独立腿按 --table 拨抽检（非法表名由 ProbeAmountScale 报错→退 2，不冒充"库里量纲错了"的 1）'
+eq114 "$ASY114" 'Amount: row.Turnover,' 1 '写侧姿势：turnover 列原样落 amount，一条换算都没有（改了这条就要同时动本组上面那枚白名单负锁）'
+neg114 "$ADP114" 'Turnover   float64 // 换手率（%）' '矛盾的旧注释（字段行形态）禁止复活；说明注释里引用它作为"曾经的两种口径之一"，所以判据锚在字段定义行上而不是裸短语'
+neg114 "$ADP114" 'parquet:"turnover"`    // 成交额/换手率' '「两个语义挤在一行」那种注释形态禁止复活（它就是本条缺陷的成因）'
+eq114 "$VDP114" '--table" "ths_daily' 1 '第 30 探针加宽到第二张表'
+eq114 "$VNG114" '--table" "ths_daily' 1 '夜间 scale 腿同样加宽（两侧不一起动，现网就只有一张表有读数）'
+eq114 "$VDP114" '$scaleBad = (($scaleRc -ne 0) -or ($scaleThsRc -ne 0))' 1 '两腿任一红才算红（写成 -and 就是把"其中一张表量纲错了"洗成绿）'
+eq114 "$VNG114" '$scaleBad = (($scaleRc -ne 0) -or ($scaleThsRc -ne 0))' 1 '同上，夜间腿同形'
+eq114 "$VDP114" '$scaleThsRc = 2' 2 '执行体缺席时两个 rc 都要落 2（只落一个，另一条会以 rc=-1「从未执行」的形态进读数＝半态被读成成功）'
+eq114 "$VNG114" '$scaleThsRc = 2' 2 '同上'
+# 判数没有被这条加宽带跑：七腿齐备与 `PASS -lt 7` 的实现归 §106（本段只断「没被抬成第 8 腿」，
+# 第二处阈值实现在这里长出来，下次改判数就只改得动一份）。
+neg114 "$VNG114" 'PASS -lt 8' '夜间判数不许被这张新表抬成 8（一腿两表≠两腿；§106 的七腿齐备锁是单实现）'
+SNAP114 4
+
+# ── ⑤ §W7-E 告警路由状态落盘：注释-实现等值 + 单写者 + 忘不掉的持久化 ──
+CNT114=$((CNT114 + 1))
+[ -f "$RST114" ] || { echo "--- FAIL: §114 路由器 journal 实现在 $RST114 之外不存在（本组与行为腿全部落空）"; exit 1; }
+eq114 "$RTG114" '重启后首个 tick 补发' 1 '头注释仍写着这句承诺（这条锁的意义是让"删掉句子来绕开等值锁"不成立：删了它等于删了需求）'
+WIRE114=$(codeline114 "$MAIN114" 'metrics.SetAlertRouterStatePath(')
+CNT114=$((CNT114 + 1))
+if [ "${WIRE114:-0}" -ne 1 ]; then
+	echo "--- FAIL: §114 注释-实现等值锁 ${CNT114}：alert_routing.go 声称「重启后首个 tick 补发」（命中 ${WIRE114:-0} 处该接线），而 cmd/quant/main.go 的代码行里 SetAlertRouterStatePath 调用点=${WIRE114:-0}，应为 1——承诺没有实现（§W7-E 本体的原形态就是这句假话）"
+	exit 1
+fi
+eqc114 "$MAIN114" 'alert_router_state.json' 1 'journal 落在 dataDir 下且只有一处名字来源（与 notify_outbox.json 同一姿势）'
+eq114 "$RST114" 'func SetAlertRouterStatePath(path string) { globalAlertRouter.setStatePath(path) }' 1 '装配期入口（灌的是进程单例，不是某个引擎实例）'
+eq114 "$RST114" 'func (r *alertRouter) restoreLocked(snap AlertRouterState) bool' 1 '回灌单实现'
+eq114 "$RST114" 'func (r *alertRouter) snapshotLocked() AlertRouterState' 1 '快照单实现'
+eq114 "$RST114" 'func (r *alertRouter) writeState(path string, snap AlertRouterState) {' 1 '落盘单实现（除 Route 内没有第二个调用姿势可写）'
+eq114 "$RST114" 'if bytes.Equal(r.lastWritten, data) {' 1 '整份快照字节比较（脏标记要在四个变更点各记一次，漏一个就静默丢；比较序列化结果忘不掉）'
+eq114 "$RST114" 'fileutil.AtomicWrite(path, data, 0o600)' 1 '原子写 + 0600（journal 里是告警内容，不是公开读数）'
+eq114 "$RST114" 'r.saveMu.Lock()' 1 '落盘串行闸：多账号引擎共用这一个进程单例，同一份 journal 只有一个写者在前'
+eq114 "$RST114" 'defer r.saveMu.Unlock()' 1 '与上一枚成对（只 Lock 不 Unlock 时，第一次落盘失败会把后续全部冻死）'
+eq114 "$RST114" 'alertRouterStateVersion = 1' 1 '格式版本：版本不符退回空态，不猜旧格式的含义'
+eq114 "$RST114" 'opslog.DayOnce("alert-router-state-persist-fail"' 1 '落盘失败可见：首报 + 每 10 次一报 + 每日一条升级留痕（静默丢失正是本批要消灭的东西）'
+for k in '"day"' '"daily"' '"announced"' '"pending_resolve"' '"last_fire"' '"suppressed"'; do
+	eq114 "$RST114" "json:${k}" 1 "四组跨重启状态之一 ${k}（少一组＝那一组事实重启后仍是内存态）"
+done
+eq114 "$RTG114" 'out := r.routeEventsLocked(events)' 1 'Route 内部：判路由'
+eq114 "$RTG114" 'snap := r.snapshotLocked()' 1 'Route 内部：取快照（持久化写在 Route 里，不靠调用方"记得调"——依赖调用方就是 §高-3 当年「评估了但没出口」的同族）'
+eq114 "$RTG114" 'r.writeState(path, snap)' 1 'Route 内部：落盘'
+# 顺序锁：文件 IO 必须在 mu 之外（mu 还被首轮评估的 Warn 与只读读数共用，持锁写盘＝把网络/磁盘
+# 抖动带进锁；倒序就是"在 mu 内写文件"，只看赋值点字符串的锁看不见这件事）。
+LN_UNLOCK114=$(grep -n 'r.mu.Unlock()' "$RTG114" | head -1 | cut -d: -f1 || true)
+LN_WRITE114=$(grep -n 'r.writeState(path, snap)' "$RTG114" | head -1 | cut -d: -f1 || true)
+CNT114=$((CNT114 + 1))
+if ! { [ -n "$LN_UNLOCK114" ] && [ -n "$LN_WRITE114" ]; }; then
+	echo "--- FAIL: §114 顺序锁取不到行号（unlock=${LN_UNLOCK114:-空} write=${LN_WRITE114:-空}）：锚点被改名，「文件 IO 在 mu 外」这条纪律没人在守"
+	exit 1
+fi
+CNT114=$((CNT114 + 1))
+[ "$LN_UNLOCK114" -lt "$LN_WRITE114" ] \
+	|| { echo "--- FAIL: §114 顺序锁 ${CNT114}：${RTG114} 里 r.mu.Unlock()（第 ${LN_UNLOCK114} 行）没有早于 writeState（第 ${LN_WRITE114}  行）——文件 IO 回到持锁区，磁盘抖动会卡住整个路由面"; exit 1; }
+# 依赖方向纪律：本包仍不 import store / notify / engine（偏离修复单「sqlite」的代价就是这条必须钉住，
+# 否则"小状态"会一路长成"指标面包住落库与推送"）。
+neg114 "$RST114" '"quant-trading-v2/internal/store"' 'metrics 不引 store（引了就把指标评估焊在落库实现上，还带来注入环）'
+neg114 "$RST114" '"quant-trading-v2/internal/notify"' 'metrics 不引 notify（双发事故同族）'
+neg114 "$RST114" '"quant-trading-v2/internal/engine"' 'metrics 不引 engine（engine→metrics→engine）'
+eq114 "$RST114" '"quant-trading-v2/internal/fileutil"' 1 '只借叶节点：原子写'
+eq114 "$RST114" '"quant-trading-v2/internal/opslog"' 1 '只借叶节点：失败可见'
+eq114 "$RSTT114" 'func TestDailySummarySurvivesRestart(t *testing.T) {' 1 'P26 跨日 + 重启补发前一日汇总'
+eq114 "$RSTT114" 'func TestPendingResolveSurvivesRestart(t *testing.T) {' 1 'P27 待补发销案跨重启'
+eq114 "$RSTT114" 'func TestAnnouncedSurvivesRestart(t *testing.T) {' 1 'P27b 已报未销标记跨重启（丢了它＝只报不销）'
+eq114 "$RSTT114" 'func TestSameDayRestartKeepsAccumulating(t *testing.T) {' 1 '同日重启不产生幽灵汇总'
+eq114 "$RSTT114" 'func TestCorruptAndVersionMismatchFallBackEmpty(t *testing.T) {' 1 '损坏/版本不符退回空态并说清'
+eq114 "$RSTT114" 'func TestWriteSkippedOnlyWhenUnchanged(t *testing.T) {' 1 '内容未变跳写（字节比较那一枚的行为腿）'
+eq114 "$RSTT114" 'func TestProductionEntryPathHydratesGlobal(t *testing.T) {' 1 '生产入口真走到 SetAlertRouterStatePath（只测内部函数＝装配那行没接也绿）'
+SNAP114 5
+
+# ── ⑥ §W7-F 落位守卫的三态分诊 + 先后顺序 ──
+eq114 "$BRG114" 'REPO_Q="$(git rev-parse --is-inside-work-tree 2>&1)" || REPO_RC=$?' 1 '前提判据：先问"这台机器是不是仓库"（不问就派生 HEAD，拿到的是 unknown 还当读数用）'
+eq114 "$BRG114" 'REPO_RC="${REPO_RC:-0}"' 1 'set -u 下的退出码兜底（不兜底时"仓库可查"这条路径会 unbound 中止，报错位置离成因很远）'
+eq114 "$BRG114" 'X 仓库不可查' 3 '三态里"问不成"那一态的三条文案：不是仓库 / 没进版本控制 / git 自己出错（旧写法把三类压成一句"有未提交改动"，读数撒方向）'
+eq114 "$BRG114" '没进版本控制，HEAD 里没有这一版可比' 1 '未纳管这一支：旧守卫对它 rc=0 直接放行，等于把无 HEAD 可对齐的半成品贴进 QMT 策略目录'
+eq114 "$BRG114" '>=2 表示 git 自己出错而不是有改动' 1 '把 ≥2 与 1 分开的那句（不写清时，值班的人会把 git 坏了读成"该提交改动"）'
+eq114 "$BRG114" '确有未提交改动（工作区 rc=' 1 '只有这一支才给改动清单'
+eq114 "$BRG114" 'git diff --quiet -- "$BRIDGE_SRC"' 1 '工作区问一次'
+eq114 "$BRG114" 'git diff --cached --quiet -- "$BRIDGE_SRC"' 1 '暂存区再问一次（只看工作区时，已 add 未 commit 的改动会被判成干净）'
+LN_REPO114=$(grep -n 'is-inside-work-tree' "$BRG114" | head -1 | cut -d: -f1 || true)
+LN_DIFF114=$(grep -n '^DIFF_RC=0' "$BRG114" | head -1 | cut -d: -f1 || true)
+LN_SSH114=$(grep -n 'if ! \$SSH ' "$BRG114" | head -1 | cut -d: -f1 || true)
+CNT114=$((CNT114 + 1))
+if [ -z "$LN_REPO114" ] || [ -z "$LN_DIFF114" ] || [ -z "$LN_SSH114" ]; then
+	echo "--- FAIL: §114 守卫顺序锁 ${CNT114} 取不到行号（仓库=${LN_REPO114:-空} 差异=${LN_DIFF114:-空} 首次外呼=${LN_SSH114:-空}）：三段锚点少一段就是守卫被拆"
+	exit 1
+fi
+CNT114=$((CNT114 + 1))
+if ! { [ "$LN_REPO114" -lt "$LN_DIFF114" ] && [ "$LN_DIFF114" -lt "$LN_SSH114" ]; }; then
+	echo "--- FAIL: §114 守卫顺序锁 ${CNT114}：顺序不是「问仓库(${LN_REPO114}) → 问差异(${LN_DIFF114}) → 才外呼(${LN_SSH114})」——先外呼再分诊＝守卫只对已经动过生产的那次运行负责"
+	exit 1
+fi
+SNAP114 6
+
+# ── ⑦ §W7-G 持仓页兜底可见（代码行尺子；说明注释里也写了这些锚点）──
+eqc114 "$POS114" '(price - (p.cost_price || 0)) * (p.qty || 0)' 1 '本地兜底那条重算腿还在（owner 裁决③明令不删：删了＝改变现网显示行为）'
+eqc114 "$POS114" 'const pnlFallback = useMemo(' 1 '兜底身份只有一枚派生（与兜底分支同一条件；两枚＝数与标记各说一套）'
+eqc114 "$POS114" '{pnlFallback && (' 1 '标记渲染恰一处'
+eqc114 "$POS114" '本地兜底' 1 '标记文案恰一枚（多一枚＝另有一处兜底读数没进本锁）'
+eqc114 "$POS114" 'data-testid="real-pnl-fallback"' 1 '标记锚点（改名＝vitest 与 Playwright 双双失明）'
+eqc114 "$POS114" 'data-testid="real-pnl-value"' 1 '数值锚点'
+eqc114 "$POS114" 'title="这个数是前端' 1 '悬停说明必须点名两条口径之差（不写清时标记只是装饰，而缺陷本体就是"看不出这是哪个口径"）'
+eqc114 "$PGT114" "it('G" 4 '四条行为腿都在（G1 兜底亮 / G2 权威值到就摘标 / G3 无实盘数据不亮 / G4 结构锁）'
+SNAP114 7
+
+# ── ⑧ §W7-COUNT-SYNC 说明条数＝源码派生条数（本批踩过的那类：加一条规则只改代码不改文案）──
+N_RULES114=$(grep -cE '^\s+\{Name: "[a-z0-9_]+", Metric:' internal/metrics/alerter.go || true)
+N_PUSH114=$(grep -cE '^\s+"[a-z0-9_]+": +RoutePush,' "$RTG114" || true)
+N_DAILY114=$(grep -cE '^\s+"[a-z0-9_]+": +RouteDaily,' "$RTG114" || true)
+min114 '规则条数派生异常（读到 0＝正则坏了，本组四枚等值全部是拿 0 比 0 的假绿）' "$N_RULES114" 20
+min114 '必推条数派生异常' "$N_PUSH114" 12
+min114 '日汇总条数派生异常' "$N_DAILY114" 8
+CNT114=$((CNT114 + 1))
+[ "$((N_PUSH114 + N_DAILY114))" = "$N_RULES114" ] \
+	|| { echo "--- FAIL: §114 分桶闭合锁 ${CNT114}：路由表派生 ${N_PUSH114}+${N_DAILY114}=$((N_PUSH114 + N_DAILY114)) != 规则派生 ${N_RULES114}（漏路由条目会掉进 DefaultRoute，等值测试也拦不住"谁都没点名"这种形态）"; exit 1; }
+eq114 internal/metrics/alert_routing.go "全部规则（现 ${N_RULES114} 条：" 1 '源码头注释的条数＝派生真值'
+eq114 "$MAIN114" "现 ${N_RULES114} 条规则全覆盖：必推 ${N_PUSH114} 条 /" 1 '装配注释的必推数＝派生真值'
+eq114 "$MAIN114" "日汇总 ${N_DAILY114} 条，2026-10-09 波 7 按脚本实数同步" 1 '装配注释的日汇总数＝派生真值'
+eq114 "$GS114" "（${N_RULES114} 条：必推 ${N_PUSH114} / 日汇总 ${N_DAILY114}）" 1 '门禁 §106 行为腿文案＝派生真值（本批开工前这里写的是 19：波 5 加了第 20 条没同步，同 §0929「加腿没同步计数」家族）'
+# 负锁取「行形」而不是旧串逐字：本段就写在门禁文件里，把旧文案整串抄进 neg114 的 needle，
+# 这条锁会永远红在自己身上（got=1 来自下一行 itself），而「删掉真代码留着注释」那种复活反而看不见。
+# 行形 `^leg106 '…（N 条）'`（只报一个光秃条数、没有分桶）本身就是过时形态——交付形态恒带派生分桶。
+re114 "$GS114" "^leg106 'metrics 路由覆盖全规则（[0-9]+ 条）'" 0 '旧文案（光秃条数、无分桶）禁止复活（复活＝说明与实现又分家，而这正是上面四枚等值锁要拦的形态）'
+SNAP114 8
+
+# ── ⑨ 行为腿：五组用例先跑真仓（各包/各栈一条，红项带全文回显）──
+go_leg114() { # $1=说明 $2=包 $3=-run 正则
+	CNT114=$((CNT114 + 1))
+	local out
+	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
+	if printf '%s\n' "$out" | grep -qE '^(--- FAIL|FAIL)'; then
+		echo "--- FAIL: §114 行为腿判红（$1），全文如下："
+		printf '%s\n' "$out" | head -40
+		exit 1
+	fi
+	CNT114=$((CNT114 + 1))
+	printf '%s\n' "$out" | grep -qE '^ok' \
+		|| { echo "--- FAIL: §114 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）：$(printf '%s\n' "$out" | head -8)"; exit 1; }
+	echo "ok - §114 行为腿 $1"
+}
+go_leg114 'trigger 窗口族（Sec 界定/反向/断流/负差分）' ./internal/trigger/ 'TestAdvanceWindow|TestWindowBoundedBySec|TestWiderSecKeepsOlderBase|TestGapResetsWindow|TestNegativeCumulativeResetsWindow'
+go_leg114 'cmd/quant 启动守卫族（staging 拒/放行/非 staging 不误伤）' ./cmd/quant/ 'TestStagingFailFastRefusesRealGateway|TestStagingAllowedWhenDisabled|TestNonStagingNeverRefused|TestGetDataDirStagingForced|TestGetDataDirNormalEnv'
+go_leg114 'metrics 路由器 journal 族（P26/P27/P27b + 假绿反证 + 生产入口）' ./internal/metrics/ 'TestDailySummarySurvivesRestart|TestPendingResolveSurvivesRestart|TestAnnouncedSurvivesRestart|TestSameDayRestartKeepsAccumulating|TestCorruptAndVersionMismatchFallBackEmpty|TestWriteSkippedOnlyWhenUnchanged|TestProductionEntryPathHydratesGlobal'
+PY_LEG114=$(cd qmt_gateway && python3 -m pytest -q tests/test_xt_mapping.py 2>&1 || true)
+N_PYTEST114=$(printf '%s\n' "$PY_LEG114" | grep -E '[0-9]+ passed' | head -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
+CNT114=$((CNT114 + 1))
+if printf '%s\n' "$PY_LEG114" | grep -qE ' failed|error'; then
+	echo "--- FAIL: §114 网关映射行为腿判红："
+	printf '%s\n' "$PY_LEG114" | tail -30
+	exit 1
+fi
+N_DEFTEST114=$(grep -cE '^\s+def test_' "$PYP114" || true)
+CNT114=$((CNT114 + 1))
+[ "${N_PYTEST114:-0}" = "${N_DEFTEST114:-0}" ] \
+	|| { echo "--- FAIL: §114 pytest 实跑与派生清单不等值（实跑 ${N_PYTEST114:-0} 条 / 文件里 ${N_DEFTEST114:-0} 个 test 定义）：多半是收集阶段就报错或被 skip，等于这条腿根本没跑"; exit 1; }
+min114 'pytest 用例数下限（波 7 后本文件应有 ≥18 条：映射 4 + 计数可见 5 + 既有 side/signal 9）' "${N_PYTEST114:-0}" 18
+VT_LEG114=$( cd web && NO_COLOR=1 npm test -- w7g_positions_pnl_fallback 2>&1 || true )
+N_VT114=$(printf '%s\n' "$VT_LEG114" | grep -E 'Tests +[0-9]+ passed' | head -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
+CNT114=$((CNT114 + 1))
+if printf '%s\n' "$VT_LEG114" | grep -qE ' failed'; then
+	echo "--- FAIL: §114 持仓页兜底行为腿判红："
+	printf '%s\n' "$VT_LEG114" | grep -E 'FAIL|AssertionError|Unable to find' | head -20
+	exit 1
+fi
+CNT114=$((CNT114 + 1))
+[ "${N_VT114:-0}" = "4" ] \
+	|| { echo "--- FAIL: §114 vitest 实跑不是「4 条用例」（读到 ${N_VT114:-空}）：G1–G4 少一条就是这条锁面的行为腿有洞"; exit 1; }
+echo "ok - §114 行为腿：Go 三组 + pytest ${N_PYTEST114} 条 + vitest ${N_VT114} 条全绿"
+SNAP114 9
+
+# ── ⑩ 镜像反证：/tmp 副本树（源文件零改动），先自证镜像基线全绿 ──
+GOMIR114="$W114/gomirror"
+PYMIR114="$W114/qmt_gateway"
+WEBMIR114="$W114/web"
+mkdir -p "$GOMIR114/internal" "$GOMIR114/cmd" "$WEBMIR114" \
+	|| { echo "--- FAIL: §114 镜像骨架建不出来（反证没有落点，宁可红不许跳）"; exit 1; }
+for _e in "$REPO114"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	internal | cmd) continue ;;
+	esac
+	ln -s "$_e" "$GOMIR114/$_b" || { echo "--- FAIL: §114 镜像软链 ${_b} 失败"; exit 1; }
+done
+for _e in "$REPO114"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	trigger | metrics) continue ;;
+	esac
+	ln -s "$_e" "$GOMIR114/internal/$_b" || { echo "--- FAIL: §114 镜像软链 internal/${_b} 失败"; exit 1; }
+done
+for _e in "$REPO114"/cmd/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	quant) continue ;;
+	esac
+	ln -s "$_e" "$GOMIR114/cmd/$_b" || { echo "--- FAIL: §114 镜像软链 cmd/${_b} 失败"; exit 1; }
+done
+cp -R "$REPO114/internal/trigger" "$GOMIR114/internal/trigger" || { echo "--- FAIL: §114 镜像实体化 internal/trigger 失败"; exit 1; }
+cp -R "$REPO114/internal/metrics" "$GOMIR114/internal/metrics" || { echo "--- FAIL: §114 镜像实体化 internal/metrics 失败"; exit 1; }
+cp -R "$REPO114/cmd/quant" "$GOMIR114/cmd/quant" || { echo "--- FAIL: §114 镜像实体化 cmd/quant 失败"; exit 1; }
+# Python 侧只取被测模块与用例目录：config*.json / *.db / 日志一律不进镜像
+# （反证不需要凭据，把凭据复制到 /tmp 只是多一处泄漏面——§105 家族纪律）。
+mkdir -p "$PYMIR114" || { echo "--- FAIL: §114 Python 镜像目录建不出来"; exit 1; }
+for _e in "$REPO114"/qmt_gateway/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	tests) cp -R "$_e" "$PYMIR114/" ;;
+	__pycache__ | .pytest_cache | *.db | *.log | outbox*) : ;;
+	config*) : ;;
+	*) cp -R "$_e" "$PYMIR114/" ;;
+	esac
+done
+for _e in "$REPO114"/web/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	node_modules | dist | test-results | .auth) continue ;;
+	esac
+	cp -R "$_e" "$WEBMIR114/" || { echo "--- FAIL: §114 镜像复制 web/$_b 失败"; exit 1; }
+done
+mkdir -p "$WEBMIR114/node_modules" || { echo "--- FAIL: §114 镜像 node_modules 目录建不出来"; exit 1; }
+for _e in "$REPO114"/web/node_modules/* "$REPO114"/web/node_modules/.[!.]*; do
+	[ -e "$_e" ] || continue
+	_b=$(basename "$_e")
+	case "$_b" in
+	.vite) continue ;;
+	esac
+	ln -s "$_e" "$WEBMIR114/node_modules/$_b" || { echo "--- FAIL: §114 镜像软链 node_modules/${_b} 失败"; exit 1; }
+done
+cat > "$W114/mutate.py" <<'PYMUT114'
+import sys
+# 用法：mutate.py <绝对文件> <old> <new> —— 整串替换并打印落地次数（不是 1 由调用方判红）。
+# 一律整串替换：改名式/子串式破坏会让「按旧前缀匹配的负锁」自己踩雷（本仓实录两次：
+# dimNaMode→dimNaModeV2、--json→--json=1 都因保留原前缀而恒绿）。
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PYMUT114
+reset114() { # $1=仓库相对路径（镜像里的那份）→ 从主仓真值整体覆盖回来
+	src_for="$(printf '%s' "$1" | sed "s#^$GOMIR114/#$REPO114/#; s#^$PYMIR114/#$REPO114/qmt_gateway/#; s#^$WEBMIR114/#$REPO114/web/#")"
+	cp "$src_for" "$1" || { echo "--- FAIL: §114 复位失败（$1）：复位不是「按清单看一眼」，复不了位的镜像后面所有读数都不可信"; return 1; }
+}
+mut114() { # $1=镜像绝对文件 $2=old $3=new → 打印落地次数
+	python3 "$W114/mutate.py" "$1" "$2" "$3" 2>&1 || true
+}
+strip_ansi114() { LC_ALL=C sed $'s/\033\[[0-9;]*m//g'; }
+go_mir114() { # $1=包 $2=-run → 在 Go 镜像里跑（返回文本，退出码不回传：反证读的是有没有 --- FAIL）
+	( cd "$GOMIR114" && go test -count=1 "$1" -run "$2" 2>&1 ) || true
+}
+py_mir114() { # → 在 Python 镜像里跑 test_xt_mapping
+	( cd "$PYMIR114" && python3 -m pytest -q tests/test_xt_mapping.py 2>&1 ) || true
+}
+vt_mir114() { # $1=测试文件名（不含扩展名）
+	# 末尾 || true：反证腿里 vitest 必红（退出码 1），而 set -euo pipefail 下管道非零会让赋值语句静默中止整段
+	# ——没有这条 || true 时表现是「日志停在上一枚 ok 之后、一行 FAIL 都没有」，归属读不出来。
+	( cd "$WEBMIR114" && npx --prefix "$REPO114/web" vitest run --reporter=verbose "src/__tests__/$1.test."* 2>&1 || true ) | strip_ansi114
+}
+# 基线自证五条：镜像不可信时「破坏后变红」不是证据（§112/§113 同族）。
+BASE_TRG114=$(go_mir114 ./internal/trigger/ 'TestWindowBoundedBySec|TestWiderSecKeepsOlderBase')
+CNT114=$((CNT114 + 1))
+printf '%s\n' "$BASE_TRG114" | grep -qE '^ok' \
+	|| { echo "--- FAIL: §114 Go 镜像基线不是绿的（trigger 包），尾部："; printf '%s\n' "$BASE_TRG114" | tail -20; exit 1; }
+BASE_MET114=$(go_mir114 ./internal/metrics/ 'TestDailySummarySurvivesRestart|TestPendingResolveSurvivesRestart|TestAnnouncedSurvivesRestart|TestProductionEntryPathHydratesGlobal')
+CNT114=$((CNT114 + 1))
+printf '%s\n' "$BASE_MET114" | grep -qE '^ok' \
+	|| { echo "--- FAIL: §114 Go 镜像基线不是绿的（metrics journal 族），尾部："; printf '%s\n' "$BASE_MET114" | tail -20; exit 1; }
+BASE_CMD114=$(go_mir114 ./cmd/quant/ 'TestStagingFailFastRefusesRealGateway|TestNonStagingNeverRefused')
+CNT114=$((CNT114 + 1))
+printf '%s\n' "$BASE_CMD114" | grep -qE '^ok' \
+	|| { echo "--- FAIL: §114 Go 镜像基线不是绿的（cmd/quant 守卫族），尾部："; printf '%s\n' "$BASE_CMD114" | tail -20; exit 1; }
+BASE_PY114=$(py_mir114)
+CNT114=$((CNT114 + 1))
+BASE_PYN114=$(printf '%s\n' "$BASE_PY114" | grep -E '[0-9]+ passed' | head -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
+if printf '%s\n' "$BASE_PY114" | grep -qE ' failed|error'; then
+	echo "--- FAIL: §114 Python 镜像基线就是红的（镜像不可信 ⇒ 后面「破坏后变红」不构成证据）："
+	printf '%s\n' "$BASE_PY114" | tail -15
+	exit 1
+fi
+CNT114=$((CNT114 + 1))
+[ "${BASE_PYN114:-0}" -ge 18 ] \
+	|| { echo "--- FAIL: §114 Python 镜像基线没跑满（passed=${BASE_PYN114:-0} 应≥18，文件里用例定义=${N_DEFTEST114:-未算}）：收集阶段就出错＝这棵反证树没有 Python 腿"; printf '%s\n' "$BASE_PY114" | tail -15; exit 1; }
+BASE_VT114=$(vt_mir114 w7g_positions_pnl_fallback)
+CNT114=$((CNT114 + 1))
+printf '%s\n' "$BASE_VT114" | grep -qE 'Tests +4 passed' \
+	|| { echo "--- FAIL: §114 web 镜像基线不是「4 passed」（node_modules 软链或 vitest 配置在镜像里坏了）："; printf '%s\n' "$BASE_VT114" | grep -E 'Test Files|Tests |FAIL|Cannot' | head -10; exit 1; }
+echo "ok - §114 镜像基线自证（Go 三包 / pytest / vitest 在 /tmp 副本树里各自全绿）"
+
+# dys114_go：镜像里改 Go 源 → 断「本枚点名的用例红」+「点名的另一条仍绿」→ 复位复绿。
+dys114_go() { # $1=编号 $2=镜像绝对文件 $3=old $4=new $5=包 $6=-run $7=必红用例 $8=必仍绿用例(可空) $9=说明
+	local id="$1" file="$2" old="$3" new="$4" pkg="$5" rx="$6" red="$7" keep="$8" why="$9" n out rc
+	CNT114=$((CNT114 + 1))
+	n=$(mut114 "$file" "$old" "$new")
+	[ "$n" = "1" ] || { echo "--- FAIL: §114 反证 ${id} 变异落地数=${n}（应恰好 1；0＝靶串没命中，>1＝破坏面比本枚射程大，后面归因不成立）：${why}"; exit 1; }
+	out=$(go_mir114 "$pkg" "$rx")
+	rc=0
+	printf '%s\n' "$out" | grep -qE "^--- FAIL: ${red}" || rc=$?
+	CNT114=$((CNT114 + 1))
+	[ "$rc" = "0" ] || { echo "--- FAIL: §114 反证 ${id} 破坏后 ${red} 没有红（${why}）——锁/用例是装饰，全文尾部："; printf '%s\n' "$out" | tail -15; exit 1; }
+	if [ -n "$keep" ]; then
+		CNT114=$((CNT114 + 1))
+		if printf '%s\n' "$out" | grep -qE "^--- FAIL: ${keep}"; then
+			echo "--- FAIL: §114 反证 ${id} 把 ${keep} 也带红了（本枚要「独有」：连带红说明破坏面越出了这一条腿，归属读不出来）"
+			exit 1
+		fi
+	fi
+	reset114 "$file" || exit 1
+	out=$(go_mir114 "$pkg" "$rx")
+	CNT114=$((CNT114 + 1))
+	printf '%s\n' "$out" | grep -qE '^ok' || { echo "--- FAIL: §114 反证 ${id} 复位后仍红＝镜像被别处污染，后续反证读数全部作废"; printf '%s\n' "$out" | tail -12; exit 1; }
+	echo "ok - §114 反证 ${id}（${why}）：${red} 必红${keep:+ / ${keep} 仍绿} + 复位复绿"
+}
+dys114_go V1 "$GOMIR114/internal/trigger/trigger.go" \
+	'cutoff := now.Add(-time.Duration(e.cfg.Sec) * time.Second)' \
+	'cutoff := now.Add(-3650 * 24 * time.Hour)' \
+	./internal/trigger/ 'TestWindowBoundedBySec|TestWiderSecKeepsOlderBase' \
+	TestWindowBoundedBySec TestWiderSecKeepsOlderBase \
+	'Sec 不参与剪窗（窗口无限长）时，跨度判据那条必红而"Sec 调大留更旧基准"那条仍绿——证明这两条用例分别管两件事'
+dys114_go V2 "$GOMIR114/cmd/quant/main.go" \
+	'if cfgMgr.Get().QMT.Enabled {' \
+	'if false && cfgMgr.Get().QMT.Enabled {' \
+	./cmd/quant/ 'TestStagingFailFastRefusesRealGateway|TestNonStagingNeverRefused' \
+	TestStagingFailFastRefusesRealGateway TestNonStagingNeverRefused \
+	'把 staging 守卫改成"永远放行"时，正腿必红、"非 staging 不被误伤"那条仍绿——退出姿势改了，资损级拒绝语义还在被盯'
+dys114_go V7 "$GOMIR114/internal/metrics/alert_router_state.go" \
+	'if restored := r.restoreLocked(snap); restored {' \
+	'if restored := false; restored { // MUTATED-V7：回灌调用整条摘掉（读文件但不装回）' \
+	./internal/metrics/ 'TestDailySummarySurvivesRestart|TestPendingResolveSurvivesRestart' \
+	TestDailySummarySurvivesRestart '' \
+	'FIX_PLAN 要的 P28 反证：清掉回灌（读到了但不灌）⇒ 跨日补发那条必红，证明落盘文件不是自说自话'
+
+# dys114_py / dys114_vitest：另两栈同形（红→归属串→复位复绿）。
+dys114_py() { # $1=编号 $2=绝对文件 $3=old $4=new $5=必红的 pytest 节点串 $6=必仍绿的节点串(可空) $7=说明
+local id="$1" file="$2" old="$3" new="$4" node="$5" keep="$6" why="$7" n out
+	CNT114=$((CNT114 + 1))
+	n=$(mut114 "$file" "$old" "$new")
+	[ "$n" = "1" ] || { echo "--- FAIL: §114 反证 ${id} 变异落地数=${n}（应恰好 1）：${why}"; exit 1; }
+	out=$(py_mir114)
+	CNT114=$((CNT114 + 1))
+	printf '%s\n' "$out" | grep -qF -- "$node" \
+		|| { echo "--- FAIL: §114 反证 ${id} 破坏后没让 ${node} 现形（${why}），尾部："; printf '%s\n' "$out" | tail -20; exit 1; }
+	printf '%s\n' "$out" | grep -qE ' failed' \
+		|| { echo "--- FAIL: §114 反证 ${id} 破坏后 pytest 一条都没红（${why}）——用例是装饰"; printf '%s\n' "$out" | tail -20; exit 1; }
+	if [ -n "$keep" ] && printf '%s\n' "$out" | grep -qF -- "$keep"; then
+		echo "--- FAIL: §114 反证 ${id} 把 ${keep} 也带红了（本枚要「独有」：连带红＝破坏面越出这一条腿，归属读不出来）"
+		exit 1
+	fi
+	CNT114=$((CNT114 + 1))
+	reset114 "$file" || exit 1
+	out=$(py_mir114)
+	CNT114=$((CNT114 + 1))
+	printf '%s\n' "$out" | grep -qE ' passed' && ! printf '%s\n' "$out" | grep -qE ' failed' \
+		|| { echo "--- FAIL: §114 反证 ${id} 复位后仍红＝镜像污染"; printf '%s\n' "$out" | tail -12; exit 1; }
+	echo "ok - §114 反证 ${id}（${why}）：${node} 必红${keep:+ / ${keep} 仍绿} + 复位复绿"
+}
+dys114_py V3 "$PYMIR114/handler.py" \
+	$'            return mapped\n        return "%s(%s)" % (UNKNOWN_STATUS_PREFIX, raw)' \
+	$'            return mapped\n        return "已报"' \
+	test_unknown_never_impersonates_known test_known_codes_do_not_count \
+	'回到旧 fail-open（读不懂一律冒充「已报」）时主断言必红；test_known_codes_do_not_count 同时仍绿，证明"已登记码不误伤"不是靠运气'
+dys114_py V4 "$PYMIR114/handler.py" \
+	'            return "%s(缺失)" % UNKNOWN_STATUS_PREFIX' \
+	'            return "已报"' \
+	test_missing_attribute_counts test_broker_unknown_255_counts \
+	'属性缺失这一支单独反证（跨构建字段名变化是常态路径，V3 打的是数字未登记那一支）'
+dys114_vitest() { # $1=编号 $2=绝对文件 $3=old $4=new $5=测试文件名 $6=必红用例前缀 $7=必仍绿用例前缀(可空) $8=说明
+local id="$1" file="$2" old="$3" new="$4" tf="$5" want="$6" keep="$7" why="$8" n out
+	CNT114=$((CNT114 + 1))
+	n=$(mut114 "$file" "$old" "$new")
+	[ "$n" = "1" ] || { echo "--- FAIL: §114 反证 ${id} 变异落地数=${n}（应恰好 1）：${why}"; exit 1; }
+	out=$(vt_mir114 "$tf")
+	CNT114=$((CNT114 + 1))
+	if ! { printf '%s\n' "$out" | grep -qE "× .*${want}" && printf '%s\n' "$out" | grep -qE 'Tests +[0-9]+ failed'; }; then
+		echo "--- FAIL: §114 反证 ${id} 破坏后 vitest 没让 ${want} 现形（${why}），尾部："
+		printf '%s\n' "$out" | grep -E 'Test Files|Tests |×' | head -14
+		exit 1
+	fi
+	if [ -n "$keep" ] && printf '%s\n' "$out" | grep -qE "× .*${keep}"; then
+		echo "--- FAIL: §114 反证 ${id} 把 ${keep} 也带红了（本枚要「独有」：连带红＝破坏面越出这一条腿，归属读不出来）"
+		exit 1
+	fi
+	CNT114=$((CNT114 + 1))
+	reset114 "$file" || exit 1
+	out=$(vt_mir114 "$tf")
+	CNT114=$((CNT114 + 1))
+	printf '%s\n' "$out" | grep -qE 'Tests +4 passed' \
+		|| { echo "--- FAIL: §114 反证 ${id} 复位后 vitest 没复绿＝镜像污染"; printf '%s\n' "$out" | grep -E 'Test Files|Tests |FAIL|×' | head -12; exit 1; }
+	echo "ok - §114 反证 ${id}（${why}）：${want} 必红${keep:+ / ${keep} 仍绿} + 复位复绿"
+}
+dys114_vitest V5 "$WEBMIR114/src/pages/Positions.jsx" '{pnlFallback && (' '{false && (' \
+	w7g_positions_pnl_fallback 'G1' 'G3' \
+	'摘掉标记渲染点：兜底数照旧亮着而没人知道（这条缺陷的本体就是"看不出是哪个口径"），G1/G4 双双必红'
+dys114_vitest V6 "$WEBMIR114/src/pages/Positions.jsx" 'const pnlFallback = useMemo(' 'const pnlFallbackRenamedX = useMemo(' \
+	w7g_positions_pnl_fallback 'G4' '' \
+	'身份派生改名（整串替换）：G4 的「恰一枚实现」必红——留旧前缀的改名式破坏会让按前缀匹配的锁恒绿'
+# 静态镜像反证：不跑测试，只断「同一把尺子在副本上的读数按预期翻转」，用于 §114 的三枚静态锁面。
+dys114_static() { # $1=编号 $2=仓库相对文件 $3=old $4=new $5=尺子(c|g) $6=needle $7=基线读数 $8=破坏后读数 $9=说明
+	local id="$1" rel="$2" old="$3" new="$4" ruler="$5" needle="$6" base="$7" want="$8" why="$9"
+	local mf="$W114/static/$rel" n got
+	CNT114=$((CNT114 + 1))
+	mkdir -p "$(dirname "$mf")" || true
+	cp "$REPO114/$rel" "$mf" || { echo "--- FAIL: §114 反证 ${id} 取不到 $rel 的副本"; exit 1; }
+	n=$(mut114 "$mf" "$old" "$new")
+	[ "$n" = "1" ] || { echo "--- FAIL: §114 反证 ${id} 变异落地数=${n}（应恰好 1）：${why}"; exit 1; }
+	if [ "$ruler" = "c" ]; then
+		got=$(REL114="$mf" PAT114="$needle" node --input-type=module -e '
+const { codeOnly } = await import("./scripts/fe_contract_scan.mjs")
+const fs = await import("node:fs")
+const code = codeOnly(fs.readFileSync(process.env.REL114, "utf8"))
+process.stdout.write(String(code.split("\n").filter((l) => l.includes(process.env.PAT114)).length))
+' 2>&1)
+	else
+		got=$(grep -cF -- "$needle" "$mf" 2>/dev/null || true)
+	fi
+	CNT114=$((CNT114 + 1))
+	[ "$got" = "$want" ] || { echo "--- FAIL: §114 反证 ${id} 读数没按预期翻转（needle=${needle} 基线=${base} 破坏后应=${want} 实得=${got}）：${why}"; rm -rf "$W114/static"; exit 1; }
+	rm -rf "$W114/static"
+	echo "ok - §114 反证 ${id}（${why}）：读数 ${base}→${got}"
+}
+dys114_static V8 cmd/quant/main.go '	return 0' '	log.Fatalf("MUTATED-V8")' c 'log.Fatalf' 0 1 \
+	'再长出一条启动期 Fatalf 时，代码行尺子必须现形（全文 grep 会被注释里的三处 Fatalf 干扰，测不出这条）'
+dys114_static V9 internal/data/amountscale.go 'var AmountScaledTables = map[string]bool{' 'var AmountScaledTables = map[string]bool{
+	"ths_daily": true,' g '"ths_daily": true,' 0 1 \
+	'有人"加了抽检就顺手换算"时（ths_daily 进换算白名单），第 ④ 组那枚负锁必须红——这是资金量纲上一道真实的门'
+DYS114_N=$(grep -cE '^dys114_(go|py|vitest|static) V' "$GS114" || true)
+CNT114=$((CNT114 + 1))
+[ "${DYS114_N:-0}" -ge 9 ] || { echo "--- FAIL: §114 反证枚数派生异常（读到 ${DYS114_N:-0}，应≥9）：枚数从调用点派生，写死的收尾文案对下一个新增反证天生失明"; exit 1; }
+
+# ── 覆盖面诚实账（不判红，只把「今天还落在锁外面的东西」如实记下来）──
+echo "INFO - §114 覆盖面账：THS dump 的 turnover 单位仍无抽样实录（第 30 探针与夜间 scale 腿的 ths_daily 读数在现网首跑前是空集，本段只能锁"尺子接到了这张表"，锁不了"这张表是元"）；cmd/dataload 里仍有 log.Fatalf（波 7-B 的射程是 cmd/quant 进程体，装载器是一次性命令、没有 defer 链可跳过，不在本批承诺内）；路由器 journal 没有 /health 键也没有 verify 探针（可见性=启动日志 + 落盘失败 opslog.DayOnce，加探针要同批改 §88 的 INFO 计数与 §106 的判数，本批按"不留半截现网面"处理而不是顺手加一格）；告警路由冷却窗与 journal 的多进程形态未测（本机是单进程多账号引擎，跨机器多实例并写同一文件这件事没有反证覆盖）。"
+
+# ── 分组自证（本段最后两道锁）──
+CNT114=$((CNT114 + 1))
+_EMPTY_J=""
+for _g in 1 2 3 4 5 6 7 8 9; do
+	_v="J${_g}_N"
+	if [ "${!_v}" -le 0 ]; then _EMPTY_J="${_EMPTY_J} ${_g}"; fi
+done
+[ -z "$_EMPTY_J" ] || { echo "--- FAIL: §114 分组快照在位锁 ${CNT114}（这些组一个判定点都没记到：组${_EMPTY_J}）——漏一处 SNAP114 时那组的锁会被并进邻组读数，累计数正常而分组数是假的"; exit 1; }
+SNAP114 10
+SUMJ114=$((J1_N + J2_N + J3_N + J4_N + J5_N + J6_N + J7_N + J8_N + J9_N + J10_N))
+CNT114=$((CNT114 + 1))
+[ "$SUMJ114" = "$((CNT114 - 1))" ] || { echo "--- FAIL: §114 分组求和自证锁 ${CNT114}（十组快照之和 ${SUMJ114} != 累计判定点扣本锁 $((CNT114 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
+rm -rf "$W114"
+echo "ok - §114 全段通过：① trigger 窗口接线 ${J1_N} 道 + ② 启动退出姿势 ${J2_N} 道 + ③ 状态映射 fail-closed 与三消费者 ${J3_N} 道 + ④ 量纲两表分离与现网两腿加宽 ${J4_N} 道 + ⑤ 路由器落盘（含注释-实现等值与顺序锁）${J5_N} 道 + ⑥ 落位守卫三态分诊 ${J6_N} 道 + ⑦ 持仓兜底可见（代码行尺子）${J7_N} 道 + ⑧ 计数同源 ${J8_N} 道（派生 ${N_RULES114}=${N_PUSH114}+${N_DAILY114}）+ ⑨ 行为腿（Go 三组 / pytest ${N_PYTEST114} 条 / vitest ${N_VT114} 条）${J9_N} 道 + ⑩ 镜像基线自证与 ${DYS114_N} 枚反证 V1–V${DYS114_N} ${J10_N} 道，累计判定点 ${CNT114}（其中十组快照之和 ${SUMJ114}，另有 1 道就是求和自证锁本身）"
+echo ""
+
+
+echo "==> 115 §CONTRACT-LEDGER 前后端契约台账（2026-10-06 修复批 波 7 收尾，§七 断言 Q1–Q3）：重算落成机器判据——台账与注册全集双向相等、无标签=0、幽灵调用=0，静态锁 + 镜像基线自证 + 十枚反证..."
+
+# 本段守的是「数字有没有人看着」。2026-10-05 全量评价里那句「35 条零调用 / 16 条无台账」是代理
+# 读数，10-06 逐条复核时抽查两例即偏（PUT /api/tenants/{id} 其实有前端调用，真零命中的是
+# GET /api/tenant/usage），于是两个数字被整体撤回「待重算」。修复单 §七 对重算提了三条断言：
+#
+#   Q1 路由全集 R 从 internal/server/server.go 的 HandleFunc **派生**（现值 186，须等值打印），
+#      台账 scripts/contract_ledger.tsv 与 R 逐条双向相等，每条带分类标签；
+#   Q2 无标签条目 = 0（等值锁）；|R| < 180 即红；
+#   Q3 幽灵调用（C − R）= 0。
+#
+# 取向：判据落在**核对器**（scripts/contract_ledger_check.py）里，本段只做三件事——
+#   ① 核台账自身的形态（行数/列数/落点诚实/不许把凭据或镜像路径写进证据列）；
+#   ② 读核对器打印的 KEY=VALUE 汇总做等值锁（本段禁止自己再数一遍：数两遍＝两套口径，
+#      §0929DRILL 那轮「两份判读函数只修一份」的教训同族）；
+#   ③ 建一棵只装「核对器真读的那些文件」的 /tmp 镜像，先自证它在镜像里也绿，再逐枚破坏。
+#
+# 为什么台账必须是 .tsv 而不是再写进报告正文（修复单 §七 明写「落一份台账文件，不是再写进报告」）：
+# 本仓 *.md 被 gitignore（文档永不进库），写进 md 的账等于没账——下一轮 checkout 就看不见，
+# 而 .tsv 进库、能被核对器读、能被门禁锁住。
+#
+# ★ 反证十枚 C1–C10 全在镜像里做，且**每枚断一个本枚独有的读数**（KEY=VALUE 那一层，
+#   不是只断「有 FAIL 行」）：C1 与 C7 都会打「台账漏了」这句话，但 C1 翻的是 LEDGER_ROWS=185、
+#   C7 翻的是 ROUTES_DERIVED=187——只断文案的两枚锁会同色，只断读数的一枚锁才分得开。
+# ★ C9/C10 破坏的是**核对器自己**（把两个派生正则改坏）：这两枚是 Q2 那两条「空转正」正锁的
+#   存在性证据。没有它们，「|R| < 180 即红」只是一句没人试过的话——解析模式与 Go 侧注册格式
+#   脱节时读回 0，红的是「全都没调用」这种**看起来更像结论**的东西（§107 预演实录同族）。
+#
+# English: §115 locks the recomputed front/back contract ledger. R is derived from HandleFunc
+# registrations; the TSV ledger must equal R two ways with a label + verifiable evidence per row;
+# untagged and ghost calls must be zero. The gate reads the checker's KEY=VALUE summary (it never
+# recounts), builds a /tmp mirror containing only the files the checker actually reads, proves the
+# mirror is green first, then runs ten reversals — each asserting the one reading that only it can
+# flip, including two that break the checker's own derivations to prove the floor guards bite.
+CNT115=0
+REPO115="$PWD"
+LED115=scripts/contract_ledger.tsv
+CLC115=scripts/contract_ledger_check.py
+SRV115=internal/server/server.go
+API115=web/src/api/index.js
+GS115=scripts/verify_changes.sh
+W115="$(mktemp -d /tmp/contract115-XXXXXX 2>/dev/null || true)"
+[ -n "$W115" ] || { echo "--- FAIL: §115 建不出镜像目录，基线自证与十枚反证无法跑（宁可红，不许跳）"; exit 1; }
+
+eq115() { # $1=文件 $2=整串 $3=预演 $4=说明
+	CNT115=$((CNT115 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §115 整串等值锁 ${CNT115}（$4）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+neg115() { # $1=文件 $2=整串 $3=说明 → 彻底没有
+	CNT115=$((CNT115 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §115 负锁 ${CNT115}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+}
+re115() { # $1=文件 $2=ERE $3=预演 $4=说明 → 按整行形状数
+	CNT115=$((CNT115 + 1))
+	local got
+	got=$(grep -cE -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §115 行形等值锁 ${CNT115}（$4）：${1} 行形「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+min115() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
+	CNT115=$((CNT115 + 1))
+	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §115 派生正锁 ${CNT115}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+}
+# run_ledger115：跑核对器并把**退出码**留住（LEDGER_RC115）。
+# 这里是本段唯一允许「期望失败」的地方：反证腿里核对器必红，而 set -euo pipefail 下
+# 命令替换里的非零退出会把整段静默带走——表现是日志停在上一枚 ok 之后、一行 FAIL 都没有（§114 实录）。
+# 用 `|| VAR=$?` 收码而不是 `|| true`：吞掉码就等于把「核对器根本没跑起来」也读成绿。
+run_ledger115() { # $1=根目录（仓库根或镜像根）
+	LEDGER_RC115=0
+	LEDGER_OUT115=$(python3 "$1/scripts/contract_ledger_check.py" 2>&1) || LEDGER_RC115=$?
+}
+lget115() { # $1=KEY → 从上一次 run_ledger115 的输出里取值（取不到返回空串，由调用方判红）
+	printf '%s\n' "$LEDGER_OUT115" | sed -n "s/^$1=//p" | head -1
+}
+eqkey115() { # $1=KEY $2=应等值 $3=说明 → 派生读数与 prose 等值（等值锁，不是单向锁）
+	CNT115=$((CNT115 + 1))
+	local got
+	got=$(lget115 "$1")
+	[ "$got" = "$2" ] || { echo "--- FAIL: §115 读数等值锁 ${CNT115}（$3）：$1 实读=${got:-<空>} 应=$2"; printf '%s\n' "$LEDGER_OUT115" | grep -E "^$1=|^--- FAIL" | head -6; exit 1; }
+}
+
+# ── ① 台账自身的形态：在位、每行五列、落点诚实、不许夹带凭据 ──
+CNT115=$((CNT115 + 1))
+[ -f "$LED115" ] || { echo "--- FAIL: §115 台账 $LED115 不在位（核对器读不到它＝整个契约账不存在）"; exit 1; }
+LED_DATA=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$LED115" || true)
+LED_DATA_N=$(printf '%s\n' "$LED_DATA" | grep -c . || true)
+min115 "台账数据行数（现值 186＝R 全集；掉到 180 以下＝有人在没改核对器的情况下删了账）" "$LED_DATA_N" 180
+CNT115=$((CNT115 + 1))
+_BADCOL=$(printf '%s\n' "$LED_DATA" | awk -F'\t' 'NF!=5 {c++} END{print c+0}' || true)
+[ "${_BADCOL:-0}" = "0" ] || { echo "--- FAIL: §115 有 ${_BADCOL} 行不是恰好 5 列（method/path/class/evidence/note）：列一错位，核对器读到的 class 会是上一条的 note（§表格行劈开同族）"; printf '%s\n' "$LED_DATA" | awk -F'\t' 'NF!=5 {print "  第" NR "行 " NF "列: " $0}' | head -4; exit 1; }
+# 证据列不许点名镜像/临时树/依赖目录：那些位置的文字在下一轮 checkout 里不存在，
+# 「可核落点」就退化成「曾经可核」——本段的立段理由恰恰是反对这种账。
+CNT115=$((CNT115 + 1))
+_BADPATH=$(printf '%s\n' "$LED_DATA" | awk -F'\t' '$4 ~ /(^|\/)(tmp|\.qoder|node_modules|\.uat-data)\// {c++} END{print c+0}' || true)
+[ "${_BADPATH:-0}" = "0" ] || { echo "--- FAIL: §115 有 ${_BADPATH} 行的落点指向镜像/临时/依赖目录（/tmp、.qoder、node_modules、.uat-data）：那种证据下次没人拨得动"; printf '%s\n' "$LED_DATA" | awk -F'\t' '$4 ~ /(^|\/)(tmp|\.qoder|node_modules|\.uat-data)\// {print "  " $1 " " $2 " → " $4}' | head -4; exit 1; }
+# 台账不许内嵌字面公网 IPv4（仓库纪律同 §Mac 侧调度链负锁：出口只走 ssh 别名或运行期参数）。
+# 允许的是回环与文档保留段——它们是夹具，不是现网地址。
+CNT115=$((CNT115 + 1))
+_IPV4=$(printf '%s\n' "$LED_DATA" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -vE '^(127\.|0\.0\.0\.0|203\.0\.113\.|192\.0\.2\.|198\.51\.)' || true)
+[ -z "$_IPV4" ] || { echo "--- FAIL: §115 台账里出现字面公网 IPv4：$(printf '%s\n' "$_IPV4" | head -3 | tr '\n' ' ')（点名机器要写文件行号，不要写地址）"; exit 1; }
+neg115 "$LED115" "admin_session_token" '台账不许把口令/令牌文件名当证据（证据要能公开复核）'
+# 核对器自身：下限常量与判据条数都在射程内，防止「掏空判据只留打印」。
+re115 "$CLC115" '^ROUTE_FLOOR = 180$' 1 'Q2 那枚 |R|<180 的下限只有一个出处（改成 0 就等于没有）'
+CNT115=$((CNT115 + 1))
+_LOCKN115=$(grep -cE '^[[:space:]]+lock\(' "$CLC115" || true)
+min115 "核对器里的判据条数（lock( 调用点；现值 14）——判据被整段删空而汇总打印还在是最难发现的坏法" "$_LOCKN115" 12
+eq115 "$CLC115" 'sys.exit(2)' 2 '读不到文件/列数错位走退出码 2（「判据没跑起来」不许冒充「判据不成立」）'
+# 接线锁：门禁必须**既读退出码又读汇总**。只看文案的接线会把「python 抛异常」读成「没打印 FAIL＝绿」。
+CNT115=$((CNT115 + 1))
+_RCUSE115=$(grep -cE 'LEDGER_RC115' "$GS115" || true)
+min115 "门禁内 LEDGER_RC115 的使用点（定义 1 + 基线断言 + 反证断言 + 本锁＝现值 ≥4）：rc 没被任何判断读过＝整段假绿" "$_RCUSE115" 4
+SNAP115() { # $1=组号 → 记下本组新增判定点数（收尾 ok 行的「① 组 N 道」由这里派生，不是手写清单）
+	printf -v "K$1_N" '%s' "$((CNT115 - PREV115))"
+	PREV115=$CNT115
+}
+PREV115=0
+SNAP115 1
+
+# ── ② 正跑：读核对器的 KEY=VALUE，逐键等值（本段不自己数）──
+run_ledger115 "$REPO115"
+CNT115=$((CNT115 + 1))
+[ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
+eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
+eqkey115 ROUTES_DERIVED 186 'Q1 的 R：HandleFunc 派生读数须等值打印（修复单 §七 明写现值 186）'
+eqkey115 CALLPATH_DERIVED 150 'C 的规范化路径条数（前端真拨得出去的地址）'
+eqkey115 CALLSITES_DERIVED 153 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账）'
+eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
+eqkey115 LEDGER_ROWS 186 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
+eqkey115 COVERED_BY_WEB 150 '被前端覆盖的路由条数'
+eqkey115 UNCALLED 36 'R−C：每条都必须有分类标签＋可核落点（本批重算的交付物就是这个数）'
+eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
+eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
+eqkey115 NO_BASIS 0 '「无依据」档必须为空：说不清为什么还留着＝待决策，不许混进台账假装闭合'
+eqkey115 BROKEN_EVIDENCE 0 '可核落点核不过的条数（运维 curl 不能只是形容词）'
+eqkey115 LEDGER_LIES 0 '标了「前端调用」却在实时派生里找不到的条数（前端删了而账没改＝假勾）'
+# 三枚求和自证：单点等值会被「两边同时错」绕过，和式锁把口径闭起来。
+CNT115=$((CNT115 + 1))
+_SUMCLS=$(printf '%s\n' "$LEDGER_OUT115" | awk -F= '/^CLASS_/{s+=$2} END{print s+0}')
+[ "$_SUMCLS" = "$(lget115 LEDGER_ROWS)" ] || { echo "--- FAIL: §115 分类求和自证（Σ CLASS_*=${_SUMCLS} != LEDGER_ROWS=$(lget115 LEDGER_ROWS)）：有行的标签没进任何一类（新增标签没登记进 CLASSES 时的形态）"; exit 1; }
+CNT115=$((CNT115 + 1))
+[ "$(( $(lget115 COVERED_BY_WEB) + $(lget115 UNCALLED) ))" = "$(lget115 ROUTES_DERIVED)" ] || { echo "--- FAIL: §115 覆盖求和自证（COVERED=$(lget115 COVERED_BY_WEB) + UNCALLED=$(lget115 UNCALLED) != ROUTES=$(lget115 ROUTES_DERIVED)）：账不闭合，等值锁再多也只是逐条自洽"; exit 1; }
+CNT115=$((CNT115 + 1))
+[ "$(lget115 CLASS_前端调用)" = "$(lget115 CALLPATH_DERIVED)" ] || { echo "--- FAIL: §115 「前端调用」条数须等于派生路径条数（实得 $(lget115 CLASS_前端调用)/$(lget115 CALLPATH_DERIVED)）：不等就有派生调用没落账，或落账的调用已经不是前端"; exit 1; }
+# 台账格式与核对器读数必须同源：两处各数一遍迟早分家（§0929DRILL「两份判读函数只修一份」同族）。
+CNT115=$((CNT115 + 1))
+[ "$LED_DATA_N" = "$(lget115 LEDGER_ROWS)" ] || { echo "--- FAIL: §115 台账行数两把尺子分家：门禁数到 ${LED_DATA_N}，核对器数到 $(lget115 LEDGER_ROWS)（注释/空行判定不一致＝其中一把会漏行）"; exit 1; }
+SNAP115 2
+
+# ── ③ 镜像：只装核对器真读的那些文件，清单从台账证据列**派生** ──
+# 为什么按派生而不是写死清单（§BOM-REPO-DERIVE 教训）：写死的文件清单对下一个新增的
+# 「运维 curl」条目天生失明——台账加一行新证据而镜像没带那个文件，反证腿会红在「文件不存在」上，
+# 读起来像锁有牙，其实是镜像残缺。
+MIR115="$W115/mir"
+mkdir -p "$MIR115/scripts" || { echo "--- FAIL: §115 建不出镜像 scripts 目录"; exit 1; }
+MIRFILES115=$(
+	{
+		printf '%s\n' "$LED_DATA" | awk -F'\t' '{split($4, a, ":"); if (a[1] != "") print a[1]}'
+		echo "$CLC115"
+		echo "$SRV115"
+		echo "$API115"
+		echo "$LED115"   # 核对器的第四个必读文件（LEDGER 自身）：镜像清单必须从**核对器读什么**派生，
+						# 而不是从「证据列写了什么」派生——10-09 首版只并了三件，基线自证当场 rc=2 报
+						# 「镜像里没有 contract_ledger.tsv」，这正是这枚自证存在的理由（少文件的镜像与代码坏了长得一样）。
+	} | sort -u
+)
+MIRN115=$(printf '%s\n' "$MIRFILES115" | grep -c . || true)
+min115 "镜像文件数（派生自台账证据列 ∪ 核对器必读四件；现值 12）＝0 或过窄说明 awk 那把尺子失效了" "$MIRN115" 10
+MIRCOPY_OK=0
+while IFS= read -r _f; do
+	[ -n "$_f" ] || continue
+	if [ ! -f "$REPO115/$_f" ]; then
+		echo "--- FAIL: §115 台账点名的证据文件在主仓不存在：${_f}（证据列在撒谎，或文件被改名而账没跟着改）"
+		exit 1
+	fi
+	mkdir -p "$MIR115/$(dirname "$_f")"
+	cp "$REPO115/$_f" "$MIR115/$_f" || { echo "--- FAIL: §115 镜像拷贝失败：$_f"; exit 1; }
+	MIRCOPY_OK=$((MIRCOPY_OK + 1))
+done <<< "$MIRFILES115"
+CNT115=$((CNT115 + 1))
+[ "$MIRCOPY_OK" = "$MIRN115" ] || { echo "--- FAIL: §115 镜像拷贝只成功 ${MIRCOPY_OK}/${MIRN115} 个文件（残缺镜像上的任何「破坏后变红」都不构成证据）"; exit 1; }
+# 镜像里不许有凭据：清单派生自证据列，所以这条是「证据列本身不许指向凭据」的第二道闸。
+CNT115=$((CNT115 + 1))
+if printf '%s\n' "$MIRFILES115" | grep -qE '\.db$|\.log$|config[^/]*\.json$|admin_session_token|\.key$|\.pem$'; then
+	echo "--- FAIL: §115 镜像清单里出现凭据/数据库/日志形态的路径：$(printf '%s\n' "$MIRFILES115" | grep -E '\.db$|\.log$|config[^/]*\.json$|admin_session_token|\.key$|\.pem$' | head -2)（反证树不该带这些，凭据不外拷是硬纪律）"
+	exit 1
+fi
+# 基线自证：同一份判据在镜像里也必须绿，且逐键读数与主仓一致（不一致＝镜像少带了文件，
+# 少一个证据文件会让 BROKEN_EVIDENCE 变红，而那和「代码坏了」长得一模一样）。
+run_ledger115 "$MIR115"
+CNT115=$((CNT115 + 1))
+[ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
+eqkey115 ROUTES_DERIVED 186 '镜像基线：R 与主仓同值'
+eqkey115 LEDGER_ROWS 186 '镜像基线：台账行数与主仓同值'
+eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
+eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
+SNAP115 3
+
+# ── ④ 十枚反证：每枚只断「本枚独有」的那个读数 ──
+cat > "$W115/mutate.py" <<'PYMUT115'
+import sys
+# 用法：mutate.py <绝对文件> <old> <new> —— 整串替换并打印落地次数（不是 1 由调用方判红）。
+# 一律整串替换：改名式/子串式破坏会让「按旧前缀匹配的锁」自己踩雷（本仓实录：
+# dimNaMode→dimNaModeV2、--json→--json=1 都因保留原前缀而恒绿）。
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PYMUT115
+dys115() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=本枚独有读数 KEY $6=翻转后的值 $7=说明
+	local id="$1" rel="$2" old="$3" new="$4" key="$5" want="$6" why="$7" n got
+	CNT115=$((CNT115 + 1))
+	cp "$REPO115/$rel" "$MIR115/$rel" || { echo "--- FAIL: §115 反证 ${id} 无法从主仓复位镜像文件 $rel"; exit 1; }
+	n=$(python3 "$W115/mutate.py" "$MIR115/$rel" "$old" "$new" 2>&1 || true)
+	[ "$n" = "1" ] || { echo "--- FAIL: §115 反证 ${id} 变异落地数=${n}（应恰好 1）：$why"; exit 1; }
+	run_ledger115 "$MIR115"
+	CNT115=$((CNT115 + 1))
+	if [ "$LEDGER_RC115" = "0" ]; then
+		echo "--- FAIL: §115 反证 ${id} 破坏后核对器仍然退出 0（这枚是假锁：${why}）"
+		exit 1
+	fi
+	got=$(lget115 "$key")
+	[ "$got" = "$want" ] || { echo "--- FAIL: §115 反证 ${id} 读数没按预期翻转（${key} 应=${want} 实得=${got:-<空>}）：${why}；FAIL 行：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -2)"; exit 1; }
+	printf '%s\n' "$LEDGER_OUT115" | grep -qE '^--- FAIL' || { echo "--- FAIL: §115 反证 ${id} 红了却没有 --- FAIL 行（rc 非 0 来自异常而不是判据：判据没跑起来不算验过）"; exit 1; }
+	cp "$REPO115/$rel" "$MIR115/$rel" || { echo "--- FAIL: §115 反证 ${id} 复位失败（${rel}）"; exit 1; }
+	run_ledger115 "$MIR115"
+	CNT115=$((CNT115 + 1))
+	[ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 反证 ${id} 复位后仍红＝镜像被污染，后面所有反证读数作废：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
+	echo "ok - §115 反证 ${id}：破坏 $rel → $key 翻成「${want}」且复位回基线"
+}
+KLINE_ROW=$(printf '%s\n' "$LED_DATA" | grep -F "$(printf '\t')/api/kline$(printf '\t')" | head -1 || true)
+CNT115=$((CNT115 + 1))
+[ -n "$KLINE_ROW" ] || { echo "--- FAIL: §115 反证靶行取不到（台账里没有带 tab 分隔的 /api/kline 行＝列格式变了，上面那些 awk 尺子也一起失效）"; exit 1; }
+# C1 整行删除：账少一条，R 照旧 186 → 翻的是 LEDGER_ROWS。
+dys115 C1 "$LED115" "$KLINE_ROW" "" LEDGER_ROWS 185 '新增/改名注册没进分类账（台账漏了一条路由）'
+# C2 幽灵台账行：行数不变、R 不变，红在「对不上现网注册」那一侧。
+# 取向：不写 printf 拼串的占位写法（拼错一次会静默变成 no-op，而 no-op 的反证看起来像跑过了）。
+KLINE_PATH_GHOST=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')/api/kline$(printf '\t')#$(printf '\t')/api/kline-renamed-x$(printf '\t')#")
+dys115 C2 "$LED115" "$KLINE_ROW" "$KLINE_PATH_GHOST" LEDGER_ROWS 186 '路由已删/改名而台账没跟着改：行数仍 186，红在「对不上现网注册」——所以本枚的独有读数是 LEDGER_ROWS 不变（与 C1 的 185 分得开）'
+KLINE_CLASS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(printf '\t')internal/server/handlers_fix.go#$(printf '\t\t')internal/server/handlers_fix.go#")
+dys115 C3 "$LED115" "$KLINE_ROW" "$KLINE_CLASS" UNTAGGED 1 '分类标签被清空：空标签＝「没看过」被算成「看过了」（Q2 的等值锁）'
+KLINE_NOBASIS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(printf '\t')internal/server/handlers_fix.go#$(printf '\t')无依据$(printf '\t')internal/server/handlers_fix.go#")
+dys115 C4 "$LED115" "$KLINE_ROW" "$KLINE_NOBASIS" NO_BASIS 1 '把说不清的条目塞进「无依据」假装闭合：那一档必须是待决策而不是台账的一行'
+KLINE_EVID=$(printf '%s' "$KLINE_ROW" | sed 's#internal/server/handlers_fix.go:531#internal/server/handlers_ghost.go:531#')
+dys115 C5 "$LED115" "$KLINE_ROW" "$KLINE_EVID" BROKEN_EVIDENCE 1 '落点指向不存在的文件：证据列退化成记忆（运维 curl 不能只是形容词）'
+# C6 前端把调用点删了而台账没改：翻 LEDGER_LIES（撒谎检测），R 与台账都不动。
+dys115 C6 web/src/api/index.js "  return request('/api/research/library')" "  return [] // §115 C6 反证：调用点被摘掉而台账仍写「前端调用」" LEDGER_LIES 1 '「标签必须被实时派生证实」这条不在 Q1–Q3 里，但没有它，台账可以把每一条都写成前端调用然后绿着'
+# C7 新注册没进账：翻 ROUTES_DERIVED（与 C1 的文案同色、读数不同色——正是本枚要断读数的原因）。
+dys115 C7 internal/server/server.go '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' "$(printf '%s\n' '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' '	s.mux.HandleFunc("GET /api/w115-newprobe", s.authMiddleware(s.handleHealth))')" ROUTES_DERIVED 187 '新加路由没归类：与 C1 的区别是 R 涨了（187）而台账还是 186——只看文案的锁分不开这两枚'
+# C8 幽灵调用（Q3）：前端拨一个服务端没注册的地址，GHOST_CALLS 才现形。
+dys115 C8 web/src/api/index.js "export async function fetchSignals() {" "$(printf '%s\n' 'export async function w115GhostProbe() {' "  return request('/api/w115-ghost-target', { method: 'POST' })" '}' '' 'export async function fetchSignals() {')" GHOST_CALLS 1 '拨未注册地址＝运行期 404：这条比缺 UI 严重，所以单独立数'
+# C9 派生模式失效的「空转正」：把 R 的正则改坏，读回 0 —— ROUTE_FLOOR 必须当场红，
+# 而不是安静地变成「路由只有 0 条、台账 186 条全对不上」那种看起来很有道理的结论。
+dys115 C9 "$CLC115" 'HandleFunc\("([A-Z]+) ([^"]+)"' 'HandleFuncZZ\("([A-Z]+) ([^"]+)"' ROUTES_DERIVED 0 'Q2 的 |R|<180 即红：解析格式与 Go 侧注册脱节时读出很小的数，比红更危险（它把「一行都没解析到」报成「全都没调用」）'
+# C10 同一枚空转正锁的调用侧：api/index.js 的 request() 形态变了会静默读空。
+dys115 C10 "$CLC115" '(?<!function )\brequest\(' '(?<!function )\brequestZZ\(' CALLSITES_DERIVED 0 'C 侧空转正：调用点派生归零时 153<100 即红，不许把「没解析到」报成「前端零调用」'
+DYS115_N=$(grep -cE '^dys115 C[0-9]+ ' "$GS115" || true)
+CNT115=$((CNT115 + 1))
+[ "${DYS115_N:-0}" -ge 10 ] || { echo "--- FAIL: §115 反证枚数派生异常（读到 ${DYS115_N:-0}，应≥10）：枚数从调用点派生，写死的收尾文案对下一个新增反证天生失明"; exit 1; }
+SNAP115 4
+
+# ── 覆盖面诚实账（不判红，只把「今天还落在锁外面的东西」如实记下来）──
+echo "INFO - §115 覆盖面账：台账只覆盖 request() 的字面量/三元调用＋人工点名的三条前端直连（登录 fetch / 登出 fetch / SSE EventSource）——web/src 的 *.jsx 里 /api/ 字面量实测 0 处（除 api/index.js 自身），所以「页面绕过 api 层直接拨」这件事现在没有发生，但**没有机器锁拦着它发生**：新增一条页面级 fetch 会走 C9/C10 那两把派生尺子的盲区（它们只读 api/index.js）。三条「运维 curl」的 /api/metrics* 在仓内没有自动拨测（发版链刻意不消费它，§FQ 凭据负锁钉死），这三行登记的是「人工拨」，机器只能核注册在位、核不到有人真拨。台账对查询串不敏感（norm 切掉 ? 之前才算路径），所以 GET 却改状态这类副作用口径不在本段射程，那是 §56 写端点收权普查的事。36 条未调用里 admin 按账号代配 8 条 + 运营账本 2 条 + 租户 2 条属「保留尺寸等页面」，本轮不删任何一条（实装优先禁删除）。"
+
+# ── 分组自证（本段最后两道锁）──
+CNT115=$((CNT115 + 1))
+_EMPTY_K=""
+for _g in 1 2 3 4; do
+	_v="K${_g}_N"
+	if [ "${!_v}" -le 0 ]; then _EMPTY_K="${_EMPTY_K} ${_g}"; fi
+done
+[ -z "$_EMPTY_K" ] || { echo "--- FAIL: §115 分组快照在位锁 ${CNT115}（这些组一个判定点都没记到：组${_EMPTY_K}）——漏一处 SNAP115 时那组的锁会被并进邻组读数，累计数正常而分组数是假的"; exit 1; }
+SNAP115 5
+SUMK115=$((K1_N + K2_N + K3_N + K4_N + K5_N))
+CNT115=$((CNT115 + 1))
+[ "$SUMK115" = "$((CNT115 - 1))" ] || { echo "--- FAIL: §115 分组求和自证锁 ${CNT115}（五组快照之和 ${SUMK115} != 累计判定点扣本锁 $((CNT115 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
+rm -rf "$W115"
+echo "ok - §115 全段通过：① 台账形态与证据诚实（含公网 IP/凭据/镜像路径三枚负锁与核对器掏空负锁）${K1_N} 道 + ② 逐键等值（R=186 / C=150 / 未调用=36 / Q2=0 / Q3=0）+ 三枚求和自证 ${K2_N} 道 + ③ 镜像基线自证（派生清单 ${MIRN115} 个文件、逐键与主仓同值）${K3_N} 道 + ④ ${DYS115_N} 枚反证 C1–C${DYS115_N}（每枚断一个本枚独有读数）${K4_N} 道 + ⑤ 覆盖面诚实账与在位锁 ${K5_N} 道，累计判定点 ${CNT115}（其中五组快照之和 ${SUMK115}，另有 1 道就是求和自证锁本身）"
 echo ""
 
 echo "==> 全部通过"

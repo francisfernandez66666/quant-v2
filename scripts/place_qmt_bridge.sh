@@ -15,7 +15,9 @@
 #   ② 远端只跑**纯 ASCII** 的 PowerShell，经 -EncodedCommand 传入：中文文件名/中文判据经
 #      bash→ssh→cmd→powershell 三层转义 + GBK 回传必乱（§4.1b.1② 的 BOM 事故、§GBK 系列教训），
 #      判据字段掺中文＝把假绿写进脚本。目标文件名在远端按 Unicode 码位拼出来，脚本体一个字都不含中文。
-#   ③ 动手前三道守卫：本机源文件必须与 HEAD 一致（不把未提交改动推进实盘链路）→ 远端落点文件
+#   ③ 动手前三道守卫：本机源文件必须与 HEAD 一致（不把未提交改动推进实盘链路；§W7-F 起
+#      这条按 git 退出码分三态报——仓库不可查 / 文件未纳管 / 确有未提交改动，
+#      安全阀一律 fail-closed，但文案不许把"git 坏了"说成"你有改动"）→ 远端落点文件
 #      SHA 必须与本机一致（不一致说明部署没跑或传了一半，落位只会把半成品贴进策略目录）→
 #      覆盖前先留时间戳备份（可回滚）。判绿只认 SHA 逐字相等，不认"跑完了"。
 #
@@ -86,8 +88,41 @@ fi
 echo "==> [1/5] 组装远端脚本体并做 ASCII 自检（不连生产就能判红）"
 # 守卫①：本机源文件必须干净——这条脚本会把它推进「实盘下单链路真正加载」的位置，
 # 未提交的改动不该有这个机会（出问题时无从对齐是哪一版）。预览不查它：看计划不需要凭据。
-if ! git diff --quiet -- "$BRIDGE_SRC" 2>/dev/null || ! git diff --cached --quiet -- "$BRIDGE_SRC" 2>/dev/null; then
-  echo "X $BRIDGE_SRC 有未提交改动：先提交（或还原）再落位，别把半成品贴进 QMT 策略目录。" >&2
+#
+# §W7-F（2026-10-06 修复批 波 7）：文案按「要防的失效形态」分诊，不再把两类原因压成一句。
+# 旧写法 `if ! git diff --quiet ... ; then echo "有未提交改动"` 只看 rc 非 0，可 git 的退出码
+# 本来是三类形态的分诊器：0=无差异、1=确有改动、>=2=问不成（外加"根本不是仓库"和
+# "文件没进版本控制"两种问不成的特例）。后果不是安全阀失效——三种形态照样一律 exit 1，
+# 后果是**读数撒了方向**：一台 git 坏掉的机器（safe.directory 未登记 / index.lock 残留 /
+# 拷树后没 git init）会让人去提交一个并不存在的改动，而真正该修的是这台机器的仓库状态；
+# 反过来「文件根本没进版本控制」在旧写法里 rc=0 直接放行＝把无 HEAD 可对齐的一份半成品
+# 贴进策略目录，这才是这条守卫原本要挡的东西。
+REPO_Q="$(git rev-parse --is-inside-work-tree 2>&1)" || REPO_RC=$?
+REPO_RC="${REPO_RC:-0}"
+if [ "$REPO_RC" -ne 0 ] || [ "$REPO_Q" != "true" ]; then
+  echo "X 仓库不可查：本机问不出 HEAD 状态（rc=${REPO_RC}，git 读数=${REPO_Q}），无法确认「本机与 HEAD 一致」。" >&2
+  echo "  要修的是这台机器的仓库状态（不是仓库 / safe.directory 未登记 / index.lock 残留 / git 不可执行），不是去提交改动。" >&2
+  exit 1
+fi
+# 未纳管的文件走的是"问不成"这条道：git diff 对它恒 rc=0（无差异），旧守卫会整条放行。
+TRACKED_Q="$(git ls-files -- "$BRIDGE_SRC")"
+if [ -z "$TRACKED_Q" ]; then
+  echo "X 仓库不可查：$BRIDGE_SRC 没进版本控制，HEAD 里没有这一版可比（落位后无从对齐是哪一版）。先 git add 并提交。" >&2
+  exit 1
+fi
+DIFF_RC=0
+git diff --quiet -- "$BRIDGE_SRC" || DIFF_RC=$?
+CACHED_RC=0
+git diff --cached --quiet -- "$BRIDGE_SRC" || CACHED_RC=$?
+if [ "$DIFF_RC" -ge 2 ] || [ "$CACHED_RC" -ge 2 ]; then
+  echo "X 仓库不可查：git diff 问不成本机源文件（工作区 rc=${DIFF_RC} 暂存区 rc=${CACHED_RC}，>=2 表示 git 自己出错而不是有改动）。" >&2
+  exit 1
+fi
+if [ "$DIFF_RC" -ne 0 ] || [ "$CACHED_RC" -ne 0 ]; then
+  # 「确有改动」这一支才给出改动清单（工作区/暂存区各说各的，操作者据此决定提交还是还原）。
+  DIRTY_Q="$(git status --porcelain -- "$BRIDGE_SRC" | head -3 | tr '\n' '/')"
+  echo "X $BRIDGE_SRC 确有未提交改动（工作区 rc=${DIFF_RC} 暂存区 rc=${CACHED_RC}）：先提交（或还原）再落位，别把半成品贴进 QMT 策略目录。" >&2
+  echo "  git status 读数：${DIRTY_Q:-（git 说有改动却没列出条目——请把上面两个 rc 一起报出来，这属第三种形态）}" >&2
   exit 1
 fi
 # 远端脚本体：全 ASCII（中文文件名按 Unicode 码位拼），只做四件事——定位根目录、备份、执行落位、回打 SHA。

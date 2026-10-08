@@ -30,9 +30,17 @@ const TushareAmountScale = 1000.0
 
 // AmountScaledTables 列出"tushare 口径需要写侧换算 amount"的表。
 // 只有日线家族在这一列语义上是千元；daily_basic 的 total_mv/circ_mv 是**万元**、
-// 且下游没有按元比较的阈值，minute_klines 走的是另一条 hithink/baostock 腿（元），
-// 因此都不在此列——把该列清单钉成显式白名单，避免以后加表时被顺手"统一乘一次"变成双重换算。
-// （The explicit whitelist of tables whose tushare `amount` is in thousand-CNY.）
+// 且下游没有按元比较的阈值，因此都不在此列——把该列清单钉成显式白名单，
+// 避免以后加表时被顺手"统一乘一次"变成双重换算。
+//
+// §W7-D（2026-10-09 波 7）改掉的一句话：旧注释在这里写着"minute_klines 走的是另一条
+// hithink/baostock 腿（元）"，把 THS 侧的口径当成已核实事实，而同一批读码发现
+// ths_daily 的 amount 来自 parquet 的 turnover 列，该列在本仓两处注释里分别写着
+// "换手率（%）"和"成交额/换手率"（internal/data/hithink_dump.go:89/:104，§W7-D 已改）。
+// ⇒ 白名单只收"上游单位有核实记录"的表；THS 日 K（ths_daily）不进这张表，
+// 它进的是 store 侧的抽检集合 AmountProbedTables——先出读数，读数说千元再谈换算。
+// （The explicit whitelist of tables whose tushare `amount` is verifiably in thousand-CNY;
+// a table may be probe-eligible without being conversion-eligible.)
 var AmountScaledTables = map[string]bool{
 	"daily":       true,
 	"index_daily": true,

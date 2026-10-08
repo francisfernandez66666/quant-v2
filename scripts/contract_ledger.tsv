@@ -1,0 +1,206 @@
+# 前后端契约台账（§CONTRACT-LEDGER，2026-10-09 修复批 波 7 收尾落纸）
+#
+# 这份文件是 2026-10-05 全量评价里「35 条零调用 / 16 条无台账」两个数字的**重算结果**：
+# 那两个数是代理读数、抽查两例即偏（PUT /api/tenants/{id} 其实有前端调用，真零命中的是
+# GET /api/tenant/usage），所以整体撤回「待重算」。重算口径 = 实时派生，不抄任何注释里的条数：
+#   · 路由全集 R 从 internal/server/server.go 的 HandleFunc 注册串派生；
+#   · 前端调用全集 C 从 web/src/api/index.js 的 request() 调用点派生（先剥注释，注释表里的
+#     几十个路径不会在运行期拨出去，不剥就会把 C−R 那枚锁架空）；
+#   · 台账必须与 R **逐条双向相等**，每条带分类标签 + 可核落点。
+# 判据实现在 scripts/contract_ledger_check.py（Q1 双向相等 / Q2 无标签=0 且 |R|≥180 / Q3 幽灵调用=0），
+# 门禁 §115 只读它的 KEY=VALUE 汇总做等值锁，禁止自己再数一遍（数两遍＝两套口径）。
+#
+# 列序（TAB 分隔，5 列）：method<TAB>注册路径原文<TAB>分类<TAB>可核落点<TAB>为什么这么归
+# 「前端调用」行由 `python3 scripts/contract_ledger_check.py --emit-web` 派生，不要手改；
+# 手改会在下一次派生时与代码分家，被「台账撒谎检测」判红（前端调用行必须能在实时派生里找到）。
+# 分类标签集合见核对器的 CLASSES；「无依据」这一档必须为 0 条——说不清为什么还留着的路由
+# 是待决策项，不允许混进台账假装闭合。
+
+POST	/api/action	前端调用	web/src/api/index.js:1465:/api/action	调用点 actionSignal()（本行由核对器派生，勿手改）
+GET	/api/admin/users	前端调用	web/src/api/index.js:2122:/api/admin/users	调用点 fetchAdminUsers()（本行由核对器派生，勿手改）
+POST	/api/admin/users	前端调用	web/src/api/index.js:2128:/api/admin/users	调用点 createAdminUser()（本行由核对器派生，勿手改）
+DELETE	/api/admin/users/{id}	前端调用	web/src/api/index.js:2164:/api/admin/users/	调用点 deleteAdminUser()（本行由核对器派生，勿手改）
+GET	/api/admin/users/{id}/config/strategy	前端调用	web/src/api/index.js:2200:/api/admin/users/	调用点 fetchAdminStrategyConfig()（本行由核对器派生，勿手改）
+POST	/api/admin/users/{id}/config/strategy	前端调用	web/src/api/index.js:2205:/api/admin/users/	调用点 setAdminStrategyConfig()（本行由核对器派生，勿手改）
+POST	/api/admin/users/{id}/enabled	前端调用	web/src/api/index.js:2152:/api/admin/users/	调用点 setAdminUserEnabled()（本行由核对器派生，勿手改）
+POST	/api/admin/users/{id}/expiry	前端调用	web/src/api/index.js:2158:/api/admin/users/	调用点 setAdminUserExpiry()（本行由核对器派生，勿手改）
+POST	/api/admin/users/{id}/password	前端调用	web/src/api/index.js:2146:/api/admin/users/	调用点 setAdminUserPassword()（本行由核对器派生，勿手改）
+POST	/api/admin/users/{id}/perms	前端调用	web/src/api/index.js:2140:/api/admin/users/	调用点 setAdminUserPerms()（本行由核对器派生，勿手改）
+POST	/api/admin/users/{id}/role	前端调用	web/src/api/index.js:2134:/api/admin/users/	调用点 setAdminUserRole()（本行由核对器派生，勿手改）
+POST	/api/admin/users/cleanup	前端调用	web/src/api/index.js:2172:/api/admin/users/cleanup	调用点 cleanupAdminUsers()（本行由核对器派生，勿手改）
+DELETE	/api/alerts	前端调用	web/src/api/index.js:828:/api/alerts	调用点 clearAlerts()（本行由核对器派生，勿手改）
+GET	/api/alerts	前端调用	web/src/api/index.js:820:/api/alerts	调用点 fetchAlerts()（本行由核对器派生，勿手改）
+DELETE	/api/alerts/{id}	前端调用	web/src/api/index.js:838:/api/alerts/	调用点 deleteAlert()（本行由核对器派生，勿手改）
+GET	/api/auth/me	前端调用	web/src/api/index.js:499:/api/auth/me	调用点 refreshMe()（本行由核对器派生，勿手改）
+POST	/api/backtest/optimize	前端调用	web/src/api/index.js:2212:/api/backtest/optimize	调用点 enqueueOptimize()（本行由核对器派生，勿手改）
+GET	/api/config/d1	前端调用	web/src/api/index.js:1782:/api/config/d1	调用点 fetchD1Config()（本行由核对器派生，勿手改）
+POST	/api/config/d1	前端调用	web/src/api/index.js:1787:/api/config/d1	调用点 setD1Config()（本行由核对器派生，勿手改）
+GET	/api/config/history	前端调用	web/src/api/index.js:1115:/api/config/history	调用点 fetchConfigHistory()（本行由核对器派生，勿手改）
+GET	/api/config/llm	前端调用	web/src/api/index.js:1708:/api/config/llm	调用点 fetchLLMConfig()（本行由核对器派生，勿手改）
+POST	/api/config/llm	前端调用	web/src/api/index.js:1720:/api/config/llm	调用点 setLLMConfig()（本行由核对器派生，勿手改）
+POST	/api/config/llm/probe	前端调用	web/src/api/index.js:1732:/api/config/llm/probe	调用点 probeLLMConfig()（本行由核对器派生，勿手改）
+POST	/api/config/llm/rollback	前端调用	web/src/api/index.js:1742:/api/config/llm/rollback	调用点 rollbackLLMConfig()（本行由核对器派生，勿手改）
+GET	/api/config/qmt	前端调用	web/src/api/index.js:921:/api/config/qmt	调用点 fetchQMTConfig()（本行由核对器派生，勿手改）
+POST	/api/config/qmt	前端调用	web/src/api/index.js:929:/api/config/qmt	调用点 updateQMTConfig()（本行由核对器派生，勿手改）
+POST	/api/config/rollback	前端调用	web/src/api/index.js:1120:/api/config/rollback	调用点 rollbackConfig()（本行由核对器派生，勿手改）
+GET	/api/config/strategy	前端调用	web/src/api/index.js:1753:/api/config/strategy	调用点 fetchStrategyConfig()（本行由核对器派生，勿手改）
+POST	/api/config/strategy	前端调用	web/src/api/index.js:1761:/api/config/strategy	调用点 setStrategyConfig()（本行由核对器派生，勿手改）
+POST	/api/consult	前端调用	web/src/api/index.js:1893:/api/consult	调用点 consultChat()（本行由核对器派生，勿手改）
+DELETE	/api/consult/history	前端调用	web/src/api/index.js:1909:/api/consult/history	调用点 clearConsultHistory()（本行由核对器派生，勿手改）
+GET	/api/consult/history	前端调用	web/src/api/index.js:1901:/api/consult/history	调用点 fetchConsultHistory()（本行由核对器派生，勿手改）
+GET	/api/consult/pro-mode	前端调用	web/src/api/index.js:1917:/api/consult/pro-mode	调用点 fetchConsultProMode()（本行由核对器派生，勿手改）
+PUT	/api/consult/pro-mode	前端调用	web/src/api/index.js:1927:/api/consult/pro-mode	调用点 setConsultProMode()（本行由核对器派生，勿手改）
+GET	/api/dashboard	前端调用	web/src/api/index.js:798:/api/dashboard	调用点 fetchDashboard()（本行由核对器派生，勿手改）
+GET	/api/data_source_health	前端调用	web/src/api/index.js:1866:/api/data_source_health	调用点 fetchDataSourceHealth()（本行由核对器派生，勿手改）
+GET	/api/depth/{code}	前端调用	web/src/api/index.js:775:/api/depth/	调用点 fetchDepth()（本行由核对器派生，勿手改）
+GET	/api/engine_health	前端调用	web/src/api/index.js:809:/api/engine_health	调用点 fetchEngineHealth()（本行由核对器派生，勿手改）
+GET	/api/evaluations	前端调用	web/src/api/index.js:1318:/api/evaluations	调用点 fetchEvaluations()（本行由核对器派生，勿手改）
+POST	/api/events/ticket	前端调用	web/src/api/index.js:1601:/api/events/ticket	调用点 connectSSE()（本行由核对器派生，勿手改）
+GET	/api/holdings	前端调用	web/src/api/index.js:856:/api/holdings	调用点 fetchHoldings()（本行由核对器派生，勿手改）
+POST	/api/holdings	前端调用	web/src/api/index.js:1220:/api/holdings	调用点 updateHoldings()（本行由核对器派生，勿手改）
+POST	/api/holdings/{code}/add	前端调用	web/src/api/index.js:1245:/api/holdings/	调用点 addHoldingLot()（本行由核对器派生，勿手改）
+POST	/api/holdings/{code}/close	前端调用	web/src/api/index.js:1261:/api/holdings/	调用点 closeHolding()（本行由核对器派生，勿手改）
+POST	/api/holdings/{code}/cost	前端调用	web/src/api/index.js:1253:/api/holdings/	调用点 setHoldingCost()（本行由核对器派生，勿手改）
+POST	/api/holdings/{code}/sell	前端调用	web/src/api/index.js:1269:/api/holdings/	调用点 sellHoldingLot()（本行由核对器派生，勿手改）
+POST	/api/holdings/balance	前端调用	web/src/api/index.js:1228:/api/holdings/balance	调用点 updateHoldingsBalance()（本行由核对器派生，勿手改）
+POST	/api/holdings/pnl-offset	前端调用	web/src/api/index.js:1237:/api/holdings/pnl-offset	调用点 resetPaperPnlOffset()（本行由核对器派生，勿手改）
+GET	/api/ipo/calendar	前端调用	web/src/api/index.js:1352:/api/ipo/calendar	调用点 fetchIPOCalendar()（本行由核对器派生，勿手改）
+GET	/api/llm-debug	前端调用	web/src/api/index.js:1795:/api/llm-debug	调用点 fetchLLMDebug()（本行由核对器派生，勿手改）
+GET	/api/market/emotion/history	前端调用	web/src/api/index.js:411:/api/market/emotion/history	调用点 fetchEmotionHistory()（本行由核对器派生，勿手改）
+GET	/api/minute	前端调用	web/src/api/index.js:763:/api/minute	调用点 fetchMinute()（本行由核对器派生，勿手改）
+GET	/api/news	前端调用	web/src/api/index.js:1411:/api/news	调用点 fetchNews()（本行由核对器派生，勿手改）
+POST	/api/news/reanalyze	前端调用	web/src/api/index.js:1425:/api/news/reanalyze	调用点 reanalyzeNews()（本行由核对器派生，勿手改）
+GET	/api/news/showall	前端调用	web/src/api/index.js:1845:/api/news/showall	调用点 fetchNewsShowAllStatus()（本行由核对器派生，勿手改）
+POST	/api/news/showall	前端调用	web/src/api/index.js:1853:/api/news/showall	调用点 toggleNewsShowAll()（本行由核对器派生，勿手改）
+GET	/api/news_source_health	前端调用	web/src/api/index.js:1880:/api/news_source_health	调用点 fetchNewsSourceHealth()（本行由核对器派生，勿手改）
+GET	/api/opslog	前端调用	web/src/api/index.js:2227:/api/opslog	调用点 fetchOpslog()（本行由核对器派生，勿手改）
+GET	/api/opslog/dates	前端调用	web/src/api/index.js:2218:/api/opslog/dates	调用点 fetchOpslogDates()（本行由核对器派生，勿手改）
+POST	/api/paper/buy	前端调用	web/src/api/index.js:1144:/api/paper/buy	调用点 buyPaperPosition()（本行由核对器派生，勿手改）
+GET	/api/paper/config	前端调用	web/src/api/index.js:1086:/api/paper/config	调用点 fetchPaperConfig()（本行由核对器派生，勿手改）
+POST	/api/paper/config	前端调用	web/src/api/index.js:1091:/api/paper/config	调用点 updatePaperConfig()（本行由核对器派生，勿手改）
+GET	/api/paper/equity	前端调用	web/src/api/index.js:1058:/api/paper/equity	调用点 fetchPaperEquity()（本行由核对器派生，勿手改）
+GET	/api/paper/orders	前端调用	web/src/api/index.js:1051:/api/paper/orders	调用点 fetchPaperOrders()（本行由核对器派生，勿手改）
+POST	/api/paper/pool/config	前端调用	web/src/api/index.js:1196:/api/paper/pool/config	调用点 configPaperPools()（本行由核对器派生，勿手改）
+POST	/api/paper/pool/reset	前端调用	web/src/api/index.js:1175:/api/paper/pool/reset	调用点 resetPaperPool()（本行由核对器派生，勿手改）
+GET	/api/paper/positions	前端调用	web/src/api/index.js:1037:/api/paper/positions	调用点 fetchPaperPositions()（本行由核对器派生，勿手改）
+POST	/api/paper/reset	前端调用	web/src/api/index.js:1209:/api/paper/reset	调用点 resetPaper()（本行由核对器派生，勿手改）
+GET	/api/paper/selfcheck	前端调用	web/src/api/index.js:1067:/api/paper/selfcheck	调用点 fetchPaperSelfCheck()（本行由核对器派生，勿手改）
+POST	/api/paper/sell	前端调用	web/src/api/index.js:1161:/api/paper/sell	调用点 sellPaperPosition()（本行由核对器派生，勿手改）
+POST	/api/paper/short_cover	前端调用	web/src/api/index.js:1167:/api/paper/short_cover	调用点 shortCoverPaper()（本行由核对器派生，勿手改）
+GET	/api/paper/state	前端调用	web/src/api/index.js:1030:/api/paper/state	调用点 fetchPaperState()（本行由核对器派生，勿手改）
+GET	/api/paper/strategies	前端调用	web/src/api/index.js:1073:/api/paper/strategies	调用点 fetchPaperStrategies()（本行由核对器派生，勿手改）
+POST	/api/paper/strategies	前端调用	web/src/api/index.js:1079:/api/paper/strategies	调用点 updatePaperStrategies()（本行由核对器派生，勿手改）
+GET	/api/paper/trades	前端调用	web/src/api/index.js:1044:/api/paper/trades	调用点 fetchPaperTrades()（本行由核对器派生，勿手改）
+GET	/api/positions/advice	前端调用	web/src/api/index.js:870:/api/positions/advice	调用点 fetchRealAdvice()（本行由核对器派生，勿手改）
+POST	/api/positions/execute	前端调用	web/src/api/index.js:890:/api/positions/execute	调用点 executeRealAction()（本行由核对器派生，勿手改）
+GET	/api/positions/real	前端调用	web/src/api/index.js:863:/api/positions/real	调用点 fetchRealPositions()（本行由核对器派生，勿手改）
+GET	/api/qmt/broker	前端调用	web/src/api/index.js:905:/api/qmt/broker	调用点 fetchQMTBroker()（本行由核对器派生，勿手改）
+POST	/api/qmt/broker	前端调用	web/src/api/index.js:912:/api/qmt/broker	调用点 switchQMTBroker()（本行由核对器派生，勿手改）
+POST	/api/qmt/cancel/{order_id}	前端调用	web/src/api/index.js:961:/api/qmt/cancel/	调用点 qmtCancel()（本行由核对器派生，勿手改）
+GET	/api/qmt/fill-amendments	前端调用	web/src/api/index.js:988:/api/qmt/fill-amendments	调用点 fetchFillAmendments()（本行由核对器派生，勿手改）
+POST	/api/qmt/fill-amendments	前端调用	web/src/api/index.js:997:/api/qmt/fill-amendments	调用点 createFillAmendment()（本行由核对器派生，勿手改）
+POST	/api/qmt/fill-amendments/{id}/apply	前端调用	web/src/api/index.js:1006:/api/qmt/fill-amendments/	调用点 applyFillAmendment()（本行由核对器派生，勿手改）
+POST	/api/qmt/fill-amendments/{id}/revoke	前端调用	web/src/api/index.js:1012:/api/qmt/fill-amendments/	调用点 revokeFillAmendment()（本行由核对器派生，勿手改）
+GET	/api/qmt/fills/conservation	前端调用	web/src/api/index.js:1022:/api/qmt/fills/conservation	调用点 fetchFillConservation()（本行由核对器派生，勿手改）
+POST	/api/qmt/halt	前端调用	web/src/api/index.js:954:/api/qmt/halt	调用点 qmtHalt()（本行由核对器派生，勿手改）
+POST	/api/qmt/order-confirm	前端调用	web/src/api/index.js:2293:/api/qmt/order-confirm	调用点 qmtOrderConfirm()（本行由核对器派生，勿手改）
+GET	/api/qmt/orders	前端调用	web/src/api/index.js:944:/api/qmt/orders	调用点 fetchQMTOrders()（本行由核对器派生，勿手改）
+GET	/api/qmt/pending-review	前端调用	web/src/api/index.js:2285:/api/qmt/pending-review	调用点 qmtPendingReview()（本行由核对器派生，勿手改）
+POST	/api/qmt/settle	前端调用	web/src/api/index.js:968:/api/qmt/settle	调用点 qmtSettle()（本行由核对器派生，勿手改）
+GET	/api/qmt/settle/history	前端调用	web/src/api/index.js:975:/api/qmt/settle/history	调用点 fetchQMTSettleHistory()（本行由核对器派生，勿手改）
+GET	/api/qmt/state	前端调用	web/src/api/index.js:898:/api/qmt/state	调用点 fetchQMTState()（本行由核对器派生，勿手改）
+GET	/api/qmt/trades	前端调用	web/src/api/index.js:937:/api/qmt/trades	调用点 fetchQMTTrades()（本行由核对器派生，勿手改）
+GET	/api/research/backtest-config	前端调用	web/src/api/index.js:2259:/api/research/backtest-config	调用点 fetchBacktestConfig()（本行由核对器派生，勿手改）
+PUT	/api/research/backtest-config	前端调用	web/src/api/index.js:2265:/api/research/backtest-config	调用点 saveBacktestConfig()（本行由核对器派生，勿手改）
+GET	/api/research/backtest-toggle	前端调用	web/src/api/index.js:2105:/api/research/backtest-toggle	调用点 fetchBacktestToggle()（本行由核对器派生，勿手改）
+POST	/api/research/backtest-toggle	前端调用	web/src/api/index.js:2111:/api/research/backtest-toggle	调用点 setBacktestToggle()（本行由核对器派生，勿手改）
+GET	/api/research/backtest/{id}	前端调用	web/src/api/index.js:2060:/api/research/backtest/	调用点 fetchBacktestStatus()（本行由核对器派生，勿手改）
+POST	/api/research/backtest/{id}/cancel	前端调用	web/src/api/index.js:2027:/api/research/backtest/	调用点 cancelBacktest()（本行由核对器派生，勿手改）
+POST	/api/research/backtest/{id}/pause	前端调用	web/src/api/index.js:2033:/api/research/backtest/	调用点 pauseBacktest()（本行由核对器派生，勿手改）
+POST	/api/research/backtest/{id}/resume	前端调用	web/src/api/index.js:2039:/api/research/backtest/	调用点 resumeBacktest()（本行由核对器派生，勿手改）
+GET	/api/research/backtest/list	前端调用	web/src/api/index.js:2072:/api/research/backtest/list	调用点 fetchAllBacktests()（本行由核对器派生，勿手改）
+GET	/api/research/backtest/running	前端调用	web/src/api/index.js:2066:/api/research/backtest/running	调用点 fetchRunningBacktests()（本行由核对器派生，勿手改）
+GET	/api/research/candidates	前端调用	web/src/api/index.js:1979:/api/research/candidates	调用点 fetchResearchCandidates()（本行由核对器派生，勿手改）
+POST	/api/research/candidates/{id}/approve	前端调用	web/src/api/index.js:1985:/api/research/candidates/	调用点 approveResearchCandidate()（本行由核对器派生，勿手改）
+POST	/api/research/candidates/{id}/backtest	前端调用	web/src/api/index.js:2017:/api/research/candidates/	调用点 backtestResearchCandidate()（本行由核对器派生，勿手改）
+POST	/api/research/candidates/{id}/grayscale	前端调用	web/src/api/index.js:1991:/api/research/candidates/	调用点 grayscaleResearchCandidate()（本行由核对器派生，勿手改）
+POST	/api/research/candidates/{id}/reject	前端调用	web/src/api/index.js:1997:/api/research/candidates/	调用点 rejectResearchCandidate()（本行由核对器派生，勿手改）
+GET	/api/research/emotion-strategy-matrix	前端调用	web/src/api/index.js:418:/api/research/emotion-strategy-matrix	调用点 fetchEmotionStrategyMatrix()（本行由核对器派生，勿手改）
+GET	/api/research/event-factor	前端调用	web/src/api/index.js:1962:/api/research/event-factor	调用点 fetchResearchEventFactor()（本行由核对器派生，勿手改）
+GET	/api/research/factors	前端调用	web/src/api/index.js:1970:/api/research/factors	调用点 fetchResearchFactors()（本行由核对器派生，勿手改）
+GET	/api/research/library	前端调用	web/src/api/index.js:2081:/api/research/library	调用点 fetchResearchLibrary()（本行由核对器派生，勿手改）
+POST	/api/research/library/{id}/backtest	前端调用	web/src/api/index.js:2054:/api/research/library/	调用点 backtestLibraryRule()（本行由核对器派生，勿手改）
+POST	/api/research/library/{id}/delete	前端调用	web/src/api/index.js:2093:/api/research/library/	调用点 deleteResearchLibrary()（本行由核对器派生，勿手改）
+POST	/api/research/library/{id}/disable	前端调用	web/src/api/index.js:2087:/api/research/library/	调用点 setResearchLibraryEnabled()（本行由核对器派生，勿手改）
+POST	/api/research/library/{id}/enable	前端调用	web/src/api/index.js:2087:/api/research/library/	调用点 setResearchLibraryEnabled()（本行由核对器派生，勿手改）
+POST	/api/research/library/{id}/rename	前端调用	web/src/api/index.js:2099:/api/research/library/	调用点 renameResearchLibrary()（本行由核对器派生，勿手改）
+GET	/api/research/optimizations	前端调用	web/src/api/index.js:2233:/api/research/optimizations	调用点 fetchOptimizations()（本行由核对器派生，勿手改）
+POST	/api/research/optimizations/{id}/approve	前端调用	web/src/api/index.js:2253:/api/research/optimizations/	调用点 approveOptimization()（本行由核对器派生，勿手改）
+POST	/api/research/optimizations/{id}/reject	前端调用	web/src/api/index.js:2271:/api/research/optimizations/	调用点 rejectOptimization()（本行由核对器派生，勿手改）
+GET	/api/research/paper-reports	前端调用	web/src/api/index.js:1109:/api/research/paper-reports	调用点 fetchPaperResearchReports()（本行由核对器派生，勿手改）
+GET	/api/research/progress	前端调用	web/src/api/index.js:1938:/api/research/progress	调用点 fetchResearchProgress()（本行由核对器派生，勿手改）
+POST	/api/research/strategies/rollback	前端调用	web/src/api/index.js:1131:/api/research/strategies/rollback	调用点 rollbackStrategyParams()（本行由核对器派生，勿手改）
+GET	/api/research/strategies/snapshots	前端调用	web/src/api/index.js:1126:/api/research/strategies/snapshots	调用点 fetchStrategySnapshots()（本行由核对器派生，勿手改）
+GET	/api/research/sweep-pools	前端调用	web/src/api/index.js:2239:/api/research/sweep-pools	调用点 fetchSweepPools()（本行由核对器派生，勿手改）
+PUT	/api/research/sweep-pools	前端调用	web/src/api/index.js:2245:/api/research/sweep-pools	调用点 saveSweepPool()（本行由核对器派生，勿手改）
+GET	/api/research/task/{id}/log	前端调用	web/src/api/index.js:1955:/api/research/task/	调用点 getResearchTaskLog()（本行由核对器派生，勿手改）
+POST	/api/review/positions	前端调用	web/src/api/index.js:845:/api/review/positions	调用点 reviewPositions()（本行由核对器派生，勿手改）
+GET	/api/risk/gates	前端调用	web/src/api/index.js:1103:/api/risk/gates	调用点 fetchRiskGates()（本行由核对器派生，勿手改）
+GET	/api/scheduler/status	前端调用	web/src/api/index.js:1947:/api/scheduler/status	调用点 getSchedulerStatus()（本行由核对器派生，勿手改）
+GET	/api/sector/hot	前端调用	web/src/api/index.js:1280:/api/sector/hot	调用点 fetchSectorHot()（本行由核对器派生，勿手改）
+GET	/api/sector/hot/records	前端调用	web/src/api/index.js:1288:/api/sector/hot/records	调用点 fetchSectorHotRecords()（本行由核对器派生，勿手改）
+GET	/api/short/status	前端调用	web/src/api/index.js:1826:/api/short/status	调用点 fetchShortStatus()（本行由核对器派生，勿手改）
+POST	/api/short/toggle	前端调用	web/src/api/index.js:1834:/api/short/toggle	调用点 toggleShort()（本行由核对器派生，勿手改）
+GET	/api/signal-logs	前端调用	web/src/api/index.js:1815:/api/signal-logs	调用点 fetchSignalLogs()（本行由核对器派生，勿手改）
+GET	/api/signalctl/verdicts	前端调用	web/src/api/index.js:1097:/api/signalctl/verdicts	调用点 fetchSignalVerdicts()（本行由核对器派生，勿手改）
+GET	/api/signals	前端调用	web/src/api/index.js:749:/api/signals	调用点 fetchSignals()（本行由核对器派生，勿手改）
+GET	/api/snapshot	前端调用	web/src/api/index.js:1299:/api/snapshot	调用点 fetchSnapshot()（本行由核对器派生，勿手改）
+GET	/api/snapshot/hot	前端调用	web/src/api/index.js:1307:/api/snapshot/hot	调用点 fetchHotSnapshot()（本行由核对器派生，勿手改）
+GET	/api/stage-records	前端调用	web/src/api/index.js:1806:/api/stage-records	调用点 fetchStageRecords()（本行由核对器派生，勿手改）
+GET	/api/status	前端调用	web/src/api/index.js:788:/api/status	调用点 fetchStatus()（本行由核对器派生，勿手改）
+GET	/api/stock/lookup	前端调用	web/src/api/index.js:1377:/api/stock/lookup	调用点 fetchStockLookup()（本行由核对器派生，勿手改）
+GET	/api/stock/names	前端调用	web/src/api/index.js:1396:/api/stock/names	调用点 fetchStockNames()（本行由核对器派生，勿手改）
+GET	/api/tenants	前端调用	web/src/api/index.js:2178:/api/tenants	调用点 fetchTenants()（本行由核对器派生，勿手改）
+POST	/api/tenants	前端调用	web/src/api/index.js:2184:/api/tenants	调用点 createTenant()（本行由核对器派生，勿手改）
+PUT	/api/tenants/{id}	前端调用	web/src/api/index.js:2190:/api/tenants/	调用点 updateTenant()（本行由核对器派生，勿手改）
+DELETE	/api/watchlist	前端调用	web/src/api/index.js:1452:/api/watchlist	调用点 removeWatchlist()（本行由核对器派生，勿手改）
+GET	/api/watchlist	前端调用	web/src/api/index.js:1436:/api/watchlist	调用点 fetchWatchlist()（本行由核对器派生，勿手改）
+POST	/api/watchlist	前端调用	web/src/api/index.js:1444:/api/watchlist	调用点 addWatchlist()（本行由核对器派生，勿手改）
+
+# ── 以下 36 行为非前端路由：逐条人工分类 + 可核落点（R − C）──
+POST	/api/auth/login	前端直连	web/src/api/index.js:722:const url = baseUrl() + '/api/auth/login'	登录页直拨 fetch（要读 401 的响应体做提示，走 request() 会被封装成抛错丢掉文案）
+POST	/api/auth/logout	前端直连	web/src/api/index.js:398:await fetch(base + '/api/auth/logout'	登出走 fetch 且不吃异常：服务端 5xx 时本地会话仍必须清干净，不能被封装的抛错打断
+GET	/api/events	前端直连	web/src/api/index.js:1621:'/api/events?ticket='	SSE 只能由 EventSource 建链（request() 不在射程）；票据由 POST /api/events/ticket 签，§WS-F C4a
+GET	/api/app/version	原生壳	internal/server/app_version.go:22:handleAppVersion	Android 壳在登录前拉强制更新单，故意不套鉴权（§APPVER：更新通道若依赖登录即死锁）
+POST	/api/qmt/report	网关回调	qmt_gateway/handler.py:129:"/api/qmt/report"	Python 网关 outbox 后台线程推送成交/委托回报（§P2-A）；鉴权走 qmtReportMiddleware，非 UI 也非 curl
+POST	/auth/login	兼容端点	scripts/monitor_test.sh:249:"${BASE_URL}/auth/login"	旧路径别名：Android 壳旧版本与监控脚本仍在拨，与 POST /api/auth/login 同一处理器，删了即 404
+POST	/auth/register	兼容端点	internal/e2e/uat_live_probe_test.go:174:"/auth/register"	注册通道实际已关（处理器内回 403 提示文案），pattern 保留让旧壳拿到可读的 403 而不是 404
+POST	/auth/temp	兼容端点	internal/e2e/uat_live_probe_test.go:178:"/auth/temp"	临时号同样已关（403）；曾因匿名可领 14 天 token 被收口（见 internal/server/qmt.go:111 成因），不复活只留别名
+GET	/api/kline	兼容端点	internal/server/handlers_fix.go:531:handleFixKLine	fix 前端兼容层里的 K 线口径：页面走 /api/minute 与研究链，本入口保留给外部脚本按旧契约取数
+GET	/api/positions	运维 curl	scripts/monitor_test.sh:308:"/api/positions" 200	监控脚本每轮读大盘持仓做存活+响应体抽检（持仓页本身走 /api/holdings 系，§E-1 对账已记）
+POST	/api/positions	运维 curl	scripts/monitor_test.sh:369:"/api/positions" 201	监控脚本建仓腿：造一条测试持仓再平掉，验证运营账本写路径整条通
+POST	/api/positions/{id}/exit	运维 curl	scripts/monitor_test.sh:377:"/api/positions/${pos_id}/exit"	上一条腿的平仓侧：do_curl 真拨 200 才算闭环（前端无入口，账本 exit 属运营操作）
+GET	/api/health	运维 curl	scripts/monitor_test.sh:386:"/api/health" 200	就绪/存活判据：监控轮 + uat_bootstrap.sh:480 的 60s 等待循环都读这个口（不算业务调用）
+GET	/setup	运维 curl	scripts/monitor_test.sh:208:"${BASE_URL}/setup"	初始化状态读数（监控脚本用它区分「服务活着」与「还没初始化」）；Web 无安装向导页
+POST	/setup	运维 curl	scripts/monitor_test.sh:231:"POST" "/setup" 200	首次抢跑守卫：只在初始化态由运维脚本写入管理员；带 SETUP_TOKEN 守卫（deploy_seoul.sh:32）
+GET	/api/engine/init-status	运维 curl	internal/e2e/uat_live_probe_test.go:246:"/api/engine/init-status"	引擎冷启动进度读数：由 UAT 真拨测与运维 curl 消费，页面用 /api/status 概览
+GET	/api/long/status	运维 curl	internal/e2e/uat_live_probe_test.go:441:"/api/long/status"	多空档位现值读数（UAT 真拨测 + 人工 curl 核对）；前端没有多空开关面板，故不在 C 里
+POST	/api/long/toggle	运维 curl	internal/e2e/uat_live_probe_test.go:445:"/api/long/toggle"	档位切换收权 admin 后只由拨测/人工触发；无 UI 入口属功能未完（不是死码，能力尺寸在）
+POST	/api/news/test-attribution	运维 curl	scripts/verify_deploy_guangzhou.sh:268:/api/news/test-attribution	发版探针按「未鉴权必 401」拨它做收权复核（§M-14）；Stage2 手动试跑口保留给 admin 排障，会烧 LLM 配额
+GET	/api/metrics	运维 curl	internal/metrics/metrics.go:2:经 /api/metrics（鉴权后）导出	expvar 量规面：人工带 admin token curl 读数；发版验证链刻意不消费它（§FQ 凭据负锁钉死，见 verify_changes.sh:4444）
+GET	/api/metrics/prometheus	运维 curl	internal/server/metrics_handler.go:14:handlePrometheusMetrics	Prometheus text 导出（§WS-L 维5，promtool 可校验）：给外部抓取器/人工 curl，本仓无面板也无抓取配置
+GET	/api/metrics/alerts	运维 curl	internal/server/metrics_handler.go:21:handleAlertState	阈值告警状态机读数（规则来自 metrics.DefaultAlertRules）：运维 curl 观察；页面告警卡走 /api/alerts 系
+PUT	/api/positions/{id}	无 UI 待补	internal/server/server.go:698:PUT /api/positions/{id}	运营账本改单能力已在（admin 门），持仓页只走 /api/holdings 系；保留尺寸等台账页，删除会断掉脚本旁路
+DELETE	/api/positions/{id}	无 UI 待补	internal/server/server.go:699:DELETE /api/positions/{id}	同上：账本删单无页面入口（§E-1 对账记录为有意设计），先补台账页再谈收敛
+GET	/api/tenant/usage	无 UI 待补	web/src/api/index.js:2194:fetchTenantUsage	前端 wrapper 已按 §PERM-GATE 删除（用量改由 GET /api/tenants 行内返回），后端路由保留供配额核对
+PUT	/api/admin/users/{id}/tenant	无 UI 待补	web/src/api/index.js:2194:moveUserTenant	账号迁移「无 UI，待定产品决策」（同一注释自认）：迁移能力先保留，产品拍板后补入口而非重写后端
+GET	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:591:GET /api/admin/users/{id}/config/d1	按账号代配通道：admin 面板目前只做全局 /api/config/d1 + 账号级 strategy；代配靠 curl，留尺寸给代客配置页
+POST	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:592:POST /api/admin/users/{id}/config/d1	读侧同族：写侧也是稀疏 merge + 写前快照 + 字段级审计（§0929CFG-D1），无 UI 只是没有页面不是没有能力
+GET	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:593:GET /api/admin/users/{id}/config/longshort	多空参数代配：前端仅 strategy 有按账号面板（index.js:2195 注释记着这批 wrapper 被当死码删过）
+POST	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:594:POST /api/admin/users/{id}/config/longshort	同上写侧：保留供运营代客调参；若将来收敛必须先确认没有账号在用这份账号级覆盖
+GET	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:595:GET /api/admin/users/{id}/config/llm	LLM 代配读侧（含脱敏哨兵回填）：页面只有本账号的 /api/config/llm，按账号覆盖靠 curl 维护
+POST	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:596:POST /api/admin/users/{id}/config/llm	LLM 代配写侧：会触发热重建客户端，属特权变更——保留但不给 UI 入口是刻意的（误点即改密钥池）
+GET	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:598:GET /api/admin/users/{id}/config/qmt	QMT/战法配置代配读侧：页面走本账号 /api/config/qmt，按账号覆盖由运营脚本与 curl 使用
+POST	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:599:POST /api/admin/users/{id}/config/qmt	代配写侧会热加载实盘参数（§P2-A 链），无 UI 入口是权限设计而非遗漏；删之前要核现网有无账号级覆盖在生效
+POST	/api/paper/short_open	无 UI 待补	internal/server/server.go:688:handlePaperShortOpen	做空开仓缺页面入口（买回 /api/paper/short_cover 已有调用点）＝功能未完，不是死码，保留后端尺寸
+POST	/api/notify-test	无 UI 待补	internal/server/server.go:764:handleFixNotifyTest	§C9 把空 stub 升级成逐通道实弹探测：前端零调用，但删了就没有人工验证 ntfy/极光通道的入口（§N-2 已收权 admin）

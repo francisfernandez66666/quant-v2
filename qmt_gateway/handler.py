@@ -17,6 +17,9 @@
 §SIDE-AUTH-2（2026-09-23 夜间批）：带 side_unverified 标记（未命中派发行、方向仅为桥/柜台
 推断）的成交走「待核对」通道落库——fills 保留可复核证据行（side 落 UNRESOLVED_STATUS），
 但绝不改动持仓账；上报载荷保留推断方向 + 标记，由首尔侧留痕（详见 on_trade/store.apply_fill）。
+§W7-C（2026-10-09 波 7）：委托状态码映射由 fail-open 改 fail-closed——读不懂的码不再冒充
+「已报」（旧 `m.get(int(code or 0), "已报")`），而是返回「未知(<原始值)>」并计数+告警，
+因为「已报」在引擎侧是三本资金账的入口谓词（详见 _status）。
 （English: report handling — callbacks only enqueue; a dedicated sender thread drains the outbox
 in order with bounded retries, so slow Seoul never blocks channel callbacks nor loses events.
 Empty position snapshots are ignored (with warning) unless seen twice consecutively.）
@@ -51,6 +54,20 @@ HEARTBEAT_SEC = 60        # §ROBUST 上行心跳间隔（尽力而为，不入�
 # English: §P1-8 — permanently-rejected statuses (client errors other than auth/rate-limit) are
 # dead-lettered instead of blocking the durable outbox FIFO forever.
 RETRYABLE_4XX = {401, 403, 408, 425, 429}
+
+# §W7-C（2026-10-09 波 7）：xtquant 委托状态码「读不懂」时的落点前缀（fail-closed 标记）。
+# 为什么单列成常量：映射（_status）、可见化（on_stock_order 的计数+告警）、运维观察位
+# （gateway._do_admin_status 的 unknown_status 段）三处都判同一个前缀，写三遍字面「未知」
+# 的结局是改一处漏两处——计数悄悄归零，而告警看上去还在。
+# English: §W7-C — the fail-closed marker prefix for status codes we cannot read; one constant
+# because mapping, counting and the ops endpoint all key off the same string.
+UNKNOWN_STATUS_PREFIX = "未知"
+
+# xtquant 委托状态码登记表（§W7-C 起从 _status 函数体提到模块级，供映射与自证用例共用）。
+# 255 是 xtquant 自带的「未知」原值，与前缀同串：柜台自己说未知时同样不冒充已报、同样计数。
+# 逐码来源：本机东莞证券 XtMiniQmt 构建实录 + xtconstant 文档枚举空间。
+XT_STATUS_CODES = {48: "未报", 49: "待报", 50: "已报", 51: "已报待撤", 52: "部成待撤",
+                   53: "部撤", 54: "已撤", 55: "部成", 56: "已成", 57: "废单", 255: "未知"}
 
 
 def _is_permanent_reject(status):
@@ -192,6 +209,10 @@ class ReportHandler:
         # §0926E2E-W2D 告警节拍态：跨水位的瞬间报一条，之后每加深 50 行追一条，回到水位下复位
         # （每次入队都刷屏会把真告警淹死；一条不回则恢复后没人知道曾溢出过）。
         self._outbox_over = False
+        # §W7-C 未识别状态码计数与最后一次原始值（repr 串，含类型便于分辨 None/""/字符串码）。
+        # 这两个是「要人去看才知道」的资金面事实，走 /admin/status 观察位而不是另开告警通道。
+        self.unknown_status_total = 0
+        self.last_unknown_status = ""
 
     def start_sender(self):
         """启动后台回报发送线程 + 上行心跳线程（幂等，重复调用直接返回）。
@@ -275,6 +296,8 @@ class ReportHandler:
         prctype=84/stat 57——xtquant 回调对象携带 status_msg/order_status_msg 被此处丢弃，
         引擎侧永远看不到柜台废单原因）。尽力提取原因字段透传给引擎（字段名跨构建不定，
         逐一探测，缺失为空串）。
+        §W7-C：状态映射由 fail-open（读不懂一律「已报」）改为 fail-closed（「未知(原始值)」+ 计数
+        告警），映射失败的单不再冒充资金账入口谓词（详见 _status）。
         """
         reason = ""
         for attr in ("order_status_msg", "status_msg", "strategy_name", "error_info", "msg"):
@@ -283,12 +306,25 @@ class ReportHandler:
                 reason = str(v)
                 break
         ts = _now_cn()  # §TZ
+        status = self._status(getattr(order, "order_status", ""))
+        # §W7-C 可见化点：映射失败（未登记/缺失/非数字，含柜台自带的 255「未知」）不再静默伪装成
+        # 已知态，但也不能只写进日志等人去翻——计数落到处理器上，由网关 /admin/status 回显
+        # （gateway._do_admin_status 的 unknown_status 段），与 §P2-G 文件桥失败计数同姿势。
+        if status.startswith(UNKNOWN_STATUS_PREFIX):
+            self.unknown_status_total += 1
+            self.last_unknown_status = repr(getattr(order, "order_status", None))
+            log.warning("[handler] §W7-C 无法识别的委托状态码 order_status=%s → %s"
+                        "（order_id=%s code=%s 累计第 %d 次；该串不进引擎侧冻结/跨日降废/在途卖量三本账，"
+                        "需人工核对柜台）",
+                        self.last_unknown_status, status,
+                        getattr(order, "order_id", ""), getattr(order, "stock_code", ""),
+                        self.unknown_status_total)
         self.on_order({
             "order_id": str(getattr(order, "order_id", "")),
             "signal_id": self._signal_of(order),
             "code": getattr(order, "stock_code", ""),
             "side": self._side_of(order),
-            "status": self._status(getattr(order, "order_status", "")),
+            "status": status,
             "price": float(getattr(order, "price", 0) or 0),
             "qty": int(getattr(order, "order_volume", 0) or 0),
             "reason": reason,
@@ -441,11 +477,41 @@ class ReportHandler:
 
     @staticmethod
     def _status(code):
-        """xtquant 委托状态码 → 中文（简化为 已报/已成/已撤/已废）。"""
-        # xtquant 状态码常量映射表：键为数字状态码，值为中文语义
-        m = {48: "未报", 49: "待报", 50: "已报", 51: "已报待撤", 52: "部成待撤", 53: "部撤",
-             54: "已撤", 55: "部成", 56: "已成", 57: "废单", 255: "未知"}
-        return m.get(int(code or 0), "已报")
+        """xtquant 委托状态码 → 中文（§W7-C：读不懂的码回「未知(<原始值>)」，不再冒充任何已知态）。
+
+        缺陷原文（旧实现）：`return m.get(int(code or 0), "已报")` ——把**一切读不懂的状态**
+        统一伪造成「已报」。这不是保守，是伪造，而且有三条真实后果链（按运行时取值链数）：
+          ① 入口就是常态空值：`on_stock_order` 取码用的是 `getattr(order, "order_status", "")`，
+             xtquant 跨构建字段名/枚举空间会变（本文件 _side_of 的同族事故就是硬编码 1101 恒不命中），
+             属性缺失 → 空串 → `int("" or 0)=0` → 表里没有 0 → 「已报」；非数字串还会让 `int()`
+             抛 ValueError 直冲回调线程。
+          ② 「已报」不是显示串，而是引擎侧三本资金账的**入口谓词**
+             （internal/store/real_positions.go:809 买入冻结 `status='已报' OR status='部成'`、
+             :856 跨日把仍停在 已报/部成 的买单降为废单、:1024 在途卖量
+             `IN ('已报','部成','已报待撤','部成待撤')`）。于是一条柜台从未确认的回报会先占住
+             当日买入预算，再在跨日时被写成终态「废单」——真实可能早已成交的单在本地账上被改成作废。
+          ③ 全程没有可读信号：委托簿显示「已报」，人看不出它是映射失败的产物（§DEADGAUGE/§CAL-GATE
+             一致的「未知不伪造」口径在这里被破坏）。
+        现取向（fail-closed）：未登记/缺失/非数字一律返回带前缀 UNKNOWN_STATUS_PREFIX 的显式未知串，
+        原始值留在串里便于回查是哪个构建；「未知…」串不匹配上述任何谓词 ⇒ 资金判定宁可少算一笔，
+        由 on_stock_order 的计数 + 告警把这一笔变成**可见**事件（不进三本账 ≠ 不用管，而是必须有人看）。
+        English: unregistered / absent / non-numeric status codes now yield an explicit
+        未知(<raw>) marker instead of impersonating 已报, because 已报 is the entry predicate of
+        three money ledgers on the decision side; visibility comes from the counter + warning.
+        """
+        raw = "" if code is None else str(code).strip()
+        if not raw:
+            # 属性缺失/空串：旧实现正是从这里滑进「已报」的常态路径
+            return "%s(缺失)" % UNKNOWN_STATUS_PREFIX
+        try:
+            numeric = int(raw)
+        except ValueError:
+            # 非数字（枚举名字符串/带前缀的单号）：原样进标记串，绝不抛异常打断回调线程
+            return "%s(%s)" % (UNKNOWN_STATUS_PREFIX, raw)
+        mapped = XT_STATUS_CODES.get(numeric)
+        if mapped is not None:
+            return mapped
+        return "%s(%s)" % (UNKNOWN_STATUS_PREFIX, raw)
 
     # ── 事件落库 + 推送 ──
     def on_order(self, ev):

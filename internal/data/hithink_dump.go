@@ -78,6 +78,13 @@ func (c *HithinkClient) DownloadDumpFile(kind HithinkDumpKind, destPath string) 
 }
 
 // HithinkDailyKRow 日 K dump 行（date_ms 由调用方换算 yyyyMMdd）。
+//
+// §W7-D（2026-10-09）字段口径统一说明：Turnover 曾被注释成"换手率（%）"，而下游
+// cmd/dataload/hithink_sync.go 把它写进 ths_daily.amount（成交额列）——两者只能有一个对。
+// 现按同花顺 API 同名字段的既有口径记为**成交额**，并把"是不是元"这件事交给抽检
+// （internal/store.AmountProbedTables 里的 ths_daily 那条，均价 = amount/(vol×100) 落 1~500 元带）；
+// 换手率在 THS 侧另有字段（本仓 API 客户端里是 TurnoverRatioPct，internal/data/hithink.go）。
+// （Turnover is the turnover VALUE, not the turnover rate; the rate lives in TurnoverRatioPct.）
 type HithinkDailyKRow struct {
 	ThsCode  string  // 同花顺代码（如 "600519.SH"）
 	Date     string  // yyyyMMdd（交易日）
@@ -85,8 +92,8 @@ type HithinkDailyKRow struct {
 	High     float64 // 最高价（元）
 	Low      float64 // 最低价（元）
 	Close    float64 // 收盘价（元）
-	Volume   float64 // 成交量
-	Turnover float64 // 换手率（%）
+	Volume   float64 // 成交量（dump 口径＝股；入库 ÷100 换"手"，与 daily 对齐）
+	Turnover float64 // 成交额（§W7-D：单位由 ths_daily 量纲抽检读数判定，不再当作已核实事实）
 }
 
 // thsDumpDailyKRow parquet 物理行结构（列名与官方 schema 一致）。
@@ -100,8 +107,10 @@ type thsDumpDailyKRow struct {
 	HighPrice  float64 `parquet:"high_price"`  // 最高价
 	LowPrice   float64 `parquet:"low_price"`   // 最低价
 	ClosePrice float64 `parquet:"close_price"` // 收盘价
-	Volume     float64 `parquet:"volume"`      // 成交量
-	Turnover   float64 `parquet:"turnover"`    // 成交额/换手率
+	Volume     float64 `parquet:"volume"`      // 成交量（股）
+	// §W7-D：原注释"成交额/换手率"是两个语义挤在一行，正是矛盾注释的形态；
+	// 该列按成交额处理（换手率在 THS 侧是另一个字段），单位是否＝元由 ths_daily 抽检读数说。
+	Turnover float64 `parquet:"turnover"` // 成交额（单位见 HithinkDailyKRow.Turnover 说明）
 }
 
 // StreamDailyKParquet 流式解析日 K parquet，逐行回调（内存占用恒定）。

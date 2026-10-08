@@ -1,6 +1,7 @@
 // ── 持仓管理页面 Positions.jsx ──
 // 纸面持仓（增删改/加减仓/改成本/清仓/批次明细） + 实盘持仓（QMT 网关对账 + 手动下单）。
-// 收益展示：纸面总盈亏（已实现+浮动，可一键清零） / 实盘总盈亏（QMT trades 汇总优先）；
+// 收益展示：纸面总盈亏（已实现+浮动，可一键清零） / 实盘总盈亏（QMT trades 汇总优先，
+// 汇总未回来时按持仓浮动兜底并挂「本地兜底」标记自报口径，§W7-G）；
 // 建议回看：实盘持仓「建议」列由 SSE real_advice 实时推送 + 挂载 REST 回填（§F-6）点亮。
 // 纯 TDesign 组件（Tabs / TabPanel / Card / Table / Dialog / Form / Input / InputNumber / Button / Tag），无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
@@ -215,6 +216,24 @@ export default function Positions() {
     ? (realAccount && realAccount.available_cash != null ? realAccount.available_cash : 0)
     : availableBalance
   // 实盘总盈亏：优先用 /api/qmt/trades 的 total_pnl（已实现+浮动）；未取到时按实盘持仓现价-成本×数量兜底
+  //
+  // §W7-G（2026-10-06 修复批 波 7，owner 裁决「不删兜底，只把口径说清 + 让兜底可见」）：
+  // 这条兜底以前**只有一个数、没有身份**——网关成交汇总还没回来（首屏、/api/qmt/trades 失败、
+  // 账号未连网关）时页头照样打出一个「实盘 总盈亏: ¥xxxx」，而它是前端逐持仓自算的
+  // 「现价−成本×数量」，两条口径不是一回事：
+  //   · 网关 total_pnl = 已实现 + 浮动（真成交流水，含已清仓的那段盈亏）；
+  //   · 本地兜底      = 只有当前仍在持仓的浮动，已实现部分**不在里面**，
+  //     且现价取的是持仓行自带的 cur_price（见本文件 curPrice：缺位或非正一律当 0，
+  //     所以行情没到位时兜底数会偏低甚至为负，这不是 bug 而是"没数就别装成有数"的另一形态）。
+  // 于是"看到的那个实盘盈亏"能不能和账本对得上，取决于一个页面上完全不可见的条件——
+  // 同页下面 §E1 纸面腿写的是相反的纪律（「null 就显示"—"，绝不本地兜底重算，那又是两套账
+  // 的老路」），两条取向并存却只有一条被标注，这本身就是缺陷（AUDIT_20261005 P2-新增，
+  // FIX_PLAN_20261006 改判为设计张力：兜底留着有价值——首屏不该空着，但必须自报身份）。
+  // 因此本批**保留兜底**，改成：兜底生效 ⇒ 派生出 pnlFallback，页头挂出「本地兜底」标记 +
+  // 悬停说明口径差异；网关数一到就自动摘掉（真值胜出，不需要用户做任何事）。
+  // English: §W7-G — the local fallback stays (owner ruling: annotate, don't delete), but it now
+  // announces itself: pnlFallback marks "this number was recomputed in the browser (unrealized P&L
+  // of held positions only), not the gateway's settled+floating total".
   const displayPnl = useMemo(() => {
     if (!hasReal) return totalPnl
     if (realTrades && realTrades.total_pnl != null) return realTrades.total_pnl
@@ -226,8 +245,17 @@ export default function Positions() {
     return sum
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasReal, realTrades, realPositions, totalPnl])
+  // §W7-G 兜底身份：只在「有实盘数据、且网关成交汇总确实没给数」时成立。
+  // 判据与 displayPnl 里的分支**同一条件同一次求值**（不是再猜一次），两条腿才会一起翻。
+  const pnlFallback = useMemo(
+    () => hasReal && !(realTrades && realTrades.total_pnl != null),
+    [hasReal, realTrades]
+  )
   // §E1 展示串单点：纸面总盈亏的格式化只算一次——页头回落形态与纸面 Tab 内嵌形态共用，
   // null（读数不可得）显示"—"，绝不本地兜底重算（那又是两套账的老路）。
+  // 与上面实盘腿的关系（§W7-G 说清，别再留两种取向各写各的）：纸面账**没有**可信的第三方
+  // 汇总可回落，所以那里"没数就是没数"；实盘账的权威数（网关 trades）在位时永远优先，
+  // 兜底只负责"权威数还在路上"这一段的首屏可读性，并且必须带着「本地兜底」标记出现。
   const paperPnlShown = totalPnl == null ? '—' : `${totalPnl >= 0 ? '+' : ''}¥${totalPnl.toFixed(2)}`
 
   // 预览加减仓后该持仓的数量（加仓=现量+加量；减仓=现量-减量，无效时归零）
@@ -857,10 +885,26 @@ export default function Positions() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             {hasReal ? (
               <>
-                {/* 实盘盈亏与可用资金展示 */}
+                {/* 实盘盈亏与可用资金展示。
+                    §W7-G：兜底生效时必须自报身份——「本地兜底」标记 + 悬停说明两条口径的差，
+                    网关 trades 的 total_pnl 一到标记自动消失（真值胜出，用户不需要做任何事）。
+                    标记用 data-testid="real-pnl-fallback" 暴露给 UAT/vitest：同一个数字旁边
+                    有没有这一枚，就是这条腿生没生效的唯一判据（测试不许靠数颜色）。 */}
                 <div className={displayPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
                   <span className="muted" style={{ fontSize: 12, marginRight: 4 }}>实盘</span>
-                  总盈亏: {displayPnl >= 0 ? '+' : ''}¥{displayPnl.toFixed(2)}
+                  总盈亏: <span data-testid="real-pnl-value">{displayPnl >= 0 ? '+' : ''}¥{displayPnl.toFixed(2)}</span>
+                  {pnlFallback && (
+                    <Tag
+                      data-testid="real-pnl-fallback"
+                      size="small"
+                      variant="light"
+                      theme="warning"
+                      style={{ marginLeft: 6 }}
+                      title="这个数是前端按「持仓现价−成本×数量」现算的浮动盈亏，只含仍在持仓的部分；网关成交汇总（/api/qmt/trades 的 total_pnl＝已实现＋浮动）还没回来。拿到真值后本标记自动消失。"
+                    >
+                      本地兜底
+                    </Tag>
+                  )}
                 </div>
                 <div style={{ fontWeight: 600 }}>可用资金: ¥{displayAvailable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
               </>

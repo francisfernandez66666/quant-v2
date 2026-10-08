@@ -1070,23 +1070,41 @@ Probe "ops:0929 five live-executable ops files in place with content markers" ($
 # 背景：daily.amount 有"元/千元"两套口径的历史缝（tushare 腿原样落千元）。本批把换算钉在写侧，
 #   并在 store 侧抽出一个抽检探针；现网这一条走 dataload.exe amount-check——**它只跑 SELECT**，
 #   不碰任何写路径，与第 15/27 探针同一条免凭据只读通道。
-# 判据：退出码 0（ok 或 no-data）算绿；1（千元/双重换算/混源）算红；2（读取失败）算红并带 stderr 摘要。
+# §W7-D（2026-10-09）：同一条腿扩到 **两张表**（daily + ths_daily，`--table` 传参）。
+#   为什么必须扩：ths_daily 是同花顺 dump 主源、amount 直接来自 parquet 的 turnover 列，
+#   而该列口径在本仓两处注释里互相矛盾过（"换手率（%）" vs "成交额/换手率"，§W7-D 已改）。
+#   该表**不在**写侧换算白名单里（data.AmountScaledTables），所以它没有任何换算兜底——
+#   注释一改就结束了、口径仍然是口头承诺；只有读数能说明库里到底是元、千元还是换手率量级。
+#   两张表用同一个判定体（store.AmountProbedTables），所以这里的判据形状也保持一条腿两个 rc，
+#   不另开第二条 Probe/INFO（§88 的 INFO 观测行计数与 PS 侧行首 Probe 计数都由"一腿一行"保证）。
+# 判据：两张表退出码都为 0（ok 或 no-data）算绿；任一为 1（千元/双重换算/混源）或 2（读取失败）算红。
 #   no-data 不判红是刻意的：库里可能只有 ths_daily 一条腿有数，日线空由新鲜度腿负责报警，
-#   这里重复判红只会把"表还没装"冒充成"量纲错了"。
+#   这里重复判红只会把"表还没装"冒充成"量纲错了"（ths_daily 现网同样可能整表未装载）。
 # 读数恒进 INFO（绿也要看得到中位均价，第一次跑就能看出库里到底是哪套口径）。
 $scaleOut = ""
 $scaleRc = -1
+$scaleThsOut = ""
+$scaleThsRc = -1
 if (Test-Path -LiteralPath ($DeployDir + "\dataload.exe")) {
     try {
         $scaleRaw = & ($DeployDir + "\dataload.exe") "--db" ($DataDir + "\trading.db") "amount-check" "--json" 2>&1
         $scaleRc = $LASTEXITCODE
         $scaleOut = ($scaleRaw -join " ")
     } catch { $scaleRc = 2; $scaleOut = "invoke-failed: " + $_.Exception.Message }
-} else { $scaleRc = 2; $scaleOut = "dataload.exe missing at " + $DeployDir }
-$scaleBad = ($scaleRc -ne 0)
-$scaleDetail = "rc=" + $scaleRc + " out=" + $scaleOut
+    try {
+        $scaleThsRaw = & ($DeployDir + "\dataload.exe") "--db" ($DataDir + "\trading.db") "amount-check" "--table" "ths_daily" "--json" 2>&1
+        $scaleThsRc = $LASTEXITCODE
+        $scaleThsOut = ($scaleThsRaw -join " ")
+    } catch { $scaleThsRc = 2; $scaleThsOut = "invoke-failed: " + $_.Exception.Message }
+} else {
+    # 执行体缺席时两个 rc 都要落 2：只落一个的话另一条保持 -1，判红文案会显示一个没跑过的读数
+    $scaleRc = 2; $scaleOut = "dataload.exe missing at " + $DeployDir
+    $scaleThsRc = 2; $scaleThsOut = "dataload.exe missing at " + $DeployDir
+}
+$scaleBad = (($scaleRc -ne 0) -or ($scaleThsRc -ne 0))
+$scaleDetail = "daily[rc=" + $scaleRc + " out=" + $scaleOut + "] ths_daily[rc=" + $scaleThsRc + " out=" + $scaleThsOut + "]"
 Write-Output ("INFO|amount_scale_readout " + $scaleDetail)
-Probe "data: daily amount caliber probe green (readout in INFO)" (-not $scaleBad) $scaleDetail
+Probe "data: daily+ths_daily amount caliber probe green (readout in INFO)" (-not $scaleBad) $scaleDetail
 
 # 21) §0929SECKEY-A（2026-09-29，第 31 探针，判数 30→31）：灾备快照与口令文件的权限面复核。
 # 为什么这条探针必须存在（现网实测锤实，不是推测）：RUNBOOK 一直写着灾备的补偿措施之一是

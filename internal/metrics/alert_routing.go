@@ -16,7 +16,12 @@
 // （当天触发次数、峰值、首次/末次时间）。汇总的发送时刻：**由下一次评估 tick 检测到本地
 // 日历日变更时补发前一日**——本包没有调度权，不新起定时器；而唯一调用点
 // （internal/engine/scoring_loop.go 的 30s 节流）在会话门禁之前，盘后/休市也照跑，
-// 所以日切最多延迟一个 tick（30s），进程停机则重启后首个 tick 补发（按记录的日期标注）。
+// 所以日切最多延迟一个 tick（30s）。
+// §W7-E（2026-10-06 修复批 波 7）：「进程停机则重启后首个 tick 补发（按记录的日期标注）」
+// 这句承诺以前是**假的**——四份状态全在内存，重启后聚合日直接换成今天，前一日永远不再出现，
+// 且挂起的销案连同"已报未销"标记一起丢失（只报不销）。现在 day/daily/pendingR/announced
+// （另加 lastF/lastR/suppressed）随每轮 tick 原子落盘到 dataDir 下的 journal 文件，
+// 装配期由 SetAlertRouterStatePath 灌回，实现与注释从本批起才真正对齐。详见 alert_router_state.go。
 //
 // 限频（照 §C9 推送风暴抑制的思路）：同一规则同一状态（fire / resolved）出站后进冷却窗，
 // 窗内重复破线不再刷第二条；恢复消息成对补发——被冷却挡下的 resolved 会挂起，
@@ -25,8 +30,11 @@
 // 依赖方向（已核实）：internal/notify 只 import internal/{opslog,strategy,fileutil}，
 // 不 import internal/metrics，所以反向依赖不会立刻成环；但 metrics 是被 notify 的兄弟层
 // 共用的度量面，一旦 import notify 就把「指标评估」焊死在「推送实现」上（还带来
-// engine→metrics→notify→engine 注入的间接环风险）。故出口以最小函数类型 AlertSink 注入，
-// 本包零新增依赖。未注入出口时：首轮评估打一条明确 Warn 说明「已评估、出口未接线」，
+// engine→metrics→notify→engine 注入的间接环风险）。故出口以最小函数类型 AlertSink 注入。
+// 依赖口径（§W7-E 起写实，替换原来那句「本包零新增依赖」）：本包对**项目内部包**只多引了两个
+// 叶节点——fileutil（原子写）与 opslog（落盘失败可见），二者都不 import 项目内任何其他包
+// （已核实，见各自文件头），因此不构成环；仍然不 import store / notify / engine。
+// 未注入出口时：首轮评估打一条明确 Warn 说明「已评估、出口未接线」，
 // 且每条投递继续落日志兜底——静默丢失正是本批要消灭的东西。
 //
 // English: §HIGH-3 (narrowed) — adds the missing egress for METRIC-type alert rules only.
@@ -35,6 +43,9 @@
 // rate-limited per rule+state with a cooldown window and always emit paired alert/resolved;
 // the rest are aggregated into a daily summary flushed when an evaluation tick observes a local
 // calendar-day change. The sink is injected as a minimal function type so metrics never imports notify.
+// §W7-E: the router's four state groups are journaled to one atomic JSON file under the data dir and
+// rehydrated during assembly, so a restart neither swallows yesterday's summary nor leaves a fired
+// alert permanently unresolved. metrics then depends only on the leaf packages fileutil / opslog.
 package metrics
 
 import (
@@ -115,9 +126,11 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 19 条，
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 20 条：
 // §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条、§0929HB-1/-2/-3
-// 加入三条"应有值缺失"型业务心跳、§0929HB-4 加入休市日增量型心跳后同步计数；
+// 加入三条"应有值缺失"型业务心跳、§0929HB-4 加入休市日增量型心跳＝第 19 条、
+// §P2-E（波 5）加入 settlement_not_verified＝第 20 条；2026-10-09 波 7 按脚本实数把这段的
+// "现 19 条"同步成 20，门禁 §106 那条行为腿文案里的 19 也一并跟上，两侧同批动），
 // alert_routing_test 有等值锁（路由条数 == 规则条数），漏一条即判红）。
 // English: factory routing table covering all DefaultAlertRules() entries.
 func DefaultAlertRouting() AlertRoutingConfig {
@@ -234,6 +247,13 @@ type alertRouter struct {
 	suppressed map[string]int        // 冷却窗内被抑制的重复触发计数（诊断风暴抑制量）
 	day        string                // 当前聚合的本地日历日
 	daily      map[string]*dailyStat
+	// §W7-E（2026-10-06 修复批 波 7）跨重启持久化：上面四份状态（day/daily + pendingR +
+	// announced，另加 lastF/lastR 冷却锚与 suppressed 诊断计数）此前只活在内存里，
+	// 重启即丢 ⇒ 前一日汇总被吞、已报未销的规则永远补不出销案。落盘实现见 alert_router_state.go。
+	statePath      string     // 非空=启用落盘（由 SetAlertRouterStatePath 在装配期注入）
+	saveMu         sync.Mutex // 落盘串行闸：多引擎并存时同一份 journal 只有一个写者在前
+	lastWritten    []byte     // 上次成功落盘的字节（内容未变即跳过写盘，非脏标记）
+	persistFailSeq int        // 连续落盘失败计数（日志节流，成功即清零）
 }
 
 // newAlertRouter 构造路由器（now 为 nil 时用 time.Now）。
@@ -256,11 +276,27 @@ func newAlertRouter(now func() time.Time) *alertRouter {
 
 // Route 对一轮评估事件做路由，返回本轮真正出站的投递列表（可能含跨日补发的汇总）。
 // 即使 events 为空也必须每轮调用：被冷却挂起的 resolved 和跨日汇总都靠这个节拍放行。
+// §W7-E：每轮结尾把整份状态快照落盘（启用路径时）——放在这里而不是调用方，是为了让
+// 「改过状态就必须落盘」这条不变量由唯一的状态变更入口保证，调用方无从遗漏。
 // English: routes one evaluation round; must be called every tick even with no events, since
 // cooldown-deferred resolutions and the day-rollover summary are released on this cadence.
+// §W7-E also persists the whole state snapshot at the end of every round (when a path is set).
 func (r *alertRouter) Route(events []AlertEvent) []AlertDelivery {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	out := r.routeEventsLocked(events)
+	path := r.statePath
+	snap := r.snapshotLocked()
+	r.mu.Unlock()
+	// 文件 IO 一律在 mu 之外（见 writeState 的 saveMu 说明）：Route 的 mu 还被
+	// ConfigureAlertRouting 与启动 rehydrate 共用，占着它写盘等于让路由表热更新排队等磁盘。
+	if path != "" {
+		r.writeState(path, snap)
+	}
+	return out
+}
+
+// routeEventsLocked 一轮路由的实体（调用方须持 mu）：日切 → 逐事件路由 → 放行悬置销案。
+func (r *alertRouter) routeEventsLocked(events []AlertEvent) []AlertDelivery {
 	now := r.now()
 	var out []AlertDelivery
 	// 先处理日切：跨日的上一日汇总排在最前，语义上属于"昨天"。

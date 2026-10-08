@@ -149,7 +149,13 @@ if ($null -eq $proc) {
 # 4) scale：成交额量纲只读抽检（§0929SCALE-⑩ 的现网腿，纯 SELECT 零写入）
 #    rc=0 绿（ok 或 no-data 都合法——日线表未装由数据新鲜度腿负责，这里重复判红会把
 #    "还没装"冒充成"量纲错了"）；rc=1 千元/双重换算/混源判红；rc=2 读取失败判红。
+#    §W7-D（2026-10-09）：这一腿抽**两张表**（daily + ths_daily）。ths_daily 是同花顺 dump 主源、
+#    amount 直接来自 parquet 的 turnover 列，且它不在写侧换算白名单里（没有任何兜底），
+#    口径只有这条读数在担保；两张表共用一个判定体（store.AmountProbedTables），
+#    所以这里保持"一腿一个 PASS"而不是拆成第 8 腿——半态守卫 `PASS -lt 7` 与
+#    §106 的七腿齐备锁都按七条写，拆腿不改那两处就是把判数撒谎写进夜里。
 $scaleOut = ""; $scaleRc = -1
+$scaleThsOut = ""; $scaleThsRc = -1
 $dl = Join-Path $DeployDir "dataload.exe"
 if (Test-Path -LiteralPath $dl) {
     try {
@@ -157,9 +163,19 @@ if (Test-Path -LiteralPath $dl) {
         $scaleRc = $LASTEXITCODE
         $scaleOut = (($raw | ForEach-Object { [string]$_ }) -join " ")
     } catch { $scaleRc = 2; $scaleOut = "invoke-failed" }
-} else { $scaleRc = 2; $scaleOut = "dataload.exe-missing" }
-Write-Output ("INFO|amount_scale rc=" + $scaleRc + " out=" + $scaleOut)
-Probe "scale:daily amount caliber probe green" ($scaleRc -eq 0) ("rc=" + $scaleRc)
+    try {
+        $rawThs = & $dl "--db" (Join-Path $DataDir "trading.db") "amount-check" "--table" "ths_daily" "--rows" "$AmountRows" "--json" 2>&1
+        $scaleThsRc = $LASTEXITCODE
+        $scaleThsOut = (($rawThs | ForEach-Object { [string]$_ }) -join " ")
+    } catch { $scaleThsRc = 2; $scaleThsOut = "invoke-failed" }
+} else {
+    # 执行体缺席时两个 rc 都落 2：只落一个，另一条会以 rc=-1（从未执行）的形态进读数
+    $scaleRc = 2; $scaleOut = "dataload.exe-missing"
+    $scaleThsRc = 2; $scaleThsOut = "dataload.exe-missing"
+}
+Write-Output ("INFO|amount_scale daily rc=" + $scaleRc + " out=" + $scaleOut + " || ths_daily rc=" + $scaleThsRc + " out=" + $scaleThsOut)
+$scaleBad = (($scaleRc -ne 0) -or ($scaleThsRc -ne 0))
+Probe "scale:daily+ths_daily amount caliber probe green" (-not $scaleBad) ("daily_rc=" + $scaleRc + " ths_rc=" + $scaleThsRc)
 
 # 5~7) queue/cand/fina 三条走同一份只读 Python 读数脚本（输出已是 PASS|/INFO| 协议，原样转发）
 #      三个阈值必须逐字透传：PS 侧默认值和 python 侧默认值虽然一致，但「靠默认」意味着

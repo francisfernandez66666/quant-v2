@@ -1446,6 +1446,15 @@ class Gateway:
             "fail_streak": int(self._file_bridge_push_fail_streak),
             "fail_held": int(self._file_bridge_push_fail_held),
         }
+        # §W7-C 观察位：xtquant 委托状态码映射失败（fail-closed 后落「未知(原始值)」）的累计次数
+        # 与最后一次原始值。为什么必须在这里看得见：「未知…」串不进引擎侧三本资金账
+        # （买入冻结 / 跨日降废 / 在途卖量都按精确中文状态串匹配），所以它**不会**以资金异常的
+        # 形态浮出来；total>0 就是"柜台有一种我们读不懂的状态码"的唯一现网信号，
+        # 需要按 last 的原始值把该码补进 handler.XT_STATUS_CODES。
+        payload["unknown_status"] = {
+            "total": int(getattr(self.handler, "unknown_status_total", 0) or 0),
+            "last": str(getattr(self.handler, "last_unknown_status", "") or ""),
+        }
         return 200, payload
 
     def _do_admin_order_confirm(self, body):

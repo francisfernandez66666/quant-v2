@@ -64,13 +64,27 @@ type Signal struct {
 	At time.Time `json:"at"`
 }
 
-// tickState 单只股票的窗口滑动状态，记录上一 tick 的快照用于计算差分指标。
-// （tickState holds the sliding-window state of a single stock, keeping the previous tick snapshot for delta metrics.）
+// sample 滑动窗口里的一个行情采样点（价格 / 累计成交额 / 累计换手 + 采样时刻）。
+// （sample is one quote sample in the sliding window: price, cumulative turnover amount/percentage and time.）
+type sample struct {
+	at    time.Time
+	price float64
+	amt   float64
+	turn  float64
+}
+
+// tickState 单只股票的窗口滑动状态。
+// §W7-SEC（2026-10-06 修复批 波 7）：这里原来只存「上一 tick」四个标量，而 Config.Sec 全仓
+// 只出现在默认值（:37）、兜底（:92）和启动日志（:116）三处——也就是说包注释宣称的
+// 「窗口内秒均涨幅 ≥ RaRate」从来没有窗口，实际算的是**相邻两帧**的差分（5s 一帧，
+// 且间隔只要不超过 60s 都照算：断流十分钟后恢复，第一帧会拿到 600 秒的差分把一天的量摊成
+// 「秒均」）。定义未接的字段比没定义更坏：读代码的人按注释调 Sec，调了没反应。
+// 现在窗口按 cfg.Sec 收缩，差分算式的分母取「窗口起点→当前帧」的真实跨度。
+// （tickState now holds the sliding window itself; cfg.Sec is what actually bounds it, so the
+// per-second deltas are computed over the retained window rather than a single inter-tick gap.）
 type tickState struct {
-	prevPrice   float64   // 上一 tick 价格
-	prevAmt     float64   // 上一 tick 累计成交额
-	prevTurn    float64   // 上一 tick 累计换手
-	lastAt      time.Time // 上一 tick 时间
+	win         []sample  // 滑动窗口采样，win[0] 为窗口起点（最旧、仍留在 Sec 射程内的帧）
+	lastAt      time.Time // 最近一帧时刻，仅用于「间隔异常＝断流」判断
 	lastTrigger time.Time // 最近一次触发时间（用于冷却判断）
 }
 
@@ -193,11 +207,13 @@ func (e *Engine) check(snap *data.MarketSnapshot) {
 }
 
 // advance 推进单只股票滑动窗口，返回窗口秒均涨幅/成交额/换手。
-// 首个 tick 或间隔异常（>60s）仅初始化状态，返回 0 表示未触发条件评估。
-// 冷却期内返回 nil 跳过。
+// 首个 tick 仅初始化状态，返回 0 表示未触发条件评估；冷却期内返回 nil 跳过。
+// §W7-SEC：窗口按 cfg.Sec 收缩——比 Sec 更早的采样会被剪出窗口，差分分母取剩余窗口起点到当前帧
+// 的真实跨度；间隔异常（非正或 >60s）视为断流，整窗重置（重置后第一帧只当基准，不参与判定，
+// 于是断流恢复不再会把十分钟的量摊成「秒均」）。
 // （advance pushes the sliding window forward for one stock and returns the window's per-second
-// gain/amount/turnover. First tick or an abnormal gap (>60s) just initializes state and returns 0;
-// returning nil means the stock is inside its cooldown.）
+// gain/amount/turnover. The window is bounded by cfg.Sec; an abnormal gap (>60s) or a non-positive
+// cumulative delta resets the window and returns 0; nil means the stock is inside its cooldown.）
 func (e *Engine) advance(code string, si *data.StockInfo, now time.Time) (float64, float64, float64, *tickState) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -211,34 +227,62 @@ func (e *Engine) advance(code string, si *data.StockInfo, now time.Time) (float6
 	if !st.lastTrigger.IsZero() && now.Sub(st.lastTrigger) < e.cfg.Cooldown {
 		return 0, 0, 0, nil
 	}
-	// 首个 tick：仅记录基准状态，不产生触发
-	if st.lastAt.IsZero() || st.prevPrice <= 0 {
-		st.prevPrice = si.Price
-		st.prevAmt = si.Amount
-		st.prevTurn = si.Turnover
-		st.lastAt = now
-		return 0, 0, 0, st
+	// 时间间隔异常（非正或超过 60s）＝断流：整窗重置，当前帧只作新基准
+	if !st.lastAt.IsZero() {
+		if gap := now.Sub(st.lastAt).Seconds(); gap <= 0 || gap > 60 {
+			st.win = nil
+		}
 	}
-	// 时间间隔异常（非正或超过 60s）：视为断流，重置基准状态，不产生触发
-	dt := now.Sub(st.lastAt).Seconds()
-	if dt <= 0 || dt > 60 {
-		st.prevPrice = si.Price
-		st.prevAmt = si.Amount
-		st.prevTurn = si.Turnover
-		st.lastAt = now
-		return 0, 0, 0, st
+	// 价格基准坏掉（非正）同样重置，否则除零会算出 ±Inf 把阈值一次满足
+	if len(st.win) > 0 && st.win[0].price <= 0 {
+		st.win = nil
 	}
-
-	// 差分计算：秒均涨幅 = Δ价/基准价/Δt；秒均成交额、秒均换手同理
-	secRise := (si.Price - st.prevPrice) / st.prevPrice * 100 / dt
-	secAmt := (si.Amount - st.prevAmt) / dt
-	secTurn := (si.Turnover - st.prevTurn) / dt
-
-	st.prevPrice = si.Price
-	st.prevAmt = si.Amount
-	st.prevTurn = si.Turnover
+	st.win = append(st.win, sample{at: now, price: si.Price, amt: si.Amount, turn: si.Turnover})
 	st.lastAt = now
+	// 按 cfg.Sec 剪窗口：只保留「仍在 Sec 射程内」的采样，但**至少留两帧**——
+	// 采样节奏（5s）比 Sec 稀时（例如 Sec=1 或采集抖动），两帧就是能拿到的全部跨度，
+	// 剪成一帧会退回「永不判定」，那是把定义未接换成定义把判定打死，同样不可接受。
+	if e.cfg.Sec > 0 && len(st.win) > 2 {
+		cutoff := now.Add(-time.Duration(e.cfg.Sec) * time.Second)
+		drop := 0
+		for drop < len(st.win)-2 && st.win[drop].at.Before(cutoff) {
+			drop++
+		}
+		if drop > 0 {
+			st.win = append([]sample(nil), st.win[drop:]...)
+		}
+	}
+	// 窗口不足两帧：仅记录基准，不产生触发
+	if len(st.win) < 2 {
+		return 0, 0, 0, st
+	}
+	base := st.win[0]
+	elapsed := now.Sub(base.at).Seconds()
+	if elapsed <= 0 {
+		return 0, 0, 0, st
+	}
+	// 累计量倒退（数据源回补/重排）：窗口作废重来，负差分不该被摊成「秒均」
+	if si.Amount < base.amt || si.Price <= 0 || base.price <= 0 {
+		st.win = []sample{{at: now, price: si.Price, amt: si.Amount, turn: si.Turnover}}
+		return 0, 0, 0, st
+	}
+
+	secRise := (si.Price - base.price) / base.price * 100 / elapsed
+	secAmt := (si.Amount - base.amt) / elapsed
+	secTurn := (si.Turnover - base.turn) / elapsed
 	return secRise, secAmt, secTurn, st
+}
+
+// windowSpan 返回某只股票当前窗口的跨度（秒），仅用于测试与自证（读不到股票时返回 -1）。
+// （windowSpan reports the current window span in seconds for tests/self-checks.）
+func (e *Engine) windowSpan(code string) float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	st := e.states[code]
+	if st == nil || len(st.win) < 2 {
+		return -1
+	}
+	return st.win[len(st.win)-1].at.Sub(st.win[0].at).Seconds()
 }
 
 // State 返回当前监控股票数量（调试用）。

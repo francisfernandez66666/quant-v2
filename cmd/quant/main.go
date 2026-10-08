@@ -30,6 +30,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -73,9 +74,26 @@ import (
 // §R6 P1-1 deployment-drift self-check to detect a binary running behind its source commit.
 var buildCommit = "unknown"
 
-// main 系统入口：初始化数据目录、认证、行情 API、LLM、新闻代理、策略引擎等所有组件，
-// 然后进入主循环，每 5 分钟驱动一次顶层编排引擎（engine.Engine）。
+// main 进程外壳：唯一的职责是「等 run() 走完 defer 链收尾，再按退出码结束进程」。
+// §W7-FATAL（2026-10-06 修复批 波 7）：原来进程体直接写在 main 里，启动期两处 log.Fatalf
+// （HTTP 监听失败、staging 守卫）加上 auth init 一处，都是在 main 的 defer 链**之外**终结进程——
+// 那时 fetcher.Stop / qmtFeed.Stop / nAgent.Stop / 状态文件句柄 Close / trigCancel 一个都不执行。
+// §0927AUDIT-D4 已经把**停机路径**的 os.Exit(0) 换成「主循环退出 → return → defer 链」，
+// 启动路径留着同样的洞，是因为当时没有地方能「return 出一个退出码」：把进程体搬进 run() int，
+// 退出码交给 main 的 os.Exit，defer 收尾与退出码就不再互斥。这不是把 fail-fast 改成软失败——
+// staging 检测到 qmt.enabled=true 依然拒绝启动、依然非零退出，只是走同一条收尾链。
+// English: main is now a thin shell — run() holds the process body so every startup abort still
+// unwinds the defer chain (fetcher/feed/agent Stop, state-file close) before os.Exit carries the code.
 func main() {
+	if code := run(); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// run 系统入口的进程体：初始化数据目录、认证、行情 API、LLM、新闻代理、策略引擎等所有组件，
+// 然后进入主循环，每 5 分钟驱动一次顶层编排引擎（engine.Engine）。
+// 返回值＝退出码（0＝正常收尾；非 0＝启动期 fail-fast，但 defer 链照常执行）。
+func run() int {
 	// §启动顺序 0：日志带文件:行号，便于多 goroutine 场景下定位输出来源；打印构建指纹。
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("[deploy] 二进制构建指纹: buildCommit=%s（未注入显示 unknown，用于比对代码头是否一致）", buildCommit)
@@ -111,7 +129,10 @@ func main() {
 	// 存量部署不受影响：已有用户的库 IsInitialized()==true，行为与此前一致。
 	authMgr := auth.NewManager(dataDir)
 	if err := authMgr.Init(); err != nil {
-		log.Fatalf("auth init: %v", err)
+		// §W7-FATAL：认证库初始化失败同样走 return（此处 defer 还没注册几个，但口径要与全进程一致——
+		// 启动期只有一种退出姿势：记日志 + 交出退出码，别再长出第三条 os.Exit/Fatalf 分支）。
+		log.Printf("认证库初始化失败, 进程退出: %v", err)
+		return 1
 	}
 	if !authMgr.IsInitialized() {
 		log.Printf("全新部署：请打开 http://<host>:8080/setup 创建管理员账号（不再提供默认口令 admin/admin123）")
@@ -402,8 +423,9 @@ func main() {
 	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
 	// §高-3（2026-09-23 修复批）指标型告警出口接线。此前 internal/metrics 的评估器只
 	// `log.Printf` 一条就返回，9 条指标规则**从不出站**（R7 验收单 D1/维5 却打了 ✅，属
-	// 「声称已做」）。路由表与冷却窗在 metrics 包内自持（必推 6 条 / 日汇总 4 条），这里
-	// 只提供出口闭包：p1→LevelHigh 走既有高优通道、其余→LevelMedium。
+	// 「声称已做」）。路由表与冷却窗在 metrics 包内自持（现 20 条规则全覆盖：必推 12 条 /
+	// 日汇总 8 条，2026-10-09 波 7 按脚本实数同步，旧文案写的「6 条 / 4 条」是 §0929HB 之前
+	// 的世代），这里只提供出口闭包：p1→LevelHigh 走既有高优通道、其余→LevelMedium。
 	// 一律经 Push —— M8 已把 WS/Webhook/推送网关三路内聚在 Push 里，绝不再直调
 	// PushGateway，否则就是当日「双发」事故的同族复犯。
 	// English: wires the metrics alert egress (previously evaluation-only). p1 maps to
@@ -415,6 +437,17 @@ func main() {
 		}
 		notifier.Push(notify.Message{Level: lvl, Title: d.Title, Content: d.Body})
 	})
+	// §W7-E（2026-10-06 修复批 波 7）告警路由器状态跨重启落盘 + 启动回灌。
+	// 为什么必须由装配期接这一行：alert_routing.go 的头注释一直写着「进程停机则重启后首个 tick
+	// 补发前一日汇总」，而路由器四份状态（聚合日/当日桶/待补发销案/已报未销标记）全在内存里，
+	// 于是那句承诺是空的——停机跨过 00:00 就把那一天永久吞掉；更糟的是 announced 丢了之后
+	// 重启回来再收到 recover 会被当"没报过"吞掉销案，那条 p1 从此只有开没有销。
+	// 路径就在 notify_outbox.json 旁边（同一 dataDir、同一个原子写原语、同一份运维心法），
+	// 必须在引擎跑起来之前调用：rehydrate 只灌空 map，晚灌会把两条时间线混成一份不可信读数。
+	// English: §W7-E — jourmal the alert router's four state groups under dataDir and rehydrate
+	// them before the engines start, so a restart neither swallows yesterday's daily summary nor
+	// leaves a fired p1 alert permanently un-resolved.
+	metrics.SetAlertRouterStatePath(filepath.Join(dataDir, "alert_router_state.json"))
 	// §ADJ-BASIS-2（2026-09-23）复权口径基线失效战法的处置策略注入。
 	// §ADJ（HfqBars 前向填充）修好了取数口径，但**改的是数值不是入口**：在此之前审批落盘的
 	// 因子战法（如 fac_1「波动突破」），其 weights/buy_threshold 是在已知错误的面板上拟合的
@@ -481,7 +514,12 @@ func main() {
 	// English: §R6 P1-1 startup self-check — dumps binary fingerprint + high-impact config summaries
 	// (LLM key sanity, QMT effective executor) to opslog once at boot so the three real incidents from
 	// 2026-09-01 surface immediately. Warning-only: existing fallbacks still apply.
-	verifyDeployment(cfgMgr, authMgr)
+	if err := verifyDeployment(cfgMgr, authMgr); err != nil {
+		// §WS-G staging 守卫：拒绝启动的语义没动，只是改成「记日志 → return 1 → defer 链收尾 → 非零退出码」，
+		// 让 supervisor 仍然看到失败退出，同时不再把已注册的 Stop/Close 整段跳过。
+		log.Printf("[deploy] 启动被拒绝: %v", err)
+		return 1
+	}
 
 	// 模拟盘账号策略：仅 admin 账号自动按战法建仓/估值；普通用户模拟盘纯手动 + 静态存储。
 	// 同时注入当前启用战法资金池模板（分仓，防单战法垄断）。
@@ -555,7 +593,11 @@ func main() {
 	}
 	ln := pickListener(addr, 20)
 	if ln == nil {
-		log.Fatalf("HTTP 监听失败 %s: 端口被占用（§W4-b fail-fast：拒绝顺延端口避免双实例写同一数据目录；请排查残留进程）", addr)
+		// §W4-b 的 fail-fast 语义不变（端口被占就拒绝启动，绝不顺延出第二个实例写同一数据目录），
+		// 变的是退出姿势：这里已注册 fetcher.Stop / qmtFeed.Stop / nAgent.Stop / 状态文件句柄 Close，
+		// Fatalf 会把它们全部跳过（采集线程带着已关闭的库继续跑、状态文件不落盘）。
+		log.Printf("HTTP 监听失败 %s: 端口被占用（§W4-b fail-fast：拒绝顺延端口避免双实例写同一数据目录；请排查残留进程）", addr)
+		return 1
 	}
 	bound := ln.Addr().String()
 	log.Printf("[main] HTTP 服务已绑定 %s (来源 %s)", bound, addr)
@@ -785,6 +827,9 @@ mainLoop:
 	// main 返回后 defer 链按 LIFO 执行（打分循环取消 → 采集器/行情馈线/新闻代理 Stop、
 	// 状态文件句柄关闭），这正是旧实现 os.Exit(0) 一直跳过的那段收尾。
 	log.Println("[main] 主循环已退出，进入 defer 链收尾（优雅停机）")
+	// §W7-FATAL：正常路径返回 0（main 不再 os.Exit），启动期 fail-fast 的三处返回非 0——
+	// 两条路走的是**同一段** defer 收尾，退出码只影响 main 外壳要不要 os.Exit。
+	return 0
 }
 
 // sleepOrStop §0927AUDIT-D4（2026-09-28 修复批）：可被根 ctx 提前叫醒的睡眠。
@@ -927,7 +972,7 @@ func isStaging() bool {
 // English: §R6 P1-1 deployment-drift self-check at boot (warning-only). Surfaces three real 2026-09-01
 // incidents at startup: stale binary missing the executor-rebuild fix; LLM key typo → full-chain 401;
 // qmt.enabled=true with missing gateway_url/token pinning the executor to Noop.
-func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
+func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) error {
 	// —— 0. staging 影子环境 fail-fast ——
 	// §WS-G：QUANT_ENV=staging 下 qmt.enabled=true 一律拒绝启动（staging 严禁连接实盘网关；
 	// enabled=true 说明部署侧残留生产配置，一旦放行即资损级误连）。staging 的决策流由
@@ -936,7 +981,7 @@ func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
 	// staging must never touch the real gateway (an enabled flag means a production config leaked in).
 	if isStaging() {
 		if cfgMgr.Get().QMT.Enabled {
-			log.Fatalf("[deploy] staging 环境检测到 qmt.enabled=true：staging 严禁连接实盘网关，拒绝启动。" +
+			return fmt.Errorf("staging 环境检测到 qmt.enabled=true：staging 严禁连接实盘网关，拒绝启动。" +
 				"请将 qmt.enabled 置 false（staging 决策流由 ShadowExecutor 接管，不真下）")
 		}
 		log.Printf("[deploy] staging 影子环境启动: 数据目录=%s（QMT 一律走 ShadowExecutor，不真下）", getDataDir())
@@ -1057,6 +1102,9 @@ func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
 			}
 		}
 	}
+	// —— 收尾 ——
+	// 只有 §WS-G staging 守卫会走 error；其余检查项一律「告警不阻断」（only-warning 语义不变）。
+	return nil
 }
 
 // redact 密钥等敏感串脱敏显示：仅留前 3 位与后 2 位，中间掩码。空串原样返回。
