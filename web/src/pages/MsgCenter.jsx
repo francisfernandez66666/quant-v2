@@ -6,6 +6,10 @@ import { Card, Tag, Button, Select, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
+// §P2-I（2026-10-06 修复批 波 6）轮询「后到丢弃」统一入口：本页由 message/scan/score 三类 SSE 事件
+// 驱动重拉 + 60s 兜底轮询（§F5），事件密集时段两条腿同时在途是常态；旧一轮的消息列表后到，
+// 会把刚清空/刚推进的消息画回来（用户看到"清掉的风险提示又出现了"，或反之漏看新消息）。
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 import { confirmDialog } from '../ui.jsx'
 
 
@@ -46,6 +50,8 @@ export default function MsgCenter() {
   const [shortEnabled, setShortEnabled] = useState(false)
   // §F3 全局个股详情抽屉的目标（{code,name}），null=关闭
   const [detail, setDetail] = useState(null)
+  // §P2-I：SSE 事件 + 60s 兜底两条驱动共用这一枚代号守卫（实例跨渲染复用，见 hook 注释）
+  const loadGuard = useStaleGuard()
   // §F5 分页：消息卡片列表按页展示（默认 50/页），筛选/类型变化时回到首页。
   const [page, setPage] = useState(1)
   // §DAILY_REVIEW 手动触发复盘标志（按钮 loading）
@@ -158,11 +164,16 @@ export default function MsgCenter() {
       setAlertsError('')
       return
     }
+    // §P2-I：本轮代号在发起请求前盖章，回写前两处判据各自到位
+    const token = loadGuard.begin()
     try {
       const all = await api.fetchAlerts()
+      if (loadGuard.isStale(token)) return // §P2-I 后到的旧轮次：列表与错误态一并作废
       setAlerts((all || []).filter(a => a.code !== 'CAL' && !(a.level && a.level.startsWith('日历'))))
       setAlertsError('')
     } catch (e) {
+      // §P2-I：旧轮次的失败也不许写错误态（新一轮已经成功了，红字会冒充"当前读不到"）
+      if (loadGuard.isStale(token)) return
       setAlertsError(e && e.message ? String(e.message) : '消息列表加载失败（网络/服务异常）')
     }
   }

@@ -8294,4 +8294,626 @@ fi
 rm -rf "$W112"
 echo "ok - §112 全段通过：① sidecar 常量族与 K4 射程集合 ${G1_N} 道 + ② 跨语言表头/缺测标记等值 ${G2_N} 道 + ③ 取数三态与落库姿势 ${G3_N} 道 + ④ 读侧单源与 schema 四处同源 ${G4_N} 道 + ⑤ 三态接线/别名 ban/映射表等值 ${G5_N} 道 + ⑥ 文件桥函数段顺序锁与观察位接线 ${G6_N} 道 + ⑦ 测试资产派生登记 ${G7_N} 道 + ⑧ 行为腿（Go ${W5GO_N} 个文件/${W5PKG_N} 包 ${NAME_N} 条用例逐包与派生数等值、pytest ${W5PY_N} 份含防空转正 floor）${G8_N} 道 + ⑨ 镜像基线自证与 ${DYS112_N} 枚反证 D1–D${DYS112_N} ${G9_N} 道 + ⑩ 覆盖面诚实与分组自证 ${G10_N} 道，累计判定点 ${CNT112}（其中十组快照之和 ${SUMG112}，另有 1 道就是求和自证锁本身）"
 echo ""
+echo "==> 113 §P2-H/§P2-I/§P2-J/§P3-FE 前端一致性契约（2026-10-06 修复批 波 6）：单实现扫描器派生读数、涨跌令牌等值、守卫/台账接线、五组行为腿与七枚镜像反证..."
+
+# 本段守波 6 的四条缺陷（10-05 全量评价 P2-H/I/J + P3 前端组 → 10-06 按 docs/FIX_PLAN_20261006.md 落码）。
+#
+#  ① §P2-H 后端通道早就齐了、前端零调用点。GET/POST /api/config/d1 自 §0929CFG-D1 起就是
+#     「稀疏 merge + 写前快照 + 字段级审计 + effective_source 回显」，而 `grep -rn 'config/d1' web/src`
+#     在本批开工前**零命中**：直接参与打分的 D1 参数只能在页面外改，「页面写的值≠引擎吃的值」
+#     这道缝没有出口。这条缺陷的锁形状必须是三段都得有（api 出口 / 面板调用 / 页面挂载），
+#     少任何一段都等于回到「没人用」——面板写了但没页面 render 就是 §DEADGAUGE「定义没接」同族，
+#     所以 M3 用的是**派生挂载页集合**（d1_mounted_pages），不是点名 Settings.jsx。
+#  ② §P2-I 轮询后到的旧响应覆盖新读数。旧形态是三页各有一份守卫写法、其余页面干脆没有，
+#     而「用不用守卫」是每页一个口头决定（本批开工前实测：11 个有轮询/SSE 的页面只有 3 个接了守卫）。
+#     ⑦组钉的是：守卫的**唯一正确写法**收在 useStaleGuard() 里（惰性 useRef），页面侧只剩一个调用点；
+#     `useRef(createStaleGuard())` 这种「每渲染 new 一个、代号序列重置、isStale 永远 false」的假绿形态
+#     必须被负锁拦住——而这把负锁**只能剥注释之后数**（那句话本身就是本批说明注释的原文，
+#     §107 预演实录：恒红的是尺子，不是产品）。
+#  ③ §P2-J 四路数据各自 `catch (_) {}`：容错本身对（一路挂掉不该拖黑整页），坏在失败之后
+#     什么都不留——界面照常显示上一轮读数或空列表。现按腿记账（loadLedger）+ 单实现红条
+#     （LoadFailBanner，testid 常量只有一处）+ KPI 与三张表不同源时明写「哪一侧是上一轮」。
+#     ⑧组的形状是**派生**：谁接了台账，谁的 catch 就必须对账、谁就必须 render 红条；
+#     点名清单会让下一个新页面自动落在锁外。
+#  ④ §P3-FE 一致性组：着色反向（Research 的「胜」配绿、「负」配红，与同页 signColor 与 Dashboard
+#     正好相反）、抽屉「实时价配冻结涨幅」、回测超额两口径、watchlist 缺数渲染 ¥0.00、
+#     DepthPanel 的 '--' 染绿、胜率取整。这些条的共同点是**不报错**——错了也看不出来，
+#     所以判据一律取「等于交付真值」而不是「看起来对」：--app-up/--app-down 的**全部定义值**
+#     （亮色 + 暗色两处；只数第一处时，暗色块被改成涨绿跌红照样绿——这是本批实录过的盲点）、
+#     缺测占位串等值、三态 pctState 的字面量等值。亚单位不取整按 owner 裁决⑧（99.6% 不得显示成 100%）。
+#
+#  ★ 本段最重要的一条纪律：**同一判据只有一份实现**。波 6 的覆盖面判据（轮询页守卫、catch 对账、
+#     D1 调用点、涨跌令牌真值）原本要在 bash 与 vitest 各写一遍——两份并存的结局本批已经踩过
+#     太多次：只修一份、另一份继续读旧判据（§0929DRILL 的 record_freshness()、
+#     §BOM-REPO-DERIVE 的派生清单、§107 的三件套同形）。现在判据只在
+#     scripts/fe_contract_scan.mjs 一处，两个消费者（vitest 的 p6_derived_coverage + 本段②组）
+#     读同一份 JSON。①组因此先锁「扫描器是唯一的尺子」：门禁自己**不许再写第二把剥注释的尺子**，
+#     vitest 文件里**不许再出现第二份 classify/auditCatches**。
+#  ★ 扫描器自己不判红（`process.exit(1)` 命中数必须为 0）：它只如实报「扫到了什么」，
+#     「扫到 0 条该不该红」由两个消费者断言。否则正则失效时它会安静地什么都不报，
+#     而那正是本枚要消灭的形态。同理，②组先用 key113 断「分母键本身读到了数」，
+#     再用它作等值分母——否则键名一坏，比较会退化成「拿 0 去比 0」的恒绿。
+#  ★ 反证七枚 V1–V7：五枚走扫描器读数（在 /tmp 镜像里破坏，断读数按预期翻转、复位复回基线），
+#     两枚走 vitest 镜像腿（Paper 摘角标、抽屉涨幅改回 props 冻结值）。镜像先做**基线自证**：
+#     读数与真仓等值 + 两份测试文件在镜像里各自绿——镜像不可信时，任何「破坏后变红」
+#     都不构成证据（§112 同族）。每枚变异落地数必须恰好 1；归属串必须是**基线里不存在**的串，
+#     否则「红了且文案里有它」是免费的（V3 的 #2fbf87 在基线里本来就作为跌色存在，
+#     所以那枚的归属串换成整行 `token_up_list=#e34d59,#2fbf87`——这条同族坑写死在函数里）。
+#
+#  English: §113 locks wave-6 frontend consistency. The judgement code lives once in
+# scripts/fe_contract_scan.mjs and both consumers (vitest + group ② here) read the same JSON; colour
+# tokens are asserted equal to the delivered truth (light AND dark definitions); guard/ledger wiring is
+# asserted by derived sets; seven /tmp mirror reverses prove the locks bite.
+CNT113=0
+REPO113="$PWD"
+SCN113=scripts/fe_contract_scan.mjs
+P6T113=web/src/__tests__/p6_derived_coverage.test.js
+PAP113=web/src/pages/Paper.jsx
+DRW113=web/src/components/StockDetailDrawer.jsx
+DPT113=web/src/components/DepthPanel.jsx
+WLS113=web/src/pages/Watchlist.jsx
+RES113=web/src/pages/Research.jsx
+STY113=web/src/styles.css
+API113=web/src/api/index.js
+PNL113=web/src/components/D1ConfigPanel.jsx
+SET113=web/src/pages/Settings.jsx
+SGD113=web/src/utils/staleGuard.js
+LGD113=web/src/utils/loadLedger.js
+LFB113=web/src/components/LoadFailBanner.jsx
+SRV113=internal/server/server.go
+HND113=internal/server/handlers_fix.go
+W113="$(mktemp -d /tmp/p2wave6-XXXXXX 2>/dev/null || true)"
+[ -n "$W113" ] || { echo "--- FAIL: §113 建不出镜像目录，扫描器读数腿与七枚反证无法跑（宁可红，不许跳）"; exit 1; }
+MIR113="$W113/mirror"
+
+eq113() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT113=$((CNT113 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §113 整串等值锁 ${CNT113}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+neg113() { # $1=文件 $2=整串 $3=说明 → 彻底没有
+	CNT113=$((CNT113 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §113 负锁 ${CNT113}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+}
+min113() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
+	CNT113=$((CNT113 + 1))
+	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §113 派生正锁 ${CNT113}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+}
+# strip_ansi113：剥掉终端转义序列。vitest 在被管道接走时**照样上色**（2026-10-09 预演实读：
+# 「Test Files」后面紧跟 \033[22m \033[1m\033[32m 再是「5 passed」），于是按「Test Files  5 passed」
+# 数行的两条锁（⑨ 的跑满清单、⑩ 的镜像基线两份各自绿）会红在颜色上而不是红在结果上。
+# 剥色只在这里一处实现，两个捕获点共用——写两遍的结局是改一遍、另一遍继续读带色的原文。
+strip_ansi113() { LC_ALL=C sed $'s/\033\[[0-9;]*m//g'; }
+# js113：JS/JSX/CSS 的代码行判据一律走扫描器的 codeOnly()——剥注释只有这一把尺子。
+# 门禁若自己再写一份「去掉 // 与 /*」的管道，就成了同一判据的第二份实现（①组的负锁拦的就是它）；
+# 而本段拦的正是 useRef(createStaleGuard()) 这类「只在说明注释里出现」的形态，
+# 用带注释的尺子数会让负锁在健康代码上恒红。
+js113() { # $1=line|re|many  $2=**仓库根相对**路径（many 模式为空格分隔的目录清单） $3=整串/正则
+	REL113="$2" PAT113="$3" MODE113="$1" node --input-type=module -e '
+const { codeOnly } = await import("./scripts/fe_contract_scan.mjs")
+const fs = await import("node:fs")
+const pathP = await import("node:path")
+const readCode = (p) => codeOnly(fs.readFileSync(p, "utf8"))
+const countLines = (text, needle) => {
+  let n = 0
+  for (const l of text.split("\n")) { if (l.includes(needle)) n++ }
+  return n
+}
+if (process.env.MODE113 === "many") {
+  let n = 0
+  for (const d of process.env.REL113.split(" ")) {
+    if (!d) continue
+    for (const f of fs.readdirSync(d).filter((x) => /\.jsx?$/.test(x))) {
+      n += countLines(readCode(pathP.join(d, f)), process.env.PAT113)
+    }
+  }
+  process.stdout.write(String(n))
+} else if (process.env.MODE113 === "re") {
+  const m = readCode(process.env.REL113).match(new RegExp(process.env.PAT113, "g"))
+  process.stdout.write(String(m ? m.length : 0))
+} else {
+  process.stdout.write(String(countLines(readCode(process.env.REL113), process.env.PAT113)))
+}
+' 2>&1
+}
+eqj113() { # $1=rel $2=整串 $3=预演 $4=说明 → 代码行行数等值
+	local got
+	got=$(js113 line "$1" "$2")
+	CNT113=$((CNT113 + 1))
+	case "$got" in
+	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	esac
+	[ "$got" = "$3" ] || { echo "--- FAIL: §113 代码行等值锁 ${CNT113}（$4）：$1 的代码行「$2」got=${got} 预演=$3"; exit 1; }
+}
+negj113() { # $1=rel $2=整串 $3=说明 → 代码行彻底没有
+	local got
+	got=$(js113 line "$1" "$2")
+	CNT113=$((CNT113 + 1))
+	case "$got" in
+	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	esac
+	[ "$got" = "0" ] || { echo "--- FAIL: §113 代码行负锁 ${CNT113}（$3）：$1 的代码行又出现「${2}」got=${got}"; exit 1; }
+}
+minj113() { # $1=rel $2=整串 $3=应≥ $4=说明 → 代码行行数下界（派生面缩水即红）
+	local got
+	got=$(js113 line "$1" "$2")
+	CNT113=$((CNT113 + 1))
+	case "$got" in
+	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	esac
+	[ "${got:-0}" -ge "$3" ] || { echo "--- FAIL: §113 代码行派生正锁 ${CNT113}（$4）：$1 的代码行「$2」实得=${got:-0} 应≥${3}"; exit 1; }
+}
+eqr113() { # $1=rel $2=正则 $3=预演 $4=说明 → 代码行命中次数等值
+	local got
+	got=$(js113 re "$1" "$2")
+	CNT113=$((CNT113 + 1))
+	[ "$got" = "$3" ] || { echo "--- FAIL: §113 次数等值锁 ${CNT113}（$4）：$1 正则「$2」got=${got} 预演=$3（got 不是数字时＝代码行尺子本身坏了）"; exit 1; }
+}
+PREV113=0
+# 十组读数先归零（set -u 下未赋值直接参与算术会中止脚本，报错位置离成因很远；
+# 「某一组一个判定点都没有」这件事由收尾的分组在位锁正面拦住，不靠 unbound 侥幸）。
+H1_N=0; H2_N=0; H3_N=0; H4_N=0; H5_N=0; H6_N=0; H7_N=0; H8_N=0; H9_N=0; H10_N=0
+SNAP113() { # $1=组号 → 记下本组新增判定点数（收尾 ok 行的「① 组 N 道」由这里派生，不是手写清单）
+	printf -v "H$1_N" '%s' "$((CNT113 - PREV113))"
+	PREV113=$CNT113
+}
+jget113() { # $1=键 → 从本段的 KEY=VALUE 读数里取值
+	printf '%s\n' "$SCAN113_KV" | sed -n "s/^$1=//p" | head -1
+}
+jline113() { # $1=键前缀 $2=必含串 → 该键的读数行里必须含归属串（整行判，不跨键蹭命中）
+	printf '%s\n' "$1" | grep "^$2" | grep -qF -- "$3"
+}
+
+# ── ① 单实现扫描器：判据只此一份、它自己不判红、两个消费者都接在同一把尺子上 ──
+CNT113=$((CNT113 + 1))
+[ -f "$SCN113" ] || { echo "--- FAIL: §113 单实现扫描器不在位（$SCN113 缺失＝波 6 的覆盖面判据没有落点，②–⑧组全部要重新定位）"; exit 1; }
+eq113 "$SCN113" 'export function classify(src)' 1 '注释/代码拆分只有这一把尺子（①–⑧组的静态判据都从它派生）'
+eq113 "$SCN113" 'export function codeOnly(src)' 1 '纯代码文本出口（负锁不剥注释就会把说明文字当一处实现）'
+eq113 "$SCN113" 'export function scanPollers(src)' 1 '轮询特征扫描（N1 射程）'
+eq113 "$SCN113" 'export function guardAccount(src)' 1 '守卫接线账（import/begin/isStale）'
+eq113 "$SCN113" 'export function pollCoverage(root)' 1 'N1 主入口：pages 派生集合'
+eq113 "$SCN113" 'export function auditCatches(src)' 1 'catch 对账（P14）'
+eq113 "$SCN113" 'export function catchCoverage(root)' 1 'P14 主入口：射程派生自台账接入面'
+eq113 "$SCN113" 'export function d1Coverage(root)' 1 'M3 主入口：api 出口/面板调用/页面挂载三段'
+eq113 "$SCN113" 'export function tokenTruths(root)' 1 '涨跌令牌：返回全部定义（只取第一处时暗色块落在锁外）'
+eq113 "$SCN113" 'export function report(root)' 1 '汇总出口：两个消费者读同一份键名'
+# 现测下界写在扫描器里（写两遍的结局是改一遍、另一遍继续用旧数）。
+eq113 "$SCN113" 'pollPages: 11' 1 '轮询页下界（2026-10-09 波 6 实跑 11 页，同提交同步）'
+eq113 "$SCN113" 'ledgerFiles: 4' 1 '台账接入页面数下界（实跑 4 页，另有共用红条）'
+eq113 "$SCN113" 'catchTotal: 40' 1 'catch 语料量级下界（实跑 44）'
+eq113 "$SCN113" 'upTokenDefs: 2' 1 '涨跌令牌定义处数下界（亮色 + 暗色各一份）'
+neg113 "$SCN113" 'process.exit(1)' '扫描器自己不判红——判红留给两个消费者（正则失效时它必须如实报 0，而不是自我销案）'
+eq113 "$SCN113" 'JSON.stringify(report(argRoot), null, 2)' 1 'CLI 出口：门禁读的就是这份 JSON'
+# 入口判据（2026-10-09 预演实录）：镜像反证把扫描器放在 **/tmp** 副本树里执行，而 macOS 的 /tmp
+# 是指向 /private/tmp 的符号链接。按字符串比 argv[1] 时两者永不相等 ⇒ 扫描器判成「被人 import」，
+# 于是安静地不打印、退出码还是 0；消费端只看到「空读数」，报错会把你引向「扫描器坏了」。
+eq113 "$SCN113" 'fs.realpathSync(path.resolve(argv1))' 1 '入口比 realpath（符号链接下空输出＋退出码 0 就是本段 ⑩ 组的第一杀手）'
+neg113 "$SCN113" 'const isMain = ' '按字符串比较 argv[1] 的旧入口写法禁止复活（镜像里跑不出读数）'
+# 消费者一＝vitest：p6 文件必须 import 扫描器，而不是自带第二份判据。
+eq113 "$P6T113" "from '../../../scripts/fe_contract_scan.mjs'" 1 'vitest 消费者接在同一把尺子上'
+neg113 "$P6T113" 'function classify(' '第二把 classify＝两份判据分家（只修一份的那条老路）'
+neg113 "$P6T113" 'function auditCatches(' '第二份 catch 对账实现'
+neg113 "$P6T113" 'function catchBodyOf(' '第二份花括号配平（体读短就看不见体内动作，v1 实录形态）'
+neg113 "$P6T113" 'function scanPollers(' '第二份轮询特征扫描'
+neg113 "$P6T113" 'function guardAccount(' '第二份守卫接线账'
+# 消费者二＝本段：JS 侧静态判据必须走 js113（内部 import 扫描器的 codeOnly），不许自带剥注释管道。
+BODY113=$(sed -n '/^echo "==> 113 /,/^echo "==> 全部通过"/p' scripts/verify_changes.sh 2>/dev/null || true)
+CNT113=$((CNT113 + 1))
+[ -n "$BODY113" ] || { echo "--- FAIL: §113 取不到本段段体（段头到收尾标记之间），尺子形状锁无从判（宁可红，不许跳）"; exit 1; }
+min113 '本段代码行判据都经扫描器 codeOnly（命中过少＝门禁自己另写了一把尺子）' "$(printf '%s\n' "$BODY113" | grep -c 'codeOnly' || true)" 2
+min113 '本段调用 js113 家族的行数（0＝静态锁退化回 grep 全文，说明注释会冒充一处实现）' "$(printf '%s\n' "$BODY113" | grep -cE '^(eqj113|negj113|minj113|eqr113|js113|BODY113) ' || true)" 40
+# A9-SELF：本枚的靶串就写在这一行上，不去掉自己这行的话锁会红在自己的话术上（§89 自指锁同族，
+# 区别是那条要求「写法不存在」所以能整串点名，这条是「本段内不许另写一把尺子」——只能按行排除）。
+neg113 <(printf '%s\n' "$BODY113" | grep -v 'A9-SELF' || true) "s|//.*||" '门禁内自制的剥注释管道＝第二把尺子（与扫描器分家的起点）'
+SNAP113 1
+
+# ── ② 扫描器读数逐键（门禁这个消费者读的 JSON，键名与 vitest 用的完全相同）──
+SCAN113_RC=0
+node "$SCN113" > "$W113/scan.json" 2>"$W113/scan.err" || SCAN113_RC=$?
+CNT113=$((CNT113 + 1))
+[ "$SCAN113_RC" = "0" ] || { echo "--- FAIL: §113 扫描器跑失败（rc=${SCAN113_RC}）：$(tail -3 "$W113/scan.err")"; exit 1; }
+CNT113=$((CNT113 + 1))
+[ -s "$W113/scan.json" ] || { echo "--- FAIL: §113 扫描器输出空文件（rc=0 但没读数＝判据整段退化成恒绿空循环）"; exit 1; }
+# JSON → KEY=VALUE 展平（列表给条数与逗号串；字典列表另给「哪个文件哪一行」的归属串）。
+cat > "$W113/flat.py" <<'PYFLAT113'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+rows = []
+for k, v in d.items():
+    if isinstance(v, dict):
+        for kk, vv in v.items():
+            rows.append("%s_%s=%s" % (k, kk, vv))
+    elif isinstance(v, list):
+        rows.append("%s_n=%d" % (k, len(v)))
+        if all(isinstance(x, str) for x in v):
+            rows.append("%s_list=%s" % (k, ",".join(v)))
+        elif v and all(isinstance(x, dict) for x in v):
+            # 归属串：反证要断「红在哪一列」，只报条数就退化成「有东西红了」
+            rows.append("%s_where=%s" % (k, ",".join("%s:%s" % (x.get("file", x.get("page", "")), x.get("line", "")) for x in v)))
+    elif isinstance(v, bool):
+        rows.append("%s=%s" % (k, "true" if v else "false"))
+    else:
+        rows.append("%s=%s" % (k, v))
+print("\n".join(rows))
+PYFLAT113
+SCAN113_KV=$(python3 "$W113/flat.py" "$W113/scan.json" 2>&1)
+CNT113=$((CNT113 + 1))
+[ -n "$SCAN113_KV" ] || { echo "--- FAIL: §113 展平后一条读数都没有（扫描器输出结构变了，逐键锁全部失去分母）：${SCAN113_KV}"; exit 1; }
+# 分母键自身必须先读到数：键名一坏，后面的等值会变成「拿 0 比 0」的恒绿。
+key113() { # $1=键 → 该键存在且非空
+	CNT113=$((CNT113 + 1))
+	local v
+	v=$(jget113 "$1")
+	[ -n "$v" ] || { echo "--- FAIL: §113 读数缺键（$1 不存在或为空＝扫描器的键名与门禁不同源，两个消费者已经分家）"; exit 1; }
+}
+for _k in poll_total poll_missing_n catch_total catch_unaccounted_n ledger_pages ledger_files_n floors_pollPages floors_ledgerFiles floors_catchTotal floors_upTokenDefs token_up_n token_down_n token_up_list token_down_list d1_endpoint_hits; do
+	key113 "$_k"
+done
+# 扫的必须是**这个仓**：root 漂移时反证会「扫真仓、破坏副本」，读数与破坏都对不上。
+eq113 "$W113/scan.json" "\"web_src\": \"$REPO113/web/src\"" 1 '扫描根＝当前仓（镜像反证另传根，见⑩组）'
+# N1：轮询页守卫覆盖面
+eq113 "$W113/scan.json" '"poll_missing": []' 1 '§P2-I N1：每个轮询页都接了守卫（非空即红，V1 就是它的反证）'
+min113 '§P2-I N2：轮询页派生集合不得缩水（掉下界＝扫描模式失效，而不是页面都修好了）' "$(jget113 poll_total)" "$(jget113 floors_pollPages)"
+# P14/P15：catch 对账
+eq113 "$W113/scan.json" '"catch_unaccounted": []' 1 '§P2-J P14：台账接入面内 0 处静默吞错（V2 是它的反证）'
+min113 '§P2-J P15：catch 语料量级（掉下来说明扫描器坏了，而不是「吞错都修完了」）' "$(jget113 catch_total)" "$(jget113 floors_catchTotal)"
+min113 '§P2-J P15：接了台账的页面数（接入面被改窄＝P14 扫不到新页面）' "$(jget113 ledger_pages)" "$(jget113 floors_ledgerFiles)"
+CNT113=$((CNT113 + 1))
+[ "$(jget113 ledger_files_n)" -gt "$(jget113 ledger_pages)" ] || { echo "--- FAIL: §113 接入面锁 ${CNT113}（红条组件不在台账接入文件集合里＝共用实现落在射程外）"; exit 1; }
+CNT113=$((CNT113 + 1))
+jline113 "$SCAN113_KV" 'ledger_files_list=' 'components/LoadFailBanner.jsx' || { echo "--- FAIL: §113 接入面内容锁 ${CNT113}（共用红条组件没进台账接入清单：它的 catch 与文案从此没人对账）"; exit 1; }
+# M3：D1 通道三段
+eq113 "$W113/scan.json" '"d1_api_get": 1' 1 '§P2-H M3：GET 出口恰好一处（两处＝第二个 fetchD1Config 冒出来了）'
+eq113 "$W113/scan.json" '"d1_api_post": 1' 1 '§P2-H M3：POST 出口恰好一处'
+min113 '§P2-H M3：端点串命中（GET/POST 各一处；开工前实测是 0 命中，那条零命中就是缺陷本体）' "$(jget113 d1_endpoint_hits)" 2
+eq113 "$W113/scan.json" '"d1_panel_get": 1' 1 '面板里的读取调用点恰好一处'
+eq113 "$W113/scan.json" '"d1_panel_post": 1' 1 '面板里的保存调用点恰好一处'
+min113 '§P2-H M3：挂载面板的页面数 ≥1（写了面板没人 render＝通道依旧没人用，§DEADGAUGE 定义没接同族）' "$(jget113 d1_mounted_pages_n)" 1
+# P1/P1b：涨跌令牌真值（等值到交付稿，不是「更红就行」的单向锁）
+eq113 "$W113/scan.json" '"token_up_warm_all": true' 1 '涨侧令牌全部定义为暖色（R>G）'
+eq113 "$W113/scan.json" '"token_down_cool_all": true' 1 '跌侧令牌全部定义为冷色（G>R）'
+CNT113=$((CNT113 + 1))
+[ "$(jget113 token_up_list)" = "#e34d59,#ff5b63" ] || { echo "--- FAIL: §113 令牌等值锁 ${CNT113}（--app-up 全部定义值应等于交付真值 #e34d59,#ff5b63，实得 $(jget113 token_up_list)）"; exit 1; }
+CNT113=$((CNT113 + 1))
+[ "$(jget113 token_down_list)" = "#00a870,#2fbf87" ] || { echo "--- FAIL: §113 令牌等值锁 ${CNT113}（--app-down 全部定义值应等于交付真值 #00a870,#2fbf87，实得 $(jget113 token_down_list)）"; exit 1; }
+CNT113=$((CNT113 + 1))
+[ "$(jget113 token_up_n)" = "$(jget113 floors_upTokenDefs)" ] || { echo "--- FAIL: §113 令牌定义处数等值锁 ${CNT113}（--app-up 实得 $(jget113 token_up_n) 应=$(jget113 floors_upTokenDefs)：少一处＝暗色块落在锁外，多一处＝有人在别处覆盖了涨跌色）"; exit 1; }
+CNT113=$((CNT113 + 1))
+[ "$(jget113 token_down_n)" = "$(jget113 floors_upTokenDefs)" ] || { echo "--- FAIL: §113 令牌定义处数等值锁 ${CNT113}（--app-down 实得 $(jget113 token_down_n) 应=$(jget113 floors_upTokenDefs)）"; exit 1; }
+SNAP113 2
+
+# ── ③ §P2-H M1/M2：后端两条路由与面板接线（前端调用点的两端都得在位）──
+eq113 "$SRV113" 's.mux.HandleFunc("GET /api/config/d1", s.adminMiddleware(s.handleGetD1Config))' 1 'M1：GET 路由带 admin 门（面板挂载门槛与它同口径）'
+eq113 "$SRV113" 's.mux.HandleFunc("POST /api/config/d1", s.adminMiddleware(s.handleSetD1Config))' 1 'M1：POST 路由带 admin 门'
+eqj113 "$API113" 'export async function fetchD1Config()' 1 'M2：GET 出口声明恰好一处'
+eqj113 "$API113" "return request('/api/config/d1')" 1 'M2：GET 请求串（斜杠开头＝绝对路径，不是拼出来的相对串）'
+eqj113 "$API113" 'export async function setD1Config(cfg)' 1 'M2：POST 出口声明恰好一处'
+eqj113 "$API113" "return request('/api/config/d1', { method: 'POST', data: cfg })" 1 'M2：POST 请求（method 必显式，缺省是 GET＝静默读而不是写）'
+minj113 "$PNL113" 'api.fetchD1Config(' 1 '面板真调用读取（写了组件不叫接线）'
+minj113 "$PNL113" 'api.setD1Config(' 1 '面板真调用保存'
+eqj113 "$PNL113" "setLoadState('error')" 1 'M2：读取失败落错误态（唯一的一处，写两遍就会有第三份）'
+eqj113 "$PNL113" "if (loadState !== 'loaded') return" 1 'M2：非 loaded 态直接拒保存（error 态禁保存，同 §N-4 战法参数口径）'
+eqj113 "$PNL113" "'D1 配置保存失败" 1 'M2：保存失败走可见 toast（静默 catch＝用户以为已经落库）'
+eqj113 "$PNL113" "{loadState === 'error' && (" 1 'M2：红条出口恰好一处（只加不减的台账会变成永久红）'
+eqj113 "$PNL113" 'setEffectiveSource(typeof cfg.effective_source' 1 'effective_source 回显接上（§0929CFG-D1 的自证字段，前端不显示等于白回）'
+eqj113 "$SET113" "const d1Admin = api.getRole() === 'admin'" 1 'M2：挂载门槛与两条 admin 路由同口径（非管理员拿 403 只会得到一块红条噪声）'
+eqj113 "$SET113" '{d1Admin && <D1ConfigPanel />}' 1 'M2：面板真被页面 render'
+negj113 "$SET113" '{<D1ConfigPanel />}' '无条件挂载形态禁止复活（与后端 adminMiddleware 口径矛盾的门，会让成员看到一块打不开的板）'
+SNAP113 3
+
+# ── ④ §P3-FE 着色令牌与单出口（等值到交付真值；旧的反向配对禁止复活）──
+eq113 "$STY113" '--app-up: #e34d59;' 1 '亮色涨＝A股红涨（交付真值，等值不是「更红就行」）'
+eq113 "$STY113" '--app-down: #00a870;' 1 '亮色跌＝A股绿跌'
+eq113 "$STY113" '--app-up: #ff5b63;' 1 '暗色涨（本批实录：只数第一处时暗色块被改反也照样绿）'
+eq113 "$STY113" '--app-down: #2fbf87;' 1 '暗色跌'
+eq113 "$STY113" '.up { color: var(--app-up); }' 1 '类名侧接线单点：.up 用涨令牌'
+eq113 "$STY113" '.down { color: var(--app-down); }' 1 '.down 用跌令牌（反向配对＝整页红绿互换，本条缺陷的原形）'
+CNT113=$((CNT113 + 1))
+UPDEF113=$(grep -cF -- '--app-up:' "$STY113" 2>/dev/null || true)
+[ "${UPDEF113:-0}" = "2" ] || { echo "--- FAIL: §113 令牌定义处数等值锁 ${CNT113}（--app-up 定义应恰好 2 处＝亮/暗各一份，实得 ${UPDEF113}：第三处＝有人在主题块外面覆盖了涨跌色）"; exit 1; }
+eqj113 "$RES113" 'export function signColor(v)' 1 'P1：全页正负数值只走这一个出口'
+eqj113 "$RES113" "return Number(v) >= 0 ? 'var(--app-up)' : 'var(--app-down)'" 1 'P1：正→红、负→绿（旧实现正好相反，且与同页另一个函数打架）'
+eqj113 "$RES113" "if (v === null || v === undefined || isNaN(v)) return 'var(--app-faint)'" 1 '缺数不着色（用弱化色而不是涨跌任一色，P8 同族）'
+negj113 "$RES113" 'function signClass' 'P3：同页第二把着色尺子禁止复活（旧 signClass 返回 pos/neg 类名，调用点手动配错色的实录见 Research :1405）'
+negj113 "$RES113" ">= 0 ? 'var(--app-down)'" 'P2：正数配跌色（绿）的反向配对禁止复活'
+negj113 "$RES113" "win > 0 ? 'var(--app-down)'" 'P2：「胜」配绿禁止复活（同页两套账的头号形态）'
+eqj113 "$RES113" "return (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%'" 1 'P6：回测超额的唯一格式化出口（toast 与表格同源）'
+CNT113=$((CNT113 + 1))
+FX113=$(js113 line "$RES113" '* 100).toFixed(2)')
+[ "${FX113:-0}" = "1" ] || { echo "--- FAIL: §113 P7 同源等值锁 ${CNT113}（格式化表达式应恰好出现在 1 行，实得 ${FX113}：两处＝toast 与表格各写一遍，正是「回测超额两口径」的原形；尺子坏了也会掉到 0）"; exit 1; }
+minj113 "$RES113" 'fmtExcess(' 3 'P6：出口被多处消费（0 处＝单源函数写了没接上）'
+minj113 "$RES113" 'signColor(' 5 'P1：着色出口被多处消费'
+SNAP113 4
+
+# ── ⑤ §P3-FE 缺数渲染三态（watchlist 的 ¥0.00 与 DepthPanel 的 '--' 染绿）──
+eqj113 "$WLS113" "export const WL_NO_DATA_PLACEHOLDER = '—'" 1 'P8：缺测占位串只有一处定义（各页自拼会让判据退化成逐页认文案）'
+eqj113 "$WLS113" 'export function PriceCell({ value })' 1 'P8：现价单元格单实现'
+eqj113 "$WLS113" 'export function PctCell({ value })' 1 'P8：涨跌单元格单实现'
+minj113 "$WLS113" 'wl-no-data' 2 'P8：两列各有一枚缺测标记 testid（少于 2＝某一列又回到渲染 0）'
+negj113 "$WLS113" 'Number(wlMap[code]?.price) || 0' 'P9：缺数归零形态禁止复活（0 会被当成「一个真实的股价」渲染成 ¥0.00）'
+negj113 "$WLS113" 'Number(s.change_pct) || 0' 'P9：行情刷新腿的归零禁止复活'
+negj113 "$WLS113" "'¥' + (row.price || 0).toFixed(2)" 'P9：表格列的 || 0 兜底禁止复活'
+negj113 "$WLS113" "(row.change_pct || 0) >= 0 ? 'var(--app-up)'" 'P9：缺数归零后还会被判成「涨」上色——0 与真涨幅同色是本条最坏的可见后果'
+eqj113 "$DPT113" "export const DEPTH_NO_DATA = '--'" 1 'P10：盘口缺测占位串单一定义'
+eqj113 "$DPT113" 'export function pctState(text)' 1 'P10：三态判据提到模块作用域（等值断言与静态锁才钉得住判据本身）'
+eqj113 "$DPT113" "if (!/^[+-]\\d/.test(s)) return 'neutral'" 1 "P10：'--' 与空串一律中性态（旧二态写法把缺测归进 else＝染成跌色）"
+eqj113 "$DPT113" 'const pctColor = { up: C.up, down: C.down, neutral: C.lv }' 1 'P10：三态各自的色值映射只在一处'
+eqj113 "$DPT113" 'data-pct-state={nowState}' 1 'P10：三态可被测试与门禁读出（渲染态而不是只存在判据里）'
+negj113 "$DPT113" "const nowCls = pctText.startsWith('+') ? 'up' : 'down'" 'P11：二态 nowCls 禁止复活（缺测走 else 分支被染绿）'
+negj113 "$DPT113" "r.volText && r.volText.startsWith('+') ? C.up : C.down" 'P11：挂单行的二态染色禁止复活'
+SNAP113 5
+
+# ── ⑥ §P3-FE 抽屉「实时价配冻结涨幅」：三层优先 + 回落必须标注 ──
+eqj113 "$DRW113" 'export function numOrNil(v)' 1 '缺数判据单点（合法 0 保留、空串/非数归 nil）'
+eqj113 "$DRW113" 'export function batchPrice(quote)' 1 '「同批」价格判据（>0 才可采信，0 是缺数不是价格）'
+eqj113 "$DRW113" 'export function deriveChg(price, prevClose)' 1 '同批自算涨幅的唯一算式（两位小数、prev≤0 一律 nil）'
+eqj113 "$DRW113" 'export function resolveDrawerChg(quote, propChangePct)' 1 'P4：涨幅三层优先收敛成一个函数（同批 change_pct → 同批自算 → props 冻结值）'
+eqj113 "$DRW113" 'const reading = resolveDrawerChg(quote, changePct)' 1 'P4：组件里只有这一个调用点（就地再写一遍 if 就是第二本账）'
+eqj113 "$DRW113" 'const chgFrozen = reading.frozen' 1 'P4：回落态必须带出标记'
+minj113 "$DRW113" 'sdd-chg-frozen' 1 'P4：冻结标注 testid 在位'
+minj113 "$DRW113" '（开抽屉时刻值）' 1 'P4：标注文案（只有角标没有文案＝用户不知道这个数字是哪一刻的）'
+negj113 "$DRW113" 'const rawChg = changePct' 'P5：涨幅只看 props 冻结值的旧形态禁止复活（价随轮询刷新、涨幅不刷＝价涨背离）'
+negj113 "$DRW113" 'Number.isFinite(Number(quote.price))' 'P5：就地判价格（绕过 batchPrice）禁止复活'
+# 后端同源腿：抽屉自算要的是**同批**昨收，取不到行情时三个键必须一起归零（半份读数比没读数更坏）。
+eq113 "$HND113" '"change_pct": r2(info.ChangePct)' 1 'M3 同源：lookup 回 change_pct（同批涨幅的第一优先来源）'
+eq113 "$HND113" '"prev_close": r2(prev)' 1 'M3 同源：回 prev_close 供自算，昨收缺时回落 Close'
+eq113 "$HND113" '"price": 0, "change_pct": 0, "prev_close": 0' 1 '取不到行情时三键一起归零（前端 batchPrice 据此判「不是同批读数」而不是当成 0 价）'
+SNAP113 6
+
+# ── ⑦ §P2-I 守卫接线：唯一正确写法 + 假绿形态负锁（跨 pages/components 派生求和）──
+eqj113 "$SGD113" 'export function useStaleGuard()' 1 'N1：hook 入口恰好一处定义（页面只剩一个调用点）'
+eqj113 "$SGD113" 'if (!ref.current) ref.current = createStaleGuard()' 1 'N1：惰性初始化（代号序列跨渲染稳定）'
+CNT113=$((CNT113 + 1))
+FAKE113=$(js113 many "web/src/pages web/src/components" 'useRef(createStaleGuard())')
+case "$FAKE113" in
+*Error*|*error*) echo "--- FAIL: §113 跨目录尺子没出数：${FAKE113}"; exit 1 ;;
+esac
+[ "${FAKE113:-0}" = "0" ] || { echo "--- FAIL: §113 假绿形态负锁 ${CNT113}（pages/components 的代码行里出现 useRef(createStaleGuard()) ${FAKE113} 处：每渲染 new 一个守卫、代号重置、isStale 永远 false＝守卫恒绿）"; exit 1; }
+CNT113=$((CNT113 + 1))
+IMP113=$(grep -rlF "utils/staleGuard.js" web/src/pages web/src/components 2>/dev/null | grep -c . || true)
+min113 '§P2-I N2：import 守卫的文件数（派生而不是点名；低于轮询页下界＝有人把整批 import 删了）' "$IMP113" "$(jget113 floors_pollPages)"
+eqr113 "$RES113" 'isStale\(t' 10 'N4：判污调用点在位（只 begin 不 isStale＝半边守卫；2026-10-09 预演实测 10 处＝Research 一页多个守卫实例各自的判污点，改名或删调用即红）'
+SNAP113 7
+
+# ── ⑧ §P2-J 台账与红条：单实现 testid + 派生接入面 + Paper 六枚角标 ──
+eqj113 "$LGD113" "export const LOAD_LEDGER_TESTID = 'load-ledger'" 1 'O1：testid 常量只有一处（各页自拼会让「红条在位」锁退化成逐页认文案）'
+eqj113 "$LFB113" 'export default function LoadFailBanner({ fails, page })' 1 'O1：红条单实现'
+eqj113 "$LFB113" 'data-testid={LOAD_LEDGER_TESTID}' 1 'O1：红条只认这一个常量'
+LEDGER113_LIST=$(jget113 ledger_files_list)
+CNT113=$((CNT113 + 1))
+[ -n "$LEDGER113_LIST" ] || { echo "--- FAIL: §113 接入面清单为空（下面的逐页循环会一次都不走，「红条在位」就此变成假锁）"; exit 1; }
+# 扫描器回的接入面清单是 **web/src 相对**路径（它整个射程就建立在 web/src 根上），
+# 而本段的尺子 js113 一律吃**仓库根相对**路径（与段头变量表同源）。这里在派生点一次性换根，
+# 而不是在每个循环里各拼一次——两处拼法的结局是第三处忘了拼然后 ENOENT 被当成「没红条」。
+IFS=',' read -r -a LEDGER113_RAW <<< "$LEDGER113_LIST"
+LEDGER113=()
+for _f in "${LEDGER113_RAW[@]}"; do
+	LEDGER113+=("web/src/$_f")
+done
+BANNER113=0
+for _f in "${LEDGER113[@]}"; do
+	case "$_f" in
+	web/src/components/LoadFailBanner.jsx) continue ;;
+	esac
+	_c=$(js113 line "$_f" '<LoadFailBanner ')
+	CNT113=$((CNT113 + 1))
+	case "$_c" in
+	''|*[!0-9]*) echo "--- FAIL: §113 接入面循环尺子没出数（${_f}「<LoadFailBanner 」实得「${_c}」）——尺子坏了不算通过，红条在位与否无从判"; exit 1 ;;
+	esac
+	[ "${_c:-0}" -ge 1 ] || { echo "--- FAIL: §113 接入面等值锁 ${CNT113}（$_f import 了台账却没 render 红条：失败记了账而用户看不见，正是本条缺陷的原形）"; exit 1; }
+	BANNER113=$((BANNER113 + 1))
+done
+key113 floors_ledgerFiles
+[ "$BANNER113" -ge "$(jget113 floors_ledgerFiles)" ] || { echo "--- FAIL: §113 接入面循环枚数锁（逐页验红条只跑了 ${BANNER113} 页，应≥$(jget113 floors_ledgerFiles)：循环没走到＝清单派生坏了，锁恒绿）"; exit 1; }
+# 各页不许自拼红条 testid（第二本 testid 会让「红条在位」数不到那一页）。
+CNT113=$((CNT113 + 1))
+SELF113=$(js113 many "web/src/pages" 'load-ledger')
+[ "${SELF113:-0}" = "0" ] || { echo "--- FAIL: §113 testid 唯一性负锁 ${CNT113}（pages 里还有 ${SELF113} 处自拼 load-ledger：判据得逐页认文案，加一页改一次锁）"; exit 1; }
+# Paper 的四腿装载与角标（O1 的产品形状）。
+eqj113 "$PAP113" 'function loadPaperLeg(' 1 'O1：四条腿的唯一装载器（各腿自己 try/catch＝第五处吞错只是时间问题）'
+eqr113 "$PAP113" 'await loadPaperLeg\(token, ' 4 'O1：四条腿各走唯一装载器（持仓/成交/委托/净值）'
+minj113 "$PAP113" "legFailFlag('" 6 'O1：按腿角标调用点 ≥6（实跑 6 处：持仓/成交/委托/净值曲线/战法开关清单/撮合配置）'
+eqj113 "$PAP113" 'paper-kpi-mismatch' 1 'O2：KPI 与三张表不同源时的说明恰好一处'
+eqj113 "$PAP113" 'Number(activeStats.win_rate_pct).toFixed(1)' 1 'P12：胜率保留一位小数（亚单位不取整，owner 裁决⑧）'
+negj113 "$PAP113" 'win_rate_pct).toFixed(0)' 'P13：99.6% 显示成 100% 的取整形态禁止复活（胜率是把几胜几负折成一个数的判据，取整后 100% 冒充零亏损）'
+minj113 "$PAP113" 'paper-win-rate' 1 'P12：胜率格整格挂 testid（只框数字会让「/ N仓」落在断言外）'
+# 空吞形态在接入面内必须清零（旧四腿的 `} catch (_) {}` 不许复活）。
+CNT113=$((CNT113 + 1))
+SWALLOW113=0
+for _f in "${LEDGER113[@]}"; do
+	_c=$(js113 line "$_f" '} catch (_) {}')
+	case "$_c" in
+	''|*[!0-9]*) echo "--- FAIL: §113 空吞循环尺子没出数（$_f 实得「${_c}」）——读数为空的「0 处空吞」是假的"; exit 1 ;;
+	esac
+	SWALLOW113=$((SWALLOW113 + _c))
+done
+[ "$SWALLOW113" = "0" ] || { echo "--- FAIL: §113 空吞负锁 ${CNT113}（台账接入面内仍有 ${SWALLOW113} 处 } catch (_) {}：失败什么都不留，运维只能靠「今天怎么没数据」反推链路坏了）"; exit 1; }
+SNAP113 8
+
+# ── ⑨ 行为腿：波 6 的前端测试文件清单由目录**派生**，文件数与实跑等值对账 ──
+# 写死「四个文件」的后果和第 31 探针那次一样：加第五份测试（本批的 p2h_d1_panel）时锁看不见它，
+# 于是新那份永远在锁外——所以清单从 web/src/__tests__ 派生，并钉一条「派生清单 <5 即红」的正锁。
+W6T113=$(cd web/src/__tests__ && ls | grep -E '^(p2h_|p3fe_|p6_derived)' | sed -E 's/\.test\.(js|jsx)$//' | LC_ALL=C sort) || true
+W6N113=$(printf '%s\n' "$W6T113" | grep -c . || true)
+min113 '波 6 行为腿清单派生为空/过短（正则失效或测试被整批删，本段就只剩静态锁）' "$W6N113" 5
+MISS6113=""
+for _t in $W6T113; do
+	ls web/src/__tests__/"$_t".test.* >/dev/null 2>&1 || MISS6113="$MISS6113 $_t"
+done
+CNT113=$((CNT113 + 1))
+[ -z "$MISS6113" ] || { echo "--- FAIL: §113 行为腿点名失效（清单派生自目录却仍缺文件，说明有半截文件）：${MISS6113}"; exit 1; }
+W6RUN113=$( cd web && NO_COLOR=1 npm test -- $W6T113 2>&1 | strip_ansi113 || true )
+CNT113=$((CNT113 + 1))
+printf '%s\n' "$W6RUN113" | grep -qE 'Test Files +'"$W6N113"' passed' \
+	|| { echo "--- FAIL: §113 波 6 行为腿没跑满派生清单（应见「Test Files $W6N113 passed」）："; printf '%s\n' "$W6RUN113" | grep -E 'Test Files|Tests |FAIL|Cannot find|Error' | head -15; exit 1; }
+CNT113=$((CNT113 + 1))
+if printf '%s\n' "$W6RUN113" | grep -qE ' failed'; then
+	echo "--- FAIL: §113 波 6 行为腿判红："
+	printf '%s\n' "$W6RUN113" | grep -E 'FAIL|✗|×|AssertionError|Unable to find' | head -20
+	exit 1
+fi
+W6T_N113=$(printf '%s\n' "$W6RUN113" | sed -n 's/.*Tests  *\([0-9][0-9]*\) passed.*/\1/p' | head -1)
+min113 '波 6 行为腿用例条数（文件数对上而用例掉到个位数＝整文件被 skip，与 §112 的防空转同族）' "${W6T_N113:-0}" 40
+SNAP113 9
+
+# ── ⑩ 镜像反证：/tmp 副本树（源文件零改动），先自证镜像基线 == 真仓读数 ──
+mkdir -p "$MIR113/scripts" "$MIR113/web/node_modules" || { echo "--- FAIL: §113 建不出镜像骨架"; exit 1; }
+cp "$REPO113/$SCN113" "$MIR113/scripts/" || { echo "--- FAIL: §113 镜像缺扫描器（反证没有尺子）"; exit 1; }
+for _e in "$REPO113"/web/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	node_modules) continue ;;
+	esac
+	cp -R "$_e" "$MIR113/web/" || { echo "--- FAIL: §113 镜像复制 web/$_b 失败"; exit 1; }
+done
+# node_modules 逐条目软链：整体软链会让镜像把 vite 依赖缓存写进**真仓**的 node_modules/.vite，
+# 于是反证与真仓互相污染（下一次真跑的读数就不干净了）；.vite 不进软链，让镜像自己建。
+for _e in "$REPO113"/web/node_modules/* "$REPO113"/web/node_modules/.[!.]*; do
+	[ -e "$_e" ] || continue
+	_b=$(basename "$_e")
+	case "$_b" in
+	.vite) continue ;;
+	esac
+	ln -s "$_e" "$MIR113/web/node_modules/$_b" || { echo "--- FAIL: §113 镜像软链 node_modules/$_b 失败"; exit 1; }
+done
+cat > "$W113/mutate.py" <<'PYMUT113'
+import sys
+# 用法：mutate.py <绝对文件> <old> <new> —— 整串替换并打印落地次数（不是 1 由调用方判红）
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PYMUT113
+scan_mirror() { # 在镜像根上跑扫描器 → KEY=VALUE（root 走参数＝破坏的是副本，读的也是副本）
+	node "$MIR113/scripts/fe_contract_scan.mjs" "$MIR113/web/src" > "$W113/mscan.json" 2>"$W113/mscan.err" || return 1
+	python3 "$W113/flat.py" "$W113/mscan.json" 2>&1
+}
+mirror_vitest() { # $1=测试文件名（不含扩展名）→ 打印全文（已剥色，尺子读的是干净文本）
+	( cd "$MIR113/web" && ./node_modules/.bin/vitest run "src/__tests__/$1.test."* 2>&1 ) | strip_ansi113
+}
+# 这里把「跑不起来」拆成两种现形：node 自身的 stderr、以及展平脚本读到空 JSON 时的报错。
+# 之前只回显 mscan.err 的那版会把「扫描器安静地没打印」（/tmp 符号链接骗过入口判据那种）说成
+# 「扫描器坏了」，而真相在 python 那侧——读数原文必须一起带出来才归属得清。
+MIR_BASE=$(scan_mirror) || { echo "--- FAIL: §113 镜像扫描器没有带回读数（node stderr＋展平原文如下）"; tail -3 "$W113/mscan.err"; printf '%s\n' "$MIR_BASE" | tail -5; exit 1; }
+kgetb() { printf '%s\n' "$MIR_BASE" | sed -n "s/^$1=//p" | head -1; }
+CNT113=$((CNT113 + 1))
+[ "$(kgetb poll_total)" = "$(jget113 poll_total)" ] \
+	|| { echo "--- FAIL: §113 镜像基线与真仓读数不等值（poll_total 镜像=$(kgetb poll_total) 真仓=$(jget113 poll_total)）——镜像不可信时，任何「破坏后变红」都不构成证据"; exit 1; }
+CNT113=$((CNT113 + 1))
+[ "$(kgetb catch_total)" = "$(jget113 catch_total)" ] \
+	|| { echo "--- FAIL: §113 镜像基线 catch_total 与真仓不等值（镜像 copy 少了一棵目录树，反证会「红了也不知道红在哪」）"; exit 1; }
+CNT113=$((CNT113 + 1))
+[ "$(kgetb token_up_list)" = "$(jget113 token_up_list)" ] \
+	|| { echo "--- FAIL: §113 镜像基线令牌读数与真仓不等值（styles.css 没被整份复制进镜像）"; exit 1; }
+BASE6113="$(mirror_vitest p3fe_paper_legfail)
+$(mirror_vitest p3fe_drawer_stale)"
+CNT113=$((CNT113 + 1))
+[ "$(printf '%s\n' "$BASE6113" | grep -c 'Test Files  1 passed')" = "2" ] \
+	|| { echo "--- FAIL: §113 镜像内 vitest 基线不是「两份各自绿」（node_modules 软链或 vitest 配置在镜像里坏了），尾部："; printf '%s\n' "$BASE6113" | grep -E 'Test Files|Errors|failed|Cannot' | head -10; exit 1; }
+echo "ok - §113 镜像基线自证（扫描器三键与真仓等值 + 两文件 vitest 在镜像里各自绿）"
+
+dys113_scan() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=读数键 $6=变异后期望 $7=基线期望 $8=归属必含串（可空） $9=归属读数键（缺省＝$5）
+	# 条数键与归属键常常不是同一行：翻转的是 poll_missing_n（0→1），而「是哪一个文件缺的」写在 poll_missing_list 上。
+	# 只按 $5 那一行找归属串的话，V1 会因为「n 那行没有文件名」判红在别处——那是尺子的形状错了，不是反证没牙。
+	local id="$1" rel="$2" old="$3" new="$4" key="$5" want="$6" base="$7" token="$8" akey="${9:-$5}" applied out got mutgot113
+	CNT113=$((CNT113 + 1))
+	cp -f "$REPO113/$rel" "$MIR113/$rel" || { echo "--- FAIL: §113 反证 ${id} 无法从主仓复位镜像文件 $rel"; exit 1; }
+	if [ -n "$token" ] && printf '%s\n' "$MIR_BASE" | grep "^$akey" | grep -qF -- "$token"; then
+		echo "--- FAIL: §113 反证 ${id} 的归属串在镜像**基线**里就已经存在（${token}）——「红了且文案里有它」是免费的，这枚反证不可归属"
+		exit 1
+	fi
+	applied=$(python3 "$W113/mutate.py" "$MIR113/$rel" "$old" "$new" 2>&1 | tail -1)
+	if [ "$applied" != "1" ]; then
+		echo "--- FAIL: §113 反证 ${id} 变异落地数=${applied}，期望恰好 1（0＝镜像里没找到目标串，这枚等于没跑；>1＝命中面比预期宽，红了也不知道红在哪）"
+		exit 1
+	fi
+	out=$(scan_mirror) || { echo "--- FAIL: §113 反证 ${id} 变异后镜像扫描器跑不起来（harness 坏了不是锁有牙）：$(tail -3 "$W113/mscan.err")"; exit 1; }
+	got=$(printf '%s\n' "$out" | sed -n "s/^$5=//p" | head -1)
+	if [ "$got" != "$want" ]; then
+		echo "--- FAIL: §113 反证 ${id} 没有让读数翻转（$5 期望「${want}」实得「${got}」）——这条锁恒绿，是假锁"
+		printf '%s\n' "$out" | grep -E "^$5" | head -3
+		exit 1
+	fi
+	if [ -n "$token" ] && ! printf '%s\n' "$out" | grep "^$akey" | grep -qF -- "$token"; then
+		echo "--- FAIL: §113 反证 ${id} 读数翻了，但归属键 ${akey} 的读数行里没有本枚指定的串「${token}」（＝红在别处，成因归属不成立）"
+		printf '%s\n' "$out" | grep -E "^$akey" | head -3
+		exit 1
+	fi
+	mutgot113="$got" # 变异那一刻的读数先留底：收尾那行要印的是它，不是复位后的基线（把「翻成 0」打在翻成 1 的枚上＝收尾账在撒谎）
+	cp -f "$REPO113/$rel" "$MIR113/$rel" || { echo "--- FAIL: §113 反证 ${id} 复位失败（${rel}）"; exit 1; }
+	out=$(scan_mirror) || { echo "--- FAIL: §113 反证 ${id} 复位后镜像扫描器跑不起来"; exit 1; }
+	got=$(printf '%s\n' "$out" | sed -n "s/^$5=//p" | head -1)
+	[ "$got" = "$base" ] || { echo "--- FAIL: §113 反证 ${id} 复位后 $5 没回到基线「${base}」（实得「${got}」）＝镜像被别处污染，后续反证读数全部作废"; exit 1; }
+	echo "ok - §113 反证 ${id}：破坏 $rel → $5 翻成「${mutgot113}」且复位回基线（${base}）"
+}
+dys113_vitest() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=测试文件名 $6=红文案必含串
+	local id="$1" rel="$2" old="$3" new="$4" tf="$5" token="$6" applied out rc
+	CNT113=$((CNT113 + 1))
+	cp -f "$REPO113/$rel" "$MIR113/$rel" || { echo "--- FAIL: §113 反证 ${id} 无法从主仓复位镜像文件 $rel"; exit 1; }
+	applied=$(python3 "$W113/mutate.py" "$MIR113/$rel" "$old" "$new" 2>&1 | tail -1)
+	if [ "$applied" != "1" ]; then
+		echo "--- FAIL: §113 反证 ${id} 变异落地数=${applied}，期望恰好 1（0＝目标串在镜像里没有，产品代码可能已被改名；>1＝命中面比预期宽）"
+		exit 1
+	fi
+	rc=0
+	out=$(mirror_vitest "$tf" 2>&1) || rc=$?
+	if [ "$rc" = "0" ]; then
+		echo "--- FAIL: §113 反证 ${id} 没有让 $tf 变红（这条测试腿是假绿——破坏产品代码它照样通过）"
+		printf '%s\n' "$out" | tail -12
+		exit 1
+	fi
+	if ! printf '%s\n' "$out" | grep -qF -- "$token"; then
+		echo "--- FAIL: §113 反证 ${id} 红了，但红文案里找不到本枚指定的归属串「${token}」（＝红在别处，成因归属不成立）"
+		printf '%s\n' "$out" | grep -E 'FAIL|AssertionError|Unable to find|×' | head -10
+		exit 1
+	fi
+	cp -f "$REPO113/$rel" "$MIR113/$rel" || { echo "--- FAIL: §113 反证 ${id} 复位失败（${rel}）"; exit 1; }
+	out=$(mirror_vitest "$tf" 2>&1) || { echo "--- FAIL: §113 反证 ${id} 复位后仍红＝镜像被别处污染，后续反证读数全部作废"; printf '%s\n' "$out" | tail -12; exit 1; }
+	echo "ok - §113 反证 ${id}：破坏 $rel → $tf 红（归属串 ${token}）且复位复绿"
+}
+# V1 摘掉一页的守卫 import ⇒ N1 的派生集合必须点名它（覆盖面锁的牙齿，不是点名清单）。
+dys113_scan V1 web/src/pages/MsgCenter.jsx "import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）" "" poll_missing_n 1 0 MsgCenter.jsx poll_missing_list
+# V2 把一处可见错误态换成 void ⇒ P14 对账必须抓到，归属点名到那一页那一行。
+dys113_scan V2 web/src/pages/Hotspot.jsx "markLoadFail('交易时段状态', err && err.message)" "void err" catch_unaccounted_n 1 0 'pages/Hotspot.jsx:' catch_unaccounted_where
+# V3 把暗色主题的涨令牌改成冷色 ⇒ 「全部定义为暖」判据必须红（只数第一处的旧尺子会照样绿）。
+dys113_scan V3 web/src/styles.css "--app-up: #ff5b63;" "--app-up: #2fbf87;" token_up_warm_all false true '#e34d59,#2fbf87' token_up_list
+# V4 摘掉页面挂载 ⇒ M3 的挂载页集合必须归零（面板写了没人 render＝通道依旧没人用）。
+dys113_scan V4 web/src/pages/Settings.jsx '{d1Admin && <D1ConfigPanel />}' "" d1_mounted_pages_n 0 1 ''
+# V5 把 GET 出口改名 ⇒ api 段命中归零（面板调用还在：三段各数一处不是冗余，是三条不同的腿）。
+dys113_scan V5 web/src/api/index.js 'export async function fetchD1Config()' 'export async function fetchD1ConfigV2()' d1_api_get 0 1 ''
+# V6 Paper 摘掉持仓腿角标 ⇒ 行为腿必须红在「找不到那枚 testid」上（O1 的可见性）。
+dys113_vitest V6 web/src/pages/Paper.jsx "{legFailFlag('持仓')}" "" p3fe_paper_legfail 'paper-leg-fail-持仓'
+# V7 抽屉涨幅改回 props 冻结值 ⇒ 抽屉行为腿必须红（P4b 那条「同批自算」的用例）。
+dys113_vitest V7 web/src/components/StockDetailDrawer.jsx 'const reading = resolveDrawerChg(quote, changePct)' 'const reading = { price: null, chg: Number(changePct) || 0, live: false, frozen: false, up: (Number(changePct) || 0) >= 0 }' p3fe_drawer_stale 'P4b'
+DYS113_N=$(grep -cE '^dys113_(scan|vitest) V' scripts/verify_changes.sh || true)
+CNT113=$((CNT113 + 1))
+[ "${DYS113_N:-0}" -ge 7 ] || { echo "--- FAIL: §113 反证枚数派生异常（读到 ${DYS113_N}，应 ≥7＝点名模式失效或反证被删，收尾分组读数不可信）"; exit 1; }
+
+# ── 覆盖面诚实账（不判红，只把「今天还落在锁外面的东西」如实记下来）──
+ALL_CATCH113=$(js113 many "web/src/pages web/src/components" 'catch (')
+CNT113=$((CNT113 + 1))
+[ "${ALL_CATCH113:-0}" -ge 100 ] || { echo "--- FAIL: §113 覆盖面账派生异常（全仓 catch 代码行读到 ${ALL_CATCH113}，应 ≥100＝many 尺子坏了，上面几枚跨目录锁的读数也一起不可信）"; exit 1; }
+echo "INFO - §113 覆盖面账：pages/components 的 catch 代码行共 ${ALL_CATCH113} 处，本段只对账台账接入面内的 $(jget113 catch_total) 处（其余落在锁外是**射程取舍**：硬扫全仓会在尚未接入的页面恒红，那种锁没人敢留）；EventSource 特征在 pages 0 命中（SSE 由 api 层单点持有，App 建连后走 sseBus 分发）；Research 的 heatColor（背景热力量表）与 signColor（文字涨跌色）同页并存、正负方向不一致，待 owner 裁决；Paper 的账户状态主腿没有独立角标，可见性由红条 + paper-kpi-mismatch 两处承担（见 p3fe_paper_legfail 的 O1b 注释）。"
+
+# ── 分组自证（本段最后两道锁）──
+CNT113=$((CNT113 + 1))
+_EMPTY_H=""
+for _g in 1 2 3 4 5 6 7 8 9; do
+	_v="H${_g}_N"
+	if [ "${!_v}" -le 0 ]; then _EMPTY_H="${_EMPTY_H} ${_g}"; fi
+done
+[ -z "$_EMPTY_H" ] || { echo "--- FAIL: §113 分组快照在位锁 ${CNT113}（这些组一个判定点都没记到：组${_EMPTY_H}）——漏一处 SNAP113 时那组的锁会被并进邻组读数，累计数正常而分组数是假的"; exit 1; }
+SNAP113 10
+SUMH113=$((H1_N + H2_N + H3_N + H4_N + H5_N + H6_N + H7_N + H8_N + H9_N + H10_N))
+CNT113=$((CNT113 + 1))
+[ "$SUMH113" = "$((CNT113 - 1))" ] || { echo "--- FAIL: §113 分组求和自证锁 ${CNT113}（十组快照之和 ${SUMH113} != 累计判定点扣本锁 $((CNT113 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
+rm -rf "$W113"
+echo "ok - §113 全段通过：① 单实现扫描器与两消费者接线 ${H1_N} 道 + ② 扫描器读数逐键（N1/N2/P14/P15/M3/P1）${H2_N} 道 + ③ D1 通道两端接线 ${H3_N} 道 + ④ 涨跌令牌等值与着色单出口 ${H4_N} 道 + ⑤ 缺数渲染三态 ${H5_N} 道 + ⑥ 抽屉三层优先与冻结标注 ${H6_N} 道 + ⑦ 守卫接线与假绿形态负锁 ${H7_N} 道 + ⑧ 台账接入面派生对账（逐页 ${BANNER113} 枚）${H8_N} 道 + ⑨ 行为腿（派生清单 ${W6N113} 个文件 / ${W6T_N113} 条用例）${H9_N} 道 + ⑩ 镜像基线自证与 ${DYS113_N} 枚反证 V1–V${DYS113_N} ${H10_N} 道，累计判定点 ${CNT113}（其中十组快照之和 ${SUMH113}，另有 1 道就是求和自证锁本身）"
+echo ""
+
 echo "==> 全部通过"

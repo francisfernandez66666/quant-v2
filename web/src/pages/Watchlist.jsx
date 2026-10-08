@@ -4,6 +4,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { Card, Table, Button, Input, Dialog, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
@@ -43,6 +44,65 @@ function scoreStyle(score, pass, strongMin) {
   return { color: 'var(--app-text-2)', fontWeight: 600 }
 }
 
+// §P3-FE P8/P9（缺数渲染，20261006 修复批）：自选行原先在**合并阶段**就把「没读到」折成 0
+// （`Number(wlMap[code]?.price) || 0` / `Number(s.change_pct) || 0`），表格再无条件渲染成
+// 「¥0.00」并按 `>=0` 染成涨红——一只停牌/未进快照覆盖的票，在界面上和「今天正好平盘」长得一模一样，
+// 用户按颜色判断涨跌就会读反（与 §P2-F 降级链把断源日写成平盘同族）。
+// 现在合并侧保留 null、渲染侧按 null 出 '--' 且不着色，缺数与平盘从此是两种读数。
+// 两把尺子必须分开定义，因为 0 在两个字段里的含义不同：
+//   price：0 不是合法现价（后端取不到行情就回 0，见 handlers_fix.go 的 price>0 判据）⇒ 只有 >0 算有数；
+//   change_pct：0 是合法实测值（平盘）⇒ 只要可解析成有限数就算有数，null/'' /undefined 才算缺数。
+function priceOrNil(v) {
+  // 现价缺数判据：可解析且 >0 才认，其余（0/NaN/null/undefined）一律 null
+  const n = Number(v)
+  // 常量 n：局部定义
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+function pctOrNil(v) {
+  // 涨跌幅缺数判据：null/空串/不可解析→null；0 与负值都是合法实测读数
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  // 常量 n：局部定义
+  return Number.isFinite(n) ? n : null
+}
+
+// §P3-FE P8/P9 渲染出口（提到模块作用域并 export：整页挂载要 mock 快照/自选/评分/时段四路端点，
+// 与「缺数怎么显示」这条断言无关，做法同 Research.jsx 的 isAdjBasisStale；表格里两格的缺数口径
+// 只有这一份实现，列定义与单测共用，不会出现「测的是 helper、表里写的是另一套」）。
+// 占位符选「—」：与本页评分列既有惯例一致（5 个评分格缺数都写「—」），不另造第二种占位符；
+// FIX_PLAN 条目里写的 '--' 是 DepthPanel 那侧的形态，两处各按各页惯例，断言按「同页占位符唯一」钉。
+// 缺数一律不着色（var(--app-faint)）：旧写法无条件按 `>=0` 染涨红/跌绿，把「不知道涨跌」显示成「在跌」，
+// 用户按颜色判断就会读反（与 §P2-F 降级链把断源日写成平盘同族）。
+// English: §P3-FE — the two quote cells' missing-data rendering, single implementation shared by the
+// table columns and the unit tests (no color at all when there is no reading).
+export const WL_NO_DATA_PLACEHOLDER = '—'
+
+/**
+ * 现价单元格：有数显示 ¥xx.xx，缺数（含 0，0 不是合法现价）显示占位符且不着色。
+ * @param {{value: number|null|string}} props
+ * @returns {JSX.Element}
+ */
+export function PriceCell({ value }) {
+  const p = priceOrNil(value)
+  // 常量 p：局部定义
+  return p == null
+    ? <span style={{ color: 'var(--app-faint)' }} data-testid="wl-no-data">{WL_NO_DATA_PLACEHOLDER}</span>
+    : <span>¥{p.toFixed(2)}</span>
+}
+
+/**
+ * 涨跌幅单元格：有数按红涨绿跌着色（0 是合法的平盘实测），缺数显示占位符且不着色。
+ * @param {{value: number|null|string}} props
+ * @returns {JSX.Element}
+ */
+export function PctCell({ value }) {
+  const c = pctOrNil(value)
+  // 常量 c：局部定义
+  return c == null
+    ? <span style={{ color: 'var(--app-faint)' }} data-testid="wl-no-data">{WL_NO_DATA_PLACEHOLDER}</span>
+    : <span data-testid="wl-pct" style={{ color: c >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{c > 0 ? '+' : ''}{c.toFixed(2)}%</span>
+}
+
 // 安全读取字段值
 function val(e, key) {
   const v = e[key]
@@ -70,6 +130,10 @@ export default function Watchlist() {
   const [detail, setDetail] = useState(null)
   // 轮询定时器（30s）
   const timer = useRef(null)
+  // §P2-I（2026-10-06 修复批 波 6）60s 轮询代号守卫：上一轮还在途时下一轮已发出，
+  // 旧响应迟到会把新一轮刚写好的行情/评分覆盖回去（数据倒挂，且一直显示到下次轮询）。
+  // 本页自 §M-10 起就漏在守卫外——自选页恰好是"评分列"最需要新鲜读数的地方。
+  const loadGuard = useStaleGuard()
   // §修复 P2#23：受控排序状态——点击表头排序后持久保留，避免 30s 数据轮询整体替换把排序重置
   // English: P2#23 — controlled sort state keeps the user's column sort across the 30s data poll.
   const [sort, setSort] = useState(null)
@@ -105,8 +169,11 @@ export default function Watchlist() {
 
   // 加载自选行情、评估数据并合并快照信息
   async function load() {
+    // §P2-I：本轮代号在**发起请求前**盖章，每次 await 回来后先判后到再写 state
+    const token = loadGuard.begin()
     try {
       const st = await api.fetchStatus()
+      if (loadGuard.isStale(token)) return // 后到的旧轮次：整包丢弃，连 session 也不写
       const cur = stocksRef.current
       const hasEmptyCode = cur.some((s) => !s.code)
       // 非交易时段且已有关联行情时跳过刷新，避免无谓请求
@@ -115,6 +182,9 @@ export default function Watchlist() {
       const [snap, wl, ev] = await Promise.all([
         api.fetchSnapshot(), api.fetchWatchlist(), api.fetchEvaluations(),
       ])
+      // §P2-I：三份数据是并行拉的，判定必须落在**合并写 state 之前**（Promise.all 回来即最新
+      // 可用判点）；放在 setStocks 之后再判等于已经覆盖完了才丢弃。
+      if (loadGuard.isStale(token)) return
       const wlStocks = (wl.stocks || []).map((c) => (typeof c === 'object' ? c : { code: c }))
       // 归一为 {code} 形式的股票列表再取代码集合
       const codes = wlStocks.map((c) => c.code)
@@ -141,8 +211,9 @@ export default function Watchlist() {
       return {
         code: typeof code === 'string' ? code : '',
         name: wlMap[code]?.name || evMap[code]?.name || code,
-        price: Number(wlMap[code]?.price) || 0,
-        change_pct: Number(wlMap[code]?.change_pct) || 0,
+        // §P3-FE P8/P9：缺数保留 null（旧写法 Number(x)||0 把「没读到」写成了「读到 0」）
+        price: priceOrNil(wlMap[code]?.price),
+        change_pct: pctOrNil(wlMap[code]?.change_pct),
         n_score: evMap[code]?.n_score || 0, n_pass: evMap[code]?.n_pass || false,
         dragon_score: evMap[code]?.dragon_score || 0, dragon_pass: evMap[code]?.dragon_pass || false,
         db_score: evMap[code]?.db_score || 0, db_pass: evMap[code]?.db_pass || false,
@@ -159,9 +230,11 @@ export default function Watchlist() {
           return {
             ...base,
             name: s.name || base.name,
-            price: Number(s.price) || base.price,
-            // §WL-FIX：Number() 失败会得 NaN（旧写法 ?? 对 NaN 不兜底）→ 直接用 || 归零
-            change_pct: Number(s.change_pct) || 0,
+            // §P3-FE P8/P9：快照有数用快照、缺数回落到自选列表带来的上一份读数，两者都没有才是 null
+            // （§WL-FIX 的教训仍在位：Number() 失败得 NaN，旧写法 `?? ` 对 NaN 不兜底，
+            //  故判据统一走 priceOrNil/pctOrNil——它们用 Number.isFinite 把 NaN 也归成「没数」）。
+            price: priceOrNil(s.price) ?? base.price,
+            change_pct: pctOrNil(s.change_pct) ?? base.change_pct,
           }
         })
       // 补全快照中未覆盖的自选股
@@ -193,8 +266,10 @@ export default function Watchlist() {
         const row = {
           code: res.stock.code || code,
           name: res.stock.name || code,
-          price: res.stock.price || 0,
-          change_pct: res.stock.change_pct || 0,
+          // §P3-FE P8/P9：添加返回没带行情时留 null（旧写法写 0 会让新行立刻显示「¥0.00 +0.00%」，
+          // 看起来像读到平盘；下一轮快照有数后才会被真值替换）
+          price: priceOrNil(res.stock.price),
+          change_pct: pctOrNil(res.stock.change_pct),
           // 各维度评分初始化为 0，等待下一轮评估刷新
           n_score: 0, n_pass: false,
           dragon_score: 0, dragon_pass: false,
@@ -206,7 +281,8 @@ export default function Watchlist() {
         setStocks((prev) => [...prev.filter((s) => s.code !== row.code), row])
       } else if (!res || !res.duplicate) {
         // 后端未返回股票信息且非重复：仅用代码构建基础行
-        setStocks((prev) => [...prev, { code, name: code, price: 0, change_pct: 0 }])
+        // §P3-FE P8/P9：行情两键留 null ⇒ 表内出 '--' 且不着色，等下一轮快照补真值
+        setStocks((prev) => [...prev, { code, name: code, price: null, change_pct: null }])
       }
       MessagePlugin.success('已添加 ' + code)
     } catch (e) { MessagePlugin.error('添加失败: ' + (e.message || '')) }
@@ -241,9 +317,11 @@ export default function Watchlist() {
     // 名称列：灰色字体，支持按名称排序
     { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name || '-'}</span> },
     // 现价列：带人民币符号，支持按价格排序
-    { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
-    // 涨跌幅列：红涨绿跌配色，支持按涨跌排序
-    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    // 涨跌列/现价列的缺数口径（§P3-FE P8/P9）：渲染出口是模块作用域的 PriceCell/PctCell（单实现，
+    // 表列与单测共用同一份，见文件头注释）；价格判据走 priceOrNil：0 不是合法现价（缓存里的历史 0 同归缺数）。
+    { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => <PriceCell value={row.price} /> },
+    // 涨跌幅列：红涨绿跌配色，支持按涨跌排序（缺数见上方口径）
+    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <PctCell value={row.change_pct} /> },
     // N形评分列：≥80红色强势，≥60黄色达标，<60灰色偏低
     { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreStyle(row.n_score, row.n_pass, 80); return <span style={c}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
     // 龙头评分列：≥70买入，50-70观察

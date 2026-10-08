@@ -1761,6 +1761,32 @@ export async function setStrategyConfig(cfg) {
   return request('/api/config/strategy', { method: 'POST', data: cfg })
 }
 
+// ── D1 事件规则配置（§P2-H，2026-10-06 修复批 波 6）──
+//
+// 后端两条通道早在 §0929CFG-D1 就收编成「稀疏 merge + 写前快照 + 字段级审计 + 如实 500」，
+// 但前端**一个调用点都没有**（本批开工前 `grep -rn 'config/d1' web/src` 零命中）：
+// 于是「D1 软加成权重/门槛、事件规则表」这些直接影响打分结果的参数只能靠脚本或翻 auth.json 改，
+// 页面上看不见、改不动，运维也无法确认运行时吃的是全局还是某账号覆盖（effective_source 白回了）。
+// 这一对函数就是把那条已存在但隐形的通道接上 UI，不动后端语义。
+// English: §P2-H — the global D1 rule/boost config channel existed on the backend but had no
+// frontend caller at all; these two wrappers wire it to the settings panel.
+//
+// GET /api/config/d1 载荷：{ rules: [{direction, score, blocked}], boost_weight,
+// boost_threshold, effective_source: 'global'|'account' }
+// POST /api/config/d1 走稀疏 merge：**没传=保留库中原值**，显式传某键一定更新该键，
+// 未知键不参与合并并在响应 ignored_keys 里如实回报（不再静默把整份配置抹成零值）。
+// 响应：{ status:'ok', ignored_keys:[...], effective_source:'global'|'account', rules_count:N }
+
+/** 读取全局 D1 事件规则与软加成配置（GET /api/config/d1，admin） */
+export async function fetchD1Config() {
+  return request('/api/config/d1')
+}
+
+/** 保存全局 D1 事件规则与软加成配置（POST /api/config/d1，admin，稀疏 merge） */
+export async function setD1Config(cfg) {
+  return request('/api/config/d1', { method: 'POST', data: cfg })
+}
+
 /** 获取 LLM 诊断调试数据 */
 /** Fetch LLM diagnostic/debug data */
 // 对应 GET /api/llm-debug，返回最近一次 LLM 决策的输入 / 输出，供 LLM 诊断页分析

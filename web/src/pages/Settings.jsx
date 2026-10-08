@@ -5,6 +5,7 @@ import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Card, Input, InputNumber, Button, Tag, Textarea, Dialog } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
+import D1ConfigPanel from '../components/D1ConfigPanel.jsx' // §P2-H 全局 D1 事件规则面板
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
@@ -155,6 +156,11 @@ export default function Settings() {
   const [histRollback, setHistRollback] = useState(null) // {kind:'rules'|'strategy', ts} | null（确认弹窗目标）
   const [histLoading, setHistLoading] = useState(false)
   const histAdmin = api.getRole() === 'admin'
+  // §P2-H：D1 面板与配置历史同一道角色门槛（GET/POST /api/config/d1 都是 adminMiddleware）。
+  // 单独起一个名字而不是复用 histAdmin，是因为两者的**含义**不同：histAdmin 管的是快照台账卡，
+  // d1Admin 管的是 D1 读写卡；写成同一个变量名，日后给其中一个换门槛就会顺带换掉另一个。
+  // English: §P2-H — the D1 panel gets its own role flag (same rule, different meaning).
+  const d1Admin = api.getRole() === 'admin'
 
   // 拉取两类快照列表（进卡/回滚后刷新）
   async function loadHist() {
@@ -751,6 +757,15 @@ export default function Settings() {
         </div>
         {strategyDirty && <span style={{ marginLeft: 8, color: 'var(--app-warn-text)', fontSize: 12 }}>● 有未保存修改</span>}
       </Card>
+
+      {/* §P2-H（2026-10-06 修复批 波 6）全局 D1 事件规则与软加成面板。
+          后端 GET/POST /api/config/d1 自 §0929CFG-D1 起就是「稀疏 merge + 写前快照 + 字段级审计 +
+          effective_source 回显」，但前端**零调用点**（本批开工前 grep 'config/d1' web/src 零命中）：
+          直接参与打分的 D1 参数只能在页面外改，且"页面写的值≠引擎吃的值"这道缝没有出口。
+          挂载门槛与战法参数同口径（两条 D1 路由都是 adminMiddleware，非管理员拿到 403 只会得到
+          一块红条噪声），所以按 api.getRole() 收口而不是让面板去猜。
+          English: §P2-H — mount the global D1 panel (admin-only, same gate as the two admin routes). */}
+      {d1Admin && <D1ConfigPanel />}
 
       <Card title="资讯显示" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>

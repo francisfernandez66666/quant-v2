@@ -6,6 +6,9 @@ import { Card, Table, Dialog, Tag, Button, Select, MessagePlugin } from 'tdesign
 import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
+import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按腿记账（共用台账）
+import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
 
 // ── 工具函数 ──
 // 截断异动原因为简短描述
@@ -55,6 +58,15 @@ export default function Hotspot() {
   const timerRef = useRef(null)         // 轮询定时器句柄
   const unsubSSERef = useRef(null)      // SSE 取消订阅函数引用
   const visHandlerRef = useRef(null)    // 页面可见性事件处理器引用
+  // §P2-I（2026-10-06 修复批 波 6）30s 兜底轮询 + SSE 事件 + 可见性刷新三条腿会交错，
+  // 旧请求的迟到响应必须整包丢弃，否则把刚刷出来的板块/评分盖回上一轮值。
+  const loadGuard = useStaleGuard()
+  // §P2-J 同族（吞错可见化）：每条数据腿的失败状态按腿名记账，页面上出红条。
+  // 台账实现走 utils/loadLedger.js 的同一份 hook——本页五路数据各有独立容错，"资讯挂了"和
+  // "板块挂了"的处置不同（板块挂了排名还有意义，双挂则整页读数过期），所以按腿记名而不是
+  // 一个全局 bool；实现收在一处也是门禁红条锁只认一个常量的前提。
+  // English: §P2-J — per-leg failure ledger from the shared hook, surfaced as a red banner.
+  const { fails: loadFails, mark: markLoadFail, clear: clearLoadFail } = useLoadLedger()
 
   // 用 ref 保存最新评分数据，避免轮询闭包引用旧值
   const evalsRef = useRef([])
@@ -191,43 +203,52 @@ export default function Hotspot() {
     // 互斥守卫 + 各数据源独立容错拉取：评分（仅交易时段或首空）、板块、资讯、IPO 日历
     if (loadingRef.current) return
     loadingRef.current = true
+    // §P2-I：本轮代号在发起任何请求前盖章，下面每一段写 state 之前先判后到
+    const token = loadGuard.begin()
     try {
       // 拉取个股五维评分：非交易时段仅在首屏为空时补拉一次，避免无谓刷新
       try {
         const st = await api.fetchStatus()
+        if (loadGuard.isStale(token)) return // §P2-I 后到的旧轮次：整包丢弃
         api.setLastSession(st.session)
         if (api.isTradingSession(st.session) || !evalsRef.current.length) {
           try {
             const e = await api.fetchEvaluations()
-            if (e) setEvals(e)
-          } catch (_) {}
+            if (loadGuard.isStale(token)) return
+            if (e) { setEvals(e); clearLoadFail('个股评分') }
+          } catch (err) { markLoadFail('个股评分', err && err.message) }
         }
-      } catch (_) {}
+      } catch (err) { markLoadFail('交易时段状态', err && err.message) }
       // 板块热点：优先取结构化日志 records（含归因），失败再退化到旧接口
       let fromRecords = false
       try {
         const recs = await api.fetchSectorHotRecords()
+        if (loadGuard.isStale(token)) return
         if (Array.isArray(recs) && recs.length) {
           setSectors(recs[0].sectors || [])
           fromRecords = true
+          clearLoadFail('热点板块')
         }
-      } catch (_) {}
+      } catch (err) { markLoadFail('热点板块', err && err.message) }
       // 结构化记录不可得：回退到旧版 fetchSectorHot 兜底
       if (!fromRecords) {
         try {
           const s = await api.fetchSectorHot()
-          if (s) setSectors(s)
-        } catch (_) {}
+          if (loadGuard.isStale(token)) return
+          if (s) { setSectors(s); clearLoadFail('热点板块') }
+        } catch (err) { markLoadFail('热点板块（含旧接口兜底）', err && err.message) }
       }
       // 资讯库与 IPO 日历并列拉取，任一失败不影响其余板块
       try {
         const n = await api.fetchNews(true)
-        if (n) setNews(n)
-      } catch (_) {}
+        if (loadGuard.isStale(token)) return
+        if (n) { setNews(n); clearLoadFail('热点资讯') }
+      } catch (err) { markLoadFail('热点资讯', err && err.message) }
       try {
         const ipo = await api.fetchIPOCalendar()
-        if (ipo) setIpoCalendar(ipo)
-      } catch (_) {}
+        if (loadGuard.isStale(token)) return
+        if (ipo) { setIpoCalendar(ipo); clearLoadFail('IPO 日历') }
+      } catch (err) { markLoadFail('IPO 日历', err && err.message) }
     } finally {
       loadingRef.current = false
     }
@@ -247,7 +268,8 @@ export default function Hotspot() {
           // 重新分析为异步任务，1.5s 后拉取一次最新结果
           setTimeout(() => load(), 1500)
         }
-    } catch (_) {} finally {
+        clearLoadFail('重新分析')
+    } catch (err) { markLoadFail('重新分析', err && err.message) } finally {
       setReanalyzing(false)
     }
   }
@@ -259,11 +281,13 @@ export default function Hotspot() {
     try {
       const sl = await fetchSignalLogs()
       setLogSignals(Array.isArray(sl) ? sl : [])
-    } catch (_) { setLogSignals([]) }
+      clearLoadFail('信号日志')
+    } catch (err) { setLogSignals([]); markLoadFail('信号日志', err && err.message) }
     try {
       const st = await fetchStageRecords()
       setLogStages(Array.isArray(st) ? st : [])
-    } catch (_) { setLogStages([]) }
+      clearLoadFail('Stage 日志')
+    } catch (err) { setLogStages([]); markLoadFail('Stage 日志', err && err.message) }
   }
 
   // 挂载时加载数据、启动兜底轮询与事件总线订阅；处理页面可见性变化；卸载时清理
@@ -378,6 +402,14 @@ export default function Hotspot() {
 
   return (
     <div className="page">
+      {/* §P2-J 同族（吞错可见化，2026-10-06 修复批 波 6）：五路数据任一读取失败都在此点名。
+          旧形态是每条腿 `catch (_) {}` 各吞一次——板块挂了显示上一轮、资讯挂了显示空列表，
+          页面本身没有任何一处说"这不是最新的"，用户只能靠"今天怎么没有热点"反推链路坏了。
+          红条只报"哪条腿没读到 + 原因"，**不清空既有数据**（§0929 ④「未落库不得脏缓存」同族：
+          把旧读数抹掉只会让"失败"变成"今天真的没有"，那是更坏的可观测性）。
+          English: §P2-J — per-leg failure banner; it names the failed legs without clearing the
+          last good readings. */}
+      {Object.keys(loadFails).length > 0 && <LoadFailBanner fails={loadFails} page="Hotspot" />}
       {/* 板块一：热点板块网格，点击卡片打开异动原因溯源弹窗 */}
       <Card>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>

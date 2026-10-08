@@ -11,6 +11,10 @@
 // bottom sheet on narrow screens (≤640px); closes on Esc / overlay click / close button.
 import React, { useState, useEffect } from 'react'
 import * as api from '../api/index.js'
+// §P2-I（2026-10-06 修复批 波 6）抽屉自己的 5s 行情轮询同样在射程内：本组件被五页共用，
+// 而 §P3-FE P4 又让涨幅也吃这份读数 ⇒ 旧响应后到时覆盖的不只是现价，而是整行「价 + 涨幅」，
+// 用户看到的就是"价格跳回去了"。守卫实例必须由 useStaleGuard() 持有（跨渲染复用，见 hook 注释）。
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 import MinuteView from './MinuteView.jsx'
 
 // codeEq 归一化比对：兼容 "600000" 与 "600000.SH/.SZ" 两种写法，任一前缀（6 位数字）相同即视为同一标的。
@@ -27,6 +31,85 @@ function fmtPct(v) {
   const n = Number(v)
   if (!Number.isFinite(n)) return ''
   return (n >= 0 ? '+' : '') + n.toFixed(2) + '%'
+}
+
+// §P3-FE P4（涨幅同源，2026-10-06 修复批 波 6）——读数解算整块提到模块作用域并导出，
+// 一是让单测能对「两次 lookup、涨幅跟着第二次变」做**等值**断言（而不是挂载后看个大概），
+// 二是让门禁静态锁能钉住判据本身（判据写在组件 JSX 里的话，锁只能数颜色字符串，改错了判据看不见）。
+//
+// 缺陷本体：旧实现 `const rawChg = changePct` 用的是**打开抽屉那一刻**宿主表格传进来的冻结值，
+// 而同一张卡头的现价每 5s 从 fetchStockLookup 刷新 ⇒ 抽屉里会出现「价格已经涨上去了、
+// 涨幅还是开抽屉那一刻的数」的自相矛盾读数（AUDIT_20261005 P3 / Drawer:86）。
+// 修法按推荐口径「涨幅与现价出自**同一份读数**」：
+//   ① 同批 change_pct 可用就用它（后端取不到行情时 price 与 change_pct 一起回 0，见 handlers_fix.go:1838，
+//      所以必须先看同批 price>0，不能只看 change_pct 是不是数）；
+//   ② change_pct 缺席（老后端/降级）但同批 prev_close>0 时自己按同批价格算，仍是实时腿；
+//   ③ 两条实时腿都没有，才回落 props 的冻结值，并在旁边明确标注「开抽屉时刻值」——
+//      不再让用户把陈旧读数当成实时读数（P5 反证：改回只读 props 即红）。
+// numOrNil：null/undefined/空串/非数一律当「没有读数」返回 null。旧写法 Number(v) 会把 null 折成 0，
+// 于是「宿主没传涨幅」被渲染成 "+0.00%"——缺数冒充平盘与 §P2-F 降级链写平盘是同族，这里一并收掉。
+// English: pure resolvers for the drawer reading row, exported so tests can assert exact values.
+
+/**
+ * 把「可能是缺数」的输入解成数字或 null（缺数绝不折叠成 0）。
+ * @param {unknown} v 原始值（数字/字符串/null/undefined/空串）
+ * @returns {number|null} 可解析则返回数字，否则 null
+ */
+export function numOrNil(v) {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * 同批行情里的可信现价：lookup 缺体、price 不可解析或 price<=0（后端取不到行情时回 0）一律算没有读数。
+ * @param {object|null} quote fetchStockLookup 的返回体
+ * @returns {number|null}
+ */
+export function batchPrice(quote) {
+  if (quote == null) return null
+  const p = numOrNil(quote.price)
+  return p !== null && p > 0 ? p : null
+}
+
+/**
+ * 用同一批的 price/prev_close 自己算涨幅（%），与后端 change_pct 同为百分数口径。
+ * @param {number|null} price 同批现价（必须 >0）
+ * @param {number|null} prevClose 同批昨收（必须 >0）
+ * @returns {number|null} 任一不可信则 null；可信则按后端 r2 口径收拢到 2 位小数
+ */
+export function deriveChg(price, prevClose) {
+  if (price === null || prevClose === null) return null
+  if (!(price > 0) || !(prevClose > 0)) return null
+  return Math.round(((price - prevClose) / prevClose) * 100 * 100) / 100
+}
+
+/**
+ * 解算抽屉头部的「价 / 涨幅 / 涨幅是否为冻结值 / 涨跌方向」四元读数。
+ * 纯函数、无副作用，返回的 frozen 就是「开抽屉时刻值」标注的开关。
+ * @param {object|null} quote fetchStockLookup 的返回体（null 表示还没拉到）
+ * @param {number|string|null} propChangePct 宿主打开抽屉时传入的涨幅（冻结值，只作最后兜底）
+ * @returns {{price: number|null, chg: number|null, live: boolean, frozen: boolean, up: boolean}}
+ */
+export function resolveDrawerChg(quote, propChangePct) {
+  const price = batchPrice(quote)
+  // 实时腿：同批 change_pct 优先，其次同批 price/prev_close 自算
+  let liveChg = null
+  if (price !== null && quote != null) {
+    const fromField = numOrNil(quote.change_pct)
+    liveChg = fromField !== null ? fromField : deriveChg(price, numOrNil(quote.prev_close))
+  }
+  const propChg = numOrNil(propChangePct)
+  const chg = liveChg !== null ? liveChg : propChg
+  return {
+    price,
+    chg,
+    live: liveChg !== null,
+    // frozen＝这一轮 lookup 没给出任何实时涨幅，屏上显示的是开抽屉那一刻的值
+    frozen: liveChg === null && chg !== null,
+    // 缺读数（chg===null）时方向不参与着色：旧写法无条件按 chgUp 染色会把「不知道涨跌」染成跌绿
+    up: chg !== null && chg >= 0,
+  }
 }
 
 // RelList 抽屉内关联列表（板块/概念/同行业个股）通用渲染子件。
@@ -55,15 +138,20 @@ function RelList({ items, render }) {
  */
 export default function StockDetailDrawer({ open, code, name, price, changePct, related, onClose }) {
   const [quote, setQuote] = useState(null)
+  // §P2-I：5s 轮询的代号守卫（切股/关抽屉重开时也各算一轮）
+  const lookupGuard = useStaleGuard()
 
   useEffect(() => {
     if (!open || !code) { setQuote(null); return }
     let alive = true
     // 拉取行情快照回填抽屉头部
     const load = () => {
+      // §P2-I：代号在 fetch 之前盖章；alive（组件卸载/换股）管的是"还要不要写"，
+      // 本代号管的是"这轮是不是最新的一轮"——两个都过才写，缺一个就还有半边覆盖窗口。
+      const token = lookupGuard.begin()
       api.fetchStockLookup(code)
-        .then((r) => { if (alive && r) setQuote(r) })
-        .catch(() => {})
+        .then((r) => { if (alive && r && !lookupGuard.isStale(token)) setQuote(r) })
+        .catch(() => { /* §P2-J 可吞：抽屉行情是旁证读数，失败保留上一份快照并在原价上标注，不打断宿主页面 */ })
     }
     load()
     const t = setInterval(load, 5000)
@@ -82,10 +170,14 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
 
   // 展示名：行情返回优先，回落入参名称/代码
   const showName = (quote && quote.name) || name || code
-  const showPrice = quote && Number.isFinite(Number(quote.price)) && Number(quote.price) > 0 ? Number(quote.price) : price
-  const rawChg = changePct
-  const chg = Number.isFinite(Number(rawChg)) ? Number(rawChg) : null
-  const chgUp = chg != null && chg >= 0
+  // §P3-FE P4：价、涨幅、是否冻结、涨跌方向**一次解算**（判据见文件头的 resolveDrawerChg）——
+  // 留在这里的只有「同批没价格时显示宿主传入的初始价」这一条展示兜底。
+  const reading = resolveDrawerChg(quote, changePct)
+  const showPrice = reading.price !== null ? reading.price : price
+  const chg = reading.chg
+  // chgFrozen＝本轮 lookup 没给出涨幅、当前显示的是开抽屉时刻的涨幅
+  const chgFrozen = reading.frozen
+  const chgUp = reading.up
 
   const rel = related || {}
   // 关联数据按本股代码过滤（信号/持仓/消息）
@@ -121,12 +213,18 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
           <span style={{ fontSize: 18, fontWeight: 700 }}>{showName}</span>
           <span style={{ fontSize: 12, color: 'var(--app-muted-2)' }}>{code}</span>
           {Number.isFinite(Number(showPrice)) && showPrice > 0 && (
-            <span style={{ fontSize: 18, fontWeight: 700, color: chgUp ? 'var(--app-up)' : 'var(--app-down)' }}>
+            // §P3-FE P8/P9 同族：旧写法无条件按 chgUp 染色，而 chg 为 null（完全没有涨幅读数）时
+            // chgUp=false ⇒ 现价被染成跌绿，把「不知道涨跌」显示成「在跌」。缺读数时走中性弱化色。
+            <span data-testid="sdd-price" style={{ fontSize: 18, fontWeight: 700, color: chg == null ? 'var(--app-faint)' : (chgUp ? 'var(--app-up)' : 'var(--app-down)') }}>
               {Number(showPrice).toFixed(2)}
             </span>
           )}
           {chg != null && (
-            <span style={{ fontSize: 13, fontWeight: 600, color: chgUp ? 'var(--app-up)' : 'var(--app-down)' }}>{fmtPct(chg)}</span>
+            <span data-testid="sdd-chg" style={{ fontSize: 13, fontWeight: 600, color: chgUp ? 'var(--app-up)' : 'var(--app-down)' }}>{fmtPct(chg)}</span>
+          )}
+          {/* §P3-FE P4：lookup 未给出涨幅时明确标注口径，不让冻结值冒充实时读数 */}
+          {chgFrozen && (
+            <span style={{ fontSize: 11, color: 'var(--app-faint)' }} data-testid="sdd-chg-frozen">（开抽屉时刻值）</span>
           )}
           <button aria-label="关闭" onClick={onClose}
             style={{ marginLeft: 'auto', border: 'none', background: 'transparent', fontSize: 20, lineHeight: 1, cursor: 'pointer', color: 'var(--app-text-2)' }}>×</button>

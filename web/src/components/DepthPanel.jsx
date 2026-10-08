@@ -19,6 +19,24 @@ const C = {
   src: '#1677ff',
 }
 
+// §P3-FE P10/P11（缺数三态，20261006 修复批）涨跌幅文本 → 涨跌态的唯一判据函数。
+// 旧实现只有一枚二态三元式 `pctText.startsWith('+') ? 'up' : 'down'`，而本组件在「现价或昨收缺失」
+// 时把 pctText 写成 '--'（:126），'--' 不以 '+' 开头 ⇒ 落进 down，画布上「无数据」被渲染成绿色下跌；
+// 同时 :131 那枚同形的 nowCls 是死变量（全组件无人使用），等于「以后有人接上就会错」的埋雷。
+// 现在三态各自有明确取值，并且真的接到渲染点（现价行的取色处）与面板根节点（data-pct-state），
+// neutral 用灰色 C.lv 而不是任何一个涨跌色。
+// 判据用 `^[+-]\d` 而不是「首字符是不是加号」：本组件的缺数占位符恰好是 '--'，
+// 它也以 '-' 开头——只按首字符判会把「没有数据」判成「下跌」，正是本条缺陷的原始形态。
+// 只有「符号后紧跟数字」才算真读数，其余（'--'、''、null、异常串）一律 neutral。
+export const DEPTH_NO_DATA = '--'
+export function pctState(text) {
+  // 涨跌态判据：形如 +1.23% → up、-0.45% → down，'--'/空串/非数串 → neutral
+  const s = String(text == null ? '' : text)
+  // 常量 s：局部定义
+  if (!/^[+-]\d/.test(s)) return 'neutral'
+  return s.startsWith('+') ? 'up' : 'down'
+}
+
 // refreshPalette 从当前主题的 --app-* 令牌刷新盘口 canvas 底色/文字色（语义涨跌色保持不变）。
 // English: refreshPalette pulls the live theme's surface/text tokens into the depth canvas
 // (semantic ask/bid/up/down colors stay fixed).
@@ -120,15 +138,18 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
   }, [])
 
   const pctText = (() => {
-    // 现价相对昨收的涨跌幅文本（带 +/ 符号），数据缺失返回 '--'
+    // 现价相对昨收的涨跌幅文本（带 +/ 符号），数据缺失返回占位符 DEPTH_NO_DATA
     const p = ob.price || 0
     const pc = ob.prev_close || 0
-    if (!p || !pc) return '--'
+    if (!p || !pc) return DEPTH_NO_DATA
     // 涨跌幅百分比：(现价-昨收)/昨收×100
     const d = (p - pc) / pc * 100
     return (d >= 0 ? '+' : '') + d.toFixed(2) + '%'
   })()
-  const nowCls = pctText.startsWith('+') ? 'up' : 'down'
+  // §P3-FE P10：三态判据（up/down/neutral），neutral 不再折进 down。
+  // 旧变量名 nowCls 是死码（全组件无人使用，等于「以后有人接上就会错」的埋雷），
+  // 这里把同一份判据接到画布取色与根节点 data-pct-state 两个真实消费点，功能只增不减。
+  const nowState = pctState(pctText)
 
   useEffect(() => {
     const cvs = canvasRef.current
@@ -196,6 +217,9 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
 
     ctx.font = '13px monospace'
     ctx.textBaseline = 'middle'
+    // §P3-FE P10 取色表：三态各配一色，neutral 明确用档位灰（放在 refreshPalette 之后，
+    // 这样主题切换时读到的是刷新后的 C.*，不是模块加载时的缺省值）
+    const pctColor = { up: C.up, down: C.down, neutral: C.lv }
 
     rows.forEach((r, ri) => {
       const y = topPad + ri * rowH
@@ -207,7 +231,8 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         ctx.fillStyle = C.lv
         ctx.textAlign = 'left'
         ctx.fillText(r.lv, col1, cy)
-        const pcolor = r.volText && r.volText.startsWith('+') ? C.up : C.down
+        // §P3-FE P10：三态取色（缺数 '--' 走档位灰 C.lv，不再按「非加号即跌」染成绿色下跌）
+        const pcolor = pctColor[pctState(r.volText)]
         ctx.fillStyle = pcolor
         ctx.textAlign = 'right'
         ctx.fillText(fmtPrice(r.price), volRight, cy)
@@ -283,7 +308,9 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
   }, [ob, factors, viewW, height, pctText, themeTick])
 
   return (
-    <div className="depth-panel">
+    // data-pct-state：把「现价行当前按哪一态取色」显式暴露在 DOM 上，
+    // 便于测试与排障直接读出三态判据的落点（canvas 内部着色在 jsdom 里不可见）
+    <div className="depth-panel" data-pct-state={nowState} data-testid="depth-panel">
       {
         // 工具栏：股票名+「盘口」标题、行情时间与数据源标识、手动刷新按钮
       }

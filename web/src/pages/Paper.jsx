@@ -15,6 +15,9 @@ import {
 } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
+import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按腿记账（共用台账）
+import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
 import MinuteView from '../components/MinuteView.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
@@ -172,6 +175,28 @@ export default function Paper() {
   const [pools, setPools] = useState([])
   // 当前选中资金池的规范化 key（null=全部；'__other__'=其他/手动）
   const [activePool, setActivePool] = useState(null)
+
+  // §P2-I 轮询/事件后到丢弃：本页有 SSE（message/scan）+ useSseRefresh 兜底轮询 + 十几处写操作后
+  // 立即 load()，多条腿并行时旧响应后到的覆盖风险最高，故与其余页面统一走同一 hook。
+  const loadGuard = useStaleGuard()
+  // §P2-J 读取失败台账（持仓/成交/委托/净值/账户状态五腿，按腿记名、成功即销案）
+  const { fails: loadFails, mark: markLoadFail, clear: clearLoadFail } = useLoadLedger()
+  // §P2-J 区块角标：台账里点到本腿的名字就在对应卡片/页签上再显一次——
+  // 页顶红条只说「哪几条腿坏了」，而用户此刻可能正盯着持仓表；失败态必须出现在**读数的旁边**，
+  // 否则「上一轮持仓」看起来就是一份正常读数（O1 要求四处各自可见）。
+  function legFailFlag(legName, note) {
+    // 本腿失败时在区块头部渲染红色小字角标，成功/未拉取时返回 null
+    // note：口径文案。列表/卡片类腿失败后显示的是上一轮读数；配置表单类腿失败后没有可用表单，
+    // 两套语义不能共用一句（把「不可用」写成「显示上一轮读数」＝让空表单冒充旧数据）。
+    if (!loadFails[legName]) return null
+    return (
+      <span
+        style={{ color: 'var(--app-up)', fontSize: 12, marginLeft: 8 }}
+        data-testid={'paper-leg-fail-' + legName}
+        title={loadFails[legName]}
+      >{note || '读取失败 · 显示上一轮读数'}</span>
+    )
+  }
 
   // 注入资金弹窗开关
   const [showDepositModal, setShowDepositModal] = useState(false)
@@ -393,14 +418,22 @@ export default function Paper() {
   }
 
   /**
-   * 加载模拟盘全部数据：先取开关/账户/资金池状态，
-   * 仅在 enabled 时再拉取持仓、成交、委托与净值曲线（各自 try/catch 互不阻断）。
+   * 加载模拟盘全部数据：先取开关/账户/资金池状态（账户状态腿），
+   * 仅在 enabled 时再依次拉取持仓、成交、委托与净值曲线四条数据腿。
+   * 四腿经 loadPaperLeg 统一封装：互不阻断（一腿失败不影响其余），但**失败必须按腿记名进台账**
+   * （§P2-J，旧形态是四句 `catch (_) {}` 吞掉后什么都不留）；整轮受 §P2-I 代号守卫保护，
+   * 后到的旧轮次响应不再覆盖新读数也不再销新轮的案。
    * @returns {Promise<void>}
    */
   // 加载模拟盘状态、持仓、成交、委托与净值曲线
   async function load() {
+    // §P2-I：本轮代号在发起任何请求前盖章；下面每个 await 回来后才写 state，旧轮次整体丢弃
+    // （本页原本就漏在守卫外：SSE 事件密集时段多条腿并行重拉，后到的旧持仓表会把刚成交的新表盖回去）。
+    const token = loadGuard.begin()
     try {
       const st = await api.fetchPaperState()
+      if (loadGuard.isStale(token)) return // §P2-I 后到的旧轮次：状态与五路数据一起作废
+      clearLoadFail('账户状态')
       // 注意：开关状态必须用本次拉取到的 st.enabled 判断，不能用组件 state 的 enabled——
       // 首屏 enabled 初始为 false，且 setInterval(load) 捕获的是首屏闭包，若用 state 判断会
       // 永远走到「未启用」提前返回，导致持仓/成交/订单/净值曲线（在 return 之后才拉取）永远为空
@@ -422,17 +455,52 @@ export default function Paper() {
         setTrades([])
         setOrders([])
         setEquity([])
+        // 开关已关：四条数据腿本轮不再拉取，台账里的旧失败案一并销掉，
+        // 否则红条会一直挂着「持仓读取失败」，而实际是「本来就没有模拟盘数据」
+        clearLoadFail('持仓'); clearLoadFail('成交'); clearLoadFail('委托'); clearLoadFail('净值曲线')
         return
       }
-      try { setPositions(await api.fetchPaperPositions()) } catch (_) {}
-      try { setTrades(await api.fetchPaperTrades()) } catch (_) {}
-      try { setOrders(await api.fetchPaperOrders()) } catch (_) {}
-      try { setEquity(await api.fetchPaperEquity()) } catch (_) {}
+      // §P2-J（AUDIT_20261005 P2-J / FIX_PLAN_20261006 波 6）四腿独立容错——
+      // 旧形态是四条各写一句 `try { setX(await api.fetch…()) } catch (_) {}`：
+      // 独立容错的方向是对的（一条腿挂不该拖黑整页），坏在**失败之后什么都不留**，
+      // 于是持仓拉取失败时页面显示的是上一轮那张表（或空表）却毫无标注，
+      // 用户会拿旧持仓做新决策。现每腿失败按名记账（页顶红条 + 对应区块角标各点名一次），
+      // 成功即销案，失败**不清空既有读数**（把旧值抹掉只会让「读取失败」冒充「今天真没数据」，
+      // 与 §0929 ④「保存失败可见」、§M-9 已修族同一姿势）。
+      await loadPaperLeg(token, '持仓', api.fetchPaperPositions, setPositions)
+      await loadPaperLeg(token, '成交', api.fetchPaperTrades, setTrades)
+      await loadPaperLeg(token, '委托', api.fetchPaperOrders, setOrders)
+      await loadPaperLeg(token, '净值曲线', api.fetchPaperEquity, setEquity)
     } catch (e) {
       // §M13/§A5：后端 403 时展示「无权限」面板，不再静默兜底。
       // 判定改为状态码 api.isForbidden(e)——旧写法 e.message.indexOf('无权限') 只认
       // adminMiddleware 的中文文案，对 permMiddleware 的英文 "no permission: <perm>" 会漏判。
       if (api.isForbidden(e)) { setForbidden(true); return }
+      // §P2-J 主腿（状态）原先在非 403 时同样什么都不留——外层 catch 走到这里就等于
+      // 「整页读数停在上一轮」，必须可见，否则四腿的台账做得再细也挡不住主腿静默失效。
+      markLoadFail('账户状态', (e && (e.message || String(e))) || '未知错误')
+    }
+  }
+
+  /**
+   * 单条数据腿的读取-记账封装（§P2-J 四腿共用一条实现，避免四份复制粘贴的分叉）。
+   * @param {number|string} token 本轮守卫代号（loadGuard.begin() 的返回）
+   * @param {string} legName 台账里的腿名（红条与区块角标点名的就是它）
+   * @param {() => Promise<Array>} fetcher 该腿的取数函数
+   * @param {(v: Array) => void} setter 该腿的 state 写入函数
+   * @returns {Promise<void>}
+   */
+  async function loadPaperLeg(token, legName, fetcher, setter) {
+    try {
+      const data = await fetcher()
+      // 后到的旧轮次：既不写 state 也不动台账（台账由本轮自己的成功/失败负责）
+      if (loadGuard.isStale(token)) return
+      if (Array.isArray(data)) { setter(data); clearLoadFail(legName) }
+      // 结构漂移（后端改了载荷形状）也算这条腿没读到：写进去会让表格 render 抛错、
+      // 静默吞掉则又是「旧读数冒充新读数」，所以按失败记账并保留上一轮。
+      else markLoadFail(legName, '返回结构不是数组（契约漂移）')
+    } catch (e) {
+      markLoadFail(legName, (e && (e.message || String(e))) || '未知错误')
     }
   }
 
@@ -515,15 +583,25 @@ export default function Paper() {
    */
   // 打开资金分配/仓位上限/买入纪律设置弹窗并回填当前配置
   function openSettingsModal() {
+    // §P2-J 战法开关清单腿：旧写法 `.catch(() => {})` 把失败吞成「列表空白」，
+    // 而空白在标签页里与「后端确实没给出 known_strategies」长得一模一样（§0929 ④「未落库不得脏缓存」同族）。
+    // 现按腿进台账：页顶红条点名 + 标签页头部角标，成功即销案。
     api.fetchPaperStrategies().then((r) => {
       const known = Array.isArray(r.known_strategies) ? r.known_strategies : []
+      // 常量 known：局部定义
       const wl = Array.isArray(r.strategies) ? r.strategies : []
+      // 常量 wl：局部定义
       const on = {}
+      // 常量 on：局部定义
       known.forEach((v) => { on[v.id] = wl.length === 0 ? v.id !== 'momentum' : wl.includes(v.id) })
       setStratKnown(known); setStratOn(on); setStratShadow(!!r.shadow_blacklist)
-    }).catch(() => {})
+      clearLoadFail('战法开关清单')
+    }).catch((e) => markLoadFail('战法开关清单', (e && e.message) || '未知错误'))
     // §F-4 拉取撮合配置回填"撮合设置"标签页（失败置 null，标签页内显示加载失败占位）
-    api.fetchPaperConfig().then((c) => setEngCfg(c)).catch(() => setEngCfg(null))
+    // §P2-J：占位只说明"这格没数据"，还需要在页顶台账留一笔，否则从持仓表切过来的人看不到失败面
+    api.fetchPaperConfig()
+      .then((c) => { setEngCfg(c); clearLoadFail('撮合配置') })
+      .catch((e) => { setEngCfg(null); markLoadFail('撮合配置', (e && e.message) || '未知错误') })
     setCfgMaxPos(appliedMax > 0 ? appliedMax : 0)
     const allocs = {}, caps = {}, rules = {}
     pools.forEach((p) => {
@@ -778,6 +856,9 @@ export default function Paper() {
         </div>
       )}
 
+      {/* §P2-J 读取失败台账红条（与其余页面共用一枚实现/一个 testid，见 components/LoadFailBanner.jsx） */}
+      <LoadFailBanner fails={loadFails} page="Paper" />
+
       {/* 注入资金弹窗 */}
       <Dialog
         visible={showDepositModal}
@@ -862,6 +943,10 @@ export default function Paper() {
           {/* §F-4 撮合设置标签页：账户级模拟盘参数（总开关/自动卖出/单笔资金/做空池预算）。
               旧缺陷：这些参数只能手改 config.json 并重启进程才生效（无端点、热同步函数死代码）。 */}
           <Tabs.TabPanel value="engine" label="撮合设置">
+            {/* §P2-J 角标与红条分工：红条列「哪几条腿坏了」，本角标把失败态放到正在读的表单旁边。
+                旧写法只有 engCfg 为 null 时的占位文案，而占位文案不点名原因（未知错误被写成一句通用提示），
+                且 legs 失败后仍可能有上一轮读数时根本走不到占位分支 ⇒ 读数旁边必须独立显式。 */}
+            {legFailFlag('撮合配置', '读取失败 · 表单不可回填')}
             {!engCfg ? (
               <div style={{ padding: '6px 2px', color: 'var(--app-text-2)', fontSize: 12 }}>撮合配置加载失败，请关闭弹窗重试</div>
             ) : (
@@ -894,6 +979,9 @@ export default function Paper() {
           </Tabs.TabPanel>
           {/* §SIGNAL_CONTROLLER 战法开关标签页：模拟盘买入准入白名单（与实盘量化页开关同构语义） */}
           <Tabs.TabPanel value="strategies" label="战法开关">
+            {/* §P2-J 战法开关清单腿失败：stratKnown 不被改写 ⇒ 这里显示的仍是上一轮勾选，
+                不标注就会被当成后端当前白名单（保存按钮还会把这轮旧勾选写回后端）。 */}
+            {legFailFlag('战法开关清单')}
             <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 8 }}>
               只有打开的战法产生的买入信号会被模拟盘撮合；关闭的战法信号仅提示不建仓。
               动量战法永不在默认全集内——需在此显式开启。卖出/止盈止损不受开关限制（不拦退出）。
@@ -1003,7 +1091,32 @@ export default function Paper() {
               {' '}{(activeStats.realized_pnl >= 0 ? '+' : '')}¥{fmt(activeStats.realized_pnl)}
             </em>
           </StatCard>
-          <StatCard label="已平仓胜率">{activeStats.win_rate_pct.toFixed(0)}% <em style={{ fontSize: 12, color: 'var(--app-muted)', fontStyle: 'normal' }}>/ {activeStats.open_positions}仓</em></StatCard>
+          {/* §P3-FE P12/P13（§0929 ⑧「亚单位不取整」同口径）：胜率原先 toFixed(0)，
+              99.6% 显示成 100%、0.4% 显示成 0%——胜率是把「几胜几负」折成一个数的判据，
+              取整后 100% 会让人以为零亏损。现保留一位小数；win_rate_pct 非数（老读数/缺字段）
+              如实显示「—」而不是崩在 .toFixed 上。
+              整格套一枚 data-testid（不是只框数字）：用例要同时断主读数与副读数「/ N仓」还在同一格里，
+              否则把整格换成缺数占位也能骗过只数数字的断言。 */}
+          <StatCard label="已平仓胜率">
+            <span data-testid="paper-win-rate">
+              {Number.isFinite(Number(activeStats.win_rate_pct)) ? Number(activeStats.win_rate_pct).toFixed(1) + '%' : '—'}
+              {' '}<em style={{ fontSize: 12, color: 'var(--app-muted)', fontStyle: 'normal' }}>/ {activeStats.open_positions}仓</em>
+            </span>
+          </StatCard>
+        </div>
+      )}
+
+      {/* §P2-J O2：KPI 卡（来自账户状态腿的服务端现值）与下方三张表（各自一条腿）不同源时，
+          必须在读数旁边讲明白「哪一侧是上一轮」，否则用户看到市值 12 万、表内合计 11 万只会怀疑账坏了。
+          账户状态腿自己失败也走这一条（那时上方 KPI 卡整块是上一轮的 stats）。 */}
+      {(loadFails['持仓'] || loadFails['成交'] || loadFails['委托'] || loadFails['账户状态']) && (
+        <div style={{ marginBottom: 8, fontSize: 12, color: 'var(--app-up)' }} data-testid="paper-kpi-mismatch">
+          ⚠ 上方绩效卡与下方列表**不是同一轮读数**：
+          {loadFails['账户状态'] ? '账户状态（含绩效统计）读取失败，绩效卡是上一轮读数；' : ''}
+          {loadFails['持仓'] ? '持仓表是上一轮读数；' : ''}
+          {loadFails['成交'] ? '成交日志是上一轮读数；' : ''}
+          {loadFails['委托'] ? '委托记录是上一轮读数；' : ''}
+          两边数字不一致属预期，请先修复链路再对账。
         </div>
       )}
 
@@ -1029,6 +1142,8 @@ export default function Paper() {
       {/* 净值曲线 */}
       {isAdmin && (
         <Card title={<span>净值曲线 <em style={{ color: 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em></span>} style={{ marginBottom: 12 }}>
+          {/* §P2-J O1：净值腿失败角标（曲线本身是上一轮点位） */}
+          {legFailFlag('净值曲线')}
           {equity.length > 1 ? (
             <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: H }}>
               {/* 净值折线主体：linePoints 由 equity 序列归一化映射到 viewBox 坐标 */}
@@ -1036,7 +1151,7 @@ export default function Paper() {
               {/* 三条水平参考网格线（画布 1/4、2/4、3/4 高度） */}
               {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} style={{ stroke: 'var(--app-divider)' }} />)}
             </svg>
-          ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>净值数据不足（自动撮合开启并产生成交后显示）</div>}
+          ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>{loadFails['净值曲线'] ? '净值读取失败，且本地没有上一轮点位' : '净值数据不足（自动撮合开启并产生成交后显示）'}</div>}
         </Card>
       )}
 
@@ -1101,6 +1216,8 @@ export default function Paper() {
         {/* 当前持仓面板：模拟盘持仓列表，含分时图展开行 */}
         <Tabs.TabPanel value="positions" label={`当前持仓 (${filteredPositions.length})`}>
           <Card>
+            {/* §P2-J O1：本腿失败角标（与页顶红条同源，读数的旁边必须可见） */}
+            {legFailFlag('持仓')}
             {/* 持仓表格：代码/名称/数量/成本/现价/盈亏/战法评分/止盈止损/移动止盈 */}
             {posData.length ? (
               <Table
@@ -1121,7 +1238,8 @@ export default function Paper() {
               />
             ) : (
               <div className="muted" style={{ padding: 24, textAlign: 'center' }}>
-                {isAdmin ? '暂无持仓（出现可开仓信号时按实时价自动买入）' : '暂无持仓（在信号页点「模拟买入」，或上方加仓/减仓管理已有持仓）'}
+                {/* §P2-J O2：读取失败＋表内为空时不能说「暂无持仓」——那是把「没读到」讲成「真的没有」 */}
+                {loadFails['持仓'] ? '持仓读取失败，且本地没有上一轮读数（请先修复链路，再看此处列表）' : (isAdmin ? '暂无持仓（出现可开仓信号时按实时价自动买入）' : '暂无持仓（在信号页点「模拟买入」，或上方加仓/减仓管理已有持仓）')}
               </div>
             )}
           </Card>
@@ -1129,6 +1247,8 @@ export default function Paper() {
         {/* 成交日志面板：模拟盘成交记录 */}
         <Tabs.TabPanel value="trades" label={`成交日志 (${filteredTrades.length})`}>
           <Card>
+            {/* §P2-J O1：本腿失败角标 */}
+            {legFailFlag('成交')}
             {/* 成交表格：代码/方向/价格/数量/时间/状态 */}
             {tradeData.length ? (
               <Table
@@ -1147,19 +1267,21 @@ export default function Paper() {
                 maxHeight="calc(100vh - 360px)"
                 pagination={{ defaultPageSize: 20, showJumper: true, pageSizeOptions: [20, 50, 100] }}
               />
-            ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无成交记录</div>}
+            ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>{loadFails['成交'] ? '成交日志读取失败，且本地没有上一轮读数' : '暂无成交记录'}</div>}
           </Card>
         </Tabs.TabPanel>
         {/* 订单记录面板：展示所有模拟交易订单 */}
         <Tabs.TabPanel value="orders" label={`订单 (${filteredOrders.length})`}>
           <Card>
+            {/* §P2-J O1：本腿失败角标 */}
+            {legFailFlag('委托')}
             {/* 订单表格：代码/方向/价格/数量/时间/状态 */}
             {orderData.length ? (
               <Table rowKey="__key" data={orderData} columns={orderColumns} bordered size="small"
                 // §F1 订单记录固定表头 + 分页
                 fixedHeader maxHeight="calc(100vh - 360px)"
                 pagination={{ defaultPageSize: 20, showJumper: true, pageSizeOptions: [20, 50, 100] }} />
-            ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无订单记录</div>}
+            ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>{loadFails['委托'] ? '委托记录读取失败，且本地没有上一轮读数' : '暂无订单记录'}</div>}
           </Card>
         </Tabs.TabPanel>
       </Tabs>

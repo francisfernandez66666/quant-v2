@@ -13,6 +13,13 @@ import ParetoChart from '../components/ParetoChart'
 import BacktestConfigPanel from '../components/BacktestConfigPanel'
 import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
+// §P2-I（2026-10-06 修复批 波 6）轮询「后到丢弃」统一入口：本页有四条独立轮询腿
+// （研究进度+任务列表 60s、战法库任务 5s、单候选回测进度 5s×N、任务日志 4s），
+// 全部是「同一端点反复重拉、后发的响应直接 setXxx 覆盖」的形态——上一轮慢响应迟到会把
+// 刚推进的任务状态画回旧值（进度条倒退、已完成又变回运行中）。
+// createStaleGuard 用于「按候选 id 动态生成」的那条腿（实例存在 ref 映射里，跨渲染复用）；
+// useStaleGuard 用于固定几条腿（内部 useRef 惰性初始化，严禁写成 useRef(createStaleGuard())）。
+import { createStaleGuard, useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 
 
 // §ADJ-BASIS-2（2026-09-23）当前复权口径基线版本，与 Go 侧 internal/research/windowed.go 的
@@ -86,6 +93,39 @@ export function LibraryHeldTag({ strategy }) {
 function fmtPctGlobal(v) {
   if (v === null || v === undefined || isNaN(v)) return '-'
   return Number(v).toFixed(2) + '%'
+}
+
+// §P3-FE（20261006 修复批）着色函数唯一化：本页原先并存两个正负着色入口——
+// signColor（旧 :210 起，正→--app-up 红）与 signClass（旧 :205 起，返回 pos/neg 类名再由调用点
+// 自己翻译成颜色）。两个出口对同一事实各翻一次，翻错一次就没人发现：任务表（旧 :1181）与候选卡
+// （旧 :1405）正是把 signClass 的 'pos' 手动配成了 --app-down（绿），于是「跑赢基准」显示成跌色、
+// 「跑输」显示成涨色，同页旧 :1348 的 signColor 却是正确的「正→红」，一屏之内两套语义自相矛盾。
+// 现删掉 signClass，全页正负数值只准走本函数一个出口（门禁 §113 P3 负锁：同页出现第二个
+// 着色函数即红）。语义真值来自 styles.css:114-115：--app-up=#e34d59（A股涨红）、
+// --app-down=#00a870（A股跌绿）。
+// 提到模块作用域并 export 是给单测直接喂数值做等值断言用（整页挂载要 mock 十余端点，与本条断言无关，
+// 与本页 isAdjBasisStale/AdjBasisStaleTag 的同款做法一致）；组件内不另留一份，仍只有一个定义。
+// English: §P3-FE — the single sign→color outlet for the whole page; hoisted to module scope and
+// exported so unit tests can assert the mapping equal to the CSS token names without mounting the page.
+export function signColor(v) {
+// 根据正负返回红/绿颜色（红涨绿跌），全页唯一正负着色出口
+  if (v === null || v === undefined || isNaN(v)) return 'var(--app-faint)'
+  return Number(v) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
+}
+
+// §P3-FE 回测超额唯一格式化出口（对应断言 P6/P7）：后端 avg_excess 是「净收益 − 基准」的**小数比率**
+// （internal/backtest/chain.go:452-458 由 CloseHfq/Open 比差得出，0.0523 即 5.23%），旧实现两处
+// 各写各的：完成 toast（旧 :1033）自己乘 100 取两位加百分号，任务表（旧 :1181）、候选卡（旧 :1348/:1405）
+// 与战法库（旧 :1326）却直接 fmt(v) 把 0.0523 当裸数字显示——同一候选「弹窗说 5.23%、表里说 0.0523」，
+// 用户无法判断单位。现全页 avg_excess 只走本函数（门禁 §113 P6 等值锁：toast 与表格串完全相等）。
+// English: §P3-FE — one formatter for the ratio-valued backtest excess, shared by the toast and the
+// tables so the same candidate can no longer read "5.23%" in one place and "0.0523" in another.
+export function fmtExcess(v) {
+// 将回测超额（小数比率）统一渲染为带符号百分比（两位小数），空值/非数回退占位符
+  if (v === null || v === undefined || isNaN(v)) return '-'
+  const n = Number(v)
+  // 常量 n：局部定义
+  return (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%'
 }
 
 /**
@@ -183,6 +223,25 @@ export default function Research() {
   // 常量 libPollTimer：局部定义
   const pollTimer = useRef(null)
   // 常量 pollTimer：局部定义
+  // §P2-I：四条轮询腿的代号守卫。固定腿各一枚（progress/backtests/log），
+  // 按候选 id 动态起的那条把实例存进 ref 映射（同一 id 复用同一枚，代号序列才连续；
+  // 每渲染 new 一枚＝守卫恒不判红＝假绿）。
+  const progressGuard = useStaleGuard()
+  const backtestsGuard = useStaleGuard()
+  const libraryGuard = useStaleGuard()
+  const logGuard = useStaleGuard()
+  const pollGuards = useRef({})
+  // 常量 pollGuards：局部定义
+  /**
+   * 取（或首次创建）某候选回测轮询的代号守卫。
+   * @param {number|string} id 候选 id
+   * @returns {{begin: () => number, isStale: (token: number) => boolean}}
+   */
+  function backtestGuard(id) {
+    // 按 id 惰性建实例：clearPoll 时一并删除，重开任务等于新腿
+    if (!pollGuards.current[id]) pollGuards.current[id] = createStaleGuard()
+    return pollGuards.current[id]
+  }
 
   const setStrategyRef = (key) => (el) => { if (el) strategyRefs.current[key] = el }
   // 生成设置各战法 ref 的回调，便于滚动定位到具体战法配置项
@@ -202,16 +261,7 @@ export default function Research() {
     if (v === null || v === undefined || isNaN(v)) return '-'
     return Number(v).toFixed(4)
   }
-  function signClass(v) {
-  // 根据正负返回 pos/neg 样式类，用于盈亏着色
-    if (v === null || v === undefined || isNaN(v)) return ''
-    return Number(v) >= 0 ? 'pos' : 'neg'
-  }
-  function signColor(v) {
-  // 根据正负返回红/绿颜色（红涨绿跌）
-    if (v === null || v === undefined || isNaN(v)) return 'var(--app-faint)'
-    return Number(v) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
-  }
+  // §P3-FE：正负着色唯一出口＝模块作用域的 signColor（本组件不再另写一份）
   function fmtNum(v, digits) {
   // 格式化数值：指定小数位，空值返回占位符
     if (v === null || v === undefined || isNaN(v)) return '-'
@@ -317,6 +367,7 @@ export default function Research() {
     // 常量 s：局部定义
     return (v >= 0 ? '+' : '') + s + '%'
   }
+  // §P3-FE：回测超额的唯一格式化出口＝模块作用域的 fmtExcess（本组件不再另写一份）
   function verdict(c) {
   // 根据样本内/样本外阈值判定战法回测结论（通过/失败）
     const insample = parseReason(c, '样本内IR')
@@ -368,9 +419,12 @@ export default function Research() {
   // ===== 进度 / 候选 =====
   // 拉取研究处理进度（数据准备度、日线/财务行数、候选计数），更新进度卡片
   async function loadProgress() {
+    // §P2-I：本轮代号先盖章；后到的旧进度整包丢弃（否则进度条会从「90%」倒回「40%」）
+    const token = progressGuard.begin()
     try {
       const p = await api.fetchResearchProgress()
       // 常量 p：局部定义
+      if (progressGuard.isStale(token)) return // §P2-I 后到的旧轮次
       if (p) setProgress(p)
     } catch (e) { console.error('Research 进度加载失败', e) }
   }
@@ -410,19 +464,27 @@ export default function Research() {
   // 打开任务运行日志弹窗：拉取 task_<id>.log，运行中的任务每 4s 自动刷新。
   async function openLog(id) {
     setLogId(id); setLogOpen(true); setLogLoading(true)
+    // §P2-I：日志弹窗打开即拉一次，随后每 4s 重拉；两次请求都写同一个 logContent，
+    // 慢的那次后到就会让日志「往回跳几行」——用户正在对照排错时序，跳行比不刷新更坏。
+    const token = logGuard.begin()
     try {
       const res = await api.getResearchTaskLog(id)
       // 常量 res：局部定义
+      if (logGuard.isStale(token)) return // §P2-I 后到的旧轮次：整包丢弃（含下面的定时器重建）
       setLogExists(res && res.exists !== false)
       setLogContent((res && res.log) || '')
     } catch (e) {
+      if (logGuard.isStale(token)) return // §P2-I：旧轮次的失败同样不得写「无日志」
       setLogExists(false); setLogContent('')
-    } finally { setLogLoading(false) }
+    } finally { if (!logGuard.isStale(token)) setLogLoading(false) }
     if (logTimer.current) clearInterval(logTimer.current)
     logTimer.current = setInterval(async () => {
+      // §P2-I：定时腿每一轮各盖一个新代号，判据与首拉共用同一枚 logGuard
+      const t = logGuard.begin()
       try {
         const res = await api.getResearchTaskLog(id)
         // 常量 res：局部定义
+        if (logGuard.isStale(t)) return // §P2-I 后到的旧轮次不得覆盖新日志
         setLogExists(res && res.exists !== false)
         setLogContent((res && res.log) || '')
       } catch (e) { /* 静默，关闭时清理 */ }
@@ -521,13 +583,18 @@ export default function Research() {
   }
   async function loadLibrary() {
   // 加载战法库列表与生效状态
+    // §P2-I：战法库在「回测完成」回调里会被重拉，同时用户手动刷新也走本函数——
+    // 后到的旧库列表会把刚注入的新战法条目抹掉（表现为"跑完回测战法却不见了"）。
+    const token = libraryGuard.begin()
     setLoadingLibrary(true)
     try {
       const res = await api.fetchResearchLibrary()
       // 常量 res：局部定义
+      if (libraryGuard.isStale(token)) return // §P2-I 后到的旧轮次：整包丢弃
       if (res && Array.isArray(res.library)) setLibrary(res.library)
     } catch (e) { console.error('战法库加载失败', e) }
-    finally { setLoadingLibrary(false) }
+    // §P2-I：spinner 复位同样判后到（旧轮次不得关掉新一轮的加载态）
+    finally { if (!libraryGuard.isStale(token)) setLoadingLibrary(false) }
   }
   async function toggleLibrary(s) {
   // 启用/禁用某条战法库记录。§EXIT-RETAIN：停用方向先确认，并说清楚"只断新开仓、
@@ -1011,11 +1078,19 @@ export default function Research() {
     const id = c.id
     // 常量 id：局部定义
     if (backtestPollers.current[id]) return
+    // §P2-I：本腿按候选 id 各持一枚守卫（同一 id 的连续轮询共用代号序列，不同候选互不牵连）
+    const g = backtestGuard(id)
+    // 常量 g：局部定义
     // 每 5000ms = 5 秒轮询一次单候选回测进度与结果，完成时回填超额收益并刷新战法库
     backtestPollers.current[id] = setInterval(async () => {
+      // 本轮代号必须在 fetch 之前盖章；j.status==='done' 这一段会**永久**回填结果并停轮询，
+      // 于是旧轮次后到的后果比进度条倒退更重：把上一轮的 avg_excess 写进 backtestResult 并
+      // 弹一次「回测完成」toast，用户会拿错数去审批。
+      const token = g.begin()
       try {
         const j = await api.fetchBacktestStatus(id)
         // 常量 j：局部定义
+        if (g.isStale(token)) return // §P2-I 后到的旧轮次：进度/完成/失败三段回写一并作废
         if (j.progress) {
           // 有进度：同步进度条与任务列表
           setBacktestProgress((p) => ({ ...p, [id]: j.progress }))
@@ -1030,7 +1105,8 @@ export default function Research() {
           setBacktestResult((r) => ({ ...r, [id]: j.avg_excess }))
           c.avg_excess = j.avg_excess
           syncJobIntoList({ status: 'done', candidate_id: id, progress: '100%', avg_excess: j.avg_excess })
-          showToast('候选 #' + id + ' 回测完成，回测超额 ' + (j.avg_excess !== undefined ? (j.avg_excess * 100).toFixed(2) + '%' : '0%'), 'success')
+          // §P3-FE P6：toast 与任务表/候选卡同走 fmtExcess，缺数不再谎报「0%」而是「-」占位
+          showToast('候选 #' + id + ' 回测完成，回测超额 ' + fmtExcess(j.avg_excess), 'success')
           loadLibrary()
         } else if (j.status === 'error') {
           // 失败：停止轮询并提示错误
@@ -1041,12 +1117,15 @@ export default function Research() {
           syncJobIntoList({ status: 'error', candidate_id: id, progress: '100%', error: j.error })
           showToast('候选 #' + id + ' 回测失败: ' + (j.error || ''), 'error')
         }
-      } catch (e) {}
+      } catch (e) { /* §P2-J 可吞：单候选进度轮询的一轮失败由下一轮（5s 后）自证，任务终态（done/error）与超时兜底都在后端记账；此处不弹错也不置败，是为了避免 5s 一响的噪声把真告警淹掉 */ }
     }, 5000)
   }
   function clearPoll(id) {
   // 清除指定候选的回测轮询定时器
     if (backtestPollers.current[id]) { clearInterval(backtestPollers.current[id]); delete backtestPollers.current[id] }
+    // §P2-I：守卫实例随定时器一并回收（否则长时间开着本页会攒下与候选数同阶的死实例；
+    // 下一轮 pollBacktest 会重新建一枚，代号序列从头开始——本腿已停，没有"旧轮次"可言）
+    if (pollGuards.current[id]) delete pollGuards.current[id]
   }
   async function restoreRunningBacktests() {
   // 页面刷新后恢复仍在运行的回测轮询
@@ -1071,10 +1150,14 @@ export default function Research() {
   }
   // 拉取全部回测任务并去重（按 kind:candidate_id），用于回测任务中心表格展示
   async function loadBacktests() {
+    // §P2-I：任务列表由 60s 兜底轮询与 5s 战法库轮询**两条定时器**共同驱动，
+    // 交错窗口就在本页身上——旧一轮的 jobs 数组后到会把新一轮刚推进的「已完成」盖回「运行中」。
+    const token = backtestsGuard.begin()
     setBtLoading(true)
     try {
       const res = await api.fetchAllBacktests()
       // 常量 res：局部定义
+      if (backtestsGuard.isStale(token)) return // §P2-I 后到的旧轮次：整包丢弃
       if (res && Array.isArray(res.jobs)) {
         const seen = new Set()
         // 常量 seen：局部定义
@@ -1087,7 +1170,9 @@ export default function Research() {
         }))
       }
     } catch (e) { console.error('加载回测任务失败', e) }
-    finally { setBtLoading(false) }
+    // §P2-I：spinner 的复位也必须判后到——旧轮次回来时新一轮正在 loading，
+    // 无条件 setBtLoading(false) 等于把别人的进度条关掉（假「加载完成」）。
+    finally { if (!backtestsGuard.isStale(token)) setBtLoading(false) }
   }
   function syncJobIntoList(j) {
   // 将回测任务状态合并进任务列表（更新或追加）
@@ -1176,9 +1261,9 @@ export default function Research() {
           </div>
         )
       }
-      // 已完成且非战法库任务：展示回测超额（红正绿负）
+      // 已完成且非战法库任务：展示回测超额（§P3-FE：涨红跌绿走唯一出口 signColor，单位走 fmtExcess）
       if (row.status === 'done' && row.kind !== 'library') {
-        return <span style={{ color: signClass(row.avg_excess) === 'pos' ? 'var(--app-down)' : 'var(--app-up)' }}>{fmt(row.avg_excess)}</span>
+        return <span style={{ color: signColor(row.avg_excess) }}>{fmtExcess(row.avg_excess)}</span>
       }
       // 其余：失败标记或占位
       return <span style={{ color: 'var(--app-faint)' }}>{row.error ? '失败' : '-'}</span>
@@ -1323,7 +1408,7 @@ export default function Research() {
                   §RFIX-2 方向拟合后恒为可解释带符号值）；旧数据行仍为优化器口径，以 reason 为准 */}
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>样本内 IR</span><span>{fmt(c.ir)}（参考，历史行以命中原因标注为准）</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>全样本 IC</span><span>{fmt(c.ic_mean)}（参考）</span></div>
-              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>全链路回测</span><span>{btTested(c) ? (c.backtest_result_text || fmt(c.avg_excess)) : '未测'}</span></div>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>全链路回测</span><span>{btTested(c) ? (c.backtest_result_text || fmtExcess(c.avg_excess)) : '未测'}</span></div>
               {paramsLines(c).length > 0 && (
                 <div style={{ borderTop: '1px dashed #e7e7e7', marginTop: 6, paddingTop: 6 }}>
                   {/* 参数快照：复现该战法所需参数 */}
@@ -1345,7 +1430,9 @@ export default function Research() {
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', gap: 6 }}><span style={{ color: 'var(--app-muted)', fontSize: 13 }}>IR</span><span style={{ color: signColor(c.ir), fontWeight: 600 }}>{fmt(c.ir)}</span></div>
               <div style={{ display: 'flex', gap: 6 }}><span style={{ color: 'var(--app-muted)', fontSize: 13 }}>IC</span><span style={{ color: signColor(c.ic_mean), fontWeight: 600 }}>{fmt(c.ic_mean)}</span></div>
-              <div style={{ display: 'flex', gap: 6 }}><span style={{ color: 'var(--app-muted)', fontSize: 13 }}>回测超额</span><span style={{ color: signColor(c.avg_excess), fontWeight: 600 }}>{fmt(c.avg_excess)}</span></div>
+              {/* §P3-FE P8/P9 同族：未跑回测时 avg_excess 恒为 0，旧口径会把它染色成「+0.00% 涨红」
+                  冒充一次真实结果；现按页面既有判定 btTested 分缺测/已测两态，缺测走弱化色 + 占位文案 */}
+              <div style={{ display: 'flex', gap: 6 }}><span style={{ color: 'var(--app-muted)', fontSize: 13 }}>回测超额</span><span style={{ color: btTested(c) ? signColor(c.avg_excess) : 'var(--app-faint)', fontWeight: 600 }}>{btTested(c) ? fmtExcess(c.avg_excess) : '未测'}</span></div>
               <div style={{ display: 'flex', gap: 6 }}><span style={{ color: 'var(--app-muted)', fontSize: 13 }}>前瞻天数</span><span style={{ fontWeight: 600 }}>{c.horizon}</span></div>
             </div>
             {
@@ -1401,8 +1488,8 @@ export default function Research() {
                 <span style={{ fontSize: 11, color: 'var(--app-faint)' }}>全链路回测 {backtestProgress[c.id] || '0%'}</span>
               </div>
             )}
-            {/* 已出结果：回填的回测超额局部展示 */}
-            {backtestResult[c.id] && <span style={{ color: signClass(backtestResult[c.id]) === 'pos' ? 'var(--app-down)' : 'var(--app-up)' }}>回测超额 {fmt(backtestResult[c.id])}</span>}
+            {/* 已出结果：回填的回测超额局部展示（§P3-FE：与任务表同源 signColor + fmtExcess） */}
+            {backtestResult[c.id] && <span style={{ color: signColor(backtestResult[c.id]) }}>回测超额 {fmtExcess(backtestResult[c.id])}</span>}
           </div>
         )}
         {!canApprove && c.status === 'proposed' && <div style={{ marginTop: 10, color: 'var(--app-muted)', fontSize: 12 }}>无审批权限（需管理员授予 research_approve）</div>}
@@ -1445,12 +1532,16 @@ export default function Research() {
                     </Tag>
                   ))}
               </div>
-              {/* 收益统计条：信号总数/胜/负/累计前向收益 */}
+              {/* 收益统计条：信号总数/胜/负/累计前向收益
+                  §P3-FE P1（styles.css:114-115 涨红跌绿）：旧实现把「胜」配 --app-down（绿）、
+                  「负」配 --app-up（红）、累计前向收益配 `>=0 ? --app-down : --app-up`，与同页 :1364
+                  的 signColor 语义正好相反，也与 Dashboard.jsx:298-300 相反——同一套账在两个页面红绿互换。
+                  现统一：盈利侧（胜、正收益）→ 红，亏损侧（负、负收益）→ 绿，且正负数值只走 signColor。 */}
               <div style={{ fontSize: 12, color: 'var(--app-faint)', marginTop: 6 }}>
                 <span>信号 <b>{s.signal_count}</b></span>
-                <span style={{ marginLeft: 8 }}>胜 <b style={{ color: 'var(--app-down)' }}>{s.win}</b></span>
-                <span style={{ marginLeft: 8 }}>负 <b style={{ color: 'var(--app-up)' }}>{s.loss}</b></span>
-                <span style={{ marginLeft: 8 }}>累计前向收益 <b style={{ color: s.cum_return >= 0 ? 'var(--app-down)' : 'var(--app-up)' }}>{fmtPct(s.cum_return)}</b></span>
+                <span style={{ marginLeft: 8 }}>胜 <b style={{ color: s.win > 0 ? 'var(--app-up)' : 'var(--app-faint)' }}>{s.win}</b></span>
+                <span style={{ marginLeft: 8 }}>负 <b style={{ color: s.loss > 0 ? 'var(--app-down)' : 'var(--app-faint)' }}>{s.loss}</b></span>
+                <span style={{ marginLeft: 8 }}>累计前向收益 <b style={{ color: signColor(s.cum_return) }}>{fmtPct(s.cum_return)}</b></span>
               </div>
               {/* 操作按钮组：启停/回测/详情/删除（仅审批权限可见） */}
               {canApprove && (
@@ -1606,7 +1697,8 @@ export default function Research() {
                         {s.samples !== null && (
                           <span style={{ color: 'var(--app-faint)', marginLeft: 4, fontSize: 11 }}>样本{s.samples}</span>
                         )}
-                        <span style={(s.bestExp ?? 0) >= 0 ? { color: 'var(--app-down)' } : { color: 'var(--app-up)' }}>
+                        {/* §P3-FE P1 同族反向点：期望收益（bestExp，单位已是百分数）正值应显涨红 */}
+                        <span style={{ color: signColor(s.bestExp ?? 0) }}>
                           {s.bestExp !== null ? ((s.bestExp >= 0 ? '+' : '') + fmtNum(s.bestExp, 2) + '%') : ''}
                         </span>
                       </Button>
@@ -1641,7 +1733,8 @@ export default function Research() {
                         <div><label>门槛分数</label><b>{(optCur.params || {}).min_score ? fmtNum(optCur.params.min_score) : '—'}</b></div>
                         <div><label>胜率</label><b>{fmtNum(optCur.win_rate, 1)}%</b></div>
                         <div><label>盈亏比</label><b>{fmtNum(optCur.profit_factor, 2)}</b></div>
-                        <div><label>期望收益</label><b style={optCur.expectancy >= 0 ? { color: 'var(--app-down)' } : { color: 'var(--app-up)' }}>{fmtNum(optCur.expectancy, 2)}%</b></div>
+                        {/* §P3-FE P1 同族反向点：期望收益正值显涨红；正数补 '+' 号与上方策略按钮读数同形 */}
+                        <div><label>期望收益</label><b style={{ color: signColor(optCur.expectancy) }}>{optCur.expectancy >= 0 ? '+' : ''}{fmtNum(optCur.expectancy, 2)}%</b></div>
                         <div><label>触发样本</label><b>{(optCur.trigger_count !== undefined && optCur.trigger_count !== null) ? optCur.trigger_count : '—'}</b></div>
                         <div><label>实盘复核</label><b>{optCur.win_rate !== undefined ? fmtNum(optCur.win_rate, 1) + '% / ' + fmtNum(optCur.profit_factor, 2) + ' / ' + fmtNum(optCur.expectancy, 2) + '%' : '—'}</b></div>
                         {/* 模拟盘实测结果（若已启用自动撮合则显示） */}

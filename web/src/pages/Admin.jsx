@@ -14,6 +14,16 @@ import { showToast, confirmDialog } from '../ui.jsx'
 // 从 api 模块导入权限判断工具：isAdmin() 读取 localStorage 中缓存的 role（由 App 的 refreshMe 写入）
 // 守卫判断来源：web/src/api/index.js 的 isAdmin()（基于 STORAGE_ROLE），与 App.jsx 中侧边栏 canAdmin 一致
 import { isAdmin } from '../api/index.js'
+// §P2-I（2026-10-06 修复批 波 6）轮询「后到丢弃」统一入口：本文件 30s 轮询的运行日志正文
+// 由「定时器 + 日期切换 + 手动刷新」三驱动交错，上一轮在途时下一轮已发出，旧响应迟到会把
+// 刚刷出来的日志盖回上一轮值——用这一个 hook 持有跨渲染稳定的守卫实例（内部 useRef 惰性初始化，
+// 严禁写成 useRef(createStaleGuard())：那样每渲染 new 一个、代号序列重置、守卫恒不判红=假绿）。
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
+// §P2-J 同族（吞错可见化）：读取腿失败按腿名进共用台账，页顶出红条点名「哪条腿没读到」，
+// 绝不再用上一轮读数或空列表冒充「最新/没有」。
+import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按腿记账（共用台账）
+// §P2-J 台账红条单实现：页面只管记账与摆放位置，文案/testid 都在组件里，不在页内抄 div。
+import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
 
 // 权限位中文标签映射：把后端下发的英文权限标识翻译为界面可读文案（当前仅"研究审批"一项）
 const PERM_LABELS = { research_approve: '研究审批' }
@@ -192,6 +202,17 @@ export default function Admin() {
   const [cleaning, setCleaning] = useState(false)
   const [opsLoading, setOpsLoading] = useState(false)
   const opsBodyRef = React.useRef(null)             // 内容区（自动滚到底部=最新事件）
+  // §P2-I（2026-10-06 修复批 波 6）：运行日志正文守卫。loadOpslog 同时被 30s 定时器、opsDate
+  // 变化 effect、手动刷新三处驱动，彼此交错；loadOpslog 里 setInterval 持的是挂载期闭包，
+  // 若上一轮 fetchOpslog 还在途、下一轮已 begin，旧响应迟到会整包覆盖 opsLines/opsMeta（数据倒挂，
+  // 一直显示到下一次轮询）。api 层 AbortController 只管超时、管不了这种交错，故必须在写 state 前判后到。
+  const opslogGuard = useStaleGuard()
+  // §P2-I：日期清单单独一个守卫实例——它与正文的定时器/手动刷新各自节奏、写的是不同 state
+  // （opsDates vs opsLines），两条腿各持独立代号序列，互不干扰更稳。
+  const opsDatesGuard = useStaleGuard()
+  // §P2-J：读取腿失败台账。本文件把每条「数据读取腿」的失败按腿名记一格、成功即销案；
+  // 台账实现收在 utils/loadLedger.js 同一份 hook（红条在位锁据此只认一个 testid 常量）。
+  const { fails: loadFails, mark: markLoadFail, clear: clearLoadFail } = useLoadLedger()
 
   // 安全读取用户权限数组
   function uPerms(u) {
@@ -199,6 +220,10 @@ export default function Admin() {
   }
 
   // 加载全部用户与权限列表（仅管理员调用；非管理员直接返回，避免越权请求）
+  // §P2-I 判定（这条不接守卫）：loadUsers 不在任何 setInterval / SSE / 事件总线的驱动路径上——
+  // 它只在挂载 useEffect 首拉一次，以及建号/删号/改角色后由用户手动动作触发重取。守卫是给
+  // 「周期或事件驱动、会自相覆盖的轮询腿」用的；一次性手动取数不存在「上一轮在途、下一轮又发出」
+  // 的交错窗口，接了反而是空转代号，故此处判为不接。
   async function loadUsers() {
     // 守卫二次校验：不是管理员则直接中止数据加载
     if (!isAdmin()) return
@@ -208,21 +233,27 @@ export default function Admin() {
       setAllPerms(res.perms || [])
       setTenantNames(res.tenant_names || {})
       setPlatform(!!res.platform)
+      clearLoadFail('用户列表') // §P2-J：本轮成功即销案
       if (res.platform) loadTenants()
     } catch (e) {
       // §A5：首拉即 403=服务端权威角色已非管理员，跳统一 403 页而非停留在错误提示
+      // 该 403 分支直接重路由（页面随即卸载），记账无意义，故只在落到下面普通失败时进台账。
       if (api.isForbidden(e)) { navigate('/403'); return }
       showToast('加载用户失败: ' + (e.message || e), 'error')
+      markLoadFail('用户列表', (e && e.message) || String(e)) // §P2-J：读取失败点名，红条标出「非最新」
     }
   }
 
   // §MT 租户清单加载（平台运营者专用）
+  // §P2-I 判定同 loadUsers：仅平台视角首拉与租户增删改的手动动作触发，无周期/SSE 驱动，不接守卫。
   async function loadTenants() {
     try {
       const res = await api.fetchTenants()
       setTenants(res.tenants || [])
+      clearLoadFail('租户列表') // §P2-J：成功销案
     } catch (e) {
       showToast('加载租户失败: ' + (e.message || e), 'error')
+      markLoadFail('租户列表', (e && e.message) || String(e)) // §P2-J：读取失败点名
     }
   }
 
@@ -240,7 +271,10 @@ export default function Admin() {
       showToast('租户已创建')
       setTenantForm({ name: '', maxUsers: 20, apiRate: 600, adminUser: '', adminPass: '' })
       loadTenants(); loadUsers()
-    } catch (e) {
+    }
+    // §P2-J 可吞：创建租户是写操作，失败已由 Toast 即时反馈给发起人（谁点谁当场看到），
+    // 不是无人触发的后台周期读数腿，无须进读取台账冒充「上一轮读数」——台账只登记周期/事件驱动的读取失败。
+    catch (e) {
       showToast('创建租户失败: ' + (e.message || e), 'error')
     } finally { setTenantSaving(false) }
   }
@@ -251,7 +285,9 @@ export default function Admin() {
     try {
       await api.updateTenant(t.id, { enabled: !t.enabled })
       showToast('已更新'); loadTenants()
-    } catch (e) { showToast('操作失败: ' + (e.message || e), 'error') }
+    }
+    // §P2-J 可吞：启停租户是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
+    catch (e) { showToast('操作失败: ' + (e.message || e), 'error') }
   }
 
   // §MT 调整租户配额：弹窗依次询问成员上限与每分钟 API 限流（0=恢复系统默认值）
@@ -263,7 +299,9 @@ export default function Admin() {
     try {
       await api.updateTenant(t.id, { quota: { max_users: Number(mv) || 0, api_rate_per_min: Number(ar) || 0 } })
       showToast('配额已更新'); loadTenants()
-    } catch (e) { showToast('更新失败: ' + (e.message || e), 'error') }
+    }
+    // §P2-J 可吞：改租户配额是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
+    catch (e) { showToast('更新失败: ' + (e.message || e), 'error') }
   }
 
   // §U-5（2026-09-14 像素级 UAT）脏账号清理：先 dry_run 预览命中清单，确认后再真删。
@@ -281,7 +319,9 @@ export default function Admin() {
       const done = await api.cleanupAdminUsers(false)
       showToast(`已清理 ${done.count || 0} 个账号`)
       loadUsers()
-    } catch (e) {
+    }
+    // §P2-J 可吞：账号清理是写操作（先 dry_run 预览再真删），失败即时 Toast 反馈发起人，非周期读数腿。
+    catch (e) {
       showToast('清理失败: ' + (e.message || e), 'error')
     } finally {
       setCleaning(false)
@@ -319,7 +359,9 @@ export default function Admin() {
       setCreateMsg('账号已创建'); setCreateMsgType('ok')
       setNewUser({ username: '', password: '', role: 'user', perms: [], expiresDays: 0, permanent: true, tenantId: '' })
       loadUsers()
-    }).catch((e) => {
+    })
+    // §P2-J 可吞：建号是写操作，失败内联回表单提示（createMsg）给发起人，非周期读数腿，不进台账。
+    .catch((e) => {
       setCreateMsg('创建失败: ' + (e.message || e)); setCreateMsgType('err')
     }).finally(() => setCreating(false))
   }
@@ -330,7 +372,9 @@ export default function Admin() {
     try {
       await api.setAdminUserRole(u.id, role)
       setUsers(users.map((x) => x.id === u.id ? { ...x, role } : x))
-    } catch (e) {
+    }
+    // §P2-J 可吞：角色升降是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
+    catch (e) {
       showToast('操作失败: ' + (e.message || e), 'error')
     }
   }
@@ -340,7 +384,9 @@ export default function Admin() {
     try {
       await api.setAdminUserPerms(u.id, next)
       setUsers(users.map((x) => x.id === u.id ? { ...x, perms: next } : x))
-    } catch (e) {
+    }
+    // §P2-J 可吞：权限位更新是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
+    catch (e) {
       showToast('权限更新失败: ' + (e.message || e), 'error')
     }
   }
@@ -355,6 +401,7 @@ export default function Admin() {
     if (!pwValue) { showToast('密码不能为空', 'warning'); return }
     api.setAdminUserPassword(pwUser.id, pwValue)
       .then(() => { showToast(pwUser.username + ' 密码已重置', 'success'); setPwUser(null) })
+      // §P2-J 可吞：重置密码是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
       .catch((e) => showToast('重置失败: ' + (e.message || e), 'error'))
   }
 
@@ -363,7 +410,9 @@ export default function Admin() {
     try {
       await api.setAdminUserEnabled(u.id, !u.enabled)
       setUsers(users.map((x) => x.id === u.id ? { ...x, enabled: !x.enabled } : x))
-    } catch (e) {
+    }
+    // §P2-J 可吞：启停账号是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
+    catch (e) {
       showToast('操作失败: ' + (e.message || e), 'error')
     }
   }
@@ -386,6 +435,7 @@ export default function Admin() {
         showToast(expUser.username + ' 有效期已更新', 'success')
         setExpUser(null)
       })
+      // §P2-J 可吞：设置有效期是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
       .catch((e) => showToast('设置失败: ' + (e.message || e), 'error'))
   }
 
@@ -395,11 +445,14 @@ export default function Admin() {
       if (!ok) return
       api.deleteAdminUser(u.id)
         .then(() => { setUsers(users.filter((x) => x.id !== u.id)); showToast(u.username + ' 已删除', 'success') })
+        // §P2-J 可吞：删除账号是写操作，失败即时 Toast 反馈发起人，非周期读数腿。
         .catch((e) => showToast('删除失败: ' + (e.message || e), 'error'))
     })
   }
 
   // 打开指定用户的战法参数配置弹窗并加载其专属配置
+  // §P2-I 判定：这是「点开弹窗时的一次性读取」，无 setInterval/SSE 周期驱动，不存在轮询自相覆盖，
+  // 不接守卫；但它是数据读取腿，读取失败须进台账（区别于下面的写操作）。
   async function openStrategy(u) {
     setActiveUser(u)
     setActiveStrategy({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} })
@@ -416,8 +469,10 @@ export default function Admin() {
         }
         setActiveStrategy(next)
       }
+      clearLoadFail('战法参数配置') // §P2-J：读取成功即销案
     } catch (e) {
       setStrategyMsg('读取配置失败: ' + (e.message || e)); setStrategyMsgType('err')
+      markLoadFail('战法参数配置', (e && e.message) || String(e)) // §P2-J：读取失败点名
     }
   }
 
@@ -431,7 +486,9 @@ export default function Admin() {
     try {
       await api.setAdminStrategyConfig(activeUser.id, activeStrategy)
       setStrategyMsg('已保存，该账号热更新即时生效'); setStrategyMsgType('ok')
-    } catch (e) {
+    }
+    // §P2-J 可吞：下发战法参数是写操作，失败内联回弹窗提示（strategyMsg）给发起人，非周期读数腿。
+    catch (e) {
       setStrategyMsg('保存失败: ' + (e.message || e)); setStrategyMsgType('err')
     }
     setStrategySaving(false)
@@ -505,29 +562,53 @@ export default function Admin() {
 
   // ── §DAILY_OPSLOG 运行日志加载 ──
   // 拉日期列表；为空（尚无日志）保持静默。默认选中最新一天。
+  // §P2-I：日期清单守卫——它由挂载 effect 与手动刷新 refreshOps 两处驱动，二者可与 30s 正文
+  // 轮询的刷新交错触发（快速连点刷新时旧响应迟到会把 opsDates 盖回上一轮），故发起前盖代号、
+  // await 回来后先判后到再写 opsDates。
   const loadOpsDates = async () => {
+    const token = opsDatesGuard.begin() // 发起任何请求**之前**盖章
     try {
       const res = await api.fetchOpslogDates()
+      // §P2-I：后到的旧轮次整包丢弃，一个 state 都不写（连返回给调用方的 ds 也返回空，避免误设 opsDate）
+      if (opsDatesGuard.isStale(token)) return []
       // 仅取 dates 字段，缺失时按空数组处理
       const ds = (res && res.dates) || []
       setOpsDates(ds)
+      clearLoadFail('日期清单') // §P2-J：本轮成功即销案
       return ds
     } catch (e) {
+      // §P2-I：这是本轮自己的请求出错，但若已被更新轮次超越，其失败结论已过时，不写台账
+      if (opsDatesGuard.isStale(token)) return []
       showToast('日志日期列表加载失败: ' + (e.message || e), 'error')
+      markLoadFail('日期清单', (e && e.message) || String(e)) // §P2-J：读取失败点名
       return []
     }
   }
   // 拉某日内容；date 空串 = 服务端今天
+  // §P2-I：正文腿守卫——loadOpslog 被 30s 定时器、opsDate effect、手动刷新三处交错驱动，
+  // setInterval 持的是挂载期闭包（loadOpsDates/opsDate 的旧引用），上一轮 fetchOpslog 在途时
+  // 下一轮已发出，旧响应迟到会整包覆盖 opsLines/opsMeta（倒挂，显示到下次轮询）。发起前盖章、
+  // await 回来后先判后到再写 state。
   const loadOpslog = async (date) => {
     setOpsLoading(true)
+    const token = opslogGuard.begin() // 发起任何请求**之前**盖章
     try {
       const res = await api.fetchOpslog(date || '', 2000)
+      // §P2-I：后到的旧轮次整包丢弃，日志正文/元信息一个 state 都不写
+      if (opslogGuard.isStale(token)) return
       setOpsLines((res && res.lines) || [])
       setOpsMeta({ total: (res && res.total) || 0, truncated: !!(res && res.truncated) })
+      clearLoadFail('运行日志') // §P2-J：本轮成功即销案
     } catch (e) {
+      // §P2-I：本轮请求自身出错，但若已被更新轮次超越，失败结论已过时（新轮会给更新判定），
+      // 不写台账也不重复弹错，交由最新一轮定夺
+      if (opslogGuard.isStale(token)) return
       showToast('日志加载失败: ' + (e.message || e), 'error')
+      markLoadFail('运行日志', (e && e.message) || String(e)) // §P2-J：读取失败点名
     } finally {
-      setOpsLoading(false)
+      // 仅非 stale 轮次复位 spinner：stale 轮不写任何 state（连 opsLoading 也不动），
+      // 由最新一轮完成时自行复位，避免旧响应把新轮次「加载中」状态盖掉。
+      if (!opslogGuard.isStale(token)) setOpsLoading(false)
     }
   }
   // 首次进入：日期列表 → 默认选最新一天并加载
@@ -591,6 +672,16 @@ export default function Admin() {
   return (
     <div className="page">
       <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>用户管理</h2>
+
+      {/* §P2-J（2026-10-06 修复批 波 6）吞错可见化红条：任一读取腿（用户列表/租户列表/
+          日期清单/运行日志/战法参数配置）本轮没读到就在此点名。旧形态是各腿失败只弹一次 Toast 或
+          什么都不留——界面照常显示上一轮读数或空列表，运维只能靠「今天怎么没数据」反推链路坏了（且方向常错）。
+          红条只报「哪条腿失败 + 原因」，**绝不清空既有数据**（把旧读数抹掉只会让「读取失败」更像「今天真的没有」，
+          是更坏的可观测性）；下一轮成功即自动销案。
+          本条只认共享组件 LoadFailBanner（单实现、单 testid、单文案），不在页内抄一段 div——
+          抄一份就等于把「红条在位」派生锁推回「逐页认文案」，加一页漏一页。
+          English: §P2-J — per-leg load-failure banner via the single shared component. */}
+      <LoadFailBanner fails={loadFails} page="Admin" />
 
       <Card title="开通新账号" style={{ marginBottom: 12 }}>
         {

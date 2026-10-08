@@ -21,6 +21,12 @@ import * as api from '../api/index.js'
 // §0926E2E-17A：接入 §F5 事件总线，实盘链路 SSE 事件驱动本页即时刷新
 import { on as sseOn } from '../sseBus.js'
 import { confirmDialog } from '../ui.jsx'
+// §P2-I（2026-10-06 修复批 波 6）轮询「后到丢弃」统一入口：本页四条 60s 兜底轮询
+// （链路状态/当日委托/待核对清单/交易流水）外加五类 SSE 事件即时重拉，同一条腿上一轮还在途时
+// 下一轮已经发出，旧响应迟到会把刚刷出来的委托状态/在途标记盖回上一轮值——实盘页的数据倒挂
+// 直接参与决策（撤单按钮的可用性、待核对清单的条数），比一般页面更要命。
+// 每条腿各持一个守卫实例（代号序列独立：状态腿的慢响应不该拖委托腿作废）。
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 import { fmtCNY2 } from '../utils'
 import { verdictDisplay } from './quantVerdicts.js'
 
@@ -209,6 +215,13 @@ export default function Quant() {
 
   const stateTimer = useRef(null)  // 链路状态轮询定时器
   const tradesTimer = useRef(null) // 交易流水轮询定时器
+  // §P2-I：四条轮询腿各一枚代号守卫（腿与腿的响应速度不同，共用一枚会让快腿的新一轮
+  // 把慢腿仍在途的正当响应误判成「后到的旧轮次」而丢弃，那是另一种数据丢失）。
+  // 实例必须来自 useStaleGuard()（内部 useRef 惰性初始化），严禁写成 useRef(createStaleGuard())。
+  const stateGuard = useStaleGuard()
+  const ordersGuard = useStaleGuard()
+  const pendingGuard = useStaleGuard()
+  const tradesGuard = useStaleGuard()
   // §0926E2E-17A：实盘链路 SSE 事件的取消订阅句柄（挂载注册、stopPolling/卸载回收）
   const sseQmtUnsub = useRef(null)
 
@@ -439,9 +452,14 @@ export default function Quant() {
   // 旧实现 403 停轮询后在飞的链仍会走到链尾发出 /api/risk/gates（双挂载 ×2 发，MP-3 真漏网点）。
   async function loadTrades() {
     if (pollingDeadRef.current) return // §M-6 链入口即失效（forbidden/卸载后不再发起任何一步）
+    // §P2-I：本轮代号在发起任何 await 之前盖章；下面三步链每一段回写 state 前都判后到。
+    // 注意与 §M-6 的 pollingDeadRef 是两件事：那个管「这条链已被止血作废」，本代号管
+    // 「同一条腿的上一轮响应迟到」——摘掉任一个都会留半边盲区（M-6 反证腿已各自在位）。
+    const token = tradesGuard.begin()
     try {
       const t = await api.fetchQMTTrades()
       if (pollingDeadRef.current) return // §M-6 上一步 await 期间 403 落地 → 链尾禁发
+      if (tradesGuard.isStale(token)) return // §P2-I 后到的旧轮次：流水与后续两步的回写一并作废
       if (t && t.summary) setTrades(t)
       // §0929FILL-NAME 流水到账后按代码补名称旁证（fire-and-forget：名称列不许拖慢流水渲染）
       resolveFillNames(((t && t.fills) || []).map((f) => f && f.code))
@@ -452,6 +470,7 @@ export default function Quant() {
     try {
       const v = await api.fetchSignalVerdicts(50)
       if (pollingDeadRef.current) return // §M-6
+      if (tradesGuard.isStale(token)) return // §P2-I
       if (v && Array.isArray(v.verdicts)) setVerdicts(v.verdicts)
     } catch (_) {
       if (pollingDeadRef.current) return // §M-6：verdicts 失败不再连带放行链尾 admin 端点
@@ -461,6 +480,7 @@ export default function Quant() {
     try {
       const g = await api.fetchRiskGates()
       if (pollingDeadRef.current) return // §M-6：链尾响应落地时已失效则不再回写 state
+      if (tradesGuard.isStale(token)) return // §P2-I：链尾同样在后到判据之外，否则旧闸口读数覆盖新读数
       if (g && Array.isArray(g.gates)) setRiskGates(g)
     } catch (e) { noteForbidden(e) }
   }
@@ -510,7 +530,14 @@ export default function Quant() {
   // 拉取链路运行状态（心跳/延迟/熔断等）
   async function loadState() {
     // §M13：/api/qmt/state 在 adminMiddleware 下，成员 403 要能触发停轮询（10s 定时器的主要噪声源）
-    try { setState(await api.fetchQMTState()) } catch (e) { noteForbidden(e) }
+    // §P2-I：熔断/心跳这类读数一旦显示出来就代表"链路当下是这个状态"，旧轮次迟到把已解除的熔断
+    // 又画回来，用户会以为还要再等一次——故同样纳入后到丢弃。
+    const token = stateGuard.begin()
+    try {
+      const s = await api.fetchQMTState()
+      if (stateGuard.isStale(token)) return // §P2-I 后到的旧轮次整包丢弃
+      setState(s)
+    } catch (e) { noteForbidden(e) }
   }
 
   // §QMT-DUAL 拉取网关 active 通道与双路径在线态（broker/xt_connected/queued_connected）
@@ -520,9 +547,13 @@ export default function Quant() {
 
   // §U-2 拉取当日委托列表（撤单按钮的数据源，含 order_id 与状态）；10s 随链路状态轮询
   async function loadOrders() {
+    // §P2-I：本轮代号在 await 之前盖章；旧轮次的委托表不得覆盖新轮次（撤单按钮的可用性按状态判，
+    // 已撤的单被旧读数画回「已报」会诱导再点一次撤销）。
+    const token = ordersGuard.begin()
     try {
       const o = await api.fetchQMTOrders()
       if (pollingDeadRef.current) return // §M-6：失效后不回写
+      if (ordersGuard.isStale(token)) return // §P2-I 后到的旧轮次整包丢弃
       setOrders(Array.isArray(o) ? o : [])
       setOrdersError('') // §M-9 成功即清错误态
     } catch (e) {
@@ -584,9 +615,13 @@ export default function Quant() {
   // 其余失败（502 网关读失败 / 503 未接入）记入 pendingReviewError——**可见的失败态**，
   // 绝不清空清单冒充「没有待核对单」（清单为空是有资金安全含义的断言）。
   async function loadPendingReview() {
+    // §P2-I：待核对清单是资金安全断言（清单为空＝"没有在途悬单"），旧轮次迟到把已改判完的
+    // 一条又画回来，会让人重走一次人工改判；故同样纳入后到丢弃。
+    const token = pendingGuard.begin()
     try {
       const r = await api.qmtPendingReview()
       if (pollingDeadRef.current) return // §M-6：失效后不回写
+      if (pendingGuard.isStale(token)) return // §P2-I 后到的旧轮次整包丢弃
       setPendingReview(Array.isArray(r.orders) ? r.orders : [])
       setPendingReviewMeta({
         count: r.unresolved_count != null ? r.unresolved_count : (Array.isArray(r.orders) ? r.orders.length : 0),

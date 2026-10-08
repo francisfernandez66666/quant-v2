@@ -1812,7 +1812,20 @@ func (s *Server) handleFixIPOCalendar(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFixStockLookup 处理 GET /api/stock/lookup 请求，根据股票代码查询实时行情。
-// 参数：?code=600519，返回代码、名称和最新价格。
+// 参数：?code=600519，返回代码、名称、最新价，以及涨跌幅与昨收。
+//
+// §P3-FE（FIX_PLAN_20261006 波 6 / 断言 P4-P5）补 change_pct + prev_close 两键的成因：
+// 全局个股抽屉（web/src/components/StockDetailDrawer.jsx）每 5s 走本端点刷**现价**，
+// 但**涨幅**一直用打开抽屉那一刻由宿主表格传入的 props 冻结值——于是抽屉能出现
+// 「价格已经动了、涨幅还是开抽屉那一刻的数」这种自相矛盾读数，用户照涨幅做决策读到的是旧账。
+// 前端当时没有可用字段可取，只能冻结；本轮把后端已有的 data.StockInfo.ChangePct/PrevClose
+// （types.go:14-28，快照链早已填充）透出来，涨幅才谈得上同源。
+// 两键的口径约定与全仓一致：change_pct 单位是百分数（1.23＝+1.23%，不是 0.0123），
+// prev_close>0 才可信（types.go:22-25 的消费方规则），取不到行情时如实回 price=0 而非猜一个数。
+//
+// English: /api/stock/lookup now also carries change_pct and prev_close so the global
+// stock-detail drawer can refresh the change percentage from the same 5s source as the price,
+// instead of pinning the value captured when the drawer was opened.
 func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	if code == "" {
@@ -1821,13 +1834,21 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := s.quote(code)
 	if err != nil {
-		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "price": 0})
+		// 取不到行情：现价/涨幅/昨收一律回 0（前端以 price>0 作「有没有数」的判据，不许猜）
+		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "price": 0, "change_pct": 0, "prev_close": 0})
 		return
 	}
+	// prev_close 兼容未改造的数据源装配点：PrevClose 缺失时回退旧 Close 字段（types.go:21-25 同规则）
+	prev := info.PrevClose
+	if prev <= 0 {
+		prev = info.Close
+	}
 	writeJSON(w, 200, map[string]interface{}{
-		"code":  info.Code,
-		"name":  info.Name,
-		"price": info.Price,
+		"code":       info.Code,
+		"name":       info.Name,
+		"price":      r2(info.Price),
+		"change_pct": r2(info.ChangePct),
+		"prev_close": r2(prev),
 	})
 }
 

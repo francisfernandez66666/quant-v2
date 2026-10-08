@@ -7,6 +7,16 @@ import { useNavigate } from 'react-router-dom'
 import { Card, Table, Tag, Button, Dialog, Tabs, Input, Select } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
+// §P2-I（2026-10-06 修复批 波 6）轮询「后到丢弃」统一入口。本页两条读取路都写 state 且会交错：
+// 页面主体 loadData 被 15s 轮询 + SSE 推送 + 手动刷新三路驱动，弹窗 load 被「可见性 + switchTab +
+// 刷新」驱动；旧请求迟到响应会把新一轮刚写好的 records/data 盖回去（数据倒挂）。用这一个 hook
+// 各取一个跨渲染稳定的守卫实例（内部 useRef 惰性初始化，禁止写成 useRef(createStaleGuard())）。
+import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
+// §P2-J 同族（吞错可见化）：读取腿失败按腿名进共用台账，页顶/弹窗各出红条点名「哪条腿没读到」，
+// 不再用空态冒充「没数据」（读取失败冒充无数据正是本页 Promise.allSettled 的老形态）。
+import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按腿记账（共用台账）
+// §P2-J 台账红条单实现：页面（含日志弹窗）只管记账与摆放位置，文案/testid 都在组件里，不在页内抄 div。
+import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
 
 // 根据新闻/信号方向（利好/利空/中性）返回对应的 TDesign Tag 主题色
 function dirTheme(d) {
@@ -60,6 +70,13 @@ function LogModal({ visible, onClose }) {
   const [sigNoData, setSigNoData] = useState(false)
   const [sigQuery, setSigQuery] = useState('')
   const [activeSigStrategy, setActiveSigStrategy] = useState('all')
+
+  // §P2-I：日志弹窗 load 的守卫——它由「弹窗可见性 effect + switchTab + 手动刷新」驱动，开弹窗
+  // 触发的加载还没回、用户又点刷新或切 tab 时，旧响应迟到会把 records/data 盖回上一轮，故接一个
+  // 独立于页面主体的守卫实例（两路 Promise.allSettled 同轮共用一个代号，回来先判后到再写 state）。
+  const modalGuard = useStaleGuard()
+  // §P2-J：弹窗两条读取腿（LLM 分析记录 / 信号批次日志）的失败台账，红条在弹窗顶部点名。
+  const { fails: modalFails, mark: markLoadFail, clear: clearLoadFail } = useLoadLedger()
 
   // 格式化时间为 HH:mm:ss
   function fmtTime(t) {
@@ -175,27 +192,48 @@ function LogModal({ visible, onClose }) {
   const load = useCallback(async () => {
     if (loading) return
     setLoading(true)
+    // §P2-I：本轮代号在两路 allSettled 发起之前盖章；allSettled 回来后统一判后到再写 records/data。
+    const token = modalGuard.begin()
     // 并行拉取两侧数据：Stage 记录（LLM 分析）与信号批次日志
     const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs()])
-    // LLM 分析记录：有数据则默认选中最新一轮并应用，否则置空态
-    if (srRes.status === 'fulfilled' && Array.isArray(srRes.value) && srRes.value.length) {
-      setLlmRecords(srRes.value)
-      setLlmIdx(0)
-      applyLLM()
+    // §P2-I：allSettled 是唯一 await 点，两路在此汇合——旧轮次整包丢弃，一个数据 state 都不写；
+    // loading 是弹窗 Spinner（非读数），复位一次即可，交给最新一轮收尾时也会复位，不会卡住。
+    if (modalGuard.isStale(token)) { setLoading(false); return }
+    // LLM 分析记录：三态分开处置——fulfilled 有数据=成功销案；fulfilled 空数组=真读数无数据（非失败，
+    // 仍销案并走空态）；rejected=读取失败，进台账点名且**绝不清空既有读数**（§P2-J 铁律3：读取失败
+    // 冒充「暂无 LLM 分析记录」正是本缺陷的老形态）。
+    if (srRes.status === 'fulfilled') {
+      if (Array.isArray(srRes.value) && srRes.value.length) {
+        setLlmRecords(srRes.value)
+        setLlmIdx(0)
+        applyLLM()
+        clearLoadFail('LLM 分析记录')
+      } else {
+        // fulfilled 但空数组：这是真实读数（本轮确实没有记录），照常置无数据空态，并撤销可能的旧失败记录
+        setLlmRecords([])
+        setLlmData(null)
+        setLlmNoData(true)
+        clearLoadFail('LLM 分析记录')
+      }
     } else {
-      setLlmRecords([])
-      setLlmData(null)
-      setLlmNoData(true)
+      // rejected：读取失败——只点名、保留上一轮读数，不清空、不置无数据（区别于「真的没有」）
+      markLoadFail('LLM 分析记录', (srRes.reason && (srRes.reason.message || String(srRes.reason))) || '未知错误')
     }
-    // 信号批次日志：同上，默认选中最新一批
-    if (slRes.status === 'fulfilled' && Array.isArray(slRes.value) && slRes.value.length) {
-      setSigRecords(slRes.value)
-      setSigIdx(0)
-      applySignal()
+    // 信号批次日志：与 LLM 分析记录同口径三态处置
+    if (slRes.status === 'fulfilled') {
+      if (Array.isArray(slRes.value) && slRes.value.length) {
+        setSigRecords(slRes.value)
+        setSigIdx(0)
+        applySignal()
+        clearLoadFail('信号批次日志')
+      } else {
+        setSigRecords([])
+        setSigData(null)
+        setSigNoData(true)
+        clearLoadFail('信号批次日志')
+      }
     } else {
-      setSigRecords([])
-      setSigData(null)
-      setSigNoData(true)
+      markLoadFail('信号批次日志', (slRes.reason && (slRes.reason.message || String(slRes.reason))) || '未知错误')
     }
     setLoading(false)
   }, [loading])
@@ -284,6 +322,12 @@ function LogModal({ visible, onClose }) {
   return (
     <Dialog visible={visible} onClose={onClose} header="📋 日志" width="900px" footer={false}>
       <div>
+        {/* §P2-J（2026-10-06 修复批 波 6）吞错可见化红条：LLM 分析记录 / 信号批次日志 任一读取腿
+            rejected 就在此点名。旧形态是 Promise.allSettled 的 rejected 被当成「没数据」置 noData 空态——
+            读取失败冒充无数据，运维无从分辨。红条只报「哪条腿失败 + 原因」，**不清空既有读数**，
+            下一轮成功即自动销案。红条本体走共享组件（单 testid、单文案），页内不抄 div。
+            English: §P2-J — per-leg load-failure banner inside the log dialog. */}
+        <LoadFailBanner fails={modalFails} page="LLMDebug-LogModal" />
         <Tabs value={activeTab} onChange={(v) => switchTab(v)}>
           <Tabs.TabPanel value="llm" label="LLM 分析">
             <div className="toolbar" style={toolbarStyle}>
@@ -527,6 +571,14 @@ export default function LLMDebug() {
 
   const [selectedSet, setSelectedSet] = useState(new Set())
 
+  // §P2-I：页面主体守卫。loadData 被 15s 轮询 + SSE 推送 + 手动刷新三路交错驱动；interval 与
+  // SSE 回调持的是挂载期闭包（其中的 loading 恒为初始 false），既有的 `if (loading) return` 互斥
+  // 挡不住它们，上一轮 fetchStageRecords 还在途时下一轮已发出，旧响应迟到会整包覆盖 records/data
+  // （数据倒挂，直到下次轮询）。故发起前盖代号、每个 await 回来后写 state 之前判后到。
+  const mainGuard = useStaleGuard()
+  // §P2-J：主体读取腿台账（Stage 流水线记录 = 主源 stage-records + 回落 llm-debug 的双源合一腿）。
+  const { fails: loadFails, mark: markLoadFail, clear: clearLoadFail } = useLoadLedger()
+
   const isSelected = (i) => selectedSet.has(i)
   // 判断 Stage1 初筛中第 i 条是否被 LLM 选中（复用 selectedSet）
 
@@ -561,6 +613,9 @@ export default function LLMDebug() {
   async function loadData() {
     if (loading) return // §FIX-0921d 防并发风暴：SSE/15s 轮询/手动刷新互斥，避免同时多个 700KB 请求挤占连接
     setLoading(true)
+    // §P2-I：本轮代号在发起任何请求之前盖章；下面每个 await 回来后、写 state 之前都判一次后到，
+    // 漏一个分支就是漏一条腿（no_engine / 双源皆空 / 成功 三条写 state 的路径都在这道代号之下）。
+    const token = mainGuard.begin()
     // 计时与诊断标记：主源/回落是否成功、错误信息
     const t0 = Date.now()
     let recs = null
@@ -572,18 +627,24 @@ export default function LLMDebug() {
     try {
       recs = await api.fetchStageRecords()
       mainOk = Array.isArray(recs) && recs.length > 0
-    } catch (e) {
+    }
+    // §P2-J 可吞：主源异常先汇入 recs=null / errMsg / forbidden，交由下面的双源回落与统一终判——
+    // 此处不直接判红，因为回落成功仍是有效读数；真正的「没读到」只在双源皆失的 else 分支进台账。
+    catch (e) {
       recs = null
       errMsg = (e && e.message) || String(e)
       if (api.isForbidden(e)) forbidden = true
     }
-    // 引擎未启动：直接置"Agent 未就绪"空态并返回
+    // §P2-I：主源 await 回来后、写任何 state 之前判后到——后到的旧轮次整包丢弃（连 no_engine 分支也不写）。
+    if (mainGuard.isStale(token)) return
+    // 引擎未启动：直接置「Agent 未就绪」空态并返回
     if (recs && recs.status === 'no_engine') {
       setNoAgent(true)
       setNoData(false)
       setRecords([])
       setData(null)
       setDiag({ n: 0, mainOk: false, fbOk: false, ms: Date.now() - t0, err: 'no_engine' })
+      clearLoadFail('Stage 流水线记录') // §P2-J：no_engine 是服务端真实响应（引擎未就绪），非读取失败→销案
       setLoading(false)
       return
     }
@@ -596,18 +657,27 @@ export default function LLMDebug() {
           recs = [d]
           fbOk = true
         }
-      } catch (e2) {
+      }
+      // §P2-J 可吞：回落源异常同样汇入 errMsg / forbidden，最终由下面 both-fail 分支统一记台账；
+      // 中间态不判红（主源可能已成功、只是没走到这条，或本条失败但整体稍后据 forbidden/空态定夺）。
+      catch (e2) {
         if (!errMsg) errMsg = (e2 && e2.message) || String(e2)
         if (api.isForbidden(e2)) forbidden = true
       }
+      // §P2-I：回落 await 回来后判后到，旧轮次不得写 state
+      if (mainGuard.isStale(token)) return
     }
+    // §P2-I：进入终判/写 state 段落前再判一次后到——无论走主源直达还是回落，此处都是最后一道闸
+    if (mainGuard.isStale(token)) return
     // 双源任一生效：展示记录并应用最新一轮
     if (Array.isArray(recs) && recs.length) {
       setRecords(recs)
       applyLatest(recs) // §FIX-0921e 传入本次取到的记录，避免读到 setState 前的旧闭包
       setDiag({ n: recs.length, mainOk, fbOk, ms: Date.now() - t0, err: '' })
+      clearLoadFail('Stage 流水线记录') // §P2-J：双源任一生效=读取成功，销案
     } else if (forbidden) {
-      // §A5：数据首拉即 403——不再渲染"暂无数据"白板掩盖权限问题，重路由统一 403 页
+      // §A5：数据首拉即 403——不再渲染「暂无数据」白板掩盖权限问题，重路由统一 403 页
+      // 跳走即卸载本页，台账随组件消失，无需在此记账
       navigate('/403')
     } else {
       // 双源皆失败：置无数据空态并记录诊断错误
@@ -616,6 +686,8 @@ export default function LLMDebug() {
       setRecords([])
       setData(null)
       setDiag({ n: 0, mainOk, fbOk, ms: Date.now() - t0, err: errMsg })
+      // §P2-J：这才是真正的「读取腿没读到」——两条源都失败，进台账点名，红条标出下方为上一轮/空、非最新
+      markLoadFail('Stage 流水线记录', errMsg || '未知错误')
     }
     setLoading(false)
   }
@@ -686,6 +758,13 @@ export default function LLMDebug() {
           <Button theme="primary" onClick={loadData} loading={loading}>刷新</Button>
         </div>
       </div>
+      {/* §P2-J（2026-10-06 修复批 波 6）吞错可见化红条：主体读取腿「Stage 流水线记录」本轮没读到
+          （主源 + 回落双源皆失）就在此点名。旧形态是失败被吞成 noData 空态，界面显示「暂无数据」冒充
+          真的没有，运维只能靠反推。红条只报「哪条腿失败 + 原因」，**不清空既有读数**，下一轮成功即销案。
+          注意与下面的 §FIX-0921d 取数自诊断小字是两件事：diag 记的是链路耗时/主源回落是否命中，
+          本条记的是「这条读取腿整体没读到」，两者各留各的格子，不合并。
+          English: §P2-J — per-leg load-failure banner; kept separate from the self-diag line above the cards. */}
+      {Object.keys(loadFails).length > 0 && <LoadFailBanner fails={loadFails} page="LLMDebug" />}
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
 
       {/* §FIX-0921d 取数自诊断行：主源/回落/轮数/耗时/错误，一眼定位白板根因 */}
