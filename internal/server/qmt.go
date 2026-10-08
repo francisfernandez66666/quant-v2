@@ -1436,11 +1436,18 @@ func (s *Server) handleQMTSettle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "real book not available")
 		return
 	}
-	diff, err := ctrl.SettleDay(req.Day, req.Mode)
+	diff, outcome, err := ctrl.SettleDay(req.Day, req.Mode)
 	if err != nil {
 		opslog.Audit("settle", userIDFor(r), req.Day, "fail: "+err.Error())
 		writeError(w, 502, "settle failed: "+err.Error())
 		return
+	}
+	// §P2-E（2026-10-06 修复批 波 5）：手工对账链同样必须把"本轮未验证"说出口。
+	// 旧实现在这两条腿上返回 200 + `"diff": null`，点"立即对账"的人看到的是"对完了、没差异"，
+	// 而事实是网关没连/执行器不支持——降级报成功（§0925EVE 报告的主题）在这条手工链上的形态。
+	// 状态码保持 200（这不是请求失败，是一次有结论的尝试），但结论必须进正文且进审计留痕。
+	if !outcome.Verified() {
+		opslog.Audit("settle", userIDFor(r), req.Day, "skipped: "+outcome.String())
 	}
 	// 差异告警（与调度路径一致）
 	if diff != nil && (len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch) > 0) {
@@ -1448,7 +1455,12 @@ func (s *Server) handleQMTSettle(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"ok": "1", "day": req.Day, "mode": req.Mode,
-		"diff": diff,
+		// verified=本轮是否真完成了三方比对；outcome=三态原文（verified /
+		// skipped-not-verified:gateway_not_connected / skipped-not-verified:executor_unsupported）。
+		// 前端与运维面读这两把，不再靠"diff 是不是 null"猜结论。
+		"verified": outcome.Verified(),
+		"outcome":  outcome.String(),
+		"diff":     diff,
 	})
 }
 

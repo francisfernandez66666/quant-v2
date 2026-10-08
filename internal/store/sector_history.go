@@ -67,9 +67,18 @@ func (d *DB) aggregateSectorDay(date string) ([]SectorDay, error) {
 // change, top gainers).
 func (d *DB) aggregateSectorDayFull(date string) ([]SectorDay, error) {
 	// 行业清单 + 成员数 + 平均涨跌幅（一次聚合）
+	//
+	// §P2-F（2026-10-06 修复批 波 5）：这条聚合加了"排除降级行"的判据。
+	// 降级行（sidecar 新浪/东财兜底腿写的 daily 行）现在 pct_chg 是 NULL，AVG() 本来就会跳过
+	// NULL——但 COUNT(*) 不会，于是"成员数"里混着没有涨跌读数的票，读的人会把
+	// 「平均涨跌幅」当成覆盖全部成员的读数。取向：这条统计的两个读数（成员数/均值）**同一样本集**，
+	// 判据一律走 store.DailySourceNotDegraded（单源，见 daily_source.go 头注释）。
+	// 注意下面的涨停家数那条查询**不加**这个判据：涨停判据用的是 close 与 up_limit，
+	// 这两个读数降级行同样给得出，把它筛掉反而会少计涨停家数。
 	aggQ := `SELECT s.industry, COUNT(*), COALESCE(AVG(dv.pct_chg),0)
 		FROM daily dv JOIN stocks s ON s.ts_code = dv.ts_code
 		WHERE dv.trade_date = ? AND s.industry IS NOT NULL AND s.industry != '' AND dv.close > 0
+		  AND ` + DailySourceNotDegraded("dv") + `
 		GROUP BY s.industry`
 	rows, err := d.db.Query(aggQ, date)
 	if err != nil {
@@ -144,7 +153,8 @@ func (d *DB) aggregateSectorDayFull(date string) ([]SectorDay, error) {
 func (d *DB) topStocksByIndustry(date string) (map[string][]string, error) {
 	query := `SELECT s.industry, s.ts_code, COALESCE(dv.pct_chg,0) FROM daily dv
 		JOIN stocks s ON s.ts_code = dv.ts_code
-		WHERE dv.trade_date = ? AND s.industry IS NOT NULL AND s.industry != '' AND dv.close > 0`
+		WHERE dv.trade_date = ? AND s.industry IS NOT NULL AND s.industry != '' AND dv.close > 0
+		  AND ` + DailySourceNotDegraded("dv")
 	rows, err := d.db.Query(query, date)
 	if err != nil {
 		return nil, err

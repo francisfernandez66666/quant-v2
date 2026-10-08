@@ -277,23 +277,49 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 
 	daily, basis, limits := make([]map[string]any, 0, len(kl)), make([]map[string]any, 0, len(kl)), make([]map[string]any, 0, len(kl))
 	for _, r := range kl {
-		if int(r.F("tradestatus")) == 0 {
+		// §P2-F：tradestatus 只在**明确读到 0**时才当停牌跳过。
+		// 旧写法 `int(r.F("tradestatus")) == 0` 把"这一列没有读数"（降级腿的空串）与
+		// "今天真的停牌"（读数=0）混成同一个判据：降级日整行不落库＝静默丢数据，
+		// 而旧版把降级腿硬编码成 "1" 之后又变成"什么都能落"——两头都不对。
+		// 现在的口径：缺测＝不因它而跳过（新浪/东财只返回有成交的日子），读到 0＝停牌才跳。
+		if ts, ok := r.FOk("tradestatus"); ok && int(ts) == 0 {
 			continue // 停牌日跳过（等价 Tushare 缺行语义）
 		}
 		date := normDate(r.S("date"))
 		closeV, preClose := r.F("close"), r.F("preclose")
+		// §P2-F 落库口径：涨跌幅/估值/ST 这几列在降级行里是"没测到"，必须写 NULL 而不是 0。
+		// 0 在 pct_chg 语义里是"平盘"这一**真实读数**，把缺测落成 0 会让广度统计
+		// （上涨家数占比、板块平均涨跌幅）把断源日算成平盘日——这正是 2026-10-05 审计里
+		// 「降级链把断源日写成平盘」的落点。读侧的排除判据见 store.DailySourceNotDegraded。
+		pct, pctOK := r.FOk("pctchg")
 		daily = append(daily, map[string]any{
 			"ts_code": code, "trade_date": date,
 			"open": r.F("open"), "high": r.F("high"), "low": r.F("low"), "close": closeV,
-			"pre_close": preClose, "change": closeV - preClose, "pct_chg": r.F("pctchg"),
-			"vol":    r.F("volume") / 100, // 股 → 手
-			"amount": r.F("amount"),
+			"pre_close": preClose,
+			// change 与 pct_chg 同进同退：只知价格差而涨跌读数缺失时留半行"半 known"，
+			// 读侧会误判"这行有涨跌数据"（change 也能折算出涨跌）。
+			"change":  numOrNil(closeV-preClose, pctOK),
+			"pct_chg": numOrNil(pct, pctOK),
+			"vol":     r.F("volume") / 100, // 股 → 手
+			"amount":  r.F("amount"),
+			// §P2-F 来源列：baostock / sina_degraded / eastmoney_degraded（sidecar 行尾带出）。
+			// 缺失时按主链路处理（老 sidecar 不带这列），但降级语义仍以列值为准。
+			"source": dailySourceOf(r),
 		})
 		basis = append(basis, map[string]any{
 			"ts_code": code, "trade_date": date,
-			"turnover_rate": r.F("turn"), "pe_ttm": r.F("pettm"), "pb": r.F("pbmrq"),
-			"ps_ttm": r.F("psttm"), "pcf_ttm": r.F("pcfncfttm"), "is_st": int(r.F("isst")),
+			"turnover_rate": r.F("turn"),
+			"pe_ttm":        numOrNil(r.FOk("pettm")),
+			"pb":            numOrNil(r.FOk("pbmrq")),
+			"ps_ttm":        numOrNil(r.FOk("psttm")),
+			"pcf_ttm":       numOrNil(r.FOk("pcfncfttm")),
+			// is_st 缺测写 NULL（不是 0＝"确定不是 ST"）：下游 ST 相关判据必须能看见"不知道"。
+			"is_st": numOrNil(r.FOk("isst")),
 		})
+		// 涨跌停价：isST 缺测时按非 ST 计算（新浪/东财降级行不给 ST 态）。
+		// 取向说明：这里不因为"不知道是不是 ST"就整行不落停板价——缺停板价会让回测护栏
+		// 直接失效（无从判涨跌停），而 ±10% 对非 ST 主板是正确值、对 ST 偏松；
+		// 偏松方向是"少拦一点"，与 §P2-F 的"不得伪造读数"不冲突（读数本身已是 NULL）。
 		up, down := limitUpDown(preClose, int(r.F("isst")), code)
 		if up > 0 {
 			limits = append(limits, map[string]any{"ts_code": code, "trade_date": date, "up_limit": up, "down_limit": down})
@@ -338,6 +364,27 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 		total += int(n)
 	}
 	return total, nil
+}
+
+// numOrNil 把 FOk 的两值返回折成"落库值"：有读数→数值，无读数→nil（写 NULL）。
+// §P2-F 的落库侧唯一姿势：降级腿给不出的列不能落成 0（0 在涨跌/ST 语义里都是真实读数）。
+// （numOrNil maps FOk's (value, ok) to a nullable insert value: nil becomes SQL NULL.）
+func numOrNil(v float64, ok bool) any {
+	if !ok {
+		return nil
+	}
+	return v
+}
+
+// dailySourceOf 取 sidecar 行尾的来源标记并归一：缺列（老 sidecar）按主链路 baostock 处理，
+// 带 degraded 后缀的（sina_degraded / eastmoney_degraded）原样落库，供读侧筛除。
+// English: normalize the sidecar's per-row source tag; a missing column means the primary chain.
+func dailySourceOf(r data.TushareRow) string {
+	s := strings.ToLower(strings.TrimSpace(r.S("source")))
+	if s == "" {
+		return "baostock"
+	}
+	return s
 }
 
 // limitUpDown 按板块/ST 规则计算当日涨跌停价（回测护栏用）。

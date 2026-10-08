@@ -88,6 +88,13 @@ type Controller struct {
 	lastSettleAttemptAt time.Time // 最近一次对账尝试时刻（成功或失败都推进）
 	settleFailDay       string    // 失败计数归属的交易日
 	settleFailCount     int       // 该交易日累计失败次数
+	// §P2-E（2026-10-06 修复批 波 5）跳过态的当日戳（mu 保护）：
+	// lastSettleDay 的语义是"当日**真比对过**"，跳过绝不写它；本两项只用于
+	// "同一结构性原因当日只留痕一次"的短路判据（原因为何必须一起看，否则先发生的
+	// NoFetcher 会把之后真能跑的窗口永久挡在门外）。
+	// English: §P2-E — per-day skip stamp (reason-aware); never advances lastSettleDay.
+	lastSettleSkipDay     string        // 最近一次"本轮未验证"归属的交易日
+	lastSettleSkipOutcome SettleOutcome // 该日最近一次结论（只认 NoFetcher 做当日短路）
 
 	// §WS-C 风控闸口统一入口：placeOrder 的全部前置守卫收敛到 risk.Gate.CheckLiveOrder
 	//（controller 只保留 orderMu 串行、幂等与 executor 分发）。新闸命中即记录+告警。

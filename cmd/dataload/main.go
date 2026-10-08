@@ -27,6 +27,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -358,6 +359,11 @@ func loadByDate(db *store.DB, c *data.TushareClient, table string, fetch func(st
 			// （断点续传按日期整批重拉重写，天然幂等）。白名单外的表原样通过。
 			recs := toMaps(rows)
 			scaleHint(table, data.NormalizeTushareAmount(table, recs), len(recs))
+			// §P2-F：tushare 主链路显式盖章 source='tushare'。降级腿由 baostock sidecar 路径
+			// 带出 sina_degraded/eastmoney_degraded，读侧靠这一列把两类行区分开
+			// （判据单源见 internal/store/daily_source.go）。只碰 daily：
+			// index_daily 没有这列，写进白名单会被 validateInsertSurface 判红。
+			stampDailySource(table, recs)
 			n, err := db.InsertRows(table, cols, recs)
 			if err != nil {
 				return fmt.Errorf("%s@%s: %v", table, d, err)
@@ -455,6 +461,27 @@ func toMaps(rows []data.TushareRow) []map[string]any {
 		out = append(out, r)
 	}
 	return out
+}
+
+// stampDailySource 给 daily 表的行盖来源章（§P2-F，2026-10-06 修复批 波 5）。
+//
+// 只处理 "daily"：index_daily 走同一套 loadByDate，但 sidecar 的指数链路没有降级腿，
+// 表里也没有这一列——无差别盖章会被 §INSERTLOCK 的写入面校验判成"未知列"而整批红。
+// 取向是"显式盖章"而不是"留 NULL 让默认值兜"：InsertRows 对缺失键写的是显式 NULL
+// （不是省略列），DDL 的 DEFAULT 根本不会生效，所以不盖章就等于"主链路行与未知世代行同形"，
+// 读侧再也分不开。
+// English: stamp daily rows with source=tushare so the read side can tell primary rows apart from
+// fallback-source rows; bar-less tables are left untouched.
+func stampDailySource(table string, recs []map[string]any) {
+	if table != "daily" {
+		return
+	}
+	for _, r := range recs {
+		if s, ok := r["source"].(string); ok && strings.TrimSpace(s) != "" {
+			continue // 上游已带标记（sidecar 降级行）：不覆盖成主链路
+		}
+		r["source"] = store.DailySourceTushare
+	}
 }
 
 // nextTradeDay 返回 dates 中严格大于 maxD 的第一个日期；无则空串。

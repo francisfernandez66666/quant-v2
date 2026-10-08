@@ -279,6 +279,14 @@ class Gateway:
         # 桥以 JSONL 文件上报事件（bridge_report.jsonl 追加行），由本线程读文件
         # 并复用 _do_dispatch_result 语义（心跳/快照/派发回报/推量仔零改动）。
         self._file_bridge_thread = None
+        # §P2-G（2026-10-06 修复批 波 5）命令文件写失败的可见化：
+        # total=累计失败轮次，streak=连续失败轮次（任一轮写成功即归零），
+        # held=最近一次失败时被按住（保持 pending、未下发）的单数。
+        # 三个都是进程内计数（重启归零），与网关既有口径一致：告警出口就是
+        # log.error + /admin/status 观察位，网关侧没有独立推送通道。
+        self._file_bridge_push_fail_total = 0
+        self._file_bridge_push_fail_streak = 0
+        self._file_bridge_push_fail_held = 0
         # §M16：inflight 派发项超时收割线程（启动先清一次 + 周期巡检）
         self._dispatch_reap_thread = None
         # §ENH-5 批E：只读 L1 行情 feed（独立线程/独立异常域；断连只影响 feed_connected 观察字段）
@@ -392,11 +400,24 @@ class Gateway:
     def _file_bridge_push_pending(self):
         """§QMT-F16 file 桥命令下发：有 pending 派发项 → 原子写 bridge_cmd.json。
         所有 pending 行由桥逐条执行并回报，gateway _apply_* 根据 seq 结算→done。
-        实现只对「有 pending」的轮次写文件（无 pending 不打扰桥）。"""
+        实现只对「有 pending」的轮次写文件（无 pending 不打扰桥）。
+
+        §P2-G（2026-10-06 修复批 波 5）顺序翻转：本函数原先第一步就调
+        `dispatch_pending()`，而那个函数**取单即翻 inflight**（HTTP 桥的正确语义——
+        响应体就是把单交给对方了）。file 桥借用它之后，"写命令文件失败"这一路变成
+        确定性的丢单：行已经是 inflight，桥永远看不到这张单，网关侧只能等 §M16 的
+        超龄收割（默认 1800s）把它判废，而判废不回 pending ⇒ 这笔交易在系统里
+        安静地消失了，只有 log.exception 一行。现改为
+        **peek（只读）→ 写文件成功 → mark_inflight**：写失败时行仍是 pending，
+        下一轮 0.5s 后照常重推，同时把失败次数计进 /admin/status 观察位
+        （网关侧没有独立告警出口，log.error + 观察位是本仓既有惯例）。
+        English: §P2-G — peek pending, write the cmd file first, only then flip to
+        inflight; a failed write keeps the rows pending and is counted outwardly.
+        """
         try:
-            pending = self.store.dispatch_pending(limit=50)
+            pending = self.store.dispatch_pending_peek(limit=50)
         except Exception:  # noqa: BLE001
-            log.exception("[file-bridge] dispatch_pending failed")
+            log.exception("[file-bridge] dispatch_pending_peek failed")
             return
         cmd_path = self._file_bridge_cmd_path()
         if not pending:
@@ -423,9 +444,49 @@ class Gateway:
                 f.write(body)
             os.replace(tmp, cmd_path)
         except Exception:  # noqa: BLE001
-            log.exception("[file-bridge] push pending to cmd file failed")
-        else:
-            log.info("[file-bridge] pushed %d pending cmd(s) to %s", len(pending), cmd_path)
+            # §P2-G 关键分支：写盘失败**不动任何状态**——上面的 peek 是只读的，
+            # 这批行仍为 pending，下一轮照常重推。计数进观察位是为了让"每轮都写失败"
+            # 这种持续故障能从 log 的汪洋里浮出来（log.exception 只能证明抛过异常，
+            # 看不出是抖动还是系统性坏了）。
+            self._record_file_bridge_push_failure(len(pending), cmd_path)
+            return
+        # 文件已落盘才推进状态：mark 只翻「仍为 pending」的行，
+        # 与 dispatch_pending 的 inflight_at 同源（收割龄仍按被取走的时间计）。
+        try:
+            moved = self.store.dispatch_mark_inflight([p.get("seq") for p in pending])
+        except Exception:  # noqa: BLE001
+            # 状态没翻成而文件已写好 ⇒ 下一轮会把同一批再 peek 出来重写。
+            # 这不是重复下单：桥按 seq 去重（bridge_seen.jsonl 落盘成功才执行，
+            # 见 qmt_bridge_strategy._record_seen/_load_seen），重写同一份命令体无害。
+            # 反过来若在这里抢翻 inflight，就等于回到"网关以为交出去了、桥其实没拿到"。
+            log.exception("[file-bridge] mark inflight failed (cmd file already written; "
+                          "bridge dedupes by seq, rows stay pending)")
+            return
+        self._file_bridge_push_fail_streak = 0
+        self._file_bridge_push_fail_held = 0
+        log.info("[file-bridge] pushed %d pending cmd(s) to %s (marked inflight=%d)",
+                 len(pending), cmd_path, moved)
+        if moved != len(pending):
+            # 翻动的行数少于本次写进文件的行数：这批里有行被别的消费者抢先取走
+            # （现网 file 桥是唯一消费者，出现即说明 bridge_mode 配错/双通道并开）。
+            log.warning("[file-bridge] mark inflight %d/%d：派发行被别的消费者取走，"
+                        "确认 bridge_mode 是否只有 file 桥一条下发通道", moved, len(pending))
+
+    def _record_file_bridge_push_failure(self, held, cmd_path):
+        """§P2-G 写失败的可见化：连续/累计计数 + 被按住的单数进 /admin/status。
+
+        只计数不抛异常：本函数在 0.5s 轮询线程里，抛出去等于把命令下发线程打死，
+        比"这一轮没写成"严重得多。streak 由成功分支归零，所以观察位上
+        `streak>0` 就等价于"此刻仍在失败"，`total` 只用于区分抖动与系统性故障。
+        """
+        self._file_bridge_push_fail_total += 1
+        self._file_bridge_push_fail_streak += 1
+        self._file_bridge_push_fail_held = int(held or 0)
+        log.error("[file-bridge] 命令文件写入失败：%d 单保持 pending（下轮重推，§P2-G），"
+                  "连续失败 %d 轮 / 累计 %d 次 path=%s",
+                  held, self._file_bridge_push_fail_streak,
+                  self._file_bridge_push_fail_total, cmd_path)
+        return self._file_bridge_push_fail_streak
 
     def _cmd_from_dispatch(self, p):
         """派发 DB 行 → 文件桥命令体（push 与 reconcile 共用，口径一致）。"""
@@ -1377,6 +1438,14 @@ class Gateway:
             for r in unresolved[:20]]
         payload["unresolved_count"] = len(unresolved)
         payload["dispatch_signal_guard"] = bool(getattr(self.store, "dispatch_signal_guard", False))
+        # §P2-G 观察位：命令文件写失败（单仍 pending、下轮重推）的三个计数。
+        # streak>0 = 此刻还在失败，total 只用于区分抖动与系统性故障（磁盘满/目录权限/
+        # 路径被删）。放在 /admin/status 而不是另开告警通道，与 unresolved_orders 同姿势。
+        payload["file_bridge_push"] = {
+            "fail_total": int(self._file_bridge_push_fail_total),
+            "fail_streak": int(self._file_bridge_push_fail_streak),
+            "fail_held": int(self._file_bridge_push_fail_held),
+        }
         return 200, payload
 
     def _do_admin_order_confirm(self, body):

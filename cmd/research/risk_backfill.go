@@ -90,9 +90,18 @@ func riskBackfillPlan(db *store.DB, start, end string, force bool) ([]store.Mark
 }
 
 // dailyUpRatio 当日全市场上涨家数占比（daily 表口径，0..1；无行返回 nil 弃权）。
-// English: up-ratio from the daily table for one trade date; nil when no rows.
+//
+// §P2-F（2026-10-06 修复批 波 5）判据补一条"排除降级行"：分母 COUNT(*) 以前把
+// 降级腿（新浪/东财）写的行也数进去，而那些行的 pct_chg 在旧口径下是被伪造的 0（平盘），
+// 于是"断源日"直接压低上涨占比、把广度读数往弱势方向带。现在降级行的涨跌是 NULL 且带来源标记，
+// 分母只数**有真实涨跌读数**的行（NULL 也一并排除，双保险：万一来源列没落上，
+// `pct_chg IS NOT NULL` 仍然把它挡在分母外）。
+// English: up-ratio from the daily table for one trade date; degraded (fallback-source) rows are
+// excluded from the denominator so a source outage no longer reads as a flat day.
 func dailyUpRatio(db *store.DB, date string) *float64 {
-	rows, err := db.QueryRows(`SELECT COALESCE(SUM(CASE WHEN pct_chg > 0 THEN 1 ELSE 0 END),0) AS up, COUNT(*) AS tot FROM daily WHERE trade_date = ?`, date)
+	rows, err := db.QueryRows(`SELECT COALESCE(SUM(CASE WHEN pct_chg > 0 THEN 1 ELSE 0 END),0) AS up,
+		COUNT(pct_chg) AS tot FROM daily
+		WHERE trade_date = ? AND pct_chg IS NOT NULL AND `+store.DailySourceNotDegraded(""), date)
 	if err != nil || len(rows) == 0 {
 		return nil
 	}

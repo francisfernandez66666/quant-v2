@@ -96,6 +96,7 @@ func (d *DB) migrate() error {
 			ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
 			open REAL, high REAL, low REAL, close REAL, pre_close REAL,
 			change REAL, pct_chg REAL, vol REAL, amount REAL,
+			source TEXT,
 			PRIMARY KEY (ts_code, trade_date)
 		)`,
 		`CREATE TABLE IF NOT EXISTS adj_factor (
@@ -613,6 +614,10 @@ func (d *DB) migrate() error {
 	// 旧库增量迁移：为已存在的表补新列（幂等）。
 	// （Incremental migration: add new columns to tables created by older schema versions.）
 	for _, mig := range []struct{ table, column, ddl string }{
+		// §P2-F（2026-10-06 修复批 波 5）：日线来源列。已建库必须补列（新库由 CREATE 语句带上），
+		// 默认 NULL＝"本列落地前的老行"，与 baostock/tushare 主链路**不混同**：主链路写入时
+		// 会显式带值（见 cmd/dataload 的 dailySourceOf），所以 NULL 只有一种含义＝世代未知。
+		{"daily", "source", "ALTER TABLE daily ADD COLUMN source TEXT"},
 		{"daily_basic", "pcf_ttm", "ALTER TABLE daily_basic ADD COLUMN pcf_ttm REAL"},
 		{"daily_basic", "is_st", "ALTER TABLE daily_basic ADD COLUMN is_st INTEGER"},
 		// 阶段3.4 战法库回测：done 任务的汇总报告文本（胜率/盈亏比等，前端直接展示）
@@ -1320,7 +1325,17 @@ func TableColumns(table string) []string {
 		return []string{"ts_code", "name", "area", "industry", "market", "list_date", "delist_date"}
 	case "trade_cal":
 		return []string{"cal_date", "is_open"}
-	case "daily", "index_daily":
+	case "daily":
+		// §P2-F（2026-10-06 修复批 波 5）：source 列 = 这一行的数据来源标记
+		// （baostock / tushare / sina_degraded / eastmoney_degraded；NULL = 本列落地前的老行）。
+		// 为什么必须有这一列：sidecar 的降级腿（新浪/东财）给不出涨跌幅/估值/ST，旧实现把
+		// 它们写成空串→Go 侧折成 0，于是"断源日"在库里与"平盘日"完全同形，广度统计跟着失真，
+		// 事后也无从筛除。有了来源列，读侧才能把降级行**排除**而不是当成真读数（判据单源见
+		// daily_source.go 的 DailySourceNotDegraded/DailySourceDegradedOnly，别在统计点各写一遍 LIKE）。
+		return []string{"ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount", "source"}
+	case "index_daily":
+		// 指数日线不参与降级链（sidecar 的 index_kline 无 akshare 兜底腿），保持原列不动——
+		// 与 daily 共用一条 case 会让指数写入面凭空多一个不存在的列（validateInsertSurface 即红）。
 		return []string{"ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"}
 	case "adj_factor":
 		return []string{"ts_code", "trade_date", "adj_factor"}

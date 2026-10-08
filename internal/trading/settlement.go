@@ -33,6 +33,91 @@ const (
 	SettleModeSyncFills  = "sync_fills"  // 券商有本地无 → 补记成交
 )
 
+// SettleOutcome §P2-E（2026-10-06 修复批 波 5）对账的**三态**结论。
+//
+// 为什么必须有三态（缺陷原文，docs/AUDIT_20261005 报告 P2-E）：旧 SettleDay 在两条"本轮根本
+// 没比对成"的分支上返回 `(nil, nil)`——执行器不支持交割单（Noop/桩）与网关未连接——而调用侧
+// MaybeSettleDay 把 `err == nil` 一律当"成功"记账：`c.lastSettleDay = day` 照写、失败量规归零、
+// 当日不再重投。于是三方对账这道**日终唯一的安全网**在最该报警的两种形态下表现为"今天对过了"：
+//   - 网关整日未连接 ⇒ 当日差异永远不会被发现，而日志里连一条 skipped 都没有（只有一句 log.Printf）；
+//   - 执行器换了/降级成 Noop ⇒ 同一天起永久"成功"，且**没有任何指标能把它和"对过、确实无差异"区分开**
+//     （两条分支都写 settlement_diff_count=0，与"对完了没有差异"用同一个读数）。
+//
+// 这不是"误告警"问题而是"账面说谎"问题：lastSettleDay 的语义被 §D4 收紧成"成功一次才算完成"，
+// 而"跳过"仍然算成功，等于 §D4 的闸被这两条分支从后面绕开了。
+//
+// 三态各自口径（owner 裁决 ② 按推荐项落码，写进本批 commit message 供事后否决）：
+//   - SettleOutcomeVerified：真比对了（有无差异由 settlement_diff_count 表达），才允许推进 lastSettleDay。
+//   - SettleOutcomeSkippedNotConnected：网关未连接＝**本轮未验证**，属"本该能跑而没跑成"的**失败向**
+//     ——不推进 lastSettleDay，交给 §D4 的 10 分钟节流重试，量规抬升、告警可销案。
+//   - SettleOutcomeSkippedNoFetcher：执行器结构性不支持（Noop/桩，非瞬时故障）＝**不适用向**
+//     ——同样不推进 lastSettleDay（账面不能说"对过"），但当日只尝试一次并只留痕一次，
+//     否则模拟盘/降级执行器会每分钟往日志和量规上刷一条"永远好不了"的记录（§CAL-GATE 刷屏判例）。
+//
+// English: §P2-E — three-state settlement outcome. "Skipped" is no longer counted as success:
+// only Verified may advance lastSettleDay, while the two skip reasons keep distinct gauge values
+// (not-connected retries; unsupported-executor short-circuits for the day but never claims success).
+type SettleOutcome int
+
+const (
+	// SettleOutcomeUnknown 零值占位：调用侧拿到零值＝"没有结论"，任何判据都必须显式覆盖它
+	// （绝不让零值顺带落进"已对账"分支——本仓 §P1-B/§D4 同族教训：兜底分支的默认值就是判据的方向）。
+	SettleOutcomeUnknown SettleOutcome = iota
+	// SettleOutcomeVerified 真完成了三方比对。
+	SettleOutcomeVerified
+	// SettleOutcomeSkippedNotConnected 网关未连接：交割单不可信，本轮未验证（失败向，会重试）。
+	SettleOutcomeSkippedNotConnected
+	// SettleOutcomeSkippedNoFetcher 执行器不支持交割单：结构性不适用（当日短路）。
+	SettleOutcomeSkippedNoFetcher
+)
+
+// §P2-E 量规键名口径（写在这里，不落 const 别名）：
+// 键 `settlement_state` 的读数 = 0 本轮未得出比对结论（含调用即出错）/ 1 已对账 / 2 未连接跳过 /
+// 3 执行器不支持。规则 settlement_not_verified 用 `ge 2` 判"本轮未验证"，因此 0 与 1 都安全、2/3 破线。
+// 刻意**不定义** `const settleStateGauge = "settlement_state"` 再拿变量去 SetGauge：
+// 门禁那枚「SetGauge("<键名>" 字面赋值点」守卫是按字面串数赋值点的，键名一旦被别名化，守卫看到的
+// 就是 `SetGauge(settleStateGauge` —— 赋值点数成 0，"量规恒不写"这种坏法在它面前是隐身的
+// （09-29 14:0x 判红实录，§DEADGAUGE 三件套里"键名 const 别名 ban 负锁"就是为这条立的）。
+// 为什么用**一个键的三个值**而不是三个键：三个键要靠"彼此不冲突"来表达一个状态，而它们由同一函数
+// 同一时刻写入，冲突时后写覆盖前写且报出来的读数不属于任何一次调用（§ADJ-BASIS-2P 的反面纪律：
+// 同刻多写共用一键会失真；这里是同一状态的三个取值，共键才是原子的）。
+// English: the gauge key stays a literal at its single write site on purpose — aliasing it would
+// blind the gate's "literal SetGauge assignment points" guard.
+
+// String 三态的可读名（留痕/HTTP 响应都用它，禁止调用侧自己拼字符串——四份文案必然漂三份）。
+// English: canonical human-readable name for each outcome.
+func (o SettleOutcome) String() string {
+	switch o {
+	case SettleOutcomeVerified:
+		return "verified"
+	case SettleOutcomeSkippedNotConnected:
+		return "skipped-not-verified:gateway_not_connected"
+	case SettleOutcomeSkippedNoFetcher:
+		return "skipped-not-verified:executor_unsupported"
+	default:
+		return "unknown"
+	}
+}
+
+// Verified 只有真比对过才算 true；未知/跳过一律 false（fail-closed 方向）。
+// English: only a real three-way comparison counts; skip and unknown are both false.
+func (o SettleOutcome) Verified() bool { return o == SettleOutcomeVerified }
+
+// gaugeValue 三态落到量规的数值（0/1/2/3），与规则 `ge 2` 的判据同源（本函数是唯一映射点）。
+// English: the single place mapping outcome → gauge number, so the rule threshold and the writer agree.
+func (o SettleOutcome) gaugeValue() int64 {
+	switch o {
+	case SettleOutcomeVerified:
+		return 1
+	case SettleOutcomeSkippedNotConnected:
+		return 2
+	case SettleOutcomeSkippedNoFetcher:
+		return 3
+	default:
+		return 0
+	}
+}
+
 // settleUnattributedPrefix §0925EVE-W3-E（C5）：无 signal_id 的交割行补记时的专属标记前缀。
 // 语义 =「无归因行」：这条成交来自券商交割单、但来源侧确实给不出归因信号（旧网关行/柜台
 // 手工流水回灌等），它**不是**真实 signal_id，也绝不冒充一个——前缀自成一路，归因/统计侧可
@@ -84,33 +169,58 @@ func normalizeSettleDay(day string) string {
 }
 
 // SettleDay 执行某交易日三方对账：券商交割单 ↔ 本地 fills ↔ real_account。
-// 返回差异摘要；gateway 不支持交割单时返回 (nil, nil)（静默跳过，不误告警）。
-// English: runs three-way settlement for a day; returns the diff summary. When the gateway lacks
-// settlement support it returns (nil, nil) silently (no false alarms).
-func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) {
+// 返回（差异摘要, §P2-E 三态结论, 错误）。
+//
+// §P2-E 之前的口径是「网关不支持/未连接 → (nil, nil) 静默跳过」，而调用侧把 `err == nil` 当成功，
+// 于是"没比对成"和"比对完没有差异"共用一本文账（详见 SettleOutcome 的成因注释）。现在两条跳过腿
+// 各自返回显式第三态，调用侧**必须**按 outcome 判定是否记为"当日已对账"。
+// English: runs three-way settlement for a day and returns (diff, §P2-E outcome, error). Skip
+// branches now carry an explicit non-verified outcome instead of masquerading as success.
+func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, SettleOutcome, error) {
+	// §P2-E：量规按**每次调用的最终结论**写一次（defer 保证出错/提前 return 也不会留下上一次的残值）。
+	// 键名保持字面量、不落 const 别名，成因见上面那段（§DEADGAUGE 键名别名 ban 同族纪律）。
+	outcome := SettleOutcomeUnknown
+	defer func() { metrics.SetGauge("settlement_state", outcome.gaugeValue()) }()
 	day = normalizeSettleDay(day) // §H1 口径归一先于一切（落库键/拉取参数/补记时间戳共用）
 	if c.store == nil {
-		return nil, fmt.Errorf("real book not set")
+		return nil, outcome, fmt.Errorf("real book not set")
 	}
 	f, ok := c.execRef().(SettlementFetcher)
 	if !ok {
-		log.Printf("[settle] 当前执行器不支持交割单（Noop/桩），跳过 %s", day)
-		// 不适用 = 0（§DEADGAUGE 统一口径：未知/不适用一律写 0，既不伪造"有差异"也不留残值）。
+		// §P2-E：执行器结构性不支持（Noop/桩）＝不适用向，旧此处的 `(nil, nil)` 会被调用侧记成成功。
+		// 「本轮到底验证没验证」从此由**两个键合起来**表达，缺一不可：
+		//   · settlement_state = 3（未验证/不适用）——这是本批新增的第三态；
+		//   · settlement_diff_count 归零——这是 §DEADGAUGE（09-23 傍晚批）负锁③的既有要求：
+		//     跳过分支「什么都不写」会把上一轮真比对出的差异条数留在量规上，让规则
+		//     settlement_diff（gt 0）在跳过日继续按陈旧差异天天报 p1（残值冒充当日读数）。
+		// 本批一度把这行归零当成"降级报成功"删掉，方向错了：冒充成功的是 **lastSettleDay 与
+		// 「已对账」账面**，不是差异读数归零；差异键的语义本来就是"当前可数的差异条数"，
+		// 没在比对＝可数差异为 0，而"这个 0 可不可信"由 settlement_state 判定。
+		// English: keep the diff gauge at zero (stale residue would keep firing p1 on a day we
+		// never actually reconciled) and let settlement_state=3 carry the "not verified" meaning.
+		log.Printf("[settle] 当前执行器不支持交割单（Noop/桩），%s 本轮**未验证**（§P2-E：不再记为已对账）", day)
+		outcome = SettleOutcomeSkippedNoFetcher
 		metrics.SetGauge("settlement_diff_count", 0)
-		return nil, nil
+		return nil, outcome, nil
 	}
 	if mode == "" {
 		mode = SettleModeReportOnly
 	}
 	resp, err := f.FetchSettlement(day)
 	if err != nil {
-		return nil, fmt.Errorf("fetch settlement %s: %w", day, err)
+		return nil, outcome, fmt.Errorf("fetch settlement %s: %w", day, err)
 	}
 	if !resp.Connected {
-		log.Printf("[settle] 网关未连接，交割单不可信，跳过 %s", day)
-		// 同上：本轮不可判 → 写 0 不适用，不把"没对成"伪装成"对出差"，也不留上一轮的残值。
+		// §P2-E：网关未连接＝失败向的"本轮未验证"（交割单不可信，绝不能推进 lastSettleDay），
+		// 交给 MaybeSettleDay 的 §D4 十分钟节流重试；成功那轮再把 settlement_state 写回 1。
+		// 差异读数同样归零（与上面"不支持"分支同一个理由）：跳过日留下的不是"无差异"这个结论，
+		// 而是"此刻可数的差异为 0"，规则 settlement_diff 因此不会在断线日拿昨天的差异刷屏。
+		// English: zero the diff gauge on the not-connected leg too — the stale count from the
+		// last verified day must not keep the gt-0 rule firing through an outage.
+		log.Printf("[settle] 网关未连接，交割单不可信，%s 本轮**未验证**（§P2-E：不记为已对账，按节流重试）", day)
+		outcome = SettleOutcomeSkippedNotConnected
 		metrics.SetGauge("settlement_diff_count", 0)
-		return nil, nil
+		return nil, outcome, nil
 	}
 
 	// 归一券商成交（side 统一为 买入/卖出）。§P0-1b（2026-09-15）：匹配键改为「物理事实键」
@@ -137,7 +247,7 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 	// 本地成交（同样按物理事实键分桶）
 	localFills, err := c.store.ListFillsByDay(c.userID, day)
 	if err != nil {
-		return nil, err
+		return nil, outcome, err
 	}
 	local := map[string][]store.RealFill{}
 	var localFeeTotal float64
@@ -229,7 +339,7 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 	}
 
 	if err := c.store.SaveSettlementDiff(c.userID, *diff); err != nil {
-		return nil, err
+		return nil, outcome, err
 	}
 	// §DEADGAUGE（2026-09-23 傍晚批收尾）：告警规则 settlement_diff（量规 settlement_diff_count，
 	// p1「交割单对账出现差异」）自 09-15 注册以来全仓无赋值点 = 永不触发的死规则（audit N-1 同族，
@@ -238,10 +348,14 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 	// 注意取「三类条数之和」而非 diff 是否为 nil：sync_fills 补记后会清空 missing，但多余/不符
 	// 仍需按当日实况告警，故必须在落库/日志口径之后统计。
 	metrics.SetGauge("settlement_diff_count", int64(len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch)))
+	// §P2-E：走到这里才是"当日已验证"——defer 那一次 SetGauge("settlement_state", …) 会据此写 1，
+	// 与上面 settlement_diff_count=0（对完了、确实没有差异）从此**可分辨**：
+	// 旧形态下"没比对成"与"比对无差异"都是 diff_count=0，运维面看不出任何区别（本条缺陷的原文）。
+	outcome = SettleOutcomeVerified
 	log.Printf("[settle] %s 三方对账完成: 缺失=%d 多余=%d 不符=%d 费用差=%.2f 现金差=%.2f (mode=%s)",
 		day, len(diff.MissingInLocal), len(diff.ExtraInLocal), len(diff.Mismatch),
 		diff.FeeDiff, diff.CashDiff, mode)
-	return diff, nil
+	return diff, outcome, nil
 }
 
 // settleFactKey 三方对账的「物理事实键」（§P0-1b，2026-09-15）：代码|方向|数量|价格(分)。
@@ -297,6 +411,14 @@ var settleRetryInterval = 10 * time.Minute
 // 留痕（"第 N 次"），让连续失败在运维日志里可数、可判定是偶发抖动还是系统性故障。
 // English: §D4 — the day is marked done only on success; failures retry under a throttle window and
 // are counted in the ops log, instead of being burned by a pre-set idempotency stamp.
+//
+// §P2-E（2026-10-06 修复批 波 5）把"成功"的口径再收一刀：本函数原先只把 `err != nil` 当失败，
+// 而 SettleDay 的两条跳过腿返回 (nil, nil)，于是**跳过被记成成功**——lastSettleDay 照写、失败
+// streak 照归零、当日不再重投。现在只有 `outcome.Verified()` 才记账；两条跳过腿各按自己的节奏
+// 重试（未连接＝每个 retry 窗口真试一次；执行器不支持＝当日短路一次并只留一次痕），
+// 且都不推进 lastSettleDay、都不发 recover。
+// English: §P2-E — a skipped reconciliation no longer counts as success; only Verified may
+// advance lastSettleDay or reset the failure streak.
 func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabled bool) {
 	if !enabled || c.store == nil || !c.Enabled() {
 		return
@@ -320,11 +442,19 @@ func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabl
 	if !lastAttempt.IsZero() && time.Since(lastAttempt) < settleRetryInterval {
 		return
 	}
+	// §P2-E 结构性不适用的**调用前**短路：执行器不支持交割单（Noop/桩）是配置期就定下的事实，
+	// 重投改变不了结论，却会把 settlement_state 反复覆写、并按十分钟节奏往日志里刷一条
+	// "永远好不了"的留痕（§CAL-GATE 刷屏判例：持续性状态走必推/高频留痕＝淹没真信号）。
+	// 短路条件刻意要求"原因也是 NoFetcher"：若当日稍后执行器换成支持的（或网关从不连变已连），
+	// 下面那一步会把戳覆写成新原因，本判据随即失效，当日仍有机会真对一次账。
+	if c.settleSkipShortCircuits(day) {
+		return
+	}
 	// 尝试戳先置位（持锁写）：这是防死循环的唯一护栏——成功与否都不回滚它，只回滚"当日已完成"标记。
 	c.mu.Lock()
 	c.lastSettleAttemptAt = time.Now()
 	c.mu.Unlock()
-	diff, err := c.SettleDay(day, mode)
+	diff, outcome, err := c.SettleDay(day, mode)
 	if err != nil {
 		// §D4：失败**不置** lastSettleDay（旧实现是在调用前置位，等于把失败当成功记账），
 		// 下一个 retry 窗口会再试一次；同时保留 §H1 的指标计数与 opslog 留痕，并把当日
@@ -349,10 +479,33 @@ func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabl
 			c.userID, day, attempt, settleRetryInterval, err)
 		return
 	}
-	// 成功（含 SettleDay 返回 (nil,nil) 的"网关不支持/未连接，静默跳过"分支）：
-	// 当日记账完成，后续窗口不再重投。
+	// §P2-E（2026-10-06 修复批 波 5）：**跳过不再是成功**。
+	// 旧此处的注释写着"成功（含 SettleDay 返回 (nil,nil) 的'网关不支持/未连接，静默跳过'分支）"，
+	// 于是两条"根本没比对成"的腿一起把 lastSettleDay 写掉、把失败 streak 归零——三方对账这道
+	// 日终安全网在最需要它的那一天表现为"今天对过了"，且事后日志里只有一句 log.Printf。
+	if !outcome.Verified() {
+		c.recordSettleSkip(day, outcome)
+		// 刻意**不**归零 settle_fail_streak：归零＝向告警面宣布"对账已恢复"，而本轮什么都没比对；
+		// 上一轮失败的告警必须一直挂到真验证成功那轮（告警只 fire 不 recover 是缺陷，反过来
+		// 用"没验证"去发 recover 是同族缺陷的另一半）。
+		if outcome == SettleOutcomeSkippedNotConnected {
+			log.Printf("[settle] %s 本轮未验证（网关未连接），当日不记为已对账，%s 后重试", day, settleRetryInterval)
+			opslog.Logf("quant", "交割单三方对账跳过 账户=%s 日=%s 原因=%s（§P2-E：网关未连接＝本轮未验证，当日不记为已对账，按 %s 窗口自动重试）",
+				c.userID, day, outcome.String(), settleRetryInterval)
+		} else {
+			// 未知态（零值）也走这一支留痕：SettleDay 新增返回位却忘了置位时，账面必须显示"没结论"，
+			// 绝不让零值顺带落进 verified 分支——本仓 §P1-B/§D4 同族教训：兜底分支的默认值就是判据方向。
+			log.Printf("[settle] %s 本轮未验证（执行器不支持/无结论 %s），当日不记为已对账", day, outcome.String())
+			opslog.Logf("quant", "交割单三方对账不适用 账户=%s 日=%s 原因=%s（§P2-E：结构性不支持，当日不记为已对账，同一原因当日只留痕一次）",
+				c.userID, day, outcome.String())
+		}
+		return
+	}
+	// 真验证成功：当日记账完成，后续窗口不再重投。
 	c.mu.Lock()
 	c.lastSettleDay = day
+	c.lastSettleSkipDay = "" // §P2-E：清掉跳过戳，旧原因不得把后续轮次挡在短路判据外
+	c.lastSettleSkipOutcome = SettleOutcomeUnknown
 	if c.settleFailDay == day && c.settleFailCount > 0 {
 		opslog.Logf("quant", "交割单三方对账恢复 账户=%s 日=%s（此前当日失败 %d 次后成功）", c.userID, day, c.settleFailCount)
 		c.settleFailCount = 0
@@ -366,4 +519,34 @@ func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabl
 			fmt.Sprintf("%s: 缺失%d 多余%d 不符%d 费用差%.2f（详见 settlement_diff）",
 				day, len(diff.MissingInLocal), len(diff.ExtraInLocal), len(diff.Mismatch), diff.FeeDiff))
 	}
+}
+
+// settleSkipShortCircuits §P2-E：本轮是否应当因为"同一日同一结构性原因已经试过了"而不必再试。
+// 判据是**三个**条件，不是一个日期：① 当日戳 ② 当日原因＝NoFetcher ③ **此刻执行器仍然不支持**。
+// 第三条必须每次重新核实到来源，不能只读那个派生出来的戳：executor 会在交易时段被
+// ApplyPendingConfig 换装（controller.go §FIX#7 的原子引用就是为它立的），"从 Noop 换成支持
+// 交割单的真实执行器"是一条现网会走到的恢复路径——只比日期就把这一天剩下的窗口全挡掉，
+// 等于用一份旧读数否决了新事实（本仓「派生状态不是来源」同族教训，10-05 那次是档位 from=env 撒谎）。
+// 未连接腿不在短路之列（它是瞬时状态，试通了就当场验证，短路只会把恢复推迟到次日）。
+// English: §P2-E — short-circuit only when the day stamp, the structural reason, AND the *current*
+// executor's capability all agree; a live executor swap must lift it immediately.
+func (c *Controller) settleSkipShortCircuits(day string) bool {
+	if _, ok := c.execRef().(SettlementFetcher); ok {
+		return false // 现在就支持：旧戳一律不作短路（换了执行器就得给它当场验证的机会）
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastSettleSkipDay == day && c.lastSettleSkipOutcome == SettleOutcomeSkippedNoFetcher
+}
+
+// recordSettleSkip §P2-E：记下"这一日因哪个原因被跳过"（当日只留一次痕的判据就靠它）。
+// 无论哪个原因都覆写戳与原因：后到的新原因必须取代旧原因，否则先发生的 NoFetcher 会把
+// 之后真能跑的窗口一起挡掉（短路判据一旦只看日期就变成单向记忆）。
+// English: §P2-E — stamps the day with the skip reason so repeat structural skips log once,
+// while any newer outcome (including a real verification) overwrites the stamp.
+func (c *Controller) recordSettleSkip(day string, outcome SettleOutcome) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastSettleSkipDay = day
+	c.lastSettleSkipOutcome = outcome
 }

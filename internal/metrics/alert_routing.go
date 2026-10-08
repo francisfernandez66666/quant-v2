@@ -147,6 +147,12 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			// —— 日汇总：事件型腿已即时推送，指标面只补「量化留痕」，避免双份 ——
 			"settlement_diff": RouteDaily, // 交割单差异（engine/settlement 的 notify 腿已在推）
 			"settle_failed":   RouteDaily, // 三方对账失败（同上：10 分钟节流重试自带播报）
+			// §P2-E（2026-10-06 修复批 波 5）：对账"本轮未验证"（网关未连接 / 执行器不支持）是
+			// **持续性状态**而非瞬时疼——未连接一整天时每 30s 评估都成立，走必推就是每 30 分钟
+			// 一条刷满推送；日汇总保证 owner 每天至少看到一次"今天到现在为止没比对成"。
+			// 与 trading_calendar_not_loaded / library_stale_days 同一条纪律（§CAL-GATE 判例）。
+			// 缺这条路由条目会掉进 DefaultRoute=RoutePush，即"注册了但走错道"——门禁按等值锁盯它。
+			"settlement_not_verified": RouteDaily,
 			// §CAL-GATE（2026-09-25 D-25-1）：日历未加载属"持续性状态"而非瞬时疼——
 			// 若 API 长期不可用（缺 key），恒触发下推通道会变成每 30 分钟一条的刷屏；
 			// 日汇总既保证 owner 每天看到一次"现在处于 fail-open"，又不淹没其它必推。

@@ -37,7 +37,7 @@ func TestSettleSyncFillsKeepsRealSignalID(t *testing.T) {
 		},
 	}}}
 	ctrl := NewController(src, db, "u_st", cfg, nil)
-	if _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills); err != nil {
+	if _, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills); err != nil {
 		t.Fatalf("settle: %v", err)
 	}
 	fills, err := db.ListFillsByDay("u_st", "2026-09-08")

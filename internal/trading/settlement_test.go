@@ -66,7 +66,7 @@ func TestSettleThreeWay(t *testing.T) {
 		},
 	}}}
 	ctrl := NewController(src, db, "u_st", cfg, nil)
-	diff, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
+	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestSettleDayFormatNormalized(t *testing.T) {
 	}}}
 	ctrl := NewController(src, db, "u_st", cfg, nil)
 	// 关键：入参为 data.TradingDayDate 的无杠格式
-	diff, err := ctrl.SettleDay("20260908", SettleModeReportOnly)
+	diff, _, err := ctrl.SettleDay("20260908", SettleModeReportOnly)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestSettleSyncFills(t *testing.T) {
 		},
 	}}}
 	ctrl := NewController(src, db, "u_st", cfg, nil)
-	diff, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
+	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestSettleSyncFills(t *testing.T) {
 		t.Fatalf("初始应 1 条缺失: %v", diff.MissingInLocal)
 	}
 	// 二次对账：补记后应为 0 差异
-	diff2, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
+	diff2, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
 	if err != nil {
 		t.Fatalf("settle2: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestSettleUnsupported(t *testing.T) {
 	cfg := configDefault()
 	cfg.Enabled = true
 	ctrl := NewController(guardServer(), db, "u_st", cfg, nil) // guardStub 未实现 SettlementFetcher
-	diff, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
+	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil || diff != nil {
 		t.Fatalf("不支持交割单应 (nil,nil), got diff=%+v err=%v", diff, err)
 	}
@@ -185,7 +185,7 @@ func TestSettleDisconnected(t *testing.T) {
 	cfg.Enabled = true
 	src := &settleExecutor{src: &mockSettle{resp: &SettlementResponse{Date: "2026-09-08", Connected: false}}}
 	ctrl := NewController(src, db, "u_st", cfg, nil)
-	diff, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
+	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil || diff != nil {
 		t.Fatalf("未连接应 (nil,nil), got diff=%+v err=%v", diff, err)
 	}
@@ -225,7 +225,7 @@ func TestSettleFactKeyNoCollapse(t *testing.T) {
 		},
 	}}}
 	ctrl := NewController(src, db, "u_st", cfg, nil)
-	diff, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
+	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestSettleSyncFillsNoDoubleCount(t *testing.T) {
 		},
 	}}}
 	ctrl := NewController(src, db, "u_st", cfg, nil)
-	if _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills); err != nil {
+	if _, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills); err != nil {
 		t.Fatalf("settle: %v", err)
 	}
 	// 模拟网关 outbox 对同一笔成交的重放（同 order_id + 同时间到达回报通道）

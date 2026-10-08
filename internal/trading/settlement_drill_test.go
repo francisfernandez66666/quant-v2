@@ -64,7 +64,7 @@ func TestSettleSyncFillsDrillRealGateway(t *testing.T) {
 	ctrl := NewController(cli, db, "u_drill", cfg, nil)
 
 	// ② sync_fills 补记：缺两笔 → 补记后流水 2 条；卖出无对应持仓（本地空仓卖单）只入流水不动持仓
-	diff, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
+	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
 	if err != nil {
 		t.Fatalf("settle#1: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestSettleSyncFillsDrillRealGateway(t *testing.T) {
 
 	// ③ 幂等重放：再 settle 两次（模拟 outbox 重推/运维手滑），持仓与流水不得二次累加
 	for i := 0; i < 2; i++ {
-		d2, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
+		d2, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
 		if err != nil {
 			t.Fatalf("settle#%d: %v", i+2, err)
 		}
@@ -127,7 +127,7 @@ func TestSettleSyncFillsDrillPhantomOnlyFlagged(t *testing.T) {
 		SignalID: "SIG-GHOST", UserID: "u_drill"}); err != nil {
 		t.Fatalf("seed fill: %v", err)
 	}
-	diff, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
+	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
 	}

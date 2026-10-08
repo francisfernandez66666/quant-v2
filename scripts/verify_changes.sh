@@ -1300,7 +1300,11 @@ go test -count=1 ./internal/trading/ -run 'TestSettleFailure' 2>&1 | grep -E '^(
 # 注意过滤注释行：§D4 注释里引用了「旧实现把 c.lastSettleDay = day 放在调用之前」的缺陷原文，
 # 不过滤会命中注释行造成顺序假红（负向/顺序锁须滤注释——本仓既有教训）。
 SET_ASSIGN=$(grep -n 'c.lastSettleDay = day' internal/trading/settlement.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
-SET_CALL=$(grep -n 'diff, err := c.SettleDay(' internal/trading/settlement.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+SET_CALL=$(grep -n ':= c.SettleDay(' internal/trading/settlement.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+# 锚写法说明（2026-10-06 波 5 §P2-E 同步）：这一句原本点着「diff, err :=」两个返回值，而本波给
+# SettleDay 加了第三个返回值（SettleOutcome），行首整串一变、锚就找不到＝顺序锁报「找不到置位/调用行」
+# 直接假红（-collect 首轮实录）。顺序锁要钉的是**赋值与调用的先后**，不是调用的返回值清单，
+# 所以锚只取「:= c.SettleDay(」这一段——将来再加返回值也不会误伤，而把置位挪回调用之前照样判红。
 [ -n "$SET_ASSIGN" ] && [ -n "$SET_CALL" ] || { echo "--- FAIL: 找不到结算置位/调用行（§D4 静态锁失效）"; exit 1; }
 [ "$SET_ASSIGN" -gt "$SET_CALL" ] || { echo "--- FAIL: lastSettleDay 又回到 SettleDay 之前置位（失败当日永久不再对账，§D4 复活）"; exit 1; }
 grep -q 'settleRetryInterval' internal/trading/settlement.go || { echo "--- FAIL: 失败重试节流窗丢失（§D4 会打爆网关或不再重试）"; exit 1; }
@@ -1791,8 +1795,23 @@ echo "==> 69 §DEADGAUGE 每条告警规则必须有真实赋值点（死规则�
 #         settlement.go 用三方对账三类差异条数之和、scoring_loop 用 llm.Client.KeysInCooldown）；
 #       ② 通用守卫：从规则表反解出每条 Metric 名，逐条要求非测试代码里存在 SetGauge("<名>") 赋值点，
 #          以后新增"只有规则没有数据源"直接判红；③ 负锁锁住两个已知假绿形态。
-# 行为锁：三条出口 + 键名一致性 + 窗口换算。
-go test -count=1 ./internal/trading/ -run 'TestSettleDayFeedsDiffGauge|TestSettleDaySkipBranchesWriteZero' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 行为锁：三条出口 + 键名一致性 + 窗口换算。用例名单点定义（go test 与下面的点名自检共用同一个串；
+# 抄成两本的结局就是刚踩过的形态——改了跑测那一本、点名那一本继续认旧名字，锁自己空转还报 ok）。
+RUN69='TestSettleDayFeedsDiffGauge|TestSettleDaySkipBranchesZeroDiffButNotVerified'
+go test -count=1 ./internal/trading/ -run "$RUN69" 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 行为腿不许空转（2026-10-08 波 5 实锤）：上面这条 `-run` 原来点的是 TestSettleDaySkipBranchesWriteZero，
+# 而本批把这个用例改名成 …ZeroDiffButNotVerified（口径改判见用例头注释）。名字一失效，
+# `go test -run` 打印的是 `ok … [no tests to run]`，而本段只 grep `^(--- FAIL|FAIL|ok)` ⇒ 恒绿，
+# 于是"跳过腿量规"这条行为锁在门禁里**一行代码都没跑过**，却以 ok 的形态存在了一整轮。
+# 修法不是把 grep 改严（真红同样会被 `[no tests to run]` 的 ok 掩护），而是逐个要求 `-run` 里的
+# 用例名在测试文件里真以 `func Test<名>(` 存在——改名、删用例、把用例搬去没登记的文件都当场现形。
+DEAD69_N=$(printf '%s\n' "$RUN69" | tr '|' '\n' | grep -c . || true)
+[ "${DEAD69_N:-0}" = "2" ] || { echo "--- FAIL: §DEADGAUGE 行为腿清单派生为空/过短（读到 ${DEAD69_N}，应为 2＝点名自检自己失明了）"; exit 1; }
+DEAD69=""
+for _t in $(printf '%s\n' "$RUN69" | tr '|' '\n'); do
+	grep -qE "^func ${_t}\(" internal/trading/settlement_gauge_test.go || DEAD69="${DEAD69} ${_t}"
+done
+[ -z "$DEAD69" ] || { echo "--- FAIL: §DEADGAUGE 行为腿点名失效（用例不存在，go test 会打 ok [no tests to run] 骗过本段）：${DEAD69}"; exit 1; }
 go test -count=1 ./internal/metrics/ -run 'TestOrderFailRate|TestRunAlertEvaluationRefreshesDerivedGauge' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/llm/ -run 'TestKeysInCooldown' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/engine/ -run 'TestRefreshFeedsLLMCooldownGauge|TestRefreshStalenessGauges' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
@@ -1834,7 +1853,7 @@ fi
 if ! grep -q 'SetGauge("settlement_diff_count", 0)' internal/trading/settlement.go; then
 	echo "--- FAIL: §DEADGAUGE 对账跳过分支不再清零（残值冒充当日差异）"; exit 1
 fi
-echo "ok - §DEADGAUGE 专项守卫通过（行为锁 4 组 + 静态锁 4 道 + 通用死规则守卫 1 条 + 负锁 3 道）"
+echo "ok - §DEADGAUGE 专项守卫通过（行为锁 4 组 + 行为腿点名自检 2 道 + 静态锁 4 道 + 通用死规则守卫 1 条 + 负锁 3 道）"
 
 echo "==> 70 §LIVEBACKUP-DEPLOY 备份链随部署下发 + 第 16 探针（P0-B 收编）..."
 # 现象：§P0-B 把广州夜间快照从「trading.db + 9 个 JSON」扩到「+ live.db + accounts/」，但
@@ -2712,7 +2731,7 @@ gu=$(grep -c 'fillSignalMatchSQL(' internal/store/real_positions.go || true)
 # 1 处定义 + 2 处调用（SumFilledQty / ResetFailedRealOrder）：少一处调用就等于两条资金查询又各写一份 SQL。
 [ "$gu" = "3" ] || { echo "--- FAIL: 配对谓词调用点 ≠ 2（计数=$gu 含定义行；两处钱查询必须同源）"; exit 1; }
 grep -q 'eligibleWhere := `signal_id=? AND user_id=? AND (status=' internal/store/real_positions.go \
-	|| { echo "--- FAIL: "已撤+零成交可重放"的谓词不再现算配对 SQL（退回编译期常量即漏掉反向腿）"; exit 1; }
+	|| { echo "--- FAIL: 「已撤+零成交可重放」的谓词不再现算配对 SQL（退回编译期常量即漏掉反向腿）"; exit 1; }
 if grep -qE 'const eligibleWhere' internal/store/real_positions.go; then
 	echo "--- FAIL: eligibleWhere 又变回 const（常量拼不进运行期双向谓词）"; exit 1; fi
 grep -q 'if strings.TrimSpace(signalID) == "" {' internal/store/real_positions.go \
@@ -7475,5 +7494,804 @@ echo "ok - §111 派生面（段数=$SEC_N 跨段 helper=$HELP_N check=OK）"
 
 rm -rf "$W111"
 echo "ok - §111 全段通过：收集模式静态锁 + 十条镜像行为腿（L1 内含 H1/H2/H3 三枚等值锁，另含 SKIP/SILENT 归属；L2 默认模式语义不变；L4 全绿闭合；L5 SKIP-without-FAIL；L6 收尾歧义；L7 工作树漂移；L8 EMPTY；L9 搬运顺序；L10 日志编码容错；L11 按字符截断）+ 五枚退回旧实现的反证（R1/R2/R3/R4/I2）+ P2-K 注入点等值锁与黑洞代理腿 I1 + G2 gofmt 对照 + G3 自证清单 + 派生面正锁，累计判定点 ${CNT111}"
+echo ""
+echo "==> 112 §P2-E/§P2-F/§P2-G 对账三态 + 降级来源标记 + 文件桥写盘顺序（2026-10-06 修复批 波 5）：跨语言线格式等值、四处同源、窗口顺序锁、派生测试资产与十枚镜像反证（枚数由源码派生）..."
+
+# 本段守波 5 三条缺陷的**全部落点**（10-05 全量评价 P2-E/F/G → 10-06 按 docs/FIX_PLAN_20261006.md 落码）。
+#
+#  ① §P2-F 降级链把断源日写成平盘。这条链四层，缺任一层「修好了」就是假话：
+#       sidecar 线格式（cmd/pydata/server.py：缺测列输出 _NA、行尾带 source 列）
+#         → Go 取数三态（internal/data：MissingCell/FOk/SOk，空串与 NA 都不再被静默折成 0）
+#         → 落库形状（cmd/dataload/baostock.go：numOrNil 写 NULL、daily.source 盖章、
+#            tradestatus 只在**明确读到 0** 时当停牌）
+#         → 读侧判据（internal/store/daily_source.go 单源片段，统计点共用）。
+#     所以本段一半的锁是**等值/同源**锁而不是「字符串在不在」锁：跨语言两端（Python 的
+#     _STOCK_FIELDS+_SOURCE_COL 对 Go 夹具的 klineHeader；Python 的 _NA 对 Go 的 MissingCell）
+#     各写一份时改一侧必红——这正是 09-25 那批「同一个判据在两个读数点各写一遍公式」的教训
+#     （§0927AUDIT-D1）。两处取向按推荐项落码并在此留痕（owner 未逐条裁决，事后可否决）：
+#       · `source IS NULL` 判为**世代未知**而非降级：宁可继续参与统计，也不把本列落地前的
+#         历史数据凭空删掉（行为腿 B4/S2 锁住这条取向）；
+#       · ST 态未知的降级行**照写** ±10% 停板价：缺护栏比偏松更糟（S3 的反向读数锁住）。
+#     `DailySourceDegradedOnly` 目前只有测试消费者（生产三个统计点全用 NotDegraded）。留着不是
+#     死码：写侧标记口径必须由读侧单点定义，删掉它，下一个「数降级行数」的统计点就会自己
+#     写一遍 LIKE（那是本枚要防的原形）。
+#  ② §P2-E 交割日静默跳过记「已对账」。旧形态是「网关未连接／执行器不支持」两条跳过腿都返回
+#     nil,error=nil 并推进 lastSettleDay，再写 settlement_diff_count=0 冒充「对完无差异」
+#     ⇒ 三方对账这条防线可以在网关断线的一整天里全程没跑，而看板与告警全部显示正常。
+#     现改为三态 SettleOutcome + 唯一映射点 gaugeValue()（0 未跑/1 已验证/2 未连接/3 不支持）
+#     + 规则 settlement_not_verified（ge 2 → p2）+ RouteDaily，§DEADGAUGE 三件套同形：接线锁
+#     （defer 那一句恰好一处）、键名 const 别名 ban 负锁（别名＝通用守卫失明，09-29 14:0x 判红实录）、
+#     赋值点等值。owner 裁决点「未连接算失败还是不适用」按**推荐项**落码＝算失败向（不推进
+#     lastSettleDay、走 §D4 十分钟节流重试）；要改口径只需动 gaugeValue 与两条行为腿，判据面
+#     （ge 2）不用改。
+#  ③ §P2-G 文件桥先翻状态后写文件。旧顺序下「写 bridge_cmd.json 失败」是**确定性丢单**：行已经
+#     是 inflight、桥永远看不到这张单、要等 §M16 收割线（默认 1800s）判废且不回 pending，
+#     现网只留一行 log.exception。现翻转成 peek（只读）→ 写盘成功 → mark_inflight，写失败保持
+#     pending 并把三个计数接进 /admin/status。这里最有价值的一枚是**窗口顺序锁**：三句代码的
+#     相对顺序就是这条缺陷的本体，而「三句都在文件里」的字符串锁对顺序颠倒完全无感（回到旧
+#     顺序照样三句齐全＝恒绿假锁）。
+#
+#  ④ 反证为什么一枚只破一个点、且每枚先要求「变异落地数恰好 1」：
+#     D1/D2 两枚都撞在同一个 pytest 用例（K4）上，所以把那两条断言的文案分别打上 K4a/K4b；
+#     D4/D5/D6 三枚都撞在同一个 Go 用例（TestDegradedRowLandsWithSourceAndNulls）上，所以
+#     daily 根数那一句从 `!= 3` 拆成 `<3 ⇒ K1a` 与 `>3 ⇒ K1c` 两条单一成因断言、is_st 那条
+#     单独成句。合并写法的后果是一串反证只证出「有东西红了」，看不出「这枚破坏被哪把尺子拦住」
+#     ——段内首红即退 ⇒ 每枚破坏必须本枚独有。
+#     两条本批真踩过的 harness 坑写在这里防复发：
+#       · 镜像反证首轮把 Go raw-string 的反引号一起吃掉 ⇒ 包编译失败、`grep '^--- FAIL:'` 自然
+#         零命中，于是报「这枚破坏没有让任何东西变红」。那是 harness 坏了，不是锁没牙 ⇒
+#         下面每条反证先断言**变异后能编译**，[build failed]/cannot find package 一律按 §112 红；
+#       · `"1"` 这个字面量在 server.py 里**合法存在**（交易日历腿的 is_open），所以「降级腿不许
+#         硬编码 1」只能按函数窗口扫（K4 的实现形状）。全文件级同款负锁会在健康代码上恒红，
+#         本段刻意不写那种形状；baostock.go 的 `"pct_chg": r.F(` 同理（指数腿是合法的），
+#         所以负锁走的是 bsLoadStockTables 的**窗口**而不是整份文件。
+CNT112=0
+REPO112="$PWD"
+SIDE112=cmd/pydata/server.py
+PYT112=cmd/pydata/tests/test_degraded_source.py
+BSD112=cmd/dataload/baostock.go
+GLD112=cmd/dataload/degraded_source_load_test.go
+DSC112=internal/store/daily_source.go
+STO112=internal/store/store.go
+TUS112=internal/data/tushare.go
+SET112=internal/trading/settlement.go
+ALR112=internal/metrics/alerter.go
+ARO112=internal/metrics/alert_routing.go
+RBK112=cmd/research/risk_backfill.go
+GWI112=qmt_gateway/gateway.py
+GWS112=qmt_gateway/store.py
+GWT112=qmt_gateway/tests/test_file_bridge_push_order.py
+W112="$(mktemp -d /tmp/p2wave5-XXXXXX 2>/dev/null || true)"
+[ -n "$W112" ] || { echo "--- FAIL: §112 建不出镜像目录，跨语言等值腿与全部镜像反证无法跑（宁可红，不许跳）"; exit 1; }
+
+eq112() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT112=$((CNT112 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §112 整串等值锁 ${CNT112}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+}
+neg112() { # $1=文件 $2=整串 $3=说明 → 彻底没有
+	CNT112=$((CNT112 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §112 负锁 ${CNT112}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+}
+min112() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
+	CNT112=$((CNT112 + 1))
+	[ "${2:-0}" -ge "$3" ] || { echo "--- FAIL: §112 派生正锁 ${CNT112}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+}
+code_hits112() { # $1=文件 $2=整串 → 非注释行命中数（Go 的 //、Python 的 #、docstring 续行的 * 都算注释）
+	local n
+	n=$({ grep -nF -- "$2" "$1" 2>/dev/null || true; } | { grep -Ev '^[0-9]+:[[:space:]]*(//|#|\*|"""|--)' || true; } | wc -l | tr -d ' ')
+	printf '%s' "${n:-0}"
+}
+win112() { # $1=文件 $2=起点整串 $3=终点正则 → 打印窗口正文（含起点行，不含终点行）
+	awk -v s="$2" -v e="$3" '
+		!f && index($0, s) { f = 1; print; next }
+		f && $0 ~ e { exit }
+		f { print }
+	' "$1" 2>/dev/null || true
+}
+winc112() { # Go 窗口内**代码行**命中行数：$1=文件 $2=起点 $3=终点 $4=整串（needle 必传，漏传会数到整窗＝恒红）
+	local n
+	n=$(win112 "$1" "$2" "$3" | { grep -Ev '^[[:space:]]*(//|\*|/\*)' || true; } | grep -cF -- "$4" 2>/dev/null || true)
+	printf '%s' "${n:-0}"
+}
+winn112() { # Go 窗口内首个命中的行序（0＝没有），同样剔整行注释：顺序锁用
+	local n
+	n=$(win112 "$1" "$2" "$3" | { grep -Ev '^[[:space:]]*(//|\*|/\*)' || true; } | grep -nF -- "$4" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	printf '%s' "${n:-0}"
+}
+# pyseg112/pyc112/pyn112：Python 侧的窗口一律走 **ast 定位的函数段**并整块剥 docstring。
+# 本批真踩过的形态：dispatch_pending_peek 的 docstring 里写着「与 dispatch_pending 的唯一区别」
+# 「写文件失败等于丢单」这类说明——按文本行切窗口时，负锁会把说明文字当成代码命中（恒红），
+# 顺序锁也可能先撞上 docstring 里那一句（取到错误行序＝判据错位）。ast 取段才是运行时真形。
+pyseg112() { # $1=py 文件 $2=函数/方法名 → 打印该函数源码段；同名函数不恰好 1 个 ⇒ 退出码 3
+	python3 - "$1" "$2" <<'PYSEG112'
+import ast, sys
+path, name = sys.argv[1], sys.argv[2]
+src = open(path, encoding="utf-8").read()
+lines = src.splitlines()
+hits = [n for n in ast.walk(ast.parse(src))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name]
+if len(hits) != 1:
+    sys.stderr.write("SEGMENTS=%d\n" % len(hits))
+    sys.exit(3)
+node = hits[0]
+end = node.end_lineno or len(lines)
+seg = lines[node.lineno - 1:end]
+b = node.body
+if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+    seg = lines[node.lineno - 1:b[0].lineno - 1] + lines[b[0].end_lineno:end]
+sys.stdout.write("\n".join(seg) + "\n")
+PYSEG112
+}
+pyc112() { # 函数段内命中行数：$1=文件 $2=函数名 $3=整串；段取不到 ⇒ 打印 SEG_ERR（让等值锁与负锁一起红，不静默放行）
+	local seg n
+	seg=$(pyseg112 "$1" "$2" 2>/dev/null) || { printf 'SEG_ERR'; return; }
+	n=$(printf '%s\n' "$seg" | grep -cF -- "$3" 2>/dev/null || true)
+	printf '%s' "${n:-0}"
+}
+pyn112() { # 函数段内首个命中序号（0＝没有，-1＝函数段派生失败）：窗口顺序锁用
+	local seg n
+	seg=$(pyseg112 "$1" "$2" 2>/dev/null) || { printf -- '-1'; return; }
+	n=$(printf '%s\n' "$seg" | grep -nF -- "$3" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	printf '%s' "${n:-0}"
+}
+PREV112=0
+# 十组的读数先归零（set -u 下未赋值直接参与算术会中止脚本，报错位置离成因很远；
+# 而「某一组一个判定点都没有」这件事由收尾那枚分组在位锁正面拦住，不靠 unbound 侥幸）。
+G1_N=0; G2_N=0; G3_N=0; G4_N=0; G5_N=0; G6_N=0; G7_N=0; G8_N=0; G9_N=0; G10_N=0
+SNAP112() { # $1=组号 → 记下本组新增判定点数（收尾 ok 行里的「① 组 N 道」由这里派生，不是手写清单）
+	# 手写分组数字的下场和「INFO 恰 N 行」那族一样：加一道锁就过期，而过期的读数就是把覆盖面报错的源头。
+	printf -v "G$1_N" '%s' "$((CNT112 - PREV112))"
+	PREV112=$CNT112
+}
+kv112() { # $1=键 $2=多行 KEY=VALUE → 取值
+	printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1
+}
+scan_go112() { # $1=整串 → cmd/internal 里非测试、非注释、排除工具缓存的命中行
+	# BSD grep 在 `--` 之后**不做选项置换**：放在路径后的 --include 被当成文件名（实测只报一行
+	# "No such file or directory" 就静默不过滤），锁面于是扫到 .py/.pyc/说明注释——负锁恒红、
+	# 派生面虚高。选项一律提到操作数之前，并额外按 .go: 兜一层。
+	{ grep -rnF --include='*.go' -- "$1" cmd internal 2>/dev/null || true; } \
+		| { grep '\.go:' || true; } \
+		| { grep -v '/\.qoder/' || true; } \
+		| { grep -v '_test\.go:' || true; } \
+		| { grep -Ev ':[0-9]+:[[:space:]]*(//|\*)' || true; }
+}
+
+# ── ① sidecar 线格式常量族（写侧与读侧共用的字面量，各恰一处）──
+eq112 "$SIDE112" '_NA = "NA"' 1 '缺测标记的定义恰好一处（两条降级腿与 Go 侧都认这一个值）'
+eq112 "$SIDE112" '_SOURCE_COL = "source"' 1 '来源列列名定义恰好一处（与 Go 侧 daily.source 列名同一个字符串）'
+eq112 "$SIDE112" '_SRC_BAOSTOCK = "baostock"' 1 '主链路标记'
+eq112 "$SIDE112" '_SRC_SINA = "sina_degraded"' 1 '新浪降级腿标记（后缀 degraded 是读侧 LIKE 的前提）'
+eq112 "$SIDE112" '_SRC_EASTMONEY = "eastmoney_degraded"' 1 '东财降级腿标记'
+eq112 "$SIDE112" 'def _fields_with_source():' 1 '表头单实现（两处出口 r_kline/_stock_kline 共用；写第二份就是第二本账）'
+eq112 "$SIDE112" '_STOCK_FIELDS.split(",") + [_SOURCE_COL]' 1 '表头=股票字段+source 的唯一构造式'
+CNT112=$((CNT112 + 1))
+LEG_N=$(grep -cE '^def _ak_[A-Za-z0-9_]*_daily\(' "$SIDE112" 2>/dev/null || true)
+min112 '兜底日线腿由源码派生（形如 _ak_xxx_daily），新增第三条腿自动进锁；派生 <2 即红＝正则失效或全被改名' "$LEG_N" 2
+# K4 射程与门禁派生射程的**集合等值**（不比字符串写法：有人把正则换成非捕获组、或在中间加个空格，
+# 整串等值锁会假红；真正要防的是「两条腿各自扫出不同的函数集合」——那才是 K4 与门禁分家）。
+LEG_NAMES112=$(grep -oE '^def _ak_[A-Za-z0-9_]*_daily\(' "$SIDE112" 2>/dev/null | sed -E 's/^def //; s/\($//' | LC_ALL=C sort -u | paste -sd, -) || true
+K4_SET=$(python3 - "$SIDE112" "$PYT112" <<'PY112K4'
+import ast, re, sys
+side, tpath = sys.argv[1], sys.argv[2]
+pat = None
+for n in ast.parse(open(tpath, encoding="utf-8").read()).body:
+    if isinstance(n, ast.Assign) and len(n.targets) == 1 and getattr(n.targets[0], "id", "") == "_DEGRADED_DAILY_DEF":
+        v = n.value
+        if isinstance(v, ast.Call) and v.args and isinstance(v.args[0], ast.Constant):
+            pat = v.args[0].value
+if not isinstance(pat, str) or not pat:
+    print("K4=NO_PATTERN")
+    sys.exit(0)
+txt = open(side, encoding="utf-8").read()
+try:
+    ms = re.findall(pat, txt, re.M)
+except re.error as exc:
+    print("K4=BAD_REGEX %s" % exc)
+    sys.exit(0)
+names = set()
+for m in ms:
+    if not isinstance(m, str):
+        m = m[0] if m else ""
+    m = re.sub(r'^def ', '', m)
+    names.add(m.rstrip("( "))
+print("K4=%s" % ",".join(sorted(n for n in names if n)))
+PY112K4
+) || { echo "--- FAIL: §112 K4 射程派生腿执行失败（$PYT112 语法坏了？）"; exit 1; }
+K4_NAMES=$(printf '%s' "$K4_SET" | sed -n 's/^K4=//p')
+CNT112=$((CNT112 + 1))
+case "$K4_SET" in
+K4=NO_PATTERN|K4=BAD_REGEX*|K4=)
+	echo "--- FAIL: §112 K4 射程派生锁 ${CNT112}（从 $PYT112 派生不到可用的 _DEGRADED_DAILY_DEF 正则：${K4_SET}）"
+	echo "    派生不到时那条腿就退化成「扫 0 个函数也算通过」的空转锁——负锁最常见的失效形态是恒真，不是报错"
+	exit 1
+	;;
+esac
+CNT112=$((CNT112 + 1))
+if [ "$K4_NAMES" != "$LEG_NAMES112" ]; then
+	echo "--- FAIL: §112 K4 射程集合等值锁 ${CNT112}（门禁派生的兜底腿与 pytest K4 扫到的不是同一批）"
+	printf '    门禁=%s\n' "$LEG_NAMES112"
+	printf '    K4  =%s\n' "${K4_NAMES}"
+	echo "    分家的后果：新增第三条兜底腿时门禁数到了、K4 没扫到 ⇒ 那条腿的 tradestatus 硬编码/来源标记写错都不会红"
+	exit 1
+fi
+echo "ok - §112 K4 射程与门禁派生同集合：${LEG_NAMES112}"
+eq112 "$PYT112" 'def _src_constant_values(src):' 1 'K4b 的来源常量表单实现（把「用了哪个标记」换算成「那个标记到底是不是降级名」）'
+
+SNAP112 1
+# ── ② 跨语言等值（Python 侧构造 vs Go 侧夹具/常量；一份改动必须两边一起红）──
+XLANG=$(python3 - "$SIDE112" "$GLD112" "$TUS112" <<'PY112X'
+import ast, re, sys
+side, gotest, tus = sys.argv[1], sys.argv[2], sys.argv[3]
+vals = {}
+for n in ast.parse(open(side, encoding="utf-8").read()).body:
+    if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+        try:
+            vals[n.targets[0].id] = ast.literal_eval(n.value)
+        except Exception:
+            pass
+hdr = ""
+if isinstance(vals.get("_STOCK_FIELDS"), str) and isinstance(vals.get("_SOURCE_COL"), str):
+    hdr = vals["_STOCK_FIELDS"] + "," + vals["_SOURCE_COL"]
+go = open(gotest, encoding="utf-8").read()
+gols = go.splitlines()
+go_hdr = ""
+for i, ln in enumerate(gols):
+    if ln.startswith("const klineHeader ="):
+        j = i
+        # 逐行吃到「上一行行尾是 +」为止：Go 里这个 const 是两段字符串拼接，只取第一段会拿到半截表头
+        while gols[j].split("//")[0].rstrip().endswith("+") and j + 1 < len(gols):
+            j += 1
+        text = "\n".join(x.split("//")[0] for x in gols[i:j + 1])
+        go_hdr = "".join(re.findall(r'"([^"]*)"', text))
+        break
+mc = re.search(r'const MissingCell = "([^"]*)"', open(tus, encoding="utf-8").read())
+print("SIDE_HDR=%s" % hdr)
+print("GO_HDR=%s" % go_hdr)
+print("SIDE_NA=%s" % (vals.get("_NA") if isinstance(vals.get("_NA"), str) else ""))
+print("GO_MISSING=%s" % (mc.group(1) if mc else ""))
+PY112X
+) || { echo "--- FAIL: §112 跨语言读数提取失败（server.py/夹具语法坏了，等值锁无从进行）"; exit 1; }
+SIDE_HDR=$(kv112 SIDE_HDR "$XLANG")
+GO_HDR=$(kv112 GO_HDR "$XLANG")
+SIDE_NA=$(kv112 SIDE_NA "$XLANG")
+GO_MISSING=$(kv112 GO_MISSING "$XLANG")
+# 先钉「两个读数都非空」：空串等于空串是恒真，那正是等值锁最阴的失效形态（提取腿坏了 ⇒ 锁装作在拦东西）。
+CNT112=$((CNT112 + 1))
+if [ -z "$SIDE_HDR" ] || [ -z "$GO_HDR" ]; then
+	echo "--- FAIL: §112 提取正锁 ${CNT112}（表头读数有一侧为空：sidecar=${#SIDE_HDR} 字符、Go 夹具=${#GO_HDR} 字符）"
+	echo "     ast/正则没抓到东西＝构造式或 const 写法变了。此时若直接比「相等」会两边都空而恒真，锁就退化成恒绿"
+	exit 1
+fi
+CNT112=$((CNT112 + 1))
+if [ "$SIDE_HDR" != "$GO_HDR" ]; then
+	echo "--- FAIL: §112 跨语言表头等值锁 ${CNT112}（sidecar 的 _STOCK_FIELDS+_SOURCE_COL 与 Go 夹具 klineHeader 不再是同一份列序）"
+	printf '    sidecar=%s\n' "$SIDE_HDR"
+	printf '    go夹具  =%s\n' "$GO_HDR"
+	echo "    列序或列名任一侧改动都会让另一侧的夹具静默错位：Go 按表头名取值，缺列就按主链路盖章（dailySourceOf 的缺省分支）"
+	exit 1
+fi
+CNT112=$((CNT112 + 1))
+HDR_COLS=$(printf '%s' "$SIDE_HDR" | tr ',' '\n' | grep -c . || true)
+min112 '表头列数（含 source）应 ≥19：列数掉下来说明有人在某一侧删了列而另一侧的夹具跟着改了' "$HDR_COLS" 19
+CNT112=$((CNT112 + 1))
+if [ -z "$SIDE_NA" ] || [ -z "$GO_MISSING" ] || [ "$SIDE_NA" != "$GO_MISSING" ]; then
+	echo "--- FAIL: §112 跨语言缺测标记等值锁 ${CNT112}（sidecar 输出 _NA=${SIDE_NA}，Go 认 MissingCell=${GO_MISSING}）"
+	echo "    两个字符串不一致时 FOk() 永远认不到缺测标记 ⇒ 降级列又回到「静默折成 0」的旧形态，而且全线绿"
+	exit 1
+fi
+echo "ok - §112 跨语言读数（表头 ${HDR_COLS} 列、缺测标记 ${SIDE_NA}）"
+
+SNAP112 2
+# ── ③ Go 取数三态 + 落库姿势 ──
+eq112 "$TUS112" 'const MissingCell = "NA"' 1 'Go 侧缺测标记定义恰好一处'
+CNT112=$((CNT112 + 1))
+MC_HITS=$(code_hits112 "$TUS112" 'MissingCell)')
+min112 'FOk/SOk/F 三个取值口都认这个标记（应 ≥3；只认一处＝另一条腿继续折 0）' "$MC_HITS" 3
+eq112 "$BSD112" 'if ts, ok := r.FOk("tradestatus"); ok && int(ts) == 0 {' 1 '停牌判据＝「明确读到 0」，缺测不因它跳行'
+neg112 "$BSD112" 'if int(r.F("tradestatus")) == 0 {' '旧写法（缺测也当停牌）不许复活；只在说明注释里提它，所以这条走整串 grep 的是**代码行**形状（带 if 前缀），注释里没有这一串'
+CNT112=$((CNT112 + 1))
+BSWIN_S='func bsLoadStockTables'
+BSWIN_E='^func '
+HARD_F=$(winc112 "$BSD112" "$BSWIN_S" "$BSWIN_E" '"pct_chg": r.F(')
+if [ "${HARD_F:-0}" != "0" ]; then
+	echo "--- FAIL: §112 窗口负锁 ${CNT112}（bsLoadStockTables 里又出现「pct_chg 走 F()」=${HARD_F}）"
+	echo "    F() 把缺测折成 0，而 0 在涨跌语义里是「平盘」这一真实读数——这正是 10-05 审计 P2-F 的落点。"
+	echo "    锁只扫这个函数窗口：同文件 bsLoadIndex 里的 r.F(\"pctchg\") 是**合法**的（指数腿没有降级链）"
+	exit 1
+fi
+CNT112=$((CNT112 + 1))
+HALT_OLD=$(winc112 "$BSD112" "$BSWIN_S" "$BSWIN_E" 'int(r.F("tradestatus"))')
+if [ "${HALT_OLD:-0}" != "0" ]; then
+	echo "--- FAIL: §112 窗口负锁 ${CNT112}（装载窗口里又出现 tradestatus 的 F() 读法=${HALT_OLD}＝缺测被当 0＝降级日整行不落库）"; exit 1
+fi
+eq112 "$BSD112" '"source": dailySourceOf(r),' 1 '来源列的唯一写点（每行必盖章，读侧才有筛除依据）'
+eq112 "$BSD112" 'func numOrNil(v float64, ok bool) any {' 1 '「两值取值 → 可空落库」的唯一姿势实现'
+CNT112=$((CNT112 + 1))
+NIL_CALLS=$(code_hits112 "$BSD112" 'numOrNil(')
+CNT112=$((CNT112 + 1))
+if [ "${NIL_CALLS:-0}" -lt 8 ]; then
+	echo "--- FAIL: §112 派生正锁 ${CNT112}（numOrNil 命中（含定义）应 ≥8＝定义 1 + 涨跌两列 2 + 估值四列 4 + is_st 1，实得 ${NIL_CALLS}）"
+	echo "    少一处＝有一列回到了「缺测落成 0」的老路；多出来的是新列，按同口径要求走 numOrNil"
+	exit 1
+fi
+echo "ok - §112 numOrNil 命中（定义+调用）= ${NIL_CALLS}"
+
+SNAP112 3
+# ── ④ 读侧判据单源 + schema 三处同源 ──
+eq112 "$DSC112" 'const DailySourceLikeDegraded = "%degraded%"' 1 'LIKE 模式常量恰好一处（后缀匹配：第三条兜底腿沿用 *_degraded 即自动进锁）'
+CNT112=$((CNT112 + 1))
+RAW_LIKE=$(scan_go112 "LIKE '%degraded%'" | wc -l | tr -d ' ')
+if [ "${RAW_LIKE:-0}" != "0" ]; then
+	echo "--- FAIL: §112 判据单源负锁 ${CNT112}（cmd/internal 的非测试代码里出现手写的降级 LIKE=${RAW_LIKE} 处）"
+	printf '%s\n' "$(scan_go112 "LIKE '%degraded%'" | head -5)"
+	echo "    每多一个统计点自己写一遍 LIKE，就多一本账：改一侧漏一侧（§0927AUDIT-D1 同族）。判据只能来自 daily_source.go"
+	exit 1
+fi
+CNT112=$((CNT112 + 1))
+READER_N=$(scan_go112 'DailySourceNotDegraded(' | wc -l | tr -d ' ')
+min112 '共用判据的生产调用点（板块聚合两处 + 广度回填一处）应 ≥3；读成 0＝有人把片段又内联回去了' "$READER_N" 3
+echo "   观测（判据生产调用点）: $(scan_go112 'DailySourceNotDegraded(' | cut -d: -f1 | LC_ALL=C sort -u | tr '\n' ' ')"
+eq112 "$STO112" 'ALTER TABLE daily ADD COLUMN source TEXT' 1 '已建库的增量迁移恰好一处（新库靠 CREATE 带上，旧库靠这条补列）'
+eq112 "$STO112" '{"daily", "source", ' 1 '迁移表名与列名逐字为 daily/source（写成 daily_basic 就永远补不到这一列）'
+eq112 "$STO112" 'source TEXT,' 1 '建表语句里的 source 列恰好一处'
+eq112 "$STO112" '"amount", "source"}' 1 'TableColumns(daily) 尾列为 source 且只此一处'
+CNT112=$((CNT112 + 1))
+IDX_SRC=$(winc112 "$STO112" 'case "index_daily":' '^[[:space:]]*case "adj_factor":' 'source')
+if [ "${IDX_SRC:-0}" != "0" ]; then
+	echo "--- FAIL: §112 窗口负锁 ${CNT112}（index_daily 的列清单里出现 source=${IDX_SRC}）"
+	echo "    指数链路没有 akshare 兜底腿，多一个不存在的列会被 validateInsertSurface 判红；与 daily 共用 case 是这次改动最容易被顺手做错的地方"; exit 1
+fi
+CNT112=$((CNT112 + 1))
+LIE_SYMS=$( { grep -rnF --include='*.go' -e 'IsDegDailyRow' -e 'DegradedDailyRowSQL' cmd internal 2>/dev/null || true; } | { grep -v '/\.qoder/' || true; } | { grep '\.go:' || true; } | wc -l | tr -d ' ')
+if [ "${LIE_SYMS:-0}" != "0" ]; then
+	echo "--- FAIL: §112 注释诚实锁 ${CNT112}（Go 里又引用了不存在的判据符号 IsDegDailyRow/DegradedDailyRowSQL=${LIE_SYMS}）"
+	echo "    本批真的踩过：注释指向早已改名掉的符号，下一个人照着注释去找判据，找到的是空气（判据单源＝daily_source.go）"
+	exit 1
+fi
+
+SNAP112 4
+# ── ⑤ §P2-E 三态：接线锁 + 别名 ban 负锁 + 赋值点等值（§DEADGAUGE 三件套同形）──
+eq112 "$SET112" 'defer func() { metrics.SetGauge("settlement_state", outcome.gaugeValue()) }()' 1 '量规接线恰好一处（defer 单点写，函数内任何 return 分支都覆盖；定义没接＝量规恒 0、规则恒不触发）'
+CNT112=$((CNT112 + 1))
+GAUGE_WRITES=$(code_hits112 "$SET112" 'SetGauge("settlement_state"')
+if [ "${GAUGE_WRITES:-0}" != "1" ]; then
+	echo "--- FAIL: §112 赋值点等值锁 ${CNT112}（settlement.go 非注释行里写这一量规应恰好 1 处＝defer 那一句，实得 ${GAUGE_WRITES}）"
+	echo "    第二处赋值＝三态之外又有人直接改读数，gaugeValue() 这个唯一映射点当场失去意义"; exit 1
+fi
+CNT112=$((CNT112 + 1))
+ALIAS_N=$( { grep -rnE --include='*.go' 'settle(State)?Gauge' cmd internal 2>/dev/null || true; } | { grep -v '/\.qoder/' || true; } | { grep '\.go:' || true; } | { grep -v '_test\.go:' || true; } | { grep -Ev ':[0-9]+:[[:space:]]*(//|\*)' || true; } | wc -l | tr -d ' ')
+if [ "${ALIAS_N:-0}" != "0" ]; then
+	echo "--- FAIL: §112 键名别名 ban 负锁 ${CNT112}（非测试代码里出现量规键名 const 别名=${ALIAS_N}）"
+	echo "    别名会让「SetGauge(\"<键名>\" 赋值点数」这类通用守卫失明（09-29 14:0x 判红实录）；测试文件里允许自定别名，生产不许"
+	exit 1
+fi
+eq112 "$ALR112" '{Name: "settlement_not_verified", Metric: "settlement_state", Op: "ge", Threshold: 2' 1 '规则注册恰好一条，且阈值 2 与 gaugeValue 的两个「未验证」读数同源'
+eq112 "$ARO112" '"settlement_not_verified": RouteDaily' 1 '路由条目恰好一条（缺路由条目会走默认路由被漏掉，长假全程破线会刷满）'
+eq112 "$SET112" 'SettleOutcomeUnknown SettleOutcome = iota' 1 '零值占位＝「没有结论」，任何判据都必须显式覆盖它'
+eq112 "$SET112" 'func (o SettleOutcome) Verified() bool { return o == SettleOutcomeVerified }' 1 'Verified 必须是「等已验证」而非「不等跳过」（写成不等就把 Unknown 当已验证）'
+neg112 "$SET112" 'return o != SettleOutcome' '上一条的旧形状不许复活'
+CNT112=$((CNT112 + 1))
+GV_CASES=$(winc112 "$SET112" 'func (o SettleOutcome) gaugeValue() int64 {' '^[[:space:]]*}$' 'return ')
+GV_TWO=$(winc112 "$SET112" 'func (o SettleOutcome) gaugeValue() int64 {' '^[[:space:]]*}$' 'return 2')
+GV_THREE=$(winc112 "$SET112" 'func (o SettleOutcome) gaugeValue() int64 {' '^[[:space:]]*}$' 'return 3')
+if [ "${GV_CASES:-0}" != "4" ] || [ "${GV_TWO:-0}" != "1" ] || [ "${GV_THREE:-0}" != "1" ]; then
+	echo "--- FAIL: §112 映射表等值锁 ${CNT112}（gaugeValue 应恰有 4 个 return、return 2 与 return 3 各恰 1：实得 分支=${GV_CASES} 二=${GV_TWO} 三=${GV_THREE}）"
+	echo "    少一个态＝有一态落进 default 的 0（与「本轮没跑」同形＝静默失效）；改 2/3 任一个都要同时改规则的 Threshold，这是同一本账"
+	exit 1
+fi
+
+SNAP112 5
+# ── ⑤b 三态与「差异读数归零」这本账（§DEADGAUGE 负锁③ 的同源要求，本批差点被当成分叉修掉）
+#     §P2-E 落码时我把跳过分支里的 `SetGauge("settlement_diff_count", 0)` 一并删了，理由是
+#     「不许用 0 冒充对完无差异」——方向错了：冒充成功的是 **lastSettleDay/「已对账」账面**，
+#     不是差异读数。删掉归零反而把 §DEADGAUGE（09-23 傍晚批）负锁③ 守了两周的东西拆了：
+#     跳过日"什么都不写"＝上一轮真比对出的差异条数留在量规上，规则 settlement_diff（gt 0、p1）
+#     会在断线日拿昨天的差异天天刷屏。现按**两键合起来才可分辨**落：state 说"验没验"、
+#     diff 说"此刻可数的差异"。整轮 -collect 首轮就是靠 §69 那条老负锁把这次拆锁抓出来的。
+CNT112=$((CNT112 + 1))
+DIFF_ZERO=$(code_hits112 "$SET112" 'SetGauge("settlement_diff_count", 0)')
+if [ "${DIFF_ZERO:-0}" != "2" ]; then
+	echo "--- FAIL: §112 跳过腿差异归零等值锁 ${CNT112}（settlement.go 的跳过分支应恰有两处把差异读数归零＝「不支持」与「未连接」各一处，实得 ${DIFF_ZERO}）"
+	echo "    少一处＝那条跳过腿保留 §DEADGAUGE 的残值形态（断线日拿昨天的差异刷 p1）；多一处＝有人在真比对路径上又归零一次，把真差异抹平"
+	exit 1
+fi
+CNT112=$((CNT112 + 1))
+DIFF_REAL=$(code_hits112 "$SET112" 'SetGauge("settlement_diff_count", int64(')
+if [ "${DIFF_REAL:-0}" != "1" ]; then
+	echo "--- FAIL: §112 真比对差异写点等值锁 ${CNT112}（真比对那处差异读数写入应恰 1 处，实得 ${DIFF_REAL}）"
+	echo "    与上一条合起来才是本波的口径：差异键只有一个真值写点 + 两条跳过腿归零，state 键只有一个 defer 写点"
+	exit 1
+fi
+
+# ── ⑥ §P2-G：窗口顺序锁（缺陷本体就是顺序）+ 失败可见化接线 ──
+PUSH_FN='_file_bridge_push_pending'
+REC_FN='_record_file_bridge_push_failure'
+PEEK_FN='dispatch_pending_peek'
+L_PEEK=$(pyn112 "$GWI112" "$PUSH_FN" 'dispatch_pending_peek(limit=50)')
+L_WRITE=$(pyn112 "$GWI112" "$PUSH_FN" 'os.replace(tmp, cmd_path)')
+L_MARK=$(pyn112 "$GWI112" "$PUSH_FN" 'dispatch_mark_inflight([')
+CNT112=$((CNT112 + 1))
+# 先验三个行号都是**正整数**：pyseg 取不到函数段时 pyn112 返回 -1、pyc 类返回 SEG_ERR，
+# `[ SEG_ERR -le 0 ]` 在 set -e 下只是让这一条 || 短路为假（整个条件于是可能全假＝顺序锁装绿）。
+case "${L_PEEK}${L_WRITE}${L_MARK}" in
+*[^0-9]*) NUM_OK112=0 ;;
+*) NUM_OK112=1 ;;
+esac
+if [ "$NUM_OK112" != "1" ] || [ "$L_PEEK" -le 0 ] || [ "$L_WRITE" -le 0 ] || [ "$L_MARK" -le 0 ] || [ "$L_PEEK" -ge "$L_WRITE" ] || [ "$L_WRITE" -ge "$L_MARK" ]; then
+	echo "--- FAIL: §112 顺序锁 ${CNT112}（_file_bridge_push_pending 函数段内必须 peek < 写盘 < mark_inflight：实得 peek=${L_PEEK} 写盘=${L_WRITE} mark=${L_MARK}、三个行号须全为正整数（NUM=${NUM_OK112}）；-1/SEG_ERR＝函数段派生失败，等同判据没落地）"
+	echo "    倒序＝回到「先翻 inflight 再写文件」：写盘失败时行已经是 inflight、桥看不到，等收割线判废且不回 pending ⇒ 确定性丢单"
+	exit 1
+fi
+CNT112=$((CNT112 + 1))
+OLD_TAKE=$(pyc112 "$GWI112" "$PUSH_FN" 'self.store.dispatch_pending(limit=50)')
+if [ "${OLD_TAKE:-0}" != "0" ]; then
+	echo "--- FAIL: §112 窗口负锁 ${CNT112}（file 桥里又用回取单即翻状态的 dispatch_pending=${OLD_TAKE}）"; exit 1
+fi
+eq112 "$GWI112" 'pending = self.store.dispatch_pending_peek(limit=50)' 1 'peek 取单点恰好一处'
+eq112 "$GWI112" 'moved = self.store.dispatch_mark_inflight([p.get("seq") for p in pending])' 1 'mark 落单点恰好一处（按 seq 翻，且只翻仍 pending 的行）'
+eq112 "$GWI112" 'self._record_file_bridge_push_failure(len(pending), cmd_path)' 1 '写失败计数接线恰好一处（旧形态只 log.exception，看不出是抖动还是系统性坏了）'
+eq112 "$GWI112" 'def _record_file_bridge_push_failure(self, held, cmd_path):' 1 '计数实现单点'
+CNT112=$((CNT112 + 1))
+RAISES=$(pyc112 "$GWI112" "$REC_FN" 'raise ')
+if [ "${RAISES:-0}" != "0" ]; then
+	echo "--- FAIL: §112 窗口负锁 ${CNT112}（计数函数里出现 raise=${RAISES}）"
+	echo "    这个函数跑在 0.5s 轮询线程里，抛出去等于把命令下发线程打死，比「这一轮没写成」严重得多"; exit 1
+fi
+CNT112=$((CNT112 + 1))
+RESET_OK=$(pyc112 "$GWI112" "$PUSH_FN" 'self._file_bridge_push_fail_streak = 0')
+if [ "${RESET_OK:-0}" != "1" ]; then
+	echo "--- FAIL: §112 成功腿归零等值锁 ${CNT112}（push 窗口内 streak 归零应恰 1 处，实得 ${RESET_OK}）"
+	echo "    不归零则观察位永远 >0（分不清「此刻还在坏」与「历史上坏过」）；归两处＝有人在别的分支提前抹平计数"; exit 1
+fi
+eq112 "$GWI112" 'payload["file_bridge_push"] = {' 1 '/admin/status 观察位恰好一个键（读侧只有一个消费者）'
+eq112 "$GWI112" '"fail_total": int(self._file_bridge_push_fail_total),' 1 '累计计数透出'
+eq112 "$GWI112" '"fail_streak": int(self._file_bridge_push_fail_streak),' 1 '连续计数透出'
+eq112 "$GWI112" '"fail_held": int(self._file_bridge_push_fail_held),' 1 '被按住的单数透出'
+eq112 "$GWS112" 'def dispatch_pending_peek(self, limit=50):' 1 '两段式第一腿（只读）定义恰好一处'
+eq112 "$GWS112" 'def dispatch_mark_inflight(self, seqs):' 1 '两段式第二腿定义恰好一处'
+eq112 "$GWS112" 'def dispatch_pending(self, limit=50):' 1 '旧函数仍在位（HTTP /dispatch/pending 是「取走即交付」，那条通道用得对；本波只把它从 file 桥换掉，没删原处能力）'
+CNT112=$((CNT112 + 1))
+PEEK_WRITE=$(pyc112 "$GWS112" "$PEEK_FN" 'UPDATE dispatch')
+if [ "${PEEK_WRITE:-0}" != "0" ]; then
+	echo "--- FAIL: §112 只读性负锁 ${CNT112}（peek 函数里出现 UPDATE dispatch=${PEEK_WRITE}）—— peek 一写状态，「写失败保持 pending」这条修法当场作废"; exit 1
+fi
+eq112 "$GWS112" "WHERE seq = ? AND status = 'pending'" 1 'mark 只翻仍 pending 的行（并发下不把别人的 inflight 拖回来）'
+
+SNAP112 6
+# ── ⑦ 测试资产派生登记（分母来自源码，不写死清单）──
+W5GO=$(grep -rl --include='*_test.go' '修复批 波 5' cmd internal 2>/dev/null | { grep '\.go$' || true; } | { grep -v '/\.qoder/' || true; } | LC_ALL=C sort || true)
+W5GO_N=$(printf '%s\n' "$W5GO" | grep -c . || true)
+min112 '波 5 标记的 Go 测试文件数（派生面；新增测试文件请连同本段的登记说明一起改）' "$W5GO_N" 7
+W5PY=$( { grep -rl --include='test_*.py' '修复批 波 5' cmd/pydata qmt_gateway 2>/dev/null || true; } | { grep '\.py$' || true; } | { grep -v __pycache__ || true; } | { grep -v '/\.qoder/' || true; } | LC_ALL=C sort || true)
+W5PY_N=$(printf '%s\n' "$W5PY" | grep -c . || true)
+min112 '波 5 标记的 pytest 文件数（线格式 K 系列 + 文件桥顺序 L 系列）' "$W5PY_N" 2
+PAIRS112="$W112/w5_pairs.tsv"
+: > "$PAIRS112"
+for _f in $W5GO; do
+	for _n in $(grep -oE '^func Test[A-Za-z0-9_]+' "$_f" 2>/dev/null | sed 's/^func //' || true); do
+		printf '%s\t%s\n' "$(dirname "$_f")" "$_n" >> "$PAIRS112"
+	done
+done
+CNT112=$((CNT112 + 1))
+NAME_N=$(grep -c . "$PAIRS112" || true)
+min112 '派生出的波 5 Go 用例总数（少一条＝有测试被删/改名/标记丢失；改名必须打断 Test 前缀才算真删）' "$NAME_N" 21
+# 包数单独派生（不抬判定点，只是收尾读数的口径）：一个包可以有多个测试文件，
+# 把「文件数」当「包数」印出来就是本段自己的「合称读数≠拆分数」形态，宁可分开数。
+W5PKG_N=$(cut -f1 "$PAIRS112" 2>/dev/null | LC_ALL=C sort -u | grep -c . || true)
+echo "   观测（波 5 资产）: go 文件 ${W5GO_N} 个/包 ${W5PKG_N} 个/用例 ${NAME_N} 条，pytest 文件 ${W5PY_N} 个"
+
+SNAP112 7
+# ── ⑧ 行为腿：逐包按派生用例名跑，PASS 数与派生数等值（防空转正＝-run 落空也报 ok）──
+go_leg112() { # $1=包目录 $2=用例名竖线串 $3=应跑条数
+	local out pass fail
+	CNT112=$((CNT112 + 1))
+	out=$(go test -count=1 -v -run "^($2)$" "./$1/" 2>&1 || true)
+	if printf '%s\n' "$out" | grep -qE '\[build failed\]|build failed|cannot find package|^# '; then
+		echo "--- FAIL: §112 Go 行为腿 ${CNT112}（包 $1 编译不过，下面的 PASS/FAIL 计数全部无意义）："
+		printf '%s\n' "$out" | head -20
+		exit 1
+	fi
+	fail=$(printf '%s\n' "$out" | grep -c '^--- FAIL' || true)
+	pass=$(printf '%s\n' "$out" | grep -c '^--- PASS' || true)
+	if [ "${fail:-0}" != "0" ]; then
+		echo "--- FAIL: §112 Go 行为腿判红（$1 的波 5 用例，红 ${fail} 条），明细："
+		printf '%s\n' "$out" | grep -E '^--- FAIL|^ +.*_test\.go:[0-9]+:' | head -20
+		exit 1
+	fi
+	if [ "${pass:-0}" != "$3" ]; then
+		echo "--- FAIL: §112 Go 行为腿计数等值 ${CNT112}（$1 应跑 $3 条、实跑 ${pass:-0} 条）"
+		echo "    少了就是有用例没被 -run 命中（改名/标记丢失/被 build tag 挡掉）——「ok 但一条没跑」是本仓最常见的假绿形态"
+		exit 1
+	fi
+	echo "ok - §112 Go 行为腿 $1：${pass}/$3 条通过"
+}
+for _p in $(cut -f1 "$PAIRS112" | LC_ALL=C sort -u); do
+	_names=$(awk -F'\t' -v d="$_p" '$1==d{print $2}' "$PAIRS112" | LC_ALL=C sort | paste -sd'|' -)
+	_want=$(awk -F'\t' -v d="$_p" '$1==d' "$PAIRS112" | grep -c . || true)
+	go_leg112 "$_p" "$_names" "$_want"
+done
+
+py_leg112() { # $1=pytest 文件 $2=最少必须真跑过的条数（依赖无关的静态腿；防空转正）
+	local target="$1" floor="$2" out want passed skipped decided ran
+	CNT112=$((CNT112 + 1))
+	want=$(grep -c '^    def test_' "$target" 2>/dev/null || true)
+	[ "${want:-0}" -ge 1 ] || { echo "--- FAIL: §112 pytest 资产派生 ${CNT112}（$target 一条 test 方法都没派生到＝文件写法变了）"; exit 1; }
+	out=$(py_tests "$target" 2>&1 || true)
+	if printf '%s\n' "$out" | grep -qE 'FAILED|ERROR|ModuleNotFoundError|No such file or directory'; then
+		echo "--- FAIL: §112 pytest 行为腿判红（${target}，派生 ${want} 条），尾部如下："
+		printf '%s\n' "$out" | tail -25
+		exit 1
+	fi
+	# 汇总行计数走 python 而不是 sed：pytest 在小文件上的汇总行**就是顶格**（`7 passed in 0.52s`），
+	# 第一版写成 `.*[ ,]\([0-9]*\) passed`——行首那一种永远匹配不到，于是明明 7 条全过的腿被当成
+	# 「unittest 退回形态」再解析一遍、读出 Ran=0 判红（本批 §112 首跑实录）。锚要按运行时真形定。
+	PYSUM=$(printf '%s\n' "$out" | python3 -c 'import re,sys
+t = sys.stdin.read()
+m = re.search(r"(\d+) passed", t)
+sk = re.search(r"(\d+) skipped", t)
+print("P=%s" % (m.group(1) if m else ""))
+print("S=%s" % (sk.group(1) if sk else ""))' 2>/dev/null || true)
+	passed=$(printf '%s' "$PYSUM" | sed -n 's/^P=//p' | head -1)
+	skipped=$(printf '%s' "$PYSUM" | sed -n 's/^S=//p' | head -1)
+	if [ -z "$passed" ]; then
+		# unittest 退回形态（本机没装 pytest 时 py_tests 走这条）：Ran N tests + 逐行 ... ok / ... skipped
+		ran=$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9][0-9]*\) tests.*/\1/p' | head -1)
+		passed=$(printf '%s\n' "$out" | grep -c '\.\.\. ok' || true)
+		skipped=$(printf '%s\n' "$out" | grep -c '\.\.\. skipped' || true)
+		[ "${ran:-0}" = "$want" ] || { echo "--- FAIL: §112 pytest 行为腿（unittest 形态）${CNT112}：$target 应跑 $want 条、实跑 Ran=${ran:-0}"; exit 1; }
+	fi
+	decided=$(( ${passed:-0} + ${skipped:-0} ))
+	if [ "$decided" != "$want" ]; then
+		echo "--- FAIL: §112 pytest 行为腿计数等值 ${CNT112}（$target 派生 $want 条、有结论 ${decided} 条＝通过 ${passed} + 跳过 ${skipped:-0}）"
+		echo "    对不上＝有方法没被收集（改名/语法坏/类没继承 TestCase），收集不全的绿不算绿"
+		exit 1
+	fi
+	if [ "${passed:-0}" -lt "$floor" ]; then
+		echo "--- FAIL: §112 pytest 防空转正锁 ${CNT112}（$target 真跑过的条数 ${passed:-0} < 应 ≥${floor}）"
+		echo "    K4/K4b 那类**只读源码**的静态腿不依赖第三方库，被整文件 skip＝本批真踩过的形状（dirname 少剥一层 ⇒ 全部 skip、门禁一条不红）"
+		exit 1
+	fi
+	echo "ok - §112 pytest 行为腿 ${target}：${passed} 通过 / ${skipped:-0} 跳过（派生 ${want}）"
+}
+for _f in $W5PY; do
+	case "$_f" in
+	"$PYT112") py_leg112 "$_f" 1 ;;   # 线格式腿需要 pandas/baostock，只有 K4 静态腿必须真跑过
+	*) py_leg112 "$_f" 5 ;;            # 文件桥顺序腿零第三方依赖，五条全须真跑
+	esac
+done
+
+SNAP112 8
+# ── ⑨ 镜像反证 D1–D10（/tmp 副本树，源文件零改动；先自证镜像基线全绿）──
+# 反证枚数由源码派生，不写死在收尾文案里：本批加 D9、再加 D10 的两次都证明「枚数」是最容易和
+# 散文走散的量（收尾写九枚、实际跑十枚，而每枚自己还是红的——没人看得出现在数到第几枚）。
+# 尺子取 `^dys112 D` 的调用行数（函数定义行 `dys112() {` 不在射程），并钉一枚 ≥10 的正锁：
+# 派生为空/过短＝模式失效（改名、换写法），整组反证会退化成恒绿的空循环。
+DYS112_N=$(grep -c '^dys112 D' scripts/verify_changes.sh || true)
+CNT112=$((CNT112 + 1))
+[ "${DYS112_N:-0}" -ge 10 ] \
+	|| { echo "--- FAIL: §112 反证枚数派生异常（读到 ${DYS112_N}，应 ≥10＝点名模式失效或反证被删，收尾分组读数不可信）"; exit 1; }
+MIR112="$W112/mirror"
+mkdir -p "$MIR112"
+cp go.mod go.sum "$MIR112"/ 2>/dev/null || { echo "--- FAIL: §112 镜像缺 go.mod/go.sum，反证跑不了"; exit 1; }
+cp -R cmd internal tools "$MIR112"/ 2>/dev/null || { echo "--- FAIL: §112 镜像复制 cmd/internal/tools 失败"; exit 1; }
+cp -R qmt_gateway "$MIR112"/ 2>/dev/null || { echo "--- FAIL: §112 镜像复制 qmt_gateway 失败"; exit 1; }
+find "$MIR112" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+CNT112=$((CNT112 + 1))
+if ! ( cd "$MIR112" && go build ./... ) > "$W112/build.log" 2>&1; then
+	echo "--- FAIL: §112 镜像基线编译不过（反证的每一次红都必须来自被破坏的那一句，不能来自镜像自己坏了），尾部："
+	tail -20 "$W112/build.log"
+	exit 1
+fi
+BASE112_RUN='TestDailySourcePartitionOnRealTable|TestDegradedRowLandsWithSourceAndNulls|TestSettleDaySkipBranchesZeroDiffButNotVerified'
+# 点名自检（与 §69 那枚同源教训，2026-10-08 波 5 实锤）：`go test -run '^(不存在的名)$'` 打的是
+# `ok … [no tests to run]`，而下面那条判据按 `^ok` 数三包等值 3 —— 用例一改名，"镜像基线自证"就
+# 退化成"三个空转的包"，反证的前置（镜像可信、红只来自被破坏那一句）从此是假的。
+NBASE112=$(printf '%s\n' "$BASE112_RUN" | tr '|' '\n' | grep -c . || true)
+CNT112=$((CNT112 + 1))
+[ "${NBASE112:-0}" = "3" ] || { echo "--- FAIL: §112 基线用例清单派生为空/过短（读到 ${NBASE112}，应为 3＝点名自检自己失明）"; exit 1; }
+BASE_MISS112=""
+for _t in $(printf '%s\n' "$BASE112_RUN" | tr '|' '\n'); do
+	find internal cmd -name '*_test.go' -exec grep -lE "^func ${_t}\(" {} + 2>/dev/null | grep -q . || BASE_MISS112="${BASE_MISS112} ${_t}"
+done
+CNT112=$((CNT112 + 1))
+[ -z "$BASE_MISS112" ] || { echo "--- FAIL: §112 基线用例点名失效（用例在仓内不存在，go test 会打 ok [no tests to run] 骗过基线自证）：${BASE_MISS112}"; exit 1; }
+BASE112=$( cd "$MIR112" && go test -count=1 -v -run "^(${BASE112_RUN})\$" ./internal/store/ ./cmd/dataload/ ./internal/trading/ 2>&1 || true )
+CNT112=$((CNT112 + 1))
+BASE_OK=$(printf '%s\n' "$BASE112" | grep -c '^ok' || true)
+if [ "${BASE_OK:-0}" != "3" ] || printf '%s\n' "$BASE112" | grep -qE '^--- FAIL|^FAIL'; then
+	echo "--- FAIL: §112 镜像基线不绿（三包应各有 1 条 ok，实得 ${BASE_OK:-0}）——镜像不可信时，任何「破坏后变红」都不构成证据"
+	printf '%s\n' "$BASE112" | tail -20
+	exit 1
+fi
+BASEPY112=$( cd "$MIR112" && py_tests "$PYT112" 2>&1 || true; printf 'SEP\n'; py_tests "$GWT112" 2>&1 || true )
+if printf '%s\n' "$BASEPY112" | grep -qE 'FAILED|ERROR'; then
+	echo "--- FAIL: §112 镜像 pytest 基线判红（两条 pytest 腿在干净镜像里就该绿），尾部："; printf '%s\n' "$BASEPY112" | tail -20; exit 1
+fi
+echo "ok - §112 镜像基线自证（三 Go 包 ok + 两条 pytest 无红）"
+
+dys112() { # $1=编号 $2=镜像相对文件 $3=python 变异片段（必须打印落地次数） $4=go|py $5=目标 $6=-run 名(py 传 -) $7=红文案必含串
+	local id="$1" rel="$2" mut="$3" kind="$4" target="$5" rx="$6" token="$7" applied out
+	CNT112=$((CNT112 + 1))
+	cp -f "$REPO112/$rel" "$MIR112/$rel" || { echo "--- FAIL: §112 反证 ${id} 无法从主仓复位镜像文件 $rel"; exit 1; }
+	applied=$( cd "$MIR112" && python3 -c "$mut" 2>&1 | tail -1 ) || { echo "--- FAIL: §112 反证 ${id} 变异脚本执行失败：${applied}"; exit 1; }
+	if [ "$applied" != "1" ]; then
+		echo "--- FAIL: §112 反证 ${id} 变异落地数=${applied}，期望恰好 1（0＝镜像里没找到目标串，这枚反证等于没跑；>1＝命中面比预期宽，红了也不知道红在哪）"
+		exit 1
+	fi
+	if [ "$kind" = go ]; then
+		out=$( cd "$MIR112" && go test -count=1 -v -run "^(${rx})\$" "$target" 2>&1 || true )
+		if printf '%s\n' "$out" | grep -qE '\[build failed\]|build failed|cannot find package|^# '; then
+			echo "--- FAIL: §112 反证 ${id} 变异后包编译不过（harness 坏了不是锁有牙），读数如下："
+			printf '%s\n' "$out" | head -20
+			exit 1
+		fi
+	else
+		out=$( cd "$MIR112" && py_tests "$target" 2>&1 || true )
+		if printf '%s\n' "$out" | grep -qE 'ModuleNotFoundError|ImportError|SyntaxError'; then
+			echo "--- FAIL: §112 反证 ${id} 变异后 import/语法坏（harness 坏了），尾部："; printf '%s\n' "$out" | tail -15; exit 1
+		fi
+	fi
+	if ! printf '%s\n' "$out" | grep -qE '^(--- FAIL|FAILED|FAIL: )|^FAIL'; then
+		echo "--- FAIL: §112 反证 ${id} 没有让被测腿变红（${target}）——这条锁恒绿，是假锁；尾部："
+		printf '%s\n' "$out" | tail -15
+		exit 1
+	fi
+	if ! printf '%s\n' "$out" | grep -qF -- "$token"; then
+		echo "--- FAIL: §112 反证 ${id} 红了，但红文案里找不到本枚指定的归属串「${token}」（＝红在别处，成因归属不成立）"
+		printf '%s\n' "$out" | grep -E 'FAIL|Error|assert' | head -10
+		exit 1
+	fi
+	cp -f "$REPO112/$rel" "$MIR112/$rel" || { echo "--- FAIL: §112 反证 ${id} 复位失败（${rel}）"; exit 1; }
+	if [ "$kind" = go ]; then
+		out=$( cd "$MIR112" && go test -count=1 -run "^(${rx})\$" "$target" 2>&1 || true )
+	else
+		out=$( cd "$MIR112" && py_tests "$target" 2>&1 || true )
+	fi
+	if printf '%s\n' "$out" | grep -qE '^(--- FAIL|FAILED|FAIL: )|^FAIL'; then
+		echo "--- FAIL: §112 反证 ${id} 复位后仍红＝镜像被别处污染（或复位不是真复位），后续反证的读数全部作废"
+		exit 1
+	fi
+	echo "ok - §112 反证 ${id}：破坏 $rel → $target 红（归属串 ${token}）且复位复绿"
+}
+
+# D1 sidecar 降级腿把 tradestatus 硬编码回 "1"（旧缺陷本体）→ K4a 必红
+dys112 D1 "$SIDE112" 'p="cmd/pydata/server.py"
+s=open(p,encoding="utf-8").read()
+a="            _NA, _NA, _NA, _NA, _NA, _NA, _NA,"
+b="            \"1\", _NA, _NA, _NA, _NA, _NA, _NA, _NA,"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' py "$PYT112" - 'K4a'
+# D2 降级腿行尾标记换成主链路标记（线格式照旧、Go 照落库，唯一痕迹是常量的值）→ K4b 必红
+dys112 D2 "$SIDE112" 'p="cmd/pydata/server.py"
+s=open(p,encoding="utf-8").read()
+a="            _SRC_SINA,"
+b="            _SRC_BAOSTOCK,"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' py "$PYT112" - 'K4b'
+# D3 读侧 LIKE 从后缀匹配改成枚举 → 假想的第三条兜底腿漏网
+dys112 D3 "$DSC112" 'p="internal/store/daily_source.go"
+s=open(p,encoding="utf-8").read()
+a="const DailySourceLikeDegraded = \"%degraded%\""
+b="const DailySourceLikeDegraded = \"%sina_degraded%\""
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' go ./internal/store/ TestDailySourcePartitionOnRealTable 'TestDailySourcePartitionOnRealTable'
+# D4 tradestatus 回到「缺测也当停牌」→ 降级行整行不落库（K1a：根数少于 3）
+dys112 D4 "$BSD112" 'p="cmd/dataload/baostock.go"
+s=open(p,encoding="utf-8").read()
+a="\t\tif ts, ok := r.FOk(\"tradestatus\"); ok && int(ts) == 0 {"
+b="\t\tif int(r.F(\"tradestatus\")) == 0 {"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' go ./cmd/dataload/ TestDegradedRowLandsWithSourceAndNulls 'K1a'
+# D5 停牌判据整个摘掉 → 停牌行被写进库（K1c：根数多于 3）
+dys112 D5 "$BSD112" 'p="cmd/dataload/baostock.go"
+s=open(p,encoding="utf-8").read()
+a="if ts, ok := r.FOk(\"tradestatus\"); ok && int(ts) == 0 {"
+b="if ts, ok := r.FOk(\"tradestatus\"); false && ok && int(ts) == 0 {"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' go ./cmd/dataload/ TestDegradedRowLandsWithSourceAndNulls 'K1c'
+# D6 is_st 退回 F()（缺测落成 0＝「确定不是 ST」这个真实读数）
+dys112 D6 "$BSD112" 'p="cmd/dataload/baostock.go"
+s=open(p,encoding="utf-8").read()
+a="\t\t\t\"is_st\": numOrNil(r.FOk(\"isst\")),"
+b="\t\t\t\"is_st\": r.F(\"isst\"),"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' go ./cmd/dataload/ TestDegradedRowLandsWithSourceAndNulls 'daily_basic.is_st'
+# D7 未连接态的量规读数改回 0（与「本轮没跑」同形 → 规则 ge 2 永不触发，静默失效复活）
+dys112 D7 "$SET112" 'p="internal/trading/settlement.go"
+s=open(p,encoding="utf-8").read()
+a="\tcase SettleOutcomeSkippedNotConnected:\n\t\treturn 2"
+b="\tcase SettleOutcomeSkippedNotConnected:\n\t\treturn 0"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' go ./internal/trading/ TestSettleDaySkipBranchesZeroDiffButNotVerified 'settlement_state 应=2'
+# D8 file 桥用回「取单即翻 inflight」→ 写盘失败的那轮单安静消失（L1 必红）
+dys112 D8 "$GWI112" 'p="qmt_gateway/gateway.py"
+s=open(p,encoding="utf-8").read()
+a="pending = self.store.dispatch_pending_peek(limit=50)"
+b="pending = self.store.dispatch_pending(limit=50)"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' py "$GWT112" - 'test_L1_write_failure_keeps_pending_and_counts'
+
+# D9 跳过腿被写回「当日已对账」（计划里的 J2 反证：把 skipped 记成 booked）⇒ J1 必红
+#    D7 验的是「三态→量规」那本账，这一枚验的是「三态→账面」那本账：同一个跳过态在两条腿上
+#    各有各的落点，只反证量规那条时，有人在账面那侧写回 `lastSettleDay = day` 照样全线绿。
+dys112 D9 "$SET112" 'p="internal/trading/settlement.go"
+s=open(p,encoding="utf-8").read()
+a="\tif !outcome.Verified() {"
+b="\tif false && !outcome.Verified() {"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' go ./internal/trading/ TestMaybeSettleDayNotConnectedDoesNotBookTheDay '§P2-E 反例'
+
+# D10 未连接腿不再归零差异读数（这是本批**改判方向**的那枚：跳过腿保留上一轮残值）。
+#     为什么要为"改错了半步"专门留反证：§P2-E 的缺陷本体是「不适用与无差异不可分辨」，
+#     中途我把它读成「跳过腿不该写差异读数」，于是删了归零那行——而 §69（§DEADGAUGE 负锁③）
+#     当场判红，理由成立：规则 settlement_diff 是 `gt 0`，不写数＝上一轮真比对的条数常驻，
+#     断线日会天天拿旧差异刷 p1。最终口径是"两个键合起来说"（diff 归零 + state 给 2/3）。
+#     反证钉住这个结论的两端：删掉归零 ⇒ 行为腿必红（残值形态复活），而不是只靠 §69 的静态串。
+dys112 D10 "$SET112" 'p="internal/trading/settlement.go"
+s=open(p,encoding="utf-8").read()
+a="\t\toutcome = SettleOutcomeSkippedNotConnected\n\t\tmetrics.SetGauge(\"settlement_diff_count\", 0)\n"
+b="\t\toutcome = SettleOutcomeSkippedNotConnected\n"
+print(s.count(a))
+open(p,"w",encoding="utf-8").write(s.replace(a,b,1))' go ./internal/trading/ TestSettleDaySkipBranchesZeroDiffButNotVerified '未连接腿同样必须归零 settlement_diff_count'
+
+# 组⑨的快照必须打在 D10 **之后**：打在前面时最后那一票反证会落进组⑩的窗口，
+# 于是收尾写「十枚反证」而组⑨只数到九枚，求和自证锁照样绿（每票仍只落一组，只是落错了组）。
+SNAP112 9
+
+# ── ⑩ 覆盖面诚实交代（本段验到哪、没验到哪）──
+# 快照调用点自身对账：每个组号**恰好调用一次**。这一枚是本批真踩出来的——D9 加进组⑨时把
+# SNAP112 9 留在了 D8 之后（旧边界），于是组⑨只数到 D9 一票、组⑩多背了一票，而「每组 >0」
+# 的在位锁与求和自证锁双双绿着：每票仍只落进一组，只是落错了组，收尾的分组读数从此不可信。
+CNT112=$((CNT112 + 1))
+SNAP_BAD112=""
+for _g in 1 2 3 4 5 6 7 8 9 10; do
+	_c=$( { grep -cE "^SNAP112 ${_g}$" "$REPO112/scripts/verify_changes.sh" 2>/dev/null || true; } | head -1)
+	[ "${_c:-0}" = "1" ] || SNAP_BAD112="${SNAP_BAD112} ${_g}(命中${_c:-0})"
+done
+if [ -n "$SNAP_BAD112" ]; then
+	echo "--- FAIL: §112 快照调用点等值锁 ${CNT112}（这些组号的 SNAP112 调用不是恰好一次：${SNAP_BAD112}）"
+	echo "    少一次＝有一组的锁并进了邻组（分组读数假）；多一次＝后一次把增量切成一小截，收尾「⑨ 镜像反证 N 道」数到的不是那一批"
+	exit 1
+fi
+CNT112=$((CNT112 + 1))
+DEGONLY=$(scan_go112 'DailySourceDegradedOnly(' | wc -l | tr -d ' ')
+if [ "${DEGONLY:-0}" != "0" ] && [ "${DEGONLY:-0}" != "1" ]; then
+	echo "--- FAIL: §112 取向锁 ${CNT112}（DailySourceDegradedOnly 的生产调用点应 0 或 1，实得 ${DEGONLY}）"
+	echo "    这一支现在只被测试消费（生产三个统计点都用 NotDegraded）。留着的理由见本段前言①；多到两处＝有人在别处又数一遍降级行"; exit 1
+fi
+CNT112=$((CNT112 + 1))
+if [ -z "${RBK112:-}" ] || [ ! -f "$RBK112" ]; then
+	echo "--- FAIL: §112 射程文件在位锁 ${CNT112}（$RBK112 不在位＝广度判据的落点被搬走了，本段的读侧锁全部要重新定位）"; exit 1
+fi
+# ── 分组自证（本段最后两道锁，收尾那行的分组读数靠它们兜底）──
+# ① 在位锁：①–⑨ 每组都必须真记到判定点。少打一处 SNAP 时，那组的锁会被**并进下一组**的读数里
+#    （累计数照样对得上），分组清单于是开始撒谎——这正是「累计 100 道却把没跑到的组算进去」的形态。
+# ② 求和锁：十组快照之和 == 累计判定点（扣掉本锁自己那一票），拦「改了 CNT112 却没落进任何组」。
+CNT112=$((CNT112 + 1))
+_EMPTY_G=""
+for _g in 1 2 3 4 5 6 7 8 9; do
+	_v="G${_g}_N"
+	if [ "${!_v}" -le 0 ]; then _EMPTY_G="${_EMPTY_G} ${_g}"; fi
+done
+if [ -n "$_EMPTY_G" ]; then
+	echo "--- FAIL: §112 分组快照在位锁 ${CNT112}（这些组一个判定点都没记到：组${_EMPTY_G}）"
+	echo "    要么该组被整组删了，要么组边界上的 SNAP112 漏了——漏一处时那组的锁会并进邻组的读数，累计数看起来正常而分组数是假的"
+	exit 1
+fi
+SNAP112 10
+CNT112=$((CNT112 + 1))
+SUMG112=$((G1_N + G2_N + G3_N + G4_N + G5_N + G6_N + G7_N + G8_N + G9_N + G10_N))
+# 求和里不含本锁自己这一票（SNAP112 10 已经打过，之后的增量只有这一道），所以扣 1。
+if [ "$SUMG112" != "$((CNT112 - 1))" ]; then
+	echo "--- FAIL: §112 分组求和自证锁 ${CNT112}（十组快照之和 ${SUMG112} != 累计判定点扣本锁 $((CNT112 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"
+	exit 1
+fi
+rm -rf "$W112"
+echo "ok - §112 全段通过：① sidecar 常量族与 K4 射程集合 ${G1_N} 道 + ② 跨语言表头/缺测标记等值 ${G2_N} 道 + ③ 取数三态与落库姿势 ${G3_N} 道 + ④ 读侧单源与 schema 四处同源 ${G4_N} 道 + ⑤ 三态接线/别名 ban/映射表等值 ${G5_N} 道 + ⑥ 文件桥函数段顺序锁与观察位接线 ${G6_N} 道 + ⑦ 测试资产派生登记 ${G7_N} 道 + ⑧ 行为腿（Go ${W5GO_N} 个文件/${W5PKG_N} 包 ${NAME_N} 条用例逐包与派生数等值、pytest ${W5PY_N} 份含防空转正 floor）${G8_N} 道 + ⑨ 镜像基线自证与 ${DYS112_N} 枚反证 D1–D${DYS112_N} ${G9_N} 道 + ⑩ 覆盖面诚实与分组自证 ${G10_N} 道，累计判定点 ${CNT112}（其中十组快照之和 ${SUMG112}，另有 1 道就是求和自证锁本身）"
 echo ""
 echo "==> 全部通过"

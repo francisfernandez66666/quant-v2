@@ -71,6 +71,32 @@ _STOCK_FIELDS = ("date,code,open,high,low,close,preclose,volume,amount,adjustfla
 # 指数日线查询字段（无估值/ST）
 _INDEX_FIELDS = ("date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg")
 
+# §P2-F（2026-10-06 修复批 波 5）显式缺测标记与来源标记。
+#
+# 缺陷原文：新浪/东财降级腿把"这一列上游根本没有"写成空串（pctChg/peTTM/isST…）或
+# **硬编码 tradestatus="1"**（=今天正常交易）。空串到 Go 侧 `TushareRow.F()` 会被静默
+# 折成 0，而 0 在行情语义里是一个真实读数（涨跌幅 0＝平盘、tradestatus 0＝停牌），
+# 于是"断源日"被写成"平盘日"，广度统计（上涨家数占比、板块平均涨跌幅）随之失真，
+# 且事后从库里完全看不出这一行是兜底来的。
+#
+# 修法约定（两侧必须同源，改一侧就是自欺）：
+#   - 缺测列一律输出 `_NA`（不是空串），Go 侧 `FOk()/SOk()` 认这个标记并返回"无读数"，
+#     落库写 NULL；`F()` 也认（返回 0），但落库路径必须用 FOk，不允许沿用 F() 伪造 0。
+#   - 每行末尾多一列 `source`：baostock / sina_degraded / eastmoney_degraded。
+#     主链路（baostock）与降级链路都带这一列，读取端才可以用同一把尺子筛。
+# English: §P2-F explicit not-measured marker and per-row source tag.
+_NA = "NA"
+_SOURCE_COL = "source"
+_SRC_BAOSTOCK = "baostock"
+_SRC_SINA = "sina_degraded"
+_SRC_EASTMONEY = "eastmoney_degraded"
+
+
+def _fields_with_source():
+    """股票日线的输出列（_STOCK_FIELDS + 末尾 source 列）。§P2-F。"""
+    return _STOCK_FIELDS.split(",") + [_SOURCE_COL]
+
+
 
 def _bs_query(fn, *args, **kwargs):
     """在串行锁内执行一次 baostock 查询，返回 (rows, fields)。
@@ -203,9 +229,17 @@ def _ak_sina_daily(code, start, end):
     """新浪 stock_zh_a_daily 拉日线（沪深与北交所均支持），按 _STOCK_FIELDS 列序对齐返回 rows。
     新浪 volume 单位=股、turnover=小数比率（×100 转 baostock 百分比口径）；
     无涨跌幅列，preclose 用前一日 close 填充（首行缺省为当日 close）。
+
+    §P2-F 口径修正：新浪**没有** tradestatus/peTTM/pbMRQ/psTTM/pcfNcfTTM/isST 这几列，
+    旧实现把 tradestatus 硬编码成 "1"（=当日正常交易）、其余留空串，Go 侧再把空串折成 0
+    ⇒ 降级日在库里长得像"停牌列已知、涨跌幅恰好为 0 的平盘日"。现在这些列统一输出 _NA
+    缺测标记，行尾带 source=sina_degraded；Go 侧用 FOk() 区分"没读数"与"读数就是 0"，
+    落库写 NULL 并保留来源，统计侧据此把降级行排除在外。
     （English: Sina daily bars via akshare (SH/SZ/BJ all supported), aligned to _STOCK_FIELDS.
     Sina volume is in shares; turnover is a decimal ratio (×100 → baostock percent); there is no
-    pct_chg column, so preclose falls back to the prior close (first row = its own close).）"""
+    pct_chg column, so preclose falls back to the prior close (first row = its own close).
+    §P2-F: columns Sina does not provide are emitted as the explicit _NA marker (never "1"/""),
+    and every row carries source=sina_degraded.）"""
     sym = _sina_sym(code)
     df = _try_ak(lambda ak: ak.stock_zh_a_daily(symbol=sym, start_date=start, end_date=end, adjust=""))
     if df is None or df.empty:
@@ -220,7 +254,10 @@ def _ak_sina_daily(code, start, end):
             str(r["date"]).replace("-", ""), code,
             _num(r.get("open")), _num(r.get("high")), _num(r.get("low")), close, preclose,
             _num(r.get("volume")), _num(r.get("amount")), "3",
-            _num(r.get("turnover")) * 100, "1", "", "", "", "", "", "",
+            _num(r.get("turnover")) * 100,
+            # tradestatus/pctChg/估值/ST：新浪侧无此列 ⇒ 显式缺测，不伪造"1"（正常交易）或 0（平盘）
+            _NA, _NA, _NA, _NA, _NA, _NA, _NA,
+            _SRC_SINA,
         ])
         prev_close = close
     return rows
@@ -229,9 +266,14 @@ def _ak_sina_daily(code, start, end):
 def _ak_em_daily(code, start, end):
     """东财 stock_zh_a_hist 拉日线（支持北交所），按 _STOCK_FIELDS 列序对齐返回 rows。
     东财成交量单位=手（×100 转股）；估值/ST 字段缺失留空；preclose 由 close/涨跌幅 反推。
+
+    §P2-F 口径修正同 _ak_sina_daily：涨跌幅是东财真实读数（保留），tradestatus 与估值/ST
+    是"这一列上游没有"⇒ 输出 _NA 并带 source=eastmoney_degraded。注意 preclose 是**反推值**
+    （close/(1+pct/100)），不是上游读数，这一点在行内无法自证，靠来源列标注整行为降级行。
     （English: pulls daily bars from Eastmoney via akshare (Beijing exchange supported), aligned to
-    _STOCK_FIELDS columns. Volume in lots (×100 → shares); valuation/ST columns empty; preclose
-    back-computed from close and pct_chg.）"""
+    _STOCK_FIELDS columns. Volume in lots (×100 → shares); §P2-F marks the columns Eastmoney does
+    not provide as _NA (never a fake "1"/0) and tags source=eastmoney_degraded; preclose is
+    back-computed from close and pct_chg, hence the whole row is marked degraded.）"""
     symbol = _bs_sym(code)
     df = _try_ak(lambda ak: ak.stock_zh_a_hist(
         symbol=symbol, period="daily",
@@ -248,7 +290,11 @@ def _ak_em_daily(code, start, end):
             str(r["日期"]).replace("-", ""), code,
             _num(r.get("开盘")), _num(r.get("最高")), _num(r.get("最低")), close, preclose,
             _num(r.get("成交量")) * 100, _num(r.get("成交额")), "3",
-            _num(r.get("换手率")), "1", pct, "", "", "", "", "",
+            _num(r.get("换手率")),
+            _NA,           # tradestatus：东财 hist 不给停牌态（降级行不当停牌处理，见 Go 侧判据）
+            pct,           # 涨跌幅是真实读数，保留
+            _NA, _NA, _NA, _NA, _NA,
+            _SRC_EASTMONEY,
         ])
     return rows
 
@@ -340,6 +386,10 @@ def _kline_impl(params, index=False):
 
     :param params: 请求参数（code/start/end/adjust）。
     :param index: 是否指数（指数走 _INDEX_FIELDS 无估值/ST 字段）。
+    §P2-F：股票日线统一在行尾多带一列 source=baostock，与两条降级腿（sina_degraded /
+    eastmoney_degraded）同一把尺子——只有"主链路也标"，读取端才可能用一句
+    `source LIKE '%degraded%'` 精确圈出降级行，而不是靠猜哪些行缺列。
+    指数无降级链路（_INDEX_FIELDS 列集不含估值/ST），保持原列序不动。
     English: core daily-K-line query via baostock; index=True uses the index field set.
     """
     code = params.get("code", "")
@@ -348,7 +398,10 @@ def _kline_impl(params, index=False):
     fields = _INDEX_FIELDS if index else _STOCK_FIELDS
     rows, _ = _bs_query(bs.query_history_k_data_plus, code, fields,
                         start_date=start, end_date=end, frequency="d", adjustflag=adj)
-    return _to_csv(fields.split(","), rows)
+    if index:
+        return _to_csv(fields.split(","), rows)
+    tagged = [list(r) + [_SRC_BAOSTOCK] for r in rows]
+    return _to_csv(_fields_with_source(), tagged)
 
 
 def r_kline(params):
@@ -372,7 +425,7 @@ def r_kline(params):
             rows = None
         if rows is None:
             rows = _ak_em_daily(code, start, end)
-        return _to_csv(_STOCK_FIELDS.split(","), rows)
+        return _to_csv(_fields_with_source(), rows)
 
 
 def r_index_kline(params):

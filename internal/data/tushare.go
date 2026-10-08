@@ -161,6 +161,84 @@ func (r TushareRow) S(key string) string {
 	}
 }
 
+// I 取整数值（无法解析返回 0）。（I returns the int value of a cell, 0 on parse failure.）
+// English: I returns the int value (0 if unparseable).
+func (r TushareRow) I(key string) int {
+	return int(r.F(key))
+}
+
+// MissingCell 上游 CSV/JSON 里表示"这一格没有读数"的显式缺测标记。
+// （MissingCell is the explicit not-measured marker used by the sidecar/upstream cells.）
+//
+// 为什么要有标记而不是复用空串：空串 "" 在 F() 里会被静默折算成 0，而 0 在行情语义里是
+// 一个**真实存在的读数**（涨跌幅 0＝平盘、tradestatus 0＝停牌）。降级数据源（新浪/东财兜底腿）
+// 提供不了这些列时，写 0 等于把"不知道"冒充成"知道且恰好是 0"——2026-10-05 审计 P2-F 的成因
+// 就是这一条（断源日被写成平盘日，广度统计随之失真）。标记串本身要短、不可能与真实数值混淆。
+const MissingCell = "NA"
+
+// FOk 取浮点值并区分"确实没读数"。（FOk returns the float value and whether a reading exists.）
+// English: FOk returns (value, ok); ok=false when the cell is absent or an explicit missing
+// marker. Callers that persist a column MUST use FOk and write NULL when ok=false.
+func (r TushareRow) FOk(key string) (float64, bool) {
+	v, ok := r.cell(key)
+	if !ok {
+		return 0, false
+	}
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case json.Number:
+		f, err := t.Float64()
+		return f, err == nil
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" || strings.EqualFold(s, MissingCell) {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	default:
+		return 0, false
+	}
+}
+
+// SOk 取字符串值并区分"确实没有"（缺测标记串按缺测处理，不是合法文本）。
+// English: SOk returns (value, ok) with the missing marker treated as absent.
+func (r TushareRow) SOk(key string) (string, bool) {
+	v, ok := r.cell(key)
+	if !ok {
+		return "", false
+	}
+	if s, isStr := v.(string); isStr {
+		t := strings.TrimSpace(s)
+		if t == "" || strings.EqualFold(t, MissingCell) {
+			return "", false
+		}
+		return s, true
+	}
+	// 非字符串单元格（数字/JSON Number）交给 S() 统一转字符串，语义上仍算有读数。
+	return r.S(key), true
+}
+
+// cell 取原始单元格（键名统一小写，与 F/S 的取键口径一致）。
+func (r TushareRow) cell(key string) (any, bool) {
+	if r == nil {
+		return nil, false
+	}
+	v, ok := r[strings.ToLower(key)]
+	if !ok || v == nil {
+		return nil, false
+	}
+	return v, true
+}
+
 // F 取浮点值（无法解析返回 0）。（F returns the float value of a cell, 0 on parse failure.）
 // English: F returns the float value (0 if unparseable).
 func (r TushareRow) F(key string) float64 {
@@ -178,6 +256,9 @@ func (r TushareRow) F(key string) float64 {
 		f, _ := t.Float64()
 		return f
 	case string:
+		if strings.EqualFold(strings.TrimSpace(t), MissingCell) {
+			return 0 // §P2-F：显式缺测标记与解析失败同为 0，落库侧必须改用 FOk 才不会伪造
+		}
 		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
 		if err != nil {
 			return 0
@@ -190,12 +271,6 @@ func (r TushareRow) F(key string) float64 {
 	default:
 		return 0
 	}
-}
-
-// I 取整数值（无法解析返回 0）。（I returns the int value of a cell, 0 on parse failure.）
-// English: I returns the int value (0 if unparseable).
-func (r TushareRow) I(key string) int {
-	return int(r.F(key))
 }
 
 // StockBasic 获取 A 股上市公司基础信息（全量在市，list_status=L）。

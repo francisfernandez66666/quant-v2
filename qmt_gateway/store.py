@@ -1038,6 +1038,13 @@ class Store:
 
         §M16：转 inflight 同时落 inflight_at 取单时刻——收割龄以「被取走的时间」计，
         而非入队时间（在 pending 排到阈值附近才被取走的单不该立刻被收割）。
+
+        适用面（§P2-G 明确划线）：**只有"取走即交付"的通道能用它**——HTTP
+        /dispatch/pending 把行放进响应体的同一刻就把单交给了对方，翻状态是对的。
+        file 桥不是这种通道（它是"先写文件，写成功了才算交付"），必须走
+        dispatch_pending_peek + dispatch_mark_inflight 两段式；沿用本函数就等于
+        "写文件失败 = 丢单"（2026-10-05 审计 P2-G 的成因，细则见
+        gateway._file_bridge_push_pending 头注释）。
         """
         with self._lock:
             rows = self._conn.execute(
@@ -1050,6 +1057,52 @@ class Store:
                     (now, r["id"]))
             self._conn.commit()
             return [dict(r) for r in rows]
+
+    def dispatch_pending_peek(self, limit=50):
+        """只读取出 pending 派发项（**不改状态**）。§P2-G（2026-10-06 修复批 波 5）。
+
+        与 dispatch_pending 的唯一区别就是不落 inflight，专供 file 桥
+        「先把命令文件写成功、再翻状态」的顺序翻转：写文件失败时这些行仍是 pending，
+        下一轮照常再推（旧顺序取单即翻 inflight ⇒ 写失败等于丢单，且 inflight
+        要等 §M16 收割线（默认数十分钟）才判废，期间桥完全看不到这张单）。
+
+        代价（如实记录）：peek 与 mark 之间不是同一临界区，若同期还有别的消费者走
+        dispatch_pending（HTTP /dispatch/pending），理论上可能被两边各取一次。现网
+        file 桥与 HTTP 桥是 bridge_mode 二选一、同一 store 只有一个消费者循环，
+        而"写失败丢单"是每次写盘异常都会发生的确定性损失，"双消费者并发"是需要
+        同时开两条下发通道才会出现的假设风险 ⇒ 取向是消除确定损失。
+        English: read-only pending rows (no status flip) for the file bridge's
+        write-then-mark ordering.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dispatch WHERE status = 'pending' ORDER BY id LIMIT ?",
+                (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def dispatch_mark_inflight(self, seqs):
+        """把指定 seq 的**仍为 pending** 行翻成 inflight 并落 inflight_at（§P2-G 第二腿）。
+
+        只翻 status='pending' 的行：并发下若该行已被别的消费者取走（inflight/done），
+        这里不会把它拖回 inflight，也不会覆盖别人的取单时刻。返回真正翻动的行数，
+        调用方据此判断"这次写盘是否对应了状态推进"。seqs 为空时直接返回 0（不动事务）。
+        English: flip the given seqs from pending to inflight (only rows still pending),
+        returning how many rows actually moved.
+        """
+        ids = [str(s) for s in (seqs or []) if str(s) != ""]
+        if not ids:
+            return 0
+        with self._lock:
+            now = _now_cn()
+            moved = 0
+            for seq in ids:
+                cur = self._conn.execute(
+                    "UPDATE dispatch SET status = 'inflight', inflight_at = ? "
+                    "WHERE seq = ? AND status = 'pending'",
+                    (now, seq))
+                moved += cur.rowcount or 0
+            self._conn.commit()
+            return moved
 
     def dispatch_inflight(self, limit=50):
         """inflight（已派发未结算）派发项快照（不改状态）。§2026-09-14 演练③：

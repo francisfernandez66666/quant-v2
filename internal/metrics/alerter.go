@@ -52,6 +52,16 @@ func DefaultAlertRules() []AlertRule {
 		// 连续失败次数"（settlement.go 失败抬升、成功归零，是真实赋值不是 N-1 那种死规则）。
 		// 触发即说明三方对账这道日终安全网今天到目前为止没跑成——差异/漏单不会被发现。
 		{Name: "settle_failed", Metric: "settle_fail_streak", Op: "gt", Threshold: 0, For: "0s", Level: "p2", Message: "交割单三方对账失败（当日自动重试中，成功后自动恢复）"},
+		// §P2-E（2026-10-06 修复批 波 5）：对账的**第三态**必须有人读。上面那条规则只管"抛错了"，
+		// 而 SettleDay 还有两条不抛错、却什么都没比对的出口（网关未连接 / 执行器不支持交割单），
+		// 旧实现把这两条也记成成功 ⇒ 全天没比对一次而告警面一条都不响。
+		// 量规 settlement_state 由 trading/settlement.go 的 SettleDay 每次调用 defer 写一次
+		// （0 未得出/未跑过、1 已对账、2 未连接跳过、3 执行器不支持），规则用 `ge 2` 判"本轮未验证"：
+		// 0 与 1 都在阈值之下，所以启动后到当日第一次对账之前这段**不会假红**（这是"必须回落"
+		// 类判据的常见自伤形态，见 §0929 心跳那批的教训）；一旦真对完账写回 1，成对 recover 自动销案。
+		// For=300s：网关未连接属可自愈的瞬时状态（重连通常在一两分钟内），给一个恢复窗防毛刺，
+		// 而结构性不支持（3）会一直挂着——持续破线由评估器 Firing 态 + 路由冷却窗去重，不刷屏。
+		{Name: "settlement_not_verified", Metric: "settlement_state", Op: "ge", Threshold: 2, For: "300s", Level: "p2", Message: "交割单三方对账本轮未验证（网关未连接或执行器不支持），当日差异不会被发现，查网关连接/执行器配置"},
 		{Name: "llm_cooldown", Metric: "llm_cooldown_count", Op: "gt", Threshold: 2, For: "60s", Level: "p2", Message: "LLM 冷却数超阈值"},
 		// §AUDIT-PM 2026-09-15 buyCh 深度预警：容量 64，过半仍在排 = 下单风暴或网关变慢（P2）。
 		{Name: "buy_queue_high", Metric: "buy_queue_depth", Op: "gt", Threshold: 32, For: "60s", Level: "p2", Message: "自动买入队列积压 >32（网关变慢或信号风暴）"},
