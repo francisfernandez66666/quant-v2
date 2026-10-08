@@ -1167,8 +1167,13 @@ Probe "sec: snapshot/restic dirs expose no ACE outside SYSTEM+Administrators" (-
 #   正是那次手工修）。本探针是三段修法的第三段：①任务名单/阈值单源＝service_definitions.ps1 的
 #   $SvcTaskRoster + $SvcTaskFreshRules + $SvcTaskInPlaceOnly；②注册体＝register_engine_services.ps1
 #   §6b（缺省只预演、-RegisterKeepaliveTask 才动手）；③本探针。
-# 输出协议：每任务一行 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|action=..`，
+# 输出协议：每任务一行 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|reg_h=..|last_run=..|action=..`，
 #   **只有读数、没有判词**；红绿由 bash 侧 judge_task_roster() 判（见本文件下方）。
+#   另有一条 `TASK|__live_names__|...` 观测行（现网同族任务名清单，只转 INFO、不参与判读）。
+#   reg_h/last_run 是 10-09 首拨之后补的两把：前者＝注册龄（分开"刚装还没到触发点"与"该跑没跑"
+#   两种从未运行），后者＝上次运行的原始时间戳（让年代界判定可被读数复核，而不是让人信判据）。
+#   缺字段容错：三条伪读数行（defs-unreadable / roster-empty / item-empty）不带这两个键，
+#   bash 侧按 `|key=` 前缀取，取不到就是空——空值走 fail-closed，不会因为"没这个字段"放行。
 #   为什么判读不放 PS：本机没有 PowerShell，判据写在 PS 就是"从没真跑过的判据"——§0929DRILL 四条
 #   缺陷的共同根因正是"脚本写得完整但从没真跑"，DRILL-A 那条 --last 假红就是没跑过的读法。
 #   放 bash 之后，门禁 §110 可以喂七种合成读数逐条验红绿，全程离线、零外呼。
@@ -1196,6 +1201,27 @@ if (-not $krDefsOk) {
 } elseif (-not $SvcTaskRoster -or @($SvcTaskRoster).Count -lt 1) {
     Write-Output "TASK|__task_roster__|present=0|rule=none|age_h=na|state=roster-empty|enabled=na|action="
 } else {
+    # 现网"像本仓命名家族"的任务名清单——**观测行，不参与判读**（bash 侧只转 INFO）。
+    # 存在理由：present=0 有两种完全不同的成因——① 这台机器根本没装过这个任务；② 装了但名字
+    #   与单源不一致（探针按单源的名字逐个查，改了名就查不到，而"改了名"正是手工时代会发生的事）。
+    #   只看 present=0 分不清这两种，红项就得人工再上机查一遍；把同名族清单一次性带回来，
+    #   absent 那行的旁边就有答案。★ 这一行是 10-09 首拨**之后**加的，不是首拨时用过的：
+    #   那次只读到 quant-all-wd present=0，两种成因分不开（这正是它当时只能登记成"待处置"、
+    #   不能顺手补注册体的原因——名字对不上就补 /Create，等于再造一条没人认领的腿）。
+    # 为什么按前缀过滤而不是全量：Windows 自带几百条 \Microsoft\Windows\* 任务，全量清单会把
+    #   我们那几条埋掉（观测面选错账本＝读数再多也不回答问题）。前缀只认 quant/qmt（PS 的
+    #   -match 默认大小写不敏感），本仓任务名全是 ASCII，非 ASCII 字符剥掉、超 200 字符截断。
+    # 位置在遍历**之前**：判读函数是单遍流式处理，absent 行要能引用这条清单，清单必须先到场。
+    try {
+        $krLive = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | ForEach-Object { [string]$_.TaskName })
+        $krMine = @($krLive | Where-Object { $_ -match '^(quant|qmt)' } | Sort-Object)
+        $krNames = ($krMine -join ",") -replace '[^\x20-\x7E,]', ''
+        if ($krNames.Length -gt 200) { $krNames = $krNames.Substring(0, 200) }
+        Write-Output ("TASK|__live_names__|present=" + $krMine.Count +
+            "|rule=none|age_h=na|state=live-names|enabled=na|action=" + $krNames)
+    } catch {
+        Write-Output "TASK|__live_names__|present=0|rule=none|age_h=na|state=live-names-unreadable|enabled=na|action="
+    }
     foreach ($krName in @($SvcTaskRoster)) {
         if (-not $krName) {
             Write-Output "TASK|__roster-item__|present=0|rule=none|age_h=na|state=item-empty|enabled=na|action="
@@ -1211,19 +1237,62 @@ if (-not $krDefsOk) {
         elseif ($krHits.Count -eq 1) { $krRuleTxt = [string]$krHits[0].MaxAgeHours }
         elseif ($SvcTaskInPlaceOnly -and (@($SvcTaskInPlaceOnly) -contains $krName)) { $krRuleTxt = "inplace" }
         $krPresent = "0"; $krAge = "na"; $krState = "absent"; $krEnabled = "na"; $krAction = ""
+        $krLastRun = "na"; $krRegH = "na"
         schtasks /Query /TN $krName 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) {
             $krPresent = "1"; $krState = "present"
+            # 一次 Get-ScheduledTask 取两样东西：任务定义 XML（注册时刻）+ 动作行。
+            # 分成两次调用不省事，反而多一个"两次读到不同版本"的窗口（现网中途重注册时）。
+            $krTask = $null
+            try { $krTask = Get-ScheduledTask -TaskName $krName -ErrorAction Stop } catch { $krTask = $null }
+            # Enabled 挂在哪一个对象上**不赌**（§DRILL-A 那一条：拿某个版本的属性形状当判据前提，
+            # 换了机器/版本就静默失灵）：任务定义（Get-ScheduledTask 的 MSFT_ScheduledTask）与
+            # 运行信息（Get-ScheduledTaskInfo）两处都试，先取定义那一份，取不到再取运行信息那份，
+            # 两份都没有就留 "na"。为什么把定义那份排在**前面**（而不是只补一条兜底）：
+            # 定义腿不依赖 TaskInfo 那条 try，TaskInfo 因权限或异常失败时 Enabled 依然读得到——
+            # 旧写法只从运行信息里找，那个类上若没有这个属性，"周期任务被禁用判红"这条在现网
+            # 就是**结构性失灵**（读数恒 na、bash 恒不判），而它在门禁里的合成腿照样绿：
+            # 这正是本批要根除的"判据从没真跑过"。
+            if ($krTask -and $krTask.PSObject.Properties['Enabled']) { $krEnabled = [string]$krTask.Enabled }
             try {
                 $krInfo = Get-ScheduledTaskInfo -TaskName $krName -ErrorAction Stop
-                if ($krInfo.PSObject.Properties['Enabled']) { $krEnabled = [string]$krInfo.Enabled }
-                if ($krInfo.LastRunTime -and $krInfo.LastRunTime.Year -gt 1900) {
+                if ($krEnabled -eq "na" -and $krInfo.PSObject.Properties['Enabled']) { $krEnabled = [string]$krInfo.Enabled }
+                # 年代界用 2010 而不是 1900（2026-10-09 首拨实录逼出来的）：那次读出的
+                # LastRunTime 反算 = 1999-11-30 00:01，是任务计划程序给"从未运行"的零值哨兵
+                # 在 UTC+8 下的展开形态（另一形态是 1900-01-01）。旧判据只挡 1900 ⇒ 哨兵被当成
+                # 真运行时间，算出 age=235445.9h 的荒谬读数并判红——**红得毫无信息量**。
+                # 为什么不背哨兵日期：这台机器上所有任务都在 2025 年之后注册，任何"2010 年前跑过"
+                # 在物理上不可能；与其赌哨兵的确切字节/日期（§DRILL-A 拿 --last 赌版本标志同族），
+                # 不如用一个宽得多的年代界，让读法对形态变化免疫。
+                if ($krInfo.LastRunTime -and $krInfo.LastRunTime.Year -gt 2010) {
                     $krAge = [string]([math]::Round(((Get-Date) - $krInfo.LastRunTime).TotalHours, 1))
                     $krState = "present+lastrun"
+                    # 原始时间戳一并回显（定格式、纯 ASCII）：哨兵与真值的差别要能在读数里看见，
+                    # 而不是靠人相信"我这个年代界判对了"。
+                    $krLastRun = $krInfo.LastRunTime.ToString("yyyy-MM-dd HH:mm:ss")
                 } else { $krAge = "never"; $krState = "never-run" }
-            } catch { $krState = "info-unreadable"; $krAge = "na"; $krEnabled = "na" }
-            try {
-                $krTask = Get-ScheduledTask -TaskName $krName -ErrorAction Stop
+            } catch { $krState = "info-unreadable"; $krAge = "na" }
+            # 注意这里**不回滚 $krEnabled**：Enabled 已由上面那条定义腿拿到过，TaskInfo 失败
+            # 只影响"上次运行/状态"那一对读数。旧写法在 catch 里把 enabled 一并抹成 na，
+            # 等于让一条腿的失败连带把另一条腿的好读数丢掉（禁用判定因此静默失效）。
+            # 注册龄（小时）＝这个任务在这台机器上装了多久。为什么探针要问这一把：
+            #   部署步 [2e] 每次都用 `schtasks /Create /F` 删建重注册 quant-backup-snap，重注册
+            #   会把运行历史清零，于是"上次运行"永远读成从未运行——而它的触发点是次日 04:00。
+            #   只看"上次运行"的判据在发版日必然红，与故障无关。有了注册龄，bash 侧能分开两种
+            #   从未运行：装了还没到触发点（正常）与装了远超阈值仍没跑过一次（该跑没跑，红）。
+            # 为什么算在 PS 一侧而不是把日期串交给 bash 算：现网时钟在那台机器上，而本机做日期
+            #   减法要同时伺候 BSD `date -j -f` 与 GNU `date -d` 两套语法——把只有正确时钟的一侧
+            #   能算对的量留在那一侧，bash 只比大小（与 age_h 同一口径）。
+            if ($krTask) {
+                try {
+                    $krRegNode = ([xml][string]$krTask.Task).Task.RegistrationInfo.Date
+                    if ($krRegNode) {
+                        $krRegDt = [datetime]::Parse([string]$krRegNode, [System.Globalization.CultureInfo]::InvariantCulture)
+                        $krRegH = [string]([math]::Round(((Get-Date) - $krRegDt).TotalHours, 1))
+                    }
+                } catch { $krRegH = "na" }
+            }
+            if ($krTask) {
                 $krParts = @()
                 foreach ($krA in @($krTask.Actions)) {
                     if ($krA.Execute) {
@@ -1234,12 +1303,13 @@ if (-not $krDefsOk) {
                 }
                 # 多动作行全量拼接：不做"取第一条"的乐观截断——截断会让人以为看见了现网全貌。
                 $krAction = ($krParts -join " || ")
-            } catch { $krAction = "action-unreadable" }
+            } else { $krAction = "action-unreadable" }
         }
         $krAction = ($krAction -replace '[^\x20-\x7E]', '')
         if ($krAction.Length -gt 160) { $krAction = $krAction.Substring(0, 160) }
         Write-Output ("TASK|" + $krName + "|present=" + $krPresent + "|rule=" + $krRuleTxt +
-            "|age_h=" + $krAge + "|state=" + $krState + "|enabled=" + $krEnabled + "|action=" + $krAction)
+            "|age_h=" + $krAge + "|state=" + $krState + "|enabled=" + $krEnabled +
+            "|reg_h=" + $krRegH + "|last_run=" + $krLastRun + "|action=" + $krAction)
     }
 }
 PSEOF
@@ -1250,21 +1320,24 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 # ── §KA-TASKREG 第 32 探针的判读（第 32 探针／bash 侧，2026-10-07 波 3）───────────────────
-# 输入：PS 回传的 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|action=..` 行；
+# 输入：PS 回传的 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|reg_h=..|last_run=..|action=..` 行；
 # 输出：每任务一行 INFO|（绿也要看得到数）+ **恰好一行** PASS| 或 FAIL|。
 # 为什么判读在 bash 而不在 PS：本机没有 PowerShell，判据写在 PS 就永远只能是"从没真跑过的判据"
-#   （§0929DRILL 四条缺陷的共同根因）。写成纯 bash 之后，门禁 §110 能直接喂七种合成读数逐条验
-#   红绿（在位新鲜／过期／缺任务／未定规则／读不到上次运行／仅查在位／整段无读数），零网络。
-# 解析口径三条，每条都是踩过的坑：
+#   （§0929DRILL 四条缺陷的共同根因）。写成纯 bash 之后，门禁 §110 能直接喂合成读数逐条验
+#   红绿（在位新鲜／过期／缺任务／未定规则／读不到上次运行／从未运行但刚装好／从未运行且早该跑过／
+#   仅查在位／整段无读数），零网络。
+# 解析口径四条，每条都是踩过的坑：
 #   ① 按 `|key=` 前缀剥字段而不是按位置 split——action= 里可能有 `|`（多动作行拼接），
 #      按位置取会把动作行的后半当成 enabled/present 读，整行错位还看不出错位；
 #   ② 比较走 awk 一次退出码判断，不在 bash 里做浮点（bash 算术只认整数，
 #      "12.3 > 30" 这种读分会静默语法错）；
 #   ③ 计数只数 `TASK|` 开头的行，汇总行自己不再产生 TASK| 前缀——否则"统计 FAIL 行数"这类
-#      下游读法会把我自己打印的那行 PASS/FAIL 也数进去（§107 同族：观测面选错账本）。
+#      下游读法会把我自己打印的那行 PASS/FAIL 也数进去（§107 同族：观测面选错账本）；
+#   ④ 新增的 reg_h/last_run 两个键**取不到就是空**，空值一律走 fail-closed（三条伪读数行本来就
+#      不带它们）——判据不能因为"读数里没有这个键"就退化成放行（§110 有这条的反证腿）。
 judge_task_roster() {
-	local line name pres rule age state en act
-	local n=0 absent="" stale="" norule="" unread="" disabled=""
+	local line name pres rule age state en act reg lr
+	local n=0 absent="" stale="" norule="" unread="" disabled="" notrun="" liveNames=""
 	while IFS= read -r line; do
 		case "$line" in
 		TASK\|*) ;;
@@ -1277,9 +1350,19 @@ judge_task_roster() {
 		age="$(printf '%s' "$line" | sed -n 's/.*|age_h=\([^|]*\).*/\1/p')"
 		state="$(printf '%s' "$line" | sed -n 's/.*|state=\([^|]*\).*/\1/p')"
 		en="$(printf '%s' "$line" | sed -n 's/.*|enabled=\([^|]*\).*/\1/p')"
+		reg="$(printf '%s' "$line" | sed -n 's/.*|reg_h=\([^|]*\).*/\1/p')"
+		lr="$(printf '%s' "$line" | sed -n 's/.*|last_run=\([^|]*\).*/\1/p')"
 		act="${line#*|action=}"
 		if [ "$act" = "$line" ]; then act=""; fi
 		n=$((n + 1))
+		if [ "$name" = "__live_names__" ]; then
+			# 观测行：`present=` 在这条里是"现网同族任务条数"，不是判据，所以**不能**落到下面的
+			# 在位判定去（否则会凭空多出一条 absent 红）。它只回答一个问题：那些 present=0 的任务
+			# 是"没装"还是"装了但名字不同"。
+			liveNames="${act}"
+			echo "INFO|ops:task_roster 现网同族任务 ${pres} 条：${act:-（空清单）}"
+			continue
+		fi
 		if [ "$name" = "__service_definitions__" ] || [ "$name" = "__task_roster__" ] || [ "$name" = "__roster-item__" ]; then
 			echo "INFO|ops:task_roster ${name} state=${state:-?}（单源没读到＝第 32 探针没有可查对象，判红而不是放行）"
 			norule="${norule} ${name}:${state:-defs}"
@@ -1287,12 +1370,12 @@ judge_task_roster() {
 		fi
 		if [ "$pres" != "1" ]; then
 			absent="${absent} ${name}(state=${state:-?})"
-			echo "INFO|ops:task_roster name=${name} present=0 state=${state:-?}"
+			echo "INFO|ops:task_roster name=${name} present=0 state=${state:-?} live_names=${liveNames:-未回传}"
 			continue
 		fi
 		if [ "$rule" = "inplace" ]; then
 			# ONLOGON/ONSTART：只查在位，不拿"上次运行时间"当健康度（结构上不由时钟决定）。
-			echo "INFO|ops:task_roster name=${name} present=1 rule=inplace(不判新鲜度) enabled=${en:-na} action=${act}"
+			echo "INFO|ops:task_roster name=${name} present=1 rule=inplace(不判新鲜度) enabled=${en:-na} reg_h=${reg:-na} action=${act}"
 			continue
 		fi
 		case "$rule" in
@@ -1304,11 +1387,38 @@ judge_task_roster() {
 			continue
 			;;
 		esac
+		if [ "$age" = "never" ]; then
+			# PS 侧认定"从未运行"（上次运行是零值哨兵或被年代界挡下）。这里必须把它拆成两种，
+			# 因为两者的处置完全相反：
+			#   ① 注册龄还在阈值内＝刚装上来、触发点还没到 ⇒ 正常。不拆开就会在**每个发版日**
+			#     凭空红一条（部署步 [2e] 用 schtasks /Create /F 删建重注册快照任务，运行历史被清零
+			#     而触发点是次日 04:00）——10-09 首拨就是这条形态，当时的读数是 age=235445.9h 的
+			#     荒谬值（哨兵没被挡住），挡住之后会变成"从未运行"，如果不看注册龄就还是同一枚假红、
+			#     只是换了个数字（§107 DRILL-C：永远红的锁教出来的是所有人忽略红）。
+			#   ② 注册龄已超阈值却一次都没跑过＝该跑没跑 ⇒ 红（这条才是本探针要的判据）。
+			# 注册龄读不出（缺失/na/负数）＝fail-closed 归到②那一侧点名，理由与"上次运行读不出"同：
+			#   本机验不了现网能不能读到任务 XML，读不到就当健康是反向失效。
+			case "$reg" in
+			'' | na | -* | *[!0-9.]*)
+				notrun="${notrun} ${name}(age=never;reg_h=${reg:-missing})"
+				echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg:-missing} => 从未运行且注册龄读不出"
+				;;
+			*)
+				if awk "BEGIN{exit !($reg > $rule)}" 2>/dev/null; then
+					notrun="${notrun} ${name}(age=never;reg_h=${reg}>rule=${rule}h)"
+					echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg}h => 从未运行且注册龄超阈值"
+				else
+					echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg}h enabled=${en:-na} => 刚注册未到触发点(不判红) action=${act}"
+				fi
+				;;
+			esac
+			continue
+		fi
 		case "$age" in
-		'' | na | never | *[!0-9.]*)
+		'' | na | *[!0-9.]*)
 			# 负 age 落在这里（`-` 不是 [0-9.]）但**不能和"读不出"混成一个标签**：
 			# 一台时钟快了几天的机器会用"未来时间"把停更的任务洗成常绿，这条必须单独点名。
-			local why="unreadable-or-never-run"
+			local why="unreadable"
 			case "$age" in -*) why="clock-skew" ;; esac
 			unread="${unread} ${name}(age=${age:-empty};${why};state=${state:-?})"
 			echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=${age:-empty} => ${why}"
@@ -1322,7 +1432,7 @@ judge_task_roster() {
 			# 周期守护被 /disable 着长期停着＝现网止损动作忘了复原（CHECKLIST 的 disable 是临时的）。
 			disabled="${disabled} ${name}"
 		fi
-		echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=${age}h enabled=${en:-na} action=${act}"
+		echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=${age}h enabled=${en:-na} lastrun=${lr:-na} reg_h=${reg:-na} action=${act}"
 	done
 	# 正锁：一条读数都没有＝PS 那一段整个没走到（被前面的异常吞掉、或 heredoc 里被误删）。
 	# "没读数"绝不能算绿，也不能只打一行 INFO 就过去（§70 派生空清单正锁同族）。
@@ -1335,6 +1445,7 @@ judge_task_roster() {
 	[ -n "$stale" ] && bad="${bad} stale=${stale}"
 	[ -n "$norule" ] && bad="${bad} no-freshness-rule=${norule}"
 	[ -n "$unread" ] && bad="${bad} last-run-unreadable=${unread}"
+	[ -n "$notrun" ] && bad="${bad} never-run-beyond-rule=${notrun}"
 	[ -n "$disabled" ] && bad="${bad} disabled=${disabled}"
 	if [ -n "$bad" ]; then
 		echo "FAIL|ops:scheduled-task roster in place + periodic tasks fresh|${bad}"

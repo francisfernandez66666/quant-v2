@@ -66,8 +66,24 @@ $SvcGatewayEnsureIntervalMin = 5
 $SvcTaskQmtctl          = "QMT-Ensure-Running"     # qmtctl 客户端守护（交互会话，每 10 分钟）
 $SvcQmtctlIntervalMin   = 10
 $SvcTaskLogPrune        = "Quant-Log-Prune"        # 日志清理（每日 07:30）
-$SvcTaskAllWatchdog     = "quant-all-wd"           # 全服务 watchdog（RUNBOOK_QMT_DAILY.md:19 在跑）
+# ⚠ 这一行原来的行尾注释写着"在跑"——那是**引用 RUNBOOK §1 的说法，不是读数**。
+#   2026-10-09 第 32 探针首拨实测按这个名字查＝present=0（这台机器上没有叫 `quant-all-wd` 的计划任务）。
+#   注释与现网不一致时以现网为准，并把不一致留在原地当证据（铲掉注释＝铲掉这次反证）。
+#   ★ 只到"按这个名字查不到"为止，**不写成"从来没注册过"**：探针按单源的名字逐个查，
+#   现网若装成了别的名字，这条读数同样是 present=0，而两种成因的处置相反（一种要补注册，
+#   一种要先查是谁改的名）。分型靠探针本轮新加的 __live_names__ 观测行，分型之前不写注册体；
+#   登记与处置动作见 RUNBOOK §4.1b.16。
+$SvcTaskAllWatchdog     = "quant-all-wd"           # 全服务 watchdog（10-09 首拨读数 present=0；是否装了别名＝待 __live_names__ 分型）
 $SvcTaskBackupSnap      = "quant-backup-snap"      # 夜间快照（deploy_guangzhou.sh [6/6] 触发位）
+# §KA-TASKREG 同族的第三条（10-09 批）：08:40 把"杀手任务"QMT-Ensure-Running 重新 enable 并触发一次。
+#   它的存在理由写在 docs/MIGRATION_QMT_DUAL_PATH.md:259 与 RUNBOOK §1 的节奏表第一行——白天测试窗口
+#   会临时 /disable 那个每 10 分钟杀 XtMiniQmt 的任务，靠这条每天早盘把它收回来。执行体
+#   scripts/enable_ensure.ps1 自 §0929OPS-⑪-1 起随部署下发到 ${DEPLOY_DIR}\scripts\（第 29 探针查在位），
+#   **任务本体同样是 2026-09-10 手工 schtasks 出来的**，与本文件此前的名单里没有它＝同一枚缺陷：
+#   名单里没有＝第 32 探针不查它＝"换机/误删后没人知道这条腿没了"。本批把它补进全集。
+#   补进名单的取向：先补**名单**（判据），注册体等读数区分开"根本没装"与"装了但改名"之后再定
+#   （探针本轮新增的 __live_names__ 观测行就是为这件事加的——名字对不上时补注册体会造出第二条腿）。
+$SvcTaskEnsureRestore   = "QMT-Ensure-Restore-0840"           # 工作日 08:40 复原杀手任务
 
 # ── §KA-TASKREG（2026-10-07 修复批 波 3）：17:10 盘后保活任务的注册入口 + 任务全集单源 ──────
 # 缺陷本体（§AUDIT_20261005 P1-D，本机读码锤实，全程未触生产）：
@@ -107,19 +123,24 @@ $SvcTaskRoster = @(
     $SvcTaskLogPrune,
     $SvcTaskAllWatchdog,
     $SvcTaskBackupSnap,
-    $SvcTaskDataloadKeepAlive
+    $SvcTaskDataloadKeepAlive,
+    $SvcTaskEnsureRestore
 )
 
 # ── 新鲜度规则（阈值按**触发周期**定，全仓只此一份）───────────────────────────────────
 # 为什么用 pscustomobject 数组而不是 hashtable 字面量：`@{ $var = 2 }` 的键求值在 PS5.1 上
 # 是可用的但可读性差、且拼错变量名会静默造出一个空键（探针查不到规则⇒要么恒红要么恒绿）。
 # 数组形状让"任务名"与"该多久跑一次"成对出现，加一条就写一行。
+# 10-09 追加第六条（QMT-Ensure-Restore-0840）时的一条取向：**阈值不是统一抄 30，而是按它自己的
+# 触发日历算**——工作日 08:40 的合法最长间隔是周五 08:40 → 周一 08:40 = 72h，给一天余量取 96h。
+# 写 30 的话，每个周一早上的体检都会在系统完全健康时判红，那就是 §107 DRILL-C 那一课的重演。
 $SvcTaskFreshRules = @(
     [pscustomobject]@{ Name = $SvcTaskGatewayEnsure;     MaxAgeHours = 2 },   # 每 5 分钟 ⇒ 2h＝24 个周期没跑
     [pscustomobject]@{ Name = $SvcTaskQmtctl;            MaxAgeHours = 4 },   # 每 10 分钟 ⇒ 4h＝24 个周期
     [pscustomobject]@{ Name = $SvcTaskLogPrune;          MaxAgeHours = 30 },  # 每日 07:30 ⇒ 一天 + 余量
     [pscustomobject]@{ Name = $SvcTaskBackupSnap;        MaxAgeHours = 30 },  # 每日 04:00 ⇒ 与 §P0-B 标记阈值同数
-    [pscustomobject]@{ Name = $SvcTaskDataloadKeepAlive; MaxAgeHours = 30 }   # 每日 17:10 ⇒ 一天 + 余量
+    [pscustomobject]@{ Name = $SvcTaskDataloadKeepAlive; MaxAgeHours = 30 },  # 每日 17:10 ⇒ 一天 + 余量
+    [pscustomobject]@{ Name = $SvcTaskEnsureRestore;     MaxAgeHours = 96 }   # 工作日 08:40 ⇒ 周末 72h + 一天
 )
 # 非周期触发（ONLOGON / ONSTART）的任务**不进** $SvcTaskFreshRules：它们的上次运行时间由
 # "有没有人登录 / 机器有没有重启"决定，不由时钟决定。拿它判新鲜度＝在一台可以连续运行数周

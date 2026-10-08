@@ -6142,7 +6142,7 @@ leg109 'store 无底仓卖出读取侧三腿（流水经 fills_effective 可见�
 
 echo "ok - §109 静态锁 ${CNT109} 道 + 结构腿 + 行为腿（pytest 15 / Go 3）通过"
 
-echo "==> 110 §KA-TASKREG + §KUMA-SECREDTO 计划任务全集探针 + 监控凭据出仓：静态锁 + 派生等值 + 判读函数十二腿 + 反证矩阵..."
+echo "==> 110 §KA-TASKREG + §KUMA-SECREDTO 计划任务全集探针 + 监控凭据出仓：静态锁 + 派生等值 + 判读函数十九腿 + 摘锁反证十二枚 + 反证矩阵..."
 
 # §KA-TASKREG（2026-10-07 修复批 波 3，§AUDIT_20261005 P1-D + P1-E）本段守两件事：
 #   ① 「有脚本无调度」第 N 次同族的**三段闭环**：任务名单/阈值单源（service_definitions.ps1）
@@ -6248,16 +6248,86 @@ CR110=$(ln110 deploy/qmt-win/register_engine_services.ps1 'schtasks /Create /F /
 eq110 scripts/verify_deploy_guangzhou.sh 'ops:scheduled-task roster in place + periodic tasks fresh' 3 '第 32 探针判定名三处同源（PASS 行 / FAIL 行 / 无读数正锁行；改名＝现网明细与门禁文案脱钩）'
 eq110 scripts/verify_deploy_guangzhou.sh 'judge_task_roster' 3 '判读函数三处（注释指涉 / 定义 / 调用点）——定义没被调用＝读数没人判、探针恒绿'
 eq110 scripts/verify_deploy_guangzhou.sh '$SvcTaskRoster' 4 '探针遍历单源集合的四处在位（elseif 空集合判定 + foreach + 两处注释）'
+# ── ④b 10-09 首拨之后的两条读法修（哨兵年代界 + 注册龄）＋ 全集补第三条任务 ──────────────
+# 背景读数（写进锁面，免得下次有人把判据"简化"回去）：首拨时 quant-backup-snap 报
+#   `age=235445.9h`，反算 = 1999-11-30 00:01，是任务计划程序给"从未运行"的零值哨兵；
+#   旧判据只挡 Year -gt 1900，挡不住这个形态 ⇒ 哨兵被当成真运行时间，探针在**健康现网**上
+#   判红（而且每个发版日都红，因为 [2e] 每次都删建重注册）。
+eq110 scripts/verify_deploy_guangzhou.sh 'LastRunTime.Year -gt 2010' 1 '上次运行的年代界（2010 而非 1900：1900 与 1999 两种零值哨兵都挡在门外）'
+eq110 scripts/verify_deploy_guangzhou.sh 'LastRunTime.Year -gt 1900' 0 '旧年代界不许复活（负锁：留着它＝哨兵又变成一条与故障无关的红）'
+eq110 scripts/verify_deploy_guangzhou.sh '"|reg_h=" + $krRegH' 1 '注册龄进读数协议（PS 一侧算，bash 只比大小）'
+eq110 scripts/verify_deploy_guangzhou.sh '"|last_run=" + $krLastRun' 1 '上次运行原始时间戳进读数协议（年代界判定要能被读数复核，而不是让人信判据）'
+eq110 scripts/verify_deploy_guangzhou.sh 'if [ "$age" = "never" ]' 1 '从未运行的两态分流在位（刚注册未到触发点 vs 该跑没跑）'
+eq110 scripts/verify_deploy_guangzhou.sh 'never-run-beyond-rule=${notrun}' 1 '注册龄超阈值仍未运行汇总成红（分流只放" young "那一侧，不放行未知）'
+eq110 scripts/verify_deploy_guangzhou.sh '从未运行且注册龄读不出' 1 'reg_h 缺失/负数/非数字走 fail-closed 并单独点名'
+eq110 scripts/verify_deploy_guangzhou.sh 'unreadable-or-never-run' 0 '旧标签（把"从未运行"与"读不出"压成一个数）不许复活——两者处置相反：一个可能是刚装好，一个是被权限/异常挡住'
+# ── Enabled 读数来源（10-09 自查锤出的第 32 探针第二个缺陷，比年代界那条更隐蔽）────────────
+# 缺陷本体：旧写法只从 Get-ScheduledTaskInfo 那个对象上找 Enabled，而"禁用中"这件事在
+#   **任务定义**（Get-ScheduledTask 的 MSFT_ScheduledTask）上才是权威位置。那个类上如果压根
+#   没有这个属性，读数就恒 "na" ⇒ bash 侧 `enabled=False` 那条判据**在现网结构性失灵**，
+#   而它在门禁里的合成腿（i 腿）照样绿——"判据从没真跑过"的同族，只是这次坏在读数供给侧。
+#   本机没有 PowerShell，这条只能靠**形状**判：两处都试、定义那份排在前面（TaskInfo 因权限
+#   或异常失败时 Enabled 仍然读得到），并且 catch 不许把好读数一起抹成 na。
+eq110 scripts/verify_deploy_guangzhou.sh 'if ($krTask -and $krTask.PSObject.Properties' 1 'Enabled 的第一来源＝任务定义（权威位置；只留运行信息那一份＝这条判据可能在现网恒不触发）'
+eq110 scripts/verify_deploy_guangzhou.sh 'if ($krEnabled -eq "na" -and $krInfo.PSObject.Properties' 1 '第二来源只在第一来源没读到时才拨（两本账：定义给了值又让运行信息覆盖，谁赢看异常顺序）'
+eq110 scripts/verify_deploy_guangzhou.sh "if (\$krInfo.PSObject.Properties['Enabled']) { \$krEnabled" 0 '旧的"只问运行信息"形态不许复活（负锁：它坏的时候没有任何症状，探针一直是绿的）'
+eq110 scripts/verify_deploy_guangzhou.sh '; $krEnabled = "na" }' 0 'TaskInfo 失败不许连带抹掉已取到的 Enabled（负锁：一条腿坏不能把另一条腿的好读数丢掉）'
+CNT110=$((CNT110 + 1))
+EN110A=$(ln110 scripts/verify_deploy_guangzhou.sh 'if ($krTask -and $krTask.PSObject.Properties')
+EN110B=$(ln110 scripts/verify_deploy_guangzhou.sh '$krInfo = Get-ScheduledTaskInfo -TaskName $krName -ErrorAction Stop')
+[ "$EN110A" -gt 0 ] && [ "$EN110B" -gt 0 ] && [ "$EN110A" -lt "$EN110B" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（定义腿取 Enabled@${EN110A} 必须早于 TaskInfo 那条 try@${EN110B}：排在 try 之后＝TaskInfo 一抛异常就永远走不到定义腿，读回 na，正好回到本枚要根除的那个坏形态）"; exit 1; }
+eq110 scripts/verify_deploy_guangzhou.sh 'if [ "$name" = "__live_names__" ]' 1 '观测行在 bash 侧有专用分支（不落到在位判定，否则凭空多一条 absent 红）'
+# 观测行的两个出口各自钉一次，而不是钉「TASK|__live_names__ 出现 2 次」：
+# 实际整串命中是 3 次——协议注释块里也写了这个字面量。计数锚一旦把注释行算进预演数，
+# 注释就背上了判据的重量（改一句说明就红），而反向更坏：删掉两个 Write-Output 出口、
+# 注释还在 ⇒ 计数从 3 掉到 1 也是红，但红的原因要人来分辨。取向是**锚只钉代码形状**：
+# 两个出口各带自己独有的下游文本，注释怎么写都不参与计数（§110 计数锚不混注释的同一条纪律）。
+eq110 scripts/verify_deploy_guangzhou.sh 'Write-Output ("TASK|__live_names__|present="' 1 '观测行的正常回传出口（唯一一处：整个清单只由这一条语句带上任务名串）'
+eq110 scripts/verify_deploy_guangzhou.sh 'TASK|__live_names__|present=0|rule=none|age_h=na|state=live-names-unreadable' 1 '读不到也照样回一条（否定支：现网同族清单读不出＝未知，不能让 absent 行失去对照）'
+CNT110=$((CNT110 + 1))
+LN110A=$(ln110 scripts/verify_deploy_guangzhou.sh 'Write-Output ("TASK|__live_names__|present=" + $krMine.Count')
+LN110B=$(ln110 scripts/verify_deploy_guangzhou.sh 'foreach ($krName in @($SvcTaskRoster)) {')
+[ "$LN110A" -gt 0 ] && [ "$LN110B" -gt 0 ] && [ "$LN110A" -lt "$LN110B" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（现网同族清单@${LN110A} 必须早于任务遍历@${LN110B}：判读是单遍流式，清单晚到 ⇒ absent 行引用它时还是空串，「没装 vs 改了名」这个区分当场失效）"; exit 1; }
+# 全集补第三条任务（QMT-Ensure-Restore-0840）的三处成对：声明 / 进名单 / 定阈值，缺一即红。
+# 为什么用"同一个变量名出现三次"而不是三条各钉一次存在：本段的立身之事就是**名单与阈值必须成对**
+# （§KA-TASKREG 的根因正是脚本在清单里、任务不在名单里），把三处压成一枚计数锁，
+# 将来补名单漏阈值就直接红，而不是等 F2 的集合等值腿去算差集（两道都在，这道更早、更便宜）。
+eq110 deploy/qmt-win/service_definitions.ps1 '$SvcTaskEnsureRestore' 3 '新任务在单源出现三处（声明 + roster + 新鲜度规则）；两处＝补了名单没定阈值或反之'
+eq110 deploy/qmt-win/service_definitions.ps1 'MaxAgeHours = 96' 1 '工作日 08:40 任务的阈值是 96h（周末合法间隔 72h + 一天），不统一抄每日任务的 30'
+eq110 deploy/qmt-win/service_definitions.ps1 'MaxAgeHours = 30' 3 '每日任务阈值 30h 恰三处（快照/日志清理/盘后保活）；加第四条每日任务要连同本枚预演数一起改，别把锁改松'
 CNT110=$((CNT110 + 1))
 sed -n '/^judge_task_roster()/,/^}/p' scripts/verify_deploy_guangzhou.sh > /tmp/w3_jtr_region_110.sh
 AWKRULE=$(grep -cF -- '$age > $rule' /tmp/w3_jtr_region_110.sh || true)
 HARDAGE=$(grep -cE '\$age > [0-9]' /tmp/w3_jtr_region_110.sh || true)
 [ "${AWKRULE:-0}" = "1" ] || { echo "--- FAIL: §110 阈值同源锁 ${CNT110}（判读区里那条 awk 年龄比较不再和读数带回的阈值比，实得 ${AWKRULE}＝0 或 >1；阈值必须是 $SvcTaskFreshRules 里那份，bash 侧不许存常量副本）。顺带一条自伤记录：这行原本把整串「dollar 变量名」抄进 FAIL 文案，全角括号紧跟变量名会被本仓 §23 的变量吞噬守卫判红——文案里引用代码要写成不邻接的说明，别反过来让守卫红在自己的话术上"; exit 1; }
 [ "${HARDAGE:-0}" = "0" ] || { echo "--- FAIL: §110 阈值同源负锁 ${CNT110}（判读区里出现写死小时数 ${HARDAGE} 处＝阈值第二本账，改单源不会带动探针，反过来探针会长期用旧阈值判红）"; exit 1; }
+# 时钟归属（10-09）：注册龄/上次运行的**日期减法只在 PS 一侧做**，bash 只比大小。
+#   为什么钉这一条：判读区一旦有人写 `date -j`（BSD）或 `date -d`（GNU），本机跑得通、
+#   换到另一套 date 语法就静默读出空值，而空值在这段里会被当成"注册龄读不出"判红——
+#   红的原因不是现网坏，是我的判据换了台机器就坏。位置排在 /tmp/w3_jtr_region_110.sh
+#   生成之后（它读的就是那份抽出来的判读区）。
+CNT110=$((CNT110 + 1))
+BASHDATE110=$(grep -cE 'date -[jd]' /tmp/w3_jtr_region_110.sh 2>/dev/null || true)
+[ "${BASHDATE110:-0}" = "0" ] || { echo "--- FAIL: §110 时钟归属负锁 ${CNT110}（判读区里出现 date 命令 ${BASHDATE110} 处＝把日期算术搬回本机；BSD date -j 与 GNU date -d 两套语法，且现网时钟在那台机器上，这里算出来的龄没有意义）"; exit 1; }
 CNT110=$((CNT110 + 1))
 TASKNAME_IN_PROBE=$(grep -vE '^[[:space:]]*#' scripts/verify_deploy_guangzhou.sh | grep -cF 'QMT-Dataload-KeepAlive' || true)
 [ "${TASKNAME_IN_PROBE:-0}" = "0" ] || { echo "--- FAIL: §110 派生正锁 ${CNT110}（探针代码行里出现字面任务名 ${TASKNAME_IN_PROBE} 处＝名单被抄了第二份，新增任务会躲过探针——本批要根除的正是清单式锁）"; exit 1; }
-echo "ok - §110 静态锁 ${CNT110} 道通过（含单实现正锁 1 + 文件面派生负锁 2 + 顺序锁 2 + 阈值/名单同源 3）"
+# 出门文本里的"顺序锁几枚"**派生自本段自己的 FAIL 文案**，不再手写：
+#   上一行原本写着"顺序锁 2"，本段加到第四枚（kuma 参数校验、注册开关、__live_names__ 位置、
+#   Enabled 来源）之后那句话就成了假话——而假话留在绿色输出里，没有人会去查。
+#   尺子是派生 + 下限：枚数从文案计数（每枚顺序锁的 FAIL 行都以「FAIL 前缀 + 这一类锁的名字」开头），
+#   读到 0 或比现值下限还低＝计数模式自己失效（§70 空清单正锁同族），这时宁可可疑不可沉默。
+#   ★ 两处不诚实的形态在这一枚上都会犯，所以按形态拆干净：
+#   其一，计数串**不能混注释**——本段上面那段说明里也写了这类锁的名字，只按锁名计数会多算注释行，
+#     于是绿色输出报"顺序锁 6 枚"而读者只数得出 4 枚（本枚最初就是这个样子）；
+#     所以计数串带上 `--- FAIL: ` 段，注释行里没有它。
+#   其二，计数串**不能把自己算进去**——grep 的模式在文件里是明文，一旦整串出现，这一行就成了第 N+1 枚；
+#     所以把串拆成"字面量前段 + 拼接后段"，文件里任何一行都不含完整串。
+CNT110=$((CNT110 + 1))
+ORDP110='--- FAIL: §110 先后顺序'
+ORD110=$(grep -c -- "${ORDP110}锁" scripts/verify_changes.sh || true)
+[ "${ORD110:-0}" -ge 4 ] || { echo "--- FAIL: §110 分类计数正锁 ${CNT110}（派生出的顺序锁枚数=${ORD110:-0}，<4＝计数模式或 FAIL 文案前缀被人改掉，本段出门文本会开始说谎）"; exit 1; }
+echo "ok - §110 静态锁 ${CNT110} 道通过（其中先后顺序锁 ${ORD110} 枚＝从本段 FAIL 文案派生计数；分项见 ①②③④ 各组标题，不再手写分项数——手写分项每加一枚锁就过一次时）"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # F2 派生集合双向等值腿（"任务名单只有一份"这条主张用机器验，而不是用注释主张）
@@ -6408,10 +6478,47 @@ f3_expect_f2_red() { # $1=标签 $2=期望的 F2-FAIL 点名片段 $3=defs $4=re
 	echo "ok - §110 F3 ${1} => $(gate_clip 96 "$(printf '%s' "$out" | grep -F 'F2-FAIL' | head -1)")"
 }
 
+# ── F3 删行锚自检（10-09 本段自己踩出来的那一条，所以钉在本段正文里）────────────────
+# 形状要求：**按数组元素删行**的锚必须对尾逗号容错（写 `,?`）。元素的行文本由它在第几位决定
+#   （末项没逗号、中间项有），锚按某一种写法刻死，下一次往名单增删项就会把反证腿自己弄瞎——
+#   本批往 roster 末尾追加 $SvcTaskEnsureRestore 时，KeepAlive 那行从末项变中间项，旧锚命中数
+#   从 1 掉到 0，红的是反证不是判据；而这种红最容易被当成"环境坏了"绕过去，正是判据失明的开始。
+# 两个方向都要钉：待扫调用数≥3（扫描表达式自己写坏＝这枚锁退化成恒绿空循环，§70 空清单同族）、
+#   不合格锚数=0。
+CNT110=$((CNT110 + 1))
+ANCHOR_SCAN=$(python3 - <<'PY110ANCH' || true
+import re
+t = open("scripts/verify_changes.sh", encoding="utf-8").read()
+calls = re.findall(r"""f3_drop_line "\$D110/service_definitions\.ps1" '([^']+)'""", t)
+roster_style = [p for p in calls if p.startswith(r"^\s*\$SvcTask")]
+bad = [p for p in roster_style if ",?" not in p]
+print("%d %d %d %s" % (len(calls), len(roster_style), len(bad), "|".join(bad)))
+PY110ANCH
+)
+read -r ASCALLS ASROSTER ASBAD ASWHAT <<<"${ANCHOR_SCAN:-0 0 0 }"
+[ "${ASCALLS:-0}" -ge 3 ] || { echo "--- FAIL: §110 删行锚自检 ${CNT110}（扫到的 f3_drop_line 调用数=${ASCALLS:-0}，<3＝扫描表达式自己写坏了，这枚正在空转；空扫描的锁比没有锁更坏，它让人以为验过）"; exit 1; }
+[ "${ASROSTER:-0}" -ge 2 ] || { echo "--- FAIL: §110 删行锚自检 ${CNT110}（按数组元素删行的锚只剩 ${ASROSTER:-0} 处，<2＝a/a2 两条反证有一条被改成了别的形状，本枚自检失去守护对象）"; exit 1; }
+[ "${ASBAD:-0}" = "0" ] || { echo "--- FAIL: §110 删行锚自检 ${CNT110}（下列按元素删行的锚没对尾逗号容错：${ASWHAT}＝名单一增删项，反证腿会报「锚没命中」而不是报锁红，红错归属）"; exit 1; }
+echo "ok - §110 删行锚自检通过（f3_drop_line 调用 ${ASCALLS} 处，其中按元素删行 ${ASROSTER} 处全部带 ,?）"
+
 # a) 删 roster 里的 keepalive（＝"注册体/名单只有一份"里那份名单少一项）⇒ 集合关系破 + 少出点名
+# ★ 删行锚必须对**尾逗号**容错（10-09 实录：本批往 roster 末尾追加 $SvcTaskEnsureRestore 时，
+#   KeepAlive 那行从"末项无逗号"变成"中间项带逗号"，旧锚 `...KeepAlive\s*$` 命中数掉到 0，
+#   反证腿当场以"锚没命中唯一行"判红）。这不是巧合而是这类锚的固有形状：数组元素的行文本
+#   由**它在第几位**决定，锚按某一位的写法写死，下一次增删元素就会把反证自己弄瞎。
+#   容错写法 `,?` 让"删掉这一项"这件事与位置无关。
 D110="$(f3_rebuild a)"
-f3_drop_line "$D110/service_definitions.ps1" '^\s*\$SvcTaskDataloadKeepAlive\s*$'
+f3_drop_line "$D110/service_definitions.ps1" '^\s*\$SvcTaskDataloadKeepAlive\s*,?\s*$'
 f3_expect_f2_red 'a 删 roster 一项 ⇒ 集合等值必红' "少出=['\$SvcTaskDataloadKeepAlive']" \
+	"$D110/service_definitions.ps1" "$D110/register_engine_services.ps1"
+
+# a2) 删 roster 里**本批新加**的那条（QMT-Ensure-Restore-0840）⇒ 同一枚集合锁、点名新元素。
+# 为什么既有 a 还要 a2：a 腿验的是 keepalive 那条**既有**关系；本批往里加了一个新元素，
+# 不加自己的反证，"集合等值"对新元素就只是"算过了"而不是"验过了"——F2 绿可能因为两边都齐，
+# 也可能因为判据压根没看见它（同族：清单式锁对下一个新增项天生失明，§BOM-REPO-DERIVE 那一课）。
+D110="$(f3_rebuild a2)"
+f3_drop_line "$D110/service_definitions.ps1" '^\s*\$SvcTaskEnsureRestore\s*,?\s*$'
+f3_expect_f2_red 'a2 删新任务 roster 一项 ⇒ 集合等值必红并点名它' "少出=['\$SvcTaskEnsureRestore']" \
 	"$D110/service_definitions.ps1" "$D110/register_engine_services.ps1"
 
 # b) 删新鲜度规则里那一行（＝任务在名单里却没人规定它该多久跑一次）⇒ 同一枚锁、多出点名
@@ -6454,7 +6561,7 @@ fi
 echo "ok - §110 F3 双向镜像反证通过（roster/规则/回退字面量三枚走同一份 python 判据 + 探针侧两枚走同一份锁本体）"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# F1 判读函数行为腿：十二合成读数 + 七枚摘锁反证
+# F1 判读函数行为腿：十九合成读数 + 十二枚摘锁反证
 #   （§KA-TASKREG 把红绿判断从 PowerShell 搬到 bash 的全部理由，就是这一段能在本机真跑）
 # ──────────────────────────────────────────────────────────────────────────────
 CNT110=$((CNT110 + 1))
@@ -6474,6 +6581,18 @@ set -uo pipefail
 printf '%s\n' "$2" | judge_task_roster | grep -E '^(PASS|FAIL)\|' | head -1
 RUN110
 chmod +x "$W3T/run.sh"
+# 第二个跑法：整段输出都留下（INFO 也是判据的一部分，观测行的价值只能从 INFO 里读）。
+# 为什么不给 run.sh 加参数：run.sh 只回判决行，那一行的形状被 §111 钉死了（gate_clip 那枚锁
+# 认的就是 leg110 的 echo），加参数等于动那条锁的锚——老跑法一个字不动，新跑法另起一份。
+cat > "$W3T/runall.sh" <<'RUN110ALL'
+#!/bin/bash
+# 把合成读数喂给判读函数，INFO 与判决一起回（$1=函数文件 $2=读数，可多行）
+set -uo pipefail
+# shellcheck source=/dev/null
+. "$1"
+printf '%s\n' "$2" | judge_task_roster
+RUN110ALL
+chmod +x "$W3T/runall.sh"
 
 leg110() { # $1=用例名 $2=期望 PASS|FAIL $3=FAIL 明细必须点名串 $4=读数
 	local got
@@ -6487,6 +6606,24 @@ leg110() { # $1=用例名 $2=期望 PASS|FAIL $3=FAIL 明细必须点名串 $4=�
 		echo "--- FAIL: §110 F1 ${1}：判红了却没点名 '$3'（红必须说清是哪个任务、因为什么，否则现网还得人工拆读数）"; exit 1;
 	fi
 	echo "ok - §110 F1 ${1} => $(gate_clip 92 "$got")"
+}
+
+legnote110() { # $1=用例名 $2=期望 PASS|FAIL $3=判决必须点名串 $4=整段输出必须包含串 $5=读数
+	local all V
+	CNT110=$((CNT110 + 1))
+	all="$(bash "$W3T/runall.sh" "$W3T/fn.sh" "$5" || true)"
+	V="$(printf '%s\n' "$all" | grep -E '^(PASS|FAIL)\|' | head -1 || true)"
+	[ "$(printf '%s\n' "$all" | grep -cE '^(PASS|FAIL)\|' || true)" = "1" ] || {
+		echo "--- FAIL: §110 F1 ${1}：判决行数≠1（观测腿同样只能给一条结论；两条＝两本账，零条＝判读函数没走到汇总）"; exit 1; }
+	[ "${V%%|*}" = "$2" ] || { echo "--- FAIL: §110 F1 ${1}：期望 $2 实得 ${V}"; exit 1; }
+	if [ "$2" = "FAIL" ] && [ -n "$3" ] && ! printf '%s' "$V" | grep -qF -- "$3"; then
+		echo "--- FAIL: §110 F1 ${1}：判红了却没点名 '$3'"; exit 1;
+	fi
+	# 第四臂是本腿存在的理由：判决对了不算完，**读数必须真的打印给看的人**
+	# （观测行只进内部变量、INFO 行被吞掉＝"加了仪表却没接线"，10-09 复盘的那条形态）。
+	printf '%s\n' "$all" | grep -qF -- "$4" || {
+		echo "--- FAIL: §110 F1 ${1}：整段输出里没有「$4」（判决对但读数没落地＝现网仍然查不到那一手信息）"; exit 1; }
+	echo "ok - §110 F1 ${1} => $(gate_clip 92 "$V")"
 }
 
 KA110_OK='TASK|QMT-Gateway-Ensure|present=1|rule=2|age_h=0.3|state=present+lastrun|enabled=True|action=wscript.exe //B C:\opt\quant\qmt-win\run_qmt_ensure.vbs'
@@ -6503,6 +6640,22 @@ leg110 'i 周期任务被禁用判红（现网 /disable 是临时的，长期停
 leg110 'j 动作行含竖线不劈字段' PASS "" 'TASK|QMT-Dataload-KeepAlive|present=1|rule=30|age_h=3.5|state=present+lastrun|enabled=True|action=cmd /c a.py || cmd /c b.py'
 leg110 'k 单源 dot-source 失败走 defs-unreadable 且判红' FAIL "no-freshness-rule=" 'TASK|__service_definitions__|present=0|rule=none|age_h=na|state=defs-unreadable|enabled=na|action='
 leg110 'l 多任务里一枚超龄即整探针红（其余绿不掩盖它）' FAIL "stale=" "$(printf '%s\n%s' "$KA110_OK" 'TASK|quant-backup-snap|present=1|rule=30|age_h=99.9|state=present+lastrun|enabled=True|action=y')"
+
+# ── m…s：10-09 首拨之后补的七条（从未运行两态 + 注册龄 fail-closed + 观测行 + 旧格式兼容）──
+# 这批读数是**照首拨现网真实形态写的**，不是编的：quant-backup-snap 每次发版被 [2e] 删建重注册，
+# 上次运行读成 never 而触发点是次日 04:00 —— 旧判据把这种正常形态读成红（先哨兵值 235445.9h，
+# 挡住后又变成"从未运行"），m 腿就是那条假红的复现；n/p 腿证明"装了很久却一次没跑"仍然必须红，
+# 否则挡住假红的同时把真红也一起放掉了（等值锁非单向锁：只往绿的方向修＝把判据修没了）。
+leg110 'm 从未运行但注册龄还在阈值内＝刚装上来，不判红（发版日假红的复现腿）' PASS "" 'TASK|quant-backup-snap|present=1|rule=30|age_h=never|state=never-run|enabled=True|reg_h=5.0|last_run=na|action=powershell -File backup_snapshot.ps1'
+leg110 'n 从未运行且注册龄超阈值＝该跑没跑，判红并点名 never-run-beyond-rule' FAIL "never-run-beyond-rule=" 'TASK|QMT-Dataload-KeepAlive|present=1|rule=30|age_h=never|state=never-run|enabled=True|reg_h=120.0|last_run=na|action=cmd /c python x.py'
+leg110 'o 从未运行且注册龄读不出（没有 reg_h 这个键）＝fail-closed 判红，不许当"新装的"' FAIL "reg_h=missing" 'TASK|Quant-Log-Prune|present=1|rule=30|age_h=never|state=never-run|enabled=True|action=powershell -File prune_logs.ps1'
+leg110 'p 注册龄是负数＝现网时钟/注册节点异常，单独点名而不是洗成绿' FAIL "reg_h=-3.2" 'TASK|QMT-Gateway-Ensure|present=1|rule=2|age_h=never|state=never-run|enabled=True|reg_h=-3.2|last_run=na|action=x'
+# q/s 走 legnote110：观测行的价值全在 INFO 里，判决行看不出来（只断 PASS 会放过"分支在但清单没打印"）。
+legnote110 'q 只有观测行时判绿，且现网同族清单真的打印出来' PASS "" '现网同族任务 3 条' 'TASK|__live_names__|present=3|rule=none|age_h=na|state=live-names|enabled=na|action=QMT-Ensure-Gateway,Quant-Log-Prune,QMT-Qmtctl-Ensure'
+leg110 'r 旧格式读数（没有 reg_h/last_run 两个新键）+ 数字年龄照旧判绿＝协议向后兼容' PASS "" 'TASK|quant-backup-snap|present=1|rule=30|age_h=12.0|state=present+lastrun|enabled=True|action=powershell -File backup_snapshot.ps1'
+# s 是本批加观测行要回答的那个问题：present=0 到底是"根本没装"还是"装了但改了名"。
+# 前者要注册，后者要先查是谁改的名——处置不同，所以缺席行必须把同族清单带在身边。
+legnote110 's 缺席任务把同族清单一起报出来（absent 的处置由清单决定）' FAIL "absent=" 'live_names=QMT-Ensure-Gateway,quant-all-watchdog-old' "$(printf '%s\n%s' 'TASK|__live_names__|present=2|rule=none|age_h=na|state=live-names|enabled=na|action=QMT-Ensure-Gateway,quant-all-watchdog-old' 'TASK|quant-all-wd|present=0|rule=inplace|age_h=na|state=absent|enabled=na|action=')"
 
 mut110() { # 摘锁反证：$1=标签 $2=原串（必须恰好出现一次）$3=替换串 $4=读数 $5=摘锁后期望判决
 	local got
@@ -6523,7 +6676,7 @@ PY110MUT
 		echo "--- FAIL: §110 反证 ${1}：摘锁后期望 $5 实得 ${got%%|*}（${got}）——说明该判据本来就没起作用，正向腿是蒙对的"; exit 1; }
 	echo "ok - §110 反证 ${1}（摘锁 => ${5}）"
 }
-# 正向七枚：每条摘掉一处判据，对应合成读数必须从红转绿——这证明那条绿是这条判据给的。
+# M1–M7：每条摘掉一处判据，对应合成读数必须翻转——这证明那条判决是这条判据给的。
 mut110 'M1 摘"零读数判红"正锁 ⇒ g 转绿' '[ "$n" -eq 0 ]' '[ "$n" -eq 99999 ]' "" PASS
 mut110 'M2 摘超龄比较 ⇒ b 转绿' 'exit !($age > $rule)' 'exit 1' 'TASK|quant-backup-snap|present=1|rule=30|age_h=72.5|state=present+lastrun|enabled=True|action=powershell -File backup_snapshot.ps1' PASS
 # M3 的读数刻意选"缺席但时间字段新鲜"那种（age=1.0h、rule=30）：如果用 c 那条（age=na）做反证，
@@ -6537,6 +6690,18 @@ mut110 'M6 摘禁用判定 ⇒ i 转绿' '[ -n "$disabled" ] && bad="${bad} disa
 # 它证的是 §107 DRILL-C 那一课——ONLOGON/ONSTART 任务的上次运行时间不由时钟决定，
 # 拿它当健康度判据会在健康现网上永远红，而"永远红的锁"教出来的是所有人忽略红。
 mut110 'M7 摘 rule=inplace 提前放行 ⇒ f 转红（这条保护是有意加的，不是漏判）' '[ "$rule" = "inplace" ]' '[ "$rule" = "zz-never-match" ]' 'TASK|QMT-Gateway-Logon|present=1|rule=inplace|age_h=na|state=present+lastrun|enabled=True|action=powershell -File start_gateway.ps1' FAIL
+# ── M8…M12：10-09 新加的三条判读（从未运行分流 / 注册龄比较 / 注册龄未知 fail-closed / 观测行分支）各配一枚 ──
+# 每枚用**自己独有**的读数（纪律 4：段内首红即退，归属不能串）：
+#   M8 摘分流 ⇒ m 转红（证明"挡住假红"这件事是分流给的，不是年代界自己做到——年代界在 PS 一侧，本机跑不到）
+#   M9 摘注册龄比较 ⇒ n 转绿（证明"装了很久没跑"这条真红靠的是那次比较）
+#   M10 摘 fail-closed 收集 ⇒ o 转绿（证明未知值不会自己变红；这一枚是本段最容易被"简化"掉的一条）
+#   M11 摘 notrun 汇总 ⇒ p 转绿（收集到了却没进 bad＝白收集，同 §107"判据算了但没人判"）
+#   M12 摘观测行分支 ⇒ q 转红（观测行落到在位判定，凭空多一条 absent 红——那枚专用分支是有承重作用的）
+mut110 'M8 摘"从未运行"分流 ⇒ m 转红（分流不可达时 never 被读不出接住，假红复活）' '[ "$age" = "never" ]' '[ "$age" = "zz-never-match" ]' 'TASK|quant-backup-snap|present=1|rule=30|age_h=never|state=never-run|enabled=True|reg_h=5.0|last_run=na|action=powershell -File backup_snapshot.ps1' FAIL
+mut110 'M9 摘注册龄与阈值的比较 ⇒ n 转绿（装了 120h 一次没跑会被无声放行）' 'exit !($reg > $rule)' 'exit 1' 'TASK|QMT-Dataload-KeepAlive|present=1|rule=30|age_h=never|state=never-run|enabled=True|reg_h=120.0|last_run=na|action=cmd /c python x.py' PASS
+mut110 'M10 摘注册龄未知的 fail-closed 收集 ⇒ o 转绿（"没有这个键"从红变成绿＝反向失效）' 'notrun="${notrun} ${name}(age=never;reg_h=${reg:-missing})"' 'notrun="${notrun}"' 'TASK|Quant-Log-Prune|present=1|rule=30|age_h=never|state=never-run|enabled=True|action=powershell -File prune_logs.ps1' PASS
+mut110 'M11 摘 never-run 汇总进 bad ⇒ p 转绿（收集了却不点名＝判据算了没人判）' '[ -n "$notrun" ] && bad="${bad} never-run-beyond-rule=${notrun}"' '[ -n "" ] && bad="$bad"' 'TASK|QMT-Gateway-Ensure|present=1|rule=2|age_h=never|state=never-run|enabled=True|reg_h=-3.2|last_run=na|action=x' PASS
+mut110 'M12 摘观测行专用分支 ⇒ q 转红（清单行被当成任务在位判定，凭空多一条 absent）' '[ "$name" = "__live_names__" ]' '[ "$name" = "zz-live-names" ]' 'TASK|__live_names__|present=3|rule=none|age_h=na|state=live-names|enabled=na|action=QMT-Ensure-Gateway,Quant-Log-Prune,QMT-Qmtctl-Ensure' FAIL
 rm -f "$W3T/fn_mut.sh"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -6731,7 +6896,7 @@ gate_need 110 "$IP110_HAS" '§107 的派生 IP 扫描没在本段之前跑完（
 CNT110=$((CNT110 + 1))
 [ "${IP_SCAN_N:-0}" -ge 13 ] || { echo "--- FAIL: §110 交接正锁 ${CNT110}（§107 的待扫文件数=${IP_SCAN_N}，<13＝那条 glob 已被人改窄，本段继承的是空扫描）"; exit 1; }
 echo "ok - §110 交接锁：沿用 §107 派生扫描读数（待扫文件 ${IP_SCAN_N} 个 / 字面公网 IP ${IP_HITS} 处）"
-echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十三腿与摘锁反证七枚 + F3 Mac 侧五组与 kuma 必传腿，累计判定点 ${CNT110}"
+echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十九腿与摘锁反证十二枚 + F3 Mac 侧五组与 kuma 必传腿，累计判定点 ${CNT110}"
 
 echo "==> 111 §P2-L/§P2-K/§P2-M 门禁体系自身（波 4）：收集模式驱动 + 装配器 + 编码口径 + DNS 注入点——静态锁、镜像行为腿与五枚「本批真踩过的坑」的反证..."
 
@@ -6873,8 +7038,9 @@ eq111 "$GPY111" 'lines = read_lines(gate)' 6 '其余六个入口（sections/help
 # 三把尺子都是「代码行」锚（`^[[:space:]]*[^#]`）而不是全文计数：本段上面那份说明注释里
 # 抄了旧写法 `${got:0:92}` 作为成因描述，按全文计数就会把这枚锁自己判红（§0929DRILL 同族：
 # 负向 grep 误伤说明注释）。要禁的是**执行态**，不是提它。
-eq111 "$GB111" 'gate_clip() {' 1 '按字符截断的单实现（三处回显共用；写第三份切片就是第二本账）'
-eq111 "$GB111" 'echo "ok - §110 F1 ${1} => $(gate_clip 92 "$got")"' 1 'F1 十二腿的读数回显走 gate_clip（就是 04:39 那轮劈坏一个汉字的那一行）'
+eq111 "$GB111" 'gate_clip() {' 1 '按字符截断的单实现（本段所有读数回显共用这一份；再写一份切片就是第二本账）'
+eq111 "$GB111" 'echo "ok - §110 F1 ${1} => $(gate_clip 92 "$got")"' 1 'F1 判决腿的读数回显走 gate_clip（就是 04:39 那轮劈坏一个汉字的那一行）'
+eq111 "$GB111" 'echo "ok - §110 F1 ${1} => $(gate_clip 92 "$V")"' 1 'F1 观测腿（10-09 加的 legnote110）同样走 gate_clip——新加的回显口子和老的一样会把中文读数截成半个字，不能只给老的那条上锁'
 CNT111=$((CNT111 + 1))
 for _p in '^[[:space:]]*[^#].*head -c ' '^[[:space:]]*[^#].*cut -c' '^[[:space:]]*[^#].*\$\{[A-Za-z_][A-Za-z0-9_]*:0:[0-9]+\}'; do
 	_n=$(code_hits111 "$GB111" "$_p")
