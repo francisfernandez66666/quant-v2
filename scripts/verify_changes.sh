@@ -1888,7 +1888,7 @@ nBomTargets=$(printf '%s\n' "$bomTargets" | grep -c . || true)
 for ps1 in $bomTargets; do
 	[ -f "$ps1" ] \
 		|| { echo "--- FAIL: 部署脚本对不存在的文件做 ps1_bom 归一（${ps1}）——上传步骤会把失败推到现网"; exit 1; }
-	python3 - "$ps1" <<'PY' || { echo "--- FAIL: $ps1 仓库字节 BOM 不合规（手工安装路径首跑必炸）"; exit 1; }
+	python3 - "$ps1" <<'PY' || { echo "--- FAIL: $ps1 仓库字节 BOM/首行不合规（手工安装路径首跑必炸）"; exit 1; }
 import sys
 d = open(sys.argv[1], 'rb').read()
 n = 0
@@ -1896,6 +1896,18 @@ while d[n:].startswith(b'\xef\xbb\xbf'):
 	n += 3
 assert n == 3, 'BOM 个数=%d（需恰好 1 个）' % (n // 3)
 d.decode('utf-8')
+# §PS1-FIRSTLINE（2026-10-09 发版实录，波 3 提交 e3fac8b 造成的现网 abort）：
+# 批量改写把两个 dot-source 文件的**首行行首 `#` 吞掉**（register_engine_services.ps1 掉
+# `# Re`、service_definitions.ps1 掉 `# `），于是仓库里那行不再是注释而是"执行一个叫
+# service_definitions.ps1 的命令"。后果不是文本难看：dot-source 时 PowerShell 抛
+# CommandNotFoundException，ensure_gateway_config.ps1 那条 ssh 因此非零返回，
+# 整轮 deploy_guangzhou.sh 在 [2b] 之后中止（服务停在停机态、前端与 [2e]/[3b] 都没跑）。
+# 为什么必须由机器钉：本机没有 PowerShell，ps1 的**语法**在这个仓库里永远无法被解析器看见，
+# BOM 锁只保证"字节可被 PS5.1 正确解码"，解码之后首行是注释还是命令它看不见。
+# 判据形状＝剥掉单个前导 BOM 后首行以 `#` 起（这些文件都是 dot-source 片段或 -File 执行体，
+# 首行按仓规必须是自述注释；纯代码开头的诊断脚本不在本清单射程，因为本清单从 ps1_bom 派生）。
+first = d[3:].decode('utf-8').split('\n', 1)[0].lstrip('\ufeff')
+assert first.startswith('#'), '首行不是注释（%r）——dot-source 时 CommandNotFoundException 会中止部署链' % first[:48]
 PY
 done
 # 落盘目录三方同源：部署上传位 == 任务默认指向 == RUNBOOK 手工安装位（否则"更新一份、执行另一份"）。

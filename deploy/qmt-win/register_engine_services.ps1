@@ -1,4 +1,4 @@
-﻿gister_engine_services.ps1 - Guangzhou all-in-one: register engine Windows services (NSSM) + qmtctl task scheduler.
+﻿# register_engine_services.ps1 - Guangzhou all-in-one: register engine Windows services (NSSM) + qmtctl task scheduler.
 # Usage (admin PowerShell):
 #   powershell -ExecutionPolicy Bypass -File register_engine_services.ps1 `
 #       -QuantExe C:\opt\quant\quant.exe -ResearchExe C:\opt\quant\researchd.exe `

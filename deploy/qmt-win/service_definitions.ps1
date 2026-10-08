@@ -1,4 +1,4 @@
-﻿service_definitions.ps1 — §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯）Windows 部署
+﻿# service_definitions.ps1 — §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯）Windows 部署
 # 「服务/任务定义」唯一来源（dot-source 配置片段，样式承袭 §H8 service_probe_config.ps1）。
 #
 # 消费方：all_service_watchdog.ps1、gateway_watchdog.ps1、register_engine_services.ps1、
