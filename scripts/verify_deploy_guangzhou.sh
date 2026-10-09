@@ -1167,11 +1167,15 @@ Probe "sec: snapshot/restic dirs expose no ACE outside SYSTEM+Administrators" (-
 #   正是那次手工修）。本探针是三段修法的第三段：①任务名单/阈值单源＝service_definitions.ps1 的
 #   $SvcTaskRoster + $SvcTaskFreshRules + $SvcTaskInPlaceOnly；②注册体＝register_engine_services.ps1
 #   §6b（缺省只预演、-RegisterKeepaliveTask 才动手）；③本探针。
-# 输出协议：每任务一行 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|reg_h=..|last_run=..|action=..`，
+# 输出协议：每任务一行 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|reg_h=..|last_run=..|en_src=..|reg_src=..|action=..`，
 #   **只有读数、没有判词**；红绿由 bash 侧 judge_task_roster() 判（见本文件下方）。
 #   另有一条 `TASK|__live_names__|...` 观测行（现网同族任务名清单，只转 INFO、不参与判读）。
 #   reg_h/last_run 是 10-09 首拨之后补的两把：前者＝注册龄（分开"刚装还没到触发点"与"该跑没跑"
 #   两种从未运行），后者＝上次运行的原始时间戳（让年代界判定可被读数复核，而不是让人信判据）。
+#   en_src/reg_src 是 10-10 那次"八条 enabled 与 reg_h 全 na"之后补的**读法自证**（取值
+#   xml-byname / xml-adapter / defs-prop / info-prop / implausible / parse-failed / none）：
+#   供给侧失灵的形态是"读数恒 na 而判据照常绿"，光有值没有来源时，红了仍然要人上机猜一次。
+#   两把只进 INFO、**不参与判读**（拿读法来源当判据＝把"我的式子换了条路"当成健康度变化）。
 #   缺字段容错：三条伪读数行（defs-unreadable / roster-empty / item-empty）不带这两个键，
 #   bash 侧按 `|key=` 前缀取，取不到就是空——空值走 fail-closed，不会因为"没这个字段"放行。
 #   为什么判读不放 PS：本机没有 PowerShell，判据写在 PS 就是"从没真跑过的判据"——§0929DRILL 四条
@@ -1237,7 +1241,7 @@ if (-not $krDefsOk) {
         elseif ($krHits.Count -eq 1) { $krRuleTxt = [string]$krHits[0].MaxAgeHours }
         elseif ($SvcTaskInPlaceOnly -and (@($SvcTaskInPlaceOnly) -contains $krName)) { $krRuleTxt = "inplace" }
         $krPresent = "0"; $krAge = "na"; $krState = "absent"; $krEnabled = "na"; $krAction = ""
-        $krLastRun = "na"; $krRegH = "na"
+        $krLastRun = "na"; $krRegH = "na"; $krEnSrc = "none"; $krRegSrc = "none"
         schtasks /Query /TN $krName 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) {
             $krPresent = "1"; $krState = "present"
@@ -1245,18 +1249,51 @@ if (-not $krDefsOk) {
             # 分成两次调用不省事，反而多一个"两次读到不同版本"的窗口（现网中途重注册时）。
             $krTask = $null
             try { $krTask = Get-ScheduledTask -TaskName $krName -ErrorAction Stop } catch { $krTask = $null }
-            # Enabled 挂在哪一个对象上**不赌**（§DRILL-A 那一条：拿某个版本的属性形状当判据前提，
-            # 换了机器/版本就静默失灵）：任务定义（Get-ScheduledTask 的 MSFT_ScheduledTask）与
-            # 运行信息（Get-ScheduledTaskInfo）两处都试，先取定义那一份，取不到再取运行信息那份，
-            # 两份都没有就留 "na"。为什么把定义那份排在**前面**（而不是只补一条兜底）：
-            # 定义腿不依赖 TaskInfo 那条 try，TaskInfo 因权限或异常失败时 Enabled 依然读得到——
-            # 旧写法只从运行信息里找，那个类上若没有这个属性，"周期任务被禁用判红"这条在现网
-            # 就是**结构性失灵**（读数恒 na、bash 恒不判），而它在门禁里的合成腿照样绿：
-            # 这正是本批要根除的"判据从没真跑过"。
-            if ($krTask -and $krTask.PSObject.Properties['Enabled']) { $krEnabled = [string]$krTask.Enabled }
+            # 定义侧的三把（Enabled / 注册龄 / 动作行）都从**任务 XML**取，不赌 CimInstance 的属性形状。
+            # 为什么改这一条：10-09 夜间首拨的现网读数就是它自己教出来的——旧写法用
+            # `[xml][string]$krTask.Task` 取注册节点，而 PS5.1 上 `.Task` 是个 CimInstance，
+            # 字符串化得到的是类型名而不是那份 XML ⇒ **八条任务的 reg_h 全读成 na**；同一次拨测里
+            # `PSObject.Properties['Enabled']` 在定义腿与运行信息腿上都没命中 ⇒ **enabled 也八条全 na**。
+            # 两把一起失灵意味着"周期任务被禁用判红"与"从未运行按注册龄分型"在现网都是**结构性失灵**
+            # （读数恒 na、bash 恒不判），而它们各自在门禁里的合成腿照绿——正是本批要根除的那一族，
+            # 这次是被一次真拨测当场锤出来的，不是被读码想到的。
+            # MSFT_ScheduledTask 的 `.Xml` 才是任务定义文本，schtasks /Create 一定会写
+            # `<RegistrationInfo><Date>` 与 `<Settings><Enabled>`；解析一次、三把各自取，
+            # 任一把取不到只把它自己留成 na（一条读腿失败不连带弄坏另一条）。
+            $krXml = $null
+            if ($krTask) { try { $krXml = [xml][string]$krTask.Xml } catch { $krXml = $null } }
+            # ★ 但"换成 .Xml"本身还只是一个**新的赌注**：计划任务 XML 带默认命名空间，适配式访问
+            #   （直接 $krXml.Task.Settings.Enabled）在带命名空间的文档上是否给值、`[string]` 一个 XmlElement
+            #   给的是 InnerText 还是类型名——这两条我在这台机器上都**没法本机验**。而"没法验"正是上一个
+            #   缺陷的出身（那次也是"我确定 `.Task` 那份是 XML"）。所以这里不选一条走到底，而是
+            #   **两条都走 + 自报走了哪条**（en_src / reg_src 两个键；先按局部名取元素，它与命名空间无关，
+            #   再退回适配式，且遇到元素对象就显式取 InnerText）。取向与 §N-5 服务 env 腿的
+            #   `read=registry|nssm-text` 同一条先例：读数要么带出值，要么带出"哪条路都没通"，
+            #   红项自己说清"是现网坏还是我的读法坏"，不需要再拿一趟上机去猜。
+            # Enabled 的取值链四级：XML 按名 → XML 适配 → 定义对象属性 → 运行信息对象属性。
+            # 注意**不要写 `[bool]$节点`**：PowerShell 里 `[bool]"false"` 是 $true（非空字符串即真），
+            # 那会把"已禁用"洗成"已启用"，正好把这条判据反着弄坏——那不是读不到，是**读反**。
+            # 所以按字面量映射成 bash 侧认的 "True"/"False" 拼写（与门禁合成读数同一口径），映射不上留 na。
+            $krEnNode = ""
+            if ($krXml) {
+                try {
+                    $krEnList = $krXml.GetElementsByTagName("Enabled")
+                    if ($krEnList -and $krEnList.Count -gt 0) { $krEnNode = [string]$krEnList[0].InnerText; $krEnSrc = "xml-byname" }
+                } catch { $krEnNode = "" }
+                if (-not $krEnNode) {
+                    try {
+                        $krEnRaw = $krXml.Task.Settings.Enabled
+                        if ($krEnRaw -is [System.Xml.XmlElement]) { $krEnNode = [string]$krEnRaw.InnerText } else { $krEnNode = [string]$krEnRaw }
+                        if ($krEnNode) { $krEnSrc = "xml-adapter" }
+                    } catch { $krEnNode = "" }
+                }
+            }
+            if ($krEnNode -eq "true") { $krEnabled = "True" }
+            elseif ($krEnNode -eq "false") { $krEnabled = "False" }
+            elseif ($krTask -and $krTask.PSObject.Properties['Enabled']) { $krEnabled = [string]$krTask.Enabled; $krEnSrc = "defs-prop" }
             try {
                 $krInfo = Get-ScheduledTaskInfo -TaskName $krName -ErrorAction Stop
-                if ($krEnabled -eq "na" -and $krInfo.PSObject.Properties['Enabled']) { $krEnabled = [string]$krInfo.Enabled }
+                if ($krEnabled -eq "na" -and $krInfo.PSObject.Properties['Enabled']) { $krEnabled = [string]$krInfo.Enabled; $krEnSrc = "info-prop" }
                 # 年代界用 2010 而不是 1900（2026-10-09 首拨实录逼出来的）：那次读出的
                 # LastRunTime 反算 = 1999-11-30 00:01，是任务计划程序给"从未运行"的零值哨兵
                 # 在 UTC+8 下的展开形态（另一形态是 1900-01-01）。旧判据只挡 1900 ⇒ 哨兵被当成
@@ -1283,14 +1320,37 @@ if (-not $krDefsOk) {
             # 为什么算在 PS 一侧而不是把日期串交给 bash 算：现网时钟在那台机器上，而本机做日期
             #   减法要同时伺候 BSD `date -j -f` 与 GNU `date -d` 两套语法——把只有正确时钟的一侧
             #   能算对的量留在那一侧，bash 只比大小（与 age_h 同一口径）。
-            if ($krTask) {
+            # 注册时刻同样只用上面那一次解析成果（不另起一次 Get-ScheduledTask——那会多出
+            #   "两次读到不同版本"的窗口）。为什么必须用 $krXml 而不是 $krTask：见上面那段首拨实录，
+            #   `.Task` 字符串化得到类型名，`[xml]` 解析它必抛，于是整块进 catch、读数恒 na，
+            #   而恒 na 在 bash 侧是"注册龄读不出"的 fail-closed 红项：**红的原因不是现网坏，
+            #   是我的读法在那台机器上从来没走到过能算出数的那条路**。
+            # 取元素的两条路与 Enabled 那四级的主干相同：先按局部名（与命名空间无关），
+            #   再退回适配式；两条都不通就留 na 并把 src 写成 none，别让"我换了个式子"冒充"我读到了"。
+            # 年代界（2010，与"上次运行"那把同源）在这里**不是防现网坏，是防我自己取错元素**：
+            #   GetElementsByTagName("Date") 按名字取，任务 XML 里若还有别的 Date 元素，拿到的就是别的时刻；
+            #   一个过老的日期正是那种错读的形状，所以取错就当读不出，而不是拿假龄去比阈值。
+            $krRegNode = ""
+            if ($krXml) {
                 try {
-                    $krRegNode = ([xml][string]$krTask.Task).Task.RegistrationInfo.Date
-                    if ($krRegNode) {
-                        $krRegDt = [datetime]::Parse([string]$krRegNode, [System.Globalization.CultureInfo]::InvariantCulture)
+                    $krRegList = $krXml.GetElementsByTagName("Date")
+                    if ($krRegList -and $krRegList.Count -gt 0) { $krRegNode = [string]$krRegList[0].InnerText; $krRegSrc = "xml-byname" }
+                } catch { $krRegNode = "" }
+                if (-not $krRegNode) {
+                    try {
+                        $krRegRaw = $krXml.Task.RegistrationInfo.Date
+                        if ($krRegRaw -is [System.Xml.XmlElement]) { $krRegNode = [string]$krRegRaw.InnerText } else { $krRegNode = [string]$krRegRaw }
+                        if ($krRegNode) { $krRegSrc = "xml-adapter" }
+                    } catch { $krRegNode = "" }
+                }
+            }
+            if ($krRegNode) {
+                try {
+                    $krRegDt = [datetime]::Parse($krRegNode, [System.Globalization.CultureInfo]::InvariantCulture)
+                    if ($krRegDt.Year -gt 2010) {
                         $krRegH = [string]([math]::Round(((Get-Date) - $krRegDt).TotalHours, 1))
-                    }
-                } catch { $krRegH = "na" }
+                    } else { $krRegH = "na"; $krRegSrc = "implausible" }
+                } catch { $krRegH = "na"; $krRegSrc = "parse-failed" }
             }
             if ($krTask) {
                 $krParts = @()
@@ -1309,7 +1369,8 @@ if (-not $krDefsOk) {
         if ($krAction.Length -gt 160) { $krAction = $krAction.Substring(0, 160) }
         Write-Output ("TASK|" + $krName + "|present=" + $krPresent + "|rule=" + $krRuleTxt +
             "|age_h=" + $krAge + "|state=" + $krState + "|enabled=" + $krEnabled +
-            "|reg_h=" + $krRegH + "|last_run=" + $krLastRun + "|action=" + $krAction)
+            "|reg_h=" + $krRegH + "|last_run=" + $krLastRun +
+            "|en_src=" + $krEnSrc + "|reg_src=" + $krRegSrc + "|action=" + $krAction)
     }
 }
 PSEOF
@@ -1320,7 +1381,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 # ── §KA-TASKREG 第 32 探针的判读（第 32 探针／bash 侧，2026-10-07 波 3）───────────────────
-# 输入：PS 回传的 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|reg_h=..|last_run=..|action=..` 行；
+# 输入：PS 回传的 `TASK|<name>|present=..|rule=..|age_h=..|state=..|enabled=..|reg_h=..|last_run=..|en_src=..|reg_src=..|action=..` 行；
 # 输出：每任务一行 INFO|（绿也要看得到数）+ **恰好一行** PASS| 或 FAIL|。
 # 为什么判读在 bash 而不在 PS：本机没有 PowerShell，判据写在 PS 就永远只能是"从没真跑过的判据"
 #   （§0929DRILL 四条缺陷的共同根因）。写成纯 bash 之后，门禁 §110 能直接喂合成读数逐条验
@@ -1336,7 +1397,7 @@ $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 #   ④ 新增的 reg_h/last_run 两个键**取不到就是空**，空值一律走 fail-closed（三条伪读数行本来就
 #      不带它们）——判据不能因为"读数里没有这个键"就退化成放行（§110 有这条的反证腿）。
 judge_task_roster() {
-	local line name pres rule age state en act reg lr
+	local line name pres rule age state en act reg lr ens rgs
 	local n=0 absent="" stale="" norule="" unread="" disabled="" notrun="" liveNames=""
 	while IFS= read -r line; do
 		case "$line" in
@@ -1352,6 +1413,11 @@ judge_task_roster() {
 		en="$(printf '%s' "$line" | sed -n 's/.*|enabled=\([^|]*\).*/\1/p')"
 		reg="$(printf '%s' "$line" | sed -n 's/.*|reg_h=\([^|]*\).*/\1/p')"
 		lr="$(printf '%s' "$line" | sed -n 's/.*|last_run=\([^|]*\).*/\1/p')"
+		# 读法来源两把**只观测、不判读**（不参与任何红绿分支）：它们回答的是"这条 enabled 是从
+		# 哪一式读来的／为什么没读来"，把它当健康度会把"我的式子换了条路"读成现网变化。
+		# 缺键就是空串（三条伪读数行与旧格式读数都没有这两个键），空串在 INFO 里显示 na。
+		ens="$(printf '%s' "$line" | sed -n 's/.*|en_src=\([^|]*\).*/\1/p')"
+		rgs="$(printf '%s' "$line" | sed -n 's/.*|reg_src=\([^|]*\).*/\1/p')"
 		act="${line#*|action=}"
 		if [ "$act" = "$line" ]; then act=""; fi
 		n=$((n + 1))
@@ -1375,7 +1441,7 @@ judge_task_roster() {
 		fi
 		if [ "$rule" = "inplace" ]; then
 			# ONLOGON/ONSTART：只查在位，不拿"上次运行时间"当健康度（结构上不由时钟决定）。
-			echo "INFO|ops:task_roster name=${name} present=1 rule=inplace(不判新鲜度) enabled=${en:-na} reg_h=${reg:-na} action=${act}"
+			echo "INFO|ops:task_roster name=${name} present=1 rule=inplace(不判新鲜度) enabled=${en:-na} en_src=${ens:-na} reg_h=${reg:-na} reg_src=${rgs:-na} action=${act}"
 			continue
 		fi
 		case "$rule" in
@@ -1401,14 +1467,14 @@ judge_task_roster() {
 			case "$reg" in
 			'' | na | -* | *[!0-9.]*)
 				notrun="${notrun} ${name}(age=never;reg_h=${reg:-missing})"
-				echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg:-missing} => 从未运行且注册龄读不出"
+				echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg:-missing} reg_src=${rgs:-na} enabled=${en:-na} en_src=${ens:-na} => 从未运行且注册龄读不出"
 				;;
 			*)
 				if awk "BEGIN{exit !($reg > $rule)}" 2>/dev/null; then
 					notrun="${notrun} ${name}(age=never;reg_h=${reg}>rule=${rule}h)"
-					echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg}h => 从未运行且注册龄超阈值"
+					echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg}h reg_src=${rgs:-na} enabled=${en:-na} en_src=${ens:-na} => 从未运行且注册龄超阈值"
 				else
-					echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg}h enabled=${en:-na} => 刚注册未到触发点(不判红) action=${act}"
+					echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=never reg_h=${reg}h reg_src=${rgs:-na} enabled=${en:-na} en_src=${ens:-na} => 刚注册未到触发点(不判红) action=${act}"
 				fi
 				;;
 			esac
@@ -1432,7 +1498,7 @@ judge_task_roster() {
 			# 周期守护被 /disable 着长期停着＝现网止损动作忘了复原（CHECKLIST 的 disable 是临时的）。
 			disabled="${disabled} ${name}"
 		fi
-		echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=${age}h enabled=${en:-na} lastrun=${lr:-na} reg_h=${reg:-na} action=${act}"
+		echo "INFO|ops:task_roster name=${name} present=1 rule=${rule}h age=${age}h enabled=${en:-na} en_src=${ens:-na} lastrun=${lr:-na} reg_h=${reg:-na} reg_src=${rgs:-na} action=${act}"
 	done
 	# 正锁：一条读数都没有＝PS 那一段整个没走到（被前面的异常吞掉、或 heredoc 里被误删）。
 	# "没读数"绝不能算绿，也不能只打一行 INFO 就过去（§70 派生空清单正锁同族）。
