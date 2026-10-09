@@ -6315,7 +6315,7 @@ eq110 scripts/verify_deploy_guangzhou.sh '-is [System.Xml.XmlElement]' 2 '元素
 eq110 scripts/verify_deploy_guangzhou.sh '$krRegDt.Year -gt 2010' 1 '注册时刻的年代界（与"上次运行"那把同源 2010）。这里防的不是现网坏，是**我自己按名取错元素**：任务 XML 里若还有别的 Date 元素，过老的日期就是那种错读的形状，取错当读不出，而不是拿假龄去比阈值'
 eq110 scripts/verify_deploy_guangzhou.sh '"|en_src=" + $krEnSrc' 1 '读法来源进读数协议（供给侧失灵的症状是"恒 na 而判据照常绿"，光有值没有来源时红了还得人上机猜）'
 eq110 scripts/verify_deploy_guangzhou.sh '"|reg_src=" + $krRegSrc' 1 '注册龄的读法来源同样进协议（两条腿共用一个自证口径，红了直接看是哪条式子没通）'
-eq110 scripts/verify_deploy_guangzhou.sh 'if ($krXml) {' 2 '两条定义侧腿的门闩都是 XML 而不是原始对象（两处＝Enabled 腿 + 注册龄腿；门闩写回原始对象＝把本枚根除的缺陷请回来，而它的症状只是恒 na。添第三条腿要连同预演数一起抬，别把锁改松）'
+eq110 scripts/verify_deploy_guangzhou.sh 'if ($krXml) {' 3 '三条定义侧腿的门闩都是 XML 文档而不是原始对象（三处＝Enabled 腿 + 注册龄腿 + 第二条通道成功后的来源回填；门闩写回原始对象＝把本来就没解析出来的文档当成「读到了」，10-10 二拨那串 na 就是这么来的）'
 eq110 scripts/verify_deploy_guangzhou.sh '$krEnNode -eq "true"' 1 'Enabled 字面量映射·真值支'
 eq110 scripts/verify_deploy_guangzhou.sh '$krEnNode -eq "false"' 1 'Enabled 字面量映射·假值支（只钉上一枚＝这条判据可以被反着弄坏而不红）'
 eq110 scripts/verify_deploy_guangzhou.sh '([xml][string]$krTask.Task)' 0 '坏形态不许复活（负锁：解析 `.Task` 必抛→注册龄恒 na→发版日凭空一条与故障无关的红）'
@@ -6327,7 +6327,51 @@ CNT110=$((CNT110 + 1))
 ENFALSE110=$(grep -oE '\[ "\$en" = "[^"]*" \]' scripts/verify_deploy_guangzhou.sh | head -1 | sed -n 's/.*= "\([^"]*\)".*/\1/p' || true)
 [ -n "$ENFALSE110" ] || { echo "--- FAIL: §110 跨语言等值正锁 ${CNT110}（从判读侧抽不出被比较的 Enabled 字面量＝那条比较式换了形状，这枚锁失去守护对象；空抽取的锁比没有锁更坏，它让人以为验过）"; exit 1; }
 ENPS110=$(grep -cF -- "\$krEnabled = \"${ENFALSE110}\"" scripts/verify_deploy_guangzhou.sh || true)
-[ "${ENPS110:-0}" = "1" ] || { echo "--- FAIL: §110 跨语言等值锁 ${CNT110}（PS 侧把 Enabled 映射成判读侧认的那个字面量的语句实得 ${ENPS110:-0} 处、应为 1；两边拼写脱钩＝读数里明明有禁用值而判据永不命中，正是 ④c 那条失灵的同族）"; exit 1; }
+# 期望 2 而不是 1（10-10 三批把 State 末级接进同一条映射之后抬的）：产出这个字面量的两支＝
+#   XML 文本假值支 + State=Disabled 末级支。两支**必须映射到判读侧认的同一个拼写**，
+#   所以这枚锁从"恰好一处"改成"恰好两处"而不是改成下限——第三支冒出来同样要问一句"它是谁"。
+[ "${ENPS110:-0}" = "2" ] || { echo "--- FAIL: §110 跨语言等值锁 ${CNT110}（PS 侧把 Enabled 映射成判读侧认的那个字面量的语句实得 ${ENPS110:-0} 处、应为 2＝XML 文本支 + State 末级支；一边拼写脱钩＝读数里明明有禁用值而判据永不命中，正是 ④c 那条失灵的同族）"; exit 1; }
+# ④d 10-10 二拨读数逼出的第三批读法（同一次拨测：`.Xml` 仍没给出值，而 `action=` 有值 ⇒
+#   `$krTask` 非空是被读数证明的，失灵点只能在解析这一步或"节点本来就不存在"）。
+# 这一段的全部内容是**把两种相反成因分开回传**，外加一条已证明活着的外部通道兜底：
+#   krObj（定义对象拿到没）/ krXmlFrom（那份 XML 从哪条通道来的）/ krXmlErr（解析器抱怨了什么），
+#   以及 Enabled 的末级来源 State（它回答的是判据真正要问的那件事：这任务现在会不会自己跑）。
+# 取向上的自我约束：**不再猜第三种属性名**。上一次失灵（`.Task`）就是因为拿"我确定它是 XML"当判据；
+#   这一次先把"我到底走到哪一步"变成读数，再决定换什么。兜底通道选 schtasks /Query /TN <name> /XML
+#   是因为这条命令行在同一个探针里已经被证明活着（present= 就靠它的退出码 0），
+#   而它的输出是微软对外的文档格式（XML），比 cmdlet 对象的属性形状稳定。
+CNT110=$((CNT110 + 1))
+eq110 scripts/verify_deploy_guangzhou.sh 'if ($krTask) { $krObj = "ok" }' 1 '定义对象自证：非空才写 ok（动作行也从同一个对象读，所以这一把不是多余的重复）'
+eq110 scripts/verify_deploy_guangzhou.sh '$krSbx = @(schtasks /Query /TN $krName /XML 2>$null)' 1 '第二条通道在位（外部通道兜底，不是又一个属性名）'
+eq110 scripts/verify_deploy_guangzhou.sh '$krXml = [xml]$krSbTxt' 1 '第二条通道的解析支在位'
+eq110 scripts/verify_deploy_guangzhou.sh 'if ($krXml -and $krXmlFrom -eq "none") { $krXmlFrom = "task-xml" }' 1 '通道来源回填：第一条通道成功时也要自证来源，否则读数只能说"有 XML"不能说"从哪来"'
+eq110 scripts/verify_deploy_guangzhou.sh '$krXmlErr = $_.Exception.Message' 2 '两条通道的解析器原话各带一次（拿到的是抱怨文本而不是猜）'
+eq110 scripts/verify_deploy_guangzhou.sh 'if ($krXmlErrRaw -and -not $krXmlErr) { $krXmlErr = "non-ascii" }' 1 'zh-CN 的异常文本剥完非 ASCII 会变空串：空串与"没有异常"必须还能分开'
+eq110 scripts/verify_deploy_guangzhou.sh '$krSt = [string]$krTask.State' 1 '末级来源取 State（只取字符串，不做布尔化、不做 -match 通配）'
+eq110 scripts/verify_deploy_guangzhou.sh '$krEnSrc = "defs-state"' 2 'State 两支各标一次来源（Disabled→False / Ready|Running→True），锚在赋值式上以免背进注释'
+eq110 scripts/verify_deploy_guangzhou.sh '"|obj=" + $krObj' 1 '三把观测键之一进协议（位置在 action= 之前）'
+eq110 scripts/verify_deploy_guangzhou.sh '"|xml_from=" + $krXmlFrom' 1 '同上：通道来源'
+eq110 scripts/verify_deploy_guangzhou.sh '"|xml_err=" + $krXmlErr' 1 '同上：解析器原话'
+# 竖线中和（10-10 三批）：`xml_err` 是**排在行中段**的自由文本（action 之前），而 bash 按"最后一处
+#   |键名="抽值——异常原文会把整段输入带回消息里，一旦其中出现 `|enabled=` 这种形状，判读键就被抽成
+#   那段文本＝读数自己把自己的判据弄反（本段根除的那一族换了个成因：值撑破协议，而不是通道不通）。
+#   锚只钉那条 -replace 本体（说明注释里不出现这一整串，免得又踩「计数锚混注释」第三次）。
+eq110 scripts/verify_deploy_guangzhou.sh "-replace '\|', '+'" 1 '行中段自由文本先中和竖线（判读键不被异常文本抽走）'
+# 未知状态不许映射（末级只认三个已知值；别的状态留 na＝读不出，而不是拿没见过的值去把禁用判反）。
+eq110 scripts/verify_deploy_guangzhou.sh '$krEnabled = [string]$krSt' 0 '不许把 State 整串直塞进 enabled（判读侧认的字面量只有 True/False）'
+# 先后顺序（本段第 6 枚）：外部通道兜底必须**先于**两个 XML 消费者，否则消费者拿到的是 null 文档、
+#   兜底白做——而读数看起来与"通道都没通"一模一样（src 仍是 none），又一次恒绿装饰。
+CNT110=$((CNT110 + 1))
+SBX110A=$(ln110 scripts/verify_deploy_guangzhou.sh '$krXml = [xml]$krSbTxt')
+SBX110B=$(ln110 scripts/verify_deploy_guangzhou.sh '$krXml.GetElementsByTagName("Enabled")')
+[ "$SBX110A" -gt 0 ] && [ "$SBX110B" -gt 0 ] && [ "$SBX110A" -lt "$SBX110B" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（外部通道解析@${SBX110A} 必须早于 XML 消费者@${SBX110B}：兜底排在消费之后就是白兜，而 src 仍写 none，两种失灵在读数上不可分）"; exit 1; }
+# 先后顺序（本段第 7 枚）：State 末级必须排在**直接来源之后**（这一枚钉的是语义次序不是语法次序）。
+#   为什么值得钉：State 是**派生态**，XML 的 <Enabled> 与对象属性才是被读的那一位。把派生态提到前面，
+#   判据就会在"标志位明明写着 false"时先撞上派生态并把它报成 True——读反，而且绿（§派生状态不是来源）。
+CNT110=$((CNT110 + 1))
+ST110A=$(ln110 scripts/verify_deploy_guangzhou.sh '$krEnSrc = "info-prop"')
+ST110B=$(ln110 scripts/verify_deploy_guangzhou.sh '$krSt = [string]$krTask.State')
+[ "$ST110A" -gt 0 ] && [ "$ST110B" -gt 0 ] && [ "$ST110A" -lt "$ST110B" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（运行信息那条直接来源腿@${ST110A} 必须早于 State 末级@${ST110B}：派生态排到来源之前＝标志位明明 false 也会被状态报成 True，是读反不是读不到）"; exit 1; }
 # 先后顺序（本段第 5 枚）：XML 解析腿必须早于它的两个消费者。为什么值得单独钉——这两条腿各自带
 #   XML 门闩，把解析那一行往下挪到任何一个消费者之后，定义侧读数会**一起**静默变 na：不报语法错、
 #   也不在别处红，现网看到的还是那串"八条全 na"（④c 的成因之一就是这样的一次挪位级别错误）。
@@ -6377,7 +6421,7 @@ BASHDATE110=$(grep -cE 'date -[jd]' /tmp/w3_jtr_region_110.sh 2>/dev/null || tru
 #   写法上两处避开本机两个坑：`\b` 是 GNU 扩展，BSD grep 不认，改用"后面不许再跟字母数字下划线"；
 #   计数管道在 set -e 下必须带 `|| true`，否则命中 0 时整段被当成命令失败而不是锁绿（§89）。
 CNT110=$((CNT110 + 1))
-SRCJUDGE110=$(grep -E '\$\{?(ens|rgs)([^[:alnum:]_]|$)' /tmp/w3_jtr_region_110.sh 2>/dev/null | grep -v 'echo "INFO' | wc -l | tr -d ' ' || true)
+SRCJUDGE110=$(grep -E '\$\{?(ens|rgs|obj|xf|xe)([^[:alnum:]_]|$)' /tmp/w3_jtr_region_110.sh 2>/dev/null | grep -v 'echo "INFO' | wc -l | tr -d ' ' || true)
 [ "${SRCJUDGE110:-0}" = "0" ] || { echo "--- FAIL: §110 观测不判读负锁 ${CNT110}（判读区里拿读法来源做判断的行 ${SRCJUDGE110} 处：src 两把只进 INFO，红绿必须由 present/rule/age_h/reg_h/enabled 这些现网量决定）"; exit 1; }
 CNT110=$((CNT110 + 1))
 SRCINFO110=$(grep -cE 'echo "INFO.*en_src=\$\{ens' /tmp/w3_jtr_region_110.sh 2>/dev/null || true)
@@ -6400,7 +6444,7 @@ TASKNAME_IN_PROBE=$(grep -vE '^[[:space:]]*#' scripts/verify_deploy_guangzhou.sh
 CNT110=$((CNT110 + 1))
 ORDP110='--- FAIL: §110 先后顺序'
 ORD110=$(grep -c -- "${ORDP110}锁" scripts/verify_changes.sh || true)
-[ "${ORD110:-0}" -ge 5 ] || { echo "--- FAIL: §110 分类计数正锁 ${CNT110}（派生出的顺序锁枚数=${ORD110:-0}，<5＝计数模式或 FAIL 文案前缀被人改掉，本段出门文本会开始说谎；本批添第五枚「解析先于消费者」后下限抬到 5，将来添锁要连同下限一起抬，别把锁改松）"; exit 1; }
+[ "${ORD110:-0}" -ge 7 ] || { echo "--- FAIL: §110 分类计数正锁 ${CNT110}（派生出的顺序锁枚数=${ORD110:-0}，<7＝计数模式或 FAIL 文案前缀被人改掉，本段出门文本会开始说谎；下限历次抬升＝第五枚「解析先于消费者」、第六枚「外部通道兜底先于 XML 消费者」、第七枚「派生态 State 晚于直接来源」，将来添锁要连同下限一起抬，别把锁改松）"; exit 1; }
 echo "ok - §110 静态锁 ${CNT110} 道通过（其中先后顺序锁 ${ORD110} 枚＝从本段 FAIL 文案派生计数；分项见 ①②③④ 各组标题，不再手写分项数——手写分项每加一枚锁就过一次时）"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -6648,9 +6692,12 @@ ENFALSEG=$(grep -cF -- '$krEnNode -eq "false"' "$D110/verify_deploy_guangzhou.sh
 ENPS_G=$(grep -cF -- "\$krEnabled = \"${ENFALSE110}\"" "$D110/verify_deploy_guangzhou.sh" || true)
 BOOLG=$(grep -cF -- '[bool]$krEnNode' "$D110/verify_deploy_guangzhou.sh" || true)
 [ "${ENFALSEG:-0}" = "0" ] || { echo "--- FAIL: §110 F3 g：假值支已被换掉，字面量映射正锁却仍读到 ${ENFALSEG}（本枚独有性不成立）"; exit 1; }
-[ "${ENPS_G:-0}" = "0" ] || { echo "--- FAIL: §110 F3 g：PS 侧已不再映射判读侧认的字面量，跨语言等值锁却仍读到 ${ENPS_G}（两边脱钩这件事验不出来）"; exit 1; }
+# 主仓这里是 2 处（XML 文本支 + State 末级支），镜像弄坏 XML 文本支之后应当只剩 1 处＝State 那一支。
+# 期望值跟主仓那枚等值锁同源（见 ④d 上面「应为 2」那行）：这枚反证断的是"XML 文本支脱离"，
+# 不是断"映射整体消失"——把它写成 0 会在补第二支的那天自己变红（计数锚随实现漂移同族）。
+[ "${ENPS_G:-0}" = "1" ] || { echo "--- FAIL: §110 F3 g：PS 侧已不再映射判读侧认的字面量（XML 文本支），跨语言等值锁却仍读到 ${ENPS_G}（应 1＝只剩 State 支；读到 0 说明 State 支也被这枚破坏顺带弄掉了，本枚独有性不成立）"; exit 1; }
 [ "${BOOLG:-0}" -ge 1 ] || { echo "--- FAIL: §110 F3 g：镜像里已写入布尔化那一式，负锁却仍读 ${BOOLG}（读反形态进得来）"; exit 1; }
-echo "ok - §110 F3 g 假值支请回布尔化 ⇒ 映射正锁与跨语言等值锁同时脱离、布尔化负锁转红（${ENFALSEG}/${ENPS_G}/${BOOLG}）"
+echo "ok - §110 F3 g 假值支请回布尔化 ⇒ 映射正锁脱离、跨语言等值锁从 2 掉到 ${ENPS_G}、布尔化负锁转红（${ENFALSEG}/${ENPS_G}/${BOOLG}）"
 # h) 「读法来源只观测、不判读」那枚负锁的反证：在镜像里真拿 $ens 做一次判读分支，再用**同一把尺子**
 #    （同一条正则＋同一条剥 INFO 的管道）去量镜像抽出的判读区。为什么这枚反证必须做在尺子上而不是
 #    做在字符串上：那枚负锁读的是一份**抽取出来的临时区**，抽取失败（函数改名、sed 锚点脱钩）时它也读 0，
@@ -6665,6 +6712,45 @@ sed -n '/^judge_task_roster()/,/^}/p' "$D110/verify_deploy_guangzhou.sh" > "$W3F
 SRCJUDGE_H=$(grep -E '\$\{?(ens|rgs)([^[:alnum:]_]|$)' "$W3F/region_h.sh" 2>/dev/null | grep -v 'echo "INFO' | wc -l | tr -d ' ' || true)
 [ "${SRCJUDGE_H:-0}" -ge 1 ] || { echo "--- FAIL: §110 F3 h：镜像里已经把读法来源拿去做判读，同一把尺子却读到 ${SRCJUDGE_H}（＝主仓那枚负锁的读数不来自判读区，它绿是蒙的）"; exit 1; }
 echo "ok - §110 F3 h 拿 src 当判据 ⇒ 同一把尺子在镜像上读出台阶（镜像实得 ${SRCJUDGE_H}，主仓应 0）"
+# i) 把第二条通道整块弄没（兜底解析式改成一个不可能命中的赋值）⇒ ④d 那枚「第二条通道的解析支在位」
+#    正锁必须脱离，而**新加的 obj/xml_from/xml_err 三把观测键仍在**（这一枚断的是"兜底没了"，
+#    不是"自证没了"；两件事分开，红的编号才认得出是哪一种删失）。
+#    为什么这枚反证值得做：二拨的全部教训就是"通道没通"与"节点本来不存在"在读数上长一样，
+#    验兜底的锁如果看不见兜底被删，那它就是在给"下一次又要靠猜"背书。
+CNT110=$((CNT110 + 1))
+D110="$(f3_rebuild i)"
+f3_sub "$D110/verify_deploy_guangzhou.sh" '$krXml = [xml]$krSbTxt' '$krXml = $null'
+SBXI=$(grep -cF -- '$krXml = [xml]$krSbTxt' "$D110/verify_deploy_guangzhou.sh" || true)
+OBSI=$(grep -cF -- '"|xml_from=" + $krXmlFrom' "$D110/verify_deploy_guangzhou.sh" || true)
+[ "${SBXI:-0}" = "0" ] || { echo "--- FAIL: §110 F3 i：外部通道解析支已被弄没，正锁却仍读到 ${SBXI}（看不见兜底被删＝恒绿装饰）"; exit 1; }
+[ "${OBSI:-0}" = "1" ] || { echo "--- FAIL: §110 F3 i：这枚只该弄没兜底，观测键 xml_from 却读 ${OBSI}（本枚独有性不成立，红项编号会骗人）"; exit 1; }
+echo "ok - §110 F3 i 删掉外部通道兜底 ⇒ 通道正锁脱离（${SBXI}，主仓应 1）、观测键仍在（${OBSI}）"
+# j) 把 State 那一步**提到直接来源之前**（镜像里在字面量映射那一支之前先读一次 State，用的是同一个
+#    字面量，所以顺序锁那把尺子的"首个命中"会跟着上移）⇒ 第 7 枚顺序锁必须判红。
+#    这一枚专门断"派生态排到来源前面"这个形态：语法完全合法、读数不会变 na，
+#    只会把"标志位明明写着 false"的任务报成 True＝**读反而绿**（§派生状态不是来源）。
+CNT110=$((CNT110 + 1))
+D110="$(f3_rebuild j)"
+f3_sub "$D110/verify_deploy_guangzhou.sh" 'if ($krEnNode -eq "true") { $krEnabled = "True" }' \
+	'if ([string]$krTask.State) { $krSt = [string]$krTask.State }
+            if ($krEnNode -eq "true") { $krEnabled = "True" }'
+STJA=$(grep -nF -- '$krEnSrc = "info-prop"' "$D110/verify_deploy_guangzhou.sh" | head -1 | cut -d: -f1 || true)
+STJB=$(grep -nF -- '$krSt = [string]$krTask.State' "$D110/verify_deploy_guangzhou.sh" | head -1 | cut -d: -f1 || true)
+[ "${STJA:-0}" -gt 0 ] && [ "${STJB:-0}" -gt 0 ] || { echo "--- FAIL: §110 F3 j：镜像里两个锚抽不出行号（${STJA}/${STJB}），这枚反证无从谈起"; exit 1; }
+[ "${STJB:-0}" -lt "${STJA:-0}" ] || { echo "--- FAIL: §110 F3 j：镜像里 State 已挪到直接来源之前，第 7 枚顺序锁的两把尺子却仍读成「来源在前」（${STJB} vs ${STJA}）＝那枚锁看不见挪位"; exit 1; }
+echo "ok - §110 F3 j 派生态挪到来源之前 ⇒ 第 7 枚顺序锁的尺子在镜像上读到 State@${STJB} 早于 info-prop@${STJA}（主仓应相反）"
+# k) 把竖线中和那一步**改成不做**（保留非 ASCII 剥离，因为那一步与本枚无关）⇒ ④d 新钉的那枚
+#    「行中段自由文本先中和竖线」正锁必须脱离，而三条观测键进协议的读数一根不许动。
+#    这一枚断的是"值撑破协议"这一族：它不改变任何判读分支的语法，只在异常文本真的带出 `|` 那天
+#    让判读键被抽错——所以正锁必须能在破坏后立刻看见，而不是等现网拨出一串说不清的读数。
+CNT110=$((CNT110 + 1))
+D110="$(f3_rebuild k)"
+f3_sub "$D110/verify_deploy_guangzhou.sh" '$krXmlErr = ($krXmlErr -replace '"'"'\|'"'"', '"'"'+'"'"')' '$krXmlErr = $krXmlErr'
+PIPEK=$(grep -cF -- "-replace '\|', '+'" "$D110/verify_deploy_guangzhou.sh" || true)
+OBJK=$(grep -cF -- '"|obj=" + $krObj' "$D110/verify_deploy_guangzhou.sh" || true)
+[ "${PIPEK:-0}" = "0" ] || { echo "--- FAIL: §110 F3 k：竖线中和已被弄没，正锁却仍读到 ${PIPEK}（看不见这一步被删＝那枚锁是恒绿装饰）"; exit 1; }
+[ "${OBJK:-0}" = "1" ] || { echo "--- FAIL: §110 F3 k：这枚只该弄没中和那一步，观测键 obj 却读 ${OBJK}（本枚独有性不成立，红项编号会骗人）"; exit 1; }
+echo "ok - §110 F3 k 删掉竖线中和 ⇒ 该枚正锁脱离（${PIPEK}，主仓应 1）、观测键仍在（${OBJK}）"
 # 复位自检：镜像全量重建后必须回到与主仓同一读数（跑完整轮反证后主仓文件本就不该被动过）
 CNT110=$((CNT110 + 1))
 python3 "$W3F/f2.py" deploy/qmt-win/service_definitions.ps1 deploy/qmt-win/register_engine_services.ps1 >/dev/null \
