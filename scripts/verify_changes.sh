@@ -6912,23 +6912,85 @@ rm -f "$W3T/fn_mut.sh"
 #   供"值不许进 argv"这条断言读——argv 同机任何进程 ps 可见，等于把凭据从 git 历史搬到运行期明文）。
 cat > "$W3T/bin/security" <<'SHIM110'
 #!/bin/bash
-# 假钥匙串桩：状态存 $FAKE_KC。find -w 打印值（无值 rc=1）；add 认两种形态（-w 带值＝argv、
-# -w 不带值＝从 stdin 读），这样门禁才能分别断言"走的是哪条"，而不是只看结果对不对。
+# 假钥匙串桩：状态文件 $FAKE_KC 的**存在**＝条目在位、**内容**＝口令值（允许为空）。
+# ★ 这一版按 2026-10-10 的真机读数重写，不是按我以为的语义写：旧桩把「-w 结尾不带值」实现成
+#   "从 stdin 读口令"，而真机那条 prompt 的是**终端**——管道里喂进去的值整串丢掉、条目照样建出来、
+#   口令字段为空、rc 还是 0。桩照着假语义实现 ⇒ 这条坏通道在"门禁 113 段全绿"里活了一整轮，
+#   直到 owner 授权真拨才被迁移器自己的读回兜底拦下（got=empty）。§MAC-DRIFT 是同一课的第二次：
+#   绿的是桩，不是真实现。下面每条都在注释里标了它由哪次实测背书。
+# 脚印分两条通道记（"值不许进 argv"这条锁要有可判的对象）：
+#   CALL: …      ＝进程 argv（同机任何进程 ps 都读得到＝泄露面）
+#   STDIN-CMD: … ＝ security -i 从 stdin 收到的那行命令行（本仓采用的通道，值在这里不算泄露）
 mode=""
-for a in "$@"; do case "$a" in find-generic-password) mode=find ;; add-generic-password) mode=add ;; esac; done
+for a in "$@"; do
+	case "$a" in
+		-i | --interactive) mode=inter ;;
+		find-generic-password) mode=find ;;
+		add-generic-password) mode=add ;;
+	esac
+done
 [ -n "${SEC_LOG:-}" ] && printf 'CALL: %s\n' "$*" >> "$SEC_LOG"
+# 实测①：find 不带 -w 只看条目在位性；带 -w 时**空口令条目照样退 0、stdout 为空**
+#   （旧桩写成"无值退 1"，那是我以为的；真机上 quant-ntfy-topic 那条空残骸退的是 0）
 if [ "$mode" = "find" ]; then
-	[ -s "${FAKE_KC:-/nonexistent}" ] || exit 1
-	cat "$FAKE_KC"
+	if [ -z "${FAKE_KC:-}" ] || [ ! -e "$FAKE_KC" ]; then exit 1; fi
+	wanted=0
+	for a in "$@"; do
+		if [ "$a" = "-w" ]; then wanted=1; fi
+	done
+	if [ "$wanted" = "1" ]; then cat "$FAKE_KC"; fi
 	exit 0
 fi
+# kc_write：唯一落盘入口。SHIM_WRITE_EMPTY=1 让"写入侧 rc=0 但值没进去"这一形态可被门禁复现
+#   （就是这次真拨撞到的那台机的行为），F3-5b 靠它把"写后读回"从一句主张变成一条判据。
+kc_write() {
+	if [ "${SHIM_WRITE_EMPTY:-0}" = "1" ]; then
+		: > "${FAKE_KC:-/dev/null}"
+	else
+		printf '%s' "$1" > "${FAKE_KC:-/dev/null}"
+	fi
+}
+# refuse_dup <命令行>：条目已在位、而这次没给 -U ＝ 真机 already exists（实测③）。退 0＝这次该拒。
+refuse_dup() {
+	[ -e "${FAKE_KC:-/nonexistent}" ] || return 1
+	if printf '%s' "$1" | grep -qE -- '(^|[[:space:]])-U([[:space:]]|$)'; then return 1; fi
+	echo "add-generic-password: The specified item already exists in the keychain." >&2
+	return 0
+}
+if [ "$mode" = "inter" ]; then
+	line="$(head -n 1 | tr -d '\r\n' || true)"
+	[ -n "${SEC_LOG:-}" ] && printf 'STDIN-CMD: %s\n' "$line" >> "$SEC_LOG"
+	case "$line" in
+		*add-generic-password*)
+			if refuse_dup "$line"; then exit 1; fi
+			# 实测⑤：交互行按双引号取值，值里的空格与 # 原样进条目（探针值 'a b c!d'、'a#b c' 各真拨一次）
+			val=""
+			if printf '%s' "$line" | grep -qE -- '-w +"[^"]*"$'; then
+				val="$(printf '%s' "$line" | sed -E 's/.*-w +"([^"]*)"/\1/')"
+			fi
+			kc_write "$val"
+			exit 0
+			;;
+		*find-generic-password*)
+			if [ -e "${FAKE_KC:-/nonexistent}" ]; then exit 0; fi
+			exit 1
+			;;
+	esac
+	# 实测②：交互模式把内部命令的退出码透传回来（unknown command 退 1、坏参数退 2）
+	#   ⇒ "security 没报错"这句话从此有意义；但正文仍不把读回当摆设（见 F3-5b）。
+	echo "security: unknown command in interactive mode" >&2
+	exit 1
+fi
 if [ "$mode" = "add" ]; then
+	if refuse_dup "$*"; then exit 1; fi
 	prev=""
 	for a in "$@"; do
-		if [ "$prev" = "-w" ] && [ -n "$a" ]; then printf '%s' "$a" > "${FAKE_KC:-/dev/null}"; exit 0; fi
+		if [ "$prev" = "-w" ] && [ -n "$a" ]; then kc_write "$a"; exit 0; fi
 		prev="$a"
 	done
-	printf '%s' "$(head -n 1 | tr -d '\r\n')" > "${FAKE_KC:-/dev/null}"
+	# 实测④：`-w` 在 argv 里是最后一个选项、后面没值 ⇒ 真机去终端要口令，管道里的值它不看，
+	#   结果＝条目建出来、口令为空、rc=0。旧桩在这里读 stdin，正是把假语义写进了判据面。
+	kc_write ""
 fi
 exit 0
 SHIM110
@@ -7021,23 +7083,61 @@ for inst in install_mac_backup_agent install_mac_drill_agent install_mac_nightly
 done
 echo "ok - §110 F3-4 三个安装器缺省预览零改动（backup/drill/nightly）"
 
-# F3-5 迁移器：预览零写 + -Apply 的值只走 stdin（argv 脚印干净）+ 写后读回兜底是活的
+# F3-5 迁移器：预览零写 + 写入只走 security -i 的 stdin 命令行（argv 脚印干净）+ 写后读回是**活的**
+#   ★ 下面 F3-5b/5c 两枚反证不是设计出来的，是 2026-10-10 owner 授权真拨时**撞出来的**：
+#     当时待写入 len=32、写后读回 got=empty、而 security 的 rc 是 0——旧写法（-w 结尾不带值指望它
+#     读管道）在真机上存的是空口令条目。桩当时按我以为的语义实现，所以这一路在 113 段全绿里过得去；
+#     拦下来的是迁移器自己的读回兜底。本组把"兜底是活的"从注释里的主张改成判据。
 CNT110=$((CNT110 + 1))
 : > "$W3T/sec.log"
-: > "$KC110"
+rm -f "$KC110"   # 缺省态＝钥匙串里压根没有这一条（真机首次安装就是这个形态；残骸态见 F3-5c）
 out110="$(NTFY_INPUT_TOKEN="$TOK110" PATH="$W3T/bin:$PATH" SEC_LOG="$W3T/sec.log" FAKE_KC="$KC110" \
 	bash -c 'unset NTFY_TOPIC; printf "%s" "$NTFY_INPUT_TOKEN" | ./deploy/mac/migrate_ntfy_topic_to_keychain.sh --from-stdin' 2>&1 || true)"
 printf '%s' "$out110" | grep -qF 'MIGRATE_NTFY_PLAN' || { echo "--- FAIL: §110 F3-5 缺省态没进预览分支：$(printf '%s' "$out110" | tail -3)"; exit 1; }
 grep -qF 'add-generic-password' "$W3T/sec.log" && { echo "--- FAIL: §110 F3-5 预览模式真调了写钥匙串（桩里留了脚印）"; exit 1; }
-[ ! -s "$KC110" ] || { echo "--- FAIL: §110 F3-5 预览模式写了假钥匙串状态文件"; exit 1; }
+# 副作用锁改成 -e 而不是 -s：桩的条目**在位性**本身就是状态（建出一条空口令条目在真机上正是这次事故的形态，
+# 按"内容非空才算写过"会把它当成没动过）。
+[ ! -e "$KC110" ] || { echo "--- FAIL: §110 F3-5 预览模式把假钥匙串条目建出来了（哪怕内容是空的）"; exit 1; }
 out110="$(NTFY_INPUT_TOKEN="$TOK110" PATH="$W3T/bin:$PATH" SEC_LOG="$W3T/sec.log" FAKE_KC="$KC110" \
 	bash -c 'unset NTFY_TOPIC; printf "%s" "$NTFY_INPUT_TOKEN" | ./deploy/mac/migrate_ntfy_topic_to_keychain.sh --from-stdin -Apply' 2>&1 || true)"
 printf '%s' "$out110" | grep -qF 'MIGRATE_NTFY_DONE' || { echo "--- FAIL: §110 F3-5 -Apply 没走完（写后读回比指纹这条兜底没过）：$(printf '%s' "$out110" | tail -3)"; exit 1; }
 [ "$(cat "$KC110")" = "$TOK110" ] || { echo "--- FAIL: §110 F3-5 桩里存下的值与输入不符（got='$(cat "$KC110")'）"; exit 1; }
-grep -F "$TOK110" "$W3T/sec.log" && { echo "--- FAIL: §110 F3-5 主题值出现在 security 的 argv 脚印里（-w 必须不带值、从 stdin 读）"; exit 1; }
-grep -qF 'add-generic-password' "$W3T/sec.log" || { echo "--- FAIL: §110 F3-5 -Apply 却没走到写入口（那 DONE 是从哪来的？）"; exit 1; }
+# 通道锁①（正向）：写入确实经 security -i 的 stdin 命令行到达桩
+grep -qF 'STDIN-CMD: add-generic-password' "$W3T/sec.log" || { echo "--- FAIL: §110 F3-5 -Apply 没走 security -i 通道（桩里连 STDIN-CMD 脚印都没有＝那条写入口径压根没被拨，DONE 是从别处来的）"; exit 1; }
+# 通道锁②（正向）：值就在那行命令行里（没有这条，下面的 argv 负锁会因为"两条通道都没写过"而假绿）
+if ! grep '^STDIN-CMD: ' "$W3T/sec.log" | grep -qF -- "$TOK110"; then echo "--- FAIL: §110 F3-5 STDIN-CMD 行里没有主题值（值既没走 stdin 也没走 argv，那条目里的值是从哪来的？）"; exit 1; fi
+# 通道锁③（负向）：argv 侧一个字都不带值（CALL: 行＝同机任何进程 ps 可见的面，把凭据从 git 历史搬到运行期明文就是它）
+if grep '^CALL: ' "$W3T/sec.log" | grep -qF -- "$TOK110"; then echo "--- FAIL: §110 F3-5 主题值出现在 security 的 argv 脚印里（只准 STDIN-CMD: 行带值，CALL: 行必须干净）"; exit 1; fi
+# 通道锁④（负向）：条目不在位时那行命令行不许带 -U（带了＝把"新建"和"覆盖已在位的另一份值"并成一条路，
+#   绕过 -Force 那道"改道是有意的吗"确认——F3-5c 反过来要求残骸态必须带 -U，两枚一起才钉住分支选择）
+if grep '^STDIN-CMD: ' "$W3T/sec.log" | grep -qE -- '(^|[[:space:]])-U([[:space:]]|$)'; then echo "--- FAIL: §110 F3-5 条目不在位却带 -U 写（分支选择退化成无条件覆盖，-Force 白给）"; exit 1; fi
 printf '%s' "$out110" | grep -qE '[0-9a-f]{32}' && { echo "--- FAIL: §110 F3-5 迁移器输出里出现 32-hex（只准报长度与指纹前 8 位）"; exit 1; }
-echo "ok - §110 F3-5 迁移器预览零写 + -Apply 值只走 stdin（argv 干净）+ 写后读回一致"
+echo "ok - §110 F3-5 迁移器预览零写 + 值只走 security -i 的 stdin（argv 干净、分支按在位性选）+ 写后读回一致"
+
+# F3-5b（反证一枚）桩复现"写入 rc=0 但值没进去"⇒ 迁移器必须退非零、点名读回不一致、且不再喊 DONE
+CNT110=$((CNT110 + 1))
+: > "$W3T/sec.log"
+rm -f "$KC110"
+rc110=0
+out110="$(NTFY_INPUT_TOKEN="$TOK110" PATH="$W3T/bin:$PATH" SEC_LOG="$W3T/sec.log" FAKE_KC="$KC110" SHIM_WRITE_EMPTY=1 \
+	bash -c 'unset NTFY_TOPIC; printf "%s" "$NTFY_INPUT_TOKEN" | ./deploy/mac/migrate_ntfy_topic_to_keychain.sh --from-stdin -Apply' 2>&1)" || rc110=$?
+[ "$rc110" != "0" ] || { echo "--- FAIL: §110 F3-5b 桩把值丢掉（写入侧 rc 仍是 0）时迁移器居然退 0＝2026-10-10 那次事故被原样重演，而它正是靠这条退非零才没让人继续装代理"; exit 1; }
+printf '%s' "$out110" | grep -qF '写入后读回指纹不一致' || { echo "--- FAIL: §110 F3-5b 退非零却没点名「读回不一致」（got 侧是 empty 还是错值，排查时是两种处置）：$(printf '%s' "$out110" | tail -2)"; exit 1; }
+printf '%s' "$out110" | grep -qF 'got=empty 的已知成因' || { echo "--- FAIL: §110 F3-5b 空值形态没给出残骸处置（谁在钥匙串里留了条空口令条目、下一步该删哪条，读数要说全）"; exit 1; }
+printf '%s' "$out110" | grep -qF 'MIGRATE_NTFY_DONE' && { echo "--- FAIL: §110 F3-5b 一边退非零一边还喊 DONE（调用方按输出尾巴读结果会当成成功＝降级报成功那一族）"; exit 1; }
+echo "ok - §110 F3-5b 桩复现「值没进去」时迁移器退非零＋点名读回不一致＋无 DONE（读回兜底是活的，不是注释）"
+
+# F3-5c（反证一枚＋分支锁）条目在位但口令为空（真机残骸态）⇒ 必须点名该形态、带 -U 覆写、最终写成功
+CNT110=$((CNT110 + 1))
+: > "$W3T/sec.log"
+: > "$KC110"   # 空文件＝条目在位、口令字段为空（真机 quant-ntfy-topic 在这次修复前就是这个状态）
+out110="$(NTFY_INPUT_TOKEN="$TOK110" PATH="$W3T/bin:$PATH" SEC_LOG="$W3T/sec.log" FAKE_KC="$KC110" \
+	bash -c 'unset NTFY_TOPIC; printf "%s" "$NTFY_INPUT_TOKEN" | ./deploy/mac/migrate_ntfy_topic_to_keychain.sh --from-stdin -Apply' 2>&1 || true)"
+printf '%s' "$out110" | grep -qF '条目在位但口令为空' || { echo "--- FAIL: §110 F3-5c 残骸态没被点名（按「值非空＝存在」选分支会给这种条目走不带 -U 的 add，真机退 45 already exists＝报「写入失败」却看不出是残骸挡路）"; exit 1; }
+if ! grep '^STDIN-CMD: ' "$W3T/sec.log" | grep -qE -- '(^|[[:space:]])-U([[:space:]]|$)'; then echo "--- FAIL: §110 F3-5c 条目已在位却没带 -U（与 F3-5 通道锁④配对：在位必带、不在位必不带，两枚一起才钉住分支）"; exit 1; fi
+[ "$(cat "$KC110")" = "$TOK110" ] || { echo "--- FAIL: §110 F3-5c 残骸没被覆写掉（got='$(cat "$KC110")'）"; exit 1; }
+printf '%s' "$out110" | grep -qF 'MIGRATE_NTFY_DONE' || { echo "--- FAIL: §110 F3-5c 残骸态覆写后没走完：$(printf '%s' "$out110" | tail -2)"; exit 1; }
+echo "ok - §110 F3-5c 空口令残骸条目被点名并以 -U 覆写（分支按条目在位性选，不按值非空选）"
 
 # F3-6（＝FIX_PLAN §5.5 的 F5）kuma_seed.js 必传参数**行为腿**：断言退出码，不断言播种结果。
 #

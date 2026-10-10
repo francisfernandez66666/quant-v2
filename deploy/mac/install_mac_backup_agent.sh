@@ -49,8 +49,11 @@ security find-generic-password -a "$USER" -s quant-restic-repo-pass >/dev/null 2
 . "$REPO_MAC_DIR/ntfy_topic.sh"
 if ! ntfy_topic_report backup-installer-preflight; then
   echo "X 取不到 ntfy 主题（env NTFY_TOPIC 未给，钥匙串 ${NTFY_KEYCHAIN_ITEM:-quant-ntfy-topic} 也没有）。" >&2
-  echo "  先落一次口令：security add-generic-password -a \"\$USER\" -s ${NTFY_KEYCHAIN_ITEM:-quant-ntfy-topic} -w" >&2
-  echo "  （从仓库历史迁出的那份旧值可用 deploy/mac/migrate_ntfy_topic_to_keychain.sh -Apply 代取，它只报长度与指纹）" >&2
+  echo "  落值只走一个入口：printf '%s' '<主题>' | deploy/mac/migrate_ntfy_topic_to_keychain.sh --from-stdin -Apply" >&2
+  echo "  （别手敲 security add-generic-password … -w 不带值那条提示式写法：它 prompt 的是终端而不是管道，" >&2
+  echo "    值会被丢掉、条目照样建出来但口令是空的，2026-10-10 本机真踩过一次；迁移器写完会读回比指纹才判成不成）" >&2
+  echo "  （从仓库历史迁出的那份旧值也可用同一个迁移器代取，它只报长度与指纹；旧值已进过 git＝按已泄露处理，" >&2
+  echo "    正式口径是轮换新主题后 --from-stdin 写进来）" >&2
   exit 1
 fi
 

@@ -72,9 +72,18 @@ redact_32() {
 
 # 1) 现网状态：钥匙串里有没有、env 里有没有（只报指纹，绝不报值）
 OLD_KC="$(security find-generic-password -a "$OWNER" -s "$ITEM" -w 2>/dev/null || true)"
+# 1b) 条目**在位性**必须用元数据查（find 不带 -w），不能拿"读回来的值非空"当存在性判据。
+#     2026-10-10 真机实测：坏写入会在钥匙串里留下一条 svce/acct 都对、口令字段为空、
+#     `find -w` 照样退 0 的条目（见下面 §KUMA-SECREDTO-W2 的那次读数）。若按"值非空＝存在"选分支，
+#     本脚本会对这种残骸走**不带 -U** 的 add，而真机那条退 45 already exists
+#     （"写入钥匙串条目失败"——报的是失败，但没人看得出来是残骸挡路，只能上机再看一遍）。
+ITEM_LIVE=0
+security find-generic-password -a "$OWNER" -s "$ITEM" >/dev/null 2>&1 && ITEM_LIVE=1
 echo "==> 目标钥匙串条目 : ${ITEM}（账号 ${OWNER}）"
 if [ -n "$OLD_KC" ]; then
 	echo "    现网状态 : 已存在 len=${#OLD_KC} fp=$(fp8 "$OLD_KC")"
+elif [ "$ITEM_LIVE" = "1" ]; then
+	echo "    现网状态 : 条目在位但口令为空（上一次坏写入的残骸）——这次会带 -U 覆写它"
 else
 	echo "    现网状态 : 不存在"
 fi
@@ -125,39 +134,60 @@ if [ "$APPLY" != "1" ]; then
 	exit 0
 fi
 
-# 4) 写入。add 与 -U（更新）分开走，避免"条目存在时 add 报错却被当成写成功"的半态。
+# 4) 写入。add 与 -U（更新）分开走，避免"条目存在时 add 报错却被当成写成功"的半态；
+#    走哪条按**条目在位性**（上面 1b 的 ITEM_LIVE）判，不按"值非空"判——残骸那条就是栽在这个区别上的。
 #
 # §KUMA-SECREDTO-W（本批补的一课，写在这里而不是藏在代码里）：**值绝不进 argv**。
 #   旧写法是 `security add-generic-password ... -w "$NEW"`，看着无害，实际把主题交给了子进程的
 #   命令行参数——`ps -o args` 同机器上任何进程都读得到，等于把凭据从 git 历史搬到运行期明文里
 #   （和 --from-stdin 的设计意图自相矛盾：注释写着"绝不进 argv"，代码却正是 argv）。
-#   现改成 `-w`（不带值＝security 自己从 stdin 提示读口令）+ printf 管道喂进去，同一条头注释
-#   从此是真的。
-#   诚实披露：`-w` 在无 TTY 时读 stdin 这个语义，本机没有真拨过（写钥匙串属于本地凭据变更，
-#   分类器按纪律拦下，且它不在本批自动执行面内）。因此这一步**不靠"命令没报错"收工**，
-#   而是紧接着第 5 步读回比指纹——若 stdin 没被吃到、存了空值或错值，读回指纹必然不等 ⇒ 当场 exit 1
-#   并提示"别继续装代理"。也就是说：语义未验证的风险已经由一次真读回兜住，owner 首次 -Apply
-#   时这条腿就会被拨通。
+#
+# §KUMA-SECREDTO-W2（2026-10-10 真拨逼出的第二条，顺序就是发现顺序，别倒过来读）：
+#   上面那句"改 `-w` 不带值＋管道喂 stdin"在**真机上不成立**。当时写下的是"本机没有真拨过，
+#   风险由第 5 步读回兜住"，今天 owner 授权真拨，兜底当场生效：
+#     待写入 len=32 fp=6c545a51 → 写入后读回 got=empty，rc 却是 0。
+#   钥匙条目确实被建出来了（`security find-generic-password` 不带 -w 能看到 cdat＝那一刻、
+#   svce/acct 都对），只是**口令字段为空**。原因写在它自己的 usage 里：
+#   "Use of the -p or -w options is insecure. Specify -w as the last option to be prompted."
+#   ⇒ 无值时它 prompt 的是**终端**，不是 stdin；管道里那 32 个字符被整串丢弃，条目照样落。
+#   这一族的教训不是"参数写错了"，而是**门禁的桩按我以为的语义实现**：§110 F3-5 那个 fake
+#   security 里"`-w` 不带值＝从 stdin 读"是我编的，于是 113 段全绿里这条坏通道活得好好的，
+#   而它对外的主张是"写入钥匙串这条只在本地，没真拨"（§MAC-DRIFT 同一课的第二次：绿的读数
+#   不等于真实现，桩的语义必须由真机读数背书）。
+#   修法＝换一条**已真拨验证过**的通道：`security -i`（交互模式，命令行从 stdin 给）。
+#   三条实测（探针值各就位后逐条复核，不是推测）：
+#     ① 值精确落位——含空格与 `!` 的探针值原样读回；
+#     ② 内部命令的退出码会透传（unknown command 退 1、坏参数退 2）⇒ "命令没报错"这条主张从此有意义；
+#     ③ 出错时 usage 只打到 stderr 且**不回显参数**（对探针值 grep 命中 0）⇒ 错误摘要不会把值带进日志。
+#   值仍在 stdin，不进 argv，所以 §KUMA-SECREDTO-W 那条主张保持不变、只是换了一条真的路。
 SEC_ERR="$(mktemp)"
+# 交互通道按双引号包值，值里带双引号或反斜杠会被解析器吃掉半截——宁可拒写也不存一个"看起来成功了"
+# 的错值（错主题的告警会发到没人看的地方，比空主题更难发现：空主题至少有 ALERT-NOT-SENT 喊出来）。
+case "$NEW" in
+	*'"'* | *'\'*)
+		echo "X 待写入的主题含双引号或反斜杠，交互通道会把它截错（拒写；ntfy 主题本身也不该有这些字符）" >&2
+		rm -f "$SEC_ERR"; exit 1 ;;
+esac
 # write_kc <0|1>：$1=1 走 -U（更新已在位条目）。写口令这一条只留一个入口，两处调用共用口径。
 # 为什么不用数组传参：macOS 自带 bash 3.2 在 `set -u` 下展开**空数组** "${extra[@]}" 会报
 # unbound variable（3.2 的老 bug），而本脚本正是 set -u；分支写白比玩数组安全，也更好读。
 write_kc() {
-	local upd="$1"
+	local upd="$1" line
 	if [ "$upd" = "1" ]; then
-		printf '%s' "$NEW" | security add-generic-password -a "$OWNER" -s "$ITEM" -U -w 2>"$SEC_ERR" >/dev/null
+		line="add-generic-password -U -a \"${OWNER}\" -s \"${ITEM}\" -w \"${NEW}\""
 	else
-		printf '%s' "$NEW" | security add-generic-password -a "$OWNER" -s "$ITEM" -w 2>"$SEC_ERR" >/dev/null
+		line="add-generic-password -a \"${OWNER}\" -s \"${ITEM}\" -w \"${NEW}\""
 	fi
+	printf '%s\n' "$line" | security -i >/dev/null 2>"$SEC_ERR"
 }
-if [ -n "$OLD_KC" ]; then
+if [ "$ITEM_LIVE" = "1" ]; then
 	write_kc 1 || {
-		echo "X 更新钥匙串条目失败（security -U 返回非 0），未改动现网状态" >&2
+		echo "X 更新钥匙串条目失败（security -i 交互通道把内部命令的退出码透传回来，非 0＝真没写成）" >&2
 		echo "  security stderr 摘要：$(redact_32 "$(head -c 200 "$SEC_ERR" 2>/dev/null || true)")" >&2
 		rm -f "$SEC_ERR"; exit 1; }
 else
 	write_kc 0 || {
-		echo "X 写入钥匙串条目失败（security add 返回非 0）" >&2
+		echo "X 写入钥匙串条目失败（security -i 交互通道把内部命令的退出码透传回来，非 0＝真没写成）" >&2
 		echo "  security stderr 摘要：$(redact_32 "$(head -c 200 "$SEC_ERR" 2>/dev/null || true)")" >&2
 		rm -f "$SEC_ERR"; exit 1; }
 fi
@@ -165,9 +195,15 @@ rm -f "$SEC_ERR"
 
 # 5) 写后真拨一次：读回来比指纹，而不是相信"命令没报错"。
 #    （§0926ROT/§RESTORE 的同一课：装入口必须真拨一次，写侧自证一致 ≠ 消费者能读到。）
+#    这一条在本批**真把一次假成功拦下来了**（见上面 §KUMA-SECREDTO-W2 的读数），所以它不是兜底装饰：
+#    凡是"命令 rc=0 但值可能没进去"的写入，判据都放在读回那一侧，而不是放在写入侧的退出码。
 VERIFY="$(security find-generic-password -a "$OWNER" -s "$ITEM" -w 2>/dev/null || true)"
 if [ "$(fp8 "$VERIFY")" != "$(fp8 "$NEW")" ]; then
 	echo "X 写入后读回指纹不一致（want=$(fp8 "$NEW") got=$(fp8 "$VERIFY")）——按失败处理，别继续装代理" >&2
+	if [ -z "$VERIFY" ]; then
+		echo "  got=empty 的已知成因：条目建出来了但口令字段是空的（值没进写入口，例如走「-w 不带值」那条读终端的路）。" >&2
+		echo "  清掉空条目再重跑：security delete-generic-password -a \"\$USER\" -s ${ITEM}" >&2
+	fi
 	exit 1
 fi
 echo "ok - 已写入 ${ITEM}：len=${#VERIFY} fp=$(fp8 "$VERIFY")（读回一致）"
