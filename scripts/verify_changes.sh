@@ -7076,6 +7076,207 @@ printf '%s' "$out110" | grep -qF 'Cannot find module' \
 printf '%s' "$out110" | grep -qF '缺少必传参数' && { echo "--- FAIL: §110 F3-6 参数齐全仍走缺参分支（校验条件写坏，现网会『配了值却说没配』）"; exit 1; }
 printf '%s' "$out110" | grep -qF -- "$TOK110" && { echo "--- FAIL: §110 F3-6 运行输出里回显了主题明文"; exit 1; }
 echo "ok - §110 F3-6 kuma 必传参数四腿（缺一个也要点名、形状出口在位、合法参数卡在依赖解析上且零回显）"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ⑤ §MACD（2026-10-10 收口批）：Mac 拉取腿的唤醒窗口读法 + 稳定副本漂移探测器
+#
+# 两条读数都是今天实锚的，不是设想出来的靶子：
+#   1) 现网侧第 32 探针三拨后的复拨（07:17）读出 `quant-backup-snap present=1 rule=30h
+#      age=3.3h enabled=True lastrun=2026-10-10 04:00:00`，同一条标记手工 `ssh gz type ...SNAPSHOT_OK`
+#      一次即读到 `ok:true ts=2026-10-10T05:24:47 integrity=ok accounts_files=30`
+#      ⇒ 快照**跑了**；而 Mac 侧拉取腿 07:10:24 报的是「读不到广州 SNAPSHOT_OK（快照任务可能没跑）」，
+#      把"本机电不到"写成了"那台机没跑"＝归因方向反了一整台机器（§0929DRILL-A 把读法失败写成
+#      现网事实，同族）。日志里四例同形（10-02 10:32、10-05 10:43、10-09 10:44 挂 65 分钟后失败、
+#      10-10 07:10 一秒即败），全部落在 launchd 唤醒后的第一个动作，且每例后面紧跟
+#      「ntfy 告警发送失败（网络？）」⇒ 同一个断网窗口既打断读取也打断报警，
+#      "今晚没备份"与"今晚没人收到通知"在现象上完全一样。修法：读取带重试（copy 那腿本来就有
+#      8 次重试，读取没道理一次判死）＋成因带回日志＋半死 TCP 有封顶（ServerAlive 15s×4）。
+#   2) 副本面：10-07 波 3 的告警硬化与 10-09 §W7-D 的两表量纲抽检**从没在调度里跑过**——
+#      launchd 执行的稳定副本 mtime 全停在 09-30（本次实测 11 对里 3 diff + 2 missing-mirror）。
+#      门禁 113 段全绿、Playwright 全绿，全部绿在仓库那份文件上；这一族连"下一次部署会带上"都没有
+#      （广州侧至少还有 -s 发版推平脚本面）。⇒ 先做探测器（清单从三个安装器的 cp 行**派生**，
+#      不写第二份文件清单），再给探测器自己配反证；探测器**只读不写**，修法仍是 install_*_agent.sh -Apply。
+# 判据面纪律：FD5 对真仓库只回显"读得出多少对"，**不拿漂移判红**——现在真就是漂移态（owner 未当面
+#   -Apply），把它做成红会让门禁在一个健康现网上永远红（§107 DRILL-C 那一课）。
+# ════════════════════════════════════════════════════════════════════════════
+RPP110=deploy/mac/restic_pull_backup.sh
+CHK110=deploy/mac/check_mac_agent_drift.sh
+eq110 "$RPP110" 'MARK_MAX_TRIES="${MARK_MAX_TRIES:-3}"' 1 '重试次数由变量给（写死 1 2 3 而文案报 env 值＝阈值惰性，本仓锤过的"预览一套实跑另一套"）'
+eq110 "$RPP110" 'for mk_try in $(seq 1 "$MARK_MAX_TRIES")' 1 '循环上界由同一个变量派生（与上一条同源，缺一枚就是文案与实跑分家）'
+eq110 "$RPP110" '-o ConnectTimeout=20 -o ServerAliveInterval=15' 1 '半死 TCP 有封顶（10-09 那例挂了 65 分钟才失败：ConnectTimeout 只管连上之前，连上之后没人管）。锚点带 ConnectTimeout 是因为 ServerAlive 那一双参数在 copy 的 sftp.args 里也有一份（整串只写 ServerAlive 会把两处算一起＝计数锚混消费者，本仓踩过两次）'
+eq110 "$RPP110" '2>&1)" && mk_rc=0 || mk_rc=$?' 1 'stdout 与 stderr 同管道取回且退出码显式收（旧写法 2>/dev/null 把成因整条吞了）'
+eq110 "$RPP110" 'c1-200' 1 '成因回显限长（行长是这条链的隐形约束，超了会在外层日志里劈行）。锚点只钉「c1-200」这一段而不钉完整截断命令：§111 有一条负锁按代码行扫「门禁正文里不许出现按字节截断」，写全串就撞上那条自己的锁（今天实踩，详见 §111 ②c 的 ★ 段——那一段是本把尺子的主人，成因写在那里）。窄锚仍然承重：改成 1-100 或换别的截断写法这串就找不到，红照样出。被扫的那份文件是 Mac 侧日志、不是分类器输入，所以限长留在拉取腿里是安全的，禁的只是门禁自己的输出面'
+eq110 "$RPP110" 'sleep "${MARK_RETRY_SLEEP_SEC:-45}"' 1 '重试间隔走 env（门禁行为腿取 0 快拨，不为此拆第二条代码路径）'
+eq110 "$RPP110" '本机这头没连上' 1 '失败文案只声明本机这头的事实，并把现网正规读法指出来（不替那台机下结论）'
+neg110() { # $1=文件 $2=整串 $3=说明 → 代码行里彻底没有（本组只用于旧归因文案下线）
+	# 为什么先剥整行注释再数：旧文案在这一版里**故意留在注释里当证据**（§W7-PROBE32 那一课——
+	#   铲掉注释等于铲掉这次反证，将来没人知道曾经错过）。而负锁要拦的是"这句还会不会被用户读到"，
+	#   只有代码行算数。计数锚混消费者本仓踩过三次，这次是第四种形态：负锁把说明文字算成回流。
+	# 局限写在明处：行尾注释（代码后跟 # 的那一种）剥不掉，会误报回流；本组锚点选的是 fail 文案整串，
+	#   真实文件里它只可能出现在代码行，所以这个局限今天不咬人——哪天红了先查是不是有人把它写进了注释。
+	CNT110=$((CNT110 + 1))
+	local got
+	got=$(sed 's/^[[:space:]]*#.*$//' "$1" | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（$3）：${1} 的代码行又出现「${2}」got=${got}"; exit 1; }
+}
+neg110 "$RPP110" '快照任务可能没跑' '把"读不到"冒充成"它没跑"的旧文案不许回流（这一句的方向性错误会让人去查错的那台机器）'
+# 同一串再做一枚**整文件**正锁：注释里那一条必须还在（它记的是"这条红曾经归因反了一整台机器"）。
+# 两枚合起来才是完整形状：代码行 0 处＝用户读不到，全文件 1 处＝成因证据没被铲掉。
+# 只留负锁的后果是"为了让注释不被算进来而删注释"＝把反证删了来让锁绿，本仓 §W7-PROBE32 已经为同款付过一次账。
+eq110 "$RPP110" '快照任务可能没跑' 1 '旧归因文案在注释里保留一处（负锁刚判过代码行为 0；这里要的是它作为证据还在，不是它能被读到）'
+CNT110=$((CNT110 + 1))
+[ -x "$CHK110" ] || { echo "--- FAIL: §110 在位锁 ${CNT110}（${CHK110} 缺执行位：launchd/外层脚本按命令用它，非零退出码就是它的判决面）"; exit 1; }
+eq110 "$CHK110" 'installers = ["install_mac_backup_agent.sh", "install_mac_nightly_agent.sh", "install_mac_drill_agent.sh"]' 1 '清单来自三个安装器本身（写死第二份文件清单＝改安装器忘了改这里，漏掉的那对永远显示"不在检查面内"）'
+eq110 "$CHK110" 'if n_pairs < 6:' 1 '派生数下限（低于下限退 2＝探测器自己坏了不许冒充"没有漂移"）'
+eq110 "$CHK110" 'DRIFT-SUMMARY|pairs=%d same=%d' 1 '汇总行形状（外层只看这一行就能分流：读得出几对、几对不一致）'
+eq110 "$CHK110" 'DRIFT-UNRESOLVED|' 1 '展不开的 cp 行必须点名（静默丢弃＝把覆盖缺口伪装成通过）'
+
+# FD1–FD4 副本漂移探测器的四态行为腿（全在 /tmp 夹具树里，仓库与真实副本一个字节都不动）
+DR110="$W3T/drift"
+mkdir -p "$DR110/repo/deploy/mac" "$DR110/home/backups/quant/bin"
+for ins in install_mac_backup_agent.sh install_mac_nightly_agent.sh install_mac_drill_agent.sh; do
+	: > "$DR110/repo/deploy/mac/$ins"
+done
+# 夹具安装器：六个 cp 对（变量两跳 A="$B/x" 的写法也要展得开，这正是真实安装器的形态）
+cat > "$DR110/repo/deploy/mac/install_mac_backup_agent.sh" <<'FIX110'
+#!/bin/bash
+BIN_DIR="$HOME/backups/quant/bin"
+REPO_MAC_DIR="$REPO_ROOT/deploy/mac"
+cp "$REPO_MAC_DIR/one.sh" "$BIN_DIR/one.sh"
+cp "$REPO_MAC_DIR/two.sh" "$BIN_DIR/two.sh"
+cp "$REPO_MAC_DIR/three.sh" "$BIN_DIR/three.sh"
+cp "$REPO_MAC_DIR/four.sh" "$BIN_DIR/four.sh"
+cp "$REPO_MAC_DIR/five.sh" "$BIN_DIR/five.sh"
+cp "${REPO_MAC_DIR}/six.sh" "${BIN_DIR}/six.sh"
+FIX110
+for n in one two three four five six; do
+	echo "print $n" > "$DR110/repo/deploy/mac/$n.sh"
+	cp "$DR110/repo/deploy/mac/$n.sh" "$DR110/home/backups/quant/bin/$n.sh"
+done
+CNT110=$((CNT110 + 1))
+HOME="$DR110/home" REPO_ROOT="$DR110/repo" bash "$CHK110" >"$DR110/fd1.log" 2>&1 && fd1_rc=0 || fd1_rc=$?
+[ "$fd1_rc" = "0" ] || { echo "--- FAIL: §110 FD1 全一致的夹具被判红（rc=${fd1_rc}）：$(tail -3 "$DR110/fd1.log")"; exit 1; }
+grep -qF 'DRIFT-SUMMARY|pairs=6 same=6 diff=0' "$DR110/fd1.log" \
+	|| { echo "--- FAIL: §110 FD1 派生清单不是六对全绿（探测器没按安装器的 cp 行配对＝它报出来的那个 green 没有内容）：$(tail -2 "$DR110/fd1.log")"; exit 1; }
+echo "ok - §110 FD1 夹具六对全一致 ⇒ rc=0（派生清单真的按 cp 行配对）"
+# FD2 改一份副本 ⇒ 必须红且点名是哪一份
+echo "tampered" >> "$DR110/home/backups/quant/bin/three.sh"
+CNT110=$((CNT110 + 1))
+HOME="$DR110/home" REPO_ROOT="$DR110/repo" bash "$CHK110" >"$DR110/fd2.log" 2>&1 && fd2_rc=0 || fd2_rc=$?
+[ "$fd2_rc" = "1" ] || { echo "--- FAIL: §110 FD2 副本被改过仍 rc=${fd2_rc}（应为 1：源改完没重装这件事现在没人说）"; exit 1; }
+grep -qF 'state=diff' "$DR110/fd2.log" || { echo "--- FAIL: §110 FD2 红了但没有 diff 态读数"; exit 1; }
+grep -qF 'bin/three.sh' "$DR110/fd2.log" || { echo "--- FAIL: §110 FD2 没点名是哪一份副本漂了（只报「有漂移」的锁没法执行修法）"; exit 1; }
+grep -qF 'DRIFT-SUMMARY|pairs=6 same=5 diff=1' "$DR110/fd2.log" \
+	|| { echo "--- FAIL: §110 FD2 汇总分项与点名行不自洽：$(tail -2 "$DR110/fd2.log")"; exit 1; }
+echo "ok - §110 FD2 一份副本字节不同 ⇒ rc=1 且点名该文件、分项自洽（same=5 diff=1）"
+# FD3 铲掉一份副本 ⇒ missing-mirror（"副本不存在"与"副本不一致"是两种修法，不许共用一个态）
+rm -f "$DR110/home/backups/quant/bin/six.sh"
+CNT110=$((CNT110 + 1))
+HOME="$DR110/home" REPO_ROOT="$DR110/repo" bash "$CHK110" -Json >"$DR110/fd3.log" 2>&1 && fd3_rc=0 || fd3_rc=$?
+[ "$fd3_rc" = "1" ] || { echo "--- FAIL: §110 FD3 副本被铲仍 rc=${fd3_rc}"; exit 1; }
+grep -qF 'missing_mirror=1' "$DR110/fd3.log" || { echo "--- FAIL: §110 FD3 没读成 missing-mirror 态：$(tail -2 "$DR110/fd3.log")"; exit 1; }
+echo "ok - §110 FD3 副本缺失 ⇒ 独立态 missing_mirror=1（-Json 只出汇总也带着分项）"
+# FD4 派生本身坏掉（安装器在但一对都展不开）⇒ 必须 rc=2，不许退成"没有漂移"的绿
+mkdir -p "$DR110/empty_repo/deploy/mac"
+for ins in install_mac_backup_agent.sh install_mac_nightly_agent.sh install_mac_drill_agent.sh; do
+	: > "$DR110/empty_repo/deploy/mac/$ins"
+done
+CNT110=$((CNT110 + 1))
+HOME="$DR110/home" REPO_ROOT="$DR110/empty_repo" bash "$CHK110" -Json >"$DR110/fd4.log" 2>&1 && fd4_rc=0 || fd4_rc=$?
+[ "$fd4_rc" = "2" ] || { echo "--- FAIL: §110 FD4 派生数为 0 时 rc=${fd4_rc}（应为 2：清单读不到与没有漂移共用一个绿＝本仓最贵的错法）"; exit 1; }
+echo "ok - §110 FD4 派生低于下限 ⇒ rc=2（探测器自己坏了不报"一切正常"）"
+# FD5 真仓库面：只锁"读得出形状"，不拿现况判红（当前 owner 未 -Apply＝真有漂移，那是台账不是门禁红）
+CNT110=$((CNT110 + 1))
+bash "$CHK110" -Json >"$DR110/fd5.log" 2>&1 && fd5_rc=0 || fd5_rc=$?
+FD5_PAIRS=$(grep -c '^DRIFT-SUMMARY|pairs=' "$DR110/fd5.log" || true)
+[ "${FD5_PAIRS:-0}" = "1" ] || { echo "--- FAIL: §110 FD5 在真仓库上读不出汇总行（探测器对本仓失效，前面四态就都是夹具里的绿）"; exit 1; }
+FD5_N=$(sed -n 's/.*DRIFT-SUMMARY|pairs=\([0-9]*\).*/\1/p' "$DR110/fd5.log" | head -1)
+[ "${FD5_N:-0}" -ge 6 ] || { echo "--- FAIL: §110 FD5 真仓库只派生出 ${FD5_N:-0} 对（<6＝安装器写法变了或 glob 空转）"; exit 1; }
+echo "ok - §110 FD5 真仓库读数面（派生 ${FD5_N} 对，现况 rc=${fd5_rc} 只回显不判红——副本待 owner 当面 -Apply，见 RUNBOOK §4.1b.19）"
+# FD6 摘锁反证：把探测器的出口判决改成恒 0，FD2 那份漂了的夹具必须"变绿"
+#   （证明 FD2 的红真的来自这条判决，而不是夹具恰好让别处先退非零）
+DR110_MIR="$DR110/mut"
+mkdir -p "$DR110_MIR"
+cp "$CHK110" "$DR110_MIR/check_mac_agent_drift.sh"
+f3_sub "$DR110_MIR/check_mac_agent_drift.sh" 'sys.exit(1 if (bad or unresolved) else 0)' 'sys.exit(0)'
+CNT110=$((CNT110 + 1))
+HOME="$DR110/home" REPO_ROOT="$DR110/repo" bash "$DR110_MIR/check_mac_agent_drift.sh" -Json >"$DR110/fd6.log" 2>&1 && fd6_rc=0 || fd6_rc=$?
+[ "$fd6_rc" = "0" ] || { echo "--- FAIL: §110 FD6 摘掉判决后仍 rc=${fd6_rc}（该枚反证没落到点上：FD2 的红其实来自别处，要重读成因）"; exit 1; }
+grep -qF 'diff=1' "$DR110/fd6.log" || { echo "--- FAIL: §110 FD6 摘锁夹具里读数不再是 diff=1（破坏改变了配对本身，反证与正锁测的不是同一件事）"; exit 1; }
+echo "ok - §110 FD6 摘掉出口判决 ⇒ 同一份漂移夹具退成 rc=0 而读数仍是 diff=1（FD2 的红归因到这条判决）"
+# FD7 拉取腿重试这条腿的**行为**证据：桩 ssh 前两次失败、第三次成功，间隔取 0 跑完
+#   （静态锁只能证明"代码长这样"，证明不了"抖一次就不再断整夜"——本批要的是后者）
+STUB110="$W3T/stub7"
+mkdir -p "$STUB110/bin" "$STUB110/run" "$STUB110/home"
+cp "$RPP110" "$STUB110/run/restic_pull_backup.sh"
+cp deploy/mac/ntfy_topic.sh "$STUB110/run/ntfy_topic.sh"
+cat > "$STUB110/bin/ssh" <<'SH7'
+#!/bin/bash
+# 桩 ssh：第 1、2 次拨号失败（模拟唤醒窗口的电不到），第 3 次成功回一份合法标记。
+# 状态计数落文件而不是变量：拉取腿每一轮重试都是**同进程内的新 ssh 调用**，
+# 变量活不过一次调用（这条桩要是把计数写错，D7 就会变成"恒成功"的假绿）。
+CNT_FILE="${FAKE_SSH_CNT:-/tmp/fake_ssh_cnt}"
+n=0
+[ -f "$CNT_FILE" ] && n="$(cat "$CNT_FILE")"
+n=$((n + 1))
+printf '%s' "$n" > "$CNT_FILE"
+if [ "$n" -lt 3 ]; then
+  echo "** WARNING: connection is not using a post-quantum key exchange algorithm." >&2
+  echo "ssh: connect to host gz port 22: No route to host" >&2
+  exit 255
+fi
+printf '%s\n' "{\"ok\":true,\"ts\":\"$(date '+%Y-%m-%dT%H:%M:%S')\",\"db_bytes\":1,\"dbs\":{\"live.db\":1,\"trading.db\":1},\"integrity\":\"ok\",\"accounts_files\":1}"
+exit 0
+SH7
+cat > "$STUB110/bin/restic" <<'SH7R'
+#!/bin/bash
+# 桩 restic：所有子命令一律成功（这一腿测的是标记读取的重试，不是 restic 的行为）。
+echo "stub-snapshot-id"
+exit 0
+SH7R
+cat > "$STUB110/bin/security" <<'SH7S'
+#!/bin/bash
+# 桩 security：钥匙串只给 restic 仓库密码；**故意不给 ntfy 主题**——
+# 于是本次运行同时走 10-07 的"无主题不请求、正文落日志"分支，一次跑验两件事。
+if [ "${1:-}" = "find-generic-password" ]; then
+  case "$*" in
+    *quant-restic-repo-pass*) echo "stub-repo-pass" ; exit 0 ;;
+  esac
+  exit 44
+fi
+exit 0
+SH7S
+chmod +x "$STUB110/bin/ssh" "$STUB110/bin/restic" "$STUB110/bin/security"
+bash -n "$STUB110/bin/ssh" || { echo "--- FAIL: §110 FD7 桩脚本语法不过（先修桩，红的是桩不是判据）"; exit 1; }
+CNT110=$((CNT110 + 1))
+rm -f "$STUB110/run/cnt"
+HOME="$STUB110/home" PATH="$STUB110/bin:$PATH" FAKE_SSH_CNT="$STUB110/run/cnt" \
+	NTFY_TOPIC="" MARK_RETRY_SLEEP_SEC=0 MARK_MAX_TRIES=3 \
+	bash "$STUB110/run/restic_pull_backup.sh" >"$STUB110/fd7.log" 2>&1 && fd7_rc=0 || fd7_rc=$?
+grep -qF '=== 备份成功 ===' "$STUB110/fd7.log" \
+	|| { echo "--- FAIL: §110 FD7 抖动两次后仍没跑到成功行（rc=${fd7_rc}）：$(tail -4 "$STUB110/fd7.log")"; exit 1; }
+FAIL_LINES=$(grep -c '次读取失败 rc=' "$STUB110/fd7.log" || true)
+[ "${FAIL_LINES:-0}" = "2" ] || { echo "--- FAIL: §110 FD7 失败留痕不是恰好两行（实得 ${FAIL_LINES}）：重试循环与 env 次数不同源，或成因没回显"; exit 1; }
+grep -qF 'No route to host' "$STUB110/fd7.log" \
+	|| { echo "--- FAIL: §110 FD7 日志里没有 ssh 侧成因（旧写法 2>/dev/null 就是这样把「快照任务可能没跑」当成事实的）"; exit 1; }
+grep -qF '**' "$STUB110/fd7.log" && { echo "--- FAIL: §110 FD7 后量子提示行混进了成因回显（那不是成因，留着会让人每次去查一句无关的告警）"; exit 1; }
+grep -qF 'ALERT-NOT-SENT' "$STUB110/fd7.log" || { echo "--- FAIL: §110 FD7 无主题时没落 ALERT-NOT-SENT（10-07 那批的显式留痕被这次改动带丢了）"; exit 1; }
+echo "ok - §110 FD7 桩 ssh 两败一成 ⇒ 拉取腿仍跑到成功行、两行成因留痕（含 No route to host、剥掉 ** 提示行）、无主题走 ALERT-NOT-SENT"
+# FD8 反证：把循环上界钉死成 1（＝旧的一次判死），同一夹具必须失败
+#   （证明 FD7 的绿来自"真的重试了"，而不是桩本身恰好一直成功）
+mkdir -p "$STUB110/once"
+cp "$RPP110" "$STUB110/once/restic_pull_backup.sh"
+cp deploy/mac/ntfy_topic.sh "$STUB110/once/ntfy_topic.sh"
+f3_sub "$STUB110/once/restic_pull_backup.sh" 'for mk_try in $(seq 1 "$MARK_MAX_TRIES")' 'for mk_try in $(seq 1 1)'
+CNT110=$((CNT110 + 1))
+rm -f "$STUB110/run/cnt8"
+HOME="$STUB110/home" PATH="$STUB110/bin:$PATH" FAKE_SSH_CNT="$STUB110/run/cnt8" \
+	NTFY_TOPIC="" MARK_RETRY_SLEEP_SEC=0 MARK_MAX_TRIES=3 \
+	bash "$STUB110/once/restic_pull_backup.sh" >"$STUB110/fd8.log" 2>&1 && fd8_rc=0 || fd8_rc=$?
+[ "$fd8_rc" != "0" ] || { echo "--- FAIL: §110 FD8 循环被钉死成一次仍判绿（FD7 的绿就不是重试给的，是桩给的）"; exit 1; }
+grep -qF '本机这头没连上' "$STUB110/fd8.log" \
+	|| { echo "--- FAIL: §110 FD8 失败文案没走新归因（说明改的是别处，或两枚反证落到同一个点上）：$(tail -3 "$STUB110/fd8.log")"; exit 1; }
+echo "ok - §110 FD8 上界钉死成 1 ⇒ 同一夹具必败且红在新文案上（重试是这条腿的承重墙，不是装饰）"
 rm -rf "$W3T" "$W3F"
 # 段尾总结把 CNT110 打出来：门禁段数与判定点数都是**要对外报的数**，
 # 让日志自己带读数，比事后靠记忆写"约 60 道"诚实（§GATE-COUNT-LOCK 同一诉求）。
@@ -7096,7 +7297,7 @@ gate_need 110 "$IP110_HAS" '§107 的派生 IP 扫描没在本段之前跑完（
 CNT110=$((CNT110 + 1))
 [ "${IP_SCAN_N:-0}" -ge 13 ] || { echo "--- FAIL: §110 交接正锁 ${CNT110}（§107 的待扫文件数=${IP_SCAN_N}，<13＝那条 glob 已被人改窄，本段继承的是空扫描）"; exit 1; }
 echo "ok - §110 交接锁：沿用 §107 派生扫描读数（待扫文件 ${IP_SCAN_N} 个 / 字面公网 IP ${IP_HITS} 处）"
-echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十九腿与摘锁反证十二枚 + F3 Mac 侧五组与 kuma 必传腿，累计判定点 ${CNT110}"
+echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十九腿与摘锁反证十二枚 + F3 Mac 侧五组与 kuma 必传腿 + ⑤ Mac 拉取腿重试与副本漂移探测（FD1–FD8，其中 FD5 只回显真仓库现况不判红），累计判定点 ${CNT110}"
 
 echo "==> 111 §P2-L/§P2-K/§P2-M 门禁体系自身（波 4）：收集模式驱动 + 装配器 + 编码口径 + DNS 注入点——静态锁、镜像行为腿与五枚「本批真踩过的坑」的反证..."
 
@@ -7238,6 +7439,11 @@ eq111 "$GPY111" 'lines = read_lines(gate)' 6 '其余六个入口（sections/help
 # 三把尺子都是「代码行」锚（`^[[:space:]]*[^#]`）而不是全文计数：本段上面那份说明注释里
 # 抄了旧写法 `${got:0:92}` 作为成因描述，按全文计数就会把这枚锁自己判红（§0929DRILL 同族：
 # 负向 grep 误伤说明注释）。要禁的是**执行态**，不是提它。
+# ★ 同一族的第四种自伤形态（2026-10-10 实踩）：**别的段的锚点**把被禁字面量原样抄进门禁正文——
+#   §110 给 Mac 拉取腿钉了一枚 `'cut -c1-200'` 整串等值锁，锁自己绿不了，红报在本段名下。
+#   这把尺子扫的是「§111 之前的门禁正文」（GB111 按行切到本段段头），所以它拦得住 §110 的锚点行。
+#   修法选了**窄锚**（同一行改钉 `c1-200`：仍然承重，改成 1-100 或换截断方式照样红）而不是给本段开豁免口：
+#   豁免口一旦存在，"这条截断其实在执行态"就无处可查了。
 eq111 "$GB111" 'gate_clip() {' 1 '按字符截断的单实现（本段所有读数回显共用这一份；再写一份切片就是第二本账）'
 eq111 "$GB111" 'echo "ok - §110 F1 ${1} => $(gate_clip 92 "$got")"' 1 'F1 判决腿的读数回显走 gate_clip（就是 04:39 那轮劈坏一个汉字的那一行）'
 eq111 "$GB111" 'echo "ok - §110 F1 ${1} => $(gate_clip 92 "$V")"' 1 'F1 观测腿（10-09 加的 legnote110）同样走 gate_clip——新加的回显口子和老的一样会把中文读数截成半个字，不能只给老的那条上锁'

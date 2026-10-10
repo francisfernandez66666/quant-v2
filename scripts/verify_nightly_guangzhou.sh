@@ -269,10 +269,36 @@ def main():
             p = parse_ts(last[4])
             if p:
                 last_age_h = (now - p).total_seconds() / 3600.0
-        detail = "active=%d limit=%d last_updated_age_h=%s last_type=%s last_status=%s" % (
+        # §MAC-QSTAT（2026-10-10 观测批）：这条腿连续三夜判红（active=31 > limit=30），而只有
+        #   active 一个数的读法归不了因——同一条 INFO 在 10-03~10-09 实测是 6→7→13→15→11→11→15→23→31→31
+        #   （单调增长、末两次停在同一个数），光看总数分不清"在排队、会自己走完"与"有行永远不动"。
+        #   取向＝**只加读数、不改判据**：阈值 30 该不该换成"只数 running（并发）"、积压该给多大上限
+        #   是产品口径（Go 侧没有 30 这个约束，代码里查不到这把尺子），不在观测批里顺手改；
+        #   本仓的规矩是读法改动与判据改动不同批（§DRILL-A 那课）。
+        #   最老年龄走 python 侧逐行 parse_ts，而不是 SQL 的 MIN(updated_at)：TEXT 时间戳的字典序最小
+        #   不等于时间最老（这张表历史上混过两种写法），比较要留在能算对的一侧。
+        by_status = "none"
+        oldest_age_h = None
+        rows = cur.execute(
+            "SELECT status, updated_at FROM research_tasks "
+            "WHERE status IN ('queued','running','paused','preempted')").fetchall()
+        if rows:
+            stat_count = {}
+            for st, upd in rows:
+                stat_count[st] = stat_count.get(st, 0) + 1
+                pp = parse_ts(upd)
+                if pp:
+                    one_age_h = (now - pp).total_seconds() / 3600.0
+                    if oldest_age_h is None or one_age_h > oldest_age_h:
+                        oldest_age_h = one_age_h
+            by_status = ",".join("%s:%d" % (k, stat_count[k]) for k in sorted(stat_count))
+        detail = ("active=%d limit=%d last_updated_age_h=%s last_type=%s last_status=%s "
+                  "by_status=%s oldest_active_age_h=%s") % (
             active, a.active_max,
             ("%.1f" % last_age_h) if last_age_h is not None else "unparsed",
-            (last[0] if last else "none"), (last[1] if last else "none"))
+            (last[0] if last else "none"), (last[1] if last else "none"),
+            by_status,
+            ("%.1f" % oldest_age_h) if oldest_age_h is not None else "unparsed")
         emit("INFO", "nightly_queue " + detail)
         okq = active <= a.active_max and last_age_h is not None and last_age_h <= a.task_age_hours
         emit("PASS" if okq else "FAIL", "queue:research task queue drained and recent terminal state", detail)

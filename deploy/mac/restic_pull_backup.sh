@@ -68,10 +68,39 @@ export RESTIC_FROM_PASSWORD="$RESTIC_PASSWORD"
 trap 'unset RESTIC_PASSWORD RESTIC_FROM_PASSWORD' EXIT
 
 # 1) 读广州侧 SNAPSHOT_OK 标记：确认快照新鲜且 integrity ok（copy 前先看源头）。
+# §MAC-WAKE（2026-10-10 收口批）：这一腿原本"一次拨号即定生死"，而它跑在 launchd 唤醒之后的
+#   第一个动作上——四例实录全部落在机器刚睡醒的窗口（10-02 10:32、10-05 10:43、
+#   10-09 10:44 起挂 65 分钟后失败、10-10 07:10 一秒即败），而每一次后面都紧跟一行
+#   「ntfy 告警发送失败（网络？）」：同一个断网窗口既打断读取、也打断报警，
+#   于是"今晚没备份"和"今晚没人能收到失败通知"在现象上一模一样（§N-6/§M2 降级不得报成功同族）。
+#   更要紧的是旧写法把 stderr 整条吞了（2>/dev/null）＋零重试：日志只剩一句"快照任务可能没跑"，
+#   而 10-10 那次现网快照其实**是好的**——同一天手工复拨一次即读到 ok:true、ts=05:24、
+#   integrity ok、accounts_files=30 ⇒ 这条红把"本机电不到"冒充成"它那头没跑"，
+#   归因方向错一整台机器（§0929DRILL-A 把读法失败写成现网事实，同族）。
+#   取向三条：① 与 copy 那条腿同一姿势给重试（copy 本来就有 8 次重试，读取没道理一次判死）；
+#   ② 每次失败把 ssh 侧原因带回日志（剥掉 "** " 开头的后量子提示行，那不是成因），
+#      末次原因随 fail 文案一起进告警正文，让"下一次真断网时这条还可信"；
+#   ③ 给半死 TCP 一个封顶（ServerAlive 15s×4 ⇒ 最坏约 60s 退出，不再出现挂 65 分钟那一例）。
+#   次数与间隔走 env（MARK_MAX_TRIES / MARK_RETRY_SLEEP_SEC），门禁的行为腿把间隔取 0 快拨，
+#   不许为了门禁好跑而把重试拆成两条代码路径——同一段循环、只是参数不同。
 log "读取广州快照标记 ..."
-MARK="$(ssh -o ConnectTimeout=20 -o LogLevel=ERROR "$SSH_HOST" \
-  'type C:\var\lib\quant-snapshot\SNAPSHOT_OK' 2>/dev/null)" \
-  || fail "读不到广州 SNAPSHOT_OK（快照任务可能没跑）"
+MARK=""
+MARK_ERR="none"
+# 循环上界**由变量生成**而不是写死 `1 2 3`：写死会让 env MARK_MAX_TRIES 变成惰性的（文案报"5 次皆败"
+# 而实际只拨 3 次），这正是本仓反复锤的"阈值只在一侧生效"（§0929OPS-⑪ 那批四处同源同族）。
+MARK_MAX_TRIES="${MARK_MAX_TRIES:-3}"
+for mk_try in $(seq 1 "$MARK_MAX_TRIES"); do
+  # stdout 与 stderr 同管道取回：一次拨号既要产物也要失败原因（成功时整串就是标记，直接用）。
+  mk_out="$(ssh -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+    -o LogLevel=ERROR "$SSH_HOST" 'type C:\var\lib\quant-snapshot\SNAPSHOT_OK' 2>&1)" && mk_rc=0 || mk_rc=$?
+  if [ "$mk_rc" -eq 0 ]; then MARK="$mk_out"; break; fi
+  # 成因回显：只留非 "** " 行、压成一行、截 200 字符（行长是这条链的隐形约束，超了会劈行）。
+  MARK_ERR="$(printf '%s\n' "$mk_out" | grep -v '^\*\* ' | tr '\n' ' ' | cut -c1-200)"
+  [ -n "$MARK_ERR" ] || MARK_ERR="ssh rc=${mk_rc}（stderr 为空）"
+  log "快照标记第 ${mk_try}/${MARK_MAX_TRIES} 次读取失败 rc=${mk_rc}：${MARK_ERR}"
+  [ "${mk_try}" -lt "${MARK_MAX_TRIES}" ] && sleep "${MARK_RETRY_SLEEP_SEC:-45}"
+done
+[ -n "$MARK" ] || fail "读不到广州 SNAPSHOT_OK（${MARK_MAX_TRIES} 次皆败，最后一次：${MARK_ERR}）——这条只证明**本机这头没连上**，现网快照在不在跑须按那台机的读数另证（正规读法：GZ_IP=gz ./scripts/verify_deploy_guangzhou.sh 的第 16/32 探针）"
 echo "$MARK" | grep -q '"ok":true' || fail "广州快照标记非 ok：$MARK"
 
 SNAP_TS="$(echo "$MARK" | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
