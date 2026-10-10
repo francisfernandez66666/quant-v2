@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- com.quant.watchdog.plist — Mac 自动化日频看门狗（§MAC-WATCHDOG，2026-10-10 新增调度）。
+     语义：每天 11:00 跑 check_mac_ops_watchdog.sh，反查两件事——
+       ① 备份拉取腿自己的心跳（pull_backup.log 里最新一条「=== 备份成功 ===」距今是否超阈），
+          这条是补 §0929DRILL 那台死调度探测器的最后一块：它反查演练与夜间验收，却没人反查它；
+       ② 定时任务稳定副本与仓库源的漂移（调 check_mac_agent_drift.sh 的只读实现，判决在它自己手里）。
+     为什么排 11:00：备份拉取腿每天 07:00 与 10:30 两档（§0929DRILL-B 加的第二时点）、夜间验收 09:20、
+       恢复演练周日 09:00（封顶 09:40）。11:00 排在**所有**被看对象的当天窗口之后，
+       否则拉取腿 10:30 那一档还没跑完就被判"心跳超龄"＝每天早晨一次假红（§107 DRILL-C 那一课：
+       阈值与判据必须对齐真实触发日历）。看门狗自己不做任何 restic 动作，不与它们抢排他锁。
+     退出码语义（launchctl list 的 LastExitStatus 就按它读）：0=两条腿都绿；1=有事要人处理；
+       2=探测器读不出（留档解析不了/仓库根不在/探测器自己退 2）——**2 不等于"没问题"**。
+     安装/升级一律走 ./install_mac_watchdog_agent.sh -Apply（拷稳定副本 + 装 plist + 重载；
+       -Kick 立即补跑一次验证通道活）。
+     ⚠️ 与 com.quant.backup 同一条 TCC 教训：ProgramArguments 绝不指 Desktop 仓库路径——
+       桌面是 macOS 保护目录，launchd 拉起的 /bin/bash 读不到它，会"每天定时、每天静默失败(126)"。
+       稳定副本在 ~/backups/quant/watchdog/，且必须**和 ntfy_topic.sh、check_mac_agent_drift.sh 同目录**
+       （前者的 source、后者的调用都按 $(dirname $0) 同目录找，少一个文件就当场 FATAL/退 2）。
+     查看：launchctl list | grep com.quant.watchdog；日志 ~/backups/quant/watchdog.log；
+       留档（每次一行 JSON，失败也写）：~/backups/quant/watchdog_record.jsonl
+       ——这份留档由拉取腿的 record_freshness 反查，断更 >2 天即推"看门狗调度疑似死了"。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.quant.watchdog</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/zhangzifei/backups/quant/watchdog/check_mac_ops_watchdog.sh</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>11</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/zhangzifei/backups/quant/watchdog_launchd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/zhangzifei/backups/quant/watchdog_launchd.err</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/Users/zhangzifei</string>
+	</dict>
+</dict>
+</plist>

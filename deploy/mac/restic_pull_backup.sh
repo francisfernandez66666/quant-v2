@@ -216,6 +216,18 @@ record_freshness "nightly(com.quant.nightly)" \
   "${NIGHTLY_MAX_AGE_DAYS:-2}" \
   "./deploy/mac/install_mac_nightly_agent.sh -Apply -Kick（每日 09:20 跑广州夜间研究七腿验收，每次一行 JSON 读数）"
 
+# 看门狗（§MAC-WATCHDOG，2026-10-10）：每天 11:00 反查"拉取腿自己的心跳"与副本漂移的第三条调度。
+#   为什么要有它：本函数（死调度探测器）挂在**这条拉取腿**上，反查的是演练与夜间验收；
+#   而"拉取腿自己多久没跑成"在被它反查之前没有任何读数——09-16~09-25 断更十天就是靠人翻日志。
+#   于是新增了一条**不共享失效域**的腿（check_mac_ops_watchdog.sh，挂在另一条调度上）反查本腿心跳，
+#   而这条腿反过来用同一个判读函数反查看门狗的留档：两条腿互相看住对方，谁死了对面都会吵。
+#   共用同一个 record_freshness 不是偷懒：判读分叉的结局就是"只修一份、另一份安静地不再判红"
+#   （§0929DRILL-A 的 --last 假红就是这种形态），这也是本函数只此一份的原因。
+record_freshness "watchdog(com.quant.watchdog)" \
+  "${WATCHDOG_RECORD:-$HOME/backups/quant/watchdog_record.jsonl}" \
+  "${WATCHDOG_MAX_AGE_DAYS:-2}" \
+  "./deploy/mac/install_mac_watchdog_agent.sh -Apply -Kick（每日 11:00 反查拉取腿心跳与副本漂移，每次一行 JSON 读数）"
+
 log "=== 备份成功 ==="
 SNAPS="$(restic -r "$REPO_LOCAL" snapshots --short 2>/dev/null | tail -1)"
 alert "quant 异地备份完成" "Mac 仓库最新快照: $SNAPS" low

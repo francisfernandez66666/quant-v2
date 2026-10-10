@@ -119,7 +119,7 @@ check("L3.register_web_service 引用 ${ProbeCaddyPort}（§H8 同源）", "$Pro
 # §M7b-1（2026-09-22 部署实录，双重根因）：①caddy validate 的 INFO 日志走 stderr，PS 5.1 在
 # ErrorActionPreference=Stop + `2>&1 | ForEach-Object` 合并下把每行 stderr 变终止性错误——
 # [2d] 曾在替换 Caddyfile 前死亡且被外层告警吞掉；②暂存文件名不带 "Caddyfile" 字样时 caddy
-# 按 JSON 解析假阴性。锁：validate 必须「临时降 Continue + --adapter caddyfile + 认 $LASTEXITCODE」。
+# 按 JSON 解析假阴性。锁：validate 必须「临时降 Continue + --adapter caddyfile + 认 ${LASTEXITCODE}」。
 check("L3.register validate stderr 撕裂+适配器已修（M7b-1）",
       '$eapPrev' in webps and '--adapter caddyfile --config $CaddyConfSrc' in webps
       and '2>&1 | ForEach-Object { Write-Host "  $_" }' not in webps)
@@ -165,10 +165,10 @@ check("L6.加固器缺省只读预演（[switch]$Apply 是唯一写闸）", "[sw
 check("L6.加固器预演能判红（outside>0 即 exit 1，不写永远绿的观测行）",
       "ACL_RESULT|ok=false" in hard and "outsideTotal -gt 0" in hard)
 mac_pull = rd("deploy/mac/restic_pull_backup.sh")
-check("L6.死调度探测器单实现双消费者（record_freshness 定义 1 次、调用 2 次）",
-      mac_pull.count("record_freshness()") == 1 and len(re.findall(r"^record_freshness ", mac_pull, re.M)) == 2)
-check("L6.演练新鲜度阈值与夜间阈值各在位一次（9d/2d，两个数写一起就会互相掩盖）",
-      "DRILL_MAX_AGE_DAYS" in mac_pull and "NIGHTLY_MAX_AGE_DAYS" in mac_pull)
+check("L6.死调度探测器单实现三消费者（record_freshness 定义 1 次、调用 3 次；§MAC-WATCHDOG 起看门狗留档也由它反查——两份近乎一样的解析必然漂移，漂了的那份安静地不再判红）",
+      mac_pull.count("record_freshness()") == 1 and len(re.findall(r"^record_freshness ", mac_pull, re.M)) == 3)
+check("L6.三条新鲜度阈值各在位一次（9d/2d/2d，两个数写一起就会互相掩盖）",
+      "DRILL_MAX_AGE_DAYS" in mac_pull and "NIGHTLY_MAX_AGE_DAYS" in mac_pull and "WATCHDOG_MAX_AGE_DAYS" in mac_pull)
 vr = rd("deploy/mac/verify_restore.sh")
 check("L6.恢复演练不再赌 restic --last/--latest（0.19.1 把它当 ID 前缀过滤⇒恒空且 rc=0）",
       not any("--last" in ln for ln in vr.splitlines() if not ln.strip().startswith("#")))

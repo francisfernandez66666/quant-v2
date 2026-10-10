@@ -803,7 +803,7 @@ grep -q 'web:fingerprint' scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL
 grep -q 'trap restore_services_on_exit EXIT' "$dg" || { echo "--- FAIL: $dg 缺停服 EXIT 兜底（§A7-C）"; exit 1; }
 grep -q '^start_engine_services()' "$dg" || { echo "--- FAIL: $dg 缺 start_engine_services（§A7-C）"; exit 1; }
 grep -q 'SERVICES_STOPPED=1' "$dg" || { echo "--- FAIL: $dg 未在停服处置位 SERVICES_STOPPED（§A7-C）"; exit 1; }
-# ③ shell 变量名吞噬：`$VAR` 紧跟全角字符（如 `$ds）`）时 bash 会把多字节并入变量名，
+# ③ shell 变量名吞噬：`$VAR` 紧跟全角字符（如 `${ds}）`）时 bash 会把多字节并入变量名，
 #    在 set -u 下报 unbound variable 直接中止（2026-09-20 实测：部署在「指纹校验通过」那行
 #    崩溃，前端因此漏传）。全仓 12 处，已全部改为 ${VAR}；此守卫防新增写法回归。
 #    注：必须用 python 扫——grep 无法可靠匹配 Unicode 区间（toybox grep 对 -P/码位静默失灵）。
@@ -2016,7 +2016,7 @@ probeN=$(grep -oE '\$pc\.Free -lt [0-9]+GB' scripts/verify_deploy_guangzhou.sh |
 # 负锁：探针不得退化成"再读一次 SNAPSHOT_OK"（那与第 16 项重复，永远看不到未来的失败）。
 if grep -qE '^\s*\$freeGB = .*SNAPSHOT_OK' scripts/verify_deploy_guangzhou.sh; then
 	echo "--- FAIL: 余量探针改从 SNAPSHOT_OK 取数（自证式假绿）"; exit 1; fi
-# §RESTIC-LOCK 补锁：Invoke-Native 的参数名绝不能叫 $Args——PS 自动变量，占用会静默改语义。
+# §RESTIC-LOCK 补锁：Invoke-Native 的参数名绝不能叫 ${Args}——PS 自动变量，占用会静默改语义。
 if grep -qE 'function Invoke-Native[\s\S]{0,80}\$Args' deploy/qmt-win/backup_snapshot.ps1; then
 	echo "--- FAIL: Invoke-Native 参数占用 \$Args 自动变量"; exit 1; fi
 grep -qE 'param\(\[string\]\$Exe, \[string\[\]\]\$CmdArgs\)' deploy/qmt-win/backup_snapshot.ps1 \
@@ -2039,7 +2039,7 @@ echo "ok - §P0-B-HEADROOM 守卫通过（探针正锁 2 + 阈值等值锁 1 + �
 #       同数（等值锁，单向锁会让"探针判绿、脚本永久拒跑"）；③拒跑分支不得释别人的锁。
 echo ""
 echo "==> 73 §SNAP-LOCK 单写者锁与锁文件同源..."
-# ① 锁文件名同源（脚本端 Join-Path $SnapRoot，探针端 Join-Path $SnapDir）。
+# ① 锁文件名同源（脚本端 Join-Path ${SnapRoot}，探针端 Join-Path ${SnapDir}）。
 grep -qE '\$Lock = Join-Path \$SnapRoot "\.backup\.lock"' deploy/qmt-win/backup_snapshot.ps1 \
 	|| { echo "--- FAIL: 脚本端锁文件名/位置形态变更（探针将读到不存在的锁=恒绿）"; exit 1; }
 grep -qE '\$Lk = Join-Path \$SnapDir "\.backup\.lock"' scripts/verify_deploy_guangzhou.sh \
@@ -2054,7 +2054,7 @@ grep -qF 'if ($writers -ge 2)' scripts/verify_deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 第 18 探针丢失 writers>=2 判据（两份快照互相覆盖看不见）"; exit 1; }
 grep -qF 'writer without lock (unguarded run)' scripts/verify_deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 第 18 探针丢失「不认锁的进程」判据（09-23 那类孤儿复犯将无信号）"; exit 1; }
-# ② 接管龄上界等值：脚本用分钟（$LockMaxMin），探针用小时，换算后必须相等。
+# ② 接管龄上界等值：脚本用分钟（${LockMaxMin}），探针用小时，换算后必须相等。
 lockMin=$(grep -oE '\$LockMaxMin = [0-9]+' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1 || true)
 probeH=$(grep -oE 'if \(\$lkAgeH -ge [0-9]+\)' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1 || true)
 [ -n "$lockMin" ] && [ -n "$probeH" ] \
@@ -3603,7 +3603,7 @@ kill "$AM_PID" 2>/dev/null || true
 wait "$AM_PID" 2>/dev/null || true
 AM_ERRS=""
 am_chk() { if [ "$2" != "$3" ]; then AM_ERRS="${AM_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 am_chk "夹具未鉴权 401 自证" "$AM_401" "401"
 am_chk "夹具就绪" "$am_wait" "up"
 am_chk "预览退出码" "$C1" "0"
@@ -3642,9 +3642,9 @@ LG_SVT=cmd/research/survey_test.go
 LG_ERE='^survey_library gate=[a-z_]+ factor_rules=[0-9]+ pattern_rules=[0-9]+ entries=[0-9]+/[0-9]+ enabled=[0-9]+/[0-9]+ dir_from=[a-z_]+ zero_reason='
 LG_ERRS=""
 lg_chk() { if [ "$2" != "$3" ]; then LG_ERRS="${LG_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 lg_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then LG_ERRS="${LG_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 # 子串判据一律用 case 而不是 grep：本段是"运行一次真 CLI"的实证，grep 的退出码在 set -e 下
 # 只会把结论变成"中止"，而 §89 已经为这件事付过一轮学费。
 lg_has() { case $LG_OUT in *"$2"*) echo 1 ;; *) echo 0 ;; esac; }
@@ -3828,9 +3828,9 @@ CG_DL=cmd/dataload/baostock.go
 CG_TST=internal/data/trade_time_calendar_test.go
 CG_ERRS=""
 cg_chk() { if [ "$2" != "$3" ]; then CG_ERRS="${CG_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 cg_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then CG_ERRS="${CG_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 
 # ── ① 结构锁 ──
 # 14 个受闸判据（与本批改写的函数清单一一对应；新增时段判据必须进这张清单，否则 ①b 循环不覆盖它）。
@@ -3953,11 +3953,11 @@ echo "==> 97 §CAND-PUSH 候选推送云端通道：只写 proposed / 备份先�
 CP_SCR=scripts/push_candidates_guangzhou.sh
 CP_ERRS=""
 cp_chk() { if [ "$2" != "$3" ]; then CP_ERRS="${CP_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 cp_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then CP_ERRS="${CP_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 cp_absent() { if [ "${2:-0}" -ne "0" ]; then CP_ERRS="${CP_ERRS}
-  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+  · ${1}（应彻底没有，实得 ${2} 处）"; fi; }
 
 
 cp_chk "§CAND-PUSH 脚本在位" "$(test -f "$CP_SCR" && echo 1 || echo 0)" "1"
@@ -4079,11 +4079,11 @@ fi
 echo "==> 98 §0925EVE-W1 第一波四修：A2 kill-switch 失败明细 / B1 财务续传键改映射表+期分布 / C1 实盘战法库三态闸 / D1 配置热重载补锁（2026-09-25 owner 令「根据修改文档开始修代码」）..."
 EV_ERRS=""
 ev_chk() { if [ "$2" != "$3" ]; then EV_ERRS="${EV_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 ev_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then EV_ERRS="${EV_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 ev_absent() { if [ "${2:-0}" -ne "0" ]; then EV_ERRS="${EV_ERRS}
-  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+  · ${1}（应彻底没有，实得 ${2} 处）"; fi; }
 # 负锁的「注释行不计」helper（§BRIDGE-PATH/§89 同族坑：set -euo pipefail 下
 # 管道里 grep 零命中退 1 会静默中止整轮，两头都要 || true 兜掉）
 ev_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
@@ -4171,11 +4171,11 @@ fi
 echo "==> 99 §0925EVE-W3 第三波接线收口：交割归因/BrokerStatus双腿/第15判据/4xx直败/时间口径/留痕/审计/审批一致/第三态面板/自举幂等/前端对话框/板块未知态（2026-09-25 owner 令「全部做完后部署」）..."
 EW_ERRS=""
 ew_chk() { if [ "$2" != "$3" ]; then EW_ERRS="${EW_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 ew_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then EW_ERRS="${EW_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 ew_absent() { if [ "${2:-0}" -ne "0" ]; then EW_ERRS="${EW_ERRS}
-  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+  · ${1}（应彻底没有，实得 ${2} 处）"; fi; }
 # 注释行过滤：Go 行注释、JS 行注释、块注释起始、JSX {/*、块注释续行 * —— 五种形态都算注释
 ew_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
 	{ grep -nE "$2" "$1" 2>/dev/null || true; } | { grep -Ev '^[0-9]+:[[:space:]]*(//|\{?/\*|\*)' || true; } | wc -l | tr -d ' '
@@ -4265,11 +4265,11 @@ echo "==> 100 §0926-W2 第二波裁决+A1/A5/B2/B3/B4/B7+E1 盈亏单轨+C7 服
 GW_ERRS=""
 GW_OBS=""
 gw_chk() { if [ "$2" != "$3" ]; then GW_ERRS="${GW_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 gw_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then GW_ERRS="${GW_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 gw_absent() { if [ "${2:-0}" -ne "0" ]; then GW_ERRS="${GW_ERRS}
-  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+  · ${1}（应彻底没有，实得 ${2} 处）"; fi; }
 # 非注释命中（§89/静态负锁同族坑：说明注释≠旧写法复活；set -e 下管道 grep 必带 || true）
 gw_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
 	{ grep -nE "$2" "$1" 2>/dev/null || true; } | { grep -Ev '^[0-9]+:[[:space:]]*(//|\*)' || true; } | wc -l | tr -d ' '
@@ -4343,7 +4343,7 @@ gw_min "E1 前端用例段（§E1 describe + 四用例）" "$(grep -c '§E1' web
 # ── ⑧ C7 Windows 服务拉起单源化（owner：「三套并存的单源化，要做」） ──
 gw_chk "C7 单源文件在位" "$(test -f deploy/qmt-win/service_definitions.ps1 && echo 1 || echo 0)" "1"
 gw_min "C7 部署清单接线（ps1_bom+scp 两腿，§ENH-5「仓库里有、现网没有」同族）" "$(grep -c 'service_definitions.ps1' scripts/deploy_guangzhou.sh || true)" "2"
-# §0926E2E-W2C 同日同步：6→7——备份脚本接入单源取 $SvcGatewayConfigFile（密钥备份腿），
+# §0926E2E-W2C 同日同步：6→7——备份脚本接入单源取 ${SvcGatewayConfigFile}（密钥备份腿），
 # 合法新增消费者，按「观测计数锁新增腿须同日同步」口径改判数（2026-09-27 预演读数 7）。
 gw_chk "C7 消费脚本 dot-source 恰 7 个（三套并存的收编面+§0926E2E-W2C 备份腿）" "$(grep -l 'Join-Path \$PSScriptRoot "service_definitions.ps1"' deploy/qmt-win/*.ps1 | wc -l | tr -d ' ')" "7"
 GW_SVCA="$(sed -n 's/^\$SvcName[A-Za-z]*[[:space:]]*=.*else { "\([^"]*\)" }$/\1/p' deploy/qmt-win/service_definitions.ps1 | sort | paste -sd, -)"
@@ -4399,11 +4399,11 @@ fi
 echo "==> 101 §0926PM 三季报通道+日历读数探针+跌停闸现值探针+restic 自愈（2026-09-26 下午批）..."
 FQ_ERRS=""
 fq_chk() { if [ "$2" != "$3" ]; then FQ_ERRS="${FQ_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 fq_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then FQ_ERRS="${FQ_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 fq_absent() { if [ "${2:-0}" -ne "0" ]; then FQ_ERRS="${FQ_ERRS}
-  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+  · ${1}（应彻底没有，实得 ${2} 处）"; fi; }
 
 FQ_SCR=scripts/backfill_fina_q3_guangzhou.sh
 FQ_VD=scripts/verify_deploy_guangzhou.sh
@@ -4511,11 +4511,11 @@ fi
 echo "==> 102 §QMT-TOKENROT-CLI 网关口令轮换正规通道（2026-09-26 owner 令收编）..."
 RT_ERRS=""
 rt_chk() { if [ "$2" != "$3" ]; then RT_ERRS="${RT_ERRS}
-  · $1（读到 ${2}，应为 ${3}）"; fi; }
+  · ${1}（读到 ${2}，应为 ${3}）"; fi; }
 rt_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then RT_ERRS="${RT_ERRS}
-  · $1（读到 ${2}，应 ≥ ${3}）"; fi; }
+  · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
 rt_absent() { if [ "${2:-0}" -ne "0" ]; then RT_ERRS="${RT_ERRS}
-  · $1（应彻底没有，实得 ${2} 处）"; fi; }
+  · ${1}（应彻底没有，实得 ${2} 处）"; fi; }
 
 RT_SCR=scripts/rotate_qmt_token_guangzhou.sh
 RT_PS1=deploy/qmt-win/rotate_qmt_token.ps1
@@ -4989,21 +4989,21 @@ CNT106=0
 # has106：存在性锁（模式必须出现在文件里）。
 has106() {
 	CNT106=$((CNT106 + 1))
-	grep -q -- "$2" "$1" || { echo "--- FAIL: §106 锁 ${CNT106}（$3）：${1} 缺「$2」"; exit 1; }
+	grep -q -- "$2" "$1" || { echo "--- FAIL: §106 锁 ${CNT106}（${3}）：${1} 缺「${2}」"; exit 1; }
 }
 # eq106：等值锁（grep -c 实际读数必须逐字等于预演读数）。
 eq106() {
 	CNT106=$((CNT106 + 1))
 	local got
 	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §106 等值锁 ${CNT106}（$4）：${1} 模式「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §106 等值锁 ${CNT106}（${4}）：${1} 模式「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 # absent106：负锁（该形态在文件里的行数必须为 0＝回归即红）。
 absent106() {
 	CNT106=$((CNT106 + 1))
 	local got
 	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §106 负锁 ${CNT106}（$3）：${1} 又出现「$2」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §106 负锁 ${CNT106}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
 # word106：标识符存在锁（整词匹配，且必须恰好 1 行）。为什么不用 has106：反证实测「把函数改名成
 # XXX_v2」时子串仍然命中，存在性锁会放过去（STAYED-GREEN 实录 6 条）。整词 + 计数等值才是锁。
@@ -5011,7 +5011,7 @@ word106() {
 	CNT106=$((CNT106 + 1))
 	local got
 	got=$(grep -cw -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "1" ] || { echo "--- FAIL: §106 整词锁 ${CNT106}（$3）：${1} 形态「$2」got=${got:-0} 预演=1"; exit 1; }
+	[ "${got:-0}" = "1" ] || { echo "--- FAIL: §106 整词锁 ${CNT106}（${3}）：${1} 形态「${2}」got=${got:-0} 预演=1"; exit 1; }
 }
 
 # ── ⑩ 成交额量纲：写侧换算调用点、抽检子命令、quality 自适应、幻觉文案不得复活 ──
@@ -5125,7 +5125,7 @@ leg106() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
 	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
-		echo "--- FAIL: §106 行为腿判红（$1），全文如下："
+		echo "--- FAIL: §106 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
@@ -5197,7 +5197,7 @@ echo "ok - §106 行为腿 8 组 + 离线自证 4 条通过"
 #   阈值三处：30/54 分流=1、透传给演练=1、演练默认 30=1；
 #   com.quant.backup.plist Hour=2（7/10 各 1）、安装器 HOUR_LINES 锁=3；
 #   restore_drill.sh accounts_files=5、PAPER_TOTAL=4、旧 MISSING 形态=0；
-#   restic_pull_backup.sh record_freshness 定义=1 调用=2、两个 *_MAX_AGE_DAYS 各=1；
+#   restic_pull_backup.sh record_freshness 定义=1 调用=3、三个 *_MAX_AGE_DAYS 各=1（§MAC-WATCHDOG 起多一位看门狗消费者）；
 #   run_nightly_verify.sh alias_declared 定义=1、预览腿=1、实跑腿=1、两条判红文案各=1；
 #   心跳四件套：规则名=1、路由=1、SetGauge 字面赋值点=2、接线=1、const 别名=0；
 #   deploy_guangzhou.sh harden_snapshot_acl=2（BOM 归一 + 上传清单，无 -File 执行行）、
@@ -5237,19 +5237,19 @@ echo "==> 107 §0929 恢复演练三条真缺陷 + 定时腿收编 + 休市日�
 CNT107=0
 has107() {
 	CNT107=$((CNT107 + 1))
-	grep -q -- "$2" "$1" || { echo "--- FAIL: §107 锁 ${CNT107}（$3）：${1} 缺「$2」"; exit 1; }
+	grep -q -- "$2" "$1" || { echo "--- FAIL: §107 锁 ${CNT107}（${3}）：${1} 缺「${2}」"; exit 1; }
 }
 eq107() {
 	CNT107=$((CNT107 + 1))
 	local got
 	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §107 等值锁 ${CNT107}（$4）：${1} 模式「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §107 等值锁 ${CNT107}（${4}）：${1} 模式「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 absent107() {
 	CNT107=$((CNT107 + 1))
 	local got
 	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §107 负锁 ${CNT107}（$3）：${1} 又出现「$2」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §107 负锁 ${CNT107}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
 # absent_code107：只在**执行行**上判红的负锁。为什么不能沿用 absent107：本批 --last 这一条
 # 恰恰要求注释里**保留**踩坑原文（含 restic 的报错行），否则下一个人"顺手加回来"时没有证据。
@@ -5258,7 +5258,7 @@ absent_code107() {
 	CNT107=$((CNT107 + 1))
 	local got
 	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -c -- "$2" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §107 执行行负锁 ${CNT107}（$3）：${1} 的非注释行里出现「$2」got=${got}（注释里保留成因是允许的，执行行不行）"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §107 执行行负锁 ${CNT107}（${3}）：${1} 的非注释行里出现「${2}」got=${got}（注释里保留成因是允许的，执行行不行）"; exit 1; }
 }
 # line_before107：先后顺序锁。本批 DRILL-B 的整个成因就是"两行语句的相对顺序"，
 # 用存在性锁（两段都在文件里）对此完全失明——把它们换个位置照样全绿。
@@ -5267,8 +5267,8 @@ line_before107() { # $1=文件 $2=应在前的模式 $3=应在后的模式 $4=�
 	local a b
 	a=$(grep -n -- "$2" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
 	b=$(grep -n -- "$3" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
-	{ [ -n "$a" ] && [ -n "$b" ]; } || { echo "--- FAIL: §107 先后锁 ${CNT107}（$4）：${1} 里两段的锚点没都找到 first=${a:-?} second=${b:-?}"; exit 1; }
-	[ "$a" -lt "$b" ] || { echo "--- FAIL: §107 先后锁 ${CNT107}（$4）：${1} 里「$2」在第 ${a} 行、已不早于「$3」第 ${b} 行（顺序一倒，每份快照装的标记就都是上一夜的）"; exit 1; }
+	{ [ -n "$a" ] && [ -n "$b" ]; } || { echo "--- FAIL: §107 先后锁 ${CNT107}（${4}）：${1} 里两段的锚点没都找到 first=${a:-?} second=${b:-?}"; exit 1; }
+	[ "$a" -lt "$b" ] || { echo "--- FAIL: §107 先后锁 ${CNT107}（${4}）：${1} 里「${2}」在第 ${a} 行、已不早于「${3}」第 ${b} 行（顺序一倒，每份快照装的标记就都是上一夜的）"; exit 1; }
 }
 
 VR=deploy/mac/verify_restore.sh
@@ -5326,11 +5326,12 @@ done
 CNT107=$((CNT107 + 1))
 [ -z "$PAIR_MISS" ] || { echo "--- FAIL: §107 调度件配对锁 ${CNT107}：${PAIR_MISS}"; exit 1; }
 
-# ── 死调度探测器：一个判读函数、两个消费者（演练 + 夜间验收），不得写回两份近乎一样的解析 ──
+# ── 死调度探测器：一个判读函数、三个消费者（演练 + 夜间验收 + 看门狗），不得写回多份近乎一样的解析 ──
 eq107 "$RP" 'record_freshness()' 1 '探测器定义唯一（两份并存的结局是只修一份，另一份继续读旧键名）'
-eq107 "$RP" '^record_freshness ' 2 '消费者恰好两个（drill / nightly；掉一个＝那条调度重新没人反查新鲜度）'
+eq107 "$RP" '^record_freshness ' 3 '消费者恰好三个（drill / nightly / watchdog；§MAC-WATCHDOG 起看门狗留档也由它反查。掉一个＝那条调度重新没人反查新鲜度；§MAC-WATCHDOG 之前是 2，涨到 3 的那一位是看门狗自己）'
 eq107 "$RP" 'DRILL_MAX_AGE_DAYS' 1 '演练超龄阈值只在调用点出现一次（9 天＝周日一次 + 两天余量）'
 eq107 "$RP" 'NIGHTLY_MAX_AGE_DAYS' 1 '夜间验收超龄阈值只在调用点出现一次（2 天＝天天跑 + 一天余量）'
+eq107 "$RP" 'WATCHDOG_MAX_AGE_DAYS' 1 '看门狗超龄阈值只在调用点出现一次（2 天＝天天跑 + 一天余量；§MAC-WATCHDOG）'
 
 # ── DRILL-D：别名前提（ssh -G 对未配置别名把别名本身当 hostname 回显 ⇒ "非空即通过"恒真）──
 eq107 "$RN" 'alias_declared()' 1 '别名点名判据单实现（预览腿与实跑腿共用，不许一个有一个没有）'
@@ -5355,7 +5356,7 @@ word107() {
 	CNT107=$((CNT107 + 1))
 	local got
 	got=$(grep -cw -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "1" ] || { echo "--- FAIL: §107 整词锁 ${CNT107}（$3）：${1} 形态「$2」got=${got:-0} 预演=1"; exit 1; }
+	[ "${got:-0}" = "1" ] || { echo "--- FAIL: §107 整词锁 ${CNT107}（${3}）：${1} 形态「${2}」got=${got:-0} 预演=1"; exit 1; }
 }
 word107 internal/engine/heartbeat_test.go 'func TestClosedDayPinnedCountPair' '休市/开市成对反证用例在位'
 word107 internal/engine/heartbeat_test.go 'func TestSignalHeartbeatSaturdayIsNotAFault' '周六不该判故障的用例在位（反向误伤形态）'
@@ -5568,7 +5569,7 @@ leg107() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
 	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
-		echo "--- FAIL: §107 行为腿判红（$1），全文如下："
+		echo "--- FAIL: §107 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
@@ -5668,7 +5669,7 @@ eq108() { # $1=文件 $2=整串 $3=预演读数 $4=说明（整文件计数，�
 	CNT108=$((CNT108 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §108 整串等值锁 ${CNT108}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §108 整串等值锁 ${CNT108}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 # 执行行等值/负锁：复用 §95 的 gw_code_hits（同一个判读实现两处消费，不再抄一份第二把尺子——
 # 两份并存的结局是只修一份、另一份继续按旧口径读数，本仓 §107 刚记过这一族）。
@@ -5676,7 +5677,7 @@ code_eq108() { # $1=文件 $2=ERE $3=期望非注释命中数 $4=说明
 	local got
 	got=$(gw_code_hits "$1" "$2")
 	CNT108=$((CNT108 + 1))
-	[ "$got" = "$3" ] || { echo "--- FAIL: §108 执行行锁 ${CNT108}（$4）：${1} 模式「$2」非注释命中=${got} 预演=$3"; exit 1; }
+	[ "$got" = "$3" ] || { echo "--- FAIL: §108 执行行锁 ${CNT108}（${4}）：${1} 模式「${2}」非注释命中=${got} 预演=$3"; exit 1; }
 }
 
 # ── 根因①：取键必须委托同源，本地优先级不得复活 ──
@@ -5805,7 +5806,7 @@ leg108() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
 	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
-		echo "--- FAIL: §108 行为腿判红（$1），全文如下："
+		echo "--- FAIL: §108 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
@@ -5931,7 +5932,7 @@ eq109() { # $1=文件 $2=整串 $3=预演读数 $4=说明
 	CNT109=$((CNT109 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §109 整串等值锁 ${CNT109}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §109 整串等值锁 ${CNT109}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 
 # ── ① Python 侧：写点唯一 / 消费点唯一 / 留痕在位 / 旧口径书写不得回流 ──
@@ -6127,7 +6128,7 @@ leg109() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
 	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
-		echo "--- FAIL: §109 Go 行为腿判红（$1），全文如下："
+		echo "--- FAIL: §109 Go 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
@@ -6167,7 +6168,7 @@ eq110() { # $1=文件 $2=整串 $3=预演读数 $4=说明
 	CNT110=$((CNT110 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §110 整串等值锁 ${CNT110}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §110 整串等值锁 ${CNT110}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 ln110() { # $1=文件 $2=整串 → 首个命中行号（0＝没有）；顺序锁用
 	local n
@@ -6300,7 +6301,7 @@ EN110B=$(ln110 scripts/verify_deploy_guangzhou.sh '$krInfo = Get-ScheduledTaskIn
 #   这两条在本机同样没法验。"没法验"正是上一个缺陷的出身。所以两条都走，并且**读数自报来源**
 #   （先例＝§N-5 服务 env 腿的 read=registry|nssm-text）：下一次拨测要么看见值，要么看见 src=none，
 #   红项自己说清"是现网坏还是我的读法坏"，不需要再拿一趟上机去猜。
-# ★ 不许把 XML 的布尔文本直接 `[bool]` 化：PowerShell 里非空字符串恒真，`[bool]"false"` 是 $true，
+# ★ 不许把 XML 的布尔文本直接 `[bool]` 化：PowerShell 里非空字符串恒真，`[bool]"false"` 是 ${true}，
 #   那一式会把"已禁用"洗成"已启用"——那不是读不到，是**读反**，比 na 更坏（na 至少还会 fail-closed）。
 #   所以按字面量映射成判读侧认的拼写，而且真值支与假值支**各钉一枚**：只钉真值支就等于给
 #   "顺手写成 [bool]"留门，而那正是把判据反着弄坏的入口。
@@ -6311,7 +6312,7 @@ eq110 scripts/verify_deploy_guangzhou.sh '$krEnRaw = $krXml.Task.Settings.Enable
 eq110 scripts/verify_deploy_guangzhou.sh '$krRegRaw = $krXml.Task.RegistrationInfo.Date' 1 '注册龄的第二条腿＝适配式（同上）'
 eq110 scripts/verify_deploy_guangzhou.sh 'if (-not $krEnNode) {' 1 'Enabled 的退路门闩在位（缺它＝第一条腿失败就直接掉到对象属性，而那两本账在现网已被实测证明读不到）'
 eq110 scripts/verify_deploy_guangzhou.sh 'if (-not $krRegNode) {' 1 '注册龄的退路门闩在位（同上）'
-eq110 scripts/verify_deploy_guangzhou.sh '-is [System.Xml.XmlElement]' 2 '元素对象显式取 InnerText 的两处（Enabled/Date 各一条适配腿）。为什么不写 `[string]$节点`：对 XmlElement 做字符串化拿什么形状本机同样没验——把"赌属性形状"换成"赌转换形状"不算修好'
+eq110 scripts/verify_deploy_guangzhou.sh '-is [System.Xml.XmlElement]' 2 '元素对象显式取 InnerText 的两处（Enabled/Date 各一条适配腿）。为什么不写 `[string]${节}点`：对 XmlElement 做字符串化拿什么形状本机同样没验——把"赌属性形状"换成"赌转换形状"不算修好'
 eq110 scripts/verify_deploy_guangzhou.sh '$krRegDt.Year -gt 2010' 1 '注册时刻的年代界（与"上次运行"那把同源 2010）。这里防的不是现网坏，是**我自己按名取错元素**：任务 XML 里若还有别的 Date 元素，过老的日期就是那种错读的形状，取错当读不出，而不是拿假龄去比阈值'
 eq110 scripts/verify_deploy_guangzhou.sh '"|en_src=" + $krEnSrc' 1 '读法来源进读数协议（供给侧失灵的症状是"恒 na 而判据照常绿"，光有值没有来源时红了还得人上机猜）'
 eq110 scripts/verify_deploy_guangzhou.sh '"|reg_src=" + $krRegSrc' 1 '注册龄的读法来源同样进协议（两条腿共用一个自证口径，红了直接看是哪条式子没通）'
@@ -6592,7 +6593,7 @@ f3_expect_f2_red() { # $1=标签 $2=期望的 F2-FAIL 点名片段 $3=defs $4=re
 	out="$(python3 "$W3F/f2.py" "$3" "$4" 2>&1)" || rcF3=$?
 	[ "$rcF3" != "0" ] || { echo "--- FAIL: §110 F3 ${1}：镜像破坏后 F2 判据仍然 0 退出（这条等值锁是恒绿的装饰）"; exit 1; }
 	printf '%s' "$out" | grep -qF 'F2-FAIL' || { echo "--- FAIL: §110 F3 ${1}：非零退出但不是判据自己点名（说明镜像坏了而不是锁红了）：$(printf '%s' "$out" | tail -2)"; exit 1; }
-	printf '%s' "$out" | grep -qF -- "$2" || { echo "--- FAIL: §110 F3 ${1}：红的归属不对（期望点名「$2」，实得尾部：$(printf '%s' "$out" | tail -1)）——本枚破坏必须只有这一枚能造成这个红"; exit 1; }
+	printf '%s' "$out" | grep -qF -- "$2" || { echo "--- FAIL: §110 F3 ${1}：红的归属不对（期望点名「${2}」，实得尾部：$(printf '%s' "$out" | tail -1)）——本枚破坏必须只有这一枚能造成这个红"; exit 1; }
 	echo "ok - §110 F3 ${1} => $(gate_clip 96 "$(printf '%s' "$out" | grep -F 'F2-FAIL' | head -1)")"
 }
 
@@ -6822,7 +6823,7 @@ legnote110() { # $1=用例名 $2=期望 PASS|FAIL $3=判决必须点名串 $4=�
 	# 第四臂是本腿存在的理由：判决对了不算完，**读数必须真的打印给看的人**
 	# （观测行只进内部变量、INFO 行被吞掉＝"加了仪表却没接线"，10-09 复盘的那条形态）。
 	printf '%s\n' "$all" | grep -qF -- "$4" || {
-		echo "--- FAIL: §110 F1 ${1}：整段输出里没有「$4」（判决对但读数没落地＝现网仍然查不到那一手信息）"; exit 1; }
+		echo "--- FAIL: §110 F1 ${1}：整段输出里没有「${4}」（判决对但读数没落地＝现网仍然查不到那一手信息）"; exit 1; }
 	echo "ok - §110 F1 ${1} => $(gate_clip 92 "$V")"
 }
 
@@ -6907,7 +6908,7 @@ rm -f "$W3T/fn_mut.sh"
 # ──────────────────────────────────────────────────────────────────────────────
 # F3 Mac 侧行为腿：单实现三态 / 空主题不请求 / 缺 lib 拒跑 / 安装器零改动 / 迁移器不回 argv
 # ──────────────────────────────────────────────────────────────────────────────
-# fake security 桩 + 假钥匙串状态文件：这三条腿全程只碰 $W3T，**本机真实钥匙串零接触**
+# fake security 桩 + 假钥匙串状态文件：这三条腿全程只碰 ${W3T}，**本机真实钥匙串零接触**
 # （写钥匙串属本地凭据变更，不在本批自动执行面内；桩把收到的命令行整串记进 SEC_LOG，
 #   供"值不许进 argv"这条断言读——argv 同机任何进程 ps 可见，等于把凭据从 git 历史搬到运行期明文）。
 cat > "$W3T/bin/security" <<'SHIM110'
@@ -7217,7 +7218,7 @@ neg110() { # $1=文件 $2=整串 $3=说明 → 代码行里彻底没有（本组
 	CNT110=$((CNT110 + 1))
 	local got
 	got=$(sed 's/^[[:space:]]*#.*$//' "$1" | grep -cF -- "$2" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（$3）：${1} 的代码行又出现「${2}」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §110 负锁 ${CNT110}（${3}）：${1} 的代码行又出现「${2}」got=${got}"; exit 1; }
 }
 neg110 "$RPP110" '快照任务可能没跑' '把"读不到"冒充成"它没跑"的旧文案不许回流（这一句的方向性错误会让人去查错的那台机器）'
 # 同一串再做一枚**整文件**正锁：注释里那一条必须还在（它记的是"这条红曾经归因反了一整台机器"）。
@@ -7226,7 +7227,7 @@ neg110 "$RPP110" '快照任务可能没跑' '把"读不到"冒充成"它没跑"�
 eq110 "$RPP110" '快照任务可能没跑' 1 '旧归因文案在注释里保留一处（负锁刚判过代码行为 0；这里要的是它作为证据还在，不是它能被读到）'
 CNT110=$((CNT110 + 1))
 [ -x "$CHK110" ] || { echo "--- FAIL: §110 在位锁 ${CNT110}（${CHK110} 缺执行位：launchd/外层脚本按命令用它，非零退出码就是它的判决面）"; exit 1; }
-eq110 "$CHK110" 'installers = ["install_mac_backup_agent.sh", "install_mac_nightly_agent.sh", "install_mac_drill_agent.sh"]' 1 '清单来自三个安装器本身（写死第二份文件清单＝改安装器忘了改这里，漏掉的那对永远显示"不在检查面内"）'
+eq110 "$CHK110" 'install_mac_*_agent.sh' 1 '安装器清单按文件名形状派生（§MAC-WATCHDOG 起四个；首版写死三个名字，第四个安装器上场时它的 cp 行就不在检查面内＝清单式锁失明同族，本枚锁防它回来）'
 eq110 "$CHK110" 'if n_pairs < 6:' 1 '派生数下限（低于下限退 2＝探测器自己坏了不许冒充"没有漂移"）'
 eq110 "$CHK110" 'DRIFT-SUMMARY|pairs=%d same=%d' 1 '汇总行形状（外层只看这一行就能分流：读得出几对、几对不一致）'
 eq110 "$CHK110" 'DRIFT-UNRESOLVED|' 1 '展不开的 cp 行必须点名（静默丢弃＝把覆盖缺口伪装成通过）'
@@ -7234,7 +7235,8 @@ eq110 "$CHK110" 'DRIFT-UNRESOLVED|' 1 '展不开的 cp 行必须点名（静默�
 # FD1–FD4 副本漂移探测器的四态行为腿（全在 /tmp 夹具树里，仓库与真实副本一个字节都不动）
 DR110="$W3T/drift"
 mkdir -p "$DR110/repo/deploy/mac" "$DR110/home/backups/quant/bin"
-for ins in install_mac_backup_agent.sh install_mac_nightly_agent.sh install_mac_drill_agent.sh; do
+# 夹具的安装器名单跟着真实形态走（§MAC-WATCHDOG 起四个；探测器按 glob 派生，多一个空文件不多一对）
+for ins in install_mac_backup_agent.sh install_mac_nightly_agent.sh install_mac_drill_agent.sh install_mac_watchdog_agent.sh; do
 	: > "$DR110/repo/deploy/mac/$ins"
 done
 # 夹具安装器：六个 cp 对（变量两跳 A="$B/x" 的写法也要展得开，这正是真实安装器的形态）
@@ -7278,7 +7280,7 @@ grep -qF 'missing_mirror=1' "$DR110/fd3.log" || { echo "--- FAIL: §110 FD3 没�
 echo "ok - §110 FD3 副本缺失 ⇒ 独立态 missing_mirror=1（-Json 只出汇总也带着分项）"
 # FD4 派生本身坏掉（安装器在但一对都展不开）⇒ 必须 rc=2，不许退成"没有漂移"的绿
 mkdir -p "$DR110/empty_repo/deploy/mac"
-for ins in install_mac_backup_agent.sh install_mac_nightly_agent.sh install_mac_drill_agent.sh; do
+for ins in install_mac_backup_agent.sh install_mac_nightly_agent.sh install_mac_drill_agent.sh install_mac_watchdog_agent.sh; do
 	: > "$DR110/empty_repo/deploy/mac/$ins"
 done
 CNT110=$((CNT110 + 1))
@@ -7377,6 +7379,162 @@ HOME="$STUB110/home" PATH="$STUB110/bin:$PATH" FAKE_SSH_CNT="$STUB110/run/cnt8" 
 grep -qF '本机这头没连上' "$STUB110/fd8.log" \
 	|| { echo "--- FAIL: §110 FD8 失败文案没走新归因（说明改的是别处，或两枚反证落到同一个点上）：$(tail -3 "$STUB110/fd8.log")"; exit 1; }
 echo "ok - §110 FD8 上界钉死成 1 ⇒ 同一夹具必败且红在新文案上（重试是这条腿的承重墙，不是装饰）"
+# ════════════════════════════════════════════════════════════════════════════
+# ⑥ 组：Mac 日频看门狗（§MAC-WATCHDOG，2026-10-10）。
+# 背景：①拉取腿自己没有看门狗——record_freshness 那台死调度探测器挂在拉取腿上、反查的是演练与
+#   夜间验收，"拉取腿多久没跑成"没有读数（09-16~09-25 断更十天靠人翻日志才发现）；
+#   ②漂移探测器此前只有人坐在前面才跑（前提是推平到 same=11，10-10 当日已达成）。
+#   ⇒ 新增第四条调度 com.quant.watchdog（每日 11:00，排在所有被看对象窗口之后），
+#   两腿互看：看门狗反查拉取腿心跳，拉取腿用同一个 record_freshness 反查看门狗留档（消费者 2→3）。
+# 行为腿 WD1–WD7 的读数形状**先在 /tmp 夹具真拨过九态**（ok/stale/no-anchor/no-log/unparsable/
+#   drift/probe-broken/repo-root-absent/no-topic）再写进断言——本日两次实踩（BSD sed 两层捕获组
+#   括号不配对 ⇒ 整腿 unparsable；set -u 下汇总行变量名笔误 ⇒ 九态全退 1 且留档空）都是真拨先抓住的，
+#   夹具必须断「overall 行在位 + 留档非空」，光看退出码会把尾巴上的笔误读成"有事"。
+# ════════════════════════════════════════════════════════════════════════════
+WD110=deploy/mac/check_mac_ops_watchdog.sh
+WDP110=deploy/mac/com.quant.watchdog.plist
+WDI110=deploy/mac/install_mac_watchdog_agent.sh
+CNT110=$((CNT110 + 1))
+[ -x "$WD110" ] && [ -x "$WDI110" ] || { echo "--- FAIL: §110 WD 在位锁 ${CNT110}（看门狗/安装器缺执行位：launchd 与外层按命令用它）"; exit 1; }
+eq110 "$WD110" 'PULL_SUCCESS_ANCHOR="${PULL_SUCCESS_ANCHOR:-=== 备份成功 ===}"' 1 '成功锚串可 env 且缺省与拉取腿那句同一条来源（两处各写一份锚＝改文案的那批不会改判据）'
+eq110 "$RPP110" 'log "=== 备份成功 ==="' 1 '拉取腿的成功锚恰一条（看门狗按它读心跳；多一条＝夹带的成功假象会喂假心跳）'
+eq110 "$WD110" 'PULL_MAX_AGE_HOURS="${PULL_MAX_AGE_HOURS:-30}"' 1 '心跳阈值单源（30h＝拉取腿每天两窗，整一天皆没跑成才吵；抄别的阈值＝对不上真实触发日历）'
+eq110 "$WD110" 'threshold_h=${PULL_MAX_AGE_HOURS}' 1 '读数文案与判据同源（文案报 env 值而判据写死＝阈值惰性，本仓锤过的形状）'
+eq110 "$WD110" 'ntfy_topic_resolve' 1 '告警主题只走单实现（本地再拼一遍 security 命令＝三份并存的必然结局是改一处漏两处）'
+eq110 "$WD110" 'ALERT-NOT-SENT reason=no-topic' 1 '无主题不发请求、整条正文落日志（打到根路径回 404 再报"网络？"＝把配置缺失伪装成网络抖动）'
+eq110 "$WD110" 'record_line "$res" "$rc"' 1 '每跑必留档（留档是这条调度唯一"真跑过"的证据面；不写＝拉取腿的反查只会看到断更）'
+eq110 "$WD110" 'WATCHDOG|overall=$res rc=$rc' 1 '汇总行带退出码（launchctl LastExitStatus 与日志两条读数面必须说的是同一件事）'
+eq110 "$WD110" 'DRIFT_SCRIPT:-$SELF_DIR/check_mac_agent_drift.sh' 1 '漂移判决走单实现（重写第二份字节比较＝只修一份、另一份安静地不再判红）'
+eq110 "$WD110" 'QUANT_REPO_ROOT="${QUANT_REPO_ROOT:-$HOME_DIR/Desktop/quant-trading-v2}"' 1 '仓库根单点缺省（副本目录里反推出来的是镜像根＝一片 missing-repo 假红，必须显式给真值且可 env 覆盖）'
+eq110 "$WDP110" '<string>com.quant.watchdog</string>' 1 'plist Label 恰一条（launchctl 按它点名；重复＝两份任务抢同一个稳定副本）'
+eq110 "$WDP110" 'backups/quant/watchdog/check_mac_ops_watchdog.sh' 1 'ProgramArguments 指稳定副本（指回 Desktop 仓库＝TCC 每天静默失败 126，本仓已付过一次账）'
+eq110 "$WDI110" 'grep -q "${WD_HOME}/check_mac_ops_watchdog.sh"' 1 '装机期自检 plist 模板与副本同源（模板没跟着改就拒绝安装旧版本）'
+eq110 "$WDI110" 'migrate_ntfy_topic_to_keychain.sh' 1 '缺主题时只指迁移器（提示式 -w 写法教出来的空口令条目 10-10 真踩过，安装器不得再教）'
+eq110 "$WDI110" 'launchctl bootstrap' 1 '重载走正规通道（只 cp 不 bootstrap＝装了没生效，正是本批 ② 要消灭的形态）'
+# 顺序锁：主题库必须先于两条腿被 source——腿里的 alert() 用到 NTFY_TOPIC，source 挪到腿后＝
+# 每次都走"无主题"分支、告警全部哑掉而两条腿的读数照绿（"判据从没真跑过"的供给侧版本）。
+WD_LIB_N=$(grep -n '\. "$NTFY_LIB"' "$WD110" | head -1 | cut -d: -f1 || true)
+WD_PULL_N=$(grep -n 'WATCHDOG|pull verdict=' "$WD110" | head -1 | cut -d: -f1 || true)
+CNT110=$((CNT110 + 1))
+[ -n "$WD_LIB_N" ] && [ -n "$WD_PULL_N" ] && [ "$WD_LIB_N" -lt "$WD_PULL_N" ] \
+	|| { echo "--- FAIL: §110 WD 顺序锁 ${CNT110}（ntfy 库 source 行=${WD_LIB_N:-无} 必须先于拉取腿读数行=${WD_PULL_N:-无}：倒序＝告警通道在腿运行时还没接上）"; exit 1; }
+# ── WD1–WD7 行为腿：/tmp 夹具树，仓库与真实副本一个字节不动 ──
+WDF="$W3T/wd"
+mkdir -p "$WDF/home/backups/quant" "$WDF/bin" "$WDF/run" "$WDF/fakerepo" "$WDF/logdir"
+cp "$WD110" "$WDF/run/check_mac_ops_watchdog.sh"
+cp deploy/mac/ntfy_topic.sh "$WDF/run/ntfy_topic.sh"
+cat > "$WDF/run/check_mac_agent_drift.sh" <<'SHWD'
+#!/bin/bash
+# 桩探测器：退出码由 DRIFT_RC 给，汇总行形状与真件一致（看门狗只消费这一行的"有没有"）。
+echo "DRIFT-SUMMARY|pairs=99 same=99 diff=0 missing_mirror=0 missing_repo=0 unresolved=0 repo_root=stub"
+exit "${DRIFT_RC:-0}"
+SHWD
+cat > "$WDF/bin/curl" <<'SHWDC'
+#!/bin/bash
+# 桩 curl：把命令行记进文件（"告警真发了"与"只落日志"就差这一笔），永不真的外呼。
+printf 'CURL %s\n' "$*" >> "${CURL_LOG:?CURL_LOG 未设}"
+exit 0
+SHWDC
+cat > "$WDF/bin/security" <<'SHWDS'
+#!/bin/bash
+# 桩 security：一律"取不到条目"。不放它，无主题那一例会去读**真钥匙串**——
+# 既把真主题送进夹具日志，又让 ALERT-NOT-SENT 那条永远测不到（夹具自己制造被测形态）。
+exit 1
+SHWDS
+chmod +x "$WDF/run/check_mac_ops_watchdog.sh" "$WDF/run/ntfy_topic.sh" "$WDF/run/check_mac_agent_drift.sh" \
+	"$WDF/bin/curl" "$WDF/bin/security"
+wd_run() { # $1=case 名 $2=PULL_LOG 路径 $3=额外 env（K=V 空格分隔，可为空）
+	local name="$1" pull="$2" extra="${3:-}" out rc
+	rm -f "$WDF/curl.log" "$WDF/home/backups/quant/watchdog_record.jsonl" "$WDF/home/backups/quant/watchdog.log"
+	# shellcheck disable=SC2086
+	out="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
+		NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log" PATH="$WDF/bin:/usr/bin:/bin" \
+		PULL_LOG="$pull" DRIFT_RC="${WD_DRIFT_RC:-0}" $extra \
+		/bin/bash "$WDF/run/check_mac_ops_watchdog.sh" 2>&1)" && rc=0 || rc=$?
+	# rc 必须由 wd_run 自己落盘：调用方 `wd_run …; echo "$?"` 记到的是本函数的返回值（最后一条 printf），
+	# 恒 0 ⇒ 期望退 1/2 的腿会全部假红（10-10 夹具首拨真踩过这个形状）。
+	printf '%s\n' "$rc" > "$WDF/$name.rc"
+	printf '%s\n' "$out" > "$WDF/$name.out"
+}
+wd_assert() { # $1=case 名 $2=期望 rc $3=overall 必含串 $4=额外断言命令（可为空）
+	local name="$1" want_rc="$2" overall="$3" extra="${4:-}" got_rc
+	# 退出码只认 wd_run 落盘的 .rc（.out 是合并了 stderr 的输出，退出码不在其中）
+	got_rc="$(cat "$WDF/$name.rc")"
+	[ "$got_rc" = "$want_rc" ] || { echo "--- FAIL: §110 WD $name 退 ${got_rc}（应 ${want_rc}）：$(grep -a 'WATCHDOG|' "$WDF/$name.out" | tail -2)"; exit 1; }
+	grep -aF -- "$overall" "$WDF/$name.out" >/dev/null \
+		|| { echo "--- FAIL: §110 WD $name 汇总行没带 ${overall}：$(grep -a 'WATCHDOG|' "$WDF/$name.out" | tail -2)"; exit 1; }
+	[ -z "$extra" ] || eval "$extra" || { echo "--- FAIL: §110 WD $name 附加断言失败（${extra}）"; exit 1; }
+	CNT110=$((CNT110 + 1))
+}
+# WD1 ok 态：新鲜锚 + 探测器 rc0 ⇒ 退 0、overall=ok、留档恰一行 result=ok、零外呼
+printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S') === 备份成功 ===" > "$WDF/logdir/ok.log"
+wd_run ok "$WDF/logdir/ok.log"
+wd_assert ok 0 'overall=ok rc=0' '[ "$(grep -c . "$WDF/home/backups/quant/watchdog_record.jsonl")" = "1" ] && grep -qF "\"result\":\"ok\"" "$WDF/home/backups/quant/watchdog_record.jsonl" && [ ! -s "$WDF/curl.log" ]'
+echo "ok - §110 WD1 心跳在阈内+零漂移 ⇒ 退 0、留档一行 result=ok、零外呼（这条腿的绿有留档背书）"
+# WD2 stale：80h 前的锚 ⇒ 退 1、文案点名阈值、curl 恰一次（告警真发出去，不是只落日志）
+printf '%s\n' "$(date -v-80H '+%Y-%m-%d %H:%M:%S') === 备份成功 ===" > "$WDF/logdir/stale.log"
+wd_run stale "$WDF/logdir/stale.log"
+wd_assert stale 1 'pull=stale' 'grep -qF "threshold_h=30" "$WDF/stale.out" && [ "$(grep -c . "$WDF/curl.log")" = "1" ]'
+echo "ok - §110 WD2 心跳超龄 ⇒ 退 1、文案带阈值、ntfy 真发一次（读数与推送两条出口都活着）"
+# WD3 两种相反成因分开：没有成功锚（跑了但每次都失败）与日志不存在（从没被拉起）不许共用一个态
+printf '%s\n' '2026-10-10 07:10:02 ERROR: 读不到广州 SNAPSHOT_OK' > "$WDF/logdir/noanchor.log"
+wd_run noanchor "$WDF/logdir/noanchor.log"
+wd_assert noanchor 1 'pull=no-anchor'
+wd_run nolog "$WDF/logdir/absent.log"
+wd_assert nolog 2 'pull=no-log'
+echo "ok - §110 WD3 no-anchor（退 1＝要人看失败原因）与 no-log（退 2＝要人查 launchd）两种成因两个态"
+# WD4 读不出时间戳 ⇒ 退 2（探测器判据失效必须显式点名，不许冒充"没问题"或"超龄"）
+printf '%s\n' 'no timestamp here === 备份成功 ===' > "$WDF/logdir/unparsable.log"
+wd_run unparsable "$WDF/logdir/unparsable.log"
+wd_assert unparsable 2 'pull=unparsable'
+echo "ok - §110 WD4 锚行取不到时间戳 ⇒ 退 2 且点名 unparsable（读不出≠超龄≠没问题）"
+# WD5 漂移三态：rc1=有漂移（退 1）、rc2=探测器自己坏（退 2）、仓库根不存在（退 2，绝不报"没有漂移"）
+WD_DRIFT_RC=1 wd_run drift "$WDF/logdir/ok.log"
+wd_assert drift 1 'drift=drift'
+WD_DRIFT_RC=2 wd_run probebroken "$WDF/logdir/ok.log"
+wd_assert probebroken 2 'drift=probe-broken'
+wd_run rootabsent "$WDF/logdir/ok.log" 'QUANT_REPO_ROOT=/tmp/wd_no_such_repo_110'
+wd_assert rootabsent 2 'drift=repo-root-absent'
+echo "ok - §110 WD5 漂移 rc1/rc2 与仓库根缺失三态分开定级（读不出绝不冒充没有漂移）"
+# WD6 无主题：stale 夹具 ⇒ ALERT-NOT-SENT 落日志、零外呼、腿级判决不受影响（退 1）
+wd_run notopic "$WDF/logdir/stale.log" 'NTFY_TOPIC='
+wd_assert notopic 1 'overall=alert rc=1' 'grep -qF "ALERT-NOT-SENT reason=no-topic" "$WDF/home/backups/quant/watchdog.log" && [ ! -s "$WDF/curl.log" ]'
+echo "ok - §110 WD6 无主题 ⇒ 显式留痕不外呼、腿级判决照常（降级不得把有事读成没事）"
+# WD7 摘锁反证两枚（各断本枚独有读数）：
+#   a) 摘掉 record_line 调用 ⇒ WD1 的"留档非空"断言必须失真（留档空）＝留档断言承重；
+#   b) 把 exit "$rc" 钉成 0 ⇒ WD2 的退出码断言必须失真（退 0）＝三态语义承重。
+mkdir -p "$WDF/mut"
+cp "$WD110" "$WDF/mut/check_mac_ops_watchdog.sh"
+cp deploy/mac/ntfy_topic.sh "$WDF/mut/ntfy_topic.sh"
+cp "$WDF/run/check_mac_agent_drift.sh" "$WDF/mut/check_mac_agent_drift.sh"
+# WD7a 不走 wd_run（要盯原样输出），所以共享的留档文件得自己清：不清则上一腿留下的行
+# 会把「摘掉 record_line 后留档必须空」这条反证读成"仍在写"＝反证自己被旧数据弄瞎。
+rm -f "$WDF/home/backups/quant/watchdog_record.jsonl"
+f3_sub "$WDF/mut/check_mac_ops_watchdog.sh" 'record_line "$res" "$rc" "$DETAIL"' ': # record_line 摘除'
+CNT110=$((CNT110 + 1))
+out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
+	NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log" PATH="$WDF/bin:/usr/bin:/bin" \
+	PULL_LOG="$WDF/logdir/ok.log" DRIFT_RC=0 \
+	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd7_rc=$?
+printf '%s\n' "$out110" | grep -qF 'overall=ok rc=0' \
+	|| { echo "--- FAIL: §110 WD7a 摘留档后连 overall 都没了（破坏改变了别的东西，反证没落在点上）"; exit 1; }
+[ ! -s "$WDF/home/backups/quant/watchdog_record.jsonl" ] \
+	|| { echo "--- FAIL: §110 WD7a 摘掉 record_line 后留档仍非空（WD1 的留档断言不承重＝锁是装饰）"; exit 1; }
+cp "$WD110" "$WDF/mut/check_mac_ops_watchdog.sh"
+f3_sub "$WDF/mut/check_mac_ops_watchdog.sh" 'exit "$rc"' 'exit 0'
+# rc 收码必须在父壳里做：`out="$(… && v=0 || v=$?)"` 的赋值落在替换子壳里，
+# set -u 下父壳读它就是 unbound（WD7 首拨真撞过）。
+wd7b_rc=0
+CNT110=$((CNT110 + 1))
+out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
+	NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log" PATH="$WDF/bin:/usr/bin:/bin" \
+	PULL_LOG="$WDF/logdir/stale.log" DRIFT_RC=0 \
+	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd7b_rc=$?
+[ "$wd7b_rc" = "0" ] \
+	|| { echo "--- FAIL: §110 WD7b 钉死 exit 0 后仍退非零（破坏没落到退出码上，反证测的不是它声称的）"; exit 1; }
+printf '%s\n' "$out110" | grep -qF 'overall=alert rc=1' \
+	|| { echo "--- FAIL: §110 WD7b 钉死 exit 0 后汇总行也变了（破坏改变了读数面，两枚反证纠缠）"; exit 1; }
+echo "ok - §110 WD7 摘 record_line ⇒ 留档空而 overall 照旧；钉死 exit ⇒ 退 0 而 overall 照旧（两枚反证各落各的点）"
 rm -rf "$W3T" "$W3F"
 # 段尾总结把 CNT110 打出来：门禁段数与判定点数都是**要对外报的数**，
 # 让日志自己带读数，比事后靠记忆写"约 60 道"诚实（§GATE-COUNT-LOCK 同一诉求）。
@@ -7463,17 +7621,17 @@ eq111() { # $1=文件 $2=整串 $3=预演读数 $4=说明
 	CNT111=$((CNT111 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §111 整串等值锁 ${CNT111}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §111 整串等值锁 ${CNT111}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 neg111() { # $1=文件 $2=整串 $3=说明 → 应彻底没有
 	CNT111=$((CNT111 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §111 负锁 ${CNT111}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §111 负锁 ${CNT111}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
 min111() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
 	CNT111=$((CNT111 + 1))
-	[ "${2:-0}" -ge "$3" ] || { echo "--- FAIL: §111 派生正锁 ${CNT111}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+	[ "${2:-0}" -ge "$3" ] || { echo "--- FAIL: §111 派生正锁 ${CNT111}（${1}）：实得=${2:-0} 应≥${3}"; exit 1; }
 }
 ln111() { # $1=文件 $2=整串 → 首个命中行号（0＝没有）；顺序锁用
 	local n
@@ -7493,7 +7651,7 @@ eq111 "$GB111" '# <<< GATE-COLLECT-DRIVER' 1 '驱动块结束标记恰好一处�
 eq111 "$GPY111" 'DRIVER_BEGIN = "# >>> GATE-COLLECT-DRIVER"' 1 '装配器认识的起始标记与门禁写的字面一致（不同步＝check 要么把驱动语句当副作用判红，要么整段失去保护）'
 eq111 "$GPY111" 'DRIVER_END = "# <<< GATE-COLLECT-DRIVER"' 1 '装配器认识的结束标记同上'
 eq111 "$GB111" 'GATE_SELF_RAW="$PWD/$0"' 1 '相对形式的 $0 按调用时的 PWD 定死（case 的 `*)` 分支；缺了它＝cd 之后基准漂移、装配器路径算到上一层兄弟目录，L9 行为腿演示的就是这个坏法）'
-eq111 "$GB111" 'GATE_SELF_RAW="$0" ;;' 1 '绝对形式的分支照旧直取 $0（两枚分开数：两个分支本就是两种形状，合成一个计数会把「少了一个分支」读成「多了一处引用」）'
+eq111 "$GB111" 'GATE_SELF_RAW="$0" ;;' 1 '绝对形式的分支照旧直取 ${0}（两枚分开数：两个分支本就是两种形状，合成一个计数会把「少了一个分支」读成「多了一处引用」）'
 CNT111=$((CNT111 + 1))
 L_DRV=$(ln111 "$GB111" '# >>> GATE-COLLECT-DRIVER')
 L_CD111=$(ln111 "$GB111" 'cd "$(dirname "$0")/.."')
@@ -8313,17 +8471,17 @@ eq112() { # $1=文件 $2=整串 $3=预演读数 $4=说明
 	CNT112=$((CNT112 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §112 整串等值锁 ${CNT112}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §112 整串等值锁 ${CNT112}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 neg112() { # $1=文件 $2=整串 $3=说明 → 彻底没有
 	CNT112=$((CNT112 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §112 负锁 ${CNT112}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §112 负锁 ${CNT112}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
 min112() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
 	CNT112=$((CNT112 + 1))
-	[ "${2:-0}" -ge "$3" ] || { echo "--- FAIL: §112 派生正锁 ${CNT112}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+	[ "${2:-0}" -ge "$3" ] || { echo "--- FAIL: §112 派生正锁 ${CNT112}（${1}）：实得=${2:-0} 应≥${3}"; exit 1; }
 }
 code_hits112() { # $1=文件 $2=整串 → 非注释行命中数（Go 的 //、Python 的 #、docstring 续行的 * 都算注释）
 	local n
@@ -8753,7 +8911,7 @@ go_leg112() { # $1=包目录 $2=用例名竖线串 $3=应跑条数
 		echo "    少了就是有用例没被 -run 命中（改名/标记丢失/被 build tag 挡掉）——「ok 但一条没跑」是本仓最常见的假绿形态"
 		exit 1
 	fi
-	echo "ok - §112 Go 行为腿 $1：${pass}/$3 条通过"
+	echo "ok - §112 Go 行为腿 ${1}：${pass}/$3 条通过"
 }
 for _p in $(cut -f1 "$PAIRS112" | LC_ALL=C sort -u); do
 	_names=$(awk -F'\t' -v d="$_p" '$1==d{print $2}' "$PAIRS112" | LC_ALL=C sort | paste -sd'|' -)
@@ -9115,17 +9273,17 @@ eq113() { # $1=文件 $2=整串 $3=预演读数 $4=说明
 	CNT113=$((CNT113 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §113 整串等值锁 ${CNT113}（$4）：${1} 整串「$2」got=${got:-0} 预演=$3"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §113 整串等值锁 ${CNT113}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 neg113() { # $1=文件 $2=整串 $3=说明 → 彻底没有
 	CNT113=$((CNT113 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §113 负锁 ${CNT113}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §113 负锁 ${CNT113}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
 min113() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
 	CNT113=$((CNT113 + 1))
-	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §113 派生正锁 ${CNT113}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §113 派生正锁 ${CNT113}（${1}）：实得=${2:-0} 应≥${3}"; exit 1; }
 }
 # strip_ansi113：剥掉终端转义序列。vitest 在被管道接走时**照样上色**（2026-10-09 预演实读：
 # 「Test Files」后面紧跟 \033[22m \033[1m\033[32m 再是「5 passed」），于是按「Test Files  5 passed」
@@ -9169,33 +9327,33 @@ eqj113() { # $1=rel $2=整串 $3=预演 $4=说明 → 代码行行数等值
 	got=$(js113 line "$1" "$2")
 	CNT113=$((CNT113 + 1))
 	case "$got" in
-	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（${1}「${2}」）：${got}"; exit 1 ;;
 	esac
-	[ "$got" = "$3" ] || { echo "--- FAIL: §113 代码行等值锁 ${CNT113}（$4）：$1 的代码行「$2」got=${got} 预演=$3"; exit 1; }
+	[ "$got" = "$3" ] || { echo "--- FAIL: §113 代码行等值锁 ${CNT113}（${4}）：$1 的代码行「${2}」got=${got} 预演=$3"; exit 1; }
 }
 negj113() { # $1=rel $2=整串 $3=说明 → 代码行彻底没有
 	local got
 	got=$(js113 line "$1" "$2")
 	CNT113=$((CNT113 + 1))
 	case "$got" in
-	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（${1}「${2}」）：${got}"; exit 1 ;;
 	esac
-	[ "$got" = "0" ] || { echo "--- FAIL: §113 代码行负锁 ${CNT113}（$3）：$1 的代码行又出现「${2}」got=${got}"; exit 1; }
+	[ "$got" = "0" ] || { echo "--- FAIL: §113 代码行负锁 ${CNT113}（${3}）：$1 的代码行又出现「${2}」got=${got}"; exit 1; }
 }
 minj113() { # $1=rel $2=整串 $3=应≥ $4=说明 → 代码行行数下界（派生面缩水即红）
 	local got
 	got=$(js113 line "$1" "$2")
 	CNT113=$((CNT113 + 1))
 	case "$got" in
-	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	*Error*|*error*|*not\ found*) echo "--- FAIL: §113 代码行尺子没出数（${1}「${2}」）：${got}"; exit 1 ;;
 	esac
-	[ "${got:-0}" -ge "$3" ] || { echo "--- FAIL: §113 代码行派生正锁 ${CNT113}（$4）：$1 的代码行「$2」实得=${got:-0} 应≥${3}"; exit 1; }
+	[ "${got:-0}" -ge "$3" ] || { echo "--- FAIL: §113 代码行派生正锁 ${CNT113}（${4}）：$1 的代码行「${2}」实得=${got:-0} 应≥${3}"; exit 1; }
 }
 eqr113() { # $1=rel $2=正则 $3=预演 $4=说明 → 代码行命中次数等值
 	local got
 	got=$(js113 re "$1" "$2")
 	CNT113=$((CNT113 + 1))
-	[ "$got" = "$3" ] || { echo "--- FAIL: §113 次数等值锁 ${CNT113}（$4）：$1 正则「$2」got=${got} 预演=$3（got 不是数字时＝代码行尺子本身坏了）"; exit 1; }
+	[ "$got" = "$3" ] || { echo "--- FAIL: §113 次数等值锁 ${CNT113}（${4}）：$1 正则「${2}」got=${got} 预演=${3}（got 不是数字时＝代码行尺子本身坏了）"; exit 1; }
 }
 PREV113=0
 # 十组读数先归零（set -u 下未赋值直接参与算术会中止脚本，报错位置离成因很远；
@@ -9562,7 +9720,7 @@ CNT113=$((CNT113 + 1))
 	|| { echo "--- FAIL: §113 镜像内 vitest 基线不是「两份各自绿」（node_modules 软链或 vitest 配置在镜像里坏了），尾部："; printf '%s\n' "$BASE6113" | grep -E 'Test Files|Errors|failed|Cannot' | head -10; exit 1; }
 echo "ok - §113 镜像基线自证（扫描器三键与真仓等值 + 两文件 vitest 在镜像里各自绿）"
 
-dys113_scan() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=读数键 $6=变异后期望 $7=基线期望 $8=归属必含串（可空） $9=归属读数键（缺省＝$5）
+dys113_scan() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=读数键 $6=变异后期望 $7=基线期望 $8=归属必含串（可空） $9=归属读数键（缺省＝${5}）
 	# 条数键与归属键常常不是同一行：翻转的是 poll_missing_n（0→1），而「是哪一个文件缺的」写在 poll_missing_list 上。
 	# 只按 $5 那一行找归属串的话，V1 会因为「n 那行没有文件名」判红在别处——那是尺子的形状错了，不是反证没牙。
 	local id="$1" rel="$2" old="$3" new="$4" key="$5" want="$6" base="$7" token="$8" akey="${9:-$5}" applied out got mutgot113
@@ -9760,23 +9918,23 @@ eq114() { # $1=文件 $2=整串 $3=预演读数 $4=说明
 	CNT114=$((CNT114 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §114 整串等值锁 ${CNT114}（$4）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §114 整串等值锁 ${CNT114}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
 }
 neg114() { # $1=文件 $2=整串 $3=说明 → 彻底没有
 	CNT114=$((CNT114 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §114 负锁 ${CNT114}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §114 负锁 ${CNT114}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
 re114() { # $1=文件 $2=ERE $3=预演 $4=说明 → 按「整行形状」数，用于缩进级语句形态锁
 	CNT114=$((CNT114 + 1))
 	local got
 	got=$(grep -cE -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §114 行形等值锁 ${CNT114}（$4）：${1} 行形「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §114 行形等值锁 ${CNT114}（${4}）：${1} 行形「${2}」got=${got:-0} 预演=${3}"; exit 1; }
 }
 min114() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
 	CNT114=$((CNT114 + 1))
-	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §114 派生正锁 ${CNT114}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §114 派生正锁 ${CNT114}（${1}）：实得=${2:-0} 应≥${3}"; exit 1; }
 }
 # code114：剥注释只此一把尺子（scripts/fe_contract_scan.mjs 的 codeOnly，§113 是它的第一个消费者，
 # 本段是第三个）。Go/Python/JSX 的「代码行 vs 说明文字」判据全部经它——波 7 的三处负锁
@@ -9809,27 +9967,27 @@ eqc114() { # $1=rel $2=整串 $3=预演 $4=说明 → 代码行等值
 	got=$(codeline114 "$1" "$2")
 	CNT114=$((CNT114 + 1))
 	case "$got" in
-	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（${1}「${2}」）：${got}"; exit 1 ;;
 	esac
-	[ "$got" = "$3" ] || { echo "--- FAIL: §114 代码行等值锁 ${CNT114}（$4）：${1} 的代码行「${2}」got=${got} 预演=${3}"; exit 1; }
+	[ "$got" = "$3" ] || { echo "--- FAIL: §114 代码行等值锁 ${CNT114}（${4}）：${1} 的代码行「${2}」got=${got} 预演=${3}"; exit 1; }
 }
 negc114() { # $1=rel $2=整串 $3=说明 → 代码行彻底没有
 	local got
 	got=$(codeline114 "$1" "$2")
 	CNT114=$((CNT114 + 1))
 	case "$got" in
-	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（${1}「${2}」）：${got}"; exit 1 ;;
 	esac
-	[ "$got" = "0" ] || { echo "--- FAIL: §114 代码行负锁 ${CNT114}（$3）：${1} 的代码行又出现「${2}」got=${got}"; exit 1; }
+	[ "$got" = "0" ] || { echo "--- FAIL: §114 代码行负锁 ${CNT114}（${3}）：${1} 的代码行又出现「${2}」got=${got}"; exit 1; }
 }
 minc114() { # $1=rel $2=整串 $3=应≥ $4=说明 → 代码行命中下界（派生面缩水即红）
 	local got
 	got=$(codeline114 "$1" "$2")
 	CNT114=$((CNT114 + 1))
 	case "$got" in
-	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（$1「$2」）：${got}"; exit 1 ;;
+	*[Ee]rror*|*not\ found*|*codeOnly*) echo "--- FAIL: §114 代码行尺子没出数（${1}「${2}」）：${got}"; exit 1 ;;
 	esac
-	[ "${got:-0}" -ge "$3" ] || { echo "--- FAIL: §114 代码行派生正锁 ${CNT114}（$4）：${1} 的代码行「${2}」实得=${got:-0} 应≥${3}"; exit 1; }
+	[ "${got:-0}" -ge "$3" ] || { echo "--- FAIL: §114 代码行派生正锁 ${CNT114}（${4}）：${1} 的代码行「${2}」实得=${got:-0} 应≥${3}"; exit 1; }
 }
 # 尺子自身的夹具自检（两枚）：先证明 codeOnly 在本仓真跑得动、并且真的在剥注释。
 # 少了这两枚，「代码行 log.Fatalf=0」既可能是"改干净了"也可能是"尺子安静地没出数"。
@@ -10046,7 +10204,7 @@ go_leg114() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
 	if printf '%s\n' "$out" | grep -qE '^(--- FAIL|FAIL)'; then
-		echo "--- FAIL: §114 行为腿判红（$1），全文如下："
+		echo "--- FAIL: §114 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
@@ -10157,7 +10315,7 @@ print(n)
 PYMUT114
 reset114() { # $1=仓库相对路径（镜像里的那份）→ 从主仓真值整体覆盖回来
 	src_for="$(printf '%s' "$1" | sed "s#^$GOMIR114/#$REPO114/#; s#^$PYMIR114/#$REPO114/qmt_gateway/#; s#^$WEBMIR114/#$REPO114/web/#")"
-	cp "$src_for" "$1" || { echo "--- FAIL: §114 复位失败（$1）：复位不是「按清单看一眼」，复不了位的镜像后面所有读数都不可信"; return 1; }
+	cp "$src_for" "$1" || { echo "--- FAIL: §114 复位失败（${1}）：复位不是「按清单看一眼」，复不了位的镜像后面所有读数都不可信"; return 1; }
 }
 mut114() { # $1=镜像绝对文件 $2=old $3=new → 打印落地次数
 	python3 "$W114/mutate.py" "$1" "$2" "$3" 2>&1 || true
@@ -10412,23 +10570,23 @@ eq115() { # $1=文件 $2=整串 $3=预演 $4=说明
 	CNT115=$((CNT115 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §115 整串等值锁 ${CNT115}（$4）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §115 整串等值锁 ${CNT115}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
 }
 neg115() { # $1=文件 $2=整串 $3=说明 → 彻底没有
 	CNT115=$((CNT115 + 1))
 	local got
 	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §115 负锁 ${CNT115}（$3）：${1} 又出现「${2}」got=${got}"; exit 1; }
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §115 负锁 ${CNT115}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
 re115() { # $1=文件 $2=ERE $3=预演 $4=说明 → 按整行形状数
 	CNT115=$((CNT115 + 1))
 	local got
 	got=$(grep -cE -- "$2" "$1" 2>/dev/null || true)
-	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §115 行形等值锁 ${CNT115}（$4）：${1} 行形「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §115 行形等值锁 ${CNT115}（${4}）：${1} 行形「${2}」got=${got:-0} 预演=${3}"; exit 1; }
 }
 min115() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
 	CNT115=$((CNT115 + 1))
-	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §115 派生正锁 ${CNT115}（$1）：实得=${2:-0} 应≥${3}"; exit 1; }
+	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §115 派生正锁 ${CNT115}（${1}）：实得=${2:-0} 应≥${3}"; exit 1; }
 }
 # run_ledger115：跑核对器并把**退出码**留住（LEDGER_RC115）。
 # 这里是本段唯一允许「期望失败」的地方：反证腿里核对器必红，而 set -euo pipefail 下
@@ -10445,7 +10603,7 @@ eqkey115() { # $1=KEY $2=应等值 $3=说明 → 派生读数与 prose 等值（
 	CNT115=$((CNT115 + 1))
 	local got
 	got=$(lget115 "$1")
-	[ "$got" = "$2" ] || { echo "--- FAIL: §115 读数等值锁 ${CNT115}（$3）：$1 实读=${got:-<空>} 应=$2"; printf '%s\n' "$LEDGER_OUT115" | grep -E "^$1=|^--- FAIL" | head -6; exit 1; }
+	[ "$got" = "$2" ] || { echo "--- FAIL: §115 读数等值锁 ${CNT115}（${3}）：$1 实读=${got:-<空>} 应=$2"; printf '%s\n' "$LEDGER_OUT115" | grep -E "^$1=|^--- FAIL" | head -6; exit 1; }
 }
 
 # ── ① 台账自身的形态：在位、每行五列、落点诚实、不许夹带凭据 ──

@@ -24,9 +24,10 @@
 #       否则"清单读不到"会和"没有漂移"共用一个绿（本仓反复锤的空 glob 静默空转）。
 #
 # 纪律对齐：
-#   - 清单**从三个安装器的 cp 行派生**，不另写第二份文件清单：写死清单的必然结局是"改安装器忘了改这里"，
-#     漏掉的那一对会永远显示"不在检查面内"（§0929 收尾批把锁面从写死清单改派生，同一取向）。
-#   - 只读：本脚本一个字节都不写。修法在 `install_mac_*_agent.sh -Apply`（带副作用的正规通道，
+#   - 清单**按安装器文件名形状从 cp 行派生**（install_mac_ 前缀安装器全集），不另写第二份文件清单：
+#     写死清单的必然结局是"改安装器忘了改这里"，漏掉的那一对会永远显示"不在检查面内"
+#     （§0929 收尾批把锁面从写死清单改派生，同一取向；2026-10-10 第四个安装器上场时这条派生救了这一面）。
+#   - 只读：本脚本一个字节都不写。修法在对应安装器的 -Apply（带副作用的正规通道，
 #     按 Mac 侧同样条款：先跑一次缺省预览看它打算做什么，再 -Apply）。
 #   - 不内嵌公网 IP / 32-hex 主题串（deploy/mac 文件面的派生负锁扫的是整个目录，本文件也在面内）。
 set -uo pipefail
@@ -49,15 +50,19 @@ DRIFT_PY="$(mktemp /tmp/check_mac_agent_drift_XXXXXX.py)"
 [ -n "$DRIFT_PY" ] || { echo "DRIFT-SUMMARY|pairs=0 state=mktemp-failed" ; exit 2; }
 trap 'rm -f "$DRIFT_PY"' EXIT
 cat > "$DRIFT_PY" <<'PY'
-# 一次性解析三个安装器：先收 NAME=value 形态的变量赋值，再把 cp 的两端展开成实际路径。
+# 一次性解析各安装器：先收 NAME=value 形态的变量赋值，再把 cp 的两端展开成实际路径。
 # 只做"够用且不骗人"的展开：值里含命令替换 $( ) 或反引号的赋值跳过（静态展不开），
 # 展开后仍留 ${ 的 cp 行归入 unresolved 并点名——**不静默丢弃**，丢弃＝把覆盖缺口伪装成通过。
-import hashlib, os, re, sys
+import glob, hashlib, os, re, sys
 
 repo_root = os.environ["REPO_ROOT"]
 quiet = os.environ.get("QUIET", "0") == "1"
 mac_dir = os.path.join(repo_root, "deploy", "mac")
-installers = ["install_mac_backup_agent.sh", "install_mac_nightly_agent.sh", "install_mac_drill_agent.sh"]
+# 安装器清单**按文件名形状派生**（按 install_mac_ 前缀排序），不写死名字列表：
+# 首版写死三个名字，2026-10-10 §MAC-WATCHDOG 补第四个安装器时当场现形——新安装器的 cp 行
+# 不在检查面内，它镜像的文件漂了探测器也不响（清单式锁失明的第 N 次复发，§BOM-REPO-DERIVE 同族）。
+# 派生之后"新增第 N 个安装器"自动进面，本文件不用跟着改；glob 空转由下面的下限退 2 兜住。
+installers = sorted(os.path.basename(p) for p in glob.glob(os.path.join(mac_dir, "install_mac_*_agent.sh")))
 
 # 预置：REPO_ROOT / REPO_MAC_DIR 由调用方给真值（安装器里那两个是命令替换，静态推不出）；
 # HOME 用当前用户主目录（副本一律落在 ~/backups/quant/ 下，非 TCC 保护目录，见 §MAC-TCC）。
