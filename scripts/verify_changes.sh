@@ -1093,7 +1093,16 @@ grep -q 'service_probe_config.ps1' deploy/qmt-win/register_engine_services.ps1 |
 if grep -qE '127\.0\.0\.1:9091|127\.0\.0\.1:8080/api/status' deploy/qmt-win/all_service_watchdog.ps1 scripts/daily_ops_check.ps1; then echo "--- FAIL: 旧误熔探针形态复活（§H8：:9091 虚构口/鉴权口探活）"; exit 1; fi
 grep -q 'service_probe_config.ps1' scripts/deploy_guangzhou.sh || { echo "--- FAIL: 探针配置未入部署同步清单（§H8/§ENH-5 教训）"; exit 1; }
 grep -q 'main.buildCommit' scripts/uat_bootstrap.sh || { echo "--- FAIL: UAT 构建指纹注入丢失（§F6 回归）"; exit 1; }
-echo "ok - §H8/§F6 专项守卫通过（静态锁 8 道）"
+# ★ 10-10 现网首拨实录锁（读法供给侧第五犯）：nssm 往 stdout 写 UTF-16（register_engine_services.ps1
+#   :214 早有记录），PS 单字节解码后是夹 NUL 的文本，对原文直接 -match 状态词恒不命中 ⇒
+#   Get-NssmStatus 恒空 ⇒ 四条 NSSM 腿全误判 DOWN——同一轮日志里探针字段全是通过，健康服务
+#   被连环重启 + 单实例治理杀子进程，quant 引擎被杀三次才靠退避上限停下。四枚锁钉死修法：
+#   剥 NUL 先于匹配／读不出状态词落 SCM 而不是判 DOWN／坏形态（对原文匹配后直接 return）不得复活。
+grep -qF "replace '\\x00', ''" deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §H8 nssm 状态读法缺 NUL 剥离（UTF-16 输出按单字节解码，不剥 NUL 恒误判 DOWN＝10-10 首拨事故形态）"; exit 1; }
+grep -qF 'SERVICE_[A-Z_]+' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §H8 nssm 状态读法缺「读出别的状态词＝确实没在跑」分支（剥完 NUL 只认 RUNNING 的话，STOPPED 会被当成读不出而落 SCM，真停服反而漏报）"; exit 1; }
+grep -qF '$st = (Get-Service -Name $name' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §H8 nssm 状态读不出时的 SCM 兜底腿不在位（fail 方向必须是往 SCM 落而不是往 DOWN 判＝10-10 事故的反面）"; exit 1; }
+if grep -qF 'return ($out -match "SERVICE_RUNNING")' deploy/qmt-win/all_service_watchdog.ps1; then echo "--- FAIL: §H8 坏形态复活（对夹 NUL 原文直接匹配后 return＝四腿恒 DOWN，10-10 首拨把健康服务连环重启）"; exit 1; fi
+echo "ok - §H8/§F6 专项守卫通过（静态锁 12 道）"
 
 echo "==> 38 §M1 quote_source 契约单源化 golden 双向锁（2026-09-22 修复批二波，代理G/K）..."
 # M1：行情源名散落六处（Go 枚举 / 前端下拉 / 网关日志文本 / 桥策略 / E2E 断言 / mock 注入）
@@ -6305,7 +6314,14 @@ EN110B=$(ln110 scripts/verify_deploy_guangzhou.sh '$krInfo = Get-ScheduledTaskIn
 #   那一式会把"已禁用"洗成"已启用"——那不是读不到，是**读反**，比 na 更坏（na 至少还会 fail-closed）。
 #   所以按字面量映射成判读侧认的拼写，而且真值支与假值支**各钉一枚**：只钉真值支就等于给
 #   "顺手写成 [bool]"留门，而那正是把判据反着弄坏的入口。
-eq110 scripts/verify_deploy_guangzhou.sh '$krXml = [xml][string]$krTask.Xml' 1 '定义侧三把的唯一解析入口＝任务定义 XML（一次调用、三把各自取）'
+# ★ 10-10 晚收口：解析入口从「一行式 [xml][string]$krTask.Xml」改成带两道门闩的守卫——
+#   上机直读证伪了"解析成功但节点不存在"的收窄：该机 CimInstance 没有 .Xml 属性，而 [xml]"" 在
+#   PS5.1 不抛、产出无根元素的空 XmlDocument 且对象为真值 ⇒ xml_from 自报 task-xml、取元素腿全空、
+#   外部通道被挡，reg_src=none 是假阴性（读法供给侧第四犯）。空串不当解析输入 + 无根不当成功，
+#   这两道门闩各自钉一枚，且第一通道失败必须让位给外部通道（顺序锁已有）。
+eq110 scripts/verify_deploy_guangzhou.sh '$krXml = [xml]$krTaskXmlTxt' 1 '定义侧三把的唯一解析入口＝任务定义文本（一次调用、三把各自取；输入先过长度下限，与外部通道同一道门槛）'
+eq110 scripts/verify_deploy_guangzhou.sh 'if (-not $krXml.DocumentElement) { $krXml = $null; $krXmlErr = "no-root-element" }' 1 '解析产物必须有根元素才算第一通道成功（[xml]"" 不抛＝空文档冒充成功的那个假阴性入口，就是这一枚钉死的）'
+eq110 scripts/verify_deploy_guangzhou.sh 'task-xml-no-prop' 1 '属性不存在要自证（"属性根本不在"与"属性在但空"是两种成因，xml_err 分得开；空文档冒充成功从此有名字可指认）'
 eq110 scripts/verify_deploy_guangzhou.sh '$krXml.GetElementsByTagName("Enabled")' 1 'Enabled 的第一条取元素腿＝按局部名，与默认命名空间无关（这条排在适配式之前：它不依赖"PS 的属性适配器怎么处理命名空间"这件事）'
 eq110 scripts/verify_deploy_guangzhou.sh '$krXml.GetElementsByTagName("Date")' 1 '注册龄的第一条取元素腿＝按局部名（同上；这条式子出现在注释里不算，锚带赋值左值才只钉代码形状）'
 eq110 scripts/verify_deploy_guangzhou.sh '$krEnRaw = $krXml.Task.Settings.Enabled' 1 'Enabled 的第二条腿＝适配式（两条腿不是冗余：任何一条单独不通时，另一条把值读回来，而"都不通"会自报 none）'
@@ -6377,7 +6393,7 @@ ST110B=$(ln110 scripts/verify_deploy_guangzhou.sh '$krSt = [string]$krTask.State
 #   XML 门闩，把解析那一行往下挪到任何一个消费者之后，定义侧读数会**一起**静默变 na：不报语法错、
 #   也不在别处红，现网看到的还是那串"八条全 na"（④c 的成因之一就是这样的一次挪位级别错误）。
 CNT110=$((CNT110 + 1))
-XML110A=$(ln110 scripts/verify_deploy_guangzhou.sh '$krXml = [xml][string]$krTask.Xml')
+XML110A=$(ln110 scripts/verify_deploy_guangzhou.sh '$krXml = [xml]$krTaskXmlTxt')
 XML110B=$(ln110 scripts/verify_deploy_guangzhou.sh '$krXml.GetElementsByTagName("Enabled")')
 XML110C=$(ln110 scripts/verify_deploy_guangzhou.sh '$krXml.GetElementsByTagName("Date")')
 [ "$XML110A" -gt 0 ] && [ "$XML110B" -gt 0 ] && [ "$XML110C" -gt 0 ] && [ "$XML110A" -lt "$XML110B" ] && [ "$XML110A" -lt "$XML110C" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（XML 解析@${XML110A} 必须早于 Enabled 取元素腿@${XML110B} 与注册时刻取元素腿@${XML110C}：解析排在消费者之后时两把读数一起静默变 na，没有语法错也没有别处会红）"; exit 1; }
@@ -6670,13 +6686,13 @@ f3_sub "$D110/verify_deploy_guangzhou.sh" 'foreach ($krName in @($SvcTaskRoster)
 NAME_IN_MIRROR=$(grep -vE '^[[:space:]]*#' "$D110/verify_deploy_guangzhou.sh" | grep -cF 'QMT-Dataload-KeepAlive' || true)
 [ "${NAME_IN_MIRROR:-0}" != "0" ] || { echo "--- FAIL: §110 F3 e：名单被抄了第二份，零字面任务名负锁却仍读 0（恒绿装饰）"; exit 1; }
 echo "ok - §110 F3 e 抄第二份名单 ⇒ 零字面任务名负锁脱离（镜像实得 ${NAME_IN_MIRROR}，主仓应 0）"
-# f) 把定义侧的解析请回那个坏形态（`.Task` 而不是 `.Xml`）⇒ ④c 的正锁与负锁必须**一起**脱离。
+# f) 把定义侧的解析请回那个坏形态（`.Task` 而不是真正的定义文本）⇒ ④c 的正锁与负锁必须**一起**脱离。
 #    为什么这段的形状锁也要镜像反证：本机没有 PowerShell，形状之外没有别的证明手段，而"把形状
 #    改坏之后它会红"是形状锁唯一能被本机验的事——否则它们与"永远绿的装饰"不可区分（纪律 2）。
 CNT110=$((CNT110 + 1))
 D110="$(f3_rebuild f)"
-f3_sub "$D110/verify_deploy_guangzhou.sh" '$krXml = [xml][string]$krTask.Xml' '$krXml = ([xml][string]$krTask.Task).Task'
-XMLPOS_F=$(grep -cF -- '$krXml = [xml][string]$krTask.Xml' "$D110/verify_deploy_guangzhou.sh" || true)
+f3_sub "$D110/verify_deploy_guangzhou.sh" '$krXml = [xml]$krTaskXmlTxt' '$krXml = ([xml][string]$krTask.Task).Task'
+XMLPOS_F=$(grep -cF -- '$krXml = [xml]$krTaskXmlTxt' "$D110/verify_deploy_guangzhou.sh" || true)
 XMLNEG_F=$(grep -cF -- '([xml][string]$krTask.Task)' "$D110/verify_deploy_guangzhou.sh" || true)
 [ "${XMLPOS_F:-0}" = "0" ] || { echo "--- FAIL: §110 F3 f：定义侧解析已退回坏形态，正锁「XML 解析入口」却仍读到 ${XMLPOS_F}（那枚锁看不见这件事发生＝恒绿装饰）"; exit 1; }
 [ "${XMLNEG_F:-0}" -ge 1 ] || { echo "--- FAIL: §110 F3 f：镜像里已写入被根除的读法，复活负锁却仍读 ${XMLNEG_F}（挡不住复活）"; exit 1; }
@@ -7038,9 +7054,14 @@ log() { echo "LOG:$*"; }
 # 桩里不能直接写 "$5"：函数被调用时 $n 会被换成**函数自己的**参数（curl 的第 5 个参数是 URL，
 # 不是标记文件路径）——先在外层把路径落成全局量，桩体只读全局量。
 CURL_MARK="$5"
-curl() { printf '%s\n' "$*" > "$CURL_MARK"; return 0; }
+# 记账用追加不覆盖（重试腿要数"到底拨了几次"）；CURL_FAIL=1 ⇒ 恒败（重试腿的恒败夹具）。
+curl() { printf '%s\n' "$*" >> "$CURL_MARK"; if [ -n "${CURL_FAIL:-}" ]; then return 7; fi; return 0; }
 # shellcheck source=/dev/null
 . "$1"
+# 重试上界/间隔的 env 缺省定义在脚本顶部、不在 alert() 体内（sed 只抽函数＝抽不到）；
+# 夹具必须自己补上同款缺省，否则 set -u 下 alert 一进重试循环就 unbound 中止＝假红。
+NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"
+NTFY_ALERT_BACKOFF_S="${NTFY_ALERT_BACKOFF_S:-5}"
 NTFY_URL="https://ntfy.invalid"
 NTFY_TOPIC="$2"
 alert "$3" "$4" high
@@ -7057,6 +7078,24 @@ out110="$(bash "$W3T/alert_run.sh" "$W3T/alert.sh" "$TOK110" t b "$W3T/curl.mark
 grep -qF "https://ntfy.invalid/$TOK110" "$W3T/curl.mark" || { echo "--- FAIL: §110 F3-2 curl 的 URL 里没带主题（发不到那个主题＝没有告警）：$(tail -1 "$W3T/curl.mark")"; exit 1; }
 if printf '%s' "$out110" | grep -qF 'ALERT-NOT-SENT'; then echo "--- FAIL: §110 F3-2 有主题却走了 ALERT-NOT-SENT（两个分支的判据串了）"; exit 1; fi
 echo "ok - §110 F3-2 空主题不请求（恰好一行留痕）+ 有主题真走到 curl 且 URL 带主题"
+# F3-2b 发送重试：桩 curl 恒败 ⇒ 恰 ATTEMPTS 次调用、失败文案带次数（与看门狗 WD8 同判据的第二实现面）。
+CNT110=$((CNT110 + 1))
+rm -f "$W3T/curl.mark"
+out110="$(CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 bash "$W3T/alert_run.sh" "$W3T/alert.sh" "$TOK110" t b "$W3T/curl.mark" 2>&1 || true)"
+f32b_n="$(grep -c . "$W3T/curl.mark" || true)"
+[ "${f32b_n:-0}" = "3" ] \
+	|| { echo "--- FAIL: §110 F3-2b 恒败时 curl 调用数=${f32b_n:-0}（应恰 3＝重试没在跑或上界没接 env）"; exit 1; }
+printf '%s' "$out110" | grep -qF '已试 3 次仍失败' \
+	|| { echo "--- FAIL: §110 F3-2b 失败文案没带次数：$(printf '%s' "$out110" | tail -1)"; exit 1; }
+# F3-2b 摘锁：把上界钉成 1 ⇒ 同夹具只拨一次＝「恰 3 次」断言失真（重试循环承重）。
+cp "$W3T/alert.sh" "$W3T/alert_mut.sh"
+f3_sub "$W3T/alert_mut.sh" 'while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do' 'while [ "${attempt}" -le 1 ]; do'
+rm -f "$W3T/curl.mark"
+out110="$(CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 bash "$W3T/alert_run.sh" "$W3T/alert_mut.sh" "$TOK110" t b "$W3T/curl.mark" 2>&1 || true)"
+f32m_n="$(grep -c . "$W3T/curl.mark" || true)"
+[ "${f32m_n:-0}" = "1" ] \
+	|| { echo "--- FAIL: §110 F3-2b 摘锁后 curl 调用数=${f32m_n:-0}（应恰 1＝上界被钉死；读数不对＝破坏落错了地方）"; exit 1; }
+echo "ok - §110 F3-2b 恒败 ⇒ 重试恰 3 次且文案带次数；摘锁钉死上界 ⇒ 只拨一次（重试循环承重）"
 
 # F3-3 缺 ntfy_topic.sh 必须当场拒跑（镜像树少拷它＝拉取腿 FATAL，而不是静默不推）
 CNT110=$((CNT110 + 1))
@@ -7209,6 +7248,11 @@ eq110 "$RPP110" '2>&1)" && mk_rc=0 || mk_rc=$?' 1 'stdout 与 stderr 同管道�
 eq110 "$RPP110" 'c1-200' 1 '成因回显限长（行长是这条链的隐形约束，超了会在外层日志里劈行）。锚点只钉「c1-200」这一段而不钉完整截断命令：§111 有一条负锁按代码行扫「门禁正文里不许出现按字节截断」，写全串就撞上那条自己的锁（今天实踩，详见 §111 ②c 的 ★ 段——那一段是本把尺子的主人，成因写在那里）。窄锚仍然承重：改成 1-100 或换别的截断写法这串就找不到，红照样出。被扫的那份文件是 Mac 侧日志、不是分类器输入，所以限长留在拉取腿里是安全的，禁的只是门禁自己的输出面'
 eq110 "$RPP110" 'sleep "${MARK_RETRY_SLEEP_SEC:-45}"' 1 '重试间隔走 env（门禁行为腿取 0 快拨，不为此拆第二条代码路径）'
 eq110 "$RPP110" '本机这头没连上' 1 '失败文案只声明本机这头的事实，并把现网正规读法指出来（不替那台机下结论）'
+# 发送重试四把（与看门狗同构；拉取腿的告警恰好都落在 launchd 唤醒后的断网窗口里，§4.1b.19 ① 同形四例）：
+eq110 "$RPP110" 'NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"' 1 '重试次数走 env 且缺省 3'
+eq110 "$RPP110" 'NTFY_ALERT_BACKOFF_S="${NTFY_ALERT_BACKOFF_S:-5}"' 1 '重试间隔走 env（F3-2 夹具取 0 快拨）'
+eq110 "$RPP110" 'while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do' 1 '重试循环上界与次数同一来源'
+eq110 "$RPP110" '已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败' 1 '失败文案报的就是循环上界那个变量'
 neg110() { # $1=文件 $2=整串 $3=说明 → 代码行里彻底没有（本组只用于旧归因文案下线）
 	# 为什么先剥整行注释再数：旧文案在这一版里**故意留在注释里当证据**（§W7-PROBE32 那一课——
 	#   铲掉注释等于铲掉这次反证，将来没人知道曾经错过）。而负锁要拦的是"这句还会不会被用户读到"，
@@ -7411,6 +7455,11 @@ eq110 "$WDP110" 'backups/quant/watchdog/check_mac_ops_watchdog.sh' 1 'ProgramArg
 eq110 "$WDI110" 'grep -q "${WD_HOME}/check_mac_ops_watchdog.sh"' 1 '装机期自检 plist 模板与副本同源（模板没跟着改就拒绝安装旧版本）'
 eq110 "$WDI110" 'migrate_ntfy_topic_to_keychain.sh' 1 '缺主题时只指迁移器（提示式 -w 写法教出来的空口令条目 10-10 真踩过，安装器不得再教）'
 eq110 "$WDI110" 'launchctl bootstrap' 1 '重载走正规通道（只 cp 不 bootstrap＝装了没生效，正是本批 ② 要消灭的形态）'
+# 发送重试四把（2026-10-10 看门狗首跑实录：ntfy.sh 间歇重置，一次判死＝断网窗口告警整批丢）：
+eq110 "$WD110" 'NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"' 1 '重试次数走 env 且缺省 3（写死循环上界＝夹具/文案与实跑分家）'
+eq110 "$WD110" 'NTFY_ALERT_BACKOFF_S="${NTFY_ALERT_BACKOFF_S:-5}"' 1 '重试间隔走 env（门禁夹具取 0 快拨，不为此拆第二条代码路径）'
+eq110 "$WD110" 'while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do' 1 '重试循环上界与次数同一来源（上界另写一个数＝循环次数与文案报的次数脱钩）'
+eq110 "$WD110" '已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败' 1 '失败文案报的就是循环上界那个变量（派生读数，不是第二个写死的 3）'
 # 顺序锁：主题库必须先于两条腿被 source——腿里的 alert() 用到 NTFY_TOPIC，source 挪到腿后＝
 # 每次都走"无主题"分支、告警全部哑掉而两条腿的读数照绿（"判据从没真跑过"的供给侧版本）。
 WD_LIB_N=$(grep -n '\. "$NTFY_LIB"' "$WD110" | head -1 | cut -d: -f1 || true)
@@ -7432,7 +7481,9 @@ SHWD
 cat > "$WDF/bin/curl" <<'SHWDC'
 #!/bin/bash
 # 桩 curl：把命令行记进文件（"告警真发了"与"只落日志"就差这一笔），永不真的外呼。
+# CURL_FAIL=1 ⇒ 恒败（WD8 重试腿用它数"到底拨了几次"）。
 printf 'CURL %s\n' "$*" >> "${CURL_LOG:?CURL_LOG 未设}"
+if [ -n "${CURL_FAIL:-}" ]; then exit 7; fi
 exit 0
 SHWDC
 cat > "$WDF/bin/security" <<'SHWDS'
@@ -7535,6 +7586,25 @@ out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT
 printf '%s\n' "$out110" | grep -qF 'overall=alert rc=1' \
 	|| { echo "--- FAIL: §110 WD7b 钉死 exit 0 后汇总行也变了（破坏改变了读数面，两枚反证纠缠）"; exit 1; }
 echo "ok - §110 WD7 摘 record_line ⇒ 留档空而 overall 照旧；钉死 exit ⇒ 退 0 而 overall 照旧（两枚反证各落各的点）"
+# WD8 发送重试：桩 curl 恒败 ⇒ 恰 ATTEMPTS 次外呼、失败文案带次数、腿级判决照常（退 1 不因发送失败升级＝重试只救通道不改判决）。
+wd_run sendfail "$WDF/logdir/stale.log" 'CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0'
+wd_assert sendfail 1 'pull=stale' '[ "$(grep -c . "$WDF/curl.log" || true)" = "3" ] && grep -qF "已试 3 次仍失败" "$WDF/home/backups/quant/watchdog.log"'
+echo "ok - §110 WD8 桩 curl 恒败 ⇒ 重试恰 3 次外呼、失败文案带次数、腿级判决照常"
+# WD8 摘锁：把重试上界钉成 1 ⇒ 同一夹具只拨一次＝WD8 的「恰 3 次」断言失真＝重试循环承重。
+cp "$WD110" "$WDF/mut/check_mac_ops_watchdog.sh"
+f3_sub "$WDF/mut/check_mac_ops_watchdog.sh" 'while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do' 'while [ "${attempt}" -le 1 ]; do'
+CNT110=$((CNT110 + 1))
+wd8m_rc=0
+out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
+	NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log.wd8m" PATH="$WDF/bin:/usr/bin:/bin" \
+	CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 \
+	PULL_LOG="$WDF/logdir/stale.log" DRIFT_RC=0 \
+	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd8m_rc=$?
+wd8m_n="$(grep -c . "$WDF/curl.log.wd8m" || true)"
+[ "${wd8m_n:-0}" = "1" ] \
+	|| { echo "--- FAIL: §110 WD8 摘锁后外呼数=${wd8m_n:-0}（应恰 1＝上界被钉死；读数不对＝破坏落错了地方）"; exit 1; }
+rm -f "$WDF/curl.log.wd8m"
+echo "ok - §110 WD8 摘锁 钉死上界=1 ⇒ 同夹具只拨一次（重试循环承重）"
 rm -rf "$W3T" "$W3F"
 # 段尾总结把 CNT110 打出来：门禁段数与判定点数都是**要对外报的数**，
 # 让日志自己带读数，比事后靠记忆写"约 60 道"诚实（§GATE-COUNT-LOCK 同一诉求）。

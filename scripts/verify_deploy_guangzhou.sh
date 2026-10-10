@@ -1267,16 +1267,32 @@ if (-not $krDefsOk) {
             # 任一把取不到只把它自己留成 na（一条读腿失败不连带弄坏另一条）。
             # ★ 10-10 二拨的现网读数：`.Xml` 这一式**仍然没给出值**（八条全 en_src=none、reg_src=none），
             #   而同一次读数里 `action=` 是有值的——动作行来自同一个 `$krTask` 对象的 `.Actions`，
-            #   于是 `$krTask` 非空是**被读数证明了的**。这就把成因收窄成两件处置相反的事之一：
-            #   ① `[xml]` 那一步抛了（这条属性在该机不给可用字符串）＝要换通道；
-            #   ② 解析成功、但那份任务定义里**根本没有** `<Settings><Enabled>` / `<RegistrationInfo><Date>`
-            #     节点（schtasks 造的任务常把"等于默认值"的节点整段省掉）＝要承认"XML 没写"这个事实本身，
-            #     并从别处（任务对象的 State）取禁用信号。
-            #   只看 src=none 分不开这两类，而按 ① 的假设去写 ② 的修法就是第三次白跑一趟。
-            #   所以本批**不再猜第三种式子**，而是把区分它们的三把观测读法加进来
-            #   （krObj / krXmlFrom / krXmlErr）+ 一条外部通道兜底，下一次拨测直接给结论。
+            #   于是 `$krTask` 非空是被读数证明了的。二拨把成因收窄成「解析抛了」与「节点本来不存在」
+            #   两件处置相反的事，三拨带着三把自证键再来——**这个收窄被 10-10 晚的上机直读整个证伪**：
+            #   真凶是第三种（`.Xml` 属性根本不在 CimInstance 上，而 [xml]"" 不抛＝空文档冒充解析成功），
+            #   reg_src=none 当时是**读数在撒谎**（假阴性，读法供给侧第四犯），不是节点不存在。
+            #   修法见下面解析块的 ★ 注释；这段历史叙事按当时的判断保留，不写成后见之明。
             $krXml = $null
-            if ($krTask) { try { $krXml = [xml][string]$krTask.Xml } catch { $krXml = $null; $krXmlErr = $_.Exception.Message } }
+            # ★ 10-10 晚上机直读证伪了"解析成功但节点不存在"的收窄：这台机器的 CimInstance 上
+            #   **没有 .Xml 属性**（hasXmlProp=False），[string]$null 得空串；而 [xml]"" 在 PS5.1
+            #   **不抛异常**——产出一个无根元素的空 XmlDocument 且对象为真值。旧写法于是读成
+            #   xml_from=task-xml、xml_err=none、两条取元素腿全空，而外部通道被下面的门闩挡住，
+            #   reg_src=none 是假阴性（真节点一直在，上机读外部通道就有 Date/Enabled）。
+            #   修法＝空串不当解析输入（与外部通道同一道长度下限）、解析产物必须有根元素才算
+            #   这条通道成功；两关任一不过都让位给外部通道，并把走到哪一关写进 xml_err——
+            #   "属性不存在"与"属性在但空"也分得开（deny 一个假阴性的前提是能指认它）。
+            if ($krTask) {
+                $krHasXmlProp = [bool]($krTask.PSObject.Properties['Xml'])
+                $krTaskXmlTxt = ""
+                try { $krTaskXmlTxt = [string]$krTask.Xml } catch { $krTaskXmlTxt = "" }
+                if ($krTaskXmlTxt.Length -gt 60) {
+                    try {
+                        $krXml = [xml]$krTaskXmlTxt
+                        if (-not $krXml.DocumentElement) { $krXml = $null; $krXmlErr = "no-root-element" }
+                    } catch { $krXml = $null; $krXmlErr = $_.Exception.Message }
+                } elseif ($krHasXmlProp) { $krXmlErr = "task-xml-empty(len=" + $krTaskXmlTxt.Length + ")" }
+                else { $krXmlErr = "task-xml-no-prop" }
+            }
             if ($krTask) { $krObj = "ok" }
             # 第二条通道＝`schtasks /Query /TN <name> /XML`。为什么选它兜底而不是再换一个属性名：
             # 这条命令行在**本探针里已被证明活着**（present= 就是靠它的退出码 0 定的），

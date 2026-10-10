@@ -104,11 +104,20 @@ function Test-ServiceProbe($svc) {
 function Get-NssmStatus($name) {
     # §C7-OPS：nssm 落位来自 service_definitions.ps1（Resolve-SvcNssm）；解析不到时回退
     # Get-Service 判在位（SCM 视角与 nssm status 的 SERVICE_RUNNING 等价，不改红绿语义）。
+    # ★ 10-10 首拨实录（读法供给侧第五犯）：nssm 往 stdout 写 UTF-16（register_engine_services.ps1
+    #   :214 有记录），PS 按单字节解码后是夹 NUL 的文本 ⇒ 对原文直接 -match 恒不命中 ⇒
+    #   四条 NSSM 腿全部误判 DOWN——而同一轮日志里探针字段全是通过（通过=True），健康服务
+    #   被连环重启 + 单实例治理杀子进程，quant 引擎被杀三次才靠退避停下。修法＝先剥 NUL
+    #   再匹配；剥完仍读不出任何 SERVICE_ 前缀状态词时落回 SCM 视角——"读不出"不得判成
+    #   "没在跑"（fail 的方向必须是往 SCM 落，而不是往 DOWN 判）。
     if ($NssmExe -and (Test-Path $NssmExe)) {
         try {
-            $out = & $NssmExe status $name 2>$null
-            return ($out -match "SERVICE_RUNNING")
-        } catch { return $false }
+            $raw = [string](& $NssmExe status $name 2>$null)
+            $txt = $raw -replace '\x00', ''
+            if ($txt -match 'SERVICE_RUNNING') { return $true }
+            if ($txt -match 'SERVICE_[A-Z_]+') { return $false }
+        } catch { }
+        # nssm 文本读不出（SYSTEM 会话解码不可靠，10-10 首拨事故形态）→ 落 SCM 视角。
     }
     $st = (Get-Service -Name $name -ErrorAction SilentlyContinue).Status
     return ($st -eq "Running")

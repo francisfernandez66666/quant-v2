@@ -77,6 +77,11 @@ line() {
 }
 
 NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
+# 发送重试：ntfy.sh 从本机网络有「TLS 握手与 HTTP/2 流都开成功、请求后被对端重置」的间歇性断连
+# （2026-10-10 看门狗首跑实录：几分钟内 200/56 交替，与 launchd/curl 二进制/标题编码均无关）。
+# 一次判死＝断网窗口里告警整批丢；只重试**失败**，成功路径仍恰一次外呼（门禁 WD2 钉着这个数）。
+NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"
+NTFY_ALERT_BACKOFF_S="${NTFY_ALERT_BACKOFF_S:-5}"
 # shellcheck source=ntfy_topic.sh
 NTFY_LIB="$SELF_DIR/ntfy_topic.sh"
 TOPIC_SOURCE="none"
@@ -98,9 +103,19 @@ alert() { # 关键事件推 ntfy（正文不回显主题值，也不带任何凭
         line "ALERT-NOT-SENT reason=no-topic title=$title body=$body"
         return 0
     fi
-    curl -fs -H "Title: $title" -H "Priority: $pri" -H "Tags: package" \
-        -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1 \
-        || line "ntfy 告警发送失败（网络？启动行的 topic_fp 可判断配的是哪一份：$(ntfy_topic_report watchdog-alert-failure)）"
+    # 重试用 if 形式而不是 `[ ] && sleep`：条件为假时后者整句返回 1，在 set -e 的调用方里就是意外中止。
+    local attempt=1
+    while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do
+        if curl -fs -H "Title: $title" -H "Priority: $pri" -H "Tags: package" \
+            -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; then
+            sleep "${NTFY_ALERT_BACKOFF_S}"
+        fi
+    done
+    line "ntfy 告警发送失败（已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败；网络？启动行的 topic_fp 可判断配的是哪一份：$(ntfy_topic_report watchdog-alert-failure)）"
 }
 
 # 留档：纯 bash 拼 JSON（这台机器上留痕腿不能反过来把判据腿拖下水——python3 缺失时照样要记下行）。

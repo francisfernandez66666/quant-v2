@@ -16,6 +16,11 @@ REPO_REMOTE="sftp:${SSH_HOST}:C:/var/lib/quant-restic-repo"   # 广州中转仓�
 REPO_LOCAL="$HOME/backups/quant/restic"                        # Mac 异地仓库（restic copy 目标）
 KEYCHAIN_ITEM="quant-restic-repo-pass"
 NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
+# 发送重试：ntfy.sh 从本机网络有「请求后被对端重置」的间歇性断连（2026-10-10 看门狗首跑实录，
+# 200/56 几分钟内交替）。拉取腿的告警恰好都落在 launchd 唤醒后的断网窗口里（§4.1b.19 ① 同形四例），
+# 一次判死＝那晚的备份告警整批丢；只重试失败、成功路径仍恰一次外呼（门禁 F3-2 钉着这个数）。
+NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"
+NTFY_ALERT_BACKOFF_S="${NTFY_ALERT_BACKOFF_S:-5}"
 # §KUMA-SECREDTO（2026-10-07 修复批 波 3）：主题不再在仓库里写缺省值。
 # 为什么：ntfy 的口径是「知道主题就能往那个主题发帖」⇒ 主题串就是凭据；这个 32-hex 以前同时
 # 写在本文件、verify_restore.sh、kuma_seed.js 三处（三份并存的必然结局＝改一处漏两处），
@@ -51,9 +56,19 @@ alert() {  # 关键事件推 ntfy
     log "ALERT-NOT-SENT reason=no-topic title=$title body=$body"
     return 0
   fi
-  curl -fs -H "Title: $title" -H "Priority: $pri" -H "Tags: package" \
-       -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1 \
-    || log "ntfy 告警发送失败（网络？启动行的 topic_fp 可判断配的是哪一份）"
+  # 重试用 if 形式而不是 `[ ] && sleep`：条件为假时后者整句返回 1，在 set -e 的调用方里就是意外中止。
+  local attempt=1
+  while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do
+    if curl -fs -H "Title: $title" -H "Priority: $pri" -H "Tags: package" \
+         -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; then
+      sleep "${NTFY_ALERT_BACKOFF_S}"
+    fi
+  done
+  log "ntfy 告警发送失败（已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败；网络？启动行的 topic_fp 可判断配的是哪一份）"
 }
 
 fail() { log "ERROR: $*"; alert "quant 备份失败" "$*" high; exit 1; }
