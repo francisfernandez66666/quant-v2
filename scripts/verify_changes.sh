@@ -6152,7 +6152,7 @@ leg109 'store 无底仓卖出读取侧三腿（流水经 fills_effective 可见�
 
 echo "ok - §109 静态锁 ${CNT109} 道 + 结构腿 + 行为腿（pytest 15 / Go 3）通过"
 
-echo "==> 110 §KA-TASKREG + §KUMA-SECREDTO 计划任务全集探针 + 监控凭据出仓：静态锁 + 派生等值 + 判读函数十九腿 + 摘锁反证十二枚 + 反证矩阵..."
+echo "==> 110 §KA-TASKREG + §KUMA-SECREDTO 计划任务全集探针 + 监控凭据出仓：静态锁 + 派生等值 + 判读函数十九腿 + 摘锁反证十二枚 + 反证矩阵...（＋ §MAC-WATCHDOG 看门狗腿与 §MAC-SYNC-RETIRE 退役链防复活／库新度两条腿）"
 
 # §KA-TASKREG（2026-10-07 修复批 波 3，§AUDIT_20261005 P1-D + P1-E）本段守两件事：
 #   ① 「有脚本无调度」第 N 次同族的**三段闭环**：任务名单/阈值单源（service_definitions.ps1）
@@ -7460,6 +7460,72 @@ eq110 "$WD110" 'NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"' 1 '重试次数
 eq110 "$WD110" 'NTFY_ALERT_BACKOFF_S="${NTFY_ALERT_BACKOFF_S:-5}"' 1 '重试间隔走 env（门禁夹具取 0 快拨，不为此拆第二条代码路径）'
 eq110 "$WD110" 'while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do' 1 '重试循环上界与次数同一来源（上界另写一个数＝循环次数与文案报的次数脱钩）'
 eq110 "$WD110" '已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败' 1 '失败文案报的就是循环上界那个变量（派生读数，不是第二个写死的 3）'
+# ── §MAC-SYNC-RETIRE（2026-10-11）：退役链防复活腿 + 本地库新度腿的静态锁 ──
+# 这两条腿存在的原因写在 $WD110 的头注里（目标机 8 月中旬改行、六步链整个生命周期零次成功、
+# 每天真实下载 37min~6h25m 后恒退 1、而这条任务当时在本机所有覆盖面之外＝无人被告知）。
+# 这里守的是**退役之后仍然要有人看着**这件事：只把调度删了，三个月后任何人重跑一次旧安装器
+# 就把它悄悄挂回来，照旧每天失败、照旧没人知道——那和没退役只差一个 commit。
+eq110 "$WD110" 'SYNC_RETIRE_LABEL="${SYNC_RETIRE_LABEL:-com.quant.syncdata}"' 1 '退役对象名走 env 且缺省点名（写死标签＝将来换名退役时这条腿恒绿，而"绿"来自读不到而不是不在位）'
+eq110 "$WD110" 'grep -qiF "could not find service"' 1 '「确定不在位」必须由 launchctl 自己那句话给出（rc≠0 就当不在位＝把"命令失败"读成"没复活"，fail-closed 的下限）'
+eq110 "$WD110" 'RET_VERDICT="plist-in-place"' 1 'plist 在位但本会话没加载**单独成态**并判红（只 bootout 不摘 plist＝下次登录原样复活，只看当前会话会读成"已停"）'
+eq110 "$WD110" 'LOCAL_DB="${LOCAL_DB:-$HOME_DIR/.quant-trading-v2/trading.db}"' 1 '本地库路径单点缺省且可覆盖（副本目录里反推路径＝读到一份空库再报"读数正常"）'
+eq110 "$WD110" 'DATA_FRESH_TABLES="${DATA_FRESH_TABLES:-daily,stk_limit,index_daily}"' 1 '新度表集单源，且 **index_daily 必须在清单里**（本机实录：它停在 2026-08-17 而 daily 停在 10-09，差近两个月、当时无人知道——清单少一张表就等于把这种形态重新埋回土里）'
+eq110 "$WD110" 'DATA_FRESH_ALERT_DAYS="${DATA_FRESH_ALERT_DAYS:-0}"' 1 '缺省 0＝只出读数不判红（下载链已退役，新度不再自动前进是既定态；把它判成恒红＝给一条 owner 有意关掉的链天天发噪声，§107 DRILL-C 那一课）'
+eq110 "$WD110" "SELECT name FROM sqlite_master WHERE type='table' LIMIT 1" 1 '★ 根探针在位：sqlite3.connect 对"存在但不是数据库的文件"**不抛**（惰性打开），异常要等第一次 execute 才出现——没有这一步，整份坏库会被下面的逐表 except 洗成三行 notable、腿退 0 报"读数正常"（本批夹具首拨真踩到的形态，与 [xml]"" 不抛同族）'
+eq110 "$WD110" 'FRESH_VERDICT="db-absent"' 1 '库文件不存在单独成态并退 2（研究侧还要用本地库时这是真问题，而"读不出"绝不等"没问题"）'
+eq110 "$WD110" 'retired=${RET_VERDICT} dbfresh=${FRESH_VERDICT}' 1 '两条新腿的态都进汇总行与留档（不进读数面＝它们绿得没有证据、红了也没人知道是哪条腿）'
+# ★ 三份"人读的那份说明"必须跟着改口（plist 模板 / 安装器 / 仓库里那份退役链的模板）。
+#   为什么单独钉：腿 3/4 是**加进代码**的，而下一次想知道"看门狗到底看几件事"的人打开的是
+#   com.quant.watchdog.plist 的注释、跑的是安装器看它打印的那句；代码改了说明没改＝读说明的人
+#   按两件事去理解一条四腿判据，红了也不知道红在哪。本仓"有代码无生效"的同族还有第三种：
+#   **有代码、有生效、说明停在旧态**。
+eq110 "$WDP110" '已退役的 com.quant.syncdata 不得复活' 1 '调度模板自己就说清第 3 条腿看什么（plist 注释是人唯一会打开读的那份；只写在 .sh 头注里＝下一个人读 plist 仍以为只看两件事）'
+eq110 "$WDP110" '0=四条腿都绿' 1 'plist 里的退出码语义跟着四腿现状（0/1/2 三态的**含义**写在模板里，抄旧语义的人会把 1 当成"心跳超龄"这一种去查）'
+eq110 "$WDI110" '四条腿都是只读' 1 '安装器 -Kick 那句自述跟着改口（它是装机人唯一会看到的"这次跑的是什么"，报两条腿＝把两条新腿读成没装）'
+# 仓库里这份退役链的模板是**一条真实的复活通道**（注释里就是 cp + launchctl load 两步照抄可用）。
+# 不删它（证据＋知情后重装的底稿），但告示必须在位：把告示删干净只剩"安装："那段，
+# 下一个人复制粘贴的方向就是把一条已证明恒失败的链重新挂回每天 15:20。
+eq110 deploy/com.quant.syncdata.plist '本调度已于 **2026-10-11 退役**' 1 '退役链的仓库模板自带作废告示（它是可直接 cp+load 的复活入口；只剩"安装：cp …"＝恒失败链被不知情的人挂回）'
+eq110 deploy/com.quant.syncdata.plist 'install_sync_agent.sh -Retire' 1 '模板把正规通道指到 -Retire（反向也要有：退役是可重跑的仓库指令，不是让人手敲 launchctl 的一次性动作）'
+# 负锁：被根探针根除的那个坏形态不许复活（逐表 except 之前没有整份自证）。
+CNT110=$((CNT110 + 1))
+if grep -qF 'conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)' "$WD110" \
+	&& ! grep -A3 -F 'conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)' "$WD110" | grep -qF "sqlite_master"; then
+	echo "--- FAIL: §110 负锁 ${CNT110}（connect 之后没有紧跟根探针＝坏库会被逐表 except 吞成 notable，这条腿又开始报假绿）"; exit 1
+fi
+echo "ok - §110 负锁：connect→逐表之间若丢掉根探针，本枚立刻判红（夹具实测：非库文件读成 read 就是它要拦的那一形）"
+# 顺序锁：根探针必须早于逐表循环；两条新腿的读数行必须早于汇总 DETAIL（否则汇总读到的是空串）。
+CNT110=$((CNT110 + 1))
+PROBE_N110="$(ln110 "$WD110" "SELECT name FROM sqlite_master WHERE type='table'")"
+FORTbl_N110="$(ln110 "$WD110" '    for t in tables:')"
+[ "$PROBE_N110" -gt 0 ] && [ "$FORTbl_N110" -gt 0 ] && [ "$PROBE_N110" -lt "$FORTbl_N110" ] \
+	|| { echo "--- FAIL: §110 顺序锁 ${CNT110}（根探针行=${PROBE_N110:-无} 必须先于逐表行=${FORTbl_N110:-无}：倒序＝先吞异常后自证，坏库照样报 read）"; exit 1; }
+echo "ok - §110 顺序锁：根探针（${PROBE_N110}）先于逐表取数（${FORTbl_N110}）"
+CNT110=$((CNT110 + 1))
+LEG3_N110="$(ln110 "$WD110" 'WATCHDOG|retired verdict=')"
+LEG4_N110="$(ln110 "$WD110" 'WATCHDOG|dbfresh verdict=')"
+DET_N110="$(ln110 "$WD110" 'DETAIL="pull=$PULL_VERDICT')"
+[ "$LEG3_N110" -gt 0 ] && [ "$LEG4_N110" -gt 0 ] && [ "$DET_N110" -gt 0 ] \
+	&& [ "$LEG3_N110" -lt "$DET_N110" ] && [ "$LEG4_N110" -lt "$DET_N110" ] \
+	|| { echo "--- FAIL: §110 顺序锁 ${CNT110}（腿3=${LEG3_N110:-无}/腿4=${LEG4_N110:-无} 都必须先于汇总 DETAIL=${DET_N110:-无}：倒序＝DETAIL 读到空串，留档里两条腿永远没有态）"; exit 1; }
+echo "ok - §110 顺序锁：腿3（${LEG3_N110}）腿4（${LEG4_N110}）都先于汇总行（${DET_N110}）"
+# 退役安装入口的两面：默认拒绝（arm）与正规退役通道（-Retire）都必须在位——
+# 少前者＝谁重跑一次安装器就把它挂回来；少后者＝退役只能靠人手敲 launchctl，
+# 而手敲的那次不会顺手把 plist 摘掉（本次实测就是"bootout + 改名"两步，缺一步都会复活）。
+SI110=scripts/install_sync_agent.sh
+eq110 "$SI110" 'if [ "${SYNC_CHAIN_ARMED:-0}" != "1" ]; then' 1 '装入口默认拒绝（本链已退役；重新挂上必须显式知情，见头注理由）'
+eq110 "$SI110" '-Retire|--retire)' 1 '退役是一条仓库指令而不是手敲 launchctl（可复核、可重跑、且保证 bootout 与摘 plist 两步都做到）'
+eq110 "$SI110" 'mv "$PLIST" "${PLIST%.plist}.retired-${stamp}"' 1 '退役把 plist 改名留证而不是原地留着（launchd 下次登录按 .plist 后缀加载＝留着就等于没退）'
+eq110 "$SI110" 'launchctl load "$PLIST"' 1 'arm 分支的装机尺寸保留（实现优先禁删除：本链将来确认目标机归属后仍要能用这一条恢复，不重写第二份）'
+CNT110=$((CNT110 + 1))
+if grep -qE '\[ -f "\$PLIST" \] && \{' "$SI110"; then
+	echo "--- FAIL: §110 负锁 ${CNT110}（-Retire 复核段里出现 `[ -f X ] && { … }` 末句形：set -e 下"复核通过"那一支会让整条与列表返回 1，脚本在没有任何输出的位置自己中止）"; exit 1
+fi
+echo "ok - §110 负锁：退役复核写成 if 形（set -e 下 AND-list 末句自伤形态进不来）"
+SD110=scripts/sync_delta_to_cloud.sh
+eq110 "$SD110" '本链已于 **2026-10-11 退役**' 1 '退役声明进脚本头注（下一个人打开的是这份脚本，不是安装器）'
+eq110 "$SD110" 'unable to open database file` 21 次' 1 '零次成功/21 次连败的读数留在脚本里（"当时为什么停"只有带着数才不会被重新推成"大概是网络问题"）'
+
 # 顺序锁：主题库必须先于两条腿被 source——腿里的 alert() 用到 NTFY_TOPIC，source 挪到腿后＝
 # 每次都走"无主题"分支、告警全部哑掉而两条腿的读数照绿（"判据从没真跑过"的供给侧版本）。
 WD_LIB_N=$(grep -n '\. "$NTFY_LIB"' "$WD110" | head -1 | cut -d: -f1 || true)
@@ -7492,14 +7558,58 @@ cat > "$WDF/bin/security" <<'SHWDS'
 # 既把真主题送进夹具日志，又让 ALERT-NOT-SENT 那条永远测不到（夹具自己制造被测形态）。
 exit 1
 SHWDS
+cat > "$WDF/bin/launchctl" <<'SHWDL'
+#!/bin/bash
+# 桩 launchctl（§MAC-SYNC-RETIRE 腿 3 用）：在位性这条判据读的是**本机 launchd 的现况**，
+# 门禁不许把它绑到"这台机此刻有没有那条服务"上——那样退役链哪天被人真挂回来，
+# 红的会是与本腿无关的一整批既有 WD 夹具，而读数归属说不清（§P2-L 读数归属同族）。
+# 于是三个态全部由 env 给：WD_LCTL_RC=0 ⇒ print 成功（服务在位）；
+# WD_LCTL_RC=1 + 那句 "Could not find service" ⇒ 确定不在位；
+# WD_LCTL_RC=其它 + 任意输出 ⇒ 读不出（leg 3 必须落 probe-broken 而不是"没在跑"）。
+case "${1:-}" in
+	print)
+		printf '%s\n' "${WD_LCTL_OUT:-Could not find service.}"
+		exit "${WD_LCTL_RC:-1}"
+		;;
+	bootout)
+		exit "${WD_LCTL_BOOTOUT_RC:-0}"
+		;;
+	*)
+		exit 0
+		;;
+esac
+SHWDL
+# 腿 4 的夹具库：三张表、两个日期档（一新一旧），新度判据才有"陈旧"这一态可拨。
+# 为什么要在夹具里造库而不是指真库：门禁不能依赖本机研究库存在（34GB、可被清、CI 上没有），
+# 而且指真库时 index_daily 那个 55 天的数是**会随时间漂的锚**（今天绿、下月红）。
+mkdir -p "$WDF/db"
+python3 - "$WDF/db/trading.db" "$WDF/db/notadb.txt" <<'PYWD' || { echo "--- FAIL: §110 WD 夹具库建不出来（sqlite 不可用＝腿 4 的四态全部无从拨）"; exit 1; }
+import sqlite3, sys, datetime, os
+db = sys.argv[1]
+if os.path.exists(db):
+    os.remove(db)
+conn = sqlite3.connect(db)
+# 最近的日期 ⇒ age_d 小（缺省阈值 0＝不判红时恒绿；阈值 1 天时它也不该被误抬红）
+recent = (datetime.date.today() - datetime.timedelta(days=1)).strftime('%Y%m%d')
+stale = '20200102'
+for t, v in [('daily', recent), ('stk_limit', recent), ('index_daily', stale)]:
+    conn.execute('CREATE TABLE %s (symbol TEXT, trade_date TEXT)' % t)
+    conn.execute('INSERT INTO %s VALUES (?, ?)' % t, ('000001', v))
+conn.commit()
+conn.close()
+# 第二份夹具：一个**存在但不是数据库**的文件（腿 4 的 unreadable 态就靠它——
+# 这一枚同时是"根探针"那枚锁的行为面反证：没有根探针时它会被逐表 except 洗成三行 notable）。
+open(sys.argv[2], 'w').write('this is not a sqlite database\n')
+PYWD
 chmod +x "$WDF/run/check_mac_ops_watchdog.sh" "$WDF/run/ntfy_topic.sh" "$WDF/run/check_mac_agent_drift.sh" \
-	"$WDF/bin/curl" "$WDF/bin/security"
+	"$WDF/bin/curl" "$WDF/bin/security" "$WDF/bin/launchctl"
 wd_run() { # $1=case 名 $2=PULL_LOG 路径 $3=额外 env（K=V 空格分隔，可为空）
 	local name="$1" pull="$2" extra="${3:-}" out rc
 	rm -f "$WDF/curl.log" "$WDF/home/backups/quant/watchdog_record.jsonl" "$WDF/home/backups/quant/watchdog.log"
 	# shellcheck disable=SC2086
 	out="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
 		NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log" PATH="$WDF/bin:/usr/bin:/bin" \
+		LOCAL_DB="$WDF/db/trading.db" \
 		PULL_LOG="$pull" DRIFT_RC="${WD_DRIFT_RC:-0}" $extra \
 		/bin/bash "$WDF/run/check_mac_ops_watchdog.sh" 2>&1)" && rc=0 || rc=$?
 	# rc 必须由 wd_run 自己落盘：调用方 `wd_run …; echo "$?"` 记到的是本函数的返回值（最后一条 printf），
@@ -7565,6 +7675,7 @@ f3_sub "$WDF/mut/check_mac_ops_watchdog.sh" 'record_line "$res" "$rc" "$DETAIL"'
 CNT110=$((CNT110 + 1))
 out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
 	NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log" PATH="$WDF/bin:/usr/bin:/bin" \
+		LOCAL_DB="$WDF/db/trading.db" \
 	PULL_LOG="$WDF/logdir/ok.log" DRIFT_RC=0 \
 	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd7_rc=$?
 printf '%s\n' "$out110" | grep -qF 'overall=ok rc=0' \
@@ -7579,6 +7690,7 @@ wd7b_rc=0
 CNT110=$((CNT110 + 1))
 out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
 	NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log" PATH="$WDF/bin:/usr/bin:/bin" \
+		LOCAL_DB="$WDF/db/trading.db" \
 	PULL_LOG="$WDF/logdir/stale.log" DRIFT_RC=0 \
 	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd7b_rc=$?
 [ "$wd7b_rc" = "0" ] \
@@ -7597,6 +7709,7 @@ CNT110=$((CNT110 + 1))
 wd8m_rc=0
 out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
 	NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log.wd8m" PATH="$WDF/bin:/usr/bin:/bin" \
+		LOCAL_DB="$WDF/db/trading.db" \
 	CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 \
 	PULL_LOG="$WDF/logdir/stale.log" DRIFT_RC=0 \
 	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd8m_rc=$?
@@ -7605,6 +7718,95 @@ wd8m_n="$(grep -c . "$WDF/curl.log.wd8m" || true)"
 	|| { echo "--- FAIL: §110 WD8 摘锁后外呼数=${wd8m_n:-0}（应恰 1＝上界被钉死；读数不对＝破坏落错了地方）"; exit 1; }
 rm -f "$WDF/curl.log.wd8m"
 echo "ok - §110 WD8 摘锁 钉死上界=1 ⇒ 同夹具只拨一次（重试循环承重）"
+# ── WD9/WD10（§MAC-SYNC-RETIRE 两条新腿的行为面）：夹具全部走桩与临时库，不碰本机 launchd、不碰研究库 ──
+# WD9 退役腿四态：absent(0) / loaded(1) / plist-in-place(1) / probe-broken(2)。
+#   loaded 与 plist-in-place 都判红是刻意的：后者本会话看着"没在跑"，但下次登录 launchd 会原样挂回
+#   来，等它自己暴露就又是一批"每天恒失败没人知道"的日子（本次实测退役正是 bootout + 改名两步）。
+wd_run ret_absent "$WDF/logdir/ok.log"
+wd_assert ret_absent 0 'overall=ok rc=0' 'grep -qF "retired=absent" "$WDF/ret_absent.out"'
+echo "ok - §110 WD9a 桩说不在位且夹具 HOME 里没 plist ⇒ retired=absent、整体退 0"
+wd_run ret_loaded "$WDF/logdir/ok.log" 'WD_LCTL_RC=0'
+wd_assert ret_loaded 1 'retired=loaded' '[ "$(grep -c . "$WDF/curl.log" || true)" = "1" ]'
+echo "ok - §110 WD9b 退役链回到调度里 ⇒ 退 1、告警真发一次（读数与推送两条出口都活着）"
+mkdir -p "$WDF/home/Library/LaunchAgents"
+printf '%s\n' '<plist/> fake' > "$WDF/home/Library/LaunchAgents/com.quant.syncdata.plist"
+wd_run ret_plist "$WDF/logdir/ok.log" "SYNC_RETIRE_PLIST=$WDF/home/Library/LaunchAgents/com.quant.syncdata.plist"
+wd_assert ret_plist 1 'retired=plist-in-place'
+rm -f "$WDF/home/Library/LaunchAgents/com.quant.syncdata.plist"
+echo "ok - §110 WD9c 本会话没加载但 plist 在位 ⇒ 单独成态并判红（只看当前会话＝把「下次登录会复活」读成「已停」）"
+wd_run ret_broken "$WDF/logdir/ok.log" 'WD_LCTL_RC=3 WD_LCTL_OUT=unrelated-failure'
+wd_assert ret_broken 2 'retired=probe-broken'
+echo "ok - §110 WD9d launchctl 给不出那句"找不到服务"⇒ 退 2（读不出绝不冒充「没复活」）"
+# WD10 新度腿：read / notable(缺表) / unreadable(整份不是库) / db-absent / stale(显式阈值) 五态。
+wd_run fresh_read "$WDF/logdir/ok.log"
+wd_assert fresh_read 0 'dbfresh=read' 'grep -qF "index_daily=20200102" "$WDF/fresh_read.out" && grep -qF "alert_days=0" "$WDF/fresh_read.out"'
+echo "ok - §110 WD10a 夹具库三表 ⇒ 读数把每张表的日期与年龄都带回来（缺省阈值 0＝只读数不判红）"
+wd_run fresh_notable "$WDF/logdir/ok.log" 'DATA_FRESH_TABLES=nosuchtable'
+wd_assert fresh_notable 0 'dbfresh=read' 'grep -qF "nosuchtable=notable" "$WDF/fresh_notable.out"'
+echo "ok - §110 WD10b 表不在清单里 ⇒ 该表单独记 notable 而整条腿仍算读成功（缺表与坏库是两个态）"
+wd_run fresh_notadb "$WDF/logdir/ok.log" "LOCAL_DB=$WDF/db/notadb.txt"
+wd_assert fresh_notadb 2 'dbfresh=unreadable'
+echo "ok - §110 WD10c 库文件存在但不是 sqlite ⇒ 退 2 点名 unreadable（这条就是根探针那枚锁的行为面：没有它这里会读成 read）"
+wd_run fresh_absent "$WDF/logdir/ok.log" 'LOCAL_DB=/tmp/wd_no_such_dir_110/trading.db'
+wd_assert fresh_absent 2 'dbfresh=db-absent'
+echo "ok - §110 WD10d 库文件不存在 ⇒ 退 2 且态名与 unreadable 分开（「从没建过库」与「建了但读不动」修法不同）"
+wd_run fresh_stale "$WDF/logdir/ok.log" 'DATA_FRESH_ALERT_DAYS=1'
+wd_assert fresh_stale 1 'dbfresh=stale' 'grep -qF "阈值 1d" "$WDF/fresh_stale.out" && [ "$(grep -c . "$WDF/curl.log" || true)" = "1" ]'
+echo "ok - §110 WD10e 显式给阈值 1 天 ⇒ 最陈旧一腿(20200102)抬红并按阈值文案报数、告警真发一次"
+# WD11 三枚摘锁反证（各断本枚独有读数，互不纠缠）：
+#   a) 删掉根探针那一行 ⇒ WD10c 的夹具从 unreadable 退成 read/退 0＝那枚探针正是"坏库不冒充正常"的承重腿
+#   b) 把汇总里腿4 的 1→rc=1 映射钉死成永不命中 ⇒ WD10e 的态名还在而整体退 0＝汇总映射承重
+#   c) 把汇总里腿3 的 1→rc=1 映射钉死成永不命中 ⇒ WD9b 的态名还在而整体退 0＝同上，两枚各证一条腿
+CNT110=$((CNT110 + 1))
+cp "$WD110" "$WDF/mut/check_mac_ops_watchdog.sh"
+f3_drop_line "$WDF/mut/check_mac_ops_watchdog.sh" 'SELECT name FROM sqlite_master'
+wd11a_rc=0
+out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
+	NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log.wd11a" PATH="$WDF/bin:/usr/bin:/bin" \
+		LOCAL_DB="$WDF/db/notadb.txt" \
+	PULL_LOG="$WDF/logdir/ok.log" DRIFT_RC=0 \
+	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd11a_rc=$?
+printf '%s\n' "$out110" | grep -qF 'dbfresh=read' \
+	|| { echo "--- FAIL: §110 WD11a 删掉根探针后坏库仍是 unreadable（破坏没落到点上，反证测的不是它声称的那一枚）"; exit 1; }
+[ "$wd11a_rc" = "0" ] \
+	|| { echo "--- FAIL: §110 WD11a 删根探针后仍退 ${wd11a_rc}（坏库被逐表 except 洗红＝本枚独有性不成立）"; exit 1; }
+rm -f "$WDF/curl.log.wd11a"
+echo "ok - §110 WD11a 删根探针 ⇒ 同一份坏库夹具退成 read/退 0（根探针承重，这条腿不是恒红装饰）"
+wd_mut_map() { # $1=被映射的 rc 变量名 $2=夹具 env $3=期望仍在的态名 $4=标签
+	# 目标行原文是 `[ "$rc_fresh" = "1" ] && rc=1`——这里的 old 串必须带**字面 dollar 号**。
+	# 写 `\"$1\"` 得到的是 `[ "rc_fresh" = "1" ]`（变量名被展开、$ 没了），f3_sub 命中 0 就判红，
+	# 反证自己先假红（本仓 §雷：把要匹配的串按"我以为的转义"写出来，落地和源码不同）。
+	cp "$WD110" "$WDF/mut/check_mac_ops_watchdog.sh"
+	local dollar='$'
+	f3_sub "$WDF/mut/check_mac_ops_watchdog.sh" "[ \"${dollar}$1\" = \"1\" ] && rc=1" "[ \"${dollar}$1\" = \"__never__\" ] && rc=1"
+	local rcx=0 o
+	o="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT="$WDF/fakerepo" \
+		NTFY_TOPIC="topicstubvalue" CURL_LOG="$WDF/curl.log.wdm" PATH="$WDF/bin:/usr/bin:/bin" \
+		LOCAL_DB="$WDF/db/trading.db" \
+		PULL_LOG="$WDF/logdir/ok.log" DRIFT_RC=0 $2 \
+		/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || rcx=$?
+	CNT110=$((CNT110 + 1))
+	printf '%s\n' "$o" | grep -qF -- "$3" \
+		|| { echo "--- FAIL: §110 WD11 $4：摘映射后连态名都没了（破坏牵连了读数面，两枚反证纠缠）"; exit 1; }
+	[ "$rcx" = "0" ] \
+		|| { echo "--- FAIL: §110 WD11 $4：摘掉汇总映射后仍退 ${rcx}（汇总那行不承重＝腿级态名与整体退出码本来就各判各的）"; exit 1; }
+	rm -f "$WDF/curl.log.wdm"
+}
+wd_mut_map rc_fresh 'DATA_FRESH_ALERT_DAYS=1' 'dbfresh=stale' 腿4
+echo "ok - §110 WD11b 摘腿4→汇总映射 ⇒ stale 态名还在而整体退 0（汇总映射承重，且只承重腿4 那一条）"
+wd_mut_map rc_retired 'WD_LCTL_RC=0' 'retired=loaded' 腿3
+echo "ok - §110 WD11c 摘腿3→汇总映射 ⇒ loaded 态名还在而整体退 0（同上，证的是另一条腿的映射）"
+# 退役装机入口的行为面：-Retire 必须真把两样东西都摘掉，且对"已经退役"的机器幂等退 0。
+CNT110=$((CNT110 + 1))
+si_retire_rc=0
+si_out="$(env HOME="$WDF/home" PATH="$WDF/bin:/usr/bin:/bin" /bin/bash scripts/install_sync_agent.sh -Retire 2>&1)" || si_retire_rc=$?
+[ "$si_retire_rc" = "0" ] || { echo "--- FAIL: §110 退役入口 -Retire 退 ${si_retire_rc}（幂等支走不通＝在已退役的机器上重跑会红，而它本该可重跑）"; exit 1; }
+printf '%s\n' "$si_out" | grep -qF '既不在调度、也没有 plist' \
+	|| { echo "--- FAIL: §110 退役入口复核句没出现（三步走完却没自证＝这条指令的绿没有证据面）：$(printf '%s\n' "$si_out" | tail -2)"; exit 1; }
+si_arm_rc=0
+env HOME="$WDF/home" PATH="$WDF/bin:/usr/bin:/bin" /bin/bash scripts/install_sync_agent.sh >/dev/null 2>&1 || si_arm_rc=$?
+[ "$si_arm_rc" = "1" ] || { echo "--- FAIL: §110 退役入口默认分支退 ${si_arm_rc}（应 1＝默认拒绝；退 0 意味着谁重跑安装器就把它悄悄挂回调度）"; exit 1; }
+echo "ok - §110 装机入口：-Retire 幂等退 0 且自带复核句；默认分支拒绝执行（退出码就是「没挂回去」的读数）"
 rm -rf "$W3T" "$W3F"
 # 段尾总结把 CNT110 打出来：门禁段数与判定点数都是**要对外报的数**，
 # 让日志自己带读数，比事后靠记忆写"约 60 道"诚实（§GATE-COUNT-LOCK 同一诉求）。
@@ -7625,7 +7827,7 @@ gate_need 110 "$IP110_HAS" '§107 的派生 IP 扫描没在本段之前跑完（
 CNT110=$((CNT110 + 1))
 [ "${IP_SCAN_N:-0}" -ge 13 ] || { echo "--- FAIL: §110 交接正锁 ${CNT110}（§107 的待扫文件数=${IP_SCAN_N}，<13＝那条 glob 已被人改窄，本段继承的是空扫描）"; exit 1; }
 echo "ok - §110 交接锁：沿用 §107 派生扫描读数（待扫文件 ${IP_SCAN_N} 个 / 字面公网 IP ${IP_HITS} 处）"
-echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十九腿与摘锁反证十二枚 + F3 Mac 侧五组与 kuma 必传腿 + ⑤ Mac 拉取腿重试与副本漂移探测（FD1–FD8，其中 FD5 只回显真仓库现况不判红），累计判定点 ${CNT110}"
+echo "ok - §110 全段通过：静态锁 + F2 派生集合等值 + F3 双向镜像反证 + F1 判读十九腿与摘锁反证十二枚 + F3 Mac 侧五组与 kuma 必传腿 + ⑤ Mac 拉取腿重试与副本漂移探测（FD1–FD8，其中 FD5 只回显真仓库现况不判红）+ ⑥ 退役链防复活与库新度两条腿（WD9a–d／WD10a–e／WD11a–c 三枚摘锁反证／装机入口 -Retire 与默认拒绝／三份说明面锁），累计判定点 ${CNT110}"
 
 echo "==> 111 §P2-L/§P2-K/§P2-M 门禁体系自身（波 4）：收集模式驱动 + 装配器 + 编码口径 + DNS 注入点——静态锁、镜像行为腿与五枚「本批真踩过的坑」的反证..."
 

@@ -1,4 +1,26 @@
 #!/bin/bash
+# ⚠⚠ 本链已于 **2026-10-11 退役**（owner 当面裁「整条停掉」，含每日本地下载那一步）。
+#    launchd 侧的 com.quant.syncdata 已 bootout、plist 改名成
+#    ~/Library/LaunchAgents/com.quant.syncdata.plist.retired-20261011 留证不再被加载；
+#    退役后由 deploy/mac/check_mac_ops_watchdog.sh 的「腿 3：已退役调度不得复活」每天验在位性，
+#    「腿 4：本地行情库新度」把"库还剩多新"变成读数（默认只读数、不判红）。
+#    脚本本身保留、不删——按需手跑的入口就是这一份，理由与证据如下（别让下一个人重新推一遍）：
+#      · 六个步骤在这台机的整个日志生命周期里**从未走到第 6 步**：stdout 留档里
+#        "云端 max:" 0 次、"同步完成" 0 次；stderr 里
+#        `sqlite3.OperationalError: unable to open database file` 21 次＝7 个交易日 × 每次 3 试，
+#        launchd `last exit code = 1` 每天如此。
+#      · 根因不在脚本读法，在**目标机已经改行**：默认写死的云端数据目录 /var/lib/quant-trading-v2
+#        在那台机上不存在（只剩一个 8 月 13 日的 .bak-<epoch> 残骸，里面是别的应用的 auth.json/
+#        messages.json），/opt 下现在的目录属于另一套服务，quant 的服务/二进制/数据一概不在。
+#        全盘能找到的唯一 trading.db 是一个 4096 字节的空壳（8 月 18 日建，只有表结构）。
+#      · 代价是真实的：第 2 步"本地 baostock 下载"每天照样跑，最短 37m36s、最长 6h25m，
+#        跑完才在第 3 步撞墙。每天烧几小时真实算力＋零产出＋无人被告知
+#        （`syncdata` 三字在 deploy/mac/*.sh 与 scripts/verify_changes.sh 里当时一次都检索不到）。
+#      · 如果将来要恢复"推到某台机"的语义，先确认两件事再动这个文件：①目标机与那个库现在归谁
+#        （现网广州那份库属**交易面**，引擎在用；把 Mac 的 baostock 行情整表推进去是一次跨面的
+#        生产写，要走备份→推送→复核的正规通道并单独设计表集/口径/幂等/锁，不是改个路径就行）；
+#        ②为什么这次是"每天自动"而不是"按需手跑"——本链退役的直接理由就是它没有产出却在自动跑。
+# 历史设计说明（退役前口径，保留原文不写成后见之明）：
 # 本地 baostock 每日自动下载 → 上传云端增量脚本（阶段2.1b，设计见 docs/DATA_SYNC_SCRIPT.md）。
 # 背景：云端 baostock IP 被封，数据下载职责迁移到本地——本脚本收盘后依次：
 #   0) 前置检查（ssh 可达 / 本地库存在 / dataload 二进制就绪）

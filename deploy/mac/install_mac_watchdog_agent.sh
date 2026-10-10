@@ -102,6 +102,6 @@ echo "INSTALLED label=com.quant.watchdog script=${WD_HOME}/check_mac_ops_watchdo
 
 if [ "$KICK" = "1" ]; then
   launchctl kickstart "gui/$(id -u)/com.quant.watchdog"
-  echo "KICKED 跑动中：两条腿都是只读（读心跳日志 + 比副本字节），秒级完成，"
+  echo "KICKED 跑动中：四条腿都是只读（读心跳日志 + 比副本字节 + 查退役调度在位性 + 读本地库新度），秒级完成，"
   echo "        读数看 ~/backups/quant/watchdog.log 的 WATCHDOG|overall= 那一行，退出码 0/1/2 三态。"
 fi

@@ -1,15 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- com.quant.watchdog.plist — Mac 自动化日频看门狗（§MAC-WATCHDOG，2026-10-10 新增调度）。
-     语义：每天 11:00 跑 check_mac_ops_watchdog.sh，反查两件事——
+<!-- com.quant.watchdog.plist — Mac 自动化日频看门狗（§MAC-WATCHDOG，2026-10-10 新增调度；
+     §MAC-SYNC-RETIRE，2026-10-11 加第 3、4 条腿）。
+     语义：每天 11:00 跑 check_mac_ops_watchdog.sh，反查四件事——
        ① 备份拉取腿自己的心跳（pull_backup.log 里最新一条「=== 备份成功 ===」距今是否超阈），
           这条是补 §0929DRILL 那台死调度探测器的最后一块：它反查演练与夜间验收，却没人反查它；
-       ② 定时任务稳定副本与仓库源的漂移（调 check_mac_agent_drift.sh 的只读实现，判决在它自己手里）。
+       ② 定时任务稳定副本与仓库源的漂移（调 check_mac_agent_drift.sh 的只读实现，判决在它自己手里）；
+       ③ 已退役的 com.quant.syncdata 不得复活（launchd 里 loaded、或 plist 回到 LaunchAgents 里但没加载，
+          两种都判红——后者下次登录就会被挂回去）；
+       ④ 本地行情库还剩多新（sqlite mode=ro 逐表取 MAX(trade_date) 报年龄）。
+          下载链退役前这面镜子由它每天推；退役后新度不再自动前进是**既定态**，
+          所以缺省 DATA_FRESH_ALERT_DAYS=0＝只出读数不判红，要抬成判红请显式给天数。
      为什么排 11:00：备份拉取腿每天 07:00 与 10:30 两档（§0929DRILL-B 加的第二时点）、夜间验收 09:20、
        恢复演练周日 09:00（封顶 09:40）。11:00 排在**所有**被看对象的当天窗口之后，
        否则拉取腿 10:30 那一档还没跑完就被判"心跳超龄"＝每天早晨一次假红（§107 DRILL-C 那一课：
        阈值与判据必须对齐真实触发日历）。看门狗自己不做任何 restic 动作，不与它们抢排他锁。
-     退出码语义（launchctl list 的 LastExitStatus 就按它读）：0=两条腿都绿；1=有事要人处理；
-       2=探测器读不出（留档解析不了/仓库根不在/探测器自己退 2）——**2 不等于"没问题"**。
+     退出码语义（launchctl list 的 LastExitStatus 就按它读）：0=四条腿都绿；1=有事要人处理；
+       2=探测器读不出（留档解析不了/仓库根不在/探测器自己退 2/launchctl 给不出确定答案/库读不到）——**2 不等于"没问题"**。
      安装/升级一律走 ./install_mac_watchdog_agent.sh -Apply（拷稳定副本 + 装 plist + 重载；
        -Kick 立即补跑一次验证通道活）。
      ⚠️ 与 com.quant.backup 同一条 TCC 教训：ProgramArguments 绝不指 Desktop 仓库路径——

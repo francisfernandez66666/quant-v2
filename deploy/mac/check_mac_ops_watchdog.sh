@@ -32,10 +32,35 @@
 #   QUANT_REPO_ROOT=/path/to/repo deploy/mac/check_mac_ops_watchdog.sh
 #
 # 退出码语义（外层与门禁行为腿都按它分流，"读不出"绝不等"没问题"）：
-#   0 = 两条腿都判 ok（心跳在阈内、副本零漂移）
-#   1 = 至少一条腿判出事（心跳超龄/没有心跳/有副本漂移）——这是**要人处理**的形态
-#   2 = 至少一条腿**读不出**（留档时间戳解析不了、仓库根不存在、探测器自己退 2、日志不可读）
+#   0 = 四条腿都判 ok（心跳在阈内、副本零漂移、退役调度确不在位、库新度读得出）
+#   1 = 至少一条腿判出事（心跳超龄/没有心跳/有副本漂移/退役任务复活）——这是**要人处理**的形态
+#   2 = 至少一条腿**读不出**（留档时间戳解析不了、仓库根不存在、探测器自己退 2、日志不可读、
+#       launchctl 给不出确定答案、本地行情库读不到）
 #       ⇒ 探测器自己坏了不许报"一切正常"（§MAC-DRIFT 的下限退 2 同姿势，本仓反复锤的空 glob 静默空转）
+#
+# ★ 腿 3/4 的由来（§MAC-SYNC-RETIRE，2026-10-11，owner 当面裁"整条停掉"）：
+#   `com.quant.syncdata`（本地 baostock 下载→推送云端）已退役，退役的依据不是"最近老失败"，
+#   而是**它在整机生命周期里一次都没成功过**：
+#     · 该任务自己那份 stdout 留档 168 行里，"云端 max:" 出现 **0 次**、"同步完成" 出现 **0 次**
+#       （第 3 步之后就没往下走过，六步链从未走到第 6 步）；
+#     · 同一份 stderr 里 `sqlite3.OperationalError: unable to open database file` 出现 **21 次**
+#       ＝最近 7 个交易日 × 每次 3 试（脚本自带重试），launchd 侧 `last exit code = 1`；
+#     · 根因在目标机：脚本默认写死的云端数据目录在那台机上**不存在**（只剩一个 8 月 13 日的
+#       `.bak-<epoch>` 残骸，里面装的是另一个应用的配置），`/opt` 下现在的目录属于别的服务，
+#       quant 的服务、二进制、数据目录一概不在——这台机 8 月中旬就改行了，而链路没人下线，
+#       于是每天 15:20 照样起来、照样跑 37 分钟到 6 小时 25 分的真实下载（daily 单轮最长实录），
+#       再照样撞在第 3 步退 1。**烧的是真资源，红的是零人知晓**。
+#   为什么"没人知晓"这一半才是本条要收的东西：这台机上其余五条 quant 调度全都在看门狗或门禁的
+#   覆盖面里，只有这条——`syncdata` 三字在 deploy/mac/*.sh 与 scripts/verify_changes.sh 里
+#   **一次都检索不到**——它每天失败、失败七天、无人被告知。这正是本周刚收口那一族
+#   （有调度、恒失败、无读数）在本机的最后一块，也是它自己而不是被读码想出来的。
+#   所以退役之后**不能只是删掉调度**：删掉之后这条链就什么都没有了，下一个人（或下一次的
+#   install_sync_agent.sh）把它重新挂上时，没人会知道它是被有意停掉的。腿 3 就是把"不许复活"
+#   变成一条每天有人验的判据；腿 4 把"本地行情库还剩多新"变成读数——下载停了，这面镜子
+#   从此只能靠人，而"靠人"必须是个看得见的数，不能是"下次发现时已经停了两个月"
+#   （实录：本机 index_daily 的最大交易日停在 2026-08-17，而同一库的 daily 停在 2026-10-09，
+#    两个数差着近两个月且当时无人知道——本批只把它摆成读数，断更成因另立一批，不混账）。
+
 #
 # 取向三条（都写在读数文案里，别让下一个人重新推）：
 #   - 两种相反成因不共用一个态：「日志里没有成功锚」＝任务跑了但每次都失败（去看失败原因），
@@ -65,6 +90,16 @@ QUANT_REPO_ROOT="${QUANT_REPO_ROOT:-$HOME_DIR/Desktop/quant-trading-v2}"
 DRIFT_SCRIPT="${DRIFT_SCRIPT:-$SELF_DIR/check_mac_agent_drift.sh}"
 
 QUIET="${QUIET:-0}"
+# 腿 3 的两个对象名都可覆盖：退役的那条调度在别的机器/别的标签上，判据要能跟着挪，
+# 而不是把标签写死成第二份来源（写死之后改名的那一天这条腿就恒绿了）。
+SYNC_RETIRE_LABEL="${SYNC_RETIRE_LABEL:-com.quant.syncdata}"
+SYNC_RETIRE_PLIST="${SYNC_RETIRE_PLIST:-$HOME_DIR/Library/LaunchAgents/${SYNC_RETIRE_LABEL}.plist}"
+# 腿 4：本地行情库的新度。默认**只出读数不判红**（DATA_FRESH_ALERT_DAYS=0）——下载链已退役，
+# 新度不再自动前进是**既定态**，把它判成红就等于给一条 owner 有意关掉的链天天发噪声（§107 DRILL-C
+# 那一课：新判据一挂就恒红在待处置面上＝探测器自杀成噪声源）。要抬成判红请显式给天数。
+LOCAL_DB="${LOCAL_DB:-$HOME_DIR/.quant-trading-v2/trading.db}"
+DATA_FRESH_ALERT_DAYS="${DATA_FRESH_ALERT_DAYS:-0}"
+DATA_FRESH_TABLES="${DATA_FRESH_TABLES:-daily,stk_limit,index_daily}"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 line() {
@@ -223,11 +258,153 @@ if [ "$rc_drift" != "0" ]; then
     fi
 fi
 
-# ── 汇总：取两条腿里最坏的语义（2=读不出 > 1=有事 > 0=都好）─────────────────
+# ── 腿 3：已退役调度不得复活（§MAC-SYNC-RETIRE 的第①半：把"有意停掉"变成有人每天验的判据）──
+# 三种"不在位"要分开，因为它们修法相反：
+#   · loaded ＝这次会话里又被挂上去了（有人跑了安装器 / 有人手工 bootstrap）→ 判红并说清是退役链
+#   · plist-in-place 且没加载 ＝文件回来了但还没起来 → **也判红**：下次登录 launchd 就把它挂回去，
+#     而这条链一挂就是每天几十分钟到几小时的真实下载 + 一次必撞的死路，等它自己跑起来才发现太晚。
+#   · launchctl 给不出确定答案（命令本身失败／输出里没有那句"找不到服务"）→ 退 2，
+#     绝不因为"看起来没在跑"就报 ok（读不出≠没复活，这条是本仓所有负向判据的下限）。
+rc_retired=0
+RET_VERDICT=""
+RET_DETAIL=""
+if ! command -v launchctl >/dev/null 2>&1; then
+    RET_VERDICT="probe-broken"
+    RET_DETAIL="本机没有 launchctl 命令——这条腿无从判起（不是「没复活」）"
+    rc_retired=2
+else
+    uid_num="$(id -u 2>/dev/null || true)"
+    if [ -z "$uid_num" ]; then
+        RET_VERDICT="probe-broken"
+        RET_DETAIL="id -u 取不到 uid，print 的域拼不出来（读不出≠没复活）"
+        rc_retired=2
+    else
+        ret_out="$(launchctl print "gui/${uid_num}/${SYNC_RETIRE_LABEL}" 2>&1)"
+        ret_rc=$?
+        if [ "$ret_rc" = "0" ]; then
+            RET_VERDICT="loaded"
+            RET_DETAIL="label=${SYNC_RETIRE_LABEL} 又在调度里了（这条链已于 2026-10-11 退役：目标机改行、六步链从未走通、每天真实下载 37min~6h25m 后恒退 1）"
+            rc_retired=1
+        elif printf '%s' "$ret_out" | grep -qiF "could not find service"; then
+            if [ -f "$SYNC_RETIRE_PLIST" ]; then
+                RET_VERDICT="plist-in-place"
+                RET_DETAIL="本次会话没加载，但 ${SYNC_RETIRE_PLIST} 在位＝下次登录 launchd 会把它挂回去（退役要连 plist 一起摘：改名成 .retired-<日期> 或直接删）"
+                rc_retired=1
+            else
+                RET_VERDICT="absent"
+                RET_DETAIL="launchd 里没有该服务、LaunchAgents 里也没有那份 plist＝退役状态成立"
+            fi
+        else
+            RET_VERDICT="probe-broken"
+            RET_DETAIL="launchctl rc=${ret_rc} 输出里没有那句「找不到服务」，读不出在不在位 line=$(printf '%s' "$ret_out" | tr -d '\r\n' | head -c 120)"
+            rc_retired=2
+        fi
+    fi
+fi
+line "WATCHDOG|retired verdict=$RET_VERDICT label=$SYNC_RETIRE_LABEL detail=$RET_DETAIL"
+if [ "$rc_retired" != "0" ]; then
+    if [ "$rc_retired" = "1" ]; then
+        alert "quant 已退役的行情同步链回到调度里（${RET_VERDICT}）" "$RET_DETAIL 背景：云端目标机 8 月中旬改行，这条链六步从未走通；恢复它之前先确认要推的是哪台机、哪个库" medium
+    else
+        alert "quant 退役链探针自己读不出（${RET_VERDICT}）" "$RET_DETAIL 这条不是「没复活」——是这条判据当前失效，先修判据" high
+    fi
+fi
+
+# ── 腿 4：本地行情库新度只出读数（§MAC-SYNC-RETIRE 的第②半：下载停了，新度变成要靠人的数）──
+# 退役前这面镜子由那条链每天推；退役后本地库不再自动前进，于是"库还剩多新"这件事第一次
+# 需要被**读出来**——本机实录是 daily 到 2026-10-09 而 index_daily 停在 2026-08-17，
+# 差近两个月且当时无人知道。默认 DATA_FRESH_ALERT_DAYS=0＝只读数不判红（见上面 env 处的理由）。
+rc_fresh=0
+FRESH_VERDICT=""
+FRESH_DETAIL=""
+if [ ! -e "$LOCAL_DB" ]; then
+    FRESH_VERDICT="db-absent"
+    FRESH_DETAIL="path=$LOCAL_DB 不存在（读不出新度；研究侧若还要用本地库，这是个真问题）"
+    rc_fresh=2
+elif ! command -v python3 >/dev/null 2>&1; then
+    FRESH_VERDICT="probe-broken"
+    FRESH_DETAIL="本机没有 python3——sqlite 读法无从执行（不是「库是新的」）"
+    rc_fresh=2
+else
+    fresh_out="$(LOCAL_DB="$LOCAL_DB" DATA_FRESH_TABLES="$DATA_FRESH_TABLES" python3 - <<'PYF' 2>/dev/null
+import os, sqlite3, datetime, re
+db = os.environ["LOCAL_DB"]
+tables = [t for t in os.environ.get("DATA_FRESH_TABLES", "").split(",") if t]
+today = datetime.date.today()
+parts = []
+try:
+    # mode=ro：看门狗是纯读数腿，一个字节都不许写；库被别的进程占用时 sqlite 会抛，
+    # 抛了就走下面的 except 落"读不出"，不猜、也不打印半个旧值冒充现值。
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    # ★ 先做一次**根探针**（读 sqlite_master 一条表名），再逐表取 MAX。
+    #   为什么必须有这一步（本批自己拨出来的形态）：把一个不是数据库的文件指进来时,
+    #   sqlite3.connect **不抛**（惰性打开）,异常要等到第一次 execute 才出现——于是逐表的
+    #   `except Exception` 会把"整份文件根本不是库"这张假牌洗成三行 `notable`,
+    #   整条腿退 0 报"读数正常"。这正是本仓最恨的那一族（坏读法冒充好读数,§[xml]"" 不抛同族）。
+    #   根探针只问一句"这是不是一份 sqlite"：它抛＝整份读不出（退 2）；它通过才允许下面
+    #   按表区分"这张表没有/空表"（那是读数,不是腿坏）。
+    conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+    for t in tables:
+        try:
+            v = conn.execute("SELECT MAX(trade_date) FROM %s" % t).fetchone()[0]
+        except Exception:
+            parts.append("%s=notable" % t)
+            continue
+        if not v:
+            parts.append("%s=empty" % t)
+            continue
+        s = str(v)
+        m = re.search(r"(\d{4})\D?(\d{2})\D?(\d{2})", s)
+        if not m:
+            parts.append("%s=unparsable(%s)" % (t, s[:16]))
+            continue
+        d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        parts.append("%s=%s age_d=%d" % (t, s, (today - d).days))
+    conn.close()
+except Exception as e:
+    print("ERR " + type(e).__name__)
+else:
+    print("OK " + " | ".join(parts))
+PYF
+)"
+    case "$fresh_out" in
+        OK\ *)
+            FRESH_VERDICT="read"
+            FRESH_DETAIL="${fresh_out#OK }"
+            # 抬红只在 owner 显式给了天数阈值时才发生：按**最小的那个 age_d** 判（最陈旧的一腿）。
+            if [ "$DATA_FRESH_ALERT_DAYS" != "0" ]; then
+                max_age="$(printf '%s' "$FRESH_DETAIL" | grep -oE 'age_d=[0-9]+' | sed 's/age_d=//' | sort -n | tail -1)"
+                if [ -n "$max_age" ] && awk "BEGIN{exit !($max_age > $DATA_FRESH_ALERT_DAYS)}" 2>/dev/null; then
+                    FRESH_VERDICT="stale"
+                    rc_fresh=1
+                    FRESH_DETAIL="$FRESH_DETAIL 阈值 ${DATA_FRESH_ALERT_DAYS}d（最陈旧一腿 ${max_age}d）"
+                fi
+            fi
+            ;;
+        ERR\ *)
+            FRESH_VERDICT="unreadable"
+            FRESH_DETAIL="path=$LOCAL_DB python3 报 ${fresh_out#ERR }（库在、读不出＝锁/损坏/权限，不是「新度正常」）"
+            rc_fresh=2
+            ;;
+        *)
+            FRESH_VERDICT="probe-broken"
+            FRESH_DETAIL="python3 没给出 OK/ERR 前缀 line=$(printf '%s' "$fresh_out" | tr -d '\r\n' | head -c 120)"
+            rc_fresh=2
+            ;;
+    esac
+fi
+line "WATCHDOG|dbfresh verdict=$FRESH_VERDICT db=$LOCAL_DB alert_days=$DATA_FRESH_ALERT_DAYS detail=$FRESH_DETAIL"
+if [ "$rc_fresh" != "0" ]; then
+    alert "quant 本地行情库新度（${FRESH_VERDICT}）" "$FRESH_DETAIL 读法：sqlite mode=ro 取 MAX(trade_date)；本地下载链已于 2026-10-11 退役，新度要靠手更" high
+fi
+
+# ── 汇总：取所有腿里最坏的语义（2=读不出 > 1=有事 > 0=都好）─────────────────
 rc=0
 [ "$rc_pull" = "1" ] && rc=1
 [ "$rc_drift" = "1" ] && rc=1
-{ [ "$rc_pull" = "2" ] || [ "$rc_drift" = "2" ]; } && rc=2
+[ "$rc_retired" = "1" ] && rc=1
+[ "$rc_fresh" = "1" ] && rc=1
+{ [ "$rc_pull" = "2" ] || [ "$rc_drift" = "2" ] || [ "$rc_retired" = "2" ] || [ "$rc_fresh" = "2" ]; } && rc=2
 
 res="ok"
 [ "$rc" = "1" ] && res="alert"
@@ -237,7 +414,7 @@ res="ok"
 #   所有态都退 1、留档一个字都不写、汇总行永远不出现，而两条腿各自的 WATCHDOG| 行看着全是绿的。
 #   这类"尾巴上的笔误"只能靠**每条行为腿都断言 overall 行在位且留档非空**来拦（§110 的 WD 组就是这么配的），
 #   光看退出码会把它读成"有事"、光看腿级读数会把它读成"没事"。
-DETAIL="pull=$PULL_VERDICT drift=${DRIFT_VERDICT} age_h=${PULL_AGE:-none} topic=${TOPIC_SOURCE}"
+DETAIL="pull=$PULL_VERDICT drift=${DRIFT_VERDICT} retired=${RET_VERDICT} dbfresh=${FRESH_VERDICT} age_h=${PULL_AGE:-none} topic=${TOPIC_SOURCE}"
 line "WATCHDOG|overall=$res rc=$rc $DETAIL"
 # 主题取不到也要在日志里吵一次（只报长度/指纹，永不回显明文）：
 # 看门狗全部的对外价值都在这一条推送上，它哑了和"两条腿都是绿的"在现象上一模一样。

@@ -1,6 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- 本地 baostock 每日自动下载→上传云端（阶段2.3，设计见 docs/DATA_SYNC_SCRIPT.md 第四节）。
+<!-- ⚠⚠ 本调度已于 **2026-10-11 退役**（owner 当面裁「整条停掉」，含每日本地下载那一步）。
+     这份模板**保留只作证据与"知情后重装"的底稿，不是可直接安装的入口**——下面那段"安装"步骤
+     已作废，照抄会把一条已知恒失败的链重新挂回每天 15:20。退役的事实根据写在
+     scripts/sync_delta_to_cloud.sh 头注里（目标机 8 月中旬改行、六步链在整个日志生命周期里
+     一次都没走到第 6 步、每天烧 37 分钟~6 小时 25 分的真实下载后恒退 1、当时不在任何看门狗
+     覆盖面内＝无人被告知）。
+     现在的正规通道只有两条，且都有机器反查：
+       退役/复核退役：./scripts/install_sync_agent.sh -Retire（幂等，bootout + plist 改名留证）
+       默认重装入口：./scripts/install_sync_agent.sh 会**直接退 1 拒绝**，
+                     确要挂回必须显式 SYNC_CHAIN_ARMED=1 并把 SERVER_IP 指到确实跑着 quant 数据面的机器。
+     挂回之后由 deploy/mac/check_mac_ops_watchdog.sh 腿 3 每天反查（loaded / plist-in-place 都判红）。
+     ── 以下为退役前的原文，保留不写成后见之明 ──
+     本地 baostock 每日自动下载→上传云端（阶段2.3，设计见 docs/DATA_SYNC_SCRIPT.md 第四节）。
      安装：
        cp deploy/com.quant.syncdata.plist ~/Library/LaunchAgents/
        # 先改 SERVER_IP 为实际值
