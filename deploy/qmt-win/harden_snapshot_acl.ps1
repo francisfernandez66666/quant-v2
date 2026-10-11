@@ -14,7 +14,7 @@
 #   两个文件；§ENH-5：部署清单漏列执行体）。所以本脚本把收敛做成**可执行、可自检、可回滚**的一步，
 #   并由 verify 探针把"还留着白名单外 ACE"变成判红项，而不是继续当纪律。
 #
-# 四个判据（缺一条这脚本就不该存在）：
+# 五个判据（缺一条这脚本就不该存在）：
 #   ① 动手前先 `icacls /save` 存回滚凭证——存不下来就直接抛，不允许"边试边改"；
 #   ② 收敛后必须**真拨一次入口**：读一个真实存在文件 + 在目标目录写一个自测文件再删掉，
 #      证明没把夜任务（SYSTEM）和 Mac 拉取腿（实测 ssh 身份是本机 administrator，
@@ -27,6 +27,11 @@
 #      -500）的 FullControl 显式 ACE，`-Apply` 跑过两回它都在位，verify 第 31 探针因此一直红着，
 #      红到 10-11 才被当成"owner 待裁"记在账上。当时的说法是"口令文件不越过脚本手工动"，
 #      正确的处置不是留一句手工纪律，而是让脚本具备撤销显式 ACE 的能力（见下面的撤销腿）。
+#   ⑤ **设计里的读数必须能在真机上看到**（10-11 同一晚拨预演时逼出来的第五条）：预演回显只有
+#      `ACL|mode=` 与 `ACL_RESULT|ok=false outside=1`，三条逐目标明细（含刚加的显式/继承两态）一行都没打出来，
+#      因为调用方是 `$r = Report-Target …` 赋值形态、函数自己 Write-Output 的那行被并进返回值。
+#      汇总数走成员枚举照样算得对 ⇒ 判据能红、明细全盲，等于"只报有几条、不报是哪一处"。
+#      所以明细只随返回值交回，由裸语句形态的调用方打印（见 Report-Target 头注与主循环）。
 #
 # 缺省 **只读预演**（不带 -Apply 一个字节都不改），与 rotate_qmt_token.ps1 / decommission 家族同姿势。
 # 只动这三处：快照根、restic 中转仓、restic 口令文件。**不碰** C:\var\lib\quant-trading-v2
@@ -119,16 +124,22 @@ function Get-OutsideKind($path) {
     return "outside_explicit=" + $exp + " outside_inherited=" + $inh
 }
 
-# 预演用：把一条目标的现状打成一行了事，绝不改字节。返回 @{sids;outside;exists} 供汇总判红。
+# 预演用：把一条目标的现状算成一行读数，绝不改字节。返回 @{sids;outside;exists;detail} 供汇总判红+打印。
+# ★ 明细这一行**不许由本函数自己 Write-Output**——调用方是 `$r = Report-Target ...` 赋值形态，
+#   PowerShell 会把函数内所有管线输出并进返回值里。10-11 现网预演实测：`ACL|mode=` 和
+#   `ACL_RESULT|ok=false outside=1` 都打出来了，唯独三条逐目标明细（含本批新加的
+#   outside_explicit / outside_inherited 两态）**一行都没有**，即"预演只报总数、不报是哪一处"
+#   ——本批加这两态就是为了让人在动手前看清形态，读数打不出来等于没加（§装入口必须真拨一次同族：
+#   设计里的读数必须能在真机上看到，否则它只是代码里的一个字符串）。
+#   所以函数只把明细**随返回值**交回，由调用方（裸语句形态，不会被吞）打印。
 function Report-Target($label, $path) {
     if (!(Test-Path $path)) {
-        Write-Output ("ACL|target=" + $label + " state=absent path=" + $path)
-        return $null
+        return @{ exists = $false; sids = @(); outside = @(); detail = ("ACL|target=" + $label + " state=absent path=" + $path) }
     }
     $sids = Get-AceSids $path
     $out = Get-Outside $sids
-    Write-Output ("ACL|target=" + $label + " path=" + $path + " sids=" + ($sids -join ';') + " outside=" + $out.Count + " " + (Get-OutsideKind $path))
-    return @{ sids = $sids; outside = $out; exists = $true }
+    $detail = "ACL|target=" + $label + " path=" + $path + " sids=" + ($sids -join ';') + " outside=" + $out.Count + " " + (Get-OutsideKind $path)
+    return @{ sids = $sids; outside = $out; exists = $true; detail = $detail }
 }
 
 function Protect-Dir($label, $path) {
@@ -201,7 +212,9 @@ $targets = @(
 $outsideTotal = 0
 foreach ($t in $targets) {
     $r = Report-Target $t.label $t.path
-    if ($null -eq $r) { continue }
+    # 明细由这里打：调用方是赋值形态，函数自己 Write-Output 的那行会并进返回值（见 Report-Target 头注）。
+    Write-Output $r.detail
+    if (-not $r.exists) { continue }
     $outsideTotal += $r.outside.Count
     if ($Apply) {
         if ($t.dir) { Protect-Dir $t.label $t.path } else { Protect-Pass $t.label $t.path }

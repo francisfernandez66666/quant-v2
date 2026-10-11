@@ -5523,6 +5523,37 @@ echo "ok - §106 行为腿 8 组 + 离线自证 4 条通过"
 #     改成整串签名才咬住（与上面 heartbeat 那枚"签名整串作锚"同规）。
 #   ok 行的分桶枚数同时从"写死 3 枚/1 枚/2 枚"改成本段正文派生 + 下界 60 枚（§23 同族教训：
 #   枚数写死在文案里，加锁当夜就过时，而"过时却全绿"的文案比没有文案更坏）。
+#   ★ 上面这套锁写完当晚就**上机拨了一次**（只读预演），于是逼出本段的第六组 §ACL-DETAIL：
+#     回显里只有 `ACL|mode=` 与 `ACL_RESULT|ok=false outside=1`，三条逐目标明细（含刚加的
+#     outside_explicit/outside_inherited 两态）一行都没打出来——根因是调用方写 `$r = Report-Target …`
+#     赋值形态，PowerShell 把函数内所有管线输出并进返回值，而汇总数走成员枚举照样算得对
+#     ⇒ **判据能红、明细全盲**。离线锁面看不见这件事（锁只看得见字节，看不见"这行字上不上屏"），
+#     所以这一组锁的形状是"明细交给返回值＋由裸语句调用方打印＋函数体内一行执行态 Write-Output 都不许有"。
+#     教训取向：给读法加读数之后，**必须再拨一次看读数出不出得来**，否则新读数只是代码里的一个字符串。
+#   ★ §ACL-DETAIL 实测（harness=/tmp/aclcp_detail.sh，锁体逐字切出、只换目标路径）：**6 枚新锁基线 GREEN
+#     （CODE=10 行非注释体／WOUT=0／PD_REV=1／PP_REV=1）**，破坏档全部 RED 且红在本枚：改主分支变量名→1、
+#     缺失分支不带 detail→2、删调用方那行→3、判空写法 `$null -eq $r` 回来→4、
+#     **真缺陷形状（函数体内自打＋调用方那行留着）→5（WOUT=1）**、起始锚前缀改名→5（CODE=0）、
+#     结束锚前缀改名→5（WOUT=8，范围一路取到文件末尾）、把口令文件腿的撤销整行原样挪进模块作用域→6
+#     （★ 同一份破坏上，上面那 11 枚老锁 **LOCKS_GREEN CNT107=11 全绿**——"调用共 2 处"与"first/last 顺序"
+#     都只数文件行号，看不见撤销是否还在函数体内；这就是本段加函数体范围锁的全部理由）。
+#   ★ 范围锚这一型本批踩了两条自己的雷，都记在这儿免得下一个人再踩：
+#     ① `/^function Report-Target/` 这种**前缀锚**对 `Report-TargetRenamed` 照样命中＝改名式破坏第三次复发，
+#        必须带到 `(` 的整串签名；
+#     ② 签名里的 `$label` 在 awk 里要写成 `\$label`——本仓跑的是 one-true-awk，模式中间的裸 `$` 不当字面量，
+#        第一版因此**切出 0 行**，基线直接红在下界那句上（下界锁在这里 earned its keep：没有它，
+#        "0 行 Write-Output"看着正好满足负锁判据＝空集自证绿）。
+#   ★ 第三条雷是**门禁自己**的：上面那批新注释把预演实录（含 `ACL_RESULT|ok=false outside=1` 原文）写进
+#     §107 头注与函数头注之后，本段那条锚同一个串的等值锁从 got=1 涨到 got=3，当晚全量回归就红在这一枚上
+#     （FAIL_IDS=107，其余 110 段绿）。这是本仓已知形态"锁的锚点被新写的说明再次命中"的第四次复发，
+#     而且这次红的是**计数锁**而不是负锁——负锁早就有 absent_code107 剥注释，等值锁一直没有对应形。
+#     裁决：新增 eq_code107（剥 # 行后再等值），把这一枚换过去；**不动注释文案**，也不把预演数抬成 3
+#     （抬数＝让锁在一个混着注释的数上绿，真删掉那句回显时只剩 2，照样"看着不对但没人知道差在哪"）。
+#     反证（harness=/tmp/acl_eqc_probe.sh，三档形状各读老/新两形）：
+#       base（现状，注释里两处命中）＝老形 3 RED／新形 1 GREEN；
+#       del_exec（真缺陷：删掉那句执行态回显，注释全留）＝老形 2 RED／**新形 0 RED**（新锁没被放宽成恒绿）；
+#       add_comment（再补一条实录注释）＝老形 4 RED／新形 1 GREEN（本仓鼓励的动作不再撞锁）。
+#     配套：ok 行的分桶派生里补上 B_EQC107——新一形若不进求和，就是"锁在岗而账上看不见"。
 # ════════════════════════════════════════════════════════════════════════════
 echo "==> 107 §0929 恢复演练三条真缺陷 + 定时腿收编 + 休市日心跳 + 快照权限 静态锁与行为腿..."
 
@@ -5551,6 +5582,23 @@ absent_code107() {
 	local got
 	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -c -- "$2" 2>/dev/null || true)
 	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §107 执行行负锁 ${CNT107}（${3}）：${1} 的非注释行里出现「${2}」got=${got}（注释里保留成因是允许的，执行行不行）"; exit 1; }
+}
+# eq_code107：等值锁的执行行版——计数前先剥掉 # 开头的注释行。
+# 为什么本批要新增这一形（10-11 现网预演夜门禁自己报的红，不是猜的）：加固器那条"预演读数能判红"
+#   的等值锁锚的是 `ACL_RESULT|ok=false`，而本批把预演实录写进头注（第五条判据的成因就是"这一行
+#   被打出来了、明细却没打出来"）后，同一个锚在**两条注释**里各命中一次 ⇒ got=3 预演=1 ⇒ §107 段
+#   自己变红。这说明等值锁与说明注释天生冲突，而且**方向不对称**：absent_code107 早就为此剥注释，
+#   等值锁却没剥——于是"把实录写进注释"这个本仓一直鼓励的动作会撞红锁，实际后果就是下一个人不再
+#   写实录注释，或把锁的预演数从 1 抬到 3 让它"绿"（后者更坏：那 3 枚里真缺陷的形状看不见）。
+# 裁决（写在这里，不要再回到改注释文案那条路上）：**计数类判据一律只看执行行**，注释里保留原文
+#   不计入等值数；被删掉的那句执行代码不会因为注释还在就蒙过这条锁（反证：把 Write-Output 那行删了
+#   ⇒ got=0 必红）。反过来，只在注释里出现的锚（本段的「五个判据」「也必须被撤销」）走 has107
+#   的存在锁，那一形本来就不承诺条数，不受本条影响。
+eq_code107() {
+	CNT107=$((CNT107 + 1))
+	local got
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -c -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §107 执行行等值锁 ${CNT107}（${4}）：${1} 的非注释行里模式「${2}」got=${got:-0} 预演=$3（注释命中不计，删执行行必红）"; exit 1; }
 }
 # line_before107：先后顺序锁。本批 DRILL-B 的整个成因就是"两行语句的相对顺序"，
 # 用存在性锁（两段都在文件里）对此完全失明——把它们换个位置照样全绿。
@@ -5671,7 +5719,7 @@ absent_code107 scripts/deploy_guangzhou.sh '\-File .*harden_snapshot_acl' '部�
 eq107 deploy/qmt-win/harden_snapshot_acl.ps1 '\[switch\]\$Apply' 1 '缺省只读预演（不带 -Apply 一个字节不改，与 rotate_qmt_token/decommission 家族同姿势）'
 eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'Protect-Dir' 2 '目录收敛实现（定义 + 调用）'
 eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'Protect-Pass' 2 '口令文件收敛实现（定义 + 调用）'
-eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'ACL_RESULT|ok=false' 1 '预演读数能判红（现网实测 outside>0 时这条命令必红；只回显数不判红就是"永远绿"的观测行）'
+eq_code107 deploy/qmt-win/harden_snapshot_acl.ps1 'ACL_RESULT|ok=false' 1 '预演读数能判红（现网实测 outside>0 时这条命令必红；只回显数不判红就是"永远绿"的观测行）。★ 本批从 eq107 换成 eq_code107：这条判据的正确形状就是"执行行一处"，而本批把预演实录写进头注后，同一锚在注释里另中两行，老形把§107 自己点红（got=3 预演=1）——计数锁与"把成因写进注释"这对矛盾必须按**锁让位、注释保留**来解，否则代价是没人再写实录，或把预演数抬成 3 让锁在含注释的数上变绿（后者更坏：真缺陷的形状就看不见了）'
 eq107 scripts/verify_deploy_guangzhou.sh '第 31 探针' 6 '第 31 探针六处同源（头部清单/可调项/变量定义/param 注释/正文段/结果段）'
 has107 scripts/verify_deploy_guangzhou.sh 'INFO|snapshot_acl_readout' 'ACL 读数恒回显腿在位（绿也要看得到现网到底放开了哪些 SID）'
 
@@ -5693,7 +5741,51 @@ absent_code107 deploy/qmt-win/harden_snapshot_acl.ps1 'S-1-5-21' '撤销清单�
 absent_code107 deploy/qmt-win/harden_snapshot_acl.ps1 '\-500' '执行行不得出现 -500 这类只在这台机上成立的尾号（成因留在注释里是允许的）'
 has107 deploy/qmt-win/harden_snapshot_acl.ps1 '白名单外这条主体翻译不成 SID' '孤儿 ACE（Translate 失败）走拒绝而不是猜主体名——猜错就是把"删不掉"报成"已撤销"'
 eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'outside_explicit=' 1 '预演读数把"白名单外"拆成显式/继承两态（两种态的修法不同，只报总数就看不出手工加过一条显式 ACE）'
-has107 deploy/qmt-win/harden_snapshot_acl.ps1 '也必须被撤销' '四条判据的第四条在说明面上（说明面写了而判据面没接＝本批要治的病）'
+has107 deploy/qmt-win/harden_snapshot_acl.ps1 '也必须被撤销' '五条判据里的第四条在说明面上（说明面写了而判据面没接＝本批要治的病）'
+has107 deploy/qmt-win/harden_snapshot_acl.ps1 '五个判据' '判据清单的条数口径与正文一致（本批从四条涨到五条：加了读数打不打得出这一条，说明面不跟着改就会继续拿旧条数当准数）'
+# ── §ACL-DETAIL（2026-10-11 现网预演逼出的第五条，接着上面的撤销腿）：设计里的读数必须真打得出 ──
+#   拨现网预演（只读）拿到的回显只有 `ACL|mode=` 与 `ACL_RESULT|ok=false outside=1` 两行，
+#   三条逐目标明细——含本批刚加的 outside_explicit / outside_inherited 两态——**一行都没打出来**。
+#   根因不在权限而在 PowerShell 的取值形态：调用方写的是 `$r = Report-Target ...`，赋值形态会把
+#   函数内**所有**管线输出并进返回值，所以函数自己那句 Write-Output 永远不会上屏；
+#   而汇总数 `$outsideTotal += $r.outside.Count` 走的是成员枚举，照样算得对 ⇒ 判据红得下来、
+#   明细看不见，这正是"总数能判红却看不出是哪一处、什么形态"的半瞎态（§装入口必须真拨一次同族：
+#   只有真拨一次才看得见读数到底出不出得来，离线锁面看不见）。
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 '$detail = "ACL|target="' 1 '明细随返回值交回调用方（主分支；明细留在函数体内自打＝现网看不见）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'exists = $false; sids = @(); outside = @(); detail' 1 '缺失分支也交回结构化返回值（旧的 `return $null` 让调用方拿字符串数组当 hashtable 用，判空全靠运气）'
+has107 deploy/qmt-win/harden_snapshot_acl.ps1 'Write-Output $r.detail' '明细由调用方（裸语句形态）打印——这一枚守的是"打得出来"，与上面两枚守的"算得对"是两件事'
+absent_code107 deploy/qmt-win/harden_snapshot_acl.ps1 '$null -eq $r' '赋值形态的判空写法不许回来（$r 是数组时 $null -eq $r 恒假＝缺失目标被当成存在继续往下走）'
+# 派生范围负锁：Report-Target 函数体（非注释行）内一行 Write-Output 都不许有。
+# 范围靠相邻两个函数名切；切空＝"0 行"看起来正好满足判据，所以先锁范围真取到了内容。
+# ★ 两端锚一律带到 `(` 的**整串签名**：只写 `/^function Report-Target/` 时把它改名成
+#   `Report-TargetRenamed` 仍是前缀命中、范围照旧（10-11 反证实测：那种改名下本枚全绿），
+#   本段 ③ 号"改名式破坏"雷在范围锚上第三次复发。
+CNT107=$((CNT107 + 1))
+RT107_BODY=$(awk '/^function Report-Target\(\$label, \$path\)/,/^function Protect-Dir\(\$label, \$path\)/' deploy/qmt-win/harden_snapshot_acl.ps1)
+RT107_CODE=$(printf '%s\n' "$RT107_BODY" | grep -v '^[[:space:]]*#' | grep -c '.' || true)
+RT107_WOUT=$(printf '%s\n' "$RT107_BODY" | grep -v '^[[:space:]]*#' | grep -c 'Write-Output' || true)
+if [ "${RT107_CODE:-0}" -lt 8 ]; then
+	echo "--- FAIL: §107 派生范围锁 ${CNT107}（Report-Target 函数体非注释行只取到 ${RT107_CODE:-0} 枚 < 8）：范围锚漂了，下面那句「体内不许 Write-Output」会拿空集自证绿"
+	exit 1
+fi
+if [ "${RT107_WOUT:-0}" -ne 0 ]; then
+	echo "--- FAIL: §107 派生范围锁 ${CNT107}（Report-Target 体内有 ${RT107_WOUT} 行执行态 Write-Output）：调用方是赋值形态，函数自己打的明细会被并进返回值＝现网只报总数、不报是哪一处（10-11 预演实录）"
+	exit 1
+fi
+# 同一把范围切法再管一件事：**撤销腿必须落在两条收敛腿的函数体内**。
+# 为什么上面那枚"调用共 2 处"的等值锁不够：等值锁只数整文件里的行数，把 Protect-Pass 里那句
+# 挪到主循环（循环前一次性撤销）时总数仍是 2、顺序锁也照旧绿（都是"文件行号比大小"这一型的盲区，
+# 10-11 同日另一批在顺序锁上锤到过同形），而"挪出函数"恰恰会让口令文件那一处不再被撤销。
+# 判据取"每个函数体内各 1 次"，切空＝0 枚直接红（不像负锁那样"0 行刚好满足"，所以不必再补下界）。
+CNT107=$((CNT107 + 1))
+PD107_BODY=$(awk '/^function Protect-Dir\(\$label, \$path\)/,/^\}/' deploy/qmt-win/harden_snapshot_acl.ps1)
+PP107_BODY=$(awk '/^function Protect-Pass\(\$label, \$path\)/,/^\}/' deploy/qmt-win/harden_snapshot_acl.ps1)
+PD107_REV=$(printf '%s\n' "$PD107_BODY" | grep -c 'Revoke-Outside \$path \$bak' || true)
+PP107_REV=$(printf '%s\n' "$PP107_BODY" | grep -c 'Revoke-Outside \$path \$bak' || true)
+if [ "${PD107_REV:-0}" != "1" ] || [ "${PP107_REV:-0}" != "1" ]; then
+	echo "--- FAIL: §107 函数体范围锁 ${CNT107}（目录腿体内撤销 ${PD107_REV:-0} 次／口令文件腿体内 ${PP107_REV:-0} 次，各须 1）：撤销腿被挪出函数或整条失踪＝那条目标还是会留显式 ACE，而文件里两个锚的总数看着是对的"
+	exit 1
+fi
 eq107 scripts/backup_restic_pass_offline.sh 'PASS_VALUE' 5 '口令值只在"取一次→算指纹→落盘"链路里出现（多出的一行＝某处把它送进了输出）'
 absent_code107 scripts/backup_restic_pass_offline.sh 'echo.*PASS_VALUE' '绝不回显口令明文（本仓纪律：凭据只报长度与指纹）'
 eq107 scripts/backup_restic_pass_offline.sh '^chmod 600 ' 2 '离线副本两处执行态 chmod 600（临时文件 / 目标文件）。为什么锚在**行首**并写 2 而不是 3：本行上一版写的是「chmod 600」计数 3，第三处命中其实是文件头那句说明注释——计数锚里混注释＝有人删掉真 chmod 而注释还在时会误判，而注释本来就不该收进"执行处数"的等值里（本仓锁形要与判据同形）。目录侧不收口而是靠 umask 077（下面那枚锁管），所以文案不再谎称"三处 600 含目录"。'
@@ -5741,14 +5833,17 @@ B_ABSC107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*absent_code107 
 B_ORD107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*line_before107 ' || true)
 B_ORDL107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*line_before_last107 ' || true)
 B_WORD107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*word107 ' || true)
-B_SUM107=$(( ${B_EQ107:-0} + ${B_HAS107:-0} + ${B_ABS107:-0} + ${B_ABSC107:-0} + ${B_ORD107:-0} + ${B_ORDL107:-0} + ${B_WORD107:-0} ))
+B_EQC107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*eq_code107 ' || true)
+B_SUM107=$(( ${B_EQ107:-0} + ${B_HAS107:-0} + ${B_ABS107:-0} + ${B_ABSC107:-0} + ${B_ORD107:-0} + ${B_ORDL107:-0} + ${B_WORD107:-0} + ${B_EQC107:-0} ))
 # 下界只防"派生 glob 静默空转"（边界取错／锚被改名 ⇒ 数出个位数还一路绿），10-11 实测 64 枚调用；
 # 新增锁不必回来改这个数，删锁才会红——这正是 §23 那枚下界正锁的取向。
+# ★ 每新增一形锁都要把它加进上面这个求和：本段新立的 eq_code107 若漏加，那一枚锁真在段里干活、
+#   却不在派生读数里出现＝"锁在岗而账上看不见"，与 §MAC-* 那族"有代码无生效"同形。
 if [ "$B_SUM107" -lt 60 ]; then
-	echo "--- FAIL: §107 派生下界锁 ${CNT107}（段内锁调用派生出 ${B_SUM107} 枚 < 下界 60）：等值=${B_EQ107:-0} 存在=${B_HAS107:-0} 负锁=${B_ABS107:-0}/${B_ABSC107:-0} 顺序=${B_ORD107:-0}/${B_ORDL107:-0} 整词=${B_WORD107:-0}——要么锁被批量删掉，要么段边界/锚点漂了"
+	echo "--- FAIL: §107 派生下界锁 ${CNT107}（段内锁调用派生出 ${B_SUM107} 枚 < 下界 60）：等值=${B_EQ107:-0} 执行行等值=${B_EQC107:-0} 存在=${B_HAS107:-0} 负锁=${B_ABS107:-0}/${B_ABSC107:-0} 顺序=${B_ORD107:-0}/${B_ORDL107:-0} 整词=${B_WORD107:-0}——要么锁被批量删掉，要么段边界/锚点漂了"
 	exit 1
 fi
-echo "ok - §107 静态锁 ${CNT107} 道通过（本段正文派生：等值 ${B_EQ107} ＋存在 ${B_HAS107} ＋键名形态负锁 ${B_ABS107} ＋执行行负锁 ${B_ABSC107} ＋先后顺序 ${B_ORD107}+${B_ORDL107}（first／last 两型）＋整词 ${B_WORD107} ＝ ${B_SUM107} 枚调用，另含段边界与派生下界各一枚）"
+echo "ok - §107 静态锁 ${CNT107} 道通过（本段正文派生：等值 ${B_EQ107} ＋执行行等值 ${B_EQC107} ＋存在 ${B_HAS107} ＋键名形态负锁 ${B_ABS107} ＋执行行负锁 ${B_ABSC107} ＋先后顺序 ${B_ORD107}+${B_ORDL107}（first／last 两型）＋整词 ${B_WORD107} ＝ ${B_SUM107} 枚调用，另含段边界与派生下界各一枚）"
 
 # ── 行为腿（全部离线，零写入、零外呼）────────────────────────────────────────
 # 为什么这一段必须有**假产物**腿：DRILL-A/B/C 三条全都是"脚本写得完整但从没真跑过"，
