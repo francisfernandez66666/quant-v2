@@ -821,7 +821,239 @@ if bad:
     print("\n".join(bad))
     sys.exit(1)
 PY
-echo "ok - 静态守卫 9/9 通过（产物指纹 5 + 停服兜底 3 + 变量名吞噬全仓扫描 1）"
+# ④ §DEP-PAUSE（2026-10-11 部署实录）：部署停机窗口与常驻看门狗互斥——部署侧静态锁。
+#   实录：quant-all-wd（15 秒一轮）在 07:10:40/07:10:44 把本轮 [2/5] 为释放 exe 文件锁停掉的
+#   quant、quant-research 判 DOWN 并 RESTART，抢在 scp 之前把 researchd.exe/research.exe 的句柄
+#   占回去 ⇒ 五份二进制被劈成两半（quant/dataload/qmtctl 已新版、两份还是旧版），而当时的验收面
+#   只看 quant 的 buildCommit，混合半态无人可见。修法与全部依据见 deploy_guangzhou.sh 的 §DEP-PAUSE 头注。
+grep -q 'set_deploy_pause_flag' "$dg" || { echo "--- FAIL: §DEP-PAUSE 立牌函数不在位（部署又会裸停服，看门狗 15 秒抢回）"; exit 1; }
+grep -q 'finalize_deploy_pause_flag' "$dg" || { echo "--- FAIL: §DEP-PAUSE 收牌腿不在位（牌立了就没人撤＝无限期免检）"; exit 1; }
+# 到期时刻必须由**现网自己的时钟**算：拿本机 date 算牌，两台钟一不同步就会出现"我这边还有效、
+# 那边已经过期"（或反向）的免检窗口；这一条与"读法要用运行时真实取值链"同规。
+grep -q 'ToUnixTimeSeconds' "$dg" || { echo "--- FAIL: §DEP-PAUSE 的到期时刻不是现网时钟算的（缺 ToUnixTimeSeconds）"; exit 1; }
+if grep -qE '\$\(date \+%s\)' "$dg"; then echo "--- FAIL: §DEP-PAUSE 不得用本机时钟算牌期（Mac 与现网不同步时牌的有效窗口就是错的）"; exit 1; fi
+# 牌名两侧必须**等值**：写牌方是 bash（路径＝$DEPLOY_DIR/<牌名>），认牌方是 PS5.1（路径＝单源里的
+#   Join-Path $SvcDeployDir "<牌名>"）。两边各写一份牌名时部署立的牌看门狗永远读不到，互斥形同虚设，
+#   而且两侧各自看都自洽——正是今天这次事故的形状（谁都没错，缺的是中间那根判据）。
+#   头注里"门禁钉着"这句话从本批起真的有钉子了：这里按**结果**比 basename，不比排版、不比整串。
+S23_DEFS_PS1=deploy/qmt-win/service_definitions.ps1
+S23_FLAG_DEFS=$(grep 'SvcDeployPauseFlag *=' "$S23_DEFS_PS1" | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+S23_FLAG_BASH=$(grep '^DEPLOY_PAUSE_FLAG=' "$dg" | head -1 | sed -E 's#.*[^/]*/##; s#[^A-Za-z0-9._-].*$##' || true)
+if [ -z "$S23_FLAG_DEFS" ] || [ "$S23_FLAG_BASH" != "$S23_FLAG_DEFS" ]; then
+	echo "--- FAIL: §DEP-PAUSE 牌名两侧不等值（看门狗单源='${S23_FLAG_DEFS}' 部署侧='${S23_FLAG_BASH}'）＝立的牌没人认，停机窗口照旧被抢回"
+	exit 1
+fi
+# 目录那一半诚实交底：两侧各自的目录来自各自的单源变量（$SvcDeployDir / $DEPLOY_DIR），跨语言没法在这一段里
+# 证等值；牌名不同才是"必然读不到"的那一类，所以本枚只管牌名，目录现值等值由部署第 [2/5] 的回读腿实证。
+# 顺序锁 1：立牌必须在停服**之前**，且立牌失败就地中止（"先停了再说"等于把文件锁交给一场抢停）
+S23_SET_LN=$(grep -n '^if ! set_deploy_pause_flag; then' "$dg" | head -1 | cut -d: -f1 || true)
+S23_STOP_LN=$(grep -n 'net stop quant; net stop quant-research' "$dg" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1 || true)   # 注释行里也写这句（头注描述停机段），不排除就取到注释号、顺序锁恒红
+if [ "${S23_SET_LN:-0}" -le 0 ] || [ "${S23_STOP_LN:-0}" -le 0 ] || [ "$S23_SET_LN" -ge "$S23_STOP_LN" ]; then
+	echo "--- FAIL: §DEP-PAUSE 顺序锁（立牌调用点=${S23_SET_LN} net stop 点=${S23_STOP_LN}，要求前者存在且更早）"
+	exit 1
+fi
+# 顺序锁 2：收牌必须挂在 EXIT 兜底里（部署任何一步失败、包括被 Ctrl-C，都要走撤牌或交底）
+S23_FIN_LN=$(grep -n '^  finalize_deploy_pause_flag' "$dg" | head -1 | cut -d: -f1 || true)
+S23_TRAP_LN=$(grep -n 'trap restore_services_on_exit EXIT' "$dg" | head -1 | cut -d: -f1 || true)
+if [ "${S23_FIN_LN:-0}" -le 0 ] || [ "${S23_TRAP_LN:-0}" -le 0 ] || [ "$S23_FIN_LN" -ge "$S23_TRAP_LN" ]; then
+	echo "--- FAIL: §DEP-PAUSE 收牌没挂在停服兜底的路径上（撤牌点=${S23_FIN_LN} trap 点=${S23_TRAP_LN}）"
+	exit 1
+fi
+# 撤牌前必须先确认引擎真就绪：引擎加载 5GB 库期间 /setup 不答话，此刻撤牌等于让看门狗把
+# "正在启动"判成 DOWN 并 restart——那是把今天的抢停换个方向再犯一次。probe 三处引用＝1 定义 + 2 调用。
+if [ "$(grep -c 'probe_engine_ready' "$dg")" != "3" ]; then
+	echo "--- FAIL: §DEP-PAUSE 引擎就绪探针引用数不是 3（定义 1＋finalize 内 2 用；实得 $(grep -c 'probe_engine_ready' "$dg")）＝撤牌前不再等就绪"
+	exit 1
+fi
+# ⑤ §DEP-FACE：待部署二进制清单必须是**一处定义、三处消费**（编译／scp／逐份对照）。
+#   写死五份名字的清单式锁是本仓锤过的失明形态，而这里少写一个不报错，只让那一份既不上新、
+#   也不在对照读数面上——混合半态就此重新隐形。
+if [ "$(grep -c '^DEPLOY_BINS=' "$dg")" != "1" ]; then
+	echo "--- FAIL: §DEP-FACE 二进制清单定义不是恰好一处（实得 $(grep -c '^DEPLOY_BINS=' "$dg")＝抄了第二份清单，改一处漏一处）"
+	exit 1
+fi
+if [ "$(grep -c 'quant researchd dataload research qmtctl' "$dg")" != "1" ]; then
+	echo "--- FAIL: §DEP-FACE 五个名字在文件里出现不止一次＝某处又开始自己列清单（该走 DEPLOY_BINS）"
+	exit 1
+fi
+grep -q 'for _b in $DEPLOY_BINS' "$dg" || { echo "--- FAIL: §DEP-FACE 编译/上传没走派生清单"; exit 1; }
+# 现网侧读法：certutil 表头随码页变、nssm 那族还往 stdout 写 UTF-16 ⇒ 同一行里必须既取 SHA256 又剥 NUL/CR
+grep -qE 'certutil -hashfile.*SHA256.*tr -d' "$dg" || { echo "--- FAIL: §DEP-FACE 远端哈希读法缺 NUL/CR 剥离或没走 SHA256（排版假设＝10-10 UTF-16 同族）"; exit 1; }
+# 锚点写成窄形 `c1-12` 而不是 `cut -c1-12`：§111 那枚"门禁正文不许按字节截断"的负锁扫的是**代码行**，
+# 它分不清"这里在执行截断"与"这里只是把截断方式当被钉的字面量抄了一遍"。10-10 的 `'cut -c1-200'`
+# 等值锁就是这样红报在 §111 名下（见该段 ②c 的说明），当时的裁决同样是**改窄锚、不开豁免口**——
+# 豁免口一旦存在，"这条截断其实在执行态"就无处可查了。截断方式本身另有两枚锁钉着：
+# 同段 `certutil … tr -d` 那枚管"剥 NUL/CR 后再取数"，下面的两条 DIFF 文案锁管"只报前缀不报全串"。
+if [ "$(grep -c 'c1-12' "$dg")" != "2" ]; then
+	echo "--- FAIL: §DEP-FACE 哈希前缀读数不是 2 处（待部署/现网各一；实得 $(grep -c 'c1-12' "$dg")＝要么全串外泄要么单边可比）"
+	exit 1
+fi
+grep -q 'X face=${_f} DIFF' "$dg" || { echo "--- FAIL: §DEP-FACE 缺逐份 DIFF 点名行（半态必须能归因到具体哪几份）"; exit 1; }
+# 上传失败必须**先收码、把读数跑完再中止**：`set -e` 下裸 scp 会在逐份对照之前把整场部署带走，
+# 于是"到底哪几份没落地"这条唯一归因证据永远打印不出来，只剩一句没有尺寸的"部署失败了"
+# （10-11 实录就是靠那四行点的名：quant/dataload/qmtctl 已新版，researchd/research 还是旧版）。
+grep -q '|| scp_rc=\$?' "$dg" || { echo "--- FAIL: §DEP-FACE 的 scp 上传没收码（set -e 抢在逐份读数之前中止＝混合半态重新隐形）"; exit 1; }
+grep -q 'scp_rc:-0' "$dg" || { echo "--- FAIL: §DEP-FACE 中止文案不读 scp 返回码（分不清「没传上去」与「传上去又被旧句柄挡回」）"; exit 1; }
+S23_FACE_LN=$(grep -n '^FACE_BAD=0' "$dg" | head -1 | cut -d: -f1 || true)
+S23_ABORT_LN=$(grep -n '二进制面混合半态' "$dg" | head -1 | cut -d: -f1 || true)
+if [ "${S23_FACE_LN:-0}" -le 0 ] || [ "${S23_ABORT_LN:-0}" -le 0 ] || [ "$S23_ABORT_LN" -le "$S23_FACE_LN" ]; then
+	echo "--- FAIL: §DEP-FACE 顺序锁（读数起点=${S23_FACE_LN} 中止文案=${S23_ABORT_LN}，要求起点更早）"
+	exit 1
+fi
+# ⑥ §DEP-PAUSE／§DEP-FACE 行为腿：两块代码都从真脚本**切出来跑**（夹具不留第二份实现），
+#   桩只替换 ssh 的远端应答；末两条是摘锁反证——摘掉后必须"变绿"，否则说明腿根本没在拦。
+S23="$(mktemp -d /tmp/gate23-deppause-XXXXXX 2>/dev/null || true)"   # 刻意不读 TMPDIR 变量：门禁可能在 env 精简的定时器下跑，set -u 下未定义即中止
+rm -rf "$S23"; mkdir -p "$S23/local" "$S23/remote"
+if [ ! -d "$S23/local" ]; then echo "--- FAIL: §DEP-PAUSE 行为腿夹具目录建不出来（S23='$S23'）——没有夹具这些腿等于没跑"; exit 1; fi
+# 切块用"停止打印"而不是 exit：第二段 awk 一 exit，第一段 `,0` 还要往管道里写到 EOF（部署脚本
+# 剩下的整千行）⇒ SIGPIPE＋pipefail ⇒ 整段以 141 静默中止，红得不带一句 FAIL（本次夹具锤出）。
+awk '/^DEPLOY_PAUSE_TTL_S=/,0' "$dg" | awk '/^restore_services_on_exit\(\)/{f=1} !f' > "$S23/defs.sh"
+if [ "$(grep -c 'set_deploy_pause_flag()' "$S23/defs.sh")" != "1" ] || [ "$(grep -c 'clear_deploy_pause_flag()' "$S23/defs.sh")" != "1" ]; then
+	echo "--- FAIL: §DEP-PAUSE 行为腿切块失败（defs.sh 里立牌/撤牌函数定义数不为 1＝锚行漂了，先修脚本别改锁）"
+	exit 1
+fi
+eval "$(grep -m1 '^DEPLOY_BINS=' "$dg")"   # 清单从真源派生，夹具不抄第二份
+awk '/^FACE_BAD=0$/,/^fi$/' "$dg" | sed "s#/tmp/#$S23/local/#g" > "$S23/face.sh"   # 只换本地字节所在目录
+S23_FACE_LN2=$(wc -l < "$S23/face.sh" | tr -d ' ')
+if [ "${S23_FACE_LN2:-0}" -lt 15 ]; then
+	echo "--- FAIL: §DEP-PAUSE 行为腿的 face 块只切出 ${S23_FACE_LN2} 行（锚行漂了，读数不可信）"
+	exit 1
+fi
+# ssh 桩：按命令片段分派，牌内容/回读形状/引擎应答由 S23CASE 一句话定一个态
+s23_stub_ssh() {
+  case "$1" in
+    *WriteAllText*)
+      case "$S23CASE" in
+        stale) echo "$(( $(date +%s) - 5 ))|sha=old reason=residual" > "$S23DIR/fake.flag" ;;
+        *) echo "$(( $(date +%s) + 900 ))|sha=abc1234 reason=deploy-window" > "$S23DIR/fake.flag" ;;
+      esac
+      return 0 ;;
+    *Test-Path*Get-Content*)
+      case "$S23CASE" in
+        missing) echo "MISSING" ;;
+        garbage) echo "not-a-number|sha=x|$(date +%s)" ;;
+        *) printf '%s|%s\n' "$(cat "$S23DIR/fake.flag" 2>/dev/null)" "$(date +%s)" ;;
+      esac
+      return 0 ;;
+    *Remove-Item*) rm -f "$S23DIR/fake.flag"; return 0 ;;
+    *Test-Path*)
+      if [ "$S23CASE" = "still-present" ]; then echo PRESENT; else echo MISSING; fi
+      return 0 ;;
+    *Invoke-WebRequest*)
+      if [ "$S23CASE" = "notready" ]; then echo ERR; else echo 200; fi
+      return 0 ;;
+    *certutil*)
+      S23_F=$(printf '%s' "$1" | sed -E 's#.*hashfile [^ ]*/([^/]+)\.exe.*#\1#')
+      printf 'CertUtil 哈希报告\r\n%s\r\n完成\r\n' "$(cat "$S23DIR/remote/$S23_F.exe" 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+      return 0 ;;
+    *) return 0 ;;
+  esac
+}
+# 夹具写法（本块六处一律如此，别改回反斜杠续行）：`\`＋换行在 "$( … )" 的双引号内会被**合并成一行**，
+# 于是 `S23DIR=… ssh() {` 粘在同一条命令里 ⇒ bash 报 syntax error near unexpected token `('——
+# /tmp 夹具里分行写跑通、搬进门禁同一块恒红，差别就在这条续行符；直接换行才是真分隔。
+s23_run() {   # $1=case $2=期望rc $3=断言子串 $4=说明  —— 跑 set_deploy_pause_flag 一条腿
+  S23_OUT="$( ( DEPLOY_DIR="C:/opt/quant" GIT_SHA="abc1234" SSH="ssh" S23CASE="$1" S23DIR="$S23"
+                ssh() { s23_stub_ssh "$@"; } ; . "$S23/defs.sh"; set_deploy_pause_flag ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+  if [ "$S23_RC" != "$2" ] || ! printf '%s' "$S23_OUT" | grep -qF "$3"; then
+    echo "--- FAIL: §DEP-PAUSE 腿 $4（期望 rc=$2 含「$3」，实得 rc=${S23_RC}，输出=$(printf '%s' "$S23_OUT" | head -2 | tr '\n' ' ')）"
+    exit 1
+  fi
+  CNT23=$((CNT23 + 1))
+}
+CNT23=0
+s23_run ok 0 "回读确认还有效" "P1 立牌并回读到有效牌"
+s23_run stale 1 "立牌未成功或回读不可信" "P2 上一场的过期残牌不得冒充立牌成功（夹具逼出：只验是不是数字会假绿）"
+s23_run missing 1 "立牌未成功或回读不可信" "P3 写不进现网 ⇒ 绝不停服"
+s23_run garbage 1 "立牌未成功或回读不可信" "P4 回读形状不认识 ⇒ 当不可信处理"
+# F1 引擎就绪 ⇒ 撤牌并回读确认
+S23_OUT="$( ( DEPLOY_DIR="C:/opt/quant" GIT_SHA="abc1234" SSH="ssh" S23CASE="ok" S23DIR="$S23"
+              ssh() { s23_stub_ssh "$@"; } ; . "$S23/defs.sh"
+              PAUSE_FLAG_SET=1; clear_deploy_pause_flag ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+if [ "$S23_RC" != "0" ] || ! printf '%s' "$S23_OUT" | grep -qF '已撤并回读确认'; then
+	echo "--- FAIL: §DEP-PAUSE 腿 F1（引擎就绪必须撤牌并回读；实得 rc=${S23_RC} 输出=$(printf '%s' "$S23_OUT" | head -2 | tr '\n' ' ')）"
+	exit 1
+fi
+CNT23=$((CNT23 + 1))
+# F2 撤不掉要**喊出来**，不许静默（牌会在 TTL 后自失效，但人得知道这几天/几分钟监督不动手）
+S23_OUT="$( ( DEPLOY_DIR="C:/opt/quant" GIT_SHA="abc1234" SSH="ssh" S23CASE="still-present" S23DIR="$S23"
+              ssh() { s23_stub_ssh "$@"; } ; . "$S23/defs.sh"
+              PAUSE_FLAG_SET=1; clear_deploy_pause_flag ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+if ! printf '%s' "$S23_OUT" | grep -qF '撤牌后仍读到牌在位'; then
+	echo "--- FAIL: §DEP-PAUSE 腿 F2（撤牌失败必须落一行可见读数；实得 rc=${S23_RC} 输出=$(printf '%s' "$S23_OUT" | head -2 | tr '\n' ' ')）"
+	exit 1
+fi
+CNT23=$((CNT23 + 1))
+# F3 引擎没就绪 ⇒ **保留牌**并交底（撤了等于让看门狗在加载期重启引擎）
+S23_OUT="$( ( DEPLOY_DIR="C:/opt/quant" GIT_SHA="abc1234" SSH="ssh" S23CASE="notready" S23DIR="$S23"
+              ssh() { s23_stub_ssh "$@"; } ; . "$S23/defs.sh"
+              echo x > "$S23/fake.flag"; PAUSE_FLAG_SET=1; DEPLOY_PAUSE_WAIT_TRIES=1; finalize_deploy_pause_flag ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+if [ ! -f "$S23/fake.flag" ] || ! printf '%s' "$S23_OUT" | grep -qF '保留静默牌'; then
+	echo "--- FAIL: §DEP-PAUSE 腿 F3（引擎未就绪时牌必须仍在位并交底；实得 rc=${S23_RC} 牌在位=$([ -f "$S23/fake.flag" ] && echo yes || echo no) 输出=$(printf '%s' "$S23_OUT" | head -2 | tr '\n' ' ')）"
+	exit 1
+fi
+CNT23=$((CNT23 + 1))
+# FA 逐份同源全等 ⇒ 五行 same、不中止；FB 一份旧字节＋一份现网缺失 ⇒ 点名 DIFF 并中止
+for b in $DEPLOY_BINS; do echo "bytes-$b" > "$S23/local/$b.exe"; cp "$S23/local/$b.exe" "$S23/remote/$b.exe"; done
+s23_face() {   # $1=face 脚本 $2=期望rc $3=断言子串 $4=说明（S23_SCPRC＝替 scp 收码读数，默认 0）
+  S23_OUT="$( ( DEPLOY_DIR="C:/opt/quant" SSH="ssh" S23CASE="face" S23DIR="$S23" scp_rc="${S23_SCPRC:-0}"
+                ssh() { s23_stub_ssh "$@"; } ; . "$1" ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+  if [ "$S23_RC" != "$2" ] || ! printf '%s' "$S23_OUT" | grep -qF "$3"; then
+    echo "--- FAIL: §DEP-FACE 腿 $4（期望 rc=$2 含「$3」，实得 rc=${S23_RC}，输出=$(printf '%s' "$S23_OUT" | head -3 | tr '\n' ' ')）"
+    exit 1
+  fi
+  CNT23=$((CNT23 + 1))
+}
+s23_face "$S23/face.sh" 0 "face=quant same" "FA 五份字节全同源 ⇒ 不中止"
+echo "OLD-BYTES" > "$S23/remote/research.exe"; rm -f "$S23/remote/qmtctl.exe"
+s23_face "$S23/face.sh" 1 "face=qmtctl DIFF" "FB 一份旧字节＋一份缺失 ⇒ 点名并中止（混合半态不许静默）"
+# FC 半态**且**上传有失败项（今天的真实现场）⇒ 除了点名差异，还要把 scp 的返回码一起交底：
+# 只说"这几份不同"分不清是没传上去、还是传上去又被抢回来的句柄挡回。
+# 显式赋值而不是 `VAR=x func` 前缀：bash 对"前缀赋值是否在函数返回后仍生效"与 POSIX 不一致，
+# 靠它给 FD 复位会读出壳依赖的假绿（本段后面 MUT1 也要回到"无失败码"那一态）。
+S23_SCPRC=5
+s23_face "$S23/face.sh" 1 "本轮 scp rc=5" "FC 上传失败码必须进中止读数（收码腿的意义就在这行字上）"
+# FD 同一份破坏、scp rc 回 0 ⇒ 那句失败码读数必须**不出现**（否则 FC 绿在"任何情况下都打印"上）
+S23_SCPRC=0
+s23_face "$S23/face.sh" 1 "face=qmtctl DIFF" "FD scp 全成功时的半态 ⇒ 只点名差异，不谎报上传失败"
+if printf '%s' "$S23_OUT" | grep -qF '本轮 scp rc='; then
+	echo "--- FAIL: §DEP-FACE 腿 FD（scp rc=0 时仍打印失败码读数＝FC 那条读数恒真，归因不可信）"
+	exit 1
+fi
+# FD 的计数已在 s23_face 内自增，这里不再 +1（否则下界就不是"腿数"而是"腿数＋1"了）
+# 摘锁反证 1：把 face 块的中止摘掉 ⇒ FB 必须"变绿"（说明 DIFF→exit 这条腿真在拦）
+sed 's/^  exit 1$/  true/' "$S23/face.sh" > "$S23/face_mut1.sh"
+if cmp -s "$S23/face.sh" "$S23/face_mut1.sh"; then
+	echo "--- FAIL: §DEP-FACE 摘锁反证 1 没改动任何字节（锚行漂了，这条绿是假绿）"
+	exit 1
+fi
+s23_face "$S23/face_mut1.sh" 0 "face=qmtctl DIFF" "MUT1 摘掉 DIFF 中止 ⇒ 同一破坏不再拦下＝证明 FB 的绿来自那条 exit"
+# 摘锁反证 2：把"至少晚 60s"摘成恒真 ⇒ 过期残牌必须被认成立牌成功（说明 P2 的绿来自那条时间校验）
+sed 's/-ge 60/-ge -999999999/' "$S23/defs.sh" > "$S23/defs_mut2.sh"
+if cmp -s "$S23/defs.sh" "$S23/defs_mut2.sh"; then
+	echo "--- FAIL: §DEP-PAUSE 摘锁反证 2 没改动任何字节（锚行漂了）"
+	exit 1
+fi
+S23_OUT="$( ( DEPLOY_DIR="C:/opt/quant" GIT_SHA="abc1234" SSH="ssh" S23CASE="stale" S23DIR="$S23"
+              ssh() { s23_stub_ssh "$@"; } ; . "$S23/defs_mut2.sh"; set_deploy_pause_flag ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+if [ "$S23_RC" != "0" ]; then
+	echo "--- FAIL: §DEP-PAUSE 摘锁反证 2 期望变绿（rc=0）实得 rc=${S23_RC}＝那条 60s 校验不是 P2 拦下来的原因，判据归属说了假话"
+	exit 1
+fi
+CNT23=$((CNT23 + 1))
+rm -rf "$S23"
+# 段内锁数派生自本段自己的锁/断言行（ok 行原来写的"20/20"是**当年这段的段号**，段号早已漂到 23；
+# 括号里那份"5+3+…"也是写死的，本批加完 §DEP-PAUSE/§DEP-FACE 后实数不是 6+5——写死的计数就是第二条
+# 需要被人记得的数字，改成派生 + 下界正锁：整族被删即红，新增不必改文案）。
+LOCKS23="$(awk '/^echo "==> 23\//{f=1} /^echo "ok - /{f=0} f && /^(test -[ef]|grep|if grep|if \[|python3 - )/' scripts/verify_changes.sh | wc -l | tr -d ' ')"
+if [ "${LOCKS23:-0}" -lt 25 ]; then echo "--- FAIL: 门禁 §23 锁数派生读数=${LOCKS23}（不足 25＝段内有锁被删、改名或整体缩进，派生 ok 行会失去意义）"; exit 1; fi
+# 行为腿条数下界：P1–P4(4)＋F1–F3(3)＋FA–FD(4)＋两枚摘锁反证(2)＝13。每加一条腿只抬下界，
+# 少一条即红—— CNT23 只在真跑到断言时才自增，所以"切块锚行漂了""腿被注释掉"都会在这里现形。
+if [ "${CNT23:-0}" -lt 13 ]; then
+	echo "--- FAIL: 门禁 §23 行为腿实跑 ${CNT23:-0} 条（不足 13＝有腿没走到或被删，静态锁全绿也不算这段过了）"
+	exit 1
+fi
+echo "ok - 门禁 §23 通过（列 0 锁/断言行 ${LOCKS23} 道：§A7-B 产物指纹 + §A7-C 停服兜底 + 变量名吞噬扫描 + §DEP-PAUSE/§DEP-FACE 部署侧与夹具守卫）＋行为腿 ${CNT23} 条（P1–P4／F1–F3／FA–FD／两枚摘锁反证）"
 
 echo "==> 24/24 §FIX-20260920 数据管道修复批专项（THS 单域熔断 + 东财 f62 主站信任 + 板块列表镜像分页 + EM-FFLOW 真值口径 + THS-KLINE 5分钟 + QUOTE-CHAIN 同花顺首选源）..."
 # A THS 单域熔断（per-operation isolation）：分钟 K 不支持档位不得误伤其他域；空 op 是 no-op；
@@ -1102,7 +1334,37 @@ grep -qF "replace '\\x00', ''" deploy/qmt-win/all_service_watchdog.ps1 || { echo
 grep -qF 'SERVICE_[A-Z_]+' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §H8 nssm 状态读法缺「读出别的状态词＝确实没在跑」分支（剥完 NUL 只认 RUNNING 的话，STOPPED 会被当成读不出而落 SCM，真停服反而漏报）"; exit 1; }
 grep -qF '$st = (Get-Service -Name $name' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §H8 nssm 状态读不出时的 SCM 兜底腿不在位（fail 方向必须是往 SCM 落而不是往 DOWN 判＝10-10 事故的反面）"; exit 1; }
 if grep -qF 'return ($out -match "SERVICE_RUNNING")' deploy/qmt-win/all_service_watchdog.ps1; then echo "--- FAIL: §H8 坏形态复活（对夹 NUL 原文直接匹配后 return＝四腿恒 DOWN，10-10 首拨把健康服务连环重启）"; exit 1; fi
-echo "ok - §H8/§F6 专项守卫通过（静态锁 12 道）"
+# ★ §DEP-PAUSE（2026-10-11 现网实录）：常驻看门狗与部署停机窗口互斥——认牌腿。
+#   当日实录：部署 [2/5] 为释放 exe 文件锁 net stop quant / quant-research，本守护 15 秒一轮，
+#   抢在 scp 之前把刚停的两条判 DOWN 并 nssm restart（watchdog_all.log 07:10:40~44 四行），
+#   researchd.exe/research.exe 被重新锁住 ⇒ scp "dest open Failure" ⇒ 五份二进制一半新一半旧，
+#   而验收脚本只比 quant 的 buildCommit ⇒ 混合半态当时不可见。修法＝部署链立"到期 Unix 秒"牌、
+#   看门狗有牌时本轮只读数不动手、牌路径单源、fail 方向一律"按无牌处理，监督照常"。
+#   本机没有 pwsh/powershell ⇒ 这一面只能静态锁；行为实证走下一次真部署窗口（RUNBOOK §4.1b.24）。
+grep -q 'function Get-DeployPauseDeadline' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §DEP-PAUSE 看门狗侧认牌函数不在位（只有部署链立牌、没人认牌＝牌是装饰品）"; exit 1; }
+grep -qF '$SvcDeployPauseFlag = Join-Path' deploy/qmt-win/service_definitions.ps1 || { echo "--- FAIL: §DEP-PAUSE 牌路径未落 service_definitions 单源（写到 A 处、去看 B 处＝互斥静默失效）"; exit 1; }
+flag_name_ps="$(sed -n 's/^\$SvcDeployPauseFlag = Join-Path \$SvcDeployDir "\([^"]*\)".*/\1/p' deploy/qmt-win/service_definitions.ps1 | head -1)"
+flag_name_sh="$(sed -n 's/^DEPLOY_PAUSE_FLAG="\${DEPLOY_PAUSE_FLAG:-\$DEPLOY_DIR\/\([^"]*\)}".*/\1/p' scripts/deploy_guangzhou.sh | head -1)"
+[ -n "$flag_name_ps" ] && [ -n "$flag_name_sh" ] && [ "$flag_name_ps" = "$flag_name_sh" ] || { echo "--- FAIL: §DEP-PAUSE 牌名两侧不等值（单源读法断腿）：看门狗侧='${flag_name_ps}' 部署侧='${flag_name_sh}'"; exit 1; }
+if grep -qF 'deploy_pause.flag' deploy/qmt-win/all_service_watchdog.ps1; then echo "--- FAIL: §DEP-PAUSE 看门狗里出现字面牌名（牌名必须只从 service_definitions 单源解析，抄第二份就会分叉）"; exit 1; fi
+pause_open="$(grep -nF 'if ($pauseDeadline) {' deploy/qmt-win/all_service_watchdog.ps1 | head -1 | cut -d: -f1 || true)"
+loop_open="$(grep -nF 'foreach ($svc in $Services) {' deploy/qmt-win/all_service_watchdog.ps1 | head -1 | cut -d: -f1 || true)"
+[ -n "$pause_open" ] && [ -n "$loop_open" ] && [ "$pause_open" -lt "$loop_open" ] || { echo "--- FAIL: §DEP-PAUSE 认牌分支不在逐服务判定之前（放在 DOWN 之后＝牌立了照样重启）"; exit 1; }
+in_pause_block="$(sed -n "${pause_open},${loop_open}p" deploy/qmt-win/all_service_watchdog.ps1 || true)"
+if grep -qE 'Restart-ServiceWithBackoff|Enforce-SingleInstance' <<<"$in_pause_block"; then echo "--- FAIL: §DEP-PAUSE 停机窗口分支里混进了重启/单实例治理（窗口内必须只读数不动手，10-11 混合半态正是这两只手抢出来的）"; exit 1; fi
+face_split="$(grep -cF 'Services | ForEach-Object' deploy/qmt-win/all_service_watchdog.ps1 || true)"
+[ "$face_split" -eq 1 ] || { echo "--- FAIL: §DEP-PAUSE 五腿读数被抄成多份（读到 ${face_split} 处）——HEARTBEAT 与 DEPLOY-PAUSE 共用 Get-ServiceFace，抄第二份就是 10-10 那套「判 DOWN 而探针面全对」的两套读法"; exit 1; }
+grep -qF '本轮只读数不重启' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §DEP-PAUSE 窗口内不再留读数（静默几分钟＝故障现场被抹掉，无法和真停机区分）"; exit 1; }
+grep -qF '牌已过期（到期' deploy/qmt-win/all_service_watchdog.ps1 || { echo "--- FAIL: §DEP-PAUSE 过期残牌不喊（部署被 kill -9 时 trap 不跑，残牌会把监督无限期关掉而没人知道）"; exit 1; }
+fail_legs="$(grep -c '按无牌处理，监督照常' deploy/qmt-win/all_service_watchdog.ps1 || true)"
+[ "${fail_legs:-0}" -ge 3 ] || { echo "--- FAIL: §DEP-PAUSE 认牌的 fail 腿只剩 ${fail_legs} 条（读不出／首行非纯数字／已过期三条都要「往监督落、不往免检落」并各留一行原因；牌读不出就不动手＝把探测器坏了当成一切正常）"; exit 1; }
+grep -qE 'SCP.*qmt-win/service_definitions\.ps1' scripts/deploy_guangzhou.sh || { echo "--- FAIL: §DEP-PAUSE 单源定义未入部署同步清单（只被 ps1_bom 提一次不算——必须出现在 SCP 行上；§H8/§ENH-5 quote_feed 漏列教训同族）"; exit 1; }
+grep -qE 'SCP.*qmt-win/all_service_watchdog\.ps1' scripts/deploy_guangzhou.sh || { echo "--- FAIL: §DEP-PAUSE 看门狗认牌版未入部署同步清单（同样只认 SCP 行；仓库里有≠现网在跑，§0927KA 同族）"; exit 1; }
+# 锁数派生自本段锁语句行数（写死的数会漂：§37 历史上就把 11 道报成 12 道）；
+# 下界正锁兜底——整段被删/改名时 ok 行不会照样绿。
+LOCKS37="$(awk '/^echo "==> 37 /{f=1} /^echo "==> 38 /{f=0} f && /^[[:space:]]*(test -[ef]|grep|if grep|\[ )/' scripts/verify_changes.sh | wc -l | tr -d ' ')"
+[ "${LOCKS37:-0}" -ge 20 ] || { echo "--- FAIL: 门禁 §37 锁数派生读数=${LOCKS37}（不足 20 道＝本段有锁被删或前缀改名；现网两族锁为 §H8/§F6/UTF-16 十一道 + §DEP-PAUSE 十三道，任一族整块消失都应判红，别让派生 ok 行失去意义）"; exit 1; }
+echo "ok - 门禁 §37 通过（锁 ${LOCKS37} 道：§H8 探针同源 + §F6 UAT 指纹 + 10-10 nssm UTF-16 读法 + §DEP-PAUSE 看门狗认牌）"
 
 echo "==> 38 §M1 quote_source 契约单源化 golden 双向锁（2026-09-22 修复批二波，代理G/K）..."
 # M1：行情源名散落六处（Go 枚举 / 前端下拉 / 网关日志文本 / 桥策略 / E2E 断言 / mock 注入）

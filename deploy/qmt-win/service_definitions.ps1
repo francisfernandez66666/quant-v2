@@ -178,6 +178,14 @@ $SvcPythonExe   = "C:\Python312\python.exe"                       # gateway_watc
 $SvcMiniQmtClientExe = "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe"  # register_engine_services.ps1:35 现值（完整交易端，自动登录）
 $SvcWatchdogBase = "C:\qmt\quant-trading-v2"                      # all_service_watchdog 配置探测兜底位（旧 C:\qmt 形态，保留兼容）
 $SvcWatchdogLog  = "C:\qmt\watchdog_all.log"                      # all_service_watchdog.ps1:11 现值
+# §DEP-PAUSE（2026-10-11 部署实录）：部署停机窗口的互斥牌路径——**只有路径在这一处定义**。
+#   写牌方＝scripts/deploy_guangzhou.sh（为释放 exe 文件锁必须 net stop，而本机的常驻看门狗每 15
+#   秒巡检、会把刚停的服务判 DOWN 并 nssm restart，抢在 scp 之前把文件重新锁住：当日实录＝五份二进制
+#   被劈成两半——quant/dataload/qmtctl 是新版、research/researchd 还是旧版，验收脚本只看 quant 的
+#   buildCommit 因而**看不见混合半态**）；认牌方＝all_service_watchdog.ps1（有牌只读数、不重启）。
+#   为什么放在单源里而不是两边各写一遍字面量：牌写到 A 处、看门狗去看 B 处＝互斥静默失效，而它坏起来
+#   和"没这个功能"一模一样（scp 又报 dest open Failure，没人知道是牌没生效）。门禁有跨文件等值锁。
+$SvcDeployPauseFlag = Join-Path $SvcDeployDir "deploy_pause.flag"
 
 # ── 网关绑定面（裁决：仅回环；公网 0.0.0.0 属首尔→广州分离期旧物，依据见头注②）─────
 $SvcGatewayBindLoopback = "127.0.0.1:$ProbeGatewayPort"

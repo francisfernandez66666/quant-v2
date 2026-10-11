@@ -179,10 +179,73 @@ function Enforce-SingleInstance($svc) {
     } catch { /* 枚举失败不阻断巡检 */ }
 }
 
+# §DEP-PAUSE（2026-10-11 部署实录）：读"部署停机窗口互斥牌"。
+#   返回 $null＝无牌/牌不可信 ⇒ 监督照常；返回 DateTime＝牌有效到该时刻 ⇒ 本轮只读数、不动手。
+#   为什么需要这张牌：部署 [2/5] 为了释放 exe 文件锁必须 net stop quant / quant-research，
+#   而本守护每 15 秒巡检一轮、会把刚被部署停掉的服务判 DOWN 并 nssm restart——当日实录就是它抢在
+#   scp 之前把 researchd.exe/research.exe 重新锁住，五份二进制被劈成两半（前三份新版、后两份旧版），
+#   而验收脚本只看 quant 的 buildCommit，混合半态当时无人可见。
+#   fail 方向定死为"往监督落、不往免检落"：文件读不出、首行不是纯数字、时间戳已过期，一律按无牌处理
+#   并留一行原因。牌本身坏掉绝不能变成一条静默的"谁都别管"通道——那是 10-10 看门狗 UTF-16 误判四腿
+#   连环重启的同族反面（那次是"判据自己瞎了还在动手"，这次是"判据读不出就不动手"，两者都不可接受）。
+$Script:PauseExpiredNoted = $false
+function Get-DeployPauseDeadline {
+    if (-not (Test-Path $SvcDeployPauseFlag)) {
+        # 牌不在位：过期提醒复位，下一次真过期还能再喊一次
+        $Script:PauseExpiredNoted = $false
+        return $null
+    }
+    $raw = $null
+    try { $raw = (Get-Content -Path $SvcDeployPauseFlag -TotalCount 1 -ErrorAction Stop) }
+    catch {
+        Log ("DEPLOY-PAUSE 牌在位但读不出（{0}）——按无牌处理，监督照常" -f $_.Exception.Message)
+        return $null
+    }
+    $head = (("$raw" -split '\|')[0]).Trim()
+    $epoch = [int64]0
+    if (-not [int64]::TryParse($head, [ref]$epoch)) {
+        Log ("DEPLOY-PAUSE 牌首行不是 Unix 秒（读到='{0}'）——按无牌处理，监督照常" -f $head)
+        return $null
+    }
+    $deadline = [DateTimeOffset]::FromUnixTimeSeconds($epoch).LocalDateTime
+    if ($deadline -le (Get-Date)) {
+        # 过期牌＝写牌方没撤成（部署被 kill -9 / SSH 断裂时不会跑 trap）。喊一次就够，
+        # 但每轮都按无牌处理：过期未撤的牌不得无限期免检。
+        if (-not $Script:PauseExpiredNoted) {
+            Log ("DEPLOY-PAUSE 牌已过期（到期 {0}，文件仍在位＝撤牌腿没走到）——按无牌处理，监督照常，请查部署链" -f $deadline.ToString("yyyy-MM-dd HH:mm:ss"))
+            $Script:PauseExpiredNoted = $true
+        }
+        return $null
+    }
+    return $deadline
+}
+
+# 五腿读数（HEARTBEAT 行与 §DEP-PAUSE 行共用同一实现——判据不抄第二份，抄了就会分叉：
+# 10-10 那次"看门狗判 DOWN 而探针面全对"的根因之一就是同一件事有两套读法）。
+function Get-ServiceFace {
+    # §C7-OPS：gwtask 腿的"在位"＝探针本身（没有 NSSM 服务可查），其余腿维持
+    # nssm status ∧ 探针 双判据——各腿语义与旧版一致，只是网关腿不再是空转。
+    return (@($Services | ForEach-Object {
+        if ($_.Type -eq "gwtask") {
+            if (Test-ServiceProbe $_) { $_.Name } else { "$($_.Name):DOWN" }
+        } elseif ((Get-NssmStatus $_.Name) -and (Test-ServiceProbe $_)) { $_.Name } else { "$($_.Name):DOWN" }
+    }) -join ",")
+}
+
 Log "all-service watchdog started (pid=$PID)"
 $lastHeartbeat = Get-Date
 
 while ($true) {
+    # §DEP-PAUSE：有牌＝部署正在停机窗口里（文件锁由部署链自己负责），本轮**只读数不动手**：
+    # 不判 DOWN、不重启、不做单实例治理（后两者都挂在 DOWN 分支上，跳过判定即一起跳过）。
+    # 读数照记，所以这段窗口在日志里是可归因的一行，而不是"看门狗这几分钟没写字"。
+    $pauseDeadline = Get-DeployPauseDeadline
+    if ($pauseDeadline) {
+        $remain = [int](($pauseDeadline - (Get-Date)).TotalSeconds)
+        Log ("DEPLOY-PAUSE 剩余 {0}s services=[{1}]（部署停机窗口，本轮只读数不重启）" -f $remain, (Get-ServiceFace))
+        Start-Sleep -Seconds 15
+        continue
+    }
     foreach ($svc in $Services) {
         # §H8：探针判定统一走 Test-ServiceProbe（HTTP 与文件心跳两类），且每轮只探一次，
         # 不再在 DOWN 日志行里重复请求。
@@ -205,14 +268,7 @@ while ($true) {
     }
     # 心跳：每 5 分钟记一次 opslog 等价留档（stdout → 计划任务日志 + 本文件）
     if (((Get-Date) - $lastHeartbeat).TotalMinutes -ge 5) {
-        # §C7-OPS：gwtask 腿的"在位"＝探针本身（没有 NSSM 服务可查），其余腿维持
-        # nssm status ∧ 探针 双判据——各腿语义与旧版一致，只是网关腿不再是空转。
-        $up = @($Services | ForEach-Object {
-            if ($_.Type -eq "gwtask") {
-                if (Test-ServiceProbe $_) { $_.Name } else { "$($_.Name):DOWN" }
-            } elseif ((Get-NssmStatus $_.Name) -and (Test-ServiceProbe $_)) { $_.Name } else { "$($_.Name):DOWN" }
-        }) -join ","
-        Log ("HEARTBEAT services=[" + $up + "]")
+        Log ("HEARTBEAT services=[" + (Get-ServiceFace) + "]")
         $lastHeartbeat = Get-Date
     }
     Start-Sleep -Seconds 15

@@ -95,12 +95,96 @@ start_engine_services() {
   echo "[cleanup] 拉起部署期间停掉的服务（quant / quant-research）..."
   $SSH "powershell -NoProfile -Command \"& '${NSSM}' start quant ; & '${NSSM}' start quant-research\"" 2>/dev/null || true
 }
+
+# ── §DEP-PAUSE（2026-10-11 部署实录）：停机窗口与常驻看门狗互斥 ──────────────────────
+# 实录：五服务看门狗（计划任务 quant-all-wd，15 秒一轮）在 07:10:40/07:10:44 把本轮 [2/5] 为释放
+#   exe 文件锁而停掉的 quant、quant-research 判 DOWN 并 `RESTART（第 1 次/10min）`——服务被抢在 scp
+#   之前重新拉起，researchd.exe/research.exe 的句柄又被占住，scp 报 "dest open Failure"，而
+#   quant/dataload/qmtctl 三份已经换上新版＝现网被劈成两半。这不是看门狗错：它看到的确实是一个
+#   不该停着的机器；也不是部署错：它确实必须停服才能换 exe。**缺的是两者之间的互斥**。
+# 牌＝现网一个只写"到期 Unix 秒|原因"的小文件（路径单源在 service_definitions.ps1 的
+#   $SvcDeployPauseFlag，本脚本的字面量与之等值，门禁钉着）。看门狗见到有效的牌就**只读数不动手**。
+# 为什么用"会过期的牌"而不是"部署期间把看门狗任务 /Disable+/End"：部署被 kill -9／SSH 一断，
+#   /Disable 是无限的哑（监督真的关掉，而且没人知道）；牌最差也只免检 TTL 秒，且过期那轮会喊一行
+#   "牌已过期＝撤牌腿没走到"。fail 方向始终是回到监督，不是回到免检。
+# 为什么撤牌要等引擎探针真过：[4/5] 拉起后引擎要几分钟才把 5GB 库载完，期间 /setup 不答话；
+#   此刻撤牌＝看门狗立刻把"正在加载"判成 DOWN 并 restart，等于把今天的抢停换个方向再犯一次。
+#   等不到就绪就不撤，让牌自然过期，并把没撤的原因打到部署输出里。
+DEPLOY_PAUSE_TTL_S="${DEPLOY_PAUSE_TTL_S:-900}"          # 牌的最长免检时长（秒），缺省 15 分钟
+DEPLOY_PAUSE_FLAG="${DEPLOY_PAUSE_FLAG:-$DEPLOY_DIR/deploy_pause.flag}"
+DEPLOY_PAUSE_WAIT_TRIES="${DEPLOY_PAUSE_WAIT_TRIES:-12}" # 撤牌前等引擎就绪的轮数（每轮 15s）
+PAUSE_FLAG_SET=0
+
+probe_engine_ready() {
+  # /setup 未初始化 200、已初始化 404——两者都算"引擎活着"（与 [5/5] 同口径，不另立第二套判据）
+  $SSH "powershell -NoProfile -Command \"try { (Invoke-WebRequest -Uri http://127.0.0.1:8081/setup -UseBasicParsing -TimeoutSec 10).StatusCode } catch { 'ERR' }\"" 2>/dev/null | tr -d '\000\r' | grep -qE "^(200|404)$"
+}
+
+set_deploy_pause_flag() {
+  # 立牌：到期时刻由**现网自己的时钟**算（Mac 与现网时钟不一定同步，拿本地时钟算就是又一份读法漂移）
+  $SSH "powershell -NoProfile -Command \"[IO.File]::WriteAllText('$DEPLOY_PAUSE_FLAG', [string]([DateTimeOffset]::Now.ToUnixTimeSeconds() + $DEPLOY_PAUSE_TTL_S) + '|sha=$GIT_SHA reason=deploy-window')\"" >/dev/null 2>&1 || true
+  local back head now
+  # 回读同时把**现网此刻**带回来：牌是否有效只能拿写牌那只钟判定，本地钟说了不算。
+  back=$($SSH "powershell -NoProfile -Command \"if (Test-Path '$DEPLOY_PAUSE_FLAG') { (Get-Content '$DEPLOY_PAUSE_FLAG' -TotalCount 1) + '|' + [string][DateTimeOffset]::Now.ToUnixTimeSeconds() } else { 'MISSING' }\"" 2>/dev/null | tr -d '\000\r')
+  head=$(printf '%s' "$back" | awk -F'|' '{print $1}')
+  now=$(printf '%s' "$back" | awk -F'|' '{print $NF}')
+  if printf '%s' "$head" | grep -qE '^[0-9]{10}$' && printf '%s' "$now" | grep -qE '^[0-9]{10}$' \
+     && [ "$(( head - now ))" -ge 60 ]; then
+    PAUSE_FLAG_SET=1
+    echo "  [ok ] 静默牌已立并**回读确认还有效**（剩余 $(( head - now ))s／TTL=${DEPLOY_PAUSE_TTL_S}s）：看门狗有效期内只读数不重启"
+    return 0
+  fi
+  # 三种坏态合这一行读数（都是"牌不可信"，但归因不同）：写不进（MISSING）、内容不是纯秒数、
+  # **读到的是上一场部署留下的过期牌**——最后这一条是夹具拨出来的：只验"是不是数字"会把
+  # 一块已经失效的残牌认成立牌成功，随后停服照样被 15 秒抢回，而部署输出却写着"已立牌"。
+  echo "  X   立牌未成功或回读不可信（回读='$back'，要求：首行 10 位秒数且比现网此刻至少晚 60s）——"
+  echo "      此时停服会被看门狗抢回（2026-10-11 实录形态）。部署**不在停服状态下继续**。"
+  echo "      排查：① $DEPLOY_PAUSE_FLAG 写不写得进 ② 是不是有上一场的残牌（先 Remove-Item 再重跑）③ 现网时钟"
+  return 1
+}
+
+clear_deploy_pause_flag() {
+  if [ "$PAUSE_FLAG_SET" != "1" ]; then
+    return 0
+  fi
+  PAUSE_FLAG_SET=0   # 先落位：撤牌只走一次，主流程与 EXIT 兜底不重复撤
+  $SSH "powershell -NoProfile -Command \"Remove-Item -Force -ErrorAction SilentlyContinue '$DEPLOY_PAUSE_FLAG'\"" >/dev/null 2>&1 || true
+  local back
+  back=$($SSH "powershell -NoProfile -Command \"if (Test-Path '$DEPLOY_PAUSE_FLAG') { 'PRESENT' } else { 'MISSING' }\"" 2>/dev/null | tr -d '\000\r')
+  if echo "$back" | grep -q 'MISSING'; then
+    echo "  [ok ] 静默牌已撤并回读确认（看门狗恢复动手）"
+  else
+    echo "  [!] 撤牌后仍读到牌在位（回读='$back'）——牌会在 TTL=${DEPLOY_PAUSE_TTL_S}s 后自行过期，期间看门狗只读数不重启，请手工核对 $DEPLOY_PAUSE_FLAG"
+  fi
+}
+
+finalize_deploy_pause_flag() {
+  if [ "$PAUSE_FLAG_SET" != "1" ]; then
+    return 0
+  fi
+  local i=0
+  while [ "$i" -lt "$DEPLOY_PAUSE_WAIT_TRIES" ]; do
+    if probe_engine_ready; then
+      break
+    fi
+    i=$((i + 1))
+    sleep 15
+  done
+  if probe_engine_ready; then
+    clear_deploy_pause_flag
+  else
+    echo "  [!] 引擎在 ${DEPLOY_PAUSE_WAIT_TRIES}×15s 窗口内仍未答话——**保留静默牌**（TTL ${DEPLOY_PAUSE_TTL_S}s 后自动过期）。现在撤牌等于让看门狗把正在加载库的引擎判 DOWN 并重启；这条读数不是失败，是停机窗口还没结束。"
+  fi
+}
+
 restore_services_on_exit() {
   rc=$?
   # 用 if 而非 `[ … ] && fn`：后者在条件不成立时返回 1，会让 set -e 在 exit 之前打断本函数。
   if [ "$SERVICES_STOPPED" = "1" ]; then
     start_engine_services
   fi
+  # §DEP-PAUSE：任何退出路径都要收牌（收不成也要把"牌还在、什么时候自己失效"打在输出里）。
+  finalize_deploy_pause_flag
   exit $rc
 }
 trap restore_services_on_exit EXIT
@@ -138,11 +222,20 @@ echo "[1/5] 交叉编译 windows/amd64..."
 # §A7-B（2026-09-20）：同一份 SHA 也用于校验前端产物是否配套（见步 [2c]），所以提到外面只算一次。
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 LDFLAGS="-X main.buildCommit=${GIT_SHA}"
-GOOS=windows GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/quant.exe      ./cmd/quant
-GOOS=windows GOARCH=amd64 go build -o /tmp/researchd.exe  ./cmd/researchd
-GOOS=windows GOARCH=amd64 go build -o /tmp/dataload.exe   ./cmd/dataload
-GOOS=windows GOARCH=amd64 go build -o /tmp/research.exe   ./cmd/research
-GOOS=windows GOARCH=amd64 go build -o /tmp/qmtctl.exe     ./cmd/qmtctl
+# §DEP-FACE（2026-10-11）：待部署二进制清单**单点定义**——编译、scp、逐份字节同源读数三处共用它。
+#   为什么不能三处各写五个名字：清单式漂移是这仓反复锤过的失明形态（§ENH-5 漏列 quote_feed.py、
+#   §0927KA 漏列 dataload_keepalive.py、§A5 漏列 trading_calendar.py），而这里更狠——"清单少一个"
+#   不会报错，只会让那一份 exe 既不上新、也不在对照读数面上，混合半态就此隐形。
+DEPLOY_BINS="${DEPLOY_BINS:-quant researchd dataload research qmtctl}"
+for _b in $DEPLOY_BINS; do
+  if [ "$_b" = "quant" ]; then
+    # 只有 quant 带 buildCommit 指纹（另外四个 main 包没有这个变量，硬加会被 go 静默忽略）；
+    # 正因如此验收面的 fingerprint 探针只覆盖五分之一，其余四份靠下面的 §DEP-FACE 逐份对照。
+    GOOS=windows GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o "/tmp/${_b}.exe" "./cmd/${_b}"
+  else
+    GOOS=windows GOARCH=amd64 go build -o "/tmp/${_b}.exe" "./cmd/${_b}"
+  fi
+done
 echo "      产物: $(ls -lh /tmp/*.exe | awk '{print $5, $9}') (quant buildCommit=$LDFLAGS)"
 
 # ── 2. 上传二进制 + 部署脚本 + qmtctl ──
@@ -150,10 +243,53 @@ echo "[2/5] 上传二进制/脚本到 $DEPLOY_DIR ..."
 # 2026-09-18 部署实录：NSSM 运行中的 quant/quant-research 锁死旧 exe，scp 直接
 # "dest open Failure"（register 脚本是 stop→install→start，救不了上传阶段的锁）。
 # 先显式停服释放文件锁——服务重启本就属于本次部署语义（步 [4/5] 注册即拉起）。
+# §DEP-PAUSE：停服之前必须先立住静默牌并回读确认（顺序锁有门禁钉着）——
+#   立牌失败就地退，绝不"先停了再说"：停了就等于把文件锁交给一场 15 秒一轮的抢停。
+$SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata, ${DEPLOY_DIR}/scripts | Out-Null\""
+if ! set_deploy_pause_flag; then
+  echo "  部署中止（未停任何服务，现网状态未变）"
+  exit 1
+fi
 $SSH "powershell -NoProfile -Command \"net stop quant; net stop quant-research; exit 0\"" >/dev/null 2>&1 || true
 SERVICES_STOPPED=1   # 置位后由 [4/5]/[4/5]-s 拉起，任何提前退出都由 EXIT 兜底补 start
-$SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata, ${DEPLOY_DIR}/scripts | Out-Null\""
-$SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/qmtctl.exe "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
+SCP_BINS=""
+for _b in $DEPLOY_BINS; do SCP_BINS="$SCP_BINS /tmp/${_b}.exe"; done
+# scp 的返回码要**收进变量**，不能 let set -e 当场把脚本带走：10-11 实录就是 scp 半途失败
+#   （researchd/research 两份 "dest open Failure"、另三份已落盘），而下面那段逐份同源读数是
+#   "到底哪几份没落地"的唯一点名面——被 set -e 抢在读数之前退出，等于把唯一的归因证据丢掉，
+#   剩下的就只有"部署失败了"这句没有尺寸的话（预期会失败的子进程一律 `|| rc=$?` 收码）。
+scp_rc=0
+$SCP $SCP_BINS "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/" || scp_rc=$?
+if [ "$scp_rc" != "0" ]; then
+  echo "  [!] 二进制上传有失败项（scp rc=${scp_rc}）——先把下面这段逐份读数跑完再中止"
+fi
+# ── §DEP-FACE（2026-10-11）：逐份字节同源读数（清单同上，DEPLOY_BINS）────────────────
+# 为什么必须有：scp 是"一条命令传五个文件"，其中两份被抢停复活的句柄挡住时报
+#   "dest open Failure"、另外三份已经落盘＝混合半态；而验收脚本只读 quant 的 buildCommit
+#   （[1/5] 的 ldflags 只注入 quant，另外四个 exe 不带指纹），所以半态在验收面是**隐形**的。
+#   逐份 SHA256 对照"本轮待部署字节"是唯一能把它变成读数的办法；只报前 12 位，不报全串。
+FACE_BAD=0
+for _f in $DEPLOY_BINS; do
+  want="$(shasum -a 256 "/tmp/${_f}.exe" 2>/dev/null | cut -c1-12 || true)"
+  # certutil 的表头文案随码页变、nssm 那族工具还往 stdout 写 UTF-16：先剥 NUL/CR，再从输出里
+  # 摘一条 64 位十六进制，绝不靠"第 2 行"这种排版假设取数。
+  got="$($SSH "certutil -hashfile ${DEPLOY_DIR}/${_f}.exe SHA256" 2>/dev/null | tr -d '\000\r' | grep -oE '[0-9a-fA-F]{64}' | head -1 | cut -c1-12 || true)"
+  if [ -n "$want" ] && [ -n "$got" ] && [ "$want" = "$got" ]; then
+    echo "  face=${_f} same（sha256 ${want}）"
+  else
+    echo "  X face=${_f} DIFF（待部署='${want}' 现网='${got}'）"
+    FACE_BAD=1
+  fi
+done
+if [ "$FACE_BAD" = "1" ]; then
+  echo "  X 二进制面混合半态：上面点名的文件仍是上一版字节。常见成因＝静默牌没生效、"
+  echo "    停服窗口被 quant-all-wd 抢回（看 C:\\qmt\\watchdog_all.log 有无 RESTART 行）。"
+  # scp 有失败项时把 rc 一并打出来：读数以 ${...:-0} 取，行为腿夹具里没有这个变量，
+  # 直读会在 set -u 下把整段炸掉（那是"判据自己瞎了"，不是判红）。
+  if [ "${scp_rc:-0}" != "0" ]; then echo "    本轮 scp rc=${scp_rc:-0}＝上传有失败项，上面点名的就是没落地的那几份。"; fi
+  echo "    部署中止，EXIT 兜底会把服务拉回并保留静默牌到期前不撤；现网请按点名逐份重传（重跑本脚本即可）。"
+  exit 1
+fi
 # §C7-OPS（2026-09-26，FIX_PLAN_20260925EVE ⑯ Windows 服务拉起三径单源化）：
 # service_definitions.ps1 是服务/任务定义**单源**，被 6 个运维脚本 dot-source（register_engine_services/
 # register_web_service/ensure_gateway_config/rotate_qmt_token/all_service_watchdog 等）。
