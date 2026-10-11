@@ -47,6 +47,15 @@ INDEX_REQUIRED_FIELDS = ("date", "open", "high", "low", "close", "preclose",
                          "pctChg", "volume", "amount")
 # 交易日历距今日超过该天数仍无开市日 → 判定日历表本身过旧，不可再作 target 依据。
 CALENDAR_STALE_DAYS = 12
+# §CAL-COVER（2026-10-11 现网实录）：日历自愈回写窗口向未来延伸的天数。
+# 事故形态：0927KA 自愈的窗口 end=today，自愈次日 trade_cal 末行就落在昨天，
+# 而开市日龄（CALENDAR_STALE_DAYS）要再等最多 12 天才会判过旧——中间每个真实
+# 交易日都被 target=旧开市日 洗成「全部到齐」直接退出（09-28~30 与 10-08/09
+# 两段漏更即此形态，引擎侧行情新鲜度自检共用同一张日历同样失明）。
+# 治本＝回写时把未来开市日一并入库（baostock 日历含全年未来日期，已对现网
+# sidecar 实测），配合 last_trade_date 的「末行不覆盖今日即过旧」检查，
+# 日历从此永远覆盖今天，盲窗在结构上消失。
+CALENDAR_LOOKAHEAD_DAYS = 45
 
 
 def log(msg):
@@ -111,11 +120,19 @@ def _calendar_latest_open(today):
         c = sqlite3.connect(DB, timeout=30)
         r = c.execute("SELECT MAX(cal_date) FROM trade_cal WHERE is_open=1 AND cal_date<=?",
                       (today.strftime("%Y%m%d"),)).fetchone()[0]
+        # §CAL-COVER 覆盖检查：除开市日龄外，还要求日历末行覆盖到今天。
+        # 否则"日历行只写到过去某天"的库（自愈窗口 end=today 的历史形态）里，
+        # 最近开市日永远"新鲜"，今天及之后的真实交易日被整段跳过。
+        cov = c.execute("SELECT MAX(cal_date) FROM trade_cal").fetchone()[0]
         c.close()
     except Exception as e:
         log("trade_cal query err (fallback to pydata): %r" % e)
         return ""
-    return str(r or "")
+    cal = str(r or "")
+    if cal and cov and str(cov) < today.strftime("%Y%m%d"):
+        log("trade_cal 不覆盖今日（末行=%s）：改用 pydata 交易日历" % cov)
+        return ""
+    return cal
 
 
 # §M6-② 第二数据源：pydata sidecar /trade_days（baostock 交易日历，CSV calendar_date,is_open；
@@ -124,12 +141,20 @@ def _calendar_latest_open(today):
 # trade_cal（自愈）——现网实证该表停在 20260818 再无人刷新，第一数据源长期过旧全靠降级；
 # 回写后 trade_cal 每晚随保活自动维持近 45 天窗，降级链退化为真兜底。回写失败只留痕，
 # 绝不影响 target 推导本身（写库竞态/表锁死不得把保活打挂）。
+# §CAL-COVER（2026-10-11）：窗口从 end=today 改为 end=today+CALENDAR_LOOKAHEAD_DAYS。
+# 旧窗口的自愈写入永远"写到今天为止"，自愈次日日历就不再覆盖今天，而开市日龄判过旧
+# 还要等最多 12 天 ⇒ 盲窗内每个交易日被 target=旧开市日 洗成"全部到齐"整段漏更
+# （09-28~30、10-08/09 两段实录）。向前延伸后日历常备未来开市日，target 恒正确。
 # （English: this fallback also self-heals trade_cal with the fetched window, so the
-# first calendar source no longer rots; persistence errors never affect target resolution.）
+# first calendar source no longer rots; persistence errors never affect target resolution.
+# Since §CAL-COVER the window extends CALENDAR_LOOKAHEAD_DAYS past today, so the stored
+# calendar always covers today — the stale-but-blind window that silently skipped trading
+# days is structurally gone.）
 def _pydata_latest_open(today):
     start = (today - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
+    end = (today + datetime.timedelta(days=CALENDAR_LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
     best = ""
+    today_str = today.strftime("%Y%m%d")  # §CAL-COVER：best 只许取 ≤今日 的开市日
     rows = []  # §0927KA 自愈素材：(归一日期, is_open int)
     try:
         url = "%s/trade_days?start=%s&end=%s" % (PYDATA, start, end)
@@ -142,7 +167,10 @@ def _pydata_latest_open(today):
                 continue
             op = str(r.get("is_open", "")).strip() in ("1", "1.0")
             rows.append((d, 1 if op else 0))
-            if op and d > best:
+            # §CAL-COVER：窗口前移后未来开市日也进 rows（回写素材），
+            # 但 target（best）必须夹在 ≤今日——否则 target 落在未来，
+            # 三张判定表永远追不平，8 轮空烧后 rc=1（0927KA 事故同形）。
+            if op and d <= today_str and d > best:
                 best = d
     except Exception as e:
         log("pydata trade_days err (fallback to weekday approx): %r" % e)

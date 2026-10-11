@@ -22,6 +22,9 @@
 #   6) cand     research_candidates：近 N 日新增条数 + 最近一条的 created_at
 #   7) fina     fina_indicator：总行数 + 各报告期 distinct ts_code 分布（§0925EVE-B1 的"整季缺失"
 #               判据原样搬过来——只打印 COUNT(*) 发现不了 0930 期被永久跳过那种形态）
+# 七条判据腿之外另有一条 **只读 INFO 附加腿**（§CAL-COVER，2026-10-11）：`cal_coverage` 报
+#   交易日历末行是否覆盖今日、行情面最新交易日与落后几个交易日；它不进判数、不影响
+#   「腿数不足 7 必红」那半态守卫，作用是把"行情面停更但七腿全绿"这种形态摆到验收面上。
 #
 # 三条现网纪律（照抄本仓已锤过的姿势，不是新发明）：
 #   ① 判据明细/键名一律 ASCII：PowerShell→SSH 回传按 GBK 码页打乱中文，拿中文当判据＝永久性假绿
@@ -304,6 +307,40 @@ def main():
         emit("PASS" if okq else "FAIL", "queue:research task queue drained and recent terminal state", detail)
     except Exception as e:  # 读数失败一律判红并留异常摘要：静默的"查不到"比查错更危险
         emit("FAIL", "queue:research task queue readable", "err=%s" % type(e).__name__)
+
+    # ── §CAL-COVER 附加读数（2026-10-11 观测批）：交易日历覆盖 + 行情面新度 ──
+    #   为什么必须有这条：10-08/09 两个真实交易日整段漏更，而上面七条腿全绿——量纲腿只看
+    #   数值口径、队列腿只看研究任务，验收面上**没有任何一条腿看过日历是否覆盖今天**。
+    #   根源（保活自愈窗口 end=today）已在 scripts/dataload_keepalive.py 修掉，这条腿负责
+    #   的是"万一再次断供（sidecar 长期不可用、日历末行落后）必须在验收面现形，而不是只活在日志里"。
+    #   取向＝**只出 INFO 读数、不进判数**：covers_today=no 现在不抬红——把停更判成红的阈值
+    #   口径属产品裁决，与 queue 腿那把 30 的尺子记在同一张账上（读法与判据不同批是本仓规矩）。
+    try:
+        cal_row = cur.execute("SELECT MAX(cal_date) FROM trade_cal").fetchone()[0]
+        cal_open = cur.execute("SELECT MAX(cal_date) FROM trade_cal WHERE is_open=1").fetchone()[0]
+        daily_max = cur.execute("SELECT MAX(trade_date) FROM daily").fetchone()[0]
+        idx_max = cur.execute("SELECT MAX(trade_date) FROM index_daily").fetchone()[0]
+        today_str = now.strftime("%Y%m%d")
+        covers = bool(cal_row) and str(cal_row) >= today_str
+        # 行情面落后交易日数：日历里 (行情最新日, 今日] 区间的开市日个数——
+        # 用「落后几个交易日」而不是「几天没更新」，节假日不会把读数染成红。
+        # ★ 但**日历不覆盖今日时这个数必须是 unknown 而不是算出来的数字**：本次实录里
+        #   日历末行停在 10-07、10-08/09 两行根本不在表内，按同一张残缺日历算"落后"读出 0
+        #   ＝缺数据的计数冒充"算得出来"（与 [xml]"" 不抛冒充解析成功同族）。宁可交"算不了"，
+        #   也不交一个会让停更继续隐形的 0。
+        lag = "unknown"
+        if covers:
+            lag = str(cur.execute(
+                "SELECT COUNT(*) FROM trade_cal WHERE is_open=1 AND cal_date>? AND cal_date<=?",
+                (daily_max or "", today_str)).fetchone()[0])
+        emit("INFO", "cal_coverage cal_last_row=%s cal_last_open=%s covers_today=%s "
+                     "daily_max=%s index_max=%s daily_lag_td=%s" % (
+            cal_row or "none", cal_open or "none",
+            "yes" if covers else "no",
+            daily_max or "none", idx_max or "none", lag))
+    except Exception as e:
+        # 读数腿自己坏了也说清楚（不进判数，但绝不沉默——沉默正是这次停更没人看见的原因）
+        emit("INFO", "cal_coverage err=%s（读数腿故障，本条不进判数）" % type(e).__name__)
 
     # ── cand ──
     try:

@@ -193,10 +193,63 @@ class TestTradeCalendarFallback(TempDbCase):
         with open(k.LOG, encoding="utf-8") as f:
             self.assertIn("回退工作日近似", f.read())  # 显式留痕，取证可查
 
+    def test_calendar_not_covering_today_falls_back_to_pydata(self):
+        """§CAL-COVER 盲窗复演（2026-10-10 现网实录形态）：日历"开市日龄"完全新鲜
+        （节前最后交易日 09-30 距今仅 9 天 < 12 天阈值），但日历末行只写到 10-07
+        （旧自愈窗口 end=today 的产物）——10-08/09 两个真实开市日不在表内，旧行为
+        把 target 洗成 09-30、此后每天"全部到齐"直接退出＝整段漏更且全闸门绿。
+        现行为：末行不覆盖今日即降级 pydata，target 正确到 10-09，并留痕。"""
+        c = sqlite3.connect(self.db_path)
+        c.execute("CREATE TABLE trade_cal (cal_date TEXT PRIMARY KEY, is_open INTEGER)")
+        for d, op in (("20260928", 1), ("20260929", 1), ("20260930", 1),
+                      ("20261001", 0), ("20261002", 0), ("20261003", 0),
+                      ("20261004", 0), ("20261005", 0), ("20261006", 0),
+                      ("20261007", 0)):
+            c.execute("INSERT INTO trade_cal VALUES (?,?)", (d, op))
+        c.commit(); c.close()
+        cal_csv = ("calendar_date,is_open\n"
+                   "2026-09-30,1\n2026-10-01,0\n2026-10-08,1\n2026-10-09,1\n")
+        with mock.patch("urllib.request.urlopen") as u:
+            u.return_value.read.return_value = cal_csv.encode("utf-8")
+            got = k.last_trade_date(today=datetime.date(2026, 10, 9))
+        self.assertEqual(got, "20261009")
+        with open(k.LOG, encoding="utf-8") as f:
+            self.assertIn("不覆盖今日", f.read())  # 覆盖检查降级留痕，取证可查
+
 
 # §0927KA（2026-09-27 部署实录）：现网 trade_cal 停在 20260818 无人再刷（本次事故里
 # 第一源恒过旧、全靠降级腿）——pydata 降级取到日历后必须把窗口行回写自愈 trade_cal。
 class TestCalendarSelfHeal(TempDbCase):
+    def test_self_heal_window_extends_past_today(self):
+        """§CAL-COVER：自愈请求窗口必须向未来延伸（旧形态 end=today 是盲窗根源：
+        自愈次日日历就不再覆盖今天，而开市日龄判过旧还要等最多 12 天）；且未来
+        开市日随自愈落库、target（best）必须夹在 ≤今日——否则三张判定表永远追
+        不平，8 轮空烧（§0927KA 事故同形）。"""
+        today = datetime.date(2026, 10, 9)
+        cal_csv = ("calendar_date,is_open\n"
+                   "2026-09-30,1\n2026-10-01,0\n2026-10-08,1\n2026-10-09,1\n"
+                   "2026-10-12,1\n2026-11-25,1\n")  # 未来开市日也在返回窗内（baostock 实测支持）
+        urls = []
+
+        def fake_urlopen(url, timeout=None):
+            urls.append(url)
+            rr = mock.Mock()
+            rr.read.return_value = cal_csv.encode("utf-8")
+            return rr
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            got = k.last_trade_date(today=today)
+        self.assertEqual(got, "20261009")  # 未来开市日（10-12、11-25）不抬高 target
+        self.assertEqual(len(urls), 1)
+        end = urls[0].split("end=")[1]
+        self.assertGreaterEqual(end, "2026-11-20")  # ≥ today+CALENDAR_LOOKAHEAD_DAYS（10-09+45=11-23）
+        c = sqlite3.connect(self.db_path)
+        rows = dict(c.execute("SELECT cal_date, is_open FROM trade_cal").fetchall())
+        c.close()
+        self.assertEqual(rows.get("20261012"), 1)  # 未来开市日已随自愈入库
+        self.assertEqual(rows.get("20261001"), 0)  # 休市日同样入库
+
+
     def test_pydata_window_upserted_back_into_trade_cal(self):
         """临时库无 trade_cal 表 + pydata 可用 → target 正确到节前交易日，
         且同批日历行（含休市日 0/开市日 1）落库、表被顺手建出来。"""

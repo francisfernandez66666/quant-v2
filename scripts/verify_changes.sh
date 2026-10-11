@@ -5057,9 +5057,22 @@ e2e_eq "KA 部署清单必须带 dataload_keepalive.py（漏列=§M6/§0927KA �
 e2e_ge "KA keepalive 源 §0927KA 加固锚（日历自愈回写+无进展早停）≥8" "8" "$(ecn scripts/dataload_keepalive.py '0927KA')"
 e2e_eq "KA 无进展早停日志锚在位恰 1（幻觉 target 最多烧两轮的保险丝）" \
 	"$(ec scripts/dataload_keepalive.py 'abort early')" "1"
+# —— §CAL-COVER（2026-10-11 现网实录：0927KA 自愈窗口 end=today ⇒ 自愈次日 trade_cal
+# 末行即落在昨天，而开市日龄 12 天内恒判"新鲜" ⇒ 09-28~30、10-08/09 两段真实交易日被
+# "全部到齐"整段跳过且全闸门绿——引擎侧行情新鲜度自检共用同一张日历，同盲）。
+# 三枚锁分别钉：窗口前移常量、覆盖检查降级句、target 夹住今天的比较；预演读数（当日
+# grep -Fc）：常量=4（定义+注释提及+使用+测试引用外的源内全部）、降级句=2（log+头注）、
+# best 夹持=1、CAL-COVER 锚=6。回退任一形态即红。
+e2e_eq "KA 日历自愈窗口必须向未来延伸（end=today 是盲窗漏更根源）恰 4" \
+	"$(ec scripts/dataload_keepalive.py 'CALENDAR_LOOKAHEAD_DAYS')" "4"
+e2e_eq "KA trade_cal 覆盖检查降级句在位恰 2（末行不覆盖今日即弃第一源）" \
+	"$(ec scripts/dataload_keepalive.py '不覆盖今日')" "2"
+e2e_eq "KA pydata best 必须夹在 ≤今日（窗口前移后未来开市日不得抬高 target）恰 1" \
+	"$(ec scripts/dataload_keepalive.py 'if op and d <= today_str and d > best:')" "1"
+e2e_ge "KA §CAL-COVER 加固锚 ≥6（各改口处同段引用）" "6" "$(ecn scripts/dataload_keepalive.py 'CAL-COVER')"
 
 if [ -z "$E2E_ERRS" ]; then
-	echo "ok - §0926E2E 守卫通过（静态锁 36 条：吞错收口 7 + 暴露面 5 + 裁决口径 4 + 体验卫生 8 + 矩阵补位 9 + 保活加固 3）"
+	echo "ok - §0926E2E 守卫通过（静态锁 40 条：吞错收口 7 + 暴露面 5 + 裁决口径 4 + 体验卫生 8 + 矩阵补位 9 + 保活加固 3 + 日历覆盖 4）"
 else
 	echo "--- FAIL: §103 断言不符:${E2E_ERRS}"
 	exit 1
@@ -5316,6 +5329,11 @@ has106 "$VNG" 'Probe "scale:' '⑪-2 腿 4 量纲抽检'
 has106 "$VNG" 'queue:research task queue' '⑪-2 腿 5 队列'
 has106 "$VNG" 'cand:nightly research produced' '⑪-2 腿 6 候选产出'
 has106 "$VNG" 'fina:financial indicator table loaded' '⑪-2 腿 7 财务覆盖'
+# §CAL-COVER（2026-10-11 现网实录）：10-08/09 两个真实交易日整段漏更而七腿全绿——验收面上
+#   没有任何一条腿看日历是否覆盖今日。保活侧根源已修，这条锁钉住"读数必须在验收面"这件事本身
+#   （锁只钉读数腿在位，不钉判据：covers_today=no 目前不进判数，阈值口径与 queue 腿那把尺子同账）。
+has106 "$VNG" 'cal_coverage cal_last_row=' '§CAL-COVER 附加读数腿在位（日历覆盖＋行情面新度，七腿全绿也不许停更隐形）'
+has106 "$VNG" 'daily_lag_td' '§CAL-COVER 落后交易日数读数在位（按开市日算落后，节假日不得染红）'
 has106 "$VNG" 'mode=ro' '⑪-2 只读通道（file:…?mode=ro，演练/校验绝不写现网库）'
 eq106 "$VNG" 'PASS" -lt 7' 1 '⑪-2 半态守卫（腿数不足 7 必红，绝不把「没跑出来」当成功）'
 # 阈值透传三连：bash 侧变量 → PS param 声明 → python 形参。少任何一环，该环境变量就是惰性的
@@ -5438,6 +5456,57 @@ printf '%s\n' "$PV" | grep -q -- '-ActiveMax' \
 printf '%s\n' "$PV" | grep -q 'C:/var/lib/quant-trading-v2' \
 	|| { echo "--- FAIL: §106 夜间验收 -Preview 的 -DataDir 指错（应指数据目录而非部署目录——心跳文件与库都在数据目录）"; exit 1; }
 bash -n scripts/restore_drill.sh || { echo "--- FAIL: §106 恢复演练脚本语法不过"; exit 1; }
+# ── §CAL-COVER（2026-10-11 现网实录）夜间读数腿的**双态离线自证** ──
+#   为什么必须两态都拨：这条腿存在的理由就是"七腿全绿而行情面停更"，只测一态的话
+#   它可能恒读 unknown（等于没读数）或恒读数字（等于把停更继续洗白）而没人发现——
+#   与「负向腿恒零命中必须补一枚塞假目标的反证」同族。两态分别是：
+#     盲窗态＝日历末行停在节前、节后两个真实开市日**根本不在表内** ⇒ covers_today=no，
+#       且 daily_lag_td **必须是 unknown**：按同一张残缺日历算"落后"会读出 0＝缺数据的
+#       计数冒充算得出来（本次实录里它真读出 0，与 [xml]"" 不抛冒充解析成功同族）。
+#     覆盖态＝日历含今日及其后的开市行 ⇒ covers_today=yes，且落后按真实开市日读出 2。
+#   取码方式＝从夜间脚本里按 heredoc 边界抽内嵌 python 原文再跑（不另写一份副本，
+#   副本会和现网执行的那份漂移）。抽取失败（边界漂了）一律判红，绝不跳过。
+VNG106_CAL="$(mktemp -d /tmp/vng-cal-XXXXXX)"
+sed -n '/^cat > .*<<.PYEOF.$/,/^PYEOF$/p' scripts/verify_nightly_guangzhou.sh | sed '1d;$d' > "$VNG106_CAL/readout.py"
+CAL_PY_BYTES=$(wc -c < "$VNG106_CAL/readout.py" | tr -d ' ')
+if [ "${CAL_PY_BYTES:-0}" -lt 2000 ]; then
+	echo "--- FAIL: §106 日历覆盖腿没能从夜间脚本抽出内嵌读数脚本（字节数=${CAL_PY_BYTES}，heredoc 边界漂了＝双态自证根本没跑，宁可红不许跳。踩过的坑记在这里：起始行以**带引号**的 PYEOF 收尾，边界写成 .*PYEOF$ 会匹配不到而抽出 0 字节）"
+	rm -rf "$VNG106_CAL"; exit 1
+fi
+python3 - "$VNG106_CAL" <<'PYCAL'
+import sqlite3, sys, os
+root = sys.argv[1]
+def mk(name, cal_rows, quote_rows):
+    p = os.path.join(root, name)
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE trade_cal (cal_date TEXT PRIMARY KEY, is_open INTEGER)")
+    c.executemany("INSERT INTO trade_cal VALUES (?,?)", cal_rows)
+    c.execute("CREATE TABLE daily (trade_date TEXT)")
+    c.executemany("INSERT INTO daily VALUES (?)", quote_rows)
+    c.execute("CREATE TABLE index_daily (trade_date TEXT)")
+    c.executemany("INSERT INTO index_daily VALUES (?)", quote_rows)
+    c.commit(); c.close()
+blind = [("20260928", 1), ("20260929", 1), ("20260930", 1)] + [(d, 0) for d in
+        ("20261001", "20261002", "20261003", "20261004", "20261005", "20261006", "20261007")]
+healed = blind + [("20261008", 1), ("20261009", 1), ("20261010", 0), ("20261011", 0),
+                  ("20261012", 1), ("20261013", 1)]
+mk("blind.db", blind, [("20260930",)])
+mk("healed.db", healed, [("20260930",)])
+PYCAL
+CAL_BLIND=$(python3 "$VNG106_CAL/readout.py" --db "$VNG106_CAL/blind.db" 2>&1 | grep -a '^INFO|cal_coverage' || true)
+CAL_HEAL=$(python3 "$VNG106_CAL/readout.py" --db "$VNG106_CAL/healed.db" 2>&1 | grep -a '^INFO|cal_coverage' || true)
+rm -rf "$VNG106_CAL"
+if ! printf '%s' "$CAL_BLIND" | grep -q 'covers_today=no' \
+   || ! printf '%s' "$CAL_BLIND" | grep -q 'daily_lag_td=unknown'; then
+	echo "--- FAIL: §106 日历覆盖腿盲窗态读数不对（实得=${CAL_BLIND:-空}，期望 covers_today=no 且 daily_lag_td=unknown＝残缺日历算出的落后必须是"算不了"，不许冒充 0）"
+	exit 1
+fi
+if ! printf '%s' "$CAL_HEAL" | grep -q 'covers_today=yes' \
+   || ! printf '%s' "$CAL_HEAL" | grep -q 'daily_lag_td=2'; then
+	echo "--- FAIL: §106 日历覆盖腿覆盖态读数不对（实得=${CAL_HEAL:-空}，期望 covers_today=yes 且 daily_lag_td=2＝日历齐了却不出数＝这条腿恒盲，白加）"
+	exit 1
+fi
+echo "ok - §106 日历覆盖双态自证通过（盲窗态 no/unknown、覆盖态 yes/2）"
 echo "ok - §106 行为腿 8 组 + 离线自证 4 条通过"
 
 # ════════════════════════════════════════════════════════════════════════════
