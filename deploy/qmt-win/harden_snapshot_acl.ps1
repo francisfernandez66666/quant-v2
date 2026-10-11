@@ -14,13 +14,19 @@
 #   两个文件；§ENH-5：部署清单漏列执行体）。所以本脚本把收敛做成**可执行、可自检、可回滚**的一步，
 #   并由 verify 探针把"还留着白名单外 ACE"变成判红项，而不是继续当纪律。
 #
-# 三个判据（缺一条这脚本就不该存在）：
+# 四个判据（缺一条这脚本就不该存在）：
 #   ① 动手前先 `icacls /save` 存回滚凭证——存不下来就直接抛，不允许"边试边改"；
 #   ② 收敛后必须**真拨一次入口**：读一个真实存在文件 + 在目标目录写一个自测文件再删掉，
 #      证明没把夜任务（SYSTEM）和 Mac 拉取腿（实测 ssh 身份是本机 administrator，
 #      属 BUILTIN\Administrators 成员）掐死；只改完打印"成功"不算通过（§装入口必须真拨一次）；
 #   ③ 白名单之外的 ACE 一律视为失败。拉取腿若哪天改用非管理员账号，用 `-ExtraSids` 显式加进去，
 #      不允许靠"留着 Users 兜底"蒙过判红。
+#   ④ **显式**白名单外 ACE 也必须被撤销，不能只断继承（10-10/10-11 现网实录逼出来的第四条）：
+#      本脚本原本只做 `/inheritance:r` + `/grant:r`，这两句**碰不到**"显式写给某个账号"的那条——
+#      09-29 那批把两个目录收干净了，而口令文件上始终留着一条本机 administrator 账户（SID 尾
+#      -500）的 FullControl 显式 ACE，`-Apply` 跑过两回它都在位，verify 第 31 探针因此一直红着，
+#      红到 10-11 才被当成"owner 待裁"记在账上。当时的说法是"口令文件不越过脚本手工动"，
+#      正确的处置不是留一句手工纪律，而是让脚本具备撤销显式 ACE 的能力（见下面的撤销腿）。
 #
 # 缺省 **只读预演**（不带 -Apply 一个字节都不改），与 rotate_qmt_token.ps1 / decommission 家族同姿势。
 # 只动这三处：快照根、restic 中转仓、restic 口令文件。**不碰** C:\var\lib\quant-trading-v2
@@ -76,6 +82,43 @@ function Get-Outside($sids) {
     return @($sids | Where-Object { $AllowedSids -notcontains $_ })
 }
 
+# 撤销腿：把**白名单外**的 ACE 逐条铲掉。判据取自"重读一遍算出的白名单外清单"，不是取自
+# 某个写死的账号——这台机的本机管理员账户 SID（尾 -500）只在那次实录里出现过一次，把它抄进
+# 代码就变成"换一台机这条腿恒不干活却照样报绿"（门禁 §107 有对应的负锁）。
+# 主体一律用 SID 串交给 icacls（`*S-1-5-…` 前缀＝按 SID 解析，绕开中文码页把账号名显示成本地化
+# 名字那一族；第 19/31 探针同规）。翻译不出 SID 的孤儿 ACE 拒绝猜主体、直接抛，交人工处置。
+function Revoke-Outside($path, $bak) {
+    $n = 0
+    foreach ($sid in (Get-Outside (Get-AceSids $path))) {
+        if ($sid -notmatch '^S-\d+(-\d+)+$') {
+            throw ("白名单外这条主体翻译不成 SID（" + $sid + "），撤销腿拒绝猜测主体名：" + $path + "（回滚凭证 " + $bak + "）")
+        }
+        & icacls $path "/remove:g" ("*{0}" -f $sid) | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw ("icacls 撤销白名单外 ACE 失败 rc=" + $LASTEXITCODE + " sid=" + $sid + " path=" + $path + "（回滚凭证 " + $bak + "）") }
+        # deny 侧同一条主体也要铲（Allow 撤销成功不等于这条 ACE 没了：deny 是另一条独立 ACE）。
+        # 这一句的退出码**不单独判红**——没有 deny 条目时 icacls 的行为未取证，拿它判红就是拿
+        # 猜来的语义拦真收敛；真实判据在下面那次重读：只要还剩白名单外的一条就抛。
+        & icacls $path "/remove:d" ("*{0}" -f $sid) | Out-Null
+        $n++
+    }
+    return $n
+}
+
+# 预演读数用：白名单外那几条到底是"继承来的"还是"显式写的"——这两种态的修法不同（前者改父目录
+# 或断继承，后者必须逐条撤销），所以预演阶段就要把形态报出来，而不是只报一个总数。
+function Get-OutsideKind($path) {
+    $acl = Get-Acl -Path $path
+    $exp = 0
+    $inh = 0
+    foreach ($ace in $acl.Access) {
+        try { $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+        catch { $sid = "UNTRANSLATABLE:$($ace.IdentityReference.Value)" }
+        if ($AllowedSids -contains $sid) { continue }
+        if ($ace.IsInherited) { $inh++ } else { $exp++ }
+    }
+    return "outside_explicit=" + $exp + " outside_inherited=" + $inh
+}
+
 # 预演用：把一条目标的现状打成一行了事，绝不改字节。返回 @{sids;outside;exists} 供汇总判红。
 function Report-Target($label, $path) {
     if (!(Test-Path $path)) {
@@ -84,7 +127,7 @@ function Report-Target($label, $path) {
     }
     $sids = Get-AceSids $path
     $out = Get-Outside $sids
-    Write-Output ("ACL|target=" + $label + " path=" + $path + " sids=" + ($sids -join ';') + " outside=" + $out.Count)
+    Write-Output ("ACL|target=" + $label + " path=" + $path + " sids=" + ($sids -join ';') + " outside=" + $out.Count + " " + (Get-OutsideKind $path))
     return @{ sids = $sids; outside = $out; exists = $true }
 }
 
@@ -100,6 +143,10 @@ function Protect-Dir($label, $path) {
     & icacls @args2 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw ("icacls 收敛失败 rc=" + $LASTEXITCODE + " path=" + $path + "（回滚凭证 " + $bak + "）") }
 
+    # ④ 撤销显式白名单外 ACE：**必须在 grant 之后**——先撤销再把执行这一发的会话（本机管理员）
+    #     关在门外，等于用一次特权变更把自己锁在外面，而 grant 已经落地时撤谁都不会失联。
+    $revoked = Revoke-Outside $path $bak
+
     # ③ 收敛后判据：白名单外一条都不许留。
     $after = Get-AceSids $path
     $out = Get-Outside $after
@@ -113,7 +160,7 @@ function Protect-Dir($label, $path) {
     $probe = Join-Path $path (".acl-selftest-" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
     [System.IO.File]::WriteAllText($probe, "acl selftest")
     Remove-Item $probe -Force
-    Write-Output ("ACL_APPLIED|target=" + $label + " path=" + $path + " sids=" + ($after -join ';') + " selftest=read+write-ok rollback=" + $bak)
+    Write-Output ("ACL_APPLIED|target=" + $label + " path=" + $path + " sids=" + ($after -join ';') + " revoked=" + $revoked + " selftest=read+write-ok rollback=" + $bak)
 }
 
 function Protect-Pass($label, $path) {
@@ -130,12 +177,17 @@ function Protect-Pass($label, $path) {
     foreach ($sid in $AllowedSids) { $gargs += ("*{0}:F" -f $sid) }
     & icacls @gargs | Out-Null
     if ($LASTEXITCODE -ne 0) { throw ("icacls 收敛失败 rc=" + $LASTEXITCODE + " path=" + $path + "（回滚凭证 " + $bak + "）") }
+    # ④ 显式 ACE 撤销腿（grant 之后才动；口令文件上那条本机管理员账户的 FullControl 就是靠这句铲）。
+    $revoked = Revoke-Outside $path $bak
     $after = Get-AceSids $path
     $out = Get-Outside $after
     if ($out.Count -gt 0) { throw ("口令文件仍有白名单外 ACE：" + ($out -join ';') + "（回滚凭证 " + $bak + "）") }
     # ② 真拨一次：夜任务的读法就是按路径读文件内容，这里用同样方式读一次（只数字节数，绝不回显内容）。
+    #     这一句排在撤销腿**之后**，所以它自证的正是本步唯一真风险：执行这一发的会话（本机管理员，
+    #     刚被铲掉那条显式 ACE）是否还能靠 Administrators 组 ACE 读到口令文件。读不到就在这里抛，
+    #     前面已存的回滚凭证路径跟着文案带出——不会留下"改完没人能读"的半成品。
     $len = ([System.IO.File]::ReadAllText($path)).Length
-    Write-Output ("ACL_APPLIED|target=" + $label + " path=" + $path + " sids=" + ($after -join ';') + " selftest=read-ok bytes=" + $len + " rollback=" + $bak)
+    Write-Output ("ACL_APPLIED|target=" + $label + " path=" + $path + " sids=" + ($after -join ';') + " revoked=" + $revoked + " selftest=read-ok bytes=" + $len + " rollback=" + $bak)
 }
 
 Write-Output ("ACL|mode=" + ($(if ($Apply) { "apply" } else { "preview" })) + " allowed=" + ($AllowedSids -join ';'))

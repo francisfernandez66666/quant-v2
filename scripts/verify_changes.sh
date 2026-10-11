@@ -5502,6 +5502,27 @@ echo "ok - §106 行为腿 8 组 + 离线自证 4 条通过"
 # 同步项（本批把「加一条腿必须同日同步计数锁」这条纪律又走了一遍，三处）：
 #   §106 行首 Probe 25→26（第 31 探针入列）、§106 行为腿文案「路由覆盖全规则（18 条）」→19 条
 #   （休市日心跳是第 19 条规则，两侧同批动）、§88 INFO 观测行 6→7（快照 ACL 读数腿）。
+#
+# ── §ACL-REVOKED 增补（2026-10-11，owner 裁「修复灾备口令文件的显式权限报错」）──
+#   本段原有那三枚加固器锁（[switch]$Apply / 两个 Protect-* 各 2 / ok=false）全数保持原值：
+#   新代码只在函数体内加腿，没动函数名与退出码文案，等值锁不必跟着改（改了反而看不出"被绕过"）。
+#   新增 **11 枚**（预演读数逐条实测后才入段，锚命中数取自查而不是记忆）：
+#     整串签名 `function Revoke-Outside($path, $bak)`=1、两处调用 `$revoked = Revoke-Outside`=2、
+#     先后顺序两枚、`/remove:g`=1、`/remove:d`=1、执行行负锁两枚（`S-1-5-21` 与 `-500` 都不许出现在
+#     非注释行——注释里保留成因是本段既有纪律）、孤儿拒绝文案=1、`outside_explicit=`=1、说明面第四条=1。
+#   ★ 顺序锁这一组是**同一枚纪律写两遍**：目录侧用 first 命中、口令文件侧必须用 last 命中，
+#     因为两处调用文本一模一样，只挂 first 那一枚时"把口令文件侧的撤销整行删掉"仍能全绿
+#     （删掉的是第二处，first 命中的还是目录那一处）。10-11 反证实测（harness=/tmp/aclcp_locks.sh，
+#     锁体从本段逐字切出、只把目标路径换成 /tmp 副本，不留第二份实现）：**11 枚破坏全部 RED
+#     且 FAIL 编号与本枚指定的锁逐一对上（1/2/3/4/5/6/7/8/9/10/11），跑完复位自检 GREEN**；
+#     另外单独跑了一组"只挂 first 顺序锁"的子集 ⇒ 删口令文件侧调用后**子集全绿**，补上 last 那枚
+#     同一次破坏立刻红在 last 上——这就是"一枚锁守的纪律在文件里有两处实例"的通用形状，
+#     别处新增顺序锁前先问"这一型有几处"。
+#   ★ 本段自己的 ③ 号雷（改名式破坏保留原锚前缀＝恒绿）**当场复发一次**：第一版把实现锁写成
+#     `function Revoke-Outside`，把函数改名成 `Revoke-OutsideRenamed` 后子串照样命中、全绿；
+#     改成整串签名才咬住（与上面 heartbeat 那枚"签名整串作锚"同规）。
+#   ok 行的分桶枚数同时从"写死 3 枚/1 枚/2 枚"改成本段正文派生 + 下界 60 枚（§23 同族教训：
+#   枚数写死在文案里，加锁当夜就过时，而"过时却全绿"的文案比没有文案更坏）。
 # ════════════════════════════════════════════════════════════════════════════
 echo "==> 107 §0929 恢复演练三条真缺陷 + 定时腿收编 + 休市日心跳 + 快照权限 静态锁与行为腿..."
 
@@ -5540,6 +5561,17 @@ line_before107() { # $1=文件 $2=应在前的模式 $3=应在后的模式 $4=�
 	b=$(grep -n -- "$3" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
 	{ [ -n "$a" ] && [ -n "$b" ]; } || { echo "--- FAIL: §107 先后锁 ${CNT107}（${4}）：${1} 里两段的锚点没都找到 first=${a:-?} second=${b:-?}"; exit 1; }
 	[ "$a" -lt "$b" ] || { echo "--- FAIL: §107 先后锁 ${CNT107}（${4}）：${1} 里「${2}」在第 ${a} 行、已不早于「${3}」第 ${b} 行（顺序一倒，每份快照装的标记就都是上一夜的）"; exit 1; }
+}
+# line_before_last107：先后锁的 last 命中版。两处调用文本完全相同时（§ACL-REVOKED 的目录侧与
+# 口令文件侧都写 `$revoked = Revoke-Outside $path $bak`），用 first 比等于**只比了第一处**，
+# 口令文件那一处被删掉也照样绿——同一条纪律的第二处必须有第二枚各看各的锚的锁。
+line_before_last107() { # $1=文件 $2=应在前的模式 $3=应在后的模式（取最后一处命中） $4=说明
+	CNT107=$((CNT107 + 1))
+	local a b
+	a=$(grep -n -- "$2" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	b=$(grep -n -- "$3" "$1" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+	{ [ -n "$a" ] && [ -n "$b" ]; } || { echo "--- FAIL: §107 先后锁(last) ${CNT107}（${4}）：${1} 里两段的锚点没都找到 first=${a:-?} last=${b:-?}"; exit 1; }
+	[ "$a" -lt "$b" ] || { echo "--- FAIL: §107 先后锁(last) ${CNT107}（${4}）：${1} 里「${2}」在第 ${a} 行、已不早于「${3}」最后一处第 ${b} 行（这一处的顺序倒了）"; exit 1; }
 }
 
 VR=deploy/mac/verify_restore.sh
@@ -5642,6 +5674,26 @@ eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'Protect-Pass' 2 '口令文件收�
 eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'ACL_RESULT|ok=false' 1 '预演读数能判红（现网实测 outside>0 时这条命令必红；只回显数不判红就是"永远绿"的观测行）'
 eq107 scripts/verify_deploy_guangzhou.sh '第 31 探针' 6 '第 31 探针六处同源（头部清单/可调项/变量定义/param 注释/正文段/结果段）'
 has107 scripts/verify_deploy_guangzhou.sh 'INFO|snapshot_acl_readout' 'ACL 读数恒回显腿在位（绿也要看得到现网到底放开了哪些 SID）'
+
+# ── §ACL-REVOKED（2026-10-11，owner 裁「修复灾备口令文件的显式权限报错」）：收敛腿必须能铲掉**显式**白名单外 ACE ──
+# 成因是现网直读，不是推测：加固器原本只做 `/inheritance:r`（砍继承来的）+ `/grant:r`（只替换
+#   白名单自己那两条），这两句**碰不到**"显式写给某个账号"的那条 ACE。10-11 用 Get-Acl 逐条读现值：
+#   快照根与 restic 中转仓各只有白名单两条（inh=False，干净），而口令文件上是三条，多出来的正是
+#   本机 administrator 账户（SID 尾 -500）的 FullControl、inh=False。⇒ `-Apply` 跑过两回它都在位，
+#   verify 第 31 探针每次都在同一处红，10-10 把它记成"owner 待裁 + 不越过脚本手工动"。
+#   那一版的处置是错的：留一句"手工动"的纪律，等于把这条红永久挂在账上；正确的修法是让脚本
+#   具备撤销显式 ACE 的能力，于是下面这组锁守的是**能力在位且接在两条腿上**，而不是一句注释。
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'function Revoke-Outside($path, $bak)' 1 '撤销实现唯一（**整串签名作锚**：只锚 `function Revoke-Outside` 时把函数改名成 Revoke-OutsideRenamed 仍被子串命中＝恒绿，本段既有的"改名式破坏"号雷在 10-11 预演里又现形一次。两处收敛共用一个函数，写第二份＝改一处漏一处）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 '$revoked = Revoke-Outside $path $bak' 2 '两条收敛腿都接上撤销（少一枚＝另一个目标还会留显式 ACE，而它看起来是"收敛过了"）'
+line_before107 deploy/qmt-win/harden_snapshot_acl.ps1 '$args2 = @($path, "/inheritance:r", "/grant:r")' '$revoked = Revoke-Outside $path $bak' '目录侧**先 grant 后撤销**（顺序倒了＝在两句之间把执行这一发的管理员会话关在门外，特权变更把自己锁死）'
+line_before_last107 deploy/qmt-win/harden_snapshot_acl.ps1 '$gargs = @($path, "/grant:r")' '$revoked = Revoke-Outside $path $bak' '口令文件侧先 grant 后撤销（两处调用文本相同，这一枚取最后一处命中；first 版只能比到目录那一处）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 '/remove:g' 1 'Allow 侧撤销在位（本批真正要铲的就是这条）'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 '/remove:d' 1 'Deny 侧同主体也撤（撤销 Allow 不等于这条主体没了：deny 是另一条独立 ACE）'
+absent_code107 deploy/qmt-win/harden_snapshot_acl.ps1 'S-1-5-21' '撤销清单只能来自"重读一遍算出的白名单外集合"，**不得把这台机的本机账号 SID 写死进代码**（写死＝换一台机这条腿恒不干活却照样报绿，与"注释里声称有锁"同族）'
+absent_code107 deploy/qmt-win/harden_snapshot_acl.ps1 '\-500' '执行行不得出现 -500 这类只在这台机上成立的尾号（成因留在注释里是允许的）'
+has107 deploy/qmt-win/harden_snapshot_acl.ps1 '白名单外这条主体翻译不成 SID' '孤儿 ACE（Translate 失败）走拒绝而不是猜主体名——猜错就是把"删不掉"报成"已撤销"'
+eq107 deploy/qmt-win/harden_snapshot_acl.ps1 'outside_explicit=' 1 '预演读数把"白名单外"拆成显式/继承两态（两种态的修法不同，只报总数就看不出手工加过一条显式 ACE）'
+has107 deploy/qmt-win/harden_snapshot_acl.ps1 '也必须被撤销' '四条判据的第四条在说明面上（说明面写了而判据面没接＝本批要治的病）'
 eq107 scripts/backup_restic_pass_offline.sh 'PASS_VALUE' 5 '口令值只在"取一次→算指纹→落盘"链路里出现（多出的一行＝某处把它送进了输出）'
 absent_code107 scripts/backup_restic_pass_offline.sh 'echo.*PASS_VALUE' '绝不回显口令明文（本仓纪律：凭据只报长度与指纹）'
 eq107 scripts/backup_restic_pass_offline.sh '^chmod 600 ' 2 '离线副本两处执行态 chmod 600（临时文件 / 目标文件）。为什么锚在**行首**并写 2 而不是 3：本行上一版写的是「chmod 600」计数 3，第三处命中其实是文件头那句说明注释——计数锚里混注释＝有人删掉真 chmod 而注释还在时会误判，而注释本来就不该收进"执行处数"的等值里（本仓锁形要与判据同形）。目录侧不收口而是靠 umask 077（下面那枚锁管），所以文案不再谎称"三处 600 含目录"。'
@@ -5671,7 +5723,32 @@ done
 [ "$IP_SCAN_N" -ge 13 ] || { echo "--- FAIL: §107 派生正锁 ${CNT107}（deploy/mac 待扫文件数=${IP_SCAN_N}，<13＝派生 glob 失效，这组锁会静默空转）"; exit 1; }
 [ "${IP_HITS:-0}" = "0" ] || { echo "--- FAIL: §107 负锁 ${CNT107}（Mac 侧链里内嵌字面公网 IPv4，出口应只有 ssh 别名 gz 或运行期参数）got=${IP_HITS} 扫描文件数=${IP_SCAN_N}"; exit 1; }
 
-echo "ok - §107 静态锁 ${CNT107} 道通过（含执行行负锁 3 枚 + 键名/形态负锁 3 枚 + 先后顺序锁 1 枚 + 派生正锁 2 枚 + 调度配对派生锁 1 枚）"
+# ok 行的分桶枚数**从本段正文派生**（§23 同族教训：枚数写死在文案里，加一枚锁就当夜过时，而
+# "文案过时却全绿"比没有文案更坏——下一个人会拿它当准数）。段边界按 §107/§108 两个段标题行取；
+# 只数**调用行**（模式一律带尾空格，函数定义 `eq107() {` 与注释都不进计数——§chmod 那枚教训同形）。
+CNT107=$((CNT107 + 1))
+LN107A=$(grep -n '^echo "==> 107 ' scripts/verify_changes.sh 2>/dev/null | head -1 | cut -d: -f1 || true)
+LN107B=$(grep -n '^echo "==> 108 ' scripts/verify_changes.sh 2>/dev/null | head -1 | cut -d: -f1 || true)
+if [ -z "$LN107A" ] || [ -z "$LN107B" ]; then
+	echo "--- FAIL: §107 边界锁 ${CNT107}（段标题行取不到 A=${LN107A:-?} B=${LN107B:-?}）：分桶枚数无从派生，宁可判红也不打猜出来的数"
+	exit 1
+fi
+SEC107_BODY=$(awk -v a="$LN107A" -v b="$LN107B" 'NR>a && NR<b' scripts/verify_changes.sh)
+B_EQ107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*eq107 ' || true)
+B_HAS107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*has107 ' || true)
+B_ABS107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*absent107 ' || true)
+B_ABSC107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*absent_code107 ' || true)
+B_ORD107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*line_before107 ' || true)
+B_ORDL107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*line_before_last107 ' || true)
+B_WORD107=$(printf '%s\n' "$SEC107_BODY" | grep -c '^[[:space:]]*word107 ' || true)
+B_SUM107=$(( ${B_EQ107:-0} + ${B_HAS107:-0} + ${B_ABS107:-0} + ${B_ABSC107:-0} + ${B_ORD107:-0} + ${B_ORDL107:-0} + ${B_WORD107:-0} ))
+# 下界只防"派生 glob 静默空转"（边界取错／锚被改名 ⇒ 数出个位数还一路绿），10-11 实测 64 枚调用；
+# 新增锁不必回来改这个数，删锁才会红——这正是 §23 那枚下界正锁的取向。
+if [ "$B_SUM107" -lt 60 ]; then
+	echo "--- FAIL: §107 派生下界锁 ${CNT107}（段内锁调用派生出 ${B_SUM107} 枚 < 下界 60）：等值=${B_EQ107:-0} 存在=${B_HAS107:-0} 负锁=${B_ABS107:-0}/${B_ABSC107:-0} 顺序=${B_ORD107:-0}/${B_ORDL107:-0} 整词=${B_WORD107:-0}——要么锁被批量删掉，要么段边界/锚点漂了"
+	exit 1
+fi
+echo "ok - §107 静态锁 ${CNT107} 道通过（本段正文派生：等值 ${B_EQ107} ＋存在 ${B_HAS107} ＋键名形态负锁 ${B_ABS107} ＋执行行负锁 ${B_ABSC107} ＋先后顺序 ${B_ORD107}+${B_ORDL107}（first／last 两型）＋整词 ${B_WORD107} ＝ ${B_SUM107} 枚调用，另含段边界与派生下界各一枚）"
 
 # ── 行为腿（全部离线，零写入、零外呼）────────────────────────────────────────
 # 为什么这一段必须有**假产物**腿：DRILL-A/B/C 三条全都是"脚本写得完整但从没真跑过"，
