@@ -900,6 +900,36 @@ if [ "${S23_FACE_LN:-0}" -le 0 ] || [ "${S23_ABORT_LN:-0}" -le 0 ] || [ "$S23_AB
 	echo "--- FAIL: §DEP-FACE 顺序锁（读数起点=${S23_FACE_LN} 中止文案=${S23_ABORT_LN}，要求起点更早）"
 	exit 1
 fi
+# ⑦ §A7-D（2026-10-13 发版实录）：上传前必须按**产物字节**复核前端指纹，而不是只读侧车文件。
+#   实录：待部署 6f08c74，dist/BUILD_COMMIT 写的就是 6f08c74，[2c] 原三道全过、上传成功、
+#   脚本自己报「OK 前端指纹校验通过」；部署后第 4b 号探针判红——index.html 引用的
+#   index-BWTRJ4rN.js 内嵌的是上一版 31c42e0，本批前端改动（web/src/pages/Quant.jsx）没进产物，
+#   现网浏览器跑旧界面。两个 mtime 把因果钉死：bundle 停在 10-12 19:21，侧车 10-13 09:50 才写下。
+#   根因不是"忘了重建"这一条纪律，而是**校验面读的是产物自称，不是产物本身**；同族＝两侧判据
+#   不同源（上传面绿、验收面红，绿的一面不算数）。修法＝把探针的判据前移到上传前。
+grep -q 'bundle_carries_commit' "$dg" || { echo "--- FAIL: §A7-D 产物字节复核函数不在位（部署又会只信侧车）"; exit 1; }
+# 定义 1＋调用 2（陈旧即强制重建 / 上传前中止）＝3。少一处＝那条判据没接线，函数只是摆着。
+if [ "$(grep -c 'bundle_carries_commit' "$dg")" != "3" ]; then
+	echo "--- FAIL: §A7-D 产物字节复核引用数不是 3（定义 1＋重建腿 1＋上传腿 1；实得 $(grep -c 'bundle_carries_commit' "$dg")）"
+	exit 1
+fi
+# 复核必须发生在**上传之前**：判据在 scp/tar 之后就是"先把陈旧产物发出去再看"，等于没有。
+S23_A7D_LN=$(grep -n '^  if ! frontend_artifact_check' "$dg" | head -1 | cut -d: -f1 || true)
+S23_TAR_LN=$(grep -n 'tar -czf /tmp/webdist.tgz' "$dg" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1 || true)
+if [ "${S23_A7D_LN:-0}" -le 0 ] || [ "${S23_TAR_LN:-0}" -le 0 ] || [ "$S23_A7D_LN" -ge "$S23_TAR_LN" ]; then
+	echo "--- FAIL: §A7-D 复核没在上传前（复核点=${S23_A7D_LN} 打包点=${S23_TAR_LN}，要求前者更早）＝陈旧产物照旧发出去"
+	exit 1
+fi
+# 期望指纹未知时**不参与比对**（与 §A7-B 同口径）：拿 'unknown' 去 chunk 里找会把每次无 git 环境的
+# 构建判成恒红，制造一条永远拦不出真问题的腿；这条守卫必须在重建触发点和复核函数里各在位一枚。
+if [ "$(grep -c '"$GIT_SHA" != "unknown"' "$dg")" -lt 2 ]; then
+	echo "--- FAIL: §A7-D 重建腿的「指纹未知不比对」守卫丢失（原侧车道＋§A7-D 应共 2 处，实得 $(grep -c '"$GIT_SHA" != "unknown"' "$dg")）"
+	exit 1
+fi
+grep -qF '|| [ "$1" = "unknown" ]' "$dg" || { echo "--- FAIL: §A7-D 复核函数缺「指纹未知即放行」那一支（没有期望值时它会把一切判红）"; exit 1; }
+# 判据两侧同源：部署侧读的必须就是探针侧读的那件事（index.html 引用的 chunk 含不含这个 SHA）。
+grep -qF 'assets/index-[A-Za-z0-9._-]' "$dg" || { echo "--- FAIL: §A7-D 没按 index.html 的 chunk 引用定位产物（判据又落回侧车＝两侧仍不同源）"; exit 1; }
+grep -q 'web:fingerprint' scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL: §A7-D 的验收面（第 4b 号探针）丢失——前移后现网侧那次复核也必须保留"; exit 1; }
 # ⑥ §DEP-PAUSE／§DEP-FACE 行为腿：两块代码都从真脚本**切出来跑**（夹具不留第二份实现），
 #   桩只替换 ssh 的远端应答；末两条是摘锁反证——摘掉后必须"变绿"，否则说明腿根本没在拦。
 S23="$(mktemp -d /tmp/gate23-deppause-XXXXXX 2>/dev/null || true)"   # 刻意不读 TMPDIR 变量：门禁可能在 env 精简的定时器下跑，set -u 下未定义即中止
@@ -1041,19 +1071,65 @@ if [ "$S23_RC" != "0" ]; then
 	exit 1
 fi
 CNT23=$((CNT23 + 1))
+# §A7-D 行为腿（2026-10-13 发版实录同形）：三个函数整块从真脚本切出来、在夹具 cwd 里跑。
+#   函数按**相对路径** web/dist 定位产物，所以夹具只要换当前目录就能喂四棵不同的树，
+#   不需要在这里抄第二份实现（本仓纪律：判据从真源切，夹具只造数据）。
+# 切块必须把**末函数的收尾花括号**一起切走：`f{print}` 排在 exit 规则之前，
+# 否则切出的 28 行少一个 `}`，夹具里 `. a7d.sh` 直接 parse error near `\n'（本次锤出）。
+awk '/^dist_index_chunk_ref\(\)/{f=1} /^frontend_artifact_check\(/{g=1} f{print} g && /^}$/{exit}' "$dg" > "$S23/a7d.sh"
+if [ "$(grep -cE '^(dist_index_chunk_ref|bundle_carries_commit|frontend_artifact_check)\(\)' "$S23/a7d.sh")" != "3" ]; then
+	echo "--- FAIL: §A7-D 行为腿切块失败（三个函数没全切到＝锚行漂了，先修部署脚本别改锁）"
+	exit 1
+fi
+# 四棵夹具树：fresh＝引用件含期望指纹；stale＝**本轮现网实录那一态**（侧车与期望一致、
+# 引用件里还是上一版指纹）；noref＝index.html 取不到 chunk 引用；nochunk＝引用了产物树里不存在的文件。
+for s23d in fresh stale noref nochunk; do mkdir -p "$S23/$s23d/web/dist/assets"; done
+echo '<script src="/assets/index-new.js"></script>' > "$S23/fresh/web/dist/index.html"
+echo 'var C="cafe123"' > "$S23/fresh/web/dist/assets/index-new.js"
+cp "$S23/fresh/web/dist/index.html" "$S23/stale/web/dist/index.html"
+echo 'var C="beef001"' > "$S23/stale/web/dist/assets/index-new.js"
+echo '<div>no asset ref here</div>' > "$S23/noref/web/dist/index.html"
+echo '<script src="/assets/index-gone.js"></script>' > "$S23/nochunk/web/dist/index.html"
+s23_a7d() {   # $1=夹具目录 $2=期望指纹 $3=侧车读数 $4=期望rc $5=断言子串(空=不比) $6=说明
+  if [ ! -d "$S23/$1" ]; then echo "--- FAIL: §A7-D 腿 $6 的夹具目录不在位（$1）——没有夹具这条绿是假的"; exit 1; fi
+  S23_OUT="$( ( cd "$S23/$1" && . "$S23/a7d.sh" && frontend_artifact_check "$2" "$3" ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+  if [ "$S23_RC" != "$4" ] || { [ -n "$5" ] && ! printf '%s' "$S23_OUT" | grep -qF "$5"; }; then
+    echo "--- FAIL: §A7-D 腿 $6（期望 rc=$4${5:+ 含「$5」}，实得 rc=${S23_RC}，输出=$(printf '%s' "$S23_OUT" | head -2 | tr '\n' ' ')）"
+    exit 1
+  fi
+  CNT23=$((CNT23 + 1))
+}
+s23_a7d fresh   cafe123  cafe123 0 ""                 "GA 引用件确实含期望指纹 ⇒ 放行上传"
+s23_a7d stale   cafe123  cafe123 1 "产物内容复核未通过" "GB 侧车写对了而引用件还是上一版指纹（10-13 实录那一态）⇒ 必须拦住"
+s23_a7d noref   cafe123  cafe123 1 "产物内容复核未通过" "GC index.html 里取不到 chunk 引用 ⇒ 无从取证即拦，不猜"
+s23_a7d nochunk cafe123  cafe123 1 "产物内容复核未通过" "GD 引用的 chunk 在产物树里不存在 ⇒ 拦"
+s23_a7d stale   unknown  cafe123 0 "待部署指纹未知"    "GE 期望指纹未知 ⇒ 不比、只交底（拿 unknown 去比＝造一条永远拦不出真问题的红腿）"
+# 摘锁反证 3：把"按期望指纹去引用件里找"改成"拿空模式找"（空模式恒命中）⇒ GB 那棵陈旧树必须**变绿**。
+#   不这么钉的话，"GB 红"也可能是判据本身恒 1（笔误、路径拼错）造成的，红得看不出它在拦什么。
+sed 's/grep -qa -- "$1"/grep -qa -- ""/' "$S23/a7d.sh" > "$S23/a7d_mut3.sh"
+if cmp -s "$S23/a7d.sh" "$S23/a7d_mut3.sh"; then
+	echo "--- FAIL: §A7-D 摘锁反证 3 没改动任何字节（锚行漂了，这条绿是假绿）"
+	exit 1
+fi
+S23_OUT="$( ( cd "$S23/stale" && . "$S23/a7d_mut3.sh" && frontend_artifact_check "cafe123" "cafe123" ) 2>&1 )" && S23_RC=0 || S23_RC=$?
+if [ "$S23_RC" != "0" ]; then
+	echo "--- FAIL: §A7-D 摘锁反证 3 期望变绿（rc=0）实得 rc=${S23_RC}＝GB 的红不是那条 grep 拦的，判据归属说了假话"
+	exit 1
+fi
+CNT23=$((CNT23 + 1))
 rm -rf "$S23"
 # 段内锁数派生自本段自己的锁/断言行（ok 行原来写的"20/20"是**当年这段的段号**，段号早已漂到 23；
 # 括号里那份"5+3+…"也是写死的，本批加完 §DEP-PAUSE/§DEP-FACE 后实数不是 6+5——写死的计数就是第二条
 # 需要被人记得的数字，改成派生 + 下界正锁：整族被删即红，新增不必改文案）。
 LOCKS23="$(awk '/^echo "==> 23\//{f=1} /^echo "ok - /{f=0} f && /^(test -[ef]|grep|if grep|if \[|python3 - )/' scripts/verify_changes.sh | wc -l | tr -d ' ')"
-if [ "${LOCKS23:-0}" -lt 25 ]; then echo "--- FAIL: 门禁 §23 锁数派生读数=${LOCKS23}（不足 25＝段内有锁被删、改名或整体缩进，派生 ok 行会失去意义）"; exit 1; fi
-# 行为腿条数下界：P1–P4(4)＋F1–F3(3)＋FA–FD(4)＋两枚摘锁反证(2)＝13。每加一条腿只抬下界，
-# 少一条即红—— CNT23 只在真跑到断言时才自增，所以"切块锚行漂了""腿被注释掉"都会在这里现形。
-if [ "${CNT23:-0}" -lt 13 ]; then
-	echo "--- FAIL: 门禁 §23 行为腿实跑 ${CNT23:-0} 条（不足 13＝有腿没走到或被删，静态锁全绿也不算这段过了）"
+if [ "${LOCKS23:-0}" -lt 40 ]; then echo "--- FAIL: 门禁 §23 锁数派生读数=${LOCKS23}（不足 40＝段内有锁被删、改名或整体缩进，派生 ok 行会失去意义）"; exit 1; fi
+# 行为腿条数下界：P1–P4(4)＋F1–F3(3)＋FA–FD(4)＋两枚摘锁反证(2)＋§A7-D 的 GA–GE(5)＋摘锁反证 3(1)＝19。
+# 每加一条腿只抬下界，少一条即红—— CNT23 只在真跑到断言时才自增，所以"切块锚行漂了""腿被注释掉"都会在这里现形。
+if [ "${CNT23:-0}" -lt 19 ]; then
+	echo "--- FAIL: 门禁 §23 行为腿实跑 ${CNT23:-0} 条（不足 19＝有腿没走到或被删，静态锁全绿也不算这段过了）"
 	exit 1
 fi
-echo "ok - 门禁 §23 通过（列 0 锁/断言行 ${LOCKS23} 道：§A7-B 产物指纹 + §A7-C 停服兜底 + 变量名吞噬扫描 + §DEP-PAUSE/§DEP-FACE 部署侧与夹具守卫）＋行为腿 ${CNT23} 条（P1–P4／F1–F3／FA–FD／两枚摘锁反证）"
+echo "ok - 门禁 §23 通过（列 0 锁/断言行 ${LOCKS23} 道：§A7-B 产物指纹 + §A7-C 停服兜底 + 变量名吞噬扫描 + §DEP-PAUSE/§DEP-FACE 部署侧与夹具守卫 + §A7-D 产物字节复核）＋行为腿 ${CNT23} 条（P1–P4／F1–F3／FA–FD／GA–GE／三枚摘锁反证）"
 
 echo "==> 24/24 §FIX-20260920 数据管道修复批专项（THS 单域熔断 + 东财 f62 主站信任 + 板块列表镜像分页 + EM-FFLOW 真值口径 + THS-KLINE 5分钟 + QUOTE-CHAIN 同花顺首选源）..."
 # A THS 单域熔断（per-operation isolation）：分钟 K 不支持档位不得误伤其他域；空 op 是 no-op；
@@ -5032,6 +5108,12 @@ e2e_ge() {
 # ec <file> <fixed-pattern>：grep -Fc 计数（无匹配 exit 1 → || true 归 0，set -e 雷区记忆）
 ec() { grep -Fc -- "$2" "$1" 2>/dev/null || true; }
 ecn() { grep -Ec -- "$2" "$1" 2>/dev/null || true; }
+# 本段的门禁自身文件路径必须**自带**一份：不能沿用 §89 的 $GS。
+# 实录（2026-10-13 全量门禁 -collect）：收集模式把每段 emit 成独立 inner_N.sh 跑，
+# 段与段之间的变量不共享，于是 §89 里那句 `GS=scripts/verify_changes.sh` 到本段就是未定义，
+# `set -u` 直接以「GS: unbound variable」中止——顺序整跑时它恰好是绿的（同一进程里 §89 先跑），
+# 所以这是"只在收集模式现形"的接线缺陷，与「有代码无调度」同族：判据依赖了别人的准备工作。
+GS103=scripts/verify_changes.sh
 
 # —— 一波「吞错放水」——
 e2e_eq "1-A gate.go TodayRealizedPnl 调用点禁「, _」吞错形态（负锁）" \
@@ -5159,7 +5241,7 @@ e2e_eq "反向锁：baostock 写日历不得退回宿主 Local 且边界落在�
 if [ -z "$E2E_ERRS" ]; then
 	# 本段锁数从正文派生（写死的枚数对下一个新增锁天生失明——"过时却全绿"比红更坏，§115 同族教训）；
 	# 派生数很小＝解析与本文格式脱节，那比红更危险，所以配下界而不是只打印。
-	E2E_LOCK_N=$(grep -cE '^e2e_(eq|ge) ' "$GS" || true)
+	E2E_LOCK_N=$(grep -cE '^e2e_(eq|ge) ' "$GS103" || true)
 	if [ "${E2E_LOCK_N:-0}" -lt 52 ]; then
 		echo "--- FAIL: §103 锁数派生异常（正文读到 ${E2E_LOCK_N:-0} 道 e2e_eq/e2e_ge 调用，应 ≥52）——派生器与本段格式脱节时，收尾读数会把「没锁到」报成「锁都在」"
 		exit 1
@@ -5885,6 +5967,12 @@ bash -n scripts/restore_drill.sh || { echo "--- FAIL: §106 恢复演练脚本�
 #       且 daily_lag_td **必须是 unknown**：按同一张残缺日历算"落后"会读出 0＝缺数据的
 #       计数冒充算得出来（本次实录里它真读出 0，与 [xml]"" 不抛冒充解析成功同族）。
 #     覆盖态＝日历含今日及其后的开市行 ⇒ covers_today=yes，且落后按真实开市日读出 2。
+#   ★ 夹具日期一律**相对今日生成**，不写死（2026-10-14 凌晨实录：上一版把日历行写死到
+#     20261013，第二天真实今日变成 20261014 时"覆盖态"夹具自己过期，读数腿判 covers_today=no、
+#     daily_lag_td=unknown，门禁在完全健康的代码上判红）。本段此前已经因为"写死落后 2"
+#     踩过同一颗雷一次（见下面 expect 的注释），那次只把**期望值**改成派生，
+#     这次把**夹具本身**改成相对日期——否则期望值派生出来是 4 而读数永远是 unknown，
+#     照样红。判据是「日历末行 >= 今日」，任何写死的日历都必然被今日追上。
 #   取码方式＝从夜间脚本里按 heredoc 边界抽内嵌 python 原文再跑（不另写一份副本，
 #   副本会和现网执行的那份漂移）。抽取失败（边界漂了）一律判红，绝不跳过。
 VNG106_CAL="$(mktemp -d /tmp/vng-cal-XXXXXX)"
@@ -5895,7 +5983,7 @@ if [ "${CAL_PY_BYTES:-0}" -lt 2000 ]; then
 	rm -rf "$VNG106_CAL"; exit 1
 fi
 python3 - "$VNG106_CAL" <<'PYCAL'
-import sqlite3, sys, os
+import sqlite3, sys, os, datetime
 root = sys.argv[1]
 def mk(name, cal_rows, quote_rows):
     p = os.path.join(root, name)
@@ -5907,18 +5995,30 @@ def mk(name, cal_rows, quote_rows):
     c.execute("CREATE TABLE index_daily (trade_date TEXT)")
     c.executemany("INSERT INTO index_daily VALUES (?)", quote_rows)
     c.commit(); c.close()
-blind = [("20260928", 1), ("20260929", 1), ("20260930", 1)] + [(d, 0) for d in
-        ("20261001", "20261002", "20261003", "20261004", "20261005", "20261006", "20261007")]
-healed = blind + [("20261008", 1), ("20261009", 1), ("20261010", 0), ("20261011", 0),
-                  ("20261012", 1), ("20261013", 1)]
-mk("blind.db", blind, [("20260930",)])
-mk("healed.db", healed, [("20260930",)])
+# 日历按**相对今日**生成：今日往前 30 天、往后 45 天（+45 与保活自愈窗口的延伸量同量级，
+# 覆盖态必须越过今日才叫"覆盖"）。开市规则用"周一到周五"近似——本段验的是读数腿的
+# **两态判读**（no/unknown 与 yes/数字），不是节假日表本身，节假日表另有 §96/§CAL-COVER 的现网腿。
+today = datetime.date.today()
+def ymd(d):
+    return d.strftime("%Y%m%d")
+days = []
+for off in range(-30, 46):
+    d = today + datetime.timedelta(days=off)
+    days.append((ymd(d), 1 if d.weekday() < 5 else 0))
+open_to_today = [ds for ds, o in days if o == 1 and ds <= ymd(today)]
+# 盲窗态：日历停在最近 3 个开市日之前 ⇒ 末行天生早于今日（covers=no），
+# 而今日之前还留着 3 个**没进表**的真实开市日＝本次实录的形状（节前停更、节后两天缺）。
+blind_end = open_to_today[-4]
+blind = [(ds, o) for ds, o in days if ds <= blind_end]
+healed = list(days)  # 覆盖态：整张日历含今日及其后的开市行
+# 行情面最新日取"最近第 3 个开市日"⇒ 覆盖态的落后恒为 2 个开市日（与段头注释一致）。
+daily_last = open_to_today[-3]
+mk("blind.db", blind, [(blind_end,)])
+mk("healed.db", healed, [(daily_last,)])
 # 覆盖态的**期望落后交易日数**必须由夹具自己派生，不能写死（写死＝日期依赖断言）：
 # 本批首版写死 2，第二天（10-12 是夹具里的开市日）真读数变 3，门禁在完全健康的代码上判红——
 # 与「窗口边界必须与写入口径同区」同族。算法与读数腿一致：日 max 之后、且不晚于今日的开市行数。
-import datetime
-today = datetime.date.today().strftime("%Y%m%d")
-expect = sum(1 for d, o in healed if o == 1 and d > "20260930" and d <= today)
+expect = sum(1 for ds, o in healed if o == 1 and ds > daily_last and ds <= ymd(today))
 open(os.path.join(root, "expect_lag"), "w").write(str(expect))
 PYCAL
 CAL_EXPECT=$(cat "$VNG106_CAL/expect_lag" 2>/dev/null || true)
@@ -11961,6 +12061,15 @@ PYMUT115
 dys115() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=本枚独有读数 KEY $6=翻转后的值 $7=说明
 	local id="$1" rel="$2" old="$3" new="$4" key="$5" want="$6" why="$7" n got
 	CNT115=$((CNT115 + 1))
+	# old 与 new 逐字相同＝这条反证是 **no-op**：mutate.py 会数到 1（靶串确实在文件里）、
+	# 写回的内容却和原来一模一样，于是核对器恒退 0，读数看上去像"锁没抓住破坏"。
+	# 本仓实录（2026-10-14）：本批把台账 /api/kline 的证据行号从 531 机械重锚到 525 后，
+	# C5 那条**写死 531** 的 sed 变成空替换，门禁红在「破坏后仍然退出 0」——
+	# 破坏串过期与判据失灵在读数上长得一模一样，所以先在这里把两件事分开。
+	if [ "$old" = "$new" ]; then
+		echo "--- FAIL: §115 反证 ${id} 的变异前/后逐字相同（no-op：靶串已被别处改动而这里的写法没跟上，等于没做反证）：${why}"
+		exit 1
+	fi
 	cp "$REPO115/$rel" "$MIR115/$rel" || { echo "--- FAIL: §115 反证 ${id} 无法从主仓复位镜像文件 $rel"; exit 1; }
 	n=$(python3 "$W115/mutate.py" "$MIR115/$rel" "$old" "$new" 2>&1 || true)
 	[ "$n" = "1" ] || { echo "--- FAIL: §115 反证 ${id} 变异落地数=${n}（应恰好 1）：$why"; exit 1; }
@@ -11992,7 +12101,10 @@ KLINE_CLASS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(prin
 dys115 C3 "$LED115" "$KLINE_ROW" "$KLINE_CLASS" UNTAGGED 1 '分类标签被清空：空标签＝「没看过」被算成「看过了」（Q2 的等值锁）'
 KLINE_NOBASIS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(printf '\t')internal/server/handlers_fix.go#$(printf '\t')无依据$(printf '\t')internal/server/handlers_fix.go#")
 dys115 C4 "$LED115" "$KLINE_ROW" "$KLINE_NOBASIS" NO_BASIS 1 '把说不清的条目塞进「无依据」假装闭合：那一档必须是待决策而不是台账的一行'
-KLINE_EVID=$(printf '%s' "$KLINE_ROW" | sed 's#internal/server/handlers_fix.go:531#internal/server/handlers_ghost.go:531#')
+# C5 证据落点指向不存在的文件。**不写死行号**（本段注释里记的那次红就是写死 531 被重锚到 525 后变空替换）：
+# 按 `file:line:anchor` 的列格式只换**文件名**段，行号与锚点原样带走，
+# 于是这条反证对"以后继续机械重锚行号"免疫，而 dys115 的落地数仍恰好 1。
+KLINE_EVID=$(printf '%s' "$KLINE_ROW" | sed 's#internal/[A-Za-z0-9_/]*\.go:#internal/ghost115_file.go:#')
 dys115 C5 "$LED115" "$KLINE_ROW" "$KLINE_EVID" BROKEN_EVIDENCE 1 '落点指向不存在的文件：证据列退化成记忆（运维 curl 不能只是形容词）'
 # C6 前端把调用点删了而台账没改：翻 LEDGER_LIES（撒谎检测），R 与台账都不动。
 dys115 C6 web/src/api/index.js "  return request('/api/research/library')" "  return [] // §115 C6 反证：调用点被摘掉而台账仍写「前端调用」" LEDGER_LIES 1 '「标签必须被实时派生证实」这条不在 Q1–Q3 里，但没有它，台账可以把每一条都写成前端调用然后绿着'
@@ -12027,6 +12139,473 @@ CNT115=$((CNT115 + 1))
 [ "$SUMK115" = "$((CNT115 - 1))" ] || { echo "--- FAIL: §115 分组求和自证锁 ${CNT115}（五组快照之和 ${SUMK115} != 累计判定点扣本锁 $((CNT115 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
 rm -rf "$W115"
 echo "ok - §115 全段通过：① 台账形态与证据诚实（含公网 IP/凭据/镜像路径三枚负锁与核对器掏空负锁）${K1_N} 道 + ② 逐键等值（R=186 / C=150 / 未调用=36 / Q2=0 / Q3=0）+ 三枚求和自证 ${K2_N} 道 + ③ 镜像基线自证（派生清单 ${MIRN115} 个文件、逐键与主仓同值）${K3_N} 道 + ④ ${DYS115_N} 枚反证 C1–C${DYS115_N}（每枚断一个本枚独有读数）${K4_N} 道 + ⑤ 覆盖面诚实账与在位锁 ${K5_N} 道，累计判定点 ${CNT115}（其中五组快照之和 ${SUMK115}，另有 1 道就是求和自证锁本身）"
+echo ""
+
+echo "==> 116 §SIGBATCH 展示侧补价收形（2026-10-13 现网信号 tab「请求超时」修复批，含二批补齐腿）：五个补价面从「逐票真打上游」改成「快照优先 + 每分片一次批量 + 3s 有界等待 + 批量覆盖不住时有上限逐票补齐」，过程读数同格式上屏——静态锁 + 两组行为腿 + 九枚反证（六枚 overlay 行为＋三枚副本静态）..."
+
+# 这一段守的不是「尺子挑错时钟」，而是**响应被自己的取价方式拖死**这一族。
+#
+#  ① 现网实录（被测 6f08c74，2026-10-13 10:19 发版当日 15:0x 起信号 tab 全空）：
+#     §N-RELAX 让「有分可观察」的 N 形观察件进看板 ⇒ 当日信号组数 75→271；
+#     handleFixSignals 给每条信号开一个 goroutine、各调一次 quoteDisplay；观察件从不被
+#     EnsureStock 钉进 fetcher 的 5s 快照池（只有买入信号进池），于是每次都落到
+#     dc.GetQuote 的逐票四级链——**这一层没有行情缓存**（5s TTL 缓存在 MarketAPI 上，
+#     dc.GetQuote 不经过它，改前代码注释里那句承诺是假的，本段第 ② 组把它钉成负锁）。
+#     结果：每次 20s 轮询≈210 次上游 HTTP ⇒ 响应恒被前端 20s AbortController 掐掉 ⇒
+#     「加载失败：请求超时」，而门禁 113 段、夜间七腿、/health 全绿。
+#     owner 裁决：观察件保留（放宽门禁是功能，不是缺陷），修的是取价方式。
+#  ② 同形缺陷不止一个面：/api/snapshot/hot 与 /api/signals 同为「全部信号代码」规模；
+#     /api/snapshot、/api/watchlist、/api/evaluations 三个面在自选页同一轮 60s 刷新里并发，
+#     每个都逐票打上游 ⇒ 一轮刷新＝自选股数×3 次上游请求。五面统一走 s.displayQuotes，
+#     少收一面就是留着同一个坑等下一次信号数量上涨再踩（owner 令「实装优先禁删除」同族）。
+#  ③ 修法三件事必须同时在场，缺一条下次照样复发：
+#     批量入口（数据层每分片一次请求，分片失败不影响其他分片，拿多少算多少）、
+#     有界等待（上限常量 3s；晚到结果不采用；缺价按缺数渲染——绝不把响应交给上游 30s 客户端超时）、
+#     同格式读数（五个面各写一条「<端点> 现价补齐 … 批量请求=N」，把「又被逐票打爆」变成天天可比读数）。
+#  ③b 二批：只有批量还不够，但补齐必须有上限（本批门禁 §2 的 e2e 契约腿实跑逼出来的）：
+#     dc.BatchQuotes 只覆盖同花顺一片，两类代码批量必然取不到价——没有 coordinator 的装配
+#     （internal/e2e 的 HTTP rig 用 server.New(...)、不调 SetCoordinator，价格来自 fixture MarketAPI）
+#     与同花顺覆盖不到的代码（北交所自 20260828 断更、停牌、分片部分返回）。
+#     改后它们交给 topUpQuotes：只补「批量没返回可用价」的代码，一次请求最多 displayQuoteSoloMax=30 次
+#     逐票上游，且必须跑在批量那个 goroutine 内（挪进主腿就是把 30 次耗时算进响应，3s 上限白设计）。
+#     洪峰形状「代码数 × 逐票」被换成了「常量 30 的硬上限」，而读数里的 逐票补齐/补齐命中
+#     两个计数把这条腿单独摊开——哪天批量源覆盖不住，日志当天可见，不用等用户报「价格全空」。
+#  ④ 行语义按**行内容**分家，最容易被"顺手统一"：/api/snapshot 的行内容就是行情本身
+#     （缺价即无该行，沿用改前语义）；/api/watchlist、/api/evaluations 的行内容是「自选里有这只」
+#     与「这只的战法评分」，现价只是附挂字段，缺价必须留行按 0 渲染。测试 ⑥ 钉的就是这个不对称，
+#     本段反证 N4 往「抹行」方向破坏一次，证明这条锁不是摆设。
+#  ⑤ 测试缝 batchQuoteFn / degradeQuoteFn 只在包内注入、生产恒 nil：要断言的是「一次请求打了几次
+#     上游」这一维（批量几次、补齐几次），真实 dc 上无法伪造（hithink 客户端是具体类型），
+#     只能换掉入口才能数调用数。判据形状＝「非测试文件里赋值点恰 0 枚」（生产不许接线）＋
+#     「测试文件里赋值点恰 8 枚」（每个用例各注一次；哪天有人把缝做成常驻，这里先红）。
+#  ⑥ 反证九枚 N1–N9 全在 `go test -overlay` 的替换副本或 /tmp 副本上做（零改源，§112/§113 同族；
+#     与 §114 的镜像树是同族两种做法：overlay 只替换编译输入，仓库字节一字不动）。
+#     三条纪律照抄：变异在副本里的**落地数必须恰好 1**（拼错一次会静默变成 no-op，
+#     而 no-op 的反证看起来像跑过了）；每枚断「本枚独有的那条红＋点名的兄弟仍绿」；
+#     并**去掉 overlay 复跑同一组必须全绿**（证明红来自变异，不来自环境）。
+#     N6/N7/N9 是三枚**静态锁**反证：同一把尺子先在未变异副本上读出基线值（副本机制自证），
+#     再在变异副本上读出另一个值（等值锁/顺序锁真的在比，不是恒绿）。
+#
+#  ★ 本段的「代码行 vs 说明文字」判据仍走 scripts/fe_contract_scan.mjs 的 codeOnly
+#     （§113 第一个消费者、§114 第二个、本段第三个），门禁内不出现第二把剥注释尺子。
+#
+#  English: §116 locks the signal-tab timeout fix. Five display-side quote surfaces stop calling
+#  the per-symbol chain and go through one batched, bounded, snapshot-first path, with a *capped*
+#  per-symbol top-up leg (displayQuoteSoloMax=30, inside the same goroutine) for codes the batch
+#  cannot cover — the shape the e2e HTTP contract test in §2 forced out of this batch.
+#  The readout line is shared by all five so a future flood is visible in logs instead of user
+#  reports; row semantics on missing quotes stay deliberately asymmetric; both quote seams are
+#  test-only (zero production assignments). Nine reversals — six overlay-behavioral, three static
+#  on copies — prove the locks bite.
+CNT116=0
+REPO116="$PWD"
+SRC116=internal/data/source.go
+HGY116=internal/data/hithink.go
+HND116=internal/server/handlers_fix.go
+SRV116=internal/server/server.go
+DT116=internal/data/sigbatch_coordinator_test.go
+ST116=internal/server/sigbatch_display_test.go
+API116=web/src/api/index.js
+GS116=scripts/verify_changes.sh
+W116="$(mktemp -d /tmp/sb116gate-XXXXXX 2>/dev/null || true)"
+[ -n "$W116" ] || { echo "--- FAIL: §116 建不出 overlay/副本目录，两组行为腿与九枚反证无法跑（宁可红，不许跳）"; exit 1; }
+
+eq116() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT116=$((CNT116 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §116 整串等值锁 ${CNT116}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+neg116() { # $1=文件 $2=整串 $3=说明 → 彻底没有（本段两枚「假承诺」负锁走原文而非剥注释：
+	# 那两串本来就是注释里的话，剥了注释再判＝锁对「把假话写回注释」这件事天生失明）
+	CNT116=$((CNT116 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §116 负锁 ${CNT116}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
+}
+re116() { # $1=文件 $2=ERE $3=预演 $4=说明 → 按「整行形状」数，用于语句形态锁
+	CNT116=$((CNT116 + 1))
+	local got
+	got=$(grep -cE -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §116 行形等值锁 ${CNT116}（${4}）：${1} 行形「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+min116() { # $1=说明 $2=实得 $3=应≥ —— 派生面过窄即红（空转正锁家族）
+	CNT116=$((CNT116 + 1))
+	[ "${2:-0}" -ge "${3:-1}" ] || { echo "--- FAIL: §116 派生正锁 ${CNT116}（${1}）：实得=${2:-0} 应≥${3}"; exit 1; }
+}
+code116() { # $1=仓库根相对路径 → 纯代码文本（与 §113/§114 同一把尺子，门禁内唯一）
+	REL116="$1" node --input-type=module -e '
+const { codeOnly } = await import("./scripts/fe_contract_scan.mjs")
+const fs = await import("node:fs")
+const raw = fs.readFileSync(process.env.REL116, "utf8")
+const code = codeOnly(raw)
+if (code.length > raw.length) {
+  process.stderr.write("codeOnly-长过了原文：" + process.env.REL116 + "\n")
+  process.exit(3)
+}
+process.stdout.write(code)
+'
+}
+body116() { # $1=文件 $2=函数声明前缀整串（必须恰命中 1 处）→ 函数体（含声明行，到下一个顶格 func 前）
+	# 声明命中数!=1 直接 rc=2：让调用方判红，而不是拿空 extract 去喂负锁（恒零命中的假绿家族）
+	local n s
+	n=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${n:-0}" = "1" ] || return 2
+	s=$(grep -nF -- "$2" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	[ -n "$s" ] || return 2
+	awk -v s="$s" 'NR>s && /^func /{exit} NR>=s{print}' "$1"
+}
+ordpos116() { # $1=文件 $2=先整串 $3=后整串 → A_LT_B / A_GE_B / NO_A / NO_B（各取首次命中）
+	local a b
+	a=$(grep -nF -- "$2" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	b=$(grep -nF -- "$3" "$1" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	if [ -z "${a:-}" ]; then echo NO_A; return; fi
+	if [ -z "${b:-}" ]; then echo NO_B; return; fi
+	if [ "$a" -lt "$b" ]; then echo A_LT_B; else echo A_GE_B; fi
+}
+eqord116() { # $1=文件 $2=先整串 $3=后整串 $4=预演 $5=说明 —— 顺序锁（前提判据必须早于派生判据）
+	CNT116=$((CNT116 + 1))
+	local got
+	got=$(ordpos116 "$1" "$2" "$3")
+	[ "$got" = "$4" ] || { echo "--- FAIL: §116 顺序锁 ${CNT116}（${5}）：「${2}」相对「${3}」读出 ${got}，预演=${4}"; exit 1; }
+}
+land116() { # $1=源文件 $2=目标副本 $3=原串 $4=新串 → 打印落地数（≠1 时由调用方判红；0＝反证根本没改到东西）
+	OV_OLD116="$3" OV_NEW116="$4" python3 - "$1" "$2" <<'PY116'
+import os, pathlib, sys
+src, dst = sys.argv[1], sys.argv[2]
+old = os.environ["OV_OLD116"]
+new = os.environ["OV_NEW116"]
+t = pathlib.Path(src).read_text(encoding="utf-8")
+n = t.count(old)
+if n != 1:
+	sys.stderr.write("landing=%d\n" % n)
+	sys.exit(4)
+pathlib.Path(dst).write_text(t.replace(old, new), encoding="utf-8")
+print("1")
+PY116
+}
+SNAP116() { # $1=组号 → 记下本组新增判定点数（收尾 ok 行的「① 组 N 道」由这里派生，不是手写清单）
+	printf -v "L$1_N" '%s' "$((CNT116 - PREV116))"
+	PREV116=$CNT116
+}
+PREV116=0
+
+# ── ① 数据层批量入口：一次请求带一片，分片失败不牵连，零价不进结果，且**不许回落逐票链** ──
+eq116 "$SRC116" "const BatchQuoteChunk = 300" 1 '分片上限＝一次上游请求带 300 只：改这个数就是改上游请求数，必须留痕'
+eq116 "$SRC116" "func (dc *DataCoordinator) BatchQuotes(codes []string) (map[string]*StockInfo, error) {" 1 '协调层批量入口签名'
+eq116 "$SRC116" "	for start := 0; start < len(uniq); start += BatchQuoteChunk {" 1 '分片循环在岗（少了它就是「一次请求塞不下就整体失败」）'
+eq116 "$SRC116" "		quotes, err := hk.BatchQuotes(chunk)" 1 '每片一次客户端调用'
+eq116 "$SRC116" "	return out, firstErr" 1 '分片失败只记第一错、其余分片照收（拿多少算多少）'
+eq116 "$SRC116" "	alias := make(map[string][]string, len(codes))" 1 '裸码→原始写法的多值别名（同一裸码可被调用方用多种写法传入）'
+eq116 "$SRC116" "		for _, orig := range alias[bare] {" 1 '每一种原始写法都要回写键，少回写一种＝调用方按自己传的串查不到'
+eq116 "$SRC116" "	hk := dc.hithinkClient()" 1 '批量入口取客户端走访问器（不直接持字段，与逐票链同源）'
+eq116 "$HGY116" "func (c *HithinkClient) BatchQuotes(codes []string) (map[string]*StockInfo, error) {" 1 '客户端批量方法签名'
+eq116 "$HGY116" "		if it.LastPrice <= 0 {" 1 '零价脏快照在客户端就被剔除（这一层才是真正的承担者，见下方 M 族反证 N 之外的数据层用例）'
+# 体级负锁一律在**剥注释的函数体**上跑（§113/§114 同一把 codeOnly 尺子，第三消费者）。
+# 为什么必须剥：本批自己的注释就写着「与 GetQuote 的 Price>0 判据一致」——用原文数 GetQuote
+# 会读出 1 处而恒红（预演实录），而那句是说明文字，不是又长出一次逐票调用。
+CODESRC116="$W116/source_code.go"
+code116 "$SRC116" > "$CODESRC116" || { echo "--- FAIL: §116 数据层剥注释尺子跑失败（node 不在位或 fe_contract_scan.mjs 改名）：下面的体级负锁没有替代品，宁可红不许跳"; exit 1; }
+BODY116="$W116/body_batch.txt"
+BODY116C="$W116/body_batch_code.txt"
+body116 "$SRC116" "func (dc *DataCoordinator) BatchQuotes(" > "$BODY116" || { echo "--- FAIL: §116 取不出 BatchQuotes 函数体（声明命中数不是 1 或文件改名）：下面三枚体级判据会全部恒绿"; exit 1; }
+body116 "$CODESRC116" "func (dc *DataCoordinator) BatchQuotes(" > "$BODY116C" || { echo "--- FAIL: §116 取不出 BatchQuotes 的剥注释函数体（尺子出了代码文本却抽不出这一段）：两枚负锁会恒绿"; exit 1; }
+BLINES116=$(grep -c . "$BODY116" || true)
+min116 "BatchQuotes 函数体行数（抽取尺子罩得住整段才谈得上体级负锁）" "$BLINES116" 30
+min116 "BatchQuotes 剥注释体行数（注释全被吃掉时负锁罩的是空气）" "$(grep -c . "$BODY116C" || true)" 20
+NOGETQ116=$(grep -cF "GetQuote" "$BODY116C" || true)
+CNT116=$((CNT116 + 1))
+[ "${NOGETQ116:-0}" = "0" ] || { echo "--- FAIL: §116 批量入口体内出现逐票链 ${NOGETQ116} 处：这条路径**刻意不回落** dc.GetQuote——回落会把一次批量重新拆成 N 次上游请求，正是本批要修的形状"; exit 1; }
+NOGETST116=$(grep -cF "GetStockInfo" "$BODY116C" || true)
+CNT116=$((CNT116 + 1))
+[ "${NOGETST116:-0}" = "0" ] || { echo "--- FAIL: §116 批量入口体内出现个股详情逐票入口 ${NOGETST116} 处（同上：不许拆成逐票）"; exit 1; }
+eq116 "$BODY116" "		quotes, err := hk.BatchQuotes(chunk)" 1 '正对照：同一把抽取尺子在体内确实看得见批量调用（否则上面两枚恒零不算证据）'
+SNAP116 1
+
+# ── ② 展示层五面收形：上限常量、批量编排、同一条读数、五个面各一枚、逐票只留在合理的那一处 ──
+eq116 "$HND116" "const displayQuoteBatchWait = 3 * time.Second" 1 '有界等待上限常量（等值锁：改大＝顶穿前端 20s，改小＝现价大量缺失，两头都得先过这里）'
+eq116 "$HND116" "const displayQuoteSoloMax = 30" 1 '逐票补齐腿的次数上限（二批新增：批量覆盖不住的代码可以逐票补，但一次请求最多 30 次——「代码数×逐票」的乘积必须换成常量上限）'
+eq116 "$HND116" "func (s *Server) displayQuotes(codes []string) (map[string]*data.StockInfo, displayQuoteStats) {" 1 '展示补价唯一编排入口'
+eq116 "$HND116" "func (s *Server) topUpQuotes(codes []string, got map[string]*data.StockInfo) (map[string]*data.StockInfo, int) {" 1 '补齐腿入口签名：第二个返回值＝真的打了几次逐票（用 len(结果) 计数会把「打出去但补不到价」抹成 0，读数就成了谎话）'
+eq116 "$HND116" "func (s *Server) degradeQuote(code string) *data.StockInfo {" 1 '补齐腿的缝包装（与 batchQuotes 同形：判据先缝后真源，用例数到的次数才代表真实路径）'
+eq116 "$HND116" "func (s *Server) logDisplayQuotes(endpoint string, st displayQuoteStats) {" 1 '读数单出口（五面共用一条格式）'
+eq116 "$HND116" "现价补齐 唯一代码=%d 快照命中=%d 批量代码=%d 批量请求=%d 批量命中=%d 逐票补齐=%d 补齐命中=%d 等待=%dms 放弃等待=%v 原因=%s" 1 '读数格式恰一枚实现，且补齐腿的两个计数必须在格式里（抄成两份会分家；漏掉计数＝这条腿哪天顶到上限也没人看得见）'
+eq116 "$HND116" "	timer := time.NewTimer(displayQuoteBatchWait)" 1 '上限真的接进了 select（只有常量没有 timer＝注释级承诺）'
+eq116 "$HND116" "	case <-timer.C:" 1 '到点分支在岗（缺它＝主腿只能等上游，等于没有时限）'
+eq116 "$HND116" "	done := make(chan batchQuoteOutcome, 1)" 1 'cap=1 channel：主腿返回后晚到的 goroutine 不阻塞也不写共享 map'
+eq116 "$HND116" "	st.chunks = (len(misses) + data.BatchQuoteChunk - 1) / data.BatchQuoteChunk" 1 '批量请求数由分片上限派生（读数里的 N 是算出来的，不是拍的）'
+eq116 "$HND116" "			if si := res.quotes[code]; si != nil && si.Price > 0 {" 1 '批量结果按 Price>0 收（与逐票链同判据；纵深防御层）'
+re116 "$HND116" 'if si := res\.quotes\[code\]' 1 '批量结果收价判据在全文件只出现一枚：同形判据复制到第二处就会分家，两处各改一半时谁也看不出少了哪一路'
+eq116 "$HND116" "if si := res.solo[code]; si != nil && si.Price > 0 {" 1 '补齐腿的结果只在批量没覆盖时才采用，且同样按 Price>0 收（两条腿分开计数，读数才分得清是谁补的）'
+re116 "$HND116" 'if si := res\.solo\[code\]' 1 '补齐结果收价判据在全文件只出现一枚（上面那枚的同一纪律：分家后改一处漏一处）'
+eq116 "$HND116" "st.soloCalls = res.calls" 1 '补齐次数经 goroutine 结果交回后写进读数——在主腿里自己数＝把最多 30 次逐票的耗时算进响应时间，3s 有界等待就白设计了（N9 断的就是这个位置）'
+eq116 "$HND116" "st.soloHits++" 1 '补齐命中单独计数：混进批量命中数就读不出「批量源覆盖不住了」这个前兆信号'
+eq116 "$SRV116" "degradeQuoteFn func(code string) *data.StockInfo" 1 '补齐腿测试缝字段在位（生产恒 nil 走 quoteDisplay，赋值点计数见 ③ 组）'
+eq116 "$SRV116" "	batchQuoteFn func(codes []string) (map[string]*data.StockInfo, error)" 1 '测试缝字段在位（签名与 dc.BatchQuotes 同形，注入才能替身）'
+# 五个面：每面一枚 displayQuotes 调用点 + 一枚读数调用点，且体内既无逐票取价也无 WaitGroup。
+CODEHND116="$W116/handlers_code.go"
+code116 "$HND116" > "$CODEHND116" || { echo "--- FAIL: §116 展示层剥注释尺子跑失败（同数据层那枚：负锁不许退回原文 grep，本批注释里就有 quoteDisplay/GetQuote 的说明文字）"; exit 1; }
+SURF116="handleFixSignals handleFixSnapshot handleFixHotSnapshot handleFixEvaluations handleFixGetWatchlist"
+SURFN116=$(printf '%s\n' $SURF116 | grep -c . || true)
+CNT116=$((CNT116 + 1))
+[ "${SURFN116:-0}" = "5" ] || { echo "--- FAIL: §116 五面清单长度读到 ${SURFN116:-0}（应 5）：清单式判据必须钉长度，短清单会把「漏收一个面」报成绿"; exit 1; }
+for f116 in $SURF116; do
+	B116="$W116/body_$f116.txt"
+	B116C="$W116/body_${f116}_code.txt"
+	body116 "$HND116" "func (s *Server) $f116(" > "$B116" || { echo "--- FAIL: §116 取不出 ${f116} 函数体（声明不唯一/改名）：这个面的四枚体级锁会恒绿"; exit 1; }
+	body116 "$CODEHND116" "func (s *Server) $f116(" > "$B116C" || { echo "--- FAIL: §116 取不出 ${f116} 的剥注释函数体：这个面的两枚恒零负锁会恒绿（恒零不是证据）"; exit 1; }
+	min116 "${f116} 函数体行数（抽取罩不住整段时负锁是假的）" "$(grep -c . "$B116" || true)" 20
+	min116 "${f116} 剥注释体行数（尺子把整段吃掉时负锁罩的是空气）" "$(grep -c . "$B116C" || true)" 10
+	eq116 "$B116" "qst := s.displayQuotes(" 1 "${f116} 体内批量补价调用点恰一枚"
+	eq116 "$B116" "	s.logDisplayQuotes(" 1 "${f116} 体内读数调用点恰一枚（少它＝这一面重新变成不可见）"
+	CNT116=$((CNT116 + 1))
+	[ "$(grep -cF 's.quoteDisplay(' "$B116C" || true)" = "0" ] || { echo "--- FAIL: §116 ${f116} 体内又出现逐票取价：这一面回到「每条一个上游请求」的形状（信号数一涨就顶穿前端超时）"; exit 1; }
+	CNT116=$((CNT116 + 1))
+	[ "$(grep -cF 's.topUpQuotes(' "$B116C" || true)" = "0" ] || { echo "--- FAIL: §116 ${f116} 体内直接调补齐腿：补齐只能由 displayQuotes 在批量那个 goroutine 内触发（放在面里＝绕掉次数上限与有界等待两层闸，各面还会长出三份不同口径的补齐）"; exit 1; }
+	CNT116=$((CNT116 + 1))
+	[ "$(grep -cF 'sync.WaitGroup' "$B116C" || true)" = "0" ] || { echo "--- FAIL: §116 ${f116} 体内长出 WaitGroup：逐票 goroutine 家族（无时限、无并发上限）不许回潮"; exit 1; }
+done
+# 正对照：同一把体级尺子在**合法保留**的那一处必须看得见逐票取价（POST 单只自选，合理）。
+BODYADD116="$W116/body_add.txt"
+BODYADDC116="$W116/body_add_code.txt"
+body116 "$HND116" "func (s *Server) handleFixAddWatchlist(" > "$BODYADD116" || { echo "--- FAIL: §116 取不出 handleFixAddWatchlist 函数体（正对照失效：上面五枚恒零负锁就没有反证了）"; exit 1; }
+body116 "$CODEHND116" "func (s *Server) handleFixAddWatchlist(" > "$BODYADDC116" || { echo "--- FAIL: §116 取不出 handleFixAddWatchlist 的剥注释体（正对照跑在空气上）"; exit 1; }
+eq116 "$BODYADDC116" "s.quoteDisplay(" 1 '正对照：单只新增自选仍走逐票入口（同一把尺子在合法处看得见真目标，五枚恒零才是证据）'
+re116 "$HND116" 's\.quoteDisplay\(' 2 '本文件逐票取价只剩两处：新增自选（单只，合理）+ degradeQuote（补齐腿的唯一出口，受 displayQuoteSoloMax 上限管）。展示面里偷偷加回第三处时这里先红'
+re116 "$HND116" 's\.topUpQuotes\(' 1 '补齐腿在全文件只有一个调用点（displayQuotes 的 goroutine 内）：多处调用＝上限是按请求算的还是全局算的读不出来，洪峰又能长回来'
+PKGQD116=$(grep -rn 's\.quoteDisplay(' internal/server --include='*.go' 2>/dev/null | grep -v '_test\.go' | grep -c . || true)
+CNT116=$((CNT116 + 1))
+[ "${PKGQD116:-0}" = "5" ] || { echo "--- FAIL: §116 internal/server 非测试文件逐票取价读到 ${PKGQD116:-0} 处，预演 5（自选新增 1 + degradeQuote 补齐腿唯一出口 1 + 模拟盘持仓 1 + 实盘持仓 2）：持仓侧那三处按 owner 口径保留（买入票会被钉进快照池、数量是个位数），新增第六处必须在这里现形"; exit 1; }
+re116 "$HND116" '^	quotes, qst := s\.displayQuotes\(' 5 '五个面的补价入口同形状（一处写成别的形态就会绕掉下面那批体级锁）'
+re116 "$HND116" '^	s\.logDisplayQuotes\("' 5 '五面各一条读数：这枚是「有代码无调度/漏一面」的家族锁，等值而非下界（多一面也红，见 N7）'
+# 顺序锁（本批五枚）：缝先于真源、快照先于批量、timer 先于到点分支、补齐先于主腿计时、上限检查先于真正打出去。
+BODYBQ116="$W116/body_batchquotes.txt"
+body116 "$HND116" "func (s *Server) batchQuotes(" > "$BODYBQ116" || { echo "--- FAIL: §116 取不出 batchQuotes 函数体：下面的顺序锁会读成 NO_A 而判红是巧合，不是判据"; exit 1; }
+eqord116 "$BODYBQ116" "	if s.batchQuoteFn != nil {" "	if s.dc == nil {" A_LT_B '测试缝判据必须先于真源判据（反序＝生产 dc 为 nil 时先把缝吃掉，用例数不到真实路径）'
+BODYDQ116="$W116/body_displayquotes.txt"
+body116 "$HND116" "func (s *Server) displayQuotes(" > "$BODYDQ116" || { echo "--- FAIL: §116 取不出 displayQuotes 函数体（同上）"; exit 1; }
+eqord116 "$BODYDQ116" "		if si := s.quoteSnapshot(code); si != nil {" "		q, err := s.batchQuotes(misses)" A_LT_B '快照优先必须先于批量（反序＝快照本可以零网络解决的代码也照样打上游）'
+eqord116 "$BODYDQ116" "	timer := time.NewTimer(displayQuoteBatchWait)" "	case <-timer.C:" A_LT_B '时限先于到点分支（这条被挪进循环/挪到 select 之后，整段有界等待就没了）'
+eq116 "$BODYDQ116" "solo, calls := s.topUpQuotes(misses, q)" 1 '正对照：补齐确实在 displayQuotes 体内（下面两枚顺序锁读的不是空气）'
+# 注意这里比的是 goroutine 的**收束标记**而不是 timer 那一行：补齐只要在 `}()` 之后出现，
+# 它就已经搬到主腿了（N9 第一次试的靶子是 timer，结果「挪出 goroutine 但仍写在 timer 之前」
+# 这种破坏照旧读 A_LT_B＝尺子对目标形态失明，反证当场把这件事逼了出来）。
+eqord116 "$BODYDQ116" "solo, calls := s.topUpQuotes(misses, q)" "	}()" A_LT_B '补齐必须排在批量那个 goroutine 收束之前（挪进主腿＝把「最多 30 次逐票」的耗时挤进响应时间，3s 有界等待白设计；N9 断的就是这个位置）'
+BODYTU116="$W116/body_topup.txt"
+body116 "$HND116" "func (s *Server) topUpQuotes(" > "$BODYTU116" || { echo "--- FAIL: §116 取不出 topUpQuotes 函数体：下面的上限判据锁与顺序锁会读成 NO_A 而判红是巧合，不是判据"; exit 1; }
+min116 "topUpQuotes 剥注释体行数（尺子把整段吃掉时下面两枚负锁罩的是空气）" "$(body116 "$CODEHND116" "func (s *Server) topUpQuotes(" | grep -c . || true)" 8
+eq116 "$BODYTU116" "if calls >= displayQuoteSoloMax {" 1 '补齐次数上限判据在体内（只有常量没有判据＝上限是注释级承诺）'
+eqord116 "$BODYTU116" "if calls >= displayQuoteSoloMax {" "calls++" A_LT_B '上限检查先于真正打出去（先调用再检查＝那一次已经发出去了，上限读成 31；判据整段删掉就是 N8 反证断的形状）'
+# 两枚「假承诺」负锁：改前注释里那两句在现网是错的，谁把它们写回来＝重新给逐票打上游发通行证。
+neg116 "$HND116" "回落走 dc.GetQuote 的 5s TTL 缓存" '改前对 dc 层缓存的错误描述（5s TTL 在 MarketAPI 上，dc.GetQuote 不经过它）'
+neg116 "$HND116" "只读，不回落真打上游" '改前对 quoteSnapshot 的错误承诺（缺失就回落，正是洪峰的入口）'
+eq116 "$API116" "  return request('/api/signals', { timeout: 20000 })" 1 '前端 20s 上限在位：3s 有界等待是按这条预算选的，两条必须一起被读'
+# 代码行尺子（同一把 codeOnly）：读数调用点是 5 行**代码**，不是 5 行注释。
+CODE116="$(code116 "$HND116")" || { echo "--- FAIL: §116 codeOnly 剥注释尺子跑失败（node 不在位或 fe_contract_scan.mjs 改名）：本段的代码行判据没有替代品，宁可红"; exit 1; }
+CODELOG116=$(printf '%s' "$CODE116" | grep -cE '^[[:space:]]*s\.logDisplayQuotes\("' || true)
+CNT116=$((CNT116 + 1))
+[ "${CODELOG116:-0}" = "5" ] || { echo "--- FAIL: §116 剥注释后 s.logDisplayQuotes 语句读到 ${CODELOG116:-0} 行，预演 5：全文 grep 会被说明文字里的同形串撑红或撑绿，这条走的是真正执行到的语句"; exit 1; }
+SNAP116 2
+
+# ── ③ 测试资产在位 + 两组行为腿（断的是「实跑并通过的用例数」，不是「包里打了 ok」）──
+re116 "$DT116" '^func Test' 6 '数据层批量用例枚数（6 枚：分片/去重别名/分片失败隔离/零价/客户端零价/无客户端）'
+re116 "$ST116" '^func TestSigBatch' 8 '展示层用例枚数（8 枚：①一次调用 ②快照零调用 ③失败保列表 ④有界等待 ⑤三面各一次 ⑥行语义分家 ⑦五面读数上屏 ⑧补齐腿次数上限）'
+eq116 "$DT116" "func TestBatchQuotesChunked(t *testing.T) {" 1 '「只打 N 次」这一维的数据层用例在位'
+eq116 "$ST116" "func TestSigBatchDisplayBoundedWait(t *testing.T) {" 1 '「有界等待」用例在位（上限常量等值锁之外的机制证明）'
+eq116 "$ST116" "func TestSigBatchDisplaySoloTopUpCapped(t *testing.T) {" 1 '「补齐腿次数上限」用例在位（displayQuoteSoloMax 常量等值锁之外的机制证明：三态全覆盖/缺 20/整片没覆盖）'
+SEAMTEST116=$(grep -cE 's\.batchQuoteFn = ' internal/server/sigbatch_display_test.go 2>/dev/null || true)
+CNT116=$((CNT116 + 1))
+[ "${SEAMTEST116:-0}" = "8" ] || { echo "--- FAIL: §116 测试文件里 batchQuoteFn 注入点读到 ${SEAMTEST116:-0}，预演 8（八个用例各一次）：某个用例不再注入缝＝它其实在测真实上游或根本没测到批量这一维"; exit 1; }
+SEAMTESTD116=$(grep -cE 's\.degradeQuoteFn = ' internal/server/sigbatch_display_test.go 2>/dev/null || true)
+CNT116=$((CNT116 + 1))
+[ "${SEAMTESTD116:-0}" = "1" ] || { echo "--- FAIL: §116 测试文件里 degradeQuoteFn 注入点读到 ${SEAMTESTD116:-0}，预演 1（只有 ⑧ 数补齐次数）：枚数涨到 2 说明有人开始用补齐缝测别的东西而那条用例的判据还在 ⑧ 手里；掉到 0 说明补齐腿的用证消失，上限锁会变成纯字节锁"; exit 1; }
+SEAMPRODD116=$(grep -rln 'degradeQuoteFn = ' internal cmd --include='*.go' 2>/dev/null | grep -v '_test\.go$' | grep -c . || true)
+CNT116=$((CNT116 + 1))
+[ "${SEAMPRODD116:-0}" = "0" ] || { echo "--- FAIL: §116 非测试文件出现 degradeQuoteFn 赋值 ${SEAMPRODD116:-0} 处：这条缝的语义同样是「生产恒 nil」，一旦被常驻接线，用例数到的补齐次数就不再代表真实的 quoteDisplay 链"; exit 1; }
+SEAMPROD116=$(grep -rln 'batchQuoteFn = ' internal cmd --include='*.go' 2>/dev/null | grep -v '_test\.go$' | grep -c . || true)
+CNT116=$((CNT116 + 1))
+[ "${SEAMPROD116:-0}" = "0" ] || { echo "--- FAIL: §116 非测试文件出现 batchQuoteFn 赋值 ${SEAMPROD116:-0} 处：这条缝的语义是「生产恒 nil」，一旦被常驻接线，用例数到的调用次数就不再代表真实路径"; exit 1; }
+GO116_DATA="$W116/godata.txt"
+go test ./internal/data/ -run 'TestBatchQuotes|TestHithinkBatchQuotes' -v > "$GO116_DATA" 2>&1 || true
+DPASS116=$(grep -cE '^--- PASS' "$GO116_DATA" || true)
+min116 "数据层批量用例实跑通过数（-run 'TestBatchQuotes|TestHithinkBatchQuotes'：写错正则这里就是 0，不会像 go test 那样打一行 ok 蒙过去）" "$DPASS116" 6
+if grep -qE '^--- FAIL|^FAIL' "$GO116_DATA"; then
+	echo "--- FAIL: §116 数据层批量用例有红（$(grep -E '^--- FAIL' "$GO116_DATA" | head -2 | tr '\n' ' ')）"
+	exit 1
+fi
+GO116_SRV="$W116/gosrv.txt"
+go test ./internal/server/ -run 'TestSigBatch' -v > "$GO116_SRV" 2>&1 || true
+SPASS116=$(grep -cE '^--- PASS' "$GO116_SRV" || true)
+min116 "展示层用例实跑通过数（-run 'TestSigBatch'）" "$SPASS116" 8
+if grep -qE '^--- FAIL|^FAIL' "$GO116_SRV"; then
+	echo "--- FAIL: §116 展示层补价用例有红（$(grep -E '^--- FAIL' "$GO116_SRV" | head -2 | tr '\n' ' ')）"
+	exit 1
+fi
+SNAP116 3
+
+# ── ④ 九枚反证 N1–N9（N1–N5、N8 走 go test -overlay 的行为反证，N6–N7、N9 走副本的静态锁反证）──
+dys116() { # $1=编号 $2=包 $3=相对源 $4=必红用例 $5=仍绿用例 $6=说明；变异串经 OV_OLD116/OV_NEW116 传入
+	local dst ov out base
+	dst="$W116/mut_$1.go"
+	ov="$W116/ov_$1.json"
+	out="$W116/out_$1.txt"
+	base="$W116/back_$1.txt"
+	local landed
+	landed=$(land116 "$REPO116/$3" "$dst" "$OV_OLD116" "$OV_NEW116" || true)
+	CNT116=$((CNT116 + 1))
+	[ "${landed:-0}" = "1" ] || { echo "--- FAIL: §116 反证 $1（${6}）：变异在副本里落地 ${landed:-0} 处（应恰 1）——落地 0 枚的反证看起来像跑过了，而它什么都没测"; exit 1; }
+	printf '{"Replace": {"%s": "%s"}}' "$REPO116/$3" "$dst" > "$ov"
+	go test -overlay "$ov" "$2" -run "^($4|$5)\$" -v > "$out" 2>&1 || true
+	CNT116=$((CNT116 + 1))
+	if ! grep -qE "^--- FAIL: $4 \(" "$out"; then
+		echo "--- FAIL: §116 反证 $1 没红（${6}）：破坏「$(printf '%s' "$OV_OLD116" | head -c 60)」之后 ${4} 仍通过，说明那条用例没在判这件事（输出=$(tail -3 "$out" | tr '\n' ' ')）"
+		exit 1
+	fi
+	CNT116=$((CNT116 + 1))
+	if ! grep -qE "^--- PASS: $5 \(" "$out"; then
+		echo "--- FAIL: §116 反证 $1 的兄弟用例 ${5} 也红了（${6}）：一枚破坏洗出两条红就读不出归属，本枚的独有红不成立"
+		exit 1
+	fi
+	go test "$2" -run "^($4|$5)\$" -v > "$base" 2>&1 || true
+	CNT116=$((CNT116 + 1))
+	if grep -qE '^--- FAIL' "$base"; then
+		echo "--- FAIL: §116 反证 $1 去掉 overlay 复跑仍红（${6}）：红来自环境或用例本身，不是本枚变异，归属不成立"
+		exit 1
+	fi
+	echo "INFO - §116 反证 $1 落地：${3} 破坏后 ${4} 红、${5} 仍绿、去 overlay 复跑全绿"
+}
+dys116s() { # $1=编号 $2=相对源 $3=尺子名 $4=基线预演 $5=变异预演 $6=说明；变异串经 env 传入
+	local base mut r1 r2
+	base="$W116/s_$1_base.go"
+	mut="$W116/s_$1_mut.go"
+	cp "$REPO116/$2" "$base"
+	local landed
+	landed=$(land116 "$REPO116/$2" "$mut" "$OV_OLD116" "$OV_NEW116" || true)
+	CNT116=$((CNT116 + 1))
+	[ "${landed:-0}" = "1" ] || { echo "--- FAIL: §116 反证 $1（${6}）：静态变异落地 ${landed:-0} 处（应恰 1）"; exit 1; }
+	r1=$(ruler116 "$3" "$base")
+	CNT116=$((CNT116 + 1))
+	[ "$r1" = "$4" ] || { echo "--- FAIL: §116 反证 $1 的副本基线自证失败：未变异副本上尺子 ${3} 读出 ${r1}，预演 ${4}——副本机制本身不可信时，「变异后翻红」不构成证据"; exit 1; }
+	r2=$(ruler116 "$3" "$mut")
+	CNT116=$((CNT116 + 1))
+	[ "$r2" = "$5" ] || { echo "--- FAIL: §116 反证 $1 没翻转（${6}）：尺子 ${3} 在变异副本读出 ${r2}，预演 ${5}——这把尺子对这种破坏形态失明"; exit 1; }
+	echo "INFO - §116 反证 $1 落地：尺子 ${3} 读数 ${r1}→${r2}"
+}
+ruler116() { # $1=尺子名 $2=文件 → 读数（与 ② 组那两枚锁用同一段代码，不是为反证另写的尺子）
+	case "$1" in
+	seam_order)
+		local bb="$W116/ruler_batch.txt"
+		body116 "$2" "func (s *Server) batchQuotes(" > "$bb" 2>/dev/null || { echo BODY_FAIL; return; }
+		ordpos116 "$bb" "	if s.batchQuoteFn != nil {" "	if s.dc == nil {"
+		;;
+	log_callsites)
+		grep -cE '^	s\.logDisplayQuotes\("' "$2" 2>/dev/null || true
+		;;
+	solo_leg_pos)
+		local bb="$W116/ruler_solo.txt"
+		body116 "$2" "func (s *Server) displayQuotes(" > "$bb" 2>/dev/null || { echo BODY_FAIL; return; }
+		ordpos116 "$bb" "solo, calls := s.topUpQuotes(misses, q)" "	}()"
+		;;
+	*)
+		echo RULER_UNKNOWN
+		;;
+	esac
+}
+# N1：分片上限抬成「一片装得下全市场」⇒ 数据层「只打 N 次」那条必红，去重别名那条仍绿。
+OV_OLD116="const BatchQuoteChunk = 300"
+OV_NEW116="const BatchQuoteChunk = 100000"
+dys116 N1 ./internal/data/ "$SRC116" TestBatchQuotesChunked TestBatchQuotesDedupAndAlias '分片上限失效＝一次请求塞不下就整体失败（或整表只打一次却漏掉后面的代码），批量这一维不再是「按片若干次」'
+# N2：有界等待的 timer 抬到一小时 ⇒ 有界等待那条必红，失败保列表那条仍绿（两枚分得开）。
+OV_OLD116="	timer := time.NewTimer(displayQuoteBatchWait)"
+OV_NEW116="	timer := time.NewTimer(time.Hour)"
+dys116 N2 ./internal/server/ "$HND116" TestSigBatchDisplayBoundedWait TestSigBatchDisplayFailureKeepsList '上限常量接线被摘＝响应交回上游 30s 客户端超时，正是把信号 tab 拖死的最后那一段'
+# N3：快照优先判据失效 ⇒ 「快照覆盖全部代码时零上游调用」必红，「271 条只打一次」仍绿。
+OV_OLD116="		if si := s.quoteSnapshot(code); si != nil {"
+OV_NEW116="		if si := s.quoteSnapshot(code); false {"
+dys116 N3 ./internal/server/ "$HND116" TestSigBatchDisplaySnapshotOnlyNoUpstream TestSigBatchDisplayOneCallPerRequest '先批量后快照＝盘中每 20s 都把已经在池子里的票再打一遍上游，白送的流量'
+# N4：把「缺价留行」改成「缺价抹行」⇒ 行语义分家那条必红，三面各一次那条仍绿。
+OV_OLD116="			sigActive = sc.SignalActive
+		}
+		info := quotes[code]"
+OV_NEW116="			sigActive = sc.SignalActive
+		}
+		info := quotes[code]
+		if info == nil {
+			continue
+		}"
+dys116 N4 ./internal/server/ "$HND116" TestSigBatchDisplaySurfaceRowSemanticsDiffer TestSigBatchDisplayWatchSurfacesOneCallPerRequest '评分面缺价抹行＝上游一慢整张战法评分表变短，用户看到的是「今天怎么就这几只」而不是「行情缺数」'
+# N5：摘掉其中一个面的读数调用点 ⇒ 五面读数上屏那条必红，调用次数那条仍绿。
+# 变异写成 `_ = qst` 而不是直接删行：删掉后 qst 变成「声明未使用」，go test 先撞编译错误
+# （实测输出 build failed ⇒ 没有 --- FAIL 行，本枚会红在「破坏没生效」而不是「锁抓住了」，读不出归属）。
+# 留一个空使用＝程序合法、只是这一面不再上屏，正是有人「顺手把这行读数删了」的形状。
+OV_OLD116="	s.logDisplayQuotes(\"/api/evaluations\", qst)
+"
+OV_NEW116="	_ = qst
+"
+dys116 N5 ./internal/server/ "$HND116" TestSigBatchDisplayReadoutOnEverySurface TestSigBatchDisplayWatchSurfacesOneCallPerRequest '少一面读数＝那一面哪天涨回逐票，日志里没有对照物，只能等用户报故障（本批事故的原点）'
+# N6：把测试缝判据整块挪到真源判据之后 ⇒ ② 组那枚顺序锁的尺子读数必须翻转。
+# （原串必须逐字节贴现源：二批把 dc==nil 那句错误文案改成了「无批量入口（本轮由逐票补齐腿兜底）」，
+#   沿用改前旧文案会让本枚落地数读 0，而「反证没落地」和「锁抓住了」在输出里长得一样。）
+OV_OLD116="	if s.batchQuoteFn != nil {
+		return s.batchQuoteFn(codes)
+	}
+	if s.dc == nil {
+		// 没有 coordinator 就没有批量入口（e2e/最小装配的形状）。这里返回错误而不是静默空表：
+		// 读数要能说清「批量不可用，本轮全靠逐票补齐腿」，否则下一次覆盖变化又是隐性事故。
+		return nil, fmt.Errorf(\"数据源未注入，无批量入口（本轮由逐票补齐腿兜底）\")
+	}"
+OV_NEW116="	if s.dc == nil {
+		return nil, fmt.Errorf(\"数据源未注入，无批量入口（本轮由逐票补齐腿兜底）\")
+	}
+	if s.batchQuoteFn != nil {
+		return s.batchQuoteFn(codes)
+	}"
+dys116s N6 "$HND116" seam_order A_LT_B A_GE_B '顺序锁反证：判据换了个位置，行为上「缝先吃掉」的语义就没了，而整串等值锁两条都还是绿的'
+# N7：多写一条读数调用点 ⇒ 五面等值锁的尺子读数 5→6（等值锁不是单向锁：只准少不准多也算挑不出来）。
+OV_OLD116="	s.logDisplayQuotes(\"/api/signals\", qst)"
+OV_NEW116="	s.logDisplayQuotes(\"/api/signals\", qst)
+	s.logDisplayQuotes(\"/api/signals\", qst)"
+dys116s N7 "$HND116" log_callsites 5 6 '等值锁反证：同一面打两次读数（比如挪进循环），下界锁会绿着，等值锁必须现形'
+# N8：把补齐腿的次数上限抬成「装得下整张信号表」⇒ ⑧（补齐上限那条）必红，「271 条只打一次」仍绿。
+# 这是本批二批新长的这条腿自己的破坏形态：上限没了＝覆盖不住时又回到「代码数 × 逐票上游」，
+# 而批量命中数不会变，所以 ①～⑦ 那七条用例全都照绿——只有 ⑧ 数得到这件事。
+OV_OLD116="		if calls >= displayQuoteSoloMax {"
+OV_NEW116="		if calls >= 1 << 30 {"
+dys116 N8 ./internal/server/ "$HND116" TestSigBatchDisplaySoloTopUpCapped TestSigBatchDisplayOneCallPerRequest '补齐上限失效＝批量源哪天覆盖不住（缺 dc、北交所、分片部分返回）就没人拦洪峰，信号数一涨照样顶穿前端 20s——本批事故的原形状只换了个触发条件'
+# N9：把补齐腿从批量那个 goroutine 里挪进主腿 ⇒ ② 组的「补齐先于计时」顺序锁尺子读数翻转。
+# 行为上这一挪只写在副本里（不编译、只喂尺子），因为它要断的是**位置**：挪进主腿后
+# 「最多 30 次逐票」的耗时就不再受 displayQuoteBatchWait 约束，3s 有界等待形同作废，
+# 而等值锁（调用点仍恰一枚、读数仍写 res.calls）四条全都照绿。
+OV_OLD116="		solo, calls := s.topUpQuotes(misses, q)
+		done <- batchQuoteOutcome{quotes: q, solo: solo, calls: calls, err: err}
+	}()"
+OV_NEW116="		done <- batchQuoteOutcome{quotes: q, err: err}
+	}()
+	solo, calls := s.topUpQuotes(misses, q)"
+dys116s N9 "$HND116" solo_leg_pos A_LT_B A_GE_B '位置锁反证：补齐挪出 goroutine 后仍然「只调用一次、仍然计数」，只有它在主腿还是子腿这一维能被这把尺子读出差别'
+DYS116_A=$(grep -cE '^dys116 N[0-9]+ ' "$GS116" 2>/dev/null || true)
+DYS116_B=$(grep -cE '^dys116s N[0-9]+ ' "$GS116" 2>/dev/null || true)
+DYS116_N=$(( ${DYS116_A:-0} + ${DYS116_B:-0} ))
+min116 "§116 反证枚数派生读数（六枚行为 overlay + 三枚副本静态，枚数从调用点派生，写死的收尾文案对下一个新增反证天生失明）" "$DYS116_N" 9
+SNAP116 4
+
+# ── 覆盖面诚实账（不判红，只把「今天还落在锁外面的东西」如实记下来）──
+echo "INFO - §116 覆盖面账：① 五面的批量编排只锁到「调用次数＋有界等待＋读数」这一维，**现价新鲜度**没有锁：3s 到点放弃等待时页面会整批退回触发价/0 价渲染，而用例判定的是「列表不塌」，没人断「这条现价是几秒前的」——那需要上游时间戳进读数，本批不加现网新面（加了就得同批改 §88 的 INFO 计数与 §106 的判数）。② 持仓侧三处逐票取价（模拟盘 1 + 实盘 2）按 owner 口径保留在包级等值锁的 5 里，它们没有反证：买入票会被 EnsureStock 钉进快照池、持仓是个位数，洪峰形状不成立，但**这只在持仓规模小时成立**，若哪天持仓涨到上百只，本段的锁不会替我们喊红。③ 数据层批量入口对「上游返回部分代码」只做了分片级隔离（某片失败不影响别片），没有断言「缺哪些代码」——缺数清单在前端表现为现价空，日志里只有计数。④ 观察件是否应进快照池（改洪峰的根，而不是改取价方式）不在本批承诺内：owner 已裁观察件保留，而进池意味着 fetcher 要为纯观察票常驻打上游，与「快照优先零网络」相冲，这条留给下一次信号数继续上涨时裁决。⑤ N2 的反证把 timer 抬到一小时，破坏形态靠用例自己的 6s 判定，**没有**验证「上限常量与前端 20s 预算的比值」这件事——那把尺子跨语言（Go 常量 vs JS 字面量），门禁里只有两条等值锁并列，换算关系写在注释里而不是判据里。⑥ 二批的补齐腿只锁到「一次请求内最多 30 次」这一维：**上限是按请求算的，不是按进程累计的**——自选页一轮刷新并发三个面，最坏情况是 3×30 次逐票，本段没有跨面/跨秒的总预算闸（要做就得引入请求间共享的令牌桶，那是另一个形状，本批不动）。同时 30 这个数是按「一轮请求里批量覆盖不住的代码量通常远小于它」选的，选型依据没有进判据；哪天现网读数天天顶到 30，说明该改的是批量源的覆盖（北交所/停牌那两片），不是把上限调大。再记一笔代价：**「逐票补齐」打的是尝试数而不是命中数**，所以批量整片失败时每轮都会把 30 次打完（缺价代码排在前面就先补）——这是有意的兜底，响应仍受 3s 上限保护，但上游确实会吃到最多 30 次/请求/面。⑦ 补齐腿「补到的价真到了前端」这件事由 §2 的 e2e 契约腿（fixture MarketAPI，断 600580 现价＝36.86）证，本段 ⑧ 证的是次数与读数；两条腿各证一维，缺一条另一条都替换不了。"
+
+# ── 分组自证（本段最后两道锁）──
+CNT116=$((CNT116 + 1))
+_EMPTY_L=""
+for _g116 in 1 2 3 4; do
+	_v116="L${_g116}_N"
+	if [ "${!_v116}" -le 0 ]; then _EMPTY_L="${_EMPTY_L} ${_g116}"; fi
+done
+[ -z "$_EMPTY_L" ] || { echo "--- FAIL: §116 分组快照在位锁 ${CNT116}（这些组一个判定点都没记到：组${_EMPTY_L}）——漏一处 SNAP116 时那组的锁会被并进邻组读数，累计数正常而分组数是假的"; exit 1; }
+SNAP116 5
+SUMK116=$((L1_N + L2_N + L3_N + L4_N + L5_N))
+CNT116=$((CNT116 + 1))
+[ "$SUMK116" = "$((CNT116 - 1))" ] || { echo "--- FAIL: §116 分组求和自证锁 ${CNT116}（五组快照之和 ${SUMK116} != 累计判定点扣本锁 $((CNT116 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
+rm -rf "$W116"
+echo "ok - §116 全段通过：① 数据层批量入口（分片/别名/零价/不回落逐票＋体级正对照）${L1_N} 道 + ② 展示层五面收形（两枚上限常量/单出口读数/补齐腿两条计数与签名/五面清单 ${SURFN116} 面各 5 枚/五枚顺序锁/两枚假承诺负锁/代码行尺子）${L2_N} 道 + ③ 测试资产与行为腿（数据层实跑 ${DPASS116} 条、展示层实跑 ${SPASS116} 条、批量缝注入 ${SEAMTEST116}/补齐缝注入 ${SEAMTESTD116}/生产赋值 ${SEAMPROD116}+${SEAMPRODD116}）${L3_N} 道 + ④ ${DYS116_N} 枚反证 N1–N${DYS116_N}（六枚 overlay 行为＋三枚副本静态，每枚断独有红与复位复绿）${L4_N} 道 + ⑤ 覆盖面诚实账与分组自证 ${L5_N} 道，累计判定点 ${CNT116}（其中五组快照之和 ${SUMK116}，另有 1 道就是求和自证锁本身）"
 echo ""
 
 echo "==> 全部通过"

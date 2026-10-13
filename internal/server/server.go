@@ -167,6 +167,24 @@ type Server struct {
 	// 用例只需要证明"取不到价→400、显式确认→受理"这一条语义。
 	quoteForOrderFn func(code string) (*data.StockInfo, error)
 
+	// §SIGBATCH 测试缝（包内注入，生产恒 nil 走 dc.BatchQuotes）：
+	// 展示侧「一次批量补价」的上游调用注入点。用例要证的是**调用数**这一维——
+	// 「N 条信号只打上游一次」在真实 dc 上无法伪造（hithink 客户端是具体类型），
+	// 只能把批量入口换成计数器，才能钉住「信号条数涨到几百条也不再把请求拖过前端超时」这条纪律。
+	// English: §SIGBATCH test seam (package-injected, nil in production): replaces the batch
+	// quote entry so tests can count upstream calls — the whole point is "N signals ⇒ one
+	// batch call", which cannot be observed against the concrete hithink client.
+	batchQuoteFn func(codes []string) (map[string]*data.StockInfo, error)
+
+	// §SIGBATCH 测试缝（包内注入，生产恒 nil 走 quoteDisplay）：批量之后「逐票补齐腿」的注入点。
+	// 这条腿要证的还是**调用数**——补齐只在批量没覆盖到时代码级触发，且次数硬上限
+	// displayQuoteSoloMax；真实 quoteDisplay 会真打上游（正是本批的红线），拿它没法数出「补了几次」，
+	// 所以换成计数器，才能同时钉住「覆盖得住时一次都不补」与「覆盖不住时最多补 30 次」。
+	// English: §SIGBATCH test seam for the bounded per-symbol top-up leg: tests assert how many
+	// per-symbol calls happen (zero when the batch covered everything, hard-capped otherwise),
+	// which the real quoteDisplay — a live upstream path — cannot be counted against.
+	degradeQuoteFn func(code string) *data.StockInfo
+
 	cacheDir string // 看板快照落盘目录（休市/重启后前端仍可读取最近一次有效数据）
 	// §A7（20260918 审计批）buildCommit：构建期 -ldflags 注入的 git 短指纹，经 SetBuildCommit
 	// 传入，随 GET /api/status 的 build_commit 字段下发。前端（尤其 APK 内嵌 assets）在启动与

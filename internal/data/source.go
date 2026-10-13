@@ -347,6 +347,107 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	return nil, err
 }
 
+// BatchQuoteChunk 批量行情的单请求代码数上限（导出：调用方据此把「未入池代码数」
+// 换算成「上游请求数」写进验收读数，也供测试与门禁锁引用）。
+// 取 300 与 fetcher 全池批量（自选池 244 + 热点上限 60 ≈ 304）同量级：现网已实测该规模
+// 一次 GET 可用，同时又给 URL 长度留了余量。
+// （English: 300 matches the fetcher's proven whole-pool batch size, so the shape is
+// already validated in production while keeping the query string bounded.）
+const BatchQuoteChunk = 300
+
+// BatchQuotes 批量实时行情：展示侧高频轮询接口专用（/api/signals、/api/snapshot/hot）。
+//
+// 为什么必须有这个方法：GetQuote 是**逐票**四级降级链，每票至少打一次同花顺（新）HTTP 请求，
+// 而且 DataCoordinator 这一层**没有任何行情缓存**（5s TTL 缓存挂在 MarketAPI 上，
+// dc.GetQuote 不经过它）。于是「一次轮询取 N 条信号的现价」＝ N 次上游请求：
+// 现网 2026-10-13 实录——§N-RELAX 放宽观察件后当日信号组数 75→271，
+// 引擎归档日志里 hithink 命中 8632 行 / 完成请求 41 次 ≈ **每次请求 210 次上游调用**，
+// 请求耗时被推到前端 20s AbortController 之外 ⇒ 信号 tab 永远「请求超时」。
+//
+// 本方法把调用数与信号数解耦：按 BatchQuoteChunk 分片，一片一次上游请求。
+// 刻意**不**回落逐票降级链：未命中的代码就是「行情缺失」，由调用方按缺失渲染
+// （展示层保留信号行、现价留空），绝不为了补一只票而重新打开逐票洪峰。
+// 同花顺（新）客户端未注入（nil）时返回空表＋明确错误，调用方按全缺失处理。
+//
+// 返回的 map 以裸 6 位码为键；调用方传入的其他写法（如 "600519.SH"/"sh600519"）
+// 各另有一份同值别名键，用原串直接查即可命中，不需要自己再归一一次。
+// （English: BatchQuotes is the display-side batched path — one upstream request per chunk
+// instead of one per symbol. It deliberately does NOT fall back to the per-symbol chain:
+// a miss stays a miss so a single absent quote can never re-open the flood. Returned keys
+// are bare 6-digit codes, plus an alias for every original spelling the caller passed in.）
+func (dc *DataCoordinator) BatchQuotes(codes []string) (map[string]*StockInfo, error) {
+	uniq := make([]string, 0, len(codes))          // 去空、去重并归一后的裸 6 位码（发给上游的形态）
+	alias := make(map[string][]string, len(codes)) // 裸码 → 调用方用过的每一种原始写法
+	seen := make(map[string]bool, len(codes))
+	for _, raw := range codes {
+		c := strings.TrimSpace(raw)
+		if c == "" {
+			continue
+		}
+		bare := normalizeCode(c)
+		if bare == "" {
+			continue
+		}
+		if !seen[bare] {
+			seen[bare] = true
+			uniq = append(uniq, bare)
+		}
+		if c != bare {
+			// 同一只票可能被不同写法传入（信号侧裸码、持仓侧 "600519.SH"、QMT 侧 "sh600519"）：
+			// 每种写法都要能查回来，否则调用方得自己再做一遍归一——那正是漏键的地方。
+			dup := false
+			for _, prev := range alias[bare] {
+				if prev == c {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				alias[bare] = append(alias[bare], c)
+			}
+		}
+	}
+	out := make(map[string]*StockInfo, len(uniq))
+	if len(uniq) == 0 {
+		return out, nil
+	}
+	hk := dc.hithinkClient()
+	if hk == nil {
+		return out, errors.New("同花顺（新）批量行情源未配置")
+	}
+	var firstErr error
+	for start := 0; start < len(uniq); start += BatchQuoteChunk {
+		end := start + BatchQuoteChunk
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		chunk := uniq[start:end]
+		quotes, err := hk.BatchQuotes(chunk)
+		if err != nil {
+			// 分片失败不影响其他分片：拿到多少算多少，剩余代码由调用方按行情缺失处理。
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("[data] 批量行情分片失败（%d 只，第 %d 片）: %v", len(chunk), start/BatchQuoteChunk+1, err)
+			continue
+		}
+		for bare, si := range quotes {
+			if si == nil || si.Price <= 0 {
+				// 零价脏快照不进结果（与 GetQuote 的 Price>0 判据一致）。
+				// ⚠ 这是**纵深防御**，不是唯一承担者：上游客户端 HithinkClient.BatchQuotes 已经
+				// 先按 LastPrice<=0 跳过（hithink.go），所以删掉本行行为不变、用例仍绿——
+				// 「零价不进结果」这条行为锁住在客户端那一处（sigbatch_coordinator_test.go 有注释点名）。
+				continue
+			}
+			out[bare] = si
+			for _, orig := range alias[bare] {
+				out[orig] = si // 原始写法别名：调用方按自己传进来的串直接查
+			}
+		}
+	}
+	return out, firstErr
+}
+
 // lookupHithinkQuote 从 hithink 批量快照结果中取指定 code 的行情。
 // BatchQuotes 以裸码（去掉 sh/sz/bj 交易所前缀）为键；入参 code 可能带前缀，
 // 故依次尝试原始 code 与去前缀裸码两种键，命中且价格有效则返回。

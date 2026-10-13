@@ -295,27 +295,17 @@ func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []fixSignal{})
 		return
 	}
-	// 逐票从 5s 快照取实时行情（只读，不回落真打上游，避免轮询打爆数据源）
-	quotes := make(map[string]*data.StockInfo, len(dash.FinalSignals))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	seen := make(map[string]bool, len(dash.FinalSignals))
+	// §SIGBATCH 现价补齐：先读 5s 快照，快照未收录的代码（观察件不进池）合并成
+	// 每分片一次的批量上游请求，并在 3s 上限内有界等待。
+	// 取代此前「每条信号一个 goroutine、各自 quoteDisplay 真打上游、无时限无并发上限」的写法：
+	// 现网实录 271 条信号 ⇒ 每次 20s 轮询约 210 次上游调用 ⇒ 响应恒超前端超时 ⇒ 信号 tab 全空。
+	// 缺价不改变列表内容（filterStaleSignals 对取不到行情的信号一律保留）。
+	codes := make([]string, 0, len(dash.FinalSignals))
 	for _, sig := range dash.FinalSignals {
-		if sig.Code == "" || seen[sig.Code] {
-			continue
-		}
-		seen[sig.Code] = true
-		wg.Add(1)
-		go func(code string) {
-			defer wg.Done()
-			if info := s.quoteDisplay(code); info != nil {
-				mu.Lock()
-				quotes[code] = info
-				mu.Unlock()
-			}
-		}(sig.Code)
+		codes = append(codes, sig.Code)
 	}
-	wg.Wait()
+	quotes, qst := s.displayQuotes(codes)
+	s.logDisplayQuotes("/api/signals", qst)
 	live, pruned := filterStaleSignals(dash.FinalSignals, quotes)
 	if pruned > 0 {
 		log.Printf("[server] /api/signals 撤下 %d 条失效信号(仅展示层,不影响日志/存储)", pruned)
@@ -1636,22 +1626,240 @@ func (s *Server) quoteSnapshot(code string) *data.StockInfo {
 }
 
 // quoteDisplay 展示行情入口：优先读 fetcher 5s 快照（批量、跨页一致），
-// 快照缺失（信号/热门个股刚出现尚未入池）时回落到 TTL 缓存的实时行情（s.quote），
-// 保证 /api/signals、/api/snapshot/hot 等展示接口的现价/涨跌幅始终真实，而非 0.00%/陈旧价。
-// 回落走 dc.GetQuote 的 5s TTL 缓存，同一股票在窗口内只打一次上游，不会造成洪峰。
-// （English: display quote entry: prefers the fetcher 5s snapshot, and falls back to the
-// TTL-cached live quote via s.quote when the stock is missing (a signal/hot stock that just
-// appeared and hasn't joined the pool yet), so price/change are always real instead of 0.00%.）
+// 快照缺失（信号/热门个股刚出现尚未入池）时回落到实时行情（s.quote），
+// 保证 /api/snapshot、/api/watchlist 等展示接口的现价/涨跌幅始终真实，而非 0.00%/陈旧价。
+//
+// ⚠ 回落**不是**廉价的：dc.GetQuote 是逐票四级降级链，每票至少打一次上游 HTTP 请求，
+// 且 DataCoordinator 这一层没有行情缓存（5s TTL 缓存在 MarketAPI 上，dc.GetQuote 不经过它）。
+// 因此本方法只能用于「代码数少」的单票/小列表路径；几百条规模的批量补价必须走
+// s.displayQuotes（快照优先 + 未命中合并成每分片一次批量请求 + 有界等待），
+// 否则信号条数一涨就会把响应拖过前端超时——现网 2026-10-13 信号 tab「请求超时」正是这条。
+// （English: display quote entry: prefers the 5s snapshot, falls back to a LIVE per-symbol
+// upstream chain when the symbol is not in the snapshot. That fallback has no cache at the
+// coordinator level, so it is only affordable for small code lists — bulk display must go
+// through displayQuotes, which batches and bounds the wait.）
 func (s *Server) quoteDisplay(code string) *data.StockInfo {
 	if si := s.quoteSnapshot(code); si != nil {
 		return si // 优先 5s 快照（高频端点防抖）
 	}
-	// 快照缺失（信号/热门股刚出现）时降级为 TTL 缓存实时价，保证涨跌幅非 0
+	// 快照缺失（信号/热门股刚出现）时降级为逐票实时价——真打上游，大批量禁用（见上方 ⚠）
 	si, err := s.quote(code)
 	if err != nil {
 		return nil
 	}
 	return si
+}
+
+// displayQuoteBatchWait 展示侧批量补价的最长等待时间（§SIGBATCH）。
+// 快照未命中的代码合并成批量上游请求，但绝不允许把整条响应拖过前端超时：
+// 前端 /api/signals 是 20s AbortController + 20s 轮询，超过本上限就直接按「行情缺失」返回。
+// 缺价不会刷掉任何信号行（filterStaleSignals 对取不到行情的信号是保留的），
+// 因此本上限买的是「列表永远能渲染出来」，代价只是现价/涨跌幅的新鲜度。
+const displayQuoteBatchWait = 3 * time.Second
+
+// displayQuoteStats 一次展示补价的过程读数。
+// 目的：把「有没有再逐票打爆上游」变成日志里天天可比的数字，而不是等用户报故障。
+// （English: the readout that makes "did we start hammering the source per symbol again"
+// visible in the logs instead of only in user reports.）
+type displayQuoteStats struct {
+	unique    int           // 待补价的唯一代码数
+	snapshot  int           // 5s 快照直接命中数（零网络）
+	batched   int           // 快照未命中、合并进批量请求的代码数
+	chunks    int           // 批量上游请求数＝ceil(batched/BatchQuoteChunk)；逐票时代这个数等于 unique
+	hits      int           // 批量结果命中数
+	soloCalls int           // 批量没覆盖、实际打出去的逐票补齐次数（上限 displayQuoteSoloMax；0＝完全没再逐票）
+	soloHits  int           // 逐票补齐里真拿到可用价的数量
+	elapsed   time.Duration // 批量请求实际等待时长
+	dropped   bool          // 是否因超过 displayQuoteBatchWait 而放弃等待（结果晚到也不采用）
+	err       string        // 批量失败原因（空＝本轮无错）
+}
+
+// failReason 批量补价失败原因；无错时给「无」，保证日志行每次都是完整读数。
+func (st displayQuoteStats) failReason() string {
+	if st.err == "" {
+		return "无"
+	}
+	return st.err
+}
+
+// displayQuoteSoloMax 批量之后「逐票补齐腿」在一次请求里最多打几次逐票上游（§SIGBATCH）。
+//
+// 为什么批量还不够、又为什么必须有上限（本批门禁 §2 e2e 契约腿实跑逼出来的形状）：
+// dc.BatchQuotes 只覆盖同花顺这一个源，于是两类代码批量必然拿不到价——
+//
+//	① 没有 coordinator 的装配：internal/e2e 的 HTTP 契约用例用 server.New(...) 构造服务、
+//	   不调 srv.SetCoordinator(dc)，行情全部来自注入 transport 的 MarketAPI（fixture）。
+//	   改前 handleFixSignals 的逐票 quoteDisplay 会经 s.quote → market.GetRealtimeQuote 拿到价，
+//	   改成只走 dc 批量后 s.dc == nil ⇒ 批量直接返回错误，于是
+//	   TestHTTPSignalsChangePct 当场红（600580 现价停在触发价 30.00，而不是 fixture 的 36.86）。
+//	   现网 cmd/quant/main.go 是有 SetCoordinator 的（main.go:422），但「装配缺 dc 就整片没价」
+//	   这件事本身是覆盖缺口：最小装配/未来把某个面的 dc 摘掉都会静默变成全表缺价。
+//	② 同花顺覆盖不到的代码（北交所自 20260828 断更、停牌、以及分片部分返回）：
+//	   改前这些行能靠逐票降级链补到价，改后只能空着。
+//
+// 上限买的是「降级腿可以存在，但不能再长出洪峰」：本批修的就是「代码数 × 逐票上游」这个乘积
+// （75→271 条 ⇒ ≈210 次/请求 ⇒ 响应顶穿前端 20s）。补齐跑在批量同一个 goroutine 里，
+// 因此同样受 displayQuoteBatchWait 约束；超出上限的代码本轮不补，按缺数渲染。
+// 读数里新增「逐票补齐=N」：N=0 是常态，N 顶到上限说明批量源又覆盖不住了——
+// 这件事必须天天看得见，而不是等下一次用户报「价格全是空的」。
+// （English: a bounded per-symbol top-up leg for codes the batch cannot cover (sources the
+// coordinator does not front, and rigs/deploys without a coordinator at all — the e2e HTTP
+// contract test caught the missing leg). It runs in the same goroutine as the batch, so the
+// 3s bound still applies, and the readout counts the calls so a growing reliance stays visible.）
+const displayQuoteSoloMax = 30
+
+// degradeQuote 逐票补齐入口：测试缝 degradeQuoteFn 注入时优先用缝（生产恒 nil 走 quoteDisplay）。
+// 与 batchQuotes 同形：判据先缝后真源，否则用例数到的「补了几次」不代表真实路径。
+func (s *Server) degradeQuote(code string) *data.StockInfo {
+	if s.degradeQuoteFn != nil {
+		return s.degradeQuoteFn(code)
+	}
+	return s.quoteDisplay(code)
+}
+
+// topUpQuotes 批量补齐腿：只对「批量没返回可用价」的代码逐票补，次数上限 displayQuoteSoloMax。
+// 返回值第二个元素＝真的打出去了几次逐票请求（读数用它，不用 len(结果)——补不到价也要计数）。
+// （English: per-symbol top-up for the codes the batch left unpriced, hard-capped; the second
+// return value is the number of upstream calls actually made, which is what the readout prints.）
+func (s *Server) topUpQuotes(codes []string, got map[string]*data.StockInfo) (map[string]*data.StockInfo, int) {
+	out := make(map[string]*data.StockInfo)
+	calls := 0
+	for _, code := range codes {
+		if code == "" {
+			continue
+		}
+		if si := got[code]; si != nil && si.Price > 0 {
+			continue // 批量已覆盖：不补
+		}
+		if calls >= displayQuoteSoloMax {
+			break // 上限之外本轮不补（缺数渲染），乘积不许再长回洪峰
+		}
+		calls++
+		if si := s.degradeQuote(code); si != nil && si.Price > 0 {
+			out[code] = si
+		}
+	}
+	return out, calls
+}
+
+// batchQuotes 批量上游入口：测试缝 batchQuoteFn 注入时优先用缝（§SIGBATCH，生产恒 nil 走 dc）。
+// 注意本函数**刻意不回落逐票链**——回落就是本批要修掉的洪峰；
+// 批量没覆盖的代码由 topUpQuotes 这条**有上限**的补齐腿处理（见 displayQuoteSoloMax）。
+func (s *Server) batchQuotes(codes []string) (map[string]*data.StockInfo, error) {
+	if s.batchQuoteFn != nil {
+		return s.batchQuoteFn(codes)
+	}
+	if s.dc == nil {
+		// 没有 coordinator 就没有批量入口（e2e/最小装配的形状）。这里返回错误而不是静默空表：
+		// 读数要能说清「批量不可用，本轮全靠逐票补齐腿」，否则下一次覆盖变化又是隐性事故。
+		return nil, fmt.Errorf("数据源未注入，无批量入口（本轮由逐票补齐腿兜底）")
+	}
+	return s.dc.BatchQuotes(codes)
+}
+
+// batchQuoteOutcome 批量请求的返回值（结果与错误一起经带缓冲 channel 交回主腿）。
+type batchQuoteOutcome struct {
+	quotes map[string]*data.StockInfo
+	solo   map[string]*data.StockInfo // 逐票补齐腿补到的价（§SIGBATCH，上限见 displayQuoteSoloMax）
+	calls  int                        // 逐票补齐真的打出去几次（读数用，含补不到价的尝试）
+	err    error
+}
+
+// displayQuotes 展示侧批量取价：先读 fetcher 5s 快照（零网络），快照未收录的代码
+// 合并成「每分片一次」的批量上游请求，并在 displayQuoteBatchWait 内有界等待。
+//
+// 它取代的是此前 handleFixSignals 的写法——为每条信号开一个 goroutine 各调一次
+// quoteDisplay，而 quoteDisplay 在快照缺失时会真打上游（dc.GetQuote 是逐票四级链，
+// 这一层没有任何行情缓存）。观察件本来就**不进**快照池（只有买入信号会被 EnsureStock 钉进池），
+// 于是信号条数一涨就是「每次轮询几百次上游请求」：现网 2026-10-13 实录
+// 75→271 条 ⇒ 约 210 次上游调用/请求 ⇒ 响应恒 ≥ 前端 20s 上限 ⇒ 信号 tab 永远「请求超时」。
+//
+// 并发安全：批量请求跑在独立 goroutine，结果只经 cap=1 的 channel 交回，
+// 主腿超时返回后 goroutine 既不阻塞也不写任何共享 map，故不存在返回后的写竞态。
+//
+// 两条腿的分工（§SIGBATCH 二批，门禁 §2 e2e 契约腿逼出来的覆盖缺口）：
+// 批量只覆盖同花顺一片，剩下的代码交给 topUpQuotes 的**有上限**逐票补齐腿
+// （上限 displayQuoteSoloMax＝一次请求最多 30 次逐票上游）。补齐跑在同一个 goroutine 内，
+// 因此照样受 displayQuoteBatchWait 约束；读数里「逐票补齐/补齐命中」两个计数把它单独摊开，
+// 批量源哪天覆盖不住了（缺 dc、北交所、分片部分返回）日志当天就能看见，不用等用户报「价格全空」。
+// （English: displayQuotes = snapshot first, then ONE batched upstream call per chunk for the
+// symbols the snapshot does not carry, awaited under a bounded timeout, plus a *capped* per-symbol
+// top-up leg for codes the batch itself cannot cover. The goroutine hands its result back over a
+// cap-1 channel, so a timed-out handler never sees a late shared write.）
+func (s *Server) displayQuotes(codes []string) (map[string]*data.StockInfo, displayQuoteStats) {
+	quotes := make(map[string]*data.StockInfo, len(codes))
+	st := displayQuoteStats{}
+	misses := make([]string, 0, len(codes))
+	seen := make(map[string]bool, len(codes))
+	for _, code := range codes {
+		if code == "" || seen[code] {
+			continue
+		}
+		seen[code] = true
+		st.unique++
+		if si := s.quoteSnapshot(code); si != nil {
+			quotes[code] = si // 快照命中：零网络，跨设备一致
+			st.snapshot++
+			continue
+		}
+		misses = append(misses, code)
+	}
+	st.batched = len(misses)
+	if len(misses) == 0 {
+		return quotes, st
+	}
+	st.chunks = (len(misses) + data.BatchQuoteChunk - 1) / data.BatchQuoteChunk
+	done := make(chan batchQuoteOutcome, 1)
+	start := time.Now()
+	go func() {
+		q, err := s.batchQuotes(misses)
+		// 逐票补齐腿（§SIGBATCH）：只补批量没返回可用价的代码，次数上限 displayQuoteSoloMax。
+		// 必须跑在这同一个 goroutine 里——它在主腿的 select 之外，放进主腿就等于把
+		// 「最多 30 次逐票上游」的耗时算进响应时间，3s 有界等待就白设计了。
+		solo, calls := s.topUpQuotes(misses, q)
+		done <- batchQuoteOutcome{quotes: q, solo: solo, calls: calls, err: err}
+	}()
+	timer := time.NewTimer(displayQuoteBatchWait)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		st.elapsed = time.Since(start)
+		st.soloCalls = res.calls
+		if res.err != nil {
+			st.err = res.err.Error()
+		}
+		for _, code := range misses {
+			if si := res.quotes[code]; si != nil && si.Price > 0 {
+				quotes[code] = si
+				st.hits++
+				continue
+			}
+			// 批量没覆盖的，才看补齐腿的结果（两条腿分开计数，读数才分得清是谁补的）。
+			if si := res.solo[code]; si != nil && si.Price > 0 {
+				quotes[code] = si
+				st.soloHits++
+			}
+		}
+	case <-timer.C:
+		// 放弃等待：不采用晚到结果，缺价行照常返回（现价留空由前端按缺数渲染）。
+		st.elapsed = time.Since(start)
+		st.dropped = true
+		st.err = fmt.Sprintf("批量补价超过 %s，本轮放弃等待（列表照常返回，现价按缺数渲染）", displayQuoteBatchWait)
+	}
+	return quotes, st
+}
+
+// logDisplayQuotes 把一次展示补价的过程读数按**同一条格式**写上日志（§SIGBATCH 的可见性腿）。
+// 五个补价面共用它：/api/signals、/api/snapshot/hot、/api/snapshot、/api/evaluations、/api/watchlist。
+// 为什么不各写一份 log.Printf：复制五份之后任何人调整一次口径（比如把「批量请求」改名）
+// 就会让另外四份的读数再也无法横向对比，而这场事故的本体正是「上游被打爆而日志里看不出来」——
+// 读数一旦分家，下次涨回来时又是靠用户报故障才发现。
+// （English: one shared readout line for all five display-side quote surfaces, so the
+// per-request upstream call count stays comparable day over day; divergent copies are how
+// this incident stayed invisible.）
+func (s *Server) logDisplayQuotes(endpoint string, st displayQuoteStats) {
+	log.Printf("[server] %s 现价补齐 唯一代码=%d 快照命中=%d 批量代码=%d 批量请求=%d 批量命中=%d 逐票补齐=%d 补齐命中=%d 等待=%dms 放弃等待=%v 原因=%s",
+		endpoint, st.unique, st.snapshot, st.batched, st.chunks, st.hits, st.soloCalls, st.soloHits, st.elapsed.Milliseconds(), st.dropped, st.failReason())
 }
 
 // handleFixSnapshot 处理 GET /api/snapshot 请求，返回指定个股或全部自选股的实时快照数据。
@@ -1664,9 +1872,17 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 	} else {
 		stockList = s.watchlist.List(requestUserID(r))
 	}
+	// §SIGBATCH 与 /api/signals 同形缺陷：Watchlist 页一轮刷新会并发拨
+	// /api/snapshot + /api/watchlist + /api/evaluations 三个接口，改前每个都是
+	// 「逐个代码 quoteDisplay」，快照未命中即真打上游 ⇒ 一轮页面刷新＝自选股数×3 次上游请求。
+	// 这里同样换成「快照优先 + 每分片一次批量 + 3s 有界等待」。
+	// 取不到价的代码沿用改前语义跳过：本端点的行内容就是行情本身，没有行情就没有这一行
+	// （页面按自选列表渲染，缺价在页面上表现为该行现价空，不是整页失败）。
+	quotes, qst := s.displayQuotes(stockList)
+	s.logDisplayQuotes("/api/snapshot", qst)
 	out := make([]map[string]interface{}, 0)
 	for _, code := range stockList {
-		info := s.quoteDisplay(code)
+		info := quotes[code]
 		if info == nil {
 			continue
 		}
@@ -1694,6 +1910,14 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []map[string]interface{}{})
 		return
 	}
+	// §SIGBATCH 与 /api/signals 同源：本页由 Dashboard 60s 轮询，同样覆盖全部信号代码，
+	// 必须走「快照优先 + 批量补价」，不能再逐票真打上游。
+	codes := make([]string, 0, len(dash.FinalSignals))
+	for _, sig := range dash.FinalSignals {
+		codes = append(codes, sig.Code)
+	}
+	quotes, qst := s.displayQuotes(codes)
+	s.logDisplayQuotes("/api/snapshot/hot", qst)
 	out := make([]map[string]interface{}, 0)
 	seen := map[string]bool{}
 	for _, sig := range dash.FinalSignals {
@@ -1701,7 +1925,7 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[sig.Code] = true
-		info := s.quoteDisplay(sig.Code)
+		info := quotes[sig.Code]
 		price := sig.Price
 		chg := 0.0
 		if info != nil {
@@ -1733,6 +1957,11 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 	if dash != nil {
 		scores = dash.Scores
 	}
+	// §SIGBATCH 评分行的现价补齐同样走批量通道（改前逐票 quoteDisplay，与 /api/snapshot
+	// 在同一轮前端刷新里并发）。这里必须**保留**取不到价的行：本端点的行内容是战法评分
+	// （来自 8a/8b 持续打分），现价只是附挂字段，缺价不该把一只票从评分表里抹掉。
+	quotes, qst := s.displayQuotes(codes)
+	s.logDisplayQuotes("/api/evaluations", qst)
 	for _, code := range codes {
 		if seen[code] {
 			continue
@@ -1752,7 +1981,7 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 			mScore = sc.MomentumScore
 			sigActive = sc.SignalActive
 		}
-		info := s.quoteDisplay(code)
+		info := quotes[code]
 		name := code
 		price := 0.0
 		chg := 0.0
@@ -2178,9 +2407,14 @@ func truncateTitle(s string, maxLen int) string {
 // handleFixGetWatchlist 处理 GET /api/watchlist 请求，返回自选股列表及其实时行情。
 func (s *Server) handleFixGetWatchlist(w http.ResponseWriter, r *http.Request) {
 	list := s.watchlist.List(requestUserID(r))
+	// §SIGBATCH 同形收编：自选列表的现价也走批量通道（改前逐票 quoteDisplay）。
+	// 取不到价的行照旧保留（名称退回代码、现价为 0），因为这一页的行内容是「自选里有这只」，
+	// 不是「这只现在有价」。
+	quotes, qst := s.displayQuotes(list)
+	s.logDisplayQuotes("/api/watchlist", qst)
 	out := make([]map[string]interface{}, 0)
 	for _, code := range list {
-		info := s.quoteDisplay(code)
+		info := quotes[code]
 		name := code
 		price := 0.0
 		chg := 0.0

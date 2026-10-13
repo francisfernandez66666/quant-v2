@@ -176,7 +176,7 @@ POST	/api/qmt/report	网关回调	qmt_gateway/handler.py:129:"/api/qmt/report"	P
 POST	/auth/login	兼容端点	scripts/monitor_test.sh:249:"${BASE_URL}/auth/login"	旧路径别名：Android 壳旧版本与监控脚本仍在拨，与 POST /api/auth/login 同一处理器，删了即 404
 POST	/auth/register	兼容端点	internal/e2e/uat_live_probe_test.go:174:"/auth/register"	注册通道实际已关（处理器内回 403 提示文案），pattern 保留让旧壳拿到可读的 403 而不是 404
 POST	/auth/temp	兼容端点	internal/e2e/uat_live_probe_test.go:178:"/auth/temp"	临时号同样已关（403）；曾因匿名可领 14 天 token 被收口（见 internal/server/qmt.go:111 成因），不复活只留别名
-GET	/api/kline	兼容端点	internal/server/handlers_fix.go:531:handleFixKLine	fix 前端兼容层里的 K 线口径：页面走 /api/minute 与研究链，本入口保留给外部脚本按旧契约取数
+GET	/api/kline	兼容端点	internal/server/handlers_fix.go:525:handleFixKLine	fix 前端兼容层里的 K 线口径：页面走 /api/minute 与研究链，本入口保留给外部脚本按旧契约取数
 GET	/api/positions	运维 curl	scripts/monitor_test.sh:308:"/api/positions" 200	监控脚本每轮读大盘持仓做存活+响应体抽检（持仓页本身走 /api/holdings 系，§E-1 对账已记）
 POST	/api/positions	运维 curl	scripts/monitor_test.sh:369:"/api/positions" 201	监控脚本建仓腿：造一条测试持仓再平掉，验证运营账本写路径整条通
 POST	/api/positions/{id}/exit	运维 curl	scripts/monitor_test.sh:377:"/api/positions/${pos_id}/exit"	上一条腿的平仓侧：do_curl 真拨 200 才算闭环（前端无入口，账本 exit 属运营操作）
@@ -190,17 +190,17 @@ POST	/api/news/test-attribution	运维 curl	scripts/verify_deploy_guangzhou.sh:2
 GET	/api/metrics	运维 curl	internal/metrics/metrics.go:2:经 /api/metrics（鉴权后）导出	expvar 量规面：人工带 admin token curl 读数；发版验证链刻意不消费它（§FQ 凭据负锁钉死，见 verify_changes.sh:4444）
 GET	/api/metrics/prometheus	运维 curl	internal/server/metrics_handler.go:14:handlePrometheusMetrics	Prometheus text 导出（§WS-L 维5，promtool 可校验）：给外部抓取器/人工 curl，本仓无面板也无抓取配置
 GET	/api/metrics/alerts	运维 curl	internal/server/metrics_handler.go:21:handleAlertState	阈值告警状态机读数（规则来自 metrics.DefaultAlertRules）：运维 curl 观察；页面告警卡走 /api/alerts 系
-PUT	/api/positions/{id}	无 UI 待补	internal/server/server.go:698:PUT /api/positions/{id}	运营账本改单能力已在（admin 门），持仓页只走 /api/holdings 系；保留尺寸等台账页，删除会断掉脚本旁路
-DELETE	/api/positions/{id}	无 UI 待补	internal/server/server.go:699:DELETE /api/positions/{id}	同上：账本删单无页面入口（§E-1 对账记录为有意设计），先补台账页再谈收敛
+PUT	/api/positions/{id}	无 UI 待补	internal/server/server.go:716:PUT /api/positions/{id}	运营账本改单能力已在（admin 门），持仓页只走 /api/holdings 系；保留尺寸等台账页，删除会断掉脚本旁路
+DELETE	/api/positions/{id}	无 UI 待补	internal/server/server.go:717:DELETE /api/positions/{id}	同上：账本删单无页面入口（§E-1 对账记录为有意设计），先补台账页再谈收敛
 GET	/api/tenant/usage	无 UI 待补	web/src/api/index.js:2194:fetchTenantUsage	前端 wrapper 已按 §PERM-GATE 删除（用量改由 GET /api/tenants 行内返回），后端路由保留供配额核对
 PUT	/api/admin/users/{id}/tenant	无 UI 待补	web/src/api/index.js:2194:moveUserTenant	账号迁移「无 UI，待定产品决策」（同一注释自认）：迁移能力先保留，产品拍板后补入口而非重写后端
-GET	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:591:GET /api/admin/users/{id}/config/d1	按账号代配通道：admin 面板目前只做全局 /api/config/d1 + 账号级 strategy；代配靠 curl，留尺寸给代客配置页
-POST	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:592:POST /api/admin/users/{id}/config/d1	读侧同族：写侧也是稀疏 merge + 写前快照 + 字段级审计（§0929CFG-D1），无 UI 只是没有页面不是没有能力
-GET	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:593:GET /api/admin/users/{id}/config/longshort	多空参数代配：前端仅 strategy 有按账号面板（index.js:2195 注释记着这批 wrapper 被当死码删过）
-POST	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:594:POST /api/admin/users/{id}/config/longshort	同上写侧：保留供运营代客调参；若将来收敛必须先确认没有账号在用这份账号级覆盖
-GET	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:595:GET /api/admin/users/{id}/config/llm	LLM 代配读侧（含脱敏哨兵回填）：页面只有本账号的 /api/config/llm，按账号覆盖靠 curl 维护
-POST	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:596:POST /api/admin/users/{id}/config/llm	LLM 代配写侧：会触发热重建客户端，属特权变更——保留但不给 UI 入口是刻意的（误点即改密钥池）
-GET	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:598:GET /api/admin/users/{id}/config/qmt	QMT/战法配置代配读侧：页面走本账号 /api/config/qmt，按账号覆盖由运营脚本与 curl 使用
-POST	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:599:POST /api/admin/users/{id}/config/qmt	代配写侧会热加载实盘参数（§P2-A 链），无 UI 入口是权限设计而非遗漏；删之前要核现网有无账号级覆盖在生效
-POST	/api/paper/short_open	无 UI 待补	internal/server/server.go:688:handlePaperShortOpen	做空开仓缺页面入口（买回 /api/paper/short_cover 已有调用点）＝功能未完，不是死码，保留后端尺寸
-POST	/api/notify-test	无 UI 待补	internal/server/server.go:764:handleFixNotifyTest	§C9 把空 stub 升级成逐通道实弹探测：前端零调用，但删了就没有人工验证 ntfy/极光通道的入口（§N-2 已收权 admin）
+GET	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:609:GET /api/admin/users/{id}/config/d1	按账号代配通道：admin 面板目前只做全局 /api/config/d1 + 账号级 strategy；代配靠 curl，留尺寸给代客配置页
+POST	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:610:POST /api/admin/users/{id}/config/d1	读侧同族：写侧也是稀疏 merge + 写前快照 + 字段级审计（§0929CFG-D1），无 UI 只是没有页面不是没有能力
+GET	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:611:GET /api/admin/users/{id}/config/longshort	多空参数代配：前端仅 strategy 有按账号面板（index.js:2195 注释记着这批 wrapper 被当死码删过）
+POST	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:612:POST /api/admin/users/{id}/config/longshort	同上写侧：保留供运营代客调参；若将来收敛必须先确认没有账号在用这份账号级覆盖
+GET	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:613:GET /api/admin/users/{id}/config/llm	LLM 代配读侧（含脱敏哨兵回填）：页面只有本账号的 /api/config/llm，按账号覆盖靠 curl 维护
+POST	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:614:POST /api/admin/users/{id}/config/llm	LLM 代配写侧：会触发热重建客户端，属特权变更——保留但不给 UI 入口是刻意的（误点即改密钥池）
+GET	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:616:GET /api/admin/users/{id}/config/qmt	QMT/战法配置代配读侧：页面走本账号 /api/config/qmt，按账号覆盖由运营脚本与 curl 使用
+POST	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:617:POST /api/admin/users/{id}/config/qmt	代配写侧会热加载实盘参数（§P2-A 链），无 UI 入口是权限设计而非遗漏；删之前要核现网有无账号级覆盖在生效
+POST	/api/paper/short_open	无 UI 待补	internal/server/server.go:706:handlePaperShortOpen	做空开仓缺页面入口（买回 /api/paper/short_cover 已有调用点）＝功能未完，不是死码，保留后端尺寸
+POST	/api/notify-test	无 UI 待补	internal/server/server.go:782:handleFixNotifyTest	§C9 把空 stub 升级成逐通道实弹探测：前端零调用，但删了就没有人工验证 ntfy/极光通道的入口（§N-2 已收权 admin）

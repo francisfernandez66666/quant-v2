@@ -391,13 +391,65 @@ $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${QMT_GATEWAY_DIR}/ens
 #   实录：本地先 `npm run build`、之后才 commit，于是 dist 内嵌指纹停在上一版（50f3594），
 #   后端用新 SHA（f78c74b）上线 → 用户立刻看到版本不一致横幅。旧脚本的
 #   `if [ ! -d web/dist ]` 分支写了"产物存在就原样上传"，所以**部署成功 ≠ 产物是新的**。
-#   现改为三道校验，任一不过即重建/中止，不再靠人记得"先提交再构建"：
+#   现改为四道校验，任一不过即重建/中止，不再靠人记得"先提交再构建"：
 #     ① 产物不存在        → 构建
 #     ② 产物自称的 SHA ≠ 待部署 SHA（dist/BUILD_COMMIT，由 vite closeBundle 落盘）→ 强制重建
 #     ③ 构建完仍不相等（git 不可用会退化成 'dev'）→ 中止，绝不把漂移的前端传上去
+#     ④ §A7-D（2026-10-13 补）：侧车相等之后，还要在**产物字节**上复核一次——index.html 引用的
+#        chunk 里必须含待部署 SHA（判据与部署后第 4b 号探针同源）→ 先强制重建，重建后仍不含即中止。
 echo "[2c/5] 同步前端 web/dist 到 $DEPLOY_DIR/web ..."
 DIST_SHA_FILE="web/dist/BUILD_COMMIT"
 dist_sha() { [ -f "$DIST_SHA_FILE" ] && tr -d '\r\n' < "$DIST_SHA_FILE" || echo ""; }
+
+# ── §A7-D（2026-10-13 发版实录补）：侧车文件相等 ≠ 产物是新的 ──────────────────────────
+# 实录：本轮待部署 SHA=6f08c74，`dist/BUILD_COMMIT` 里写的确实是 6f08c74，[2c] 的三道校验
+#   全过、上传成功、脚本自己打出「OK 前端指纹校验通过（BUILD_COMMIT=6f08c74）」；
+#   而**部署后**第 4b 号探针判红：index.html 引用的 index-BWTRJ4rN.js 内嵌的是上一版 31c42e0
+#   ——本批的前端改动（web/src/pages/Quant.jsx）压根没进产物，现网浏览器跑的还是旧界面。
+#   两条读数的 mtime 把这件事钉死了：bundle 停在 10-12 19:21（上一版的构建），侧车文件是
+#   10-13 09:50 才被写下的。
+# 根因：§A7-B 落盘 BUILD_COMMIT 的初衷是"读一个确定性的文件，别去压缩混淆的 JS 里猜十六进制
+#   字面量"，这个初衷是对的；但它把"产物自称哪一版"当成了"产物是哪一版"——侧车是一次
+#   writeFileSync 的**旁路产物**，可以脱离 bundle 被单独写下或覆盖，于是校验面与真相之间
+#   缺了一根线，而那根线正好就是部署后探针已经在读的那句"引用的 chunk 里含不含这个 SHA"。
+#   同族＝「两侧判据不同源」：上传面与验收面各判各的，绿的一面不算数。
+# 裁决：**把探针的判据前移到上传前**（同一份语义、同一份字节，先挡住再谈上传）。探针照旧
+#   保留——探针管"现网落地的字节"，本函数管"准备上传的字节"，两次都得过，缺一个就是
+#   "部署成功但前端陈旧"。GIT_SHA 取不到（'unknown'）时不参与比对，与 §A7-B 同口径：
+#   没有可信期望值就不要拿它当判据，否则造出一条恒红的腿。
+# English: the sidecar can be written independently of the bundle, so gate ② passed while the
+#   chunk referenced by index.html still carried the previous SHA. Re-apply the deploy probe's own
+#   judgment (marker must literally appear in the referenced chunk) *before* uploading.
+# 返回 dist/index.html 里引用的入口 chunk 相对路径（形如 assets/index-XXXX.js）；取不到回空。
+dist_index_chunk_ref() {
+  grep -oE 'assets/index-[A-Za-z0-9._-]+\.js' web/dist/index.html 2>/dev/null | head -1
+}
+
+# 返回 0 = index.html 引用的那个 chunk 里确实含有期望指纹；非 0 = 不含／引用缺失／文件缺失。
+# `-a` 是必需的：vite 产物是单行压缩文件，部分 grep 会把它当二进制而让 `-q` 的命中判定不可信。
+bundle_carries_commit() {   # $1=期望指纹（git 短 SHA）
+  _ref="$(dist_index_chunk_ref)"
+  [ -n "$_ref" ] || return 1
+  [ -f "web/dist/${_ref}" ] || return 1
+  grep -qa -- "$1" "web/dist/${_ref}" || return 1
+  return 0
+}
+
+# 上传前的产物内容复核：$1=待部署指纹 $2=侧车读数（只进文案，不参与判定）
+frontend_artifact_check() {
+  if [ -z "$1" ] || [ "$1" = "unknown" ]; then
+    echo "  [!] 待部署指纹未知（git 不可用）——跳过产物内容复核，只比侧车（与 §A7-B 同口径）"
+    return 0
+  fi
+  if bundle_carries_commit "$1"; then
+    return 0
+  fi
+  echo "  X 前端产物内容复核未通过（§A7-D）：index.html 引用 '$(dist_index_chunk_ref)'，其中找不到指纹 '${1}'。"
+  echo "    侧车 ${DIST_SHA_FILE} 自称 '${2:-缺失}'——侧车与 bundle 不符正是「先 build 后 commit」"
+  echo "    或侧车被单独写下的形状；此时上传＝线上跑旧前端，而部署输出全绿。"
+  echo "    排查：npm run build 是否真跑完（指纹在 closeBundle 才落盘）、dist/index.html 与 dist/assets 是否同一次构建。"
+  return 1
+}
 
 NEED_BUILD=0
 if [ ! -d web/dist ]; then
@@ -408,6 +460,12 @@ else
   if [ "$ds" != "$GIT_SHA" ]; then
     echo "  [!] 前端产物陈旧：dist/BUILD_COMMIT='${ds:-缺失}' ≠ 待部署 '${GIT_SHA}' → 强制重建"
     echo "      （这正是「前端与服务器版本不一致」横幅的成因：先 build 后 commit）"
+    NEED_BUILD=1
+  elif [ "$GIT_SHA" != "unknown" ] && [ -n "$GIT_SHA" ] && ! bundle_carries_commit "$GIT_SHA"; then
+    # §A7-D：侧车对了也要看产物本身——2026-10-13 实录就是这一态（侧车 6f08c74、chunk 里还是
+    # 上一版 31c42e0），旧逻辑在这里"两道全过"直接把陈旧产物传了上去。
+    echo "  [!] 前端产物陈旧（§A7-D）：侧车已是 '${GIT_SHA}'，但 index.html 引用的 chunk 里找不到该指纹 → 强制重建"
+    echo "      （侧车与 bundle 出自同一文件系统的两次写入，可以各自新旧；判据必须落在产物字节上）"
     NEED_BUILD=1
   fi
 fi
@@ -428,9 +486,17 @@ if [ -d web/dist ]; then
     echo "    排查：web/vite.config.js 的 buildCommit() 是否拿不到 git（回退 'dev'）。"
     exit 1
   fi
+  # §A7-D（2026-10-13 实录）：侧车等值之外再按**产物字节**复核一次，判据与部署后第 4b 号探针同源
+  # （index.html 引用的 chunk 里含不含这个 SHA）。放在这里的原因：上一道的判据读的是那个可被
+  # 单独写下的侧车文件，"侧车对、bundle 旧"这一态只有读产物才看得见。中止部署是可接受的代价——
+  # [2/5] 已停过的服务由 §A7-C 的 EXIT 兜底拉起，不会把引擎留在停机态；而"传上去才发现"的代价是
+  # 现网跑旧前端且部署输出全绿（今天踩中的正是这一态）。
+  if ! frontend_artifact_check "$GIT_SHA" "$ds"; then
+    exit 1
+  fi
   # ${ds} 必须带花括号：紧跟其后的全角「）」会被 bash 并入变量名（实测报
   # `ds）: unbound variable`，在 set -u 下直接中止部署）——本行曾因此漏过首次上传。
-  echo "  OK 前端指纹校验通过（BUILD_COMMIT=${ds}）"
+  echo "  OK 前端指纹校验通过（BUILD_COMMIT=${ds}，且 index.html 引用的 chunk 内含该指纹）"
   $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path ${DEPLOY_DIR}/web | Out-Null\""
   tar -czf /tmp/webdist.tgz -C web/dist .
   $SCP /tmp/webdist.tgz "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/webdist.tgz"
