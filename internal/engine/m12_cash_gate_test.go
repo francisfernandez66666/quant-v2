@@ -80,17 +80,20 @@ func TestAutoPlaceCashThreeStates(t *testing.T) {
 			t.Fatalf("新鲜真 0 资金不得被当成不设限，实际到单 %d 笔", len(*orders))
 		}
 	})
-	// ④新鲜有值 → 既有 §UAT-CASH 降档语义原样保留：5000 现金买 10 元股降到 400 股
-	// （5000×0.994=4970 余量后可负担 4 手），预算 10000 全额 1000 股被降为 400。
+	// ④新鲜有值 → 既有 §UAT-CASH 降档语义原样保留：6000 现金买 10 元股降到 500 股
+	// （6000×0.994=5964 余量后可负担 5 手），预算 10000 全额 1000 股被降为 500。
+	// （owner 2026-10-12 裁决后场景从 5000→6000：5000 现金降档出的 400 股×10=4000 元
+	// 已被新单笔成交额下限闸（默认 5000 元）拦下——那是裁决要消灭的碎单形态，
+	// 降档语义本身由 6000 现金（降档后 5000 元恰达门槛）这条腿继续守护。）
 	t.Run("fresh_value_downgrades", func(t *testing.T) {
 		e, db, _, orders := newQMTEngine(t, nil)
-		m12SeedCash(t, db, 5000, time.Minute)
+		m12SeedCash(t, db, 6000, time.Minute)
 		e.autoPlace(m12BuySig("600904"), m12Live("600904"))
 		if len(*orders) != 1 {
 			t.Fatalf("新鲜资金应降档下单一笔，实际 %d 笔", len(*orders))
 		}
-		if q := (*orders)[0]["qty"]; q != float64(400) {
-			t.Fatalf("降档股数应为 400（5000 现金可负担整手），got %v", q)
+		if q := (*orders)[0]["qty"]; q != float64(500) {
+			t.Fatalf("降档股数应为 500（6000 现金可负担整手），got %v", q)
 		}
 	})
 	// ⑤回鲜恢复：过期 fail-close 后账本被新回报刷新 → 自动买入腿无需重启即恢复（stale 只是闸，不是熔断）。

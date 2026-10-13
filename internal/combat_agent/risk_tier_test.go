@@ -79,12 +79,15 @@ func TestSynthesizeRiskTierRollback(t *testing.T) {
 	}
 }
 
-// TestApplyRiskTierYellowBars Yellow：非 N 低置信降级、达门槛放行、动量 watch 不被 Yellow 剔除。
+// TestApplyRiskTierYellowBars Yellow：非 N 低置信降级、达门槛放行、动量 watch 不被 Yellow 剔除、
+// §N-RELAX N 形买入不参与置信降级（置信≈总分/100 到不了 0.90，Yellow 日 N 形全灭的结构死区已裁掉；
+// 买入资格由战法层分数闸管——黄金窗 ≥60、10 点后 ≥80）。
 func TestApplyRiskTierYellowBars(t *testing.T) {
 	cfg := config.MacroGateConfig{} // YellowMinConf 默认 0.90
 	sigs := []Signal{
 		testSignal(string(strategy.SignalDragon), "buy", 0.85), // <0.90 → watch
 		testSignal(string(strategy.SignalDragon), "buy", 0.95), // ≥0.90 → 放行
+		testSignal(string(strategy.SignalNShape), "buy", 0.67), // §N-RELAX：N 形豁免置信降级 → 放行
 		{Strategy: "动量", Action: "watch", Confidence: 0.5},     // Yellow 不剔除动量 watch
 	}
 	out := applyRiskTier(sigs, RiskTierYellow, cfg, []string{"情绪退潮"})
@@ -94,7 +97,11 @@ func TestApplyRiskTierYellowBars(t *testing.T) {
 	if out[1].Action != "buy" {
 		t.Errorf("Yellow 达门槛买入应放行, got=%s", out[1].Action)
 	}
-	if len(out) != 3 {
+	// §N-RELAX：0.67 的 N 形买入在 Yellow 下保持 buy——被降级即结构死区复活
+	if out[2].Action != "buy" {
+		t.Errorf("N 形买入 Yellow 下应放行（分数闸管买入资格）, got=%s reason=%s", out[2].Action, out[2].Reason)
+	}
+	if len(out) != 4 {
 		t.Fatalf("Yellow 不应剔除动量 watch, len=%d", len(out))
 	}
 }

@@ -422,13 +422,21 @@ func TestEndToEndFullPipeline(t *testing.T) {
 	})
 
 	t.Run("预期差信号", func(t *testing.T) {
-		// 恒瑞医药：有利好新闻但股价 -1.49% → 利好不涨(GapBullishNoRise) 触发
-		sig := findSignal(dash.FinalSignals, "600276")
-		if sig == nil {
-			t.Fatal("FinalSignals 缺少 600276")
+		// 恒瑞医药：有利好新闻但股价 -1.49% → 利好不涨(GapBullishNoRise) 触发。
+		// §N-RELAX 后 600276 还可能并持一条 N形 watch 观察信号（fixture 给了 D1 分），
+		// findSignal 按序取第一条会撞上它 ⇒ 本子测按策略名精确取预期差信号。
+		// English: after §N-RELAX 600276 may also carry an N-shape watch signal (fixture grants a D1
+		// score); select the 预期差 signal by strategy name instead of first-match.
+		var gap *combat_agent.Signal
+		for i := range dash.FinalSignals {
+			s := &dash.FinalSignals[i]
+			if s.Code == "600276" && s.Strategy == "预期差" {
+				gap = s
+				break
+			}
 		}
-		if sig.Strategy != "预期差" {
-			t.Errorf("600276 应为预期差信号, got %s", sig.Strategy)
+		if gap == nil {
+			t.Fatal("FinalSignals 缺少 600276 的预期差信号")
 		}
 		// 宁德时代 +2.9% 属利好正常反应，不应触发预期差
 		for _, s := range dash.FinalSignals {
@@ -533,21 +541,33 @@ func TestEndToEndFullPipeline(t *testing.T) {
 				t.Errorf("300308 NScore 应>0（D1 已透传）, got %.0f（DataGaps=%v）", sc.NScore, sc.DataGaps)
 			}
 		}
-		// 3) 门控断言（N形门槛放开 + 一突打标）：fixture 300308 D1=0.3 已进总分，
-		//    即使 Total=15<60（D2/D3/D4 凑分不足），一突破位（价>前高×1.005 且量比≥1.8）且
-		//    D1>0 时按新打标规则仍可产出一突/二突买入信号；全链闸门拦截仍由 n_shape_gate_test.go 覆盖。
-		//    因此此处断言：凡产出的 N 形做多信号必须带一突/二突标记（证明走打标路径，而非绕过闸门）。
-		var nSig int
+		// 3) 门控断言（§N-RELAX「只要有分就可观察，分数高就买入信号」）：
+		//    fixture 300308 D1=0.3 已进总分但 Total≈15<60 ⇒ 按新裁决产 tagless watch 观察信号
+		//    （Action=watch，Reason 带"N形观察"前缀），不再只进诊断日志；
+		//    若有 N 形买入信号（Total≥60 且一突/二突波形确认），必须带一突/二突标记（走打标路径而非绕闸）。
+		//    全链买入闸门仍由 n_shape_gate_test.go 覆盖。
+		var nBuy, nWatch int
 		for _, s := range dash.FinalSignals {
-			if (s.Strategy == "N形" || s.Strategy == "n_shape") && s.Direction == "做多" {
-				nSig++
-				t.Logf("N形信号 %s(%s) 分=%.0f tag=%s %s", s.Code, s.Name, s.Confidence*100, s.Tag, s.Reason)
+			if s.Strategy != "N形" && s.Strategy != "n_shape" {
+				continue
+			}
+			if s.Action == "watch" {
+				nWatch++
+				t.Logf("N形观察 %s(%s) 分=%.1f %s", s.Code, s.Name, s.Confidence*100, s.Reason)
+				continue
+			}
+			if s.Direction == "做多" {
+				nBuy++
+				t.Logf("N形买入 %s(%s) 分=%.1f tag=%s %s", s.Code, s.Name, s.Confidence*100, s.Tag, s.Reason)
 				if s.Tag != "一突" && s.Tag != "二突" {
-					t.Errorf("N形打标信号应带一突/二突标记, got tag=%q %s(%s)", s.Tag, s.Code, s.Name)
+					t.Errorf("N形买入信号应带一突/二突标记, got tag=%q %s(%s)", s.Tag, s.Code, s.Name)
 				}
 			}
 		}
-		t.Logf("N形做多信号数=%d(fixture D1>0 的一突/二突打标信号)", nSig)
+		t.Logf("N形信号数=%d（买入 %d + 观察 %d；§N-RELAX：有分可观察，高分才买入）", nBuy+nWatch, nBuy, nWatch)
+		if nBuy+nWatch == 0 {
+			t.Error("§N-RELAX 后 300308（D1>0）应至少产出一条 N形 观察或买入信号")
+		}
 	})
 
 	t.Run("东财板块列表", func(t *testing.T) {

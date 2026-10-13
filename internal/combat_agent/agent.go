@@ -953,6 +953,16 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		pe = input.PE[code]
 	}
 	var sigs []Signal
+	// §N-RELAX 观察信号单独收集：观察（有分可看、未过买入闸）不进 sigs 主流——
+	// 若混入，会把 SignalActive（持仓止盈止损降级的"仍有做多信号"判据）和动量 Q2
+	// 的"四战法均未出信号"补位判据全部撑开：一条置信 2% 的观察就能把硬止盈压成
+	// "持有观察"、把动量信号顶掉，观察就反向劫持了持仓管理与补位（2026-10-12 e2e 现形）。
+	// 观察在函数末尾、全部判据算完后才并入返回值。
+	// English: §N-RELAX observations are collected separately — mixing them into sigs would open
+	// SignalActive (the "still-bullish" input to take-profit/stop-loss downgrades) and the momentum
+	// Q2 fallback gate to a 2%-confidence observation, hijacking position management. They are
+	// merged into the return value only after all gates have been evaluated.
+	var obsSigs []Signal
 	var unSig []string // 未出信号战法的原因（诊断：为何非龙头战法不出信号）
 
 	// 动量分单独计算（量价+MACD+走势），作为 8a/8b 打分量的一部分；
@@ -1078,6 +1088,51 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			}
 			a.recordNDiag(NDiag{Code: code, Name: md.Name, D1: d1, Total: eval.TotalScore,
 				Level: eval.Level, Tag: tag, Pass: eval.Pass, Reason: reason})
+			// §N-RELAX（owner 2026-10-12 裁决「只要有分就可观察，分数高就买入信号」）前半：
+			// D1 有分（有实质事件）但未过买入闸（总分<60）的候选，不再只进诊断日志——
+			// 产一条 watch 观察信号进消息中心（消息中心按 code@策略 日级去重，不会刷屏），
+			// 让"今天有事件分的票"可见可跟踪；买入资格仍完全由分数闸管
+			// （黄金窗 ≥60＋一突/二突、10 点后 ≥80，见 risk_tier.go §N-RELAX 注释）。
+			// D1=0（无实质事件）仍不出任何信号：无事件的票没有观察价值，只会刷屏。
+			// English: §N-RELAX (owner ruling 2026-10-12, "any score → observable; high score → buy") —
+			// a candidate with a substantive D1 event but below the buy gate now emits a watch signal
+			// (message center dedups daily per code@strategy) instead of diag-only; D1=0 stays silent.
+			if d1 > 0 && !eval.Pass {
+				meta := make(map[string]float64, len(eval.Details))
+				for k, v := range eval.Details {
+					meta[k] = v
+				}
+				// 观察件显式打标（Meta["observe"]=1）：看板冲突裁决（resolveConflict）据此把
+				// 观察列为最低优先级——绝不顶掉实信号，避免 2% 置信的观察按"最新胜"挤掉
+				// 同股高置信的预期差/龙头信号（Action=watch 不是独有判据，预期差提醒也是 watch）。
+				// English: tag the observation explicitly (Meta["observe"]=1) so the dashboard conflict
+				// resolver treats it as lowest precedence — it never displaces a real signal
+				// (Action=watch is not a sufficient discriminator; the gap reminder is also watch).
+				meta["observe"] = 1
+				obsSigs = append(obsSigs, Signal{
+					ID:           seqID(),
+					Code:         code,
+					Name:         md.Name,
+					Strategy:     StrategyDisplayName(string(runner.Type)),
+					StrategyType: string(runner.Type),
+					Direction:    direction,
+					Action:       "watch",
+					Tag:          tag,
+					Price:        md.Price,
+					Confidence:   eval.Confidence,
+					ATR:          atr14Last(md.KLines),
+					// 读数纪律：d1 允许 LLM 小数分（如 0.3），用 %.0f 会把 0.3 四舍五入成"d1=0"，
+					// 让"有分才发"的守卫在理由文字里自相矛盾（2026-10-12 e2e 现形）。统一 %.1f。
+					// English: d1 may be a fractional LLM score (e.g. 0.3); %.0f rounds it to "0" and
+					// contradicts the d1>0 guard in the reason text. Always %.1f.
+					Reason: fmt.Sprintf("N形观察: d1=%.1f 总分=%.1f（低于60买入线，有事件待强化）",
+						d1, eval.TotalScore),
+					Sector:      sectorName,
+					GeneratedAt: now,
+					Meta:        meta,
+					Reasons:     strategy.CopyReasons(eval.Reasons),
+				})
+			}
 		}
 		// 未通过战法硬性/评分门槛；二突/一突已在上面被提为 Pass → 只记分不出信号
 		// English: strategy below hard/score gates (left/right already promoted to Pass above) →
@@ -1304,6 +1359,11 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	a.applyLaodengToSignals(sigs, md, pe, sectorName)
 	// §P1.2 开盘窗口竞价强度观察（仅注入回调且处于 9:30-10:00 时追加观察字段，不加分）。
 	a.applyAuctionConfirmToSignals(sigs, now)
+	// §N-RELAX 收尾：观察信号在 SignalActive/动量 Q2/风险档/LLM 参考标注等全部判据算完后并入。
+	// 观察是纯展示/消息中心件（Action=watch），不再参与任何闸门判定。
+	// English: §N-RELAX merge observations only after all gates (SignalActive / momentum Q2 / risk
+	// tier / LLM ref) have been evaluated — they are display/message-center-only (Action=watch).
+	sigs = append(sigs, obsSigs...)
 	return sigs
 }
 

@@ -207,6 +207,10 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 
 // nearBy 返回以 ref 为基准第 offset 个历史开盘日（offset=0 返回最近开盘日）；
 // trade_cal 无对应行时返回 ""。offset 从 0 开始：0=最新开盘日，1=上一个开盘日，以此类推。
+// §CAL-COVER-GO 登记（本批不改判据）：ref 若等于今日而日历末行停在昨天，这里拿到的
+// "最近开盘日"就是昨天——调用方无从分辨"昨天确实休市"与"日历没在维护"。同一张失明的表
+// 还喂着 TradeDates（store.go）与行情新鲜度自检；后者已加 covers_today 独立腿，这两处
+// 属日龄口径、改动会牵动质量评分基线，按另立一批裁（与 owner 已登的引擎侧加固同账）。
 // English: returns the offset-th open trading day at-or-before ref (0 = most recent);
 // "" when no such calendar row exists.
 func (d *DB) nearBy(ref string, offset int) string {

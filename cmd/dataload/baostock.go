@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -33,7 +34,7 @@ func bsFull(db *store.DB, c *data.BaostockClient, start, end string) error {
 	if err := bsLoadIndex(db, c, start, end); err != nil {
 		return fmt.Errorf("指数: %v", err)
 	}
-	return bsRunDaily(db, c, start, end)
+	return bsRunDaily(db, c, start, end, nil, false)
 }
 
 // bsMetaDates §B4-META（2026-09-26）：上市/退市元数据回填——baostock query_stock_basic 全表
@@ -124,7 +125,9 @@ func bsLoadMeta(db *store.DB, c *data.BaostockClient) error {
 
 	// 交易日历自 2015 年起全量落库：交易时段判定、回测区间对齐都依赖 trade_cal，
 	// 缺它就只能按自然日推进（周末/节假日会产出空行情周期）。
-	cal, err := c.TradeDays("2015-01-01", time.Now().Format("2006-01-02"))
+	// §CAL-COVER-GO：右边界必须是 today+45 而不是 today（baostock 日历本来就含全年未来日期，
+	// 截在今日等于自己把末行钉在昨天——与 tushare 那条写入口共用 cntime 同一个常量）。
+	cal, err := c.TradeDays("2015-01-01", cntime.CalendarEndDay(time.Now()))
 	if err != nil {
 		return err
 	}
@@ -180,23 +183,34 @@ func bsLoadIndex(db *store.DB, c *data.BaostockClient, start, end string) error 
 // latest daily trade date; the four tables are upserted together per stock. Robustness: retries a
 // failing stock up to 3 times (baostock's single connection tends to drop on long runs); if it still
 // fails, logs and skips that stock to keep the full universe moving, and a later run can top it up.）
-func bsRunDaily(db *store.DB, c *data.BaostockClient, start, end string) error {
-	codes, err := db.StockCodes()
-	if err != nil {
-		return err
+// bsRunDaily 逐票拉日线（§BOARD-COVER 判定腿配套的中段回补能力）：
+// onlyCodes 非空时只拨清单内代码（-codes 圈定范围，避免全市场陪跑）；
+// noResume=true 时忽略每股 MAX(trade_date)+1 断点、强制从 -start 重拉——
+// 2026-10-12 实录：.BJ 先补上了 20260917 以后的日子，断点被顶到最新，
+// 中段（20260829~0916）六周空洞靠常规 daily 永远追不平（from=nextDay(max)>end 直接跳过）。
+// English: bsRunDaily — optional codes filter + no-resume force pull; the resume point being
+// pushed past the gap made mid-span holes permanently unreachable by the normal daily pass.
+func bsRunDaily(db *store.DB, c *data.BaostockClient, start, end string, onlyCodes []string, noResume bool) error {
+	codes := onlyCodes
+	if codes == nil {
+		var err error
+		codes, err = db.StockCodes()
+		if err != nil {
+			return err
+		}
 	}
-	log.Printf("[dataload] 行情类开始：%d 只股票（baostock 逐票）", len(codes))
+	log.Printf("[dataload] 行情类开始：%d 只股票（baostock 逐票，no-resume=%v）", len(codes), noResume)
 	tStart := time.Now()
 	done, inserted, skipped := 0, 0, 0
 	// maxRetry 单票失败最大重试次数（网络错误 10002007 等，重试前短暂等待）。
 	const maxRetry = 3
 	for _, code := range codes {
-		n, err := bsLoadStockTables(db, c, code, start, end)
+		n, err := bsLoadStockTables(db, c, code, start, end, noResume)
 		// 失败重试（网络错误 10002007 等；每次重试前短暂等待，让 baostock 连接恢复）
 		for attempt := 0; err != nil && attempt < maxRetry; attempt++ {
 			log.Printf("[dataload] %s 重试 %d/%d: %v", code, attempt+1, maxRetry, err)
 			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
-			n, err = bsLoadStockTables(db, c, code, start, end)
+			n, err = bsLoadStockTables(db, c, code, start, end, noResume)
 		}
 		if err != nil {
 			// 重试耗尽仍失败 → 跳过该股票（记录，不中断整批）
@@ -251,16 +265,18 @@ func clampEndToLastClosedDay(end string) string {
 
 // bsLoadStockTables 装载单只股票的行情类四表，返回插入行数。
 // （bsLoadStockTables loads one stock's four bar-like tables, returning inserted rows.）
-func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end string) (int, error) {
-	max, err := db.MaxTradeDate("daily", code)
-	if err != nil {
-		return 0, err
-	}
+func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end string, noResume bool) (int, error) {
 	from := start
-	if max != "" {
-		from = nextDay(max)
-		if from > end {
-			return 0, nil // 已最新，跳过
+	if !noResume {
+		max, err := db.MaxTradeDate("daily", code)
+		if err != nil {
+			return 0, err
+		}
+		if max != "" {
+			from = nextDay(max)
+			if from > end {
+				return 0, nil // 已最新，跳过
+			}
 		}
 	}
 	end = clampEndToLastClosedDay(end) // §W3-a 半根K线防线

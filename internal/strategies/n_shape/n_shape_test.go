@@ -2,6 +2,7 @@
 package n_shape
 
 import (
+	"strings"
 	"testing"
 
 	"quant-trading-v2/internal/config"
@@ -124,6 +125,41 @@ func TestGenerateSignal(t *testing.T) {
 	sig, _ = n.GenerateSignal("1", &strategy.Evaluation{Level: "fail", Confidence: 0.3})
 	if sig.Action != strategy.ActionWatch {
 		t.Errorf("fail 应 watch, got %s", sig.Action)
+	}
+}
+
+// TestFullChainCanOpenGate §N-RELAX（owner 2026-10-12 裁决「分数高就买入信号」）：
+// 10 点后强分不足（scorer 置 canopen=0）的 full_chain 从"照发买入"落回 watch，
+// 理由写明分线；黄金窗口（canopen=1）照旧买入；Details 缺 canopen 键（手拼 eval
+// 的测试/旁路）保持既有买入行为不降级。
+// English: §N-RELAX — post-10:00 full_chain with canopen=0 degrades to watch with an explicit
+// score-line reason; canopen=1 buys as before; evals without the key keep legacy behavior.
+func TestFullChainCanOpenGate(t *testing.T) {
+	n := newNS()
+
+	sig, _ := n.GenerateSignal("1", &strategy.Evaluation{
+		Level: "full_chain", Confidence: 0.67,
+		Details: map[string]float64{"canopen": 0},
+	})
+	if sig.Action != strategy.ActionWatch || sig.Priority != strategy.P3 {
+		t.Errorf("10点后强分不足应 watch/P3, got %s/%d", sig.Action, sig.Priority)
+	}
+	if !strings.Contains(sig.Reason, "10点后未达强分") {
+		t.Errorf("降观察理由应写明分线, got %s", sig.Reason)
+	}
+
+	sig, _ = n.GenerateSignal("1", &strategy.Evaluation{
+		Level: "full_chain", Confidence: 0.85,
+		Details: map[string]float64{"canopen": 1},
+	})
+	if sig.Action != strategy.ActionBuy || sig.Priority != strategy.P1 {
+		t.Errorf("黄金窗口 canopen=1 应 buy/P1, got %s/%d", sig.Action, sig.Priority)
+	}
+
+	// 兼容腿：手拼 eval 无 canopen 键 → 既有行为（buy）不降级
+	sig, _ = n.GenerateSignal("1", &strategy.Evaluation{Level: "full_chain", Confidence: 0.65})
+	if sig.Action != strategy.ActionBuy {
+		t.Errorf("缺 canopen 键应保持买入行为, got %s", sig.Action)
 	}
 }
 

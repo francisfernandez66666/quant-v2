@@ -10,6 +10,20 @@
 #      次日计划任务兜底；§0927KA 加无进展早停——连续两轮三表读数零变化即收手
 #      （09-26 实录：target 幻觉成休市日时 8 轮＝12h 空烧配额并锁死 dataload.exe）。
 #
+# §POOL-STAMP／§TARGET-NOT-CLOSED（2026-10-12）盘口链两条新增（都在 main 进场处）：
+#   ④ 漏更日逐日回补：新鲜判定用的是 MAX(trade_date)>=target，中间漏掉的那一天既看不见
+#      也不会再被请求。涨停池改为整日快照落库后，本函数每轮把 15 日窗内「日历开市但当日
+#      0 行」的日子点名补一次（至多 5 天/轮），并把 found/fixed/left 打成一行读数。
+#   ⑤ 收盘前归位：target 就是今天而此刻尚未过收盘缓冲（15:05）时，把目标改成上一开市日——
+#      旧行为在收盘前手工拨一次必追不平，8 轮后 rc=1，把"早拨了一次"报成"补数失败"。
+#   ⑥ §BOARD-COVER 按板块覆盖：全库 MAX(trade_date) 是 .SH/.SZ 的最新，整块板块停更
+#      （`.BJ` 断更六周实录）在全库口径下永久隐形；每轮结束打一行三板块
+#      （板块最新日＋全库最新日行数）读数，缺板当天可见（库读不到→unknown，绝不冒充 0）。
+#      同形态第二犯（2026-10-12 当日实录）：one_round 的新鲜判定也用整库 MAX——.BJ 当天
+#      补进的 311 行把全库 MAX 垫到 target，.SH/.SZ 还停在上一交易日也宣告「all fresh」。
+#      判定腿同修：daily 新鲜改按三板块各自 MAX 全达标（latest_board/daily_boards_fresh），
+#      判不成时把各板块最新日打成归因读数。
+#
 # §M6（2026-09-22 修复批）两处根治：
 #   ① 指数日线表头键名：pydata sidecar 的 CSV 表头契约（cmd/pydata/server.py _INDEX_FIELDS）
 #      为 "pctChg"（驼峰），旧实现读 r.get("pctchg") —— csv.DictReader 大小写敏感，恒取不到
@@ -211,6 +225,186 @@ def last_trade_date(today=None):
     return d.strftime("%Y%m%d")
 
 
+# ── §POOL-STAMP（2026-10-12）盘口三池漏更日逐日回补 + 收盘前"目标日未到"归位 ──
+
+# 逐日回补的扫描窗口与单轮上限。两个数都是**约束**而不是偏好：
+#   LOOKBACK_DAYS=15 与 one_round 里日线补数窗口同尺（d0 = target-15d），两套"最近多少天"
+#     用同一把尺，才不会出现日线补到 15 天、池子只补 5 天的口径分叉；
+#   MAX_DAYS_PER_RUN=5 因为每个漏更日是一次独立的 hithink 上游调用（三池各一次），
+#     一轮扫完整个窗口会顶到配额并把保活拖过部署停机窗口——剩下的次日继续，读数点名。
+POOL_GAP_TABLE = "ths_limit_up_daily"
+POOL_GAP_LOOKBACK_DAYS = 15
+POOL_GAP_MAX_DAYS_PER_RUN = 5
+# 收盘后当日行情可取的缓冲时刻（15:05）。早于此刻且 target 就是今天 ⇒ 那一天"还没收盘"，
+# 不是"没备份"。旧形态在这一格直接 8 轮×10 分钟空烧后 rc=1，把"早拨了一次"报成补数失败。
+POST_CLOSE_READY_MINUTES = 15 * 60 + 5
+
+
+def row_count_on(table, date):
+    """某表某交易日的行数；读不到（缺表/锁死/异常）返回 -1＝**无从判定**，绝不返回 0。
+    0 与"读失败"在缺数判据里含义相反：前者是"确凿没数据、该补"，后者是"现在还不知道"。"""
+    try:
+        c = sqlite3.connect(DB, timeout=30)
+        n = c.execute("SELECT COUNT(*) FROM %s WHERE trade_date=?" % table, (date,)).fetchone()[0]
+        c.close()
+        return int(n or 0)
+    except Exception as e:
+        log("row_count_on %s %s err: %r" % (table, date, e))
+        return -1
+
+
+def _calendar_open_days(start, end):
+    """trade_cal 里 [start,end] 的开市日（升序 yyyyMMdd）。表缺失/异常 → []（缺数不猜、不工作日近似）。
+    逐日回补只用这一条日历源：日历不可用时宁可不补，也不能把休市日当成漏更日去拨上游。"""
+    try:
+        c = sqlite3.connect(DB, timeout=30)
+        rows = c.execute("SELECT cal_date FROM trade_cal WHERE is_open=1 AND cal_date>=? AND cal_date<=? "
+                         "ORDER BY cal_date", (start, end)).fetchall()
+        c.close()
+    except Exception as e:
+        log("trade_cal open days err: %r" % e)
+        return []
+    return [str(r[0]) for r in rows if _valid_yyyymmdd(str(r[0]))]
+
+
+def pool_gap_days(target):
+    """回看窗口内「日历开市、涨停池当日 0 行」的日子（升序，截到单轮上限，不含 target 本身）。
+
+    为什么必须有这条腿：one_round 的新新鲜判定是 `latest(table) >= target`，即 MAX(trade_date) 对比。
+    整日快照替换落地后，"最后一天到了"与"每一天都在"是两件事——中间漏掉的那天既不会被任何
+    现有判据看见，也永远不会再被请求（MAX 已达标 ⇒ 池子一步都不拨）。这就是"漏更日永不自动回补"。
+    """
+    d = datetime.datetime.strptime(target, "%Y%m%d").date()
+    start = (d - datetime.timedelta(days=POOL_GAP_LOOKBACK_DAYS)).strftime("%Y%m%d")
+    out = []
+    for day in _calendar_open_days(start, target):
+        if day >= target:
+            continue  # target 由 one_round 自己负责，两腿不并发拨同一天
+        if row_count_on(POOL_GAP_TABLE, day) == 0:
+            out.append(day)
+    return out[:POOL_GAP_MAX_DAYS_PER_RUN]
+
+
+def fill_pool_gaps(target):
+    """逐日回补漏更日，返回 (发现数, 补成数, 仍缺数)。
+
+    仍缺数只可能来自两种成因：上游确实给不出那一天（含同步链的幻影日拦停），或调用失败。
+    两种都不许用"补上了别的地方的数据"来消掉——宁可留一个点名到日的缺数读数。
+    """
+    gaps = pool_gap_days(target)
+    if not gaps:
+        return 0, 0, 0
+    fixed = 0
+    for day in gaps:
+        rc, msg = run([DATALOAD, "-db", DB, "hithink-sync", "--kind", "pools", "--date", day])
+        after = row_count_on(POOL_GAP_TABLE, day)
+        log("pools_gap day=%s rc=%d rows_after=%s msg=%s" % (day, rc, after, msg))
+        if after > 0:
+            fixed += 1
+    left = len(gaps) - fixed
+    log("pools_gap scanned=%d refilled=%d still_missing=%d days=%s" % (len(gaps), fixed, left, ",".join(gaps)))
+    return len(gaps), fixed, left
+
+
+def target_day_reachable(target, now=None):
+    """target 那天现在拿得到数据吗：早于今日一律 True；就是今天则须已过收盘缓冲时刻。
+    返回 (可取的 target, 是否发生归位, 归位说明)。"""
+    now = now or datetime.datetime.now()
+    if not isinstance(now, datetime.datetime):
+        # 只给日期＝无法判"是否已过收盘时刻"，按收盘后处理（归位这条腿宁可不触发，
+        # 也不要把一个没钟点的输入猜成"还没收盘"从而改走上一交易日）。
+        now = datetime.datetime.combine(now, datetime.time(POST_CLOSE_READY_MINUTES // 60,
+                                                           POST_CLOSE_READY_MINUTES % 60))
+    today_obj = now.date() if hasattr(now, "date") else now  # 允许传 date（测试与人工拨测同形）
+    today = today_obj.strftime("%Y%m%d")
+    if target != today:
+        return target, False, ""
+    if now.hour * 60 + now.minute >= POST_CLOSE_READY_MINUTES:
+        return target, False, ""
+    # 归位到"上一个开市日"：收盘前的当日数据本来就不存在，把今天当目标是恒追不平的；
+    # 但今天之前那一天可能真有缺（例如昨夜补数没跑完），所以是换目标继续补，而不是直接退出。
+    prev = last_trade_date(today_obj - datetime.timedelta(days=1))
+    if not _valid_yyyymmdd(prev) or prev >= target:
+        # 拿不到上一开市日（日历两源皆不可用）时**不改 target**，退回旧行为并留痕——
+        # 把 target 猜成某天，比追不平退出更糟。
+        log("target-not-closed day=%s now=%s retreat=none（上一开市日不可得，保持原 target）" % (target, now.strftime("%H:%M")))
+        return target, False, ""
+    log("target-not-closed day=%s now=%s retreat=%s（收盘前当日数据未到，改按上一开市日补）"
+        % (target, now.strftime("%H:%M"), prev))
+    return prev, True, prev
+
+
+# ── §BOARD-COVER（2026-10-12 波 6）按板块覆盖读数 ──
+# 背景：`.BJ` 整板日线断更六周而全库口径看不见（RUNBOOK §2.1 ③）——所有"最新"判据读的
+# 都是 MAX(trade_date)，那是 .SH/.SZ 的最新；任何一整块板块停下都只是在总数里静默隐形，
+# 每票三次重试还把整窗耗时往上抬。这条读数把每个板块的（板块最新交易日、全库最新日
+# 当日行数）逐个点名，与全库同日基线直接对照：缺板当天可见。
+# 语义：库读不到 → unknown 态；daily 全表无行 → empty 态（未启动采集的合法态）；
+# 单板块查询失败 → 该板块记 -1。"无从判定"绝不冒充 0 行——0 是"确凿没数据、该补"，
+# -1 是"现在还不知道"，两者在缺数判据里含义相反。
+BOARD_SUFFIXES = (".SH", ".SZ", ".BJ")
+
+
+def board_coverage_line():
+    """逐板块覆盖读数一行文本（进保活日志，夜间验收可 grep）。"""
+    try:
+        c = sqlite3.connect(DB, timeout=30)
+        overall = str(c.execute("SELECT COALESCE(MAX(trade_date),'') FROM daily").fetchone()[0] or "")
+        c.close()
+    except Exception as e:
+        log("board_coverage daily err: %r" % (e,))
+        return "board_coverage state=unknown（daily 读不到，无从判定）"
+    if not overall:
+        return "board_coverage state=empty（daily 全表无行，未启动采集）"
+    parts = ["board_coverage latest=%s" % overall]
+    for suf in BOARD_SUFFIXES:
+        try:
+            c = sqlite3.connect(DB, timeout=30)
+            mx = str(c.execute("SELECT COALESCE(MAX(trade_date),'') FROM daily WHERE ts_code LIKE ?",
+                               ("%" + suf,)).fetchone()[0] or "")
+            n = int(c.execute("SELECT COUNT(*) FROM daily WHERE trade_date=? AND ts_code LIKE ?",
+                              (overall, "%" + suf)).fetchone()[0])
+            c.close()
+            parts.append("%s[max=%s rows=%d]" % (suf.strip("."), mx or "none", n))
+        except Exception as e:
+            log("board_coverage %s rows=-1 err: %r" % (suf, e))
+            parts.append("%s[max=unknown rows=-1]" % suf.strip("."))
+    return " ".join(parts)
+
+
+# §BOARD-COVER 判定腿（2026-10-12 当日实录）：one_round 的新鲜判定原本也读整库 MAX——
+# .BJ 当天补进的 311 行把全库 MAX 垫到 target，.SH/.SZ 还停在上一交易日也宣告
+# 「all fresh」零调用退出。daily 的新鲜改按三板块各自 MAX 全部 >= target 才算齐；
+# 读不到/空板块一律算不新鲜（unknown 不冒充达标——宁可多拨一轮，不可谎报齐了）。
+def latest_board(suffix, col="trade_date"):
+    """单板块 daily 最新交易日（整库 latest 的板块级版本）；查询失败返回空串。"""
+    try:
+        c = sqlite3.connect(DB, timeout=30)
+        r = c.execute("SELECT COALESCE(MAX(%s),'') FROM daily WHERE ts_code LIKE ?" % col,
+                      ("%" + suffix,)).fetchone()[0]
+        c.close()
+        return str(r or "")
+    except Exception as e:
+        log("query daily[%s] err: %r" % (suffix, e))
+        return ""
+
+
+def daily_boards_fresh(target):
+    """daily 全板块新鲜判定：三板块各自 MAX 全部 >= target 才算齐（整库 MAX 会
+    被任何一块垫高——§BOARD-COVER 判定腿修的就是这个谎报形态）。"""
+    for suf in BOARD_SUFFIXES:
+        mx = latest_board(suf)  # 空串（读不到/空板块）一律不新鲜：unknown 不冒充达标
+        if not mx or mx < target:
+            return False
+    return True
+
+
+def daily_boards_line(target):
+    """判不成时的板块级归因读数（哪个板块停在哪个交易日，一行点名）。"""
+    return " ".join("%s[max=%s]" % (suf.strip("."), latest_board(suf) or "unknown")
+                    for suf in BOARD_SUFFIXES)
+
+
 def fetch_index(start_iso, end_iso):
     # 指数日线直补（pydata sidecar，CSV 协议与 Go BaostockClient 对齐）。
     # §M6-① 返回 (written, rejected)：rejected>0 表示该批源字段缺失/不可解析，
@@ -272,18 +466,21 @@ def fetch_index(start_iso, end_iso):
 
 def one_round(target):
     # 单轮补数：返回 True 表示目标表全部达到 target（yyyyMMdd）。
-    # 三张判定表全新鲜时零外部调用直接返回（不触发任何拉取）。
-    core = ("daily", "index_daily", "ths_limit_up_daily")
-    if all(latest(t) >= target for t in core):
+    # daily 判据走板块级（§BOARD-COVER 判定腿）：整库 MAX 会被任何一块板块垫高
+    # （2026-10-12 实录：.BJ 补到 target、.SH/.SZ 停在上一交易日也宣告全新鲜）。
+    # 其余两表全新鲜时零外部调用直接返回（不触发任何拉取）。
+    if daily_boards_fresh(target) and all(latest(t) >= target for t in ("index_daily", "ths_limit_up_daily")):
         return True
     ok = True
     d0 = datetime.datetime.strptime(target, "%Y%m%d").date() - datetime.timedelta(days=15)
-    if latest("daily") < target:
+    if not daily_boards_fresh(target):
         rc, msg = run([DATALOAD, "-db", DB, "-start", d0.strftime("%Y%m%d"),
                        "-end", time.strftime("%Y%m%d"), "daily"])
         log("daily rc=%d %s" % (rc, msg))
-    if latest("daily") < target:
-        ok = False
+        if not daily_boards_fresh(target):
+            # 板块级落后不冒充完成：点名哪个板块停在哪个交易日（归因读数进保活日志）。
+            log("daily 板块覆盖仍缺 %s（target=%s）" % (daily_boards_line(target), target))
+            ok = False
     start_iso, end_iso = d0.strftime("%Y-%m-%d"), datetime.date.today().strftime("%Y-%m-%d")
     if latest("index_daily") < target:
         n, bad = fetch_index(start_iso, end_iso)
@@ -316,15 +513,33 @@ def _core_snap():
 
 
 # 保活主流程：取最新交易日并对数据加载链路做一轮心跳检查/补数。
-def main():
+def main(now=None):
+    # §TARGET-NOT-CLOSED（2026-10-12）：now 可注入（测试与人工收盘前拨测同形），缺省=当下。
     log("keepalive run start pid=%d" % os.getpid())
-    target = last_trade_date()
+    # §TARGET-NOT-CLOSED 的注入时钟必须喂满两处：target 的推导（last_trade_date）和
+    # 归位判定（target_day_reachable）。只喂归位那一处时，"今天"仍按本机墙上钟算——
+    # 2026-10-13 00:10 复跑本批用例时，注入的是 10-12 10:44（收盘前、该归位到 20261009），
+    # 而 last_trade_date() 按墙上钟取出 §CAL-COVER 向未来延伸后的日历开市日 20261013，
+    # 于是 target(20261013) != today(20261012) 让归位腿直接判定"不是今天、无需归位"，
+    # 归位永远不触发、追不平 rc=1（夜里跨过零点才现形＝白天同一条用例是绿的）。
+    today_injected = None
+    if now is not None:
+        today_injected = now.date() if isinstance(now, datetime.datetime) else now
+    target = last_trade_date(today_injected)
+    # 收盘前手工拨：当日数据本来就没出，旧形态把"今天"当目标 ⇒ 8 轮追不上 ⇒ rc=1 报"补数失败"，
+    # 现按上一开市日归位（那一天若真缺照样补），归位过程本身留下读数。
+    target, retreated, retreat_note = target_day_reachable(target, now)
     done = False
+    # §POOL-GAP：MAX(trade_date) 达标≠每一天都在——把 15 日窗里的漏更日逐日点名回补，
+    # 一轮至多 5 天（每池每日一拨，扫完整窗会顶配额并拖过停机窗口）。整日替换落库后
+    # 这是唯一会主动补漏更日的通道，也是唯一把漏更日打成读数的地方。
+    pool_gap_total, pool_gap_fixed, pool_gap_days_left = fill_pool_gaps(target)
     last_snap = _core_snap()   # §0927KA 首轮进场前的基线快照
     no_progress = 0             # §0927KA 连续零进展轮数（见 _core_snap 注释）
     for rnd in range(8):
         if one_round(target):
-            log("all fresh up to %s (round %d) — exit" % (target, rnd + 1))
+            log("all fresh up to %s (round %d) — exit%s" % (target, rnd + 1,
+                (" [retreated=%s]" % retreat_note) if retreated else ""))
             done = True
             break
         snap = _core_snap()
@@ -342,6 +557,11 @@ def main():
         time.sleep(600)
     if not done:
         log("gave up for %s after %d rounds; next daily run will retry" % (target, rnd + 1))
+    if pool_gap_total:
+        log("pool gap: found=%d fixed=%d left=%d" % (pool_gap_total, pool_gap_fixed, pool_gap_days_left))
+    # §BOARD-COVER：收尾逐板块点名一次（断板在全库 MAX 口径下永久隐形——.BJ 六周断更的教训；
+    # 放在补数轮之后＝这行读数就是当天补完后的真实覆盖面）。
+    log(board_coverage_line())
     return 0 if done else 1
 
 

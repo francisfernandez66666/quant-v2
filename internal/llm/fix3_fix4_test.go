@@ -31,19 +31,32 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 // 桩 RoundTrip：把请求转交注入的函数处理。
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-// TestStreamIdleResetsOnChunks §FIX-3 反向用例（核心）：服务端每 60ms 滴一个分片、共 10 片，
-// 总耗时 ~600ms >> idle 200ms——空闲按"相邻分片"计就应全部读完成功；
-// 旧实现（空闲=整段硬超时）会在 200ms 误杀。
+// TestStreamIdleResetsOnChunks §FIX-3 反向用例（核心）：服务端按固定节奏滴分片，整段耗时**远大于**
+// 空闲阈值——空闲按"相邻分片"计就应全部读完成功；旧实现（空闲=整段硬超时）会在阈值处误杀。
+//
+// §DET-TIME-3（2026-10-13 收形）：这条用例的**负载余量＝空闲阈值与单片间隔的比值**，不是绝对秒数。
+// 旧形是 60ms 滴 10 片、阈值 200ms ⇒ 只留 140ms 余量。门禁第 7 遍 03:39 的 §15 就红在这里
+// （`流式响应空闲超时(200ms)`，用例耗时 0.86s）。归因走的是"复现阶梯"而不是猜：
+// 本机单跑同一用例 5/5 绿（0.86~1.73s）→ §15 那条整批并行命令（12 个包一次 go test）复跑 2/2 绿
+// → 16 路并发同时跑这一用例仍 0/16 红 ⇒ 红的那一刻不是分片重置逻辑坏了，而是**整个进程被挂起
+// 超过 140ms**（凌晨机器打盹／本机另一个项目的负载），墙钟一把尺子上"没发生的等待"被判成了卡死。
+// 与前端 §DET-TIME-2 同族：尺子挑错了时钟。修法＝比值抬到 25:1（滴 60ms、阈值 1500ms、片数 40），
+// 要误杀必须连续挂起 1.5 秒；反向证明力一点没缩——整段滴流 ~2.4s 仍 >> 1.5s，旧实现照旧在阈值掐死。
 func TestStreamIdleResetsOnChunks(t *testing.T) {
+	const (
+		dripInterval = 60 * time.Millisecond   // 单片间隔（被测的是"相邻分片重置"，间隔取小值即可）
+		dripChunks   = 40                      // 片数：整段 ~2.4s，保证比阈值长一大截
+		idleLimit    = 1500 * time.Millisecond // 空闲阈值：25 倍单片间隔＝负载余量
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
-		for i := 0; i < 10; i++ {
+		for i := 0; i < dripChunks; i++ {
 			fmt.Fprint(w, sseChunk(fmt.Sprintf("片段%d", i)))
 			if fl != nil {
 				fl.Flush()
 			}
-			time.Sleep(60 * time.Millisecond)
+			time.Sleep(dripInterval)
 		}
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
@@ -53,14 +66,15 @@ func TestStreamIdleResetsOnChunks(t *testing.T) {
 		APIKey:             "k",
 		APIURL:             srv.URL,
 		Streaming:          true,
-		StreamIdleTimeout:  200 * time.Millisecond, // 远小于整段耗时：只有"分片即重置"才能活着读完
+		StreamIdleTimeout:  idleLimit, // 远小于整段耗时：只有"分片即重置"才能活着读完
 		StreamTotalTimeout: 30 * time.Second,
 	})
 	got, err := c.streamChat(ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
 	if err != nil {
 		t.Fatalf("慢速滴流不应被空闲超时误杀: %v", err)
 	}
-	if !strings.Contains(got, "片段9") || !strings.Contains(got, "片段0") {
+	// 首尾两片都必须在：只拼到中途（被掐断）或整段丢弃都算红（片号随 dripChunks 派生，不写死）
+	if !strings.Contains(got, fmt.Sprintf("片段%d", dripChunks-1)) || !strings.Contains(got, "片段0") {
 		t.Fatalf("分片拼接不完整: %q", got)
 	}
 }

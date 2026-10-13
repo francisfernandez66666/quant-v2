@@ -176,7 +176,20 @@ func resolveConflict(bull, bear, alerts []combat_agent.Signal, blocked map[strin
 
 	// 先按置信度降序排序，再按代码去重：
 	// 同代码出现多次时保留生成时间最新的信号；blocked 的股票直接剔除。
+	// §N-RELAX 优先级补丁（2026-10-12）：观察件（Meta["observe"]=1，"有分可观察"的纯观察件）
+	// 优先级最低——观察不顶掉任何信号（含同为 Action=watch 的预期差提醒），任何信号都可顶掉
+	// 观察，观察之间按"最新胜"；其余信号维持原"最新胜"语义不变。否则一条置信 2% 的 N形观察
+	// 会因生成时间更晚把同股 72% 的预期差信号从看板挤掉（e2e 现形）。
+	// 风险面：FinalSignals 仅消费于展示/手动咨询上下文（交易走信号控制器），语义变化不影响成交路径。
+	// English: §N-RELAX precedence — observations (Meta["observe"]=1) are lowest precedence: they never
+	// displace any signal (including the gap reminder, which is also Action=watch); anything displaces an
+	// observation; observations compete among themselves by "latest wins"; all other pairs keep the legacy
+	// latest-wins semantics. Safe: FinalSignals feeds display/manual-advice only; trading goes through
+	// the signal controller.
 	seen := make(map[string]*combat_agent.Signal)
+	isObserve := func(s *combat_agent.Signal) bool {
+		return s != nil && s.Meta["observe"] >= 1
+	}
 	sort.Slice(all, func(i, j int) bool {
 		return all[i].Confidence > all[j].Confidence
 	})
@@ -185,7 +198,14 @@ func resolveConflict(bull, bear, alerts []combat_agent.Signal, blocked map[strin
 			continue
 		}
 		if existing, ok := seen[s.Code]; ok {
-			if s.GeneratedAt.After(existing.GeneratedAt) {
+			replace := s.GeneratedAt.After(existing.GeneratedAt)
+			switch {
+			case isObserve(&s) && !isObserve(existing):
+				replace = false // 观察不顶掉实信号
+			case !isObserve(&s) && isObserve(existing):
+				replace = true // 实信号顶掉观察
+			}
+			if replace {
 				seen[s.Code] = &s
 			}
 		} else {

@@ -22,9 +22,12 @@
 #   6) cand     research_candidates：近 N 日新增条数 + 最近一条的 created_at
 #   7) fina     fina_indicator：总行数 + 各报告期 distinct ts_code 分布（§0925EVE-B1 的"整季缺失"
 #               判据原样搬过来——只打印 COUNT(*) 发现不了 0930 期被永久跳过那种形态）
-# 七条判据腿之外另有一条 **只读 INFO 附加腿**（§CAL-COVER，2026-10-11）：`cal_coverage` 报
-#   交易日历末行是否覆盖今日、行情面最新交易日与落后几个交易日；它不进判数、不影响
-#   「腿数不足 7 必红」那半态守卫，作用是把"行情面停更但七腿全绿"这种形态摆到验收面上。
+# 七条判据腿之外另有两条 **只读 INFO 附加腿**（不进判数、不影响「腿数不足 7 必红」守卫）：
+#   §CAL-COVER（2026-10-11）：`cal_coverage` 报交易日历末行是否覆盖今日、行情面最新交易日
+#     与落后几个交易日，把"行情面停更但七腿全绿"摆到验收面上。
+#   §BOARD-COVER（2026-10-12）：`board_coverage` 按 .SH/.SZ/.BJ 三板块点名（板块最新交易日
+#     ＋全库最新日当日行数）——全库 MAX 口径是 .SH/.SZ 的最新，`.BJ` 整板断更六周只在
+#     总数里隐形；缺板当天可见，阈值口径与 cal_coverage 记在同一张账上。
 #
 # 三条现网纪律（照抄本仓已锤过的姿势，不是新发明）：
 #   ① 判据明细/键名一律 ASCII：PowerShell→SSH 回传按 GBK 码页打乱中文，拿中文当判据＝永久性假绿
@@ -39,6 +42,7 @@
 #   ./scripts/verify_nightly_guangzhou.sh -Preview                            # 离线预览（需 GZ_IP）
 # 可选环境变量：GZ_USER / DEPLOY_DIR / DATA_DIR / PY_EXE / RESEARCH_MAX_AGE_MIN /
 #   TASK_MAX_AGE_HOURS / RESEARCH_MEM_LIMIT_MB / CAND_MAX_AGE_DAYS / ACTIVE_QUEUE_MAX / AMOUNT_CHECK_ROWS
+#   PARKED_MAX / REQUEUE_MAX（§QUEUE-REQUEUE 队列熔断两条尺子，见队列腿注释）
 # 退出码：0=七腿全绿；非 0=任一腿判红（含"读数解析失败"这种半态，绝不猜成功）。
 #
 # English: nightly-research acceptance for the Guangzhou (Windows/NSSM) production host, judged by
@@ -56,6 +60,13 @@ RESEARCH_MAX_AGE_MIN="${RESEARCH_MAX_AGE_MIN:-5}"
 RESEARCH_MEM_LIMIT_MB="${RESEARCH_MEM_LIMIT_MB:-900}"
 TASK_MAX_AGE_HOURS="${TASK_MAX_AGE_HOURS:-48}"
 ACTIVE_QUEUE_MAX="${ACTIVE_QUEUE_MAX:-30}"
+# §QUEUE-REQUEUE（2026-10-12）队列侧两把尺子，与 Go 侧 store.TotalRequeueLimit 同源（20）：
+#   PARKED_MAX＝库里 failed_needs_attention 条数上限（默认 0：挂起就是"要人看"，不该天天红着，
+#                但也绝不能绿着隐身——红一条具名腿比整条链静默强）；
+#   REQUEUE_MAX＝活跃行累计回队次数上限（达 store 侧阈值时本应已挂起；库里还留着一行转到这个
+#                次数＝熔断闸没落上，属于判据失效，必须现形而不是当积压一起忽略）。
+PARKED_MAX="${PARKED_MAX:-0}"
+REQUEUE_MAX="${REQUEUE_MAX:-20}"
 CAND_MAX_AGE_DAYS="${CAND_MAX_AGE_DAYS:-7}"
 AMOUNT_CHECK_ROWS="${AMOUNT_CHECK_ROWS:-800}"
 
@@ -69,10 +80,10 @@ PS_TARGET="${DEPLOY_DIR}/verify_nightly_probes.ps1"
 PY_TARGET="${DEPLOY_DIR}/verify_nightly_readout.py"
 
 # 远端命令原文（预览模式打印的就是这里，保证"预览"与"实跑"不会各说一套）
-PS_ARGS="-DataDir ${DATA_DIR} -DeployDir ${DEPLOY_DIR} -PythonExe ${PY_EXE} -ReadoutPy ${PY_TARGET} -MaxAgeMin ${RESEARCH_MAX_AGE_MIN} -MemLimitMb ${RESEARCH_MEM_LIMIT_MB} -AmountRows ${AMOUNT_CHECK_ROWS} -ActiveMax ${ACTIVE_QUEUE_MAX} -TaskAgeHours ${TASK_MAX_AGE_HOURS} -CandAgeDays ${CAND_MAX_AGE_DAYS}"
+PS_ARGS="-DataDir ${DATA_DIR} -DeployDir ${DEPLOY_DIR} -PythonExe ${PY_EXE} -ReadoutPy ${PY_TARGET} -MaxAgeMin ${RESEARCH_MAX_AGE_MIN} -MemLimitMb ${RESEARCH_MEM_LIMIT_MB} -AmountRows ${AMOUNT_CHECK_ROWS} -ActiveMax ${ACTIVE_QUEUE_MAX} -TaskAgeHours ${TASK_MAX_AGE_HOURS} -CandAgeDays ${CAND_MAX_AGE_DAYS} -ParkedMax ${PARKED_MAX} -RequeueMax ${REQUEUE_MAX}"
 RUN_PS="powershell -NoProfile -ExecutionPolicy Bypass -File ${PS_TARGET} ${PS_ARGS}"
 # 队列/候选/财务三条腿由 PS 内部调这条 python 命令（阈值同样经 PS 参数透传，见 PSEOF 里的 pyCmd）
-RUN_PY="${PY_EXE} ${PY_TARGET} --db ${DATA_DIR}/trading.db --active-max ${ACTIVE_QUEUE_MAX} --task-age-hours ${TASK_MAX_AGE_HOURS} --cand-age-days ${CAND_MAX_AGE_DAYS}"
+RUN_PY="${PY_EXE} ${PY_TARGET} --db ${DATA_DIR}/trading.db --active-max ${ACTIVE_QUEUE_MAX} --task-age-hours ${TASK_MAX_AGE_HOURS} --cand-age-days ${CAND_MAX_AGE_DAYS} --parked-max ${PARKED_MAX} --requeue-max ${REQUEUE_MAX}"
 
 if [ "$PREVIEW" -eq 1 ]; then
   echo "== verify_nightly_guangzhou -Preview（不连现网，仅打印将要执行的远端命令）=="
@@ -90,7 +101,7 @@ TMP_PY="$(mktemp /tmp/vng_readout_XXXXXX).py" || { echo "mktemp 失败"; exit 1;
 # ── PS 侧四条腿（服务态 / 文件心跳 / 进程内存 / 量纲抽检）──
 # 输出协议与 verify_deploy_guangzhou.sh 一致：PASS|<名> / FAIL|<名> / INFO|<读数>，明细全 ASCII。
 cat > "$TMP_PS" <<'PSEOF'
-# 三个队列/候选阈值（ActiveMax / TaskAgeHours / CandAgeDays）必须由 bash 侧透传（见 PS_ARGS）。
+# 队列/候选阈值（ActiveMax / TaskAgeHours / CandAgeDays / ParkedMax / RequeueMax）必须由 bash 侧透传（见 PS_ARGS）。
 # param 默认值只作「单独直跑 PS」的兜底，与 bash/python 同名默认值一致；漏透传不会报错、
 # 只会静默按默认判，因此门禁 §106 用等值锁把这三个名字在两侧同时钉住（防惰性阈值）。
 param(
@@ -103,7 +114,9 @@ param(
     [int]$AmountRows = 800,
     [int]$ActiveMax = 30,
     [int]$TaskAgeHours = 48,
-    [int]$CandAgeDays = 7
+    [int]$CandAgeDays = 7,
+    [int]$ParkedMax = 0,
+    [int]$RequeueMax = 20
 )
 function Probe([string]$name, [bool]$ok, [string]$detail) {
     $tag = if ($ok) { "PASS" } else { "FAIL" }
@@ -185,7 +198,7 @@ Probe "scale:daily+ths_daily amount caliber probe green" (-not $scaleBad) ("dail
 #      环境变量 CAND_MAX_AGE_DAYS / TASK_MAX_AGE_HOURS / ACTIVE_QUEUE_MAX 在实跑里失效
 #      （预览打印的命令行和真正执行的命令行会各说一套，那是本仓锤过的假绿形态）。
 if (Test-Path -LiteralPath $PythonExe) {
-    $pyRaw = & $PythonExe $ReadoutPy "--db" (Join-Path $DataDir "trading.db") "--active-max" "$ActiveMax" "--task-age-hours" "$TaskAgeHours" "--cand-age-days" "$CandAgeDays" 2>&1
+    $pyRaw = & $PythonExe $ReadoutPy "--db" (Join-Path $DataDir "trading.db") "--active-max" "$ActiveMax" "--task-age-hours" "$TaskAgeHours" "--cand-age-days" "$CandAgeDays" "--parked-max" "$ParkedMax" "--requeue-max" "$RequeueMax" 2>&1
     foreach ($l in ($pyRaw | ForEach-Object { [string]$_ })) {
         if ($l -match '^(PASS|FAIL|INFO)\|') { Write-Output $l }
         elseif ($l.Trim().Length -gt 0) { Write-Output ("FAIL|py:readout-crashed :: " + $l.Replace("|", "/")) }
@@ -241,6 +254,10 @@ def main():
     ap.add_argument("--active-max", type=int, default=30)
     ap.add_argument("--task-age-hours", type=int, default=48)
     ap.add_argument("--cand-age-days", type=int, default=7)
+    # §QUEUE-REQUEUE（2026-10-12）两把队列熔断尺子的兜底默认，与 bash/PS/Go 四处同源：
+    #   requeue-max 的字面值必须等于 Go 侧 store.TotalRequeueLimit（门禁 §106 钉这条跨语言等值）。
+    ap.add_argument("--parked-max", type=int, default=0)
+    ap.add_argument("--requeue-max", type=int, default=20)
     a = ap.parse_args()
 
     now = dt.datetime.now()
@@ -295,15 +312,72 @@ def main():
                     if oldest_age_h is None or one_age_h > oldest_age_h:
                         oldest_age_h = one_age_h
             by_status = ",".join("%s:%d" % (k, stat_count[k]) for k in sorted(stat_count))
+        # §QUEUE-REQUEUE（2026-10-12）队列侧新口径：把"这条红的成因"直接读成字段。
+        #   旧判据只有 active/last_age 两把尺子，10-11 那晚 active=31 判红之后归因要人翻库——
+        #   实录是同一个任务被 8 小时单步超时送回队尾 33 次（回队循环），加上 38 条真排队，
+        #   两种成因在旧读数里长得一模一样。现在：
+        #     parked        = failed_needs_attention 条数（两条熔断闸挂起的总数，>0 即"要人看"）；
+        #     churn_max     = 活跃行的累计回队次数最大值（回队循环的现场指纹）；
+        #     churn_max_id  = 那一行的 id:type:fail_streak:requeue_total（能直接定位去查）；
+        #     oldest_chain  = 活跃行里最老的夜间链日（积压是老链没走完还是新链在排）；
+        #     reasons=      = 判红的具名成因列表（空＝绿），人不用再猜是哪把尺子量的。
+        #   churn 读数**列缺席时报 absent 并报红**（reasons=requeue_col_absent）：该列由新 binary
+        #   首次开库时幂等迁移添加，缺席＝这台机还没跑过带累计闸的版本，属于必须现形的时序差，
+        #   绝不静默按 0 处理（0 会让回队循环继续绿着转——§缺数不报 0 的同族）。
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(research_tasks)").fetchall()]
+        parked = cur.execute(
+            "SELECT COUNT(*) FROM research_tasks WHERE status='failed_needs_attention'").fetchone()[0]
+        parked_first = "none"
+        prow = cur.execute(
+            "SELECT id,type,error FROM research_tasks WHERE status='failed_needs_attention' "
+            "ORDER BY updated_at DESC LIMIT 3").fetchall()
+        if prow:
+            parked_first = ",".join("%s:%s" % (r[0], r[1]) for r in prow)
+        churn_max, churn_max_id, col_state = -1, "none", "ok"
+        if "requeue_total" in cols:
+            churn_max = int(cur.execute(
+                "SELECT COALESCE(MAX(requeue_total),0) FROM research_tasks "
+                "WHERE status IN ('queued','running','paused','preempted')").fetchone()[0] or 0)
+            trow = cur.execute(
+                "SELECT id, type, requeue_total, fail_streak FROM research_tasks "
+                "WHERE status IN ('queued','running','paused','preempted') "
+                "ORDER BY requeue_total DESC, id ASC LIMIT 1").fetchone()
+            if trow:
+                churn_max_id = "%s:%s:total=%s:streak=%s" % (trow[0], trow[1], trow[2], trow[3])
+        else:
+            col_state = "absent"
+        oldest_chain = "none"
+        if "chain_day" in cols:
+            crow2 = cur.execute(
+                "SELECT MIN(chain_day) FROM research_tasks "
+                "WHERE status IN ('queued','running','paused','preempted') AND chain_day<>''").fetchone()
+            oldest_chain = crow2[0] or "none"
+        reasons = []
+        if active > a.active_max:
+            reasons.append("backlog_gt_%d" % a.active_max)
+        if last_age_h is None:
+            reasons.append("last_terminal_unparsed")
+        elif last_age_h > a.task_age_hours:
+            reasons.append("stall_gt_%dh" % a.task_age_hours)
+        if parked > a.parked_max:
+            reasons.append("parked_gt_%d" % a.parked_max)
+        if col_state != "ok":
+            reasons.append("requeue_col_absent")
+        elif churn_max >= a.requeue_max:
+            reasons.append("churn_ge_%d" % a.requeue_max)
         detail = ("active=%d limit=%d last_updated_age_h=%s last_type=%s last_status=%s "
-                  "by_status=%s oldest_active_age_h=%s") % (
+                  "by_status=%s oldest_active_age_h=%s parked=%d parked_max=%d parked_first=%s "
+                  "churn_max=%s churn_max_task=%s requeue_max=%d oldest_chain_day=%s reasons=%s") % (
             active, a.active_max,
             ("%.1f" % last_age_h) if last_age_h is not None else "unparsed",
             (last[0] if last else "none"), (last[1] if last else "none"),
             by_status,
-            ("%.1f" % oldest_age_h) if oldest_age_h is not None else "unparsed")
+            ("%.1f" % oldest_age_h) if oldest_age_h is not None else "unparsed",
+            parked, a.parked_max, parked_first,
+            churn_max if col_state == "ok" else "absent", churn_max_id, a.requeue_max,
+            oldest_chain, ",".join(reasons) if reasons else "none")
         emit("INFO", "nightly_queue " + detail)
-        okq = active <= a.active_max and last_age_h is not None and last_age_h <= a.task_age_hours
+        okq = not reasons
         emit("PASS" if okq else "FAIL", "queue:research task queue drained and recent terminal state", detail)
     except Exception as e:  # 读数失败一律判红并留异常摘要：静默的"查不到"比查错更危险
         emit("FAIL", "queue:research task queue readable", "err=%s" % type(e).__name__)
@@ -341,6 +415,26 @@ def main():
     except Exception as e:
         # 读数腿自己坏了也说清楚（不进判数，但绝不沉默——沉默正是这次停更没人看见的原因）
         emit("INFO", "cal_coverage err=%s（读数腿故障，本条不进判数）" % type(e).__name__)
+
+    # ── §BOARD-COVER 附加读数（2026-10-12 波 6）：按板块覆盖点名 ──
+    #   `.BJ` 整板断更六周而全库 MAX 口径看不见的教训：任何"最新"判据都是 .SH/.SZ 的最新，
+    #   整块板块停下只在总数里隐形。与 cal_coverage 同取向＝只出 INFO 不进判数；
+    #   行数在无最新日时读 unknown（无从判定不冒充 0）。
+    try:
+        overall = cur.execute("SELECT MAX(trade_date) FROM daily").fetchone()[0]
+        parts = ["latest=%s" % (overall or "none")]
+        for suf in (".SH", ".SZ", ".BJ"):
+            mx = cur.execute("SELECT MAX(trade_date) FROM daily WHERE ts_code LIKE ?",
+                             ("%" + suf,)).fetchone()[0]
+            if overall:
+                n = str(cur.execute("SELECT COUNT(*) FROM daily WHERE trade_date=? AND ts_code LIKE ?",
+                                    (overall, "%" + suf)).fetchone()[0])
+            else:
+                n = "unknown"
+            parts.append("%s[max=%s rows=%s]" % (suf.strip("."), mx or "none", n))
+        emit("INFO", "board_coverage " + " ".join(parts))
+    except Exception as e:
+        emit("INFO", "board_coverage err=%s（读数腿故障，本条不进判数）" % type(e).__name__)
 
     # ── cand ──
     try:

@@ -73,7 +73,7 @@ func openDB(t *testing.T) *store.DB {
 // 所以断言单表根数必须另走 countRows，别拿合计当根数用。
 func mustLoad(t *testing.T, db *store.DB, url, code, start, end string) int {
 	t.Helper()
-	n, err := bsLoadStockTables(db, data.NewBaostockClient(url), code, start, end)
+	n, err := bsLoadStockTables(db, data.NewBaostockClient(url), code, start, end, false)
 	if err != nil {
 		t.Fatalf("bsLoadStockTables: %v", err)
 	}
@@ -294,5 +294,48 @@ func TestLegacySidecarWithoutSourceColumn(t *testing.T) {
 	}
 	if toCount(deg) != 0 {
 		t.Fatalf("老 sidecar 行被判成降级（%v）⇒ 读侧会凭空丢掉整段历史", deg[0]["n"])
+	}
+}
+
+// TestNoResumeForcePullReachesMidSpanHole §BOARD-COVER 判定腿配套能力锁（2026-10-12）：
+// 断更中段回补的真实形态——库里已有一行"较新"日（每股 resume 断点被顶到它之后），
+// 常规 daily 对 -start 落在断点之前的窗口一律跳过（from=nextDay(max)>end），空洞永远
+// 追不平（.BJ 先补上 20260917+ 顶住断点、20260829~0916 六周空洞的实录）。no-resume
+// 必须无视断点从 -start 强拉，中段行落库。
+func TestNoResumeForcePullReachesMidSpanHole(t *testing.T) {
+	const code = "600000.SH"
+	db := openDB(t)
+	// 第一步：造"断点被顶过"的库态——只有 20260918 一行。
+	seed := []string{
+		"2026-09-18," + code + ",10.0,10.6,9.9,10.5,10.0,120000,1260000,3,1.1,1,5.0,8.1,0.9,2.2,1.1,0,baostock",
+	}
+	mustLoad(t, db, bsSidecar(t, seed).URL, code, "2026-09-01", "2026-09-30")
+
+	// 第二步：目标空洞 20260901。resume 口径下 from=nextDay(20260918)=20260919 > end=0918
+	// ⇒ 跳过返回 0（空洞不可达——这正是被锁住的缺陷形态）。
+	hole := []string{
+		"2026-09-01," + code + ",9.0,9.5,8.9,9.4,9.0,100000,940000,3,1.0,1,4.0,8.0,0.9,2.0,1.0,0,baostock",
+	}
+	n, err := bsLoadStockTables(db, data.NewBaostockClient(bsSidecar(t, hole).URL), code, "2026-09-01", "2026-09-18", false)
+	if err != nil {
+		t.Fatalf("resume 口径装载: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("resume 口径应跳过（断点已越过 -start~end 窗口），实拉 %d 行", n)
+	}
+	if got := countRows(t, db, "daily", "trade_date='20260901'"); got != 0 {
+		t.Fatalf("resume 口径不得写出中段行（空洞保持不可达形态），实际 %d 行", got)
+	}
+
+	// 第三步：no-resume 强拉同窗口 → 中段行落库（能力本体）。
+	n2, err := bsLoadStockTables(db, data.NewBaostockClient(bsSidecar(t, hole).URL), code, "2026-09-01", "2026-09-18", true)
+	if err != nil {
+		t.Fatalf("no-resume 装载: %v", err)
+	}
+	if n2 == 0 {
+		t.Fatalf("no-resume 必须无视断点从 -start 强拉，实拉 0 行（能力没接线）")
+	}
+	if got := dailyCell(t, db, "close", code, "20260901"); got == nil {
+		t.Fatalf("中段行没落库（no-resume 能力空转）")
 	}
 }

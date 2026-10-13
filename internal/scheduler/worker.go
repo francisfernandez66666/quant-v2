@@ -1179,7 +1179,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			}
 			s.noteFailure(tk.ID)
 			s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
-			s.notifySameCauseBreaker(db, &tk, errMsg) // §M14 熔断挂起检测（留痕+告警；置于链收尾后，覆盖展示态为 needs_attention）
+			s.notifyRequeueBreaker(db, &tk) // §M14 熔断挂起检测（留痕+告警；置于链收尾后，覆盖展示态为 needs_attention）
 		}
 		s.mu.Lock()
 		s.busy = false
@@ -1216,7 +1216,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		_ = db.RequeueFailedTask(tk.ID, errMsg)
 		s.noteFailure(tk.ID)
 		s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
-		s.notifySameCauseBreaker(db, &tk, errMsg) // §M14 熔断挂起检测（置于链收尾后，见其注释）
+		s.notifyRequeueBreaker(db, &tk) // §M14 熔断挂起检测（置于链收尾后，见其注释）
 	}
 
 	// 重活一律交给子进程：先解析该任务类型对应的可执行文件与参数，解析失败（如缺二进制、
@@ -1603,7 +1603,13 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		}
 	}
 	if status == store.TaskPreempted {
-		_ = db.RequeueTask(tk.ID) // preempted → queued（队首优先级由出队排序保证）
+		// §QUEUE-REQUEUE（2026-10-12）：抢占续跑改走 RequeueAfterPreemption，不再走人工复活入口
+		// RequeueTask——后者会把同因连败计数清零，worker 每重启一次熔断账就被抹一次，
+		// 这正是现网"同一任务 8 小时超时回队 33 次"没被 §M14 拦住的第二条通道。
+		// 抢占本身不是失败，但仍计入累计闸（反复让位也跑不完＝需要人看）。
+		if err := db.RequeueAfterPreemption(tk.ID); err != nil {
+			log.Printf("[scheduler] 任务 #%d 抢占回队落库失败: %v", tk.ID, err)
+		}
 	}
 	if status == store.TaskFailedRetry {
 		// §失败重排队：回队尾（updated_at 沉底），error 列留最后失败原因，冷却后重试。
@@ -1621,9 +1627,10 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	log.Printf("[scheduler] 任务 #%d(%s) -> %s%s", tk.ID, tk.Type, status, tailOf(errMsg))
 	opslog.Logf("research", "任务 #%d(%s) 终态=%s%s", tk.ID, tk.Type, status, tailOf(errMsg))
 	s.finishTask(db, cfg, &tk, status, errMsg)
-	if status == store.TaskFailedRetry {
-		// §M14 熔断挂起检测：置于链收尾之后——挂起时把展示态覆盖为 needs_attention 并高优告警一次。
-		s.notifySameCauseBreaker(db, &tk, errMsg)
+	if status == store.TaskFailedRetry || status == store.TaskPreempted {
+		// §M14 / §QUEUE-REQUEUE 熔断挂起检测：置于链收尾之后——挂起时把展示态覆盖为
+		// needs_attention 并高优告警一次。抢占续跑也纳入：累计闸现在同样会在这条路上触闸。
+		s.notifyRequeueBreaker(db, &tk)
 	}
 }
 
@@ -1648,33 +1655,42 @@ func (s *Scheduler) clearFailure(taskID int64) {
 	s.mu.Unlock()
 }
 
-// notifySameCauseBreaker §M14（2026-09-22）同因连败熔断挂起处理：每次失败回队落库后重读
-// 任务行，若 store 侧已按「同指纹连败达阈值」将其挂为 failed_needs_attention（不再回队），则：
-//   - opslog/日志双留痕（error 列本身含「同因连败熔断」标记，挂起可审计）；
+// notifyRequeueBreaker §M14（2026-09-22）同因连败 + §QUEUE-REQUEUE（2026-10-12）累计回队
+// 两条闸的挂起处理：每次回队落库后重读任务行，若 store 侧已把它挂为 failed_needs_attention
+// （不再回队），则：
+//   - opslog/日志双留痕（error 列本身含「同因连败熔断」或「累计回队熔断」前缀，挂起可审计，
+//     文案按前缀分因——旧实现无论哪条闸触的都写"同因 N 连败"，累计闸触的那次会告一条假原因）；
 //   - 清除冷却表占位（挂起终态不会再被出队，留着只占内存）；
 //   - state 文件记 needs_attention（前端 /api/research/progress 可见）；
 //   - 经 SetAlertFunc 注入的推送通道高优告警一次——挂起是瞬时跃迁（queued→挂起只发生
-//     在触阈值那一次 RequeueFailedTask），天然去重，不会每轮重复告警。
+//     在触阈值那一次回队落库），天然去重，不会每轮重复告警。
 //
-// English: M14 — after each failed-requeue write, detect the same-cause breaker trip
-// (failed_needs_attention) and leave an audit trail + fire the one-shot ops alert.
-func (s *Scheduler) notifySameCauseBreaker(db *store.DB, tk *store.ResearchTask, errMsg string) {
+// English: detects either breaker trip (same-cause streak or lifetime requeue cap) after a
+// requeue write, leaves an audit trail, and fires the one-shot ops alert with the real trip reason.
+func (s *Scheduler) notifyRequeueBreaker(db *store.DB, tk *store.ResearchTask) {
 	cur, err := db.GetResearchTask(tk.ID)
 	if err != nil || cur == nil || cur.Status != store.TaskNeedsAttention {
 		return // 常态：任务已回队尾重试，无需熔断处理
 	}
-	log.Printf("[scheduler] §M14 任务 #%d(%s) 同因 %d 连败→熔断挂起（failed_needs_attention，不再重排队，待人工 Requeue）",
-		tk.ID, tk.Type, cur.FailStreak)
-	opslog.Logf("research", "§M14 任务 #%d(%s) 同因连败熔断挂起（%d 连败，高优告警已发）: %s",
-		tk.ID, tk.Type, cur.FailStreak, cur.Error)
+	trip := store.RequeueTripReasonOf(cur.Error)
+	// 文案按触闸成因分岔：同因闸报连败次数，累计闸报回队次数——旧实现只认同因，
+	// 累计闸触的那次会告出一条假原因（读数与判据同源，告警也不例外）。
+	head, count := "累计回队", cur.RequeueTotal
+	if trip == "same_cause" {
+		head, count = "同因连败", cur.FailStreak
+	}
+	log.Printf("[scheduler] §M14/§QUEUE-REQUEUE 任务 #%d(%s) %s %d 次→熔断挂起（成因=%s，failed_needs_attention，不再重排队，待人工 Requeue）",
+		tk.ID, tk.Type, head, count, trip)
+	opslog.Logf("research", "任务 #%d(%s) 熔断挂起（成因=%s，高优告警已发）: %s",
+		tk.ID, tk.Type, trip, cur.Error)
 	s.clearFailure(tk.ID)
 	s.recordStepState(tk.Type, "needs_attention", cur.Error)
 	s.mu.Lock()
 	fn := s.alertFn
 	s.mu.Unlock()
 	if fn != nil {
-		fn("研究任务同因连败熔断", fmt.Sprintf("任务 #%d(%s) 连续 %d 次同因失败已挂起，不再重排队（原因：%s）。请排查后经 RequeueTask 人工复活。",
-			tk.ID, tk.Type, cur.FailStreak, tailOf(errMsg)))
+		fn("研究任务重排队熔断", fmt.Sprintf("任务 #%d(%s) %s %d 次已挂起，不再重排队（库内记录：%s）。请排查后经 RequeueTask 人工复活。",
+			tk.ID, tk.Type, head, count, cur.Error))
 	}
 }
 
@@ -1733,6 +1749,22 @@ func (s *Scheduler) finishTask(db *store.DB, cfg config.SchedulerConfig, tk *sto
 		if t.ChainDay == tk.ChainDay {
 			return // 链尚未排空
 		}
+	}
+	// §QUEUE-REQUEUE（2026-10-12）排空 ≠ 跑完：同链里有被熔断闸挂起的步时 done 位必须留在
+	// false——挂起态不在 ActiveResearchTasks 的集合里，只看"没有活跃行"就会把"某步根本没跑成"
+	// 报成"这一天全跑完了"（前端与心跳都读这个位，属本仓锤过的降级报成功族）。
+	// 读挂起数失败时同样不置位：宁可 done=false 让人来查，也不猜成功。
+	parked, perr := db.ChainParkedCount(tk.ChainDay)
+	if perr != nil {
+		log.Printf("[scheduler] 夜间链 %s 挂起步数读取失败，done 位保持不置: %v", tk.ChainDay, perr)
+		return
+	}
+	if parked > 0 {
+		log.Printf("[scheduler] 夜间链 %s 队列已排空但**未完成**：%d 步被熔断挂起待人工处理，done 位不置",
+			tk.ChainDay, parked)
+		opslog.Logf("research", "夜间链 %s 排空但有 %d 步挂起（failed_needs_attention），不计为完成", tk.ChainDay, parked)
+		s.saveState()
+		return
 	}
 	s.mu.Lock()
 	if s.state.Day == tk.ChainDay {

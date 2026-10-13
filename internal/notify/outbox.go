@@ -134,6 +134,12 @@ func outboxDelivererFor(n *Notifier, deliverStr string) (func(string, Message) e
 	switch {
 	case deliverStr == "gateway":
 		return deliverGateway(n), true
+	case deliverStr == "ntfy":
+		// §NTFY-OUTBOX（2026-10-12 波 7）：ntfy 失败行（PushGateway 并投腿入队的 kind="ntfy"）
+		// 此前不在重建白名单——引擎一重启，待补投的止损/清仓运维提醒被静默丢弃（上方循环对
+		// 未知 deliverStr 一律 continue）。与 gateway 同语义重建；通道已下线时 deliverNtfy
+		// 按既有语义视为成功出队（不误投）。
+		return deliverNtfy(n), true
 	case strings.HasPrefix(deliverStr, "webhook:"):
 		return deliverWebhook(n, strings.TrimPrefix(deliverStr, "webhook:")), true
 	}

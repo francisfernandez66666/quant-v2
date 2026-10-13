@@ -187,7 +187,8 @@ func TestD1ScoresUpsertAndQuery(t *testing.T) {
 
 // TestTaskSameCauseBreaker §M14（2026-09-22）同因连败熔断（取代 §P1-11 异因混计上限）：
 //  1. 同一失败指纹连败达阈值 → failed_needs_attention 挂起终态，不再出队；
-//  2. 异因失败不误伤——指纹每次不同则连败恒为 1，队列语义不变；
+//  2. 异因失败不误判同因——指纹每次不同则连败恒为 1，但 §QUEUE-REQUEUE（2026-10-12）
+//     另有一条与原因无关的累计回队闸把它们收口（旧"异因不设上限"正是 33 次回队的空子）；
 //  3. 人工 Requeue 复活 → 回到 queued 且连败计数清零（重新起算）。
 func TestTaskSameCauseBreaker(t *testing.T) {
 	db := testDB(t)
@@ -252,18 +253,216 @@ func TestTaskSameCauseBreaker(t *testing.T) {
 	if tk.FailStreak != 0 || tk.FailFP != "" {
 		t.Fatalf("成功后连败计数应清零, got %+v", tk)
 	}
-	// 2) 异因失败不误伤：每次指纹不同 → 恒为 1，远超阈值仍留队
+	// 2) §QUEUE-REQUEUE（2026-10-12）改判：异因**不再"不设上限"**。
+	//    旧断言（转 20 圈仍留队）就是现网"同一任务被 8 小时单步超时回队 33 次"的护身符——
+	//    超时文案与「运行失败(…)：末行输出」交替时指纹每次都变，同因闸恒为 1 永不触闸。
+	//    现行为：连败计数仍恒 1（不误判成同因），但累计回队次数达 TotalRequeueLimit 即挂起。
 	id2, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
 	if err != nil {
 		t.Fatalf("enqueue2: %v", err)
 	}
-	for i := 1; i <= SameReasonFailLimit*2; i++ {
+	for i := 1; i < TotalRequeueLimit; i++ {
 		if err := db.RequeueFailedTask(id2, "boom-异因-"+itoa(i)); err != nil {
 			t.Fatalf("异因第 %d 次: %v", i, err)
 		}
+		tk2, err := db.GetResearchTask(id2)
+		if err != nil {
+			t.Fatalf("get2: %v", err)
+		}
+		// 每轮都还能出队重试（未触闸），且两把尺子各计各的：streak 恒 1、total 逐轮 +1
+		if tk2.Status != TaskQueued || tk2.FailStreak != 1 || tk2.RequeueTotal != i {
+			t.Fatalf("异因第 %d 次应 queued/streak=1/total=%d, got %+v", i, i, tk2)
+		}
+		if next, _ := db.DequeueHighestTask(); next == nil || next.ID != id2 {
+			t.Fatalf("异因第 %d 次应能出队重试", i)
+		}
+	}
+	if err := db.RequeueFailedTask(id2, "boom-异因-最后一轮"); err != nil {
+		t.Fatalf("异因末轮: %v", err)
 	}
 	tk2, _ := db.GetResearchTask(id2)
-	if tk2 == nil || tk2.Status != TaskQueued || tk2.FailStreak != 1 {
-		t.Fatalf("异因循环 %d 次不应熔断且计数恒 1, got %+v", SameReasonFailLimit*2, tk2)
+	if tk2 == nil || tk2.Status != TaskNeedsAttention {
+		t.Fatalf("累计回队达 %d 次应挂起, got %+v", TotalRequeueLimit, tk2)
+	}
+	if !strings.HasPrefix(tk2.Error, "累计回队熔断") || RequeueTripReasonOf(tk2.Error) != "total_requeue" {
+		t.Fatalf("挂起留痕必须写清是累计闸触的（不能冒充同因）, got %q", tk2.Error)
+	}
+	if next, _ := db.DequeueHighestTask(); next != nil {
+		t.Fatalf("累计闸挂起后不应出队, 取到 %+v", next)
+	}
+	// 人工复活把两把尺子一起清零：不清 total 的话，owner 刚复活的任务一跑就再次触闸。
+	if err := db.RequeueTask(id2); err != nil {
+		t.Fatalf("人工 Requeue(累计闸): %v", err)
+	}
+	tk2, _ = db.GetResearchTask(id2)
+	if tk2.Status != TaskQueued || tk2.RequeueTotal != 0 || tk2.FailStreak != 0 {
+		t.Fatalf("复活后应 queued 且两把尺子清零, got %+v", tk2)
+	}
+}
+
+// TestTaskPreemptRequeueKeepsStreakAndCounts §QUEUE-REQUEUE 抢占续跑通道：
+// 旧形态走人工复活入口 RequeueTask，每次 worker 重启/让位都把同因连败账清零——
+// 这是 33 次回队没被熔断拦住的第二条通道。现行为：
+//  1. 抢占回队**不清** fail_fp/fail_streak（连败账跨重启有效）；
+//  2. 抢占回队计入 requeue_total（反复让位也跑不完＝需要人看）；
+//  3. 达上限挂起，且挂起文案是"含抢占/重启续跑"而不是伪造一条崩溃原因。
+func TestTaskPreemptRequeueKeepsStreakAndCounts(t *testing.T) {
+	db := testDB(t)
+	id, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// 先攒一次同因失败（streak=1），再模拟"重启让位"——旧实现这一步就会把 streak 抹成 0。
+	if err := db.RequeueFailedTask(id, "单步超时(8h0m0s)，已回队尾重试"); err != nil {
+		t.Fatalf("首败: %v", err)
+	}
+	if err := db.UpdateTaskRunState(id, TaskPreempted, "10%", 0, "", "调度器停止，断点缓存有效"); err != nil {
+		t.Fatalf("preempted: %v", err)
+	}
+	if err := db.RequeueAfterPreemption(id); err != nil {
+		t.Fatalf("抢占回队: %v", err)
+	}
+	tk, _ := db.GetResearchTask(id)
+	if tk.Status != TaskQueued || tk.FailStreak != 1 {
+		t.Fatalf("抢占回队不得清零同因连败账, got %+v", tk)
+	}
+	if tk.RequeueTotal != 2 { // 1 次失败回队 + 1 次抢占回队
+		t.Fatalf("抢占回队必须计入累计闸, got %+v", tk)
+	}
+	// 反复抢占续跑（原因每次不同，同因闸永不触）→ 由累计闸收口。
+	// 每轮都先落 preempted 再回队：RequeueAfterPreemption 只认 preempted/paused（0 行会报错），
+	// 这与 worker 的真实顺序一致（终态落库 → 回队翻转），不给"绕过状态闸"留合法通道。
+	for i := tk.RequeueTotal + 1; i < TotalRequeueLimit; i++ {
+		if err := db.UpdateTaskRunState(id, TaskPreempted, "10%", 0, "", "调度器停止，断点缓存有效"); err != nil {
+			t.Fatalf("preempted 第 %d 次: %v", i, err)
+		}
+		if err := db.RequeueAfterPreemption(id); err != nil {
+			t.Fatalf("抢占回队第 %d 次: %v", i, err)
+		}
+	}
+	tk, _ = db.GetResearchTask(id)
+	if tk.Status != TaskQueued || tk.RequeueTotal != TotalRequeueLimit-1 {
+		t.Fatalf("未达上限时抢占任务应仍 queued 且计数=%d, got %+v", TotalRequeueLimit-1, tk)
+	}
+	if err := db.RequeueAfterPreemption(id); err != nil {
+		t.Fatalf("末轮抢占: %v", err)
+	}
+	tk, _ = db.GetResearchTask(id)
+	if tk.Status != TaskNeedsAttention || !strings.HasPrefix(tk.Error, "累计回队熔断") {
+		t.Fatalf("抢占续跑达上限应挂起并留累计闸文案, got %+v", tk)
+	}
+	if !strings.Contains(tk.Error, "含抢占/重启续跑") {
+		t.Fatalf("文案必须说明这条是抢占累计（不是崩溃）, got %q", tk.Error)
+	}
+	// 挂起行不再出队
+	if next, _ := db.DequeueHighestTask(); next != nil {
+		t.Fatalf("挂起后不应出队, 取到 %+v", next)
+	}
+}
+
+// TestTaskPreemptRequeueZeroRowIsLoud §QUEUE-REQUEUE 状态闸的现形腿：queued 行调用抢占回队
+// 必须报错，而不是"改了 0 行还返回 nil"——静默 0 行意味着累计闸一次都没计上，
+// 任务照样无限转圈，而日志全绿（本仓锤过的静默失败族）。
+func TestTaskPreemptRequeueZeroRowIsLoud(t *testing.T) {
+	db := testDB(t)
+	id, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := db.RequeueAfterPreemption(id); err == nil {
+		t.Fatal("queued 行的抢占回队必须现形（0 行不是成功）")
+	} else if !strings.Contains(err.Error(), "抢占回队未生效") {
+		t.Fatalf("报错文案要指名是哪条腿没落上, got %v", err)
+	}
+	tk, _ := db.GetResearchTask(id)
+	if tk.RequeueTotal != 0 {
+		t.Fatalf("未生效时不得留下计数, got %+v", tk)
+	}
+}
+
+// TestTaskRequeueTripReasonReadsBothBreakers 触闸成因回读：两个前缀各自归因，
+// 其它 error（人工写的、旧数据）不得被冒充成其中任何一种。
+func TestTaskRequeueTripReasonReadsBothBreakers(t *testing.T) {
+	cases := []struct{ errText, want string }{
+		{"同因连败熔断(10连败)：boom", "same_cause"},
+		{"累计回队熔断(20次回队)：boom", "total_requeue"},
+		{"运行失败(exit status 1)", "requeue"},
+		{"", "requeue"},
+	}
+	for _, c := range cases {
+		if got := RequeueTripReasonOf(c.errText); got != c.want {
+			t.Fatalf("成因回读 %q → %s，期望 %s", c.errText, got, c.want)
+		}
+	}
+}
+
+// TestTaskRequeueTotalSurvivesSuccess 累计闸跨"偶发成功"不清账（设计取舍，反例锁）：
+// 中间成功一次不是免罪——跑成了还继续重排才是空烧的佐证；只有人工 Requeue 才清零。
+func TestTaskRequeueTotalSurvivesSuccess(t *testing.T) {
+	db := testDB(t)
+	id, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := db.RequeueFailedTask(id, "网络抖动"); err != nil {
+		t.Fatalf("失败回队: %v", err)
+	}
+	if err := db.UpdateTaskRunState(id, TaskDone, "100%", 0, "", ""); err != nil {
+		t.Fatalf("done: %v", err)
+	}
+	tk, _ := db.GetResearchTask(id)
+	if tk.FailStreak != 0 || tk.RequeueTotal != 1 {
+		t.Fatalf("成功应清同因账、不清累计账, got %+v", tk)
+	}
+}
+
+// TestChainParkedCount §QUEUE-REQUEUE 链收尾的诚实位：挂起态不在 ActiveResearchTasks 集合里，
+// "队列排空"必须由挂起步数单独证明，否则链会把"某步被熔断请出队列"报成"这一天全跑完"。
+// 三态自证：无链日＝0；全跑完＝0；有挂起步＝该数。
+func TestChainParkedCount(t *testing.T) {
+	db := testDB(t)
+	a, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskBacktestNightly, Payload: `{}`, ChainDay: "20261012", ChainSeq: 1})
+	if err != nil {
+		t.Fatalf("enqueue a: %v", err)
+	}
+	b, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskBacktestStrategy, Payload: `{}`, ChainDay: "20261012", ChainSeq: 2})
+	if err != nil {
+		t.Fatalf("enqueue b: %v", err)
+	}
+	// 空串链日＝无链任务，不参与统计（也不报错）
+	if n, err := db.ChainParkedCount(""); err != nil || n != 0 {
+		t.Fatalf("无链日应 (0,nil), got (%d,%v)", n, err)
+	}
+	// 两条都正常跑完 → 0
+	if err := db.UpdateTaskRunState(a, TaskDone, "100%", 0, "", ""); err != nil {
+		t.Fatalf("done a: %v", err)
+	}
+	if err := db.UpdateTaskRunState(b, TaskDone, "100%", 0, "", ""); err != nil {
+		t.Fatalf("done b: %v", err)
+	}
+	if n, err := db.ChainParkedCount("20261012"); err != nil || n != 0 {
+		t.Fatalf("全跑完时应 0, got (%d,%v)", n, err)
+	}
+	// 把 b 改成挂起态（模拟熔断闸请出队列）→ 必须数出来
+	if err := db.UpdateTaskRunState(b, TaskNeedsAttention, "", 0, "", "累计回队熔断(20次回队)：boom"); err != nil {
+		t.Fatalf("park b: %v", err)
+	}
+	n, err := db.ChainParkedCount("20261012")
+	if err != nil || n != 1 {
+		t.Fatalf("挂起 1 步必须现形, got (%d,%v)", n, err)
+	}
+	// 挂起行同时不得出现在"活跃/未终结"集合里（这条锁住的就是 finishTask 那个盲点的前提）
+	active, err := db.ActiveResearchTasks()
+	if err != nil {
+		t.Fatalf("active: %v", err)
+	}
+	for _, tk := range active {
+		if tk.ID == b {
+			t.Fatalf("挂起行不应算活跃（正因如此链收尾必须单独数挂起）, got %+v", active)
+		}
+	}
+	// 别的链日不受影响
+	if n, err := db.ChainParkedCount("20261011"); err != nil || n != 0 {
+		t.Fatalf("邻日应 0, got (%d,%v)", n, err)
 	}
 }

@@ -149,8 +149,19 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	switch eval.Level {
 	case "full_chain":
 		// 完整链确认：按置信度分档 高→P1(≥0.8)、中→P2(≥0.6)、低→P3（Full-chain: confidence tiers P1(≥0.8)/P2(≥0.6)/P3）
+		// §N-RELAX（owner 2026-10-12 裁决「分数高就买入信号」）：10 点后时间优先级不足强分
+		// （StrongMin=80）时 scorer 置 CanOpen=false——此前该字段只进 Meta、全仓无消费者，
+		// 60~79 分的"过线但不够强"信号照发买入；现把"分数不够高"落回 watch 观察，
+		// 买入资格由分数闸单一来源（黄金窗口 CanOpen 恒 true，不受影响）。
+		// Details 缺 canopen 键（手拼 eval 的测试/旁路）不降级，保持既有买入行为。
+		// English: §N-RELAX — post-10:00 signals below the strong bar (StrongMin=80, CanOpen=false from
+		// the scorer) now degrade to watch; previously canopen was Meta-only with no consumer, so 60~79
+		// buys went out unfiltered. Golden window unaffected; evals without the key keep legacy behavior.
 		action = strategy.ActionBuy
-		if eval.Confidence >= 0.8 {
+		if v, ok := eval.Details["canopen"]; ok && v == 0 {
+			action = strategy.ActionWatch
+			prio = strategy.P3
+		} else if eval.Confidence >= 0.8 {
 			prio = strategy.P1
 		} else if eval.Confidence >= 0.6 {
 			prio = strategy.P2
@@ -193,13 +204,20 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	// previously only the scores were copied, so the frontend's d3_desc/d4_desc stayed empty.
 	reasons := strategy.CopyReasons(eval.Reasons)
 
+	// §N-RELAX：10 点后强分不足被降观察时，理由写明分线（消息中心可读、复盘可归因）；
+	// 其余路径沿用级别串。
+	reason := eval.Level
+	if action == strategy.ActionWatch && eval.Level == "full_chain" {
+		reason = "10点后未达强分(需80):" + eval.Level
+	}
+
 	// 组装信号：动作与优先级已由上面的形态分档和一突提档逻辑定完，
 	// Reason 只带形态级别串，各维分数经 Meta 透传给前端与复盘。
 	return &strategy.Signal{
 		Action:     action,
 		Priority:   prio,
 		Confidence: eval.Confidence,
-		Reason:     eval.Level,
+		Reason:     reason,
 		Type:       strategy.SignalNShape,
 		Meta:       meta,
 		Reasons:    reasons,

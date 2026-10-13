@@ -129,8 +129,15 @@ describe('§H-2 Positions 保存可用资金失败（toast + 回滚 + 缓存不�
     await saveBalanceAs(999)
 
     // ① toast（showToast 补导入后才会真的出现）
+    // ★ §DET-TIME-2（2026-10-13，门禁第 6 遍 §51 实录同形）：toast 由 MessagePlugin 按
+    // `duration:3000` 的**真实时钟**自动收起，而 `findByText` 在"找到的那一刻"就已经证明它在
+    // 文档里；负载把那句解析回调推迟到收起之后时，再补一句 `expect(toast).toBeInTheDocument()`
+    // 会对同一枚节点报「element could not be found in the document」（本轮 §51 就红在本文件 T5b
+    // 补的那句上，findByText 本身已成功返回——T1 与此同形，一并收）。改成认"取到的那枚节点上的
+    // 文字"：判据一点没放宽（没出现照样
+    // 由 findByText 抛错判红），只是不再拿"三秒后还在不在"当第二把尺子。
     const toast = await screen.findByText(/保存可用资金失败：服务端 500/, {}, { timeout: 5000 })
-    expect(toast, '§H-2：失败必须给出可见 toast（旧码 ReferenceError 零提示）').toBeInTheDocument()
+    expect(toast.textContent, '§H-2：失败必须给出可见 toast（旧码 ReferenceError 零提示）').toContain('保存可用资金失败')
 
     // ② 回滚到编辑前值
     await screen.findByText(/可用资金: ¥100\.00/, {}, { timeout: 5000 })
@@ -222,8 +229,14 @@ describe('§E1 Positions 盈亏单轨：页头读数=后端 total_pnl，清零�
     render(<Positions />)
     await screen.findByText(/总盈亏/, {}, { timeout: 5000 })
     fireEvent.click(screen.getByRole('button', { name: '清零' }))
+    // ★ §DET-TIME-2（2026-10-13 门禁第 6 遍 §51 实录）：本轮 §51 的唯一红就在这条用例的
+    // 第二句——`findByText(/盈亏校准失败/)` **已经成功返回**，紧跟的 `toBeInTheDocument()`
+    // 却报「element could not be found in the document」。成因＝toast 按 `duration:3000` 的
+    // 真实时钟自动收起，而邻居负载把 findByText 的解析回调推迟到收起之后（settle.js 头注写的
+    // "事件循环被抢走"同一形态）。改成认取到的那枚节点上的文字：没出现仍由 findByText 抛错判红，
+    // 判据不放宽，只是不再拿"三秒后还在不在"当第二把尺子。
     const toast = await screen.findByText(/盈亏校准失败/, {}, { timeout: 5000 })
-    expect(toast).toBeInTheDocument()
+    expect(toast.textContent, '§E1：清零失败必须给出可见 toast（静默＝用户以为已校准）').toContain('盈亏校准失败')
   })
 
   it('T6 静态负向锁：pnl_offset 键不得复活；空头浮盈不得保留本地公式', () => {

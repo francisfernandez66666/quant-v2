@@ -955,8 +955,12 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		"strategy_allocs":     cfg.StrategyAllocs,
 		"daily_max_buys":      cfg.DailyMaxBuys,
 		"daily_budget_amount": cfg.DailyBudgetAmount,
-		"auto_sell":           cfg.AutoSell,
-		"miss_heartbeat_sec":  cfg.MissHeartbeatSec,
+		// owner 2026-10-12 裁决两闸（原值透出；0=出厂默认，负数=显式关闭，语义见 config.go）
+		"min_buy_price":      cfg.MinBuyPrice,
+		"min_order_amount":   cfg.MinOrderAmount,
+		"max_extends":        cfg.Discipline.MaxExtends, // 延持次数上限（默认 2，负数=无上限）
+		"auto_sell":          cfg.AutoSell,
+		"miss_heartbeat_sec": cfg.MissHeartbeatSec,
 		// §R4-1 kill-switch 与撤单闭环参数
 		"halted":           cfg.Halted,
 		"cancel_stale_sec": cfg.CancelStaleSec,
@@ -991,6 +995,10 @@ type setQMTConfigReq struct {
 	// §AUDIT-PM 2026-09-15 单笔委托金额绝对帽（元；0=关）——安全封顶闸，保存即生效，
 	// 不随开关队列滞留到次日（与 §U-3 halted 即时语义同口径）。
 	MaxOrderAmount *float64 `json:"max_order_amount"`
+	// owner 2026-10-12 裁决两闸 + 延持上限（指针=nil 本次不改；0=出厂默认，负数=显式关闭）。
+	MinBuyPrice    *float64 `json:"min_buy_price"`    // 最低买入价（元，默认 5）
+	MinOrderAmount *float64 `json:"min_order_amount"` // 单笔最低成交额（元，默认 5000）
+	MaxExtends     *int     `json:"max_extends"`      // 卖出延持次数上限（默认 2，负数=无上限）
 }
 
 // handleSetQMTConfig 处理 POST /api/config/qmt：局部合并保存当前账号实盘配置并热加载生效。
@@ -1097,6 +1105,33 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 			return
 		}
 		cfg.DailyBudgetAmount = *req.DailyBudgetAmount
+	}
+	// owner 2026-10-12 裁决两闸 + 延持上限（nil=本次不改）。取值语义与引擎一致：
+	// 0=出厂默认（min_buy_price 5 元 / min_order_amount 5000 元 / max_extends 2 次）、
+	// 负数=显式关闭该闸（max_extends 负数=恢复无上限旧行为）；上限钳到 1e6 防误输天文数字。
+	if req.MinBuyPrice != nil {
+		v := *req.MinBuyPrice
+		if v > 1e6 {
+			writeError(w, 400, "min_buy_price 超出范围（≤1000000）")
+			return
+		}
+		cfg.MinBuyPrice = v
+	}
+	if req.MinOrderAmount != nil {
+		v := *req.MinOrderAmount
+		if v > 1e6 {
+			writeError(w, 400, "min_order_amount 超出范围（≤1000000）")
+			return
+		}
+		cfg.MinOrderAmount = v
+	}
+	if req.MaxExtends != nil {
+		v := *req.MaxExtends
+		if v > 1e6 {
+			writeError(w, 400, "max_extends 超出范围（≤1000000）")
+			return
+		}
+		cfg.Discipline.MaxExtends = v
 	}
 	// §AUDIT-PM 2026-09-15 单笔金额绝对帽（0=关；上限 1e9 防误输成"天文数字"失去封顶意义）
 	if req.MaxOrderAmount != nil {

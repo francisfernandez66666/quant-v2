@@ -51,7 +51,9 @@ func main() {
 	token := flag.String("token", "", "Tushare Pro token（仅 tushare 需要）")
 	start := flag.String("start", "20200101", "起始日期 YYYYMMDD")
 	end := flag.String("end", cntime.DayCompactOf(time.Now()), "结束日期 YYYYMMDD")
-	codesFile := flag.String("codes", "", "研究池清单文件（每行一个 ts_code）：finance / adjfactor / minute-sync 共用")
+	codesFile := flag.String("codes", "", "研究池清单文件（每行一个 ts_code）：daily / finance / adjfactor / minute-sync 共用")
+	// §BOARD-COVER 判定腿配套：断更中段回补专用（配 -codes 圈定范围，勿对全市场开）。
+	noResume := flag.Bool("no-resume", false, "忽略每股 MAX(trade_date)+1 断点，强制从 -start 重拉（中段空洞回补专用）")
 	finStart := flag.Int("fin-start", 2020, "财务起始年份")
 	finEnd := flag.Int("fin-end", time.Now().Year(), "财务结束年份")
 	withDelisted := flag.Bool("with-delisted", false, "§WS-D D-2 拉取已退市/暂停上市股票（list_status=L,D,P），消除回测幸存者偏差")
@@ -59,7 +61,9 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: dataload [flags] <full|daily|meta-dates|finance|bars ts_code|verify|amount-check>")
+		// 子命令清单必须与下面的 switch 同面：旧文案只列到 amount-check，
+		// 让人以为 hithink-sync/ths-backfill 不存在只能去读源码——文案过时比缺失更难查。
+		log.Fatalf("用法: dataload [flags] <full|daily|meta-dates|finance|bars ts_code|verify|amount-check|hithink-sync|ths-backfill|minute-sync|pool-probe>")
 	}
 	cmd := args[0]
 
@@ -105,11 +109,21 @@ func main() {
 			log.Fatalf("full 失败: %v", err)
 		}
 	case "daily":
+		// §BOARD-COVER 判定腿配套（2026-10-12）：-codes 圈定范围（如只拨 .BJ）+
+		// -no-resume 忽略每股断点强制从 -start 重拉——.BJ 先补上最新日把断点顶过去后，
+		// 中段（20260829~0916）空洞靠常规 daily 永远追不平（from=nextDay(max)>end 直接跳过）。
+		var onlyCodes []string
+		if *codesFile != "" {
+			var err error
+			if onlyCodes, err = readCodesFile(*codesFile); err != nil {
+				log.Fatalf("codes 清单读取失败: %v", err)
+			}
+		}
 		var err error
 		if *provider == "tushare" {
 			err = runDaily(db, *token, *start, *end)
 		} else {
-			err = bsRunDaily(db, bsClient, *start, *end)
+			err = bsRunDaily(db, bsClient, *start, *end, onlyCodes, *noResume)
 		}
 		if err != nil {
 			log.Fatalf("daily 失败: %v", err)
@@ -203,6 +217,12 @@ func main() {
 		// 因此不需要 token；判红退 1，供夜间校验/部署后验收拦停。见 amount_check.go 文件头。
 		cmdAmountCheck(db, args[1:])
 		return
+	case "pool-probe":
+		// §POOL-STAMP 盘口池子只读日期探针：不写库、不判红（退 0=取到读数，退 2=取不到）。
+		// 现网用它把 payload_day/shadow_state 两个语义量出来，再决定同步链要不要提级成拦停。
+		// English: read-only pool date probe — never writes, never exits 1.
+		cmdPoolProbe(db, args[1:])
+		return
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}
@@ -252,8 +272,10 @@ func loadMeta(db *store.DB, token string, withDelisted bool) error {
 		log.Printf("[dataload] stocks 写入 %d 行（list_status=%s）", n, listStatus)
 	}
 
-	// 交易日历拉 2015-至今（含 2020 前的校准区间，供热手/校准回测使用）
-	cal, err := c.TradeCal("20150101", cntime.DayCompactOf(time.Now()))
+	// 交易日历拉 2015-至今**再向未来 45 天**（含 2020 前的校准区间，供热手/校准回测使用）。
+	// §CAL-COVER-GO：右边界写"今日"就是盲窗本体——明天这张表末行即落在昨天，行情新鲜度自检
+	// 与全部按「≤今日最近开市日」倒推的判据一起失明。尺度必须与 Python 保活侧同源（cntime 常量）。
+	cal, err := c.TradeCal("20150101", cntime.CalendarEndDayCompact(time.Now()))
 	if err != nil {
 		return err
 	}

@@ -416,6 +416,23 @@ type QMTConfig struct {
 	// buy orders (Price×Qty) and rejects new buys past the cap (sells unaffected).
 	// 日买入预算
 	DailyBudgetAmount float64 `json:"daily_budget_amount"`
+	// MinBuyPrice 最低买入价闸（元；owner 2026-10-12 裁决）：现价低于该值的"杂毛股"不做自动买入。
+	// 0=按出厂默认 5 生效（存量配置快照没有该键时反序列化得 0，必须兜到默认而非旁路）；
+	// 负数=显式关闭本闸。生效读数走 EffectiveMinBuyPrice（两处兜底口径单点收敛）。
+	// English: minimum buy price floor (owner ruling 2026-10-12) — skip auto-buys priced below it.
+	// 0 = factory default 5 (old config snapshots lack the key and would silently bypass the gate
+	// if 0 meant "off"); negative = explicitly disable. Read via EffectiveMinBuyPrice.
+	// 最低买入价
+	MinBuyPrice float64 `json:"min_buy_price"`
+	// MinOrderAmount 单笔买入最低成交额闸（元；owner 2026-10-12 裁决）：成交额=股价×最终买入股数，
+	// 低于该值的单子（典型=降档后的 1 手 2 手碎单）不做自动买入。判据在现金降档**之后**、
+	// 组单之前取最终股数核算。0=按出厂默认 5000 生效（同上：存量快照缺键必须兜默认而非旁路）；
+	// 负数=显式关闭本闸。生效读数走 EffectiveMinOrderAmount。
+	// English: per-order minimum notional floor (owner ruling 2026-10-12) — notional = price × FINAL
+	// lot count, checked AFTER the cash-downgrade block and BEFORE order assembly. 0 = factory
+	// default 5000; negative = explicitly disable. Read via EffectiveMinOrderAmount.
+	// 单笔最低成交额
+	MinOrderAmount float64 `json:"min_order_amount"`
 	// AutoSell 实盘卖出自动化开关（§GAP1.1，默认开启）：mode=auto 时，止损级建议
 	// （止损/清仓类）自动全仓卖出，止盈/减仓保持提醒半自动。signal_id 按日幂等防重。
 	// English: auto-sell switch for the real book (default on): in auto mode, stop-loss-class advice
@@ -767,6 +784,18 @@ type DisciplineConfig struct {
 	// cycle) counts as absent when the sell window decides whether to extend the hold.
 	// 卖出延持信号新鲜度上限秒数
 	SellSignalMaxAgeSec int `json:"sell_signal_max_age_sec"`
+	// MaxExtends 延持次数上限（owner 2026-10-12 裁决）：卖出观察窗结算时，"仍有新鲜做多信号→延持"
+	// 最多执行该次数；超限后即使信号仍在也按无信号处置（止损线→半平、止盈/移动止盈→全平）。
+	// 背景：000063 中兴通讯止损触线（-6.4%）后战法 fac_138 持续喊买，旧口径"反复延持=按设计拿着"
+	// 一路延持 22 次（10:00→15:15），要等 -12% 深破线才无条件兜底，回撤成本过高。
+	// 0=按出厂默认 2 生效（存量纪律快照没有该键时反序列化得 0，必须兜到默认而非旁路）；
+	// 负数=显式恢复"无上限"旧行为（逃生阀，不推荐）。
+	// English: extension cap for the sell-hold window (owner ruling 2026-10-12) — "fresh bull signal →
+	// extend" may run at most this many times; past the cap the settle treats the signal as absent
+	// (stop-loss → trim half; TP/trail → close). 0 = factory default 2 (legacy discipline snapshots
+	// lack the key); negative = restore the old unlimited behavior (escape hatch, discouraged).
+	// 延持次数上限
+	MaxExtends int `json:"max_extends"`
 }
 
 // DefaultQMTConfig 返回 QMT 实盘配置出厂默认：enabled=false（默认关闭）、manual 半自动、对手价。
@@ -783,6 +812,8 @@ func DefaultQMTConfig() QMTConfig {
 		MissHeartbeatSec:  120,
 		DailyMaxBuys:      20,
 		DailyBudgetAmount: 100000,
+		MinBuyPrice:       5,
+		MinOrderAmount:    5000,
 		AutoSell:          true,
 		Advice: QMTAdviceConfig{
 			AddReopenDrawdownPct: -5,
@@ -3187,7 +3218,7 @@ var DefaultRules = &Rules{
 
 // DefaultDisciplineConfig 统一止盈止损纪律的出厂默认（可后台配置覆盖）：
 // 止损-6 / 止盈+15 / 移动回撤-6 / 深破2×(-12) / 低置信买入确认5min / 高置信观察30s /
-// 止损止盈结算窗15min / 移动止盈洗盘过滤45min / 探针5s / 高置信阈值85。
+// 止损止盈结算窗15min / 移动止盈洗盘过滤45min / 探针5s / 高置信阈值85 / 延持上限2次。
 func DefaultDisciplineConfig() DisciplineConfig {
 	return DisciplineConfig{
 		StopLossPct:       6,
@@ -3202,7 +3233,42 @@ func DefaultDisciplineConfig() DisciplineConfig {
 		HighConfThreshold: 85,
 		// §SELLPOINT-UNIFY 边界⑥：延持信号默认一个打分周期（5min）内有效
 		SellSignalMaxAgeSec: 300,
+		// 延持次数上限（owner 2026-10-12 裁决，000063 事故）：默认最多延持 2 次
+		MaxExtends: 2,
 	}
+}
+
+// EffectiveMinBuyPrice 最低买入价闸的生效读数（单点收敛，engine 下单路径只吃这里）：
+// >0=闸开（返回值即阈值）；0=关闭（负数显式关闭 或 未配置且默认也被关）。缺省 5 元。
+// 为什么 0 兜默认而不是当"未配置"旁路：存量账号规则快照（DB 里的 per-user rules JSON）
+// 没有该键，typed-unmarshal 得 0——若 0 语义为"关"，发版即静默放行全部低价杂毛股，
+// 正是"有代码无生效"的事故家族。
+// English: effective min-buy-price floor (>0 = gate on; 0 = off). Zero falls back to the
+// factory default 5 because legacy per-account rule snapshots lack the key — treating 0 as
+// "off" would silently disable the gate on deploy.
+func (c QMTConfig) EffectiveMinBuyPrice() float64 {
+	switch {
+	case c.MinBuyPrice > 0:
+		return c.MinBuyPrice
+	case c.MinBuyPrice < 0:
+		return 0 // 显式负数=关闭本闸
+	}
+	return 5
+}
+
+// EffectiveMinOrderAmount 单笔买入最低成交额闸的生效读数（单点收敛）：>0=闸开；0=关闭。缺省 5000 元。
+// 判据口径=股价×**最终**买入股数（现金降档之后核算），与 owner 原话「成交额=股价*手数」一致。
+// English: effective per-order minimum notional floor (>0 = gate on; 0 = off; default 5000).
+// Notional = price × FINAL lot count (checked after the cash downgrade), matching the owner's
+// definition 成交额=股价*手数.
+func (c QMTConfig) EffectiveMinOrderAmount() float64 {
+	switch {
+	case c.MinOrderAmount > 0:
+		return c.MinOrderAmount
+	case c.MinOrderAmount < 0:
+		return 0
+	}
+	return 5000
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。

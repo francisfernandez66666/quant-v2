@@ -202,9 +202,10 @@ func containsCI(s, sub string) bool {
 }
 
 // applyRiskTier 对已生成信号应用分层风险档（§三 作用层1，applyMacroGate 的泛化）：
-//   - Yellow：非 N 形买入信号置信度 < YellowMinConf(默认0.90) → 降级 watch；N 形/动量不额外拦截（仅门槛上浮）。
+//   - Yellow：非 N 形买入信号置信度 < YellowMinConf(默认0.90) → 降级 watch；N 形买入不参与置信降级
+//     （§N-RELAX：置信≈总分/100 到不了 0.90，买入资格由战法层分数闸管——黄金窗 ≥60、10 点后 ≥80）。
 //   - Red：非 N 形买入信号置信度 < RedMinConf(默认0.92) → 降级 watch；并按 BlockNShape/BlockMomentum
-//     一律拦截 N 形超短（降级 watch）与动量 watch（剔除）——沿用旧 E1 交割日硬闸语义。
+//     一律拦截 N 形超短（降级 watch）与动量 watch（剔除）——沿用旧 E1 交割日硬闸语义，§N-RELAX 不豁免 Red。
 //   - 板块级映射命中（§三 作用层2）：命中 MacroSectorMap 的信号档位再上浮一档（Yellow→按 Red 对待）。
 //
 // 原地改 reason/action（Red 拦截动量 watch 时从输出剔除，保持其余顺序）。理由前缀标注触发源，
@@ -237,6 +238,7 @@ func applyRiskTier(sigs []Signal, tier string, cfg config.MacroGateConfig, reaso
 			minConf = cfg.RedMinConf()
 		}
 		isBuy := s.Action == "buy" || s.Action == "买入"
+		isN := NormalizeStrategyName(s.Strategy) == NormalizeStrategyName(string(strategy.SignalNShape))
 		// 动量 watch：仅 Red 且开启拦截时剔除（整体利空下不新增观察）；Yellow 保留。
 		if s.Strategy == "动量" && s.Action == "watch" {
 			if eff == RiskTierRed && redBlockMomentum {
@@ -254,7 +256,15 @@ func applyRiskTier(sigs []Signal, tier string, cfg config.MacroGateConfig, reaso
 			continue
 		}
 		// 非 N 形买入：置信度低于门槛 → 降级 watch。
-		if isBuy && s.Confidence < minConf {
+		// §N-RELAX（owner 2026-10-12 裁决「分数高就买入信号」）：N 形买入不再参与置信降级——
+		// N 形置信≈总分/100，YellowMinConf(0.90) 下结构性全灭（10-12 实录全天最高 0.67＝
+		// Yellow 日 N 形一次都买不了的死区）；其买入资格已由战法层分数闸单一管住
+		// （黄金窗 ≥60＋一突/二突、10 点后 ≥80——canopen 已在 GenerateSignal 消费）。
+		// Red 档硬拦不受影响（上方 BlockNShape 分支照旧，系统性风险日 N 形仍一律降级）。
+		// English: non-N buys below the confidence bar degrade to watch. §N-RELAX — N-shape buys are
+		// exempt: N confidence ≈ total/100 can structurally never reach 0.90 (a Yellow-day dead zone);
+		// its buy eligibility is owned by the strategy-layer score gates instead. Red hard-block unchanged.
+		if isBuy && !isN && s.Confidence < minConf {
 			s.Action = "watch"
 			s.Reason = prefix + "降级(置信度<" + fmtRate(minConf) + "): " + s.Reason
 		}

@@ -1160,6 +1160,9 @@ var coverageGuard = struct {
 // checkDataCoverageOnce 行情库覆盖断言（§D-4）：trade_cal 可用且行情滞后 >1 交易日时
 // 投递 high 告警（ws/webhook + 网关 ntfy/JPush 双通道）并写 opslog；无从判定（无日历/未启动
 // 采集）与新鲜态只留 debug 日志。错误静默（旁路观测面，绝不影响主循环）。
+// §CAL-COVER-GO：判因分两型——行情落后（补 dataload/hithink）与日历停更（修日历回写窗口）。
+// 后者必须单独成句且抄进告警，因为它的现象是"行情看起来全部到齐"，按前者归因会去查同步链、
+// 而真正停的是那张被两边共用的 trade_cal（2026-10-08/09 现网实录即此型）。
 // English: §D-4 — once-per-day quote-DB coverage assertion; lagging >1 trading day fires a
 // high-severity ops alert (desktop/webhook + gateway/ntfy) plus an opslog line.
 func checkDataCoverageOnce(db *store.DB, n *notify.Notifier) {
@@ -1170,7 +1173,7 @@ func checkDataCoverageOnce(db *store.DB, n *notify.Notifier) {
 	if now.Hour() < 16 { // 盘前/盘中不判（当日行情本就没有）
 		return
 	}
-	today := now.Format("20060102")
+	today := now.Format("20060102") // 本进程 init 已把 time.Local 钉成 Asia/Shanghai（§TZ1），日界与 cntime 同值
 	coverageGuard.mu.Lock()
 	if coverageGuard.day == today {
 		coverageGuard.mu.Unlock()
@@ -1189,11 +1192,20 @@ func checkDataCoverageOnce(db *store.DB, n *notify.Notifier) {
 		}
 		return
 	}
-	content := f.String() + "——请检查 dataload/hithink 同步链（断供期间回测与情绪链在用旧数据）"
+	// 两型各一句：修法不同、值班动作也不同（补行情 vs 补日历窗口）。
+	content := f.String()
+	title := "行情数据断供"
+	switch f.Reason {
+	case store.FreshReasonCalendarStalled:
+		content += "——交易日历停更（末行未到今日），行情判据在此形态下恒读「滞后 0」不可信：先检查 trade_cal 回写窗口是否为 today+45（§CAL-COVER-GO），再复核行情"
+		title = "交易日历停更（行情新鲜度判据已失明）"
+	case store.FreshReasonLag:
+		content += "——请检查 dataload/hithink 同步链（断供期间回测与情绪链在用旧数据）"
+	}
 	opslog.Logf("quant", "行情库覆盖断言失败: %s", content)
 	log.Printf("[coverage] ⚠ %s", content)
 	if n != nil {
-		msg := notify.Message{Level: notify.LevelHigh, Title: "行情数据断供", Content: content}
+		msg := notify.Message{Level: notify.LevelHigh, Title: title, Content: content}
 		// §M8（2026-09-22 修复批）：Push 已内聚 WS/Webhook/手机网关三路（高级别必过网关门槛），
 		// 不再额外直调 PushGateway（双发去重设计见 internal/notify/notify.go Push 注释）。
 		n.Push(msg)

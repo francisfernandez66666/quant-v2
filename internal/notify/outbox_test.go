@@ -285,6 +285,35 @@ func TestOutboxPersistsAcrossRestart(t *testing.T) {
 	}
 }
 
+// TestOutboxNtfyRowSurvivesRestart §NTFY-OUTBOX（2026-10-12 波 7）回归：ntfy 失败行的
+// deliver_str="ntfy" 此前不在重建白名单——引擎一重启，待补投的运维提醒被静默丢弃
+// （15:08 实录：ntfy 超时进补投队列后，当夜发版重启＝队列清零且无任何读数）。
+// 修复后：ntfy 行必须恢复、经重建的 deliverNtfy 补投成功出队。
+func TestOutboxNtfyRowSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	row := `[{"kind":"ntfy","msg":{"level":3,"title":"中兴通讯 止损硬清"},"attempts":2,` +
+		`"next_at":"2026-10-12T15:10:00+08:00","deliver_str":"ntfy"}]`
+	path := dir + "/outbox.json"
+	if err := os.WriteFile(path, []byte(row), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n := New()
+	n.SetNtfy(fakeGatewayOK{})
+	n.SetOutboxPersistPath(path)
+	defer n.outbox.Stop()
+	if got := n.outbox.pendingLen(); got != 1 {
+		t.Fatalf("ntfy 行应在重启后恢复，got %d", got)
+	}
+	// 驱动到期 → 重建的 deliverNtfy（ntfy 通道在位）真投一次 → 成功出队
+	n.outbox.mu.Lock()
+	n.outbox.items[0].nextAt = time.Now().Add(-time.Second)
+	n.outbox.mu.Unlock()
+	n.outbox.pump()
+	if n.outbox.pendingLen() != 0 {
+		t.Fatalf("ntfy 行补投成功后应出队，pending=%d", n.outbox.pendingLen())
+	}
+}
+
 // fakeGatewayOK 恒成功的推送网关桩。
 type fakeGatewayOK struct{}
 

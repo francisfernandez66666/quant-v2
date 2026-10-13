@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,6 +75,10 @@ func ClosedDayCount() int {
 // 这个方向是刻意的（宁可多跑也不漏跑真交易日），但"到底加载没有"必须能被看见——
 // 否则日历拉挂了整个休市日都会被当盘中，且无人知晓（2026-09-25 中秋实录的根因之一）。
 // 读数含：加载状态（含磁盘缓存来源）/ 休市日个数 / 覆盖窗口（仅 API 成功刷新时有值）。
+// §CAL-COVER-GO（2026-10-12）：窗口有了还必须看得见"覆盖到今日没有"。日历末行停在昨天时
+// isClosedDay(今日)=false，今日被当交易日运行——这既是 §CAL-COVER 盲窗在运行时的同一形态
+// （那张 trade_cal 与这份内存集合各自的停更都不会自己开口），也是 09-25 中秋那次的同型；
+// 所以这里把停更直接写进健康读数，而不是等行情面停更三天后从别的表反推。
 // English: a single-line Chinese health reading of the trading calendar — load state, closed-day
 // count and the covered window; required because the fail-open fallback is silent by design.
 func TradingCalendarHealth() string {
@@ -85,7 +90,16 @@ func TradingCalendarHealth() string {
 	if calWindow == "" {
 		return fmt.Sprintf("交易日历已加载（休市日 %d 天，覆盖窗口未知）", len(closedDays))
 	}
-	return fmt.Sprintf("交易日历已加载（休市日 %d 天，覆盖窗口 %s）", len(closedDays), calWindow)
+	// calWindow 形如 "min~max"；取 max 与今日比（YYYYMMDD 字典序即日期序）。
+	maxD := calWindow
+	if i := strings.LastIndexByte(calWindow, '~'); i >= 0 && i+1 < len(calWindow) {
+		maxD = calWindow[i+1:]
+	}
+	stall := ""
+	if maxD < cntime.DayCompactOf(cntime.Now()) {
+		stall = "，覆盖未到今日（日历停更，今日暂按周末口径当交易日）"
+	}
+	return fmt.Sprintf("交易日历已加载（休市日 %d 天，覆盖窗口 %s%s）", len(closedDays), calWindow, stall)
 }
 
 // RefreshTradingCalendar 拉取同花顺交易日历并推导休市日集合。

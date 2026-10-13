@@ -44,6 +44,7 @@ function apiMockBase() {
 
 async function mountApp() {
   vi.resetModules()
+
   const api = apiMockBase()
   vi.doMock('../api/index.js', () => api)
   // 首屏页 Dashboard 与全部业务接口解耦掉：本用例只锁 App 壳层的 expired 行为
@@ -58,6 +59,17 @@ async function mountApp() {
   )
   return { api, utils }
 }
+
+// §DET-TIME-2（2026-10-13，门禁第 6 遍 §15 实录）：把 App.jsx＋tdesign 整条**按需转换链的成本**
+// 从"被计时的用例窗口"挪到"文件收集阶段"。
+// 空闲机单跑实测：本文件第一条用例 12.06 秒，而这 12 秒几乎全是 mountApp 里那句
+// `await import('../App.jsx')` 的冷转换（转换缓存没热之前，谁先跑谁付账）；
+// 它付在 timeout:60000 的那 60 秒之内，于是邻居负载（settle.js 头注写的 15~23）一抢事件循环
+// 就顶穿 60 秒 ⇒ `Test timed out`，随后本文件其余用例全被"超时残留的挂载体"级联成红
+// （"Found multiple elements with the text: 量化交易辅助工具"就是那个僵尸）。
+// 预热只填 vite 的转换缓存、**不注册任何 mock、不 render**；用例里 `vi.resetModules()`+doMock
+// 的真挂载链一个字节都不动，判据也不放宽。
+await import('../App.jsx')
 
 describe('App - auth:expired 事件读取最新登录态（§H7）', () => {
   beforeEach(() => {

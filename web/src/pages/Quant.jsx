@@ -122,6 +122,8 @@ export default function Quant() {
     fixed_amount: 10000, max_positions: 10, initial_capital: 100000,
     daily_max_buys: 20, daily_budget_amount: 100000, miss_heartbeat_sec: 120,
     max_order_amount: 0,
+    // owner 2026-10-12 裁决两闸 + 延持上限（0=出厂默认，负数=显式关闭该闸）
+    min_buy_price: 5, min_order_amount: 5000, max_extends: 2,
   })
 
   // §UAT-D3（2026-09-16）修复「loadConfig 晚到回填冲掉用户输入」竞态：
@@ -387,6 +389,10 @@ export default function Quant() {
         daily_max_buys: c.daily_max_buys ?? 20, daily_budget_amount: c.daily_budget_amount ?? 100000,
         miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
         max_order_amount: c.max_order_amount ?? 0,
+        // owner 2026-10-12 裁决两闸 + 延持上限（缺省回退出厂默认口径）
+        min_buy_price: c.min_buy_price ?? 5,
+        min_order_amount: c.min_order_amount ?? 5000,
+        max_extends: c.max_extends ?? 2,
       }
       // §UAT-D3 脏守卫：用户已编辑表单时，晚到的 GET 响应不得覆盖输入（见上方 userEditedRef 注释）。
       // 合法全量回填时机：首次加载 / 保存成功或失败后的刷新（patch 内显式 force）。
@@ -777,12 +783,15 @@ export default function Quant() {
     await patch(fields, '网关连接参数已保存')
   }
 
-  // 保存仓位纪律（最大持仓/单票金额/初始资金/日买笔数上限/日预算/单笔金额绝对帽）
+  // 保存仓位纪律（最大持仓/单票金额/初始资金/日买笔数上限/日预算/单笔金额绝对帽/
+  // 最低买入价与单笔成交额两闸/卖出延持上限——owner 2026-10-12 裁决）
   async function saveCaps() {
     await patch({
       max_positions: form.max_positions, fixed_amount: form.fixed_amount,
       initial_capital: form.initial_capital, daily_max_buys: form.daily_max_buys,
       daily_budget_amount: form.daily_budget_amount, max_order_amount: form.max_order_amount,
+      min_buy_price: form.min_buy_price, min_order_amount: form.min_order_amount,
+      max_extends: form.max_extends,
     }, '仓位纪律已保存')
   }
 
@@ -1076,15 +1085,42 @@ export default function Quant() {
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=关；买卖双向封顶，防胖手误</span>
       </div>
     )
+    // owner 2026-10-12 裁决：最低买入价闸——现价低于该值的杂毛股不做自动买入
+    const minBuyPrice = (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>最低买入价(元)</label>
+        <Input type="number" value={form.min_buy_price} step={1} onChange={(v) => setFormUser({ ...form, min_buy_price: parseFloat(v) })} />
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=默认5元；负数=关闭本闸；杂毛低价股不买</span>
+      </div>
+    )
+    // owner 2026-10-12 裁决：单笔最低成交额闸——股价×最终股数低于该值的碎单不做自动买入
+    const minOrderAmt = (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单笔最低成交额(元)</label>
+        <Input type="number" value={form.min_order_amount} step={500} onChange={(v) => setFormUser({ ...form, min_order_amount: parseFloat(v) })} />
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=默认5000元；负数=关闭；按降档后股数核算</span>
+      </div>
+    )
+    // owner 2026-10-12 裁决：卖出延持次数上限——止损触线后战法喊买最多延持这么多次
+    const maxExtends = (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>卖出延持上限(次)</label>
+        <Input type="number" value={form.max_extends} min={-1} step={1} onChange={(v) => setFormUser({ ...form, max_extends: parseInt(v, 10) })} />
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=默认2次；负数=不设上限；超限按无信号处置</span>
+      </div>
+    )
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12 }}>
-        {/* 仓位纪律字段：最大持仓/单票金额/初始资金/日买笔数/日预算/单笔绝对帽 */}
+        {/* 仓位纪律字段：最大持仓/单票金额/初始资金/日买笔数/日预算/单笔绝对帽/两把买入闸/延持上限 */}
         {maxPos}
         {fixedAmt}
         {initCap}
         {dailyBuys}
         {dailyBudget}
         {maxOrderAmt}
+        {minBuyPrice}
+        {minOrderAmt}
+        {maxExtends}
       </div>
     )
   }

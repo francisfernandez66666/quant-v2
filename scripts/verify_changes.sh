@@ -1275,7 +1275,56 @@ grep -q 'id: o.nextID' internal/notify/outbox.go || { echo "--- FAIL: 出队条�
 grep -q 'inflight_at' qmt_gateway/store.py || { echo "--- FAIL: inflight 取单时刻落列丢失（§M16 回归）"; exit 1; }
 grep -q '_reap_dispatch_inflight' qmt_gateway/gateway.py || { echo "--- FAIL: 网关 inflight 收割线程未接线（§M16 回归）"; exit 1; }
 grep -q '_execute_diag' qmt_gateway/qmt_bridge.py || { echo "--- FAIL: 桥 diag kind 处理丢失（§M16 永挂复活）"; exit 1; }
-echo "ok - §H9/§M16 专项守卫通过（Go 2 例 + py 3 组 + 静态锁 5 道）"
+# §NTFY-OUTBOX（2026-10-12 波 7）：ntfy 失败行（PushGateway 并投腿 enqueue kind="ntfy"）此前
+# 不在持久化重建白名单 outboxDelivererFor 里——引擎一重启，待补投的止损/清仓运维提醒被
+# 静默清零（SetPersistPath 对未知 deliverStr 一律 continue 且无逐行读数）。重建腿在位 +
+# 回归用例真跑（桩持久化文件含 ntfy 行 → 恢复 → 经重建 deliverNtfy 补投成功出队）。
+grep -q 'case deliverStr == "ntfy":' internal/notify/outbox.go || { echo "--- FAIL: ntfy 补投行重建腿丢失（§NTFY-OUTBOX 重启清零复活）"; exit 1; }
+go test -count=1 ./internal/notify/ -run 'TestOutboxNtfyRowSurvivesRestart' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+echo "ok - §H9/§M16 专项守卫通过（Go 3 例 + py 3 组 + 静态锁 6 道）"
+
+echo "==> 34b §BUY-REJECT-BACKOFF 买入拒单退避（2026-10-12 波 7）..."
+# 缺陷原文：确定性业务拒单（资金不足/废单）经 controller 降级「发送失败」后每个 ~5s 打分周期
+# 重投同一具必败请求、热循环到收盘。修法：一切拨单路径统一走 placeOrderNow（拨前过退避闸，
+# 拒单按代码 2min 翻倍封顶 60min 记账，传输失败不记账，成功清零，duplicate 幂等拦截不记账）。
+# 行为回归 4 例（含"无分发器直调分支也必须过闸"的旁路反证）+ 静态锁：四个账本函数在位、
+# placeOrderNow 闸接线、duplicate 豁免判据、autoPlace 两条同步路径都改走 placeOrderNow（等值 2）。
+go test -count=1 ./internal/engine/ -run 'TestBuyReject' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'func (e \*Engine) buyRejectAllow(' internal/engine/engine.go || { echo "--- FAIL: 退避拨闸丢失（§BUY-REJECT-BACKOFF 复活）"; exit 1; }
+grep -q 'func buyRejectDelay(' internal/engine/engine.go || { echo "--- FAIL: 退避档位函数丢失（§BUY-REJECT-BACKOFF 复活）"; exit 1; }
+grep -q 'func (e \*Engine) buyRejectRecord(' internal/engine/engine.go || { echo "--- FAIL: 拒单记账腿丢失（§BUY-REJECT-BACKOFF 复活）"; exit 1; }
+grep -q 'func (e \*Engine) buyRejectClear(' internal/engine/engine.go || { echo "--- FAIL: 成功清零腿丢失（§BUY-REJECT-BACKOFF 复活）"; exit 1; }
+grep -q 'if !e.buyRejectAllow(req.Code) {' internal/engine/engine.go || { echo "--- FAIL: placeOrderNow 拨前过闸接线丢失（§BUY-REJECT-BACKOFF 复活）"; exit 1; }
+grep -q 'strings.HasPrefix(res.Err, "duplicate")' internal/engine/engine.go || { echo "--- FAIL: duplicate 幂等拦截豁免判据丢失（§BUY-REJECT-BACKOFF 误封 B 战法同码首拨）"; exit 1; }
+n_sync_dial=$(grep -cF 'e.placeOrderNow(req, sig)' internal/engine/engine.go || true)
+if [ "$n_sync_dial" != "2" ]; then echo "--- FAIL: autoPlace 同步路径未全部改走 placeOrderNow（等值 2，现 ${n_sync_dial}，旁路形态）"; exit 1; fi
+echo "ok - §BUY-REJECT-BACKOFF 专项守卫通过（行为锁 4 例 + 静态锁 7 道）"
+
+echo "==> 34c §N-RELAX N形放宽门禁（owner 2026-10-12 裁决「只要有分就可观察，分数高就买入信号」）..."
+# 三处改动：①canopen 真正被消费——scorer 10 点后时间优先级不足 StrongMin=80 置 CanOpen=false，
+# 此前该字段只进 Meta、全仓无消费者，60~79 分的过线信号照发买入；现 GenerateSignal 落回 watch
+# 并把分线写进理由。②d1>0 但总分<60 的候选不再只进诊断日志——产 watch 观察信号（消息中心
+# 按 code@策略日级去重）；d1=0 仍静默（无事件的票没有观察价值）。③Yellow 档 N 形买入不再按
+# 置信 0.90 降级（置信≈总分/100 结构性到不了 0.90＝Yellow 日 N 形全灭的死区，10-12 实录最高
+# 0.67）；买入资格由战法层分数闸单一管住。Red 硬拦（BlockNShape）不动。
+# 注：canopen 消费判据对 Details 缺键的手拼 eval 不降级（兼容腿在用例里钉住）。
+go test -count=1 ./internal/strategies/n_shape/ -run 'TestFullChainCanOpenGate' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/combat_agent/ -run 'TestApplyRiskTierYellowBars' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'if v, ok := eval.Details\["canopen"\]; ok && v == 0 {' internal/strategies/n_shape/n_shape.go || { echo "--- FAIL: canopen 消费腿丢失（§N-RELAX：10点后 60~79 分重新照发买入）"; exit 1; }
+grep -q '10点后未达强分(需80):' internal/strategies/n_shape/n_shape.go || { echo "--- FAIL: 降观察理由分线文案丢失（§N-RELAX 归因面）"; exit 1; }
+grep -q 'N形观察: ' internal/combat_agent/agent.go || { echo "--- FAIL: d1>0 观察信号腿丢失（§N-RELAX 有分不可观察复活）"; exit 1; }
+grep -q 'if isBuy && !isN && s.Confidence < minConf {' internal/combat_agent/risk_tier.go || { echo "--- FAIL: N形 Yellow 置信豁免腿丢失（§N-RELAX 结构死区复活）"; exit 1; }
+# 摘锁反证（go test -overlay 零改源）：把 N 形豁免摘掉恢复旧"恒降级"行为，YellowBars 用例必须红——
+# 反证不红＝这枚锁没牙（豁免判据与用例脱钩，改判据时用例先瞎）。
+R34C=$(mktemp -d)
+sed 's/if isBuy && !isN && s.Confidence < minConf {/if isBuy \&\& s.Confidence < minConf {/' internal/combat_agent/risk_tier.go > "$R34C/risk_tier_mutated.go"
+if cmp -s internal/combat_agent/risk_tier.go "$R34C/risk_tier_mutated.go"; then echo "--- FAIL: 摘锁反证 sed 未生效（豁免腿字节没变）"; exit 1; fi
+printf '{"Replace": {"%s/internal/combat_agent/risk_tier.go": "%s/risk_tier_mutated.go"}}' "$(pwd)" "$R34C" > "$R34C/overlay.json"
+if go test -count=1 -overlay "$R34C/overlay.json" ./internal/combat_agent/ -run 'TestApplyRiskTierYellowBars' >/dev/null 2>&1; then
+	echo "--- FAIL: 摘掉 N 形豁免腿后 YellowBars 用例仍绿（§N-RELAX 锁没牙）"; exit 1
+fi
+rm -rf "$R34C"
+echo "ok - §N-RELAX 专项守卫通过（行为腿 2 例 + 静态锁 4 道 + 摘锁反证 1 枚）"
 
 echo "==> 35 §F2/§M4/§F5/§M5/§F3 回报接入段五修（2026-09-22 修复批，代理D）..."
 # §F2 持仓快照 ts_code 整批字段校验（ErrInvalidPositionReport→400→网关死信）；
@@ -4962,7 +5011,7 @@ fi
 #    本段全部等值调用按「先读数、后预演值」传参，故文案改印「实读=/应=」——读反一次就够，
 #    会把下一个人往「把阈值改成实读数以外」的方向同步。
 # ════════════════════════════════════════════════════════════════════════════
-echo "==> 103 §0926E2E 全量审计修复批（一~四波+矩阵补位+§0927KA 保活加固静态锁 36 条（含 §0926E2E-13b 双发守卫三枚，09-27 增））..."
+echo "==> 103 §0926E2E 全量审计修复批（一~四波+矩阵补位+§0927KA 保活加固+§CAL-COVER 日历覆盖+§CAL-COVER-GO 引擎侧日历加固的静态锁；条数不写在段头，由段尾正文派生读数给出）..."
 E2E_ERRS=""
 # e2e_eq <名> <实得> <期望>：等值锁（本段全部调用按「先读数值、后写预演值」传参）；
 # e2e_ge <名> <下限> <实得>：存在性下限锁（先阈值后读数）。
@@ -5071,8 +5120,51 @@ e2e_eq "KA pydata best 必须夹在 ≤今日（窗口前移后未来开市日�
 	"$(ec scripts/dataload_keepalive.py 'if op and d <= today_str and d > best:')" "1"
 e2e_ge "KA §CAL-COVER 加固锚 ≥6（各改口处同段引用）" "6" "$(ecn scripts/dataload_keepalive.py 'CAL-COVER')"
 
+# —— §CAL-COVER-GO（2026-10-12）：引擎侧（Go）同一把尺子的三处加固 ——
+# 事故形态是"判据读它要检验的那张表"：写日历的窗口右边界落在今日 ⇒ 次日末行即停在昨天，
+# 行情只要跟到同一天，日龄判据恒读「滞后 0＝全部到齐」。Python 保活侧已由 §CAL-COVER 收口，
+# 本批把同一判据交到 Go 的三个面：两条写日历的入口（tushare / baostock）、行情新鲜度自检
+# （CheckDataFreshness 加独立覆盖腿＋两型判因）、运行时交易日历健康读数（覆盖不到今日要点明，
+# 否则 isClosedDay 的 fail-open 又是静默的）。前瞻天数收成两侧同源的一个常量：两个数字各自
+# 漂移时后写日历的那条链会把前一条的末行拖回去，覆盖判据再次失明——等值锁按正文派生读数，
+# 不写死 45（写死的锁对下一个改动者只会在错误方向上对齐）。
+# 预演读数（10-12 grep -Fc/-Ec）：覆盖计算行=1、停更分支=1、末行无过滤读法=1、调用方分型=1、
+# 两条写入口未来边界各=1、cntime 常量锚=5、运行时停更读数=1；两枚反向锁今日恒 0；
+# 两侧派生天数各=45。
+CAL45_PY=$(grep -E '^CALENDAR_LOOKAHEAD_DAYS' scripts/dataload_keepalive.py | grep -oE '[0-9]+' | head -1 || true)
+CAL45_GO=$(grep -E '^const CalendarLookaheadDays' internal/cntime/cntime.go | grep -oE '[0-9]+' | head -1 || true)
+e2e_eq "GO 行情自检的日历覆盖判据计算行在位恰 1（末行<今日即判停更；整行签名锁，追加「&& false」式语义破坏必须当场红）" \
+	"$(ecn internal/store/data_freshness.go '^[[:space:]]*f\.CoversToday = f\.CalMax >= today$')" "1"
+e2e_eq "GO 行情自检的停更分支在位恰 1（摘掉它＝滞后 0 冒充全部到齐，10-08/09 事故本体；同样整行签名）" \
+	"$(ecn internal/store/data_freshness.go '^[[:space:]]*if !f\.CoversToday \{$')" "1"
+e2e_eq "GO 日历末行必须按无过滤读法取（不带 is_open／不带上限，否则停更日就是「最近开市日」）恰 1" \
+	"$(ec internal/store/data_freshness.go 'FROM trade_cal`).Scan(&f.CalMax)')" "1"
+e2e_eq "GO 调用方按判因分型出告警（日历停更与行情落后两型各一句）恰 1" \
+	"$(ec cmd/quant/main.go 'case store.FreshReasonCalendarStalled:')" "1"
+e2e_eq "tushare 写日历入口必须走 cntime 未来边界恰 1" \
+	"$(ec cmd/dataload/main.go 'cntime.CalendarEndDayCompact(time.Now())')" "1"
+e2e_eq "baostock 写日历入口必须走 cntime 未来边界恰 1" \
+	"$(ec cmd/dataload/baostock.go 'cntime.CalendarEndDay(time.Now())')" "1"
+e2e_ge "cntime 前瞻常量锚（定义+两种口径函数+注释引用）≥4" "4" "$(ecn internal/cntime/cntime.go 'CalendarLookaheadDays')"
+e2e_eq "两侧前瞻天数必须同值（Python 保活=${CAL45_PY:-空} vs Go cntime=${CAL45_GO:-空}；各自漂移＝末行互相拖回去）" \
+	"${CAL45_PY:-none}" "${CAL45_GO:-none}"
+e2e_ge "前瞻天数下界 30（短于一个长假+春节连休窗口时覆盖判据仍会盲）" "30" "${CAL45_GO:-0}"
+e2e_eq "运行时交易日历健康读数必须点明覆盖未到今日（fail-open 不得再次静默）恰 1" \
+	"$(ec internal/data/trade_calendar.go '覆盖未到今日')" "1"
+e2e_eq "反向锁：tushare 写日历不得退回右边界落在今日的形态（0 命中）" \
+	"$(ec cmd/dataload/main.go 'TradeCal("20150101", cntime.DayCompactOf')" "0"
+e2e_eq "反向锁：baostock 写日历不得退回宿主 Local 且边界落在今日的形态（0 命中）" \
+	"$(ec cmd/dataload/baostock.go 'TradeDays("2015-01-01", time.Now().Format')" "0"
+
 if [ -z "$E2E_ERRS" ]; then
-	echo "ok - §0926E2E 守卫通过（静态锁 40 条：吞错收口 7 + 暴露面 5 + 裁决口径 4 + 体验卫生 8 + 矩阵补位 9 + 保活加固 3 + 日历覆盖 4）"
+	# 本段锁数从正文派生（写死的枚数对下一个新增锁天生失明——"过时却全绿"比红更坏，§115 同族教训）；
+	# 派生数很小＝解析与本文格式脱节，那比红更危险，所以配下界而不是只打印。
+	E2E_LOCK_N=$(grep -cE '^e2e_(eq|ge) ' "$GS" || true)
+	if [ "${E2E_LOCK_N:-0}" -lt 52 ]; then
+		echo "--- FAIL: §103 锁数派生异常（正文读到 ${E2E_LOCK_N:-0} 道 e2e_eq/e2e_ge 调用，应 ≥52）——派生器与本段格式脱节时，收尾读数会把「没锁到」报成「锁都在」"
+		exit 1
+	fi
+	echo "ok - §0926E2E 守卫通过（静态锁 ${E2E_LOCK_N} 条，条数由正文派生；分组：吞错收口/暴露面/裁决口径/体验卫生/矩阵补位/保活加固 §0927KA/日历覆盖 §CAL-COVER/引擎侧日历覆盖 §CAL-COVER-GO）"
 else
 	echo "--- FAIL: §103 断言不符:${E2E_ERRS}"
 	exit 1
@@ -5270,29 +5362,63 @@ echo "ok - §0927AUDIT 修复批守卫通过（行为腿 1 组 + 静态锁 10 �
 echo "==> 106 §0929 数据量纲 ⑩ + 运维面 ⑪ 专项静态锁与行为腿（2026-09-29 批）..."
 
 CNT106=0
+# 形态计数（§QUEUE-REQUEUE 批收编）：ok 行的分桶枚数过去写死在文案里，加一道锁就要人手改文案，
+# 忘了改就是「过时却全绿」（§115 同族）。改为四个 helper 各自累加，ok 行只读这些派生数。
+N106_HAS=0
+N106_LEG=0
+N106_EQ=0
+N106_WORD=0
+N106_ABSENT=0
 # has106：存在性锁（模式必须出现在文件里）。
 has106() {
+	[ $# -eq 3 ] || { echo "--- FAIL: §106 has106 调用参数个数=${#}（应为 文件/模式/说明 三项）：$*"; exit 1; }
 	CNT106=$((CNT106 + 1))
+	N106_HAS=$((N106_HAS + 1))
 	grep -q -- "$2" "$1" || { echo "--- FAIL: §106 锁 ${CNT106}（${3}）：${1} 缺「${2}」"; exit 1; }
 }
 # eq106：等值锁（grep -c 实际读数必须逐字等于预演读数）。
 eq106() {
+	# 参数个数自锁（2026-10-12 实录）：eq106 是四参（文件/模式/预演数/说明），word106 是三参。
+	# 把 word106 改成 eq106 时漏掉"预演数"这一项，$4 未绑 ⇒ set -u 直接中止整段，
+	# 屏幕上只有「line 5206: 4: unbound variable」这种看不懂的行号——锁写歪必须点名是哪枚锁。
+	# English: arity self-lock — a 3-arg call into the 4-arg helper aborted the whole section with an
+	# opaque unbound-variable line; mis-arity must be named instead.
+	[ $# -eq 4 ] || { echo "--- FAIL: §106 eq106 调用参数个数=${#}（应为 文件/模式/预演数/说明 四项）：$*"; exit 1; }
 	CNT106=$((CNT106 + 1))
+	N106_EQ=$((N106_EQ + 1))
 	local got
 	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
 	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §106 等值锁 ${CNT106}（${4}）：${1} 模式「${2}」got=${got:-0} 预演=$3"; exit 1; }
 }
 # absent106：负锁（该形态在文件里的行数必须为 0＝回归即红）。
 absent106() {
+	[ $# -eq 3 ] || { echo "--- FAIL: §106 absent106 调用参数个数=${#}（应为 文件/模式/说明 三项）：$*"; exit 1; }
 	CNT106=$((CNT106 + 1))
+	N106_ABSENT=$((N106_ABSENT + 1))
 	local got
 	got=$(grep -c -- "$2" "$1" 2>/dev/null || true)
 	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §106 负锁 ${CNT106}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
 }
+# absent_exec106：只在**执行行**上判红的负锁（§107 absent_code107 的 JS 形，2026-10-13 §DET-TIME-2 起）。
+# 为什么本批要这一形：前端那条「toast 不得再做二次在文档判定」的负锁锚要能在源码里认得出旧码，
+# 而本批按本仓纪律把**踩坑原文**（`expect(toast).toBeInTheDocument()` 一句）写进了用例上方的说明注释
+# （留成因给下一个人）⇒ 纯 absent106 恒 got=1 假红。这与 §107 那枚被注释撑红的等值锁是同一条雷的
+# 反方向形状（那枚是计数锁、这枚是负锁），裁决同样不是删注释，而是给负锁补剥注释的形。
+# 剥的形：以 // 开头的行、块注释里的 ` * ` 续行、以及 `/*` 起始行——三种都只可能出现在说明里。
+absent_exec106() {
+	[ $# -eq 3 ] || { echo "--- FAIL: §106 absent_exec106 调用参数个数=${#}（应为 文件/模式/说明 三项）：$*"; exit 1; }
+	CNT106=$((CNT106 + 1))
+	N106_ABSENT=$((N106_ABSENT + 1))
+	local got
+	got=$(grep -vE '^[[:space:]]*(//|\*|/\*)' "$1" 2>/dev/null | grep -c -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §106 执行行负锁 ${CNT106}（${3}）：${1} 的非注释行里出现「${2}」got=${got}（注释里保留成因允许，执行行不行）"; exit 1; }
+}
 # word106：标识符存在锁（整词匹配，且必须恰好 1 行）。为什么不用 has106：反证实测「把函数改名成
 # XXX_v2」时子串仍然命中，存在性锁会放过去（STAYED-GREEN 实录 6 条）。整词 + 计数等值才是锁。
 word106() {
+	[ $# -eq 3 ] || { echo "--- FAIL: §106 word106 调用参数个数=${#}（应为 文件/模式/说明 三项）：$*"; exit 1; }
 	CNT106=$((CNT106 + 1))
+	N106_WORD=$((N106_WORD + 1))
 	local got
 	got=$(grep -cw -- "$2" "$1" 2>/dev/null || true)
 	[ "${got:-0}" = "1" ] || { echo "--- FAIL: §106 整词锁 ${CNT106}（${3}）：${1} 形态「${2}」got=${got:-0} 预演=1"; exit 1; }
@@ -5338,10 +5464,12 @@ has106 "$VNG" 'mode=ro' '⑪-2 只读通道（file:…?mode=ro，演练/校验�
 eq106 "$VNG" 'PASS" -lt 7' 1 '⑪-2 半态守卫（腿数不足 7 必红，绝不把「没跑出来」当成功）'
 # 阈值透传三连：bash 侧变量 → PS param 声明 → python 形参。少任何一环，该环境变量就是惰性的
 # （本批首版就是这样：预览里带阈值、实跑里没带，判据悄悄按默认值走）。
-for th in ActiveMax TaskAgeHours CandAgeDays; do
+# §QUEUE-REQUEUE（2026-10-12）把两条新尺子（挂起步数 ParkedMax / 累计回队 RequeueMax）加进同一条
+# 透传链：漏任何一环不会报错、只会静默按默认判，所以沿用「四处同源」这一形而不是另立一套。
+for th in ActiveMax TaskAgeHours CandAgeDays ParkedMax RequeueMax; do
 	eq106 "$VNG" "$th" 4 "⑪-2 阈值 ${th} 四处同源（bash 变量行/PS 调用行/param 声明/兜底默认）"
 done
-for py in active-max task-age-hours cand-age-days; do
+for py in active-max task-age-hours cand-age-days parked-max requeue-max; do
 	CNT106=$((CNT106 + 1))
 	got=$(grep -c -- "--$py" "$VNG" 2>/dev/null || true)
 	[ "${got:-0}" = "3" ] || { echo "--- FAIL: §106 等值锁 ${CNT106}（⑪-2 python 形参 --${py} 三处同源：RUN_PY 预览/PS 实调用/argparse）got=${got:-0} 预演=3＝阈值没真透传"; exit 1; }
@@ -5407,11 +5535,235 @@ eq106 web/e2e/uat_full.spec.mjs 'interceptHoldingsWrite(' 4 '④ 三条腿共用
 eq106 internal/server/admin.go '"config_d1_merge"' 1 '① D1 稀疏 merge 变更留痕动作名在位（改名＝审计账断腿）'
 eq106 internal/server/admin.go '"config_snapshot_failed"' 1 '① D1 快照失败留痕动作名在位（快照没落成也要有痕）'
 
-echo "ok - §106 静态锁 ${CNT106} 道通过（含负锁 5 枚 + 阈值透传等值锁 6 道 + 测试资产登记锁 4 道）"
+# ── ⑪-6 2026-10-12 修复批三条同族缺陷：池子快照 / 保活时序 / 队列回队（实现锁 + 跨语言同源）──
+# 三条病根同一形状，所以锁面也按同一套形出：
+#   池子侧＝空回包整日替换把「上游没给数据」洗成「当日无数据」，而上游重发上一日的字节又造成
+#     幻影日——两道闸（空回包不改写 + 回包日期与请求日同源）都在**落库之前**，锁钉函数与读数键；
+#   保活侧＝收盘前拨时目标日天生不可能到，旧实现三轮空烧后报失败，「时间没到」与「真缺数」
+#     在账上同形——改判「未到则退上一开市日」，锁钉判据函数与三态读数；
+#   队列侧＝同因连败闸有两条**合法旁路**（指纹每次不同→连败归零；抢占走人工复活入口→计数清零），
+#     现网同一任务被送回队尾 33 次无人拦——补一条与原因无关的累计闸，锁钉计数列、专用入口、
+#     三条调用点与「排空≠跑完」的收尾账本。
+# 为什么不只钉行为腿：行为腿在 -run 正则被改窄、用例被改名时会「匹配不到也算 ok」，
+# 所以每条行为腿前面先钉一枚整词用例名锁（§106 既有纪律）。
+eq106 internal/store/ths_special.go 'ErrPoolSnapshotEmpty = errors.New' 1 '⑪-6 空回包整日替换被拒的错误单点（多定义＝判据分叉）'
+eq106 internal/store/ths_special.go 'type PoolReplaceResult struct' 1 '⑪-6 整日替换两侧读数（deleted/written）类型声明在位（只报 written＝池子缩了与根本没动同形）'
+eq106 internal/store/ths_special.go 'ReplaceThsSimplePool(table, tradeDate string' 1 '⑪-6 简池整日替换入口恰一处（含表名参数＝逐表隔离）'
+eq106 internal/store/ths_special.go 'SimplePoolCountOnDate(table, date string)' 1 '⑪-6 按日行数读数在位（判"当日有没有"不许靠全表 MAX）'
+eq106 internal/store/ths_special.go 'ReplaceThsLimitUps(rows ' 1 '⑪-6 涨停池整日替换入口恰一处'
+eq106 cmd/dataload/hithink_sync.go 'func replaceOrSkipSimplePool' 1 '⑪-6 空回包保数据分支恰一处（三条池子共用＝不各写一份判红）'
+has106 cmd/dataload/hithink_sync.go 'empty_payload=skipped_replace' '⑪-6 空回包留痕读数（未落库也未删除必须写明，否则"跳过"与"替换"共用一行）'
+has106 cmd/dataload/hithink_sync.go '当日池子收缩' '⑪-6 池子收缩可见腿（deleted>... 才报得出缩了）'
+eq106 cmd/dataload/hithink_sync.go '涨停池幻影日拦停' 1 '⑪-6 回包日期≠请求日的拦停文案恰一处'
+eq106 cmd/dataload/hithink_sync.go 'shadow_of=' 3 '⑪-6 幻影日来源读数三处（拦停文案/放行文案/读数明细——少一处就有一支看不见来源）'
+eq106 cmd/dataload/ths_backfill.go 'shadow_of=' 2 '⑪-6 逐日回补侧同源读数两处在位（回补也不能把上一日字节当今日新增）'
+eq106 cmd/dataload/hithink_sync.go 'pool=%s requested=%s payload_ms=%d payload_day=%s match=%s rows=%d' 1 '⑪-6 日期同源判据的行格式单源'
+eq106 cmd/dataload/pool_probe.go 'pool=%s requested=%s payload_ms=%d payload_day=%s match=%s rows=%d' 1 '⑪-6 探针与同步共用同一行格式（各写一份＝探针绿、落库红）'
+eq106 cmd/dataload/main.go 'pool-probe' 2 '⑪-6 pool-probe 子命令注册+用法两处（缺用法＝有命令没人知道）'
+eq106 cmd/dataload/main.go 'ths-backfill' 3 '⑪-6 ths-backfill 逐日回补子命令三处在位'
+word106 cmd/dataload/pool_sync_test.go 'func TestSyncPoolsPhantomDayBlockedAndEscaped' '⑪-6 幻影日拦停/放行双态用例在位'
+word106 cmd/dataload/pool_sync_test.go 'func TestSyncPoolsEmptyPayloadNeverErasesDay' '⑪-6 空回包不抹当日用例在位'
+word106 cmd/dataload/pool_sync_test.go 'func TestNewPoolStampReadoutKeepsEveryKey' '⑪-6 读数键完整性用例在位（缺键＝判据看不见来源）'
+word106 internal/store/ths_pool_replace_test.go 'func TestReplaceThsLimitUpsAbortsBeforeDelete' '⑪-6 删除前中止（半态不留）用例在位'
+word106 internal/store/ths_pool_replace_test.go 'func TestLimitUpShadowOfDetectsPhantomDay' '⑪-6 影子日判据用例在位'
+
+# ⑪-6-b 保活侧（python）：收盘前判"未到"而不是空烧，缺更日逐日回补且有上限
+eq106 scripts/dataload_keepalive.py 'def target_day_reachable' 1 '⑪-6 目标日可达判定单点（三处各写＝改一处漏两处）'
+has106 scripts/dataload_keepalive.py 'retreat=none' '⑪-6 退无可退那一支必须留痕（上一开市日不可得时保持原 target，不许静默）'
+has106 scripts/dataload_keepalive.py 'POST_CLOSE_READY_MINUTES' '⑪-6 收盘后数据就绪窗口常量在位（判"未到"的尺子）'
+eq106 scripts/dataload_keepalive.py 'POOL_GAP_MAX_DAYS_PER_RUN' 2 '⑪-6 单次回补上限两处（定义+使用；无上限＝一次拨把上游打爆）'
+eq106 scripts/dataload_keepalive.py 'still_missing=' 1 '⑪-6 回补后仍缺的读数（只报"补了几天"＝把补不动的缺口洗白）'
+# ★ 注入时钟必须喂满两处（2026-10-13 00:10 跨零点复跑实录）：归位判定吃了 now，
+# 而 target 推导按本机墙上钟算"今天"——白天本机日期==注入日期时那条端到端用例是绿的，
+# 夜里过零点后 target(次日) != today(注入日) 让归位腿直接判"不是今天"永不触发、rc=1。
+# 日期依赖的锁不是锁：这三枚把"接线"本身钉住（等值+负向+用例名），摘接线随时必红。
+eq106 scripts/dataload_keepalive.py 'target = last_trade_date(today_injected)' 1 '⑪-6 注入时钟喂满 target 推导（恰一处接线）'
+absent106 scripts/dataload_keepalive.py 'target = last_trade_date()' '⑪-6 裸取本机墙上钟算今天的旧形不得复活'
+word106 qmt_gateway/tests/test_dataload_keepalive.py 'def test_main_feeds_injected_clock_to_target_derivation' '⑪-6 接线锁用例在位（捕获桩实参，与本机日期无关）'
+word106 qmt_gateway/tests/test_dataload_keepalive.py 'class TestTargetNotClosed' '⑪-6 收盘前退上一开市日用例组在位'
+word106 qmt_gateway/tests/test_dataload_keepalive.py 'class TestPoolGapBackfill' '⑪-6 缺更日逐日回补用例组在位'
+
+# ⑪-6-b2 §BOARD-COVER：按板块覆盖读数（.BJ 整板断更六周而全库 MAX 口径看不见的教训）
+eq106 scripts/dataload_keepalive.py 'BOARD_SUFFIXES = (".SH", ".SZ", ".BJ")' 1 '⑪-6 三板块名单单点（漏一块＝那块继续隐形）'
+eq106 scripts/dataload_keepalive.py 'def board_coverage_line' 1 '⑪-6 板块读数单点（两处各写＝口径漂移）'
+eq106 scripts/dataload_keepalive.py 'state=unknown' 1 '⑪-6 库读不到必须显式 unknown（冒充 0＝断板洗成确凿没数据）'
+eq106 scripts/dataload_keepalive.py 'state=empty' 1 '⑪-6 空表显式 empty 态（全新部署合法态不冒充读数）'
+eq106 scripts/dataload_keepalive.py 'rows=-1' 2 '⑪-6 单板块查询失败两处（读数+日志归因；少一处＝失败面无名）'
+eq106 scripts/dataload_keepalive.py 'log(board_coverage_line())' 1 '⑪-6 main 收尾接线恰一处（不接线＝有函数无读数）'
+word106 qmt_gateway/tests/test_dataload_keepalive.py 'class TestBoardCoverage' '⑪-6 板块覆盖用例组在位'
+
+# ⑪-6-b3 §BOARD-COVER 判定腿（2026-10-12 当日实录）：one_round 的 daily 新鲜判定原读
+# 整库 MAX——.BJ 当天补进的 311 行垫高全库 MAX，.SH/.SZ 停在上一交易日也宣告 all fresh
+# 零调用退出。判定改按三板块各自 MAX 全达标；判不成打板块级归因读数。
+eq106 scripts/dataload_keepalive.py 'def latest_board(' 1 '⑪-6 板块级 MAX 单点（各处自写＝口径漂移）'
+eq106 scripts/dataload_keepalive.py 'def daily_boards_fresh(' 1 '⑪-6 板块新鲜判定单点'
+eq106 scripts/dataload_keepalive.py 'def daily_boards_line(' 1 '⑪-6 落后板块归因读数单点'
+eq106 scripts/dataload_keepalive.py 'if not daily_boards_fresh(target):' 2 '⑪-6 判定腿两处接线（短路+补数前后；少一处＝旁路回潮）'
+eq106 scripts/dataload_keepalive.py '板块覆盖仍缺' 1 '⑪-6 板块落后不冒充完成的归因读数在位'
+word106 qmt_gateway/tests/test_dataload_keepalive.py 'class TestDailyBoardFreshness' '⑪-6 整库 MAX 谎报新鲜复现用例组在位'
+# 注：这里必须是等值计数而不是整词锁——word106 走 grep -cw，模式以「(」结尾且后面紧跟
+# 构词字符（self）时 -w 判"匹配不在词边界"恒拒＝签名带参的夹具永远数 0（本批全量回归实测）。
+eq106 qmt_gateway/tests/test_dataload_keepalive.py 'def insert_board(' 1 '⑪-6 按板块播种夹具在位（夹具回退单行＝用例验的是旧口径）'
+
+# ⑪-6-b4 no-resume 中段回补能力（2026-10-12）：断点被先补上的最新日顶过去后，
+# 中段空洞靠常规 daily 永远不可达（from=nextDay(max)>end 直接跳过）——
+# -codes 圈定 + -no-resume 强拉是补洞的正解，能力缺位＝判据揭穿了也补不动。
+eq106 cmd/dataload/baostock.go 'noResume bool' 2 '⑪-6 no-resume 参数贯穿两函数（少一处＝能力半接线）'
+eq106 cmd/dataload/baostock.go 'if !noResume {' 1 '⑪-6 断点跳过逻辑必须挂在 noResume 开关下'
+# ★ 模式里的 `*` 必须转义：eq106 走 `grep -c --`（基本正则），裸 `*` 是「前一个字符重复 0 次以上」
+# 的量词而不是字面星号——本枚最初写成 `, *start` 恒 got=0，代码里那行接线明明在位（main.go:126）
+# 却永久假红（2026-10-13 现网实录：全量门禁 §106 唯一红就是它，判据对、形写错）。
+eq106 cmd/dataload/main.go 'bsRunDaily(db, bsClient, \*start, \*end, onlyCodes, \*noResume)' 1 '⑪-6 daily 子命令两开关接线恰一处'
+word106 cmd/dataload/degraded_source_load_test.go 'func TestNoResumeForcePullReachesMidSpanHole' '⑪-6 中段空洞可达性用例在位（跳过态+强拉态双腿）'
+
+# ⑪-6-c 队列侧（Go）：累计回队闸 + 抢占专用入口 + 排空≠跑完
+eq106 internal/store/research_tasks.go 'const TotalRequeueLimit = 20' 1 '⑪-6 累计回队上限常量单点'
+eq106 internal/store/store.go 'requeue_total INTEGER NOT NULL DEFAULT 0' 2 '⑪-6 累计计数列两处（建表 + 幂等迁移；缺迁移＝老库读不到列）'
+eq106 internal/store/research_tasks.go 'RequeueAfterPreemption(id int64) error' 1 '⑪-6 抢占回队专用入口恰一处（走人工复活入口＝清零计数，正是 33 次回队的旁路）'
+absent106 internal/scheduler/worker.go 'db.RequeueTask(' '⑪-6 抢占路径不得再调人工复活入口（复活入口只服务人工）'
+eq106 internal/scheduler/worker.go 'db.RequeueAfterPreemption(tk.ID)' 1 '⑪-6 抢占回队接线在位'
+eq106 internal/scheduler/worker.go 'notifyRequeueBreaker(db, &tk)' 3 '⑪-6 熔断告警接线三处（失败/panic/抢占三条跃迁链，少一条＝那条链挂起无人知）'
+eq106 internal/scheduler/worker.go 'db.ChainParkedCount(tk.ChainDay)' 1 '⑪-6 收尾账本读取在位（排空但挂起时 done 位不置）'
+eq106 internal/store/research_tasks.go 'ChainParkedCount(chainDay string) (int, error)' 1 '⑪-6 挂起步数读数单点'
+eq106 internal/store/research_tasks.go 'func RequeueTripReasonOf(errText string) string' 1 '⑪-6 成因回读函数在位（两条闸共用一个终态，告警不许都写同因）'
+word106 internal/scheduler/worker_m14_test.go 'func TestMixedCauseRequeueCapParksTask' '⑪-6 异因循环撞累计闸用例在位'
+word106 internal/scheduler/worker_m14_test.go 'func TestFinishTaskParkedChainKeepsDoneFalse' '⑪-6 挂起步不置 done 用例在位'
+word106 internal/store/research_tasks_test.go 'func TestTaskPreemptRequeueKeepsStreakAndCounts' '⑪-6 抢占不清连败用例在位'
+word106 internal/store/research_tasks_test.go 'func TestTaskPreemptRequeueZeroRowIsLoud' '⑪-6 抢占回队零行必响用例在位（静默 0 行＝计数没落上）'
+word106 internal/store/research_tasks_test.go 'func TestTaskRequeueTotalSurvivesSuccess' '⑪-6 成功不清累计账用例在位'
+word106 internal/store/research_tasks_test.go 'func TestChainParkedCount' '⑪-6 挂起步数读数用例在位'
+
+# ⑪-6-d 跨语言阈值同源（值比对，不是枚数）：上限这个数字被抄在四门上——Go 常量是判据本身，
+# bash 变量、PS param 默认、python argparse 默认是验收尺子。四者不等值时，夜间验收会按自己的
+# 尺子判绿而生产按 Go 的尺子挂起（"33 次回队"那晚就是这样：验收红的是另一把尺子）。
+# 取不到任何一侧读数一律判红（读不到 ≠ 相等，本仓锤过的「没读到冒充没配置」）。
+CNT106=$((CNT106 + 1))
+GO_CAP=$(grep -oE 'const TotalRequeueLimit = [0-9]+' internal/store/research_tasks.go | grep -oE '[0-9]+$' || true)
+SH_CAP=$(grep -oE 'REQUEUE_MAX="\$\{REQUEUE_MAX:-[0-9]+\}' "$VNG" | grep -oE '[0-9]+' | tail -1 || true)
+PS_CAP=$(grep -oE '\[int\]\$RequeueMax = [0-9]+' "$VNG" | grep -oE '[0-9]+$' || true)
+PY_CAP=$(grep -oE '"--requeue-max", type=int, default=[0-9]+' "$VNG" | grep -oE '[0-9]+$' || true)
+if [ -z "$GO_CAP" ] || [ -z "$SH_CAP" ] || [ -z "$PS_CAP" ] || [ -z "$PY_CAP" ]; then
+	echo "--- FAIL: §106 跨语言同源锁 ${CNT106}（⑪-6 累计回队上限）：某侧读数取空 go=${GO_CAP:-∅} sh=${SH_CAP:-∅} ps=${PS_CAP:-∅} py=${PY_CAP:-∅}——取空一律判红，绝不按相等放行"
+	exit 1
+fi
+if [ "$GO_CAP" != "$SH_CAP" ] || [ "$GO_CAP" != "$PS_CAP" ] || [ "$GO_CAP" != "$PY_CAP" ]; then
+	echo "--- FAIL: §106 跨语言同源锁 ${CNT106}（⑪-6 累计回队上限四门不等值）：go=${GO_CAP} bash=${SH_CAP} ps=${PS_CAP} py=${PY_CAP}（生产按 go 挂起、验收按另三把尺子判，尺子不同账就不同）"
+	exit 1
+fi
+echo "ok - §106 跨语言同源锁：累计回队上限四门同值 ${GO_CAP}"
+
+# ⑪-6-e §DET-TIME-2：前端用例挑错时钟的两型（2026-10-13 门禁第 6 遍，红在 §15 与 §51 两段）
+# 两条都不是产品缺陷，是**尺子挑错了时钟**（§DET-TIME 同族，本批把它续到第二型）：
+#   ① §15 的 `Test timed out in 60000ms`：App.jsx＋tdesign 整条**按需转换链**的成本（空闲机实测
+#      首用例 12.059s）被算在"被计时的用例窗口"里。邻居负载反证：/tmp/fe_test_clean.log 里出现
+#      本机另一个项目的用例文件名 ⇒ 门禁那一刻真被别人抢着 CPU，12s 的固定成本被推过 60s；
+#      该用例被超时打断后挂载没卸载，于是同文件后面几条红全是它的级联（multiple elements／
+#      空 body／调用计数 0），逐条读下来只有第一条是本体。
+#      修法＝文件模块级先 `await import('../App.jsx')` 预热，把成本挪进"文件收集阶段"（那一段
+#      没有 per-test 计时；hook 里的写法不行——hookTimeout 另有一把 10s 尺子）。
+#      改后同三文件实录：首用例 12059ms → **1411ms**，13 用例全绿、tests 总时长 11.76s。
+#   ② §51 的 toast 假红：`findByText` 成功返回的那一刻**已经证明** toast 在文档里，紧跟的
+#      `expect(toast).toBeInTheDocument()` 又拿 MessagePlugin `duration:3000` 的**真实时钟**
+#      量同一枚节点一次——负载把那句解析回调推迟到收起之后就红（本轮红在 T5b，findByText 本身
+#      已成功返回；T1 与此同形，一并收）。
+#      修法＝认"取到的那枚节点上的文字"（expect(toast.textContent, …).toContain(…)）：判据一点
+#      没放宽（toast 没出现照样由 findByText 抛错判红），只是不再拿"三秒后还在不在"当第二把尺子。
+# 锁的形状：①走**派生清单**（凡动态挂载 App.jsx 的用例文件都必须带模块级预热行）并钉"清单非空"
+# 正锁——空清单上的负向锁＝恒绿假锁（本仓教训）；②走"新形等值 + 旧形执行行负锁"，故本段需要
+# absent_exec106 这一形（见其定义处说明）。
+# 预演读数（2026-10-13 03:2x 本机逐枚实测）：动态 import App.jsx 的用例文件=2 份、各含列 0 预热行
+# 1 行；h2 文件 expect(toast.textContent=2／旧形执行行=0（注释里保留 1 处原文，不计入）；
+# T1/T5b 取 toast 整串各 1 行、getByText 那两枚消息的同步查询形各 0 行（文件里另有一处 getByText
+# 用于别的判据，故负锁锚必须带消息正则，不能只锚 screen.getByText(＝预演 got=1 会把自己判红）。
+CNT106=$((CNT106 + 1))
+APPFILES106=$(grep -l "await import('\.\./App\.jsx')" web/src/__tests__/*.test.jsx 2>/dev/null || true)
+APPN106=$(printf '%s\n' "$APPFILES106" | grep -c 'test\.jsx$' || true)
+APPMISS106=""
+for f106 in $APPFILES106; do
+	grep -q '^await import(' "$f106" || APPMISS106="$APPMISS106 $f106"
+done
+if [ "${APPN106:-0}" -lt 2 ]; then
+	echo "--- FAIL: §106 派生锁 ${CNT106}（⑪-6-e 动态挂载 App.jsx 的用例文件清单）：派生到 ${APPN106:-0} 份（预演 ≥2）——清单空了这份锁就没有射程，宁判红不判绿"
+	exit 1
+fi
+if [ -n "$APPMISS106" ]; then
+	echo "--- FAIL: §106 派生锁 ${CNT106}（⑪-6-e 模块级预热行）：${APPMISS106} 缺列 0 的「await import(」＝冷 transform 又回到被计时的用例窗口里"
+	exit 1
+fi
+echo "ok - §106 派生锁：${APPN106} 份动态挂载 App.jsx 的用例文件全部带模块级预热行（§DET-TIME-2）"
+eq106 web/src/__tests__/h2_positions_balance.test.jsx 'expect(toast\.textContent' 2 '⑪-6-e toast 判据认节点文字两处（T1+T5b；只留一处＝另一处回到二次在文档判定）'
+# ★ 负锁锚写成 `expect(toast.*\.toBeInTheDocument()`（`.*` 跨消息参数），而不是只锚
+#   `expect(toast)` 那种紧括号形：反证实测第一版把 T5b 退回**真实旧码**
+#   `expect(toast, '§E1：…').toBeInTheDocument()` 时锁仍 got=0 恒绿——旧码带消息参数，
+#   紧括号锚根本没在射程里（锁在岗却看不见它要防的那件事，比没有锁更坏）。
+absent_exec106 web/src/__tests__/h2_positions_balance.test.jsx 'expect(toast.*\.toBeInTheDocument()' '⑪-6-e 不得对 toast 再做二次在文档判定（3s 真实时钟收起＝负载假红；用例注释里保留成因原文不算命中，见 absent_exec106）'
+# 上面那枚 textContent 等值锁锚的是**公共前缀**（本仓教训：子串锚会把"改名式破坏"放过去），
+# 这里按目标各补一枚整串锁：把两处判据各自的签名（取 toast 那一整行 + 认文字那一行的消息）钉死，
+# 任一处回到同步查询或丢掉消息参数都会当场掉到 0。
+eq106 web/src/__tests__/h2_positions_balance.test.jsx 'const toast = await screen.findByText(/保存可用资金失败：服务端 500/, {}, { timeout: 5000 })' 1 '⑪-6-e T1 取 toast 整串（异步 findBy＋5s 上限；退回 getByText＝负载下拿不到就是 undefined，判据静默放行）'
+eq106 web/src/__tests__/h2_positions_balance.test.jsx 'const toast = await screen.findByText(/盈亏校准失败/, {}, { timeout: 5000 })' 1 '⑪-6-e T5b 取 toast 整串（同上）'
+absent106 web/src/__tests__/h2_positions_balance.test.jsx 'screen.getByText(/保存可用资金失败' '⑪-6-e T1 同步查询形态禁止复活（getByText 不等待，正是"降级报成功"在用例侧的镜像）'
+absent106 web/src/__tests__/h2_positions_balance.test.jsx 'screen.getByText(/盈亏校准失败' '⑪-6-e T5b 同步查询形态禁止复活'
+
+# ⑪-6-f 调度轮界确定性（§flake 根修 2026-10-13，同遍门禁 §15 之外唯一红在 scheduler）
+# 现象：本机单跑 1.80s 全绿，整轮 -full 里 TestSameCauseBreakerParksTask 第 2 轮 15.61s 撞破
+# waitFor 的 15s 预算判红。根因不是预算小，是**轮次边界交给了"上一轮的异步尾巴刚好来得及"**：
+# worker 排水期 s.busy 为真时 tick() 是空转，于是那一轮根本没派活，等到排水完才动，等待窗已被
+# 排水吃掉。修法＝beginRound 把"等排水停手 → 拨钟越过 5min 失败冷却窗 → tick"钉成一条显式状态
+# 转移（等待预算同时抬到 60s，只防调度延迟冒充失败，确定性来自 beginRound）。
+# 为什么挂 §106 而不是新开段：本批 ⑪-6 队列回队闸就在这个文件里，轮界修复是它的使用前提。
+# 预演读数：func beginRound=1、beginRound(t, s, clk)=3（三处轮次循环；文件里另两处"停车后续跑
+# 三轮"的循环**故意不套助手**——它要的就是连拨三次 tick 观察挂起态，语义不同）、
+# waitFor(t, roundSettleWait=3、const 定义=1。
+word106 internal/scheduler/worker_m14_test.go 'func beginRound' '⑪-6-f 轮开助手单点（等排水→拨钟→tick 的顺序只有一份定义）'
+eq106 internal/scheduler/worker_m14_test.go 'beginRound(t, s, clk)' 3 '⑪-6-f 三处轮次循环全部走助手（少一处＝那条循环仍在赌异步尾巴来得及）'
+eq106 internal/scheduler/worker_m14_test.go 'waitFor(t, roundSettleWait' 3 '⑪-6-f 轮内等待统一走常量（秒数写死在三处＝改一处漏两处）'
+eq106 internal/scheduler/worker_m14_test.go 'const roundSettleWait = 60 \* time\.Second' 1 '⑪-6-f 等待预算常量单点定义'
+
+# ⑪-6-g 流式空闲用例的负载余量（§DET-TIME-3 收形 2026-10-13，第 7 遍门禁 §15 的红项）
+# 现象：§15 的"实时链路相关全量单测"（12 个包一次 go test）里 TestStreamIdleResetsOnChunks 红，
+# 错误文案正是被测语义的输出：`流式响应空闲超时(200ms)`，用例耗时 0.86s。
+# 归因走复现阶梯（每一档都实跑，不是推断）：本机单跑同一用例 5/5 绿 → 整包单跑 2/2 绿 →
+# §15 那条批命令原样复跑 2/2 绿 → 16 路并发同跑该用例 0/16 红。⇒ 逻辑没坏，是**旧形只留
+# 140ms 余量**（阈值 200ms − 单片 60ms），进程被整体挂起超过 140ms 就够红；凌晨机器打盹／本机
+# 别的项目都能造成这一挂起。与前端 §DET-TIME-2 同族：尺子挑错了时钟（用墙钟量"没发生的等待"）。
+# 修法＝把比值抬到 25:1（滴 60ms、40 片、阈值 1500ms），要误杀必须连续挂起 1.5 秒；反向证明力
+# 不缩：整段 ~2.4s 仍 >> 1.5s。旧实现（idle 不随分片重置）用 go test -overlay 换掉 llm.go 实测：
+#   --- FAIL: TestStreamIdleResetsOnChunks (2.67s)：流式响应空闲超时(1.5s): 模型疑似卡死
+# ⇒ 加宽余量后这条用例仍然抓得住它原本要抓的那个缺陷（不是"放宽成永远绿"）。
+# 为什么锁"常量三件套 + 配置位从常量取"这一形：字面秒数写在配置位上＝下一个改的人只看得见那一个
+# 数字，看不见它和滴流总时长的比值关系，余量会被无意压回去（本批的红正是这么来的）。
+# 预演读数（全部当场 grep 实取）：三个常量定义各 1、循环与 Sleep 走常量各 1、配置位 idleLimit=1、
+# 断言按 dripChunks-1 派生=1、旧形三态（inline 60ms Sleep / inline 200ms 阈值 / 硬编码"片段9"）均 0、
+# llm.go 内 idle.Reset(c.idleTimeout)=1、case <-progress:=1。
+eq106 internal/llm/fix3_fix4_test.go 'dripInterval[[:space:]]*= 60 \* time\.Millisecond' 1 '⑪-6-g 单片间隔常量单点（滴流节奏与阈值必须写在同一处，比值才可读）'
+eq106 internal/llm/fix3_fix4_test.go 'dripChunks[[:space:]]*= 40' 1 '⑪-6-g 片数常量单点（整段耗时由它派生，写死循环上界＝改了片数不改阈值）'
+eq106 internal/llm/fix3_fix4_test.go 'idleLimit[[:space:]]*= 1500 \* time\.Millisecond' 1 '⑪-6-g 空闲阈值常量（25 倍单片间隔＝负载余量，压回 200ms 即本批那条红复活）'
+eq106 internal/llm/fix3_fix4_test.go 'for i := 0; i < dripChunks; i++' 1 '⑪-6-g 滴流循环上界取常量（不回到字面 10）'
+eq106 internal/llm/fix3_fix4_test.go 'time\.Sleep(dripInterval)' 1 '⑪-6-g 分片间隔取常量'
+eq106 internal/llm/fix3_fix4_test.go 'StreamIdleTimeout:[[:space:]]*idleLimit' 1 '⑪-6-g 配置位从阈值常量取（字面秒数回到这里＝比值关系又只存在于某个人的脑子里）'
+eq106 internal/llm/fix3_fix4_test.go 'fmt\.Sprintf("片段%d", dripChunks-1)' 1 '⑪-6-g 末片断言按片数派生（写死片号＝改片数时判据静默失效）'
+absent106 internal/llm/fix3_fix4_test.go 'time\.Sleep(60 \* time\.Millisecond)' '⑪-6-g 旧形滴流间隔字面量禁止复活'
+absent106 internal/llm/fix3_fix4_test.go 'StreamIdleTimeout:[[:space:]]*200 \* time\.Millisecond' '⑪-6-g 旧形 200ms 阈值禁止复活（那把尺子的余量只有 140ms）'
+absent106 internal/llm/fix3_fix4_test.go '"片段9"' '⑪-6-g 硬编码末片号禁止复活（10 片时代的产物，与 40 片不符）'
+eq106 internal/llm/fix3_fix4_test.go '§DET-TIME-3' 1 '⑪-6-g 成因随锁走：余量口径的说明必须留在用例头上（删了说明，下一个人只会看到三个不相干的数字）'
+# 被测实现在位锁：这条用例的全部意义在"分片即重置"那一句上；那句被删＝用例必红，但红在行为腿，
+# 静态锁让它同时在源码面上现形并指到那一句（行为腿红只说"超时了"，不指到被删的实现）。
+eq106 internal/llm/llm.go 'idle\.Reset(c\.idleTimeout)' 1 '⑪-6-g 空闲随分片重置的实现在位（§FIX-3 的语义本体）'
+eq106 internal/llm/llm.go 'case <-progress:' 1 '⑪-6-g 心跳消费分支在位（reset 那条 case 的宿主）'
+
+# 分桶枚数由这几个 helper 累加得到（写死＝下一道锁加进来时就过时，而"过时却全绿"比红更坏）；
+# 下界只防"helper 与正文脱节把整段锁数没"，不参与判据本身。
+if [ "${CNT106:-0}" -lt 50 ]; then
+	echo "--- FAIL: §106 静态锁派生异常（本段只数到 ${CNT106} 道，应 ≥50）——计数与正文脱节时会把「没锁到」报成「锁都在」"
+	exit 1
+fi
+echo "ok - §106 静态锁 ${CNT106} 道通过（形态派生：存在性 ${N106_HAS}／等值 ${N106_EQ}／整词 ${N106_WORD}／负锁 ${N106_ABSENT}，另含阈值透传与跨语言同源等手工道）"
 
 # ── 行为腿：五组用例 + 两条脚本离线自证（先收全文再判红，红项当场可读）──
 leg106() { # $1=说明 $2=包 $3=-run 正则
 	local out
+	N106_LEG=$((N106_LEG + 1))
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
 	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
 		echo "--- FAIL: §106 行为腿判红（${1}），全文如下："
@@ -5422,8 +5774,77 @@ leg106() { # $1=说明 $2=包 $3=-run 正则
 		echo "--- FAIL: §106 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
 		exit 1
 	}
+	# ★ 空跑腿（2026-10-13 加）：go test 在"-run 正则一条用例都没吃到"时照样打 `ok` 行
+	#   （形如 `ok  pkg  0.005s [no tests to run]`），所以上面那枚"无 ok 行＝没跑到"判据
+	#   对这种形态是瞎的——本段头注原先声称"吃不到用例时也会判红"，实测不符（注释说有的判据
+	#   而判据不在＝比没有判据更坏，它让人以为验过）。这里按输出里的空跑标记补一刀。
+	if printf '%s\n' "$out" | /usr/bin/grep -qE '\[no tests to run\]'; then
+		echo "--- FAIL: §106 行为腿空跑（$1）：-run 正则「$3」在 $2 里一条用例都没吃到，ok 行是空跑的 ok＝这条腿没有射程"
+		exit 1
+	fi
 	echo "ok - §106 行为腿 $1"
 }
+# ⑪-6-e 行为腿（先整词锁钉用例名，再真跑；吃不到用例＝上面那枚空跑腿判红，不打绿灯）
+leg106 'store 累计回队闸（异因撞上限/抢占不清账/零行必响/成因回读/成功不清账/挂起读数）' ./internal/store/ \
+	'TestTaskSameCauseBreaker|TestTaskPreemptRequeueKeepsStreakAndCounts|TestTaskPreemptRequeueZeroRowIsLoud|TestTaskRequeueTripReasonReadsBothBreakers|TestTaskRequeueTotalSurvivesSuccess|TestChainParkedCount'
+leg106 'scheduler 熔断挂起（同因连败/异因撞累计闸/挂起步不置 done）' ./internal/scheduler/ \
+	'TestSameCauseBreakerParksTask|TestDifferentCauseFailuresNeverBreaker|TestMixedCauseRequeueCapParksTask|TestFinishTaskParkedChainKeepsDoneFalse'
+leg106 'dataload 池子快照（整日替换/幻影日拦停放行/时间戳三态/空回包保数据/探针同源）' ./cmd/dataload/ \
+	'TestSyncPools|TestPoolProbe|TestNewPoolStampReadout'
+leg106 'store 池子整日替换（删旧行/删除前中止/影子日/文本归一/简池）' ./internal/store/ \
+	'TestReplaceThsLimitUpsRemovesStaleRows|TestReplaceThsLimitUpsAbortsBeforeDelete|TestLimitUpShadowOfDetectsPhantomDay|TestPoolTextNormAndRowSig|TestReplaceThsSimplePool'
+# ⑪-6-g 行为腿：滴流活着读完（正）与真卡流必掐（反）同拨——只有前者会放走"把超时整条删掉"的破坏，
+# 只有后者会放走"阈值加宽到永远不掐"的破坏；成对跑才让 25:1 余量这条改动仍然是判据而不是放宽。
+leg106 'llm 流式空闲双向（慢滴流不被误杀/真卡流必掐且文案含空闲超时）' ./internal/llm/ \
+	'TestStreamIdleResetsOnChunks|TestStreamIdleKillsTrueStall'
+# ⑪-6-h 今日两处"有代码无调度"的收编（第 8 遍门禁全绿之后自查查出来的，不是跑测跑出来的）：
+#   ① 新写的日历前瞻包 internal/cntime 既不在实时链路那 12 个包里，也不在回测增强那 5 个包里，
+#      三条用例在此前任何一遍门禁里都没真跑过（静态锁只钉住函数名在位，钉不住它跑没跑）；
+#   ② 降级源中段空洞那条用例（TestNoResumeForcePullReachesMidSpanHole）同形：cmd/dataload 在门禁里
+#      只按 'TestSyncPools|TestPoolProbe|...' 和 'Minute|HasBars|...' 两种正则跑，它两头都不沾。
+#   这一型在本仓不是第一次（"有脚本无调度"），差别是这次量具自己也在射程外——所以先给 leg106 补了
+#   空跑腿（-run 吃不到用例时 go 仍打 ok，旧判据对这种 ok 是瞎的），再落这两条腿。
+word106 internal/cntime/cntime_test.go 'func TestCalendarEndDayExtendsFuture' '⑪-6-h 前瞻窗口用例在位'
+word106 internal/cntime/cntime_test.go 'func TestCalendarEndDayFormatsAgree' '⑪-6-h 两种口径同格式用例在位'
+word106 internal/cntime/cntime_test.go 'func TestCalendarEndDayIgnoresHostZone' '⑪-6-h 不受本机时区用例在位（钉死 45 天的跨零点形状）'
+leg106 'cntime 日历前瞻边界（窗口向未来延伸/两种口径同格式/不受本机时区影响）' ./internal/cntime/ \
+	'TestCalendarEndDayExtendsFuture|TestCalendarEndDayFormatsAgree|TestCalendarEndDayIgnoresHostZone'
+leg106 'dataload 降级源中段空洞可达（跳过态拦得住、强拉态补得到）' ./cmd/dataload/ \
+	'TestNoResumeForcePullReachesMidSpanHole'
+
+# ── ⑪-7 owner 交易裁决两件（2026-10-12，000063 事故批）：延持次数上限 + 低价/成交额买入闸 ──
+# 背景：000063 中兴通讯止损触线（-6.4%）后战法持续喊买，旧口径「反复延持=按设计拿着」一路
+# 延持 22 次拿到收盘；同日 09:54 五十余信号瞬间打满日预算，后续信号降档成几块钱的 1 手 2 手
+# 碎单堆仓。owner 裁决：延持最多 N 次（默认 2）超限按无信号处置；买入侧加最低价（默认 5 元）
+# 与单笔成交额下限（默认 5000 元，按**降档后最终股数**核算）两闸，数值可配置并热生效。
+# 三态口径锁死在实现里（0=出厂默认——存量快照缺键必须兜默认而非旁路；负数=显式关闭/无上限），
+# 这里锁接线与口径锚；行为腿真跑 + 摘锁反证见 sell_extend_cap_test.go / qmt_buy_floor_test.go 头注。
+eq106 internal/config/config.go 'MinBuyPrice float64' 1 '⑪-7 最低买入价配置键在位（0 必须兜默认，不能当"未配置"旁路）'
+eq106 internal/config/config.go 'MinOrderAmount float64' 1 '⑪-7 单笔最低成交额配置键在位'
+eq106 internal/config/config.go 'func (c QMTConfig) EffectiveMinBuyPrice() float64' 1 '⑪-7 最低价生效读数单点收敛（下单路径只吃这里）'
+eq106 internal/config/config.go 'func (c QMTConfig) EffectiveMinOrderAmount() float64' 1 '⑪-7 成交额生效读数单点收敛'
+eq106 internal/config/config.go 'MinBuyPrice:       5,' 1 '⑪-7 出厂默认最低价 5 元'
+eq106 internal/config/config.go 'MinOrderAmount:    5000,' 1 '⑪-7 出厂默认成交额 5000 元'
+eq106 internal/config/config.go 'MaxExtends: 2,' 1 '⑪-7 延持上限出厂默认 2 次（owner 裁决）'
+eq106 internal/signalctl/sell.go 'maxExt: 2}' 1 '⑪-7 sellParams 缺省兜 2（存量纪律快照缺键=兜默认，不是无限延持）'
+eq106 internal/signalctl/sell.go 'case cfg.MaxExtends > 0:' 1 '⑪-7 显式配置分支在位'
+eq106 internal/signalctl/sell.go 'case cfg.MaxExtends < 0:' 1 '⑪-7 负数=无上限逃生阀分支在位'
+eq106 internal/signalctl/sell.go 'capped := false' 1 '⑪-7 超限按无信号处置的判据在位（摘掉=回到 000063 事故口径）'
+eq106 internal/signalctl/sell.go '延持已达%d次上限，按无信号处置：' 1 '⑪-7 达上限处置理由必须可归因'
+eq106 internal/engine/engine.go 'cfg\.EffectiveMinBuyPrice()' 1 '⑪-7 低价闸接线在位（涨停封板闸之后、金额折算之前）'
+eq106 internal/engine/engine.go 'cfg\.EffectiveMinOrderAmount()' 1 '⑪-7 成交额闸接线在位（现金降档之后、组单之前＝按最终股数核算）'
+eq106 internal/engine/engine.go '"minprice:"+sig.Code' 1 '⑪-7 低价拒买留痕键在位'
+eq106 internal/engine/engine.go '"minamount:"+sig.Code' 1 '⑪-7 碎单拒买留痕键在位'
+word106 internal/signalctl/sell_extend_cap_test.go 'func TestSellExtendCapDefaultsToTwo' '⑪-7 默认上限 2 次用例在位（-run 正则匹配不到也算 ok，用例名必须逐名钉住）'
+word106 internal/signalctl/sell_extend_cap_test.go 'func TestSellCapDeepBreachStillOverrides' '⑪-7 深破优先于上限用例在位'
+word106 internal/engine/qmt_buy_floor_test.go 'func TestBuyFloorMinPriceDefaultRejectsJunk' '⑪-7 低价闸默认开用例在位'
+word106 internal/engine/qmt_buy_floor_test.go 'func TestBuyFloorMinOrderAmountAfterCashDowngrade' '⑪-7 降档后核算口径用例在位'
+# ⑪-7 行为腿（先整词锁钉用例名，再真跑）
+leg106 'signalctl 延持上限（默认2次/显式1次/负数逃生阀/深破优先于上限）' ./internal/signalctl/ \
+	'TestSellExtendCapDefaultsToTwo|TestSellExtendCapExplicitConfig|TestSellExtendUnlimitedEscapeHatch|TestSellCapDeepBreachStillOverrides'
+leg106 'engine 买入两闸（低价默认拦/负数关闭/压线阈值/碎单拦/降档后核算/正常单不误伤）' ./internal/engine/ \
+	'TestBuyFloor'
+
 # 三件套等值闸：路由表条目数 == DefaultAlertRules 条数（本批 15→18，§107 再 +1＝19，两侧同批动）
 # §W7-COUNT-SYNC（2026-10-09 波 7）：现**实数 20**（必推 12 / 日汇总 8，两个集合名字逐一对齐）。
 #   多出来的那一条是波 5 §P2-E 的 settlement_not_verified——它入表时只加了路由条目和规则注册，
@@ -5492,7 +5913,15 @@ healed = blind + [("20261008", 1), ("20261009", 1), ("20261010", 0), ("20261011"
                   ("20261012", 1), ("20261013", 1)]
 mk("blind.db", blind, [("20260930",)])
 mk("healed.db", healed, [("20260930",)])
+# 覆盖态的**期望落后交易日数**必须由夹具自己派生，不能写死（写死＝日期依赖断言）：
+# 本批首版写死 2，第二天（10-12 是夹具里的开市日）真读数变 3，门禁在完全健康的代码上判红——
+# 与「窗口边界必须与写入口径同区」同族。算法与读数腿一致：日 max 之后、且不晚于今日的开市行数。
+import datetime
+today = datetime.date.today().strftime("%Y%m%d")
+expect = sum(1 for d, o in healed if o == 1 and d > "20260930" and d <= today)
+open(os.path.join(root, "expect_lag"), "w").write(str(expect))
 PYCAL
+CAL_EXPECT=$(cat "$VNG106_CAL/expect_lag" 2>/dev/null || true)
 CAL_BLIND=$(python3 "$VNG106_CAL/readout.py" --db "$VNG106_CAL/blind.db" 2>&1 | grep -a '^INFO|cal_coverage' || true)
 CAL_HEAL=$(python3 "$VNG106_CAL/readout.py" --db "$VNG106_CAL/healed.db" 2>&1 | grep -a '^INFO|cal_coverage' || true)
 rm -rf "$VNG106_CAL"
@@ -5501,13 +5930,17 @@ if ! printf '%s' "$CAL_BLIND" | grep -q 'covers_today=no' \
 	echo "--- FAIL: §106 日历覆盖腿盲窗态读数不对（实得=${CAL_BLIND:-空}，期望 covers_today=no 且 daily_lag_td=unknown＝残缺日历算出的落后必须是"算不了"，不许冒充 0）"
 	exit 1
 fi
-if ! printf '%s' "$CAL_HEAL" | grep -q 'covers_today=yes' \
-   || ! printf '%s' "$CAL_HEAL" | grep -q 'daily_lag_td=2'; then
-	echo "--- FAIL: §106 日历覆盖腿覆盖态读数不对（实得=${CAL_HEAL:-空}，期望 covers_today=yes 且 daily_lag_td=2＝日历齐了却不出数＝这条腿恒盲，白加）"
+if [ -z "${CAL_EXPECT:-}" ] || [ "${CAL_EXPECT:-0}" -lt 1 ]; then
+	echo "--- FAIL: §106 日历覆盖腿拿不到派生期望值（expect_lag=${CAL_EXPECT:-∅}，应 ≥1）——夹具与今日之间没有落后开市日时这条自证退化，须改夹具而不是放行"
 	exit 1
 fi
-echo "ok - §106 日历覆盖双态自证通过（盲窗态 no/unknown、覆盖态 yes/2）"
-echo "ok - §106 行为腿 8 组 + 离线自证 4 条通过"
+if ! printf '%s' "$CAL_HEAL" | grep -q 'covers_today=yes' \
+   || ! printf '%s' "$CAL_HEAL" | grep -q "daily_lag_td=${CAL_EXPECT}"; then
+	echo "--- FAIL: §106 日历覆盖腿覆盖态读数不对（实得=${CAL_HEAL:-空}，期望 covers_today=yes 且 daily_lag_td=${CAL_EXPECT}＝由夹具日历与今日派生；读不出数字＝这条腿恒盲，白加）"
+	exit 1
+fi
+echo "ok - §106 日历覆盖双态自证通过（盲窗态 no/unknown、覆盖态 yes/${CAL_EXPECT}，期望值随夹具派生）"
+echo "ok - §106 行为腿 ${N106_LEG} 组（派生计数：加腿忘抬文案＝这里自己跟上） + 离线自证 4 条通过"
 
 # ════════════════════════════════════════════════════════════════════════════
 # §107 §0929 晚批：恢复演练**首次挂调度真跑**锤实的三条缺陷（DRILL-A/B/C）+ 两条
@@ -7281,7 +7714,7 @@ fi
 echo "ok - §110 F3 双向镜像反证通过（roster/规则/回退字面量三枚走同一份 python 判据，探针侧各枚走同一份锁本体；枚数不在此手写，红项的编号才是账）"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# F1 判读函数行为腿：十九合成读数 + 十二枚摘锁反证
+# F1 判读函数行为腿：二十一合成读数 + 十三枚摘锁反证（t/u + M13＝2026-10-12 波 5 就地禁用收编）
 #   （§KA-TASKREG 把红绿判断从 PowerShell 搬到 bash 的全部理由，就是这一段能在本机真跑）
 # ──────────────────────────────────────────────────────────────────────────────
 CNT110=$((CNT110 + 1))
@@ -7376,6 +7809,13 @@ leg110 'r 旧格式读数（没有 reg_h/last_run 两个新键）+ 数字年龄�
 # s 是本批加观测行要回答的那个问题：present=0 到底是"根本没装"还是"装了但改了名"。
 # 前者要注册，后者要先查是谁改的名——处置不同，所以缺席行必须把同族清单带在身边。
 legnote110 's 缺席任务把同族清单一起报出来（absent 的处置由清单决定）' FAIL "absent=" 'live_names=QMT-Ensure-Gateway,quant-all-watchdog-old' "$(printf '%s\n%s' 'TASK|__live_names__|present=2|rule=none|age_h=na|state=live-names|enabled=na|action=QMT-Ensure-Gateway,quant-all-watchdog-old' 'TASK|quant-all-wd|present=0|rule=inplace|age_h=na|state=absent|enabled=na|action=')"
+# t/u：就地禁用（owner 2026-10-10 定性）——rule=inplace 的任务被 /disable 着是**合法稳态**
+# （定性过的处置，不是忘复原的止损动作），周期任务的禁用判据（leg i）不得波及它。
+# 为什么必须钉住：这是"往绿的方向修"的缺口——后人把禁用检查挪到 inplace 放行**之前**，
+# 两枚定性任务就会在完全健康的现网上永远红（§107 DRILL-C：永远红的锁教出来的是所有人忽略红）。
+# t 锁判决（PASS），u 锁读数（INFO 里 enabled=False 必须可见——放行≠读数消失，观察面不能跟着哑）。
+leg110 't 就地禁用（rule=inplace + enabled=False）判绿：定性过的合法稳态，不拿周期任务的禁用判据去红它' PASS "" 'TASK|quant-all-wd|present=1|rule=inplace|age_h=na|state=present+lastrun|enabled=False|action=powershell -File quant_all_watchdog.ps1'
+legnote110 'u 就地禁用放行时 INFO 必须把 enabled=False 带出来（放行≠读数消失）' PASS "" 'enabled=False' 'TASK|quant-all-wd|present=1|rule=inplace|age_h=na|state=present+lastrun|enabled=False|action=powershell -File quant_all_watchdog.ps1'
 
 mut110() { # 摘锁反证：$1=标签 $2=原串（必须恰好出现一次）$3=替换串 $4=读数 $5=摘锁后期望判决
 	local got
@@ -7422,6 +7862,14 @@ mut110 'M9 摘注册龄与阈值的比较 ⇒ n 转绿（装了 120h 一次没�
 mut110 'M10 摘注册龄未知的 fail-closed 收集 ⇒ o 转绿（"没有这个键"从红变成绿＝反向失效）' 'notrun="${notrun} ${name}(age=never;reg_h=${reg:-missing})"' 'notrun="${notrun}"' 'TASK|Quant-Log-Prune|present=1|rule=30|age_h=never|state=never-run|enabled=True|action=powershell -File prune_logs.ps1' PASS
 mut110 'M11 摘 never-run 汇总进 bad ⇒ p 转绿（收集了却不点名＝判据算了没人判）' '[ -n "$notrun" ] && bad="${bad} never-run-beyond-rule=${notrun}"' '[ -n "" ] && bad="$bad"' 'TASK|QMT-Gateway-Ensure|present=1|rule=2|age_h=never|state=never-run|enabled=True|reg_h=-3.2|last_run=na|action=x' PASS
 mut110 'M12 摘观测行专用分支 ⇒ q 转红（清单行被当成任务在位判定，凭空多一条 absent）' '[ "$name" = "__live_names__" ]' '[ "$name" = "zz-live-names" ]' 'TASK|__live_names__|present=3|rule=none|age_h=na|state=live-names|enabled=na|action=QMT-Ensure-Gateway,Quant-Log-Prune,QMT-Qmtctl-Ensure' FAIL
+# M13 就地禁用的摘锁反证（方向：摘掉放行 ⇒ t 必须转红）：证 t 的绿是 inplace 提前放行给的，
+# 不是禁用判据"碰巧没跑到"。变异=把禁用判据提到 inplace 放行之前（正是上面 t 注释里预言的
+# 那种"往红的方向修错"），定性任务跌进 no-freshness-rule 分支被点名——放行是承重的，不是漏判。
+# 变异锚用带 if 前缀的整行（M7 已占用裸比较串，mut110 要求原串恰好出现一次）。
+mut110 'M13 禁用判据提到 inplace 放行之前 ⇒ t 转红（就地禁用放行是承重的，不是漏判）' \
+	'if [ "$rule" = "inplace" ]; then' \
+	'if [ "$rule" = "inplace" ] && [ "$en" != "False" ]; then' \
+	'TASK|quant-all-wd|present=1|rule=inplace|age_h=na|state=present+lastrun|enabled=False|action=powershell -File quant_all_watchdog.ps1' FAIL
 rm -f "$W3T/fn_mut.sh"
 
 # ──────────────────────────────────────────────────────────────────────────────

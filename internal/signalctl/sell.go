@@ -10,6 +10,9 @@
 //     深破兜底=止损线×DeepStopMult（默认 −12）；
 //   - 触线≠即卖：首触锁定判定线与固定结算点（对齐 09:30 栅格，边界⑤不随价格波动滚动），
 //     窗结算时窗内有新鲜做多信号 → 延持一个窗长（信号在就拿着），无信号 → 处置；
+//   - 延持有次数上限（MaxExtends，出厂默认 2；owner 2026-10-12 裁决）：超限后即使信号仍在
+//     也按无信号处置——000063 事故形态：止损触线后战法持续喊买，旧口径无限延持把 -6.4% 一路
+//     拿到收盘（10:00→15:15 延持 22 次），只靠 -12% 深破线兜底，回撤成本过高；
 //   - 延持只认做多信号 hasBull（语义②，修正旧实现止损窗 hasBear→延持的方向性错误）；
 //     做多信号必须新鲜（边界⑥：产出时刻超 SellSignalMaxAgeSec 按无信号）；
 //   - 利空即时硬清（语义①）：触止损线 + 利空且验证等级=双源（§八护栏4）→ 当轮直接全平、不等窗；
@@ -137,7 +140,10 @@ type sellState struct {
 	// ConfirmedAt 结论确认发生的时刻——§0926E2E-11A 重放新鲜度闸的判据（只重放确认当日）。
 	ConfirmedAt time.Time
 	HighPrice   float64
-	Extends     int // 已延持次数（留痕用，不设上限：信号持续=按设计拿着，深破线兜底）
+	// Extends 已延持次数。旧口径"不设上限：信号持续=按设计拿着，深破线兜底"已在
+	// 000063 事故（止损触线后战法持续喊买，-6.4% 一路延持 22 次拿到收盘）后被 owner 裁决推翻：
+	// 延持最多 MaxExtends 次（默认 2），超限按无信号处置（见 sellProbe ⑤）。
+	Extends int
 }
 
 // sellKey 卖出状态键：(通道, 账号, 代码)——与买入探针同构，live/paper 天然隔离。
@@ -147,17 +153,19 @@ type sellKey struct {
 	code    string
 }
 
-// sellParams 裁决参数（默认值兜底后的一次性快照）。
+// sellParams 裁决参数（默认值兜底后的一次性快照）。maxExt=延持次数上限（0=无上限，负配置已在
+// sellParamsOf 折算；默认 2——owner 2026-10-12 裁决，000063 事故后不再"反复延持=按设计拿着"）。
 type sellParams struct {
 	sl, tp, pb, dm float64
 	exitMin        int
 	trailMin       int
 	bullMaxAge     time.Duration
+	maxExt         int
 }
 
 // sellParamsOf 从纪律配置解析卖出裁决参数（缺省与 DefaultDisciplineConfig 同口径）。
 func sellParamsOf(cfg config.DisciplineConfig) sellParams {
-	p := sellParams{sl: 6, tp: 15, pb: 6, dm: 2, exitMin: 15, trailMin: 45, bullMaxAge: 5 * time.Minute}
+	p := sellParams{sl: 6, tp: 15, pb: 6, dm: 2, exitMin: 15, trailMin: 45, bullMaxAge: 5 * time.Minute, maxExt: 2}
 	if cfg.StopLossPct > 0 {
 		p.sl = cfg.StopLossPct
 	}
@@ -178,6 +186,14 @@ func sellParamsOf(cfg config.DisciplineConfig) sellParams {
 	}
 	if cfg.SellSignalMaxAgeSec > 0 {
 		p.bullMaxAge = time.Duration(cfg.SellSignalMaxAgeSec) * time.Second
+	}
+	// 延持上限三态：>0=显式配置；0=出厂默认 2（存量纪律快照没有该键，必须兜默认而非旁路——
+	// 否则发版即静默恢复无限延持）；<0=显式恢复旧"无上限"行为（逃生阀）。
+	switch {
+	case cfg.MaxExtends > 0:
+		p.maxExt = cfg.MaxExtends
+	case cfg.MaxExtends < 0:
+		p.maxExt = 0
 	}
 	return p
 }
@@ -412,13 +428,23 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 		return st, &SellDisposal{Code: in.Code, Action: SellActionClose, Line: st.Line, PnlPct: pnl, At: now,
 			Reason: "深破窗结算，无条件全平离场" + evi}, ""
 	}
-	// 有新鲜做多信号 → 延持一个窗长（结算点沿固定栅格顺延一格；反复延持=按设计拿着）。
+	// 有新鲜做多信号 → 延持一个窗长（结算点沿固定栅格顺延一格）。
+	// 延持上限（owner 2026-10-12 裁决，MaxExtends 默认 2）：延持次数用尽后即使信号仍在，
+	// 也按无信号处置走下方处置开关（止损线→半平、止盈/移动止盈→全平）。000063 事故形态：
+	// 止损触线后战法 fac_138 持续喊买，旧口径一路延持 22 次（10:00→15:15）拿到收盘，
+	// 只靠 -12% 深破线兜底——上限正是给"延持止损"这个无界下行定价的第二重闸。
+	// maxExt<=0 = 无上限（逃生阀口径，正常配置到不了这里）。
+	capped := false
 	if bullLive {
-		st.Extends++
-		st.SettleStart = st.SettleStart.Add(time.Duration(st.WindowMin) * time.Minute)
-		return st, nil, fmt.Sprintf("窗结算仍有做多信号，延持第%d次（新结算点 %s）", st.Extends, st.SettleStart.Format("15:04:05")) + evi
+		if p.maxExt > 0 && st.Extends >= p.maxExt {
+			capped = true // 信号仍在但不再延持，落到下方按无信号处置
+		} else {
+			st.Extends++
+			st.SettleStart = st.SettleStart.Add(time.Duration(st.WindowMin) * time.Minute)
+			return st, nil, fmt.Sprintf("窗结算仍有做多信号，延持第%d次（新结算点 %s）", st.Extends, st.SettleStart.Format("15:04:05")) + evi
+		}
 	}
-	// 无信号 → 处置：止盈/移动止盈全平；止损首触未深破半平（与旧口径一致）。
+	// 无信号（或延持达上限视同无信号）→ 处置：止盈/移动止盈全平；止损首触未深破半平（与旧口径一致）。
 	st.Settled, st.Confirmed = true, true
 	d := &SellDisposal{Code: in.Code, Line: st.Line, PnlPct: pnl, At: now, Action: SellActionClose}
 	switch st.Line {
@@ -429,6 +455,10 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 		d.Reason = "止损窗结算无信号，首触止损未深破减半仓" + evi
 	default:
 		d.Reason = "止损窗结算无信号，止损离场" + evi
+	}
+	if capped {
+		// 处置理由必须可归因：审计侧要能分清"真没信号"与"信号在但延持额度用完"。
+		d.Reason = fmt.Sprintf("延持已达%d次上限，按无信号处置：", p.maxExt) + d.Reason
 	}
 	st.ConfirmedAction = d.Action // 固化动作，后续重放逐字一致
 	st.ConfirmedAt = now          // §0926E2E-11A：确认时刻落戳，重放新鲜度闸的判据

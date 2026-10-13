@@ -58,6 +58,9 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	// → daily-k-10d dump 自广州迁移起从未落盘成功（ths_daily 停摆至 0821 的根因）。
 	tmpPath := fs.String("tmp", defaultHithinkTmpPath(), "parquet 落盘临时路径")
 	batchSize := fs.Int("batch", 5000, "批量 upsert 行数")
+	// §POOL-STAMP 两道守卫的提级/逃生开关（默认值与理由见 poolSyncOpts 注释）。
+	allowShadow := fs.Bool("allow-shadow", false, "pools：影子日（与上一有数据日逐行签名相同）允许落库——仅在人工核实上游确有其事后使用")
+	enforceStamp := fs.Bool("enforce-stamp", false, "pools：回包时间戳与请求日不符即判失败——data.timestamp 语义现网取证后才提级")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("参数解析失败: %v", err)
 	}
@@ -72,7 +75,7 @@ func cmdHithinkSync(db *store.DB, args []string) {
 		return
 	}
 	if *kind == "pools" {
-		cmdHithinkSyncPools(client, db, *dateF)
+		cmdHithinkSyncPools(client, db, *dateF, poolSyncOpts{allowShadow: *allowShadow, stampEnforce: *enforceStamp})
 		return
 	}
 	if *kind == "anomaly" {
@@ -263,10 +266,28 @@ func prevStr(d string) string {
 
 // ── 盘口三池 + 连板天梯 + 异动（§P1 盘口升级）──
 
+// poolSyncOpts 盘口同步的两道守卫开关（§POOL-STAMP，2026-10-12）。
+//
+// 两个默认值不是随手取的，各自对应一条现网取证强度：
+//   - allowShadow=false：影子日（回包与上一有数据日逐行签名完全相同）**默认拦停**。
+//     依据是 2026-10-12 实测的那 72 行——写进 20261012 的池子与 20261009 逐字节相同，
+//     那一天的涨停池从未发生。这一型不需要新前提就能判。
+//   - stampEnforce=false：回包时间戳与请求日不符**默认只记读数、不拦停**。
+//     原因是池子回包里 data.timestamp 到底是"数据日"还是"请求时刻"尚未在现网取证
+//     （internal/data/hithink_flow.go 把另一族端点的 Timestamp 当数据时刻用，只是旁证）。
+//     把一个未取证的语义抬成拦停＝造一条永远判红的腿；先出读数，读数归因后再由 --enforce-stamp 提级。
+type poolSyncOpts struct {
+	allowShadow  bool // true＝影子日照常落库（人工确认为真数据后的逃生口）
+	stampEnforce bool // true＝回包日期与请求日不符直接判失败（现网取证后才提级）
+}
+
+// defaultPoolSyncOpts 盘后同步链的缺省守卫组合：影子日拦停、时间戳只记读数。
+func defaultPoolSyncOpts() poolSyncOpts { return poolSyncOpts{} }
+
 // cmdHithinkSyncPools 盘后三池+连板天梯入库。
 // dateFlag 为 yyyyMMdd；缺省=今日（API 缺省当日）。
-func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag string) {
-	n1, err := syncPoolsForDate(client, db, dateFlag)
+func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag string, opts poolSyncOpts) {
+	res, err := syncPoolsForDate(client, db, dateFlag, opts)
 	if err != nil {
 		log.Fatalf("盘口同步失败: %v", err)
 	}
@@ -293,14 +314,86 @@ func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag stri
 		log.Printf("[hithink] 连板天梯 %d 行", n4)
 	}
 	cnt, _ := db.LimitUpCountOnDate(tradeDate)
-	log.Printf("[hithink] 盘口同步完成(trade_date=%s)：涨停池 %d 行(当日家数 %d)", tradeDate, n1, cnt)
+	// deleted/written 两个数都要打：只有 written 就分不清"池子缩了"与"根本没动"
+	// （§POOL-SNAPSHOT：整日替换的两侧读数，同 PoolReplaceResult 的注释）。
+	log.Printf("[hithink] 盘口同步完成(trade_date=%s)：涨停池 deleted=%d written=%d(当日家数 %d)",
+		tradeDate, res.Deleted, res.Written, cnt)
 }
 
-// syncPoolsForDate 三池（涨停/跌停/炸板）单日同步核心：拉取+幂等 upsert，返回涨停池行数。
+// poolStampReadout 一次池子拉取的"日期同源"读数（三池各一行，字段名固定供门禁 grep 与现网归因）。
+type poolStampReadout struct {
+	Pool       string // limit_up|limit_down|break_pool
+	Requested  string // 请求的交易日 yyyyMMdd
+	PayloadMS  int64  // 上游 data.timestamp（毫秒；0＝未给出）
+	PayloadDay string // 时间戳换成的北京日 yyyyMMdd（""＝无从判定）
+	Match      string // yes|no|unknown（unknown＝时间戳缺失或越界，不许当成 yes）
+	Rows       int    // 本次回包行数
+}
+
+// newPoolStampReadout 从池子回包构造读数。Match 的三态是判据本体：
+// unknown 与 no 的含义相反——unknown 是"这条证据不存在"，no 是"这条证据说不是同一天"。
+// 把 unknown 折进 no 会让上游一改响应形状就集体判红。
+func newPoolStampReadout(pool, requested string, p data.HithinkPool) poolStampReadout {
+	r := poolStampReadout{Pool: pool, Requested: requested, PayloadMS: p.TimestampMs,
+		PayloadDay: data.PoolDayCompact(p.TimestampMs), Rows: len(p.Items)}
+	switch {
+	case r.PayloadDay == "":
+		r.Match = "unknown"
+	case r.PayloadDay == requested:
+		r.Match = "yes"
+	default:
+		r.Match = "no"
+	}
+	return r
+}
+
+// String 一行的固定形状：键=值 空格分隔，现网日志与门禁都按这条抓。
+func (r poolStampReadout) String() string {
+	return fmt.Sprintf("pool=%s requested=%s payload_ms=%d payload_day=%s match=%s rows=%d",
+		r.Pool, r.Requested, r.PayloadMS, dayOr(r.PayloadDay), r.Match, r.Rows)
+}
+
+// dayOr 空日期在读数里打成 "<none>"，不能让 `payload_day=` 后面空着——
+// 空值会被 grep 成"这行没有这个键"，等于把读数藏起来。
+func dayOr(s string) string {
+	if s == "" {
+		return "<none>"
+	}
+	return s
+}
+
+// limitUpRowsFromItems 把涨停池回包折成待落库行集——**构造口径的唯一定义处**：
+// 同步链与只读探针 `pool-probe` 都走这里，否则探针验的行集与真要写的行集不同形，影子日判据
+// 在探针里"通过"到了现网就不算数（§深验证审计：判据必须跑在交付同一条代码上）。
+// English: the single item→row builder shared by the sync chain and the read-only pool probe.
+func limitUpRowsFromItems(items []data.HithinkLimitUpItem, tradeDate string) []store.ThsLimitUpRow {
+	rows := make([]store.ThsLimitUpRow, 0, len(items))
+	for _, it := range items {
+		rows = append(rows, store.ThsLimitUpRow{
+			TradeDate: tradeDate, TsCode: it.ThsCode, Name: it.Name,
+			IsST: it.IsST, IsNew: it.IsNew, Price: it.LastPrice,
+			PctChg: it.PriceChangeRatioPct, FirstSealTime: it.LimitUpTime,
+			ContinueCnt: it.ContinueDayCnt, ContinueText: it.ContinueDayText,
+			LimitReason: deref(it.LimitUpReason), SealMoney: it.SealMoney,
+			MaxSealMoney: it.MaxSealMoney,
+		})
+	}
+	return rows
+}
+
+// syncPoolsForDate 三池（涨停/跌停/炸板）单日同步核心：拉取 + 日期同源校验 + 整日快照替换。
+// 返回涨停池的替换读数（deleted/written），供调用方打总结。
 // 错误一律上抛（供 §ENH-A ths-backfill 逐日循环容错续跑；pools 子命令外层转 Fatal）。
-// English: per-date three-pool sync core returning an error so the backfill loop can
-// skip/retry days instead of aborting.
-func syncPoolsForDate(client *data.HithinkClient, db *store.DB, dateFlag string) (int64, error) {
+//
+// §POOL-STAMP／§POOL-SNAPSHOT（2026-10-12）三处口径变化：
+//  1. 落库从 INSERT OR REPLACE 的"只增不删"改成整日替换——旧写法让已出池的股票留在同一天，
+//     涨停家数/最高连板/炸板率单向漂移，而第二次同步仍是 rc=0；
+//  2. 空回包、缺 trade_date、跨多个交易日三种行集在 DELETE **之前**返回错误，库一个字节不动
+//     （§降级链会兜死分支：失败不许伪装成"产物为空"）；
+//  3. 每池打一行日期同源读数，涨停池另加影子日判据（与库内上一有数据日逐行签名比对）。
+//
+// English: per-date three-pool sync — stamp readout, phantom-day guard, whole-day snapshot replace.
+func syncPoolsForDate(client *data.HithinkClient, db *store.DB, dateFlag string, opts poolSyncOpts) (store.PoolReplaceResult, error) {
 	tradeDate := dateFlag
 	if tradeDate == "" {
 		tradeDate = cntime.DayCompactOf(time.Now())
@@ -310,53 +403,110 @@ func syncPoolsForDate(client *data.HithinkClient, db *store.DB, dateFlag string)
 		dateMs = t.UnixMilli()
 	}
 
-	up, err := client.LimitUpPool(dateMs)
+	up, err := client.LimitUpPoolStamped(dateMs)
 	if err != nil {
-		return 0, fmt.Errorf("涨停池拉取失败(%s): %w", tradeDate, err)
+		return store.PoolReplaceResult{}, fmt.Errorf("涨停池拉取失败(%s): %w", tradeDate, err)
 	}
-	luRows := make([]store.ThsLimitUpRow, 0, len(up))
-	for _, it := range up {
-		luRows = append(luRows, store.ThsLimitUpRow{
-			TradeDate: tradeDate, TsCode: it.ThsCode, Name: it.Name,
-			IsST: it.IsST, IsNew: it.IsNew, Price: it.LastPrice,
-			PctChg: it.PriceChangeRatioPct, FirstSealTime: it.LimitUpTime,
-			ContinueCnt: it.ContinueDayCnt, ContinueText: it.ContinueDayText,
-			LimitReason: deref(it.LimitUpReason), SealMoney: it.SealMoney,
-			MaxSealMoney: it.MaxSealMoney,
-		})
+	ro := newPoolStampReadout("limit_up", tradeDate, up)
+	log.Printf("[hithink] %s", ro.String())
+	if ro.Match == "no" && opts.stampEnforce {
+		return store.PoolReplaceResult{},
+			fmt.Errorf("涨停池日期同源判红(%s)：回包时间戳落在 %s 而非请求日 ⇒ 上游给的不是这一天的数据（--enforce-stamp）",
+				tradeDate, ro.PayloadDay)
 	}
-	n1, err := db.UpsertThsLimitUps(luRows)
+	luRows := limitUpRowsFromItems(up.Items, tradeDate)
+	// 影子日判据只在"有上一日可比"时成立；库内此前无数据时 identical 恒 false＝无从判定，
+	// 这条不是通过，但也没有别的证据可用——由下面的 payload_day 读数继续追。
+	shadowOf, same, serr := db.LimitUpShadowOf(tradeDate, luRows)
+	if serr != nil {
+		return store.PoolReplaceResult{}, fmt.Errorf("涨停池影子日判据读取失败(%s): %w", tradeDate, serr)
+	}
+	if same {
+		log.Printf("[hithink] pool=limit_up requested=%s shadow_of=%s shadow=same rows=%d ⇒ 幻影日（这一包与上一有数据日逐行签名完全相同）",
+			tradeDate, shadowOf, len(luRows))
+		if !opts.allowShadow {
+			return store.PoolReplaceResult{},
+				fmt.Errorf("涨停池幻影日拦停(%s)：整包与 %s 的已落库行集逐行签名相同，落库等于把没发生过的交易日写成真数据；"+
+					"人工核实上游确有其事可加 --allow-shadow 强落（shadow_of=%s）", tradeDate, shadowOf, shadowOf)
+		}
+		log.Printf("[hithink] pool=limit_up --allow-shadow 生效：影子日照常落库(shadow_of=%s)", shadowOf)
+	}
+	res, err := db.ReplaceThsLimitUps(luRows)
 	if err != nil {
-		return n1, fmt.Errorf("涨停池写入失败(%s): %w", tradeDate, err)
+		return res, fmt.Errorf("涨停池写入失败(%s): %w", tradeDate, err)
+	}
+	log.Printf("[hithink] pool=limit_up replaced trade_date=%s deleted=%d written=%d", res.TradeDate, res.Deleted, res.Written)
+	if res.Deleted > res.Written {
+		// 收缩读数只记不拦：整日替换的语义就是"这一天的池子以本次回包为准"，
+		// 而"少了一半"既可能是上游留存截断（--force 重拉历史日会撞上），也可能是当日真有人出池。
+		// 判红需要的是能把这两种成因分开的那一行 deleted/written，不是第二个阈值。
+		log.Printf("[hithink][WARN] pool=limit_up 当日池子收缩 trade_date=%s deleted=%d written=%d"+
+			" ⇒ 情绪链的家数/最高连板会跟着变小：重拉历史日请核对上游是否仍留全该日，人工同步今日属正常",
+			res.TradeDate, res.Deleted, res.Written)
 	}
 
-	dn, err := client.LimitDownPool(dateMs)
+	dn, err := client.LimitDownPoolStamped(dateMs)
 	if err != nil {
-		return n1, fmt.Errorf("跌停池拉取失败(%s): %w", tradeDate, err)
+		return res, fmt.Errorf("跌停池拉取失败(%s): %w", tradeDate, err)
 	}
-	dnMap := make(map[string]store.ThsPoolSimple, len(dn))
-	for _, it := range dn {
+	log.Printf("[hithink] %s", newPoolStampReadout("limit_down", tradeDate, dn).String())
+	dnMap := make(map[string]store.ThsPoolSimple, len(dn.Items))
+	for _, it := range dn.Items {
 		dnMap[it.ThsCode] = store.ThsPoolSimple{Name: it.Name, Price: it.LastPrice,
 			PctChg: it.PriceChangeRatioPct, TurnoverRatioPct: it.TurnoverRatioPct}
 	}
-	if _, err := db.UpsertThsSimplePool("ths_limit_down_daily", tradeDate, dnMap); err != nil {
-		return n1, fmt.Errorf("跌停池写入失败(%s): %w", tradeDate, err)
+	// 两侧读数（deleted/written）由 helper 自己打：空回包那一支没有 deleted/written 可报，
+	// 把日志留在调用方会让「跳过了」与「替换了」共用一行格式（旧形态，且只能靠 _ = res 消警告）。
+	if _, err := replaceOrSkipSimplePool(db, "ths_limit_down_daily", "limit_down", tradeDate, dnMap); err != nil {
+		return res, fmt.Errorf("跌停池写入失败(%s): %w", tradeDate, err)
 	}
 
-	bk, err := client.LimitBreakPool(dateMs)
+	bk, err := client.LimitBreakPoolStamped(dateMs)
 	if err != nil {
-		return n1, fmt.Errorf("炸板池拉取失败(%s): %w", tradeDate, err)
+		return res, fmt.Errorf("炸板池拉取失败(%s): %w", tradeDate, err)
 	}
-	bkMap := make(map[string]store.ThsPoolSimple, len(bk))
-	for _, it := range bk {
+	log.Printf("[hithink] %s", newPoolStampReadout("break_pool", tradeDate, bk).String())
+	bkMap := make(map[string]store.ThsPoolSimple, len(bk.Items))
+	for _, it := range bk.Items {
 		bkMap[it.ThsCode] = store.ThsPoolSimple{Name: it.Name, Price: it.LastPrice,
 			PctChg: it.PriceChangeRatioPct, OpenTimes: it.OpenTimes,
 			TurnoverRatioPct: it.TurnoverRatioPct, Turnover: it.Turnover}
 	}
-	if _, err := db.UpsertThsSimplePool("ths_break_pool_daily", tradeDate, bkMap); err != nil {
-		return n1, fmt.Errorf("炸板池写入失败(%s): %w", tradeDate, err)
+	if _, err := replaceOrSkipSimplePool(db, "ths_break_pool_daily", "break_pool", tradeDate, bkMap); err != nil {
+		return res, fmt.Errorf("炸板池写入失败(%s): %w", tradeDate, err)
 	}
-	return n1, nil
+	return res, nil
+}
+
+// replaceOrSkipSimplePool 跌停/炸板池的整日替换入口，空回包走"跳过替换 + WARN 读数"而不是报错。
+//
+// 两侧理由都要写下来：
+//   - 不删：空回包既可能是"今天真的一只都没有"，也可能是上游这次没给（配额/降级/半截响应）。
+//     拿后者把一整天的跌停或炸板删空，比留下旧数据更坏——§降级链会兜死分支的同族。
+//   - 不判失败：跌停家数为 0、炸板家数为 0 在强/弱市里都是**合法形态**（不同于涨停池：
+//     A 股不存在零涨停的交易日，涨停池的空回包仍由 ReplaceThsLimitUps 硬拦停）。
+//     把合法形态报成失败会让夜间腿与保活天天踩红线，红线一多就被忽略——那才是真的风险。
+//
+// 留下的可见性：调用前的 pool=… rows=0 读数 + 这里一行 skipped_replace WARN，
+// 两者都在日志里，人能看到"这一天我没敢删"。
+// English: whole-day replace for limit-down/break pools; an empty payload skips the delete with a
+// WARN instead of failing the sync (a zero-count day is legitimate for these two pools).
+func replaceOrSkipSimplePool(db *store.DB, table, name, tradeDate string,
+	rows map[string]store.ThsPoolSimple) (store.PoolReplaceResult, error) {
+	if len(rows) == 0 {
+		log.Printf("[hithink][WARN] pool=%s empty_payload=skipped_replace trade_date=%s "+
+			"⇒ 未落库也未删除该日旧行：分不清「今日真为零」与「上游这次没给数据」，先保数据。"+
+			"连续多日出现这行才需要人工复核（单日出现属正常）", name, tradeDate)
+		return store.PoolReplaceResult{TradeDate: tradeDate}, nil
+	}
+	res, err := db.ReplaceThsSimplePool(table, tradeDate, rows)
+	// 整日替换的两条读数只在成功时打印：失败时 deleted/written 是半截事务的中间量，
+	// 打上会被当成"这一天只剩这些"（§备份件要回验的同族：失败产物不当验收面）。
+	if err == nil {
+		log.Printf("[hithink] pool=%s replaced trade_date=%s deleted=%d written=%d",
+			name, res.TradeDate, res.Deleted, res.Written)
+	}
+	return res, err
 }
 
 // cmdHithinkSyncAnomaly 当日全市场异动原因入库（D1 归因辅证 + 消息推送数据源）。

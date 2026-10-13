@@ -82,6 +82,11 @@ async function mountApp(seq) {
   await flush() // 走完 checkAuth → startPolling → 首轮 refreshStatus
 }
 
+// §DET-TIME-2（2026-10-13，与 auth_expired_h7.test.jsx 同一条锁）：冷转换成本付在收集阶段，
+// 不付在某个用例的 60 秒预算里（详见那个文件里的同段注释：邻居负载下 `import('../App.jsx')`
+// 顶穿 60 秒 ⇒ 首条 Test timed out，余下三条全是残留挂载体的级联红）。预热不注册 mock、不 render。
+await import('../App.jsx')
+
 describe('§0926E2E-13 连续失败才转离线（去抖 + 灰条 + 计数清零）', () => {
   beforeEach(() => {
     localStorage.clear()

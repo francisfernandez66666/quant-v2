@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // HithinkBaseURL 同花顺金融数据服务地址。
@@ -405,25 +407,81 @@ type HithinkPoolPage struct {
 	Item []HithinkLimitUpItem `json:"item"` // 池内股票条目
 }
 
+// HithinkPool 三池取数结果：条目 + 上游给出的数据时间戳（毫秒；0=上游未给出）。
+// §POOL-STAMP（2026-10-12）：时间戳是"这批池子到底是哪一天的"唯一随包带回来的线索。
+// 现网实录：按 date_ms 请求 20261012（当天池子还不存在）时，上游把缺失日兜底成最近一个有数据的
+// 交易日，回包条目与 20261009 逐行同值——落库侧按"请求日"盖 trade_date，就造出一个库里从没发生过的
+// 幻影涨停池日（72 行，10-12 07:45 人工删除）。此前 fetchPool 把 out.Timestamp 解析出来又丢掉，
+// 判据只能读到"请求了哪天"，永远看不到"拿回来的是哪天"。
+// English: pool payload plus the upstream data timestamp — the only in-band evidence of which
+// trading day the rows actually belong to (the phantom-day incident of 2026-10-12).
+type HithinkPool struct {
+	Items       []HithinkLimitUpItem
+	TimestampMs int64 // 上游 data.timestamp（毫秒）；0=未给出（判据必须按"不知道"处理，不许当今天）
+}
+
+// PoolDayCompact 把池子回包的时间戳换成北京时间口径的 YYYYMMDD；0 或越界时返回 ""（=无从判定）。
+// 返回空串是本批的硬口径：缺读数不能冒充任何一天，否则"不知道"在读数面上长得像"没问题"。
+// English: converts the payload timestamp to a Beijing YYYYMMDD day key; "" when absent.
+func PoolDayCompact(ms int64) string {
+	if ms <= 0 {
+		return ""
+	}
+	// 合理区间自证：毫秒时间戳应落在 2001-01-01 之后、2100 年之前；越界＝上游给的不是毫秒时间戳
+	// （例如给了行内序号），按"不知道"处理而不是硬算出一个荒谬日期去污染判据。
+	const minMs, maxMs int64 = 978307200000, 4102444800000
+	if ms < minMs || ms > maxMs {
+		return ""
+	}
+	return time.UnixMilli(ms).In(cstime()).Format("20060102")
+}
+
+// cstime 北京时区（cntime 已加载；单点取出，供本包时间戳→日历日换算复用）。
+func cstime() *time.Location { return cntime.Loc }
+
 // LimitUpPool 涨停股票池（dateMs=0 取当日；自动翻页取尽）。
 // 文档：GET /api/a-share/special-data/limit-up-pool
+// §POOL-STAMP：需要"回包到底是哪天"的调用方走 LimitUpPoolStamped；这里保持既有签名不破消费面。
 func (c *HithinkClient) LimitUpPool(dateMs int64) ([]HithinkLimitUpItem, error) {
+	pool, err := c.LimitUpPoolStamped(dateMs)
+	return pool.Items, err
+}
+
+// LimitUpPoolStamped 涨停池 + 上游数据时间戳（幻影日判据的唯一在包证据）。
+func (c *HithinkClient) LimitUpPoolStamped(dateMs int64) (HithinkPool, error) {
 	return c.fetchPool("limit-up-pool", dateMs)
 }
 
 // LimitDownPool 跌停股票池。
 func (c *HithinkClient) LimitDownPool(dateMs int64) ([]HithinkLimitUpItem, error) {
+	pool, err := c.LimitDownPoolStamped(dateMs)
+	return pool.Items, err
+}
+
+// LimitDownPoolStamped 跌停池 + 上游数据时间戳。
+func (c *HithinkClient) LimitDownPoolStamped(dateMs int64) (HithinkPool, error) {
 	return c.fetchPool("limit-down-pool", dateMs)
 }
 
 // LimitBreakPool 炸板股票池。
 func (c *HithinkClient) LimitBreakPool(dateMs int64) ([]HithinkLimitUpItem, error) {
+	pool, err := c.LimitBreakPoolStamped(dateMs)
+	return pool.Items, err
+}
+
+// LimitBreakPoolStamped 炸板池 + 上游数据时间戳。
+func (c *HithinkClient) LimitBreakPoolStamped(dateMs int64) (HithinkPool, error) {
 	return c.fetchPool("limit-break-pool", dateMs)
 }
 
-// fetchPool 三池通用翻页拉取。
-func (c *HithinkClient) fetchPool(name string, dateMs int64) ([]HithinkLimitUpItem, error) {
+// fetchPool 三池通用翻页拉取（把每页回包的 data.timestamp 收成首见值随条目一并上抛）。
+// 时间戳口径：取**首个非零**值并记在包上——翻页只改 page/size 不改 date_ms，各页本该同一天；
+// 若翻页之间出现两个不同日期（上游换日/换批次），按"不可信"返回 0，让上层落到"不知道"分支。
+// English: paged pool fetch that also surfaces the in-envelope data timestamp; conflicting page
+// timestamps collapse to 0 so callers treat the payload day as unknown rather than pick one.
+func (c *HithinkClient) fetchPool(name string, dateMs int64) (HithinkPool, error) {
 	var all []HithinkLimitUpItem
+	stamp := int64(0)
 	for page := 1; ; page++ {
 		p := url.Values{}
 		p.Set("page", strconv.Itoa(page))
@@ -433,11 +491,18 @@ func (c *HithinkClient) fetchPool(name string, dateMs int64) ([]HithinkLimitUpIt
 		}
 		var out HithinkPoolPage
 		if err := c.get("/api/a-share/special-data/"+name, p, &out); err != nil {
-			return nil, err
+			return HithinkPool{Items: all, TimestampMs: stamp}, err
+		}
+		if out.Timestamp > 0 {
+			if stamp != 0 && stamp != out.Timestamp {
+				stamp = 0 // 页间不一致＝批次不可信，按"不知道"上交（不许挑第一页）
+			} else if stamp == 0 {
+				stamp = out.Timestamp
+			}
 		}
 		all = append(all, out.Item...)
 		if page >= out.Pagination.Pages || len(out.Item) == 0 {
-			return all, nil
+			return HithinkPool{Items: all, TimestampMs: stamp}, nil
 		}
 	}
 }

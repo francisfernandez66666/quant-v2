@@ -10,6 +10,7 @@
 package data
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -169,4 +170,14 @@ func TestTradingCalendarHealth(t *testing.T) {
 	if h := TradingCalendarHealth(); h == "" {
 		t.Error("带窗口健康读数不得为空")
 	}
+	// §CAL-COVER-GO 双态自证：同一个读数必须既能报"覆盖到今日"（不提停更），也能在
+	// 末行停在昨天时把停更写出来——缺前者＝判据恒红，缺后者＝这条腿恒盲（白加）。
+	if h := TradingCalendarHealth(); strings.Contains(h, "日历停更") {
+		t.Errorf("窗口覆盖到年底却报停更（读数把在位态判成盲态）: %s", h)
+	}
+	setCalendarWindow("20250101", "20250930") // 人为把末行按在"昨天之前"
+	if h := TradingCalendarHealth(); !strings.Contains(h, "覆盖未到今日") {
+		t.Errorf("窗口末行不覆盖今日时健康读数必须点明停更（否则 fail-open 又是静默的）: %s", h)
+	}
+	setCalendarWindow("20260101", "20261231") // 复位，避免影响同包后续用例
 }

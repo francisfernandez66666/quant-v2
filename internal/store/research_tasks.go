@@ -91,11 +91,15 @@ type ResearchTask struct {
 	FailStreak int    `json:"fail_streak"`
 	// RequeueSeq §失败重排队尾键：失败重入队时取全局 max+1，出队按它 ASC 沉底
 	// （秒级 updated_at 在同秒内无法区分先后，专用单调序列才可靠）。
-	RequeueSeq int64  `json:"requeue_seq,omitempty"` // 重入队序号
-	CreatedAt  string `json:"created_at"`            // 创建时间
-	StartedAt  string `json:"started_at,omitempty"`  // 开始时间
-	FinishedAt string `json:"finished_at,omitempty"` // 完成时间
-	UpdatedAt  string `json:"updated_at"`            // 更新时间
+	RequeueSeq int64 `json:"requeue_seq,omitempty"` // 重入队序号
+	// RequeueTotal §QUEUE-REQUEUE（2026-10-12）累计回队次数（失败回队 + 抢占续跑都计入，
+	// 与失败原因无关）；达 TotalRequeueLimit 即挂起。人工 Requeue 清零。
+	// English: cause-independent lifetime requeue count driving the total breaker.
+	RequeueTotal int    `json:"requeue_total"`
+	CreatedAt    string `json:"created_at"`            // 创建时间
+	StartedAt    string `json:"started_at,omitempty"`  // 开始时间
+	FinishedAt   string `json:"finished_at,omitempty"` // 完成时间
+	UpdatedAt    string `json:"updated_at"`            // 更新时间
 }
 
 // nowStr 当前本地时间串（统一格式，与既有表一致）。
@@ -221,6 +225,9 @@ func (d *DB) UpdateTaskRunState(id int64, status, progress string, resultNum flo
 		status, progress, resultNum, resultText, errMsg, fin, fin, now, id)
 	// §M14 成功/取消终结即打断「连败」链条：清零同因连败计数（fail_fp/fail_streak），
 	// 避免陈旧连败与新周期的偶发同因失败拼接误触熔断。
+	// §QUEUE-REQUEUE：这里**故意不清 requeue_total**——累计闸要防的是"同一个任务在队列里
+	// 无限转圈"，而中间偶有一次成功恰恰是空烧的佐证（跑成了还继续重排 19 次），不是免罪；
+	// 清账只留给人工 RequeueTask。夜间读数只数活跃行，已终结行的旧计数不会把判据染红。
 	if status == TaskDone || status == TaskCancelled {
 		if _, e := d.db.Exec(`UPDATE research_tasks SET fail_fp='', fail_streak=0 WHERE id=?`, id); e != nil {
 			return e
@@ -251,14 +258,17 @@ func (d *DB) ConsumeTaskControl(id int64) (string, error) {
 	return c, nil
 }
 
-// RequeueTask 把 preempted/paused 任务放回 queued（worker 抢占后续跑入口）。
+// RequeueTask 把 preempted/paused 任务放回 queued（**人工**复活入口，owner 排查后调用）。
 // §M14 同因连败熔断挂起的 failed_needs_attention 也经本入口人工复活：复活即清零连败计数
-// （新一轮失败重新计数，不给挂起前旧账“续命”）。
-// English: puts a preempted/paused task back to queued; since M14 also revives a circuit-broken
-// failed_needs_attention task on manual requeue, resetting the same-cause streak.
+// （新一轮失败重新计数，不给挂起前旧账"续命"）。
+// §QUEUE-REQUEUE（2026-10-12）：本入口同时清零 requeue_total——人工介入就是"这圈空转到此为止，
+// 从本次重新起算"；不清零的话 owner 复活一个已经转过 20 圈的任务，它一跑就再次触闸挂起。
+// 注意：worker 的抢占续跑**不走本函数**（改走 RequeueAfterPreemption），否则连败账会被重启抹掉。
+// English: manual revive entry — clears both the same-cause streak and the lifetime requeue total;
+// the worker's preemption path no longer uses this (see RequeueAfterPreemption).
 func (d *DB) RequeueTask(id int64) error {
 	_, err := d.db.Exec(`UPDATE research_tasks SET status='queued', updated_at=?,
-		fail_fp='', fail_streak=0, finished_at=''
+		fail_fp='', fail_streak=0, requeue_total=0, finished_at=''
 		WHERE id=? AND status IN ('preempted','paused','failed_needs_attention')`, nowStr(), id)
 	return err
 }
@@ -271,6 +281,47 @@ func (d *DB) RequeueTask(id int64) error {
 // English: M14 same-cause consecutive-failure breaker threshold (replaces the old mixed-reason
 // cap of 5). Different fingerprints always restart at 1; the identical one strikes out at 10.
 const SameReasonFailLimit = 10
+
+// TotalRequeueLimit §QUEUE-REQUEUE（2026-10-12）累计回队上限：同一任务不管因为什么回队
+// （同因失败、异因失败、抢占续跑），累计回队次数达该值即挂起 failed_needs_attention。
+//
+// 为什么同因熔断挡不住现网那一晚：10-11 实录里同一个任务被 8 小时单步超时送回队尾 33 次，
+// 而 §M14 的连败计数有两条合法的"漏计"通道——
+//   - 换因即从 1 重计：超时文案与「运行失败(exit status…)：最后一行输出」交替出现时，
+//     指纹每轮都在变，streak 永远到不了 10（现网 33 次正是这个形态）；
+//   - 抢占路径 RequeueTask 把 fail_streak 清零：worker 重启/让位一次，连败账就被抹一次。
+//
+// 取向＝**再加一条与原因无关的总量闸**，而不是把同因阈值调小或给抢占单独开口子：
+// 真缺数据、真跑不完的任务，无论失败文案怎么变，都不该在队列里转三十圈。
+// 20 次的来由：夜间链一轮跑 5~8 步，一步最多重试两三次即应人工介入；20 次足够容忍
+// 一整周的瞬态抖动（网络/资源），又远小于现网那 33 次的空烧规模。
+// English: cause-independent lifetime requeue cap — the same-cause streak could be reset by
+// mixed fingerprints or by the preemption requeue path, so a task could churn 33 times.
+const TotalRequeueLimit = 20
+
+// requeueParkError 挂起终态的 error 列文案：把**触闸的那一条**写在最前面，
+// 消费方（worker 告警、夜间读数、人工排查）都按这个前缀分成因，不需要再猜。
+// 同因熔断在前、总量闸在后：同因说明"确定性失败已经很清楚"，比"转了很多圈"更可诊断。
+func requeueParkError(streak, total int, errMsg string) string {
+	if streak >= SameReasonFailLimit {
+		return "同因连败熔断(" + itoa(SameReasonFailLimit) + "连败)：" + errMsg
+	}
+	return "累计回队熔断(" + itoa(total) + "次回队，原因每次不同未被同因闸捕获)：" + errMsg
+}
+
+// RequeueTripReasonOf 从 error 列文案回读触闸成因（worker 侧告警文案用，导出给调度层）。
+// 只认这两个前缀，其余一律 "requeue"——不把"猜不出"写成"同因"（读数不编造）。
+// English: maps the parked row's error text back to which breaker tripped.
+func RequeueTripReasonOf(errText string) string {
+	switch {
+	case strings.HasPrefix(errText, "同因连败熔断"):
+		return "same_cause"
+	case strings.HasPrefix(errText, "累计回队熔断"):
+		return "total_requeue"
+	default:
+		return "requeue"
+	}
+}
 
 // errorFingerprint §M14 失败原因指纹化：去首尾空白取前 200 字符（按 rune 截，
 // 中文报错不得切断半个字）。同指纹≈同因。
@@ -288,18 +339,22 @@ func errorFingerprint(msg string) string {
 // §M14 同因连败熔断：以 error 前 200 字符为指纹与上一次失败指纹比对——相同则 fail_streak+1，
 // 不同则从 1 重计（异因不误伤）；连败达 SameReasonFailLimit 次不再回队，置
 // failed_needs_attention 挂起终态，等 owner 人工 Requeue 复活。
+// §QUEUE-REQUEUE（2026-10-12）另加与原因无关的累计闸：每次回队都记 requeue_total，
+// 达 TotalRequeueLimit 即同挂 failed_needs_attention（error 前缀写清是哪一条闸触的）。
 // English: re-enqueues a failed task at the queue tail. M14: the error fingerprint drives a
-// same-cause streak; N identical consecutive failures park the task as failed_needs_attention
-// instead of requeueing, while mixed-reason failures keep the unlimited-retry design.
+// same-cause streak; QUEUE-REQUEUE adds a cause-independent lifetime requeue counter.
 func (d *DB) RequeueFailedTask(id int64, errMsg string) error {
-	if len(errMsg) > 500 {
-		errMsg = errMsg[:500]
+	// 按 rune 截而不是字节截：错误行是中文，errMsg[:500] 会把最后一个字劈成非法 UTF-8
+	// 再落库（与 errorFingerprint 的截法保持同一口径）。
+	if r := []rune(errMsg); len(r) > 500 {
+		errMsg = string(r[:500])
 	}
 	fp := errorFingerprint(errMsg)
-	var cur, streak int
+	var cur, streak, total int
 	var lastFP string
-	if err := d.db.QueryRow(`SELECT COALESCE(retry_count,0), COALESCE(fail_streak,0), COALESCE(fail_fp,'')
-		FROM research_tasks WHERE id=?`, id).Scan(&cur, &streak, &lastFP); err != nil {
+	if err := d.db.QueryRow(`SELECT COALESCE(retry_count,0), COALESCE(fail_streak,0),
+			COALESCE(requeue_total,0), COALESCE(fail_fp,'')
+		FROM research_tasks WHERE id=?`, id).Scan(&cur, &streak, &total, &lastFP); err != nil {
 		return err
 	}
 	cur++
@@ -308,21 +363,71 @@ func (d *DB) RequeueFailedTask(id int64, errMsg string) error {
 	} else {
 		streak = 1 // §M14 换因即重新起算：只有「连续同因」才会烧穿熔断线
 	}
-	// §M14 同因连败达阈值：挂起终态（不出队、不回队），error 列留熔断标记+原因。
-	if streak >= SameReasonFailLimit {
+	total++ // §QUEUE-REQUEUE 累计回队：不看原因、不看是否同因，回队一次记一次
+	// §M14 同因连败 / §QUEUE-REQUEUE 累计回队达阈值：挂起终态（不出队、不回队），
+	// error 列留「哪条闸触的 + 最后一次原因」。
+	if streak >= SameReasonFailLimit || total >= TotalRequeueLimit {
 		_, err := d.db.Exec(`UPDATE research_tasks SET status='`+TaskNeedsAttention+`',
-			retry_count=?, fail_fp=?, fail_streak=?, progress='',
+			retry_count=?, fail_fp=?, fail_streak=?, requeue_total=?, progress='',
 			error=?, finished_at=?, updated_at=? WHERE id=?`,
-			cur, fp, streak,
-			"同因连败熔断("+itoa(SameReasonFailLimit)+"连败)："+errMsg, nowStr(), nowStr(), id)
+			cur, fp, streak, total,
+			requeueParkError(streak, total, errMsg), nowStr(), nowStr(), id)
 		return err
 	}
 	_, err := d.db.Exec(`UPDATE research_tasks SET status='queued', retry_count=?,
-		fail_fp=?, fail_streak=?, progress='', error=?,
+		fail_fp=?, fail_streak=?, requeue_total=?, progress='', error=?,
 		finished_at='', updated_at=?,
 		requeue_seq=(SELECT COALESCE(MAX(requeue_seq),0)+1 FROM research_tasks)
-		WHERE id=?`, cur, fp, streak, errMsg, nowStr(), id)
+		WHERE id=?`, cur, fp, streak, total, errMsg, nowStr(), id)
 	return err
+}
+
+// RequeueAfterPreemption §QUEUE-REQUEUE（2026-10-12）抢占/重启续跑的回队入口。
+//
+// 与人工复活入口 RequeueTask 分开，是因为这两条链的语义正好相反：
+//   - 人工复活：owner 已经排查过，必须把连败账（fail_fp/fail_streak）和累计账（requeue_total）
+//     一起清零，否则旧账会让刚修好的任务一跑就挂起；
+//   - 抢占续跑：只是"这台机器让位/重启了"，**不代表这次跑成功过**，既不能清零连败账
+//     （旧形态 RequeueTask 的清零正是 33 次回队循环把熔断打漏的第二条通道），
+//     也不能不设上限（每次重启都白跑 8 小时）。
+//
+// 累计账达 TotalRequeueLimit 时同样挂起为 failed_needs_attention，并落 error 文案——
+// 抢占型任务反复跑不完同样是"需要人看"，不是可以无限续跑的常态。
+// English: preemption requeue — does NOT clear the failure streak (that reset was one of the two
+// ways the same-cause breaker got bypassed), only sinks the task to the tail and counts it against
+// the cause-independent lifetime requeue cap.
+func (d *DB) RequeueAfterPreemption(id int64) error {
+	var total int
+	var lastErr string
+	if err := d.db.QueryRow(`SELECT COALESCE(requeue_total,0), COALESCE(error,'')
+		FROM research_tasks WHERE id=?`, id).Scan(&total, &lastErr); err != nil {
+		return err
+	}
+	total++
+	if total >= TotalRequeueLimit {
+		// 抢占型反复跑不完没有"最后一次失败原因"可写（error 列留的是上次记录），
+		// 所以文案里显式带上"含抢占续跑"与旧 error，读的人不会以为这条是崩溃挂起。
+		_, err := d.db.Exec(`UPDATE research_tasks SET status='`+TaskNeedsAttention+`',
+			requeue_total=?, progress='', finished_at=?, updated_at=?, error=? WHERE id=?`,
+			total, nowStr(), nowStr(),
+			"累计回队熔断("+itoa(TotalRequeueLimit)+"次回队，含抢占/重启续跑，同因闸未捕获)：最近一次记录＝"+lastErr, id)
+		return err
+	}
+	// 占位符与实参必须逐一对应（这里曾是 3 个 ? 配 4 个参数＝整条 UPDATE 直接失败，
+	// 表现为"抢占回队什么都没改"）：requeue_total / updated_at / id。
+	res, err := d.db.Exec(`UPDATE research_tasks SET status='queued', requeue_total=?,
+		finished_at='', updated_at=?,
+		requeue_seq=(SELECT COALESCE(MAX(requeue_seq),0)+1 FROM research_tasks)
+		WHERE id=? AND status IN ('preempted','paused')`, total, nowStr(), id)
+	if err != nil {
+		return err
+	}
+	// 0 行必须现形：状态闸（只认 preempted/paused）没命中＝调用顺序错了或任务已被别人改写，
+	// 静默返回会让累计闸一次也没计上、任务永远转圈而日志全绿（本仓锤过的静默失败族）。
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("抢占回队未生效(id=%d)：该行当前状态不是 preempted/paused，累计计数与挂起都没落上", id)
+	}
+	return nil
 }
 
 // itoa 小工具：避免为单一常量引入 strconv（重试上限文案用）。
@@ -392,6 +497,25 @@ func (d *DB) ChainTaskSeqs(chainDay string) (map[int]int, error) {
 	return out, rows.Err()
 }
 
+// ChainParkedCount §QUEUE-REQUEUE（2026-10-12）某运行日夜间链里挂起（failed_needs_attention）
+// 的步数。链收尾必须先问这个数：ActiveResearchTasks 把挂起态算"已终结"，于是"队列里没有活跃行"
+// 会被读成"这一天的链全跑完了"——而那一行其实是被熔断闸请出队列的。done=true 就是这么撒的谎
+// （前端 /api/research/progress 与心跳都读这个位；§降级链会兜死分支同族）。
+// English: count of parked steps in a nightly chain — "no active rows" must never be reported as
+// "chain finished" while any step is parked by a breaker.
+func (d *DB) ChainParkedCount(chainDay string) (int, error) {
+	if chainDay == "" {
+		return 0, nil
+	}
+	var n int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM research_tasks WHERE chain_day=? AND status=?`,
+		chainDay, TaskNeedsAttention).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("chain parked count(%s): %w", chainDay, err)
+	}
+	return n, nil
+}
+
 // ListResearchTasks 全部任务最新在前（前端「回测」tab 列表）。
 func (d *DB) ListResearchTasks() ([]ResearchTask, error) {
 	return d.listResearchTasks("")
@@ -443,7 +567,7 @@ const researchTaskCols = `id, type, ref_id, priority, status, progress,
 		COALESCE(result_num,0), COALESCE(result_text,''), COALESCE(error,''), payload,
 		COALESCE(chain_day,''), COALESCE(chain_seq,0), COALESCE(control,''),
 		COALESCE(requeue_seq,0), COALESCE(retry_count,0),
-		COALESCE(fail_fp,''), COALESCE(fail_streak,0),
+		COALESCE(fail_fp,''), COALESCE(fail_streak,0), COALESCE(requeue_total,0),
 		created_at, COALESCE(started_at,''), COALESCE(finished_at,''), updated_at`
 
 // scanResearchTask 从一行扫描出 ResearchTask（QueryRow 与 Rows 共用）。
@@ -452,7 +576,7 @@ func scanResearchTask(s rowScanner) (*ResearchTask, error) {
 	if err := s.Scan(&t.ID, &t.Type, &t.RefID, &t.Priority, &t.Status, &t.Progress,
 		&t.ResultNum, &t.ResultText, &t.Error, &t.Payload,
 		&t.ChainDay, &t.ChainSeq, &t.Control, &t.RequeueSeq, &t.RetryCount,
-		&t.FailFP, &t.FailStreak,
+		&t.FailFP, &t.FailStreak, &t.RequeueTotal,
 		&t.CreatedAt, &t.StartedAt, &t.FinishedAt, &t.UpdatedAt); err != nil {
 		return nil, err
 	}

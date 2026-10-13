@@ -279,6 +279,7 @@ func (d *DB) migrate() error {
 			chain_seq INTEGER DEFAULT 0,
 			control TEXT DEFAULT '',
 			retry_count INTEGER NOT NULL DEFAULT 0,
+			requeue_total INTEGER NOT NULL DEFAULT 0,
 			fail_fp TEXT NOT NULL DEFAULT '',
 			fail_streak INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
@@ -704,6 +705,15 @@ func (d *DB) migrate() error {
 	if ok, err := d.hasColumn("research_tasks", "retry_count"); err == nil && !ok {
 		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("store migrate research_tasks.retry_count: %w", err)
+		}
+	}
+	// §QUEUE-REQUEUE（2026-10-12）累计回队次数列：与失败原因无关的总量闸读数（见 TotalRequeueLimit）。
+	// 旧库增量迁移，幂等；默认 0＝历史任务从"本次起重新计数"，不会一上线就被旧账误挂起。
+	// English: cause-independent lifetime requeue counter; idempotent ALTER, defaults to 0 so
+	// pre-existing rows are never parked on sight right after the migration.
+	if ok, err := d.hasColumn("research_tasks", "requeue_total"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN requeue_total INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.requeue_total: %w", err)
 		}
 	}
 	// §M14 同因连败熔断（2026-09-22）：fail_fp=最近一次失败指纹（error 前 200 字），
@@ -1495,6 +1505,8 @@ func (d *DB) Count(table string, fromDate string) (int, error) {
 }
 
 // TradeDates 返回 [from,to]（含）内全部交易日（升序）。
+// §CAL-COVER-GO 登记（本批不改）：日历停更时"区间内交易日"会整段缺掉未来那截，调用方按
+// 返回集合推进就等于把没维护的日期当作非交易日——与 nearBy 同型，判据要独立看末行覆盖度。
 // （TradeDates returns the ascending trade dates within [from,to] inclusive.）
 func (d *DB) TradeDates(from, to string) ([]string, error) {
 	// 查询开市日历（is_open=1）并升序返回。

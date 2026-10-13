@@ -292,6 +292,17 @@ type Engine struct {
 	paperAnchorLoaded bool                          // 懒加载标记（首次访问读一次文件）
 	// §A+B 近实时打分循环间隔（默认 0 → 回退 5s），可配置为 1-2s 以加快信号翻转检出。
 	scoringInterval time.Duration
+	// §BUY-REJECT-BACKOFF（2026-10-12 波 7）业务拒单退避账本：同一代码被网关业务拒单
+	// （资金不足/废单/duplicate 等确定性拒绝）后，约 5s 的打分周期会把同一具必败请求
+	// 每周期重投一次、从开盘热循环到收盘（日志刷屏 + 网关空转 + 占位行反复升降级）。
+	// 按代码记「下次允许再拨时刻」与连续拒单次数：连续拒单指数拉长退避窗（见
+	// buyRejectDelay），下单成功即清零；进程重启清零（可接受——重启后的首拨本就是一次真读数）。
+	// English: per-code backoff ledger for business-rejected buys — the ~5s scoring cycle used to
+	// re-dial a deterministically rejected order all day; the ledger stretches the retry window
+	// exponentially and clears on success.
+	buyRejectMu     sync.Mutex
+	buyRejectNextAt map[string]time.Time // 代码 → 下次允许再拨时刻
+	buyRejectStreak map[string]int       // 代码 → 连续拒单次数（退避档位）
 }
 
 // buyTask §A+B 异步下单任务：守卫已过的 buy 信号 + 已折算的 OrderRequest。
@@ -1355,6 +1366,20 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		})
 		return
 	}
+	// 最低买入价闸（owner 2026-10-12 裁决）：现价低于阈值的"杂毛股"不做自动买入。
+	// 阈值出厂默认 5 元（EffectiveMinBuyPrice 内 0 兜默认、负数=显式关闭，存量账号快照缺键
+	// 时反序列化得 0——若当"未配置"旁路，发版即静默放行全部低价股）。配置热生效同 fixed_amount
+	// （syncAccountConfig 每轮 QueueConfigUpdate，5s 内生效）。
+	// English: minimum buy price floor (owner ruling 2026-10-12) — skip auto-buys below the
+	// threshold (factory default 5; zero falls back to the default inside EffectiveMinBuyPrice,
+	// negative disables). Hot-effective like fixed_amount via the per-cycle config sync.
+	if minP := cfg.EffectiveMinBuyPrice(); minP > 0 && price < minP {
+		log.Printf("[qmt] %s(%s) 现价 %.2f 低于最低买入价 %.2f 元，拒买跳过", sig.Code, sig.Name, price, minP)
+		opslog.DayOnce("minprice:"+sig.Code, func() {
+			opslog.Logf("quant", "低价拒买 %s(%s) 现价=%.2f 最低买入价=%.2f 策略=%s/%s", sig.Code, sig.Name, price, minP, sig.StrategyID, sig.Strategy)
+		})
+		return
+	}
 	amount := cfg.FixedAmount
 	// §QUANT-TAB 每战法仓位大小：该战法配置了正数金额则覆盖全局 fixed_amount（量化交易页可配）。
 	// §UAT-FIX 2026-08-31：面板按战法 ID（fac_1…）配置金额，同键优先，回退显示名，再回退全局。
@@ -1441,6 +1466,24 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 			qty = affordable
 		}
 	}
+	// 单笔买入最低成交额闸（owner 2026-10-12 裁决）：成交额=股价×**最终**买入股数，
+	// 低于阈值（出厂默认 5000 元）的单子不做自动买入——典型形态=预算/资金降档后的
+	// 1 手 2 手碎单（2026-10-12 实盘：50+ 信号 09:54 瞬间打满日预算，后续信号降档成
+	// 100~200 股的几块钱碎单堆仓）。判据必须在现金降档**之后**：降档前的名义金额没有
+	// 代表性，真正报给柜台的就是降档后的这一单。0 兜默认、负数=显式关闭（同低价闸口径）。
+	// English: per-order minimum notional floor (owner ruling 2026-10-12) — notional = price ×
+	// FINAL lot count, checked AFTER the cash downgrade (the degraded lot is what actually hits
+	// the counter), before order assembly. Factory default 5000; zero falls back to the default,
+	// negative disables.
+	if minAmt := cfg.EffectiveMinOrderAmount(); minAmt > 0 && float64(qty)*price < minAmt {
+		log.Printf("[qmt] %s(%s) 单笔成交额 %.0f 元（%d股×%.2f）低于最低成交额 %.0f 元，拒买跳过",
+			sig.Code, sig.Name, float64(qty)*price, qty, price, minAmt)
+		opslog.DayOnce("minamount:"+sig.Code, func() {
+			opslog.Logf("quant", "碎单拒买 %s(%s) 成交额=%.0f（%d股×%.2f）最低成交额=%.0f 策略=%s/%s",
+				sig.Code, sig.Name, float64(qty)*price, qty, price, minAmt, sig.StrategyID, sig.Strategy)
+		})
+		return
+	}
 	// §GAP2-W1 确定性幂等键（资损级修复）：实盘买入 signal_id 改为 buy:<纯代码>:<稳定战法键>:<交易日>。
 	// 旧实现直接用 sig.ID（seqID="SIG"+UnixNano，每轮扫描重新生成）——主循环每 ~5 分钟重扫一次，
 	// 同一股票只要持续满足条件就会拿到全新 signal_id 反复真实下单，直到烧满 daily_max_buys/预算；
@@ -1524,19 +1567,13 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		default:
 			log.Printf("[trading] auto order QUEUE FULL → 同步下单兜底 %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
 			opslog.Logf("quant", "auto 买单队列满回落同步 %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
-			if res, err := ctrl.PlaceOrder(req); err != nil {
-				log.Printf("[trading] auto order(同步兜底) %s(%s): %v", sig.Code, sig.Name, err)
-			} else {
-				log.Printf("[trading] auto order(同步兜底) %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
-			}
+			// §BUY-REJECT-BACKOFF：同步兜底与 worker 同走 placeOrderNow——退避闸与拒单记账
+			// 对一切拨单路径生效，不留"队列满时退避失效"的旁路形态。
+			e.placeOrderNow(req, sig)
 		}
 	} else {
-		res, err := ctrl.PlaceOrder(req)
-		if err != nil {
-			log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
-			return
-		}
-		log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+		// §BUY-REJECT-BACKOFF：无分发器调用方（测试/直调）同样过退避闸与记账。
+		e.placeOrderNow(req, sig)
 	}
 }
 
@@ -1637,7 +1674,11 @@ func (e *Engine) StopBuyDispatcher() {
 }
 
 // placeOrderNow §A+B worker 实际下单：每次读取最新 qmtCtrl（配置热重载安全），调用网关。
-// English: A+B worker — performs the actual order via the latest qmtCtrl (config hot-reload safe).
+// §BUY-REJECT-BACKOFF：拨单前过退避闸——业务拒单（res.OK=false）按代码记账并指数拉长冷却窗；
+// 传输失败（err≠nil）不记账（瞬态，§GAP2-W1 的重试语义保留）；下单成功清零退避账。
+// English: A+B worker — performs the actual order via the latest qmtCtrl (config hot-reload safe);
+// business rejections feed a per-code exponential backoff so a doomed order is no longer re-dialed
+// every scoring cycle; transport errors stay retryable and success clears the ledger.
 func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
@@ -1645,15 +1686,84 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 	if ctrl == nil {
 		return
 	}
+	if !e.buyRejectAllow(req.Code) {
+		return
+	}
 	res, err := ctrl.PlaceOrder(req)
 	if err != nil {
 		log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
 		return
 	}
+	if res != nil && !res.OK {
+		// duplicate 拦截（controller 幂等键命中，未到网关）不是业务拒单——同键当日已有单，
+		// 不得给该代码记退避（否则 A 战法的重复会封住 B 战法同码首拨）。
+		// 判据与 controller.go 的 duplicate 返回文案同源（strings.HasPrefix，勿改前缀）。
+		if strings.HasPrefix(res.Err, "duplicate") {
+			log.Printf("[trading] auto order %s(%s) 幂等拦截（同键当日已有单），不记退避: %s", sig.Code, sig.Name, res.Err)
+		} else {
+			e.buyRejectRecord(req.Code, res.Err)
+		}
+	} else {
+		e.buyRejectClear(req.Code)
+	}
 	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, req.Qty, req.Price, res)
 	// §DAILY_OPSLOG auto 实际下单结果（受理/业务拒单由 controller 侧另记，此处补策略上下文）
 	opslog.Logf("quant", "auto 下单 %s(%s) 策略=%s/%s qty=%d price=%.2f → ok=%v order=%s err=%s",
 		sig.Code, sig.Name, req.StrategyID, req.Strategy, req.Qty, req.Price, res.OK, res.OrderID, res.Err)
+}
+
+// buyRejectDelay §BUY-REJECT-BACKOFF 退避档位：连续第 streak 次拒单后的冷却窗——
+// 2 分钟起步逐次翻倍，封顶 60 分钟（确定性拒绝里「资金不足」这类可能被卖出回款解开，
+// 所以留重试通道；但 5s 周期级重拨是纯空转）。
+func buyRejectDelay(streak int) time.Duration {
+	const maxDelay = 60 * time.Minute
+	d := 2 * time.Minute
+	for i := 1; i < streak; i++ {
+		d *= 2
+		if d >= maxDelay {
+			return maxDelay
+		}
+	}
+	return d
+}
+
+// buyRejectAllow 拨单闸：该代码仍在退避窗内时不再重拨；抑制期读数经 DayOnce 每天每码至多一条。
+func (e *Engine) buyRejectAllow(code string) bool {
+	e.buyRejectMu.Lock()
+	defer e.buyRejectMu.Unlock()
+	next, ok := e.buyRejectNextAt[code]
+	if !ok || !time.Now().Before(next) {
+		return true
+	}
+	opslog.DayOnce("buy-reject-backoff:"+code, func() {
+		opslog.Logf("quant", "买入退避 %s：业务拒单冷却窗内（至 %s），本轮跳过重拨", code, next.Format("15:04:05"))
+	})
+	return false
+}
+
+// buyRejectRecord 记一次业务拒单：连续次数 +1、按档位推后下次可拨时刻，并留一条归因读数。
+func (e *Engine) buyRejectRecord(code, reason string) {
+	e.buyRejectMu.Lock()
+	if e.buyRejectStreak == nil {
+		e.buyRejectStreak = make(map[string]int)
+	}
+	e.buyRejectStreak[code]++
+	streak := e.buyRejectStreak[code]
+	if e.buyRejectNextAt == nil {
+		e.buyRejectNextAt = make(map[string]time.Time)
+	}
+	next := time.Now().Add(buyRejectDelay(streak))
+	e.buyRejectNextAt[code] = next
+	e.buyRejectMu.Unlock()
+	log.Printf("[qmt] %s 业务拒单退避：连续第 %d 次，冷却至 %s（%s）", code, streak, next.Format("15:04:05"), reason)
+}
+
+// buyRejectClear 下单成功（受理或重复拦截之外的正常回包）即清零该代码的退避账。
+func (e *Engine) buyRejectClear(code string) {
+	e.buyRejectMu.Lock()
+	defer e.buyRejectMu.Unlock()
+	delete(e.buyRejectNextAt, code)
+	delete(e.buyRejectStreak, code)
 }
 
 // SetScoringInterval §A+B 设置近实时打分循环间隔（0 → 回退 5s）。
