@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // 研究任务类型（type 列取值）。
@@ -49,11 +51,18 @@ const (
 	// TaskFailedRetry §失败重排队：worker 内部伪状态——落库前立即经 RequeueFailedTask
 	// 转为 queued（队尾），不持久化该字面值。error 列保留失败原因。
 	TaskFailedRetry = "failed_retry"
-	// TaskNeedsAttention §M14（2026-09-22）同因连败熔断挂起终态：同一失败指纹连续
-	// SameReasonFailLimit 次失败后由 RequeueFailedTask 置入——不再回队、不再被出队，
-	// 等 owner 人工排查后经 RequeueTask 复活（连败计数同时清零）。
-	// English: M14 same-cause breaker terminal state — after N consecutive failures with the
-	// same error fingerprint the task stops being requeued until a manual requeue revives it.
+	// TaskYielded §NIGHTCAP（2026-10-14）"这一夜让位"伪状态：单夜占用到上限、或连续两次
+	// 没跑完后的顺延——**不是失败**（没报错、断点缓存有效），因此不进失败连败账、不进
+	// 累计回队账，只写 defer_day 并保留 progress。与 TaskFailedRetry 同为不持久化的伪状态。
+	// English: pseudo "yielded for the night" state — a planned hand-off, not a failure, so it
+	// touches neither failure streak nor the requeue total; only defer_day is written.
+	TaskYielded = "yielded"
+	// TaskNeedsAttention §M14（2026-09-22）连败熔断挂起终态：连续 ConsecutiveFailLimit 次
+	// 没跑成（§NIGHTCAP 2026-10-14 起不再比对失败指纹）后由 RequeueFailedTask 置入——
+	// 不再回队、不再被出队，等 owner 人工排查后经 RequeueTask 复活（连败计数同时清零）。
+	// English: M14 breaker terminal state — after ConsecutiveFailLimit consecutive non-completions
+	// (fingerprint-agnostic since §NIGHTCAP) the task stops being requeued until a manual requeue
+	// revives it and clears the streak.
 	TaskNeedsAttention = "failed_needs_attention"
 )
 
@@ -95,11 +104,30 @@ type ResearchTask struct {
 	// RequeueTotal §QUEUE-REQUEUE（2026-10-12）累计回队次数（失败回队 + 抢占续跑都计入，
 	// 与失败原因无关）；达 TotalRequeueLimit 即挂起。人工 Requeue 清零。
 	// English: cause-independent lifetime requeue count driving the total breaker.
-	RequeueTotal int    `json:"requeue_total"`
-	CreatedAt    string `json:"created_at"`            // 创建时间
-	StartedAt    string `json:"started_at,omitempty"`  // 开始时间
-	FinishedAt   string `json:"finished_at,omitempty"` // 完成时间
-	UpdatedAt    string `json:"updated_at"`            // 更新时间
+	RequeueTotal int `json:"requeue_total"`
+	// NightDay/NightUsedMin §NIGHTCAP（2026-10-14）单条任务的"本夜已占用分钟数"台账。
+	// night_day＝记账所属的北京日历日（串到第二天凌晨时仍记在起跑那一夜），
+	// night_used_min＝该夜已累计占用的分钟数。出队时用「上限 − 已用」算出这次还能跑多久，
+	// 上限是**单条任务单夜的占用天花板**，不是总夜长——所以低优先级长任务再也吃不光整夜。
+	// English: per-task per-night occupancy ledger (day key + minutes used that night), which
+	// turns the nightly cap into the effective deadline for the next claim.
+	NightDay     string `json:"night_day,omitempty"`
+	NightUsedMin int    `json:"night_used_min"`
+	// UnfinishedStreak §NIGHTCAP 连续"这一夜没跑完"的次数（超时/被抢占/预算让位都算，
+	// 跑完一次即清零）。达 DeferralStreakLimit 次就顺延一夜——队首那一条不再占着唯一槽位，
+	// 后面几十条链任务才有机会排水（现网实录：#416 每夜吃光夜窗却永不落终态，积压 54 条）。
+	// English: consecutive nights this task failed to finish; at the limit it is deferred one
+	// night so the queue head stops monopolising the single worker slot.
+	UnfinishedStreak int `json:"unfinished_streak"`
+	// DeferDay §NIGHTCAP 顺延目标日（北京紧凑日 YYYYMMDD）。非空且**大于今日**时该任务不出队
+	// （本夜已让位），到点那夜自动恢复。人工 Requeue 清空。
+	// English: deferral target day — rows whose defer_day is later than today are invisible to
+	// the dequeue query until that night arrives.
+	DeferDay   string `json:"defer_day,omitempty"`
+	CreatedAt  string `json:"created_at"`            // 创建时间
+	StartedAt  string `json:"started_at,omitempty"`  // 开始时间
+	FinishedAt string `json:"finished_at,omitempty"` // 完成时间
+	UpdatedAt  string `json:"updated_at"`            // 更新时间
 }
 
 // nowStr 当前本地时间串（统一格式，与既有表一致）。
@@ -132,19 +160,27 @@ func (d *DB) EnqueueResearchTask(t *ResearchTask) (int64, error) {
 // DequeueHighestTask 取下一个应执行的任务（不出队，仅查询）：high 先于 low；
 // 同级内 preempted（自动续跑）排最前，其余按 chain_day → chain_seq → requeue_seq → id FIFO。
 // §失败重排队：requeue_seq 单调递增作为尾键——失败重新入队取全局 max+1 沉到同类末尾，
-// 异因失败不设重试上限（§M14 后由同因连败熔断兜底确定性失败）；其他任务先行消化，
+// 异因失败不设重试上限（§NIGHTCAP 后由连败熔断兜底确定性失败）；其他任务先行消化，
 // 空队时按冷却间隔慢速重试。（秒级时间串同秒并列不可靠，故用专用单调列。）
+// §NIGHTCAP（2026-10-14）顺延闸：defer_day 非空且**晚于今日**的行整条不进候选。
+// 为什么必须新加这把闸：上面那句"沉到同类末尾"对**链任务结构性无效**——出队序是
+// chain_day → chain_seq → requeue_seq，链内序位排在沉底号之前，同一环回队后仍回到
+// 原来的队首槽（现网 #416 连续六夜都是队首，就是这个原因）。让位改由 defer_day 承担：
+// 该环本夜不再被认领，后面的链任务得以排水，到顺延那夜自动恢复。
 // 无新任务返回 (nil, nil)。failed_needs_attention（§M14 挂起态）不在出队集合。
-// English: peeks the next runnable task — high before low; preempted first; then FIFO with the
-// monotonic requeue_seq as the tail key so failed-and-requeued tasks sink to the back.
+// English: peeks the next runnable task — high before low; preempted first; then chain FIFO.
+// Rows deferred to a later night (defer_day > today) are excluded outright — the actual
+// head-of-line fix, since a chain row's chain_seq keeps it in the same head slot after a requeue.
 func (d *DB) DequeueHighestTask() (*ResearchTask, error) {
 	// 只读预览队首（不出队）：high 先于 low，同级 preempted 续跑优先，
-	// 再按 chain_day → chain_seq → requeue_seq → id FIFO
-	row := d.db.QueryRow(`SELECT ` + researchTaskCols + ` FROM research_tasks
-		WHERE status IN ('` + TaskQueued + `','` + TaskPreempted + `')
+	// 再按 chain_day → chain_seq → requeue_seq → id FIFO；顺延未到点的行整条排除。
+	row := d.db.QueryRow(`SELECT `+researchTaskCols+` FROM research_tasks
+		WHERE status IN ('`+TaskQueued+`','`+TaskPreempted+`')
+			AND (COALESCE(defer_day,'')='' OR defer_day <= ?)
 		ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END,
-			CASE status WHEN '` + TaskPreempted + `' THEN 0 ELSE 1 END,
-			chain_day ASC, chain_seq ASC, requeue_seq ASC, id ASC LIMIT 1`)
+			CASE status WHEN '`+TaskPreempted+`' THEN 0 ELSE 1 END,
+			chain_day ASC, chain_seq ASC, requeue_seq ASC, id ASC LIMIT 1`,
+		cntime.DayCompactOf(cntime.Now()))
 	t, err := scanResearchTask(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -225,11 +261,15 @@ func (d *DB) UpdateTaskRunState(id int64, status, progress string, resultNum flo
 		status, progress, resultNum, resultText, errMsg, fin, fin, now, id)
 	// §M14 成功/取消终结即打断「连败」链条：清零同因连败计数（fail_fp/fail_streak），
 	// 避免陈旧连败与新周期的偶发同因失败拼接误触熔断。
+	// §NIGHTCAP（2026-10-14）：成功/取消同时清零"连续没跑完"的顺延账（unfinished_streak）
+	// 与顺延标记（defer_day）——跑完了就是顺延故事结束；夜账（night_day/night_used_min）
+	// 刻意保留，它们按北京日取键、隔夜自动归零，且是审计读数。
 	// §QUEUE-REQUEUE：这里**故意不清 requeue_total**——累计闸要防的是"同一个任务在队列里
 	// 无限转圈"，而中间偶有一次成功恰恰是空烧的佐证（跑成了还继续重排 19 次），不是免罪；
 	// 清账只留给人工 RequeueTask。夜间读数只数活跃行，已终结行的旧计数不会把判据染红。
 	if status == TaskDone || status == TaskCancelled {
-		if _, e := d.db.Exec(`UPDATE research_tasks SET fail_fp='', fail_streak=0 WHERE id=?`, id); e != nil {
+		if _, e := d.db.Exec(`UPDATE research_tasks SET fail_fp='', fail_streak=0,
+			unfinished_streak=0, defer_day='' WHERE id=?`, id); e != nil {
 			return e
 		}
 	}
@@ -263,24 +303,31 @@ func (d *DB) ConsumeTaskControl(id int64) (string, error) {
 // （新一轮失败重新计数，不给挂起前旧账"续命"）。
 // §QUEUE-REQUEUE（2026-10-12）：本入口同时清零 requeue_total——人工介入就是"这圈空转到此为止，
 // 从本次重新起算"；不清零的话 owner 复活一个已经转过 20 圈的任务，它一跑就再次触闸挂起。
+// §NIGHTCAP（2026-10-14）：顺延账一并清零（unfinished_streak/defer_day/night_used_min）——
+// owner 排查过就是"让位故事到此为止"，复活后立刻可跑满整个单夜预算，不该带着旧让位账。
 // 注意：worker 的抢占续跑**不走本函数**（改走 RequeueAfterPreemption），否则连败账会被重启抹掉。
-// English: manual revive entry — clears both the same-cause streak and the lifetime requeue total;
-// the worker's preemption path no longer uses this (see RequeueAfterPreemption).
+// English: manual revive entry — clears the streak, the lifetime requeue total and the yield
+// ledger (unfinished_streak/defer_day/night budget); the worker's preemption path no longer uses
+// this (see RequeueAfterPreemption).
 func (d *DB) RequeueTask(id int64) error {
 	_, err := d.db.Exec(`UPDATE research_tasks SET status='queued', updated_at=?,
-		fail_fp='', fail_streak=0, requeue_total=0, finished_at=''
+		fail_fp='', fail_streak=0, requeue_total=0,
+		unfinished_streak=0, defer_day='', night_day='', night_used_min=0, finished_at=''
 		WHERE id=? AND status IN ('preempted','paused','failed_needs_attention')`, nowStr(), id)
 	return err
 }
 
-// SameReasonFailLimit §M14（2026-09-22）同因连败熔断阈值：同一失败指纹连续失败达该次数，
-// RequeueFailedTask 不再回队尾，而是置 failed_needs_attention 挂起终态（worker 侧高优告警一次）。
-// 取代原 §P1-11「retry_count≥5 一律终态 error」的异因混计上限——瞬态失败（网络抖动/资源紧张）
-// 换因即重新计数不会误杀；确定性失败（参数非法/数据必缺/缺二进制）同因 10 连败即挂起，
-// 不再无限重排队烧 LLM/算力。
-// English: M14 same-cause consecutive-failure breaker threshold (replaces the old mixed-reason
-// cap of 5). Different fingerprints always restart at 1; the identical one strikes out at 10.
-const SameReasonFailLimit = 10
+// ConsecutiveFailLimit §M14（2026-09-22）连败熔断阈值，§NIGHTCAP（2026-10-14）口径归一：
+// **连续失败次数**达该值即挂起 failed_needs_attention——不再要求"同一原因"。
+// 为什么把"同因"这一维去掉：现网 #416（三年窗因子发现）每夜先撞 8 小时单步超时、
+// 次日 09:15 又被交易时段抢占，两条终态文案天然交替，指纹每轮都在变 ⇒ 连败计数被反复
+// 洗回 1，阈值 10 永远追不上（库里实录：fail_streak=1 而 retry_count=6）。
+// "换因即宽限"本意是保护瞬态抖动（网络断一下），但抖动族在 8 小时量级的任务上根本不是
+// 瞬态——真能跑完就不会换因。所以判据改成看"连续几次没成"，原因只留在 error 列供人归因。
+// 6 次的来由：夜间链每晚 8 环左右，同一环连败 6 次已跨过 2~3 个夜窗，再试下去只是空烧。
+// English: consecutive-failure breaker — the same-fingerprint requirement is dropped because the
+// production task alternated timeout/preemption texts forever, so the streak never reached the cap.
+const ConsecutiveFailLimit = 6
 
 // TotalRequeueLimit §QUEUE-REQUEUE（2026-10-12）累计回队上限：同一任务不管因为什么回队
 // （同因失败、异因失败、抢占续跑），累计回队次数达该值即挂起 failed_needs_attention。
@@ -291,31 +338,61 @@ const SameReasonFailLimit = 10
 //     指纹每轮都在变，streak 永远到不了 10（现网 33 次正是这个形态）；
 //   - 抢占路径 RequeueTask 把 fail_streak 清零：worker 重启/让位一次，连败账就被抹一次。
 //
-// 取向＝**再加一条与原因无关的总量闸**，而不是把同因阈值调小或给抢占单独开口子：
-// 真缺数据、真跑不完的任务，无论失败文案怎么变，都不该在队列里转三十圈。
-// 20 次的来由：夜间链一轮跑 5~8 步，一步最多重试两三次即应人工介入；20 次足够容忍
-// 一整周的瞬态抖动（网络/资源），又远小于现网那 33 次的空烧规模。
-// English: cause-independent lifetime requeue cap — the same-cause streak could be reset by
-// mixed fingerprints or by the preemption requeue path, so a task could churn 33 times.
-const TotalRequeueLimit = 20
+// 取向＝**再加一条与原因无关的总量闸**，而不是给抢占单独开口子：真缺数据、真跑不完的任务，
+// 无论失败文案怎么变，都不该在队列里转三十圈。
+// §NIGHTCAP（2026-10-14）阈值 20 → 8：单夜占用上限落地后一条任务一夜最多被让位一次，
+// 20 次意味着同一环要占满 20 个夜窗（约四周）才有人看见它——太晚了。8 的口径＝"允许它跨
+// 8 个夜窗续跑（三年窗因子发现按 240 分钟/夜约需 3~4 夜，留一倍余量），再多就是真跑不完"。
+// 失败回队与抢占续跑都计这条账；单夜预算用尽的**设计内让位不计**（见 YieldTaskToNight）。
+// English: cause-independent lifetime requeue cap, lowered 20 → 8 once the nightly budget exists
+// (a planned yield is not counted; repeated failures and preemptions are).
+const TotalRequeueLimit = 8
+
+// DeferralStreakLimit §NIGHTCAP（2026-10-14）顺延触发的"连续没跑完"次数：同一任务连续
+// 两次没跑完（超时 / 被抢占 / 单夜预算用尽都算），第三次起就不再回到队首，而是顺延一夜
+// （defer_day 一写，本夜剩余时间由后面的链任务接手）。
+// 取 2 的理由：一次没跑完完全可能是夜窗太短或上游抖动，立刻顺延会把正常任务挤出去；
+// 连着两次就是现网 #416 的形状——每夜吃光夜窗、永不落终态、后面 54 条一条都排不动。
+// English: after this many consecutive non-completing attempts the task is deferred one night
+// instead of returning to the head — this is the head-of-line fix.
+const DeferralStreakLimit = 2
+
+// MinNightStartMin §NIGHTCAP 起跑最小剩余预算（分钟）：本夜余额连这点都不够时不再认领该任务
+// （直接顺延），免得跑三分钟就被预算切断、白烧一次装配成本（分钟级加载行情）。
+// English: minimum remaining night budget worth starting for; below it the task yields at once.
+const MinNightStartMin = 15
+
+// NightCapDefaultMin §NIGHTCAP 单夜占用上限的内置兜底（分钟）：配置项
+// rules.scheduler.per_task_night_max_min 未给出正值时使用。与 config 默认值同源，
+// 两处必须一致（门禁 §117 有等值锁）。
+// English: built-in fallback per-task nightly occupancy cap (minutes), same value as the config
+// default — the gate keeps the two equal.
+const NightCapDefaultMin = 240
 
 // requeueParkError 挂起终态的 error 列文案：把**触闸的那一条**写在最前面，
 // 消费方（worker 告警、夜间读数、人工排查）都按这个前缀分成因，不需要再猜。
-// 同因熔断在前、总量闸在后：同因说明"确定性失败已经很清楚"，比"转了很多圈"更可诊断。
+// 连败熔断在前、总量闸在后：连败说明"确定性失败已经很清楚"，比"转了很多圈"更可诊断。
+// §NIGHTCAP 文案口径随判据一起改：旧文案写「同因连败」而判据已不看原因，运维照着那四个字
+// 去找一个并不存在的共同原因（读数撒谎族）。
 func requeueParkError(streak, total int, errMsg string) string {
-	if streak >= SameReasonFailLimit {
-		return "同因连败熔断(" + itoa(SameReasonFailLimit) + "连败)：" + errMsg
+	if streak >= ConsecutiveFailLimit {
+		return "连败熔断(" + itoa(ConsecutiveFailLimit) + "连败，不看失败原因)：" + errMsg
 	}
-	return "累计回队熔断(" + itoa(total) + "次回队，原因每次不同未被同因闸捕获)：" + errMsg
+	return "累计回队熔断(" + itoa(total) + "次回队，原因每次不同未被连败闸捕获)：" + errMsg
 }
 
 // RequeueTripReasonOf 从 error 列文案回读触闸成因（worker 侧告警文案用，导出给调度层）。
-// 只认这两个前缀，其余一律 "requeue"——不把"猜不出"写成"同因"（读数不编造）。
-// English: maps the parked row's error text back to which breaker tripped.
+// §NIGHTCAP 新前缀「连败熔断」判读为 consecutive_fail；同时**保留**旧前缀「同因连败熔断」的
+// 判读（same_cause）——现网库里已有按旧文案挂起的行（发版前落的账），读它们时不能撒谎说
+// "成因未知"。其余一律 "requeue"（不把"猜不出"写成某个具体成因）。
+// English: maps the parked row's error text back to which breaker tripped; the legacy same-cause
+// prefix still reads so pre-deploy parked rows aren't mislabelled.
 func RequeueTripReasonOf(errText string) string {
 	switch {
+	case strings.HasPrefix(errText, "连败熔断"):
+		return "consecutive_fail"
 	case strings.HasPrefix(errText, "同因连败熔断"):
-		return "same_cause"
+		return "same_cause" // 旧文案（发版前挂起的行）仍可判读
 	case strings.HasPrefix(errText, "累计回队熔断"):
 		return "total_requeue"
 	default:
@@ -336,13 +413,15 @@ func errorFingerprint(msg string) string {
 // RequeueFailedTask 失败任务自动重新入队——排队尾（requeue_seq 单调尾键，刷新即沉底）；
 // retry_count 累计 +1（展示/审计口径）；progress/finished_at 清空等待下次运行；
 // error 列保留最后一次失败原因。
-// §M14 同因连败熔断：以 error 前 200 字符为指纹与上一次失败指纹比对——相同则 fail_streak+1，
-// 不同则从 1 重计（异因不误伤）；连败达 SameReasonFailLimit 次不再回队，置
-// failed_needs_attention 挂起终态，等 owner 人工 Requeue 复活。
+// §M14 连败熔断：达 ConsecutiveFailLimit 次不再回队，置 failed_needs_attention 挂起终态，
+// 等 owner 人工 Requeue 复活。
+// §NIGHTCAP（2026-10-14）口径归一：连败计数**不再比对错误指纹**——超时与被抢占两条文案天然
+// 交替时旧实现每轮都把 streak 洗回 1，现网同一任务因此空烧 6 轮而熔断读数仍是 1（见
+// ConsecutiveFailLimit 注释）。fail_fp 列继续写，只作展示与归因用，不再参与判据。
 // §QUEUE-REQUEUE（2026-10-12）另加与原因无关的累计闸：每次回队都记 requeue_total，
 // 达 TotalRequeueLimit 即同挂 failed_needs_attention（error 前缀写清是哪一条闸触的）。
-// English: re-enqueues a failed task at the queue tail. M14: the error fingerprint drives a
-// same-cause streak; QUEUE-REQUEUE adds a cause-independent lifetime requeue counter.
+// English: re-enqueues a failed task at the queue tail. The streak now counts consecutive
+// failures whatever text each one carried; the fingerprint column is display-only.
 func (d *DB) RequeueFailedTask(id int64, errMsg string) error {
 	// 按 rune 截而不是字节截：错误行是中文，errMsg[:500] 会把最后一个字劈成非法 UTF-8
 	// 再落库（与 errorFingerprint 的截法保持同一口径）。
@@ -351,22 +430,17 @@ func (d *DB) RequeueFailedTask(id int64, errMsg string) error {
 	}
 	fp := errorFingerprint(errMsg)
 	var cur, streak, total int
-	var lastFP string
 	if err := d.db.QueryRow(`SELECT COALESCE(retry_count,0), COALESCE(fail_streak,0),
-			COALESCE(requeue_total,0), COALESCE(fail_fp,'')
-		FROM research_tasks WHERE id=?`, id).Scan(&cur, &streak, &total, &lastFP); err != nil {
+			COALESCE(requeue_total,0)
+		FROM research_tasks WHERE id=?`, id).Scan(&cur, &streak, &total); err != nil {
 		return err
 	}
 	cur++
-	if lastFP == fp {
-		streak++
-	} else {
-		streak = 1 // §M14 换因即重新起算：只有「连续同因」才会烧穿熔断线
-	}
-	total++ // §QUEUE-REQUEUE 累计回队：不看原因、不看是否同因，回队一次记一次
-	// §M14 同因连败 / §QUEUE-REQUEUE 累计回队达阈值：挂起终态（不出队、不回队），
+	streak++ // §NIGHTCAP 连续没成即累加：换原因不再把账洗回 1（判据只看"连着几次没成"）
+	total++  // §QUEUE-REQUEUE 累计回队：不看原因、不看是否同因，回队一次记一次
+	// §M14 连败 / §QUEUE-REQUEUE 累计回队达阈值：挂起终态（不出队、不回队），
 	// error 列留「哪条闸触的 + 最后一次原因」。
-	if streak >= SameReasonFailLimit || total >= TotalRequeueLimit {
+	if streak >= ConsecutiveFailLimit || total >= TotalRequeueLimit {
 		_, err := d.db.Exec(`UPDATE research_tasks SET status='`+TaskNeedsAttention+`',
 			retry_count=?, fail_fp=?, fail_streak=?, requeue_total=?, progress='',
 			error=?, finished_at=?, updated_at=? WHERE id=?`,
@@ -428,6 +502,127 @@ func (d *DB) RequeueAfterPreemption(id int64) error {
 		return fmt.Errorf("抢占回队未生效(id=%d)：该行当前状态不是 preempted/paused，累计计数与挂起都没落上", id)
 	}
 	return nil
+}
+
+// AddTaskNightUsed §NIGHTCAP（2026-10-14）把本次运行占用的时间记进"单夜账"。
+// 记账键是**起跑那一夜**的北京日（worker 在任务结束时传入，跨零点的运行整段记在起跑夜）：
+// night_day 与传入日不同（新的一夜第一次跑）就把账本翻页（used=minutes），否则累加。
+// 出队侧用「上限 − 当日已用」算本次还能跑多久——这就是单夜占用上限的账本面。
+// minutes<=0 也照写翻页（新夜首跑 0 分钟也要把键换过来，否则昨天的账会被算到今天头上）。
+// English: records this run's occupancy into the per-night ledger keyed by the night the run
+// started; a different day key flips the page, otherwise minutes accumulate.
+func (d *DB) AddTaskNightUsed(id int64, nightDay string, minutes int) error {
+	if nightDay == "" {
+		return nil // 无键不记账（防御：调用方必须给北京日，读数不编造）
+	}
+	if minutes < 0 {
+		minutes = 0
+	}
+	_, err := d.db.Exec(`UPDATE research_tasks SET
+		night_day=CASE WHEN COALESCE(night_day,'')=? THEN night_day ELSE ? END,
+		night_used_min=CASE WHEN COALESCE(night_day,'')=? THEN COALESCE(night_used_min,0)+? ELSE ? END,
+		updated_at=? WHERE id=?`, nightDay, nightDay, nightDay, minutes, minutes, nowStr(), id)
+	return err
+}
+
+// MarkTaskUnfinished §NIGHTCAP（2026-10-14）记一次"这一夜没跑完"：unfinished_streak+1；
+// 连续没跑完达 DeferralStreakLimit 次就顺延——defer_day 写成传入的下一夜（worker 用
+// 北京日历算，store 不重复造日历），出队查询把它整条排除到那一夜为止。
+// 返回 (最新 streak, 是否已顺延, error)。
+// 只对还活跃的行（queued/preempted/paused）生效：若该行已被熔断挂起或落了终态，
+// 顺延无意义（挂起本来就不出队），静默跳过并如实返回 deferred=false——调用方不打扰告警。
+// 该函数**不动** requeue_total/fail_streak：让位不是失败，两把熔断账只认失败与抢占。
+// English: records one non-completing night; at DeferralStreakLimit the row is deferred to the
+// given next night (defer_day), which removes it from the dequeue query. Yielding never touches
+// the failure or lifetime-requeue breakers.
+func (d *DB) MarkTaskUnfinished(id int64, nextDay string) (streak int, deferred bool, err error) {
+	var status string
+	if err = d.db.QueryRow(`SELECT COALESCE(unfinished_streak,0), status
+		FROM research_tasks WHERE id=?`, id).Scan(&streak, &status); err != nil {
+		return 0, false, err
+	}
+	if status == TaskNeedsAttention || status == TaskDone || status == TaskError || status == TaskCancelled {
+		return streak, false, nil // 挂起/终态行：顺延无意义，跳过（不把告警变成误报）
+	}
+	streak++
+	if streak >= DeferralStreakLimit && nextDay != "" {
+		if _, err = d.db.Exec(`UPDATE research_tasks SET unfinished_streak=?, defer_day=?,
+			updated_at=? WHERE id=?`, streak, nextDay, nowStr(), id); err != nil {
+			return streak, false, err
+		}
+		return streak, true, nil
+	}
+	if _, err = d.db.Exec(`UPDATE research_tasks SET unfinished_streak=?, updated_at=?
+		WHERE id=?`, streak, nowStr(), id); err != nil {
+		return streak, false, err
+	}
+	return streak, false, nil
+}
+
+// YieldTaskToNight §NIGHTCAP（2026-10-14）"设计内让位"落库：单夜占用到上限（或余额不足起跑），
+// 不是失败——progress 保留（断点缓存有效）、error 写让位原因、status 回 queued、
+// defer_day 写下一夜（本夜剩余时间让给后面的链任务），requeue_seq 不动（保持链内槽位）。
+// 与 MarkTaskUnfinished 的差别：那条按"连续没跑完"计数、到阈值才顺延；这条**无条件**顺延
+// （预算已花光，继续排队只会原地空转），所以单独一个入口，也便于读数按成因区分。
+// requeue_total/fail_streak 同样不碰——让位不是失败，也不算"转圈"。
+// 只对 running 行生效（0 行=调用顺序错了，必须现形，不能静默）。
+// English: lands a *planned* yield — budget exhausted or not worth starting: keeps progress,
+// queues the row with defer_day set to the next night, and never touches the breakers.
+func (d *DB) YieldTaskToNight(id int64, nextDay, reason string) error {
+	if r := []rune(reason); len(r) > 500 {
+		reason = string(r[:500])
+	}
+	res, err := d.db.Exec(`UPDATE research_tasks SET status='`+TaskQueued+`', defer_day=?,
+		updated_at=?, error=? WHERE id=? AND status='`+TaskRunning+`'`,
+		nextDay, nowStr(), reason, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("单夜让位未生效(id=%d)：该行当前状态不是 running，顺延与留痕都没落上", id)
+	}
+	return nil
+}
+
+// DeferQueuedTaskToNight §NIGHTCAP（2026-10-14）队首"余额不足起跑"的让位落库：该任务还在
+// 队列里（尚未认领成 running），本夜剩余预算连 MinNightStartMin 都不够，直接写 defer_day
+// 让位——否则出队查询每 30s 都会把它取回来，队首后面的任务一条也轮不上。
+// 与 YieldTaskToNight 的差别只是行所在状态（queued/preempted vs running），语义同一条：
+// 设计内让位，不碰熔断账、不碰 requeue_seq（保持链内槽位）。0 行必须现形。
+// English: head-of-queue yield when the remaining night budget isn't worth starting for —
+// same semantics as YieldTaskToNight, applied to not-yet-claimed rows.
+func (d *DB) DeferQueuedTaskToNight(id int64, nextDay, reason string) error {
+	if r := []rune(reason); len(r) > 500 {
+		reason = string(r[:500])
+	}
+	res, err := d.db.Exec(`UPDATE research_tasks SET defer_day=?, updated_at=?, error=?
+		WHERE id=? AND status IN ('`+TaskQueued+`','`+TaskPreempted+`')`,
+		nextDay, nowStr(), reason, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("队首让位未生效(id=%d)：该行当前状态不是 queued/preempted，顺延没落上", id)
+	}
+	return nil
+}
+
+// NightBudgetLeftMin §NIGHTCAP 纯读数：该任务在本夜（传入北京日）还剩多少分钟可跑。
+// night_day 不是今日＝本夜还没跑过，返回全额 cap；是今日＝cap − 已用。cap<=0 恒返回 -1
+// （=不限，调用方据此跳过预算逻辑）。
+// English: minutes remaining for this task tonight; -1 means uncapped.
+func NightBudgetLeftMin(usedMin int, usedDay, today string, capMin int) int {
+	if capMin <= 0 {
+		return -1
+	}
+	if usedDay != today {
+		return capMin
+	}
+	left := capMin - usedMin
+	if left < 0 {
+		return 0
+	}
+	return left
 }
 
 // itoa 小工具：避免为单一常量引入 strconv（重试上限文案用）。
@@ -568,15 +763,19 @@ const researchTaskCols = `id, type, ref_id, priority, status, progress,
 		COALESCE(chain_day,''), COALESCE(chain_seq,0), COALESCE(control,''),
 		COALESCE(requeue_seq,0), COALESCE(retry_count,0),
 		COALESCE(fail_fp,''), COALESCE(fail_streak,0), COALESCE(requeue_total,0),
+		COALESCE(night_day,''), COALESCE(night_used_min,0), COALESCE(unfinished_streak,0),
+		COALESCE(defer_day,''),
 		created_at, COALESCE(started_at,''), COALESCE(finished_at,''), updated_at`
 
 // scanResearchTask 从一行扫描出 ResearchTask（QueryRow 与 Rows 共用）。
+// 列序必须与 researchTaskCols 逐字对应（§NIGHTCAP 新增四列插在 requeue_total 之后）。
 func scanResearchTask(s rowScanner) (*ResearchTask, error) {
 	var t ResearchTask
 	if err := s.Scan(&t.ID, &t.Type, &t.RefID, &t.Priority, &t.Status, &t.Progress,
 		&t.ResultNum, &t.ResultText, &t.Error, &t.Payload,
 		&t.ChainDay, &t.ChainSeq, &t.Control, &t.RequeueSeq, &t.RetryCount,
 		&t.FailFP, &t.FailStreak, &t.RequeueTotal,
+		&t.NightDay, &t.NightUsedMin, &t.UnfinishedStreak, &t.DeferDay,
 		&t.CreatedAt, &t.StartedAt, &t.FinishedAt, &t.UpdatedAt); err != nil {
 		return nil, err
 	}

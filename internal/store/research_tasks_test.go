@@ -196,21 +196,24 @@ func TestTaskSameCauseBreaker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	// 1) 同因连败：前 N-1 次仍回队尾可重试，第 N 次挂起
-	for i := 1; i <= SameReasonFailLimit; i++ {
-		if err := db.RequeueFailedTask(id, "boom"); err != nil {
+	// 1) 连败熔断：前 N-1 次仍回队尾可重试，第 N 次挂起。
+	//    §NIGHTCAP（2026-10-14）判据归一后这条闸叫"连败"而不是"同因"——本段故意让每次
+	//    失败原因都不同，只要连着没成就必须累加（旧的"换因从 1 重计"正是 #416 空烧六轮
+	//    而熔断读数恒 1 的根因），由下面第二段的异因循环共同自证。
+	for i := 1; i <= ConsecutiveFailLimit; i++ {
+		if err := db.RequeueFailedTask(id, "boom-异因-"+itoa(i)); err != nil {
 			t.Fatalf("第 %d 次重入队: %v", i, err)
 		}
 		tk, err := db.GetResearchTask(id)
 		if err != nil {
 			t.Fatalf("get: %v", err)
 		}
-		if i < SameReasonFailLimit {
+		if i < ConsecutiveFailLimit {
 			if tk.Status != TaskQueued {
 				t.Fatalf("第 %d 次应仍为 queued, 实际 %s", i, tk.Status)
 			}
 			if tk.FailStreak != i {
-				t.Fatalf("第 %d 次 fail_streak 应为 %d, 实际 %d", i, i, tk.FailStreak)
+				t.Fatalf("第 %d 次 fail_streak 应为 %d（换因不再洗账）, 实际 %d", i, i, tk.FailStreak)
 			}
 			next, _ := db.DequeueHighestTask()
 			if next == nil || next.ID != id {
@@ -218,10 +221,13 @@ func TestTaskSameCauseBreaker(t *testing.T) {
 			}
 		} else {
 			if tk.Status != TaskNeedsAttention {
-				t.Fatalf("同因 %d 连败应挂起 failed_needs_attention, 实际 %s", i, tk.Status)
+				t.Fatalf("连败 %d 次应挂起 failed_needs_attention, 实际 %s", i, tk.Status)
 			}
-			if !strings.Contains(tk.Error, "同因连败熔断") || !strings.Contains(tk.Error, "boom") {
+			if !strings.Contains(tk.Error, "连败熔断") || !strings.Contains(tk.Error, "boom-异因-") {
 				t.Fatalf("挂起留痕应含熔断标记+原因, got %q", tk.Error)
+			}
+			if got := RequeueTripReasonOf(tk.Error); got != "consecutive_fail" {
+				t.Fatalf("挂起成因应判读为 consecutive_fail, 实际 %s", got)
 			}
 		}
 	}
@@ -253,15 +259,16 @@ func TestTaskSameCauseBreaker(t *testing.T) {
 	if tk.FailStreak != 0 || tk.FailFP != "" {
 		t.Fatalf("成功后连败计数应清零, got %+v", tk)
 	}
-	// 2) §QUEUE-REQUEUE（2026-10-12）改判：异因**不再"不设上限"**。
-	//    旧断言（转 20 圈仍留队）就是现网"同一任务被 8 小时单步超时回队 33 次"的护身符——
-	//    超时文案与「运行失败(…)：末行输出」交替时指纹每次都变，同因闸恒为 1 永不触闸。
-	//    现行为：连败计数仍恒 1（不误判成同因），但累计回队次数达 TotalRequeueLimit 即挂起。
+	// 2) §NIGHTCAP（2026-10-14）改判：异因循环现在由**连败闸**收口（累计闸 8 > 连败 6，
+	//    失败路径上先触连败）。旧断言"换因后 streak 恒 1、只能等累计 20 圈"就是 #416 空烧
+	//    六轮而熔断读数恒 1 的护身符；现在异因照样累加，第 6 次挂起、成因如实判读为
+	//    consecutive_fail（不是同因也不是累计）。累计闸在失败路径上退为兜底，
+	//    其独立存活面由抢占路径的 TestTaskPreemptRequeueKeepsStreakAndCounts 证明。
 	id2, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
 	if err != nil {
 		t.Fatalf("enqueue2: %v", err)
 	}
-	for i := 1; i < TotalRequeueLimit; i++ {
+	for i := 1; i < ConsecutiveFailLimit; i++ {
 		if err := db.RequeueFailedTask(id2, "boom-异因-"+itoa(i)); err != nil {
 			t.Fatalf("异因第 %d 次: %v", i, err)
 		}
@@ -269,9 +276,10 @@ func TestTaskSameCauseBreaker(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get2: %v", err)
 		}
-		// 每轮都还能出队重试（未触闸），且两把尺子各计各的：streak 恒 1、total 逐轮 +1
-		if tk2.Status != TaskQueued || tk2.FailStreak != 1 || tk2.RequeueTotal != i {
-			t.Fatalf("异因第 %d 次应 queued/streak=1/total=%d, got %+v", i, i, tk2)
+		// 每轮都还能出队重试，且两把尺子各计各的：streak/total 逐轮 +1；
+		// unfinished_streak 不在本入口动（由 worker 终态分派统一记，见 MarkTaskUnfinished）。
+		if tk2.Status != TaskQueued || tk2.FailStreak != i || tk2.RequeueTotal != i || tk2.UnfinishedStreak != 0 {
+			t.Fatalf("异因第 %d 次应 queued/streak=%d/total=%d/unfinished=0, got %+v", i, i, i, tk2)
 		}
 		if next, _ := db.DequeueHighestTask(); next == nil || next.ID != id2 {
 			t.Fatalf("异因第 %d 次应能出队重试", i)
@@ -282,21 +290,21 @@ func TestTaskSameCauseBreaker(t *testing.T) {
 	}
 	tk2, _ := db.GetResearchTask(id2)
 	if tk2 == nil || tk2.Status != TaskNeedsAttention {
-		t.Fatalf("累计回队达 %d 次应挂起, got %+v", TotalRequeueLimit, tk2)
+		t.Fatalf("连败达 %d 次应挂起, got %+v", ConsecutiveFailLimit, tk2)
 	}
-	if !strings.HasPrefix(tk2.Error, "累计回队熔断") || RequeueTripReasonOf(tk2.Error) != "total_requeue" {
-		t.Fatalf("挂起留痕必须写清是累计闸触的（不能冒充同因）, got %q", tk2.Error)
+	if !strings.HasPrefix(tk2.Error, "连败熔断") || RequeueTripReasonOf(tk2.Error) != "consecutive_fail" {
+		t.Fatalf("挂起留痕必须写清是连败闸触的（不能冒充同因/累计）, got %q", tk2.Error)
 	}
 	if next, _ := db.DequeueHighestTask(); next != nil {
-		t.Fatalf("累计闸挂起后不应出队, 取到 %+v", next)
+		t.Fatalf("连败闸挂起后不应出队, 取到 %+v", next)
 	}
-	// 人工复活把两把尺子一起清零：不清 total 的话，owner 刚复活的任务一跑就再次触闸。
+	// 人工复活把所有尺子一起清零：不清 total/顺延账的话，owner 刚复活的任务一跑就再次触闸。
 	if err := db.RequeueTask(id2); err != nil {
-		t.Fatalf("人工 Requeue(累计闸): %v", err)
+		t.Fatalf("人工 Requeue(连败闸): %v", err)
 	}
 	tk2, _ = db.GetResearchTask(id2)
-	if tk2.Status != TaskQueued || tk2.RequeueTotal != 0 || tk2.FailStreak != 0 {
-		t.Fatalf("复活后应 queued 且两把尺子清零, got %+v", tk2)
+	if tk2.Status != TaskQueued || tk2.RequeueTotal != 0 || tk2.FailStreak != 0 || tk2.UnfinishedStreak != 0 || tk2.DeferDay != "" {
+		t.Fatalf("复活后应 queued 且连败/累计/顺延账全清零, got %+v", tk2)
 	}
 }
 
@@ -384,8 +392,9 @@ func TestTaskPreemptRequeueZeroRowIsLoud(t *testing.T) {
 // 其它 error（人工写的、旧数据）不得被冒充成其中任何一种。
 func TestTaskRequeueTripReasonReadsBothBreakers(t *testing.T) {
 	cases := []struct{ errText, want string }{
-		{"同因连败熔断(10连败)：boom", "same_cause"},
-		{"累计回队熔断(20次回队)：boom", "total_requeue"},
+		{"连败熔断(6连败，不看失败原因)：boom", "consecutive_fail"},
+		{"同因连败熔断(10连败)：boom", "same_cause"}, // §NIGHTCAP 旧文案（发版前挂起的行）仍可判读
+		{"累计回队熔断(8次回队)：boom", "total_requeue"},
 		{"运行失败(exit status 1)", "requeue"},
 		{"", "requeue"},
 	}

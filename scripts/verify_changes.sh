@@ -1421,17 +1421,19 @@ grep -q 'muxWithJSONErrors' internal/server/server.go || { echo "--- FAIL: 404/4
 grep -q 'can_use_qty' qmt_gateway/broker.py || { echo "--- FAIL: xt 直连通道 T+1 可卖量字段丢失（§M5 通道字段对齐回归）"; exit 1; }
 echo "ok - §F2 回报接入段专项守卫通过（Go 5 例 + py 1 文件 + 静态锁 7 道）"
 
-echo "==> 36 §M14/§M15 队列同因连败熔断 + 夜链半截自愈（2026-09-22 修复批，代理E）..."
-# §M14：RequeueFailedTask 以 error 前 200 字为指纹，同因连败 SameReasonFailLimit=10 挂起
-# failed_needs_attention（不再重排，人工 RequeueTask 复活清零计数）；异因不设上限保留旧
-# 设计；worker 三处失败收口统一 notifySameCauseBreaker（留痕+清冷却+state+高优告警一次，
-# researchd 经 SetAlertFunc 接 PushGateway）。§M15：夜链改「计划序位即 chain_seq +
-# ChainTaskSeqs 占用补缺」，单环入队失败不中断整链、后续 tick 自动补投，state 记
-# chain_issued/chain_total，缺额 opslog.OncePer(30min) 留痕。
-go test -count=1 ./internal/scheduler/ -run 'TestSameCauseBreakerParksTask|TestDifferentCauseFailuresNeverBreaker|TestNightlyChainHalfEnqueueBackfill|TestNightlyChainMissingSeqBackfilledAcrossRestart' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+echo "==> 36 §M14/§M15 连败熔断 + 夜链半截自愈（2026-09-22 修复批；§NIGHTCAP 2026-10-14 口径归一）..."
+# §M14：RequeueFailedTask 连败 ConsecutiveFailLimit=6 挂起 failed_needs_attention（不再重排，
+# 人工 RequeueTask 复活清零计数）。§NIGHTCAP 口径归一：连败计数**不再比对错误指纹**——超时与
+# 被抢占两条文案天然交替时旧实现每轮把 streak 洗回 1（现网 #416 空烧六夜的成因之一），换因失败
+# 同样累加；旧常量名 SameReasonFailLimit 不得复活（absent 锁在 §117）。worker 三处失败收口统一
+# notifyRequeueBreaker（留痕+清冷却+state+高优告警一次，researchd 经 SetAlertFunc 接 PushGateway），
+# 成因分岔按前缀读（连败/累计回队，旧「同因连败」前缀保留判读兼容存量行）。§M15：夜链改
+# 「计划序位即 chain_seq + ChainTaskSeqs 占用补缺」，单环入队失败不中断整链、后续 tick 自动补投，
+# state 记 chain_issued/chain_total，缺额 opslog.OncePer(30min) 留痕。
+go test -count=1 ./internal/scheduler/ -run 'TestConsecutiveFailBreakerParksTask|TestDifferentCauseFailuresStillPark|TestNightlyChainHalfEnqueueBackfill|TestNightlyChainMissingSeqBackfilledAcrossRestart' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/store/ -run 'TestTaskSameCauseBreaker' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-grep -q 'SameReasonFailLimit = 10' internal/store/research_tasks.go || { echo "--- FAIL: 同因熔断阈值常量丢失（§M14 回归）"; exit 1; }
-if grep -q 'researchTaskRetryCap' internal/store/research_tasks.go; then echo "--- FAIL: 旧异因混计上限复活（§M14 设计为同因取代）"; exit 1; fi
+grep -q 'ConsecutiveFailLimit = 6' internal/store/research_tasks.go || { echo "--- FAIL: 连败熔断阈值常量丢失（§M14/§NIGHTCAP 回归）"; exit 1; }
+if grep -q 'researchTaskRetryCap' internal/store/research_tasks.go; then echo "--- FAIL: 旧异因混计上限复活（§M14 设计为连败闸取代）"; exit 1; fi
 grep -q 'failed_needs_attention' internal/store/research_tasks.go || { echo "--- FAIL: 挂起终态缺失（§M14 回归）"; exit 1; }
 grep -q 'ChainTaskSeqs' internal/scheduler/worker.go || { echo "--- FAIL: 夜链序位补缺丢失，半截链复活（§M15 回归）"; exit 1; }
 grep -q 'SetAlertFunc' cmd/researchd/main.go || { echo "--- FAIL: researchd 告警通道未接线（§M14 静默死亡复活）"; exit 1; }
@@ -5699,7 +5701,7 @@ eq106 cmd/dataload/main.go 'bsRunDaily(db, bsClient, \*start, \*end, onlyCodes, 
 word106 cmd/dataload/degraded_source_load_test.go 'func TestNoResumeForcePullReachesMidSpanHole' '⑪-6 中段空洞可达性用例在位（跳过态+强拉态双腿）'
 
 # ⑪-6-c 队列侧（Go）：累计回队闸 + 抢占专用入口 + 排空≠跑完
-eq106 internal/store/research_tasks.go 'const TotalRequeueLimit = 20' 1 '⑪-6 累计回队上限常量单点'
+eq106 internal/store/research_tasks.go 'const TotalRequeueLimit = 8' 1 '⑪-6 累计回队上限常量单点（§NIGHTCAP 2026-10-14 由 20 收紧到 8，与连败阈值 6 配成 6<8 梯度）'
 eq106 internal/store/store.go 'requeue_total INTEGER NOT NULL DEFAULT 0' 2 '⑪-6 累计计数列两处（建表 + 幂等迁移；缺迁移＝老库读不到列）'
 eq106 internal/store/research_tasks.go 'RequeueAfterPreemption(id int64) error' 1 '⑪-6 抢占回队专用入口恰一处（走人工复活入口＝清零计数，正是 33 次回队的旁路）'
 absent106 internal/scheduler/worker.go 'db.RequeueTask(' '⑪-6 抢占路径不得再调人工复活入口（复活入口只服务人工）'
@@ -5708,7 +5710,8 @@ eq106 internal/scheduler/worker.go 'notifyRequeueBreaker(db, &tk)' 3 '⑪-6 熔�
 eq106 internal/scheduler/worker.go 'db.ChainParkedCount(tk.ChainDay)' 1 '⑪-6 收尾账本读取在位（排空但挂起时 done 位不置）'
 eq106 internal/store/research_tasks.go 'ChainParkedCount(chainDay string) (int, error)' 1 '⑪-6 挂起步数读数单点'
 eq106 internal/store/research_tasks.go 'func RequeueTripReasonOf(errText string) string' 1 '⑪-6 成因回读函数在位（两条闸共用一个终态，告警不许都写同因）'
-word106 internal/scheduler/worker_m14_test.go 'func TestMixedCauseRequeueCapParksTask' '⑪-6 异因循环撞累计闸用例在位'
+word106 internal/scheduler/worker_m14_test.go 'func TestConsecutiveFailBreakerParksTask' '⑪-6 连败熔断挂起用例在位（§NIGHTCAP 口径归一后由 TestSameCauseBreakerParksTask 改名重切）'
+word106 internal/scheduler/worker_m14_test.go 'func TestDifferentCauseFailuresStillPark' '⑪-6 换因不再洗账用例在位（旧 TestDifferentCauseFailuresNeverBreaker 反演：指纹口径已废）'
 word106 internal/scheduler/worker_m14_test.go 'func TestFinishTaskParkedChainKeepsDoneFalse' '⑪-6 挂起步不置 done 用例在位'
 word106 internal/store/research_tasks_test.go 'func TestTaskPreemptRequeueKeepsStreakAndCounts' '⑪-6 抢占不清连败用例在位'
 word106 internal/store/research_tasks_test.go 'func TestTaskPreemptRequeueZeroRowIsLoud' '⑪-6 抢占回队零行必响用例在位（静默 0 行＝计数没落上）'
@@ -5794,12 +5797,14 @@ absent106 web/src/__tests__/h2_positions_balance.test.jsx 'screen.getByText(/盈
 # 排水吃掉。修法＝beginRound 把"等排水停手 → 拨钟越过 5min 失败冷却窗 → tick"钉成一条显式状态
 # 转移（等待预算同时抬到 60s，只防调度延迟冒充失败，确定性来自 beginRound）。
 # 为什么挂 §106 而不是新开段：本批 ⑪-6 队列回队闸就在这个文件里，轮界修复是它的使用前提。
-# 预演读数：func beginRound=1、beginRound(t, s, clk)=3（三处轮次循环；文件里另两处"停车后续跑
-# 三轮"的循环**故意不套助手**——它要的就是连拨三次 tick 观察挂起态，语义不同）、
-# waitFor(t, roundSettleWait=3、const 定义=1。
+# 预演读数：func beginRound=1、beginRound(t, s, clk)=2（§NIGHTCAP 2026-10-14 由 3 改 2：原第三处是
+# TestMixedCauseRequeueCapParksTask 的轮次循环，本批按 6<8 梯度删除该用例——失败路径连败恒先触闸，
+# worker 侧累计闸用例结构不可达，累计上限改由 store 侧行为腿钉；语义不变＝每处重试轮循环都必须走
+# 助手；文件里另两处"停车后续跑三轮"的循环**故意不套助手**——它要的就是连拨三次 tick 观察挂起
+# 态，语义不同）、waitFor(t, roundSettleWait=2、const 定义=1。
 word106 internal/scheduler/worker_m14_test.go 'func beginRound' '⑪-6-f 轮开助手单点（等排水→拨钟→tick 的顺序只有一份定义）'
-eq106 internal/scheduler/worker_m14_test.go 'beginRound(t, s, clk)' 3 '⑪-6-f 三处轮次循环全部走助手（少一处＝那条循环仍在赌异步尾巴来得及）'
-eq106 internal/scheduler/worker_m14_test.go 'waitFor(t, roundSettleWait' 3 '⑪-6-f 轮内等待统一走常量（秒数写死在三处＝改一处漏两处）'
+eq106 internal/scheduler/worker_m14_test.go 'beginRound(t, s, clk)' 2 '⑪-6-f 重试轮循环全部走助手（§NIGHTCAP 后两处；少一处＝那条循环仍在赌异步尾巴来得及）'
+eq106 internal/scheduler/worker_m14_test.go 'waitFor(t, roundSettleWait' 2 '⑪-6-f 轮内等待统一走常量（§NIGHTCAP 后两处；写死秒数＝改一处漏一处）'
 eq106 internal/scheduler/worker_m14_test.go 'const roundSettleWait = 60 \* time\.Second' 1 '⑪-6-f 等待预算常量单点定义'
 
 # ⑪-6-g 流式空闲用例的负载余量（§DET-TIME-3 收形 2026-10-13，第 7 遍门禁 §15 的红项）
@@ -12606,6 +12611,115 @@ CNT116=$((CNT116 + 1))
 [ "$SUMK116" = "$((CNT116 - 1))" ] || { echo "--- FAIL: §116 分组求和自证锁 ${CNT116}（五组快照之和 ${SUMK116} != 累计判定点扣本锁 $((CNT116 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
 rm -rf "$W116"
 echo "ok - §116 全段通过：① 数据层批量入口（分片/别名/零价/不回落逐票＋体级正对照）${L1_N} 道 + ② 展示层五面收形（两枚上限常量/单出口读数/补齐腿两条计数与签名/五面清单 ${SURFN116} 面各 5 枚/五枚顺序锁/两枚假承诺负锁/代码行尺子）${L2_N} 道 + ③ 测试资产与行为腿（数据层实跑 ${DPASS116} 条、展示层实跑 ${SPASS116} 条、批量缝注入 ${SEAMTEST116}/补齐缝注入 ${SEAMTESTD116}/生产赋值 ${SEAMPROD116}+${SEAMPRODD116}）${L3_N} 道 + ④ ${DYS116_N} 枚反证 N1–N${DYS116_N}（六枚 overlay 行为＋三枚副本静态，每枚断独有红与复位复绿）${L4_N} 道 + ⑤ 覆盖面诚实账与分组自证 ${L5_N} 道，累计判定点 ${CNT116}（其中五组快照之和 ${SUMK116}，另有 1 道就是求和自证锁本身）"
+echo "==> 117 §NIGHTCAP 队列单夜占用上限＋顺延让位＋连败口径归一（2026-10-14 修复批）..."
+
+# 现网实录（2026-10-14，54 条积压归因批的三条修法，owner 裁决「解堵＋顺延/占用上限＋熔断补形」）：
+#   ① 队首独占：低优任务本夜剩余预算不足起跑（MinNightStartMin=15 分钟）时不再认领，
+#     写 defer_day 让位——不设这把闸，出队查询每 30s 把同一条取回来，队首后面的任务一条
+#     也轮不上（#416 连续六夜独占队首的另一半成因；解堵已由人工挂起先行落库）。
+#   ② 运行侧截断：低优任务实际可跑时长＝min(单步超时, 本夜剩余预算 NightCapDefaultMin=240)，
+#     到点子进程被杀，终态走「让位」（TaskYielded 伪状态→queued+defer_day=下一夜、progress
+#     保留、两把熔断账不动）而不是「失败」——让位进熔断账＝下一夜它带旧账跑，两次就让误挂起。
+#   ③ 连败口径归一：连败计数不再比对错误指纹——超时与被抢占两条文案天然交替时旧实现每轮
+#     把 streak 洗回 1（#416 空烧六夜的成因之一）；阈值 20/10 收紧到 8/6，且失败-only 路径
+#     streak==total 同步递增而 6<8，必先触更可诊断的连败闸；累计闸的独占射程只剩抢占/重启续跑。
+#   ④ 连续两次没跑完（DeferralStreakLimit=2）由 store 侧自动再顺延一夜（环级让位）。
+#   夜账（night_day/night_used_min）按起跑那夜的北京日整段记账，跨零点自动翻页。
+#   English: §NIGHTCAP — per-night occupancy ledger + head-side budget gate + run-side cap that
+#   yields instead of failing, plus a fingerprint-agnostic consecutive-failure breaker (6/8).
+
+CNT117=0
+RT117=internal/store/research_tasks.go
+SG117=internal/store/store.go
+CF117=internal/config/config.go
+WK117=internal/scheduler/worker.go
+M14117=internal/scheduler/worker_m14_test.go
+
+eq117() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT117=$((CNT117 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §117 整串等值锁 ${CNT117}（${4}）：${1} 整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+neg117() { # $1=文件 $2=整串 $3=说明 → 彻底没有
+	CNT117=$((CNT117 + 1))
+	local got
+	got=$(grep -cF -- "$2" "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §117 负锁 ${CNT117}（${3}）：${1} 又出现「${2}」got=${got}"; exit 1; }
+}
+
+# A. 四把阈值常量单点 + 配置默认等值（240 在 store/config 各写一份，并列两枚钉死：改一处另一处必红）
+eq117 "$RT117" 'ConsecutiveFailLimit = 6' 1 '连败熔断阈值单点（口径归一后不看失败原因）'
+eq117 "$RT117" 'TotalRequeueLimit = 8' 1 '累计回队阈值单点（6<8 梯度：失败-only 路径必先触连败闸）'
+eq117 "$RT117" 'DeferralStreakLimit = 2' 1 '连续没跑完顺延阈值单点（环级让位的尺子）'
+eq117 "$RT117" 'MinNightStartMin = 15' 1 '队首起跑预算下限单点（低于它起跑=起跑即到点）'
+eq117 "$RT117" 'NightCapDefaultMin = 240' 1 '单夜占用上限内置默认单点'
+eq117 "$CF117" 'PerTaskNightMaxMin: 240' 1 'config 默认与 store 内置默认等值'
+eq117 "$CF117" 'per_task_night_max_min' 2 '配置键恰两处（json tag + 覆盖解析；少一处＝env 档位撒谎族）'
+
+# B. 伪状态 + 五个 store 入口 + 夜账四列（建表＋幂等迁移各 2 处；缺迁移＝老库读不到列）
+eq117 "$RT117" 'TaskYielded = "yielded"' 1 '让位伪状态单点（不持久化，只写 defer_day）'
+eq117 "$RT117" 'func (d *DB) AddTaskNightUsed(id int64, nightDay string, minutes int) error' 1 '夜账入账入口单点'
+eq117 "$RT117" 'func (d *DB) MarkTaskUnfinished(id int64, nextDay string) (streak int, deferred bool, err error)' 1 '未跑完记账入口单点'
+eq117 "$RT117" 'func (d *DB) YieldTaskToNight(id int64, nextDay, reason string) error' 1 '让位落库入口单点'
+eq117 "$RT117" 'func (d *DB) DeferQueuedTaskToNight(id int64, nextDay, reason string) error' 1 '队首让位落库入口单点'
+eq117 "$RT117" 'func NightBudgetLeftMin(usedMin int, usedDay, today string, capMin int) int' 1 '预算纯函数单点（判据与读数同源）'
+eq117 "$RT117" 'COALESCE(night_used_min,0)' 2 'night_used_min 兜底读数恰两处：写侧 MarkTaskUnfinished 增量 CASE（streak/顺延账）＋读侧 researchTaskCols 扫描列——少一处＝写账或读数断一腿'
+eq117 "$SG117" "night_day TEXT NOT NULL DEFAULT ''" 2 '夜账日键列两处（建表+迁移）'
+eq117 "$SG117" 'night_used_min INTEGER NOT NULL DEFAULT 0' 2 '夜账占用列两处（建表+迁移）'
+eq117 "$SG117" 'unfinished_streak INTEGER NOT NULL DEFAULT 0' 2 '未跑完账列两处（建表+迁移）'
+eq117 "$SG117" "defer_day TEXT NOT NULL DEFAULT ''" 2 '顺延目标日列两处（建表+迁移）'
+
+# C. worker 侧接线（各恰一枚：队首闸/让位分派/未跑完记账/夜账入账/两处预算读数）
+eq117 "$WK117" 'func nightCapMinutes(cfg config.SchedulerConfig) int' 1 '上限取值函数单点（0=默认/负=禁用）'
+eq117 "$WK117" 'db.DeferQueuedTaskToNight(next.ID, nextDay, reason)' 1 '队首预算闸接线在位'
+eq117 "$WK117" 'db.YieldTaskToNight(tk.ID, nextNight, errMsg)' 1 '让位分派接线在位'
+eq117 "$WK117" 'db.MarkTaskUnfinished(tk.ID, nextNight)' 1 '未跑完记账接线在位'
+eq117 "$WK117" 'db.AddTaskNightUsed(tk.ID, cntime.DayCompactOf(startAt), used)' 1 '夜账入账接线在位（记起跑夜）'
+eq117 "$WK117" 'store.NightBudgetLeftMin(next.NightUsedMin, next.NightDay, today, capMin)' 1 '队首侧预算读数在位'
+eq117 "$WK117" 'store.NightBudgetLeftMin(tk.NightUsedMin, tk.NightDay, today, capMin)' 1 '运行侧预算截断读数在位'
+
+# D. 出队顺延过滤 + 旧口径不得复活
+eq117 "$RT117" 'OR defer_day <= ?' 1 '出队查询的顺延过滤在位（缺它=队首让位后 30s 又被取回，闸白设）'
+neg117 "$RT117" 'SameReasonFailLimit' '旧「同因」常量名不得复活（口径已不看原因，名字会撒谎）'
+neg117 "$WK117" 'SameReasonFailLimit' '旧「同因」常量名不得复活（worker 侧）'
+neg117 "$M14117" 'SameReasonFailLimit' '旧「同因」常量名不得复活（熔断测试侧）'
+
+# E. 行为腿：store 五例（顺延过滤/队首让位零行必响/让位 running-only/夜账翻页/未跑完顺延）
+CNT117=$((CNT117 + 1))
+STORERUN117=$(go test -count=1 ./internal/store/ -run 'TestDeferDay|TestDeferQueued|TestYieldTask|TestNightBudget|TestMarkTaskUnfinished' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)' || true)
+echo "$STORERUN117" | grep -q '^ok' || { echo "--- FAIL: §117 store 行为腿红：$STORERUN117"; exit 1; }
+# F. 行为腿：worker 两条（队首让位+解堵 ~1s／预算截断让位 ~65s——预算按整数分钟无更短档）
+CNT117=$((CNT117 + 1))
+WKRUN117=$(go test -count=1 ./internal/scheduler/ -run 'TestNightcap' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)' || true)
+echo "$WKRUN117" | grep -q '^ok' || { echo "--- FAIL: §117 worker 行为腿红：$WKRUN117"; exit 1; }
+
+# G. 反证三枚（go test -overlay 零改源，§116 同族三条纪律：变异落地数恰 1、断本枚独有红、仓库字节不动）
+#   R1 摘出队顺延过滤（比较符反转→顺延行照样出队）⇒ 顺延过滤用例必红；
+#   R2 摘连败闸（挂起条件只留累计闸）⇒ 连败挂起用例必红（6 次不再挂起＝口径归一失效）；
+#   R3 摘环级顺延判定（恒不 defer）⇒ 未跑完顺延用例必红。
+NG117="$(mktemp -d /tmp/nc117gate-XXXXXX 2>/dev/null || true)"
+[ -n "$NG117" ] || { echo "--- FAIL: §117 建不出 overlay 目录，三枚反证无法跑（宁可红，不许跳）"; exit 1; }
+
+ovl117() { # $1=sed 表达式 $2=跑哪个测试 $3=反证名 → 变异副本必红
+	sed -e "$1" "$RT117" > "$NG117/mutated.go"
+	if cmp -s "$RT117" "$NG117/mutated.go"; then
+		echo "--- FAIL: §117 反证 $3 的 sed 未生效（锚行漂了，这条绿是假绿）"; exit 1
+	fi
+	printf '{"Replace": {"%s/%s": "%s/mutated.go"}}' "$(pwd)" "$RT117" "$NG117" > "$NG117/overlay.json"
+	if go test -count=1 -overlay "$NG117/overlay.json" ./internal/store/ -run "$2" >/dev/null 2>&1; then
+		echo "--- FAIL: §117 反证 $3 期望变红实得绿＝对应锁没牙（判据与用例脱钩）"; exit 1
+	fi
+	CNT117=$((CNT117 + 1))
+}
+# sed 分隔符用 @：R2 的判据串里含 ||（| 当分隔符会把判据劈成 pattern/flags 两截，sed 直接报错）
+ovl117 's@defer_day <= ?@defer_day >= ?@' 'TestDeferDayBlocksDequeueUntilDue' 'R1 出队顺延过滤'
+ovl117 's@streak >= ConsecutiveFailLimit || total >= TotalRequeueLimit@total >= TotalRequeueLimit@' 'TestTaskSameCauseBreaker' 'R2 连败闸摘除'
+ovl117 's@streak >= DeferralStreakLimit && nextDay != ""@false@' 'TestMarkTaskUnfinishedDefersAtStreakLimit' 'R3 环级顺延判定'
+rm -rf "$NG117"
+
+echo "ok - §117 §NIGHTCAP 专项守卫通过：阈值常量与配置默认 7 道 + 伪状态与 store 入口/列 12 道 + worker 接线 7 道 + 顺延过滤与旧名负锁 4 道 + 行为腿 2 组（store 5 例＋worker 2 例）+ 反证 3 枚，累计判定点 ${CNT117}"
+echo ""
 echo ""
 
 echo "==> 全部通过"

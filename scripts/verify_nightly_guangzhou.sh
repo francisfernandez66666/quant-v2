@@ -60,13 +60,14 @@ RESEARCH_MAX_AGE_MIN="${RESEARCH_MAX_AGE_MIN:-5}"
 RESEARCH_MEM_LIMIT_MB="${RESEARCH_MEM_LIMIT_MB:-900}"
 TASK_MAX_AGE_HOURS="${TASK_MAX_AGE_HOURS:-48}"
 ACTIVE_QUEUE_MAX="${ACTIVE_QUEUE_MAX:-30}"
-# §QUEUE-REQUEUE（2026-10-12）队列侧两把尺子，与 Go 侧 store.TotalRequeueLimit 同源（20）：
+# §QUEUE-REQUEUE（2026-10-12）队列侧两把尺子，与 Go 侧 store.TotalRequeueLimit 同源
+# （§NIGHTCAP 2026-10-14 起＝8，门禁 §106 钉四门跨语言等值）：
 #   PARKED_MAX＝库里 failed_needs_attention 条数上限（默认 0：挂起就是"要人看"，不该天天红着，
 #                但也绝不能绿着隐身——红一条具名腿比整条链静默强）；
 #   REQUEUE_MAX＝活跃行累计回队次数上限（达 store 侧阈值时本应已挂起；库里还留着一行转到这个
 #                次数＝熔断闸没落上，属于判据失效，必须现形而不是当积压一起忽略）。
 PARKED_MAX="${PARKED_MAX:-0}"
-REQUEUE_MAX="${REQUEUE_MAX:-20}"
+REQUEUE_MAX="${REQUEUE_MAX:-8}"
 CAND_MAX_AGE_DAYS="${CAND_MAX_AGE_DAYS:-7}"
 AMOUNT_CHECK_ROWS="${AMOUNT_CHECK_ROWS:-800}"
 
@@ -116,7 +117,7 @@ param(
     [int]$TaskAgeHours = 48,
     [int]$CandAgeDays = 7,
     [int]$ParkedMax = 0,
-    [int]$RequeueMax = 20
+    [int]$RequeueMax = 8
 )
 function Probe([string]$name, [bool]$ok, [string]$detail) {
     $tag = if ($ok) { "PASS" } else { "FAIL" }
@@ -257,7 +258,7 @@ def main():
     # §QUEUE-REQUEUE（2026-10-12）两把队列熔断尺子的兜底默认，与 bash/PS/Go 四处同源：
     #   requeue-max 的字面值必须等于 Go 侧 store.TotalRequeueLimit（门禁 §106 钉这条跨语言等值）。
     ap.add_argument("--parked-max", type=int, default=0)
-    ap.add_argument("--requeue-max", type=int, default=20)
+    ap.add_argument("--requeue-max", type=int, default=8)
     a = ap.parse_args()
 
     now = dt.datetime.now()
@@ -352,6 +353,35 @@ def main():
                 "SELECT MIN(chain_day) FROM research_tasks "
                 "WHERE status IN ('queued','running','paused','preempted') AND chain_day<>''").fetchone()
             oldest_chain = crow2[0] or "none"
+        # ── §NIGHTCAP（2026-10-14）让位/占用读数：把"今晚谁在让位、谁占了多久"读成字段。
+        #   deferred_now ＝ 已被顺延到未来某夜、还在队里的条数（54 条积压排水期天天 >0 属设计内，
+        #                  只出读数不判红——判红口径挂账待裁，与 CAL-COVER 读数同批规矩）；
+        #   night_used_today ＝ 活跃行里「今天」夜账占用的最大分钟数（占用上限 240 的现场读数）。
+        #   列缺席报红（reasons=nightcap_col_absent）：四列由新 binary 首次开库幂等迁移添加，
+        #   缺席＝这台机还没跑过带夜账的版本，属于必须现形的时序差（§缺数不报 0 同族）。
+        deferred_now, deferred_ids, night_used_today, nightcap_state = 0, "none", 0, "ok"
+        today_str2 = now.strftime("%Y%m%d")
+        if "defer_day" in cols and "night_used_min" in cols:
+            drows = cur.execute(
+                "SELECT id, type, defer_day FROM research_tasks "
+                "WHERE status IN ('queued','running','paused','preempted') "
+                "AND COALESCE(defer_day,'')>? ORDER BY defer_day, id LIMIT 8",
+                (today_str2,)).fetchall()
+            deferred_now = int(cur.execute(
+                "SELECT COUNT(*) FROM research_tasks "
+                "WHERE status IN ('queued','running','paused','preempted') "
+                "AND COALESCE(defer_day,'')>?").fetchone()[0] or 0)
+            if drows:
+                deferred_ids = ",".join("%s:%s->%s" % (r[0], r[1], r[2]) for r in drows)
+            nrow = cur.execute(
+                "SELECT id, night_used_min FROM research_tasks "
+                "WHERE status IN ('queued','running','paused','preempted') "
+                "AND night_day=? ORDER BY night_used_min DESC, id ASC LIMIT 1",
+                (today_str2,)).fetchone()
+            if nrow:
+                night_used_today = int(nrow[1] or 0)
+        else:
+            nightcap_state = "absent"
         reasons = []
         if active > a.active_max:
             reasons.append("backlog_gt_%d" % a.active_max)
@@ -365,9 +395,12 @@ def main():
             reasons.append("requeue_col_absent")
         elif churn_max >= a.requeue_max:
             reasons.append("churn_ge_%d" % a.requeue_max)
+        if nightcap_state != "ok":
+            reasons.append("nightcap_col_absent")
         detail = ("active=%d limit=%d last_updated_age_h=%s last_type=%s last_status=%s "
                   "by_status=%s oldest_active_age_h=%s parked=%d parked_max=%d parked_first=%s "
-                  "churn_max=%s churn_max_task=%s requeue_max=%d oldest_chain_day=%s reasons=%s") % (
+                  "churn_max=%s churn_max_task=%s requeue_max=%d oldest_chain_day=%s "
+                  "deferred_now=%d deferred_first=%s night_used_today=%d nightcap_cols=%s reasons=%s") % (
             active, a.active_max,
             ("%.1f" % last_age_h) if last_age_h is not None else "unparsed",
             (last[0] if last else "none"), (last[1] if last else "none"),
@@ -375,7 +408,9 @@ def main():
             ("%.1f" % oldest_age_h) if oldest_age_h is not None else "unparsed",
             parked, a.parked_max, parked_first,
             churn_max if col_state == "ok" else "absent", churn_max_id, a.requeue_max,
-            oldest_chain, ",".join(reasons) if reasons else "none")
+            oldest_chain,
+            deferred_now, deferred_ids, night_used_today, nightcap_state,
+            ",".join(reasons) if reasons else "none")
         emit("INFO", "nightly_queue " + detail)
         okq = not reasons
         emit("PASS" if okq else "FAIL", "queue:research task queue drained and recent terminal state", detail)

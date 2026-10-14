@@ -893,6 +893,17 @@ type SchedulerConfig struct {
 	// English: memory gate — tasks stay queued when system MemAvailable drops below this.
 	// 内存总闸阈值（MB）
 	MinFreeMemMB int `json:"min_free_mem_mb"`
+	// PerTaskNightMaxMin §NIGHTCAP（2026-10-14）单条任务单夜占用上限（分钟）：0=用内置默认
+	// 240（store.NightCapDefaultMin，两处等值由门禁 §117 锁）；负数=不限（逃生口，不建议）；
+	// 仅对 low 优先级生效。夜窗只有一个消费槽，历史上一条三年窗因子发现每夜吃光 8 小时步长
+	// 却永不落终态，队首后面 54 条一条都排不动。上限落地后单条任务一夜最多占 240 分钟，
+	// 到点让位（进度/断点缓存保留，顺延下一夜续跑），后面的链任务得以排水；起跑前余额
+	// 不足 MinNightStartMin（15 分钟）时同样直接让位。
+	// English: per-task nightly occupancy cap (minutes): 0 = built-in default 240, negative =
+	// uncapped escape hatch; low priority only. One never-finishing task used to monopolise
+	// whole nights on the single worker slot; the cap turns it into a bounded share with a
+	// yield-and-resume hand-off.
+	PerTaskNightMaxMin int `json:"per_task_night_max_min"`
 	// ReplayThrottleMs 战法库全量回放逐股节流（毫秒/只）：>0 时回放循环每处理完一只股票
 	// sleep 该时长——盘后十几个小时足够，用拉长总时长换取对 quant/系统的瞬时 CPU 挤压最小化
 	// （2 核 4G 服务器上全池回放瞬时会把可用内存打到熔断线以下）。0=不节流。
@@ -1087,6 +1098,13 @@ func DefaultSchedulerConfig() SchedulerConfig {
 			IntervalMinutes: 30,
 		},
 		TrimIntervalMin: 15,
+		// §NIGHTCAP（2026-10-14）单条任务单夜占用上限默认 240 分钟：与 store.NightCapDefaultMin
+		// 同源（门禁 §117 等值锁钉两处一致）。默认即开启——夜窗只有唯一消费槽，不设上限就是
+		// 允许一条跑不完的任务占光整夜（现网 #416 实录：六夜排不出一条）。
+		// English: per-task nightly occupancy cap default 240 minutes, kept equal to
+		// store.NightCapDefaultMin (gate-locked); on by default because the night has a single
+		// consumer slot.
+		PerTaskNightMaxMin: 240,
 	}
 }
 
@@ -2986,6 +3004,13 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 	// 服务器实际空闲可用内存仅几百 MB，400 兜底无法按需留足 quant 余量。
 	if v, ok := cfgInt(m, "min_free_mem_mb"); ok {
 		out.MinFreeMemMB = v
+	}
+	// §NIGHTCAP（2026-10-14）单条任务单夜占用上限（分钟）：同上，解析遗漏＝配置值永远不
+	// 生效——这里必须与字段默认值（240，见 DefaultSchedulerConfig）分开写，等值由门禁 §117 锁。
+	// English: per-task nightly occupancy cap (minutes) — parse here so the JSON key actually
+	// takes effect; the built-in default lives in DefaultSchedulerConfig.
+	if v, ok := cfgInt(m, "per_task_night_max_min"); ok {
+		out.PerTaskNightMaxMin = v
 	}
 	if v, ok := cfgInt(m, "replay_throttle_ms"); ok {
 		out.ReplayThrottleMs = v

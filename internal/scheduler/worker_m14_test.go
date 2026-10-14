@@ -1,16 +1,26 @@
-// §M14（2026-09-22）同因连败熔断 worker 侧守护测试（反例锁）：
-//   - 确定性失败（同因）连败达阈值 → failed_needs_attention 挂起终态，此后绝不再被出队执行，
+// §M14（2026-09-22）连败熔断 worker 侧守护测试（反例锁）：
+//   - 确定性失败连败达阈值 → failed_needs_attention 挂起终态，此后绝不再被出队执行，
 //     高优告警恰好一次，挂起全程留痕（error 列 / opslog / state 文件）；
-//   - 异因失败不误伤：每次失败指纹不同则连败恒从 1 重计，维持回队重试主策略。
+//   - §NIGHTCAP（2026-10-14）口径归一：连败计数**不再比对错误指纹**——超时与被抢占两条
+//     文案天然交替时旧实现每轮都把 streak 洗回 1（现网 #416 六夜空烧的成因之一），
+//     所以「换着原因失败」同样累加连败，达 ConsecutiveFailLimit(6) 一并挂起，
+//     挂起文案写「连败熔断」而不是旧口径的「同因连败」（照旧文案找一个不存在的共同原因）。
 //
-// §QUEUE-REQUEUE（2026-10-12）本文件再加两条 worker 侧守护：
-//   - 异因循环不再是「无限循环」：不管原因怎么换，累计回队达 TotalRequeueLimit 也必须挂起，
-//     且挂起文案/告警必须写清是「累计回队」而不是「同因连败」（现网 33 次回队的成因就在这条漏网闸上）；
+// §QUEUE-REQUEUE（2026-10-12）累计回队闸的 worker 侧说明：失败路径上 streak 与 total 同步
+// 递增，而连败阈值(6) < 累计阈值(8)，失败-only 路径数学上必先触连败闸——累计闸的独占射程
+// 是「抢占/重启续跑」（RequeueAfterPreemption 只记 total 不记 streak），该路径的阈值闸在
+// store 层 TestTaskPreemptRequeueKeepsStreakAndCounts 钉死，worker 接线由
+// TestWorkerPreemptsLowByHigh 覆盖，此处不再重复一根同形腿（旧 TestMixedCauseRequeueCapParksTask
+// 的前提「异因逃过同因闸」已随口径归一作废，用例删除）。
 //   - 夜间链收尾：同链有步被挂起时 done 位绝不置起（排空 ≠ 跑完）。
 //
-// English: M14 guard tests — identical-cause streak parks the task (one-shot alert, no more
-// requeue); mixed-cause failures never trip the *streak* breaker but are capped by the
-// cause-independent requeue limit; a parked chain step keeps the nightly done flag false.
+// §NIGHTCAP 本批的让位/占用行为腿在 worker_nightcap_test.go（队首预算闸、单夜占用到点让位）。
+//
+// English: M14 guard tests — the failure streak breaker no longer compares error fingerprints
+// (the timeout/preemption text alternation used to reset it forever), so alternating causes also
+// park at ConsecutiveFailLimit with the new「连败熔断」wording; the cause-independent requeue cap
+// is only reachable via preemption requeues and is pinned at store level; a parked chain step
+// keeps the nightly done flag false.
 package scheduler
 
 import (
@@ -123,10 +133,10 @@ func runTaskCalls(t *testing.T, logPath string) int {
 	return n
 }
 
-// TestSameCauseBreakerParksTask §M14 反例锁（同因连败 10 次后不再重排）：
+// TestConsecutiveFailBreakerParksTask §M14 反例锁（§NIGHTCAP 口径归一：连败 6 次后不再重排）：
 // 一条恒定失败的 high 任务被反复回队重试，触阈值后必须挂起为 failed_needs_attention、
 // 告警一次、留痕可审计，且后续 tick 绝不再拉起子进程（不再烧算力）。
-func TestSameCauseBreakerParksTask(t *testing.T) {
+func TestConsecutiveFailBreakerParksTask(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "fake.log")
 	bin := failRunTaskScript(t, dir, logPath, false)
@@ -168,7 +178,9 @@ func TestSameCauseBreakerParksTask(t *testing.T) {
 
 	prevRetry := 0
 	tripped := false
-	for round := 0; round < store.SameReasonFailLimit+3; round++ {
+	// §NIGHTCAP 阈值 6 < 累计 8：本用例恒定失败，若挂起来自累计闸（文案带「累计回队」）
+	// 说明连败闸被绕过，由下方文案断言反向锁死——先触的必须是更可诊断的那条。
+	for round := 0; round < store.ConsecutiveFailLimit+3; round++ {
 		beginRound(t, s, clk) // 越过 5min 失败冷却窗，模拟夜间逐轮慢速重试
 		waitFor(t, roundSettleWait, func() bool {
 			tk, _ := qdb.GetResearchTask(id)
@@ -182,17 +194,20 @@ func TestSameCauseBreakerParksTask(t *testing.T) {
 		}
 	}
 	if !tripped {
-		t.Fatalf("同因 %d 连败后应挂起 failed_needs_attention", store.SameReasonFailLimit)
+		t.Fatalf("连败 %d 次后应挂起 failed_needs_attention", store.ConsecutiveFailLimit)
 	}
 	tk, _ := qdb.GetResearchTask(id)
-	if tk.FailStreak != store.SameReasonFailLimit {
-		t.Fatalf("同因连败计数应为 %d, 实际 %d", store.SameReasonFailLimit, tk.FailStreak)
+	if tk.FailStreak != store.ConsecutiveFailLimit {
+		t.Fatalf("连败计数应为 %d, 实际 %d", store.ConsecutiveFailLimit, tk.FailStreak)
 	}
-	if !strings.Contains(tk.Error, "同因连败熔断") || !strings.Contains(tk.Error, "数据缺失") {
+	if !strings.Contains(tk.Error, "连败熔断") || !strings.Contains(tk.Error, "数据缺失") {
 		t.Fatalf("挂起留痕应含熔断标记+原始原因, got %q", tk.Error)
 	}
-	if got := runTaskCalls(t, logPath); got != store.SameReasonFailLimit {
-		t.Fatalf("子进程应恰好被执行 %d 次（触阈值即停）, 实际 %d", store.SameReasonFailLimit, got)
+	if strings.Contains(tk.Error, "累计回队") {
+		t.Fatalf("失败-only 路径必先触连败闸（6<8），挂起不应来自累计闸, got %q", tk.Error)
+	}
+	if got := runTaskCalls(t, logPath); got != store.ConsecutiveFailLimit {
+		t.Fatalf("子进程应恰好被执行 %d 次（触阈值即停）, 实际 %d", store.ConsecutiveFailLimit, got)
 	}
 	// §M14 高优告警恰好一次（挂起是瞬时跃迁，天然去重）
 	// §flake 根修（2026-09-22 收尾核验）：告警在 runner 协程里于「DB 挂起落库」之后才异步
@@ -201,6 +216,15 @@ func TestSameCauseBreakerParksTask(t *testing.T) {
 	waitFor(t, 15*time.Second, func() bool { return alerts.count() >= 1 }, "熔断告警应送达")
 	if got := alerts.count(); got != 1 {
 		t.Fatalf("熔断告警应恰好 1 次, 实际 %d", got)
+	}
+	// §NIGHTCAP 成因分岔锁：连败闸触的告警必须报「连败 N 次」——报成「累计回队」就是
+	// 告警撒谎（运维照假成因排查一个不存在的转圈史）。notifyRequeueBreaker 的分岔没跟上
+	// 新前缀「连败熔断」时正是这个形态（本批实锤后修）。
+	alerts.mu.Lock()
+	streakBody := strings.Join(alerts.calls, "\n")
+	alerts.mu.Unlock()
+	if !strings.Contains(streakBody, "连败") || strings.Contains(streakBody, "累计回队") {
+		t.Fatalf("连败闸告警正文应报连败次数（不得报累计回队）, got %q", streakBody)
 	}
 	// 挂起留痕落到展示状态上报（recordStepState → research_state.json）：
 	// 用测试开头安装的 stepStateObserver 事件流判定（根修说明见安装处注释）。
@@ -234,7 +258,7 @@ func TestSameCauseBreakerParksTask(t *testing.T) {
 	if tk2, _ := qdb.GetResearchTask(id); tk2.Status != store.TaskNeedsAttention {
 		t.Fatalf("挂起终态不应被后续 tick 改动, 实际 %s", tk2.Status)
 	}
-	if got := runTaskCalls(t, logPath); got != store.SameReasonFailLimit {
+	if got := runTaskCalls(t, logPath); got != store.ConsecutiveFailLimit {
 		t.Fatalf("挂起后不得再拉起子进程（不再重排队烧算力）, 实际执行 %d 次", got)
 	}
 	if got := alerts.count(); got != 1 {
@@ -243,13 +267,18 @@ func TestSameCauseBreakerParksTask(t *testing.T) {
 	waitIdleAndSettle(t, s)
 }
 
-// TestDifferentCauseFailuresNeverBreaker §M14 反例锁（不同因失败不误伤）：
-// 每次失败原因指纹不同（瞬态抖动族），远超同因阈值仍维持回队重试、不挂起、不告警，
-// 连败计数恒为 1（异因从 1 重计）。
-func TestDifferentCauseFailuresNeverBreaker(t *testing.T) {
+// TestDifferentCauseFailuresStillPark §NIGHTCAP（2026-10-14）口径归一的正面腿（旧
+// TestDifferentCauseFailuresNeverBreaker 的反演）：连败判据不再比对错误指纹——每次失败
+// 原因各不相同（rotate 假二进制逐轮换文案）**同样累加**连败，达 ConsecutiveFailLimit(6)
+// 一并挂起，挂起文案是「连败熔断」而不是「累计回队」（6<8，失败-only 路径先触连败闸）。
+// 旧实现里这正是 #416 形态的漏洞：超时与被抢占文案交替，streak 每轮洗回 1，熔断读数恒 1
+// 而任务空烧六夜。
+// English: the inverted guard — alternating failure reasons no longer reset the streak;
+// the task still parks at ConsecutiveFailLimit via the (more diagnostic) streak breaker.
+func TestDifferentCauseFailuresStillPark(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "fake.log")
-	bin := failRunTaskScript(t, dir, logPath, true) // 每次末行原因带自增轮次
+	bin := failRunTaskScript(t, dir, logPath, true) // 每次末行原因带自增轮次（指纹各不相同）
 	dbPath := filepath.Join(dir, "trading.db")
 	cfg := cfgSamples(bin, dbPath)
 	cfgPath := mustConfig(t, cfg)
@@ -272,67 +301,11 @@ func TestDifferentCauseFailuresNeverBreaker(t *testing.T) {
 		t.Fatal(err)
 	}
 	prevRetry := 0
-	rounds := store.SameReasonFailLimit + 2 // 超过阈值：若是同因早已熔断挂起
-	for round := 0; round < rounds; round++ {
-		beginRound(t, s, clk)
-		waitFor(t, roundSettleWait, func() bool {
-			tk, _ := qdb.GetResearchTask(id)
-			return tk != nil && tk.RetryCount > prevRetry
-		}, fmt.Sprintf("第 %d 轮异因失败应回队重试", round))
-		tk, _ := qdb.GetResearchTask(id)
-		prevRetry = tk.RetryCount
-	}
-	tk, _ := qdb.GetResearchTask(id)
-	if tk.Status != store.TaskQueued {
-		t.Fatalf("异因循环 %d 次应维持 queued 重试（不设上限主策略）, 实际 %s", rounds, tk.Status)
-	}
-	if tk.FailStreak != 1 {
-		t.Fatalf("异因每次应从 1 重计, 实际 fail_streak=%d", tk.FailStreak)
-	}
-	if got := alerts.count(); got != 0 {
-		t.Fatalf("异因失败绝不应触发熔断告警, 实际 %d 次", got)
-	}
-	waitIdleAndSettle(t, s)
-}
-
-// TestMixedCauseRequeueCapParksTask §QUEUE-REQUEUE（2026-10-12）累计回队闸的 worker 侧证据：
-// 现网实录是「同一个 high 任务被 8 小时单步超时反复送回队尾 33 次」——每轮失败原因都不同
-// （网络/上游/分区缺失轮换），指纹一变 §M14 的同因连败就归零，于是旧实现里这条任务可以
-// 永远排在队列里无限烧算力，而夜间验收只看得到「队列 31 条 > 30」这一个数、归不了因。
-// 本用例把这条漏网闸钉成行为腿：异因循环必须达 TotalRequeueLimit 挂起，且告警/库内文案
-// 必须写成「累计回队」（写成「同因连败」会把真实成因在运维面上撒谎，正是本批要修的病根）。
-func TestMixedCauseRequeueCapParksTask(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "fake.log")
-	bin := failRunTaskScript(t, dir, logPath, true) // rotate=true：每轮末行原因各不相同
-	dbPath := filepath.Join(dir, "trading.db")
-	cfg := cfgSamples(bin, dbPath)
-	cfgPath := mustConfig(t, cfg)
-	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
-	alerts := &alertCapture{}
-	s.SetAlertFunc(alerts.fn)
-	loc := time.FixedZone("CST", 8*3600)
-	clk := &manualClock{t: time.Date(2026, 8, 22, 16, 0, 0, 0, loc)} // 周六盘后
-	s.setNow(clk.now)
-
-	qdb, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("打开队列: %v", err)
-	}
-	defer qdb.Close()
-	id, err := qdb.EnqueueResearchTask(&store.ResearchTask{
-		Type: store.TaskBacktestCandidate, RefID: 99, Priority: "high", Payload: `{}`,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	prevRetry := 0
 	tripped := false
-	// 上界留 +3 轮余量：若累计闸失效，这里会一直 queued 转圈，最终由下面的 tripped 断言判红
-	// （而不是让循环本身悄悄跑不完）。
-	for round := 0; round < store.TotalRequeueLimit+3; round++ {
-		beginRound(t, s, clk) // 越过 5min 失败冷却窗
+	// 上界留 +3 轮余量：若换因洗账的旧病复发（streak 每轮归 1），累计闸 8 也要 8 轮才触，
+	// 循环 9 轮仍挂起则文案断言会判出「挂起来自累计闸」＝口径归一失效，同样红。
+	for round := 0; round < store.ConsecutiveFailLimit+3; round++ {
+		beginRound(t, s, clk)
 		waitFor(t, roundSettleWait, func() bool {
 			tk, _ := qdb.GetResearchTask(id)
 			return tk != nil && (tk.RetryCount > prevRetry || tk.Status == store.TaskNeedsAttention)
@@ -345,35 +318,27 @@ func TestMixedCauseRequeueCapParksTask(t *testing.T) {
 		}
 	}
 	if !tripped {
-		t.Fatalf("异因循环 %d 次后应被累计回队闸挂起，实际仍在回队", store.TotalRequeueLimit)
+		t.Fatalf("换因失败 %d 轮后必须挂起（口径归一：连败不看原因）", store.ConsecutiveFailLimit)
 	}
 	tk, _ := qdb.GetResearchTask(id)
-	if tk.RequeueTotal != store.TotalRequeueLimit {
-		t.Fatalf("累计回队计数应为 %d, 实际 %d", store.TotalRequeueLimit, tk.RequeueTotal)
+	if tk.FailStreak != store.ConsecutiveFailLimit {
+		t.Fatalf("换因失败连败账应逐轮累加到 %d（不再每轮洗回 1）, 实际 %d", store.ConsecutiveFailLimit, tk.FailStreak)
 	}
-	// 成因自证：异因每次从 1 重计 ⇒ 同因闸确实没被触发，挂起只能来自累计闸。
-	if tk.FailStreak != 1 {
-		t.Fatalf("异因循环 fail_streak 应恒为 1（同因闸未触发）, 实际 %d", tk.FailStreak)
+	if tk.RequeueTotal != store.ConsecutiveFailLimit {
+		t.Fatalf("累计回队账应与连败同步为 %d, 实际 %d", store.ConsecutiveFailLimit, tk.RequeueTotal)
 	}
-	if !strings.Contains(tk.Error, "累计回队熔断") {
-		t.Fatalf("挂起文案应含累计回队标记, got %q", tk.Error)
+	if !strings.Contains(tk.Error, "连败熔断") || strings.Contains(tk.Error, "累计回队") {
+		t.Fatalf("挂起必须来自连败闸（先触、更可诊断）, got %q", tk.Error)
 	}
-	if got := store.RequeueTripReasonOf(tk.Error); got != "total_requeue" {
-		t.Fatalf("挂起成因应判读为 total_requeue, 实际 %s（文案=%q）", got, tk.Error)
+	if got := store.RequeueTripReasonOf(tk.Error); got != "consecutive_fail" {
+		t.Fatalf("挂起成因应判读为 consecutive_fail, 实际 %s（文案=%q）", got, tk.Error)
 	}
-	if got := runTaskCalls(t, logPath); got != store.TotalRequeueLimit {
-		t.Fatalf("子进程应恰好执行 %d 次（达上限即停）, 实际 %d", store.TotalRequeueLimit, got)
+	if got := runTaskCalls(t, logPath); got != store.ConsecutiveFailLimit {
+		t.Fatalf("子进程应恰好执行 %d 次（达阈值即停）, 实际 %d", store.ConsecutiveFailLimit, got)
 	}
-	waitFor(t, 15*time.Second, func() bool { return alerts.count() >= 1 }, "累计回队熔断告警应送达")
+	waitFor(t, 15*time.Second, func() bool { return alerts.count() >= 1 }, "熔断告警应送达")
 	if got := alerts.count(); got != 1 {
 		t.Fatalf("熔断告警应恰好 1 次, 实际 %d", got)
-	}
-	// 告警正文必须带上真实成因（运维只读这一段话，写「同因连败」会让人去找一个不存在的原因）。
-	alerts.mu.Lock()
-	body := strings.Join(alerts.calls, "\n")
-	alerts.mu.Unlock()
-	if !strings.Contains(body, "累计回队") {
-		t.Fatalf("告警正文应含「累计回队」成因口径, got %q", body)
 	}
 	// 挂起后继续 tick：绝不复活、绝不再出队执行
 	for round := 0; round < 3; round++ {
@@ -384,11 +349,13 @@ func TestMixedCauseRequeueCapParksTask(t *testing.T) {
 	if tk2, _ := qdb.GetResearchTask(id); tk2.Status != store.TaskNeedsAttention {
 		t.Fatalf("挂起终态不应被后续 tick 改动, 实际 %s", tk2.Status)
 	}
-	if got := runTaskCalls(t, logPath); got != store.TotalRequeueLimit {
-		t.Fatalf("挂起后不得再拉起子进程, 实际执行 %d 次", got)
-	}
 	waitIdleAndSettle(t, s)
 }
+
+// （旧 TestMixedCauseRequeueCapParksTask 已删：其前提「异因逃过同因闸、只有累计闸能拦」
+// 随 §NIGHTCAP 口径归一作废——失败-only 路径 streak==total 同步递增而 6<8，必先触连败闸，
+// 该形态已由上方 TestDifferentCauseFailuresStillPark 正面钉死；累计闸的独占射程只剩
+// 抢占/重启续跑，其阈值闸在 store 层 TestTaskPreemptRequeueKeepsStreakAndCounts 钉死。）
 
 // TestFinishTaskParkedChainKeepsDoneFalse §QUEUE-REQUEUE 收尾账本（排空 ≠ 跑完）：
 // 夜间链某步被熔断闸挂起后，它既不在活跃集合（queued/running/paused/preempted）也不再重试，

@@ -460,6 +460,21 @@ func memGateDecide(availMB, threshMB int) bool {
 	return availMB >= threshMB
 }
 
+// nightCapMinutes §NIGHTCAP（2026-10-14）单夜占用上限取值：配置 0/未给＝内置默认
+// store.NightCapDefaultMin（240，与 config 默认值等值、门禁 §117 锁）；负数＝不限（返回 0
+// 表示禁用该闸，high 手动任务无论如何都不受限）。
+// English: resolves the per-task nightly occupancy cap — 0/absent falls back to the built-in
+// default, a negative config disables the gate entirely (returns 0).
+func nightCapMinutes(cfg config.SchedulerConfig) int {
+	if cfg.PerTaskNightMaxMin < 0 {
+		return 0
+	}
+	if cfg.PerTaskNightMaxMin == 0 {
+		return store.NightCapDefaultMin
+	}
+	return cfg.PerTaskNightMaxMin
+}
+
 // tryStartNext 空闲则出队下一个任务并启动（带盘后门控+内存总闸）。任务完成后的自驱排水入口，
 // 不依赖 30s tick，长队列可在夜班窗口内连续消费。
 // English: dequeues and starts the next task when idle (after-hours + memory gated). Self-draining.
@@ -500,6 +515,31 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	// submissions) must wait — otherwise leftovers become a gate bypass.
 	if !NightlyEligible(s.nowTime(), cfg) && next.Status != store.TaskPreempted {
 		return
+	}
+	// §NIGHTCAP（2026-10-14）单夜占用闸（队首侧）：低优先级任务本夜剩余预算不足起跑
+	// （MinNightStartMin 分钟）时不再认领——直接写 defer_day 让位，本夜剩余时间交给后面的
+	// 链任务。不设这把闸的话，出队查询每 30s 都会把同一条取回来，队首后面的任务一条也
+	// 轮不上（现网 #416 连续六夜独占队首的另一半成因）。high（手动紧急）不受限。
+	// English: §NIGHTCAP head-side budget gate — when a low-priority task has less than
+	// MinNightStartMin minutes of night budget left, defer it instead of claiming; 'high'
+	// (manual urgent) tasks are never capped.
+	if next.Priority == "low" {
+		if capMin := nightCapMinutes(cfg); capMin > 0 {
+			today := cntime.DayCompactOf(s.nowTime())
+			if left := store.NightBudgetLeftMin(next.NightUsedMin, next.NightDay, today, capMin); left < store.MinNightStartMin {
+				nextDay := cntime.DayCompactOf(s.nowTime().AddDate(0, 0, 1))
+				reason := fmt.Sprintf("单夜占用已达上限(%d分钟，余%d分钟不足起跑)，顺延至%s续跑", capMin, left, nextDay)
+				if err := db.DeferQueuedTaskToNight(next.ID, nextDay, reason); err != nil {
+					log.Printf("[scheduler] 任务 #%d 队首让位落库失败: %v", next.ID, err)
+					return
+				}
+				log.Printf("[scheduler] §NIGHTCAP 任务 #%d(%s) 单夜预算用尽，让位至 %s（progress/断点保留）",
+					next.ID, next.Type, nextDay)
+				opslog.Logf("research", "§NIGHTCAP 任务 #%d(%s) 单夜占用 %d/%d 分钟，让位至 %s",
+					next.ID, next.Type, next.NightUsedMin, capMin, nextDay)
+				return
+			}
+		}
 	}
 	s.mu.Lock()
 	if s.busy {
@@ -1205,10 +1245,11 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		tk.ID, tk.Type, tk.Priority, tk.RefID, tk.ChainDay, tk.ChainSeq)
 	opslog.Logf("research", "任务 #%d(%s) 启动 prio=%s chain=%s/%d", tk.ID, tk.Type, tk.Priority, tk.ChainDay, tk.ChainSeq)
 
-	// §失败重排队：失败不再落 error 终态——回队尾（updated_at 尾键沉底）；异因失败不设重试上限
-	// （瞬态失败此设计正确），§M14（2026-09-22）新增「同因连败熔断」兜底确定性失败
-	// （参数非法/数据必缺/缺二进制）：error 指纹连续 store.SameReasonFailLimit 次相同 →
-	// store 置 failed_needs_attention 挂起，本 worker 高优告警一次，不再秒级/冷却级重投。
+	// §失败重排队：失败不再落 error 终态——回队尾（requeue_seq 尾键沉底），不设重试上限
+	// （瞬态失败此设计正确）；§M14 连败熔断兜底确定性失败（参数非法/数据必缺/缺二进制）。
+	// §NIGHTCAP（2026-10-14）口径归一：连败计数**不再比对错误指纹**——超时与被抢占两条
+	// 文案天然交替时旧实现每轮把 streak 洗回 1（现网 #416 空烧六夜的成因之一），现改成
+	// 「连着 ConsecutiveFailLimit 次没跑成」即挂起；error 指纹列只作展示归因。
 	// error 列保留最后失败原因。冷却窗防快速失败自旋。
 	fail := func(errMsg string) {
 		log.Printf("[scheduler] 任务 #%d(%s) 失败→回队尾重试: %s", tk.ID, tk.Type, errMsg)
@@ -1238,6 +1279,25 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	// steady "回测进度 xx%" output means this can't mask a stall.
 	if tk.Type == store.TaskBacktestStrategy && timeout < 6*time.Hour {
 		timeout = 6 * time.Hour
+	}
+	// §NIGHTCAP（2026-10-14）单夜预算截断：低优先级任务的**本次实际可跑时长**取
+	// min(单步超时, 本夜剩余预算)。低优先级链任务再也吃不光整夜——到点子进程被杀，
+	// 终态走"让位"而不是"失败"（budgetCapped 标记在下面终态判定里分流）：
+	// progress/断点缓存保留，defer_day 写下一夜，两把熔断账都不动。
+	// English: §NIGHTCAP caps the *effective* per-run duration at the remaining night budget
+	// for low-priority tasks; the terminal-state router treats an expiry of that budget as a
+	// planned yield, not a failure.
+	budgetCapped := false
+	if tk.Priority == "low" {
+		if capMin := nightCapMinutes(cfg); capMin > 0 {
+			today := cntime.DayCompactOf(s.nowTime())
+			if left := store.NightBudgetLeftMin(tk.NightUsedMin, tk.NightDay, today, capMin); left >= 0 {
+				if budget := time.Duration(left) * time.Minute; budget < timeout {
+					timeout = budget
+					budgetCapped = true
+				}
+			}
+		}
 	}
 	runCtx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
@@ -1532,9 +1592,9 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	}
 
 	// 终态判定（优先级：抢占 > 用户取消 > 单步超时 > 运行错误 > 成功）
-	// §失败重排队：超时/运行错误不再落 error 终态——统一回队尾重试（异因不设上限），
-	// error 列记最后一次失败原因；仅用户取消保持终态。
-	// §M14 同因连败达阈值时 RequeueFailedTask 不再回队，改挂起 failed_needs_attention+告警。
+	// §失败重排队：超时/运行错误不再落 error 终态——统一回队尾重试，error 列记最后一次
+	// 失败原因；仅用户取消保持终态。§M14 连败达阈值时 RequeueFailedTask 不再回队，改挂起
+	// failed_needs_attention+告警（§NIGHTCAP 起连败不看原因，见 store 侧常量注释）。
 	status := store.TaskDone
 	errMsg := ""
 	var resultNum float64
@@ -1550,8 +1610,16 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		status = store.TaskCancelled
 		errMsg = "用户取消"
 	case runCtx.Err() == context.DeadlineExceeded && base.Err() == nil:
-		status = store.TaskFailedRetry
-		errMsg = fmt.Sprintf("单步超时(%v)，已回队尾重试", timeout)
+		if budgetCapped {
+			// §NIGHTCAP 单夜预算到点：设计内让位，不是失败——不进连败账/累计回队账，
+			// progress 与断点缓存原样保留，defer_day 顺延下一夜（见下方 TaskYielded 分派）。
+			// English: the night budget expired — a planned yield, not a failure.
+			status = store.TaskYielded
+			errMsg = fmt.Sprintf("单夜占用达上限(%v)，让位至下一夜续跑（进度/断点缓存保留）", timeout)
+		} else {
+			status = store.TaskFailedRetry
+			errMsg = fmt.Sprintf("单步超时(%v)，已回队尾重试", timeout)
+		}
 	case base.Err() != nil:
 		// §停机语义修正：调度器 ctx 取消（SIGTERM/restart）→ preempted，断点续跑
 		status = store.TaskPreempted
@@ -1595,14 +1663,35 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			}
 		}
 	}
+	// §NIGHTCAP（2026-10-14）夜账入账：本次运行占用多少分钟，整段记在**起跑那一夜**的
+	// 北京日键下（跨零点的运行也整段记起跑夜，隔日自动翻页）。所有终态（成功/失败/抢占/
+	// 让位）都要入账——占用就是占用，与结局无关。起跑时刻取认领时落库的 started_at；
+	// 解析失败不阻塞终态链路（少记一次账可容忍，卡死终态落库不可容忍）。
+	if startAt, perr := time.ParseInLocation("2006-01-02 15:04:05", tk.StartedAt, time.Local); perr == nil {
+		used := int(s.nowTime().Sub(startAt).Minutes())
+		if used < 0 {
+			used = 0
+		}
+		if err := db.AddTaskNightUsed(tk.ID, cntime.DayCompactOf(startAt), used); err != nil {
+			log.Printf("[scheduler] 任务 #%d 夜账入账失败: %v", tk.ID, err)
+		}
+	}
 	// 先落运行终态，再做状态翻转（顺序不可换：Requeue* 的 WHERE 依赖前置状态，
 	// 且翻转后不得再被 Update 覆盖回去——否则盘后门控会把 preempted 无限重启）。
-	if status != store.TaskFailedRetry {
+	// §NIGHTCAP：yielded 走自己的落库入口（YieldTaskToNight），不走 UpdateTaskRunState。
+	if status != store.TaskFailedRetry && status != store.TaskYielded {
 		if err := db.UpdateTaskRunState(tk.ID, status, progress, resultNum, resultText, errMsg); err != nil {
 			log.Printf("[scheduler] 任务 #%d 终态落库失败: %v", tk.ID, err)
 		}
 	}
-	if status == store.TaskPreempted {
+	nextNight := cntime.DayCompactOf(s.nowTime().AddDate(0, 0, 1)) // §NIGHTCAP 顺延目标日=下一夜
+	if status == store.TaskYielded {
+		// §NIGHTCAP 让位分派：status 回 queued、defer_day=下一夜、error 写让位原因、
+		// progress 不动（跟失败回队清 progress 的口径刻意不同——让位是"没跑完"，不是"跑砸了"）。
+		if err := db.YieldTaskToNight(tk.ID, nextNight, errMsg); err != nil {
+			log.Printf("[scheduler] 任务 #%d 让位落库失败: %v", tk.ID, err)
+		}
+	} else if status == store.TaskPreempted {
 		// §QUEUE-REQUEUE（2026-10-12）：抢占续跑改走 RequeueAfterPreemption，不再走人工复活入口
 		// RequeueTask——后者会把同因连败计数清零，worker 每重启一次熔断账就被抹一次，
 		// 这正是现网"同一任务 8 小时超时回队 33 次"没被 §M14 拦住的第二条通道。
@@ -1614,7 +1703,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	if status == store.TaskFailedRetry {
 		// §失败重排队：回队尾（updated_at 沉底），error 列留最后失败原因，冷却后重试。
 		// 状态落库交给 RequeueFailedTask 一步完成（避免中间态被 peek 到）。
-		// §M14：该步内 store 同步做同因连败计数，达阈值直接挂起不再回队——
+		// §M14：该步内 store 同步做连败计数，达阈值直接挂起不再回队——
 		// 回队落库后立即检测挂起态并告警留痕。
 		if err := db.RequeueFailedTask(tk.ID, errMsg); err != nil {
 			log.Printf("[scheduler] 任务 #%d 失败回队落库失败: %v", tk.ID, err)
@@ -1623,6 +1712,18 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		s.noteFailure(tk.ID)
 	} else if status == store.TaskDone || status == store.TaskCancelled {
 		s.clearFailure(tk.ID) // 成功/取消清除冷却记录
+	}
+	// §NIGHTCAP 记一次"这一夜没跑完"：失败/抢占都算（让位路径在 YieldTaskToNight 之后
+	// 也记，保持同一个口径）；连续两次没跑完由 store 侧自动顺延一夜。
+	if status == store.TaskFailedRetry || status == store.TaskPreempted || status == store.TaskYielded {
+		if streak, deferred, err := db.MarkTaskUnfinished(tk.ID, nextNight); err != nil {
+			log.Printf("[scheduler] 任务 #%d 未跑完记账失败: %v", tk.ID, err)
+		} else if deferred {
+			log.Printf("[scheduler] §NIGHTCAP 任务 #%d(%s) 连续 %d 次没跑完，顺延至 %s（本夜让位给后面的链任务）",
+				tk.ID, tk.Type, streak, nextNight)
+			opslog.Logf("research", "§NIGHTCAP 任务 #%d(%s) 连续 %d 次没跑完，顺延至 %s",
+				tk.ID, tk.Type, streak, nextNight)
+		}
 	}
 	log.Printf("[scheduler] 任务 #%d(%s) -> %s%s", tk.ID, tk.Type, status, tailOf(errMsg))
 	opslog.Logf("research", "任务 #%d(%s) 终态=%s%s", tk.ID, tk.Type, status, tailOf(errMsg))
@@ -1655,11 +1756,12 @@ func (s *Scheduler) clearFailure(taskID int64) {
 	s.mu.Unlock()
 }
 
-// notifyRequeueBreaker §M14（2026-09-22）同因连败 + §QUEUE-REQUEUE（2026-10-12）累计回队
+// notifyRequeueBreaker §M14（2026-09-22）连败 + §QUEUE-REQUEUE（2026-10-12）累计回队
 // 两条闸的挂起处理：每次回队落库后重读任务行，若 store 侧已把它挂为 failed_needs_attention
 // （不再回队），则：
-//   - opslog/日志双留痕（error 列本身含「同因连败熔断」或「累计回队熔断」前缀，挂起可审计，
-//     文案按前缀分因——旧实现无论哪条闸触的都写"同因 N 连败"，累计闸触的那次会告一条假原因）；
+//   - opslog/日志双留痕（error 列本身含「连败熔断」「同因连败熔断」或「累计回队熔断」前缀，
+//     挂起可审计，文案按前缀分因——旧实现无论哪条闸触的都写"同因 N 连败"，累计闸触的那次
+//     会告一条假原因；§NIGHTCAP 口径归一后新前缀「连败熔断」同样按连败次数报）；
 //   - 清除冷却表占位（挂起终态不会再被出队，留着只占内存）；
 //   - state 文件记 needs_attention（前端 /api/research/progress 可见）；
 //   - 经 SetAlertFunc 注入的推送通道高优告警一次——挂起是瞬时跃迁（queued→挂起只发生
@@ -1673,10 +1775,15 @@ func (s *Scheduler) notifyRequeueBreaker(db *store.DB, tk *store.ResearchTask) {
 		return // 常态：任务已回队尾重试，无需熔断处理
 	}
 	trip := store.RequeueTripReasonOf(cur.Error)
-	// 文案按触闸成因分岔：同因闸报连败次数，累计闸报回队次数——旧实现只认同因，
+	// 文案按触闸成因分岔：连败闸报连败次数、累计闸报回队次数——旧实现只认同因，
 	// 累计闸触的那次会告出一条假原因（读数与判据同源，告警也不例外）。
+	// §NIGHTCAP 口径归一后连败闸不再比对指纹，新前缀「连败熔断」判读为 consecutive_fail，
+	// 同样按连败次数报（旧「同因连败」前缀保留判读，兼容发版前挂起的存量行）。
 	head, count := "累计回队", cur.RequeueTotal
-	if trip == "same_cause" {
+	switch trip {
+	case "consecutive_fail":
+		head, count = "连败", cur.FailStreak
+	case "same_cause":
 		head, count = "同因连败", cur.FailStreak
 	}
 	log.Printf("[scheduler] §M14/§QUEUE-REQUEUE 任务 #%d(%s) %s %d 次→熔断挂起（成因=%s，failed_needs_attention，不再重排队，待人工 Requeue）",
@@ -1728,6 +1835,8 @@ func (s *Scheduler) finishTask(db *store.DB, cfg config.SchedulerConfig, tk *sto
 		disp = "paused"
 	case store.TaskFailedRetry:
 		disp = "retrying" // §失败重排队：对外展示重试中（任务仍在队列）
+	case store.TaskYielded:
+		disp = "yielded" // §NIGHTCAP：对外展示"让位中"（单夜预算用尽/连续没跑完，顺延下一夜）
 	}
 	s.recordStepState(tk.Type, disp, errMsg)
 

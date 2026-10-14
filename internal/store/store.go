@@ -282,6 +282,13 @@ func (d *DB) migrate() error {
 			requeue_total INTEGER NOT NULL DEFAULT 0,
 			fail_fp TEXT NOT NULL DEFAULT '',
 			fail_streak INTEGER NOT NULL DEFAULT 0,
+			-- §NIGHTCAP（2026-10-14）单夜占用台账 + 顺延闸四列（旧库由下方迁移补齐）：
+			-- night_day/night_used_min＝按北京日记账的"本夜已占用分钟数"；
+			-- unfinished_streak＝连续没跑完次数（达阈值即顺延）；defer_day＝顺延目标日。
+			night_day TEXT NOT NULL DEFAULT '',
+			night_used_min INTEGER NOT NULL DEFAULT 0,
+			unfinished_streak INTEGER NOT NULL DEFAULT 0,
+			defer_day TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			started_at TEXT DEFAULT '',
 			finished_at TEXT DEFAULT '',
@@ -714,6 +721,35 @@ func (d *DB) migrate() error {
 	if ok, err := d.hasColumn("research_tasks", "requeue_total"); err == nil && !ok {
 		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN requeue_total INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("store migrate research_tasks.requeue_total: %w", err)
+		}
+	}
+	// §NIGHTCAP（2026-10-14）单夜占用台账两列：night_day＝记账所属北京日、
+	// night_used_min＝该夜已占用分钟数（见 research_tasks.go 的 AddTaskNightUsed）。
+	// 旧库增量迁移，幂等；默认 ''/0＝历史任务本夜从零起算，不会一上线就被预算闸卡住。
+	// English: per-night occupancy ledger columns, idempotent ALTER with neutral defaults.
+	if ok, err := d.hasColumn("research_tasks", "night_day"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN night_day TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.night_day: %w", err)
+		}
+	}
+	if ok, err := d.hasColumn("research_tasks", "night_used_min"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN night_used_min INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.night_used_min: %w", err)
+		}
+	}
+	// §NIGHTCAP（2026-10-14）顺延闸两列：unfinished_streak＝连续没跑完次数（达
+	// DeferralStreakLimit 即顺延）、defer_day＝顺延目标日（晚于今日的行不出队——
+	// 这是真正让出队首的那把闸，见 DequeueHighestTask 注释）。旧库增量迁移，幂等。
+	// English: yield-gate columns — the consecutive non-completion streak and the deferral
+	// target day; idempotent ALTER with neutral defaults.
+	if ok, err := d.hasColumn("research_tasks", "unfinished_streak"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN unfinished_streak INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.unfinished_streak: %w", err)
+		}
+	}
+	if ok, err := d.hasColumn("research_tasks", "defer_day"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN defer_day TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.defer_day: %w", err)
 		}
 	}
 	// §M14 同因连败熔断（2026-09-22）：fail_fp=最近一次失败指纹（error 前 200 字），
