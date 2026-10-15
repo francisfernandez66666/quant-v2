@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -262,7 +263,8 @@ func TestUATLiveProbeSignal(t *testing.T) {
 		}
 	}
 
-	// SSE：HTTP 长连接注册（auth token）→ 等订阅建立 → 通过服务端 broker 广播 → 确认前端能收到。
+	// SSE：HTTP 长连接注册（§SSE-RETIRED：走票据通道，与今天的 web 端同一条路）→ 等订阅建立 →
+	// 通过服务端 broker 广播 → 确认前端能收到。
 	// 注：rig 引擎持有独立 broker，HTTP /api/events 走 srv 自己的 broker（生产由 main.go 统一注入），
 	// 此处直接驱动 srv broker 验证 HTTP SSE 传输链路；引擎→broker 的广播链路由主 e2e 覆盖。
 	bodyReader := sseConnect(t, ur, token)
@@ -539,9 +541,25 @@ func TestUATLiveProbeAdmin(t *testing.T) {
 }
 
 // sseConnect 建立 SSE 连接返回流读取器。
+// §SSE-RETIRED（2026-10-15）：改走**票据通道**（POST /api/events/ticket → GET /api/events?ticket=）。
+// 这条 UAT 探针代表「今天真实客户端怎么建链」：web 端自 §WS-F C4a 起就是这两步，而
+// `?token=` 回退分支已按 §0926E2E-W2B 的截止日退役（10-15 00:00 CST 之后一律 401）。
+// 探针原先直接挂 `?token=`，等于一直在测一条生产已经不再走的路——退役闸一落地它就红了，
+// 而红的是尺子、不是产品；顺带这条改动把「票据主路经真实 HTTP 全链」纳进了验收面（此前只有
+// 包内单测用时钟注入测过，端到端从没拨过）。
 func sseConnect(t *testing.T, ur *uatRig, token string) *bufio.Reader {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, ur.base+"/api/events?token="+token, nil)
+	code, body, _ := ur.doReq(t, http.MethodPost, "/api/events/ticket", token, "")
+	if code != 200 {
+		t.Fatalf("POST /api/events/ticket → %d body=%s", code, body)
+	}
+	var tk struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.Unmarshal([]byte(body), &tk); err != nil || tk.Ticket == "" {
+		t.Fatalf("票据响应异常: %v body=%s", err, body)
+	}
+	req, err := http.NewRequest(http.MethodGet, ur.base+"/api/events?ticket="+url.QueryEscape(tk.Ticket), nil)
 	if err != nil {
 		t.Fatalf("sse req: %v", err)
 	}

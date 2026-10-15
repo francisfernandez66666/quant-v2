@@ -133,16 +133,32 @@ NTFY_TOPIC="$(ntfy_topic_resolve || true)"
 [ -n "$NTFY_TOPIC" ] && TOPIC_SOURCE="resolved"
 
 alert() { # 关键事件推 ntfy（正文不回显主题值，也不带任何凭据）
-    local title="$1" body="$2" pri="${3:-medium}"
+    local title="$1" body="$2" pri_raw="${3:-high}" pri rc=0
     if [ -z "$NTFY_TOPIC" ]; then
         line "ALERT-NOT-SENT reason=no-topic title=$title body=$body"
         return 0
     fi
+    # §NTFY-PRI（2026-10-15）：词表与"一次拨号"都在 ntfy_topic.sh 里单实现（与拉取腿同一份）。
+    #   本函数的默认值过去写 medium——那不是 ntfy 认的词（上游回 400 invalid priority parameter），
+    #   于是这条腿的告警从装机起 100% 发不出去，而失败文案是「网络？」，10-12 批的"修法"又是
+    #   给必然 400 的请求加三次重试。今天补齐两刀：默认值改 high；非法值兜到 high 并**点名原值**，
+    #   绝不因为一个拼错的词把通知打死（发不出去才是真损失），也不静默兜底（日志里查得到是谁传的）。
+    rc=0
+    pri="$(ntfy_priority_normalize "$pri_raw")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        line "WARN ntfy Priority 非法值已兜底 raw=${pri_raw} used=${pri}（词表见 ntfy_topic.sh；这条告警照发，不是降级）"
+    fi
     # 重试用 if 形式而不是 `[ ] && sleep`：条件为假时后者整句返回 1，在 set -e 的调用方里就是意外中止。
     local attempt=1
     while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do
-        if curl -fs -H "Title: $title" -H "Priority: $pri" -H "Tags: package" \
-            -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1; then
+        rc=0
+        ntfy_attempt line "$NTFY_URL" "$NTFY_TOPIC" "$title" "$pri" "package" "$body" watchdog || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            return 0
+        fi
+        # rc=2 ⇒ 上游回 4xx：请求本身不合格，重试只是把同一条错误请求重放。
+        #   ntfy_attempt 已把 http 码与响应体摘要打进日志，这里直接收手（网络抖动那一族才配重试）。
+        if [ "$rc" -eq 2 ]; then
             return 0
         fi
         attempt=$((attempt + 1))
@@ -150,7 +166,7 @@ alert() { # 关键事件推 ntfy（正文不回显主题值，也不带任何凭
             sleep "${NTFY_ALERT_BACKOFF_S}"
         fi
     done
-    line "ntfy 告警发送失败（已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败；网络？启动行的 topic_fp 可判断配的是哪一份：$(ntfy_topic_report watchdog-alert-failure)）"
+    line "ntfy 告警发送失败（已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败，均为传输层错误/5xx；非 4xx——4xx 会在上面那条 http= 行里点名。启动行的 topic_fp 可判断配的是哪一份：$(ntfy_topic_report watchdog-alert-failure)）"
 }
 
 # 留档：纯 bash 拼 JSON（这台机器上留痕腿不能反过来把判据腿拖下水——python3 缺失时照样要记下行）。
@@ -252,7 +268,7 @@ fi
 line "WATCHDOG|drift verdict=${DRIFT_VERDICT} repo_root=$QUANT_REPO_ROOT summary=$DRIFT_SUMMARY"
 if [ "$rc_drift" != "0" ]; then
     if [ "$rc_drift" = "1" ]; then
-        alert "quant Mac 副本漂移（调度执行的不是仓库那份）" "$DRIFT_SUMMARY 修法：对应 install_mac_*_agent.sh 先跑一次缺省预览再 -Apply（探测器只读不写）" medium
+        alert "quant Mac 副本漂移（调度执行的不是仓库那份）" "$DRIFT_SUMMARY 修法：对应 install_mac_*_agent.sh 先跑一次缺省预览再 -Apply（探测器只读不写）" default
     else
         alert "quant Mac 漂移探测器自己读不出（${DRIFT_VERDICT}）" "$DRIFT_SUMMARY 这条不是「没有漂移」——是这条判据当前失效，先修探测器" high
     fi
@@ -304,7 +320,7 @@ fi
 line "WATCHDOG|retired verdict=$RET_VERDICT label=$SYNC_RETIRE_LABEL detail=$RET_DETAIL"
 if [ "$rc_retired" != "0" ]; then
     if [ "$rc_retired" = "1" ]; then
-        alert "quant 已退役的行情同步链回到调度里（${RET_VERDICT}）" "$RET_DETAIL 背景：云端目标机 8 月中旬改行，这条链六步从未走通；恢复它之前先确认要推的是哪台机、哪个库" medium
+        alert "quant 已退役的行情同步链回到调度里（${RET_VERDICT}）" "$RET_DETAIL 背景：云端目标机 8 月中旬改行，这条链六步从未走通；恢复它之前先确认要推的是哪台机、哪个库" default
     else
         alert "quant 退役链探针自己读不出（${RET_VERDICT}）" "$RET_DETAIL 这条不是「没复活」——是这条判据当前失效，先修判据" high
     fi

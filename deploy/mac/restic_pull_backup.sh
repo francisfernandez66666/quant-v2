@@ -48,7 +48,7 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
 [ -n "$NTFY_TOPIC" ] || log "WARN: ntfy 主题未配置（env NTFY_TOPIC 与钥匙串 quant-ntfy-topic 皆空）⇒ 本任务告警只落日志不推送：$(ntfy_topic_report restic-pull)"
 
 alert() {  # 关键事件推 ntfy
-  local title="$1" body="$2" pri="${3:-high}"
+  local title="$1" body="$2" pri_raw="${3:-high}" pri rc=0
   if [ -z "$NTFY_TOPIC" ]; then
     # 无主题时**不发请求**：打到 https://ntfy.sh/（根路径）只会回 404，而日志里写"网络？"
     # 会把「配置缺失」伪装成「网络抖动」——下一次真断网时没人再信这条（§0929DRILL-A 假红同族）。
@@ -56,11 +56,26 @@ alert() {  # 关键事件推 ntfy
     log "ALERT-NOT-SENT reason=no-topic title=$title body=$body"
     return 0
   fi
+  # §NTFY-PRI（2026-10-15）：优先级词表与"一次拨号"归到 ntfy_topic.sh 单实现，和看门狗读同一套词。
+  #   本文件的三个调用点过去传 medium（不是 ntfy 认的词，上游 400 invalid priority parameter），
+  #   也就是**调度疑似死了 / 从未留下记录 / 探针读不出**这三条最该叫醒人的告警一直发不出去，
+  #   而日志只留下一句「网络？」。默认值本来就是 high，兜底也兜到 high（宁高不丢）。
+  rc=0
+  pri="$(ntfy_priority_normalize "$pri_raw")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "WARN: ntfy Priority 非法值已兜底 raw=${pri_raw} used=${pri}（词表见 ntfy_topic.sh；这条告警照发，不是降级）"
+  fi
   # 重试用 if 形式而不是 `[ ] && sleep`：条件为假时后者整句返回 1，在 set -e 的调用方里就是意外中止。
   local attempt=1
   while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do
-    if curl -fs -H "Title: $title" -H "Priority: $pri" -H "Tags: package" \
-         -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1; then
+    rc=0
+    ntfy_attempt log "$NTFY_URL" "$NTFY_TOPIC" "$title" "$pri" "package" "$body" restic-pull || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    fi
+    # rc=2 ⇒ 上游 4xx：请求本身不合格，重试只是重放同一条错误请求；http 码与响应摘要已在
+    #   ntfy_attempt 那行日志里点名，这里直接收手（只有传输层错误/5xx 才按网络抖动重试）。
+    if [ "$rc" -eq 2 ]; then
       return 0
     fi
     attempt=$((attempt + 1))
@@ -68,7 +83,7 @@ alert() {  # 关键事件推 ntfy
       sleep "${NTFY_ALERT_BACKOFF_S}"
     fi
   done
-  log "ntfy 告警发送失败（已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败；网络？启动行的 topic_fp 可判断配的是哪一份）"
+  log "ntfy 告警发送失败（已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败，均为传输层错误/5xx；非 4xx——4xx 会在上面那条 http= 行里点名。启动行的 topic_fp 可判断配的是哪一份）"
 }
 
 fail() { log "ERROR: $*"; alert "quant 备份失败" "$*" high; exit 1; }
@@ -188,7 +203,7 @@ record_freshness() {
   if [ ! -s "$rec" ]; then
     # 留档文件不存在＝这个探测器自己的前提没落地（launchd 没装 / 第一次还没跑），必须吵而不是沉默。
     log "${label} freshness=NO-RECORD（${rec} 不存在或为空）"
-    alert "quant ${label} 从未留下记录" "留档文件不存在：${rec}。安装：${hint}" medium
+    alert "quant ${label} 从未留下记录" "留档文件不存在：${rec}。安装：${hint}" default
     return 0
   fi
   last="$(tail -1 "$rec" 2>/dev/null || true)"
@@ -209,12 +224,12 @@ PYAGE
   if [ "$age" = "unparsable" ]; then
     # 留档存在但最新一行解析不出时间＝探测器读法坏了：如实报"读不出"，不报"超龄"。
     log "${label} freshness=UNPARSABLE（record=${rec} line=${last:-?}）——判读法坏了而不是调度死了"
-    alert "quant ${label} 新鲜度探针读不出时间戳" "留档最新一行没有可解析的 ts 字段：${rec}。这条探测器的判据已失效，请先修读法再谈调度。" medium
+    alert "quant ${label} 新鲜度探针读不出时间戳" "留档最新一行没有可解析的 ts 字段：${rec}。这条探测器的判据已失效，请先修读法再谈调度。" default
     return 0
   fi
   log "${label} freshness=${age%.*}d last_result=${res:-?} max=${max_days}d record=${rec}"
   if awk "BEGIN{exit !($age > $max_days)}" 2>/dev/null; then
-    alert "quant ${label} 调度疑似死了" "最近一次留档已 ${age%.*} 天（>${max_days} 天）。查：launchctl list | grep ${label}、安装：${hint}" medium
+    alert "quant ${label} 调度疑似死了" "最近一次留档已 ${age%.*} 天（>${max_days} 天）。查：launchctl list | grep ${label}、安装：${hint}" default
   fi
   return 0
 }

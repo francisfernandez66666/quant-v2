@@ -305,7 +305,10 @@ gate_collect_main() {
 	# 跑前工作树指纹；`|| true` 是必需的——不是 git 仓库时 git 返回非零，pipefail 下会把前言打死。
 	git -C "$GATE_ROOT_ABS" status --porcelain 2>/dev/null | sort > "$work/tree.before" || true
 
-	start=$(python3 "$GATE_SECTIONS_PY" sections "$GATE_SELF_ABS" 2> "$work/sections.err" | awk -F'\t' '$1 ~ /^[0-9]+$/ {print $1; exit}') || start=""
+	# 首段起点从派生清单取：编号口径与装配器一致（数字＋可选小写字母后缀，§GATE-SELFACC）。
+	#   只认纯数字的话，哪天第一段被写成 `1b` 形态，这里派生不出起点、整轮 collect 直接判红——
+	#   宁可红也要红在"口径不一致"这件事本身上，而不是让两处各自认一半。
+	start=$(python3 "$GATE_SECTIONS_PY" sections "$GATE_SELF_ABS" 2> "$work/sections.err" | awk -F'\t' '$1 ~ /^[0-9]+[a-z]?$/ {print $1; exit}') || start=""
 	if [ -z "$start" ]; then
 		echo "--- FAIL: §P2-L -collect 派生不出段清单（首段都没有＝装配器与脚本格式脱节）：$(head -1 "$work/sections.err" 2>/dev/null)"
 		return 1
@@ -8114,6 +8117,13 @@ CURL_MARK="$5"
 curl() { printf '%s\n' "$*" >> "$CURL_MARK"; if [ -n "${CURL_FAIL:-}" ]; then return 7; fi; return 0; }
 # shellcheck source=/dev/null
 . "$1"
+# §NTFY-PRI（2026-10-15）：alert() 把"一次拨号"交给了 ntfy_topic.sh 里的 ntfy_attempt（单实现），
+# 夹具必须把那份 lib 一并 source 进来——否则 alert 调到的是"命令不存在"（rc=127），curl 一次都不会
+# 被拨到，于是出现"有主题时没调 curl"的假红。这条腿要盯的是**整条发送链**（alert → attempt → curl），
+# 而不是某一个文件里的某一行；本文件的 shell 函数 curl 会盖住外部 curl ⇒ 桩照样接得住。
+# shellcheck source=/dev/null
+[ -f "$6" ] || { echo "F3-HARNESS-FAIL: 取不到 $6（lib 不在＝这条腿在验空气）"; exit 3; }
+. "$6"
 # 重试上界/间隔的 env 缺省定义在脚本顶部、不在 alert() 体内（sed 只抽函数＝抽不到）；
 # 夹具必须自己补上同款缺省，否则 set -u 下 alert 一进重试循环就 unbound 中止＝假红。
 NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"
@@ -8123,13 +8133,13 @@ NTFY_TOPIC="$2"
 alert "$3" "$4" high
 AR110
 rm -f "$W3T/curl.mark"
-out110="$(bash "$W3T/alert_run.sh" "$W3T/alert.sh" "" "quant 备份失败" "restic copy 失败" "$W3T/curl.mark" 2>&1 || true)"
+out110="$(bash "$W3T/alert_run.sh" "$W3T/alert.sh" "" "quant 备份失败" "restic copy 失败" "$W3T/curl.mark" deploy/mac/ntfy_topic.sh 2>&1 || true)"
 [ "$(printf '%s\n' "$out110" | grep -c 'ALERT-NOT-SENT' || true)" = "1" ] || { echo "--- FAIL: §110 F3-2 空主题没有恰好一行 ALERT-NOT-SENT（got 见下）：$(printf '%s' "$out110" | head -3)"; exit 1; }
 [ -e "$W3T/curl.mark" ] && { echo "--- FAIL: §110 F3-2 空主题仍然请求了 ntfy（打到根路径吃 404，再把原因写成「网络？」＝把配置缺失伪装成网络抖动）"; exit 1; }
 printf '%s' "$out110" | grep -qF '网络？' && { echo "--- FAIL: §110 F3-2 空主题分支出现「网络？」文案（没发请求就不该甩锅网络）"; exit 1; }
 printf '%s' "$out110" | grep -qF 'restic copy 失败' || { echo "--- FAIL: §110 F3-2 空主题没把正文整条落日志（发不出去时日志是唯一证据面）"; exit 1; }
 rm -f "$W3T/curl.mark"
-out110="$(bash "$W3T/alert_run.sh" "$W3T/alert.sh" "$TOK110" t b "$W3T/curl.mark" 2>&1 || true)"
+out110="$(bash "$W3T/alert_run.sh" "$W3T/alert.sh" "$TOK110" t b "$W3T/curl.mark" deploy/mac/ntfy_topic.sh 2>&1 || true)"
 [ -e "$W3T/curl.mark" ] || { echo "--- FAIL: §110 F3-2 有主题时没调 curl＝整条 alert 是死支，上一条空主题分支的绿一并作废"; exit 1; }
 grep -qF "https://ntfy.invalid/$TOK110" "$W3T/curl.mark" || { echo "--- FAIL: §110 F3-2 curl 的 URL 里没带主题（发不到那个主题＝没有告警）：$(tail -1 "$W3T/curl.mark")"; exit 1; }
 if printf '%s' "$out110" | grep -qF 'ALERT-NOT-SENT'; then echo "--- FAIL: §110 F3-2 有主题却走了 ALERT-NOT-SENT（两个分支的判据串了）"; exit 1; fi
@@ -8137,7 +8147,7 @@ echo "ok - §110 F3-2 空主题不请求（恰好一行留痕）+ 有主题真�
 # F3-2b 发送重试：桩 curl 恒败 ⇒ 恰 ATTEMPTS 次调用、失败文案带次数（与看门狗 WD8 同判据的第二实现面）。
 CNT110=$((CNT110 + 1))
 rm -f "$W3T/curl.mark"
-out110="$(CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 bash "$W3T/alert_run.sh" "$W3T/alert.sh" "$TOK110" t b "$W3T/curl.mark" 2>&1 || true)"
+out110="$(CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 bash "$W3T/alert_run.sh" "$W3T/alert.sh" "$TOK110" t b "$W3T/curl.mark" deploy/mac/ntfy_topic.sh 2>&1 || true)"
 f32b_n="$(grep -c . "$W3T/curl.mark" || true)"
 [ "${f32b_n:-0}" = "3" ] \
 	|| { echo "--- FAIL: §110 F3-2b 恒败时 curl 调用数=${f32b_n:-0}（应恰 3＝重试没在跑或上界没接 env）"; exit 1; }
@@ -8147,7 +8157,7 @@ printf '%s' "$out110" | grep -qF '已试 3 次仍失败' \
 cp "$W3T/alert.sh" "$W3T/alert_mut.sh"
 f3_sub "$W3T/alert_mut.sh" 'while [ "${attempt}" -le "${NTFY_ALERT_ATTEMPTS}" ]; do' 'while [ "${attempt}" -le 1 ]; do'
 rm -f "$W3T/curl.mark"
-out110="$(CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 bash "$W3T/alert_run.sh" "$W3T/alert_mut.sh" "$TOK110" t b "$W3T/curl.mark" 2>&1 || true)"
+out110="$(CURL_FAIL=1 NTFY_ALERT_ATTEMPTS=3 NTFY_ALERT_BACKOFF_S=0 bash "$W3T/alert_run.sh" "$W3T/alert_mut.sh" "$TOK110" t b "$W3T/curl.mark" deploy/mac/ntfy_topic.sh 2>&1 || true)"
 f32m_n="$(grep -c . "$W3T/curl.mark" || true)"
 [ "${f32m_n:-0}" = "1" ] \
 	|| { echo "--- FAIL: §110 F3-2b 摘锁后 curl 调用数=${f32m_n:-0}（应恰 1＝上界被钉死；读数不对＝破坏落错了地方）"; exit 1; }
@@ -8993,7 +9003,7 @@ neg111 "$GB111" '[ "$_gate_arg" = "-collect" ] &&' '上一条的旧写法不许�
 eq111 "$GB111" 'GATE_COLLECT_INNER=1 bash "$work/inner_$idx.sh" $GATE_ARG_INNER' 1 '内层脚本必须带 GATE_COLLECT_INNER 起（gate_need 的 SKIP 分支与递归防护都读这把键）'
 eq111 "$GB111" 'echo "GATE-SKIP ${sid} · ${reason}"' 1 'gate_need 的 SKIP 标记格式与装配器 SKIP_RE 严格对齐（对不上＝跳过被读成 SILENT，成因归属就错了）'
 eq111 "$GB111" '本遍记 SKIP（成因由段自己声明，原文照抄）' 1 '驱动把内层日志里的 GATE-SKIP 原文回显到 stdout（只留在 log 文件里的话，现网拿到的汇总就只剩「少了一段」，看不出那段自己写了什么；§111 L1 断言的正是这份可见性）'
-eq111 "$GPY111" 'SKIP_RE = re.compile(r'"'"'^GATE-SKIP (\d+) · (.*)$'"'"')' 1 '解析侧的字面量与上枚成对'
+eq111 "$GPY111" 'SKIP_RE = re.compile(r'"'"'^GATE-SKIP ([0-9]+[a-z]?) · (.*)$'"'"')' 1 '解析侧的字面量与上枚成对（§GATE-SELFACC 起编号允许带小写后缀，两侧口径必须一起改，见 §120）'
 eq111 "$GB111" 'GATE_COLLECT_MAX_PASSES="${GATE_COLLECT_MAX_PASSES:-60}"' 1 '遍数上限的赋值恰好一处（每遍是「从红段跑到文件尾」，红得越早后面越贵；越限时未读到的段由 MISSING 面点名，不当绿）'
 eq111 "$GB111" 'echo "WORK=${work}"' 1 '收尾三个读数各占一行、行首即键名（镜像腿就是这样取 WORK 去复跑 summary 的；挤成一行时只有第一个键能被 `^KEY=` 取到，其余两个在消费方读成空串＝反证空过）'
 
@@ -9456,10 +9466,13 @@ import sys
 
 src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 # 退回本批第一轮实跑的那个形状：四桶同用逗号切，且分号循环只填 skip_reason、不填桶。
+#   §GATE-SELFACC 之后桶里的元素从 int 变成编号字符串（`34b` 这类带后缀的编号必须进桶），
+#   所以这里的锚跟着换成新写的形状——反证要破的仍然是「SKIP 被逗号切吞掉」这一条，
+#   判据（SKIP_SECTIONS=0 且 BALANCE=MISSING:4）一字未动。
 pairs = [
     ('        for key in ("PASS", "FAIL", "SILENT"):', '        for key in buckets:'),
-    ('                    buckets["SKIP"].append(int(sid))\n', ''),
-    ('            elif chunk.strip().isdigit():\n                buckets["SKIP"].append(int(chunk))\n', ''),
+    ('                    buckets["SKIP"].append(sid.strip())\n', ''),
+    ('            elif chunk.strip() in id_set:\n                buckets["SKIP"].append(chunk.strip())\n', ''),
 ]
 out = src
 for old, new in pairs:
@@ -12721,5 +12734,1012 @@ rm -rf "$NG117"
 echo "ok - §117 §NIGHTCAP 专项守卫通过：阈值常量与配置默认 7 道 + 伪状态与 store 入口/列 12 道 + worker 接线 7 道 + 顺延过滤与旧名负锁 4 道 + 行为腿 2 组（store 5 例＋worker 2 例）+ 反证 3 枚，累计判定点 ${CNT117}"
 echo ""
 echo ""
+
+echo "==> 118 §QUEUE-BACKLOG 夜间队列阈值口径（吞吐判排水＋失控恒红）＋读数脚本离线八态夹具＋§QUEUE-THRESH 挂起容忍入口接线（2026-10-15 批）..."
+
+# 现网实录（这批的起因是一条**随代码一起发上去的缺陷**，不是新需求）：
+#   10-14 §NIGHTCAP 给夜间验收的队列腿加了三条只读读数，其中 deferred_now 那条 COUNT 写了
+#   `>?` 却漏传绑定 ⇒ SQLite 抛 ProgrammingError ⇒ 10-15 现网首夜真拨时整条队列腿判成 err。
+#   仓里当时抓不到，因为这份内嵌 python 读数脚本**从没被离线跑过一次**：门禁只钉字符串在位
+#   （列名、阈值等值），"有代码没跑过"正是本仓锤过的「度量腿没自证射程」形态
+#   （go test -run 空跑仍打 ok、Playwright .first() 命中隐藏节点同族）。
+#   ⇒ 本段的形状＝静态锁（口径在位＋三语值同源）＋**行为腿实跑夹具**＋四枚变异反证：
+#     判据与读数都必须被真执行一次，摘掉任一把尺子夹具必须转红。
+#   口径本身（owner 10-12 令「观察一夜再裁」到期）：积压不再按绝对条数判生死，
+#     改按吞吐判——排水期（最近 24h 落终态 ≥ drain_min_done）超软上限只出读数；
+#     失控线 backlog_runaway_max 恒红不看吞吐（旧尺子唯一的真价值保在这里）。
+#   English: §QUEUE-BACKLOG — backlog is judged by throughput (drained in 24h) with an absolute
+#   runaway line kept; the embedded nightly readout now runs offline in a state fixture so a
+#   missing SQL binding can never ship green again.
+#
+# 二形（同夜 owner 裁决「保持挂起，容忍数临时放 1」逼出的两件事）：
+#   ① 夹具从五态扩到**八态**：F 挂 1 条＋容忍 1 判绿；G 挂 2 条＋容忍 1 判具名红 parked_gt_1；
+#     G2 摘掉 parked 那一支，同一份 G 态库必须转绿。加这三态的理由与当年漏绑定同一条：
+#     `failed_needs_attention` 那把尺子在旧夹具里**根本没有可构造的输入**，也就是它从没被真执行
+#     过一次——直到现网真挂起一条任务那一夜才第一次跑，跑出来的是一条红。
+#   ② 段名从「夹具里有几个 run_leg」「回显写不写 states=5」这种**字节死数**改成**派生**：夹具自己
+#     声明 min=<态数>，静态侧比对 state_done/run_leg 的执行行计数各等于它，行为腿再按实跑自报的
+#     FIXTURE_COUNT states=N legs=L min=M 判「N==L、L>=M、M>=8、N==静态声明」。写死件数那两枚在
+#     扩态当夜必然红——红的还是尺子不是代码（本仓「写死件数锁被一枚合法新增顶红」那一形），
+#     所以这里一次性换成派生，而不是把 5 抬成 8。
+
+CNT118=0
+VNG118=scripts/verify_nightly_guangzhou.sh
+FX118=scripts/nightly_readout_fixture.sh
+
+# eq_code118：执行行等值锁（计数前剥掉 # 注释行）。本批把成因实录写进注释，
+#   锚在注释里另中若干行——按 §107 的裁决「锁让位、注释保留」，计数类判据一律只看执行行。
+eq_code118() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	CNT118=$((CNT118 + 1))
+	local got
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §118 执行行等值锁 ${CNT118}（${4}）：${1} 非注释行里整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+neg_code118() { # $1=文件 $2=整串 $3=说明 → 执行行里彻底没有
+	CNT118=$((CNT118 + 1))
+	local got
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §118 负锁 ${CNT118}（${3}）：${1} 执行行里又出现「${2}」got=${got}"; exit 1; }
+}
+
+# ── A. 两把新闸的三语透传在位（bash 变量→PS 调用→param 声明→python 形参，少一环就是惰性的）──
+eq_code118 "$VNG118" 'DRAIN_MIN_DONE="${DRAIN_MIN_DONE:-6}"' 1 'bash 侧排水下限默认值行恰一枚'
+eq_code118 "$VNG118" 'BACKLOG_RUNAWAY_MAX="${BACKLOG_RUNAWAY_MAX:-90}"' 1 'bash 侧失控线默认值行恰一枚'
+eq_code118 "$VNG118" 'DrainMinDone' 3 'DrainMinDone 三处同源（PS_ARGS 透传/param 声明/PS 实调用 python）'
+eq_code118 "$VNG118" 'BacklogRunawayMax' 3 'BacklogRunawayMax 三处同源（同上）'
+eq_code118 "$VNG118" '--drain-min-done' 3 'python 形参 --drain-min-done 三处同源（RUN_PY 预览/PS 实调用/argparse）'
+eq_code118 "$VNG118" '--backlog-runaway-max' 3 'python 形参 --backlog-runaway-max 三处同源'
+eq_code118 "$VNG118" 'ParkedMax' 3 '-ParkedMax 三处同源（PS_ARGS 透传/param 声明/PS 实调用 python）'
+eq_code118 "$VNG118" '--parked-max' 3 'python 形参 --parked-max 三处同源（RUN_PY 预览/PS 实调用/argparse）'
+
+# ── B. 三语**值**同源（派生取数比对，绝不写死数字；任一侧取空一律判红）──
+# 为什么不等值就危险：bash 侧改了默认而 PS/python 没跟，夜间验收会按另一把尺子判绿，
+#   与 §106 累计回队上限四门同源同一-form（10-12 那晚"验收红的不是生产用的那把尺子"）。
+drain_same118() { # $1=名字 $2=bash 取值模式 $3=PS 取值模式 $4=python 取值模式
+	CNT118=$((CNT118 + 1))
+	local sh ps py
+	sh=$(grep -oE "$2" "$VNG118" | grep -oE '[0-9]+' | tail -1 || true)
+	ps=$(grep -oE "$3" "$VNG118" | grep -oE '[0-9]+$' | head -1 || true)
+	py=$(grep -oE "$4" "$VNG118" | grep -oE '[0-9]+$' | head -1 || true)
+	if [ -z "$sh" ] || [ -z "$ps" ] || [ -z "$py" ]; then
+		echo "--- FAIL: §118 三语值同源锁 ${CNT118}（${1}）：某侧读数取空 bash=${sh:-∅} ps=${ps:-∅} py=${py:-∅}——取空一律判红，绝不按相等放行"
+		exit 1
+	fi
+	if [ "$sh" != "$ps" ] || [ "$sh" != "$py" ]; then
+		echo "--- FAIL: §118 三语值同源锁 ${CNT118}（${1} 三门不等值）：bash=${sh} ps=${ps} py=${py}（验收按自己那把尺子判绿，生产口径另算）"
+		exit 1
+	fi
+	echo "ok - §118 三语值同源：${1} 三门同值 ${sh}"
+}
+drain_same118 '排水下限 drain_min_done' 'DRAIN_MIN_DONE="\$\{DRAIN_MIN_DONE:-[0-9]+\}' '\[int\]\$DrainMinDone = [0-9]+' '"--drain-min-done", type=int, default=[0-9]+'
+drain_same118 '失控线 backlog_runaway_max' 'BACKLOG_RUNAWAY_MAX="\$\{BACKLOG_RUNAWAY_MAX:-[0-9]+\}' '\[int\]\$BacklogRunawayMax = [0-9]+' '"--backlog-runaway-max", type=int, default=[0-9]+'
+# 挂起上限这一把额外重要：owner 裁的是「临时容忍 1」，而容忍**只准落在调度入口那层**（见 G 块）。
+#   判据本体的三处默认若被顺手抬成 1，等于让「熔断挂起」和「人工挂起」一起免检——库里没有可信的
+#   「是谁挂的」来源字段（只有会漂移的 error 文案），所以只能靠「默认仍是 0」这条线守着。
+drain_same118 '挂起上限 parked_max（判据本体三处默认）' 'PARKED_MAX="\$\{PARKED_MAX:-[0-9]+\}' '\[int\]\$ParkedMax = [0-9]+' '"--parked-max", type=int, default=[0-9]+'
+
+# ── C. 判据出口与窗口口径（这五条就是"新尺子怎么判"的本体）──
+eq_code118 "$VNG118" 'backlog_runaway_gt_%d' 1 '失控线出口文案恰一枚（恒红、不看吞吐那条）'
+eq_code118 "$VNG118" 'backlog_not_draining_lt_%d' 1 '停排出口文案恰一枚（超软上限且吞吐不足才红）'
+eq_code118 "$VNG118" 'elif active > a.active_max and drained_24h < a.drain_min_done:' 1 '软上限那条必须带"且吞吐不足"这一半（摘掉它＝退回绝对条数尺子，排水期天天红）'
+eq_code118 "$VNG118" 'since_24h = (now - dt.timedelta(hours=24))' 1 '24h 窗口在 python 侧按真实时钟算（边界与写入口径同区）'
+eq_code118 "$VNG118" 'drained_24h = -1' 1 '读不出按 -1 判红，绝不"查不到就当在排水"'
+neg_code118 "$VNG118" "datetime('now'" "SQL 侧 UTC 尺子不得复活（updated_at 是北京时间写入，datetime('now') 是 UTC，差 8 小时把昨夜那一波切成半个）"
+neg_code118 "$VNG118" 'backlog_gt_%d' '旧判据文案 backlog_gt_%d 不得复活（两把尺子并存＝同一形态两个出口，台账对不上）'
+eq_code118 "$VNG118" "(today_str2,)).fetchone()[0] or 0)" 1 'deferred_now 那条 COUNT 的绑定在位（10-15 现网红的就是这一处漏传）'
+eq_code118 "$VNG118" 'if parked > a.parked_max:' 1 '挂起那一支的比较式在位（G2/M5 摘线反证都锚这一行，锚漂了反证退化成 no-op）'
+eq_code118 "$VNG118" 'parked_gt_%d' 1 '挂起超限的具名出口恰一枚（容忍只放行多出来的那一条，第二条必须叫得出名字）'
+
+# ── D. 夹具资产在位：抽取锚必须两头都对得上（锚漂了夹具会静默抽出空文件，一切绿都是蒙的）──
+eq_code118 "$VNG118" 'PYEOF' 2 '内嵌读数块的 heredoc 开/闭两行仍在（夹具的抽取锚就锚这两行）'
+eq_code118 "$FX118" "<<.PYEOF.\$" 1 '夹具侧抽取锚在位（写成正则形，随源脚本改名必须同改）'
+eq_code118 "$FX118" 'FIXTURE_RESULT=ok states=${STATE_N}' 1 '夹具成功读数行在位（态数由夹具自己派生，门禁不再死数 states=5）'
+eq_code118 "$FX118" 'FIXTURE_COUNT states=' 1 '夹具自报派生读数那一行在位（行为腿就读这一行；谁把态数写回字面量即红）'
+eq_code118 "$FX118" 'PY_LINES' 4 '抽取行数下界守卫在位（拿到空文件必红，不许静默跑过）'
+eq_code118 "$FX118" 'AND type<>?' 3 'D 态摘绑反证件的构造三处（替换串＋计数校验＋报错文案）在位'
+eq_code118 "$FX118" 'if False and active > a.backlog_runaway_max:' 1 'E 态摘线反证件的构造串在位'
+# 态数**派生自夹具自述的 min**：扩态时只改一个声明数，锁面自动跟；删态不改声明当场红，
+#   删态连声明一起删，E 块行为腿还要按实跑自报的 states/legs/min 三者等值再拦一道（两把尺子不同源）。
+MIN118=$(grep -v '^[[:space:]]*#' "$FX118" | grep -oE 'min=[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+[ -n "$MIN118" ] || { echo "--- FAIL: §118 态数派生锁 ${CNT118}：夹具里取不到 min=<数>（声明态数的锚漂了＝后面所有「几态」判定都成无源之水，取空一律判红）"; exit 1; }
+fx_scope118() { # $1=整串 $2=说明 → 执行行里出现次数必须等于夹具自述的态数
+	CNT118=$((CNT118 + 1))
+	local got
+	got=$(grep -v '^[[:space:]]*#' "$FX118" 2>/dev/null | grep -cF -- "$1" 2>/dev/null || true)
+	[ "${got:-0}" = "$MIN118" ] || { echo "--- FAIL: §118 态数派生锁 ${CNT118}（${2}）：整串「${1}」实数 ${got:-0} 而夹具自述 ${MIN118} 态——两数不等＝要么有态没拨脚本，要么改了态数没同步自述"; exit 1; }
+	echo "ok - §118 态数派生：${2} 计数 ${got} 等于夹具自述 min=${MIN118}"
+}
+fx_scope118 'run_leg ' '每态各拨一次读数脚本'
+fx_scope118 'state_done ' '每态各自落一枚 STATE_N 计数'
+eq_code118 "$FX118" '--parked-max 1' 3 '挂起三态（F 容忍绿·G 第二条具名红·G2 摘线转绿）各自都带 --parked-max 1（少一处＝那一态按 parked_max=0 判，量的不是同一把尺子）'
+eq_code118 "$FX118" 'build_db 55 8 2 230' 1 'A 态库形：55 活跃＋8 排水＋2 顺延＋夜账 230 分'
+eq_code118 "$FX118" 'build_db 55 0 0 0' 1 'B 态库形：55 活跃＋零排水'
+eq_code118 "$FX118" 'build_db 95 8 0 0' 1 'C 态库形：95 活跃（超失控线）＋8 排水'
+eq_code118 "$FX118" 'build_db 10 6 0 0 "$WORK/f.db" 1' 1 'F 态库形：10 活跃＋6 排水＋挂起 1 条（容忍态）'
+eq_code118 "$FX118" 'build_db 10 6 0 0 "$WORK/g.db" 2' 1 'G 态库形：与 F 同形只差多挂一条（这条就是「容忍不吞第二条」的对照件）'
+eq_code118 "$FX118" 'if False and parked > a.parked_max:' 1 'G2 摘挂起线反证件的构造串在位'
+# E 态断言方向锁（10-15 本夹具首跑就是被这条的反向写法判红：期望"文案消失"却写成 grep -q || red，
+#   正确结果反而触发红）。方向这种事 grep 数不出来，必须读"紧跟其后的那一行是 && 还是 ||"。
+CNT118=$((CNT118 + 1))
+E118_ANCHOR=$(grep -n '"$LE".*backlog_runaway_gt_90' "$FX118" | head -1 | cut -d: -f1 || true)
+[ -n "$E118_ANCHOR" ] || { echo "--- FAIL: §118 断言方向锁 ${CNT118}：找不到 E 态那条 grep（夹具改版后本锁的锚必须同改，不许删锁省事）"; exit 1; }
+E118_NEXT=$(sed -n "$((E118_ANCHOR + 1))p" "$FX118" || true)
+printf '%s' "$E118_NEXT" | grep -q '^[[:space:]]*&&' \
+	|| { echo "--- FAIL: §118 断言方向锁 ${CNT118}：E 态「期望文案消失」的那条判据下一行不是 && 而是「${E118_NEXT}」——写成 || red 时正确结果会触发红（10-15 实测首跑就红在这里）"; exit 1; }
+
+# ── E. 行为腿：把夹具真跑一遍，判的是它**自报的派生读数**（不是文案里有几个字）──
+CNT118=$((CNT118 + 1))
+# 收码形必须写 `X=$(...) || rc=$?`：本段跑在门禁的 `set -euo pipefail` 下，
+#   裸赋值 `X=$(cmd); rc=$?` 在 cmd 非 0 时会先被 -e 掐掉整段——屏幕上只剩上一行 ok，
+#   连"哪枚锁红"都打不出来（§set-e 下 grep 计数管道静默中止 同一族，本批首跑亲撞）。
+FXRC118=0
+FXOUT118=$(bash "$FX118" 2>&1) || FXRC118=$?
+FC118=$(printf '%s' "$FXOUT118" | grep -oE 'FIXTURE_COUNT states=[0-9]+ legs=[0-9]+ min=[0-9]+' | tail -1 || true)
+if [ -z "$FC118" ]; then
+	echo "--- FAIL: §118 行为腿 ${CNT118}：夹具没有自报 FIXTURE_COUNT 派生读数（rc=${FXRC118}），末 12 行回显："
+	printf '%s\n' "$FXOUT118" | tail -12
+	exit 1
+fi
+FS118=$(printf '%s' "$FC118" | sed -n 's/.*states=\([0-9]*\).*/\1/p')
+FL118=$(printf '%s' "$FC118" | sed -n 's/.*legs=\([0-9]*\).*/\1/p')
+FM118=$(printf '%s' "$FC118" | sed -n 's/.*min=\([0-9]*\).*/\1/p')
+# 五件事各自成立才算绿：退出码 0；自报 states==legs（每态各拨一次脚本，缺一态即劈叉）；
+#   legs>=min（没缩水）；min>=8（射程下界自证——夹具哪天退化成 smoke 当场拦）；
+#   自报 states 等于 D 块静态声明的 min（静态锚与运行时读数**不同源**，只改一侧必红）；
+#   成功行必须带着那个自报态数（谁把态数写回字面量，等值立刻断）。
+if [ "$FXRC118" -ne 0 ] || [ "$FS118" != "$FL118" ] || [ "$FL118" -lt "$FM118" ] \
+	|| [ "$FM118" -lt 8 ] || [ "$FS118" != "$MIN118" ] \
+	|| ! printf '%s' "$FXOUT118" | grep -q "FIXTURE_RESULT=ok states=${FS118}"; then
+	echo "--- FAIL: §118 行为腿 ${CNT118}：夹具实跑未过（rc=${FXRC118} 自报=${FC118} 静态声明=${MIN118}），末 12 行回显："
+	printf '%s\n' "$FXOUT118" | tail -12
+	exit 1
+fi
+echo "ok - §118 行为腿：夹具实跑自报 states=${FS118} legs=${FL118} min=${FM118}，与静态声明 ${MIN118} 四道等值各自成立"
+
+# ── F. 四枚变异反证：把口径里的任一把尺子摘掉，夹具必须转红 ──
+#   没有这一组，"夹具绿"可能只是它压根没在看这些判据（§负向腿恒零命中必须补一枚假目标）。
+#   零改源：整份复制到临时目录树里改副本，仓库里的实跑件一个字节都不动。
+W118=$(mktemp -d)
+mkdir -p "$W118/scripts"
+cp "$FX118" "$W118/scripts/nightly_readout_fixture.sh"
+cp "$VNG118" "$W118/scripts/verify_nightly_guangzhou.sh"
+mut118() { # $1=sed 表达式 $2=期望红话术片段 $3=反证名
+	CNT118=$((CNT118 + 1))
+	cp "$VNG118" "$W118/scripts/verify_nightly_guangzhou.sh"
+	if ! sed -E "$1" "$VNG118" > "$W118/mut.py"; then
+		echo "--- FAIL: §118 反证 ${3} 的 sed 执行失败（表达式本身不合法）"; exit 1
+	fi
+	cmp -s "$VNG118" "$W118/mut.py" && { echo "--- FAIL: §118 反证 ${3} 未生效（空替换＝no-op，这条绿是假绿）"; exit 1; }
+	cp "$W118/mut.py" "$W118/scripts/verify_nightly_guangzhou.sh"
+	M118_RC=0
+	M118_OUT=$(bash "$W118/scripts/nightly_readout_fixture.sh" 2>&1) || M118_RC=$?
+	if [ "$M118_RC" -eq 0 ]; then
+		echo "--- FAIL: §118 反证 ${3} 期望夹具变红实得绿＝该判据在夹具射程内没人看（口径改了夹具也不会拦）"; exit 1
+	fi
+	printf '%s' "$M118_OUT" | grep -q -- "$2" \
+		|| { echo "--- FAIL: §118 反证 ${3} 红了但不是预期的那一处（期望话术含「${2}」）：红因不可归因，可能是夹具别处先坏"; exit 1; }
+}
+# M1 漏绑定回归（现网当年那一形）：删掉 (today_str2,) 绑定 ⇒ A 态整条队列腿 err=ProgrammingError
+mut118 's@\(today_str2,\)\)\.fetchone\(\)\[0\] or 0\)@).fetchone()[0] or 0)@' 'ProgrammingError' 'M1 deferred_now 漏传绑定'
+# M2 摘失控线：95 条积压不再具名红（C 态那把红失去出处）
+mut118 's@if active > a.backlog_runaway_max:@if False and active > a.backlog_runaway_max:@' 'C 态（失控线）应具名红' 'M2 失控线摘除'
+# M3 吞吐那一半摘掉（退回旧的绝对条数尺子）：A 态 55 条积压当场变红
+mut118 's@elif active > a.active_max and drained_24h < a.drain_min_done:@elif active > a.active_max:@' 'A 态（排水中）应绿' 'M3 吞吐判据摘除'
+# M4 窗口从 24h 缩到 1h：A 态的 8 条排水读数掉出窗口 ⇒ 排水态判红（钉住"24"这个量纲真的在拦事）
+#   （BSD sed 的 -E 形：正则里每个字面括号都得反斜杠转义，漏一个就"parentheses not balanced"，
+#    本批首跑亲撞——所以这里只截到 hours=24 之前，把闭合括号留在替换串外。）
+mut118 's@dt\.timedelta\(hours=24@dt.timedelta(hours=1@' 'A 态读数缺项' 'M4 吞吐窗口量纲'
+# M5 摘掉 parked 那一支：F/G/G2 三态的输入库照旧，只是判据少了一把尺子 ⇒ G 态（挂 2 条）转绿，
+#   夹具必红在 G 那条断言上。没有这枚，"八态全绿"里新加的三态可能只是陪跑
+#   （§负向腿恒零命中必须补一枚假目标 同一族）。
+mut118 's@if parked > a.parked_max:@if False and parked > a.parked_max:@' 'G 态（挂 2 条、容忍 1）应红' 'M5 挂起线摘除'
+rm -rf "$W118"
+
+# ── G. §QUEUE-THRESH（owner 10-15 裁决「保持挂起，容忍数临时放 1」）：容忍只落在**调度入口**那一层 ──
+#   为什么必须真 eval 而不是只 grep：这两行是"入口把 PARKED_MAX 带进被调脚本环境"的唯一传值方式，
+#     写在那儿≠解析得出来（本仓「有代码没跑过」那一族：赋值形态吞掉函数输出、度量腿没自证射程同族）。
+#     本块把两行**从文件里取出来、在一个干净子壳里执行一次**，读出的 PARKED_MAX 必须是 1。
+#   为什么还要钉「在 -Preview 分支之前」：预览与实跑必须拼出同一条命令，否则装机自检绿、真跑那夜红。
+#     值锁与序锁分开证（W3 只挪位置不删内容，解析值仍是 1，靠顺序那枚锚单独红）。
+RN118=deploy/mac/run_nightly_verify.sh
+CNT118=$((CNT118 + 1))
+[ -f "$RN118" ] || { echo "--- FAIL: §118 入口文件锁 ${CNT118}：找不到 ${RN118}（薄壳改名而本段仍锚旧名＝整块 G 变哑）"; exit 1; }
+eq_code118 "$RN118" 'PARKED_MAX_TOLERANCE="${PARKED_MAX_TOLERANCE:-1}"' 1 '入口容忍默认值行恰一枚（顶格写，W1/W2 的 sed 锚也按顶格）'
+eq_code118 "$RN118" 'export PARKED_MAX="${PARKED_MAX:-$PARKED_MAX_TOLERANCE}"' 1 '入口导出行恰一枚（export 是这条链唯一的传值方式，写成普通赋值进不了被调脚本的环境）'
+eq_code118 "$RN118" 'THRESH parked_tolerance=${PARKED_MAX}' 1 '入口把当夜生效值写成日志读数（回收那天要查得出容忍是哪几夜生效的）'
+resolve_thresh118() { # $1=runner 路径 → 打印 "<解析值>|<顺序>"（顺序=before|after|absent）
+	local f="$1" lnA lnP order val
+	lnA=$(grep -nF 'PARKED_MAX_TOLERANCE="${PARKED_MAX_TOLERANCE:-' "$f" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	lnP=$(grep -nF 'if [ "${1:-}" = "-Preview" ]; then' "$f" 2>/dev/null | head -1 | cut -d: -f1 || true)
+	if [ -z "$lnA" ] || [ -z "$lnP" ]; then
+		order=absent
+	elif [ "$lnA" -lt "$lnP" ]; then
+		order=before
+	else
+		order=after
+	fi
+	val=$(
+		# set +u：本壳要演的就是"这两行其中一行不在文件里"那两种破坏态（W1/W2）。门禁跑在
+		#   `set -euo pipefail` 下，缺行时导出那行的 `${PARKED_MAX_TOLERANCE}` 会先炸出
+		#   `unbound variable` 噪声再由 `|| val=EMPTY` 兜住——兜底虽对，红因会被噪声搅浑，
+		#   所以这里只关 -u（未定义即展开成空串，正是"该值没被赋过"的语义），保留判空口径。
+		set +u
+		unset PARKED_MAX PARKED_MAX_TOLERANCE
+		eval "$(grep -v '^[[:space:]]*#' "$f" | grep -F 'PARKED_MAX_TOLERANCE="${PARKED_MAX_TOLERANCE:-' | head -1 || true)"
+		eval "$(grep -v '^[[:space:]]*#' "$f" | grep -F 'export PARKED_MAX="${PARKED_MAX:-$PARKED_MAX_TOLERANCE}"' | head -1 || true)"
+		printf '%s' "${PARKED_MAX:-EMPTY}"
+	) || val="EMPTY"
+	printf '%s|%s' "${val:-EMPTY}" "$order"
+}
+CNT118=$((CNT118 + 1))
+RES118=$(resolve_thresh118 "$RN118")
+[ "$RES118" = "1|before" ] || { echo "--- FAIL: §118 入口真解析腿 ${CNT118}：把入口那两行取出来真执行一次，期望 PARKED_MAX=1 且拼在 -Preview 之前，实得「${RES118}」（两行在文件里却解析不出这个值＝容忍从没生效过）"; exit 1; }
+echo "ok - §118 入口真解析：调度入口 eval 出 PARKED_MAX=1，位置在 -Preview 分支之前（预览与实跑同一条命令）"
+WT118=$(mktemp -d)
+anti_thresh118() { # $1=反证名 $2=变异副本 $3=原件读数（实得必须不等于它）
+	CNT118=$((CNT118 + 1))
+	if [ ! -s "$2" ]; then
+		echo "--- FAIL: §118 入口反证 ${1}：变异副本是空的（破坏没落地＝假反证）"
+		exit 1
+	fi
+	cmp -s "$RN118" "$2" && { echo "--- FAIL: §118 入口反证 ${1}：变异后与原件逐字节相同＝no-op"; exit 1; }
+	local got
+	got=$(resolve_thresh118 "$2")
+	[ "$got" != "$3" ] || { echo "--- FAIL: §118 入口反证 ${1}：破坏之后仍读出「${got}」＝那个值不是被破坏的那行给的，真解析腿是蒙的"; exit 1; }
+	echo "ok - §118 入口反证 ${1}：破坏后读数「${got}」不等于原件「${3}」"
+}
+sed '/^export PARKED_MAX=/d' "$RN118" > "$WT118/w1.sh"
+anti_thresh118 "W1 摘导出行" "$WT118/w1.sh" "$RES118"
+sed '/^PARKED_MAX_TOLERANCE=/d' "$RN118" > "$WT118/w2.sh"
+anti_thresh118 "W2 摘容忍默认值行" "$WT118/w2.sh" "$RES118"
+# W3 只挪位置不删内容：解析值仍是 1，但落到 -Preview 之后 ⇒ 必须由顺序锚单独红（值锁抓不到它）
+{ sed '/^PARKED_MAX_TOLERANCE=/d;/^export PARKED_MAX=/d' "$RN118"; echo 'PARKED_MAX_TOLERANCE="${PARKED_MAX_TOLERANCE:-1}"'; echo 'export PARKED_MAX="${PARKED_MAX:-$PARKED_MAX_TOLERANCE}"'; } > "$WT118/w3.sh"
+anti_thresh118 "W3 挪到 -Preview 之后" "$WT118/w3.sh" "$RES118"
+rm -rf "$WT118"
+
+# 自账下界（本仓「ok 文案枚数改段正文派生＋下界」那一形）：桶名照写，**桶内数字一律不写死**，
+#   只报 CNT118 这个逐枚累加的派生读数；哪天少的是整块锁（而不是改形），下界当场拦。
+CNT118=$((CNT118 + 1))
+[ "$CNT118" -ge 34 ] || { echo "--- FAIL: §118 自账锁 ${CNT118}：本段判定点 ${CNT118} 低于下界 34＝有整块锁被删掉而不是被改形（删锁请连下界一起写明理由）"; exit 1; }
+echo "ok - §118 §QUEUE-BACKLOG 专项守卫通过：三语透传 + 三语值同源（派生取数，取空即红）+ 判据出口与窗口 + 夹具资产与断言方向 + 态数派生（夹具自述 min=${MIN118}，state_done/run_leg 各等于它）+ §QUEUE-THRESH 入口容忍（真 eval 解析 + W1/W2/W3 三枚破坏反证）+ 行为腿 1 组（八态实跑 states==legs==min==静态声明）+ 变异反证 5 枚（M1 漏绑定·M2 摘失控线·M3 摘吞吐那一半·M4 窗口量纲·M5 摘挂起线）+ 自账下界 1 枚，累计判定点 ${CNT118}"
+echo ""
+
+echo ""
+echo ""
+
+echo "==> 119 §NTFY-PRI Mac 告警优先级词表＋失效分类单实现（4xx 不重试＋状态码优先）（2026-10-15 批）..."
+
+# 现网实录（这批的起因不是"想加锁"，是**一条从没成功发出去过的告警通道**）：
+#   ① 现象：看门狗与拉取腿的 alert() 把 Priority 的默认值和传参都写成 **medium**。ntfy 的
+#      Priority 头只认 min/low/default/high/urgent 与 1–5，`medium` 是英语里"中"的直觉词，
+#      上游直接回 HTTP 400 {"code":40007,"error":"invalid priority parameter"}。
+#      于是这两条腿**从装机那天起每一条告警 100% 发不出去**——10-10 首跑的失败被读成
+#      「ntfy.sh 间歇断连」，10-12 批的"修法"是给必然 400 的请求加三次重试（同一条错误请求
+#      再发三遍），并把文案写成「网络？」。配置错误被伪装成网络抖动整整五天。
+#   ② 锤实方式：今天用零凭据只读探针逐个优先级拨公开 topic（不带主题凭据、不占现网通道）：
+#      high/default/3/urgent → 200，medium → 400。**同一次探针还实测到 `curl_rc=56 + http=400
+#      + 响应体为空`**——上游发完状态行就断连接。这直接否决"按 curl 退出码判成败"的写法：
+#      只按 curlrc 判，"200 之后被重置"会被当成失败而重试（重复告警轰炸手机），而 400 会被
+#      归进可重试那一支（正是这次要治的形）。
+#   ③ 为什么不能只在发送方改一行：同一纪律写在三处＝改一处漏两处（§0929DRILL 主题值三处并存
+#      就是同一课）。词表与"一次拨号"必须单实现，门禁才能用**派生取数**钉"Mac 两个发送方与
+#      Go 引擎侧读的是同一套词"——Go 侧用的是数字 2/3/4，白名单里没有 2 就是引擎告警全灭。
+#   ④ 为什么"发不出去"不能影响判据：本仓反复锤的「降级不得报成功」（§N-6）。非法值兜到 high
+#      并**点名原值**（照发，不静默），4xx 只留痕不重试、也不改脚本退出码。
+#   ⇒ 本段形状＝静态锁（词表/分类/接线在位＋跨语言同源）＋行为腿（假 curl 走 ntfy_attempt
+#     八态＋三个发送方的 alert() 实跑）＋反证（五枚变异＋两枚往负锁那侧塞假目标，各带对照）。
+#   English: §NTFY-PRI — the priority whitelist and the single dial-with-classification live in
+#   one lib file; 4xx means the request itself is invalid (never retry, never blame the network),
+#   and the delivery decision reads the HTTP status code before curl's exit code.
+
+# CNT119 是判定点总数，NEG119 单独数**负锁**那几枚：ok 行里「其中 N 枚负锁」过去写死 10，
+#   而 A 组 2 枚＋B 组循环 3 文件×3 枚＋演练腿 1 枚＝实跑 12 枚——写死的那份从加第三枚发送方
+#   负锁那夜起就已经是假读数（本仓规矩：枚数只引判据的派生读数，不引我以为的数）。
+CNT119=0
+NEG119=0
+LIB119=deploy/mac/ntfy_topic.sh
+WD119=deploy/mac/check_mac_ops_watchdog.sh
+PL119=deploy/mac/restic_pull_backup.sh
+VR119=deploy/mac/verify_restore.sh
+GO119=internal/notify/ntfy.go
+TOK119="gate-fake-topic-119"
+
+# eq_code119 / neg_code119：执行行等值锁（计数前剥掉 # 注释行，§118/§107 同口径）。
+#   本批把上面那整段成因写进各文件头注，锚在注释里的同串会多出若干命中——判红只看执行态。
+eq_code119() { # $1=文件 $2=整串 $3=预演读数 $4=说明
+	local got
+	CNT119=$((CNT119 + 1))
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §119 执行行等值锁 ${CNT119}（${4}）：${1} 非注释行里整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+neg_code119() { # $1=文件 $2=整串 $3=说明 → 执行行里彻底没有
+	local got
+	CNT119=$((CNT119 + 1))
+	NEG119=$((NEG119 + 1))
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §119 负锁 ${CNT119}（${3}）：${1} 执行行里又出现「${2}」got=${got}"; exit 1; }
+}
+
+# ── A. 单实现文件里那两把新契约（词表闸 + 一次拨号的三态分类）──
+eq_code119 "$LIB119" 'ntfy_priority_normalize() {' 1 '优先级白名单闸在库里恰一枚（发送方不许各写一份 case）'
+eq_code119 "$LIB119" 'min | low | default | high | urgent | 1 | 2 | 3 | 4 | 5)' 1 '白名单整行等值（改词、删词、加词都当场红）'
+eq_code119 "$LIB119" "printf 'high'" 1 '非法值兜底档位＝high（宁高不丢，§N-6 同族）恰一枚；锚不带缩进＝shfmt 改缩进不会把这枚锁打红（本批首跑亲撞：带两个 tab 的锚实得 0，真文件里是一 tab）'
+eq_code119 "$LIB119" 'ntfy_attempt() {' 1 '一次拨号单实现恰一枚（三个发送方都调它）'
+eq_code119 "$LIB119" "-w '%{http_code}'" 1 '状态码读数来源在 curl 那一行（没有它就没法「状态码优先」）'
+eq_code119 "$LIB119" '2[0-9][0-9] | 3[0-9][0-9])' 1 '送达支（2xx/3xx）恰一枚'
+eq_code119 "$LIB119" '4[0-9][0-9])' 1 '不可重试支（4xx）恰一枚'
+eq_code119 "$LIB119" '5[0-9][0-9])' 1 '可重试支（5xx）恰一枚'
+eq_code119 "$LIB119" 'curl_rc=${curlrc} src=${src}' 1 '失效日志带 curl 码与归因前缀（10-12 那次只剩「发送失败」四个字才没人分得清）'
+eq_code119 "$LIB119" '响应=${snippet:-无body}' 1 '响应体缺失必须读成「无body」而不是把整条读数带崩（10-15 实测 body 就是拿不到）'
+eq_code119 "$LIB119" 'return 2' 1 '4xx 折算成伪状态 2 恰一枚（绝不静默折回 1）'
+neg_code119 "$LIB119" '] && rm -f' '库里不得用「[ -n X ] && cmd」收尾：条件为假整句返回 1，而本文件会被 set -e 的调用方 source'
+neg_code119 "$LIB119" 'Priority: medium' '库里不得再出现 medium 这个词组'
+SEC119=$CNT119
+
+# ── B. 三个发送方的接线：拨号只走库、词表只读库、medium 彻底出局 ──
+#   负锁的口径是"发送方一行 curl 都不许自己拼"——过去三处各拼一遍所以改一处漏两处；
+#   今天只要有人在发送方里再写一次 `-H "Title:`，本枚立刻红（假目标反证 G6 实测这枚有牙）。
+for f119 in "$PL119" "$WD119" "$VR119"; do
+	eq_code119 "$f119" 'ntfy_attempt ' 1 "${f119} 必须真调库里的单次拨号（恰一枚）"
+	neg_code119 "$f119" 'curl -fs -H "Title:' "${f119} 又自己拼了一遍 ntfy 请求（第二实现＝改一处漏两处的老路）"
+	neg_code119 "$f119" 'Priority: $pri' "${f119} 里出现自拼的 Priority 头（词表必须只写在 ntfy_topic.sh）"
+	neg_code119 "$f119" 'medium' "${f119} 执行行里还剩 medium（就是那个让全链告警静默死掉五天的词）"
+done
+for f119 in "$PL119" "$WD119"; do
+	eq_code119 "$f119" 'pri_raw="${3:-high}"' 1 "${f119} 的缺省优先级＝high（过去写 medium，本枚钉住它不回归）"
+	eq_code119 "$f119" 'ntfy_priority_normalize "$pri_raw"' 1 "${f119} 走库里的白名单闸（恰一枚）"
+	eq_code119 "$f119" 'raw=${pri_raw} used=${pri}' 1 "${f119} 兜底时必须点名原值与实得值（静默兜底＝下次还是没人知道是谁传错）"
+	eq_code119 "$f119" 'if [ "$rc" -eq 2 ]; then' 1 "${f119} 对 4xx 早退（重试只留给传输层/5xx）"
+	eq_code119 "$f119" '已试 ${NTFY_ALERT_ATTEMPTS} 次仍失败' 1 "${f119} 的耗尽文案带次数（10-12 加重试时定下的读数，口径不许漂）"
+done
+# 演练腿：本腿传的就是合法词 high、且**单次拨号**的语义不因为这次改造变成重试循环
+#   （alert 永不影响退出码；重试上界变量压根不该出现在这里——出现＝把演练腿改成了另一条链）。
+eq_code119 "$VR119" 'ntfy_attempt log "$NTFY_URL" "$NTFY_TOPIC" "$title" high warning "$body" verify-restore' 1 '演练腿交库时送的字面合法词（恰一枚，参数顺序一并钉住）'
+neg_code119 "$VR119" 'NTFY_ALERT_ATTEMPTS' '演练腿引入了重试上界（本腿设计就是单次拨号，重试是拉取/看门狗那两条的事）'
+SECB=$CNT119
+
+# ── C. 跨语言词表同源（派生取数，任一侧取空即红；绝不写死数字/词表）──
+#   Mac 侧词表写在 bash 的 case 行里，引擎侧写在 internal/notify/ntfy.go 的 pri 赋值里。
+#   两侧写死比对＝下一轮换词就红在锁自己；派生取数＝Go 侧真送出的每个值必须落在库里那张表内。
+WL119=$(grep -E '^[[:space:]]*min \| low \| default \| high \| urgent' "$LIB119" 2>/dev/null | head -1 | tr '|' '\n' | sed -e 's/[()]//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' | tr '\n' ' ' || true)
+CNT119=$((CNT119 + 1))
+if [ -z "$WL119" ]; then
+	echo "--- FAIL: §119 词表派生取数取空（库里那行 case 漂了）——取空一律判红，绝不把「读不到」当成「没问题」"
+	exit 1
+fi
+GO_PRI119=$(grep -oE 'pri :?=[[:space:]]*"[0-9a-zA-Z]+"' "$GO119" 2>/dev/null | grep -oE '"[0-9a-zA-Z]+"' | tr -d '"' | tr '\n' ' ' || true)
+CNT119=$((CNT119 + 1))
+if [ -z "$GO_PRI119" ]; then
+	echo "--- FAIL: §119 引擎侧 Priority 取值派生取空（${GO119} 里 pri 赋值改了形）——本枚会静默失去对照对象，必须先改锁的取数口径再谈绿"
+	exit 1
+fi
+for v119 in $GO_PRI119; do
+	CNT119=$((CNT119 + 1))
+	hit119=0
+	for w119 in $WL119; do
+		if [ "$v119" = "$w119" ]; then hit119=1; fi
+	done
+	[ "$hit119" = "1" ] || { echo "--- FAIL: §119 跨语言词表不同源：引擎侧送出「${v119}」不在 Mac 白名单 ${WL119} 里（同一套词分叉＝一侧告警永远发不出去，而两侧各自的日志都说自己成功）"; exit 1; }
+done
+eq_code119 "$GO119" 'req.Header.Set("Priority", pri)' 1 '引擎侧只有一处把优先级送上头（对照对象在位）'
+echo "ok - §119 词表同源：Mac 白名单 ${WL119}，引擎侧实发值 ${GO_PRI119} 全部在册"
+SECC=$CNT119
+
+# ── 行为腿夹具：假 curl 只按 ntfy_attempt 真实使用的参数形态工作 ──
+W119="$(mktemp -d 2>/dev/null || true)"
+[ -n "$W119" ] || { echo "--- FAIL: §119 建不出隔离工作目录，行为腿与反证无法跑（宁可红，不许跳）"; exit 1; }
+mkdir -p "$W119/bin" "$W119/mut"
+cat > "$W119/bin/curl" <<'STUB119'
+#!/bin/bash
+# 假 curl：-o 收响应体、-w 要状态码，每次外呼把整串参数追加进 CURL_MARK。
+# 三个控制量：FAKE_HTTP＝回显的状态码（空串＝拿不到，真断网那一族）、FAKE_RC＝curl 退出码、
+# FAKE_BODY＝响应体（空＝不落文件，10-15 实测上游就是这一态：发完状态行就断）。
+# 为什么状态码用 printf 不用 echo：真 curl 的 -w 输出不带换行，桩必须同形，
+# 否则调用方拿到的串多一个换行，"got=200" 与 "200" 的比较就成了夹具自己的错。
+out=""
+all="$*"
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = "-o" ]; then out="${2:-}"; shift 2; continue; fi
+	shift
+done
+if [ -n "${CURL_MARK:-}" ]; then printf '%s\n' "$all" >>"$CURL_MARK"; fi
+if [ -n "$out" ] && [ -n "${FAKE_BODY:-}" ]; then printf '%s' "$FAKE_BODY" >"$out"; fi
+printf '%s' "${FAKE_HTTP:-}"
+exit "${FAKE_RC:-0}"
+STUB119
+chmod +x "$W119/bin/curl"
+
+# alert() 夹具：三个发送方的函数体都从真文件里切出来跑（本仓纪律：判据从真源切，夹具只造数据）。
+#   log 与 line 两种名字都定义——拉取腿/演练腿用 log，看门狗用 line，切哪个都能跑。
+#   curl 桩**不在这里定义成函数**：ntfy_attempt 在 lib 里，它调用的 curl 必须由 PATH 命中假件。
+cat > "$W119/alert_run.sh" <<'AL119'
+#!/bin/bash
+# $1=alert 函数体文件 $2=ntfy_topic.sh $3=主题 $4=标题 $5=正文 $6=原始优先级词
+set -uo pipefail
+log() { echo "LOG:$*"; }
+line() { echo "LOG:$*"; }
+ALERT="${ALERT:-1}"
+# shellcheck source=/dev/null
+[ -f "$2" ] || { echo "F-HARNESS-FAIL: 取不到 $2（lib 不在＝这条腿在验空气）"; exit 3; }
+. "$2"
+# 重试上界/间隔的缺省定义在各脚本顶部、不在 alert() 体内（sed 只抽函数＝抽不到），夹具自己补。
+NTFY_ALERT_ATTEMPTS="${NTFY_ALERT_ATTEMPTS:-3}"
+NTFY_ALERT_BACKOFF_S="${NTFY_ALERT_BACKOFF_S:-0}"
+NTFY_URL="https://ntfy.invalid"
+NTFY_TOPIC="$3"
+# shellcheck source=/dev/null
+[ -f "$1" ] || { echo "F-HARNESS-FAIL: 取不到 $1（alert 函数体没切出来）"; exit 3; }
+. "$1"
+alert "$4" "$5" "$6"
+AL119
+
+run_attempt119() { # $1=lib $2=FAKE_HTTP $3=FAKE_RC $4=FAKE_BODY $5=期望rc $6=期望日志含(空不比) $7=说明
+	local out119 rc119=0
+	rm -f "$W119/mark"
+	out119="$(FAKE_HTTP="$2" FAKE_RC="$3" FAKE_BODY="$4" CURL_MARK="$W119/mark" PATH="$W119/bin:$PATH" LIBF="$1" \
+		bash -c 'log119() { echo "LOG:$*"; }; . "$LIBF"; ntfy_attempt log119 https://ntfy.invalid gate-fake-topic "标题" high warning "正文" leg' 2>&1)" && rc119=0 || rc119=$?
+	CNT119=$((CNT119 + 1))
+	if [ "${rc119}" != "$5" ]; then
+		echo "--- FAIL: §119 行为腿 ${7}：ntfy_attempt 返回码期望 ${5} 实得 ${rc119}，输出=$(printf '%s' "$out119" | tr '\n' ' ')（三态语义＝0 送达／1 可重试／2 不可重试，混任何一支就是「把配置错误当网络抖动治」）"
+		exit 1
+	fi
+	if [ -n "$6" ]; then
+		printf '%s' "$out119" | grep -qF -- "$6" || { echo "--- FAIL: §119 行为腿 ${7}：日志缺「${6}」，实际=$(printf '%s' "$out119" | tr '\n' ' ')"; exit 1; }
+	fi
+}
+
+run_alert119() { # $1=发送方 $2=lib $3=FAKE_HTTP $4=FAKE_RC $5=原始优先级 $6=期望外呼次数(空不比) $7=日志含(空不比) $8=日志不含(空不比) $9=curl行含(空不比) $10=说明
+	local body119 out119 dial119
+	body119="$W119/alert_body.sh"
+	sed -n '/^alert() {/,/^}/p' "$1" >"$body119"
+	CNT119=$((CNT119 + 1))
+	grep -q '^alert() {' "$body119" || { echo "--- FAIL: §119 行为腿 ${10}：${1} 的 alert() 抽不出来（sed 锚点与文件脱钩＝这条腿在验空气，同段其它绿一并作废）"; exit 1; }
+	rm -f "$W119/mark"
+	: >"$W119/mark"
+	out119="$(FAKE_HTTP="$3" FAKE_RC="$4" CURL_MARK="$W119/mark" PATH="$W119/bin:$PATH" \
+		bash "$W119/alert_run.sh" "$body119" "$2" "$TOK119" "标题" "正文" "$5" 2>&1)" || true
+	# alert 永不影响脚本退出码（10-15 这条契约不变），所以这里只比「外呼次数＋日志」，不比 rc。
+	if [ -n "$6" ]; then
+		dial119=$(grep -c . "$W119/mark" 2>/dev/null || true)
+		[ "${dial119:-0}" = "$6" ] || { echo "--- FAIL: §119 行为腿 ${10}：外呼次数期望 ${6} 实得 ${dial119:-0}（4xx 必须只拨一次；重试只配给传输层错误/5xx）"; exit 1; }
+	fi
+	if [ -n "$7" ]; then
+		printf '%s' "$out119" | grep -qF -- "$7" || { echo "--- FAIL: §119 行为腿 ${10}：日志缺「${7}」，实际=$(printf '%s' "$out119" | tr '\n' ' ')"; exit 1; }
+	fi
+	if [ -n "$8" ]; then
+		if printf '%s' "$out119" | grep -qF -- "$8"; then echo "--- FAIL: §119 行为腿 ${10}：日志出现了不该有的「${8}」（4xx 走成重试文案＝又把配置错误当成网络抖动）"; exit 1; fi
+	fi
+	if [ -n "$9" ]; then
+		grep -qF -- "$9" "$W119/mark" || { echo "--- FAIL: §119 行为腿 ${10}：送上头的优先级不是「${9}」（词表改了而线上还是旧词＝白改）：$(tail -1 "$W119/mark")"; exit 1; }
+	fi
+}
+
+leg_valid119() { # $1=lib $2=白名单里的词 → 原样回显且退 0
+	local out119 rc119=0
+	out119="$(PATH="$W119/bin:$PATH" LIBF="$1" V119="$2" bash -c '. "$LIBF"; ntfy_priority_normalize "$V119"' 2>&1)" && rc119=0 || rc119=$?
+	CNT119=$((CNT119 + 1))
+	[ "${rc119}" = "0" ] || { echo "--- FAIL: §119 行为腿 E 合法词「${2}」被判成非法（rc=${rc119}）：白名单里的词被拒＝这张表自己就是下一个 400"; exit 1; }
+	[ "${out119}" = "$2" ] || { echo "--- FAIL: §119 行为腿 E 合法词「${2}」没被原样回显（实得 ${out119}）：闸在改写值＝线上送的是什么词没人知道"; exit 1; }
+}
+leg_invalid119() { # $1=lib $2=非法值 → 兜到 high 且退 1（调用方据此打 WARN 点名原值）
+	local out119 rc119=0
+	out119="$(PATH="$W119/bin:$PATH" LIBF="$1" V119="$2" bash -c '. "$LIBF"; ntfy_priority_normalize "$V119"' 2>&1)" && rc119=0 || rc119=$?
+	CNT119=$((CNT119 + 1))
+	[ "${rc119}" = "1" ] || { echo "--- FAIL: §119 行为腿 E 非法值「${2}」没退 1（实得 rc=${rc119}）：调用方靠这个码决定要不要点名，退 0＝兜底静默"; exit 1; }
+	[ "${out119}" = "high" ] || { echo "--- FAIL: §119 行为腿 E 非法值「${2}」兜底不是 high（实得 ${out119}）：兜到更低的档＝本该叫醒人的那条通知自己降了级"; exit 1; }
+}
+
+# ── D. ntfy_attempt 的八态分类（每态一枚：返回码就是三条腿各走各路的那三条路）──
+run_attempt119 "$LIB119" 200 0 "" 0 "" "D1 上游 200 ⇒ 送达"
+run_attempt119 "$LIB119" 200 56 "" 0 "" "D2 200 之后连接被重置（curl_rc=56）⇒ 仍判送达，绝不重试轰炸手机（★ 状态码优先于 curl 退出码这一枚就钉在这里）"
+run_attempt119 "$LIB119" 304 0 "" 0 "" "D3 3xx ⇒ 送达"
+run_attempt119 "$LIB119" 400 56 "" 2 "响应=无body" "D4 400 且响应体拿不到（10-15 实测形态）⇒ 不可重试，日志还能读"
+run_attempt119 "$LIB119" 400 0 '{"code":40007,"error":"invalid priority parameter"}' 2 "invalid priority parameter" "D5 400 带响应体 ⇒ 把上游 error 文案点名（否则只剩四个字，分不出优先级写错还是主题写错）"
+run_attempt119 "$LIB119" 500 0 "" 1 "" "D6 上游 5xx ⇒ 可重试那一族"
+run_attempt119 "$LIB119" "" 7 "" 1 "" "D7 拿不到状态码且 curl 报错（真断网/DNS）⇒ 可重试"
+run_attempt119 "$LIB119" "" 0 "" 0 "" "D8 拿不到状态码但 rc=0（门禁桩形态）⇒ 判送达，§110 WD2/WD8 的读数口径一字不动"
+# D9：一次 attempt 恰好一次外呼，且词表值原样落到 -H 上（防"只改返回值不改线上"那一族）。
+CNT119=$((CNT119 + 1))
+rm -f "$W119/mark"
+: >"$W119/mark"
+FAKE_HTTP=200 FAKE_RC=0 CURL_MARK="$W119/mark" PATH="$W119/bin:$PATH" LIBF="$LIB119" \
+	bash -c 'log119() { echo "LOG:$*"; }; . "$LIBF"; ntfy_attempt log119 https://ntfy.invalid gate-fake-topic "标题" high warning "正文" leg' >/dev/null 2>&1 || true
+D9N=$(grep -c . "$W119/mark" 2>/dev/null || true)
+[ "${D9N:-0}" = "1" ] || { echo "--- FAIL: §119 行为腿 D9：attempt 自身拨号数不是恰 1（实得 ${D9N:-0}；它只该拨一次，重试归调用方）"; exit 1; }
+grep -qF -- '-H Priority: high' "$W119/mark" || { echo "--- FAIL: §119 行为腿 D9：优先级没落到 curl 的 -H 上：$(tail -1 "$W119/mark")"; exit 1; }
+SECD=$CNT119
+
+# ── E. 白名单闸的两态（合法词原样回显／非法词兜 high 并退 1 让调用方点名）──
+#   合法词表来自 C 段的派生取数：表里每一个词都必须被真拨一次，负向那侧同样逐个真拨。
+for w119 in $WL119; do
+	leg_valid119 "$LIB119" "$w119"
+done
+for v119 in medium "" Medium 6 -1; do
+	leg_invalid119 "$LIB119" "$v119"
+done
+SECE=$CNT119
+
+# ── F. 三个发送方 alert() 的实跑（medium 兜底点名／4xx 只拨一次／传输层失败才重试）──
+run_alert119 "$PL119" "$LIB119" 200 0 medium 1 "raw=medium used=high" "" "Priority: high" "F1 拉取腿传 medium ⇒ WARN 点名原值并兜到 high，且真的以 high 上线"
+run_alert119 "$WD119" "$LIB119" 200 0 medium 1 "raw=medium used=high" "" "Priority: high" "F1 看门狗传 medium ⇒ 同一套兜底（两条腿不能一个改了一个没改）"
+run_alert119 "$PL119" "$LIB119" 400 56 high 1 "http=400" "已试" "" "F2 拉取腿 4xx ⇒ 恰好拨一次、且不写「已试 N 次」（把 400 重放三遍就是 10-12 那次的错法）"
+run_alert119 "$WD119" "$LIB119" 400 56 high 1 "http=400" "已试" "" "F2 看门狗 4xx ⇒ 同上"
+run_alert119 "$VR119" "$LIB119" 400 56 high 1 "http=400" "" "" "F2 演练腿 4xx ⇒ 只留痕、不改退出码，且本来就不重试"
+run_alert119 "$PL119" "$LIB119" "" 7 high 3 "已试 3 次仍失败" "" "" "F3 拉取腿传输层恒败 ⇒ 重试恰 3 次且文案带次数"
+run_alert119 "$WD119" "$LIB119" "" 7 high 3 "已试 3 次仍失败" "" "" "F3 看门狗传输层恒败 ⇒ 同上（第二实现面）"
+run_alert119 "$VR119" "$LIB119" "" 7 high 1 "传输层错误/5xx" "" "" "F4 演练腿传输层失败 ⇒ 仍只拨一次（本腿设计语义不变，改造不许顺手把它变成第三条重试链）"
+SECF=$CNT119
+
+# ── G. 反证：五枚变异（只改 /tmp 副本，仓库字节不动）＋两枚"往负锁那侧塞假目标" ──
+mk_mut119() { # $1=源文件 $2=sed 表达式 $3=输出名 → 变异必须真的落地（cmp 挡空替换：空替换的绿是假绿）
+	sed -e "$2" "$1" >"$W119/mut/$3"
+	if cmp -s "$1" "$W119/mut/$3"; then
+		echo "--- FAIL: §119 反证 ${3} 的 sed 未生效（锚行漂了，这条绿是假绿）"; exit 1
+	fi
+}
+red119() { # $1=反证名 $2=预期红短语 $3..=在子 shell 里跑的既有判据腿（期望它红，且红的是预期的那一处）
+	local out119 rc119=0
+	# 跳过前两枚（反证名与预期短语），从 $3 起才是"要跑的腿＋它的参数"。
+	#   写成 "$@" 会把反证名当命令名（10-15 首跑亲撞：command not found 被当成"这枚反证红了"）。
+	out119="$("${@:3}" 2>&1)" || rc119=$?
+	CNT119=$((CNT119 + 1))
+	[ "$rc119" -ne 0 ] || { echo "--- FAIL: §119 反证 ${1} 期望转红实得绿＝对应尺子没牙（判据与被测代码脱钩）"; exit 1; }
+	printf '%s' "$out119" | grep -qF -- "$2" \
+		|| { echo "--- FAIL: §119 反证 ${1} 红了但不是预期的那一处（期望话术含「${2}」）：实得红因=$(printf '%s' "$out119" | tr '\n' ' ')"; exit 1; }
+}
+# G1 把 4xx 折算成可重试（return 2 → return 1）：F2「只拨一次」必须红（这正是本次治的病）。
+mk_mut119 "$LIB119" 's@return 2@return 1@' 'lib_g1.sh'
+red119 "G1 4xx 折回可重试" "F2 拉取腿 4xx" run_alert119 "$PL119" "$W119/mut/lib_g1.sh" 400 56 high 1 "http=400" "已试" "" "F2 拉取腿 4xx（变异件）"
+# G2 送达判据退回"按 curl 退出码"（摘掉 2xx/3xx 那一支）：D2「200 后被重置」必须红。
+mk_mut119 "$LIB119" 's@2\[0-9\]\[0-9\] | 3\[0-9\]\[0-9\])@99xx-never-matches)@' 'lib_g2.sh'
+red119 "G2 状态码优先摘除" "D2 200 之后连接被重置" run_attempt119 "$W119/mut/lib_g2.sh" 200 56 "" 0 "" "D2 200 之后连接被重置（变异件）"
+# G3 兜底档位从 high 漂成 min：E 非法值腿必须红（"该叫醒人的时候按高处理"这条铁律被换了个方向）。
+mk_mut119 "$LIB119" "s@printf 'high'@printf 'min'@" 'lib_g3.sh'
+red119 "G3 兜底档位漂移" "非法值「medium」兜底不是 high" leg_invalid119 "$W119/mut/lib_g3.sh" medium
+# G4 摘掉看门狗里的白名单闸（直接用调用方给的词）：F1 medium 腿必须红（medium 又上线了）。
+mk_mut119 "$WD119" 's@pri="$(ntfy_priority_normalize "$pri_raw")" || rc=$?@pri="$pri_raw"@' 'wd_g4.sh'
+red119 "G4 发送方摘掉归一化" "F1 看门狗传 medium" run_alert119 "$W119/mut/wd_g4.sh" "$LIB119" 200 0 medium 1 "raw=medium used=high" "" "Priority: high" "F1 看门狗传 medium（变异件）"
+# G5 摘掉 5xx 那一支（上游 500 被当成送达）：D6 必须红——"上游明确说它坏了"与"没人答话"混成一支，
+#     重试账就再也对不上（10-11 nssm 假绿同族：把读数错归类比没读数更坏）。
+mk_mut119 "$LIB119" 's@5\[0-9\]\[0-9\])@99xx-never-matches)@' 'lib_g5.sh'
+red119 "G5 5xx 支摘除" "D6 上游 5xx" run_attempt119 "$W119/mut/lib_g5.sh" 500 0 "" 1 "" "D6 上游 5xx（变异件）"
+# G6/G7 负锁的反证：负向锁恒零命中时必须往那一侧塞一个假目标，否则"绿"可能只是因为尺子扫不到东西
+#     （§反证纪律）。同一份未塞东西的副本作空白对照，证明红来自假目标本身而不是文件选错。
+neg_code119_mut() { # $1=文件 $2=串 $3=说明（与 neg_code119 同判据，只用在副本上）
+	local got
+	CNT119=$((CNT119 + 1))
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §119 负锁（${3}）：${1} 执行行里又出现「${2}」got=${got}"; exit 1; }
+}
+cp "$PL119" "$W119/mut/pl_plain.sh"
+cp "$PL119" "$W119/mut/pl_fake_curl.sh"
+printf '%s\n' 'curl -fs -H "Title: $title" -H "Priority: $pri" -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1 || true' >>"$W119/mut/pl_fake_curl.sh"
+printf '%s\n' 'alert "quant 备份失败" "假目标：第二实现回归" medium' >>"$W119/mut/pl_fake_curl.sh"
+red119 "G6 假目标（自拼 curl 回归）" "负锁" neg_code119_mut "$W119/mut/pl_fake_curl.sh" 'curl -fs -H "Title:' '假目标反证'
+red119 "G7 假目标（medium 回归）" "负锁" neg_code119_mut "$W119/mut/pl_fake_curl.sh" 'medium' '假目标反证'
+neg_code119_mut "$W119/mut/pl_plain.sh" 'curl -fs -H "Title:' '空白对照（未塞假目标的同一份副本）'
+neg_code119_mut "$W119/mut/pl_plain.sh" 'medium' '空白对照（未塞假目标的同一份副本）'
+rm -rf "$W119"
+
+echo "ok - §119 §NTFY-PRI 专项守卫通过：库里词表与三态分类 $((SEC119)) 道 + 三发送方接线 $((SECB - SEC119)) 道（负锁累计 ${NEG119} 枚，派生自 neg_code119 的实跑次数：不自拼 curl／不自写 Priority 头／medium 出局／演练腿不引入重试上界）+ 跨语言词表同源派生 $((SECC - SECB)) 道 + attempt 八态与送头上 $((SECD - SECC)) 道 + 白名单两态 $((SECE - SECD)) 道 + alert 实跑 $((SECF - SECE)) 道 + 反证 $((CNT119 - SECF)) 枚（G1–G5 变异·G6/G7 假目标·空白对照），累计判定点 ${CNT119}"
+
+echo "==> 120 §GATE-SELFACC 门禁自账收口：段编号＝唯一身份（后缀编号不再被折成同一段）＋重复编号当场炸（2026-10-15 批）..."
+
+# 现网实录（这笔账挂了四夜，起因不是"总数打印错了"，是**收集模式会在同号段上原地打转**）：
+#   ① 现象：10-14 整轮 -collect 的汇总打的是 `TOTAL_SECTIONS=116` 而四桶之和只有 114，
+#      当时登记成「只影响打印总数、漏跑检测有效」。今天把这条账锤到底，锤出来的比登记更坏。
+#   ② 根因：段头写成 `echo "==> 34 §H9…"`、`echo "==> 34b §BUY-REJECT-BACKOFF…"`、
+#      `echo "==> 34c §N-RELAX…"`——10-12 批往老段尾巴后追加新段时借用了 34 号加字母后缀，
+#      而解析器的段身份取的是 `(\d+)` **只有数字那一半**：三行解析出同一个 id 34。于是
+#        a) `TOTAL_SECTIONS=len(ids)` 数的是三行，四桶按 id 去重最多只能到一段 ⇒ 116 vs 114；
+#      b) 更要命的是 collect 的推进：红发生在 34b 时 classify 的 NEXT 仍是 34，而 emit 的
+#         尾体起点取**第一处**同编号段 ⇒ 下一遍从 34 那段重跑，同一个红点再红一次，
+#         一直烧到 GATE_COLLECT_MAX_PASSES=60 用尽，后面所有段一条读数都没有，
+#         还白烧 60 遍尾体（默认模式全绿时看不见这条路，所以四夜没人看见）。
+#   ③ 锤实方式：/tmp 最小夹具（1 绿、2 红、2 绿、3）实测复现——classify 回
+#      `STARTED=1,2 / FAIL=2 / NEXT=2`（下一遍起点等于本遍起点），这两条读数就是"原地打转"的
+#      直接证据，不是推理。改完之后同一夹具的 NEXT 变成 2b，带后缀的编号在段清单里各占一行。
+#   ④ 为什么不能只把 34b/34c 改成 120/121 了事：号段是**追加**出来的，下一批往中间插段时
+#      还会写 119b，纯数字口径迟早再撞一次；而且汇总的总分母（len(ids)）与桶（按 id 去重）
+#      本来就是两把尺子，不统一身份就永远对不齐。断根只有一条：**段的身份＝编号整串**，
+#      后缀是身份的一部分；顺带把"同编号出现两次"做成解析期当场炸（宁可炸得早，
+#      也不让 collect 安静地少跑一段——本仓锤过的「把没验过说成验过了」是同一个方向）。
+#   ⑤ 跨层一致性：段编号这条口径同时活在五处——装配器的 HEADER_RE／MARK_RE／SKIP_RE、
+#      summary 认桶的尺子（原来用 `isdigit()`，带后缀的编号会被**安静丢掉**）、emit 的
+#      `int(start_id)`、跨段 helper 的"更晚的段"判据（编号变字符串后 `cs <= producer` 不报错，
+#      而是按字典序**安静判错**：实测 "11" 小于 "9"，§9 定义的 helper 被 §11 调用时整条搬运腿
+#      消失，跑到那一段是 command not found）、以及门禁驱动取首段起点的 awk 正则。少改一环的
+#      后果不是报错，而是那一环读不到带后缀的段 ⇒ 四桶少一段／装配当场炸／helper 没搬过去，
+#      三种坏法都不可归因。⇒ 五处一起改，各钉执行行等值锁，并配"退回旧写法"的变异反证（N1–N7）。
+#   English: §GATE-SELFACC — the section label (digits plus optional letter suffix) is the section's
+#   identity. Duplicated numeric labels used to fold three real sections into one id, which both broke
+#   the collect-mode totals and made the sweep restart from the first occurrence forever. Labels are
+#   now unique strings, duplicates raise at parse time, and every layer that reads a label (three
+#   regexes, bucket membership, the emit start id, the helper-ordering predicate, the driver's awk) is
+#   locked to the same shape with mutation proofs.
+
+PY120=scripts/gate_sections.py
+GS120=scripts/verify_changes.sh
+
+# 判定点计数走文件不走 shell 变量：反证的腿必须在子壳里跑（要捕获它的输出与退出码），
+#   子壳里 `CNT=$((CNT+1))` 主壳看不见——本段既有直跑的腿也有子壳里的腿，用变量记账面会少数，
+#   而「累计判定点／负锁枚数」正是这段对外唯一的读数（只引派生读数，不引我以为的数）。
+W120="$(mktemp -d 2>/dev/null || true)"
+[ -n "$W120" ] || { echo "--- FAIL: §120 建不出隔离工作目录，夹具与反证无法跑（宁可红，不许跳）"; exit 1; }
+mkdir -p "$W120/mut"
+CNTF120="$W120/points.tsv"
+: > "$CNTF120"
+GATE_PT120_QUIET=0
+LAST120=0
+cnt120() { awk 'END {print NR+0}' "$CNTF120" 2>/dev/null || printf '0'; }
+pcount120() { awk -F'\t' -v k="$1" '$1 == k {c++} END {print c+0}' "$CNTF120" 2>/dev/null || printf '0'; }
+pt120() { # $1=类别（eq/neg/beh/ctl/mut） $2=说明 → 记一个判定点；quiet 时不落账（反证复用的腿不算新判定点）
+	if [ "$GATE_PT120_QUIET" != "1" ]; then
+		printf '%s\t%s\n' "$1" "$2" >> "$CNTF120"
+		LAST120=$(cnt120)
+	else
+		LAST120=$(cnt120)
+	fi
+	return 0
+}
+
+# 本段的锁文案里抄了被判的字符串（写锁的人没法不抄），所以门禁侧的计数只数**本段之前**的正文；
+#   装配器侧（.py）剥掉 # 注释行。同一口径见 §111 的 GB111 切片与 §107 的「锁让位、注释保留」裁决。
+HDR120_LN=$(grep -nF 'echo "==> 120 ' "$GS120" 2>/dev/null | head -1 | cut -d: -f1 || true)
+case "$HDR120_LN" in
+''|*[!0-9]*) echo "--- FAIL: §120 切片锁：在门禁里找不到本段段头（写法被改＝切片没有右边界，宁可红，不许拿整份文件凑数）"; exit 1 ;;
+esac
+sed -n "1,$((HDR120_LN - 1))p" "$GS120" > "$W120/gate_before_120.txt"
+GB120="$W120/gate_before_120.txt"
+
+eq_code120() { # $1=文件 $2=整串 $3=预演读数 $4=说明（执行行：剥 # 注释行后整串等值）
+	local got
+	pt120 eq "等值锁：${4}"
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "$3" ] || { echo "--- FAIL: §120 执行行等值锁 ${LAST120}（${4}）：${1} 非注释行里整串「${2}」got=${got:-0} 预演=${3}"; exit 1; }
+}
+neg_code120() { # $1=文件 $2=整串 $3=说明 → 执行行里彻底没有
+	local got
+	pt120 neg "负锁：${3}"
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §120 负锁（${3}）：${1} 执行行里又出现「${2}」got=${got}"; exit 1; }
+}
+neg_code_mut120() { # 与 neg_code120 同判据，只打在副本上（反证用，不落账）
+	local got
+	got=$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null | grep -cF -- "$2" 2>/dev/null || true)
+	[ "${got:-0}" = "0" ] || { echo "--- FAIL: §120 负锁（${3}）：${1} 执行行里又出现「${2}」got=${got}"; exit 1; }
+}
+
+# ── A. 五处口径一起改（装配器四处＋驱动一处），旧写法各留一枚负锁 ──
+eq_code120 "$PY120" 'HEADER_RE = re.compile(r'"'"'^echo "==> (\d+[a-z]?)([^"]*)"'"'"')' 1 '段头正则把后缀捕进身份组（只捕数字就是 34/34b/34c 折成同一段的那把旧尺子）'
+eq_code120 "$PY120" 'MARK_RE = re.compile(r'"'"'^GATE-SECTION-START ([0-9]+[a-z]?)$'"'"')' 1 '段标记正则同形（不同步＝带后缀的段在分类器里根本不存在，四桶凭空少一段）'
+eq_code120 "$PY120" 'SKIP_RE = re.compile(r'"'"'^GATE-SKIP ([0-9]+[a-z]?) · (.*)$'"'"')' 1 'SKIP 标记正则同形（与 §111 那枚"两侧成对"锁对齐）'
+eq_code120 "$GB120" '$1 ~ /^[0-9]+[a-z]?$/ {print $1; exit}' 1 '驱动取首段起点的 awk 同形（只认纯数字时，哪天首段被写成 1b，整轮 collect 派生不出起点＝当场判红而不是安静少跑）'
+neg_code120 "$GB120" '$1 ~ /^[0-9]+$/ {print $1; exit}' '驱动的旧 awk 不许复活'
+# 身份是字符串编号，任何一处再套 int() 都会在带后缀的编号上当场炸
+eq_code120 "$PY120" 'heads.append((m.group(1), i, m.group(2).strip().rstrip(".").strip()))' 1 '段身份取整串'
+neg_code120 "$PY120" 'heads.append((int(m.group(1))' '解析侧的旧 int() 不许复活'
+eq_code120 "$PY120" 'sid = m.group(1)' 1 'classify 取标记里的编号同样按字符串'
+neg_code120 "$PY120" 'sid = int(m.group(1))' 'classify 的旧 int() 不许复活'
+eq_code120 "$PY120" 'skipped[sm.group(1)] = sm.group(2)' 1 'SKIP 桶的键按编号字符串存'
+eq_code120 "$PY120" 'text, prelude_names = build_inner(gate, start_id, root)' 1 'emit 不再 int(start_id)（带后缀起点必须能被装配出来）'
+neg_code120 "$PY120" 'build_inner(gate, int(start_id), root)' 'emit 的旧 int() 不许复活'
+# 汇总认桶：尺子从"是不是数字"换成"在不在派生段清单里"，清单外单列一档
+eq_code120 "$PY120" 'if t in id_set:' 1 'PASS/FAIL/SILENT 三桶按清单认（isdigit 会把带后缀编号安静丢掉＝四桶少一段，还查不出是谁丢的）'
+eq_code120 "$PY120" 'if sid.strip() in id_set:' 1 'SKIP 桶同尺'
+neg_code120 "$PY120" 'if tok.strip().isdigit():' '旧的 isdigit 尺子不许复活（说明注释里提它可以，执行行里不许有）'
+eq_code120 "$PY120" 'balance = "BOGUS_ID:"' 1 '清单外编号单列一档（既不折进 PASS 也不折进 MISSING，读数必须能归因）'
+# 段的先后按文件位置比，不按编号比大小（编号是字符串时字典序会说谎）
+eq_code120 "$PY120" 'if cstart <= pstart or cs in own_sections:' 1 '跨段 helper 的"更晚的段"按行序判'
+neg_code120 "$PY120" 'if cs <= producer or cs in own_sections:' '旧的按编号比大小不许复活（实测不报 TypeError，而是安静少搬 helper，见反证 N5）'
+eq_code120 "$PY120" 'order = {sid: k for k, sid in enumerate(ids)}' 2 '位置表两处各一枚（emit 的前置搬运／summary 的点名列序）'
+eq_code120 "$PY120" 'if not any(order[c] >= start_pos for c in consumers if c in order):' 1 '搬运判据走位置表'
+eq_code120 "$PY120" 'order.get(sid2, -1) < start_pos' 1 '取"更早段里的同名定义"也走位置表'
+# 重复编号当场炸（判据一枚＋文案点名一枚）
+eq_code120 "$PY120" 'if len(rows) > 1:' 1 '重复编号守卫的判据行恰一枚'
+eq_code120 "$PY120" 'gate-parse: 段编号 %s 重复出现在第' 1 '炸出来的文案点名编号与行号（只说"解析失败"的话，下一个人还得自己去找是哪两段撞号）'
+SECA120=$(cnt120)
+
+# ── B. 夹具：同号四段的坏形（旧缺陷复现件）＋带后缀五段两条红的推进件
+#        ＋"§9 定义、§11 调用"的搬运件（字典序说谎的形状）──
+cat > "$W120/dup_gate.sh" <<'DUP120'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "==> 1 绿段..."
+echo "ok - dup s1"
+echo "==> 2 §甲 判红段..."
+echo "--- FAIL: dup s2 deliberate red"
+exit 1
+echo "==> 2 §乙 与 §甲同号的追加段..."
+echo "ok - dup s2b"
+echo "==> 3 末段..."
+echo "ok - dup s3"
+echo ""
+echo "==> 全部通过"
+DUP120
+cat > "$W120/seq_gate.sh" <<'SEQ120'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "==> 1 绿段..."
+echo "ok - seq s1"
+echo "==> 2 §甲 第一条红..."
+echo "--- FAIL: seq jia deliberate red"
+exit 1
+echo "==> 2b §乙 绿段（旧口径下这一行不是一段）..."
+echo "ok - seq s2b"
+echo "==> 2c §丙 第二条红..."
+echo "--- FAIL: seq bing deliberate red"
+exit 1
+echo "==> 3 末段..."
+echo "ok - seq s3"
+echo ""
+echo "==> 全部通过"
+SEQ120
+cat > "$W120/helper_gate.sh" <<'HLP120'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "==> 1 首段..."
+echo "ok - s1"
+echo "==> 9 定义 helper 的段..."
+h120_helper() {
+	printf 'H120-HELPER-RAN\n'
+}
+h120_helper
+echo "ok - s9"
+echo "==> 10 中段..."
+echo "ok - s10"
+echo "==> 11 更晚、调用 helper 的段..."
+h120_helper
+echo "ok - s11"
+echo ""
+echo "==> 全部通过"
+HLP120
+
+# ── 腿（每一条都真跑一次；反证只把 $1 换成变异装配器就能打在同一判据上）──
+leg_manifest120() { # $1=装配器 $2=门禁件 → 段清单三读数自证（行数＝去重数＝派生 TOTAL），取空即红
+	local py="$1" g="$2" rows uniq total out
+	pt120 beh "段清单三读数闭合（${g}）"
+	out=$(python3 "$py" sections "$g" 2>&1) || { echo "--- FAIL: §120 清单腿（${g}）：装配器 sections 非零退出：$(printf '%s' "$out" | tr '\n' ' ' | tail -c 200)"; exit 1; }
+	rows=$(printf '%s\n' "$out" | awk -F'\t' '$1 ~ /^[0-9]+[a-z]?$/ {c++} END {print c+0}')
+	uniq=$(printf '%s\n' "$out" | awk -F'\t' '$1 ~ /^[0-9]+[a-z]?$/ {print $1}' | sort -u | wc -l | tr -d ' ')
+	total=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "TOTAL" {print $2}')
+	[ "${rows:-0}" -gt 0 ] || { echo "--- FAIL: §120 清单腿（${g}）：段清单行数为 0＝解析与脚本格式脱节，任何"恰好几段"的等值锁分母都不可信"; exit 1; }
+	[ "$rows" = "$total" ] || { echo "--- FAIL: §120 清单腿（${g}）：清单行数 ${rows} 不等于派生 TOTAL ${total}（两把尺子又分叉了＝本批 116 vs 114 那笔账的原形）"; exit 1; }
+	[ "$uniq" = "$total" ] || { echo "--- FAIL: §120 清单腿（${g}）：去重后编号数 ${uniq} 不等于 ${total}＝仍有两个段共用一个身份"; exit 1; }
+	# 读数走全局变量不走 stdout：调用点用 `MAN120=$(leg_manifest120 ...)` 时，
+	#   腿里那行 `--- FAIL` 会一起被吞进变量、屏幕上只剩一句"上面已点名"——
+	#   本仓 §ACL-DETAIL 锤过的同一个坏法，绝不在新段里重犯。
+	MAN120_OUT=$(printf 'rows=%s uniq=%s total=%s' "$rows" "$uniq" "$total")
+}
+leg_dup120() { # $1=装配器 $2=门禁件 → 重复编号必须当场炸且点名
+	local py="$1" g="$2" rc120=0 out
+	pt120 beh "重复编号守卫（${g}）"
+	out=$(python3 "$py" sections "$g" 2>&1) || rc120=$?
+	[ "$rc120" -ne 0 ] || { echo "--- FAIL: §120 重复编号守卫腿（${g}）：两段同号却被解析成合法清单（rc=0）＝collect 会在这两段上原地打转，正是本批治的缺陷"; exit 1; }
+	printf '%s' "$out" | grep -qF '段编号 2 重复出现在第' \
+		|| { echo "--- FAIL: §120 重复编号守卫腿（${g}）：非零退出但不是撞号引起的（实得=$(printf '%s' "$out" | tr '\n' ' ' | tail -c 200)）——红因不可归因"; exit 1; }
+}
+leg_next120() { # $1=装配器 $2=门禁件 $3=日志 $4=rc $5=期望 NEXT $6=期望 STARTED 含 → collect 的推进方向
+	local py="$1" g="$2" lg="$3" rc="$4" want="$5" want_started="$6" out got_next got_started
+	pt120 beh "推进方向（起点件 $(basename "$g")／日志 $(basename "$lg")）"
+	out=$(python3 "$py" classify "$g" "$lg" "$rc" 2>&1) || { echo "--- FAIL: §120 推进腿（${g}）：classify 非零退出 $(printf '%s' "$out" | tail -1)"; exit 1; }
+	got_next=$(printf '%s\n' "$out" | sed -n 's/^NEXT\t//p')
+	got_started=$(printf '%s\n' "$out" | sed -n 's/^STARTED\t//p')
+	[ "$got_next" = "$want" ] || { echo "--- FAIL: §120 推进腿（$(basename "$g")）：下一遍起点读到「${got_next:-空}」应为「${want}」——起点等于本遍红段＝同一红点重跑，最多烧满 GATE_COLLECT_MAX_PASSES 遍且后面的段全无读数"; exit 1; }
+	printf '%s' "$got_started" | grep -qF -- "$want_started" \
+		|| { echo "--- FAIL: §120 推进腿（$(basename "$g")）：本遍 STARTED=「${got_started}」里没有「${want_started}」＝那个段的段标记压根没被认出来（分类器与段清单不同口径）"; exit 1; }
+}
+leg_emit120() { # $1=装配器 $2=门禁件 $3=起点编号 $4=尾体必须含 $5=尾体必须不含（可空）
+	local py="$1" g="$2" st="$3" must="$4" mustnot="$5" rc120=0 out
+	pt120 beh "装配起点（§${st}）"
+	out=$(python3 "$py" emit "$g" "$st" "$W120/inner_emit.sh" "$W120" 2>&1) || rc120=$?
+	[ "$rc120" = "0" ] || { echo "--- FAIL: §120 装配腿（起点 §${st}）：emit 非零退出（$(printf '%s' "$out" | tr '\n' ' ' | tail -c 200)）——带后缀的起点装不出来，collect 到这一段就永远出不了下一遍"; exit 1; }
+	grep -qF -- "$must" "$W120/inner_emit.sh" || { echo "--- FAIL: §120 装配腿（起点 §${st}）：尾体里没有「${must}」＝起点指错了段"; exit 1; }
+	if [ -n "$mustnot" ] && grep -qF -- "$mustnot" "$W120/inner_emit.sh"; then
+		echo "--- FAIL: §120 装配腿（起点 §${st}）：尾体里还留着「${mustnot}」（本该被跳过）＝emit 取了同编号的第一处"
+		exit 1
+	fi
+}
+leg_helper120() { # $1=装配器 $2=夹具 $3=起点 $4=必须被搬进前言的函数名 → 跨段 helper 搬运要真跑进尾体
+	local py="$1" g="$2" st="$3" fn="$4" rc120=0 out ran
+	pt120 beh "跨段 helper 搬运（起点 §${st}／${fn}）"
+	out=$(python3 "$py" emit "$g" "$st" "$W120/inner_helper.sh" "$W120" 2>&1) || rc120=$?
+	[ "$rc120" = "0" ] || { echo "--- FAIL: §120 helper 搬运腿（起点 §${st}）：emit 非零退出（$(printf '%s' "$out" | tr '\n' ' ' | tail -c 200)）"; exit 1; }
+	grep -qF -- "$fn() {" "$W120/inner_helper.sh" \
+		|| { echo "--- FAIL: §120 helper 搬运腿（起点 §${st}）：装配出来的尾体里没有「$fn() {」＝"更晚的段"判据没把 §11 当成更晚（编号字典序把 11 排到 9 前面），跨段 helper 整条不搬，真跑到那一段就是 command not found"; exit 1; }
+	ran=$(bash "$W120/inner_helper.sh" 2>&1) || rc120=$?
+	[ "$rc120" = "0" ] || { echo "--- FAIL: §120 helper 搬运腿（起点 §${st}）：装配出来的尾体跑不出去（rc=${rc120}）：$(printf '%s' "$ran" | tr '\n' ' ' | tail -c 200)"; exit 1; }
+	printf '%s' "$ran" | grep -qF 'H120-HELPER-RAN' \
+		|| { echo "--- FAIL: §120 helper 搬运腿（起点 §${st}）：尾体跑完了却没打出 helper 的输出＝搬了个名字没搬实体"; exit 1; }
+}
+leg_bogus120() { # $1=装配器 → 清单外编号必须单列 BOGUS_ID 点名（不折进任何桶）
+	local py="$1" out bal
+	pt120 beh "清单外编号归因（BOGUS_ID）"
+	mkdir -p "$W120/bogus_work"
+	printf 'STARTED\t1,2,2b,2c,3\nPASS\t1,2,2b,2c,3,99x\nFAIL\t\nSKIP\t\nSILENT\t\nDONE\t1\nNEXT\t\nEMPTY\t0\n' > "$W120/bogus_work/cls_1.txt"
+	out=$(python3 "$py" summary "$W120/seq_gate.sh" "$W120/bogus_work" 2>&1) || { echo "--- FAIL: §120 归因腿：summary 非零退出 $(printf '%s' "$out" | tail -1)"; exit 1; }
+	bal=$(printf '%s\n' "$out" | sed -n 's/^BALANCE\t//p')
+	[ "$bal" = "BOGUS_ID:cls_1.txt:99x" ] \
+		|| { echo "--- FAIL: §120 归因腿：BALANCE=「${bal:-空}」应为「BOGUS_ID:cls_1.txt:99x」——清单外的编号既不许折进 PASS（那会把没验过的东西记成验过），也不许冒充 MISSING（那会让人去改无关的段）；点名到哪个桶文件里的哪个编号才有牙"; exit 1; }
+}
+# 镜像 collect：把真驱动块（GB120 里那段）搬进 /tmp 小仓，跑"带后缀五段两条红"的件。
+p2l120_make() { # $1=装配器文件 $2=输出目录
+	local d="$2"
+	rm -rf "$d"
+	mkdir -p "$d/scripts" "$d/gate"
+	cp "$1" "$d/scripts/gate_sections.py"
+	{
+		printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+		# 只取**第一对**标记之间的驱动块：`sed -n '/A/,/B/p'` 在 A 之后再遇到 A 会再起一段区间，
+		#   而本仓正文里有四处把这对标记当锚串抄写（§111 的等值锁与本段的抽取命令自己），
+		#   用 sed 抽就会把 §111 之后的几千行一并抄进夹具，装配器当场被那些行里的函数定义判死
+		#   （本段第一轮实跑就是这个形状：`gate-parse: 函数 p2l120_make 找不到顶格 }`）。
+		awk '/# >>> GATE-COLLECT-DRIVER/{f=1} f{print} /# <<< GATE-COLLECT-DRIVER/{if(f)exit}' "$GB120"
+		printf '%s\n' 'cd "$(dirname "$0")/.."'
+		cat "$W120/seq_gate.sh"
+	} > "$d/gate/fixture.sh"
+	chmod +x "$d/gate/fixture.sh"
+	printf '%s\n' '__pycache__/' '*.pyc' > "$d/.gitignore"
+	git init -q "$d" 2>/dev/null || true
+}
+rc_collect120() { # $1=镜像目录 → 置全局 RC120／OUT120（上限压到 8 遍，打满上限本身就是一条读数）
+	RC120=0
+	OUT120=$(GATE_COLLECT_MAX_PASSES=8 bash "$1/gate/fixture.sh" -collect 2>&1) || RC120=$?
+	return 0
+}
+kv120() { printf '%s\n' "$OUT120" | sed -n "s/^$1=//p" | head -1; }
+leg_collect120() { # $1=镜像目录 $2=期望 PASSES $3=期望 FAIL $4=期望 TOTAL $5=期望 BALANCE $6=期望 FAIL_IDS
+	local d="$1" p f t bal failids
+	pt120 beh "镜像 collect 全链（$(basename "$d")）"
+	rc_collect120 "$d"
+	if [ "$RC120" = "0" ]; then
+		echo "--- FAIL: §120 镜像 collect 腿（$(basename "$d")）：夹具里两条刻意判红却整轮退 0＝收集模式把红洗成绿"
+		exit 1
+	fi
+	p=$(kv120 PASSES)
+	f=$(kv120 FAIL_SECTIONS)
+	t=$(kv120 TOTAL_SECTIONS)
+	bal=$(kv120 BALANCE)
+	failids=$(kv120 FAIL_IDS)
+	# 期望遍数按夹具的真实推进算：一遍跑到 EOF，所以"1 绿＋2 红"是一遍（不是两遍），
+	#   三遍收完＝①§1→§2 红 ②§2b→§2c 红 ③§3 绿并打出收尾；比这多即在同号段上原地打转，比这少即有一遍没推进。
+	[ "${p:-0}" = "$2" ] || { echo "--- FAIL: §120 镜像 collect 腿（$(basename "$d")）：遍数读到 ${p:-空}，应为 $2；原始输出末尾=$(printf '%s' "$OUT120" | tr '\n' ' ' | tail -c 220)"; exit 1; }
+	[ "${f:-0}" = "$3" ] || { echo "--- FAIL: §120 镜像 collect 腿（$(basename "$d")）：FAIL_SECTIONS=${f:-空} 应为 $3（两条红必须各记一次，折成一条就是本批治的形）"; exit 1; }
+	[ "${t:-0}" = "$4" ] || { echo "--- FAIL: §120 镜像 collect 腿（$(basename "$d")）：TOTAL_SECTIONS=${t:-空} 应为 $4（带后缀的编号没各算一段）"; exit 1; }
+	[ "${bal:-空}" = "$5" ] || { echo "--- FAIL: §120 镜像 collect 腿（$(basename "$d")）：BALANCE=「${bal:-空}」应为「$5」＝四桶与派生总段数没闭合"; exit 1; }
+	[ "${failids:-空}" = "$6" ] || { echo "--- FAIL: §120 镜像 collect 腿（$(basename "$d")）：FAIL_IDS=「${failids}」应为「$6」＝红段没被逐个点名"; exit 1; }
+	COL120_OUT=$(printf 'PASSES=%s FAIL=%s TOTAL=%s BAL=%s FAIL_IDS=%s' "$p" "$f" "$t" "$bal" "$failids")
+}
+red_collect120() { # $1=镜像目录 $2=期望红短语 → 变异装配器下同一件必须红且话术点名（反证用，不落账）
+	local d="$1" phrase="$2"
+	rc_collect120 "$d"
+	[ "$RC120" != "0" ] || { echo "N：变异件在收集模式下居然正常收完＝缺陷不复现（$(basename "$d")）"; exit 1; }
+	printf '%s' "$OUT120" | grep -qF -- "$phrase" \
+		|| { echo "N：红了但话术里没有「${phrase}」＝红因不可归因；末尾=$(printf '%s' "$OUT120" | tr '\n' ' ' | tail -c 200)"; exit 1; }
+	echo "N：整轮红且点名「${phrase}」"
+	exit 1
+}
+mk_mut120() { # $1=输出名，之后成对传「旧串 新串」→ 置全局 MUT120；锚不唯一／空替换＝当场红
+	local name="$1" out e
+	MUT120=""
+	shift
+	out="$W120/mut/$name"
+	python3 - "$PY120" "$out" "$@" <<'PY120MUT' || { echo "--- FAIL: §120 变异件 ${name} 未生成（锚漂了或替换没落地）"; exit 1; }
+import pathlib
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+pairs = sys.argv[3:]
+if len(pairs) % 2:
+    raise SystemExit("变异件参数必须成对（旧串 新串）")
+base = pathlib.Path(src).read_text(encoding="utf-8")
+text = base
+for old, new in zip(pairs[0::2], pairs[1::2]):
+    n = text.count(old)
+    if n != 1:
+        raise SystemExit("变异锚出现 %d 次（应为 1）：%r" % (n, old))
+    text = text.replace(old, new)
+if text == base:
+    raise SystemExit("替换后与原件相同（空替换＝这条反证是 no-op）")
+pathlib.Path(dst).write_text(text, encoding="utf-8")
+PY120MUT
+	MUT120="$out"
+}
+red120() { # $1=反证名 $2=预期红短语 $3..=要跑的腿（子壳里跑，期望它红且红的是预期那一处）
+	local out120 rc120=0
+	GATE_PT120_QUIET=1
+	out120=$("${@:3}" 2>&1) || rc120=$?
+	GATE_PT120_QUIET=0
+	pt120 mut "反证：${1}"
+	[ "$rc120" -ne 0 ] || { echo "--- FAIL: §120 反证 ${1} 期望转红实得绿＝对应尺子没牙（判据与被测代码脱钩）"; exit 1; }
+	printf '%s' "$out120" | grep -qF -- "$2" \
+		|| { echo "--- FAIL: §120 反证 ${1} 红了但不是预期的那一处（期望话术含「${2}」）：实得红因=$(printf '%s' "$out120" | tr '\n' ' ' | tail -c 220)"; exit 1; }
+}
+
+# ── C. 正向读数（每条都真跑，屏幕上就有数）──
+leg_manifest120 "$PY120" "$GS120"
+echo "ok - §120 段清单三读数闭合：${MAN120_OUT}（清单行数＝去重编号数＝派生 TOTAL，本批那笔 116 vs 114 的账在这里对平）"
+SUFROWS120=$(python3 "$PY120" sections "$GS120" 2>/dev/null | awk -F'\t' '$1 ~ /^[0-9]+[a-z]$/ {c++; s=s" "$1} END {print c+0 s}')
+pt120 beh "带后缀编号在册"
+SUFN120=$(printf '%s' "$SUFROWS120" | awk '{print $1}')
+if [ "${SUFN120:-0}" -lt 2 ]; then
+	echo "--- FAIL: §120 带后缀编号正锁：段清单里带字母后缀的编号只有 ${SUFN120} 个（应为 2 个以上）——34b/34c 这类历史追加段必须各占一行，少一行就是又被折回去了"
+	exit 1
+fi
+echo "ok - §120 带后缀编号在册：${SUFROWS120}（这两段在旧口径下不是一段，而是一段的一半）"
+leg_dup120 "$PY120" "$W120/dup_gate.sh"
+echo "ok - §120 重复编号守卫：同号件当场炸并点名（旧口径下它会被解析成合法的三段清单，然后 collect 在里面打转）"
+printf 'GATE-SECTION-START 1\nok\nGATE-SECTION-START 2\n--- FAIL: seq jia deliberate red\n' > "$W120/log_red.txt"
+leg_next120 "$PY120" "$W120/seq_gate.sh" "$W120/log_red.txt" 1 "2b" "2"
+echo "ok - §120 推进方向：红在 §2 时下一遍起点是 §2b（旧实现读出来是 2＝同一个红点重跑）"
+leg_emit120 "$PY120" "$W120/seq_gate.sh" "2b" 'echo "==> 2b ' 'echo "==> 2 §甲 第一条红'
+echo "ok - §120 装配起点：emit 2b 的尾体从 §乙 起（旧实现按同编号取第一处，会把 §甲 的红色一遍遍搬回来）"
+leg_helper120 "$PY120" "$W120/helper_gate.sh" "11" "h120_helper"
+echo "ok - §120 跨段 helper 搬运：§9 定义的 helper 进了起点 §11 的尾体且真跑出输出（按编号比大小会把 §11 当成更早的段而整条不搬）"
+leg_bogus120 "$PY120"
+echo "ok - §120 清单外编号归因：BALANCE 点名列出 cls_1.txt 里的 99x，既不折桶也不冒充 MISSING"
+p2l120_make "$PY120" "$W120/mirror"
+leg_collect120 "$W120/mirror" 3 2 5 OK "2,2c"
+echo "ok - §120 镜像 collect 全链：${COL120_OUT}"
+SECB120=$(cnt120)
+
+# ── D. 旧账的机器复现（空白对照：摘掉守卫必须变绿，证明上面那枚红是守卫带来的）──
+#   恒红的反证不等于有牙；能变绿才说明判据咬的是这一处，而不是夹具选错／python 起不来。
+sed -e 's@if len(rows) > 1:@if False:@' "$PY120" > "$W120/mut/py_no_guard.py"
+pt120 ctl "摘守卫对照件不是空替换"
+cmp -s "$PY120" "$W120/mut/py_no_guard.py" && { echo "--- FAIL: §120 对照件的空替换（sed 锚行漂了，这条绿是假绿）"; exit 1; }
+NOG_RC=0
+python3 "$W120/mut/py_no_guard.py" sections "$W120/dup_gate.sh" >/dev/null 2>&1 || NOG_RC=$?
+pt120 ctl "摘守卫后撞号件退 0"
+[ "$NOG_RC" = "0" ] || { echo "--- FAIL: §120 空白对照：摘掉守卫后撞号件仍非零退出（rc=${NOG_RC}）＝红不是守卫带来的，上面那枚点名撞号的腿在验别的东西"; exit 1; }
+NOG_OUT120=$(python3 "$W120/mut/py_no_guard.py" sections "$W120/dup_gate.sh" 2>/dev/null)
+NOG_TOT=$(printf '%s\n' "$NOG_OUT120" | awk -F'\t' '$1 == "TOTAL" {print $2}')
+NOG_UNIQ=$(printf '%s\n' "$NOG_OUT120" | awk -F'\t' '$1 ~ /^[0-9]+[a-z]?$/ {print $1}' | sort -u | wc -l | tr -d ' ')
+pt120 ctl "旧账复现（TOTAL 与去重数分叉）"
+[ "${NOG_TOT:-0}" != "${NOG_UNIQ:-0}" ] || { echo "--- FAIL: §120 旧缺陷复现锁：摘掉守卫后 TOTAL=${NOG_TOT} 与去重编号数 ${NOG_UNIQ} 居然相等＝撞号件没被折段，那笔分母与桶两把尺子的账不复现（夹具或判据不合格）"; exit 1; }
+echo "ok - §120 空白对照：摘掉守卫 → 撞号件退 0 且 TOTAL=${NOG_TOT} 不等于去重 ${NOG_UNIQ}（116 vs 114 那笔账的机器复现）"
+SECC120=$(cnt120)
+
+# ── E. 反证：五处口径各退回旧写法一次，对应的腿必须在同一个件上转红 ──
+# N1 段头只捕数字＋摘掉撞号守卫＝当年"116 vs 114 且原地打转"的完整复现：镜像必须打遍数上限
+#   （不摘守卫的话解析期先炸，"打转"这一形态就复现不出来——两处都得退旧写法才凑成当年的形状）。
+mk_mut120 'py_n1.py' '\d+[a-z]?' '\d+' 'if len(rows) > 1:' 'if False:'
+p2l120_make "$W120/mut/py_n1.py" "$W120/mirror_n1"
+red120 "N1 段头只捕数字（无守卫）" "整轮红且点名「遍数超过上限」" red_collect120 "$W120/mirror_n1" "遍数超过上限"
+
+# N2 emit 的 int(start_id) 复活：带后缀起点装不出来 → 装配腿红。
+mk_mut120 'py_n2.py' 'text, prelude_names = build_inner(gate, start_id, root)' 'text, prelude_names = build_inner(gate, int(start_id), root)'
+red120 "N2 emit 退回 int()" "非零退出" leg_emit120 "$MUT120" "$W120/seq_gate.sh" "2b" 'echo "==> 2b ' ''
+
+# N3 MARK_RE 退回只认数字：带后缀的段标记在分类器里不存在 → STARTED 认不出 2b。
+mk_mut120 'py_n3.py' "^GATE-SECTION-START ([0-9]+[a-z]?)" '^GATE-SECTION-START (\d+)'
+printf 'GATE-SECTION-START 1\nok\nGATE-SECTION-START 2\nok\nGATE-SECTION-START 2b\nok\n' > "$W120/log_started.txt"
+red120 "N3 MARK_RE 退回只认数字" "里没有「2b」" leg_next120 "$MUT120" "$W120/seq_gate.sh" "$W120/log_started.txt" 0 "2b" "2b"
+
+# N4 汇总认桶退回 isdigit：带后缀编号被安静丢掉 → 分桶不闭合，MISSING 现形（而不是绿）。
+mk_mut120 'py_n4.py' 'if t in id_set:' 'if t.strip().isdigit():'
+p2l120_make "$MUT120" "$W120/mirror_n4"
+red120 "N4 认桶退回 isdigit" "整轮红且点名「MISSING:2b,2c」" red_collect120 "$W120/mirror_n4" "MISSING:2b,2c"
+
+# N5「更晚的段」退回按编号比大小：编号是字符串 ⇒ 不报 TypeError，而是**安静少搬 helper**，
+#     尾体跑到 §11 时 command not found（比报错更坏：全绿时看不见，红时归属还落在别的段上）。
+mk_mut120 'py_n5.py' 'if cstart <= pstart or cs in own_sections:' 'if cs <= producer or cs in own_sections:'
+red120 "N5 段序退回比编号" "跨段 helper 整条不搬" leg_helper120 "$MUT120" "$W120/helper_gate.sh" "11" "h120_helper"
+
+# N6 BOGUS_ID 那一档被摘掉：清单外编号既进不了桶也不点名 → 归因腿必须红（报成 OK 就是把它当闭合）。
+mk_mut120 'py_n6.py' '    elif bogus:' '    elif False:'
+red120 "N6 摘掉清单外单列档" "应为「BOGUS_ID:cls_1.txt:99x」" leg_bogus120 "$MUT120"
+
+# N7 负锁的假目标：往副本里写回旧写法，负锁必须红；未塞东西的同一份副本作空白对照（红来自假目标本身）。
+cp "$PY120" "$W120/mut/py_plain_n7.py"
+cp "$PY120" "$W120/mut/py_fake_n7.py"
+printf '%s\n' 'def _n7_decoy():' '    return [heads.append((int(m.group(1)), i, t))]' >> "$W120/mut/py_fake_n7.py"
+red120 "N7 假目标（int() 取号回归）" "负锁" neg_code_mut120 "$W120/mut/py_fake_n7.py" 'heads.append((int(m.group(1))' '假目标反证'
+pt120 ctl "N7 空白对照（未塞假目标的同一份副本）"
+neg_code_mut120 "$W120/mut/py_plain_n7.py" 'heads.append((int(m.group(1))' '空白对照（未塞假目标的同一份副本）'
+
+echo "ok - §120 §GATE-SELFACC 门禁自账收口通过：静态锁 $(pcount120 eq) 枚等值＋$(pcount120 neg) 枚负锁（装配器四处口径＋驱动 awk，旧写法每处一枚负锁）+ 行为腿 $(pcount120 beh) 道（段清单三读数／带后缀在册／撞号守卫／推进方向／装配起点／跨段 helper 搬运／清单外归因／镜像 collect 全链）+ 空白对照与旧账复现 $(pcount120 ctl) 道（摘守卫复现 116 vs 114·N7 未塞假目标的同一份副本）+ 反证 $(pcount120 mut) 枚（N1 段头只捕数字·N2 emit 退回 int()·N3 MARK_RE 退回只认数字·N4 认桶退回 isdigit·N5 段序退回比编号·N6 摘掉清单外单列档·N7 往副本里写回旧写法），累计判定点 $(cnt120)（A 组 ${SECA120}／C 组止于 ${SECB120}／D 组止于 ${SECC120}，逐级派生不写死）；派生段清单 $(python3 "$PY120" sections "$GS120" 2>/dev/null | awk -F'\t' '$1 == "TOTAL" {print $2}') 段（编号整串为唯一身份）"
+
+rm -rf "$W120"
 
 echo "==> 全部通过"

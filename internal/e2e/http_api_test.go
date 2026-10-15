@@ -88,7 +88,16 @@ func apiReqWithOrigin(t *testing.T, hr *httpRig, method, path, origin string) *h
 
 // sseConnectStatus 建立 SSE 连接，用带超时的上下文驱动 ServeHTTP 返回后取状态码。
 // qs 直接作为 query string（如 ticket=xxx 或 token=xxx）。
+// §SSE-RETIRED（2026-10-15）：状态码之外还要断言 401 的**文案指向**（旧客户端能否自助处置），
+// 所以真实实现挪到 sseConnectResult，本函数只取状态码，既有调用方一字未动。
 func sseConnectStatus(t *testing.T, hr *httpRig, qs string) int {
+	t.Helper()
+	code, _ := sseConnectResult(t, hr, qs)
+	return code
+}
+
+// sseConnectResult 与 sseConnectStatus 同一条建链路径，额外返回响应体（401 拒因可读）。
+func sseConnectResult(t *testing.T, hr *httpRig, qs string) (int, string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -104,7 +113,41 @@ func sseConnectStatus(t *testing.T, hr *httpRig, qs string) int {
 	case <-time.After(3 * time.Second):
 		t.Fatal("SSE 建链超时")
 	}
-	return rec.Code
+	return rec.Code, rec.Body.String()
+}
+
+// sseLegacyQueryWant 派生「`?token=` 遗留通道此刻应不应该放行」的期望值。
+// §0926E2E-W2B 给这条回退分支装了退役截止（出厂值 2026-10-15 00:00 CST），截止日写在
+// 服务端登录响应的 sse_query_token_expires_at 里下发给旧客户端。用例**不把这个日期抄进代码**：
+// 抄死的断言会在无人改动任何一行代码的情况下、于零点一过自己变红（10-15 00:46 门禁 pass#1
+// 的 TestHTTPSSeTicket 就是这个形状），反过来写死 401 又会在截止日前恒红。
+// 期望值按运行时真实取值链取：登录响应里的截止日 > now ⇒ 兼容 200；否则 ⇒ 401。
+// 退场闸本身的四态行为（截止前放行／截止后拒＋文案／票据不受影响／既有拒因不变）
+// 由 internal/server/w2b_sse_deadline_test.go 用时钟注入逐态钉死，本函数只负责「今天」。
+func sseLegacyQueryWant(t *testing.T, hr *httpRig) (int, time.Time) {
+	t.Helper()
+	code, body := apiReq(t, hr, "", http.MethodPost, "/api/auth/login",
+		[]byte(`{"username":"tester","password":"tester123"}`))
+	if code != http.StatusOK {
+		t.Fatalf("派生截止日需先登录：POST /api/auth/login → %d body=%s", code, body)
+	}
+	var resp struct {
+		SSEQueryTokenExpiresAt string `json:"sse_query_token_expires_at"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("登录响应解析失败: %v body=%s", err, body)
+	}
+	if resp.SSEQueryTokenExpiresAt == "" {
+		t.Fatal("登录响应缺 sse_query_token_expires_at＝旧客户端的升级提示数据源断供（§0926E2E-W2B）")
+	}
+	deadline, err := time.Parse(time.RFC3339, resp.SSEQueryTokenExpiresAt)
+	if err != nil {
+		t.Fatalf("sse_query_token_expires_at 不是 RFC3339（%q）: %v", resp.SSEQueryTokenExpiresAt, err)
+	}
+	if deadline.After(time.Now()) {
+		return http.StatusOK, deadline
+	}
+	return http.StatusUnauthorized, deadline
 }
 
 // TestHTTPAuthRequired 未带 token 访问业务端点应返回 401。
@@ -193,9 +236,11 @@ func TestHTTPCORSHardening(t *testing.T) {
 // TestHTTPSSeTicket §WS-F C4a + §M5：POST /api/events/ticket 取 60s 建链票据；
 // /api/events?ticket= 建链 200；**TTL 内同票复用 200**（§M5：浏览器原生重连原样重发同 URL，
 // 消费即废会让重连必然 401、Last-Event-ID 补发通道断绝）；伪造票 401；无票无 token 401；
-// 旧版 token query 兼容仍可用。
+// 旧版 token query 通道按 §0926E2E-W2B 的退役截止**派生**期望（截止前 200／截止后 401 且文案指向票据）。
 // English: §M5 — the ticket is reusable within its 60s TTL (native EventSource reconnect replays the
-// same URL); bogus tickets and missing credentials still get 401; legacy token query still works.
+// same URL); bogus tickets and missing credentials still get 401; the legacy token-query channel is
+// asserted against the retirement deadline the server itself publishes, so the case cannot rot on
+// the day the deadline passes.
 func TestHTTPSSeTicket(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
@@ -234,9 +279,19 @@ func TestHTTPSSeTicket(t *testing.T) {
 	if code, _ := apiReq(t, hr, "", http.MethodPost, "/api/events/ticket", nil); code != 401 {
 		t.Errorf("未认证取票应 401, got %d", code)
 	}
-	// 旧版 token query 兼容
-	if code := sseConnectStatus(t, hr, "token="+hr.token); code != 200 {
-		t.Errorf("token query 兼容应 200, got %d", code)
+	// 旧版 token query 通道：§0926E2E-W2B 装了退役截止，放行窗口按**当前真实时钟**派生
+	// （见 sseLegacyQueryWant 的注释——10-15 零点一过，写死 200 的断言就会自己变红）。
+	wantLegacy, deadline := sseLegacyQueryWant(t, hr)
+	legacyCode, legacyBody := sseConnectResult(t, hr, "token="+hr.token)
+	if legacyCode != wantLegacy {
+		t.Errorf("token query 通道（截止=%s，期望 %d）实得 %d body=%s",
+			deadline.Format(time.RFC3339), wantLegacy, legacyCode, legacyBody)
+	}
+	if wantLegacy == http.StatusUnauthorized {
+		// 已退役 ⇒ 拒因必须指向票据通道，老客户端拿到 401 能自助处置（不是闷掉）。
+		if !strings.Contains(legacyBody, "retired") || !strings.Contains(legacyBody, "/api/events/ticket") {
+			t.Errorf("退役后的 401 文案应指向票据通道，实得 %s", legacyBody)
+		}
 	}
 }
 

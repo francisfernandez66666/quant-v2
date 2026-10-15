@@ -68,6 +68,17 @@ ACTIVE_QUEUE_MAX="${ACTIVE_QUEUE_MAX:-30}"
 #                次数＝熔断闸没落上，属于判据失效，必须现形而不是当积压一起忽略）。
 PARKED_MAX="${PARKED_MAX:-0}"
 REQUEUE_MAX="${REQUEUE_MAX:-8}"
+# §QUEUE-BACKLOG（2026-10-15 阈值口径批，owner 10-12 原话「观察一夜再裁」到期落槌）：
+# 积压这把尺子从「活跃条数 > 30 就红」换成**按吞吐判**，两把新闸同源（SH/PS/PY 三处，门禁 §118 钉等值）：
+#   DRAIN_MIN_DONE＝最近 24h 落终态（done/cancelled/failed_needs_attention）条数下限，
+#     达到它就判「在排水」——积压超上限此时只出 INFO，不再天天抬红；
+#   BACKLOG_RUNAWAY_MAX＝失控线：活跃条数冲破它恒红，**不看吞吐**（每夜排 7 条、每小时新增 10 条
+#     那种"越排越多"必须在验收面现形，这是把旧尺子唯一的真价值保下来）。
+# 定标依据＝现网实录（10-04~10-14 各夜落终态 7~12 条、活跃 55 条 ⇒ 54 条积压按吞吐需 5~8 夜排空）：
+#   旧口径会在整段排水期恒红，而这条恒红的唯一后果就是把真停摆（stall）掩成噪音——本仓锤过的
+#   「报警疲劳型失明」。30 这把旧线保留作"软上限"（判排水与否的分母），不再单独定生死。
+DRAIN_MIN_DONE="${DRAIN_MIN_DONE:-6}"
+BACKLOG_RUNAWAY_MAX="${BACKLOG_RUNAWAY_MAX:-90}"
 CAND_MAX_AGE_DAYS="${CAND_MAX_AGE_DAYS:-7}"
 AMOUNT_CHECK_ROWS="${AMOUNT_CHECK_ROWS:-800}"
 
@@ -81,10 +92,10 @@ PS_TARGET="${DEPLOY_DIR}/verify_nightly_probes.ps1"
 PY_TARGET="${DEPLOY_DIR}/verify_nightly_readout.py"
 
 # 远端命令原文（预览模式打印的就是这里，保证"预览"与"实跑"不会各说一套）
-PS_ARGS="-DataDir ${DATA_DIR} -DeployDir ${DEPLOY_DIR} -PythonExe ${PY_EXE} -ReadoutPy ${PY_TARGET} -MaxAgeMin ${RESEARCH_MAX_AGE_MIN} -MemLimitMb ${RESEARCH_MEM_LIMIT_MB} -AmountRows ${AMOUNT_CHECK_ROWS} -ActiveMax ${ACTIVE_QUEUE_MAX} -TaskAgeHours ${TASK_MAX_AGE_HOURS} -CandAgeDays ${CAND_MAX_AGE_DAYS} -ParkedMax ${PARKED_MAX} -RequeueMax ${REQUEUE_MAX}"
+PS_ARGS="-DataDir ${DATA_DIR} -DeployDir ${DEPLOY_DIR} -PythonExe ${PY_EXE} -ReadoutPy ${PY_TARGET} -MaxAgeMin ${RESEARCH_MAX_AGE_MIN} -MemLimitMb ${RESEARCH_MEM_LIMIT_MB} -AmountRows ${AMOUNT_CHECK_ROWS} -ActiveMax ${ACTIVE_QUEUE_MAX} -TaskAgeHours ${TASK_MAX_AGE_HOURS} -CandAgeDays ${CAND_MAX_AGE_DAYS} -ParkedMax ${PARKED_MAX} -RequeueMax ${REQUEUE_MAX} -DrainMinDone ${DRAIN_MIN_DONE} -BacklogRunawayMax ${BACKLOG_RUNAWAY_MAX}"
 RUN_PS="powershell -NoProfile -ExecutionPolicy Bypass -File ${PS_TARGET} ${PS_ARGS}"
 # 队列/候选/财务三条腿由 PS 内部调这条 python 命令（阈值同样经 PS 参数透传，见 PSEOF 里的 pyCmd）
-RUN_PY="${PY_EXE} ${PY_TARGET} --db ${DATA_DIR}/trading.db --active-max ${ACTIVE_QUEUE_MAX} --task-age-hours ${TASK_MAX_AGE_HOURS} --cand-age-days ${CAND_MAX_AGE_DAYS} --parked-max ${PARKED_MAX} --requeue-max ${REQUEUE_MAX}"
+RUN_PY="${PY_EXE} ${PY_TARGET} --db ${DATA_DIR}/trading.db --active-max ${ACTIVE_QUEUE_MAX} --task-age-hours ${TASK_MAX_AGE_HOURS} --cand-age-days ${CAND_MAX_AGE_DAYS} --parked-max ${PARKED_MAX} --requeue-max ${REQUEUE_MAX} --drain-min-done ${DRAIN_MIN_DONE} --backlog-runaway-max ${BACKLOG_RUNAWAY_MAX}"
 
 if [ "$PREVIEW" -eq 1 ]; then
   echo "== verify_nightly_guangzhou -Preview（不连现网，仅打印将要执行的远端命令）=="
@@ -117,7 +128,11 @@ param(
     [int]$TaskAgeHours = 48,
     [int]$CandAgeDays = 7,
     [int]$ParkedMax = 0,
-    [int]$RequeueMax = 8
+    [int]$RequeueMax = 8,
+    # §QUEUE-BACKLOG（2026-10-15）：PS 侧默认值必须与 bash/Python 两处逐字一致（门禁 §118 钉等值）。
+    # 三个阈值都靠命令行透传，任何一处"读默认"都会让环境变量在实跑里失效。
+    [int]$DrainMinDone = 6,
+    [int]$BacklogRunawayMax = 90
 )
 function Probe([string]$name, [bool]$ok, [string]$detail) {
     $tag = if ($ok) { "PASS" } else { "FAIL" }
@@ -199,7 +214,7 @@ Probe "scale:daily+ths_daily amount caliber probe green" (-not $scaleBad) ("dail
 #      环境变量 CAND_MAX_AGE_DAYS / TASK_MAX_AGE_HOURS / ACTIVE_QUEUE_MAX 在实跑里失效
 #      （预览打印的命令行和真正执行的命令行会各说一套，那是本仓锤过的假绿形态）。
 if (Test-Path -LiteralPath $PythonExe) {
-    $pyRaw = & $PythonExe $ReadoutPy "--db" (Join-Path $DataDir "trading.db") "--active-max" "$ActiveMax" "--task-age-hours" "$TaskAgeHours" "--cand-age-days" "$CandAgeDays" "--parked-max" "$ParkedMax" "--requeue-max" "$RequeueMax" 2>&1
+    $pyRaw = & $PythonExe $ReadoutPy "--db" (Join-Path $DataDir "trading.db") "--active-max" "$ActiveMax" "--task-age-hours" "$TaskAgeHours" "--cand-age-days" "$CandAgeDays" "--parked-max" "$ParkedMax" "--requeue-max" "$RequeueMax" "--drain-min-done" "$DrainMinDone" "--backlog-runaway-max" "$BacklogRunawayMax" 2>&1
     foreach ($l in ($pyRaw | ForEach-Object { [string]$_ })) {
         if ($l -match '^(PASS|FAIL|INFO)\|') { Write-Output $l }
         elseif ($l.Trim().Length -gt 0) { Write-Output ("FAIL|py:readout-crashed :: " + $l.Replace("|", "/")) }
@@ -259,6 +274,11 @@ def main():
     #   requeue-max 的字面值必须等于 Go 侧 store.TotalRequeueLimit（门禁 §106 钉这条跨语言等值）。
     ap.add_argument("--parked-max", type=int, default=0)
     ap.add_argument("--requeue-max", type=int, default=8)
+    # §QUEUE-BACKLOG（2026-10-15 阈值口径批）：积压改按吞吐判，两把新尺子的兜底默认
+    #   必须与 bash（DRAIN_MIN_DONE / BACKLOG_RUNAWAY_MAX）和 PS（-DrainMinDone / -BacklogRunawayMax）
+    #   逐字一致——门禁 §118 钉这条三语言等值（与 §QUEUE-REQUEUE 那把 8 同一个形）。
+    ap.add_argument("--drain-min-done", type=int, default=6)
+    ap.add_argument("--backlog-runaway-max", type=int, default=90)
     a = ap.parse_args()
 
     now = dt.datetime.now()
@@ -370,7 +390,11 @@ def main():
             deferred_now = int(cur.execute(
                 "SELECT COUNT(*) FROM research_tasks "
                 "WHERE status IN ('queued','running','paused','preempted') "
-                "AND COALESCE(defer_day,'')>?").fetchone()[0] or 0)
+                "AND COALESCE(defer_day,'')>?",
+                # 2026-10-15 修：这条 COUNT 的 ? 原本漏传绑定，SQLite 抛 ProgrammingError
+                #   把整条队列腿判成 err=ProgrammingError（10-15 现网首夜真拨才现形——这条腿
+                #   在仓里从来没有离线夹具跑过，§118 现在补上：夹具两态＋摘参反证）。
+                (today_str2,)).fetchone()[0] or 0)
             if drows:
                 deferred_ids = ",".join("%s:%s->%s" % (r[0], r[1], r[2]) for r in drows)
             nrow = cur.execute(
@@ -383,8 +407,31 @@ def main():
         else:
             nightcap_state = "absent"
         reasons = []
-        if active > a.active_max:
-            reasons.append("backlog_gt_%d" % a.active_max)
+        # §QUEUE-BACKLOG（2026-10-15 阈值口径批，owner 10-12 令「观察一夜再裁」到期）：
+        #   积压这把尺子从「active > 30 就红」改成**按吞吐判**，两把新闸：
+        #     1) drained_24h ＝ 最近 24 小时落终态（done/cancelled/failed_needs_attention）的条数。
+        #        现网实录（10-04~10-14 各夜落终态 7~12 条、活跃 55 条）⇒ 54 条积压按吞吐要 5~8 夜排空，
+        #        旧口径会在整段排水期天天红，唯一的后果是把真停摆（stall）掩成噪音——本仓锤过的
+        #        「报警疲劳型失明」。排水期（drained_24h ≥ drain_min_done）积压超软上限只出读数。
+        #     2) 失控线 backlog_runaway_max（默认 90）**恒红、不看吞吐**：
+        #        "每夜排 7 条、每小时新增 10 条"那种越排越多必须在验收面现形，这是旧尺子唯一的真价值。
+        #   窗口边界一律在 python 侧算好再绑进 SQL：这张表的 updated_at 是北京时间写入口径，
+        #   SQL 里的 datetime('now') 是 UTC，差 8 小时会把"昨夜那一波"整段切成半个
+        #   （§TEXT 时间戳的窗口边界：边界必须与写入口径同区）。
+        since_24h = (now - dt.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            drained_24h = int(cur.execute(
+                "SELECT COUNT(*) FROM research_tasks "
+                "WHERE status IN ('done','cancelled','failed_needs_attention') AND updated_at>=?",
+                (since_24h,)).fetchone()[0] or 0)
+        except Exception:
+            # 读数打不出来＝按 -1 处理（负数永远 < 下限 ⇒ 判红）：绝不"查不到就当在排水"，
+            #  §缺数不报 0／静默成功同族。
+            drained_24h = -1
+        if active > a.backlog_runaway_max:
+            reasons.append("backlog_runaway_gt_%d" % a.backlog_runaway_max)
+        elif active > a.active_max and drained_24h < a.drain_min_done:
+            reasons.append("backlog_not_draining_lt_%d" % a.drain_min_done)
         if last_age_h is None:
             reasons.append("last_terminal_unparsed")
         elif last_age_h > a.task_age_hours:
@@ -400,7 +447,8 @@ def main():
         detail = ("active=%d limit=%d last_updated_age_h=%s last_type=%s last_status=%s "
                   "by_status=%s oldest_active_age_h=%s parked=%d parked_max=%d parked_first=%s "
                   "churn_max=%s churn_max_task=%s requeue_max=%d oldest_chain_day=%s "
-                  "deferred_now=%d deferred_first=%s night_used_today=%d nightcap_cols=%s reasons=%s") % (
+                  "deferred_now=%d deferred_first=%s night_used_today=%d nightcap_cols=%s "
+                  "drained_24h=%d drain_min=%d runaway_max=%d reasons=%s") % (
             active, a.active_max,
             ("%.1f" % last_age_h) if last_age_h is not None else "unparsed",
             (last[0] if last else "none"), (last[1] if last else "none"),
@@ -410,6 +458,7 @@ def main():
             churn_max if col_state == "ok" else "absent", churn_max_id, a.requeue_max,
             oldest_chain,
             deferred_now, deferred_ids, night_used_today, nightcap_state,
+            drained_24h, a.drain_min_done, a.backlog_runaway_max,
             ",".join(reasons) if reasons else "none")
         emit("INFO", "nightly_queue " + detail)
         okq = not reasons

@@ -44,11 +44,22 @@ import os
 import re
 import sys
 
-# 段头：顶格 `echo "==> <数字> ...`（收尾的 `echo "==> 全部通过"` 没有数字，天然被排除）。
-HEADER_RE = re.compile(r'^echo "==> (\d+)([^"]*)"')
+# 段头：顶格 `echo "==> <编号> ...`（收尾的 `echo "==> 全部通过"` 没有编号，天然被排除）。
+# §GATE-SELFACC（2026-10-15 批）：编号允许带小写字母后缀（`34b`／`34c` 这一形是本仓历史上
+#   往老段后面追加新段时留下的），并且**整个编号串就是段的身份**。为什么不能只取数字：
+#   `==> 34` / `==> 34b` / `==> 34c` 三行按旧口径解析出同一个 id 34，于是
+#     ① `TOTAL_SECTIONS=len(ids)`=119 与四桶之和（按 id 去重只能到 117）天生对不上＝本批
+#        PROGRESS 记的「TOTAL=116 vs 判数 114」那笔账；
+#     ② 更要命的是 collect 的推进逻辑：红发生在第二个 34 时 classify 的 NEXT 仍是 34，
+#        而 emit 的 `body_start` 按 `[s for s in sections if s[0]==start_id][0]` 取**第一处**，
+#        下一遍从同一个红点重跑同样一段——直到 GATE_COLLECT_MAX_PASSES=60 用尽，
+#        后面的段一条读数都没有，还烧满 60 遍尾体（2026-10-15 用 /tmp 最小夹具实测复现：
+#        STARTED=1,2 / FAIL=2 / NEXT=2，emit 2 的尾体第一行落在 §甲）。
+#   ⇒ 编号带后缀、身份唯一、重复即炸（见 parse() 的 uniqueness 守卫），三处坏法一起断根。
+HEADER_RE = re.compile(r'^echo "==> (\d+[a-z]?)([^"]*)"')
 DONE_TEXT = "==> 全部通过"
-MARK_RE = re.compile(r'^GATE-SECTION-START (\d+)$')
-SKIP_RE = re.compile(r'^GATE-SKIP (\d+) · (.*)$')
+MARK_RE = re.compile(r'^GATE-SECTION-START ([0-9]+[a-z]?)$')
+SKIP_RE = re.compile(r'^GATE-SKIP ([0-9]+[a-z]?) · (.*)$')
 FUNC_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{')
 CD_RE = re.compile(r'^cd "\$\(dirname "\$0"\)/\.\."$')
 DRIVER_BEGIN = "# >>> GATE-COLLECT-DRIVER"
@@ -173,7 +184,13 @@ def section_of(sections, idx):
 
 
 def parse(lines):
-    """返回 (sections, prologue_end, funcs)；索引 0-based，区间左闭右开。"""
+    """返回 (sections, prologue_end, funcs)；索引 0-based，区间左闭右开。
+
+    段的身份是**编号整串**（`"34"`、`"34b"`），不是数字：见 HEADER_RE 上面那段成因。
+    编号重复＝三段共用一个身份，classify/emit/summary 会把"跑过三段"折成"跑过一段"，
+    还会让 collect 在第二个同id 段上原地打转（NEXT 指回同一个起点、emit 永远取第一处）。
+    与其让汇总安静地少一段，不如解析当场炸：谁在同一天撞两个编号，谁就得当场改名。
+    """
     mask = heredoc_mask(lines)
     heads = []
     for i, line in enumerate(lines):
@@ -181,9 +198,18 @@ def parse(lines):
             continue
         m = HEADER_RE.match(line)
         if m:
-            heads.append((int(m.group(1)), i, m.group(2).strip().rstrip(".").strip()))
+            heads.append((m.group(1), i, m.group(2).strip().rstrip(".").strip()))
     if not heads:
-        raise SystemExit('gate-parse: 没解析出任何段头（^echo "==> <数字>），先确认门禁脚本格式没被改坏')
+        raise SystemExit('gate-parse: 没解析出任何段头（^echo "==> <编号>），先确认门禁脚本格式没被改坏')
+    seen = {}
+    for sid, start, _title in heads:
+        seen.setdefault(sid, []).append(start + 1)
+    for sid, rows in sorted(seen.items()):
+        if len(rows) > 1:
+            raise SystemExit(
+                "gate-parse: 段编号 %s 重复出现在第 %s 行——collect 的推进按编号定位，同编号的多段会被折成一段"
+                "（汇总少一段），红在第二段时下一遍还会从第一段重跑（最多烧满 GATE_COLLECT_MAX_PASSES 遍）。"
+                "追加段请写成 %sb／%sc 这样的带后缀唯一编号，或直接用下一个新号" % (sid, ",".join(str(r) for r in rows), sid, sid))
     prologue_end = heads[0][1]
     sections = []
     for k, (sid, start, title) in enumerate(heads):
@@ -229,14 +255,16 @@ def cross_section_helpers(sections, funcs, lines, mask):
         if name not in first_by_name:
             first_by_name[name] = (start, end, sid)
     out = []
-    for name, (_s, _e, producer) in sorted(first_by_name.items()):
+    for name, (pstart, _e, producer) in sorted(first_by_name.items()):
         if producer is None:
             continue  # 前言里的定义本来就会搬，不属于"跨段搬运"
         own_sections = {sid for _n, _a, _b, sid in funcs if _n == name}
         consumers = []
         pat = word_re(name)
         for cs, cstart, cend, _t in sections:
-            if cs <= producer or cs in own_sections:
+            # "被更晚的段调用"按**文件位置**判，不按编号比大小：编号自 §GATE-SELFACC 起是字符串
+            #   （`34b` 与 `34` 比大小会当场 TypeError），而段的先后本来就以行序为准。
+            if cstart <= pstart or cs in own_sections:
                 continue
             hit = False
             for i in range(cstart, cend):
@@ -258,7 +286,7 @@ def cmd_sections(gate):
     lines = read_lines(gate)
     sections, prologue_end, _funcs = parse(lines)
     for sid, start, end, title in sections:
-        print("%d\t%d\t%d\t%s" % (sid, start + 1, end + 1, title[:70]))
+        print("%s\t%d\t%d\t%s" % (sid, start + 1, end + 1, title[:70]))
     print("TOTAL\t%d\tPROLOGUE\t%d" % (len(sections), prologue_end))
 
 
@@ -282,6 +310,10 @@ def build_inner(gate, start_id, root):
     if start_id not in ids:
         raise SystemExit("gate-emit: 段号 %s 不在派生段清单里（共 %d 段）" % (start_id, len(ids)))
     body_start = [s for s in sections if s[0] == start_id][0][1]
+    # 段的"先后"一律按文件位置比，不按编号比大小：编号是字符串（`34b`），而且历史上确有
+    #   带后缀的编号排在纯数字编号后面（§GATE-SELFACC）。order 就是派生段清单的下标。
+    order = {sid: k for k, sid in enumerate(ids)}
+    start_pos = order[start_id]
 
     prelude = []
     prelude_names = []
@@ -293,12 +325,12 @@ def build_inner(gate, start_id, root):
 
     deps = cross_section_helpers(sections, funcs, lines, mask)
     for name, producer, consumers, _dup in deps:
-        if not any(c >= start_id for c in consumers):
+        if not any(order[c] >= start_pos for c in consumers if c in order):
             continue
         if name in prelude_names:
             continue
         for n2, s2, e2, sid2 in funcs:
-            if n2 == name and (sid2 is None or sid2 < start_id):
+            if n2 == name and (sid2 is None or order.get(sid2, -1) < start_pos):
                 prelude_names.append(name)
                 prelude.append("# helper %s：原定义在第 %d 行（段 %s），collect 前置搬运" % (name, s2 + 1, sid2))
                 prelude.append("\n".join(lines[s2:e2]))
@@ -326,7 +358,8 @@ def build_inner(gate, start_id, root):
 
 
 def cmd_emit(gate, start_id, out_path, root):
-    text, prelude_names = build_inner(gate, int(start_id), root)
+    # start_id 原样传（字符串编号，可能是 `34b`）；旧口径的 int() 会把带后缀的编号当场炸掉。
+    text, prelude_names = build_inner(gate, start_id, root)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(text)
     os.chmod(out_path, 0o755)
@@ -345,13 +378,13 @@ def cmd_classify(gate, log_path, rc):
     for line in log:
         m = MARK_RE.match(line)
         if m:
-            sid = int(m.group(1))
+            sid = m.group(1)
             if sid in ids and sid not in started:
                 started.append(sid)
             continue
         sm = SKIP_RE.match(line)
-        if sm and int(sm.group(1)) in ids:
-            skipped[int(sm.group(1))] = sm.group(2)
+        if sm and sm.group(1) in ids:
+            skipped[sm.group(1)] = sm.group(2)
     done = any(line.startswith(DONE_TEXT) for line in log)
     rc = int(rc)
     fail_id = ""
@@ -378,7 +411,7 @@ def cmd_classify(gate, log_path, rc):
         "STARTED": ",".join(str(x) for x in started),
         "PASS": ",".join(str(x) for x in pass_ids),
         "FAIL": str(fail_id),
-        "SKIP": ";".join("%d·%s" % (k, v) for k, v in sorted(skipped.items())),
+        "SKIP": ";".join("%s·%s" % (k, v) for k, v in sorted(skipped.items())),
         "SILENT": str(silent_id),
         "DONE": "1" if done else "0",
         "NEXT": str(nxt),
@@ -395,8 +428,11 @@ def cmd_summary(gate, work_dir):
     lines = read_lines(gate)
     sections, _pe, _funcs = parse(lines)
     ids = [s[0] for s in sections]
+    id_set = set(ids)
+    order = {sid: k for k, sid in enumerate(ids)}
     buckets = {"PASS": [], "FAIL": [], "SKIP": [], "SILENT": []}
     skip_reason = {}
+    bogus = []
     empties = []
     for path in sorted(glob.glob(os.path.join(work_dir, "cls_*.txt"))):
         kv = {}
@@ -407,31 +443,48 @@ def cmd_summary(gate, work_dir):
                 k, v = raw.split("\t", 1)
                 kv[k] = v
         for key in ("PASS", "FAIL", "SILENT"):
-            # 这三桶是裸段号，逗号分隔。
+            # 这三桶是裸段编号，逗号分隔。
+            #   §GATE-SELFACC：认段的尺子从 `isdigit()` 换成「在不在派生段清单里」。按数字认，
+            #   `34b` 这种带后缀的编号会被**安静丢掉**——四桶之和凭空少一段，而少了的那段
+            #   正是"没人验过"的那段；把「没验过」折算成「验过了」是本枚改造要消灭的形状，
+            #   反过来把「验过了」折算成「没验过」同样是假结论（会逼人去改无关的段）。
+            #   清单是 parse() 派生的唯一真相，落在清单外的一律进 bogus 点名，不折进任何桶。
             for tok in (kv.get(key, "") or "").split(","):
-                if tok.strip().isdigit():
-                    buckets[key].append(int(tok))
-        # SKIP 桶单独解：classify 输出的是 `id·原因` 用分号串起来的形态，
+                t = tok.strip()
+                if not t:
+                    continue
+                if t in id_set:
+                    buckets[key].append(t)
+                else:
+                    bogus.append("%s:%s" % (os.path.basename(path), t))
+        # SKIP 桶单独解：classify 输出的是 `编号·原因` 用分号串起来的形态，
         # 拿逗号去切它会得到 "4·fixture：…" 这种非数字串，`isdigit()` 一律为假 ⇒
         # 四桶之和凭空少一段，等值锁以 MISSING 判红（2026-10-07 夹具第一轮实跑就是这个形状）。
         for chunk in (kv.get("SKIP", "") or "").split(";"):
             if "·" in chunk:
                 sid, reason = chunk.split("·", 1)
-                if sid.strip().isdigit():
-                    buckets["SKIP"].append(int(sid))
-                    skip_reason[int(sid)] = reason
-            elif chunk.strip().isdigit():
-                buckets["SKIP"].append(int(chunk))
+                if sid.strip() in id_set:
+                    buckets["SKIP"].append(sid.strip())
+                    skip_reason[sid.strip()] = reason
+                elif sid.strip():
+                    bogus.append("%s:%s" % (os.path.basename(path), sid.strip()))
+            elif chunk.strip() in id_set:
+                buckets["SKIP"].append(chunk.strip())
+            elif chunk.strip():
+                bogus.append("%s:%s" % (os.path.basename(path), chunk.strip()))
         if kv.get("EMPTY") == "1":
             empties.append(os.path.basename(path))
     allids = buckets["PASS"] + buckets["FAIL"] + buckets["SKIP"] + buckets["SILENT"]
-    dup = sorted({x for x in allids if allids.count(x) > 1})
-    missing = sorted(set(ids) - set(allids))
+    dup = sorted({x for x in allids if allids.count(x) > 1}, key=lambda x: order[x])
+    missing = sorted(set(ids) - set(allids), key=lambda x: order[x])
     balance = "OK"
     if dup:
         balance = "DUPLICATE:" + ",".join(str(x) for x in dup)
     elif missing:
         balance = "MISSING:" + ",".join(str(x) for x in missing)
+    elif bogus:
+        # 桶里出现清单外的编号＝分类器与解析器对"什么是一段"的看法分叉了，读数不可归属。
+        balance = "BOGUS_ID:" + ",".join(bogus)
     print("PASS_SECTIONS\t%d" % len(buckets["PASS"]))
     print("FAIL_SECTIONS\t%d" % len(buckets["FAIL"]))
     print("SKIP_SECTIONS\t%d" % len(buckets["SKIP"]))
@@ -440,13 +493,13 @@ def cmd_summary(gate, work_dir):
     print("BALANCE\t%s" % balance)
     # PASS_IDS 也点名（只有四个计数不够用：H3 要断"消费段记在 SKIP、没记在 PASS"，
     # 光看 PASS_SECTIONS 的数字看不出一个段是不是两边都挂着——DUPLICATE 只抓同桶外的重复）。
-    print("PASS_IDS\t%s" % ",".join(str(x) for x in sorted(set(buckets["PASS"]))))
-    print("FAIL_IDS\t%s" % ",".join(str(x) for x in sorted(set(buckets["FAIL"]))))
-    print("SKIP_IDS\t%s" % ",".join(str(x) for x in sorted(set(buckets["SKIP"]))))
-    print("SILENT_IDS\t%s" % ",".join(str(x) for x in sorted(set(buckets["SILENT"]))))
+    print("PASS_IDS\t%s" % ",".join(sorted(set(buckets["PASS"]), key=lambda x: order[x])))
+    print("FAIL_IDS\t%s" % ",".join(sorted(set(buckets["FAIL"]), key=lambda x: order[x])))
+    print("SKIP_IDS\t%s" % ",".join(sorted(set(buckets["SKIP"]), key=lambda x: order[x])))
+    print("SILENT_IDS\t%s" % ",".join(sorted(set(buckets["SILENT"]), key=lambda x: order[x])))
     print("EMPTY_PASSES\t%s" % ",".join(empties))
-    for sid in sorted(skip_reason):
-        print("SKIP_REASON\t%d·%s" % (sid, skip_reason[sid]))
+    for sid in sorted(skip_reason, key=lambda x: order[x]):
+        print("SKIP_REASON\t%s·%s" % (sid, skip_reason[sid]))
 
 
 def cmd_check(gate):

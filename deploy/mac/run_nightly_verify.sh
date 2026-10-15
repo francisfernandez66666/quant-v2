@@ -19,6 +19,11 @@
 #      由每天必然跑成的备份拉取腿反查它的新鲜度（死调度探测器，见 restic_pull_backup.sh §4.6）。
 #   ③ **超时封顶**：七腿走公网 SSH，卡住不能永远挂着（launchd 下卡死＝后面每天都不触发）。
 #
+# 唯一一处例外（§QUEUE-THRESH 2026-10-15）：队列腿的「挂起容忍数」在本壳里临时抬到 1。
+#   抬的是**这次定时运行的入口环境**，不是判据本体（被调脚本三处默认仍是 0）——
+#   因为那条挂起是 owner 明确保留的解堵动作，而"天天一条预期内的红"会把报警磨成疲劳型失明。
+#   位置放在 -Preview 分支之前，就是为了让**预览拼出来的命令**与实跑同一条（见该块注释）。
+#
 # 依赖方向：本壳 → scripts/verify_nightly_guangzhou.sh（七腿判据的唯一实现，这里不重写第二份）。
 # 安装/升级：./install_mac_nightly_agent.sh -Apply（稳定副本 ~/backups/quant/nightly/，
 #   必须放非 TCC 保护目录且镜像 scripts/ 一层，理由见 install_mac_nightly_agent.sh 文件头）。
@@ -76,6 +81,23 @@ alias_declared() {
     return 0
 }
 
+# §QUEUE-THRESH（2026-10-15 owner 裁决＝「保持挂起，容忍数临时放 1」）——**临时豁免打在这里，不打进判据本体**。
+#   现况：研究队列里挂着 1 条 `failed_needs_attention`（任务 #416 三年窗因子，10-14 为了让整条队列
+#     重新转起来被正规挂起；挂起本身就是"解堵动作"，不是故障）。而队列腿的默认尺子是
+#     `parked > 0 即红`，于是这条**已知且有意的**挂起会让每晚验收都稳定红一条——
+#     正是本仓锤过的「报警疲劳型失明」：天天有一条预期内的红，真挂第二条的那天没人看。
+#   取向：只在**调度入口**把容忍值抬到 1（被调脚本 bash/PS/python 三处默认值一律保持 0，
+#     由门禁 §118 的等值锁钉着；抬默认值＝把判据本体改了，任何机器上的第二次挂起都会跟着一起失明）。
+#   失效条件（回收到 0 的三个时点，任一到达就把本行删掉，不留"临时"变成永久）：
+#     ① 队列积压排到软上限以内（读数 active ≤ 30）；
+#     ② #416 被恢复或被确认为不再需要跑（owner 侧决定）；
+#     ③ 出现第二条挂起——不需要人动手，G 态那条判据会当场把它判红（parked_gt_1）。
+#   为什么不是"改判据让它区分人工挂起/熔断挂起"：库里现没有一个可信的"是谁挂的"来源字段
+#     （只有 error 文案，而文案会随版本漂移），拿文案当判据＝把豁免开给任何写到这句话的任务；
+#     那要另立一批在写侧落来源，不该塞进一次阈值裁决。
+PARKED_MAX_TOLERANCE="${PARKED_MAX_TOLERANCE:-1}"
+export PARKED_MAX="${PARKED_MAX:-$PARKED_MAX_TOLERANCE}"
+
 # -Preview：安装期自检用（证明稳定副本两半都在、七腿命令真拼得出来），
 #   **不写日志、不写留档、不发一次 SSH**。留档新鲜度探测器（restic_pull_backup.sh §4.6）
 #   读的就是 nightly_record.jsonl 的最新时间戳，自检要是往里面写一行，
@@ -120,6 +142,9 @@ if [ -z "$GZ_HOST" ]; then
     exit 1
 fi
 line "START host=$SSH_ALIAS log=$LOG record=$RECORD timeout=${VERIFY_TIMEOUT_SEC}s target=$TARGET"
+# §QUEUE-THRESH：把「本次实际生效」的挂起容忍值打进日志（不是把注释里的数抄一遍）——
+#   红/绿归因时必须能看出今晚是按 1 放行还是按 0 严判，否则豁免就变成静默改判据。
+line "THRESH parked_tolerance=${PARKED_MAX} tolerance_default=${PARKED_MAX_TOLERANCE} scope=schedule-entry（判据本体三处默认仍为 0；回收条件见 §QUEUE-THRESH 注释）"
 
 if command -v timeout >/dev/null 2>&1; then
     RUNNER=(timeout "$VERIFY_TIMEOUT_SEC")
@@ -131,6 +156,7 @@ else
     RUNNER=()
     line "WARN runner=none（本机既无 timeout 也无 perl，超时封顶失效——请装 coreutils）"
 fi
+
 
 # 只把主机名交给被调脚本（它自己按 GZ_IP 拼 ssh/scp），口令/凭据一律不经过这里。
 if [ ${#RUNNER[@]} -gt 0 ]; then

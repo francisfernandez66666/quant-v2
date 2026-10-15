@@ -103,8 +103,17 @@ alert() {
         log "ALERT-NOT-SENT reason=no-topic title=$title body=$body"
         return 0
     fi
-    curl -fs -H "Title: $title" -H "Priority: high" -H "Tags: warning" \
-         -d "$body" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1 || log "ntfy 发送失败（不改变本脚本退出码）"
+    # §NTFY-PRI（2026-10-15）：拨号动作交给 ntfy_topic.sh 的 ntfy_attempt，三个发送方（演练腿／
+    # 拉取腿／看门狗）读同一份实现与同一张优先级词表——过去是各写一遍 curl，改一处漏两处。
+    #   本腿本来传的就是合法词 high，改动的收益是**分类**：上游 4xx 会由 attempt 把 http 码与响应体
+    #   摘要点名进日志，不再只剩一句"发送失败"（演练失败推不出去时，日志就是唯一证据面）。
+    #   告警永不影响本脚本退出码 ⇒ 三种返回码（0 送达／1 传输层或 5xx／2 上游 4xx）全部只留痕，
+    #   且演练腿单次拨号的原语义不变（不引入重试循环）。
+    local rc119=0
+    ntfy_attempt log "$NTFY_URL" "$NTFY_TOPIC" "$title" high warning "$body" verify-restore || rc119=$?
+    if [ "$rc119" -ne 0 ] && [ "$rc119" -ne 2 ]; then
+        log "ntfy 发送失败（不改变本脚本退出码；传输层错误/5xx）"
+    fi
 }
 # 留档行：纯 bash 拼 JSON（演练机器上不一定有 python3，留痕腿不能反过来把判据腿拖下水，
 # 与 restore_drill.sh write_record 同口径）。文案先剥双引号/反斜杠——一行 JSON 带引号的中文
