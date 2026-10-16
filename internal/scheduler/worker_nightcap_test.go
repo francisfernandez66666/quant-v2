@@ -50,7 +50,7 @@ func nightcapCallsFor(t *testing.T, logPath string, id int64) int {
 }
 
 // TestNightcapHeadBudgetDefersAndReleasesQueue §NIGHTCAP 队首侧预算闸（解堵腿）：
-// 队首低优任务本夜已占 300 分钟（上限 240，余量夹 0）→ tick 应把它顺延到下一夜
+// 队首低优任务本夜已占上限+60 分钟（余量夹 0）→ tick 应把它顺延到下一夜
 // （defer_day=明天、行留 queued、error 写让位原因），且**同一次收尾后队首后面的任务
 // 能照常入跑**——第二次 tick 里 B 执行完成，而被让位的 A 子进程一次都没起过。
 // English: the head-of-line budget gate — an over-budget low task is deferred to tomorrow
@@ -91,9 +91,9 @@ func TestNightcapHeadBudgetDefersAndReleasesQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 预记账：A 本夜（起跑日键=今天）已占 300 分钟 > 上限 240 → 剩余预算夹 0 < 起跑下限 15。
+	// 预记账：A 本夜（起跑日键=今天）已占 NightCapDefaultMin+60 分钟 → 剩余预算夹 0 < 起跑下限 15。
 	// 走生产写入口 AddTaskNightUsed 记账，不走夹具裸写（判据与来源同源，§派生状态不是来源）。
-	if err := qdb.AddTaskNightUsed(aID, today, 300); err != nil {
+	if err := qdb.AddTaskNightUsed(aID, today, store.NightCapDefaultMin+60); err != nil {
 		t.Fatal(err)
 	}
 
@@ -129,7 +129,7 @@ func TestNightcapHeadBudgetDefersAndReleasesQueue(t *testing.T) {
 }
 
 // TestNightcapBudgetCapYieldsTask §NIGHTCAP 运行侧预算截断（让位腿，实测 ~65s）：
-// 低优任务本夜已占 239 分钟（余 1 分钟 < 90 分钟单步超时）→ 实际可跑时长被夹到 1 分钟；
+// 低优任务本夜已占 NightCapDefaultMin-1 分钟（余 1 分钟 < 90 分钟单步超时）→ 实际可跑时长被夹到 1 分钟；
 // 长睡子进程到点被杀，终态必须是「让位」而不是「失败」：
 //   - status=yielded、行回 queued、defer_day=下一夜、error 写让位原因、progress 保留；
 //   - 连败账 fail_streak 与累计回队账 requeue_total 都不得动（让位是设计内行为，
@@ -178,7 +178,7 @@ func TestNightcapBudgetCapYieldsTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := qdb.AddTaskNightUsed(id, today, 239); err != nil { // 余 1 分钟
+	if err := qdb.AddTaskNightUsed(id, today, store.NightCapDefaultMin-1); err != nil { // 余 1 分钟
 		t.Fatal(err)
 	}
 	if ok, err := qdb.ClaimResearchTask(id); err != nil || !ok {

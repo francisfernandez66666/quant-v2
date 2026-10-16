@@ -461,8 +461,8 @@ func memGateDecide(availMB, threshMB int) bool {
 }
 
 // nightCapMinutes §NIGHTCAP（2026-10-14）单夜占用上限取值：配置 0/未给＝内置默认
-// store.NightCapDefaultMin（240，与 config 默认值等值、门禁 §117 锁）；负数＝不限（返回 0
-// 表示禁用该闸，high 手动任务无论如何都不受限）。
+// store.NightCapDefaultMin（360，与 config 默认值等值、门禁 §117 锁；240→360 见
+// §QRESUME 2026-10-17）；负数＝不限（返回 0 表示禁用该闸，high 手动任务无论如何都不受限）。
 // English: resolves the per-task nightly occupancy cap — 0/absent falls back to the built-in
 // default, a negative config disables the gate entirely (returns 0).
 func nightCapMinutes(cfg config.SchedulerConfig) int {

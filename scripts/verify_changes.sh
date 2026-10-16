@@ -12655,7 +12655,7 @@ echo "==> 117 §NIGHTCAP 队列单夜占用上限＋顺延让位＋连败口径�
 #   ① 队首独占：低优任务本夜剩余预算不足起跑（MinNightStartMin=15 分钟）时不再认领，
 #     写 defer_day 让位——不设这把闸，出队查询每 30s 把同一条取回来，队首后面的任务一条
 #     也轮不上（#416 连续六夜独占队首的另一半成因；解堵已由人工挂起先行落库）。
-#   ② 运行侧截断：低优任务实际可跑时长＝min(单步超时, 本夜剩余预算 NightCapDefaultMin=240)，
+#   ② 运行侧截断：低优任务实际可跑时长＝min(单步超时, 本夜剩余预算 NightCapDefaultMin=360），
 #     到点子进程被杀，终态走「让位」（TaskYielded 伪状态→queued+defer_day=下一夜、progress
 #     保留、两把熔断账不动）而不是「失败」——让位进熔断账＝下一夜它带旧账跑，两次就让误挂起。
 #   ③ 连败口径归一：连败计数不再比对错误指纹——超时与被抢占两条文案天然交替时旧实现每轮
@@ -12691,8 +12691,8 @@ eq117 "$RT117" 'ConsecutiveFailLimit = 6' 1 '连败熔断阈值单点（口径�
 eq117 "$RT117" 'TotalRequeueLimit = 8' 1 '累计回队阈值单点（6<8 梯度：失败-only 路径必先触连败闸）'
 eq117 "$RT117" 'DeferralStreakLimit = 2' 1 '连续没跑完顺延阈值单点（环级让位的尺子）'
 eq117 "$RT117" 'MinNightStartMin = 15' 1 '队首起跑预算下限单点（低于它起跑=起跑即到点）'
-eq117 "$RT117" 'NightCapDefaultMin = 240' 1 '单夜占用上限内置默认单点'
-eq117 "$CF117" 'PerTaskNightMaxMin: 240' 1 'config 默认与 store 内置默认等值'
+eq117 "$RT117" 'NightCapDefaultMin = 360' 1 '单夜占用上限内置默认单点（§QRESUME 2026-10-17 放宽 240→360）'
+eq117 "$CF117" 'PerTaskNightMaxMin: 360' 1 'config 默认与 store 内置默认等值'
 eq117 "$CF117" 'per_task_night_max_min' 2 '配置键恰两处（json tag + 覆盖解析；少一处＝env 档位撒谎族）'
 
 # B. 伪状态 + 五个 store 入口 + 夜账四列（建表＋幂等迁移各 2 处；缺迁移＝老库读不到列）

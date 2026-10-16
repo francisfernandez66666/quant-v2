@@ -365,9 +365,16 @@ const MinNightStartMin = 15
 // NightCapDefaultMin §NIGHTCAP 单夜占用上限的内置兜底（分钟）：配置项
 // rules.scheduler.per_task_night_max_min 未给出正值时使用。与 config 默认值同源，
 // 两处必须一致（门禁 §117 有等值锁）。
+// 240→360（§QRESUME 2026-10-17 owner 裁决）：断点续跑补齐后（权重优化阶段 trial 级缓存，
+// 见 internal/research windowed.go），"到点让位"从"整阶段作废重来"变成"次夜从断点继续"，
+// 长任务占满 6h 的代价从零产出降到有缓存收益；仍留一半夜窗给链上其余任务，不重蹈
+// #416"8h 单步独占队首"覆辙。三年全池发现的权重优化满程约 194 试验（~8.7h），6h/夜
+// +断点续跑两夜可完成。
 // English: built-in fallback per-task nightly occupancy cap (minutes), same value as the config
-// default — the gate keeps the two equal.
-const NightCapDefaultMin = 240
+// default — the gate keeps the two equal. 240→360 (§QRESUME 2026-10-17): with trial-level
+// checkpoint resume in place, a 6h occupancy leaves cache instead of wasted work, while still
+// leaving half the night for the rest of the chain.
+const NightCapDefaultMin = 360
 
 // requeueParkError 挂起终态的 error 列文案：把**触闸的那一条**写在最前面，
 // 消费方（worker 告警、夜间读数、人工排查）都按这个前缀分成因，不需要再猜。

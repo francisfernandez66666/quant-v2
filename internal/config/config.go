@@ -900,15 +900,19 @@ type SchedulerConfig struct {
 	// 内存总闸阈值（MB）
 	MinFreeMemMB int `json:"min_free_mem_mb"`
 	// PerTaskNightMaxMin §NIGHTCAP（2026-10-14）单条任务单夜占用上限（分钟）：0=用内置默认
-	// 240（store.NightCapDefaultMin，两处等值由门禁 §117 锁）；负数=不限（逃生口，不建议）；
+	// 360（store.NightCapDefaultMin，两处等值由门禁 §117 锁）；负数=不限（逃生口，不建议）；
 	// 仅对 low 优先级生效。夜窗只有一个消费槽，历史上一条三年窗因子发现每夜吃光 8 小时步长
-	// 却永不落终态，队首后面 54 条一条都排不动。上限落地后单条任务一夜最多占 240 分钟，
+	// 却永不落终态，队首后面 54 条一条都排不动。上限落地后单条任务一夜最多占一个上限值，
 	// 到点让位（进度/断点缓存保留，顺延下一夜续跑），后面的链任务得以排水；起跑前余额
 	// 不足 MinNightStartMin（15 分钟）时同样直接让位。
-	// English: per-task nightly occupancy cap (minutes): 0 = built-in default 240, negative =
+	// 240→360（§QRESUME 2026-10-17 owner 裁决）：权重优化阶段补齐 trial 级断点后续跑语义
+	// 从"整阶段作废"变为"次夜从断点继续"——长任务占满 6h 的占用有缓存收益而非零产出；
+	// 同时仍给链上其余任务留半窗以上，不重蹈 #416"8h 单步独占队首"覆辙。
+	// English: per-task nightly occupancy cap (minutes): 0 = built-in default 360, negative =
 	// uncapped escape hatch; low priority only. One never-finishing task used to monopolise
 	// whole nights on the single worker slot; the cap turns it into a bounded share with a
-	// yield-and-resume hand-off.
+	// yield-and-resume hand-off. 240→360 (§QRESUME 2026-10-17) — with trial-level checkpoint
+	// resume, a longer share now leaves cache instead of wasted work.
 	PerTaskNightMaxMin int `json:"per_task_night_max_min"`
 	// ReplayThrottleMs 战法库全量回放逐股节流（毫秒/只）：>0 时回放循环每处理完一只股票
 	// sleep 该时长——盘后十几个小时足够，用拉长总时长换取对 quant/系统的瞬时 CPU 挤压最小化
@@ -1104,13 +1108,16 @@ func DefaultSchedulerConfig() SchedulerConfig {
 			IntervalMinutes: 30,
 		},
 		TrimIntervalMin: 15,
-		// §NIGHTCAP（2026-10-14）单条任务单夜占用上限默认 240 分钟：与 store.NightCapDefaultMin
+		// §NIGHTCAP（2026-10-14）单条任务单夜占用上限默认 360 分钟：与 store.NightCapDefaultMin
 		// 同源（门禁 §117 等值锁钉两处一致）。默认即开启——夜窗只有唯一消费槽，不设上限就是
 		// 允许一条跑不完的任务占光整夜（现网 #416 实录：六夜排不出一条）。
-		// English: per-task nightly occupancy cap default 240 minutes, kept equal to
+		// 240→360（§QRESUME 2026-10-17）：trial 级断点补齐后让位=有缓存收益，长任务 6h
+		// 占用两夜可完成三年全池发现；仍留半窗以上给链上其余任务。
+		// English: per-task nightly occupancy cap default 360 minutes, kept equal to
 		// store.NightCapDefaultMin (gate-locked); on by default because the night has a single
-		// consumer slot.
-		PerTaskNightMaxMin: 240,
+		// consumer slot. 240→360 (§QRESUME 2026-10-17): with trial-level checkpoint resume, a
+		// longer share leaves cache instead of waste and still leaves half the night for the chain.
+		PerTaskNightMaxMin: 360,
 	}
 }
 

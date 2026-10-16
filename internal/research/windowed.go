@@ -24,6 +24,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"quant-trading-v2/internal/factor"
@@ -81,6 +82,97 @@ func noteWindowFail(stage string, total, failed int, firstErr error) {
 		return
 	}
 	log.Printf("[research] %s 阶段窗口装配降级：%d/%d 窗失败（首例：%v）——结论仅覆盖剩余窗口", stage, failed, total, firstErr)
+}
+
+// weightsVecTag 权重向量的稳定短标识（**含取值**）。与 weightsTag（只含因子集合，用于
+// 分段IR/gen 的固定权重缓存）刻意分开：坐标上升每次试验都是不同取值，trial 级断点
+// 必须按完整向量（因子名+权重）区分，否则权重微调会互相串缓存。
+// English: stable short tag over the full weight vector (values included) — deliberately
+// distinct from weightsTag (factor-set only); ascent trials differ by value, so the cache
+// key must cover values or weight tweaks would collide.
+func weightsVecTag(w map[string]float64) string {
+	keys := make([]string, 0, len(w))
+	for k := range w {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%s=%.6f;", k, w[k])
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// optCacheRow §QRESUME trial 级断点 payload：只缓存 IC 统计。Trials 计数与最终权重
+// 属于上升轨迹的调用方状态（权重向量已在 key 里），不进缓存。
+// 数值一律以字符串存（strconv 'g' 格式）：JSON 原生不支持 NaN/Inf，而退化窗口
+// （样本不足/零方差）的 IC 统计恰恰可能是 NaN——直接 marshal 会整条缓存写不进去，
+// 次夜又得重算（合成数据实测复现：常量 IC → 零方差 → IR=NaN）。
+// English: trial checkpoint payload — IC stats only; the trial counter and final weights
+// belong to the ascent loop and are recomputed (the weight vector is the key). Values are
+// stored as strings because JSON cannot represent NaN/Inf, and degenerate windows (too few
+// samples / zero variance) legitimately produce NaN — marshalling would drop the whole row.
+type optCacheRow struct {
+	ICMean string `json:"ic_mean"`
+	ICStd  string `json:"ic_std"`
+	IR     string `json:"ir"`
+	NDays  int    `json:"n_days"`
+}
+
+// newOptCacheRow 从评估结果构造缓存行（数值→字符串，NaN/Inf 无损）。
+// English: builds a cache row from an evaluation result (value to string, NaN/Inf lossless).
+func newOptCacheRow(r OptResult) optCacheRow {
+	return optCacheRow{
+		ICMean: strconv.FormatFloat(r.ICMean, 'g', -1, 64),
+		ICStd:  strconv.FormatFloat(r.ICStd, 'g', -1, 64),
+		IR:     strconv.FormatFloat(r.IR, 'g', -1, 64),
+		NDays:  r.NDays,
+	}
+}
+
+// toOpt 还原为 OptResult（字符串→数值；解析失败按 NaN 处理，与计算侧口径一致）。
+// English: restores an OptResult (string to value; a parse failure counts as NaN, matching compute).
+func (r optCacheRow) toOpt() OptResult {
+	f := func(s string) float64 {
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return math.NaN()
+		}
+		return v
+	}
+	return OptResult{ICMean: f(r.ICMean), ICStd: f(r.ICStd), IR: f(r.IR), NDays: r.NDays}
+}
+
+// loadKeyed/saveKeyed 按 (stage, key) 存取**与窗口无关**的断点产物（§QRESUME 权重优化
+// 的 trial 级缓存用）。复用同一张表：win_start=key、win_end=""，主键四元组不冲突。
+// 语义与 load/save 完全一致：nil 接收者直通、未命中/JSON 损坏返回 false、序列化或落库
+// 失败静默跳过（断点是加速件不是正确性件，失败可继续）。
+// English: load/save a window-independent artifact under (stage, key) via the same table
+// (win_start=key, win_end=""); identical semantics to load/save.
+func (c *winCkpt) loadKeyed(key string, dst any) bool {
+	if c == nil || c.db == nil {
+		return false
+	}
+	js, ok, err := c.db.GetWindowCkpt(c.resumeKey, c.stage, key, "")
+	if err != nil || !ok {
+		return false
+	}
+	return json.Unmarshal([]byte(js), dst) == nil
+}
+
+func (c *winCkpt) saveKeyed(key string, v any) {
+	if c == nil || c.db == nil {
+		return
+	}
+	js, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("[research] 断点序列化失败（跳过缓存 %s %s）: %v", c.stage, key, err)
+		return
+	}
+	if err := c.db.PutWindowCkpt(c.resumeKey, c.stage, key, "", string(js)); err != nil {
+		log.Printf("[research] 断点落库失败（下次将重算 %s %s）: %v", c.stage, key, err)
+	}
 }
 
 // stageProgress 阶段进度：把窗口完成数映射到全局百分比带并打印"发现进度 xx%"
@@ -553,18 +645,25 @@ func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs
 }
 
 // windowOptimizeWeights 坐标上升权重优化（窗口分块版）。复刻 OptimizeWeights 的算法，
-// 但内部用 windowCompositeIC 代替全量面板的 CompositeIC。权重候选是瞬态的（坐标上升每步
-// 组合都不同），不做窗口断点——断点只覆盖输入确定的阶段（预筛/贪心/分段IR/反推）。
-// §WD-1 该阶段既无窗口断点也不打进度行，而调度器看门狗仅以"发现进度 xx%"行判活性 →
-// 长耗时会被当停滞 terminate（2026-09-20 广州 #268 实录：~336min 的真实计算被 320min 阈值
-// 反复误杀成死循环）。故新增 onTrial 回调：每完成一次真实 trial 评估回调一次，由调用方映射
-// 成进度行喂看门狗。onTrial 为 nil 时行为与旧版完全一致。
-// English: window-chunked coordinate-ascent weight optimization. Candidate weights are transient
-// (different every ascent step), so no window checkpoints here — checkpoints only cover
-// deterministic stages (pre-screen / greedy / split-IR / reverse-extension). onTrial is invoked
-// after every real trial evaluation so the caller can emit watchdog-recognizable progress; nil
-// reproduces the legacy behaviour exactly.
-func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chunks [][2]string, dates []string, onTrial func()) OptResult {
+// 但内部用 windowCompositeIC 代替全量面板的 CompositeIC。
+// §WD-1 该阶段原先不打进度行，而调度器看门狗仅以"发现进度 xx%"行判活性 → 长耗时会被当
+// 停滞 terminate（2026-09-20 广州 #268 实录：~336min 的真实计算被 320min 阈值反复误杀成
+// 死循环）。故新增 onTrial 回调：每完成一次 trial 评估回调一次，由调用方映射成进度行喂
+// 看门狗。onTrial 为 nil 时行为与旧版完全一致。
+// §QRESUME（2026-10-17）trial 级断点：权重候选虽然每步都不同，但**给定权重向量的评估
+// 结果是确定的**，且坐标上升的试验轨迹完全可复现（同 opts+chunks+dates → 同一串候选）。
+// 因此按权重向量哈希把每个 trial 的 IC 统计落进 research_ckpts（stage "optw"）：单夜预算
+// 到点被杀后，次夜从零重放同一轨迹——已评过的 trial 逐条命中缓存直达断点，只算新 trial，
+// 不会再出现"每夜烧满 4h 却永远停在 69%"的死循环（现网 #427/#435 一周实录）。
+// 数据时效口径与既有缓存一致：断点是加速件不是正确性件（§M-8/N-6），复权口径变更靠
+// discoveryResumeKey 里的 adj 位轮换 key 失效，不靠本表删行。
+// English: window-chunked coordinate-ascent weight optimization. §QRESUME adds trial-level
+// checkpoints keyed by the full weight vector: although every candidate differs, the evaluation
+// of a fixed vector is deterministic and the ascent trajectory is reproducible, so a night-budget
+// kill resumes at the kill point instead of restarting the ascent from zero (the #427/#435
+// week-long 69% death loop). Cache semantics match the existing stages — acceleration, not a
+// correctness dependency; basis changes rotate the resume key.
+func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chunks [][2]string, dates []string, onTrial func(), ck *winCkpt) OptResult {
 	if len(opts.Factors) == 0 {
 		return OptResult{Reason: "因子池为空"}
 	}
@@ -587,7 +686,24 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 		w[f] = 1.0
 	}
 	w = cloneWeights(w)
-	best := windowEval(db, codes, opts, w, chunks, dates)
+	// §QRESUME trial 级缓存评估器：命中断点直接返回（次夜续跑不重算已评试验），
+	// 未命中照常计算并落库。ck 为 nil 时与旧行为完全一致（无断点直通）。
+	// English: trial-level cached evaluator — hits resume across nights, misses compute+persist;
+	// a nil ck reproduces the legacy no-checkpoint behaviour exactly.
+	evalCached := func(w map[string]float64) OptResult {
+		if ck == nil {
+			return windowEval(db, codes, opts, w, chunks, dates)
+		}
+		key := weightsVecTag(w)
+		var row optCacheRow
+		if ck.loadKeyed(key, &row) {
+			return row.toOpt()
+		}
+		r := windowEval(db, codes, opts, w, chunks, dates)
+		ck.saveKeyed(key, newOptCacheRow(r))
+		return r
+	}
+	best := evalCached(w)
 	trials := 1 // §ENH-B 试验计数（与 OptimizeWeights 同口径：初值+每次候选评估）
 	if onTrial != nil {
 		onTrial()
@@ -601,7 +717,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 				if cand[f] < 0 {
 					cand[f] = 0
 				}
-				r := windowEval(db, codes, opts, cand, chunks, dates)
+				r := evalCached(cand)
 				trials++
 				if onTrial != nil {
 					onTrial()
@@ -820,12 +936,19 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 				dirs[fid] = 1
 			}
 		}
+		// §QRESUME 阶段 3 断点：stage "optw" 挂在 rkBase 下（与 greedy 同款排除集无关
+		// 的复用位）——真正的隔离由权重向量 tag 完成（不同 selected 组合 → 不同因子名
+		// → 不同 tag，不可能串缓存；即使两轮 selected 相同，评估结论也本就一致）。
+		// English: stage-3 checkpoints live under rkBase like greedy; isolation comes from
+		// the weight-vector tag (different selected sets ⇒ different factor names ⇒ different
+		// tags, and identical vectors legitimately share results).
+		optCk := &winCkpt{db: db, resumeKey: rkBase, stage: "optw"}
 		opt := windowOptimizeWeights(db, codes, OptimizeOpts{
 			Factors: selected, Horizon: opts.Horizon, MinStocks: opts.MinStocks,
 			Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
 			GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
 			End: dates[splitIdx],
-		}, inChunks, dates[:splitIdx+1], optProg.tick)
+		}, inChunks, dates[:splitIdx+1], optProg.tick, optCk)
 
 		// 4) E3 分段 + 反推验证（窗口分块，IR 行与 gen 都走 per-rerun rk，跨排他轮隔离）
 		irCk := func() *winCkpt { return &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(opt.Weights)} }

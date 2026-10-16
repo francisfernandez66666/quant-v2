@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"math"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -324,4 +325,83 @@ func TestPostPreProgressEmitted(t *testing.T) {
 		t.Fatalf("预筛之后应打出 [36,99] 进度行（否则长阶段会被看门狗误判停滞）\n实际日志:\n%s", out)
 	}
 	t.Logf("后段进度行 %d 条", postLines)
+}
+
+// TestOptTrialCheckpointResume §QRESUME（2026-10-17）回归：坐标上升权重优化阶段的 trial
+// 级断点。现网 #427/#435 三年全池发现每夜烧满单夜预算(4h)后从零重跑同一试验轨迹、
+// 进度永远停在 69%（断点表实测只有 pre/greedy 行、零 ir/gen 行）——本测试锤实三件事：
+//  ① 落库面：首跑后初始等权向量必须有 optw 缓存行；
+//  ② 命中原样返回：预置"带毒"缓存（|IR|=9.99 不可能被候选击败），重跑必须原样采用
+//     该值且权重停在初值——证明续跑走缓存而不是重算；
+//  ③ 缓存不改变结论：换全新断点键的二跑与冷跑结果一致。
+// English: §QRESUME regression for trial-level checkpoints in the weight-optimization stage —
+// the initial vector must be cached, a poisoned entry must be adopted verbatim (proving hits
+// short-circuit recompute), and a fresh-key re-run reproduces the cold result.
+func TestOptTrialCheckpointResume(t *testing.T) {
+	db := seedWindowDB(t)
+	codes, _ := db.StockCodes()
+	dates, err := db.TradeDates("20230101", datesEnd(db))
+	if err != nil || len(dates) < 10 {
+		t.Fatalf("交易日不足: %v", err)
+	}
+	chunks := windowChunks(dates, windowDays)
+	opts := OptimizeOpts{
+		Factors: []string{"Mom20", "STO20"}, Horizon: 5, MinStocks: 3,
+		MaxIter: 2, Step: 0.1, Metric: "ir",
+		GuardMinIR: 0.1, GuardMinDays: 10,
+	}
+	resumeKey := "optw-test|rk"
+	ck := &winCkpt{db: db, resumeKey: resumeKey, stage: "optw"}
+
+	// ① 冷缓存首跑 + 初始等权向量落库
+	// English: cold-cache first run; the initial equal-weight vector must be persisted.
+	cold := windowOptimizeWeights(db, codes, opts, chunks, dates, nil, ck)
+	// 初始等权经 cloneWeights 的 L1 归一化后是 1/N（上升轨迹的第一个 trial 向量）
+	// English: the initial equal weights are L1-normalized by cloneWeights to 1/N.
+	w0 := map[string]float64{}
+	for _, f := range opts.Factors {
+		w0[f] = 1.0 / float64(len(opts.Factors))
+	}
+	var row optCacheRow
+	if !ck.loadKeyed(weightsVecTag(w0), &row) {
+		t.Fatal("trial 断点未落库（初始等权向量应有缓存行）")
+	}
+
+	// ② 带毒缓存：初始向量行改成显著取值，重跑必须原样命中且权重停在初值
+	// English: poisoned cache — overwrite the initial row; the next run must adopt it verbatim.
+	poison := optCacheRow{ICMean: "0.123456", ICStd: "0.05", IR: "9.99", NDays: 42}
+	ck.saveKeyed(weightsVecTag(w0), poison)
+	hot := windowOptimizeWeights(db, codes, opts, chunks, dates, nil, ck)
+	if hot.ICMean != 0.123456 || hot.IR != 9.99 || hot.NDays != 42 {
+		t.Fatalf("命中断点未原样返回：got ICMean=%v IR=%v NDays=%v，want ICMean=0.123456 IR=9.99 NDays=42",
+			hot.ICMean, hot.IR, hot.NDays)
+	}
+	for f, v := range w0 {
+		if hot.Weights[f] != v {
+			t.Fatalf("命中后续跑权重应保持初值 %s=%.4f，got %.4f（毒值应无候选可破）", f, v, hot.Weights[f])
+		}
+	}
+
+	// ③ 全新断点键二跑与冷跑一致（缓存不改变上升结论）。合成公式数据的 IR 可能是
+	// NaN（常量 IC → 零方差），比较必须 NaN 感知，否则 NaN≠NaN 会误报。
+	// English: a fresh-key second run reproduces the cold result; comparison must be
+	// NaN-aware because formulaic synthetic data yields NaN IR (constant IC → zero variance).
+	sameF := func(a, b float64) bool { return a == b || (math.IsNaN(a) && math.IsNaN(b)) }
+	ck2 := &winCkpt{db: db, resumeKey: resumeKey + "-fresh", stage: "optw"}
+	again := windowOptimizeWeights(db, codes, opts, chunks, dates, nil, ck2)
+	if !sameF(again.ICMean, cold.ICMean) || !sameF(again.IR, cold.IR) || again.NDays != cold.NDays {
+		t.Fatalf("重跑结果与首跑不一致: cold ICMean=%v IR=%v NDays=%v, again ICMean=%v IR=%v NDays=%v",
+			cold.ICMean, cold.IR, cold.NDays, again.ICMean, again.IR, again.NDays)
+	}
+
+	// ④ 向量 tag 敏感性：只差一个权重取值必须换 key；表顺序不影响 key
+	// English: vector-tag sensitivity — one differing value changes the key; map order doesn't.
+	wA := map[string]float64{"Mom20": 1.0, "STO20": 1.0}
+	wB := map[string]float64{"Mom20": 1.1, "STO20": 1.0}
+	if weightsVecTag(wA) == weightsVecTag(wB) {
+		t.Fatal("权重取值变化必须换 trial 断点 key（否则权重微调串缓存）")
+	}
+	if weightsVecTag(wA) != weightsVecTag(map[string]float64{"STO20": 1.0, "Mom20": 1.0}) {
+		t.Fatal("权重表顺序不应影响 key")
+	}
 }
