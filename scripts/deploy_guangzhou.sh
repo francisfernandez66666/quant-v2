@@ -527,7 +527,11 @@ if [ -d web/dist ]; then
   # 这正是 RUNBOOK 长期把「前端 dist 发布」列为"脚本外手动流程"的原因——[2c] 从未跑完过。
   # 本步是尽力而为的垃圾清理，失败不得中断部署。
   $SSH "powershell -NoProfile -Command \"tar -xzf ${DEPLOY_DIR}/webdist.tgz -C ${DEPLOY_DIR}/web; Remove-Item -Force ${DEPLOY_DIR}/webdist.tgz; Get-ChildItem -Path ${DEPLOY_DIR}/web -Recurse -Filter '._*' | Remove-Item -Force -ErrorAction SilentlyContinue; exit 0\"" || true
-  rm -f /tmp/webdist.tgz
+  # §DEP-SANDBOX-RM（2026-10-16 实录）：本行删除失败**不得中断部署**——沙箱执行上下文里
+  # unlink 被 OS 层全局拒绝（/bin/rm 实测 EPERM），而前端此刻已经同步成功，让一次临时
+  # 包清理把 [2d]/[2e]/[3*]/[5/5] 全部跳掉等于拿收尾的次要动作换半套部署。与上一行
+  # `._*` 清理同一姿势：尽力而为，失败不阻断（真 needing 清理时它自己会在下次构建覆盖）。
+  rm -f /tmp/webdist.tgz || true
   echo "  OK 前端已同步到 $DEPLOY_DIR/web"
 else
   echo "  X web/dist 构建失败，跳过前端同步（其余部署照常进行）"
