@@ -224,6 +224,25 @@ func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 // English: Impact period = Duration days before to Duration days after the event date.
 // English: Returns sorted by priority (war > contract > fomc > pce > cpi > nfp > other) descending.
 func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
+	return GetActiveMacroEventsWithin(events, now, 168*time.Hour)
+}
+
+// GetActiveMacroEventsWithin 与 GetActiveMacroEvents 同口径，但**前瞻窗可配**（自然日跨度）。
+//
+// §DYN-SIZE P4：固定的 7 自然日窗口在长假期前会漏事件——"事件前 5 个**交易日**"跨一次国庆
+// 长假就是 ~14 个自然日，7 天窗下那 5 个交易日的前瞻在节前根本取不到事件（前瞻曲线形同虚设）。
+// 调用方按交易日历把"N 个交易日"折算成自然日跨度传进来（data.TradingDaySpan）。
+// 窗**放大是安全的**：真正决定是否降权的仍是 signalctl 的 `macroLeadFactor`（按 `DaysToEvent`
+// 交易日距离查曲线），超出前瞻天数的事件即便在列表里也不产生任何缩放。
+//
+// English: §DYN-SIZE P4 — the same filter with a configurable forward window. The hard-coded 7
+// natural days misses events before a long holiday (5 trading days can span ~14 natural days), so
+// the lead curve never saw them. Widening the window is safe: the actual scaling is decided by
+// macroLeadFactor from the trading-day distance, so extra events in the list change nothing.
+func GetActiveMacroEventsWithin(events []MacroEvent, now time.Time, horizon time.Duration) []MacroEvent {
+	if horizon <= 0 {
+		horizon = 168 * time.Hour
+	}
 	var active []MacroEvent
 
 	// 事件类别权重表：战争/贸易合约这类突发冲击排在美联储与经济数据之前，
@@ -241,10 +260,10 @@ func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
 	for _, e := range events {
 		before := e.Date.AddDate(0, 0, -e.Duration)
 		after := e.Date.AddDate(0, 0, e.Duration)
-		// 当前在影响期内，或未来7天内即将发生
-		// English: Currently in the impact period, or due within the next 7 days.
+		// 当前在影响期内，或在可配前瞻窗内即将发生
+		// English: currently in the impact period, or due within the configurable forward window.
 		inRange := (now.After(before) && now.Before(after.AddDate(0, 0, 1))) ||
-			(now.Before(e.Date) && e.Date.Sub(now).Hours() <= 168)
+			(now.Before(e.Date) && e.Date.Sub(now) <= horizon)
 		if inRange {
 			e.DaysLeft = int(math.Ceil(after.Sub(now).Hours() / 24))
 			active = append(active, e)

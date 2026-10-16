@@ -205,9 +205,18 @@ func nShapeTag(eval *strategy.Evaluation) string {
 type Agent struct {
 	mu          sync.RWMutex           // 读写锁，保护并发访问
 	strategyCfg *config.StrategyConfig // 策略参数配置（含动量分权重等，可热更新）
-	laodengCfg  *config.LaodengConfig  // Laodeng 评分配置（nil 表示未启用）
-	runners     []StrategyRunner       // 多策略运行器列表（做多/通用扫描共用）
-	shortRunner StrategyRunner         // 做空策略运行器（预留，历史字段保留兼容）
+	// §DYN-SIZE P5 止损/止盈两态偏移的注入态（引擎每轮在 CheckPositionAlerts 前刷新）。
+	// 为什么走注入而不是在 Agent 里自己拉指数：大盘读数引擎侧已有 30s 短 TTL 缓存
+	// （fillIndexReadings），Agent 再独立拉一遍就是重复打上游（§SIGBATCH 教训）。
+	// 零值（Enabled=false）→ 两态偏移恒不生效（零行为变更）。
+	// English: §DYN-SIZE P5 — the market context for the two-state stop offset, refreshed by the
+	// engine before each CheckPositionAlerts call so the index reading is not fetched twice.
+	stopOffsetCfg    config.SizingConfig
+	stopIdxChange    float64               // 大盘最近一个交易日涨跌幅 %（NaN=不可得）
+	stopIdxTrendBrok bool                  // 趋势破位
+	laodengCfg       *config.LaodengConfig // Laodeng 评分配置（nil 表示未启用）
+	runners          []StrategyRunner      // 多策略运行器列表（做多/通用扫描共用）
+	shortRunner      StrategyRunner        // 做空策略运行器（预留，历史字段保留兼容）
 	// shortRunners §SHORT-1 做空四战法运行器列表（ScanShort 专用；空时回退复用做多 runners 旧骨架行为）。
 	// （shortRunners are the bear-side tactic runners used by ScanShort; empty falls back to legacy skeleton.）
 	shortRunners []StrategyRunner
@@ -1992,6 +2001,26 @@ func (a *Agent) evalShort(input *ScanInput, runners []StrategyRunner, code strin
 	return sigs
 }
 
+// SetMarketStopContext §DYN-SIZE P5：注入本轮市场态（大盘涨跌幅 + 趋势破位）与该账号定权配置。
+// 引擎在每次 CheckPositionAlerts 之前调用（读数取自引擎侧 30s TTL 缓存，不额外打上游）。
+// 未注入（零值 cfg）→ Enabled=false → 两态偏移恒不生效，有效阈值与改造前逐字一致。
+// English: §DYN-SIZE P5 — injects this round's market context and the account's sizing config
+// before each alert check. Zero-value cfg keeps the offset inert.
+func (a *Agent) SetMarketStopContext(cfg config.SizingConfig, indexChangePct float64, indexTrendBroken bool) {
+	a.mu.Lock()
+	a.stopOffsetCfg = cfg
+	a.stopIdxChange = indexChangePct
+	a.stopIdxTrendBrok = indexTrendBroken
+	a.mu.Unlock()
+}
+
+// stopOffsetContext 读回注入的市场态（零值安全）。
+func (a *Agent) stopOffsetContext() (config.SizingConfig, float64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.stopOffsetCfg, a.stopIdxChange, a.stopIdxTrendBrok
+}
+
 // CheckPositionAlerts 检查所有持仓的止盈止损条件，返回需要提醒的信号列表。
 // 根据实时行情价格计算盈亏比例，触发止盈/止损阈值时生成提醒信号。
 //
@@ -2033,6 +2062,10 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 		dropPct = p
 	}
 
+	// §DYN-SIZE P5：市场态**每次调用读一次**（不是每个持仓读一次——§SIGBATCH 教训）。
+	// 未注入（零值 cfg → Enabled=false）时 offsets 恒零值，有效阈值 = 配置阈值，与改造前逐字一致。
+	stopCfg, idxChange, idxTrendBroken := a.stopOffsetContext()
+
 	for _, pos := range positions {
 		// §R4-6 行情取用快照化：优先取调用方注入的 5s 快照（主循环/近实时循环批量现成），
 		// 缺失时才逐票兜底单查。此前逐持仓串行同步调 GetRealtimeQuote——持仓多时 5s 循环
@@ -2068,6 +2101,31 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 		}
 		isShort := pos.Direction == "做空"
 
+		// §DYN-SIZE P5 两态止损/止盈偏移：单日冲击 → 放宽止损 / 上浮止盈；趋势破位 → 收紧止损。
+		// 做空持仓 / N 形超短 / 个股独立崩坏（跌幅偏离大盘 ≥3pt）三条豁免见 stop_offset.go。
+		// **绝不改写 pos.StopLossPct**（开仓冻结值）：只在判定点解析有效阈值——冻结值一旦被改，
+		// 后续所有轮次都在"上一次修正"之上再修正，偏移会累积漂移。
+		// English: resolve the effective thresholds at the decision point only; never mutate the frozen
+		// pos.StopLossPct (cumulative drift would otherwise compound every round).
+		offs := ComputeStopOffsets(StopOffsetInput{
+			IndexChangePct:   idxChange,
+			IndexTrendBroken: idxTrendBroken,
+			StockChangePct:   quote.ChangePct,
+			IsShort:          isShort,
+			Strategy:         pos.Strategy,
+		}, stopCfg)
+		effSL, effTP := pos.StopLossPct+offs.SL, pos.TakeProfitPct+offs.TP
+		if pos.StopLossPct > 0 && effSL < 0.5 {
+			effSL = 0.5 // 收紧到贴地 = 配置异常，钳到 0.5pt 而非制造"下一轮必卖"
+		}
+		if pos.TakeProfitPct > 0 && effTP < 0.5 {
+			effTP = 0.5
+		}
+		offNote := ""
+		if offs.Applied {
+			offNote = "（" + offs.Reason + "）"
+		}
+
 		// 当日跌幅提醒（独立于成本止损）：做多持仓当日跌幅超过阈值即提醒，
 		// 与"按持仓成本盈亏"的止损逻辑分开，防止当日急跌但成本尚未破线时不提示。
 		// 做空持仓下跌=获利方向，不触发。（English: daily-drop alert for long holdings — a daily decline
@@ -2100,9 +2158,9 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 		// 做多：仍有做多信号→持有(降级提示)；无→硬止盈。做空：仍有做空信号→持有；无→硬止盈。
 		// English: take-profit line hit — with a same-direction signal keep holding (downgraded hint),
 		// otherwise issue a hard take-profit alert.
-		if pos.TakeProfitPct > 0 && pnl >= pos.TakeProfitPct {
+		if pos.TakeProfitPct > 0 && pnl >= effTP {
 			alertType, action := "止盈", "止盈"
-			reason := fmt.Sprintf("盈亏%.2f%% 触及止盈%.0f%%", pnl, pos.TakeProfitPct)
+			reason := fmt.Sprintf("盈亏%.2f%% 触及止盈%.0f%%%s", pnl, effTP, offNote)
 			keepSig := hasBear // 做空：有做空信号继续持有
 			if !isShort {
 				keepSig = hasBull // 做多：有做多信号继续持有
@@ -2110,9 +2168,9 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 			if keepSig {
 				alertType, action = "提示", "关注"
 				if isShort {
-					reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%% 但仍有做空信号,建议持有观察", pnl, pos.TakeProfitPct)
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%%%s 但仍有做空信号,建议持有观察", pnl, effTP, offNote)
 				} else {
-					reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%% 但仍有做多信号,建议持有观察", pnl, pos.TakeProfitPct)
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%%%s 但仍有做多信号,建议持有观察", pnl, effTP, offNote)
 				}
 			}
 			alerts = append(alerts, Signal{
@@ -2138,9 +2196,9 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 		// (half-position auto-exit); an adverse signal OR a deep breach (-2× the line) forces a hard
 		// full close. The sell side auto-executes these levels (trim/close), replacing the old
 		// "downgrade to watch" that only reminded without acting (the "held days at -13% never sold" bug).
-		if pos.StopLossPct > 0 && pnl <= -pos.StopLossPct {
+		if pos.StopLossPct > 0 && pnl <= -effSL {
 			alertType, action := "止损", "止损"
-			reason := fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%", pnl, pos.StopLossPct)
+			reason := fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%%s", pnl, effSL, offNote)
 			// 是否出现对持仓不利的确认信号（决定直接全清）
 			// English: whether an adverse confirmation is present (decides a hard full close).
 			hard := false
@@ -2149,17 +2207,20 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 			} else {
 				hard = hasBear // 做多止损：出现做空(利空)信号→硬止损
 			}
-			// 深度破位兜底：浮亏达到 2×止损线时无论有无确认一律全清（防止阴跌钝刀割肉）。
-			// English: deep-breach backstop — at 2× the stop line, close regardless of confirmation.
-			if !hard && pnl <= -2*pos.StopLossPct {
+			// 深度破位兜底：浮亏达到 2×**有效**止损线时无论有无确认一律全清（防止阴跌钝刀割肉）。
+			// 以有效止损为基准而非配置值：止损已从 6% 放宽到 9% 时，深破线应是 18% 而不是 12%——
+			// 否则"放宽止损"刚生效就被深破线反噬（双重放宽变双重收紧，owner 诉求被架空）。
+			// English: the deep-breach backstop uses the EFFECTIVE stop, otherwise loosening 6%→9%
+			// would be immediately undone by a 12% deep-breach line.
+			if !hard && pnl <= -2*effSL {
 				hard = true
 			}
 			if !hard {
 				alertType, action = "减仓", "卖出"
 				if isShort {
-					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未现利好确认,先减半仓控制风险", pnl, pos.StopLossPct)
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%%%s 未现利好确认,先减半仓控制风险", pnl, effSL, offNote)
 				} else {
-					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未现利空/做空信号,先减半仓控制风险", pnl, pos.StopLossPct)
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%%%s 未现利空/做空信号,先减半仓控制风险", pnl, effSL, offNote)
 				}
 			}
 			alerts = append(alerts, Signal{

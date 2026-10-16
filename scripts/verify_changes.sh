@@ -2632,14 +2632,15 @@ echo "ok - §CKPT-PRUNE 守卫通过（dry-run 锁 2 + 格式/双拒门锁 3 + �
 #   退出码照样 0、照样打 done，退役却根本没发生——故本段除脚本自身的顺序锁外，另钉调用点与探针。
 echo ""
 echo "==> 77 §C-OPS 运维安全阀..."
-for ps in decommission_qmt_mock rotate_qmt_token; do
+for ps in decommission_qmt_mock rotate_qmt_token quant_lifecycle; do
 	grep -q "ps1_bom deploy/qmt-win/${ps}.ps1" scripts/deploy_guangzhou.sh \
 		|| { echo "--- FAIL: deploy/qmt-win/${ps}.ps1 不在 ps1_bom 清单（现网 PowerShell 按 ANSI 读，中文注释吞语法）"; exit 1; }
 	grep -qE "^[^#]*\\\$SCP [^|;]*deploy/qmt-win/${ps}\.ps1" scripts/deploy_guangzhou.sh \
 		|| { echo "--- FAIL: ${ps}.ps1 未被上传命令带走（归一好却进不了现网=探针永远红）"; exit 1; }
 done
-# 两个 .ps1 的仓库字节形态：恰好一个 UTF-8 BOM 在文件头（§BOM-REPO：重复归一 = 现网解析炸）。
-python3 - deploy/qmt-win/decommission_qmt_mock.ps1 deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || { echo "--- FAIL: 运维 .ps1 的 BOM 字节不符（必须恰好一个 UTF-8 BOM 在文件头）"; exit 1; }
+# 三个 .ps1 的仓库字节形态：恰好一个 UTF-8 BOM 在文件头（§BOM-REPO：重复归一 = 现网解析炸）。
+# §LIFECYCLE（2026-10-16）第三个入列：它含中文注释且会真删数据，BOM 与清单两条腿都不能少。
+python3 - deploy/qmt-win/decommission_qmt_mock.ps1 deploy/qmt-win/rotate_qmt_token.ps1 deploy/qmt-win/quant_lifecycle.ps1 <<'PY' || { echo "--- FAIL: 运维 .ps1 的 BOM 字节不符（必须恰好一个 UTF-8 BOM 在文件头）"; exit 1; }
 import sys
 for p in sys.argv[1:]:
     raw = open(p, 'rb').read()
@@ -7460,6 +7461,21 @@ LN110B=$(ln110 scripts/verify_deploy_guangzhou.sh 'foreach ($krName in @($SvcTas
 eq110 deploy/qmt-win/service_definitions.ps1 '$SvcTaskEnsureRestore' 3 '新任务在单源出现三处（声明 + roster + 新鲜度规则）；两处＝补了名单没定阈值或反之'
 eq110 deploy/qmt-win/service_definitions.ps1 'MaxAgeHours = 96' 1 '工作日 08:40 任务的阈值是 96h（周末合法间隔 72h + 一天），不统一抄每日任务的 30'
 eq110 deploy/qmt-win/service_definitions.ps1 'MaxAgeHours = 30' 3 '每日任务阈值 30h 恰三处（快照/日志清理/盘后保活）；加第四条每日任务要连同本枚预演数一起改，别把锁改松'
+# §LIFECYCLE（2026-10-16）新任务同族成对锁（与上面 QMT-Ensure-Restore-0840 那枚逐字同构）：
+# 声明 / 进名单 / 定阈值三处成对——"补了名单没定阈值"这类半途状态当场红，不等 F2 集合腿算差集。
+# 阈值 168h 按它自己的触发日历算（周日 05:30 ⇒ 本周日 05:30 到下周日 05:29 恰一周）；
+# 抄每日任务的 30 会让它在头六天判红（§107 DRILL-C：永远红的锁等于没有锁）。
+eq110 deploy/qmt-win/service_definitions.ps1 '$SvcTaskLifecycle' 3 '数据生命周期任务在单源出现三处（声明 + roster + 新鲜度规则）；两处＝补了名单没定阈值或反之'
+eq110 deploy/qmt-win/service_definitions.ps1 'MaxAgeHours = 168' 1 '周日 05:30 任务的阈值是 168h（恰好一周），不统一抄每日任务的 30'
+# 注册侧三枚（同 §KA-TASKREG 家族：开关在位 / 预演读数 / 注册语句唯一且任务名取单源变量）
+# + 一枚顺序锁（开关必须早于 /Create——先给人看预演读数、再动现网的次序不能反）。
+eq110 deploy/qmt-win/register_engine_services.ps1 '[switch]$RegisterLifecycleTask' 1 '§LIFECYCLE 注册开关在位（§0929OPS-⑪：schtasks /Create 属现网特权变更，缺省只预演）'
+eq110 deploy/qmt-win/register_engine_services.ps1 'LIFECYCLE name=' 1 '预演读数行在位（绿也要看得到现网到底存着哪条动作行）'
+eq110 deploy/qmt-win/register_engine_services.ps1 'schtasks /Create /F /SC WEEKLY /D SUN /ST 05:30 /TN $SvcTaskLifecycle' 1 '注册语句唯一且任务名取单源变量（写死任务名＝与第 32 探针脱钩的第二本账）'
+CNT110=$((CNT110 + 1))
+LP_SW110=$(ln110 deploy/qmt-win/register_engine_services.ps1 'if ($RegisterLifecycleTask) {')
+LP_CR110=$(ln110 deploy/qmt-win/register_engine_services.ps1 'schtasks /Create /F /SC WEEKLY /D SUN /ST 05:30 /TN $SvcTaskLifecycle')
+[ "$LP_SW110" -gt 0 ] && [ "$LP_CR110" -gt 0 ] && [ "$LP_SW110" -lt "$LP_CR110" ] || { echo "--- FAIL: §110 先后顺序锁 ${CNT110}（开关@${LP_SW110} 必须早于 /Create@${LP_CR110}：先读预演读数再动手，次序反了＝没给人看就改了现网）"; exit 1; }
 CNT110=$((CNT110 + 1))
 sed -n '/^judge_task_roster()/,/^}/p' scripts/verify_deploy_guangzhou.sh > /tmp/w3_jtr_region_110.sh
 AWKRULE=$(grep -cF -- '$age > $rule' /tmp/w3_jtr_region_110.sh || true)

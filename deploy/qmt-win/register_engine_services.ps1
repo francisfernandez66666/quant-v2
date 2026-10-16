@@ -62,6 +62,13 @@ param(
     #   正是 09-16 根因（裸 python ⇒ 天天 127 静默失败）的复刻风险。
     #   所以按 §0929OPS-⑪ 运维脚本纪律：预演读数给 owner 当面看过，再带开关执行。
     [switch]$RegisterKeepaliveTask,
+    # §LIFECYCLE（2026-10-16）：周数据生命周期治理任务的**注册开关**，纪律同 §KA-TASKREG：
+    #   缺省不开＝只打印预演读数（现网任务状态 + 动作行 + 将要写入的动作行），一个字节都不动。
+    #   为什么同样用开关而不是像 Quant-Log-Prune 那样直接 /Create /F：Quant-Lifecycle 的
+    #   执行体 quant_lifecycle.ps1 会做**真删数据**的四步（stale ckpt 修剪/jsonl 删原件/
+    #   restic forget --prune/WAL checkpoint），虽然每步都有工具自护门与幂等设计，但注册
+    #   一条会自己动手的周任务仍属现网特权变更——预演读数给 owner 当面看过，再带开关执行。
+    [switch]$RegisterLifecycleTask,
     [string]$NSSMUrl = "https://nssm.cc/release/nssm-2.24.zip"
 )
 $ErrorActionPreference = "Stop"
@@ -108,6 +115,9 @@ if (Test-Path $svcDefsFile) {
     $SvcKeepaliveDailyAt = "17:10"
     $SvcKeepalivePythonExe = "C:\Python312\python.exe"
     $SvcKeepaliveScript = "C:\opt\quant\dataload_keepalive.py"
+    # §LIFECYCLE（2026-10-16）同族回退：回退字面量与 service_definitions.ps1 单源同值，
+    # 由 verify_changes.sh §110 F2 派生集合等值腿逐项钉住。
+    $SvcTaskLifecycle = "Quant-Lifecycle"
     $SvcKeepaliveLog = "C:\opt\quant\dataload_keepalive.log"
 }
 
@@ -493,6 +503,83 @@ if ($RegisterKeepaliveTask) {
     Info ("SKIP-CREATE 缺省只预演（§0929OPS-⑪ 现网特权变更须 owner 当面看读数）：确认无误后加 -RegisterKeepaliveTask 重跑")
 }
 
+# ── 6c. §LIFECYCLE（2026-10-16）：周日 05:30 数据生命周期治理任务注册入口 ──────────────────
+# 与 §6b 完全同构的三段式（单源在 service_definitions.ps1：$SvcTaskLifecycle）：
+#   ① 缺省只预演——打印现网任务态 / 现有动作行 / 本脚本将写入的动作行三行读数；
+#   ② -RegisterLifecycleTask 才 schtasks /Create /F；③ 装完回读动作行与写入值归一化比对。
+# 前提缺失（执行体 quant_lifecycle.ps1 不在 $PSScriptRoot）＝09-16 keepalive 的失效形态
+# （任务在位、每周触发、执行体起不来、日志一行不写）⇒ 计数进 $lcMissing，开关态下判非零。
+$lcMissing = @()
+$lcScript = Join-Path $PSScriptRoot "quant_lifecycle.ps1"
+$lcTr = "powershell -NoProfile -ExecutionPolicy Bypass -File $lcScript"
+$lcState = "absent"
+$lcExistingAction = ""
+schtasks /Query /TN $SvcTaskLifecycle 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    $lcState = "present"
+    try {
+        $lcObj = Get-ScheduledTask -TaskName $SvcTaskLifecycle -ErrorAction Stop
+        foreach ($lcA in $lcObj.Actions) {
+            if ($lcA.Execute) {
+                $lcOne = [string]$lcA.Execute
+                if ($lcA.Arguments) { $lcOne = $lcOne + " " + [string]$lcA.Arguments }
+                if ($lcExistingAction) { $lcExistingAction = $lcExistingAction + " || " + $lcOne }
+                else { $lcExistingAction = $lcOne }
+            }
+        }
+    } catch {
+        $lcExistingAction = "unreadable:" + $_.Exception.GetType().Name
+    }
+}
+if (-not (Test-Path -LiteralPath $lcScript)) {
+    $lcMissing += "lifecycle:script-missing(查 deploy_guangzhou.sh scp 清单：quant_lifecycle.ps1)"
+}
+Info ("LIFECYCLE name=" + $SvcTaskLifecycle + " state=" + $lcState +
+      " schedule=weekly@SUN-05:30 ru=SYSTEM" +
+      " script_exists=" + $(if (Test-Path -LiteralPath $lcScript) { $true } else { $false }) +
+      " switch=" + $(if ($RegisterLifecycleTask) { "on" } else { "off(仅预演)" }))
+Info ("  existing_action=" + $(if ($lcExistingAction) { $lcExistingAction } else { "-" }))
+Info ("  proposed_action=" + $lcTr)
+if ($RegisterLifecycleTask) {
+    if ($lcMissing.Count -gt 0) {
+        Warn ("带 -RegisterLifecycleTask 但前提缺失，**不创建也不覆盖** -> " + ($lcMissing -join ","))
+    } else {
+        # MultipleInstancesPolicy 保持 schtasks 缺省 IgnoreNew：手工触发一次即等价本周收工，
+        # 周日 05:30 不会与手工触发的在场实例双开（与 §6b 同口径，不显式改）。
+        schtasks /Create /F /SC WEEKLY /D SUN /ST 05:30 /TN $SvcTaskLifecycle /TR $lcTr /RU SYSTEM /RL HIGHEST | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Warn ("schtasks /Create 失败 rc=" + $LASTEXITCODE + "（任务名 " + $SvcTaskLifecycle +
+                  "；需管理员会话，且 /TR 上限 259 字符）")
+            $lcMissing += "lifecycle:create-failed"
+        } else {
+            Ok ("task " + $SvcTaskLifecycle + " created (weekly SUN 05:30, SYSTEM)")
+            # 装完真读一次（§装入口必须真拨一次）：回读动作行与写入值归一化比对，不一致＝
+            # schtasks 把 /TR 改写/截断过，当场点名而不是等周日凌晨才发现任务里存着起不来的命令。
+            $lcAfter = ""
+            try {
+                $lcObj2 = Get-ScheduledTask -TaskName $SvcTaskLifecycle -ErrorAction Stop
+                foreach ($lcB in $lcObj2.Actions) {
+                    if ($lcB.Execute) {
+                        $lcOne2 = [string]$lcB.Execute
+                        if ($lcB.Arguments) { $lcOne2 = $lcOne2 + " " + [string]$lcB.Arguments }
+                        if ($lcAfter) { $lcAfter = $lcAfter + " || " + $lcOne2 } else { $lcAfter = $lcOne2 }
+                    }
+                }
+            } catch { $lcAfter = "unreadable:" + $_.Exception.GetType().Name }
+            $lcNorm = { param($x) (($x -replace '"', '') -replace '\s+', ' ').Trim() }
+            if ((& $lcNorm $lcAfter) -ne (& $lcNorm $lcTr)) {
+                Warn ("回读动作行与写入值不一致（schtasks 改写/截断？）read=" + $lcAfter)
+                $lcMissing += "lifecycle:readback-mismatch"
+            } else {
+                Ok "readback ok（现网存的动作行＝预演打印的那条，未回显任何凭据）"
+            }
+        }
+    }
+} else {
+    Info ("缺省只预演（§0929OPS-⑪ 同 §6b 口径）：确认无误后加 -RegisterLifecycleTask 重跑；" +
+          "任务名册/新鲜度阈值的单源在 service_definitions.ps1（第 32 探针按它判红绿）")
+}
+
 # ── 7. §N-5 收尾：服务运行环境键名存在性断言（缺键即 Warn + 非零退出，降级不得报成功）────
 # 硬规矩：**只断言键名、绝不回显值**——本段以及它调用的 Get-ExistingEnvExtra 的输出里
 #   任何时候出现密钥明文都算事故。所以这里比对的集合只有键名，Warn 也只拼键名。
@@ -569,6 +656,13 @@ Ok "服务 env 键名断言通过：quant 5 硬键 + quant-research 3 硬键在�
 if ($kaMissing.Count -gt 0) {
     Warn ("§KA-TASKREG 部署判失败 -> " + ($kaMissing -join ", ") +
           "；排查：python 绝对路径/脚本落盘位/是否管理员会话（详见上方 KA_TASK 三行读数）")
+    exit 1
+}
+# §LIFECYCLE 同口径收尾：创建失败／前提缺失／回读不一致都是真缺；但**开关未开不是缺**
+#（那本就是缺省态，判红会让每一次常规服务注册都红——§107 DRILL-C 同族）。
+if ($lcMissing.Count -gt 0) {
+    Warn ("§LIFECYCLE 部署判失败 -> " + ($lcMissing -join ", ") +
+          "；排查：quant_lifecycle.ps1 是否随部署落在 $PSScriptRoot / 是否管理员会话 / /TR 字符上限")
     exit 1
 }
 Ok "engine services registered. Verify: Get-Service $SvcNameQuant,$SvcNameResearch,$SvcNamePydata ; schtasks /Query /TN $SvcTaskQmtctl ; 网关守护腿见 service_definitions.ps1（$SvcTaskGatewayEnsure/$SvcTaskGatewayLogon，register_service.ps1 注册）"

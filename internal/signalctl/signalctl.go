@@ -64,6 +64,9 @@ const (
 	StageSectorBlack   = "sector_blacklist" // 板块黑名单
 	StageConfirm       = "confirm"          // 持续性确认窗
 	StagePassthrough   = "passthrough"      // 非买入/开仓信号直通（提醒、卖出、watch）
+	// StageSizing §DYN-SIZE 动态仓位硬拦（情绪冰点 / 风险档Red / 个股LLM利空且风险档≥Yellow /
+	// 连续止损熔断 / 长假前最后一日禁开仓）：命中即把买入降级为 hold，不进金额连乘。
+	StageSizing = "sizing"
 )
 
 // Decision 单信号单通道裁定。留痕结构体（Recent 环形缓冲与 HTTP 端点共用形状）。
@@ -80,6 +83,17 @@ type Decision struct {
 	Reason   string    `json:"reason,omitempty"` // block/hold 必填
 	Shadow   bool      `json:"shadow,omitempty"` // true=影子命中（会拦但未拦，新行为观察期）
 	At       time.Time `json:"at"`
+	// BuyScale §DYN-SIZE 动态仓位缩放系数（>0 才写入；P0 阶段恒不写=零行为变更）。
+	// 执行层金额 = 基准金额 × BuyScale。1.0 不写（omitempty 不省 1.0，故显式只在 !=1 时赋值）。
+	// English: §DYN-SIZE applied buy scale (written only when non-trivial); amount = base × BuyScale.
+	BuyScale float64 `json:"buy_scale,omitempty"`
+	// SizingReasons §DYN-SIZE 命中的定权/加权因子（买入侧"情绪相位×0.50"这类；卖出侧
+	// 卖出加权的触发条件"风险档=Red"这类），供前端 tooltip 与复盘。
+	// English: the sizing / sell-boost factors that fired, for the UI tooltip and post-trade review.
+	SizingReasons []string `json:"sizing_reasons,omitempty"`
+	// SellBoost §DYN-SIZE 卖出加权档位（L1/L2/L3；空=未命中）。由卖出裁决 JudgeSell 消费并回填。
+	// English: the sell-boost tier (L1/L2/L3; empty = not fired), consumed by JudgeSell.
+	SellBoost string `json:"sell_boost,omitempty"`
 }
 
 // Policy 单通道准入策略快照（由流程引擎每轮装配下发；控制器不读配置文件、不持 Manager）。
@@ -99,6 +113,11 @@ type Policy struct {
 	// Discipline 持续性参数（探针+确认窗；低置信 BuyConfirmMin 分钟 / 高置信 BuyConfirmHighSec 秒；
 	// 两窗均 ≤0 = 关闭持续性监测，买入直通——与旧 paper discipline 缺省语义一致）。
 	Discipline config.DisciplineConfig
+	// Regime §DYN-SIZE 市场环境快照（引擎每轮装配，见 regime.go）。零值时全部因子弃权 →
+	// 合成恒返回 Scale=1.0（基准态反证），故旧装配点不注入 Regime 也不会改变行为。
+	// English: §DYN-SIZE market-regime snapshot. A zero value abstains on every factor, so the
+	// synthesis returns Scale=1.0 — legacy assembly points that don't inject it keep zero change.
+	Regime Regime
 }
 
 // probeKey 持续性探针状态键：(通道, 账号, 战法键, 代码)。
@@ -348,6 +367,7 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 	highWin := time.Duration(disc.BuyConfirmHighSec) * time.Second
 	// 两窗均未配置 → 关闭持续性监测，买入直接放行（与旧 paper discipline 缺省语义一致）。
 	if lowWin <= 0 && highWin <= 0 {
+		c.applySizing(&d, sig, pol) // §DYN-SIZE（Enabled=false 时零操作）
 		return d
 	}
 	// 探针键含通道+账号+战法键+代码，多账号/双通道确认态互不干扰。
@@ -383,7 +403,47 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 	c.mu.Lock()
 	delete(c.probes, key) // 确认通过，清除探针（下单/撮合由执行层幂等键兜底重复）
 	c.mu.Unlock()
+	c.applySizing(&d, sig, pol) // §DYN-SIZE（Enabled=false 时零操作）
 	return d
+}
+
+// applySizing §DYN-SIZE：买入信号放行前叠加动态仓位合成。
+//
+//   - Enabled=false（P0/出厂默认）→ **立即返回**，连留痕都不写：零行为变更；
+//   - Shadow=true（灰度期）→ 合成照算但不下发，仅标注 Decision.Shadow/SizingReasons 供观察；
+//   - 硬拦命中 → 降级为 hold（StageSizing），返回 true 表示调用方应直接返回；
+//   - 缩放非 1.0 → 写 BuyScale + SizingReasons（执行层金额 = 基准 × BuyScale）。
+//
+// English: §DYN-SIZE — applied before a buy is released. Disabled → immediate no-op (zero change);
+// shadow → annotate only; hard block → downgrade to hold; otherwise attach the scale and reasons.
+func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Policy) bool {
+	cfg := pol.Regime.SizeCfg
+	if !cfg.Enabled {
+		return false // P0/未启用：零行为变更
+	}
+	res := ComputeSizing(pol.Regime, sig)
+	if cfg.ShadowOn() {
+		// 影子模式：只留痕不改裁定（灰度观察期，先积累"会缩到多少"的分布再决定是否真拨）。
+		if res.Downgrade || res.Scale != 1.0 {
+			d.Shadow = true
+			d.SizingReasons = res.Reasons
+			if res.Downgrade {
+				d.SizingReasons = append([]string{"[shadow]拟降级"}, res.Reasons...)
+			}
+		}
+		return false
+	}
+	if res.Downgrade {
+		d.Verdict, d.Stage = VerdictHold, StageSizing
+		d.Reason = "动态仓位硬拦(" + strings.Join(res.Reasons, "+") + ")"
+		c.record(*d)
+		return true
+	}
+	if res.Scale != 1.0 {
+		d.BuyScale = res.Scale
+		d.SizingReasons = res.Reasons
+	}
+	return false
 }
 
 // blockOrShadow 影子模式：命中留痕但裁定 pass（新行为观察期用，方案 §八）。

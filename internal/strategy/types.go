@@ -170,19 +170,41 @@ type ExitContext struct {
 	// bars are missing); ATRStopMult is the stop multiplier (≤0 = disabled, fall back to fixed percent).
 	ATR         float64 // 标的当前 ATR（通常 ATR14，缺日K时为 0）
 	ATRStopMult float64 // ATR 止损倍数（≤0 表示未启用、回退固定百分比）
+
+	// MarketStopOffsetPct §DYN-SIZE P5 大盘两态偏移（百分点，叠加在 ATR/固定止损之上）：
+	// >0 = 大盘单日冲击 → 放宽止损；<0 = 趋势破位 → 收紧。0 = 不适用（默认，与改造前逐字一致）。
+	// 由引擎用 combat_agent.ComputeStopOffsets 解析后注入——战法层不自己拉大盘（纯逻辑）。
+	// English: §DYN-SIZE P5 two-state market offset in percentage points, stacked on top of the
+	// ATR/fixed stop (>0 loosens on a single-day shock, <0 tightens on a broken trend); 0 = not
+	// applicable (default, byte-identical to the pre-change behavior).
+	MarketStopOffsetPct float64
 }
 
 // ATRStopPct 返回本持仓的有效止损亏损百分比（相对成本）：
 // ATRStopMult>0 且 ATR>0 时返回 ATR×mult/成本×100（动态 ATR 止损），否则返回 fallbackPct（固定百分比）。
+//
+// §DYN-SIZE P5：最后叠加 `MarketStopOffsetPct`（大盘两态偏移）——放宽时止损线更远、收紧时更近。
+// 钳到 (0, 100] 区间：偏移不得把止损推到成本价以下（负止损 = 下一轮必卖）或超过 100%。
 // English: returns this position's effective stop-loss loss percent (vs cost): ATR×mult/cost×100 when
-// ATR stopping is active (ATRStopMult>0 and ATR>0), else the fixed fallbackPct.
+// ATR stopping is active (ATRStopMult>0 and ATR>0), else the fixed fallbackPct. §DYN-SIZE P5 stacks
+// the market offset on top, clamped to (0, 100].
 func (c *ExitContext) ATRStopPct(fallbackPct float64) float64 {
+	base := fallbackPct
 	if c.ATRStopMult > 0 && c.ATR > 0 && c.CostPrice > 0 {
 		if atrPct := c.ATR * c.ATRStopMult / c.CostPrice * 100; atrPct > 0 {
-			return atrPct
+			base = atrPct
 		}
 	}
-	return fallbackPct
+	if c.MarketStopOffsetPct != 0 {
+		base += c.MarketStopOffsetPct
+		if base <= 0 {
+			base = 0.5 // 钳制：偏移不得制造"必卖"（配置异常时的安全侧）
+		}
+		if base > 100 {
+			base = 100
+		}
+	}
+	return base
 }
 
 // KLine 简化的 K 线数据结构（用于退出评估）。（KLine is a simplified bar used for exit evaluation.）

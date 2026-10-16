@@ -1037,7 +1037,7 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// 控制器准入（白名单/黑名单/持续性确认），本引擎只负责撮合执行。
 		// English: the in-engine buy-confirm state machine moved to the signal controller; signals
 		// reaching here are already admitted — pure execution.
-		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, false); err != nil {
+		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, s.SizeScale, false); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 			// 订单留痕：买入被拒（现金不足/超上限/池上限/买不起一手）。
 			// English: order audit — the buy was rejected (cash short / cap / pool cap / can't afford a lot).
@@ -1164,7 +1164,7 @@ func (e *Engine) poolPositionCountLocked(poolKey string) int {
 // each other. qty > 0 is an explicit lot count (manual buy/add, fails when exceeding the pool balance);
 // qty <= 0 auto-sizes to FixedAmount in whole lots, shrinking to the largest affordable lot on a
 // shortfall (skipping below one lot).
-func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string, confidence float64, manual bool) error {
+func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string, confidence, sizeScale float64, manual bool) error {
 	// 每池持仓上限（与全局上限解耦，可自定义）：该池新开仓达到池上限即拒绝。
 	// 池上限 0 = 该池不单独设限；加仓（已持仓）不在此路径（走 addToPositionLocked）。
 	// English: per-pool position cap (decoupled from the global cap, customizable) — a new open in this
@@ -1196,6 +1196,13 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		// English: Phase-4 IR-scaled sizing — the auto amount scales by the pool's reference IR
 		// (higher IR → larger per-trade budget, lower IR → smaller).
 		amount := e.cfg.FixedAmount * e.applyPoolIRLocked(poolKey)
+		// §DYN-SIZE 动态仓位缩放（signal.SizeScale，由信号控制器裁定后写回；0/1.0=不缩放）：
+		// 与 live 通道同源同值（方案 §5「通道一致」测试锁）。缩后仍走下方整手/现金降档。
+		// English: §DYN-SIZE buy scale written back by the signal controller (0/1.0 = no scaling),
+		// same value as the live leg; the lot/cash degradation below still applies afterwards.
+		if sizeScale > 0 && sizeScale != 1.0 {
+			amount *= sizeScale
+		}
 		qty = int(amount/price/100) * 100
 	}
 	if qty <= 0 {
@@ -1350,7 +1357,7 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 	if poolKey != "" {
 		reason = "手动模拟买入(归" + poolKey + ")"
 	}
-	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, reason, 1.0, true); err != nil {
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, reason, 1.0, 0, true); err != nil {
 		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
@@ -1421,7 +1428,7 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	if poolKey != "" {
 		reason = "手动模拟买入(归" + poolKey + ")"
 	}
-	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, reason, 1.0, true); err != nil {
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, reason, 1.0, 0, true); err != nil {
 		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err

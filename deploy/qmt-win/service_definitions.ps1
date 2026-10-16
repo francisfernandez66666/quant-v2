@@ -66,6 +66,14 @@ $SvcGatewayEnsureIntervalMin = 5
 $SvcTaskQmtctl          = "QMT-Ensure-Running"     # qmtctl 客户端守护（交互会话，每 10 分钟）
 $SvcQmtctlIntervalMin   = 10
 $SvcTaskLogPrune        = "Quant-Log-Prune"        # 日志清理（每日 07:30）
+# §LIFECYCLE（2026-10-16）：周数据生命周期治理任务（周日 05:30，SYSTEM）——nightly snapshot
+# 04:00 之后、周一开盘前。执行体 deploy/qmt-win/quant_lifecycle.ps1 四步：research_ckpts
+# stale prune（工具自护门）、verdicts jsonl gzip 归档、restic forget --keep-last、WAL
+# checkpoint。背景：C 盘 60G 实录 88% 满，trading.db 6.78G 经 freelist 实测无膨胀，
+# 治理=保留策略不是 VACUUM。注册体同 §KA-TASKREG 纪律：register_engine_services.ps1 §6c
+# 缺省只预演、-RegisterLifecycleTask 才动手；"有脚本无调度"是本仓第 N+1 个同族缺陷，
+# 所以名册/注册体/探针三段一次补齐，缺一段就回到同一个形态。
+$SvcTaskLifecycle       = "Quant-Lifecycle"        # 数据生命周期治理（每周日 05:30）
 # ⚠ 这一行原来的行尾注释写着"在跑"——那是**引用 RUNBOOK §1 的说法，不是读数**。
 #   2026-10-09 第 32 探针首拨实测按这个名字查＝present=0（这台机器上没有叫 `quant-all-wd` 的计划任务）。
 #   注释与现网不一致时以现网为准，并把不一致留在原地当证据（铲掉注释＝铲掉这次反证）。
@@ -124,7 +132,8 @@ $SvcTaskRoster = @(
     $SvcTaskAllWatchdog,
     $SvcTaskBackupSnap,
     $SvcTaskDataloadKeepAlive,
-    $SvcTaskEnsureRestore
+    $SvcTaskEnsureRestore,
+    $SvcTaskLifecycle
 )
 
 # ── 新鲜度规则（阈值按**触发周期**定，全仓只此一份）───────────────────────────────────
@@ -140,7 +149,11 @@ $SvcTaskFreshRules = @(
     [pscustomobject]@{ Name = $SvcTaskLogPrune;          MaxAgeHours = 30 },  # 每日 07:30 ⇒ 一天 + 余量
     [pscustomobject]@{ Name = $SvcTaskBackupSnap;        MaxAgeHours = 30 },  # 每日 04:00 ⇒ 与 §P0-B 标记阈值同数
     [pscustomobject]@{ Name = $SvcTaskDataloadKeepAlive; MaxAgeHours = 30 },  # 每日 17:10 ⇒ 一天 + 余量
-    [pscustomobject]@{ Name = $SvcTaskEnsureRestore;     MaxAgeHours = 96 }   # 工作日 08:40 ⇒ 周末 72h + 一天
+    [pscustomobject]@{ Name = $SvcTaskEnsureRestore;     MaxAgeHours = 96 },  # 工作日 08:40 ⇒ 周末 72h + 一天
+    # §LIFECYCLE（2026-10-16）：周日 05:30 ⇒ 合法最长间隔是本周日 05:30 到下周日 05:29＝168h 整，
+    #   取 168 不多不少——多给余量会让"没跑"拖到第二周才红，少给则每周七天里必有一天假红
+    #   （§107 DRILL-C：阈值按它自己的触发日历算，不抄现成值）。
+    [pscustomobject]@{ Name = $SvcTaskLifecycle;        MaxAgeHours = 168 }   # 每周日 05:30 ⇒ 恰好一周
 )
 # 非周期触发（ONLOGON / ONSTART）的任务**不进** $SvcTaskFreshRules：它们的上次运行时间由
 # "有没有人登录 / 机器有没有重启"决定，不由时钟决定。拿它判新鲜度＝在一台可以连续运行数周

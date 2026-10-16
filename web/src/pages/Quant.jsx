@@ -28,7 +28,7 @@ import { confirmDialog } from '../ui.jsx'
 // 每条腿各持一个守卫实例（代号序列独立：状态腿的慢响应不该拖委托腿作废）。
 import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 import { fmtCNY2 } from '../utils'
-import { verdictDisplay } from './quantVerdicts.js'
+import { verdictDisplay, sizingDisplay } from './quantVerdicts.js'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
@@ -1564,6 +1564,13 @@ export default function Quant() {
                 } },
               { colKey: 'code', title: '代码', width: 90 },
               { colKey: 'strategy', title: '战法', width: 120 },
+              // §DYN-SIZE 缩放/加权列：买入金额 = 基准 × buy_scale；卖出加权 = sell_boost 档位。
+              // 悬停看命中的定权/加权因子（sizing_reasons）。
+              { colKey: 'buy_scale', title: '缩放/加权', width: 110, cell: ({ row }) => {
+                  const s = sizingDisplay(row)
+                  if (!s.label) return <span style={{ color: 'var(--app-text-2)' }}>—</span>
+                  return <span title={s.tip}><Tag theme={s.theme} variant="light-outline">{s.label}</Tag></span>
+                } },
               { colKey: 'reason', title: '原因', cell: ({ row }) => <span title={row.reason}>{row.reason}</span> },
             ]}
           />

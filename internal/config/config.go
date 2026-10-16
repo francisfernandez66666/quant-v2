@@ -113,6 +113,12 @@ type Rules struct {
 	// English: research-product knobs — what to do with applied factor strategies whose fitted
 	// parameters were derived on a now-invalid price-adjustment basis.
 	Research ResearchConfig `json:"research"`
+	// §DYN-SIZE 动态仓位合成配置（docs/DYN_SIZE_FINAL_PLAN_20261016.md）：把"每笔买多少"从
+	// 固定金额改成由「个股信号 × 宏观事件 × 大盘情绪 × 节假日 × 个股波动率」合成的动态权重决定。
+	// 全部默认安全：Enabled=false 时 signalctl 零行为变更（只走 shadow 读数）。
+	// English: §DYN-SIZE dynamic position-sizing config. Safe by default — Enabled=false keeps every
+	// admission verdict unchanged (shadow readouts only).
+	Sizing SizingConfig `json:"sizing"`
 }
 
 // ResearchConfig §ADJ-BASIS-2（2026-09-23）研究战法库相关配置。目前只有一项：
@@ -1362,6 +1368,277 @@ type PositionConfig struct {
 	// daily change ≤ -threshold, a holding alert fires regardless of cost-based P/L (<=0 defaults to 5).）
 	// 持仓当日跌幅提醒阈值(%)
 	DailyDropAlertPct float64 `json:"daily_drop_alert_pct"`
+}
+
+// ── §DYN-SIZE 动态仓位合成配置 ──────────────────────────────────────────────────
+//
+// SizingConfig 动态仓位合成配置（docs/DYN_SIZE_FINAL_PLAN_20261016.md §4）。
+//
+// 分层合成（这是本方案的核心口径，勿改成纯连乘）：
+//
+//		BuyScale  = clamp( min( Π权重因子 , m_上限因子1 , m_上限因子2 , ... ) , Floor , Cap )
+//		Downgrade = 任一硬拦因子命中（情绪冰点 / 风险档Red / D1利空且风险档≥Yellow / 连续止损熔断）
+//
+//	  - 权重/倾向类（信号质量、Kelly、波动率、情绪、状态、风险档、宏观影响期/前瞻、节前、大盘跌幅、
+//	    LLM利空、广度）**乘性连乘 Π**——它们各自描述"这件事让仓位该多大"；
+//	  - 上限类（总仓位、权益回撤）各自算一个 0~1 乘子后**取 min**——它们描述"不能超过某条线"，
+//	    连乘会把同一风险（波动高与相关性高常是同一件事的投影）惩罚两次。
+//
+// 全部默认安全：Enabled=false 时 signalctl 不改变任何裁定（零行为变更）；Shadow=true 只留痕。
+// 零值字段一律由 WithDefaults 补出厂默认（存量配置零迁移）。
+//
+// English: §DYN-SIZE sizing config. Layered synthesis — weight/inclination factors multiply;
+// risk-cap factors each yield a 0..1 multiplier and the smallest wins. Safe by default:
+// Enabled=false leaves every verdict unchanged; WithDefaults fills every zero field.
+type SizingConfig struct {
+	// Enabled 总开关（默认 false = 零行为变更：合成照算但不下发，只走 shadow 读数）。
+	Enabled bool `json:"enabled"`
+	// Shadow 影子模式（默认 true）：合成结果只留痕/日志，不改变实际下单金额。
+	// nil 视为 true（与 Enabled 独立：Enabled=true 且 Shadow=true 时仍不下发，用于灰度）。
+	Shadow *bool `json:"shadow,omitempty"`
+	// Floor 合成缩放地板（默认 0.15）——任何利空叠加也不会把单笔仓位压到该值以下。
+	Floor float64 `json:"floor"`
+	// Cap 合成缩放上限（默认 1.15）——允许"进攻档"（比基准加仓）但设硬顶。
+	Cap float64 `json:"cap"`
+	// KellyLambda Fractional Kelly 系数 λ（默认 0.5，López de Prado 半凯利）。
+	KellyLambda float64 `json:"kelly_lambda"`
+	// KellyMinProb 最小优势概率（默认 0.52）：置信度低于此值视为"无优势"→固定 0.6 缩放。
+	KellyMinProb float64 `json:"kelly_min_prob"`
+	// VolTargetPct 个股波动率目标（ATR 占现价百分比，默认 2.0）：低波动股放大、高波动股缩小。
+	VolTargetPct float64 `json:"vol_target_pct"`
+	// VolClampLo/VolClampHi 波动率乘子限幅（默认 0.5 / 1.5）。
+	VolClampLo float64 `json:"vol_clamp_lo"`
+	VolClampHi float64 `json:"vol_clamp_hi"`
+	// EmotionScales 情绪相位映射（键：退潮/背离/高潮/发酵/启动；冰点走硬拦不进本表）。
+	EmotionScales map[string]float64 `json:"emotion_scales,omitempty"`
+	// StateScales 市场状态映射（键：bull/range/bear；状态机关闭时该因子弃权）。
+	StateScales map[string]float64 `json:"state_scales,omitempty"`
+	// TierScales 风险档金额权重（键：Yellow；Red 走硬拦不进本表）。
+	TierScales map[string]float64 `json:"tier_scales,omitempty"`
+	// MacroWindowScales 宏观影响期缩放（键：high/medium/low）。
+	MacroWindowScales map[string]float64 `json:"macro_window_scales,omitempty"`
+	// MacroLeadDays 事件前瞻交易日数（默认 5）：事件前 N 个交易日起渐进收仓。
+	MacroLeadDays int `json:"macro_lead_days"`
+	// MacroLeadCurve 前瞻曲线，下标 0 = 距事件 MacroLeadDays 个交易日（默认 [0.9,0.85,0.8,0.7,0.5]）。
+	MacroLeadCurve []float64 `json:"macro_lead_curve,omitempty"`
+	// MacroEventDayScale 事件当日（T日）缩放（默认 0.30）——与前瞻曲线尾部相接。
+	MacroEventDayScale float64 `json:"macro_event_day_scale"`
+	// HolidayScales 节前分级（键：weekend/small1/small2/long1/long2/long3，数字=节前第 N 个交易日）。
+	// 未加载日历（CalendarLoaded=false）时该因子**弃权**（绝不把"未知"当"普通日"）。
+	HolidayScales map[string]float64 `json:"holiday_scales,omitempty"`
+	// HolidayBlockNew 长假前最后一日禁止新开仓（默认 false，owner 风险偏好项）。
+	HolidayBlockNew *bool `json:"holiday_block_new,omitempty"`
+	// IndexScaleThresholds 大盘跌幅映射（键：-1 / -2 / deep，deep 表示 ≤-2% 档）。
+	IndexScaleThresholds map[string]float64 `json:"index_scale_thresholds,omitempty"`
+	// LLMBearishScale 个股 LLM 利空缩放（默认 0.5，首次接入买入侧）。
+	LLMBearishScale float64 `json:"llm_bearish_scale"`
+	// MaxTotalPositionPct 总仓位上限（默认 0.80；0=不启用）。接通既有死字段 Position.MaxTotalPositionPct。
+	MaxTotalPositionPct float64 `json:"max_total_position_pct"`
+	// MaxDrawdownPct 账户权益回撤熔断（默认 0.10；0=不启用）：回撤达此比例时按 pysystemtrade
+	// risk_overlay 口径缩仓（mult = limit/max(limit, drawdown)）。
+	MaxDrawdownPct float64 `json:"max_drawdown_pct"`
+	// StoplossGuardCount 连续止损熔断次数（默认 4；0=不启用）：回看窗内止损达该次数即硬拦新开仓。
+	StoplossGuardCount int `json:"stoploss_guard_count"`
+	// StoplossGuardWindowDays 连续止损回看窗（交易日，默认 1）。
+	StoplossGuardWindowDays int `json:"stoploss_guard_window_days"`
+	// SLOffsetPerPct 止损放宽系数（pt / 大盘每跌 1%，默认 3.0）：大盘 -2% → 止损下浮 3pt。
+	SLOffsetPerPct float64 `json:"sl_offset_per_pct"`
+	// SLOffsetCap 止损放宽上限（pt，默认 4.0）。
+	SLOffsetCap float64 `json:"sl_offset_cap"`
+	// TPOffsetPerPct 止盈上浮系数（pt / 大盘每跌 1%，默认 3.0）。
+	TPOffsetPerPct float64 `json:"tp_offset_per_pct"`
+	// TPOffsetCap 止盈上浮上限（pt，默认 5.0）。
+	TPOffsetCap float64 `json:"tp_offset_cap"`
+	// SLOffsetMinIndexDrop 触发止损放宽的大盘跌幅门槛（%，默认 1.0）。
+	SLOffsetMinIndexDrop float64 `json:"sl_offset_min_index_drop"`
+	// BearSLTightenPt 趋势破位时止损收紧（pt，默认 1.0）——两态判别中的"趋势下跌"腿。
+	BearSLTightenPt float64 `json:"bear_sl_tighten_pt"`
+	// SLOffsetRiskBudgetKeep 放宽止损强制同比例缩仓（默认 true）：止损 6%→9% ⇒ 仓位 ×6/9。
+	// 不缩仓等于股灾日把单笔最大亏损放大 50%（owner 已裁决强制）。
+	SLOffsetRiskBudgetKeep *bool `json:"sl_offset_risk_budget_keep,omitempty"`
+	// SellBoostLevel 卖出加权档位（L1/L2/L3，默认 L2）。
+	SellBoostLevel string `json:"sell_boost_level"`
+}
+
+// DefaultSizingConfig §DYN-SIZE 出厂默认（全部"安全侧"：总开关关、影子开）。
+// English: §DYN-SIZE factory defaults — master switch off, shadow on.
+func DefaultSizingConfig() SizingConfig {
+	return SizingConfig{
+		Enabled:                 false,
+		Floor:                   0.15,
+		Cap:                     1.15,
+		KellyLambda:             0.5,
+		KellyMinProb:            0.52,
+		VolTargetPct:            2.0,
+		VolClampLo:              0.5,
+		VolClampHi:              1.5,
+		EmotionScales:           map[string]float64{"退潮": 0.50, "背离": 0.60, "高潮": 0.80, "发酵": 1.00, "启动": 1.00},
+		StateScales:             map[string]float64{"bull": 1.00, "range": 0.70, "bear": 0.40},
+		TierScales:              map[string]float64{"Yellow": 0.60},
+		MacroWindowScales:       map[string]float64{"high": 0.50, "medium": 0.80, "low": 1.00},
+		MacroLeadDays:           5,
+		MacroLeadCurve:          []float64{0.90, 0.85, 0.80, 0.70, 0.50},
+		MacroEventDayScale:      0.30,
+		HolidayScales:           map[string]float64{"weekend": 0.85, "small1": 0.70, "small2": 0.85, "long1": 0.40, "long2": 0.60, "long3": 0.75},
+		IndexScaleThresholds:    map[string]float64{"-1": 1.00, "-2": 0.70, "deep": 0.40},
+		LLMBearishScale:         0.5,
+		MaxTotalPositionPct:     0.80,
+		MaxDrawdownPct:          0.10,
+		StoplossGuardCount:      4,
+		StoplossGuardWindowDays: 1,
+		SLOffsetPerPct:          3.0,
+		SLOffsetCap:             4.0,
+		TPOffsetPerPct:          3.0,
+		TPOffsetCap:             5.0,
+		SLOffsetMinIndexDrop:    1.0,
+		BearSLTightenPt:         1.0,
+		SellBoostLevel:          "L2",
+	}
+}
+
+// NormalizeLegacyTotalPosPct §DYN-SIZE P6：把既有死字段 `PositionConfig.MaxTotalPositionPct`
+// 归一化为**比例**（0~1]，供 `SizingConfig.MaxTotalPositionPct` 回落使用。
+//
+// 为什么需要归一化：该字段是历史遗留，校验只查 0~100（validate.go:85），而 `backtest_params.json`
+// 里写的是 0.8——两种写法都在"合法"区间内。若把 80 当比例传进 `totalPosCap`，`limit/max(limit,risk)`
+// 会恒等于 1.0（限额大到永远不约束），接了个寂寞。约定：>1 视为百分数，÷100。
+// 返回 0 表示"未设置"（调用方应回落到 `SizingConfig` 自己的默认 0.80）。
+// English: normalizes the legacy dead field to a ratio in (0,1]. The validator accepts 0..100 while
+// the shipped config writes 0.8, so both conventions are "legal"; a raw 80 would make the cap a
+// permanent no-op. Values >1 are therefore read as percentages. 0 means "unset".
+func NormalizeLegacyTotalPosPct(v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	if v > 1 {
+		return v / 100
+	}
+	return v
+}
+
+// ShadowOn 影子模式是否开启（nil = 默认 true）。
+// English: whether shadow mode is on (nil defaults to true).
+func (s SizingConfig) ShadowOn() bool { return s.Shadow == nil || *s.Shadow }
+
+// HolidayBlockNewOn 长假前最后一日是否禁止新开仓（nil = 默认 false）。
+// English: whether new opens are banned on the last trading day before a long holiday (nil = false).
+func (s SizingConfig) HolidayBlockNewOn() bool { return s.HolidayBlockNew != nil && *s.HolidayBlockNew }
+
+// RiskBudgetKeepOn 放宽止损是否强制同比例缩仓（nil = 默认 true）。
+// English: whether loosening the stop must shrink the position proportionally (nil = true).
+func (s SizingConfig) RiskBudgetKeepOn() bool {
+	return s.SLOffsetRiskBudgetKeep == nil || *s.SLOffsetRiskBudgetKeep
+}
+
+// SellBoostLevelOf 归一化卖出加权档位：返回 "L1"/"L2"/"L3"，空串表示**显式关闭**（"off"/"none"/"0"）。
+// 未识别值（含空串，若调用方未走 WithDefaults）→ 回退默认 "L2"。大小写不敏感、容忍空白。
+// English: normalizes the sell-boost tier to L1/L2/L3; an explicit off/none/0 disables it; any
+// unrecognized value falls back to the default L2.
+func (s SizingConfig) SellBoostLevelOf() string {
+	switch strings.ToUpper(strings.TrimSpace(s.SellBoostLevel)) {
+	case "L1", "L2", "L3":
+		return strings.ToUpper(strings.TrimSpace(s.SellBoostLevel))
+	case "OFF", "NONE", "NO", "0":
+		return ""
+	}
+	return "L2"
+}
+
+// WithDefaults 返回补齐出厂默认后的副本：所有数值字段 <=0 用默认，映射字段与默认**合并**
+// （用户只需覆盖关心的键），指针开关保持原样（由 ShadowOn/HolidayBlockNewOn/RiskBudgetKeepOn 解析）。
+// 引擎装配 Regime 时调用一次，signalctl 侧因此可直接读平字段、无需逐字段兜默认。
+// English: returns a copy with every zero numeric field defaulted and every map merged over the
+// defaults (callers override only the keys they care about); pointer switches are left for their
+// *On accessors. Called once by the engine when assembling the Regime snapshot.
+func (s SizingConfig) WithDefaults() SizingConfig {
+	d := DefaultSizingConfig()
+	out := s
+	if out.Floor <= 0 {
+		out.Floor = d.Floor
+	}
+	if out.Cap <= 0 {
+		out.Cap = d.Cap
+	}
+	if out.KellyLambda <= 0 {
+		out.KellyLambda = d.KellyLambda
+	}
+	if out.KellyMinProb <= 0 {
+		out.KellyMinProb = d.KellyMinProb
+	}
+	if out.VolTargetPct <= 0 {
+		out.VolTargetPct = d.VolTargetPct
+	}
+	if out.VolClampLo <= 0 {
+		out.VolClampLo = d.VolClampLo
+	}
+	if out.VolClampHi <= 0 {
+		out.VolClampHi = d.VolClampHi
+	}
+	out.EmotionScales = mergeScales(d.EmotionScales, out.EmotionScales)
+	out.StateScales = mergeScales(d.StateScales, out.StateScales)
+	out.TierScales = mergeScales(d.TierScales, out.TierScales)
+	out.MacroWindowScales = mergeScales(d.MacroWindowScales, out.MacroWindowScales)
+	out.HolidayScales = mergeScales(d.HolidayScales, out.HolidayScales)
+	out.IndexScaleThresholds = mergeScales(d.IndexScaleThresholds, out.IndexScaleThresholds)
+	if out.MacroLeadDays <= 0 {
+		out.MacroLeadDays = d.MacroLeadDays
+	}
+	if len(out.MacroLeadCurve) == 0 {
+		out.MacroLeadCurve = d.MacroLeadCurve
+	}
+	if out.MacroEventDayScale <= 0 {
+		out.MacroEventDayScale = d.MacroEventDayScale
+	}
+	if out.LLMBearishScale <= 0 {
+		out.LLMBearishScale = d.LLMBearishScale
+	}
+	if out.MaxTotalPositionPct <= 0 {
+		out.MaxTotalPositionPct = d.MaxTotalPositionPct
+	}
+	if out.MaxDrawdownPct <= 0 {
+		out.MaxDrawdownPct = d.MaxDrawdownPct
+	}
+	if out.StoplossGuardCount <= 0 {
+		out.StoplossGuardCount = d.StoplossGuardCount
+	}
+	if out.StoplossGuardWindowDays <= 0 {
+		out.StoplossGuardWindowDays = d.StoplossGuardWindowDays
+	}
+	if out.SLOffsetPerPct <= 0 {
+		out.SLOffsetPerPct = d.SLOffsetPerPct
+	}
+	if out.SLOffsetCap <= 0 {
+		out.SLOffsetCap = d.SLOffsetCap
+	}
+	if out.TPOffsetPerPct <= 0 {
+		out.TPOffsetPerPct = d.TPOffsetPerPct
+	}
+	if out.TPOffsetCap <= 0 {
+		out.TPOffsetCap = d.TPOffsetCap
+	}
+	if out.SLOffsetMinIndexDrop <= 0 {
+		out.SLOffsetMinIndexDrop = d.SLOffsetMinIndexDrop
+	}
+	if out.BearSLTightenPt <= 0 {
+		out.BearSLTightenPt = d.BearSLTightenPt
+	}
+	if strings.TrimSpace(out.SellBoostLevel) == "" {
+		out.SellBoostLevel = d.SellBoostLevel
+	}
+	return out
+}
+
+// mergeScales 把 override 覆盖到 base 之上（base 先拷贝，override 的键优先）；返回新映射，不改入参。
+// English: overlays override onto a copy of base (override wins); returns a fresh map.
+func mergeScales(base, override map[string]float64) map[string]float64 {
+	out := make(map[string]float64, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
 }
 
 // StrategyConfig 各策略的独立参数配置。

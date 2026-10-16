@@ -250,6 +250,13 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	exitSigs := e.combatAgent.CheckPositionsExits(e.rpt, exitQuotes, exitDayK, time.Now())
 	// 通用止盈/止损/当日跌幅提醒并入近实时通道（止损提醒延迟 ≤5s；消息中心按稳定键去重不重复）
 	// §R4-6：行情传 5s 快照（quotes），缺失的持仓才逐票兜底单查。
+	// §DYN-SIZE P5：先把本轮市场态注入战法代理——两态止损偏移（单日冲击放宽 / 趋势破位收紧）在
+	// CheckPositionAlerts 内解析。读数取自引擎侧 30s TTL 缓存，不额外打上游。
+	// §DYN-SIZE P6：先落当日权益点（日级去重，券商未回报则跳过），再装配 regime——否则本轮
+	// 装配出的权益回撤读的是昨天之前的序列，账户级 MaxDrawdown 上限永远慢一天。
+	e.recordDailyEquitySnapshot()
+	alertRegime := e.regimeForAccount(e.primaryMember())
+	e.combatAgent.SetMarketStopContext(alertRegime.SizeCfg, alertRegime.IndexChangePct, alertRegime.IndexTrendBroken)
 	alertSigs := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, quotes, scores, nil)
 	// 逐股卖点评估（利空D1/破MA5·MA20/放量派发/动量衰竭）：对打分池全量个股独立评估，仅提醒。
 	// 仅做多（shortEnabled=false）时非持仓个股不评估、不发减仓/清仓提醒（非持仓无从减仓，纯噪音）；
@@ -354,6 +361,9 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		// round — a signal is observed from the start of its confirm window and filled at the fresh snapshot
 		// price once confirmed (paper and live both benefit), removing whole-round "signal present, no quote" rejects.
 		e.ensureBuyQuotes(buys, quotes)
+		// §DYN-SIZE P3：登记本轮买入信号的质量分桶键 + 用本轮快照结算已到期的样本
+		// （Enhance.DynWeight 关闭时零操作）。放在分发之前——登记与准入看到同一批信号。
+		e.observeSignalQuality(buys, quotes, emotionPhase)
 		exitSell := append(append([]combat_agent.Signal{}, exitSigs...), alertSigs...)
 		e.paperSignals(buys, exitSell, quotes, roundSellMode)
 

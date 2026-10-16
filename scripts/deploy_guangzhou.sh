@@ -306,6 +306,15 @@ $SCP deploy/qmt-win/service_probe_config.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/
 # 必须入本清单——教训见 §ENH-5 quote_feed.py 漏列导致网关 ImportError 起不来）
 ps1_bom deploy/qmt-win/prune_logs.ps1
 $SCP deploy/qmt-win/prune_logs.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+# §LIFECYCLE（2026-10-16）：周数据生命周期治理执行体（周日 05:30：research_ckpts stale
+#   prune + verdicts jsonl 归档 + restic 保留 + WAL checkpoint）。落 ${DEPLOY_DIR}/qmt-win/
+#   ＝register_engine_services.ps1 §6c 的 $PSScriptRoot 解析位，与 prune_logs.ps1 同目录。
+#   注册体在 register §6c（-RegisterLifecycleTask 开关，缺省只预演——§0929OPS-⑪：schtasks
+#   /Create 属现网特权变更，不随部署自动发生）；本行只保证脚本字节与仓库同源，解决的是
+#   "修好的执行体躺在仓库、现网没有"（同族判例：§ENH-5 quote_feed.py、§P0-B backup_snapshot.ps1、
+#   §0927KA dataload_keepalive.py、§KA-TASKREG——每一次都是清单漏一行，纸面永远成立）。
+ps1_bom deploy/qmt-win/quant_lifecycle.ps1
+$SCP deploy/qmt-win/quant_lifecycle.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # §QMT-MOCK-DECOM + §QMT-TOKENROT（2026-09-23）：mock 退役脚本与 token 轮换脚本入清单。
 # 教训同 §ENH-5/§A5/§P0-B：deploy/qmt-win 新增 .ps1 必须随部署下发——否则"仓库里有、现网没有"，
 # RUNBOOK 照着写命令却找不到文件。decommission 由 [3d] 的显式开关执行；rotate 只上传不执行

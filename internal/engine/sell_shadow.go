@@ -98,7 +98,11 @@ func (e *Engine) runSellUnifiedJudge(
 		rows = append(rows, sellProbeRow{Code: p.TsCode, Name: p.Name, EntryPrice: p.CostPrice, HighPrice: p.HighestPrice})
 	}
 	feed := sellJudgeFeed{Scores: scores, D1Scores: d1Scores, BearReasons: bearReasons, PoolQuotes: exitQuotes, SnapQuotes: quotes}
-	verdicts := e.judgeSellPositions(signalctl.ChannelLive, account, rows, signalctl.Policy{Discipline: ctl.Config().Discipline}, feed, orDefault(mode, "shadow"))
+	// §DYN-SIZE P2：注入市场环境快照——卖出加权（情绪退潮/风险档/大盘≤-2%/节前/连续止损/宏观影响期）
+	// 从这里解析。未启用（出厂默认）时 ComputeSellBoost 立即返回 ""，裁决与改造前逐字一致。
+	// 与 paper 通道同源同值（方案 §5「通道一致」测试锁）。
+	pol := signalctl.Policy{Discipline: ctl.Config().Discipline, Regime: e.regimeForAccount(account)}
+	verdicts := e.judgeSellPositions(signalctl.ChannelLive, account, rows, pol, feed, orDefault(mode, "shadow"))
 	// 状态生命周期与持仓对齐（平仓即删，重新入场从零开始）。
 	held := make(map[string]bool, len(positions))
 	for _, p := range positions {
@@ -234,8 +238,13 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows [
 		if vr.Disposal != nil {
 			// shadow 模式下的处置只留痕；on 模式 live 侧经 autoExecuteRealSells 来源闸执行、
 			// paper 侧由 runPaperUnifiedJudge→ApplyUnifiedSell 执行。
-			log.Printf("[sell-judge:%s] %s(%s) 建议处置=%s 线=%s 盈亏=%.2f%% 理由=%s",
-				modeTag, row.Name, row.Code, vr.Disposal.Action, vr.Disposal.Line, vr.Disposal.PnlPct, vr.Disposal.Reason)
+			// §DYN-SIZE P2：加权档位单独打点（理由串里已有前缀，这里给结构化字段便于 grep 统计）。
+			boostTag := ""
+			if vr.Boost != "" {
+				boostTag = " 加权=" + vr.Boost
+			}
+			log.Printf("[sell-judge:%s] %s(%s) 建议处置=%s 线=%s 盈亏=%.2f%%%s 理由=%s",
+				modeTag, row.Name, row.Code, vr.Disposal.Action, vr.Disposal.Line, vr.Disposal.PnlPct, boostTag, vr.Disposal.Reason)
 		}
 	}
 	return verdicts

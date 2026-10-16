@@ -98,8 +98,51 @@ func TradingCalendarHealth() string {
 	stall := ""
 	if maxD < cntime.DayCompactOf(cntime.Now()) {
 		stall = "，覆盖未到今日（日历停更，今日暂按周末口径当交易日）"
+	} else if CalendarForwardCoverageDays() < calForwardCoverageMinDays {
+		// §DYN-SIZE P4 补强：覆盖到今日**不等于**够用。节前因子（长假分级 + 长假前最后一日禁开仓）
+		// 回答的是"未来那段休市有多长"——窗口若只到今日+3 天，国庆就整个看不见，`ClosedRun` 会
+		// 退化成 2（周末），长假因子**静默**变成"只能识别周末"。这与"停更"是两回事：停更时
+		// 覆盖根本没到今天，这里覆盖到了但看得不够远。
+		// English: covering today is not the same as covering far enough. The pre-holiday factor asks
+		// how long the NEXT closed run is; a window ending 3 days out cannot see a National Day break
+		// and silently degrades to "weekends only". That is distinct from a stalled calendar.
+		stall = fmt.Sprintf("，前向覆盖仅 %d 天（< %d 天，长假因子可能只识别到周末）",
+			CalendarForwardCoverageDays(), calForwardCoverageMinDays)
 	}
 	return fmt.Sprintf("交易日历已加载（休市日 %d 天，覆盖窗口 %s%s）", len(closedDays), calWindow, stall)
+}
+
+// calForwardCoverageMinDays 交易日历前向覆盖的最小自然日数（§DYN-SIZE P4 节前因子的前提）。
+//
+// 为什么是 15：最长的一档休市（国庆/春节连休）约 8~9 个自然日，节前因子还要在**休市开始前**
+// 就识别出来（`PreHolidayN` 1~3）。窗口末端距今日不足 15 天时，一段即将到来的长假可能整个落在
+// 窗口之外——那时 `ClosedRun` 只数得到周末，长假分级静默失效。15 天留出"假期本身 + 节前 2~3 个
+// 交易日"的余量。
+// English: the minimum forward coverage (natural days) the pre-holiday factor needs. The longest
+// break runs ~8-9 days and must be visible BEFORE it starts (PreHolidayN 1-3), so 15 days leaves
+// room for the break plus the 2-3 trading days leading into it.
+const calForwardCoverageMinDays = 15
+
+// CalendarForwardCoverageDays §DYN-SIZE P4：日历覆盖窗口末端距今日的自然日数（负数=覆盖未到今日）。
+// 未加载 / 窗口未知 → 返回 -1（调用方按"不可知"处理，不做正面判断）。
+// English: natural days from today to the calendar window's end; -1 when unknown/unloaded.
+func CalendarForwardCoverageDays() int {
+	calMu.RLock()
+	defer calMu.RUnlock()
+	if !calLoaded || calWindow == "" {
+		return -1
+	}
+	maxD := calWindow
+	if i := strings.LastIndexByte(calWindow, '~'); i >= 0 && i+1 < len(calWindow) {
+		maxD = calWindow[i+1:]
+	}
+	t, err := time.ParseInLocation("20060102", maxD, cntime.Loc)
+	if err != nil {
+		return -1
+	}
+	now := cntime.In(cntime.Now())
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	return int(t.Sub(today).Hours() / 24)
 }
 
 // RefreshTradingCalendar 拉取同花顺交易日历并推导休市日集合。

@@ -31,6 +31,25 @@ func macroEventsAt(now time.Time) []data.MacroEvent {
 	return data.GetActiveMacroEvents(macroEventsCache(now.Year()), now)
 }
 
+// ActiveMacroEventsAt §DYN-SIZE：对外暴露"当前处于影响期/临近"的宏观事件（含 P6 校准覆盖、按年缓存）。
+// 供流程引擎装配 Regime 快照消费（宏观影响期缩放 + 事件前瞻交易日距离），与宏门控共用同一份日历缓存。
+// English: §DYN-SIZE — exposes the active/near macro events (with the P6 calibrated override and the
+// per-year cache) so the flow engine can assemble the Regime snapshot, sharing the gate's calendar cache.
+func ActiveMacroEventsAt(now time.Time) []data.MacroEvent { return macroEventsAt(now) }
+
+// ActiveMacroEventsWithin §DYN-SIZE P4：同上，但**前瞻窗可配**（自然日跨度）。
+//
+// 定长 7 自然日窗（ActiveMacroEventsAt 的语义）在长假期前会漏事件：需求是"事件前 5 个**交易日**"
+// 渐进收仓，而这 5 个交易日跨一次国庆长假就是 ~14 个自然日——节前那几天前瞻曲线取不到任何事件。
+// 调用方按交易日历折算自然日跨度传入（data.TradingDaySpan）；窗放大是安全的，真正的降权判定
+// 仍在 signalctl.macroLeadFactor（按交易日距离查曲线）。
+// English: §DYN-SIZE P4 — same as ActiveMacroEventsAt but with a configurable forward window, so a
+// trading-day lead survives a long holiday; widening is safe since macroLeadFactor still gates on the
+// trading-day distance.
+func ActiveMacroEventsWithin(now time.Time, horizon time.Duration) []data.MacroEvent {
+	return data.GetActiveMacroEventsWithin(macroEventsCache(now.Year()), now, horizon)
+}
+
 // macroEventsCache 按年缓存宏观事件日历（跨年自动重建；并发安全）。§MARKET_RISK_GATE P6：并入进程级校准
 // 覆盖（真实 CPI/FOMC/交割日日期），并按校准代际号失效重建——每日重校准后版本号变化，缓存自动刷新。
 // English: per-year calendar cache (rebuilt on rollover; thread-safe). P6: merges the process-wide

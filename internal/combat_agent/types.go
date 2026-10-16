@@ -147,13 +147,27 @@ type Signal struct {
 	// 顶掉，展示层（trading.Advise）据本字段定帽，不再从 Reason 子串猜级别（§P4 缺陷3）。
 	// （SellLevel carries the structured sell-point severity for short mode, where AlertType is the
 	// direction word 做空; the display layer maps the cap from this field instead of reason substrings.）
-	SellLevel   string    `json:"sell_level,omitempty"`
-	Price       float64   `json:"price"`         // 触发价格
-	Confidence  float64   `json:"confidence"`    // 置信度（0~1）
-	ATR         float64   `json:"atr,omitempty"` // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
-	Reason      string    `json:"reason"`        // 信号生成原因
-	Sector      string    `json:"sector"`        // 所属板块
-	GeneratedAt time.Time `json:"generated_at"`  // 信号生成时间
+	SellLevel  string  `json:"sell_level,omitempty"`
+	Price      float64 `json:"price"`         // 触发价格
+	Confidence float64 `json:"confidence"`    // 置信度（0~1）
+	ATR        float64 `json:"atr,omitempty"` // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
+	// QualityWeight §DYN-SIZE 信号质量归一化权重（引擎由 research.SignalQualityTable.Weight 解析后填入，
+	// 1.0=中性、限幅 ±10%；0=未解析/功能关闭 → 定权合成时该维度弃权）。
+	// 非持久化（json:"-"）：它是每轮定权的**临时输入**，不应随信号固化/前端广播出去；
+	// 回测/复盘要复现定权请读 Decision 上的 sizing_reasons（已落留痕）。
+	// English: §DYN-SIZE normalized signal-quality weight resolved by the engine from
+	// SignalQualityTable.Weight (1.0 neutral, clamped ±10%); 0 = unresolved → that dimension abstains.
+	// Transient (json:"-") — a per-round sizing input, not part of the pinned/broadcast signal.
+	QualityWeight float64 `json:"-"`
+	// SizeScale §DYN-SIZE 动态仓位缩放系数（0=未定权/未启用；1.0 不写）。
+	// 由信号控制器裁定后写回，执行层（paper 撮合）金额 = 基准 × SizeScale。
+	// live 通道不经本字段——dispatchLive 直接把 Decision.BuyScale 传进 autoPlace。
+	// English: §DYN-SIZE buy scale written back by the signal controller; the paper fill multiplies
+	// the base amount by it. The live channel passes Decision.BuyScale into autoPlace directly.
+	SizeScale   float64   `json:"size_scale,omitempty"`
+	Reason      string    `json:"reason"`       // 信号生成原因
+	Sector      string    `json:"sector"`       // 所属板块
+	GeneratedAt time.Time `json:"generated_at"` // 信号生成时间
 
 	// StrategyID 战法库规则 ID（如 "fac_1"）。用于效果监测：把触发信号归属到具体已应用战法规则。
 	// 仅多规则战法（因子战法库）填充；其余战法为空。

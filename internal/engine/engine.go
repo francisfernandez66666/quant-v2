@@ -86,21 +86,47 @@ type Engine struct {
 	// maSlopeDay 记录已算交易日，跨日才重算；未注入源/取数失败时保持 NaN 弃权。
 	// English: daily cache of index MA slopes (trend slope is intraday-invariant; recompute only on a
 	// new trading day; NaN abstain when no source or on failure).
-	maSlopeDay   string
-	maSlope20    float64
-	maSlope60    float64
-	newsAgent    *newsagent.Agent        // 新闻代理（拉取 + Stage0/1/2 归因分析）
-	strategy     *strategy_engine.Engine // 策略引擎（事件归因 → 评分池 → 行情数据）
-	sectorAgent  *sector_agent.Agent     // 板块验证代理（战法扫描前做板块真伪验证）
-	combatAgent  *combat_agent.Agent     // 战法代理（8a/8b 打分 + 多战法信号扫描）
-	agg          *display.Aggregator     // 看板聚合器（SSE 数据源）
-	rpt          *report.Report          // 持仓/交易报表（止盈止损提醒依赖）
-	stockTracker *data.StockTracker      // 个股跟踪池（8a/8b 入池与失效管理）
-	wlMgr        *data.WatchlistManager  // 用户自选股管理
-	sse          *server.SSEBroker       // SSE 广播器（推送打分/信号到前端）
-	llmClient    *llm.Client             // LLM 客户端（D1 评分 / 标题党校正）
-	ths          *data.THSClient         // 同花顺客户端（板块名单/行情表/实时报价降级）
-	scanner      *data.SectorScanner     // 板块扫描器（板块名单索引，板块验真与归因校验依赖）
+	maSlopeDay string
+	maSlope20  float64
+	maSlope60  float64
+	// ── §DYN-SIZE 动态仓位快照与读数缓存 ────────────────────────────────────────────
+	// 全部由 assembleRegime 装配，live/paper 策略快照经 currentRegime 共享（短 TTL）。
+	// 指数读数日级/短 TTL 缓存，绝不逐信号打上游（§SIGBATCH 教训）。
+	// English: §DYN-SIZE regime snapshot + reading caches, assembled by assembleRegime and shared
+	// by the live/paper policy snapshots; index reads are cached, never fetched per signal.
+	lastRegime     signalctl.Regime // 最近一轮装配的市场环境快照
+	lastUpRatio    float64          // 主循环最近一轮真实上涨占比（NaN=弃权，供广度因子）
+	idxQuoteDay    string           // 大盘涨跌幅读数所属交易日 YYYYMMDD
+	idxQuotePct    float64          // 大盘最近一个交易日涨跌幅 %（NaN=未取到）
+	idxQuoteAt     time.Time        // 大盘读数取数时刻（短 TTL，防每轮打上游）
+	idxTrendBroken bool             // 大盘趋势破位（日级缓存，止损两态判别用）
+	idxTrendDay    string           // idxTrendBroken 的缓存交易日
+	holidayDay     string           // 节前窗口读数缓存交易日
+	holidayProbe   data.HolidayWindowProbe
+	// regimeReadoutDay §DYN-SIZE 每日 shadow 读数去重（YYYYMMDD，每日一行）。
+	regimeReadoutDay string
+	// macroLeadProbeDay §DYN-SIZE P4 前瞻窗/日历覆盖读数去重（YYYYMMDD，每日一行）。
+	// English: §DYN-SIZE P4 daily dedup for the lead-window / calendar-coverage readout.
+	macroLeadProbeDay string
+	// equitySnapDay §DYN-SIZE P6 权益日快照去重（YYYY-MM-DD，写成功才置位）。
+	// English: §DYN-SIZE P6 daily dedup for the equity snapshot (set only after a successful write).
+	equitySnapDay string
+	// accountProbeFn §DYN-SIZE 账户级读数探针（registry/main 注入：回看窗止损次数 / 权益回撤 /
+	// 总仓位占比）。nil=未注入 → AccountState 保持零值（各上限因子弃权），不影响任何裁定。
+	// English: §DYN-SIZE account-level reading probe (injected by registry/main); nil = abstain.
+	accountProbeFn func(userID string) (stopLosses int, drawdown float64, totalPosPct float64, ok bool)
+	newsAgent      *newsagent.Agent        // 新闻代理（拉取 + Stage0/1/2 归因分析）
+	strategy       *strategy_engine.Engine // 策略引擎（事件归因 → 评分池 → 行情数据）
+	sectorAgent    *sector_agent.Agent     // 板块验证代理（战法扫描前做板块真伪验证）
+	combatAgent    *combat_agent.Agent     // 战法代理（8a/8b 打分 + 多战法信号扫描）
+	agg            *display.Aggregator     // 看板聚合器（SSE 数据源）
+	rpt            *report.Report          // 持仓/交易报表（止盈止损提醒依赖）
+	stockTracker   *data.StockTracker      // 个股跟踪池（8a/8b 入池与失效管理）
+	wlMgr          *data.WatchlistManager  // 用户自选股管理
+	sse            *server.SSEBroker       // SSE 广播器（推送打分/信号到前端）
+	llmClient      *llm.Client             // LLM 客户端（D1 评分 / 标题党校正）
+	ths            *data.THSClient         // 同花顺客户端（板块名单/行情表/实时报价降级）
+	scanner        *data.SectorScanner     // 板块扫描器（板块名单索引，板块验真与归因校验依赖）
 
 	userID string // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/分 scores）
 	// §WMQ-1（20260917）：共享引擎的 QMT 配置热同步源账号（首建/管理员成员，registry 注入）。
@@ -188,6 +214,7 @@ type Engine struct {
 	d1MaxTokens       int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
 	lastTiming        *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
 	factorMon         *factorMonitor                                                                                  // 因子战法效果监测（战法库触发信号前向收益结算）
+	qualityTrack      *signalQualityTracker                                                                           // §DYN-SIZE P3 信号质量分桶结果回喂（Enhance.DynWeight 开启时懒建）
 	paper             *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
 	paperOnSignals    func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
 	paperMarkFn       func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
@@ -1086,6 +1113,9 @@ func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Si
 	combined := make([]combat_agent.Signal, 0, len(emit)+len(exit))
 	combined = append(combined, emit...)
 	combined = append(combined, exit...)
+	// §DYN-SIZE P3：与 live 通道同源解析信号质量权重（方案 §5「通道一致」测试锁）——
+	// 两通道读同一张表、同一分桶键，paper 的 QualityWeight 与 live 逐字相同。
+	e.annotateQualityWeights(combined)
 	if dispatch != nil {
 		dispatch(combined, nil, quotes)
 		return
@@ -1163,6 +1193,8 @@ func (e *Engine) liveSignalPolicy() signalctl.Policy {
 			pol.ShadowBlacklist = rules.SignalCtl.BlacklistShadow()
 		}
 	}
+	// §DYN-SIZE：注入市场环境快照 + 该账号定权配置/账本读数（未启用时合成恒 1.0，行为不变）。
+	pol.Regime = e.regimeForAccount(uid)
 	return pol
 }
 
@@ -1187,6 +1219,8 @@ func (e *Engine) paperSignalPolicy(uid string) signalctl.Policy {
 			pol.Discipline = rules.Paper.Discipline
 		}
 	}
+	// §DYN-SIZE：注入市场环境快照（与 live 通道同源同值——方案 §5「通道一致」测试锁）。
+	pol.Regime = e.regimeForAccount(uid)
 	return pol
 }
 
@@ -1202,9 +1236,14 @@ func (e *Engine) dispatchLive(buys []combat_agent.Signal, live map[string]*data.
 	if len(buys) == 0 {
 		return
 	}
+	// §DYN-SIZE P3：把信号质量归一化权重解析到每条买入信号（Enhance.DynWeight 关闭时零操作）。
+	// 放在准入之前——qualityFactor 读的就是 Signal.QualityWeight。
+	e.annotateQualityWeights(buys)
 	ctl := e.SignalCtl()
 	acct := e.primaryMember()
 	pol := e.liveSignalPolicy()
+	// §DYN-SIZE P0 影子读数：每交易日一行，打印快照因子 + 本轮买入集合成缩放分布（含 enabled=false）。
+	e.regimeShadowReadout(pol.Regime, buys)
 	var decisions []signalctl.Decision
 	if prune {
 		decisions = ctl.Evaluate(signalctl.ChannelLive, acct, buys, pol, now)
@@ -1226,11 +1265,13 @@ func (e *Engine) dispatchLive(buys []combat_agent.Signal, live map[string]*data.
 		}
 	}
 	e.mu.Unlock()
+	// §DYN-SIZE：把控制器的缩放系数透传到执行层（0=未定权，执行层按基准金额）。
+	sizingOn := pol.Regime.SizeCfg.Enabled
 	for i, d := range decisions {
 		if d.Verdict != signalctl.VerdictPass {
 			continue
 		}
-		e.autoPlace(buys[i], live)
+		e.autoPlaceScaled(buys[i], live, d.BuyScale, sizingOn)
 	}
 }
 
@@ -1263,9 +1304,15 @@ func (e *Engine) filterPaperAdmitted(uid string, sigs []combat_agent.Signal, now
 	decisions := e.SignalCtl().Evaluate(signalctl.ChannelPaper, uid, sigs, e.paperSignalPolicy(uid), now)
 	out := make([]combat_agent.Signal, 0, len(sigs))
 	for i, s := range sigs {
-		if decisions[i].Verdict == signalctl.VerdictPass {
-			out = append(out, s)
+		if decisions[i].Verdict != signalctl.VerdictPass {
+			continue
 		}
+		// §DYN-SIZE：把控制器的缩放系数写回信号（paper 撮合金额 = 基准 × SizeScale）。
+		// live 通道不经此字段（dispatchLive 直接传参给 autoPlace），两条腿同源同值。
+		if sc := decisions[i].BuyScale; sc > 0 && sc != 1.0 {
+			s.SizeScale = sc
+		}
+		out = append(out, s)
 	}
 	return out
 }
@@ -1313,7 +1360,21 @@ func (e *Engine) IgnoreSignal(code, strategy string) int {
 // 本函数包私不可外部直调，防绕过准入的后门）。
 // English: AUTO_TRADING_PLAN M1 — pure execution (mode/sealed-board/lot/cash/idempotency); strategy
 // whitelist & confirm moved to the signal controller; unexported so no path bypasses admission.
+// autoPlace 执行层入口（无动态定权版本）：等价于 autoPlaceScaled(…, 0, false)。
+// 保留旧签名是为了不惊动大量既有执行层单测；生产唯一调用方 dispatchLive 走带缩放的版本。
+// English: the no-sizing entry point (equivalent to autoPlaceScaled(…, 0, false)); kept so the
+// existing execution-layer tests stay untouched. The only production caller is dispatchLive.
 func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockInfo) {
+	e.autoPlaceScaled(sig, live, 0, false)
+}
+
+// autoPlaceScaled §DYN-SIZE 执行层入口（带动态仓位缩放）。
+//
+// buyScale：信号控制器给出的缩放系数（0=未定权，按基准金额；1.0=中性）。
+// sizingOn：动态定权总开关是否开启——用于让内联 Yellow 缩放让位（防同一风险双乘）。
+// English: §DYN-SIZE execution entry with the controller's buy scale (0 = not sized; 1.0 = neutral)
+// and the master switch, so the legacy inline Yellow scaling can yield to it (no double penalty).
+func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.StockInfo, buyScale float64, sizingOn bool) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
 	e.mu.RUnlock()
@@ -1391,12 +1452,29 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	if amount <= 0 {
 		amount = 10000
 	}
+	// §DYN-SIZE 动态仓位缩放（BuyScale）：金额 = 基准 × 缩放（个股信号 × 宏观事件 × 大盘情绪 ×
+	// 节假日 × 个股波动率 的合成结果，已在信号控制器内算好）。缩后仍走下方整手/现金降档。
+	// English: §DYN-SIZE — the amount is the base scaled by the synthesized BuyScale; the lot/cash
+	// degradation below still applies afterwards.
+	if buyScale > 0 && buyScale != 1.0 {
+		orig := amount
+		amount = amount * buyScale
+		log.Printf("[qmt] %s(%s) §DYN-SIZE 动态缩放 %.0f→%.0f（系数%.3f）", sig.Code, sig.Name, orig, amount, buyScale)
+		opslog.DayOnce("dynsize:"+sig.Code, func() {
+			opslog.Logf("quant", "§DYN-SIZE 动态缩放 %s(%s) 预算=%.0f→%.0f 系数=%.3f 策略=%s/%s",
+				sig.Code, sig.Name, orig, amount, buyScale, sig.StrategyID, sig.Strategy)
+		})
+	}
 	// §MARKET_RISK_GATE P4 auto-buy 谨慎层（默认关闭，裁决④）：真金白银下单层的第二道风险闸——
 	// Red 当日拒开新仓（DayOnce+opslog 留痕）；Yellow 按仓位档缩放买入金额（优先状态机 MaxPosPct，回退
 	// YellowPosScale；缩后仍走下方整手/现金降档）。与信号侧 P3 降级独立叠加。
-	// English: the P4 auto-buy caution layer (default off, ruling ④) — a second risk gate on the money path:
-	// reject new opens on Red (DayOnce+opslog), scale the buy amount on Yellow (state-machine MaxPosPct first,
-	// YellowPosScale fallback; still passes the lot/cash degradation below). Stacks independently with P3.
+	// §DYN-SIZE 互斥纪律：动态定权开启时，风险档已作为权重因子进入 BuyScale（Yellow→0.60、Red→硬拦），
+	// 此处**不得**再缩一次——同一风险双乘属方案 §5 明令禁止的"双重惩罚"。故 Yellow 内联缩放仅在
+	// sizingOn=false 时生效（Red 拒开保留为无害的第二道保险：sizing 开启时 Red 已被硬拦在上游）。
+	// English: the P4 auto-buy caution layer (default off, ruling ④). §DYN-SIZE mutual exclusion: with
+	// dynamic sizing on, the risk tier is already a weight factor inside BuyScale, so the inline Yellow
+	// scaling must yield (double-multiplying one risk is forbidden); the Red rejection stays as a
+	// harmless second guard because sizing already hard-blocks Red upstream.
 	if cfg.AutoCautionOn() {
 		e.mu.RLock()
 		tier, maxPos := e.lastRiskTier, e.lastMaxPosPct
@@ -1409,6 +1487,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 			})
 			return
 		case combat_agent.RiskTierYellow:
+			if sizingOn {
+				break // §DYN-SIZE：风险档已进 BuyScale，不再二次缩放
+			}
 			scale := cfg.YellowScale()
 			if maxPos > 0 && maxPos < scale {
 				scale = maxPos // 状态机给出更严的仓位档时以其为准
@@ -4287,6 +4368,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	}
 	e.mu.Lock()
 	e.lastEmotionPhase = emotionPhase
+	// §DYN-SIZE：缓存本轮真实上涨占比，供 Regime 广度因子消费（NaN=弃权）。5s 循环复用该值，
+	// 不重复拉广度（广度是网络调用，绝不逐轮打上游）。
+	// English: §DYN-SIZE — cache this round's real up-ratio for the Regime breadth factor (NaN abstains);
+	// the 5s loop reuses it instead of re-fetching breadth.
+	e.lastUpRatio = riskUpRatio
 	// FIX#13 缓存本轮利空归因，供近实时实盘建议（pushRealAdvice→BearishAttributionAlerts）复用：
 	// 实盘持仓命中利空板块/利空个股 → advice Action=止损 → autoExecuteRealSells 自动全平。
 	// English: FIX#13 cache this round's bearish attributions for the near-realtime real-book advice,
@@ -4719,6 +4805,12 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 13. 持仓止盈/止损提醒（传入当轮打分表 + 利空板块信号：有反向信号才硬推止盈/止损）
 	// §R4-6：行情优先走 5s 快照（批量），缺失持仓才逐票兜底单查。
 	_stepAlerts := time.Now()
+	// §DYN-SIZE P5：注入本轮市场态（两态止损偏移的输入）。与 5s 近实时轮同源同值——
+	// 两处都走 regimeForAccount 的同一份快照，不会出现"主循环放宽、近实时收紧"的双口径。
+	// §DYN-SIZE P6：主循环同样先落当日权益点（日级去重），保证账户级 MaxDrawdown 读数当天就绪。
+	e.recordDailyEquitySnapshot()
+	alertRegime := e.regimeForAccount(e.primaryMember())
+	e.combatAgent.SetMarketStopContext(alertRegime.SizeCfg, alertRegime.IndexChangePct, alertRegime.IndexTrendBroken)
 	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, e.snapshotQuotes(), stockScores, bearHitCodes(sr))
 	_alertsT := time.Since(_stepAlerts)
 
@@ -6129,6 +6221,485 @@ func (e *Engine) MarketEnvSnapshot() (emotion, marketState string, maxPosPct flo
 	return e.lastEmotionPhase, e.lastMarketState, e.lastMaxPosPct, e.lastRiskTier, e.lastRiskReasons
 }
 
+// ── §DYN-SIZE 市场环境快照装配 ────────────────────────────────────────────────────
+
+// SetAccountSizingProbe §DYN-SIZE：**替换**账户级读数探针（回看窗止损次数 / 权益回撤 / 总仓位占比）。
+//
+// 这是**覆盖缝**，不是唯一接线点：未调用时 `resolveAccountProbe` 会在实盘账本可用
+// （`SetQMT` 注入过 `realStore`）时自动使用内置实现 `accountSizingProbe`（P6 起接通）。
+// 两者都缺席（纯内存引擎 / 无实盘库）时 AccountState 保持零值 → 总仓位上限与权益回撤两个上限
+// 因子**弃权**，连续止损熔断也不触发（WindowStopLosses=0 < 阈值）——即"没有账本就不假装有约束"。
+// English: an override seam, not the only wiring point. When never called, resolveAccountProbe falls
+// back to the built-in probe once a live book is available (wired by SetQMT since P6). With neither,
+// AccountState stays zero and every account-level factor abstains — no ledger, no pretend constraints.
+func (e *Engine) SetAccountSizingProbe(fn func(userID string) (stopLosses int, drawdown float64, totalPosPct float64, ok bool)) {
+	e.mu.Lock()
+	e.accountProbeFn = fn
+	e.mu.Unlock()
+}
+
+// currentRegime §DYN-SIZE：返回本轮市场环境快照（3s 短 TTL，live/paper 策略装配共享同一份）。
+// 主循环与 5s 循环在同一轮内多次装配策略时不会重复拉指数/宏观。
+// English: this round's regime snapshot with a 3s TTL, shared by the live/paper policy snapshots.
+func (e *Engine) currentRegime() signalctl.Regime {
+	now := time.Now()
+	e.mu.RLock()
+	r := e.lastRegime
+	fresh := !r.AsOf.IsZero() && now.Sub(r.AsOf) < 3*time.Second
+	e.mu.RUnlock()
+	if fresh {
+		return r
+	}
+	r = e.assembleRegime(now)
+	e.mu.Lock()
+	e.lastRegime = r
+	e.mu.Unlock()
+	return r
+}
+
+// assembleRegime §DYN-SIZE：装配市场环境快照（每轮一次；昂贵读数走日级/短 TTL 缓存）。
+// 任一读数不可得时保持零值/NaN（=弃权），绝不伪造成中性。
+// English: assembles the regime snapshot once per round; expensive reads are cached; any missing
+// reading stays zero/NaN (abstain) rather than a fabricated neutral.
+func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
+	// 1. 引擎缓存的状态机读数（主循环每轮刷新）。
+	e.mu.RLock()
+	r := signalctl.Regime{
+		AsOf:           now,
+		EmotionPhase:   e.lastEmotionPhase,
+		MarketState:    e.lastMarketState,
+		MaxPosPct:      e.lastMaxPosPct,
+		RiskTier:       e.lastRiskTier,
+		BreadthUpRatio: e.lastUpRatio,
+	}
+	if len(e.lastRiskReasons) > 0 {
+		r.RiskReasons = append([]string(nil), e.lastRiskReasons...)
+	}
+	e.mu.RUnlock()
+
+	// 2~4. 指数 / 宏观 / 节前（各带缓存）——这三类读数与账号无关，全局缓存即可。
+	// 账号级的定权配置与账本读数由 regimeForAccount 叠加（paper 通道是逐账号的）。
+	e.fillIndexReadings(&r, now)
+	e.fillMacroEvents(&r, now)
+	e.fillHoliday(&r, now)
+	return r
+}
+
+// regimeForAccount §DYN-SIZE：在市场环境快照（全局缓存）之上叠加**账号级**读数——
+// 定权配置（该账号 Rules.Sizing）与账户账本（回看窗止损次数 / 权益回撤 / 总仓位占比）。
+// English: overlays the per-account readings (sizing config + account ledger) on the cached,
+// account-independent market regime.
+func (e *Engine) regimeForAccount(uid string) signalctl.Regime {
+	if uid == "" {
+		uid = e.primaryMember()
+	}
+	r := e.currentRegime()
+	r.SizeCfg = e.sizingConfigFor(uid)
+	// §DYN-SIZE P5：两态止损偏移（只取市场态腿——逐持仓的个股/N形/做空豁免在 CheckPositionAlerts
+	// 侧各自判定；这里回答的是"今天新开仓的止损线会被放宽多少"，供风险预算守恒缩仓）。
+	offs := combat_agent.ComputeStopOffsets(combat_agent.StopOffsetInput{
+		IndexChangePct:   r.IndexChangePct,
+		IndexTrendBroken: r.IndexTrendBroken,
+		StockChangePct:   math.NaN(), // 新开仓无个股语境 → 不做独立崩坏判定
+	}, r.SizeCfg)
+	r.StopLossOffsetPct = offs.SL
+	r.BaseStopLossPct = e.disciplineStopLossPct(uid)
+	if probe := e.resolveAccountProbe(); probe != nil {
+		if sl, dd, tp, ok := probe(uid); ok {
+			r.Account = signalctl.AccountState{WindowStopLosses: sl, EquityDrawdown: dd, TotalPosPct: tp}
+		}
+	}
+	return r
+}
+
+// resolveAccountProbe §DYN-SIZE P6：取账户级读数探针。
+//
+// 优先级：**显式注入优先**（`SetAccountSizingProbe`，测试/宿主可替换），否则在实盘账本可用时
+// 回落到内置实现 `accountSizingProbe`。这样"有没有账本"由引擎自己判断，宿主无需记得接线；
+// 而显式注入永远是最高优先级，任何调用顺序都不会把测试缝顶掉。
+// English: §DYN-SIZE P6 — resolves the account-reading probe: an explicit injection always wins,
+// otherwise the built-in probe is used when the live book is available. Wiring the default here
+// (instead of at the host) means "no ledger → abstain" is decided by the engine itself.
+func (e *Engine) resolveAccountProbe() func(userID string) (int, float64, float64, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.accountProbeFn != nil {
+		return e.accountProbeFn
+	}
+	if e.realStore != nil {
+		return e.accountSizingProbe
+	}
+	return nil
+}
+
+// accountSizingProbe §DYN-SIZE P6 内置账户级读数探针：回看窗止损次数 / 权益回撤 / 总仓位占比。
+//
+// 回看窗：`stoploss_guard_window_days`（交易日）折算成自然日跨度（跨周末/长假不能按自然日硬算）。
+// 回撤窗：独立取 `equityDrawdownLookbackDays` 交易日——回撤是"从高位下来的距离"，与"最近几次
+// 止损"不是同一个时间尺度，复用止损窗会让回撤永远读不出（默认窗只有 1 个交易日）。
+//
+// ok=false 仅在**无实盘账本**时返回（整组弃权）；三个读数各自缺失时保持零值，由 signalctl 侧
+// 逐因子弃权。任何查询失败都只影响它自己那一个读数，绝不把整组拉黑。
+// English: the built-in probe. The stop-loss window comes from stoploss_guard_window_days (trading
+// days → holiday-aware calendar span); the drawdown window is its own constant because "distance
+// from a high" and "recent stop-outs" are different time scales. ok=false only when there is no
+// live book at all; each reading abstains on its own when its own data is missing.
+func (e *Engine) accountSizingProbe(uid string) (int, float64, float64, bool) {
+	e.mu.RLock()
+	st := e.realStore
+	cm := e.cfgMgr
+	e.mu.RUnlock()
+	if st == nil {
+		return 0, 0, 0, false
+	}
+	if uid == "" {
+		uid = e.primaryMember()
+	}
+	cfg := config.DefaultSizingConfig()
+	if cm != nil {
+		if rules := cm.GetRulesFor(uid); rules != nil {
+			cfg = rules.Sizing.WithDefaults()
+		}
+	}
+	// 止损回看窗（交易日 → 自然日跨度；日历未加载时 TradingDaySpan 退化为按自然日近似，
+	// 最坏情况窗口略窄——窗口窄只会让熔断更难触发，属安全方向）。
+	now := time.Now()
+	compact := data.TradingDayDate(now) // YYYYMMDD：交易日历口径（TradingDaySpan 的入参格式）
+	today := now.Format("2006-01-02")   // YYYY-MM-DD：账本口径（fills.traded_at / real_equity_daily.day）
+	guardSpan := data.TradingDaySpan(compact, cfg.StoplossGuardWindowDays)
+	if guardSpan < 1 {
+		guardSpan = cfg.StoplossGuardWindowDays
+	}
+	sinceDay := now.AddDate(0, 0, -guardSpan).Format("2006-01-02")
+	sl, _, tp, ok := st.AccountSizingReadings(uid, sinceDay, today)
+	if !ok {
+		return 0, 0, 0, false
+	}
+	// 权益回撤用**独立窗**（见函数头注释）：AccountSizingReadings 里的回撤读的是止损窗
+	// （默认仅 1 个交易日），对"从高位下来的距离"这个语义过窄，故此处按回撤窗重读。
+	ddSpan := data.TradingDaySpan(compact, equityDrawdownLookbackDays)
+	if ddSpan < 1 {
+		ddSpan = equityDrawdownLookbackDays
+	}
+	ddSince := now.AddDate(0, 0, -ddSpan).Format("2006-01-02")
+	if v, got, err := st.EquityDrawdown(uid, ddSince, today); err == nil && got {
+		return sl, v, tp, true
+	}
+	return sl, 0, tp, true
+}
+
+// recordDailyEquitySnapshot §DYN-SIZE P6：每个交易日把券商回报的账户权益落一个点
+// （real_equity_daily），供账户权益回撤（MaxDrawdown）上限因子使用。
+//
+// 日级去重（同一天只写一次，写成功才置位）；无实盘账本 / 券商尚未回报（总资产<=0）时静默跳过
+// ——不落伪零（store.RecordEquitySnapshot 也会再拒一次 <=0）。
+// English: P6 — persists one equity point per trading day for the drawdown cap. Deduped per day
+// (the guard is set only after a successful write); skipped silently without a live book or a
+// broker-reported total asset, so no pseudo-zero ever enters the series.
+func (e *Engine) recordDailyEquitySnapshot() {
+	e.mu.RLock()
+	st := e.realStore
+	e.mu.RUnlock()
+	if st == nil {
+		return
+	}
+	uid := e.primaryMember()
+	if uid == "" {
+		return
+	}
+	day := time.Now().Format("2006-01-02")
+	e.mu.RLock()
+	done := e.equitySnapDay == day
+	e.mu.RUnlock()
+	if done {
+		return
+	}
+	acc, err := st.GetRealAccount(uid)
+	if err != nil || acc.TotalAsset <= 0 {
+		return // 券商未回报 → 本轮不落点（下一轮再试），绝不把"未知"写成 0
+	}
+	if err := st.RecordEquitySnapshot(uid, day, acc.TotalAsset); err != nil {
+		log.Printf("[dynsize] 权益快照落库失败 user=%s day=%s: %v", uid, day, err)
+		return
+	}
+	e.mu.Lock()
+	e.equitySnapDay = day
+	e.mu.Unlock()
+}
+
+// equityDrawdownLookbackDays 权益回撤的独立回看窗（交易日）。
+// 取 60 个交易日（约一个季度）：短于此，"从高位下来"的读数会被单日噪声主导；
+// 长于此，牛市早期的峰值会永久压制当前仓位。它不进配置——owner 需要的是"熔断该不该响"，
+// 而不是又一个要调的旋钮；真需要改时改这个常量并留痕。
+// English: the equity-drawdown lookback (trading days). 60 ≈ one quarter — shorter is noise-driven,
+// longer lets an old peak suppress the position forever. Deliberately not configurable.
+const equityDrawdownLookbackDays = 60
+
+// disciplineStopLossPct 风险预算守恒的基准止损（该账号的纪律止损；<=0 时回退出厂默认）。
+// 口径：实盘与模拟盘共用同一套纪律参数（config.Rules.Paper.Discipline 的注释已声明），
+// 故这里只取一处，不做双通道分叉。
+// English: the base stop for risk-budget conservation (the account's discipline stop, factory
+// default as fallback). Live and paper share one discipline, so there is no per-channel split.
+func (e *Engine) disciplineStopLossPct(uid string) float64 {
+	e.mu.RLock()
+	cm := e.cfgMgr
+	e.mu.RUnlock()
+	if cm != nil {
+		if rules := cm.GetRulesFor(uid); rules != nil && rules.Paper.Discipline.StopLossPct > 0 {
+			return rules.Paper.Discipline.StopLossPct
+		}
+	}
+	return config.DefaultDisciplineConfig().StopLossPct
+}
+
+// sizingConfigFor 取该账号的定权配置（WithDefaults 补齐）；无配置管理器 → 出厂默认。
+// English: the account's sizing config with defaults filled; factory default without a manager.
+func (e *Engine) sizingConfigFor(uid string) config.SizingConfig {
+	e.mu.RLock()
+	cm := e.cfgMgr
+	e.mu.RUnlock()
+	if cm != nil {
+		if rules := cm.GetRulesFor(uid); rules != nil {
+			sc := rules.Sizing
+			// §DYN-SIZE P6 接通既有死字段：定权配置未显式设置总仓位上限时，回落到纪律仓位字段
+			// `rules.position.max_total_position_pct`（归一化后）。老配置零迁移即可让上限生效；
+			// 显式写了 `rules.sizing.max_total_position_pct` 的以它为准。
+			// English: P6 wires the previously-dead position field as a fallback for the total-position
+			// cap; an explicit sizing value always wins.
+			if sc.MaxTotalPositionPct <= 0 {
+				legacy := rules.Position.MaxTotalPositionPct
+				sc.MaxTotalPositionPct = config.NormalizeLegacyTotalPosPct(legacy)
+				// 桥接必须**可观测**：该字段此前是死字段，两种历史写法（0.8 / 80）都"合法"，
+				// 一旦读到百分数写法就是一次单位换算——静默换算等于把 owner 的配置语义悄悄改掉。
+				// 日级去重（配置稳定，不该每 5s 刷一行）。
+				if legacy > 1 {
+					opslog.DayOnce("legacy-total-pos:"+uid, func() {
+						opslog.Logf("quant", "§DYN-SIZE 总仓位上限桥接：rules.position.max_total_position_pct=%.4g 按百分数归一为 %.4f（rules.sizing.max_total_position_pct 可显式覆盖）",
+							legacy, sc.MaxTotalPositionPct)
+					})
+				}
+			}
+			return sc.WithDefaults()
+		}
+	}
+	return config.DefaultSizingConfig()
+}
+
+// fillIndexReadings 填充大盘涨跌幅（30s 短 TTL）与趋势破位（日级缓存）。
+// 无行情源/取数失败 → NaN/false 弃权，绝不编造。
+// English: fills the index change (30s TTL) and trend-break flag (daily cache); failures abstain.
+func (e *Engine) fillIndexReadings(r *signalctl.Regime, now time.Time) {
+	today := data.TradingDayDate(now)
+	e.mu.RLock()
+	trendDay, trendBroken := e.idxTrendDay, e.idxTrendBroken
+	quoteDay, quotePct, quoteAt := e.idxQuoteDay, e.idxQuotePct, e.idxQuoteAt
+	market := e.marketAPI
+	e.mu.RUnlock()
+
+	// 趋势破位：日级缓存（日内不变）。
+	if trendDay != today {
+		trendBroken = false
+		if market != nil {
+			trendBroken = market.IndexTrendBroken()
+		}
+		e.mu.Lock()
+		e.idxTrendDay, e.idxTrendBroken = today, trendBroken
+		e.mu.Unlock()
+	}
+	r.IndexTrendBroken = trendBroken
+
+	// 涨跌幅：30s 短 TTL（盘中会变，但不能每轮打上游）。
+	if quoteDay == today && !quoteAt.IsZero() && now.Sub(quoteAt) < 30*time.Second {
+		r.IndexChangePct, r.IndexChangeDay = quotePct, quoteDay
+		return
+	}
+	pct := math.NaN()
+	if market != nil {
+		if q, err := market.GetIndexQuote("000001"); err == nil && q != nil {
+			pct = q.ChangePct
+		}
+	}
+	e.mu.Lock()
+	e.idxQuoteDay, e.idxQuotePct, e.idxQuoteAt = today, pct, now
+	e.mu.Unlock()
+	r.IndexChangePct, r.IndexChangeDay = pct, today
+}
+
+// fillMacroEvents 填充宏观事件视图：影响期标记 + **交易日**前瞻距离。
+// 距离必须按交易日算——跨周末/长假用自然日会把国庆 8 天算成 8 个"交易日"。
+//
+// §DYN-SIZE P4：**取数窗**同样按交易日折算（`macroLeadHorizon`），不再用定长 7 自然日——
+// 5 个交易日跨一次长假是 ~14 个自然日，定长窗下节前那几天取不到任何事件，前瞻曲线形同虚设。
+// English: fills macro event views with the impact-window flag and the trading-day lead distance;
+// the fetch window itself is also derived from trading days (P4), not a fixed 7 natural days.
+func (e *Engine) fillMacroEvents(r *signalctl.Regime, now time.Time) {
+	horizon := macroLeadHorizon(now)
+	e.logMacroLeadProbeOnce(now, horizon)
+	events := combat_agent.ActiveMacroEventsWithin(now, horizon)
+	if len(events) == 0 {
+		return
+	}
+	today := data.TradingDayDate(now)
+	views := make([]signalctl.MacroEventView, 0, len(events))
+	for _, ev := range events {
+		before := ev.Date.AddDate(0, 0, -ev.Duration)
+		after := ev.Date.AddDate(0, 0, ev.Duration)
+		v := signalctl.MacroEventView{
+			Level:       ev.Level,
+			Title:       ev.Title,
+			Impact:      ev.Impact,
+			InWindow:    now.After(before) && now.Before(after.AddDate(0, 0, 1)),
+			DaysToEvent: data.TradingDaysUntil(today, ev.Date.Format("20060102")),
+		}
+		views = append(views, v)
+	}
+	r.MacroEvents = views
+}
+
+// macroLeadHorizonMinDays 日历可用时的前瞻窗自然日**下限**：等于改造前的定长 7 天——
+// 精确折算只会把窗放大（跨长假），绝不会比旧口径更窄，不产生回归。
+const macroLeadHorizonMinDays = 7
+
+// macroLeadHorizonFallbackDays 日历**不可用**时的前瞻窗自然日兜底（21 天 = 中国最长连休
+// 8~9 天 × 2 余量 + 5 个交易日）。取数窗放大不产生副作用（真正降权由 macroLeadFactor 按
+// 交易日距离决定），故不可知时宁宽勿窄——窄了前瞻曲线在长假期前直接失效。
+const macroLeadHorizonFallbackDays = 21
+
+// macroLeadHorizon §DYN-SIZE P4：把"事件前 N 个交易日"折算成自然日取数窗。
+//
+// 为什么不能定长 7 自然日（改造前的口径）：5 个交易日在平常是 7 个自然日，跨一次国庆长假却是
+// 15 个——节前那几天前瞻曲线取不到任何事件，"事件前 5 个交易日渐进收仓"形同虚设。
+// 日历可用时按交易日精确折算（`data.TradingDaySpan`）；不可用时按最长连休宽松兜底。
+// English: converts the trading-day lead into a natural-day fetch window; the old fixed 7 days
+// misses events before a long holiday. Falls back generously when the calendar is unavailable.
+func macroLeadHorizon(now time.Time) time.Duration {
+	lead := config.DefaultSizingConfig().MacroLeadDays
+	if !data.CalendarLoaded() {
+		return macroLeadHorizonFallbackDays * 24 * time.Hour
+	}
+	span := data.TradingDaySpan(data.TradingDayDate(now), lead) + 1 // +1 覆盖"事件当日/次日"边界
+	if span < macroLeadHorizonMinDays {
+		span = macroLeadHorizonMinDays
+	}
+	return time.Duration(span) * 24 * time.Hour
+}
+
+// logMacroLeadProbeOnce §DYN-SIZE P4：每交易日一行"前瞻窗 + 交易日历未来覆盖"读数。
+//
+// 为什么必须打点：节前因子与前瞻窗折算都建立在"未来假期可知"之上，而 `RefreshTradingCalendar`
+// **不外推 API 窗口外**。覆盖不到未来假期时，长假因子会静默退化成"只能识别周末"——这一行就是
+// 让那次退化在日志里开口（方案 §7 附的"依赖外部数据的风险"）。
+// English: §DYN-SIZE P4 — one line per trading day with the computed lead window and the calendar's
+// future coverage. The holiday factor silently degrades to "weekends only" when coverage stops short,
+// and this line is how that degradation becomes visible.
+func (e *Engine) logMacroLeadProbeOnce(now time.Time, horizon time.Duration) {
+	today := data.TradingDayDate(now)
+	e.mu.RLock()
+	done := e.macroLeadProbeDay == today
+	e.mu.RUnlock()
+	if done {
+		return
+	}
+	e.mu.Lock()
+	e.macroLeadProbeDay = today
+	e.mu.Unlock()
+
+	calMin, calMax, loaded := data.CalendarCoverage()
+	// 覆盖判定：日历最大覆盖日是否已越过"前瞻窗末端"。末端按自然日近似（日志判据，不参与决策）。
+	need := now.Add(horizon).Format("20060102")
+	coverNote := "日历未加载（节前/前瞻窗按宽松兜底，长假因子只能识别周末）"
+	if loaded {
+		if calMax >= need {
+			coverNote = "覆盖充足"
+		} else {
+			coverNote = fmt.Sprintf("覆盖不足（需到 %s，实际到 %s）——长假因子将退化为仅识别周末", need, calMax)
+		}
+	}
+	// §DYN-SIZE P4 补强：节前因子对覆盖的要求与前瞻窗**不同**（它要看见"未来那段休市有多长"，
+	// 需要 ≥15 自然日前向覆盖），故单列一个读数——两条需求不能用一个判据糊过去。
+	fwd := data.CalendarForwardCoverageDays()
+	fwdNote := "不可知"
+	if fwd >= 0 {
+		fwdNote = fmt.Sprintf("%d天", fwd)
+	}
+	log.Printf("[dynsize] 前瞻窗读数 日=%s 取数窗=%s 折算交易日=5 日历(加载=%v 窗口=%s~%s 前向=%s) %s",
+		today, horizon, loaded, calMin, calMax, fwdNote, coverNote)
+}
+
+// fillHoliday 填充节前窗口读数（已加载时日级缓存；未加载则每轮重探，避免日历补载后仍弃权一天）。
+// English: fills the pre-holiday window (cached per day once loaded; re-probed while unloaded so a
+// mid-day calendar load is picked up).
+func (e *Engine) fillHoliday(r *signalctl.Regime, now time.Time) {
+	today := data.TradingDayDate(now)
+	e.mu.RLock()
+	day, p := e.holidayDay, e.holidayProbe
+	e.mu.RUnlock()
+	if day != today || !p.CalendarLoaded {
+		p = data.ProbeHolidayWindow(now)
+		if p.CalendarLoaded {
+			e.mu.Lock()
+			e.holidayDay, e.holidayProbe = today, p
+			e.mu.Unlock()
+		}
+	}
+	r.Holiday = signalctl.HolidayWindow{
+		DaysToNextOpen: p.DaysToNextOpen,
+		ClosedRun:      p.ClosedRun,
+		PreHolidayN:    p.PreHolidayN,
+		CalendarLoaded: p.CalendarLoaded,
+	}
+}
+
+// regimeShadowReadout §DYN-SIZE P0 影子读数：每个交易日一行，打印快照各因子取值 +
+// 本轮活跃买入集的合成缩放分布（min/中位/max + 拟降级数）。Enabled=false 时也照打——
+// 这正是 P0 的价值：先拿到"改造前基线分布"，再决定是否真拨。
+// English: §DYN-SIZE P0 shadow readout — one line per trading day with the snapshot's factor values
+// and the buy-set scale distribution, logged even while disabled (the point of P0).
+func (e *Engine) regimeShadowReadout(r signalctl.Regime, buys []combat_agent.Signal) {
+	if len(buys) == 0 || r.SizeCfg.Floor <= 0 {
+		return
+	}
+	today := data.TradingDayDate(time.Now())
+	e.mu.RLock()
+	done := e.regimeReadoutDay == today
+	e.mu.RUnlock()
+	if done {
+		return
+	}
+	scales := make([]float64, 0, len(buys))
+	downgrades := 0
+	var sampleReasons []string
+	for _, s := range buys {
+		res := signalctl.ComputeSizing(r, s)
+		if res.Downgrade {
+			downgrades++
+		}
+		scales = append(scales, res.Scale)
+		if len(res.Reasons) > len(sampleReasons) {
+			sampleReasons = res.Reasons
+		}
+	}
+	sort.Float64s(scales)
+	lo, hi := scales[0], scales[len(scales)-1]
+	med := scales[len(scales)/2]
+	probeWired := e.resolveAccountProbe() != nil
+	// §DYN-SIZE P2 卖出加权档位：与买入侧同源快照，一并打点（Enabled=false 时恒为 ""）。
+	boost, boostReasons := signalctl.ComputeSellBoost(r)
+	e.mu.Lock()
+	e.regimeReadoutDay = today
+	e.mu.Unlock()
+	log.Printf("[dynsize] 影子读数 日=%s 活跃买入=%d 缩放min/中位/max=%.2f/%.2f/%.2f 拟降级=%d "+
+		"情绪=%q 状态=%q 风险档=%q 大盘=%.2f%% 破位=%v 广度=%.2f 节前(加载=%v N=%d 休市=%d 距开市=%d) "+
+		"宏观事件=%d 总仓位上限=%.2f 账户探针=%v 账本(止损%d次/回撤%.2f/仓位%.2f) 卖出加权=%q%v enabled=%v shadow=%v 样本因子=%v",
+		today, len(buys), lo, med, hi, downgrades,
+		r.EmotionPhase, r.MarketState, r.RiskTier, r.IndexChangePct, r.IndexTrendBroken, r.BreadthUpRatio,
+		r.Holiday.CalendarLoaded, r.Holiday.PreHolidayN, r.Holiday.ClosedRun, r.Holiday.DaysToNextOpen,
+		len(r.MacroEvents), r.SizeCfg.MaxTotalPositionPct, probeWired,
+		r.Account.WindowStopLosses, r.Account.EquityDrawdown, r.Account.TotalPosPct,
+		boost, boostReasons,
+		r.SizeCfg.Enabled, r.SizeCfg.ShadowOn(), sampleReasons)
+}
+
 // macroCalGuardMu/macroCalGuardDay 进程级"每日一次校准"闸门（校准缓存是进程全局的，
 // 多账号引擎共用，故只需一个引擎每天跑一次，避免重复 LLM 调用/token 浪费）。
 var (
@@ -6236,6 +6807,19 @@ func (e *Engine) SignalQualityRecord(tactic, sector, newsType, phase string, hit
 		return
 	}
 	tb.Update(research.MakeQualityKey(tactic, sector, newsType, phase), hit)
+}
+
+// SignalQualityRecordKey §DYN-SIZE P3：按**已组装好的分桶键**回喂一条结果样本。
+// 为什么需要键直传版：结果是在信号触发后（前瞻窗到期）才判定的，那时情绪相位/板块早已推进，
+// 现算的键会与登记时的键不同——必须用登记时快照下来的键（signal_quality_track.go）。
+// English: feeds an outcome back by the key snapshotted at signal time (the live dimensions have
+// moved on by the time the forward window matures).
+func (e *Engine) SignalQualityRecordKey(key research.QualityBucketKey, hit bool) {
+	tb := e.signalQualityTable()
+	if tb == nil {
+		return
+	}
+	tb.Update(key, hit)
 }
 
 // SignalQualityWeight 返回分桶权重乘子（§P2.5）；未达最小样本或未开启时恒 1.0。

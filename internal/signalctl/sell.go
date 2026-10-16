@@ -155,12 +155,23 @@ type sellKey struct {
 
 // sellParams 裁决参数（默认值兜底后的一次性快照）。maxExt=延持次数上限（0=无上限，负配置已在
 // sellParamsOf 折算；默认 2——owner 2026-10-12 裁决，000063 事故后不再"反复延持=按设计拿着"）。
+//
+// §DYN-SIZE P2 三个卖出加权字段（由 JudgeSellView 从 Regime 解析后注入，见 applySellBoost）：
+// boost=档位（""=未加权）；noExtend=取消延持（L2+）；dualOnSingle=单源利空即算 dual（L2+）。
+// L3 独有升级（owner 2026-10-16 授权）：boost==L3 时"首触止损未深破的半平"在**窗结算确认时**
+// 升级为全平——判定点见 sellProbe 处置开关；已确认处置的重放不受影响（重放逐字节锁，见
+// ConfirmedAction）——档位是配置轴，和价格深度一样不能在重放侧翻案。
+// 三者恒为零值时 sellProbe 行为与改造前**逐字一致**——这是基准态反证锁。
 type sellParams struct {
 	sl, tp, pb, dm float64
 	exitMin        int
 	trailMin       int
 	bullMaxAge     time.Duration
 	maxExt         int
+	// ── §DYN-SIZE P2 卖出加权 ──
+	boost        string // L1/L2/L3（""=未命中）
+	noExtend     bool   // 取消延持（L2+）：窗结算时即使有新鲜做多信号也直接处置
+	dualOnSingle bool   // 单源利空即算 dual（L2+）：放宽"触线即时硬清"的证据门槛
 }
 
 // sellParamsOf 从纪律配置解析卖出裁决参数（缺省与 DefaultDisciplineConfig 同口径）。
@@ -211,25 +222,53 @@ func (in SellInput) bullLive(now time.Time, p sellParams) bool {
 }
 
 // bearHard 利空是否具备"触线即时硬清"资格（语义①+§八护栏4）：命中且双源验证。
-func (in SellInput) bearHard() bool {
-	return in.Bear.Hit && in.Bear.Verified == BearVerifiedDual
+//
+// §DYN-SIZE P2：卖出加权 L2+ 时门槛放宽到**单源**（p.dualOnSingle）——"严买入宽卖出"的卖出侧
+// 兑现。未验证（BearUnverified，LLM 提案/新题材首日）仍不给硬清资格：那是"可能有利空"，
+// 不足以授权不等观察窗的即时清仓。
+// English: §DYN-SIZE P2 — under an L2+ sell boost the bar drops to a single verified source;
+// unverified bearish stays预警-only.
+func (in SellInput) bearHard(p sellParams) bool {
+	if !in.Bear.Hit {
+		return false
+	}
+	if in.Bear.Verified == BearVerifiedDual {
+		return true
+	}
+	return p.dualOnSingle && in.Bear.Verified == BearVerifiedSingle
 }
 
 // SellVerdict 单持仓一轮裁决的完整产出（§SELLPOINT-UNIFY P2 展示投影用）：
 // Disposal=pass 处置单（nil=本轮无处置）、HoldReason=观察/延持说明、Line/Settled/Extends=状态快照。
+// Boost=§DYN-SIZE P2 本轮生效的卖出加权档位（""=未加权）。
 type SellVerdict struct {
 	Disposal   *SellDisposal
 	HoldReason string
 	Line       SellLine
 	Settled    bool
 	Extends    int
-	Valid      bool // false=价格无效等不可裁决轮次（状态未动，展示层不得出卡）
+	Boost      string // §DYN-SIZE P2：生效的卖出加权档位（""=未加权）
+	Valid      bool   // false=价格无效等不可裁决轮次（状态未动，展示层不得出卡）
 }
 
 // JudgeSellView 与 JudgeSell 同一次裁决，但回传完整三态视图（P2 切闸后 engine 投影/执行都吃它）。
 // （JudgeSellView performs the same adjudication as JudgeSell and returns the full verdict view.）
 func (c *Controller) JudgeSellView(ch Channel, account string, in SellInput, pol Policy, now time.Time) SellVerdict {
 	p := sellParamsOf(pol.Discipline)
+
+	// §DYN-SIZE P2 卖出加权：从市场环境快照解析档位并注入裁决参数。
+	// 影子模式（灰度期）只留痕不下发——与买入侧 applySizing 同纪律：观察期先积累"会加权几次"，
+	// 不提前改变资金行为（卖出加权会缩短确认窗/取消延持，直接改变成交时点）。
+	// English: §DYN-SIZE P2 — resolve the sell-boost tier from the regime and inject it into the
+	// adjudication params; shadow mode records only (same discipline as the buy-side applySizing).
+	boost, boostReasons := ComputeSellBoost(pol.Regime)
+	boostShadow := boost != "" && pol.Regime.SizeCfg.ShadowOn()
+	if boost != "" && !boostShadow {
+		p.boost = boost
+		p.noExtend = SellBoostApplies(boost)
+		p.dualOnSingle = SellBoostApplies(boost)
+	}
+
 	key := sellKey{ch, account, in.Code}
 
 	c.mu.Lock()
@@ -267,11 +306,24 @@ func (c *Controller) JudgeSellView(ch Channel, account string, in SellInput, pol
 			record.Reason = holdReason
 		}
 	}
+	// §DYN-SIZE P2 卖出加权留痕：命中即挂档位 + 触发条件（影子期标 [shadow]，只观察不下发）；
+	// 处置理由前置档位前缀——审计侧要能一眼分清"基准口径卖的"与"加权口径卖的"。
+	if boost != "" {
+		record.SellBoost = boost
+		record.SizingReasons = boostReasons
+		if boostShadow {
+			record.Shadow = true
+			record.SizingReasons = append([]string{"[shadow]拟加权"}, boostReasons...)
+		} else if disposal != nil {
+			disposal.Reason = "[" + boost + "卖出加权] " + disposal.Reason
+			record.Reason = disposal.Reason
+		}
+	}
 	c.mu.Unlock()
 	if record.Verdict != "" {
 		c.record(record)
 	}
-	return SellVerdict{Disposal: disposal, HoldReason: holdReason, Line: st.Line, Settled: st.Settled, Extends: st.Extends, Valid: true}
+	return SellVerdict{Disposal: disposal, HoldReason: holdReason, Line: st.Line, Settled: st.Settled, Extends: st.Extends, Boost: boost, Valid: true}
 }
 
 // JudgeSell 卖出裁决唯一入口（单持仓一轮探针）。返回处置单或 nil；三态裁定自动留痕。
@@ -364,13 +416,19 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	case pnl <= -p.sl*p.dm:
 		line = SellLineDeepBreach
 	case pnl <= -p.sl:
-		if in.bearHard() {
+		if in.bearHard(p) {
 			// 语义①：触止损线 + 双源验证利空 → 当轮直接硬清，不等窗（首触/窗内/延持期均即时）。
+			// §DYN-SIZE P2：卖出加权 L2+ 时门槛放宽到单源（p.dualOnSingle），理由文案随之区分。
 			st.Line = firstOf(st.Line, SellLineStopLoss)
 			st.Settled, st.Confirmed = true, true
 			st.ConfirmedAt, st.ConfirmedAction = now, SellActionClose
+			bearWhy := "触止损线且利空双源验证，即时硬清"
+			if p.dualOnSingle && in.Bear.Verified != BearVerifiedDual {
+				// 档位由 JudgeSellView 留痕时统一挂前缀，此处只说明"门槛被放宽"这一事实。
+				bearWhy = "触止损线且利空单源验证（加权放宽），即时硬清"
+			}
 			return st, &SellDisposal{Code: in.Code, Action: SellActionClose, Line: st.Line, PnlPct: pnl, At: now,
-				Reason: "触止损线且利空双源验证，即时硬清" + evi}, ""
+				Reason: bearWhy + evi}, ""
 		}
 		line = SellLineStopLoss
 	case pnl >= p.tp:
@@ -388,6 +446,8 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	}
 
 	// ③ 首触锁定：判定线 + 固定结算点（对齐 09:30 栅格一次锁死，边界⑤）。
+	// §DYN-SIZE P2：卖出加权 L2+ 时观察窗**减半**（下限 1 分钟）——风险来临时缩短"再等等看"的
+	// 暴露时间；窗长只影响结算点，判定线/栅格对齐口径不变。
 	if st.Line == SellLineNone {
 		if line == SellLineNone {
 			return st, nil, ""
@@ -397,6 +457,12 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 		st.WindowMin = p.exitMin
 		if line == SellLineTrail {
 			st.WindowMin = p.trailMin
+		}
+		if SellBoostApplies(p.boost) {
+			st.WindowMin = st.WindowMin / 2
+			if st.WindowMin < 1 {
+				st.WindowMin = 1
+			}
 		}
 		st.SettleStart = alignSettleSell(now, st.WindowMin)
 		return st, nil, fmt.Sprintf("命中%s(盈亏%.2f%%)，进入%d分钟观察窗", st.Line, pnl, st.WindowMin) + evi
@@ -434,31 +500,49 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	// 止损触线后战法 fac_138 持续喊买，旧口径一路延持 22 次（10:00→15:15）拿到收盘，
 	// 只靠 -12% 深破线兜底——上限正是给"延持止损"这个无界下行定价的第二重闸。
 	// maxExt<=0 = 无上限（逃生阀口径，正常配置到不了这里）。
+	// §DYN-SIZE P2：卖出加权 L2+（p.noExtend）直接取消延持——风险环境下不给"信号还在就再拿着"
+	// 的额度，与"严买入宽卖出"同向；理由文案与"延持额度用尽"严格区分，审计侧可归因。
 	capped := false
+	noExtend := false
 	if bullLive {
-		if p.maxExt > 0 && st.Extends >= p.maxExt {
+		switch {
+		case p.noExtend:
+			noExtend = true
+		case p.maxExt > 0 && st.Extends >= p.maxExt:
 			capped = true // 信号仍在但不再延持，落到下方按无信号处置
-		} else {
+		default:
 			st.Extends++
 			st.SettleStart = st.SettleStart.Add(time.Duration(st.WindowMin) * time.Minute)
 			return st, nil, fmt.Sprintf("窗结算仍有做多信号，延持第%d次（新结算点 %s）", st.Extends, st.SettleStart.Format("15:04:05")) + evi
 		}
 	}
 	// 无信号（或延持达上限视同无信号）→ 处置：止盈/移动止盈全平；止损首触未深破半平（与旧口径一致）。
+	// §DYN-SIZE L3（owner 2026-10-16 授权）：加权到 L3 时半平**升级为全平**（trim→close）——
+	// "严买入宽卖出"在风险环境下的最高档：首触止损即整仓离场，不再留半仓暴露。升级只发生在
+	// 确认这一刻；已确认处置按 ConfirmedAction 重放（逐字节一致，见 ①），档位变更不翻案。
 	st.Settled, st.Confirmed = true, true
 	d := &SellDisposal{Code: in.Code, Line: st.Line, PnlPct: pnl, At: now, Action: SellActionClose}
 	switch st.Line {
 	case SellLineTakeProfit, SellLineTrail:
 		d.Reason = "止盈窗结算无信号，止盈离场" + evi
 	case SellLineStopLoss:
-		d.Action = SellActionTrim
-		d.Reason = "止损窗结算无信号，首触止损未深破减半仓" + evi
+		if SellBoostEscalatesTrim(p.boost) {
+			d.Reason = "止损窗结算无信号，首触止损未深破升级全平（trim→close）" + evi
+		} else {
+			d.Action = SellActionTrim
+			d.Reason = "止损窗结算无信号，首触止损未深破减半仓" + evi
+		}
 	default:
 		d.Reason = "止损窗结算无信号，止损离场" + evi
 	}
 	if capped {
 		// 处置理由必须可归因：审计侧要能分清"真没信号"与"信号在但延持额度用完"。
 		d.Reason = fmt.Sprintf("延持已达%d次上限，按无信号处置：", p.maxExt) + d.Reason
+	}
+	if noExtend {
+		// §DYN-SIZE P2：卖出加权取消延持（与"额度用完"是两条不同的授权路径，理由必须可区分）。
+		// 档位前缀由 JudgeSellView 统一挂（此处不重复挂，否则留痕出现双前缀）。
+		d.Reason = "取消延持，按无信号处置：" + d.Reason
 	}
 	st.ConfirmedAction = d.Action // 固化动作，后续重放逐字一致
 	st.ConfirmedAt = now          // §0926E2E-11A：确认时刻落戳，重放新鲜度闸的判据
@@ -483,7 +567,8 @@ func sellConfirmedStale(at, now time.Time) bool {
 func confirmedReplay(st *sellState, code string, pnl float64, now time.Time, p sellParams, evi string) *SellDisposal {
 	action := st.ConfirmedAction
 	if action == "" { // 兜底：存量状态无固化动作时按线型回退
-		if st.Line == SellLineStopLoss && pnl > -2*p.sl {
+		// L3 升级同样适用于这条兜底路（与窗结算确认口径一致：存量状态也不留半仓）。
+		if st.Line == SellLineStopLoss && pnl > -2*p.sl && !SellBoostEscalatesTrim(p.boost) {
 			action = SellActionTrim
 		} else {
 			action = SellActionClose

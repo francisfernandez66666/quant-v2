@@ -2360,6 +2360,66 @@ func (m *MarketAPI) GetIndexMASlopes() (ma20Slope, ma60Slope float64) {
 	return
 }
 
+// IndexTrendBroken §DYN-SIZE：上证指数是否**趋势破位**——供止损两态判别（单日冲击 vs 趋势下跌）。
+//
+// 判据（任一成立即破位，三条都取自日线，非当日分时）：
+//   - 收盘跌破**下行**的 MA20（收盘 < MA20 且 MA20 较 5 日前更低）；
+//   - 收盘创 20 日新低（含当日）；
+//   - 连续 ≥3 个交易日阴跌（逐日收盘递减）。
+//
+// 数据不足（<26 根日线）或接口失败 → false（弃权方向：不因数据缺失而把"单日冲击"误判成
+// "趋势破位"，那会让止损在数据抖动时反向收紧）。
+// English: §DYN-SIZE — whether the SH index trend has broken down (below a falling MA20 / a fresh
+// 20-day low / ≥3 consecutive down days). Insufficient data or a fetch failure returns false
+// (abstain), so a missing reading never turns a one-day shock into a "trend breakdown".
+func (m *MarketAPI) IndexTrendBroken() bool {
+	klines, err := m.klineBySecID(indexSecID("000001"), "101", 60)
+	if err != nil || len(klines) < 26 {
+		return false
+	}
+	closes := make([]float64, len(klines))
+	for i := range klines {
+		closes[i] = klines[i].Close
+	}
+	n := len(closes)
+	last := closes[n-1]
+
+	// 1. 收盘跌破下行的 MA20。
+	ma20At := func(end int) float64 { // end 为闭区间右端（含），向前取 20 根
+		sum := 0.0
+		for i := end - 19; i <= end; i++ {
+			sum += closes[i]
+		}
+		return sum / 20
+	}
+	ma20Now, ma20Prev := ma20At(n-1), ma20At(n-6)
+	if ma20Now > 0 && ma20Prev > 0 && last < ma20Now && ma20Now < ma20Prev {
+		return true
+	}
+
+	// 2. 创 20 日新低（含当日）。
+	min20 := closes[n-20]
+	for i := n - 20; i < n; i++ {
+		if closes[i] < min20 {
+			min20 = closes[i]
+		}
+	}
+	if last <= min20 {
+		return true
+	}
+
+	// 3. 连续 ≥3 日阴跌。
+	down := 0
+	for i := n - 1; i > 0; i-- {
+		if closes[i] < closes[i-1] {
+			down++
+			continue
+		}
+		break
+	}
+	return down >= 3
+}
+
 // masLowSlope 对收盘价序列计算 maLen 均线在 lookback 日前的归一化变化率；数据不足返回 NaN。
 // English: normalized change-rate of the maLen moving average over `lookback` bars; NaN if insufficient.
 func masLowSlope(closes []float64, maLen, lookback int) float64 {
