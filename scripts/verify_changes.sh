@@ -2311,6 +2311,15 @@ first = d[3:].decode('utf-8').split('\n', 1)[0].lstrip('\ufeff')
 assert first.startswith('#'), '首行不是注释（%r）——dot-source 时 CommandNotFoundException 会中止部署链' % first[:48]
 PY
 done
+# §DEP-LOCALE（2026-10-16 部署实录）：face 段的 `tr -d '\000\r'` 必须活在字节透明 locale 里。
+# 实录：调用方 shell 是 C.UTF-8，certutil 的现网输出按码页 936 带 GBK 双字节 → tr 抛
+# Illegal byte sequence 并**静默产出空** → face 五份全 DIFF 假红、部署自我熔断，而 scp
+# 其实全部成功（本地/现网哈希一致）。修法＝脚本自己钉 LC_ALL=C/LANG=C，不随调用方环境。
+# 本锁钉住这两行在位：少一行，换个 UTF-8 shell 调部署就会把成功的上传熔断在半路。
+grep -qF 'export LC_ALL=C' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署脚本未显式钉字节透明 locale（face 段 tr 在 UTF-8 shell 下静默产出空＝部署自我熔断）"; exit 1; }
+grep -qF 'export LANG=C' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署脚本未钉 LANG=C（LC_ALL 缺位时的第二道环境依赖）"; exit 1; }
 # 落盘目录三方同源：部署上传位 == 任务默认指向 == RUNBOOK 手工安装位（否则"更新一份、执行另一份"）。
 grep -qF 'BACKUP_DIR="${DEPLOY_DIR}/deploy/qmt-win"' scripts/deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 部署侧快照目录不再与任务指向同源（双份脚本漂移风险复活）"; exit 1; }

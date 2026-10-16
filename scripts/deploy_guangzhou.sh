@@ -38,6 +38,17 @@
 
 set -euo pipefail
 
+# §DEP-LOCALE（2026-10-16 部署实录）：字节透明 locale 必须**显式钉死**，不随调用方 shell。
+# 实录：本批部署在 face 段五份二进制全部 DIFF（现网读数为空）被自己的熔断正确拦下，而
+# scp 其实全部成功——根因是调用方 shell 的 locale 是 C.UTF-8：certutil 的现网输出按码页
+# 936 带 GBK 双字节（表头"哈希"两字），`tr -d '\000\r'` 遇非法 UTF-8 序列直接
+# Illegal byte sequence 并**静默产出空**，后面 grep 自然摘不到 64 位十六进制。
+# 历史上能跑是因为此前都在 C locale 的 shell 里调本脚本——同一个二进制在不同调用环境下
+# 表现相反，这种环境依赖必须钉掉：LC_ALL=C 下 tr/grep 对所有字节一视同仁，
+# GBK 噪音原样穿过、十六进制照常落地，face 读数恢复"逐份字节同源"的本意。
+export LC_ALL=C
+export LANG=C
+
 SYNC_ONLY=0
 while getopts ":s" opt; do case $opt in s) SYNC_ONLY=1 ;; *) ;; esac; done
 
