@@ -1695,7 +1695,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 				var h struct {
 					LiveReady bool `json:"live_ready"`
 				}
-				_ = json.NewDecoder(resp.Body).Decode(&h)
+				if decErr := json.NewDecoder(resp.Body).Decode(&h); decErr != nil {
+					// 网关健康体解析失败：保持 gateway=false（依赖不可判定按不可用收口），并留痕
+					log.Printf("[readyz] 网关 /health 解析失败: %v", decErr)
+				}
 				resp.Body.Close()
 				gatewayOK = h.LiveReady
 			}
