@@ -255,31 +255,46 @@ Probe ("web:fingerprint:" + $Commit) $hit $detail
 # favicon/robots 全盲——W1 改完它照样全绿，"verify 绿"不能证明 W1 生效。
 # 明细全 ASCII（PS→SSH→bash 回传按 GBK 解码，中文明细会变乱码，见第 19 探针判例）。
 function HVal($h, $name) {
-    foreach ($k in $h.Keys) { if ($k -ieq $name) { return [string]$h[$k] } }
-    return ""
+    # 直接按头名取值：不枚举 AllKeys/Keys——PS5.1 的 BasicHtmlWebResponseObject.Headers
+    # 是 Dictionary 适配对象，枚举路径在现网首跑抛过空引用（G1–G6 全 ERR 的根因）。
+    if ($null -eq $h) { return "" }
+    try { return [string]$h[$name] } catch { return "" }
 }
-function HReq($url, $method = "GET", $range = "") {
-    $p = @{ Uri = $url; Method = $method; UseBasicParsing = $true; TimeoutSec = 10 }
-    if ($range) { $p.Headers = @{ Range = $range } }
+function HReq($url, $method = "GET") {
     try {
-        $r = Invoke-WebRequest @p
-        $dict = @{}
-        $keys = @()
-        try { $keys = @($r.Headers.AllKeys) } catch { }
-        if ($keys.Count -eq 0) { try { $keys = @($r.Headers.Keys) } catch { } }
-        foreach ($k in $keys) { $dict[$k] = [string]$r.Headers[$k] }
-        return @{ code = [int]$r.StatusCode; h = $dict; body = [string]$r.Content }
+        if ($method -eq "HEAD") {
+            $r = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 10
+        } else {
+            $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
+        }
+        return @{ code = [int]$r.StatusCode; h = $r.Headers; body = [string]$r.Content }
     } catch {
         $resp = $_.Exception.Response
         if ($null -ne $resp) {
-            $dict = @{}
-            $keys = @()
-            try { $keys = @($resp.Headers.AllKeys) } catch { }
-            if ($keys.Count -eq 0) { try { $keys = @($resp.Headers.Keys) } catch { } }
-            foreach ($k in $keys) { $dict[$k] = [string]$resp.Headers[$k] }
-            return @{ code = [int]$resp.StatusCode; h = $dict; body = "" }
+            return @{ code = [int]$resp.StatusCode; h = $resp.Headers; body = "" }
         }
-        return @{ code = "ERR"; h = @{}; body = "" }
+        return @{ code = "ERR"; h = $null; body = [string]$_.Exception.Message }
+    }
+}
+# HReqRange 单独走 Headers（Range 200/206 的判据在 G4）。
+function HReqRange($url, $range) {
+    try {
+        # PS5.1 的 Invoke-WebRequest 把 Range 视为受限头，直接塞 -Headers 会在发请求前抛异常；
+        # Windows Server 2022 自带 curl.exe，改用 curl 取状态行与 Content-Range（只读 1KB）。
+        $raw = @(& curl.exe -s -D - -o NUL -H ("Range: " + $range) $url)
+        $code = "ERR"
+        $dict = @{}
+        foreach ($line in $raw) {
+            if ($line -match '^HTTP/') {
+                $parts = $line -split ' '
+                if ($parts.Count -ge 2) { $code = [int]$parts[1] }
+            } elseif ($line -imatch '^content-range:\s*(.+)$') {
+                $dict['Content-Range'] = $matches[1].Trim()
+            }
+        }
+        return @{ code = $code; h = $dict; body = "" }
+    } catch {
+        return @{ code = "ERR"; h = @{}; body = [string]$_.Exception.Message }
     }
 }
 $webBase = "http://127.0.0.1:" + $WebPort
@@ -317,7 +332,7 @@ $g4 = HReq ($webBase + "/dl/quant-latest.apk") "HEAD"
 $g4ct = HVal $g4.h "Content-Type"
 $g4cd = HVal $g4.h "Content-Disposition"
 $g4cc = HVal $g4.h "Cache-Control"
-$g4r = HReq ($webBase + "/dl/quant-latest.apk") "HEAD" "bytes=0-1023"
+$g4r = HReqRange ($webBase + "/dl/quant-latest.apk") "bytes=0-1023"
 $g4ok = ($g4.code -eq 200) -and ($g4ct -match "android.package-archive") -and ($g4cd -match "attachment") -and $g4cc -and
         ($g4r.code -eq 206) -and (HVal $g4r.h "Content-Range")
 Probe "web:G4 apk headers/range" $g4ok ("code=" + $g4.code + " ct=" + $g4ct + " cd=" + $g4cd + " cc=" + $g4cc + " range=" + $g4r.code + "/" + (HVal $g4r.h "Content-Range"))

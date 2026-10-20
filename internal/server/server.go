@@ -1684,7 +1684,22 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	marketOK := s.dc != nil || s.market != nil
 	gatewayOK := false
 	if ctrl := s.qmtCtrlFor(s.operatorID()); ctrl != nil {
-		gatewayOK = ctrl.Snapshot().LastProbeOK
+		snap := ctrl.Snapshot()
+		gatewayOK = snap.LastProbeOK
+		// §F-13：控制器缓存可能停在部署启动时（首探失败后要等下一轮）；
+		// 网关 /health 的 live_ready 是同一事实源的即时读数，作为第二权威，避免 readyz 误报依赖不可用。
+		// 只读本机网关、2s 上限、只取布尔，不触碰任何业务数据/凭据。
+		if !gatewayOK && snap.GatewayURL != "" {
+			cli := &http.Client{Timeout: 2 * time.Second}
+			if resp, err := cli.Get(strings.TrimRight(snap.GatewayURL, "/") + "/health"); err == nil {
+				var h struct {
+					LiveReady bool `json:"live_ready"`
+				}
+				_ = json.NewDecoder(resp.Body).Decode(&h)
+				resp.Body.Close()
+				gatewayOK = h.LiveReady
+			}
+		}
 	}
 	ok := dbOK && marketOK && gatewayOK
 	status := http.StatusOK

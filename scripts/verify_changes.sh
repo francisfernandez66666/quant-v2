@@ -5538,7 +5538,7 @@ for f in outbox_admin.py register_service.ps1 all_service_watchdog.ps1 daily_ops
 done
 eq106 scripts/verify_deploy_guangzhou.sh '第 29 探针' 5 '⑪-1 第 29 探针五处同源（头部清单/可调项说明/变量定义/param 注释/正文段）'
 eq106 scripts/verify_deploy_guangzhou.sh '第 30 探针' 3 '⑩ 第 30 探针三处同源（头部清单/param 注释/正文段）'
-eq106 scripts/verify_deploy_guangzhou.sh '^Probe ' 26 '⑩⑪＋§107 后 PS 侧行首探针语句数（第 31 探针快照 ACL 入列 25→26；新增探针须先重跑预演再改这里的数）'
+eq106 scripts/verify_deploy_guangzhou.sh '^Probe ' 32 '⑩⑪＋§107 后 PS 侧行首探针语句数（第 31 探针快照 ACL 入列 25→26；2026-10-20 §N-06 G1–G6 公共面 26→32）'
 eq106 scripts/verify_deploy_guangzhou.sh 'amount-check' 4 '⑩ 现网只读抽检调用链（注释 2 处 + 实调用 2 处：§W7-D 起 daily 腿与 ths_daily 腿各一条，2026-10-09 同步 3→4）'
 # INFO 恒回显在位锁：绿也要看得到抽检读数（摘掉这条＝量纲只在红的时候才留痕，观察面退回自证）。
 # 与 §101 的 INFO|cal_readout / INFO|limitdown_readout 两把同姿势；摘掉即 §88 计数锁同时判红。
@@ -13770,7 +13770,10 @@ echo "ok - §120 §GATE-SELFACC 门禁自账收口通过：静态锁 $(pcount120
 rm -rf "$W120"
 
 echo "==> §20261020 UAT 修复批（W1–W11）静态锁"
-fail2026() { echo "--- FAIL: §20261020 $*"; exit 1; }
+fail2026() {
+  echo "--- FAIL: §20261020 $*"
+  exit 1
+}
 # W1 Caddy：两站点块同构的深链/资产/APK/安全头/初始化入口
 [ "$(grep -c 'try_files {path} /index.html' deploy/caddy/guangzhou.conf)" -ge 2 ] || fail2026 "Caddy SPA 深链回落缺失（两份站点块都要有）"
 [ "$(grep -c 'handle /assets/\*' deploy/caddy/guangzhou.conf)" -ge 2 ] || fail2026 "Caddy /assets 独立 handle 缺失"

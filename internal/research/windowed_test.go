@@ -330,10 +330,12 @@ func TestPostPreProgressEmitted(t *testing.T) {
 // TestOptTrialCheckpointResume §QRESUME（2026-10-17）回归：坐标上升权重优化阶段的 trial
 // 级断点。现网 #427/#435 三年全池发现每夜烧满单夜预算(4h)后从零重跑同一试验轨迹、
 // 进度永远停在 69%（断点表实测只有 pre/greedy 行、零 ir/gen 行）——本测试锤实三件事：
-//  ① 落库面：首跑后初始等权向量必须有 optw 缓存行；
-//  ② 命中原样返回：预置"带毒"缓存（|IR|=9.99 不可能被候选击败），重跑必须原样采用
-//     该值且权重停在初值——证明续跑走缓存而不是重算；
-//  ③ 缓存不改变结论：换全新断点键的二跑与冷跑结果一致。
+//
+//	① 落库面：首跑后初始等权向量必须有 optw 缓存行；
+//	② 命中原样返回：预置"带毒"缓存（|IR|=9.99 不可能被候选击败），重跑必须原样采用
+//	   该值且权重停在初值——证明续跑走缓存而不是重算；
+//	③ 缓存不改变结论：换全新断点键的二跑与冷跑结果一致。
+//
 // English: §QRESUME regression for trial-level checkpoints in the weight-optimization stage —
 // the initial vector must be cached, a poisoned entry must be adopted verbatim (proving hits
 // short-circuit recompute), and a fresh-key re-run reproduces the cold result.
