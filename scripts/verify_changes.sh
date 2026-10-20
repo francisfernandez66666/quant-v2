@@ -10623,6 +10623,7 @@ PAP113=web/src/pages/Paper.jsx
 DRW113=web/src/components/StockDetailDrawer.jsx
 DPT113=web/src/components/DepthPanel.jsx
 WLS113=web/src/pages/Watchlist.jsx
+PF113=web/src/components/priceFormat.jsx
 RES113=web/src/pages/Research.jsx
 STY113=web/src/styles.css
 API113=web/src/api/index.js
@@ -10900,10 +10901,13 @@ minj113 "$RES113" 'signColor(' 5 'P1：着色出口被多处消费'
 SNAP113 4
 
 # ── ⑤ §P3-FE 缺数渲染三态（watchlist 的 ¥0.00 与 DepthPanel 的 '--' 染绿）──
-eqj113 "$WLS113" "export const WL_NO_DATA_PLACEHOLDER = '—'" 1 'P8：缺测占位串只有一处定义（各页自拼会让判据退化成逐页认文案）'
-eqj113 "$WLS113" 'export function PriceCell({ value })' 1 'P8：现价单元格单实现'
-eqj113 "$WLS113" 'export function PctCell({ value })' 1 'P8：涨跌单元格单实现'
-minj113 "$WLS113" 'wl-no-data' 2 'P8：两列各有一枚缺测标记 testid（少于 2＝某一列又回到渲染 0）'
+# §F-19（2026-10-20）：单实现已抽到 components/priceFormat.jsx；Watchlist 只保留同名重导出。
+# 判据仍钉“定义恰好一处”，但定义位置随实现迁移——只改目标文件，不放宽等值。
+eqj113 "$PF113" "export const WL_NO_DATA_PLACEHOLDER = '—'" 1 'P8：缺测占位串只有一处定义（各页自拼会让判据退化成逐页认文案）'
+eqj113 "$PF113" 'export function PriceCell({ value })' 1 'P8：现价单元格单实现'
+eqj113 "$PF113" 'export function PctCell({ value })' 1 'P8：涨跌单元格单实现'
+eqj113 "$WLS113" 'export const WL_NO_DATA_PLACEHOLDER = SHARED_NO_DATA' 1 'P8：Watchlist 只重导出共享占位串，不再另写一份'
+minj113 "$PF113" 'wl-no-data' 2 'P8：两列各有一枚缺测标记 testid（少于 2＝某一列又回到渲染 0）'
 negj113 "$WLS113" 'Number(wlMap[code]?.price) || 0' 'P9：缺数归零形态禁止复活（0 会被当成「一个真实的股价」渲染成 ¥0.00）'
 negj113 "$WLS113" 'Number(s.change_pct) || 0' 'P9：行情刷新腿的归零禁止复活'
 negj113 "$WLS113" "'¥' + (row.price || 0).toFixed(2)" 'P9：表格列的 || 0 兜底禁止复活'
@@ -12016,13 +12020,13 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 186 'Q1 的 R：HandleFunc 派生读数须等值打印（修复单 §七 明写现值 186）'
+eqkey115 ROUTES_DERIVED 188 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-20 新增 /livez /readyz 后 186→188）'
 eqkey115 CALLPATH_DERIVED 150 'C 的规范化路径条数（前端真拨得出去的地址）'
 eqkey115 CALLSITES_DERIVED 153 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 186 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
+eqkey115 LEDGER_ROWS 188 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
 eqkey115 COVERED_BY_WEB 150 '被前端覆盖的路由条数'
-eqkey115 UNCALLED 36 'R−C：每条都必须有分类标签＋可核落点（本批重算的交付物就是这个数）'
+eqkey115 UNCALLED 38 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 两条兼容端点后 36→38）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
 eqkey115 NO_BASIS 0 '「无依据」档必须为空：说不清为什么还留着＝待决策，不许混进台账假装闭合'
@@ -12084,8 +12088,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 186 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 186 '镜像基线：台账行数与主仓同值'
+eqkey115 ROUTES_DERIVED 188 '镜像基线：R 与主仓同值'
+eqkey115 LEDGER_ROWS 188 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -12137,11 +12141,11 @@ KLINE_ROW=$(printf '%s\n' "$LED_DATA" | grep -F "$(printf '\t')/api/kline$(print
 CNT115=$((CNT115 + 1))
 [ -n "$KLINE_ROW" ] || { echo "--- FAIL: §115 反证靶行取不到（台账里没有带 tab 分隔的 /api/kline 行＝列格式变了，上面那些 awk 尺子也一起失效）"; exit 1; }
 # C1 整行删除：账少一条，R 照旧 186 → 翻的是 LEDGER_ROWS。
-dys115 C1 "$LED115" "$KLINE_ROW" "" LEDGER_ROWS 185 '新增/改名注册没进分类账（台账漏了一条路由）'
+dys115 C1 "$LED115" "$KLINE_ROW" "" LEDGER_ROWS 187 '新增/改名注册没进分类账（台账漏了一条路由）'
 # C2 幽灵台账行：行数不变、R 不变，红在「对不上现网注册」那一侧。
 # 取向：不写 printf 拼串的占位写法（拼错一次会静默变成 no-op，而 no-op 的反证看起来像跑过了）。
 KLINE_PATH_GHOST=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')/api/kline$(printf '\t')#$(printf '\t')/api/kline-renamed-x$(printf '\t')#")
-dys115 C2 "$LED115" "$KLINE_ROW" "$KLINE_PATH_GHOST" LEDGER_ROWS 186 '路由已删/改名而台账没跟着改：行数仍 186，红在「对不上现网注册」——所以本枚的独有读数是 LEDGER_ROWS 不变（与 C1 的 185 分得开）'
+dys115 C2 "$LED115" "$KLINE_ROW" "$KLINE_PATH_GHOST" LEDGER_ROWS 188 '路由已删/改名而台账没跟着改：行数仍 188，红在「对不上现网注册」——所以本枚的独有读数是 LEDGER_ROWS 不变（与 C1 的 187 分得开）'
 KLINE_CLASS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(printf '\t')internal/server/handlers_fix.go#$(printf '\t\t')internal/server/handlers_fix.go#")
 dys115 C3 "$LED115" "$KLINE_ROW" "$KLINE_CLASS" UNTAGGED 1 '分类标签被清空：空标签＝「没看过」被算成「看过了」（Q2 的等值锁）'
 KLINE_NOBASIS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(printf '\t')internal/server/handlers_fix.go#$(printf '\t')无依据$(printf '\t')internal/server/handlers_fix.go#")
@@ -12154,7 +12158,7 @@ dys115 C5 "$LED115" "$KLINE_ROW" "$KLINE_EVID" BROKEN_EVIDENCE 1 '落点指向�
 # C6 前端把调用点删了而台账没改：翻 LEDGER_LIES（撒谎检测），R 与台账都不动。
 dys115 C6 web/src/api/index.js "  return request('/api/research/library')" "  return [] // §115 C6 反证：调用点被摘掉而台账仍写「前端调用」" LEDGER_LIES 1 '「标签必须被实时派生证实」这条不在 Q1–Q3 里，但没有它，台账可以把每一条都写成前端调用然后绿着'
 # C7 新注册没进账：翻 ROUTES_DERIVED（与 C1 的文案同色、读数不同色——正是本枚要断读数的原因）。
-dys115 C7 internal/server/server.go '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' "$(printf '%s\n' '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' '	s.mux.HandleFunc("GET /api/w115-newprobe", s.authMiddleware(s.handleHealth))')" ROUTES_DERIVED 187 '新加路由没归类：与 C1 的区别是 R 涨了（187）而台账还是 186——只看文案的锁分不开这两枚'
+dys115 C7 internal/server/server.go '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' "$(printf '%s\n' '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' '	s.mux.HandleFunc("GET /api/w115-newprobe", s.authMiddleware(s.handleHealth))')" ROUTES_DERIVED 189 '新加路由没归类：与 C1 的区别是 R 涨了（189）而台账还是 188——只看文案的锁分不开这两枚'
 # C8 幽灵调用（Q3）：前端拨一个服务端没注册的地址，GHOST_CALLS 才现形。
 dys115 C8 web/src/api/index.js "export async function fetchSignals() {" "$(printf '%s\n' 'export async function w115GhostProbe() {' "  return request('/api/w115-ghost-target', { method: 'POST' })" '}' '' 'export async function fetchSignals() {')" GHOST_CALLS 1 '拨未注册地址＝运行期 404：这条比缺 UI 严重，所以单独立数'
 # C9 派生模式失效的「空转正」：把 R 的正则改坏，读回 0 —— ROUTE_FLOOR 必须当场红，
@@ -12183,7 +12187,7 @@ SUMK115=$((K1_N + K2_N + K3_N + K4_N + K5_N))
 CNT115=$((CNT115 + 1))
 [ "$SUMK115" = "$((CNT115 - 1))" ] || { echo "--- FAIL: §115 分组求和自证锁 ${CNT115}（五组快照之和 ${SUMK115} != 累计判定点扣本锁 $((CNT115 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
 rm -rf "$W115"
-echo "ok - §115 全段通过：① 台账形态与证据诚实（含公网 IP/凭据/镜像路径三枚负锁与核对器掏空负锁）${K1_N} 道 + ② 逐键等值（R=186 / C=150 / 未调用=36 / Q2=0 / Q3=0）+ 三枚求和自证 ${K2_N} 道 + ③ 镜像基线自证（派生清单 ${MIRN115} 个文件、逐键与主仓同值）${K3_N} 道 + ④ ${DYS115_N} 枚反证 C1–C${DYS115_N}（每枚断一个本枚独有读数）${K4_N} 道 + ⑤ 覆盖面诚实账与在位锁 ${K5_N} 道，累计判定点 ${CNT115}（其中五组快照之和 ${SUMK115}，另有 1 道就是求和自证锁本身）"
+echo "ok - §115 全段通过：① 台账形态与证据诚实（含公网 IP/凭据/镜像路径三枚负锁与核对器掏空负锁）${K1_N} 道 + ② 逐键等值（R=188 / C=150 / 未调用=38 / Q2=0 / Q3=0）+ 三枚求和自证 ${K2_N} 道 + ③ 镜像基线自证（派生清单 ${MIRN115} 个文件、逐键与主仓同值）${K3_N} 道 + ④ ${DYS115_N} 枚反证 C1–C${DYS115_N}（每枚断一个本枚独有读数）${K4_N} 道 + ⑤ 覆盖面诚实账与在位锁 ${K5_N} 道，累计判定点 ${CNT115}（其中五组快照之和 ${SUMK115}，另有 1 道就是求和自证锁本身）"
 echo ""
 
 echo "==> 116 §SIGBATCH 展示侧补价收形（2026-10-13 现网信号 tab「请求超时」修复批，含二批补齐腿）：五个补价面从「逐票真打上游」改成「快照优先 + 每分片一次批量 + 3s 有界等待 + 批量覆盖不住时有上限逐票补齐」，过程读数同格式上屏——静态锁 + 两组行为腿 + 九枚反证（六枚 overlay 行为＋三枚副本静态）..."

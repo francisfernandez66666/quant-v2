@@ -41,7 +41,9 @@ function persistCache(rows, savedAt) {
   // §P2-J 可吞：localStorage 写失败只影响首帧缓存，不影响回源主链
   try {
     localStorage.setItem(cacheKeyForAccount(), JSON.stringify({ v: CACHE_VERSION, saved_at: savedAt, rows }))
-  } catch (_) {}
+  } catch (_) {
+    // §P2-J 可吞：localStorage 写失败只影响首帧缓存，不影响回源主链
+  }
 }
 // 读取缓存：旧数组格式（无 saved_at）与超过 TTL 的缓存一律当作没有缓存
 function loadCache() {
@@ -66,7 +68,11 @@ function loadCache() {
 // 清空本账号缓存（自选被删空时使用，避免下一次进页仍闪出已删除的行）
 function clearCache() {
   // §P2-J 可吞：清缓存失败不影响列表正确性，下一次回源会覆盖
-  try { localStorage.removeItem(cacheKeyForAccount()) } catch (_) {}
+  try {
+    localStorage.removeItem(cacheKeyForAccount())
+  } catch (_) {
+    // §P2-J 可吞：清缓存是旁路动作，失败不阻断主链
+  }
 }
 // 缓存徽标文案：只写“截至”，不得出现“实时”二字
 function formatCacheAt(savedAt) {
