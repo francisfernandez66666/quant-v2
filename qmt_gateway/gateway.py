@@ -8,7 +8,8 @@
                 → {"ok","order_id","err"}
   POST /cancel  {"order_id"}                                                    → {"ok","err"}
   GET  /state   → {"connected","account","positions","orders"}
-  GET  /health  → {"ok","ts","broker","broker_connected"}   （免鉴权；broker_connected 反映通道真实状态）
+  GET  /health  → {"ok","ts","broker","broker_connected","live_ready","xt_connected","feed_connected","xt_last_fail_at"}
+                （免鉴权；ok=进程存活，live_ready=交易通道就绪，两者语义分开——§N-01）
 
 §A1/A2（AUDIT_FULLSTACK_20260918）字段消费口径——/order 15 字段逐字段显式声明：
   消费：signal_id/code/side/price_type/price/qty/amount/created_at/strategy_type/strategy（broker 备注）；
@@ -279,6 +280,9 @@ class Gateway:
         # 桥以 JSONL 文件上报事件（bridge_report.jsonl 追加行），由本线程读文件
         # 并复用 _do_dispatch_result 语义（心跳/快照/派发回报/推量仔零改动）。
         self._file_bridge_thread = None
+        # §N-01（2026-10-20）：最近一次 xt 连接失败时刻（北京时间字符串，空=从未失败）。
+        # 只记录发生时刻，不记录错误原文——/health 免鉴权，内部异常串不得外泄。
+        self._xt_last_fail_at = ""
         # §P2-G（2026-10-06 修复批 波 5）命令文件写失败的可见化：
         # total=累计失败轮次，streak=连续失败轮次（任一轮写成功即归零），
         # held=最近一次失败时被按住（保持 pending、未下发）的单数。
@@ -897,6 +901,8 @@ class Gateway:
                         # 连接失败：失败计数递增后按指数退避等待（封顶 60s），
                         # continue 跳过本轮其余通道的重连，避免每秒猛戳 QMT 客户端
                         xt_fail_streak += 1
+                        # §N-01：把"最后一次失败发生在几点"落成 /health 可读字段
+                        self._xt_last_fail_at = _now_cn()
                         backoff = min(60, int(self.cfg.get("reconnect_sec", 5)) * (2 ** min(xt_fail_streak, 4)))
                         log.warning("[gateway] %s connect failed: %s (backoff %ss, streak=%d)",
                                     key, e, backoff, xt_fail_streak)
@@ -1047,17 +1053,29 @@ class Gateway:
         }
 
     def _health_payload(self):
-        """组装 /health 响应：active 通道状态 + 双通道（xt/queued）状态。"""
+        """组装 /health 响应：进程存活 + 通道就绪 + 双通道（xt/queued）状态。
+
+        §N-01（2026-10-20）：`ok` 只表示"网关进程能回 HTTP"，不再兼任"交易通道可用"。
+        通道健康单列 `live_ready`（= active broker 已连接）；xt/feed 三连接位恒下发布尔，
+        并补 `xt_last_fail_at`（最近一次 xt 连接失败时刻，枚举/时间戳，不是凭据）——
+        这样"通道全断但进程活着"在看门狗、拨测与前端各有一份可读事实。
+        English: §N-01 — `ok` means the HTTP process answers; channel readiness is `live_ready`.
+        The three connection booleans and `xt_last_fail_at` are always present.
+        """
         broker_connected = self.active_broker.is_connected()
         payload = {
-            "ok": True,
+            "ok": True,  # §N-01：仅进程存活语义（旧版被误读成"通道健康"）
             "ts": _now_cn(),
             "broker": self.active_key,
             "broker_connected": bool(broker_connected),
             "broker_mode": self.active_key,  # 与 Go 侧解析字段兼容的别名
+            # 通道就绪：当前接单通道真的连上了才算 ready；进程活着但通道断时这里必须为 false
+            "live_ready": bool(broker_connected),
+            # 最近一次 xt 连接失败时刻（从未失败则为空串）；看门狗与 /readyz 用它回答"几点断的"
+            "xt_last_fail_at": self._xt_last_fail_at,
         }
-        if "xt" in self.brokers:
-            payload["xt_connected"] = bool(self.brokers["xt"].is_connected())
+        # 三个连接位恒下发，避免消费方按"字段缺失"误判成未知/健康
+        payload["xt_connected"] = bool(self.brokers["xt"].is_connected()) if "xt" in self.brokers else False
         if "queued" in self.brokers:
             payload["queued_connected"] = bool(self.brokers["queued"].is_connected())
         # §ENH-5：行情 feed 状态仅作观察字段——Go 侧 Health() 只解析 ok/broker_connected，

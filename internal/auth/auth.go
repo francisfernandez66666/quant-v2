@@ -1445,6 +1445,63 @@ func (m *Manager) DeleteUser(userID string) error {
 	return fmt.Errorf("user not found")
 }
 
+// DeleteConfigs 删除某账号的全部配置行（§F-15 删号数据清理）。
+// 安全约束：userID 为空必须拒绝——空 ID 是平台级/遗留行，清掉等于误删他人配置。
+// 破坏性操作先备份并逐列回验（写盘→读回→逐条比对），备份不成立就不删；返回删除条数。
+// English: deletes every config row for a user. Empty userID is rejected (platform-level rows);
+// a verified backup is written before deletion, and deletion aborts if the backup does not round-trip.
+func (m *Manager) DeleteConfigs(userID string) (int, error) {
+	if userID == "" {
+		return 0, fmt.Errorf("refuse to delete configs with empty user id")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := make([]ConfigEntry, 0, len(m.db.Configs))
+	var removed []ConfigEntry
+	for _, c := range m.db.Configs {
+		if c.UserID == userID {
+			removed = append(removed, c)
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if len(removed) == 0 {
+		return 0, nil
+	}
+	backup := filepath.Join(m.dataDir, fmt.Sprintf("deleted_configs_%s_%s.json", userID, time.Now().Format("20060102_150405")))
+	raw, err := json.MarshalIndent(map[string]interface{}{
+		"user_id": userID, "deleted_at": time.Now().Format(time.RFC3339), "configs": removed,
+	}, "", "  ")
+	if err != nil {
+		return 0, fmt.Errorf("marshal config backup: %w", err)
+	}
+	if err := dataio.AtomicWrite(backup, raw, 0o600); err != nil {
+		return 0, fmt.Errorf("write config backup: %w", err)
+	}
+	// 逐列回验：读回后与内存中的待删行逐条等值，备份不成立就不动数据库
+	back, err := os.ReadFile(backup)
+	if err != nil {
+		return 0, fmt.Errorf("read config backup: %w", err)
+	}
+	var verify struct {
+		Configs []ConfigEntry `json:"configs"`
+	}
+	if err := json.Unmarshal(back, &verify); err != nil || len(verify.Configs) != len(removed) {
+		return 0, fmt.Errorf("config backup verify failed (len=%d want=%d)", len(verify.Configs), len(removed))
+	}
+	for i := range removed {
+		if verify.Configs[i] != removed[i] {
+			return 0, fmt.Errorf("config backup verify mismatch at row %d", i)
+		}
+	}
+	m.db.Configs = kept
+	if err := m.save(); err != nil {
+		return 0, err
+	}
+	log.Printf("[auth] 删号清理配置 user=%s count=%d backup=%s", userID, len(removed), backup)
+	return len(removed), nil
+}
+
 // SetConfig 写入用户配置项（键不存在则新增）。
 // 以 (userID, key) 为唯一维度，已存在则覆盖值，否则追加新条目并落盘。
 // （SetConfig writes a user config entry (adding it when absent). Keyed uniquely by (userID, key):

@@ -80,6 +80,23 @@ function fmtAmt(v) {
   return String(n)
 }
 
+// §N-12a：reason_code → 固定中文话术。后端逐腿诊断/err.message 一律不得直接上屏
+// （旧实现把 push2 主机名、circuit-breaker、unexpected end 这些内部串端给了客户）。
+export function minuteReasonText(data) {
+  const code = data && data.reason_code
+  if (code === 'no_symbol_data') return '该标的暂无分时数据（可能停牌/退市）'
+  if (code === 'minute_sources_unavailable') return '行情源暂时不可用，请稍后重试'
+  return '暂无分时数据'
+}
+// 缓存截至时刻（RFC3339 → "YYYY-MM-DD HH:mm"）；解析失败原样返回
+function fmtCacheAt(v) {
+  if (!v) return ''
+  const d = new Date(v)
+  if (!Number.isFinite(d.getTime())) return String(v)
+  const p = (n) => String(n).padStart(2, '0')
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+}
+
 // 根据容器宽高推导画布视图高度（限制在 0.5×宽 ~ 440px 之间）
 function computeViewH(w, h) {
   return Math.min(440, Math.max(h, Math.round(w * 0.5)))
@@ -116,6 +133,8 @@ export default function KLineChart({
   const [dispName, setDispName] = useState(name)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  // §N-12c：缓存命中时刻（后端 cached_at）；非空时工具栏显示“缓存 · 截至 …”
+  const [cachedAt, setCachedAt] = useState('')
   // 最新收盘价与相对昨收的涨跌幅（工具栏汇总展示）
   const [lastClose, setLastClose] = useState(0)
   const [last, setLast] = useState(0)
@@ -136,6 +155,9 @@ export default function KLineChart({
       if (!code) return
       setLoading(true)
       setError('')
+      // 切换标的/周期时先清旧画布，避免把上一只票的图当成新标的的图
+      setRaw([])
+      setCachedAt('')
       try {
         // 请求分时接口；响应 points 非数组视为格式异常
         const data = await api.fetchMinute(code, scale, count)
@@ -144,21 +166,20 @@ export default function KLineChart({
           if (!cancelled) setError('分时数据格式异常')
           return
         }
-        // 空数据：清空画布数据源；后端附带 error 文案时一并展示
+        if (cancelled) return
+        setCachedAt(data.cached_at || '')
+        // 空数据：清空画布；错误态只读 reason_code 的固定中文（§N-12a）
         if (pts.length === 0) {
-          if (!cancelled) {
-            setRaw([])
-            if (data && data.error) setError(data.error)
-          }
+          setRaw([])
+          setError(minuteReasonText(data))
           return
         }
-        if (cancelled) return
         // 回填点位、昨收与展示名，触发画布重绘
         setRaw(pts)
         setPrevClose(Number(data.prev_close) || 0)
         if (data.name) setDispName(data.name)
       } catch (e) {
-        if (!cancelled) setError(e && e.message ? e.message : '分时加载失败')
+        if (!cancelled) setError('分时加载失败，请稍后重试')
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -515,17 +536,25 @@ export default function KLineChart({
           </span>
         ) : null}
         {
+          // §N-12c：缓存命中时显示截至时刻（与自选页缓存徽标同一契约）
+        }
+        {cachedAt ? <span className="kline-summary">缓存 · 截至 {fmtCacheAt(cachedAt)}</span> : null}
+        {
           // 刷新按钮：重新拉取分时数据并回填状态
         }
         <button className="btn-refresh" disabled={loading} onClick={() => {
+          // §N-12e：刷新与首次加载共用同一状态机——开始先清旧错误；成功（含空结果）再按新结果置态
           setLoading(true)
+          setError('')
           api.fetchMinute(code, scale, count).then((data) => {
             const pts = data && Array.isArray(data.points) ? data.points : null
             if (!pts) { setError('分时数据格式异常'); return }
-            setRaw(pts); setPrevClose(Number(data.prev_close) || 0)
+            setRaw(pts)
+            setCachedAt(data.cached_at || '')
+            setPrevClose(Number(data.prev_close) || 0)
             if (data.name) setDispName(data.name)
-            if (pts.length === 0 && data && data.error) setError(data.error)
-          }).catch((e) => setError(e && e.message ? e.message : '分时加载失败')).finally(() => setLoading(false))
+            if (pts.length === 0) setError(minuteReasonText(data))
+          }).catch(() => setError('分时加载失败，请稍后重试')).finally(() => setLoading(false))
         }}>刷新</button>
       </div>
 
@@ -537,9 +566,9 @@ export default function KLineChart({
       {!loading && !error && raw.length === 0 ? <div className="kline-state">暂无分时数据</div> : null}
 
       {
-        // 分时画布：数据就绪时渲染，支持 hover 十字光标
+        // 分时画布：数据就绪时渲染；刷新失败时保留上一次的图（错误条在上方说明）
       }
-      {!loading && !error && raw.length > 0 ? (
+      {!loading && raw.length > 0 ? (
         <div ref={wrapRef} className="kline-wrap">
           <canvas
             ref={canvasRef}

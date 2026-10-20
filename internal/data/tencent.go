@@ -9,6 +9,7 @@
 package data
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -144,6 +145,10 @@ func (m *MarketAPI) GetTencentMinuteKLine(code string, scale, count int) ([]KLin
 		if status != http.StatusOK {
 			return nil, fmt.Errorf("tencent minute kline status: %d", status)
 		}
+		// §N-12a：200 + 空体/HTML 都不得被当成“零行数据”
+		if len(bytes.TrimSpace(body)) == 0 {
+			return nil, fmt.Errorf("tencent minute kline empty body")
+		}
 		var raw tencentKResp
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return nil, fmt.Errorf("tencent minute kline json: %v", err)
@@ -166,7 +171,19 @@ func (m *MarketAPI) GetTencentMinuteKLine(code string, scale, count int) ([]KLin
 		default:
 			rows = toRows(stk.M5)
 		}
-		return parseTencentKLine(rows, true)
+		// §N-12a：零行＝该标的无分钟数据（合法信封），不是“所有源均失败”
+		if len(rows) == 0 {
+			return nil, ErrNoMinuteData
+		}
+		kl, err := parseTencentKLine(rows, true)
+		if err != nil {
+			// 解析器对“零有效行”只报内部串；在分钟腿把它归成 no_data，其余解析错误仍算源错误
+			if strings.Contains(err.Error(), "no valid rows") {
+				return nil, ErrNoMinuteData
+			}
+			return nil, err
+		}
+		return kl, nil
 	})
 }
 

@@ -524,6 +524,11 @@ func (m *MarketAPI) doWithHeaders(url, referer string) (*http.Response, error) {
 	if rerr != nil {
 		return nil, fmt.Errorf("eastmoney read: %v", rerr)
 	}
+	// §N-12b：200 + 空体必须按失败计——旧实现把空体当成功并回 emRecord(nil) 清零熔断计数，
+	// 于是“空体风暴”永远开不了熔断、已打开的熔断还会被一次假成功洗掉。
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, fmt.Errorf("eastmoney empty body (%s)", url)
+	}
 	if len(raw) > 0 && raw[0] == '<' {
 		return nil, fmt.Errorf("eastmoney returned html (anti-crawler) (%s)", url)
 	}
@@ -871,27 +876,46 @@ func (m *MarketAPI) checkTencentHealth(code string) bool {
 	return err == nil
 }
 
+// healthCheckTimeout §F-18：健康探测总时限（测试可缩短；生产 3s）。
+var healthCheckTimeout = 3 * time.Second
+
 // HealthCheck 探测所有行情源的可用性。
-// 返回每个数据源的探测结果（true=可用，false=不可用）。
-// （HealthCheck probes the availability of all market data sources.
-//
-//	Returns the availability status of each data source.）
+// §F-18（2026-10-20）：三条上游探测改为**并发 + 总时限**——旧实现串行三连探，
+// 首屏健康读数要等三条腿之和（现网约 1.3s）。现在总耗时≈最慢单腿，超过 3s 未回的腿
+// 按 false（不可用）收口，绝不让一个挂起的源把整个健康接口拖死。
+// 返回每个数据源的探测结果（true=可用，false=不可用/超时）。
 func (m *MarketAPI) HealthCheck() map[string]bool {
-	result := make(map[string]bool, 4)
-
-	// 探测东财：尝试获取已知代码 000021 的行情
-	result["eastmoney"] = m.checkEastMoneyHealth("000021")
-
-	// 探测新浪：尝试获取已知代码 600580 的行情
-	result["sina"] = m.checkSinaHealth("600580")
-
-	// 探测腾讯：尝试获取已知代码 000021 的行情
-	result["tencent"] = m.checkTencentHealth("000021")
-
-	// 探测同花顺：同花顺行情源由 DataCoordinator 联合探测，前端通过
-	// /api/data_source_health 汇总返回；此处保持兼容，返回 false。
+	result := map[string]bool{"eastmoney": false, "sina": false, "tencent": false, "ths": false}
+	probes := []struct {
+		name string
+		fn   func() bool
+	}{
+		{"eastmoney", func() bool { return m.checkEastMoneyHealth("000021") }},
+		{"sina", func() bool { return m.checkSinaHealth("600580") }},
+		{"tencent", func() bool { return m.checkTencentHealth("000021") }},
+	}
+	type probeResult struct {
+		name string
+		ok   bool
+	}
+	ch := make(chan probeResult, len(probes))
+	for _, p := range probes {
+		go func(name string, fn func() bool) { ch <- probeResult{name, fn()} }(p.name, p.fn)
+	}
+	timeout := time.After(healthCheckTimeout)
+	for i := 0; i < len(probes); i++ {
+		select {
+		case r := <-ch:
+			result[r.name] = r.ok
+		case <-timeout:
+			// 超时后未回的腿保持 false；goroutine 结果写进带缓冲通道后自行退出，不泄漏。
+			log.Printf("[market] HealthCheck 超过 %s 仍有腿未返回，按不可用收口", healthCheckTimeout)
+			return result
+		}
+	}
+	// 探测同花顺：由 DataCoordinator 联合探测，前端通过 /api/data_source_health 汇总；
+	// 此处保持兼容，返回 false。
 	result["ths"] = false
-
 	return result
 }
 
@@ -1534,13 +1558,28 @@ func (m *MarketAPI) GetSinaMinuteKLine(code string, scale, count int) ([]KLine, 
 		return nil, fmt.Errorf("sina minute kline http: %v", err)
 	}
 	defer resp.Body.Close()
+	// §N-12a：HTTP 层必须验状态码/Content-Type/空体——旧实现把 4xx/5xx 的 JSON 错误页
+	// 也当 K 线解析，或对空体报出 "unexpected end of JSON input" 这种对客无意义的内部串。
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("sina minute kline status: %d", resp.StatusCode)
+	}
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); ct != "" && !strings.Contains(ct, "json") {
+		return nil, fmt.Errorf("sina minute kline content-type: %s", ct)
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("sina minute kline read: %v", err)
 	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, fmt.Errorf("sina minute kline empty body")
+	}
 	var raw []sinaKLineRaw
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("sina minute kline json: %v", err)
+	}
+	// null 与 [] 都是“该标的没有分钟数据”的合法信封，归 no_data，不再冒充源故障
+	if len(raw) == 0 {
+		return nil, ErrNoMinuteData
 	}
 	klines := make([]KLine, 0, len(raw))
 	for _, r := range raw {
@@ -1567,6 +1606,10 @@ func (m *MarketAPI) GetSinaMinuteKLine(code string, scale, count int) ([]KLine, 
 			Volume: volume,
 			Amount: amount,
 		})
+	}
+	// 有行但全部被时间解析拒收：视作该标的无可用分钟数据（不是源故障）
+	if len(klines) == 0 {
+		return nil, ErrNoMinuteData
 	}
 	// 分钟数据源时间序不固定，统一按时间升序排序
 	sort.Slice(klines, func(i, j int) bool {

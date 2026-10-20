@@ -117,4 +117,6 @@ web/.auth/
 qmt_gateway/bridge_cmd.json
 
 # 静态资源（web/public/ 下的图片由构建产出，需入库；其余 png/jpg 不入库）
-!web/public/
+# 注意：只否定目录本身不会解除 *.png/*.svg 对目录内文件的命中，必须按文件模式否定。
+!web/public/**/*.png
+!web/public/**/*.svg

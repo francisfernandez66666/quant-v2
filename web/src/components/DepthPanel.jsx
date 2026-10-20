@@ -103,8 +103,8 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
           if (!cancelled) setError('盘口数据格式异常')
         }
       } catch (e) {
-        // 请求失败：展示后端错误信息或通用提示，避免面板空白无反馈
-        if (!cancelled) setError(e && e.message ? e.message : '盘口加载失败')
+        // §N-12e：失败只显示固定中文，不把后端/网络的原始错误串端给客户
+        if (!cancelled) setError('盘口加载失败，请稍后重试')
       } finally {
         if (!cancelled) setLoading(false)
       }

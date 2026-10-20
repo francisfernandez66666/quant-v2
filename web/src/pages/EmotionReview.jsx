@@ -33,28 +33,28 @@ export default function EmotionReview() {
   const [equity, setEquity] = useState([])      // 净值点 [{date,value}]
   // 首屏加载态
   const [loading, setLoading] = useState(true)
-  // 接口错误信息（非阻断式提示）
+  // 接口错误信息（非阻断式提示）与净值腿的独立提示
   const [error, setError] = useState('')
+  const [equityErr, setEquityErr] = useState('')
   const [hover, setHover] = useState(null)      // 悬停的日期索引（信息条显示）
 
-  // 区间变化时拉取数据：情绪历史必定请求；账户净值失败静默吞掉（无模拟盘/非 admin 时右轴无数据）
-  // alive 标记防止卸载/快速切换区间后旧请求回调写 state。
+  // 区间变化时拉取数据：两路并发、各自记账。
+  // §F-14：情绪历史失败必须显式报错（主序列）；净值失败单独标注——
+  // 无模拟盘/非 admin 时右轴本来就没有数据，不能把两路一锅端成“加载失败”。
   useEffect(() => {
     let alive = true
     setLoading(true)
     setError('')
-    // 两路并发：情绪历史必拉；净值失败静默（无模拟盘/非 admin 时右轴隐藏）
-    Promise.all([
-      api.fetchEmotionHistory(days).then((r) => (Array.isArray(r && r.series) ? r.series : [])).catch(() => []),
-      api.fetchPaperEquity().then((r) => (Array.isArray(r) ? r : [])).catch(() => []),
-    ]).then(([hist, eq]) => {
+    setEquityErr('')
+    Promise.allSettled([
+      api.fetchEmotionHistory(days).then((r) => (Array.isArray(r && r.series) ? r.series : [])),
+      api.fetchPaperEquity().then((r) => (Array.isArray(r) ? r : [])),
+    ]).then(([histRes, eqRes]) => {
       if (!alive) return
-      setSeries(hist)
-      setEquity(eq)
-      setLoading(false)
-    }).catch((e) => {
-      if (!alive) return
-      setError((e && e.message) || '加载失败')
+      if (histRes.status === 'fulfilled') setSeries(histRes.value)
+      else setError('情绪历史加载失败，请稍后重试')
+      if (eqRes.status === 'fulfilled') setEquity(eqRes.value)
+      else setEquityErr('净值曲线读取失败（可能未启用模拟盘或当前账号无权限）')
       setLoading(false)
     })
     return () => { alive = false }
@@ -123,6 +123,8 @@ export default function EmotionReview() {
         </div>
       }>
         {error && <div style={{ color: 'var(--app-warn-text)', fontSize: 13 }}>{error}</div>}
+        {/* §F-14：净值腿失败只作次要提示，不影响情绪历史主图的失败判定 */}
+        {equityErr && !error && <div className="muted" style={{ fontSize: 12 }}>{equityErr}</div>}
         {loading && <div className="muted" style={{ fontSize: 13 }}>加载 {days} 日情绪与净值…</div>}
         {/* 空态：引擎从未跑过评分循环时无留痕数据 */}
         {!loading && !error && !series.length && (

@@ -250,6 +250,107 @@ if (Test-Path $idxHtml) {
 }
 Probe ("web:fingerprint:" + $Commit) $hit $detail
 
+# 7c) §N-06（2026-10-20）G 公共面：W1 的修复必须有独立判据。
+# 旧版只探“首页 200 + bundle 指纹 + 网关 ok”，对深链、/assets 404 头、APK 三头、安全头、
+# favicon/robots 全盲——W1 改完它照样全绿，"verify 绿"不能证明 W1 生效。
+# 明细全 ASCII（PS→SSH→bash 回传按 GBK 解码，中文明细会变乱码，见第 19 探针判例）。
+function HVal($h, $name) {
+    foreach ($k in $h.Keys) { if ($k -ieq $name) { return [string]$h[$k] } }
+    return ""
+}
+function HReq($url, $method = "GET", $range = "") {
+    $p = @{ Uri = $url; Method = $method; UseBasicParsing = $true; TimeoutSec = 10 }
+    if ($range) { $p.Headers = @{ Range = $range } }
+    try {
+        $r = Invoke-WebRequest @p
+        $dict = @{}
+        $keys = @()
+        try { $keys = @($r.Headers.AllKeys) } catch { }
+        if ($keys.Count -eq 0) { try { $keys = @($r.Headers.Keys) } catch { } }
+        foreach ($k in $keys) { $dict[$k] = [string]$r.Headers[$k] }
+        return @{ code = [int]$r.StatusCode; h = $dict; body = [string]$r.Content }
+    } catch {
+        $resp = $_.Exception.Response
+        if ($null -ne $resp) {
+            $dict = @{}
+            $keys = @()
+            try { $keys = @($resp.Headers.AllKeys) } catch { }
+            if ($keys.Count -eq 0) { try { $keys = @($resp.Headers.Keys) } catch { } }
+            foreach ($k in $keys) { $dict[$k] = [string]$resp.Headers[$k] }
+            return @{ code = [int]$resp.StatusCode; h = $dict; body = "" }
+        }
+        return @{ code = "ERR"; h = @{}; body = "" }
+    }
+}
+$webBase = "http://127.0.0.1:" + $WebPort
+
+# G1 安全头四条逐条等值 + Server 必须已摘除
+$r = HReq ($webBase + "/")
+$g1miss = @()
+if (-not (HVal $r.h "Strict-Transport-Security")) { $g1miss += "hsts" }
+if (-not (HVal $r.h "X-Content-Type-Options")) { $g1miss += "nosniff" }
+if (-not (HVal $r.h "Referrer-Policy")) { $g1miss += "referrer" }
+if (-not (HVal $r.h "X-Frame-Options")) { $g1miss += "xfo" }
+if (HVal $r.h "Server") { $g1miss += ("server=" + (HVal $r.h "Server")) }
+Probe "web:G1 security headers" (($r.code -eq 200) -and ($g1miss.Count -eq 0)) ("code=" + $r.code + " missing=" + ($g1miss -join ","))
+
+# G2 SPA 深链：200 且正文是入口 HTML（不是 0 字节）
+$r = HReq ($webBase + "/dashboard")
+$g2ok = ($r.code -eq 200) -and ($r.body.Length -gt 0) -and ($r.body -match '<div id="app">')
+Probe "web:G2 deep-link /dashboard" $g2ok ("code=" + $r.code + " bytes=" + $r.body.Length)
+
+# G3 /assets：存在的入口 chunk 长缓存；缺失的哈希名 404 + no-store
+$g3entry = ""
+if (Test-Path $idxHtml) {
+    $m3 = [regex]::Match((Get-Content $idxHtml -Raw), 'assets/index-[A-Za-z0-9_\-]+\.js')
+    if ($m3.Success) { $g3entry = "/" + $m3.Value }
+}
+$g3a = HReq ($webBase + $g3entry)
+$g3aok = ($g3a.code -eq 200) -and ((HVal $g3a.h "Cache-Control") -match "immutable")
+$g3b = HReq ($webBase + "/assets/__not_exist__.js")
+$g3bcc = HVal $g3b.h "Cache-Control"
+$g3bok = ($g3b.code -eq 404) -and ($g3bcc -match "no-store") -and ($g3bcc -notmatch "immutable")
+Probe "web:G3 assets cache/404" ($g3entry -ne "" -and $g3aok -and $g3bok) ("entry=" + $g3entry + " hit=" + $g3a.code + "/" + (HVal $g3a.h "Cache-Control") + " miss=" + $g3b.code + "/" + $g3bcc)
+
+# G4 APK 三头齐 + Range 206
+$g4 = HReq ($webBase + "/dl/quant-latest.apk") "HEAD"
+$g4ct = HVal $g4.h "Content-Type"
+$g4cd = HVal $g4.h "Content-Disposition"
+$g4cc = HVal $g4.h "Cache-Control"
+$g4r = HReq ($webBase + "/dl/quant-latest.apk") "HEAD" "bytes=0-1023"
+$g4ok = ($g4.code -eq 200) -and ($g4ct -match "android.package-archive") -and ($g4cd -match "attachment") -and $g4cc -and
+        ($g4r.code -eq 206) -and (HVal $g4r.h "Content-Range")
+Probe "web:G4 apk headers/range" $g4ok ("code=" + $g4.code + " ct=" + $g4ct + " cd=" + $g4cd + " cc=" + $g4cc + " range=" + $g4r.code + "/" + (HVal $g4r.h "Content-Range"))
+
+# G5 favicon / robots（新增静态面；200 + content-type 正确）
+$g5 = @()
+foreach ($pair in @(@("/favicon.ico", "icon"), @("/favicon.svg", "svg"), @("/robots.txt", "text/plain"))) {
+    $rr = HReq ($webBase + $pair[0])
+    $ct = HVal $rr.h "Content-Type"
+    if (($rr.code -ne 200) -or ($ct -notmatch $pair[1])) { $g5 += ($pair[0] + "=" + $rr.code + "/" + $ct) }
+}
+Probe "web:G5 favicon/robots" ($g5.Count -eq 0) ($g5 -join " ")
+
+# G6 网关：进程存活 ok 与通道 live_ready 分开报 + 三连接位 + xt_last_fail_at 必须在响应里
+$g6 = HReq ("http://127.0.0.1:" + $GwPort + "/health")
+$g6ok = $false; $g6hasLive = $false; $g6hasLinks = $false; $g6hasFailAt = $false
+$g6live = "na"; $g6links = "na"; $g6failAt = "na"
+if ($g6.code -eq 200) {
+    try {
+        $j = $g6.body | ConvertFrom-Json
+        $g6ok = ($j.ok -eq $true)
+        $names = @($j.PSObject.Properties.Name)
+        $g6hasLive = ($names -contains "live_ready")
+        if ($g6hasLive) { $g6live = [string]$j.live_ready }
+        $g6hasLinks = ($names -contains "broker_connected") -and ($names -contains "xt_connected") -and ($names -contains "feed_connected")
+        if ($g6hasLinks) { $g6links = [string]$j.broker_connected + "/" + [string]$j.xt_connected + "/" + [string]$j.feed_connected }
+        $g6hasFailAt = ($names -contains "xt_last_fail_at")
+        if ($g6hasFailAt) { $g6failAt = [string]$j.xt_last_fail_at }
+    } catch { }
+}
+Probe "gw:G6 ok/live_ready/links" (($g6.code -eq 200) -and $g6ok -and $g6hasLive -and $g6hasLinks -and $g6hasFailAt) ("code=" + $g6.code + " live_ready=" + $g6live + " links=" + $g6links + " xt_last_fail_at=" + $g6failAt)
+Write-Output ("INFO|gw:channel state live_ready=" + $g6live + " links(B/X/F)=" + $g6links + " xt_last_fail_at=" + $g6failAt)
+
 # 5) 网关：/health + §P0-1a /settlement 新端点路由
 try {
     $h = (Invoke-WebRequest -Uri ("http://127.0.0.1:" + $GwPort + "/health") -UseBasicParsing -TimeoutSec 10).Content

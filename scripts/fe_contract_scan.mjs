@@ -101,6 +101,8 @@ function listDir(absDir) {
 // 因为两者都有"后到的旧响应覆盖新读数"的窗口。
 const POLL_MARKS = [
   ['setInterval', /setInterval\(/],
+  // §N-09：统一轮询 hook 也是轮询入口（页面把裸 setInterval 迁进 usePolling 后仍须接守卫）
+  ['usePolling', /usePolling\(/],
   ['EventSource', /EventSource/],
   ['sseBus', /sseBus/],
   ['useSseRefresh', /useSseRefresh/],

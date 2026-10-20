@@ -60,7 +60,8 @@ $Log     = $SvcWatchdogLog
 #   Type=http       GET 探针 URL 返回 200 = 健康（均为无鉴权端点，401 不再被当成服务挂）
 #   Type=heartbeat  无 HTTP 口（researchd）：探针文件 mtime 距今 ≤ MaxAgeMin 分钟 = 健康
 #   Type=gwtask     qmt_gateway：非 NSSM 服务（交互会话计划任务拉起，Session 0 恒连不上柜台）——
-#                   健康判定只看 /health 探针；恢复走 Restart-GatewayViaTask（schtasks /Enable + /Run）。
+#                   健康判定读 /health 结构化字段（§N-01）：进程/HTTP 不可达 → 走 Restart-GatewayViaTask；
+#                   进程活但 live_ready=false → 只告警不重启（重启治不了终端未登录）；feed 断 → 仅告警。
 $Services = $SvcWatchServices
 
 # 退避状态：服务名 → @{ Restarts=0; WindowStart=epoch }
@@ -82,6 +83,26 @@ function Invoke-Probe($url) {
         return ($resp.StatusCode -eq 200)
     } catch { return $false }
 }
+
+# §N-01（2026-10-20）：网关腿必须读结构化字段，不能只看 HTTP 200。
+#   gateway.py 的 ok 恒为 true（进程能回 HTTP 就真），通道全断时它照样 200——
+#   旧判据把"进程活着"当成"通道健康"，于是 broker/xt/feed 全断时看门狗每轮判健康、
+#   一次都不告警（F-23 能静默 4 天的复发机制）。
+#   返回 $null＝进程/HTTP 不可达（真 DOWN，走交互任务拉起）；
+#   返回对象＝进程活着，再由调用方按 live_ready / feed_connected 分流（D9：通道断不重启）。
+function Get-GatewayHealth($url) {
+    if (-not $url) { return $null }
+    try {
+        $resp = Invoke-WebRequest -Uri $url -TimeoutSec 5 -UseBasicParsing
+        if ($resp.StatusCode -ne 200) { return $null }
+        return ($resp.Content | ConvertFrom-Json)
+    } catch { return $null }
+}
+
+# 网关三态告警去抖：只在状态翻转时写一行，避免每 15s 刷屏把日志淹掉
+$Script:GwLiveDownNoted = $false
+$Script:GwFeedDownNoted = $false
+$Script:GwFeedDownRounds = 0
 
 # §H8：researchd 等无 HTTP 口服务的文件心跳判定——scheduler 每 30s 落一次
 # scheduler_status.json（internal/scheduler/scheduler.go tick→writeStatus），mtime 新鲜即存活；
@@ -227,7 +248,15 @@ function Get-ServiceFace {
     # nssm status ∧ 探针 双判据——各腿语义与旧版一致，只是网关腿不再是空转。
     return (@($Services | ForEach-Object {
         if ($_.Type -eq "gwtask") {
-            if (Test-ServiceProbe $_) { $_.Name } else { "$($_.Name):DOWN" }
+            $gh = Get-GatewayHealth $_.Probe
+            if ($null -eq $gh) { "$($_.Name):DOWN" }
+            else {
+                # §N-01：live_ready 缺失时回落 broker_connected（旧网关）；两者皆假＝通道不可用
+                $hasLive = @($gh.PSObject.Properties.Name) -contains "live_ready"
+                $live = $false
+                if ($hasLive) { $live = [bool]$gh.live_ready } else { $live = [bool]$gh.broker_connected }
+                if ($live) { $_.Name } else { "$($_.Name):LIVE_UNAVAILABLE" }
+            }
         } elseif ((Get-NssmStatus $_.Name) -and (Test-ServiceProbe $_)) { $_.Name } else { "$($_.Name):DOWN" }
     }) -join ",")
 }
@@ -252,9 +281,53 @@ while ($true) {
         # §C7-OPS：网关腿（gwtask）没有 NSSM 服务可查——在位与否以 /health 探针为准
         # （旧形态拿 nssm status 查一个不存在的服务，导致每轮恒 DOWN 且重启对象错误）。
         if ($svc.Type -eq "gwtask") {
-            if (Test-ServiceProbe $svc) { continue }
-            Log ("DOWN {0}（交互任务腿，NSSM运行=n/a 探针={1} 通过=False）" -f $svc.Name, $svc.Probe)
-            Restart-ServiceWithBackoff $svc (Get-RestartState $svc.Name)
+            # §N-01/D9：进程死 → 交互任务拉起；进程活但通道断 → 只告警、绝不重启
+            $gh = Get-GatewayHealth $svc.Probe
+            if ($null -eq $gh) {
+                Log ("DOWN {0}（交互任务腿，进程/HTTP 不可达 探针={1}）" -f $svc.Name, $svc.Probe)
+                $Script:GwLiveDownNoted = $false
+                $Script:GwFeedDownNoted = $false
+                $Script:GwFeedDownRounds = 0
+                Restart-ServiceWithBackoff $svc (Get-RestartState $svc.Name)
+                continue
+            }
+            $names = @($gh.PSObject.Properties.Name)
+            $hasLive = $names -contains "live_ready"
+            $live = $false
+            if ($hasLive) { $live = [bool]$gh.live_ready } else { $live = [bool]$gh.broker_connected }
+            $broker = [bool]$gh.broker_connected
+            $xt = $false
+            if ($names -contains "xt_connected") { $xt = [bool]$gh.xt_connected }
+            $feed = $false
+            if ($names -contains "feed_connected") { $feed = [bool]$gh.feed_connected }
+            $xfail = ""
+            if ($names -contains "xt_last_fail_at") { $xfail = [string]$gh.xt_last_fail_at }
+            if (-not $live) {
+                if (-not $Script:GwLiveDownNoted) {
+                    Log ("LIVE_UNAVAILABLE {0}（进程存活但交易通道不可用：broker={1} xt={2} feed={3} xt_last_fail_at={4}）——按 D9 不重启：重启治不了券商终端未登录，请人工登录终端" -f $svc.Name, $broker, $xt, $feed, $xfail)
+                    $Script:GwLiveDownNoted = $true
+                }
+                continue
+            }
+            if ($Script:GwLiveDownNoted) {
+                Log ("LIVE_READY {0}（交易通道已恢复：broker={1} xt={2} feed={3}）" -f $svc.Name, $broker, $xt, $feed)
+                $Script:GwLiveDownNoted = $false
+            }
+            if (-not $feed) {
+                # feed 断连不污染交易熔断面（gateway.py 的设计铁律），按 D9 只告警；
+                # 连续 4 轮（约 60s）才喊，避免行情源瞬时抖动刷屏。
+                $Script:GwFeedDownRounds++
+                if ($Script:GwFeedDownRounds -ge 4 -and -not $Script:GwFeedDownNoted) {
+                    Log ("FEED_UNAVAILABLE {0}（行情 feed 断开已约 {1}s；交易面不受影响，仅告警）" -f $svc.Name, ($Script:GwFeedDownRounds * 15))
+                    $Script:GwFeedDownNoted = $true
+                }
+            } else {
+                $Script:GwFeedDownRounds = 0
+                if ($Script:GwFeedDownNoted) {
+                    Log ("FEED_RECOVERED {0}（行情 feed 已恢复）" -f $svc.Name)
+                    $Script:GwFeedDownNoted = $false
+                }
+            }
             continue
         }
         $running = Get-NssmStatus $svc.Name

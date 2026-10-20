@@ -3354,12 +3354,13 @@ done
 #    + 跌停闸现值读数（§A5-CURRENT，2026-09-26 深夜批第 28 探针；§101 ②b 有专属锁）
 #    + 成交额量纲抽检读数（§0929SCALE-⑩，2026-09-29 批第 30 探针；§106 有 INFO|amount_scale_readout 在位锁）
 #    + 快照目录 ACL 读数（§0929OPS-⑪-3，2026-09-29 深夜批第 31 探针；§107 有 INFO|snapshot_acl_readout 在位锁）。
-#    本仓纪律：**新增 INFO 腿必须与这条计数锁同日同步**（09-26 的 4→5、09-29 的 5→6、同日晚的 6→7 都是这么走的），
+#    本仓纪律：**新增 INFO 腿必须与这条计数锁同日同步**（09-26 的 4→5、09-29 的 5→6、同日晚的 6→7、
+#    2026-10-20 的 7→8（§N-06 G6 网关通道状态）都是这么走的），
 #    否则计数锁会在别人加观测腿时判红——那是好事，前提是红项能一眼看出该同步哪一条，故枚举必须写全。
 grep -qF 'INFO\|*) echo' "$VD" \
 	|| { echo '--- FAIL: bash 侧 INFO 分支丢失（观测读数会被当成未知行，或被误接进 PASS/FAIL 计数）'; exit 1; }
 infop=$(grep -c 'Write-Output ("INFO|' "$VD" || true)
-[ "$infop" = "7" ] || { echo "--- FAIL: INFO 观测行数不是 7（逐文件空态/逐文件明细/当日聚合/日历读数/跌停闸现值/成交额量纲抽检/快照 ACL 读数，计数=${infop}）"; exit 1; }
+[ "$infop" = "8" ] || { echo "--- FAIL: INFO 观测行数不是 8（逐文件空态/逐文件明细/当日聚合/日历读数/跌停闸现值/成交额量纲抽检/快照 ACL 读数/网关通道状态，计数=${infop}）"; exit 1; }
 # ⑨ 负锁：本探针不得用 `| Out-String` 读 JSON 字段（PS 控制台按 120 列折行会劈开值，§N-5 的教训本体；
 #    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
 grep -qF '([string]$sgJson.trading_day)' "$VD" \
@@ -13766,5 +13767,78 @@ neg_code_mut120 "$W120/mut/py_plain_n7.py" 'heads.append((int(m.group(1))' '空�
 echo "ok - §120 §GATE-SELFACC 门禁自账收口通过：静态锁 $(pcount120 eq) 枚等值＋$(pcount120 neg) 枚负锁（装配器四处口径＋驱动 awk，旧写法每处一枚负锁）+ 行为腿 $(pcount120 beh) 道（段清单三读数／带后缀在册／撞号守卫／推进方向／装配起点／跨段 helper 搬运／清单外归因／镜像 collect 全链）+ 空白对照与旧账复现 $(pcount120 ctl) 道（摘守卫复现 116 vs 114·N7 未塞假目标的同一份副本）+ 反证 $(pcount120 mut) 枚（N1 段头只捕数字·N2 emit 退回 int()·N3 MARK_RE 退回只认数字·N4 认桶退回 isdigit·N5 段序退回比编号·N6 摘掉清单外单列档·N7 往副本里写回旧写法），累计判定点 $(cnt120)（A 组 ${SECA120}／C 组止于 ${SECB120}／D 组止于 ${SECC120}，逐级派生不写死）；派生段清单 $(python3 "$PY120" sections "$GS120" 2>/dev/null | awk -F'\t' '$1 == "TOTAL" {print $2}') 段（编号整串为唯一身份）"
 
 rm -rf "$W120"
+
+echo "==> §20261020 UAT 修复批（W1–W11）静态锁"
+fail2026() { echo "--- FAIL: §20261020 $*"; exit 1; }
+# W1 Caddy：两站点块同构的深链/资产/APK/安全头/初始化入口
+[ "$(grep -c 'try_files {path} /index.html' deploy/caddy/guangzhou.conf)" -ge 2 ] || fail2026 "Caddy SPA 深链回落缺失（两份站点块都要有）"
+[ "$(grep -c 'handle /assets/\*' deploy/caddy/guangzhou.conf)" -ge 2 ] || fail2026 "Caddy /assets 独立 handle 缺失"
+grep -q '@asset file {http.request.uri.path}' deploy/caddy/guangzhou.conf || fail2026 "Caddy /assets 存在性匹配器缺失"
+grep -q 'Cache-Control "no-store"' deploy/caddy/guangzhou.conf || fail2026 "Caddy /assets 404 no-store 缺失"
+grep -q 'application/vnd.android.package-archive' deploy/caddy/guangzhou.conf || fail2026 "APK Content-Type 缺失"
+grep -q 'Content-Disposition "attachment' deploy/caddy/guangzhou.conf || fail2026 "APK Content-Disposition 缺失"
+grep -q 'Strict-Transport-Security "max-age=31536000"' deploy/caddy/guangzhou.conf || fail2026 "安全头 HSTS 缺失"
+grep -q 'handle /setup' deploy/caddy/guangzhou.conf || fail2026 "D11 /setup 默认 404 缺失"
+grep -q '!web/public/\*\*/\*.png' .gitignore || fail2026 "web/public 图标入库否定规则缺失（*.png 会继续挡）"
+
+# F-21/N-11d 自选：缓存信封、强制回源、刷新入口、未取真值不写回
+grep -q "CACHE_VERSION = 2" web/src/pages/Watchlist.jsx || fail2026 "自选缓存信封缺失"
+grep -q 'load(true)' web/src/pages/Watchlist.jsx || fail2026 "进页强制回源缺失"
+grep -q 'persistCache(merged, nowIso)' web/src/pages/Watchlist.jsx || fail2026 "回源成功才写缓存缺失"
+grep -q 'wl-cache-badge' web/src/pages/Watchlist.jsx || fail2026 "缓存截至徽标缺失"
+grep -q 'onRowClick=' web/src/pages/Watchlist.jsx || fail2026 "F-16 整行点击未接线"
+
+# F-17/F-03/F-20 移动端
+grep -q 'sidebar-close' web/src/App.jsx web/src/styles.css || fail2026 "移动抽屉显式关闭按钮缺失"
+grep -q 'onClick={() => setMenuOpen(false)}' web/src/App.jsx || fail2026 "菜单点击收起缺失"
+grep -q '.t-size-s' web/src/styles.css || fail2026 "TDesign small 按钮触控选择器缺失"
+grep -q 'dash-two-col' web/src/styles.css web/src/pages/Dashboard.jsx || fail2026 "仪表盘窄屏单列缺失"
+
+# F-14 失败台账 + F-19 价格单实现
+for f in web/src/pages/Dashboard.jsx web/src/pages/Watchlist.jsx web/src/pages/EmotionReview.jsx; do
+  grep -q 'useLoadLedger\|setEquityErr\|LoadFailBanner' "$f" || fail2026 "$f 失败态未接台账"
+done
+grep -q 'PriceCell' web/src/components/StockDetailDrawer.jsx || fail2026 "抽屉未复用 PriceCell"
+[ "$(grep -c 'export function PriceCell' web/src/pages/Watchlist.jsx)" -eq 1 ] || fail2026 "Watchlist PriceCell 导出唯一性破坏"
+
+# N-12 分时链：可判定 sentinel、软失败阈值、对客脱敏、价格语义
+grep -q 'ErrNoMinuteData' internal/data/source.go || fail2026 "分钟链 no_data sentinel 缺失"
+grep -q 'ErrMinuteSourcesUnavailable' internal/data/source.go || fail2026 "分钟链 sources_unavailable sentinel 缺失"
+grep -q 'noteThsSoftFailure' internal/data/source.go || fail2026 "同花顺单票不连坐（软失败）缺失"
+grep -q 'ErrTHSParseError' internal/data/ths.go || fail2026 "同花顺解析错误哨兵缺失"
+grep -q 'minuteFailureResponse' internal/server/handlers_fix.go || fail2026 "分钟错误对客脱敏映射缺失"
+grep -q 'price_kind' internal/server/handlers_fix.go web/src/pages/Signals.jsx || fail2026 "信号价格语义 price_kind 缺失"
+grep -q 'minuteCacheKey' internal/server/handlers_fix.go || fail2026 "分时缓存键未含周期"
+! grep -q 'reason = "分时获取失败：" + err.Error()' internal/server/handlers_fix.go || fail2026 "原始诊断串又拼回对客文案"
+! grep -q 'data.error' web/src/components/KLineChart.jsx || fail2026 "KLineChart 又直接渲染后端 error 原文"
+
+# F-15 删号清数据 + F-18 健康并发 + F-13 探活 + F-11 会话到期
+grep -q 'func (m \*Manager) DeleteConfigs' internal/auth/auth.go || fail2026 "DeleteConfigs 缺失"
+grep -q 'func (w \*WatchlistManager) Delete' internal/data/watchlist.go || fail2026 "Watchlist.Delete 缺失"
+grep -q 'refuse to delete configs with empty user id' internal/auth/auth.go || fail2026 "配置删除空 ID 护栏缺失"
+grep -q 'healthCheckTimeout' internal/data/market.go || fail2026 "健康探测总时限缺失"
+grep -q 'GET /livez' internal/server/server.go && grep -q 'GET /readyz' internal/server/server.go || fail2026 "livez/readyz 路由缺失"
+grep -q '"expires_at": time.Unix(user.TokenExp' internal/server/server.go || fail2026 "登录 expires_at 未接会话到期"
+
+# N-01 网关三态 + 看门狗 D9
+grep -q '"live_ready": bool(broker_connected)' qmt_gateway/gateway.py || fail2026 "网关 live_ready 缺失"
+grep -q 'xt_last_fail_at' qmt_gateway/gateway.py || fail2026 "网关 xt_last_fail_at 缺失"
+grep -q 'Get-GatewayHealth' deploy/qmt-win/all_service_watchdog.ps1 || fail2026 "看门狗结构化网关判据缺失"
+grep -q 'LIVE_UNAVAILABLE' deploy/qmt-win/all_service_watchdog.ps1 || fail2026 "看门狗通道断不重启分支缺失"
+
+# N-09/N-10 生命周期与请求层
+grep -q 'export function usePolling' web/src/utils/usePolling.js || fail2026 "统一 usePolling 缺失"
+for f in web/src/App.jsx web/src/pages/Watchlist.jsx web/src/pages/Positions.jsx web/src/pages/Quant.jsx; do
+  grep -q 'usePolling(' "$f" || fail2026 "$f 未接统一轮询"
+done
+grep -q 'inflightGets' web/src/api/index.js || fail2026 "GET 并发去重缺失"
+grep -q 'RETRYABLE_STATUS' web/src/api/index.js || fail2026 "GET 5xx 重试缺失"
+grep -q 'opts.signal' web/src/api/index.js || fail2026 "外部取消 signal 缺失"
+
+# N-06 部署验收 G 段
+for g in 'web:G1 security headers' 'web:G2 deep-link /dashboard' 'web:G3 assets cache/404' 'web:G4 apk headers/range' 'web:G5 favicon/robots' 'gw:G6 ok/live_ready/links'; do
+  grep -q "$g" scripts/verify_deploy_guangzhou.sh || fail2026 "部署验收缺 $g"
+done
+echo "ok - §20261020 静态锁通过（W1/W2/W3/W4/W5/W6/W8/W9/W11 关键实现均在位）"
 
 echo "==> 全部通过"

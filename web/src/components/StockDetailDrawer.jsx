@@ -16,6 +16,7 @@ import * as api from '../api/index.js'
 // 用户看到的就是"价格跳回去了"。守卫实例必须由 useStaleGuard() 持有（跨渲染复用，见 hook 注释）。
 import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 import MinuteView from './MinuteView.jsx'
+import { PriceCell } from './priceFormat.jsx' // §F-19：与自选表共用同一价格渲染出口
 
 // codeEq 归一化比对：兼容 "600000" 与 "600000.SH/.SZ" 两种写法，任一前缀（6 位数字）相同即视为同一标的。
 // English: tolerant code match — treats "600000" and "600000.SH" as the same symbol via its 6-digit prefix.
@@ -212,13 +213,10 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, padding: '14px 16px', borderBottom: '1px solid #eef0f3' }}>
           <span style={{ fontSize: 18, fontWeight: 700 }}>{showName}</span>
           <span style={{ fontSize: 12, color: 'var(--app-muted-2)' }}>{code}</span>
-          {Number.isFinite(Number(showPrice)) && showPrice > 0 && (
-            // §P3-FE P8/P9 同族：旧写法无条件按 chgUp 染色，而 chg 为 null（完全没有涨幅读数）时
-            // chgUp=false ⇒ 现价被染成跌绿，把「不知道涨跌」显示成「在跌」。缺读数时走中性弱化色。
-            <span data-testid="sdd-price" style={{ fontSize: 18, fontWeight: 700, color: chg == null ? 'var(--app-faint)' : (chgUp ? 'var(--app-up)' : 'var(--app-down)') }}>
-              {Number(showPrice).toFixed(2)}
-            </span>
-          )}
+          {/* §F-19：价格渲染与自选表共用 PriceCell——缺数显示「—」，不再整段消失或写出第二种形态 */}
+          <span data-testid="sdd-price" style={{ fontSize: 18, fontWeight: 700, color: chg == null ? 'var(--app-faint)' : (chgUp ? 'var(--app-up)' : 'var(--app-down)') }}>
+            <PriceCell value={showPrice} />
+          </span>
           {chg != null && (
             <span data-testid="sdd-chg" style={{ fontSize: 13, fontWeight: 600, color: chgUp ? 'var(--app-up)' : 'var(--app-down)' }}>{fmtPct(chg)}</span>
           )}

@@ -546,7 +546,7 @@ export default function Settings() {
       <Card title="服务器连接" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>服务器地址</span>
-          <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="http://localhost:8080" style={{ width: 280 }} />
+          <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" style={{ width: 280 }} />
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>连接状态</span>

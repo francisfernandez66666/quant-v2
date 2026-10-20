@@ -32,6 +32,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -87,23 +88,26 @@ type fixSignal struct {
 	// §SHORT-4 信号方向（做多/做空）：做空战法信号带方向下发，前端按做空开关显隐与打标。
 	// English: §SHORT-4 signal direction — bear-tactic signals carry it so the frontend can badge and
 	// gate short content by the short-enabled switch.
-	Direction    string  `json:"direction,omitempty"` // 方向：做多/做空（空=做多历史兼容）
-	TotalScore   float64 `json:"total_score"`         // 总分（0~100）
-	RemindLevel  string  `json:"remind_level"`        // 提醒级别：strong/observe/mute
-	Level        string  `json:"level"`               // 固定"交易"
-	Action       string  `json:"action"`              // 交易动作（buy 等）
-	Price        float64 `json:"price"`               // 信号触发价格
-	ChangePct    float64 `json:"change_pct"`          // 实时涨跌幅（%）
-	CanOpen      bool    `json:"can_open"`            // 是否可开仓（置信度≥0.7 且为买入）
-	D1           float64 `json:"d1"`                  // 维度1 评分
-	D2           float64 `json:"d2"`                  // 维度2 评分
-	D3           float64 `json:"d3"`                  // 维度3 评分
-	D4           float64 `json:"d4"`                  // 维度4 评分
-	D1Desc       string  `json:"d1_desc"`             // 维度1 说明（§0929DIM 优先战法理由，无则退回信号 Reason）
-	D2Desc       string  `json:"d2_desc"`             // 维度2 说明（§0929DIM 优先战法理由，无则退回所属板块）
-	D3Desc       string  `json:"d3_desc"`             // 维度3 说明（§0929DIM 战法理由，此前恒空）
-	D4Desc       string  `json:"d4_desc"`             // 维度4 说明（§0929DIM 战法理由，此前恒空）
-	SignalActive bool    `json:"signal_active"`       // 信号是否活跃
+	Direction   string  `json:"direction,omitempty"` // 方向：做多/做空（空=做多历史兼容）
+	TotalScore  float64 `json:"total_score"`         // 总分（0~100）
+	RemindLevel string  `json:"remind_level"`        // 提醒级别：strong/observe/mute
+	Level       string  `json:"level"`               // 固定"交易"
+	Action      string  `json:"action"`              // 交易动作（buy 等）
+	Price       float64 `json:"price"`               // 价格（live=现价；trigger=信号触发价；none=无值）
+	// §N-12d：价格语义必须显式下发——旧实现把触发价塞进「现价」列，客户会拿它做交易判断。
+	PriceKind    string  `json:"price_kind"`         // live / trigger / none
+	QuoteAt      string  `json:"quote_at,omitempty"` // 现价快照时刻（仅 live）
+	ChangePct    float64 `json:"change_pct"`         // 实时涨跌幅（%）
+	CanOpen      bool    `json:"can_open"`           // 是否可开仓（置信度≥0.7 且为买入）
+	D1           float64 `json:"d1"`                 // 维度1 评分
+	D2           float64 `json:"d2"`                 // 维度2 评分
+	D3           float64 `json:"d3"`                 // 维度3 评分
+	D4           float64 `json:"d4"`                 // 维度4 评分
+	D1Desc       string  `json:"d1_desc"`            // 维度1 说明（§0929DIM 优先战法理由，无则退回信号 Reason）
+	D2Desc       string  `json:"d2_desc"`            // 维度2 说明（§0929DIM 优先战法理由，无则退回所属板块）
+	D3Desc       string  `json:"d3_desc"`            // 维度3 说明（§0929DIM 战法理由，此前恒空）
+	D4Desc       string  `json:"d4_desc"`            // 维度4 说明（§0929DIM 战法理由，此前恒空）
+	SignalActive bool    `json:"signal_active"`      // 信号是否活跃
 
 	// §FIX-0921 信号产生时间（2026-09-01 用户需求）：信号页新增「产生时间」列。
 	// 内部 Signal.GeneratedAt 已有完整时间戳，此前未透出前端——用户无法判断信号新旧。
@@ -156,6 +160,11 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 		// English: §0929DIM — the four dimension descriptions are read with the same per-strategy key
 		// mapping as the four scores, so each frontend cell shows the score plus its evidence.
 		r1, r2, r3, r4 := dimDescs(s)
+		// §N-12d：这里的 Price 是信号触发价，不是现价——先标 trigger，行情快照覆盖后才改标 live
+		priceKind := "trigger"
+		if s.Price <= 0 {
+			priceKind = "none"
+		}
 		fs := fixSignal{
 			Code:         s.Code,
 			Name:         s.Name,
@@ -167,6 +176,7 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			Level:        "交易",
 			Action:       s.Action,
 			Price:        s.Price,
+			PriceKind:    priceKind,
 			CanOpen:      s.Confidence >= 0.7 && s.Action == "buy",
 			// D1~D4 维度评分、D1 阻断信息与事件标题、盘口因素。
 			D1: d1,
@@ -311,11 +321,13 @@ func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[server] /api/signals 撤下 %d 条失效信号(仅展示层,不影响日志/存储)", pruned)
 	}
 	out := toFixSignals(live)
-	// 逐票补充实时现价与涨跌幅（忽略失败，保留信号触发价兜底）
+	// 逐票补充实时现价与涨跌幅（§N-12d：只有 >0 的真报价才允许覆盖触发价并改标 live）
 	for i := range out {
-		if info, ok := quotes[out[i].Code]; ok && info != nil {
+		if info, ok := quotes[out[i].Code]; ok && info != nil && info.Price > 0 {
 			out[i].Price = info.Price
 			out[i].ChangePct = info.ChangePct
+			out[i].PriceKind = "live"
+			out[i].QuoteAt = time.Now().Format("2006-01-02 15:04:05")
 		}
 	}
 	writeJSON(w, 200, out)
@@ -374,6 +386,49 @@ type minuteCacheEntry struct {
 	At        time.Time        // 缓存时间
 }
 
+// minuteCacheKey §N-12c：缓存键必须带周期——旧实现只按 code，请求 15 分钟线失败时
+// 会把上一次 1 分钟线的缓存当 15 分钟线返回，前端无从分辨。
+func minuteCacheKey(code string, scale int) string {
+	return fmt.Sprintf("%s|%d", code, scale)
+}
+
+// §N-12a 符号状态前置缓存：5 分钟内同一代码只查一次库（状态读数缓存，不是“结论”缓存）。
+var (
+	minuteSymbolStateMu sync.Mutex
+	minuteSymbolState   = map[string]minuteSymbolStateEntry{}
+)
+
+type minuteSymbolStateEntry struct {
+	At     time.Time
+	NoData bool
+}
+
+// minuteSymbolNoData §N-12a：拨上游前用只读符号状态判断“这只票是否已退市”。
+// 命中即直接报 no_symbol_data，一条上游都不拨——避免退市票制造四腿错误串、
+// 也避免一条空体把同花顺整源软失败计数推高。
+// ★长期无成交分支本轮**刻意不启用**：minute_klines 全局最大交易日停在 2026-09-24（N-02/F-22），
+// 陈旧库会把全市场判成“长期无成交”，那是把一个缺陷换成更安静的缺陷。只保留 delist_date 硬判据。
+func (s *Server) minuteSymbolNoData(code string) bool {
+	now := time.Now()
+	minuteSymbolStateMu.Lock()
+	if e, ok := minuteSymbolState[code]; ok && now.Sub(e.At) < 5*time.Minute {
+		minuteSymbolStateMu.Unlock()
+		return e.NoData
+	}
+	minuteSymbolStateMu.Unlock()
+
+	noData := false
+	if s.researchDB != nil {
+		if d, err := s.researchDB.StockDelistDate(code); err == nil && d != "" && d <= now.Format("20060102") {
+			noData = true
+		}
+	}
+	minuteSymbolStateMu.Lock()
+	minuteSymbolState[code] = minuteSymbolStateEntry{At: now, NoData: noData}
+	minuteSymbolStateMu.Unlock()
+	return noData
+}
+
 // minuteCacheEvictLocked 在写锁内调用：超出容量上限时淘汰 At 最早的条目，将内存增长收敛在
 // minuteCacheMax 以内。English: drop the stalest entry when over capacity (caller holds the write lock).
 func minuteCacheEvictLocked() {
@@ -420,6 +475,18 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 	if count > 3000 {
 		count = 3000
 	}
+	cacheKey := minuteCacheKey(code, scale)
+
+	// §N-12a：符号状态前置——已退市/无记录命中即返回业务结果，一条上游都不拨
+	if s.minuteSymbolNoData(code) {
+		log.Printf("[server] /api/minute %s 命中符号状态（已退市），未拨上游", code)
+		writeJSON(w, 200, map[string]interface{}{
+			"code": code, "name": s.stockName(code), "prev_close": 0, "points": []fixMinutePoint{},
+			"available": false, "reason_code": "no_symbol_data",
+			"message": "该标的暂无分时数据（可能停牌/退市）",
+		})
+		return
+	}
 
 	// 分时取数按数据源优先级走：自建数据中心在位就用它，否则退回腾讯行情；
 	// 两路都拿不到时才落到下面的缓存回退分支。
@@ -431,30 +498,31 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 		klines, err = s.market.GetTencentMinuteKLine(code, scale, count)
 	}
 	if err != nil || len(klines) == 0 {
-		reason := "该标的暂无分时数据"
-		if err != nil {
-			reason = "分时获取失败：" + err.Error()
-		} else if s.dc == nil && s.market == nil {
-			reason = "行情数据源未初始化（服务未接入行情链路）"
-		} else if !data.IsTradingWindow(time.Now()) && !data.IsActiveSession(time.Now()) {
-			reason = "非交易时段：无当日分时行情，开盘后自动恢复"
-		}
-		log.Printf("[server] /api/minute %s 获取失败: %v", code, err)
-		// 回退到最近一次成功缓存的分时（非交易时段/数据源抖动），标注 cached
+		// §N-12a：对外只给固定枚举 + 中文话术；逐腿诊断只进日志
+		reasonCode, message := minuteFailureResponse(err, s.dc == nil && s.market == nil)
+		log.Printf("[server] /api/minute %s scale=%d count=%d 失败 reason_code=%s: %v", code, scale, count, reasonCode, err)
+		// 回退到最近一次成功缓存的分时（非交易时段/数据源抖动），标注 cached 与截至时刻
 		minuteCacheMu.RLock()
-		cached, ok := minuteCache[code]
+		cached, ok := minuteCache[cacheKey]
 		minuteCacheMu.RUnlock()
 		if ok && len(cached.Points) > 0 && time.Since(cached.At) <= minuteCacheTTL {
+			lastPointAt := cached.Points[len(cached.Points)-1].Time
 			writeJSON(w, 200, map[string]interface{}{
-				"code":       code,
-				"name":       cached.Name,
-				"prev_close": r2(cached.PrevClose),
-				"points":     cached.Points,
-				"cached":     true,
+				"code":          code,
+				"name":          cached.Name,
+				"prev_close":    r2(cached.PrevClose),
+				"points":        cached.Points,
+				"cached":        true,
+				"cached_at":     cached.At.Format(time.RFC3339),
+				"last_point_at": lastPointAt,
+				"available":     true,
 			})
 			return
 		}
-		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "prev_close": 0, "points": []fixMinutePoint{}, "error": reason})
+		writeJSON(w, 200, map[string]interface{}{
+			"code": code, "name": "", "prev_close": 0, "points": []fixMinutePoint{},
+			"available": false, "reason_code": reasonCode, "message": message,
+		})
 		return
 	}
 
@@ -492,18 +560,37 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 缓存本次成功拉取的分时，供非交易时段/数据源抖动回退
+	// 缓存本次成功拉取的分时，供非交易时段/数据源抖动回退（键含周期，§N-12c）
+	nowAt := time.Now()
 	minuteCacheMu.Lock()
-	minuteCache[code] = &minuteCacheEntry{Points: points, PrevClose: prevClose, Name: s.stockName(code), At: time.Now()}
+	minuteCache[cacheKey] = &minuteCacheEntry{Points: points, PrevClose: prevClose, Name: s.stockName(code), At: nowAt}
 	minuteCacheEvictLocked()
 	minuteCacheMu.Unlock()
 
+	lastPointAt := ""
+	if len(points) > 0 {
+		lastPointAt = points[len(points)-1].Time
+	}
 	writeJSON(w, 200, map[string]interface{}{
-		"code":       code,
-		"name":       s.stockName(code),
-		"prev_close": r2(prevClose),
-		"points":     points,
+		"code":          code,
+		"name":          s.stockName(code),
+		"prev_close":    r2(prevClose),
+		"points":        points,
+		"available":     true,
+		"last_point_at": lastPointAt,
 	})
+}
+
+// minuteFailureResponse §N-12a：把分钟链失败折成对外的固定 reason_code + 中文话术。
+// 逐腿诊断只进日志；这里绝不拼接 err.Error()（旧实现把 push2 主机名/熔断器内部串端给客户）。
+func minuteFailureResponse(err error, noSource bool) (string, string) {
+	if errors.Is(err, data.ErrNoMinuteData) || err == nil {
+		return "no_symbol_data", "该标的暂无分时数据（可能停牌/退市）"
+	}
+	if noSource {
+		return "minute_sources_unavailable", "行情数据源未初始化（服务未接入行情链路）"
+	}
+	return "minute_sources_unavailable", "行情源暂时不可用，请稍后重试"
 }
 
 // stockName 返回个股名称（持仓记录已知则用之，否则返回空串）。
@@ -2147,7 +2234,9 @@ func (s *Server) handleFixDepth(w http.ResponseWriter, r *http.Request) {
 	}
 	ob, err := s.market.GetOrderBook(code)
 	if err != nil {
-		writeError(w, 502, "depth unavailable: "+err.Error())
+		// §N-12e：原始错误只进日志，对客只给固定中文——不把内部实现细节端到屏幕上
+		log.Printf("[server] /api/depth/%s 获取失败: %v", code, err)
+		writeError(w, 502, "盘口数据暂时不可用，请稍后重试")
 		return
 	}
 	levels := data.DepthLevels

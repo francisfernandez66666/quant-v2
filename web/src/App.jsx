@@ -18,6 +18,8 @@ import Disclaimer from './components/Disclaimer'
 import IcpFooter from './components/IcpFooter'
 import ThemeToggle from './components/ThemeToggle'
 import { useTheme } from './theme.js'
+import { usePolling } from './utils/usePolling.js' // §N-09 统一可见性轮询生命周期
+import { useStaleGuard } from './utils/staleGuard.js' // §N-09 轮询后到丢弃
 import * as api from './api/index.js'
 import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
@@ -144,7 +146,6 @@ export default function App() {
   const [logging, setLogging] = useState(false)
   const [loginError, setLoginError] = useState('')
 
-  const statusTimer = useRef(null) // 状态轮询定时器句柄
   // §0926E2E-13：fetchStatus 连续失败计数（ref 不进渲染态，避免无谓重渲）；成功一轮即清零。
   const statusFails = useRef(0)
   const unsubSSE = useRef(null)     // SSE 取消订阅函数引用
@@ -157,6 +158,12 @@ export default function App() {
   const loggedInRef = useRef(false)
   // §H7：同样镜像最新 onAuthExpired 闭包（内含最新 logout/navigate），挂载 effect 经 ref 转发调用
   const authExpiredHandler = useRef(null)
+
+  // §N-09：登录后 60s 状态轮询统一走 usePolling——后台标签页暂停、恢复可见立即补一次。
+  // 旧的 startPolling 里裸 setInterval 在后台仍每 60s 打 /api/status。
+  usePolling(refreshStatus, 60000, loggedIn)
+  // §N-09：可见性恢复会立即补一轮，与在途轮次可能交错；旧响应不得覆盖新状态。
+  const statusGuard = useStaleGuard()
 
   // 根据当前用户权限刷新研究/管理入口可见性
   function applyRoleGates() {
@@ -235,8 +242,11 @@ export default function App() {
 
   // 轮询服务器状态、未读信号数、未读消息数与做空开关状态
   async function refreshStatus() {
+    const token = statusGuard.begin()
     try {
       const st = await api.fetchStatus()
+      // §N-09：后到的旧轮次整包丢弃（可见性恢复与定时轮询可能交错）
+      if (statusGuard.isStale(token)) return
       // §0926E2E-13：任何一轮成功都复位连续失败计数、灰条与离线判定
       statusFails.current = 0
       setStatusStale(false)
@@ -388,14 +398,14 @@ export default function App() {
   // 启动状态轮询并订阅 SSE 推送
   function startPolling() {
     refreshStatus()
-    statusTimer.current = setInterval(refreshStatus, 60000)
+    // §N-09：状态轮询定时器由 usePolling 统一管理（此处不再裸建 setInterval）
     api.connectSSE()
     unsubSSE.current = api.onSSE(handleSSE)
   }
 
   // 停止轮询并断开 SSE 连接
   function stopPolling() {
-    if (statusTimer.current) { clearInterval(statusTimer.current); statusTimer.current = null }
+    // §N-09：状态轮询定时器由 usePolling 随 loggedIn 关闭
     api.disconnectSSE()
     if (unsubSSE.current) { unsubSSE.current(); unsubSSE.current = null }
   }
@@ -410,8 +420,13 @@ export default function App() {
     // English: §0926E2E-13b — guard the async auth restore with a per-mount `active` flag so a
     // cleaned-up (StrictMode first-pass) mount can never start a second polling loop.
     let active = true
-    checkAuth().then((ok) => { if (ok && active) startPolling() })
-    api.fetchPaperState().then(d => setPaperEnabled(!!d.enabled)).catch(() => setPaperEnabled(false))
+    // §F-02：受保护接口只能在认证成功后拨——登录页不再先发一次必然 401 的 /api/paper/state
+    checkAuth().then((ok) => {
+      if (!active) return
+      if (!ok) { setPaperEnabled(false); return }
+      startPolling()
+      api.fetchPaperState().then(d => { if (active) setPaperEnabled(!!d.enabled) }).catch(() => setPaperEnabled(false))
+    })
     // §H7：deps 保持 []（监听器只在挂载注册一次），但注册的是转发壳——
     // 经 authExpiredHandler.current 取最新闭包执行，彻底绕开首帧陈旧闭包；
     // 卸载时按同一壳引用注销。
@@ -621,6 +636,11 @@ export default function App() {
             {/* 侧边栏：品牌 logo + 导航菜单 + 底部当前账号；menuOpen 控制移动端抽屉展开 */}
             <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
               {/*
+               * §F-17 移动端显式关闭按钮：汉堡在顶栏、层级低于侧栏（aside z-index 200），
+               * 展开后会被盖住；这颗 ✕ 放在侧栏内部，层级高于侧栏自身，保证随时能收起。
+               * English: explicit close button inside the drawer (above aside's stacking context). */}
+              <button type="button" className="sidebar-close" aria-label="关闭菜单" onClick={() => setMenuOpen(false)}>✕</button>
+              {/*
                * 品牌标识区：logo 文字 */}
               <div className="brand-logo">量仔</div>
               {/*
@@ -631,8 +651,9 @@ export default function App() {
                  * Menu 配置：value 取当前路由路径，选中项即导航并收起抽屉 */}
                 <Menu theme={theme === 'dark' ? 'dark' : 'light'} value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
                   {/* 导航项循环渲染：icon + 文案 + 可选未读角标 */}
+                  {/* §F-17：点「当前页」时 Menu onChange 不触发（值未变化），MenuItem 的 onClick 无条件收起抽屉 */}
                   {navItems.map((it) => (
-                    <Menu.MenuItem key={it.to} value={it.to}>
+                    <Menu.MenuItem key={it.to} value={it.to} onClick={() => setMenuOpen(false)}>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
                         {it.icon}
                         <span>{it.label}</span>

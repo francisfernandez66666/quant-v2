@@ -27,6 +27,7 @@ import { confirmDialog } from '../ui.jsx'
 // 直接参与决策（撤单按钮的可用性、待核对清单的条数），比一般页面更要命。
 // 每条腿各持一个守卫实例（代号序列独立：状态腿的慢响应不该拖委托腿作废）。
 import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
+import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
 import { fmtCNY2 } from '../utils'
 import { verdictDisplay, sizingDisplay } from './quantVerdicts.js'
 
@@ -192,10 +193,8 @@ export default function Quant() {
   const [settleBusy, setSettleBusy] = useState(false)
   const [settle, setSettle] = useState(null)        // 最近一次对账结果/历史
   const [halted, setHalted] = useState(false)       // kill-switch 当前态（来自 config.halted）
-  const ordersTimer = useRef(null)                  // 委托列表轮询定时器
-  // §0925EVE-W3-G 待核对清单轮询定时器（30s：第三态收敛是人工作业，不需要 10s 实时性，
-  // 且每次都要打网关 /admin/status，降频避免给跨网链路加常驻负载）
-  const pendingTimer = useRef(null)
+  // §N-09：admin 只读轮询总开关（进入/退出本页或权限止血时切换）
+  const [pollingActive, setPollingActive] = useState(false)
 
   // 战法自定义金额输入（按 strategyId → 金额）
   const [amountsInput, setAmountsInput] = useState({})
@@ -215,8 +214,6 @@ export default function Quant() {
   // so a stale cached value can never be mistaken for the server's truth.
   const [syncing, setSyncing] = useState(true)
 
-  const stateTimer = useRef(null)  // 链路状态轮询定时器
-  const tradesTimer = useRef(null) // 交易流水轮询定时器
   // §P2-I：四条轮询腿各一枚代号守卫（腿与腿的响应速度不同，共用一枚会让快腿的新一轮
   // 把慢腿仍在途的正当响应误判成「后到的旧轮次」而丢弃，那是另一种数据丢失）。
   // 实例必须来自 useStaleGuard()（内部 useRef 惰性初始化），严禁写成 useRef(createStaleGuard())。
@@ -224,6 +221,11 @@ export default function Quant() {
   const ordersGuard = useStaleGuard()
   const pendingGuard = useStaleGuard()
   const tradesGuard = useStaleGuard()
+  // §N-09：四条 admin 只读轮询统一走 usePolling——后台暂停、恢复补一次、卸载/止血清理。
+  usePolling(loadState, 60000, pollingActive)
+  usePolling(loadOrders, 60000, pollingActive)
+  usePolling(loadPendingReview, 60000, pollingActive)
+  usePolling(loadTrades, 60000, pollingActive)
   // §0926E2E-17A：实盘链路 SSE 事件的取消订阅句柄（挂载注册、stopPolling/卸载回收）
   const sseQmtUnsub = useRef(null)
 
@@ -263,19 +265,15 @@ export default function Quant() {
   // §M13（FIX_PLAN_20260922，2026-09-22 修复批 K）轮询止血三件套 ──────────────────
   // 缺陷原文：本页所有端点（/api/config/qmt、/api/qmt/state|orders|trades|broker|settle、
   //   /api/risk/gates）都挂在 adminMiddleware 上；成员账号首屏拿到 403、页面渲染「无权限」面板，
-  //   但挂载副作用里起的 stateTimer(10s)/ordersTimer(10s)/tradesTimer(30s) 继续跑——
-  //   每 10 秒三发 403 灌进 opslog，审计面被噪声淹没（M13 的"降级不停摆"半边）。
+  //   但挂载副作用里起的四条轮询继续跑——每轮都会三发 403 灌进 opslog，审计面被噪声淹没。
+  //   §N-09 起四条轮询由 usePolling 随 pollingActive 统一开关；stopPolling 置 false 即全部停摆。
   // stopPolling 幂等清除全部轮询定时器（定时器句柄置 null，重复调用安全）。
   // §M-6（2026-09-22 修复批）同时置位 pollingDeadRef——clearInterval 只能挡「下一次定时触发」，
   // 挡不住已在飞的 promise 链；标志位让链上未执行的步骤全部早退（含 StrictMode 双挂载的第二条链）。
   function stopPolling() {
     pollingDeadRef.current = true
-    for (const ref of [stateTimer, ordersTimer, tradesTimer, pendingTimer]) {
-      if (ref && ref.current) {
-        clearInterval(ref.current)
-        ref.current = null
-      }
-    }
+    // §N-09：四条轮询由 usePolling 随 pollingActive 关闭，这里只止血 SSE 订阅
+    setPollingActive(false)
     // §0926E2E-17A：SSE 事件刷新同样是取数触发源——止血（403/卸载）时必须一并退订，
     // 否则成员账号仍会因服务端事件回调去拉 admin 端点，绕开 §M13 的止血语义。
     if (sseQmtUnsub.current) { sseQmtUnsub.current(); sseQmtUnsub.current = null }
@@ -323,19 +321,14 @@ export default function Quant() {
   function startAdminReads() {
     stopPolling()
     pollingDeadRef.current = false
+    // §N-09：先开轮询总开关，再由 usePolling 建定时器；首轮取数仍在这里立即打
+    setPollingActive(true)
     loadState()
-    stateTimer.current = setInterval(loadState, 60000)
-    // §U-2 当日委托：60s 兜底；在途单状态推进的即时性走 SSE qmt_report/real_order。
     loadOrders()
-    ordersTimer.current = setInterval(loadOrders, 60000)
-    // §0925EVE-W3-G 待核对清单：60s（第三态人工改判本属低频作业，§0926E2E-17A 统一口径）
     loadPendingReview()
-    pendingTimer.current = setInterval(loadPendingReview, 60000)
     loadSettleHistory()
     loadBroker()
     loadTrades()
-    // 交易流水兜底轮询：60s；成交回报到达即经 SSE qmt_report 刷新
-    tradesTimer.current = setInterval(loadTrades, 60000)
     // §0926E2E-17A：订阅实盘链路 SSE 事件（后端早已对当前账号定向广播）。
     // 回调里再核一次角色：成员会话即便收到事件也不得借回调去拉 admin 端点。
     sseQmtUnsub.current = sseOn(
@@ -1001,7 +994,7 @@ export default function Quant() {
     // 网关地址配置
     const gatewayUrl = (
       <Form.FormItem label="网关地址">
-        <Input style={{ flex: 1, minWidth: 240 }} value={form.gateway_url} placeholder="http://81.71.69.17:8789"
+        <Input style={{ flex: 1, minWidth: 240 }} value={form.gateway_url} placeholder="http://<网关主机>:8789"
           onChange={(v) => setFormUser({ ...form, gateway_url: v })} />
       </Form.FormItem>
     )

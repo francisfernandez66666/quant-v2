@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="robots" content="noindex, nofollow" />
+  <meta name="theme-color" content="#000000" />
+  <title>量仔 Android 客户端下载</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #000; color: #E7E9EA; font: 16px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 460px; background: #0E1014; border: 1.2px solid #5A6270;
+      border-radius: 16px; padding: 28px; text-align: center;
+    }
+    .logo { width: 72px; height: 72px; border-radius: 18px; }
+    h1 { margin: 16px 0 6px; font-size: 22px; font-weight: 600; }
+    p { margin: 6px 0; color: #A8AFBA; font-size: 14px; }
+    .ver { color: #E7E9EA; font-variant-numeric: tabular-nums; }
+    .btn {
+      display: inline-block; margin-top: 20px; padding: 13px 28px; border-radius: 999px;
+      background: #FFF; color: #0A0C10; text-decoration: none; font-weight: 600; font-size: 15px;
+      border: 1.2px solid #FFF;
+    }
+    .btn:active { opacity: .82; }
+    .note { margin-top: 18px; font-size: 12px; color: #78808C; }
+    .err { color: #E65A5A; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img class="logo" src="/logo.png" alt="量仔" />
+    <h1>量仔 Android 客户端</h1>
+    <p>版本：<span class="ver" id="ver">读取中…</span></p>
+    <p>安装前请在系统设置中允许「安装未知来源应用」。</p>
+    <a class="btn" id="dl" href="/dl/quant-latest.apk">下载 APK</a>
+    <p class="note" id="note">如浏览器提示风险，请选择「仍要安装」；本安装包由本站直接提供。</p>
+  </main>
+  <script>
+    // 版本号只从服务端单一事实源读取；取不到就显示“以实际下载为准”，不写死版本。
+    (function () {
+      var ver = document.getElementById('ver');
+      var note = document.getElementById('note');
+      fetch('/api/app/version', { headers: { Accept: 'application/json' } })
+        .then(function (r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+        .then(function (d) {
+          var code = d && (d.latest_version_code != null ? d.latest_version_code : d.version_code);
+          var name = d && (d.latest_version || d.version);
+          ver.textContent = name ? (name + (code != null ? '（versionCode ' + code + '）' : '')) : (code != null ? 'versionCode ' + code : '以实际下载为准');
+        })
+        .catch(function () {
+          ver.textContent = '以实际下载为准';
+          note.className = 'note err';
+          note.textContent = '版本信息暂时取不到，下载入口仍可用。';
+        });
+    })();
+  </script>
+</body>
+</html>

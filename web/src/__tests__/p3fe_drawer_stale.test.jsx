@@ -192,7 +192,7 @@ describe('§P3-FE P4 / §P2-I N4 挂载行为腿（fake timers 轮询）', () =>
     }
     render(<StockDetailDrawer open code="600000" name="浦发银行" price={10} changePct={0.5} onClose={() => {}} />)
     await settle()
-    expect(screen.getByTestId('sdd-price').textContent).toBe('10.00')
+    expect(screen.getByTestId('sdd-price').textContent).toBe('¥10.00')
     expect(screen.getByTestId('sdd-chg').textContent).toBe('+0.50%')
     // 宿主传进来的冻结值 0.5 已不是最新读数，标注「开抽屉时刻值」不该出现
     expect(screen.queryByTestId('sdd-chg-frozen')).toBeNull()
@@ -200,7 +200,7 @@ describe('§P3-FE P4 / §P2-I N4 挂载行为腿（fake timers 轮询）', () =>
     await act(async () => { vi.advanceTimersByTime(5000) })
     await settle()
     expect(calls).toBe(2)
-    expect(screen.getByTestId('sdd-price').textContent).toBe('11.00')
+    expect(screen.getByTestId('sdd-price').textContent).toBe('¥11.00')
     expect(screen.getByTestId('sdd-chg').textContent).toBe('+10.50%')
   })
 
@@ -222,7 +222,7 @@ describe('§P3-FE P4 / §P2-I N4 挂载行为腿（fake timers 轮询）', () =>
     state.impl.fetchStockLookup = () => Promise.resolve({ price: 0, change_pct: 0, prev_close: 0, name: '' })
     render(<StockDetailDrawer open code="600000" name="浦发银行" price={10} changePct={3.4} onClose={() => {}} />)
     await settle()
-    expect(screen.getByTestId('sdd-price').textContent).toBe('10.00')
+    expect(screen.getByTestId('sdd-price').textContent).toBe('¥10.00')
     expect(screen.getByTestId('sdd-chg').textContent).toBe('+3.40%')
     expect(screen.getByTestId('sdd-chg-frozen')).toBeInTheDocument()
   })
@@ -234,7 +234,9 @@ describe('§P3-FE P4 / §P2-I N4 挂载行为腿（fake timers 轮询）', () =>
     render(<StockDetailDrawer open code="600000" name="浦发银行" onClose={() => {}} />)
     await settle()
     expect(screen.queryByTestId('sdd-chg')).toBeNull()
-    expect(screen.queryByTestId('sdd-price')).toBeNull()
+    // §F-19：缺价不再整段消失，而是与自选表共用 PriceCell 显示占位符「—」
+    expect(screen.getByTestId('sdd-price').textContent).toBe('—')
+    expect(screen.getByTestId('wl-no-data')).toBeInTheDocument()
     expect(screen.queryByTestId('sdd-chg-frozen')).toBeNull()
   })
 
@@ -252,12 +254,12 @@ describe('§P3-FE P4 / §P2-I N4 挂载行为腿（fake timers 轮询）', () =>
     await settle()
     await act(async () => { vi.advanceTimersByTime(5000) })
     await settle()
-    expect(screen.getByTestId('sdd-price').textContent).toBe('11.00')
+    expect(screen.getByTestId('sdd-price').textContent).toBe('¥11.00')
     expect(screen.getByTestId('sdd-chg').textContent).toBe('+10.50%')
     // 旧轮此刻才返回：守卫必须按代号丢掉（P4 之后被覆盖的是整行读数，不只是价格）
     await act(async () => { resolveSlow({ price: 9.0, change_pct: -9.55, prev_close: 9.95, name: '浦发银行' }) })
     await settle()
-    expect(screen.getByTestId('sdd-price').textContent, '§P2-I N4：迟到的旧轮不得覆盖最新价').toBe('11.00')
+    expect(screen.getByTestId('sdd-price').textContent, '§P2-I N4：迟到的旧轮不得覆盖最新价').toBe('¥11.00')
     expect(screen.getByTestId('sdd-chg').textContent, '§P2-I N4：迟到的旧轮不得覆盖最新涨幅').toBe('+10.50%')
   })
 
@@ -275,10 +277,10 @@ describe('§P3-FE P4 / §P2-I N4 挂载行为腿（fake timers 轮询）', () =>
     await settle()
     rerender(<StockDetailDrawer open code="000333" name="美的集团" onClose={() => {}} />)
     await settle()
-    expect(screen.getByTestId('sdd-price').textContent).toBe('20.00')
+    expect(screen.getByTestId('sdd-price').textContent).toBe('¥20.00')
     await act(async () => { resolveOld({ price: 9.0, change_pct: -9.55, prev_close: 9.95, name: '浦发银行' }) })
     await settle()
-    expect(screen.getByTestId('sdd-price').textContent, '§P2-I N4：换股后旧股响应不得回写').toBe('20.00')
+    expect(screen.getByTestId('sdd-price').textContent, '§P2-I N4：换股后旧股响应不得回写').toBe('¥20.00')
     expect(screen.getByTestId('sdd-chg').textContent).toBe('+2.00%')
   })
 })

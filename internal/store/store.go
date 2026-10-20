@@ -80,6 +80,9 @@ func Open(dbPath string) (*DB, error) {
 // （Close closes the database.）
 func (d *DB) Close() error { return d.db.Close() }
 
+// Ping 只读探活（§F-13 /readyz 的 db 依赖位）。SQLite 本地文件，正常情况下立即返回。
+func (d *DB) Ping() error { return d.db.Ping() }
+
 // migrate 建表（幂等，IF NOT EXISTS）。
 // 所有表均为历史研究数据，主键即 Tushare 主键，便于 INSERT OR REPLACE 断点续传。
 // （migrate creates the schema idempotently; primary keys match Tushare's for resumable upserts.）
@@ -1503,6 +1506,26 @@ func (d *DB) MaxTradeDateAll(table string) (string, error) {
 	query := fmt.Sprintf("SELECT MAX(trade_date) FROM %s", table)
 	var v sql.NullString
 	if err := d.db.QueryRow(query).Scan(&v); err != nil {
+		return "", err
+	}
+	return v.String, nil
+}
+
+// StockDelistDate 返回某代码的退市日（YYYYMMDD）；未退市/无记录返回空串。
+// §N-12a：入参允许裸 6 位（分钟接口的形态）或带后缀的 ts_code——stocks 表只有 ts_code，
+// 故用前缀匹配兜住裸代码。查不到 != 退市，调用方不得把空值当成“已退市”。
+// English: returns delist_date for a code (bare 6-digit or full ts_code); empty = still listed
+// or unknown, which callers must NOT treat as delisted.
+func (d *DB) StockDelistDate(code string) (string, error) {
+	var v sql.NullString
+	err := d.db.QueryRow(
+		`SELECT COALESCE(delist_date,'') FROM stocks WHERE ts_code=? OR ts_code LIKE ? LIMIT 1`,
+		code, code+".%",
+	).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
 		return "", err
 	}
 	return v.String, nil

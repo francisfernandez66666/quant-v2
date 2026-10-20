@@ -363,14 +363,30 @@ export default function Signals() {
 
     {
       colKey: 'price', title: '现价/涨跌', width: 130, sorter: sorterNum('price'),
-      cell: ({ row }) => (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          <span>¥{(row.price || 0).toFixed(2)}</span>
-          <span style={{ color: chgColor(row.change_pct) }}>
-            {(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%
-          </span>
-        </div>
-      ),
+      // §N-12d：只有 price_kind=live 才是现价；trigger 是信号触发价，必须显示为 — 并注明，
+      // 旧写法把触发价渲染成「¥xx.xx +0.00%」，客户会当成真实现价。
+      cell: ({ row }) => {
+        const kind = row.price_kind || 'live'
+        if (kind !== 'live') {
+          const isTrigger = kind === 'trigger' && Number(row.price) > 0
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <span style={{ color: 'var(--app-faint)' }} data-testid="sig-no-live-price">—</span>
+              <span className="muted" style={{ fontSize: 11 }}>
+                {isTrigger ? '触发价 ¥' + Number(row.price).toFixed(2) : '无行情'}
+              </span>
+            </div>
+          )
+        }
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span title={row.quote_at ? '行情截至 ' + row.quote_at : undefined}>¥{(row.price || 0).toFixed(2)}</span>
+            <span style={{ color: chgColor(row.change_pct) }}>
+              {(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%
+            </span>
+          </div>
+        )
+      },
     },
     {
       colKey: 'strategy', title: '策略', width: 130, sorter: sorterStr('strategy'),
@@ -594,7 +610,7 @@ export default function Signals() {
               {klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时'}
             </button>
             {/* §F3 详情：打开全局个股详情抽屉（实时价+分时/盘口+同码相关信号） */}
-            <button style={sheetBtnStyle('#722ed1')} onClick={() => { const s = sheetSignal; setSheetSignal(null); if (s) setDetail({ code: s.code, name: s.name, price: s.price, changePct: s.change_pct }) }}>详情</button>
+            <button style={sheetBtnStyle('#722ed1')} onClick={() => { const s = sheetSignal; setSheetSignal(null); if (s) setDetail({ code: s.code, name: s.name, price: (s.price_kind === 'live' || !s.price_kind) ? s.price : null, changePct: s.change_pct }) }}>详情</button>
             <button style={{ ...sheetBtnStyle('var(--app-muted)'), background: 'var(--app-divider)' }} onClick={() => setSheetSignal(null)}>取消</button>
           </div>
         </div>

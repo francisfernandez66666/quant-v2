@@ -4,11 +4,14 @@
 package data
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // WatchlistManager 自选股管理器，线程安全，持久化到 JSON。
@@ -95,6 +98,46 @@ func (w *WatchlistManager) save(path string, list []string) {
 	if err := atomicWrite(path, data, 0644); err != nil {
 		log.Printf("[watchlist] 保存失败: %v", err)
 	}
+}
+
+// Delete §F-15：删号时删除该账号的自选文件（先备份并逐字节回验，备份不成立就不删）。
+// 空 userID 必须拒绝——那会打到平台所有者自己的 watchlist.json。
+// 返回 (是否真的删了文件, 备份路径, 错误)；文件本来就不存在时返回 (false,"",nil)。
+// English: deletes a user's watchlist file after a byte-verified backup; empty userID is rejected
+// because it would target the platform owner's legacy watchlist.json.
+func (w *WatchlistManager) Delete(userID string) (bool, string, error) {
+	if userID == "" {
+		return false, "", fmt.Errorf("refuse to delete watchlist with empty user id")
+	}
+	if strings.ContainsAny(userID, `/\`) || strings.Contains(userID, "..") {
+		return false, "", fmt.Errorf("invalid user id for watchlist delete")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	path := w.watchlistFile(userID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	backup := fmt.Sprintf("%s/deleted_watchlist_%s_%s.json", w.dir, userID, time.Now().Format("20060102_150405"))
+	if err := atomicWrite(backup, raw, 0o600); err != nil {
+		return false, "", fmt.Errorf("write watchlist backup: %w", err)
+	}
+	back, err := os.ReadFile(backup)
+	if err != nil {
+		return false, "", fmt.Errorf("read watchlist backup: %w", err)
+	}
+	if !bytes.Equal(back, raw) {
+		return false, "", fmt.Errorf("watchlist backup verify failed")
+	}
+	if err := os.Remove(path); err != nil {
+		return false, "", err
+	}
+	log.Printf("[watchlist] 删号清理自选 user=%s bytes=%d backup=%s", userID, len(raw), backup)
+	return true, backup, nil
 }
 
 // All 返回全部账号自选股的并集（引擎打分/行情采集用）。

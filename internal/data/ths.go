@@ -13,6 +13,7 @@
 package data
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -374,6 +375,12 @@ const (
 // callers must detect it via errors.Is and must NOT trip the breaker.
 var ErrTHSUnsupportedPeriod = errors.New("ths: unsupported intraday period")
 
+// ErrTHSParseError §N-12b：200 响应但空体/HTML/JSON 解析失败。
+// 与传输层错误区分：这类失败只记“软失败”，不因单票立即熔断整源（60s 内 ≥5 个不同代码才 trip）。
+// English: a 200 response whose body is empty/HTML/unparseable — a soft failure that must not
+// trip the whole source for a single symbol.
+var ErrTHSParseError = errors.New("ths: parse error")
+
 // thsIntradayScale 把"分钟周期"映射为同花顺 scale 码；不支持的周期返回 false。
 // §2026-09-20：不支持的周期必须让调用方降级，**绝不拿别的周期顶替**——
 // 5 分钟 MACD 与 1 分钟 MACD 数值完全不同，静默替换等于给出错误指标。
@@ -523,11 +530,11 @@ func parseTHSLine(body []byte, isMinute bool) ([]KLine, error) {
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(text), &wrapper); err != nil {
-		return nil, fmt.Errorf("ths kline json: %v", err)
+		return nil, fmt.Errorf("%w: ths kline json: %v", ErrTHSParseError, err)
 	}
 	rows, err := thsSplitLineRows(wrapper.Data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrTHSParseError, err)
 	}
 
 	// 逐行解析 CSV → K线结构：字段数不足/数值解析失败的脏行直接跳过（不因一行坏数据废整段历史）。
@@ -563,7 +570,11 @@ func parseTHSLine(body []byte, isMinute bool) ([]KLine, error) {
 		})
 	}
 	if len(klines) == 0 {
-		return nil, fmt.Errorf("ths line: no valid rows")
+		// 合法信封但零行＝该标的无数据；有行却全部校验失败＝解析/数据质量错误
+		if len(rows) == 0 {
+			return nil, ErrNoMinuteData
+		}
+		return nil, fmt.Errorf("%w: ths line: no valid rows", ErrTHSParseError)
 	}
 	return klines, nil
 }
@@ -606,12 +617,23 @@ func (tc *THSClient) GetTHSMinuteKLine(code string, scale int) ([]KLine, error) 
 	THSLimiter.Wait()
 	resp, err := tc.getWithHeaders(url)
 	if err != nil {
+		// 传输层失败：由调用方立即熔断（真源故障要快速失败）
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// §N-12a/b：200 之外的状态码归传输层源错误；200 + HTML/空体归软失败（不立即熔断）
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ths minute kline status: %d", resp.StatusCode)
+	}
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); strings.Contains(ct, "text/html") {
+		return nil, fmt.Errorf("%w: html content-type %s", ErrTHSParseError, ct)
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, fmt.Errorf("%w: empty body", ErrTHSParseError)
 	}
 	return parseTHSLine(body, true)
 }

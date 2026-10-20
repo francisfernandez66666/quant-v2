@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="量仔">
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="#0A0C10" stroke="#404854" stroke-width="1.6"/>
+  <g stroke="#78808C" stroke-width="1.8" stroke-linecap="round">
+    <path d="M18 14v36M32 10v44M46 18v30"/>
+  </g>
+  <rect x="13" y="24" width="10" height="18" rx="2" fill="#E7E9EA"/>
+  <rect x="27" y="18" width="10" height="22" rx="2" fill="#40C88C"/>
+  <rect x="41" y="27" width="10" height="14" rx="2" fill="#E65A5A"/>
+</svg>

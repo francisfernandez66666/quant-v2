@@ -11,6 +11,7 @@ import MinuteView from '../components/MinuteView.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
+import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
 // §H-2（2026-09-22 修复批）：editBalanceSave 的失败分支调用 showToast，但导入区一直没有
 // ui.jsx —— 保存可用资金一旦失败即抛 ReferenceError（异步未捕获、用户零提示）。补齐导入。
 // English: §H-2 — showToast was called without being imported; the save-failure branch died
@@ -133,8 +134,7 @@ export default function Positions() {
   const [realFormStrategy, setRealFormStrategy] = useState('')
   // 实盘下单提交中标记（防重复提交）
   const [realSubmitting, setRealSubmitting] = useState(false)
-  // 实盘轮询定时器（进入实盘标签时启动）
-  const realTimer = useRef(null)
+  // 实盘轮询由 §N-09 的 usePolling 统一管理（进入实盘标签且为 admin 时启用）
   // §M-10（2026-09-22 PM 批清扫）轮询请求代号守卫：纸面 load 与实盘 loadReal 各自独立代号，
   // 60s 轮询/SSE 触发/手动刷新交错时，旧请求的迟到响应整包丢弃（防数据倒挂）。
   const paperGuard = useRef(null)
@@ -198,8 +198,13 @@ export default function Positions() {
   // 实盘 tab 显示无权限面板（此前 403 被 loadReal 的 catch 静默吞成"空表"，误导为无持仓）。
   const admin = api.isAdmin()
 
+  // §N-09：纸面/实盘两条轮询统一走 usePolling——后台暂停、恢复补一次、卸载清理。
+  // 实盘只在 admin 且当前标签为「实盘」时轮询（与旧 switchBook 的启停语义一致）。
+  usePolling(load, 60000, bookTab === 'paper')
+  usePolling(loadReal, 60000, admin && bookTab === 'real')
+
   // 纸面持仓轮询定时器（30s）
-  const timer = useRef(null)
+  // 纸面/实盘轮询均交给 §N-09 的 usePolling，不再使用页面级定时器 ref
   // SSE 订阅取消函数
   const unsubSSE = useRef(null)
 
@@ -608,10 +613,6 @@ export default function Positions() {
     setBookTab(tab)
     if (tab === 'real') {
       loadReal()
-      // 进入实盘标签时启动 30s 轮询对账
-      if (!realTimer.current) realTimer.current = setInterval(loadReal, 60000) // §F5 实盘持仓兜底 60s（回报走 SSE）
-    } else if (realTimer.current) {
-      clearInterval(realTimer.current); realTimer.current = null
     }
   }
   // 加载 QMT 状态与实盘持仓
@@ -634,6 +635,21 @@ export default function Positions() {
   }
   // 取实盘持仓的有效现价（无效价返回 0，避免展示脏数据）
   function curPrice(p) { return (p.cur_price && p.cur_price > 0) ? p.cur_price : 0 }
+  // §N-02：实盘数据的"截至时刻"——持仓行与账户 updated_at 的最大值。
+  // 为什么必须显式上屏：real_positions 可能停在很久以前，而页面照样有表格与金额，
+  // 不标时刻就会让"几周前的对账"看起来和"今天刚回报"一模一样。
+  function latestUpdatedAt() {
+    let best = ''
+    let bestT = -Infinity
+    const push = (v) => {
+      if (!v) return
+      const t = Date.parse(v)
+      if (Number.isFinite(t) && t > bestT) { bestT = t; best = v }
+    }
+    if (realAccount) push(realAccount.updated_at)
+    realPositions.forEach((p) => push(p.updated_at))
+    return best
+  }
   // 计算实盘持仓盈亏百分比（成本或现价为空时返回 0）
   function realPnlPct(p) {
     if (!p.cost_price || p.cost_price <= 0 || !curPrice(p)) return 0
@@ -771,7 +787,8 @@ export default function Positions() {
 
   // 挂载时加载持仓、启动轮询并订阅 SSE 实盘建议；卸载时清理
   useEffect(() => {
-    load(); timer.current = setInterval(load, 60000) // §F5 纸面持仓兜底轮询降为 60s
+    load()
+    // §N-09：纸面轮询由 usePolling 管理，此处只做首轮加载与 SSE 订阅
     // 订阅 SSE 事件总线（App 单连接扇出）：处理实盘建议推送与 QMT/订单回报，触发对应刷新
     unsubSSE.current = on(['real_advice', 'qmt_report', 'real_order'], (msg) => {
       // 实盘操作建议：按 ts_code 汇总成建议映射
@@ -799,10 +816,8 @@ export default function Positions() {
         if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices)
       }).catch(() => {})
     }
-    // 卸载时清理：纸面轮询/实盘轮询/SSE订阅
+    // 卸载时清理：轮询由 usePolling 负责，这里只取消 SSE 订阅
     return () => {
-      if (timer.current) clearInterval(timer.current)
-      if (realTimer.current) clearInterval(realTimer.current)
       if (unsubSSE.current) unsubSSE.current()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -982,6 +997,8 @@ export default function Positions() {
                 columns={paperColumns}
                 rowKey="code"
                 size="small"
+                // §N-11e：客户主路径显式空态，不再用 TDesign 默认「暂无数据」混淆加载失败
+                empty="暂无纸面持仓"
                 // §F5 长持仓分页（默认 20/页，可选 20/50/100）
                 pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100], showJumper: true }}
                 // §F1 长持仓列表固定表头
@@ -1047,6 +1064,18 @@ export default function Positions() {
             {realAccount && realAccount.total_asset > 0 && (
               <span className="muted">总值 ¥{(realAccount.total_asset || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
             )}
+            {/* §N-02：数据截至时刻（超过 4 天未更新转警示色） */}
+            {(() => {
+              const at = latestUpdatedAt()
+              if (!at) return <span className="muted">持仓数据截至 —（网关未上报）</span>
+              const ageDays = (Date.now() - Date.parse(at)) / 86400000
+              const stale = Number.isFinite(ageDays) && ageDays > 4
+              return (
+                <span className={stale ? '' : 'muted'} style={stale ? { color: 'var(--td-warning-color)' } : undefined}>
+                  持仓数据截至 {at}{stale ? '（超过 4 天未更新）' : ''}
+                </span>
+              )
+            })()}
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
           </div>
 
@@ -1060,7 +1089,7 @@ export default function Positions() {
             </Card>
           ) : (
             <Card>
-              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} />
+              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} empty="暂无实盘持仓" />
             </Card>
           )}
           </>

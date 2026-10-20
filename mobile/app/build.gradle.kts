@@ -22,8 +22,8 @@ android {
         // 为什么直接跳 2：v1 包没有任何更新通道（服务端驱动强制更新自 v2 起才生效），
         // 旧 v1 用户无法被远程引导升级，须由 owner 重装一次 v2；此后 v2+ 由 UpdateGate
         // 强制更新链路接管（min_version_code 门槛拦截）。
-        versionCode = 2       // 整数递增版本号（每次上架 +1，Google Play 与覆盖安装据此判新旧）
-        versionName = "1.1.0" // 展示用语义版本号（v2：登录 token 迁原生加密存储 + 强制更新闸）
+        versionCode = 3       // 整数递增版本号（每次上架 +1，Google Play 与覆盖安装据此判新旧）
+        versionName = "1.2.0" // 展示用语义版本号（v3：2026-10-20 修复批，前端落后 81 提交的追赶包）
 
         // 极光推送 JPush：包名 + AppKey（极光控制台创建应用后获得）+ 渠道号
         // （JPush placeholders: package name, AppKey from the JPush console, channel label.）

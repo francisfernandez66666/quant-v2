@@ -5,6 +5,13 @@ import React, { useState, useEffect, useRef } from 'react'
 import { Card, Table, Button, Input, Dialog, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
+import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
+import { useLoadLedger } from '../utils/loadLedger.js' // §F-14 读取失败按腿记账
+import LoadFailBanner from '../components/LoadFailBanner.jsx' // §F-14 统一失败红条
+import {
+  PriceCell as SharedPriceCell, PctCell as SharedPctCell,
+  priceOrNil, pctOrNil, WL_NO_DATA_PLACEHOLDER as SHARED_NO_DATA,
+} from '../components/priceFormat.jsx' // §F-19 价格渲染全站单实现
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
@@ -21,19 +28,52 @@ function cacheKeyForAccount() {
   return acc ? CACHE_KEY + ':' + acc : CACHE_KEY
 }
 
-// 将自选股列表持久化到 localStorage
-function persistCache(stocks) {
-  try { localStorage.setItem(cacheKeyForAccount(), JSON.stringify(stocks)) } catch (_) {}
+// §F-21 / §N-11d（2026-10-20）：缓存从「裸数组」升级为「带快照时刻的信封」。
+// 为什么必须带 saved_at：进页允许先显示上一份缓存，但屏上必须能回答“这是几点的行情”；
+// 没有时刻的旧数组无法标注，按当帧失效处理（不显示、不续命）。
+// 72h TTL 只兜“跨好几个交易日还在拿旧价”；真正的兜底是每次进页必回源（见 load(true)）。
+const CACHE_VERSION = 2
+const CACHE_TTL_MS = 72 * 3600 * 1000
+
+// 将自选股列表与快照时刻一起持久化；没有真值时刻的列表一律不写回（陈旧自我续命就是这么来的）
+function persistCache(rows, savedAt) {
+  if (!savedAt) return
+  // §P2-J 可吞：localStorage 写失败只影响首帧缓存，不影响回源主链
+  try {
+    localStorage.setItem(cacheKeyForAccount(), JSON.stringify({ v: CACHE_VERSION, saved_at: savedAt, rows }))
+  } catch (_) {}
 }
-// 从 localStorage 读取自选股缓存
+// 读取缓存：旧数组格式（无 saved_at）与超过 TTL 的缓存一律当作没有缓存
 function loadCache() {
+  // §P2-J 可吞：缓存读坏按无缓存处理，主数据仍会强制回源
   try {
     const legacy = localStorage.getItem(CACHE_KEY)
     if (legacy) localStorage.removeItem(CACHE_KEY)
     const raw = localStorage.getItem(cacheKeyForAccount())
-    const arr = raw ? JSON.parse(raw) : []
-    return Array.isArray(arr) ? arr : []
-  } catch (_) { return [] }
+    if (!raw) return { rows: [], savedAt: null }
+    const parsed = JSON.parse(raw)
+    if (!parsed || parsed.v !== CACHE_VERSION || !parsed.saved_at || !Array.isArray(parsed.rows)) {
+      return { rows: [], savedAt: null }
+    }
+    const at = new Date(parsed.saved_at)
+    if (!Number.isFinite(at.getTime()) || Date.now() - at.getTime() > CACHE_TTL_MS) {
+      return { rows: [], savedAt: null }
+    }
+    return { rows: parsed.rows, savedAt: parsed.saved_at }
+    // §P2-J 可吞：缓存读坏按无缓存处理，主数据仍会强制回源
+  } catch (_) { return { rows: [], savedAt: null } }
+}
+// 清空本账号缓存（自选被删空时使用，避免下一次进页仍闪出已删除的行）
+function clearCache() {
+  // §P2-J 可吞：清缓存失败不影响列表正确性，下一次回源会覆盖
+  try { localStorage.removeItem(cacheKeyForAccount()) } catch (_) {}
+}
+// 缓存徽标文案：只写“截至”，不得出现“实时”二字
+function formatCacheAt(savedAt) {
+  const d = new Date(savedAt)
+  if (!Number.isFinite(d.getTime())) return ''
+  const p = (n) => String(n).padStart(2, '0')
+  return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
 }
 
 // 根据分数与阈值返回评分单元格的颜色样式
@@ -44,63 +84,26 @@ function scoreStyle(score, pass, strongMin) {
   return { color: 'var(--app-text-2)', fontWeight: 600 }
 }
 
-// §P3-FE P8/P9（缺数渲染，20261006 修复批）：自选行原先在**合并阶段**就把「没读到」折成 0
-// （`Number(wlMap[code]?.price) || 0` / `Number(s.change_pct) || 0`），表格再无条件渲染成
-// 「¥0.00」并按 `>=0` 染成涨红——一只停牌/未进快照覆盖的票，在界面上和「今天正好平盘」长得一模一样，
-// 用户按颜色判断涨跌就会读反（与 §P2-F 降级链把断源日写成平盘同族）。
-// 现在合并侧保留 null、渲染侧按 null 出 '--' 且不着色，缺数与平盘从此是两种读数。
-// 两把尺子必须分开定义，因为 0 在两个字段里的含义不同：
-//   price：0 不是合法现价（后端取不到行情就回 0，见 handlers_fix.go 的 price>0 判据）⇒ 只有 >0 算有数；
-//   change_pct：0 是合法实测值（平盘）⇒ 只要可解析成有限数就算有数，null/'' /undefined 才算缺数。
-function priceOrNil(v) {
-  // 现价缺数判据：可解析且 >0 才认，其余（0/NaN/null/undefined）一律 null
-  const n = Number(v)
-  // 常量 n：局部定义
-  return Number.isFinite(n) && n > 0 ? n : null
-}
-function pctOrNil(v) {
-  // 涨跌幅缺数判据：null/空串/不可解析→null；0 与负值都是合法实测读数
-  if (v === null || v === undefined || v === '') return null
-  const n = Number(v)
-  // 常量 n：局部定义
-  return Number.isFinite(n) ? n : null
-}
-
-// §P3-FE P8/P9 渲染出口（提到模块作用域并 export：整页挂载要 mock 快照/自选/评分/时段四路端点，
-// 与「缺数怎么显示」这条断言无关，做法同 Research.jsx 的 isAdjBasisStale；表格里两格的缺数口径
-// 只有这一份实现，列定义与单测共用，不会出现「测的是 helper、表里写的是另一套」）。
-// 占位符选「—」：与本页评分列既有惯例一致（5 个评分格缺数都写「—」），不另造第二种占位符；
-// FIX_PLAN 条目里写的 '--' 是 DepthPanel 那侧的形态，两处各按各页惯例，断言按「同页占位符唯一」钉。
-// 缺数一律不着色（var(--app-faint)）：旧写法无条件按 `>=0` 染涨红/跌绿，把「不知道涨跌」显示成「在跌」，
-// 用户按颜色判断就会读反（与 §P2-F 降级链把断源日写成平盘同族）。
-// English: §P3-FE — the two quote cells' missing-data rendering, single implementation shared by the
-// table columns and the unit tests (no color at all when there is no reading).
-export const WL_NO_DATA_PLACEHOLDER = '—'
+// §P3-FE P8/P9 / §F-19：缺数渲染的实现已抽到 components/priceFormat.jsx（表格与个股抽屉共用一份）。
+// 这里保留同名导出，既有列定义、单测与调用方不需要改 import；占位符仍是 U+2014「—」。
+export const WL_NO_DATA_PLACEHOLDER = SHARED_NO_DATA
 
 /**
- * 现价单元格：有数显示 ¥xx.xx，缺数（含 0，0 不是合法现价）显示占位符且不着色。
+ * 现价单元格（薄封装，真正实现见 components/priceFormat.jsx）。
  * @param {{value: number|null|string}} props
  * @returns {JSX.Element}
  */
-export function PriceCell({ value }) {
-  const p = priceOrNil(value)
-  // 常量 p：局部定义
-  return p == null
-    ? <span style={{ color: 'var(--app-faint)' }} data-testid="wl-no-data">{WL_NO_DATA_PLACEHOLDER}</span>
-    : <span>¥{p.toFixed(2)}</span>
+export function PriceCell(props) {
+  return <SharedPriceCell {...props} />
 }
 
 /**
- * 涨跌幅单元格：有数按红涨绿跌着色（0 是合法的平盘实测），缺数显示占位符且不着色。
+ * 涨跌幅单元格（薄封装，真正实现见 components/priceFormat.jsx）。
  * @param {{value: number|null|string}} props
  * @returns {JSX.Element}
  */
-export function PctCell({ value }) {
-  const c = pctOrNil(value)
-  // 常量 c：局部定义
-  return c == null
-    ? <span style={{ color: 'var(--app-faint)' }} data-testid="wl-no-data">{WL_NO_DATA_PLACEHOLDER}</span>
-    : <span data-testid="wl-pct" style={{ color: c >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{c > 0 ? '+' : ''}{c.toFixed(2)}%</span>
+export function PctCell(props) {
+  return <SharedPctCell {...props} />
 }
 
 // 安全读取字段值
@@ -128,8 +131,6 @@ export default function Watchlist() {
   const [sheetStock, setSheetStock] = useState(null)
   // §F3 全局个股详情抽屉目标（{code,name,price,changePct}），null=关闭
   const [detail, setDetail] = useState(null)
-  // 轮询定时器（30s）
-  const timer = useRef(null)
   // §P2-I（2026-10-06 修复批 波 6）60s 轮询代号守卫：上一轮还在途时下一轮已发出，
   // 旧响应迟到会把新一轮刚写好的行情/评分覆盖回去（数据倒挂，且一直显示到下次轮询）。
   // 本页自 §M-10 起就漏在守卫外——自选页恰好是"评分列"最需要新鲜读数的地方。
@@ -138,18 +139,27 @@ export default function Watchlist() {
   // English: P2#23 — controlled sort state keeps the user's column sort across the 30s data poll.
   const [sort, setSort] = useState(null)
 
-  // 初始化：读取缓存、加载数据、启动 30s 轮询
+  // 首帧缓存徽标：null=屏上已是回源真值；非空=仍在展示该时刻的缓存
+  const [cacheAt, setCacheAt] = useState(null)
+  // 手动刷新进行中标记
+  const [refreshing, setRefreshing] = useState(false)
+  // 最近一次回源成功写入的行情时刻（增删自选时沿用，避免用“现在”冒充行情时刻）
+  const lastQuoteAtRef = useRef(null)
+  // §F-14：读取失败台账——旧实现只 console.warn，屏上仍显示“暂无自选股”
+  const { fails: loadFails, mark: markLoadFail, clear: clearLoadFail } = useLoadLedger()
+  const LOAD_LEG = '自选行情'
+
+  // 初始化：读取缓存、**强制回源一次**
   useEffect(() => {
-    setStocks(loadCache())
-    load()
-    // 每 30s 轮询刷新自选股行情与评分
-    timer.current = setInterval(load, 60000) // §F5 兜底降为 60s
-    return () => { if (timer.current) clearInterval(timer.current) }
+    const cached = loadCache()
+    if (cached.rows.length) { setStocks(cached.rows); setCacheAt(cached.savedAt) }
+    // §F-21：进页必回源——交易时段只决定“要不要继续轮询”，不再决定“要不要取数”
+    load(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 自选股变动时持久化缓存
-  useEffect(() => { persistCache(stocks) }, [stocks])
+  // §N-09：60s 轮询统一走 usePolling（后台标签页暂停、恢复可见立即补一次、卸载清理）
+  usePolling(() => load(false), 60000)
 
   // 按当前排序键计算展示列表，无排序键时按最高维度分倒序
   const sortedEvals = (() => {
@@ -168,17 +178,20 @@ export default function Watchlist() {
   useEffect(() => { stocksRef.current = stocks }, [stocks])
 
   // 加载自选行情、评估数据并合并快照信息
-  async function load() {
+  // force=true：进页首轮/手动刷新——无论交易时段一律回源（F-21 的核心契约）
+  async function load(force = false) {
     // §P2-I：本轮代号在**发起请求前**盖章，每次 await 回来后先判后到再写 state
     const token = loadGuard.begin()
     try {
       const st = await api.fetchStatus()
       if (loadGuard.isStale(token)) return // 后到的旧轮次：整包丢弃，连 session 也不写
+      // 会话态先落盘；下面的时段判据只作用于“后续轮询轮次”，不影响进页首轮
+      api.setLastSession(st.session)
       const cur = stocksRef.current
       const hasEmptyCode = cur.some((s) => !s.code)
-      // 非交易时段且已有关联行情时跳过刷新，避免无谓请求
-      if (!api.isTradingSession(st.session) && cur.length && !hasEmptyCode) return
-      api.setLastSession(st.session)
+      // §F-21：交易时段只决定“要不要继续轮询”。非交易时段的轮询轮在已有行情时跳过重活；
+      // 进页首轮与手动刷新（force）必须回源，否则客户会把上周的缓存当成今天的价。
+      if (!force && !api.isTradingSession(st.session) && cur.length && !hasEmptyCode) return
       const [snap, wl, ev] = await Promise.all([
         api.fetchSnapshot(), api.fetchWatchlist(), api.fetchEvaluations(),
       ])
@@ -188,7 +201,14 @@ export default function Watchlist() {
       const wlStocks = (wl.stocks || []).map((c) => (typeof c === 'object' ? c : { code: c }))
       // 归一为 {code} 形式的股票列表再取代码集合
       const codes = wlStocks.map((c) => c.code)
-      if (!codes.length) { setStocks([]); return }
+      if (!codes.length) {
+        lastQuoteAtRef.current = null
+        setStocks([])
+        setCacheAt(null)
+        clearCache()
+        clearLoadFail(LOAD_LEG)
+        return
+      }
       const wlMap = {}
       wlStocks.forEach((c) => { wlMap[c.code] = c })
       const evMap = {}
@@ -198,8 +218,30 @@ export default function Watchlist() {
       // ReferenceError(wlRow is not defined) 且被静默 catch 吞掉 → 永远渲染「暂无自选股」，
       // 只有当次会话内手动添加的乐观行可见（即线上「看不到自选/添加后刷新即丢」的根因）。
       // 组装最终展示列表：优先快照数据，回退评估数据，补全缺失股票
-      setStocks(buildDisplayList(snap, ev, codes, wlMap, evMap))
-    } catch (e) { console.warn('WL_LOAD_FAIL', e && (e.stack || e.message || String(e))) }
+      // 组装最终展示列表：优先快照数据，回退评估数据，补全缺失股票
+      const merged = buildDisplayList(snap, ev, codes, wlMap, evMap)
+      // 只有真正回源成功时才更新缓存与“截至”时刻；失败分支不得写回（陈旧自我续命）
+      const nowIso = new Date().toISOString()
+      lastQuoteAtRef.current = nowIso
+      setStocks(merged)
+      setCacheAt(null)
+      persistCache(merged, nowIso)
+      clearLoadFail(LOAD_LEG)
+    } catch (e) {
+      // §F-21：失败不写缓存、不清徽标——屏上保留上一份可解释数据，等下一轮/手动刷新
+      // §F-14：同时把失败点名进台账，避免屏上落到“暂无自选股”的假空态
+      markLoadFail(LOAD_LEG, e && (e.message || String(e)))
+      console.warn('WL_LOAD_FAIL', e && (e.stack || e.message || String(e)))
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  // 手动刷新：客户不必等开盘（F-21④）
+  function refresh() {
+    if (refreshing) return
+    setRefreshing(true)
+    load(true)
   }
 
   // 将快照/评估数据与自选股列表合并为统一展示行数组
@@ -277,12 +319,16 @@ export default function Watchlist() {
           dr_score: 0, dr_pass: false,
           m_score: 0, m_pass: false,
         }
-        // 去重后追加到列表末尾
-        setStocks((prev) => [...prev.filter((s) => s.code !== row.code), row])
+        // 去重后追加到列表末尾；缓存沿用上一次回源时刻，没有真值时刻就不写
+        const next = [...stocksRef.current.filter((s) => s.code !== row.code), row]
+        setStocks(next)
+        persistCache(next, lastQuoteAtRef.current)
       } else if (!res || !res.duplicate) {
         // 后端未返回股票信息且非重复：仅用代码构建基础行
         // §P3-FE P8/P9：行情两键留 null ⇒ 表内出 '--' 且不着色，等下一轮快照补真值
-        setStocks((prev) => [...prev, { code, name: code, price: null, change_pct: null }])
+        const next = [...stocksRef.current, { code, name: code, price: null, change_pct: null }]
+        setStocks(next)
+        persistCache(next, lastQuoteAtRef.current)
       }
       MessagePlugin.success('已添加 ' + code)
     } catch (e) { MessagePlugin.error('添加失败: ' + (e.message || '')) }
@@ -293,7 +339,11 @@ export default function Watchlist() {
   async function remove(code) {
     try {
       await api.removeWatchlist(code)
-      setStocks((prev) => prev.filter((s) => s.code !== code))
+      const next = stocksRef.current.filter((s) => s.code !== code)
+      setStocks(next)
+      // 删空即清缓存；否则沿用上一次回源时刻（不能用“现在”冒充行情时刻）
+      if (next.length) persistCache(next, lastQuoteAtRef.current)
+      else clearCache()
       MessagePlugin.success('已移除 ' + code)
     } catch (e) { MessagePlugin.error('删除失败: ' + (e.message || '')) }
   }
@@ -315,7 +365,7 @@ export default function Watchlist() {
     // 代码列：蓝色等宽字体展示，支持按代码排序
     { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name, price: row.price, changePct: row.change_pct }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     // 名称列：灰色字体，支持按名称排序
-    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name || '-'}</span> },
+    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name || WL_NO_DATA_PLACEHOLDER}</span> },
     // 现价列：带人民币符号，支持按价格排序
     // 涨跌列/现价列的缺数口径（§P3-FE P8/P9）：渲染出口是模块作用域的 PriceCell/PctCell（单实现，
     // 表列与单测共用同一份，见文件头注释）；价格判据走 priceOrNil：0 不是合法现价（缓存里的历史 0 同归缺数）。
@@ -367,11 +417,14 @@ export default function Watchlist() {
         fixedHeader
         maxHeight="calc(100vh - 300px)"
 
-        // §F1 展开为受控模式：整行点击不展开（避免与移动端 onRowTap 打开底部面板冲突），
+        // §F1 展开为受控模式：整行点击不展开分时（避免与移动端行点击打开底部面板冲突），
         // 分时行的展开/收起只由「K线」列按钮与底部面板经 toggleKline 改 expandedKeys
         expandOnRowClick={false}
         expandedRowKeys={expandedKeys}
         onExpandChange={handleExpandChange}
+        // §F-16：整行点击接到 onRowTap（窄屏打开底部操作面板）；代码列/按钮列已 stopPropagation，
+        // 不会双触发。旧实现 onRowTap 只有定义、从未挂到 Table 上。
+        onRowClick={(ctx) => onRowTap(ctx && ctx.row ? ctx.row : ctx)}
         expandedRow={expandedContent}
       />
     )
@@ -385,16 +438,29 @@ export default function Watchlist() {
       <Card style={{ marginBottom: 16 }}>
         <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>自选股</h2>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            {/* §N-11d：首帧缓存必须能看出“这是几点的行情”；回源成功后徽标消失 */}
+            {cacheAt && (
+              <span className="muted" data-testid="wl-cache-badge" style={{ fontSize: 12 }}>
+                缓存数据 · 截至 {formatCacheAt(cacheAt)}
+              </span>
+            )}
             <Input value={newCode} placeholder="输入代码 (如 000001)" onChange={(v) => setNewCode(v)} onEnter={() => add()} disabled={adding} style={{ width: 200 }} />
             <Button theme="primary" onClick={add} loading={adding}>{adding ? '添加中…' : '添加'}</Button>
+            {/* §F-21④：显式刷新入口，客户不必等到开盘 */}
+            <Button variant="outline" onClick={refresh} loading={refreshing}>{refreshing ? '刷新中…' : '刷新'}</Button>
           </div>
         </div>
       </Card>
 
+      {/* §F-14：读取失败红条（下方保留上一轮读数或明确失败态） */}
+      <LoadFailBanner fails={loadFails} page="Watchlist" />
+
       {/* 自选股表格：可排序列、展开行显示分时图与盘口面板 */}
       {stocks.length > 0 ? renderStockTable() : (
-        <Card><div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无自选股，输入代码添加</div></Card>
+        <Card><div className="muted" style={{ padding: 24, textAlign: 'center' }}>
+          {Object.keys(loadFails).length > 0 ? '自选行情读取失败，请点上方「刷新」重试' : '暂无自选股，输入代码添加'}
+        </div></Card>
       )}
 
       {/* 评分图例：颜色含义 + 各维度操作阈值说明 */}

@@ -1141,7 +1141,16 @@ export default function Paper() {
 
       {/* 净值曲线 */}
       {isAdmin && (
-        <Card title={<span>净值曲线 <em style={{ color: 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em></span>} style={{ marginBottom: 12 }}>
+        <Card title={<span>净值曲线 <em style={{ color: 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em>
+          {/* §N-02：paper_daily 的最后净值日必须可见；超过 4 天未更新转警示色 */}
+          {(() => {
+            const last = equity.length ? equity[equity.length - 1].date : ''
+            if (!last) return null
+            const ageDays = (Date.now() - Date.parse(last)) / 86400000
+            const stale = Number.isFinite(ageDays) && ageDays > 4
+            return <em style={{ color: stale ? 'var(--td-warning-color)' : 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>· 最后净值日 {last}{stale ? '（超过 4 天未更新）' : ''}</em>
+          })()}
+        </span>} style={{ marginBottom: 12 }}>
           {/* §P2-J O1：净值腿失败角标（曲线本身是上一轮点位） */}
           {legFailFlag('净值曲线')}
           {equity.length > 1 ? (

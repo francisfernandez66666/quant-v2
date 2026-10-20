@@ -201,6 +201,8 @@ const STORAGE_KEY = 'liangzai_token'
 const STORAGE_SERVER = 'liangzai_server_url'
 const STORAGE_ACCOUNT = 'liangzai_account'
 const STORAGE_ROLE = 'liangzai_role'
+// §F-11：会话到期时刻（RFC3339，来自登录响应 expires_at＝Session.Exp，与账号到期不是一回事）
+const STORAGE_EXPIRES = 'liangzai_session_expires_at'
 // STORAGE_ROLE 存储当前登录账号角色（admin/member），角色位图随登录响应写入
 // STORAGE_ROLE holds the logged-in account role (admin/member); the role bitmap is written from the login response
 const STORAGE_PERMS = 'liangzai_perms'
@@ -319,6 +321,8 @@ export function storeAuth(token, account, expiresAt, role, perms) {
   localStorage.setItem(STORAGE_ACCOUNT, account || '')
   localStorage.setItem(STORAGE_ROLE, role || 'user')
   localStorage.setItem(STORAGE_PERMS, JSON.stringify(perms || []))
+  // §F-11：把服务端会话到期时刻真实落盘（旧版收了第三参却从未使用）
+  localStorage.setItem(STORAGE_EXPIRES, expiresAt || '')
   // §M-11（2026-09-22 修复批）登录账号上桥：移动端原生壳据此派生并即时重设极光别名
   // （quant_<uid>），换账号不再停留在默认别名 quant_owner（定向推送变广播的根因）。
   // 旧版 APK 无 setAccount 方法——typeof 守卫后静默跳过，行为与迁移前一致。
@@ -376,6 +380,7 @@ export function clearAuth() {
   localStorage.removeItem(STORAGE_ACCOUNT)
   localStorage.removeItem(STORAGE_ROLE)
   localStorage.removeItem(STORAGE_PERMS)
+  localStorage.removeItem(STORAGE_EXPIRES)
 }
 
 /** §D7 自助退出：先向服务端吊销当前 Bearer 对应的会话（POST /api/auth/logout）。
@@ -596,18 +601,40 @@ export const LLM_PROBE_TIMEOUT_MS = LLM_PROBE_TIMEOUT
  * @returns {Promise<object>} 响应 JSON
  * @returns {Promise<object>} response JSON
  */
+// §N-10（2026-10-20）：同源 GET 并发去重 + 有界重试 + 外部取消。
+// 为什么需要去重：StrictMode 双跑、可见性恢复、SSE 触发会叠出重复 GET；落地即清，不做 TTL 缓存。
+const inflightGets = new Map()
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+// 可重试状态：仅网关瞬时故障；POST/PUT/DELETE 是写路径，永不重试。
+const RETRYABLE_STATUS = new Set([502, 503, 504])
+
 // §P2-15（2026-09-15）：导出 request 供单测直接驱动四个错误分支（401 清态/超时/同源回退/非 JSON 错误体）
+// §N-10：外层只做 GET 去重（键含 method+url+token，避免把 A 账号响应喂给 B 账号）。
 export async function request(path, opts = {}) {
+  const method = String(opts.method || 'GET').toUpperCase()
+  const dedupe = method === 'GET' && !opts.signal && opts.dedupe !== false
+  const token = getToken() || ''
+  const key = method + ' ' + baseUrl() + path + '|' + token
+  if (dedupe && inflightGets.has(key)) return inflightGets.get(key)
+  const p = requestInner(path, opts)
+  if (dedupe) {
+    inflightGets.set(key, p)
+    const done = () => { if (inflightGets.get(key) === p) inflightGets.delete(key) }
+    p.then(done, done)
+  }
+  return p
+}
+
+// requestInner 单轮请求实现：每次尝试独立 AbortController（超时/外部取消），
+// GET 允许一次重试（网络错误或 502/503/504），其余方法一律只发一次。
+async function requestInner(path, opts = {}) {
   // 拼接完整请求地址：服务器基础地址 + 相对路径
-  // Build the full request URL: server base URL + relative path
   const base = baseUrl()
-  // 设置请求超时（默认 REQUEST_TIMEOUT，可通过 opts.timeout 覆盖，如 LLM 咨询需要更长等待），超时后中止请求
-  // Set a request timeout (default REQUEST_TIMEOUT, overridable via opts.timeout, e.g. LLM consult needs to wait longer); abort on timeout
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), opts.timeout || REQUEST_TIMEOUT)
+  const method = String(opts.method || 'GET').toUpperCase()
+  const timeoutMs = opts.timeout || REQUEST_TIMEOUT
+  let retried = false
 
   // 单次请求执行：base 为基础地址（可为自定义服务器或同源空串）
-  // Single attempt: base is the server base (custom server URL or same-origin empty string)
   const doFetch = async (tryBase) => {
     const url = tryBase + path
     // 合并请求头：默认 JSON 头在前，opts.headers 同名可覆盖默认值
@@ -615,51 +642,70 @@ export async function request(path, opts = {}) {
     // 鉴权：本地持有 token 则自动附加 Authorization: Bearer 头
     const token = getToken()
     if (token) headers['Authorization'] = 'Bearer ' + token
-    return fetch(url, {
-      method: opts.method || 'GET',
-      headers,
-      body: opts.data ? JSON.stringify(opts.data) : undefined,
-      signal: ctrl.signal,
-    })
+    // §N-10：每次尝试独立 controller；外部 signal（页面卸载）只取消本次请求
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    const onAbort = () => ctrl.abort()
+    if (opts.signal) {
+      if (opts.signal.aborted) ctrl.abort()
+      else opts.signal.addEventListener('abort', onAbort, { once: true })
+    }
+    try {
+      return await fetch(url, {
+        method,
+        headers,
+        body: opts.data ? JSON.stringify(opts.data) : undefined,
+        signal: ctrl.signal,
+      })
+    } finally {
+      clearTimeout(timer)
+      if (opts.signal) opts.signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  // 一次有界重试：GET 专属；300ms 抖动避免同时重试打爆上游
+  const retryOnce = async (fn) => {
+    retried = true
+    await sleep(300 + Math.floor(Math.random() * 150))
+    if (opts.signal && opts.signal.aborted) {
+      const err = new Error('请求已取消')
+      err.name = 'AbortError'
+      throw err
+    }
+    return fn()
   }
 
   let res
   try {
     res = await doFetch(base)
   } catch (e) {
-    // 网络层失败（DNS 解析失败 / 连接被拒 / 跨域 / 超时）：若配置了自定义服务器且同源可用，
-    // 自动回退到「当前页面同源」再试一次——修复「设置了失效的自定义服务器地址后，
-    // 登录态靠缓存令牌保留、但所有页面都拿不到后端数据」的系统性断联问题。
-    // English: on a network-level failure (DNS/connection/CORS/timeout), if a custom server was
-    // configured but same-origin is reachable, retry against same-origin once. This heals the
-    // "stale custom server URL keeps you logged in (cached token) yet every page is empty" case.
+    // 外部取消（页面卸载）：原样抛出 AbortError，调用方不弹错误提示
     if (e && e.name === 'AbortError') {
-      clearTimeout(timer)
+      if (opts.signal && opts.signal.aborted) throw e
       throw new Error('请求超时')
     }
-    // 非超时类网络错误：若配置了自定义服务器，则回退当前页面同源地址重试一次。
-    // §FIX-9i(2026-09-19)：回退重发仅限幂等的 GET——此前不分方法，POST /api/consult
-    // 这类"计费 + 写历史"的请求在自定义地址网络失败后会被原样重发一次，等于用户
-    // 点一次发送花两份钱、落两条历史。非幂等方法（POST/PUT/PATCH 等）直接抛原始错误。
-    // English: same-origin fallback retry is now restricted to idempotent GET; billable
-    // POSTs (e.g. consult) must never be auto-resent.
-    if (base !== '' && (opts.method || 'GET') === 'GET') {
+    // 网络层失败：GET 允许先在同源/自定义地址间回退一次，再重试一次
+    if (base !== '' && method === 'GET') {
       try {
         if (typeof console !== 'undefined') {
           console.warn('[api] 自定义服务器地址不可达，回退同源请求:', base + path)
         }
         res = await doFetch('')
       } catch (e2) {
-        clearTimeout(timer)
+        if (!retried && method === 'GET') return retryOnce(() => doFetch(''))
         throw e2 || e
       }
-      // 未配置自定义服务器（base 为空同源请求）或不可重发方法：无回退余地，直接抛出原始网络错误
+    } else if (!retried && method === 'GET') {
+      return retryOnce(() => doFetch(base))
     } else {
-      clearTimeout(timer)
       throw e
     }
   }
-  clearTimeout(timer)
+
+  // §N-10：GET 的 5xx 瞬时故障重试一次；POST/PUT/DELETE 永不重发（计费/写路径）
+  if (!retried && method === 'GET' && RETRYABLE_STATUS.has(res.status)) {
+    res = await retryOnce(() => doFetch(base))
+  }
 
   // 401 表示令牌过期，清除本地登录态
   // 401 means the token expired; clear local auth state
@@ -717,19 +763,39 @@ export async function request(path, opts = {}) {
  * 对应后端 POST /api/auth/login，请求体 { username, password }
  * @returns {Promise<object>} { token, account, expires_at }
  */
+// §F-09：登录失败的中文话术表。原始英文串继续进控制台（可诊断性不换），只把对客文案中文化。
+const LOGIN_ERR_TEXT = {
+  'invalid credentials': '账号或密码不正确',
+  'username and password required': '请填写账号和密码',
+  'invalid request body': '请求格式不正确，请重试',
+}
+function loginErrorMessage(raw, status) {
+  const key = String(raw || '').trim()
+  if (LOGIN_ERR_TEXT[key]) return LOGIN_ERR_TEXT[key]
+  if (status === 429) return '尝试过于频繁，请稍后再试'
+  return '登录失败，请稍后重试'
+}
+
 // 登录：换取 token 并落盘账号/角色/权限
 export async function login(username, password) {
   const url = baseUrl() + '/api/auth/login'
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  })
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    })
+  } catch (e) {
+    // 网络层失败（地址错/DNS/跨域）：原始异常进控制台，对客给可操作的中文话术
+    console.warn('[login] network error:', e)
+    throw new Error('连不上服务器，请检查服务器地址或网络')
+  }
   if (!res.ok) {
-    // 非 2xx 响应时提取后端错误信息并抛出
-    // On non-2xx responses, extract the backend error message and throw
+    // 非 2xx 响应时提取后端错误信息并抛出（原始串只进日志）
     const err = await res.json().catch(() => ({}))
-    throw new Error(err.error || '登录失败')
+    console.warn('[login] backend error:', err.error || res.status, 'status=', res.status)
+    throw new Error(loginErrorMessage(err.error, res.status))
   }
   const data = await res.json()
   // 登录成功后持久化 token 与账号

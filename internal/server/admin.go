@@ -333,6 +333,11 @@ func (s *Server) handleSetUserEnabled(w http.ResponseWriter, r *http.Request) {
 // English: handles DELETE /api/admin/users/{id} — deletes a user (admins cannot be deleted).
 func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §F-15：空 ID 绝不进入删除链——它会打到平台级/遗留数据（auth 与 watchlist 两处都再拒一次）
+	if strings.TrimSpace(id) == "" {
+		writeError(w, 400, "user id required")
+		return
+	}
 	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
 	if !s.denyOutOfScope(w, r, id) {
 		return
@@ -341,11 +346,33 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	// §F-15（D4 第二档）：账号删除后必须清理账号级数据，且清理结果进入审计（旧实现恒写 "ok"）。
+	cfgN, cfgErr := s.auth.DeleteConfigs(id)
+	wlState := "missing"
+	var wlErr error
+	if s.watchlist != nil {
+		removed, backup, err := s.watchlist.Delete(id)
+		wlErr = err
+		if removed {
+			wlState = "removed"
+			log.Printf("[admin] 删号自选已备份并清理 user=%s backup=%s", id, backup)
+		}
+	}
+	// watchlist 为 nil 的测试/精简装配：没有自选管理器就没有该账号的自选文件可清，
+	// 按 missing 记账而不是把整次删号判成失败。
+	result := fmt.Sprintf("configs=%d wl=%s", cfgN, wlState)
+	if cfgErr != nil || wlErr != nil {
+		result = fmt.Sprintf("configs=%d wl=%s cfg_err=%v wl_err=%v", cfgN, wlState, cfgErr, wlErr)
+		opslog.Audit("user_delete", userIDFor(r), id, result)
+		log.Printf("[admin] 用户 %s 已删除，但账号级数据清理不完整：%s", id, result)
+		writeError(w, 500, "user deleted but data cleanup incomplete: "+result)
+		return
+	}
 	// §0925EVE-W3-F（⑲/D4）：删除是不可逆特权变更（user_cleanup 批量通道本有审计，
 	// 单删通道此前反而无痕），补齐；被删用户名留作事后取证线索。
-	opslog.Audit("user_delete", userIDFor(r), id, "ok")
-	log.Printf("[admin] 已删除用户 %s", id)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	opslog.Audit("user_delete", userIDFor(r), id, result)
+	log.Printf("[admin] 已删除用户 %s（%s）", id, result)
+	writeJSON(w, 200, map[string]interface{}{"status": "ok", "configs": cfgN, "watchlist": wlState})
 }
 
 // ── 管理员代配他人账号配置 ──

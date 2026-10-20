@@ -69,6 +69,13 @@ type DataCoordinator struct {
 	// period being treated as a provider outage and killing the working quote/board paths).
 	thsDeadlines map[string]time.Time
 
+	// §N-12b（2026-10-20）：同花顺分钟腿的“软失败”计数（code → 最近失败时刻）。
+	// 200 + 空体/解析失败不再立即熔断整源（一只票的错误连坐所有票 60s），
+	// 改为 60s 窗口内累计 ≥5 个不同代码才 trip；传输/5xx/HTML 仍立即 trip。
+	// English: per-code soft-failure timestamps for the THS minute leg; trip only after
+	// five distinct codes within 60s, while transport errors still trip immediately.
+	thsSoftFails map[string]time.Time
+
 	sectorCache      []SectorInfo                  // 板块列表缓存
 	sectorCacheAt    time.Time                     // 板块缓存写入时间（30s TTL）
 	sectorStockCache map[string]cachedSectorStocks // 板块成分股缓存（60s TTL）
@@ -168,6 +175,21 @@ const (
 	thsOpBoardStock = "boardstocks" // 板块成分股
 )
 
+// §N-12b：同花顺“软失败”阈值——60s 内 ≥5 个不同代码的 200-空体/解析失败才熔断整源。
+const (
+	thsSoftFailThreshold = 5
+	thsSoftFailWindow    = 60 * time.Second
+)
+
+// §N-12a：分钟链的可判定结果（handler 据此映射对外 reason_code，不再把 err.Error() 端给客户）。
+//
+//	ErrNoMinuteData：至少一条腿在合法信封里明确回“该标的无数据”，且没有被尝试的腿是源级错误；
+//	ErrMinuteSourcesUnavailable：有传输/非 2xx/HTML/超时/解析失败，或无法判定为“标的无数据”。
+var (
+	ErrNoMinuteData             = errors.New("minute: no data for symbol")
+	ErrMinuteSourcesUnavailable = errors.New("minute: sources unavailable")
+)
+
 // thsAvailable §R3-2 P0-D1 熔断状态锁内读取：thsDeadline 此前被 GetQuote/GetKLine/
 // GetMinuteKLine/GetSectors/GetSectorStocks 五条并发路径（fetcher 5s 循环 × HTTP handler ×
 // 打分循环）裸读写——data race 且熔断时间戳撕裂会导致熔断失效或提前熔断。统一走本封装。
@@ -192,6 +214,51 @@ func (dc *DataCoordinator) tripThs(op string) {
 	}
 	dc.thsDeadlines[op] = time.Now().Add(60 * time.Second)
 	dc.mu.Unlock()
+}
+
+// noteThsSoftFailure §N-12b：记录一次“200 但空体/解析失败”的软失败。
+// 只有 60s 窗口内累计到 ≥5 个**不同代码**才熔断整源；单票坏响应不再连坐其他票。
+// English: record a soft failure; trip the whole source only after five distinct codes fail
+// within 60s, so one bad symbol cannot take down every other symbol for a minute.
+func (dc *DataCoordinator) noteThsSoftFailure(code string) {
+	now := time.Now()
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if dc.thsSoftFails == nil {
+		dc.thsSoftFails = make(map[string]time.Time, thsSoftFailThreshold)
+	}
+	dc.thsSoftFails[code] = now
+	n := 0
+	for k, at := range dc.thsSoftFails {
+		if now.Sub(at) > thsSoftFailWindow {
+			delete(dc.thsSoftFails, k)
+			continue
+		}
+		n++
+	}
+	if n >= thsSoftFailThreshold {
+		if dc.thsDeadlines == nil {
+			dc.thsDeadlines = make(map[string]time.Time, 5)
+		}
+		dc.thsDeadlines[thsOpMinute] = now.Add(60 * time.Second)
+		dc.thsSoftFails = make(map[string]time.Time, thsSoftFailThreshold)
+		log.Printf("[minute] 同花顺 %s 在 %s 内累计 %d 个不同代码软失败，熔断整源 60s（§N-12b 阈值）", thsOpMinute, thsSoftFailWindow, n)
+	}
+}
+
+// classifyMinuteLeg §N-12a：把一条腿的结果归一成四档之一（no_data / rejected / source_error）。
+// breaker_open 由调用方在“未拨上游”时直接记账，不经过本函数。
+func classifyMinuteLeg(err error, n int) string {
+	if err == nil {
+		if n == 0 {
+			return "no_data"
+		}
+		return "rejected"
+	}
+	if errors.Is(err, ErrNoMinuteData) {
+		return "no_data"
+	}
+	return "source_error"
 }
 
 // HealthCheck 探测所有行情源的可用性，委托给东财 MarketAPI 的健康检查。
@@ -542,15 +609,32 @@ func (dc *DataCoordinator) minuteKLineChain(rawCode string, scale, count int, al
 		log.Printf("[minute] %s 归一为裸代码 %s 后再请求各分钟腿（上游只认裸代码）", rawCode, code)
 	}
 	var legs []string
-	// legFail 记录一条腿为什么没供数（错误 / 空返回 / 有数但被校验判空）。
-	legFail := func(leg string, n int, err error) {
-		switch {
-		case err != nil:
-			legs = append(legs, leg+"="+err.Error())
-		case n == 0:
-			legs = append(legs, leg+"=空返回")
-		default:
+	hadSourceErr := false
+	hadNoData := false
+	// legFail §N-12a：记录一条腿为什么没供数，并累计聚合结论所需的两个事实。
+	// kind ∈ no_data / rejected / source_error / breaker_open / unsupported；
+	// 只有 no_data 能支撑“标的无数据”，source_error/rejected 会把结论翻成“源不可用”。
+	legFail := func(leg, kind string, n int, err error) {
+		switch kind {
+		case "no_data":
+			hadNoData = true
+			legs = append(legs, leg+"=无该标的数据")
+		case "rejected":
+			hadSourceErr = true
 			legs = append(legs, fmt.Sprintf("%s=%d 根但被拒收", leg, n))
+		case "source_error":
+			hadSourceErr = true
+			if err != nil {
+				legs = append(legs, leg+"="+err.Error())
+			} else {
+				legs = append(legs, leg+"=源错误")
+			}
+		case "breaker_open":
+			legs = append(legs, leg+"=熔断中（未拨上游）")
+		case "unsupported":
+			legs = append(legs, leg+"=该周期不支持（客户端能力缺失）")
+		default:
+			legs = append(legs, leg+"="+kind)
 		}
 	}
 	// legServed 非主源供数时打一条降级日志（主源命中不打，回填 500 只不刷屏）。
@@ -563,7 +647,7 @@ func (dc *DataCoordinator) minuteKLineChain(rawCode string, scale, count int, al
 	if klines, err := dc.eastMoney.GetSinaMinuteKLine(code, scale, count); err == nil && len(klines) > 0 {
 		return klines, nil
 	} else {
-		legFail("新浪", len(klines), err)
+		legFail("新浪", classifyMinuteLeg(err, len(klines)), len(klines), err)
 	}
 
 	if dc.thsAvailable(thsOpMinute) {
@@ -573,42 +657,64 @@ func (dc *DataCoordinator) minuteKLineChain(rawCode string, scale, count int, al
 		if thsErr == nil && len(thsKL) > 0 {
 			legServed("同花顺", len(thsKL))
 			return thsKL, nil
-		} else if thsErr != nil {
-			// §修复 THS-BREAKER(20260920)：周期不受支持是**客户端能力缺失**，不是供应商故障，
-			// 绝不能熔断——否则一次 15 分钟请求就会把同花顺整源按故障关掉 60s。
-			if !errors.Is(thsErr, ErrTHSUnsupportedPeriod) {
-				dc.tripThs(thsOpMinute)
-				log.Printf("同花顺分钟线失败 (%s): %v, 熔断60s", code, thsErr)
-			} else {
-				log.Printf("同花顺不支持该分钟周期 (%s, %d 分钟)，跳过该源不熔断", code, scale)
-			}
-			legFail("同花顺", len(thsKL), thsErr)
-		} else {
-			legFail("同花顺", len(thsKL), nil)
+		}
+		switch {
+		case errors.Is(thsErr, ErrTHSUnsupportedPeriod):
+			// 周期不受支持是**客户端能力缺失**，不是供应商故障：不熔断、也不算源错误。
+			log.Printf("同花顺不支持该分钟周期 (%s, %d 分钟)，跳过该源不熔断", code, scale)
+			legFail("同花顺", "unsupported", len(thsKL), thsErr)
+		case errors.Is(thsErr, ErrNoMinuteData):
+			legFail("同花顺", "no_data", len(thsKL), thsErr)
+		case errors.Is(thsErr, ErrTHSParseError):
+			// §N-12b：200 + 空体/解析失败只记软失败，不因一只票立刻熔断整源；
+			// 60s 内 ≥5 个不同代码都坏才 trip（真源故障的快速失败仍然保留）。
+			dc.noteThsSoftFailure(code)
+			log.Printf("同花顺分钟线解析失败 (%s): %v（软失败，不立即熔断）", code, thsErr)
+			legFail("同花顺", "source_error", len(thsKL), thsErr)
+		case thsErr != nil:
+			// 传输层/非 2xx/HTML/超时 ⇒ 立即熔断该操作域（保留原有的快速失败语义）
+			dc.tripThs(thsOpMinute)
+			log.Printf("同花顺分钟线失败 (%s): %v, 熔断60s", code, thsErr)
+			legFail("同花顺", "source_error", len(thsKL), thsErr)
+		default:
+			legFail("同花顺", classifyMinuteLeg(thsErr, len(thsKL)), len(thsKL), thsErr)
 		}
 	} else {
-		legFail("同花顺", 0, errors.New("熔断中"))
+		legFail("同花顺", "breaker_open", 0, nil)
 	}
 
 	if klines, err := dc.eastMoney.GetTencentMinuteKLine(code, scale, count); err == nil && len(klines) > 0 {
 		legServed("腾讯", len(klines))
 		return klines, nil
 	} else {
-		legFail("腾讯", len(klines), err)
+		legFail("腾讯", classifyMinuteLeg(err, len(klines)), len(klines), err)
 	}
 
 	if !allowQFQLeg {
-		// 严格不复权链在此收口：末腿（东财前复权）不请求，失败原因写进逐腿记账，让装载器把它计成失败。
-		return nil, fmt.Errorf("所有不复权分钟K线源均失败 for %s（逐腿：%s | 东财=前复权腿按口径拒用，见 GetUnadjustedMinuteKLine）",
-			rawCode, strings.Join(legs, " | "))
+		// 严格不复权链在此收口：末腿（东财前复权）不请求，按“未尝试”记账（不是源错误）。
+		legs = append(legs, "东财=前复权腿按口径未请求")
+		return nil, minuteChainError(rawCode, legs, hadSourceErr, hadNoData)
 	}
 	if klines, err := dc.eastMoney.GetKLine(code, strconv.Itoa(scale), count); err == nil && len(klines) > 0 {
 		legServed("东财", len(klines))
 		return klines, nil
 	} else {
-		legFail("东财", len(klines), err)
+		legFail("东财", classifyMinuteLeg(err, len(klines)), len(klines), err)
 	}
-	return nil, fmt.Errorf("所有分钟K线源均失败 for %s（逐腿：%s）", rawCode, strings.Join(legs, " | "))
+	return nil, minuteChainError(rawCode, legs, hadSourceErr, hadNoData)
+}
+
+// minuteChainError §N-12a：按“有源错误 ⇒ 源不可用；否则有 no_data ⇒ 标的无数据；否则源不可用”
+// 的优先级把逐腿事实折成一个可判定的 sentinel error。逐腿细节只用于日志，不进对客 message。
+func minuteChainError(rawCode string, legs []string, hadSourceErr, hadNoData bool) error {
+	detail := strings.Join(legs, " | ")
+	if hadSourceErr {
+		return fmt.Errorf("%w for %s（逐腿：%s）", ErrMinuteSourcesUnavailable, rawCode, detail)
+	}
+	if hadNoData {
+		return fmt.Errorf("%w for %s（逐腿：%s）", ErrNoMinuteData, rawCode, detail)
+	}
+	return fmt.Errorf("%w for %s（逐腿：%s）", ErrMinuteSourcesUnavailable, rawCode, detail)
 }
 
 // GetSectors 获取板块列表。同花顺(ths) → 东财。

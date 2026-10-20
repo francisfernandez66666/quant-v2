@@ -575,6 +575,9 @@ func (s *Server) registerRoutes() {
 	// English: §APPVER public by design — the native shell checks for updates *before* login,
 	// so this read-only endpoint must stay auth-free (a login-gated update channel would deadlock).
 	s.mux.HandleFunc("GET /api/app/version", s.handleAppVersion)
+	// §F-13：匿名只读探活（保留 /api/health 契约不动）。只出状态词与布尔，不出业务数字/凭据。
+	s.mux.HandleFunc("GET /livez", s.handleLivez)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 	// §D7 自助退出：吊销当前 Bearer 对应的服务端会话（旧行为只清浏览器 localStorage，
 	// 令牌在服务端 Sessions 里长期有效，换设备/清缓存后仍可被截获回放）。
 	// English: self-service logout revokes the presenting token's server-side session.
@@ -1073,6 +1076,9 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// §N-05：ACAO 按请求 Origin 回显，必须带 Vary: Origin——
+		// 否则共享缓存可能把 A 源的响应喂给 B 源（浏览器侧表现为"有时跨域可用有时不可用"）。
+		w.Header().Add("Vary", "Origin")
 		// 逐请求判定放行策略：无 Origin（非浏览器）回退 *；
 		// 命中白名单（完整源 / host / 与 Host 同源）则回显该源；跨域一律不写 Allow-Origin。
 		origin := r.Header.Get("Origin")
@@ -1086,11 +1092,12 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		if allow != "" {
 			w.Header().Set("Access-Control-Allow-Origin", allow)
 		}
-		// 预检响应通用头：允许的方法与请求头（token 走 Authorization，无 cookie，不开 Credentials）
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		// OPTIONS 预检直接终结，不进入业务 handler
+		// §N-05：方法/请求头只在预检分支写，不再挂在所有 GET/POST 响应上
 		if r.Method == "OPTIONS" {
+			w.Header().Add("Vary", "Access-Control-Request-Method")
+			w.Header().Add("Vary", "Access-Control-Request-Headers")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 			w.WriteHeader(204)
 			return
 		}
@@ -1260,6 +1267,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"account": user.Username,
 		"role":    user.Role,
 		"perms":   user.Perms,
+		// §F-11：会话到期时刻唯一来源＝issueSession 写进 Session.Exp（同步到 user.TokenExp）。
+		// 不要与 User.ExpiresAt（账号到期）或 sse_query_token_expires_at（分钟级票据）混用。
+		"expires_at": time.Unix(user.TokenExp, 0).Format(time.RFC3339),
 		// §0926E2E-W2B：SSE `?token=` 遗留通道退役预告——旧客户端（APK）登录即拿到退役日期，
 		// 截止前留有一个版本周期的升级窗口（web 端自 §WS-F C4a 起已走票据、与此无关）。
 		// 只加字段不改任何既有键，宽松解码的老客户端不受影响。
@@ -1655,6 +1665,36 @@ func (s *Server) permMiddleware(perm string, next http.HandlerFunc) http.Handler
 // handleHealth 处理 GET /api/health：健康检查，恒返回 {"status":"ok"}。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleLivez §F-13：只回答“进程活着”，匿名可拨，供第三方拨测。
+// 红线：只出 ok + build（构建指纹），不出任何业务数据/凭据/绝对路径。
+func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "build": s.buildCommit})
+}
+
+// handleReadyz §F-13：依赖就绪（db/market/gateway），任一坏回 503。
+// gateway 取运营账号 QMT 控制器的最近一次探测结果（LastProbeOK）；未接入实盘即 false。
+// 只出布尔，不出网关地址/token/持仓等任何业务信息。
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	dbOK := false
+	if s.researchDB != nil {
+		dbOK = s.researchDB.Ping() == nil
+	}
+	marketOK := s.dc != nil || s.market != nil
+	gatewayOK := false
+	if ctrl := s.qmtCtrlFor(s.operatorID()); ctrl != nil {
+		gatewayOK = ctrl.Snapshot().LastProbeOK
+	}
+	ok := dbOK && marketOK && gatewayOK
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, map[string]interface{}{
+		"ok": ok, "build": s.buildCommit,
+		"db": dbOK, "market": marketOK, "gateway": gatewayOK,
+	})
 }
 
 // handleDataSourceHealth 处理 GET /api/data_source_health：返回各数据源健康探测结果。

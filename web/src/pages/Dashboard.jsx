@@ -7,6 +7,8 @@ import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
+import { useLoadLedger } from '../utils/loadLedger.js' // §F-14 读取失败按腿记账
+import LoadFailBanner from '../components/LoadFailBanner.jsx' // §F-14 统一失败红条
 import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
@@ -109,6 +111,8 @@ export default function Dashboard() {
   const [strategyStats, setStrategyStats] = useState({})
   // 实盘/QMT 链路状态
   const [qmtState, setQmtState] = useState(null)
+  // §F-14：读取失败按腿记账——失败不再被 allSettled 静默吞成“空态”
+  const { fails: loadFails, mark: markLoadFail, clear: clearLoadFail } = useLoadLedger()
 
   // 主数据刷新定时器（§F5 每 10s 兜底轮询，实时性靠 SSE）
   const timer = useRef(null)
@@ -190,9 +194,16 @@ export default function Dashboard() {
   // English: §M-9 — health probes now ride the 10s poll; a failed fetch keeps the last snapshot
   // and a never-fetched one shows the '–' unknown glyph instead of a fake state.
   async function loadHealth() {
+    const names = ['数据源健康', '资讯源健康', '引擎健康']
     const [dsRes, nsRes, ehRes] = await Promise.allSettled([
       api.fetchDataSourceHealth(), api.fetchNewsSourceHealth(), api.fetchEngineHealth(),
     ])
+    // §F-14：成功销案、失败点名；不再让三个健康腿的失败静默停在旧读数
+    const results = [dsRes, nsRes, ehRes]
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') clearLoadFail(names[i])
+      else markLoadFail(names[i], r.reason && (r.reason.message || String(r.reason)))
+    })
     if (dsRes.status === 'fulfilled' && dsRes.value) setDataSourceHealth(dsRes.value)
     if (nsRes.status === 'fulfilled' && nsRes.value) setNewsSourceHealth(nsRes.value)
     if (ehRes.status === 'fulfilled' && ehRes.value) setEngineHealth((ehRes.value.engine) || ehRes.value || {})
@@ -209,6 +220,12 @@ export default function Dashboard() {
       api.fetchHotSnapshot(), api.fetchIPOCalendar(), api.fetchDashboard(),
     ])
     if (loadGuard.current.isStale(token)) return // 后到的旧轮次响应：不得覆盖新数据
+    // §F-14：七条腿逐条销案/点名——失败不许再被 allSettled 静默吞成空态
+    const legNames = ['信号', '状态', '资讯', '板块', '快照', 'IPO', '战法统计']
+    ;[sigRes, stRes, newsRes, secRes, snapRes, ipoRes, dashRes].forEach((r, i) => {
+      if (r.status === 'fulfilled') clearLoadFail(legNames[i])
+      else markLoadFail(legNames[i], r.reason && (r.reason.message || String(r.reason)))
+    })
     // 逐项处理各接口返回结果，任一失败不阻断其他数据展示
     if (sigRes.status === 'fulfilled' && Array.isArray(sigRes.value)) setSignals(sigRes.value)
     if (stRes.status === 'fulfilled' && stRes.value) setStatus(stRes.value)
@@ -346,6 +363,16 @@ export default function Dashboard() {
         <Button theme="default" variant="outline" onClick={() => setShowLog(true)}>📋 日志</Button>
       </div>
 
+      {/* §F-14：读取失败红条（点名哪条腿；下方区块仍是上一轮读数） */}
+      <LoadFailBanner fails={loadFails} page="Dashboard" />
+
+      {/* §F-23/D5：管理员可见的实盘通道状态——进程活着但通道断时，此屏与盘后屏必须字节可辨 */}
+      {qmtState && qmtState.enabled && qmtState.last_probe_ok === false && (
+        <div data-testid="live-unavailable-banner" style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: 'var(--app-danger-bg, #fdecee)', border: '1px solid var(--app-warn-border)', color: 'var(--app-warn-text)', fontSize: 13 }}>
+          ⚠ 实盘通道不可用：网关进程可能存活但券商交易通道未连接，实盘下单已暂停。请检查券商终端登录后重试。
+        </div>
+      )}
+
       {/* §Dashboard 情绪面板 A：当前相位徽章 + 30 日色带 + 涨停/连板/建议仓位三指标 */}
       <SentimentCard />
 
@@ -369,14 +396,16 @@ export default function Dashboard() {
         ))}
       </div>
 
-      {/* 左栏热门个股 + 右栏资讯动态，双栏并列展示 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+      {/* 左栏热门个股 + 右栏资讯动态，双栏并列展示（窄屏单列，§F-20） */}
+      <div className="dash-two-col">
         {/* 热门个股实时快照表格（带 LIVE 标签），无数据时显示等待提示 */}
         <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>}>
           {snapshotStocks.length ? (
             <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} fixedHeader maxHeight={320} />
           ) : (
-            <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待行情数据...</div>
+            <div className="muted" style={{ padding: 24, textAlign: 'center' }}>
+              {loadFails['快照'] ? '热门个股读取失败（见上方红条）' : '等待行情数据...'}
+            </div>
           )}
           <div className="muted" style={{ marginTop: 8 }}>{snapshotTime}</div>
         </Card>
@@ -436,10 +465,12 @@ export default function Dashboard() {
       {/* 系统状态面板：运行时间、数据源健康、新闻源、快照统计、流程引擎、实盘链路 */}
       <Card title="系统">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
-          <span>运行 {status.uptime || '-'}</span>
+          <span>运行 {status.uptime || '—'}</span>
           {/* §M-9（2026-09-22 修复批）健康点走 healthMark 三态：●=确证健康 / ○=确证故障 / –=未取到（unknown），
               旧的 `x ? '●' : '○'` 二态会把「接口没拉到」画成故障点、把「故障」与「无数据」混为一谈 */}
           <span>数据源：东财{healthMark(dataSourceHealth.eastmoney)} 新浪{healthMark(dataSourceHealth.sina)} 腾讯{healthMark(dataSourceHealth.tencent)} 同花顺{healthMark(dataSourceHealth.ths)}</span>
+          {/* §F-18：– 期间不是“故障”，而是尚未取到（首次探测进行中）；把口径写在屏上 */}
+          <span className="muted" style={{ fontSize: 11 }}>– = 尚未取到（首次探测进行中或该腿从未成功），会自动刷新</span>
           <span>新闻：财联社{newsMark(newsSourceHealth.cailanshe)} 同花顺{newsMark(newsSourceHealth.kuaixun)} 新浪{newsMark(newsSourceHealth.sina)}</span>
           <span>快照 {scanStats.total_stocks || 0}股 / {scanStats.hot_sector_count || 0}板块</span>
           <span>原始 {scanStats.raw_signals || 0} → 最终 {scanStats.final_signals || 0}</span>
