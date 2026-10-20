@@ -4613,9 +4613,10 @@ ew_chk "SumFilledQty 出错留痕行在位（0=未知口径保留）" "$(grep -c
 # ── ② §F D4 特权审计 ──
 # 计数口径同日同步（本仓纪律，同 §88 INFO 行）：8 行＝09-25 批五类特权变更；
 # 10 行＝09-29 §0929D1 稀疏 merge 写通道再加两行（config_d1_merge 变更留痕 +
-# config_snapshot_failed 快照失败留痕——快照没落成也必须有痕迹，否则"改过什么"永远查不到）。
+# config_snapshot_failed 快照失败留痕——快照没落成也必须有痕迹，否则"改过什么"永远查不到）；
+# 11 行＝2026-10-20 §F-15 删号清理部分失败也要落审计（用户已删但数据未清干净时必须留痕）。
 # 新增审计行必须同日同步这条数，并在 §106 逐名钉住动作名，防"少一行＝静默无痕"。
-ew_chk "admin.go 审计行 8→10（09-25 五类特权变更 8 + §0929D1 写通道留痕 2）" "$(grep -c 'opslog.Audit' internal/server/admin.go || true)" "10"
+ew_chk "admin.go 审计行 8→11（09-25 五类特权变更 8 + §0929D1 写通道留痕 2 + §F-15 删除清理失败 1）" "$(grep -c 'opslog.Audit' internal/server/admin.go || true)" "11"
 
 # ── ③ §G C2 审批一致 ──
 ew_min "Apply 失败保持 proposed 的用例在位" "$(grep -c 'TestResearchApproveApplyFailureKeepsProposed' internal/server/research_test.go || true)" "1"
@@ -5247,8 +5248,8 @@ e2e_ge "cntime 前瞻常量锚（定义+两种口径函数+注释引用）≥4" 
 e2e_eq "两侧前瞻天数必须同值（Python 保活=${CAL45_PY:-空} vs Go cntime=${CAL45_GO:-空}；各自漂移＝末行互相拖回去）" \
 	"${CAL45_PY:-none}" "${CAL45_GO:-none}"
 e2e_ge "前瞻天数下界 30（短于一个长假+春节连休窗口时覆盖判据仍会盲）" "30" "${CAL45_GO:-0}"
-e2e_eq "运行时交易日历健康读数必须点明覆盖未到今日（fail-open 不得再次静默）恰 1" \
-	"$(ec internal/data/trade_calendar.go '覆盖未到今日')" "1"
+e2e_eq "运行时交易日历健康读数必须点明覆盖未到今日（fail-open 不得再次静默）恰 2（代码文案 1 + 前瞻注释 1）" \
+	"$(ec internal/data/trade_calendar.go '覆盖未到今日')" "2"
 e2e_eq "反向锁：tushare 写日历不得退回右边界落在今日的形态（0 命中）" \
 	"$(ec cmd/dataload/main.go 'TradeCal("20150101", cntime.DayCompactOf')" "0"
 e2e_eq "反向锁：baostock 写日历不得退回宿主 Local 且边界落在今日的形态（0 命中）" \

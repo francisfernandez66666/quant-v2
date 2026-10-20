@@ -692,7 +692,7 @@ func (dc *DataCoordinator) minuteKLineChain(rawCode string, scale, count int, al
 
 	if !allowQFQLeg {
 		// 严格不复权链在此收口：末腿（东财前复权）不请求，按“未尝试”记账（不是源错误）。
-		legs = append(legs, "东财=前复权腿按口径未请求")
+		legs = append(legs, "东财=前复权腿按口径拒用（未请求）")
 		return nil, minuteChainError(rawCode, legs, hadSourceErr, hadNoData)
 	}
 	if klines, err := dc.eastMoney.GetKLine(code, strconv.Itoa(scale), count); err == nil && len(klines) > 0 {

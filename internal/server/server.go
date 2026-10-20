@@ -1268,7 +1268,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"role":    user.Role,
 		"perms":   user.Perms,
 		// §F-11：会话到期时刻唯一来源＝issueSession 写进 Session.Exp（同步到 user.TokenExp）。
-		// 不要与 User.ExpiresAt（账号到期）或 sse_query_token_expires_at（分钟级票据）混用。
+		// 不要与 User.ExpiresAt（账号到期）或 SSE 查询票据到期（分钟级）混用。
 		"expires_at": time.Unix(user.TokenExp, 0).Format(time.RFC3339),
 		// §0926E2E-W2B：SSE `?token=` 遗留通道退役预告——旧客户端（APK）登录即拿到退役日期，
 		// 截止前留有一个版本周期的升级窗口（web 端自 §WS-F C4a 起已走票据、与此无关）。

@@ -422,9 +422,10 @@ export default function App() {
     let active = true
     // §F-02：受保护接口只能在认证成功后拨——登录页不再先发一次必然 401 的 /api/paper/state
     checkAuth().then((ok) => {
+      // §0926E2E-13b：StrictMode 第一遍挂载已作废时不得再拉起轮询（保留原守卫形态）
+      if (ok && active) startPolling()
       if (!active) return
       if (!ok) { setPaperEnabled(false); return }
-      startPolling()
       api.fetchPaperState().then(d => { if (active) setPaperEnabled(!!d.enabled) }).catch(() => setPaperEnabled(false))
     })
     // §H7：deps 保持 []（监听器只在挂载注册一次），但注册的是转发壳——
