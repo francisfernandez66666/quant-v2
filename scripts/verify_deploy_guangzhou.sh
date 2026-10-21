@@ -28,7 +28,7 @@
 #      + 产物 SNAPSHOT_OK.ok=true 且 dbs 同时含 trading.db/live.db（字节>0）、accounts_files>0、
 #      标记新鲜度 ≤30h（任务存在但每晚失败只有时间戳能暴露）
 #  10) §P0-B-HEADROOM（2026-09-23，第 17 探针）：备份护栏的**前置条件**本身要日检——C: 余量必须
-#      ≥ backup_snapshot.ps1 step 0 的 8GB 护栏（同数由 verify_changes.sh §72 等值锁钉住）。
+#      ≥ backup_snapshot.ps1 step 0 的 7GB 护栏（§N6 2026-10-21 owner 裁决 8→7GB；同数由 verify_changes.sh §72 等值锁钉住）。
 #      实录：04:00 那次护栏还过、07:1x 首跑只剩 6.9GB，余量是单调往下走的；只读 SNAPSHOT_OK 的
 #      ok=false 要等人去读 err 才发现根因，本探针判红明细直接带 free/snapshot/relay/datadir 四数。
 #  11) §SNAP-LOCK（2026-09-23，第 18 探针）：快照单写者锁健康度（锁龄 + 按命令行统计在跑进程数）。
@@ -538,8 +538,10 @@ Probe "backup:snap task+script(live.db)+artifacts" ($bkMissing.Count -eq 0) ("�
 #   "昨晚的失败原因"和"今晚会不会失败"不是同一件事。护栏本身是设计正确的（不足即 ok:false
 #   退 1，绝不撕裂快照），但它只在备份脚本里生效——没人跑备份就没人知道盘已经不够了。
 #   同族缺陷主题：降级只在动作发生时才吵 = 事实上无人值守。本探针把余量抬成部署面日检项。
-# 判据与 backup_snapshot.ps1 的 step 0 护栏**同数**（8GB；由 verify_changes.sh §72 等值锁钉住，
-#   改任一侧必须同改，否则探针判绿而脚本必失败）。
+# 判据与 backup_snapshot.ps1 的 step 0 护栏**同数**（7GB；由 verify_changes.sh §72 等值锁钉住，
+#   改任一侧必须同改，否则探针判绿而脚本必失败）。§N6 2026-10-21 owner 裁决 8→7GB：暂存目录
+#   是常驻的 Mac 拉取目标（7.19GB），夜间快照重建后 C: 稳态余量 7.28GB；04:00 快照在 7.3GB 下
+#   完整跑完，原 8GB 阈值因此每天白天假红。
 # 明细顺带报三个大目录的占用（SnapRoot/中转仓/数据目录），这样判红时不需要再上机找是谁吃的盘。
 function DirGB($p) {
     if (-not (Test-Path $p)) { return -1.0 }
@@ -551,11 +553,11 @@ function DirGB($p) {
 $hd = @()
 $pc = Get-PSDrive -Name C
 $freeGB = [math]::Round($pc.Free / 1GB, 1)
-if ($pc.Free -lt 8GB) { $hd += ("C: free " + $freeGB + "GB < 8GB guard") }
+if ($pc.Free -lt 7GB) { $hd += ("C: free " + $freeGB + "GB < 7GB guard") }
 $snapGB = DirGB $SnapDir
 $repoGB = DirGB "C:\var\lib\quant-restic-repo"   # 与 backup_snapshot.ps1 的 $RepoDir 同一路径（无参数入口，故此处同为字面量）
 $dataGB = DirGB $DataDir
-Probe "backup:disk headroom (guard=8GB)" ($hd.Count -eq 0) ("free=" + $freeGB + "GB snapshot=" + $snapGB + "GB relay=" + $repoGB + "GB datadir=" + $dataGB + "GB 缺项=" + ($hd -join ","))
+Probe "backup:disk headroom (guard=7GB)" ($hd.Count -eq 0) ("free=" + $freeGB + "GB snapshot=" + $snapGB + "GB relay=" + $repoGB + "GB datadir=" + $dataGB + "GB 缺项=" + ($hd -join ","))
 
 # 11) §SNAP-LOCK（2026-09-23，第 18 探针）：快照单写者锁的健康度。
 # 为什么需要：快照产物是**固定名覆盖**，两个进程同跑会写出混合页的"看着正常"备份；拒跑保护写在

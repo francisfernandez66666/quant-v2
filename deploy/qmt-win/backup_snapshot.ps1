@@ -123,9 +123,17 @@ try {
     $holderTaken = $true
 
     # 0) Disk guard: now TWO databases land here (trading.db ~5GB + live.db), plus the relay repo
-    #    needs headroom on C:. Refuse if <8GB free (unchanged threshold; see HARDENING plan risk note).
+    #    needs headroom on C:. Refuse if <7GB free.
+    #    §N6 阈值调整（owner 2026-10-21 裁决「护栏口径改 7GB」）：原 8GB 是在"暂存目录尚未常驻"
+    #    的拓扑下标定的；现在 quant-snapshot 是 Mac 每晚拉取的目标（trading.db 7.19GB），夜间任务
+    #    重建后 C: 稳态余量就是 7.28GB——04:00 快照在 free 7.3GB 下完整跑完并校验 ok，8GB 阈值
+    #    因此每个白天都会假红。7GB 仍高于本脚本一次落盘所需的增量（暂存是就地覆盖，不产生第二份
+    #    全量拷贝），并给 live.db/日志留出余量；阈值与部署探针两侧由 verify_changes.sh §72 等值锁同源。
+    #    English: threshold lowered 8GB→7GB by owner decision 2026-10-21 — the nightly staging copy is
+    #    a permanent 7.19GB pull target whose steady state leaves 7.28GB free (the 04:00 run completed at
+    #    7.3GB), so 8GB failed every day; 7GB still covers the in-place overwrite increment.
     $c = Get-PSDrive -Name C
-    if ($c.Free -lt 8GB) { throw ("C: free space " + [math]::Round($c.Free/1GB,1) + "GB < 8GB guard") }
+    if ($c.Free -lt 7GB) { throw ("C: free space " + [math]::Round($c.Free/1GB,1) + "GB < 7GB guard") }
 
     # 1+2) Consistent single-file snapshot + integrity_check via SQLite backup API (python stdlib,
     #      safe while engine keeps writing). Logic lives in backup_snap.py next to this script;

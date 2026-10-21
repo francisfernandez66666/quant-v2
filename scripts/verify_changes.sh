@@ -2406,12 +2406,17 @@ echo "ok - §ADJ-BASIS 守卫通过（键位正锁 3 + 常量锁 1 + 回归测�
 #       读的是 SNAPSHOT_OK 的 ok/err，要人主动去读那一行 err 才知道是盘不够。余量不足时备份
 #       永远不会发生 ⇒ 标记要么陈旧要么 ok=false，实盘账本照旧无灾备。
 # 为什么不能直接把护栏调小：护栏守的是"GB 级快照写到一半盘满"这种比不备更糟的形态（撕裂快照
-#       比缺快照更难发现），阈值属于资金安全侧，只能扩盘或清盘，不能改数凑跑。
+#       比缺快照更难发现），阈值属于资金安全侧，原则上只能扩盘或清盘。
+# ★ §N6（owner 2026-10-21 裁决「护栏口径改 7GB」）：8GB 是在"暂存目录尚未常驻"的拓扑下标定的。
+#   现在 quant-snapshot 是 Mac 每晚拉取的目标（trading.db 7.19GB），夜间任务重建后 C: 稳态余量
+#   7.28GB——04:00 快照在 free 7.3GB 下完整跑完、SNAPSHOT_OK 校验通过，8GB 阈值因此每个白天都
+#   假红。降为 7GB 的依据是**实测成功读数**而非凑绿：暂存是就地覆盖（不产生第二份全量拷贝），
+#   7GB 仍覆盖 live.db/日志的落盘增量。若未来扩盘或暂存换落点，应把此数调回 8GB 并同步两侧。
 # 修法前置：新增第 17 探针（只读）把余量抬成部署面日检项，并用**等值锁**钉住两处阈值同源——
-#       单向锁（"探针必须 ≥8"）会让两侧各自漂移，故这里比对的是两侧解析出的同一个数。
+#       单向锁（"探针必须 ≥7"）会让两侧各自漂移，故这里比对的是两侧解析出的同一个数。
 echo ""
 echo "==> 72 §P0-B-HEADROOM 余量探针与护栏阈值等值锁..."
-grep -qF 'backup:disk headroom (guard=8GB)' scripts/verify_deploy_guangzhou.sh \
+grep -qF 'backup:disk headroom (guard=7GB)' scripts/verify_deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 第 17 余量探针丢失（盘不足将再次只在备份失败当晚才知情）"; exit 1; }
 # 明细必须带四个数，否则判红后还要上机二查是谁吃的盘。
 grep -qF 'free=" + $freeGB + "GB snapshot="' scripts/verify_deploy_guangzhou.sh \
