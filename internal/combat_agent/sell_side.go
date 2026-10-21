@@ -229,7 +229,7 @@ func (a *Agent) AssessSellSide(codes []string, md map[string]*strategy_engine.St
 			alertType, direction = "做空", "做空"
 			reason = fmt.Sprintf("卖点等级:%s; %s", alpha.level, reason)
 		}
-		signals = append(signals, Signal{
+		sellSig := Signal{
 			ID:          seqID(),
 			Code:        code,
 			Name:        sd.Name,
@@ -242,7 +242,10 @@ func (a *Agent) AssessSellSide(codes []string, md map[string]*strategy_engine.St
 			Confidence:  float64(len(factors)) * 0.25,
 			Reason:      reason,
 			GeneratedAt: now,
-		})
+		}
+		// 卖点信号也进信号日志：冻结当轮行情，复盘时能区分"当天涨着卖"还是"跌着卖"。
+		freezeMarketQuote(&sellSig, sd)
+		signals = append(signals, sellSig)
 	}
 	return signals
 }

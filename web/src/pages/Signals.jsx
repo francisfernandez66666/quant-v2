@@ -365,24 +365,35 @@ export default function Signals() {
       colKey: 'price', title: '现价/涨跌', width: 130, sorter: sorterNum('price'),
       // §N-12d：只有 price_kind=live 才是现价；trigger 是信号触发价，必须显示为 — 并注明，
       // 旧写法把触发价渲染成「¥xx.xx +0.00%」，客户会当成真实现价。
+      // §HISQUOTE（2026-10-22）：缺行情显示「无行情」而不是 ¥0.00 / 0.00%。两处独立判据——
+      //   · price_kind 非 live（trigger/none）；
+      //   · price_kind 缺失或为 live 但 price<=0（旧载荷/上游漏填）→ 同样按无行情处理。
+      // 涨跌幅缺失（null/undefined）显示「—」，只有真的 0 才显示 0.00%：缺数≠平盘。
       cell: ({ row }) => {
         const kind = row.price_kind || 'live'
-        if (kind !== 'live') {
-          const isTrigger = kind === 'trigger' && Number(row.price) > 0
+        const price = Number(row.price)
+        const hasLive = kind === 'live' && price > 0
+        if (!hasLive) {
+          const isTrigger = kind === 'trigger' && price > 0
           return (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
               <span style={{ color: 'var(--app-faint)' }} data-testid="sig-no-live-price">—</span>
               <span className="muted" style={{ fontSize: 11 }}>
-                {isTrigger ? '触发价 ¥' + Number(row.price).toFixed(2) : '无行情'}
+                {isTrigger ? '触发价 ¥' + price.toFixed(2) : '无行情'}
               </span>
             </div>
           )
         }
+        const chg = row.change_pct
+        const hasChg = chg !== null && chg !== undefined && Number.isFinite(Number(chg))
         return (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            <span title={row.quote_at ? '行情截至 ' + row.quote_at : undefined}>¥{(row.price || 0).toFixed(2)}</span>
-            <span style={{ color: chgColor(row.change_pct) }}>
-              {(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%
+            <span title={row.quote_at ? '行情截至 ' + row.quote_at : undefined}>¥{price.toFixed(2)}</span>
+            <span
+              style={{ color: hasChg ? chgColor(chg) : 'var(--app-faint)' }}
+              data-testid={hasChg ? undefined : 'sig-live-chg-empty'}
+            >
+              {hasChg ? `${Number(chg) > 0 ? '+' : ''}${Number(chg).toFixed(2)}%` : '—'}
             </span>
           </div>
         )

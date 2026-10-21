@@ -1118,7 +1118,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 				// resolver treats it as lowest precedence — it never displaces a real signal
 				// (Action=watch is not a sufficient discriminator; the gap reminder is also watch).
 				meta["observe"] = 1
-				obsSigs = append(obsSigs, Signal{
+				obsSig := Signal{
 					ID:           seqID(),
 					Code:         code,
 					Name:         md.Name,
@@ -1140,7 +1140,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 					GeneratedAt: now,
 					Meta:        meta,
 					Reasons:     strategy.CopyReasons(eval.Reasons),
-				})
+				}
+				// 生成时刻冻结涨跌幅/昨收：观察件同样进信号日志，复盘要看当时动量。
+				freezeMarketQuote(&obsSig, md)
+				obsSigs = append(obsSigs, obsSig)
 			}
 		}
 		// 未通过战法硬性/评分门槛；二突/一突已在上面被提为 Pass → 只记分不出信号
@@ -1242,7 +1245,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		if displayName == "" {
 			displayName = StrategyDisplayName(string(runner.Type))
 		}
-		sigs = append(sigs, Signal{
+		outSig := Signal{
 			ID:           seqID(),
 			Code:         code,
 			Name:         orDefault(sig.Name, md.Name),
@@ -1262,7 +1265,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			// §0929DIM 各维度理由文本过「战法→信号」边界的落点：与 Meta 同批拷贝，
 			// 前端 d1_desc~d4_desc 由此而来（此前只有分数过界，说明整列空白）。
 			Reasons: sig.Reasons,
-		})
+		}
+		// 生成时刻冻结涨跌幅/昨收（信号日志历史批次复盘的动量读数）。
+		freezeMarketQuote(&outSig, md)
+		sigs = append(sigs, outSig)
 	}
 	// 动量分已在循环前计算并写入下方 sc（保持 8a/8b 打分量输出一致）
 	// English: momentum score was already computed before the loop; assign it to keep 8a/8b output stable.
@@ -1290,7 +1296,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			action = "buy"
 			reasonPrefix = fmt.Sprintf("强动量%.0f≥%.0f ", sc.MomentumScore, a.momentumBuySignalThreshold())
 		}
-		sigs = append(sigs, Signal{
+		mSig := Signal{
 			ID:           seqID(),
 			Code:         code,
 			Name:         md.Name,
@@ -1303,7 +1309,9 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			Reason:       fmt.Sprintf("%s动量%.0f 量价齐升(MA+MACD+走势)", reasonPrefix, sc.MomentumScore),
 			Sector:       sectorName,
 			GeneratedAt:  now,
-		})
+		}
+		freezeMarketQuote(&mSig, md)
+		sigs = append(sigs, mSig)
 		sc.SignalActive = true
 	} else if len(sigs) == 0 && sc.MomentumScore >= a.momentumSignalThreshold() && !sc.MomentumValid {
 		// 竞价/盘前数据不完整时不发 watch，但保留可排查日志
@@ -1962,7 +1970,7 @@ func (a *Agent) evalShort(input *ScanInput, runners []StrategyRunner, code strin
 		if sigPrice <= 0 {
 			sigPrice = md.Price
 		}
-		sigs = append(sigs, Signal{
+		shSig := Signal{
 			ID:           seqID(),
 			Code:         code,
 			Name:         orDefault(sig.Name, md.Name),
@@ -1980,7 +1988,10 @@ func (a *Agent) evalShort(input *ScanInput, runners []StrategyRunner, code strin
 			// §0929DIM 做空腿同样带走维度理由：做多/做空两路只在这里有一次差异，
 			// 漏拷其中一路会让做空信号的 D 列空白（与做多"看起来更好"的假象）。
 			Reasons: sig.Reasons,
-		})
+		}
+		// 做空腿同样冻结行情：做多/做空两路在日志里的读数维度必须一致。
+		freezeMarketQuote(&shSig, md)
+		sigs = append(sigs, shSig)
 	}
 	if len(sigs) > 0 {
 		sc.SignalActive = true
@@ -2124,7 +2135,7 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 		// unreported even when cost P/L has not hit the stop-loss line yet. Shorts profit from drops, so
 		// they are excluded.）
 		if !isShort && quote.ChangePct <= -dropPct {
-			alerts = append(alerts, Signal{
+			dropSig := Signal{
 				ID:          seqID(),
 				Code:        pos.Code,
 				Name:        pos.Name,
@@ -2136,7 +2147,10 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 				Confidence:  1.0,
 				Reason:      fmt.Sprintf("当日跌幅%.2f%% 注意短期风险,关注是否止跌企稳", quote.ChangePct),
 				GeneratedAt: now,
-			})
+			}
+			// 提醒件也要冻结生成时刻行情，信号日志里才看得到"当时跌了多少"。
+			freezeStockQuote(&dropSig, quote)
+			alerts = append(alerts, dropSig)
 		}
 
 		// 未设置止盈/止损阈值的持仓跳过止盈/止损检查（跌幅提醒不受此限制）
@@ -2164,7 +2178,7 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 					reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%%%s 但仍有做多信号,建议持有观察", pnl, effTP, offNote)
 				}
 			}
-			alerts = append(alerts, Signal{
+			tpSig := Signal{
 				ID:          seqID(),
 				Code:        pos.Code,
 				Name:        pos.Name,
@@ -2176,7 +2190,9 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 				Confidence:  1.0,
 				Reason:      reason,
 				GeneratedAt: now,
-			})
+			}
+			freezeStockQuote(&tpSig, quote)
+			alerts = append(alerts, tpSig)
 		}
 
 		// 触及止损线 → 分级止损提醒（FIX#12）：首触线且无反向确认 → 减仓（半仓自动退出）；
@@ -2214,7 +2230,7 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%%%s 未现利空/做空信号,先减半仓控制风险", pnl, effSL, offNote)
 				}
 			}
-			alerts = append(alerts, Signal{
+			slSig := Signal{
 				ID:          seqID(),
 				Code:        pos.Code,
 				Name:        pos.Name,
@@ -2226,7 +2242,9 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 				Confidence:  1.0,
 				Reason:      reason,
 				GeneratedAt: now,
-			})
+			}
+			freezeStockQuote(&slSig, quote)
+			alerts = append(alerts, slSig)
 		}
 	}
 

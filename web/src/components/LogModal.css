@@ -55,11 +55,11 @@
   padding: 6px 10px; border-radius: 6px; border: 1px solid var(--app-border);
   background: var(--app-surface-2); color: var(--app-text-2); font-size: 14px; cursor: pointer; max-width: 340px; flex: 1;
 }
-.log-strategy-select {
+.log-strategy-select, .log-days-select {
   padding: 6px 10px; border-radius: 6px; border: 1px solid var(--app-border);
   background: var(--app-surface-2); color: var(--app-text-2); font-size: 14px; cursor: pointer; outline: none;
 }
-.log-strategy-select:focus { border-color: #b388ff; }
+.log-strategy-select:focus, .log-days-select:focus { border-color: #b388ff; }
 .btn-refresh {
   padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F;
   background: transparent; color: #FF4D4F; font-size: 14px; cursor: pointer; white-space: nowrap;
@@ -131,6 +131,9 @@
 .sig-strategy { font-size: 14px; color: #b388ff; background: rgba(179,136,255,0.12); padding: 1px 6px; border-radius: 3px; }
 .sig-conf { font-size: 14px; color: var(--app-muted); }
 .sig-price { font-size: 14px; color: #FAAD14; }
+/* 生成时刻涨跌幅：有值按红涨绿跌着色；无行情时用淡色「—」（与真平盘 0.00% 必须可区分） */
+.sig-chg { font-size: 14px; }
+.sig-chg-empty { color: var(--app-faint); }
 .sig-body { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-size: 14px; flex-wrap: wrap; }
 .sig-sector { font-size: 14px; color: #64b5f6; background: rgba(100,181,246,0.1); padding: 1px 6px; border-radius: 3px; }
 .sig-reason { color: var(--app-text-2); line-height: 1.4; }

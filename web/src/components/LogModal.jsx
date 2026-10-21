@@ -17,6 +17,19 @@ function fmtTime(t) {
 }
 
 /**
+ * 将时间戳格式化为 "MM-DD HH:mm:ss"：信号批次现在可跨交易日回溯，
+ * 只显示时分秒会让不同日期的同名批次无法辨认。
+ * @param {number|string} t 时间戳或日期字符串
+ * @returns {string} 含月日的本地时间，缺失时返回 "-"
+ */
+function fmtDateTime(t) {
+  if (!t) return '-'
+  const d = new Date(t)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${fmtTime(t)}`
+}
+
+/**
  * 大小写不敏感地判断文本是否包含关键词（空白关键词视为不匹配）。
  * @param {string} text 待检索文本
  * @param {string} q 关键词
@@ -62,6 +75,33 @@ function sigHit(sg, q) {
   return false
 }
 
+// 涨跌幅配色（红涨绿跌），与信号页/看板同口径
+function chgColor(v) {
+  return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
+}
+
+/**
+ * 信号生成时刻的涨跌幅徽标。字段缺失（本批次落盘时还没冻结行情）显示「—」，
+ * 绝不折叠成 0.00%——那会把「没有读数」伪装成「平盘」，也无法与真实平盘区分。
+ * 快照由后端在信号生成时冻结，历史批次不会拿今天的实时价回填（台账 2026-10-15 第二条）。
+ * @param {{sg: object}} props sg=信号对象
+ * @returns {JSX.Element} 带颜色的涨跌幅或灰色破折号
+ */
+function SigChange({ sg }) {
+  const raw = sg ? sg.change_pct : null
+  const n = raw == null ? NaN : Number(raw)
+  if (Number.isNaN(n)) {
+    return (
+      <span className="sig-chg sig-chg-empty" data-testid="sig-log-chg-empty" title="生成时刻无行情，历史批次不回填实时价">—</span>
+    )
+  }
+  return (
+    <span className="sig-chg" data-testid="sig-log-chg" style={{ color: chgColor(n) }}>
+      {n > 0 ? '+' : ''}{n.toFixed(2)}%
+    </span>
+  )
+}
+
 // 日志弹窗：按批次展示 LLM 分析 / 信号批次两类日志，支持跨批次搜索
 export default function LogModal({ visible, onClose }) {
   const [activeTab, setActiveTab] = useState('llm')
@@ -80,6 +120,8 @@ export default function LogModal({ visible, onClose }) {
   const [sigNoData, setSigNoData] = useState(false)
   const [sigQuery, setSigQuery] = useState('')
   const [activeSigStrategy, setActiveSigStrategy] = useState('all')
+  // 信号批次回溯天数（含今日）：1=仅当日；跨日历史来自后端每日归档
+  const [sigDays, setSigDays] = useState(5)
 
   const firstLoad = useRef(false) // 是否已完成首次加载（避免重复请求）
 
@@ -112,6 +154,10 @@ export default function LogModal({ visible, onClose }) {
 
   const llmSearching = useMemo(() => (llmQuery || '').trim() !== '', [llmQuery]) // LLM 搜索框是否有输入
   const sigSearching = useMemo(() => (sigQuery || '').trim() !== '', [sigQuery]) // 信号搜索框是否有输入
+  // 战法筛选独立生效：只选战法、不输关键词也要进入跨批次视图。旧实现把搜索视图的前提
+  // 写死成「有关键词」，战法筛选于是只作用于当前批次下拉选中的那一批（跨批次筛选失效）。
+  const sigStrategyFiltering = activeSigStrategy !== 'all'
+  const sigFiltering = sigSearching || sigStrategyFiltering
 
   const sigStrategyOptions = useMemo(() => {
     // 汇总全部信号记录中出现过的战法列表（用于筛选下拉）
@@ -123,13 +169,6 @@ export default function LogModal({ visible, onClose }) {
     }
     return [...set]
   }, [sigRecords])
-
-  const sigFiltered = useMemo(() => {
-    // 按当前战法筛选过滤信号数据
-    const sigs = sigData?.signals || []
-    if (activeSigStrategy === 'all') return sigs
-    return sigs.filter((sg) => sg.strategy === activeSigStrategy)
-  }, [sigData, activeSigStrategy])
 
   const llmSearchGroups = useMemo(() => {
     // 按关键字检索 LLM 阶段事件，按处理批次分组返回
@@ -151,13 +190,14 @@ export default function LogModal({ visible, onClose }) {
   )
 
   const sigSearchGroups = useMemo(() => {
-    // 按关键字 + 战法筛选检索信号记录，按处理批次分组返回
+    // 按关键字 + 战法筛选检索全部已加载批次，按处理批次分组返回。
+    // 空关键词 + 具体战法是合法组合（只筛战法、不限个股），也必须聚合所有批次。
     const q = (sigQuery || '').trim().toUpperCase()
-    if (!q) return []
+    if (!q && activeSigStrategy === 'all') return []
     const groups = []
     for (const r of sigRecords) {
-      // 过滤命中关键字且战法筛选通过的本批次信号行
-      const items = (r.signals || []).filter((sg) => sigHit(sg, q) && sigMatchStrategy(sg))
+      // 过滤命中关键字（若有）且战法筛选通过的本批次信号行
+      const items = (r.signals || []).filter((sg) => (!q || sigHit(sg, q)) && sigMatchStrategy(sg))
       if (items.length) groups.push({ time: r.process_time, items })
     }
     return groups
@@ -179,13 +219,16 @@ export default function LogModal({ visible, onClose }) {
   /**
    * 并行拉取 LLM 分析记录与信号批次日志（任一失败不影响另一部分展示）。
    * 成功时回填对应 state；全部为空时标记 NoData。
+   * @param {number} [days] 信号批次回溯天数（含今日）；缺省/非数字（如 onClick 事件）沿用当前选择
    * @returns {Promise<void>}
    */
-  async function load() {
+  async function load(days) {
     if (loading) return
+    // 事件对象与空值一律回落到当前选择，避免把 SyntheticEvent 当天数发给后端
+    const n = Number(days) > 0 ? Number(days) : sigDays
     setLoading(true)
     // 并发请求两类日志，使用 allSettled 避免一方失败阻断另一方
-    const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs()])
+    const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs(n)])
     if (srRes.status === 'fulfilled' && Array.isArray(srRes.value) && srRes.value.length) {
       setLlmRecords(srRes.value)
       setLlmIdx(0)
@@ -317,7 +360,7 @@ export default function LogModal({ visible, onClose }) {
               {
                 // 手动刷新：重新拉取 LLM 分析与信号批次全部日志
               }
-              <button className="btn-refresh" onClick={load} disabled={loading}>刷新</button>
+              <button className="btn-refresh" onClick={() => load()} disabled={loading}>刷新</button>
             </div>
 
             {
@@ -546,13 +589,31 @@ export default function LogModal({ visible, onClose }) {
                 placeholder="搜索：个股名称 / 代码 / 板块（跨批次）"
               />
               {
+                // 回溯天数下拉：1=仅当日，跨日历史由后端每日归档提供（上限 30）
+              }
+              <select
+                value={sigDays}
+                onChange={(e) => {
+                  const n = Number(e.target.value)
+                  setSigDays(n)
+                  load(n)
+                }}
+                className="log-days-select"
+                title="信号批次回溯范围（交易日，含今日）"
+              >
+                <option value={1}>仅今日</option>
+                <option value={5}>近 5 个交易日</option>
+                <option value={10}>近 10 个交易日</option>
+                <option value={30}>近 30 个交易日</option>
+              </select>
+              {
                 // 战法筛选下拉：全部战法 / 各战法（选项来自全部批次信号去重汇总）
               }
               <select
                 value={activeSigStrategy}
                 onChange={(e) => setActiveSigStrategy(e.target.value)}
                 className="log-strategy-select"
-                title="按战法策略筛选"
+                title="按战法策略筛选（跨批次）"
               >
                 <option value="all">全部战法</option>
                 {sigStrategyOptions.map((st) => (
@@ -560,9 +621,9 @@ export default function LogModal({ visible, onClose }) {
                 ))}
               </select>
               {
-                // 批次下拉：按处理时间倒序展示各信号批次（搜索态隐藏）
+                // 批次下拉：按处理时间倒序展示各信号批次（跨批次搜索/战法筛选态隐藏——此时展示的是聚合视图）
               }
-              {!sigSearching && (
+              {!sigFiltering && (
                 <select
                   value={sigIdx}
                   disabled={sigRecords.length < 2}
@@ -581,27 +642,34 @@ export default function LogModal({ visible, onClose }) {
                   }
                   {sigRecords.map((r, i) => (
                     <option key={r.process_time} value={i}>
-                      批次 {sigRecords.length - i} · {fmtTime(r.process_time)}（{r.signals.length} 信号 / {r.raw_count} 条）
+                      批次 {sigRecords.length - i} · {fmtDateTime(r.process_time)}（{r.signals.length} 信号 / {r.raw_count} 条）
                     </option>
                   ))}
                 </select>
               )}
-              <button className="btn-refresh" onClick={load} disabled={loading}>刷新</button>
+              <button className="btn-refresh" onClick={() => load()} disabled={loading}>刷新</button>
             </div>
 
             {
-              // 跨批次搜索视图：命中概要 + 按批次分组的信号卡片
+              // 跨批次视图：关键词搜索或单点战法筛选都会进入；命中概要 + 按批次分组的信号卡片
             }
-            {sigSearching ? (
+            {sigFiltering ? (
               <div className="search-view">
                 {
-                  // 无命中提示 / 命中概要（总条数与批次数）
+                  // 无命中提示 / 命中概要（总条数与批次数，注明回溯范围）
                 }
                 {!sigSearchGroups.length ? (
-                  <div className="log-empty">未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
+                  <div className="log-empty">
+                    {sigSearching
+                      ? '未找到匹配项（可试：代码 / 名称 / 板块关键词）'
+                      : `战法「${activeSigStrategy}」在最近 ${sigDays} 个交易日内无信号`}
+                  </div>
                 ) : (
                   <div className="search-summary">
-                    共 {sigTotalHits} 条信号命中，跨 {sigSearchGroups.length} 个批次
+                    {sigSearching
+                      ? `共 ${sigTotalHits} 条信号命中，跨 ${sigSearchGroups.length} 个批次`
+                      : `战法「${activeSigStrategy}」共 ${sigTotalHits} 条信号，跨 ${sigSearchGroups.length} 个批次`}
+                    {' · '}范围：最近 {sigDays} 个交易日（含今日）
                   </div>
                 )}
                 {
@@ -613,7 +681,7 @@ export default function LogModal({ visible, onClose }) {
                       // 分组头：批次时间 + 该批命中条数
                     }
                     <div className="search-group-head">
-                      <span className="search-batch">批次 {fmtTime(g.time)}</span>
+                      <span className="search-batch">批次 {fmtDateTime(g.time)}</span>
                       <span className="search-count">命中 {g.items.length} 条</span>
                     </div>
                     {
@@ -631,7 +699,8 @@ export default function LogModal({ visible, onClose }) {
                           <span className={'tag dir-' + sg.direction}>{sg.direction || '中性'}</span>
                           <span className={'tag act-' + sg.action}>{sg.action || '-'}</span>
                           <span className="sig-conf">置信 {(sg.confidence || 0).toFixed(2)}</span>
-                          {sg.price && <span className="sig-price">¥{sg.price.toFixed(2)}</span>}
+                          {Number(sg.price) > 0 && <span className="sig-price">¥{Number(sg.price).toFixed(2)}</span>}
+                          <SigChange sg={sg} />
                         </div>
                         {
                           // 详情行：所属板块与入选理由（有值才渲染）
@@ -648,9 +717,9 @@ export default function LogModal({ visible, onClose }) {
             /* 单批次详情视图：无数据提示 / 概要栏 + 信号列表 */
             ) : (
               <>
-                {/* 无数据：当日尚无信号批次记录 */}
+                {/* 无数据：所选回溯范围内尚无信号批次记录 */}
                 {sigNoData ? (
-                  <div className="log-empty">暂无信号批次记录，等待下一轮扫描</div>
+                  <div className="log-empty">最近 {sigDays} 个交易日内暂无信号批次记录，等待下一轮扫描</div>
                 ) : sigData ? (
                   <>
                     {
@@ -659,7 +728,7 @@ export default function LogModal({ visible, onClose }) {
                     <div className="summary-bar">
                       <div className="summary-item">
                         <span className="summary-label">批次时间</span>
-                        <span className="summary-value">{fmtTime(sigData.process_time)}</span>
+                        <span className="summary-value">{fmtDateTime(sigData.process_time)}</span>
                       </div>
                       {
                         // 概要项：原始新闻条数（信号批次）
@@ -678,11 +747,11 @@ export default function LogModal({ visible, onClose }) {
                     </div>
 
                     {
-                      // 信号列表：按战法筛选后的信号逐条展示；筛选后为空给区分性空态文案
+                      // 信号列表：当前批次全量信号逐条展示（战法筛选已切到跨批次聚合视图）
                     }
-                    {sigFiltered.length ? (
+                    {sigData.signals.length ? (
                       <div className="signal-list">
-                        {sigFiltered.map((sg, i) => (
+                        {sigData.signals.map((sg, i) => (
                           <div key={sg.id || i} className="signal-item">
                             {
                               // 信号头部：代码/名称/战法/方向/动作/置信/信号价
@@ -694,7 +763,8 @@ export default function LogModal({ visible, onClose }) {
                               <span className={'tag dir-' + sg.direction}>{sg.direction || '中性'}</span>
                               <span className={'tag act-' + sg.action}>{sg.action || '-'}</span>
                               <span className="sig-conf">置信 {(sg.confidence || 0).toFixed(2)}</span>
-                              {sg.price && <span className="sig-price">¥{sg.price.toFixed(2)}</span>}
+                              {Number(sg.price) > 0 && <span className="sig-price">¥{Number(sg.price).toFixed(2)}</span>}
+                              <SigChange sg={sg} />
                             </div>
                             {
                               // 信号正文：所属板块与入选理由（有值才渲染）
@@ -707,8 +777,8 @@ export default function LogModal({ visible, onClose }) {
                         ))}
                       </div>
                     ) : (
-                      /* 空态：区分「当前战法无匹配」与「本轮无信号产出」 */
-                      <div className="log-empty">{sigData.signals.length ? '当前战法无匹配信号' : '本轮无信号产出'}</div>
+                      /* 空态：当前批次确实没有产出信号（战法筛选走的是上面的跨批次视图） */
+                      <div className="log-empty">本轮无信号产出</div>
                     )}
                   </>
                 ) : null}

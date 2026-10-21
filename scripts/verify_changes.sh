@@ -668,7 +668,7 @@ if [ "${1:-}" = "-full" ]; then
 	echo ""
 	echo "==> 附加：实时链路相关全量单测..."
 	go test -count=1 ./internal/combat_agent/... ./internal/engine/... ./internal/llm/... ./internal/strategies/... ./internal/paper/... \
-		./internal/data/... ./internal/display/... ./internal/newsagent/... ./internal/e2e/ ./internal/server/ ./cmd/quant/...
+		./internal/data/... ./internal/display/... ./internal/newsagent/... ./internal/signalarchive/... ./internal/e2e/ ./internal/server/ ./cmd/quant/...
 	echo ""
 	echo "==> 附加：回测增强全量单测（含回归短路）..."
 	go test -count=1 ./internal/config/... ./internal/btreplay/... ./internal/store/... ./internal/scheduler/... ./cmd/research/...
@@ -13980,5 +13980,62 @@ PYNRISK
 NRISK=${NRISK:-0}
 [ "$NRISK" -ge 30 ] || { echo "--- FAIL: §N6-RISK 判据派生读数异常（=${NRISK}，下界 30＝段被截断或调用形变了；先核实扫描表达式自己，再怀疑锁）"; exit 1; }
 echo "   §N6-RISK 判据派生读数：${NRISK} 道 failrisk 调用（本行不计入，扫描件与判据同源）"
+
+echo "==> 121 §SIZING-FINE/§LOGCROSS 精细仓位参数面板 + 信号页历史批次三修（2026-10-22）..."
+fail1022() {
+  echo "--- FAIL: §121 $*"
+  exit 1
+}
+# ① 精细参数必须真在面板里（键名与 SizingConfig 的 JSON 同名；漏一个＝页面上永远改不到它）。
+#    不锁"面板出现数字"这类形状判据：对照组是下面 ② 的载荷行为腿，静态锁只防键被悄悄删掉。
+for k in kelly_lambda kelly_min_prob vol_target_pct vol_clamp_lo vol_clamp_hi emotion_scales state_scales \
+	macro_window_scales macro_lead_days macro_lead_curve macro_event_day_scale holiday_scales \
+	holiday_block_new index_scale_thresholds llm_bearish_scale max_total_position_pct \
+	max_drawdown_pct stoploss_guard_count stoploss_guard_window_days sl_offset_per_pct \
+	sl_offset_cap tp_offset_per_pct tp_offset_cap sl_offset_min_index_drop bear_sl_tighten_pt \
+	sl_offset_risk_budget_keep; do
+	grep -q "$k" web/src/components/RegimeConfigPanel.jsx || fail1022 "风控面板缺精细参数 $k"
+done
+grep -q '展开精细参数' web/src/components/RegimeConfigPanel.jsx || fail1022 "精细参数折叠区缺失"
+grep -q 'parseCurve' web/src/components/RegimeConfigPanel.jsx || fail1022 "前瞻曲线解析缺失（自由文本→数组）"
+grep -q '地板须小于上限' web/src/components/RegimeConfigPanel.jsx || fail1022 "合成边界校验缺失（floor<cap 是引擎夹取的前提）"
+# ② 缺行情的三态：唯一现价口径是 price_kind=live 且 price>0；涨跌幅缺失显示「—」而不是 0.00%。
+grep -q "kind === 'live' && price > 0" web/src/pages/Signals.jsx || fail1022 "现价口径退回「有价即现价」（触发价/0 价会被渲染成真行情）"
+grep -q 'sig-no-live-price' web/src/pages/Signals.jsx || fail1022 "无行情占位缺失"
+grep -q '无行情' web/src/pages/Signals.jsx || fail1022 "无行情文案缺失（用户只看到一个破折号会以为是加载中）"
+grep -q 'sig-live-chg-empty' web/src/pages/Signals.jsx || fail1022 "现价缺涨跌幅的空态缺失（缺数≠平盘 0.00%）"
+# ③ 历史批次涨跌幅：生成时刻冻结进 Signal，渲染端只有「有值/无值」两态，绝不回填实时价。
+grep -q 'ChangePct \*float64' internal/combat_agent/types.go || fail1022 "Signal 未携带生成时刻涨跌幅"
+[ -f internal/combat_agent/signal_quote.go ] || fail1022 "行情冻结助手缺失（各信号产出点会退回只写价格）"
+grep -q 'sig-log-chg-empty' web/src/components/LogModal.jsx || fail1022 "历史批次无涨跌幅占位缺失"
+grep -q '生成时刻无行情' web/src/components/LogModal.jsx || fail1022 "历史批次空态未说明不回溯（用户会以为数据丢了）"
+# ④ 战法筛选跨批次 + 跨天读范围。
+grep -q 'function sigMatchStrategy' web/src/components/LogModal.jsx || fail1022 "战法匹配函数缺失"
+grep -q "if (!q && activeSigStrategy === 'all') return \[\]" web/src/components/LogModal.jsx \
+	|| fail1022 "战法筛选仍被空关键词短路（选了战法也只在当前批次里搜）"
+grep -q 'GetSignalLogsRange' internal/engine/engine.go || fail1022 "引擎缺跨天读取入口"
+grep -q 'signalarchive.ReadRange' internal/server/server.go || fail1022 "服务端未接按天归档（跨天复盘只能看内存当日）"
+grep -q 'signal_records_archive' internal/engine/engine.go || fail1022 "引擎未装配归档目录"
+[ -f internal/signalarchive/signalarchive.go ] || fail1022 "按天归档实现缺失"
+grep -q "days=' + q" web/src/api/index.js || fail1022 "前端未把回溯范围传给服务端"
+# ⑤ 行为腿：冻结语义（nil≠0）、归档读边界（内存空回落当日归档）、days 解析、精细参数读写往返。
+if ! go test -count=1 ./internal/combat_agent -run 'TestFreezeQuote|TestFreezeMarketQuote|TestFreezeStockQuote|TestSignalChangePctJSON' >/dev/null 2>&1; then
+	fail1022 "行情冻结回归测试未通过（缺价/平盘/派生昨收/JNil 与 0 的 JSON 区分任一丢失）"
+fi
+if ! go test -count=1 ./internal/signalarchive >/dev/null 2>&1; then
+	fail1022 "按天归档回归测试未通过（写入/窗口/排序/当日回落/清理任一丢失）"
+fi
+if ! go test -count=1 ./internal/server -run 'TestSignalLogDays|TestRegimeConfigFineSizingRoundTrip' >/dev/null 2>&1; then
+	fail1022 "days 解析或精细参数 HTTP 往返未通过"
+fi
+if ! ( cd web && npm test -- regime_panel_n6 signals_price_state_1022 log_modal_history_1022 >/dev/null 2>&1 ); then
+	fail1022 "前端行为腿未通过（面板精细参数/缺行情三态/跨批次筛选）"
+fi
+# ⑥ 负向：旧形状不许复活——把 null 跌成 0 的合流写法、旧的 sigFiltered 早短路。
+#    判据贴具体变量看过：`change_pct || 0` 正是「缺数当平盘」的那一种写法，0 会绕开空态。
+! grep -q 'sigFiltered' web/src/components/LogModal.jsx || fail1022 "旧 sigFiltered 早短路回潮（战法筛选会重新只看当前批次）"
+! grep -q 'sg.change_pct || 0' web/src/components/LogModal.jsx || fail1022 "历史批次把缺涨跌幅合流成 0（空态被绕开，页面报 +0.00%）"
+! grep -q 'row.change_pct || 0' web/src/pages/Signals.jsx || fail1022 "信号页把缺涨跌幅合流成 0（缺数≠平盘）"
+echo "ok - §121 静态锁通过（精细参数键 25 枚/缺行情三态/涨跌幅冻结/跨批次筛选/归档读路径/行为腿）"
 
 echo "==> 全部通过"

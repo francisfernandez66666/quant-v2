@@ -409,10 +409,12 @@ func (a *Agent) MarketRiskAlerts(rpt *report.Report, quotes map[string]*data.Sto
 			continue // 系统性风险对做空是顺向，不提醒减仓
 		}
 		price := pos.EntryPrice
-		if q := quotes[pos.Code]; q != nil && q.Price > 0 {
-			price = q.Price
+		var q *data.StockInfo
+		if qq := quotes[pos.Code]; qq != nil && qq.Price > 0 {
+			price = qq.Price
+			q = qq
 		}
-		alerts = append(alerts, Signal{
+		riskSig := Signal{
 			ID:          seqID(),
 			Code:        pos.Code,
 			Name:        pos.Name,
@@ -424,7 +426,9 @@ func (a *Agent) MarketRiskAlerts(rpt *report.Report, quotes map[string]*data.Sto
 			Confidence:  conf,
 			Reason:      fmt.Sprintf("市场风险档[%s]（%s）：建议对持仓 %s(%s) 主动控制仓位（系统提醒，不自动卖出）", tier, reasonText, pos.Name, pos.Code),
 			GeneratedAt: now,
-		})
+		}
+		freezeStockQuote(&riskSig, q)
+		alerts = append(alerts, riskSig)
 	}
 	if len(alerts) > 0 {
 		log.Printf("[combat_agent] MarketRiskAlerts 风险档=%s → %d 条做多持仓减仓提醒（不自动执行）", tier, len(alerts))

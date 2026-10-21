@@ -382,7 +382,10 @@ func (a *Agent) CheckPositionsExits(rpt *report.Report, quotes map[string]*data.
 		if res == nil {
 			continue
 		}
-		alerts = append(alerts, exitSignalFromResult(pos, price, res, now))
+		exitSig := exitSignalFromResult(pos, price, res, now)
+		// 退出提醒同样冻结生成时刻行情；q 在上面已校验 price>0。
+		freezeStockQuote(&exitSig, q)
+		alerts = append(alerts, exitSig)
 	}
 
 	if len(alerts) > 0 {
@@ -408,10 +411,12 @@ func (a *Agent) EmotionRetreatAlerts(rpt *report.Report, quotes map[string]*data
 			continue
 		}
 		price := pos.EntryPrice
-		if q := quotes[pos.Code]; q != nil && q.Price > 0 {
-			price = q.Price
+		var q *data.StockInfo
+		if qq := quotes[pos.Code]; qq != nil && qq.Price > 0 {
+			price = qq.Price
+			q = qq
 		}
-		alerts = append(alerts, Signal{
+		emoSig := Signal{
 			ID:          seqID(),
 			Code:        pos.Code,
 			Name:        pos.Name,
@@ -423,7 +428,10 @@ func (a *Agent) EmotionRetreatAlerts(rpt *report.Report, quotes map[string]*data
 			Confidence:  1.0,
 			Reason:      fmt.Sprintf("情绪周期进入[%s],市场赚钱效应收缩,建议对持仓 %s(%s) 整体减仓控制风险", phase, pos.Name, pos.Code),
 			GeneratedAt: now,
-		})
+		}
+		// 有实时行情才冻结涨跌幅；只有成本价时留 nil（前端显示「—」）。
+		freezeStockQuote(&emoSig, q)
+		alerts = append(alerts, emoSig)
 	}
 	return alerts
 }
@@ -457,10 +465,12 @@ func (a *Agent) BearishAttributionAlerts(rpt *report.Report, quotes map[string]*
 			continue
 		}
 		price := pos.EntryPrice
-		if q := quotes[pos.Code]; q != nil && q.Price > 0 {
-			price = q.Price
+		var q *data.StockInfo
+		if qq := quotes[pos.Code]; qq != nil && qq.Price > 0 {
+			price = qq.Price
+			q = qq
 		}
-		alerts = append(alerts, Signal{
+		bearSig := Signal{
 			ID:          seqID(),
 			Code:        pos.Code,
 			Name:        pos.Name,
@@ -472,7 +482,9 @@ func (a *Agent) BearishAttributionAlerts(rpt *report.Report, quotes map[string]*
 			Confidence:  1.0,
 			Reason:      "利空归因: " + reason + " → 建议尽快抛售该持仓以规避风险",
 			GeneratedAt: now,
-		})
+		}
+		freezeStockQuote(&bearSig, q)
+		alerts = append(alerts, bearSig)
 	}
 	if len(alerts) > 0 {
 		log.Printf("[combat_agent] BearishAttributionAlerts: %d 持仓命中利空归因 → %d 抛售提醒", len(positions), len(alerts))

@@ -371,7 +371,7 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 			if l.Score >= leaderBuyThreshold {
 				action = "buy"
 			}
-			signals = append(signals, Signal{
+			ldSig := Signal{
 				ID:       seqID(),
 				Code:     l.Stock.Code,
 				Name:     l.Stock.Name,
@@ -389,7 +389,11 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 				Reason:       fmt.Sprintf("龙头评分%.0f(排名%d): %s | %s | 行业:%s", l.Score, l.Rank, l.Reason, l.Stock.LimitType, l.Stock.Industry),
 				Sector:       l.Stock.Industry,
 				GeneratedAt:  now,
-			})
+			}
+			// 涨停池条目自带 Price/ChangePct（无昨收），冻结后历史批次可回看当时涨幅；
+			// 昨收由 price 与涨跌幅反推（freezeQuote 内完成）。
+			freezeQuote(&ldSig, l.Stock.Price, l.Stock.ChangePct, 0)
+			signals = append(signals, ldSig)
 		}
 	}
 
@@ -435,7 +439,7 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 			if !gap.Trigger {
 				continue
 			}
-			signals = append(signals, Signal{
+			gapSig := Signal{
 				ID:          seqID(),
 				Code:        code,
 				Name:        md.Name,
@@ -448,7 +452,10 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 				Reason:      fmt.Sprintf("%s(%.2f%%): %s — %s", gap.GapType, changePct, gap.Reason, nb.Title),
 				Sector:      "个股",
 				GeneratedAt: now,
-			})
+			}
+			// 预期差信号进同一份信号日志，冻结当轮行情（md.Quote.PrevClose 优先）。
+			freezeMarketQuote(&gapSig, md)
+			signals = append(signals, gapSig)
 			break
 		}
 	}

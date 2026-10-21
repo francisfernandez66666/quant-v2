@@ -185,6 +185,115 @@ func TestRegimeConfigPersistsToDisk(t *testing.T) {
 	}
 }
 
+// TestRegimeConfigFineSizingRoundTrip §SIZING-FINE（2026-10-22）：面板新暴露的精细参数必须
+// 走同一对通道——GET 回显补齐后的生效值、POST 稀疏 merge 后逐键落盘。这些键此前只在
+// config.json 里能改，页面上一个都拨不到；若 GET 漏键，面板会把「没读到」显示成空/0，
+// 用户一保存就用零值覆盖配置（§N6-RISK 同族事故）。
+// English: every fine-grained sizing key surfaced by the panel round-trips through GET/POST,
+// and unmentioned sibling keys survive the sparse merge.
+func TestRegimeConfigFineSizingRoundTrip(t *testing.T) {
+	s, admin, cfgPath := newRegimeTestServer(t)
+	rr := adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
+	if rr.Code != 200 {
+		t.Fatalf("GET 应 200, got %d", rr.Code)
+	}
+	_, sizing, _ := decodeRegime(t, rr.Body.String())
+	num := func(key string) float64 {
+		t.Helper()
+		v, ok := sizing[key].(float64)
+		if !ok {
+			t.Fatalf("GET 未回显 %s（面板会把它当未配置）: %v", key, sizing)
+		}
+		return v
+	}
+	// 标量：出厂默认逐键核对（值取自 DefaultSizingConfig）。
+	for key, want := range map[string]float64{
+		"floor": 0.15, "cap": 1.15,
+		"kelly_lambda": 0.5, "kelly_min_prob": 0.52,
+		"vol_target_pct": 2.0, "vol_clamp_lo": 0.5, "vol_clamp_hi": 1.5,
+		"macro_lead_days": 5, "macro_event_day_scale": 0.30,
+		"llm_bearish_scale":      0.5,
+		"max_total_position_pct": 0.80, "max_drawdown_pct": 0.10,
+		"stoploss_guard_count": 4, "stoploss_guard_window_days": 1,
+		"sl_offset_per_pct": 3, "sl_offset_cap": 4,
+		"tp_offset_per_pct": 3, "tp_offset_cap": 5,
+		"sl_offset_min_index_drop": 1, "bear_sl_tighten_pt": 1,
+	} {
+		if got := num(key); got != want {
+			t.Fatalf("GET %s 默认值应 %v, got %v", key, want, got)
+		}
+	}
+	// 映射：每张表补默认而非整表替换（缺键的面板会显示空）。
+	m := func(key string) map[string]any {
+		t.Helper()
+		v, ok := sizing[key].(map[string]any)
+		if !ok {
+			t.Fatalf("GET 未回显映射 %s: %v", key, sizing)
+		}
+		return v
+	}
+	if v, _ := m("emotion_scales")["退潮"].(float64); v != 0.50 {
+		t.Fatalf("emotion_scales[退潮] 应 0.50, got %v", v)
+	}
+	if v, _ := m("macro_window_scales")["high"].(float64); v != 0.50 {
+		t.Fatalf("macro_window_scales[high] 应 0.50, got %v", v)
+	}
+	if v, _ := m("holiday_scales")["long1"].(float64); v != 0.40 {
+		t.Fatalf("holiday_scales[long1] 应 0.40, got %v", v)
+	}
+	if v, _ := m("index_scale_thresholds")["deep"].(float64); v != 0.40 {
+		t.Fatalf("index_scale_thresholds[deep] 应 0.40, got %v", v)
+	}
+	curve, _ := sizing["macro_lead_curve"].([]any)
+	if len(curve) != 5 || curve[0] != 0.90 {
+		t.Fatalf("macro_lead_curve 应回显默认 5 档且首档 0.90, got %v", curve)
+	}
+
+	// 写入一组非默认精细值：标量、映射单键、切片、整数、两个 *bool 开关。
+	body := `{"sizing":{"floor":0.20,"kelly_lambda":0.35,"emotion_scales":{"退潮":0.40},` +
+		`"macro_lead_days":3,"macro_lead_curve":[0.80,0.60,0.40],` +
+		`"stoploss_guard_count":6,"max_drawdown_pct":0.15,` +
+		`"holiday_block_new":true,"sl_offset_risk_budget_keep":false}}`
+	rr2 := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", body))
+	if rr2.Code != 200 {
+		t.Fatalf("写精细参数应 200, got %d body=%s", rr2.Code, rr2.Body.String())
+	}
+	_, sizing2, _ := decodeRegime(t, rr2.Body.String())
+	if v, _ := sizing2["floor"].(float64); v != 0.20 {
+		t.Fatalf("floor 未回显, got %v", sizing2["floor"])
+	}
+	if v, _ := sizing2["kelly_lambda"].(float64); v != 0.35 {
+		t.Fatalf("kelly_lambda 未回显, got %v", sizing2["kelly_lambda"])
+	}
+	if v, _ := sizing2["stoploss_guard_count"].(float64); v != 6 {
+		t.Fatalf("stoploss_guard_count 未回显, got %v", sizing2["stoploss_guard_count"])
+	}
+	curve2, _ := sizing2["macro_lead_curve"].([]any)
+	if len(curve2) != 3 || curve2[0] != 0.80 || curve2[2] != 0.40 {
+		t.Fatalf("macro_lead_curve 未按新长度回显, got %v", curve2)
+	}
+	// 落盘侧读回：新值在、未提过的兄弟键仍是默认（稀疏 merge 的旁证）。
+	got := config.NewManager(cfgPath).GetSizingConfig()
+	if got.Floor != 0.20 || got.KellyLambda != 0.35 || got.StoplossGuardCount != 6 {
+		t.Fatalf("精细参数未落盘: floor=%v kelly=%v guard=%v", got.Floor, got.KellyLambda, got.StoplossGuardCount)
+	}
+	if got.MacroLeadDays != 3 || len(got.MacroLeadCurve) != 3 || got.MacroLeadCurve[2] != 0.40 {
+		t.Fatalf("前瞻曲线未落盘: days=%v curve=%v", got.MacroLeadDays, got.MacroLeadCurve)
+	}
+	if got.EmotionScales["退潮"] != 0.40 || got.EmotionScales["背离"] != 0.60 {
+		t.Fatalf("emotion_scales 应只改退潮且保留背离, got %v", got.EmotionScales)
+	}
+	if got.MaxDrawdownPct != 0.15 {
+		t.Fatalf("max_drawdown_pct 未落盘, got %v", got.MaxDrawdownPct)
+	}
+	if got.HolidayBlockNew == nil || !*got.HolidayBlockNew {
+		t.Fatal("holiday_block_new 未落盘为 true")
+	}
+	if got.SLOffsetRiskBudgetKeep == nil || *got.SLOffsetRiskBudgetKeep {
+		t.Fatal("sl_offset_risk_budget_keep 未落盘为 false（指针被当成未设置就退回默认 true）")
+	}
+}
+
 // TestRegimeConfigMacroGateRoundTrip macro_gate 走战法配置合并通道，red_block_new_buy 必须
 // 逐键往返，且置信度门槛与硬拦子开关互不影响。
 // English: macro_gate rides the strategy-config merge; red_block_new_buy round-trips per key.

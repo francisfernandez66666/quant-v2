@@ -75,6 +75,7 @@ import (
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/signalarchive"
 	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
@@ -3036,10 +3037,10 @@ func (s *Server) operatorStageRecordsFromDisk() []newsagent.DebugInfo {
 	return f.Records
 }
 
-// operatorSignalLogsFromDisk 读操作员账号目录的当日 signal_records.json（内存为空时的兜底源）。
-// English: reads the operator account's on-disk signal_records.json as a fallback when the in-memory
-// signal logs are empty; same-trading-day records only.
-func (s *Server) operatorSignalLogsFromDisk() []combat_agent.SignalLog {
+// operatorSignalLogsFromDisk 读操作员账号的信号批次：当日文件 + 按天归档（内存为空时的兜底源）。
+// days 含当日；当日文件不是今天的则忽略（跨日文件不参与），更早日期一律从 signal_records_archive 读。
+// English: disk fallback for signal logs — today's file plus per-day archives, up to `days` trading days.
+func (s *Server) operatorSignalLogsFromDisk(days int) []combat_agent.SignalLog {
 	dir := s.cacheDir
 	if dir == "" {
 		return nil
@@ -3048,26 +3049,49 @@ func (s *Server) operatorSignalLogsFromDisk() []combat_agent.SignalLog {
 	if op == "" {
 		return nil
 	}
-	p := filepath.Join(dir, "accounts", op, "signal_records.json")
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		return nil
+	acctDir := filepath.Join(dir, "accounts", op)
+	var current []combat_agent.SignalLog
+	p := filepath.Join(acctDir, "signal_records.json")
+	if raw, err := os.ReadFile(p); err == nil {
+		var f struct {
+			TradingDay string                   `json:"trading_day"`
+			Records    []combat_agent.SignalLog `json:"records"`
+		}
+		if json.Unmarshal(raw, &f) == nil && f.TradingDay == data.TradingDayDate(time.Now()) {
+			current = f.Records
+		}
 	}
-	var f struct {
-		TradingDay string                   `json:"trading_day"`
-		Records    []combat_agent.SignalLog `json:"records"`
-	}
-	if err := json.Unmarshal(raw, &f); err != nil {
-		return nil
-	}
-	if f.TradingDay != data.TradingDayDate(time.Now()) {
-		return nil
-	}
-	return f.Records
+	return signalarchive.ReadRange(filepath.Join(acctDir, "signal_records_archive"), current, days, data.TradingDayDate(time.Now()))
 }
 
-// handleSignalLogs 返回当日全量信号批次记录（用于"信号日志"弹窗按批次复盘）。
-// §FIX-0921c：内存为空时回落操作员账号当日落盘（同 stage-records 口径），并打诊断日志。
+// signalLogDays 解析 /api/signal-logs?days=N：缺省/非法回落 5 个交易日，上限 30（与归档保留窗口一致）。
+// English: parses the `days` query (default 5, clamped to 1..30).
+func signalLogDays(r *http.Request) int {
+	const (
+		def = 5
+		max = 30
+	)
+	v, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("days")))
+	if err != nil || v <= 0 {
+		return def
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// signalLogRangeProvider 引擎的可选跨天读能力：实现则按 days 合并归档，未实现退回当日内存。
+// 单独做可选断言而不是加进 EngineController：测试里的 fake controller 嵌入 nil 接口，
+// 强加方法会把「没被触碰」的路径变成 panic 源。
+// English: optional cross-day reader; kept out of EngineController so embedded-nil test fakes
+// don't panic on a method they never implement.
+type signalLogRangeProvider interface {
+	GetSignalLogsRange(days int) []combat_agent.SignalLog
+}
+
+// handleSignalLogs 返回最近 days 个交易日的信号批次记录（用于"信号日志"弹窗跨批次/跨天复盘）。
+// §FIX-0921c：内存为空时回落操作员账号落盘（同 stage-records 口径），并打诊断日志。
 func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
 	c := s.ctrlFor(uid)
@@ -3076,15 +3100,19 @@ func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
+	days := signalLogDays(r)
 	recs := c.GetSignalLogs()
+	if p, ok := c.(signalLogRangeProvider); ok {
+		recs = p.GetSignalLogsRange(days)
+	}
 	src := "mem"
 	if len(recs) == 0 {
-		if disk := s.operatorSignalLogsFromDisk(); len(disk) > 0 {
+		if disk := s.operatorSignalLogsFromDisk(days); len(disk) > 0 {
 			recs = disk
 			src = "disk"
 		}
 	}
-	log.Printf("[llm-diag] uid=%s signal-logs: src=%s recs=%d", uid, src, len(recs))
+	log.Printf("[llm-diag] uid=%s signal-logs: src=%s days=%d recs=%d", uid, src, days, len(recs))
 	if recs == nil {
 		recs = []combat_agent.SignalLog{}
 	}

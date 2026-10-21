@@ -1885,13 +1885,18 @@ export async function fetchStageRecords() {
   return request('/api/stage-records', { timeout: 30000 })
 }
 
-/** 获取当日全量信号批次记录（固化到磁盘，供复盘） */
-/** Fetch today's full signal batch records (persisted to disk, for review) */
-// 对应 GET /api/signal-logs，返回当日各轮信号批次快照（做多/做空/提醒），用于信号日志弹窗
-// Maps to GET /api/signal-logs; returns today's per-round signal batch snapshots (long/short/alerts) for the log modal
-export async function fetchSignalLogs() {
+/** 获取信号批次记录（默认当日，可按天数跨交易日回溯，供复盘） */
+/** Fetch signal batch records (today by default; cross-trading-day history via days, for review) */
+// 对应 GET /api/signal-logs?days=N：N 含今日（1=仅当日），后端默认 5、上限 30。
+// 跨日历史来自每日归档文件（signal_records_archive/day.json），旧批次不含实时行情，
+// 涨跌幅按生成时刻冻结值展示，取不到就显示「—」。
+// Maps to GET /api/signal-logs?days=N (N includes today; server default 5, max 30). Cross-day
+// history comes from per-day archive files; old batches never get live prices backfilled.
+export async function fetchSignalLogs(days = 5) {
+  const n = Number(days)
+  const q = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 30) : 5
   // §FIX-0921b 复盘类接口同样放宽 30s（信号批次含全量信号明细，弱网同理）
-  return request('/api/signal-logs', { timeout: 30000 })
+  return request('/api/signal-logs?days=' + q, { timeout: 30000 })
 }
 
 // ── 做空开关 ──

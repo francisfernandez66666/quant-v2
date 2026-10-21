@@ -162,7 +162,17 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     const body = api.setRegimeConfig.mock.calls[0][0]
     expect(Object.keys(body).sort()).toEqual(['enhance', 'macro_gate', 'sizing'])
     expect(Object.keys(body.enhance)).toEqual(['market_state_enabled'])
-    expect(Object.keys(body.sizing).sort()).toEqual(['breadth_missing_scale', 'enabled', 'sell_boost_level', 'tier_scales'])
+    // §SIZING-FINE（2026-10-22）：面板现在负责 sizing 的**全量**键（精细参数折叠区也在内），
+    // 逐键等值锁住键集——多一个未定义键会被后端稀疏 merge 写进配置，少一个键等于某组精细参数失踪。
+    expect(Object.keys(body.sizing).sort()).toEqual([
+      'bear_sl_tighten_pt', 'breadth_missing_scale', 'cap', 'emotion_scales', 'enabled', 'floor',
+      'holiday_block_new', 'holiday_scales', 'index_scale_thresholds', 'kelly_lambda', 'kelly_min_prob',
+      'llm_bearish_scale', 'macro_event_day_scale', 'macro_lead_curve', 'macro_lead_days',
+      'macro_window_scales', 'max_drawdown_pct', 'max_total_position_pct', 'sell_boost_level', 'shadow',
+      'sl_offset_cap', 'sl_offset_min_index_drop', 'sl_offset_per_pct', 'sl_offset_risk_budget_keep',
+      'state_scales', 'stoploss_guard_count', 'stoploss_guard_window_days', 'tier_scales', 'tp_offset_cap',
+      'tp_offset_per_pct', 'vol_clamp_hi', 'vol_clamp_lo', 'vol_target_pct',
+    ].sort())
     expect(Object.keys(body.sizing.tier_scales).sort()).toEqual(['Red', 'Yellow'])
     expect(Object.keys(body.macro_gate).sort()).toEqual(
       ['block_momentum', 'block_n_shape', 'emotion_enabled', 'red_block_new_buy', 'red_confidence', 'yellow_confidence'].sort(),
@@ -173,6 +183,15 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     expect(body.sizing.sell_boost_level).toBe('L2')
     expect(body.enhance.market_state_enabled).toBe(true)
     expect(body.macro_gate.red_block_new_buy).toBe(false)
+    // 精细参数缺键时必须按出厂默认落 payload（不是 undefined/0）：后端 WithDefaults 同样兜底，
+    // 但页面若把缺键写成 0，稀疏 merge 会真的把 0 写进配置，等于把闸门关掉。
+    expect(body.sizing.shadow).toBe(true)
+    expect(body.sizing.floor).toBe(0.15)
+    expect(typeof body.sizing.floor).toBe('number')
+    expect(body.sizing.emotion_scales['退潮']).toBe(0.5)
+    expect(body.sizing.macro_lead_curve).toEqual([0.9, 0.85, 0.8, 0.7, 0.5])
+    expect(body.sizing.sl_offset_risk_budget_keep).toBe(true)
+    expect(body.sizing.holiday_block_new).toBe(false)
   })
 
   // R3 读取失败 → 红条 + 零 POST。形态如实钉成「整表单不渲染、连保存按钮都不存在」而不是
@@ -274,5 +293,159 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     await settle()
     expect(screen.getByText(/有未保存修改/).textContent).toBeTruthy()
     expect([...document.body.querySelectorAll('*')].some((n) => /保存失败/.test(n.textContent || ''))).toBe(true)
+  })
+
+  // ── §SIZING-FINE（2026-10-22）精细参数折叠区 ──
+  // 这一批把 SizingConfig 的 40 余个精细参数接到页面。锁的重点不是"渲染了行"，而是：
+  // 读侧显示后端**实际生效值**（不是写死默认）、写侧逐键进 payload、越界/曲线长度不符拒绝保存。
+
+  function expandFine() {
+    fireEvent.click(btn('展开精细参数'))
+  }
+
+  it('R8 精细参数读侧：后端非默认值逐项回显（含曲线文本与三个开关）', async () => {
+    const p = regimePayload()
+    Object.assign(p.sizing, {
+      floor: 0.2, cap: 1.1, kelly_lambda: 0.4, kelly_min_prob: 0.55,
+      vol_target_pct: 2.5, vol_clamp_lo: 0.6, vol_clamp_hi: 1.4,
+      emotion_scales: { 退潮: 0.45, 背离: 0.65, 高潮: 0.75, 发酵: 1.0, 启动: 1.0 },
+      state_scales: { bull: 1.0, range: 0.65, bear: 0.35 },
+      macro_window_scales: { high: 0.45, medium: 0.75, low: 1.0 },
+      macro_lead_days: 3, macro_lead_curve: [0.8, 0.6, 0.4], macro_event_day_scale: 0.25,
+      holiday_scales: { weekend: 0.8, small1: 0.65, small2: 0.8, long1: 0.35, long2: 0.55, long3: 0.7 },
+      holiday_block_new: true,
+      index_scale_thresholds: { '-1': 1.0, '-2': 0.6, deep: 0.3 },
+      llm_bearish_scale: 0.4, max_total_position_pct: 0.75, max_drawdown_pct: 0.08,
+      stoploss_guard_count: 3, stoploss_guard_window_days: 2,
+      sl_offset_per_pct: 2.5, sl_offset_cap: 3.5, tp_offset_per_pct: 2.5, tp_offset_cap: 4.5,
+      sl_offset_min_index_drop: 0.8, bear_sl_tighten_pt: 1.2,
+      sl_offset_risk_budget_keep: false,
+      shadow: false,
+    })
+    state.impl.fetchRegimeConfig = () => p
+    render(<RegimeConfigPanel />)
+    await settle()
+    expandFine()
+    await settle()
+    expect(switchByLabel('影子模式（只留痕不下发）').getAttribute('aria-checked')).toBe('false')
+    expect(numberByLabel('仓位缩放地板').value).toBe('0.2')
+    expect(numberByLabel('仓位缩放上限').value).toBe('1.1')
+    expect(numberByLabel('Kelly 系数').value).toBe('0.4')
+    expect(numberByLabel('Kelly 最小优势概率').value).toBe('0.55')
+    expect(numberByLabel('波动率目标').value).toBe('2.5')
+    expect(numberByLabel('波动率乘子下限').value).toBe('0.6')
+    expect(numberByLabel('波动率乘子上限').value).toBe('1.4')
+    expect(numberByLabel('情绪「退潮」权重').value).toBe('0.45')
+    expect(numberByLabel('状态 bear 权重').value).toBe('0.35')
+    expect(numberByLabel('宏观影响 high 权重').value).toBe('0.45')
+    expect(numberByLabel('事件前瞻交易日数').value).toBe('3')
+    expect(numberByLabel('前瞻曲线（逗号分隔）').value).toBe('0.80, 0.60, 0.40')
+    expect(numberByLabel('事件当日缩放').value).toBe('0.25')
+    expect(numberByLabel('节前权重 long1').value).toBe('0.35')
+    expect(switchByLabel('长假前最后一日禁新开仓').getAttribute('aria-checked')).toBe('true')
+    expect(numberByLabel('大盘档位权重 deep').value).toBe('0.3')
+    expect(numberByLabel('LLM 利空缩放').value).toBe('0.4')
+    expect(numberByLabel('总仓位上限').value).toBe('0.75')
+    expect(numberByLabel('权益回撤熔断比例').value).toBe('0.08')
+    expect(numberByLabel('连续止损熔断次数').value).toBe('3')
+    expect(numberByLabel('连续止损回看窗').value).toBe('2')
+    expect(numberByLabel('止损放宽系数').value).toBe('2.5')
+    expect(numberByLabel('止损放宽上限').value).toBe('3.5')
+    expect(numberByLabel('止盈上浮系数').value).toBe('2.5')
+    expect(numberByLabel('止盈上浮上限').value).toBe('4.5')
+    expect(numberByLabel('止损放宽触发跌幅').value).toBe('0.8')
+    expect(numberByLabel('趋势破位止损收紧').value).toBe('1.2')
+    expect(switchByLabel('放宽止损同比例缩仓').getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('R9 精细参数写侧：改动逐键进 payload 且类型正确（数值/整数/数组/布尔）', async () => {
+    render(<RegimeConfigPanel />)
+    await settle()
+    expandFine()
+    await settle()
+    fireEvent.change(numberByLabel('仓位缩放地板'), { target: { value: '0.25' } })
+    fireEvent.change(numberByLabel('Kelly 系数'), { target: { value: '0.35' } })
+    fireEvent.change(numberByLabel('情绪「退潮」权重'), { target: { value: '0.4' } })
+    fireEvent.change(numberByLabel('事件前瞻交易日数'), { target: { value: '3' } })
+    fireEvent.change(numberByLabel('前瞻曲线（逗号分隔）'), { target: { value: '0.8，0.6 0.4' } })
+    fireEvent.change(numberByLabel('连续止损熔断次数'), { target: { value: '6' } })
+    fireEvent.click(switchByLabel('长假前最后一日禁新开仓'))
+    fireEvent.click(switchByLabel('放宽止损同比例缩仓'))
+    await settle()
+    fireEvent.click(btn('保存风控配置'))
+    await settle()
+    const api = await import('../api/index.js')
+    expect(api.setRegimeConfig.mock.calls.length).toBe(1)
+    const sz = api.setRegimeConfig.mock.calls[0][0].sizing
+    expect(sz.floor).toBe(0.25)
+    expect(sz.kelly_lambda).toBe(0.35)
+    expect(sz.emotion_scales['退潮']).toBe(0.4)
+    expect(sz.macro_lead_days).toBe(3)
+    expect(sz.macro_lead_curve).toEqual([0.8, 0.6, 0.4])
+    expect(sz.stoploss_guard_count).toBe(6)
+    expect(Number.isInteger(sz.stoploss_guard_count)).toBe(true)
+    expect(sz.holiday_block_new).toBe(true)
+    expect(sz.sl_offset_risk_budget_keep).toBe(false)
+    expect(sz.cap).toBe(1.15)
+    expect(typeof sz.cap).toBe('number')
+  })
+
+  it('R10 前瞻曲线个数与交易日数不符 → 拒绝保存、点名、零请求', async () => {
+    render(<RegimeConfigPanel />)
+    await settle()
+    expandFine()
+    await settle()
+    // 默认曲线 5 项，把前瞻交易日数改成 4 → 曲线必须同步改成 4 项才允许保存
+    fireEvent.change(numberByLabel('事件前瞻交易日数'), { target: { value: '4' } })
+    await settle()
+    fireEvent.click(btn('保存风控配置'))
+    await settle()
+    const api = await import('../api/index.js')
+    expect(api.setRegimeConfig.mock.calls.length, '§SIZING-FINE：曲线长度不符不得提交').toBe(0)
+    expect(document.body.textContent).toContain('以下参数无效')
+    expect(document.body.textContent).toContain('前瞻曲线')
+  })
+
+  it('R11 缩放地板 ≥ 上限 → 拒绝保存并点名', async () => {
+    render(<RegimeConfigPanel />)
+    await settle()
+    expandFine()
+    await settle()
+    fireEvent.change(numberByLabel('仓位缩放地板'), { target: { value: '1.2' } })
+    await settle()
+    fireEvent.click(btn('保存风控配置'))
+    await settle()
+    const api = await import('../api/index.js')
+    expect(api.setRegimeConfig.mock.calls.length, '§SIZING-FINE：地板≥上限不得提交').toBe(0)
+    expect(document.body.textContent).toContain('地板须小于上限')
+  })
+
+  it('R12 空 sizing 载荷 → 精细参数全部回落出厂默认（无 0/空输入），保存也不把 0 写进配置', async () => {
+    state.impl.fetchRegimeConfig = () => ({ sizing: {} })
+    render(<RegimeConfigPanel />)
+    await settle()
+    expandFine()
+    await settle()
+    expect(switchByLabel('影子模式（只留痕不下发）').getAttribute('aria-checked')).toBe('true')
+    expect(numberByLabel('仓位缩放地板').value).toBe('0.15')
+    expect(numberByLabel('情绪「退潮」权重').value).toBe('0.5')
+    expect(numberByLabel('事件前瞻交易日数').value).toBe('5')
+    expect(numberByLabel('前瞻曲线（逗号分隔）').value).toBe('0.90, 0.85, 0.80, 0.70, 0.50')
+    expect(numberByLabel('节前权重 long1').value).toBe('0.4')
+    expect(numberByLabel('大盘档位权重 deep').value).toBe('0.4')
+    expect(numberByLabel('连续止损熔断次数').value).toBe('4')
+    expect(switchByLabel('长假前最后一日禁新开仓').getAttribute('aria-checked')).toBe('false')
+    expect(switchByLabel('放宽止损同比例缩仓').getAttribute('aria-checked')).toBe('true')
+    const vals = [...document.querySelectorAll('input')].map((i) => i.value)
+    expect(vals.filter((v) => v === '0' || v === ''), '§SIZING-FINE：缺键不得折叠成 0/空').toEqual([])
+    fireEvent.click(btn('保存风控配置'))
+    await settle()
+    const api = await import('../api/index.js')
+    const sz = api.setRegimeConfig.mock.calls[0][0].sizing
+    expect(sz.shadow).toBe(true)
+    expect(sz.floor).toBe(0.15)
+    expect(sz.emotion_scales['退潮']).toBe(0.5)
+    expect(sz.macro_lead_curve).toEqual([0.9, 0.85, 0.8, 0.7, 0.5])
+    expect(sz.sl_offset_risk_budget_keep).toBe(true)
   })
 })

@@ -151,6 +151,19 @@ type Signal struct {
 	Price      float64 `json:"price"`         // 触发价格
 	Confidence float64 `json:"confidence"`    // 置信度（0~1）
 	ATR        float64 `json:"atr,omitempty"` // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
+	// ChangePct 信号**生成时刻**的当日涨跌幅（%）。用指针区分两种零：
+	//   nil = 当时取不到行情（历史批次只能显示「—」，绝不追补实时价）；
+	//   指向 0 = 当时有行情且确实平盘（展示 0.00% 是合法读数）。
+	// 该值在生成时由行情快照冻结，之后随信号批次落盘/回放都不再改写——历史批次不能
+	// 拿今天的实时价回填，否则等于给旧信号盖今天的价格戳（台账 2026-10-15 第二条）。
+	// English: the day's change % frozen at signal generation. The pointer separates "no quote"
+	// (nil → render "—", never backfilled with live prices) from a genuine flat reading (0).
+	ChangePct *float64 `json:"change_pct,omitempty"`
+	// PrevClose 信号生成时刻的昨收价（元），>0 才可信。用于复盘核对涨跌幅口径，
+	// 缺失时可由 price 与 changePct 反推（见 freezeQuote）。
+	// English: previous close frozen at generation time (>0 = trustworthy); lets reviews recheck
+	// the change-% basis. Derived from price/changePct when the source omitted it.
+	PrevClose float64 `json:"prev_close,omitempty"`
 	// QualityWeight §DYN-SIZE 信号质量归一化权重（引擎由 research.SignalQualityTable.Weight 解析后填入，
 	// 1.0=中性、限幅 ±10%；0=未解析/功能关闭 → 定权合成时该维度弃权）。
 	// 非持久化（json:"-"）：它是每轮定权的**临时输入**，不应随信号固化/前端广播出去；

@@ -78,6 +78,17 @@ function headerPnlText() {
 }
 
 
+// 等 toast 走完自己的 3s 生命周期正常收起，再结束用例。
+// 为什么必须等：TDesign 的每条 toast 是 body 上的独立 React root；若在它自动关窗前被下一条用例的
+// beforeEach 手工 remove()，到点时 React 会对已摘走的节点再 removeChild，抛 NotFoundError——
+// 用例全过、进程却因 unhandled error 非零退出（本文件 2026-10-22 在整轮门禁里现形）。
+// 这里不改任何断言方向：仍由 findByText 证明它出现过，只是把"何时允许下一轮清理"钉在它自己收起之后。
+async function waitToastGone(re) {
+  await waitFor(() => {
+    expect(screen.queryByText(re)).not.toBeInTheDocument()
+  }, { timeout: 7000 })
+}
+
 // 打开「可用资金」编辑 → 输入新值 → blur 触发 editBalanceSave（与线上交互同路径）
 // 注：TDesign InputNumber 的 input 在 jsdom 下不保证映射 role=spinbutton，直接取 DOM。
 async function saveBalanceAs(nextVal) {
@@ -149,6 +160,8 @@ describe('§H-2 Positions 保存可用资金失败（toast + 回滚 + 缓存不�
       expect(raw.balance, '§H-2：错误余额绝不能进 pos_cache_v1（跨刷新污染）').toBe(100)
     })
     expect(String(localStorage.getItem('pos_cache_v1'))).not.toContain('999')
+    // 让这条失败 toast 自己收起后再结束，避免它的 React root 与下一条用例的清理相撞
+    await waitToastGone(/保存可用资金失败/)
   })
 
   // T2：保存成功 → 无失败 toast、界面更新、60s 轮询后缓存同步到新确认值（守卫不伤正常路径）
@@ -237,6 +250,8 @@ describe('§E1 Positions 盈亏单轨：页头读数=后端 total_pnl，清零�
     // 判据不放宽，只是不再拿"三秒后还在不在"当第二把尺子。
     const toast = await screen.findByText(/盈亏校准失败/, {}, { timeout: 5000 })
     expect(toast.textContent, '§E1：清零失败必须给出可见 toast（静默＝用户以为已校准）').toContain('盈亏校准失败')
+    // 同上：等 toast 自行收起，杜绝"节点已被摘走、React 到点再 removeChild"的 unhandled error
+    await waitToastGone(/盈亏校准失败/)
   })
 
   it('T6 静态负向锁：pnl_offset 键不得复活；空头浮盈不得保留本地公式', () => {

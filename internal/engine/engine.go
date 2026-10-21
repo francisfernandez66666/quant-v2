@@ -41,6 +41,7 @@ import (
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
+	"quant-trading-v2/internal/signalarchive"
 	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
@@ -159,7 +160,11 @@ type Engine struct {
 
 	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
 	signalRecPath string                   // 信号批次记录持久化文件路径
-	signalStore   *signalStore             // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
+	// signalArchiveDir 按交易日归档的历史信号批次目录（signal_records_<YYYYMMDD>.json）。
+	// 当日文件跨日即失效，跨天按战法复盘必须从这份归档读（台账 2026-10-15 第三条）。
+	// English: per-day signal-batch archive; the day file resets, so cross-day review reads here.
+	signalArchiveDir string
+	signalStore      *signalStore // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
 	// English: pinned per-day signal store (latest Pass per code@strategy, restored across restarts)
 	storeDay string // §修复 P2#23：signalStore/signalRecords 已加载的交易日（YYYMMDD），跨日即清空避免昨日信号残留
 	// §0929HB-1（2026-09-29 全量审计批 ⑪-4）：零固化信号心跳的计时锚（e.mu 保护，只在
@@ -594,6 +599,7 @@ func New(
 	}
 	hotRecPath := ""
 	signalRecPath := ""
+	signalArchiveDir := ""
 	signalStorePath := ""
 	macroCalCachePath := "" // §MARKET_RISK_GATE P6 日历校准落盘缓存（dataDir 空则禁用）
 	// §M10/§M11（2026-09-22 修复批）：paper 移动止盈锚点文件与停机买单队列文件，
@@ -603,6 +609,7 @@ func New(
 	if dataDir != "" {
 		hotRecPath = filepath.Join(dataDir, "hot_records.json")
 		signalRecPath = filepath.Join(dataDir, "signal_records.json")
+		signalArchiveDir = filepath.Join(dataDir, "signal_records_archive")
 		signalStorePath = filepath.Join(dataDir, "signals_today.json")
 		macroCalCachePath = filepath.Join(dataDir, "macro_calendar_cache.json")
 		paperAnchorPath = filepath.Join(dataDir, "paper_sell_anchors.json")
@@ -628,6 +635,7 @@ func New(
 		stageRecPath:      stageRecPath,
 		signalRecords:     loadSignalRecords(signalRecPath),
 		signalRecPath:     signalRecPath,
+		signalArchiveDir:  signalArchiveDir,
 		signalStore:       newSignalStore(signalStorePath),
 		storeDay:          data.TradingDayDate(time.Now()), // 启动日即视为已加载日（新库只装当日），跨日才触发滚动清空
 		msgStore:          data.NewMessageStore(msgPath),
@@ -2334,13 +2342,17 @@ func (e *Engine) persistSignalRecords() {
 	recsSig := make([]combat_agent.SignalLog, len(e.signalRecords))
 	copy(recsSig, e.signalRecords)
 	e.mu.RUnlock()
-	f := signalRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: recsSig}
+	day := data.TradingDayDate(time.Now())
+	f := signalRecordFile{TradingDay: day, Records: recsSig}
 	raw, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		log.Printf("[engine] signal_records 序列化失败: %v", err)
 		return
 	}
 	mustAtomicWrite("signal_records", e.signalRecPath, raw)
+	// 同一份全量快照另写按天归档：当日文件跨日失效，跨天复盘只能靠它（台账 2026-10-15 第三条）。
+	// 写失败由 signalarchive 内部记日志，不影响上面的当日主文件。
+	signalarchive.Write(e.signalArchiveDir, day, recsSig, signalarchive.DefaultKeepDays)
 }
 
 // GetSignalLogs 返回当日全量信号批次记录（供前端"信号日志"弹窗按批次展示）。
@@ -2350,6 +2362,22 @@ func (e *Engine) GetSignalLogs() []combat_agent.SignalLog {
 	out := make([]combat_agent.SignalLog, len(e.signalRecords))
 	copy(out, e.signalRecords)
 	return out
+}
+
+// GetSignalLogsRange 返回最近 days 个交易日（含当日）的信号批次，时间升序。
+// 当日批次以内存为准；更早日期从 signal_records_archive 读取。days<=1 等价 GetSignalLogs。
+// English: returns the last `days` trading days of signal batches (today from memory, prior days
+// from the per-day archive), ascending by time.
+func (e *Engine) GetSignalLogsRange(days int) []combat_agent.SignalLog {
+	if days <= 1 {
+		return e.GetSignalLogs()
+	}
+	e.mu.RLock()
+	current := make([]combat_agent.SignalLog, len(e.signalRecords))
+	copy(current, e.signalRecords)
+	dir := e.signalArchiveDir
+	e.mu.RUnlock()
+	return signalarchive.ReadRange(dir, current, days, data.TradingDayDate(time.Now()))
 }
 
 // captureSignalRecords 收集本轮全部信号为一条批次快照，固化到当日信号记录。
