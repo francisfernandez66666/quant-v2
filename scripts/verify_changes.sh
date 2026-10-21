@@ -14038,4 +14038,71 @@ fi
 ! grep -q 'row.change_pct || 0' web/src/pages/Signals.jsx || fail1022 "信号页把缺涨跌幅合流成 0（缺数≠平盘）"
 echo "ok - §121 静态锁通过（精细参数键 25 枚/缺行情三态/涨跌幅冻结/跨批次筛选/归档读路径/行为腿）"
 
+echo "==> 122 §NTFY-REDACT/§D1-NOON ntfy 主题脱敏 + D1 中午零窗（2026-10-22 遗留项②④收口）..."
+fail122() {
+	echo "--- FAIL: §122 $*"
+	exit 1
+}
+CNT122=0
+# ① ntfy 主题脱敏（遗留项④）：主题名即凭证，而 net/http 的网络错误文本会把请求 URL 原样带上
+#    （`Post "<url>/<topic>": dial tcp …`）；该错误会被 recordFail、PushGateway 与补投日志原样打印。
+#    判据＝「原始错误绝不进熔断记录/返回值」，不是「日志里出现 <topic> 字样」——后者会被占位文案
+#    自身满足，是本仓锤过的空转锁形态。
+grep -q 'func (g \*NtfyGateway) redactTopic' internal/notify/ntfy.go || fail122 "redactTopic 助手缺失"
+grep -q 'gerr := g.redactTopic(err)' internal/notify/ntfy.go || fail122 "网络错误未先脱敏再记录（raw err 会带完整 topic）"
+grep -q 'g.recordFail(time.Now(), gerr)' internal/notify/ntfy.go || fail122 "recordFail 收到未脱敏错误"
+grep -q 'return gerr' internal/notify/ntfy.go || fail122 "Send 仍把未脱敏错误返回给调用方/补投日志"
+grep -q 'return g.redactTopic(err)' internal/notify/ntfy.go || fail122 "建请求失败分支未脱敏"
+grep -q 'g.URL+"/<topic>"' internal/notify/ntfy.go || fail122 "脱敏占位缺失（整段抹掉会让排障看不出是哪条通道）"
+! grep -q 'recordFail(time.Now(), err)' internal/notify/ntfy.go || fail122 "旧形回流：原始错误直接进 recordFail"
+CNT122=$((CNT122 + 7))
+# ② D1 空窗（遗留项②）：事件池为空不构成「该股事件变化」，整轮沿用上轮评分并保留签名；
+#    只复用「上一轮确有事件签名」的个股（跨日/从未评分不得借旧分），跨日缓存必须清空。
+#    注意负锁靶子贴函数体看过：旧实现在 engine.go 内联 `toScore` 变量与无条件签名覆写。
+[ -f internal/engine/d1_incremental.go ] || fail122 "D1 增量决策器缺失"
+grep -q 'func planD1Round' internal/engine/d1_incremental.go || fail122 "planD1Round 缺失"
+grep -q 'if len(valid) == 0 {' internal/engine/d1_incremental.go || fail122 "空事件池分支缺失（零窗会复发）"
+grep -q 'prevSig\[code\] != ""' internal/engine/d1_incremental.go || fail122 "空窗复用缺「上一轮确有事件签名」闸（会沿用跨日旧分）"
+grep -q 'plan := planD1Round(' internal/engine/engine.go || fail122 "引擎未接 planD1Round"
+grep -q 'if plan.sigNow != nil {' internal/engine/engine.go || fail122 "空窗轮会覆写签名（新事件到达时被误判为无变化）"
+grep -q 'e.d1ScoredSig = make(map\[string\]string)' internal/engine/engine.go || fail122 "跨日未清 D1 签名（昨日评分会冒充今日事件分）"
+! grep -q 'e.d1ScoredSig = sigNow' internal/engine/engine.go || fail122 "旧形回流：签名无条件覆写（空窗清空路径复活）"
+! grep -q 'd1Scorer.BatchScore(toScore' internal/engine/engine.go || fail122 "旧内联增量评分回流（空窗归零路径复活）"
+CNT122=$((CNT122 + 9))
+# ③ 行为腿：脱敏错误串两侧断言（含脱敏占位＝证明真走到脱敏路径）＋ 零窗三段式
+#    （早盘评分 → 空池沿用 → 新事件重评）＋ 待重试保留/板块事件重评/跨日清理。
+if ! go test -count=1 ./internal/notify -run 'TestNtfySendErrorRedactsTopic' >/dev/null 2>&1; then
+	fail122 "ntfy 脱敏行为腿未通过（错误串仍含完整 topic 或未走脱敏路径）"
+fi
+CNT122=$((CNT122 + 1))
+if ! go test -count=1 ./internal/engine -run 'TestPlanD1RoundNoonSeam|TestPlanD1RoundEmptyPoolSkipsUnscored|TestPlanD1RoundSectorEventChangeRescores|TestRolloverDayStoresClearsD1Cache' >/dev/null 2>&1; then
+	fail122 "D1 空窗行为腿未通过（空窗复用/待重试保留/板块事件重评/跨日清理任一丢失）"
+fi
+CNT122=$((CNT122 + 1))
+# ④ 反证两枚（go test -overlay 零改源：变异副本必红，证明行为腿咬住实现而不是空转；
+#    每条先 cmp 断 sed 真落地——空替换＝no-op 时用例照样红，读起来却像"锁抓住了破坏"）。
+R122="$(mktemp -d /tmp/d122gate-XXXXXX 2>/dev/null || true)"
+[ -n "$R122" ] || fail122 "建不出 overlay 目录，两枚反证无法跑（宁可红，不许跳）"
+# R1 摘脱敏：两处 redactTopic 调用还原成裸 err ⇒ 脱敏用例必须红。
+sed -e 's/gerr := g.redactTopic(err)/gerr := err/' -e 's/return g.redactTopic(err)/return err/' internal/notify/ntfy.go > "$R122/ntfy_mut.go"
+if cmp -s internal/notify/ntfy.go "$R122/ntfy_mut.go"; then
+	fail122 "R1 sed 未生效（锚行漂了，这条绿是假绿）"
+fi
+printf '{"Replace": {"%s/internal/notify/ntfy.go": "%s/ntfy_mut.go"}}' "$(pwd)" "$R122" > "$R122/overlay_ntfy.json"
+if go test -count=1 -overlay "$R122/overlay_ntfy.json" ./internal/notify/ -run 'TestNtfySendErrorRedactsTopic' >/dev/null 2>&1; then
+	fail122 "R1 摘掉脱敏后脱敏用例仍绿＝锁没牙"
+fi
+# R2 摘空窗分支：if len(valid) == 0 → if false（旧语义：空池照常重评归零）⇒ 零窗用例必须红。
+sed 's/if len(valid) == 0 {/if false {/' internal/engine/d1_incremental.go > "$R122/d1_mut.go"
+if cmp -s internal/engine/d1_incremental.go "$R122/d1_mut.go"; then
+	fail122 "R2 sed 未生效（锚行漂了）"
+fi
+printf '{"Replace": {"%s/internal/engine/d1_incremental.go": "%s/d1_mut.go"}}' "$(pwd)" "$R122" > "$R122/overlay_d1.json"
+if go test -count=1 -overlay "$R122/overlay_d1.json" ./internal/engine/ -run 'TestPlanD1RoundNoonSeam' >/dev/null 2>&1; then
+	fail122 "R2 摘掉空窗分支后零窗用例仍绿＝锁没牙"
+fi
+rm -rf "$R122"
+CNT122=$((CNT122 + 2))
+echo "ok - §122 静态锁与行为腿通过（ntfy 错误脱敏 7 道 + D1 空窗 9 道 + 行为腿 2 组 + 反证 2 枚，累计判定点 ${CNT122}）"
+
 echo "==> 全部通过"

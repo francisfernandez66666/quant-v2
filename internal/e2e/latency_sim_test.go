@@ -166,20 +166,29 @@ func TestRealSpeedRehearsal(t *testing.T) {
 		mainTimings = append(mainTimings, rig.eng.LastRunTiming())
 	}
 
-	// 阶段2：近实时打分轮（无新闻 + D1 复用 → 打分-only 路径，测 5s 稳态）
+	// 阶段2：近实时打分轮——两段式：先跑一轮带新闻的消费轮让 D1 真评一次并落 lastD1Scores，
+	// 随后清空新闻源连跑 3 轮。事件池空窗（§D1-NOON）应沿用上轮评分，不再调 Stage0/Stage2/D1。
+	// 旧写法「全程空新闻」断言 d1N==1 依赖旧语义（空池也调 LLM、全池归零）：新语义下空池且无历史
+	// 评分本就不该调 LLM（省一次无效调用），故改为「先有后空」，直接覆盖空窗复用路径。
 	metricsScore := &simMetrics{}
-	consumeRig := newRehearsalRig(t, fix, profile, metricsScore, false)
+	consumeRig := newRehearsalRig(t, fix, profile, metricsScore, true)
 	consumeRig.eng.SetShortEnabled(true)
 	consumeRig.eng.SetLongEnabled(true)
 	consumeRig.wl.Add("", "300750")
 	consumeRig.wl.Add("", "300308")
 	since := newsSince(t, fix)
-	consumeRig.eng.Run(context.Background(), since) // 消费新闻
+	consumeRig.eng.Run(context.Background(), since) // 消费轮：有新闻，D1 真评一次
+	warmStage0, warmStage2, warmD1 := metricsScore.counts()
+	warmScores := consumeRig.eng.LastD1Scores()
+	// 清空新闻源进入空事件池空窗；origNews 供阶段3复原同一份 fixture。
+	origNews := fix.News
+	fix.News = map[string][]data.NewsItem{"ths": {}, "sina": {}, "cls": {}}
 	var scoreTimings []*engine.RunTiming
 	for i := 0; i < 3; i++ {
-		consumeRig.eng.Run(context.Background(), since.Add(2*time.Second))
+		consumeRig.eng.Run(context.Background(), since.Add(time.Duration(i+1)*2*time.Second))
 		scoreTimings = append(scoreTimings, consumeRig.eng.LastRunTiming())
 	}
+	fix.News = origNews
 
 	// 阶段3：纯计算标定（Scale=0 → 注入 0，测得各分段纯 CPU 时间）
 	prof0 := realisticProfile()
@@ -196,18 +205,41 @@ func TestRealSpeedRehearsal(t *testing.T) {
 	todos := renderRehearsalReport(t, profile, metricsMain, metricsScore, mainTimings, scoreTimings, compute)
 
 	// ---- 断言：彩排驱动全链路且无行为回归 ----
-	if metricsMain.stage0N == 0 || metricsMain.stage2N == 0 || metricsMain.d1N == 0 {
-		t.Errorf("新闻触发轮应产生 Stage0/2/D1 LLM 调用(实测 %d/%d/%d)",
-			metricsMain.stage0N, metricsMain.stage2N, metricsMain.d1N)
+	mainStage0, mainStage2, mainD1 := metricsMain.counts()
+	if mainStage0 == 0 || mainStage2 == 0 || mainD1 == 0 {
+		t.Errorf("新闻触发轮应产生 Stage0/2/D1 LLM 调用(实测 %d/%d/%d)", mainStage0, mainStage2, mainD1)
 	}
-	if metricsScore.stage0N != 0 || metricsScore.stage2N != 0 {
-		t.Errorf("近实时打分轮不应重复调 Stage0/Stage2 新闻分析 LLM(实测 %d/%d), 打分轮应无新闻分析",
-			metricsScore.stage0N, metricsScore.stage2N)
+	// §S1 增量 D1：消费轮新评分池调一次 D1；其后 3 个空窗轮无有效事件 + 已有分 → 沿用不重评。
+	// 断言消费轮恰 1 次：既证明打分池没断链（真调了 LLM），又证明没有重复评分。
+	if warmD1 != 1 {
+		t.Errorf("消费轮应恰调 1 次 D1(实测%d), 否则打分池断链或重复评分", warmD1)
 	}
-	// §S1 增量 D1：消费轮新评分池全量调一次 D1；其后 3 个打分轮签名未变 + 已有分 → 全量复用不重复调 LLM。
-	// 断言 d1N==1：既证明打分池没断链（首轮真调了 LLM），又证明增量复用生效（不每轮重打）。
-	if metricsScore.d1N != 1 {
-		t.Errorf("近实时打分轮应仅消费轮调 1 次 D1(增量复用, 实测%d), 否则打分池断链或复用未生效", metricsScore.d1N)
+	if len(warmScores) == 0 {
+		t.Fatal("消费轮后应留下 D1 评分（空窗复用依赖 lastD1Scores）")
+	}
+	// §D1-NOON 空窗轮：新闻分析与 D1 计数必须冻结（不重评、不归零），已评分个股分数沿用。
+	stage0After, stage2After, d1After := metricsScore.counts()
+	if stage0After != warmStage0 || stage2After != warmStage2 {
+		t.Errorf("空窗轮不应重复调 Stage0/Stage2 新闻分析(消费轮 %d/%d → 空窗后 %d/%d)",
+			warmStage0, warmStage2, stage0After, stage2After)
+	}
+	if d1After != warmD1 {
+		t.Errorf("空窗轮不应重调 D1(消费轮 %d → 空窗后 %d), 空事件池应沿用上轮评分", warmD1, d1After)
+	}
+	afterScores := consumeRig.eng.LastD1Scores()
+	carried := 0
+	for code, before := range warmScores {
+		after, ok := afterScores[code]
+		if !ok {
+			continue
+		}
+		carried++
+		if after.Score != before.Score || after.Blocked != before.Blocked {
+			t.Errorf("空窗轮 %s 评分应沿用消费轮 %+v, got %+v", code, before, after)
+		}
+	}
+	if carried == 0 {
+		t.Errorf("空窗轮未沿用任何个股评分(%d→%d), 空事件池复用未生效", len(warmScores), len(afterScores))
 	}
 	// 打分轮稳态应显著快于新闻触发轮（无 LLM 等待）
 	avgMain := avgDur(mainTimings, func(tm *engine.RunTiming) time.Duration { return tm.Total })

@@ -113,6 +113,24 @@ func NewNtfyGateway(url, topic string) *NtfyGateway {
 	return &NtfyGateway{URL: strings.TrimRight(url, "/"), Topic: topic, Timeout: 5 * time.Second}
 }
 
+// redactTopic 抹掉错误串里的完整 topic。主题名即凭证（随机串可被用于伪造运维消息），
+// 而 net/http 的错误文本会把请求 URL 原样带上（`Post "<url>/<topic>": dial tcp …`）；
+// 该错误会被 recordFail、PushGateway 与补投日志原样打印，等于把通道写权限写进日志。
+// 返回全新错误而非再包装原错误：url.Error 仍能经 Unwrap 取回未脱敏文本，包装等于没脱敏。
+// English: strips the topic from error text (the topic is the credential; net/http errors embed
+// the request URL, and that text is logged by recordFail/PushGateway/outbox).
+func (g *NtfyGateway) redactTopic(err error) error {
+	if err == nil {
+		return nil
+	}
+	secret := g.URL + "/" + g.Topic
+	msg := err.Error()
+	if !strings.Contains(msg, secret) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(msg, secret, g.URL+"/<topic>"))
+}
+
 // Send 把消息以纯文本 POST 到 <url>/<topic>，标题/优先级走 HTTP 头。
 // 级别映射：LevelHigh→high(4)（强提醒不静音），中→default(3)，低→low(2)。
 // 正文截断 4KB（ntfy 公共服务器消息上限 4096B）。
@@ -138,7 +156,7 @@ func (g *NtfyGateway) Send(msg Message) error {
 	url := g.URL + "/" + g.Topic
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
 	if err != nil {
-		return err
+		return g.redactTopic(err)
 	}
 	req.Header.Set("Title", msg.Title)
 	req.Header.Set("Priority", pri)
@@ -146,8 +164,10 @@ func (g *NtfyGateway) Send(msg Message) error {
 	client := &http.Client{Timeout: g.Timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		g.recordFail(time.Now(), err)
-		return err
+		// 先脱敏再交给熔断记录与调用方：两者都会把错误文本打进日志。
+		gerr := g.redactTopic(err)
+		g.recordFail(time.Now(), gerr)
+		return gerr
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {

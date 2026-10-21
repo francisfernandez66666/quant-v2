@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -66,6 +67,30 @@ func TestNtfyDisabledEmptyTopic(t *testing.T) {
 	var g *NtfyGateway // nil 接收者
 	if err := g.Send(Message{Title: "a", Content: "b"}); err != nil {
 		t.Errorf("nil 网关 Send 应静默成功, got %v", err)
+	}
+}
+
+// TestNtfySendErrorRedactsTopic 网络失败的返回错误不得携带完整 topic（主题名即凭证）：
+// net/http 把请求 URL 原样写进错误文本，而这条错误会被 recordFail/PushGateway/补投日志打印。
+// 用"先起后关"的 httptest 服务制造确定性连接拒绝（不依赖外网与具体端口占用）。
+func TestNtfySendErrorRedactsTopic(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srvURL := srv.URL
+	srv.Close() // 关闭后连接必被拒：client.Do 返回含完整 URL 的 *url.Error
+	const topic = "s3cr3t-topic-abc"
+	g := NewNtfyGateway(srvURL, topic)
+	g.Timeout = time.Second
+	err := g.Send(Message{Level: LevelHigh, Title: "t", Content: "c"})
+	if err == nil {
+		t.Fatal("连接已关闭的服务应返回错误")
+	}
+	if strings.Contains(err.Error(), topic) {
+		t.Fatalf("错误串泄露完整 topic: %v", err)
+	}
+	// 两侧断言：<topic> 占位在位证明错误里确实带着 URL——否则「没泄露」可能只是
+	// 错误压根没走到脱敏路径（用例退化成空跑，本仓已栽过多次）。
+	if !strings.Contains(err.Error(), "<topic>") {
+		t.Fatalf("错误串未走脱敏路径（应保留 %s/<topic> 占位）: %v", g.URL, err)
 	}
 }
 

@@ -2423,6 +2423,10 @@ func (e *Engine) RolloverDayStores() {
 	}
 	e.mu.Lock()
 	e.signalRecords = nil
+	// §D1-NOON：D1 增量缓存按交易日失效——空事件池空窗复用分支只认「上一轮有事件签名」，
+	// 若不按日清理，隔夜/重启后的首个空窗轮会把昨日评分当作今日事件分沿用。
+	e.lastD1Scores = make(map[string]combat_agent.D1Score)
+	e.d1ScoredSig = make(map[string]string)
 	e.mu.Unlock()
 }
 
@@ -4526,28 +4530,28 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	prevScores := e.lastD1Scores
 	prevSig := e.d1ScoredSig
 	e.mu.RUnlock()
-	// 遍历打分池：计算每只个股本次事件签名，与上一轮相同则复用旧分（不加进待评列表）。
-	toScore := make([]string, 0, len(sr.ScoringPool))
-	reuse := make(map[string]combat_agent.D1Score, len(sr.ScoringPool))
-	sigNow := make(map[string]string, len(sr.ScoringPool))
-	for _, code := range sr.ScoringPool {
-		sig := combat_agent.EventSignature(code, sr.MarketData[code], valid, eventMap[code])
-		sigNow[code] = sig
-		if prev, ok := prevScores[code]; ok && !prev.RetryPending && prevSig[code] == sig {
-			reuse[code] = prev
-			continue
-		}
-		toScore = append(toScore, code)
+	// §D1-NOON：增量决策抽成纯函数 planD1Round——事件池空窗（衰减把最后一条有效事件滤掉、
+	// 且无新事件）不重评归零，整轮沿用上一轮评分并保留签名；详见 d1_incremental.go。
+	plan := planD1Round(sr.ScoringPool, valid, sr.MarketData, eventMap, prevScores, prevSig)
+	d1Scores := make(map[string]combat_agent.D1Score, len(plan.reuse)+len(plan.toScore))
+	if len(plan.toScore) > 0 {
+		d1Scores = d1Scorer.BatchScore(plan.toScore, valid, sr.MarketData)
 	}
-	d1Scores := d1Scorer.BatchScore(toScore, valid, sr.MarketData)
-	for code, sc := range reuse {
+	for code, sc := range plan.reuse {
 		d1Scores[code] = sc
 	}
-	log.Printf("[engine] D1增量: 全池%d只 → 复用%d只(无新事件) 重评%d只", len(sr.ScoringPool), len(reuse), len(toScore))
-	// 记录本轮评分时的事件签名（供下轮增量复用判定；离池个股签名一并清理防无限增长）
-	e.mu.Lock()
-	e.d1ScoredSig = sigNow
-	e.mu.Unlock()
+	if plan.empty {
+		log.Printf("[engine] D1增量: 本轮事件池为空(有效=0), 沿用上轮评分%d只(不重评归零)", len(plan.reuse))
+	} else {
+		log.Printf("[engine] D1增量: 全池%d只 → 复用%d只(无新事件) 重评%d只", len(sr.ScoringPool), len(plan.reuse), len(plan.toScore))
+	}
+	// 记录本轮评分时的事件签名（供下轮增量复用判定；离池个股签名一并清理防无限增长）。
+	// 空窗轮不覆写：签名必须停留在最后一次真实事件集，新事件到达时差异才能触发重评。
+	if plan.sigNow != nil {
+		e.mu.Lock()
+		e.d1ScoredSig = plan.sigNow
+		e.mu.Unlock()
+	}
 	// 收集 LLM 失败待重试个股：并入重试队列（下轮重调 LLM），并清理已成功个股。
 	// English: collect RetryPending stocks into the retry queue (re-scored next round); drop the resolved ones.
 	nextRetry := make(map[string]bool)

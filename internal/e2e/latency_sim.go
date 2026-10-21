@@ -167,6 +167,13 @@ func (m *simMetrics) addStage2(d time.Duration) {
 // addD1 记一笔 D1 评分注入时延。
 func (m *simMetrics) addD1(d time.Duration) { m.mu.Lock(); m.d1Ms += d; m.d1N++; m.mu.Unlock() }
 
+// counts 返回 Stage0/Stage2/D1 三个 LLM 阶段的累计调用数快照（锁内读取，供分段差值断言）。
+func (m *simMetrics) counts() (stage0, stage2, d1 int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stage0N, m.stage2N, m.d1N
+}
+
 // addOther 记一笔其余环节（触发/聚合等）注入时延。
 func (m *simMetrics) addOther(d time.Duration) {
 	m.mu.Lock()
