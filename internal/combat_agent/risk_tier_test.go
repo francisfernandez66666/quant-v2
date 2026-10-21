@@ -85,10 +85,10 @@ func TestSynthesizeRiskTierRollback(t *testing.T) {
 func TestApplyRiskTierYellowBars(t *testing.T) {
 	cfg := config.MacroGateConfig{} // YellowMinConf 默认 0.90
 	sigs := []Signal{
-		testSignal(string(strategy.SignalDragon), "buy", 0.85), // <0.90 → watch
-		testSignal(string(strategy.SignalDragon), "buy", 0.95), // ≥0.90 → 放行
-		testSignal(string(strategy.SignalNShape), "buy", 0.67), // §N-RELAX：N 形豁免置信降级 → 放行
-		{Strategy: "动量", Action: "watch", Confidence: 0.5},     // Yellow 不剔除动量 watch
+		testSignal(string(strategy.SignalDoubleBump), "buy", 0.85), // <0.90 → watch
+		testSignal(string(strategy.SignalDoubleBump), "buy", 0.95), // ≥0.90 → 放行
+		testSignal(string(strategy.SignalNShape), "buy", 0.67),     // §N-RELAX：N 形豁免置信降级 → 放行
+		{Strategy: "动量", Action: "watch", Confidence: 0.5},         // Yellow 不剔除动量 watch
 	}
 	out := applyRiskTier(sigs, RiskTierYellow, cfg, []string{"情绪退潮"})
 	if out[0].Action != "watch" || !strings.Contains(out[0].Reason, "风险档Yellow") {
@@ -110,10 +110,10 @@ func TestApplyRiskTierYellowBars(t *testing.T) {
 func TestApplyRiskTierRedHardBlocks(t *testing.T) {
 	cfg := config.MacroGateConfig{} // RedMinConf 默认 0.92，BlockN/Momentum 默认 true
 	sigs := []Signal{
-		testSignal(string(strategy.SignalNShape), "buy", 0.99), // N 形高置信也被拦截
-		{Strategy: "动量", Action: "watch", Confidence: 0.99},    // 动量 watch 被剔除
-		testSignal(string(strategy.SignalDragon), "buy", 0.91), // <0.92 → watch
-		testSignal(string(strategy.SignalDragon), "buy", 0.93), // ≥0.92 → 放行
+		testSignal(string(strategy.SignalNShape), "buy", 0.99),     // N 形高置信也被拦截
+		{Strategy: "动量", Action: "watch", Confidence: 0.99},        // 动量 watch 被剔除
+		testSignal(string(strategy.SignalDoubleBump), "buy", 0.91), // <0.92 → watch
+		testSignal(string(strategy.SignalDoubleBump), "buy", 0.93), // ≥0.92 → 放行
 	}
 	out := applyRiskTier(sigs, RiskTierRed, cfg, []string{"情绪冰点"})
 	if out[0].Action != "watch" || !strings.Contains(out[0].Reason, "拦截N形") {
@@ -132,8 +132,8 @@ func TestApplyRiskTierRedHardBlocks(t *testing.T) {
 func TestApplyRiskTierSectorEscalation(t *testing.T) {
 	cfg := config.MacroGateConfig{MacroSectorMap: map[string][]string{"cpi": {"科技"}}}
 	sigs := []Signal{
-		{Strategy: string(strategy.SignalDragon), Action: "buy", Confidence: 0.91, Sector: "半导体科技"}, // 命中→按 Red：0.91<0.92 降级
-		{Strategy: string(strategy.SignalDragon), Action: "buy", Confidence: 0.91, Sector: "银行"},    // 未命中→Yellow：0.91<0.90? 否(≥0.90)放行
+		{Strategy: string(strategy.SignalDoubleBump), Action: "buy", Confidence: 0.91, Sector: "半导体科技"}, // 命中→按 Red：0.91<0.92 降级
+		{Strategy: string(strategy.SignalDoubleBump), Action: "buy", Confidence: 0.91, Sector: "银行"},    // 未命中→Yellow：0.91<0.90? 否(≥0.90)放行
 	}
 	out := applyRiskTier(sigs, RiskTierYellow, cfg, []string{"CPI影响期"})
 	if out[0].Action != "watch" {

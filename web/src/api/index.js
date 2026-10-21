@@ -1853,6 +1853,19 @@ export async function setD1Config(cfg) {
   return request('/api/config/d1', { method: 'POST', data: cfg })
 }
 
+// ── §N6-RISK 信号生成层开关（市场状态机 / 动态仓位 / 卖出加权 / 风险档门槛） ──
+// GET /api/config/regime → { enhance, sizing, macro_gate }
+// POST 稀疏 merge：body 可只带其中一段，未出现的键保留库中原值（admin）。
+/** 读取风控与仓位开关（GET /api/config/regime，admin） */
+export async function fetchRegimeConfig() {
+  return request('/api/config/regime')
+}
+
+/** 保存风控与仓位开关（POST /api/config/regime，admin，稀疏 merge） */
+export async function setRegimeConfig(cfg) {
+  return request('/api/config/regime', { method: 'POST', data: cfg })
+}
+
 /** 获取 LLM 诊断调试数据 */
 /** Fetch LLM diagnostic/debug data */
 // 对应 GET /api/llm-debug，返回最近一次 LLM 决策的输入 / 输出，供 LLM 诊断页分析

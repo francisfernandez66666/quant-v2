@@ -38,8 +38,12 @@ type Regime struct {
 	// 二次相乘属"同一风险双罚"，违反方案 §5 测试锁）；仅作 shadow 读数与既有 auto 谨慎层消费。
 	MaxPosPct float64 `json:"max_pos_pct,omitempty"`
 
-	// RiskTier 合成风险档：Red/Yellow/""（空=无档）。Red 走**硬拦**。
+	// RiskTier 合成风险档：Red/Yellow/""（空=无档）。Red 默认走**权重收束**（tier_scales.Red），
+	// 只有 RedBlockNewBuy=true 时才硬拦新开仓（§N6-RISK owner 裁决：收束优先，不全拒）。
 	RiskTier string `json:"risk_tier,omitempty"`
+	// RedBlockNewBuy Red 日是否禁止新开仓（来自 macro_gate.red_block_new_buy，默认 false）。
+	// English: whether Red hard-blocks new buys (from red_block_new_buy; default false).
+	RedBlockNewBuy bool `json:"red_block_new_buy,omitempty"`
 	// RiskReasons 风险档触发原因（留痕用）。
 	RiskReasons []string `json:"risk_reasons,omitempty"`
 

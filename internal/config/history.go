@@ -563,6 +563,16 @@ func AuditAccountWrite(m *Manager, actor, userID, key string, before []byte) {
 var configSurfaces = map[string]bool{
 	"d1": true, "strategy": true, "llm": true, "longshort": true,
 	"scheduler": true, "qmt": true, "paper": true, "global": true,
+	// §N6-RISK（2026-10-21）/api/config/regime 表面名。该通道写的是
+	// rules.enhance / rules.sizing / rules.strategy.macro_gate 三段，全部住在**全局
+	// config.json** 里（MergeEnhanceConfig/MergeSizingConfig 直接重绑 m.rules 字段后 Save，
+	// macro_gate 借 MergeStrategyConfig(patch,"") 同写全局），所以它归 default 组（target="global"）。
+	// 漏登记的后果实测过：SnapshotBeforeWrite 报「未知配置面」，写照样落库、但每次风控开关
+	// 变更都留不下回滚点，并在日志里刷一条 P1——正是本表注释警告的"无快照写入"形态。
+	// English: the /api/config/regime surface. Its three sections all live in the global
+	// config.json, so it belongs to the default (global) group; omitting it made every
+	// risk-switch write untracked and un-rollbackable.
+	"regime": true,
 }
 
 // resolveWriteScope 判定"这次写入替换的是哪本文档"，返回 (账号, KV 键, 目标描述)。

@@ -6271,6 +6271,8 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 		MaxPosPct:      e.lastMaxPosPct,
 		RiskTier:       e.lastRiskTier,
 		BreadthUpRatio: e.lastUpRatio,
+		// §N6-RISK：Red 硬拦只由应急开关触发；默认走 tier_scales.Red 权重收束。
+		RedBlockNewBuy: e.combatAgent != nil && e.combatAgent.RedBlockNewBuyOn(),
 	}
 	if len(e.lastRiskReasons) > 0 {
 		r.RiskReasons = append([]string(nil), e.lastRiskReasons...)

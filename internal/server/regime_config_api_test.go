@@ -1,0 +1,354 @@
+// regime_config_api_test.go — §N6-RISK（2026-10-21）信号生成层开关的 HTTP 面与落盘行为锁。
+//
+// 这一组开关（enhance / sizing / macro_gate）决定「宏观·大盘·风险情绪」怎么进入信号生成，
+// owner 裁决要求「全部可配 + 前端有开关」。面板写得进、引擎吃得到，靠的就是
+// GET 回显生效值 + POST 稀疏 merge + 落盘 这三件事，而它们此前**一条断言都没有**。
+// 本文件钉六件事：
+//  1. GET 必须回显**补齐出厂默认后的生效值**（配置文件没写 rules.sizing 时，
+//     不能把零值 Red 权重/广度降权送给前端——那会让面板显示 0，而引擎实际按 0.30/0.90 跑）；
+//  2. POST 稀疏 merge 只改出现的键，未出现的键与**同段兄弟键**必须保留（抹平事故的源头）；
+//  3. 嵌套 map（tier_scales）按**键级**合并，只发 Red 不得清掉 Yellow；
+//  4. 写侧落盘：换一个 Manager 读同一份文件必须看到新值（否则页面改完引擎重启回退）；
+//  5. macro_gate 借战法配置的 merge 通道写入，red_block_new_buy 逐键往返；
+//  6. 鉴权与坏输入：非 admin 403、非法 JSON / 类型不符 400（绝不半写就回 ok）。
+//
+// English: HTTP-surface and persistence locks for the §N6-RISK signal-layer switches — GET echoes
+// defaults-filled effective values, POST sparse-merges per key (including nested maps), writes
+// persist to disk, macro_gate round-trips through the strategy merge channel, and auth/bad-input
+// fail closed.
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/config"
+)
+
+// newRegimeTestServer 装配指向独立配置文件的 Server（每次独立 TempDir，避免与同包其它用例抢账本）。
+// English: a Server bound to its own config file under TempDir.
+func newRegimeTestServer(t *testing.T) (*Server, *auth.User, string) {
+	t.Helper()
+	dir := t.TempDir()
+	mgr := auth.NewManager(dir)
+	if err := mgr.Init(); err != nil {
+		t.Fatalf("auth init: %v", err)
+	}
+	admin, err := mgr.CreateUser("admin", "adminpw", auth.RoleAdmin, nil, 0)
+	if err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cfgMgr.SetStore(mgr)
+	s := &Server{auth: mgr, cfg: cfgMgr, mux: http.NewServeMux()}
+	s.registerRoutes()
+	return s, admin, cfgPath
+}
+
+// decodeRegime 解析 GET /api/config/regime 的三段载荷。
+// English: decodes the three payload sections of GET /api/config/regime.
+func decodeRegime(t *testing.T, body string) (enhance map[string]any, sizing map[string]any, macro map[string]any) {
+	t.Helper()
+	var got struct {
+		Enhance   map[string]any `json:"enhance"`
+		Sizing    map[string]any `json:"sizing"`
+		MacroGate map[string]any `json:"macro_gate"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("载荷解析失败: %v body=%s", err, body)
+	}
+	if got.Enhance == nil || got.Sizing == nil {
+		t.Fatalf("enhance/sizing 段缺失（前端会拿到 undefined 而不是生效值）: %s", body)
+	}
+	return got.Enhance, got.Sizing, got.MacroGate
+}
+
+// TestRegimeConfigGetEchoesDefaults 出厂空配置下 GET 必须回显补齐后的生效值。
+// 反证靶心：Red 金额权重若回 0，面板显示 0 而引擎按 0.30 跑——「页面写的≠引擎吃的」正是本仓
+// 反复锤实的派生状态撒谎形态。
+// English: with an untouched config file, GET must report defaults-filled values, never raw zeros.
+func TestRegimeConfigGetEchoesDefaults(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	rr := adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
+	if rr.Code != 200 {
+		t.Fatalf("GET /api/config/regime 应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	_, sizing, _ := decodeRegime(t, rr.Body.String())
+	tiers, _ := sizing["tier_scales"].(map[string]any)
+	if tiers == nil {
+		t.Fatalf("tier_scales 未回显: %v", sizing)
+	}
+	if got, _ := tiers["Red"].(float64); got != 0.30 {
+		t.Fatalf("Red 金额权重应回显默认生效值 0.30（不是零值 0）, got %v", tiers["Red"])
+	}
+	if got, _ := tiers["Yellow"].(float64); got != 0.60 {
+		t.Fatalf("Yellow 金额权重应回显 0.60, got %v", tiers["Yellow"])
+	}
+	if got, _ := sizing["breadth_missing_scale"].(float64); got != 0.90 {
+		t.Fatalf("广度缺失降权应回显 0.90, got %v", sizing["breadth_missing_scale"])
+	}
+	if lvl, _ := sizing["sell_boost_level"].(string); lvl != "L2" {
+		t.Fatalf("卖出加权档位应回显 L2（owner 裁决默认档）, got %v", lvl)
+	}
+	// Enabled 出厂 false：动态仓位默认关，这条必须可见（面板据此显示开关初态）。
+	if on, _ := sizing["enabled"].(bool); on {
+		t.Fatal("sizing.enabled 出厂必须为 false（默认关＝零行为变更是 §DYN-SIZE 的出厂纪律）")
+	}
+}
+
+// TestRegimeConfigSparseMergeKeepsSiblings POST 只带 enhance 时，已写入的 sizing 值不得被抹平。
+// English: a PATCH carrying only enhance must leave previously stored sizing values intact.
+func TestRegimeConfigSparseMergeKeepsSiblings(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	// 先写 sizing：把 Red 权重改成 0.5、广度降权改成 0.8。
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"tier_scales":{"Red":0.5},"breadth_missing_scale":0.8}}`))
+	if rr.Code != 200 {
+		t.Fatalf("写 sizing 应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 再**只**写 enhance——sizing 一个键都没提，必须原样保留。
+	rr2 := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"enhance":{"market_state_enabled":true}}`))
+	if rr2.Code != 200 {
+		t.Fatalf("写 enhance 应 200, got %d body=%s", rr2.Code, rr2.Body.String())
+	}
+	enh, sizing, _ := decodeRegime(t, rr2.Body.String())
+	if on, _ := enh["market_state_enabled"].(bool); !on {
+		t.Fatalf("market_state_enabled 未写入: %v", enh)
+	}
+	tiers, _ := sizing["tier_scales"].(map[string]any)
+	if got, _ := tiers["Red"].(float64); got != 0.5 {
+		t.Fatalf("只发 enhance 却把 sizing.tier_scales.Red 抹回默认（稀疏 merge 失效）, got %v", tiers["Red"])
+	}
+	if got, _ := sizing["breadth_missing_scale"].(float64); got != 0.8 {
+		t.Fatalf("breadth_missing_scale 被抹平, got %v", sizing["breadth_missing_scale"])
+	}
+	// 兄弟键 Yellow 全程没发过，必须仍是默认 0.60（键级合并的旁证）。
+	if got, _ := tiers["Yellow"].(float64); got != 0.60 {
+		t.Fatalf("Yellow 权重应保持默认 0.60, got %v", tiers["Yellow"])
+	}
+}
+
+// TestRegimeConfigNestedMapKeyMerge tier_scales 只发 Red 时 Yellow 必须存活；反向同证。
+// 深合并若退化成「整map 替换」，前端提交一份只显示 Red 的载荷就会清掉运维另配的 Yellow。
+// English: nested maps merge key-by-key — sending only Red must keep Yellow, and vice versa.
+func TestRegimeConfigNestedMapKeyMerge(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"tier_scales":{"Yellow":0.45}}}`)); rr.Code != 200 {
+		t.Fatalf("首次写应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"tier_scales":{"Red":0.25}}}`))
+	_, sizing, _ := decodeRegime(t, rr.Body.String())
+	tiers, _ := sizing["tier_scales"].(map[string]any)
+	if got, _ := tiers["Red"].(float64); got != 0.25 {
+		t.Fatalf("Red 未按键写入, got %v", tiers["Red"])
+	}
+	if got, _ := tiers["Yellow"].(float64); got != 0.45 {
+		t.Fatalf("只发 Red 把上一轮 Yellow=0.45 顶掉（嵌套 map 被整体替换）, got %v", tiers["Yellow"])
+	}
+}
+
+// TestRegimeConfigPersistsToDisk 写入必须落盘：换一个 Manager 读同一份文件要看到新值。
+// 反证形态＝页面改成功、进程重启后引擎吃回旧值（§RestartBeforeVerify 同族）。
+// English: writes must hit disk — a fresh Manager over the same file sees the new values.
+func TestRegimeConfigPersistsToDisk(t *testing.T) {
+	s, admin, cfgPath := newRegimeTestServer(t)
+	body := `{"sizing":{"enabled":true,"sell_boost_level":"L3","breadth_missing_scale":0.7},` +
+		`"enhance":{"market_state_enabled":true}}`
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", body)); rr.Code != 200 {
+		t.Fatalf("写入应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	reloaded := config.NewManager(cfgPath)
+	got := reloaded.GetSizingConfig()
+	if !got.Enabled {
+		t.Fatal("sizing.enabled 未落盘（重启后动态仓位会回退到关）")
+	}
+	if got.SellBoostLevelOf() != "L3" {
+		t.Fatalf("sell_boost_level 未落盘, got %q", got.SellBoostLevelOf())
+	}
+	if got.BreadthMissingScale != 0.7 {
+		t.Fatalf("breadth_missing_scale 未落盘, got %v", got.BreadthMissingScale)
+	}
+	if !reloaded.GetEnhanceConfig().MarketState {
+		t.Fatal("enhance.market_state_enabled 未落盘")
+	}
+	// 落盘的是原始写入值，展示层再补默认——两侧都得对：引擎读的 sizingConfigFor 也走 WithDefaults。
+	if v, ok := got.TierScales["Red"]; !ok || v != 0.30 {
+		t.Fatalf("未显式写过的 Red 应经 WithDefaults 补回 0.30, got %v ok=%v", got.TierScales["Red"], ok)
+	}
+}
+
+// TestRegimeConfigMacroGateRoundTrip macro_gate 走战法配置合并通道，red_block_new_buy 必须
+// 逐键往返，且置信度门槛与硬拦子开关互不影响。
+// English: macro_gate rides the strategy-config merge; red_block_new_buy round-trips per key.
+func TestRegimeConfigMacroGateRoundTrip(t *testing.T) {
+	s, admin, cfgPath := newRegimeTestServer(t)
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"macro_gate":{"red_block_new_buy":true,"yellow_confidence":0.88}}`))
+	if rr.Code != 200 {
+		t.Fatalf("写 macro_gate 应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	_, _, macro := decodeRegime(t, rr.Body.String())
+	if on, _ := macro["red_block_new_buy"].(bool); !on {
+		t.Fatalf("red_block_new_buy 未回显: %v", macro)
+	}
+	if c, _ := macro["yellow_confidence"].(float64); c != 0.88 {
+		t.Fatalf("yellow_confidence 未回显: %v", macro["yellow_confidence"])
+	}
+	// 落盘侧按访问器读：应急阀为 true、Yellow 门槛为 0.88，而 Red 门槛没发过应保持默认 0.92。
+	mg := config.NewManager(cfgPath).GetStrategyConfig().MacroGate
+	if !mg.RedBlockNewBuyOn() {
+		t.Fatal("red_block_new_buy 未落盘，应急阀页面拨了引擎不吃")
+	}
+	if mg.YellowMinConf() != 0.88 {
+		t.Fatalf("Yellow 门槛落盘值错误, got %v", mg.YellowMinConf())
+	}
+	if mg.RedMinConf() != 0.92 {
+		t.Fatalf("未发过的 Red 门槛应保留默认 0.92, got %v", mg.RedMinConf())
+	}
+	// 关掉应急阀：*bool 必须能被显式写回 false（nil 与 false 语义不同，锁死这条）。
+	rr2 := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"macro_gate":{"red_block_new_buy":false}}`))
+	_, _, macro2 := decodeRegime(t, rr2.Body.String())
+	if v, present := macro2["red_block_new_buy"]; present && v != false {
+		t.Fatalf("应急阀显式关失败, got %v", v)
+	}
+	if config.NewManager(cfgPath).GetStrategyConfig().MacroGate.RedBlockNewBuyOn() {
+		t.Fatal("显式写 false 后 RedBlockNewBuyOn 仍为 true（指针未落到 false）")
+	}
+}
+
+// TestRegimeConfigAdminOnly 非管理员访问两端点一律 403——这些开关是系统级资金纪律，
+// 子账号不得自行放宽风险档。
+// English: non-admins get 403 on both endpoints (system-level risk discipline is admin-owned).
+func TestRegimeConfigAdminOnly(t *testing.T) {
+	s, _, _ := newRegimeTestServer(t)
+	member, err := s.auth.CreateUser("member-regime", "pw", auth.RoleUser, nil, 0)
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	if rr := adminDo(s, adminReq(s, member, http.MethodGet, "/api/config/regime", "")); rr.Code != 403 {
+		t.Fatalf("非 admin GET 应 403, got %d", rr.Code)
+	}
+	rr := adminDo(s, adminReq(s, member, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"enabled":true}}`))
+	if rr.Code != 403 {
+		t.Fatalf("非 admin POST 应 403, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 拒绝必须是「什么都没改」，而不是「改了但没告诉调用方」。
+	if s.cfg.GetSizingConfig().Enabled {
+		t.Fatal("被 403 拒绝的写入仍生效（鉴权挡在副作用之后）")
+	}
+}
+
+// TestRegimeConfigBadInput 非法 JSON / 类型不符必须 400，且不得半写。
+// 类型不符尤其关键：mergeStructPatch 靠最后一步反序列化校验，若放行会把 "0.9" 这类字符串
+// 塞进 float64 字段然后静默丢掉。
+// English: malformed JSON and type mismatches return 400 and never half-apply.
+func TestRegimeConfigBadInput(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	before := s.cfg.GetSizingConfig()
+	cases := map[string]string{
+		"非法JSON":      `not-json`,
+		"权重类型不符":      `{"sizing":{"tier_scales":{"Red":"cheap"}}}`,
+		"开关类型不符":      `{"sizing":{"enabled":"yes"}}`,
+		"enhance类型不符": `{"enhance":{"market_state_enabled":123}}`,
+	}
+	for name, body := range cases {
+		rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", body))
+		if rr.Code != 400 {
+			t.Fatalf("[%s] 非法载荷应 400, got %d body=%s", name, rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "error") && rr.Body.String() == "" {
+			t.Fatalf("[%s] 400 未带回原因（前端只会显示一块空白红条）", name)
+		}
+	}
+	after := s.cfg.GetSizingConfig()
+	if after.TierScales["Red"] != before.TierScales["Red"] || after.Enabled != before.Enabled {
+		t.Fatalf("非法请求把配置改动了: before=%v after=%v", before.TierScales, after.TierScales)
+	}
+}
+
+// TestRegimeConfigWriteIsRollbackable 风控开关写入必须有写前快照（可回滚）且落对账。
+// 本批开工时的真实缺陷：/api/config/regime 用了未登记的表面名 "regime"，
+// SnapshotBeforeWrite 直接报「未知配置面」——写照样落库、日志刷一条 [P1] 不可回滚，
+// 而 handler 注释写着"写前经统一配置快照入口留痕"。留痕失败却回 ok，正是本仓反复锤实的
+// 「降级报成功」形态：owner 拨了 Red 应急阀发现拨错，回滚点根本不存在。
+// 另一侧基线 before 也必须取到（与快照同作用域），否则写后字段级 diff 恒空、审计退化成
+// "只证明调用过"。
+// English: regime writes must take a pre-write snapshot against the right ledger. The channel
+// originally used an unregistered surface name, so every risk-switch write succeeded with no
+// rollback point while the handler claimed it was snapshotted.
+func TestRegimeConfigWriteIsRollbackable(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	// 先拨一次让 config.json 存在。原因如实记下：SnapshotRules 是直接读配置文件原文，
+	// 文件还没落地时取不到基线（os.ReadFile 报 no such file），这条对**所有**全局配置面
+	// 一视同仁，属既有边缘行为、非本批引入——现网 config.json 恒存在，故不记成缺陷，
+	// 只在本用例里绕开，免得把「快照语义」这场大改混进风控批。
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"enabled":true}}`)); rr.Code != 200 {
+		t.Fatalf("预置写入应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	tr := s.snapshotConfigWrite(admin.ID, admin.ID, "regime")
+	if tr.err != nil {
+		t.Fatalf("regime 配置面未登记，写入不可回滚: %v", tr.err)
+	}
+	if tr.name == "" {
+		t.Fatal("快照名为空＝这次变更没有回滚点")
+	}
+	// 作用域必须是 global：三段（enhance/sizing/macro_gate）都住全局 config.json。
+	// 翻错账比没账更坏——回滚会把没被改过的文档滚回旧态，真正改动的原封不动。
+	if tr.ledger != "global" {
+		t.Fatalf("regime 落账作用域应为 global（实际三段都写全局 config.json）, got %q", tr.ledger)
+	}
+	// 另一侧基线也得取到（与快照同作用域），否则写后字段级 diff 恒空、审计退化成
+	// "只证明调用过"。
+	if len(tr.before) == 0 {
+		t.Fatal("写前原文基线为空——写后 diff 会恒为「无变更」，审计只剩自证调用")
+	}
+	if !strings.Contains(string(tr.before), "sizing") {
+		t.Fatalf("基线文档不含 sizing 段（取错册）: %.200s", tr.before)
+	}
+}
+
+// TestUnknownConfigSurfaceStillRejected 反向腿：登记表不能被"反正都登记了"撑成放行任意表面名。
+// 未登记表面名必须报错——这条正是上一枚用例赖以发现缺陷的那道闸，摘掉它以后新增野路通道
+// 会静默获得"看起来有留痕"的待遇。
+// English: an unregistered surface must still error — that is the very gate that caught the defect.
+func TestUnknownConfigSurfaceStillRejected(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	tr := s.snapshotConfigWrite(admin.ID, admin.ID, "regime-not-registered")
+	if tr.err == nil {
+		t.Fatal("未登记配置面竟拿到快照（登记表失去意义）")
+	}
+	if !strings.Contains(tr.err.Error(), "未知配置面") {
+		t.Fatalf("报错语义应为未知配置面, got %v", tr.err)
+	}
+}
+
+// TestRegimeConfigEmptyBodyIsNoOp 三段全空（`{}`）必须 200 且逐字不改——
+// 面板在「没改动就点保存」时会发出这种载荷，若它把默认值折叠进载荷就等于覆盖运维配置。
+// English: an empty patch is a no-op (the panel may legitimately submit nothing when unchanged).
+func TestRegimeConfigEmptyBodyIsNoOp(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"tier_scales":{"Red":0.20}}}`)); rr.Code != 200 {
+		t.Fatalf("预置写入应 200, got %d", rr.Code)
+	}
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", `{}`))
+	if rr.Code != 200 {
+		t.Fatalf("空补丁应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	_, sizing, _ := decodeRegime(t, rr.Body.String())
+	tiers, _ := sizing["tier_scales"].(map[string]any)
+	if got, _ := tiers["Red"].(float64); got != 0.20 {
+		t.Fatalf("空补丁动了已存值, got %v", tiers["Red"])
+	}
+}

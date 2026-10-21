@@ -453,6 +453,12 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 		}
 	}
 
+	// §N6-RISK：信号生成层的统一风险闸门——龙头/预期差与策略信号走同一个入口。
+	// 龙头豁免置信度降级（量纲不同，见 applyRiskTier），但 red_block_new_buy=true 时仍会被整笔降级；
+	// 执行层不感知风险档，只消费最终 action。
+	// English: the same signal-layer risk gate as strategy signals. Dragons skip the confidence bar
+	// (different scale) but still obey the emergency new-buy block.
+	signals = a.applyRiskRegime(signals)
 	if len(signals) > 0 {
 		log.Printf("[combat_agent] ScanLimitUp: 池%d 个股%d → %d 增强信号", len(input.LimitUpPool), len(input.IndividualStocks), len(signals))
 	}

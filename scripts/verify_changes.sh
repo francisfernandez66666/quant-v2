@@ -1392,11 +1392,16 @@ go test -count=1 ./internal/combat_agent/ -run 'TestApplyRiskTierYellowBars' 2>&
 grep -q 'if v, ok := eval.Details\["canopen"\]; ok && v == 0 {' internal/strategies/n_shape/n_shape.go || { echo "--- FAIL: canopen 消费腿丢失（§N-RELAX：10点后 60~79 分重新照发买入）"; exit 1; }
 grep -q '10点后未达强分(需80):' internal/strategies/n_shape/n_shape.go || { echo "--- FAIL: 降观察理由分线文案丢失（§N-RELAX 归因面）"; exit 1; }
 grep -q 'N形观察: ' internal/combat_agent/agent.go || { echo "--- FAIL: d1>0 观察信号腿丢失（§N-RELAX 有分不可观察复活）"; exit 1; }
-grep -q 'if isBuy && !isN && s.Confidence < minConf {' internal/combat_agent/risk_tier.go || { echo "--- FAIL: N形 Yellow 置信豁免腿丢失（§N-RELAX 结构死区复活）"; exit 1; }
-# 摘锁反证（go test -overlay 零改源）：把 N 形豁免摘掉恢复旧"恒降级"行为，YellowBars 用例必须红——
+# 锁形口径（§N6-RISK 2026-10-21 修订）：本枚只管 **N 形**豁免。§N-RELAX 落码时该行只有 `!isN`
+# 一项，写死整串等于把「同一处允许多个豁免项」这条语义误钉成死形——今日新增龙头豁免（`!isDragon`）
+# 就把这枚锁顶红了（尺子不合格，不是 N 形豁免丢了）。龙头豁免由 §N6-RISK 段自己的等值锁负责，
+# 一段一职责；这里只允许 N 之后多出豁免项，不许 N 被摘掉。
+grep -qE 'if isBuy && !isN( && [^ ]+)* && s\.Confidence < minConf \{' internal/combat_agent/risk_tier.go || { echo "--- FAIL: N形 Yellow 置信豁免腿丢失（§N-RELAX 结构死区复活）"; exit 1; }
+# 摘锁反证（go test -overlay 零改源）：只摘 `!isN` 这一项（龙头豁免留着），YellowBars 用例必须红——
 # 反证不红＝这枚锁没牙（豁免判据与用例脱钩，改判据时用例先瞎）。
+# 摘法按 token 删而不是整串替换：源码那行的豁免项增减不该让反证变成 sed 空转（空转由下一句 cmp 兜住）。
 R34C=$(mktemp -d)
-sed 's/if isBuy && !isN && s.Confidence < minConf {/if isBuy \&\& s.Confidence < minConf {/' internal/combat_agent/risk_tier.go > "$R34C/risk_tier_mutated.go"
+sed -E 's/if isBuy && !isN &&/if isBuy \&\&/' internal/combat_agent/risk_tier.go > "$R34C/risk_tier_mutated.go"
 if cmp -s internal/combat_agent/risk_tier.go "$R34C/risk_tier_mutated.go"; then echo "--- FAIL: 摘锁反证 sed 未生效（豁免腿字节没变）"; exit 1; fi
 printf '{"Replace": {"%s/internal/combat_agent/risk_tier.go": "%s/risk_tier_mutated.go"}}' "$(pwd)" "$R34C" > "$R34C/overlay.json"
 if go test -count=1 -overlay "$R34C/overlay.json" ./internal/combat_agent/ -run 'TestApplyRiskTierYellowBars' >/dev/null 2>&1; then
@@ -11988,7 +11993,7 @@ CNT115=$((CNT115 + 1))
 [ -f "$LED115" ] || { echo "--- FAIL: §115 台账 $LED115 不在位（核对器读不到它＝整个契约账不存在）"; exit 1; }
 LED_DATA=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$LED115" || true)
 LED_DATA_N=$(printf '%s\n' "$LED_DATA" | grep -c . || true)
-min115 "台账数据行数（现值 186＝R 全集；掉到 180 以下＝有人在没改核对器的情况下删了账）" "$LED_DATA_N" 180
+min115 "台账数据行数（现值 190＝R 全集；掉到 180 以下＝有人在没改核对器的情况下删了账）" "$LED_DATA_N" 180
 CNT115=$((CNT115 + 1))
 _BADCOL=$(printf '%s\n' "$LED_DATA" | awk -F'\t' 'NF!=5 {c++} END{print c+0}' || true)
 [ "${_BADCOL:-0}" = "0" ] || { echo "--- FAIL: §115 有 ${_BADCOL} 行不是恰好 5 列（method/path/class/evidence/note）：列一错位，核对器读到的 class 会是上一条的 note（§表格行劈开同族）"; printf '%s\n' "$LED_DATA" | awk -F'\t' 'NF!=5 {print "  第" NR "行 " NF "列: " $0}' | head -4; exit 1; }
@@ -12025,12 +12030,12 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 188 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-20 新增 /livez /readyz 后 186→188）'
-eqkey115 CALLPATH_DERIVED 150 'C 的规范化路径条数（前端真拨得出去的地址）'
-eqkey115 CALLSITES_DERIVED 153 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账）'
+eqkey115 ROUTES_DERIVED 190 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-21 新增 /api/config/regime 两枚后 188→190）'
+eqkey115 CALLPATH_DERIVED 152 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-21 §N6-RISK 面板两枚 fetchRegimeConfig/setRegimeConfig 进账后 150→152）'
+eqkey115 CALLSITES_DERIVED 155 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-21 同批 153→155）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 188 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
-eqkey115 COVERED_BY_WEB 150 '被前端覆盖的路由条数'
+eqkey115 LEDGER_ROWS 190 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
+eqkey115 COVERED_BY_WEB 152 '被前端覆盖的路由条数（2026-10-21 同批 150→152）'
 eqkey115 UNCALLED 38 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 两条兼容端点后 36→38）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
@@ -12048,6 +12053,15 @@ CNT115=$((CNT115 + 1))
 # 台账格式与核对器读数必须同源：两处各数一遍迟早分家（§0929DRILL「两份判读函数只修一份」同族）。
 CNT115=$((CNT115 + 1))
 [ "$LED_DATA_N" = "$(lget115 LEDGER_ROWS)" ] || { echo "--- FAIL: §115 台账行数两把尺子分家：门禁数到 ${LED_DATA_N}，核对器数到 $(lget115 LEDGER_ROWS)（注释/空行判定不一致＝其中一把会漏行）"; exit 1; }
+# C7 的期望值不许写死条数（2026-10-21 实录：/api/config/regime 两枚新注册把基线 R 抬到 190，
+# 写死 189 的那枚立刻顶红，读起来像锁抓住了破坏，其实是尺子自己过时）。
+# 本枚要断的语义是「R 恰好比基线多一条、台账没跟上」，所以从主仓基线派生 +1。
+R_BASE115=$(lget115 ROUTES_DERIVED)
+L_BASE115=$(lget115 LEDGER_ROWS)
+C_BASE115=$(lget115 CALLPATH_DERIVED)
+U_BASE115=$(lget115 UNCALLED)
+CNT115=$((CNT115 + 1))
+case "$R_BASE115$L_BASE115" in (''|*[!0-9]*) echo "--- FAIL: §115 反证基线 ROUTES/LEDGER_ROWS 读不出数字（=${R_BASE115:-<空>}/${L_BASE115:-<空>}）：C1/C2/C7 的期望值会跟着一起失真"; exit 1;; esac
 SNAP115 2
 
 # ── ③ 镜像：只装核对器真读的那些文件，清单从台账证据列**派生** ──
@@ -12093,8 +12107,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 188 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 188 '镜像基线：台账行数与主仓同值'
+eqkey115 ROUTES_DERIVED 190 '镜像基线：R 与主仓同值'
+eqkey115 LEDGER_ROWS 190 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -12145,12 +12159,12 @@ dys115() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=本枚独有读数
 KLINE_ROW=$(printf '%s\n' "$LED_DATA" | grep -F "$(printf '\t')/api/kline$(printf '\t')" | head -1 || true)
 CNT115=$((CNT115 + 1))
 [ -n "$KLINE_ROW" ] || { echo "--- FAIL: §115 反证靶行取不到（台账里没有带 tab 分隔的 /api/kline 行＝列格式变了，上面那些 awk 尺子也一起失效）"; exit 1; }
-# C1 整行删除：账少一条，R 照旧 186 → 翻的是 LEDGER_ROWS。
-dys115 C1 "$LED115" "$KLINE_ROW" "" LEDGER_ROWS 187 '新增/改名注册没进分类账（台账漏了一条路由）'
+# C1 整行删除：账少一条，R 照旧 → 翻的是 LEDGER_ROWS（期望值从基线派生，不写死条数）。
+dys115 C1 "$LED115" "$KLINE_ROW" "" LEDGER_ROWS "$((L_BASE115 - 1))" '新增/改名注册没进分类账（台账漏了一条路由）'
 # C2 幽灵台账行：行数不变、R 不变，红在「对不上现网注册」那一侧。
 # 取向：不写 printf 拼串的占位写法（拼错一次会静默变成 no-op，而 no-op 的反证看起来像跑过了）。
 KLINE_PATH_GHOST=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')/api/kline$(printf '\t')#$(printf '\t')/api/kline-renamed-x$(printf '\t')#")
-dys115 C2 "$LED115" "$KLINE_ROW" "$KLINE_PATH_GHOST" LEDGER_ROWS 188 '路由已删/改名而台账没跟着改：行数仍 188，红在「对不上现网注册」——所以本枚的独有读数是 LEDGER_ROWS 不变（与 C1 的 187 分得开）'
+dys115 C2 "$LED115" "$KLINE_ROW" "$KLINE_PATH_GHOST" LEDGER_ROWS "$L_BASE115" '路由已删/改名而台账没跟着改：行数仍等值于基线，红在「对不上现网注册」——所以本枚的独有读数是 LEDGER_ROWS 不变（与 C1 的基线−1 分得开）'
 KLINE_CLASS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(printf '\t')internal/server/handlers_fix.go#$(printf '\t\t')internal/server/handlers_fix.go#")
 dys115 C3 "$LED115" "$KLINE_ROW" "$KLINE_CLASS" UNTAGGED 1 '分类标签被清空：空标签＝「没看过」被算成「看过了」（Q2 的等值锁）'
 KLINE_NOBASIS=$(printf '%s' "$KLINE_ROW" | sed "s#$(printf '\t')兼容端点$(printf '\t')internal/server/handlers_fix.go#$(printf '\t')无依据$(printf '\t')internal/server/handlers_fix.go#")
@@ -12163,21 +12177,21 @@ dys115 C5 "$LED115" "$KLINE_ROW" "$KLINE_EVID" BROKEN_EVIDENCE 1 '落点指向�
 # C6 前端把调用点删了而台账没改：翻 LEDGER_LIES（撒谎检测），R 与台账都不动。
 dys115 C6 web/src/api/index.js "  return request('/api/research/library')" "  return [] // §115 C6 反证：调用点被摘掉而台账仍写「前端调用」" LEDGER_LIES 1 '「标签必须被实时派生证实」这条不在 Q1–Q3 里，但没有它，台账可以把每一条都写成前端调用然后绿着'
 # C7 新注册没进账：翻 ROUTES_DERIVED（与 C1 的文案同色、读数不同色——正是本枚要断读数的原因）。
-dys115 C7 internal/server/server.go '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' "$(printf '%s\n' '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' '	s.mux.HandleFunc("GET /api/w115-newprobe", s.authMiddleware(s.handleHealth))')" ROUTES_DERIVED 189 '新加路由没归类：与 C1 的区别是 R 涨了（189）而台账还是 188——只看文案的锁分不开这两枚'
+dys115 C7 internal/server/server.go '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' "$(printf '%s\n' '	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))' '	s.mux.HandleFunc("GET /api/w115-newprobe", s.authMiddleware(s.handleHealth))')" ROUTES_DERIVED "$((R_BASE115 + 1))" "新加路由没归类：与 C1 的区别是 R 涨了（基线 ${R_BASE115} → $((R_BASE115 + 1))）而台账没跟上——只看文案的锁分不开这两枚"
 # C8 幽灵调用（Q3）：前端拨一个服务端没注册的地址，GHOST_CALLS 才现形。
 dys115 C8 web/src/api/index.js "export async function fetchSignals() {" "$(printf '%s\n' 'export async function w115GhostProbe() {' "  return request('/api/w115-ghost-target', { method: 'POST' })" '}' '' 'export async function fetchSignals() {')" GHOST_CALLS 1 '拨未注册地址＝运行期 404：这条比缺 UI 严重，所以单独立数'
 # C9 派生模式失效的「空转正」：把 R 的正则改坏，读回 0 —— ROUTE_FLOOR 必须当场红，
-# 而不是安静地变成「路由只有 0 条、台账 186 条全对不上」那种看起来很有道理的结论。
+# 而不是安静地变成「路由只有 0 条、台账 190 条全对不上」那种看起来很有道理的结论。
 dys115 C9 "$CLC115" 'HandleFunc\("([A-Z]+) ([^"]+)"' 'HandleFuncZZ\("([A-Z]+) ([^"]+)"' ROUTES_DERIVED 0 'Q2 的 |R|<180 即红：解析格式与 Go 侧注册脱节时读出很小的数，比红更危险（它把「一行都没解析到」报成「全都没调用」）'
 # C10 同一枚空转正锁的调用侧：api/index.js 的 request() 形态变了会静默读空。
-dys115 C10 "$CLC115" '(?<!function )\brequest\(' '(?<!function )\brequestZZ\(' CALLSITES_DERIVED 0 'C 侧空转正：调用点派生归零时 153<100 即红，不许把「没解析到」报成「前端零调用」'
+dys115 C10 "$CLC115" '(?<!function )\brequest\(' '(?<!function )\brequestZZ\(' CALLSITES_DERIVED 0 'C 侧空转正：调用点派生归零时 155<100 即红，不许把「没解析到」报成「前端零调用」'
 DYS115_N=$(grep -cE '^dys115 C[0-9]+ ' "$GS115" || true)
 CNT115=$((CNT115 + 1))
 [ "${DYS115_N:-0}" -ge 10 ] || { echo "--- FAIL: §115 反证枚数派生异常（读到 ${DYS115_N:-0}，应≥10）：枚数从调用点派生，写死的收尾文案对下一个新增反证天生失明"; exit 1; }
 SNAP115 4
 
 # ── 覆盖面诚实账（不判红，只把「今天还落在锁外面的东西」如实记下来）──
-echo "INFO - §115 覆盖面账：台账只覆盖 request() 的字面量/三元调用＋人工点名的三条前端直连（登录 fetch / 登出 fetch / SSE EventSource）——web/src 的 *.jsx 里 /api/ 字面量实测 0 处（除 api/index.js 自身），所以「页面绕过 api 层直接拨」这件事现在没有发生，但**没有机器锁拦着它发生**：新增一条页面级 fetch 会走 C9/C10 那两把派生尺子的盲区（它们只读 api/index.js）。三条「运维 curl」的 /api/metrics* 在仓内没有自动拨测（发版链刻意不消费它，§FQ 凭据负锁钉死），这三行登记的是「人工拨」，机器只能核注册在位、核不到有人真拨。台账对查询串不敏感（norm 切掉 ? 之前才算路径），所以 GET 却改状态这类副作用口径不在本段射程，那是 §56 写端点收权普查的事。36 条未调用里 admin 按账号代配 8 条 + 运营账本 2 条 + 租户 2 条属「保留尺寸等页面」，本轮不删任何一条（实装优先禁删除）。"
+echo "INFO - §115 覆盖面账：台账只覆盖 request() 的字面量/三元调用＋人工点名的三条前端直连（登录 fetch / 登出 fetch / SSE EventSource）——web/src 的 *.jsx 里 /api/ 字面量实测 0 处（除 api/index.js 自身），所以「页面绕过 api 层直接拨」这件事现在没有发生，但**没有机器锁拦着它发生**：新增一条页面级 fetch 会走 C9/C10 那两把派生尺子的盲区（它们只读 api/index.js）。三条「运维 curl」的 /api/metrics* 在仓内没有自动拨测（发版链刻意不消费它，§FQ 凭据负锁钉死），这三行登记的是「人工拨」，机器只能核注册在位、核不到有人真拨。台账对查询串不敏感（norm 切掉 ? 之前才算路径），所以 GET 却改状态这类副作用口径不在本段射程，那是 §56 写端点收权普查的事。38 条未调用里 admin 按账号代配 8 条 + 运营账本 2 条 + 租户 2 条属「保留尺寸等页面」，本轮不删任何一条（实装优先禁删除）。"
 
 # ── 分组自证（本段最后两道锁）──
 CNT115=$((CNT115 + 1))
@@ -12192,7 +12206,7 @@ SUMK115=$((K1_N + K2_N + K3_N + K4_N + K5_N))
 CNT115=$((CNT115 + 1))
 [ "$SUMK115" = "$((CNT115 - 1))" ] || { echo "--- FAIL: §115 分组求和自证锁 ${CNT115}（五组快照之和 ${SUMK115} != 累计判定点扣本锁 $((CNT115 - 1))）——有判定点没落进任何一组，收尾的覆盖面读数不可信"; exit 1; }
 rm -rf "$W115"
-echo "ok - §115 全段通过：① 台账形态与证据诚实（含公网 IP/凭据/镜像路径三枚负锁与核对器掏空负锁）${K1_N} 道 + ② 逐键等值（R=188 / C=150 / 未调用=38 / Q2=0 / Q3=0）+ 三枚求和自证 ${K2_N} 道 + ③ 镜像基线自证（派生清单 ${MIRN115} 个文件、逐键与主仓同值）${K3_N} 道 + ④ ${DYS115_N} 枚反证 C1–C${DYS115_N}（每枚断一个本枚独有读数）${K4_N} 道 + ⑤ 覆盖面诚实账与在位锁 ${K5_N} 道，累计判定点 ${CNT115}（其中五组快照之和 ${SUMK115}，另有 1 道就是求和自证锁本身）"
+echo "ok - §115 全段通过：① 台账形态与证据诚实（含公网 IP/凭据/镜像路径三枚负锁与核对器掏空负锁）${K1_N} 道 + ② 逐键等值（R=${R_BASE115} / C=${C_BASE115} / 未调用=${U_BASE115} / Q2=0 / Q3=0）+ 三枚求和自证 ${K2_N} 道 + ③ 镜像基线自证（派生清单 ${MIRN115} 个文件、逐键与主仓同值）${K3_N} 道 + ④ ${DYS115_N} 枚反证 C1–C${DYS115_N}（每枚断一个本枚独有读数）${K4_N} 道 + ⑤ 覆盖面诚实账与在位锁 ${K5_N} 道，累计判定点 ${CNT115}（其中五组快照之和 ${SUMK115}，另有 1 道就是求和自证锁本身）"
 echo ""
 
 echo "==> 116 §SIGBATCH 展示侧补价收形（2026-10-13 现网信号 tab「请求超时」修复批，含二批补齐腿）：五个补价面从「逐票真打上游」改成「快照优先 + 每分片一次批量 + 3s 有界等待 + 批量覆盖不住时有上限逐票补齐」，过程读数同格式上屏——静态锁 + 两组行为腿 + 九枚反证（六枚 overlay 行为＋三枚副本静态）..."
@@ -13873,5 +13887,98 @@ grep -q 'return srv.ExportPaperToResearch(userID, pe)' cmd/quant/main.go || fail
 [ -f internal/engine/registry_dayclose_test.go ] || failn6 "盘后导出回归用例缺失"
 grep -q 'TestExportPaperDailyIfDue' internal/engine/registry_dayclose_test.go || failn6 "盘后导出用例函数名缺失"
 echo "ok - §N6 静态锁通过（兜底入口/接线/成败语义/裸调用负锁/回归用例 7 道）"
+
+echo "==> §N6-RISK 风险/宏观/大盘接入信号生成层（2026-10-21）"
+failrisk() {
+  echo "--- FAIL: §N6-RISK $*"
+  exit 1
+}
+# ① 唯一闸门：所有信号产出点都过 applyRiskRegime（策略 + 龙头/预期差）。
+grep -q 'func (a \*Agent) applyRiskRegime' internal/combat_agent/risk_tier.go || failrisk "统一信号闸门缺失"
+grep -q 'sigs = a.applyRiskRegime(sigs)' internal/combat_agent/agent.go || failrisk "GenerateSignal 未接统一闸门"
+grep -q 'signals = a.applyRiskRegime(signals)' internal/combat_agent/limit_up.go || failrisk "ScanLimitUp（龙头/预期差）未接统一闸门（Red 日龙头会再次绕过风控）"
+# ② 龙头豁免置信度门槛（量纲不同），但应急阀仍可整笔拦截。
+grep -q 'isBuy && !isN && !isDragon && s.Confidence < minConf' internal/combat_agent/risk_tier.go || failrisk "龙头豁免置信度降级缺失（Yellow/Red 日龙头会结构性全灭）"
+grep -q 'isDragon := s.StrategyType == string(strategy.SignalDragon)' internal/combat_agent/risk_tier.go || failrisk "龙头判定未按 StrategyType 归口"
+grep -q '禁止新开仓' internal/combat_agent/risk_tier.go || failrisk "Red 禁新开仓应急阀缺失"
+# ③ Red 不默认硬拦：权重 0.30；只有 red_block_new_buy=true 才硬拦。
+grep -qF 'RedBlockNewBuy *bool `json:"red_block_new_buy,omitempty"`' internal/config/config.go || failrisk "red_block_new_buy 配置缺失"
+grep -q 'func (m MacroGateConfig) RedBlockNewBuyOn' internal/config/config.go || failrisk "red_block_new_buy 访问器缺失"
+grep -q '"Red": 0.30' internal/config/config.go || failrisk "Red 默认金额权重 0.30 缺失"
+grep -q 'r.RiskTier == combat_agent.RiskTierRed && r.RedBlockNewBuy' internal/signalctl/sizing.go || failrisk "sizingHardBlock 仍无条件硬拦 Red"
+# ④ 广度缺失小幅降权 0.90（不整档降级）。
+grep -q 'BreadthMissingScale float64 `json:"breadth_missing_scale"`' internal/config/config.go || failrisk "breadth_missing_scale 配置缺失"
+grep -q 'BreadthMissingScale:     0.90' internal/config/config.go || failrisk "广度缺失默认 0.90 缺失"
+grep -q 'math.IsNaN(up)' internal/signalctl/sizing.go || failrisk "广度 NaN 未走缺失降权"
+# ⑤ Regime 透传应急阀 + 引擎装配。
+grep -q 'RedBlockNewBuy bool `json:"red_block_new_buy,omitempty"`' internal/signalctl/regime.go || failrisk "Regime 未携带 red_block_new_buy"
+grep -q 'RedBlockNewBuy: e.combatAgent != nil && e.combatAgent.RedBlockNewBuyOn()' internal/engine/engine.go || failrisk "引擎未装配 Red 禁新开仓开关"
+# ⑥ 配置端点 + 前端面板。
+grep -q 'GET /api/config/regime' internal/server/server.go || failrisk "GET /api/config/regime 路由缺失"
+grep -q 'POST /api/config/regime' internal/server/server.go || failrisk "POST /api/config/regime 路由缺失"
+grep -q 'export async function fetchRegimeConfig' web/src/api/index.js || failrisk "前端 fetchRegimeConfig 缺失"
+grep -q 'export async function setRegimeConfig' web/src/api/index.js || failrisk "前端 setRegimeConfig 缺失"
+[ -f web/src/components/RegimeConfigPanel.jsx ] || failrisk "风控与仓位面板缺失"
+grep -q '<RegimeConfigPanel />' web/src/pages/Settings.jsx || failrisk "风控面板未挂到设置页"
+# ⑦ 负责任的口径锁：权重/门槛在面板中都可配。
+for k in market_state_enabled sell_boost_level tier_scales breadth_missing_scale red_block_new_buy yellow_confidence red_confidence; do
+  grep -q "$k" web/src/components/RegimeConfigPanel.jsx || failrisk "面板缺配置项 $k"
+done
+# ⑧ 行为腿：龙头豁免/应急阀/Red 权重/广度降权。
+[ -f internal/combat_agent/risk_tier_dragon_test.go ] || failrisk "龙头闸门回归用例缺失"
+[ -f internal/signalctl/sizing_gate_test.go ] || failrisk "Red 权重/广度降权回归用例缺失"
+if ! go test ./internal/combat_agent ./internal/signalctl -run 'Dragon|RedBlock|TierFactor|HardBlockRed|Breadth' -count=1 >/dev/null 2>&1; then
+  failrisk "风险闸门/仓位权重回归测试未通过"
+fi
+# ⑧b 本批两条实锤缺陷的归位锁（都不是"顺手加的测试"，而是曾经**零覆盖**的资金安全面）：
+#   · regime 配置面必须登记——漏登记时 SnapshotBeforeWrite 报「未知配置面」，快照取不到、
+#     每次风控开关写入都留一条 P1 且**不可回滚**，而落库照常成功、页面照报"已保存"
+#     （降级了但报成功那一族）；
+#   · NewManager 不得与进程级出厂默认同指针——别名时第一个实例的配置写会改写出厂表，
+#     同进程后建的 Manager 起点变成"别人刚写的值"（现网表现为重启后默认值漂移）。
+grep -q '"regime": true' internal/config/history.go || failrisk "regime 配置面未登记（该面写入无回滚点）"
+grep -q 'rules: cloneDefaultRules(),' internal/config/config.go || failrisk "NewManager 仍与出厂默认同指针（实例写会改写出厂表）"
+[ -f internal/server/regime_config_api_test.go ] || failrisk "regime 端点读写/回滚回归用例缺失"
+[ -f internal/config/default_rules_no_alias_test.go ] || failrisk "出厂默认别名回归用例缺失"
+[ -f web/src/__tests__/regime_panel_n6.test.jsx ] || failrisk "风控面板行为锁缺失"
+if ! go test ./internal/server -run 'TestRegimeConfig|TestUnknownConfigSurface' -count=1 >/dev/null 2>&1; then
+  failrisk "regime 端点回归测试未通过（回显/稀疏 merge/落盘/回滚位任一丢失）"
+fi
+if ! go test ./internal/config -run 'TestNewManagerDoesNotAlias|TestInstanceWriteKeepsFactoryDefaults' -count=1 >/dev/null 2>&1; then
+  failrisk "出厂默认隔离回归测试未通过"
+fi
+# ⑧c 共用闸职责必须在面板文案点名：block_n_shape/block_momentum 同时被 Red 风险档
+# （applyRiskTier）与交割日事件（applyMacroGate）读——两边都经 macroGateBlockNShape/…Momentum
+# 这一对访问器取值，所以"共用"这件事的可回归证据就是**两个文件各自都在调用它**（锚贴函数体
+# 看过才写：早先按 `grep block_n_shape internal/combat_agent/risk_tier.go` 刻判据是猜的键名，
+# 风险档侧读的是 Go 字段而非 json tag，那枚锁恒红而红得像"锁丢了"）。
+# 标签只写「Red 拦截」＝管理员一次点击关掉两道闸、界面只显示一道（文案锁按等值，不按"有内容"）。
+grep -q 'redBlockN := macroGateBlockNShape(cfg)' internal/combat_agent/risk_tier.go || failrisk "Red 风险档不再读 N 形拦截开关（与下方文案锁需同时改形）"
+grep -q 'blockN := macroGateBlockNShape(cfg)' internal/combat_agent/macro_gate.go || failrisk "交割日事件不再读 N 形拦截开关（键已分家则上方文案锁需同步松形）"
+grep -q '同一开关管两件事' web/src/components/RegimeConfigPanel.jsx || failrisk "N 形/动量共用闸的第二职责（交割日）未在面板点名"
+# ⑨ 移动端（§N6-MOBILE）：顶栏不裁切、宽表横滚、弹窗上限、Dashboard 单列。
+grep -q 't-dialog { max-width: calc(100vw - 32px); }' web/src/styles.css || failrisk "弹窗缺少视口宽度上限"
+grep -q 'max-width: 520px' web/src/styles.css || failrisk "顶栏窄屏规则缺失（≤520 裁掉右侧按钮）"
+grep -q 'max-width: 1200px' web/src/styles.css || failrisk "Dashboard 单列阈值未抬到 1200"
+grep -q 'flexWrap: .wrap.' web/src/pages/Settings.jsx || failrisk "Settings 行不允许换行"
+echo "ok - §N6-RISK 静态锁通过（统一闸门/龙头豁免/Red 权重与应急阀/广度降权/端点与面板/行为腿/配置面登记/共用闸文案/移动端）"
+# 枚数只引派生读数，不写死：写死的件数在"加锁当夜"就过时，而过时的读数仍然全绿——比红更难发现
+#   （§GATE 同族 2026-10-15 教训）。必须用 python 扫：BSD grep 在本仓 UTF-8 语料上对字符类
+#   静默失灵（实测 `grep -cE ''fail[r]isk "''` 整文件 0 命中，而同一串按字面数 38 命中——
+#   拿它当计数分母会得到恒 0 的读数，锁退化成正好那种"看起来验过"的空转）。
+NRISK=$(python3 - <<'PYNRISK' || true
+import io
+p = "scripts/verify_changes.sh"
+lines = io.open(p, encoding="utf-8").read().splitlines()
+start = next(i for i, l in enumerate(lines) if l.startswith('echo "==> §N6-RISK'))
+end = next(i for i, l in enumerate(lines) if l.startswith('echo "ok - §N6-RISK') and i > start)
+tok = "|| fail" + "risk " + chr(34)
+n = sum(1 for l in lines[start:end] if tok in l)
+print(n)
+PYNRISK
+)
+NRISK=${NRISK:-0}
+[ "$NRISK" -ge 30 ] || { echo "--- FAIL: §N6-RISK 判据派生读数异常（=${NRISK}，下界 30＝段被截断或调用形变了；先核实扫描表达式自己，再怀疑锁）"; exit 1; }
+echo "   §N6-RISK 判据派生读数：${NRISK} 道 failrisk 调用（本行不计入，扫描件与判据同源）"
 
 echo "==> 全部通过"

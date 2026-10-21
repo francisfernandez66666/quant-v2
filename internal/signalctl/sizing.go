@@ -89,7 +89,7 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 	mul("节前", holidayFactor(r.Holiday, cfg))
 	mul("大盘跌幅", indexFactor(r.IndexChangePct, cfg))
 	mul("LLM利空", llmFactor(sig, cfg))
-	mul("广度", breadthFactor(r.BreadthUpRatio))
+	mul("广度", breadthFactor(r.BreadthUpRatio, cfg))
 
 	// 3. 上限类：各自 0~1 乘子取 min（不连乘——同一风险不得双罚）。
 	// m 的初值必须是 +Inf 而不是 1.0：上限类只**向下**约束，若初值取 1.0 会把权重类的进攻档
@@ -136,9 +136,12 @@ func sizingHardBlock(r Regime, sig combat_agent.Signal, cfg config.SizingConfig)
 	if r.EmotionPhase == phaseIce {
 		return true, "情绪冰点"
 	}
-	// 风险档 Red：系统性风险，当日拒开新仓（与既有 auto 谨慎层 Red 拒开同向）。
-	if r.RiskTier == combat_agent.RiskTierRed {
-		return true, "风险档Red"
+	// 风险档 Red：默认**不硬拦**，由 tier_scales.Red（默认 0.30）收束仓位 + 信号层置信度门槛；
+	// 只有 red_block_new_buy=true（应急阀）才整笔拒绝。owner 2026-10-21：收束优先，不全拒。
+	// English: Red is not a hard block by default — it scales size via tier_scales.Red and the
+	// confidence gate; only the explicit red_block_new_buy emergency switch rejects outright.
+	if r.RiskTier == combat_agent.RiskTierRed && r.RedBlockNewBuy {
+		return true, "风险档Red禁止新开仓"
 	}
 	// 个股 LLM 利空 且 风险档≥Yellow：个股有负面事件、大盘也在收紧 → 硬拦。
 	if sig.D1Blocked && (r.RiskTier == combat_agent.RiskTierYellow || r.RiskTier == combat_agent.RiskTierRed) {
@@ -324,12 +327,17 @@ func stateFactor(r Regime, cfg config.SizingConfig) float64 {
 	return 0
 }
 
-// tierFactor 风险档金额权重（Red 已走硬拦）。空档=已知中性 1.0。
-// English: risk-tier money weight (Red is a hard block); empty tier = known neutral.
+// tierFactor 风险档金额权重。空档=已知中性 1.0；Red 默认 0.30（可配），不再返回 0——
+// 硬拦只走 sizingHardBlock 且需 red_block_new_buy=true。
+// English: risk-tier money weight. Empty = neutral; Red defaults to 0.30 (configurable), never 0
+// here — hard blocking lives only in sizingHardBlock behind red_block_new_buy.
 func tierFactor(tier string, cfg config.SizingConfig) float64 {
 	switch tier {
 	case combat_agent.RiskTierRed:
-		return 0 // 硬拦（防御）
+		if v, ok := cfg.TierScales[combat_agent.RiskTierRed]; ok && v > 0 {
+			return v
+		}
+		return 0.30
 	case combat_agent.RiskTierYellow:
 		if v, ok := cfg.TierScales["Yellow"]; ok {
 			return v
@@ -467,14 +475,24 @@ func llmFactor(sig combat_agent.Signal, cfg config.SizingConfig) float64 {
 // breadthFactor 市场广度映射（带宽固定 0.30 / 0.50）：<0.30→0.70；0.30~0.50→0.85；否则 1.00。
 // NaN（广度不可得）→ 弃权。
 // English: breadth mapping with fixed bands; NaN → abstain.
-func breadthFactor(up float64) float64 {
-	// up<=0 与 NaN 都按**弃权**：0 既是"全市场下跌"的合法读数，也是 float64 零值（快照未装配/
-	// 主循环尚未跑过）——无法区分，故一律弃权。真正"全市场下跌"的仓位压制由情绪相位（冰点/退潮）
-	// 与大盘跌幅两个因子覆盖，不会漏。
-	// English: up<=0 and NaN both abstain — 0 is both a legal "everything down" reading and the
-	// float64 zero value (snapshot not assembled yet); the genuine all-down case is covered by the
-	// emotion-phase and index-drop factors.
-	if up <= 0 || math.IsNaN(up) {
+func breadthFactor(up float64, cfg config.SizingConfig) float64 {
+	// §N6-RISK（2026-10-21 owner 裁决）：读数**缺失（NaN）**不再弃权，而是按
+	// BreadthMissingScale 做小百分比降权（默认 0.90），数据恢复后自动回到真实广度档。
+	// 只降这一处，不叠加状态档——避免把"数据没到"当成"市场转熊"再罚一次。
+	// English: a missing (NaN) breadth reading applies a small haircut (default 0.90) instead of
+	// abstaining; the real factor returns as soon as the reading does. Applied exactly once.
+	if math.IsNaN(up) {
+		v := cfg.BreadthMissingScale
+		if v <= 0 {
+			v = 0.90
+		}
+		return v
+	}
+	// 0 是 float64 零值（快照未装配）也是"全跌"的合法读数，无法区分——沿用旧口径弃权，
+	// 全跌由情绪相位与大盘跌幅因子覆盖；只有 NaN 才是"取数缺失"，走上面的降权。
+	// English: 0 is ambiguous (zero value vs everything-down) → keep the legacy abstain; only NaN
+	// means "reading missing" and takes the haircut above.
+	if up <= 0 {
 		return 0
 	}
 	switch {

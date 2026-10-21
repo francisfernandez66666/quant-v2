@@ -1420,8 +1420,16 @@ type SizingConfig struct {
 	EmotionScales map[string]float64 `json:"emotion_scales,omitempty"`
 	// StateScales 市场状态映射（键：bull/range/bear；状态机关闭时该因子弃权）。
 	StateScales map[string]float64 `json:"state_scales,omitempty"`
-	// TierScales 风险档金额权重（键：Yellow；Red 走硬拦不进本表）。
+	// TierScales 风险档金额权重（键：Yellow/Red）。Red 默认 0.30（§N6-RISK 2026-10-21 owner 裁决：
+	// 用权重收束而不是一刀切硬拦；只有 red_block_new_buy=true 才在信号层整笔拒绝）。
+	// English: risk-tier money weights (Yellow/Red). Red defaults to 0.30 — the owner prefers
+	// tightening over blanket rejection; full rejection only when red_block_new_buy is on.
 	TierScales map[string]float64 `json:"tier_scales,omitempty"`
+	// BreadthMissingScale 广度读数缺失时的小幅降权乘子（默认 0.90 = 10%，owner 2026-10-21 裁决：
+	// 不按 bull→range→bear 整档下调，只做小百分比因子降权；数据恢复即回到真实广度乘子）。
+	// English: small multiplicative haircut when breadth data is missing (default 0.90 = 10%);
+	// restored to the real breadth factor as soon as the reading returns.
+	BreadthMissingScale float64 `json:"breadth_missing_scale"`
 	// MacroWindowScales 宏观影响期缩放（键：high/medium/low）。
 	MacroWindowScales map[string]float64 `json:"macro_window_scales,omitempty"`
 	// MacroLeadDays 事件前瞻交易日数（默认 5）：事件前 N 个交易日起渐进收仓。
@@ -1481,7 +1489,8 @@ func DefaultSizingConfig() SizingConfig {
 		VolClampHi:              1.5,
 		EmotionScales:           map[string]float64{"退潮": 0.50, "背离": 0.60, "高潮": 0.80, "发酵": 1.00, "启动": 1.00},
 		StateScales:             map[string]float64{"bull": 1.00, "range": 0.70, "bear": 0.40},
-		TierScales:              map[string]float64{"Yellow": 0.60},
+		TierScales:              map[string]float64{"Yellow": 0.60, "Red": 0.30},
+		BreadthMissingScale:     0.90,
 		MacroWindowScales:       map[string]float64{"high": 0.50, "medium": 0.80, "low": 1.00},
 		MacroLeadDays:           5,
 		MacroLeadCurve:          []float64{0.90, 0.85, 0.80, 0.70, 0.50},
@@ -1580,6 +1589,9 @@ func (s SizingConfig) WithDefaults() SizingConfig {
 	}
 	if out.VolClampHi <= 0 {
 		out.VolClampHi = d.VolClampHi
+	}
+	if out.BreadthMissingScale <= 0 {
+		out.BreadthMissingScale = d.BreadthMissingScale
 	}
 	out.EmotionScales = mergeScales(d.EmotionScales, out.EmotionScales)
 	out.StateScales = mergeScales(d.StateScales, out.StateScales)
@@ -1732,6 +1744,14 @@ type MacroGateConfig struct {
 	// English: whether the momentum watch signal is also blocked on delivery days (default true). nil means default true; only an explicit false disables it.
 	// 交割日是否拦截动量观察信号
 	BlockMomentum *bool `json:"block_momentum,omitempty"`
+	// RedBlockNewBuy Red 档是否禁止一切新开仓买入（默认 false：owner 2026-10-21 裁决「更倾向提高
+	// 信号门槛收束，而不是直接全部拒绝」）。true 时 Red 日全部 buy（含龙头/N 形/策略）在**信号生成层**
+	// 降级 watch；执行层不感知该开关，仍只执行信号给出的动作。
+	// English: Red-day new-buy kill switch (default false — the owner prefers raising signal thresholds
+	// over blanket rejection). When true, every buy is degraded to watch at the signal-generation layer;
+	// execution stays dumb and only acts on the final action.
+	// Red 档禁止新开仓
+	RedBlockNewBuy *bool `json:"red_block_new_buy,omitempty"`
 
 	// ── §MARKET_RISK_GATE P3 风险档扩展（全部向后兼容：未配置即取下方默认）──
 
@@ -1856,6 +1876,12 @@ func (m MacroGateConfig) RedMinConf() float64 {
 		return 0.92
 	}
 	return m.RedConfidence
+}
+
+// RedBlockNewBuyOn Red 档是否禁止新开仓（nil 默认 false）。
+// English: Red-day new-buy block (nil defaults to false).
+func (m MacroGateConfig) RedBlockNewBuyOn() bool {
+	return m.RedBlockNewBuy != nil && *m.RedBlockNewBuy
 }
 
 // WeakBreadthUpRatio range 弱势广度阈值（默认 0.40）。
@@ -2119,11 +2145,28 @@ type Manager struct {
 	operatorID string
 }
 
+// cloneDefaultRules 给每个 Manager 一份**独立**的出厂规则实例。
+// §DEFECT-CLONE（2026-10-21 §N6-RISK 测试批锤出）：此前 NewManager 直接把进程级全局
+// `DefaultRules` 指针存进实例，而全部 setter 都是 `m.rules.<段> = next` 这种**字段重绑**
+// （strategy/llm/qmt/scheduler/notify/enhance/sizing 共 10 处）——配置文件不存在时 Load()
+// 会原样保留这个别名指针，于是第一次配置写就把"出厂默认表"本身改掉了：同进程里后建的
+// Manager 会把自己的起点认成"别人刚写的值"，测试串跑时前一条用例写 Red 权重 0.25、后一条
+// 用例读到的"默认"就变成 0.25（单跑各自绿、串跑必红＝跨实例状态泄漏的指纹）。
+// 浅拷贝足够：全仓没有任何就地改写 rules 内层 map/slice 的写法（已核），字段重绑只动
+// 实例自己那份结构体。
+// English: each Manager now owns a private copy of the factory rules. The old code aliased the
+// process-global DefaultRules pointer, so the first write on a fresh install mutated the factory
+// defaults themselves and leaked state into every later manager in the same process.
+func cloneDefaultRules() *Rules {
+	cp := *DefaultRules
+	return &cp
+}
+
 // NewManager 创建配置管理器，加载指定路径的 JSON 配置文件。
 // （NewManager creates a config manager and loads the JSON config from the given path.）
 func NewManager(path string) *Manager {
 	m := &Manager{
-		rules: DefaultRules,
+		rules: cloneDefaultRules(),
 		d1:    &D1Config{},
 		path:  path,
 	}
@@ -2140,7 +2183,7 @@ func NewManager(path string) *Manager {
 // programmatic/test constructor now that the fields are unexported.
 func NewManagerWithRules(rules *Rules) *Manager {
 	if rules == nil {
-		rules = DefaultRules
+		rules = cloneDefaultRules()
 	}
 	d1 := &D1Config{}
 	normalizeD1(d1) // 与 NewManager 同口径：空 D1 补出厂规则集
@@ -2710,6 +2753,86 @@ func (m *Manager) MergeStrategyConfig(patch map[string]json.RawMessage, baseVers
 	m.mu.Unlock()
 	m.Save()
 	return next, nil
+}
+
+// GetEnhanceConfig 返回全局增强开关（rules.enhance）快照。
+// English: returns the global enhance switches (rules.enhance).
+func (m *Manager) GetEnhanceConfig() EnhanceConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rules.Enhance
+}
+
+// GetSizingConfig 返回动态仓位/卖出加权配置（rules.sizing），零值字段按出厂默认补齐——
+// 前端展示必须看到"实际生效值"，而不是配置文件里没写的 0。
+// English: returns rules.sizing with factory defaults filled in, so the UI shows effective values.
+func (m *Manager) GetSizingConfig() SizingConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rules.Sizing.WithDefaults()
+}
+
+// MergeEnhanceConfig 稀疏 merge rules.enhance：只改 patch 中出现的键，未出现=保留旧值。
+// English: sparse-merge writer for rules.enhance (absent keys keep the stored value).
+func (m *Manager) MergeEnhanceConfig(patch map[string]json.RawMessage) (EnhanceConfig, error) {
+	m.mu.Lock()
+	base := m.rules.Enhance
+	var next EnhanceConfig
+	if err := mergeStructPatch(base, patch, &next); err != nil {
+		m.mu.Unlock()
+		return base, err
+	}
+	m.rules.Enhance = next
+	m.mu.Unlock()
+	m.Save()
+	return next, nil
+}
+
+// MergeSizingConfig 稀疏 merge rules.sizing（与 Enhance 同一语义）。落盘保留"只写过的键"，
+// 展示层由 GetSizingConfig 补默认。
+// English: sparse-merge writer for rules.sizing; stored raw, defaults filled on read.
+func (m *Manager) MergeSizingConfig(patch map[string]json.RawMessage) (SizingConfig, error) {
+	m.mu.Lock()
+	base := m.rules.Sizing
+	var next SizingConfig
+	if err := mergeStructPatch(base, patch, &next); err != nil {
+		m.mu.Unlock()
+		return base, err
+	}
+	m.rules.Sizing = next
+	m.mu.Unlock()
+	m.Save()
+	return next, nil
+}
+
+// mergeStructPatch 把 base 序列化成 map 后按 patch 深合并，再反序列化回 out（类型不符即报错）。
+// English: deep-merges patch onto base's JSON map, then decodes back into out (type mismatch errors).
+func mergeStructPatch(base any, patch map[string]json.RawMessage, out any) error {
+	baseMap := map[string]any{}
+	raw, err := json.Marshal(base)
+	if err != nil {
+		return fmt.Errorf("当前配置序列化异常: %w", err)
+	}
+	if err := json.Unmarshal(raw, &baseMap); err != nil {
+		return fmt.Errorf("当前配置解析异常: %w", err)
+	}
+	patchMap := make(map[string]any, len(patch))
+	for k, pr := range patch {
+		var v any
+		if err := json.Unmarshal(pr, &v); err != nil {
+			return fmt.Errorf("字段 %s 不是合法 JSON: %w", k, err)
+		}
+		patchMap[k] = v
+	}
+	deepMergeAny(baseMap, patchMap)
+	merged, err := json.Marshal(baseMap)
+	if err != nil {
+		return fmt.Errorf("合并结果序列化失败: %w", err)
+	}
+	if err := json.Unmarshal(merged, out); err != nil {
+		return fmt.Errorf("配置校验失败: %w", err)
+	}
+	return nil
 }
 
 // deepMergeAny 递归合并 src 进 dst：两侧同为对象→逐键递归；否则 src 整体替换

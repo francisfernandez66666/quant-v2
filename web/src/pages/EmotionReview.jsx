@@ -147,9 +147,12 @@ export default function EmotionReview() {
                 </>
               ) : '悬停柱子看当日明细'}
             </div>
+            {/* §N6-MOBILE：手机屏把 1000 宽 viewBox 压到 ~360px 时轴标签只剩 3~4px 高。
+                改为自适应高 + 最小 720px 宽，窄屏横向滑动看图，标签保持可读。 */}
+            <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
             <svg
               viewBox={`0 0 ${W} ${H}`}
-              style={{ width: '100%', height: 380, display: 'block' }}
+              style={{ width: '100%', minWidth: 720, height: 'auto', display: 'block' }}
               onMouseLeave={() => setHover(null)}
             >
               {/* 左轴网格（涨停家数）：4 条水平参考线 */}
@@ -191,6 +194,7 @@ export default function EmotionReview() {
                 </text>
               ))}
             </svg>
+            </div>
             {/* 图例：相位 → 区间内天数 */}
             <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', marginTop: 10, fontSize: 12 }}>
               {Object.entries(phaseCount).sort((a, b) => b[1] - a[1]).map(([ph, cnt]) => (

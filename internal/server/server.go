@@ -674,6 +674,9 @@ func (s *Server) registerRoutes() {
 	// QMT 实盘配置：运营数据统一归属管理员（系统级共享），仅管理员可读写。
 	// 子账号不拥有/不操作量化交易，后端据此鉴权，前端不自行判定权限。
 	// （QMT config is operator-owned: admin-only read+write; sub-accounts are denied at the API layer.）
+	// §N6-RISK（2026-10-21）：信号生成层两段开关（市场状态机 + 动态仓位/卖出加权）的管理员读写。
+	s.mux.HandleFunc("GET /api/config/regime", s.adminMiddleware(s.handleGetRegimeConfig))
+	s.mux.HandleFunc("POST /api/config/regime", s.adminMiddleware(s.handleSetRegimeConfig))
 	s.mux.HandleFunc("GET /api/config/qmt", s.adminMiddleware(s.handleGetQMTConfig))
 	s.mux.HandleFunc("POST /api/config/qmt", s.adminMiddleware(s.handleSetQMTConfig))
 
@@ -2198,6 +2201,71 @@ func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request)
 	// §0929CFG-HIST：字段级 diff 审计（与实盘配置那条通道同一单入口），target 点名落的是账号账。
 	trace.audit(s)
 	writeJSON(w, 200, map[string]string{"status": "ok", "updated_at": merged.UpdatedAt})
+}
+
+// handleGetRegimeConfig 处理 GET /api/config/regime：市场状态机 + 动态仓位/卖出加权开关快照。
+// 两个配置段都是"信号生成层"的输入：enhance.market_state_enabled 决定大盘状态是否参与风险档，
+// sizing 决定买入缩放与卖出加权；执行层不读这两段。
+// English: returns the signal-layer switches — enhance (market-state machine) and sizing (buy
+// scaling / sell boost). The execution layer never reads them.
+func (s *Server) handleGetRegimeConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"enhance":    s.cfg.GetEnhanceConfig(),
+		"sizing":     s.cfg.GetSizingConfig(),
+		"macro_gate": s.cfg.GetStrategyConfig().MacroGate,
+	})
+}
+
+// handleSetRegimeConfig 处理 POST /api/config/regime：稀疏 merge（body 可只带 enhance 或只带
+// sizing，未出现的键一律保留）。写前经统一配置快照入口留痕。
+// English: sparse-merge writer for the two signal-layer config sections (absent keys keep values);
+// snapshotted through the shared config-write path before persisting.
+func (s *Server) handleSetRegimeConfig(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enhance   map[string]json.RawMessage `json:"enhance"`
+		Sizing    map[string]json.RawMessage `json:"sizing"`
+		MacroGate map[string]json.RawMessage `json:"macro_gate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	trace := s.snapshotConfigWrite(userIDFor(r), userIDFor(r), "regime")
+	if len(body.Enhance) > 0 {
+		if _, err := s.cfg.MergeEnhanceConfig(body.Enhance); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
+	if len(body.Sizing) > 0 {
+		if _, err := s.cfg.MergeSizingConfig(body.Sizing); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
+	// 风险档门槛/硬拦属于 rules.strategy.macro_gate：借战法配置的稀疏 merge 写入（不带版本基线，
+	// 写端已在快照留痕；页面上的乐观锁只覆盖战法参数页那条通道）。
+	if len(body.MacroGate) > 0 {
+		raw, err := json.Marshal(body.MacroGate)
+		if err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		if _, err := s.cfg.MergeStrategyConfig(map[string]json.RawMessage{"macro_gate": raw}, ""); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
+	opslog.Audit("config_regime_merge", userIDFor(r), "regime",
+		fmt.Sprintf("enhance_keys=%d sizing_keys=%d macro_gate_keys=%d %s",
+			len(body.Enhance), len(body.Sizing), len(body.MacroGate), trace.detail()))
+	trace.audit(s)
+	writeJSON(w, 200, map[string]interface{}{
+		"status":     "ok",
+		"enhance":    s.cfg.GetEnhanceConfig(),
+		"sizing":     s.cfg.GetSizingConfig(),
+		"macro_gate": s.cfg.GetStrategyConfig().MacroGate,
+	})
 }
 
 // ── D1 规则配置 ──

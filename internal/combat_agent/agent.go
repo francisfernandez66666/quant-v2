@@ -1323,16 +1323,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	// English: P3 risk-tier gate (generalized applyMacroGate) — the tier computed by the Engine each cycle
 	// tightens long buys (Yellow raises the bar, Red hard-blocks N-shape/momentum); when the master switch
 	// is explicitly off it falls back to the legacy E1 delivery-day behavior.
-	if cfg := a.macroGateConfig(); cfg.RiskGateOn() {
-		a.mu.RLock()
-		tier, tReasons := a.riskTier, a.riskTierReasons
-		a.mu.RUnlock()
-		if tier != RiskTierNone {
-			sigs = applyRiskTier(sigs, tier, cfg, tReasons)
-		}
-	} else if active, mcfg := a.macroGateActive(); active {
-		sigs = applyMacroGate(sigs, true, mcfg)
-	}
+	sigs = a.applyRiskRegime(sigs)
 	// 战法评分日志：code + 各维度分 + 是否命中（FLOW 全流程日志要求）
 	// 附加"未出"原因（diagnostic）：各战法未出信号的具体原因，便于排查非龙头为何不出分/不发声。
 	// English: scoring log — code + each dimension score + hit flag (FLOW requirement), plus a diagnostic

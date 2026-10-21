@@ -46,6 +46,12 @@ func (a *Agent) ComputeAndSetRiskTier(emotionPhase, marketState string, upRatio 
 	return tier, reasons
 }
 
+// RedBlockNewBuyOn 返回 Red 日禁新开仓开关（引擎装配仓位快照时读取；默认 false）。
+// English: exposes the Red new-buy block switch for the sizing regime snapshot (default false).
+func (a *Agent) RedBlockNewBuyOn() bool {
+	return a.macroGateConfig().RedBlockNewBuyOn()
+}
+
 // RiskTier 返回引擎最近下发的风险档 + 触发原因（供做空增强/自动买/持仓预警/F2 读取）。
 // English: returns the latest tier + reasons pushed by the Engine (for short boost / auto-buy / alerts / F2).
 func (a *Agent) RiskTier() (string, []string) {
@@ -201,6 +207,32 @@ func containsCI(s, sub string) bool {
 	return false
 }
 
+// applyRiskRegime 信号生成层的**唯一**风险闸门：策略信号与龙头/预期差信号在产出后都必须经过这里，
+// 执行层（paper/实盘下单）只认最终 action，不做任何风控判断。
+// §N6-RISK（2026-10-21）：此前只有 GenerateSignal 调用风险档，龙头识别走 ScanLimitUp 直接产出
+// buy——现网 Red 日仍有 8 笔 0.70~0.75 置信度的龙头买入绕过风控。新增信号来源必须接本入口。
+// English: the single risk gate at the signal-generation layer. Every signal producer (strategy
+// signals and ScanLimitUp leaders/gaps) must pass through here; the execution layer never judges.
+func (a *Agent) applyRiskRegime(sigs []Signal) []Signal {
+	if len(sigs) == 0 {
+		return sigs
+	}
+	cfg := a.macroGateConfig()
+	if cfg.RiskGateOn() {
+		a.mu.RLock()
+		tier, reasons := a.riskTier, a.riskTierReasons
+		a.mu.RUnlock()
+		if tier != RiskTierNone {
+			return applyRiskTier(sigs, tier, cfg, reasons)
+		}
+		return sigs
+	}
+	if active, mcfg := a.macroGateActive(); active {
+		return applyMacroGate(sigs, true, mcfg)
+	}
+	return sigs
+}
+
 // applyRiskTier 对已生成信号应用分层风险档（§三 作用层1，applyMacroGate 的泛化）：
 //   - Yellow：非 N 形买入信号置信度 < YellowMinConf(默认0.90) → 降级 watch；N 形买入不参与置信降级
 //     （§N-RELAX：置信≈总分/100 到不了 0.90，买入资格由战法层分数闸管——黄金窗 ≥60、10 点后 ≥80）。
@@ -239,11 +271,30 @@ func applyRiskTier(sigs []Signal, tier string, cfg config.MacroGateConfig, reaso
 		}
 		isBuy := s.Action == "buy" || s.Action == "买入"
 		isN := NormalizeStrategyName(s.Strategy) == NormalizeStrategyName(string(strategy.SignalNShape))
+		// §N6-RISK（2026-10-21 owner 裁决）：龙头信号的 confidence=龙头评分/100（现网 0.70~0.75），
+		// 与策略信号的置信度不同量纲；套 0.90/0.92 会让 Yellow/Red 日龙头买入结构性全灭
+		// （§N-RELAX 为 N 形修过的同一类坑）。龙头**豁免置信度降级**，由仓位权重
+		// （Yellow 0.60 / Red 0.30）与 red_block_new_buy 应急阀收束。
+		// English: dragon confidence is score/100 (0.70–0.75 live), a different scale from strategy
+		// signals — applying 0.90/0.92 would structurally wipe out every dragon buy on risk days.
+		// Dragons are exempt from the confidence downgrade; sizing weights and the emergency switch
+		// do the tightening instead.
+		isDragon := s.StrategyType == string(strategy.SignalDragon) ||
+			NormalizeStrategyName(s.Strategy) == NormalizeStrategyName(string(strategy.SignalDragon))
 		// 动量 watch：仅 Red 且开启拦截时剔除（整体利空下不新增观察）；Yellow 保留。
 		if s.Strategy == "动量" && s.Action == "watch" {
 			if eff == RiskTierRed && redBlockMomentum {
 				continue
 			}
+			out = append(out, *s)
+			continue
+		}
+		// Red 禁新开仓（§N6-RISK 2026-10-21 owner 开关，默认 false）：所有买入在**信号生成层**
+		// 降级 watch——含龙头/N 形/策略全路径；执行层只认最终 action，不做二次判断。
+		// English: Red-day new-buy kill switch — every buy degrades to watch at signal generation.
+		if isBuy && eff == RiskTierRed && cfg.RedBlockNewBuyOn() {
+			s.Action = "watch"
+			s.Reason = prefix + "禁止新开仓: " + s.Reason
 			out = append(out, *s)
 			continue
 		}
@@ -264,7 +315,7 @@ func applyRiskTier(sigs []Signal, tier string, cfg config.MacroGateConfig, reaso
 		// English: non-N buys below the confidence bar degrade to watch. §N-RELAX — N-shape buys are
 		// exempt: N confidence ≈ total/100 can structurally never reach 0.90 (a Yellow-day dead zone);
 		// its buy eligibility is owned by the strategy-layer score gates instead. Red hard-block unchanged.
-		if isBuy && !isN && s.Confidence < minConf {
+		if isBuy && !isN && !isDragon && s.Confidence < minConf {
 			s.Action = "watch"
 			s.Reason = prefix + "降级(置信度<" + fmtRate(minConf) + "): " + s.Reason
 		}

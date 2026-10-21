@@ -40,7 +40,11 @@ func TestSizingHardBlocks(t *testing.T) {
 		mut  func(*Regime, *combat_agent.Signal)
 	}{
 		{"情绪冰点", func(r *Regime, _ *combat_agent.Signal) { r.EmotionPhase = "冰点" }},
-		{"风险档Red", func(r *Regime, _ *combat_agent.Signal) { r.RiskTier = combat_agent.RiskTierRed }},
+		// §N6-RISK：Red 默认不硬拦（走 tier_scales.Red=0.30 权重收束），只有应急开关打开才整笔拒绝。
+		{"风险档Red+red_block_new_buy", func(r *Regime, _ *combat_agent.Signal) {
+			r.RiskTier = combat_agent.RiskTierRed
+			r.RedBlockNewBuy = true
+		}},
 		{"个股LLM利空+Yellow", func(r *Regime, s *combat_agent.Signal) {
 			r.RiskTier = combat_agent.RiskTierYellow
 			s.D1Blocked = true
@@ -130,7 +134,8 @@ func TestSizingAbstain(t *testing.T) {
 		{"情绪空串", func(r *Regime, _ *combat_agent.Signal) { r.EmotionPhase = "" }},
 		{"状态空串", func(r *Regime, _ *combat_agent.Signal) { r.MarketState = "" }},
 		{"大盘NaN", func(r *Regime, _ *combat_agent.Signal) { r.IndexChangePct = math.NaN() }},
-		{"广度NaN", func(r *Regime, _ *combat_agent.Signal) { r.BreadthUpRatio = math.NaN() }},
+		// §N6-RISK：广度 NaN 不再弃权，改为 breadth_missing_scale（默认 0.90）小幅降权，
+		// 由 sizing_gate_test.go 的 TestBreadthFactorMissingHaircut 覆盖。
 		{"广度零值", func(r *Regime, _ *combat_agent.Signal) { r.BreadthUpRatio = 0 }},
 		{"日历未加载", func(r *Regime, _ *combat_agent.Signal) {
 			r.Holiday = HolidayWindow{CalendarLoaded: false, ClosedRun: 8, PreHolidayN: 1}

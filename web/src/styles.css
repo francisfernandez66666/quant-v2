@@ -48,7 +48,9 @@ body {
    minmax(0,1fr) 才是结构修法；窄屏切单列，表格自身仍可横向滑动。 */
 .dash-two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
 .dash-two-col > * { min-width: 0; }
-@media (max-width: 768px) {
+/* §N6-MOBILE：单列阈值从 768 抬到 1200——两栏各含 1060px 宽表，1024 iPad/1280 笔记本下
+   半栏根本放不下，整页会横向溢出（审计实测）。 */
+@media (max-width: 1200px) {
   .dash-two-col { grid-template-columns: minmax(0, 1fr); }
 }
 
@@ -92,6 +94,22 @@ body {
   .app-main { overflow: auto; }
   .page { padding: 12px; }
   .app-header { padding: 0 12px; }
+}
+
+/* ====== §N6-MOBILE 全尺寸移动端修复 ======
+   审计结论：宽表只在 ≤768 才有横向滚动容器，769–1325 的平板/笔记本整页横向溢出；
+   弹窗固定 480~900px 无 max-width，窄屏两侧被裁。以下两条与断点无关，全尺寸生效。 */
+.t-table__content { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.t-dialog { max-width: calc(100vw - 32px); }
+.t-dialog__body { overflow-x: auto; }
+
+/* 顶栏 ≤520px：只保留汉堡与右侧操作（做空/通知/主题/退出），状态文字隐藏——
+   不隐藏会需要约 535px，被 .app-shell overflow:hidden 静默裁掉右侧按钮（审计实测 390px 屏裁 145px）。 */
+@media (max-width: 520px) {
+  .app-header { padding: 0 8px; gap: 6px; }
+  .app-header > div:first-child > span { display: none; }
+  .app-header > div:last-child { gap: 6px; }
+  .app-header .t-size-s { padding: 0 8px; }
 }
 
 /* 超宽屏：限制内容最大宽度，避免表格无限拉伸 */
@@ -265,7 +283,8 @@ body { background: var(--app-bg); }
   .page { padding: 10px 8px; }
   /* 触控目标最小高度，手指点按更稳（§F-03 两档：主表单 44px，表格次级 40px）
      TDesign 的 small 按钮类名是 t-size-s（旧版曾按 t-button--size-small 写，选择器没命中）。 */
-  .t-size-s, .t-button--size-small, .t-table__expanded-icon { min-height: 40px; min-width: 40px; }
+  .t-size-s, .t-button--size-small, .t-table__expanded-icon { min-height: 44px; min-width: 44px; }
+  .hamburger, .sidebar-close { width: 44px; height: 44px; }
   /* 主表单控件（登录框/代码输入/筛选下拉）：首屏第一触点按 44px 给足 */
   .t-input__wrap, .t-select, .login-box .t-input__wrap, .login-box button { min-height: 44px; }
   .login-box input { min-height: 44px; }

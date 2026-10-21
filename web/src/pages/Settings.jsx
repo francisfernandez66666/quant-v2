@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom'
 import { Card, Input, InputNumber, Button, Tag, Textarea, Dialog } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
 import D1ConfigPanel from '../components/D1ConfigPanel.jsx' // §P2-H 全局 D1 事件规则面板
+import RegimeConfigPanel from '../components/RegimeConfigPanel.jsx' // §N6-RISK 风控与仓位（信号生成层）
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
@@ -83,7 +84,8 @@ const strategyGroups = [
 // 生成空的战法参数字典（五大战法占位空对象），用于初始化/合并后端配置
 const emptyStrategy = () => ({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} })
 
-const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' } // 设置项行布局
+// §N6-MOBILE：窄屏行内放不下 label+input（约 500px），必须允许换行，否则整页横向滚动。
+const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0', flexWrap: 'wrap' } // 设置项行布局
 const labelStyle = { width: 160, flexShrink: 0, color: 'var(--app-muted-2)', fontSize: 13 } // 设置项标签样式
 
 /**
@@ -765,6 +767,8 @@ export default function Settings() {
           挂载门槛与战法参数同口径（两条 D1 路由都是 adminMiddleware，非管理员拿到 403 只会得到
           一块红条噪声），所以按 api.getRole() 收口而不是让面板去猜。
           English: §P2-H — mount the global D1 panel (admin-only, same gate as the two admin routes). */}
+      {d1Admin && <RegimeConfigPanel />}
+
       {d1Admin && <D1ConfigPanel />}
 
       <Card title="资讯显示" style={{ marginBottom: 16 }}>
