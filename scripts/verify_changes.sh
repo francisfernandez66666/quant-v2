@@ -13849,4 +13849,24 @@ for g in 'web:G1 security headers' 'web:G2 deep-link /dashboard' 'web:G3 assets 
 done
 echo "ok - §20261020 静态锁通过（W1/W2/W3/W4/W5/W6/W8/W9/W11 关键实现均在位）"
 
+echo "==> §N6 盘后导出确定性触发 + 失败可重试（2026-10-21）"
+failn6() {
+  echo "--- FAIL: §N6 $*"
+  exit 1
+}
+# ① 触发点必须独立于盘中打分循环：盘后维护分支按墙上时钟补一次（打分循环 15:00 后即休眠）。
+grep -q 'func (r \*Registry) ExportPaperDailyIfDue' internal/engine/registry.go || failn6 "盘后导出兜底入口缺失"
+grep -q 'registry.ExportPaperDailyIfDue(time.Now())' cmd/quant/main.go || failn6 "main 休市分支未接盘后导出兜底"
+# ② 回调必须带成败语义：失败不推进"今日已导出"日戳，保留下一轮重试。
+grep -q 'dayCloseHook   func(userID string, pe \*paper.Engine) bool' internal/engine/registry.go || failn6 "导出回调未返回成败"
+grep -q 'if hook != nil && !hook(userID, pe)' internal/engine/registry.go || failn6 "checkDayClose 未按回调结果决定是否记账"
+grep -q 'func (s \*Server) ExportPaperToResearch(userID string, pe \*paper.Engine) bool' internal/server/paper.go || failn6 "ExportPaperToResearch 未返回落库成败"
+grep -q 'return srv.ExportPaperToResearch(userID, pe)' cmd/quant/main.go || failn6 "main 注入未透传成败"
+# ③ 负锁：不许退回"调用即当成功"的裸语句形态（旧写法）。
+! grep -q '^[[:space:]]*hook(userID, pe)$' internal/engine/registry.go || failn6 "裸 hook 调用回潮（失败会被记成已导出）"
+# ④ 行为腿在位（四态：盘中不导 / 盘后导 / 失败重试 / 成功当天不重复且次日再导）。
+[ -f internal/engine/registry_dayclose_test.go ] || failn6 "盘后导出回归用例缺失"
+grep -q 'TestExportPaperDailyIfDue' internal/engine/registry_dayclose_test.go || failn6 "盘后导出用例函数名缺失"
+echo "ok - §N6 静态锁通过（兜底入口/接线/成败语义/裸调用负锁/回归用例 7 道）"
+
 echo "==> 全部通过"

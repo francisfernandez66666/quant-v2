@@ -120,8 +120,8 @@ type Registry struct {
 	// 盘后落库：每账号导出日期记录（一天一次）+ 导出回调（main 注入 server.ExportPaperToResearch）。
 	// English: post-close export — per-account last-export date (once a day) + the export callback
 	// (wired by main to server.ExportPaperToResearch).
-	paperExportDay map[string]string                     // userID → 最近盘后导出日期
-	dayCloseHook   func(userID string, pe *paper.Engine) // 盘后导出回调
+	paperExportDay map[string]string                          // userID → 最近盘后导出日期（只在导出成功后推进）
+	dayCloseHook   func(userID string, pe *paper.Engine) bool // 盘后导出回调（返回是否真正落库成功）
 
 	// 战法分仓：全局资金池类型模板（engine.ActivePoolTypes 注入），新老账号模拟盘据此分池，
 	// 每个战法池只扣自己战法的预算（防波动突破垄断）。English: strategy pooling — the global
@@ -538,12 +538,18 @@ func (r *Registry) OpenPositionStrategyCounts() combat_agent.HeldStrategyKeys {
 // English: fires the post-close export hook once per account per day — on the first call after 15:00 on a
 // trading day (exports the day's fills + daily snapshot to the research DB). One export per day per
 // account; store unique keys keep the write idempotent.
+//
+// §N6 修复（2026-10-21）：导出日只在 hook **确认落库成功**后才推进。此前 hook 无返回值，写库失败
+// （典型：15:00 前后研究库被写锁占用）也会被记成"今天导过了"，当天不再重试——现网 paper_daily
+// 从 2026-10-14 起整段缺失即此形态。回调改为返回 bool，失败保持未导出，下一次触发继续重试。
+// English: §N6 — advance the exported-day marker only when the hook reports a real DB write. The hook
+// used to return nothing, so a failed write was recorded as done and never retried that day.
 func (r *Registry) checkDayClose(userID string, pe *paper.Engine, now time.Time) {
 	cn := cntime.In(now) // §TZ1 北京 15 点为界（宿主机 Local 曾致 UTC 主机判定漂移 8 小时）
 	if !data.IsTradingDay(cn) || cn.Hour() < 15 {
 		return
 	}
-	day := now.Format("2006-01-02")
+	day := cn.Format("2006-01-02")
 	r.mu.Lock()
 	last := r.paperExportDay[userID]
 	if last == day {
@@ -554,19 +560,46 @@ func (r *Registry) checkDayClose(userID string, pe *paper.Engine, now time.Time)
 	r.mu.Unlock()
 	// §E7 修复：先执行 hook 成功后再记账——此前先占坑后执行，DB 抖动一次该账号当日
 	// 研究数据即缺失且当天永不重试。导出本身幂等（store 唯一键兜底），重跑安全。
-	if hook != nil {
-		hook(userID, pe)
+	if hook != nil && !hook(userID, pe) {
+		log.Printf("[paper] 盘后导出未落库成功 user=%s day=%s，保留待重试", userID, day)
+		return
 	}
 	r.mu.Lock()
 	r.paperExportDay[userID] = day
 	r.mu.Unlock()
 }
 
+// ExportPaperDailyIfDue 盘后导出兜底：不依赖盘中打分循环，按墙上时钟对全部自动撮合账号
+// 执行一次 checkDayClose（每账号每天最多成功一次，失败自动重试）。
+// §N6 根因：checkDayClose 原本只挂在 dispatchPaperMark 上，而近实时打分循环在
+// IsActiveSession 为假的时刻（15:00 收盘后即如此）整段休眠——收盘后根本走不到导出，
+// paper_daily 只能靠"恰好有盘中 tick 跨过 15:00"这种偶发路径写入。main 在休市分支
+// （每次 ≤15 分钟一轮，且进程启动即刻进入）调用本方法，把导出变成确定性的盘后动作。
+// English: a wall-clock post-close fallback — runs checkDayClose for every auto-paper account without
+// depending on the in-session scoring loop (which hibernates once the session ends at 15:00).
+func (r *Registry) ExportPaperDailyIfDue(now time.Time) {
+	cn := cntime.In(now)
+	if !data.IsTradingDay(cn) || cn.Hour() < 15 {
+		return
+	}
+	for _, e := range r.All() {
+		for _, uid := range r.usersOf(e) {
+			if !r.isAutoPaper(uid) {
+				continue
+			}
+			if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
+				r.checkDayClose(uid, pe, now)
+			}
+		}
+	}
+}
+
 // SetDayCloseExport 注入盘后导出回调（main 接线 server.ExportPaperToResearch：把模拟盘当日成交与
-// 每日快照写入研究库，供自动研究消费）。
+// 每日快照写入研究库，供自动研究消费）。回调返回 true 表示两笔写入都成功——只有成功才记"今日已导出"。
 // English: injects the post-close export callback (main wires server.ExportPaperToResearch, which writes
-// the paper day's fills + daily snapshot into the research DB for auto-research).
-func (r *Registry) SetDayCloseExport(fn func(userID string, pe *paper.Engine)) {
+// the paper day's fills + daily snapshot into the research DB for auto-research). Returning true means
+// both writes landed; only then is the day marked as exported.
+func (r *Registry) SetDayCloseExport(fn func(userID string, pe *paper.Engine) bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dayCloseHook = fn

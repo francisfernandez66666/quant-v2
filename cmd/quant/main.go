@@ -535,8 +535,8 @@ func run() int {
 	// 盘后落库：每个交易日收盘后把模拟盘当日成交 + 每日快照导出研究库，供自动研究消费。
 	// English: post-close export — after each trading-day close, the paper day's fills + daily snapshot
 	// are exported to the research DB for auto-research.
-	registry.SetDayCloseExport(func(userID string, pe *paper.Engine) {
-		srv.ExportPaperToResearch(userID, pe)
+	registry.SetDayCloseExport(func(userID string, pe *paper.Engine) bool {
+		return srv.ExportPaperToResearch(userID, pe)
 	})
 
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程。§UI-AUTHORITATIVE 修复：改走
@@ -714,6 +714,12 @@ func run() int {
 					// against the latest base right away.
 					e.SyncMonitorBase()
 				}
+				// §N6 盘后导出兜底：近实时打分循环在收盘（15:00）后整段休眠，挂在它上面的
+				// checkDayClose 永远等不到 15:00 后的 tick——现网 paper_daily 因此从 2026-10-14
+				// 起整段缺失。这里按墙上时钟补一次（每账号每天成功一次，失败保留待下轮重试）。
+				// English: §N6 — the scoring loop hibernates right at the close, so the day-close export
+				// hooked onto it never ran after 15:00; run it from this wall-clock maintenance branch instead.
+				registry.ExportPaperDailyIfDue(time.Now())
 				// §D-4（GAP_VERIFY_20260917_PM）行情库覆盖断言（每日盘后一次）：
 				// 免费源断供时回测/情绪链会静默吃旧数据——滞后 >1 交易日即 ntfy/webhook 告警 + opslog 留痕。
 				checkDataCoverageOnce(researchDB, notifier)

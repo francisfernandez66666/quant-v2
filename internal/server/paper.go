@@ -252,15 +252,17 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 }
 
 // ExportPaperToResearch 盘后把某账号模拟盘的当日成交与每日快照导出到研究库（供自动研究消费）。
-// 由 main 注入 registry.SetDayCloseExport，注册表每日盘后触发一次；幂等由 store 唯一键保证。
+// 由 main 注入 registry.SetDayCloseExport，注册表每日盘后触发；幂等由 store 唯一键保证。
 // 普通用户（非自动撮合账号）不参与（isAutoPaper 过滤已在上游完成）。
+// 返回值 = 两笔写入是否都真正落库：false 时注册表不记"今日已导出"，下一轮维护分支会重试
+// （§N6：此前无返回值，写库失败也被当成成功，一次抖动就丢一整天数据）。
 // English: exports an account's paper fills + daily snapshot into the research DB after the close
-// (for auto-research). Wired by main into registry.SetDayCloseExport and fired once per day by the
-// registry; idempotency is guaranteed by store unique keys. Normal (non-auto) accounts are filtered
-// upstream.
-func (s *Server) ExportPaperToResearch(userID string, pe *paper.Engine) {
+// (for auto-research). Wired by main into registry.SetDayCloseExport and fired by the registry;
+// idempotency is guaranteed by store unique keys. Returns true only when both writes landed — the
+// registry keeps retrying on failure instead of marking the day done.
+func (s *Server) ExportPaperToResearch(userID string, pe *paper.Engine) bool {
 	if s.researchDB == nil {
-		return
+		return false
 	}
 	// 当日成交 → paper_trades（INSERT OR IGNORE，同一笔不重复入库）
 	// English: the day's fills → paper_trades (INSERT OR IGNORE, never duplicated).
@@ -285,7 +287,7 @@ func (s *Server) ExportPaperToResearch(userID string, pe *paper.Engine) {
 	}
 	if err := s.researchDB.SavePaperTrades(recs); err != nil {
 		log.Printf("[paper] 盘后导出成交失败 user=%s: %v", userID, err)
-		return
+		return false
 	}
 	// 当日快照 → paper_daily（现金/市值/净值/已实现/持仓数）
 	// English: the daily snapshot → paper_daily (cash/market value/equity/realized/positions).
@@ -301,10 +303,11 @@ func (s *Server) ExportPaperToResearch(userID string, pe *paper.Engine) {
 		Positions:   st.OpenPositions,
 	}); err != nil {
 		log.Printf("[paper] 盘后导出快照失败 user=%s: %v", userID, err)
-		return
+		return false
 	}
 	log.Printf("[paper] 盘后导出研究库 user=%s 成交=%d 快照现金=%.2f 净值=%.2f",
 		userID, len(recs), st.Cash, st.TotalValue)
+	return true
 }
 
 // liveQuotes 构造实时行情表：优先 5s 快照，缺失时对指定代码降级单票拉取。
