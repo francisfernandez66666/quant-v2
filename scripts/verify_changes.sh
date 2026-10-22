@@ -12038,7 +12038,7 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 190 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-21 新增 /api/config/regime 两枚后 188→190）'
+eqkey115 ROUTES_DERIVED 191 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 新增概念状态路由后 190→191）'
 eqkey115 CALLPATH_DERIVED 152 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-21 §N6-RISK 面板两枚 fetchRegimeConfig/setRegimeConfig 进账后 150→152）'
 eqkey115 CALLSITES_DERIVED 155 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-21 同批 153→155）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
@@ -12115,7 +12115,7 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 190 '镜像基线：R 与主仓同值'
+eqkey115 ROUTES_DERIVED 191 '镜像基线：R 与主仓同值'
 eqkey115 LEDGER_ROWS 190 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
