@@ -4150,7 +4150,10 @@ lg_entry true > "$LG_TMP/withlib/applied_factors.json"
 # 它和"文件根本没有"是两种成因（no_entries vs file_missing），⑥ 用例正是拿它验证侧名与成因。
 printf '[]\n' > "$LG_TMP/withlib/applied_patterns.json"
 LG_BIN="$LG_TMP/research"
-if ! go build -o "$LG_BIN" ./cmd/research; then
+# 夹具二进制不需要版本戳：VCS stamping 会额外起一个 git 子进程，10-22 整轮里它撞上一次
+# `error obtaining VCS status: exit status 128`（同一条命令单拨两次都 0），把 §95 的六态实证整段挡掉。
+# 前置构建被一次 git 打嗝判红＝把环境算成缺陷，故显式 -buildvcs=false（本段无任何断言读版本戳）。
+if ! go build -buildvcs=false -o "$LG_BIN" ./cmd/research; then
 	echo "--- FAIL: §LIB-GATE 运行时实证的前置构建失败（研究二进制建不出来，下面的六态用例全部没跑）"
 	rm -rf "$LG_TMP"
 	exit 1
@@ -13988,14 +13991,19 @@ fail1022() {
 }
 # ① 精细参数必须真在面板里（键名与 SizingConfig 的 JSON 同名；漏一个＝页面上永远改不到它）。
 #    不锁"面板出现数字"这类形状判据：对照组是下面 ② 的载荷行为腿，静态锁只防键被悄悄删掉。
-for k in kelly_lambda kelly_min_prob vol_target_pct vol_clamp_lo vol_clamp_hi emotion_scales state_scales \
+#    键列表提成变量：收尾那行的件数必须由同一份列表派生（G3：旧文案写死 25 而列表实为 26，
+#    判据照绿、读数撒谎——本仓锤过的「写死件数过时却全绿」形态）。
+FINE_KEYS_1022="kelly_lambda kelly_min_prob vol_target_pct vol_clamp_lo vol_clamp_hi emotion_scales state_scales \
 	macro_window_scales macro_lead_days macro_lead_curve macro_event_day_scale holiday_scales \
 	holiday_block_new index_scale_thresholds llm_bearish_scale max_total_position_pct \
 	max_drawdown_pct stoploss_guard_count stoploss_guard_window_days sl_offset_per_pct \
 	sl_offset_cap tp_offset_per_pct tp_offset_cap sl_offset_min_index_drop bear_sl_tighten_pt \
-	sl_offset_risk_budget_keep; do
+	sl_offset_risk_budget_keep"
+for k in $FINE_KEYS_1022; do
 	grep -q "$k" web/src/components/RegimeConfigPanel.jsx || fail1022 "风控面板缺精细参数 $k"
 done
+FINE_N_1022=$(set -- $FINE_KEYS_1022; echo $#)
+[ "${FINE_N_1022:-0}" -ge 20 ] || fail1022 "精细参数键列表被读空/截短（got=${FINE_N_1022}，下界 20＝列表变量没展开或续行断了，此时上面的 for 一条都没判）"
 grep -q '展开精细参数' web/src/components/RegimeConfigPanel.jsx || fail1022 "精细参数折叠区缺失"
 grep -q 'parseCurve' web/src/components/RegimeConfigPanel.jsx || fail1022 "前瞻曲线解析缺失（自由文本→数组）"
 grep -q '地板须小于上限' web/src/components/RegimeConfigPanel.jsx || fail1022 "合成边界校验缺失（floor<cap 是引擎夹取的前提）"
@@ -14036,7 +14044,7 @@ fi
 ! grep -q 'sigFiltered' web/src/components/LogModal.jsx || fail1022 "旧 sigFiltered 早短路回潮（战法筛选会重新只看当前批次）"
 ! grep -q 'sg.change_pct || 0' web/src/components/LogModal.jsx || fail1022 "历史批次把缺涨跌幅合流成 0（空态被绕开，页面报 +0.00%）"
 ! grep -q 'row.change_pct || 0' web/src/pages/Signals.jsx || fail1022 "信号页把缺涨跌幅合流成 0（缺数≠平盘）"
-echo "ok - §121 静态锁通过（精细参数键 25 枚/缺行情三态/涨跌幅冻结/跨批次筛选/归档读路径/行为腿）"
+echo "ok - §121 静态锁通过（精细参数键 ${FINE_N_1022} 枚，件数派生自本段键列表/缺行情三态/涨跌幅冻结/跨批次筛选/归档读路径/行为腿）"
 
 echo "==> 122 §NTFY-REDACT/§D1-NOON ntfy 主题脱敏 + D1 中午零窗（2026-10-22 遗留项②④收口）..."
 fail122() {
@@ -14104,5 +14112,73 @@ fi
 rm -rf "$R122"
 CNT122=$((CNT122 + 2))
 echo "ok - §122 静态锁与行为腿通过（ntfy 错误脱敏 7 道 + D1 空窗 9 道 + 行为腿 2 组 + 反证 2 枚，累计判定点 ${CNT122}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 123 §HARNESS-TEETH 全链路 UAT 工装收口：字节 UAT 缺陷必须非零退出＋接口告警判据不得白名单化＋golden 读写原子化（2026-10-22 UAT 批）..."
+# 本段只管「测试工装自身的牙」：这一段跑的每一件都是产品代码之外的断言器。
+# 为什么要单独成段——本批三条缺陷（S7 恒 exit 0、接口告警只归档不判红、golden 非原子重写）
+# 全都不改变任何业务行为，却能让整条验收链把红读成绿；这类改动不进门禁就会静默退化。
+fail123() {
+	echo "--- FAIL: §123 $*"
+	exit 1
+}
+CNT123=0
+INDEP123=tools/indep_byte_uat.sh
+SPEC123=web/e2e/uat_full.spec.mjs
+QSR123=web/e2e/quote_sources.mjs
+GTEST123=internal/data/quote_sources_contract_test.go
+PW123=web/playwright.config.mjs
+
+# —— ① S7：字节 UAT 的退出码契约（旧末句 `&& echo || echo` 两分支都返回 echo 的 0）——
+# 判据不是「文件里有 exit 1」——§0 栈未就绪那条也是 exit 1，会把缺陷收口混进去；
+# 这里锁的是「汇总段按 FAIL 分流」这一形态：显式 if + 缺陷侧 exit 1，且旧一行式不回潮。
+grep -q 'if \[ "$FAIL" = "0" \]; then' "$INDEP123" || fail123 "汇总段不再按 FAIL 分流（缺陷数只打印、不影响退出码）"
+EXIT1_123=$(grep -c '^exit 1$' "$INDEP123" || true)
+[ "${EXIT1_123:-0}" = "1" ] || fail123 "缺陷侧 exit 1 计数漂移（got=${EXIT1_123} 期望=1：汇总段那一条；多＝有人另加退出点，少＝收口被删）"
+grep -q '\[ "$FAIL" = "0" \] && echo' "$INDEP123" && fail123 "旧一行式尾巴回潮（FAIL 再高也 exit 0）"
+CNT123=$((CNT123 + 3))
+# —— 陈旧 admin.token 自愈：一次性夹具令牌会随栈重启失效，脚本必须拨活再决定是否重登 ——
+grep -q 'tok_alive' "$INDEP123" || fail123 "token 在位性探针丢失（陈旧令牌直接进矩阵＝整片 401 假缺陷）"
+grep -q 'admin.token 陈旧' "$INDEP123" || fail123 "自愈分支不留痕（排障时看不出走的是重登还是缓存令牌）"
+grep -q '> "$DATA_DIR/admin.token"' "$INDEP123" || fail123 "重登后的新令牌没回写（下次仍拿旧的打）"
+CNT123=$((CNT123 + 3))
+
+# —— ② 接口告警：归档之外必须判红，且白名单恒空（白名单一开就是永久兜死分支）——
+grep -q 'recordApiWarnings(name, errs)' "$SPEC123" || fail123 "告警明细不再落件（判红时只剩一行汇总，无法归因）"
+grep -q 'expect(apiWarningFailureMessage(name, errs)' "$SPEC123" || fail123 "告警只归档不断言（4xx/5xx 全绿通过＝本批最重的空转锁）"
+grep -q '^const API_WARNING_ALLOWLIST = \[\]$' "$SPEC123" || fail123 "接口告警白名单非空或形变（任何一条都在永久豁免一类接口错误）"
+grep -q '接口告警锁自证：合成 500/REQFAIL 必须判红' "$SPEC123" || fail123 "合成反证用例缺失（不注入故障＝抓不到只归档不断言）"
+grep -q '接口告警锁自证：真页面 500 必须让 checkPage 判红' "$SPEC123" || fail123 "交付路径反证缺失（合成函数绿≠checkPage 真的会红）"
+CNT123=$((CNT123 + 5))
+# —— 空态行不是数据行：TDesign 空表也渲染 tbody tr，软兜底会把「表格空」判成「用例通过」 ——
+grep -q ':not(.t-table__empty-row)' "$SPEC123" || fail123 "数据行选择器回退成裸 tr（空态会被计入行数，筛选/排序腿恒真）"
+grep -q 'test.skip(!ALLOW_PROD' web/e2e/cors_browser.spec.mjs || fail123 "现网跨域拨测的显式开关丢失（默认必须跳过，不许悄悄打生产）"
+CNT123=$((CNT123 + 2))
+
+# —— ③ golden 读写：写侧原子替换，读侧只重试 ECANCELED/EAGAIN/EINTR ——
+grep -q 'os.CreateTemp' "$GTEST123" || fail123 "-update 腿又回到就地覆写（并发读者会读到半截文件＝间歇性假红）"
+grep -q 'os.Rename(tmpName, path)' "$GTEST123" || fail123 "原子落盘缺 rename（临时文件留下了，golden 却没换）"
+grep -q 'function readGoldenWithRetry' "$QSR123" || fail123 "读侧重试缺失（ECANCELED 直接判红＝把写者竞态算成产品缺陷）"
+grep -q 'os.WriteFile(path' "$GTEST123" && fail123 "就地覆写 golden 回潮（CreateTemp+Rename 才是契约）"
+CNT123=$((CNT123 + 4))
+# —— 单 worker：多个 spec 文件共打同一套可变服务端配置，跨文件并行会互踩 ——
+grep -q 'workers: 1' "$PW123" || fail123 "Playwright 并行度收回单 worker（跨文件并发改配置＝假红温床）"
+CNT123=$((CNT123 + 1))
+
+# —— ④ 反证：负向腿恒零命中不算锁，必须往「坏形态」那侧塞假目标，证明判据抓得到 ——
+W123=$(mktemp -d "${TMPDIR:-/tmp}/gate123.XXXXXX") || fail123 "反证工作目录建不起来"
+printf '%s\n' 'FAIL=1' '[ "$FAIL" = "0" ] && echo 结论：全部通过 || echo 结论：有缺陷' > "$W123/fake_old_tail.sh"
+printf '%s\n' 'const API_WARNING_ALLOWLIST = ["HTTP418"]' > "$W123/fake_allowlist.mjs"
+printf '%s\n' 'func w() { os.WriteFile(path, b, 0644) }' > "$W123/fake_inline_write.go"
+# 假目标必须各自命中对应判据（命中＝真件上这条判据确实会红）
+grep -q '\[ "$FAIL" = "0" \] && echo' "$W123/fake_old_tail.sh" || fail123 "反证失效：旧尾巴假目标没被抓到（判据对真形也恒绿）"
+grep -q '^const API_WARNING_ALLOWLIST = \[\]$' "$W123/fake_allowlist.mjs" && fail123 "反证失效：白名单假目标仍满足等值判据（＝白名单可以随便加）"
+grep -q 'os.WriteFile(path' "$W123/fake_inline_write.go" || fail123 "反证失效：就地覆写假目标没被抓到"
+# 真件侧同判据反向自证：假目标不得满足正向锁，否则正向锁对两种形态没有区分度
+grep -q 'if \[ "$FAIL" = "0" \]; then' "$W123/fake_old_tail.sh" && fail123 "反证不自洽：旧尾巴假目标也满足正向判据（正向锁无区分度）"
+rm -rf "$W123"
+CNT123=$((CNT123 + 4))
+
+echo "ok - §123 工装牙齿锁通过（S7 退出码 3 道 + 令牌自愈 3 道 + 告警判据 5 道 + 空态/跳过 2 道 + golden 4 道 + 并行度 1 道 + 反证 4 枚，累计判定点 ${CNT123}）"
 
 echo "==> 全部通过"

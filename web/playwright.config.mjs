@@ -13,6 +13,11 @@ const BASE = process.env.E2E_BASE_URL || 'http://localhost:5173'
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: false,
+  // §BYTE-UAT 2026-10-22：整套只对着一个 UAT 栈跑，而用例普遍会改写服务端共享配置
+  // （/api/config/qmt 的预算/帽、战法开关、删除类操作）。fullyParallel:false 只串行化同一文件内，
+  // 文件之间默认仍按 CPU 起多 worker ⇒ 两个文件同时改同一份配置就是互相污染（红项随调度漂移、
+  // 且可能把别人刚改的值读成"通过"）。显式 workers:1，把"绝不并发跑 UAT"从口头纪律变成配置。
+  workers: 1,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [['github'], ['html', { open: 'never' }]] : [['list']],
   use: {

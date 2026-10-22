@@ -332,8 +332,31 @@ func TestQuoteSourcesGolden(t *testing.T) {
 
 	if *updateQuoteGolden {
 		out, _ := json.Marshal(want)
-		if werr := os.WriteFile(path, append(out, '\n'), 0644); werr != nil {
-			t.Fatalf("写 golden 失败: %v", werr)
+		// 原子落盘（§BYTE-UAT 2026-10-22）：web/e2e/quote_sources.mjs 在同一次门禁里读这份
+		// golden，而 os.WriteFile 是「truncate → write」——读腿正好撞在 truncate 与 write 之间
+		// 会拿到 ECANCELED/空文件，把 Playwright 的 L1-1 打成一条与代码无关的假红（实测复现过）。
+		// 同目录临时文件 + os.Rename 才有「要么旧内容、要么新内容」的可见性。
+		tmp, terr := os.CreateTemp(filepath.Dir(path), ".quote_sources.golden-*")
+		if terr != nil {
+			t.Fatalf("建 golden 临时文件失败: %v", terr)
+		}
+		tmpName := tmp.Name()
+		if _, werr := tmp.Write(append(out, '\n')); werr != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+			t.Fatalf("写 golden 临时文件失败: %v", werr)
+		}
+		if cerr := tmp.Close(); cerr != nil {
+			_ = os.Remove(tmpName)
+			t.Fatalf("关闭 golden 临时文件失败: %v", cerr)
+		}
+		if chmodErr := os.Chmod(tmpName, 0644); chmodErr != nil {
+			_ = os.Remove(tmpName)
+			t.Fatalf("golden 临时文件权限设置失败: %v", chmodErr)
+		}
+		if rerr := os.Rename(tmpName, path); rerr != nil {
+			_ = os.Remove(tmpName)
+			t.Fatalf("golden 原子替换失败: %v", rerr)
 		}
 		t.Logf("golden 已按枚举再生产: %v", want)
 		return

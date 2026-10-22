@@ -29,6 +29,17 @@ hc=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/setup"); chk "GET /setup
 echo "########## 1. 获取令牌（独立路径，不读项目测试夹具） ##########"
 ADMIN_TOKEN="$(cat "$DATA_DIR/admin.token" 2>/dev/null)"
 [ -z "$ADMIN_TOKEN" ] && ADMIN_TOKEN=$(curl -s -X POST "$BASE/setup" -H 'Content-Type: application/json' -d '{"username":"admin","password":"Nightly!2026"}' | jget "d['token']")
+# §BYTE-UAT 2026-10-22 假红收口：admin.token 由 uat_bootstrap 起栈时铸一次，引擎之后重启（或
+# JWT exp 到期）就必然失效——脚本读到「文件存在且非空」直接开跑，后面 4 条判据全因 401 变红，
+# 而红项看起来像产品缺陷。现改为「先探活、不活就重新登录并覆写文件」自愈，把陈旧令牌这条
+# 环境产物从判据面上彻底摘掉。探活只拨 /api/status（GET，无副作用）。
+tok_alive() { [ "$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H "Authorization: Bearer $1" "$BASE/api/status")" = "200" ]; }
+if [ -n "$ADMIN_TOKEN" ] && ! tok_alive "$ADMIN_TOKEN"; then
+  echo "  NOTE admin.token 陈旧（/api/status 非 200）→ 走 /api/auth/login 自愈并覆写 $DATA_DIR/admin.token"
+  ADMIN_TOKEN=$(curl -s -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d '{"username":"admin","password":"Nightly!2026"}' | jget "d['token']")
+  [ -n "$ADMIN_TOKEN" ] && printf '%s' "$ADMIN_TOKEN" > "$DATA_DIR/admin.token"
+fi
+[ -n "$ADMIN_TOKEN" ] && ! tok_alive "$ADMIN_TOKEN" && echo "  NOTE 自愈后令牌仍非 200——后续 admin 段判据不可信，请先 ./scripts/uat_bootstrap.sh stop && up"
 rawchk "admin token 取得" "$ADMIN_TOKEN"
 AH="Authorization: Bearer $ADMIN_TOKEN"
 # tester token：走登录端点（authMiddleware）
@@ -88,4 +99,12 @@ if [ -n "$FOUND" ]; then echo "  PASS  FE↔BE 前端 dist 含构建指纹($GH)�
 echo
 echo "########## 汇总 ##########"
 echo "PASS=$PASS  FAIL=$FAIL"
-[ "$FAIL" = "0" ] && echo "结论：独立字节级 UAT 全部通过" || echo "结论：存在未登记缺陷，见上"
+# §S7 退出码收口：旧末句是 `&& echo || echo`，两分支返回值都是 echo 的 0，
+# FAIL 再高脚本也 exit 0 —— 外层调度（CI/夜间链）会把「有缺陷」读成「全绿」。
+# 现按 FAIL 显式分流并 exit 1，缺陷数直接进决策句，不再只靠人看汇总行。
+if [ "$FAIL" = "0" ]; then
+  echo "结论：独立字节级 UAT 全部通过（PASS=$PASS FAIL=0）"
+  exit 0
+fi
+echo "结论：存在 $FAIL 项未登记缺陷（PASS=$PASS FAIL=$FAIL），见上；脚本按缺陷非零退出"
+exit 1

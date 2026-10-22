@@ -9,6 +9,7 @@
 // F-4 撮合配置热开关（保存后引擎实时生效，无需重启）；F-5 风控闸口状态卡渲染（当日命中/开关标签/空占位）。
 // 本批用例普遍采用「先记服务端基线 + finally API 直写还原」模式，防止中途失败污染共享配置。
 import { test, expect } from '@playwright/test'
+import fs from 'node:fs'
 // §M1/§F4（2026-09-22 修复批 K）：quote_source 枚举不再在本文件硬编，改读后端 golden 单源
 // （qmt_gateway/contract/quote_sources.json）；helper 内含「golden 缺失 → 显式失败」口径。
 import { loadQuoteSources } from './quote_sources.mjs'
@@ -22,6 +23,15 @@ import { loadQuoteSources } from './quote_sources.mjs'
 const ADMIN = { u: process.env.E2E_USER, p: process.env.E2E_PASS }
 const USER = { u: process.env.E2E_USER2, p: process.env.E2E_PASS2 }
 const SHOT = 'test-results/uat-pixels'
+// §BYTE-UAT 2026-10-22：接口告警落盘账本。本地 reporter 只有 ['list']，annotation（告警明细）
+// 跑完即失，事后无法回答「这一页当时到底报了什么」——白名单要归因必须先有件。
+// 逐页一个文件而不是共用一份追加日志：spec 文件之间默认多 worker 并发，追加行会互相劈开。
+// 写失败不吞：证据链断在写件这一步就该判红。
+function recordApiWarnings(name, errs) {
+  const dir = `${SHOT}/api-warnings`
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(`${dir}/${name}.txt`, `${new Date().toISOString()} ${name}\n${errs.join('\n') || 'none'}\n`)
+}
 
 test.beforeEach(async () => {
   const missing = []
@@ -65,16 +75,41 @@ function watch(page) {
   return errs
 }
 
-// 打开指定 hash 页面并做渲染体检：断言页面主体可见、等数据稳定（2.5s）、全页截图、
-// 断言无未捕获 JS 异常；返回全部采集错误（含接口告警）供调用方归档到 annotation。
+// 接口告警白名单（当前为空）。条目形如 'HTTP404: /api/xxx' 或 'REQFAIL: /api/xxx'，
+// 按「采集串 startsWith 命中」放行。之所以要显式列出来：任何一条 4xx/5xx/请求失败都必须
+// 先归因（是产品缺陷、还是该页面的设计内分支），归因结论写在这里，而不是让用例静默通过。
+// 空列表 = 「本栈上不允许有任何接口告警」，这是正向锁；下面的反证用例证明它真会判红。
+const API_WARNING_ALLOWLIST = []
+
+// 从采集串里挑出「接口层告警」（HTTP≥400 + 请求失败），不含 console/PAGEERROR。
+// 先过白名单再返回，因此白名单命中项既不进断言也不留采集原样（调用方 annotation 仍存全量 errs）。
+function apiWarningsOf(errs) {
+  const raw = errs.filter((e) => e.startsWith('HTTP') || e.startsWith('REQFAIL'))
+  return raw.filter((e) => !API_WARNING_ALLOWLIST.some((a) => e.startsWith(a)))
+}
+
+// 接口告警判据（纯函数，供用例与自证用例共用）：返回 null = 无白名单外告警；
+// 返回非空字符串 = 失败文案。checkPage 里 `expect(msg).toBeNull()` 即用此判据。
+function apiWarningFailureMessage(name, errs) {
+  const warns = apiWarningsOf(errs)
+  if (!warns.length) return null
+  return name + ' 接口无 4xx/5xx/请求失败（白名单外）: ' + warns.join(' ;; ')
+}
+
+// 打开指定 hash 页面并做渲染体检：断言页面主体可见、等数据稳定（2.5s）、全页截图，
+// 并硬断言两件事——① 无未捕获 JS 异常（PAGEERROR 致命）；② 无接口告警（4xx/5xx/请求失败）。
+// 第②条在 §BYTE-UAT 2026-10-22 前只写 annotation 不断言，实测把「页面悄悄读到 401/500」
+// 洗成 96 条全绿；现收紧成默认全红、白名单逐条点名。返回全部采集串供调用方归档 annotation。
 async function checkPage(page, hash, name) {
   const errs = watch(page)
   await page.goto('/' + hash)
   await expect(page.locator('.app-main .page').first(), name + ' 页面主体渲染').toBeVisible({ timeout: 15000 })
   await page.waitForTimeout(2500) // 等异步数据与渲染稳定
   await page.screenshot({ path: `${SHOT}/${name}.png`, fullPage: true })
+  recordApiWarnings(name, errs) // 判据之前先落件：判红时也要留下当时的明细
   const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
   expect(fatal, name + ' 无未捕获JS错误: ' + fatal.join('|')).toHaveLength(0)
+  expect(apiWarningFailureMessage(name, errs), '接口告警判据见 apiWarningFailureMessage').toBeNull()
   return errs
 }
 
@@ -101,6 +136,41 @@ test.describe('像素级全页面 UAT (admin)', () => {
       test.info().annotations.push({ type: 'api-warnings', description: errs.join(' ;; ') || 'none' })
     })
   }
+
+  // 接口告警锁自证（§BYTE-UAT 2026-10-22 新增，反证腿）：
+  // 判据是新增的，如果它其实从不触发，上面 14 条页面用例会一起变成假绿。
+  // 因此本用例自己往采集串里塞 4xx/5xx/请求失败，断言判据必须变红，
+  // 并断言白噪声（CONSOLE/PAGEERROR）不会被误算成接口告警。
+  test('接口告警锁自证：合成 500/REQFAIL 必须判红', async () => {
+    const hit = apiWarningFailureMessage('synthetic', ['HTTP500: /api/x', 'REQFAIL: /api/y', 'CONSOLE: noise'])
+    expect(hit, '反证①：白名单外的 HTTP500/REQFAIL 必须产出失败文案（返回 null = 锁形同虚设）').toBeTruthy()
+    expect(hit).toContain('HTTP500: /api/x')
+    expect(hit).toContain('REQFAIL: /api/y')
+    expect(hit).not.toContain('CONSOLE')
+    const quiet = apiWarningFailureMessage('synthetic', ['CONSOLE: only-noise', 'PAGEERROR: handled elsewhere'])
+    expect(quiet, '反证②：非接口类采集串不应让接口告警锁变红（否则交付态 14 页必红）').toBeNull()
+    expect(API_WARNING_ALLOWLIST, '白名单当前应为空；任何条目都要先归因再点名，禁止为省事先加条目').toHaveLength(0)
+  })
+
+  // 接口告警锁接线自证（正向腿）：直接走交付态那条 checkPage——在真页面上把
+  // /api/status* 打成 500，断言它必须判红、且红在「接口无 4xx/5xx」这一条判据上。
+  // 这条是整块的核心：只测合成数据不能证明 14 条页面用例真接到了这把锁。
+  test('接口告警锁自证：真页面 500 必须让 checkPage 判红', async ({ page }) => {
+    await page.route('**/api/status*', (r) => r.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'lock-proof 500（本用例故意注入，不代表产品行为）' }),
+    }))
+    let thrown = null
+    try {
+      await checkPage(page, '#/dashboard', 'lockproof-dashboard-500')
+    } catch (e) {
+      thrown = String(e && e.message ? e.message : e)
+    }
+    expect(thrown, '注入 /api/status 500 后 checkPage 必须判红（没判红＝接口告警锁没接到页面上）').toBeTruthy()
+    expect(thrown, '红项须落在接口告警判据上，而不是别的断言顺带拦住: ' + thrown.slice(0, 400)).toContain('接口无 4xx/5xx')
+    await page.unroute('**/api/status*')
+  })
 })
 
 // 交易相关分支：Quant 配置链路、Paper 撮合/战法/交易操作、消息中心与信号页交互
@@ -324,32 +394,114 @@ test.describe('交易相关分支', () => {
 
   // 消息中心筛选覆盖：交易信号/止盈止损/盘后复盘/全部四个 tab + 删除弹窗取消分支
   test('MsgCenter：筛选分支+删除消息', async ({ page }) => {
+    // §BYTE-UAT 2026-10-22 收掉软守卫：原 `if (await del.count()) {...}` = 删除钮一旦被改名/删掉
+    // 本用例仍然全绿（0 断言）。现按「卡片数 ↔ 删除钮数」等值锁 + 取消不删来断。
     await page.goto('/#/msgcenter')
     for (const f of ['交易信号', '止盈止损', '盘后复盘', '全部']) {
       await page.getByRole('button', { name: f, exact: true }).click()
       await page.waitForTimeout(300)
     }
     await page.screenshot({ path: `${SHOT}/branch-msgcenter.png` })
-    const del = page.getByRole('button', { name: '✕' }).first()
-    if (await del.count()) {
-      await del.click()
-      await page.locator('.t-dialog').getByRole('button', { name: '取消' }).click()
+    // 每条消息卡片恰好一个「查看个股详情」代码入口（renderAlertCard headerRow），
+    // 用它当卡片尺子；admin 下每条卡片又恰好一个 ✕，两者必须等值。
+    const cardCount = () => page.locator('[role="button"][title="查看个股详情"]').count()
+    const delCount = () => page.getByRole('button', { name: '✕', exact: true }).count()
+    await expect(async () => {
+      expect(await delCount(), '✕ 删除钮数量应等于消息卡片数量（admin 全量渲染）').toBe(await cardCount())
+    }).toPass({ timeout: 10000 })
+    const cards = await cardCount()
+    if (cards > 0) {
+      await page.getByRole('button', { name: '✕', exact: true }).first().click()
+      const dlg = page.locator('.t-dialog')
+      await expect(dlg, '点删除须先弹确认框').toBeVisible({ timeout: 8000 })
+      await dlg.getByRole('button', { name: '取消' }).click()
+      await expect(dlg).toBeHidden({ timeout: 8000 })
+      await expect(async () => {
+        expect(await cardCount(), '取消分支不得真的删掉消息').toBe(cards)
+      }).toPass({ timeout: 8000 })
+      recordApiWarnings('msgcenter-delete-cancel', ['分支=有消息', '卡片数=' + cards, '取消后卡片数=' + (await cardCount())])
+    } else {
+      await expect(page.getByText('暂无消息').first(), '零消息须显式空态（不是静默无控件）').toBeVisible({ timeout: 8000 })
+      recordApiWarnings('msgcenter-delete-cancel', ['分支=零消息(走空态断言，删除腿未走)', '空态文案=暂无消息'])
+      test.info().annotations.push({ type: 'msgcenter-empty', description: '本栈消息池为空，删除/取消分支未走；空态分支已断言' })
     }
   })
 
   // 信号页三大交互分支：搜索过滤、表头排序、分时图展开/收起
+  // §BYTE-UAT 2026-10-22 收掉软守卫：原实现三条都写成 `if (await locator.count())`——
+  // 控件一旦被删/改名，用例照样 0 断言通过（假绿）。现改为：
+  //   · 搜索框、总分表头是页面常驻件，无条件断言可见后才操作；
+  //   · 分时按钮是行内件，先数真实行数派生期望：有行必须有按钮并走展开/收起，
+  //     无行必须命中「暂无信号」空态（不是"什么都不做"）。
   test('Signals：搜索/排序/分时展开分支', async ({ page }) => {
+    // 先挂响应等待再导航：信号列表 GET /api/signals 到手才算脱离加载态，
+    // 否则会把「首屏还没落地」数成「零信号」（§测试断言自伤形态：固定 sleep 取一次数）。
+    const firstLoad = page.waitForResponse((r) => new URL(r.url()).pathname === '/api/signals', { timeout: 20000 })
     await page.goto('/#/signals')
-    await page.waitForTimeout(1500)
-    const search = page.locator('input[placeholder*="搜索"], input[placeholder*="代码"]').first()
-    if (await search.count()) { await search.fill('600'); await page.waitForTimeout(500); await search.fill('') }
-    const header = page.locator('.t-table th').filter({ hasText: '总分' })
-    if (await header.count()) { await header.first().click(); await page.waitForTimeout(300) }
-    const kf = page.getByRole('button', { name: '分时' }).first()
-    if (await kf.count()) {
-      await kf.click(); await page.waitForTimeout(1200)
+    await firstLoad
+    // 数据行尺子：TDesign 空态/加载态会渲染 tr.t-table__empty-row，不能算成信号行。
+    const dataRows = page.locator('.t-table tbody tr:not(.t-table__empty-row)')
+    const search = page.getByPlaceholder('搜索代码/名称')
+    await expect(search, '信号页搜索框常驻（Signals.jsx Input placeholder=搜索代码/名称）').toBeVisible()
+    const totalHeader = page.locator('.t-table th').filter({ hasText: '总分' })
+    await expect(totalHeader.first(), '信号表总分表头常驻（列定义 colKey=total_score）').toBeVisible()
+
+    await search.fill('')
+    const rowCount = await dataRows.count()
+
+    await search.fill('600')
+    await expect(async () => {
+      const filtered = await dataRows.count()
+      expect(filtered, '按 600 过滤后行数应 ≤ 全量行数（搜索确有作用）').toBeLessThanOrEqual(rowCount)
+    }).toPass({ timeout: 8000 })
+    await search.fill('')
+    await expect(async () => {
+      expect(await dataRows.count(), '清空搜索后行数回到基线').toBe(rowCount)
+    }).toPass({ timeout: 8000 })
+
+    await totalHeader.first().click()
+    // 排序真效果：按表头里「总分」的列位取该列文本，点表头后非空数值必须单调（升或降）。
+    // 原实现只点不等，等于没测——列被删、sorter 丢失都照样绿。
+    const thTexts = await page.locator('.t-table th').allTextContents()
+    const scoreIdx = thTexts.findIndex((t) => t.includes('总分'))
+    expect(scoreIdx, '总分列位在表头里可定位').toBeGreaterThanOrEqual(0)
+    const scoreVals = []
+    for (let i = 0; i < rowCount; i++) {
+      const txt = ((await dataRows.nth(i).locator('td').nth(scoreIdx).textContent().catch(() => '')) || '').trim()
+      const n = Number(txt)
+      if (txt !== '' && !Number.isNaN(n)) scoreVals.push(n)
+    }
+    if (scoreVals.length >= 2) {
+      const asc = scoreVals.every((v, i) => i === 0 || scoreVals[i - 1] <= v)
+      const desc = scoreVals.every((v, i) => i === 0 || scoreVals[i - 1] >= v)
+      expect(asc || desc, '点总分表头后该列必须呈单调序（读到：' + scoreVals.join(',') + '）').toBeTruthy()
+    }
+    // 读数落件：本地 reporter 只有 ['list']，annotation 跑完即失；把这一步的真实读数写成文件，
+    // 事后才能回答「排序腿当时到底有没有走到、读到的是哪一列的值」。
+    recordApiWarnings('signals-sort', [
+      'rowCount=' + rowCount,
+      'scoreIdx=' + scoreIdx,
+      'scoreVals=' + scoreVals.join(','),
+      '可验证腿=' + (scoreVals.length >= 2 ? '单调序断言已走' : '数值<2，未走（池太小）'),
+    ])
+    if (scoreVals.length < 2) {
+      test.info().annotations.push({ type: 'signals-sort-unverifiable', description: '总分列可解析数值 <2，排序腿无法验证（rowCount=' + rowCount + '）' })
+    }
+
+    const klineBtn = page.getByRole('button', { name: '分时', exact: true }).first()
+    if (rowCount > 0) {
+      await expect(klineBtn, `有 ${rowCount} 行信号就必须有可点的分时按钮（kline 列 render）`).toBeVisible()
+      await klineBtn.click()
+      await expect(page.getByRole('button', { name: '收起', exact: true }).first(), '展开后按钮应切成收起').toBeVisible({ timeout: 8000 })
       await page.screenshot({ path: `${SHOT}/branch-signals-kline.png`, fullPage: true })
-      await page.getByRole('button', { name: '收起' }).first().click()
+      await page.getByRole('button', { name: '收起', exact: true }).first().click()
+      await expect(klineBtn, '收起后回到分时态').toBeVisible()
+      recordApiWarnings('signals-kline', ['分支=有行(展开/收起双腿已走)', 'rowCount=' + rowCount])
+    } else {
+      await expect(page.locator('.t-table__empty').first(), '零信号时表格必须显式空态「暂无信号」（不是静默无控件）')
+        .toContainText('暂无信号', { timeout: 8000 })
+      recordApiWarnings('signals-kline', ['分支=零行(走空态断言，分时展开腿未走)', '空态文案=暂无信号'])
+      test.info().annotations.push({ type: 'signals-empty-pool', description: '本栈信号池为空，分时展开分支未走；空态分支已断言' })
     }
   })
 })

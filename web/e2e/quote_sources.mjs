@@ -50,6 +50,32 @@ function collectStrings(raw) {
 }
 
 /**
+ * 读 golden 文本，对「瞬时可恢复」的读错误做一次有界重试。
+ * §BYTE-UAT 2026-10-22：L1-1 曾以 `ECANCELED: operation canceled, read` 红过一次——
+ * 同一轮门禁里 Go 侧 `-update` 正在重写这份 golden。写侧已改成临时文件 + rename 原子替换，
+ * 读侧再兜一层：ECANCELED/EAGAIN/EINTR 三种瞬时码重试 3 次（50ms 同步退避），
+ * 其余错误（真·文件缺失/JSON 非法）保持立即抛错，不把它洗成"再试一次也许就绿"。
+ * @param {string} file
+ * @returns {string} 文件文本
+ */
+function readGoldenWithRetry(file) {
+  const transient = new Set(['ECANCELED', 'EAGAIN', 'EINTR'])
+  let lastErr = null
+  for (let i = 0; i < 3; i++) {
+    try {
+      return fs.readFileSync(file, 'utf8')
+    } catch (e) {
+      lastErr = e
+      if (!transient.has(e && e.code)) break
+    }
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50)
+    } catch (_) { /* 退避失败不影响重试语义 */ }
+  }
+  throw lastErr
+}
+
+/**
  * 读取 quote_source golden。
  * @returns {{file:string, sources:string[], matchedBy:string, text:string}}
  * @throws {Error} 文件缺失 / JSON 非法 / 解析不出任何枚举时抛错（错误信息即失败文案）
@@ -66,7 +92,7 @@ export function loadQuoteSources() {
   }
   let raw
   try {
-    raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    raw = JSON.parse(readGoldenWithRetry(file))
   } catch (e) {
     throw new Error('§M1/§F4 quote_source golden 解析失败：' + file + ' → ' + (e && e.message ? e.message : e))
   }
