@@ -154,7 +154,11 @@ CONTRACT_CONSUMED_FIELDS = {
     "signal_id", "code", "side", "price_type", "price", "qty",
     "amount", "created_at", "strategy_type", "strategy",
 }
-CONTRACT_IGNORED_FIELDS = {"name", "strategy_id", "staleness_ms", "prev_close", "current_price"}
+CONTRACT_IGNORED_FIELDS = {
+    "name", "strategy_id", "staleness_ms", "prev_close", "current_price",
+    # §C2：VWAP 与回踩超时是 Seoul 侧执行/研究字段，网关不消费但必须显式声明（三点契约）。
+    "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec",
+}
 
 # §SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）下单方向白名单：网关接单的唯一合法取值集。
 # 与 Go internal/trading 的 SideBuy/SideSell、桥侧 BUY/SELL（\\u 转义）以及 handler 的方向

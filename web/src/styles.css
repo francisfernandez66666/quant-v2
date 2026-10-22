@@ -287,5 +287,7 @@ body { background: var(--app-bg); }
   .hamburger, .sidebar-close { width: 44px; height: 44px; }
   /* 主表单控件（登录框/代码输入/筛选下拉）：首屏第一触点按 44px 给足 */
   .t-input__wrap, .t-select, .login-box .t-input__wrap, .login-box button { min-height: 44px; }
-  .login-box input { min-height: 44px; }
+  /* TDesign 的 .t-input 自带 height:32px，只有 min-height 会被它压回 32——登录首触点必须给足 44px。
+     §A13：线上 UAT 实测真实可点层 tap=32，低于 40px 下限；这里同时钉 height/min-height。 */
+  .login-box .t-input, .login-box input { height: 44px; min-height: 44px; }
 }
