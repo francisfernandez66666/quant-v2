@@ -167,6 +167,8 @@ func kvHistoryPrefix(key string) string {
 		return "d1"
 	case perUserLongShortKey:
 		return "longshort"
+	case perUserSizingKey:
+		return "sizing"
 	default:
 		// 未知键：消毒后原样作前缀，绝不落到裸 ts 名（裸 ts 名与主配置快照撞车）。
 		return "key_" + sanitizeHistorySegment(key)
@@ -183,6 +185,8 @@ func accountKeyFromHistoryPrefix(name string) (string, bool) {
 		return perUserD1Key, true
 	case strings.HasPrefix(name, "longshort_"):
 		return perUserLongShortKey, true
+	case strings.HasPrefix(name, "sizing_"):
+		return perUserSizingKey, true
 	default:
 		return "", false
 	}
@@ -239,6 +243,15 @@ func (m *Manager) effectiveAccountValue(userID, key string) ([]byte, error) {
 		b, err := json.Marshal(m.GetLongShortConfigFor(userID))
 		if err != nil {
 			return nil, fmt.Errorf("账号 %s 多空开关序列化失败: %w", userID, err)
+		}
+		return b, nil
+	case perUserSizingKey:
+		// §A0：快照底片取**原始** effective sizing（专用键 → 账号旧值 → 全局），不补默认；
+		// 补默认会把“未配置”物化成显式默认值，回滚时反而冻结该账号。
+		sc, _, _ := m.sizingBaseRaw(userID)
+		b, err := json.Marshal(sc)
+		if err != nil {
+			return nil, fmt.Errorf("账号 %s sizing 序列化失败: %w", userID, err)
 		}
 		return b, nil
 	}
@@ -563,16 +576,16 @@ func AuditAccountWrite(m *Manager, actor, userID, key string, before []byte) {
 var configSurfaces = map[string]bool{
 	"d1": true, "strategy": true, "llm": true, "longshort": true,
 	"scheduler": true, "qmt": true, "paper": true, "global": true,
-	// §N6-RISK（2026-10-21）/api/config/regime 表面名。该通道写的是
-	// rules.enhance / rules.sizing / rules.strategy.macro_gate 三段，全部住在**全局
-	// config.json** 里（MergeEnhanceConfig/MergeSizingConfig 直接重绑 m.rules 字段后 Save，
-	// macro_gate 借 MergeStrategyConfig(patch,"") 同写全局），所以它归 default 组（target="global"）。
+	// §N6-RISK（2026-10-21）/api/config/regime 表面名：enhance / macro_gate 仍写全局
+	// config.json，归 default 组（target="global"）。
+	// §A0（2026-10-22）：sizing 改为账号专用键 quant_config_sizing_v1，不能再借这张全局快照，
+	// 否则账号级写入没有真正的回滚点。新增 "regime_sizing" 单独归账号账。
 	// 漏登记的后果实测过：SnapshotBeforeWrite 报「未知配置面」，写照样落库、但每次风控开关
 	// 变更都留不下回滚点，并在日志里刷一条 P1——正是本表注释警告的"无快照写入"形态。
-	// English: the /api/config/regime surface. Its three sections all live in the global
-	// config.json, so it belongs to the default (global) group; omitting it made every
-	// risk-switch write untracked and un-rollbackable.
-	"regime": true,
+	// English: the regime surface keeps the global enhance/macro_gate ledger; since §A0 the sizing
+	// leg lives in its own account key and therefore has a dedicated "regime_sizing" surface.
+	"regime":        true,
+	"regime_sizing": true,
 }
 
 // resolveWriteScope 判定"这次写入替换的是哪本文档"，返回 (账号, KV 键, 目标描述)。
@@ -613,6 +626,12 @@ func (m *Manager) resolveWriteScope(userID, surface string) (oid string, key str
 			return oid, "", "global"
 		}
 		return oid, perUserKey, "account:rules"
+	case "regime_sizing":
+		// §A0：账号级 sizing 专用键；无 store / 无账号时与旧行为一致回退全局文件。
+		if m.store == nil || oid == "" {
+			return oid, "", "global"
+		}
+		return oid, perUserSizingKey, "account:sizing"
 	default: // scheduler / global
 		return oid, "", "global"
 	}

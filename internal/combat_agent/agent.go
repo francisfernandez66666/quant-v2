@@ -1268,6 +1268,8 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		}
 		// 生成时刻冻结涨跌幅/昨收（信号日志历史批次复盘的动量读数）。
 		freezeMarketQuote(&outSig, md)
+		// §C4 技术过滤输入：同一份日 K 上算 KDJ/长均线（临时字段，不广播）。
+		applyTechInputs(&outSig, md.KLines)
 		sigs = append(sigs, outSig)
 	}
 	// 动量分已在循环前计算并写入下方 sc（保持 8a/8b 打分量输出一致）
@@ -1991,6 +1993,7 @@ func (a *Agent) evalShort(input *ScanInput, runners []StrategyRunner, code strin
 		}
 		// 做空腿同样冻结行情：做多/做空两路在日志里的读数维度必须一致。
 		freezeMarketQuote(&shSig, md)
+		applyTechInputs(&shSig, md.KLines)
 		sigs = append(sigs, shSig)
 	}
 	if len(sigs) > 0 {

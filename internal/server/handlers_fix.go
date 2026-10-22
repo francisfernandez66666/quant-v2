@@ -928,13 +928,19 @@ func (s *Server) handleSectorHotRecords(w http.ResponseWriter, r *http.Request) 
 // fixHolding 前端持仓格式的结构体。
 // 包含持仓数量、成本价、现价、盈亏比例、止盈止损价等字段。
 type fixHolding struct {
-	Code          string       `json:"code"`            // 股票代码
-	Name          string       `json:"name"`            // 股票名称
-	Quantity      float64      `json:"quantity"`        // 持仓数量
-	CostPrice     float64      `json:"cost_price"`      // 持仓成本价
-	CurPrice      float64      `json:"cur_price"`       // 最新现价
-	ChangePct     float64      `json:"change_pct"`      // 当日涨跌幅（%）
-	PnlPct        float64      `json:"pnl_pct"`         // 持仓盈亏比例（%）
+	Code      string  `json:"code"`       // 股票代码
+	Name      string  `json:"name"`       // 股票名称
+	Quantity  float64 `json:"quantity"`   // 持仓数量
+	CostPrice float64 `json:"cost_price"` // 持仓成本价
+	CurPrice  float64 `json:"cur_price"`  // 最新现价（兼容旧前端；来源见 price_kind）
+	ChangePct float64 `json:"change_pct"` // 当日涨跌幅（%）
+	PnlPct    float64 `json:"pnl_pct"`    // 持仓盈亏比例（%）
+	// §C7 行情来源契约：live=真实现价 / cost=回退成本 / none=无价格。
+	// quote_ok 表示是否有可用实时行情；change_ok/pnl_ok 分别表示涨跌幅/盈亏是否为有效读数。
+	PriceKind     string       `json:"price_kind"`
+	QuoteOK       bool         `json:"quote_ok"`
+	ChangeOK      bool         `json:"change_ok"`
+	PnlOK         bool         `json:"pnl_ok"`
 	TakeProfitPct float64      `json:"take_profit_pct"` // 止盈百分比设置
 	StopLossPct   float64      `json:"stop_loss_pct"`   // 止损百分比设置
 	SignalActive  bool         `json:"signal_active"`   // 是否有活跃信号
@@ -1088,25 +1094,42 @@ func (s *Server) handleFixSetBalance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"status": "ok", "available_balance": r2(acc.AvailableCash)})
 }
 
+// holdingSource §C7 持仓价格来源三态：有有效行情=live；无行情但成本>0=cost（不是现价）；
+// 两者都没有=none。pnl_ok 仅在 live 且成本可算时为 true。
+// English: §C7 holding price source — live / cost fallback / none; pnl_ok only when live and a
+// cost basis exists.
+func holdingSource(info *data.StockInfo, entry float64) (cur, chg float64, kind string, quoteOK, changeOK, pnlOK bool) {
+	if info != nil && info.Price > 0 {
+		return info.Price, info.ChangePct, "live", true, true, entry > 0
+	}
+	if entry > 0 {
+		return entry, 0, "cost", false, false, false
+	}
+	return 0, 0, "none", false, false, false
+}
+
 // buildHolding 将一条持仓执行日志组装为前端 fixHolding 格式：
 // 实时拉取股价计算盈亏与当日涨跌，关联聚合器的评分/活跃信号，附上加仓批次明细。
 func (s *Server) buildHolding(l report.ExecLog, userID string) fixHolding {
-	cur := l.EntryPrice
-	chg := 0.0
 	pnl := 0.0
 	name := l.Name
-	// 实时拉取股价；失败时回退到开仓价（盈亏视为 0）
-	if info, err := s.quote(l.Code); err == nil {
-		cur = info.Price
-		chg = info.ChangePct
-		name = info.Name
+	// 实时拉取股价；失败时回退到开仓价（盈亏视为 0），但必须标 cost，不能再冒充现价。
+	var info *data.StockInfo
+	if q, err := s.quote(l.Code); err == nil && q != nil && q.Price > 0 {
+		info = q
+	}
+	cur, chg, kind, quoteOK, changeOK, pnlOK := holdingSource(info, l.EntryPrice)
+	if info != nil {
+		if info.Name != "" {
+			name = info.Name
+		}
 		// 顺带回填仓库里的旧名/空名，提升消息与展示一致性
 		if name != "" && name != l.Name {
 			s.rpt.Update(l.SignalID, func(x *report.ExecLog) { x.Name = name })
 		}
 	}
-	// 盈亏比例 = (现价 - 成本价) / 成本价 * 100
-	if cur > 0 && l.EntryPrice > 0 {
+	// 盈亏比例 = (现价 - 成本价) / 成本价 * 100；只有 live 且成本可得时才是有效读数。
+	if pnlOK {
 		pnl = (cur - l.EntryPrice) / l.EntryPrice * 100
 	}
 	qty := l.Quantity
@@ -1121,6 +1144,10 @@ func (s *Server) buildHolding(l report.ExecLog, userID string) fixHolding {
 		CurPrice:      r2(cur),
 		ChangePct:     r2(chg),
 		PnlPct:        r2(pnl),
+		PriceKind:     kind,
+		QuoteOK:       quoteOK,
+		ChangeOK:      changeOK,
+		PnlOK:         pnlOK,
 		TakeProfitPct: r2(l.TakeProfitPct),
 		StopLossPct:   r2(l.StopLossPct),
 		TakeProfit:    r2(l.EntryPrice * (1 + l.TakeProfitPct/100)),
@@ -1989,6 +2016,19 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+// quoteSource §C7 把「行情 + 触发价」折叠成前端可判的来源契约。
+// live=有效实时价；trigger=只有信号触发价（不是现价）；none=两者都没有。
+// English: §C7 folds (quote, trigger price) into the four-state contract the UI renders by.
+func quoteSource(info *data.StockInfo, trigger float64) (price, chg float64, kind string, quoteOK, changeOK bool) {
+	if info != nil && info.Price > 0 {
+		return info.Price, info.ChangePct, "live", true, true
+	}
+	if trigger > 0 {
+		return trigger, 0, "trigger", false, false
+	}
+	return 0, 0, "none", false, false
+}
+
 // handleFixHotSnapshot 处理 GET /api/snapshot/hot 请求，返回当前有信号的个股实时快照。
 // 从 FinalSignals 中提取个股信息并拉取实时行情，去重后返回。
 func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -2013,17 +2053,19 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 		}
 		seen[sig.Code] = true
 		info := quotes[sig.Code]
-		price := sig.Price
-		chg := 0.0
-		if info != nil {
-			price = info.Price
-			chg = info.ChangePct
-		}
+		// §C7（2026-10-22）：价格来源契约。取不到行情时不再把触发价冒充现价、也不再把
+		// 缺失涨跌幅折成 0；前端按 price_kind 渲染。
+		// English: §C7 price-source contract — a missing quote must not masquerade as a live price
+		// or a flat 0%; the frontend renders by price_kind.
+		price, chg, kind, quoteOK, changeOK := quoteSource(info, sig.Price)
 		out = append(out, map[string]interface{}{
 			"code":          sig.Code,
 			"name":          sig.Name,
 			"price":         r2(price),
 			"change_pct":    r2(chg),
+			"price_kind":    kind,
+			"quote_ok":      quoteOK,
+			"change_ok":     changeOK,
 			"sector":        sig.Sector,
 			"sector_reason": sig.Reason,
 			"reason":        sig.Reason,
@@ -2070,18 +2112,19 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 		}
 		info := quotes[code]
 		name := code
-		price := 0.0
-		chg := 0.0
-		if info != nil {
+		if info != nil && info.Name != "" {
 			name = info.Name
-			price = info.Price
-			chg = info.ChangePct
 		}
+		// §C7：评分行没有触发价语义，取不到行情就是 none（行保留，数值可为 0）。
+		price, chg, kind, quoteOK, changeOK := quoteSource(info, 0)
 		out = append(out, map[string]interface{}{
 			"code":          code,
 			"name":          name,
 			"price":         r2(price),
 			"change_pct":    r2(chg),
+			"price_kind":    kind,
+			"quote_ok":      quoteOK,
+			"change_ok":     changeOK,
 			"n_score":       r0(nScore),
 			"n_pass":        nScore >= 60,
 			"dragon_score":  r0(dragonScore),

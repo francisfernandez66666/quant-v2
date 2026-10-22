@@ -7,6 +7,7 @@ import { Card, Input, InputNumber, Button, Tag, Textarea, Dialog } from 'tdesign
 import ToggleSw from '../components/ToggleSw'
 import D1ConfigPanel from '../components/D1ConfigPanel.jsx' // §P2-H 全局 D1 事件规则面板
 import RegimeConfigPanel from '../components/RegimeConfigPanel.jsx' // §N6-RISK 风控与仓位（信号生成层）
+import ExecutionRiskPanel from '../components/ExecutionRiskPanel.jsx' // §C1/C2/C3/C5/C6/B7 执行层风控与执行质量
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
@@ -768,6 +769,8 @@ export default function Settings() {
           一块红条噪声），所以按 api.getRole() 收口而不是让面板去猜。
           English: §P2-H — mount the global D1 panel (admin-only, same gate as the two admin routes). */}
       {d1Admin && <RegimeConfigPanel />}
+
+      {d1Admin && <ExecutionRiskPanel />}
 
       {d1Admin && <D1ConfigPanel />}
 

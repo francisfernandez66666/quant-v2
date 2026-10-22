@@ -2073,3 +2073,72 @@ test.describe('修复回归 · §0929POS-SAVE 持仓整表写浏览器腿 (2026-
     await page.screenshot({ path: `${SHOT}/pos-0929-save-retry.png` })
   })
 })
+
+// ── §C7 行情来源契约故障注入（2026-10-22）──
+// 用 page.route 把行情/评分/持仓三条响应改成“缺行情”，锁住三页不再出现 ¥0.00 / 0.00% 假冒，
+// 且触发价/成本回退有明确来源文案。常规 UAT 的 mock 永远给价，结构性走不到这些分支。
+// English: §C7 fault injection — force missing quotes on the three endpoints and assert the UI
+// never fabricates ¥0.00 / 0.00%, while trigger/cost fallbacks are explicitly labelled.
+test.describe('§C7 行情来源契约（故障注入）', () => {
+  test('D1 首页热门快照：缺行情显示触发价，不显示 LIVE / ¥0.00', async ({ page }) => {
+    await page.route('**/api/snapshot/hot*', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify([{
+        code: '600000', name: '缺行情股', price: 9.99, change_pct: 0,
+        price_kind: 'trigger', quote_ok: false, change_ok: false,
+        sector: '测试', sector_reason: '故障注入', reason: '故障注入',
+      }]),
+    }))
+    await page.goto('/#/dashboard')
+    const table = page.getByTestId('hot-snapshot-table')
+    await expect(table).toBeVisible({ timeout: 15000 })
+    await expect(table).toContainText('触发价 ¥9.99')
+    await expect(table).not.toContainText('¥0.00')
+    await expect(table).not.toContainText('0.00%')
+  })
+
+  test('D2 热点页今日评估：缺行情显示 —，不显示 ¥0.00 / 0.00%', async ({ page }) => {
+    await page.route('**/api/evaluations*', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify([{
+        code: '600001', name: '无行情股', price: 0, change_pct: 0,
+        price_kind: 'none', quote_ok: false, change_ok: false,
+        n_score: 0, n_pass: false, dragon_score: 0, dragon_pass: false,
+        db_score: 0, db_pass: false, dr_score: 0, dr_pass: false,
+        m_score: 0, m_pass: false, signal_active: false,
+      }]),
+    }))
+    await page.goto('/#/hotspot')
+    const table = page.getByTestId('eval-table')
+    await expect(table).toBeVisible({ timeout: 15000 })
+    await expect(table).toContainText('—')
+    await expect(table).not.toContainText('¥0.00')
+    await expect(table).not.toContainText('0.00%')
+  })
+
+  test('D3 持仓页：缺行情按成本列示，涨跌/盈亏不显示 0.00%', async ({ page }) => {
+    await page.route('**/api/holdings*', async (route) => {
+      if (route.request().method() !== 'GET') return route.continue()
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          holdings: [{
+            code: '600002', name: '成本回退股', quantity: 100, cost_price: 10,
+            cur_price: 10, change_pct: 0, pnl_pct: 0,
+            price_kind: 'cost', quote_ok: false, change_ok: false, pnl_ok: false,
+            lots: [],
+          }],
+          available_balance: 100000,
+        }),
+      })
+    })
+    await page.goto('/#/positions')
+    const table = page.getByTestId('paper-holdings-table')
+    await expect(table).toBeVisible({ timeout: 15000 })
+    await expect(table).toContainText('按成本列示')
+    await expect(table).not.toContainText('0.00%')
+  })
+})

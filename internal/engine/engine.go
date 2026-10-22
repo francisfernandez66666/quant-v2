@@ -106,6 +106,10 @@ type Engine struct {
 	holidayProbe   data.HolidayWindowProbe
 	// regimeReadoutDay §DYN-SIZE 每日 shadow 读数去重（YYYYMMDD，每日一行）。
 	regimeReadoutDay string
+	// riskPoolReadoutDay §C6 跌停/炸板池影子读数去重（YYYYMMDD，每日一行）。
+	riskPoolReadoutDay string
+	// conceptSyncDay §C1-V2 概念库每日同步去重（YYYYMMDD；异步执行，不阻塞主循环）。
+	conceptSyncDay string
 	// macroLeadProbeDay §DYN-SIZE P4 前瞻窗/日历覆盖读数去重（YYYYMMDD，每日一行）。
 	// English: §DYN-SIZE P4 daily dedup for the lead-window / calendar-coverage readout.
 	macroLeadProbeDay string
@@ -1200,6 +1204,10 @@ func (e *Engine) liveSignalPolicy() signalctl.Policy {
 			pol.SectorBlacklist = rules.Theme.BlackList
 			pol.ShadowBlacklist = rules.SignalCtl.BlacklistShadow()
 		}
+		// §C4：enhance 是**系统级**配置，必须读全局；账号完整规则快照里的 enhance 可能是旧副本。
+		// English: §C4 — enhance is system-level, so read the global snapshot; a full per-account
+		// rules snapshot may carry a stale copy.
+		pol.TechFilter = cfgMgr.GetEnhanceConfig().TechFilter
 	}
 	// §DYN-SIZE：注入市场环境快照 + 该账号定权配置/账本读数（未启用时合成恒 1.0，行为不变）。
 	pol.Regime = e.regimeForAccount(uid)
@@ -1225,6 +1233,8 @@ func (e *Engine) paperSignalPolicy(uid string) signalctl.Policy {
 			pol.SectorBlacklist = rules.Theme.BlackList
 			pol.ShadowBlacklist = rules.SignalCtl.BlacklistShadow()
 			pol.Discipline = rules.Paper.Discipline
+			// §C4 enhance 系统级：读全局，避免账号快照旧副本。
+			pol.TechFilter = cm.GetEnhanceConfig().TechFilter
 		}
 	}
 	// §DYN-SIZE：注入市场环境快照（与 live 通道同源同值——方案 §5「通道一致」测试锁）。
@@ -1241,6 +1251,17 @@ func (e *Engine) paperSignalPolicy(uid string) signalctl.Policy {
 // English: the single live dispatch entry — Evaluate on the live channel, autoPlace the passed
 // buys; hold/block are annotated into message decisions. Only the full-feed caller prunes probes.
 func (e *Engine) dispatchLive(buys []combat_agent.Signal, live map[string]*data.StockInfo, prune bool, now time.Time) {
+	// 5 秒近实时轮与测试默认走这里：计算照常，但**不消费**当日唯一影子读数行。
+	// English: the 5s realtime loop (and tests) use this entry — it never consumes the daily
+	// shadow readout slot; only the main loop is allowed to write it (§A1).
+	e.dispatchLiveSource(buys, live, prune, now, false)
+}
+
+// dispatchLiveSource 与 dispatchLive 同语义，额外声明调用方是否允许消费当日影子读数。
+// allowShadowReadout=true 只允许主循环传入；5 秒轮传 false，避免它抢先烧掉每日唯一一行。
+// English: same admission path with an explicit "may consume the daily shadow readout" flag;
+// only the main cycle passes true, so the 5s loop cannot burn the once-per-day line.
+func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]*data.StockInfo, prune bool, now time.Time, allowShadowReadout bool) {
 	if len(buys) == 0 {
 		return
 	}
@@ -1250,8 +1271,10 @@ func (e *Engine) dispatchLive(buys []combat_agent.Signal, live map[string]*data.
 	ctl := e.SignalCtl()
 	acct := e.primaryMember()
 	pol := e.liveSignalPolicy()
-	// §DYN-SIZE P0 影子读数：每交易日一行，打印快照因子 + 本轮买入集合成缩放分布（含 enabled=false）。
-	e.regimeShadowReadout(pol.Regime, buys)
+	// §A1 影子读数来源闸：只有主循环允许写当日唯一一行（含 enabled=false 的基线读数）。
+	if allowShadowReadout {
+		e.regimeShadowReadout(pol.Regime, buys)
+	}
 	var decisions []signalctl.Decision
 	if prune {
 		decisions = ctl.Evaluate(signalctl.ChannelLive, acct, buys, pol, now)
@@ -1376,6 +1399,44 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	e.autoPlaceScaled(sig, live, 0, false)
 }
 
+// atrRiskBudgetQty §C3 由账户权益与 ATR 止损距离倒推股数。
+// 返回 (股数, 权益, ok)；ATR<=0、权益不可得、无实盘账本时 ok=false（整条弃权，不伪造成 0）。
+// 止损倍数取该账号 rules.position.atr_stop_mult，缺省 2.5（与纪律/ATR 动态止损同口径）。
+// English: §C3 derives the risk-budget lot count from equity and ATR stop distance; missing inputs
+// abstain. The stop multiplier comes from the account's position config (default 2.5).
+func (e *Engine) atrRiskBudgetQty(sig combat_agent.Signal, price, riskPct float64) (qty int, equity float64, ok bool) {
+	if sig.ATR <= 0 || price <= 0 || riskPct <= 0 {
+		return 0, 0, false
+	}
+	e.mu.RLock()
+	st := e.realStore
+	cm := e.cfgMgr
+	uid := e.userID
+	e.mu.RUnlock()
+	if uid == "" {
+		uid = e.primaryMember()
+	}
+	if st == nil || uid == "" {
+		return 0, 0, false
+	}
+	total, err := st.TotalAssets(uid)
+	if err != nil || total <= 0 {
+		return 0, 0, false
+	}
+	mult := 2.5
+	if cm != nil {
+		if rules := cm.GetRulesFor(uid); rules != nil && rules.Position.ATRStopMult > 0 {
+			mult = rules.Position.ATRStopMult
+		}
+	}
+	stopDist := sig.ATR * mult
+	if stopDist <= 0 {
+		return 0, 0, false
+	}
+	riskAmt := total * riskPct / 100
+	return int(riskAmt/stopDist/100) * 100, total, true
+}
+
 // autoPlaceScaled §DYN-SIZE 执行层入口（带动态仓位缩放）。
 //
 // buyScale：信号控制器给出的缩放系数（0=未定权，按基准金额；1.0=中性）。
@@ -1421,6 +1482,42 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 			opslog.Logf("quant", "auto价格无效跳过 %s(%s) 策略=%s/%s price=%.2f", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, price)
 		})
 		return
+	}
+	// §C2 VWAP：下单时点市场 VWAP 只从快照 Amount/Volume 采集；缺失保持 0（不伪造）。
+	// 硬过滤与软回踩默认关，配置后才改变报价。
+	vwap, vwapOK := data.VWAPOf(si)
+	vwapSource, vwapAsOf := "", ""
+	priceType := cfg.PriceType
+	entryTimeout := 0
+	signalPrice := sig.Price
+	if signalPrice <= 0 {
+		signalPrice = price
+	}
+	premium := 0.0
+	if vwapOK {
+		vwapSource = "quote"
+		vwapAsOf = time.Now().Format(time.RFC3339)
+		premium = (signalPrice - vwap) / vwap * 100
+		if cfg.MaxSignalVWAPPremiumPct > 0 && premium > cfg.MaxSignalVWAPPremiumPct {
+			shadow := cfg.VWAPPremiumShadowOn()
+			log.Printf("[qmt] %s(%s) §C2 信号价高于VWAP %.2f%% > 阈值 %.2f%% shadow=%v", sig.Code, sig.Name, premium, cfg.MaxSignalVWAPPremiumPct, shadow)
+			opslog.DayOnce("vwap-premium:"+sig.Code, func() {
+				opslog.Logf("quant", "§C2 VWAP硬过滤 %s(%s) 信号价=%.2f VWAP=%.3f 偏离=%.2f%% 阈值=%.2f%% shadow=%v",
+					sig.Code, sig.Name, signalPrice, vwap, premium, cfg.MaxSignalVWAPPremiumPct, shadow)
+			})
+			if !shadow {
+				return
+			}
+		}
+		if cfg.EntryPullbackPct > 0 {
+			if limit := vwap * (1 - cfg.EntryPullbackPct/100); limit > 0 && price > limit {
+				log.Printf("[qmt] %s(%s) §C2 软回踩限价 %.2f→%.2f（VWAP %.3f 回踩 %.2f%%）", sig.Code, sig.Name, price, limit, vwap, cfg.EntryPullbackPct)
+				price = limit
+				priceType = "limit"
+				// §C2 回踩单按单超时（0=沿用全局 cancel_stale_sec）。
+				entryTimeout = cfg.EntryTimeoutSec
+			}
+		}
 	}
 	// §GAP1.5 涨停封板拒买（与模拟盘 paper.LimitUpPct 同款分板块守卫）：
 	// 封板股买单现实中几乎无法排队成交，auto 模式直接报单只会买在炸板瞬间或制造虚假成交。
@@ -1511,6 +1608,24 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		}
 	}
 	qty := int(amount/price/100) * 100
+	// §C3 ATR 风险预算：用“账户权益 × 单笔风险% / (ATR×止损倍数)”倒推股数，与金额股数取 min。
+	// 影子期只记录原本会缩到多少；正式期才真正收紧。缺 ATR/权益时整条弃权。
+	// English: §C3 ATR risk budget — qty = equity×risk%/(ATR×stopMult), min()'d with the amount qty.
+	// Shadow logs the would-be shrink; enforcement only when shadow=false; missing inputs abstain.
+	if qty > 0 && cfg.RiskGate.RiskPerTradePct > 0 {
+		if qRisk, equity, ok := e.atrRiskBudgetQty(sig, price, cfg.RiskGate.RiskPerTradePct); ok && qRisk < qty {
+			shadow := cfg.RiskGate.RiskBudgetShadowOn()
+			log.Printf("[qmt] %s(%s) §C3 ATR风险预算 金额股数=%d 风险股数=%d equity=%.0f ATR=%.3f shadow=%v",
+				sig.Code, sig.Name, qty, qRisk, equity, sig.ATR, shadow)
+			opslog.DayOnce("riskbudget:"+sig.Code, func() {
+				opslog.Logf("quant", "§C3 ATR风险预算 %s(%s) 金额股数=%d 风险股数=%d equity=%.0f ATR=%.3f shadow=%v 策略=%s/%s",
+					sig.Code, sig.Name, qty, qRisk, equity, sig.ATR, shadow, sig.StrategyID, sig.Strategy)
+			})
+			if !shadow {
+				qty = qRisk
+			}
+		}
+	}
 	// §R0.7 修复：高价股不足一手时不再强凑 1 手（旧逻辑 qty=100 导致订单金额超预算数倍）
 	if qty <= 0 {
 		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
@@ -1612,12 +1727,18 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		StrategyID:   sig.StrategyID,
 		StrategyType: sig.StrategyType,
 		Side:         trading.SideBuy,
-		PriceType:    cfg.PriceType,
+		PriceType:    priceType,
 		Price:        price,
 		Qty:          qty,
 		Amount:       float64(qty) * price,
 		CreatedAt:    time.Now().Format(time.RFC3339),
 		StalenessMs:  e.quoteStalenessMs(sig.Code),
+		// §C2 下单时点 VWAP 与信号价偏差（缺失保持 0/空）。
+		MarketVWAP:           vwap,
+		VWAPSource:           vwapSource,
+		VWAPAsOf:             vwapAsOf,
+		SignalVWAPPremiumPct: premium,
+		TimeoutSec:           entryTimeout,
 	}
 	if si != nil {
 		req.CurrentPrice = si.Price
@@ -4822,7 +4943,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			// prune=false——探针清理权归近实时全量喂入方，本方只推进（与旧 realBuyConfirmPass
 			// 无 prune 的行为一致，防主循环子集喂入误清 5s 循环探针）。
 			// English: main-loop live dispatch — controller-passed buys only; no pruning here.
-			e.dispatchLive(buys, e.snapshotQuotes(), false, time.Now())
+			// §C6 风险池影子读数：只记录，不改变 RiskTier。
+			e.riskPoolShadowReadout()
+			// §C1-V2 概念库每日同步（异步；rules.concept.enabled=false 时零操作）。
+			e.maybeSyncConcepts()
+			e.dispatchLiveSource(buys, e.snapshotQuotes(), false, time.Now(), true)
 			// §统一纪律·买入确认：主循环也喂全量活跃买入信号（非仅翻转），持续性确认由
 			// 信号控制器 paper 通道在 registry 分发时统一裁定（旧 paper 内嵌状态机已删除）。
 			e.paperSignals(buys, nil, e.snapshotQuotes(), roundSellMode)
@@ -6328,6 +6453,11 @@ func (e *Engine) regimeForAccount(uid string) signalctl.Regime {
 		uid = e.primaryMember()
 	}
 	r := e.currentRegime()
+	// §A1（2026-10-22）：3 秒缓存只保留静态/昂贵读数；动态字段每次按最新 last* 覆盖，
+	// 避免主循环更新后 dispatch 仍复用缓存里的旧情绪/风险档。
+	// English: §A1 — the 3s cache keeps only static/expensive readings; dynamic fields are
+	// overlaid from the latest last* on every call so dispatch never reuses stale risk state.
+	e.overlayDynamicRegime(&r)
 	r.SizeCfg = e.sizingConfigFor(uid)
 	// §DYN-SIZE P5：两态止损偏移（只取市场态腿——逐持仓的个股/N形/做空豁免在 CheckPositionAlerts
 	// 侧各自判定；这里回答的是"今天新开仓的止损线会被放宽多少"，供风险预算守恒缩仓）。
@@ -6344,6 +6474,32 @@ func (e *Engine) regimeForAccount(uid string) signalctl.Regime {
 		}
 	}
 	return r
+}
+
+// overlayDynamicRegime §A1 把主循环最新刷新的动态风险字段覆盖到快照上。
+// 只覆盖“每轮会变”的字段；指数/宏观/节前等昂贵读数保持 currentRegime 缓存值不动。
+// 一次 RLock 读齐，RedBlockNewBuy 每轮重读 agent（应急开关可能盘中翻转）。
+// English: §A1 overlays the per-round dynamic risk fields onto the snapshot; expensive
+// index/macro/holiday readings keep their cached values. One RLock for all dynamic fields;
+// the Red emergency switch is re-read from the agent every round.
+func (e *Engine) overlayDynamicRegime(r *signalctl.Regime) {
+	if r == nil {
+		return
+	}
+	e.mu.RLock()
+	r.EmotionPhase = e.lastEmotionPhase
+	r.MarketState = e.lastMarketState
+	r.MaxPosPct = e.lastMaxPosPct
+	r.RiskTier = e.lastRiskTier
+	r.BreadthUpRatio = e.lastUpRatio
+	if len(e.lastRiskReasons) > 0 {
+		r.RiskReasons = append([]string(nil), e.lastRiskReasons...)
+	} else {
+		r.RiskReasons = nil
+	}
+	agent := e.combatAgent
+	e.mu.RUnlock()
+	r.RedBlockNewBuy = agent != nil && agent.RedBlockNewBuyOn()
 }
 
 // resolveAccountProbe §DYN-SIZE P6：取账户级读数探针。
@@ -6493,28 +6649,13 @@ func (e *Engine) sizingConfigFor(uid string) config.SizingConfig {
 	cm := e.cfgMgr
 	e.mu.RUnlock()
 	if cm != nil {
-		if rules := cm.GetRulesFor(uid); rules != nil {
-			sc := rules.Sizing
-			// §DYN-SIZE P6 接通既有死字段：定权配置未显式设置总仓位上限时，回落到纪律仓位字段
-			// `rules.position.max_total_position_pct`（归一化后）。老配置零迁移即可让上限生效；
-			// 显式写了 `rules.sizing.max_total_position_pct` 的以它为准。
-			// English: P6 wires the previously-dead position field as a fallback for the total-position
-			// cap; an explicit sizing value always wins.
-			if sc.MaxTotalPositionPct <= 0 {
-				legacy := rules.Position.MaxTotalPositionPct
-				sc.MaxTotalPositionPct = config.NormalizeLegacyTotalPosPct(legacy)
-				// 桥接必须**可观测**：该字段此前是死字段，两种历史写法（0.8 / 80）都"合法"，
-				// 一旦读到百分数写法就是一次单位换算——静默换算等于把 owner 的配置语义悄悄改掉。
-				// 日级去重（配置稳定，不该每 5s 刷一行）。
-				if legacy > 1 {
-					opslog.DayOnce("legacy-total-pos:"+uid, func() {
-						opslog.Logf("quant", "§DYN-SIZE 总仓位上限桥接：rules.position.max_total_position_pct=%.4g 按百分数归一为 %.4f（rules.sizing.max_total_position_pct 可显式覆盖）",
-							legacy, sc.MaxTotalPositionPct)
-					})
-				}
-			}
-			return sc.WithDefaults()
-		}
+		// §A0（2026-10-22）：账号级专用键 → 账号旧 sizing → 全局；旧 position 字段桥接与
+		// NormalizeLegacyTotalPosPct 已收进 config.GetSizingConfigFor，引擎不再自行拼装，
+		// 保证面板 GET 与引擎读的是同一份 effective 配置。
+		// English: §A0 — the manager owns the whole fallback chain (dedicated key → account legacy
+		// → global → legacy position bridge), so the panel and the engine read one effective value.
+		sc, _ := cm.GetSizingConfigFor(uid)
+		return sc
 	}
 	return config.DefaultSizingConfig()
 }
@@ -6732,6 +6873,102 @@ func (e *Engine) regimeShadowReadout(r signalctl.Regime, buys []combat_agent.Sig
 		r.Account.WindowStopLosses, r.Account.EquityDrawdown, r.Account.TotalPosPct,
 		boost, boostReasons,
 		r.SizeCfg.Enabled, r.SizeCfg.ShadowOn(), sampleReasons)
+}
+
+// riskPoolShadowReadout §C6 每日一次的跌停/炸板池影子读数。
+// 只读 PoolLimitDown/PoolLimitBreak；任一路取不到就明确记“弃权”，绝不把取不到当 0 家。
+// would-change 是粗映射（跌停≥50 家→Red、≥20 家→Yellow），仅作影子观察，不改实际风险档。
+// English: §C6 once-per-day shadow readout of the limit-down / limit-break pools. Missing data is
+// logged as an abstention, never treated as zero. would-change is a coarse observation only.
+func (e *Engine) riskPoolShadowReadout() {
+	e.mu.RLock()
+	cm := e.cfgMgr
+	dc := e.coordinator
+	tier := e.lastRiskTier
+	done := e.riskPoolReadoutDay == data.TradingDayDate(time.Now())
+	e.mu.RUnlock()
+	if cm == nil || dc == nil || done {
+		return
+	}
+	if !cm.GetEnhanceConfig().RiskPoolShadowOn() {
+		return
+	}
+	today := data.TradingDayDate(time.Now())
+	down, dErr := dc.PoolLimitDown(today)
+	brk, bErr := dc.PoolLimitBreak(today)
+	e.mu.Lock()
+	e.riskPoolReadoutDay = today
+	e.mu.Unlock()
+
+	downN, downSrc := 0, ""
+	if dErr != nil {
+		downSrc = "unavailable"
+	} else {
+		downN, downSrc = len(down.Stocks), down.Source
+	}
+	brkN, brkSrc := 0, ""
+	if bErr != nil {
+		brkSrc = "unavailable"
+	} else {
+		brkN, brkSrc = len(brk.Stocks), brk.Source
+	}
+	would := ""
+	if dErr == nil {
+		switch {
+		case downN >= 50:
+			would = "Red"
+		case downN >= 20:
+			would = "Yellow"
+		}
+	}
+	changed := would != "" && would != tier
+	log.Printf("[riskpool] §C6 影子读数 日=%s 跌停=%d(%s) 炸板=%d(%s) 当前风险档=%q 若纳入would=%q would_change=%v（只读，不改档）",
+		today, downN, downSrc, brkN, brkSrc, tier, would, changed)
+	if dErr != nil {
+		log.Printf("[riskpool] §C6 跌停池不可得，弃权（不按 0 家处理）: %v", dErr)
+	}
+	if bErr != nil {
+		log.Printf("[riskpool] §C6 炸板池不可得，弃权（不按 0 家处理）: %v", bErr)
+	}
+}
+
+// maybeSyncConcepts §C1-V2 每日一次异步同步概念库（不阻塞主循环）。
+// 开关在全局 rules.concept.enabled；无协调器/无实盘库/已同步过则跳过。失败只记日志，
+// 覆盖率与状态由 concept_sync_state 表如实反映。
+// English: §C1-V2 once-per-day async concept sync. Gated by global rules.concept.enabled;
+// missing coordinator/store or already-run days skip. Failures are logged; coverage/status
+// stay honest in concept_sync_state.
+func (e *Engine) maybeSyncConcepts() {
+	e.mu.RLock()
+	cm := e.cfgMgr
+	dc := e.coordinator
+	st := e.realStore
+	ranToday := e.conceptSyncDay == data.TradingDayDate(time.Now())
+	e.mu.RUnlock()
+	if cm == nil || dc == nil || st == nil || ranToday {
+		return
+	}
+	rules := cm.Get()
+	if rules == nil || !rules.Concept.Enabled {
+		return
+	}
+	today := data.TradingDayDate(time.Now())
+	e.mu.Lock()
+	if e.conceptSyncDay == today {
+		e.mu.Unlock()
+		return
+	}
+	e.conceptSyncDay = today
+	e.mu.Unlock()
+	go func() {
+		res, err := dc.SyncConcepts(st, 0)
+		if err != nil {
+			log.Printf("[concept] §C1-V2 概念库同步失败: %v", err)
+			return
+		}
+		log.Printf("[concept] §C1-V2 概念库同步完成 总数=%d 成功=%d 失败=%d 成员=%d 最近成功=%s",
+			res.Total, res.Synced, res.Failed, res.Members, res.LastSuccess)
+	}()
 }
 
 // macroCalGuardMu/macroCalGuardDay 进程级"每日一次校准"闸门（校准缓存是进程全局的，

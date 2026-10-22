@@ -151,6 +151,15 @@ type Signal struct {
 	Price      float64 `json:"price"`         // 触发价格
 	Confidence float64 `json:"confidence"`    // 置信度（0~1）
 	ATR        float64 `json:"atr,omitempty"` // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
+	// §C4 技术过滤输入（临时字段，不广播/不落盘）：由 combat_agent 在已有日 K 上计算。
+	// CloseVsMA 存 close/MA−1（负=收盘低于均线）；均线不足时为 0/缺失（弃权，不误拦）。
+	// English: §C4 transient technical-filter inputs (never broadcast/persisted); CloseVsMA holds
+	// close/MA−1 (negative = below MA). Insufficient bars leave zero/absent (abstain).
+	KDJ_J     float64            `json:"-"`
+	MA60      float64            `json:"-"`
+	MA120     float64            `json:"-"`
+	MA250     float64            `json:"-"`
+	CloseVsMA map[string]float64 `json:"-"`
 	// ChangePct 信号**生成时刻**的当日涨跌幅（%）。用指针区分两种零：
 	//   nil = 当时取不到行情（历史批次只能显示「—」，绝不追补实时价）；
 	//   指向 0 = 当时有行情且确实平盘（展示 0.00% 是合法读数）。

@@ -516,6 +516,13 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		if oreq.PrevClose <= 0 {
 			oreq.PrevClose = q.Close
 		}
+		// §C2 手动单同样记录下单时点 VWAP（缺失保持 0/空，不伪造）。
+		if v, ok := data.VWAPOf(q); ok {
+			oreq.MarketVWAP = v
+			oreq.VWAPSource = "quote"
+			oreq.VWAPAsOf = time.Now().Format(time.RFC3339)
+			oreq.SignalVWAPPremiumPct = (req.Price - v) / v * 100
+		}
 		staleMs = 0
 	}
 	oreq.StalenessMs = staleMs
@@ -956,10 +963,31 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		"daily_max_buys":      cfg.DailyMaxBuys,
 		"daily_budget_amount": cfg.DailyBudgetAmount,
 		// owner 2026-10-12 裁决两闸（原值透出；0=出厂默认，负数=显式关闭，语义见 config.go）
-		"min_buy_price":      cfg.MinBuyPrice,
-		"min_order_amount":   cfg.MinOrderAmount,
-		"max_extends":        cfg.Discipline.MaxExtends, // 延持次数上限（默认 2，负数=无上限）
-		"auto_sell":          cfg.AutoSell,
+		"min_buy_price":                  cfg.MinBuyPrice,
+		"min_order_amount":               cfg.MinOrderAmount,
+		"max_extends":                    cfg.Discipline.MaxExtends, // 延持次数上限（默认 2，负数=无上限）
+		"auto_sell":                      cfg.AutoSell,
+		"auto_sell_all_sources":          cfg.AutoSellAllSourcesOn(),
+		"auto_risk_caution":              cfg.AutoCautionOn(),
+		"sell_unified_mode":              cfg.SellUnifiedMode,
+		"entry_pullback_pct":             cfg.EntryPullbackPct,
+		"entry_timeout_sec":              cfg.EntryTimeoutSec,
+		"max_signal_vwap_premium_pct":    cfg.MaxSignalVWAPPremiumPct,
+		"max_signal_vwap_premium_shadow": cfg.VWAPPremiumShadowOn(),
+		"risk_gate": map[string]interface{}{
+			"sector_value_pct":       cfg.RiskGate.SectorValuePct,
+			"sector_value_shadow":    cfg.RiskGate.SectorValueShadowOn(),
+			"concept_value_pct":      cfg.RiskGate.ConceptValuePct,
+			"concept_value_shadow":   cfg.RiskGate.ConceptValueShadowOn(),
+			"risk_per_trade_pct":     cfg.RiskGate.RiskPerTradePct,
+			"risk_budget_shadow":     cfg.RiskGate.RiskBudgetShadowOn(),
+			"limit_up_block_buy":     cfg.RiskGate.LimitUpBlockBuy,
+			"limit_down_block_sell":  cfg.RiskGate.LimitDownBlockSellEnabled(),
+			"day_loss_limit_pct":     cfg.RiskGate.DayLossLimitPct,
+			"single_stock_value_pct": cfg.RiskGate.SingleStockValuePct,
+			"stale_quote_ms":         cfg.RiskGate.StaleQuoteMs,
+			"cross_check_pct":        cfg.RiskGate.CrossCheckPct,
+		},
 		"miss_heartbeat_sec": cfg.MissHeartbeatSec,
 		// §R4-1 kill-switch 与撤单闭环参数
 		"halted":           cfg.Halted,
@@ -999,6 +1027,37 @@ type setQMTConfigReq struct {
 	MinBuyPrice    *float64 `json:"min_buy_price"`    // 最低买入价（元，默认 5）
 	MinOrderAmount *float64 `json:"min_order_amount"` // 单笔最低成交额（元，默认 5000）
 	MaxExtends     *int     `json:"max_extends"`      // 卖出延持次数上限（默认 2，负数=无上限）
+	// §B7 全卖出自动化：true=战法自带止盈/减仓也自动执行（默认 false）。
+	AutoSellAllSources *bool `json:"auto_sell_all_sources"`
+	// §C6 自动买谨慎层（nil=不改；显式 true/false 落库）。
+	AutoRiskCaution *bool `json:"auto_risk_caution"`
+	// §SELLPOINT-UNIFY 卖出统一裁决模式（shadow/on/off；空=shadow 缺省语义）。
+	SellUnifiedMode *string `json:"sell_unified_mode"`
+	// §C2 VWAP 执行质量（0=关）。
+	EntryPullbackPct        *float64 `json:"entry_pullback_pct"`
+	EntryTimeoutSec         *int     `json:"entry_timeout_sec"`
+	MaxSignalVWAPPremiumPct *float64 `json:"max_signal_vwap_premium_pct"`
+	// §C2 VWAP 硬过滤影子模式（nil=不改）。
+	MaxSignalVWAPPremiumShadow *bool `json:"max_signal_vwap_premium_shadow"`
+	// §C1/C3 风控闸参数（嵌套对象，指针=nil 本次不改）。
+	RiskGate *riskGatePatch `json:"risk_gate"`
+}
+
+// riskGatePatch §C1/C3 风控闸局部更新（仅显式出现的键生效）。
+// English: §C1/C3 partial risk-gate patch — only present keys are applied.
+type riskGatePatch struct {
+	SectorValuePct      *float64 `json:"sector_value_pct"`
+	SectorValueShadow   *bool    `json:"sector_value_shadow"`
+	ConceptValuePct     *float64 `json:"concept_value_pct"`
+	ConceptValueShadow  *bool    `json:"concept_value_shadow"`
+	RiskPerTradePct     *float64 `json:"risk_per_trade_pct"`
+	RiskBudgetShadow    *bool    `json:"risk_budget_shadow"`
+	LimitUpBlockBuy     *bool    `json:"limit_up_block_buy"`
+	LimitDownBlockSell  *bool    `json:"limit_down_block_sell"`
+	DayLossLimitPct     *float64 `json:"day_loss_limit_pct"`
+	SingleStockValuePct *float64 `json:"single_stock_value_pct"`
+	StaleQuoteMs        *int64   `json:"stale_quote_ms"`
+	CrossCheckPct       *float64 `json:"cross_check_pct"`
 }
 
 // handleSetQMTConfig 处理 POST /api/config/qmt：局部合并保存当前账号实盘配置并热加载生效。
@@ -1070,6 +1129,87 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	}
 	if req.AutoSell != nil {
 		cfg.AutoSell = *req.AutoSell // 自动卖出开关（尾盘清仓等）
+	}
+	if req.AutoSellAllSources != nil {
+		cfg.AutoSellAllSources = req.AutoSellAllSources
+	}
+	if req.AutoRiskCaution != nil {
+		cfg.AutoRiskCaution = req.AutoRiskCaution
+	}
+	if req.SellUnifiedMode != nil {
+		m := strings.ToLower(strings.TrimSpace(*req.SellUnifiedMode))
+		if m != "" && m != "shadow" && m != "on" && m != "off" {
+			writeError(w, 400, "sell_unified_mode 仅允许 shadow/on/off/空")
+			return
+		}
+		cfg.SellUnifiedMode = m
+	}
+	if req.EntryPullbackPct != nil {
+		if *req.EntryPullbackPct < 0 || *req.EntryPullbackPct > 100 {
+			writeError(w, 400, "entry_pullback_pct 超出范围 0-100")
+			return
+		}
+		cfg.EntryPullbackPct = *req.EntryPullbackPct
+	}
+	if req.EntryTimeoutSec != nil {
+		if *req.EntryTimeoutSec < 0 {
+			writeError(w, 400, "entry_timeout_sec 不能为负")
+			return
+		}
+		cfg.EntryTimeoutSec = *req.EntryTimeoutSec
+	}
+	if req.MaxSignalVWAPPremiumPct != nil {
+		if *req.MaxSignalVWAPPremiumPct < 0 || *req.MaxSignalVWAPPremiumPct > 100 {
+			writeError(w, 400, "max_signal_vwap_premium_pct 超出范围 0-100")
+			return
+		}
+		cfg.MaxSignalVWAPPremiumPct = *req.MaxSignalVWAPPremiumPct
+	}
+	if req.MaxSignalVWAPPremiumShadow != nil {
+		cfg.MaxSignalVWAPPremiumShadow = req.MaxSignalVWAPPremiumShadow
+	}
+	if p := req.RiskGate; p != nil {
+		pct := func(name string, v *float64, dst *float64) bool {
+			if v == nil {
+				return true
+			}
+			if *v < 0 || *v > 100 {
+				writeError(w, 400, name+" 超出范围 0-100")
+				return false
+			}
+			*dst = *v
+			return true
+		}
+		if !pct("risk_gate.sector_value_pct", p.SectorValuePct, &cfg.RiskGate.SectorValuePct) ||
+			!pct("risk_gate.concept_value_pct", p.ConceptValuePct, &cfg.RiskGate.ConceptValuePct) ||
+			!pct("risk_gate.risk_per_trade_pct", p.RiskPerTradePct, &cfg.RiskGate.RiskPerTradePct) ||
+			!pct("risk_gate.day_loss_limit_pct", p.DayLossLimitPct, &cfg.RiskGate.DayLossLimitPct) ||
+			!pct("risk_gate.single_stock_value_pct", p.SingleStockValuePct, &cfg.RiskGate.SingleStockValuePct) ||
+			!pct("risk_gate.cross_check_pct", p.CrossCheckPct, &cfg.RiskGate.CrossCheckPct) {
+			return
+		}
+		if p.SectorValueShadow != nil {
+			cfg.RiskGate.SectorValueShadow = p.SectorValueShadow
+		}
+		if p.ConceptValueShadow != nil {
+			cfg.RiskGate.ConceptValueShadow = p.ConceptValueShadow
+		}
+		if p.RiskBudgetShadow != nil {
+			cfg.RiskGate.RiskBudgetShadow = p.RiskBudgetShadow
+		}
+		if p.LimitUpBlockBuy != nil {
+			cfg.RiskGate.LimitUpBlockBuy = *p.LimitUpBlockBuy
+		}
+		if p.LimitDownBlockSell != nil {
+			cfg.RiskGate.LimitDownBlockSell = p.LimitDownBlockSell
+		}
+		if p.StaleQuoteMs != nil {
+			if *p.StaleQuoteMs < 0 {
+				writeError(w, 400, "risk_gate.stale_quote_ms 不能为负")
+				return
+			}
+			cfg.RiskGate.StaleQuoteMs = *p.StaleQuoteMs
+		}
 	}
 	if req.FixedAmount != nil {
 		if *req.FixedAmount < 0 {

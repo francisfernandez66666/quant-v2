@@ -1856,14 +1856,21 @@ export async function setD1Config(cfg) {
 // ── §N6-RISK 信号生成层开关（市场状态机 / 动态仓位 / 卖出加权 / 风险档门槛） ──
 // GET /api/config/regime → { enhance, sizing, macro_gate }
 // POST 稀疏 merge：body 可只带其中一段，未出现的键保留库中原值（admin）。
-/** 读取风控与仓位开关（GET /api/config/regime，admin） */
-export async function fetchRegimeConfig() {
-  return request('/api/config/regime')
+/** 读取风控与仓位开关（GET /api/config/regime；sizing 为账号级，enhance/macro_gate 为系统级） */
+export async function fetchRegimeConfig(accountId) {
+  const q = accountId ? '?account_id=' + encodeURIComponent(accountId) : ''
+  return request('/api/config/regime' + q)
 }
 
-/** 保存风控与仓位开关（POST /api/config/regime，admin，稀疏 merge） */
-export async function setRegimeConfig(cfg) {
-  return request('/api/config/regime', { method: 'POST', data: cfg })
+/** 保存风控与仓位开关（POST /api/config/regime，稀疏 merge；sizing 写目标账号，系统级段仅 admin） */
+export async function setRegimeConfig(cfg, accountId) {
+  const q = accountId ? '?account_id=' + encodeURIComponent(accountId) : ''
+  return request('/api/config/regime' + q, { method: 'POST', data: cfg })
+}
+
+/** §C1-V2 概念库覆盖率/同步状态（GET /api/config/concept/status，admin） */
+export async function fetchConceptStatus() {
+  return request('/api/config/concept/status')
 }
 
 /** 获取 LLM 诊断调试数据 */

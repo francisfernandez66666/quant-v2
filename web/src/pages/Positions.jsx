@@ -17,6 +17,7 @@ import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮
 // English: §H-2 — showToast was called without being imported; the save-failure branch died
 // with an uncaught ReferenceError (no toast at all). Import added.
 import { showToast } from '../ui.jsx'
+import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（cost 不再冒充现价）
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -836,10 +837,11 @@ export default function Positions() {
       : <span style={{ color: 'var(--app-faint)' }}>{row.name}</span>) },
     { colKey: 'quantity', title: '数量', width: 70, sorter: (a, b) => (a.quantity || 0) - (b.quantity || 0), cell: ({ row }) => row.quantity },
     { colKey: 'cost_price', title: '成本价', width: 80, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(2) : '-') },
-    { colKey: 'cur_price', title: '现价', width: 80, sorter: (a, b) => (a.cur_price || 0) - (b.cur_price || 0), cell: ({ row }) => (row.cur_price != null ? '¥' + Number(row.cur_price).toFixed(2) : '-') },
-    { colKey: 'change_pct', title: '当日涨跌', width: 90, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    // §C7：现价/涨跌/盈亏按来源渲染。cost=无行情回退成本（不是现价）；缺数显示 —，不显示 0.00%。
+    { colKey: 'cur_price', title: '现价', width: 130, sorter: (a, b) => (a.cur_price || 0) - (b.cur_price || 0), cell: ({ row }) => <PriceCell value={row.cur_price} kind={row.price_kind} /> },
+    { colKey: 'change_pct', title: '当日涨跌', width: 90, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <PctCell value={row.change_pct} ok={row.change_ok} /> },
     // 持仓盈亏百分比列：红涨绿跌（§F1 可排序——盯盘最常用「按盈亏排序找雷/找赢家」）
-    { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, sorter: (a, b) => (a.pnl_pct || 0) - (b.pnl_pct || 0), cell: ({ row }) => <span style={{ color: (row.pnl_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.pnl_pct || 0) > 0 ? '+' : ''}{(row.pnl_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, sorter: (a, b) => (a.pnl_pct || 0) - (b.pnl_pct || 0), cell: ({ row }) => <PctCell value={row.pnl_pct} ok={row.pnl_ok} /> },
 
     // 信号状态列：有策略信号时显示⚡
     { colKey: 'signal', title: '信号', width: 50, cell: ({ row }) => row.signal_active ? <span title="有策略信号">⚡</span> : <span style={{ color: 'var(--app-border)' }}>—</span> },
@@ -992,6 +994,7 @@ export default function Positions() {
             // 持仓表格：支持展开分时图、行点击打开操作面板
             <Card>
               {/* 持仓表格：数据绑定/列定义/行展开分时图 */}
+              <div data-testid="paper-holdings-table">
               <Table
                 data={holdings}
                 columns={paperColumns}
@@ -1012,6 +1015,7 @@ export default function Positions() {
                   <MinuteView code={row.code} name={row.name} />
                 )}
               />
+              </div>
             </Card>
           ) : (
             // 无持仓空态：引导用户新增持仓

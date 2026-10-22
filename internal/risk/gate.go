@@ -18,6 +18,7 @@ package risk
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -115,6 +116,16 @@ type Gate struct {
 	stratFilledFn func(userID, day, strategyKey string) (float64, error)
 	// stratFrozenFn 战法维在途冻结读数（见上一字段注释）。
 	stratFrozenFn func(userID, day, strategyKey string) (float64, error)
+	// industryOf §C1 行业来源（code→行业名；nil=闸跳过）。由装配层注入 DataCoordinator，
+	// 避免 risk 包依赖 data 的具体协调器（也便于测试注入固定行业）。
+	// English: §C1 industry source injected by the assembly layer (nil = gate skipped).
+	industryOf func(code string) string
+	// conceptMinCoverage §C1-V2 概念库覆盖率门槛（%）：低于该值 → 概念敞口闸弃权（fail-open）。
+	// 由装配层从 rules.concept.min_coverage_pct 注入；<=0 时按 95。
+	// English: §C1-V2 concept coverage floor; below it the concept gate abstains (fail-open).
+	conceptMinCoverage float64
+	// conceptMaxStaleness §C1-V2 概念数据最大陈旧时长（<=0=不检查）。
+	conceptMaxStaleness time.Duration
 }
 
 // NewGate 创建风控闸。onGate 可空（命中时告警回调；新闸默认高优告警，存量守卫不告警）。
@@ -130,6 +141,25 @@ func NewGate(st *store.DB, userID string, onGate func(level, title, content stri
 // because the coordinator is only available late in engine assembly.
 func (g *Gate) SetCrossPriceSource(fn func(code string) (float64, error)) {
 	g.crossPrice = fn
+}
+
+// SetIndustrySource §C1 注入行业来源（nil=行业敞口闸保持跳过，零行为变化）。
+// English: §C1 injects the industry lookup (nil keeps the sector gate inert).
+func (g *Gate) SetIndustrySource(fn func(code string) string) {
+	g.industryOf = fn
+}
+
+// SetConceptPolicy §C1-V2 注入概念库覆盖率门槛与最大陈小时数（<=0 时按 95%/48h；陈小时=0 关闭）。
+// English: §C1-V2 injects the coverage floor and max staleness (<=0 → 95%/48h; staleness 0 = off).
+func (g *Gate) SetConceptPolicy(minCoveragePct float64, maxStalenessHours int) {
+	if minCoveragePct <= 0 {
+		minCoveragePct = 95
+	}
+	g.conceptMinCoverage = minCoveragePct
+	if maxStalenessHours < 0 {
+		maxStalenessHours = 0
+	}
+	g.conceptMaxStaleness = time.Duration(maxStalenessHours) * time.Hour
 }
 
 // CheckLiveOrder 下单前置守卫统一入口：按序执行全部闸口，首个命中即返回阻断裁定
@@ -168,18 +198,20 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 		alert bool
 		run   func() string
 	}{
-		{"st", false, func() string { return g.checkST(o) }},                               // ST/退市股禁买
-		{"blacklist", false, func() string { return g.checkBlacklist(cfg, o) }},            // 个股黑名单禁买
-		{"max_order_amount", true, func() string { return g.checkMaxOrderAmount(cfg, o) }}, // 单笔金额绝对帽
-		{"t1_sellable", false, func() string { return g.checkT1Sellable(cfg, o) }},         // T+1 可卖量（含在途卖单）
-		{"limit_up_down", true, func() string { return g.checkLimitPrice(cfg, o) }},        // 涨停不可追买/跌停不可追卖
-		{"stale_quote", true, func() string { return g.checkStaleQuote(cfg, o) }},          // 行情新鲜度硬闸
-		{"price_cross_check", true, func() string { return g.checkPriceCross(cfg, o) }},    // §XCHECK 价格复核闸（数据类闸与上闸聚拢）
-		{"day_loss", true, func() string { return g.checkDayLoss(cfg, o) }},                // 日内已实现亏损熔断
-		{"concentration", true, func() string { return g.checkConcentration(cfg, o) }},     // 单票市值集中度
-		{"buy_discipline", false, func() string { return g.checkBuyDiscipline(cfg, o) }},   // 买入纪律（已成交笔数/预算/可用资金）
-		{"whitelist", false, func() string { return g.checkWhitelist(cfg, o) }},            // 战法白名单
-		{"max_positions", false, func() string { return g.checkMaxPositions(cfg, o) }},     // 持仓数上限
+		{"st", false, func() string { return g.checkST(o) }},                                // ST/退市股禁买
+		{"blacklist", false, func() string { return g.checkBlacklist(cfg, o) }},             // 个股黑名单禁买
+		{"max_order_amount", true, func() string { return g.checkMaxOrderAmount(cfg, o) }},  // 单笔金额绝对帽
+		{"t1_sellable", false, func() string { return g.checkT1Sellable(cfg, o) }},          // T+1 可卖量（含在途卖单）
+		{"limit_up_down", true, func() string { return g.checkLimitPrice(cfg, o) }},         // 涨停不可追买/跌停不可追卖
+		{"stale_quote", true, func() string { return g.checkStaleQuote(cfg, o) }},           // 行情新鲜度硬闸
+		{"price_cross_check", true, func() string { return g.checkPriceCross(cfg, o) }},     // §XCHECK 价格复核闸（数据类闸与上闸聚拢）
+		{"day_loss", true, func() string { return g.checkDayLoss(cfg, o) }},                 // 日内已实现亏损熔断
+		{"concentration", true, func() string { return g.checkConcentration(cfg, o) }},      // 单票市值集中度
+		{"sector_exposure", true, func() string { return g.checkSectorExposure(cfg, o) }},   // §C1 行业敞口
+		{"concept_exposure", true, func() string { return g.checkConceptExposure(cfg, o) }}, // §C1-V2 概念敞口
+		{"buy_discipline", false, func() string { return g.checkBuyDiscipline(cfg, o) }},    // 买入纪律（已成交笔数/预算/可用资金）
+		{"whitelist", false, func() string { return g.checkWhitelist(cfg, o) }},             // 战法白名单
+		{"max_positions", false, func() string { return g.checkMaxPositions(cfg, o) }},      // 持仓数上限
 	}
 	// 短路语义：首个命中即返回阻断裁定，后续闸不再评估（与原 controller 行为一致）。
 	for _, c := range checks {
@@ -521,6 +553,158 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 			proj, total, proj/total*100, cfg.RiskGate.SingleStockValuePct)
 	}
 	return ""
+}
+
+// checkSectorExposure §C1 行业敞口：买入后目标行业预计市值 / 总资产 超过上限 → 拒新买。
+// 未知行业、总资产不可得、无行业源 → fail-open（弃权）；影子期只写 risk_gates 留痕并放行。
+// English: §C1 sector exposure — projected sector value / total assets above the cap rejects the
+// buy; unknown inputs abstain; shadow mode records a hit but passes.
+func (g *Gate) checkSectorExposure(cfg config.QMTConfig, o LiveOrder) string {
+	if o.Side != SideBuy || cfg.RiskGate.SectorValuePct <= 0 || g.st == nil || g.industryOf == nil {
+		return ""
+	}
+	target := strings.TrimSpace(g.industryOf(o.Code))
+	if target == "" {
+		return "" // 行业未知 → 弃权，不把“取不到”当 0 敞口
+	}
+	// 总资产不可得（账本缺失或 ≤0）→ 弃权：用不可信分母算出的比例没有意义。
+	total, err := g.st.TotalAssets(g.userID)
+	if err != nil || total <= 0 {
+		return ""
+	}
+	// 本单金额：优先用委托金额，缺失时按 价×量 估算。
+	amount := o.Amount
+	if amount <= 0 {
+		amount = o.Price * float64(o.Qty)
+	}
+	if amount <= 0 {
+		return ""
+	}
+	positions, err := g.st.RealPositionsForUser(g.userID)
+	if err != nil {
+		return ""
+	}
+	// 逐持仓聚合目标行业市值：现价优先，缺失回退成本价；未知行业不计入（弃权）。
+	held := 0.0
+	for _, p := range positions {
+		if p.Qty <= 0 || strings.TrimSpace(p.TsCode) == "" {
+			continue
+		}
+		ind := strings.TrimSpace(g.industryOf(p.TsCode))
+		if ind == "" || ind != target {
+			continue
+		}
+		price := p.CurPrice
+		if price <= 0 {
+			price = p.CostPrice
+		}
+		if price > 0 {
+			held += price * float64(p.Qty)
+		}
+	}
+	// 买入后预计行业市值占比；未超上限直接放行。
+	proj := held + amount
+	pct := proj / total * 100
+	if pct <= cfg.RiskGate.SectorValuePct {
+		return ""
+	}
+	reason := fmt.Sprintf("行业敞口超限: 行业=%s 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%",
+		target, proj, total, pct, cfg.RiskGate.SectorValuePct)
+	if cfg.RiskGate.SectorValueShadowOn() {
+		// 影子期：留痕但不拒单（回滚/灰度期内不改变真实下单行为）。
+		_ = g.st.RecordRiskGate(g.userID, g.today(), "sector_exposure", "[shadow] "+reason)
+		return ""
+	}
+	return reason
+}
+
+// checkConceptExposure §C1-V2 概念敞口：一只股票多概念时取“命中的最大敞口概念”检查，
+// 不做重叠求和；覆盖率不足/概念未知/总资产不可得 → 弃权。影子期只留痕。
+// English: §C1-V2 concept exposure — check the single largest matching concept (no overlap sum);
+// low coverage / unknown concept / missing assets abstain; shadow records only.
+func (g *Gate) checkConceptExposure(cfg config.QMTConfig, o LiveOrder) string {
+	if o.Side != SideBuy || cfg.RiskGate.ConceptValuePct <= 0 || g.st == nil {
+		return ""
+	}
+	_, total, coverage, lastSuccess, err := g.st.ConceptCoverage()
+	if err != nil || total == 0 {
+		return ""
+	}
+	// 数据过期与覆盖率不足同属“概念库不可信”，一律弃权（fail-open），不误拦。
+	if g.conceptMaxStaleness > 0 && lastSuccess != "" {
+		if t, perr := time.Parse(time.RFC3339, lastSuccess); perr == nil && time.Since(t) > g.conceptMaxStaleness {
+			return ""
+		}
+	}
+	floor := g.conceptMinCoverage
+	if floor <= 0 {
+		floor = 95
+	}
+	if coverage < floor {
+		return "" // 覆盖率不足 → 概念数据不可信，弃权
+	}
+	targetConcepts, err := g.st.ConceptMembersForTsCode(o.Code)
+	if err != nil || len(targetConcepts) == 0 {
+		return "" // 概念未知 → 弃权
+	}
+	// 总资产不可得 → 弃权；概念敞口的分母必须是可信总资产。
+	assets, err := g.st.TotalAssets(g.userID)
+	if err != nil || assets <= 0 {
+		return ""
+	}
+	// 本单金额：委托金额优先，缺失按 价×量 估算。
+	amount := o.Amount
+	if amount <= 0 {
+		amount = o.Price * float64(o.Qty)
+	}
+	if amount <= 0 {
+		return ""
+	}
+	positions, err := g.st.RealPositionsForUser(g.userID)
+	if err != nil {
+		return ""
+	}
+	// 逐持仓按概念聚合市值；单只票的多概念分别计入，最终按单概念取最大敞口，不做重叠求和。
+	held := map[string]float64{}
+	for _, p := range positions {
+		if p.Qty <= 0 || strings.TrimSpace(p.TsCode) == "" {
+			continue
+		}
+		price := p.CurPrice
+		if price <= 0 {
+			price = p.CostPrice
+		}
+		if price <= 0 {
+			continue
+		}
+		mv := price * float64(p.Qty)
+		codes, cerr := g.st.ConceptMembersForTsCode(p.TsCode)
+		if cerr != nil {
+			continue
+		}
+		for _, c := range codes {
+			held[c] += mv
+		}
+	}
+	// 只检查本单目标股票命中的概念，取其中预计占比最大的一个作为判定口径。
+	worstPct, worstConcept := 0.0, ""
+	for _, c := range targetConcepts {
+		pct := (held[c] + amount) / assets * 100
+		if pct > worstPct {
+			worstPct, worstConcept = pct, c
+		}
+	}
+	if worstConcept == "" || worstPct <= cfg.RiskGate.ConceptValuePct {
+		return ""
+	}
+	// 超限：影子期只写 risk_gates（原因带 [shadow]）并放行；正式期返回拒单原因。
+	reason := fmt.Sprintf("概念敞口超限: 概念=%s 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%（覆盖率 %.1f%%）",
+		worstConcept, held[worstConcept]+amount, assets, worstPct, cfg.RiskGate.ConceptValuePct, coverage)
+	if cfg.RiskGate.ConceptValueShadowOn() {
+		_ = g.st.RecordRiskGate(g.userID, g.today(), "concept_exposure", "[shadow] "+reason)
+		return ""
+	}
+	return reason
 }
 
 // checkWhitelist 策略白名单校验（仅买方向；卖出不受限——退出的持仓其战法可能不在白名单，

@@ -276,6 +276,18 @@ func (c *Controller) SetCrossPriceSource(fn func(code string) (float64, error)) 
 	c.gate.SetCrossPriceSource(fn)
 }
 
+// SetIndustrySource §C1 把行业来源注入该账号风控闸（nil=行业敞口闸跳过）。
+// English: §C1 injects the industry lookup into this account's risk gate (nil keeps it inert).
+func (c *Controller) SetIndustrySource(fn func(code string) string) {
+	c.gate.SetIndustrySource(fn)
+}
+
+// SetConceptPolicy §C1-V2 注入概念库覆盖率门槛与最大陈小时数（低于/超过时概念闸弃权）。
+// English: §C1-V2 injects the concept coverage floor and staleness limit (gate abstains outside).
+func (c *Controller) SetConceptPolicy(minCoveragePct float64, maxStalenessHours int) {
+	c.gate.SetConceptPolicy(minCoveragePct, maxStalenessHours)
+}
+
 // StateSnapshot 互通健康快照：下行（首尔探测网关）+ 上行（网关回报到首尔）两侧状态，
 // 供 /api/qmt/state、仪表盘系统行与量化交易页消费。零值时间表示"从未发生"。
 // English: connectivity snapshot for the dashboard/system row and quant page — downlink probe
@@ -566,6 +578,12 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		Qty:       req.Qty,
 		CreatedAt: req.CreatedAt,
 		UserID:    c.userID, // §W2-10 委托行打归属账号（多账号审计/后续租户读过滤）
+		// §C2 下单时点 VWAP 随委托行落库，成交回报到达时由 store 继承并算偏差。
+		MarketVWAP:           req.MarketVWAP,
+		VWAPSource:           req.VWAPSource,
+		VWAPAsOf:             req.VWAPAsOf,
+		SignalVWAPPremiumPct: req.SignalVWAPPremiumPct,
+		TimeoutSec:           req.TimeoutSec,
 	})
 	if err != nil {
 		return nil, err
@@ -901,7 +919,6 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		return nil
 	}
 	res := &SweepResult{CloseSweep: closeSweep}
-	staleAfter := time.Duration(staleSec) * time.Second
 	for _, o := range orders {
 		// §P1-7 超时撤单范围扩展到部成：已报/部成 均可能剩余未成交，需自动撤销。
 		if o.Status != "已报" && o.Status != "部成" {
@@ -913,9 +930,17 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 			continue
 		}
 		age := now.Sub(cntime.In(at))
+		// §C2 软回踩买单：优先用按单超时（timeout_sec>0），否则沿用全局 cancel_stale_sec。
+		// 卖单不受 entry_timeout_sec 影响（它只约束回踩入场单）。
+		// English: §C2 pullback buys use their per-order timeout when set; sells keep the global value.
+		orderStale := staleSec
+		if o.Side == "买入" && o.TimeoutSec > 0 {
+			orderStale = o.TimeoutSec
+		}
+		orderStaleAfter := time.Duration(orderStale) * time.Second
 		if strings.HasPrefix(o.OrderID, "pend:") {
 			// 占位行从未到达网关：超时降级为"发送失败"（同 signal_id 可重试）
-			if staleSec > 0 && age > staleAfter {
+			if orderStale > 0 && age > orderStaleAfter {
 				if err := c.store.MarkRealOrderSendFailed(c.userID, o.SignalID); err == nil {
 					res.Demoted++
 				} else {
@@ -924,7 +949,7 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 			}
 			continue
 		}
-		if !((staleSec > 0 && age > staleAfter) || closeSweep) {
+		if !((orderStale > 0 && age > orderStaleAfter) || closeSweep) {
 			continue
 		}
 		if err := c.execRef().Cancel(o.OrderID); err != nil {

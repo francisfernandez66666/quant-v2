@@ -676,8 +676,14 @@ func (s *Server) registerRoutes() {
 	// 子账号不拥有/不操作量化交易，后端据此鉴权，前端不自行判定权限。
 	// （QMT config is operator-owned: admin-only read+write; sub-accounts are denied at the API layer.）
 	// §N6-RISK（2026-10-21）：信号生成层两段开关（市场状态机 + 动态仓位/卖出加权）的管理员读写。
-	s.mux.HandleFunc("GET /api/config/regime", s.adminMiddleware(s.handleGetRegimeConfig))
-	s.mux.HandleFunc("POST /api/config/regime", s.adminMiddleware(s.handleSetRegimeConfig))
+	// §A0（2026-10-22）：sizing 改为账号级后，本人也要能读写自己的配置；权限判定下沉到
+	// handler（admin 任意账号 / 本人自己 / 他人 403），不能再由 adminMiddleware 一刀切。
+	// English: §A0 — sizing is account-scoped now, so the route only requires auth and the handler
+	// enforces admin-or-self; adminMiddleware would block self-service edits.
+	// §C1-V2 概念库状态（覆盖率/最后同步/失败概念）；admin 只读。
+	s.mux.HandleFunc("GET /api/config/concept/status", s.adminMiddleware(s.handleConceptStatus))
+	s.mux.HandleFunc("GET /api/config/regime", s.authMiddleware(s.handleGetRegimeConfig))
+	s.mux.HandleFunc("POST /api/config/regime", s.authMiddleware(s.handleSetRegimeConfig))
 	s.mux.HandleFunc("GET /api/config/qmt", s.adminMiddleware(s.handleGetQMTConfig))
 	s.mux.HandleFunc("POST /api/config/qmt", s.adminMiddleware(s.handleSetQMTConfig))
 
@@ -2204,42 +2210,150 @@ func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, 200, map[string]string{"status": "ok", "updated_at": merged.UpdatedAt})
 }
 
-// handleGetRegimeConfig 处理 GET /api/config/regime：市场状态机 + 动态仓位/卖出加权开关快照。
-// 两个配置段都是"信号生成层"的输入：enhance.market_state_enabled 决定大盘状态是否参与风险档，
-// sizing 决定买入缩放与卖出加权；执行层不读这两段。
-// English: returns the signal-layer switches — enhance (market-state machine) and sizing (buy
-// scaling / sell boost). The execution layer never reads them.
-func (s *Server) handleGetRegimeConfig(w http.ResponseWriter, r *http.Request) {
+// regimeTargetAccount 解析并鉴权 /api/config/regime 的目标账号。
+// 缺省 account_id = 当前登录账号；admin 可操作任意账号；普通账号只能操作自己，否则 403。
+// English: resolves and authorizes the target account — defaults to the caller; admins may target
+// anyone, ordinary accounts only themselves (403 otherwise).
+func (s *Server) regimeTargetAccount(w http.ResponseWriter, r *http.Request) (target string, ok bool) {
+	u := userFromContext(r)
+	if u == nil {
+		writeError(w, 401, "unauthorized")
+		return "", false
+	}
+	target = strings.TrimSpace(r.URL.Query().Get("account_id"))
+	if target == "" {
+		target = u.ID
+	}
+	if !u.IsAdmin() && target != u.ID {
+		opslog.Audit("config_regime_forbidden", u.ID, target, "非管理员尝试读写他人账号 sizing")
+		writeError(w, 403, "无权限：只能读写自己的仓位配置")
+		return "", false
+	}
+	return target, true
+}
+
+// regimeConfigPayload 组装 GET/POST 的统一回显：账号身份 + effective shadow + 三段配置。
+// §A2：无论库里的 shadow 省略还是显式 false/true，回显一律是 effective 布尔值，前端不再猜默认。
+// English: shared response — account identity, effective shadow (always explicit), and the three
+// config sections; the UI never has to infer the shadow default from a missing key.
+func (s *Server) regimeConfigPayload(target string, dedicated bool) map[string]interface{} {
+	sc, _ := s.cfg.GetSizingConfigFor(target)
+	eff := sc.ShadowOn()
+	sc.Shadow = &eff
+	return map[string]interface{}{
+		"account_id":          target,
+		"sizing_scope":        "account",
+		"sizing_has_override": dedicated,
+		"enhance":             s.cfg.GetEnhanceConfig(),
+		"sizing":              sc,
+		"macro_gate":          s.cfg.GetStrategyConfig().MacroGate,
+		"concept":             s.cfg.GetConceptConfig(),
+	}
+}
+
+// handleConceptStatus §C1-V2 处理 GET /api/config/concept/status：概念库覆盖率与逐概念同步状态。
+// 读不到账本/查询失败如实回错误，不返回“覆盖率 0 但看起来正常”的假读数。
+// English: §C1-V2 concept-library status — coverage and per-concept sync state; missing ledger or
+// query errors are surfaced honestly.
+func (s *Server) handleConceptStatus(w http.ResponseWriter, r *http.Request) {
+	db := s.realDB()
+	if db == nil {
+		writeError(w, 503, "实盘账本不可用，概念库状态不可读")
+		return
+	}
+	synced, total, coverage, last, err := db.ConceptCoverage()
+	if err != nil {
+		writeError(w, 500, "概念库覆盖率查询失败: "+err.Error())
+		return
+	}
+	states, err := db.ListConceptSyncState()
+	if err != nil {
+		writeError(w, 500, "概念库状态查询失败: "+err.Error())
+		return
+	}
+	failed := []string{}
+	for _, st := range states {
+		if st.Status != "ok" {
+			failed = append(failed, st.ConceptCode)
+		}
+	}
 	writeJSON(w, 200, map[string]interface{}{
-		"enhance":    s.cfg.GetEnhanceConfig(),
-		"sizing":     s.cfg.GetSizingConfig(),
-		"macro_gate": s.cfg.GetStrategyConfig().MacroGate,
+		"synced_concepts": synced,
+		"total_concepts":  total,
+		"coverage_pct":    coverage,
+		"last_success":    last,
+		"failed_concepts": failed,
+		"concepts":        states,
 	})
 }
 
-// handleSetRegimeConfig 处理 POST /api/config/regime：稀疏 merge（body 可只带 enhance 或只带
-// sizing，未出现的键一律保留）。写前经统一配置快照入口留痕。
-// English: sparse-merge writer for the two signal-layer config sections (absent keys keep values);
-// snapshotted through the shared config-write path before persisting.
+// handleGetRegimeConfig 处理 GET /api/config/regime：市场状态机 + 账号级仓位配置。
+// `account_id` 缺省=当前账号；admin 可查任意账号，普通账号只能查自己。
+// enhance/macro_gate 仍是系统级全局值，所有账号只读。
+// English: returns the signal-layer switches for the target account — sizing is account-scoped,
+// enhance/macro_gate remain global read-only values.
+func (s *Server) handleGetRegimeConfig(w http.ResponseWriter, r *http.Request) {
+	target, ok := s.regimeTargetAccount(w, r)
+	if !ok {
+		return
+	}
+	_, dedicated := s.cfg.GetSizingConfigFor(target)
+	writeJSON(w, 200, s.regimeConfigPayload(target, dedicated))
+}
+
+// handleSetRegimeConfig 处理 POST /api/config/regime：稀疏 merge（body 可只带 enhance/sizing/
+// macro_gate，未出现的键一律保留）。sizing 写目标账号专用键；enhance/macro_gate 只允许 admin
+// 写全局。写前经统一配置快照入口留痕，actor 与 target 分开记录。
+// English: sparse-merge writer — sizing goes to the target account's dedicated key; the global
+// enhance/macro_gate sections are admin-only. Snapshot + audit keep actor and target distinct.
 func (s *Server) handleSetRegimeConfig(w http.ResponseWriter, r *http.Request) {
+	u := userFromContext(r)
+	if u == nil {
+		writeError(w, 401, "unauthorized")
+		return
+	}
+	target, ok := s.regimeTargetAccount(w, r)
+	if !ok {
+		return
+	}
 	var body struct {
 		Enhance   map[string]json.RawMessage `json:"enhance"`
 		Sizing    map[string]json.RawMessage `json:"sizing"`
 		MacroGate map[string]json.RawMessage `json:"macro_gate"`
+		Concept   map[string]json.RawMessage `json:"concept"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	trace := s.snapshotConfigWrite(userIDFor(r), userIDFor(r), "regime")
-	if len(body.Enhance) > 0 {
-		if _, err := s.cfg.MergeEnhanceConfig(body.Enhance); err != nil {
-			writeError(w, 400, err.Error())
-			return
-		}
+	// 系统级段只有 admin 可写：普通账号即使把这两段塞进 body 也明确 403，不静默忽略后回 200。
+	if !u.IsAdmin() && (len(body.Enhance) > 0 || len(body.MacroGate) > 0 || len(body.Concept) > 0) {
+		writeError(w, 403, "无权限：enhance/macro_gate/concept 为系统级配置，仅管理员可修改")
+		return
+	}
+	trace := s.snapshotConfigWrite(u.ID, target, "regime")
+	// §A0：sizing 落账号专用键，单独取一份写前快照（全局那份覆盖不到账号账）。
+	var sizingTrace *configWriteTrace
+	if len(body.Sizing) > 0 {
+		t := s.snapshotConfigWrite(u.ID, target, "regime_sizing")
+		sizingTrace = &t
 	}
 	if len(body.Sizing) > 0 {
-		if _, err := s.cfg.MergeSizingConfig(body.Sizing); err != nil {
+		if _, err := s.cfg.MergeSizingConfigFor(target, body.Sizing); err != nil {
+			// 持久化/复读失败是 500；补丁本身非法（类型不符等）是 400。
+			if strings.Contains(err.Error(), "持久化") || strings.Contains(err.Error(), "复读") || strings.Contains(err.Error(), "存储不可用") {
+				writeError(w, 500, err.Error())
+			} else {
+				writeError(w, 400, err.Error())
+			}
+			return
+		}
+		if sizingTrace != nil {
+			sizingTrace.audit(s)
+		}
+	}
+	if len(body.Enhance) > 0 {
+		if _, err := s.cfg.MergeEnhanceConfig(body.Enhance); err != nil {
 			writeError(w, 400, err.Error())
 			return
 		}
@@ -2257,16 +2371,24 @@ func (s *Server) handleSetRegimeConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	opslog.Audit("config_regime_merge", userIDFor(r), "regime",
-		fmt.Sprintf("enhance_keys=%d sizing_keys=%d macro_gate_keys=%d %s",
-			len(body.Enhance), len(body.Sizing), len(body.MacroGate), trace.detail()))
+	if len(body.Concept) > 0 {
+		if _, err := s.cfg.MergeConceptConfig(body.Concept); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
+	sizingLedger := "none"
+	if sizingTrace != nil {
+		sizingLedger = sizingTrace.ledger
+	}
+	opslog.Audit("config_regime_merge", u.ID, target,
+		fmt.Sprintf("actor=%s target=%s enhance_keys=%d sizing_keys=%d macro_gate_keys=%d concept_keys=%d sizing_ledger=%s %s",
+			u.ID, target, len(body.Enhance), len(body.Sizing), len(body.MacroGate), len(body.Concept), sizingLedger, trace.detail()))
 	trace.audit(s)
-	writeJSON(w, 200, map[string]interface{}{
-		"status":     "ok",
-		"enhance":    s.cfg.GetEnhanceConfig(),
-		"sizing":     s.cfg.GetSizingConfig(),
-		"macro_gate": s.cfg.GetStrategyConfig().MacroGate,
-	})
+	_, dedicated := s.cfg.GetSizingConfigFor(target)
+	out := s.regimeConfigPayload(target, dedicated)
+	out["status"] = "ok"
+	writeJSON(w, 200, out)
 }
 
 // ── D1 规则配置 ──

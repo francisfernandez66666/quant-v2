@@ -17,6 +17,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,15 @@ import (
 // 名称含 ST（含 *ST，大小写不敏感）按 5% 档（4.9）。code 形如 "600519.SH" 或裸码均可。
 // English: board-aware limit-up threshold for the sealed-board buy guard — main board ~10%,
 // ChiNext/STAR 20%, BSE 30%, ST (name contains "ST") 5%.
+// vwapPremiumPct §C2 成交价相对市场 VWAP 的偏差（%）；缺 VWAP 返回 0（未采集）。
+// English: §C2 fill-vs-VWAP premium; zero when VWAP is absent.
+func vwapPremiumPct(fill, vwap float64) float64 {
+	if vwap <= 0 {
+		return 0
+	}
+	return (fill - vwap) / vwap * 100
+}
+
 func LimitUpPct(code, name string) float64 {
 	// §R6 P1-4 收敛到 data.LimitUpPct（全系统唯一口径，含北交所 30% 板）。
 	// English: delegated to data.LimitUpPct — single authoritative board-aware threshold.
@@ -131,6 +141,10 @@ type Position struct {
 	// English: the stock's ATR14 carried by the opening signal — used by the report-book mirror for
 	// C4 ATR dynamic stop distance; 0 for manual buys (mirror falls back to fixed-percentage stops).
 	ATR float64 `json:"atr,omitempty"`
+	// §C2 成交时点市场 VWAP 与信号价偏差（0/空=未采集，不伪造）。
+	// English: §C2 market VWAP at fill time and signal-vs-VWAP premium (zero = not captured).
+	MarketVWAP     float64 `json:"market_vwap,omitempty"`
+	VWAPPremiumPct float64 `json:"vwap_premium_pct,omitempty"`
 }
 
 // MarketValue 返回该持仓按当前估值价的市值。
@@ -215,6 +229,9 @@ type Trade struct {
 	// English: fees charged on this fill (commission + stamp tax; audit field for fee accounting).
 	Fee    float64 `json:"fee,omitempty"`    // 本笔成交费用（佣金+印花税）
 	Reason string  `json:"reason,omitempty"` // 原因
+	// §C2 成交时点市场 VWAP 与偏差（0/空=未采集）。
+	MarketVWAP     float64 `json:"market_vwap,omitempty"`
+	VWAPPremiumPct float64 `json:"vwap_premium_pct,omitempty"`
 }
 
 // ── §R1/R2 费用模型（A股口径）───────────────────────────────────────────
@@ -442,6 +459,23 @@ type Engine struct {
 	// reason is audited once. Cleared on a successful fill.
 	lastBuyReject map[string]string
 
+	// §C1 行业敞口（与实盘态同口径）：上限%、影子开关、行业查询源。默认全关/影子，
+	// 未注入时闸自然跳过，零行为变化。
+	// English: §C1 sector exposure (same semantics as the live gate) — cap %, shadow switch and
+	// industry lookup; all inert by default/when not injected.
+	sectorLimitPct float64
+	sectorShadow   bool
+	industryOf     func(code string) string
+	// §C1-V2 概念敞口（与实盘同口径）：上限、影子、覆盖率门槛、覆盖率读数、股票→概念反查。
+	// 覆盖率不可得/低于门槛时闸弃权；概念未知也弃权。
+	// English: §C1-V2 paper concept exposure — cap, shadow, coverage floor, coverage reading and
+	// stock→concepts lookup; missing/low-coverage inputs abstain.
+	conceptLimitPct    float64
+	conceptShadow      bool
+	conceptMinCoverage float64
+	conceptCoverageFn  func() (pct float64, ok bool)
+	conceptsOf         func(code string) []string
+
 	// §SHORT-3 融券做空侧（详见 short.go）：独立做空池 shortCash（预算，与做多 cash/pools
 	// 完全隔离）+ 负持仓表 shorts + 已实现盈亏 shortRealized + 利息按日计提去重表 shortFeeDone。
 	// 净值口径：总资产 = 做多(cash+mv) + 做空(shortCash + Σ担保占用 + 浮动盈亏)。
@@ -453,6 +487,148 @@ type Engine struct {
 	shortRealized float64                   // 做空已实现盈亏（买回平仓结算，含费用）
 	shortFeeDone  map[string]string         // 融券利息计提去重：code → 已计提交易日
 	shortOpenSeen map[string]string         // 开仓信号去重：code → 触发交易日（同日同码只下一笔融券单）
+}
+
+// SetSectorExposure §C1 注入行业敞口参数（limitPct<=0 或 industryOf=nil 时闸跳过）。
+// shadow=true 时命中只打日志放行，与实盘 risk_gates 影子期同口径。
+// English: §C1 injects the sector cap; shadow mode logs and passes, mirroring the live gate.
+func (e *Engine) SetSectorExposure(limitPct float64, shadow bool, industryOf func(code string) string) {
+	e.mu.Lock()
+	e.sectorLimitPct = limitPct
+	e.sectorShadow = shadow
+	e.industryOf = industryOf
+	e.mu.Unlock()
+}
+
+// SetConceptExposure §C1-V2 注入纸面概念敞口参数（任一依赖缺席/上限<=0 时闸跳过）。
+// English: §C1-V2 injects paper concept exposure; any missing dependency keeps the gate inert.
+func (e *Engine) SetConceptExposure(limitPct float64, shadow bool, minCoverage float64,
+	coverageFn func() (float64, bool), conceptsOf func(code string) []string) {
+	e.mu.Lock()
+	e.conceptLimitPct = limitPct
+	e.conceptShadow = shadow
+	e.conceptMinCoverage = minCoverage
+	e.conceptCoverageFn = coverageFn
+	e.conceptsOf = conceptsOf
+	e.mu.Unlock()
+}
+
+// checkConceptExposureLocked §C1-V2 纸面概念敞口检查（调用方须持 e.mu）。
+// 与实盘同口径：单票多概念取最大敞口，不做重叠求和；覆盖率不足/概念未知弃权。
+// English: §C1-V2 paper concept check — single largest matching concept, no overlap sum;
+// low coverage / unknown concept abstain.
+func (e *Engine) checkConceptExposureLocked(code string, orderCost float64) (bool, string) {
+	if e.conceptLimitPct <= 0 || e.conceptCoverageFn == nil || e.conceptsOf == nil || orderCost <= 0 {
+		return true, ""
+	}
+	coverage, ok := e.conceptCoverageFn()
+	if !ok || coverage < e.conceptMinCoverage {
+		return true, ""
+	}
+	targets := e.conceptsOf(code)
+	if len(targets) == 0 {
+		return true, ""
+	}
+	total := e.cash
+	for _, p := range e.positions {
+		price := p.Mark
+		if price <= 0 {
+			price = p.CostPrice
+		}
+		if price > 0 {
+			total += price * float64(p.Qty)
+		}
+	}
+	if total <= 0 {
+		return true, ""
+	}
+	held := map[string]float64{}
+	for _, p := range e.positions {
+		if p.Qty <= 0 {
+			continue
+		}
+		price := p.Mark
+		if price <= 0 {
+			price = p.CostPrice
+		}
+		if price <= 0 {
+			continue
+		}
+		for _, c := range e.conceptsOf(p.Code) {
+			held[c] += price * float64(p.Qty)
+		}
+	}
+	worstPct, worst := 0.0, ""
+	for _, c := range targets {
+		pct := (held[c] + orderCost) / total * 100
+		if pct > worstPct {
+			worstPct, worst = pct, c
+		}
+	}
+	if worst == "" || worstPct <= e.conceptLimitPct {
+		return true, ""
+	}
+	reason := fmt.Sprintf("概念敞口超限: 概念=%s 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%（覆盖率 %.1f%%）",
+		worst, held[worst]+orderCost, total, worstPct, e.conceptLimitPct, coverage)
+	if e.conceptShadow {
+		log.Printf("[paper] §C1-V2 概念敞口影子命中（放行） %s: %s", code, reason)
+		return true, ""
+	}
+	return false, reason
+}
+
+// checkSectorExposureLocked §C1 纸面行业敞口检查（调用方须持 e.mu）。
+// 未知行业/总资产不可得 → 放行（弃权）；影子命中只留日志，不拒单。
+// English: §C1 paper-book sector check (caller holds e.mu); unknown inputs abstain; shadow logs only.
+func (e *Engine) checkSectorExposureLocked(code string, orderCost float64) (bool, string) {
+	if e.sectorLimitPct <= 0 || e.industryOf == nil || orderCost <= 0 {
+		return true, ""
+	}
+	target := strings.TrimSpace(e.industryOf(code))
+	if target == "" {
+		return true, ""
+	}
+	total := e.cash
+	for _, p := range e.positions {
+		price := p.Mark
+		if price <= 0 {
+			price = p.CostPrice
+		}
+		if price > 0 {
+			total += price * float64(p.Qty)
+		}
+	}
+	if total <= 0 {
+		return true, ""
+	}
+	held := 0.0
+	for _, p := range e.positions {
+		if p.Qty <= 0 {
+			continue
+		}
+		if ind := strings.TrimSpace(e.industryOf(p.Code)); ind == "" || ind != target {
+			continue
+		}
+		price := p.Mark
+		if price <= 0 {
+			price = p.CostPrice
+		}
+		if price > 0 {
+			held += price * float64(p.Qty)
+		}
+	}
+	proj := held + orderCost
+	pct := proj / total * 100
+	if pct <= e.sectorLimitPct {
+		return true, ""
+	}
+	reason := fmt.Sprintf("行业敞口超限: 行业=%s 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%",
+		target, proj, total, pct, e.sectorLimitPct)
+	if e.sectorShadow {
+		log.Printf("[paper] §C1 行业敞口影子命中（放行） %s: %s", code, reason)
+		return true, ""
+	}
+	return false, reason
 }
 
 // New 创建模拟盘引擎并加载历史持久化数据。
@@ -1037,7 +1213,8 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// 控制器准入（白名单/黑名单/持续性确认），本引擎只负责撮合执行。
 		// English: the in-engine buy-confirm state machine moved to the signal controller; signals
 		// reaching here are already admitted — pure execution.
-		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, s.SizeScale, false); err != nil {
+		qVWAP, _ := data.VWAPOf(q)
+		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, s.SizeScale, false, qVWAP); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 			// 订单留痕：买入被拒（现金不足/超上限/池上限/买不起一手）。
 			// English: order audit — the buy was rejected (cash short / cap / pool cap / can't afford a lot).
@@ -1164,7 +1341,7 @@ func (e *Engine) poolPositionCountLocked(poolKey string) int {
 // each other. qty > 0 is an explicit lot count (manual buy/add, fails when exceeding the pool balance);
 // qty <= 0 auto-sizes to FixedAmount in whole lots, shrinking to the largest affordable lot on a
 // shortfall (skipping below one lot).
-func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string, confidence, sizeScale float64, manual bool) error {
+func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string, confidence, sizeScale float64, manual bool, marketVWAP float64) error {
 	// 每池持仓上限（与全局上限解耦，可自定义）：该池新开仓达到池上限即拒绝。
 	// 池上限 0 = 该池不单独设限；加仓（已持仓）不在此路径（走 addToPositionLocked）。
 	// English: per-pool position cap (decoupled from the global cap, customizable) — a new open in this
@@ -1224,6 +1401,15 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		log.Printf("[paper] 分仓预算拒绝 %s→%s: %s", strategy, code, reason)
 		return errPoolDiscipline
 	}
+	// §C1 行业/概念敞口：在最终股数/金额确定后、扣款前检查；纸面与实盘同口径。
+	if ok, why := e.checkSectorExposureLocked(code, cost); !ok {
+		log.Printf("[paper] §C1 行业敞口拒绝 %s(%s): %s", code, name, why)
+		return fmt.Errorf("%s", why)
+	}
+	if ok, why := e.checkConceptExposureLocked(code, cost); !ok {
+		log.Printf("[paper] §C1-V2 概念敞口拒绝 %s(%s): %s", code, name, why)
+		return fmt.Errorf("%s", why)
+	}
 	pool := e.pools[poolKey]
 	if cost+fee > pool {
 		if explicitQty {
@@ -1277,6 +1463,9 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		SignalAt:     signalAt,
 		FilledAt:     now,
 		Mark:         price,
+		// §C2 VWAP 偏差：只在采集到时计算；缺失保持 0。
+		MarketVWAP:     marketVWAP,
+		VWAPPremiumPct: vwapPremiumPct(price, marketVWAP),
 	}
 	latency := int64(0)
 	if !signalAt.IsZero() {
@@ -1286,19 +1475,21 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		}
 	}
 	e.trades = append(e.trades, Trade{
-		Code:         code,
-		Name:         name,
-		Strategy:     strategy,
-		StrategyType: poolKey,
-		Side:         "buy",
-		Price:        price,
-		SignalPrice:  signalPrice,
-		Qty:          qty,
-		Amount:       cost,
-		Time:         now,
-		LatencySec:   latency,
-		Fee:          fee,
-		Reason:       reason,
+		Code:           code,
+		Name:           name,
+		Strategy:       strategy,
+		StrategyType:   poolKey,
+		Side:           "buy",
+		Price:          price,
+		SignalPrice:    signalPrice,
+		Qty:            qty,
+		Amount:         cost,
+		Time:           now,
+		LatencySec:     latency,
+		Fee:            fee,
+		Reason:         reason,
+		MarketVWAP:     marketVWAP,
+		VWAPPremiumPct: vwapPremiumPct(price, marketVWAP),
 	})
 	log.Printf("[paper] 模拟买入 %s(%s) %d股 @%.2f 信号价%.2f 延迟%ds 费%.2f",
 		code, name, qty, price, signalPrice, latency, fee)
@@ -1357,7 +1548,8 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 	if poolKey != "" {
 		reason = "手动模拟买入(归" + poolKey + ")"
 	}
-	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, reason, 1.0, 0, true); err != nil {
+	qVWAP, _ := data.VWAPOf(quotes[code])
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, reason, 1.0, 0, true, qVWAP); err != nil {
 		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
@@ -1428,7 +1620,8 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	if poolKey != "" {
 		reason = "手动模拟买入(归" + poolKey + ")"
 	}
-	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, reason, 1.0, 0, true); err != nil {
+	qVWAP, _ := data.VWAPOf(quotes[code])
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, reason, 1.0, 0, true, qVWAP); err != nil {
 		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
@@ -1473,6 +1666,15 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	}
 	if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
 		return fmt.Errorf("%w: %s", errPoolDiscipline, reason)
+	}
+	// §C1 行业/概念敞口：加仓同样增加敞口，必须与首买同闸。
+	if ok, why := e.checkSectorExposureLocked(code, cost); !ok {
+		log.Printf("[paper] §C1 行业敞口拒绝加仓 %s(%s): %s", code, name, why)
+		return fmt.Errorf("%s", why)
+	}
+	if ok, why := e.checkConceptExposureLocked(code, cost); !ok {
+		log.Printf("[paper] §C1-V2 概念敞口拒绝加仓 %s(%s): %s", code, name, why)
+		return fmt.Errorf("%s", why)
 	}
 	e.pools[poolKey] = pool - cost - fee
 	e.cash -= cost + fee

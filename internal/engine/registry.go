@@ -250,6 +250,44 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	// 的 5s 调度路径；改为锁外构建、重取锁二次检查后再注册。
 	cfg := r.opts.Paper.Cfg()
 	pe := paper.New(cfg, r.paperPath(userID))
+	// §C1 行业敞口：纸面与实盘同口径。参数取该账号 QMT risk_gate，行业源取行情协调器；
+	// 任一缺席时闸自动跳过（零行为变化）。
+	// English: §C1 paper/live parity — cap from the account's qmt.risk_gate, industry from the
+	// coordinator; either missing keeps the gate inert.
+	if r.opts.CfgMgr != nil {
+		q := r.opts.CfgMgr.GetQMTConfigFor(userID)
+		if q != nil {
+			var ind func(string) string
+			if r.opts.Coordinator != nil {
+				ind = r.opts.Coordinator.GetStockSector
+			}
+			pe.SetSectorExposure(q.RiskGate.SectorValuePct, q.RiskGate.SectorValueShadowOn(), ind)
+		}
+		// §C1-V2 纸面概念敞口：覆盖率与时效都从实盘库读；任一不可得时闸弃权。
+		if st := r.opts.RealStore; st != nil {
+			cc := r.opts.CfgMgr.GetConceptConfig()
+			coverageFn := func() (float64, bool) {
+				_, _, cov, last, err := st.ConceptCoverage()
+				if err != nil || cov <= 0 {
+					return 0, false
+				}
+				if cc.MaxStaleness() > 0 && last != "" {
+					if t, perr := time.Parse(time.RFC3339, last); perr != nil || time.Since(t) > time.Duration(cc.MaxStaleness())*time.Hour {
+						return 0, false
+					}
+				}
+				return cov, true
+			}
+			conceptsFn := func(code string) []string {
+				codes, err := st.ConceptMembersForTsCode(code)
+				if err != nil {
+					return nil
+				}
+				return codes
+			}
+			pe.SetConceptExposure(q.RiskGate.ConceptValuePct, q.RiskGate.ConceptValueShadowOn(), cc.MinCoverage(), coverageFn, conceptsFn)
+		}
+	}
 	// §SIGNAL_CONTROLLER 20260917：统一纪律（买入确认窗）注入已随 paper 状态机删除——
 	// rules.paper.discipline 现由引擎 paperSignalPolicy 装配进信号控制器 paper 通道裁定。
 	// English: discipline injection moved to the signal controller's paper policy builder.
@@ -960,7 +998,16 @@ func (r *Registry) build(userID string) *Engine {
 		// per-account gate; absent coordinator or pct=0 keeps the gate inert (shadow by default).
 		if opts.Coordinator != nil {
 			ctrl.SetCrossPriceSource(opts.Coordinator.CrossCheckPrice)
+			// §C1 行业敞口：注入协调器的行业查询（东财 f127，带缓存）；闸默认关，
+			// 开启后默认影子，本接线本身零行为变化。
+			// English: §C1 wires the coordinator's industry lookup; the gate is off by default
+			// and shadow-first, so this wiring alone changes no behaviour.
+			ctrl.SetIndustrySource(opts.Coordinator.GetStockSector)
 		}
+		// §C1-V2 概念覆盖率门槛取**全局** rules.concept（概念库是系统级数据，账号快照里的
+		// concept 可能是旧副本）。
+		cc := opts.CfgMgr.GetConceptConfig()
+		ctrl.SetConceptPolicy(cc.MinCoverage(), cc.MaxStaleness())
 		// 引擎侧两个库职责分离（§UAT-2026-09-08 修复）：
 		//  - realStore = 实盘账本库（live.db）：pushRealAdvice 读 real_positions 生成建议/自动卖出；
 		//  - d1Store   = 研究库（trading.db）：d1_scores 历史落库（研究侧数据）。

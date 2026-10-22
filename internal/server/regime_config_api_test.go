@@ -165,8 +165,15 @@ func TestRegimeConfigPersistsToDisk(t *testing.T) {
 	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", body)); rr.Code != 200 {
 		t.Fatalf("写入应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
+	// §A0：sizing 已改为账号专用键，落盘验证必须挂回同一 KV 存储再读账号配置；
+	// 全局 config.json 只承载 enhance/macro_gate。
 	reloaded := config.NewManager(cfgPath)
-	got := reloaded.GetSizingConfig()
+	store2 := auth.NewManager(filepath.Dir(cfgPath))
+	if err := store2.Init(); err != nil {
+		t.Fatalf("reopen auth store: %v", err)
+	}
+	reloaded.SetStore(store2)
+	got, _ := reloaded.GetSizingConfigFor(admin.ID)
 	if !got.Enabled {
 		t.Fatal("sizing.enabled 未落盘（重启后动态仓位会回退到关）")
 	}
@@ -273,7 +280,14 @@ func TestRegimeConfigFineSizingRoundTrip(t *testing.T) {
 		t.Fatalf("macro_lead_curve 未按新长度回显, got %v", curve2)
 	}
 	// 落盘侧读回：新值在、未提过的兄弟键仍是默认（稀疏 merge 的旁证）。
-	got := config.NewManager(cfgPath).GetSizingConfig()
+	// §A0：sizing 住账号专用键，必须挂回 KV 存储再读。
+	reloaded := config.NewManager(cfgPath)
+	store2 := auth.NewManager(filepath.Dir(cfgPath))
+	if err := store2.Init(); err != nil {
+		t.Fatalf("reopen auth store: %v", err)
+	}
+	reloaded.SetStore(store2)
+	got, _ := reloaded.GetSizingConfigFor(admin.ID)
 	if got.Floor != 0.20 || got.KellyLambda != 0.35 || got.StoplossGuardCount != 6 {
 		t.Fatalf("精细参数未落盘: floor=%v kelly=%v guard=%v", got.Floor, got.KellyLambda, got.StoplossGuardCount)
 	}
@@ -334,26 +348,139 @@ func TestRegimeConfigMacroGateRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRegimeConfigAdminOnly 非管理员访问两端点一律 403——这些开关是系统级资金纪律，
-// 子账号不得自行放宽风险档。
-// English: non-admins get 403 on both endpoints (system-level risk discipline is admin-owned).
-func TestRegimeConfigAdminOnly(t *testing.T) {
-	s, _, _ := newRegimeTestServer(t)
+// TestRegimeConfigAccountPermissions §A0 权限矩阵：admin 任意账号；本人可读写自己的 sizing；
+// 他人账号 403；enhance/macro_gate 是系统级，普通账号写入 403。
+// English: §A0 — admins may target any account; a user may read/write their own sizing; other
+// accounts are 403; the system-level enhance/macro_gate sections stay admin-only.
+func TestRegimeConfigAccountPermissions(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
 	member, err := s.auth.CreateUser("member-regime", "pw", auth.RoleUser, nil, 0)
 	if err != nil {
 		t.Fatalf("create member: %v", err)
 	}
-	if rr := adminDo(s, adminReq(s, member, http.MethodGet, "/api/config/regime", "")); rr.Code != 403 {
-		t.Fatalf("非 admin GET 应 403, got %d", rr.Code)
+	other, err := s.auth.CreateUser("other-regime", "pw", auth.RoleUser, nil, 0)
+	if err != nil {
+		t.Fatalf("create other: %v", err)
 	}
+	// 本人读自己：200。
+	if rr := adminDo(s, adminReq(s, member, http.MethodGet, "/api/config/regime", "")); rr.Code != 200 {
+		t.Fatalf("本人 GET 自己应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 本人写自己的 sizing：200，且只影响自己。
 	rr := adminDo(s, adminReq(s, member, http.MethodPost, "/api/config/regime",
-		`{"sizing":{"enabled":true}}`))
-	if rr.Code != 403 {
-		t.Fatalf("非 admin POST 应 403, got %d body=%s", rr.Code, rr.Body.String())
+		`{"sizing":{"enabled":true,"shadow":false}}`))
+	if rr.Code != 200 {
+		t.Fatalf("本人写自己 sizing 应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
-	// 拒绝必须是「什么都没改」，而不是「改了但没告诉调用方」。
-	if s.cfg.GetSizingConfig().Enabled {
+	if got, _ := s.cfg.GetSizingConfigFor(member.ID); !got.Enabled {
+		t.Fatal("本人写入未生效")
+	}
+	if got, _ := s.cfg.GetSizingConfigFor(admin.ID); got.Enabled {
+		t.Fatal("本人写入污染了 admin 的账号配置")
+	}
+	// 本人读/写他人：403。
+	if rr := adminDo(s, adminReq(s, member, http.MethodGet, "/api/config/regime?account_id="+other.ID, "")); rr.Code != 403 {
+		t.Fatalf("本人 GET 他人应 403, got %d", rr.Code)
+	}
+	if rr := adminDo(s, adminReq(s, member, http.MethodPost, "/api/config/regime?account_id="+other.ID,
+		`{"sizing":{"enabled":true}}`)); rr.Code != 403 {
+		t.Fatalf("本人写他人应 403, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got, _ := s.cfg.GetSizingConfigFor(other.ID); got.Enabled {
 		t.Fatal("被 403 拒绝的写入仍生效（鉴权挡在副作用之后）")
+	}
+	// 普通账号写系统级段：403，且全局 enhance 不变。
+	beforeEnh := s.cfg.GetEnhanceConfig()
+	if rr := adminDo(s, adminReq(s, member, http.MethodPost, "/api/config/regime",
+		`{"enhance":{"market_state_enabled":true}}`)); rr.Code != 403 {
+		t.Fatalf("普通账号写 enhance 应 403, got %d", rr.Code)
+	}
+	if s.cfg.GetEnhanceConfig().MarketState != beforeEnh.MarketState {
+		t.Fatal("被 403 拒绝的系统级写入仍生效")
+	}
+	// admin 代配他人：200。
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime?account_id="+other.ID,
+		`{"sizing":{"enabled":true}}`)); rr.Code != 200 {
+		t.Fatalf("admin 代配他人应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got, _ := s.cfg.GetSizingConfigFor(other.ID); !got.Enabled {
+		t.Fatal("admin 代配未生效")
+	}
+}
+
+// TestRegimeConfigShadowEcho §A2：GET 必须显式回显 effective shadow（空/true/false 三态），
+// 前端不再靠“字段缺失”推断默认 true；响应同时带回 account_id 与 sizing_scope。
+// English: §A2 — GET always echoes an explicit effective shadow (absent/true/false), so the UI
+// never infers the default from a missing key; account identity is echoed too.
+func TestRegimeConfigShadowEcho(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+
+	shadowOf := func(t *testing.T, body string) bool {
+		t.Helper()
+		var got struct {
+			AccountID   string         `json:"account_id"`
+			SizingScope string         `json:"sizing_scope"`
+			Sizing      map[string]any `json:"sizing"`
+		}
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("载荷解析失败: %v body=%s", err, body)
+		}
+		if got.AccountID != admin.ID || got.SizingScope != "account" {
+			t.Fatalf("账号身份回显不对: account_id=%q scope=%q", got.AccountID, got.SizingScope)
+		}
+		v, ok := got.Sizing["shadow"].(bool)
+		if !ok {
+			t.Fatalf("shadow 未被显式回显（缺省/非布尔）: %v", got.Sizing["shadow"])
+		}
+		return v
+	}
+
+	rr := adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
+	if rr.Code != 200 {
+		t.Fatalf("GET 应 200, got %d", rr.Code)
+	}
+	if !shadowOf(t, rr.Body.String()) {
+		t.Fatal("空配置的 effective shadow 应为 true")
+	}
+
+	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", `{"sizing":{"shadow":false}}`))
+	if rr.Code != 200 {
+		t.Fatalf("写 shadow=false 应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if shadowOf(t, rr.Body.String()) {
+		t.Fatal("显式 false 后回显仍为 true")
+	}
+	rr = adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
+	if shadowOf(t, rr.Body.String()) {
+		t.Fatal("GET 未回显已保存的 shadow=false")
+	}
+
+	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", `{"sizing":{"shadow":true}}`))
+	if rr.Code != 200 || !shadowOf(t, rr.Body.String()) {
+		t.Fatalf("显式 true 回显失败: %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRegimeConceptConfigRoundTrip §C1-V2：concept 段随 regime API 往返（系统级，admin 写）。
+// English: §C1-V2 — the concept section round-trips through the regime API (system-level, admin-only).
+func TestRegimeConceptConfigRoundTrip(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"concept":{"enabled":true,"shadow":false,"min_coverage_pct":97,"max_staleness_hours":24}}`))
+	if rr.Code != 200 {
+		t.Fatalf("写 concept 应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Concept map[string]any `json:"concept"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析: %v", err)
+	}
+	if got.Concept == nil || got.Concept["enabled"] != true || got.Concept["min_coverage_pct"] != float64(97) {
+		t.Fatalf("concept 未回显: %v", got.Concept)
+	}
+	if c := s.cfg.GetConceptConfig(); !c.Enabled || c.MinCoverage() != 97 || c.MaxStaleness() != 24 {
+		t.Fatalf("concept 未落库: %+v", c)
 	}
 }
 
@@ -401,8 +528,10 @@ func TestRegimeConfigWriteIsRollbackable(t *testing.T) {
 	// 文件还没落地时取不到基线（os.ReadFile 报 no such file），这条对**所有**全局配置面
 	// 一视同仁，属既有边缘行为、非本批引入——现网 config.json 恒存在，故不记成缺陷，
 	// 只在本用例里绕开，免得把「快照语义」这场大改混进风控批。
+	// §A0 后 sizing 写账号专用键、不再落地全局 config.json；这里改用 enhance 预置，
+	// 让全局配置文件先存在（本用例验证的是 regime 全局快照面）。
 	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
-		`{"sizing":{"enabled":true}}`)); rr.Code != 200 {
+		`{"enhance":{"market_state_enabled":true}}`)); rr.Code != 200 {
 		t.Fatalf("预置写入应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
 	tr := s.snapshotConfigWrite(admin.ID, admin.ID, "regime")

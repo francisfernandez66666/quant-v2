@@ -67,6 +67,8 @@ const (
 	// StageSizing §DYN-SIZE 动态仓位硬拦（情绪冰点 / 风险档Red / 个股LLM利空且风险档≥Yellow /
 	// 连续止损熔断 / 长假前最后一日禁开仓）：命中即把买入降级为 hold，不进金额连乘。
 	StageSizing = "sizing"
+	// StageTechFilter §C4 KDJ/长均线买入过滤（影子期只标注，正式期降级 hold）。
+	StageTechFilter = "tech_filter"
 )
 
 // Decision 单信号单通道裁定。留痕结构体（Recent 环形缓冲与 HTTP 端点共用形状）。
@@ -118,6 +120,9 @@ type Policy struct {
 	// English: §DYN-SIZE market-regime snapshot. A zero value abstains on every factor, so the
 	// synthesis returns Scale=1.0 — legacy assembly points that don't inject it keep zero change.
 	Regime Regime
+	// TechFilter §C4 买入技术过滤配置（KDJ J 上限 / 长均线）；两条都未配=关闭。
+	// English: §C4 buy-side technical filter (KDJ J cap / long MA); both unset = disabled.
+	TechFilter config.TechFilterConfig
 }
 
 // probeKey 持续性探针状态键：(通道, 账号, 战法键, 代码)。
@@ -359,6 +364,19 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 		d.Stage = StageSectorBlack
 		d.Reason = fmt.Sprintf("板块黑名单(%s)", sig.Sector)
 		return c.blockOrShadow(&d, pol)
+	}
+	// 3.5 §C4 技术过滤：命中后影子期只标注、继续走原流程；正式期降级 hold。
+	// English: §C4 technical filter — shadow annotates and continues; enforce downgrades to hold.
+	if hit, why := techFilterHit(sig, pol.TechFilter); hit {
+		d.Stage = StageTechFilter
+		d.Reason = why
+		if pol.TechFilter.ShadowOn() {
+			d.Shadow = true
+		} else {
+			d.Verdict = VerdictHold
+			c.record(d)
+			return d
+		}
 	}
 	// 4. 持续性监测（探针+确认窗；双窗≤0=未启用，买入直通）
 	disc := pol.Discipline

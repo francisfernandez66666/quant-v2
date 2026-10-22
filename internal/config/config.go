@@ -119,6 +119,37 @@ type Rules struct {
 	// English: §DYN-SIZE dynamic position-sizing config. Safe by default — Enabled=false keeps every
 	// admission verdict unchanged (shadow readouts only).
 	Sizing SizingConfig `json:"sizing"`
+	// Concept §C1-V2 概念库每日同步与敞口开关（独立于 SizingConfig，避免 0 被 WithDefaults 补默认）。
+	// English: §C1-V2 concept-library sync/exposure switches, independent of SizingConfig.
+	Concept ConceptConfig `json:"concept"`
+}
+
+// ConceptConfig §C1-V2 概念库同步与自动接线。
+// 默认关闭；覆盖率达阈值且数据未过期后，由后台任务或 admin 显式开启。
+// English: §C1-V2 concept sync; off by default, enabled only after coverage/staleness checks.
+type ConceptConfig struct {
+	Enabled           bool    `json:"enabled"`
+	Shadow            bool    `json:"shadow"`
+	MinCoveragePct    float64 `json:"min_coverage_pct"`
+	MaxStalenessHours int     `json:"max_staleness_hours"`
+}
+
+// MinCoverage §C1-V2 覆盖率阈值（<=0 回退 95%）。
+// English: coverage threshold (<=0 → 95%).
+func (c ConceptConfig) MinCoverage() float64 {
+	if c.MinCoveragePct <= 0 {
+		return 95
+	}
+	return c.MinCoveragePct
+}
+
+// MaxStaleness §C1-V2 数据最大陈旧小时数（<=0 回退 48h）。
+// English: max data staleness (<=0 → 48h).
+func (c ConceptConfig) MaxStaleness() int {
+	if c.MaxStalenessHours <= 0 {
+		return 48
+	}
+	return c.MaxStalenessHours
 }
 
 // ResearchConfig §ADJ-BASIS-2（2026-09-23）研究战法库相关配置。目前只有一项：
@@ -298,6 +329,54 @@ type EnhanceConfig struct {
 	DynWeight bool `json:"dynweight_enabled"`
 	// T0 底仓 T+0（P3）。
 	T0 bool `json:"t0_enabled"`
+	// RiskPoolShadow §C6 跌停池/炸板池影子读数（nil/true=默认只读影子）：只记录家数与
+	// “若纳入风险合成是否会改档”，不改变 RiskTier。缺失数据弃权，不把取不到当 0。
+	// English: §C6 risk-pool shadow readout (nil/true = shadow by default) — records counts and
+	// whether the tier would change; missing data abstains.
+	RiskPoolShadow *bool `json:"risk_pool_shadow,omitempty"`
+	// TechFilter §C4 KDJ/长均线买入过滤（默认关/影子）。
+	// English: §C4 KDJ / long-MA buy filter (off / shadow by default).
+	TechFilter TechFilterConfig `json:"tech_filter,omitempty"`
+}
+
+// RiskPoolShadowOn §C6 风险池影子读数是否开启（nil/true=开，显式 false 关）。
+// English: §C6 risk-pool shadow switch (nil/true = on).
+func (e EnhanceConfig) RiskPoolShadowOn() bool { return e.RiskPoolShadow == nil || *e.RiskPoolShadow }
+
+// TechFilterConfig §C4 买入技术过滤配置。
+//   - KDJJMax >0：J 值高于该阈值 → 不新开仓；
+//   - MAFilter：off / ma20 / ma60 / ma120_250；
+//   - Shadow：nil/true=只记录“本应拦截”，不改裁定。
+//
+// English: §C4 buy-side technical filter. KDJJMax rejects J above the threshold; MAFilter selects
+// the MA rule; Shadow (nil/true) records-only, explicit false enforces.
+type TechFilterConfig struct {
+	KDJJMax  float64 `json:"kdj_j_max"`
+	MAFilter string  `json:"ma_filter"`
+	Shadow   *bool   `json:"shadow,omitempty"`
+}
+
+// ShadowOn §C4 是否影子模式（nil/true=影子）。
+// English: §C4 whether the filter is shadow-only (nil/true = shadow).
+func (t TechFilterConfig) ShadowOn() bool { return t.Shadow == nil || *t.Shadow }
+
+// MAFilterOf §C4 归一化均线过滤档位：off/ma20/ma60/ma120_250；未知值回退 off（不误拦）。
+// English: §C4 normalizes the MA filter; unknown values fall back to off (never over-block).
+func (t TechFilterConfig) MAFilterOf() string {
+	switch strings.ToLower(strings.TrimSpace(t.MAFilter)) {
+	case "ma20", "ma60", "ma120_250", "ma120250":
+		if strings.EqualFold(strings.TrimSpace(t.MAFilter), "ma120250") {
+			return "ma120_250"
+		}
+		return strings.ToLower(strings.TrimSpace(t.MAFilter))
+	}
+	return "off"
+}
+
+// Enabled §C4 过滤是否配置了至少一条规则（两条都未配=关闭，零行为变化）。
+// English: §C4 reports whether at least one rule is configured (both unset = disabled).
+func (t TechFilterConfig) Enabled() bool {
+	return t.KDJJMax > 0 || t.MAFilterOf() != "off"
 }
 
 // PaperConfig 模拟盘（纸面交易）配置：把 buy 信号按实时价自动撮合成虚拟持仓，独立于真实持仓。
@@ -430,6 +509,23 @@ type QMTConfig struct {
 	// if 0 meant "off"); negative = explicitly disable. Read via EffectiveMinBuyPrice.
 	// 最低买入价
 	MinBuyPrice float64 `json:"min_buy_price"`
+	// EntryPullbackPct §C2 软回踩：>0 时挂单价 = min(信号价, VWAP×(1−pct/100))；0=关（默认）。
+	// 只改限价参考，不改变股数上限；未成交仍由既有超时撤单兜底。
+	// English: §C2 soft pullback — limit price = min(signal, VWAP×(1−pct/100)); 0 = off.
+	EntryPullbackPct float64 `json:"entry_pullback_pct"`
+	// EntryTimeoutSec §C2 软回踩单超时秒数（0=沿用 qmt.cancel_stale_sec 的既有撤单闭环）。
+	// English: §C2 pullback order timeout (0 = use the existing cancel_stale_sec sweep).
+	EntryTimeoutSec int `json:"entry_timeout_sec"`
+	// MaxSignalVWAPPremiumPct §C2 硬过滤：信号价高于 VWAP 超过该 % 时放弃本次买入；0=关（默认）。
+	// 上线前先影子统计误杀率。
+	// English: §C2 hard filter — skip the buy when the signal price is above VWAP by more than this
+	// percent; 0 = off (default).
+	MaxSignalVWAPPremiumPct float64 `json:"max_signal_vwap_premium_pct"`
+	// MaxSignalVWAPPremiumShadow §C2 硬过滤影子模式（nil/true=默认影子）：命中只记录“本应放弃”，
+	// 不真的跳过；显式 false 才硬过滤。先影子统计误杀率。
+	// English: §C2 hard-filter shadow (nil/true = shadow by default): record the would-be skip only;
+	// explicit false enforces it.
+	MaxSignalVWAPPremiumShadow *bool `json:"max_signal_vwap_premium_shadow,omitempty"`
 	// MinOrderAmount 单笔买入最低成交额闸（元；owner 2026-10-12 裁决）：成交额=股价×最终买入股数，
 	// 低于该值的单子（典型=降档后的 1 手 2 手碎单）不做自动买入。判据在现金降档**之后**、
 	// 组单之前取最终股数核算。0=按出厂默认 5000 生效（同上：存量快照缺键必须兜默认而非旁路）；
@@ -439,6 +535,11 @@ type QMTConfig struct {
 	// default 5000; negative = explicitly disable. Read via EffectiveMinOrderAmount.
 	// 单笔最低成交额
 	MinOrderAmount float64 `json:"min_order_amount"`
+	// AutoSellAllSources §B7（owner 2026-10-22）全卖出自动化开关（nil/false=保持旧行为）：
+	// true 时战法自带来源的止盈/减仓也自动执行（止损本就任意来源自动）。默认 false 便于回滚。
+	// English: §B7 all-source auto-sell (nil/false = legacy): when true, strategy-native TP/trim
+	// sources also auto-execute (stop-loss already auto from any source). Off by default for rollback.
+	AutoSellAllSources *bool `json:"auto_sell_all_sources,omitempty"`
 	// AutoSell 实盘卖出自动化开关（§GAP1.1，默认开启）：mode=auto 时，止损级建议
 	// （止损/清仓类）自动全仓卖出，止盈/减仓保持提醒半自动。signal_id 按日幂等防重。
 	// English: auto-sell switch for the real book (default on): in auto mode, stop-loss-class advice
@@ -537,6 +638,18 @@ type QMTConfig struct {
 // English: whether the P4 auto-buy caution layer is on (nil = false, conservative; must be enabled explicitly).
 func (q QMTConfig) AutoCautionOn() bool { return q.AutoRiskCaution != nil && *q.AutoRiskCaution }
 
+// VWAPPremiumShadowOn §C2 VWAP 硬过滤是否仍处影子期（nil/true=只记录）。
+// English: §C2 whether the VWAP premium hard filter is shadow-only (nil/true = record only).
+func (q QMTConfig) VWAPPremiumShadowOn() bool {
+	return q.MaxSignalVWAPPremiumShadow == nil || *q.MaxSignalVWAPPremiumShadow
+}
+
+// AutoSellAllSourcesOn §B7 是否放开战法自带来源的止盈/减仓自动执行（nil/false=旧行为）。
+// English: §B7 whether strategy-native TP/trim sources may auto-execute (nil/false = legacy).
+func (q QMTConfig) AutoSellAllSourcesOn() bool {
+	return q.AutoSellAllSources != nil && *q.AutoSellAllSources
+}
+
 // YellowScale Yellow 档降额系数（默认 0.35）。
 func (q QMTConfig) YellowScale() float64 {
 	if q.YellowPosScale <= 0 || q.YellowPosScale > 1 {
@@ -562,6 +675,29 @@ type RiskGateConfig struct {
 	// Σ today's sell fills (fillPrice − cost)×qty; at threshold the day's new buys are circuit-broken
 	// (sells/liquidation stay open) with a P1 alert.
 	DayLossLimitPct float64 `json:"day_loss_limit_pct"`
+	// SectorValuePct §C1 行业敞口上限（%）：买入后目标行业预计市值/总资产超阈值 → 拒新买。
+	// 0=关（默认）。未知行业/总资产不可得 → fail-open（弃权，不误拦）。
+	// English: §C1 sector exposure cap (%) — projected sector market value / total assets; 0 = off.
+	// Unknown industry or unavailable total assets fail open.
+	SectorValuePct float64 `json:"sector_value_pct"`
+	// SectorValueShadow §C1 行业敞口影子模式（nil/true=默认影子）：命中仅 risk_gates 留痕并放行；
+	// 显式 false 才硬拒。与 cross_check_shadow 同款灰度约定。
+	SectorValueShadow *bool `json:"sector_value_shadow,omitempty"`
+	// ConceptValuePct §C1-V2 概念敞口上限（%）：0=关（默认）。一只股票多概念时取命中的
+	// **最大敞口概念**检查，不做重叠求和；概念未知/覆盖率不足/数据过期 → 弃权。
+	// English: §C1-V2 concept exposure cap (%); 0 = off. Multi-concept stocks are checked against
+	// the single largest exposure (no overlap sum); unknown/low-coverage/stale data abstains.
+	ConceptValuePct float64 `json:"concept_value_pct"`
+	// ConceptValueShadow §C1-V2 概念敞口影子模式（nil/true=默认影子）。
+	ConceptValueShadow *bool `json:"concept_value_shadow,omitempty"`
+	// RiskPerTradePct §C3 单笔交易风险预算（% 账户权益）：0=关（默认）。
+	// 股数 = equity × risk_pct/100 / (ATR × ATRStopMult)，再与金额股数取 min；ATR/权益缺失弃权。
+	// English: §C3 per-trade risk budget (% of equity); 0 = off. Qty is capped by
+	// equity×pct/(ATR×stopMult) and min()'d with the amount-derived qty; missing inputs abstain.
+	RiskPerTradePct float64 `json:"risk_per_trade_pct"`
+	// RiskBudgetShadow §C3 影子模式（nil/true=默认影子）：只记录“原本会缩到多少”，不改 qty；
+	// 显式 false 才真正收紧股数。
+	RiskBudgetShadow *bool `json:"risk_budget_shadow,omitempty"`
 	// SingleStockValuePct 单票市值/总资产 集中度上限（%）：0=关（默认）。
 	// 买入后该股预计市值（持仓+本单）/ 总资产（可用现金+持仓市值）超过阈值 → 拒新买。
 	// English: single-stock market value / total assets concentration cap (%). 0 = off (default).
@@ -620,6 +756,24 @@ func (r RiskGateConfig) CrossCheckEnforce() bool {
 	return r.CrossCheckShadow != nil && !*r.CrossCheckShadow
 }
 
+// SectorValueShadowOn §C1 行业敞口是否仍处影子期：nil/true = 影子（留痕放行），显式 false = 硬拒。
+// English: §C1 sector gate shadow switch — nil/true means record-and-pass; explicit false enforces.
+func (r RiskGateConfig) SectorValueShadowOn() bool {
+	return r.SectorValueShadow == nil || *r.SectorValueShadow
+}
+
+// RiskBudgetShadowOn §C3 ATR 风险预算是否仍处影子期：nil/true=只记录，显式 false=真收紧。
+// English: §C3 risk-budget shadow switch — nil/true records only; explicit false enforces.
+func (r RiskGateConfig) RiskBudgetShadowOn() bool {
+	return r.RiskBudgetShadow == nil || *r.RiskBudgetShadow
+}
+
+// ConceptValueShadowOn §C1-V2 概念敞口影子开关（nil/true=影子）。
+// English: §C1-V2 concept exposure shadow switch (nil/true = shadow).
+func (r RiskGateConfig) ConceptValueShadowOn() bool {
+	return r.ConceptValueShadow == nil || *r.ConceptValueShadow
+}
+
 // LimitDownBlockSellEnabled §A5-常开（owner 裁决 2026-09-26）返回跌停追卖拒单闸是否生效：
 // nil（未配置）→ true 常开；显式布尔按值。判定姿势与 EnforceT1Enabled 同款。
 // English: reports whether the limit-down sell-chase block is active — unset defaults to true
@@ -639,7 +793,8 @@ func (r RiskGateConfig) LimitDownBlockSellEnabled() bool {
 // gate active", no longer "all gates off".
 func (r RiskGateConfig) AnyEnabled() bool {
 	return r.DayLossLimitPct > 0 || r.SingleStockValuePct > 0 || r.StaleQuoteMs > 0 ||
-		r.LimitUpBlockBuy || r.LimitDownBlockSellEnabled() || r.MaxOrderAmount > 0 || r.CrossCheckPct > 0
+		r.LimitUpBlockBuy || r.LimitDownBlockSellEnabled() || r.MaxOrderAmount > 0 ||
+		r.CrossCheckPct > 0 || r.SectorValuePct > 0 || r.ConceptValuePct > 0 || r.RiskPerTradePct > 0
 }
 
 // defaultOffGateEntries §0926E2E-4B（2026-09-26 全量评价批，裁决=选项B）：六道"出厂默认关"
@@ -2110,6 +2265,12 @@ const perUserD1Key = "quant_config_d1_v1"
 // （perUserLongShortKey is the KVStore key holding a per-account long/short toggle snapshot.）
 const perUserLongShortKey = "quant_config_longshort_v1"
 
+// perUserSizingKey §A0（2026-10-22）账号级仓位配置专用键。
+// 只存 SizingConfig 原始值，不写完整 Rules，避免把该账号其余配置一并冻结。
+// English: §A0 account-scoped sizing config key — stores SizingConfig only, never a full Rules
+// snapshot, so saving sizing cannot freeze the account's other config sections.
+const perUserSizingKey = "quant_config_sizing_v1"
+
 // LongShortConfig 每账号做多/做空开关状态。
 // （LongShortConfig holds the per-account long/short toggle state.）
 type LongShortConfig struct {
@@ -2782,6 +2943,11 @@ func (m *Manager) MergeEnhanceConfig(patch map[string]json.RawMessage) (EnhanceC
 		m.mu.Unlock()
 		return base, err
 	}
+	// §C4：技术过滤阈值/档位在写入口校验，非法值 400 而不是静默落库。
+	if err := validateEnhance(&next); err != nil {
+		m.mu.Unlock()
+		return base, err
+	}
 	m.rules.Enhance = next
 	m.mu.Unlock()
 	m.Save()
@@ -2800,6 +2966,177 @@ func (m *Manager) MergeSizingConfig(patch map[string]json.RawMessage) (SizingCon
 		return base, err
 	}
 	m.rules.Sizing = next
+	m.mu.Unlock()
+	m.Save()
+	return next, nil
+}
+
+// storedSizing 读取账号专用 sizing 原始值（无回退、不补默认）。
+// §A0：专用键只存 SizingConfig，解析失败按“无专用配置”处理（读侧继续回退旧账号/全局），
+// 不让一份坏文件把该账号的仓位配置整块拉黑。
+// English: reads the account's dedicated sizing document without fallback/defaults; a parse
+// failure is treated as "no dedicated config" so the caller can fall back safely.
+func (m *Manager) storedSizing(userID string) (SizingConfig, bool) {
+	if m.store == nil || userID == "" {
+		return SizingConfig{}, false
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(userID, perUserSizingKey)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return SizingConfig{}, false
+	}
+	var sc SizingConfig
+	if err := json.Unmarshal([]byte(raw), &sc); err != nil {
+		log.Printf("[config] 账号 %s sizing 专用键反序列化失败，回退旧配置: %v", userID, err)
+		return SizingConfig{}, false
+	}
+	return sc, true
+}
+
+// accountRulesSnapshot 返回账号自身规则快照（账号键优先，兼容历史系统级 "" 键），无覆盖返回 nil。
+// 与 userRules 的区别：这里不返回全局副本，调用方需要区分“账号有覆盖”与“纯全局”。
+// English: returns the account's own rules snapshot (per-account key, then legacy system-level
+// key), or nil when there is no account override — callers need to tell override from global.
+func (m *Manager) accountRulesSnapshot(userID string) *Rules {
+	if m.store == nil || userID == "" {
+		return nil
+	}
+	if r, ok := m.storedUserRules(userID); ok {
+		return r
+	}
+	if r, ok := m.storedUserRules(""); ok {
+		return r
+	}
+	return nil
+}
+
+// sizingBaseRaw 返回账号 sizing 的原始基准（专用键 → 账号旧 sizing → 全局），不补默认。
+// 返回值 dedicated 表示是否存在账号专用键，供 API 回显 sizing_scope/是否有覆盖。
+// English: raw sizing base (dedicated key → account legacy sizing → global) without defaults.
+func (m *Manager) sizingBaseRaw(userID string) (sc SizingConfig, acct *Rules, dedicated bool) {
+	if v, ok := m.storedSizing(userID); ok {
+		return v, m.accountRulesSnapshot(userID), true
+	}
+	if a := m.accountRulesSnapshot(userID); a != nil {
+		return a.Sizing, a, false
+	}
+	m.mu.RLock()
+	sc = m.rules.Sizing
+	m.mu.RUnlock()
+	return sc, nil, false
+}
+
+// legacySizingBridgeLog 记录“旧 position 字段被桥接为 sizing 上限”的日级证据。
+// 只在读到百分数写法（>1）时记录一次/账号/日，避免每 5 秒刷一行。
+var (
+	legacySizingBridgeMu  sync.Mutex
+	legacySizingBridgeDay = map[string]string{}
+)
+
+func logLegacySizingBridge(userID string, legacy, normalized float64) {
+	if legacy <= 1 {
+		return
+	}
+	day := time.Now().Format("2006-01-02")
+	legacySizingBridgeMu.Lock()
+	if legacySizingBridgeDay[userID] == day {
+		legacySizingBridgeMu.Unlock()
+		return
+	}
+	legacySizingBridgeDay[userID] = day
+	legacySizingBridgeMu.Unlock()
+	log.Printf("[config] §A0 总仓位上限桥接 账号=%s rules.position.max_total_position_pct=%.4g 按百分数归一为 %.4f（rules.sizing.max_total_position_pct 或账号专用键可显式覆盖）",
+		userID, legacy, normalized)
+}
+
+// GetSizingConfigFor §A0 返回账号的 effective sizing 配置。
+//
+// 读取优先级：`quant_config_sizing_v1` 专用键 → 账号旧 `rules.sizing` → 全局 `rules.sizing` →
+// 出厂默认。`max_total_position_pct<=0` 时在 `WithDefaults` **之前**回退账号/全局
+// `rules.position.max_total_position_pct`，否则 0 会先被补成 0.80，旧字段永远读不到。
+// 第二个返回值表示是否存在账号专用键（API 回显用），不影响配置内容。
+// English: effective account sizing — dedicated key → account legacy sizing → global; the legacy
+// position cap is bridged BEFORE WithDefaults so a zero never masks the old field.
+func (m *Manager) GetSizingConfigFor(userID string) (SizingConfig, bool) {
+	sc, acct, dedicated := m.sizingBaseRaw(userID)
+	if sc.MaxTotalPositionPct <= 0 {
+		legacy := 0.0
+		if acct != nil {
+			legacy = acct.Position.MaxTotalPositionPct
+		}
+		if legacy <= 0 {
+			m.mu.RLock()
+			legacy = m.rules.Position.MaxTotalPositionPct
+			m.mu.RUnlock()
+		}
+		sc.MaxTotalPositionPct = NormalizeLegacyTotalPosPct(legacy)
+		logLegacySizingBridge(userID, legacy, sc.MaxTotalPositionPct)
+	}
+	return sc.WithDefaults(), dedicated
+}
+
+// MergeSizingConfigFor §A0 稀疏 merge 账号级 sizing 并持久化到专用键。
+//
+// 基准取“当前 effective 原始值”（专用键 → 账号旧 sizing → 全局），只应用 patch 中出现的键；
+// 然后整体写入 `quant_config_sizing_v1`。首次保存会把当前继承值物化到账号键，此后该账号
+// sizing 独立于全局——这是 R2 账号独立的预期语义，面板与运维文档已注明。
+// 落库走 setConfigVerifiedLocked：写失败/复读不一致如实返回 error，不静默成功。
+// English: sparse-merge the account's sizing into the dedicated key. The base is the current
+// effective raw value; the first save materializes the inherited values, after which the account
+// is independent of global sizing (the R2 semantics). Persistence is read-back verified.
+func (m *Manager) MergeSizingConfigFor(userID string, patch map[string]json.RawMessage) (SizingConfig, error) {
+	if m.store == nil {
+		return SizingConfig{}, fmt.Errorf("账号级配置存储不可用")
+	}
+	if userID == "" {
+		return SizingConfig{}, fmt.Errorf("需要账号 ID")
+	}
+	base, _, _ := m.sizingBaseRaw(userID)
+	var next SizingConfig
+	if err := mergeStructPatch(base, patch, &next); err != nil {
+		return base, err
+	}
+	data, err := json.Marshal(next)
+	if err != nil {
+		return base, fmt.Errorf("sizing 序列化失败: %w", err)
+	}
+	m.mu.Lock()
+	err = m.setConfigVerifiedLocked(userID, perUserSizingKey, data)
+	m.mu.Unlock()
+	if err != nil {
+		return base, fmt.Errorf("账号 %s sizing 配置%w", userID, err)
+	}
+	return next, nil
+}
+
+// GetConceptConfig §C1-V2 返回全局概念库配置快照。
+// English: §C1-V2 returns the global concept-library config snapshot.
+func (m *Manager) GetConceptConfig() ConceptConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rules.Concept
+}
+
+// MergeConceptConfig §C1-V2 稀疏 merge rules.concept（系统级，仅 admin 写）。
+// English: §C1-V2 sparse-merges the system-level rules.concept section.
+func (m *Manager) MergeConceptConfig(patch map[string]json.RawMessage) (ConceptConfig, error) {
+	m.mu.Lock()
+	base := m.rules.Concept
+	var next ConceptConfig
+	if err := mergeStructPatch(base, patch, &next); err != nil {
+		m.mu.Unlock()
+		return base, err
+	}
+	if next.MinCoveragePct < 0 || next.MinCoveragePct > 100 {
+		m.mu.Unlock()
+		return base, fmt.Errorf("concept.min_coverage_pct 超出范围 0-100（实际 %.2f）", next.MinCoveragePct)
+	}
+	if next.MaxStalenessHours < 0 || next.MaxStalenessHours > 720 {
+		m.mu.Unlock()
+		return base, fmt.Errorf("concept.max_staleness_hours 超出范围 0-720（实际 %d）", next.MaxStalenessHours)
+	}
+	m.rules.Concept = next
 	m.mu.Unlock()
 	m.Save()
 	return next, nil

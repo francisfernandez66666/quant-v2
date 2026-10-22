@@ -48,6 +48,16 @@ type OrderRequest struct {
 	// (concentration gate).
 	PrevClose    float64 `json:"prev_close,omitempty"`
 	CurrentPrice float64 `json:"current_price,omitempty"`
+	// §C2 下单时点的市场 VWAP 与来源/时间；缺失时 0/空（不伪造）。
+	// SignalVWAPPremiumPct = (参考价 − VWAP)/VWAP×100。
+	// English: §C2 market VWAP at order time plus source/as-of; missing means zero/empty, never faked.
+	MarketVWAP           float64 `json:"market_vwap,omitempty"`
+	VWAPSource           string  `json:"vwap_source,omitempty"`
+	VWAPAsOf             string  `json:"vwap_as_of,omitempty"`
+	SignalVWAPPremiumPct float64 `json:"signal_vwap_premium_pct,omitempty"`
+	// §C2 软回踩单的按单超时秒数（0=沿用全局 cancel_stale_sec）。
+	// English: §C2 per-order timeout for pullback entries (0 = global cancel_stale_sec).
+	TimeoutSec int `json:"timeout_sec,omitempty"`
 }
 
 // OrderResult 下单返回（网关 → 首尔）。

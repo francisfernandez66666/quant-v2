@@ -132,7 +132,7 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     expect(numberByLabel('Yellow 金额权重').value).toBe('0.6')
     expect(numberByLabel('Red 金额权重').value).toBe('0.3')
     expect(numberByLabel('广度缺失降权').value).toBe('0.9')
-    const sel = document.querySelector('select')
+    const sel = document.querySelector('[data-testid="sell-boost"]')
     expect(sel.value).toBe('L2')
   })
 
@@ -160,8 +160,9 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     const api = await import('../api/index.js')
     expect(api.setRegimeConfig.mock.calls.length).toBe(1)
     const body = api.setRegimeConfig.mock.calls[0][0]
-    expect(Object.keys(body).sort()).toEqual(['enhance', 'macro_gate', 'sizing'])
-    expect(Object.keys(body.enhance)).toEqual(['market_state_enabled'])
+    expect(Object.keys(body).sort()).toEqual(['concept', 'enhance', 'macro_gate', 'sizing'])
+    expect(Object.keys(body.enhance).sort()).toEqual(['market_state_enabled', 'risk_pool_shadow', 'tech_filter'])
+    expect(Object.keys(body.concept).sort()).toEqual(['enabled', 'max_staleness_hours', 'min_coverage_pct', 'shadow'])
     // §SIZING-FINE（2026-10-22）：面板现在负责 sizing 的**全量**键（精细参数折叠区也在内），
     // 逐键等值锁住键集——多一个未定义键会被后端稀疏 merge 写进配置，少一个键等于某组精细参数失踪。
     expect(Object.keys(body.sizing).sort()).toEqual([
@@ -271,7 +272,7 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
   it('R7 改档位→出现未保存标记，保存成功→标记清除且档位回传 L3', async () => {
     render(<RegimeConfigPanel />)
     await settle()
-    fireEvent.change(document.querySelector('select'), { target: { value: 'L3' } })
+    fireEvent.change(document.querySelector('[data-testid="sell-boost"]'), { target: { value: 'L3' } })
     await settle()
     expect(screen.getByText(/有未保存修改/)).toBeInTheDocument()
     fireEvent.click(btn('保存风控配置'))
@@ -436,7 +437,11 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     expect(numberByLabel('连续止损熔断次数').value).toBe('4')
     expect(switchByLabel('长假前最后一日禁新开仓').getAttribute('aria-checked')).toBe('false')
     expect(switchByLabel('放宽止损同比例缩仓').getAttribute('aria-checked')).toBe('true')
-    const vals = [...document.querySelectorAll('input')].map((i) => i.value)
+    // §C4 的 KDJ J 上限 0 是合法“关闭”语义，不属于“缺键折叠成 0”，单独排除。
+    const kdjInput = numberByLabel('KDJ J 上限')
+    const vals = [...document.querySelectorAll('input')]
+      .filter((i) => i !== kdjInput)
+      .map((i) => i.value)
     expect(vals.filter((v) => v === '0' || v === ''), '§SIZING-FINE：缺键不得折叠成 0/空').toEqual([])
     fireEvent.click(btn('保存风控配置'))
     await settle()

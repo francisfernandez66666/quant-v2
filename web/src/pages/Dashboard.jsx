@@ -13,6 +13,7 @@ import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
 import SentimentCard from '../components/SentimentCard.jsx'
+import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（live/trigger/cost/none）
 
 // 根据 IPO/上市日期计算倒计时或上市状态
 function ipoCountdown(c) {
@@ -294,15 +295,15 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 热点个股表格列定义：代码、名称、板块（含原因 title 悬浮）、现价、涨跌幅
+  // 热点个股表格列定义：代码、名称、板块（含原因 title 悬浮）、现价、涨跌幅。
+  // §C7：价格/涨跌按后端来源字段渲染，缺行情时显示 —（触发价）而不是 ¥0.00 / 0.00%。
+  const hasLiveHot = snapshotStocks.some((r) => r && r.price_kind === 'live')
   const stockColumns = [
     { colKey: 'code', title: '代码', width: 90 },
     { colKey: 'name', title: '名称', width: 100 },
     { colKey: 'sector', title: '板块', ellipsis: true, cell: ({ row }) => <span title={row.sector_reason || ''}>{row.sector || '—'}</span> },
-    { colKey: 'price', title: '现价', width: 90, cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
-    { colKey: 'change_pct', title: '涨跌', width: 100, cell: ({ row }) => (
-      <span style={{ color: chgColor(row.change_pct) }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span>
-    ) },
+    { colKey: 'price', title: '现价', width: 130, cell: ({ row }) => <PriceCell value={row.price} kind={row.price_kind} triggerPrice={row.price} /> },
+    { colKey: 'change_pct', title: '涨跌', width: 100, cell: ({ row }) => <PctCell value={row.change_pct} ok={row.change_ok} /> },
   ]
 
   // 按战法归因表格列定义：战法、样本数、已平仓、胜率、平均盈亏、盈亏比、持仓中
@@ -399,9 +400,13 @@ export default function Dashboard() {
       {/* 左栏热门个股 + 右栏资讯动态，双栏并列展示（窄屏单列，§F-20） */}
       <div className="dash-two-col">
         {/* 热门个股实时快照表格（带 LIVE 标签），无数据时显示等待提示 */}
-        <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>}>
+        <Card title={<span>🔥 热门个股 {hasLiveHot
+          ? <Tag theme="warning" size="small">LIVE</Tag>
+          : <Tag theme="default" size="small">触发价/等待行情</Tag>}</span>}>
           {snapshotStocks.length ? (
-            <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} fixedHeader maxHeight={320} />
+            <div data-testid="hot-snapshot-table">
+              <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} fixedHeader maxHeight={320} />
+            </div>
           ) : (
             <div className="muted" style={{ padding: 24, textAlign: 'center' }}>
               {loadFails['快照'] ? '热门个股读取失败（见上方红条）' : '等待行情数据...'}

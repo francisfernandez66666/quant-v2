@@ -78,6 +78,15 @@ type RealOrder struct {
 	Qty       int     `json:"qty"`               // 数量
 	CreatedAt string  `json:"created_at"`        // 创建时间
 	UserID    string  `json:"user_id,omitempty"` // §W2-10 归属账号（空=遗留全局行）
+	// §C2 下单时点市场 VWAP（元/股）与来源/时间；0/空=未采集，不伪造。
+	// English: §C2 market VWAP at order time plus source/as-of; zero/empty = not captured.
+	MarketVWAP           float64 `json:"market_vwap,omitempty"`
+	VWAPSource           string  `json:"vwap_source,omitempty"`
+	VWAPAsOf             string  `json:"vwap_as_of,omitempty"`
+	SignalVWAPPremiumPct float64 `json:"signal_vwap_premium_pct,omitempty"`
+	// §C2 软回踩单按单超时秒数（0=沿用全局 cancel_stale_sec）。
+	// English: §C2 per-order timeout for pullback entries (0 = global cancel_stale_sec).
+	TimeoutSec int `json:"timeout_sec,omitempty"`
 }
 
 // RealFill 实盘成交回报行。
@@ -110,10 +119,16 @@ type RealFill struct {
 	// 直接从原始 fills 表读的路径（判重/幂等）不填这些字段，零值即"未勘误"。
 	// English: Side is the EFFECTIVE direction (amended when a correction is applied); OrigSide
 	// keeps the raw broker direction, AmendID>0 marks a corrected row.
-	OrigSide      string `json:"orig_side,omitempty"`      // 柜台原始方向（未勘误时与 Side 相同）
-	AmendID       int64  `json:"amend_id,omitempty"`       // 生效勘误行 ID（0=未勘误）
-	AmendReason   string `json:"amend_reason,omitempty"`   // 勘误理由（审计回显）
-	AmendOperator string `json:"amend_operator,omitempty"` // 勘误提交人
+	OrigSide string `json:"orig_side,omitempty"` // 柜台原始方向（未勘误时与 Side 相同）
+	AmendID  int64  `json:"amend_id,omitempty"`  // 生效勘误行 ID（0=未勘误）
+	// §C2 成交时点的市场 VWAP 与成交价偏差（正=买贵/卖便宜）。0=未采集。
+	// English: §C2 market VWAP at fill time and the fill-vs-VWAP premium (positive = worse).
+	MarketVWAP         float64 `json:"market_vwap,omitempty"`
+	FillVWAPPremiumPct float64 `json:"fill_vwap_premium_pct,omitempty"`
+	VWAPSource         string  `json:"vwap_source,omitempty"`
+	VWAPAsOf           string  `json:"vwap_as_of,omitempty"`
+	AmendReason        string  `json:"amend_reason,omitempty"`   // 勘误理由（审计回显）
+	AmendOperator      string  `json:"amend_operator,omitempty"` // 勘误提交人
 	// AmendKey 本行的勘误匹配键（Go 侧单点计算，见 FillAmendKey）：前端用它把"已提交、
 	// 尚未批准"的影子勘误挂到正确的成交行上。
 	AmendKey string `json:"amend_key,omitempty"`
@@ -703,9 +718,33 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			f.OrderID, f.TradeID, f.TradedAt, f.Qty)
 		return tx.Rollback()
 	}
-	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial, f.TradeID); err != nil {
+	// §C2 成交侧 VWAP：网关成交回报只带成交价，市场 VWAP 从下单时落库的 orders 行继承；
+	// 找不到/为 0 就保持未采集，绝不用成交价冒充 VWAP。偏差只在 VWAP>0 时计算。
+	// English: §C2 — inherit the market VWAP captured at order time; absent stays unset (never
+	// substitute the fill price). Premium is computed only when VWAP > 0.
+	if f.MarketVWAP <= 0 {
+		var mv float64
+		var src, asOf string
+		q := `SELECT COALESCE(market_vwap,0), COALESCE(vwap_source,''), COALESCE(vwap_as_of,'')
+			FROM orders WHERE order_id=?`
+		args := []any{f.OrderID}
+		if f.UserID != "" {
+			q += ` AND (user_id='' OR user_id=?)`
+			args = append(args, f.UserID)
+		}
+		q += ` LIMIT 1`
+		if err := tx.QueryRow(q, args...).Scan(&mv, &src, &asOf); err == nil && mv > 0 {
+			f.MarketVWAP, f.VWAPSource, f.VWAPAsOf = mv, src, asOf
+		}
+	}
+	if f.MarketVWAP > 0 {
+		f.FillVWAPPremiumPct = (f.Price - f.MarketVWAP) / f.MarketVWAP * 100
+	}
+	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id,
+		 market_vwap, fill_vwap_premium_pct, vwap_source, vwap_as_of)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial, f.TradeID,
+		f.MarketVWAP, f.FillVWAPPremiumPct, f.VWAPSource, f.VWAPAsOf); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -868,9 +907,11 @@ func (d *DB) SweepStaleBuyOrders(userID, beforeDay string) (int64, error) {
 func (d *DB) UpsertRealOrder(o RealOrder) (bool, error) {
 	// §W2-10 租户列：委托行打归属账号（存量行为空串=遗留全局）
 	res, err := d.db.Exec(`INSERT OR IGNORE INTO orders
-		(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID)
+		(order_id, signal_id, code, side, status, price, qty, created_at, user_id,
+		 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID,
+		o.MarketVWAP, o.VWAPSource, o.VWAPAsOf, o.SignalVWAPPremiumPct, o.TimeoutSec)
 	if err != nil {
 		return false, err
 	}
@@ -1258,7 +1299,7 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 // English: user-scoped live orders; legacy global rows are visible to any caller.
 func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	rows, err := d.db.Query(`SELECT order_id, signal_id, code, side, status, price, qty, created_at,
-		COALESCE(user_id,'') FROM orders WHERE user_id = '' OR user_id = ?
+		COALESCE(user_id,''), COALESCE(timeout_sec,0) FROM orders WHERE user_id = '' OR user_id = ?
 		ORDER BY created_at DESC, order_id DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -1267,7 +1308,7 @@ func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	var out []RealOrder
 	for rows.Next() {
 		var o RealOrder
-		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID); err != nil {
+		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID, &o.TimeoutSec); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -1397,9 +1438,11 @@ func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
 	case sql.ErrNoRows:
 		// 本地无此单（网侧重放/回报先于下单回填到达）：补插完整委托行。
 		res, err := tx.Exec(`INSERT OR IGNORE INTO orders
-			(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID)
+			(order_id, signal_id, code, side, status, price, qty, created_at, user_id,
+			 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID,
+			o.MarketVWAP, o.VWAPSource, o.VWAPAsOf, o.SignalVWAPPremiumPct, o.TimeoutSec)
 		if err != nil {
 			return "", err
 		}

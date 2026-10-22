@@ -609,12 +609,15 @@ const storeBarsMaxStale = 10
 // (anchor-normalized) → marked-unadjusted Sina/THS. prevClose (0 = unknown) only gates the local leg.
 func (e *Engine) fetchDayKLine(code string, prevClose float64) ([]data.KLine, bool, string) {
 	// 1. 主源：腾讯前复权（Tencent qfq is the primary leg since 2026-09-23.）
-	if klines, err := e.marketAPI.GetTencentKLine(code, 120); err == nil && data.ValidateKLine(klines) {
+	// §C4：拉 260 根（而非 120），保证剔除当日未完成 K 后仍有 ≥120/250 根供 MA120/MA250。
+	// English: §C4 fetches 260 bars so MA120/MA250 still have enough completed bars after dropping
+	// today's unfinished bar.
+	if klines, err := e.marketAPI.GetTencentKLine(code, 260); err == nil && data.ValidateKLine(klines) {
 		e.bumpKLineSrc("腾讯")
 		return klines, false, "腾讯"
 	}
 	// 2. 第二复权源：东财 push2（fqt=qfq 恒定，§D6 认定为最稳复权源，本批从主源位降级但**不摘掉**）
-	if klines, err := e.marketAPI.GetKLine(code, "101", 120); err == nil && data.ValidateKLine(klines) {
+	if klines, err := e.marketAPI.GetKLine(code, "101", 260); err == nil && data.ValidateKLine(klines) {
 		e.bumpKLineSrc("东财")
 		return klines, false, "东财"
 	}
@@ -624,7 +627,7 @@ func (e *Engine) fetchDayKLine(code string, prevClose float64) ([]data.KLine, bo
 		return klines, false, kLineSrcStore
 	}
 	// 4. 不复权兜底：拿到也不进 KLines（只置标记），语义同 §H3，不再是"能不能出信号"的那道闸
-	if klines, err := e.marketAPI.GetSinaKLine(code, 120); err == nil && data.ValidateKLine(klines) {
+	if klines, err := e.marketAPI.GetSinaKLine(code, 260); err == nil && data.ValidateKLine(klines) {
 		e.bumpKLineSrc("新浪")
 		e.noteUnadjustedFallback(code)
 		return klines, true, "新浪" // 不复权兜底：只供 LastClose/现价类用途（not for factors）

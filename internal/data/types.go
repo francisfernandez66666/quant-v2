@@ -5,7 +5,10 @@
 // without third-party market libraries.
 package data
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // StockInfo 个股实时行情快照。
 // 由多数据源（东方财富 push2、新浪、同花顺）统一填充，缺失字段留零值。
@@ -33,6 +36,21 @@ type StockInfo struct {
 	// 真 0 误报成"数据源未返回"，诱导模型说"没有数据"。缺数=false、有数=true（含 0）。
 	HasFlow bool   `json:"has_flow"`
 	Sector  string `json:"sector"` // 所属板块名称
+}
+
+// VWAPOf §C2 由快照的累计成交额/成交量算当日 VWAP（元/股）。
+// 缺失（Volume<=0 或 Amount<=0）返回 ok=false——绝不把“没读到”折成 0 或现价。
+// English: §C2 computes the day's VWAP from cumulative Amount/Volume; missing inputs return
+// ok=false rather than fabricating a zero or the last price.
+func VWAPOf(q *StockInfo) (float64, bool) {
+	if q == nil || q.Volume <= 0 || q.Amount <= 0 {
+		return 0, false
+	}
+	v := q.Amount / q.Volume
+	if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return v, true
 }
 
 // KLine K 线数据。

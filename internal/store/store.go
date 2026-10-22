@@ -423,6 +423,12 @@ func (d *DB) migrate() error {
 			qty INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
 			user_id TEXT DEFAULT '',
+			-- §C2 下单时点市场 VWAP（0/空=未采集，绝不伪造）
+			market_vwap REAL DEFAULT 0,
+			vwap_source TEXT DEFAULT '',
+			vwap_as_of TEXT DEFAULT '',
+			signal_vwap_premium_pct REAL DEFAULT 0,
+			timeout_sec INTEGER DEFAULT 0,
 			UNIQUE (user_id, signal_id)
 		)`,
 
@@ -446,7 +452,12 @@ func (d *DB) migrate() error {
 			-- → 字段被静默丢弃，本地 fills 只剩 (order_id,traded_at,price,qty) 复合键这一把身份锚。
 			-- English: broker trade number — the gateway always sent it, the old Go envelope had no
 			-- tag, so it was silently dropped and fills had no exact identity anchor.
-			trade_id TEXT DEFAULT ''
+			trade_id TEXT DEFAULT '',
+			-- §C2 成交时点市场 VWAP 与偏差（0/空=未采集）
+			market_vwap REAL DEFAULT 0,
+			fill_vwap_premium_pct REAL DEFAULT 0,
+			vwap_source TEXT DEFAULT '',
+			vwap_as_of TEXT DEFAULT ''
 		)`,
 		// §W3-b 成交回报幂等唯一键：同一委托+同一回报时间戳+同价同量只入账一次，
 		// 根除 outbox 重试遇响应丢失时的双倍记账（首尔侧此前零幂等）。
@@ -457,6 +468,25 @@ func (d *DB) migrate() error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_idem ON fills(order_id, traded_at, price, qty)`,
 		// §WS-A T+1/交割单对账查询加速：按交易日聚合成交/费用
 		`CREATE INDEX IF NOT EXISTS idx_fills_traded_at ON fills(traded_at)`,
+		// §C1-V2 概念库：概念→成分（反向查询走 idx_concept_members_ts），以及每个概念的同步状态。
+		// English: §C1-V2 concept library — concept→members plus per-concept sync state.
+		`CREATE TABLE IF NOT EXISTS concept_members (
+			concept_code TEXT NOT NULL,
+			concept_name TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			source TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (concept_code, ts_code)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_concept_members_ts ON concept_members(ts_code)`,
+		`CREATE TABLE IF NOT EXISTS concept_sync_state (
+			concept_code TEXT PRIMARY KEY,
+			concept_name TEXT NOT NULL,
+			last_success TEXT,
+			member_count INTEGER DEFAULT 0,
+			status TEXT DEFAULT '',
+			error TEXT DEFAULT ''
+		)`,
 		// §WS-B 券商交割单三方对账结果：每日一条对账差异快照（report_only 落账 / sync_fills 纠偏留痕）。
 		`CREATE TABLE IF NOT EXISTS settlement_diff (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -675,6 +705,16 @@ func (d *DB) migrate() error {
 		{"real_positions", "buy_date", "ALTER TABLE real_positions ADD COLUMN buy_date TEXT DEFAULT ''"},
 		// §M4 券商成交编号列（成交回报最精确的身份锚；旧库回填为空串=未知）
 		{"fills", "trade_id", "ALTER TABLE fills ADD COLUMN trade_id TEXT DEFAULT ''"},
+		// §C2 VWAP 落库：先只加列，缺失保持 0/空，不伪造。
+		{"orders", "market_vwap", "ALTER TABLE orders ADD COLUMN market_vwap REAL DEFAULT 0"},
+		{"orders", "vwap_source", "ALTER TABLE orders ADD COLUMN vwap_source TEXT DEFAULT ''"},
+		{"orders", "vwap_as_of", "ALTER TABLE orders ADD COLUMN vwap_as_of TEXT DEFAULT ''"},
+		{"orders", "signal_vwap_premium_pct", "ALTER TABLE orders ADD COLUMN signal_vwap_premium_pct REAL DEFAULT 0"},
+		{"orders", "timeout_sec", "ALTER TABLE orders ADD COLUMN timeout_sec INTEGER DEFAULT 0"},
+		{"fills", "market_vwap", "ALTER TABLE fills ADD COLUMN market_vwap REAL DEFAULT 0"},
+		{"fills", "fill_vwap_premium_pct", "ALTER TABLE fills ADD COLUMN fill_vwap_premium_pct REAL DEFAULT 0"},
+		{"fills", "vwap_source", "ALTER TABLE fills ADD COLUMN vwap_source TEXT DEFAULT ''"},
+		{"fills", "vwap_as_of", "ALTER TABLE fills ADD COLUMN vwap_as_of TEXT DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {
@@ -1097,11 +1137,20 @@ func (d *DB) migrateOrdersSignalUnique() error {
 			qty INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
 			user_id TEXT DEFAULT '',
+			-- §C2 重建时保留 VWAP 列，否则 P0-2 迁移会把已补的列丢掉。
+			market_vwap REAL DEFAULT 0,
+			vwap_source TEXT DEFAULT '',
+			vwap_as_of TEXT DEFAULT '',
+			signal_vwap_premium_pct REAL DEFAULT 0,
+			timeout_sec INTEGER DEFAULT 0,
 			UNIQUE (user_id, signal_id)
 		);
 		INSERT OR REPLACE INTO orders_new
-			(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-		SELECT order_id, signal_id, code, side, status, price, qty, created_at, COALESCE(user_id, '')
+			(order_id, signal_id, code, side, status, price, qty, created_at, user_id,
+			 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec)
+		SELECT order_id, signal_id, code, side, status, price, qty, created_at, COALESCE(user_id, ''),
+			COALESCE(market_vwap,0), COALESCE(vwap_source,''), COALESCE(vwap_as_of,''), COALESCE(signal_vwap_premium_pct,0),
+			COALESCE(timeout_sec,0)
 		FROM orders;
 		DROP TABLE orders;
 		ALTER TABLE orders_new RENAME TO orders;

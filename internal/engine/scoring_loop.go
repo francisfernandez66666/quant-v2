@@ -944,7 +944,8 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 	// English: FIX#14 surface the silent sell gate — when stop-loss class advice exists but auto mode
 	// is off, log a throttled warning so "why didn't it auto-sell" is visible (the old early-return
 	// made users believe auto-sell was on while nothing ever fired).
-	gated := !ctrl.Enabled() || ctrl.Mode() != "auto" || !ctrl.Config().AutoSell
+	cfg := ctrl.Config()
+	gated := !ctrl.Enabled() || ctrl.Mode() != "auto" || !cfg.AutoSell
 	if gated {
 		for _, a := range advices {
 			if a.Action == "止损" {
@@ -999,7 +1000,10 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 		// from the discipline engine or the unified sell adjudicator.
 		var class string
 		var qty int
-		executableSellSource := a.Source == "discipline" || a.Source == trading.UnifiedSellSourceAction
+		// §B7（owner 2026-10-22）：auto_sell_all_sources=true 时战法自带来源也纳入执行；
+		// 默认 false 保持“战法自带止盈/减仓只提醒”的旧行为，便于回滚。
+		executableSellSource := a.Source == "discipline" || a.Source == trading.UnifiedSellSourceAction ||
+			cfg.AutoSellAllSourcesOn()
 		switch a.Action {
 		case "止损":
 			class = "止损"

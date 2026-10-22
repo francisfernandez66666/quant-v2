@@ -9,6 +9,7 @@ import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
 import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢弃（统一 hook）
 import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按腿记账（共用台账）
 import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
+import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（缺行情不再显示 ¥0.00）
 
 // ── 工具函数 ──
 // 截断异动原因为简短描述
@@ -338,8 +339,16 @@ export default function Hotspot() {
   const evalColumns = [
     { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name || '-'}</span> },
-    { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
-    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    // §C7：缺数行排最后，不把“没读到”当成最低价；价格/涨跌按来源渲染。
+    { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => {
+      const ap = a.price_kind === 'live' ? a.price : null
+      const bp = b.price_kind === 'live' ? b.price : null
+      if (ap == null && bp == null) return 0
+      if (ap == null) return 1
+      if (bp == null) return -1
+      return ap - bp
+    }, cell: ({ row }) => <PriceCell value={row.price} kind={row.price_kind} /> },
+    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <PctCell value={row.change_pct} ok={row.change_ok} /> },
     { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.n_score, row.n_score >= 60, 80), fontWeight: 600 }}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> },
     { colKey: 'dragon_score', title: '龙≥60', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.dragon_score, row.dragon_score >= 60, 80), fontWeight: 600 }}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> },
     { colKey: 'db_score', title: '凸≥60', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.db_score, row.db_score >= 60, 80), fontWeight: 600 }}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> },
@@ -700,14 +709,16 @@ export default function Hotspot() {
           <span className="muted">N形≥60 / 龙头≥60 / 双凸≥60 / 回头≥60 / 动量≥50</span>
         </div>
         {evals.length ? (
-          <Table
-            data={sortedEvals}
-            columns={evalColumns}
-            rowKey="code"
-            size="small"
-            // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页显示「共 0 条」且下一页不可用
-            pagination={{ pageSize: 20, showJumper: true, total: sortedEvals.length }}
-          />
+          <div data-testid="eval-table">
+            <Table
+              data={sortedEvals}
+              columns={evalColumns}
+              rowKey="code"
+              size="small"
+              // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页显示「共 0 条」且下一页不可用
+              pagination={{ pageSize: 20, showJumper: true, total: sortedEvals.length }}
+            />
+          </div>
         ) : (
           <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待评估结果...</div>
         )}

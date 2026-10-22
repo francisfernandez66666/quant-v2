@@ -109,11 +109,12 @@ function toNum(v) {
 }
 
 // NumRow 精细参数行：标签 + 数字输入 + 说明。测试按标签文案定位本行（不按顺序）。
-function NumRow({ label, hint, value, min = 0.01, max = 2, step = 0.01, precision, onChange }) {
+function NumRow({ label, hint, value, min = 0.01, max = 2, step = 0.01, precision, onChange, testId }) {
   return (
     <div style={rowStyle}>
       <span style={labelStyle}>{label}</span>
       <InputNumber
+        data-testid={testId}
         min={min}
         max={max}
         step={step}
@@ -145,19 +146,25 @@ export default function RegimeConfigPanel() {
   const [baseline, setBaseline] = useState('')
   const [form, setForm] = useState(null)
   const [showFine, setShowFine] = useState(false) // 精细参数折叠区
+  // §A0 账号级 sizing：accountId 为空 = 当前登录账号；admin 选择器可代配他人。
+  const [accountId, setAccountId] = useState('')
+  const [accounts, setAccounts] = useState([])
+  const [hasOverride, setHasOverride] = useState(false)
 
   const set = useCallback((patch) => setForm((f) => ({ ...f, ...patch })), [])
 
-  async function load() {
+  async function load(id = accountId) {
     setState('loading')
     setError('')
     try {
-      const cfg = await api.fetchRegimeConfig()
+      const cfg = await api.fetchRegimeConfig(id || undefined)
       if (!cfg || typeof cfg !== 'object') throw new Error('返回载荷为空/非对象')
       const enh = cfg.enhance || {}
       const sz = cfg.sizing || {}
       const mg = cfg.macro_gate || {}
       const tiers = sz.tier_scales || {}
+      const tech = enh.tech_filter || {}
+      const conc = cfg.concept || {}
       const next = {
         marketState: !!enh.market_state_enabled,
         sizingOn: !!sz.enabled,
@@ -201,9 +208,19 @@ export default function RegimeConfigPanel() {
         slMinDrop: num(sz.sl_offset_min_index_drop, DEFAULTS.slMinDrop),
         bearTighten: num(sz.bear_sl_tighten_pt, DEFAULTS.bearTighten),
         riskBudgetKeep: sz.sl_offset_risk_budget_keep !== false,
+        // §C4 / §C6 / §C1-V2（系统级）
+        techKdjMax: num(tech.kdj_j_max, 0),
+        techMa: String(tech.ma_filter || 'off'),
+        techShadow: tech.shadow !== false,
+        riskPoolShadow: enh.risk_pool_shadow !== false,
+        conceptEnabled: conc.enabled === true,
+        conceptShadow: conc.shadow !== false,
+        conceptCoverage: num(conc.min_coverage_pct, 95),
+        conceptStaleness: intNum(conc.max_staleness_hours, 48),
       }
       setForm(next)
       setBaseline(JSON.stringify(next))
+      setHasOverride(cfg.sizing_has_override === true)
       setState('loaded')
     } catch (e) {
       setForm(null)
@@ -213,7 +230,25 @@ export default function RegimeConfigPanel() {
     }
   }
 
-  useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load('') }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 账号选择器数据：平台/租户 admin 会成功；普通账号 403 时静默忽略，面板退回“当前账号”。
+  useEffect(() => {
+    let alive = true
+    // 测试里 api 是部分 mock：Vitest 对未定义导出会在“取值”时直接抛错，故必须 try/catch，
+    // 不能只写 typeof 判断。取不到就把选择器留在“当前账号”。
+    let loadUsers = null
+    try { loadUsers = api.fetchAdminUsers } catch { loadUsers = null }
+    if (typeof loadUsers !== 'function') return undefined
+    loadUsers()
+      .then((res) => {
+        if (!alive) return
+        const list = (res && Array.isArray(res.users)) ? res.users : []
+        setAccounts(list.filter((u) => u && u.id))
+      })
+      .catch(() => { /* 非管理员：无账号列表，保留当前账号 */ })
+    return () => { alive = false }
+  }, [])
 
   const dirty = form && baseline && JSON.stringify(form) !== baseline
 
@@ -279,6 +314,14 @@ export default function RegimeConfigPanel() {
     pos('止盈上浮上限', f.tpCap, 50)
     pos('止损放宽触发跌幅', f.slMinDrop, 20)
     pos('趋势破位止损收紧', f.bearTighten, 50)
+    // §C4：0=关；>0 时上限 200。
+    const kdj = Number(f.techKdjMax)
+    if (!Number.isFinite(kdj) || kdj < 0 || kdj > 200) bad.push('KDJ J 上限')
+    // §C1-V2：0=恢复默认 95；允许 0，其余 0-100。
+    const cov = Number(f.conceptCoverage)
+    if (!Number.isFinite(cov) || cov < 0 || cov > 100) bad.push('概念覆盖率门槛')
+    const stale = Number(f.conceptStaleness)
+    if (!Number.isInteger(stale) || stale < 0 || stale > 720) bad.push('概念数据最大陈旧小时')
     return bad
   }
 
@@ -292,7 +335,22 @@ export default function RegimeConfigPanel() {
     setSaving(true)
     try {
       const body = {
-        enhance: { market_state_enabled: !!form.marketState },
+        enhance: {
+          market_state_enabled: !!form.marketState,
+          // §C4/§C6 系统级增强开关
+          risk_pool_shadow: !!form.riskPoolShadow,
+          tech_filter: {
+            kdj_j_max: Number(form.techKdjMax),
+            ma_filter: form.techMa,
+            shadow: !!form.techShadow,
+          },
+        },
+        concept: {
+          enabled: !!form.conceptEnabled,
+          shadow: !!form.conceptShadow,
+          min_coverage_pct: Number(form.conceptCoverage),
+          max_staleness_hours: Number(form.conceptStaleness),
+        },
         sizing: {
           enabled: !!form.sizingOn,
           shadow: !!form.shadow,
@@ -337,8 +395,9 @@ export default function RegimeConfigPanel() {
           block_momentum: !!form.blockMomentum,
         },
       }
-      await api.setRegimeConfig(body)
+      await api.setRegimeConfig(body, accountId || undefined)
       setBaseline(JSON.stringify(form))
+      setHasOverride(true)
       showToast('风控与仓位配置已保存，热更新即时生效', 'success')
     } catch (e) {
       showToast('保存失败: ' + String((e && e.message) || e), 'error')
@@ -372,19 +431,55 @@ export default function RegimeConfigPanel() {
 
       {form && (
         <>
+          {/* §A0 账号选择器：admin 可代配任意账号；普通账号只看到自己的配置。 */}
+          <div style={rowStyle}>
+            <span style={labelStyle}>配置账号</span>
+            <select
+              data-testid="account-select"
+              value={accountId}
+              onChange={(e) => { const id = e.target.value; setAccountId(id); load(id) }}
+              disabled={accounts.length === 0}
+              style={{ minWidth: 220, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--app-border, #ddd)', background: 'var(--app-bg, #fff)' }}
+            >
+              <option value="">当前登录账号</option>
+              {accounts.map((u) => (
+                <option key={u.id} value={u.id}>{u.username || u.id}</option>
+              ))}
+            </select>
+            <span style={hintStyle}>仓位参数按账号独立；市场状态/风险档门槛为系统级（仅管理员可改）</span>
+          </div>
+          {state === 'loaded' && !hasOverride && (
+            <div style={{ ...hintStyle, margin: '0 0 6px' }}>
+              该账号尚未保存过专用仓位配置，当前继承旧账号/全局值；首次保存后将物化为账号独立配置。
+            </div>
+          )}
           <div style={rowStyle}>
             <span style={labelStyle}>市场状态机（大盘走向）</span>
+            <Tag theme="primary" variant="light" size="small">系统级</Tag>
             <ToggleSw checked={form.marketState} onChange={(v) => set({ marketState: v })} />
             <span style={hintStyle}>开启后 bull/range/bear 参与风险档与仓位；广度缺失按下方系数降权</span>
           </div>
           <div style={rowStyle}>
             <span style={labelStyle}>动态仓位（买入缩放）</span>
+            <Tag theme="success" variant="light" size="small">账号级</Tag>
             <ToggleSw checked={form.sizingOn} onChange={(v) => set({ sizingOn: v })} />
             <span style={hintStyle}>按市场状态、风险档、宏观窗口、波动率等合成买入仓位倍数</span>
           </div>
+          {form.sizingOn && form.shadow && (
+            <div
+              role="status"
+              style={{
+                margin: '0 0 10px', padding: '8px 10px', borderRadius: 4, fontSize: 12,
+                background: 'var(--app-warn-bg, #fff7e6)', border: '1px solid var(--app-border, #e0e0e0)',
+              }}
+            >
+              当前为影子模式：只留痕，不改变下单金额。要真正生效请关闭「影子模式」。
+            </div>
+          )}
           <div style={rowStyle}>
             <span style={labelStyle}>卖出加权档位</span>
             <select
+              data-testid="sell-boost"
               value={form.sellBoost}
               onChange={(e) => set({ sellBoost: e.target.value })}
               style={{ minWidth: 200, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--app-border, #ddd)', background: 'var(--app-bg, #fff)' }}
@@ -567,6 +662,78 @@ export default function RegimeConfigPanel() {
                 hint="默认开（强制）：止损 6%→9% 时仓位 ×6/9，避免放宽止损放大单笔亏损"
                 checked={form.riskBudgetKeep}
                 onChange={(v) => set({ riskBudgetKeep: v })}
+              />
+
+              <div style={groupStyle}>技术过滤 / 风险池 / 概念库（系统级）</div>
+              <NumRow
+                label="KDJ J 上限"
+                hint="0=关；J 高于该值不新开仓（目标 90）。先影子统计误杀率。"
+                testId="tech-kdj-max"
+                value={form.techKdjMax}
+                min={0}
+                max={200}
+                step={1}
+                precision={0}
+                onChange={(v) => set({ techKdjMax: v })}
+              />
+              <div style={rowStyle}>
+                <span style={labelStyle}>长均线过滤</span>
+                <select
+                  data-testid="tech-ma-filter"
+                  value={form.techMa}
+                  onChange={(e) => set({ techMa: e.target.value })}
+                  style={{ minWidth: 200, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--app-border, #ddd)', background: 'var(--app-bg, #fff)' }}
+                >
+                  <option value="off">off（关闭）</option>
+                  <option value="ma20">收盘低于 MA20 不买</option>
+                  <option value="ma60">收盘低于 MA60 不买</option>
+                  <option value="ma120_250">收盘低于 MA120/MA250 不买</option>
+                </select>
+                <span style={hintStyle}>日K不足时该条件弃权，不误拦</span>
+              </div>
+              <SwitchRow
+                label="技术过滤影子模式"
+                hint="默认开：只记录“本应拦截”，不改裁定"
+                checked={form.techShadow}
+                onChange={(v) => set({ techShadow: v })}
+              />
+              <SwitchRow
+                label="风险池影子读数"
+                hint="默认开：只记录跌停/炸板家数与 would-change，不改风险档"
+                checked={form.riskPoolShadow}
+                onChange={(v) => set({ riskPoolShadow: v })}
+              />
+              <SwitchRow
+                label="概念库自动同步/敞口"
+                hint="覆盖率达门槛且数据未过期后再开；敞口上限在执行层面板配置"
+                checked={form.conceptEnabled}
+                onChange={(v) => set({ conceptEnabled: v })}
+              />
+              <SwitchRow
+                label="概念敞口影子模式"
+                hint="默认开；先跑影子一周统计误杀率"
+                checked={form.conceptShadow}
+                onChange={(v) => set({ conceptShadow: v })}
+              />
+              <NumRow
+                label="概念覆盖率门槛 %"
+                hint="0=恢复默认 95%；低于该值概念敞口闸弃权"
+                value={form.conceptCoverage}
+                min={0}
+                max={100}
+                step={1}
+                precision={0}
+                onChange={(v) => set({ conceptCoverage: v })}
+              />
+              <NumRow
+                label="概念数据最大陈旧 小时"
+                hint="0=恢复默认 48h；超过该时长概念数据不可信"
+                value={form.conceptStaleness}
+                min={0}
+                max={720}
+                step={1}
+                precision={0}
+                onChange={(v) => set({ conceptStaleness: v })}
               />
             </>
           )}
