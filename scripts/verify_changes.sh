@@ -12116,7 +12116,7 @@ run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
 eqkey115 ROUTES_DERIVED 191 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 190 '镜像基线：台账行数与主仓同值'
+eqkey115 LEDGER_ROWS 191 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
