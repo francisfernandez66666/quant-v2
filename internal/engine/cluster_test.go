@@ -85,7 +85,8 @@ func TestApplyEventDecay(t *testing.T) {
 	e.sectorEventTimes["半导体|利好"] = time.Now().Add(-4 * time.Hour)
 	e.applyEventDecay(events)
 	want := 0.8 * 0.5
-	if math.Abs(events[0].Score-want) > 1e-9 {
+	// 时间衰减含浮点连乘，1e-9 会被 0.3999999989 这类表示误差误判；按 1e-6 判。
+	if math.Abs(events[0].Score-want) > 1e-6 {
 		t.Errorf("4h后 score = %v, want %v", events[0].Score, want)
 	}
 	// 个股事件不衰减
