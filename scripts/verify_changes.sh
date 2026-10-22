@@ -10920,7 +10920,8 @@ SNAP113 4
 # §F-19（2026-10-20）：单实现已抽到 components/priceFormat.jsx；Watchlist 只保留同名重导出。
 # 判据仍钉“定义恰好一处”，但定义位置随实现迁移——只改目标文件，不放宽等值。
 eqj113 "$PF113" "export const WL_NO_DATA_PLACEHOLDER = '—'" 1 'P8：缺测占位串只有一处定义（各页自拼会让判据退化成逐页认文案）'
-eqj113 "$PF113" 'export function PriceCell({ value })' 1 'P8：现价单元格单实现'
+# §C7（2026-10-22）：PriceCell 增加 kind/triggerPrice 来源参数；锁“单实现”而不是绑死旧签名。
+eqr113 "$PF113" 'export function PriceCell\(' 1 'P8：现价单元格单实现'
 eqj113 "$PF113" 'export function PctCell({ value })' 1 'P8：涨跌单元格单实现'
 eqj113 "$WLS113" 'export const WL_NO_DATA_PLACEHOLDER = SHARED_NO_DATA' 1 'P8：Watchlist 只重导出共享占位串，不再另写一份'
 minj113 "$PF113" 'wl-no-data' 2 'P8：两列各有一枚缺测标记 testid（少于 2＝某一列又回到渲染 0）'
