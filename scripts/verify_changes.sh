@@ -13944,7 +13944,10 @@ fi
 #     （降级了但报成功那一族）；
 #   · NewManager 不得与进程级出厂默认同指针——别名时第一个实例的配置写会改写出厂表，
 #     同进程后建的 Manager 起点变成"别人刚写的值"（现网表现为重启后默认值漂移）。
-grep -q '"regime": true' internal/config/history.go || failrisk "regime 配置面未登记（该面写入无回滚点）"
+# 空白容忍：gofmt 会把 map 字面量按最长键对齐，锁不能绑死无空格形态。
+grep -qE '"regime":[[:space:]]+true' internal/config/history.go || failrisk "regime 配置面未登记（该面写入无回滚点）"
+# §A0：sizing 落账号专用键后必须有独立快照面，否则账号级写入无真正回滚点。
+grep -qE '"regime_sizing":[[:space:]]+true' internal/config/history.go || failrisk "regime_sizing 配置面未登记（账号级 sizing 写入无回滚点）"
 grep -q 'rules: cloneDefaultRules(),' internal/config/config.go || failrisk "NewManager 仍与出厂默认同指针（实例写会改写出厂表）"
 [ -f internal/server/regime_config_api_test.go ] || failrisk "regime 端点读写/回滚回归用例缺失"
 [ -f internal/config/default_rules_no_alias_test.go ] || failrisk "出厂默认别名回归用例缺失"
