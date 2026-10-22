@@ -10922,7 +10922,8 @@ SNAP113 4
 eqj113 "$PF113" "export const WL_NO_DATA_PLACEHOLDER = '—'" 1 'P8：缺测占位串只有一处定义（各页自拼会让判据退化成逐页认文案）'
 # §C7（2026-10-22）：PriceCell 增加 kind/triggerPrice 来源参数；锁“单实现”而不是绑死旧签名。
 eqr113 "$PF113" 'export function PriceCell\(' 1 'P8：现价单元格单实现'
-eqj113 "$PF113" 'export function PctCell({ value })' 1 'P8：涨跌单元格单实现'
+# §C7（2026-10-22）：PctCell 增加 ok 来源参数；同样锁“单实现”而非旧签名。
+eqr113 "$PF113" 'export function PctCell\(' 1 'P8：涨跌单元格单实现'
 eqj113 "$WLS113" 'export const WL_NO_DATA_PLACEHOLDER = SHARED_NO_DATA' 1 'P8：Watchlist 只重导出共享占位串，不再另写一份'
 minj113 "$PF113" 'wl-no-data' 2 'P8：两列各有一枚缺测标记 testid（少于 2＝某一列又回到渲染 0）'
 negj113 "$WLS113" 'Number(wlMap[code]?.price) || 0' 'P9：缺数归零形态禁止复活（0 会被当成「一个真实的股价」渲染成 ¥0.00）'
