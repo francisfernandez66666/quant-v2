@@ -2351,6 +2351,8 @@ func (s *Server) handleSetRegimeConfig(w http.ResponseWriter, r *http.Request) {
 		if sizingTrace != nil {
 			sizingTrace.audit(s)
 		}
+		// §DYN-SIZE-v3：sizing 变更即时同步到共享模拟盘引擎（否则要等下一次 paper 配置保存）。
+		s.syncPaperSizing(target)
 	}
 	if len(body.Enhance) > 0 {
 		if _, err := s.cfg.MergeEnhanceConfig(body.Enhance); err != nil {

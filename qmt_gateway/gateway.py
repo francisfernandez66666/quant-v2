@@ -158,6 +158,8 @@ CONTRACT_IGNORED_FIELDS = {
     "name", "strategy_id", "staleness_ms", "prev_close", "current_price",
     # §C2：VWAP 与回踩超时是 Seoul 侧执行/研究字段，网关不消费但必须显式声明（三点契约）。
     "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec",
+    # §DYN-SIZE-v3: audit-only marker on the order envelope; the gateway never consumes it.
+    "dynamic_budget",
 }
 
 # §SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）下单方向白名单：网关接单的唯一合法取值集。
@@ -925,11 +927,12 @@ class Gateway:
                         self.handler.disconnected = False
                         poss = b.query_positions()
                         if poss:
-                            self.handler.on_positions(poss)
+                            self.handler.on_positions(poss, synced=True, data_ts=_now_cn())
                         else:
+                            self.handler.on_positions([], synced=False, data_ts=_now_cn())
                             log.warning("[gateway] post-connect empty positions snapshot — "
                                         "reconcile skipped (account data may not be synced yet)")
-                        self.handler.on_account(b.query_asset())
+                        self.handler.on_account(b.query_asset(), synced=True, data_ts=_now_cn())
                     except Exception:  # noqa: BLE001
                         log.exception("[gateway] post-connect reconcile failed (will retry on next transition)")
                 prev[key] = conn
@@ -1132,14 +1135,19 @@ class Gateway:
                 return 200, {"ok": True, "err": ""}
             if etype == "positions":
                 poss = req.get("positions") or []
+                synced = req.get("synced")
+                data_ts = req.get("data_ts")
                 self.store.bridge_snapshot_set("positions", poss)
-                self.handler.on_positions(poss)
+                # v3: pass bridge freshness through untouched (None = legacy bridge).
+                self.handler.on_positions(poss, synced=synced, data_ts=data_ts)
                 return 200, {"ok": True, "err": ""}
             if etype == "account":
                 asset = req.get("asset")
                 if asset:
+                    synced = req.get("synced")
+                    data_ts = req.get("data_ts")
                     self.store.bridge_snapshot_set("asset", asset)
-                    self.handler.on_account(asset)
+                    self.handler.on_account(asset, synced=synced, data_ts=data_ts)
                 return 200, {"ok": True, "err": ""}
             if etype == "order_result":
                 return self._apply_order_result(req)

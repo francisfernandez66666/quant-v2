@@ -262,6 +262,8 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 				ind = r.opts.Coordinator.GetStockSector
 			}
 			pe.SetSectorExposure(q.RiskGate.SectorValuePct, q.RiskGate.SectorValueShadowOn(), ind)
+			// §DYN-SIZE-v3：单票 35% 额度与行业同源（0=动态模式回退 35）。
+			pe.SetSingleStockCap(q.RiskGate.SingleStockValuePct)
 		}
 		// §C1-V2 纸面概念敞口：覆盖率与时效都从实盘库读；任一不可得时闸弃权。
 		if st := r.opts.RealStore; st != nil {

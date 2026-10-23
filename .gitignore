@@ -53,6 +53,9 @@ __pycache__/
 *.pyc
 # pytest 会自带 .gitignore 兜底，这里显式声明以防裸 pytest 版本不写（缓存可随时重建，不入库）
 .pytest_cache/
+# §DYN-SIZE-v3：沙箱里系统临时目录不可写，跑 qmt_gateway 的 pytest 需把 TMPDIR 指到项目内
+# （TMPDIR=$PWD/.pytest-tmp）——该目录纯属运行期产物，不入库。
+.pytest-tmp/
 
 # 本地回测工具（不入库）
 bt_jq/

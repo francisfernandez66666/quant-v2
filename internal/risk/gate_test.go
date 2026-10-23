@@ -328,6 +328,31 @@ func TestGateConcentration(t *testing.T) {
 	}
 }
 
+// TestGateConcentrationDynamicBudgetSecondNet §DYN-SIZE-v3 §5.4：动态预算标记不得绕过单票集中度
+// 第二道保险——正常路径预算已减额，读数漂移时必须仍然拒单（fail-closed）。
+func TestGateConcentrationDynamicBudgetSecondNet(t *testing.T) {
+	db := gateDB(t)
+	g := NewGate(db, "u_g", nil)
+	cfg := qmtCfg()
+	cfg.RiskGate.SingleStockValuePct = 20
+	if err := db.UpsertRealAccount(store.RealAccount{
+		UserID: "u_g", AvailableCash: 100000,
+		UpdatedAt: cntime.In(time.Now()).Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("account: %v", err)
+	}
+	o := liveOrder(SideBuy)
+	o.DynamicBudget = true
+	o.Amount = 25000
+	if v := g.CheckLiveOrder(cfg, o); v.Pass || v.Gate != "concentration" {
+		t.Fatalf("dynamic 单也不得绕过集中度保险, got %+v", v)
+	}
+	o.Amount = 15000
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("额度内应放行, got %+v", v)
+	}
+}
+
 // TestGateBuyDiscipline 买入纪律迁入闸口：笔数按「已成交」计 + 预算超限拦截。
 //
 // §P0 2026-09-18 口径修正回归：笔数闸原先数 orders 表里「今日已报」的委托数——报单即占额度，

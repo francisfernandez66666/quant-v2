@@ -1555,6 +1555,25 @@ type PositionConfig struct {
 type SizingConfig struct {
 	// Enabled 总开关（默认 false = 零行为变更：合成照算但不下发，只走 shadow 读数）。
 	Enabled bool `json:"enabled"`
+	// BudgetMode 预算口径（账号级）：legacy=旧固定金额/战法分配/每日闸；dynamic=动态仓位是唯一
+	// 预算决策者（v3 定稿）。默认 legacy，代码合并本身不改变现有行为，上线按账号切换。
+	// English: account-scoped budget pipeline. "legacy" keeps the old fixed-amount gates;
+	// "dynamic" makes dynamic sizing the sole budget authority (v3). Default legacy for rollout.
+	BudgetMode string `json:"budget_mode,omitempty"`
+	// Mode 动态仓位合成口径：product=旧连乘（默认，逐字回归）；power_mean=分组幂平均（v3）。
+	// English: factor synthesis mode — "product" is the legacy byte-identical path, "power_mean"
+	// is the v3 grouped power mean.
+	Mode string `json:"mode,omitempty"`
+	// PowerP 幂平均指数（默认 0.5；0=几何平均）。仅 power_mean 生效。
+	// 用指针区分“未设置”（nil→0.5）与显式 0（几何平均）——旧 float 实现把 0 当缺省，
+	// 导致 v3 文档承诺的 p=0 永远无法生效。
+	// English: power-mean exponent (nil defaults to 0.5; explicit 0 = geometric mean). A pointer is
+	// required to tell "unset" apart from the meaningful zero.
+	PowerP *float64 `json:"power_p,omitempty"`
+	// GroupFloors 分组低于此值时抬到地板，避免单组全军覆没把仓位压到不可交易。
+	// 键：market（市场组，默认 0.45）/ stock（个股组，默认 0.35）。
+	// English: per-group floors — market (0.45) and stock (0.35) by default.
+	GroupFloors map[string]float64 `json:"group_floors,omitempty"`
 	// Shadow 影子模式（默认 true）：合成结果只留痕/日志，不改变实际下单金额。
 	// nil 视为 true（与 Enabled 独立：Enabled=true 且 Shadow=true 时仍不下发，用于灰度）。
 	Shadow *bool `json:"shadow,omitempty"`
@@ -1633,8 +1652,13 @@ type SizingConfig struct {
 // DefaultSizingConfig §DYN-SIZE 出厂默认（全部"安全侧"：总开关关、影子开）。
 // English: §DYN-SIZE factory defaults — master switch off, shadow on.
 func DefaultSizingConfig() SizingConfig {
+	defaultP := 0.5
 	return SizingConfig{
 		Enabled:                 false,
+		BudgetMode:              "legacy",
+		Mode:                    "product",
+		PowerP:                  &defaultP,
+		GroupFloors:             map[string]float64{"market": 0.45, "stock": 0.35},
 		Floor:                   0.15,
 		Cap:                     1.15,
 		KellyLambda:             0.5,
@@ -1687,6 +1711,56 @@ func NormalizeLegacyTotalPosPct(v float64) float64 {
 	return v
 }
 
+// BudgetModeOf 归一化预算口径：仅 "dynamic" 开启动态预算，其余一律按 legacy。
+// English: normalizes the budget pipeline; anything other than "dynamic" is legacy.
+func (s SizingConfig) BudgetModeOf() string {
+	if strings.EqualFold(strings.TrimSpace(s.BudgetMode), "dynamic") {
+		return "dynamic"
+	}
+	return "legacy"
+}
+
+// DynamicBudgetOn 动态预算是否开启。
+// English: whether the dynamic budget pipeline is active.
+func (s SizingConfig) DynamicBudgetOn() bool { return s.BudgetModeOf() == "dynamic" }
+
+// ModeOf 归一化合成口径：仅 "power_mean" 走新合成，其余按 product。
+// English: normalizes the synthesis mode; anything other than "power_mean" is product.
+func (s SizingConfig) ModeOf() string {
+	if strings.EqualFold(strings.TrimSpace(s.Mode), "power_mean") {
+		return "power_mean"
+	}
+	return "product"
+}
+
+// PowerPOf 返回幂平均指数（未设置时用默认 0.5；显式 0 = 几何平均）。
+// English: returns the power-mean exponent; nil defaults to 0.5 while an explicit 0 is kept
+// (geometric mean).
+func (s SizingConfig) PowerPOf() float64 {
+	if s.PowerP != nil {
+		return *s.PowerP
+	}
+	return 0.5
+}
+
+// GroupFloor 返回分组 floor（未设置时 market=0.45、stock=0.35，其余=0）。
+// English: per-group floor (market 0.45 / stock 0.35 by default; other groups 0).
+func (s SizingConfig) GroupFloor(group string) float64 {
+	if v, ok := s.GroupFloors[group]; ok && v > 0 {
+		if v > 1 {
+			return 1 // §5.6：组 floor 是“下限”，>1 等于凭空加杠杆，钳到 1。
+		}
+		return v
+	}
+	switch group {
+	case "market":
+		return 0.45
+	case "stock":
+		return 0.35
+	}
+	return 0
+}
+
 // ShadowOn 影子模式是否开启（nil = 默认 true）。
 // English: whether shadow mode is on (nil defaults to true).
 func (s SizingConfig) ShadowOn() bool { return s.Shadow == nil || *s.Shadow }
@@ -1724,6 +1798,16 @@ func (s SizingConfig) SellBoostLevelOf() string {
 func (s SizingConfig) WithDefaults() SizingConfig {
 	d := DefaultSizingConfig()
 	out := s
+	if strings.TrimSpace(out.BudgetMode) == "" {
+		out.BudgetMode = d.BudgetMode
+	}
+	if strings.TrimSpace(out.Mode) == "" {
+		out.Mode = d.Mode
+	}
+	if out.PowerP == nil {
+		out.PowerP = d.PowerP
+	}
+	out.GroupFloors = mergeScales(d.GroupFloors, out.GroupFloors)
 	if out.Floor <= 0 {
 		out.Floor = d.Floor
 	}

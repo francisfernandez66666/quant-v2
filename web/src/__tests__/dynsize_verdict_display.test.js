@@ -42,6 +42,22 @@ describe('§DYN-SIZE 定权裁定展示映射', () => {
     expect(sizingDisplay({ buy_scale: 'x' }).label).toBe('')
   })
 
+  // §DYN-SIZE-v3 §6.4：power_mean 的分组理由串必须原样进入 tooltip（组内用 |、组间箭头）。
+  it('power_mean 分组理由串（市场组/个股组/组间/上限/触地板）进入 tooltip', () => {
+    const reasons = [
+      '市场组:情绪相位×0.80|风险档×0.60→0.693',
+      '个股组:信号质量×1.05|个股波动率×0.85→0.945',
+      '组间→0.809',
+      '总仓位上限×0.82',
+      '触地板',
+    ]
+    const s = sizingDisplay({ buy_scale: 0.809, sizing_reasons: reasons })
+    expect(s.tip).toBe(reasons.join(' · '))
+    expect(s.tip).toContain('市场组:')
+    expect(s.tip).toContain('组间→0.809')
+    expect(s.label).toBe('缩仓 81%')
+  })
+
   // ── §DYN-SIZE P2 卖出加权 ──
   it('卖出加权（sell_boost）显示档位，悬停看触发条件', () => {
     const s = sizingDisplay({ sell_boost: 'L2', sizing_reasons: ['情绪相位=退潮', '风险档=Red'] })

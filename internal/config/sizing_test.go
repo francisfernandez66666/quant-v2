@@ -134,3 +134,70 @@ func TestNormalizeLegacyTotalPosPct(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestSizingPowerPSemantics §DYN-SIZE-v3 §6/§7：power_p 必须区分“未设置”（0.5）与显式 0（几何平均）。
+// 旧 float 实现把 0 当缺省，导致文档承诺的 p=0 永远无法生效。
+func TestSizingPowerPSemantics(t *testing.T) {
+	if got := DefaultSizingConfig().PowerPOf(); got != 0.5 {
+		t.Fatalf("出厂默认 p 应为 0.5，got %v", got)
+	}
+	var zero SizingConfig
+	if got := zero.WithDefaults().PowerPOf(); got != 0.5 {
+		t.Fatalf("零值补齐后 p 应为 0.5，got %v", got)
+	}
+	var explicit struct {
+		PowerP *float64 `json:"power_p"`
+	}
+	if err := json.Unmarshal([]byte(`{"power_p":0}`), &explicit); err != nil {
+		t.Fatalf("解析 power_p=0 失败: %v", err)
+	}
+	sc := SizingConfig{PowerP: explicit.PowerP}
+	if got := sc.WithDefaults().PowerPOf(); got != 0 {
+		t.Fatalf("显式 p=0 必须保留为几何平均，got %v", got)
+	}
+	raw, err := json.Marshal(sc.WithDefaults())
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	var back SizingConfig
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("反序列化失败: %v", err)
+	}
+	if got := back.PowerPOf(); got != 0 {
+		t.Fatalf("显式 p=0 往返后仍应为 0，got %v (raw=%s)", got, raw)
+	}
+}
+
+// TestSizingBudgetModeAndGroupFloors §DYN-SIZE-v3 §7：新键默认值与归一化。
+func TestSizingBudgetModeAndGroupFloors(t *testing.T) {
+	d := DefaultSizingConfig()
+	if d.BudgetModeOf() != "legacy" || d.ModeOf() != "product" {
+		t.Fatalf("默认口径应为 legacy/product，got %s/%s", d.BudgetModeOf(), d.ModeOf())
+	}
+	if d.DynamicBudgetOn() {
+		t.Fatalf("legacy 不得开启动态预算")
+	}
+	if got := d.GroupFloor("market"); got != 0.45 {
+		t.Fatalf("市场组 floor 默认 0.45，got %v", got)
+	}
+	if got := d.GroupFloor("stock"); got != 0.35 {
+		t.Fatalf("个股组 floor 默认 0.35，got %v", got)
+	}
+	custom := SizingConfig{
+		BudgetMode:  " DYNAMIC ",
+		Mode:        " POWER_MEAN ",
+		GroupFloors: map[string]float64{"market": 0.6},
+	}
+	got := custom.WithDefaults()
+	if !got.DynamicBudgetOn() || got.ModeOf() != "power_mean" {
+		t.Fatalf("大小写/空白应归一化，got %s/%s", got.BudgetModeOf(), got.ModeOf())
+	}
+	if got.GroupFloor("market") != 0.6 || got.GroupFloor("stock") != 0.35 {
+		t.Fatalf("分组 floor 覆盖/合并错误: market=%v stock=%v", got.GroupFloor("market"), got.GroupFloor("stock"))
+	}
+	// §5.6：组 floor >1 等于凭空加杠杆，必须钳到 1。
+	over := SizingConfig{GroupFloors: map[string]float64{"market": 1.5}}
+	if got := over.GroupFloor("market"); got != 1 {
+		t.Fatalf("分组 floor 应钳到 1，got %v", got)
+	}
+}

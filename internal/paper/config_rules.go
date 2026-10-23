@@ -16,7 +16,10 @@ import "quant-trading-v2/internal/config"
 //
 // English: builds the engine Config from account rules; nil auto-sell/short flags mean ON, and
 // zero margin/fee/stop values normalize to broker-real defaults (same contract as the old main.go).
-func ConfigFromRules(rp config.PaperConfig) Config {
+// 可选 sizing 入参：存在时把账号的动态预算口径/开关/影子同步进引擎配置（v3）。
+// English: optional sizing input carries the account's v3 budget mode / switch / shadow into
+// the engine config.
+func ConfigFromRules(rp config.PaperConfig, sizing ...config.SizingConfig) Config {
 	d := DefaultConfig()
 	shortMarginRate, shortFeeAnnual, shortStopPct := rp.ShortMarginRate, rp.ShortFeeAnnual, rp.ShortStopLossPct
 	if shortMarginRate <= 0 {
@@ -28,7 +31,7 @@ func ConfigFromRules(rp config.PaperConfig) Config {
 	if shortStopPct <= 0 {
 		shortStopPct = d.ShortStopLossPct
 	}
-	return Config{
+	c := Config{
 		Enabled:          rp.Enabled,
 		FixedAmount:      rp.FixedAmount,
 		MaxPositions:     rp.MaxPositions,
@@ -41,4 +44,11 @@ func ConfigFromRules(rp config.PaperConfig) Config {
 		ShortFixedAmount: rp.ShortFixedAmount,
 		ShortStopLossPct: shortStopPct,
 	}
+	if len(sizing) > 0 {
+		sc := sizing[0].WithDefaults()
+		c.BudgetMode = sc.BudgetModeOf()
+		c.SizingEnabled = sc.Enabled
+		c.SizingShadow = sc.ShadowOn()
+	}
+	return c
 }

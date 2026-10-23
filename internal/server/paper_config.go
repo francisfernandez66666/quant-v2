@@ -148,7 +148,8 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 	// ConfigFromRules 会把 AutoSell/ShortEnabled 的 nil 归一为默认值，得到引擎可直接消费的 Config。
 	pc := paper.Config{}
 	if rules := s.cfg.GetRulesFor(uid); rules != nil {
-		pc = paper.ConfigFromRules(rules.Paper)
+		sc, _ := s.cfg.GetSizingConfigFor(uid)
+		pc = paper.ConfigFromRules(rules.Paper, sc)
 	}
 	// 热同步第①层：全局模板引擎（旧单引擎路径）立即换用新配置，不动持仓/账本数据。
 	if s.paperEngine() != nil {
@@ -178,4 +179,28 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 		v.EngineEnabled, v.EngineAutoSell = pe.Enabled(), pe.Cfg().AutoSell
 	}
 	writeJSON(w, 200, v)
+}
+
+// syncPaperSizing §DYN-SIZE-v3 账号 sizing 变更后，把操作员模拟盘的预算口径/缩放开关热同步到
+// 共享模拟盘引擎。模拟盘账本是操作员级共享账本，因此只对操作员账号的 sizing 变更生效。
+// English: hot-syncs the operator paper book's v3 budget mode/switch after a sizing change.
+// The paper book is operator-scoped, so only the operator account's sizing matters.
+func (s *Server) syncPaperSizing(target string) {
+	if target == "" || target != s.operatorID() {
+		return
+	}
+	rules := s.cfg.GetRulesFor(target)
+	if rules == nil {
+		return
+	}
+	sc, _ := s.cfg.GetSizingConfigFor(target)
+	pc := paper.ConfigFromRules(rules.Paper, sc)
+	if s.paperEngine() != nil {
+		s.paperEngine().UpdateConfig(pc)
+	}
+	if s.registry != nil {
+		s.registry.SetPaperConfig(pc)
+	}
+	log.Printf("[paper] §DYN-SIZE-v3 模拟盘预算口径已热更新: budget_mode=%s sizing_enabled=%v shadow=%v",
+		pc.BudgetMode, pc.SizingEnabled, pc.SizingShadow)
 }

@@ -1186,3 +1186,37 @@ func TestRealPositionCanUseQty(t *testing.T) {
 		t.Fatalf("ensure 幂等: %v", err)
 	}
 }
+
+// TestPendingBuysDateNormalizationAndRemainder §DYN-SIZE-v3：在途买单必须能按 YYYYMMDD 命中
+// （orders.created_at 是 YYYY-MM-DD），部成按未成交余量计入，已成/已撤不计。
+func TestPendingBuysDateNormalizationAndRemainder(t *testing.T) {
+	db := testDB(t)
+	day, dashed := "20261023", "2026-10-23 09:30:00"
+	if _, err := db.UpsertRealOrder(RealOrder{
+		OrderID: "P1", SignalID: "SIG-P1", Code: "600000.SH", Side: "买入",
+		Status: "已报", Price: 10, Qty: 1000, CreatedAt: dashed, UserID: "u_pend",
+	}); err != nil {
+		t.Fatalf("upsert order: %v", err)
+	}
+	// 部分成交 300 → 剩余 700。
+	if err := db.ApplyRealFill(RealFill{
+		OrderID: "P1", Code: "600000.SH", Side: "买入", Price: 10, Qty: 300,
+		Amount: 3000, TradedAt: dashed, SignalID: "SIG-P1", UserID: "u_pend",
+	}); err != nil {
+		t.Fatalf("apply fill: %v", err)
+	}
+	pend, err := db.PendingBuys("u_pend", day)
+	if err != nil {
+		t.Fatalf("PendingBuys: %v", err)
+	}
+	if len(pend) != 1 || pend[0].Remain != 700 || pend[0].Price != 10 {
+		t.Fatalf("应命中 1 笔剩余 700 股，got %+v", pend)
+	}
+	// 已成交状态不再计入。
+	if _, err := db.UpdateRealOrderStatusMonotonic("u_pend", "P1", "已成"); err != nil {
+		t.Fatalf("update status: %v", err)
+	}
+	if pend, _ := db.PendingBuys("u_pend", day); len(pend) != 0 {
+		t.Fatalf("已成委托不应计入在途，got %+v", pend)
+	}
+}

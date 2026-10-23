@@ -250,7 +250,7 @@ export default function ExecutionRiskPanel() {
           </Row>
 
           <div style={groupStyle}>行业 / 概念敞口（C1）</div>
-          <Row label="行业敞口上限 %" hint="0=关；30=单行业预计市值/总资产上限 30%。未知行业弃权。">
+          <Row label="行业敞口上限 %" hint="0=关；dynamic 模式下 0 按 35% 兜底并只减额不拒买；未知行业不套行业上限。">
             <InputNumber min={0} max={100} step={1} value={form.sectorPct} onChange={(v) => set({ sectorPct: num(v, 0) })} />
           </Row>
           <Row label="行业敞口影子模式" hint="默认开：命中只写 risk_gates，不拒单。">
@@ -264,7 +264,7 @@ export default function ExecutionRiskPanel() {
           </Row>
 
           <div style={groupStyle}>ATR 风险预算（C3）</div>
-          <Row label="单笔风险预算 % 权益" hint="0=关；0.5=单笔最大亏损约为权益 0.5%。">
+          <Row label="单笔风险预算 % 权益" hint="0=关；0.5=单笔最大亏损约为权益 0.5%。已废弃：budget_mode=dynamic 时 ATR 预算退场（仅 legacy 回滚口径）。">
             <InputNumber min={0} max={100} step={0.1} value={form.riskPerTrade} onChange={(v) => set({ riskPerTrade: num(v, 0) })} />
           </Row>
           <Row label="ATR 预算影子模式" hint="默认开：只记录原本会缩到多少，不改股数。">
@@ -281,13 +281,13 @@ export default function ExecutionRiskPanel() {
           <Row label="日内已实现亏损熔断 %" hint="0=关；达到阈值停止当日新买入。">
             <InputNumber min={0} max={100} step={0.5} value={form.dayLoss} onChange={(v) => set({ dayLoss: num(v, 0) })} />
           </Row>
-          <Row label="单票集中度上限 %" hint="0=关；买入后该票市值/总资产上限。">
+          <Row label="单票集中度上限 %" hint="0=关；dynamic 模式下 0 按 35% 兜底，仅减额不拒买；仍作为第二道保险。">
             <InputNumber min={0} max={100} step={1} value={form.concentration} onChange={(v) => set({ concentration: num(v, 0) })} />
           </Row>
           <Row label="行情新鲜度阈值 ms" hint="0=关；超过该陈旧度拒单。">
             <InputNumber min={0} max={600000} step={1000} value={form.staleQuoteMs} onChange={(v) => set({ staleQuoteMs: num(v, 0) })} />
           </Row>
-          <Row label="单笔最低成交额 元" hint="默认 5000；目标 10000。降档后的碎单会被拒。">
+          <Row label="单笔最低成交额 元" hint="默认 5000；已废弃：budget_mode=dynamic 时不再作为拒买闸（仅 legacy 回滚口径）。">
             <InputNumber min={0} max={1000000} step={1000} value={form.minOrderAmount} onChange={(v) => set({ minOrderAmount: num(v, 5000) })} />
           </Row>
 

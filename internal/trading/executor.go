@@ -58,6 +58,12 @@ type OrderRequest struct {
 	// §C2 软回踩单的按单超时秒数（0=沿用全局 cancel_stale_sec）。
 	// English: §C2 per-order timeout for pullback entries (0 = global cancel_stale_sec).
 	TimeoutSec int `json:"timeout_sec,omitempty"`
+	// DynamicBudget §DYN-SIZE-v3：本单由动态预算生成。风控闸据此让位旧的持仓数上限/每日次数/
+	// 每日预算/战法分配；行业/单票检查仍作为第二道保险执行（不因本标记放行）。
+	// 网关侧不消费（ignored_by_gateway），只随单留痕便于审计。
+	// English: v3 dynamic-budget marker — legacy position-count/daily/strategy-alloc gates yield;
+	// sector/single-stock checks still run as a second safety net. The gateway ignores this field.
+	DynamicBudget bool `json:"dynamic_budget,omitempty"`
 }
 
 // OrderResult 下单返回（网关 → 首尔）。

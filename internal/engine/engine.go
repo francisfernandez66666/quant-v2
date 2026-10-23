@@ -36,6 +36,7 @@ import (
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
+	"quant-trading-v2/internal/ordbudget"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/research"
@@ -77,6 +78,11 @@ type Engine struct {
 	lastAlertEval time.Time
 
 	marketAPI *data.MarketAPI // 行情 API（实时价/K线/资金流/涨停池）
+	// industryFn §DYN-SIZE-v3 行业查询测试缝：非空时优先于 marketAPI.GetStockIndustry，
+	// 让动态预算的行业额度可在离线单测中验证（生产恒 nil，走行情源直调）。
+	// English: test seam for industry lookup used by the v3 dynamic budget; production leaves it nil
+	// and falls back to marketAPI.GetStockIndustry.
+	industryFn func(code string) string
 	// §MARKET_RISK_GATE P0 风险盘口主源：注入多源协调器后，涨停池等盘口统计走 hithink 主源、
 	// 东财兜底；未注入（nil）或 riskHithink=false 时全部回落旧的 e.marketAPI 东财直连。
 	// English: multi-source coordinator for the risk boards — once injected, board stats route
@@ -1302,7 +1308,7 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 		if d.Verdict != signalctl.VerdictPass {
 			continue
 		}
-		e.autoPlaceScaled(buys[i], live, d.BuyScale, sizingOn)
+		e.autoPlaceScaled(buys[i], live, d.BuyScale, sizingOn, pol.Regime.SizeCfg)
 	}
 }
 
@@ -1437,13 +1443,162 @@ func (e *Engine) atrRiskBudgetQty(sig combat_agent.Signal, price, riskPct float6
 	return int(riskAmt/stopDist/100) * 100, total, true
 }
 
+// dynamicBuyQty §DYN-SIZE-v3 实盘动态预算：总资产 × 动态缩放，再受行业/单票 35% 额度与现金约束。
+//
+// 口径见 docs/DYN_SIZE_V3_PLAN_20261023.md §4。关键点：
+//   - 基数=券商 total_asset（不可得时回落 TotalAssets；两者皆无 → 不开仓）；
+//   - 行业/单票额度把**在途买单**计入当前市值，避免连续信号穿透；
+//   - 行业未知时禁用行业额度，单票 35% 始终兜底；
+//   - 额度不足 1 手 → 跳过，不允许“先凑 1 手”突破 35%。
+//
+// English: v3 live dynamic budget — total assets × scale, then capped by 35% industry/stock rooms
+// (including pending buys) and cash. Missing equity abstains; an insufficient room skips instead
+// of forcing one lot through the cap.
+func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64, sizingCfg config.SizingConfig, ctrl *trading.Controller) int {
+	e.mu.RLock()
+	st := e.realStore
+	uid := e.userID
+	mkt := e.marketAPI
+	e.mu.RUnlock()
+	if uid == "" {
+		uid = e.primaryMember()
+	}
+	if st == nil || uid == "" || mkt == nil {
+		log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：账本/账号/行情未就绪", sig.Code)
+		return 0
+	}
+	// 基数优先用券商 total_asset（与方案一致）；缺失才回落账本合计。
+	total := 0.0
+	if acc, err := st.GetRealAccount(uid); err == nil && acc.TotalAsset > 0 {
+		total = acc.TotalAsset
+	} else if v, err := st.TotalAssets(uid); err == nil && v > 0 {
+		total = v
+	}
+	if total <= 0 {
+		log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：总资产不可得", sig.Code)
+		opslog.DayOnce("dynbudget-equity:"+sig.Code, func() {
+			opslog.Logf("quant", "§DYN-SIZE-v3 总资产不可得，跳过 %s(%s)", sig.Code, sig.Name)
+		})
+		return 0
+	}
+	cash, fresh := ctrl.AvailableCash()
+	if !fresh {
+		log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：可用资金口径不可得", sig.Code)
+		opslog.DayOnce("dynbudget-cash:"+sig.Code, func() {
+			opslog.Logf("quant", "§DYN-SIZE-v3 可用资金不可得，跳过 %s(%s)", sig.Code, sig.Name)
+		})
+		return 0
+	}
+
+	// 行业/单票额度分母=总资产；上限默认 35%，账号配置为正数时以配置为准。
+	qcfg := ctrl.Config()
+	indCap := qcfg.RiskGate.SectorValuePct
+	if indCap <= 0 {
+		indCap = 35
+	}
+	stockCap := qcfg.RiskGate.SingleStockValuePct
+	if stockCap <= 0 {
+		stockCap = 35
+	}
+	// §DYN-SIZE-v3 §5.6：单票/行业上限不得高于 100（配置可绕过前端直接写入，这里钳死）。
+	if indCap > 100 {
+		indCap = 100
+	}
+	if stockCap > 100 {
+		stockCap = 100
+	}
+
+	// 聚合当前市值：持仓 + 在途买单（已报全额/部成未成交余量）。
+	stockVal := map[string]float64{}
+	indVal := map[string]float64{}
+	e.mu.RLock()
+	industryFn := e.industryFn
+	e.mu.RUnlock()
+	industryOf := func(code string) string {
+		if industryFn != nil {
+			return strings.TrimSpace(industryFn(code))
+		}
+		if mkt == nil {
+			return ""
+		}
+		return strings.TrimSpace(mkt.GetStockIndustry(pureTsCode(code)))
+	}
+	if poses, err := st.RealPositionsForUser(uid); err == nil {
+		for _, p := range poses {
+			if p.Qty <= 0 {
+				continue
+			}
+			px := p.CurPrice
+			if px <= 0 {
+				px = p.CostPrice
+			}
+			if px <= 0 {
+				continue
+			}
+			code := pureTsCode(p.TsCode)
+			v := px * float64(p.Qty)
+			stockVal[code] += v
+			if ind := industryOf(code); ind != "" {
+				indVal[ind] += v
+			}
+		}
+	}
+	if pend, err := st.PendingBuys(uid, data.TradingDayDate(time.Now())); err == nil {
+		for _, pb := range pend {
+			code := pureTsCode(pb.Code)
+			v := pb.Price * float64(pb.Remain)
+			stockVal[code] += v
+			if ind := industryOf(code); ind != "" {
+				indVal[ind] += v
+			}
+		}
+	}
+
+	targetInd := industryOf(sig.Code)
+	// 缩放：影子/未开启时中性 1.0；否则用信号控制器算好的 BuyScale（0=未定权也按中性）。
+	scale := 1.0
+	if sizingCfg.Enabled && !sizingCfg.ShadowOn() && buyScale > 0 {
+		scale = buyScale
+	}
+	res := ordbudget.Compute(ordbudget.Inputs{
+		Base:              total,
+		CapEquity:         total,
+		Scale:             scale,
+		Price:             price,
+		Cash:              cash,
+		Lot:               ordbudget.DefaultLot,
+		IndustryCapPct:    indCap,
+		SingleStockCapPct: stockCap,
+		IndustryValue:     indVal[targetInd],
+		StockValue:        stockVal[pureTsCode(sig.Code)],
+		IndustryKnown:     targetInd != "",
+		FeeBufferPct:      0.6,
+	})
+	if res.SkipReason != "" {
+		log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 跳过：%s（总资产=%.0f 缩放=%.3f 行业=%q 行业额度=%.0f 单票额度=%.0f 现金=%.0f）",
+			sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash)
+		opslog.DayOnce("dynbudget-skip:"+sig.Code, func() {
+			opslog.Logf("quant", "§DYN-SIZE-v3 跳过 %s(%s) 原因=%s 总资产=%.0f 缩放=%.3f 行业=%s 行业额度=%.0f 单票额度=%.0f 现金=%.0f 策略=%s/%s",
+				sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash, sig.StrategyID, sig.Strategy)
+		})
+		return 0
+	}
+	log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 预算 qty=%d 金额=%.0f（总资产=%.0f 缩放=%.3f 约束=%s 行业=%q 行业额度=%.0f 单票额度=%.0f）",
+		sig.Code, sig.Name, res.Qty, res.Notional, total, scale, res.CappedBy, targetInd, res.IndustryRoom, res.StockRoom)
+	opslog.DayOnce("dynbudget:"+sig.Code, func() {
+		opslog.Logf("quant", "§DYN-SIZE-v3 预算 %s(%s) qty=%d 金额=%.0f 总资产=%.0f 缩放=%.3f 约束=%s 行业=%s 行业额度=%.0f 单票额度=%.0f 策略=%s/%s",
+			sig.Code, sig.Name, res.Qty, res.Notional, total, scale, res.CappedBy, targetInd, res.IndustryRoom, res.StockRoom, sig.StrategyID, sig.Strategy)
+	})
+	return res.Qty
+}
+
 // autoPlaceScaled §DYN-SIZE 执行层入口（带动态仓位缩放）。
 //
 // buyScale：信号控制器给出的缩放系数（0=未定权，按基准金额；1.0=中性）。
 // sizingOn：动态定权总开关是否开启——用于让内联 Yellow 缩放让位（防同一风险双乘）。
 // English: §DYN-SIZE execution entry with the controller's buy scale (0 = not sized; 1.0 = neutral)
 // and the master switch, so the legacy inline Yellow scaling can yield to it (no double penalty).
-func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.StockInfo, buyScale float64, sizingOn bool) {
+func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.StockInfo, buyScale float64, sizingOn bool, budgetCfg ...config.SizingConfig) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
 	e.mu.RUnlock()
@@ -1466,6 +1621,17 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		return
 	}
 	cfg := ctrl.Config()
+	// §DYN-SIZE-v3：动态预算模式——动态仓位是唯一预算决策者，旧的固定金额/战法金额/每日闸/
+	// ATR 风险预算/最低成交额闸全部让位。无配置入参（旧测试/autoPlace）保持 legacy 路径。
+	// English: v3 dynamic budget mode makes dynamic sizing the sole authority; the legacy amount,
+	// strategy allocation, daily, ATR and min-notional gates all yield. Calls without the config
+	// (old tests / autoPlace) stay on the legacy path.
+	var sizingCfg config.SizingConfig
+	dynamicBudget := false
+	if len(budgetCfg) > 0 {
+		sizingCfg = budgetCfg[0]
+		dynamicBudget = sizingCfg.DynamicBudgetOn()
+	}
 	// §SIGNAL_CONTROLLER 20260917：此处原内联白名单（含 §20260917 热修键统一）已删除——
 	// 战法准入统一由信号控制器 live 通道裁定（dispatchLive 唯一喂入），执行层不再比对名单，
 	// 双写漂移（autoPlace 一份、risk.Gate 一份）就此终结。
@@ -1546,29 +1712,32 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		})
 		return
 	}
-	amount := cfg.FixedAmount
-	// §QUANT-TAB 每战法仓位大小：该战法配置了正数金额则覆盖全局 fixed_amount（量化交易页可配）。
-	// §UAT-FIX 2026-08-31：面板按战法 ID（fac_1…）配置金额，同键优先，回退显示名，再回退全局。
-	if v := cfg.StrategyAmounts[sig.StrategyID]; v > 0 {
-		amount = v
-	} else if v := cfg.StrategyAmounts[sig.Strategy]; v > 0 {
-		amount = v
-	}
-	if amount <= 0 {
-		amount = 10000
-	}
-	// §DYN-SIZE 动态仓位缩放（BuyScale）：金额 = 基准 × 缩放（个股信号 × 宏观事件 × 大盘情绪 ×
-	// 节假日 × 个股波动率 的合成结果，已在信号控制器内算好）。缩后仍走下方整手/现金降档。
-	// English: §DYN-SIZE — the amount is the base scaled by the synthesized BuyScale; the lot/cash
-	// degradation below still applies afterwards.
-	if buyScale > 0 && buyScale != 1.0 {
-		orig := amount
-		amount = amount * buyScale
-		log.Printf("[qmt] %s(%s) §DYN-SIZE 动态缩放 %.0f→%.0f（系数%.3f）", sig.Code, sig.Name, orig, amount, buyScale)
-		opslog.DayOnce("dynsize:"+sig.Code, func() {
-			opslog.Logf("quant", "§DYN-SIZE 动态缩放 %s(%s) 预算=%.0f→%.0f 系数=%.3f 策略=%s/%s",
-				sig.Code, sig.Name, orig, amount, buyScale, sig.StrategyID, sig.Strategy)
-		})
+	amount := 0.0
+	if !dynamicBudget {
+		amount = cfg.FixedAmount
+		// §QUANT-TAB 每战法仓位大小：该战法配置了正数金额则覆盖全局 fixed_amount（量化交易页可配）。
+		// §UAT-FIX 2026-08-31：面板按战法 ID（fac_1…）配置金额，同键优先，回退显示名，再回退全局。
+		if v := cfg.StrategyAmounts[sig.StrategyID]; v > 0 {
+			amount = v
+		} else if v := cfg.StrategyAmounts[sig.Strategy]; v > 0 {
+			amount = v
+		}
+		if amount <= 0 {
+			amount = 10000
+		}
+		// §DYN-SIZE 动态仓位缩放（BuyScale）：金额 = 基准 × 缩放（个股信号 × 宏观事件 × 大盘情绪 ×
+		// 节假日 × 个股波动率 的合成结果，已在信号控制器内算好）。缩后仍走下方整手/现金降档。
+		// English: §DYN-SIZE — the amount is the base scaled by the synthesized BuyScale; the lot/cash
+		// degradation below still applies afterwards.
+		if buyScale > 0 && buyScale != 1.0 {
+			orig := amount
+			amount = amount * buyScale
+			log.Printf("[qmt] %s(%s) §DYN-SIZE 动态缩放 %.0f→%.0f（系数%.3f）", sig.Code, sig.Name, orig, amount, buyScale)
+			opslog.DayOnce("dynsize:"+sig.Code, func() {
+				opslog.Logf("quant", "§DYN-SIZE 动态缩放 %s(%s) 预算=%.0f→%.0f 系数=%.3f 策略=%s/%s",
+					sig.Code, sig.Name, orig, amount, buyScale, sig.StrategyID, sig.Strategy)
+			})
+		}
 	}
 	// §MARKET_RISK_GATE P4 auto-buy 谨慎层（默认关闭，裁决④）：真金白银下单层的第二道风险闸——
 	// Red 当日拒开新仓（DayOnce+opslog 留痕）；Yellow 按仓位档缩放买入金额（优先状态机 MaxPosPct，回退
@@ -1592,8 +1761,8 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 			})
 			return
 		case combat_agent.RiskTierYellow:
-			if sizingOn {
-				break // §DYN-SIZE：风险档已进 BuyScale，不再二次缩放
+			if sizingOn || dynamicBudget {
+				break // §DYN-SIZE：风险档已进 BuyScale/动态预算，不再二次缩放
 			}
 			scale := cfg.YellowScale()
 			if maxPos > 0 && maxPos < scale {
@@ -1607,12 +1776,22 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 			}
 		}
 	}
-	qty := int(amount/price/100) * 100
+	qty := 0
+	if dynamicBudget {
+		qty = e.dynamicBuyQty(sig, price, buyScale, sizingCfg, ctrl)
+		if qty <= 0 {
+			// 具体原因在 dynamicBuyQty 内已按 DayOnce 留痕；这里只结束本单。
+			return
+		}
+	} else {
+		qty = int(amount/price/100) * 100
+	}
 	// §C3 ATR 风险预算：用“账户权益 × 单笔风险% / (ATR×止损倍数)”倒推股数，与金额股数取 min。
 	// 影子期只记录原本会缩到多少；正式期才真正收紧。缺 ATR/权益时整条弃权。
 	// English: §C3 ATR risk budget — qty = equity×risk%/(ATR×stopMult), min()'d with the amount qty.
 	// Shadow logs the would-be shrink; enforcement only when shadow=false; missing inputs abstain.
-	if qty > 0 && cfg.RiskGate.RiskPerTradePct > 0 {
+	// §DYN-SIZE-v3：dynamic 模式下 ATR 风险预算退场，不再二次缩股。
+	if !dynamicBudget && qty > 0 && cfg.RiskGate.RiskPerTradePct > 0 {
 		if qRisk, equity, ok := e.atrRiskBudgetQty(sig, price, cfg.RiskGate.RiskPerTradePct); ok && qRisk < qty {
 			shadow := cfg.RiskGate.RiskBudgetShadowOn()
 			log.Printf("[qmt] %s(%s) §C3 ATR风险预算 金额股数=%d 风险股数=%d equity=%.0f ATR=%.3f shadow=%v",
@@ -1628,9 +1807,12 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	}
 	// §R0.7 修复：高价股不足一手时不再强凑 1 手（旧逻辑 qty=100 导致订单金额超预算数倍）
 	if qty <= 0 {
-		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
+		// §DYN-SIZE-v3：预算可能被动态缩放与 35% 额度同时压缩，文案不再只指向现金。
+		log.Printf("[qmt] %s 预算不足以买入一手（现价 %.2f，一手需 %.0f 元，预算 %.0f 元），跳过下单",
+			sig.Code, price, price*100, amount)
 		opslog.DayOnce("one-lot:"+sig.Code, func() {
-			opslog.Logf("quant", "金额不足一手跳过 %s 现价=%.2f 预算=%.0f 策略=%s/%s", sig.Code, price, amount, sig.StrategyID, sig.Strategy)
+			opslog.Logf("quant", "预算不足一手跳过（整手/额度不足） %s 现价=%.2f 一手=%.0f 预算=%.0f 策略=%s/%s",
+				sig.Code, price, price*100, amount, sig.StrategyID, sig.Strategy)
 		})
 		return
 	}
@@ -1679,7 +1861,8 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	// FINAL lot count, checked AFTER the cash downgrade (the degraded lot is what actually hits
 	// the counter), before order assembly. Factory default 5000; zero falls back to the default,
 	// negative disables.
-	if minAmt := cfg.EffectiveMinOrderAmount(); minAmt > 0 && float64(qty)*price < minAmt {
+	// §DYN-SIZE-v3：dynamic 模式下“最低成交额”不再作为拒买闸——1 手碎单由 35% 额度与现金决定。
+	if minAmt := cfg.EffectiveMinOrderAmount(); !dynamicBudget && minAmt > 0 && float64(qty)*price < minAmt {
 		log.Printf("[qmt] %s(%s) 单笔成交额 %.0f 元（%d股×%.2f）低于最低成交额 %.0f 元，拒买跳过",
 			sig.Code, sig.Name, float64(qty)*price, qty, price, minAmt)
 		opslog.DayOnce("minamount:"+sig.Code, func() {
@@ -1739,6 +1922,8 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		VWAPAsOf:             vwapAsOf,
 		SignalVWAPPremiumPct: premium,
 		TimeoutSec:           entryTimeout,
+		// §DYN-SIZE-v3：标记本单由动态预算生成，让旧数量/每日/行业拒买闸让位。
+		DynamicBudget: dynamicBudget,
 	}
 	if si != nil {
 		req.CurrentPrice = si.Price

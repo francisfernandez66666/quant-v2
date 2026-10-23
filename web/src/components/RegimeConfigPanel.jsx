@@ -168,6 +168,12 @@ export default function RegimeConfigPanel() {
       const next = {
         marketState: !!enh.market_state_enabled,
         sizingOn: !!sz.enabled,
+        // §DYN-SIZE-v3：预算口径与合成口径（账号级）。
+        budgetMode: String(sz.budget_mode || 'legacy').toLowerCase(),
+        sizingMode: String(sz.mode || 'product').toLowerCase(),
+        powerP: num(sz.power_p, 0.5),
+        groupMarket: num((sz.group_floors || {}).market, 0.45),
+        groupStock: num((sz.group_floors || {}).stock, 0.35),
         sellBoost: String(sz.sell_boost_level || 'L2').toUpperCase(),
         yellowConf: num(mg.yellow_confidence, 0.90),
         redConf: num(mg.red_confidence, 0.92),
@@ -276,6 +282,10 @@ export default function RegimeConfigPanel() {
     ratio('Yellow 金额权重', f.yellowWeight)
     ratio('Red 金额权重', f.redWeight)
     ratio('广度缺失降权', f.breadthMissing)
+    // §DYN-SIZE-v3：p 允许 0（几何平均）与负值，范围 [-10,10]；分组 floor 0~1。
+    if (!Number.isFinite(Number(f.powerP)) || Number(f.powerP) < -10 || Number(f.powerP) > 10) bad.push('幂平均指数 p')
+    ratio('市场组 floor', f.groupMarket)
+    ratio('个股组 floor', f.groupStock)
 
     pos('仓位缩放地板', f.floor, 5)
     pos('仓位缩放上限', f.cap, 5)
@@ -353,6 +363,11 @@ export default function RegimeConfigPanel() {
         },
         sizing: {
           enabled: !!form.sizingOn,
+          // §DYN-SIZE-v3：dynamic=动态仓位是唯一预算决策者；power_mean=分组幂平均。
+          budget_mode: form.budgetMode === 'dynamic' ? 'dynamic' : 'legacy',
+          mode: form.sizingMode === 'power_mean' ? 'power_mean' : 'product',
+          power_p: Number(form.powerP),
+          group_floors: { market: Number(form.groupMarket), stock: Number(form.groupStock) },
           shadow: !!form.shadow,
           sell_boost_level: form.sellBoost,
           breadth_missing_scale: Number(form.breadthMissing),
@@ -476,6 +491,44 @@ export default function RegimeConfigPanel() {
               当前为影子模式：只留痕，不改变下单金额。要真正生效请关闭「影子模式」。
             </div>
           )}
+          <div style={rowStyle}>
+            <span style={labelStyle}>预算口径</span>
+            <select
+              data-testid="budget-mode"
+              value={form.budgetMode}
+              onChange={(e) => set({ budgetMode: e.target.value })}
+              style={{ minWidth: 220, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--app-border, #ddd)', background: 'var(--app-bg, #fff)' }}
+            >
+              <option value="legacy">legacy 旧固定金额/战法分配/每日闸</option>
+              <option value="dynamic">dynamic 动态仓位唯一预算（v3）</option>
+            </select>
+            <span style={hintStyle}>dynamic：总资产（模拟盘=池权益）× 缩放，再减到行业/单票 35% 额度；旧金额与次数闸不生效</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={labelStyle}>合成口径</span>
+            <select
+              data-testid="sizing-mode"
+              value={form.sizingMode}
+              onChange={(e) => set({ sizingMode: e.target.value })}
+              style={{ minWidth: 220, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--app-border, #ddd)', background: 'var(--app-bg, #fff)' }}
+            >
+              <option value="product">product 旧连乘（逐字回归）</option>
+              <option value="power_mean">power_mean 分组幂平均（v3）</option>
+            </select>
+            <span style={hintStyle}>power_mean：市场组/个股组各自幂平均，再组间合成，避免多因子过度连乘</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={labelStyle}>幂平均指数 p</span>
+            <InputNumber data-testid="power-p" min={-10} max={10} step={0.1} value={form.powerP} onChange={(v) => set({ powerP: toNum(v) })} />
+            <span style={hintStyle}>0.5=更宽容；0=几何平均；仅 power_mean 生效</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={labelStyle}>分组 floor</span>
+            <InputNumber data-testid="group-market-floor" min={0.01} max={1} step={0.01} value={form.groupMarket} onChange={(v) => set({ groupMarket: toNum(v) })} />
+            <span style={hintStyle}>市场组（默认 0.45）</span>
+            <InputNumber data-testid="group-stock-floor" min={0.01} max={1} step={0.01} value={form.groupStock} onChange={(v) => set({ groupStock: toNum(v) })} />
+            <span style={hintStyle}>个股组（默认 0.35）</span>
+          </div>
           <div style={rowStyle}>
             <span style={labelStyle}>卖出加权档位</span>
             <select

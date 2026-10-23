@@ -25,6 +25,7 @@ import (
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/ordbudget"
 )
 
 // LimitUpPct §R6 分板块涨停封板近似阈值（实时涨幅 ≥ 该值视为封板拒买）。
@@ -70,6 +71,20 @@ type Config struct {
 	// English: re-entry cooldown (minutes, §R1.4) — 0 = unlimited (legacy default); >0 blocks re-buying
 	// the same code within the window after a full close. Configurable via rules.paper.reentry_cooldown_min.
 	ReentryCooldownMin int `json:"reentry_cooldown_min"`
+
+	// §DYN-SIZE-v3 动态预算口径：dynamic 时池权益×缩放是唯一预算来源，固定金额/IR/每池次数/
+	// 每日预算/持仓数量上限全部让位。legacy 保持旧行为。由 paper.ConfigFromRules 从账号 sizing
+	// 配置装配；默认 legacy，代码合并本身不改变现有行为。
+	// English: v3 dynamic budget — pool equity × scale is the sole budget source; the legacy fixed
+	// amount / IR / daily count / daily budget / position-count caps all yield. Default legacy.
+	BudgetMode string `json:"budget_mode,omitempty"`
+	// SizingEnabled/SizingShadow 动态缩放是否开启/影子；影子或未开启时预算按中性 1.0 计算。
+	SizingEnabled bool `json:"sizing_enabled,omitempty"`
+	SizingShadow  bool `json:"sizing_shadow,omitempty"`
+	// SingleStockCapPct 单票集中度上限（%，0=动态模式下回退 35）。行业上限复用 SetSectorExposure。
+	// English: single-stock concentration cap (%; 0 falls back to 35 in dynamic mode). The industry
+	// cap reuses SetSectorExposure.
+	SingleStockCapPct float64 `json:"single_stock_cap_pct,omitempty"`
 
 	// §SHORT-3 纸面融券做空（模拟盘做空侧，决策④）：做空战法信号 → 融券卖出开仓（负持仓），
 	// 下跌买回平仓获利、上涨触发做空止损；独立做空资金池 shortCash，与做多池完全隔离，
@@ -466,6 +481,9 @@ type Engine struct {
 	sectorLimitPct float64
 	sectorShadow   bool
 	industryOf     func(code string) string
+	// singleStockLimitPct §DYN-SIZE-v3 单票集中度上限（%；0=动态模式回退 35）。
+	// English: v3 single-stock concentration cap (%; 0 falls back to 35 in dynamic mode).
+	singleStockLimitPct float64
 	// §C1-V2 概念敞口（与实盘同口径）：上限、影子、覆盖率门槛、覆盖率读数、股票→概念反查。
 	// 覆盖率不可得/低于门槛时闸弃权；概念未知也弃权。
 	// English: §C1-V2 paper concept exposure — cap, shadow, coverage floor, coverage reading and
@@ -700,6 +718,20 @@ func (e *Engine) Cfg() Config {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.cfg
+}
+
+// dynamicBudgetOn 动态预算是否开启（调用方通常已持 e.mu；仅读 cfg 标量，不额外加锁）。
+// English: whether the v3 dynamic budget is active (callers generally already hold e.mu).
+func (e *Engine) dynamicBudgetOn() bool {
+	return strings.EqualFold(strings.TrimSpace(e.cfg.BudgetMode), "dynamic")
+}
+
+// SetSingleStockCap §DYN-SIZE-v3 注入单票集中度上限（%）；<=0 时动态预算回退 35。
+// English: injects the single-stock concentration cap (%; <=0 falls back to 35 in dynamic mode).
+func (e *Engine) SetSingleStockCap(pct float64) {
+	e.mu.Lock()
+	e.singleStockLimitPct = pct
+	e.mu.Unlock()
 }
 
 // UpdateConfig §修复 S2（2026-08-29）：后台改账户级模拟盘配置（费率/滑点/开关等）后热同步到运行实例，
@@ -1149,7 +1181,7 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// 改为跳过该买单并留痕，继续处理后续信号。
 		// English: R4 fix — the cap used to `return`, aborting the whole loop and silently dropping
 		// every later buy AND stop-loss sell; now it skips this buy with an audit record and continues.
-		if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
+		if !e.dynamicBudgetOn() && e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 			e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 				StrategyType: s.StrategyType, Side: "buy", Kind: "自动撮合",
 				SignalPrice: s.Price, Status: "rejected", CreatedAt: now},
@@ -1205,8 +1237,10 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// English: per-pool position cap (decoupled from the global cap, customizable) — skip the signal
 		// when the pool already holds >= its cap. 0 = no per-pool limit (global cap only); Σpool caps ≤
 		// the global cap (conserved by the frontend config).
-		if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
-			continue
+		if !e.dynamicBudgetOn() {
+			if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
+				continue
+			}
 		}
 		// §SIGNAL_CONTROLLER 20260917：此处原"统一纪律·买入确认扳机"（探针+双确认窗，
 		// discipline/buyConfirm 状态机）整体迁入信号控制器 paper 通道——到达本函数的信号均已经
@@ -1332,6 +1366,113 @@ func (e *Engine) poolPositionCountLocked(poolKey string) int {
 	return n
 }
 
+// markPriceLocked 持仓估值价：实时标记优先，缺失回落成本价。
+// English: position mark price — live mark first, cost price as fallback.
+func (e *Engine) markPriceLocked(p *Position) float64 {
+	if p.Mark > 0 {
+		return p.Mark
+	}
+	return p.CostPrice
+}
+
+// poolEquityLocked 池权益 = 池现金 + 该池持仓市值（动态预算基数）。
+// English: pool equity = pool cash + market value of that pool's positions (v3 budget base).
+func (e *Engine) poolEquityLocked(poolKey string) float64 {
+	eq := e.pools[poolKey]
+	for _, p := range e.positions {
+		if p.StrategyType != poolKey {
+			continue
+		}
+		if px := e.markPriceLocked(p); px > 0 {
+			eq += px * float64(p.Qty)
+		}
+	}
+	return eq
+}
+
+// totalPaperEquityLocked 整个模拟盘权益（动态预算集中度分母）：做多现金+持仓市值+做空侧权益。
+// English: whole paper-book equity (v3 concentration denominator): long cash + positions + short book.
+func (e *Engine) totalPaperEquityLocked() float64 {
+	eq := e.cash + e.shortEquityLocked()
+	for _, p := range e.positions {
+		if px := e.markPriceLocked(p); px > 0 {
+			eq += px * float64(p.Qty)
+		}
+	}
+	return eq
+}
+
+// dynamicPaperQtyLocked 模拟盘动态预算：池权益 × 缩放，再受全盘 35% 行业/单票额度与池现金约束。
+// 返回 (股数, 跳过原因)；跳过原因为空表示成功。调用方须持 e.mu。
+// English: paper dynamic budget — pool equity × scale, capped by whole-book 35% industry/stock
+// rooms and pool cash. Caller must hold e.mu.
+func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale float64) (int, string) {
+	base := e.poolEquityLocked(poolKey)
+	capEq := e.totalPaperEquityLocked()
+	if base <= 0 || capEq <= 0 || price <= 0 {
+		return 0, "池权益/价格不可得"
+	}
+	cash := e.pools[poolKey]
+	if cash <= 0 {
+		return 0, "池现金不足"
+	}
+	scale := 1.0
+	if e.cfg.SizingEnabled && !e.cfg.SizingShadow && sizeScale > 0 {
+		scale = sizeScale
+	}
+	ind := ""
+	if e.industryOf != nil {
+		ind = strings.TrimSpace(e.industryOf(code))
+	}
+	indVal, stockVal := 0.0, 0.0
+	for _, p := range e.positions {
+		px := e.markPriceLocked(p)
+		if px <= 0 || p.Qty <= 0 {
+			continue
+		}
+		v := px * float64(p.Qty)
+		if p.Code == code {
+			stockVal += v
+		}
+		if ind != "" && strings.TrimSpace(e.industryOf(p.Code)) == ind {
+			indVal += v
+		}
+	}
+	indCap := e.sectorLimitPct
+	if indCap <= 0 {
+		indCap = 35
+	}
+	stockCap := e.singleStockLimitPct
+	if stockCap <= 0 {
+		stockCap = 35
+	}
+	// §DYN-SIZE-v3 §5.6：单票/行业上限不得高于 100（配置可绕过前端直接写入，这里钳死）。
+	if indCap > 100 {
+		indCap = 100
+	}
+	if stockCap > 100 {
+		stockCap = 100
+	}
+	res := ordbudget.Compute(ordbudget.Inputs{
+		Base:              base,
+		CapEquity:         capEq,
+		Scale:             scale,
+		Price:             price,
+		Cash:              cash,
+		Lot:               ordbudget.DefaultLot,
+		IndustryCapPct:    indCap,
+		SingleStockCapPct: stockCap,
+		IndustryValue:     indVal,
+		StockValue:        stockVal,
+		IndustryKnown:     ind != "",
+		FeeBufferPct:      0,
+	})
+	if res.SkipReason != "" {
+		return 0, res.SkipReason
+	}
+	return res.Qty, ""
+}
+
 // fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
 // poolKey 为该笔买入所属的战法资金池（""=其他/手动池）；扣款只扣对应池预算，池与池互不侵占。
 // qty > 0 为显式手数（手动买入/加仓，超出池内资金直接失败）；
@@ -1347,8 +1488,11 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	// English: per-pool position cap (decoupled from the global cap, customizable) — a new open in this
 	// pool is rejected once the pool reaches its cap. 0 = no per-pool limit; add-ons (already held) don't
 	// pass through here (they use addToPositionLocked).
-	if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
-		return errMaxPos
+	// §DYN-SIZE-v3：dynamic 模式下持仓数量上限退场，仓位由 35% 额度/现金决定。
+	if !e.dynamicBudgetOn() {
+		if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
+			return errMaxPos
+		}
 	}
 	// §分仓纪律引擎·预检查（不需要cost）：日限次数+冷却+评分门槛。
 	// §R7 MinScore 真正生效：confidence 由信号传入；manual=true（手动买入/加仓）= 用户自主决策放行。
@@ -1367,8 +1511,18 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 			return fmt.Errorf("再入场冷却中(%.0f/%.0f分钟)", elapsed, float64(e.cfg.ReentryCooldownMin))
 		}
 	}
-	explicitQty := qty > 0
-	if !explicitQty {
+	// §DYN-SIZE-v3：dynamic 模式忽略显式股数与固定金额，统一走池权益×缩放；legacy 保持旧路径。
+	explicitQty := qty > 0 && !e.dynamicBudgetOn()
+	if e.dynamicBudgetOn() {
+		q, why := e.dynamicPaperQtyLocked(poolKey, code, price, sizeScale)
+		if q <= 0 {
+			if why == "" {
+				why = "动态预算不足"
+			}
+			return fmt.Errorf("动态仓位: %s", why)
+		}
+		qty = q
+	} else if !explicitQty {
 		// §Phase4 IR 动态仓位：自动买入金额按该池参考 IR 缩放（高 IR 加大单笔预算、低 IR 缩仓）。
 		// English: Phase-4 IR-scaled sizing — the auto amount scales by the pool's reference IR
 		// (higher IR → larger per-trade budget, lower IR → smaller).
@@ -1397,9 +1551,12 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	fee := e.buyFeeLocked(cost)
 
 	// §分仓纪律引擎·预算检查（需要cost）：日内花费不超池资金配比（按本金口径计数）。
-	if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
-		log.Printf("[paper] 分仓预算拒绝 %s→%s: %s", strategy, code, reason)
-		return errPoolDiscipline
+	// §DYN-SIZE-v3：dynamic 模式下每日预算退场，预算只由池权益×缩放与现金决定。
+	if !e.dynamicBudgetOn() {
+		if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
+			log.Printf("[paper] 分仓预算拒绝 %s→%s: %s", strategy, code, reason)
+			return errPoolDiscipline
+		}
 	}
 	// §C1 行业/概念敞口：在最终股数/金额确定后、扣款前检查；纸面与实盘同口径。
 	if ok, why := e.checkSectorExposureLocked(code, cost); !ok {
@@ -1523,10 +1680,12 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	// 持有/达最大仓位即拒绝，再按 quote 实时价成交。
-	if _, held := e.positions[code]; held {
+	// §DYN-SIZE-v3：dynamic 模式下已持仓走动态加仓（数量按剩余 35% 额度与现金重算）。
+	p, held := e.positions[code]
+	if held && !e.dynamicBudgetOn() {
 		return errHeld
 	}
-	if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
+	if !e.dynamicBudgetOn() && e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 		return errMaxPos
 	}
 	var price float64
@@ -1534,6 +1693,27 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 		price = q.Price
 	} else {
 		return errNoQuote
+	}
+	if held {
+		q, why := e.dynamicPaperQtyLocked(p.StrategyType, code, price, 1.0)
+		if q <= 0 {
+			if why == "" {
+				why = "动态预算不足"
+			}
+			e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: p.StrategyType, Side: "buy",
+				Kind: "手动加仓", SignalPrice: signalPrice, Status: "rejected", Reason: "动态仓位: " + why})
+			return fmt.Errorf("动态仓位: %s", why)
+		}
+		if err := e.addToPositionLocked(p, code, name, strategy, signalPrice, price, q, "手动模拟加仓(动态仓位)"); err != nil {
+			e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: p.StrategyType, Side: "buy",
+				Kind: "手动加仓", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
+			return err
+		}
+		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: p.StrategyType, Side: "buy",
+			Kind: "手动加仓", SignalPrice: signalPrice, Price: price, Qty: q, Status: "filled", Reason: "动态仓位加仓"})
+		e.mirrorOpenLocked(p)
+		e.persist()
+		return nil
 	}
 	if _, ok := e.pools[poolKey]; !ok {
 		// §健壮性：未知池 key 不再静默回退「其他池」——静默回退会让资金被悄悄计入错误池，
@@ -1595,7 +1775,7 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	if p, held := e.positions[code]; held {
 		return e.addToPositionLocked(p, code, name, strategy, signalPrice, price, qty, "手动模拟加仓")
 	}
-	if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
+	if !e.dynamicBudgetOn() && e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 		return errMaxPos
 	}
 	if qty <= 0 {
@@ -2663,7 +2843,7 @@ var (
 	errNoQuote     = errMsg("无实时行情，无法成交")
 	errHeld        = errMsg("已持有该股票")
 	errMaxPos      = errMsg("已达持仓数量上限")
-	errLotTooSmall = errMsg("资金不足以买入一手")
+	errLotTooSmall = errMsg("预算不足以买入一手（整手/额度不足）")
 	errCash        = errMsg("可用资金不足")
 	errTPlusOne    = errMsg("T+1限制：当日买入次日方可卖出")
 )
@@ -2736,7 +2916,8 @@ func (e *Engine) checkPoolDisciplinePre(poolKey string, confidence float64, manu
 		return ""
 	}
 
-	if rule.MaxDailyBuys > 0 && d.buysToday >= rule.MaxDailyBuys {
+	// §DYN-SIZE-v3：dynamic 模式下每日买入次数退场；冷却/最低评分仍保留。
+	if !e.dynamicBudgetOn() && rule.MaxDailyBuys > 0 && d.buysToday >= rule.MaxDailyBuys {
 		return fmt.Sprintf("日买次数达上限(%d/%d)", d.buysToday, rule.MaxDailyBuys)
 	}
 	if rule.CooldownMinutes > 0 && !d.lastBuyAt.IsZero() {
@@ -2759,6 +2940,9 @@ func (e *Engine) checkPoolDisciplinePre(poolKey string, confidence float64, manu
 
 // checkPoolBudget 预算占比检查（需要 cost）。
 func (e *Engine) checkPoolBudget(poolKey string, cost float64) string {
+	if e.dynamicBudgetOn() {
+		return ""
+	}
 	rule := e.poolBuyRules[poolKey]
 	if rule == nil || rule.BudgetPctPerDay <= 0 || rule.BudgetPctPerDay >= 100 {
 		return ""

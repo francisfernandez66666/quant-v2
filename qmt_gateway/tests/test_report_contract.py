@@ -142,9 +142,10 @@ class TestGatewayEmitsMatchGolden(unittest.TestCase):
     def tearDownClass(cls):
         handler_mod.is_active_trading_session = cls._real_session
 
-    def _emit_and_capture(self, h, pushed, fn, *args):
+    def _emit_and_capture(self, h, pushed, fn, *args, **kwargs):
+        """调用上报回调并取最后一条载荷；kwargs 透传（§DYN-SIZE-v3 起 synced/data_ts 走关键字）。"""
         del pushed[:]
-        fn(*args)
+        fn(*args, **kwargs)
         self.assertTrue(pushed, "未捕获到任何上报载荷：%s" % fn)
         return pushed[-1]
 
@@ -170,19 +171,40 @@ class TestGatewayEmitsMatchGolden(unittest.TestCase):
         self.assertIn("created_at", payload)  # §M4：Go 旧信封缺这条，委托创建时间被记成回报时刻
 
     def test_positions_account_disconnect_heartbeat_broker(self):
+        """§DYN-SIZE-v3：positions/account 的 synced/data_ts 两条新腿进 golden 并真被发出。
+
+        改前形态：这两个事件只按"最小载荷"调用（不带 synced/data_ts），于是网关
+        gateway.py 周期推送实际带上的两条腿从未进入断言——桥加了腿而契约两侧全绿。
+        改后按 gateway.py 真实周期路径传参（synced=True + data_ts），并逐条断言腿在位。
+        English: the positions/account legs are now exercised the way gateway.py really pushes
+        them (synced + data_ts), so dropping either leg fails here.
+        """
         h, pushed = _capturing_handler()
+        data_ts = "2026-10-23T09:30:00+08:00"
         cases = [
             ("positions", h.on_positions, ([{"ts_code": "600519.SH", "name": "贵州茅台", "qty": 100,
                                              "cost_price": 10.0, "amount": 1000.0,
-                                             "highest_price": 10.0, "updated_at": "2026-09-22T09:30:00+08:00"}],)),
+                                             "highest_price": 10.0, "updated_at": "2026-09-22T09:30:00+08:00"}],),
+             {"synced": True, "data_ts": data_ts}),
             ("account", h.on_account, ({"cash": 1000.0, "frozen_cash": 0.0,
-                                        "total_asset": 2000.0, "market_value": 1000.0},)),
-            ("disconnect", h.on_disconnected, ()),
+                                        "total_asset": 2000.0, "market_value": 1000.0},),
+             {"synced": True, "data_ts": data_ts}),
+            ("disconnect", h.on_disconnected, (), {}),
         ]
-        for name, fn, args in cases:
-            payload = self._emit_and_capture(h, pushed, fn, *args)
+        for name, fn, args, kwargs in cases:
+            payload = self._emit_and_capture(h, pushed, fn, *args, **kwargs)
             self.assertEqual(sorted(payload.keys()), sorted(self.golden["gateway_emitted_fields"][name]),
                              "事件 %s 发出键集与 golden 不一致" % name)
+        # 新腿在位断言（防"golden 登记了但代码没发"的假腿）。
+        pos = self._emit_and_capture(h, pushed, h.on_positions,
+                                     [{"ts_code": "600519.SH", "name": "贵州茅台", "qty": 100}],
+                                     synced=True, data_ts=data_ts)
+        self.assertIs(pos["synced"], True, "§DYN-SIZE-v3 positions 必须带 synced")
+        self.assertEqual(pos["data_ts"], data_ts, "§DYN-SIZE-v3 positions 必须带 data_ts")
+        acc = self._emit_and_capture(h, pushed, h.on_account, {"cash": 1.0},
+                                     synced=False, data_ts=data_ts)
+        self.assertIs(acc["synced"], False, "§DYN-SIZE-v3 未同步会话必须上报 synced=false")
+        self.assertEqual(acc["data_ts"], data_ts, "§DYN-SIZE-v3 account 必须带 data_ts")
         hb = {"type": "heartbeat", "user_id": h.user_id}
         self.assertEqual(sorted(hb.keys()), sorted(self.golden["gateway_emitted_fields"]["heartbeat"]))
         br = {"type": "broker", "broker": "queued", "from": "xt", "at": "2026-09-22T09:30:00+08:00",

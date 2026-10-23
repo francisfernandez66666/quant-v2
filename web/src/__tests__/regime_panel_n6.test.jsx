@@ -166,14 +166,19 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     // §SIZING-FINE（2026-10-22）：面板现在负责 sizing 的**全量**键（精细参数折叠区也在内），
     // 逐键等值锁住键集——多一个未定义键会被后端稀疏 merge 写进配置，少一个键等于某组精细参数失踪。
     expect(Object.keys(body.sizing).sort()).toEqual([
-      'bear_sl_tighten_pt', 'breadth_missing_scale', 'cap', 'emotion_scales', 'enabled', 'floor',
-      'holiday_block_new', 'holiday_scales', 'index_scale_thresholds', 'kelly_lambda', 'kelly_min_prob',
+      'bear_sl_tighten_pt', 'breadth_missing_scale', 'budget_mode', 'cap', 'emotion_scales', 'enabled', 'floor',
+      'group_floors', 'holiday_block_new', 'holiday_scales', 'index_scale_thresholds', 'kelly_lambda', 'kelly_min_prob',
       'llm_bearish_scale', 'macro_event_day_scale', 'macro_lead_curve', 'macro_lead_days',
-      'macro_window_scales', 'max_drawdown_pct', 'max_total_position_pct', 'sell_boost_level', 'shadow',
+      'macro_window_scales', 'max_drawdown_pct', 'max_total_position_pct', 'mode', 'power_p', 'sell_boost_level', 'shadow',
       'sl_offset_cap', 'sl_offset_min_index_drop', 'sl_offset_per_pct', 'sl_offset_risk_budget_keep',
       'state_scales', 'stoploss_guard_count', 'stoploss_guard_window_days', 'tier_scales', 'tp_offset_cap',
       'tp_offset_per_pct', 'vol_clamp_hi', 'vol_clamp_lo', 'vol_target_pct',
     ].sort())
+    // §DYN-SIZE-v3 §7：缺键时新口径必须落在安全默认（legacy/product/0.5/0.45/0.35）。
+    expect(body.sizing.budget_mode).toBe('legacy')
+    expect(body.sizing.mode).toBe('product')
+    expect(body.sizing.power_p).toBe(0.5)
+    expect(body.sizing.group_floors).toEqual({ market: 0.45, stock: 0.35 })
     expect(Object.keys(body.sizing.tier_scales).sort()).toEqual(['Red', 'Yellow'])
     expect(Object.keys(body.macro_gate).sort()).toEqual(
       ['block_momentum', 'block_n_shape', 'emotion_enabled', 'red_block_new_buy', 'red_confidence', 'yellow_confidence'].sort(),
@@ -193,6 +198,28 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     expect(body.sizing.macro_lead_curve).toEqual([0.9, 0.85, 0.8, 0.7, 0.5])
     expect(body.sizing.sl_offset_risk_budget_keep).toBe(true)
     expect(body.sizing.holiday_block_new).toBe(false)
+  })
+
+  // R2b §DYN-SIZE-v3：预算/合成口径与 p=0/分组 floor 必须原样写出（p=0=几何平均，不能被折叠成 0.5）。
+  it('R2b 写侧：dynamic/power_mean/p=0/分组 floor 逐键回传', async () => {
+    render(<RegimeConfigPanel />)
+    await settle()
+    fireEvent.change(document.querySelector('[data-testid="budget-mode"]'), { target: { value: 'dynamic' } })
+    fireEvent.change(document.querySelector('[data-testid="sizing-mode"]'), { target: { value: 'power_mean' } })
+    fireEvent.change(numberByLabel('幂平均指数 p'), { target: { value: '0' } })
+    const floorInputs = labelRow('分组 floor').querySelectorAll('input')
+    fireEvent.change(floorInputs[0], { target: { value: '0.5' } })
+    fireEvent.change(floorInputs[1], { target: { value: '0.4' } })
+    await settle()
+    fireEvent.click(btn('保存风控配置'))
+    await settle()
+    const api = await import('../api/index.js')
+    expect(api.setRegimeConfig.mock.calls.length).toBe(1)
+    const sz = api.setRegimeConfig.mock.calls[0][0].sizing
+    expect(sz.budget_mode).toBe('dynamic')
+    expect(sz.mode).toBe('power_mean')
+    expect(sz.power_p).toBe(0)
+    expect(sz.group_floors).toEqual({ market: 0.5, stock: 0.4 })
   })
 
   // R3 读取失败 → 红条 + 零 POST。形态如实钉成「整表单不渲染、连保存按钮都不存在」而不是

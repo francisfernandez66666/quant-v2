@@ -544,19 +544,20 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// entry (adding a gate means editing only the gate, it can't be forgotten); hits are recorded in
 	// risk_gates; new gates also alert; missing quote fields fail their gates open.
 	lo := risk.LiveOrder{
-		SignalID:     req.SignalID,
-		Code:         req.Code,
-		Name:         req.Name,
-		Strategy:     req.Strategy,
-		StrategyID:   req.StrategyID,
-		StrategyType: req.StrategyType,
-		Side:         req.Side,
-		Price:        req.Price,
-		Qty:          req.Qty,
-		Amount:       req.Amount,
-		StalenessMs:  req.StalenessMs,
-		CurrentPrice: req.CurrentPrice,
-		PrevClose:    req.PrevClose,
+		SignalID:      req.SignalID,
+		Code:          req.Code,
+		Name:          req.Name,
+		Strategy:      req.Strategy,
+		StrategyID:    req.StrategyID,
+		StrategyType:  req.StrategyType,
+		Side:          req.Side,
+		Price:         req.Price,
+		Qty:           req.Qty,
+		Amount:        req.Amount,
+		StalenessMs:   req.StalenessMs,
+		CurrentPrice:  req.CurrentPrice,
+		PrevClose:     req.PrevClose,
+		DynamicBudget: req.DynamicBudget,
 	}
 	if v := c.gate.CheckLiveOrder(cfg, lo); !v.Pass {
 		return nil, fmt.Errorf("%s", v.Reason)
@@ -682,14 +683,52 @@ func (c *Controller) Reconcile() error {
 		return err
 	}
 	// 委托流水对账（此前 State 拉回即丢）：仅记日志差异告警，自动纠偏仍留给回报线程。
-	if len(st.Orders) > 0 {
-		local, _ := c.store.RealOrdersForUser(c.userID)
-		if len(local) != len(st.Orders) {
-			log.Printf("[trading] 对账差异: 网关委托 %d 笔 vs 本地 %d 笔（以回报线程为准，仅告警）",
-				len(st.Orders), len(local))
+	// §DYN-SIZE-v3：改为按 order_id 集合比较——网关 State 只带回窗口内委托，本地是全量，
+	// 用 len() 比必然“恒不等”，47 次/日假告警掩盖真实缺失。集合比只报真正缺失的 id。
+	// English: compare order_id sets, not lengths — the gateway returns a window while the local
+	// book is full-history, so len() always differs and drowns out real missing orders.
+	local, lerr := c.store.RealOrdersForUser(c.userID)
+	if lerr != nil {
+		log.Printf("[trading] 委托对账读取本地失败: %v", lerr)
+		return nil
+	}
+	localSet := make(map[string]bool, len(local))
+	for _, o := range local {
+		if o.OrderID != "" {
+			localSet[o.OrderID] = true
 		}
 	}
+	remoteSet := make(map[string]bool, len(st.Orders))
+	for _, o := range st.Orders {
+		if o.OrderID != "" {
+			remoteSet[o.OrderID] = true
+		}
+	}
+	var missingLocal, missingRemote []string
+	for id := range remoteSet {
+		if !localSet[id] {
+			missingLocal = append(missingLocal, id)
+		}
+	}
+	for id := range localSet {
+		if !remoteSet[id] {
+			missingRemote = append(missingRemote, id)
+		}
+	}
+	if len(missingLocal) > 0 || len(missingRemote) > 0 {
+		log.Printf("[trading] 对账差异: 网关有本地无 %d 笔%v / 本地有网关无 %d 笔%v（以回报线程为准，仅告警）",
+			len(missingLocal), sampleIDs(missingLocal, 5), len(missingRemote), sampleIDs(missingRemote, 5))
+	}
 	return nil
+}
+
+// sampleIDs 截断 id 列表用于日志（避免大单量时刷屏）。
+// English: truncates an id list for logging so large books cannot flood the log.
+func sampleIDs(ids []string, n int) []string {
+	if len(ids) <= n {
+		return ids
+	}
+	return append(append([]string(nil), ids[:n]...), fmt.Sprintf("...(+%d)", len(ids)-n))
 }
 
 // MaybeReconcile §W6-a 周期对账接线（此前 Controller.Reconcile 是零调用死代码，

@@ -249,7 +249,7 @@ export default function Signals() {
   // the same defaults; submission logic lives in submitPaperBuy. WebView shells ignore native prompts.
   function paperBuy(s) {
     setPaperTarget(s)
-    setPaperForm({ price: String(s.price || s.close || ''), qty: '1' })
+    setPaperForm({ price: String(s.price || s.close || '') })
   }
 
   // §0925EVE-W3-I（E2）模拟买入弹窗「确认」：校验手数 → confirmDialog 二次确认（沿用原确认
@@ -257,29 +257,22 @@ export default function Signals() {
   async function submitPaperBuy() {
     if (!paperTarget) return
 
-    // 校验手数与价格合法性（口径与旧 prompt 版一致：手数必须正整数，价格留空/非法按实时价）
-    const qty = parseInt(paperForm.qty, 10)
+    // §DYN-SIZE-v3：手动买入不再手填股数，数量由动态仓位（池权益×缩放+35%额度+现金）决定。
     const price = parseFloat(paperForm.price)
-    if (isNaN(qty) || qty <= 0) {
-      MessagePlugin.error('买入手数无效，请填写正整数')
-      return
-    }
 
-    // 价格为空按实时价成交，有价格则用指定价格；二次确认后才提交（与旧 window.confirm 文案一致）
+    // 价格为空按实时价成交，有价格则用指定价格；二次确认后才提交。
     const confirmMsg = (!isNaN(price) && price > 0)
-      ? `确认模拟买入 ${paperTarget.code} ${paperTarget.name || ''} ${qty} 手 @${price.toFixed(2)}？`
-      : `确认模拟买入 ${paperTarget.code} ${paperTarget.name || ''} ${qty} 手？将按实时价成交。`
+      ? `确认模拟买入 ${paperTarget.code} ${paperTarget.name || ''} @${price.toFixed(2)}？数量按动态仓位计算。`
+      : `确认模拟买入 ${paperTarget.code} ${paperTarget.name || ''}？将按实时价成交，数量按动态仓位计算。`
     if (!(await confirmDialog(confirmMsg, '模拟买入确认'))) return
 
     // 关闭输入弹窗（取消/关闭可留弹窗改数值，仅真正提交后收起）
     setPaperTarget(null)
 
-    // 调用后端模拟买入接口：code/name/strategy/price/qty/type/id
-    // §FIX-1(20260919) 手/股单位收敛：表单输入的是手数，API qty 契约为股数（引擎按股记账），
-    // 提交前在此唯一换算点 ×100。
+    // qty 传 0：后端 dynamic 模式走动态预算（legacy 模式回退固定金额）。
     try {
-      await api.buyPaperPosition(paperTarget.code, paperTarget.name || '', paperTarget.strategy || '', paperTarget.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty * 100, paperTarget.strategy_type || '', paperTarget.strategy_id || '')
-      MessagePlugin.success(`已模拟买入 ${paperTarget.code} ${qty} 手`)
+      await api.buyPaperPosition(paperTarget.code, paperTarget.name || '', paperTarget.strategy || '', paperTarget.price || 0, isNaN(price) || price <= 0 ? 0 : price, 0, paperTarget.strategy_type || '', paperTarget.strategy_id || '')
+      MessagePlugin.success(`已模拟买入 ${paperTarget.code}`)
     } catch (e) {
       MessagePlugin.error(e.message || '模拟买入失败')
     }
@@ -649,9 +642,8 @@ export default function Signals() {
             <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 4 }}>买入价（元，留空用实时价）</div>
             <Input value={paperForm.price} onChange={(v) => setPaperForm((f) => ({ ...f, price: v }))} placeholder="留空按实时价成交" />
           </div>
-          <div>
-            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 4 }}>买入手数（1 手 = 100 股）</div>
-            <Input value={paperForm.qty} onChange={(v) => setPaperForm((f) => ({ ...f, qty: v }))} placeholder="正整数手数" />
+          <div style={{ fontSize: 12, color: 'var(--app-muted)' }}>
+            数量：按动态仓位自动计算（总资产/池权益 × 缩放，再受行业/单票 35% 额度与现金约束）
           </div>
         </div>
       </Dialog>

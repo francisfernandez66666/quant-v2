@@ -591,7 +591,7 @@ class ReportHandler:
             log.exception("[handler] on_trade failed, event skipped: %s", ev)
             return False
 
-    def on_positions(self, positions):
+    def on_positions(self, positions, synced=None, data_ts=None):
         """全量对账 + 推送。§G5：空快照守卫——只有连续两次空快照且本地有持仓才接受清空。
 
         §清算 Guard（2026-09-11）：接受清空前再校验最近账户资产回报——
@@ -609,6 +609,12 @@ class ReportHandler:
         # §修复 G3（2026-08-29）：回调异常保护（见 on_order 说明）。
         try:
             if not positions:
+                # v3: forward an explicit unsynced marker so the engine can distinguish
+                # "flat book" from "session not synced" without clearing anything.
+                if synced is False:
+                    self._push({"type": "positions", "positions": [], "synced": False,
+                                "data_ts": data_ts or _now_cn()})
+                    return
                 held = len(self.store.list_positions())
                 self._empty_snaps += 1
                 if held == 0:
@@ -636,11 +642,16 @@ class ReportHandler:
                 p["user_id"] = self.user_id
             n = self.store.reconcile_positions(positions)
             log.info("[handler] reconciled %d positions", n)
-            self._push({"type": "positions", "positions": list(positions)})
+            payload = {"type": "positions", "positions": list(positions)}
+            if synced is not None:
+                payload["synced"] = bool(synced)
+            if data_ts:
+                payload["data_ts"] = data_ts
+            self._push(payload)
         except Exception:  # noqa: BLE001
             log.exception("[handler] on_positions failed, reconcile skipped")
 
-    def on_account(self, asset):
+    def on_account(self, asset, synced=None, data_ts=None):
         """账户资产回报（可用资金/冻结/总值/市值）。asset 为 None 时跳过（查询失败）。
 
         §清算 Guard：回报里的 market_value 是空持仓快照是否可信的最后仲裁依据，
@@ -650,7 +661,12 @@ class ReportHandler:
         if not asset:
             return
         self._last_asset = dict(asset)
-        self._push({"type": "account", "asset": dict(asset)})
+        payload = {"type": "account", "asset": dict(asset)}
+        if synced is not None:
+            payload["synced"] = bool(synced)
+        if data_ts:
+            payload["data_ts"] = data_ts
+        self._push(payload)
 
     def push_disconnect(self):
         """对外封装断线回调（供外部调用方触发），等价于 on_disconnected。"""
@@ -706,7 +722,8 @@ def periodic_reconcile(handler, broker, interval_sec=60, stop=None):
         try:
             b = broker() if callable(broker) else broker
             if b.is_connected():
-                handler.on_positions(b.query_positions())
-                handler.on_account(b.query_asset())
+                poss = b.query_positions()
+                handler.on_positions(poss, synced=bool(poss), data_ts=_now_cn())
+                handler.on_account(b.query_asset(), synced=True, data_ts=_now_cn())
         except Exception as e:  # noqa: BLE001
             log.warning("[handler] periodic reconcile failed: %s", e)

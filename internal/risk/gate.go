@@ -65,6 +65,13 @@ type LiveOrder struct {
 	StalenessMs  int64
 	CurrentPrice float64
 	PrevClose    float64
+
+	// DynamicBudget §DYN-SIZE-v3：本单由动态预算生成，旧的持仓数/每日次数/每日预算/战法分配让位
+	// （预算已在执行层按 35% 额度减额）；行业/单票检查仍保留为第二道保险，不因本标记放行。
+	// English: v3 dynamic-budget marker — legacy count/budget/strategy-alloc gates yield because the
+	// executor already shrank the order to the 35% rooms; sector/single-stock checks still apply as a
+	// second safety net and are NOT bypassed by this flag.
+	DynamicBudget bool
 }
 
 // Verdict 单笔下单的风控裁定。
@@ -527,6 +534,10 @@ func (g *Gate) checkDayLoss(cfg config.QMTConfig, o LiveOrder) string {
 // fails open.
 func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 	// 未启用/无账本/非买方向（卖出减少集中度，无需检查）→ 不检查。
+	// §DYN-SIZE-v3：dynamic 模式已在执行层把预算减到单票 35% 额度内；本检查仍保留为第二道保险——
+	// 正常路径不应命中，命中说明预算读数（总资产/持仓/在途）与风控读数漂移，宁可拒买。
+	// English: dynamic mode already shrank the budget to the single-stock room; this check stays as a
+	// second safety net so any drift between budget inputs and gate inputs fails closed.
 	if cfg.RiskGate.SingleStockValuePct <= 0 || g.st == nil || o.Side != SideBuy {
 		return ""
 	}
@@ -560,6 +571,10 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 // English: §C1 sector exposure — projected sector value / total assets above the cap rejects the
 // buy; unknown inputs abstain; shadow mode records a hit but passes.
 func (g *Gate) checkSectorExposure(cfg config.QMTConfig, o LiveOrder) string {
+	// §DYN-SIZE-v3：dynamic 模式已在执行层把预算减到行业 35% 剩余额度内（含在途）；本检查同样
+	// 保留为第二道保险，读数漂移时 fail-closed。
+	// English: dynamic mode already shrank to the sector room (in-flight included); keep this check
+	// as a second safety net that fails closed on input drift.
 	if o.Side != SideBuy || cfg.RiskGate.SectorValuePct <= 0 || g.st == nil || g.industryOf == nil {
 		return ""
 	}
@@ -736,7 +751,8 @@ func (g *Gate) checkWhitelist(cfg config.QMTConfig, o LiveOrder) string {
 // English: position-count cap (buy-only, per-account) — reject new buys when max_positions is reached.
 func (g *Gate) checkMaxPositions(cfg config.QMTConfig, o LiveOrder) string {
 	// 未启用（≤0）/非买方向（卖出减仓不受持仓数限制）/无账本 → 不检查。
-	if cfg.MaxPositions <= 0 || o.Side != SideBuy || g.st == nil {
+	// §DYN-SIZE-v3：dynamic 模式下持仓数量上限退场（仓位由 35% 额度/现金决定）。
+	if o.DynamicBudget || cfg.MaxPositions <= 0 || o.Side != SideBuy || g.st == nil {
 		return ""
 	}
 	// 按账号读取本地持仓行；读取失败视为命中（错误原因即进入判定留痕）。
@@ -812,68 +828,73 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	// 附带收益：交割单 sync_fills 补记的手工成交（没有本地 orders 行）也能正确计入。
 	// 防信号风暴的能力不因此丢失：闸2 预算按「已成交 + 在途冻结」计——无节制报单会先在金额闸上
 	// 撞墙（见 checkBuyDiscipline 头注的闸口分工）。
-	if cfg.DailyMaxBuys > 0 {
-		filled, ferr := g.st.CountBuyFilledOrdersByDay(g.userID, today)
-		if ferr != nil {
-			return fmt.Sprintf("read buy fills: %v", ferr)
-		}
-		if filled >= cfg.DailyMaxBuys {
-			return fmt.Sprintf("单日买入笔数达上限 %d（今日已成交 %d 笔）", cfg.DailyMaxBuys, filled)
-		}
-	}
-	// 闸2：单日买入预算（0=不限）——**动态冻结账口径（2026-09-18，原为已报口径再改静态冻结账）**。
-	//
-	// 占用 = 已成交金额（fills，真花掉的钱）+ 在途冻结（LocalBuyFrozen：已报=全额、
-	// 部成=未成交余量、已撤/部撤/废单/已成=自动解冻）− 卖出回款（fills 卖出金额）。
-	// 卖出即回血：回款实时对冲当日占用，预算闸是活的——预算不够时卖一笔，额度立刻回来。
-	// 占用钳到 0：清旧仓的回款可以吃满当日预算，但不会把预算放大到超出配置值
-	// （预算语义仍是「单日净投入上限」，不是「可无限循环放大」）。
-	// 买入的终点只有一个：闸1 今日已成交笔数达上限。预算/资金闸都随成交与回款动态伸缩。
-	if cfg.DailyBudgetAmount > 0 {
-		occupied := filledAmt + frozen - sellProceeds
-		if occupied < 0 {
-			occupied = 0
-		}
-		if occupied+amount > cfg.DailyBudgetAmount {
-			return fmt.Sprintf("单日买入预算不足: 已成交 %.0f + 在途冻结 %.0f − 卖出回款 %.0f = 占用 %.0f，+ 本次 %.0f > 预算 %.0f（卖出回款可实时释放额度）",
-				filledAmt, frozen, sellProceeds, occupied, amount, cfg.DailyBudgetAmount)
-		}
-	}
-	// §STRATEGY_ALLOC 子闸 2b：每战法单日预算（可选）。
-	// 与全局闸2 正交——后者控"今天总共能花多少"，本闸控"每个战法今天最多能花多少"。
-	//
-	// §STRATEGY-FIX（2026-10-06 波 1）两处修正：
-	//   ① 取键改由 resolveStratKeyForGate 委托 signalctl.StrategyKeyOf。旧实现在此注释里写
-	//      「按 LiveOrder.StrategyID 精确匹配」，而内置战法的 StrategyID 恒为空串、回退成显示名，
-	//      对五个内置战法**恒不命中**＝本闸形同虚设（详见该函数注释里的完整取值链）。
-	//   ② 判定口径从「只比已成交」改成「已成交 + 本战法在途冻结」。旧注释写着
-	//      「LocalBuyFrozen 无 strategy 维度……此处作为叠加守卫足够保守」——那是幻觉注释：
-	//      全局闸 2 只保总量，同一战法连发时本闸对本战法的在途一分钱都不感知，
-	//      可以一路穿透到全局闸才停（"足够保守"的前提并不存在）。战法维度的在途账
-	//      已由 store.LocalBuyFrozenByStrategy 补上，本处经 g.stratFrozenAmount 消费它
-	//      （测试缝优先，见结构体字段注释）。
-	//      与全局闸 2 的有意差异：本子闸**不做卖出回款对冲**——实盘卖出的幂等键带的是
-	//      类别（止损/止盈/减仓）而不是战法键，「这个战法今天回血多少」在账本上问不出来，
-	//      硬凑近似只会把保守换成假精确。方向上本子闸因此比全局闸更紧（毛花口径）。
-	// 查询错误一律按拒绝放行处理（fail-closed），与相邻三本账（filled/frozen/proceeds）同姿势。
-	if cfg.StrategyAllocs != nil {
-		stratKey := resolveStratKeyForGate(o)
-		alloc, hasAlloc := strategyAllocFor(cfg, stratKey)
-		if hasAlloc && alloc > 0 {
-			filledByStrat, sErr := g.stratFilledAmount(today, stratKey)
-			if sErr != nil {
-				return fmt.Sprintf("查询战法资金分配: %v", sErr)
+	// §DYN-SIZE-v3：dynamic 模式下每日次数/每日预算/战法分配退场，仅保留下方现金类守卫。
+	// English: v3 dynamic mode retires the daily count/budget and strategy allocation; the cash
+	// guards below remain active.
+	if !o.DynamicBudget {
+		if cfg.DailyMaxBuys > 0 {
+			filled, ferr := g.st.CountBuyFilledOrdersByDay(g.userID, today)
+			if ferr != nil {
+				return fmt.Sprintf("read buy fills: %v", ferr)
 			}
-			frozenByStrat, fErr := g.stratFrozenAmount(today, stratKey)
-			if fErr != nil {
-				return fmt.Sprintf("查询战法在途冻结: %v", fErr)
-			}
-			if filledByStrat+frozenByStrat+amount > alloc {
-				return fmt.Sprintf("战法[%s] 日预算不足: 今日已成交 %.0f + 在途冻结 %.0f + 本次 %.0f > 分配预算 %.0f（本子闸不做卖出回款对冲，口径较全局预算闸偏紧）",
-					stratKey, filledByStrat, frozenByStrat, amount, alloc)
+			if filled >= cfg.DailyMaxBuys {
+				return fmt.Sprintf("单日买入笔数达上限 %d（今日已成交 %d 笔）", cfg.DailyMaxBuys, filled)
 			}
 		}
-	}
+		// 闸2：单日买入预算（0=不限）——**动态冻结账口径（2026-09-18，原为已报口径再改静态冻结账）**。
+		//
+		// 占用 = 已成交金额（fills，真花掉的钱）+ 在途冻结（LocalBuyFrozen：已报=全额、
+		// 部成=未成交余量、已撤/部撤/废单/已成=自动解冻）− 卖出回款（fills 卖出金额）。
+		// 卖出即回血：回款实时对冲当日占用，预算闸是活的——预算不够时卖一笔，额度立刻回来。
+		// 占用钳到 0：清旧仓的回款可以吃满当日预算，但不会把预算放大到超出配置值
+		// （预算语义仍是「单日净投入上限」，不是「可无限循环放大」）。
+		// 买入的终点只有一个：闸1 今日已成交笔数达上限。预算/资金闸都随成交与回款动态伸缩。
+		if cfg.DailyBudgetAmount > 0 {
+			occupied := filledAmt + frozen - sellProceeds
+			if occupied < 0 {
+				occupied = 0
+			}
+			if occupied+amount > cfg.DailyBudgetAmount {
+				return fmt.Sprintf("单日买入预算不足: 已成交 %.0f + 在途冻结 %.0f − 卖出回款 %.0f = 占用 %.0f，+ 本次 %.0f > 预算 %.0f（卖出回款可实时释放额度）",
+					filledAmt, frozen, sellProceeds, occupied, amount, cfg.DailyBudgetAmount)
+			}
+		}
+		// §STRATEGY_ALLOC 子闸 2b：每战法单日预算（可选）。
+		// 与全局闸2 正交——后者控"今天总共能花多少"，本闸控"每个战法今天最多能花多少"。
+		//
+		// §STRATEGY-FIX（2026-10-06 波 1）两处修正：
+		//   ① 取键改由 resolveStratKeyForGate 委托 signalctl.StrategyKeyOf。旧实现在此注释里写
+		//      「按 LiveOrder.StrategyID 精确匹配」，而内置战法的 StrategyID 恒为空串、回退成显示名，
+		//      对五个内置战法**恒不命中**＝本闸形同虚设（详见该函数注释里的完整取值链）。
+		//   ② 判定口径从「只比已成交」改成「已成交 + 本战法在途冻结」。旧注释写着
+		//      「LocalBuyFrozen 无 strategy 维度……此处作为叠加守卫足够保守」——那是幻觉注释：
+		//      全局闸 2 只保总量，同一战法连发时本闸对本战法的在途一分钱都不感知，
+		//      可以一路穿透到全局闸才停（"足够保守"的前提并不存在）。战法维度的在途账
+		//      已由 store.LocalBuyFrozenByStrategy 补上，本处经 g.stratFrozenAmount 消费它
+		//      （测试缝优先，见结构体字段注释）。
+		//      与全局闸 2 的有意差异：本子闸**不做卖出回款对冲**——实盘卖出的幂等键带的是
+		//      类别（止损/止盈/减仓）而不是战法键，「这个战法今天回血多少」在账本上问不出来，
+		//      硬凑近似只会把保守换成假精确。方向上本子闸因此比全局闸更紧（毛花口径）。
+		// 查询错误一律按拒绝放行处理（fail-closed），与相邻三本账（filled/frozen/proceeds）同姿势。
+		if cfg.StrategyAllocs != nil {
+			stratKey := resolveStratKeyForGate(o)
+			alloc, hasAlloc := strategyAllocFor(cfg, stratKey)
+			if hasAlloc && alloc > 0 {
+				filledByStrat, sErr := g.stratFilledAmount(today, stratKey)
+				if sErr != nil {
+					return fmt.Sprintf("查询战法资金分配: %v", sErr)
+				}
+				frozenByStrat, fErr := g.stratFrozenAmount(today, stratKey)
+				if fErr != nil {
+					return fmt.Sprintf("查询战法在途冻结: %v", fErr)
+				}
+				if filledByStrat+frozenByStrat+amount > alloc {
+					return fmt.Sprintf("战法[%s] 日预算不足: 今日已成交 %.0f + 在途冻结 %.0f + 本次 %.0f > 分配预算 %.0f（本子闸不做卖出回款对冲，口径较全局预算闸偏紧）",
+						stratKey, filledByStrat, frozenByStrat, amount, alloc)
+				}
+			}
+		}
+	} // §DYN-SIZE-v3: end of legacy daily/strategy-allocation gates
 	// 闸3：近似可用资金闸（依赖 InitialCapital 配置；无本金口径时跳过）。
 	if cfg.InitialCapital > 0 {
 		// 券商账户快照 10 分钟内视为新鲜；新鲜时直接用券商口径，跳过本地近似估算。

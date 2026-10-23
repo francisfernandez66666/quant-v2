@@ -839,6 +839,52 @@ func (d *DB) LocalBuyFrozenByStrategy(userID, day, strategyKey string) (float64,
 	return d.localBuyFrozen(userID, day, strategyKey)
 }
 
+// PendingBuy 在途买单的剩余未成交量（用于集中度额度计算）。
+// English: a pending buy's remaining unfilled quantity (for concentration headroom).
+type PendingBuy struct {
+	Code   string  `json:"code"`
+	Price  float64 `json:"price"`
+	Remain int     `json:"remain"`
+}
+
+// PendingBuys 返回某账号当日在途买单（已报/部成）的剩余量：已报按全额、部成按未成交余量。
+// 集中度额度必须把这些在途单计入当前市值，否则连续信号会穿透 35% 上限。
+// English: returns today's pending buy orders with remaining qty (已报 full, 部成 unfilled
+// remainder) so consecutive signals cannot pierce the concentration cap.
+func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
+	// 调用方通常传 data.TradingDayDate（YYYYMMDD），而 orders.created_at 是 YYYY-MM-DD HH:MM:SS；
+	// 不归一化会让 substr(created_at,1,10)=? 永远不命中（在途委托等于从未计入）。
+	// English: normalize YYYYMMDD to the dashed form used by orders.created_at, otherwise the
+	// substring predicate never matches and pending buys are silently ignored.
+	day = strings.TrimSpace(day)
+	if len(day) == 8 {
+		day = day[:4] + "-" + day[4:6] + "-" + day[6:]
+	}
+	rows, err := d.db.Query(`SELECT code, signal_id, price, qty FROM orders
+		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')
+		AND substr(created_at,1,10)=?`, userID, day)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingBuy
+	for rows.Next() {
+		var code, sid string
+		var price float64
+		var qty int
+		if err := rows.Scan(&code, &sid, &price, &qty); err != nil {
+			continue
+		}
+		filled := d.SumFilledQty(userID, sid)
+		remain := qty - filled
+		if remain <= 0 || price <= 0 {
+			continue
+		}
+		out = append(out, PendingBuy{Code: code, Price: price, Remain: remain})
+	}
+	return out, rows.Err()
+}
+
 // localBuyFrozen 冻结账的唯一实现（strategyKey 为空＝不限战法）。
 // 两把公开口径共用一份 SQL 与一段行处理，避免「改了全局那本账、战法那本账忘了改」。
 // English: the single implementation behind both public entry points; an empty strategy key means

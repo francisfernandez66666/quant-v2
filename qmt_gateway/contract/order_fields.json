@@ -5,11 +5,12 @@
     "signal_id", "code", "name", "strategy", "strategy_id", "strategy_type",
     "side", "price_type", "price", "qty", "amount", "created_at",
     "staleness_ms", "prev_close", "current_price",
-    "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec"
+    "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec",
+    "dynamic_budget"
   ],
   "consumed_by_gateway": [
     "signal_id", "code", "side", "price_type", "price", "qty",
     "amount", "created_at", "strategy_type", "strategy"
   ],
-  "ignored_by_gateway": ["name", "strategy_id", "staleness_ms", "prev_close", "current_price", "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec"]
+  "ignored_by_gateway": ["name", "strategy_id", "staleness_ms", "prev_close", "current_price", "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec", "dynamic_budget"]
 }

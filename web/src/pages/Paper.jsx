@@ -264,23 +264,8 @@ export default function Paper() {
   const [tradeTarget, setTradeTarget] = useState(null)
   // 交易表单委托价（0=留空，后端按实时价撮合）
   const [tradeFormPrice, setTradeFormPrice] = useState(0)
-  // 交易表单手数（1手=100股；清仓时不可编辑、固定全部持仓）
-  const [tradeFormQty, setTradeFormQty] = useState(1)
-
   const W = 900, H = 220 // 净值曲线 SVG 的逻辑尺寸（viewBox 坐标，非真实像素）
   const timer = useRef(null) // §F5 预留（轮询已由 SSE + useSseRefresh 兜底接管）
-
-
-  // 解析交易弹窗中输入的手数（无效或非正整数则归零，用于预览/校验）
-  const tradePreviewQty = useMemo(() => {
-    const q = parseInt(tradeFormQty, 10)
-    return isNaN(q) || q <= 0 ? 0 : q
-  }, [tradeFormQty])
-  // 减仓手数×100 是否超过当前持仓股数（超卖时禁用确认）
-  // §P2-15（2026-09-15）：原 `>=` 把"全部清仓"也当成超卖禁用——与 Positions.jsx:171 的
-  // `sell > cur` 口径不一致，用户在模拟盘无法一键清掉整只持仓。改为严格大于。
-  const tradeOverSell = useMemo(() =>
-    tradeDir === 'trim' && tradeTarget && tradePreviewQty * 100 > tradeTarget.qty, [tradeDir, tradePreviewQty, tradeTarget])
 
   // 判断指定资金池是否已配置买入纪律（日限/冷却/最低分/日预算任一非空即视为已配）
   const poolCurrentRule = (key) => {
@@ -383,8 +368,6 @@ export default function Paper() {
   function openTrade(p, dir) {
     setTradeTarget(p); setTradeDir(dir)
     setTradeFormPrice(p.mark || 0)
-    // close 时持仓 qty 为股数，表单口径是手——回填换算成整手展示（不足一手按 1 手）
-    setTradeFormQty(dir === 'close' ? Math.max(1, Math.round((p.qty || 0) / 100)) : 1)
     setTradeModal(true)
   }
 
@@ -401,16 +384,14 @@ export default function Paper() {
     const p = tradeTarget
     if (!p) return
     const price = parseFloat(tradeFormPrice)
-    const qty = parseInt(tradeFormQty, 10)
-    if (tradeDir !== 'close' && (isNaN(qty) || qty <= 0)) { showToast('请输入有效的数量','warning'); return }
-    const shares = qty * 100 // 手→股；close 不走此值（传 0=全平）
+    // §DYN-SIZE-v3：加仓数量按动态仓位计算（qty=0）；卖出按清仓处理（qty=0=全平）。
     try {
       if (tradeDir === 'add') {
-        await api.buyPaperPosition(p.code, p.name || '', p.strategy || '', 0, price > 0 ? price : 0, shares)
-        showToast(`已加仓 ${p.code} ${qty} 手`,'success')
+        await api.buyPaperPosition(p.code, p.name || '', p.strategy || '', 0, price > 0 ? price : 0, 0)
+        showToast(`已加仓 ${p.code}（数量按动态仓位）`,'success')
       } else {
-        await api.sellPaperPosition(p.code, price > 0 ? price : 0, tradeDir === 'close' ? 0 : shares)
-        showToast(`已${tradeDir === 'close' ? '清仓' : '减仓'} ${p.code}`,'success')
+        await api.sellPaperPosition(p.code, price > 0 ? price : 0, 0)
+        showToast(`已清仓 ${p.code}`,'success')
       }
       setTradeModal(false)
       await load()
@@ -967,7 +948,7 @@ export default function Paper() {
                   <Checkbox checked={!!engCfg.auto_sell} onChange={(v) => setEngCfg({ ...engCfg, auto_sell: !!v })}>{'止盈止损/清仓告警自动平仓'}</Checkbox>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
-                  <span>每票固定买入资金（元）</span>
+                  <span>每票固定买入资金（元）<span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 6 }}>已废弃：budget_mode=dynamic 时按池权益×动态缩放计算</span></span>
                   <InputNumber value={engCfg.fixed_amount} min={0} step={1000} onChange={(v) => setEngCfg({ ...engCfg, fixed_amount: v || 0 })} style={{ width: 240 }} />
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
@@ -1320,11 +1301,11 @@ export default function Paper() {
       {/* 交易弹窗：加仓 / 减仓 / 清仓 */}
       <Dialog
         visible={tradeModal}
-        header={(tradeDir === 'add' ? '加仓' : tradeDir === 'trim' ? '减仓' : '清仓') + (tradeTarget ? ' ' + tradeTarget.code + ' ' + tradeTarget.name : '')}
+        header={(tradeDir === 'add' ? '加仓' : '清仓') + (tradeTarget ? ' ' + tradeTarget.code + ' ' + tradeTarget.name : '')}
         onClose={() => setTradeModal(false)}
         onConfirm={confirmTrade}
-        // 确认按钮：减仓超卖(tradeOverSell)时禁用；清仓按钮用危险色
-        confirmBtn={{ content: '确定', disabled: tradeOverSell, theme: tradeDir === 'close' ? 'danger' : 'primary' }}
+        // 确认按钮：清仓用危险色；数量由后端动态仓位/清仓语义决定。
+        confirmBtn={{ content: '确定', theme: tradeDir === 'add' ? 'primary' : 'danger' }}
       >
         <Form layout="vertical">
           {/* 当前持仓回显：股数与成本价 */}
@@ -1335,16 +1316,12 @@ export default function Paper() {
           <Form.FormItem label="价格">
             <InputNumber value={tradeFormPrice} step={0.001} placeholder="成交价格（留空用实时价）" onChange={(v) => setTradeFormPrice(v || 0)} style={{ width: 240 }} />
           </Form.FormItem>
-          {/* 手数输入：加/减仓可编辑（1手=100股），清仓固定为全部持仓 */}
-          <Form.FormItem label={tradeDir === 'add' ? '加仓手数' : tradeDir === 'trim' ? '减仓手数' : '清仓'}>
-            {tradeDir !== 'close'
-              ? <InputNumber value={tradeFormQty} step={1} placeholder="手数（1手=100股）" onChange={(v) => setTradeFormQty(v || 1)} style={{ width: 240 }} />
-              : <span>{tradeTarget?.qty} 股（全部）</span>}
+          {/* §DYN-SIZE-v3：加仓不填股数，由动态仓位计算；卖出按清仓处理。 */}
+          <Form.FormItem label="数量">
+            {tradeDir === 'add'
+              ? <span>按动态仓位自动计算（总资产/池权益 × 缩放，再受行业/单票 35% 额度与现金约束）</span>
+              : <span>{tradeTarget?.qty} 股（全部清仓）</span>}
           </Form.FormItem>
-          {/* 减仓预览：按手数×100 实时计算减仓后剩余股数 */}
-          {tradeDir === 'trim' && tradePreviewQty > 0 && (
-            <div style={{ color: 'var(--td-warning-color)' }}>减仓后：剩余 {tradeTarget.qty - tradePreviewQty * 100} 股</div>
-          )}
         </Form>
       </Dialog>
 

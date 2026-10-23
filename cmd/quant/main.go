@@ -267,7 +267,9 @@ func run() int {
 	paperCfg := cfgMgr.Get().Paper
 	// §F-4（20260917 缺陷修复批）装配逻辑收敛到 paper.ConfigFromRules（零值归一口径不变），
 	// 与 POST /api/paper/config 热更新共用同一构建器，消灭"只有重启才生效"的独一份内联。
-	paperEngine := paper.New(paper.ConfigFromRules(paperCfg), filepath.Join(dataDir, "paper.json"))
+	// §DYN-SIZE-v3：同时把操作员账号的 sizing 口径（legacy/dynamic）注入模拟盘引擎。
+	paperSizing, _ := cfgMgr.GetSizingConfigFor(authMgr.AdminID())
+	paperEngine := paper.New(paper.ConfigFromRules(paperCfg, paperSizing), filepath.Join(dataDir, "paper.json"))
 	srv.SetPaper(paperEngine)
 	if paperEngine.Enabled() {
 		log.Printf("[paper] 模拟盘已启用: 每票%.0f元 上限%d仓 初始%.0f元",

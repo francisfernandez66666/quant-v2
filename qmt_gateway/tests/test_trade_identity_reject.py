@@ -132,7 +132,9 @@ class TestReportFieldsContractIntact(unittest.TestCase):
     """§REJECT 只收紧"两键皆空"非法组合，report_fields.json 契约字段集不得**无意**变动
     （F2 golden 三方锁的网关侧一极）。§M4（2026-09-22 PM 批）系有意的契约修复：
     created_at/name/trade_id 三条网关一直在发、Go 信封却没接的"丢腿"补上 tag 后并入金标，
-    双向锁见 tests/test_report_contract.py 与 internal/server/report_contract_test.go。"""
+    双向锁见 tests/test_report_contract.py 与 internal/server/report_contract_test.go。
+    §DYN-SIZE-v3（2026-10-23 批）同为有意新增：synced/data_ts 两条会话新鲜度腿
+    （桥侧 account/positions 上报、Go qmtReportFreshness 消费），语义见方案 §8.7。"""
 
     def test_contract_sets_unchanged(self):
         with open(os.path.join(_ROOT, "qmt_gateway", "contract", "report_fields.json"),
@@ -140,12 +142,12 @@ class TestReportFieldsContractIntact(unittest.TestCase):
             c = json.load(f)
         # §SIDE-AUTH-2（2026-09-23 夜间批）系有意的契约新增：side_unverified（trade 专用，
         # 未命中派发行/派发行为空方向时的成交标记）——随契约变更同步更新本硬编码集，
-        # 先例见 §M4 三条补腿。
+        # 先例见 §M4 三条补腿。§DYN-SIZE-v3 再补 synced/data_ts（会话新鲜度）。
         self.assertEqual(
             sorted(c["report_event_fields"]),
-            sorted(["amount", "asset", "at", "broker", "code", "created_at", "fee", "from",
-                    "name", "order_id", "positions", "price", "qty", "reason", "side",
-                    "side_unverified", "signal_id", "stamp_tax", "status", "trade_id",
+            sorted(["amount", "asset", "at", "broker", "code", "created_at", "data_ts", "fee",
+                    "from", "name", "order_id", "positions", "price", "qty", "reason", "side",
+                    "side_unverified", "signal_id", "stamp_tax", "status", "synced", "trade_id",
                     "traded_at", "type", "user_id"]))
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 

@@ -627,10 +627,41 @@ type qmtReportEvent struct {
 	// RealPosition carries can_use_qty (nil when the channel omits it) through this decode.
 	Positions []store.RealPosition `json:"positions"`
 	Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
-	At        string               `json:"at"`
-	UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
+	At     string `json:"at"`
+	UserID string `json:"user_id"` // §GAP1.10 网关配置的归属账号
+	// Synced/DataTS §DYN-SIZE-v3 §8.7：桥侧会话新鲜度。
+	// Synced=nil 表示旧桥未上报（按旧口径处理）；false=会话未同步，快照不可信；
+	// DataTS 是快照生成时刻（RFC3339），超过 qmtSnapshotMaxAge 视为数据停滞。
+	// English: bridge session freshness. nil = legacy bridge (old behavior); false = snapshot from
+	// an unsynced session; DataTS older than qmtSnapshotMaxAge is treated as stale.
+	Synced *bool  `json:"synced"`
+	DataTS string `json:"data_ts"`
 	Broker    string               `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
 	From      string               `json:"from"`    // §QMT-DUAL 通道切换事件：来源通道
+}
+
+// qmtSnapshotMaxAge 桥侧快照的最大可信年龄：超过即视为“数据停滞”，不得据此刷新资金/持仓。
+// English: max trusted age of a bridge snapshot; older snapshots must not refresh cash/positions.
+const qmtSnapshotMaxAge = 10 * time.Minute
+
+// qmtReportFreshness 判定快照是否可信：显式 synced=false → 不可信；data_ts 可解析且过旧 → 不可信。
+// data_ts 缺失/不可解析按旧桥口径放行（向后兼容），由调用方的其余守卫兜底。
+// English: snapshot trust check — explicit synced=false or a parseable-but-stale data_ts is
+// untrusted; a missing/unparseable data_ts falls back to legacy behavior.
+func qmtReportFreshness(ev qmtReportEvent, now time.Time) (bool, time.Time) {
+	ts := now
+	if raw := strings.TrimSpace(ev.DataTS); raw != "" {
+		if p, err := time.Parse(time.RFC3339, raw); err == nil {
+			ts = p.In(cntime.Loc)
+		}
+	}
+	if ev.Synced != nil && !*ev.Synced {
+		return false, ts
+	}
+	if now.Sub(ts) > qmtSnapshotMaxAge {
+		return false, ts
+	}
+	return true, ts
 }
 
 // handleQMTReport 接收网关回报（POST /api/qmt/report，Bearer token 鉴权）。
@@ -668,6 +699,31 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 忽略 body 携带的 user_id——防止持有 A 账号网关 token 者借 ev.UserID 越权写入/清空任意账号持仓。
 		// 此前"网关 user_id > token uid"的优先级是越权写面。
 		owner := uid
+		// §DYN-SIZE-v3 §8.7：会话未同步/数据停滞的快照不可信——不得用它清账或覆盖持仓。
+		// 返回 200 让网关 outbox 正常结算，避免同一条不可信快照被反复重推。
+		// English: an unsynced/stale snapshot must not clear or overwrite the book; ACK 200 so the
+		// durable outbox settles instead of retrying the same untrusted event.
+		fresh, _ := qmtReportFreshness(ev, cntime.Now())
+		if !fresh {
+			log.Printf("[trading] ⚠ positions 快照不可信(用户=%s synced=%v data_ts=%s)，跳过对账", owner, ev.Synced, ev.DataTS)
+			opslog.DayOnce("positions-unsynced:"+owner, func() {
+				opslog.Logf("quant", "持仓快照未同步/停滞 用户=%s synced=%v data_ts=%s，本次跳过对账",
+					owner, ev.Synced, ev.DataTS)
+			})
+			writeJSON(w, 200, map[string]interface{}{"ok": true, "skipped": "unsynced"})
+			return
+		}
+		// 空快照 + 券商仍报有市值 → 推断会话未同步（桥侧可能漏报 synced，不能就此清账）。
+		if len(ev.Positions) == 0 {
+			if acc, aerr := db.GetRealAccount(owner); aerr == nil && acc.MarketValue > 0 {
+				log.Printf("[trading] ⚠ positions 空快照但账户市值 %.0f>0(用户=%s)——推断未同步，跳过对账", acc.MarketValue, owner)
+				opslog.DayOnce("positions-empty-mv:"+owner, func() {
+					opslog.Logf("quant", "持仓空快照但账户市值 %.0f>0 用户=%s，推断会话未同步，跳过对账", acc.MarketValue, owner)
+				})
+				writeJSON(w, 200, map[string]interface{}{"ok": true, "skipped": "market_value_conflict"})
+				return
+			}
+		}
 		// §AUDIT-PM 2026-09-15 空快照纵深守卫（第三层）：positions 语义是全量替换，而 broker.py
 		// 在通道断连时同样返回空列表——若仅靠 网关token(第一层)+网关 clear_guard(第二层)，
 		// Go 侧一个畸形/伪造的空数组仍会清空本账号持仓。规则：本地该账号仍有持仓而快照为空 →
@@ -869,13 +925,28 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "empty account asset")
 			return
 		}
+		// §DYN-SIZE-v3 §8.7：未同步/停滞的资产快照不得刷新 updated_at——否则资金口径会被
+		// 伪造成“新鲜”，动态预算会拿过期资金自动开仓。跳过即让 AvailableCash 自然过期 fail-close。
+		// English: unsynced/stale asset snapshots must not refresh updated_at, otherwise the dynamic
+		// budget would treat stale cash as fresh; skipping lets AvailableCash expire (fail-closed).
+		fresh, dataTS := qmtReportFreshness(ev, cntime.Now())
+		if !fresh {
+			log.Printf("[trading] ⚠ account 快照不可信(用户=%s synced=%v data_ts=%s)，不刷新资产时间", owner, ev.Synced, ev.DataTS)
+			opslog.DayOnce("account-unsynced:"+owner, func() {
+				opslog.Logf("quant", "账户资产快照未同步/停滞 用户=%s synced=%v data_ts=%s，本次不落库",
+					owner, ev.Synced, ev.DataTS)
+			})
+			writeJSON(w, 200, map[string]interface{}{"ok": true, "skipped": "unsynced"})
+			return
+		}
+		updatedAt := dataTS.Format("2006-01-02 15:04:05")
 		if err := db.UpsertRealAccount(store.RealAccount{
 			UserID:        owner,
 			AvailableCash: ev.Asset["cash"],
 			FrozenCash:    ev.Asset["frozen_cash"],
 			TotalAsset:    ev.Asset["total_asset"],
 			MarketValue:   ev.Asset["market_value"],
-			UpdatedAt:     time.Now().Format("2006-01-02 15:04:05"),
+			UpdatedAt:     updatedAt,
 		}); err != nil {
 			writeError(w, 500, "upsert account: "+err.Error())
 			return

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -221,7 +222,7 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 	// §FIX-1(20260919) 整手纪律闸：显式股数必须是 100 的整数倍，防止把"手数"当"股数"提交后
 	// 以 1/100 规模建仓（历史 P0：UI 传手数、引擎按股记账导致账本 100 倍错位）。
 	// English: explicit share counts must be whole lots; this blocks the historic lots-vs-shares P0.
-	if req.Qty > 0 && req.Qty%100 != 0 {
+	if req.Qty > 0 && req.Qty%100 != 0 && !strings.EqualFold(strings.TrimSpace(pe.Cfg().BudgetMode), "dynamic") {
 		writeError(w, 400, "买入数量需为 100 股整数倍（1 手 = 100 股）")
 		return
 	}
@@ -233,7 +234,14 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 		poolKey = req.StrategyID
 	}
 	quotes := s.liveQuotes(req.Code) // 行情快照（撮合价基准），一次构造供买入使用
-	if req.Qty > 0 {
+	// §DYN-SIZE-v3：dynamic 模式下手动买入不再接受手填股数，统一走动态仓位（qty 字段忽略）。
+	// English: in v3 dynamic mode manual buys ignore the typed qty and always use dynamic sizing.
+	if strings.EqualFold(strings.TrimSpace(pe.Cfg().BudgetMode), "dynamic") {
+		if err := pe.BuyInPool(req.Code, req.Name, req.Strategy, poolKey, req.SignalPrice, quotes); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	} else if req.Qty > 0 {
 		// 输入价格+股数：按用户指定记账（price=0 时用实时价，仍按指定股数）
 		// English: typed price + share count: fills as specified (price=0 falls back to the live quote
 		// but still respects the typed share count).
@@ -357,7 +365,7 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 	}
 	// §FIX-1(20260919) 零股守卫：部分减仓留下非整手尾仓会污染后续清仓口径，与实盘零股纪律
 	// （handlers_fix.go/qmt.go 卖出守卫）对齐；qty>=持仓=清仓不拦（尾仓零股须能平掉）。
-	if req.Qty > 0 && req.Qty%100 != 0 {
+	if req.Qty > 0 && req.Qty%100 != 0 && !strings.EqualFold(strings.TrimSpace(pe.Cfg().BudgetMode), "dynamic") {
 		for _, p := range pe.Positions() {
 			if p.Code == req.Code && req.Qty < p.Qty {
 				writeError(w, 400, "减仓数量需为 100 股整数倍（1 手 = 100 股），零股请清仓卖出")
@@ -366,7 +374,14 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// qty>0 按股数减仓，否则整仓卖出（价格按用户输入，缺省走实时价）。
-	if req.Qty > 0 {
+	// §DYN-SIZE-v3：dynamic 模式下手动卖出按清仓处理，部分减仓交给后续信号/数据。
+	// English: in v3 dynamic mode manual sells always close the whole position.
+	if strings.EqualFold(strings.TrimSpace(pe.Cfg().BudgetMode), "dynamic") {
+		if err := pe.Sell(req.Code, s.liveQuotes(req.Code)); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	} else if req.Qty > 0 {
 		if err := pe.SellEx(req.Code, req.Price, req.Qty, s.liveQuotes(req.Code)); err != nil {
 			writeError(w, 400, err.Error())
 			return

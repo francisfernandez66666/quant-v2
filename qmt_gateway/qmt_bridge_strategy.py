@@ -1130,6 +1130,35 @@ def _load_seen():
     return out
 
 
+def _apply_order_floor(cmd, cfg):
+    """v3 order-floor fallback (server-side 1-lot floor is authoritative).
+
+    mode=legacy (default): leave qty untouched (zero behavior change).
+    mode=one_lot: if the server sent a sub-lot qty (0 < qty < 100), raise it to one lot,
+    but only when the one-lot cost is within lot_fallback_cap (cap<=0 means no ceiling).
+    Larger qty/non-lot multiples are never rewritten here: the engine owns sizing.
+    """
+    mode = str((cfg or {}).get("order_floor_mode", "legacy") or "legacy").lower()
+    if mode != "one_lot":
+        return
+    try:
+        qty = int(cmd.get("qty", 0) or 0)
+        price = float(cmd.get("price", 0) or 0)
+    except Exception:
+        return
+    lot = 100
+    if qty <= 0 or qty >= lot or price <= 0:
+        return
+    cap = float((cfg or {}).get("lot_fallback_cap", 0) or 0)
+    one_lot = price * lot
+    sig = str(cmd.get("signal_id", "") or "")
+    if cap > 0 and one_lot > cap:
+        _trace("one_lot floor refused: one_lot=%.2f cap=%.2f qty=%s sig=%s" % (one_lot, cap, qty, sig))
+        return
+    cmd["qty"] = lot
+    _trace("one_lot floor raised: %s -> %s (price=%.3f one_lot=%.2f) sig=%s" % (qty, lot, price, one_lot, sig))
+
+
 def _handle_cmd(cmd, seen):
     import json
     kind = str(cmd.get("kind", ""))
@@ -1151,6 +1180,7 @@ def _handle_cmd(cmd, seen):
     seen.add(seq)
     try:
         if kind == "order":
+            _apply_order_floor(cmd, _TICK.get("cfg") or {})
             try:
                 ok, order_id, err = _xt().place(cmd)
             except Exception as e:
@@ -1163,8 +1193,11 @@ def _handle_cmd(cmd, seen):
                                                       order_id, cmd)
                 except Exception as e:
                     _trace("resolve error (kept seq ref): " + repr(e))
+            # signal_id is echoed back for audit/reconciliation (the gateway already maps seq);
+            # keeping it here means a bridge-side report can always be traced to its dispatch row.
             result = {"type": "order_result", "seq": seq, "ok": ok,
-                      "order_id": order_id, "err": err}
+                      "order_id": order_id, "err": err,
+                      "signal_id": str(cmd.get("signal_id", "") or "")}
             # M-3 (2026-09-22 fix batch) order-leg second confirmation.
             # Defect: passorder() not raising was taken as "the counter accepted the
             # order", so the bridge reported ok=True and the gateway forwarded a plain
@@ -1294,16 +1327,26 @@ def _bridge_tick():
         adapter = _xt()
         try:
             poss = adapter.query_positions()
+            snap_ts = _now_cn_str()
             if poss:
-                _report({"type": "positions", "positions": poss})
+                # synced/data_ts tell the engine whether this snapshot reflects a live broker
+                # session. Empty snapshots are reported too (with synced=false) so the server
+                # can distinguish "flat book" from "session not synced" instead of clearing.
+                _report({"type": "positions", "positions": poss,
+                         "synced": True, "data_ts": snap_ts})
             else:
+                _report({"type": "positions", "positions": [],
+                         "synced": False, "data_ts": snap_ts})
                 _trace("empty positions snapshot (session not synced?)")
         except Exception as e:
             _trace("positions snapshot error: " + repr(e))
         try:
             asset = adapter.query_asset()
             if asset:
-                _report({"type": "account", "asset": asset})
+                _report({"type": "account", "asset": asset,
+                         "synced": True, "data_ts": _now_cn_str()})
+            else:
+                _trace("empty account snapshot (session not synced?)")
         except Exception as e:
             _trace("asset snapshot error: " + repr(e))
         try:

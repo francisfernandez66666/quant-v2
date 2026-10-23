@@ -87,6 +87,24 @@ func TestSectorExposureBlocksOverCap(t *testing.T) {
 	}
 }
 
+// TestSectorExposureDynamicBudgetSecondNet §DYN-SIZE-v3 §5.4：动态预算标记不得绕过行业敞口保险。
+func TestSectorExposureDynamicBudgetSecondNet(t *testing.T) {
+	db := sectorGateDB(t)
+	seedSectorBook(t, db)
+	g := NewGate(db, "u_sector", nil)
+	g.SetIndustrySource(func(code string) string { return "银行" })
+	cfg := qmtCfg()
+	cfg.RiskGate.SectorValuePct = 30
+	hardShadow := false
+	cfg.RiskGate.SectorValueShadow = &hardShadow
+
+	o := sectorOrder("600001.SH", 15000)
+	o.DynamicBudget = true
+	if v := g.CheckLiveOrder(cfg, o); v.Pass || v.Gate != "sector_exposure" {
+		t.Fatalf("dynamic 单不得绕过行业敞口保险, got %+v", v)
+	}
+}
+
 func TestSectorExposureShadowOnlyRecords(t *testing.T) {
 	db := sectorGateDB(t)
 	seedSectorBook(t, db)

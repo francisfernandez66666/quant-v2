@@ -21,6 +21,7 @@ package signalctl
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
@@ -64,6 +65,13 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 	// 1. 硬拦因子：命中即降级（不进连乘，避免"既降级又缩额"的双重惩罚）。
 	if down, why := sizingHardBlock(r, sig, cfg); down {
 		return SizingResult{Scale: cfg.Floor, Downgrade: true, Reasons: []string{why}}
+	}
+
+	// §DYN-SIZE-v3：分组幂平均口径。旧 product 路径原样保留在下方，供回滚与逐字回归。
+	// English: v3 grouped power-mean path; the legacy product path below is kept byte-identical
+	// for rollback and regression.
+	if cfg.ModeOf() == "power_mean" {
+		return computeSizingPowerMean(r, sig, cfg)
 	}
 
 	// 2. 权重/倾向类：乘性连乘 Π（弃权因子直接跳过）。
@@ -118,6 +126,127 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 
 	// 4. 分层合成 + 地板/上限。
 	scale := math.Min(w, m)
+	if scale < cfg.Floor {
+		scale = cfg.Floor
+		reasons = append(reasons, "触地板")
+	}
+	if scale > cfg.Cap {
+		scale = cfg.Cap
+		reasons = append(reasons, "触上限")
+	}
+	return SizingResult{Scale: scale, Reasons: reasons}
+}
+
+// sizingFactor 一个已求值的仓位因子（v<=0 表示弃权）。
+// English: one evaluated sizing factor; v<=0 means abstain.
+type sizingFactor struct {
+	name string
+	v    float64
+}
+
+// powerMean 幂平均：p=0 退化为几何平均；空集返回 1.0（中性）。
+// 公式：((Σv_i^p)/n)^(1/p)。只接受 v>0，调用方负责过滤弃权。
+// English: power mean; p=0 is the geometric mean and an empty set is neutral (1.0).
+func powerMean(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 1.0
+	}
+	if p == 0 {
+		prod := 1.0
+		for _, v := range vals {
+			prod *= v
+		}
+		return math.Pow(prod, 1/float64(len(vals)))
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += math.Pow(v, p)
+	}
+	return math.Pow(sum/float64(len(vals)), 1/p)
+}
+
+// sizingGroup 对一组因子做幂平均并套组 floor；返回组值和可读理由。
+// 组内全部弃权 → 组值 1.0（不奖不罚），理由明确写"无"。
+// English: power-mean one factor group, apply its floor, and return a readable reason.
+// An all-abstain group is neutral (1.0) and says so explicitly.
+func sizingGroup(name string, floor float64, factors []sizingFactor, p float64) (float64, string) {
+	vals := make([]float64, 0, len(factors))
+	parts := make([]string, 0, len(factors))
+	for _, f := range factors {
+		if f.v <= 0 {
+			continue
+		}
+		vals = append(vals, f.v)
+		if f.v != 1.0 {
+			parts = append(parts, fmt.Sprintf("%s×%.2f", f.name, f.v))
+		}
+	}
+	if len(vals) == 0 {
+		return 1.0, fmt.Sprintf("%s:无→1.00", name)
+	}
+	g := powerMean(vals, p)
+	floored := false
+	if floor > 0 && g < floor {
+		g = floor
+		floored = true
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "中性")
+	}
+	reason := fmt.Sprintf("%s:%s→%.3f", name, strings.Join(parts, "|"), g)
+	if floored {
+		reason += "(触地板)"
+	}
+	return g, reason
+}
+
+// computeSizingPowerMean v3 合成：市场组/个股组各自幂平均，再组间幂平均；上限类仍取 min。
+// English: v3 synthesis — market and stock groups each power-meaned, then combined; caps still min.
+func computeSizingPowerMean(r Regime, sig combat_agent.Signal, cfg config.SizingConfig) SizingResult {
+	p := cfg.PowerPOf()
+	market := []sizingFactor{
+		{"情绪相位", emotionFactor(r.EmotionPhase, cfg)},
+		{"市场状态", stateFactor(r, cfg)},
+		{"风险档", tierFactor(r.RiskTier, cfg)},
+		{"宏观影响期", macroWindowFactor(r, cfg)},
+		{"宏观前瞻", macroLeadFactor(r, cfg)},
+		{"节前", holidayFactor(r.Holiday, cfg)},
+		{"大盘跌幅", indexFactor(r.IndexChangePct, cfg)},
+		{"广度", breadthFactor(r.BreadthUpRatio, cfg)},
+	}
+	stock := []sizingFactor{
+		{"信号质量", qualityFactor(sig)},
+		{"信号强度", kellyFactor(sig.Confidence, cfg)},
+		{"个股波动率", volFactor(sig, cfg)},
+		{"LLM利空", llmFactor(sig, cfg)},
+	}
+	mg, mr := sizingGroup("市场组", cfg.GroupFloor("market"), market, p)
+	sg, sr := sizingGroup("个股组", cfg.GroupFloor("stock"), stock, p)
+	raw := powerMean([]float64{mg, sg}, p)
+	reasons := []string{mr, sr, fmt.Sprintf("组间→%.3f", raw)}
+
+	// 上限类仍取 min（与旧路径同口径：只向下约束，不连乘）。
+	m := math.Inf(1)
+	for _, c := range []struct {
+		name string
+		v    float64
+	}{
+		{"总仓位上限", totalPosCap(r.Account, cfg)},
+		{"权益回撤", drawdownCap(r.Account, cfg)},
+		{"风险预算", riskBudgetCap(r, cfg)},
+	} {
+		if c.v <= 0 {
+			continue
+		}
+		if c.v < m {
+			m = c.v
+		}
+		if c.v < 1.0 {
+			reasons = append(reasons, fmt.Sprintf("%s×%.2f", c.name, c.v))
+		}
+	}
+
+	scale := math.Min(raw, m)
 	if scale < cfg.Floor {
 		scale = cfg.Floor
 		reasons = append(reasons, "触地板")
