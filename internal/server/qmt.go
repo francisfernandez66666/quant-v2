@@ -627,8 +627,8 @@ type qmtReportEvent struct {
 	// RealPosition carries can_use_qty (nil when the channel omits it) through this decode.
 	Positions []store.RealPosition `json:"positions"`
 	Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
-	At     string `json:"at"`
-	UserID string `json:"user_id"` // §GAP1.10 网关配置的归属账号
+	At        string               `json:"at"`
+	UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
 	// Synced/DataTS §DYN-SIZE-v3 §8.7：桥侧会话新鲜度。
 	// Synced=nil 表示旧桥未上报（按旧口径处理）；false=会话未同步，快照不可信；
 	// DataTS 是快照生成时刻（RFC3339），超过 qmtSnapshotMaxAge 视为数据停滞。
@@ -636,8 +636,8 @@ type qmtReportEvent struct {
 	// an unsynced session; DataTS older than qmtSnapshotMaxAge is treated as stale.
 	Synced *bool  `json:"synced"`
 	DataTS string `json:"data_ts"`
-	Broker    string               `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
-	From      string               `json:"from"`    // §QMT-DUAL 通道切换事件：来源通道
+	Broker string `json:"broker"` // §QMT-DUAL 通道切换事件：目标通道
+	From   string `json:"from"`   // §QMT-DUAL 通道切换事件：来源通道
 }
 
 // qmtSnapshotMaxAge 桥侧快照的最大可信年龄：超过即视为“数据停滞”，不得据此刷新资金/持仓。
