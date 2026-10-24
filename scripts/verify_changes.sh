@@ -14223,16 +14223,24 @@ WEBO124=web/src/pages/Positions.jsx
 # 判据靶子是 sellProbe 里那行盈亏算式**整串**，不是「文件里有没有 AnchorPrice 字样」——
 # SellInput 已按裁决二新增 AnchorPrice 字段连同说明注释，字样命中属设计，按字样锁必误伤注释
 # （本项目吃过负向 grep 打中注释的亏）。
-grep -q 'pnl := (in\.CurPrice - in\.EntryPrice) / in\.EntryPrice \* 100' "$SEL124" ||
-	fail124 "sellProbe 的盈亏分母不再是摊薄成本 EntryPrice＝W2 越界切硬（W3 的前提是 owner 签认 Q10 逐票线位移动表；未签认前整仓风险线搬家等于未经批准的止损位变更）"
+# W3（2026-10-25）起 sellProbe 引入**单一 basis**：默认仍取摊薄成本 EntryPrice（W2 契约不变），
+# 只有 in.UseAnchor 显式为真且锚点已知才换成 AnchorPrice。于是「未签认前不许搬家」这条锁
+# 改写成三条等值 + 一条门数等值：① 默认基准是 EntryPrice；② 换锚只有一个门；③ 盈亏/高水/
+# 移动止盈共用同一个 basis；④ in.AnchorPrice 只许出现一次（就是那道门，多一处＝绕门裸读）。
+grep -q 'basis := in\.EntryPrice' "$SEL124" ||
+	fail124 "sellProbe 的基准默认值不再是摊薄成本 EntryPrice（默认换锚＝未签认就把整仓风险线搬家）"
+grep -q 'if in\.UseAnchor && in\.AnchorPrice > 0 {' "$SEL124" ||
+	fail124 "换锚门不再是「in.UseAnchor && in.AnchorPrice > 0」（门一松，缺锚持仓会按 0 基准算盈亏）"
+grep -q 'pnl := (in\.CurPrice - basis) / basis \* 100' "$SEL124" ||
+	fail124 "sellProbe 的盈亏算式没走单一 basis（三处消费点各算各的＝读数混两把尺，比不切更坏）"
 INA124=$(grep -c 'in\.AnchorPrice' "$SEL124" || true)
-[ "${INA124:-0}" = "0" ] ||
-	fail124 "sellProbe 读到了随行锚点（${SEL124} 里 in.AnchorPrice ${INA124} 处）"
-# 射程自证：同一条判据打在对照层必须命中，否则上面那条「恒 0」是判据机器失灵而不是内核干净。
+[ "${INA124:-0}" = "1" ] ||
+	fail124 "sellProbe 里 in.AnchorPrice 出现 ${INA124} 处（期望=1，只许是换锚门那一处；多一处＝绕门裸读锚点）"
+# 射程自证：同一条判据打在对照层必须命中，否则上面那条「等值 1」是判据机器失灵而不是内核干净。
 RGA124=$(grep -c 'in\.AnchorPrice' "$ASH124" || true)
 [ "${RGA124:-0}" -ge 1 ] ||
 	fail124 "射程自证失败：同一条 in.AnchorPrice 判据在 ${ASH124} 也读出 0＝判据失灵，上面那条绿没有任何含义"
-CNT124=$((CNT124 + 3))
+CNT124=$((CNT124 + 5))
 
 # —— ② 三本账都有锚点字段 ——
 for F124 in "$RP124" "$PAP124" "$RPT124"; do
@@ -14335,6 +14343,276 @@ fi
 rm -rf "$W124M"
 CNT124=$((CNT124 + 3))
 
-echo "ok - §124 §ANCHOR-FIRST W2 锁通过（内核未换锚 3 道 + 三本账字段 3 道 + 写入冻结 3 道 + 影子装配 7 道（三口账本标识逐个等值）+ 日志镜像 1 道 + 前端 4 道 + 行为腿 5 包共 ${LEG124_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT124}；W2 只影子，切硬待 Q10 签认）"
+echo "ok - §124 §ANCHOR-FIRST W2/W3 锁通过（默认基准未换锚 5 道：basis 默认 EntryPrice／换锚唯一门／算式走单一 basis／in.AnchorPrice 门数等值／射程自证 + 三本账字段 3 道 + 写入冻结 3 道 + 影子装配 7 道（三口账本标识逐个等值）+ 日志镜像 1 道 + 前端 4 道 + 行为腿 5 包共 ${LEG124_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT124}；W2 只影子、W3 切硬开关默认关，等 Q10 签认）"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# §125 §T1-PARTIAL（2026-10-24 owner 裁决三）模拟盘层账 / 减量成交 / 残量意图 / 真实减仓
+#
+# 裁决原文：「加仓后遇到退出，先只卖可卖部分（就是做正 T）」。改前的两个方向都是错的：
+#   ① 加仓从不刷新成交时间 ⇒ 当日加的仓被旧日期判成可卖（**漏放**，少拦，方向危险）；
+#   ② 全仓当日买入时一笔卖出整单报错 ⇒ 退出裁决被 T+1 整单挡死（该卖的卖不掉）。
+# 本段锁的是"改后的形态还在不在"，以及 owner 追加的"减仓不再是清仓"：
+#   ① 层账结构在位（Position.Lots / PositionLot 三字段），整仓二值判据 sellCheckT1Locked 已删除；
+#   ② 三条写入路径都在写批次（建仓 / 加仓 / 卖出扣减），且可卖量只从层账派生；
+#   ③ 残量意图在册（结构 + 持久化键 + 两个执行钩子 + 3 交易日有效期 + 窗口不被顺延）；
+#   ④ 减仓腿前后端同批：后端 handlePaperSell 不再按预算口径强制全卖，前端 trim 提交手数×100；
+#   ⑤ 行为腿两包真跑，条数与源码派生对拍（写死枚数对下一个新增用例天生失明）；
+#   ⑥ 三枚反证：把坏形态塞进临时副本，证明上面的等值锁真有区分度。
+# English: the ruling-3 contract — lot ledger in place (the binary whole-position guard is gone), all
+# three write paths maintain batches, sellable derives from the ledger only, residual intents persist and
+# execute from the next trading day without extending their window, and a trim is a real partial sell on
+# both sides of the wire.
+echo "==> 125 §T1-PARTIAL 层账面：批次层账＋可卖量等值底仓＋残量意图＋减仓不再是清仓（2026-10-24 裁决三）..."
+fail125() {
+	echo "--- FAIL: §125 $*"
+	exit 1
+}
+CNT125=0
+P125=internal/paper/paper.go
+T125=internal/paper/t1_partial.go
+S125=internal/server/paper.go
+R125=internal/engine/registry.go
+E125=internal/engine/engine.go
+W125=web/src/pages/Paper.jsx
+
+# —— ① 层账结构在位，整仓二值判据不得回潮 ——
+grep -q 'Lots \[\]PositionLot' "$P125" ||
+	fail125 "$P125 缺 Position.Lots 层账字段（没有批次就答不出「今天能卖多少」，裁决三无处落地）"
+for tag125 in 'json:"qty"' 'json:"price"' 'json:"filled_at"'; do
+	grep -q "$tag125" "$T125" ||
+		fail125 "$T125 的 PositionLot 缺 ${tag125}（批次必须同时带股数/成本/成交时间，缺一个就判不了日）"
+done
+# 负锁：整仓二值判据必须彻底消失。它若回潮，层账与旧判据会同时生效，同一持仓出现两套可卖量。
+NEG125=$(grep -c 'func (e \*Engine) sellCheckT1Locked' "$P125" || true)
+[ "${NEG125:-0}" = "0" ] ||
+	fail125 "整仓二值判据 sellCheckT1Locked 又回到 ${P125}（${NEG125} 处）——它与层账并存会让同一持仓出现两套可卖量"
+CNT125=$((CNT125 + 5))
+
+# —— ② 三条写入路径都在维护批次；可卖量只从层账派生 ——
+LOT125=$(grep -c 'Lots: \[\]PositionLot{{' "$P125" || true)
+[ "${LOT125:-0}" = "1" ] ||
+	fail125 "建仓写批次的点应恰好 1 处（got=${LOT125}）：建仓不写批次＝层账从第一天起就是空的"
+ADD125=$(grep -c 'addBuyLot(' "$P125" || true)
+[ "${ADD125:-0}" -ge 1 ] ||
+	fail125 "$P125 的加仓路径没有调 addBuyLot——这正是改前的漏放根因（加仓不刷新成交时间）"
+CON125=$(grep -c 'consumeSellableLots(' "$P125" || true)
+[ "${CON125:-0}" -ge 1 ] ||
+	fail125 "卖出路径没有调 consumeSellableLots：层账只增不减，卖完之后可卖量会虚高"
+# 可卖量的唯一算法：从层账汇总。写成 return p.Qty 就是把缺陷原样搬回来。
+SELL125=$(grep -c 'return LayersOfPosition(p, now)\.Sellable' "$T125" || true)
+[ "${SELL125:-0}" = "1" ] ||
+	fail125 "可卖量必须从层账派生（t1_partial.go 里 'return LayersOfPosition(p, now).Sellable' got=${SELL125}）——退回整仓 p.Qty 就是漏放"
+CNT125=$((CNT125 + 4))
+
+# —— ③ 残量意图：结构、持久化、两个执行钩子、有效期、窗口不被顺延 ——
+grep -q 'PendingExits map\[string\]\*PendingExit' "$P125" ||
+	fail125 "$P125 的持久化状态缺 pending_exits（残量意图不落盘 ⇒ 重启即丢，退出裁决被静默吞掉）"
+grep -q 'json:"pending_exits' "$P125" ||
+	fail125 "$P125 的 pending_exits 缺 JSON 键（不落盘＝跨重启丢失）"
+HOOK125=$(grep -c 'pe\.RunPendingExits(quotes)' "$R125" "$E125" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}' || true)
+[ "${HOOK125:-0}" = "2" ] ||
+	fail125 "残量意图的执行钩子应恰好 2 处（多机注册表 ${R125} + 单机回退 ${E125}；got=${HOOK125}）——少一处＝那条路径上的残量永远卖不掉"
+grep -q 'pendingExitValidDays = 3' "$T125" ||
+	fail125 "残量意图有效期常量不是 3 个交易日（Q6 采纳的边界，改它就等于改裁决）"
+# 合并时**不得**改写到期日：整个文件里到期日只允许被算一次（新建意图那一支的复合字面量）。
+EXP125=$(grep -c 'ExpireOn: data\.AddTradingDays(day, pendingExitValidDays)' "$T125" || true)
+[ "${EXP125:-0}" = "1" ] ||
+	fail125 "到期日计算点应恰好 1 处（got=${EXP125}）：出现第 2 处＝反复触发会把有效期无限顺延，残量永远追不完"
+FIRED125=$(grep -c 'if ex\.FiredDay == ""' "$T125" || true)
+[ "${FIRED125:-0}" = "1" ] ||
+	fail125 "合并分支应保留最初触发日（'if ex.FiredDay == \"\"' got=${FIRED125}）——无条件改写会让「登记当日不补卖」的守卫失效"
+CNT125=$((CNT125 + 6))
+
+# —— ④ 减仓腿：后端不再按预算口径强制全卖，前端 trim 真的提交股数 ——
+# 只取 handlePaperSell 函数体，避免把 handlePaperBuy（它确实还要按预算口径分支）算进来。
+BODY125=$(awk '/^func \(s \*Server\) handlePaperSell/,/^}/' "$S125")
+[ -n "$BODY125" ] || fail125 "抽不出 handlePaperSell 函数体（判据没射程，本段后续锁全都会是假绿）"
+if printf '%s' "$BODY125" | grep -q 'BudgetMode'; then
+	fail125 "handlePaperSell 又按预算口径分支了（UAT U-2/U-4 原案：dynamic 下 qty 被丢弃 ⇒ 点减仓把整仓清掉）"
+fi
+BEX125=$(printf '%s' "$BODY125" | grep -c 'pe\.SellEx(' || true)
+[ "${BEX125:-0}" = "1" ] ||
+	fail125 "handlePaperSell 必须走一次 SellEx（真实减仓），got=${BEX125}"
+BSELL125=$(printf '%s' "$BODY125" | grep -c 'pe\.Sell(' || true)
+[ "${BSELL125:-0}" = "1" ] ||
+	fail125 "handlePaperSell 必须保留一条 Sell（qty<=0 的清仓档），got=${BSELL125}"
+# 提交口径那行整串（不是"文件里出现过 ×100"）：弹窗里还有一处同形的**展示**换算（回显"几股"），
+# 按字样数会恒 2；按整串锁提交点才分得清"改了展示"与"改了提交"。
+FE125=$(grep -c 'const qty = Math\.max(0, Math\.floor(tradeFormLots) \* 100)' "$W125" || true)
+[ "${FE125:-0}" = "1" ] ||
+	fail125 "$W125 缺手数×100 这唯一提交换算点（got=${FE125}）：前端不传股数，后端就只能清仓"
+FS125=$(grep -c 'sellable_qty' "$W125" || true)
+[ "${FS125:-0}" -ge 2 ] ||
+	fail125 "减仓弹窗必须上屏可卖量（sellable_qty 出现 ${FS125} 处，至少 2 处：默认手数 + 提示文案）"
+CNT125=$((CNT125 + 6))
+
+# —— ⑤ 行为腿：两包真跑，条数与源码派生对拍 ——
+W125D=$(mktemp -d "${TMPDIR:-/tmp}/gate125.XXXXXX") || fail125 "行为腿工作目录建不起来"
+LEG125_TOTAL=0
+for spec125 in "internal/paper:TestT1Partial" "internal/server:TestPaperSell"; do
+	D125=${spec125%%:*}
+	PAT125=${spec125#*:}
+	LOG125="$W125D/$(printf '%s' "$D125" | tr '/' '_').log"
+	WANT125=$(grep -hE "^func ${PAT125}" "$D125"/*_test.go 2>/dev/null | wc -l | tr -d ' ' || true)
+	[ "${WANT125:-0}" -ge 1 ] || { rm -rf "$W125D"; fail125 "$D125 一条本批用例都没有（派生期望 0＝判据没射程，不是全绿）"; }
+	if ! go test -v -run "$PAT125" "./$D125/" -count=1 >"$LOG125" 2>&1; then
+		tail -20 "$LOG125"
+		rm -rf "$W125D"
+		fail125 "$D125 行为腿非零退出（上面贴出末 20 行归因）"
+	fi
+	GOT125=$(grep -c '^--- PASS' "$LOG125" || true)
+	BAD125=$(grep -c '^--- FAIL' "$LOG125" || true)
+	[ "${BAD125:-0}" = "0" ] || { tail -20 "$LOG125"; rm -rf "$W125D"; fail125 "$D125 用例 FAIL=${BAD125}"; }
+	[ "${GOT125:-0}" = "${WANT125}" ] || {
+		rm -rf "$W125D"
+		fail125 "$D125 跑到的条数与源码派生不符（PASS=${GOT125} 应有=${WANT125}——少跑＝-run 没覆盖新增用例）"
+	}
+	LEG125_TOTAL=$((LEG125_TOTAL + GOT125))
+done
+rm -rf "$W125D"
+CNT125=$((CNT125 + 2))
+
+# —— ⑥ 反证：三枚坏形态进临时副本，上面的等值锁必须抓得住 ——
+W125M=$(mktemp -d "${TMPDIR:-/tmp}/gate125m.XXXXXX") || fail125 "反证工作目录建不起来"
+printf '%s\n' 'func (e *Engine) sellableQtyLocked(p *Position, now time.Time) int {' '	return p.Qty // 坏形态：整仓二值（漏放）' '}' > "$W125M/fake_sellable.go"
+printf '%s\n' 'ExpireOn: data.AddTradingDays(day, pendingExitValidDays),' 'ExpireOn: data.AddTradingDays(day, pendingExitValidDays),' > "$W125M/fake_merge.go"
+printf '%s\n' 'await api.sellPaperPosition(p.code, price, 0)' > "$W125M/fake_trim.jsx"
+grep -q 'return p\.Qty' "$W125M/fake_sellable.go" || fail125 "反证失效：整仓二值假目标没被可卖量判据抓到"
+[ "$(grep -c 'ExpireOn: data\.AddTradingDays' "$W125M/fake_merge.go" || true)" -gt 1 ] ||
+	fail125 "反证失效：窗口顺延假目标没被「到期日只许一处」判据抓到"
+if grep -q 'Math\.floor(tradeFormLots) \* 100' "$W125M/fake_trim.jsx"; then
+	fail125 "反证不自洽：qty=0 的假 trim 也满足手数换算判据（前端锁无区分度）"
+fi
+rm -rf "$W125M"
+CNT125=$((CNT125 + 3))
+
+echo "ok - §125 §T1-PARTIAL 锁通过（层账结构 5 道 + 写入路径 4 道 + 残量意图 6 道 + 减仓腿 6 道 + 行为腿 2 包共 ${LEG125_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT125}；W4 收尾完成，W5 实盘侧另批）"
+
+# §126 §T-MODE 做 T（W6 正 T / W7 反 T）+ §ANCHOR-FIRST W3 存量锚点回填
+#
+# 这一段的射程：做 T 是**资金路径上新增的日内双向操作**（方案 3.6 的方向性风险），
+# 所以每一枚锁都必须能区分"改前/改后"与"改对/改错"，不许出现恒绿锁。
+# English: §T-MODE T rounds plus the W3 legacy anchor backfill. T is new intraday two-way trading on
+# the money path, so every lock below must distinguish before/after AND right/wrong.
+echo "==> 126 §T-MODE 做 T（两腿串行 / 留一手 / 不烧槽 / 尾盘收摊）+ W3 锚点回填（三本账）..."
+fail126() {
+	echo "--- FAIL: §126 $*"
+	FAIL=1
+}
+CNT126=0
+C126=internal/config/config.go
+T126=internal/paper/t_rounds.go
+D126=internal/engine/intraday_t.go
+P126=internal/paper/anchor_backfill.go
+R126=internal/report/report.go
+S126=internal/store/real_positions.go
+M126=cmd/quant/main.go
+
+# —— ① 配置面 4 道：账号级 TConfig 存在、默认关、七个访问器齐全、出厂阈值可派生 ——
+grep -q 'json:"t,omitempty"' "$C126" ||
+	fail126 "SizingConfig 缺 T 字段：做 T 参数必须与预算口径同键空间（Q5 的耦合前提）"
+grep -q 'func (c TConfig) TEnabled() bool { return c.Enabled != nil && \*c.Enabled }' "$C126" ||
+	fail126 "TEnabled 必须是**只有显式 true 才开**（nil 读成开＝默认就动了资金路径）"
+TA126=$(grep -c 'func (c TConfig) T' "$C126" || true)
+[ "${TA126:-0}" -ge 7 ] ||
+	fail126 "TConfig 访问器不足 7 个（got ${TA126}）：缺一个就等于某个阈值没有兜底默认"
+grep -q 'defaultTForceUnwindAt' "$C126" && grep -q '"1450"' "$C126" ||
+	fail126 "尾盘强制配平时刻的出厂默认 1450 缺失（机动仓不隔夜靠它）"
+CNT126=$((CNT126 + 4))
+
+# —— ② 编排面 7 道：两腿串行 / 绝不整笔清仓 / 留一手 / 不烧槽 / 跨日收摊 / 到点判定 / 收摊留痕 ——
+PAIR126=$(grep -n 'e.pairTRoundLocked(code' "$T126" | head -1 | cut -d: -f1 || true)
+OPEN126=$(grep -n 'e.openTRoundsLocked(quotes' "$T126" | head -1 | cut -d: -f1 || true)
+[ -n "$PAIR126" ] && [ -n "$OPEN126" ] && [ "$PAIR126" -lt "$OPEN126" ] ||
+	fail126 "配对必须先于开新腿（pair@${PAIR126:-?} open@${OPEN126:-?}）：反序会让两条腿在同一轮里重叠＝踩对敲口径"
+# 只看**代码行**（排除注释）：本文件的注释里大量引用这两个标识符来说明"为什么不用它们"，
+# 按全文计数会把解释文字当成违规——那类恒红锁比没有锁更糟（会被当成噪声关掉）。
+ALL126=$(grep -E 'sellAllLocked' "$T126" | grep -vE '^[[:space:]]*//' | wc -l | tr -d ' ' || true)
+[ "${ALL126:-0}" = "0" ] ||
+	fail126 "做 T 编排里出现 sellAllLocked 调用（代码行 ${ALL126} 处）：清仓会删持仓+记冷却，买回腿当场被自家闸门挡死"
+grep -q 'layers.BaseQty - tRMinBaseKeep' "$T126" ||
+	fail126 "反 T 卖量上界缺「留一手底仓」：卖光会让持仓变僵尸行或走清仓分支"
+TRIM126=$(grep -E 'trimDone' "$T126" | grep -vE '^[[:space:]]*//' | wc -l | tr -d ' ' || true)
+[ "${TRIM126:-0}" = "0" ] ||
+	fail126 "做 T 编排里出现 trimDone（代码行 ${TRIM126} 处）：一次做 T 会吞掉当日真正的退出裁决"
+grep -q 'func (e \*Engine) rollTRoundsLocked' "$T126" ||
+	fail126 "缺跨日收摊 rollTRoundsLocked：昨日开腿会静默变成隔夜仓位/隔夜减仓"
+grep -q 'func (e \*Engine) tForceReached' "$T126" ||
+	fail126 "缺尾盘到点判定 tForceReached：强制配平永远不会触发"
+UNW126=$(grep -c 'tRStateUnwound' "$T126" || true)
+[ "${UNW126:-0}" -ge 4 ] ||
+	fail126 "收摊档写入点不足（got ${UNW126}）：半态必须显式留痕，不许静默丢弃"
+CNT126=$((CNT126 + 7))
+
+# —— ③ 驱动面 3 道：会话时段闸 + 两条纸面估值路径都挂上 ——
+grep -q 'data.IsActiveSession' "$D126" ||
+	fail126 "engine 侧驱动缺 IsActiveSession：集合竞价/盘后做 T 只是纸面自我安慰"
+grep -q 'e.runIntradayT(uid, pe, quotes)' internal/engine/registry.go ||
+	fail126 "共享引擎路径没挂做 T 钩子（registry.dispatchPaperMark）"
+grep -q 'e.runIntradayT(e.primaryMember(), pe, quotes)' internal/engine/engine.go ||
+	fail126 "单机回退路径没挂做 T 钩子：两套部署形态会行为分叉"
+CNT126=$((CNT126 + 3))
+
+# —— ④ 回填面 4 道：三本账各一处 + 启动装配一处（切硬前必须把存量补上） ——
+grep -q 'p.AnchorPrice = p.CostPrice' "$P126" ||
+	fail126 "模拟盘账本缺存量锚点回填（W3 切硬后这批持仓会永远走回落成本）"
+grep -q 'l.AnchorPrice = l.EntryPrice' "$R126" ||
+	fail126 "持仓账（ExecLog）缺存量锚点回填：退出引擎读的就是这本账"
+grep -q 'SET anchor_price = cost_price' "$S126" ||
+	fail126 "实盘账本缺存量锚点回填 SQL"
+grep -q 'BackfillRealPositionAnchors()' "$M126" ||
+	fail126 "启动装配没调实盘锚点回填：函数写了但没人调＝死代码"
+CNT126=$((CNT126 + 4))
+
+# —— ⑤ 行为腿：4 组真跑，条数与源码派生对拍（少跑＝-run 没覆盖新增用例） ——
+W126=$(mktemp -d "${TMPDIR:-/tmp}/gate126.XXXXXX") || fail126 "行为腿工作目录建不起来"
+LEG126_TOTAL=0
+for spec126 in \
+	"internal/paper:TestTRound" \
+	"internal/paper:TestBackfillAnchorsLegacyPaper" \
+	"internal/report:TestBackfillAnchorsLegacyReport" \
+	"internal/store:TestBackfillRealPositionAnchorsLegacy"; do
+	D126D=${spec126%%:*}
+	PAT126=${spec126#*:}
+	LOG126="$W126/$(printf '%s' "$D126D" | tr '/' '_').log"
+	WANT126=$(grep -hE "^func ${PAT126}" "$D126D"/*_test.go 2>/dev/null | wc -l | tr -d ' ' || true)
+	[ "${WANT126:-0}" -ge 1 ] ||
+		{ rm -rf "$W126"; fail126 "$D126D 一条本批用例都没有（派生期望 0＝判据没射程，不是全绿）"; }
+	if ! go test -v -run "$PAT126" "./$D126D/" -count=1 >"$LOG126" 2>&1; then
+		tail -20 "$LOG126"
+		rm -rf "$W126"
+		fail126 "$D126D 行为腿非零退出（上面贴出末 20 行归因）"
+	fi
+	GOT126=$(grep -c '^--- PASS' "$LOG126" || true)
+	BAD126=$(grep -c '^--- FAIL' "$LOG126" || true)
+	[ "${BAD126:-0}" = "0" ] || { tail -20 "$LOG126"; rm -rf "$W126"; fail126 "$D126D 用例 FAIL=${BAD126}"; }
+	[ "${GOT126:-0}" = "${WANT126}" ] || {
+		rm -rf "$W126"
+		fail126 "$D126D 跑到的条数与源码派生不符（PASS=${GOT126} 应有=${WANT126}）"
+	}
+	LEG126_TOTAL=$((LEG126_TOTAL + GOT126))
+done
+rm -rf "$W126"
+CNT126=$((CNT126 + 4))
+
+# —— ⑥ 反证 3 枚：三种"看起来实现了、其实改错方向"的坏形态，上面的判据必须抓得住 ——
+W126M=$(mktemp -d "${TMPDIR:-/tmp}/gate126m.XXXXXX") || fail126 "反证工作目录建不起来"
+# 坏形态 A：反 T 卖量上界丢了"留一手"（会卖光 ⇒ 清仓分支 ⇒ 冷却挡住买回）
+printf '%s\n' 'maxSell := layers.BaseQty' 'if capQty < maxSell {' > "$W126M/fake_keep.go"
+if grep -q 'layers\.BaseQty - tRMinBaseKeep' "$W126M/fake_keep.go"; then
+	fail126 "反证不自洽：丢掉「留一手」的坏形态也满足上界判据（判据无区分度）"
+fi
+# 坏形态 B：做 T 的腿走整笔清仓（生命周期被关、冷却被记）
+printf '%s\n' 'sold, err := e.sellAllLocked(pos, price, need)' > "$W126M/fake_allsell.go"
+grep -q 'sellAllLocked' "$W126M/fake_allsell.go" ||
+	fail126 "反证失效：整笔清仓的坏形态没被 sellAllLocked 判据抓到"
+# 坏形态 C：做 T 顺手烧了当日减仓槽（会吞掉真正的退出裁决）
+printf '%s\n' 'e.trimDone[pos.Code] = day' > "$W126M/fake_trim.go"
+grep -q 'trimDone' "$W126M/fake_trim.go" ||
+	fail126 "反证失效：烧槽的坏形态没被 trimDone 判据抓到"
+rm -rf "$W126M"
+CNT126=$((CNT126 + 3))
+
+echo "ok - §126 §T-MODE + W3 回填锁通过（配置面 4 道 + 编排面 7 道 + 驱动面 3 道 + 回填面 4 道 + 行为腿 4 组共 ${LEG126_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT126}）"
 
 echo "==> 全部通过"

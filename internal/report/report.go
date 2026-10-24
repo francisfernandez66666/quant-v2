@@ -841,5 +841,41 @@ func (r *Report) Load() {
 		log.Printf("[report] 解析失败: %v", err)
 		return
 	}
+	// §ANCHOR-FIRST W3 存量锚点回填（持仓账侧）：W2 之前落盘的记录 AnchorPrice=0，切硬后
+	// `AnchorOrCost` 会回落成本 ⇒ 这批记录的风险线永远走成本口径，与新建仓的锚点口径并存两套分母。
+	// 回填口径与 paper 侧一致：用**含费入场价**（EntryPrice）当锚点，语义是"切硬对存量零位移"；
+	// 不用成交历史去凑"真正的首买价"——那份历史可能已被保留期裁掉，凑出来的数会被当成事实判线。
+	// English: W3 anchor backfill for the holding book — legacy rows get the fee-inclusive entry price as
+	// their anchor so the hard cutover moves no existing risk line.
+	if n := r.BackfillAnchors(); n > 0 {
+		r.save()
+	}
 	log.Printf("[report] 已加载 %d 条持仓记录", len(r.logs))
+}
+
+// BackfillAnchors §ANCHOR-FIRST W3 存量锚点回填：给 AnchorPrice≤0 且有入场价的记录补上锚点，
+// 返回回填条数。幂等（补过的不再动）；EntryPrice≤0 的记录跳过——写 0 等于没写，读侧照样回落。
+//
+// 为什么锚点取 EntryPrice 而不是"翻成交历史找首买价"：EntryPrice 在 W2 之前就是**含费入场价**，
+// 与新建仓的锚点口径同源；而成交历史（Lots）会被 normalizeLots 合成单批、也可能早已被清理，
+// 拿它反推会造出一个"看起来像首买价、其实是某天均价"的数，落库后无法与真锚点区分。
+// English: idempotent W3 backfill; the anchor is the fee-inclusive entry price (same source as newly
+// opened positions), never a reconstruction from the possibly-collapsed lot history.
+func (r *Report) BackfillAnchors() int {
+	filled := 0
+	for i := range r.logs {
+		l := &r.logs[i]
+		if l.AnchorPrice > 0 || l.EntryPrice <= 0 {
+			continue
+		}
+		l.AnchorPrice = l.EntryPrice
+		if l.AnchorAt.IsZero() {
+			l.AnchorAt = l.EntryAt
+		}
+		filled++
+	}
+	if filled > 0 {
+		log.Printf("[report] §ANCHOR-FIRST W3 存量锚点回填：%d 条（按含费入场价，切硬零位移）", filled)
+	}
+	return filled
 }

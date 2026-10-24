@@ -56,7 +56,26 @@ func Open(dbPath string) (*DB, error) {
 	// WAL 提升并发读写吞吐。English: busy_timeout avoids "database is locked" across the
 	// dataload/backtest processes; WAL boosts concurrent read/write throughput.
 	// §W4-c journal_size_limit：WAL 收尾后自动截断到 64MB，防夜间大批量装载后 -wal 滞留膨胀
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(67108864)")
+	dsn := dbPath + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(67108864)"
+	// §TEST-JOURNAL（2026-10-24 本机实录，测试缝）：沙箱/安全中心策略把**一切 file-delete** 拦掉时，
+	// WAL 的 -wal/-shm 文件删不掉 ⇒ 任何 SQLite 写操作都报 `disk I/O error`（10 / 扩展码 2570），
+	// 连系统 `sqlite3` CLI 执行 `create table` 都同样失败——是文件系统策略问题，不是 Go 侧缺陷。
+	// 现场判据：stderr 里出现 `delete …/xxx.db-journal (rule: …)` 就是这一族。
+	// 处置：显式设置 `QT_SQLITE_JOURNAL_MODE=MEMORY|OFF` 时改用不落 journal 文件的模式（这两档
+	// 不产生额外文件，因而没有删除动作）。**只接受这两个值**，其余一律忽略并保持 WAL——
+	// 防止有人拿它当"随便调 journal"的旋钮。生产环境不设该变量，行为与改前逐字相同。
+	// 代价（写清楚，别当免费午餐）：MEMORY/OFF 下进程崩溃会丢掉未提交事务的原子性保证，
+	// 只适合测试与一次性脚本，绝不能用于带真实持仓的运行实例。
+	// English: §TEST-JOURNAL — when the sandbox forbids every file-delete, WAL's -wal/-shm cannot be
+	// removed and *any* SQLite write fails with disk I/O error (also reproduced with the system
+	// `sqlite3` CLI, so it is a filesystem-policy problem, not a Go bug). Setting
+	// QT_SQLITE_JOURNAL_MODE=MEMORY|OFF switches to a mode that writes no journal file. Only those two
+	// values are honoured; unset (production) keeps WAL byte-for-byte. MEMORY/OFF trades away
+	// crash-atomicity — test/one-shot use only.
+	if jm := strings.ToLower(strings.TrimSpace(os.Getenv("QT_SQLITE_JOURNAL_MODE"))); jm == "memory" || jm == "off" {
+		dsn = dbPath + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(" + strings.ToUpper(jm) + ")"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store open %s: %v", dbPath, err)
 	}

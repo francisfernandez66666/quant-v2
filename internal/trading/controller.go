@@ -561,6 +561,24 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	}
 	if v := c.gate.CheckLiveOrder(cfg, lo); !v.Pass {
 		return nil, fmt.Errorf("%s", v.Reason)
+	} else if v.ClampQty > 0 {
+		// §T1-PARTIAL-W5 减量放行落地：闸门只说"最多能卖这么多"，改量必须在这里做——
+		// 不在这里改就等于闸判了不执行（§WS-C 的假放行族）。三个字段要同步：
+		//   ① req.Qty：后续占位行、幂等键、成交回报全靠它；
+		//   ② req.Amount：按原单价等比缩放（原值为 0 说明调用方没给金额，保持 0 由下游算）；
+		//   ③ lo.Qty：本函数后面还有闸读 lo，不留旧值会让后面的闸按旧量判（比原量更大＝更严，
+		//      但那会让"已钳位"的读数与真实下单量对不上，排障时看不出到底报了多少）。
+		// English: §T1-PARTIAL-W5 — the gate only reports the cap; rewriting the qty has to happen
+		// here, otherwise the clamp is a no-op (the §WS-C "gate passed but executor ignored it" family).
+		origQty := req.Qty
+		req.Qty = v.ClampQty
+		if req.Amount > 0 && origQty > 0 {
+			req.Amount = req.Amount / float64(origQty) * float64(v.ClampQty)
+		}
+		lo.Qty = req.Qty
+		lo.Amount = req.Amount
+		log.Printf("[qmt] §T1-PARTIAL-W5 减量放行 %s 请求 %d 股 → 实报 %d 股（%s）",
+			req.Code, origQty, req.Qty, v.Reason)
 	}
 
 	// 幂等：同一 signal_id 不重复下单。
@@ -653,6 +671,11 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// §DAILY_OPSLOG 下单受理（网关已收单）——含策略归因与金额口径
 	opslog.Logf("quant", "下单受理 %s %s %s qty=%d price=%.2f amount=%.0f 策略=%s/%s order=%s",
 		req.SignalID, req.Side, req.Code, req.Qty, req.Price, req.Amount, req.StrategyID, req.Strategy, res.OrderID)
+	// §T1-PARTIAL-W5 回填实际报出量：req.Qty 此时已是风控钳位后的值（未钳位时等于原请求量），
+	// 调用方靠它分辨"要求卖的量"与"真正报出去的量"，进而决定残量要不要另记一笔。
+	if res != nil {
+		res.PlacedQty = req.Qty
+	}
 	return res, nil
 }
 

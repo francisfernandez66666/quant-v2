@@ -1245,6 +1245,13 @@ func (e *Engine) paperSignalPolicy(uid string) signalctl.Policy {
 		e.mu.RUnlock()
 	}
 	if cm := e.cfgMgr; cm != nil {
+		// §ANCHOR-FIRST-W3：纸面通道与实盘通道共用同一个账号级开关（`anchor_hard`）。
+		// 为什么不给 paper 单开一个键：锚点口径是"风险线按哪个价算"，与账本类型无关；
+		// 两本账各持一个开关必然出现"实盘按锚、纸面按成本"，同一个策略在两个账上给出
+		// 不同的卖出裁决，对照表当场失去意义。
+		if qc := cm.GetQMTConfigFor(uid); qc != nil {
+			pol.AnchorHard = qc.AnchorHardEnabled()
+		}
 		if rules := cm.GetRulesFor(uid); rules != nil {
 			pol.Strategies = rules.Paper.Strategies
 			pol.CodeBlacklist = rules.Paper.Blacklist
@@ -2210,6 +2217,15 @@ func (e *Engine) paperMark(quotes map[string]*data.StockInfo) {
 		// so a held position never displays 0.00 / -100%.
 		pe.MarkToMarket(backfillPaperQuotes(e, pe, quotes))
 		pe.Snapshot(time.Now())
+		// §T1-PARTIAL：单机回退账本同样每轮拨一次残量退出（钩子说明见 registry.dispatchPaperMark）。
+		// English: the single-engine fallback book gets the same per-round residual-exit hook.
+		pe.RunPendingExits(quotes)
+		// §T-MODE：单机回退账本同样每轮拨一次做 T（与共享引擎路径同口径，避免两套部署形态行为分叉）。
+		// 账号取主账号：单机回退账本本就是"没有多租户分发时的默认账本"，它只服务一个身份，
+		// 配置也只会从那个身份读（与 sell_shadow 的 report 分组回退同口径）。
+		// English: same per-round T-round hook for the single-engine fallback deployment; the account is
+		// the primary member, since that book only ever serves one identity.
+		e.runIntradayT(e.primaryMember(), pe, quotes)
 	}
 }
 
@@ -7097,6 +7113,10 @@ func (e *Engine) riskPoolShadowReadout() {
 	e.riskPoolReadoutDay = today
 	e.mu.Unlock()
 
+	// 读数的"可用性"与"数值"分开记：取数失败时数值留 0、来源标 unavailable，
+	// 这样影子对照表能区分"今天真的 0 只跌停"与"今天没取到数"——两者对风控档位的含义完全相反。
+	// English: availability is tracked separately from the value, so the shadow table can tell
+	// "genuinely zero limit-downs" from "the read failed" — opposite meanings for the risk tier.
 	downN, downSrc := 0, ""
 	if dErr != nil {
 		downSrc = "unavailable"

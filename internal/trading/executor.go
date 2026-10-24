@@ -72,6 +72,12 @@ type OrderResult struct {
 	OK      bool   `json:"ok"`            // 是否受理成功
 	OrderID string `json:"order_id"`      // 网关委托单号
 	Err     string `json:"err,omitempty"` // 错误信息
+	// PlacedQty §T1-PARTIAL-W5 实际报出的股数（风控减量放行后由 controller 回填）。
+	// 为什么要单独一个字段：请求量与报出量在减量档下会不同，调用方（自动卖出腿）必须能分辨
+	// "我要求卖 1000、实际只报了 600"，否则会把残量当成交、把减仓槽烧掉（Q7 的残量槽问题）。
+	// 0 表示未经过 controller 的钳位回填（老调用方/直连 executor 的路径）。
+	// English: §T1-PARTIAL-W5 — the qty actually sent to the broker after risk clamping (0 = not filled in).
+	PlacedQty int `json:"placed_qty,omitempty"`
 }
 
 // GatewayState 网关状态快照（/state）。

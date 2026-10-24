@@ -89,6 +89,12 @@ type Verdict struct {
 	Alert string `json:"alert,omitempty"` // 非空=触发上层告警的标题
 	// Blocked 是否被彻底阻断（不进入后续下单流程；与 Action=block 同义）。
 	Blocked bool `json:"blocked"`
+	// ClampQty §T1-PARTIAL-W5 减量放行时**允许报出的股数**（0=不钳位，按原请求量下单）。
+	// 只有 Pass=true 且 ClampQty>0 才有意义：调用方必须把下单量改成这个值，否则闸门等于没生效
+	// （这正是 §WS-C 要防的"闸判了但执行层不认"）。它不改 Action/Reason 语义，仍是一次放行。
+	// English: §T1-PARTIAL-W5 — the share count actually allowed through (0 = no clamping). Only
+	// meaningful with Pass=true; the caller MUST replace the order qty with it.
+	ClampQty int `json:"clamp_qty,omitempty"`
 }
 
 // Gate 下单风控闸：依赖本地账本（store）与归属账号，产出阻断裁定并记录命中。
@@ -200,15 +206,25 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 	// run 返回非空字符串即视为命中并携带原因。共 12 道闸（§XCHECK 2026-09-22 C批 新增第 12 道
 	// price_cross_check）：其中 st/blacklist/t1_sellable/buy_discipline/whitelist/max_positions
 	// 为存量守卫（不告警），其余为新增机构闸（命中高优告警）。
+	// §T1-PARTIAL-W5 钳位量出口：checks 表里每道闸的 run 只返回拒单原因（签名统一），
+	// 减量档需要额外把"允许股数"带出循环，所以用本函数的局部变量承接——CheckLiveOrder 是
+	// 单次调用单 goroutine 的纯判据，不放 Gate 字段上（放字段＝并发下会串单）。
+	clampQty := 0
 	checks := []struct {
 		gate  string
 		alert bool
 		run   func() string
 	}{
-		{"st", false, func() string { return g.checkST(o) }},                                // ST/退市股禁买
-		{"blacklist", false, func() string { return g.checkBlacklist(cfg, o) }},             // 个股黑名单禁买
-		{"max_order_amount", true, func() string { return g.checkMaxOrderAmount(cfg, o) }},  // 单笔金额绝对帽
-		{"t1_sellable", false, func() string { return g.checkT1Sellable(cfg, o) }},          // T+1 可卖量（含在途卖单）
+		{"st", false, func() string { return g.checkST(o) }},                               // ST/退市股禁买
+		{"blacklist", false, func() string { return g.checkBlacklist(cfg, o) }},            // 个股黑名单禁买
+		{"max_order_amount", true, func() string { return g.checkMaxOrderAmount(cfg, o) }}, // 单笔金额绝对帽
+		{"t1_sellable", false, func() string { // T+1 可卖量（含在途卖单）
+			reason, clamp := g.checkT1Sellable(cfg, o)
+			if reason == "" && clamp > 0 {
+				clampQty = clamp
+			}
+			return reason
+		}},
 		{"limit_up_down", true, func() string { return g.checkLimitPrice(cfg, o) }},         // 涨停不可追买/跌停不可追卖
 		{"stale_quote", true, func() string { return g.checkStaleQuote(cfg, o) }},           // 行情新鲜度硬闸
 		{"price_cross_check", true, func() string { return g.checkPriceCross(cfg, o) }},     // §XCHECK 价格复核闸（数据类闸与上闸聚拢）
@@ -226,7 +242,16 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 			return g.verdict(c.gate, reason, c.alert)
 		}
 	}
-	// 全部闸口通过 → 放行。
+	// 全部闸口通过 → 放行。§T1-PARTIAL-W5：若 T+1 闸把本单钳过，必须把钳位量一并交回，
+	// 由 controller 改写下单量（否则就是"闸说能卖、执行层照原量报出"的假放行）。
+	if clampQty > 0 {
+		return &Verdict{
+			Pass:     true,
+			Action:   "pass",
+			Reason:   fmt.Sprintf("风控通过（T+1 减量放行：本单按 %d 股报出）", clampQty),
+			ClampQty: clampQty,
+		}
+	}
 	return &Verdict{Pass: true, Action: "pass", Reason: "风控通过"}
 }
 
@@ -320,10 +345,22 @@ func (g *Gate) checkBlacklist(cfg config.QMTConfig, o LiveOrder) string {
 // The local estimate keeps the §UAT-D4 open-sell deduction because a broker snapshot cannot
 // see orders accepted after it was taken; when the counter value is absent, behavior is
 // exactly as before (local only).
-func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
-	// 仅卖出方向且开关启用且账本可用时才检查；其余情况跳过。
+//
+// §T1-PARTIAL-W5（2026-10-24 owner 裁决 Q7）返回值扩成 (拒单原因, 允许股数) 双通道：
+//   - 拒单档（默认，`t1_clamp_qty` 未开）：请求量 > 可卖量 ⇒ 返回原因、允许股数 0，语义与改前逐字相同。
+//   - 减量档（显式开）：请求量 > 可卖量且可卖量 > 0 ⇒ **放行**，返回空原因 + 可卖量，由调用方把下单量
+//     改成这个数。为什么不是"闸内改量"：Gate 是纯判据层，不持有委托对象；改量必须在 controller
+//     的 placeOrder 里落，否则会出现"闸说放行、执行层仍按原量报出"的假放行（§WS-C 的失效族）。
+//   - 可卖量为 0 时**两档都拒**：钳到 0 股不是放行，是一张必被柜台打回的零股委托。
+//
+// English: returns (block reason, allowed qty). Default keeps the legacy whole-order rejection;
+// with `t1_clamp_qty` on, an oversized sell is clamped to the sellable slice (reason empty) and the
+// caller must rewrite the order qty — a gate that "passes" without the executor honouring the clamp
+// is exactly the §WS-C failure family. sellable==0 rejects in both modes.
+func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) {
+	// 仅卖出方向且开关启用且账本可用时才检查；其余情况跳过（不钳位）。
 	if o.Side != SideSell || !cfg.EnforceT1Enabled() || g.st == nil {
-		return ""
+		return "", 0
 	}
 	// 未知仓位 fail-open：本地查不到该持仓行时跳过校验，交由券商柜台终裁（不拦合法退出）。
 	if p, perr := g.st.RealPositionByCodeForUser(g.userID, o.Code); perr == nil && p.Qty > 0 {
@@ -364,13 +401,28 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 				}
 			}
 		}
-		// 请求量超过可卖量 → 拒单（先到者占额度，后到者在网关侧被拦）。
+		// 请求量超过可卖量：按档位处置（先到者占额度，后到者在网关侧被拦）。
+		// §T1-PARTIAL-W5：可卖量 > 0 且显式开了减量档 ⇒ 放行可卖的那一截；否则维持整单拒。
 		if o.Qty > sellable {
+			if cfg.T1ClampEnabled() && sellable > 0 {
+				// 减量放行留痕：这是"闸门改了执行量"的一次真实资损向决定，必须能从日志与
+				// risk_gates 两处回看到"哪一单被砍到多少"，否则事后无法解释"为什么只卖了一半"。
+				reason := fmt.Sprintf("T+1 减量放行: 可卖 %d < 请求 %d，本单按 %d 股报出（%s；持仓 %d, 当日买入 %d, 在途卖 %d）",
+					sellable, o.Qty, sellable, basis, p.Qty, bought, openSell)
+				log.Printf("[risk] §T1-PARTIAL-W5 %s %s %s", g.userID, o.Code, reason)
+				if g.st != nil {
+					_ = g.st.RecordRiskGate(g.userID, g.today(), "t1_sellable_clamped", reason)
+				}
+				if g.onGate != nil {
+					g.onGate("warn", "T+1 可卖量减量放行", reason)
+				}
+				return "", sellable
+			}
 			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %d < 请求 %d（%s；持仓 %d, 当日买入 %d, 在途卖 %d）",
-				sellable, o.Qty, basis, p.Qty, bought, openSell)
+				sellable, o.Qty, basis, p.Qty, bought, openSell), 0
 		}
 	}
-	return ""
+	return "", 0
 }
 
 // checkMaxOrderAmount 单笔委托金额绝对帽（默认关，阈值 0=放行一切）：本单金额（装配缺失时

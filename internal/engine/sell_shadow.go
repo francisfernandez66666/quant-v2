@@ -105,7 +105,10 @@ func (e *Engine) runSellUnifiedJudge(
 	// §DYN-SIZE P2：注入市场环境快照——卖出加权（情绪退潮/风险档/大盘≤-2%/节前/连续止损/宏观影响期）
 	// 从这里解析。未启用（出厂默认）时 ComputeSellBoost 立即返回 ""，裁决与改造前逐字一致。
 	// 与 paper 通道同源同值（方案 §5「通道一致」测试锁）。
-	pol := signalctl.Policy{Discipline: ctl.Config().Discipline, Regime: e.regimeForAccount(account)}
+	// §ANCHOR-FIRST-W3：AnchorHard 与 Discipline 同源取自本轮配置快照——一处收口，
+	// 三通道（live/paper/report）要么全按锚点判线、要么全按成本判线，不会半切硬。
+	pol := signalctl.Policy{Discipline: ctl.Config().Discipline, Regime: e.regimeForAccount(account),
+		AnchorHard: ctl.Config().AnchorHardEnabled()}
 	verdicts := e.judgeSellPositions(signalctl.ChannelLive, account, "live", rows, pol, feed, orDefault(mode, "shadow"))
 	// 状态生命周期与持仓对齐（平仓即删，重新入场从零开始）。
 	held := make(map[string]bool, len(positions))
@@ -204,8 +207,10 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account, book string, 
 			EntryPrice: row.EntryPrice,
 			HighPrice:  row.HighPrice,
 			CurPrice:   price,
-			// §ANCHOR-FIRST W2：随行锚点只供影子对照；sellProbe 不读它，本轮资金行为零变化。
+			// §ANCHOR-FIRST W2：随行锚点只供影子对照；W3 起由 pol.AnchorHard 决定它是否参与判线。
 			AnchorPrice: row.AnchorPrice,
+			// §ANCHOR-FIRST-W3：基准选择从轮首 Policy 快照带进来（四处装配共用这一处出口）。
+			UseAnchor: pol.AnchorHard,
 		}
 		// 做多信号（延持唯一资格源，语义②）：带打分轮次时间戳（边界⑥）。
 		// §H5（2026-09-22 修复批）产分时刻优先取信号自身 UpdatedAt（combat_agent 打分链路

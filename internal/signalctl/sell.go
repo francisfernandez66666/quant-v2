@@ -112,6 +112,15 @@ type SellInput struct {
 	// English: §ANCHOR-FIRST first-buy anchor. In W2 nothing in sellProbe reads it — the only
 	// consumer is the CompareAnchor shadow table. Deliberately not a rename of EntryPrice (diluted cost).
 	AnchorPrice float64
+	// UseAnchor §ANCHOR-FIRST-W3 风险线基准选择：true＝本笔按 AnchorPrice 判线（锚点未知时回落
+	// EntryPrice）；false/nil＝按 EntryPrice（摊薄成本）判线，即 W2 及以前的全部行为。
+	// 为什么是入参而不是在 sellProbe 里读配置：sellProbe 是 100% 可单测的纯函数、不读全局
+	// （文件头纪律），开关只能由装配层翻译成入参带进来——这也让"同一笔输入只差开关"成为
+	// 一条可写的等值锁（`TestSellProbeAnchorSwitch`）。
+	// English: §ANCHOR-FIRST-W3 — true judges this position against the anchor (falling back to cost
+	// when unknown); false keeps the diluted-cost basis. Injected by the assembly layer because
+	// sellProbe is a pure function that never reads global config.
+	UseAnchor bool
 }
 
 // SellDisposal 处置单（仅 pass 裁定产生）：Action=close 全平 / trim 半平。
@@ -385,17 +394,26 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	if in.EntryPrice <= 0 || in.CurPrice <= 0 {
 		return st, nil, "" // 无有效成本/现价不下结论（停牌/行情缺失，状态保留）
 	}
+	// §ANCHOR-FIRST-W3 基准价：开关打开且锚点有效时用锚点，否则一律回落摊薄成本。
+	// 三处消费点（高水初始值、盈亏%、移动止盈资格）共用这一个 basis，避免"改了两处漏一处"
+	// 那种半切硬形态——半切硬比不切硬更危险：读数会同时反映两套口径，没人能解释线位为什么动了。
+	// English: §ANCHOR-FIRST-W3 — one basis for all three consumers (high-water seed, pnl%, trailing
+	// eligibility); a half-switched basis is worse than no switch because readings mix two rulers.
+	basis := in.EntryPrice
+	if in.UseAnchor && in.AnchorPrice > 0 {
+		basis = in.AnchorPrice
+	}
 	if st == nil {
 		high := in.HighPrice
 		if high <= 0 {
-			high = in.EntryPrice
+			high = basis
 		}
 		st = &sellState{HighPrice: high}
 	}
 	if in.CurPrice > st.HighPrice {
 		st.HighPrice = in.CurPrice
 	}
-	pnl := (in.CurPrice - in.EntryPrice) / in.EntryPrice * 100
+	pnl := (in.CurPrice - basis) / basis * 100
 	bullLive := in.bullLive(now, p)
 	evi := evidenceSuffix(in.Evidence)
 
@@ -448,7 +466,9 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 			line = SellLineTrail
 		}
 	}
-	if line == SellLineNone && st.Line == SellLineNone && st.HighPrice > in.EntryPrice &&
+	// §ANCHOR-FIRST-W3：移动止盈的"已有利润"判据同样换 basis——这里是第四条消费点。
+	// 漏掉它就会出现"止损线按锚点、移动止盈资格按成本"的混口径（方案 §4.2-4 明令整批换）。
+	if line == SellLineNone && st.Line == SellLineNone && st.HighPrice > basis &&
 		(st.HighPrice-in.CurPrice)/st.HighPrice*100 >= p.pb {
 		line = SellLineTrail // 已有利润、回撤超阈值 → 移动止盈（洗盘过滤窗更长）
 	}

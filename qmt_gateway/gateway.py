@@ -1138,7 +1138,9 @@ class Gateway:
                 synced = req.get("synced")
                 data_ts = req.get("data_ts")
                 self.store.bridge_snapshot_set("positions", poss)
-                # v3: pass bridge freshness through untouched (None = legacy bridge).
+                # v3：把桥侧的"新鲜度"原样透传（None＝旧版桥没带这两个键，下游按未知处理，
+                # 绝不把"没带"当成"是新鲜的"）。English: pass bridge freshness through untouched
+                # (None = legacy bridge that doesn't carry these keys; never read as "fresh").
                 self.handler.on_positions(poss, synced=synced, data_ts=data_ts)
                 return 200, {"ok": True, "err": ""}
             if etype == "account":

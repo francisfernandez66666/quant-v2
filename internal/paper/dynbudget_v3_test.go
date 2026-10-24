@@ -77,10 +77,10 @@ func TestPaperDynamicManualSellClosesAll(t *testing.T) {
 	if err := pe.Buy("600000.SH", "浦发", "龙头", 10, quotes); err != nil {
 		t.Fatalf("Buy: %v", err)
 	}
-	// T+1 是保留的合规闸：把成交日改到昨日，再验证 dynamic 手动卖出全平。
+	// T+1 是保留的合规闸：把成交日改到昨日（层账批次一并回拨），再验证 dynamic 手动卖出全平。
 	pe.mu.Lock()
 	for _, p := range pe.positions {
-		p.FilledAt = time.Now().AddDate(0, 0, -1)
+		t1Backdate(p, time.Now().AddDate(0, 0, -1))
 	}
 	pe.mu.Unlock()
 	if err := pe.Sell("600000.SH", quotes); err != nil {

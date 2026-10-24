@@ -9,6 +9,9 @@ import (
 	"testing"
 )
 
+// TestQMTRiskPatchRoundTrip 全字段补丁往返：一次写全 → 读回逐键等值 → 再写一个"只带一个键"的
+// 稀疏补丁 → 其余键必须保持原值（指针式 merge 的核心不变量，漏了就等于每次保存都清空别的配置）。
+// English: full-patch round trip then a sparse patch — untouched keys must survive.
 func TestQMTRiskPatchRoundTrip(t *testing.T) {
 	s, admin, _ := newRegimeTestServer(t)
 	body := `{
@@ -69,6 +72,8 @@ func TestQMTRiskPatchRoundTrip(t *testing.T) {
 	}
 }
 
+// containsAll 断言 s 同时包含全部 subs（用于检查 JSON 回显里几个键都在，缺一个就红）。
+// English: asserts s contains every one of subs.
 func containsAll(s string, subs ...string) bool {
 	for _, sub := range subs {
 		found := false

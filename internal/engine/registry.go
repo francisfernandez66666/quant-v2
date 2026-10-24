@@ -473,6 +473,20 @@ func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInf
 				// marked with their last daily close.
 				pe.MarkToMarket(backfillPaperQuotes(e, pe, quotes))
 				pe.Snapshot(now)
+				// §T1-PARTIAL 残量退出的执行钩子（Q6：次日**无条件**补卖，与信号到达无关）。不能挂在
+				// dispatchSignals 的 OnSignals 上——那条只在有信号时触发（`len(acct) > 0`），残量就会永远
+				// 挂着。这里每轮估值都拨一次；引擎内部自带同日去重（FiredDay）、缺价跳过与 3 日有效期。
+				// 价格用实时快照原样传入：不用回填收盘价成交（与自动卖出同款"无实价不误成交"纪律）。
+				// English: the residual-exit hook — it runs unconditionally every in-session round (a signal-gated
+				// hook would let residuals hang forever). Internally idempotent: same-day dedup, skips missing
+				// prices, expires after 3 trading days. Live quotes only — never fills on a backfilled close.
+				pe.RunPendingExits(quotes)
+				// §T-MODE 做 T 的执行钩子（W6/W7）：与残量退出同位置、同频率，因为两者都必须在
+				// **没有卖出信号**的轮次里也能推进（正 T 的第二腿等的是价差，不是信号）。
+				// 内部自带四道前置（账本开/自动卖出开/方向已配/预算口径 dynamic）与会话时段判定。
+				// English: the T-round hook — same place and cadence as residual exits, because both must
+				// progress in rounds with no sell signal (the pairing leg waits for a spread, not a signal).
+				e.runIntradayT(uid, pe, quotes)
 			}
 			r.checkDayClose(uid, pe, now)
 		}

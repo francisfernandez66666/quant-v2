@@ -583,6 +583,25 @@ type QMTConfig struct {
 	// English: §WS-A T+1 sell-guard switch — nil means enabled by default (A-share T+1 is universal);
 	// explicit false disables the local hard gate and falls back to the broker's rejection.
 	EnforceT1 *bool `json:"enforce_t1,omitempty"`
+	// T1ClampQty §T1-PARTIAL-W5（2026-10-24 owner 裁决 Q7）T+1 可卖量不足时的处置档位：
+	// nil/false＝**整单拒**（旧行为，保持默认）；true＝**减量放行**——按可卖量把本单钳到能卖的
+	// 那一截真实报出，残量由调用方（自动卖出腿）登记"未卖完"并按次日重试。
+	// 为什么要有开关而不是直接改语义：这是资金路径上"拒单 / 部分成交"两种截然不同的处置，
+	// 拒绝会让止损挂整天不执行（#3 要收掉的形态），减量则可能把一次完整退出拆成两天。
+	// 两种都有正当场景，所以做成可拨的双态并各自留读数，不做单边替换。
+	// English: §T1-PARTIAL-W5 — nil/false keeps the legacy whole-order rejection; true clamps the
+	// order down to the sellable slice and lets the caller park the remainder for the next session.
+	T1ClampQty *bool `json:"t1_clamp_qty,omitempty"`
+	// AnchorHard §ANCHOR-FIRST-W3（2026-10-24 裁决二切硬）风险线基准：nil/false＝按**摊薄成本**
+	// 判线（W2 及以前的全部行为）；true＝按**不可变首买价锚点**判线（`AnchorOrCost` 的读取点）。
+	// 默认关不是偷懒：切硬那一刻每条在持仓的止盈/止损线都会移动，Q10 要求 owner 先看过
+	// ≥3 个交易日的影子对照清单再签认，所以代码先就位、开关等人签字。
+	// 锚点未知（存量未回填 / 对账重建丢锚）时**一律回落成本**，绝不拿 0 当基准——
+	// 0 会让所有百分比判据除零或恒触发，比"用旧口径"危险得多。
+	// English: §ANCHOR-FIRST-W3 — nil/false keeps the diluted-cost basis (pre-W3 behaviour);
+	// true switches the risk lines to the immutable first-buy anchor. Unknown anchors fall back
+	// to cost, never to zero (zero would divide-by-zero or fire every percentage rule).
+	AnchorHard *bool `json:"anchor_hard,omitempty"`
 	// Money §WS-M 资金管理：现金缓冲 + 本地在途冻结动态占用。
 	// Money = capital buffer + dynamic local frozen-in-transit accounting (§WS-M).
 	Money MoneyMgmtConfig `json:"money,omitempty"`
@@ -911,6 +930,22 @@ func (c QMTConfig) EnforceT1Enabled() bool {
 		return true
 	}
 	return *c.EnforceT1
+}
+
+// T1ClampEnabled §T1-PARTIAL-W5 返回 T+1 可卖量不足时是否减量放行：nil/显式 false → false（整单拒，
+// 旧行为）；只有显式 true 才减量。方向与 EnforceT1Enabled 相反——那条是"制度恒真所以默认开"，
+// 这条是"两种处置都正当所以默认保守（不改变既有行为）"，要开必须显式表态。
+// English: §T1-PARTIAL-W5 — clamps only when explicitly enabled; unset/false keeps the legacy
+// whole-order rejection (opposite default of EnforceT1Enabled on purpose: this changes the money path).
+func (c QMTConfig) T1ClampEnabled() bool {
+	return c.T1ClampQty != nil && *c.T1ClampQty
+}
+
+// AnchorHardEnabled §ANCHOR-FIRST-W3 返回风险线是否已切到首买价锚点：nil/显式 false → false
+// （按摊薄成本判线，W2 及以前的行为）；只有显式 true 才切硬。默认关的理由见字段注释（Q10 签认）。
+// English: §ANCHOR-FIRST-W3 — only an explicit true switches the risk lines to the anchor basis.
+func (c QMTConfig) AnchorHardEnabled() bool {
+	return c.AnchorHard != nil && *c.AnchorHard
 }
 
 // DisciplineConfig 统一止盈止损纪律参数（探针5s扫描 + 扳机确认窗）。
@@ -1667,6 +1702,135 @@ type SizingConfig struct {
 	SLOffsetRiskBudgetKeep *bool `json:"sl_offset_risk_budget_keep,omitempty"`
 	// SellBoostLevel 卖出加权档位（L1/L2/L3，默认 L2）。
 	SellBoostLevel string `json:"sell_boost_level"`
+	// T §T-MODE 做 T（正 T / 反 T）的账号级参数（2026-10-24 owner 裁决四，施工波次 W6/W7）。
+	// 挂在本结构而不是新开键空间：做 T 的开关与预算口径强耦合（Q5 明确 legacy 档下必须禁用），
+	// 两套配置分居两个键就会出现"预算已回退 legacy、做 T 还开着"的不可表达组合。
+	// English: §T-MODE per-account T-round parameters, kept inside the sizing payload on purpose —
+	// the T switch is coupled to the budget pipeline (Q5 forbids T under legacy), so splitting them
+	// across two keys would make the illegal combination representable.
+	T TConfig `json:"t,omitempty"`
+}
+
+// TConfig §T-MODE 做 T 参数（2026-10-24 owner 裁决四）。
+//
+// 做 T 是**执行手法不是新战法**（Q12）：不注册进 strategy 枚举、不进战法白名单、不进战法统计、
+// 不进契约台账的战法面——它只作为持仓上的一种"当日回转"操作挂在模拟盘执行器里。
+// 之所以不给每个字段设出厂非零值：整块默认关（Enabled=nil），所有阈值都由访问器兜底，
+// 这样"账号从没配过"与"账号显式配成默认值"在落盘上仍可区分（与 §DYN-GLOBAL 的三态口径同源）。
+// English: §T-MODE — T is an execution technique, not a strategy (ruling Q12), so it never enters the
+// strategy enum / whitelist / statistics. The whole block defaults to off; every threshold is
+// resolved by an accessor so "never configured" stays distinguishable from "configured to default".
+type TConfig struct {
+	// Enabled 总开关：nil/false＝关（默认）；只有显式 true 才开。
+	// 默认关的理由：这是资金路径上**新增日内双向操作**（方案 3.6 的方向性风险），
+	// Q14 明确要求先只在模拟盘开、跑够交易日再谈实盘灰度。
+	// English: master switch — off unless explicitly true (new intraday two-way trading on the money path).
+	Enabled *bool `json:"enabled,omitempty"`
+	// Mode 允许的方向：""/"both"＝正反都做；"buy_first"＝只做正 T（先买后卖）；
+	// "sell_first"＝只做反 T（先卖后买）。无法识别的取值按"都不做"处理（资金路径宁可不做）。
+	// English: which directions are allowed — ""/both, buy_first, sell_first; unknown means neither.
+	Mode string `json:"mode,omitempty"`
+	// MaxRoundsPerCodePerDay 单码单日最大回转次数（默认 1）：一次回转＝两腿都成交才算。
+	// 限次是为了让手续费/滑点可控——日内回转的成本是确定支出，价差是不确定收入。
+	// English: max completed rounds per code per trading day (default 1).
+	MaxRoundsPerCodePerDay int `json:"max_rounds_per_code_per_day,omitempty"`
+	// IntradayCapPct 机动仓上限（占总持仓百分比，默认 30，沿用 paper.T0Cap 口径）。
+	// English: intraday layer cap as a percentage of the position (default 30, same as T0Cap).
+	IntradayCapPct float64 `json:"intraday_cap_pct,omitempty"`
+	// MinSpreadPct 最小价差（%，默认 1.0）：第二腿相对第一腿的**有利**变动达到该幅度才配对。
+	// 反 T 的买回腿与正 T 的卖出腿共用这一个阈值——两腿都是"把第一腿的浮盈落袋"。
+	// English: minimum favourable move (%, default 1.0) before the pairing leg fires; shared by both modes.
+	MinSpreadPct float64 `json:"min_spread_pct,omitempty"`
+	// ForceUnwindAt 尾盘强制配平时刻（HHMM，默认 "1450"）：正 T 的买腿到点仍未配对 ⇒ 卖出等量
+	// 底仓回到原仓位，绝不把机动仓留过夜（机动仓的定义就是"当日买、当日平"）。
+	// 反 T 的卖腿到点仍未买回 ⇒ 按 Q8 收摊（不追买），所以这个时刻对它只是"停止新开"的界线。
+	// English: end-of-day forced pairing time (HHMM, default 1450). An unpaired buy-first leg sells an
+	// equal base amount instead of leaving the intraday layer overnight; for sell-first it only stops
+	// new rounds (Q8 forbids chasing the buy-back).
+	ForceUnwindAt string `json:"force_unwind_at,omitempty"`
+}
+
+// T 做 T 的出厂阈值（访问器兜底用；刻意不写进 DefaultSizingConfig，理由见 TConfig 注释）。
+// English: factory thresholds used by the accessors (deliberately not materialized into defaults).
+const (
+	defaultTIntradayCapPct = 30.0
+	defaultTMinSpreadPct   = 1.0
+	defaultTMaxRounds      = 1
+	defaultTForceUnwindAt  = "1450"
+)
+
+// TEnabled 做 T 总开关是否生效：nil/显式 false → false；只有显式 true 才开。
+// English: true only when explicitly enabled.
+func (c TConfig) TEnabled() bool { return c.Enabled != nil && *c.Enabled }
+
+// TBuyFirst 是否允许正 T（先买后卖）。空串/"both" 都允许，未知取值一律不允许。
+// English: whether buy-first rounds are allowed (""/"both" yes, unknown no).
+func (c TConfig) TBuyFirst() bool {
+	switch c.Mode {
+	case "", "both", "buy_first":
+		return true
+	}
+	return false
+}
+
+// TSellFirst 是否允许反 T（先卖后买）。空串/"both" 都允许，未知取值一律不允许。
+// English: whether sell-first rounds are allowed (""/"both" yes, unknown no).
+func (c TConfig) TSellFirst() bool {
+	switch c.Mode {
+	case "", "both", "sell_first":
+		return true
+	}
+	return false
+}
+
+// TIntradayCapPct 机动仓上限百分比（≤0 回落到 30）。
+// English: intraday cap percentage, falling back to 30 when unset.
+func (c TConfig) TIntradayCapPct() float64 {
+	if c.IntradayCapPct <= 0 {
+		return defaultTIntradayCapPct
+	}
+	if c.IntradayCapPct > 100 {
+		return 100
+	}
+	return c.IntradayCapPct
+}
+
+// TMinSpreadPct 最小价差百分比（≤0 回落到 1.0）。
+// English: minimum spread percentage, falling back to 1.0 when unset.
+func (c TConfig) TMinSpreadPct() float64 {
+	if c.MinSpreadPct <= 0 {
+		return defaultTMinSpreadPct
+	}
+	return c.MinSpreadPct
+}
+
+// TMaxRounds 单码单日最大回转次数（≤0 回落到 1；硬顶 5，防止配置手滑把日内换手放大到成本失控）。
+// English: max rounds per code per day (default 1, hard-capped at 5).
+func (c TConfig) TMaxRounds() int {
+	n := c.MaxRoundsPerCodePerDay
+	if n <= 0 {
+		n = defaultTMaxRounds
+	}
+	if n > 5 {
+		n = 5
+	}
+	return n
+}
+
+// TForceUnwindHM 尾盘强制配平时刻，返回 4 位 HHMM；格式非法一律回落到 1450
+// （宁可早一点平，也不要把机动仓留过夜）。
+// English: the forced-pairing time as HHMM, falling back to 1450 on malformed input.
+func (c TConfig) TForceUnwindHM() string {
+	s := strings.TrimSpace(c.ForceUnwindAt)
+	if len(s) != 4 {
+		return defaultTForceUnwindAt
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return defaultTForceUnwindAt
+		}
+	}
+	return s
 }
 
 // sizingBool 返回布尔值的指针，供 §DYN-GLOBAL 出厂默认区分"显式开/关"与"键缺失"。

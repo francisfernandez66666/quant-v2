@@ -400,6 +400,38 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 	return n, nil
 }
 
+// BackfillRealPositionAnchors §ANCHOR-FIRST W3 存量锚点回填（幂等，可每次启动都跑）。
+//
+// 只处理 anchor_price 为空或 ≤0 且 cost_price>0 的行，把**含费摊薄成本**写成锚点。
+// 口径与 paper / report 两本账完全一致（见 paper/anchor_backfill.go 的完整论证）：
+//   - 不去翻 fills 表凑"真正的首买价"——保留期裁剪过的历史会凑出一个"像首买价、其实是某天均价"的数，
+//     而它一旦落库就会被当成事实参与判线，且再也无法与真锚点区分；
+//   - 用成本回填的语义是**切硬对这批存量持仓零位移**，这是能如实交代的最强承诺；
+//   - cost_price≤0 的行跳过（无价格信息，写 0 等于没写，读侧照样回落）。
+//
+// 返回 (本次回填行数, 仍无锚点的剩余行数)。剩余行数不为 0 时上层应记一条日志——
+// 那些行在切硬后走"回落成本"路径，属于已知且被接受的降级，但必须可见。
+// English: idempotent W3 legacy anchor backfill for the real book — same rule as the paper/report books
+// (fee-inclusive cost, never a reconstructed first-buy price). Returns (filled, remaining).
+func (d *DB) BackfillRealPositionAnchors() (filled, remaining int64, err error) {
+	if err := d.ensureAnchorPriceColumn(); err != nil {
+		return 0, 0, err
+	}
+	res, err := d.db.Exec(`UPDATE real_positions
+		SET anchor_price = cost_price
+		WHERE (anchor_price IS NULL OR anchor_price <= 0) AND cost_price > 0`)
+	if err != nil {
+		return 0, 0, err
+	}
+	filled, _ = res.RowsAffected()
+	if qerr := d.db.QueryRow(`SELECT COUNT(*) FROM real_positions
+		WHERE anchor_price IS NULL OR anchor_price <= 0`).Scan(&remaining); qerr != nil {
+		// 计数失败不影响回填本身已生效的事实，按"剩余未知=0"返回并让调用方只打回填数。
+		return filled, 0, nil
+	}
+	return filled, remaining, nil
+}
+
 // ReconcilePositionsForUser §R3-8 P1-G 用户隔离的全量对账写入（Controller.Reconcile 专用）：
 //   - 每行打 UserID 归属后 upsert；
 //   - 删除范围限定在 本账号行 ∪ 遗留全局行（user_id=”）——绝不动其他账号的 scoped 行

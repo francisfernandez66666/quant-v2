@@ -56,6 +56,9 @@ __pycache__/
 # §DYN-SIZE-v3：沙箱里系统临时目录不可写，跑 qmt_gateway 的 pytest 需把 TMPDIR 指到项目内
 # （TMPDIR=$PWD/.pytest-tmp）——该目录纯属运行期产物，不入库。
 .pytest-tmp/
+# 同上口径（go test 用 TMPDIR=$PWD/.tmp）：本机安全策略禁止删除 /tmp 下文件时，测试夹具的
+# 临时目录只能落在项目内。纯运行期产物，不入库。
+.tmp/
 
 # 本地回测工具（不入库）
 bt_jq/

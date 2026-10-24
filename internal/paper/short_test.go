@@ -158,7 +158,7 @@ func TestShortOnSignalsRoutingAndEquity(t *testing.T) {
 	e.SetStrategyPools([]string{"dragon"})
 	buy := combat_agent.Signal{Code: "300001", Name: "多", Strategy: "龙头", StrategyType: "dragon", Action: "buy", Price: 10}
 	e.OnSignals([]combat_agent.Signal{buy}, map[string]*data.StockInfo{"300001": {Price: 10}})
-	e.positions["300001"].FilledAt = e.positions["300001"].FilledAt.AddDate(0, 0, -1) // 平多受既有 T+1 守卫约束
+	t1Backdate(e.positions["300001"], e.positions["300001"].FilledAt.AddDate(0, 0, -1)) // 平多受既有 T+1 守卫约束
 	watch := combat_agent.Signal{Code: "300002", Name: "空A", Strategy: "放量破位", StrategyType: "break_down", Direction: "做空", Action: "watch", Price: 10}
 	sellHeld := combat_agent.Signal{Code: "300001", Name: "多", Strategy: "龙头断板", StrategyType: "leader_decay", Direction: "做空", Action: "sell", Price: 10}
 	equityBefore := e.cash + e.marketValueLocked() + e.shortEquityLocked()

@@ -1240,7 +1240,12 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		cfg.MaxSignalVWAPPremiumShadow = req.MaxSignalVWAPPremiumShadow
 	}
 	if p := req.RiskGate; p != nil {
+		// pct 百分比字段的统一校验闭包：nil＝本次不改（返回 true 继续），越界＝回 400 并返回 false，
+		// 合法才写进目标字段。抽成闭包是因为下面六七个字段的规则完全相同，逐个手写必漏一处校验。
+		// English: shared validator for the percentage fields — nil means "not patched", out-of-range
+		// answers 400, and only valid values are written.
 		pct := func(name string, v *float64, dst *float64) bool {
+			// nil＝本次补丁没带这个键 ⇒ 原样保留（返回 true 让调用方继续处理后面的键）。
 			if v == nil {
 				return true
 			}
@@ -1251,6 +1256,8 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 			*dst = *v
 			return true
 		}
+		// 六个百分比字段逐个校验：任一个越界就回 400 并停止（不要"改了一半"——半套配置比不改更难排查）。
+		// English: validate every percentage field first; a single out-of-range value aborts the whole patch.
 		if !pct("risk_gate.sector_value_pct", p.SectorValuePct, &cfg.RiskGate.SectorValuePct) ||
 			!pct("risk_gate.concept_value_pct", p.ConceptValuePct, &cfg.RiskGate.ConceptValuePct) ||
 			!pct("risk_gate.risk_per_trade_pct", p.RiskPerTradePct, &cfg.RiskGate.RiskPerTradePct) ||

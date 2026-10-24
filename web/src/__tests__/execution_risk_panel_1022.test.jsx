@@ -23,6 +23,8 @@ vi.mock('../ui.jsx', () => ({ showToast: () => {} }))
 
 import ExecutionRiskPanel from '../components/ExecutionRiskPanel.jsx'
 
+// 每个用例前重置三个 mock：fetchQMTConfig 回一份"全字段默认值"，updateQMTConfig 回 ok。
+// 必须重置而不是只赋值——上一用例的调用次数会累加，断言"保存时带了什么"就会串味。
 beforeEach(() => {
   mocks.updateQMTConfig.mockReset().mockResolvedValue({ status: 'ok' })
   mocks.fetchQMTConfig.mockReset().mockResolvedValue({

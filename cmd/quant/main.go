@@ -353,6 +353,22 @@ func run() int {
 		log.Printf("[research] live.db 打开失败, 实盘账本回退 trading.db: %v", liveErr)
 	}
 
+	// §ANCHOR-FIRST W3 存量锚点回填（实盘账本）：切硬前必须把 W2 之前落盘的存量持仓补上锚点，
+	// 否则 `AnchorOrCost` 对它们永远回落成本 ⇒ 同一本账里"存量走成本、新建走锚点"两套分母并存。
+	// 回填口径＝含费摊薄成本（切硬零位移），幂等，每次启动跑一遍即可；剩余无锚点的行如实点名。
+	// 位置要求：必须在 realStore 定档（live.db 优先、失败回退 trading.db）之后、控制器装配之前。
+	// English: W3 legacy anchor backfill for the real book — idempotent, runs on every boot, and must
+	// happen after realStore is resolved and before the controller is wired.
+	if realStore != nil {
+		if filled, remaining, aerr := realStore.BackfillRealPositionAnchors(); aerr != nil {
+			log.Printf("[启动] §ANCHOR-FIRST W3 锚点回填失败(忽略, 回落成本判线): %v", aerr)
+		} else if filled > 0 || remaining > 0 {
+			log.Printf("[启动] §ANCHOR-FIRST W3 锚点回填完成：回填 %d 行（按含费成本，切硬零位移），仍无锚点 %d 行（走回落成本）",
+				filled, remaining)
+			opslog.Logf("quant", "§ANCHOR-FIRST W3 实盘锚点回填：回填 %d 行，剩余无锚点 %d 行", filled, remaining)
+		}
+	}
+
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
 	notifier := notify.New()
 	// §R3-8 P1-D 补投队列持久化：进程重启后继续补投失败的止损/清仓提醒（此前纯内存即丢）。

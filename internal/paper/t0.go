@@ -4,16 +4,19 @@
 //   - 层拆分：Base 底仓（昨日及以前买入，可卖）与 Intraday 机动仓（当日买入，当日不可卖）；
 //   - 机动仓上限（默认总仓 30%，不隔夜——尾盘须平掉等价量）；
 //   - 结算：价差与成本摊薄核算。
-// 纯核算（不读 config）。§WMQ-0（20260917 缺口核证）：当前引擎/纸面账本无任何生产调用点
-// （仅本文件单测引用）——属"已设计未接线"，配置开关 Enhance.T0 尚无消费方。
-// 接线前置条件：先向柜台确认支持"当日卖旧+当日买新"申报顺序，再在 paper 卖出审计与
-// Enhance.T0 门控处接入（详见 docs/BUGFIX_WATCHLIST_20260917.md #1 决策记录）。English: base-position T+0 (P3). A-share T+1 means shares bought
-// today sellable only next day; with a base lot from prior days you can intraday-buy (intraday
-// layer) and sell an equal base amount same-day to lock in the intraday spread and lower cost.
-// Here we compute layers (base/sellable vs intraday), the intraday cap (default 30% of total,
-// never held overnight), and a settle accounting (spread & cost improvement). Pure math — gated by
-// the engine's Enhance.T0 (off by default). Confirm broker support for same-day sell-old/buy-new
-// before enabling on real books.
+// 纯核算（不读 config）。§T1-PARTIAL（2026-10-24 裁决三 W4）改变了本文件的地位：
+//   - 🆕 `LayersOfPosition`（t1_partial.go）把这份数学接进了生产——它按**批次层账**汇总底仓/机动仓，
+//     成为模拟盘两个卖出入口的可卖量判据；无层账的存量持仓仍回落本文件的整仓二值口径。
+//   - 因此 `AllocLayers` 不再是"已设计未接线"，而是**存量兼容路径 + 单测基准**。
+//   - 仍未接线的是"做 T 的编排"：机动仓上限、配平、回转结算这三件事没有调度方，配置开关
+//     Enhance.T0 依旧无消费方（方案 §4.4 第 11 行要求 W6 要么接上它、要么由新 TConfig 取代，
+//     不许留第三个 T 开关）。接线前置条件也仍挂着：先向柜台确认支持"当日卖旧+当日买新"申报
+//     顺序与两腿幂等（Q13，详见 docs/BUGFIX_WATCHLIST_20260917.md #1 决策记录）。
+// English: pure math. §T1-PARTIAL changed its status — LayersOfPosition now feeds the production sellable
+// qty from the per-batch lot ledger (this file's AllocLayers remains the legacy fallback + unit baseline),
+// so it is no longer "designed but unwired". What is still unwired is the T-round orchestration (intraday
+// cap, rebalancing, round settlement) and the Enhance.T0 switch, whose broker prerequisite (same-day
+// sell-old/buy-new ordering + two-leg idempotency, Q13) is still unconfirmed.
 
 package paper
 

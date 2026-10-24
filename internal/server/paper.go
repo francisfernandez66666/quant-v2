@@ -363,36 +363,58 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
-	// §FIX-1(20260919) 零股守卫：部分减仓留下非整手尾仓会污染后续清仓口径，与实盘零股纪律
-	// （handlers_fix.go/qmt.go 卖出守卫）对齐；qty>=持仓=清仓不拦（尾仓零股须能平掉）。
-	if req.Qty > 0 && req.Qty%100 != 0 && !strings.EqualFold(strings.TrimSpace(pe.Cfg().BudgetMode), "dynamic") {
-		for _, p := range pe.Positions() {
-			if p.Code == req.Code && req.Qty < p.Qty {
-				writeError(w, 400, "减仓数量需为 100 股整数倍（1 手 = 100 股），零股请清仓卖出")
-				return
-			}
+	// §DYN-TRIM（2026-10-24 owner 裁决）：**任何预算口径下，qty>0 都是真实减仓，不再退化成清仓**。
+	// 改前的两处坑（UAT U-2/U-4 原案）：dynamic 口径下这一支直接调 Sell() 把 qty 丢掉（点"减仓"
+	// 结果整仓清掉），而零股守卫在 dynamic 下又被跳过——于是"想减仓"既不可控也不设防。现在：
+	// qty>0 ⇒ 按股数减仓（SellEx），qty<=0 ⇒ 清仓（Sell）；零股纪律两种口径都生效。
+	// 持仓量在卖出前取一次：SellEx 会把请求量封顶到可卖量，事后再读就分不清"成交了多少"。
+	// English: §DYN-TRIM — under every budget mode a positive qty is a real partial trim (SellEx), only
+	// qty<=0 closes. The pre-fix code dropped qty entirely in dynamic mode (a "trim" click closed the
+	// whole position) and skipped the odd-lot guard there too.
+	held, sellable := 0, 0
+	for _, p := range pe.Positions() {
+		if p.Code == req.Code {
+			held = p.Qty
 		}
 	}
-	// qty>0 按股数减仓，否则整仓卖出（价格按用户输入，缺省走实时价）。
-	// §DYN-SIZE-v3：dynamic 模式下手动卖出按清仓处理，部分减仓交给后续信号/数据。
-	// English: in v3 dynamic mode manual sells always close the whole position.
-	if strings.EqualFold(strings.TrimSpace(pe.Cfg().BudgetMode), "dynamic") {
-		if err := pe.Sell(req.Code, s.liveQuotes(req.Code)); err != nil {
-			writeError(w, 400, err.Error())
-			return
-		}
-	} else if req.Qty > 0 {
-		if err := pe.SellEx(req.Code, req.Price, req.Qty, s.liveQuotes(req.Code)); err != nil {
-			writeError(w, 400, err.Error())
-			return
-		}
+	if held <= 0 {
+		writeError(w, 400, "未持有该标的")
+		return
+	}
+	sellable = pe.SellableQty(req.Code)
+	if req.Qty > 0 && req.Qty%100 != 0 && req.Qty < held {
+		writeError(w, 400, "减仓数量需为 100 股整数倍（1 手 = 100 股），零股请清仓卖出")
+		return
+	}
+	// 请求量超过持仓＝清仓形态（允许零股尾仓随仓平掉，与 §FIX-1 口径一致）。
+	trimQty := req.Qty
+	if trimQty > held {
+		trimQty = held
+	}
+	var err error
+	if req.Qty > 0 {
+		err = pe.SellEx(req.Code, req.Price, trimQty, s.liveQuotes(req.Code))
 	} else {
-		if err := pe.Sell(req.Code, s.liveQuotes(req.Code)); err != nil {
-			writeError(w, 400, err.Error())
-			return
+		err = pe.Sell(req.Code, s.liveQuotes(req.Code))
+	}
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	// 成交后重读：sold = 卖出前持仓 − 卖出后持仓（整仓清掉时为全量，不依赖 SellEx 的返回值）。
+	left := 0
+	for _, p := range pe.Positions() {
+		if p.Code == req.Code {
+			left = p.Qty
 		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true})
+	writeJSON(w, 200, map[string]interface{}{
+		"ok":        true,
+		"sold":      held - left,
+		"remaining": left,
+		// sellable 是**卖出前**的可卖量：前端据此说明"填的量为什么被截断"（T+1 锁着当日买入的批次）。
+		"sellable": sellable,
+	})
 }
 
 // handlePaperShortOpen §SHORT-4 手动融券开仓：{"code","name","strategy","price"}；price>0 用指定价，

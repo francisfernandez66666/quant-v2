@@ -123,6 +123,13 @@ type Policy struct {
 	// TechFilter §C4 买入技术过滤配置（KDJ J 上限 / 长均线）；两条都未配=关闭。
 	// English: §C4 buy-side technical filter (KDJ J cap / long MA); both unset = disabled.
 	TechFilter config.TechFilterConfig
+	// AnchorHard §ANCHOR-FIRST-W3 风险线基准：true＝三通道（live/paper/report）的判线统一改用
+	// 首买价锚点（锚点未知回落成本），false/零值＝摊薄成本（W2 及以前行为）。
+	// 放在 Policy 而不是每个 SellInput 上：装配点有四处（实盘/纸面/复盘/影子），逐处传参必漏；
+	// Policy 是每轮唯一快照，一处收口就等于"要么全切、要么全不切"，不会出现半切硬的混口径。
+	// English: §ANCHOR-FIRST-W3 — one switch on the per-round policy snapshot so all channels switch
+	// together (four assembly points would otherwise drift into a half-switched basis).
+	AnchorHard bool
 }
 
 // probeKey 持续性探针状态键：(通道, 账号, 战法键, 代码)。

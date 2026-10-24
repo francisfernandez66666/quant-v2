@@ -177,6 +177,51 @@ type Position struct {
 	// English: when the anchor was stamped (same instant as the opening fill); zero alongside
 	// AnchorPrice==0 means "not backfilled".
 	AnchorAt time.Time `json:"anchor_at,omitempty"`
+	// Lots §T1-PARTIAL（2026-10-24 裁决三）批次层账：同一交易日买到的股数合成一批。
+	// 它只回答"这批哪天买的 ⇒ 今天可卖多少"，不改任何价格口径（结算仍按 CostPrice 摊薄、
+	// 风险线仍按 AnchorPrice 冻结）。空层账＝本批之前落盘的存量持仓 ⇒ 退回旧的整仓二值判定。
+	// 为什么必须存在：旧实现一个持仓只有一个 FilledAt，且加仓从不刷新它——当日加过仓的持仓
+	// 会带着昨日底仓的日期被判"整仓可卖"（T+1 漏放），而全仓今日买入时退出裁决又被整单挡死。
+	// English: per-day buy batches, answering only "which day was this lot bought → how much is
+	// sellable today". Prices are untouched (settlement stays on the diluted CostPrice, risk lines on the
+	// frozen AnchorPrice). An empty ledger means a legacy position and falls back to the old binary rule.
+	Lots []PositionLot `json:"lots,omitempty"`
+	// Status §T1-PARTIAL 持仓的卖出状态："部分可卖"＝这条持仓此刻有一部分股卖不掉（层账里有当日批）
+	// 且另一部分能卖——由建仓/加仓/减仓三条路径按层账重算，不参与任何撮合判定。
+	// 为什么要这个字段：裁决三之后"减仓只卖掉一半"变成正常结局，用户必须能在账面上看到
+	// "为什么没卖光"，否则会被读成引擎出错。
+	// 全仓今日买入（可卖 0）刻意不打标签：那一态的读数已经在 sellable_qty=0 上，把两个维度挤进
+	// 同一个字符串，前端就无法分别显示"卖得掉多少"与"为什么卖不掉"。
+	// English: sell-side status marker — "部分可卖" only for the mixed case (part T+1-locked, part sellable).
+	// Recomputed from the lot ledger on the open/add/trim paths; never feeds an execution decision. The
+	// fully-locked case is intentionally unlabelled because sellable_qty=0 already says it.
+	Status string `json:"status,omitempty"`
+}
+
+// statusPartSellable §T1-PARTIAL 的展示态文案（唯一写入点，避免各处手打字符串漂移）。
+// English: the one status literal written by the partial-sellable path.
+const statusPartSellable = "部分可卖"
+
+// PendingExitQty 该持仓名下尚未执行完的残量退出意图股数（0＝无欠账）。
+// 语义钉死为"意图量"，不承诺与 Qty−今日批次之和相等：手动加过仓、部分卖出后都只会让意图
+// 缩量或提前作废，绝不反向虚增（虚增会把一次已经卖完的退出说成没卖完）。
+// English: outstanding residual-exit quantity for this code (0 = nothing owed). Deliberately the intent
+// quantity, not a recomputed Qty−intraday sum, so it can never overstate what is still unsold.
+func (e *Engine) PendingExitQty(code string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if pe := e.pendingExits[code]; pe != nil {
+		return pe.WantQty
+	}
+	return 0
+}
+
+// SellableQty 该代码当前可卖股数（与卖出入口同源；不在账返回 0）。
+// English: shares sellable now for a code (same source as the sell path; 0 when not held).
+func (e *Engine) SellableQty(code string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.sellableQtyLocked(e.positions[code], time.Now())
 }
 
 // AnchorOrCost 返回风险线应使用的基准价：有锚点用锚点，存量无锚点持仓回落成本价。
@@ -201,18 +246,23 @@ func (p *Position) MarketValue() float64 { return p.Mark * float64(p.Qty) }
 func (p Position) MarshalJSON() ([]byte, error) {
 	// alias 原始 Position 类型别名（避免自定义 MarshalJSON 造成无限递归）。
 	type alias Position
+	// SellableQty §T1-PARTIAL 可卖量上屏：前端"减仓"要知道今天到底能卖多少，否则用户填的量
+	// 一定被引擎封顶、看不出发生了什么。口径与卖出入口完全同源（同一个 LayersOfPosition），
+	// 不是第二把尺子。
 	return json.Marshal(&struct {
 		alias
 		Pnl         float64 `json:"pnl"`
 		PnlPct      float64 `json:"pnl_pct"`
 		SlippagePct float64 `json:"slippage_pct"`
 		LatencySec  int64   `json:"latency_sec"`
+		SellableQty int     `json:"sellable_qty"`
 	}{
 		alias:       alias(p),
 		Pnl:         p.PnL(),
 		PnlPct:      round2(p.PnLPct()),
 		SlippagePct: round2(p.SlippagePct()),
 		LatencySec:  p.LatencySec(),
+		SellableQty: LayersOfPosition(&p, time.Now()).Sellable,
 	})
 }
 
@@ -486,6 +536,12 @@ type Engine struct {
 	// trading day so repeated alerts can't keep halving the position. Full closes need no dedup (natural
 	// no-op once flat).
 	trimDone map[string]string // 当日减仓去重表（code → 交易日）
+	// pendingExits §T1-PARTIAL（裁决三 W4）残量退出意图：code → 因 T+1 没卖完的那部分。
+	// 与 trimDone 正交（3.3 要求两者互不吞并）：去重表只管"减仓信号当日还能不能再来一次"，
+	// 意图表只管"这笔退出裁决还欠多少股没卖"，次日由 RunPendingExits 无条件补卖。
+	// English: §T1-PARTIAL residual exit intents per code — orthogonal to trimDone (dedup says whether a
+	// trim signal may act again today; the intent says how much of an exit is still unsold).
+	pendingExits map[string]*PendingExit
 	// reEntry 同票清仓后再入场冷却追踪器（§R1.4，来自 paper_r12）。清仓时记录时间，
 	// 新开仓前置检查处调用 canReEnter 拦住冷却期内回马枪。nil 安全（未启用冷却时为 nil）。
 	// English: re-entry cooldown tracker (§R1.4, paper_r12). Records close time; the fill pre-check calls
@@ -510,6 +566,19 @@ type Engine struct {
 	// English: once-per-day dedup for the half-open budget warning above (probe calls OnSignals every
 	// round, so an undeduped log line would flood). No reset needed after a fix — the next day re-checks.
 	budgetWarnDay string
+
+	// tRounds §T-MODE（2026-10-24 裁决四 W6/W7）做 T 回转账：每条记录一次"两腿成对"的日内回转。
+	// 独立于 trades/orders —— trades 是成交流水（一次回转产生两条），orders 是委托生命周期留痕，
+	// 回转账回答的是第三个问题："这两条成交是不是同一次回转的两条腿、锁了多少价差"。
+	// English: §T-MODE T-round ledger — one record per two-leg intraday round. Kept apart from trades
+	// (fill stream) and orders (order lifecycle) because it answers a third question: whether two fills
+	// belong to the same round and what spread was locked.
+	tRounds []TRound
+	// tWarnDay 做 T 被预算口径挡下时的每日一次告警去重（与 budgetWarnDay 同口径，但独立计数：
+	// 两者解除条件不同——预算半开态改配置就消失，做 T 禁用还要看 Q5 的口径）。
+	// English: once-per-day dedup for the "T blocked by budget pipeline" log, tracked separately from
+	// budgetWarnDay because the two clear under different conditions.
+	tWarnDay string
 
 	// §C1 行业敞口（与实盘态同口径）：上限%、影子开关、行业查询源。默认全关/影子，
 	// 未注入时闸自然跳过，零行为变化。
@@ -708,7 +777,8 @@ func New(cfg Config, path string) *Engine {
 		extraPoolKeys:  make(map[string]bool),
 		positions:      make(map[string]*Position),
 		trimDone:       make(map[string]string),
-		reEntry:        newReEntryTracker(), // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
+		pendingExits:   make(map[string]*PendingExit), // §T1-PARTIAL 残量退出意图表（load 时按盘重建）
+		reEntry:        newReEntryTracker(),           // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
 		lastBuyReject:  make(map[string]string),
 		// §SHORT-3 做空侧初始化：shortCash 预算仅在 ShortCapital>0 时开设（默认 0=关闭）。
 		// load() 若磁盘已有做空持仓则保留恢复值不覆盖（见 paper.go load）。
@@ -914,6 +984,18 @@ type persistedState struct {
 	ShortRealized float64                   `json:"short_realized,omitempty"`
 	ShortFeeDone  map[string]string         `json:"short_fee_done,omitempty"`
 	ShortOpenSeen map[string]string         `json:"short_open_seen,omitempty"`
+	// PendingExits §T1-PARTIAL（裁决三 W4）残量退出意图表：跨重启必须保留，否则"昨日裁决欠下的
+	// 那部分卖出"会随进程重启静默消失（敞口留在仓上却再没人负责卖掉）。
+	// 旧文件无此字段 → 空表，行为与本批之前完全一致。
+	// English: residual exit intents; must survive restarts, otherwise a quit-and-restart silently drops the
+	// obligation to finish yesterday's exit. Legacy files load as an empty table.
+	PendingExits map[string]*PendingExit `json:"pending_exits,omitempty"`
+	// TRounds §T-MODE（裁决四 W6/W7）做 T 回转账：跨重启必须保留，否则"昨日已开腿、今日该配对"
+	// 的回转会在重启后凭空消失，机动仓（正 T）或已减掉的底仓（反 T）就没人负责收尾。
+	// 旧文件无此字段 → 空表，行为与本批之前完全一致。
+	// English: T-round ledger; must survive restarts, otherwise a round opened yesterday loses its
+	// obligation to pair today and the intraday layer / trimmed base silently goes unaccounted for.
+	TRounds []TRound `json:"t_rounds,omitempty"`
 }
 
 // tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
@@ -952,6 +1034,10 @@ func (e *Engine) persist() {
 		ShortRealized: e.shortRealized,
 		ShortFeeDone:  e.shortFeeDone,
 		ShortOpenSeen: e.shortOpenSeen,
+		// §T1-PARTIAL 残量退出意图随状态落盘（重启后次日仍要把欠下的那部分卖掉）
+		PendingExits: e.pendingExits,
+		// §T-MODE 做 T 回转账随状态落盘（跨重启要能继续配对/收摊）
+		TRounds: e.tRounds,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -1057,6 +1143,24 @@ func (e *Engine) load() {
 	if st.Orders != nil {
 		e.orders = st.Orders
 	}
+	// §T1-PARTIAL 恢复残量退出意图（旧数据无此字段 → 保持 New 建好的空表）。
+	// 逐条按持仓表自愈：持仓已不在账或数量已归零的意图直接丢弃，避免重启后拿一条指向空仓的
+	// 欠账去下单（runPendingExitsLocked 也有同一道守卫，这里是让它无活可派）。
+	// English: restore residual exits; intents whose position no longer exists are dropped on load so a
+	// restart never carries an obligation against a flat book.
+	if st.PendingExits != nil {
+		e.pendingExits = make(map[string]*PendingExit, len(st.PendingExits))
+		for code, pe := range st.PendingExits {
+			if pe == nil || pe.WantQty <= 0 {
+				continue
+			}
+			if p := e.positions[code]; p == nil || p.Qty <= 0 {
+				continue
+			}
+			pe.Code = code
+			e.pendingExits[code] = pe
+		}
+	}
 	// §SHORT-3 恢复做空侧：存在持久化空头/池现金时以磁盘为准覆盖 New 的预算初值
 	// （shortCash 在 New 用 cfg.ShortCapital 播种，重启后必须以实际余额恢复，防预算重置资金凭空放大）。
 	// English: §SHORT-3 — restore the short book; persisted cash overrides the New-time budget seed
@@ -1073,6 +1177,25 @@ func (e *Engine) load() {
 	}
 	if st.ShortOpenSeen != nil {
 		e.shortOpenSeen = st.ShortOpenSeen
+	}
+	// §T-MODE 恢复做 T 回转账（旧数据无此字段 → 空表，行为与本批之前完全一致）。
+	// 不做逐条自愈：一条 open 态回转跨重启后仍要按"次日配对/收摊"处理，那正是它存在的意义；
+	// 真的失去对象时（持仓已被清盘重置）rollTRoundsLocked 会在下一轮明确留痕收摊。
+	// English: restore the T-round ledger. Open rounds are deliberately NOT pruned on load — carrying
+	// them across a restart is the point; a round whose position disappeared is unwound with a reason
+	// on the next round instead of vanishing silently.
+	if st.TRounds != nil {
+		e.tRounds = st.TRounds
+	}
+	// §ANCHOR-FIRST W3 存量锚点回填：加载完成、持仓就位后立刻补一次（幂等，只有真的补了才落盘）。
+	// 放在 load 而不是启动期一次性迁移里：纸面账本是**按账号懒加载**的，启动时那些账本还没被读进来，
+	// 挂在启动钩子上会漏掉所有"启动后才第一次被访问"的账号。
+	// English: W3 legacy anchor backfill runs right after the positions are restored. It belongs here and
+	// not in a startup migration because paper books are lazily loaded per account — a startup hook would
+	// miss every book first touched after boot.
+	if filled, skipped := e.backfillAnchorsLocked(); filled > 0 {
+		log.Printf("[paper] §ANCHOR-FIRST W3 锚点回填已落盘 %s：回填%d 跳过%d", e.path, filled, skipped)
+		e.persist()
 	}
 	e.backfillPoolPerfLocked()
 	e.trimTradesLocked()
@@ -1353,14 +1476,17 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 }
 
 // autoSellLocked 卖出信号自动成交（阶段1.1，须持锁调用）：
-//   - act=="close"：全仓卖出（清仓/硬止盈/硬止损），收益回池并镜像关闭 report 账记录；
-//   - act=="trim" ：半仓减仓（减仓/情绪退潮/利空归因），每码每交易日至多一次（trimDone 去重）。
+//   - act=="close"：清仓（清仓/硬止盈/硬止损），收益回池并镜像关闭 report 账记录；当日买入的部分
+//     卖不掉时**减量成交**，剩余量登记成次日无条件执行的残量意图（§T1-PARTIAL 裁决三）；
+//   - act=="trim" ：半仓减仓（减仓/情绪退潮/利空归因），每码每交易日至多一次（trimDone 去重），
+//     目标量按可卖量钳位后取整手。
 //
 // 行情缺失时跳过（避免以信号价误成交）；非本账持仓自然 no-op；AutoSell=false 时整体停用。
-// English: auto-executes a sell signal (caller must hold the lock): "close" sells the whole position
-// (proceeds back to pool + report-book mirror close); "trim" halves it at most once per code per trading
-// day (trimDone dedup). Skips on missing quotes; no-op for codes not in this book; disabled entirely
-// when AutoSell is off.
+// English: auto-executes a sell signal (caller must hold the lock): "close" sells the position (proceeds
+// back to pool + report-book mirror close) and, when part of it is T+1-locked, fills the sellable part and
+// registers the residual as a next-day intent; "trim" halves it at most once per code per trading day
+// (trimDone dedup), with the target capped by the sellable qty and rounded to whole lots. Skips on missing
+// quotes; no-op for codes not in this book; disabled entirely when AutoSell is off.
 func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[string]*data.StockInfo) {
 	if !e.cfg.AutoSell {
 		return
@@ -1386,35 +1512,72 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 	}
 	switch act {
 	case "close":
-		qty := p.Qty
-		// §GAP1.9 修复：卖出被拒（如 T+1 当日买当日卖拦截）不得落假 filled 订单——
-		// 此前忽略 sellAllLocked 的 error，账实不符；现按买入路径同款 rejected 留痕。
-		// English: §GAP1.9 fix — a rejected close (e.g. T+1 same-day-sell block) must not be recorded
-		// as "filled"; audit it as rejected like the buy path does.
-		if err := e.sellAllLocked(p, price, reason); err != nil {
+		// §T1-PARTIAL（裁决三）：清仓从"整仓一把梭"改成"先卖可卖部分"。Sellable=0 时保持既有语义
+		// ——拒绝留痕、不落假 filled（§GAP1.9），也**不登记残量意图**（方案 §4.3 第 4 行：整仓都卖不
+		// 掉属于"退出裁决撞 T+1 全拦"，计划要求维持现状，只登记减量成交后的那截残量）。
+		// English: a close now sells the sellable part first. When nothing is sellable the old behaviour
+		// stands (rejected audit row, no fake fill, no intent); an intent is recorded only for the
+		// residual left after a partial close.
+		want := p.Qty
+		sold, err := e.sellPositionLocked(p, price, reason)
+		if err != nil {
 			e.recordOrderLocked(func() Order {
-				o := mkOrder("rejected", qty)
+				o := mkOrder("rejected", want)
 				o.Reason = "自动清仓被拒:" + err.Error()
 				return o
 			}())
 			log.Printf("[paper] 自动清仓被拒 %s(%s): %v", s.Code, s.Name, err)
 			return
 		}
-		e.recordOrderLocked(func() Order { o := mkOrder("filled", qty); o.Price = price; return o }())
+		if sold >= want {
+			e.recordOrderLocked(func() Order { o := mkOrder("filled", sold); o.Price = price; return o }())
+		} else {
+			e.recordOrderLocked(func() Order { o := mkOrder("partial", sold); o.Price = price; return o }())
+			// 残量登记为次日无条件执行的退出意图（Q6：退出是风险裁决，敞口挂着比卖早了更贵）。
+			e.recordPendingExitLocked(s.Code, want-sold, pendingExitClose, reason, time.Now())
+		}
 	case "trim":
 		today := cntime.DayCompactOf(time.Now()) // §TZ1
 		if e.trimDone[s.Code] == today {
 			return
 		}
-		half := p.Qty / 2 / 100 * 100 // 半仓取整手（A 股一手 100 股）
-		if half <= 0 {
+		baseHalf := p.Qty / 2 / 100 * 100 // 半仓取整手（A 股一手 100 股）
+		if baseHalf <= 0 {
 			return // 持仓不足两手无法半仓减仓，等清仓类信号处理
+		}
+		// 半仓目标既 ≤ 可卖量又取整手：不可卖的那截不进目标量，避免"目标 500 股、实卖 300 股"
+		// 这种由钳位产生的假残量。
+		// English: the trim target is capped by the sellable qty and rounded down to whole lots, so the
+		// residual is a real T+1 residual rather than an artefact of clamping.
+		half := baseHalf
+		sellable := e.sellableQtyLocked(p, time.Now())
+		if sellable < half {
+			half = sellable / 100 * 100
+		}
+		if half <= 0 {
+			// 可卖量不足一手（多半是当日买入被 T+1 锁死）：减仓做不了，但**必须留痕**——
+			// §GAP1.9 同款纪律：被拒不落假 partial 订单，也不置 trimDone（当日真正可减仓的窗口
+			// 不能被永久跳过）。静默返回会让用户看到"信号发了却没动静"。
+			// English: not enough sellable shares for a whole lot — the trim cannot run, but it leaves a
+			// rejected audit row (no fake "partial") and does not set trimDone.
+			why := "T+1限制：当日买入次日方可卖出"
+			if sellable > 0 {
+				why = fmt.Sprintf("可卖量 %d 股不足一手，无法按整手减仓", sellable)
+			}
+			e.recordOrderLocked(func() Order {
+				o := mkOrder("rejected", baseHalf)
+				o.Reason = "自动减仓被拒:" + why
+				return o
+			}())
+			log.Printf("[paper] 自动减仓被拒 %s(%s): %s", s.Code, s.Name, why)
+			return
 		}
 		// §GAP1.9 修复：trim 被拒时同样不落假 partial 订单，且不得置 trimDone——
 		// 否则当日真正可减仓的窗口（如次日）被永久跳过。
 		// English: §GAP1.9 fix — a rejected trim must not record a fake "partial" order nor set trimDone,
 		// which would permanently skip later valid trim windows on the same day.
-		if err := e.sellQtyLocked(p, price, half, reason); err != nil {
+		sold, err := e.sellQtyLocked(p, price, half, reason)
+		if err != nil {
 			e.recordOrderLocked(func() Order {
 				o := mkOrder("rejected", half)
 				o.Reason = "自动减仓被拒:" + err.Error()
@@ -1423,8 +1586,12 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 			log.Printf("[paper] 自动减仓被拒 %s(%s): %v", s.Code, s.Name, err)
 			return
 		}
-		e.recordOrderLocked(func() Order { o := mkOrder("partial", half); o.Price = price; return o }())
+		e.recordOrderLocked(func() Order { o := mkOrder("partial", sold); o.Price = price; return o }())
 		e.trimDone[s.Code] = today
+		// 残量槽与 trimDone 互不吞（3.3）：本日的减仓槽已被这半仓用掉，残量走独立意图队列次日执行。
+		if sold < half {
+			e.recordPendingExitLocked(s.Code, half-sold, pendingExitTrim, reason, time.Now())
+		}
 	}
 }
 
@@ -1697,6 +1864,8 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		// §ANCHOR-FIRST 建仓即冻结的锚点：与当刻 CostPrice 同值（含费），此后没有任何路径改写它。
 		AnchorPrice: totalCost / float64(qty),
 		AnchorAt:    now,
+		// §T1-PARTIAL 建仓即建层账：一笔建仓 = 一批，含费每股成本与锚点同源。
+		Lots: []PositionLot{{Qty: qty, Price: totalCost / float64(qty), FilledAt: now}},
 		// §C2 VWAP 偏差：只在采集到时计算；缺失保持 0。
 		MarketVWAP:     marketVWAP,
 		VWAPPremiumPct: vwapPremiumPct(price, marketVWAP),
@@ -1943,10 +2112,19 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 		e.poolPerf[poolKey] = &PoolPerf{}
 	}
 	e.poolPerf[poolKey].Cost += cost
+	// §T1-PARTIAL 加仓先落层账，再改数量/成本——顺序是有意义的：addBuyLot 需要"加仓前"的 p.Qty
+	// 给存量持仓补写旧批次（否则层账只覆盖这一笔，可卖量会凭空少掉旧股）。
+	// 这一步同时收掉 2.3 的 T+1 漏放：旧实现加仓完全不写时间戳，当日新买的机动仓继承昨日底仓
+	// 的 FilledAt 被当成可卖；按批次记日之后，可卖量只认批次自己的日期。
+	// English: the lot is appended BEFORE Qty/Cost mutate (the seed path needs the pre-add quantity), and
+	// this is exactly what closes the T+1 leak — add-ons used to inherit the base lot's date.
+	p.addBuyLot(qty, (cost+fee)/float64(qty), time.Now())
 	p.Cost += cost + fee
 	p.Qty += qty
 	p.CostPrice = p.Cost / float64(p.Qty)
 	p.Mark = price
+	// §T1-PARTIAL 展示态刷新：加仓之后当日买入的那部分立刻不可卖，账面上要如实标"部分可卖"。
+	p.refreshSellStatusLocked(time.Now())
 	e.trades = append(e.trades, Trade{
 		Code:         code,
 		Name:         name,
@@ -2036,7 +2214,13 @@ func (e *Engine) marketValueLocked() float64 {
 }
 
 // Sell 手动按实时价卖出持仓（清仓）。返回错误信息（无持仓/行情缺失时 err != nil）。
-// English: manually sells a position at the live price. Returns an error when not held / no quote.
+// §T1-PARTIAL（裁决三）：整仓里有一部分当日买不可卖时，**卖掉可卖的那部分**、持仓留着，订单落
+// partial；一股都卖不掉才返回 errTPlusOne（与改前逐笔一致，前端仍按 400 提示）。手动路径**不登记
+// 残量意图**：人自己下的单不该由引擎第二天早上替他决定卖什么（自动路径才有意图队列）。
+// English: manually sells a position at the live price. Ruling #3: when part of the book is T+1-locked,
+// the sellable part fills and the order is booked as "partial"; only a fully-locked position errors (so the
+// HTTP layer still returns 400). Manual sells deliberately do NOT register a residual intent — the engine
+// must not decide on a human's behalf what to sell tomorrow morning.
 func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	if !e.cfg.Enabled {
 		return errDisabled
@@ -2053,11 +2237,15 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	} else {
 		return errNoQuote
 	}
-	qty := p.Qty
-	err := e.sellAllLocked(p, price, "手动模拟卖出")
+	want := p.Qty
+	sold, err := e.sellPositionLocked(p, price, "手动模拟卖出")
 	if err == nil {
+		status := "filled"
+		if sold < want {
+			status = "partial" // 残量留在账上，由人次日再卖（手动路径不自动补卖）
+		}
 		e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
-			Side: "sell", Kind: "手动卖出", Price: price, Qty: qty, Status: "filled", Reason: "手动模拟卖出"})
+			Side: "sell", Kind: "手动卖出", Price: price, Qty: sold, Status: status, Reason: "手动模拟卖出"})
 		e.persist()
 	}
 	return err
@@ -2065,13 +2253,16 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 
 // SellEx 手动按指定价格与数量减仓（部分卖出）。qty 单位=股数（§FIX-1(20260919) 口径收敛：手数→股数
 // 换算在调用方完成，引擎一律按股记账，同 BuyExInPool/paper_test.go:682）；price > 0 用输入价，
-// price = 0 回退实时价。数量 >= 当前持仓时退化为清仓（复用 sellAllLocked）。
+// price = 0 回退实时价。数量 >= 当前持仓时退化为清仓（复用 sellPositionLocked 的减量成交口径）。
 // 整手/零股纪律由 HTTP 入口守卫（internal/server/paper.go handlePaperBuy/Sell）负责，引擎不重复校验
 // ——引擎测试与自动路径允许任意股数（如减仓 50 股的成本摊销用例）。
+// §T1-PARTIAL：请求量超过可卖量时减量成交（返回的持仓保留残量），订单元按**实际成交量**记账；
+// 可卖量为 0 时返回 errTPlusOne。同 Sell：手动路径不登记残量意图。
 // English: manually trims a position at an explicit price and share count (qty is in SHARES — the
 // lots→shares conversion is the caller's job, §FIX-1 20260919); price > 0 uses the typed price,
-// price = 0 falls back to the live quote. A qty >= the position degrades to a full close (reuses
-// sellAllLocked). Lot discipline is enforced at the HTTP entry, not here.
+// price = 0 falls back to the live quote. A qty >= the position degrades to a full close. Ruling #3: a qty
+// beyond the sellable amount fills partially and the order books the executed size; zero sellable errors.
+// Lot discipline is enforced at the HTTP entry, not here.
 func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*data.StockInfo) error {
 	if !e.cfg.Enabled {
 		return errDisabled
@@ -2093,34 +2284,26 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 		}
 	}
 	if qty >= p.Qty {
-		full := p.Qty
-		err := e.sellAllLocked(p, price, "手动模拟卖出")
+		want := p.Qty
+		sold, err := e.sellPositionLocked(p, price, "手动模拟卖出")
 		if err == nil {
+			status := "filled"
+			if sold < want {
+				status = "partial"
+			}
 			e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
-				Side: "sell", Kind: "手动卖出", Price: price, Qty: full, Status: "filled", Reason: "手动模拟卖出"})
+				Side: "sell", Kind: "手动卖出", Price: price, Qty: sold, Status: status, Reason: "手动模拟卖出"})
+			e.persist()
 		}
-		e.persist()
 		return err
 	}
-	err := e.sellQtyLocked(p, price, qty, "手动模拟减仓")
+	sold, err := e.sellQtyLocked(p, price, qty, "手动模拟减仓")
 	if err == nil {
 		e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
-			Side: "sell", Kind: "手动减仓", Price: price, Qty: qty, Status: "partial", Reason: "手动模拟减仓"})
+			Side: "sell", Kind: "手动减仓", Price: price, Qty: sold, Status: "partial", Reason: "手动模拟减仓"})
 		e.persist()
 	}
 	return err
-}
-
-// sellCheckT1Locked §R3 T+1 约束（A 股规则：当日买入次日方可卖出）——两个卖出入口共用。
-// FilledAt 为零值（旧数据）视为可卖（向后兼容）。
-// English: T+1 guard shared by both sell entry points — shares bought today cannot be sold until the
-// next trading day; zero FilledAt (legacy data) stays sellable.
-func (e *Engine) sellCheckT1Locked(p *Position) error {
-	if !canSellToday(p.FilledAt, time.Now()) {
-		log.Printf("[paper] T+1拦截 %s(%s) 当日买入不可卖", p.Code, p.Name)
-		return errTPlusOne
-	}
-	return nil
 }
 
 // applySellPriceLocked §R2 卖出滑点下浮成交（与买入上浮对称；0=不启用）。
@@ -2132,23 +2315,64 @@ func (e *Engine) applySellPriceLocked(price float64) float64 {
 	return price
 }
 
+// sellPositionLocked 退出裁决的执行入口（须持锁调用）：能卖多少就卖多少，不再因为"整仓里有一部分
+// 当日买不可卖"而把一笔卖出整单拒掉（§T1-PARTIAL 裁决三，形态上等价于一次正 T 的"买新卖旧"）。
+// 返回实际卖出股数；可卖量覆盖全仓时走完整清仓（删持仓 + 生命周期镜像 + 再入场冷却），
+// 只卖掉一部分时持仓留着、**不关生命周期、不记冷却**——这两点正是 2.7 里"次日买回/续卖被自家
+// 闸门挡掉"的成因，半笔减仓若去调清仓分支就把残量锁死了。
+// 可卖量=0 时仍返回 errTPlusOne（与改前"当日整仓不可卖"的留痕形态逐笔一致，调用方按被拒记账）。
+// English: the exit-execution entry — sells whatever is sellable instead of rejecting the whole order when
+// part of the lot was bought today. A full close deletes the position and fires the mirror/cooldown; a
+// partial one keeps the position open with no lifecycle close and no re-entry cooldown (that omission is
+// the point: the residual must stay tradable tomorrow). Zero sellable still yields errTPlusOne.
+func (e *Engine) sellPositionLocked(p *Position, price float64, reason string) (int, error) {
+	now := time.Now()
+	sellable := e.sellableQtyLocked(p, now)
+	if sellable <= 0 {
+		log.Printf("[paper] T+1拦截 %s(%s) 当日买入不可卖", p.Code, p.Name)
+		return 0, errTPlusOne
+	}
+	if sellable >= p.Qty {
+		return e.sellAllLocked(p, price, reason)
+	}
+	sold, err := e.sellQtyLocked(p, price, sellable, reason)
+	if err != nil {
+		return 0, err
+	}
+	log.Printf("[paper] §T1-PARTIAL 只卖可卖部分 %s(%s) 卖%d股 残%d股 原因=%s", p.Code, p.Name, sold, p.Qty, reason)
+	return sold, nil
+}
+
 // sellQtyLocked 按股数部分减仓：回池、结算已实现盈亏、追加卖出记录（须持锁调用）。
 // 手动减仓与自动减仓（阶段1.1 卖出信号半仓）共用；不触发清仓镜像（report 账记录保留至整笔平仓）。
-// §R3 T+1：当日买入拒绝减仓。§R2 费用：卖出价下浮滑点、佣金(含最低)+印花税从所得中扣除。
+// §R3 T+1：一股都卖不掉时拒绝减仓。§T1-PARTIAL（裁决三 W4）：请求量超过可卖量时**减量成交**
+// 而不是整单报错，返回值就是真实成交股数，差额由调用方登记残量意图（3.3）。
+// §R2 费用：卖出价下浮滑点、佣金(含最低)+印花税从所得中扣除。
 // §修复 FIX#3（2026-09-04）：减仓同步摊销 p.Cost（减去已卖股份对应的含费成本）。
 // 旧实现只 p.Qty -= qty、成本总额保持初始整笔——清仓 sellAllLocked 再按 net-p.Cost 结算，
 // 减掉部分成本被重复扣除，realized/poolPerf.Realized/ReturnPct 全被低估。
+// 层账按 FIFO 扣减（只扣可卖批次），成本口径仍走 FIX#3 的均价摊销——本批刻意不让层账变成第二把
+// 成本尺子（见 PositionLot 注释）。锚点在任何卖出路径都不改写（§ANCHOR-FIRST 写入冻结）。
 // English: trims by share count — pool return, realized P&L, extra sell fill (caller must hold the lock).
-// Shared by manual trims and auto trims; does NOT fire the close mirror. R3: T+1 enforced; R2: sell-side
-// slippage + commission(min) + stamp tax are deducted from proceeds.
-// English: §FIX#3 — a trim now amortizes p.Cost (subtracts the sold shares' fee-inclusive cost), so a
-// later close via sellAllLocked settles against the remaining cost instead of the original total.
-func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason string) error {
-	if err := e.sellCheckT1Locked(p); err != nil {
-		return err
+// Shared by manual trims, auto trims and residual-exit execution; does NOT fire the close mirror.
+// R3: zero sellable rejects; §T1-PARTIAL: an over-sellable request now fills the sellable part and returns
+// the actual shares sold, so the caller can book the shortfall as an intent. R2: sell-side slippage +
+// commission(min) + stamp tax are deducted from proceeds. §FIX#3 amortization is unchanged — batches are
+// consumed FIFO for the *dates*, while cost keeps amortizing at the diluted average. The anchor is never
+// rewritten here.
+func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason string) (int, error) {
+	now := time.Now()
+	sellable := e.sellableQtyLocked(p, now)
+	if sellable <= 0 {
+		log.Printf("[paper] T+1拦截 %s(%s) 当日买入不可卖", p.Code, p.Name)
+		return 0, errTPlusOne
+	}
+	sold := qty
+	if sold > sellable {
+		sold = sellable
 	}
 	price = e.applySellPriceLocked(price)
-	gross := price * float64(qty)
+	gross := price * float64(sold)
 	fee := e.sellFeeLocked(gross)
 	net := gross - fee
 	// 减仓收益回原战法池（按持仓记录的类型；空=其他池）。
@@ -2156,19 +2380,22 @@ func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason strin
 	// the other pool).
 	e.pools[p.StrategyType] += net
 	e.cash += net
-	e.realized += net - p.CostPrice*float64(qty)
+	e.realized += net - p.CostPrice*float64(sold)
 	// 卖出结算：已实现盈亏计入本池（卖出仍记分仓资金池，跨重启保留）。按净额口径。
 	// English: sale settlement — realized P&L credits the position's own pool on a net basis.
 	if e.poolPerf[p.StrategyType] == nil {
 		e.poolPerf[p.StrategyType] = &PoolPerf{}
 	}
-	e.poolPerf[p.StrategyType].Realized += net - p.CostPrice*float64(qty)
+	e.poolPerf[p.StrategyType].Realized += net - p.CostPrice*float64(sold)
 	// §FIX#3 成本摊销：已卖股份的含费成本从持仓总额中扣除，避免清仓时整笔成本重复结算。
 	// 剩余持仓 CostPrice 保持不变（均价口径），仅总额收缩。
 	// English: §FIX#3 cost amortization — subtract the sold shares' fee-inclusive cost so the later
 	// full close settles against the remaining cost; per-share average cost stays unchanged.
-	p.Cost -= p.CostPrice * float64(qty)
-	p.Qty -= qty
+	p.Cost -= p.CostPrice * float64(sold)
+	p.Qty -= sold
+	// §T1-PARTIAL 层账按 FIFO 扣可卖批次，并刷新展示态（残量若仍含当日批次 → "部分可卖"）。
+	consumeSellableLots(p, sold, now)
+	p.refreshSellStatusLocked(now)
 	e.trades = append(e.trades, Trade{
 		Code:         p.Code,
 		Name:         p.Name,
@@ -2176,25 +2403,38 @@ func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason strin
 		StrategyType: p.StrategyType,
 		Side:         "sell",
 		Price:        price,
-		Qty:          qty,
+		Qty:          sold,
 		Amount:       gross,
-		Time:         time.Now(),
+		Time:         now,
 		Fee:          fee,
 		Reason:       reason,
 	})
-	log.Printf("[paper] 模拟减仓 %s(%s) -%d股 @%.2f 剩余%d股 费%.2f 原因=%s", p.Code, p.Name, qty, price, p.Qty, fee, reason)
+	log.Printf("[paper] 模拟减仓 %s(%s) -%d股 @%.2f 剩余%d股 费%.2f 原因=%s", p.Code, p.Name, sold, price, p.Qty, fee, reason)
 	e.persist()
-	return nil
+	return sold, nil
 }
 
 // sellAllLocked 清仓单一持仓：回池、结算已实现盈亏、追加卖出记录，并触发清仓镜像
 // （阶段1.2 两本账合一：report 账对应记录同步平仓；须持锁调用）。
-// §R3 T+1：当日买入拒绝清仓。§R2 费用：卖出价下浮滑点、佣金(含最低)+印花税从所得中扣除。
+// §R3 T+1 + §T1-PARTIAL：这是一把**严格整笔**的尺子——可卖量必须覆盖全仓才成交，否则返回
+// errTPlusOne 交回调用方（想"能卖多少卖多少"请走 sellPositionLocked，那才是裁决三的入口）。
+// 之所以保留严格档：残量执行卖到最后一股时要走这里，把生命周期关掉、把冷却记上；半笔减仓绝不能
+// 误走这条路（2.7：删持仓 + 冷却会把次日的残量买回/续卖全挡死）。
+// §R2 费用：卖出价下浮滑点、佣金(含最低)+印花税从所得中扣除。
 // English: closes a single position — pool return, realized P&L, extra sell fill, plus the close mirror
-// (unified books; caller must hold the lock). R3: T+1 enforced; R2: slippage + fees deducted.
-func (e *Engine) sellAllLocked(p *Position, price float64, reason string) error {
-	if err := e.sellCheckT1Locked(p); err != nil {
-		return err
+// (unified books; caller must hold the lock). STRICT: requires the sellable quantity to cover the whole
+// position, otherwise errTPlusOne (use sellPositionLocked for the ruling-3 degraded sale). R2: slippage +
+// fees deducted.
+func (e *Engine) sellAllLocked(p *Position, price float64, reason string) (int, error) {
+	now := time.Now()
+	sellable := e.sellableQtyLocked(p, now)
+	if sellable < p.Qty {
+		if sellable <= 0 {
+			log.Printf("[paper] T+1拦截 %s(%s) 当日买入不可卖", p.Code, p.Name)
+		} else {
+			log.Printf("[paper] §T1-PARTIAL %s(%s) 可卖%d<持仓%d，整笔清仓不执行（请走减量卖法）", p.Code, p.Name, sellable, p.Qty)
+		}
+		return 0, errTPlusOne
 	}
 	price = e.applySellPriceLocked(price)
 	gross := price * float64(p.Qty)
@@ -2222,11 +2462,15 @@ func (e *Engine) sellAllLocked(p *Position, price float64, reason string) error 
 		Price:        price,
 		Qty:          p.Qty,
 		Amount:       gross,
-		Time:         time.Now(),
+		Time:         now,
 		Fee:          fee,
 		Reason:       reason,
 	})
 	log.Printf("[paper] 模拟卖出 %s(%s) %d股 @%.2f 盈亏%.2f 费%.2f 原因=%s", p.Code, p.Name, p.Qty, price, net-p.Cost, fee, reason)
+	// §T1-PARTIAL 整笔平仓：层账随持仓一起出清（先扣光再删行，避免 p 指针被复用时留着幽灵批次）。
+	consumeSellableLots(p, p.Qty, now)
+	p.Lots = nil
+	p.Status = ""
 	delete(e.positions, p.Code)
 	// 清仓镜像（阶段1.2）：report 账对应记录同步平仓（pap_<code> 稳定键）。
 	// English: close mirror (unified books) — the report-book record closes in sync (stable key pap_<code>).
@@ -2235,8 +2479,10 @@ func (e *Engine) sellAllLocked(p *Position, price float64, reason string) error 
 	if e.reEntry != nil {
 		e.reEntry.recordClose(p.Code, time.Now())
 	}
+	// §T1-PARTIAL 整笔清仓＝残量意图失去对象（清仓之后没有"还没卖掉的股"可言）。
+	delete(e.pendingExits, p.Code)
 	e.persist()
-	return nil
+	return qty, nil
 }
 
 // SetStrategyPools 设置启用的战法资金池（按当前现金均分，key 集合 = types + ""）。
@@ -2429,6 +2675,11 @@ func (e *Engine) Reconfigure(initialCapital float64, maxPositions int) {
 	}
 	e.cash = e.cfg.InitialCapital
 	e.positions = make(map[string]*Position)
+	// §T1-PARTIAL：重配资金清空持仓时必须同批注销残量意图——意图按 code 记，若留着，之后重新买入
+	// 同一只票会被一条属于上一个仓的旧意图在次日卖掉。
+	// English: the capital-reset wipe must also drop residual-exit intents — they are keyed by code, so a
+	// stale one would sell a freshly re-opened position in it next day.
+	e.pendingExits = make(map[string]*PendingExit)
 	e.equity = nil
 	e.realized = 0
 	e.poolPerf = make(map[string]*PoolPerf)
@@ -2461,6 +2712,10 @@ func (e *Engine) Reset() {
 	e.realized = 0
 	e.poolPerf = make(map[string]*PoolPerf)
 	e.trimDone = make(map[string]string)
+	// §T1-PARTIAL：清盘同样注销全部残量退出意图（持仓已清，意图指向的 code 不复存在；留着会在
+	// 重新买入同码后被次日补卖）。
+	// English: 清盘重置 also drops every residual-exit intent, so a re-bought code can't inherit an old book's intent.
+	e.pendingExits = make(map[string]*PendingExit)
 	// §修复 P2#21：清盘重开应重置运行时纪律——旧实现残留 on-buy 计费/dayStartCash（poolDiscipline）
 	// 与清仓冷却（reEntry）到下次清盘：重置后立刻买入会被"重置前的今日计数/预算分母"与
 	// 已在冷跟踪中但本次清空的记录拦截，和"只清空重开"的语义冲突。
@@ -2509,6 +2764,9 @@ func (e *Engine) ResetPool(key string) {
 			}
 			proceeds += mv
 			delete(e.positions, code)
+			// §T1-PARTIAL：本池清盘也注销该码的残量意图（池已清，意图不能再在次日替用户卖出重开的仓）。
+			// English: single-pool liquidation drops that code's residual intent for the same reason.
+			delete(e.pendingExits, code)
 			closed++
 			// 清盘镜像（阶段1.2）：report 账对应记录同步平仓（按估值价/成本价结算）。
 			// English: liquidation mirror (unified books) — the report-book record closes in sync

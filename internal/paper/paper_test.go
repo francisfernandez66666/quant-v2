@@ -348,14 +348,30 @@ func TestMarkToMarketAndSnapshot(t *testing.T) {
 }
 
 // t1Ready §R3 测试辅助：把全部持仓 FilledAt 回拨到 25 小时前，模拟"次日卖出"绕过 T+1。
-// English: test helper — backdates every position's FilledAt by 25h to simulate next-day selling
-// past the T+1 gate.
+// §T1-PARTIAL（裁决三）后 T+1 判据改读**批次层账**（Position.Lots），所以必须连层账一起回拨；
+// 只回拨 FilledAt 会留下"层账里是今天买的批次"⇒ 仍判不可卖（这正是新判据要抓的漏放形态）。
+// English: test helper — backdates every position's FilledAt by 25h to simulate next-day selling past the
+// T+1 gate. §T1-PARTIAL reads the T+1 state from the per-batch lot ledger, so the lots must be backdated
+// too; leaving them at today would keep the position unsellable.
 func t1Ready(e *Engine) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	y := time.Now().Add(-25 * time.Hour)
 	for _, p := range e.positions {
-		p.FilledAt = y
+		t1Backdate(p, y)
+	}
+}
+
+// t1Backdate 把一条持仓的整仓成交时间与**全部批次**一起回拨（§T1-PARTIAL：T+1 判据读层账，
+// 只回拨整仓时间会留下"层账是今天买的批次"⇒ 仍判不可卖）。
+// English: backdates a position's fill time and every batch in its lot ledger.
+func t1Backdate(p *Position, y time.Time) {
+	if p == nil {
+		return
+	}
+	p.FilledAt = y
+	for i := range p.Lots {
+		p.Lots[i].FilledAt = y
 	}
 }
 

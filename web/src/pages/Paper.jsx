@@ -264,6 +264,8 @@ export default function Paper() {
   const [tradeTarget, setTradeTarget] = useState(null)
   // 交易表单委托价（0=留空，后端按实时价撮合）
   const [tradeFormPrice, setTradeFormPrice] = useState(0)
+  // 减仓手数（§DYN-TRIM：减仓是**真实部分卖出**，手数×100 才是提交给后端的股数）
+  const [tradeFormLots, setTradeFormLots] = useState(1)
   const W = 900, H = 220 // 净值曲线 SVG 的逻辑尺寸（viewBox 坐标，非真实像素）
   const timer = useRef(null) // §F5 预留（轮询已由 SSE + useSseRefresh 兜底接管）
 
@@ -368,6 +370,10 @@ export default function Paper() {
   function openTrade(p, dir) {
     setTradeTarget(p); setTradeDir(dir)
     setTradeFormPrice(p.mark || 0)
+    // 减仓默认填"可卖量的一半"（整手向下取整、至少 1 手）：这是最常用的减仓幅度，
+    // 同时天然不会超过 T+1 锁住的那部分。可卖量为 0 时留 1 手，由确认按钮置灰拦住。
+    const sellableLots = Math.floor((p.sellable_qty ?? p.qty ?? 0) / 100)
+    setTradeFormLots(Math.max(1, Math.floor(sellableLots / 2)))
     setTradeModal(true)
   }
 
@@ -384,11 +390,27 @@ export default function Paper() {
     const p = tradeTarget
     if (!p) return
     const price = parseFloat(tradeFormPrice)
-    // §DYN-SIZE-v3：加仓数量按动态仓位计算（qty=0）；卖出按清仓处理（qty=0=全平）。
+    // §DYN-TRIM（2026-10-24 owner 裁决）：加仓 qty=0 交给动态仓位；**减仓按手数真实减仓**
+    // （qty = 手数×100，唯一换算点）；只有清仓才是 qty=0。改前 trim 也发 qty=0，后端在 dynamic
+    // 口径下又忽略 qty ⇒ 点"减仓"实际把整仓清掉（UAT U-2/U-4）。
+    // English: add → qty=0 (dynamic sizing); trim → qty = lots×100 (the single conversion point);
+    // close → qty=0. Previously trim also sent 0 and the backend ignored qty, so "trim" closed the
+    // whole position.
     try {
       if (tradeDir === 'add') {
         await api.buyPaperPosition(p.code, p.name || '', p.strategy || '', 0, price > 0 ? price : 0, 0)
         showToast(`已加仓 ${p.code}（数量按动态仓位）`,'success')
+      } else if (tradeDir === 'trim') {
+        const qty = Math.max(0, Math.floor(tradeFormLots) * 100)
+        if (qty <= 0) { showToast('减仓手数需 ≥ 1 手（100 股）','error'); return }
+        const r = await api.sellPaperPosition(p.code, price > 0 ? price : 0, qty)
+        // 后端按可卖量封顶成交：卖出的可能少于填的量（当日买入那部分受 T+1 锁），如实告知。
+        const sold = r && typeof r.sold === 'number' ? r.sold : qty
+        const left = r && typeof r.remaining === 'number' ? r.remaining : null
+        const msg = left != null && sold < qty
+          ? `已减仓 ${sold} 股（余 ${left} 股；当日买入部分受 T+1 限制，次日可卖）`
+          : `已减仓 ${sold} 股`
+        showToast(msg,'success')
       } else {
         await api.sellPaperPosition(p.code, price > 0 ? price : 0, 0)
         showToast(`已清仓 ${p.code}`,'success')
@@ -1310,14 +1332,18 @@ export default function Paper() {
       {/* 交易弹窗：加仓 / 减仓 / 清仓 */}
       <Dialog
         visible={tradeModal}
-        header={(tradeDir === 'add' ? '加仓' : '清仓') + (tradeTarget ? ' ' + tradeTarget.code + ' ' + tradeTarget.name : '')}
+        header={(tradeDir === 'add' ? '加仓' : tradeDir === 'trim' ? '减仓' : '清仓') + (tradeTarget ? ' ' + tradeTarget.code + ' ' + tradeTarget.name : '')}
         onClose={() => setTradeModal(false)}
         onConfirm={confirmTrade}
-        // 确认按钮：清仓用危险色；数量由后端动态仓位/清仓语义决定。
-        confirmBtn={{ content: '确定', theme: tradeDir === 'add' ? 'primary' : 'danger' }}
+        // 确认按钮：清仓用危险色；减仓在"可卖量为 0"（当日买入全被 T+1 锁着）时置灰。
+        confirmBtn={{
+          content: '确定',
+          theme: tradeDir === 'add' ? 'primary' : 'danger',
+          disabled: tradeDir === 'trim' && !((tradeTarget?.sellable_qty ?? tradeTarget?.qty ?? 0) >= 100),
+        }}
       >
         <Form layout="vertical">
-          {/* 当前持仓回显：股数与成本价 */}
+          {/* 当前持仓回显：股数、成本价与可卖量（可卖量 = 今日真能卖掉的股数，受 T+1 约束） */}
           <Form.FormItem label="当前持仓">
             <span>{tradeTarget?.qty} 股 / 成本 ¥{tradeTarget?.cost_price?.toFixed(2)}</span>
           </Form.FormItem>
@@ -1325,11 +1351,32 @@ export default function Paper() {
           <Form.FormItem label="价格">
             <InputNumber value={tradeFormPrice} step={0.001} placeholder="成交价格（留空用实时价）" onChange={(v) => setTradeFormPrice(v || 0)} style={{ width: 240 }} />
           </Form.FormItem>
-          {/* §DYN-SIZE-v3：加仓不填股数，由动态仓位计算；卖出按清仓处理。 */}
+          {/* 数量：加仓=动态仓位；减仓=手数（真实部分卖出）；清仓=全部 */}
           <Form.FormItem label="数量">
-            {tradeDir === 'add'
-              ? <span>按动态仓位自动计算（总资产/池权益 × 缩放，再受行业/单票 35% 额度与现金约束）</span>
-              : <span>{tradeTarget?.qty} 股（全部清仓）</span>}
+            {tradeDir === 'add' && <span>按动态仓位自动计算（总资产/池权益 × 缩放，再受行业/单票 35% 额度与现金约束）</span>}
+            {tradeDir === 'trim' && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <InputNumber
+                  value={tradeFormLots}
+                  min={1}
+                  step={1}
+                  onChange={(v) => setTradeFormLots(v || 1)}
+                  style={{ width: 120 }}
+                  placeholder="手数（1手=100股）"
+                />
+                <span>手（{Math.max(0, Math.floor(tradeFormLots) * 100)} 股）</span>
+                <span style={{ color: 'var(--td-text-color-secondary)' }}>
+                  可卖 {tradeTarget?.sellable_qty ?? tradeTarget?.qty ?? 0} 股
+                  {tradeTarget?.status ? `（${tradeTarget.status}）` : ''}
+                </span>
+              </div>
+            )}
+            {tradeDir === 'trim' && !((tradeTarget?.sellable_qty ?? tradeTarget?.qty ?? 0) >= 100) && (
+              <div style={{ color: 'var(--td-warning-color)', marginTop: 4 }}>
+                当日买入的持仓受 T+1 限制，今日不可卖；请次日再减仓，或直接清仓（清仓会先卖掉可卖部分）。
+              </div>
+            )}
+            {tradeDir === 'close' && <span>{tradeTarget?.qty} 股（全部清仓；当日买入部分次日再卖）</span>}
           </Form.FormItem>
         </Form>
       </Dialog>

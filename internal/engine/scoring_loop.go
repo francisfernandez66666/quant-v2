@@ -864,10 +864,10 @@ func pureTsCode(tsCode string) string {
 // English: §P1-4 — sell orders now carry CurrentPrice/PrevClose so the limit-up/down risk gate
 // (which fail-opens on PrevClose<=0) actually sees market context; without quotes the gate stays
 // fail-open (positions remain exitable) instead of blocking protective sells.
-func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string) error {
+func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string) (int, error) {
 	cfg := ctrl.Config()
 	if qty <= 0 || price <= 0 {
-		return nil
+		return 0, nil
 	}
 	req := trading.OrderRequest{
 		SignalID:    signalID,
@@ -896,7 +896,7 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 	res, err := ctrl.PlaceOrder(req)
 	if err != nil {
 		log.Printf("[qmt] 自动卖出 %s(%s) 失败: %v", p.TsCode, p.Name, err)
-		return err
+		return 0, err
 	}
 	if res != nil && !res.OK {
 		if strings.Contains(res.Err, "duplicate") {
@@ -904,7 +904,9 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 			// 或在途/已有成交"（发送失败、**已撤零成交**的单都会经 MarkRealOrderSendFailed /
 			// ResetFailedRealOrder 的同键重放放行，不再以 duplicate 形态出现），
 			// 因此幂等命中=目标已达成，静默返回是正确行为。
-			return nil // 当日已下过同类卖单（幂等命中），静默
+			// §T1-PARTIAL-W5：幂等命中按"本次期望量已达成"回报，调用方照常烧槽（不能因为
+			// 没有新成交就把槽留着，否则同日会重复下同键单）。
+			return qty, nil
 		}
 		// §H4（2026-09-22 修复批）业务拒单不再假成功：网关 200+ok:false（券商拒单等）时
 		// err 为 nil，旧实现只打日志就返回 nil——调用方把"没卖出去"当成功，幂等槽（realTrimDone）
@@ -915,11 +917,17 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 			reject = "网关未受理"
 		}
 		log.Printf("[qmt] 自动卖出 %s(%s) 被网关拒单: %s", p.TsCode, p.Name, reject)
-		return fmt.Errorf("sell %s rejected: %s", p.TsCode, reject)
+		return 0, fmt.Errorf("sell %s rejected: %s", p.TsCode, reject)
+	}
+	// §T1-PARTIAL-W5：回报**实际报出量**（风控减量档下会小于 qty），调用方据此判断有没有残量。
+	// 取不到回填值（老路径）时按请求量处理——不制造"凭空多出来的残量"。
+	placed := qty
+	if res != nil && res.PlacedQty > 0 {
+		placed = res.PlacedQty
 	}
 	log.Printf("[qmt] 自动卖出 %s(%s) %d股 @%.2f 类别=%s 原因=%s → %+v",
-		p.TsCode, p.Name, qty, price, class, reason, res)
-	return nil
+		p.TsCode, p.Name, placed, price, class, reason, res)
+	return placed, nil
 }
 
 // autoExecuteRealSells §GAP1.1 的兼容入口（未指定轮次快照的调用方/测试用）：
@@ -1077,7 +1085,8 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 		sid := fmt.Sprintf("%s:r%d", base, qty)
 		// §H4（2026-09-22 修复批）错误不再吞：卖单失败即 log + opslog 留档（5s 轮高频，opslog 按
 		// 码+类别 1 分钟节流），幂等槽不烧，纪律状态机下一轮重放同键补卖（占位行已降级"发送失败"可重试）。
-		if serr := e.sellRealPosition(ctrl, p, qty, sid, a.RefPrice, class, a.Reason); serr != nil {
+		placed, serr := e.sellRealPosition(ctrl, p, qty, sid, a.RefPrice, class, a.Reason)
+		if serr != nil {
 			log.Printf("[qmt] 实盘自动卖单失败 %s(%s) 类别=%s: %v（幂等槽未烧，下一轮可重试）", p.TsCode, p.Name, class, serr)
 			opslog.OncePer("real-sell-fail:"+pureTsCode(p.TsCode)+":"+class, time.Minute, func() {
 				opslog.Logf("quant", "实盘自动卖单失败 %s(%s) 类别=%s 建议原因=%s: %v", p.TsCode, p.Name, class, a.Reason, serr)
@@ -1085,6 +1094,23 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 			continue
 		}
 		if class == "减仓" {
+			// §T1-PARTIAL-W5（owner 裁决 Q7「减量放行 + 残量意图」）：风控把本单砍到可卖量时，
+			// 这次只卖掉了"能卖的那一截"，剩下的量还在账上。此时**不烧当日减仓槽**——烧了就等于
+			// 宣告"今天的减仓已经做完"，残量要等到次日才有人管（正是 #3 要收掉的形态）。
+			// 不烧槽的效果：下一轮 remaining 会按"已报量已占额度"重算出一个更小的 qty 和新 sid，
+			// 若当日还有可卖量就继续卖；等到可卖量归零，T+1 闸会把 qty 拦成 0（两档都拒），
+			// 那条腿自然停下，不会空转下零股单。
+			// English: when risk clamped the order, only the sellable slice went out — do NOT burn the
+			// daily trim slot, otherwise the remainder waits until tomorrow (exactly the #3 defect).
+			if placed < qty {
+				log.Printf("[qmt] 实盘减仓 %s(%s) 减量放行：期望 %d 股、实报 %d 股，残量 %d 股当日留待下一轮（当日减仓槽不烧）",
+					p.TsCode, p.Name, qty, placed, qty-placed)
+				opslog.OncePer("real-trim-clamped:"+pureTsCode(p.TsCode), time.Minute, func() {
+					opslog.Logf("quant", "实盘减仓减量放行 %s(%s)：期望 %d 股、实报 %d 股（T+1 可卖量不足），残量 %d 股不烧槽",
+						p.TsCode, p.Name, qty, placed, qty-placed)
+				})
+				continue
+			}
 			// §H4 卖单成功后才烧当日减仓槽（duplicate 幂等命中同样视为目标达成，一样烧槽）。
 			e.mu.Lock()
 			if e.realTrimDone == nil {
@@ -1192,8 +1218,13 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 			sid := fmt.Sprintf("%s:r%d", base, remaining)
 			// §H4（2026-09-22 修复批）同批止吞错：M8 清仓失败不再 `_ =` 静默——占位行已降级
 			// "发送失败"，下一轮 M8 仍触发时同键可重试；这里补一条显式失败日志留证。
-			if serr := e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", verdict.Reason+"兜底清仓"); serr != nil {
+			// §T1-PARTIAL-W5：M8 是全平腿，钳位后剩下的量下一轮 M8 会按新 remaining 重算，
+			// 这里只需把"实际只报了 placed 股"记下来，不需要另立残量意图（M8 每轮都重判）。
+			placed, serr := e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", verdict.Reason+"兜底清仓")
+			if serr != nil {
 				log.Printf("[qmt] M8 兜底清仓卖单失败 %s(%s): %v（下一轮 M8 触发可重试）", p.TsCode, p.Name, serr)
+			} else if placed < remaining {
+				log.Printf("[qmt] M8 兜底清仓 %s(%s) 减量放行：期望 %d 股、实报 %d 股，残量下一轮重判", p.TsCode, p.Name, remaining, placed)
 			}
 		}
 	}
