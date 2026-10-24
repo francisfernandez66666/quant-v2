@@ -61,6 +61,9 @@ type sellProbeRow struct {
 	Name       string
 	EntryPrice float64
 	HighPrice  float64 // 持仓期最高价（≤0 内核回退成本价；live=账本 highest_price，paper=§M10 引擎侧持久化锚点）
+	// AnchorPrice §ANCHOR-FIRST 首次买入价锚（0=未回填）。W2 影子期只随行进入对照表，
+	// 内核（signalctl.sellProbe）不读它——切硬属 W3（Q10 签认之后）。
+	AnchorPrice float64
 }
 
 // runSellUnifiedJudge live 卖出裁决主入口（pushRealAdvice 每轮调用；仅交易时段，随宿主循环）。
@@ -95,14 +98,15 @@ func (e *Engine) runSellUnifiedJudge(
 	rows := make([]sellProbeRow, 0, len(positions))
 	for i := range positions {
 		p := positions[i]
-		rows = append(rows, sellProbeRow{Code: p.TsCode, Name: p.Name, EntryPrice: p.CostPrice, HighPrice: p.HighestPrice})
+		rows = append(rows, sellProbeRow{Code: p.TsCode, Name: p.Name, EntryPrice: p.CostPrice, HighPrice: p.HighestPrice,
+			AnchorPrice: p.AnchorPrice}) // §ANCHOR-FIRST 实盘账锚点列（ApplyRealFill 建仓写入；0=存量未回填）
 	}
 	feed := sellJudgeFeed{Scores: scores, D1Scores: d1Scores, BearReasons: bearReasons, PoolQuotes: exitQuotes, SnapQuotes: quotes}
 	// §DYN-SIZE P2：注入市场环境快照——卖出加权（情绪退潮/风险档/大盘≤-2%/节前/连续止损/宏观影响期）
 	// 从这里解析。未启用（出厂默认）时 ComputeSellBoost 立即返回 ""，裁决与改造前逐字一致。
 	// 与 paper 通道同源同值（方案 §5「通道一致」测试锁）。
 	pol := signalctl.Policy{Discipline: ctl.Config().Discipline, Regime: e.regimeForAccount(account)}
-	verdicts := e.judgeSellPositions(signalctl.ChannelLive, account, rows, pol, feed, orDefault(mode, "shadow"))
+	verdicts := e.judgeSellPositions(signalctl.ChannelLive, account, "live", rows, pol, feed, orDefault(mode, "shadow"))
 	// 状态生命周期与持仓对齐（平仓即删，重新入场从零开始）。
 	held := make(map[string]bool, len(positions))
 	for _, p := range positions {
@@ -139,10 +143,10 @@ func (e *Engine) runPaperUnifiedJudge(account string, pe *paper.Engine, feed sel
 		// （SellProbe.HighPrice 恒 0），旧语义「状态机每轮自抬」意味着进程重启即锚点清零——
 		// 高点回落到成本价，移动止盈在重启后永不触发。裁决前先取引擎侧持久化锚点注入探针。
 		rows = append(rows, sellProbeRow{Code: pr.Code, Name: pr.Name, EntryPrice: pr.EntryPrice,
-			HighPrice: e.paperSellAnchor(account, pr.Code)})
+			HighPrice: e.paperSellAnchor(account, pr.Code), AnchorPrice: pr.AnchorPrice})
 		held[pr.Code] = true
 	}
-	verdicts := e.judgeSellPositions(signalctl.ChannelPaper, account, rows, pol, feed, orDefault(mode, "shadow"))
+	verdicts := e.judgeSellPositions(signalctl.ChannelPaper, account, "paper", rows, pol, feed, orDefault(mode, "shadow"))
 	e.SignalCtl().PruneSellStates(signalctl.ChannelPaper, account, held)
 	// §M10 锚点随轮次持久化：本轮有效现价抬高锚点、平仓代码删除锚点（重新入场从零起算，
 	// 与裁决状态 Prune 同生命周期），有变更才原子落盘。
@@ -172,7 +176,11 @@ func (e *Engine) runPaperUnifiedJudge(account string, pe *paper.Engine, feed sel
 // 价格解析与旧口径一致：打分池价优先、5s 快照兜底，两者皆缺=无效价轮（不下结论、状态不动）。
 // §H5（2026-09-22 修复批）做多信号新鲜度按信号自身产分时刻（StockScores.UpdatedAt）判断；
 // e.scoresAt 只兜底无时刻的存量装配（边界⑥）。利空验证等级取 bearTierFor（护栏4，dual 才有硬清资格）。
-func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows []sellProbeRow, pol signalctl.Policy, feed sellJudgeFeed, modeTag string) []sellRoundVerdict {
+// book=账本标识（live/paper/report），只用于 §ANCHOR-FIRST W2 影子对照表分账本；裁决本身不读它，
+// 也**不读 AnchorPrice**——切硬属 W3，前提是 owner 签认那张对照表（Q10）。
+// English: shared kernel; book tags only the W2 anchor shadow table (the verdict still runs on
+// the diluted cost — hard cutover is W3, gated on Q10 sign-off).
+func (e *Engine) judgeSellPositions(ch signalctl.Channel, account, book string, rows []sellProbeRow, pol signalctl.Policy, feed sellJudgeFeed, modeTag string) []sellRoundVerdict {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -182,6 +190,7 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows [
 	e.mu.RUnlock()
 
 	verdicts := make([]sellRoundVerdict, 0, len(rows))
+	shadowRows := make([]signalctl.AnchorShadowRow, 0, len(rows)) // §ANCHOR-FIRST W2 影子对照（不进裁决）
 	for _, row := range rows {
 		code := pureTsCode(row.Code)
 		price := 0.0
@@ -195,6 +204,8 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows [
 			EntryPrice: row.EntryPrice,
 			HighPrice:  row.HighPrice,
 			CurPrice:   price,
+			// §ANCHOR-FIRST W2：随行锚点只供影子对照；sellProbe 不读它，本轮资金行为零变化。
+			AnchorPrice: row.AnchorPrice,
 		}
 		// 做多信号（延持唯一资格源，语义②）：带打分轮次时间戳（边界⑥）。
 		// §H5（2026-09-22 修复批）产分时刻优先取信号自身 UpdatedAt（combat_agent 打分链路
@@ -230,6 +241,14 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows [
 			}
 			in.Evidence = append(in.Evidence, ev)
 		}
+		// §ANCHOR-FIRST W2：影子对照独立于内核结论——停牌/无有效价的行也进表。
+		// 线位（止损价/止盈价）只由基准与阈值决定，与本轮有没有价无关，而"锚点回填进度"
+		// 正是 Q10 签认要看的那一列；无价行的判线自然记 None。
+		if row.EntryPrice > 0 {
+			sr := signalctl.CompareAnchor(in, pol, book)
+			sr.Name = row.Name
+			shadowRows = append(shadowRows, sr)
+		}
 		vr := e.SignalCtl().JudgeSellView(ch, account, in, pol, now)
 		if !vr.Valid {
 			continue // 无效价轮：状态未动、不出卡不执行
@@ -247,6 +266,10 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows [
 				modeTag, row.Name, row.Code, vr.Disposal.Action, vr.Disposal.Line, vr.Disposal.PnlPct, boostTag, vr.Disposal.Reason)
 		}
 	}
+	// §ANCHOR-FIRST W2：一轮一次交账本对照表（内部按 (账本×北京日) 去重，当日只落首轮）。
+	// 空表不交：见上面 len(rows)==0 的提前返回——"0 行"分不清"今天全空仓"和"持仓快照还没到"，
+	// 这两种含义在 Q10 签认材料里正好相反，宁可缺行也不写一行会误导的读数。
+	e.recordAnchorShadow(account, book, shadowRows, now)
 	return verdicts
 }
 
@@ -330,13 +353,14 @@ func (e *Engine) judgeReportLedger(feed sellJudgeFeed, mode string) {
 		if g.held[pos.Code] {
 			continue // 同码多行异常（理论不发生）：首行为准，处置时逐行会重复卖
 		}
-		g.rows = append(g.rows, sellProbeRow{Code: pos.Code, Name: pos.Name, EntryPrice: pos.EntryPrice, HighPrice: pos.HighestPrice})
+		g.rows = append(g.rows, sellProbeRow{Code: pos.Code, Name: pos.Name, EntryPrice: pos.EntryPrice,
+			HighPrice: pos.HighestPrice, AnchorPrice: pos.AnchorPrice})
 		g.byCode[pos.Code] = pos
 		g.held[pos.Code] = true
 	}
 	for uid, g := range groups {
 		account := uid + "@report"
-		verdicts := e.judgeSellPositions(signalctl.ChannelPaper, account, g.rows, e.paperSignalPolicy(uid), feed, orDefault(mode, "shadow"))
+		verdicts := e.judgeSellPositions(signalctl.ChannelPaper, account, "report", g.rows, e.paperSignalPolicy(uid), feed, orDefault(mode, "shadow"))
 		e.SignalCtl().PruneSellStates(signalctl.ChannelPaper, account, g.held)
 		if mode != "on" {
 			continue // shadow：只留痕（13e 旧链仍在执行 report 处置）

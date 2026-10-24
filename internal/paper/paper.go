@@ -160,6 +160,36 @@ type Position struct {
 	// English: §C2 market VWAP at fill time and signal-vs-VWAP premium (zero = not captured).
 	MarketVWAP     float64 `json:"market_vwap,omitempty"`
 	VWAPPremiumPct float64 `json:"vwap_premium_pct,omitempty"`
+	// AnchorPrice §ANCHOR-FIRST（2026-10-24 裁决二）首次买入价锚点＝建仓那笔成交的**含费**
+	// 每股成本，与当刻的 CostPrice 同值，但此后**永不被改写**。
+	// 为什么必须再养一个价：CostPrice 是盈亏口径，加仓必须摊薄（`addToPositionLocked` 重算
+	// `p.Cost/p.Qty`），而止盈/止损/移动止盈的分母跟着摊薄走会造成两个形态——高位加仓把止损线
+	// 一起抬高（该砍的砍不掉）、低位摊薄制造假盈利提前触发；移动止盈的 `highest > cost` 前置
+	// 更会被一次加仓直接抹掉资格。裁决二把风险线钉回首次买入价，盈亏口径保持摊薄不变。
+	// 写入冻结：只在 fillLocked 建仓处写一次；加仓/减仓/改成本一律不碰（由测试锁死）。
+	// 0=未知（本批之前落盘的存量持仓）→ 影子期不参与判定、对照表点名，回填属 W3。
+	// English: §ANCHOR-FIRST — fee-inclusive per-share cost of the opening fill, written once and
+	// never rewritten. CostPrice stays the diluted P&L basis; the anchor is the risk-line basis the
+	// ruling froze at the first buy. 0 = legacy position (named in the shadow table, backfilled in W3).
+	AnchorPrice float64 `json:"anchor_price,omitempty"`
+	// AnchorAt 锚点写入时刻（与建仓同时刻，用于回填审计与"锚点是否可信"判读）。
+	// 存量持仓的 AnchorAt 为零值，前端/对照表按 AnchorPrice==0 一并视为未回填。
+	// English: when the anchor was stamped (same instant as the opening fill); zero alongside
+	// AnchorPrice==0 means "not backfilled".
+	AnchorAt time.Time `json:"anchor_at,omitempty"`
+}
+
+// AnchorOrCost 返回风险线应使用的基准价：有锚点用锚点，存量无锚点持仓回落成本价。
+// ⚠ 本方法是 §ANCHOR-FIRST **W3 切硬**时的读取入口；W2 影子期不消费它（对照表用 AnchorPrice
+// 原值，0 就是"未知"，绝不拿成本价冒充首买价参与对照，否则两侧永远相同、对照表恒绿即恒盲）。
+// English: the risk-line basis (anchor when known, diluted cost for legacy positions). This is the W3
+// read entry — the W2 shadow table deliberately uses the raw AnchorPrice so "unknown" never masquerades
+// as "identical".
+func (p *Position) AnchorOrCost() float64 {
+	if p.AnchorPrice > 0 {
+		return p.AnchorPrice
+	}
+	return p.CostPrice
 }
 
 // MarketValue 返回该持仓按当前估值价的市值。
@@ -1664,6 +1694,9 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		SignalAt:     signalAt,
 		FilledAt:     now,
 		Mark:         price,
+		// §ANCHOR-FIRST 建仓即冻结的锚点：与当刻 CostPrice 同值（含费），此后没有任何路径改写它。
+		AnchorPrice: totalCost / float64(qty),
+		AnchorAt:    now,
 		// §C2 VWAP 偏差：只在采集到时计算；缺失保持 0。
 		MarketVWAP:     marketVWAP,
 		VWAPPremiumPct: vwapPremiumPct(price, marketVWAP),

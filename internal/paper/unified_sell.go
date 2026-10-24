@@ -14,15 +14,21 @@ import (
 )
 
 // SellProbe 统一卖出裁决层的单持仓探针输入（paper 账本快照）。
-// HighPrice 固定传 0：paper 不持久化持仓期最高价，裁决状态机以成本价为首见高点、
-// 此后每轮用现价自行抬高（进程重启后高点重算——保守方向只可能提前触发移动止盈，不会延后）。
-// English: per-position probe input; HighPrice stays 0 — the judge seeds the trail high at cost
-// and ratchets it live each round (restart recomputes from cost: early-biased, never late).
+// HighPrice 由 engine 侧 §M10 锚点文件注入（paper 账本本身不存持仓期最高价）：
+// runPaperUnifiedJudge 裁决前取 <acctDir>/paper_sell_anchors.json 里的持久化锚点填进探针，
+// 因此"重启后高点退回成本价"的旧形态已被收口（见 internal/engine/sell_anchor.go 头注）。
+// EntryPrice 是**摊薄成本**（盈亏口径，裁决内核当前用它算涨跌幅）；AnchorPrice 是
+// §ANCHOR-FIRST 的**首次买入价**（风险线口径，W2 影子期只随行对照、不参与判定）。
+// English: probe input for the unified sell judge. HighPrice comes from the engine-side §M10
+// anchor file (the paper book itself stores no holding-period high). EntryPrice is the diluted cost
+// (P&L basis, still what the kernel measures against); AnchorPrice is the §ANCHOR-FIRST first-buy
+// basis — carried alongside for the W2 shadow comparison only.
 type SellProbe struct {
-	Code       string
-	Name       string
-	EntryPrice float64
-	Qty        int
+	Code        string
+	Name        string
+	EntryPrice  float64
+	AnchorPrice float64 // §ANCHOR-FIRST 首次买入价锚（0=存量未回填）
+	Qty         int
 }
 
 // SellProbes 当前全部有效持仓的裁决探针快照（Qty>0；现金/池状态不参与判定）。
@@ -34,7 +40,8 @@ func (e *Engine) SellProbes() []SellProbe {
 		if p == nil || p.Qty <= 0 {
 			continue
 		}
-		out = append(out, SellProbe{Code: p.Code, Name: p.Name, EntryPrice: p.CostPrice, Qty: p.Qty})
+		out = append(out, SellProbe{Code: p.Code, Name: p.Name, EntryPrice: p.CostPrice,
+			AnchorPrice: p.AnchorPrice, Qty: p.Qty})
 	}
 	return out
 }

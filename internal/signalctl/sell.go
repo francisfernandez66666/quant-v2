@@ -104,6 +104,14 @@ type SellInput struct {
 	Bull       SignalFresh
 	Bear       BearConfirm
 	Evidence   []string
+	// AnchorPrice §ANCHOR-FIRST（2026-10-24 裁决二）首次买入价锚点。**W2 影子期专用**：
+	// sellProbe 一行都没读它（判定链仍按 EntryPrice，切硬属 W3），它唯一的消费者是
+	// CompareAnchor 产出的对照表。为什么不复用 EntryPrice 这个名字（方案 §4.2-4）：
+	// EntryPrice 语义是"摊薄成本"，改名会把两个口径混成一个，正是裁决二要拆开的那件事。
+	// 0=该账本该行没有锚点（存量未回填），对照表按 AnchorKnown=false 点名，不静默等同成本价。
+	// English: §ANCHOR-FIRST first-buy anchor. In W2 nothing in sellProbe reads it — the only
+	// consumer is the CompareAnchor shadow table. Deliberately not a rename of EntryPrice (diluted cost).
+	AnchorPrice float64
 }
 
 // SellDisposal 处置单（仅 pass 裁定产生）：Action=close 全平 / trim 半平。

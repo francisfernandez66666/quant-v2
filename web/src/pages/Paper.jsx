@@ -727,6 +727,15 @@ export default function Paper() {
     ) },
     { colKey: 'qty', title: '数量', width: 70 },
     { colKey: 'cost', title: '成本价', width: 90, cell: ({ row }) => (row.cost_price || 0).toFixed(2) },
+    // §ANCHOR-FIRST（2026-10-24 裁决二）首买锚点列：风险线（止盈/止损/移动止盈）的基准价，
+    // 建仓即冻结、加仓摊薄不改它 ⇒ 与左边"成本价"（含费摊薄，盈亏口径）可以不同。
+    // 未知（本批之前的存量持仓）显示 '-'——绝不折叠成 0.00 或成本价，那会把"还没回填"
+    // 冒充成"锚点就是成本"（W3 切硬的对照读数因此必须是两列并排，不是一个数）。
+    // English: the frozen first-buy anchor (risk-line basis) next to the diluted cost; unknown
+    // legacy rows render '-' rather than masquerading as the cost price.
+    { colKey: 'anchor', title: '首买锚点', width: 90, cell: ({ row }) => (row.anchor_price > 0
+      ? <span title="风险线基准：首次买入价，加仓不改写">{Number(row.anchor_price).toFixed(2)}</span>
+      : <span style={{ color: 'var(--app-faint)' }} title="该持仓早于锚点口径落库，尚无首买价">-</span>) },
     { colKey: 'mark', title: '现价', width: 90, cell: ({ row }) => (row.mark || 0).toFixed(2) },
     // 浮盈 / 浮盈% / 滑点 三列：均按正负红涨绿跌着色
     { colKey: 'pnl', title: '浮盈', width: 100, cell: ({ row }) => <span style={{ color: row.pnl >= 0 ? UP : DOWN }}>{fmt(row.pnl)}</span> },

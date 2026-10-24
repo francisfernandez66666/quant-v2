@@ -47,6 +47,17 @@ type ExecLog struct {
 	EntryMeta     map[string]float64 `json:"entry_meta,omitempty"`    // 入场评分快照（entry_nphase/vol_ratio/limit_price/highest_price 等，供战法退出引擎使用）
 	HighestPrice  float64            `json:"highest_price,omitempty"` // 阶段最高价（移动止盈基准；开仓时=入场价，盘中实时抬高）
 	ExitReason    string             `json:"exit_reason,omitempty"`   // 卖出原因（如 手动/止损/移动止盈/尾盘强平，供消息与复盘）
+	// AnchorPrice §ANCHOR-FIRST（2026-10-24 裁决二）首次买入价锚点：开仓那一刻的含费入场价，
+	// 写入后**永不被改写**——EntryPrice 会随 AddLot/SellLot/normalizeLots/SetCostBasis 摊薄或
+	// 被人工改成本，风险线（止盈/止损/移动止盈的 `highest > cost` 前置）若跟着 EntryPrice 走，
+	// 一次高位加仓就能把移动止盈资格抹掉。裁决二把风险线分母钉回首买价，盈亏口径照旧摊薄。
+	// 0=未知（本批之前的存量记录）：影子期不参与判定、由对照表点名，回填属 W3（Q10 之后）。
+	// English: §ANCHOR-FIRST — the fee-inclusive entry price, frozen at open. EntryPrice keeps being
+	// diluted/edited; the anchor never moves. 0 = legacy record (backfill lands in W3).
+	AnchorPrice float64 `json:"anchor_price,omitempty"`
+	// AnchorAt 锚点写入时刻（建仓=与 EntryAt 同刻；SetAnchor 显式改锚时刷新，供审计）。
+	// English: when the anchor was stamped (EntryAt at open; refreshed only by the explicit SetAnchor).
+	AnchorAt time.Time `json:"anchor_at,omitempty"`
 }
 
 // Report 管理所有交易持仓记录，提供线程安全的增删改查与文件持久化能力。
@@ -109,14 +120,17 @@ func (r *Report) LogSignalWithMeta(id, code, name, direction, strategy string, e
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	entryAt := time.Now() // §ANCHOR-FIRST 建仓时刻只取一次，EntryAt 与 AnchorAt 必须同一瞬间（两条 time.Now() 会劈开）
 	r.logs = append(r.logs, ExecLog{
 		SignalID:      id,
 		Code:          code,
 		Name:          name,
 		Direction:     direction,
 		Strategy:      strategy,
-		EntryAt:       time.Now(),
+		EntryAt:       entryAt,
 		EntryPrice:    entryPrice,
+		AnchorPrice:   entryPrice, // §ANCHOR-FIRST 建仓即冻结的首次买入价锚（含费口径由调用方保证）
+		AnchorAt:      entryAt,
 		Status:        "持仓中",
 		TakeProfitPct: takeProfitPct,
 		StopLossPct:   stopLossPct,
@@ -147,6 +161,7 @@ func (r *Report) LogSignalWithMetaUser(id, code, name, direction, strategy strin
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	entryAt := time.Now() // §ANCHOR-FIRST 与 EntryAt 同一瞬间，见 LogSignalWithMeta 同款注释
 	r.logs = append(r.logs, ExecLog{
 		SignalID:      id,
 		UserID:        userID, // §多账号隔离：镜像建仓归属到具体账号
@@ -154,8 +169,10 @@ func (r *Report) LogSignalWithMetaUser(id, code, name, direction, strategy strin
 		Name:          name,
 		Direction:     direction,
 		Strategy:      strategy,
-		EntryAt:       time.Now(),
+		EntryAt:       entryAt,
 		EntryPrice:    entryPrice,
+		AnchorPrice:   entryPrice, // §ANCHOR-FIRST 建仓即冻结；镜像链的含费口径由 paper 侧 CostPrice 保证
+		AnchorAt:      entryAt,
 		Status:        "持仓中",
 		TakeProfitPct: takeProfitPct,
 		StopLossPct:   stopLossPct,
@@ -369,7 +386,11 @@ func (r *Report) SellLot(id string, price, qty float64) {
 // SetCostBasis 更新指定 ID 持仓的成本价（改成本）：直接设置 EntryPrice，
 // 并把批次明细重建为一条合成批次，使其与显示的成本/数量保持一致。
 // 找不到记录时静默返回。修改后自动持久化。
-// （SetCostBasis sets a position's cost price and rebuilds lots into a single synthetic lot to match display.）
+// §ANCHOR-FIRST（2026-10-24 裁决二，Q9 口径）：改成本**不动锚点**。人工改成本是盈亏口径的
+// 修正口子，若让它顺手挪风险线，就会出现"改了个显示数字，止损线被推远"的隐式后果；
+// 要改风险线必须显式调用 SetAnchor（独立动作、独立留痕）。
+// English: §ANCHOR-FIRST / Q9 — editing the cost basis deliberately does NOT move the anchor;
+// risk-line changes require the explicit SetAnchor action.
 func (r *Report) SetCostBasis(id string, price float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -385,8 +406,52 @@ func (r *Report) SetCostBasis(id string, price float64) {
 	r.save()
 }
 
+// SetAnchor §ANCHOR-FIRST 显式设定/清除某条记录的首次买入价锚点（风险线基准）。
+//
+// 语义（Q9 裁决的落码面）：
+//   - price==nil 或 *price<=0 ⇒ 声明「首买价未知」，锚点归零（0/NULL 同义），对照表按未回填点名。
+//     这一支不是可有可无的：paper→report 镜像遇到本批之前落盘的存量持仓时，手上只有**摊薄成本**，
+//     拿它当锚点等于给风险线编一个假基准——必须能显式说"不知道"。
+//   - *price>0 ⇒ 写入并把 AnchorAt 刷新为当前时刻（改锚留痕，与建仓时的 AnchorAt=EntryAt 区分）。
+//
+// 返回 false=记录不存在（调用方据此出声，不静默）。找不到记录/零值都不落盘。
+// English: the explicit anchor setter/clearer. nil or a non-positive value declares "first-buy price
+// unknown" (a diluted cost must never masquerade as the risk basis); a positive value stamps it with
+// AnchorAt=now. Returns false when the record is absent.
+func (r *Report) SetAnchor(id string, price *float64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := -1
+	for i := range r.logs {
+		if r.logs[i].SignalID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return false
+	}
+	next := 0.0
+	if price != nil && *price > 0 {
+		next = *price
+	}
+	if r.logs[idx].AnchorPrice == next {
+		return true // 幂等：同值不写盘（镜像每轮可能重复声明，避免无谓 IO）
+	}
+	r.logs[idx].AnchorPrice = next
+	if next > 0 {
+		r.logs[idx].AnchorAt = time.Now()
+	} else {
+		r.logs[idx].AnchorAt = time.Time{}
+	}
+	r.save()
+	return true
+}
+
 // normalizeLots 依据批次明细重算 EntryPrice（加权平均成本）与 Quantity（累计数量）。
 // 无批次明细时保持现有 EntryPrice/Quantity 不变（兼容旧的持久化数据）。
+// §ANCHOR-FIRST：本函数**只**动 EntryPrice/Quantity，绝不参与锚点——它是加仓/减仓摊薄成本的
+// 唯一重算口，锚点必须活过它（AnchorPrice 不可变性由 report_anchor_test.go 锁死）。
 // （normalizeLots recomputes EntryPrice and Quantity from the lots; without lots it keeps current values for legacy data.）
 func normalizeLots(l *ExecLog) {
 	amt, qty := 0.0, 0.0

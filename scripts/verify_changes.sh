@@ -14189,4 +14189,152 @@ CNT123=$((CNT123 + 4))
 
 echo "ok - §123 工装牙齿锁通过（S7 退出码 3 道 + 令牌自愈 3 道 + 告警判据 5 道 + 空态/跳过 2 道 + golden 4 道 + 并行度 1 道 + 反证 4 枚，累计判定点 ${CNT123}）"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# §ANCHOR-FIRST W2（2026-10-24 裁决二「止盈止损点和动态加减仓按首次买入价做锚点」）。
+# 这一段锁的是「W2 只影子、没切硬」这批改动的全部契约，五组判据各管一件事：
+#   ① 内核仍按摊薄成本判线——切硬属 W3，前提是 owner 签认 Q10 那张逐票线位移动表；
+#   ② 三本账（实盘/纸面/日志）都带锚点字段；
+#   ③ 锚点**只在建行时写**：任何 UPDATE SET 都不许碰它（券商对账快照不认识这个键，一旦进 SET
+#      列表，一次全量同步就能把首买价洗成摊薄成本或 0，裁决二的风险线基准当场失效）；
+#   ④ 影子三口（live/paper/report）齐备且真被裁决轮次调用——「有代码无调度」是本项目登记在册的缺陷级名词；
+#   ⑤ 前端两账本上屏，且「未回填」绝不显示成 ¥0.00（拿假首买价骗人）。
+# 再加行为腿：五包 -run Anchor 真跑，条数与**源码派生**的期望对拍；负向锁各配一枚假目标反证。
+# English: the W2 contract — kernel still prices off diluted cost, anchors are write-once at open,
+# all three books feed the shadow table from real rounds, the UI never renders unknown as zero,
+# and the five behavior legs run (count derived from source, never hardcoded).
+echo "==> 124 §ANCHOR-FIRST W2 锚点面：内核未换锚＋锚点建仓即冻结（三本账）＋影子三口齐备＋前端两账本上屏（2026-10-24 裁决二）..."
+fail124() {
+	echo "--- FAIL: §124 $*"
+	exit 1
+}
+CNT124=0
+RP124=internal/store/real_positions.go
+SEL124=internal/signalctl/sell.go
+ASH124=internal/signalctl/anchor_shadow.go
+SHDW124=internal/engine/sell_shadow.go
+ENGG124=internal/engine/engine.go
+REG124=internal/engine/registry.go
+PAP124=internal/paper/paper.go
+RPT124=internal/report/report.go
+WEBP124=web/src/pages/Paper.jsx
+WEBO124=web/src/pages/Positions.jsx
+
+# —— ① 内核未换锚：W2 的「本轮资金行为零变化」契约 ——
+# 判据靶子是 sellProbe 里那行盈亏算式**整串**，不是「文件里有没有 AnchorPrice 字样」——
+# SellInput 已按裁决二新增 AnchorPrice 字段连同说明注释，字样命中属设计，按字样锁必误伤注释
+# （本项目吃过负向 grep 打中注释的亏）。
+grep -q 'pnl := (in\.CurPrice - in\.EntryPrice) / in\.EntryPrice \* 100' "$SEL124" ||
+	fail124 "sellProbe 的盈亏分母不再是摊薄成本 EntryPrice＝W2 越界切硬（W3 的前提是 owner 签认 Q10 逐票线位移动表；未签认前整仓风险线搬家等于未经批准的止损位变更）"
+INA124=$(grep -c 'in\.AnchorPrice' "$SEL124" || true)
+[ "${INA124:-0}" = "0" ] ||
+	fail124 "sellProbe 读到了随行锚点（${SEL124} 里 in.AnchorPrice ${INA124} 处）"
+# 射程自证：同一条判据打在对照层必须命中，否则上面那条「恒 0」是判据机器失灵而不是内核干净。
+RGA124=$(grep -c 'in\.AnchorPrice' "$ASH124" || true)
+[ "${RGA124:-0}" -ge 1 ] ||
+	fail124 "射程自证失败：同一条 in.AnchorPrice 判据在 ${ASH124} 也读出 0＝判据失灵，上面那条绿没有任何含义"
+CNT124=$((CNT124 + 3))
+
+# —— ② 三本账都有锚点字段 ——
+for F124 in "$RP124" "$PAP124" "$RPT124"; do
+	grep -q 'AnchorPrice float64 `json:"anchor_price' "$F124" ||
+		fail124 "$F124 缺 AnchorPrice 字段（三本账任一本没有锚点，对照表就缺一本账的证据）"
+done
+CNT124=$((CNT124 + 3))
+
+# —— ③ 写入冻结：anchor_price 只出现在建行 INSERT 列清单，绝不出现在任何 UPDATE SET ——
+SETA124=$(grep -rn --include='*.go' 'anchor_price=' internal/ 2>/dev/null | grep -v '_test\.go' | wc -l | tr -d ' ' || true)
+[ "${SETA124:-0}" = "0" ] ||
+	fail124 "anchor_price 被写进了 UPDATE SET（非测试代码 ${SETA124} 处）——券商对账快照没有锚点这个键，一次全量同步就会把首买价洗成摊薄成本/0"
+# 建行 INSERT 三处（实盘成交回报主路径 + 两条对账/测试专用入口）。等值锁：多＝有人新开了锚点写入口
+# （要按裁决二逐条核对是否仍「仅建仓时写」），少＝建行路径被删（锚点永远回填不上）。
+INSA124=$(grep -c 'anchor_price)' "$RP124" || true)
+[ "${INSA124:-0}" = "3" ] ||
+	fail124 "锚点建行 INSERT 口数漂移（got=${INSA124} 期望=3；重新数法 grep -n 'anchor_price)' ${RP124}）"
+# 读侧四口一律 COALESCE(anchor_price,0)：NULL=锚点未知，归一成 0 后由对照层点名「未回填」，
+# 绝不让 Go 侧 Scan 直接吃 NULL（那会是一条打不开的错误，而不是一行诚实的空白）。
+RDA124=$(grep -c 'COALESCE(anchor_price,0) FROM' "$RP124" || true)
+[ "${RDA124:-0}" = "4" ] ||
+	fail124 "锚点读取口数漂移（got=${RDA124} 期望=4：全表／含买日／单标的／按账号四口；少一口＝那个读取方看不见锚点）"
+CNT124=$((CNT124 + 3))
+
+# —— ④ 影子装配三口齐备 + 落盘接线在位 ——
+ROWA124=$(grep -c 'AnchorPrice:' "$SHDW124" || true)
+[ "${ROWA124:-0}" = "4" ] ||
+	fail124 "卖出探针行的锚点装配口数漂移（got=${ROWA124} 期望=4：live/paper/report 三处装配 + SellInput 构造一处）"
+# 三口各自的账本标识必须**逐个**恰好一处：只数总口数（旧写法）对「把 report 那口写成 paper」
+# 没有区分度——三个合法字面量里换一个，总数照样是 3，那张对照表却少了一本账。
+# English: per-literal equality, not a total count — swapping one book label for another keeps the
+# total at 3 while silently dropping a whole book from the sign-off table.
+for B124 in live paper report; do
+	ONE124=$(grep -cE "judgeSellPositions\(signalctl\.Channel[A-Za-z]+, account, \"${B124}\"" "$SHDW124" || true)
+	[ "${ONE124:-0}" = "1" ] ||
+		fail124 "统一卖出裁决缺 ${B124} 账本标识（got=${ONE124} 期望=1：三口必须各不相同；重复或缺口都让 Q10 对照表少一本账）"
+done
+CNT124=$((CNT124 + 3))
+CMPA124=$(grep -c 'signalctl\.CompareAnchor(in, pol, book)' "$SHDW124" || true)
+[ "${CMPA124:-0}" = "1" ] ||
+	fail124 "内核轮次里的对照调用丢失（got=${CMPA124} 期望=1；CompareAnchor 没被真裁决轮次调用＝纯函数有代码无调度）"
+RECA124=$(grep -c 'e\.recordAnchorShadow(account, book, shadowRows, now)' "$SHDW124" || true)
+[ "${RECA124:-0}" = "1" ] ||
+	fail124 "对照表落盘调用丢失（got=${RECA124} 期望=1；没有它，Q10 那张签认材料永远不会自己长出来）"
+grep -q 'anchorShadowPath = filepath\.Join(dataDir, "anchor_shadow\.json")' "$ENGG124" ||
+	fail124 "对照文件路径没在引擎装配期定死（只剩日志、没有可签认的文件）"
+CNT124=$((CNT124 + 4))
+
+# —— ⑤ 日志账镜像两分支：有锚写锚、无锚显式声明未知（不拿摊薄成本冒充首买价）——
+MIRA124=$(grep -c 'rpt\.SetAnchor("pap_"' "$REG124" || true)
+[ "${MIRA124:-0}" = "2" ] ||
+	fail124 "纸面建仓镜像日志账的 SetAnchor 口数漂移（got=${MIRA124} 期望=2：带锚/显式未知两分支；少一支＝要么漏写锚点，要么把 0 冒充成首买价）"
+CNT124=$((CNT124 + 1))
+
+# —— ⑥ 前端两账本上屏，且「未回填」绝不显示成 ¥0.00 ——
+for F124 in "$WEBP124" "$WEBO124"; do
+	T124=$(grep -c '首买锚点' "$F124" || true)
+	[ "${T124:-0}" = "2" ] || fail124 "$F124 的「首买锚点」计数漂移（got=${T124} 期望=2：列标题 + 悬停说明）"
+	G124=$(grep -c 'row\.anchor_price > 0' "$F124" || true)
+	[ "${G124:-0}" = "1" ] || fail124 "$F124 缺「锚点>0 才显示」的门槛（got=${G124} 期望=1；未回填直接渲染成 0.00 就是拿假首买价骗人）"
+done
+CNT124=$((CNT124 + 4))
+
+# —— ⑦ 行为腿：五包 -run Anchor 真跑，PASS 条数与源码派生的期望对拍 ——
+# 期望值现从 `^func Test...Anchor` 数出来，不写死（写死＝新增一条用例当晚过时，而「过时却全绿」比红更坏）。
+# got 取 -v 的 `--- PASS` 行数：go test 对 -run 空匹配照样打 ok，只比退出码抓不到「判据压根没跑」。
+W124=$(mktemp -d "${TMPDIR:-/tmp}/gate124.XXXXXX") || fail124 "行为腿工作目录建不起来"
+LEG124_TOTAL=0
+for D124 in internal/signalctl internal/engine internal/store internal/paper internal/report; do
+	LOG124="$W124/$(printf '%s' "$D124" | tr '/' '_').log"
+	WANT124=$(grep -hE '^func Test[A-Za-z0-9_]*Anchor' "$D124"/*_test.go 2>/dev/null | wc -l | tr -d ' ' || true)
+	[ "${WANT124:-0}" -ge 1 ] || { rm -rf "$W124"; fail124 "$D124 一条锚点用例都没有（派生期望 0＝判据没射程，不是全绿）"; }
+	if ! go test -v -run Anchor "./$D124/" -count=1 >"$LOG124" 2>&1; then
+		tail -20 "$LOG124"
+		rm -rf "$W124"
+		fail124 "$D124 锚点行为腿非零退出（上面贴出末 20 行归因）"
+	fi
+	GOT124=$(grep -c '^--- PASS' "$LOG124" || true)
+	BAD124=$(grep -c '^--- FAIL' "$LOG124" || true)
+	[ "${BAD124:-0}" = "0" ] || { tail -20 "$LOG124"; rm -rf "$W124"; fail124 "$D124 锚点用例 FAIL=${BAD124}"; }
+	[ "${GOT124:-0}" = "${WANT124}" ] || {
+		rm -rf "$W124"
+		fail124 "$D124 锚点腿跑到的条数与源码派生不符（PASS=${GOT124} 应有=${WANT124}——少跑＝-run 正则没覆盖新增用例，这条绿不算全绿）"
+	}
+	LEG124_TOTAL=$((LEG124_TOTAL + GOT124))
+done
+rm -rf "$W124"
+CNT124=$((CNT124 + 5))
+
+# —— ⑧ 反证：把「坏形态」塞进临时副本，证明负向锁真会红（恒零命中不算锁）——
+W124M=$(mktemp -d "${TMPDIR:-/tmp}/gate124m.XXXXXX") || fail124 "反证工作目录建不起来"
+printf '%s\n' 'ON CONFLICT DO UPDATE SET anchor_price=excluded.anchor_price,' > "$W124M/fake_set.go"
+printf '%s\n' 'pnlBase := in.AnchorPrice' > "$W124M/fake_kernel.go"
+grep -q 'anchor_price=' "$W124M/fake_set.go" || fail124 "反证失效：SET 裸写的假目标没被负向判据抓到"
+grep -q 'in\.AnchorPrice' "$W124M/fake_kernel.go" || fail124 "反证失效：内核换锚的假目标没被负向判据抓到"
+# 自洽：假目标不得满足正向算式判据，否则 ① 的等值锁对两种形态没有区分度。
+if grep -q 'pnl := (in\.CurPrice - in\.EntryPrice) / in\.EntryPrice \* 100' "$W124M/fake_kernel.go"; then
+	fail124 "反证不自洽：换锚假目标也满足成本口径算式判据（正向锁无区分度）"
+fi
+rm -rf "$W124M"
+CNT124=$((CNT124 + 3))
+
+echo "ok - §124 §ANCHOR-FIRST W2 锁通过（内核未换锚 3 道 + 三本账字段 3 道 + 写入冻结 3 道 + 影子装配 7 道（三口账本标识逐个等值）+ 日志镜像 1 道 + 前端 4 道 + 行为腿 5 包共 ${LEG124_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT124}；W2 只影子，切硬待 Q10 签认）"
+
 echo "==> 全部通过"

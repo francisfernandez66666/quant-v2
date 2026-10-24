@@ -332,6 +332,15 @@ type Engine struct {
 	paperAnchorPath   string                        // <acctDir>/paper_sell_anchors.json（空=纯内存禁用落盘）
 	paperAnchors      map[string]map[string]float64 // 账号 → 持仓代码 → 持仓期最高价锚点
 	paperAnchorLoaded bool                          // 懒加载标记（首次访问读一次文件）
+	// §ANCHOR-FIRST（2026-10-24 裁决二，W2 影子层）三本账「成本口径 vs 首次买入价锚点」对照表：
+	// 每个（账本 × 北京交易日）当日首轮记一次，落 <acctDir>/anchor_shadow.json + 一行日志总账。
+	// 与上面 paper 锚点不同，这里不缓存跨轮文档（每次读-改-写），只在内存留「该账本当日已取样」
+	// 标记挡住读盘——当日读数写下即不再变化，5 秒轮因此不会变成 IO 热点。
+	// English: §ANCHOR-FIRST W2 shadow table (diluted cost vs frozen first-buy anchor), one sample
+	// per book per Beijing day. No cross-round copy of the document, only a sampled-day marker.
+	anchorShadowMu      sync.Mutex
+	anchorShadowPath    string          // <acctDir>/anchor_shadow.json（空=纯内存禁用落盘，日志照打）
+	anchorShadowSampled map[string]bool // "<book>|<北京日>" → 当日已取样（挡读盘，不改判定语义）
 	// §A+B 近实时打分循环间隔（默认 0 → 回退 5s），可配置为 1-2s 以加快信号翻转检出。
 	scoringInterval time.Duration
 	// §BUY-REJECT-BACKOFF（2026-10-12 波 7）业务拒单退避账本：同一代码被网关业务拒单
@@ -616,6 +625,7 @@ func New(
 	// 均落在账号数据目录下（per-acctDir 装配天然按账号隔离；dataDir 空=纯内存禁用）。
 	paperAnchorPath := ""
 	buyQueuePath := ""
+	anchorShadowPath := "" // §ANCHOR-FIRST 影子对照表落盘路径（dataDir 空=禁用文件、只打日志）
 	if dataDir != "" {
 		hotRecPath = filepath.Join(dataDir, "hot_records.json")
 		signalRecPath = filepath.Join(dataDir, "signal_records.json")
@@ -624,6 +634,7 @@ func New(
 		macroCalCachePath = filepath.Join(dataDir, "macro_calendar_cache.json")
 		paperAnchorPath = filepath.Join(dataDir, "paper_sell_anchors.json")
 		buyQueuePath = filepath.Join(dataDir, "buy_queue_pending.json")
+		anchorShadowPath = filepath.Join(dataDir, "anchor_shadow.json") // §ANCHOR-FIRST W2 影子对照表
 	}
 	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
 	e := &Engine{
@@ -668,8 +679,9 @@ func New(
 		d1ScoredSig:       make(map[string]string),
 		d1RetryQueue:      make(map[string]bool),
 		factorMon:         newFactorMonitor(dataDir, 5),
-		paperAnchorPath:   paperAnchorPath, // §M10 paper 移动止盈锚点文件（空=纯内存不落盘）
-		buyQueuePath:      buyQueuePath,    // §M11 停机买单队列落盘路径（空=禁用）
+		paperAnchorPath:   paperAnchorPath,  // §M10 paper 移动止盈锚点文件（空=纯内存不落盘）
+		buyQueuePath:      buyQueuePath,     // §M11 停机买单队列落盘路径（空=禁用）
+		anchorShadowPath:  anchorShadowPath, // §ANCHOR-FIRST W2 影子对照表（空=不落盘，日志照打）
 	}
 	// §D-2（GAP_VERIFY_20260917_PM）裁定留痕落盘：JSONL 按日轮转 + 启动回灌当日环，
 	// quant 重启不再丢"为何没成交"的拦截原因。dataDir 空（纯内存测试路径）自动跳过；

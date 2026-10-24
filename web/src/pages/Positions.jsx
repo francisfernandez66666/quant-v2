@@ -878,6 +878,12 @@ export default function Positions() {
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name}</span> },
     { colKey: 'qty', title: '数量', width: 70, sorter: (a, b) => (a.qty || 0) - (b.qty || 0), cell: ({ row }) => row.qty },
     { colKey: 'cost_price', title: '成本价', width: 90, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(3) : '-') },
+    // §ANCHOR-FIRST（2026-10-24 裁决二）首买锚点=风险线基准（建仓即冻结，加仓摊薄不改写它），
+    // 与左侧"成本价"（含费摊薄，盈亏口径）分两列并排——W3 切硬前 owner 要逐票看清两者的差。
+    // 0/缺失显示 '—'（存量持仓尚未回填），不得回退成成本价，否则影子对照会被读成"两者相同"。
+    // English: the frozen first-buy anchor beside the diluted cost; un-backfilled rows show '—'
+    // rather than falling back to cost (which would fake "the two bases agree").
+    { colKey: 'anchor_price', title: '首买锚点', width: 90, sorter: (a, b) => (a.anchor_price || 0) - (b.anchor_price || 0), cell: ({ row }) => (row.anchor_price > 0 ? '¥' + Number(row.anchor_price).toFixed(3) : '—') },
     { colKey: 'cur_price', title: '现价', width: 90, sorter: (a, b) => curPrice(a) - curPrice(b), cell: ({ row }) => curPrice(row) ? '¥' + curPrice(row).toFixed(2) : '—' },
     // §F1 实盘持仓盈亏按 realPnlPct 派生值排序（成本价×数量的浮盈率），与展示口径一致
     { colKey: 'pnl', title: '持仓盈亏', width: 90, sorter: (a, b) => realPnlPct(a) - realPnlPct(b), cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },

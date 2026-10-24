@@ -217,6 +217,19 @@ func (r *Registry) paperMirror(userID string) (func(paper.Position), func(string
 		// （此前漏打 user_id，导致不同账号的纸面持仓在 report 账里互相可见/被错误消费）。
 		rpt.LogSignalWithMetaQtyUser("pap_"+pos.Code, pos.Code, pos.Name, "做多", pos.Strategy,
 			pos.CostPrice, tp, sl, float64(pos.Qty), meta, userID)
+		// §ANCHOR-FIRST（2026-10-24 裁决二）镜像锚点必须由 paper 账本自己申报，不能沿用 LogSignal
+		// 里"锚点=当刻成本"的默认值：回灌路径（存量持仓重启回灌）上的持仓可能已经过加仓摊薄，
+		// pos.CostPrice 早已不是首次买入价。pos.AnchorPrice<=0（老 paper.json 无此字段）时显式
+		// 声明未知——宁可 report 侧少一行可比对照，也不让摊薄成本冒充风险线基准（那会让 W2
+		// 影子表在回填完成前给出假绿）。
+		// English: the mirror declares the anchor from the paper book itself; an unknown anchor is
+		// declared unknown rather than filled with the diluted cost (a false basis ⇒ a false-green table).
+		anchor := pos.AnchorPrice
+		if anchor <= 0 {
+			rpt.SetAnchor("pap_"+pos.Code, nil)
+		} else {
+			rpt.SetAnchor("pap_"+pos.Code, &anchor)
+		}
 		log.Printf("[registry] 镜像开仓 %s(%s) 战法:%s 数量%d 止盈%.0f%% 止损%.0f%%",
 			pos.Name, pos.Code, pos.StrategyType, pos.Qty, tp, sl)
 	}
