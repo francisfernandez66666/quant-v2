@@ -140,6 +140,8 @@ export default function Research() {
   const [noDB, setNoDB] = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
   const [progress, setProgress] = useState(null)
+  // §2026-10-24 研究进度读取失败可见：旧实现 catch 只 console.error，页面无提示也无重试。
+  const [progressError, setProgressError] = useState('')
   // ── 战法库状态：库列表、加载标记、展开指定战法 ──
   const [library, setLibrary] = useState([])
   const [loadingLibrary, setLoadingLibrary] = useState(false)
@@ -422,11 +424,26 @@ export default function Research() {
     // §P2-I：本轮代号先盖章；后到的旧进度整包丢弃（否则进度条会从「90%」倒回「40%」）
     const token = progressGuard.begin()
     try {
-      const p = await api.fetchResearchProgress()
-      // 常量 p：局部定义
+      let p
+      try {
+        p = await api.fetchResearchProgress()
+      } catch (e) {
+        // §2026-10-24：冷缓存重算可能超过一次请求窗口，退避后重试一次（仍受 staleGuard 约束）。
+        if (progressGuard.isStale(token)) return
+        await new Promise((r) => setTimeout(r, 2000))
+        if (progressGuard.isStale(token)) return
+        p = await api.fetchResearchProgress()
+      }
       if (progressGuard.isStale(token)) return // §P2-I 后到的旧轮次
-      if (p) setProgress(p)
-    } catch (e) { console.error('Research 进度加载失败', e) }
+      if (p) {
+        setProgress(p)
+        setProgressError('')
+      }
+    } catch (e) {
+      if (progressGuard.isStale(token)) return
+      setProgressError(String((e && e.message) || e || '研究进度读取失败'))
+      console.error('Research 进度加载失败', e)
+    }
   }
   // 按当前状态筛选拉取研究候选列表；研究库未接入时进入 noDB 空状态
   async function loadData() {
@@ -1640,6 +1657,12 @@ export default function Research() {
 
             {candSubTab === 'patterns' && (
               <div>
+                {progressError && (
+                  <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: 'var(--app-warn-bg, #fff7e6)', border: '1px solid var(--app-warn-border, #ffd591)', color: 'var(--td-warning-color)', fontSize: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span>⚠ 研究进度读取失败：{progressError.slice(0, 160)}</span>
+                    <Button size="small" variant="outline" theme="warning" onClick={() => loadProgress()}>重试</Button>
+                  </div>
+                )}
                 {/* 研究处理进度卡片：数据准备度/日线行数/财务行数/候选统计 */}
                 {progress && (
                   <Card style={{ marginBottom: 12 }} title={<span>研究处理进度 {progress.db_attached && <Tag theme="success" size="small">数据源: {progress.db_attached}</Tag>}</span>}>

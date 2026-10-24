@@ -12,7 +12,6 @@ import (
 
 	"quant-trading-v2/internal/factor"
 	"quant-trading-v2/internal/research"
-	"sync"
 	"time"
 )
 
@@ -42,13 +41,302 @@ func (s *Server) handleResearchFactors(w http.ResponseWriter, r *http.Request) {
 // （handleResearchProgress serves GET /api/research/progress — the research DB data-loading and
 // research-task progress: stock counts, daily coverage, financial coverage, candidate counts and
 // how many stocks are research-ready. The auto-research page renders progress bars from this.）
-// progressCache 进度接口结果缓存：该接口含三次全表统计（daily 765万行 COUNT/GROUP BY），
-// 浏览器 30s 轮询 × 全表扫描曾参与把整机挤进内存枯竭（2026-08-23 实录）。
-// 60s 缓存对进度条展示完全够用。English: 60s cache — three full-table stats per poll was a wedge ingredient.
-var progressCache struct {
-	mu   sync.Mutex
-	at   time.Time
-	body map[string]any
+// §2026-10-24 研究进度快照：接口含多次全表统计（daily 数百万行），冷缓存可达数十秒。
+// 处理原则：每 Server 独立缓存（不用包级全局，避免测试/多实例串台）+ 落盘快照 +
+// stale-while-revalidate + 单飞重算。进度只用于展示，不参与交易决策，允许短时间旧值。
+const researchProgressTTL = 5 * time.Minute
+
+// researchProgressSnapshotFile 快照文件名（研究目录下；无 researchDir 时不落盘）。
+const researchProgressSnapshotFile = "research_progress_snapshot.json"
+
+// researchProgressSnapshot 落盘结构。
+type researchProgressSnapshot struct {
+	AsOf time.Time      `json:"as_of"`
+	Body map[string]any `json:"body"`
+}
+
+// researchProgressPath 快照路径；未配置研究目录返回空串。
+func (s *Server) researchProgressPath() string {
+	if s.researchDir == "" {
+		return ""
+	}
+	return filepath.Join(s.researchDir, researchProgressSnapshotFile)
+}
+
+// loadResearchProgressSnapshot 读取落盘快照；缺失/损坏返回 false。
+func (s *Server) loadResearchProgressSnapshot() (map[string]any, time.Time, bool) {
+	p := s.researchProgressPath()
+	if p == "" {
+		return nil, time.Time{}, false
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil || len(raw) == 0 {
+		return nil, time.Time{}, false
+	}
+	var snap researchProgressSnapshot
+	if json.Unmarshal(raw, &snap) != nil || snap.Body == nil {
+		return nil, time.Time{}, false
+	}
+	at := snap.AsOf
+	if at.IsZero() {
+		if st, serr := os.Stat(p); serr == nil {
+			at = st.ModTime()
+		}
+	}
+	return snap.Body, at, true
+}
+
+// saveResearchProgressSnapshot 原子写快照（临时文件 + rename），失败只记日志。
+func (s *Server) saveResearchProgressSnapshot(body map[string]any, at time.Time) {
+	p := s.researchProgressPath()
+	if p == "" || body == nil {
+		return
+	}
+	raw, err := json.MarshalIndent(researchProgressSnapshot{AsOf: at, Body: body}, "", " ")
+	if err != nil {
+		log.Printf("[research] progress 快照序列化失败: %v", err)
+		return
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		log.Printf("[research] progress 快照写入失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		log.Printf("[research] progress 快照替换失败: %v", err)
+		_ = os.Remove(tmp)
+	}
+}
+
+// progressResponse 复制一份响应并附上快照时间/是否旧值（增量字段，前端可忽略）。
+func progressResponse(body map[string]any, at time.Time, stale bool) map[string]any {
+	out := make(map[string]any, len(body)+2)
+	for k, v := range body {
+		out[k] = v
+	}
+	if !at.IsZero() {
+		out["as_of"] = at.Format(time.RFC3339)
+	}
+	out["stale"] = stale
+	return out
+}
+
+// startResearchProgressCompute 单飞启动一次后台重算；已有重算在跑时直接返回。
+func (s *Server) startResearchProgressCompute() {
+	if s.researchDB == nil {
+		return
+	}
+	s.researchProgressMu.Lock()
+	if s.researchProgressComputing {
+		s.researchProgressMu.Unlock()
+		return
+	}
+	if s.researchProgressBody != nil && time.Since(s.researchProgressAt) < researchProgressTTL {
+		s.researchProgressMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	s.researchProgressComputing = true
+	s.researchProgressDone = done
+	s.researchProgressMu.Unlock()
+
+	go func() {
+		body, err := s.computeResearchProgress()
+		s.finishResearchProgressCompute(body, err, done)
+	}()
+}
+
+// finishResearchProgressCompute 收口一次重算：成功才更新缓存并落盘；无论成败都释放单飞闸。
+func (s *Server) finishResearchProgressCompute(body map[string]any, err error, done chan struct{}) {
+	now := time.Now()
+	s.researchProgressMu.Lock()
+	s.researchProgressComputing = false
+	if err == nil && body != nil {
+		s.researchProgressBody = body
+		s.researchProgressAt = now
+	}
+	if s.researchProgressDone == done {
+		close(done)
+		s.researchProgressDone = nil
+	}
+	s.researchProgressMu.Unlock()
+	if err != nil {
+		log.Printf("[research] progress 计算失败: %v", err)
+		return
+	}
+	if body != nil {
+		s.saveResearchProgressSnapshot(body, now)
+	}
+}
+
+// WarmResearchProgress 启动后延迟预热一次进度快照（不阻塞启动）。
+// 目的：避免部署后第一位打开自动研究页的用户吃到 40s 冷算；已有新鲜缓存则跳过。
+func (s *Server) WarmResearchProgress(delay time.Duration) {
+	if s.researchDB == nil {
+		return
+	}
+	start := func() {
+		s.researchProgressMu.Lock()
+		fresh := s.researchProgressBody != nil && time.Since(s.researchProgressAt) < researchProgressTTL
+		s.researchProgressMu.Unlock()
+		if !fresh {
+			s.startResearchProgressCompute()
+		}
+	}
+	if delay <= 0 {
+		start()
+		return
+	}
+	time.AfterFunc(delay, start)
+}
+
+// handleResearchProgress 处理 GET /api/research/progress：返回研究库数据加载与研究任务进度。
+// 统计：股票总数、行情覆盖天数/行数、财务覆盖、候选数、研究池可用股票数。
+// 前端自动研究页据此渲染进度条（数据准备度）与候选产出状态。
+func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) {
+	if s.researchDB == nil {
+		writeError(w, 503, "研究库未接入")
+		return
+	}
+
+	// 1) 内存缓存：新鲜直接回；旧值先回并触发后台重算（stale-while-revalidate）。
+	s.researchProgressMu.Lock()
+	if body := s.researchProgressBody; body != nil {
+		at := s.researchProgressAt
+		if time.Since(at) < researchProgressTTL {
+			s.researchProgressMu.Unlock()
+			writeJSON(w, 200, progressResponse(body, at, false))
+			return
+		}
+		s.researchProgressMu.Unlock()
+		s.startResearchProgressCompute()
+		writeJSON(w, 200, progressResponse(body, at, true))
+		return
+	}
+	s.researchProgressMu.Unlock()
+
+	// 2) 没有内存值：尝试落盘快照；有旧快照先回，再后台重算。
+	if body, at, ok := s.loadResearchProgressSnapshot(); ok {
+		s.researchProgressMu.Lock()
+		if s.researchProgressBody == nil {
+			s.researchProgressBody = body
+			s.researchProgressAt = at
+		}
+		body = s.researchProgressBody
+		at = s.researchProgressAt
+		s.researchProgressMu.Unlock()
+		s.startResearchProgressCompute()
+		writeJSON(w, 200, progressResponse(body, at, true))
+		return
+	}
+
+	// 3) 既无缓存也无快照：若已有重算在跑，等它结束；否则同步算一次（首个请求仍可能慢，
+	//    但结果会落盘，后续请求走快照/缓存；部署侧用 WarmResearchProgress 预热）。
+	s.researchProgressMu.Lock()
+	if s.researchProgressComputing {
+		done := s.researchProgressDone
+		s.researchProgressMu.Unlock()
+		if done != nil {
+			<-done
+		}
+		s.researchProgressMu.Lock()
+		body := s.researchProgressBody
+		at := s.researchProgressAt
+		s.researchProgressMu.Unlock()
+		if body != nil {
+			writeJSON(w, 200, progressResponse(body, at, false))
+			return
+		}
+		writeError(w, 500, "研究进度计算失败，请稍后重试")
+		return
+	}
+	done := make(chan struct{})
+	s.researchProgressComputing = true
+	s.researchProgressDone = done
+	s.researchProgressMu.Unlock()
+
+	body, err := s.computeResearchProgress()
+	s.finishResearchProgressCompute(body, err, done)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	s.researchProgressMu.Lock()
+	at := s.researchProgressAt
+	s.researchProgressMu.Unlock()
+	writeJSON(w, 200, progressResponse(body, at, false))
+}
+
+// computeResearchProgress 真正的统计逻辑（纯计算，不写 ResponseWriter）。
+// 所有错误向上返回，由 handler/异步重算决定如何呈现。
+func (s *Server) computeResearchProgress() (map[string]any, error) {
+	db := s.researchDB
+	stocks, err := db.StockCodes()
+	if err != nil {
+		return nil, err
+	}
+	nStocks := len(stocks)
+
+	// 行情覆盖：近一年有日线的股票数（研究可用的有效池）+ daily 总行数
+	dailyRows, err := db.Count("daily", "")
+	if err != nil {
+		return nil, err
+	}
+	// 研究池：近一年（约 244 个交易日）有行情的股票数
+	ready := 0
+	if nStocks > 0 {
+		ready, err = db.ReadyStockCount()
+		if err != nil {
+			return nil, err
+		}
+	}
+	// 财务覆盖（近一年有财报的股票数，作为因子可用性代理）
+	fin, err := db.Count("fina_indicator", "")
+	if err != nil {
+		return nil, err
+	}
+	// 候选产出
+	cands, err := db.ListCandidates("")
+	if err != nil {
+		return nil, err
+	}
+	applied, proposed := 0, 0
+	for _, c := range cands {
+		switch c.Status {
+		case "applied":
+			applied++
+		case "proposed":
+			proposed++
+		}
+	}
+
+	// 覆盖比例：研究池就绪 = 近一年有行情的股票 / 总股票
+	readyPct := 0.0
+	if nStocks > 0 {
+		readyPct = float64(ready) / float64(nStocks)
+	}
+	log.Printf("[research] progress: stocks=%d ready=%d daily_rows=%d fin=%d cands=%d", nStocks, ready, dailyRows, fin, len(cands))
+	// §数据源标识：前端徽标展示「同花顺（新）/ baostock」
+	ds := "baostock"
+	if s.cfg != nil {
+		if ps := s.cfg.Get().Data.PrimarySource; ps == "hithink" { // §0925EVE-D1：字段裸读改加锁访问器
+			ds = "同花顺（新）"
+		}
+	}
+	// 汇总研究进度统计并返回：各数据源覆盖量、就绪比、候选/已应用数。
+	return map[string]any{
+		"stocks":       nStocks,
+		"ready_stocks": ready,
+		"ready_pct":    readyPct,
+		"daily_rows":   dailyRows,
+		"fin_rows":     fin,
+		"candidates":   len(cands),
+		"applied":      applied,
+		"proposed":     proposed,
+		"db_attached":  true,
+		"data_source":  ds,
+		"scheduler":    s.schedulerState(),
+	}, nil
 }
 
 // handleSchedulerStatus 处理 GET /api/scheduler/status：读取 researchd 每 30s 写入的
@@ -121,109 +409,6 @@ func (s *Server) handleResearchTaskLog(w http.ResponseWriter, r *http.Request) {
 		raw = raw[len(raw)-maxBytes:]
 	}
 	writeJSON(w, 200, map[string]any{"exists": true, "log": string(raw)})
-}
-
-// handleResearchProgress 处理 GET /api/research/progress：返回自动研究流水尾部日志
-// （截断至 maxBytes 防止超大响应），配合前端轮询展示研究执行进度。
-func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) {
-	if s.researchDB == nil {
-		writeError(w, 503, "研究库未接入")
-		return
-	}
-	// 60s 缓存：命中则直接返回上次结果，避免高频轮询重复统计。
-	progressCache.mu.Lock()
-	if progressCache.body != nil && time.Since(progressCache.at) < 60*time.Second {
-		body := progressCache.body
-		progressCache.mu.Unlock()
-		writeJSON(w, 200, body)
-		return
-	}
-	progressCache.mu.Unlock()
-	body := s.computeResearchProgress(w)
-	if body == nil {
-		return
-	}
-	// 未命中缓存时重新统计并刷新缓存。
-	progressCache.mu.Lock()
-	progressCache.at, progressCache.body = time.Now(), body
-	progressCache.mu.Unlock()
-	writeJSON(w, 200, body)
-}
-
-// computeResearchProgress 真正的统计逻辑（原 handler 体，签名化以便缓存包装）。
-func (s *Server) computeResearchProgress(w http.ResponseWriter) map[string]any {
-	db := s.researchDB
-	stocks, err := db.StockCodes()
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return nil
-	}
-	nStocks := len(stocks)
-
-	// 行情覆盖：近一年有日线的股票数（研究可用的有效池）+ daily 总行数
-	dailyRows, err := db.Count("daily", "")
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return nil
-	}
-	// 研究池：近一年（约 244 个交易日）有行情的股票数
-	ready := 0
-	if nStocks > 0 {
-		ready, err = db.ReadyStockCount()
-		if err != nil {
-			writeError(w, 500, err.Error())
-			return nil
-		}
-	}
-	// 财务覆盖（近一年有财报的股票数，作为因子可用性代理）
-	fin, err := db.Count("fina_indicator", "")
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return nil
-	}
-	// 候选产出
-	cands, err := db.ListCandidates("")
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return nil
-	}
-	applied, proposed := 0, 0
-	for _, c := range cands {
-		switch c.Status {
-		case "applied":
-			applied++
-		case "proposed":
-			proposed++
-		}
-	}
-
-	// 覆盖比例：研究池就绪 = 近一年有行情的股票 / 总股票
-	readyPct := 0.0
-	if nStocks > 0 {
-		readyPct = float64(ready) / float64(nStocks)
-	}
-	log.Printf("[research] progress: stocks=%d ready=%d daily_rows=%d fin=%d cands=%d", nStocks, ready, dailyRows, fin, len(cands))
-	// §数据源标识：前端徽标展示「同花顺（新）/ baostock」
-	ds := "baostock"
-	if s.cfg != nil {
-		if ps := s.cfg.Get().Data.PrimarySource; ps == "hithink" { // §0925EVE-D1：字段裸读改加锁访问器
-			ds = "同花顺（新）"
-		}
-	}
-	// 汇总研究进度统计并返回：各数据源覆盖量、就绪比、候选/已应用数。
-	return map[string]any{
-		"stocks":       nStocks,
-		"ready_stocks": ready,
-		"ready_pct":    readyPct,
-		"daily_rows":   dailyRows,
-		"fin_rows":     fin,
-		"candidates":   len(cands),
-		"applied":      applied,
-		"proposed":     proposed,
-		"db_attached":  true,
-		"data_source":  ds,
-		"scheduler":    s.schedulerState(),
-	}
 }
 
 // schedulerState 读取 research_state.json 的最近步骤结果（阶段2.4 状态上报）：

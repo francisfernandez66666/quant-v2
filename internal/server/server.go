@@ -158,6 +158,18 @@ type Server struct {
 
 	researchDB  *store.DB // B5 研究候选库（optimize 产出入库；web 审批读写）
 	researchDir string    // B5 应用目录（applied_rules.json 落盘处）
+
+	// §2026-10-24 研究进度快照：进度接口含多次全表统计，冷缓存可达数十秒。
+	// 用每 Server 独立缓存（不再用包级全局）+ 落盘快照 + 单飞重算：
+	//   - 新鲜（5min）直接返回；
+	//   - 有旧值先返回旧值，同时后台重算（stale-while-revalidate）；
+	//   - 无旧值但有文件快照，先返回文件并后台重算；
+	//   - 同一时刻只允许一个重算，避免多标签并发扫全表。
+	researchProgressMu        sync.Mutex
+	researchProgressAt        time.Time
+	researchProgressBody      map[string]any
+	researchProgressComputing bool
+	researchProgressDone      chan struct{}
 	// liveDB 实盘账本隔离库（real_positions/orders/fills/real_account）。§OPT-3：与 researchDB（trading.db）
 	// 拆分，避免夜间研究大批量写入与实时实盘对账/心跳同文件争锁，并便于独立备份。
 	// 为空时 realDB() 回退 researchDB，保证旧部署（实盘账本仍在 trading.db）向后兼容。

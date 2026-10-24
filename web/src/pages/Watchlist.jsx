@@ -15,6 +15,7 @@ import {
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+import { normalizeStockCode } from '../utils/stockCode.js'
 
 // 自选股列表的 localStorage 缓存键（账号后缀由 cacheKeyForAccount() 拼接）
 const CACHE_KEY = 'wl_cache_v1'
@@ -304,16 +305,19 @@ export default function Watchlist() {
   async function add() {
     const code = (newCode || '').trim()
     if (!code || adding) return
+    // §2026-10-24 前端预校验（与服务端同源）：非法代码不发请求、不写缓存。
+    const norm = normalizeStockCode(code)
+    if (norm.error) { MessagePlugin.error(norm.error); return }
     setAdding(true)
     try {
       // 调用后端添加接口，返回新股票信息
-      const res = await api.addWatchlist(code)
+      const res = await api.addWatchlist(norm.code)
       setNewCode('')
       if (res && res.stock) {
         // 后端返回完整股票信息：用返回数据构建展示行
         const row = {
-          code: res.stock.code || code,
-          name: res.stock.name || code,
+          code: res.stock.code || norm.code,
+          name: res.stock.name || norm.code,
           // §P3-FE P8/P9：添加返回没带行情时留 null（旧写法写 0 会让新行立刻显示「¥0.00 +0.00%」，
           // 看起来像读到平盘；下一轮快照有数后才会被真值替换）
           price: priceOrNil(res.stock.price),
@@ -336,7 +340,7 @@ export default function Watchlist() {
         setStocks(next)
         persistCache(next, lastQuoteAtRef.current)
       }
-      MessagePlugin.success('已添加 ' + code)
+      MessagePlugin.success('已添加 ' + norm.code)
     } catch (e) { MessagePlugin.error('添加失败: ' + (e.message || '')) }
     setAdding(false)
   }

@@ -10968,7 +10968,7 @@ esac
 CNT113=$((CNT113 + 1))
 IMP113=$(grep -rlF "utils/staleGuard.js" web/src/pages web/src/components 2>/dev/null | grep -c . || true)
 min113 '§P2-I N2：import 守卫的文件数（派生而不是点名；低于轮询页下界＝有人把整批 import 删了）' "$IMP113" "$(jget113 floors_pollPages)"
-eqr113 "$RES113" 'isStale\(t' 10 'N4：判污调用点在位（只 begin 不 isStale＝半边守卫；2026-10-09 预演实测 10 处＝Research 一页多个守卫实例各自的判污点，改名或删调用即红）'
+eqr113 "$RES113" 'isStale\(t' 13 'N4：判污调用点在位（只 begin 不 isStale＝半边守卫；2026-10-09 预演实测 10 处＝Research 一页多个守卫实例各自的判污点，改名或删调用即红；2026-10-24 研究进度重试增加 3 处同 token 判污，计数同步 10→13）'
 SNAP113 7
 
 # ── ⑧ §P2-J 台账与红条：单实现 testid + 派生接入面 + Paper 六枚角标 ──

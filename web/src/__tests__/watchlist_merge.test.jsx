@@ -4,7 +4,7 @@
 // 线上表现为「看不到自选股 / 添加后本次会话可见、刷新即丢」。
 // 本用例锁定合并语义：快照覆盖的行 + 快照未覆盖（评估回退）的行都必须出现在列表里。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 
 vi.mock('../api/index.js', () => ({
   // §F29 账号隔离缓存用到的 getAccount
@@ -26,9 +26,10 @@ vi.mock('../api/index.js', () => ({
 }))
 
 import Watchlist from '../pages/Watchlist.jsx'
+import * as api from '../api/index.js'
 
 describe('自选股 §WL-FIX：整表合并不再被跨作用域 wlRow 炸掉', () => {
-  beforeEach(() => { localStorage.clear(); cleanup() })
+  beforeEach(() => { localStorage.clear(); cleanup(); vi.clearAllMocks() })
   it('快照覆盖的行 + 快照未覆盖（评估回退）的行都要显示', async () => {
     render(<Watchlist />)
     await waitFor(() => {
@@ -36,5 +37,13 @@ describe('自选股 §WL-FIX：整表合并不再被跨作用域 wlRow 炸掉', 
       expect(screen.getByText('600036')).toBeTruthy()
       expect(screen.getByText('招商银行')).toBeTruthy()
     }, { timeout: 3000 })
+  })
+
+  it('非法代码前端预校验：不发 POST /api/watchlist', async () => {
+    render(<Watchlist />)
+    await waitFor(() => expect(screen.getByPlaceholderText(/输入代码/)).toBeTruthy(), { timeout: 3000 })
+    fireEvent.change(screen.getByPlaceholderText(/输入代码/), { target: { value: 'ZZZZZZ' } })
+    fireEvent.click(screen.getByText('添加'))
+    await waitFor(() => expect(api.addWatchlist).not.toHaveBeenCalled())
   })
 })

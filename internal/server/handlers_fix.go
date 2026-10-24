@@ -2570,6 +2570,72 @@ type watchlistReq struct {
 	Code string `json:"code"` // 股票代码
 }
 
+// §2026-10-24 自选代码校验：当前只开放 A 股股票。
+// 规则与前端 web/src/utils/stockCode.js 同源；指数/基金/可转债等资产类型待证券解析器落地后
+// 再开放，这里先明确拒绝，避免 110043（沪市转债）、510300（ETF）、399001（指数）被当股票写入。
+// 返回裸 6 位代码（存储仍沿用旧格式，避免一次性改账本/缓存结构）。
+func normalizeWatchStockCode(raw string) (string, error) {
+	s := strings.ToUpper(strings.TrimSpace(raw))
+	if s == "" {
+		return "", fmt.Errorf("请输入股票代码")
+	}
+	code, market := s, ""
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		parts := strings.Split(s, ".")
+		if len(parts) != 2 {
+			return "", fmt.Errorf("股票代码格式不正确")
+		}
+		code, market = parts[0], parts[1]
+	} else if len(s) == 8 && (strings.HasPrefix(s, "SH") || strings.HasPrefix(s, "SZ") || strings.HasPrefix(s, "BJ")) {
+		market, code = s[:2], s[2:]
+	}
+	if len(code) != 6 || !allAsciiDigits(code) {
+		return "", fmt.Errorf("股票代码须为 6 位数字（可带 .SH/.SZ/.BJ 后缀）")
+	}
+	expected := aStockMarket(code)
+	if expected == "" {
+		return "", fmt.Errorf("暂只支持 A 股股票代码（指数/基金/可转债后续开放）")
+	}
+	if market != "" && market != expected {
+		return "", fmt.Errorf("市场与代码不匹配：%s 应为 %s", code, expected)
+	}
+	return code, nil
+}
+
+// allAsciiDigits 仅接受 ASCII 数字（避免全角/Unicode 数字混入代码）。
+func allAsciiDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// aStockMarket 按 A 股股票代码段返回市场；非股票（指数/基金/可转债）返回空串。
+// 北交所：43/83/87/92 开头；沪市：600/601/603/605/688/689；深市：000/001/002/003/300/301。
+func aStockMarket(code string) string {
+	for _, p := range []string{"600", "601", "603", "605", "688", "689"} {
+		if strings.HasPrefix(code, p) {
+			return "SH"
+		}
+	}
+	for _, p := range []string{"000", "001", "002", "003", "300", "301"} {
+		if strings.HasPrefix(code, p) {
+			return "SZ"
+		}
+	}
+	for _, p := range []string{"43", "83", "87", "92"} {
+		if strings.HasPrefix(code, p) {
+			return "BJ"
+		}
+	}
+	return ""
+}
+
 // handleFixAddWatchlist 处理 POST /api/watchlist 请求，添加个股到自选股。
 // 返回新增股票的行情数据（名称/现价/涨跌幅），前端可直接追加行，无需整表重载。
 func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
@@ -2578,9 +2644,9 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	code := strings.TrimSpace(req.Code)
-	if code == "" {
-		writeError(w, 400, "code required")
+	code, err := normalizeWatchStockCode(req.Code)
+	if err != nil {
+		writeError(w, 400, err.Error())
 		return
 	}
 	if !s.watchlist.Add(requestUserID(r), code) {
@@ -2623,7 +2689,17 @@ func (s *Server) handleFixRemoveWatchlist(w http.ResponseWriter, r *http.Request
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.watchlist.Remove(requestUserID(r), req.Code)
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		writeError(w, 400, "code required")
+		return
+	}
+	// 删除侧兼容历史脏数据：能归一就归一，不能归一的旧代码仍允许按原文删除，
+	// 否则修复前写入的非法代码会变成“删不掉”。
+	if norm, err := normalizeWatchStockCode(code); err == nil {
+		code = norm
+	}
+	s.watchlist.Remove(requestUserID(r), code)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 

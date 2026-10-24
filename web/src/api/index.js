@@ -2026,7 +2026,8 @@ export async function setConsultProMode(enabled) {
 // 返回 { stocks, ready_stocks, ready_pct, daily_rows, fin_rows, candidates, applied, proposed, db_attached }
 // Returns { stocks, ready_stocks, ready_pct, daily_rows, fin_rows, candidates, applied, proposed, db_attached }
 export async function fetchResearchProgress() {
-  return request('/api/research/progress')
+  // §2026-10-24：冷缓存重算可能数十秒；服务端已加快照/单飞，前端仍给比默认 10s 更宽的窗口。
+  return request('/api/research/progress', { timeout: 15000 })
 }
 
 /** 获取研究调度可见性快照（GET /api/scheduler/status） */

@@ -39,20 +39,20 @@ POST	/api/news/test-attribution	运维 curl	scripts/verify_deploy_guangzhou.sh:3
 GET	/api/metrics	运维 curl	internal/metrics/metrics.go:2:经 /api/metrics（鉴权后）导出	expvar 量规面：人工带 admin token curl 读数；发版验证链刻意不消费它（§FQ 凭据负锁钉死，见 verify_changes.sh:4444）
 GET	/api/metrics/prometheus	运维 curl	internal/server/metrics_handler.go:14:handlePrometheusMetrics	Prometheus text 导出（§WS-L 维5，promtool 可校验）：给外部抓取器/人工 curl，本仓无面板也无抓取配置
 GET	/api/metrics/alerts	运维 curl	internal/server/metrics_handler.go:21:handleAlertState	阈值告警状态机读数（规则来自 metrics.DefaultAlertRules）：运维 curl 观察；页面告警卡走 /api/alerts 系
-PUT	/api/positions/{id}	无 UI 待补	internal/server/server.go:729:PUT /api/positions/{id}	运营账本改单能力已在（admin 门），持仓页只走 /api/holdings 系；保留尺寸等台账页，删除会断掉脚本旁路
-DELETE	/api/positions/{id}	无 UI 待补	internal/server/server.go:730:DELETE /api/positions/{id}	同上：账本删单无页面入口（§E-1 对账记录为有意设计），先补台账页再谈收敛
+PUT	/api/positions/{id}	无 UI 待补	internal/server/server.go:741:PUT /api/positions/{id}	运营账本改单能力已在（admin 门），持仓页只走 /api/holdings 系；保留尺寸等台账页，删除会断掉脚本旁路
+DELETE	/api/positions/{id}	无 UI 待补	internal/server/server.go:742:DELETE /api/positions/{id}	同上：账本删单无页面入口（§E-1 对账记录为有意设计），先补台账页再谈收敛
 GET	/api/tenant/usage	无 UI 待补	web/src/api/index.js:2285:fetchTenantUsage	前端 wrapper 已按 §PERM-GATE 删除（用量改由 GET /api/tenants 行内返回），后端路由保留供配额核对
 PUT	/api/admin/users/{id}/tenant	无 UI 待补	web/src/api/index.js:2285:moveUserTenant	账号迁移「无 UI，待定产品决策」（同一注释自认）：迁移能力先保留，产品拍板后补入口而非重写后端
-GET	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:613:GET /api/admin/users/{id}/config/d1	按账号代配通道：admin 面板目前只做全局 /api/config/d1 + 账号级 strategy；代配靠 curl，留尺寸给代客配置页
-POST	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:614:POST /api/admin/users/{id}/config/d1	读侧同族：写侧也是稀疏 merge + 写前快照 + 字段级审计（§0929CFG-D1），无 UI 只是没有页面不是没有能力
-GET	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:615:GET /api/admin/users/{id}/config/longshort	多空参数代配：前端仅 strategy 有按账号面板（index.js:2195 注释记着这批 wrapper 被当死码删过）
-POST	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:616:POST /api/admin/users/{id}/config/longshort	同上写侧：保留供运营代客调参；若将来收敛必须先确认没有账号在用这份账号级覆盖
-GET	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:617:GET /api/admin/users/{id}/config/llm	LLM 代配读侧（含脱敏哨兵回填）：页面只有本账号的 /api/config/llm，按账号覆盖靠 curl 维护
-POST	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:618:POST /api/admin/users/{id}/config/llm	LLM 代配写侧：会触发热重建客户端，属特权变更——保留但不给 UI 入口是刻意的（误点即改密钥池）
-GET	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:620:GET /api/admin/users/{id}/config/qmt	QMT/战法配置代配读侧：页面走本账号 /api/config/qmt，按账号覆盖由运营脚本与 curl 使用
-POST	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:621:POST /api/admin/users/{id}/config/qmt	代配写侧会热加载实盘参数（§P2-A 链），无 UI 入口是权限设计而非遗漏；删之前要核现网有无账号级覆盖在生效
-POST	/api/paper/short_open	无 UI 待补	internal/server/server.go:719:handlePaperShortOpen	做空开仓缺页面入口（买回 /api/paper/short_cover 已有调用点）＝功能未完，不是死码，保留后端尺寸
-POST	/api/notify-test	无 UI 待补	internal/server/server.go:792:handleFixNotifyTest	§C9 把空 stub 升级成逐通道实弹探测：前端零调用，但删了就没有人工验证 ntfy/极光通道的入口（§N-2 已收权 admin）
+GET	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:625:GET /api/admin/users/{id}/config/d1	按账号代配通道：admin 面板目前只做全局 /api/config/d1 + 账号级 strategy；代配靠 curl，留尺寸给代客配置页
+POST	/api/admin/users/{id}/config/d1	无 UI 待补	internal/server/server.go:626:POST /api/admin/users/{id}/config/d1	读侧同族：写侧也是稀疏 merge + 写前快照 + 字段级审计（§0929CFG-D1），无 UI 只是没有页面不是没有能力
+GET	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:627:GET /api/admin/users/{id}/config/longshort	多空参数代配：前端仅 strategy 有按账号面板（index.js:2195 注释记着这批 wrapper 被当死码删过）
+POST	/api/admin/users/{id}/config/longshort	无 UI 待补	internal/server/server.go:628:POST /api/admin/users/{id}/config/longshort	同上写侧：保留供运营代客调参；若将来收敛必须先确认没有账号在用这份账号级覆盖
+GET	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:629:GET /api/admin/users/{id}/config/llm	LLM 代配读侧（含脱敏哨兵回填）：页面只有本账号的 /api/config/llm，按账号覆盖靠 curl 维护
+POST	/api/admin/users/{id}/config/llm	无 UI 待补	internal/server/server.go:630:POST /api/admin/users/{id}/config/llm	LLM 代配写侧：会触发热重建客户端，属特权变更——保留但不给 UI 入口是刻意的（误点即改密钥池）
+GET	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:632:GET /api/admin/users/{id}/config/qmt	QMT/战法配置代配读侧：页面走本账号 /api/config/qmt，按账号覆盖由运营脚本与 curl 使用
+POST	/api/admin/users/{id}/config/qmt	无 UI 待补	internal/server/server.go:633:POST /api/admin/users/{id}/config/qmt	代配写侧会热加载实盘参数（§P2-A 链），无 UI 入口是权限设计而非遗漏；删之前要核现网有无账号级覆盖在生效
+POST	/api/paper/short_open	无 UI 待补	internal/server/server.go:731:handlePaperShortOpen	做空开仓缺页面入口（买回 /api/paper/short_cover 已有调用点）＝功能未完，不是死码，保留后端尺寸
+POST	/api/notify-test	无 UI 待补	internal/server/server.go:807:handleFixNotifyTest	§C9 把空 stub 升级成逐通道实弹探测：前端零调用，但删了就没有人工验证 ntfy/极光通道的入口（§N-2 已收权 admin）
 POST	/api/action	前端调用	web/src/api/index.js:1531:/api/action	调用点 actionSignal()（本行由核对器派生，勿手改）
 GET	/api/admin/users	前端调用	web/src/api/index.js:2210:/api/admin/users	调用点 fetchAdminUsers()（本行由核对器派生，勿手改）
 POST	/api/admin/users	前端调用	web/src/api/index.js:2210:/api/admin/users	调用点 createAdminUser()（本行由核对器派生，勿手改）
@@ -203,8 +203,8 @@ PUT	/api/tenants/{id}	前端调用	web/src/api/index.js:2278:/api/tenants/	调�
 DELETE	/api/watchlist	前端调用	web/src/api/index.js:1518:/api/watchlist	调用点 removeWatchlist()（本行由核对器派生，勿手改）
 GET	/api/watchlist	前端调用	web/src/api/index.js:1502:/api/watchlist	调用点 fetchWatchlist()（本行由核对器派生，勿手改）
 POST	/api/watchlist	前端调用	web/src/api/index.js:1510:/api/watchlist	调用点 addWatchlist()（本行由核对器派生，勿手改）
-GET	/livez	兼容端点	internal/server/server.go:580:GET /livez	匿名存活探针（§F-13），无 UI；evidence 为 server.go 注册行
-GET	/readyz	兼容端点	internal/server/server.go:581:GET /readyz	匿名依赖就绪探针（§F-13），无 UI；evidence 为 server.go 注册行
+GET	/livez	兼容端点	internal/server/server.go:592:GET /livez	匿名存活探针（§F-13），无 UI；evidence 为 server.go 注册行
+GET	/readyz	兼容端点	internal/server/server.go:593:GET /readyz	匿名依赖就绪探针（§F-13），无 UI；evidence 为 server.go 注册行
 GET	/api/config/regime	前端调用	web/src/api/index.js:1862:/api/config/regime	调用点 fetchRegimeConfig()
 POST	/api/config/regime	前端调用	web/src/api/index.js:1865:/api/config/regime	调用点 setRegimeConfig()
 GET	/api/config/concept/status	前端调用	web/src/api/index.js:1872:fetchConceptStatus	执行层面板概念覆盖率/同步状态（§C1-V2 2026-10-22）
