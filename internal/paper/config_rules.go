@@ -47,7 +47,7 @@ func ConfigFromRules(rp config.PaperConfig, sizing ...config.SizingConfig) Confi
 	if len(sizing) > 0 {
 		sc := sizing[0].WithDefaults()
 		c.BudgetMode = sc.BudgetModeOf()
-		c.SizingEnabled = sc.Enabled
+		c.SizingEnabled = sc.EnabledOn()
 		c.SizingShadow = sc.ShadowOn()
 	}
 	return c

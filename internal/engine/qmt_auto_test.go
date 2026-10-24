@@ -84,6 +84,15 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 	ctrl := trading.NewController(exec, db, "u_1", cfg, nil)
 	e := &Engine{}
 	e.SetQMT(ctrl, db)
+	// §DYN-GLOBAL（2026-10-24 owner 裁决一）把出厂默认抬成 dynamic 之后，本 harness 必须显式
+	// 钉住**账号级 legacy 退路**：这里测的是固定金额/笔数/幂等/封板这些旧预算腿，而 dynamic 要求
+	// 净值账本就绪（没播种就整笔判"账本/账号/行情未就绪"跳过），会让每个用例的红都长得像缺陷。
+	// 需要 dynamic 的用例自己覆写 cfgMgr（dynbudget_v3_test.go 就是这么做的）。
+	// English: with the factory default now dynamic, the harness pins the account-level legacy
+	// escape hatch so these fixed-amount/idempotency/limit tests keep testing their own subject.
+	e.SetCfgMgr(config.NewManagerWithRules(&config.Rules{
+		Sizing: config.SizingConfig{Enabled: dynBoolPtr(false), BudgetMode: "legacy"},
+	}))
 	return e, db, srv, &orders
 }
 

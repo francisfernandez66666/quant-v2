@@ -25,7 +25,7 @@ func neutralSignal() combat_agent.Signal {
 // budgetRegime 启用态 + 指定偏移/基准止损的快照（其余维度全弃权）。
 func budgetRegime(offset, baseSL float64) Regime {
 	return Regime{
-		SizeCfg:           config.SizingConfig{Enabled: true}.WithDefaults(),
+		SizeCfg:           config.SizingConfig{Enabled: boolPtr(true)}.WithDefaults(),
 		StopLossOffsetPct: offset,
 		BaseStopLossPct:   baseSL,
 	}
@@ -88,7 +88,7 @@ func TestRiskBudgetCapAbstains(t *testing.T) {
 // "helpfully" adds a gate that would flatten the shadow baseline to all-1.0.
 func TestRiskBudgetCapEnabledAgnostic(t *testing.T) {
 	r := budgetRegime(3, 6)
-	r.SizeCfg.Enabled = false
+	r.SizeCfg.Enabled = boolPtr(false)
 	res := ComputeSizing(r, neutralSignal())
 	if math.Abs(res.Scale-6.0/9.0) > 1e-9 {
 		t.Fatalf("合成器应忽略 Enabled（调用方门槛），得 %.4f", res.Scale)

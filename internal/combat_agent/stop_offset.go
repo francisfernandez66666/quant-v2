@@ -58,11 +58,16 @@ type StopOffsets struct {
 
 // ComputeStopOffsets 两态判别主入口（纯函数，100% 可单测）。
 //
-// 总开关 `cfg.Enabled=false`（出厂默认）时恒返回零值 → 调用方的有效阈值与改造前**逐字一致**。
-// English: the pure entry point. With the master switch off (factory default) it returns the zero
-// value, so the caller's effective thresholds stay byte-identical to the pre-change behavior.
+// 总开关关（`EnabledOn()==false`，账号级显式关闭）时恒返回零值 → 调用方的有效阈值与改造前
+// **逐字一致**。§DYN-GLOBAL 起出厂默认是"开"，本特性因此随动态仓位一起生效；不要它请按账号
+// 关掉总开关，或把 `sl_offset_*` 参数归零（每把子闸都有独立退路，不额外加影子判断——影子只约束
+// 买入金额，市场态止损偏移按其原设计跟随总开关）。
+// English: the pure entry point. With the master switch off it returns the zero value so effective
+// thresholds stay byte-identical to pre-change behavior. Since §DYN-GLOBAL the default is on, so
+// this feature activates together with dynamic sizing; opt out per account via the master switch or
+// by zeroing the sl_offset_* parameters (shadow only gates buy amounts, by original design).
 func ComputeStopOffsets(in StopOffsetInput, cfg config.SizingConfig) StopOffsets {
-	if !cfg.Enabled {
+	if !cfg.EnabledOn() {
 		return StopOffsets{} // 未启用：零行为变更
 	}
 	if in.IsShort {

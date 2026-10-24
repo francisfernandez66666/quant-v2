@@ -264,7 +264,7 @@ export default function ExecutionRiskPanel() {
           </Row>
 
           <div style={groupStyle}>ATR 风险预算（C3）</div>
-          <Row label="单笔风险预算 % 权益" hint="0=关；0.5=单笔最大亏损约为权益 0.5%。已废弃：budget_mode=dynamic 时 ATR 预算退场（仅 legacy 回滚口径）。">
+          <Row label="单笔风险预算 % 权益" hint="0=关；0.5=单笔最大亏损约为权益 0.5%。默认 budget_mode=dynamic 下 ATR 预算退场；切回 legacy 才生效。">
             <InputNumber min={0} max={100} step={0.1} value={form.riskPerTrade} onChange={(v) => set({ riskPerTrade: num(v, 0) })} />
           </Row>
           <Row label="ATR 预算影子模式" hint="默认开：只记录原本会缩到多少，不改股数。">
@@ -287,7 +287,7 @@ export default function ExecutionRiskPanel() {
           <Row label="行情新鲜度阈值 ms" hint="0=关；超过该陈旧度拒单。">
             <InputNumber min={0} max={600000} step={1000} value={form.staleQuoteMs} onChange={(v) => set({ staleQuoteMs: num(v, 0) })} />
           </Row>
-          <Row label="单笔最低成交额 元" hint="默认 5000；已废弃：budget_mode=dynamic 时不再作为拒买闸（仅 legacy 回滚口径）。">
+          <Row label="单笔最低成交额 元" hint="默认 5000；默认 budget_mode=dynamic 下不再作为拒买闸；切回 legacy 才恢复该闸。">
             <InputNumber min={0} max={1000000} step={1000} value={form.minOrderAmount} onChange={(v) => set({ minOrderAmount: num(v, 5000) })} />
           </Row>
 

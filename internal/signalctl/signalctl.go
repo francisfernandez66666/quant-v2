@@ -427,17 +427,18 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 
 // applySizing §DYN-SIZE：买入信号放行前叠加动态仓位合成。
 //
-//   - Enabled=false（P0/出厂默认）→ **立即返回**，连留痕都不写：零行为变更；
+//   - Enabled=false（账号级显式关闭；§DYN-GLOBAL 起出厂默认为开）→ **立即返回**，连留痕都不写；
 //   - Shadow=true（灰度期）→ 合成照算但不下发，仅标注 Decision.Shadow/SizingReasons 供观察；
 //   - 硬拦命中 → 降级为 hold（StageSizing），返回 true 表示调用方应直接返回；
 //   - 缩放非 1.0 → 写 BuyScale + SizingReasons（执行层金额 = 基准 × BuyScale）。
 //
-// English: §DYN-SIZE — applied before a buy is released. Disabled → immediate no-op (zero change);
-// shadow → annotate only; hard block → downgrade to hold; otherwise attach the scale and reasons.
+// English: §DYN-SIZE — applied before a buy is released. Disabled (an explicit account-level off;
+// the factory default is on since §DYN-GLOBAL) → immediate no-op; shadow → annotate only;
+// hard block → downgrade to hold; otherwise attach the scale and reasons.
 func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Policy) bool {
 	cfg := pol.Regime.SizeCfg
-	if !cfg.Enabled {
-		return false // P0/未启用：零行为变更
+	if !cfg.EnabledOn() {
+		return false // 总开关关：零行为变更
 	}
 	res := ComputeSizing(pol.Regime, sig)
 	if cfg.ShadowOn() {

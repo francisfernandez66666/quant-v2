@@ -948,7 +948,7 @@ export default function Paper() {
                   <Checkbox checked={!!engCfg.auto_sell} onChange={(v) => setEngCfg({ ...engCfg, auto_sell: !!v })}>{'止盈止损/清仓告警自动平仓'}</Checkbox>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
-                  <span>每票固定买入资金（元）<span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 6 }}>已废弃：budget_mode=dynamic 时按池权益×动态缩放计算</span></span>
+                  <span>每票固定买入资金（元）<span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 6 }}>默认 budget_mode=dynamic 时按池权益×动态缩放计算（legacy 为账号级退路）</span></span>
                   <InputNumber value={engCfg.fixed_amount} min={0} step={1000} onChange={(v) => setEngCfg({ ...engCfg, fixed_amount: v || 0 })} style={{ width: 240 }} />
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>

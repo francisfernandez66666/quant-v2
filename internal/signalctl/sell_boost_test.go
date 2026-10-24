@@ -10,7 +10,8 @@
 // （trim→close，扩大自动卖出面）。升级只发生在**窗结算确认那一刻**；已确认处置的重放按
 // ConfirmedAction 逐字节走（配置热切不翻案——执行层日级幂等键已按首结论下单）。
 //
-// 基准态反证（本文件最重要的锁）：`Enabled=false`（出厂默认）或档位显式关（off/none/0）或
+// 基准态反证（本文件最重要的锁）：`Enabled=false`（§DYN-GLOBAL 后需账号显式写出，出厂默认已是开）
+// 或档位显式关（off/none/0）或
 // 无触发条件时，ComputeSellBoost 恒返回 ""，sellParams 三个加权字段保持零值，sellProbe 行为与
 // 改造前**逐字一致**——删掉 boost 分支不影响任何既有测试。
 //
@@ -30,12 +31,20 @@ import (
 	"quant-trading-v2/internal/config"
 )
 
+// offCfg 账号级显式关闭动态仓位总开关的出厂配置（§DYN-GLOBAL 后"关"不再是默认态）。
+// English: factory defaults with the account-level master switch explicitly turned off.
+func offCfg() config.SizingConfig {
+	sc := config.DefaultSizingConfig()
+	sc.Enabled = boolPtr(false)
+	return sc
+}
+
 // boostRegime 构造"已启用 + 非影子 + L2 档"的卖出加权快照（各触发条件由调用方按需填）。
 func boostRegime() Regime {
 	shadow := false
 	return Regime{
 		SizeCfg: config.SizingConfig{
-			Enabled:        true,
+			Enabled:        boolPtr(true),
 			Shadow:         &shadow,
 			SellBoostLevel: "L2",
 		}.WithDefaults(),
@@ -47,7 +56,7 @@ func boostL3Regime() Regime {
 	shadow := false
 	return Regime{
 		SizeCfg: config.SizingConfig{
-			Enabled:        true,
+			Enabled:        boolPtr(true),
 			Shadow:         &shadow,
 			SellBoostLevel: "L3",
 		}.WithDefaults(),
@@ -142,7 +151,8 @@ func TestSellBoostMultiTrigger(t *testing.T) {
 
 // ── 2. ComputeSellBoost：关闭态与档位 ────────────────────────────────────────────
 
-// TestSellBoostDisabledInert 出厂默认（Enabled=false）→ 即使满屏利空也恒返回 ""（零行为变更锁）。
+// TestSellBoostDisabledInert 总开关关（账号级显式 Enabled=false）→ 即使满屏利空也恒返回 ""。
+// §DYN-GLOBAL 起出厂默认是开，所以"关"这一态必须显式构造——这条锁的就是那把账号级退路开关。
 func TestSellBoostDisabledInert(t *testing.T) {
 	r := Regime{
 		EmotionPhase:   "冰点",
@@ -151,7 +161,7 @@ func TestSellBoostDisabledInert(t *testing.T) {
 		Holiday:        HolidayWindow{CalendarLoaded: true, ClosedRun: 8, PreHolidayN: 1},
 		Account:        AccountState{WindowStopLosses: 9},
 		MacroEvents:    []MacroEventView{{Title: "CPI", Impact: "high", InWindow: true}},
-		SizeCfg:        config.DefaultSizingConfig(), // Enabled=false
+		SizeCfg:        offCfg(), // 账号级显式关闭
 	}
 	if lvl, reasons := ComputeSellBoost(r); lvl != "" || reasons != nil {
 		t.Fatalf("总开关关必须零加权，得 %q %v", lvl, reasons)
@@ -167,7 +177,7 @@ func TestSellBoostExplicitOffLevel(t *testing.T) {
 	for _, off := range []string{"off", "OFF", " none ", "0"} {
 		shadow := false
 		r := boostRegime()
-		r.SizeCfg = config.SizingConfig{Enabled: true, Shadow: &shadow, SellBoostLevel: off}.WithDefaults()
+		r.SizeCfg = config.SizingConfig{Enabled: boolPtr(true), Shadow: &shadow, SellBoostLevel: off}.WithDefaults()
 		r.EmotionPhase = "冰点" // 满屏利空
 		r.RiskTier = combat_agent.RiskTierRed
 		if lvl, _ := ComputeSellBoost(r); lvl != "" {
@@ -182,7 +192,7 @@ func TestSellBoostLevelL1L3(t *testing.T) {
 	for _, lvl := range []string{"L1", "L3"} {
 		shadow := false
 		r := boostRegime()
-		r.SizeCfg = config.SizingConfig{Enabled: true, Shadow: &shadow, SellBoostLevel: lvl}.WithDefaults()
+		r.SizeCfg = config.SizingConfig{Enabled: boolPtr(true), Shadow: &shadow, SellBoostLevel: lvl}.WithDefaults()
 		r.EmotionPhase = "冰点"
 		got, _ := ComputeSellBoost(r)
 		if got != lvl {
@@ -316,7 +326,7 @@ func TestSellBoostSingleSourceBearHardClears(t *testing.T) {
 func TestSellBoostL1KeepsKernelIntact(t *testing.T) {
 	shadow := false
 	r := boostRegime()
-	r.SizeCfg = config.SizingConfig{Enabled: true, Shadow: &shadow, SellBoostLevel: "L1"}.WithDefaults()
+	r.SizeCfg = config.SizingConfig{Enabled: boolPtr(true), Shadow: &shadow, SellBoostLevel: "L1"}.WithDefaults()
 	r.EmotionPhase = "冰点"
 	pol := boostPol(r)
 
@@ -351,7 +361,7 @@ func TestSellBoostL1KeepsKernelIntact(t *testing.T) {
 func TestSellBoostShadowAnnotatesOnly(t *testing.T) {
 	shadow := true
 	r := boostRegime()
-	r.SizeCfg = config.SizingConfig{Enabled: true, Shadow: &shadow, SellBoostLevel: "L2"}.WithDefaults()
+	r.SizeCfg = config.SizingConfig{Enabled: boolPtr(true), Shadow: &shadow, SellBoostLevel: "L2"}.WithDefaults()
 	r.EmotionPhase = "冰点"
 	pol := boostPol(r)
 

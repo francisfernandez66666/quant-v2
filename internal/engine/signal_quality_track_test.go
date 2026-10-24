@@ -83,7 +83,7 @@ func TestQualityColdStartNeutral(t *testing.T) {
 	if sigs[0].QualityWeight != 1.0 {
 		t.Fatalf("冷启动应写中性 1.0，得 %v", sigs[0].QualityWeight)
 	}
-	r := signalctl.Regime{SizeCfg: config.SizingConfig{Enabled: true}.WithDefaults()}
+	r := signalctl.Regime{SizeCfg: config.SizingConfig{Enabled: dynBoolPtr(true)}.WithDefaults()}
 	withDim := signalctl.ComputeSizing(r, sigs[0])
 	withoutDim := sigs[0]
 	withoutDim.QualityWeight = 0 // 该维度弃权（等价于功能关闭）
@@ -111,7 +111,7 @@ func TestQualityWeightDrivesSizing(t *testing.T) {
 	if sigs[0].QualityWeight <= 1.0 {
 		t.Fatalf("高命中率桶应得 >1.0 的权重，得 %v", sigs[0].QualityWeight)
 	}
-	r := signalctl.Regime{SizeCfg: config.SizingConfig{Enabled: true}.WithDefaults()}
+	r := signalctl.Regime{SizeCfg: config.SizingConfig{Enabled: dynBoolPtr(true)}.WithDefaults()}
 	res := signalctl.ComputeSizing(r, sigs[0])
 	if res.Scale <= 1.0 {
 		t.Fatalf("高命中率应放大合成，得 %+v", res)

@@ -47,7 +47,10 @@ func TestStopOffsetDeepBreachFollowsEffectiveStop(t *testing.T) {
 	// ── 腿 A：偏移关（Enabled=false）⇒ 有效止损 == 冻结止损 ⇒ 硬止损 ──
 	aOff, rptOff, mOff := newAlertTestRig(t)
 	rptOff.LogSignal("pos-off", "600000", "浦发银行", "做多", "龙头", cost, 15.0, stopPct)
-	off := config.DefaultSizingConfig() // Enabled=false（出厂默认）
+	off := config.DefaultSizingConfig()
+	// §DYN-GLOBAL 后出厂默认是 Enabled=true，"偏移关"这条腿只能靠**账号级显式关闭**构造
+	// （也正是裁决一保留的那把 legacy/退路开关的语义：不要市场态偏移就按账号关掉总开关）。
+	off.Enabled = boolPtr(false)
 	aOff.SetMarketStopContext(off, -2.0, false)
 	alertsOff := aOff.CheckPositionAlerts(rptOff, mOff, quotes, nil)
 	if len(alertsOff) != 1 {
@@ -61,7 +64,7 @@ func TestStopOffsetDeepBreachFollowsEffectiveStop(t *testing.T) {
 	aOn, rptOn, mOn := newAlertTestRig(t)
 	rptOn.LogSignal("pos-on", "600000", "浦发银行", "做多", "龙头", cost, 15.0, stopPct)
 	on := config.DefaultSizingConfig()
-	on.Enabled = true
+	on.Enabled = boolPtr(true)
 	on.Shadow = nil // 非影子：偏移真生效（ShadowOn 只影响 signalctl 的下发，不影响本处判定）
 	aOn.SetMarketStopContext(on, -2.0, false)
 	alertsOn := aOn.CheckPositionAlerts(rptOn, mOn, quotes, nil)
@@ -90,7 +93,7 @@ func TestStopOffsetDoesNotMutateFrozenStop(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	rpt.LogSignal("pos-frozen", "600000", "浦发银行", "做多", "龙头", 10.0, 15.0, stopPct)
 	cfg := config.DefaultSizingConfig()
-	cfg.Enabled = true
+	cfg.Enabled = boolPtr(true)
 	a.SetMarketStopContext(cfg, -3.0, false) // 大盘 -3% ⇒ 放宽已顶到 SLOffsetCap
 
 	quotes := map[string]*data.StockInfo{

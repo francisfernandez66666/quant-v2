@@ -1546,19 +1546,32 @@ type PositionConfig struct {
 //	  - 上限类（总仓位、权益回撤）各自算一个 0~1 乘子后**取 min**——它们描述"不能超过某条线"，
 //	    连乘会把同一风险（波动高与相关性高常是同一件事的投影）惩罚两次。
 //
-// 全部默认安全：Enabled=false 时 signalctl 不改变任何裁定（零行为变更）；Shadow=true 只留痕。
-// 零值字段一律由 WithDefaults 补出厂默认（存量配置零迁移）。
+// §DYN-GLOBAL（2026-10-24 owner 裁决一）起出厂默认改为**下发态**：Enabled=true、
+// BudgetMode=dynamic、Shadow=false。三把键必须同时成立才算真下发（见 EnabledOn/
+// BudgetModeOf/ShadowOn），任何一把没到位都只是影子读数。
+// 零值字段一律由 WithDefaults 补出厂默认（缺键=跟随新全局口径；显式 legacy/false=账号级退路）。
 //
-// English: §DYN-SIZE sizing config. Layered synthesis — weight/inclination factors multiply;
-// risk-cap factors each yield a 0..1 multiplier and the smallest wins. Safe by default:
-// Enabled=false leaves every verdict unchanged; WithDefaults fills every zero field.
+// English: since §DYN-GLOBAL (owner ruling 1, 2026-10-24) the factory default is the *delivering*
+// state: Enabled=true, BudgetMode=dynamic, Shadow=false. All three keys must hold for the scale to
+// reach real orders; any one missing leaves shadow-only reads. WithDefaults fills missing keys with
+// the new defaults, while an explicit legacy/false stays as the account-level escape hatch.
 type SizingConfig struct {
-	// Enabled 总开关（默认 false = 零行为变更：合成照算但不下发，只走 shadow 读数）。
-	Enabled bool `json:"enabled"`
-	// BudgetMode 预算口径（账号级）：legacy=旧固定金额/战法分配/每日闸；dynamic=动态仓位是唯一
-	// 预算决策者（v3 定稿）。默认 legacy，代码合并本身不改变现有行为，上线按账号切换。
-	// English: account-scoped budget pipeline. "legacy" keeps the old fixed-amount gates;
-	// "dynamic" makes dynamic sizing the sole budget authority (v3). Default legacy for rollout.
+	// Enabled 总开关。§DYN-GLOBAL 后默认开（nil=开，见 EnabledOn）。
+	// 改成指针的原因：旧 `bool` 让 WithDefaults 无法区分"这个键没写过"和"显式关了"——
+	// 而 `json:"enabled"` 无 omitempty，任何物化过的账号载荷里都躺着 `"enabled":false`。
+	// 若只把出厂默认翻成 true，存量账号会**静默留在关闭态**，正是本项目最忌的
+	// "以为开了其实没开"。指针 + 访问器把这两态真正分开。
+	// English: master switch, on by default (nil = on). A pointer is required because the old plain
+	// bool could not tell "key absent" from "explicitly false" — and every materialized payload
+	// carries "enabled":false, so flipping the factory default alone would silently leave existing
+	// accounts disabled.
+	Enabled *bool `json:"enabled,omitempty"`
+	// BudgetMode 预算口径（账号级）：dynamic=动态仓位是唯一预算决策者（v3 定稿，新默认）；
+	// legacy=旧固定金额/战法分配/每日闸，只作为**账号级显式退路**保留。
+	// 空串按新默认 dynamic；其余无法识别的取值按 legacy 处理并由 BudgetModeDrift 出声报警。
+	// English: account-scoped budget pipeline. "dynamic" (the new default) makes dynamic sizing the
+	// sole budget authority; "legacy" is kept only as an explicit per-account escape hatch. An empty
+	// value follows the new default; any other unrecognized value is treated as legacy and reported.
 	BudgetMode string `json:"budget_mode,omitempty"`
 	// Mode 动态仓位合成口径：product=旧连乘（默认，逐字回归）；power_mean=分组幂平均（v3）。
 	// English: factor synthesis mode — "product" is the legacy byte-identical path, "power_mean"
@@ -1574,9 +1587,16 @@ type SizingConfig struct {
 	// 键：market（市场组，默认 0.45）/ stock（个股组，默认 0.35）。
 	// English: per-group floors — market (0.45) and stock (0.35) by default.
 	GroupFloors map[string]float64 `json:"group_floors,omitempty"`
-	// Shadow 影子模式（默认 true）：合成结果只留痕/日志，不改变实际下单金额。
-	// nil 视为 true（与 Enabled 独立：Enabled=true 且 Shadow=true 时仍不下发，用于灰度）。
+	// Shadow 影子模式（§DYN-GLOBAL 后出厂默认 false=真下发；nil 由 WithDefaults 补成出厂值）。
+	// 与 Enabled 相互独立：Enabled=true 且 Shadow=true 时合成照算、只留痕不下发，用于灰度对照。
+	// English: shadow mode; the factory default is now false (deliver). Independent from Enabled —
+	// Enabled=true with Shadow=true still computes the scale but only logs it, for gray comparison.
 	Shadow *bool `json:"shadow,omitempty"`
+	// PolicyVersion §DYN-GLOBAL 迁移标记：由 MigrateSizingToGlobalDefault 写入（=1），
+	// 作用是**只迁一次**——迁移之后账号再显式改回 legacy，重启不会被再次抬走。
+	// English: §DYN-GLOBAL migration marker, written once by the startup migration so that a later
+	// deliberate account-level switch back to legacy is never overwritten again on restart.
+	PolicyVersion int `json:"policy_version,omitempty"`
 	// Floor 合成缩放地板（默认 0.15）——任何利空叠加也不会把单笔仓位压到该值以下。
 	Floor float64 `json:"floor"`
 	// Cap 合成缩放上限（默认 1.15）——允许"进攻档"（比基准加仓）但设硬顶。
@@ -1649,14 +1669,28 @@ type SizingConfig struct {
 	SellBoostLevel string `json:"sell_boost_level"`
 }
 
-// DefaultSizingConfig §DYN-SIZE 出厂默认（全部"安全侧"：总开关关、影子开）。
-// English: §DYN-SIZE factory defaults — master switch off, shadow on.
+// sizingBool 返回布尔值的指针，供 §DYN-GLOBAL 出厂默认区分"显式开/关"与"键缺失"。
+// English: pointer factory for the tri-state bool switches (explicit on/off vs absent).
+func sizingBool(v bool) *bool { return &v }
+
+// DefaultSizingConfig §DYN-SIZE 出厂默认。
+//
+// §DYN-GLOBAL（2026-10-24 owner 裁决一「dynamic 全局，legacy 开关账户级别」）把三把下发键从
+// "安全侧" 抬到 "下发侧"：Enabled=true / BudgetMode=dynamic / Shadow=false。
+// 其余因子参数一律保持原值——本次裁决只改**是否生效**，不改**生效时怎么算**。
+// Mode 留在 "product"（Q1 推荐项：先把口径切换做干净，幂平均另批再谈，避免一次动两个变量）。
+//
+// English: §DYN-SIZE factory defaults. §DYN-GLOBAL (owner ruling 1) moves the three delivery keys
+// from the safe side to the delivering side (enabled/budget_mode=dynamic/shadow=false) and changes
+// nothing else — the ruling changes whether the scale applies, not how it is computed. Mode stays
+// "product" so only one variable moves per batch.
 func DefaultSizingConfig() SizingConfig {
 	defaultP := 0.5
 	return SizingConfig{
-		Enabled:                 false,
-		BudgetMode:              "legacy",
+		Enabled:                 sizingBool(true),
+		BudgetMode:              "dynamic",
 		Mode:                    "product",
+		Shadow:                  sizingBool(false),
 		PowerP:                  &defaultP,
 		GroupFloors:             map[string]float64{"market": 0.45, "stock": 0.35},
 		Floor:                   0.15,
@@ -1711,13 +1745,47 @@ func NormalizeLegacyTotalPosPct(v float64) float64 {
 	return v
 }
 
-// BudgetModeOf 归一化预算口径：仅 "dynamic" 开启动态预算，其余一律按 legacy。
-// English: normalizes the budget pipeline; anything other than "dynamic" is legacy.
+// EnabledOn 动态仓位合成是否处于"允许生效"态（nil = 出厂默认 = 开）。
+// English: whether the sizing synthesis is allowed to take effect (nil = factory default = on).
+func (s SizingConfig) EnabledOn() bool { return s.Enabled == nil || *s.Enabled }
+
+// BudgetModeOf 归一化预算口径。§DYN-GLOBAL 后的判据：
+//   - 空串/未设置 → "dynamic"（新全局默认：动态仓位是唯一预算决策者）；
+//   - "dynamic"（大小写不敏感）→ "dynamic"；
+//   - 其余一律 "legacy" —— 含显式 "legacy"（账号级退路，owner 裁决一保留）与脏值。
+//     脏值按 legacy 是**保守侧**（旧闸全部继续生效），并由 BudgetModeDrift 单独出声。
+//
+// English: normalizes the budget pipeline. Empty means the new global default "dynamic";
+// "dynamic" is dynamic; everything else is legacy — both the explicit account-level escape hatch
+// and any dirty value. Dirty values fall to the conservative side and are reported by BudgetModeDrift.
 func (s SizingConfig) BudgetModeOf() string {
-	if strings.EqualFold(strings.TrimSpace(s.BudgetMode), "dynamic") {
+	v := strings.ToUpper(strings.TrimSpace(s.BudgetMode))
+	switch v {
+	case "":
 		return "dynamic"
+	case "DYNAMIC":
+		return "dynamic"
+	default:
+		return "legacy"
 	}
-	return "legacy"
+}
+
+// BudgetModeDrift 报告 budget_mode 里"既不是空、也不是 legacy/dynamic 认得写法"的脏值。
+// 脏值被 BudgetModeOf 保守地当成 legacy，但那是"配置写错了"而不是"账号选了 legacy"，
+// 必须出声——本项目历史上吃过多次"配置错误被伪装成网络抖动/静默失效"的亏。
+// 返回空串表示无漂移。
+// English: surfaces a budget_mode value that is neither absent nor a recognized spelling. Such a
+// value is treated as legacy (conservative) but is a typo, not a choice, and must be logged.
+func (s SizingConfig) BudgetModeDrift() string {
+	v := strings.TrimSpace(s.BudgetMode)
+	if v == "" {
+		return ""
+	}
+	switch strings.ToUpper(v) {
+	case "LEGACY", "DYNAMIC":
+		return ""
+	}
+	return v
 }
 
 // DynamicBudgetOn 动态预算是否开启。
@@ -1761,8 +1829,14 @@ func (s SizingConfig) GroupFloor(group string) float64 {
 	return 0
 }
 
-// ShadowOn 影子模式是否开启（nil = 默认 true）。
-// English: whether shadow mode is on (nil defaults to true).
+// ShadowOn 影子模式是否开启。
+//
+// 注意分层：这里是**未归一结构体**的兜底（nil=影子开，宁可只留痕），不是出厂默认——
+// 出厂默认是 Shadow=false（真下发），由 WithDefaults 在键缺失时补上。因此真下发需要
+// 走归一化入口（GetSizingConfigFor/DefaultSizingConfig），而不是裸结构体。
+// English: shadow flag for a *non-normalized* struct — nil defaults to ON (prefer logging over
+// trading). The factory default is the opposite (Shadow=false) and is applied by WithDefaults, so
+// real delivery requires going through the normalizing entry points, not a bare struct.
 func (s SizingConfig) ShadowOn() bool { return s.Shadow == nil || *s.Shadow }
 
 // HolidayBlockNewOn 长假前最后一日是否禁止新开仓（nil = 默认 false）。
@@ -1790,16 +1864,27 @@ func (s SizingConfig) SellBoostLevelOf() string {
 }
 
 // WithDefaults 返回补齐出厂默认后的副本：所有数值字段 <=0 用默认，映射字段与默认**合并**
-// （用户只需覆盖关心的键），指针开关保持原样（由 ShadowOn/HolidayBlockNewOn/RiskBudgetKeepOn 解析）。
+// （用户只需覆盖关心的键），Enabled/Shadow 两把下发键在**键缺失**时补出厂值（§DYN-GLOBAL），
+// 其余指针开关（HolidayBlockNew/RiskBudgetKeepOn/PowerP）仍由各自访问器解析。
 // 引擎装配 Regime 时调用一次，signalctl 侧因此可直接读平字段、无需逐字段兜默认。
 // English: returns a copy with every zero numeric field defaulted and every map merged over the
-// defaults (callers override only the keys they care about); pointer switches are left for their
-// *On accessors. Called once by the engine when assembling the Regime snapshot.
+// defaults; the Enabled/Shadow delivery switches take the factory value only when the key is absent
+// (§DYN-GLOBAL), other pointer switches keep their own *On accessors. Called once by the engine.
 func (s SizingConfig) WithDefaults() SizingConfig {
 	d := DefaultSizingConfig()
 	out := s
 	if strings.TrimSpace(out.BudgetMode) == "" {
 		out.BudgetMode = d.BudgetMode
+	}
+	// §DYN-GLOBAL：两把指针开关的"键缺失"态必须补成出厂值。不补的话存量/新建载荷里
+	// Shadow==nil 会永远读成影子开，出厂默认 Shadow=false 就成了写在纸上却走不到的分支。
+	// 显式写过的值（含显式 false/true）一律原样保留——那是账号自己的选择。
+	// English: absent pointer switches inherit the factory defaults; explicit values are kept.
+	if out.Enabled == nil {
+		out.Enabled = d.Enabled
+	}
+	if out.Shadow == nil {
+		out.Shadow = d.Shadow
 	}
 	if strings.TrimSpace(out.Mode) == "" {
 		out.Mode = d.Mode

@@ -50,35 +50,48 @@ func newSizingTestManager(t *testing.T, rules *Rules) (*Manager, *memKV) {
 	return m, kv
 }
 
-// TestSizingConfigForIsolatesAccounts 专用键按账号隔离，A 开启不影响 B/全局。
+// TestSizingConfigForIsolatesAccounts 专用键按账号隔离，A 的写入不影响 B/全局。
+//
+// §DYN-GLOBAL 后"是否下发"不再是可用的隔离探针（A、B 都会跟随默认读成 enabled=true），
+// 所以这里改用**只有 A 显式写过**的因子键（floor/shadow）作隔离证据：B 必须仍是出厂值。
+// 另外补一枚 B 的默认态锁——账号无专用键时跟随全局新默认（enabled=true、非影子、dynamic），
+// 这正是裁决一"dynamic 全局"在账号维度的落地形状。
 func TestSizingConfigForIsolatesAccounts(t *testing.T) {
 	m, _ := newSizingTestManager(t, &Rules{})
 	if _, err := m.MergeSizingConfigFor("A", map[string]json.RawMessage{
 		"enabled": json.RawMessage(`true`),
 		"shadow":  json.RawMessage(`false`),
+		"floor":   json.RawMessage(`0.5`),
 	}); err != nil {
 		t.Fatalf("写 A: %v", err)
 	}
-	if got, _ := m.GetSizingConfigFor("A"); !got.Enabled || got.ShadowOn() {
-		t.Fatalf("A 应为 enabled=true shadow=false, got %+v", got)
+	if got, _ := m.GetSizingConfigFor("A"); !got.EnabledOn() || got.ShadowOn() || got.Floor != 0.5 {
+		t.Fatalf("A 应为 enabled=true shadow=false floor=0.5, got %+v", got)
 	}
-	if got, _ := m.GetSizingConfigFor("B"); got.Enabled || !got.ShadowOn() {
-		t.Fatalf("B 不应被 A 污染: %+v", got)
+	gotB, _ := m.GetSizingConfigFor("B")
+	if gotB.Floor != 0.15 {
+		t.Fatalf("B 的 floor 不应被 A 污染（应仍是出厂 0.15）, got %v", gotB.Floor)
 	}
-	if m.GetSizingConfig().Enabled {
-		t.Fatal("账号写入不应改变全局 rules.sizing")
+	// B 无专用键 → 跟随 §DYN-GLOBAL 新默认（下发态）。
+	if !gotB.EnabledOn() || gotB.ShadowOn() || !gotB.DynamicBudgetOn() {
+		t.Fatalf("§DYN-GLOBAL：B 无专用键应跟随全局新默认（enabled/非影子/dynamic），got %+v", gotB)
+	}
+	// GetSizingConfig 走 WithDefaults，所以这里锁的是"全局没被 A 的显式值串过去"：
+	// A 把 floor 写成 0.5，全局必须仍是出厂 0.15。
+	if m.GetSizingConfig().Floor != 0.15 {
+		t.Fatalf("账号写入不应改变全局 rules.sizing, got floor=%v", m.GetSizingConfig().Floor)
 	}
 }
 
 // TestSizingConfigForFallbackOrder 专用键 → 账号旧 sizing → 全局。
 func TestSizingConfigForFallbackOrder(t *testing.T) {
-	global := &Rules{Sizing: SizingConfig{Enabled: true, SellBoostLevel: "L3"}}
+	global := &Rules{Sizing: SizingConfig{Enabled: boolPtr(true), SellBoostLevel: "L3"}}
 	m, kv := newSizingTestManager(t, global)
 
-	// 账号旧 rules.sizing 存在时优先于全局。
-	acctRules, _ := json.Marshal(&Rules{Sizing: SizingConfig{Enabled: false, SellBoostLevel: "L1"}})
+	// 账号旧 rules.sizing 存在时优先于全局（用显式 enabled=false 证明"账号自己的值赢"）。
+	acctRules, _ := json.Marshal(&Rules{Sizing: SizingConfig{Enabled: boolPtr(false), SellBoostLevel: "L1"}})
 	kv.data["u"] = map[string]string{perUserKey: string(acctRules)}
-	if got, _ := m.GetSizingConfigFor("u"); got.Enabled || got.SellBoostLevelOf() != "L1" {
+	if got, _ := m.GetSizingConfigFor("u"); got.EnabledOn() || got.SellBoostLevelOf() != "L1" {
 		t.Fatalf("应回退账号旧 sizing, got %+v", got)
 	}
 	// 专用键出现后压过账号旧 sizing。
@@ -88,7 +101,7 @@ func TestSizingConfigForFallbackOrder(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("写专用键: %v", err)
 	}
-	if got, _ := m.GetSizingConfigFor("u"); !got.Enabled || got.SellBoostLevelOf() != "L2" {
+	if got, _ := m.GetSizingConfigFor("u"); !got.EnabledOn() || got.SellBoostLevelOf() != "L2" {
 		t.Fatalf("专用键应优先, got %+v", got)
 	}
 }
@@ -128,8 +141,8 @@ func TestMergeSizingConfigForKeepsSiblings(t *testing.T) {
 		t.Fatalf("二次写: %v", err)
 	}
 	got, _ := m.GetSizingConfigFor("u")
-	if !got.Enabled || got.Floor != 0.2 || got.Cap != 1.5 {
-		t.Fatalf("兄弟键被抹掉: enabled=%v floor=%v cap=%v", got.Enabled, got.Floor, got.Cap)
+	if !got.EnabledOn() || got.Floor != 0.2 || got.Cap != 1.5 {
+		t.Fatalf("兄弟键被抹掉: enabled=%v floor=%v cap=%v", got.EnabledOn(), got.Floor, got.Cap)
 	}
 }
 

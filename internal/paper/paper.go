@@ -474,6 +474,13 @@ type Engine struct {
 	// reason is audited once. Cleared on a successful fill.
 	lastBuyReject map[string]string
 
+	// §DYN-GLOBAL「dynamic 预算已生效、缩放未交付」半开态留痕去重：记录最近一次告警的自然日
+	// （cntime.DayOf 口径）。探针每轮都进 OnSignals，不去重会把日志刷爆；配置被修正后无需清零——
+	// 次日仍会按当时的取值重新判断一次。
+	// English: once-per-day dedup for the half-open budget warning above (probe calls OnSignals every
+	// round, so an undeduped log line would flood). No reset needed after a fix — the next day re-checks.
+	budgetWarnDay string
+
 	// §C1 行业敞口（与实盘态同口径）：上限%、影子开关、行业查询源。默认全关/影子，
 	// 未注入时闸自然跳过，零行为变化。
 	// English: §C1 sector exposure (same semantics as the live gate) — cap %, shadow switch and
@@ -720,10 +727,46 @@ func (e *Engine) Cfg() Config {
 	return e.cfg
 }
 
+// DynamicBudgetWithoutScale §DYN-GLOBAL 半开态识别：预算口径已经切到 dynamic（持仓数量上限等
+// legacy 闸门全部退场），但动态缩放本身没有交付（账号总开关关着或仍影子）。
+// 这个组合既拿不到 legacy 的数量约束，也拿不到 dynamic 的风险收缩——撮合按中性 scale=1.0
+// 直接吃满 35% 额度，是所有口径里最激进的一档，且不会有任何报错。
+// 出厂默认 enabled=true/budget_mode=dynamic/shadow=false 三者同向，只有账号级显式退路
+// （enabled=false 或 shadow=true）而忘切 budget_mode 时才会落到这里，因此必须留痕。
+// English: detects the half-open state — v3 dynamic budget active (legacy count caps retired) while the
+// risk scale itself is not delivered (account switch off or still shadow). That combination keeps
+// neither the legacy caps nor the dynamic shrink and fills at neutral scale 1.0, the most aggressive
+// setting, silently.
+func (c Config) DynamicBudgetWithoutScale() bool {
+	if !strings.EqualFold(strings.TrimSpace(c.BudgetMode), "dynamic") {
+		return false
+	}
+	return !(c.SizingEnabled && !c.SizingShadow)
+}
+
 // dynamicBudgetOn 动态预算是否开启（调用方通常已持 e.mu；仅读 cfg 标量，不额外加锁）。
 // English: whether the v3 dynamic budget is active (callers generally already hold e.mu).
 func (e *Engine) dynamicBudgetOn() bool {
 	return strings.EqualFold(strings.TrimSpace(e.cfg.BudgetMode), "dynamic")
+}
+
+// warnBudgetWithoutScaleLocked §DYN-GLOBAL 半开态每日一次留痕（调用方须持 e.mu）。
+// 只打日志、不改任何撮合口径：告警的意义是"这个账号此刻既没有 legacy 数量闸、也没有动态风险收缩"，
+// 需要人工决定是把 budget_mode 退回 legacy，还是把 enabled/shadow 交付到位。
+// English: once-per-day audit log for the half-open state (caller holds e.mu). Log only — no behavior
+// change; a human decides whether to roll budget_mode back to legacy or deliver enabled/shadow.
+func (e *Engine) warnBudgetWithoutScaleLocked(now time.Time) {
+	if !e.cfg.DynamicBudgetWithoutScale() {
+		return
+	}
+	day := cntime.DayOf(now) // §TZ1
+	if e.budgetWarnDay == day {
+		return
+	}
+	e.budgetWarnDay = day
+	log.Printf("[paper] §DYN-GLOBAL 半开态：%s 预算口径=budget_mode=%s(dynamic) 但缩放未交付"+
+		"(enabled=%v shadow=%v)——legacy 数量上限已退场、动态风险收缩未生效，本日撮合按中性 scale=1.0 全额执行",
+		day, strings.TrimSpace(e.cfg.BudgetMode), e.cfg.SizingEnabled, e.cfg.SizingShadow)
 }
 
 // SetSingleStockCap §DYN-SIZE-v3 注入单票集中度上限（%）；<=0 时动态预算回退 35。
@@ -1141,6 +1184,7 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		return
 	}
 	now := time.Now()
+	e.warnBudgetWithoutScaleLocked(now)
 	for i := range sigs {
 		s := sigs[i]
 		// §SHORT-3 融券做空侧：做空战法通过信号（sell=持仓走弱卖出 / watch=纯做空机会）先落独立

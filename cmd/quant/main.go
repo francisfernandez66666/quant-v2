@@ -176,6 +176,24 @@ func run() int {
 	// 运营数据统一归属管理员：把管理员账号 ID 注入配置管理器，使量化/模拟盘/策略/D1/LLM/
 	// 做多空等配置与持仓/告警等数据系统级共享，后端按角色鉴权（子账号只读公开部分）。
 	cfgMgr.SetOperatorID(authMgr.AdminID())
+	// §DYN-GLOBAL（2026-10-24 owner 裁决一「dynamic 全局，legacy 开关账户级别」）一次性迁移：
+	// 出厂默认已抬成下发态，但面板物化过的存量载荷里躺着显式的 enabled=false / budget_mode=legacy，
+	// 只改代码默认会让这些账号**静默留在关闭态**。此处按"从未被碰过的旧安全形状"逐字归一，
+	// 迁完打 policy_version 标记（重启不重跑，之后账号自己改回 legacy 不再被抬）。
+	// 顺序要求：必须早于 §P1-6 热重载与下方所有 sizing 消费者（模拟盘/引擎/控制器）装配，
+	// 否则热重载会把未迁的全局文档吃回去、或引擎在迁移前就读到旧值。
+	userIDsForSizing := make([]string, 0, 8)
+	for _, u := range authMgr.ListUsers() {
+		userIDsForSizing = append(userIDsForSizing, u.ID)
+	}
+	sizingMigration := cfgMgr.MigrateSizingToGlobalDefault(userIDsForSizing)
+	// 脏值体检：写错的 budget_mode 会保守按 legacy 处理，但那是笔误不是选择，必须点名。
+	cfgMgr.LogSizingBudgetDrift(userIDsForSizing)
+	// 汇总行是部署 verify 的对账锚点：迁移内部逐条打日志，这一行给出"这一轮到底扫了几个账号、
+	// 全局归一成什么态"，红项一眼能归因到迁移而不是引擎。
+	log.Printf("[启动] §DYN-GLOBAL sizing 迁移完成 全局=%s 扫描=%d 迁移=%d 挂起=%d 失败=%d",
+		sizingMigration.Global, sizingMigration.Scanned, sizingMigration.Migrated,
+		len(sizingMigration.Holds), len(sizingMigration.Failures))
 	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
 	cfgMgr.Watch(context.Background(), 60*time.Second)
 	// §0925EVE-D1 跟随改动：本行起 Watch 后台协程可能随时经 Load() 热替换全局 rules/d1
@@ -289,6 +307,9 @@ func run() int {
 	researchDB, dbErr := store.Open(filepath.Join(dataDir, "trading.db"))
 	if researchDB != nil && dbErr == nil {
 		srv.SetResearch(researchDB, dataDir)
+		// §2026-10-24 研究进度预热：延迟 5s 算一次并落盘快照，避免部署后第一位打开
+		// 自动研究页的用户吃到全表统计冷算；已有新鲜快照时自动跳过。
+		srv.WarmResearchProgress(5 * time.Second)
 		// §RFIX-4 启动恢复：backtest_jobs 残留 running 僵尸行标 interrupted（上次进程崩溃/
 		// 重启遗留）。MarkRunningInterrupted 此前是死代码——research_tasks 的启动接管只覆盖
 		// 任务队列表，backtest_jobs 表恢复职责丢失（生产 id=3 自 08-21 挂 running）。

@@ -22,7 +22,7 @@ import (
 
 // onCfg 启用态定权配置（其余走出厂默认）。
 func onCfg() config.SizingConfig {
-	return config.SizingConfig{Enabled: true}.WithDefaults()
+	return config.SizingConfig{Enabled: boolPtr(true)}.WithDefaults()
 }
 
 // longShock 大盘 -2%、趋势未破、个股同步下跌（不触发独立崩坏）的做多持仓输入。

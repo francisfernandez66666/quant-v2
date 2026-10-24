@@ -22,7 +22,7 @@ import (
 // dynSizingCfg dynamic 预算 + 已退出影子的 sizing 配置。
 func dynSizingCfg() config.SizingConfig {
 	sc := config.DefaultSizingConfig()
-	sc.Enabled = true
+	sc.Enabled = dynBoolPtr(true)
 	shadow := false
 	sc.Shadow = &shadow
 	sc.BudgetMode = "dynamic"

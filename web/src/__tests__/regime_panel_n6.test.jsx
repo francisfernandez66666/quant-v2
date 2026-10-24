@@ -174,8 +174,10 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
       'state_scales', 'stoploss_guard_count', 'stoploss_guard_window_days', 'tier_scales', 'tp_offset_cap',
       'tp_offset_per_pct', 'vol_clamp_hi', 'vol_clamp_lo', 'vol_target_pct',
     ].sort())
-    // §DYN-SIZE-v3 §7：缺键时新口径必须落在安全默认（legacy/product/0.5/0.45/0.35）。
-    expect(body.sizing.budget_mode).toBe('legacy')
+    // §DYN-GLOBAL（2026-10-24）：缺键必须落在**新**出厂默认 dynamic。此前锁的是 legacy，
+    // 而 legacy 只剩账号级退路——面板把缺键写成 legacy，等于管理员点一次"保存"就把账号
+    // 从动态预算踢回旧闸门，且页面上看不出自己刚做了这件事。
+    expect(body.sizing.budget_mode).toBe('dynamic')
     expect(body.sizing.mode).toBe('product')
     expect(body.sizing.power_p).toBe(0.5)
     expect(body.sizing.group_floors).toEqual({ market: 0.45, stock: 0.35 })
@@ -191,7 +193,9 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     expect(body.macro_gate.red_block_new_buy).toBe(false)
     // 精细参数缺键时必须按出厂默认落 payload（不是 undefined/0）：后端 WithDefaults 同样兜底，
     // 但页面若把缺键写成 0，稀疏 merge 会真的把 0 写进配置，等于把闸门关掉。
-    expect(body.sizing.shadow).toBe(true)
+    // §DYN-GLOBAL：影子的出厂默认改成关（缩放真下发），缺键必须落 false——落 true 等于
+    // 一次保存就把动态缩放按回"只留痕"。
+    expect(body.sizing.shadow).toBe(false)
     expect(body.sizing.floor).toBe(0.15)
     expect(typeof body.sizing.floor).toBe('number')
     expect(body.sizing.emotion_scales['退潮']).toBe(0.5)
@@ -454,7 +458,12 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     await settle()
     expandFine()
     await settle()
-    expect(switchByLabel('影子模式（只留痕不下发）').getAttribute('aria-checked')).toBe('true')
+    // §DYN-GLOBAL（2026-10-24）三把交付键的出厂默认全部反转：enabled=开、budget_mode=dynamic、
+    // shadow=关。空载荷必须按**新**默认回显——读成旧默认（关/legacy/影子）会让管理员以为动态
+    // 仓位没生效而去"打开"它，实际引擎早就在按动态缩放下单。
+    expect(switchByLabel('动态仓位（买入缩放）').getAttribute('aria-checked')).toBe('true')
+    expect(document.querySelector('[data-testid="budget-mode"]').value).toBe('dynamic')
+    expect(switchByLabel('影子模式（只留痕不下发）').getAttribute('aria-checked')).toBe('false')
     expect(numberByLabel('仓位缩放地板').value).toBe('0.15')
     expect(numberByLabel('情绪「退潮」权重').value).toBe('0.5')
     expect(numberByLabel('事件前瞻交易日数').value).toBe('5')
@@ -474,7 +483,11 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     await settle()
     const api = await import('../api/index.js')
     const sz = api.setRegimeConfig.mock.calls[0][0].sizing
-    expect(sz.shadow).toBe(true)
+    // §DYN-GLOBAL：空载荷点保存，写出去的必须是新出厂默认（dynamic + 非影子 + enabled 开），
+    // 否则这次保存本身就把账号退回旧口径。
+    expect(sz.shadow).toBe(false)
+    expect(sz.budget_mode).toBe('dynamic')
+    expect(sz.enabled).toBe(true)
     expect(sz.floor).toBe(0.15)
     expect(sz.emotion_scales['退潮']).toBe(0.5)
     expect(sz.macro_lead_curve).toEqual([0.9, 0.85, 0.8, 0.7, 0.5])

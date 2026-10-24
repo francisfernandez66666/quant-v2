@@ -1035,7 +1035,7 @@ export default function Quant() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>最大持仓数</label>
         <Input type="number" value={form.max_positions} min={1} max={50} onChange={(v) => setFormUser({ ...form, max_positions: parseInt(v, 10) })} />
-        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>1-50，双端校验；已废弃：budget_mode=dynamic 时不生效（仅 legacy 回滚口径）</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>1-50，双端校验；默认 budget_mode=dynamic 下不生效；把本账号口径切回 legacy 才生效</span>
       </div>
     )
     // 单票金额：每次买入投入金额
@@ -1043,7 +1043,7 @@ export default function Quant() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单票金额(元)</label>
         <Input type="number" value={form.fixed_amount} min={0} step={500} onChange={(v) => setFormUser({ ...form, fixed_amount: parseFloat(v) })} />
-        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>已废弃：budget_mode=dynamic 时由总资产×动态缩放决定（仅 legacy 回滚口径）</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>默认 budget_mode=dynamic 下由总资产×动态缩放决定；切回 legacy 才按固定金额</span>
       </div>
     )
     // 初始资金：用于仓位约束预检
@@ -1059,7 +1059,7 @@ export default function Quant() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单日买入笔数上限</label>
         <Input type="number" value={form.daily_max_buys} min={0} onChange={(v) => setFormUser({ ...form, daily_max_buys: parseInt(v, 10) })} />
-        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，按当日已成交笔数计；已废弃：dynamic 时不生效（仅 legacy 回滚口径）</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，按当日已成交笔数计；默认 dynamic 下不生效；切回 legacy 才生效</span>
       </div>
     )
     // 单日买入预算：0=不设限，超出拒绝新买入
@@ -1067,7 +1067,7 @@ export default function Quant() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单日买入预算(元)</label>
         <Input type="number" value={form.daily_budget_amount} min={0} step={10000} onChange={(v) => setFormUser({ ...form, daily_budget_amount: parseFloat(v) })} />
-        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限；已废弃：dynamic 时不生效（仅 legacy 回滚口径）</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限；默认 dynamic 下不生效；切回 legacy 才生效</span>
       </div>
     )
     // §AUDIT-PM 2026-09-15 单笔金额绝对帽：0=关，手动/自动单统一封顶（保存即生效，不等开关队列）
@@ -1091,7 +1091,7 @@ export default function Quant() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单笔最低成交额(元)</label>
         <Input type="number" value={form.min_order_amount} step={500} onChange={(v) => setFormUser({ ...form, min_order_amount: parseFloat(v) })} />
-        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=默认5000元；负数=关闭；已废弃：dynamic 时不再拒买（仅 legacy 回滚口径）</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=默认5000元；负数=关闭；默认 dynamic 下不再拒买；切回 legacy 才恢复该闸</span>
       </div>
     )
     // owner 2026-10-12 裁决：卖出延持次数上限——止损触线后战法喊买最多延持这么多次
@@ -1527,7 +1527,7 @@ export default function Quant() {
         <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 12 }}>关闭的战法信号不会进入实盘链路；「全部开启」= 默认全集（内置四形态+已审批库规则），动量战法需在此显式开启。因子/形态战法需先在「自动研究」页审批应用后才会出现在此处。模拟盘撮合的独立开关在「模拟盘 → 设置 → 战法开关」。</div>
         {renderStrategyGroups()}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'flex-end', marginTop: 10 }}>
-          <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>{strategyHint} · 仓位留空/0 = 使用全局单票金额 · 已废弃：budget_mode=dynamic 时战法金额不生效（仅 legacy 回滚口径）</span>
+          <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>{strategyHint} · 仓位留空/0 = 使用全局单票金额 · 默认 budget_mode=dynamic 下战法金额不生效；把本账号口径切回 legacy 才生效</span>
           <Button theme="primary" disabled={!strategyDirty || saving || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={saveStrategies}>
             {saving ? '保存中…' : (strategyDirty ? '保存战法开关 *' : '已同步')}
           </Button>

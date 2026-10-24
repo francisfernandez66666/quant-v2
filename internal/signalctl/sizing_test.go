@@ -303,11 +303,13 @@ func TestSizingTradingDayLeadCurve(t *testing.T) {
 	}
 }
 
-// TestAdmitSizingDisabledInert §DYN-SIZE P0 零行为变更：Enabled=false 时裁定与留痕均不变。
+// TestAdmitSizingDisabledInert §DYN-SIZE 零行为变更锁：Enabled=false（账号级显式关闭，
+// §DYN-GLOBAL 后不再等于出厂默认）时裁定与留痕均不变。
 func TestAdmitSizingDisabledInert(t *testing.T) {
 	c := New()
 	pol := Policy{Discipline: config.DisciplineConfig{}} // 两窗 ≤0 → 买入直通
-	pol.Regime = baseRegime()                            // Enabled=false
+	pol.Regime = baseRegime()
+	pol.Regime.SizeCfg.Enabled = boolPtr(false) // 关闭态必须由账号显式写出（默认已是开）
 	sig := baseSig()
 	sig.Action, sig.Direction = "buy", "做多"
 	d := c.Admit(ChannelLive, "u1", sig, pol, time.Now())
@@ -323,7 +325,7 @@ func TestAdmitSizingDisabledInert(t *testing.T) {
 func TestAdmitSizingEnabledApplies(t *testing.T) {
 	c := New()
 	cfg := config.DefaultSizingConfig()
-	cfg.Enabled, cfg.Shadow = true, boolPtr(false)
+	cfg.Enabled, cfg.Shadow = boolPtr(true), boolPtr(false)
 	pol := Policy{Discipline: config.DisciplineConfig{}}
 	pol.Regime = Regime{SizeCfg: cfg, EmotionPhase: "退潮"}
 	sig := baseSig()
@@ -351,7 +353,7 @@ func TestAdmitSizingEnabledApplies(t *testing.T) {
 func TestAdmitSizingShadow(t *testing.T) {
 	c := New()
 	cfg := config.DefaultSizingConfig()
-	cfg.Enabled, cfg.Shadow = true, boolPtr(true) // 影子
+	cfg.Enabled, cfg.Shadow = boolPtr(true), boolPtr(true) // 影子
 	pol := Policy{Discipline: config.DisciplineConfig{}}
 	pol.Regime = Regime{SizeCfg: cfg, EmotionPhase: "冰点"}
 	sig := baseSig()

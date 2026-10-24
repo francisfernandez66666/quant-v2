@@ -1303,7 +1303,7 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 	}
 	e.mu.Unlock()
 	// §DYN-SIZE：把控制器的缩放系数透传到执行层（0=未定权，执行层按基准金额）。
-	sizingOn := pol.Regime.SizeCfg.Enabled
+	sizingOn := pol.Regime.SizeCfg.EnabledOn()
 	for i, d := range decisions {
 		if d.Verdict != signalctl.VerdictPass {
 			continue
@@ -1557,7 +1557,7 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	targetInd := industryOf(sig.Code)
 	// 缩放：影子/未开启时中性 1.0；否则用信号控制器算好的 BuyScale（0=未定权也按中性）。
 	scale := 1.0
-	if sizingCfg.Enabled && !sizingCfg.ShadowOn() && buyScale > 0 {
+	if sizingCfg.EnabledOn() && !sizingCfg.ShadowOn() && buyScale > 0 {
 		scale = buyScale
 	}
 	res := ordbudget.Compute(ordbudget.Inputs{

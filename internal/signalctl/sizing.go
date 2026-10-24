@@ -320,8 +320,8 @@ const (
 // "unknown" must not be spent as if it were risk.
 func ComputeSellBoost(r Regime) (string, []string) {
 	cfg := r.SizeCfg
-	if !cfg.Enabled {
-		return "", nil // 总开关关（P2 出厂默认）：零行为变更
+	if !cfg.EnabledOn() {
+		return "", nil // 总开关关（账号级显式关闭）：零行为变更
 	}
 	if cfg.Floor <= 0 || cfg.Cap <= 0 {
 		cfg = cfg.WithDefaults()

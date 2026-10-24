@@ -167,9 +167,14 @@ export default function RegimeConfigPanel() {
       const conc = cfg.concept || {}
       const next = {
         marketState: !!enh.market_state_enabled,
-        sizingOn: !!sz.enabled,
+        // §DYN-GLOBAL：动态仓位现在出厂即开，账号级 enabled 只是退路。键缺失必须读成"开"
+        // （与后端 WithDefaults 同口径），写成 `!!sz.enabled` 会把没写过该键的存量账号显示成关，
+        // 而引擎其实按开在跑——两侧读数不一致会让管理员以为要"打开"才生效，点了保存反而多写一笔。
+        sizingOn: sz.enabled !== false,
+        // §DYN-GLOBAL：预算口径出厂即 dynamic，legacy 只剩账号级退路。这里的兜底值必须和后端
+        // 默认一致（键缺失=没写过=按 dynamic 跑），否则面板显示 legacy、实际下单走 dynamic。
         // §DYN-SIZE-v3：预算口径与合成口径（账号级）。
-        budgetMode: String(sz.budget_mode || 'legacy').toLowerCase(),
+        budgetMode: String(sz.budget_mode || 'dynamic').toLowerCase(),
         sizingMode: String(sz.mode || 'product').toLowerCase(),
         powerP: num(sz.power_p, 0.5),
         groupMarket: num((sz.group_floors || {}).market, 0.45),
@@ -185,7 +190,10 @@ export default function RegimeConfigPanel() {
         blockN: mg.block_n_shape !== false,
         blockMomentum: mg.block_momentum !== false,
         // ── 精细参数（SizingConfig 全量） ──
-        shadow: sz.shadow !== false,
+        // §DYN-GLOBAL：影子出厂默认关（缩放真下发）。键缺失必须读成"不影子"，写成
+        // `!== false` 会把缺键显示成影子开、保存时再把 shadow=true 真写进配置，
+        // 等于用一次点击把刚上线的动态缩放重新按回只留痕。
+        shadow: sz.shadow === true,
         floor: num(sz.floor, DEFAULTS.floor),
         cap: num(sz.cap, DEFAULTS.cap),
         kellyLambda: num(sz.kelly_lambda, DEFAULTS.kellyLambda),
@@ -499,10 +507,10 @@ export default function RegimeConfigPanel() {
               onChange={(e) => set({ budgetMode: e.target.value })}
               style={{ minWidth: 220, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--app-border, #ddd)', background: 'var(--app-bg, #fff)' }}
             >
-              <option value="legacy">legacy 旧固定金额/战法分配/每日闸</option>
-              <option value="dynamic">dynamic 动态仓位唯一预算（v3）</option>
+              <option value="dynamic">dynamic 动态仓位唯一预算（v3，默认）</option>
+              <option value="legacy">legacy 旧固定金额/战法分配/每日闸（账号级退路）</option>
             </select>
-            <span style={hintStyle}>dynamic：总资产（模拟盘=池权益）× 缩放，再减到行业/单票 35% 额度；旧金额与次数闸不生效</span>
+            <span style={hintStyle}>dynamic（默认）：总资产（模拟盘=池权益）× 缩放，再减到行业/单票 35% 额度；旧金额与次数闸不再拦（改成 legacy 即按账号退回旧口径）</span>
           </div>
           <div style={rowStyle}>
             <span style={labelStyle}>合成口径</span>

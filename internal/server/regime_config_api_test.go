@@ -95,9 +95,16 @@ func TestRegimeConfigGetEchoesDefaults(t *testing.T) {
 	if lvl, _ := sizing["sell_boost_level"].(string); lvl != "L2" {
 		t.Fatalf("卖出加权档位应回显 L2（owner 裁决默认档）, got %v", lvl)
 	}
-	// Enabled 出厂 false：动态仓位默认关，这条必须可见（面板据此显示开关初态）。
-	if on, _ := sizing["enabled"].(bool); on {
-		t.Fatal("sizing.enabled 出厂必须为 false（默认关＝零行为变更是 §DYN-SIZE 的出厂纪律）")
+	// §DYN-GLOBAL（2026-10-24 裁决一）：三把交付键的出厂态全部反转，GET 必须把**新**默认回显出来
+	// （面板据此显示初态；回显旧默认＝页面显示"没开"而引擎其实在按动态缩放下单）。
+	if on, _ := sizing["enabled"].(bool); !on {
+		t.Fatal("§DYN-GLOBAL：sizing.enabled 出厂必须回显 true（动态仓位全局默认开，legacy 只剩账号级退路）")
+	}
+	if mode, _ := sizing["budget_mode"].(string); mode != "dynamic" {
+		t.Fatalf("§DYN-GLOBAL：sizing.budget_mode 出厂必须回显 dynamic, got %v", sizing["budget_mode"])
+	}
+	if sh, _ := sizing["shadow"].(bool); sh {
+		t.Fatal("§DYN-GLOBAL：sizing.shadow 出厂必须回显 false（缩放真下发，不是只留痕）")
 	}
 }
 
@@ -160,7 +167,10 @@ func TestRegimeConfigNestedMapKeyMerge(t *testing.T) {
 // English: writes must hit disk — a fresh Manager over the same file sees the new values.
 func TestRegimeConfigPersistsToDisk(t *testing.T) {
 	s, admin, cfgPath := newRegimeTestServer(t)
-	body := `{"sizing":{"enabled":true,"sell_boost_level":"L3","breadth_missing_scale":0.7},` +
+	// §DYN-GLOBAL 后 enabled=true 是默认态、测不出"落盘"，所以这里写的是**账号级显式退路**
+	// （enabled=false + budget_mode=legacy）：它必须原样落盘并在重启后仍读成关——
+	// 这正是把 Enabled 改成指针要守住的那一态（缺键=跟随全局开，显式 false=恒关）。
+	body := `{"sizing":{"enabled":false,"budget_mode":"legacy","sell_boost_level":"L3","breadth_missing_scale":0.7},` +
 		`"enhance":{"market_state_enabled":true}}`
 	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", body)); rr.Code != 200 {
 		t.Fatalf("写入应 200, got %d body=%s", rr.Code, rr.Body.String())
@@ -174,8 +184,11 @@ func TestRegimeConfigPersistsToDisk(t *testing.T) {
 	}
 	reloaded.SetStore(store2)
 	got, _ := reloaded.GetSizingConfigFor(admin.ID)
-	if !got.Enabled {
-		t.Fatal("sizing.enabled 未落盘（重启后动态仓位会回退到关）")
+	if got.EnabledOn() {
+		t.Fatal("账号级显式 enabled=false 未落盘（重启后动态仓位会自己抬成开）")
+	}
+	if got.BudgetModeOf() != "legacy" {
+		t.Fatalf("账号级 budget_mode=legacy 未落盘，got %q", got.BudgetModeOf())
 	}
 	if got.SellBoostLevelOf() != "L3" {
 		t.Fatalf("sell_boost_level 未落盘, got %q", got.SellBoostLevelOf())
@@ -367,15 +380,17 @@ func TestRegimeConfigAccountPermissions(t *testing.T) {
 		t.Fatalf("本人 GET 自己应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
 	// 本人写自己的 sizing：200，且只影响自己。
+	// §DYN-GLOBAL 后 enabled 不再是可用的隔离探针（所有账号默认都读成开），
+	// 改用只有"本人写过"的 floor 值做证据。
 	rr := adminDo(s, adminReq(s, member, http.MethodPost, "/api/config/regime",
-		`{"sizing":{"enabled":true,"shadow":false}}`))
+		`{"sizing":{"enabled":true,"shadow":false,"floor":0.42}}`))
 	if rr.Code != 200 {
 		t.Fatalf("本人写自己 sizing 应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
-	if got, _ := s.cfg.GetSizingConfigFor(member.ID); !got.Enabled {
-		t.Fatal("本人写入未生效")
+	if got, _ := s.cfg.GetSizingConfigFor(member.ID); !got.EnabledOn() || got.Floor != 0.42 {
+		t.Fatalf("本人写入未生效: enabled=%v floor=%v", got.EnabledOn(), got.Floor)
 	}
-	if got, _ := s.cfg.GetSizingConfigFor(admin.ID); got.Enabled {
+	if got, _ := s.cfg.GetSizingConfigFor(admin.ID); got.Floor == 0.42 {
 		t.Fatal("本人写入污染了 admin 的账号配置")
 	}
 	// 本人读/写他人：403。
@@ -383,10 +398,10 @@ func TestRegimeConfigAccountPermissions(t *testing.T) {
 		t.Fatalf("本人 GET 他人应 403, got %d", rr.Code)
 	}
 	if rr := adminDo(s, adminReq(s, member, http.MethodPost, "/api/config/regime?account_id="+other.ID,
-		`{"sizing":{"enabled":true}}`)); rr.Code != 403 {
+		`{"sizing":{"enabled":true,"floor":0.42}}`)); rr.Code != 403 {
 		t.Fatalf("本人写他人应 403, got %d body=%s", rr.Code, rr.Body.String())
 	}
-	if got, _ := s.cfg.GetSizingConfigFor(other.ID); got.Enabled {
+	if got, _ := s.cfg.GetSizingConfigFor(other.ID); got.Floor == 0.42 {
 		t.Fatal("被 403 拒绝的写入仍生效（鉴权挡在副作用之后）")
 	}
 	// 普通账号写系统级段：403，且全局 enhance 不变。
@@ -400,18 +415,21 @@ func TestRegimeConfigAccountPermissions(t *testing.T) {
 	}
 	// admin 代配他人：200。
 	if rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime?account_id="+other.ID,
-		`{"sizing":{"enabled":true}}`)); rr.Code != 200 {
+		`{"sizing":{"enabled":true,"floor":0.43}}`)); rr.Code != 200 {
 		t.Fatalf("admin 代配他人应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
-	if got, _ := s.cfg.GetSizingConfigFor(other.ID); !got.Enabled {
-		t.Fatal("admin 代配未生效")
+	if got, _ := s.cfg.GetSizingConfigFor(other.ID); !got.EnabledOn() || got.Floor != 0.43 {
+		t.Fatalf("admin 代配未生效: enabled=%v floor=%v", got.EnabledOn(), got.Floor)
 	}
 }
 
-// TestRegimeConfigShadowEcho §A2：GET 必须显式回显 effective shadow（空/true/false 三态），
-// 前端不再靠“字段缺失”推断默认 true；响应同时带回 account_id 与 sizing_scope。
-// English: §A2 — GET always echoes an explicit effective shadow (absent/true/false), so the UI
-// never infers the default from a missing key; account identity is echoed too.
+// TestRegimeConfigShadowEcho §A2：GET 必须显式回显 effective shadow（键不许缺失），
+// 前端不再靠“字段缺失”推断默认；响应同时带回 account_id 与 sizing_scope。
+// §DYN-GLOBAL 换了默认方向（影子默认**关**），所以三腿顺序也反过来拨：
+// 缺省 false → 显式 true 必须看得见 → 再显式 false 必须落得回去。若沿用旧顺序（缺省 true→写 false），
+// 第一腿和第三腿读数相同，这条锁就再也区分不了"有人显式关过影子"和"没人动过"。
+// English: §A2 — GET always echoes an explicit effective shadow; §DYN-GLOBAL flipped the default to
+// non-shadow, so the legs now run absent→true→false to keep the lock discriminating.
 func TestRegimeConfigShadowEcho(t *testing.T) {
 	s, admin, _ := newRegimeTestServer(t)
 
@@ -439,10 +457,24 @@ func TestRegimeConfigShadowEcho(t *testing.T) {
 	if rr.Code != 200 {
 		t.Fatalf("GET 应 200, got %d", rr.Code)
 	}
-	if !shadowOf(t, rr.Body.String()) {
-		t.Fatal("空配置的 effective shadow 应为 true")
+	if shadowOf(t, rr.Body.String()) {
+		t.Fatal("§DYN-GLOBAL：空配置的 effective shadow 应为 false（影子默认关，缩放真下发）")
 	}
 
+	// 拨到与默认相反的一侧——默认已经是 false，再写 false 就区分不出"有人显式关过"。
+	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", `{"sizing":{"shadow":true}}`))
+	if rr.Code != 200 {
+		t.Fatalf("写 shadow=true 应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !shadowOf(t, rr.Body.String()) {
+		t.Fatal("显式 true 后回显仍为 false（写侧没吃到）")
+	}
+	rr = adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
+	if !shadowOf(t, rr.Body.String()) {
+		t.Fatal("GET 未回显已保存的 shadow=true")
+	}
+
+	// 收回：显式 false 必须压过"曾经 true"的旧值并落住。
 	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", `{"sizing":{"shadow":false}}`))
 	if rr.Code != 200 {
 		t.Fatalf("写 shadow=false 应 200, got %d body=%s", rr.Code, rr.Body.String())
@@ -453,11 +485,6 @@ func TestRegimeConfigShadowEcho(t *testing.T) {
 	rr = adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
 	if shadowOf(t, rr.Body.String()) {
 		t.Fatal("GET 未回显已保存的 shadow=false")
-	}
-
-	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime", `{"sizing":{"shadow":true}}`))
-	if rr.Code != 200 || !shadowOf(t, rr.Body.String()) {
-		t.Fatalf("显式 true 回显失败: %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -507,8 +534,11 @@ func TestRegimeConfigBadInput(t *testing.T) {
 		}
 	}
 	after := s.cfg.GetSizingConfig()
-	if after.TierScales["Red"] != before.TierScales["Red"] || after.Enabled != before.Enabled {
-		t.Fatalf("非法请求把配置改动了: before=%v after=%v", before.TierScales, after.TierScales)
+	// §DYN-GLOBAL：Enabled 改成了 *bool，裸比指针比的是地址（每次 WithDefaults 都可能是新指针），
+	// 必须按语义值比，否则这条"非法请求不得改动配置"的锁会恒红。
+	if after.TierScales["Red"] != before.TierScales["Red"] || after.EnabledOn() != before.EnabledOn() {
+		t.Fatalf("非法请求把配置改动了: before=%v/%v after=%v/%v",
+			before.TierScales["Red"], before.EnabledOn(), after.TierScales["Red"], after.EnabledOn())
 	}
 }
 
