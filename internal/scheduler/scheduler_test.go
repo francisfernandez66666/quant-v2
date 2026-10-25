@@ -45,6 +45,8 @@ func cfgSamples(fakeBin, db string) config.SchedulerConfig {
 			WeekendStartHHMM: 1530,
 			Steps:            []string{"dataload"},
 			AbortOnError:     false,
+			// 测试夹具默认关闭 evo（链计数类测试聚焦研究链本身；evo 入链有专门测试覆盖）。
+			EvoEnabled: false,
 		},
 		DataloadDuringTrade: config.DataloadDuringTradeConfig{Enabled: false, IntervalMinutes: 30},
 	}

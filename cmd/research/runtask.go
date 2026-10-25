@@ -69,6 +69,18 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 			"zero-obs-days", "pending-expire-days"))
 	case store.TaskList:
 		cmdList(db, nil)
+	case store.TaskEvoL1:
+		// §SIZING-EVO 周度 L1 快筛（与自动研究共用调度闸门/轮流）。
+		cmdSizingEvo(db, dbPath, []string{"--weekly"})
+	case store.TaskEvoL2:
+		// §SIZING-EVO 夜间 L2（灰度晋升/回拒 + 生效配置衰退降级）。
+		cmdSizingEvo(db, dbPath, []string{"--nightly"})
+	case store.TaskEvoR4:
+		// §R4 分布标定：读影子库真实横截面净流入率样本。
+		cmdSizingEvo(db, dbPath, []string{"--r4"})
+	case store.TaskEvoR08:
+		// §R-08 因子值取证：扫描影子库确认 annotations 已落因子值。
+		cmdSizingEvo(db, dbPath, []string{"--r08"})
 	case store.TaskBacktestCandidate:
 		btArgs := payloadArgs(p, "start", "end", "h", "min-stocks", "min-limit-ups", "top-k", "max-per-day")
 		id := payloadInt(p, "id", 0)

@@ -328,6 +328,89 @@ func (s *SnapshotStore) Samples() ([]SizingSnapshot, error) {
 	return out, nil
 }
 
+// FlowRatios 抽取影子库里全部（或指定 day）快照的 5 日净流入率样本（FlowRatio5D != 0 才计入，
+// 0 表示弃权中性不进分布）。用于 R4 分布标定——真实横截面净流入率样本。day 空=汇总全部交易日。
+// 不写库、不触交易，纯读影子里程碑。English: extracts the cross-sectional 5D net-flow-rate sample
+// (skips zero=abstain) for R4 band calibration; read-only.
+func (s *SnapshotStore) FlowRatios(day string) ([]float64, error) {
+	var days []string
+	if day != "" {
+		days = []string{day}
+	} else {
+		var err error
+		days, err = s.Days()
+		if err != nil {
+			return nil, err
+		}
+	}
+	var out []float64
+	for _, d := range days {
+		snaps, err := s.Load(d)
+		if err != nil {
+			return nil, err
+		}
+		for _, sn := range snaps {
+			if sn.Sig.FlowRatio5D != 0 {
+				out = append(out, sn.Sig.FlowRatio5D)
+			}
+		}
+	}
+	return out, nil
+}
+
+// ForensicHit R-08 取证单条：证明 annotations 已落因子值（非空 flow_ratio_*）。
+// English: one R-08 forensic record — evidence that the sizing factor values were persisted.
+type ForensicHit struct {
+	Day            string  `json:"day"`             // 北京交易日
+	Code           string  `json:"code"`           // 纯数字代码
+	Channel        string  `json:"channel"`        // live / paper
+	CfgVer         string  `json:"cfg_ver"`        // 生效配置定位戳
+	FlowRatio5D    float64 `json:"flow_ratio_5d"`  // 5 日净流入率（因子值，注解落点）
+	FlowRatioToday float64 `json:"flow_ratio_today"` // 当日净流入率
+	Scale          float64 `json:"scale"`          // 当时生效 BuyScale（0=未定权/硬拦）
+}
+
+// ForensicRecords 扫描影子库前 N 条含因子值的记录（FlowRatio5D != 0），用于 R-08 取证。
+// n<=0 取全部；day 空=全部交易日。只读，不写库。English: scans the first N snapshots that
+// actually carry a factor value, confirming annotations landed factor values in the shadow store.
+func (s *SnapshotStore) ForensicRecords(day string, n int) ([]ForensicHit, error) {
+	var days []string
+	if day != "" {
+		days = []string{day}
+	} else {
+		var err error
+		days, err = s.Days()
+		if err != nil {
+			return nil, err
+		}
+	}
+	var out []ForensicHit
+	for _, d := range days {
+		snaps, err := s.Load(d)
+		if err != nil {
+			return nil, err
+		}
+		for _, sn := range snaps {
+			if sn.Sig.FlowRatio5D == 0 {
+				continue
+			}
+			out = append(out, ForensicHit{
+				Day:            sn.Day,
+				Code:           sn.Code,
+				Channel:        sn.Channel,
+				CfgVer:         sn.CfgVer,
+				FlowRatio5D:    sn.Sig.FlowRatio5D,
+				FlowRatioToday: sn.Sig.FlowRatioToday,
+				Scale:          sn.Scale,
+			})
+			if n > 0 && len(out) >= n {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
+}
+
 // Counts 库规模观测：总快照数 / 已结算数 / 覆盖交易日数（opslog 与冷启动判定用）。
 // English: store size stats — total, settled, and day count (cold-start gating).
 type Counts struct {

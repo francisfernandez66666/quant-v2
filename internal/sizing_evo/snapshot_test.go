@@ -223,3 +223,65 @@ func TestSnapshotNilStoreSafe(t *testing.T) {
 		t.Fatalf("nil settle: %d/%v", n, err)
 	}
 }
+
+// TestSnapshotFlowRatios §R4 分布标定采样：只收 FlowRatio5D!=0（弃权中性不进分布）。
+func TestSnapshotFlowRatios(t *testing.T) {
+	dir := t.TempDir()
+	st := NewSnapshotStore(dir)
+	// 两条同日快照：一条弃权（FlowRatio5D=0）、一条 +1.5；另一条 -2.5。
+	abstain := evoSnap("20261025", "600001", 1.1)
+	abstain.Sig.FlowRatio5D = 0
+	hit := evoSnap("20261025", "600002", 1.0)
+	neg := evoSnap("20261025", "600003", 0.9)
+	neg.Sig.FlowRatio5D = -2.5
+	st.Append("20261025", abstain, hit, neg)
+
+	got, err := st.FlowRatios("")
+	if err != nil {
+		t.Fatalf("FlowRatios: %v", err)
+	}
+	// 弃权那条必须被剔除，剩 2 条。
+	if len(got) != 2 {
+		t.Fatalf("want 2 non-abstain ratios, got %d: %v", len(got), got)
+	}
+	// 值须为 [1.5, -2.5]（顺序按文件行序）。
+	if got[0] != 1.5 || got[1] != -2.5 {
+		t.Fatalf("ratios mismatch: %v", got)
+	}
+	// 限定日与全库一致（只有这一个日）。
+	if d, _ := st.FlowRatios("20261025"); len(d) != 2 {
+		t.Fatalf("day-scoped must be 2, got %d", len(d))
+	}
+	// 空日返回空集（非错误）。
+	if d, err := st.FlowRatios("20261024"); err != nil || len(d) != 0 {
+		t.Fatalf("missing day must be empty, got %v/%v", d, err)
+	}
+}
+
+// TestSnapshotForensicRecords §R-08 因子值取证：只取 FlowRatio5D!=0 的前 N 条。
+func TestSnapshotForensicRecords(t *testing.T) {
+	dir := t.TempDir()
+	st := NewSnapshotStore(dir)
+	abstain := evoSnap("20261025", "600001", 1.1)
+	abstain.Sig.FlowRatio5D = 0
+	hit1 := evoSnap("20261025", "600002", 1.0)
+	hit2 := evoSnap("20261025", "600003", 0.9)
+	st.Append("20261025", abstain, hit1, hit2)
+
+	all, err := st.ForensicRecords("", 0)
+	if err != nil {
+		t.Fatalf("ForensicRecords: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("want 2 hits, got %d", len(all))
+	}
+	// 字段保真：code/cfg_ver/flow5d 均来自快照画像。
+	if all[0].Code != "600002" || all[0].FlowRatio5D != 1.5 || all[0].CfgVer != "u1#abc123" {
+		t.Fatalf("forensic field mismatch: %+v", all[0])
+	}
+	// n 上限截断。
+	cap, err := st.ForensicRecords("", 1)
+	if err != nil || len(cap) != 1 {
+		t.Fatalf("capped must be 1, got %v/%v", cap, err)
+	}
+}

@@ -664,6 +664,26 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 		steps = insertAfter(steps, "library_replay", "optimize")
 		log.Printf("[scheduler] 策略自优化引擎开启：夜间链追加 optimize 任务（全库参数寻优）")
 	}
+	// §SIZING-EVO 与自动研究共用闸门 + 自动轮流：evo 步骤挂在研究链尾部，单槽串行即"轮流"，
+	// 同样受 nightcap/memgate/drainAllowed 约束（evo_l1 周度由 stepTask 按周六拦截，其余夜晚跳过）。
+	// 由 scheduler.nightly.evo_enabled 开关控制（默认关，与 backtest_enabled 同口径），evo 开关
+	// （sizing.evo.enabled）未开时即使本项开启，任务仍由 CLI 内部 EvoOn 守卫 no-op，不浪费资源。
+	// English: when evo_enabled, append the sizing-evo steps after the research chain so they share the
+	// same gate chain and run alternately in the single worker slot.
+	if cfg.Nightly.EvoEnabled {
+		if !containsStep(steps, "evo_l2") {
+			steps = append(steps, "evo_l2")
+		}
+		if !containsStep(steps, "evo_r4") {
+			steps = append(steps, "evo_r4")
+		}
+		if !containsStep(steps, "evo_r08") {
+			steps = append(steps, "evo_r08")
+		}
+		if !containsStep(steps, "evo_l1") {
+			steps = append(steps, "evo_l1")
+		}
+	}
 	// §MINUTE-K 分钟日增环门控：分钟表还没被一次性回填过时，日增必然"清单为空/0 行落库"而
 	// 每晚判失败（这是装载器的诚实出口，不该改），而天天失败只会把真告警淹掉。所以这里
 	// 如实摘掉该环并打印补救命令——**跳过必须留痕**，不是静默降级。
@@ -972,6 +992,23 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 		return store.TaskBacktestStrategy, mustJSON(p), true
 	case "list":
 		return store.TaskList, "{}", true
+	case "evo_l2":
+		// §SIZING-EVO 夜间 L2（灰度晋升/回拒 + 生效配置衰退降级）。与自动研究共用闸门/轮流：
+		// 走同一条队列、单槽串行、共享 nightcap/memgate/drainAllowed，绝不抢 quant 资源。
+		return store.TaskEvoL2, "{}", true
+	case "evo_r4":
+		// §R4 分布标定：读 evo 影子库真实横截面净流入率样本做档位占比标定（只读）。
+		return store.TaskEvoR4, "{}", true
+	case "evo_r08":
+		// §R-08 因子值取证：扫描影子库确认 annotations 已落因子值（只读）。
+		return store.TaskEvoR08, "{}", true
+	case "evo_l1":
+		// §SIZING-EVO 周度 L1 快筛（候选→护栏→进灰度）。周度执行：仅周六夜里入队，
+		// 其余夜晚 stepTask 返回 ok=false 跳过（避免每晚重跑全量网格搜索）。
+		if tw, err := time.Parse("20060102", today); err == nil && tw.Weekday() != time.Saturday {
+			return "", "", false
+		}
+		return store.TaskEvoL1, "{}", true
 	}
 	return "", "", false
 }

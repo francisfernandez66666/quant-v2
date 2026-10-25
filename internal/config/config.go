@@ -1193,6 +1193,12 @@ type NightlyConfig struct {
 	// UI shows as "未测" otherwise. Default false to save time/CPU.
 	// Backtest是否启用
 	BacktestEnabled bool `json:"backtest_enabled"`
+	// EvoEnabled §SIZING-EVO 是否把仓位进化步骤（evo_l1/evo_l2/evo_r4/evo_r08）挂入夜间链，
+	// 与自动研究共用同一套闸门/退避并自动轮流。默认 false（与 BacktestEnabled 同口径，按需开启）。
+	// evo 开关（sizing.evo.enabled）未开时即使本项开启，任务仍由 CLI 内部 EvoOn 守卫 no-op。
+	// English: when true, append the sizing-evo steps to the nightly chain so they share the same gate
+	// chain and alternate with research. Default false (opt-in, like BacktestEnabled).
+	EvoEnabled bool `json:"evo_enabled"`
 	// BacktestEvents B4 回测事件数上限（backtest_enabled 时生效；0=用默认合理值）。
 	// B4 回测事件数上限
 	BacktestEvents int `json:"backtest_events"`
@@ -1263,6 +1269,12 @@ func DefaultSchedulerConfig() SchedulerConfig {
 			AbortOnError:    false,
 			BacktestEnabled: false,
 			BacktestEvents:  0,
+			// §SIZING-EVO 默认开启：evo 步骤挂入夜间链尾部（战法回测/library_replay 之后），
+			// 与自动研究共用闸门/退避并自动轮流；开盘前（盘前门）由 drainAllowed 拦截停摆，
+			// 被抢占遗留经 TaskPreempted 断点续跑。evo 开关未开时 CLI 内部 EvoOn 守卫 no-op。
+			// English: evo steps are on by default, appended after the research chain; gated by the same
+			// gate chain and resumable via TaskPreempted.
+			EvoEnabled:      true,
 			// 多轮自动发现：默认 4 轮 = 2 变体 × top_n=2 排他。
 			// English: multi-round default 4 = 2 variants × top_n=2 exclusive reruns.
 			ResearchRounds: 4,
@@ -4065,6 +4077,12 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 		}
 		if v, ok := cfgBool(sub, "backtest_enabled"); ok {
 			out.Nightly.BacktestEnabled = v
+		}
+		// §SIZING-EVO evo 步骤入链开关：JSON 显式值（含 false）必须覆盖默认（默认 true），
+		// 否则配置里关不掉、测试夹具也关不掉。English: evo_enabled in the nightly block must
+		// override the default (true) when explicitly set — including an explicit false.
+		if v, ok := cfgBool(sub, "evo_enabled"); ok {
+			out.Nightly.EvoEnabled = v
 		}
 		if v, ok := cfgInt(sub, "backtest_events"); ok {
 			out.Nightly.BacktestEvents = v

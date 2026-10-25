@@ -37,6 +37,15 @@ const (
 	TaskMinuteSync = "minute_sync"
 	// TaskLifecycle §GAP-P1 20260915：策略生命周期评估（灰度晋升 + 实盘衰退自动降级）。
 	TaskLifecycle = "lifecycle"
+	// TaskEvoL1 §SIZING-EVO 周度 L1 快筛（候选→护栏→进灰度）；与自动研究共用闸门/轮流
+	// （由 scheduler 单槽串行 + nightcap/memgate/drainAllowed 约束，详见 worker.ensureNightlyEnqueue）。
+	TaskEvoL1 = "evo_l1"
+	// TaskEvoL2 §SIZING-EVO 夜间 L2（灰度晋升/回拒 + 生效配置衰退降级）。
+	TaskEvoL2 = "evo_l2"
+	// TaskEvoR4 §R4 分布标定：读 evo 影子库真实横截面净流入率样本，做档位占比标定。
+	TaskEvoR4 = "evo_r4"
+	// TaskEvoR08 §R-08 因子值取证：扫描影子库确认 annotations 已落因子值（flow_ratio_5d/today）。
+	TaskEvoR08 = "evo_r08"
 )
 
 // 任务状态（status 列取值）。

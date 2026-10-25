@@ -4,6 +4,7 @@ package scheduler
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -210,6 +211,133 @@ func TestLifecycleStepMapped(t *testing.T) {
 	}
 	if !containsStep(cfg.Nightly.Steps, "lifecycle") {
 		t.Fatalf("默认 Steps 应含 lifecycle, 得 %v", cfg.Nightly.Steps)
+	}
+}
+
+// TestEvoStepMapped §SIZING-EVO 与自动研究共用闸门：evo 步骤正确映射为对应任务类型；
+// evo_l1 仅周六夜里入队（stepTask 内部按周六拦截），其余夜晚 ok=false 跳过，避免每晚重跑全量网格。
+// 未知 evo 步骤一律跳过。English: evo nightly steps map to the right task kinds; evo_l1 is Saturday-only.
+func TestEvoStepMapped(t *testing.T) {
+	cfg := config.DefaultSchedulerConfig()
+	// 2026-10-31 是周六；2026-10-26 是周一（今天）。
+	const sat, mon = "20261031", "20261026"
+	if tw, _ := time.Parse("20060102", sat); tw.Weekday() != time.Saturday {
+		t.Fatalf("%s 应为周六", sat)
+	}
+	// 每夜任务（evo_l2/r4/r08）任意日都映射成功。
+	for _, c := range []struct {
+		step, want string
+	}{
+		{"evo_l2", store.TaskEvoL2},
+		{"evo_r4", store.TaskEvoR4},
+		{"evo_r08", store.TaskEvoR08},
+	} {
+		typ, _, ok := stepTask(c.step, cfg, mon)
+		if !ok || typ != c.want {
+			t.Fatalf("stepTask(%s,%s)=(%s,%v), want (%s,true)", c.step, mon, typ, ok, c.want)
+		}
+	}
+	// evo_l1：周六入队，周一跳过。
+	if typ, _, ok := stepTask("evo_l1", cfg, sat); !ok || typ != store.TaskEvoL1 {
+		t.Fatalf("evo_l1 周六应入队, 得 (%s,%v)", typ, ok)
+	}
+	if _, _, ok := stepTask("evo_l1", cfg, mon); ok {
+		t.Fatalf("evo_l1 周一应跳过（ok=false）")
+	}
+	// 未知步骤跳过。
+	if _, _, ok := stepTask("evo_xxx", cfg, mon); ok {
+		t.Fatalf("未知 evo 步骤应跳过")
+	}
+}
+
+// TestEvoStepsInNightlyChain §SIZING-EVO 与自动研究共用闸门：EvoEnabled=true 时 evo 步骤挂入
+// 夜间链尾部（战法回测/library_replay 之后），与自动研究自动轮流；evo_l1 仅周六入队，其余夜晚跳过。
+// 任务均为 low 优先级（共享 nightcap/memgate/drainAllowed）。English: with EvoEnabled, evo steps
+// append after the research chain and run alternately; evo_l1 is Saturday-only.
+func TestEvoStepsInNightlyChain(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "trading.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	cfg := cfgSamples("unused-fake-bin", dbPath)
+	cfg.Nightly.Steps = []string{"dataload"}
+	cfg.Nightly.BacktestEnabled = false
+	cfg.OptimizeEnabled = false
+	cfg.Nightly.EvoEnabled = true // 关键：开启 evo 入链
+
+	statePath := filepath.Join(dir, "research_state.json")
+	s := New(dir, filepath.Join(dir, "config.json"), statePath)
+	loc := time.FixedZone("CST", 8*3600)
+
+	// 周六盘后：应含 evo_l1（4 个 evo 步骤全入）。
+	s.setNow(func() time.Time { return time.Date(2026, 10, 31, 16, 0, 0, 0, loc) }) // 周六
+	s.ensureNightlyEnqueue(db, cfg, time.Date(2026, 10, 31, 16, 0, 0, 0, loc))
+	tasks, _ := db.ListResearchTasks()
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ChainSeq < tasks[j].ChainSeq })
+	wantSat := []string{store.TaskDataload, store.TaskEvoL2, store.TaskEvoR4, store.TaskEvoR08, store.TaskEvoL1}
+	if len(tasks) != len(wantSat) {
+		t.Fatalf("周六链应有 %d 个任务, 实际 %d: %+v", len(wantSat), len(tasks), tasks)
+	}
+	for i, tk := range tasks {
+		if tk.Type != wantSat[i] {
+			t.Fatalf("序位 %d 期望 %s, 得 %s（顺序错）", i, wantSat[i], tk.Type)
+		}
+		if tk.Priority != "low" {
+			t.Fatalf("evo 任务须为 low 优先级, 得 %s", tk.Priority)
+		}
+		if tk.ChainDay != "20261031" {
+			t.Fatalf("ChainDay 应为 20261031, 得 %s", tk.ChainDay)
+		}
+	}
+
+	// 周一盘后：evo_l1 应被 stepTask 周六拦截，链只含 dataload + 3 个每夜 evo 步骤。
+	db2Path := filepath.Join(dir, "trading2.db")
+	db2, _ := store.Open(db2Path)
+	defer db2.Close()
+	cfg2 := cfgSamples("unused-fake-bin", db2Path)
+	cfg2.Nightly.Steps = []string{"dataload"}
+	cfg2.Nightly.EvoEnabled = true
+	s2 := New(dir, filepath.Join(dir, "config2.json"), statePath)
+	s2.setNow(func() time.Time { return time.Date(2026, 10, 26, 16, 0, 0, 0, loc) }) // 周一
+	s2.ensureNightlyEnqueue(db2, cfg2, time.Date(2026, 10, 26, 16, 0, 0, 0, loc))
+	tasks2, _ := db2.ListResearchTasks()
+	sort.Slice(tasks2, func(i, j int) bool { return tasks2[i].ChainSeq < tasks2[j].ChainSeq })
+	wantMon := []string{store.TaskDataload, store.TaskEvoL2, store.TaskEvoR4, store.TaskEvoR08}
+	if len(tasks2) != len(wantMon) {
+		t.Fatalf("周一链应有 %d 个任务（不含 evo_l1）, 实际 %d: %+v", len(wantMon), len(tasks2), tasks2)
+	}
+	for i, tk := range tasks2 {
+		if tk.Type != wantMon[i] {
+			t.Fatalf("周一序位 %d 期望 %s, 得 %s", i, wantMon[i], tk.Type)
+		}
+	}
+}
+
+// TestEvoStepsGatedOffWhenDisabled §SIZING-EVO 开关门控：EvoEnabled=false（默认测试夹具口径）时
+// 夜间链不含任何 evo 步骤，链组成与原研究链一致（不污染既有断言）。English: with EvoEnabled off,
+// the chain contains no evo steps.
+func TestEvoStepsGatedOffWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "trading.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	cfg := cfgSamples("unused-fake-bin", dbPath) // EvoEnabled=false（夹具默认）
+	cfg.Nightly.Steps = []string{"dataload"}
+	statePath := filepath.Join(dir, "research_state.json")
+	s := New(dir, filepath.Join(dir, "config.json"), statePath)
+	loc := time.FixedZone("CST", 8*3600)
+	s.setNow(func() time.Time { return time.Date(2026, 10, 31, 16, 0, 0, 0, loc) })
+	s.ensureNightlyEnqueue(db, cfg, time.Date(2026, 10, 31, 16, 0, 0, 0, loc))
+	tasks, _ := db.ListResearchTasks()
+	if len(tasks) != 1 || tasks[0].Type != store.TaskDataload {
+		t.Fatalf("EvoEnabled=false 时应只有 dataload, 得 %+v", tasks)
 	}
 }
 
