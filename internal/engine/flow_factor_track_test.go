@@ -11,6 +11,7 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,9 +51,9 @@ func flowDays(n int, today string, mainNet float64) []data.FlowDay {
 // English: the same-day ratio's two gates; a legal zero reading is not a missing one.
 func TestFlowTodayRatioGates(t *testing.T) {
 	cases := []struct {
-		name   string
-		q      *data.StockInfo
-		want   float64
+		name    string
+		q       *data.StockInfo
+		want    float64
 		wantWhy string
 	}{
 		{"无报价", nil, 0, "no_quote"},
@@ -292,5 +293,105 @@ func TestFlowRatiosForSellPath(t *testing.T) {
 	t2, f2 := e.flowRatiosFor("600002", nil, time.Now())
 	if t2 != 0 || f2 != 0 {
 		t.Fatalf("nil 行情必须两维弃权，得 %v/%v", t2, f2)
+	}
+}
+
+// ── 5. R9 弃权率告警（opslog 阈值）─────────────────────────────────────────────
+
+// flowAlertRecorder 把 R9 告警收进切片（替代 opslog.Logf 的文件落盘），返回读取闭包。
+// English: captures R9 alerts in memory instead of writing the opslog journal.
+func flowAlertRecorder(e *Engine) func() []string {
+	var lines []string
+	e.flowAlertf = func(tag string, format string, args ...any) {
+		lines = append(lines, tag+"|"+fmt.Sprintf(format, args...))
+	}
+	return func() []string { return lines }
+}
+
+// countDim 数某个维度（"当日"/"5日"）的告警条数——两个维度各自独立判定，混着数会看不出
+// 是哪一维越线。
+// English: counts alerts per dimension.
+func countDim(lines []string, dim string) int {
+	n := 0
+	for _, l := range lines {
+		if strings.Contains(l, "维度="+dim) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestFlowAbstainAlertThreshold 压线即报 / 未压线不报 / 同键节流 / 负数关闭 四态。
+//
+// 口径：4 买 1 弃权 = 25% < 50% 不报；2 买 1 弃权 = 50% 压线必报（阈值是"达到即报"，
+// 不是"超过才报"——运维写 50 的意思就是"一半拿不到数就叫我"）；同一原因分布 30 分钟内
+// 只留一条（弃权是持续态，不节流会把日刊写成墙）；阈值配负数=只留每轮诊断行。
+// English: threshold crossing (>=, not >), throttle per reason histogram, negative disables.
+func TestFlowAbstainAlertThreshold(t *testing.T) {
+	// ① 未压线：4 条买入里 1 条无报价 = 25%
+	e := &Engine{}
+	lines := flowAlertRecorder(e)
+	quotes := map[string]*data.StockInfo{
+		"600001": flowQuote(10, 1e6, 1e8, true),
+		"600002": flowQuote(10, 1e6, 1e8, true),
+		"600003": flowQuote(10, 1e6, 1e8, true),
+	}
+	sigs := []combat_agent.Signal{flowBuySig("600001"), flowBuySig("600002"), flowBuySig("600003"), flowBuySig("600009")}
+	e.annotateFlowFactors(sigs, quotes)
+	if got := countDim(lines(), "当日"); got != 0 {
+		t.Fatalf("25%% 弃权不应告警，得 %d 条：%v", got, lines())
+	}
+
+	// ② 压线：2 条买入里 1 条无报价 = 50%（阈值达到即报）
+	e2 := &Engine{}
+	lines2 := flowAlertRecorder(e2)
+	sigs2 := []combat_agent.Signal{flowBuySig("600001"), flowBuySig("600009")}
+	e2.annotateFlowFactors(sigs2, quotes)
+	if got := countDim(lines2(), "当日"); got != 1 {
+		t.Fatalf("50%% 弃权必须告警 1 条，得 %d 条：%v", got, lines2())
+	}
+	hit := lines2()[0]
+	for _, want := range []string{"FLOWFACTOR-ALERT", "弃权率=50.0%", "阈值=50.0%", "no_quote=1"} {
+		if !strings.Contains(hit, want) {
+			t.Errorf("告警文案缺 %q：%s", want, hit)
+		}
+	}
+
+	// ③ 同键节流：同一原因分布再来一轮，不新增告警
+	e2.annotateFlowFactors([]combat_agent.Signal{flowBuySig("600001"), flowBuySig("600009")}, quotes)
+	if got := countDim(lines2(), "当日"); got != 1 {
+		t.Fatalf("同键应节流（仍 1 条），得 %d 条", got)
+	}
+
+	// ④ 负数=关闭：同样输入一条都不写
+	e3 := &Engine{}
+	lines3 := flowAlertRecorder(e3)
+	cm := config.NewManager("")
+	cm.Get().Sizing.FlowFactor.AbstainAlertPct = -1
+	e3.cfgMgr = cm
+	e3.annotateFlowFactors([]combat_agent.Signal{flowBuySig("600001"), flowBuySig("600009")}, quotes)
+	if got := len(lines3()); got != 0 {
+		t.Fatalf("阈值负数应关闭告警，得 %d 条：%v", got, lines3())
+	}
+}
+
+// TestFlowAbstainAlertCustomThreshold 自定义阈值 100%：只有全军覆没才报（"一个都拿不到"）。
+// English: a custom 100% threshold only fires when every signal abstains.
+func TestFlowAbstainAlertCustomThreshold(t *testing.T) {
+	e := &Engine{}
+	lines := flowAlertRecorder(e)
+	cm := config.NewManager("")
+	cm.Get().Sizing.FlowFactor.AbstainAlertPct = 100
+	e.cfgMgr = cm
+	quotes := map[string]*data.StockInfo{"600001": flowQuote(10, 1e6, 1e8, true)}
+	// 一半弃权（50%）< 100% → 不报
+	e.annotateFlowFactors([]combat_agent.Signal{flowBuySig("600001"), flowBuySig("600009")}, quotes)
+	if got := countDim(lines(), "当日"); got != 0 {
+		t.Fatalf("50%% < 100%% 不应告警，得 %d 条", got)
+	}
+	// 全弃权（100%）→ 报
+	e.annotateFlowFactors([]combat_agent.Signal{flowBuySig("600009")}, quotes)
+	if got := countDim(lines(), "当日"); got != 1 {
+		t.Fatalf("100%% 弃权必须告警，得 %d 条：%v", got, lines())
 	}
 }

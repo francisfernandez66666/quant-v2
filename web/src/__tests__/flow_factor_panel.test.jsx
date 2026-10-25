@@ -172,4 +172,28 @@ describe('§FLOW-FACTOR 设置页：默认语义 / 负阈值回显 / 整块提�
     expect(api.setRegimeConfig.mock.calls.length).toBe(0)
     expect([...document.body.querySelectorAll('*')].some((n) => /须严格递减/.test(n.textContent || ''))).toBe(true)
   })
+
+  // F5 R9 弃权率告警阈值：负数是**合法**语义（=关闭告警），必须原样回显、原样提交。
+  // 这条钉的是 num() 的 `n > 0` 判据——用它读这个字段，用户填的 -1 会被静默改成 50（默认开）。
+  // English: the R9 threshold accepts negatives (= disable); num()'s `n > 0` gate would silently
+  // rewrite an explicit -1 into the default 50.
+  it('F5 R9 阈值负数回显与提交都不被吞（-1 保持 -1，不回落 50）', async () => {
+    const p = regimePayload()
+    p.sizing.flow_factor.abstain_alert_pct = -1
+    state.impl = { ...stubs(), fetchRegimeConfig: () => p }
+    await openFine()
+    expect(Number(numberByLabel('弃权率告警阈值（%）').value)).toBe(-1)
+    fireEvent.click(btn('保存风控配置'))
+    await settle()
+    const api = await import('../api/index.js')
+    expect(api.setRegimeConfig.mock.calls.length).toBe(1)
+    expect(api.setRegimeConfig.mock.calls[0][0].sizing.flow_factor.abstain_alert_pct).toBe(-1)
+  })
+
+  // F6 缺键 → 显示出厂 50（不是 0：0 在后端语义里也等于 50，但显示 0 会让运维以为"关掉了"）。
+  // English: a missing key shows the factory 50 rather than 0.
+  it('F6 R9 阈值缺键 → 回显出厂的 50', async () => {
+    await openFine()
+    expect(Number(numberByLabel('弃权率告警阈值（%）').value)).toBe(50)
+  })
 })

@@ -49,7 +49,33 @@ type FlowFactorConfig struct {
 	// SellBands 卖出触发阈值（%，键：strong_out_pct/mild_out_pct）。
 	// English: sell trigger thresholds in percent.
 	SellBands map[string]float64 `json:"sell_bands,omitempty"`
+	// AbstainAlertPct R9 弃权率告警阈值（%）：单轮买入信号里某一维弃权占比达到本值即写 opslog
+	// 告警（同一维同一原因组合 30 分钟内只留一条）。0/缺键=出厂默认 50；负数=关闭告警（只留
+	// 每轮诊断打点）。取值口径沿用本仓 §N-RELAX 的"0=默认、负数=关闭"，防"配置缺键=静默放行"。
+	// English: R9 abstain-rate alert threshold in percent — 0/absent falls back to the factory 50,
+	// negative disables the alert (the per-round diagnostic line stays).
+	AbstainAlertPct float64 `json:"abstain_alert_pct,omitempty"`
 }
+
+// DefaultFlowAbstainAlertPct R9 弃权率告警阈值出厂值（%）。
+// 50% 的含义：某一维半数以上买入信号拿不到数，"数据源退化"与"个股断档"已经不能当噪声看；
+// 低于这个水位时弃权是常态（新股无 5 日历史、停牌无当日快照），报警只会把人训练成不看。
+// English: factory abstain-rate alert threshold — below half the signals abstaining is normal noise.
+const DefaultFlowAbstainAlertPct = 50.0
+
+// AbstainAlertThreshold 解析 R9 告警阈值：0/缺键=出厂默认；负数=关闭（返回 -1）；正数=自定义。
+// English: resolves the R9 threshold — 0/absent → default, negative → -1 (disabled), else the value.
+func (f FlowFactorConfig) AbstainAlertThreshold() float64 {
+	switch {
+	case f.AbstainAlertPct < 0:
+		return -1 // 关闭：调用方见负数即只打诊断行、不写 opslog 告警
+	case f.AbstainAlertPct == 0:
+		return DefaultFlowAbstainAlertPct
+	default:
+		return f.AbstainAlertPct
+	}
+}
+
 
 // 档位键名常量（映射表与带映射共用，防拼写漂移）。
 // English: band key constants shared by the maps and the band mapper.

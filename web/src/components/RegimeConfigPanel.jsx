@@ -52,6 +52,9 @@ const DEFAULT_FLOW_BT = { strong_in: 1.05, mild_in: 1.025, neutral: 1.00, mild_o
 const DEFAULT_FLOW_BANDS = { strong_in_pct: 3, mild_in_pct: 1, mild_out_pct: -1, strong_out_pct: -3 }
 const DEFAULT_FLOW_SELL = { strong_out: 0.85, mild_out: 0.95, today_strong_out: 0.95, today_mild_out: 0.975 }
 const DEFAULT_FLOW_SELL_BANDS = { strong_out_pct: -3, mild_out_pct: -1 }
+// R9 弃权率告警阈值出厂值（%），与后端 config.DefaultFlowAbstainAlertPct 同值。
+// English: R9 abstain-alert threshold default, mirroring the backend constant.
+const DEFAULT_FLOW_ABSTAIN_PCT = 50
 // 档位键 → 中文标签（页面与 tooltip 共用，防拼写漂移）。
 // English: band key → Chinese label, shared by the rows and their hints.
 const FLOW_BAND_LABEL = { strong_in: '强流入', mild_in: '中流入', neutral: '中性', mild_out: '中流出', strong_out: '强流出' }
@@ -90,6 +93,16 @@ const DEFAULTS = {
 function num(v, fallback) {
   const n = Number(v)
   return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+// signedNum 允许负数/0 的数值读取。
+// 为什么不能复用 num()：num() 的 `n > 0` 判据把 0 与负数一律当"没写"回落默认——对"负数=关闭"
+// 这类语义（R9 告警阈值）会把用户的显式关闭静默改回默认开，是 §FLOW-FACTOR 档位阈值同族的坑。
+// English: reads signed numbers; num()'s `n > 0` gate would silently turn an explicit "negative =
+// disabled" back into the default.
+function signedNum(v, fallback) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
 }
 
 function intNum(v, fallback) {
@@ -274,6 +287,10 @@ export default function RegimeConfigPanel() {
         flowBTBands: mapSigned((sz.flow_factor || {}).buy_today_bands, DEFAULT_FLOW_BANDS),
         flowSell: mapNums((sz.flow_factor || {}).sell_scales, DEFAULT_FLOW_SELL),
         flowSellBands: mapSigned((sz.flow_factor || {}).sell_bands, DEFAULT_FLOW_SELL_BANDS),
+        // R9 弃权率告警阈值（%）：0/缺键=后端取出厂 50；负数=关闭告警（只留每轮诊断行）。
+        // 用 mapSigned 的口径读——负数是合法值，不能被 num() 的 n>0 判据吞掉。
+        // English: R9 abstain-alert threshold; negative is legal (disables), so read it signed.
+        flowAbstainPct: signedNum((sz.flow_factor || {}).abstain_alert_pct, DEFAULT_FLOW_ABSTAIN_PCT),
         // §SIZING-EVO（2026-10-25）：自进化回路开关。出厂 **nil=关**（与因子默认开相反：
         // 进化是新增常驻行为，必须显式开），故这里判据是 `=== true`。
         // English: evolution switch defaults OFF (nil=off), unlike the factors — hence `=== true`.
@@ -423,6 +440,9 @@ export default function RegimeConfigPanel() {
       const n = Number(v)
       if (!Number.isFinite(n) || n < 0 || n > 3) bad.push(`净流入档位乘子 ${k}`)
     }
+    // R9 阈值：>100 无意义（弃权率不可能超过 100%）；负数合法（=关闭），只挡非数与非有限值。
+    const ap = Number(f.flowAbstainPct)
+    if (!Number.isFinite(ap) || ap > 100) bad.push('弃权率告警阈值（须 ≤100，负数=关闭）')
     return bad
   }
 
@@ -504,6 +524,8 @@ export default function RegimeConfigPanel() {
             buy_today_bands: { ...form.flowBTBands },
             sell_scales: { ...form.flowSell },
             sell_bands: { ...form.flowSellBands },
+            // R9：弃权率告警阈值（%）。负数=关闭告警，原样提交，不在前端"纠正"成 0/默认。
+            abstain_alert_pct: Number(form.flowAbstainPct),
           },
           // §SIZING-EVO：只提交开关两键，其余（search_bounds/schedule/min_samples）留配置层，
           // 避免页面一次保存把围栏覆盖掉。
@@ -840,6 +862,15 @@ export default function RegimeConfigPanel() {
                   onChange={(v) => setMap('flowSellBands', k, v)}
                 />
               ))}
+              <NumRow
+                label="弃权率告警阈值（%）"
+                hint="单轮买入信号里某一维拿不到数的占比达到该值即写 opslog 告警（同一原因 30 分钟一条）；默认 50；填负数=关闭告警"
+                value={form.flowAbstainPct}
+                min={-100}
+                max={100}
+                step={5}
+                onChange={(v) => set({ flowAbstainPct: v })}
+              />
 
               <div style={groupStyle}>自进化回路（§SIZING-EVO，出厂关）</div>
               <SwitchRow

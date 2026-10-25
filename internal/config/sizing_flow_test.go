@@ -177,3 +177,32 @@ func TestEvoSearchBoundsOverride(t *testing.T) {
 		t.Error("WithDefaults must not mutate the caller's map")
 	}
 }
+
+// TestFlowAbstainAlertThreshold R9 阈值三态：缺键/0 → 出厂 50；负数 → -1（关闭）；正数 → 原值。
+// 这条锁的是"配置缺键不得等于静默放行"——0 与负数语义必须分家，否则运维想关告警只能猜。
+// English: R9 threshold tri-state — absent/0 → factory 50, negative → disabled (-1), else the value.
+func TestFlowAbstainAlertThreshold(t *testing.T) {
+	if got := DefaultFlowFactorConfig().AbstainAlertThreshold(); got != DefaultFlowAbstainAlertPct {
+		t.Errorf("出厂阈值 = %v, want %v", got, DefaultFlowAbstainAlertPct)
+	}
+	cases := []struct {
+		name string
+		in   float64
+		want float64
+	}{
+		{"缺键/0取默认", 0, DefaultFlowAbstainAlertPct},
+		{"负数关闭", -1, -1},
+		{"负数任意值都关闭", -0.5, -1},
+		{"正数自定义", 20, 20},
+		{"恰好100", 100, 100},
+	}
+	for _, c := range cases {
+		if got := (FlowFactorConfig{AbstainAlertPct: c.in}).AbstainAlertThreshold(); got != c.want {
+			t.Errorf("%s: AbstainAlertThreshold(%v) = %v, want %v", c.name, c.in, got, c.want)
+		}
+	}
+	// WithDefaults 不得把用户写的阈值抹掉（阈值不参与档位合并，但必须原样穿过合并）。
+	if got := (FlowFactorConfig{AbstainAlertPct: 20}).WithDefaults().AbstainAlertThreshold(); got != 20 {
+		t.Errorf("WithDefaults 后阈值 = %v, want 20", got)
+	}
+}

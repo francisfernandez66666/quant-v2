@@ -23,14 +23,17 @@
 package engine
 
 import (
+	"fmt"
 	"log"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/opslog"
 )
 
 // flowHistTTL 5 日历史取数缓存 TTL（成功）。盘中序列只会追加当日行，10 分钟新鲜度对
@@ -264,8 +267,111 @@ func (e *Engine) annotateFlowFactors(sigs []combat_agent.Signal, quotes map[stri
 		}
 	}
 	// R9：有弃权才打点（全命中时静默，防刷屏）；原因分布让"数据源退化"与"个股断档"可区分。
+	// 诊断行（stderr）与告警行（opslog 日刊）刻意分家：前者每轮都写、供盘中盯盘；后者只在
+	// 弃权率越过阈值时写一条、供盘后复盘与值班告警——日刊的定位是"策划性低频事件"，
+	// 每轮都写会把 90 天日刊淹掉。
 	if nBuy > 0 && (len(whyToday) > 0 || len(whyFive) > 0) {
 		log.Printf("[flowfactor] 本轮 %d 条买入：当日命中 %d 弃权 %v；5日命中 %d 弃权 %v",
 			nBuy, nToday, whyToday, nFive, whyFive)
 	}
+	if nBuy > 0 {
+		th := e.flowAbstainAlertThreshold()
+		if th >= 0 {
+			e.flowAbstainAlert("当日", nBuy, nToday, whyToday, th)
+			e.flowAbstainAlert("5日", nBuy, nFive, whyFive, th)
+		}
+	}
+}
+
+// flowAbstainAlertThreshold 读本账号的 R9 告警阈值（%；负数=关闭）。
+// English: reads the account's R9 abstain-alert threshold (percent; negative = disabled).
+func (e *Engine) flowAbstainAlertThreshold() float64 {
+	sc := e.sizingConfigFor(e.primaryMember())
+	return sc.FlowFactor.AbstainAlertThreshold()
+}
+
+// flowAbstainAlertWindow 同键告警节流窗口：弃权是"持续状态"，一次数据源退化会在每一轮都成立，
+// 30 分钟一条足够让值班看见，又不会把日刊写成一堵墙。
+// English: throttle window per alert key — a degraded source stays degraded for many rounds.
+const flowAbstainAlertWindow = 30 * time.Minute
+
+// flowAbstainAlert 单维弃权率越阈值时写一条 opslog（同键 30 分钟内只留一条）。
+//
+// 为什么按"维度+原因分布"做键而不是只按维度：原因是可区分的处置线索——
+//   - 全是 no_flow_today / no_flow_hist  ⇒ 上游资金流端点退化（查限速/反爬，R9 主场景）；
+//   - 全是 no_floatcap                  ⇒ 流通股本解析断了（THS realhead "402" 字段变了）；
+//   - 全是 stale_hist                   ⇒ 5 日序列末行不是本交易日（数据源停更，同 §CAL-COVER 形态）；
+//   - 混杂的 no_quote                   ⇒ 停牌/未订阅，属正常噪声。
+//
+// 键里带原因分布，就自动做到"原因变了就重新报一条"，不会因为旧键还在节流窗内把新故障吞掉。
+// English: writes one opslog line when a dimension's abstain rate crosses the threshold; the throttle
+// key includes the reason histogram so a *new* failure mode is never swallowed by an old window.
+func (e *Engine) flowAbstainAlert(dim string, nBuy, nHit int, why map[string]int, threshold float64) {
+	if nBuy <= 0 {
+		return
+	}
+	abstain := nBuy - nHit
+	if abstain <= 0 {
+		return
+	}
+	rate := float64(abstain) / float64(nBuy) * 100
+	// 浮点比较留 1e-9 余量：恰好压线（如 50.0）必须算越线，不能因为二进制表示误差漏报。
+	if rate+1e-9 < threshold {
+		return
+	}
+	key := dim + "|" + flowReasonKey(why)
+	e.flowAlertOnce(key, func() {
+		e.flowAlertWrite("FLOWFACTOR-ALERT",
+			"净流入因子弃权率越阈值：维度=%s 本轮买入=%d 弃权=%d 弃权率=%.1f%% 阈值=%.1f%% 原因分布=%s（数据源退化或个股断档，查日线资金流端点/流通股本解析/交易日历；只影响仓位乘子，不影响是否出信号）",
+			dim, nBuy, abstain, rate, threshold, flowReasonKey(why))
+	})
+}
+
+// flowAlertOnce 同键节流（窗口内只执行一次 fn）。表为空时懒建，长跑下键数受"维度×原因分布"
+// 组合数约束（有限），不会无界增长。
+// English: per-key throttle; the key space is bounded by dimension × reason-histogram combinations.
+func (e *Engine) flowAlertOnce(key string, fn func()) {
+	e.flowAlertMu.Lock()
+	if e.flowAlertAt == nil {
+		e.flowAlertAt = map[string]time.Time{}
+	}
+	now := time.Now()
+	if last, ok := e.flowAlertAt[key]; ok && now.Sub(last) < flowAbstainAlertWindow {
+		e.flowAlertMu.Unlock()
+		return
+	}
+	e.flowAlertAt[key] = now
+	e.flowAlertMu.Unlock()
+	fn()
+}
+
+// flowAlertWrite 写告警：测试缝非 nil 时走缝，否则落 opslog 日刊。
+// English: writes the alert through the test seam when set, otherwise into the opslog journal.
+func (e *Engine) flowAlertWrite(tag, format string, args ...any) {
+	if e.flowAlertf != nil {
+		e.flowAlertf(tag, format, args...)
+		return
+	}
+	opslog.Logf(tag, format, args...)
+}
+
+// flowReasonKey 把原因分布压成稳定的短串（键序排序，保证同一分布恒得同一键）。
+// English: stable short rendering of the reason histogram (sorted keys → same input, same key).
+func flowReasonKey(why map[string]int) string {
+	if len(why) == 0 {
+		return "-"
+	}
+	keys := make([]string, 0, len(why))
+	for k := range why {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%s=%d", k, why[k])
+	}
+	return b.String()
 }

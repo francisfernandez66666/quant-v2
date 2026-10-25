@@ -224,22 +224,31 @@ type Engine struct {
 	// English: P6 calendar calibration — cache-file path (empty dataDir disables it) + a daily-calibrated marker.
 	macroCalCachePath string
 	calibrateDay      string
-	lastBearReasons   map[string]string                                                                               // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
-	d1MaxRetries      int                                                                                             // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
-	d1MaxTokens       int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
-	lastTiming        *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
-	factorMon         *factorMonitor                                                                                  // 因子战法效果监测（战法库触发信号前向收益结算）
-	qualityTrack      *signalQualityTracker                                                                           // §DYN-SIZE P3 信号质量分桶结果回喂（Enhance.DynWeight 开启时懒建）
-	flowTrack         *flowFactorTracker                                                                              // §FLOW-FACTOR 净流入率解析器（5 日历史 (code,交易日) 缓存；因子开时懒建）
-	evoTrack          *sizingEvoTracker                                                                               // §SIZING-EVO 影子落盘器（结构化快照/灰度照算/前向结算；evo 开时懒建）
-	evoStoreDir       string                                                                                          // §SIZING-EVO 影子库目录（<dataDir>/sizing_evo；空=纯内存禁用）
-	paper             *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
-	paperOnSignals    func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
-	paperMarkFn       func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
-	paperSellJudgeFn  func(feed sellJudgeFeed, sellMode string)                                                       // §SELLPOINT-UNIFY P3：按账号遍历模拟盘账本的统一卖出裁决（registry 注入；nil=回退全局 e.paper 单账本）；sellMode=§M9 轮首快照透传
-	paperHeldCodes    func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
-	lastBaseLog       time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
-	lastTrim          time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
+	lastBearReasons   map[string]string     // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
+	d1MaxRetries      int                   // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
+	d1MaxTokens       int                   // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
+	lastTiming        *RunTiming            // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
+	factorMon         *factorMonitor        // 因子战法效果监测（战法库触发信号前向收益结算）
+	qualityTrack      *signalQualityTracker // §DYN-SIZE P3 信号质量分桶结果回喂（Enhance.DynWeight 开启时懒建）
+	flowTrack         *flowFactorTracker    // §FLOW-FACTOR 净流入率解析器（5 日历史 (code,交易日) 缓存；因子开时懒建）
+	// flowAlertf §FLOW-FACTOR R9 opslog 告警测试缝：非 nil 时替代 opslog.Logf（单测用它抓告警文案，
+	// 不必在全局 opslog 目录上做文件断言）；生产恒 nil，走真实 opslog 日刊。
+	// flowAlertAt 同维度同原因组合的告警节流表（键=维度|原因分布，值=上次写出时刻），配 flowAlertMu
+	// 单独加锁——不挤占 e.mu（告警写在评分轮内，抢主锁会把整轮拖住）。
+	// English: R9 test seam for the opslog alert writer + the per-key throttle table (own mutex, never
+	// the engine lock — alerts fire inside the scoring round).
+	flowAlertf       func(tag, format string, args ...any)
+	flowAlertMu      sync.Mutex
+	flowAlertAt      map[string]time.Time
+	evoTrack         *sizingEvoTracker                                                                               // §SIZING-EVO 影子落盘器（结构化快照/灰度照算/前向结算；evo 开时懒建）
+	evoStoreDir      string                                                                                          // §SIZING-EVO 影子库目录（<dataDir>/sizing_evo；空=纯内存禁用）
+	paper            *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
+	paperOnSignals   func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
+	paperMarkFn      func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
+	paperSellJudgeFn func(feed sellJudgeFeed, sellMode string)                                                       // §SELLPOINT-UNIFY P3：按账号遍历模拟盘账本的统一卖出裁决（registry 注入；nil=回退全局 e.paper 单账本）；sellMode=§M9 轮首快照透传
+	paperHeldCodes   func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
+	lastBaseLog      time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
+	lastTrim         time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
 	// §DAILY_REVIEW 盘后持仓综合复盘：reviewGuardDay 记录本引擎最近一次复盘的交易日（YYYY-MM-DD），
 	// 保证每日只自动跑一次（盘后休眠分支每 ~15min 唤醒亦触发，靠此去重）；reviewRunning 防自动/手动并发重入；
 	// reviewDailyK / reviewAsk 为可注入依赖（默认取 e.marketAPI.GetSinaKLine 与 e.llmClient.Chat），
