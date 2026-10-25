@@ -2927,7 +2927,14 @@ echo "==> 83 §SIDE-AUTH-2 方向权威补漏：xt 直连同源作保 + side_unv
 # 前置：未证方向一律不入账本——网关落「待核对」通道（保留全部成交证据、不动持仓），
 #       Go 侧留痕拒入账本并广播 side_unverified，历史错账走 §FILL-AMEND 人工勘误（见 84）。
 go test -count=1 ./internal/server/ -run 'TestExecuteRejectsNonCanonicalSide|TestExecuteSellSideStillAccepted|TestReportSideUnverified|TestReportEnvelopeDecodesSideUnverified' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-python3 -m pytest qmt_gateway/tests/test_side_auth2.py qmt_gateway/tests/test_report_contract.py -q 2>&1 | tail -3
+# §TEST-PYFALLBACK（2026-10-25 实录）：这两行原来是裸 `python3 -m pytest ... | tail -3`。
+# 本机没有 pytest 时 `python3 -m pytest` 直接非零退出，而 `set -o pipefail` 会让整条管道
+# 返回非零 ⇒ set -e 当场把脚本带走，后面的静态锁一条都没读数（首次全量门禁 §83 就死在这里，
+# 而 §83 自己的文案还写着"行为锁 2 套件"——一条都没跑过）。改用 py_tests()：有 pytest 走
+# pytest，没有就退回标准库 unittest（该 helper 本来就是为这件事写的，见前言说明）。
+# 注意 py_tests 一次只收一个 target，原来那一行传两个文件，这里分成两次调用。
+py_tests qmt_gateway/tests/test_side_auth2.py
+py_tests qmt_gateway/tests/test_report_contract.py
 # 双通道同源锁：桥/HTTP 入口与 xt 直连入口必须各自做一次派发行作保，少一处就留半边 fail-open。
 grep -q 'def _apply_trade' qmt_gateway/gateway.py \
 	&& grep -q 'req\["side_unverified"\] = True' qmt_gateway/gateway.py \
@@ -3126,7 +3133,10 @@ echo "==> 86 §SIGID-TRUNC 成交回报 signal_id 被柜台截到 24 字符：�
 #   §FILL-AMEND 勘误台账都挂在它上面 → 回填历史（改长度）会让新旧行分裂、可能同一笔双倍记账。
 #   因此：**历史行走读取端两边兼容（不回填、不动 fills 一列）**，**新行在写路径收口**（桥以
 #   wire_ref 为唯一截断点、网关以第四级前缀唯一归因还原成完整编号后入账）。
-python3 -m pytest qmt_gateway/tests/test_sigid_trunc.py -q 2>&1 | tail -3
+# §TEST-PYFALLBACK（2026-10-25 实录，与 §83 同族）：裸 `python3 -m pytest` 在本机没有 pytest 时
+# 非零退出，`set -o pipefail` 让整条管道返回非零 ⇒ set -e 当场带走脚本，本段后面二十余道静态锁
+# 一条都不读数。改走 py_tests()（有 pytest 用 pytest，没有退回 unittest）。
+py_tests qmt_gateway/tests/test_sigid_trunc.py
 go test -count=1 ./internal/store/ -run 'TestSumFilledQtyMatchesCounterTruncatedID|TestSumFilledQtyReverseLegNeedsSameDay|TestSumFilledQtyEmptySignalIDIsZero|TestResetCancelledWithTruncatedFillNotReplayable' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # ① 截断只准有一处：一个常量 + 一个函数（三处截断点各写一份 = 上限变更时必然漏改一处）。
 grep -q 'WIRE_REF_MAX = 24' qmt_gateway/qmt_bridge_strategy.py \
@@ -10309,7 +10319,14 @@ py_leg112() { # $1=pytest 文件 $2=最少必须真跑过的条数（依赖无�
 	want=$(grep -c '^    def test_' "$target" 2>/dev/null || true)
 	[ "${want:-0}" -ge 1 ] || { echo "--- FAIL: §112 pytest 资产派生 ${CNT112}（$target 一条 test 方法都没派生到＝文件写法变了）"; exit 1; }
 	out=$(py_tests "$target" 2>&1 || true)
-	if printf '%s\n' "$out" | grep -qE 'FAILED|ERROR|ModuleNotFoundError|No such file or directory'; then
+	# §TEST-PYFALLBACK（2026-10-25 实录）：判红词必须**锚在行首**。test_degraded_source.py 的跳过
+	# 理由原文是 `skipped 'sidecar 无法 import（ModuleNotFoundError("No module named \'baostock\'")），
+	# 线格式用例跳过'`——"缺第三方库所以跳过"是这个文件**设计好的合法态**（floor=1，只要求 K4 静态腿
+	# 真跑）。旧的非锚定写法把这行理由也当判红词，于是一台没装 pandas/baostock 的机器上这条腿
+	# **永远红**，而它的 7 条用例其实跑得好好的（6 skip + 1 ok）。
+	# 现在只有真·收集失败才会命中：pytest 的 FAILED/ERROR 顶格、Traceback 顶格、
+	# import 炸掉时的 ModuleNotFoundError 顶格、以及 OS 级文件缺失。
+	if printf '%s\n' "$out" | grep -qE '^(FAILED|ERROR)|^Traceback|^ModuleNotFoundError|No such file or directory'; then
 		echo "--- FAIL: §112 pytest 行为腿判红（${target}，派生 ${want} 条），尾部如下："
 		printf '%s\n' "$out" | tail -25
 		exit 1
@@ -11606,8 +11623,16 @@ go_leg114() { # $1=说明 $2=包 $3=-run 正则
 go_leg114 'trigger 窗口族（Sec 界定/反向/断流/负差分）' ./internal/trigger/ 'TestAdvanceWindow|TestWindowBoundedBySec|TestWiderSecKeepsOlderBase|TestGapResetsWindow|TestNegativeCumulativeResetsWindow'
 go_leg114 'cmd/quant 启动守卫族（staging 拒/放行/非 staging 不误伤）' ./cmd/quant/ 'TestStagingFailFastRefusesRealGateway|TestStagingAllowedWhenDisabled|TestNonStagingNeverRefused|TestGetDataDirStagingForced|TestGetDataDirNormalEnv'
 go_leg114 'metrics 路由器 journal 族（P26/P27/P27b + 假绿反证 + 生产入口）' ./internal/metrics/ 'TestDailySummarySurvivesRestart|TestPendingResolveSurvivesRestart|TestAnnouncedSurvivesRestart|TestSameDayRestartKeepsAccumulating|TestCorruptAndVersionMismatchFallBackEmpty|TestWriteSkippedOnlyWhenUnchanged|TestProductionEntryPathHydratesGlobal'
-PY_LEG114=$(cd qmt_gateway && python3 -m pytest -q tests/test_xt_mapping.py 2>&1 || true)
+# §TEST-PYFALLBACK（2026-10-25 实录）：原来是 `cd qmt_gateway && python3 -m pytest -q tests/...`。
+# 本机没有 pytest 时输出只有一句 "No module named pytest"，下面按 `N passed` 取数取到 0，
+# 与文件里 18 个 test 定义不等值 ⇒ 判红，而这条腿其实一条都没跑（"没跑"被读成"跑红了"）。
+# 改走 py_tests()，并让计数兼容两种形态：pytest 的 "N passed" 与 unittest 退回形态的
+# "Ran N tests"——两者取到的数都等于"真有结论的用例数"，与 N_DEFTEST114 等值才是这条腿的意义。
+PY_LEG114=$(py_tests qmt_gateway/tests/test_xt_mapping.py 2>&1 || true)
 N_PYTEST114=$(printf '%s\n' "$PY_LEG114" | grep -E '[0-9]+ passed' | head -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
+if [ -z "${N_PYTEST114:-}" ]; then
+	N_PYTEST114=$(printf '%s\n' "$PY_LEG114" | sed -n 's/^Ran \([0-9][0-9]*\) tests.*/\1/p' | head -1 || true)
+fi
 CNT114=$((CNT114 + 1))
 if printf '%s\n' "$PY_LEG114" | grep -qE ' failed|error'; then
 	echo "--- FAIL: §114 网关映射行为腿判红："
@@ -14225,18 +14250,21 @@ WEBO124=web/src/pages/Positions.jsx
 # （本项目吃过负向 grep 打中注释的亏）。
 # W3（2026-10-25）起 sellProbe 引入**单一 basis**：默认仍取摊薄成本 EntryPrice（W2 契约不变），
 # 只有 in.UseAnchor 显式为真且锚点已知才换成 AnchorPrice。于是「未签认前不许搬家」这条锁
-# 改写成三条等值 + 一条门数等值：① 默认基准是 EntryPrice；② 换锚只有一个门；③ 盈亏/高水/
-# 移动止盈共用同一个 basis；④ in.AnchorPrice 只许出现一次（就是那道门，多一处＝绕门裸读）。
+# 改写成四条等值：① 默认基准是 EntryPrice；② 换锚只有一个门；③ 门内唯一一次赋值；
+# ④ 盈亏/高水/移动止盈共用同一个 basis（算式整串必须命中 basis）。
+# 门数等值数的是**代码行**（注释里说明"为什么用这个门"的散文不算）：换锚门一处 + 门内赋值
+# 一处 ＝ 恰好 2。多一处＝有人绕开门裸读锚点，少一处＝门成了空转。
 grep -q 'basis := in\.EntryPrice' "$SEL124" ||
 	fail124 "sellProbe 的基准默认值不再是摊薄成本 EntryPrice（默认换锚＝未签认就把整仓风险线搬家）"
 grep -q 'if in\.UseAnchor && in\.AnchorPrice > 0 {' "$SEL124" ||
 	fail124 "换锚门不再是「in.UseAnchor && in.AnchorPrice > 0」（门一松，缺锚持仓会按 0 基准算盈亏）"
-grep -q 'pnl := (in\.CurPrice - basis) / basis \* 100' "$SEL124" ||
-	fail124 "sellProbe 的盈亏算式没走单一 basis（三处消费点各算各的＝读数混两把尺，比不切更坏）"
-INA124=$(grep -c 'in\.AnchorPrice' "$SEL124" || true)
-[ "${INA124:-0}" = "1" ] ||
-	fail124 "sellProbe 里 in.AnchorPrice 出现 ${INA124} 处（期望=1，只许是换锚门那一处；多一处＝绕门裸读锚点）"
-# 射程自证：同一条判据打在对照层必须命中，否则上面那条「等值 1」是判据机器失灵而不是内核干净。
+grep -q 'basis = in\.AnchorPrice' "$SEL124" ||
+	fail124 "换锚门里没有「basis = in.AnchorPrice」这一处赋值（门成立了却不赋值＝形式主义切硬）"
+INA124=$({ grep -nF -- 'in.AnchorPrice' "$SEL124" 2>/dev/null || true; } \
+	| { grep -Ev '^[0-9]+:[[:space:]]*(//|\*|/\*)' || true; } | wc -l | tr -d ' ')
+[ "${INA124:-0}" = "2" ] ||
+	fail124 "sellProbe 里 in.AnchorPrice 的代码行数是 ${INA124:-0}（期望=2：换锚门一处 + 门内赋值一处；多一处＝绕门裸读锚点，少一处＝门空转）"
+# 射程自证：同一条判据打在对照层必须命中，否则上面那条「等值 2」是判据机器失灵而不是内核干净。
 RGA124=$(grep -c 'in\.AnchorPrice' "$ASH124" || true)
 [ "${RGA124:-0}" -ge 1 ] ||
 	fail124 "射程自证失败：同一条 in.AnchorPrice 判据在 ${ASH124} 也读出 0＝判据失灵，上面那条绿没有任何含义"
