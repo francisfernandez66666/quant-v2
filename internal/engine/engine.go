@@ -230,6 +230,9 @@ type Engine struct {
 	lastTiming        *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
 	factorMon         *factorMonitor                                                                                  // 因子战法效果监测（战法库触发信号前向收益结算）
 	qualityTrack      *signalQualityTracker                                                                           // §DYN-SIZE P3 信号质量分桶结果回喂（Enhance.DynWeight 开启时懒建）
+	flowTrack         *flowFactorTracker                                                                              // §FLOW-FACTOR 净流入率解析器（5 日历史 (code,交易日) 缓存；因子开时懒建）
+	evoTrack          *sizingEvoTracker                                                                               // §SIZING-EVO 影子落盘器（结构化快照/灰度照算/前向结算；evo 开时懒建）
+	evoStoreDir       string                                                                                          // §SIZING-EVO 影子库目录（<dataDir>/sizing_evo；空=纯内存禁用）
 	paper             *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
 	paperOnSignals    func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
 	paperMarkFn       func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
@@ -626,6 +629,7 @@ func New(
 	paperAnchorPath := ""
 	buyQueuePath := ""
 	anchorShadowPath := "" // §ANCHOR-FIRST 影子对照表落盘路径（dataDir 空=禁用文件、只打日志）
+	evoStoreDir := ""      // §SIZING-EVO 影子库目录（dataDir 空=纯内存禁用）
 	if dataDir != "" {
 		hotRecPath = filepath.Join(dataDir, "hot_records.json")
 		signalRecPath = filepath.Join(dataDir, "signal_records.json")
@@ -635,6 +639,7 @@ func New(
 		paperAnchorPath = filepath.Join(dataDir, "paper_sell_anchors.json")
 		buyQueuePath = filepath.Join(dataDir, "buy_queue_pending.json")
 		anchorShadowPath = filepath.Join(dataDir, "anchor_shadow.json") // §ANCHOR-FIRST W2 影子对照表
+		evoStoreDir = filepath.Join(dataDir, "sizing_evo")              // §SIZING-EVO 影子库
 	}
 	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
 	e := &Engine{
@@ -682,6 +687,7 @@ func New(
 		paperAnchorPath:   paperAnchorPath,  // §M10 paper 移动止盈锚点文件（空=纯内存不落盘）
 		buyQueuePath:      buyQueuePath,     // §M11 停机买单队列落盘路径（空=禁用）
 		anchorShadowPath:  anchorShadowPath, // §ANCHOR-FIRST W2 影子对照表（空=不落盘，日志照打）
+		evoStoreDir:       evoStoreDir,      // §SIZING-EVO 影子库目录（空=纯内存禁用）
 	}
 	// §D-2（GAP_VERIFY_20260917_PM）裁定留痕落盘：JSONL 按日轮转 + 启动回灌当日环，
 	// quant 重启不再丢"为何没成交"的拦截原因。dataDir 空（纯内存测试路径）自动跳过；
@@ -1146,6 +1152,8 @@ func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Si
 	// §DYN-SIZE P3：与 live 通道同源解析信号质量权重（方案 §5「通道一致」测试锁）——
 	// 两通道读同一张表、同一分桶键，paper 的 QualityWeight 与 live 逐字相同。
 	e.annotateQualityWeights(combined)
+	// §FLOW-FACTOR：与 live 通道同源挂载净流入率（只挂买入；卖出侧由统一裁决路径单独挂）。
+	e.annotateFlowFactors(combined, quotes)
 	if dispatch != nil {
 		dispatch(combined, nil, quotes)
 		return
@@ -1293,6 +1301,9 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 	// §DYN-SIZE P3：把信号质量归一化权重解析到每条买入信号（Enhance.DynWeight 关闭时零操作）。
 	// 放在准入之前——qualityFactor 读的就是 Signal.QualityWeight。
 	e.annotateQualityWeights(buys)
+	// §FLOW-FACTOR：把两个净流入率（当日/5 日）挂到买入信号（两侧开关都关时零操作）。
+	// 同位置准入之前——signalctl 的 flow5DFactor/flowTodayFactor 读的就是这两个字段。
+	e.annotateFlowFactors(buys, live)
 	ctl := e.SignalCtl()
 	acct := e.primaryMember()
 	pol := e.liveSignalPolicy()
@@ -1321,6 +1332,9 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 		}
 	}
 	e.mu.Unlock()
+	// §SIZING-EVO R1：把本轮定权结果落结构化快照（含灰度候选的 shadow 照算）。
+	// 放在执行之前——执行层失败（资金不足/拒单）不影响"当时定权多少"这个观测事实。
+	e.evoRecordDecisions(pol, decisions, buys, "live", acct, now)
 	// §DYN-SIZE：把控制器的缩放系数透传到执行层（0=未定权，执行层按基准金额）。
 	sizingOn := pol.Regime.SizeCfg.EnabledOn()
 	for i, d := range decisions {
@@ -1357,7 +1371,10 @@ func (e *Engine) filterPaperAdmitted(uid string, sigs []combat_agent.Signal, now
 	if len(sigs) == 0 {
 		return sigs
 	}
-	decisions := e.SignalCtl().Evaluate(signalctl.ChannelPaper, uid, sigs, e.paperSignalPolicy(uid), now)
+	pol := e.paperSignalPolicy(uid)
+	decisions := e.SignalCtl().Evaluate(signalctl.ChannelPaper, uid, sigs, pol, now)
+	// §SIZING-EVO R1：paper 通道同样落结构化快照（与 live 同源同口径，只换 Channel）。
+	e.evoRecordDecisions(pol, decisions, sigs, "paper", uid, now)
 	out := make([]combat_agent.Signal, 0, len(sigs))
 	for i, s := range sigs {
 		if decisions[i].Verdict != signalctl.VerdictPass {

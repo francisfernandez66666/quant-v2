@@ -197,10 +197,13 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account, book string, 
 	for _, row := range rows {
 		code := pureTsCode(row.Code)
 		price := 0.0
+		var fq *data.StockInfo // §FLOW-FACTOR：与本轮同源定价的行情快照（净流入率分母/当日值来源）
 		if q := feed.PoolQuotes[code]; q != nil && q.Price > 0 {
 			price = q.Price
+			fq = q
 		} else if q := feed.SnapQuotes[code]; q != nil && q.Price > 0 {
 			price = q.Price // §R4-6 同口径：打分池外的持仓用 5s 快照兜底，两者皆缺→无效价不下结论
+			fq = q
 		}
 		in := signalctl.SellInput{
 			Code:       row.Code,
@@ -211,6 +214,12 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account, book string, 
 			AnchorPrice: row.AnchorPrice,
 			// §ANCHOR-FIRST-W3：基准选择从轮首 Policy 快照带进来（四处装配共用这一处出口）。
 			UseAnchor: pol.AnchorHard,
+		}
+		// §FLOW-FACTOR：净流入率挂到 SellInput（卖出加权消费：净流出 → 确认窗时长×权重）。
+		// 账号级卖出开关关 / 取数失败 → 两个比值保持 0 = 该维弃权（不加权也不惩罚）。
+		// 与买入侧挂载共用同一缓存与同一道闸（R3 日期断言 / §FIX-9e 缺数不当 0）。
+		if pol.Regime.SizeCfg.FlowSellOn() {
+			in.FlowRatioToday, in.FlowRatio5D = e.flowRatiosFor(code, fq, now)
 		}
 		// 做多信号（延持唯一资格源，语义②）：带打分轮次时间戳（边界⑥）。
 		// §H5（2026-09-22 修复批）产分时刻优先取信号自身 UpdatedAt（combat_agent 打分链路

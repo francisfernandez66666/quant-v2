@@ -579,6 +579,13 @@ type Engine struct {
 	// English: once-per-day dedup for the "T blocked by budget pipeline" log, tracked separately from
 	// budgetWarnDay because the two clear under different conditions.
 	tWarnDay string
+	// nowFn 做 T 的时钟缝（nil ⇒ time.Now）。存在的理由只有一个：`RunIntradayT` 内部取"现在"
+	// 判断是否已到 14:50 尾盘强制配平线，取真实时间会让**全部正 T 用例在 14:50 之后必然变红**
+	// （force=true 直接跳过开腿）——白天绿、晚上红的测试等于没有测试。生产路径永远留 nil。
+	// English: clock seam for §T-MODE only. RunIntradayT compares "now" against the 14:50 forced-pairing
+	// line; reading the wall clock makes every buy-first case fail after 14:50 (force short-circuits leg
+	// opening). nil in production — the seam exists so tests can pin a session time.
+	nowFn func() time.Time
 
 	// §C1 行业敞口（与实盘态同口径）：上限%、影子开关、行业查询源。默认全关/影子，
 	// 未注入时闸自然跳过，零行为变化。
@@ -848,6 +855,15 @@ func (c Config) DynamicBudgetWithoutScale() bool {
 // English: whether the v3 dynamic budget is active (callers generally already hold e.mu).
 func (e *Engine) dynamicBudgetOn() bool {
 	return strings.EqualFold(strings.TrimSpace(e.cfg.BudgetMode), "dynamic")
+}
+
+// clockNow 取"现在"：测试注入 nowFn 时用注入值，生产路径回落 time.Now。
+// English: "now" — the injected test clock when set, time.Now in production.
+func (e *Engine) clockNow() time.Time {
+	if e.nowFn != nil {
+		return e.nowFn()
+	}
+	return time.Now()
 }
 
 // warnBudgetWithoutScaleLocked §DYN-GLOBAL 半开态每日一次留痕（调用方须持 e.mu）。

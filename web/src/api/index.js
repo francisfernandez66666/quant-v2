@@ -2191,6 +2191,15 @@ export async function renameResearchLibrary(id, name) {
   return request('/api/research/library/' + encodeURIComponent(id) + '/rename', { method: 'POST', data: { name } })
 }
 
+// ── §SIZING-EVO 仓位进化（动态仓位 + 因子加权的自动回测研究回路）──
+// Sizing evolution loop: shadow-store progress, grayscale verdicts, applied config.
+
+/** 获取仓位进化面板数据（GET /api/research/sizing-evo，只读） */
+/** Fetch the sizing-evolution panel payload (GET /api/research/sizing-evo, read-only) */
+export async function fetchSizingEvo() {
+  return request('/api/research/sizing-evo')
+}
+
 /** 查询全量回测全局开关（GET /api/research/backtest-toggle） */
 /** Get the global full-backtest toggle (GET /api/research/backtest-toggle) */
 export async function fetchBacktestToggle() {

@@ -121,6 +121,13 @@ type SellInput struct {
 	// when unknown); false keeps the diluted-cost basis. Injected by the assembly layer because
 	// sellProbe is a pure function that never reads global config.
 	UseAnchor bool
+	// FlowRatio5D / FlowRatioToday §FLOW-FACTOR 净流入率（%）：引擎 annotateFlowFactors 每轮
+	// 填充（5 日累计 / 当日实时）；0=未解析或功能未开 → 卖出加权维度弃权（不加权也不惩罚）。
+	// 负值是合法读数（净流出）→ 确认窗时长×权重（§2.5，权重=买入偏离折半）。
+	// English: transient net-inflow ratios (%) — zero means unresolved → the sell-weight dimension
+	// abstains; negative values are valid readings that shorten the confirm window.
+	FlowRatio5D    float64
+	FlowRatioToday float64
 }
 
 // SellDisposal 处置单（仅 pass 裁定产生）：Action=close 全平 / trim 半平。
@@ -189,6 +196,11 @@ type sellParams struct {
 	boost        string // L1/L2/L3（""=未命中）
 	noExtend     bool   // 取消延持（L2+）：窗结算时即使有新鲜做多信号也直接处置
 	dualOnSingle bool   // 单源利空即算 dual（L2+）：放宽"触线即时硬清"的证据门槛
+	// ── §FLOW-FACTOR 卖出加权 ──
+	// flowWeight 净流出确认窗时长权重（0=未注入/不加权；<1=窗长×权重，与 boost 两维并存：
+	// 档位改行为集、权重改时长）。由 JudgeSellView 从 SellInput 的两个比值解析后注入。
+	// English: net-outflow confirm-window weight (0 = not injected); coexists with the boost tier.
+	flowWeight float64
 }
 
 // sellParamsOf 从纪律配置解析卖出裁决参数（缺省与 DefaultDisciplineConfig 同口径）。
@@ -265,6 +277,9 @@ type SellVerdict struct {
 	Settled    bool
 	Extends    int
 	Boost      string // §DYN-SIZE P2：生效的卖出加权档位（""=未加权）
+	// FlowWeight §FLOW-FACTOR：本轮生效的净流出卖出窗长权重（0=未命中/未注入）。
+	// English: the net-outflow sell window weight in force this round (0 = not fired).
+	FlowWeight float64
 	Valid      bool   // false=价格无效等不可裁决轮次（状态未动，展示层不得出卡）
 }
 
@@ -284,6 +299,15 @@ func (c *Controller) JudgeSellView(ch Channel, account string, in SellInput, pol
 		p.boost = boost
 		p.noExtend = SellBoostApplies(boost)
 		p.dualOnSingle = SellBoostApplies(boost)
+	}
+
+	// §FLOW-FACTOR 卖出侧：净流出 → 确认窗时长×权重（不缩量）。与 boost 两维并存：
+	// tier 改行为集、权重改时长。影子模式只留痕不下发（与 boost / 买入侧同纪律）。
+	// English: net outflow shortens the confirm window by a weight (never the size); shadow records only.
+	flowW := flowSellWeight(in, pol.Regime.SizeCfg)
+	flowShadow := flowW > 0 && flowW < 1 && pol.Regime.SizeCfg.ShadowOn()
+	if flowW > 0 && flowW < 1 && !flowShadow {
+		p.flowWeight = flowW
 	}
 
 	key := sellKey{ch, account, in.Code}
@@ -336,11 +360,26 @@ func (c *Controller) JudgeSellView(ch Channel, account string, in SellInput, pol
 			record.Reason = disposal.Reason
 		}
 	}
+	// §FLOW-FACTOR 卖出加权留痕：命中即挂权重（影子期标 [shadow]，只观察不下发）；处置理由
+	// 前置前缀——审计侧要能分清"基准口径卖的"与"净流出加权卖的"。
+	if flowW > 0 && flowW < 1 {
+		note := fmt.Sprintf("净流出卖出加权窗长×%.2f", flowW)
+		if flowShadow {
+			record.Shadow = true
+			record.SizingReasons = append(record.SizingReasons, "[shadow]"+note)
+		} else {
+			record.SizingReasons = append(record.SizingReasons, note)
+			if disposal != nil {
+				disposal.Reason = "[净流出加权] " + disposal.Reason
+				record.Reason = disposal.Reason
+			}
+		}
+	}
 	c.mu.Unlock()
 	if record.Verdict != "" {
 		c.record(record)
 	}
-	return SellVerdict{Disposal: disposal, HoldReason: holdReason, Line: st.Line, Settled: st.Settled, Extends: st.Extends, Boost: boost, Valid: true}
+	return SellVerdict{Disposal: disposal, HoldReason: holdReason, Line: st.Line, Settled: st.Settled, Extends: st.Extends, Boost: boost, FlowWeight: flowW, Valid: true}
 }
 
 // JudgeSell 卖出裁决唯一入口（单持仓一轮探针）。返回处置单或 nil；三态裁定自动留痕。
@@ -476,6 +515,8 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	// ③ 首触锁定：判定线 + 固定结算点（对齐 09:30 栅格一次锁死，边界⑤）。
 	// §DYN-SIZE P2：卖出加权 L2+ 时观察窗**减半**（下限 1 分钟）——风险来临时缩短"再等等看"的
 	// 暴露时间；窗长只影响结算点，判定线/栅格对齐口径不变。
+	// §FLOW-FACTOR：净流出权重先乘（下限 1 分钟），L2+ 减半再叠——两个维度描述两件事
+	// （失血程度 / 系统性风险），窗长取两者叠加后的值；只影响首触这一刻锁定的窗长。
 	if st.Line == SellLineNone {
 		if line == SellLineNone {
 			return st, nil, ""
@@ -486,14 +527,19 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 		if line == SellLineTrail {
 			st.WindowMin = p.trailMin
 		}
+		st.WindowMin = flowWindowMin(st.WindowMin, p.flowWeight)
+		flowNote := ""
+		if p.flowWeight > 0 && p.flowWeight < 1 {
+			flowNote = fmt.Sprintf("，净流出加权窗长×%.2f", p.flowWeight)
+		}
 		if SellBoostApplies(p.boost) {
 			st.WindowMin = st.WindowMin / 2
-			if st.WindowMin < 1 {
-				st.WindowMin = 1
-			}
+		}
+		if st.WindowMin < 1 {
+			st.WindowMin = 1
 		}
 		st.SettleStart = alignSettleSell(now, st.WindowMin)
-		return st, nil, fmt.Sprintf("命中%s(盈亏%.2f%%)，进入%d分钟观察窗", st.Line, pnl, st.WindowMin) + evi
+		return st, nil, fmt.Sprintf("命中%s(盈亏%.2f%%)，进入%d分钟观察窗%s", st.Line, pnl, st.WindowMin, flowNote) + evi
 	}
 
 	// 线升级（任意线型→深破）：§C2（2026-09-22 修复批）旧的升级判定只认 StopLoss→DeepBreach，

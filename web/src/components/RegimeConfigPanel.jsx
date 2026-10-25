@@ -42,6 +42,28 @@ const DEFAULT_MACRO_WINDOW = { high: 0.50, medium: 0.80, low: 1.00 }
 const DEFAULT_LEAD_CURVE = [0.90, 0.85, 0.80, 0.70, 0.50]
 const DEFAULT_HOLIDAY = { weekend: 0.85, small1: 0.70, small2: 0.85, long1: 0.40, long2: 0.60, long3: 0.75 }
 const DEFAULT_INDEX = { '-1': 1.00, '-2': 0.70, deep: 0.40 }
+// §FLOW-FACTOR（2026-10-25）：净流入 dynamic 因子的出厂档位，与
+// internal/config/sizing_flow.go::DefaultFlowFactorConfig 逐键对齐。改这里必须同步改后端，
+// 否则页面显示的"默认"与引擎实际生效值会分叉。
+// English: factory bands for the net-inflow factor — must stay byte-identical to
+// DefaultFlowFactorConfig in the backend.
+const DEFAULT_FLOW_B5 = { strong_in: 1.10, mild_in: 1.05, neutral: 1.00, mild_out: 0.85, strong_out: 0.70 }
+const DEFAULT_FLOW_BT = { strong_in: 1.05, mild_in: 1.025, neutral: 1.00, mild_out: 0.95, strong_out: 0.90 }
+const DEFAULT_FLOW_BANDS = { strong_in_pct: 3, mild_in_pct: 1, mild_out_pct: -1, strong_out_pct: -3 }
+const DEFAULT_FLOW_SELL = { strong_out: 0.85, mild_out: 0.95, today_strong_out: 0.95, today_mild_out: 0.975 }
+const DEFAULT_FLOW_SELL_BANDS = { strong_out_pct: -3, mild_out_pct: -1 }
+// 档位键 → 中文标签（页面与 tooltip 共用，防拼写漂移）。
+// English: band key → Chinese label, shared by the rows and their hints.
+const FLOW_BAND_LABEL = { strong_in: '强流入', mild_in: '中流入', neutral: '中性', mild_out: '中流出', strong_out: '强流出' }
+const FLOW_SELL_LABEL = {
+  strong_out: '5日强流出',
+  mild_out: '5日中流出',
+  today_strong_out: '当日强流出',
+  today_mild_out: '当日中流出',
+  strong_out_pct: '5日强流出',
+  mild_out_pct: '5日中流出',
+}
+
 const DEFAULTS = {
   floor: 0.15,
   cap: 1.15,
@@ -83,6 +105,24 @@ function mapNums(src, defaults) {
     for (const k of Object.keys(defaults)) {
       const n = Number(src[k])
       if (Number.isFinite(n) && n > 0) out[k] = n
+    }
+  }
+  return out
+}
+
+// mapSigned 与 mapNums 同构，但**允许负数与 0**。
+//
+// 净流入率档位阈值天生带负号（strong_out_pct = -3 表示"流出 3% 以上"），用 mapNums 的
+// `n > 0` 判据会把负数当成"缺失"而静默回落默认值——管理员把 -3 改成 -5、保存、再读回来
+// 又变回 -3，配置被悄悄丢掉且毫无提示。凡是带符号的档位一律走本函数。
+// English: like mapNums but accepts negatives/zero — band thresholds are inherently signed,
+// and the `n > 0` test would silently drop them (user edits -3 → -5, saves, reads back -3).
+function mapSigned(src, defaults) {
+  const out = { ...defaults }
+  if (src && typeof src === 'object') {
+    for (const k of Object.keys(defaults)) {
+      const n = Number(src[k])
+      if (Number.isFinite(n)) out[k] = n
     }
   }
   return out
@@ -222,6 +262,23 @@ export default function RegimeConfigPanel() {
         slMinDrop: num(sz.sl_offset_min_index_drop, DEFAULTS.slMinDrop),
         bearTighten: num(sz.bear_sl_tighten_pt, DEFAULTS.bearTighten),
         riskBudgetKeep: sz.sl_offset_risk_budget_keep !== false,
+        // ── §FLOW-FACTOR 净流入因子（2026-10-25） ──
+        // 开关与后端同口径：键缺失 = 没写过 = 按**开**跑（nil=开），所以判据是 `!== false`
+        // 而不是 `=== true`——写成后者会把存量账号显示成"关"，引擎却在按开算。
+        // English: switches follow the backend's nil=on semantics (`!== false`, not `=== true`).
+        flowOn: ((sz.flow_factor || {}).enabled) !== false,
+        flowSellOn: ((sz.flow_factor || {}).sell_enabled) !== false,
+        flowB5: mapNums((sz.flow_factor || {}).buy_5d_scales, DEFAULT_FLOW_B5),
+        flowB5Bands: mapSigned((sz.flow_factor || {}).buy_5d_bands, DEFAULT_FLOW_BANDS),
+        flowBT: mapNums((sz.flow_factor || {}).buy_today_scales, DEFAULT_FLOW_BT),
+        flowBTBands: mapSigned((sz.flow_factor || {}).buy_today_bands, DEFAULT_FLOW_BANDS),
+        flowSell: mapNums((sz.flow_factor || {}).sell_scales, DEFAULT_FLOW_SELL),
+        flowSellBands: mapSigned((sz.flow_factor || {}).sell_bands, DEFAULT_FLOW_SELL_BANDS),
+        // §SIZING-EVO（2026-10-25）：自进化回路开关。出厂 **nil=关**（与因子默认开相反：
+        // 进化是新增常驻行为，必须显式开），故这里判据是 `=== true`。
+        // English: evolution switch defaults OFF (nil=off), unlike the factors — hence `=== true`.
+        evoOn: ((sz.evo || {}).enabled) === true,
+        evoAutoPromote: ((sz.evo || {}).auto_promote) === true,
         // §C4 / §C6 / §C1-V2（系统级）
         techKdjMax: num(tech.kdj_j_max, 0),
         techMa: String(tech.ma_filter || 'off'),
@@ -340,6 +397,32 @@ export default function RegimeConfigPanel() {
     if (!Number.isFinite(cov) || cov < 0 || cov > 100) bad.push('概念覆盖率门槛')
     const stale = Number(f.conceptStaleness)
     if (!Number.isInteger(stale) || stale < 0 || stale > 720) bad.push('概念数据最大陈旧小时')
+    // §FLOW-FACTOR：档位阈值必须**严格递减**（strong_in > mild_in > mild_out > strong_out）。
+    // 顺序写反的后果不是报错而是静默错档：flowBandOf 从强到弱逐个比，写反了永远命中第一档，
+    // 于是"净流出 5%"和"净流入 5%"拿到同一个乘子——必须在保存前拦住。
+    // English: band thresholds must strictly decrease; a reversed pair silently collapses every
+    // reading into the first matching band, so it is rejected before saving.
+    const bandOK = (m, label) => {
+      const v = ['strong_in_pct', 'mild_in_pct', 'mild_out_pct', 'strong_out_pct'].map((k) => Number(m[k]))
+      if (v.some((x) => !Number.isFinite(x))) return bad.push(`${label}档位阈值`)
+      if (!(v[0] > v[1] && v[1] > v[2] && v[2] > v[3])) bad.push(`${label}档位阈值（须严格递减）`)
+      return undefined
+    }
+    bandOK(f.flowB5Bands, '5日净流入')
+    bandOK(f.flowBTBands, '当日净流入')
+    const sb = Number(f.flowSellBands.strong_out_pct)
+    const mb = Number(f.flowSellBands.mild_out_pct)
+    if (!Number.isFinite(sb) || !Number.isFinite(mb) || !(sb < mb)) bad.push('卖出净流出档位阈值（须 strong_out < mild_out）')
+    // 卖出权重是"确认窗时长乘子"，>1 会**延长**确认窗（与净流出加速离场的初衷相反），故限 (0,1]。
+    // English: sell weights shorten the confirm window, so >1 is nonsense — clamp to (0,1].
+    for (const [k, v] of Object.entries(f.flowSell)) {
+      const n = Number(v)
+      if (!Number.isFinite(n) || n <= 0 || n > 1) bad.push(`卖出权重 ${k}`)
+    }
+    for (const [k, v] of [...Object.entries(f.flowB5), ...Object.entries(f.flowBT)]) {
+      const n = Number(v)
+      if (!Number.isFinite(n) || n < 0 || n > 3) bad.push(`净流入档位乘子 ${k}`)
+    }
     return bad
   }
 
@@ -408,6 +491,24 @@ export default function RegimeConfigPanel() {
           sl_offset_min_index_drop: Number(form.slMinDrop),
           bear_sl_tighten_pt: Number(form.bearTighten),
           sl_offset_risk_budget_keep: !!form.riskBudgetKeep,
+          // §FLOW-FACTOR（2026-10-25）：整块提交（后端 WithDefaults 会补齐缺键）。
+          // 档位阈值用 mapSigned 读回来的值原样回写，负数不丢。
+          // English: submit the whole flow_factor block; signed band thresholds round-trip as-is.
+          flow_factor: {
+            enabled: !!form.flowOn,
+            sell_enabled: !!form.flowSellOn,
+            ratio_basis: 'float_mcap',
+            buy_5d_scales: { ...form.flowB5 },
+            buy_5d_bands: { ...form.flowB5Bands },
+            buy_today_scales: { ...form.flowBT },
+            buy_today_bands: { ...form.flowBTBands },
+            sell_scales: { ...form.flowSell },
+            sell_bands: { ...form.flowSellBands },
+          },
+          // §SIZING-EVO：只提交开关两键，其余（search_bounds/schedule/min_samples）留配置层，
+          // 避免页面一次保存把围栏覆盖掉。
+          // English: only the two switches; search bounds and cadence stay config-file owned.
+          evo: { enabled: !!form.evoOn, auto_promote: !!form.evoAutoPromote },
         },
         macro_gate: {
           yellow_confidence: Number(form.yellowConf),
@@ -655,6 +756,104 @@ export default function RegimeConfigPanel() {
                   onChange={(v) => setMap('macroWindow', k, v)}
                 />
               ))}
+
+              <div style={groupStyle}>净流入因子（§FLOW-FACTOR，2026-10-25）</div>
+              <SwitchRow
+                label="买入侧净流入因子"
+                hint="默认开。关掉等于两个买入因子整体弃权（与「没有这一维」逐字一致，不当中性）"
+                checked={form.flowOn}
+                onChange={(v) => set({ flowOn: v })}
+              />
+              <SwitchRow
+                label="卖出侧净流出加权"
+                hint="默认开。净流出只缩短卖出确认窗时长（不缩量），可与 L1/L2/L3 档位叠加"
+                checked={form.flowSellOn}
+                onChange={(v) => set({ flowSellOn: v })}
+              />
+              {Object.keys(DEFAULT_FLOW_B5).map((k) => (
+                <NumRow
+                  key={'f5-' + k}
+                  label={`5日净流入 ${FLOW_BAND_LABEL[k]}`}
+                  hint={`比值=近5日主力净流入/流通市值；默认 ${DEFAULT_FLOW_B5[k]}`}
+                  value={form.flowB5[k]}
+                  min={0}
+                  max={3}
+                  onChange={(v) => setMap('flowB5', k, v)}
+                />
+              ))}
+              {Object.keys(DEFAULT_FLOW_BANDS).map((k) => (
+                <NumRow
+                  key={'f5b-' + k}
+                  label={`5日档位阈值 ${FLOW_BAND_LABEL[k.replace('_pct', '')]}`}
+                  hint={`单位 %（可负）；默认 ${DEFAULT_FLOW_BANDS[k]}，须严格递减`}
+                  value={form.flowB5Bands[k]}
+                  min={-100}
+                  max={100}
+                  step={0.5}
+                  onChange={(v) => setMap('flowB5Bands', k, v)}
+                />
+              ))}
+              {Object.keys(DEFAULT_FLOW_BT).map((k) => (
+                <NumRow
+                  key={'ft-' + k}
+                  label={`当日净流入 ${FLOW_BAND_LABEL[k]}`}
+                  hint={`实时值，档位幅度为 5 日的一半（进行中值噪音大）；默认 ${DEFAULT_FLOW_BT[k]}`}
+                  value={form.flowBT[k]}
+                  min={0}
+                  max={3}
+                  onChange={(v) => setMap('flowBT', k, v)}
+                />
+              ))}
+              {Object.keys(DEFAULT_FLOW_BANDS).map((k) => (
+                <NumRow
+                  key={'ftb-' + k}
+                  label={`当日档位阈值 ${FLOW_BAND_LABEL[k.replace('_pct', '')]}`}
+                  hint={`单位 %（可负）；默认 ${DEFAULT_FLOW_BANDS[k]}，须严格递减`}
+                  value={form.flowBTBands[k]}
+                  min={-100}
+                  max={100}
+                  step={0.5}
+                  onChange={(v) => setMap('flowBTBands', k, v)}
+                />
+              ))}
+              {Object.keys(DEFAULT_FLOW_SELL).map((k) => (
+                <NumRow
+                  key={'fs-' + k}
+                  label={`卖出加权 ${FLOW_SELL_LABEL[k]}`}
+                  hint={`确认窗时长乘子（0,1]，<1 表示提前放行；默认 ${DEFAULT_FLOW_SELL[k]}`}
+                  value={form.flowSell[k]}
+                  min={0.01}
+                  max={1}
+                  step={0.005}
+                  onChange={(v) => setMap('flowSell', k, v)}
+                />
+              ))}
+              {Object.keys(DEFAULT_FLOW_SELL_BANDS).map((k) => (
+                <NumRow
+                  key={'fsb-' + k}
+                  label={`卖出触发阈值 ${FLOW_SELL_LABEL[k.replace('_pct', '')]}`}
+                  hint={`单位 %（须为负）；默认 ${DEFAULT_FLOW_SELL_BANDS[k]}`}
+                  value={form.flowSellBands[k]}
+                  min={-100}
+                  max={0}
+                  step={0.5}
+                  onChange={(v) => setMap('flowSellBands', k, v)}
+                />
+              ))}
+
+              <div style={groupStyle}>自进化回路（§SIZING-EVO，出厂关）</div>
+              <SwitchRow
+                label="启用仓位进化引擎"
+                hint="默认关。开启后周度跑 L1 寻优、夜间跑 L2 灰度/降级；关掉即冻结回默认配置（零行为变更）"
+                checked={form.evoOn}
+                onChange={(v) => set({ evoOn: v })}
+              />
+              <SwitchRow
+                label="达标候选自动晋升"
+                hint="默认关。关=只产候选+留痕，需人工在「自动研究 → 仓位进化」审阅后放行"
+                checked={form.evoAutoPromote}
+                onChange={(v) => set({ evoAutoPromote: v })}
+              />
 
               <div style={groupStyle}>宏观事件前瞻（按交易日）</div>
               <NumRow

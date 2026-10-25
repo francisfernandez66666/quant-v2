@@ -14,13 +14,20 @@ README*
 README.md
 README-*.md
 events_leftside.yaml
-FLOW*
-ARCH*
-SEQUENCE*
+# ⚠ 这三条必须锚定仓库根：macOS 默认 core.ignorecase=true，裸 `FLOW*`/`ARCH*` 会把
+# `internal/signalctl/flow_factor.go`、`internal/sizing_evo/arch_test.go` 这类**源码**一起吞掉
+# （曾真实发生：四个 flow_factor 源文件 + 回路独立性架构测试全部被静默排除在提交之外）。
+# 流程图只在仓库根，所以按根锚定即可，既不误伤源码也不放宽文档纪律。
+# English: these three MUST stay root-anchored. Bare FLOW*/ARCH* matched source files
+# (flow_factor.go, arch_test.go) on case-insensitive filesystems and silently dropped them from commits.
+/FLOW*
+/ARCH*
+/SEQUENCE*
 
 # 构建产物
 # 仅忽略仓库根的编译产物 ./quant，避免误伤源码目录 cmd/quant/（其 *_test.go 需纳入版本控制）
 /quant
+/dynsize_whatif
 dist/
 
 # 前端依赖
@@ -105,6 +112,9 @@ web/.auth/
 
 # §FIX-5 UAT 自举的临时栈（独立数据目录 + 构建产物 + 日志，不入库）
 .uat-data/
+
+# 独立字节级 UAT 探针的证据目录（每次运行落一份 json/日志，供报告引用；本地留档不入库）
+tools/indep_cloud_evidence_*/
 
 # 本地 QMT 网关 mock（UAT 用二进制，不入库）
 /qmt-mock

@@ -1709,6 +1709,17 @@ type SizingConfig struct {
 	// the T switch is coupled to the budget pipeline (Q5 forbids T under legacy), so splitting them
 	// across two keys would make the illegal combination representable.
 	T TConfig `json:"t,omitempty"`
+	// FlowFactor §FLOW-FACTOR（2026-10-25）：净流入 dynamic 因子配置（5 日/当日买入 +
+	// 净流出卖出加权，docs/MODPLAN_UAT_FLOWFACTOR_20261025.md §2.6）。挂在 SizingConfig
+	// 而不是新开键空间：因子加权与预算口径强耦合（legacy 档下 dynamic 不生效，因子同样不生效）。
+	// English: net-inflow dynamic-factor config; kept inside the sizing payload on purpose —
+	// factor weighting is coupled to the budget pipeline, so a separate key would make the
+	// illegal "legacy budget + flow factor" combination representable.
+	FlowFactor FlowFactorConfig `json:"flow_factor,omitempty"`
+	// Evo §SIZING-EVO（2026-10-25）：动态仓位+因子加权的自动回测研究配置（独立回路，
+	// 方法论同构自动研究但零 import internal/research，方案 §2.7.0）。
+	// English: auto-backtest-research config for the sizing synthesizer (independent loop).
+	Evo EvoConfig `json:"evo,omitempty"`
 }
 
 // TConfig §T-MODE 做 T 参数（2026-10-24 owner 裁决四）。
@@ -1886,6 +1897,8 @@ func DefaultSizingConfig() SizingConfig {
 		SLOffsetMinIndexDrop:    1.0,
 		BearSLTightenPt:         1.0,
 		SellBoostLevel:          "L2",
+		FlowFactor:              DefaultFlowFactorConfig(),
+		Evo:                     DefaultEvoConfig(),
 	}
 }
 
@@ -2132,6 +2145,13 @@ func (s SizingConfig) WithDefaults() SizingConfig {
 	if strings.TrimSpace(out.SellBoostLevel) == "" {
 		out.SellBoostLevel = d.SellBoostLevel
 	}
+	// §FLOW 因子层与自进化层：各自 WithDefaults 补缺（Scale 表按 default→user 合并，
+	// 指针三态保留"键缺失补出厂、显式 false=账号级关"）。FlowFactor 缺省**开**（默认档位
+	// 全为中性 1.0 集合，等效关闭但不弃权）；Evo 缺省**关**（nil=关，须显式打开）。
+	// English: the flow-factor and sizing-evolution sub-configs self-heal via their own
+	// WithDefaults; FlowFactor defaults on (neutral scales), Evo defaults off (nil = off).
+	out.FlowFactor = out.FlowFactor.WithDefaults()
+	out.Evo = out.Evo.WithDefaults()
 	return out
 }
 

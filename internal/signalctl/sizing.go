@@ -98,6 +98,11 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 	mul("大盘跌幅", indexFactor(r.IndexChangePct, cfg))
 	mul("LLM利空", llmFactor(sig, cfg))
 	mul("广度", breadthFactor(r.BreadthUpRatio, cfg))
+	// §FLOW-FACTOR：5 日净流入（主）+ 当日净流入（辅，幅度减半）→ 买入乘子。
+	// 与信号质量/强度等同为个股组维度；比值未解析（0）→ 弃权，不进连乘。
+	// English: 5-day (primary) and same-day (secondary) net-inflow buy multipliers; abstain when unresolved.
+	mul("5日净流入", flow5DFactor(sig, cfg))
+	mul("当日净流入", flowTodayFactor(sig, cfg))
 
 	// 3. 上限类：各自 0~1 乘子取 min（不连乘——同一风险不得双罚）。
 	// m 的初值必须是 +Inf 而不是 1.0：上限类只**向下**约束，若初值取 1.0 会把权重类的进攻档
@@ -219,6 +224,10 @@ func computeSizingPowerMean(r Regime, sig combat_agent.Signal, cfg config.Sizing
 		{"信号强度", kellyFactor(sig.Confidence, cfg)},
 		{"个股波动率", volFactor(sig, cfg)},
 		{"LLM利空", llmFactor(sig, cfg)},
+		// §FLOW-FACTOR：两个净流入维度同属个股组（都是"这只票本身"的证据）。
+		// 5 日是主、当日是辅（当日档位幅度减半）；未解析 → 0，sizingGroup 按弃权跳过。
+		{"5日净流入", flow5DFactor(sig, cfg)},
+		{"当日净流入", flowTodayFactor(sig, cfg)},
 	}
 	mg, mr := sizingGroup("市场组", cfg.GroupFloor("market"), market, p)
 	sg, sr := sizingGroup("个股组", cfg.GroupFloor("stock"), stock, p)
@@ -463,7 +472,10 @@ func stateFactor(r Regime, cfg config.SizingConfig) float64 {
 func tierFactor(tier string, cfg config.SizingConfig) float64 {
 	switch tier {
 	case combat_agent.RiskTierRed:
-		if v, ok := cfg.TierScales[combat_agent.RiskTierRed]; ok && v > 0 {
+		if v, ok := cfg.TierScales[combat_agent.RiskTierRed]; ok {
+			if v <= 0 {
+				return 0 // 显式 0/脏值 = 该维弃权（进化器可关；默认 0.30 只在缺键时生效）
+			}
 			return v
 		}
 		return 0.30
@@ -612,6 +624,10 @@ func breadthFactor(up float64, cfg config.SizingConfig) float64 {
 	// abstaining; the real factor returns as soon as the reading does. Applied exactly once.
 	if math.IsNaN(up) {
 		v := cfg.BreadthMissingScale
+		// 平面字段无三态（缺键与显式 0 不可分）：沿用"非正兜 0.90"。广度维度的参与面
+		// 因此不可配置关闭（结构恒开）——强度由 BreadthMissingScale 本身调节。
+		// English: a plain float has no tri-state (absent vs explicit 0 are indistinguishable),
+		// so a non-positive value keeps the 0.90 haircut; breadth participation is always on.
 		if v <= 0 {
 			v = 0.90
 		}
@@ -704,10 +720,19 @@ func clampF(v, lo, hi float64) float64 {
 	return v
 }
 
-// scaleOr 读映射键，缺失或非正时用默认值。
+// scaleOr 读映射键。**显式 0 = 该维弃权**（abstain）：进化器（sizing_evo C 组合层）关掉
+// 一个因子的唯一手段就是把它所有档位写 0，这里必须放行而不是兜底成默认值——否则"关因子"
+// 在配置层表达不出来。缺键或负值（脏值）才用默认。
+// English: reads a map key; an explicit 0 means abstain (the evo loop's only way to switch a
+// factor off), a missing key or negative dirty value falls back to the default.
 func scaleOr(m map[string]float64, key string, def float64) float64 {
-	if v, ok := m[key]; ok && v > 0 {
-		return v
+	if v, ok := m[key]; ok {
+		if v == 0 {
+			return 0
+		}
+		if v > 0 {
+			return v
+		}
 	}
 	return def
 }

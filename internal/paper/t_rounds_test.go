@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 )
 
@@ -46,7 +47,24 @@ func seedBase(t *testing.T, code string, qty int) *Engine {
 	e.mu.Lock()
 	e.cfg.BudgetMode = "dynamic"
 	e.mu.Unlock()
+	pinTRClock(e)
 	return e
+}
+
+// pinTRClock 把做 T 用例的时钟钉在**当日 10:00（交易时段内、未到 14:50 尾盘线）**。
+//
+// 这不是洁癖：`RunIntradayT` 用"现在"判断是否已过 `ForceUnwindHM`，过线就 `force=true` 直接
+// 跳过开腿。取真实时钟的后果是——**同一份代码，上午跑全绿、傍晚跑全红**（正 T 两条用例在 14:50
+// 之后 100% 失败）。这种用例等于没有用例，还会把真实回归淹掉。时钟缝在生产路径留 nil，行为不变。
+// English: pins the T-round clock at 10:00 today. RunIntradayT compares "now" against the forced-pairing
+// line and short-circuits leg opening once past it, so a wall clock makes the buy-first cases fail 100%
+// of the time after 14:50 — green in the morning, red in the evening. The seam is nil in production.
+func pinTRClock(e *Engine) {
+	n := cntime.In(time.Now())
+	pinned := time.Date(n.Year(), n.Month(), n.Day(), 10, 0, 0, 0, n.Location())
+	e.mu.Lock()
+	e.nowFn = func() time.Time { return pinned }
+	e.mu.Unlock()
 }
 
 // tRoundParams 默认参数的做 T 入参（单码单日 1 轮、机动仓 30%、最小价差 1%、尾盘 14:50）。

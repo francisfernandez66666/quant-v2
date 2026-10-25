@@ -885,6 +885,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/research/backtest/list", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestList))
 	// 战法库（因子战法）：列出已应用 + 启用/禁用/删除 + 重命名 + 效果监测 + 全量回测全局开关
 	s.mux.HandleFunc("GET /api/research/library", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibrary))
+	// §SIZING-EVO 仓位进化面板：只读（开关/影子库进度/灰度判定/生效配置/净流入档位/最近运行报告）
+	// English: sizing-evolution panel — read-only status (switches, shadow-store progress, verdicts,
+	// applied config, flow bands, last run reports).
+	s.mux.HandleFunc("GET /api/research/sizing-evo", s.permMiddleware(auth.PermResearchApprove, s.handleSizingEvoStatus))
 	// 阶段3.4 战法库回测入口：对战法库一条已应用规则跑历史回放回测（异步，结果进回测 tab）
 	s.mux.HandleFunc("POST /api/research/library/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleLibraryBacktest))
 	// §P2-f 参数优化：入队扫参 / 列表 / 审批（写规则覆盖+热重载）/ 淘汰

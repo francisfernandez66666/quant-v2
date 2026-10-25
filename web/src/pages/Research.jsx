@@ -51,6 +51,30 @@ export function AdjBasisStaleTag({ strategy }) {
   )
 }
 
+// §SIZING-EVO 灰度判定 → 标签文案/主题（导出供单测直接断言，免挂整页）。
+// pending 必须显式说"观测中"：观察期未满/前向收益未回填都不是"没通过"，混成一种会误导审批。
+// English: grayscale verdict → label/theme; "pending" is its own state, never folded into "rejected".
+export function evoVerdictBadge(v) {
+  const k = (v && v.verdict) || 'pending'
+  if (k === 'promote') return { label: '达标待晋升', theme: 'success' }
+  if (k === 'reject') return { label: '回拒', theme: 'danger' }
+  return { label: '观测中', theme: 'warning' }
+}
+
+// §SIZING-EVO 运行报告 → 一行摘要（前端与运维日志同口径）。
+// English: one-line summary for a persisted run report (same wording as the CLI log).
+export function evoRunSummary(kind, rep) {
+  const r = rep || {}
+  if (kind === 'weekly') {
+    if (r.entered) return '评估 ' + (r.evaluated || 0) + ' 候选 / ' + (r.passed || 0) + ' 达标，最优 ' + r.entered + ' 进灰度'
+    if (r.skipped) return '评估 ' + (r.evaluated || 0) + ' 候选 / ' + (r.passed || 0) + ' 达标 · ' + r.skipped
+    return '评估 ' + (r.evaluated || 0) + ' 候选 / ' + (r.passed || 0) + ' 达标'
+  }
+  return '晋升 ' + ((r.promoted || []).length) + ' / 待人工 ' + ((r.awaiting_human || []).length) +
+    ' / 回拒 ' + ((r.rejected || []).length) + ' / 观测中 ' + ((r.pending || []).length) +
+    (r.demoted ? ' · 已降级 ' + (r.demoted.rule_id || '') : '')
+}
+
 // 把开放持仓数（后端 open_positions）归一成正整数：缺字段/老后端按 0 计。
 function heldPositionsOf(s) {
   const n = Number(s && s.open_positions)
@@ -192,15 +216,20 @@ export default function Research() {
   const [adviceOpen, setAdviceOpen] = useState(0)
   // §ENH-4 事件因子报告（news_score@stock/@sector）：由服务器端 research event-layers 落盘，前端只读展示
   const [eventFactor, setEventFactor] = useState(null) // null=未加载；数组=报告；{exists:false}=未生成
+  // §SIZING-EVO 仓位进化面板：开关/影子库进度/灰度判定/生效配置/净流入档位/最近运行报告
+  const [evoStatus, setEvoStatus] = useState(null)
+  const [loadingEvo, setLoadingEvo] = useState(false)
+  const [evoError, setEvoError] = useState('')
 
   const canApprove = api.hasPerm('research_approve')
   // 常量 canApprove：局部定义
 
   const tabs = [
-  // 顶部主导航标签定义（待审批候选 / 战法库 / 回测 / 设置）
+  // 顶部主导航标签定义（待审批候选 / 战法库 / 回测 / 仓位进化 / 设置）
     { value: 'candidates', label: '待审批候选' },
     { value: 'library', label: '战法库' },
     { value: 'backtests', label: '回测' },
+    { value: 'sizingevo', label: '仓位进化' },
     { value: 'settings', label: '设置' },
   ]
   // §ENH-4 首次进入"回测"tab 拉一次事件因子报告；接口异常按未生成降级（卡内给引导语）
@@ -211,6 +240,10 @@ export default function Research() {
         .catch(() => setEventFactor({ exists: false }))
     }
   }, [activeTab, eventFactor])
+  // §SIZING-EVO 每次进入"仓位进化"tab 都重拉（灰度判定随时间推进，缓存会误导）
+  useEffect(() => {
+    if (activeTab === 'sizingevo') loadEvoStatus()
+  }, [activeTab])
   const builtinPatterns = [
   // 内置形态战法枚举（双响炮/龙头/龙回头/N形），用于回测与战法库归类
     { id: 'double_bump', name: '双响炮' },
@@ -612,6 +645,19 @@ export default function Research() {
     } catch (e) { console.error('战法库加载失败', e) }
     // §P2-I：spinner 复位同样判后到（旧轮次不得关掉新一轮的加载态）
     finally { if (!libraryGuard.isStale(token)) setLoadingLibrary(false) }
+  }
+  // §SIZING-EVO 拉仓位进化面板：只读端点，失败保留旧数据并给可重试错误条。
+  async function loadEvoStatus() {
+    setLoadingEvo(true)
+    setEvoError('')
+    try {
+      const res = await api.fetchSizingEvo()
+      setEvoStatus(res || null)
+    } catch (e) {
+      setEvoError((e && (e.message || e.toString())) || '未知错误')
+    } finally {
+      setLoadingEvo(false)
+    }
   }
   async function toggleLibrary(s) {
   // 启用/禁用某条战法库记录。§EXIT-RETAIN：停用方向先确认，并说清楚"只断新开仓、
@@ -1584,6 +1630,217 @@ export default function Research() {
     )
   }
 
+  // ===== §SIZING-EVO 仓位进化面板 =====
+  // 动态仓位 + 因子加权的自动回测研究回路（与战法回测完全独立：自己的影子库/灰度/状态）。
+  // 数据源：GET /api/research/sizing-evo（只读）。评估本身在 research sizing-evo CLI 里跑，
+  // 本页只展示"现在是什么状态、候选判成什么、生效哪套参数"。
+  function renderSizingEvo() {
+    if (evoError) {
+      return (
+        <Card>
+          <div style={{ color: 'var(--app-up)', fontSize: 13 }}>读取失败：{evoError}</div>
+          <Button style={{ marginTop: 8 }} size="small" theme="primary" variant="outline" onClick={loadEvoStatus}>重试</Button>
+        </Card>
+      )
+    }
+    if (!evoStatus) {
+      return <Card>{loadingEvo ? '加载中…' : '暂无数据（首次进入请点刷新）'}</Card>
+    }
+    const s = evoStatus
+    const counts = s.counts || {}
+    const grayscale = s.grayscale || []
+    const applied = s.applied
+    const demoted = s.demoted || []
+    const ff = s.flow_factor || {}
+    const b5 = ff.buy_5d_bands || {}
+    const s5 = ff.buy_5d_scales || {}
+    const bt = ff.buy_today_bands || {}
+    const st = ff.buy_today_scales || {}
+    const sb = ff.sell_bands || {}
+    const ss = ff.sell_scales || {}
+    const minSamples = s.min_samples || 200
+    const coldPct = Math.min(100, minSamples > 0 ? (s.samples || 0) / minSamples * 100 : 0)
+    const num = (v, d) => (v === null || v === undefined || isNaN(v) ? '-' : Number(v).toFixed(d === undefined ? 2 : d))
+    const verdictTag = (v) => {
+      const b = evoVerdictBadge(v)
+      return <Tag theme={b.theme} size="small">{b.label}</Tag>
+    }
+    const th = { fontSize: 12, color: 'var(--app-muted)', textAlign: 'left', padding: '4px 8px', borderBottom: '1px solid var(--app-divider)' }
+    const td = { fontSize: 12, padding: '4px 8px', borderBottom: '1px solid var(--app-divider)' }
+    const bandTable = (title, rows) => (
+      <div style={{ flex: '1 1 240px', minWidth: 240 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>{title}</div>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead><tr><th style={th}>档位</th><th style={th}>阈值</th><th style={th}>乘子</th></tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={title + r[0]}>
+                <td style={td}>{r[0]}</td>
+                <td style={td}>{r[1]}</td>
+                <td style={{ ...td, color: r[2] >= 1 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{num(r[2], 3)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+    return (
+      <div style={{ marginTop: 12 }}>
+        {/* ① 开关与进度 */}
+        <Card style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+            <Tag theme={s.enabled ? 'success' : 'default'}>{s.enabled ? '进化已启用' : '进化未启用（出厂默认关）'}</Tag>
+            <Tag theme={s.auto_promote ? 'warning' : 'default'}>{s.auto_promote ? '自动晋升' : '人工闸：只产候选+留痕'}</Tag>
+            <span style={{ fontSize: 12 }}>灰度队列 <b>{grayscale.length}</b> / {s.grayscale_max}</span>
+            <span style={{ fontSize: 12 }}>影子库 <b>{counts.settled || 0}</b> / {counts.total || 0} 已结算 · {counts.days || 0} 交易日</span>
+            <span style={{ fontSize: 12 }}>观察期 {s.observation_days} 交易日</span>
+            <Button size="small" variant="outline" loading={loadingEvo} onClick={loadEvoStatus}>刷新</Button>
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)' }}>
+              冷启动进度（可用样本 {s.samples || 0} / 门槛 {minSamples}；不足时进化器不动任何配置）
+            </div>
+            <div style={{ height: 8, background: 'var(--app-divider)', borderRadius: 4, overflow: 'hidden', marginTop: 4 }}>
+              <div style={{ width: coldPct + '%', height: '100%', background: 'linear-gradient(90deg,#4caf50,#64b5f6)' }} />
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--app-faint)', marginTop: 8, lineHeight: 1.6 }}>
+            回路与战法回测完全独立：影子库 = 每轮定权的结构化快照（Regime+信号画像+scale），前向收益 5 交易日回填。
+            周度 L1 快筛达标候选进灰度 → shadow 通道照算观测 N 个交易日 → 夜间 L2 判晋升/回拒；生效配置连续衰退自动回默认。
+            手动触发：<code>research sizing-evo --weekly</code> / <code>research sizing-evo --nightly</code>。
+          </div>
+        </Card>
+
+        {/* ② 灰度候选 + 实时 L2 判定 */}
+        <Card title={<span>灰度候选 <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>（shadow 通道照算，只留痕不下发）</span></span>} style={{ marginBottom: 12 }}>
+          {grayscale.length === 0 ? (
+            <div style={{ fontSize: 12, color: 'var(--app-muted)' }}>暂无候选——周度 L1 出现达标候选后会进这里。</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  <th style={th}>候选</th><th style={th}>进入日</th><th style={th}>已观测</th><th style={th}>判定</th>
+                  <th style={th}>IC-IR</th><th style={th}>胜率</th><th style={th}>盈亏比</th><th style={th}>回撤</th>
+                  <th style={th}>参数</th><th style={th}>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {grayscale.map((g) => {
+                  const v = g.verdict || {}
+                  return (
+                    <tr key={g.cand_id}>
+                      <td style={{ ...td, fontFamily: 'monospace' }}>{g.cand_id}</td>
+                      <td style={td}>{g.entered_at}</td>
+                      <td style={td}>{v.observed_days || 0} 日</td>
+                      <td style={td}>{verdictTag(v)}</td>
+                      <td style={{ ...td, color: signColor(v.ir || 0) }}>{num(v.ir, 3)}</td>
+                      <td style={td}>{num(v.win_rate, 1)}%</td>
+                      <td style={td}>{num(v.profit_factor, 2)}</td>
+                      <td style={td}>{num(v.max_drawdown_pct, 1)}%</td>
+                      <td style={{ ...td, fontFamily: 'monospace', fontSize: 11 }}>
+                        {Object.entries(g.params || {}).map(([k, val]) => k + '=' + val).join(' · ') || '基线'}
+                      </td>
+                      <td style={{ ...td, fontSize: 11, color: 'var(--app-muted)' }}>{v.reason || g.note || '-'}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </Card>
+
+        {/* ③ 生效配置 + 降级记录 */}
+        <Card title="生效配置" style={{ marginBottom: 12 }}>
+          {applied ? (
+            <div style={{ fontSize: 12, lineHeight: 1.9 }}>
+              <div>
+                <Tag theme="success" size="small">已生效</Tag>
+                <span style={{ marginLeft: 8, fontFamily: 'monospace' }}>{applied.cand_id}</span>
+                <span style={{ marginLeft: 8, color: 'var(--app-muted)' }}>应用日 {applied.applied_at} · {applied.auto ? '自动晋升' : '人工审批'}</span>
+              </div>
+              <div style={{ fontFamily: 'monospace', marginTop: 4 }}>
+                {Object.entries(applied.params || {}).map(([k, val]) => k + '=' + val).join(' · ') || '（基线）'}
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: 'var(--app-muted)' }}>
+              出厂默认配置（尚未晋升任何候选）。降级时也会自动回到这里——默认配置是安全港。
+            </div>
+          )}
+          {demoted.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>降级记录（最近 {demoted.length} 条）</div>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead><tr><th style={th}>候选</th><th style={th}>时间</th><th style={th}>原因</th></tr></thead>
+                <tbody>
+                  {demoted.slice(-5).reverse().map((d, i) => (
+                    <tr key={d.cand_id + d.at + i}>
+                      <td style={{ ...td, fontFamily: 'monospace' }}>{d.cand_id}</td>
+                      <td style={td}>{d.at}</td>
+                      <td style={{ ...td, color: 'var(--app-muted)' }}>{d.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        {/* ④ 净流入因子档位（当前生效） */}
+        <Card title={<span>净流入因子档位 <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>（归一化 = 主力净流入 / 流通市值；卖出权重 = 买入偏离折半，作用于卖出确认窗时长）</span></span>} style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+            {bandTable('5 日净流入（主因子）', [
+              ['强流入', '≥ ' + (b5.strong_in_pct ?? '-') + '%', s5.strong_in],
+              ['弱流入', '≥ ' + (b5.mild_in_pct ?? '-') + '%', s5.mild_in],
+              ['中性', '中间区间', s5.neutral],
+              ['弱流出', '≤ ' + (b5.mild_out_pct ?? '-') + '%', s5.mild_out],
+              ['强流出', '≤ ' + (b5.strong_out_pct ?? '-') + '%', s5.strong_out],
+            ])}
+            {bandTable('当日净流入（辅因子）', [
+              ['强流入', '≥ ' + (bt.strong_in_pct ?? '-') + '%', st.strong_in],
+              ['弱流入', '≥ ' + (bt.mild_in_pct ?? '-') + '%', st.mild_in],
+              ['中性', '中间区间', st.neutral],
+              ['弱流出', '≤ ' + (bt.mild_out_pct ?? '-') + '%', st.mild_out],
+              ['强流出', '≤ ' + (bt.strong_out_pct ?? '-') + '%', st.strong_out],
+            ])}
+            {bandTable('卖出加权（确认窗时长×权重）', [
+              ['5日强流出', '≤ ' + (sb.strong_out_pct ?? '-') + '%', ss.strong_out],
+              ['5日弱流出', '≤ ' + (sb.mild_out_pct ?? '-') + '%', ss.mild_out],
+              ['当日强流出', '同 5 日阈值', ss.today_strong_out],
+              ['当日弱流出', '同 5 日阈值', ss.today_mild_out],
+            ])}
+          </div>
+        </Card>
+
+        {/* ⑤ 最近运行报告 */}
+        <Card title="最近运行">
+          {(() => {
+            const wr = s.weekly_report
+            const nr = s.nightly_report
+            const line = (label, rep, body) => (
+              <div style={{ fontSize: 12, marginBottom: 8 }}>
+                <b>{label}</b>
+                {rep ? (
+                  <span style={{ color: 'var(--app-muted)', marginLeft: 8 }}>
+                    {rep.at} · {body(rep.report || {})}
+                  </span>
+                ) : (
+                  <span style={{ color: 'var(--app-faint)', marginLeft: 8 }}>未跑过（执行 research sizing-evo --{label === '周度 L1' ? 'weekly' : 'nightly'}）</span>
+                )}
+              </div>
+            )
+            return (
+              <div>
+                {line('周度 L1', wr, (r) => evoRunSummary('weekly', r))}
+                {line('夜间 L2', nr, (r) => evoRunSummary('nightly', r))}
+              </div>
+            )
+          })()}
+        </Card>
+      </div>
+    )
+  }
+
   // ===== 兜底渲染错误 =====
   if (renderError) {
     return (
@@ -1981,6 +2238,10 @@ export default function Research() {
               </Card>
             )}
           </div>
+        </Tabs.TabPanel>
+
+        <Tabs.TabPanel value="sizingevo" label="仓位进化">
+          {renderSizingEvo()}
         </Tabs.TabPanel>
 
         <Tabs.TabPanel value="settings" label="设置">

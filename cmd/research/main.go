@@ -120,6 +120,11 @@ func main() {
 		// §GAP-P1 20260915 完整生命周期：衰退自动降级 + 灰度晋升评估（夜间链 run-task 分发同源）
 		dataDir := filepath.Dir(*dbPath)
 		cmdLifecycle(db, dataDir, args[1:])
+	case "sizing-evo":
+		// §SIZING-EVO 动态仓位进化：周度 L1 快筛 / 夜间 L2 灰度+降级。
+		// 与 research 生命周期**完全独立**（自己的状态库/影子库，零共享战法库）。
+		// English: sizing evolution — weekly L1 screening / nightly L2 + demotion (independent loop).
+		cmdSizingEvo(db, *dbPath, args[1:])
 	case "event-layers":
 		// §ENH-4 事件因子（news_score@stock/@sector）IC/分层/单调性检验，产出 event_factor_report.json。
 		// English: event-factor validation (batch D of ENHANCEMENT_PLAN_20260919).

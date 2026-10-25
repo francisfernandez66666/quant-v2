@@ -136,7 +136,7 @@ func (e *Engine) RunIntradayT(quotes map[string]*data.StockInfo, p TParams) {
 		}
 		return
 	}
-	e.runIntradayTLocked(quotes, p, time.Now())
+	e.runIntradayTLocked(quotes, p, e.clockNow())
 }
 
 // runIntradayTLocked 做 T 的一轮主流程（须持锁调用）。

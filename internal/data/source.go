@@ -963,6 +963,15 @@ func (dc *DataCoordinator) GetStockMoneyFlow(code string) (*CapitalFlow, error) 
 	return dc.eastMoney.GetStockMoneyFlow(code)
 }
 
+// GetStockMoneyFlowHistory §FLOW-HIST 获取个股资金流**日线历史**（近 days 个交易日，主力口径）。
+// 仅东财日线（push2his daykline，klt=101）——同花顺第二源只有当日快照，**不得**用它累加
+// 伪造历史（方案明令禁止）；失败即返回错误，由调用方弃权（不当中性、不伪造 0）。
+// English: per-stock daily capital-flow history (EastMoney daykline only). No second source:
+// the THS snapshot must never be accumulated into fake history. Failure → caller abstains.
+func (dc *DataCoordinator) GetStockMoneyFlowHistory(code string, days int) ([]FlowDay, error) {
+	return dc.eastMoney.getEastMoneyMoneyFlowHistory(code, days)
+}
+
 // GetIndexData 获取指数行情。
 // English: GetIndexData fetches index quotes.
 // GetIndexData fetches the index data via EastMoney.

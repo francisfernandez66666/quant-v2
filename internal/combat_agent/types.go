@@ -181,6 +181,16 @@ type Signal struct {
 	// SignalQualityTable.Weight (1.0 neutral, clamped ±10%); 0 = unresolved → that dimension abstains.
 	// Transient (json:"-") — a per-round sizing input, not part of the pinned/broadcast signal.
 	QualityWeight float64 `json:"-"`
+	// FlowRatioToday / FlowRatio5D §FLOW-FACTOR 净流入率（%）临时输入（引擎 annotateFlowFactors
+	// 填入，signalctl 定权时消费；0 或缺失=该维弃权，绝不当中性 1.0 之外的解释）：
+	//   FlowRatioToday = 当日主力净流入 / 流通市值 ×100（实时值，辅因子，幅度减半）；
+	//   FlowRatio5D    = 近 5 个交易日主力净流入累计 / 流通市值 ×100（主因子）。
+	// 非持久化（json:"-"）：它们是每轮定权的临时输入，不随信号固化/广播；复盘复现定权读
+	// Decision 上的 sizing_reasons（含最终档位与权重，已落留痕）。
+	// English: transient net-inflow ratios (%) filled by annotateFlowFactors and consumed by the
+	// sizing synthesizer; zero/absent → that dimension abstains. Never persisted or broadcast.
+	FlowRatioToday float64 `json:"-"`
+	FlowRatio5D    float64 `json:"-"`
 	// SizeScale §DYN-SIZE 动态仓位缩放系数（0=未定权/未启用；1.0 不写）。
 	// 由信号控制器裁定后写回，执行层（paper 撮合）金额 = 基准 × SizeScale。
 	// live 通道不经本字段——dispatchLive 直接把 Decision.BuyScale 传进 autoPlace。

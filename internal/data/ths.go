@@ -640,10 +640,16 @@ func (tc *THSClient) GetTHSMinuteKLine(code string, scale int) ([]KLine, error) 
 
 // 同花顺 realhead 字段 id。
 // §实测钉死（2026-09-20）：300489 与 600519 两只样本的 14 个字段与腾讯行情逐项交叉验证一致
-// （现价/昨收/今开/最高/最低/成交量/成交额/涨跌幅/换手率/涨跌额/振幅/流通市值/总市值/量比）。
-// 注意：这些是**同花顺自有的无规律数字 id**，不是位序数组下标——旧解析器按位序读，因而恒失败。
+// （现价/昨收/今开/最高/最低/成交量/成交额/涨跌幅/换手率/涨跌额/振幅/流通股本/总股本/量比）。
+// §FLOW-FLOATCAP 订正（2026-10-25 复测 600519，与腾讯 qt.gtimg.cn 逐元交叉验证）：旧版
+// 本条把 "402"/"407" 写成"流通市值/总市值"是**错的**——载荷里是**股本（股）**：
+//   - "402" = 流通股本（股）：600519 实测 1250081601，与腾讯同值；
+//   - "407" = 总股本（股）：600519 与流通股本同值（全流通）；
+//   - 流通市值须派生：402 × 现价("10") = 1250081601 × 1335 = 16,688.59 亿元，与腾讯
+//     直接给出的流通市值字段逐元一致。订正注释避免后人误找"市值直值字段"而空手回。
 // THS realhead field ids, verified 2026-09-20 against Tencent quotes on two independent samples.
-// These are THS-specific opaque numeric ids, NOT positional array indexes.
+// Correction (2026-10-25, re-probed 600519): fields "402"/"407" are SHARE COUNTS, not market
+// caps — float market cap must be derived as shares × price (verified cent-exact vs Tencent).
 const (
 	thsFCode      = "5"       // 6 位证券代码
 	thsFPrevClose = "6"       // 昨收（元）
@@ -656,6 +662,10 @@ const (
 	thsFChangePct = "199112"  // 涨跌幅（%）
 	thsFTurnover  = "1968584" // 换手率（%）
 	thsFName      = "name"    // 证券名称
+	// §FLOW-FLOATCAP（2026-10-25）：股本字段——解析进 StockInfo 供流通市值派生
+	// （净流入/流通市值归一化的分母，docs/MODPLAN_UAT_FLOWFACTOR_20261025.md §2.2/§2.3）。
+	thsFFloatShares = "402" // 流通股本（股）
+	thsFTotalShares = "407" // 总股本（股）
 )
 
 // parseTHSQuote 解析同花顺 realhead 实时行情响应体。
@@ -732,6 +742,12 @@ func parseTHSQuote(body []byte, code string) (*StockInfo, error) {
 		Amount:    num(thsFAmount),    // 已为元
 		Turnover:  num(thsFTurnover),  // 换手率（%）——新浪无此字段，此源可补
 		ChangePct: num(thsFChangePct),
+		// §FLOW-FLOATCAP（2026-10-25）：股本直取 + 市值派生（流通市值 = 流通股本 × 现价）。
+		// 与腾讯交叉验证逐元一致（600519：1250081601 × 1335 = 16,688.59 亿）。股本缺失
+		// （老股票/上游缺字段）时留 0，消费方走 FloatMarketCapOf 换手率反推兜底或弃权。
+		FloatShares:    num(thsFFloatShares),
+		TotalShares:    num(thsFTotalShares),
+		FloatMarketCap: num(thsFFloatShares) * price,
 	}
 	// 涨跌幅字段缺失时才用昨收推算；字段存在则以字段为准，避免口径分歧。
 	if _, ok := raw.Items[thsFChangePct]; !ok && si.PrevClose > 0 {

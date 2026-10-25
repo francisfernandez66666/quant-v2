@@ -30,6 +30,20 @@ type StockInfo struct {
 	Amount    float64 `json:"amount"`     // 成交额（元）
 	ChangePct float64 `json:"change_pct"` // 涨跌幅（%，如 1.23 表示 +1.23%）
 	Turnover  float64 `json:"turnover"`   // 换手率（%，如 5.67 表示 5.67%）
+	// FloatShares 流通股本（股）。§FLOW-FLOATCAP（2026-10-25）：同花顺 realhead 字段 "402" 直取
+	// （与腾讯行情交叉验证逐只一致，600519=1250081601）；0=该源未返回/未解析。
+	// English: free-float share count (THS realhead field "402"); 0 = source absent/unparsed.
+	FloatShares float64 `json:"float_shares,omitempty"`
+	// FloatMarketCap 流通市值（元）= FloatShares × Price。§FLOW-FLOATCAP 归一化分母
+	// （净流入/流通市值，见 docs/MODPLAN_UAT_FLOWFACTOR_20261025.md §2.3）；0=不可得。
+	// 直取缺失时消费方用 FloatMarketCapOf 走"成交量/换手率"反推兜底，仍不可得即弃权。
+	// English: float market cap (CNY) = FloatShares × Price; normalization denominator for
+	// net-inflow ratios. 0 = unavailable (see FloatMarketCapOf for the derived fallback).
+	FloatMarketCap float64 `json:"float_market_cap,omitempty"`
+	// TotalShares 总股本（股）。THS realhead 字段 "407"；0=未返回（全流通股票与流通股本同值）。
+	// English: total share count (THS realhead field "407"); 0 = absent (equals FloatShares
+	// for fully-floating stocks).
+	TotalShares float64 `json:"total_shares,omitempty"`
 	NetInflow float64 `json:"net_inflow"` // 主力净流入（元），东方财富口径
 	// HasFlow §FIX-9e(20260919)：NetInflow 是否真由数据源返回。东财口径下"净流入=0"是
 	// 合法实测值（超大+大单买卖完全对冲），旧消费方以 NetInflow==0 判"源未返回"会把
@@ -51,6 +65,33 @@ func VWAPOf(q *StockInfo) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// FloatMarketCapOf §FLOW-FLOATCAP 取流通市值（元）：直取值（FloatMarketCap）优先；缺失时用
+// 成交量/换手率反推流通股本再乘现价。两条路都缺输入返回 ok=false——**绝不**把"没读到"
+// 折成 0 或现价（与 VWAPOf 同纪律；§FIX-9e 缺数语义：判"有无"绝不能靠零值）。
+// English: resolves float market cap — the direct field first, else derived from
+// volume/turnover (shares = volume / (turnover/100)); ok=false when neither path has
+// its inputs. Never fabricate a zero or the last price for a missing reading.
+func FloatMarketCapOf(q *StockInfo) (float64, bool) {
+	if q == nil {
+		return 0, false
+	}
+	if q.FloatMarketCap > 0 {
+		return q.FloatMarketCap, true
+	}
+	if q.Price <= 0 || q.Volume <= 0 || q.Turnover <= 0 {
+		return 0, false
+	}
+	shares := q.Volume / (q.Turnover / 100)
+	if shares <= 0 || math.IsNaN(shares) || math.IsInf(shares, 0) {
+		return 0, false
+	}
+	cap := shares * q.Price
+	if cap <= 0 || math.IsNaN(cap) || math.IsInf(cap, 0) {
+		return 0, false
+	}
+	return cap, true
 }
 
 // KLine K 线数据。
