@@ -76,7 +76,6 @@ func (f FlowFactorConfig) AbstainAlertThreshold() float64 {
 	}
 }
 
-
 // 档位键名常量（映射表与带映射共用，防拼写漂移）。
 // English: band key constants shared by the maps and the band mapper.
 const (

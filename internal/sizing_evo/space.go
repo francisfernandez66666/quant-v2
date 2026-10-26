@@ -106,6 +106,7 @@ func DefaultParamSpace() *ParamSpace {
 		add(mkMap("macro_window."+k, "A", 0.30, 1.00, 0.05, macroWinAt, k))
 	}
 	for i := 0; i < 5; i++ { // macro_lead_curve[T-5..T-1]
+		// 捕获循环下标：闭包按引用捕获会让 5 个曲线槽全部读到最后一项。
 		idx := i
 		add(scale("macro_lead."+string(rune('1'+i)), "A", 0.30, 1.00, 0.05,
 			func(c *config.SizingConfig) float64 {

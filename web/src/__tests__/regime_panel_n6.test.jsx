@@ -166,8 +166,9 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     // §SIZING-FINE（2026-10-22）：面板现在负责 sizing 的**全量**键（精细参数折叠区也在内），
     // 逐键等值锁住键集——多一个未定义键会被后端稀疏 merge 写进配置，少一个键等于某组精细参数失踪。
     expect(Object.keys(body.sizing).sort()).toEqual([
-      'bear_sl_tighten_pt', 'breadth_missing_scale', 'budget_mode', 'cap', 'emotion_scales', 'enabled', 'floor',
-      'group_floors', 'holiday_block_new', 'holiday_scales', 'index_scale_thresholds', 'kelly_lambda', 'kelly_min_prob',
+      'bear_sl_tighten_pt', 'breadth_missing_scale', 'budget_mode', 'cap', 'emotion_scales', 'enabled', 'evo',
+      'flow_factor', 'floor', 'group_floors', 'holiday_block_new', 'holiday_scales', 'index_scale_thresholds',
+      'kelly_lambda', 'kelly_min_prob',
       'llm_bearish_scale', 'macro_event_day_scale', 'macro_lead_curve', 'macro_lead_days',
       'macro_window_scales', 'max_drawdown_pct', 'max_total_position_pct', 'mode', 'power_p', 'sell_boost_level', 'shadow',
       'sl_offset_cap', 'sl_offset_min_index_drop', 'sl_offset_per_pct', 'sl_offset_risk_budget_keep',

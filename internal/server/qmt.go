@@ -1567,6 +1567,14 @@ func (s *Server) handleQMTOrders(w http.ResponseWriter, r *http.Request) {
 			out = append(out, o)
 		}
 	}
+	// §F9：page/page_size 可选；缺省 size=0 保持旧行为（返回全部），但响应头始终带 total。
+	page, size := parsePageParams(r, 0, 500)
+	total := len(out)
+	start, end, _ := pageBounds(total, page, size)
+	if size > 0 {
+		out = out[start:end]
+	}
+	setPaginationHeaders(w, total, page, size)
 	writeJSON(w, 200, out)
 }
 
@@ -2001,14 +2009,20 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 		unrealized += p.Amount - float64(p.Qty)*p.CostPrice
 	}
 
-	// 流水倒序输出最近 100 笔并附战法标签。
-	// start 为窗口起点：全量超过 100 笔时只展示末尾 100 笔（新的在前）。
-	outFills := make([]map[string]interface{}, 0, len(fills))
-	start := 0
-	if len(fills) > 100 {
-		start = len(fills) - 100
+	// §F9（2026-10-26）：流水分页读取。默认仍是最新 100 笔（保持旧行为），
+	// 但 page/page_size 可继续向更早翻，响应带 total/total_pages/has_more，
+	// 不再让第 101 笔静默消失。English: page/page_size paging over newest-first fills.
+	page, pageSize := parsePageParams(r, 100, 500)
+	total := len(fills)
+	fromNewest := (page - 1) * pageSize
+	lo := total - fromNewest - pageSize
+	if lo < 0 {
+		lo = 0
 	}
-	for i := len(fills) - 1; i >= start; i-- {
+	hi := total - fromNewest - 1
+	hasMore := fromNewest+pageSize < total
+	outFills := make([]map[string]interface{}, 0, pageSize)
+	for i := hi; i >= lo && i >= 0; i-- {
 		f := fills[i]
 		// 标签策略：买入直接从 signal_id 解析；卖出沿用重放状态里的入场战法；兜底 manual。
 		strat := stratState[f.Code]
@@ -2057,6 +2071,11 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			"trade_count":  st.Count,
 		})
 	}
+	setPaginationHeaders(w, total, page, pageSize)
+	totalPages := 0
+	if pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"summary": map[string]interface{}{
 			"realized_pnl":   math.Round(realized*100) / 100,
@@ -2068,5 +2087,12 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 		},
 		"by_strategy": stratList,
 		"fills":       outFills,
+		"pagination": map[string]interface{}{
+			"page":        page,
+			"page_size":   pageSize,
+			"total":       total,
+			"total_pages": totalPages,
+			"has_more":    hasMore,
+		},
 	})
 }

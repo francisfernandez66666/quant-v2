@@ -261,7 +261,19 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 
 	// §E9 修复：磁盘恢复 IO（paper.New 读 paper.json）此前发生在全局锁内，会卡住所有账号
 	// 的 5s 调度路径；改为锁外构建、重取锁二次检查后再注册。
+	//
+	// §PAPER-CFG-DESYNC（2026-10-26）：引擎配置必须优先取该账号的 rules.paper，而不是全局模板。
+	// 旧实现直接 r.opts.Paper.Cfg()（=启动时 cfgMgr.Get().Paper，默认 enabled=false）：
+	// /api/paper/config 读账号级 rules 显示 enabled=true，但引擎实跑 enabled=false，前端菜单
+	// 又按引擎值隐藏 ⇒ 关掉一次后再也进不了模拟盘页去重新打开。此处与 POST /api/paper/config
+	// 的热同步共用 paper.ConfigFromRules 同一构建器，保证读、写、运行时三处同源。
 	cfg := r.opts.Paper.Cfg()
+	if r.opts.CfgMgr != nil {
+		if rules := r.opts.CfgMgr.GetRulesFor(userID); rules != nil {
+			sc, _ := r.opts.CfgMgr.GetSizingConfigFor(userID)
+			cfg = paper.ConfigFromRules(rules.Paper, sc)
+		}
+	}
 	pe := paper.New(cfg, r.paperPath(userID))
 	// §C1 行业敞口：纸面与实盘同口径。参数取该账号 QMT risk_gate，行业源取行情协调器；
 	// 任一缺席时闸自动跳过（零行为变化）。
@@ -1328,6 +1340,14 @@ func (r *Registry) Len() int {
 // English: hot-swaps the shared LLM client across the registry template (so future lazily
 // built engines pick it up), the shared news agent (the real attribution path), and all
 // live engines — previously only live engines were updated, silently bypassing the UI save.
+// LLMClient 返回注册表当前 LLM 客户端（nil=未配置）；/api/usage 读取当日用量用。
+// English: returns the registry's current LLM client (nil when unconfigured) for usage stats.
+func (r *Registry) LLMClient() *llm.Client {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.opts.LLMClient
+}
+
 func (r *Registry) SetLLMClient(c *llm.Client) {
 	r.mu.Lock()
 	r.opts.LLMClient = c // 模板更新：后续 GetOrBuild 新建引擎直接带新客户端

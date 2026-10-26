@@ -151,6 +151,8 @@ func run() int {
 
 	// 行情客户端：东财行情 API + 同花顺板块出口（板块列表/涨跌幅/主力净流入）
 	marketAPI := data.NewMarketAPI()
+	// §DATA-RELIABILITY：资金流日线历史落本地快照，东财失败/重启后同日仍可回退。
+	marketAPI.SetFlowHistCacheDir(dataDir)
 	thsClient := data.NewTHSClient() // 同花顺出口（板块列表/涨跌幅/主力净流入、个股换手率）
 	// §QUOTE-CHAIN(20260920)：把同花顺注入行情客户端，使其成为**咨询页行情链首选源**。
 	// 换手率只有同花顺（免费）能提供，东财 push2 不可达时旧链会退到新浪从而丢掉该字段。
@@ -283,6 +285,12 @@ func run() int {
 	// When enabled, the engine auto-fills buy signals at the live snapshot price; rules.paper in
 	// config.json controls the switch and parameters.
 	paperCfg := cfgMgr.Get().Paper
+	// §PAPER-CFG-DESYNC（2026-10-26）：模拟盘是运营账号共享账本，模板必须取运营账号的
+	// rules.paper，不能取系统级默认 Paper（默认 enabled=false）。否则账号级把模拟盘打开后，
+	// /api/paper/config 显示 enabled=true、引擎却按系统默认构造出 enabled=false，菜单被隐藏。
+	if rules := cfgMgr.GetRulesFor(authMgr.AdminID()); rules != nil {
+		paperCfg = rules.Paper
+	}
 	// §F-4（20260917 缺陷修复批）装配逻辑收敛到 paper.ConfigFromRules（零值归一口径不变），
 	// 与 POST /api/paper/config 热更新共用同一构建器，消灭"只有重启才生效"的独一份内联。
 	// §DYN-SIZE-v3：同时把操作员账号的 sizing 口径（legacy/dynamic）注入模拟盘引擎。
@@ -545,6 +553,13 @@ func run() int {
 		ShadowExec:         isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
 	})
 	srv.SetEngineRegistry(registry)
+	// §OBSERVABILITY：/api/usage 读取注册表当前 LLM 客户端的当日调用/token 用量（热更新后自动跟随）。
+	srv.SetLLMUsageFn(func() map[string]int64 {
+		if c := registry.LLMClient(); c != nil {
+			return c.UsageStats()
+		}
+		return map[string]int64{}
+	})
 
 	// §R6 P1-1 部署漂移自检：启动阶段汇总高影响配置的"声明态 vs 实际生效态"，与二进制指纹一并
 	// 落到 opslog + 启动日志，早期暴露 2026-09-01 三类线上事故（旧二进制缺修复 / LLM key 拼写/

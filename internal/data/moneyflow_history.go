@@ -26,8 +26,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // emFFlowDayKLType klt=101 → 日线（与 klt=1 当日分时同端点不同周期）。
@@ -118,6 +121,81 @@ func parseFlowNum(s string) (float64, bool) {
 	return v, true
 }
 
+// SetFlowHistCacheDir 设置资金流日线历史的本地快照目录（空=不落盘）。
+// English: sets the local snapshot dir for daily capital-flow history (empty = disabled).
+func (m *MarketAPI) SetFlowHistCacheDir(dir string) { m.flowHistCacheDir = dir }
+
+// flowHistCacheMaxAge 本地快照最长复用窗口（同日 + 2 小时；跨日绝不命中）。
+const flowHistCacheMaxAge = 2 * time.Hour
+
+type flowHistCacheFile struct {
+	SavedAt time.Time `json:"saved_at"`
+	Days    []FlowDay `json:"days"`
+}
+
+func (m *MarketAPI) flowHistCachePath(code string) string {
+	if m.flowHistCacheDir == "" || code == "" {
+		return ""
+	}
+	safe := strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r == ':' {
+			return '_'
+		}
+		return r
+	}, code)
+	return filepath.Join(m.flowHistCacheDir, "moneyflow_history", safe+".json")
+}
+
+// saveFlowHistCache 成功取数后原子写本地快照；失败只告警，不影响主链路。
+func (m *MarketAPI) saveFlowHistCache(code string, days []FlowDay) {
+	p := m.flowHistCachePath(code)
+	if p == "" || len(days) == 0 {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		log.Printf("[market] 资金流历史快照目录创建失败 %s: %v", p, err)
+		return
+	}
+	raw, err := json.Marshal(flowHistCacheFile{SavedAt: time.Now(), Days: days})
+	if err != nil {
+		log.Printf("[market] 资金流历史快照序列化失败 %s: %v", code, err)
+		return
+	}
+	if err := AtomicWrite(p, raw, 0o644); err != nil {
+		log.Printf("[market] 资金流历史快照落盘失败 %s: %v", p, err)
+	}
+}
+
+// loadFlowHistCache 东财失败时读本地快照：必须同交易日且 2 小时内，跨日绝不冒充当日。
+func (m *MarketAPI) loadFlowHistCache(code string, days int) ([]FlowDay, bool) {
+	p := m.flowHistCachePath(code)
+	if p == "" {
+		return nil, false
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil, false
+	}
+	var f flowHistCacheFile
+	if err := json.Unmarshal(raw, &f); err != nil || len(f.Days) == 0 {
+		return nil, false
+	}
+	if time.Since(f.SavedAt) > flowHistCacheMaxAge {
+		return nil, false
+	}
+	last := f.Days[len(f.Days)-1]
+	if strings.ReplaceAll(strings.TrimSpace(last.Date), "-", "") != TradingDayDate(time.Now()) {
+		return nil, false
+	}
+	out := f.Days
+	if days > 0 && len(out) > days {
+		out = out[len(out)-days:]
+	}
+	cp := make([]FlowDay, len(out))
+	copy(cp, out)
+	return cp, true
+}
+
 // getEastMoneyMoneyFlowHistory 东财日线资金流历史主源（§FLOW-HIST）。
 // 主机用 push2his（data.eastmoney.com 资金流向页同款历史主机；2026-10-25 实测可达，
 // 同族 push2 在沙盒外探不可达——生产主机可达性由调用方监控弃权率，R8/R9 已入文档）。
@@ -133,19 +211,28 @@ func (m *MarketAPI) getEastMoneyMoneyFlowHistory(code string, days int) ([]FlowD
 	url := fmt.Sprintf("https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=%s&klt=%d&lmt=%d",
 		sid, emFFlowFields2, emFFlowDayKLType, days)
 	EastMoneyLimiter.Wait() // §FLOW-HIST R8：日线端点纳入同一限速器，超限即弃权不硬打
+	// §DATA-RELIABILITY：东财单源失败时回退同日本地快照（2 小时内）；无快照才弃权。
+	fallback := func(cause error) ([]FlowDay, error) {
+		if cached, ok := m.loadFlowHistCache(code, days); ok {
+			log.Printf("[market] 资金流历史东财失败，回退同日本地快照 %s（%d行）: %v", code, len(cached), cause)
+			return cached, nil
+		}
+		return nil, cause
+	}
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
-		return nil, fmt.Errorf("eastmoney moneyflow-history http: %v", err)
+		return fallback(fmt.Errorf("eastmoney moneyflow-history http: %v", err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("eastmoney moneyflow-history read: %v", err)
+		return fallback(fmt.Errorf("eastmoney moneyflow-history read: %v", err))
 	}
 	days5, err := parseMoneyFlowHistory(body, code)
 	if err != nil {
-		log.Printf("[market] 日线资金流历史解析失败(将弃权): %s %v", code, err)
-		return nil, err
+		log.Printf("[market] 日线资金流历史解析失败(尝试本地快照): %s %v", code, err)
+		return fallback(err)
 	}
+	m.saveFlowHistCache(code, days5)
 	return days5, nil
 }

@@ -678,6 +678,10 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	// 与快照陈旧度——供 nightly/Playwright 断言 feed 链路，纯观察不参与任何判定。
 	quoteSource := ""
 	quoteAgeSec := 0.0
+	breakers := map[string]map[string]any{}
+	if s.dc != nil {
+		breakers = s.dc.BreakerDetail()
+	}
 	if dash != nil {
 		rawCount = len(dash.NewsEvents)
 		matCount = rawCount
@@ -702,14 +706,15 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	inTrade := cur == data.SessionMorningTrade || cur == data.SessionAfternoonTrade
 	active := data.IsFullTradingHours(now)
 	writeJSON(w, 200, map[string]interface{}{
-		"uptime":        uptime,
-		"session":       session,
-		"session_label": cur.String(),
-		"in_trade_time": inTrade,
-		"active":        active,
-		"signal_count":  finalCount,
-		"quote_source":  quoteSource,
-		"quote_age_sec": quoteAgeSec,
+		"uptime":               uptime,
+		"session":              session,
+		"session_label":        cur.String(),
+		"in_trade_time":        inTrade,
+		"active":               active,
+		"signal_count":         finalCount,
+		"quote_source":         quoteSource,
+		"quote_age_sec":        quoteAgeSec,
+		"data_source_breakers": breakers,
 		// §A7（20260918 审计批）：下发后端二进制 git 指纹。部署脚本对后端与前端 dist 用同一
 		// checkout 构建（deploy_seoul.sh LDFLAGS 同源），故该值即"服务端配套前端版本"；
 		// APK 内嵌 assets 的构建指纹与之比对不一致时顶栏横幅告警。未注入时为 "unknown"，
@@ -754,6 +759,17 @@ func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 // 未接入引擎时回退到实时看板 + 持仓日志。结果按时间倒序排列。
 func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
+	// §F9：page/page_size 可选；缺省 size=0 返回全部（旧行为），响应头始终带 total。
+	page, size := parsePageParams(r, 0, 500)
+	writePaged := func(out []map[string]interface{}) {
+		total := len(out)
+		start, end, _ := pageBounds(total, page, size)
+		if size > 0 {
+			out = out[start:end]
+		}
+		setPaginationHeaders(w, total, page, size)
+		writeJSON(w, 200, out)
+	}
 	ctrl := s.ctrlFor(uid)
 	if ctrl != nil {
 		// §GAP2-W2 账户隔离读侧：只返回 公共 ∪ 本人私有 的消息，
@@ -796,7 +812,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		sort.Slice(out, func(i, j int) bool {
 			return alertGeneratedAtKey(out[i]["generated_at"]) > alertGeneratedAtKey(out[j]["generated_at"])
 		})
-		writeJSON(w, 200, out)
+		writePaged(out)
 		return
 	}
 
@@ -862,7 +878,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(out, func(i, j int) bool {
 		return alertGeneratedAtKey(out[i]["generated_at"]) > alertGeneratedAtKey(out[j]["generated_at"])
 	})
-	writeJSON(w, 200, out)
+	writePaged(out)
 }
 
 // alertGeneratedAtKey 把消息条目的 generated_at 归一化为可比较的时间键。

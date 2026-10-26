@@ -173,6 +173,40 @@ func TestFlowTrackerNegativeCache(t *testing.T) {
 	}
 }
 
+// TestFlowTrackerSameDayLKG §DATA-RELIABILITY（2026-10-26）：东财日线历史单源熔断时，
+// 同一交易日内回退最近一次成功读数（30 分钟窗口），不让 5 日净流入因子整段失明；
+// 跨日/超窗必须回到弃权，R3 日期断言不被 LKG 绕过。
+func TestFlowTrackerSameDayLKG(t *testing.T) {
+	tr := newFlowFactorTracker()
+	day := "20261025"
+	now := time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
+	nGood := 0
+	good := countingFetch(flowDays(5, day, 1e6), nil, &nGood)
+	if sum, ok, why := tr.fiveDaySum("600519", day, good, now); !ok || why != "" || sum != 5e6 {
+		t.Fatalf("首次成功应得 5e6，got sum=%v ok=%v why=%q", sum, ok, why)
+	}
+
+	// 11 分钟后上游失败：应回退同日 LKG，而不是 hist_fail。
+	nBad := 0
+	bad := countingFetch(nil, fmt.Errorf("eastmoney down"), &nBad)
+	sum, ok, why := tr.fiveDaySum("600519", day, bad, now.Add(11*time.Minute))
+	if !ok || why != "" || sum != 5e6 {
+		t.Fatalf("失败应回退同日 LKG=5e6，got sum=%v ok=%v why=%q", sum, ok, why)
+	}
+	// 负缓存 60s 内不再打上游，仍返回 LKG。
+	if sum, ok, why := tr.fiveDaySum("600519", day, bad, now.Add(11*time.Minute+30*time.Second)); !ok || why != "" || sum != 5e6 || nBad != 1 {
+		t.Fatalf("负缓存内应复用 LKG 且不重取，got sum=%v ok=%v why=%q fetches=%d", sum, ok, why, nBad)
+	}
+	// 超过 30 分钟 LKG 窗口：必须弃权，不能拿过期读数继续用。
+	if _, ok, why := tr.fiveDaySum("600519", day, bad, now.Add(31*time.Minute)); ok || why != "hist_fail" {
+		t.Fatalf("LKG 超窗应弃权 hist_fail，got ok=%v why=%q", ok, why)
+	}
+	// 跨交易日：不得复用前一日 LKG（R3 日期断言优先）。
+	if _, ok, why := tr.fiveDaySum("600519", "20261026", bad, now.Add(32*time.Minute)); ok || why != "hist_fail" {
+		t.Fatalf("跨日不得复用 LKG，got ok=%v why=%q", ok, why)
+	}
+}
+
 // TestFlowTrackerGates 三道闸：取数失败 / 末行陈旧（R3）/ 行数不足 → 各自弃权且原因可归因。
 // English: the three gates — fetch failure, stale last row (R3), too few rows.
 func TestFlowTrackerGates(t *testing.T) {

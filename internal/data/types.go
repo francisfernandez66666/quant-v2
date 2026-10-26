@@ -44,7 +44,7 @@ type StockInfo struct {
 	// English: total share count (THS realhead field "407"); 0 = absent (equals FloatShares
 	// for fully-floating stocks).
 	TotalShares float64 `json:"total_shares,omitempty"`
-	NetInflow float64 `json:"net_inflow"` // 主力净流入（元），东方财富口径
+	NetInflow   float64 `json:"net_inflow"` // 主力净流入（元），东方财富口径
 	// HasFlow §FIX-9e(20260919)：NetInflow 是否真由数据源返回。东财口径下"净流入=0"是
 	// 合法实测值（超大+大单买卖完全对冲），旧消费方以 NetInflow==0 判"源未返回"会把
 	// 真 0 误报成"数据源未返回"，诱导模型说"没有数据"。缺数=false、有数=true（含 0）。

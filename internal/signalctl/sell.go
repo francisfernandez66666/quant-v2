@@ -280,7 +280,7 @@ type SellVerdict struct {
 	// FlowWeight §FLOW-FACTOR：本轮生效的净流出卖出窗长权重（0=未命中/未注入）。
 	// English: the net-outflow sell window weight in force this round (0 = not fired).
 	FlowWeight float64
-	Valid      bool   // false=价格无效等不可裁决轮次（状态未动，展示层不得出卡）
+	Valid      bool // false=价格无效等不可裁决轮次（状态未动，展示层不得出卡）
 }
 
 // JudgeSellView 与 JudgeSell 同一次裁决，但回传完整三态视图（P2 切闸后 engine 投影/执行都吃它）。

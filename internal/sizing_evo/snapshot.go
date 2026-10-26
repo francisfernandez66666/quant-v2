@@ -361,13 +361,13 @@ func (s *SnapshotStore) FlowRatios(day string) ([]float64, error) {
 // ForensicHit R-08 取证单条：证明 annotations 已落因子值（非空 flow_ratio_*）。
 // English: one R-08 forensic record — evidence that the sizing factor values were persisted.
 type ForensicHit struct {
-	Day            string  `json:"day"`             // 北京交易日
-	Code           string  `json:"code"`           // 纯数字代码
-	Channel        string  `json:"channel"`        // live / paper
-	CfgVer         string  `json:"cfg_ver"`        // 生效配置定位戳
-	FlowRatio5D    float64 `json:"flow_ratio_5d"`  // 5 日净流入率（因子值，注解落点）
+	Day            string  `json:"day"`              // 北京交易日
+	Code           string  `json:"code"`             // 纯数字代码
+	Channel        string  `json:"channel"`          // live / paper
+	CfgVer         string  `json:"cfg_ver"`          // 生效配置定位戳
+	FlowRatio5D    float64 `json:"flow_ratio_5d"`    // 5 日净流入率（因子值，注解落点）
 	FlowRatioToday float64 `json:"flow_ratio_today"` // 当日净流入率
-	Scale          float64 `json:"scale"`          // 当时生效 BuyScale（0=未定权/硬拦）
+	Scale          float64 `json:"scale"`            // 当时生效 BuyScale（0=未定权/硬拦）
 }
 
 // ForensicRecords 扫描影子库前 N 条含因子值的记录（FlowRatio5D != 0），用于 R-08 取证。

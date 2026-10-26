@@ -11,6 +11,7 @@
 //   hasError  {boolean}  是否已进入错误状态
 //   error     {Error}    捕获到的错误信息对象
 import React from 'react'
+import { reportClientError } from '../errorReporter.js'
 
 /**
  * 全局错误边界类组件
@@ -35,6 +36,11 @@ export default class ErrorBoundary extends React.Component {
   componentDidCatch(error, errorInfo) {
     // 打印错误堆栈与组件栈信息，方便本地开发定位问题
     console.error('ErrorBoundary 捕获到渲染错误:', error, errorInfo)
+    // §OBSERVABILITY：渲染期错误同步进后端 opslog/用量看板（上报自身 no-throw）。
+    reportClientError(error, {
+      source: 'react-error-boundary',
+      componentStack: errorInfo && errorInfo.componentStack,
+    })
   }
 
   // 点击"刷新重试"时重置错误状态并尝试重新渲染子树；失败仍会再次被捕获

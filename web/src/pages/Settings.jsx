@@ -533,6 +533,9 @@ export default function Settings() {
     // instead of 0; an actually-stored 0 still renders 0.
     return (
       <InputNumber
+        // 浏览器要求表单字段有 id/name（否则控制台报 "A form field element should have
+        // an id or name attribute"）；策略字段按 组_键 生成稳定名，兼作自动填充排除标记。
+        name={`strategy_${group.key}_${f.k}`}
         value={strategyCfg[group.key][f.k] ?? undefined}
         onChange={(v) => setStrategyField(group.key, f.k, v)}
         step={f.step || 1}
@@ -549,7 +552,7 @@ export default function Settings() {
       <Card title="服务器连接" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>服务器地址</span>
-          <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" style={{ width: 280 }} />
+          <Input name="server_url" value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" style={{ width: 280 }} />
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>连接状态</span>
@@ -591,7 +594,7 @@ export default function Settings() {
       <Card title="LLM 配置" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>API URL</span>
-          <Input value={llmApiUrl} onChange={(v) => setLlmApiUrl(v)} placeholder="https://api.siliconflow.cn/v1/chat/completions" style={{ width: 280 }} />
+          <Input name="llm_api_url" value={llmApiUrl} onChange={(v) => setLlmApiUrl(v)} placeholder="https://api.siliconflow.cn/v1/chat/completions" style={{ width: 280 }} />
         </div>
         <div style={{ ...rowStyle, alignItems: 'flex-start' }}>
           <span style={labelStyle} />
@@ -608,7 +611,7 @@ export default function Settings() {
         }
         <div style={rowStyle}>
           <span style={labelStyle}>API Key(s)</span>
-          <Textarea value={llmApiKeys} onChange={(v) => setLlmApiKeys(v)} placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" autosize={{ minRows: 4, maxRows: 8 }} style={{ width: 280 }} />
+          <Textarea name="llm_api_keys" value={llmApiKeys} onChange={(v) => setLlmApiKeys(v)} placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" autosize={{ minRows: 4, maxRows: 8 }} style={{ width: 280 }} />
         </div>
         <div style={{ ...rowStyle, alignItems: 'flex-start' }}>
           <span style={labelStyle} />
@@ -619,28 +622,28 @@ export default function Settings() {
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>模型</span>
-          <Input value={llmModel} onChange={(v) => setLlmModel(v)} placeholder="gpt-4o-mini" style={{ width: 280 }} />
+          <Input name="llm_model" value={llmModel} onChange={(v) => setLlmModel(v)} placeholder="gpt-4o-mini" style={{ width: 280 }} />
         </div>
         {
           /* 分类专用模型：留空则回退主模型 */
         }
         <div style={rowStyle}>
           <span style={labelStyle}>分类专用模型</span>
-          <Input value={llmClassifierModel} onChange={(v) => setLlmClassifierModel(v)} placeholder="留空则用主模型" style={{ width: 280 }} />
+          <Input name="llm_classifier_model" value={llmClassifierModel} onChange={(v) => setLlmClassifierModel(v)} placeholder="留空则用主模型" style={{ width: 280 }} />
         </div>
         {
           /* 归因批并发度：批量归因请求的并发上限（1-16） */
         }
         <div style={rowStyle}>
           <span style={labelStyle}>归因批并发度</span>
-          <InputNumber value={llmBatchConcurrency} onChange={(v) => setLlmBatchConcurrency(v)} min={1} max={16} style={{ width: 200 }} />
+          <InputNumber name="llm_batch_concurrency" value={llmBatchConcurrency} onChange={(v) => setLlmBatchConcurrency(v)} min={1} max={16} style={{ width: 200 }} />
         </div>
         {
           /* D1 推理上限：单条 D1 评分推理的最大 tokens */
         }
         <div style={rowStyle}>
           <span style={labelStyle}>D1推理上限</span>
-          <InputNumber value={llmD1MaxTokens} onChange={(v) => setLlmD1MaxTokens(v)} min={512} max={4096} step={256} style={{ width: 200 }} />
+          <InputNumber name="llm_d1_max_tokens" value={llmD1MaxTokens} onChange={(v) => setLlmD1MaxTokens(v)} min={512} max={4096} step={256} style={{ width: 200 }} />
           <span style={{ ...labelStyle, color: 'var(--app-muted-2)', marginLeft: 8, fontSize: 12 }}>tokens（默认 2048，D1 评分推理长度）</span>
         </div>
         {

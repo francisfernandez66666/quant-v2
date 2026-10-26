@@ -17,6 +17,7 @@ package data
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,56 @@ import (
 type LimitUpPoolSource struct {
 	Stocks []LimitUpStock
 	Source string
+	// Stale/AsOf §DATA-RELIABILITY（2026-10-26）：主源/兜底源都失败时回退的同日 last-known-good。
+	// Stale=true 的读数仍然真实，但已过期；消费方必须区分"真 0"与"取不到/回退值"。
+	Stale bool      `json:"stale,omitempty"`
+	AsOf  time.Time `json:"as_of,omitempty"`
+}
+
+// poolLKGMaxAge 三池 last-known-good 最长复用窗口（同交易日；跨日不复用）。
+const poolLKGMaxAge = 10 * time.Minute
+
+// poolLKGEntry 三池缓存条目（按 kind|YYYYMMDD 键）。
+type poolLKGEntry struct {
+	result LimitUpPoolSource
+	at     time.Time
+}
+
+// poolCacheKey 三池缓存键：date 空=当日；"2006-01-02" 归一为 YYYYMMDD，跨日绝不命中。
+func poolCacheKey(kind, date string) string {
+	d := strings.TrimSpace(date)
+	if d == "" {
+		d = TradingDayDate(time.Now())
+	} else {
+		d = strings.ReplaceAll(d, "-", "")
+	}
+	return kind + "|" + d
+}
+
+// poolLKGGet 读同日 last-known-good；超窗返回 false。
+func (dc *DataCoordinator) poolLKGGet(key string) (LimitUpPoolSource, bool) {
+	dc.poolLKGMu.Lock()
+	defer dc.poolLKGMu.Unlock()
+	e, ok := dc.poolLKG[key]
+	if !ok || time.Since(e.at) > poolLKGMaxAge {
+		return LimitUpPoolSource{}, false
+	}
+	res := e.result
+	res.Stale = true
+	res.AsOf = e.at
+	return res, true
+}
+
+// poolLKGSet 写入成功读数（失败/回退值绝不覆盖成功读数）。
+func (dc *DataCoordinator) poolLKGSet(key string, res LimitUpPoolSource) {
+	dc.poolLKGMu.Lock()
+	defer dc.poolLKGMu.Unlock()
+	if dc.poolLKG == nil {
+		dc.poolLKG = make(map[string]poolLKGEntry)
+	}
+	res.Stale = false
+	res.AsOf = time.Now()
+	dc.poolLKG[key] = poolLKGEntry{result: res, at: res.AsOf}
 }
 
 // PoolLimitUp 涨停池主源切换：hithink 优先、东财兜底。
@@ -33,51 +84,92 @@ type LimitUpPoolSource struct {
 // English: limit-up pool with hithink-primary + EastMoney-fallback. Empty date = today. When both
 // sources fail the last error is returned and the caller treats it as an empty pool (never panics/fabricates).
 func (dc *DataCoordinator) PoolLimitUp(date string) (LimitUpPoolSource, error) {
+	key := poolCacheKey("up", date)
 	if hk := dc.hithinkClient(); hk != nil {
 		dateMs := poolDateMillis(date)
 		if items, err := hk.LimitUpPool(dateMs); err == nil && len(items) > 0 {
-			return LimitUpPoolSource{Stocks: hithinkItemsToLimitUp(items), Source: "hithink"}, nil
+			res := LimitUpPoolSource{Stocks: hithinkItemsToLimitUp(items), Source: "hithink"}
+			dc.poolLKGSet(key, res)
+			return res, nil
 		} else if err != nil {
 			log.Printf("[risk_pools] 涨停池 hithink 取数失败，降级东财: %v", err)
 		}
 	}
 	// 东财永远兜底（且是 hithink 缺席/无 Key 时的唯一路径）。
 	if dc.eastMoney == nil {
+		if res, ok := dc.poolLKGGet(key); ok {
+			log.Printf("[risk_pools] 涨停池双源不可用，回退 %v 前 last-known-good（%d只, source=%s）",
+				time.Since(res.AsOf).Round(time.Second), len(res.Stocks), res.Source)
+			return res, nil
+		}
 		return LimitUpPoolSource{}, fmt.Errorf("limit-up pool: both hithink absent and eastmoney nil")
 	}
 	pool, err := dc.eastMoney.GetLimitUpPool(date)
 	if err != nil {
+		if res, ok := dc.poolLKGGet(key); ok {
+			log.Printf("[risk_pools] 涨停池双源失败，回退 %v 前 last-known-good（%d只, source=%s）",
+				time.Since(res.AsOf).Round(time.Second), len(res.Stocks), res.Source)
+			return res, nil
+		}
 		return LimitUpPoolSource{}, fmt.Errorf("limit-up pool both sources failed: %v", err)
 	}
-	return LimitUpPoolSource{Stocks: pool, Source: "eastmoney"}, nil
+	res := LimitUpPoolSource{Stocks: pool, Source: "eastmoney"}
+	dc.poolLKGSet(key, res)
+	return res, nil
 }
 
 // PoolLimitDown 跌停池：仅 hithink 提供（东财无该接口）。取不到返回错误，上层按 0 弃权。
 // English: limit-down pool — hithink-only (EastMoney has none); a miss returns an error to abstain.
 func (dc *DataCoordinator) PoolLimitDown(date string) (LimitUpPoolSource, error) {
+	key := poolCacheKey("down", date)
 	hk := dc.hithinkClient()
 	if hk == nil {
+		if res, ok := dc.poolLKGGet(key); ok {
+			log.Printf("[risk_pools] 跌停池 hithink 不可用，回退 %v 前 last-known-good（%d只）",
+				time.Since(res.AsOf).Round(time.Second), len(res.Stocks))
+			return res, nil
+		}
 		return LimitUpPoolSource{}, fmt.Errorf("limit-down pool: hithink unavailable")
 	}
 	items, err := hk.LimitDownPool(poolDateMillis(date))
 	if err != nil {
+		if res, ok := dc.poolLKGGet(key); ok {
+			log.Printf("[risk_pools] 跌停池 hithink 失败，回退 %v 前 last-known-good（%d只）: %v",
+				time.Since(res.AsOf).Round(time.Second), len(res.Stocks), err)
+			return res, nil
+		}
 		return LimitUpPoolSource{}, fmt.Errorf("limit-down pool hithink: %v", err)
 	}
-	return LimitUpPoolSource{Stocks: hithinkItemsToLimitUp(items), Source: "hithink"}, nil
+	res := LimitUpPoolSource{Stocks: hithinkItemsToLimitUp(items), Source: "hithink"}
+	dc.poolLKGSet(key, res)
+	return res, nil
 }
 
 // PoolLimitBreak 炸板池：仅 hithink 提供（BreakCount 映射 OpenTimes，用于真实炸板率）。
 // English: break pool — hithink-only; BreakCount maps to OpenTimes for the true break-rate.
 func (dc *DataCoordinator) PoolLimitBreak(date string) (LimitUpPoolSource, error) {
+	key := poolCacheKey("break", date)
 	hk := dc.hithinkClient()
 	if hk == nil {
+		if res, ok := dc.poolLKGGet(key); ok {
+			log.Printf("[risk_pools] 炸板池 hithink 不可用，回退 %v 前 last-known-good（%d只）",
+				time.Since(res.AsOf).Round(time.Second), len(res.Stocks))
+			return res, nil
+		}
 		return LimitUpPoolSource{}, fmt.Errorf("limit-break pool: hithink unavailable")
 	}
 	items, err := hk.LimitBreakPool(poolDateMillis(date))
 	if err != nil {
+		if res, ok := dc.poolLKGGet(key); ok {
+			log.Printf("[risk_pools] 炸板池 hithink 失败，回退 %v 前 last-known-good（%d只）: %v",
+				time.Since(res.AsOf).Round(time.Second), len(res.Stocks), err)
+			return res, nil
+		}
 		return LimitUpPoolSource{}, fmt.Errorf("limit-break pool hithink: %v", err)
 	}
-	return LimitUpPoolSource{Stocks: hithinkItemsToLimitUp(items), Source: "hithink"}, nil
+	res := LimitUpPoolSource{Stocks: hithinkItemsToLimitUp(items), Source: "hithink"}
+	dc.poolLKGSet(key, res)
+	return res, nil
 }
 
 // MarketBreadth 涨跌家数（裁决⑤：东财主源 + 真实弃权 + hithink 全市场统计兜底）。

@@ -45,6 +45,13 @@ const flowHistTTL = 10 * time.Minute
 // English: negative-cache TTL so a flaky upstream is not hammered every round.
 const flowHistFailTTL = 60 * time.Second
 
+// flowHistLKGTTL 同日 last-known-good 最长复用窗口（§DATA-RELIABILITY 2026-10-26）：
+// 东财日线历史是单源，熔断/超时后直接弃权会让 5 日净流入因子整段失明；同一交易日内
+// 早先成功取到的累计值仍是真实读数（只缺最近几分钟增量），30 分钟内回退它比弃权更可靠。
+// 跨日绝不复用（R3 日期断言仍生效）。
+// English: same-day LKG window for the single-source daily flow history; cross-day never.
+const flowHistLKGTTL = 30 * time.Minute
+
 // flowHistDays 5 日窗口行数（含当日）。当日被"5 日主因子"与"当日辅因子"两个维度共享，
 // 辅因子档位幅度减半正是对这份重叠的定价（§2.4），故这里含当日取 5 行。
 // English: 5 rows including today — the same-day factor's halved bands price in this overlap.
@@ -67,6 +74,10 @@ type flowHistEntry struct {
 	ok  bool
 	why string // 失败原因（ok=false 时非空；R9 弃权率归因用）
 	at  time.Time
+	// lkgSum/lkgAt 同日最近一次成功读数（§DATA-RELIABILITY）：失败时按 flowHistLKGTTL 复用。
+	// 只随成功取数推进；失败负缓存不覆盖它，保证熔断期间仍能读到最近一次真实值。
+	lkgSum float64
+	lkgAt  time.Time
 }
 
 // flowFactorTracker 净流入率解析器（线程安全；每引擎一份，懒建）。
@@ -94,6 +105,9 @@ func (t *flowFactorTracker) fiveDaySum(code, day string, fetch func() ([]data.Fl
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if e := t.hist[code]; e != nil && e.day == day && now.Sub(e.at) < flowCacheTTL(e.ok) {
+		if !e.ok && lkgValid(e.lkgAt, now) {
+			return e.lkgSum, true, "" // 负缓存期内仍可用同日 LKG，不让一次抖动把因子打空
+		}
 		return e.sum, e.ok, e.why
 	}
 	sum, ok, why := 0.0, false, ""
@@ -112,13 +126,35 @@ func (t *flowFactorTracker) fiveDaySum(code, day string, fetch func() ([]data.Fl
 			sum, ok, why = data.SumMainNet(days), true, ""
 		}
 	}
+	// §DATA-RELIABILITY：失败时保留同日最近一次成功读数（LKG）。跨日/Day 不同绝不使用。
+	prev := t.hist[code]
+	lkgSum, lkgAt := 0.0, time.Time{}
+	if prev != nil && prev.day == day {
+		if prev.ok {
+			lkgSum, lkgAt = prev.sum, prev.at
+		} else {
+			lkgSum, lkgAt = prev.lkgSum, prev.lkgAt
+		}
+	}
+	retSum, retOK, retWhy := sum, ok, why
+	if !retOK && lkgValid(lkgAt, now) {
+		log.Printf("[flow] %s 历史取数失败(%s)，回退同日 last-known-good（%.0f 元，%v 前）",
+			code, retWhy, lkgSum, now.Sub(lkgAt).Round(time.Second))
+		retSum, retOK, retWhy = lkgSum, true, ""
+	}
 	if t.hist == nil {
 		t.hist = make(map[string]*flowHistEntry)
 	}
 	if len(t.hist) < flowHistMaxEntries {
-		t.hist[code] = &flowHistEntry{day: day, sum: sum, ok: ok, why: why, at: now}
+		// ok/why 记录本次真实取数结果（保持负缓存 60s 与 R9 归因），LKG 单独随行。
+		t.hist[code] = &flowHistEntry{day: day, sum: sum, ok: ok, why: why, at: now, lkgSum: lkgSum, lkgAt: lkgAt}
 	}
-	return sum, ok, why
+	return retSum, retOK, retWhy
+}
+
+// lkgValid 同日 last-known-good 是否仍在复用窗口内（零值=从未成功过）。
+func lkgValid(at, now time.Time) bool {
+	return !at.IsZero() && now.Sub(at) <= flowHistLKGTTL
 }
 
 // flowCacheTTL 成功/失败两种 TTL。

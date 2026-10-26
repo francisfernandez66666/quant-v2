@@ -138,6 +138,7 @@ func (e *Engine) evoRecordDecisions(pol signalctl.Policy, decisions []signalctl.
 		cfgVer = sizing_evo.CfgVerOf(account, st.Applied.CandID)
 	}
 
+	// 把本轮 pass 的定权决策落成结构化快照（含影子/灰度），供夜间 evo 汇总消费。
 	var batch []sizing_evo.SizingSnapshot
 	tr.mu.Lock()
 	if tr.seenDay != day {
@@ -217,6 +218,7 @@ func (e *Engine) evoSettlePass(tr *sizingEvoTracker, now time.Time) {
 	}
 	tr.mu.Unlock()
 
+	// 结算到期候选：逐条取未来 K 线；取不到就留待下轮重试，绝不拿缺数当 0。
 	settled := 0
 	for _, p := range pend {
 		bars, ok := tr.bars(p.code, evoSettleBars)

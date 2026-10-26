@@ -88,6 +88,8 @@ export default function Dashboard() {
   const [signals, setSignals] = useState([])
   // 引擎/扫描整体状态（含 uptime、scan_stats 等）
   const [status, setStatus] = useState({})
+  // §OBSERVABILITY：管理员可见的 LLM 当日用量 + 前端错误聚合（/api/usage）。
+  const [usage, setUsage] = useState(null)
   // 最新资讯与宏观日历事件
   const [newsItems, setNewsItems] = useState([])
   // 热门板块列表
@@ -210,12 +212,24 @@ export default function Dashboard() {
     if (ehRes.status === 'fulfilled' && ehRes.value) setEngineHealth((ehRes.value.engine) || ehRes.value || {})
   }
 
+  // §OBSERVABILITY：用量看板仅管理员可读（/api/usage 是 admin 端点）；失败不阻断主看板。
+  async function loadUsage() {
+    if (!api.isAdmin || !api.isAdmin()) return
+    try {
+      const u = await api.fetchUsage()
+      if (u) setUsage(u)
+    } catch (_) {
+      // §P2-J 可吞：用量看板是辅助信息，失败不影响行情/信号主链路（主看板另有健康三态与失败红条）。
+    }
+  }
+
   // 并行加载仪表盘所需的信号、状态、新闻、板块、快照、IPO 与战法统计
   // §M-10：本轮代号先取后发——allSettled 返回时若已有更新的轮次在途/完成，整包丢弃。
   async function load() {
     const token = loadGuard.current.begin()
     // §M-9 健康端点并入主轮询（10s）；独立 allSettled，不阻断主数据
     loadHealth()
+    loadUsage()
     const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes, dashRes] = await Promise.allSettled([
       api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(),
       api.fetchHotSnapshot(), api.fetchIPOCalendar(), api.fetchDashboard(),
@@ -474,6 +488,45 @@ export default function Dashboard() {
           {/* §M-9（2026-09-22 修复批）健康点走 healthMark 三态：●=确证健康 / ○=确证故障 / –=未取到（unknown），
               旧的 `x ? '●' : '○'` 二态会把「接口没拉到」画成故障点、把「故障」与「无数据」混为一谈 */}
           <span>数据源：东财{healthMark(dataSourceHealth.eastmoney)} 新浪{healthMark(dataSourceHealth.sina)} 腾讯{healthMark(dataSourceHealth.tencent)} 同花顺{healthMark(dataSourceHealth.ths)}</span>
+          {/* §DATA-RELIABILITY（2026-10-26）：把 /api/status 已有的 quote_source/quote_age_sec 上屏——
+              东财熔断降级后用户至少能看到"现在用的是哪个源、数据多旧"，而不是只看到价格继续显示。
+              仅交易时段对 >60s 的数据龄打「可能过期」，盘后不误报。 */}
+          {(() => {
+            const rawAge = status.quote_age_sec
+            const age = (rawAge === null || rawAge === undefined || rawAge === '') ? null : Number(rawAge)
+            const hasAge = Number.isFinite(age)
+            const stale = !!status.in_trade_time && hasAge && age > 60
+            return (
+              <span>
+                行情源：{status.quote_source || '未就绪（盘外/降级）'}
+                {hasAge ? ` · ${age}s 前` : ''}
+                {stale ? <Tag theme="warning" size="small" style={{ marginLeft: 6 }}>数据可能过期</Tag> : null}
+              </span>
+            )
+          })()}
+          {/* §OBSERVABILITY（2026-10-26）：管理员可见的 LLM 当日用量与前端错误聚合（/api/usage）。 */}
+          {usage && usage.llm && (
+            <span>
+              {usage.llm.available === false
+                ? 'LLM 用量：未接入'
+                : `LLM 今日：调用 ${usage.llm.calls || 0}${usage.llm.call_budget > 0 ? ` / ${usage.llm.call_budget}` : ''} 次 · token ${usage.llm.tokens || 0}${usage.llm.token_budget > 0 ? ` / ${usage.llm.token_budget}` : ''}`}
+              {usage.client_errors && usage.client_errors.total > 0
+                ? ` · 前端错误 ${usage.client_errors.total} 条（唯一 ${usage.client_errors.unique}）`
+                : ''}
+              {usage.client_errors && usage.client_errors.total > 0
+                ? <Tag theme="warning" size="small" style={{ marginLeft: 6 }}>前端错误</Tag>
+                : null}
+            </span>
+          )}
+          {/* §DATA-RELIABILITY（2026-10-26）：东财按接口域熔断明细——只有连败/熔断中才显示，正常不占屏。 */}
+          {(() => {
+            const b = status.data_source_breakers || {}
+            const parts = Object.entries(b)
+              .filter(([, v]) => v && (v.open || Number(v.fail_streak) > 0))
+              .map(([k, v]) => `${k}${v.open ? '熔断中' : `连败${v.fail_streak}`}`)
+            if (!parts.length) return null
+            return <span style={{ color: 'var(--app-warning, #e37318)' }}>数据源熔断：{parts.join(' / ')}</span>
+          })()}
           {/* §F-18：– 期间不是“故障”，而是尚未取到（首次探测进行中）；把口径写在屏上 */}
           <span className="muted" style={{ fontSize: 11 }}>– = 尚未取到（首次探测进行中或该腿从未成功），会自动刷新</span>
           <span>新闻：财联社{newsMark(newsSourceHealth.cailanshe)} 同花顺{newsMark(newsSourceHealth.kuaixun)} 新浪{newsMark(newsSourceHealth.sina)}</span>

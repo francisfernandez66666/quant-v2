@@ -44,6 +44,61 @@ func TestFillInheritsOrderVWAP(t *testing.T) {
 	if math.Abs(prem-want) > 1e-9 {
 		t.Fatalf("偏差应为 %.6f, got %.6f", want, prem)
 	}
+
+	// §C2-VWAP-READ：成交列表读取路径（fills_effective + ListFillsByDay）也必须带出 VWAP；
+	// 此前视图/查询没这四列，页面永远看不到——这条是读取断链的反例锁。
+	fills, err := db.ListFillsByDay("u_v", "2026-10-22")
+	if err != nil {
+		t.Fatalf("ListFillsByDay: %v", err)
+	}
+	if len(fills) != 1 {
+		t.Fatalf("成交列表应 1 条，got %d", len(fills))
+	}
+	got := fills[0]
+	if got.MarketVWAP != 9.5 || got.VWAPSource != "quote" || got.VWAPAsOf == "" {
+		t.Fatalf("成交列表未带出 VWAP: mv=%v src=%q asOf=%q", got.MarketVWAP, got.VWAPSource, got.VWAPAsOf)
+	}
+	if math.Abs(got.FillVWAPPremiumPct-want) > 1e-9 {
+		t.Fatalf("成交列表偏差应为 %.6f, got %.6f", want, got.FillVWAPPremiumPct)
+	}
+}
+
+// TestRealOrderReadRoundTripAllFields §C2-VWAP-READ：RealOrder 所有字段必须能写进去再原样读回。
+// 这是"写侧加列、读侧漏 SELECT"那一类缺陷的通用反例锁——以后新增字段漏接读取即红。
+func TestRealOrderReadRoundTripAllFields(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "order_roundtrip.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	want := RealOrder{
+		OrderID: "O-ROUND", SignalID: "S-ROUND", Code: "600002.SH", Side: "买入", Status: "已报",
+		Price: 12.34, Qty: 300, CreatedAt: "2026-10-26 09:31:00", UserID: "u_round",
+		MarketVWAP: 11.99, VWAPSource: "quote", VWAPAsOf: "2026-10-26T09:31:00+08:00",
+		SignalVWAPPremiumPct: (12.34 - 11.99) / 11.99 * 100, TimeoutSec: 120,
+	}
+	if _, err := db.UpsertRealOrder(want); err != nil {
+		t.Fatalf("UpsertRealOrder: %v", err)
+	}
+	orders, err := db.RealOrdersForUser("u_round")
+	if err != nil {
+		t.Fatalf("RealOrdersForUser: %v", err)
+	}
+	if len(orders) != 1 {
+		t.Fatalf("订单列表应 1 条，got %d", len(orders))
+	}
+	got := orders[0]
+	if got.OrderID != want.OrderID || got.SignalID != want.SignalID || got.Code != want.Code ||
+		got.Side != want.Side || got.Status != want.Status || got.Qty != want.Qty ||
+		got.CreatedAt != want.CreatedAt || got.UserID != want.UserID || got.TimeoutSec != want.TimeoutSec {
+		t.Fatalf("订单基础字段回读不一致:\nwant=%+v\ngot =%+v", want, got)
+	}
+	if got.Price != want.Price || got.MarketVWAP != want.MarketVWAP ||
+		got.VWAPSource != want.VWAPSource || got.VWAPAsOf != want.VWAPAsOf ||
+		math.Abs(got.SignalVWAPPremiumPct-want.SignalVWAPPremiumPct) > 1e-9 {
+		t.Fatalf("订单 VWAP 字段回读不一致:\nwant=%+v\ngot =%+v", want, got)
+	}
 }
 
 func TestFillWithoutOrderVWAPStaysEmpty(t *testing.T) {

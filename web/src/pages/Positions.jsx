@@ -8,6 +8,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin, DialogPlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
+import AnchorShadowCard from '../components/AnchorShadowCard.jsx' // §ANCHOR-FIRST W2 影子对照（只读）
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
@@ -1106,6 +1107,9 @@ export default function Positions() {
           )}
         </Tabs.TabPanel>
       </Tabs>
+
+      {/* §ANCHOR-FIRST W2：成本口径 vs 首买价锚的影子对照（只读，不参与任何处置） */}
+      <AnchorShadowCard />
 
       {/* 移动端操作菜单 */}
       <Dialog visible={!!sheetHolding} header={(sheetHolding ? sheetHolding.code : '') + ' ' + (sheetHolding ? sheetHolding.name : '')} onClose={() => setSheetHolding(null)} footer={false}>

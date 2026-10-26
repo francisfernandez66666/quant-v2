@@ -70,6 +70,7 @@ func (s *Server) handleSizingEvoStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// 组装只读响应：开关/阈值/样本计数/灰度与 L2 统计一次出门，前端不再二次拼口径。
 	resp := map[string]any{
 		"enabled":          base.EvoOn(),
 		"auto_promote":     base.EvoAutoPromoteOn(),

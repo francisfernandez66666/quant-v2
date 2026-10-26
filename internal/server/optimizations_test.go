@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"quant-trading-v2/internal/config"
@@ -170,5 +171,111 @@ func TestThresholdOverrideWarning(t *testing.T) {
 	}
 	if w := thresholdOverrideWarning(db, "fac_999", 95); w != "" {
 		t.Fatalf("候选不存在不应告警: %q", w)
+	}
+}
+
+// TestOptimizationApproveOverridePersistsRankingParams §F4/P0-B：审批带 Pareto override 时，
+// 排名行 params 必须同步为实际写入的推荐解；重开页面（GetOptimization）与 applied 配置一致。
+func TestOptimizationApproveOverridePersistsRankingParams(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "trading.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &Server{researchDB: db, researchDir: dir, cfg: config.NewManager("")}
+	seedOptLib(t, dir)
+
+	if err := db.SaveOptimizationResults(991, "profitfactor", []map[string]any{
+		{"rank": 1.0, "strategy": "因子战法#1", "strategy_kind": "fac_1",
+			"params":   map[string]any{"trail_pct": 12.0, "hold_days": 20.0, "min_score": 60.0},
+			"win_rate": 45.0, "profit_factor": 1.1, "avg_hold_days": 5.0, "trigger_count": 90.0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.OptimizationResultsByTask(991)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("seed rows: %v %d", err, len(rows))
+	}
+	id := rows[0].ID
+
+	// 模拟前端「应用推荐解」：override 为 15/7/9/72，不是旧冠军 12/20/60。
+	body := `{"params":{"take_profit_pct":15,"stop_loss_pct":7,"hold_days":9,"min_score":72}}`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/approve", strings.NewReader(body))
+	req.SetPathValue("id", itoa(id))
+	s.handleOptimizationApprove(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("override 审批失败 code=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// ① 重开页面的数据源：排名行 params 必须是 applied 参数，不是旧冠军。
+	got, err := db.GetOptimization(id)
+	if err != nil || got == nil {
+		t.Fatalf("GetOptimization: %v", err)
+	}
+	if got.Params.TakeProfitPct != 15 || got.Params.StopLossPct != 7 || got.Params.HoldDays != 9 || got.Params.MinScore != 72 {
+		t.Fatalf("排名行 params 未同步为 override 值: %+v", got.Params)
+	}
+	if got.Status != "approved" {
+		t.Fatalf("状态应为 approved, got %s", got.Status)
+	}
+
+	// ② 实际写入的规则库必须与排名行一致。
+	entries, err := research.ListAppliedFactorRules(dir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("读规则库: %v", err)
+	}
+	e := entries[0]
+	if e.BuyThreshold != 72 || e.ExitTrailPct != 15 || e.ExitMaxHoldDays != 9 {
+		t.Fatalf("applied 配置与排名行不一致: threshold=%v trail=%v hold=%v",
+			e.BuyThreshold, e.ExitTrailPct, e.ExitMaxHoldDays)
+	}
+}
+
+// TestOptimizationApproveOverrideBuiltinUsesOverride 内置战法分支也必须用 override 后的 row.Params
+// 写配置，不能回落到旧冠军（与规则行同一条 §F4 不变量）。
+func TestOptimizationApproveOverrideBuiltinUsesOverride(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "trading.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cfgMgr := config.NewManager("")
+	s := &Server{researchDB: db, researchDir: dir, cfg: cfgMgr}
+
+	if err := db.SaveOptimizationResults(992, "profitfactor", []map[string]any{
+		{"rank": 1.0, "strategy": "双响炮", "strategy_kind": "",
+			"params":   map[string]any{"trail_pct": 8.0, "hold_days": 15.0, "min_score": 70.0},
+			"win_rate": 40.0, "profit_factor": 1.2, "avg_hold_days": 3.0, "trigger_count": 100.0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.OptimizationResultsByTask(992)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("seed rows: %v %d", err, len(rows))
+	}
+	id := rows[0].ID
+
+	body := `{"params":{"take_profit_pct":18,"hold_days":5,"min_score":70}}`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/approve", strings.NewReader(body))
+	req.SetPathValue("id", itoa(id))
+	s.handleOptimizationApprove(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("内置 override 审批失败 code=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	gotCfg := cfgMgr.GetStrategyConfig()
+	if gotCfg.DoubleBump.TrailingDrawbackPct != 18 || gotCfg.DoubleBump.MaxHoldDays != 5 {
+		t.Fatalf("内置配置未使用 override: %+v", gotCfg.DoubleBump)
+	}
+	got, err := db.GetOptimization(id)
+	if err != nil || got == nil {
+		t.Fatalf("GetOptimization: %v", err)
+	}
+	if got.Params.TakeProfitPct != 18 || got.Params.HoldDays != 5 {
+		t.Fatalf("内置行排名 params 未同步: %+v", got.Params)
 	}
 }

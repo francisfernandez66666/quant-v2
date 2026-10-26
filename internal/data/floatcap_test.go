@@ -71,11 +71,11 @@ func TestFloatMarketCapOf(t *testing.T) {
 	}
 	// ③ 两条路都缺输入 → ok=false（缺数纪律：不折 0、不折现价）。
 	for name, q := range map[string]*StockInfo{
-		"nil":            nil,
-		"全零":             {},
-		"有价无量":           {Price: 10},
-		"有量无换手":          {Price: 10, Volume: 1000},
-		"换手为零(歧义弃权)":    {Price: 10, Volume: 1000, Turnover: 0},
+		"nil":        nil,
+		"全零":         {},
+		"有价无量":       {Price: 10},
+		"有量无换手":      {Price: 10, Volume: 1000},
+		"换手为零(歧义弃权)": {Price: 10, Volume: 1000, Turnover: 0},
 	} {
 		if got, ok := FloatMarketCapOf(q); ok {
 			t.Fatalf("%s 应弃权(ok=false), got %.0f", name, got)

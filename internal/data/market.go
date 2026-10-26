@@ -136,6 +136,11 @@ type MarketAPI struct {
 	// upstream); within a short window a failed round serves the stale-but-real value loudly.
 	indexLKG   *indexLKGEntry // 上一份成功的指数行情（nil=从未成功）
 	indexLKGMu sync.Mutex     // 保护 indexLKG 读写
+
+	// §DATA-RELIABILITY（2026-10-26）：资金流日线历史的本地快照目录。
+	// 东财是唯一源；盘中失败时回退同日最近一次成功快照（跨重启仍可用），
+	// 供 5 日净流入因子与研究/回测离线消费。
+	flowHistCacheDir string
 }
 
 // ── §M3 新闻源健康记录 ──
@@ -346,6 +351,27 @@ func (m *MarketAPI) emAllow(scope string) bool {
 // 需配合 emAllow 在调用前判断是否快速失败。
 // emRecord drives the per-endpoint breaker: increments the streak on failure and trips it
 // at the threshold; resets on success. Pair with emAllow(scope) before each call.
+// BreakerDetail §DATA-RELIABILITY（2026-10-26）：东财按接口域(scope)的熔断明细。
+// 只读当前内存状态；给 /api/status 上屏"哪个接口在熔断、连败几次"，不再只有健康点。
+func (m *MarketAPI) BreakerDetail() map[string]map[string]any {
+	m.emBreakerMu.Lock()
+	defer m.emBreakerMu.Unlock()
+	out := make(map[string]map[string]any, len(m.emBreakers))
+	now := time.Now()
+	for scope, b := range m.emBreakers {
+		if b == nil {
+			continue
+		}
+		item := map[string]any{"fail_streak": b.failStreak, "open": now.Before(b.openUntil)}
+		if now.Before(b.openUntil) {
+			item["open_until"] = b.openUntil.Format(time.RFC3339)
+		}
+		out[scope] = item
+	}
+	return out
+}
+
+// emRecord 记录东财某接口域(scope)的调用结果：连续失败到阈值即熔断，成功清零连败。
 func (m *MarketAPI) emRecord(scope string, err error) {
 	m.emBreakerMu.Lock()
 	defer m.emBreakerMu.Unlock()

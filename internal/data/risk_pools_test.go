@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // newTestHithink 构造一个指向 httptest 服务器的 HithinkClient（不限速、注入测试 Key）。
@@ -69,6 +70,36 @@ func TestPoolLimitDownHithinkOnly(t *testing.T) {
 	dc := NewDataCoordinator(nil, nil) // 未 SetHithink → hithink 缺席
 	if _, err := dc.PoolLimitDown(""); err == nil {
 		t.Fatal("hithink 缺席时跌停池应返回错误（绝不编造）")
+	}
+}
+
+// TestPoolLKGFallback §DATA-RELIABILITY（2026-10-26）：跌停/炸板池 hithink 单源失败时，
+// 同日 10 分钟内的 last-known-good 必须能回退且标 Stale；跨日/超窗必须继续报错。
+func TestPoolLKGFallback(t *testing.T) {
+	dc := NewDataCoordinator(nil, nil) // hithink 缺席
+	day := "20261026"
+	res := LimitUpPoolSource{Stocks: []LimitUpStock{{Code: "600000", Name: "浦发银行"}}, Source: "hithink"}
+	dc.poolLKGSet(poolCacheKey("down", day), res)
+
+	got, err := dc.PoolLimitDown(day)
+	if err != nil {
+		t.Fatalf("同日 LKG 应可回退，got err=%v", err)
+	}
+	if !got.Stale || len(got.Stocks) != 1 || got.AsOf.IsZero() {
+		t.Fatalf("回退读数必须标 Stale/AsOf 且保留股票: %+v", got)
+	}
+
+	// 跨日不得复用前一日 LKG。
+	if _, err := dc.PoolLimitDown("20261027"); err == nil {
+		t.Fatal("跨日不得命中 LKG")
+	}
+
+	// 超窗（>10 分钟）不得复用。
+	dc.poolLKGMu.Lock()
+	dc.poolLKG[poolCacheKey("break", day)] = poolLKGEntry{result: res, at: time.Now().Add(-11 * time.Minute)}
+	dc.poolLKGMu.Unlock()
+	if _, err := dc.PoolLimitBreak(day); err == nil {
+		t.Fatal("LKG 超过 10 分钟窗口不得复用")
 	}
 }
 

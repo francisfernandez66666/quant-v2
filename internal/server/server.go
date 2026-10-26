@@ -268,6 +268,14 @@ type Server struct {
 	// blasts the GLOBAL channels, so the throttle is per-process rather than per-account.
 	notifyTestMu     sync.Mutex
 	notifyTestLastAt time.Time // 最近一次被受理的探测时刻（零值=从未）
+
+	// §OBSERVABILITY（2026-10-26）：前端错误聚合与 LLM 用量读取。
+	// clientErrStats 按指纹去重计数；llmUsageFn 由 main 注入（读取注册表当前 LLM 客户端的当日用量）。
+	clientErrMu    sync.Mutex
+	clientErrStats map[string]*clientErrStat
+	clientErrTotal int64
+	clientErrLast  time.Time
+	llmUsageFn     func() map[string]int64
 }
 
 // EngineRegistry 引擎注册表的 HTTP 可见接口（由 engine.Registry 实现，避免 server→engine 依赖环）。
@@ -417,6 +425,10 @@ func (s *Server) loadCachedDash() *display.DashboardData {
 func (s *Server) SetLLMRecreate(fn func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string)) {
 	s.llmRecreate = fn
 }
+
+// SetLLMUsageFn 注入 LLM 当日用量读取（main 用注册表当前客户端实现；nil=未接入）。
+// English: injects the LLM daily-usage reader (main wires it to the registry's current client).
+func (s *Server) SetLLMUsageFn(fn func() map[string]int64) { s.llmUsageFn = fn }
 
 // SetFetcher 注入 5s 实时行情采集器（报价接口优先读快照，缺失再降级拉取）。
 func (s *Server) SetFetcher(f *data.Fetcher) { s.fetcher = f }
@@ -651,6 +663,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/metrics/alerts", s.adminMiddleware(s.handleAlertState))
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
 	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
+	// §ANCHOR-FIRST W2：影子对照表只读面（admin；仅读账号目录，不触发取样/不写文件）。
+	s.mux.HandleFunc("GET /api/anchor-shadow", s.adminMiddleware(s.handleAnchorShadow))
+	// §OBSERVABILITY（2026-10-26）：前端错误上报（登录用户；载荷限长+指纹去重）与运行用量看板（admin）。
+	s.mux.HandleFunc("POST /api/client-errors", s.authMiddleware(s.handleClientError))
+	s.mux.HandleFunc("GET /api/usage", s.adminMiddleware(s.handleUsage))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
 	// §Dashboard 情绪面板 A：日级情绪/风险档历史（近 30 交易日色带 + 关键指标）
 	// English: sentiment card backend — daily emotion/market-state series for the Dashboard.

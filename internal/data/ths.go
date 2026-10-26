@@ -647,6 +647,7 @@ func (tc *THSClient) GetTHSMinuteKLine(code string, scale int) ([]KLine, error) 
 //   - "407" = 总股本（股）：600519 与流通股本同值（全流通）；
 //   - 流通市值须派生：402 × 现价("10") = 1250081601 × 1335 = 16,688.59 亿元，与腾讯
 //     直接给出的流通市值字段逐元一致。订正注释避免后人误找"市值直值字段"而空手回。
+//
 // THS realhead field ids, verified 2026-09-20 against Tencent quotes on two independent samples.
 // Correction (2026-10-25, re-probed 600519): fields "402"/"407" are SHARE COUNTS, not market
 // caps — float market cap must be derived as shares × price (verified cent-exact vs Tencent).

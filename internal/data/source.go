@@ -90,6 +90,12 @@ type DataCoordinator struct {
 	// English: ipoRefreshing: an IPO-calendar refresh is in flight (prevents concurrent
 	// English: duplicate refreshes when multiple callers hit the expired-TTL path at once).
 
+	// §DATA-RELIABILITY（2026-10-26）：涨停/跌停/炸板三池的同日 last-known-good。
+	// 跌停/炸板仍只有 hithink 单源；主源抖动时回退最近 10 分钟的真实读数（标 Stale），
+	// 好过把"取不到"当 0 家。独立锁，避免与 hithinkClient() 的 dc.mu 形成嵌套。
+	poolLKGMu sync.Mutex
+	poolLKG   map[string]poolLKGEntry
+
 	lastSource string // §P1-10 最近一次成功命中的行情源名称（取值见 §M1 QuoteSource* 枚举）
 	// English: name of the last successful quote source (values locked to the §M1 QuoteSource* enum).
 }
@@ -264,6 +270,18 @@ func classifyMinuteLeg(err error, n int) string {
 // HealthCheck 探测所有行情源的可用性，委托给东财 MarketAPI 的健康检查。
 // English: HealthCheck probes the availability of all quote sources, delegating to the EastMoney MarketAPI health check.
 // （HealthCheck probes the availability of all market data sources, delegating to the EastMoney MarketAPI health check.）
+// BreakerDetail 返回东财各接口域的熔断明细（无引擎/未初始化时返回空 map）。
+// English: per-scope EastMoney breaker detail (empty when unconfigured).
+func (dc *DataCoordinator) BreakerDetail() map[string]map[string]any {
+	dc.mu.RLock()
+	em := dc.eastMoney
+	dc.mu.RUnlock()
+	if em == nil {
+		return map[string]map[string]any{}
+	}
+	return em.BreakerDetail()
+}
+
 func (dc *DataCoordinator) HealthCheck() map[string]bool {
 	if dc.eastMoney == nil {
 		return map[string]bool{"eastmoney": false, "sina": false, "tencent": false, "ths": false}

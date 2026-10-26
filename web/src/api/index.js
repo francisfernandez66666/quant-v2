@@ -999,8 +999,9 @@ export async function updateQMTConfig(data) {
 /** Live trade ledger and overall PnL (realized / unrealized / per-strategy attribution) */
 // 对应 GET /api/qmt/trades，返回 { summary:{realized_pnl, unrealized_pnl, total_pnl,
 //   trade_count, wins, losses}, by_strategy:[...], fills:[...最近100笔倒序] }
-export async function fetchQMTTrades() {
-  return request('/api/qmt/trades')
+export async function fetchQMTTrades(page = 1, pageSize = 100) {
+  // §F9：page/page_size 让「加载更早成交」可继续向历史翻；缺省仍是最近 100 笔。
+  return request(`/api/qmt/trades?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`)
 }
 
 /** 实盘：当日委托列表（§U-2 撤单 UI 数据源；仅当日，含 order_id 供撤单） */
@@ -1969,6 +1970,20 @@ export async function fetchDataSourceHealth() {
  */
 export async function fetchNewsSourceHealth() {
   return request('/api/news_source_health')
+}
+
+// §ANCHOR-FIRST W2 影子对照表（只读）：成本口径 vs 首买价锚的逐票线位移动。
+// 对应 GET /api/anchor-shadow?days=N（admin）。
+/** 获取影子对照表（W2，只读） */
+export async function fetchAnchorShadow(days = 20) {
+  return request(`/api/anchor-shadow?days=${encodeURIComponent(days)}`)
+}
+
+// §OBSERVABILITY：运行用量看板（LLM 当日调用/token、数据源健康、前端错误聚合）。
+// 对应 GET /api/usage（admin）。
+/** 获取运行用量看板 */
+export async function fetchUsage() {
+  return request('/api/usage')
 }
 
 // ── 股票咨询（多轮对话）──

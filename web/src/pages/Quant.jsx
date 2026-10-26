@@ -154,6 +154,11 @@ export default function Quant() {
   const [saving, setSaving] = useState(false)
   // 交易流水数据（summary 汇总 + by_strategy 分战法 + fills 成交明细），30s 轮询刷新
   const [trades, setTrades] = useState(null)
+  // §F9：服务端分页——当前页、已加载的更早成交、总笔数（加载更多时追加并去重）
+  const [tradesPage, setTradesPage] = useState(1)
+  const [olderFills, setOlderFills] = useState([])
+  const [tradesTotal, setTradesTotal] = useState(0)
+  const [tradesLoadingMore, setTradesLoadingMore] = useState(false)
   // §0929FILL-NAME 成交流水的「名称」旁证映射 {代码(大写)→股票名}。
   // 账本里没有这个名字（fills 表无 name 列），它是前端按代码向本地股票池表问出来的**展示旁证**：
   // 只进单元格渲染，绝不进提交体、锚点或任何账目计算（幂等锚仍是 (order_id,traded_at,price,qty)+trade_id）。
@@ -256,6 +261,17 @@ export default function Quant() {
     if (allStrategyOn) return '当前：全部允许'
     return `当前：${onCount}/${strategyList.length} 允许进入实盘`
   }, [strategyList, strategyOn, allStrategyOn])
+
+  // §F9：当前页 + 已加载的更早成交合并去重（新成交插队导致页边界移动时不重复）。
+  const allFills = useMemo(() => {
+    const seen = new Set()
+    return [...((trades && trades.fills) || []), ...olderFills].filter((f) => {
+      const k = f && (f.order_id || `${f.code}|${f.traded_at}|${f.price}|${f.qty}`)
+      if (!k || seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+  }, [trades, olderFills])
 
   // 金额格式化：正数补 + 号并保留两位小数
   function fmtMoney(v) {
@@ -459,7 +475,10 @@ export default function Quant() {
       const t = await api.fetchQMTTrades()
       if (pollingDeadRef.current) return // §M-6 上一步 await 期间 403 落地 → 链尾禁发
       if (tradesGuard.isStale(token)) return // §P2-I 后到的旧轮次：流水与后续两步的回写一并作废
-      if (t && t.summary) setTrades(t)
+      if (t && t.summary) {
+        setTrades(t)
+        setTradesTotal(t.pagination ? Number(t.pagination.total) || 0 : (Number(t.summary.trade_count) || 0))
+      }
       // §0929FILL-NAME 流水到账后按代码补名称旁证（fire-and-forget：名称列不许拖慢流水渲染）
       resolveFillNames(((t && t.fills) || []).map((f) => f && f.code))
     } catch (e) {
@@ -482,6 +501,26 @@ export default function Quant() {
       if (tradesGuard.isStale(token)) return // §P2-I：链尾同样在后到判据之外，否则旧闸口读数覆盖新读数
       if (g && Array.isArray(g.gates)) setRiskGates(g)
     } catch (e) { noteForbidden(e) }
+  }
+
+  // §F9：向更早的成交翻一页（只在用户点「加载更早成交」时发，不参与 60s 轮询）。
+  async function loadMoreTrades() {
+    if (tradesLoadingMore) return
+    setTradesLoadingMore(true)
+    try {
+      const next = tradesPage + 1
+      const t = await api.fetchQMTTrades(next, 100)
+      if (t && Array.isArray(t.fills)) {
+        setOlderFills((prev) => prev.concat(t.fills))
+        setTradesPage(next)
+        if (t.pagination && t.pagination.total != null) setTradesTotal(Number(t.pagination.total) || 0)
+        resolveFillNames(t.fills.map((f) => f && f.code))
+      }
+    } catch (e) {
+      noteForbidden(e)
+    } finally {
+      setTradesLoadingMore(false)
+    }
   }
 
   // §0929FILL-NAME 按成交代码补「名称」旁证映射（只问没问过的代码，一批一次请求）。
@@ -1628,10 +1667,17 @@ export default function Quant() {
               <div style={{ padding: '8px 2px', color: 'var(--app-text-2)', fontSize: 13 }}>暂无成交——实盘成交后此处出现按战法归因的盈亏统计（飞轮回流数据源）</div>
             )}
             {/* 成交流水明细表：时间、代码、名称（§0929FILL-NAME 前端旁证）、方向、价格、数量、金额、战法 */}
-            {(trades.fills || []).length ? (
-              <Table data={trades.fills} columns={fillsColumns} rowKey="order_id" size="small"
-                // §FIX-20260902 补 total=长度：tdesign 未传 total 时分页默认 0 → 页脚「共 0 条」且无法翻页
-                pagination={{ pageSize: 10, showJumper: true, total: trades.fills.length }} />
+            {allFills.length ? (
+              <>
+                <Table data={allFills} columns={fillsColumns} rowKey="order_id" size="small"
+                  // §FIX-20260902 补 total=长度：tdesign 未传 total 时分页默认 0 → 页脚「共 0 条」且无法翻页
+                  pagination={{ pageSize: 10, showJumper: true, total: allFills.length }} />
+                {tradesTotal > allFills.length && (
+                  <Button size="small" variant="outline" loading={tradesLoadingMore} onClick={loadMoreTrades} style={{ marginTop: 8 }}>
+                    加载更早成交（已显示 {allFills.length}/{tradesTotal}）
+                  </Button>
+                )}
+              </>
             ) : null}
           </>
         ) : (

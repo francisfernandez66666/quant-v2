@@ -44,6 +44,7 @@ function okPayloads() {
     fetchDashboard: () => ({}),
     fetchDataSourceHealth: () => ({ eastmoney: true, sina: true, tencent: true, ths: true }),
     fetchNewsSourceHealth: () => ({}),
+    fetchUsage: () => ({}),
     fetchEngineHealth: () => ({ engine: {} }),
     fetchEmotionHistory: () => ({ series: [] }),
     fetchEmotionStrategyMatrix: () => ({ rows: [] }),
@@ -146,6 +147,51 @@ describe('§M-9 三态分离：后端 500 不得伪装成空态/加载态', () =
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  // E6 §DATA-RELIABILITY（2026-10-26）：行情源/数据年龄上屏；仅交易时段对 >60s 打「可能过期」。
+  it('E6 Dashboard 显示行情源与数据年龄；交易时段超龄标记、盘后不误报', async () => {
+    state.impl.fetchStatus = () => ({
+      session: 'test', signal_count: 0, in_trade_time: true,
+      quote_source: 'sina', quote_age_sec: 125, scan_stats: {},
+    })
+    const { container } = render(<MemoryRouter><Dashboard /></MemoryRouter>)
+    await waitForText(container, /行情源：sina/)
+    expect(container.textContent).toMatch(/行情源：sina · 125s 前/)
+    expect(container.textContent, '交易时段 >60s 应提示可能过期').toContain('数据可能过期')
+
+    cleanup()
+    state.impl.fetchStatus = () => ({
+      session: 'test', signal_count: 0, in_trade_time: false,
+      quote_source: 'sina', quote_age_sec: 3600, scan_stats: {},
+    })
+    const r2 = render(<MemoryRouter><Dashboard /></MemoryRouter>)
+    await waitForText(r2.container, /行情源：sina/)
+    expect(r2.container.textContent, '盘后不应对数据龄误报过期').not.toContain('数据可能过期')
+  })
+
+  // E8 §DATA-RELIABILITY：东财接口域熔断明细可见（连败/熔断中才显示）。
+  it('E8 Dashboard 显示东财熔断明细', async () => {
+    state.impl.fetchStatus = () => ({
+      session: 'test', signal_count: 0, in_trade_time: true,
+      quote_source: 'sina', quote_age_sec: 3, scan_stats: {},
+      data_source_breakers: { push2: { fail_streak: 5, open: true } },
+    })
+    const { container } = render(<MemoryRouter><Dashboard /></MemoryRouter>)
+    await waitForText(container, /数据源熔断：push2熔断中/)
+  })
+
+  // E7 §OBSERVABILITY：管理员看板显示 LLM 当日用量与前端错误计数。
+  it('E7 Dashboard 管理员显示 LLM 用量与前端错误聚合', async () => {
+    state.impl.isAdmin = () => true
+    state.impl.fetchUsage = () => ({
+      llm: { calls: 3, call_budget: 10, tokens: 120, token_budget: 1000 },
+      client_errors: { total: 2, unique: 1 },
+    })
+    const { container } = render(<MemoryRouter><Dashboard /></MemoryRouter>)
+    await waitForText(container, /LLM 今日：调用 3 \/ 10 次/)
+    expect(container.textContent).toContain('token 120 / 1000')
+    expect(container.textContent).toContain('前端错误 2 条（唯一 1）')
   })
 })
 

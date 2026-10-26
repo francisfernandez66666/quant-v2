@@ -1451,9 +1451,21 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 
 // RealOrdersForUser §P0-3 按账号返回实盘委托单；遗留全局行（user_id=”）对查询账号可见。
 // English: user-scoped live orders; legacy global rows are visible to any caller.
+// realOrderSelectColumns RealOrder 的读取列单一清单：RealOrdersForUser 与全字段回读测试共用。
+// 新增 RealOrder 字段时只改这里 + Scan，并由 TestRealOrderReadRoundTripAllFields 证明没漏。
+const realOrderSelectColumns = `order_id, signal_id, code, side, status, price, qty, created_at,
+	COALESCE(user_id,''), COALESCE(timeout_sec,0),
+	COALESCE(market_vwap,0), COALESCE(vwap_source,''), COALESCE(vwap_as_of,''),
+	COALESCE(signal_vwap_premium_pct,0)`
+
 func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
-	rows, err := d.db.Query(`SELECT order_id, signal_id, code, side, status, price, qty, created_at,
-		COALESCE(user_id,''), COALESCE(timeout_sec,0) FROM orders WHERE user_id = '' OR user_id = ?
+	// §C2-VWAP-READ（2026-10-26）：写入侧一直有 market_vwap/vwap_source/vwap_as_of/
+	// signal_vwap_premium_pct 四列，但本查询此前没 SELECT，导致订单 API 永远回空——
+	// 用户无法判断"到底是没采到 VWAP，还是采到了没显示"。
+	// 读取列收口到 realOrderSelectColumns，并由 TestRealOrderReadRoundTripAllFields 做全字段
+	// 回读——以后 RealOrder 新增字段而读侧漏接，用例当场红，不再靠人记忆。
+	rows, err := d.db.Query(`SELECT `+realOrderSelectColumns+`
+		FROM orders WHERE user_id = '' OR user_id = ?
 		ORDER BY created_at DESC, order_id DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -1462,7 +1474,8 @@ func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	var out []RealOrder
 	for rows.Next() {
 		var o RealOrder
-		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID, &o.TimeoutSec); err != nil {
+		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID, &o.TimeoutSec,
+			&o.MarketVWAP, &o.VWAPSource, &o.VWAPAsOf, &o.SignalVWAPPremiumPct); err != nil {
 			return nil, err
 		}
 		out = append(out, o)

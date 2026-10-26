@@ -1274,7 +1274,7 @@ func DefaultSchedulerConfig() SchedulerConfig {
 			// 被抢占遗留经 TaskPreempted 断点续跑。evo 开关未开时 CLI 内部 EvoOn 守卫 no-op。
 			// English: evo steps are on by default, appended after the research chain; gated by the same
 			// gate chain and resumable via TaskPreempted.
-			EvoEnabled:      true,
+			EvoEnabled: true,
 			// 多轮自动发现：默认 4 轮 = 2 变体 × top_n=2 排他。
 			// English: multi-round default 4 = 2 variants × top_n=2 exclusive reruns.
 			ResearchRounds: 4,

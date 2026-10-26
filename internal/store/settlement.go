@@ -38,9 +38,12 @@ type SettlementDiff struct {
 // through the amendment view so the realized-P&L breaker and the settlement local leg agree with
 // the discipline gates.
 func (d *DB) ListFillsByDay(userID, day string) ([]RealFill, error) {
+	// §C2-VWAP-READ（2026-10-26）：fills 表一直有 VWAP 四列，fills_effective 视图与
+	// 本查询此前都没带出来，成交列表永远看不到 VWAP/偏差。补齐读取列。
 	rows, err := d.db.Query(`SELECT id, order_id, code, side, price, qty, amount, traded_at,
 		COALESCE(signal_id,''), COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(serial,''),
-		COALESCE(trade_id,''), COALESCE(orig_side,''), COALESCE(amend_id,0)
+		COALESCE(trade_id,''), COALESCE(orig_side,''), COALESCE(amend_id,0),
+		COALESCE(market_vwap,0), COALESCE(fill_vwap_premium_pct,0), COALESCE(vwap_source,''), COALESCE(vwap_as_of,'')
 		FROM fills_effective WHERE user_id=? AND substr(traded_at,1,10)=? ORDER BY traded_at ASC`, userID, day)
 	if err != nil {
 		return nil, err
@@ -51,7 +54,8 @@ func (d *DB) ListFillsByDay(userID, day string) ([]RealFill, error) {
 		var f RealFill
 		if err := rows.Scan(&f.ID, &f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount,
 			&f.TradedAt, &f.SignalID, &f.UserID, &f.Fee, &f.StampTax, &f.Serial,
-			&f.TradeID, &f.OrigSide, &f.AmendID); err != nil {
+			&f.TradeID, &f.OrigSide, &f.AmendID,
+			&f.MarketVWAP, &f.FillVWAPPremiumPct, &f.VWAPSource, &f.VWAPAsOf); err != nil {
 			return nil, err
 		}
 		f.AmendKey = FillAmendKey(f.TradeID, f.OrderID, f.Code, f.TradedAt, f.Price, f.Qty)

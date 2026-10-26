@@ -20,6 +20,7 @@ import ThemeToggle from './components/ThemeToggle'
 import { useTheme } from './theme.js'
 import { usePolling } from './utils/usePolling.js' // §N-09 统一可见性轮询生命周期
 import { useStaleGuard } from './utils/staleGuard.js' // §N-09 轮询后到丢弃
+import { shouldShowPaperTab } from './utils/paperNav.js' // §PAPER-CFG-DESYNC 模拟盘入口可见性
 import * as api from './api/index.js'
 import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
@@ -472,15 +473,15 @@ export default function App() {
              * 表单域一：服务器地址，留空即用当前域名 */}
             <div className="form-group">
               <label>服务器地址</label>
-              <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
+              <Input name="server_url" value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
             </div>
             <div className="form-group">
               <label>账号</label>
-              <Input value={username} onChange={(v) => setUsername(v)} placeholder="输入账号" />
+              <Input name="username" value={username} onChange={(v) => setUsername(v)} placeholder="输入账号" />
             </div>
             <div className="form-group">
               <label>密码</label>
-              <Input type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码"
+              <Input name="password" type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码"
                 onEnter={handleLogin} />
             </div>
             {/*
@@ -509,7 +510,11 @@ export default function App() {
     { to: '/msgcenter', icon: <NotificationIcon size="18px" />, label: '消息', badge: alertCount },
     { to: '/positions', icon: <WalletIcon size="18px" />, label: '持仓' },
     { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' },
-    paperEnabled ? { to: '/paper', icon: <RocketIcon size="18px" />, label: '模拟盘' } : null,
+    // §PAPER-CFG-DESYNC：管理员即使模拟盘当前关闭也保留入口——启用开关在本页「⚙ 设置」内，
+    // 只按 enabled 隐藏会让关掉后无法再打开。
+    shouldShowPaperTab(paperEnabled, canAdmin)
+      ? { to: '/paper', icon: <RocketIcon size="18px" />, label: '模拟盘' }
+      : null,
     canAdmin ? { to: '/settings', icon: <SettingIcon size="18px" />, label: '设置' } : null,
     // §PERM-GATE 20260918：LLM 诊断两个主数据源均为 admin 守卫（server.go:683/692），
     // 成员常显入口进页必 403 —— 收敛为仅管理员可见。
@@ -540,19 +545,19 @@ export default function App() {
              * 表单域一：服务器地址（留空使用当前域名） */}
             <div className="form-group">
               <label>服务器地址</label>
-              <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
+              <Input name="server_url" value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
             </div>
             {/*
              * 表单域二：登录账号 */}
             <div className="form-group">
               <label>账号</label>
-              <Input value={username} onChange={(v) => setUsername(v)} placeholder="输入账号" />
+              <Input name="username" value={username} onChange={(v) => setUsername(v)} placeholder="输入账号" />
             </div>
             {/*
              * 表单域三：登录密码（支持回车直接登录） */}
             <div className="form-group">
               <label>密码</label>
-              <Input type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码" onEnter={handleLogin} />
+              <Input name="password" type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码" onEnter={handleLogin} />
             </div>
             {/*
              * 登录按钮与错误提示 */}

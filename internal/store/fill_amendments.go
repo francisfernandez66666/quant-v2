@@ -215,7 +215,12 @@ func (d *DB) migrateFillAmendments() error {
 			f.fee AS fee,
 			f.stamp_tax AS stamp_tax,
 			f.serial AS serial,
-			f.trade_id AS trade_id,
+			f.trade_id AS trade_id,` +
+			// §C2-VWAP-READ（2026-10-26）：成交 VWAP 四列随视图带出，供 ListFillsByDay/前端排障。
+			`COALESCE(f.market_vwap,0) AS market_vwap,
+			COALESCE(f.fill_vwap_premium_pct,0) AS fill_vwap_premium_pct,
+			COALESCE(f.vwap_source,'') AS vwap_source,
+			COALESCE(f.vwap_as_of,'') AS vwap_as_of,
 			a.id AS amend_id,
 			a.status AS amend_status,
 			a.reason AS amend_reason,

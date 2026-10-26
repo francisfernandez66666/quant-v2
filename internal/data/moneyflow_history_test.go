@@ -7,9 +7,12 @@
 package data
 
 import (
+	"encoding/json"
 	"math"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // emFlowHistoryLive600519 线上实抓报文（2026-10-25 抓取，600519）。只保留 data.klines。
@@ -54,12 +57,12 @@ func TestParseMoneyFlowHistoryLive(t *testing.T) {
 // English: abstention discipline — any malformed row fails the whole call.
 func TestParseMoneyFlowHistoryAbstain(t *testing.T) {
 	cases := map[string]string{
-		"空 klines":     `{"data":{"klines":[]}}`,
-		"字段短缺":        `{"data":{"klines":["2026-10-16,1,2,3"]}}`,
-		"非数字":         `{"data":{"klines":["2026-10-16,abc,2,3,4,5"]}}`,
-		"null 占位":     `{"data":{"klines":["2026-10-16,null,2,3,4,5"]}}`,
-		"空日期":         `{"data":{"klines":[",1,2,3,4,5"]}}`,
-		"坏 JSON":       `not-json`,
+		"空 klines": `{"data":{"klines":[]}}`,
+		"字段短缺":     `{"data":{"klines":["2026-10-16,1,2,3"]}}`,
+		"非数字":      `{"data":{"klines":["2026-10-16,abc,2,3,4,5"]}}`,
+		"null 占位":  `{"data":{"klines":["2026-10-16,null,2,3,4,5"]}}`,
+		"空日期":      `{"data":{"klines":[",1,2,3,4,5"]}}`,
+		"坏 JSON":   `not-json`,
 	}
 	for name, body := range cases {
 		if _, err := parseMoneyFlowHistory([]byte(body), "600519"); err == nil {
@@ -75,6 +78,40 @@ func TestParseMoneyFlowHistoryAbstain(t *testing.T) {
 
 // TestParseMoneyFlowHistoryPartialRows 行数不足请求天数（新股票/断档）是合法形态：按已有行返回。
 // English: fewer rows than requested is legal (new listing/gap) — return what exists.
+// TestFlowHistCacheSameDayOnly §DATA-RELIABILITY（2026-10-26）：本地快照只在同交易日
+// 且 2 小时内可回退；跨日/超窗必须判为不可用，绝不拿旧日数据冒充当日。
+func TestFlowHistCacheSameDayOnly(t *testing.T) {
+	dir := t.TempDir()
+	m := &MarketAPI{flowHistCacheDir: dir}
+	today := TradingDayDate(time.Now())
+	date := today[:4] + "-" + today[4:6] + "-" + today[6:]
+	days := []FlowDay{{Date: date, MainNet: 1e6}, {Date: date, MainNet: 2e6}}
+	m.saveFlowHistCache("600519", days)
+
+	got, ok := m.loadFlowHistCache("600519", 5)
+	if !ok || len(got) != 2 || got[1].MainNet != 2e6 {
+		t.Fatalf("同日快照应可回退，got ok=%v rows=%d", ok, len(got))
+	}
+
+	// 跨日：最后一行不是本交易日 → 不可用。
+	raw, _ := json.Marshal(flowHistCacheFile{SavedAt: time.Now(), Days: []FlowDay{{Date: "2000-01-01", MainNet: 1}}})
+	if err := os.WriteFile(m.flowHistCachePath("600519"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.loadFlowHistCache("600519", 5); ok {
+		t.Fatal("跨日快照不得命中")
+	}
+
+	// 超窗：同日但 3 小时前 → 不可用。
+	raw, _ = json.Marshal(flowHistCacheFile{SavedAt: time.Now().Add(-3 * time.Hour), Days: days})
+	if err := os.WriteFile(m.flowHistCachePath("600519"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.loadFlowHistCache("600519", 5); ok {
+		t.Fatal("超过 2 小时窗口的快照不得命中")
+	}
+}
+
 func TestParseMoneyFlowHistoryPartialRows(t *testing.T) {
 	days, err := parseMoneyFlowHistory([]byte(`{"data":{"klines":["2026-10-23,100,1,2,3,4"]}}`), "600519")
 	if err != nil {

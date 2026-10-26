@@ -26,11 +26,11 @@ func TestFlowBandBoundaries(t *testing.T) {
 		want  string
 	}{
 		{10, config.FlowBandStrongIn},
-		{3, config.FlowBandStrongIn},  // 恰好压在强入线 → 强入（归严）
+		{3, config.FlowBandStrongIn}, // 恰好压在强入线 → 强入（归严）
 		{2.99, config.FlowBandMildIn},
 		{1, config.FlowBandMildIn}, // 恰好压在轻入线 → 轻入
 		{0.99, config.FlowBandNeutral},
-		{0, ""},                    // 未解析 → 弃权（不是中性！）
+		{0, ""}, // 未解析 → 弃权（不是中性！）
 		{-0.5, config.FlowBandNeutral},
 		{-1, config.FlowBandMildOut}, // 恰好压在轻出线 → 轻出（归严）
 		{-2, config.FlowBandMildOut},
@@ -56,14 +56,14 @@ func TestFlowBuyFactors(t *testing.T) {
 		want5D  float64
 		wantTD  float64
 	}{
-		{"双未解析", 0, 0, 0, 0},                                   // 都弃权
-		{"5日强入", 5, 0, 1.10, 0},                                 // 当日缺 → 当日维弃权
-		{"5日强出", -5, 0, 0.70, 0},                                // 主因子惩罚档
-		{"当日轻入", 0, 1.5, 0, 1.025},                             // 辅因子独立解析
-		{"当日强入", 0, 5, 0, 1.05},                                // 当日档幅度减半（1.05 vs 5日 1.10）
-		{"双命中", 5, 5, 1.10, 1.05},                               // 两维都进合成
-		{"当日中性", 0, 0.5, 0, 1.00},                              // |ratio|<1% → 中性 1.0（合法读数，不是弃权）
-		{"当日轻出", 0, -2, 0, 0.95},                               // 当日流出惩罚轻一档
+		{"双未解析", 0, 0, 0, 0},       // 都弃权
+		{"5日强入", 5, 0, 1.10, 0},    // 当日缺 → 当日维弃权
+		{"5日强出", -5, 0, 0.70, 0},   // 主因子惩罚档
+		{"当日轻入", 0, 1.5, 0, 1.025}, // 辅因子独立解析
+		{"当日强入", 0, 5, 0, 1.05},    // 当日档幅度减半（1.05 vs 5日 1.10）
+		{"双命中", 5, 5, 1.10, 1.05},  // 两维都进合成
+		{"当日中性", 0, 0.5, 0, 1.00},  // |ratio|<1% → 中性 1.0（合法读数，不是弃权）
+		{"当日轻出", 0, -2, 0, 0.95},   // 当日流出惩罚轻一档
 	}
 	for _, c := range cases {
 		sig := combat_agent.Signal{FlowRatio5D: c.ratio5D, FlowRatioToday: c.ratioTD}

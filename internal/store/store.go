@@ -86,6 +86,14 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// §SCHEMA-VERSION（2026-10-26，旧审计 F10）：所有迁移都是幂等加列；用 PRAGMA user_version
+	// 给库一个可读版本号。旧库(0)自动抬到当前；未来版本(>current)拒绝启动，避免旧二进制
+	// 对着新 schema 静默跑。English: stamp PRAGMA user_version after idempotent migrations;
+	// refuse to open a DB written by a newer schema.
+	if err := d.ensureSchemaVersion(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// §D-5（GAP_VERIFY_20260917_PM）库文件权限 0600：trading.db/live.db 含 LLM 密钥池与 QMT token
 	// 的 KV 快照，默认 0644 在共享主机/备份外泄面过大。auth.json 0600 先例（§A3）同口径收口。
 	// -wal/-shm 旁文件同样处理（WAL 下常驻）。个别平台 chmod 不支持时静默跳过。
@@ -93,6 +101,37 @@ func Open(dbPath string) (*DB, error) {
 		_ = os.Chmod(p, 0o600)
 	}
 	return d, nil
+}
+
+// schemaVersion 当前 schema 版本（迁移全部幂等加列，版本号用于读侧自证与防旧二进制开新库）。
+// 每次新增不可逆/语义变更的迁移时递增。English: bump on incompatible/semantic migrations.
+const schemaVersion = 1
+
+// ensureSchemaVersion 读 PRAGMA user_version：旧库抬到当前；新库直接拒绝。
+func (d *DB) ensureSchemaVersion() error {
+	var cur int
+	if err := d.db.QueryRow(`PRAGMA user_version`).Scan(&cur); err != nil {
+		return fmt.Errorf("store schema version read: %w", err)
+	}
+	if cur > schemaVersion {
+		return fmt.Errorf("store schema version %d 高于本二进制支持的 %d（拒绝旧代码开新库）", cur, schemaVersion)
+	}
+	if cur == schemaVersion {
+		return nil
+	}
+	if _, err := d.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		return fmt.Errorf("store schema version set: %w", err)
+	}
+	return nil
+}
+
+// SchemaVersion 返回库当前 schema 版本（0=未标记/老库）。
+func (d *DB) SchemaVersion() int {
+	var v int
+	if err := d.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return 0
+	}
+	return v
 }
 
 // Close 关闭数据库。

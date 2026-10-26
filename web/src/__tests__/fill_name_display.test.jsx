@@ -167,7 +167,8 @@ describe('§0929FILL-NAME 成交流水名称旁证列', () => {
   // T5a：静态边界——rowKey 仍是 order_id（名称列不得变成行主键：两只股票同名即 React key 冲突）。
   it('T5a 流水表行主键仍是 order_id，未改用名称', () => {
     const src = fs.readFileSync(path.join(HERE, '..', 'pages', 'Quant.jsx'), 'utf8')
-    const m = src.match(/<Table data=\{trades\.fills\} columns=\{fillsColumns\} rowKey="([^"]+)"/)
+    // §F9 后数据源可能是 allFills（当前页+更早页去重），但行主键仍必须是 order_id。
+    const m = src.match(/<Table data=\{(?:trades\.fills|allFills)\} columns=\{fillsColumns\}[\s\S]{0,120}?rowKey="([^"]+)"/)
     expect(m, '找不到成交流水表的 rowKey 声明').not.toBeNull()
     expect(m[1]).toBe('order_id')
     // 名称列的取值只来自 fillNames 映射，不来自行对象（行对象里根本没有 name）
