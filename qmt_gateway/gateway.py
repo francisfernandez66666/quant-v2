@@ -160,6 +160,9 @@ CONTRACT_IGNORED_FIELDS = {
     "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec",
     # §DYN-SIZE-v3: audit-only marker on the order envelope; the gateway never consumes it.
     "dynamic_budget",
+    # §DYN-T（批7/W8-A）同样是"只随单留痕"的标记：日内回转的净额语义在首尔侧 risk.Gate 完成，
+    # 网关不复算也不消费。声明集必须与 golden 同步（三点契约），漏一处就是双红。
+    "intraday_t",
 }
 
 # §SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）下单方向白名单：网关接单的唯一合法取值集。

@@ -7,6 +7,7 @@ import { Card, Input, InputNumber, Button, Tag, Textarea, Dialog } from 'tdesign
 import ToggleSw from '../components/ToggleSw'
 import D1ConfigPanel from '../components/D1ConfigPanel.jsx' // §P2-H 全局 D1 事件规则面板
 import RegimeConfigPanel from '../components/RegimeConfigPanel.jsx' // §N6-RISK 风控与仓位（信号生成层）
+import MigrationSignoffCard from '../components/MigrationSignoffCard.jsx' // §DYN-SIZE v4 / §ANCHOR-FIRST 发版签字单
 import ExecutionRiskPanel from '../components/ExecutionRiskPanel.jsx' // §C1/C2/C3/C5/C6/B7 执行层风控与执行质量
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
@@ -772,6 +773,9 @@ export default function Settings() {
           一块红条噪声），所以按 api.getRole() 收口而不是让面板去猜。
           English: §P2-H — mount the global D1 panel (admin-only, same gate as the two admin routes). */}
       {d1Admin && <RegimeConfigPanel />}
+      {/* §DYN-SIZE v4 / §ANCHOR-FIRST 签字单：改的是资金参数（合成口径、目标天花板、判线基准），
+          未签字只读；与 RegimeConfigPanel 同权限（d1Admin），不是所有账号都能看见的一栏。 */}
+      {d1Admin && <MigrationSignoffCard />}
 
       {d1Admin && <ExecutionRiskPanel />}
 

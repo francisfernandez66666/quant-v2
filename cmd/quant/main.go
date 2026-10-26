@@ -196,6 +196,20 @@ func run() int {
 	log.Printf("[启动] §DYN-GLOBAL sizing 迁移完成 全局=%s 扫描=%d 迁移=%d 挂起=%d 失败=%d",
 		sizingMigration.Global, sizingMigration.Scanned, sizingMigration.Migrated,
 		len(sizingMigration.Holds), len(sizingMigration.Failures))
+	// §DYN-SIZE v4 迁移（policy_version 1→2，方案 §1.7）：只把**逐字等于旧物化默认**的两个键抬成
+	// power_mean / 1.00。这两个键曾被旧 DefaultSizingConfig 物化进账号专用键，只改代码默认值对它们
+	// 无效——owner 报的"一笔打满"里就有一条是"配置看着正常，其实是上一代的默认还在压着"。
+	//
+	// **签字门（六轮 T4-8/B8：dry-run 未签字不写盘）**：默认只算不写，报告逐账号打进日志
+	// （mode 与总仓位上限的前后值 + 目标天花板的位移）。落盘只有两条授权路径：
+	//   ① 接口 POST /api/config/sizing-v4-apply（body 带 authorize=签字 token）；
+	//   ② 部署时显式设 QUANT_SIZING_V4_APPLY=<token> 重启。
+	// 刻意不把"忘了摘掉的一个环境变量"当成授权：这条迁移改的是资金参数，误写一次就把 owner
+	// 手调过的保守档一起抬走了——那正是本批要防的形态。
+	// English: the v4 migration runs read-only at startup; writing requires the owner's signed token,
+	// either through the apply endpoint or an env var set to that exact value on purpose.
+	v4Report := cfgMgr.MigrateSizingToV4(userIDsForSizing, os.Getenv("QUANT_SIZING_V4_APPLY") == server.SignoffV4Token)
+	log.Printf("[启动] §DYN-SIZE-v4 迁移 %s（逐账号前后值见上一行；未签字时 apply=false）", v4Report.String())
 	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
 	cfgMgr.Watch(context.Background(), 60*time.Second)
 	// §0925EVE-D1 跟随改动：本行起 Watch 后台协程可能随时经 Load() 热替换全局 rules/d1

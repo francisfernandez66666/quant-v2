@@ -34,6 +34,15 @@ type Regime struct {
 	EmotionPhase string `json:"emotion_phase,omitempty"`
 	// MarketState 市场状态机结果：bull/range/bear；空串=状态机关闭（该因子弃权）。
 	MarketState string `json:"market_state,omitempty"`
+	// EmotionEnabled / MarketStateEnabled 这两个维度**本轮是否被启用**（引擎按配置装配）。
+	//
+	// 为什么必须分开：§1.4 的「关键输入缺失 → 目标封顶半仓」针对的是**该有读数的数据盲区**
+	// （情绪/状态机已开，但池子取空、探测未产出）；owner 主动关掉这两个维度时，因子弃权是**设计如此**，
+	// 若也按缺失封顶，账户会永久停在 50% 目标——把"关功能"惩罚成"看不清水位"。
+	// English: they separate a deliberate feature-off (factor abstains by design) from a real blind
+	// spot (feature on, reading absent) — the latter is what caps the target at 0.50.
+	EmotionEnabled     bool `json:"emotion_enabled,omitempty"`
+	MarketStateEnabled bool `json:"market_state_enabled,omitempty"`
 	// MaxPosPct 状态机建议最大仓位比例（0=未启用）。**不参与定权连乘**（已由 MarketState 档位覆盖，
 	// 二次相乘属"同一风险双罚"，违反方案 §5 测试锁）；仅作 shadow 读数与既有 auto 谨慎层消费。
 	MaxPosPct float64 `json:"max_pos_pct,omitempty"`

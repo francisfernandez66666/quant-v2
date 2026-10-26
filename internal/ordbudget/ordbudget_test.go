@@ -1,6 +1,6 @@
 // ordbudget_test.go — 共享买入预算纯函数边界锁（v3 §9.1）。
 //
-// 覆盖：正常预算、行业/单票减额、1 手地板、地板不得突破额度、行业未知兜底、
+// 覆盖：正常预算、行业/单票减额、目标仓位剩余空间、1 手地板、地板不得突破额度、行业未知兜底、
 // 现金压缩与费用缓冲、参数不可得、整手向下取整。
 //
 // English: boundary locks for the shared buy-budget pure function — normal sizing, industry/stock
@@ -191,6 +191,52 @@ func TestComputeDisabledCaps(t *testing.T) {
 	}
 	if res.IndustryRoom != 0 || res.StockRoom != 0 {
 		t.Fatalf("未启用额度的 Room 应保持 0，got %+v", res)
+	}
+}
+
+// TestComputeTargetRoom 目标仓位剩余空间：与行业/单票同口径取 min；为 0 必须跳过。
+func TestComputeTargetRoom(t *testing.T) {
+	// 基础：raw=82000，目标只剩 5000 → 买 500 股。
+	in := baseInput()
+	in.TargetRoom, in.TargetRoomSet = 5000, true
+	res := Compute(in)
+	if res.Qty != 500 || res.CappedBy != "target" || res.TargetRoom != 5000 {
+		t.Fatalf("应按目标空间 5000 买 500 股，got %+v", res)
+	}
+
+	// 剩余空间为 0：有效读数，必须跳过并给出可读原因。
+	in2 := baseInput()
+	in2.TargetRoom, in2.TargetRoomSet = 0, true
+	res2 := Compute(in2)
+	if res2.Qty != 0 || res2.SkipReason != "已达动态目标仓位" {
+		t.Fatalf("目标空间为 0 应跳过，got %+v", res2)
+	}
+
+	// 剩余空间不足 1 手（500 元 < 1000）：跳过。
+	in3 := baseInput()
+	in3.TargetRoom, in3.TargetRoomSet = 500, true
+	res3 := Compute(in3)
+	if res3.Qty != 0 || res3.SkipReason != "已达动态目标仓位" {
+		t.Fatalf("目标空间不足 1 手应跳过，got %+v", res3)
+	}
+
+	// 1 手地板不得突破目标空间。
+	in4 := baseInput()
+	in4.Base, in4.Scale = 1000, 0.1 // raw=100 → 抬到 1 手 1000
+	in4.IndustryCapPct, in4.SingleStockCapPct = 0, 0
+	in4.TargetRoom, in4.TargetRoomSet = 500, true
+	res4 := Compute(in4)
+	if res4.Qty != 0 || res4.SkipReason != "已达动态目标仓位" {
+		t.Fatalf("1 手地板不得突破目标空间，got %+v", res4)
+	}
+
+	// 未启用 TargetRoomSet：不得把零值当成「没空间」。
+	in5 := baseInput()
+	in5.IndustryCapPct, in5.SingleStockCapPct = 0, 0
+	in5.Base, in5.Scale = 100000, 0.5
+	res5 := Compute(in5)
+	if res5.Qty != 5000 || res5.CappedBy != "dynamic" {
+		t.Fatalf("未启用目标空间时应按动态预算，got %+v", res5)
 	}
 }
 

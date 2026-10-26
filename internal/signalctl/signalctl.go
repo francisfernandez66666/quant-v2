@@ -89,6 +89,14 @@ type Decision struct {
 	// 执行层金额 = 基准金额 × BuyScale。1.0 不写（omitempty 不省 1.0，故显式只在 !=1 时赋值）。
 	// English: §DYN-SIZE applied buy scale (written only when non-trivial); amount = base × BuyScale.
 	BuyScale float64 `json:"buy_scale,omitempty"`
+	// MarketScale / StockScale §DYN-SIZE v4（方案 §1.4）：定权层的**拆分读数**，由执行层消费。
+	// 为什么要在 Decision 上带出来而不是让执行层自己再算一次：定权与执行必须用同一个数，
+	// 否则"目标仓位按 A 算、单笔金额按 B 算"会让账本无法解释；而且执行层重算会二次触发行情读数。
+	// MissingKeyInput 同理由：数据盲区必须一路传到执行层，让 T 层也能据此关闭（§1.5）。
+	// English: the split reading travels on the decision so sizing and execution share one number.
+	MarketScale     float64 `json:"market_scale,omitempty"`
+	StockScale      float64 `json:"stock_scale,omitempty"`
+	MissingKeyInput bool    `json:"missing_key_input,omitempty"`
 	// SizingReasons §DYN-SIZE 命中的定权/加权因子（买入侧"情绪相位×0.50"这类；卖出侧
 	// 卖出加权的触发条件"风险档=Red"这类），供前端 tooltip 与复盘。
 	// English: the sizing / sell-boost factors that fired, for the UI tooltip and post-trade review.
@@ -469,6 +477,9 @@ func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Polic
 		d.BuyScale = res.Scale
 		d.SizingReasons = res.Reasons
 	}
+	// §DYN-SIZE v4：拆分读数**无条件带出**（哪怕 Scale 恰好 1.0）——执行层的目标仓位与单笔基准
+	// 各自消费 MS/SS，用不到 BuyScale 的那条路径同样必须拿得到它们。
+	d.MarketScale, d.StockScale, d.MissingKeyInput = res.MarketScale, res.StockScale, res.MissingKeyInput
 	return false
 }
 

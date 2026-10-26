@@ -558,6 +558,8 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		CurrentPrice:  req.CurrentPrice,
 		PrevClose:     req.PrevClose,
 		DynamicBudget: req.DynamicBudget,
+		// §DYN-T 批 7：做 T 标记必须透传给风控（漏装＝集中度按全额拦 T 买腿，灰度账号稍集中就永远开不了 T）。
+		IntradayT: req.IntradayT,
 	}
 	if v := c.gate.CheckLiveOrder(cfg, lo); !v.Pass {
 		return nil, fmt.Errorf("%s", v.Reason)
@@ -603,6 +605,14 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		VWAPAsOf:             req.VWAPAsOf,
 		SignalVWAPPremiumPct: req.SignalVWAPPremiumPct,
 		TimeoutSec:           req.TimeoutSec,
+		// §DYN-T 批 8 补齐：日内回转腿的标志必须**随占位行落库**，不只是给风控看。
+		// 漏在这里的后果不是审计缺一列那么轻：引擎的目标仓位模型读 `PendingBuy.intraday_t`
+		// 来把"排队未成交的 T 买腿"从战略在途里剔出去（CurStrat），落库缺这一位
+		// 就等于让日内低吸永久按战略建仓计价——目标空间被吃掉，下一笔战略买入被误拦。
+		// 风控侧（risk.checkConcentration）早就吃得到这个标志（W8-A），所以这个洞只红在读侧。
+		// English: the T flag must land in the placeholder row too, or the target-position model
+		// keeps counting a queued T leg as a strategic entry.
+		IntradayT: req.IntradayT,
 	})
 	if err != nil {
 		return nil, err

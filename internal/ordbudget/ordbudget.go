@@ -4,16 +4,16 @@
 //
 //	raw       = Base × Scale
 //	if raw < OneLot: raw = OneLot
-//	room      = min(raw, 行业剩余额度, 单票剩余额度)
+//	room      = min(raw, 目标仓位剩余空间, 行业剩余额度, 单票剩余额度)
 //	if room < OneLot: 跳过
 //	qty       = floor(room / Price / Lot) × Lot
 //	qty       = min(qty, 现金可负担整手)
 //
 // 关键纪律：
-//   - 1 手地板不能突破 35% 额度；额度不足 1 手就跳过；
+//   - 1 手地板不能突破任何额度（含目标仓位剩余空间）；额度不足 1 手就跳过；
 //   - 行业未知时禁用行业额度，但单票额度始终参与；
 //   - 所有金额向下取整到整手；
-//   - 纯函数、无 IO，调用方负责把在途委托计入 IndustryValue/StockValue。
+//   - 纯函数、无 IO，调用方负责把在途委托计入 TargetRoom/IndustryValue/StockValue。
 //
 // English: shared pure buy-budget calculator for live and paper. Dynamic sizing is the sole
 // budget authority; 35% industry/single-stock rooms shrink the order instead of rejecting it,
@@ -58,6 +58,16 @@ type Inputs struct {
 	IndustryKnown bool
 	// FeeBufferPct 现金费用缓冲百分数（实盘 0.6）；<=0 表示不预留。
 	FeeBufferPct float64
+	// TargetRoom 目标仓位剩余空间（元）：动态仓位的「目标总仓位 − 当前仓位（含在途）」。
+	// 与行业/单票额度同口径参与取 min，防止一笔新单把账户从半仓直接推向满仓。
+	// English: remaining room under the dynamic target position (target − current, incl. pending);
+	// min()'d with the industry/stock rooms like any other budget cap.
+	TargetRoom float64
+	// TargetRoomSet 是否启用 TargetRoom。单独用布尔位是因为「剩余空间恰为 0」是必须跳过的
+	// 有效读数，不能与「未启用」的零值混淆。
+	// English: enables TargetRoom; a bool is required because an exact zero is a valid
+	// "no room left, skip" reading and must not collide with the disabled zero value.
+	TargetRoomSet bool
 }
 
 // Result 预算结果。
@@ -71,13 +81,15 @@ type Result struct {
 	IndustryRoom float64
 	// StockRoom 单票剩余额度（未启用为 0）。
 	StockRoom float64
+	// TargetRoom 目标仓位剩余空间（未启用为 0）。
+	TargetRoom float64
 	// Budget 最终预算（= Notional）。
 	Budget float64
 	// Qty 最终整手股数。
 	Qty int
 	// Notional 最终成交额（Qty×Price）。
 	Notional float64
-	// CappedBy 最终约束来源：dynamic / one_lot_floor / industry / stock / cash / none。
+	// CappedBy 最终约束来源：dynamic / one_lot_floor / industry / stock / target / cash / none。
 	CappedBy string
 	// SkipReason 非空表示不下单（额度不足1手/现金不足/参数不可得）。
 	SkipReason string
@@ -135,6 +147,21 @@ func Compute(in Inputs) Result {
 			capped = "stock"
 		}
 	}
+	// 目标仓位剩余空间：动态仓位把 Scale 当目标总仓位后，本单最多只能吃到「目标 − 当前」。
+	// 与行业/单票同口径只减额不拒买；剩余空间为 0 是有效读数，必须跳过而不是当作未启用。
+	// English: the dynamic target room — with Scale as the target exposure, one order may only
+	// consume (target − current). Shrinks like the other rooms; an exact zero is a valid skip.
+	if in.TargetRoomSet {
+		room := in.TargetRoom
+		if room < 0 {
+			room = 0
+		}
+		res.TargetRoom = room
+		if room < budget {
+			budget = room
+			capped = "target"
+		}
+	}
 
 	// 额度不足 1 手 → 跳过：1 手地板只是抬升 raw 的手段，绝不允许反噬 35% 额度。
 	// English: below one lot the buy is skipped — the one-lot floor may raise raw but can never
@@ -142,7 +169,13 @@ func Compute(in Inputs) Result {
 	if budget+moneyEpsilon < oneLot {
 		res.Budget = budget
 		res.CappedBy = capped
-		res.SkipReason = "额度不足1手"
+		// 目标空间不足 1 手时给出可读原因；否则沿用额度不足文案。
+		// English: a target-room shortfall gets its own reason so "already at target" is visible.
+		if capped == "target" {
+			res.SkipReason = "已达动态目标仓位"
+		} else {
+			res.SkipReason = "额度不足1手"
+		}
 		return res
 	}
 

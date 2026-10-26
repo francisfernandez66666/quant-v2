@@ -149,10 +149,19 @@ type Engine struct {
 	// 确保 friends 共享引擎的实盘账本/QMT 控制器默认归属创建者/管理员，而非首个普通成员。
 	// English: P1-4 admin predicate (wired from main's auth.IsAdmin) — primaryMember prefers an admin.
 	isAdminFn    func(userID string) bool
-	accountsRoot string          // §GAP2-W2 <dataDir>/accounts 根（私有文件按账号寻址）
-	cfgMgr       *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
-	longEnabled  bool            // 利好开关（做多分支）
-	shortEnabled bool            // 利空开关（做空分支）
+	accountsRoot string // §GAP2-W2 <dataDir>/accounts 根（私有文件按账号寻址）
+	// tLiveReg §DYN-T 实盘日内回转账本注册表（按账号懒建，文件落 <dataDir>/accounts/<uid>/t_rounds_live.json）。
+	// 目标仓位模型必须能问出"哪些敞口是 T 腿"，所以它比 T 编排本身更早接入执行链（批 2）。
+	tLiveReg *tLiveRegistry
+	// tSignals §DYN-T 买入信号消费账本（候选 B 的新鲜度来源 + 一次性消费，§8.4.3）。
+	tSignals *tSignalLedger
+	// tMinuteCache 分时均线的分钟链校验腿缓存（60s TTL，按代码）。
+	tMinuteCache *tMinuteCache
+	// tSellVerdicts 该码最近一次活跃卖出/退出裁决的时刻（反 T 否决门用，5 分钟内有效）。
+	tSellVerdicts map[string]time.Time
+	cfgMgr        *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
+	longEnabled   bool            // 利好开关（做多分支）
+	shortEnabled  bool            // 利空开关（做空分支）
 
 	m8PeakTotal float64 // §GAP1.2 实盘组合市值峰值（M8 回撤兜底基线；e.mu 保护，平仓后归零重计）
 
@@ -649,6 +658,11 @@ func New(
 	}
 	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
 	e := &Engine{
+		// §DYN-T 三件 T 专用状态在构造期就建好：账本缺位时日内回转必须"不开腿"而不是"少一道校验"，
+		// 靠 nil 兜底会让某条路径静默失去候选 B 判定（最危险的失败模式是"看起来在跑，其实没数"）。
+		tSignals:          newTSigLedger(),
+		tMinuteCache:      newTMinuteCache(),
+		tSellVerdicts:     map[string]time.Time{},
 		marketAPI:         marketAPI,
 		newsAgent:         newsAgent,
 		strategy:          strategy,
@@ -1374,7 +1388,7 @@ func (e *Engine) IgnoreSignal(code, strategy string) int {
 // English: the no-sizing entry point (equivalent to autoPlaceScaled(…, 0, false)); kept so the
 // existing execution-layer tests stay untouched. The only production caller is dispatchLive.
 func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockInfo) {
-	e.autoPlaceScaled(sig, live, 0, false)
+	e.autoPlaceScaled(sig, live, 0, false, dynBudgetCtx{})
 }
 
 // atrRiskBudgetQty §C3 由账户权益与 ATR 止损距离倒推股数。
@@ -1426,7 +1440,53 @@ func (e *Engine) atrRiskBudgetQty(sig combat_agent.Signal, price, riskPct float6
 // English: v3 live dynamic budget — total assets × scale, then capped by 35% industry/stock rooms
 // (including pending buys) and cash. Missing equity abstains; an insufficient room skips instead
 // of forcing one lot through the cap.
-func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64, sizingCfg config.SizingConfig, ctrl *trading.Controller) int {
+// dynBudgetCtx 定权层带给执行层的拆分读数（§DYN-SIZE v4 / 方案 §1.4）。
+//
+// 为什么单独造一个类型而不是多传两个 float：这三个数必须**成组**出现——只带 MS 不带 SS
+// 会让单笔金额按市场组算、目标按另一套算；带全零则执行层显式回落到旧的 buyScale 口径
+// （老调用点与单测仍在用旧签名，回落路径要可辨识，不能装作有拆分）。
+// English: the split reading passed from sizing into execution as one unit; all-zero means the
+// caller stayed on the legacy blended buyScale.
+type dynBudgetCtx struct {
+	MarketScale float64
+	StockScale  float64
+	// MissingKeyInput 数据盲区标志（目标封顶半仓，且日内 T 层整体关闭，§1.5）。
+	MissingKeyInput bool
+}
+
+// hasSplit 是否带了有效拆分读数。
+func (c dynBudgetCtx) hasSplit() bool { return c.MarketScale > 0 && c.StockScale > 0 }
+
+// shadowTargetRatio 影子期的目标仓位读数基准（固定 50%）。
+// 影子模式的定义是"只留痕不执法"，但留痕必须有个可比较的目标值；用真实 MS 会让影子与正式
+// 同一份日志无法区分"缩到一半"还是"按因子缩"。owner 方案 §1.5 定的是 0.50。
+const shadowTargetRatio = 0.50
+
+// tLiveFor 返回该账号当日的实盘 T 账本；accountsRoot 未注入（无数据目录）时返回 nil，
+// 调用方按"无 T 腿"处理——这只在纯内存/单测环境出现，生产恒有目录。
+func (e *Engine) tLiveFor(uid string) *tLiveStore {
+	if uid == "" {
+		uid = e.primaryMember()
+	}
+	e.mu.RLock()
+	rg, root := e.tLiveReg, e.accountsRoot
+	e.mu.RUnlock()
+	if rg != nil {
+		return rg.get(uid)
+	}
+	if root == "" {
+		return nil
+	}
+	e.mu.Lock()
+	if e.tLiveReg == nil {
+		e.tLiveReg = newTLiveRegistry(root)
+	}
+	rg = e.tLiveReg
+	e.mu.Unlock()
+	return rg.get(uid)
+}
+
+func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64, sizingCfg config.SizingConfig, ctrl *trading.Controller, ctx dynBudgetCtx) int {
 	e.mu.RLock()
 	st := e.realStore
 	uid := e.userID
@@ -1481,8 +1541,16 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	}
 
 	// 聚合当前市值：持仓 + 在途买单（已报全额/部成未成交余量）。
-	stockVal := map[string]float64{}
+	// §DYN-SIZE v4 新增两条纪律（方案 §1.5）：
+	// ① **fail-closed**：持仓读不到、或有持仓定价不了 → 本轮直接不开仓。旧实现 `err == nil`
+	//    静默跳过等于把"读不到"当成"没有仓位"，目标剩余空间被高估——这正是"半仓之上一笔打满"
+	//    的另一半根因（前一半天目标是把 Scale 当预算倍数）。
+	// ② T 腿**不计入战略当前仓位**（CurStrat），但**全额计入行业/单票额度市值**：
+	//    前者防止一笔日内低吸吃掉战略剩余空间，后者防止 T 腿变成"更便宜的资金来源"（§8.4.6）。
+	stockVal := map[string]float64{} // 集中度口径的当前市值（含 T 腿，一行都不许少）
 	indVal := map[string]float64{}
+	var stratVal, tBuyVal, tSellVal, frozenCash float64 // 战略仓位 / 正T买腿 / 反T卖腿 / 冻结回购款
+	curUnknown := false                                 // 有仓位读不到定价 → 本轮 fail-closed
 	e.mu.RLock()
 	industryFn := e.industryFn
 	e.mu.RUnlock()
@@ -1495,49 +1563,133 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		}
 		return strings.TrimSpace(mkt.GetStockIndustry(pureTsCode(code)))
 	}
-	if poses, err := st.RealPositionsForUser(uid); err == nil {
-		for _, p := range poses {
-			if p.Qty <= 0 {
-				continue
-			}
-			px := p.CurPrice
-			if px <= 0 {
-				px = p.CostPrice
-			}
-			if px <= 0 {
-				continue
-			}
-			code := pureTsCode(p.TsCode)
-			v := px * float64(p.Qty)
-			stockVal[code] += v
-			if ind := industryOf(code); ind != "" {
-				indVal[ind] += v
-			}
+	poses, err := st.RealPositionsForUser(uid)
+	if err != nil {
+		log.Printf("[qmt] %s §DYN-TARGET 跳过：持仓读取失败（fail-closed，不把读不到当成空仓）：%v", sig.Code, err)
+		opslog.DayOnce("dyntarget-posread:"+sig.Code, func() {
+			opslog.Logf("quant", "§DYN-TARGET 持仓读取失败跳过 %s 原因=%v", sig.Code, err)
+		})
+		return 0
+	}
+	posPrices := map[string]float64{} // 供 T 腿按同一轮行情折市值（与底仓同源，不另取快照）
+	for _, p := range poses {
+		if p.Qty <= 0 {
+			continue
+		}
+		px := p.CurPrice
+		if px <= 0 {
+			px = p.CostPrice
+		}
+		if px <= 0 {
+			// 定价不可得的持仓**计入未知**而不是跳过：跳过会让 CurStrat 偏低、Room 偏高，
+			// 方向是"更敢买"，正是本批要关掉的那类缺陷。
+			curUnknown = true
+			continue
+		}
+		code := pureTsCode(p.TsCode)
+		v := px * float64(p.Qty)
+		stockVal[code] += v
+		posPrices[code] = px
+		if ind := industryOf(code); ind != "" {
+			indVal[ind] += v
 		}
 	}
-	if pend, err := st.PendingBuys(uid, data.TradingDayDate(time.Now())); err == nil {
-		for _, pb := range pend {
-			code := pureTsCode(pb.Code)
-			v := pb.Price * float64(pb.Remain)
-			stockVal[code] += v
-			if ind := industryOf(code); ind != "" {
-				indVal[ind] += v
-			}
+	pend, err := st.PendingBuys(uid, data.TradingDayDate(time.Now()))
+	if err != nil {
+		log.Printf("[qmt] %s §DYN-TARGET 跳过：在途买单读取失败（连续信号会穿透目标）：%v", sig.Code, err)
+		opslog.DayOnce("dyntarget-pendread:"+sig.Code, func() {
+			opslog.Logf("quant", "§DYN-TARGET 在途买单读取失败跳过 %s 原因=%v", sig.Code, err)
+		})
+		return 0
+	}
+	for _, pb := range pend {
+		code := pureTsCode(pb.Code)
+		v := pb.Price * float64(pb.Remain)
+		stockVal[code] += v // 集中度口径：T 腿同样占用行业/单票额度，不放行
+		if ind := industryOf(code); ind != "" {
+			indVal[ind] += v
 		}
+		if pb.IntradayT {
+			tBuyVal += v // 战略口径：正 T 买腿（在途）不是战略建仓
+			continue
+		}
+		stratVal += v
+	}
+	// 已成交的 T 腿从回转账本取：买腿要减、卖腿（欠着买回）要加回，冻结款要留出。
+	if book := e.tLiveFor(uid).bookValue(posPrices); book.OpenCount > 0 {
+		tBuyVal += book.BuyLegValue
+		tSellVal += book.SellLegValue
+		frozenCash += book.FrozenCash
+	}
+	if curUnknown {
+		log.Printf("[qmt] %s §DYN-TARGET 跳过：有持仓无法定价（fail-closed）总资产=%.0f", sig.Code, total)
+		opslog.DayOnce("dyntarget-posprice:"+sig.Code, func() {
+			opslog.Logf("quant", "§DYN-TARGET 持仓缺价跳过 %s 总资产=%.0f", sig.Code, total)
+		})
+		return 0
 	}
 
 	targetInd := industryOf(sig.Code)
-	// 缩放：影子/未开启时中性 1.0；否则用信号控制器算好的 BuyScale（0=未定权也按中性）。
+
+	// ── §DYN-SIZE v4：目标仓位层（方案 §1.4）────────────────────────────────────────
+	// 把"市场组决定目标总仓位、个股组决定这一笔大小"分开算，是本批的核心修复：
+	// 旧模型里 Scale 既当预算倍数又混着个股因子，中性 1.0 时一笔可吃掉半个账户。
+	// 逐信号重算 Regime（纯函数 + 3s 缓存读数）：目标只作上限不作下限，读数漂移方向偏保守。
+	// 拆分读数由定权层（Decision）带下来，执行层**不重算定权**：
+	// 一是保证"目标仓位按什么算"与"这一笔按什么算"是同一份数，二是装配 Regime 会触发行情读数，
+	// 每个信号一次等于在下单路径上打外网。ctx 缺省（老调用点/单测）时回落控制器给的 buyScale。
+	marketScale, stockScale := ctx.MarketScale, ctx.StockScale
+	if marketScale <= 0 {
+		marketScale = 1.0
+	}
+	if stockScale <= 0 {
+		stockScale = 1.0
+	}
+	// 单笔基准仓位：总资产 × per_trade_position_pct × (MarketScale × StockScale)。
+	perTradePct := sizingCfg.PerTradePositionPct
+	if perTradePct <= 0 || perTradePct > 1 {
+		perTradePct = 0.10 // 与出厂默认同值；越界（把 10% 写成 10）按默认，不让它放大成单笔满仓
+	}
+	ceiling := sizingCfg.MaxTotalPositionPct
+	if ceiling <= 0 || ceiling > 1 {
+		ceiling = 1.0 // 天花板语义：>1 是配置手滑，钳到 1.0（总资产上限）
+	}
+	targetRatio := marketScale
+	if targetRatio > ceiling {
+		targetRatio = ceiling
+	}
+	curStrat := stratVal - tBuyVal + tSellVal
+	if curStrat < 0 {
+		curStrat = 0 // 全是 T 腿的极端态里战略仓位为负无意义，按 0 处理（Room 由目标决定）
+	}
+	targetVal := total * targetRatio
+	room := targetVal - curStrat
+	if room < 0 {
+		room = 0
+	}
+	// 缩放：影子/未开启时中性 1.0；否则用 MarketScale×StockScale（定权未跑时回落控制器给的 buyScale）。
 	scale := 1.0
-	if sizingCfg.EnabledOn() && !sizingCfg.ShadowOn() && buyScale > 0 {
-		scale = buyScale
+	if sizingCfg.EnabledOn() && !sizingCfg.ShadowOn() {
+		if ctx.hasSplit() {
+			scale = marketScale * stockScale
+		} else if buyScale > 0 {
+			scale = buyScale
+		}
+	}
+	// 影子期**只留痕不收紧**：这里算出"会按多少目标执行"并打日志，但不把 TargetRoom 交给预算层。
+	// （owner 的 §1.5 是"影子期按 50% 读数"，不是"影子期改变真实下单"；把观察期当执法会误伤回滚路径。）
+	targetRoomSet := sizingCfg.EnabledOn() && !sizingCfg.ShadowOn()
+	shadowRatio := shadowTargetRatio
+	antiCash := cash - frozenCash // 反 T 冻结回购款是专款，战略买入不得动用（§8.3 纪律 3）
+	if antiCash < 0 {
+		antiCash = 0
 	}
 	res := ordbudget.Compute(ordbudget.Inputs{
 		Base:              total,
 		CapEquity:         total,
-		Scale:             scale,
+		Scale:             perTradePct * scale,
 		Price:             price,
-		Cash:              cash,
+		Cash:              antiCash,
 		Lot:               ordbudget.DefaultLot,
 		IndustryCapPct:    indCap,
 		SingleStockCapPct: stockCap,
@@ -1545,7 +1697,16 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		StockValue:        stockVal[pureTsCode(sig.Code)],
 		IndustryKnown:     targetInd != "",
 		FeeBufferPct:      0.6,
+		TargetRoom:        room,
+		TargetRoomSet:     targetRoomSet,
 	})
+	// §DYN-TARGET 留痕：目标/当前/剩余/拆分缩放一次打全，事后能否解释"为什么只买了这些"全靠这行。
+	log.Printf("[qmt] %s(%s) §DYN-TARGET 总资产=%.0f MS=%.3f SS=%.3f 缩放=%.3f 目标=%.0f(占比%.3f 天花板%.2f) 战略当前=%.0f 正T买腿=%.0f 反T卖腿=%.0f 剩余=%.0f 单笔基准=%.2f 影子目标占比=%.2f 缺失关键输入=%v",
+		sig.Code, sig.Name, total, marketScale, stockScale, scale, targetVal, targetRatio, ceiling,
+		stratVal, tBuyVal, tSellVal, room, perTradePct, shadowRatio, ctx.MissingKeyInput)
+	if !targetRoomSet && sizingCfg.ShadowOn() {
+		log.Printf("[qmt] %s(%s) §DYN-TARGET 影子期读数：目标=%.0f 剩余=%.0f（不收紧，仅留痕）", sig.Code, sig.Name, targetVal, room)
+	}
 	if res.SkipReason != "" {
 		log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 跳过：%s（总资产=%.0f 缩放=%.3f 行业=%q 行业额度=%.0f 单票额度=%.0f 现金=%.0f）",
 			sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash)
@@ -1570,7 +1731,7 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 // sizingOn：动态定权总开关是否开启——用于让内联 Yellow 缩放让位（防同一风险双乘）。
 // English: §DYN-SIZE execution entry with the controller's buy scale (0 = not sized; 1.0 = neutral)
 // and the master switch, so the legacy inline Yellow scaling can yield to it (no double penalty).
-func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.StockInfo, buyScale float64, sizingOn bool, budgetCfg ...config.SizingConfig) {
+func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.StockInfo, buyScale float64, sizingOn bool, ctx dynBudgetCtx, budgetCfg ...config.SizingConfig) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
 	e.mu.RUnlock()
@@ -1659,7 +1820,6 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	}
 	vwapSource, vwapAsOf := "", ""
 	priceType := cfg.PriceType
-	entryTimeout := 0
 	signalPrice := sig.Price
 	if signalPrice <= 0 {
 		signalPrice = price
@@ -1668,28 +1828,54 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	if vwapOK {
 		vwapSource = "quote"
 		vwapAsOf = time.Now().Format(time.RFC3339)
+		// 信号价口径的溢价**只作留痕**（落库列 signal_vwap_premium_pct 的既有语义）；
+		// 执法判定已下移到下面那段"委托价口径"，否则会出现"信号价合规、挂单价却高出 8%"的空闸。
 		premium = (signalPrice - vwap) / vwap * 100
-		if cfg.MaxSignalVWAPPremiumPct > 0 && premium > cfg.MaxSignalVWAPPremiumPct {
+	}
+	// ── §C2-VWAP-PRICE（2026-10-26 方案 C，owner 报的实盘第二条 bug）──────────────────
+	// 旧实现的软回踩把委托价锚在 `VWAP×(1−entry_pullback_pct%)`，与现价的距离＝回踩幅度＋当前溢价
+	// （生产参数下最大约 8%），且硬闸用**信号价**判定，拦不住"已经涨上去了还挂回踩"——
+	// 截图里 14:06–14:10 那一排「已撤」就是这么来的：单子根本不可能成交。
+	// 现在：① 委托价＝现价 + 1 个最小变动价位（0.01 元，保成交优先）；
+	// ② 硬闸改用**委托价**判偏离，超过 VWAP+阈值就不追高；
+	// ③ `entry_pullback_pct` 保留解析但**不再影响报价**（标废弃，配置面同步显示），
+	//    将来若要恢复回踩，必须同时加 `data.IsContinuousTrade` 时段门与让价上限（方案 §3.2）。
+	if cfg.EntryPullbackPct > 0 {
+		log.Printf("[qmt] %s(%s) §C2 软回踩已废弃（entry_pullback_pct=%.2f 不再影响报价），按现价+1tick 挂单",
+			sig.Code, sig.Name, cfg.EntryPullbackPct)
+		opslog.DayOnce("vwap-pullback-deprecated:"+sig.Code, func() {
+			opslog.Logf("quant", "§C2 软回踩配置仍为 %.2f%% 但本批起不再生效（方案C）%s(%s) 策略=%s/%s",
+				cfg.EntryPullbackPct, sig.Code, sig.Name, sig.StrategyID, sig.Strategy)
+		})
+	}
+	// A 股最小变动价位统一按 0.01 元；ETF/REITs 是 0.001，本系统自动买入只做个股，
+	// 这里刻意不做分品种 tick 表：多一张表就多一处会写错的地方，而写错的后果是**报价低于现价**。
+	const minTick = 0.01
+	orderPrice := math.Round((price+minTick)*100) / 100
+	if orderPrice <= 0 {
+		orderPrice = price
+	}
+	if vwapOK {
+		// 硬闸判定价：委托价（不是信号价、不是现价）——"我实际挂出去多少钱"才是会被成交的价格。
+		orderPremium := (orderPrice - vwap) / vwap * 100
+		if cfg.MaxSignalVWAPPremiumPct > 0 && orderPremium > cfg.MaxSignalVWAPPremiumPct {
 			shadow := cfg.VWAPPremiumShadowOn()
-			log.Printf("[qmt] %s(%s) §C2 信号价高于VWAP %.2f%% > 阈值 %.2f%% shadow=%v", sig.Code, sig.Name, premium, cfg.MaxSignalVWAPPremiumPct, shadow)
-			opslog.DayOnce("vwap-premium:"+sig.Code, func() {
-				opslog.Logf("quant", "§C2 VWAP硬过滤 %s(%s) 信号价=%.2f VWAP=%.3f 偏离=%.2f%% 阈值=%.2f%% shadow=%v",
-					sig.Code, sig.Name, signalPrice, vwap, premium, cfg.MaxSignalVWAPPremiumPct, shadow)
+			log.Printf("[qmt] %s(%s) §C2 委托价高于VWAP %.2f%% > 阈值 %.2f%%（现价=%.2f 委托=%.2f VWAP=%.3f）shadow=%v → 不追高跳过",
+				sig.Code, sig.Name, orderPremium, cfg.MaxSignalVWAPPremiumPct, price, orderPrice, vwap, shadow)
+			opslog.DayOnce("vwap-orderpremium:"+sig.Code, func() {
+				opslog.Logf("quant", "§C2 VWAP硬闸(委托价口径) %s(%s) 现价=%.2f 委托=%.2f VWAP=%.3f 偏离=%.2f%% 阈值=%.2f%% shadow=%v 策略=%s/%s",
+					sig.Code, sig.Name, price, orderPrice, vwap, orderPremium, cfg.MaxSignalVWAPPremiumPct, shadow, sig.StrategyID, sig.Strategy)
 			})
 			if !shadow {
 				return
 			}
 		}
-		if cfg.EntryPullbackPct > 0 {
-			if limit := vwap * (1 - cfg.EntryPullbackPct/100); limit > 0 && price > limit {
-				log.Printf("[qmt] %s(%s) §C2 软回踩限价 %.2f→%.2f（VWAP %.3f 回踩 %.2f%%）", sig.Code, sig.Name, price, limit, vwap, cfg.EntryPullbackPct)
-				price = limit
-				priceType = "limit"
-				// §C2 回踩单按单超时（0=沿用全局 cancel_stale_sec）。
-				entryTimeout = cfg.EntryTimeoutSec
-			}
-		}
 	}
+	// ⚠ 只把**委托价**换成现价+1tick，`price` 保持"本轮估值现价"：
+	// 股数折算、最低成交额闸、现金降档、预算留痕全都按现价口径（与模拟盘/回测同尺），
+	// 若顺手把 price 一起改掉，一笔 1 万元的预算会被 10.01 元反算成 900 股（少买一整手）。
+	entryPrice := orderPrice
+	priceType = "limit"
 	// §GAP1.5 涨停封板拒买（与模拟盘 paper.LimitUpPct 同款分板块守卫）：
 	// 封板股买单现实中几乎无法排队成交，auto 模式直接报单只会买在炸板瞬间或制造虚假成交。
 	// English: §GAP1.5 sealed-board buy guard (same board-aware rule as the paper book) — a buy order
@@ -1783,7 +1969,7 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	}
 	qty := 0
 	if dynamicBudget {
-		qty = e.dynamicBuyQty(sig, price, buyScale, sizingCfg, ctrl)
+		qty = e.dynamicBuyQty(sig, price, buyScale, sizingCfg, ctrl, ctx)
 		if qty <= 0 {
 			// 具体原因在 dynamicBuyQty 内已按 DayOnce 留痕；这里只结束本单。
 			return
@@ -1916,9 +2102,9 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		StrategyType: sig.StrategyType,
 		Side:         trading.SideBuy,
 		PriceType:    priceType,
-		Price:        price,
+		Price:        entryPrice, // 方案 C：现价 + 1 个最小变动价位（保成交优先）
 		Qty:          qty,
-		Amount:       float64(qty) * price,
+		Amount:       float64(qty) * entryPrice,
 		CreatedAt:    time.Now().Format(time.RFC3339),
 		StalenessMs:  e.quoteStalenessMs(sig.Code),
 		// §C2 下单时点 VWAP 与信号价偏差（缺失保持 0/空）。
@@ -1926,7 +2112,9 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		VWAPSource:           vwapSource,
 		VWAPAsOf:             vwapAsOf,
 		SignalVWAPPremiumPct: premium,
-		TimeoutSec:           entryTimeout,
+		// TimeoutSec 只服务软回踩单（按单超时撤挂单）；方案 C 之后不再有回踩单，
+		// 字段与 orders.timeout_sec 列保留（回滚即恢复），此处恒 0=沿用全局 cancel_stale_sec。
+		TimeoutSec: 0,
 		// §DYN-SIZE-v3：标记本单由动态预算生成，让旧数量/每日/行业拒买闸让位。
 		DynamicBudget: dynamicBudget,
 	}
@@ -1958,6 +2146,9 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	if buyCh != nil {
 		select {
 		case buyCh <- buyTask{req: req, sig: sig}:
+			// §DYN-T 排队即视为该信号已被战略侧花掉：不在此记账的话，worker 异步成交前
+			// 同一条信号会被日内 T 腿当作"未消费的新信号"再买一次（同一判断买两次）。
+			e.tMarkStrategicConsumed(sig.ID)
 			// §AUDIT-PM 2026-09-15 队列深度量规：崩溃丢单的观测面（深度逼近容量即预警风暴）。
 			// §M11（2026-09-22 修复批）推翻旧口径「重启后同 signal_id 自愈重发、不做持久化」——
 			// 自愈依赖战法当日重新翻转，重启后条件变化即不再翻转发单；排队单现随停机排空落盘
@@ -2014,6 +2205,11 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 	// §DAILY_OPSLOG auto 实际下单结果（受理/业务拒单由 controller 侧另记，此处补策略上下文）
 	opslog.Logf("quant", "auto 下单 %s(%s) 策略=%s/%s qty=%d price=%.2f → ok=%v order=%s err=%s",
 		sig.Code, sig.Name, req.StrategyID, req.Strategy, req.Qty, req.Price, res.OK, res.OrderID, res.Err)
+	// §DYN-T 一次性消费：这笔战略买入真的花掉了该信号 ⇒ 记进消费账，T 腿不得再用同一判断买第二次
+	// （反方向由 tMarkTConsumed 覆盖：T 先买过时，战略侧在同一信号上也不得再加买）。
+	if res.OK {
+		e.tMarkStrategicConsumed(sig.ID)
+	}
 }
 
 // buyRejectDelay §BUY-REJECT-BACKOFF 退避档位：连续第 streak 次拒单后的冷却窗——
@@ -5815,6 +6011,12 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 		MaxPosPct:      e.lastMaxPosPct,
 		RiskTier:       e.lastRiskTier,
 		BreadthUpRatio: e.lastUpRatio,
+		// §DYN-SIZE v4（§1.4 关键输入缺失判定）：把"这一维是 owner 关掉的"与"这一维该有读数却没拿到"
+		// 分开告诉 signalctl——只有后者才把目标仓位封顶半仓，否则关掉状态机就等于永久半仓。
+		// English: distinguishes a deliberately disabled dimension from a blind spot; only the latter
+		// caps the target position at 0.50.
+		EmotionEnabled:     e.emotionConfigured(),
+		MarketStateEnabled: e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState }),
 		// §N6-RISK：Red 硬拦只由应急开关触发；默认走 tier_scales.Red 权重收束。
 		RedBlockNewBuy: e.combatAgent != nil && e.combatAgent.RedBlockNewBuyOn(),
 	}
@@ -6027,6 +6229,20 @@ func (e *Engine) disciplineStopLossPct(uid string) float64 {
 		}
 	}
 	return config.DefaultDisciplineConfig().StopLossPct
+}
+
+// disciplineTakeProfitPct 该账号的纪律止盈幅度%（反 T 否决门要算"现价距止盈线多远"）。
+// 与 disciplineStopLossPct 同一套回落：读不到配置就用出厂默认，绝不返回 0 让否决门形同虚设。
+func (e *Engine) disciplineTakeProfitPct(uid string) float64 {
+	e.mu.RLock()
+	cm := e.cfgMgr
+	e.mu.RUnlock()
+	if cm != nil {
+		if rules := cm.GetRulesFor(uid); rules != nil && rules.Paper.Discipline.TakeProfitPct > 0 {
+			return rules.Paper.Discipline.TakeProfitPct
+		}
+	}
+	return config.DefaultDisciplineConfig().TakeProfitPct
 }
 
 // sizingConfigFor 取该账号的定权配置（WithDefaults 补齐）；无配置管理器 → 出厂默认。

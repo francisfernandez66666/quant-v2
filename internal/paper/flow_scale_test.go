@@ -39,6 +39,10 @@ func flowBuySignal(code string, sizeScale float64) combat_agent.Signal {
 func flowFillQty(t *testing.T, cfg Config, sizeScale float64) int {
 	t.Helper()
 	e := New(cfg, "")
+	// §DYN-SIZE v4：出厂单笔基准 10%（1000 股上限），那样"scale 乘在基数上"与"35% 额度截断"
+	// 两条约束会同时看不出差别。这里把基准临时放大到 100%，让本文件原有的 scale 敏感性对照继续有效
+	// ——锁的靶心是"scale 有没有落到执行层"，不是"基准是多少"（基准本身由 §1.4 的用例锁）。
+	e.SetSizingContext(1.0, 1.0, 1.0, false)
 	e.SetStrategyPools([]string{"dragon"}) // OnSignals 按战法池入账：不设池则无池可买
 	quotes := map[string]*data.StockInfo{"600000.SH": {Code: "600000.SH", Price: 10, ChangePct: 1}}
 	e.OnSignals([]combat_agent.Signal{flowBuySignal("600000.SH", sizeScale)}, quotes)

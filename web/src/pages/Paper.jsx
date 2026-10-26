@@ -19,6 +19,7 @@ import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢
 import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按腿记账（共用台账）
 import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
 import MinuteView from '../components/MinuteView.jsx'
+import TRoundsCard from '../components/TRoundsCard.jsx' // §DYN-T 日内回转：做 T 收益独立口径 + 被拦分布
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
 
@@ -1306,6 +1307,10 @@ export default function Paper() {
           </Card>
         </Tabs.TabPanel>
       </Tabs>
+
+      {/* §DYN-T 日内回转（做 T）卡：收益独立口径 + 当日被拦分布，纸面/实盘两本账分栏。
+          刻意放在三张表之后、弹窗之前：它自带一次独立取数，不参与本页的轮询刷新链。 */}
+      <TRoundsCard />
 
       {/* 移动端：持仓行操作菜单 */}
       <Dialog visible={!!sheetPos} header={sheetPos ? sheetPos.code + ' ' + sheetPos.name : ''} onClose={() => setSheetPos(null)} footer={null}>

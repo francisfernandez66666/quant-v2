@@ -1085,3 +1085,88 @@ func TestGateBuyDisciplineSubGate2bFailClosed(t *testing.T) {
 		t.Fatalf("复位后应放行, got %+v", v)
 	}
 }
+
+// TestGateConcentrationIntradayNet §DYN-T（批 7/W8-A）正 T 买腿的集中度净额两态 + 可卖量复核。
+//
+// 三条断言缺一不可，因为它们各自挡一种"看起来对"的坏实现：
+//
+//	① 打了 T 标、可卖量覆盖得住配平量 ⇒ 按净额放行。不这么做的话，灰度账号只要持仓稍集中
+//	   就永远开不了 T——那是把风控闸用错口径（日内回转当日就回到原仓位，不是加仓）。
+//	② 同样参数但**没打 T 标** ⇒ 必须仍然拒。这条是①的反证：如果实现写成"额度内一律放行"，
+//	   ①也过、②也"过"，就等于给所有买单发了免检票。
+//	③ 打了 T 标但可卖量覆盖不住（当日买入被 T+1 锁住 / 底仓已被别的裁决卖掉）⇒ 必须按全额拒。
+//	   标志是编排层给的意图，不是事实；复核不过就不给净额待遇（宁可误拦一次回转，
+//	   也不让一笔事实上会加仓的买单借"做 T"名义绕过集中度）。
+//
+// English: the buy-first T leg is netted only with a proven sellable base; the same order without
+// the flag still fails, and the flag never overrides a failed sellable re-check.
+func TestGateConcentrationIntradayNet(t *testing.T) {
+	db := gateDB(t)
+	g := NewGate(db, "u_g", nil)
+	cfg := qmtCfg()
+	cfg.RiskGate.SingleStockValuePct = 20
+	if err := db.UpsertRealAccount(store.RealAccount{
+		UserID: "u_g", AvailableCash: 100000,
+		UpdatedAt: cntime.In(time.Now()).Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("account: %v", err)
+	}
+	// 底仓 1800 股 @10 = 1.8 万；总资产 = 现金 10 万 + 持仓 1.8 万 = 11.8 万，
+	// 集中度上限 20% = 2.36 万 ⇒ 已有市值单独看没超限，加上本笔 1.8 万才超限。
+	// 这个配比是这条锁的要点：差额必须**完全由标志决定**，不能靠额度巧合放行。
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{
+		TsCode: "600000.SH", Name: "浦发", Qty: 1800, CostPrice: 10, CurPrice: 10,
+		Amount: 18000, UserID: "u_g", AnchorPrice: 10, AnchorSource: store.AnchorSourceFirstBuyOrder,
+	}}); err != nil {
+		t.Fatalf("positions: %v", err)
+	}
+	// 当日买入 300 股（T+1 锁定）：持仓变 2100、当日买入 300 ⇒ 可卖量仍是 1800，
+	// 恰好覆盖本笔 1800 股——**这一步必须是"够"**，否则①拒单的原因就变成复核而不是额度，
+	// 那条断言会假绿（本项目最恨的一种绿：结论对、理由是错的）。
+	if err := db.ApplyRealFill(store.RealFill{
+		OrderID: "GW-T0", Code: "600000.SH", Side: "买入", Price: 10, Qty: 300, Amount: 3000,
+		TradedAt: cntime.In(time.Now()).Format("2006-01-02") + "T09:31:00+08:00", UserID: "u_g",
+	}); err != nil {
+		t.Fatalf("today buy fill: %v", err)
+	}
+	day := cntime.In(time.Now()).Format("2006-01-02")
+	if got := db.TodayBoughtQty("u_g", "600000.SH", day); got != 300 {
+		t.Fatalf("夹具前提不成立：当日买入量应 300，got %d", got)
+	}
+
+	o := liveOrder(SideBuy)
+	o.DynamicBudget = true
+	o.Amount = 18000
+	o.Qty = 1800
+	o.IntradayT = true
+
+	// ① 净额放行：可卖量 2100-300=1800 ≥ 本笔 1800 ⇒ 集中度只看已有市值（2.1 万 < 2.36 万）。
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("可卖量覆盖得住的正 T 买腿应按净额放行, got %+v", v)
+	}
+
+	// ② 同参数去掉标志 ⇒ 必须仍然拒（2.1 万 + 1.8 万 = 3.9 万 > 2.36 万）。
+	// 这条是①的反证：写成"额度内一律放行"的话，①②会一起变绿。
+	plain := o
+	plain.IntradayT = false
+	if v := g.CheckLiveOrder(cfg, plain); v.Pass || v.Gate != "concentration" {
+		t.Fatalf("非 T 买单不得享受净额待遇, got %+v", v)
+	}
+
+	// ③ 读数漂移 ⇒ 复核不过，按全额计。形态取真实会出现的那一种：柜台快照回拉
+	// （持仓 1800 而当日买入仍记 300 ⇒ 可卖 1500 < 本笔 1800）。
+	// 为什么必须造这一态而不是"删掉底仓"：底仓没了这笔单根本不叫回转，
+	// 而"标志在、配平量却卖不出来"才是复核存在的唯一理由——它必须是**唯一**变化的那一维。
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{
+		TsCode: "600000.SH", Name: "浦发", Qty: 1800, CostPrice: 10, CurPrice: 10,
+		Amount: 18000, UserID: "u_g", AnchorPrice: 10, AnchorSource: store.AnchorSourceFirstBuyOrder,
+	}}); err != nil {
+		t.Fatalf("drift positions: %v", err)
+	}
+	if got := db.TodayBoughtQty("u_g", "600000.SH", day); got != 300 {
+		t.Fatalf("漂移夹具不成立：当日买入应仍为 300（否则可卖量没被压缩），got %d", got)
+	}
+	if v := g.CheckLiveOrder(cfg, o); v.Pass || v.Gate != "concentration" {
+		t.Fatalf("可卖量复核不过时必须按全额计（宁可误拦一次回转，也不放一笔真加仓借 T 名义过关），got %+v", v)
+	}
+}

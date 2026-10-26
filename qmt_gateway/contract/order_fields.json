@@ -1,16 +1,17 @@
 {
   "source": "internal/trading/executor.go OrderRequest",
-  "updated": "2026-09-18",
+  "updated": "2026-10-27",
   "fields": [
     "signal_id", "code", "name", "strategy", "strategy_id", "strategy_type",
     "side", "price_type", "price", "qty", "amount", "created_at",
     "staleness_ms", "prev_close", "current_price",
     "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec",
-    "dynamic_budget"
+    "dynamic_budget",
+    "intraday_t"
   ],
   "consumed_by_gateway": [
     "signal_id", "code", "side", "price_type", "price", "qty",
     "amount", "created_at", "strategy_type", "strategy"
   ],
-  "ignored_by_gateway": ["name", "strategy_id", "staleness_ms", "prev_close", "current_price", "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec", "dynamic_budget"]
+  "ignored_by_gateway": ["name", "strategy_id", "staleness_ms", "prev_close", "current_price", "market_vwap", "vwap_source", "vwap_as_of", "signal_vwap_premium_pct", "timeout_sec", "dynamic_budget", "intraday_t"]
 }

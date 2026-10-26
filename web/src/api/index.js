@@ -1979,6 +1979,57 @@ export async function fetchAnchorShadow(days = 20) {
   return request(`/api/anchor-shadow?days=${encodeURIComponent(days)}`)
 }
 
+// §DYN-T 日内回转（做 T）只读面，两张账本分开取：
+//   · GET /api/paper/t-rounds —— 纸面账本（走引擎，含"拦在哪一步"的分布，那只在内存里）；
+//   · GET /api/t-live/rounds  —— 实盘账本（读账号私有文件，state 有 ok/missing/corrupt 三态）。
+// 「做 T 收益」是独立口径（六轮 T6-5）：pnl.net/gross 只统计 done 轮，任何总收益卡片都不许把它加进去。
+// English: read-only §DYN-T endpoints; T P&L is standalone and must not fold into total return.
+/** 获取纸面做 T 回转（只读） */
+export async function fetchPaperTRounds(params = {}) {
+  const q = new URLSearchParams()
+  if (params.day) q.set('day', String(params.day))
+  if (params.limit) q.set('limit', String(params.limit))
+  // 查询串与路径写在同一段模板字面量里（`?${…}`）：§115 的契约台账按「? 之前才是路径」派生，
+  // 拆成 `'/api/paper/t-rounds' + suffix` 两段会被读成 `/api/paper/t-rounds*`，
+  // 于是「前端拨了、服务端没注册」的幽灵调用判红——台账与代码分家的形态。
+  return request(`/api/paper/t-rounds?${q.toString()}`)
+}
+
+/** 获取实盘做 T 回转账本（只读，admin） */
+export async function fetchLiveTRounds(params = {}) {
+  const q = new URLSearchParams()
+  if (params.day) q.set('day', String(params.day))
+  if (params.limit) q.set('limit', String(params.limit))
+  // 同上：路径与查询串同段，保证 §115 派生出的就是注册串本身。
+  return request(`/api/t-live/rounds?${q.toString()}`)
+}
+
+// §DYN-SIZE v4 / §ANCHOR-FIRST 签字面（六轮 T4-8/B8：dry-run 未签字不写盘）。
+// 两个 GET 永远只读、可反复查；两个 POST 必须带 authorize=签字 token 才写资金参数。
+// token 的唯一真源在后端（internal/server/signoff_api.go 的 v4SignoffToken），前端只从
+// 报告里读回来再原样提交——写死一份字面量就会出现"页面显示已签字、后端认的是另一个词"。
+// English: the sign-off surface. The token is echoed by the report and sent back verbatim;
+// the frontend never hardcodes a second copy of it.
+/** 获取 v4 仓位配置迁移的 dry-run 报告（admin，只读） */
+export async function fetchSizingV4Plan() {
+  return request('/api/config/sizing-v4-plan')
+}
+
+/** 按报告签字并落盘 v4 迁移（admin，写资金参数） */
+export async function applySizingV4Migration(authorize) {
+  return request('/api/config/sizing-v4-apply', { method: 'POST', data: { authorize } })
+}
+
+/** 获取存量锚点回填的 dry-run 计划（admin，只读） */
+export async function fetchAnchorBackfillPlan() {
+  return request('/api/paper/anchor-backfill-plan')
+}
+
+/** 按报告签字并落盘锚点回填（admin，写判线基准） */
+export async function applyAnchorBackfill(authorize) {
+  return request('/api/paper/anchor-backfill', { method: 'POST', data: { authorize } })
+}
+
 // §OBSERVABILITY：运行用量看板（LLM 当日调用/token、数据源健康、前端错误聚合）。
 // 对应 GET /api/usage（admin）。
 /** 获取运行用量看板 */

@@ -177,6 +177,16 @@ type Position struct {
 	// English: when the anchor was stamped (same instant as the opening fill); zero alongside
 	// AnchorPrice==0 means "not backfilled".
 	AnchorAt time.Time `json:"anchor_at,omitempty"`
+	// AnchorSource §DYN-T（方案 §1.6a，六轮前的四轮 T4-6 定口径）锚点是从哪来的：
+	//   first_lot         层账里最早那一批的含费买入价（＝真正的首买价，最可信）
+	//   first_buy_order   买入历史（实盘 orders/fills）里最早一笔成交单价
+	//   cost_fallback     只有摊薄成本可读（存量无层账、又查不到买入历史）
+	//   none              什么价都拿不到，AnchorPrice 保持 0
+	// 为什么必须留来源而不只留价格：**`cost_fallback` 的票不许开 T 腿**——那个数可能被历史加仓
+	// 甚至被 T 腿摊薄过，把它当"最初那笔"会让回填悄悄把摊薄成本请回风控基准（正是本批要修的缺陷）。
+	// English: provenance of the anchor; cost_fallback/none rows are barred from opening T legs because a
+	// diluted cost must never be passed off as the first buy price.
+	AnchorSource string `json:"anchor_source,omitempty"`
 	// Lots §T1-PARTIAL（2026-10-24 裁决三）批次层账：同一交易日买到的股数合成一批。
 	// 它只回答"这批哪天买的 ⇒ 今天可卖多少"，不改任何价格口径（结算仍按 CostPrice 摊薄、
 	// 风险线仍按 AnchorPrice 冻结）。空层账＝本批之前落盘的存量持仓 ⇒ 退回旧的整仓二值判定。
@@ -574,11 +584,29 @@ type Engine struct {
 	// (fill stream) and orders (order lifecycle) because it answers a third question: whether two fills
 	// belong to the same round and what spread was locked.
 	tRounds []TRound
+	// tCfgWarnDay §8.8 配置自洽告警（min_spread 与振幅门打架）的每日一次去重。刻意与下面的
+	// tWarnDay 分开：两把闸在同一个启动日各自都可能要出声，共用一个 latch 会让先响的那条把后响的吞掉。
+	tCfgWarnDay string
 	// tWarnDay 做 T 被预算口径挡下时的每日一次告警去重（与 budgetWarnDay 同口径，但独立计数：
 	// 两者解除条件不同——预算半开态改配置就消失，做 T 禁用还要看 Q5 的口径）。
 	// English: once-per-day dedup for the "T blocked by budget pipeline" log, tracked separately from
 	// budgetWarnDay because the two clear under different conditions.
 	tWarnDay string
+	// tBlockDay / tBlock §DYN-T 被拦计数（按"哪一步拦的"归一，方案 §8.9）。
+	// 为什么必须有：灰度期最贵的不是少做了几轮，而是**不知道为什么会少做**——
+	// 只写"没做 T"的日志，两周后没人能判断是门槛过严还是行情不给振幅。
+	// 每条留痕按 (step, code) 每日去重打印，计数则每次累加，供接口/面板汇总。
+	// English: per-step block counters with a once-per-day line per (step, code), so "why no T round"
+	// is answerable from data instead of from memory.
+	tBlockDay string
+	tBlock    map[string]int
+	// tBlockLogged 留痕去重表（每个 (step,code) 每天只打一行），与计数分开：
+	// 计数要"每次都加"，日志不能每 5 秒刷一行。
+	tBlockLogged map[string]bool
+	// sizingCtx §DYN-SIZE v4：engine 每轮注入的定权上下文（市场缩放、单笔基准、天花板、盲区标志）。
+	// 为什么不进 Config：Config 是会落盘的账号规则，而 MS 是**本轮行情算出来的数**，
+	// 落盘就等于把某一时刻的市场读数固化成长期配置。
+	sizingCtx paperSizingCtx
 	// nowFn 做 T 的时钟缝（nil ⇒ time.Now）。存在的理由只有一个：`RunIntradayT` 内部取"现在"
 	// 判断是否已到 14:50 尾盘强制配平线，取真实时间会让**全部正 T 用例在 14:50 之后必然变红**
 	// （force=true 直接跳过开腿）——白天绿、晚上红的测试等于没有测试。生产路径永远留 nil。
@@ -1209,9 +1237,11 @@ func (e *Engine) load() {
 	// English: W3 legacy anchor backfill runs right after the positions are restored. It belongs here and
 	// not in a startup migration because paper books are lazily loaded per account — a startup hook would
 	// miss every book first touched after boot.
-	if filled, skipped := e.backfillAnchorsLocked(); filled > 0 {
-		log.Printf("[paper] §ANCHOR-FIRST W3 锚点回填已落盘 %s：回填%d 跳过%d", e.path, filled, skipped)
-		e.persist()
+	// §DYN-T 口径收紧：加载时只回填**层账可证的首买价**；成本回落档必须走 owner 签字后的
+	// BackfillAnchors（见 anchor_backfill.go 头注），否则"打开账本"就等于把摊薄成本写成锚点。
+	if filled, skipped := e.BackfillAnchorsOnLoad(); filled > 0 || skipped > 0 {
+		log.Printf("[paper] §DYN-T 加载期锚点回填 %s：首买价回填%d 无价可回填%d（成本档须走签字回填）",
+			e.path, filled, skipped)
 	}
 	e.backfillPoolPerfLocked()
 	e.trimTradesLocked()
@@ -1710,12 +1740,49 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 	if stockCap > 100 {
 		stockCap = 100
 	}
+	// §DYN-SIZE v4：模拟盘与实盘同一套目标口径（方案 §1.4）。
+	//	目标 Tgt = 池权益 × min(MS, 天花板)；战略当前 = 池持仓市值 − 正T买腿 + 反T卖腿
+	//	剩余 Room = max(0, Tgt − 战略当前)；本单再与单笔基准、行业/单票额度、池现金取小。
+	// 逐票的个股因子只进 scale（sizeScale），**不进目标**：否则同一轮里 A 票质量高能抬全池目标。
+	poolHold := base - cash // 池权益 − 池现金 ＝该池持仓市值（与 poolEquityLocked 同源，不另取快照）
+	if poolHold < 0 {
+		poolHold = 0
+	}
+	curStrat := poolHold - e.tOpenBuyValueLocked() + e.tOpenSellValueLocked()
+	if curStrat < 0 {
+		curStrat = 0
+	}
+	ms := e.sizingCtx.MarketScale
+	ceiling := e.sizingCtx.Ceiling
+	if ceiling <= 0 || ceiling > 1 {
+		ceiling = 1.0
+	}
+	targetRatio := ms
+	if targetRatio > ceiling {
+		targetRatio = ceiling
+	}
+	room := base*targetRatio - curStrat
+	if room < 0 {
+		room = 0
+	}
+	perTradePct := e.sizingCtx.PerTradePct
+	if perTradePct <= 0 || perTradePct > 1 {
+		perTradePct = 0.10 // 与出厂默认同值；>1 是把 10% 写成 10 的手滑，钳回默认而不是放大成满池
+	}
+	// 影子期 / 关键输入缺失 / engine 未注入 MS ⇒ **不收紧**（只留痕）：观察期不是执法期，
+	// 未注入时保持 v3 行为可回归（老测试与纯内存账本走这条路）。
+	roomSet := e.cfg.SizingEnabled && !e.cfg.SizingShadow && !e.sizingCtx.MissingKey && ms > 0
+	// 反 T 冻结回购款是专款，战略买入不得动用（§8.3 纪律 3）。
+	avail := cash - e.tFrozenCashLocked()
+	if avail < 0 {
+		avail = 0
+	}
 	res := ordbudget.Compute(ordbudget.Inputs{
 		Base:              base,
 		CapEquity:         capEq,
-		Scale:             scale,
+		Scale:             perTradePct * scale,
 		Price:             price,
-		Cash:              cash,
+		Cash:              avail,
 		Lot:               ordbudget.DefaultLot,
 		IndustryCapPct:    indCap,
 		SingleStockCapPct: stockCap,
@@ -1723,11 +1790,52 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 		StockValue:        stockVal,
 		IndustryKnown:     ind != "",
 		FeeBufferPct:      0,
+		TargetRoom:        room,
+		TargetRoomSet:     roomSet,
 	})
 	if res.SkipReason != "" {
 		return 0, res.SkipReason
 	}
 	return res.Qty, ""
+}
+
+// paperSizingCtx engine 每轮注入的定权上下文（见 Engine.sizingCtx）。
+type paperSizingCtx struct {
+	MarketScale float64 // 市场组读数（目标仓位与 T 额度由它派生）；0=未注入
+	PerTradePct float64 // 单笔基准仓位（占池权益）
+	Ceiling     float64 // 目标仓位天花板（默认 1.00）
+	MissingKey  bool    // 关键市场读数缺失（目标封顶半仓、日内 T 关闭）
+}
+
+// SetSizingContext 注入本轮定权上下文（engine 的纸面通道每轮调用）。
+// 刻意不持久化：它描述的是"这一轮的市场"，不是"用户的配置"。
+func (e *Engine) SetSizingContext(ms, perTradePct, ceiling float64, missingKey bool) {
+	e.mu.Lock()
+	e.sizingCtx = paperSizingCtx{MarketScale: ms, PerTradePct: perTradePct, Ceiling: ceiling, MissingKey: missingKey}
+	e.mu.Unlock()
+}
+
+// PositionPoolAndMark 返回该持仓的战法池键与当前估值价（供 T 的"转战略/回补"走战略预算通道）。
+// 池键直接用 StrategyType：poolEquityLocked 就是按它归池的，另造一套映射必然漂移。
+func (e *Engine) PositionPoolAndMark(code string) (poolKey string, price float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p := e.positions[code]
+	if p == nil {
+		return "", 0
+	}
+	return p.StrategyType, e.markPriceLocked(p)
+}
+
+// StrategicBuyRoom 战略闸门在模拟盘的读数：这只票此刻还能按战略口径买多少股（0＝没有空间）。
+// 做 T 的两处都要走它（§8.5.3）：正 T 转战略加仓、反 T 尾盘回补——"转战略"不是一次改状态，
+// 而是一次真实的战略下单提案，必须吃同一套单笔/目标/行业单票帽。
+// English: the strategic room a T leg may consume; conversion is a real order proposal, never a
+// status flip that sidesteps the caps.
+func (e *Engine) StrategicBuyRoom(poolKey, code string, price float64) (int, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.dynamicPaperQtyLocked(poolKey, code, price, 1.0)
 }
 
 // fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
@@ -1878,8 +1986,9 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		FilledAt:     now,
 		Mark:         price,
 		// §ANCHOR-FIRST 建仓即冻结的锚点：与当刻 CostPrice 同值（含费），此后没有任何路径改写它。
-		AnchorPrice: totalCost / float64(qty),
-		AnchorAt:    now,
+		AnchorPrice:  totalCost / float64(qty),
+		AnchorSource: anchorSourceFirstLot, // §DYN-T 建仓即首买价，来源可证（回填只处理 AnchorPrice=0 的存量行）
+		AnchorAt:     now,
 		// §T1-PARTIAL 建仓即建层账：一笔建仓 = 一批，含费每股成本与锚点同源。
 		Lots: []PositionLot{{Qty: qty, Price: totalCost / float64(qty), FilledAt: now}},
 		// §C2 VWAP 偏差：只在采集到时计算；缺失保持 0。

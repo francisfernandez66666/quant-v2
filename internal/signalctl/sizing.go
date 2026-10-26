@@ -39,15 +39,44 @@ const (
 // SizingResult 动态仓位合成结果。
 //
 //   - Scale：建议缩放系数（基准态恒 1.0；已 clamp 到 [Floor, Cap]）；
+//   - MarketScale：市场组因子 + 账户级上限 → 决定**目标总仓位**与 T 仓额度（§DYN-SIZE v4 §1.4）。
+//     它刻意不含任何个股因子：账户级的「目标仓位」必须是一个逐票不漂移的数，
+//     否则同一轮里 A 票质量高就能把全账户的目标抬起来，日内 T 池也无从定义。
+//   - StockScale：个股组因子 → **只决定这一笔的大小**，不参与目标仓位；
+//   - MissingKeyInput：关键市场读数（市场状态 / 情绪相位 / 大盘指数）任一弃权。
+//     弃权因子不进合成 ⇒ 连乘结果偏向 1.0，而新模型里 1.0＝目标满仓 —— 数据盲区会比熊市（0.15）更激进。
+//     因此这条命中时 MarketScale 封顶 0.50（owner 2026-10-26：「关键指标缺失时默认半仓」）。
 //   - Downgrade：true=命中硬拦因子，调用方应把买入信号降级为 hold（不执行）；
 //   - Reasons：命中的因子与取值（留痕/前端 tooltip）。
 //
-// English: the synthesis result — Scale (clamped, 1.0 in the baseline), Downgrade (a hard-block
-// factor fired → the caller should hold), and the fired-factor reasons for the audit trail.
+// English: the synthesis result — the legacy Scale (clamped, 1.0 in the baseline) plus the v4 split:
+// MarketScale (market factors + account caps → target total position and the T quota), StockScale
+// (stock factors → this trade's size only) and MissingKeyInput (any key market reading abstained →
+// target capped at 0.50, because abstentions would otherwise lean the product toward 1.0 = full).
 type SizingResult struct {
-	Scale     float64  `json:"scale"`
-	Downgrade bool     `json:"downgrade,omitempty"`
-	Reasons   []string `json:"reasons,omitempty"`
+	Scale           float64  `json:"scale"`
+	MarketScale     float64  `json:"market_scale,omitempty"`
+	StockScale      float64  `json:"stock_scale,omitempty"`
+	MissingKeyInput bool     `json:"missing_key_input,omitempty"`
+	Downgrade       bool     `json:"downgrade,omitempty"`
+	Reasons         []string `json:"reasons,omitempty"`
+}
+
+// BuyScale 单笔金额缩放（新模型口径）＝ MarketScale × StockScale。
+//
+// 为什么不用 Scale：Scale 在 power_mean 模式下是「组间幂平均」，把市场和个股两件事折成一个数，
+// 无法回答「这只票差所以少买」与「市场差所以总仓位低」的区别；新仓位模型必须分开相乘。
+// 代价（如实登记）：power_mean 模式下 MS×SS 比组间幂平均更严 ⇒ 单笔更小（安全侧），
+// 而目标仓位用 MS（幂平均后的市场组值），符合 owner「按因子综合决定」的裁决方向。
+//
+// English: per-trade scale in the v4 model = MarketScale × StockScale; Scale stays a blended number
+// (power-mean across groups in v3 mode) and can neither define an account-level target nor keep the
+// per-stock effect separate.
+func (s SizingResult) BuyScale() float64 {
+	if s.MarketScale <= 0 || s.StockScale <= 0 {
+		return s.Scale // 兜底：调用方拿到的是未拆分的老结果
+	}
+	return s.MarketScale * s.StockScale
 }
 
 // ComputeSizing §DYN-SIZE 主入口：对一条买入信号算动态仓位缩放。
@@ -64,7 +93,10 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 
 	// 1. 硬拦因子：命中即降级（不进连乘，避免"既降级又缩额"的双重惩罚）。
 	if down, why := sizingHardBlock(r, sig, cfg); down {
-		return SizingResult{Scale: cfg.Floor, Downgrade: true, Reasons: []string{why}}
+		// 硬拦时目标仓位仍要给一个可读数：MarketScale 取地板（这笔不买，但账户级 T 池要能算），
+		// StockScale 取中性 1.0（个股维度未参与）。
+		return SizingResult{Scale: cfg.Floor, MarketScale: cfg.Floor, StockScale: 1.0,
+			Downgrade: true, Reasons: []string{why}}
 	}
 
 	// §DYN-SIZE-v3：分组幂平均口径。旧 product 路径原样保留在下方，供回滚与逐字回归。
@@ -75,46 +107,59 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 	}
 
 	// 2. 权重/倾向类：乘性连乘 Π（弃权因子直接跳过）。
+	// 同时按组分别求值（§1.4 拆分）：`w` 保持与改造前**逐字一致**的连乘顺序与理由文案，
+	// pm/ps 只用于导出 MarketScale / StockScale，不参与 Scale 的计算。
 	w := 1.0
+	pm, ps := 1.0, 1.0
 	var reasons []string
-	mul := func(name string, v float64) {
+	mul := func(name string, v float64, market bool) {
 		if v <= 0 {
 			return // 弃权
 		}
 		w *= v
+		if market {
+			pm *= v
+		} else {
+			ps *= v
+		}
 		if v != 1.0 {
 			reasons = append(reasons, fmt.Sprintf("%s×%.2f", name, v))
 		}
 	}
-	mul("信号质量", qualityFactor(sig))
-	mul("信号强度", kellyFactor(sig.Confidence, cfg))
-	mul("个股波动率", volFactor(sig, cfg))
-	mul("情绪相位", emotionFactor(r.EmotionPhase, cfg))
-	mul("市场状态", stateFactor(r, cfg))
-	mul("风险档", tierFactor(r.RiskTier, cfg))
-	mul("宏观影响期", macroWindowFactor(r, cfg))
-	mul("宏观前瞻", macroLeadFactor(r, cfg))
-	mul("节前", holidayFactor(r.Holiday, cfg))
-	mul("大盘跌幅", indexFactor(r.IndexChangePct, cfg))
-	mul("LLM利空", llmFactor(sig, cfg))
-	mul("广度", breadthFactor(r.BreadthUpRatio, cfg))
+	// 组归属：市场组＝情绪/状态/风险档/宏观期/宏观前瞻/节前/大盘跌幅/广度（"今天这种行情该持多少"）；
+	// 个股组＝质量/强度/波动/LLM/净流入（"这只票该买多少"）。分组是 §1.4 的根：
+	// 只有市场组能决定目标仓位，个股因子不得逐票拖动账户级读数。
+	mul("信号质量", qualityFactor(sig), false)
+	mul("信号强度", kellyFactor(sig.Confidence, cfg), false)
+	mul("个股波动率", volFactor(sig, cfg), false)
+	mul("情绪相位", emotionFactor(r.EmotionPhase, cfg), true)
+	mul("市场状态", stateFactor(r, cfg), true)
+	mul("风险档", tierFactor(r.RiskTier, cfg), true)
+	mul("宏观影响期", macroWindowFactor(r, cfg), true)
+	mul("宏观前瞻", macroLeadFactor(r, cfg), true)
+	mul("节前", holidayFactor(r.Holiday, cfg), true)
+	mul("大盘跌幅", indexFactor(r.IndexChangePct, cfg), true)
+	mul("LLM利空", llmFactor(sig, cfg), false)
+	mul("广度", breadthFactor(r.BreadthUpRatio, cfg), true)
 	// §FLOW-FACTOR：5 日净流入（主）+ 当日净流入（辅，幅度减半）→ 买入乘子。
 	// 与信号质量/强度等同为个股组维度；比值未解析（0）→ 弃权，不进连乘。
 	// English: 5-day (primary) and same-day (secondary) net-inflow buy multipliers; abstain when unresolved.
-	mul("5日净流入", flow5DFactor(sig, cfg))
-	mul("当日净流入", flowTodayFactor(sig, cfg))
+	mul("5日净流入", flow5DFactor(sig, cfg), false)
+	mul("当日净流入", flowTodayFactor(sig, cfg), false)
 
 	// 3. 上限类：各自 0~1 乘子取 min（不连乘——同一风险不得双罚）。
+	// §DYN-SIZE v4：**总仓位上限（totalPosCap）移出合成**——它在新模型里是"目标仓位"的定义本身
+	// （Tgt＝总资产×min(MarketScale,1)），再当乘子用会让同一个数罚两次，且半仓时恒等于 1.0 拦不住。
 	// m 的初值必须是 +Inf 而不是 1.0：上限类只**向下**约束，若初值取 1.0 会把权重类的进攻档
 	// （>1.0）一并压回 1.0，"允许进攻档 cap=1.15" 就永远不可达。
-	// English: m starts at +Inf, not 1.0 — caps only constrain downward, and a 1.0 start would
-	// silently clip the weight class's attack tier (>1.0), making cap=1.15 unreachable.
+	// English: totalPosCap left the synthesis (it now defines the target, so as a multiplier it would
+	// double-penalize and never bind at half position). m starts at +Inf, not 1.0 — caps only
+	// constrain downward, and a 1.0 start would silently clip the attack tier (>1.0).
 	m := math.Inf(1)
 	for _, c := range []struct {
 		name string
 		v    float64
 	}{
-		{"总仓位上限", totalPosCap(r.Account, cfg)},
 		{"权益回撤", drawdownCap(r.Account, cfg)},
 		{"风险预算", riskBudgetCap(r, cfg)},
 	} {
@@ -129,7 +174,7 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 		}
 	}
 
-	// 4. 分层合成 + 地板/上限。
+	// 4. 分层合成 + 地板/上限。Scale 与改造前逐字一致（回归锁盯这里）。
 	scale := math.Min(w, m)
 	if scale < cfg.Floor {
 		scale = cfg.Floor
@@ -139,8 +184,60 @@ func ComputeSizing(r Regime, sig combat_agent.Signal) SizingResult {
 		scale = cfg.Cap
 		reasons = append(reasons, "触上限")
 	}
-	return SizingResult{Scale: scale, Reasons: reasons}
+
+	// 5. §1.4 拆分读数：市场组含账户上限 → MarketScale；个股组 → StockScale。
+	market := clampGroup(pm, m, cfg)
+	stock := clampGroup(ps, math.Inf(1), cfg)
+	res := SizingResult{Scale: scale, MarketScale: market, StockScale: stock, Reasons: reasons}
+	applyMissingKeyCap(r, cfg, &res)
+	return res
 }
+
+// clampGroup 把一个组值（再套账户上限 cap）夹到 [Floor, Cap]。
+// 上限类只属于市场组：权益回撤与风险预算都是"账户级"约束，不该出现在个股缩放里。
+// English: clamp a group value with the account caps into [Floor, Cap]; caps belong to the market
+// group only (drawdown and risk budget are account-level, never per-stock).
+func clampGroup(v, cap float64, cfg config.SizingConfig) float64 {
+	if v > cap {
+		v = cap
+	}
+	return clampF(v, cfg.Floor, cfg.Cap)
+}
+
+// applyMissingKeyCap §1.4 覆盖检查：关键市场读数弃权 → 目标封顶 0.50 并留痕。
+//
+// 只算三个"没它就不知道今天该持多少"的读数：市场状态机、情绪相位、大盘指数。
+// 广度缺失（NaN）**不算弃权**——它已按 BreadthMissingScale 做小百分比降权（§N6-RISK 裁决），
+// 再计一次就是同一件事罚两次。
+//
+// English: the three readings that define "how much to hold today"; breadth is deliberately excluded
+// (it already takes its own haircut, counting it here would double-penalize one gap).
+func applyMissingKeyCap(r Regime, cfg config.SizingConfig, res *SizingResult) {
+	var missing []string
+	// 只在"该维度被启用却拿不到读数"时计缺失；owner 主动关掉维度不算盲区（见 Regime 的 *Enabled 注释）。
+	if r.MarketStateEnabled && r.MarketState == "" {
+		missing = append(missing, "市场状态")
+	}
+	if r.EmotionEnabled && r.EmotionPhase == "" {
+		missing = append(missing, "情绪相位")
+	}
+	if math.IsNaN(r.IndexChangePct) {
+		missing = append(missing, "大盘指数")
+	}
+	if len(missing) == 0 {
+		return
+	}
+	res.MissingKeyInput = true
+	// 封顶值用常量而非配置：这条是数据盲区的安全垫，不给"放宽成 0.9"的口子（§8.8 之外的少数硬编码）。
+	if cap := missingKeyTargetCap; res.MarketScale > cap {
+		res.MarketScale = cap
+	}
+	res.Reasons = append(res.Reasons, fmt.Sprintf("关键输入缺失(%s)→目标封顶%.0f%%",
+		strings.Join(missing, "|"), missingKeyTargetCap*100))
+}
+
+// missingKeyTargetCap 关键市场读数缺失时的目标仓位封顶（0.50＝半仓，owner 2026-10-26 裁决）。
+const missingKeyTargetCap = 0.50
 
 // sizingFactor 一个已求值的仓位因子（v<=0 表示弃权）。
 // English: one evaluated sizing factor; v<=0 means abstain.
@@ -235,12 +332,12 @@ func computeSizingPowerMean(r Regime, sig combat_agent.Signal, cfg config.Sizing
 	reasons := []string{mr, sr, fmt.Sprintf("组间→%.3f", raw)}
 
 	// 上限类仍取 min（与旧路径同口径：只向下约束，不连乘）。
+	// §DYN-SIZE v4：总仓位上限已移出合成（改为目标仓位定义），此处只剩权益回撤与风险预算。
 	m := math.Inf(1)
 	for _, c := range []struct {
 		name string
 		v    float64
 	}{
-		{"总仓位上限", totalPosCap(r.Account, cfg)},
 		{"权益回撤", drawdownCap(r.Account, cfg)},
 		{"风险预算", riskBudgetCap(r, cfg)},
 	} {
@@ -264,7 +361,15 @@ func computeSizingPowerMean(r Regime, sig combat_agent.Signal, cfg config.Sizing
 		scale = cfg.Cap
 		reasons = append(reasons, "触上限")
 	}
-	return SizingResult{Scale: scale, Reasons: reasons}
+	// 拆分读数：mg（含账户上限）→ MarketScale 决定目标仓位；sg → StockScale 只决定这一笔。
+	res := SizingResult{
+		Scale:       scale,
+		MarketScale: clampGroup(mg, m, cfg),
+		StockScale:  clampGroup(sg, math.Inf(1), cfg),
+		Reasons:     reasons,
+	}
+	applyMissingKeyCap(r, cfg, &res)
+	return res
 }
 
 // sizingHardBlock 硬拦因子判定：命中即降级为 hold（不进金额连乘）。
@@ -648,20 +753,6 @@ func breadthFactor(up float64, cfg config.SizingConfig) float64 {
 	default:
 		return 1.0
 	}
-}
-
-// totalPosCap 总仓位上限乘子（pysystemtrade risk_overlay 口径：limit/max(limit,risk)）。
-// 未启用（MaxTotalPositionPct<=0）或持仓占比不可得（<=0）→ 弃权。
-// English: total-position cap multiplier (risk_overlay: limit/max(limit,risk)); disabled/unknown → abstain.
-func totalPosCap(a AccountState, cfg config.SizingConfig) float64 {
-	limit := cfg.MaxTotalPositionPct
-	if limit <= 0 || a.TotalPosPct <= 0 {
-		return 0
-	}
-	if a.TotalPosPct <= limit {
-		return 1.0
-	}
-	return limit / a.TotalPosPct
 }
 
 // drawdownCap 账户权益回撤熔断乘子（同上口径）。未启用或回撤不可得 → 弃权。

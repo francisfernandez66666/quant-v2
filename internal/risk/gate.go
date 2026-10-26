@@ -72,6 +72,13 @@ type LiveOrder struct {
 	// executor already shrank the order to the 35% rooms; sector/single-stock checks still apply as a
 	// second safety net and are NOT bypassed by this flag.
 	DynamicBudget bool
+
+	// IntradayT §DYN-T（批 7 / W8-A）：本单是日内回转的一条腿（正 T 买腿 / 反 T 卖腿）。
+	// 只有**买方向**会被集中度净额化，且必须过下面 checkConcentration 里的可卖量复核；
+	// 卖方向本来就不增集中度，这个标志对它是纯留痕。
+	// English: intraday round-trip marker. Only buy legs can be netted, and only after the
+	// sellable-base re-check inside checkConcentration; sell legs never add concentration anyway.
+	IntradayT bool
 }
 
 // Verdict 单笔下单的风控裁定。
@@ -609,13 +616,51 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 			posVal = price * float64(p.Qty)
 		}
 	}
-	// 买入后该票预计市值 = 现有持仓市值 + 本单金额，占总资产比例超上限即拒新买。
-	proj := posVal + o.Amount
+	// §DYN-T 批 7：日内回转的**正 T 买腿**按净额增量计（当日会配等量底仓卖出，收盘持仓回到原量）。
+	//
+	// 但"标了 T 就净额"是不行的：标志由编排层给出，而编排层完全可能在底仓根本卖不出等量时
+	// 仍报出这条买腿（T+1 锁定、已挂卖单占用、持仓刚被别的裁决减掉）。所以这里自己复核一次
+	// 可卖量——`持仓量 − 当日买入量` 必须覆盖本单股数，覆盖不了就**按全额计**：
+	// 宁可误拦一笔日内回转，也不能让一笔事实上会加仓的买单借"做 T"的名义绕过集中度闸
+	// （与 §DYN-SIZE-v3「dynamic 标记不放行第二道保险」同一条哲学）。
+	// English: a buy-first T leg is netted only after this gate independently re-checks the
+	// sellable base (held − same-day buys). If the pairing can't be covered, charge the full amount —
+	// a falsely blocked round-trip is acceptable, a strategic add-on wearing a T flag is not.
+	netAmount := o.Amount
+	if o.IntradayT && o.Side == SideBuy && o.Qty > 0 && g.tPairingCovered(o) {
+		netAmount = 0
+	}
+	// 买入后该票预计市值 = 现有持仓市值 + 本单净额，占总资产比例超上限即拒新买。
+	proj := posVal + netAmount
 	if proj/total*100 > cfg.RiskGate.SingleStockValuePct {
 		return fmt.Sprintf("单票集中度超限: 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%",
 			proj, total, proj/total*100, cfg.RiskGate.SingleStockValuePct)
 	}
 	return ""
+}
+
+// tPairingCovered 复核"这条正 T 买腿当日真能配平"：该账号该票的**可卖量 ≥ 本单股数**。
+//
+// 可卖量口径沿用引擎侧 T+1 的那一条：持仓量 − 当日买入量（当日买入部分 T+1 不可卖）。
+// 任何一环取不到（无账本、持仓读失败、当日买入读失败）一律返回 false ⇒ 调用方按全额计。
+// 这里**不做** fail-open：净额化是给日内手法让路，不是给"读数缺失"让路。
+// English: re-checks that the pairing really covers this leg (sellable qty >= order qty).
+// Any missing reading returns false, i.e. the gate charges the full amount — netting is a
+// concession to the round-trip mechanic, never to an absent reading.
+func (g *Gate) tPairingCovered(o LiveOrder) bool {
+	if g.st == nil {
+		return false
+	}
+	p, err := g.st.RealPositionByCodeForUser(g.userID, o.Code)
+	// RealPositionByCodeForUser 返回值类型（无持仓时 Qty=0），所以这里只看 err 与 Qty。
+	if err != nil || p.Qty <= 0 {
+		return false
+	}
+	today := g.st.TodayBoughtQty(g.userID, o.Code, g.today())
+	if today < 0 {
+		return false
+	}
+	return p.Qty-today >= o.Qty
 }
 
 // checkSectorExposure §C1 行业敞口：买入后目标行业预计市值 / 总资产 超过上限 → 拒新买。

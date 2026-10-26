@@ -83,13 +83,30 @@ func TestQualityColdStartNeutral(t *testing.T) {
 	if sigs[0].QualityWeight != 1.0 {
 		t.Fatalf("冷启动应写中性 1.0，得 %v", sigs[0].QualityWeight)
 	}
-	r := signalctl.Regime{SizeCfg: config.SizingConfig{Enabled: dynBoolPtr(true)}.WithDefaults()}
+	// 本条锁断言的是 **product** 路径的性质（连乘里 ×1.0 与不乘逐字相同）。
+	// §DYN-SIZE v4 出厂默认切到 power_mean 后该性质**不再成立**：幂平均按"因子个数"取均值，
+	// 多写一个中性 1.0 会把其它因子的惩罚往 1.0 方向稀释——这正是下面第二段要显式钉住的行为差异。
+	prodCfg := config.SizingConfig{Enabled: dynBoolPtr(true)}.WithDefaults()
+	prodCfg.Mode = "product"
+	r := signalctl.Regime{SizeCfg: prodCfg}
 	withDim := signalctl.ComputeSizing(r, sigs[0])
 	withoutDim := sigs[0]
 	withoutDim.QualityWeight = 0 // 该维度弃权（等价于功能关闭）
 	absent := signalctl.ComputeSizing(r, withoutDim)
 	if withDim.Scale != absent.Scale {
-		t.Fatalf("冷启动 1.0 必须与弃权同值：写 1.0=%v 弃权=%v", withDim.Scale, absent.Scale)
+		t.Fatalf("冷启动 1.0 必须与弃权同值（product）：写 1.0=%v 弃权=%v", withDim.Scale, absent.Scale)
+	}
+	// power_mean 对照：中性 1.0 会**抬高**缩放（稀释个股惩罚）。这是默认模式切换的已知副作用，
+	// 写进测试而不是藏在注释里，免得日后有人把"冷启动零影响"当成两种模式都成立的假设。
+	pmCfg := config.SizingConfig{Enabled: dynBoolPtr(true)}.WithDefaults()
+	pmCfg.Mode = "power_mean"
+	rp := signalctl.Regime{SizeCfg: pmCfg}
+	pmWith := signalctl.ComputeSizing(rp, sigs[0])
+	pmSig := sigs[0]
+	pmSig.QualityWeight = 0
+	pmAbsent := signalctl.ComputeSizing(rp, pmSig)
+	if pmWith.Scale <= pmAbsent.Scale {
+		t.Fatalf("power_mean 下写中性 1.0 应抬高缩放（稀释个股惩罚）：with=%v absent=%v", pmWith.Scale, pmAbsent.Scale)
 	}
 	if withDim.Downgrade || absent.Downgrade {
 		t.Fatalf("冷启动不应降级：%+v / %+v", withDim, absent)

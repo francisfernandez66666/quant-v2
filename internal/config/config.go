@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -592,15 +593,15 @@ type QMTConfig struct {
 	// English: §T1-PARTIAL-W5 — nil/false keeps the legacy whole-order rejection; true clamps the
 	// order down to the sellable slice and lets the caller park the remainder for the next session.
 	T1ClampQty *bool `json:"t1_clamp_qty,omitempty"`
-	// AnchorHard §ANCHOR-FIRST-W3（2026-10-24 裁决二切硬）风险线基准：nil/false＝按**摊薄成本**
-	// 判线（W2 及以前的全部行为）；true＝按**不可变首买价锚点**判线（`AnchorOrCost` 的读取点）。
-	// 默认关不是偷懒：切硬那一刻每条在持仓的止盈/止损线都会移动，Q10 要求 owner 先看过
-	// ≥3 个交易日的影子对照清单再签认，所以代码先就位、开关等人签字。
-	// 锚点未知（存量未回填 / 对账重建丢锚）时**一律回落成本**，绝不拿 0 当基准——
-	// 0 会让所有百分比判据除零或恒触发，比"用旧口径"危险得多。
-	// English: §ANCHOR-FIRST-W3 — nil/false keeps the diluted-cost basis (pre-W3 behaviour);
-	// true switches the risk lines to the immutable first-buy anchor. Unknown anchors fall back
-	// to cost, never to zero (zero would divide-by-zero or fire every percentage rule).
+	// AnchorHard §ANCHOR-FIRST-W3 风险线基准：nil/true＝按**首次买入价锚点**判线；显式 false 才回到摊薄成本。
+	// 2026-10-26 §DYN-T（方案 §0 第 10 条）把默认翻成"锚点口径"，理由不是风格：
+	// 正 T 买腿走 `addToPositionLocked`（与手动加仓同一条路径，刻意不旁路），一成交就摊薄整仓
+	// `CostPrice`；如果风险线继续按摊薄成本算，**一次日内低吸就偷偷把该股的止盈/止损线整体下移**，
+	// 等于让 T 腿改写了风控参数。锚点在建仓时冻结、后续一律不改，才是 T 改造能安全落地的前提。
+	// 代价如实登记（§1.6a）：加仓后成本低于首买价的持仓，切锚点后**止损线会抬高**（离现价更近），
+	// 因此回填必须 dry-run 逐票打印前后触发价、owner 签字后才写盘。
+	// English: risk-line basis now defaults to the frozen first-buy anchor; diluted cost would let an
+	// intraday buy leg silently move a position's stop/profit lines, which is exactly the defect §0-10 records.
 	AnchorHard *bool `json:"anchor_hard,omitempty"`
 	// Money §WS-M 资金管理：现金缓冲 + 本地在途冻结动态占用。
 	// Money = capital buffer + dynamic local frozen-in-transit accounting (§WS-M).
@@ -941,11 +942,12 @@ func (c QMTConfig) T1ClampEnabled() bool {
 	return c.T1ClampQty != nil && *c.T1ClampQty
 }
 
-// AnchorHardEnabled §ANCHOR-FIRST-W3 返回风险线是否已切到首买价锚点：nil/显式 false → false
-// （按摊薄成本判线，W2 及以前的行为）；只有显式 true 才切硬。默认关的理由见字段注释（Q10 签认）。
-// English: §ANCHOR-FIRST-W3 — only an explicit true switches the risk lines to the anchor basis.
+// AnchorHardEnabled 风险线基准：**nil 视为已切硬**（按首买价锚点判线），显式 false 才回摊薄成本。
+// 默认方向在 2026-10-26 §DYN-T 翻转（方案 §0 第 10 条：T 腿摊薄成本会偷偷移动止盈止损线）；
+// 显式 false 保留为回滚位——回填或判线出问题时，配置改一项即可退回旧口径，不必回退代码。
+// English: nil now means the anchor basis is on; an explicit false is the documented rollback switch.
 func (c QMTConfig) AnchorHardEnabled() bool {
-	return c.AnchorHard != nil && *c.AnchorHard
+	return c.AnchorHard == nil || *c.AnchorHard
 }
 
 // DisciplineConfig 统一止盈止损纪律参数（探针5s扫描 + 扳机确认窗）。
@@ -1688,8 +1690,19 @@ type SizingConfig struct {
 	IndexScaleThresholds map[string]float64 `json:"index_scale_thresholds,omitempty"`
 	// LLMBearishScale 个股 LLM 利空缩放（默认 0.5，首次接入买入侧）。
 	LLMBearishScale float64 `json:"llm_bearish_scale"`
-	// MaxTotalPositionPct 总仓位上限（默认 0.80；0=不启用）。接通既有死字段 Position.MaxTotalPositionPct。
+	// MaxTotalPositionPct **目标仓位天花板**（默认 1.00；0=不启用＝不额外封顶）。
+	// §DYN-SIZE v4（2026-10-26）：语义从"逐笔缩放乘子"改为"目标仓位的天花板"——
+	// 0.80 作为缩放乘子在半仓时恒等于 1.0（永不约束），正是 owner 报的"一笔打满"的根因之一；
+	// 现在账户级约束由 `Tgt=总资产×min(MarketScale, 本值)` 与 ordbudget 的 TargetRoom 承担，
+	// 本值只做**极端行情下的额外上限**（owner：大牛市满仓也不是不行，故默认放到 1.00）。
+	// English: now the ceiling of the account target position, not a per-trade multiplier.
 	MaxTotalPositionPct float64 `json:"max_total_position_pct"`
+	// PerTradePositionPct 单笔基准仓位（占**总资产**比例，默认 0.10）。
+	// §DYN-SIZE v4 新增：旧模型没有这个数——单笔金额＝总资产×Base×Scale，Scale 中性 1.0 时
+	// 单笔可用满权益（owner 报的"新委托将近半仓、成交即满仓"）。现在单笔上限先由本键钉死，
+	// 再乘 MarketScale×StockScale，最后与目标剩余空间取小。
+	// English: the per-trade base weight (share of total assets) that anchors one order before scaling.
+	PerTradePositionPct float64 `json:"per_trade_position_pct"`
 	// MaxDrawdownPct 账户权益回撤熔断（默认 0.10；0=不启用）：回撤达此比例时按 pysystemtrade
 	// risk_overlay 口径缩仓（mult = limit/max(limit, drawdown)）。
 	MaxDrawdownPct float64 `json:"max_drawdown_pct"`
@@ -1744,10 +1757,14 @@ type SizingConfig struct {
 // strategy enum / whitelist / statistics. The whole block defaults to off; every threshold is
 // resolved by an accessor so "never configured" stays distinguishable from "configured to default".
 type TConfig struct {
-	// Enabled 总开关：nil/false＝关（默认）；只有显式 true 才开。
-	// 默认关的理由：这是资金路径上**新增日内双向操作**（方案 3.6 的方向性风险），
-	// Q14 明确要求先只在模拟盘开、跑够交易日再谈实盘灰度。
-	// English: master switch — off unless explicitly true (new intraday two-way trading on the money path).
+	// Enabled 总开关：**nil＝出厂开**；显式 false 才关（一键止血）。
+	// 2026-10-26 六轮裁决 T4-12（owner：「T 生产打开」）**推翻**旧 Q14「先只在模拟盘开、
+	// 跑够交易日再谈实盘灰度」：本批发版后实盘日内回转直接生效，不设纸面观察期。
+	// 补偿控制不是把开关关回去，而是方案 §8.11.5 的四条：配置热停一键止血、`mode` 可临时降
+	// buy_first、发版当日 §6.3 B 组逐条签字不过就当晚回退、纸面账号先做回滚演练。
+	// English: shipped default is ON (owner overturned the paper-only ramp); the safety net moved
+	// from "off by default" to hot-stop plus same-day acceptance checks.
+	// 注意 nil 与显式 false 必须可分：面板要能区分"没配过"与"owner 主动关掉"。
 	Enabled *bool `json:"enabled,omitempty"`
 	// Mode 允许的方向：""/"both"＝正反都做；"buy_first"＝只做正 T（先买后卖）；
 	// "sell_first"＝只做反 T（先卖后买）。无法识别的取值按"都不做"处理（资金路径宁可不做）。
@@ -1764,6 +1781,33 @@ type TConfig struct {
 	// 反 T 的买回腿与正 T 的卖出腿共用这一个阈值——两腿都是"把第一腿的浮盈落袋"。
 	// English: minimum favourable move (%, default 1.0) before the pairing leg fires; shared by both modes.
 	MinSpreadPct float64 `json:"min_spread_pct,omitempty"`
+	// ── §DYN-T 日内口径与保护阈值（2026-10-26 四轮/五轮/六轮裁决；全部可配，见方案 §8.8）──
+	// 设计约束（owner 四轮 C 组第 12 条：「保护阈值还是做配置」，推翻我原本的常量方案）：
+	// 保护不再靠"不给人配"，改成三条硬纪律——① 每键有合法区间，越界/非法/NaN 一律回落安全默认；
+	// ② 区间**非对称**：收紧方向给足空间，放宽方向封顶（不允许把熔断设成 0、把近极值带设成 0）；
+	// ③ 回落必须可观测：TFallbacks() 逐轮上报"哪些键被回落、生效值是多少"，写进日志与面板。
+	// English: all thresholds are configurable; protection now comes from asymmetric legal ranges,
+	// fail-safe fallbacks, and observable reporting of every fallback rather than from hidden constants.
+	VWAPDevPct      float64 `json:"vwap_dev_pct,omitempty"`      // 现价相对分时均线的偏离门（%）
+	MinAmplitudePct float64 `json:"min_amplitude_pct,omitempty"` // 日内振幅下限（%）
+	LastOpenAt      string  `json:"last_open_at,omitempty"`      // 最后开新腿时刻（HHMM）
+	// 下面六个键刻意用指针：这些维度上 **0 是合法配置**（＝不设门/不设该条），而平面字段的零值
+	// 分不清"没配"与"配了 0"，会让出厂默认永远不生效（正 T 环境门形同虚设）。
+	// English: pointer = tri-state, because 0 is legal here; a plain field could not tell "unset"
+	// from "explicitly zero", so the shipped default would never apply.
+	MinMarketScale          *float64 `json:"min_market_scale,omitempty"`            // 正 T 环境门
+	SellEnvMinMarketScale   *float64 `json:"sell_env_min_market_scale,omitempty"`   // 反 T 环境门（六轮 T6-1：极端弱势就是不做 T）
+	IntradaySellCapTotalPct float64  `json:"intraday_sell_cap_total_pct,omitempty"` // 当日反 T 卖腿市值帽（分母 min(总资产,持仓市值)）
+	MarketPlungePct         *float64 `json:"market_plunge_pct,omitempty"`           // 大盘急跌停正 T（负值；0＝不设该门）
+	NearExtremePct          float64  `json:"near_extreme_pct,omitempty"`            // 近极值带（%）
+	LimitDistancePct        float64  `json:"limit_distance_pct,omitempty"`          // 距涨/跌停最小距离（%）
+	OpenCoolingMin          float64  `json:"open_cooling_min,omitempty"`            // 开盘冷静期（分钟）
+	StopGuardPct            float64  `json:"stop_guard_pct,omitempty"`              // 反 T 否决门的止盈止损距离（%）
+	LossBreakerPct          float64  `json:"loss_breaker_pct,omitempty"`            // 买回熔断阈值（%）
+	MinAmountWan            *float64 `json:"min_amount_wan,omitempty"`              // 流动性前置：当日成交额（万元；0＝不设该条）
+	MinTurnoverPct          *float64 `json:"min_turnover_pct,omitempty"`            // 流动性前置：换手率（%；0＝不设该条）
+	MinListedDays           *float64 `json:"min_listed_days,omitempty"`             // 流动性前置：上市天数（0＝不设该条）
+	VWAPCheckTolPct         float64  `json:"vwap_check_tol_pct,omitempty"`          // 分时均线主源与分钟链复算的允许偏差（%）
 	// ForceUnwindAt 尾盘强制配平时刻（HHMM，默认 "1450"）：正 T 的买腿到点仍未配对 ⇒ 卖出等量
 	// 底仓回到原仓位，绝不把机动仓留过夜（机动仓的定义就是"当日买、当日平"）。
 	// 反 T 的卖腿到点仍未买回 ⇒ 按 Q8 收摊（不追买），所以这个时刻对它只是"停止新开"的界线。
@@ -1771,20 +1815,32 @@ type TConfig struct {
 	// equal base amount instead of leaving the intraday layer overnight; for sell-first it only stops
 	// new rounds (Q8 forbids chasing the buy-back).
 	ForceUnwindAt string `json:"force_unwind_at,omitempty"`
+
+	// fallbacks 是**非导出**的运行时诊断队列（不参与 JSON 序列化）：记录本轮被区间校验挡掉的键
+	// 与实际生效值。刻意不放 DefaultSizingConfig，也不落盘——它是"这一轮配置的生效情况"，不是配置本身。
+	fallbacks map[string]float64
 }
 
 // T 做 T 的出厂阈值（访问器兜底用；刻意不写进 DefaultSizingConfig，理由见 TConfig 注释）。
 // English: factory thresholds used by the accessors (deliberately not materialized into defaults).
 const (
-	defaultTIntradayCapPct = 30.0
-	defaultTMinSpreadPct   = 1.0
+	// defaultTIntradayCapPct 由 30 提到 **50**（owner：反 T 必留 50~70% 底仓，防止被洗下车）；
+	// defaultTMinSpreadPct 由 1.0 提到 **2.0**（owner：日内 2% 及以上价差才值得做 T）。
+	// TConfig 整块没被 DefaultSizingConfig 物化，所以"没配过"的账号自动吃新默认、显式配过的不动
+	// （方案 §1.7：这比写迁移更强，不会把 owner 手调过的保守档冲成新默认）。
+	defaultTIntradayCapPct = 50.0
+	defaultTMinSpreadPct   = 2.0
 	defaultTMaxRounds      = 1
 	defaultTForceUnwindAt  = "1450"
+	// defaultTMode 回显用：Mode 空串在语义上等于 both（TSellFirst/TBuyFirst 都放行），
+	// 面板若显示空串会被读成"没配方向"，这里显影成 both。
+	defaultTMode = "both"
 )
 
-// TEnabled 做 T 总开关是否生效：nil/显式 false → false；只有显式 true 才开。
-// English: true only when explicitly enabled.
-func (c TConfig) TEnabled() bool { return c.Enabled != nil && *c.Enabled }
+// TEnabled 做 T 总开关：**nil 视为出厂开**，只有显式 false 才关（六轮 T4-12 改的默认方向）。
+// 关仍然是热生效的止血路径：引擎每轮重读配置，下一轮即停开新腿，在途腿照常配平/收摊。
+// English: nil now means on (shipped default); an explicit false is the one-key stop.
+func (c TConfig) TEnabled() bool { return c.Enabled == nil || *c.Enabled }
 
 // TBuyFirst 是否允许正 T（先买后卖）。空串/"both" 都允许，未知取值一律不允许。
 // English: whether buy-first rounds are allowed (""/"both" yes, unknown no).
@@ -1806,22 +1862,29 @@ func (c TConfig) TSellFirst() bool {
 	return false
 }
 
-// TIntradayCapPct 机动仓上限百分比（≤0 回落到 30）。
-// English: intraday cap percentage, falling back to 30 when unset.
-func (c TConfig) TIntradayCapPct() float64 {
+// TIntradayCapPct 单票做 T 上限（占该股当前持仓 %）：≤0 回落 50；**上界封顶 70**。
+// 封 70 是 owner「反 T 必须留 50~70% 底仓」的反面约束——不允许把该键配成 100 卖光底仓，
+// 也不允许越界值静默生效（方案 §8.8 的非对称区间：放宽方向有封顶）。
+func (c *TConfig) TIntradayCapPct() float64 {
+	if c.IntradayCapPct > 70 {
+		c.noteFallback("intraday_cap_pct", 70)
+		return 70
+	}
 	if c.IntradayCapPct <= 0 {
 		return defaultTIntradayCapPct
-	}
-	if c.IntradayCapPct > 100 {
-		return 100
 	}
 	return c.IntradayCapPct
 }
 
-// TMinSpreadPct 最小价差百分比（≤0 回落到 1.0）。
-// English: minimum spread percentage, falling back to 1.0 when unset.
-func (c TConfig) TMinSpreadPct() float64 {
+// TMinSpreadPct 配对价差（%）：≤0 回落出厂 2.0；合法区间 [0.5, 8]，越界回落并记可观测回落。
+// 它是**第二腿配对**门槛，与开腿门槛（§8.4.1 偏离门/振幅门）完全分离——旧实现两腿共用一个数，
+// 会让"开一条注定配不上对的腿"成为默认行为（方案 §8.4.5 / 评审 P1-6）。
+func (c *TConfig) TMinSpreadPct() float64 {
 	if c.MinSpreadPct <= 0 {
+		return defaultTMinSpreadPct
+	}
+	if c.MinSpreadPct < 0.5 || c.MinSpreadPct > 8 {
+		c.noteFallback("min_spread_pct", defaultTMinSpreadPct)
 		return defaultTMinSpreadPct
 	}
 	return c.MinSpreadPct
@@ -1856,6 +1919,289 @@ func (c TConfig) TForceUnwindHM() string {
 	return s
 }
 
+// ── §DYN-T 访问器：合法区间 + 非对称封顶 + 回落可观测（方案 §8.8）─────────────────────
+//
+// 每个键都走 tClamp：值落在 [lo, hi] 内才生效，否则**忽略该值并回落默认**，同时把键名记进
+// fallback 上报队列（引擎每轮打一条 `t-config-fallback`）。这样"保护"不再依赖不给配，
+// 而是依赖：越界无效 + 放宽有封顶 + 生效值可回显。
+// English: every threshold goes through tClamp — out-of-range values are ignored in favour of the
+// safe default and reported, so protection comes from validation plus observability, not secrecy.
+
+// T 侧出厂默认（与方案 §8.8 表一一对应；改默认只改这里，不散落在调用点）。
+const (
+	defaultTVWAPDevPct              = 0.8
+	defaultTMinAmplitudePct         = 2.5
+	defaultTLastOpenAt              = "1400"
+	defaultTMinMarketScale          = 0.40
+	defaultTSellEnvMinMarketScale   = 0.20
+	defaultTIntradaySellCapTotalPct = 20.0
+	defaultTMarketPlungePct         = -2.0
+	defaultTNearExtremePct          = 0.3
+	// defaultTLimitDistancePct §C1（2026-10-26）：本批**从常量转成配置键**，但默认值沿用既有常量
+	// tRLimitDistancePct（internal/paper/t_rounds.go），不借转配置之机把 1.0% 改小放宽。
+	defaultTLimitDistancePct = 1.0
+	defaultTOpenCoolingMin   = 15.0
+	defaultTStopGuardPct     = 1.5
+	defaultTLossBreakerPct   = 3.0
+	defaultTMinAmountWan     = 3000.0
+	defaultTMinTurnoverPct   = 1.5
+	defaultTMinListedDays    = 60.0
+	defaultTVWAPCheckTolPct  = 0.1
+	// tLastOpenAtHardTopHM 唯一保留的硬顶：14:45 之后开腿基本配不上对，只能带半态进收盘竞价。
+	// 它由竞价结构决定而非风险偏好，因此**不随"保护阈值改配置"一起放开**（方案 §8.4.4）。
+	tLastOpenAtHardTopHM = 1445
+)
+
+// tRange 一个键的合法区间（lo/hi 为**含端点**的可生效范围）。
+type tRange struct {
+	def float64
+	lo  float64
+	hi  float64
+}
+
+// tClamp 取值并做区间校验；命中回落时把键名记进 c.fallbacks（由 TFallbacks 消费）。
+// NaN/0 值与越界同处置：这些键的"没配"与"配坏"都必须落到同一个安全默认上。
+func (c *TConfig) tClamp(key string, v float64, r tRange) float64 {
+	// v==0 且该键的下界为正 ⇒ 这是"账号根本没配这个键"（JSON 缺省就是零值），静默用出厂默认，
+	// **不记回落**——回落日志要留给"配了但配错"，否则每个老账号每轮都会刷出十几个假回落。
+	if v == 0 && r.lo > 0 {
+		return r.def
+	}
+	if math.IsNaN(v) || v < r.lo || v > r.hi {
+		c.noteFallback(key, r.def)
+		return r.def
+	}
+	return v
+}
+
+// noteFallback 记录"该键的落盘值被忽略、实际生效值是 X"。
+// 队列长度设上限（16）：这是同一份配置每轮重复命中的诊断信息，不需要无限增长。
+func (c *TConfig) noteFallback(key string, eff float64) {
+	if c.fallbacks == nil {
+		c.fallbacks = map[string]float64{}
+	}
+	if len(c.fallbacks) >= 16 {
+		return
+	}
+	c.fallbacks[key] = eff
+}
+
+// TFallbacks 返回本轮被回落的键 → 实际生效值（引擎据此打 `t-config-fallback` 日志并送面板）。
+// 调用后队列清空，避免同一键每 5 秒重复刷屏。
+// English: drains the fallback report so the engine can log/echo the effective values once.
+func (c *TConfig) TFallbacks() map[string]float64 {
+	m := c.fallbacks
+	c.fallbacks = nil
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// VWAPDevPctOf 现价相对分时均线的偏离门（%）。
+func (c *TConfig) VWAPDevPctOf() float64 {
+	return c.tClamp("vwap_dev_pct", c.VWAPDevPct, tRange{defaultTVWAPDevPct, 0.3, 5})
+}
+
+// TMinAmplitudePctOf 日内振幅下限（%）：开腿门槛必须给配对留出空间，否则就是开一条注定配不上的腿。
+func (c *TConfig) TMinAmplitudePctOf() float64 {
+	return c.tClamp("min_amplitude_pct", c.MinAmplitudePct, tRange{defaultTMinAmplitudePct, 1, 10})
+}
+
+// TLastOpenHM 最后开新腿时刻（HHMM）。格式非法回落 "1400"；**晚于 1445 一律钳到 1445**（唯一硬顶）。
+func (c *TConfig) TLastOpenHM() string {
+	s := strings.TrimSpace(c.LastOpenAt)
+	if len(s) != 4 {
+		c.noteFallback("last_open_at", 1400)
+		return defaultTLastOpenAt
+	}
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			c.noteFallback("last_open_at", 1400)
+			return defaultTLastOpenAt
+		}
+		n = n*10 + int(r-'0')
+	}
+	if n < 945 || n > 1445 {
+		// 越界不是"按默认"而是"按最近可行值"：配成 1500 的人想要的是"尽量晚"，钳到 1445 比跳回 1400 更符合意图。
+		if n > 1445 {
+			c.noteFallback("last_open_at", tLastOpenAtHardTopHM)
+			return "1445"
+		}
+		c.noteFallback("last_open_at", 1400)
+		return defaultTLastOpenAt
+	}
+	return s
+}
+
+// TMinMarketScaleOf 正 T 环境门（MS 低于此值不开买腿）。0 是合法配置（＝不设门），用负值/NaN 判缺失。
+func (c *TConfig) TMinMarketScaleOf() float64 {
+	v := c.MinMarketScale
+	if v == nil {
+		return defaultTMinMarketScale // 没配＝出厂门限 0.40
+	}
+	if math.IsNaN(*v) || *v < 0 || *v > 1 {
+		c.noteFallback("min_market_scale", defaultTMinMarketScale)
+		return defaultTMinMarketScale
+	}
+	return *v
+}
+
+// TSellEnvMinMarketScaleOf 反 T 环境门。刻意允许 0（＝不加门，回到三轮时的行为），
+// 但若配成高于正 T 门限（反直觉），按"取两者较小值"生效并记回落，避免反 T 比正 T 更难做。
+func (c *TConfig) TSellEnvMinMarketScaleOf() float64 {
+	v := defaultTSellEnvMinMarketScale
+	if p := c.SellEnvMinMarketScale; p != nil {
+		if math.IsNaN(*p) || *p < 0 || *p > 1 {
+			c.noteFallback("sell_env_min_market_scale", defaultTSellEnvMinMarketScale)
+		} else {
+			v = *p
+		}
+	}
+	if ms := c.TMinMarketScaleOf(); v > ms {
+		c.noteFallback("sell_env_min_market_scale", ms)
+		v = ms
+	}
+	return v
+}
+
+// TIntradaySellCapTotalPctOf 当日反 T 卖腿市值帽（%，分母由调用方按 min(总资产, 持仓市值) 给）。
+func (c *TConfig) TIntradaySellCapTotalPctOf() float64 {
+	return c.tClamp("intraday_sell_cap_total_pct", c.IntradaySellCapTotalPct, tRange{defaultTIntradaySellCapTotalPct, 5, 50})
+}
+
+// TMarketPlungePctOf 大盘急跌停（负值）。区间 [-10, 0]：0 合法（＝不设此门）。
+func (c *TConfig) TMarketPlungePctOf() float64 {
+	v := c.MarketPlungePct
+	if v == nil {
+		return defaultTMarketPlungePct
+	}
+	if math.IsNaN(*v) || *v > 0 || *v < -10 {
+		c.noteFallback("market_plunge_pct", defaultTMarketPlungePct)
+		return defaultTMarketPlungePct
+	}
+	return *v
+}
+
+// TNearExtremePctOf 近极值带（%）：下限 0.1，防止配成 0 变成"贴着日内极值也敢开腿"。
+func (c *TConfig) TNearExtremePctOf() float64 {
+	return c.tClamp("near_extreme_pct", c.NearExtremePct, tRange{defaultTNearExtremePct, 0.1, 2})
+}
+
+// TLimitDistancePctOf 距涨/跌停最小距离（%）。
+func (c *TConfig) TLimitDistancePctOf() float64 {
+	return c.tClamp("limit_distance_pct", c.LimitDistancePct, tRange{defaultTLimitDistancePct, 0.5, 5})
+}
+
+// TOpenCoolingMinOf 开盘冷静期（分钟）：下限 10 保证覆盖样本不足的早盘初段。
+func (c *TConfig) TOpenCoolingMinOf() float64 {
+	return c.tClamp("open_cooling_min", c.OpenCoolingMin, tRange{defaultTOpenCoolingMin, 10, 60})
+}
+
+// TStopGuardPctOf 反 T 否决门的止盈止损距离（%）。
+func (c *TConfig) TStopGuardPctOf() float64 {
+	return c.tClamp("stop_guard_pct", c.StopGuardPct, tRange{defaultTStopGuardPct, 0.5, 5})
+}
+
+// TLossBreakerPctOf 买回熔断阈值（%）：下限 1，杜绝"设成 0 = 永不熔断"这种放宽。
+func (c *TConfig) TLossBreakerPctOf() float64 {
+	return c.tClamp("loss_breaker_pct", c.LossBreakerPct, tRange{defaultTLossBreakerPct, 1, 10})
+}
+
+// TMinAmountWanOf 流动性前置：当日成交额下限（万元）。0 合法＝不设该条。
+func (c *TConfig) TMinAmountWanOf() float64 {
+	v := c.MinAmountWan
+	if v == nil {
+		return defaultTMinAmountWan
+	}
+	if math.IsNaN(*v) || *v < 0 || *v > 1e6 {
+		c.noteFallback("min_amount_wan", defaultTMinAmountWan)
+		return defaultTMinAmountWan
+	}
+	return *v
+}
+
+// TMinTurnoverPctOf 流动性前置：换手率下限（%）。0 合法＝不设该条。
+func (c *TConfig) TMinTurnoverPctOf() float64 {
+	v := c.MinTurnoverPct
+	if v == nil {
+		return defaultTMinTurnoverPct
+	}
+	if math.IsNaN(*v) || *v < 0 || *v > 25 {
+		c.noteFallback("min_turnover_pct", defaultTMinTurnoverPct)
+		return defaultTMinTurnoverPct
+	}
+	return *v
+}
+
+// TMinListedDaysOf 流动性前置：上市天数下限。0 合法＝不设该条。
+func (c *TConfig) TMinListedDaysOf() float64 {
+	v := c.MinListedDays
+	if v == nil {
+		return defaultTMinListedDays
+	}
+	if math.IsNaN(*v) || *v < 0 || *v > 3650 {
+		c.noteFallback("min_listed_days", defaultTMinListedDays)
+		return defaultTMinListedDays
+	}
+	return *v
+}
+
+// TVWAPCheckTolPctOf 分时均线主源与分钟链复算的允许偏差（%）：下限 0.05，防"0＝永不校验"。
+func (c *TConfig) TVWAPCheckTolPctOf() float64 {
+	return c.tClamp("vwap_check_tol_pct", c.VWAPCheckTolPct, tRange{defaultTVWAPCheckTolPct, 0.05, 1})
+}
+
+// FillEffective 把 T 段的**生效值**就地填好，只用于对外回显（面板/接口），**不得**用在写盘路径上。
+//
+// 为什么单独一个方法而不是并进 WithDefaults：WithDefaults 的结果会被
+// MergeSizingConfigFor 当作"写前基值"再落盘，一旦在这里把默认值物化，就等于把出厂默认
+// 变成每个账号的显式配置——以后改默认再也传不下去（`mode`/`max_total_position_pct`
+// 那两个被物化坑过的键就是这么丢的，方案 §1.7）。
+// 指针键在这里也被填成数值：它们代表"引擎这一轮真正按多少在跑"，回显 null 会让面板显示
+// "没配"而引擎其实在按 0.40 收门，属同一类撒谎形态。
+// English: fills the T block with its effective values for **display only**; persisting it would
+// pin today's defaults as per-account config and break future default changes.
+func (c *TConfig) FillEffective() {
+	enabled := c.TEnabled()
+	c.Enabled = &enabled
+	if c.Mode == "" {
+		c.Mode = defaultTMode
+	}
+	c.MaxRoundsPerCodePerDay = c.TMaxRounds()
+	c.IntradayCapPct = c.TIntradayCapPct()
+	c.MinSpreadPct = c.TMinSpreadPct()
+	c.ForceUnwindAt = c.TForceUnwindHM()
+	c.VWAPDevPct = c.VWAPDevPctOf()
+	c.MinAmplitudePct = c.TMinAmplitudePctOf()
+	c.LastOpenAt = c.TLastOpenHM()
+	c.MinMarketScale = refOf(c.TMinMarketScaleOf())
+	c.SellEnvMinMarketScale = refOf(c.TSellEnvMinMarketScaleOf())
+	c.IntradaySellCapTotalPct = c.TIntradaySellCapTotalPctOf()
+	c.MarketPlungePct = refOf(c.TMarketPlungePctOf())
+	c.NearExtremePct = c.TNearExtremePctOf()
+	c.LimitDistancePct = c.TLimitDistancePctOf()
+	c.OpenCoolingMin = c.TOpenCoolingMinOf()
+	c.StopGuardPct = c.TStopGuardPctOf()
+	c.LossBreakerPct = c.TLossBreakerPctOf()
+	c.MinAmountWan = refOf(c.TMinAmountWanOf())
+	c.MinTurnoverPct = refOf(c.TMinTurnoverPctOf())
+	c.MinListedDays = refOf(c.TMinListedDaysOf())
+	c.VWAPCheckTolPct = c.TVWAPCheckTolPctOf()
+}
+
+// SizingConfig.WithTEffective 返回**仅供回显**的副本：T 段填成生效值，其余保持 WithDefaults 结果。
+// 调用方必须是读侧（GET /api/config/regime、T 状态接口），写侧一律用 WithDefaults。
+func (c SizingConfig) WithTEffective() SizingConfig {
+	out := c
+	out.T.FillEffective()
+	return out
+}
+
+// refOf 数值取指针（回显填充专用）。
+func refOf(v float64) *float64 { return &v }
+
 // sizingBool 返回布尔值的指针，供 §DYN-GLOBAL 出厂默认区分"显式开/关"与"键缺失"。
 // English: pointer factory for the tri-state bool switches (explicit on/off vs absent).
 func sizingBool(v bool) *bool { return &v }
@@ -1874,9 +2220,15 @@ func sizingBool(v bool) *bool { return &v }
 func DefaultSizingConfig() SizingConfig {
 	defaultP := 0.5
 	return SizingConfig{
-		Enabled:                 sizingBool(true),
-		BudgetMode:              "dynamic",
-		Mode:                    "product",
+		Enabled:    sizingBool(true),
+		BudgetMode: "dynamic",
+		// §DYN-SIZE v4（owner 2026-10-26 裁决，**明确推翻旧裁决 Q1「本批只切是否生效、不切怎么算」**）：
+		// 出厂默认切到 power_mean。理由是惩罚不叠加——同一组因子 product 连乘≈0.378、power_mean 市场组≈0.79，
+		// 在新模型里就是"目标 38% vs 79%"，后者才符合 owner 对"按因子综合决定"的期望。
+		// 代价如实登记：目标上移、T 池相应变小；控制项＝迁移 dry-run 未签字不写盘、回滚只改配置。
+		// English: shipped default is power_mean now (owner overturned the earlier "mode in a later batch" ruling);
+		// it de-stacks penalties so the target reflects the factor set rather than their product.
+		Mode:                    "power_mean",
 		Shadow:                  sizingBool(false),
 		PowerP:                  &defaultP,
 		GroupFloors:             map[string]float64{"market": 0.45, "stock": 0.35},
@@ -1898,7 +2250,8 @@ func DefaultSizingConfig() SizingConfig {
 		HolidayScales:           map[string]float64{"weekend": 0.85, "small1": 0.70, "small2": 0.85, "long1": 0.40, "long2": 0.60, "long3": 0.75},
 		IndexScaleThresholds:    map[string]float64{"-1": 1.00, "-2": 0.70, "deep": 0.40},
 		LLMBearishScale:         0.5,
-		MaxTotalPositionPct:     0.80,
+		MaxTotalPositionPct:     1.00, // 目标仓位天花板（v4：不再是逐笔乘子）
+		PerTradePositionPct:     0.10,
 		MaxDrawdownPct:          0.10,
 		StoplossGuardCount:      4,
 		StoplossGuardWindowDays: 1,
@@ -2126,6 +2479,14 @@ func (s SizingConfig) WithDefaults() SizingConfig {
 	}
 	if out.MaxTotalPositionPct <= 0 {
 		out.MaxTotalPositionPct = d.MaxTotalPositionPct
+	}
+	// §DYN-SIZE v4：单笔基准仓位。≤0 补默认；>1 是配置手滑（把 10% 写成 10 之类），
+	// 按 1.0 钳死——它乘在总资产上，越界等于允许单笔超过全账户，必须在配置层就拦掉。
+	if out.PerTradePositionPct <= 0 {
+		out.PerTradePositionPct = d.PerTradePositionPct
+	}
+	if out.PerTradePositionPct > 1 {
+		out.PerTradePositionPct = 1
 	}
 	if out.MaxDrawdownPct <= 0 {
 		out.MaxDrawdownPct = d.MaxDrawdownPct

@@ -145,12 +145,14 @@ func TestAutoPlacePlacesOrder(t *testing.T) {
 	if o["side"] != "买入" {
 		t.Fatalf("side: %v", o["side"])
 	}
-	// fixed_amount=10000 / price=10 → 1000 股（整手）
-	if o["qty"].(float64) != 1000 {
-		t.Fatalf("qty from fixed_amount: %v", o["qty"])
+	// §C2 方案 C（2026-10-26）：委托价＝现价 + 1 个最小变动价位 = 10.01，不再是 10.00。
+	if p, _ := o["price"].(float64); p != 10.01 {
+		t.Fatalf("委托价应为现价+1tick=10.01，got %v", p)
 	}
-	if o["price"].(float64) != 10 {
-		t.Fatalf("price: %v", o["price"])
+	// 股数仍按**现价**折算（10000÷10=1000 股）：方案 C 加的 1 个 tick 只作用于委托价。
+	// 若把估值价也一起换成 10.01，同样 1 万预算会被反算成 900 股——白少一整手。
+	if o["qty"].(float64) != 1000 {
+		t.Fatalf("fixed_amount=10000 ÷ 现价 10 ⇒ 1000 股，got %v", o["qty"])
 	}
 }
 
@@ -272,10 +274,11 @@ func TestAutoPlacePriceFromLive(t *testing.T) {
 	if o["code"] != "300750.SZ" {
 		t.Fatalf("code: %v", o["code"])
 	}
-	if o["price"].(float64) != 105 {
-		t.Fatalf("should use live price 105, got %v", o["price"])
+	// §C2 方案 C：定价基准取**实时快照现价** 105（不是信号触发价 100），委托价＝现价+1tick=105.01。
+	if pr, _ := o["price"].(float64); pr != 105.01 {
+		t.Fatalf("应按现价 105 加一个最小变动价位挂单，got %v", pr)
 	}
-	if o["qty"].(float64) != 100 { // 20000/105=190 股 → 整手取整 100
+	if o["qty"].(float64) != 100 { // 20000/105.01=190 股 → 整手取整 100
 		t.Fatalf("qty floor to one lot: %v", o["qty"])
 	}
 }
@@ -631,4 +634,63 @@ func TestM8PeakResetsWhenFlat(t *testing.T) {
 	if len(*orders) != 0 {
 		t.Fatalf("重建仓不应被陈旧峰值误判回撤而强平, got %d orders", len(*orders))
 	}
+}
+
+// TestVWAPPlanCOrderPrice §C2 方案 C（2026-10-26 实盘第二条 bug 的修复锁）三件事：
+//
+//	① 委托价＝现价 + 1 个最小变动价位，并按 0.01 取整（不再出现 `VWAP×0.97` 那种长小数）；
+//	② `entry_pullback_pct` 即便仍配着正值，也**不得**改变报价（软回踩退役，回滚靠配置不靠代码）；
+//	③ VWAP 硬闸改按**委托价**判定：现价已高出 VWAP 阈值时不追高，留痕口径同步是委托价。
+//
+// English: plan-C locks — order price is current price plus one tick rounded to 0.01, the retired
+// pullback knob can no longer move the quote, and the VWAP ceiling is judged on the order price.
+func TestVWAPPlanCOrderPrice(t *testing.T) {
+	t.Run("回踩配置不再生效且按tick加价", func(t *testing.T) {
+		e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) {
+			c.FixedAmount = 20000
+			c.EntryPullbackPct = 3 // 旧生产值：本批起只是"配着"，不再影响报价
+			c.MaxSignalVWAPPremiumPct = 0
+		})
+		// VWAP=100、现价=101：旧实现会挂 97（买不进）；新实现挂 101.01。
+		sig := combat_agent.Signal{ID: "PC1", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 101}
+		e.autoPlace(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 101, Amount: 100 * 1e6, Volume: 1e6}})
+		if len(*orders) != 1 {
+			t.Fatalf("应下 1 单，got %d", len(*orders))
+		}
+		if p, _ := (*orders)[0]["price"].(float64); p != 101.01 {
+			t.Fatalf("委托价应为现价+1tick=101.01（绝不能是 97 的回踩价），got %v", p)
+		}
+	})
+
+	t.Run("硬闸按委托价判定不追高", func(t *testing.T) {
+		e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) {
+			c.FixedAmount = 20000
+			c.MaxSignalVWAPPremiumPct = 5 // 委托价高于 VWAP 5% 就不买
+			// 硬过滤出厂默认仍在影子期（nil=只记录），本例要验执法行为，显式拨成真拦。
+			c.MaxSignalVWAPPremiumShadow = dynBoolPtr(false)
+		})
+		// VWAP=100、现价=106 → 委托 106.01 偏离 6.01% > 5% ⇒ 跳过。
+		sig := combat_agent.Signal{ID: "PC2", Code: "600001", Name: "偏离股", Strategy: "龙头", Direction: "做多", Price: 106}
+		e.autoPlace(sig, map[string]*data.StockInfo{"600001": {Code: "600001", Price: 106, Amount: 100 * 1e6, Volume: 1e6}})
+		if len(*orders) != 0 {
+			t.Fatalf("委托价高出 VWAP 阈值必须不追高，got %d 单", len(*orders))
+		}
+	})
+
+	t.Run("阈值内正常挂单且金额按0.01取整", func(t *testing.T) {
+		e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) {
+			c.FixedAmount = 20000
+			c.MaxSignalVWAPPremiumPct = 5
+		})
+		// VWAP=100、现价=104 → 委托 104.01，偏离 4.01% < 5% ⇒ 放行。
+		sig := combat_agent.Signal{ID: "PC3", Code: "600002", Name: "合规股", Strategy: "龙头", Direction: "做多", Price: 104}
+		e.autoPlace(sig, map[string]*data.StockInfo{"600002": {Code: "600002", Price: 104, Amount: 100 * 1e6, Volume: 1e6}})
+		if len(*orders) != 1 {
+			t.Fatalf("阈值内应放行，got %d 单", len(*orders))
+		}
+		p, _ := (*orders)[0]["price"].(float64)
+		if p != 104.01 {
+			t.Fatalf("委托价应为 104.01（0.01 取整），got %v", p)
+		}
+	})
 }

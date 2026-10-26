@@ -155,12 +155,18 @@ func TestL1GuardOrder(t *testing.T) {
 
 // TestL1R11MedianGuard R11：候选中位 scale 低于基线中位×0.8 → 拒（防"进化到不做生意"）。
 // kelly_lambda 0.5→0.2 把所有 scale 同比压 0.787 倍（排序不变、IC 不变），恰好触发 R11。
+//
+// 基线在这里**显式钉 product**：R11 的前提是"λ 同比压缩每一个 scale"，那是连乘路径的性质；
+// §DYN-SIZE v4 的出厂默认已切 power_mean，同一 λ 会被组间幂平均稀释成不到 20% 的中位降幅，
+// 用它验证"同比压缩"这条几何会测错对象。文件末尾另有一条 power_mean 对照，把差异写死在测试里。
 func TestL1R11MedianGuard(t *testing.T) {
 	ps := DefaultParamSpace()
 	start, split := evoSplit()
 	snaps := evoSynthetic(35, 10, start)
 	c := Candidate{ID: "r11", Params: map[string]float64{"kelly_lambda": 0.2}}
-	res := EvaluateCandidate(evoBase(), snaps, c, ps, L1Opts{SplitDay: split})
+	base := evoBase()
+	base.Mode = "product"
+	res := EvaluateCandidate(base, snaps, c, ps, L1Opts{SplitDay: split})
 	if res.PassGuard {
 		t.Fatal("R11 必须拒")
 	}

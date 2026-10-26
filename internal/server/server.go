@@ -665,6 +665,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
 	// §ANCHOR-FIRST W2：影子对照表只读面（admin；仅读账号目录，不触发取样/不写文件）。
 	s.mux.HandleFunc("GET /api/anchor-shadow", s.adminMiddleware(s.handleAnchorShadow))
+	// §DYN-SIZE v4 / §ANCHOR-FIRST 签字面：GET 只出报告（任何时候可查），POST 才写资金参数。
+	// 四个端点全部限 admin——它们改的是判线基准与合成口径，不是展示层配置。
+	// English: the sign-off surface for the v4 sizing migration and the anchor backfill:
+	// GET reports only, POST writes, admin-only in both directions.
+	s.mux.HandleFunc("GET /api/config/sizing-v4-plan", s.adminMiddleware(s.handleSizingV4Plan))
+	s.mux.HandleFunc("POST /api/config/sizing-v4-apply", s.adminMiddleware(s.handleSizingV4Apply))
+	s.mux.HandleFunc("GET /api/paper/anchor-backfill-plan", s.adminMiddleware(s.handleAnchorBackfillPlan))
+	s.mux.HandleFunc("POST /api/paper/anchor-backfill", s.adminMiddleware(s.handleAnchorBackfillApply))
 	// §OBSERVABILITY（2026-10-26）：前端错误上报（登录用户；载荷限长+指纹去重）与运行用量看板（admin）。
 	s.mux.HandleFunc("POST /api/client-errors", s.authMiddleware(s.handleClientError))
 	s.mux.HandleFunc("GET /api/usage", s.adminMiddleware(s.handleUsage))
@@ -729,6 +737,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/paper/orders", s.authMiddleware(s.handlePaperOrders))
 	s.mux.HandleFunc("GET /api/paper/equity", s.authMiddleware(s.handlePaperEquity))
 	s.mux.HandleFunc("GET /api/paper/selfcheck", s.authMiddleware(s.handlePaperSelfCheck))
+	// §DYN-T 日内回转（做 T）只读面：纸面账本走引擎（被拦 step 分布只在内存里），
+	// 实盘账本读账号私有文件（server 不依赖 engine，损坏如实报 corrupt）。
+	// English: read-only §DYN-T surface — paper book from the engine, live book from its file.
+	s.mux.HandleFunc("GET /api/paper/t-rounds", s.authMiddleware(s.handlePaperTRounds))
+	s.mux.HandleFunc("GET /api/t-live/rounds", s.adminMiddleware(s.handleLiveTRounds))
+	// §DYN-SIZE v4 目标仓位一帧读数（§8.8 面板展示的唯一出口，全部由账本引擎按下单同式算出）。
+	s.mux.HandleFunc("GET /api/paper/target", s.authMiddleware(s.handlePaperTargetReadout))
 	// §SIGNAL_CONTROLLER 模拟盘战法开关（白名单语义与实盘 /api/config/qmt.strategies 同构）：
 	// 读对已登录账号开放，写限管理员（模拟盘为运营数据）。
 	// English: paper strategy whitelist endpoints (read for authed users, write admin-only).
@@ -2273,6 +2288,12 @@ func (s *Server) regimeConfigPayload(target string, dedicated bool) map[string]i
 	sc, _ := s.cfg.GetSizingConfigFor(target)
 	eff := sc.ShadowOn()
 	sc.Shadow = &eff
+	// §DYN-T 回显专用：把 T 段填成**区间校验后的生效值**。
+	// 只在读侧做（WithTEffective 明确不进写盘路径）：物化回显值一旦落盘，
+	// 就等于把今天的出厂默认钉成每个账号的显式配置，日后改默认再也传不下去
+	// （`mode`/`max_total_position_pct` 被物化坑过一次，方案 §1.7）。
+	// 前端必须按"稀疏提交"配合：只发用户真正改过的键，别把这份回显原样 POST 回来。
+	sc = sc.WithTEffective()
 	return map[string]interface{}{
 		"account_id":          target,
 		"sizing_scope":        "account",

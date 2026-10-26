@@ -50,7 +50,7 @@ func TestDynSizeYellowScalingYieldsToBuyScale(t *testing.T) {
 	// ① sizingOn=true：风险档已进 BuyScale ⇒ 内联 Yellow 缩放让位，金额保持基准。
 	//    buyScale 传 1.0（中性）以隔离出"内联缩放是否被跳过"这一件事。
 	sigOn := combat_agent.Signal{ID: "SIG-ON", Code: "600001", Name: "甲", Strategy: "龙头", Direction: "做多", Price: 10}
-	e.autoPlaceScaled(sigOn, live, 1.0, true)
+	e.autoPlaceScaled(sigOn, live, 1.0, true, dynBudgetCtx{})
 	if len(*orders) != 1 {
 		t.Fatalf("sizingOn 应下 1 单, got %d", len(*orders))
 	}
@@ -62,7 +62,7 @@ func TestDynSizeYellowScalingYieldsToBuyScale(t *testing.T) {
 
 	// ② sizingOn=false：内联 Yellow 缩放正常生效（回归腿——证明①的"不缩放"不是因为闸坏了）。
 	sigOff := combat_agent.Signal{ID: "SIG-OFF", Code: "600002", Name: "乙", Strategy: "龙头", Direction: "做多", Price: 10}
-	e.autoPlaceScaled(sigOff, live, 0, false)
+	e.autoPlaceScaled(sigOff, live, 0, false, dynBudgetCtx{})
 	if len(*orders) != 2 {
 		t.Fatalf("sizingOn=false 应再下 1 单, got %d", len(*orders))
 	}
@@ -93,7 +93,7 @@ func TestDynSizeRedStillRejectedWhenSizingOn(t *testing.T) {
 
 	sig := combat_agent.Signal{ID: "SIG-RED", Code: "600003", Name: "丙", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600003": {Code: "600003", Price: 10}}
-	e.autoPlaceScaled(sig, live, 1.0, true) // 即便 sizingOn=true，Red 仍应被拒
+	e.autoPlaceScaled(sig, live, 1.0, true, dynBudgetCtx{}) // 即便 sizingOn=true，Red 仍应被拒
 	if len(*orders) != 0 {
 		t.Fatalf("Red 档在 sizingOn=true 时仍应拒开新仓, got %d 单", len(*orders))
 	}

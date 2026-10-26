@@ -1,39 +1,47 @@
-// t_rounds.go — §T-MODE 做 T（2026-10-24 owner 裁决四，施工波次 W6 正 T / W7 反 T）。
+// t_rounds.go — §T-MODE 做 T（2026-10-26 §DYN-T 四轮~六轮裁决后的**日内口径**实现）。
 //
-// 做 T 是什么：持有底仓时，用"当日买、当日卖"的一对腿把日内波动变成成本摊薄。A 股 T+1 下只有
-// 底仓可卖，所以两种方向各有一条腿必须落在当日批次上：
-//   - **正 T**（先买后卖）：低吸买入机动仓 → 卖出**等量底仓**。收盘后持仓回到原量，成本下降。
-//     卖出的是底仓（可卖），当日买入的那批原样留着次日转可卖——这正是裁决三"先只卖可卖部分"的
-//     资金形态，所以 W4 的层账是它的前置。
-//   - **反 T**（先卖后买）：高抛卖出一部分底仓 → 回踩后买回等量。卖腿必须**留一手底仓**，
-//     否则持仓被卖光、生命周期关掉、再入场冷却记上，买回腿会被自家闸门挡死（方案 2.7）。
+// 做 T 是什么：持有底仓时，用"当日买、当日卖"的一对腿把日内波动变成降本。A 股 T+1 下只有底仓可卖，
+// 所以两个方向各有一条腿必须落在既有底仓上：
+//   - **正 T**（先买后卖）：分时均线下方低吸机动仓 → 冲高后卖出**等量底仓**；
+//   - **反 T**（先卖后买）：分时均线上方高抛一部分底仓 → 回落后买回等量（或按新口径不回补）。
 //
-// 三条硬约束（全部来自 Q13 实读结论，不是偏好）：
-//  1. **两腿串行**：一轮回转同一时刻最多只有一条开腿，绝不同时挂反向腿。对敲判定只看"执行中的
-//     委托"，串行就落不进那个口径；同时挂两条腿必然踩。
-//  2. **不做两腿事务**：柜台没有原子两腿（Q13 第 5 条），所以配对失败一律按"收摊"处理而不是
-//     "重试到成功"——Q8 明确不追买，追买是方向性风险。
-//  3. **不烧退出槽、不关生命周期**：做 T 的腿走 `sellQtyLocked`（部分卖）与 `addToPositionLocked`
-//     （加仓），绝不进 `sellAllLocked` 的 delete+冷却分支，也绝不置位 `trimDone`
-//     ——否则一次做 T 会把当日真正的退出裁决吞掉。
+// 本文件在 2026-10-26 被整体重写，因为 owner 报的第一条 bug 在 T 侧的翻版是**发起点用错了基准**：
+// 旧实现 `ref := pos.AnchorOrCost()`，正 T 判"现价比成本低 2%"、反 T 判"现价比成本高 2%"，
+// 且**开腿阈值与配对阈值共用同一个数**。成本口径回答的是"这笔投资赚没赚"，
+// 日内回转要回答的是"现在是不是日内偏低的时点"——两个问题不同，用同一个数就必然出错：
+// 单边上涨里现价可以整天都高于成本 2% 以上 ⇒ 一路反 T 卖飞；单边下跌里整天都低于成本 2% 以上
+// ⇒ 反复正 T 低吸，越 T 越深。现在发起点全部改成**日内口径**（§8.4.1）。
 //
-// 幂等键：`t0:<code>:<方向>:<YYYYMMDD>:<seq>`，与退出/减仓键正交（方案 2.6 第 4 项）。
-// 落地位置：本文件在 paper 包而不是 engine 包。方案 §4.4 第 2 项原本写 `internal/engine/intraday_t.go`，
-// 但回转状态必须与账本同锁、同落盘、同一次原子写——放到 engine 侧就要复制一套持久化与锁，
-// 反而更容易出"账本已变、回转状态没跟上"的半态。故取"独立文件、不进 paper.go"这条本意，
-// engine 侧只留一个只读配置解析 + 每轮调用的薄驱动（`internal/engine/intraday_t.go`）。
+// 判定顺序即安全（§8.4.6，逐只持仓走一遍，任一步不过就结束本票本轮并打印被哪一步拦）：
 //
-// English: §T-MODE intraday T rounds (W6 buy-first / W7 sell-first). Two legs are strictly
-// serialized (the Q13 read: the broker's counter-trade check only sees *live* orders, so never
-// place both legs at once), there is no two-leg transaction (Q13 #5), so a failed pairing is
-// unwound per Q8 instead of retried. T legs never burn the trim dedup slot and never take the
-// full-close branch, so a round can't swallow the day's real exit adjudication.
+//	0   全局前置：开关/方向/交易时段/熔断日/影子/关键输入缺失/环境门/总量帽/V 可用性
+//	0.5 流动性前置（成交额、换手、非 ST、上市天数）
+//	1   状态收敛：有 open 腿 ⇒ 只处理这条腿（配对先于新开，绝不叠腿），处理完直接结束本票
+//	2   次数帽：单码当日回转组数 ≥ max_rounds（防抖主力层）
+//	3   时刻帽：≥ last_open_at 或在开盘冷静期内
+//	4   日内位置：振幅门 → 偏离门（对分时均线）→ 近极值带门 → 涨跌停距离门 → V 与分钟链一致性
+//	5   信号侧：正 T 要"新且活跃"的买入信号（候选 B）且未被消费；反 T 是否决门（无卖出裁决 + 距止盈止损够远）
+//	6   战略让路：该股有未执行的战略买卖信号或在途单 ⇒ 不开（战略先消费本轮判定）
+//	7   额度：单票 50% 帽 / T 可用现金 / 可卖量 / 反 T 当日总量帽余量
+//	8   风控闸门：买入走与战略同一套路径，不留半态
+//	9   落账：登记回转 + 消费信号 + 冻结回购款 + 全读数日志
+//
+// 三条硬约束（来自 Q13 实读，不是偏好）：两腿串行、不做两腿事务、不烧退出槽/不关生命周期/不改锚点。
+// 幂等键 `t0:<code>:<方向>:<YYYYMMDD>:<seq>` 与退出/减仓键正交。
+// 落地位置仍在 paper 包：回转状态必须与账本同锁、同一次原子写，放 engine 侧就要复制一套持久化。
+//
+// English: rewritten on 2026-10-26 to an intraday basis (the old cost/anchor reference made T rounds
+// fire all day in a trending market), with a strict step order, a signal gate on the buy side
+// (candidate B), veto gates on the sell side, liquidity prefilter, market-environment gates for both
+// directions, a per-day sell-notional cap, and a standalone T P&L that never touches the position cost.
 package paper
 
 import (
 	"fmt"
 	"log"
+	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -41,37 +49,37 @@ import (
 )
 
 // 做 T 的枚举（字符串直接进账本与前端，改字面量等于改契约，故集中在此）。
-// English: T-round enums; the literals are persisted and shown in the UI, so they live here only.
 const (
 	TRModeBuyFirst  = "正T" // 先买后卖（低吸机动仓 → 卖等量底仓）
-	TRModeSellFirst = "反T" // 先卖后买（高抛底仓 → 回踩买回）
+	TRModeSellFirst = "反T" // 先卖后买（高抛底仓 → 回踩买回或不回补）
 
 	tRLegBuy  = "buy"  // 第一腿＝买入
 	tRLegSell = "sell" // 第一腿＝卖出
 
-	tRStateOpen    = "open"    // 已开腿，等第二腿配对
-	tRStateDone    = "done"    // 两腿都成交，回转完成
-	tRStateUnwound = "unwound" // 半态收摊（买回被拦 / 尾盘未配平 / 跨日），显式留痕不重试
+	tRStateOpen    = "open"      // 已开腿，等第二腿
+	tRStateDone    = "done"      // 两腿都成交，回转完成（唯一有 T 收益的状态）
+	tRStateUnwound = "unwound"   // 半态收摊（可卖量不足/买回被拦/跨日），仓位是被动变更
+	tRStateConvert = "converted" // 尾盘未配对且**无活跃买入信号** ⇒ 转战略持仓/战略减仓（六轮：只有信号才回补）
 )
 
-// tRMinBaseKeep 反 T 卖腿必须留下的底仓股数（1 手 = 100 股）。
-// 为什么要留：卖光之后 `sellQtyLocked` 会把持仓留成 Qty=0 的僵尸行，而清仓分支
-// （sellAllLocked）会删行 + 记再入场冷却 —— 两条路都会让买回腿被自家闸门挡死。
-// English: sell-first must keep at least one lot, otherwise the position becomes a zero-qty zombie
-// row or takes the full-close branch (delete + re-entry cooldown) and the buy-back is blocked.
+// tRMinBaseKeep 反 T 卖腿必须留下的底仓股数（1 手）。卖光会让持仓变成 Qty=0 僵尸行或走清仓分支
+// （删行 + 再入场冷却），两条路都会让买回腿被自家闸门挡死。
 const tRMinBaseKeep = 100
 
-// tRKeepRounds 回转账保留条数上限（只留最近这些条，防止一年下来把账本撑成几 MB）。
-// English: how many round records to keep (most recent first), bounding the ledger size.
+// tRKeepRounds 回转账保留条数上限（账本体积，不影响判定）。
 const tRKeepRounds = 300
 
-// TRound 一次做 T 回转的记账单元（Q11：独立回转账，不往 report.ExecLog 里塞 TRounds[]，
-// 因为"一仓一生命周期"是 ExecLog 的既有不变量，日内多次回转会直接打穿它）。
-// ID 是对外幂等键，也是"这笔成交属于哪次回转"的唯一线索。
-// English: one T round. Q11 keeps this as its own ledger instead of extending report.ExecLog,
-// whose one-position-one-lifecycle invariant would be broken by intraday repeats.
+// tRStrategies T 腿在订单留痕里用的战法名（刻意不注册 strategy 枚举、不进白名单：T 是执行手法）。
+const tRStrategies = "§T-MODE"
+
+// tRFrozenFeeBufferPct 反 T 冻结回购款的默认费用缓冲（%）：买回时要有钱付佣金印花税，
+// 专款留 0.6% 与实盘预算口径同值，宁可多冻一点也不让买回因几分钱失败。
+const tRFrozenFeeBufferPct = 0.6
+
+// TRound 一次做 T 回转的记账单元（Q11：独立回转账，不塞进 report.ExecLog——
+// "一仓一生命周期"是它的既有不变量，日内多次回转会直接打穿）。
 type TRound struct {
-	ID   string `json:"id"`   // 幂等键 t0:<code>:<方向>:<YYYYMMDD>:<seq>
+	ID   string `json:"id"`   // 幂等键 t0:<code>:<dir>:<YYYYMMDD>:<seq>
 	Code string `json:"code"` // 标的代码
 	Name string `json:"name"` // 标的名称
 	Mode string `json:"mode"` // 正T / 反T
@@ -81,112 +89,195 @@ type TRound struct {
 	LegQty   int       `json:"leg_qty"`   // 第一腿成交股数
 	LegPrice float64   `json:"leg_price"` // 第一腿成交价（含滑点，第二腿的价差基准）
 	LegAt    time.Time `json:"leg_at"`    // 第一腿成交时刻
-	// BaseQty 第一腿成交**前**的底仓量。正 T 的卖出腿上界、反 T 的卖出量上界都从它派生，
-	// 用事后读到的持仓量去推会把这期间的其他成交算进来。
+	// BaseQty 第一腿成交**前**的底仓量：正 T 的卖出腿上界、反 T 的卖出量上界都从它派生。
 	BaseQty int    `json:"base_qty"`
-	State   string `json:"state"` // open / done / unwound
+	State   string `json:"state"` // open / done / unwound / converted
 	// PairQty/PairPrice/PnL 第二腿成交与本次回转的锁定价差（元，未扣第二腿费用）。
-	// PnL 用"第二腿价 − 第一腿价"乘股数，正 T 与反 T 同号：正 T 是低买高卖，反 T 是高卖低买。
 	PairQty   int       `json:"pair_qty,omitempty"`
 	PairPrice float64   `json:"pair_price,omitempty"`
 	PnL       float64   `json:"pnl,omitempty"`
 	ClosedAt  time.Time `json:"closed_at,omitempty"`
 	Day       string    `json:"day"`              // 开腿日 YYYYMMDD（限次与跨日收摊的判据）
-	Reason    string    `json:"reason,omitempty"` // 收摊/成交原因（事后核"为什么没配平"）
+	Reason    string    `json:"reason,omitempty"` // 收摊/转换/成交原因
+
+	// ── §DYN-T v4 新增字段 ────────────────────────────────────────────────────────
+	// AnchorPrice 开腿时的卖出裁决锚点。T 腿不得改动它，这里只留证（§6.1 锁 11）。
+	AnchorPrice float64 `json:"anchor_price,omitempty"`
+	// VWAP/Vmin/CheckDevPct 开腿时刻的分时均线读数：主源、分钟链复算值、两者偏差%。
+	// 为什么三个都存：灰度期唯一能复盘"发起点对不对"的证据，也是回答"程序里的 V 和图上那条线
+	// 是不是同一个数"的凭据（§8.4.1 的命名结论靠它验证）。
+	VWAP          float64 `json:"v,omitempty"`
+	Vmin          float64 `json:"v_min,omitempty"`
+	CheckDevPct   float64 `json:"check_dev_pct,omitempty"`
+	DevPct        float64 `json:"dev_pct,omitempty"`         // 现价相对分时均线的偏离%
+	High          float64 `json:"high,omitempty"`            // 日内高点（开腿时刻读数）
+	Low           float64 `json:"low,omitempty"`             // 日内低点
+	AmplitudePct  float64 `json:"amplitude_pct,omitempty"`   // 当日振幅%
+	AmountWan     float64 `json:"amount_wan,omitempty"`      // 当日成交额（万元，流动性前置读数）
+	TurnoverPct   float64 `json:"turnover_pct,omitempty"`    // 换手率%
+	ListedDays    int     `json:"listed_days,omitempty"`     // 上市天数
+	UsedSignalID  string  `json:"used_signal_id,omitempty"`  // 本次消费的买入信号 ID（§8.4.3 一次性消费）
+	FrozenCash    float64 `json:"frozen_cash,omitempty"`     // 反 T 冻结回购资金（含费用缓冲）
+	MarketScaleAt float64 `json:"market_scale_at,omitempty"` // 开腿时的 MS（事后核"环境门当时是多少"）
+	// TPnlGross/TPnlNet/QMatched/FeeEst 「做 T 收益」独立口径（六轮 T6-5 / §8.9a）。
+	// 刻意与 PnL 并存：PnL 是旧字段（未扣费），TPnlNet 是**已扣两腿费用**的净额，只有 done 轮有值。
+	TPnlGross float64 `json:"t_pnl_gross,omitempty"`
+	TPnlNet   float64 `json:"t_pnl_net,omitempty"`
+	QMatched  int     `json:"q_matched,omitempty"`
+	FeeEst    bool    `json:"t_fee_est,omitempty"`
 }
 
 // TParams 一轮做 T 的执行参数——由 engine 侧从账号级配置解析后注入。
-// paper 包不读 config（与 AllocLayers/T0Settle 的"纯核算"分工一致），所以阈值全部走入参，
-// 好处是同一套编排逻辑可以在测试里用任意阈值驱动，不必构造一份配置。
-// English: per-round T parameters injected by the engine layer. The paper package never reads
-// config, so every threshold is an argument and the orchestration is testable with any numbers.
+// paper 包不读 config（保持"纯核算"分工），所以阈值与外部读数都走入参；
+// 好处是同一套编排可以在测试里用任意阈值驱动，不必构造配置文件。
+//
+// 回调为 nil 时的处置一律是**不开腿**（fail-closed）：日内口径依赖这些读数，
+// 缺读数还硬开等于在盲区里做双向操作（§8.13 C 组第 10/11 条，owner 已同意）。
+// English: every threshold and external reading is injected; a nil callback blocks the round rather
+// than degrading to the old cost basis.
 type TParams struct {
-	BuyFirst      bool    // 允许正 T
-	SellFirst     bool    // 允许反 T
-	MaxRounds     int     // 单码单日最大回转次数
-	CapPct        float64 // 机动仓上限（百分比，如 30）
-	MinSpreadPct  float64 // 最小价差（百分比，如 1.0）
-	ForceUnwindHM string  // 尾盘强制配平时刻 HHMM（如 "1450"）
+	// ── 开关与环境 ──
+	Enabled         bool    // t.enabled（六轮：实盘也默认开）
+	BuyFirst        bool    // 允许正 T
+	SellFirst       bool    // 允许反 T
+	MaxRounds       int     // 单码单日最大回转组数（防抖主力，灰度期=1）
+	CapPct          float64 // 单票 T 上限（占该股当前持仓%）
+	MinSpreadPct    float64 // 第二腿配对价差%
+	ForceUnwindHM   string  // 尾盘判定时刻 HHMM
+	MarketScale     float64 // 本轮 MarketScale（账户级，逐票不漂）
+	MissingKeyInput bool    // 关键市场读数缺失 ⇒ 整个 T 关闭（§1.5）
+	Shadow          bool    // 影子期 ⇒ 整个 T 关闭
+	DayBlocked      bool    // 熔断日 ⇒ 两向都不开
+	// ── 日内口径门槛（§8.4.1/§8.4.4）──
+	VWAPDevPct       float64 // 偏离门（现价相对分时均线）
+	MinAmplitudePct  float64 // 振幅门
+	NearExtremePct   float64 // 近极值带
+	LimitDistancePct float64 // 距涨/跌停最小距离
+	OpenCoolingMin   float64 // 开盘冷静期（分钟）
+	LastOpenHM       string  // 最后开新腿时刻 HHMM（硬顶 14:45 由配置层钳好）
+	VWAPCheckTolPct  float64 // 主源与分钟链复算的允许偏差%
+	// ── 两道方向门（§8.4.1 四轮/六轮）──
+	MinMarketScale          float64 // 正 T 环境门
+	SellEnvMinMarketScale   float64 // 反 T 环境门（极端弱势就是不做 T）
+	MarketPlungePct         float64 // 大盘急跌（负值）停正 T
+	IntradaySellCapTotalPct float64 // 当日反 T 卖腿市值帽（分母 min(总资产,持仓市值)）
+	// ── 否决与熔断（§8.4.2/§8.5.2）──
+	StopGuardPct   float64 // 距止盈/止损线小于该值 ⇒ 否决反 T
+	LossBreakerPct float64 // 亏损超过该值 ⇒ 封买回通道
+	// ── 流动性前置（§8.4.4b）──
+	MinAmountWan   float64
+	MinTurnoverPct float64
+	MinListedDays  float64
+	// IndexChangePct 本轮大盘涨跌幅%（NaN/0 由调用方决定语义）；FeeBufferPct 冻结款费用缓冲%。
+	IndexChangePct float64
+	FeeBufferPct   float64
+	// ── 外部读数回调 ──
+	// MinuteBasis 返回分钟链复算的分时均线（校验腿）；ok=false ⇒ 只记降级，不拦。
+	MinuteBasis func(code string) (vmin float64, ok bool)
+	// NewBuySignal 返回"比 since 更新的活跃买入信号"（候选 B）；ok=false ⇒ 正 T 不开。
+	NewBuySignal func(code string, since time.Time) (signalID string, ok bool)
+	// ActiveBuySignal 返回尾盘是否具备活跃买入信号（§8.5.4：开腿时刻之后的活跃信号）。
+	ActiveBuySignal func(code string, since time.Time) (signalID string, ok bool)
+	// ActiveSellVerdict 该票此刻是否有活跃卖出/退出裁决（有 ⇒ 反 T 否决，交给信号执行）。
+	ActiveSellVerdict func(code string) bool
+	// StopLineDistance 现价距止盈/止损线的最小距离%；ok=false ⇒ 按否决处理。
+	StopLineDistance func(code string, price float64) (pct float64, ok bool)
+	// StockMeta 上市天数与是否 ST；ok=false ⇒ 流动性前置按不过。
+	StockMeta func(code string) (listedDays int, isST bool, ok bool)
+	// StrategicBusy 该股有未执行的战略买卖信号或在途单 ⇒ T 让路（§8.7）。
+	StrategicBusy func(code string) bool
+	// StrategicGate 转战略/尾盘回补都要重走的战略闸门（§8.5.3）；返回放行的数量。
+	StrategicGate func(code string, qty int) (allowed int, reason string)
+	// ConsumeSignal 把信号 ID 记为"已被 T 腿消费"（§8.4.3 ①，账本在 engine/paper 两侧各自持有）。
+	ConsumeSignal func(signalID string)
+	// SignalConsumedByStrategic 该信号是否已被战略买单消费（T 不得重复买第二次）。
+	SignalConsumedByStrategic func(signalID string) bool
 }
 
 // RunIntradayT 做 T 的每轮执行入口（交易时段内由纸面估值轮调用）。
-//
-// 三道前置全部是"用户接管优先"：账本关、自动卖出关、做 T 参数一个方向都没开 —— 任一成立即整轮跳过。
-// 第四道是 Q5：预算口径不是 dynamic 时禁用做 T（legacy 档下买回腿要过每日次数/预算/战法日预算三墙，
-// 极易做成半态）。这条只打一次日志，不每轮刷。
-// English: per-round entry. Four guards, all "the user's switch wins": book off, auto-sell off, no
-// direction enabled, and (Q5) budget pipeline not dynamic. The last one logs once per day.
+// 前置四道：账本关、自动卖出关、方向都没开、预算口径不是 dynamic（Q5）；
+// v4 再加两道全局关闭：`Enabled=false` 与"影子/关键输入缺失"（§1.5——读数不可信时整个 T 停，
+// 而不是"按半额度照做"，盲区里做日内双向操作比不做贵得多）。
 func (e *Engine) RunIntradayT(quotes map[string]*data.StockInfo, p TParams) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.cfg.Enabled || !e.cfg.AutoSell {
+	if !e.cfg.Enabled || !e.cfg.AutoSell || !p.Enabled {
 		return
 	}
 	if !p.BuyFirst && !p.SellFirst {
 		return
+	}
+	if p.Shadow || p.MissingKeyInput {
+		e.tNoteBlockLocked("step0", "影子期/关键输入缺失→本轮整体不做T", "")
+		return
+	}
+	// §8.8 配置自洽告警（**不阻塞**）：配对价差门若高过振幅下限的 80%，这条回转在数学上就几乎配不上对
+	// ——开腿时当日振幅才 2.5%，却要第二腿走出 2.0% 的有利价差，尾盘大概率只能收摊。
+	// 之所以只告警不拦：这两个键都是 owner 显式可调的保护阈值，拦下来等于替人改配置；
+	// 但"配了一对互相打架的值然后静默什么都不做"是本项目吃过多次的形态，必须每天出声一次。
+	if p.MinSpreadPct > 0 && p.MinAmplitudePct > 0 && p.MinSpreadPct > 0.8*p.MinAmplitudePct {
+		if e.tCfgWarnDay != cntime.DayCompactOf(e.clockNow()) {
+			e.tCfgWarnDay = cntime.DayCompactOf(e.clockNow())
+			log.Printf("[paper] §T-MODE 配置告警：min_spread_pct=%.2f 已达 min_amplitude_pct=%.2f 的 80%% 以上，"+
+				"开腿后很可能配不上对（尾盘多走收摊/转换）；不阻塞，按现值继续",
+				p.MinSpreadPct, p.MinAmplitudePct)
+		}
 	}
 	if !e.dynamicBudgetOn() {
 		now := time.Now()
 		day := cntime.DayOf(now)
 		if e.tWarnDay != day {
 			e.tWarnDay = day
-			log.Printf("[paper] §T-MODE 做T已配置但预算口径=%q（非 dynamic）→ 按 Q5 本日禁用"+
-				"（legacy 档下买回腿要过每日次数/预算/战法日预算三墙，极易做成半态）",
-				e.cfg.BudgetMode)
+			log.Printf("[paper] §T-MODE 做T已配置但预算口径=%q（非 dynamic）→ 按 Q5 本日禁用", e.cfg.BudgetMode)
 		}
 		return
 	}
 	e.runIntradayTLocked(quotes, p, e.clockNow())
 }
 
-// runIntradayTLocked 做 T 的一轮主流程（须持锁调用）。
-// 次序是硬要求：**先处理已开腿、再考虑开新腿**。反过来的话同一轮里可能先开一条新腿、
-// 又去配平另一条旧腿，两条腿在时间上重叠 —— 正是 Q13 第 4 条要避开的并发形态。
-// 尾盘（force=true）只收摊不开新腿：留一条刚开的一腿过夜，比"今天少做一轮"贵得多。
-// English: pairing runs before opening (never overlap two legs in one round), and once the forced
-// unwind time is reached no new leg is opened at all.
+// runIntradayTLocked 一轮主流程（须持锁调用）。次序是硬要求：**先配平已开腿，再考虑开新腿**。
+// 反过来的话同一轮里可能先开一条新腿、又去配平另一条旧腿，两条腿时间上重叠——
+// 那既是 Q13 第 4 条要避开的并发形态，也是"同一时刻同码挂着反向两笔委托"的合规风险来源。
 func (e *Engine) runIntradayTLocked(quotes map[string]*data.StockInfo, p TParams, now time.Time) {
 	day := cntime.DayCompactOf(now)
-	e.rollTRoundsLocked(day, now)
-	force := e.tForceReached(now, p.ForceUnwindHM)
+	e.rollTRoundsLocked(day, now, p)
 
+	// step1：状态收敛。有 open 腿的票本轮只处理这条腿，处理完结束（绝不叠腿）。
 	for _, code := range e.tOpenCodesLocked() {
-		e.pairTRoundLocked(code, quotes, p, force, now)
+		e.pairTRoundLocked(code, quotes, p, e.tForceReached(now, p.ForceUnwindHM), now)
 	}
-	if force {
+	// 尾盘判定时刻之后**不再开新腿**（旧实现是"尾盘只收摊"，但配平时刻与停开时刻是两个概念：
+	// last_open_at 之后开的腿大概率当天配不上对，只能带着半态进收盘竞价）。
+	if e.tForceReached(now, p.ForceUnwindHM) {
 		return
 	}
 	e.openTRoundsLocked(quotes, p, day, now)
 }
 
-// rollTRoundsLocked 跨日收摊：昨日仍 open 的回转一律标记 unwound 并留痕（须持锁调用）。
-//
-// 为什么必须显式收：正 T 的买腿过夜意味着机动仓变成了底仓（违背"当日买当日平"的定义），
-// 反 T 的卖腿过夜意味着那次高抛事实上退化成了一次减仓。两种都不是崩溃，但**必须在账上说出来**，
-// 否则复盘时只看到"多了一笔仓位"或"少了一笔仓位"而找不到原因。
-// English: yesterday's still-open rounds are explicitly unwound with a reason. An overnight buy leg
-// means the intraday layer silently became base; an overnight sell leg means the spike sale degraded
-// into a plain trim. Neither is a crash, but both must be visible in the ledger.
-func (e *Engine) rollTRoundsLocked(day string, now time.Time) {
+// rollTRoundsLocked 跨日收摊：昨日仍 open 的回转显式标终态（须持锁调用）。
+// 正 T 买腿过夜＝机动仓悄悄变成底仓；反 T 卖腿过夜＝那次高抛退化成战略减仓。
+// 两者都不是崩溃，但**必须在账上说出来**，否则复盘只看到仓位多了/少了一块而找不到原因。
+func (e *Engine) rollTRoundsLocked(day string, now time.Time, p TParams) {
 	for i := range e.tRounds {
 		r := &e.tRounds[i]
 		if r.State != tRStateOpen || r.Day == day {
 			continue
 		}
-		r.State = tRStateUnwound
-		r.ClosedAt = now
 		if r.Leg == tRLegBuy {
+			r.State = tRStateUnwound
 			r.Reason = "跨日未配平：机动仓已成隔夜底仓（正T买腿未卖出等量底仓）"
 		} else {
-			r.Reason = "跨日未回踩：反T卖腿按普通减仓收摊（不追买）"
+			// 反 T 跨日不回补：按战略减仓记账（converted），与"尾盘只有信号才回补"同口径。
+			r.State = tRStateConvert
+			r.Reason = "跨日未回补：反T卖腿转战略减仓（§8.5.2 只有信号才回补）"
 		}
-		log.Printf("[paper] §T-MODE 回转跨日收摊 %s %s 第%d轮 腿=%s %d股 @%.2f → %s",
-			r.Code, r.Mode, r.Seq, r.Leg, r.LegQty, r.LegPrice, r.Reason)
+		r.ClosedAt = now
+		log.Printf("[paper] §T-MODE 回转跨日收摊 %s %s 第%d轮 腿=%s %d股@%.2f → %s %s",
+			r.ID, r.Mode, r.Seq, r.Leg, r.LegQty, r.LegPrice, r.State, r.Reason)
 	}
 }
 
-// tForceReached 是否已到/过了尾盘强制配平时刻（HHMM 字符串比较即时间比较）。
-// English: whether the forced-pairing time has been reached (HHMM lexicographic compare is a time compare).
+// tForceReached 是否已到/过尾盘判定时刻（HHMM 字符串比较即时间比较）。
 func (e *Engine) tForceReached(now time.Time, hm string) bool {
 	if len(hm) != 4 {
 		return false
@@ -194,9 +285,28 @@ func (e *Engine) tForceReached(now time.Time, hm string) bool {
 	return cntime.In(now).Format("1504") >= hm
 }
 
-// tOpenCodesLocked 当前处于 open 态的回转所对应的代码（排序后返回，保证每轮处理次序稳定）。
-// 直接在 map 上 range 会让"这一轮先处理哪只"随哈希漂移，多码同日时排障无从复现。
-// English: codes with an open round, sorted so the per-round processing order is reproducible.
+// tLastOpenPassed 是否已过"最后开新腿时刻"。与 force 时刻分开是刻意的：
+// 默认 14:00 停开新腿、14:50 才做尾盘判定，中间那 50 分钟专门用来配平已有腿。
+func tLastOpenPassed(now time.Time, hm string) bool {
+	if len(hm) != 4 {
+		return false
+	}
+	return cntime.In(now).Format("1504") >= hm
+}
+
+// tInCooling 是否还在开盘冷静期内（默认 9:30 起 15 分钟）。
+// 为什么要这道门：早盘样本少的时候分时均线与现价几乎重合，偏离门自动失效，
+// 此刻的"低吸/高抛"读数是噪声而不是信息（方案 §8.4.4）。
+func tInCooling(now time.Time, minutes float64) bool {
+	if minutes <= 0 {
+		return false
+	}
+	cst := cntime.In(now)
+	open := time.Date(cst.Year(), cst.Month(), cst.Day(), 9, 30, 0, 0, cst.Location())
+	return cst.Before(open.Add(time.Duration(minutes) * time.Minute))
+}
+
+// tOpenCodesLocked 当前处于 open 态的回转代码（排序后返回，保证每轮处理次序稳定可复现）。
 func (e *Engine) tOpenCodesLocked() []string {
 	seen := make(map[string]bool, len(e.tRounds))
 	out := make([]string, 0, len(e.tRounds))
@@ -211,8 +321,7 @@ func (e *Engine) tOpenCodesLocked() []string {
 	return out
 }
 
-// openTRoundFor 取该代码当前处于 open 态的回转（0 或 1 条——两腿串行的结构性保证）。
-// English: the code's single open round, if any (0 or 1 by construction of the serialized legs).
+// openTRoundFor 该代码当前处于 open 态的回转（0 或 1 条——两腿串行的结构性保证）。
 func (e *Engine) openTRoundFor(code string) *TRound {
 	for i := range e.tRounds {
 		if e.tRounds[i].Code == code && e.tRounds[i].State == tRStateOpen {
@@ -222,8 +331,26 @@ func (e *Engine) openTRoundFor(code string) *TRound {
 	return nil
 }
 
-// tRoundsUsedLocked 该代码当日已开过的回转次数（含已收摊的，因为收摊那次的腿也已经真实成交了）。
-// English: rounds opened today for this code, including unwound ones (their legs really traded).
+// lastRoundEndedAt 该代码上一次回转结束时刻（**候选 B** 的新鲜度基准，§8.4.2）。
+// 当日无历史回转 ⇒ 返回当日 9:30：也就是"今天新出现的信号才算数"，
+// 老持仓那条恒成立的"持有中"信号不能再拿来开正 T 腿（否则信号门形同虚设）。
+func (e *Engine) lastRoundEndedAt(code string, now time.Time) time.Time {
+	cst := cntime.In(now)
+	dayStart := time.Date(cst.Year(), cst.Month(), cst.Day(), 9, 30, 0, 0, cst.Location())
+	best := dayStart
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.Code != code || r.State == tRStateOpen || r.ClosedAt.IsZero() {
+			continue
+		}
+		if r.ClosedAt.After(best) {
+			best = r.ClosedAt
+		}
+	}
+	return best
+}
+
+// tRoundsUsedLocked 该代码当日已占用的回转组数（含在途与已收摊：一次回转＝一组完整反向动作）。
 func (e *Engine) tRoundsUsedLocked(code, day string) int {
 	n := 0
 	for i := range e.tRounds {
@@ -234,15 +361,127 @@ func (e *Engine) tRoundsUsedLocked(code, day string) int {
 	return n
 }
 
+// tSignalConsumedLocked 该信号 ID 是否已被某条 T 腿消费（§8.4.3 ①，账本就在这张回转表里）。
+func (e *Engine) tSignalConsumedLocked(signalID string) bool {
+	if strings.TrimSpace(signalID) == "" {
+		return false
+	}
+	for i := range e.tRounds {
+		if e.tRounds[i].UsedSignalID == signalID {
+			return true
+		}
+	}
+	return false
+}
+
+// sellFirstNotionalLocked 当日反 T 卖腿已占用的市值合计（总量帽分子，§8.4.5 / 六轮 T6-2）。
+// 用成交股数×成交价（不是现价）：帽约束的是"今天已经卖掉多少底仓"，
+// 用现价会让已经卖出的那部分随行情涨跌而重新计数，判定就成了移动靶。
+func (e *Engine) sellFirstNotionalLocked(day string) float64 {
+	sum := 0.0
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.Day != day || r.Leg != tRLegSell || r.LegQty <= 0 {
+			continue
+		}
+		sum += r.LegPrice * float64(r.LegQty)
+	}
+	return sum
+}
+
+// tFrozenCash 当前全部在途反 T 腿的冻结回购资金合计（战略买入不得动用，§8.3 纪律 3）。
+// 导出给策略预算与面板共用同一本账，避免"策略把做 T 的回购钱花掉了"这种半态来源。
+func (e *Engine) tFrozenCash() float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.tFrozenCashLocked()
+}
+
+// TRoundOpenBuyLegs 在途正 T 买腿的市值合计（供目标仓位模型剔出战略当前数）。
+func (e *Engine) TRoundOpenBuyLegs() (value float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.State == tRStateOpen && r.Leg == tRLegBuy {
+			value += r.LegPrice * float64(r.LegQty)
+		}
+	}
+	return value
+}
+
+// TRoundOpenSellLegs 在途反 T 卖腿的市值合计（供目标仓位模型加回战略当前数）。
+func (e *Engine) TRoundOpenSellLegs() (value, frozen float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.State == tRStateOpen && r.Leg == tRLegSell {
+			value += r.LegPrice * float64(r.LegQty)
+			frozen += r.FrozenCash
+		}
+	}
+	return value, frozen
+}
+
+// ── 被拦留痕（§8.9：按 step 编号统计"这只票为什么今天没做 T"）───────────────────────────
+
+// tNoteBlockLocked 记一条"被哪一步拦"。日志按 (step, code) 每日一次防刷屏（做 T 驱动约 5s 一轮），
+// 计数则每次累加——灰度期看的是**分布**：step2 最多说明次数帽太紧，step4 最多说明行情不给振幅。
+func (e *Engine) tNoteBlockLocked(step, why, code string) {
+	day := cntime.DayCompactOf(e.clockNow())
+	if e.tBlockDay != day {
+		e.tBlockDay = day
+		e.tBlock = map[string]int{}
+		e.tBlockLogged = map[string]bool{}
+	}
+	if e.tBlock == nil {
+		e.tBlock = map[string]int{}
+	}
+	key := step + "|" + code
+	e.tBlock[key]++
+	if e.tBlockLogged == nil {
+		e.tBlockLogged = map[string]bool{}
+	}
+	if e.tBlockLogged[key] {
+		return
+	}
+	e.tBlockLogged[key] = true
+	log.Printf("[paper] §T-MODE 不开腿 %s 拦在 %s：%s", orDash(code), step, why)
+}
+
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
+}
+
+// TBlockStats 返回当日"被哪一步拦"的计数快照（接口与面板用）。
+func (e *Engine) TBlockStats() (day string, counts map[string]int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]int, len(e.tBlock))
+	for k, v := range e.tBlock {
+		out[k] = v
+	}
+	return e.tBlockDay, out
+}
+
+// ── step1/尾盘：配对与收摊 ────────────────────────────────────────────────────────────
+
 // pairTRoundLocked 处理一条已开腿的第二腿（须持锁调用）。
 //
-// 正 T（Leg=buy）：卖出等量底仓。可卖量必须覆盖 need —— 因为可卖的只有底仓，机动仓当日不可卖；
-// 覆盖不了说明这条持仓的底仓在开腿之后被别的路径卖掉了，此时尾盘只能收摊留痕（不硬卖）。
-// 反 T（Leg=sell）：回踩后买回等量。买回被拦（现金不足/池纪律/涨停/无价）一律按 Q8 收摊：
-// **不重试、不隔夜追买**——追买是在已经证明"买不回来"之后继续加注，方向是错的。
-// English: the pairing leg. Buy-first sells an equal base amount (only base is sellable, the intraday
-// layer is T+1 locked); sell-first buys the same amount back and, per Q8, unwinds on any block
-// instead of retrying — chasing after a proven failure is the wrong direction.
+// 正 T（Leg=buy）：现价相对买价走出 `min_spread_pct` 有利价差 ⇒ 卖出**等量底仓**；
+// 到判定时刻（force）**无条件**卖出等量底仓、亏损也卖——买腿是新增敞口，敞口过夜需要许可，
+// 减敞口不需要（owner 三轮裁决里唯一保留的"时钟义务"就是这一条）。
+//
+// 反 T（Leg=sell）：
+//
+//	· 盘中配对（回落 ≥ min_spread_pct）⇒ 买回等量，规则驱动不要求买入信号；
+//	· 尾盘未配对 ⇒ **只有活跃买入信号才回补**，且必须重走战略闸门（§8.5.3）；
+//	  亏损超过 `loss_breaker_pct` ⇒ 熔断买回通道，转战略减仓并告警；
+//	  无信号 ⇒ `converted`（仓位主动变更，不是被动收摊，账务与 T 收益都分开）。
 func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo, p TParams, force bool, now time.Time) {
 	r := e.openTRoundFor(code)
 	if r == nil {
@@ -250,7 +489,7 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 	}
 	pos := e.positions[code]
 	if pos == nil || pos.Qty <= 0 {
-		e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0, "持仓已不在账，回转作废", now)
+		e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0, "持仓已不在账，回转作废", now, 0)
 		return
 	}
 	price := tQuotePrice(quotes, code)
@@ -262,49 +501,87 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 		need := r.LegQty
 		fav := (price - r.LegPrice) / r.LegPrice * 100
 		if !force && fav < p.MinSpreadPct {
-			return // 价差没到：继续等（不追高卖，卖腿只负责把已实现的浮盈落袋）
+			return // 价差没到：继续等（不追高卖）
 		}
 		sellable := e.sellableQtyLocked(pos, now)
 		if sellable < need {
 			if force {
 				e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0,
-					fmt.Sprintf("尾盘强制配平失败：可卖%d<需卖%d，机动仓将隔夜", sellable, need), now)
+					fmt.Sprintf("尾盘强制配平失败：可卖%d<需卖%d，机动仓将隔夜", sellable, need), now, 0)
 			}
 			return
 		}
-		sold, err := e.sellQtyLocked(pos, price, need, "§T-MODE 正T卖出腿 "+r.ID)
+		sold, err := e.sellQtyLocked(pos, price, need, tRStrategies+" 正T卖出腿 "+r.ID)
 		if err != nil {
 			log.Printf("[paper] §T-MODE 正T卖出腿被拒 %s: %v（回转保持 open，下一轮再试）", code, err)
 			return
 		}
-		e.finishTRoundLocked(r, tRStateDone, sold, e.applySellPriceLocked(price),
-			(e.applySellPriceLocked(price)-r.LegPrice)*float64(sold),
-			fmt.Sprintf("正T配对完成：买%.2f→卖%.2f 价差%.2f%%", r.LegPrice, e.applySellPriceLocked(price), fav), now)
+		fill := e.applySellPriceLocked(price)
+		e.finishTRoundLocked(r, tRStateDone, sold, fill, (fill-r.LegPrice)*float64(sold),
+			fmt.Sprintf("正T配对完成：买%.2f→卖%.2f 价差%.2f%%%s", r.LegPrice, fill, fav,
+				tern(force, "（尾盘强制配平）", "")), now, sold)
 		e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
-			StrategyType: pos.StrategyType, Side: "sell", Kind: "正T卖出", Price: e.applySellPriceLocked(price),
-			Qty: sold, Status: "filled", Reason: "§T-MODE " + r.ID, CreatedAt: now})
+			StrategyType: pos.StrategyType, Side: "sell", Kind: "正T卖出", Price: fill,
+			Qty: sold, Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
 		return
 	}
 
-	// 反 T：先卖后买，第二腿是买回。
-	if force {
-		e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0,
-			"尾盘未回踩：反T卖腿按普通减仓收摊（Q8 不追买）", now)
-		return
-	}
+	// 反 T：第一腿已卖出，第二腿是买回。
 	fav := (r.LegPrice - price) / r.LegPrice * 100
-	if fav < p.MinSpreadPct {
-		return
-	}
 	need := r.LegQty
+	if force {
+		lossPct := (price - r.LegPrice) / r.LegPrice * 100 // 正数＝买回更贵＝这轮是亏的
+		if p.LossBreakerPct > 0 && lossPct > p.LossBreakerPct {
+			e.finishTRoundLocked(r, tRStateConvert, 0, 0, 0,
+				fmt.Sprintf("买回熔断：亏损 %.2f%% > 阈值 %.2f%% ⇒ 封买回通道，转战略减仓并告警",
+					lossPct, p.LossBreakerPct), now, 0)
+			log.Printf("[paper] §T-MODE t-buyback-breaker 熔断 %s(%s) 卖%.2f 现%.2f 亏%.2f%% 阈值%.2f%%",
+				r.Code, r.Name, r.LegPrice, price, lossPct, p.LossBreakerPct)
+			return
+		}
+		sigID, hasSig := "", false
+		if p.ActiveBuySignal != nil {
+			sigID, hasSig = p.ActiveBuySignal(code, r.LegAt)
+		}
+		if !hasSig {
+			e.finishTRoundLocked(r, tRStateConvert, 0, 0, 0,
+				"尾盘无活跃买入信号 ⇒ 不回补，转战略减仓（§8.5.2 作废时钟义务）", now, 0)
+			log.Printf("[paper] §T-MODE 尾盘不回补 %s(%s) 卖%d股@%.2f → converted",
+				r.Code, r.Name, r.LegQty, r.LegPrice)
+			return
+		}
+		if e.tSignalConsumedLocked(sigID) ||
+			(p.SignalConsumedByStrategic != nil && p.SignalConsumedByStrategic(sigID)) {
+			e.finishTRoundLocked(r, tRStateConvert, 0, 0, 0,
+				"尾盘回补要用的信号已被消费 ⇒ 不再买回（§8.4.3 一次性消费）", now, 0)
+			return
+		}
+		allowed := need
+		if p.StrategicGate != nil {
+			a, reason := p.StrategicGate(code, need)
+			if a <= 0 {
+				e.finishTRoundLocked(r, tRStateConvert, 0, 0, 0,
+					"尾盘回补被战略闸门拦下 ⇒ 转战略减仓："+reason, now, 0)
+				return
+			}
+			allowed = a
+		}
+		if allowed < need {
+			e.finishTRoundLocked(r, tRStateConvert, 0, 0, 0,
+				fmt.Sprintf("尾盘回补仅部分过闸门 %d/%d ⇒ 差额转战略减仓（§8.5.3）", allowed, need), now, 0)
+			return
+		}
+		r.UsedSignalID = sigID
+	} else if fav < p.MinSpreadPct {
+		return // 盘中配对只看价差
+	}
 	if err := e.addToPositionLocked(pos, pos.Code, pos.Name, pos.Strategy, price, price, need,
-		"§T-MODE 反T买回腿 "+r.ID); err != nil {
-		// Q8：买回被拦即收摊，不重试不追买；被拒本身也留一条订单（事后能看出"为什么没买回来"）。
+		tRStrategies+" 反T买回腿 "+r.ID); err != nil {
 		e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 			StrategyType: pos.StrategyType, Side: "buy", Kind: "反T买回", Price: price, Qty: need,
-			Status: "rejected", Reason: "买回被拦，按普通减仓收摊: " + err.Error(), CreatedAt: now})
+			Status: "rejected", Reason: "买回被拦，按战略减仓收摊: " + err.Error(), CreatedAt: now})
 		e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0,
-			"买回被拦，按普通减仓收摊（不追买）: "+err.Error(), now)
+			"买回被拦，按战略减仓收摊（不追买）: "+err.Error(), now, 0)
 		return
 	}
 	fill := price
@@ -312,32 +589,67 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 		fill = price * (1 + e.cfg.SlippageBps/10000.0) // 与 addToPositionLocked 内部同口径
 	}
 	e.finishTRoundLocked(r, tRStateDone, need, fill, (r.LegPrice-fill)*float64(need),
-		fmt.Sprintf("反T配对完成：卖%.2f→买%.2f 价差%.2f%%", r.LegPrice, fill, fav), now)
+		fmt.Sprintf("反T配对完成：卖%.2f→买%.2f 价差%.2f%%%s", r.LegPrice, fill, fav,
+			tern(force, "（尾盘有信号回补）", "")), now, need)
 	e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 		StrategyType: pos.StrategyType, Side: "buy", Kind: "反T买回", Price: fill, Qty: need,
-		Status: "filled", Reason: "§T-MODE " + r.ID, CreatedAt: now})
+		Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
+	if r.UsedSignalID != "" && p.ConsumeSignal != nil {
+		p.ConsumeSignal(r.UsedSignalID)
+	}
 }
 
-// finishTRoundLocked 收尾一条回转：置终态、记第二腿与锁定价差、落盘（须持锁调用）。
-// 第二腿的成交本身已在 sellQtyLocked / addToPositionLocked 内落过盘，但那时回转还是 open 态，
-// 所以这里必须再落一次——否则重启后一条已完成的回转会被读成"还欠一条腿"，次日直接收摊留痕。
-// English: closes a round and persists again — the leg fill already persisted while the round was
-// still open, so without this second write a restart would read a completed round as still pending.
-func (e *Engine) finishTRoundLocked(r *TRound, state string, pairQty int, pairPrice, pnl float64, reason string, now time.Time) {
+func tern(cond bool, a, b string) string {
+	if cond {
+		return a
+	}
+	return b
+}
+
+// finishTRoundLocked 收尾一条回转：置终态、记第二腿与价差、算「做 T 收益」、释放冻结款并落盘。
+// 只有 done 轮有 `t_pnl_*`：converted/unwound 没有已实现 T 价差（§8.9a），
+// 计进去就是把日内手法虚增成收益。
+func (e *Engine) finishTRoundLocked(r *TRound, state string, pairQty int, pairPrice, spreadPnl float64, reason string, now time.Time, matched int) {
 	r.State = state
 	r.PairQty = pairQty
 	r.PairPrice = pairPrice
-	r.PnL = pnl
+	r.PnL = spreadPnl
 	r.ClosedAt = now
 	r.Reason = reason
-	log.Printf("[paper] §T-MODE 回转 %s %s(%s) 第%d轮 终态=%s 腿=%s %d股@%.2f 配对%d股@%.2f 价差%.2f 原因=%s",
-		r.ID, r.Mode, r.Name, r.Seq, state, r.Leg, r.LegQty, r.LegPrice, pairQty, pairPrice, pnl, reason)
+	r.QMatched = matched
+	r.FrozenCash = 0 // 终态一律释放冻结（买回已完成或明确不再买回），不留"永远占着回购款"的死账
+	if state == tRStateDone && matched > 0 && r.LegPrice > 0 && pairPrice > 0 {
+		gross := (pairPrice - r.LegPrice) * float64(matched)
+		if r.Leg == tRLegSell {
+			gross = (r.LegPrice - pairPrice) * float64(matched)
+		}
+		r.TPnlGross = round2(gross)
+		r.TPnlNet = round2(gross - e.tRoundFeeLocked(r, pairPrice, matched))
+	}
+	log.Printf("[paper] §T-MODE 回转 %s %s(%s) 第%d轮 终态=%s 腿=%s %d股@%.2f 配对%d股@%.2f 毛%.2f 净%.2f 原因=%s",
+		r.ID, r.Mode, r.Name, r.Seq, state, r.Leg, r.LegQty, r.LegPrice, pairQty, pairPrice,
+		r.TPnlGross, r.TPnlNet, reason)
 	e.trimTRoundsLocked()
 	e.persist()
 }
 
-// trimTRoundsLocked 只保留最近 tRKeepRounds 条回转（须持锁调用；只影响账本体积，不影响任何判定）。
-// English: keeps the most recent tRKeepRounds records (ledger size only, no decision impact).
+// tRoundFeeLocked 一条回转两腿的费用合计——**复用**账本既有的 `buyFeeLocked/sellFeeLocked`，
+// 不新造费率常量：否则"做 T 收益"里的费用和现金里真实扣掉的钱会变成两套口径。
+func (e *Engine) tRoundFeeLocked(r *TRound, pairPrice float64, matched int) float64 {
+	buyCost, sellProceeds := 0.0, 0.0
+	if r.Leg == tRLegBuy {
+		buyCost, sellProceeds = r.LegPrice*float64(matched), pairPrice*float64(matched)
+	} else {
+		sellProceeds, buyCost = r.LegPrice*float64(matched), pairPrice*float64(matched)
+	}
+	fee := e.buyFeeLocked(buyCost) + e.sellFeeLocked(sellProceeds)
+	if math.IsNaN(fee) || fee < 0 {
+		return 0
+	}
+	return fee
+}
+
+// trimTRoundsLocked 只保留最近 tRKeepRounds 条（账本体积，不影响判定）。
 func (e *Engine) trimTRoundsLocked() {
 	if len(e.tRounds) <= tRKeepRounds {
 		return
@@ -345,130 +657,410 @@ func (e *Engine) trimTRoundsLocked() {
 	e.tRounds = append([]TRound(nil), e.tRounds[len(e.tRounds)-tRKeepRounds:]...)
 }
 
-// openTRoundsLocked 第二遍：为符合条件的持仓开新腿（须持锁调用）。
-//
-// 入场条件全部是"宁可少做"：有底仓、无未平机动仓、当日次数未用尽、无开腿、有实时价、基准价有效。
-// 触发阈值统一相对 `AnchorOrCost()`（§ANCHOR-FIRST 的基准：有锚点用锚点，存量回落成本）——
-// 做 T 的"低吸/高抛"必须相对**建仓那笔的价**，相对摊薄成本会随着做 T 本身不断漂移，
-// 越做越容易触发，最后变成一台无脑换手机器。
-// English: opens new legs only under conservative conditions. The trigger is measured against
-// AnchorOrCost() on purpose: measuring against the diluted cost would drift every time a round
-// completes, so the trigger would get easier and easier and degrade into mindless churn.
+// ── step0~step7：能不能开腿的判定链（与执行分离，便于逐条驱动与单测）────────────────────
+
+// openTRoundsLocked 遍历持仓，先问"能不能开"（tOpenBlockReason），可以才真正开腿。
 func (e *Engine) openTRoundsLocked(quotes map[string]*data.StockInfo, p TParams, day string, now time.Time) {
+	if p.DayBlocked {
+		e.tNoteBlockLocked("step0", "熔断日两向都不开新腿", "")
+		return
+	}
 	codes := make([]string, 0, len(e.positions))
 	for code := range e.positions {
 		codes = append(codes, code)
 	}
 	sort.Strings(codes)
-
+	// 总量帽分母＝min(总资产, 持仓总市值)（六轮 T6-2）。持仓市值用本层同一批估值价，
+	// 不另取快照：两个读数来源不同会让帽的松紧随读取时点漂移。
+	totalValue, holdValue := e.tBookValueLocked(now)
+	capBase := math.Min(totalValue, holdValue)
 	for _, code := range codes {
-		pos := e.positions[code]
-		if pos == nil || pos.Qty <= 0 {
+		if why := e.tOpenBlockReason(code, quotes, p, day, now, capBase); why != "" {
+			step, reason := splitStep(why)
+			e.tNoteBlockLocked(step, reason, code)
 			continue
 		}
-		if e.openTRoundFor(code) != nil {
-			continue // 已有开腿：先把它配平，绝不叠加第二条腿
-		}
-		if e.tRoundsUsedLocked(code, day) >= p.MaxRounds {
-			continue
-		}
-		layers := LayersOfPosition(pos, now)
-		if layers.BaseQty <= 0 {
-			continue // 无底仓（含全仓当日买入）：T+1 下没有任何可卖量，做不了 T
-		}
-		if layers.IntradayQty > 0 {
-			continue // 已有未平机动仓：先把旧的配平，不叠新的（否则机动仓会越滚越大）
-		}
-		price := tQuotePrice(quotes, code)
-		if price <= 0 {
-			continue
-		}
-		ref := pos.AnchorOrCost()
-		if ref <= 0 {
-			continue
-		}
-		capQty := T0Cap(pos.Qty, p.CapPct/100.0)
+		e.openLegForCodeLocked(code, quotes, p, day, now)
+	}
+}
 
-		// 正 T：现价相对基准跌够阈值 ⇒ 低吸买入机动仓。
-		if p.BuyFirst {
-			if dip := (ref - price) / ref * 100; dip >= p.MinSpreadPct {
-				qty := lotFloor(capQty)
-				if qty >= 100 {
-					if e.openBuyFirstLocked(pos, layers.BaseQty, qty, price, day, now, dip) {
-						continue // 同一轮同一代码只开一条腿
-					}
+// splitStep 把"step4 xxx"拆成 (step4, xxx)，供留痕按步骤归一。
+func splitStep(s string) (step, rest string) {
+	if i := strings.Index(s, " "); i > 0 {
+		return s[:i], s[i+1:]
+	}
+	return "step?", s
+}
+
+// tOpenBlockReason 返回空串＝允许开腿；非空是"stepN 原因"。
+func (e *Engine) tOpenBlockReason(code string, quotes map[string]*data.StockInfo, p TParams, day string,
+	now time.Time, capBase float64) string {
+	pos := e.positions[code]
+	if pos == nil || pos.Qty <= 0 {
+		return "step0 无持仓"
+	}
+	if e.openTRoundFor(code) != nil {
+		return "step1 该票已有在途腿（配对先于新开，绝不叠腿）"
+	}
+	if why := e.TAnchorBlockReason(pos); why != "" {
+		return "step0 " + why
+	}
+	q := quotes[code]
+	if q == nil || q.Price <= 0 {
+		return "step0 无实时价（fail-closed）"
+	}
+	v, ok := data.VWAPOf(q)
+	if !ok {
+		return fmt.Sprintf("step0 分时均线不可信(Volume=%.0f Amount=%.0f)，不做 T 也不回落成本口径", q.Volume, q.Amount)
+	}
+	buyDir, sellDir := tRoundDirections(q, v, p)
+	if buyDir && p.MinMarketScale > 0 && p.MarketScale < p.MinMarketScale {
+		return fmt.Sprintf("step0 正T环境门 MS=%.3f<%.2f", p.MarketScale, p.MinMarketScale)
+	}
+	if sellDir && p.MarketScale < p.SellEnvMinMarketScale {
+		return fmt.Sprintf("step0 反T环境门 MS=%.3f<%.2f（极端弱势不做T）", p.MarketScale, p.SellEnvMinMarketScale)
+	}
+	if buyDir && p.MarketPlungePct < 0 && p.IndexChangePct <= p.MarketPlungePct {
+		return fmt.Sprintf("step0 大盘急跌 %.2f%% ≤ %.2f%%，停正T", p.IndexChangePct, p.MarketPlungePct)
+	}
+	if why := e.tLiquidityBlock(code, q, p); why != "" {
+		return "step0.5 " + why
+	}
+	if p.MaxRounds > 0 && e.tRoundsUsedLocked(code, day) >= p.MaxRounds {
+		return fmt.Sprintf("step2 单码当日回转次数已满(%d/%d)", e.tRoundsUsedLocked(code, day), p.MaxRounds)
+	}
+	if tLastOpenPassed(now, p.LastOpenHM) {
+		return fmt.Sprintf("step3 已过最后开腿时刻 %s", p.LastOpenHM)
+	}
+	if tInCooling(now, p.OpenCoolingMin) {
+		return "step3 开盘冷静期内（分时均线样本不足，V 与现价几乎重合）"
+	}
+	if why := tIntradayBlock(q, v, p); why != "" {
+		return "step4 " + why
+	}
+	if _, _, why := e.tVminCheck(code, v, p); why != "" {
+		return "step4 " + why
+	}
+	if why := e.tSignalBlock(code, q, v, p, now); why != "" {
+		return "step5 " + why
+	}
+	if p.StrategicBusy != nil && p.StrategicBusy(code) {
+		return "step6 该股有未执行战略信号/在途单，T 让路（§8.7）"
+	}
+	if why := e.tQuotaBlock(code, pos, q, v, p, day, capBase, buyDir, sellDir); why != "" {
+		return "step7 " + why
+	}
+	return ""
+}
+
+// tRoundDirections 现价在分时均线哪一侧，决定本轮可能开的是正 T 还是反 T。
+// 两侧都不满足偏离门时两个 false —— 这就是"今天这只票没有回转机会"，不是缺陷。
+func tRoundDirections(q *data.StockInfo, v float64, p TParams) (buy, sell bool) {
+	dev := (q.Price - v) / v * 100
+	if p.BuyFirst && dev <= -p.VWAPDevPct {
+		buy = true
+	}
+	if p.SellFirst && dev >= p.VWAPDevPct {
+		sell = true
+	}
+	return buy, sell
+}
+
+// tLiquidityBlock 流动性前置（§8.4.4b）：任一读数不可得**按不过处理**。
+func (e *Engine) tLiquidityBlock(code string, q *data.StockInfo, p TParams) string {
+	if p.MinAmountWan > 0 {
+		if q.Amount <= 0 {
+			return "当日成交额读数不可得，按不过处理"
+		}
+		if w := q.Amount / 10000.0; w < p.MinAmountWan {
+			return fmt.Sprintf("当日成交额 %.0f 万 < %.0f 万", w, p.MinAmountWan)
+		}
+	}
+	if p.MinTurnoverPct > 0 {
+		if q.Turnover <= 0 {
+			return "换手率读数不可得，按不过处理"
+		}
+		if q.Turnover < p.MinTurnoverPct {
+			return fmt.Sprintf("换手率 %.2f%% < %.2f%%", q.Turnover, p.MinTurnoverPct)
+		}
+	}
+	if strings.Contains(strings.ToUpper(q.Name), "ST") {
+		return "ST/退市整理股不做日内回转（±5% 限制 + 停牌风险，止损通道随时关门）"
+	}
+	if p.MinListedDays > 0 {
+		if p.StockMeta == nil {
+			return "上市天数无源（未接 StockMeta 回调），按不过处理"
+		}
+		days, isST, ok := p.StockMeta(code)
+		if isST {
+			return "ST 股不做日内回转"
+		}
+		if !ok || days <= 0 {
+			return "上市天数读数不可得，按不过处理"
+		}
+		if days < int(p.MinListedDays) {
+			return fmt.Sprintf("上市 %d 天 < %.0f 天（次新股日内振幅常超 10%%，振幅门形同不设）", days, p.MinListedDays)
+		}
+	}
+	return ""
+}
+
+// tIntradayBlock 日内位置：振幅门 → 偏离门 → 近极值带 → 涨跌停距离。
+func tIntradayBlock(q *data.StockInfo, v float64, p TParams) string {
+	base := q.PrevClose
+	if base <= 0 {
+		base = q.Close
+	}
+	if base <= 0 || q.High <= 0 || q.Low <= 0 || q.High < q.Low {
+		return "日内 High/Low/PrevClose 读数不完整"
+	}
+	if amp := (q.High - q.Low) / base * 100; amp < p.MinAmplitudePct {
+		return fmt.Sprintf("当日振幅 %.2f%% < 门槛 %.2f%%（振幅不够就走不完成本+价差，开了也配不上对）", amp, p.MinAmplitudePct)
+	}
+	dev := (q.Price - v) / v * 100
+	if math.Abs(dev) < p.VWAPDevPct {
+		return fmt.Sprintf("现价相对分时均线只偏 %.2f%%，未达偏离门 %.2f%%", dev, p.VWAPDevPct)
+	}
+	if dev < 0 && q.Price < q.Low*(1+p.NearExtremePct/100) {
+		return "正T位置门：现价已砸到日内低点附近，不接正在砸向低点的刀"
+	}
+	if dev > 0 && q.Price < q.High*(1-p.NearExtremePct/100) {
+		return "反T位置门：涨过又回落过半，不在近高点区，不做半山腰卖"
+	}
+	if p.LimitDistancePct > 0 {
+		up, down := tLimitPrices(q.Code, q.Name, base)
+		if up > 0 && q.Price >= up*(1-p.LimitDistancePct/100) {
+			return "逼近涨停：反T卖腿可能封板、正T也买不进，本票本轮不做"
+		}
+		if down > 0 && q.Price <= down*(1+p.LimitDistancePct/100) {
+			return "逼近跌停：正T买腿买得到也卖不掉，本票本轮不做"
+		}
+	}
+	return ""
+}
+
+// tVminCheck 分钟链一致性校验（§8.4.1 校验腿）：差异过大说明两个读数至少有一个不可信，不动资金；
+// 分钟链本身取不到只记降级、不拦——它不该成为日内操作的新单点依赖。
+func (e *Engine) tVminCheck(code string, v float64, p TParams) (vmin, dev float64, block string) {
+	if p.MinuteBasis == nil || v <= 0 {
+		return 0, 0, ""
+	}
+	vm, ok := p.MinuteBasis(code)
+	if !ok || vm <= 0 {
+		return 0, 0, ""
+	}
+	dev = math.Abs(vm-v) / v * 100
+	if dev > p.VWAPCheckTolPct {
+		return vm, dev, fmt.Sprintf("分时均线校验不一致：主源%.3f vs 分钟链%.3f 偏差%.2f%%>%.2f%%",
+			v, vm, dev, p.VWAPCheckTolPct)
+	}
+	return vm, dev, ""
+}
+
+// tSignalBlock 信号侧（§8.4.2）。两边语义相反且刻意不对称：
+// 正 T 缺信号＝不作为（安全）；反 T 缺信号＝照做（减敞口），它靠否决门让位给止盈止损。
+func (e *Engine) tSignalBlock(code string, q *data.StockInfo, v float64, p TParams, now time.Time) string {
+	dev := (q.Price - v) / v * 100
+	if dev < 0 {
+		if !p.BuyFirst {
+			return "正T方向未开"
+		}
+		if p.NewBuySignal == nil {
+			return "正T需要活跃买入信号，但未接 NewBuySignal 回调（不作为）"
+		}
+		id, ok := p.NewBuySignal(code, e.lastRoundEndedAt(code, now))
+		if !ok {
+			return "无候选 B 口径的新活跃买入信号（老信号不许反复低吸）"
+		}
+		if e.tSignalConsumedLocked(id) {
+			return "该信号已被本账 T 腿消费（§8.4.3 一次性消费）"
+		}
+		if p.SignalConsumedByStrategic != nil && p.SignalConsumedByStrategic(id) {
+			return "该信号已被战略买单消费，同一判断不买第二次"
+		}
+		return ""
+	}
+	if !p.SellFirst {
+		return "反T方向未开"
+	}
+	if p.ActiveSellVerdict != nil && p.ActiveSellVerdict(code) {
+		return "反T否决：已有活跃卖出裁决，交给信号执行（§8.7）"
+	}
+	if p.StopLineDistance == nil {
+		return "反T否决门未接线（无 StopLineDistance 回调），宁可不 T"
+	}
+	d, ok := p.StopLineDistance(code, q.Price)
+	if !ok {
+		return "反T否决：止盈/止损线距离读数不可得，按否决处理（fail-closed）"
+	}
+	if d < p.StopGuardPct {
+		return fmt.Sprintf("反T否决：距止盈/止损线 %.2f%% < %.2f%%（止盈止损优先于做T）", d, p.StopGuardPct)
+	}
+	return ""
+}
+
+// tQuotaBlock 额度门：底仓/机动仓、单票 50% 帽、反 T 当日总量帽余量、T 可用现金。
+func (e *Engine) tQuotaBlock(code string, pos *Position, q *data.StockInfo, v float64, p TParams,
+	day string, capBase float64, buy, sell bool) string {
+	layers := LayersOfPosition(pos, e.clockNow())
+	if layers.BaseQty <= 0 {
+		return "无底仓（全仓当日买入）：T+1 下没有任何可卖量，做不了 T"
+	}
+	if layers.IntradayQty > 0 {
+		return "已有未平机动仓：先把旧的配平，不叠新的"
+	}
+	capQty := T0Cap(pos.Qty, p.CapPct/100.0)
+	if lotFloor(capQty) < 100 {
+		return fmt.Sprintf("单票 T 帽（%.0f%%）不足 1 手", p.CapPct)
+	}
+	if sell && p.IntradaySellCapTotalPct > 0 {
+		if capBase <= 0 {
+			return "反T总量帽分母不可得，按不过处理"
+		}
+		remain := capBase*p.IntradaySellCapTotalPct/100.0 - e.sellFirstNotionalLocked(day)
+		if remain <= 0 {
+			return fmt.Sprintf("当日反T卖腿市值已达总量帽 %.0f（分母 min(总资产,持仓市值)），不再开卖腿",
+				capBase*p.IntradaySellCapTotalPct/100.0)
+		}
+		if remain < q.Price*100 {
+			return fmt.Sprintf("总量帽余量 %.0f 不足 1 手", remain)
+		}
+	}
+	if buy {
+		avail := e.cash - e.tFrozenCashLocked()
+		if avail < q.Price*100 {
+			return fmt.Sprintf("T 可用现金 %.0f 不足 1 手（反T冻结款是专款，不参与竞争）", avail)
+		}
+	}
+	return ""
+}
+
+// ── step8/step9：真正开腿并落账 ────────────────────────────────────────────────────────
+
+// openLegForCodeLocked 开腿。走到这里说明 0~7 步全过；顺序一旦被打乱，这里就可能开出半态腿。
+func (e *Engine) openLegForCodeLocked(code string, quotes map[string]*data.StockInfo, p TParams, day string, now time.Time) {
+	pos := e.positions[code]
+	q := quotes[code]
+	price := q.Price
+	v, _ := data.VWAPOf(q)
+	vmin, checkDev, block := e.tVminCheck(code, v, p)
+	if block != "" {
+		e.tNoteBlockLocked("step4", block, code)
+		return
+	}
+	layers := LayersOfPosition(pos, now)
+	capQty := T0Cap(pos.Qty, p.CapPct/100.0)
+	base := q.PrevClose
+	if base <= 0 {
+		base = q.Close
+	}
+	amp := 0.0
+	if base > 0 {
+		amp = (q.High - q.Low) / base * 100
+	}
+	rd := tReadings{v: v, vmin: vmin, checkDev: checkDev, dev: (price - v) / v * 100,
+		high: q.High, low: q.Low, amp: amp, amountWan: q.Amount / 10000.0, turnover: q.Turnover,
+		ms: p.MarketScale}
+	if rd.dev < 0 && p.BuyFirst {
+		sigID := ""
+		if p.NewBuySignal != nil {
+			if id, ok := p.NewBuySignal(code, e.lastRoundEndedAt(code, now)); ok {
+				sigID = id
+			}
+		}
+		if qty := lotFloor(capQty); qty >= 100 {
+			e.openBuyFirstLocked(pos, layers.BaseQty, qty, price, day, now, rd, sigID, p)
+		}
+		return
+	}
+	if rd.dev > 0 && p.SellFirst {
+		maxSell := layers.BaseQty - tRMinBaseKeep
+		if capQty < maxSell {
+			maxSell = capQty
+		}
+		if p.IntradaySellCapTotalPct > 0 {
+			totalValue, holdValue := e.tBookValueLocked(now)
+			if capBase := math.Min(totalValue, holdValue); capBase > 0 {
+				remain := capBase*p.IntradaySellCapTotalPct/100.0 - e.sellFirstNotionalLocked(day)
+				if byCap := int(remain / price); byCap < maxSell {
+					maxSell = byCap
 				}
 			}
 		}
-		// 反 T：现价相对基准涨够阈值 ⇒ 高抛一部分底仓（必须留一手）。
-		if p.SellFirst {
-			if rise := (price - ref) / ref * 100; rise >= p.MinSpreadPct {
-				maxSell := layers.BaseQty - tRMinBaseKeep
-				if capQty < maxSell {
-					maxSell = capQty
-				}
-				if qty := lotFloor(maxSell); qty >= 100 {
-					e.openSellFirstLocked(pos, layers.BaseQty, qty, price, day, now, rise)
-				}
-			}
+		if qty := lotFloor(maxSell); qty >= 100 {
+			e.openSellFirstLocked(pos, layers.BaseQty, qty, price, day, now, rd, p)
 		}
 	}
 }
 
-// openBuyFirstLocked 正 T 第一腿：买入机动仓。返回 true 表示腿已成交并登记回转。
-//
-// 买入走 `addToPositionLocked`（与手动加仓同一条路径）：费用、滑点、池扣款、层账批次、展示态
-// 全部一致——做 T 的买入没有任何理由绕开这些口径，否则"做 T 的仓位"会成为一个更便宜的资金来源。
-// 池纪律/现金不足会直接返回错误，此时不开回转（不是失败，只是这一轮不做）。
-// English: the buy-first opening leg goes through addToPositionLocked so fees, slippage, pool debit,
-// lot ledger and display state all match a manual add-on. A blocked buy simply means no round this
-// round — not a failure.
-func (e *Engine) openBuyFirstLocked(pos *Position, baseQty, qty int, price float64, day string, now time.Time, dip float64) bool {
+// tReadings 开腿时刻的日内读数集合（一次性打包，避免 newTRoundLocked 长出十几个参数）。
+type tReadings struct {
+	v, vmin, checkDev, dev  float64
+	high, low, amp          float64
+	amountWan, turnover, ms float64
+}
+
+// openBuyFirstLocked 正 T 第一腿：买入机动仓。
+// 刻意走 `addToPositionLocked`（与手动加仓同一条路径）：费用、滑点、池扣款、层账批次全部一致，
+// 绕开它会让"做 T 的仓位"成为更便宜的资金来源；代价是它会摊薄整仓成本，
+// 所以缺陷修在**裁决内核读锚点**（AnchorHard + 锚点前置），而不是给 T 腿开旁路。
+func (e *Engine) openBuyFirstLocked(pos *Position, baseQty, qty int, price float64, day string, now time.Time,
+	rd tReadings, sigID string, p TParams) bool {
 	if err := e.addToPositionLocked(pos, pos.Code, pos.Name, pos.Strategy, price, price, qty,
-		"§T-MODE 正T买入腿"); err != nil {
+		tRStrategies+" 正T买入腿"); err != nil {
 		log.Printf("[paper] §T-MODE 正T买入腿未成交 %s(%s) %d股: %v", pos.Code, pos.Name, qty, err)
 		return false
 	}
 	fill := price
 	if e.cfg.SlippageBps > 0 {
-		fill = price * (1 + e.cfg.SlippageBps/10000.0) // 与 addToPositionLocked 内部同口径
+		fill = price * (1 + e.cfg.SlippageBps/10000.0)
 	}
-	r := e.newTRoundLocked(pos, TRModeBuyFirst, tRLegBuy, qty, fill, baseQty, day, now,
-		fmt.Sprintf("低吸触发：现价相对基准跌 %.2f%%", dip))
+	r := e.newTRoundLocked(pos, TRModeBuyFirst, tRLegBuy, qty, fill, baseQty, day, now, rd, sigID,
+		fmt.Sprintf("低吸触发：现价在分时均线下方 %.2f%%", rd.dev))
+	r.AnchorPrice = pos.AnchorPrice
 	e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 		StrategyType: pos.StrategyType, Side: "buy", Kind: "正T买入", Price: fill, Qty: qty,
-		Status: "filled", Reason: "§T-MODE " + r.ID, CreatedAt: now})
+		Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
+	if sigID != "" && p.ConsumeSignal != nil {
+		p.ConsumeSignal(sigID)
+	}
 	return true
 }
 
-// openSellFirstLocked 反 T 第一腿：卖出底仓的一部分（必然留 ≥ tRMinBaseKeep 股）。
-//
-// 刻意走 `sellQtyLocked` 而不是 `sellAllLocked`：后者会删持仓 + 触发清仓镜像 + 记再入场冷却，
-// 三件事任何一件发生，买回腿都会被自家闸门挡死（方案 2.7）。也不置位 trimDone ——
-// 做 T 不是减仓裁决，占了当日减仓槽就会把真正的退出裁决吞掉。
-// English: deliberately uses sellQtyLocked, never sellAllLocked (which would delete the position,
-// mirror a close and stamp the re-entry cooldown, blocking the buy-back), and never touches trimDone
-// (a T leg is not a trim adjudication and must not consume the day's trim slot).
-func (e *Engine) openSellFirstLocked(pos *Position, baseQty, qty int, price float64, day string, now time.Time, rise float64) {
-	sold, err := e.sellQtyLocked(pos, price, qty, "§T-MODE 反T卖出腿")
+// openSellFirstLocked 反 T 第一腿：卖出底仓一部分（必然留 ≥1 手 + ≥50% 原持仓），
+// 并冻结回购资金：专款专用，战略买入不得动用（§8.3 纪律 3）。
+func (e *Engine) openSellFirstLocked(pos *Position, baseQty, qty int, price float64, day string, now time.Time,
+	rd tReadings, p TParams) {
+	sold, err := e.sellQtyLocked(pos, price, qty, tRStrategies+" 反T卖出腿")
 	if err != nil {
 		log.Printf("[paper] §T-MODE 反T卖出腿被拒 %s(%s) %d股: %v", pos.Code, pos.Name, qty, err)
 		return
 	}
 	fill := e.applySellPriceLocked(price)
-	r := e.newTRoundLocked(pos, TRModeSellFirst, tRLegSell, sold, fill, baseQty, day, now,
-		fmt.Sprintf("高抛触发：现价相对基准涨 %.2f%%", rise))
+	r := e.newTRoundLocked(pos, TRModeSellFirst, tRLegSell, sold, fill, baseQty, day, now, rd, "",
+		fmt.Sprintf("高抛触发：现价在分时均线上方 %.2f%%", rd.dev))
+	r.AnchorPrice = pos.AnchorPrice
+	// 冻结款＝max(卖腿回款, 现价×买回量) + 费用缓冲：买回价高于卖价时也要有钱等着，
+	// 否则"尾盘有信号却不回补"会变成现金不足造成的半态，而不是决策。
+	proceeds := fill * float64(sold)
+	needCash := price * float64(sold)
+	buf := p.FeeBufferPct
+	if buf <= 0 {
+		buf = tRFrozenFeeBufferPct // 默认 0.6%：与实盘预算的费用缓冲同值
+	}
+	frozen := math.Max(proceeds, needCash) * (1 + buf/100.0)
+	r.FrozenCash = round2(frozen)
+	e.trimTRoundsLocked()
+	e.persist()
 	e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 		StrategyType: pos.StrategyType, Side: "sell", Kind: "反T卖出", Price: fill, Qty: sold,
-		Status: "filled", Reason: "§T-MODE " + r.ID, CreatedAt: now})
+		Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
 }
 
 // newTRoundLocked 登记一条 open 态回转并落盘（须持锁调用）。
-// seq 按"该代码当日已开次数 + 1"生成，因此幂等键在单日单码内严格递增且不与既有键重复。
-// English: registers an open round; seq is (rounds opened today for this code + 1), so the idempotency
-// key is strictly increasing within one code-day and never collides.
+// seq＝该代码当日已开次数 + 1，因此幂等键在单码单日内严格递增且不与既有键重复。
 func (e *Engine) newTRoundLocked(pos *Position, mode, leg string, qty int, price float64, baseQty int,
-	day string, now time.Time, reason string) *TRound {
+	day string, now time.Time, rd tReadings, sigID, reason string) *TRound {
 	seq := e.tRoundsUsedLocked(pos.Code, day) + 1
 	r := TRound{
 		ID:       fmt.Sprintf("t0:%s:%s:%s:%d", pos.Code, mode, day, seq),
@@ -484,18 +1076,110 @@ func (e *Engine) newTRoundLocked(pos *Position, mode, leg string, qty int, price
 		State:    tRStateOpen,
 		Day:      day,
 		Reason:   reason,
+		VWAP:     round3(rd.v), Vmin: round3(rd.vmin), CheckDevPct: round2(rd.checkDev),
+		DevPct: round2(rd.dev), High: rd.high, Low: rd.low, AmplitudePct: round2(rd.amp),
+		AmountWan: round2(rd.amountWan), TurnoverPct: round2(rd.turnover),
+		UsedSignalID: sigID, MarketScaleAt: rd.ms,
 	}
 	e.tRounds = append(e.tRounds, r)
-	log.Printf("[paper] §T-MODE 开腿 %s %s(%s) %s %d股 @%.2f 底仓%d股 原因=%s",
-		r.ID, mode, pos.Name, leg, qty, price, baseQty, reason)
+	log.Printf("[paper] §T-MODE 开腿 %s %s(%s) %s %d股@%.2f 底仓%d股 V=%.3f Vmin=%.3f 偏差%.2f%% 振幅%.2f%% 成交额%.0f万 换手%.2f%% MS=%.3f 信号=%s 原因=%s",
+		r.ID, mode, pos.Name, leg, qty, price, baseQty, rd.v, rd.vmin, rd.dev, rd.amp,
+		rd.amountWan, rd.turnover, rd.ms, orDash(sigID), reason)
 	e.trimTRoundsLocked()
 	e.persist()
 	return &e.tRounds[len(e.tRounds)-1]
 }
 
-// TRounds 全部回转记录的快照（只读；供接口与排障展示）。
-// 返回副本而不是切片头：调用方在锁外遍历时，引擎可能正在 append，共享底层数组会读到撕裂的行。
-// English: a read-only snapshot (a copy, so an out-of-lock reader can't observe a torn append).
+// ── 账本口径与只读接口 ──────────────────────────────────────────────────────────────────
+
+// tBookValueLocked 返回（总资产＝现金+持仓市值, 持仓总市值）。总量帽分母要两者的较小值。
+func (e *Engine) tBookValueLocked(now time.Time) (total, holdValue float64) {
+	for _, p := range e.positions {
+		if p == nil || p.Qty <= 0 {
+			continue
+		}
+		v := p.Mark
+		if v <= 0 {
+			v = p.CostPrice
+		}
+		holdValue += v * float64(p.Qty)
+	}
+	return e.cash + holdValue, holdValue
+}
+
+// tOpenBuyValueLocked 在途正 T 买腿市值（须持锁调用）：目标仓位模型要把它从战略当前仓位里剔出去。
+func (e *Engine) tOpenBuyValueLocked() float64 {
+	sum := 0.0
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.State == tRStateOpen && r.Leg == tRLegBuy {
+			sum += r.LegPrice * float64(r.LegQty)
+		}
+	}
+	return sum
+}
+
+// tOpenSellValueLocked 在途反 T 卖腿市值（须持锁调用）：那部分底仓还欠着买回，战略仓位要加回去，
+// 否则"高抛之后"会被读成目标已经达成、又腾出一块空间去开新仓。
+func (e *Engine) tOpenSellValueLocked() float64 {
+	sum := 0.0
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.State == tRStateOpen && r.Leg == tRLegSell {
+			sum += r.LegPrice * float64(r.LegQty)
+		}
+	}
+	return sum
+}
+
+// tFrozenCashLocked 在途反 T 腿的冻结回购款合计（须持锁调用）。
+func (e *Engine) tFrozenCashLocked() float64 {
+	sum := 0.0
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.State == tRStateOpen && r.Leg == tRLegSell {
+			sum += r.FrozenCash
+		}
+	}
+	return sum
+}
+
+// TFrozenCash 对外只读入口（战略预算与面板共用同一本冻结账）。
+func (e *Engine) TFrozenCash() float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.tFrozenCashLocked()
+}
+
+// tQuotePrice 取实时快照价（缺失/非法返回 0，调用方按"无有效价"跳过）。
+func tQuotePrice(quotes map[string]*data.StockInfo, code string) float64 {
+	if q, ok := quotes[code]; ok && q != nil && q.Price > 0 {
+		return q.Price
+	}
+	return 0
+}
+
+// lotFloor 向下取整到整手；不足 1 手返回 0（两腿都必须整手，零股只能清仓卖出）。
+func lotFloor(qty int) int {
+	if qty < 100 {
+		return 0
+	}
+	return qty / 100 * 100
+}
+
+// tLimitPrices 按昨收算涨/跌停价（分板块幅度复用 LimitUpPct，不另立一套）。
+func tLimitPrices(code, name string, prevClose float64) (up, down float64) {
+	if prevClose <= 0 {
+		return 0, 0
+	}
+	pct := LimitUpPct(code, name)
+	return round2(prevClose * (1 + pct/100)), round2(prevClose * (1 - pct/100))
+}
+
+// round3 三位小数：分时均线类读数要能看出分厘差，账本既有的 round2（两位）不复用，避免把 V 抹成现价。
+func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
+
+// TRounds 全部回转记录的只读快照（返回副本：调用方在锁外遍历时不能共享正在 append 的底层数组）。
 func (e *Engine) TRounds() []TRound {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -504,10 +1188,7 @@ func (e *Engine) TRounds() []TRound {
 	return out
 }
 
-// TRoundPnL 已完成的回转累计锁定价差（元，未扣第二腿费用），供收益归因与前端展示。
-// 只统计 done 态：unwound 的那一腿已经并进普通持仓/减仓口径，再计一次就是重复记账。
-// English: accumulated locked spread of completed rounds only — unwound legs already land in the
-// normal position/trim accounting, so counting them again would double-book.
+// TRoundPnL 已完成回转变的**毛**价差合计（旧字段口径，未扣费），保留给既有面板与归因。
 func (e *Engine) TRoundPnL() float64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -520,20 +1201,89 @@ func (e *Engine) TRoundPnL() float64 {
 	return sum
 }
 
-// tQuotePrice 取实时快照价（缺失/非法返回 0，调用方按"无有效价"跳过）。
-// English: live snapshot price, 0 when missing/invalid (callers treat 0 as "no valid price").
-func tQuotePrice(quotes map[string]*data.StockInfo, code string) float64 {
-	if q, ok := quotes[code]; ok && q != nil && q.Price > 0 {
-		return q.Price
+// TRoundNetPnL 「做 T 收益」独立口径（六轮 T6-5 / §8.9a）：
+// 只统计 done 轮的**已扣两腿费用**净额；converted/unwound 与在途 open 一律不计
+// （它们的仓位变化属战略侧，计进来就是把日内手法虚增成收益）。
+// 整仓成本与卖出裁决基准都不消费这个数——T 腿盈亏永不并入 EntryPrice 是 §0 第 10 条的锁。
+// English: the standalone T P&L — net of both legs' fees, done-rounds only, never folded into cost basis.
+func (e *Engine) TRoundNetPnL() (net, gross float64, done int, feeEstShare float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	est := 0
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.State != tRStateDone {
+			continue
+		}
+		done++
+		net += r.TPnlNet
+		gross += r.TPnlGross
+		if r.FeeEst {
+			est++
+		}
 	}
-	return 0
+	if done > 0 {
+		feeEstShare = float64(est) / float64(done)
+	}
+	return round2(net), round2(gross), done, feeEstShare
 }
 
-// lotFloor 向下取整到整手（1 手 = 100 股）。做 T 的两条腿都必须整手，零股只能清仓卖出。
-// English: floor to whole lots; both T legs must be whole lots (odd shares are close-only).
-func lotFloor(qty int) int {
-	if qty < 100 {
-		return 0
+// TRoundDayStats 当日回转汇总（开/配对/收摊/转换/熔断 + 做 T 收益 + 被拦分布）。
+type TRoundDayStats struct {
+	Day          string         `json:"day"`
+	Opened       int            `json:"opened"`
+	Done         int            `json:"done"`
+	Unwound      int            `json:"unwound"`
+	Converted    int            `json:"converted"`
+	LossBreaker  int            `json:"loss_breaker"`
+	NetPnl       float64        `json:"t_pnl_net"`
+	GrossPnl     float64        `json:"t_pnl_gross"`
+	OpenLegs     int            `json:"open_legs"`
+	FrozenCash   float64        `json:"frozen_cash"`
+	SellNotional float64        `json:"sell_notional"`
+	ConvertedQty int            `json:"converted_qty"` // 未回补而转战略减仓的股数（底仓磨薄的直接读数）
+	BlockByStep  map[string]int `json:"block_by_step"`
+}
+
+// TRoundDay 返回某日（空串＝今天）的回转汇总，供接口与每日总账使用。
+func (e *Engine) TRoundDay(day string) TRoundDayStats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if day == "" {
+		day = cntime.DayCompactOf(e.clockNow())
 	}
-	return qty / 100 * 100
+	st := TRoundDayStats{Day: day, BlockByStep: map[string]int{}}
+	for k, v := range e.tBlock {
+		st.BlockByStep[k] = v
+	}
+	for i := range e.tRounds {
+		r := &e.tRounds[i]
+		if r.Day != day {
+			continue
+		}
+		st.Opened++
+		switch r.State {
+		case tRStateDone:
+			st.Done++
+			st.NetPnl += r.TPnlNet
+			st.GrossPnl += r.TPnlGross
+		case tRStateUnwound:
+			st.Unwound++
+		case tRStateConvert:
+			st.Converted++
+			st.ConvertedQty += r.LegQty
+			if strings.Contains(r.Reason, "熔断") {
+				st.LossBreaker++
+			}
+		case tRStateOpen:
+			st.OpenLegs++
+			st.FrozenCash += r.FrozenCash
+		}
+		if r.Leg == tRLegSell {
+			st.SellNotional += r.LegPrice * float64(r.LegQty)
+		}
+	}
+	st.NetPnl, st.GrossPnl = round2(st.NetPnl), round2(st.GrossPnl)
+	st.FrozenCash, st.SellNotional = round2(st.FrozenCash), round2(st.SellNotional)
+	return st
 }

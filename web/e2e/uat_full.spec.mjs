@@ -2142,3 +2142,115 @@ test.describe('§C7 行情来源契约（故障注入）', () => {
     await expect(table).not.toContainText('0.00%')
   })
 })
+
+// ── §DYN-T / §DYN-SIZE v4（2026-10-26 批 + 2026-10-27 收尾）UAT ──
+//
+// 这一批把三件"钱路径"的事搬到了页面上：做 T 回转与它的独立收益口径、v4 目标仓位模型的
+// 全部可调阈值、以及两次一次性改写资金参数前必须签字的报告（v4 迁移 + 存量锚点回填）。
+// 用例设计的原则与 §BYTE-UAT 一致：**判据打在"写没写"而不是"看起来对不对"**——
+// 报告类接口最大的风险不是读不出来，而是"读一次就顺手改了一遍配置"。
+// 所以每个 GET 之后都要回读配置确认逐字未变，再由显式带 token 的 POST 才允许变。
+//
+// English: UAT for the §DYN-T book, the v4 sizing keys and the two sign-off reports. The
+// load-bearing assertion on every report endpoint is that reading it changes nothing at all.
+test.describe('§DYN-T 做 T 与 §DYN-SIZE v4：读数面 + 签字门（2026-10-27）', () => {
+  const apiGet = async (request, path) => {
+    const res = await request.get(path)
+    return { status: res.status(), body: await res.json().catch(() => null) }
+  }
+
+  test('DYN-T1 纸面做 T 账本只读接口：结构完整、收益只算 done 轮', async ({ request }) => {
+    const { status, body } = await apiGet(request, '/api/paper/t-rounds?limit=50')
+    expect(status, 'GET /api/paper/t-rounds 必须 200（不是 404 的路由缺失）').toBe(200)
+    expect(body, '响应必须是对象').toBeTruthy()
+    expect(body.book).toBe('paper')
+    expect(Array.isArray(body.rounds), 'rounds 必须是数组（null 会让前端 map 崩）').toBe(true)
+    expect(Array.isArray(body.block_steps), 'block_steps 必须是数组').toBe(true)
+    expect(body.pnl, 'pnl 必须存在（做 T 收益是独立口径，缺字段前端只能显示 0）').toBeTruthy()
+    // 反证方向：把一条 unwound/converted 轮也算进 done_rounds 是最容易写的错，
+    // 这里用真实账本验证"净额与完成轮数同源"——有净额就必须有轮数，反之亦然。
+    const hasNet = Number(body.pnl.net || 0) !== 0
+    if (hasNet) expect(Number(body.pnl.done_rounds) > 0, '有净额却零完成轮数＝把非 done 轮计进了收益').toBe(true)
+  })
+
+  test('DYN-T2 实盘做 T 账本：缺文件必须显式 missing，绝不空数组假装正常', async ({ request }) => {
+    const { status, body } = await apiGet(request, '/api/t-live/rounds')
+    expect(status).toBe(200)
+    expect(['ok', 'missing', 'corrupt']).toContain(body.state)
+    if (body.state === 'missing' || body.state === 'corrupt') {
+      expect(Array.isArray(body.rounds) && body.rounds.length === 0, '空态也必须是数组，且损坏态不得夹带半解析明细').toBe(true)
+      expect(body.reason, 'missing/corrupt 必须给原因文案（前端要能回答"为什么没有"）').toBeTruthy()
+    }
+    if (body.state === 'ok') {
+      const done = (body.rounds || []).filter((r) => r.status === 'done')
+      expect(Number(body.pnl.done_rounds), 'done_rounds 应等于明细里的 done 行数').toBe(done.length)
+    }
+  })
+
+  test('DYN-S1 v4 报告：GET 只读不改配置，未带 token 的 POST 一律 400 且不写盘', async ({ request }) => {
+    const before = await apiGet(request, '/api/config/regime')
+    expect(before.status).toBe(200)
+    const modeBefore = (before.body.sizing || {}).mode
+
+    const plan = await apiGet(request, '/api/config/sizing-v4-plan')
+    expect(plan.status, 'GET /api/config/sizing-v4-plan 必须 200').toBe(200)
+    expect(plan.body.report, '报告必须有总账').toBeTruthy()
+    expect(plan.body.report.apply, 'GET 出来的报告 apply 必须是 false（只读）').toBe(false)
+    expect(plan.body.authorize_key, '报告要告诉前端签字 token 的键名').toBeTruthy()
+
+    // 读一次之后配置必须逐字未变——这是本条用例的全部意义（报告接口被反复点）。
+    const afterGet = await apiGet(request, '/api/config/regime')
+    expect((afterGet.body.sizing || {}).mode, 'GET 报告不得改动落盘的合成口径').toBe(modeBefore)
+
+    const unsigned = await request.post('/api/config/sizing-v4-apply', { data: { authorize: '我看过了' } })
+    expect(unsigned.status(), '错误 token 必须 400').toBe(400)
+    const afterBad = await apiGet(request, '/api/config/regime')
+    expect((afterBad.body.sizing || {}).mode, '未签字的 POST 不得改动资金参数').toBe(modeBefore)
+  })
+
+  test('DYN-S2 锚点回填报告：只读、给出前后触发价，且成本档标注不得开 T', async ({ request }) => {
+    const { status, body } = await apiGet(request, '/api/paper/anchor-backfill-plan')
+    expect(status).toBe(200)
+    expect(body.coverage, '报告首页必须是覆盖率读数').toBeTruthy()
+    expect(Array.isArray(body.plan)).toBe(true)
+    for (const row of body.plan || []) {
+      expect(row.anchor_source, '每行必须写清回填来源').toBeTruthy()
+      expect(row.stop_after > 0 || row.would_skip, '每行必须给出回填后的止损触发价，或明说无从回填').toBe(true)
+    }
+    expect(String(body.note || ''), '报告必须点明 cost_fallback/none 不许开 T 腿').toContain('不得开')
+  })
+
+  test('DYN-P1 模拟盘页：做 T 卡上屏并标明收益独立口径', async ({ page }) => {
+    const errs = watch(page)
+    await page.goto('/#/paper')
+    await expect(page.locator('.app-main .page').first()).toBeVisible({ timeout: 15000 })
+    const card = page.getByText('日内回转（做 T）', { exact: false }).first()
+    await expect(card, '做 T 卡必须出现在模拟盘页').toBeVisible({ timeout: 15000 })
+    await expect(page.getByText('收益独立口径', { exact: false }).first(), '必须写明"不计入整仓收益"').toBeVisible()
+    await page.waitForTimeout(1500)
+    await page.screenshot({ path: `${SHOT}/dyn-t-card.png`, fullPage: false })
+    const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+    expect(fatal, '做 T 卡渲染不得有未捕获 JS 错误: ' + fatal.join('|')).toHaveLength(0)
+  })
+
+  test('DYN-P2 设置页：v4 阈值表单与签字单卡；未输 token 时应用按钮禁用', async ({ page }) => {
+    const errs = watch(page)
+    await page.goto('/#/settings')
+    await expect(page.locator('.app-main .page').first()).toBeVisible({ timeout: 15000 })
+    const sheet = page.getByText('发版签字单', { exact: false }).first()
+    await expect(sheet, '签字单卡必须挂在设置页（admin）').toBeVisible({ timeout: 15000 })
+    // 两个应用按钮在没有 token 时必须禁用——一次误触就改资金参数是不可接受的。
+    const applyBtn = page.getByRole('button', { name: /签字并应用 v4 迁移/ })
+    await expect(applyBtn).toBeVisible()
+    await expect(applyBtn, '未输 token 不得可点').toBeDisabled()
+    // T 段阈值表单：展开精细参数后必须能看到"做 T 总开关"与至少三个阈值键（区间与后端 tClamp 同值）。
+    await page.getByRole('button', { name: /展开精细参数/ }).click()
+    await expect(page.getByText('做 T 总开关').first()).toBeVisible({ timeout: 10000 })
+    await expect(page.getByText('当日反 T 卖腿市值帽', { exact: false }).first()).toBeVisible()
+    await expect(page.getByText('买回熔断阈值', { exact: false }).first()).toBeVisible()
+    await page.waitForTimeout(1200)
+    await page.screenshot({ path: `${SHOT}/dyn-v4-panel.png`, fullPage: false })
+    const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+    expect(fatal, 'v4 面板渲染不得有未捕获 JS 错误: ' + fatal.join('|')).toHaveLength(0)
+  })
+})

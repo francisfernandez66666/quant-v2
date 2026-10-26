@@ -284,6 +284,9 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account, book string, 
 	// 空表不交：见上面 len(rows)==0 的提前返回——"0 行"分不清"今天全空仓"和"持仓快照还没到"，
 	// 这两种含义在 Q10 签认材料里正好相反，宁可缺行也不写一行会误导的读数。
 	e.recordAnchorShadow(account, book, shadowRows, now)
+	// §DYN-T 反 T 否决门的数据源：本轮真有处置裁定的代码记进"最近卖出裁决"表。
+	// 记在这里（三通道唯一出口）而不是各调用点抄一遍——四处装配各写一份必然会漂移。
+	e.tRecordSellVerdicts(verdicts, now)
 	return verdicts
 }
 

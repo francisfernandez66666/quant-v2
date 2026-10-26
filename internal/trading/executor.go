@@ -64,6 +64,15 @@ type OrderRequest struct {
 	// English: v3 dynamic-budget marker — legacy position-count/daily/strategy-alloc gates yield;
 	// sector/single-stock checks still run as a second safety net. The gateway ignores this field.
 	DynamicBudget bool `json:"dynamic_budget,omitempty"`
+	// IntradayT §DYN-T（批 7 / W8-A）：本单是**日内回转（做 T）的一条腿**，不是战略建仓/减仓。
+	// 与 DynamicBudget 同姿势——网关不消费，只随单留痕（落 orders.intraday_t 列），
+	// 真正吃它的是风控侧的单票集中度：正 T 买腿当日会配等量底仓卖出，收盘持仓回到原量，
+	// 按全额计会把"日内回转"误判成"加仓"，那是把闸用错口径而不是放松风控。
+	// 判据的完整因果与"复核不过按全额计"的保守方向见 internal/risk/gate.go checkConcentration。
+	// English: this order is one leg of an intraday round-trip, not a strategic entry. The gateway
+	// ignores it; the concentration gate uses it to net the buy leg out — but only after re-checking
+	// that the sellable base really covers the pairing, otherwise it charges the full amount.
+	IntradayT bool `json:"intraday_t,omitempty"`
 }
 
 // OrderResult 下单返回（网关 → 首尔）。

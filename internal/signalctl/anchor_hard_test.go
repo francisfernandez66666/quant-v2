@@ -76,12 +76,15 @@ func TestSellProbeAnchorSwitchOffKeepsCostBasis(t *testing.T) {
 	}
 }
 
-// TestAnchorHardEnabledDefaultsOff 配置默认值锁：nil 与显式 false 都是"未切硬"，
-// 只有显式 true 才切。资金路径上的默认值不允许"看起来像开了"。
-func TestAnchorHardEnabledDefaultsOff(t *testing.T) {
+// TestAnchorHardEnabledDefaultsOn §DYN-T（2026-10-26 方案 §0 第 10 条）配置默认值锁：
+// **nil 视为已切硬**（风险线按首买价锚点），只有显式 false 才回摊薄成本。
+// 默认方向翻过来的原因不是审美：正 T 买腿走加仓路径会摊薄整仓成本，判线若跟成本走，
+// 一次日内低吸就把该股止盈/止损线整体下移——T 腿改到了风控参数。
+// 显式 false 保留成回滚位：回填/判线出问题时改配置即可退回旧口径，不必回退代码。
+func TestAnchorHardEnabledDefaultsOn(t *testing.T) {
 	var c config.QMTConfig
-	if c.AnchorHardEnabled() {
-		t.Fatalf("零值配置不得视为已切硬")
+	if !c.AnchorHardEnabled() {
+		t.Fatalf("零值配置必须视为已切硬（§DYN-T 默认翻转）")
 	}
 	off := false
 	c.AnchorHard = &off

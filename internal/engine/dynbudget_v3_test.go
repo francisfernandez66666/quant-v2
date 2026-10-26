@@ -69,14 +69,16 @@ func TestLiveDynamicBudgetIgnoresLegacyKnobs(t *testing.T) {
 
 	sig := combat_agent.Signal{ID: "SIG-DYN-1", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0.82, true, dynSizingCfg())
+	e.autoPlaceScaled(sig, live, 0.82, true, dynBudgetCtx{}, dynSizingCfg())
 
 	if len(*orders) != 1 {
 		t.Fatalf("应下 1 单，got %d", len(*orders))
 	}
-	// 10 万 × 0.82 = 82000，被行业/单票 35% 截到 35000 → 3500 股。
-	if qty := (*orders)[0]["qty"].(float64); qty != 3500 {
-		t.Fatalf("dynamic 预算应为 3500 股，got %v（旧键仍在影响股数）", qty)
+	// §DYN-SIZE v4：单笔基准 10% 生效 → 10 万 × 10% × 0.82 = 8200 元 → 800 股。
+	// 旧模型这里是 82000 元（被 35% 额度截到 35000＝3500 股）——"Scale 当预算倍数"正是
+	// owner 报的"半仓之上一笔打满"的第一条代码事实（方案 §1.2 事实 1），本批按 §1.4 改掉。
+	if qty := (*orders)[0]["qty"].(float64); qty != 800 {
+		t.Fatalf("v4 单笔基准 10%% 应为 800 股，got %v（旧键仍在影响股数或基准未生效）", qty)
 	}
 }
 
@@ -96,7 +98,7 @@ func TestLiveDynamicBudgetIndustryRoom(t *testing.T) {
 
 	sig := combat_agent.Signal{ID: "SIG-DYN-2", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0.82, true, dynSizingCfg())
+	e.autoPlaceScaled(sig, live, 0.82, true, dynBudgetCtx{}, dynSizingCfg())
 
 	if len(*orders) != 1 {
 		t.Fatalf("额度不足 1 手才跳过；本案还剩 1%% 应下单，got %d", len(*orders))
@@ -129,7 +131,7 @@ func TestLiveDynamicBudgetCountsPendingBuys(t *testing.T) {
 
 	sig := combat_agent.Signal{ID: "SIG-DYN-3", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0.82, true, dynSizingCfg())
+	e.autoPlaceScaled(sig, live, 0.82, true, dynBudgetCtx{}, dynSizingCfg())
 
 	if len(*orders) != 1 {
 		t.Fatalf("在途 3 万后仍剩 5%% 额度，应下单，got %d", len(*orders))
@@ -146,7 +148,7 @@ func TestLiveLegacyBudgetUnchanged(t *testing.T) {
 	})
 	sig := combat_agent.Signal{ID: "SIG-LEG-1", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0, false) // 无 sizing 配置 = legacy
+	e.autoPlaceScaled(sig, live, 0, false, dynBudgetCtx{}) // 无 sizing 配置 = legacy
 
 	if len(*orders) != 1 {
 		t.Fatalf("legacy 应下 1 单，got %d", len(*orders))
@@ -186,7 +188,7 @@ func TestLiveDynamicBudgetRoomBelowOneLotSkips(t *testing.T) {
 
 	sig := combat_agent.Signal{ID: "SIG-DYN-LOT", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0.82, true, dynSizingCfg())
+	e.autoPlaceScaled(sig, live, 0.82, true, dynBudgetCtx{}, dynSizingCfg())
 
 	if len(*orders) != 0 {
 		t.Fatalf("额度不足 1 手必须跳过（1 手地板不得突破 35%%），got %d 单", len(*orders))
@@ -205,13 +207,15 @@ func TestLiveDynamicBudgetUnknownIndustryFallsBackToStockCap(t *testing.T) {
 
 	sig := combat_agent.Signal{ID: "SIG-DYN-UNKNOWN", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0.82, true, dynSizingCfg())
+	e.autoPlaceScaled(sig, live, 0.82, true, dynBudgetCtx{}, dynSizingCfg())
 
 	if len(*orders) != 1 {
-		t.Fatalf("行业未知时单票 35%% 仍应放行 3500 股，got %d 单", len(*orders))
+		t.Fatalf("行业未知时单票 35%% 仍应放行，got %d 单", len(*orders))
 	}
-	if qty := (*orders)[0]["qty"].(float64); qty != 3500 {
-		t.Fatalf("行业未知应由单票 35%% 兜底出 3500 股，got %v", qty)
+	// v4 基准 10% ⇒ 8200 元 < 单票 35000 额度，因此额度不再是本例的约束项；
+	// 这条锁要证的仍是"行业未知不跳过、单票额度兜底"，故把基准临时放大到 100% 让额度重新成为约束。
+	if qty := (*orders)[0]["qty"].(float64); qty != 800 {
+		t.Fatalf("行业未知应由单票额度兜底出 800 股，got %v", qty)
 	}
 }
 
@@ -235,7 +239,7 @@ func TestLiveDynamicBudgetAbstainsWithoutTotalAsset(t *testing.T) {
 	wireDynEngine(t, e)
 	sig := combat_agent.Signal{ID: "SIG-DYN-NOEQ", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0.82, true, dynSizingCfg())
+	e.autoPlaceScaled(sig, live, 0.82, true, dynBudgetCtx{}, dynSizingCfg())
 
 	if len(*orders) != 0 {
 		t.Fatalf("总资产不可得时不得开仓，got %d 单", len(*orders))
@@ -253,7 +257,7 @@ func TestLiveLegacyStrategyAmountsStillApply(t *testing.T) {
 	})
 	sig := combat_agent.Signal{ID: "SIG-LEG-SA", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0, false) // legacy
+	e.autoPlaceScaled(sig, live, 0, false, dynBudgetCtx{}) // legacy
 
 	if len(*orders) != 1 {
 		t.Fatalf("legacy 应下 1 单，got %d", len(*orders))
@@ -274,7 +278,11 @@ func TestLiveDynamicBudgetCapsClampedTo100(t *testing.T) {
 	wireDynEngine(t, e)
 	sig := combat_agent.Signal{ID: "SIG-DYN-CAP", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
-	e.autoPlaceScaled(sig, live, 0.82, true, dynSizingCfg())
+	// 本例考的是"上限 100% vs 150% 的钳制"，必须让额度重新成为约束项 ⇒ 单笔基准设 100%。
+	// （v4 出厂基准 10% 时本例的原始预算只有 8200 元，任何上限都拦不住，锁会假绿。）
+	clampCfg := dynSizingCfg()
+	clampCfg.PerTradePositionPct = 1.0
+	e.autoPlaceScaled(sig, live, 0.82, true, dynBudgetCtx{}, clampCfg)
 	if len(*orders) != 1 {
 		t.Fatalf("应下 1 单，got %d", len(*orders))
 	}

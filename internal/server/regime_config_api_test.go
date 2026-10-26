@@ -232,8 +232,10 @@ func TestRegimeConfigFineSizingRoundTrip(t *testing.T) {
 		"kelly_lambda": 0.5, "kelly_min_prob": 0.52,
 		"vol_target_pct": 2.0, "vol_clamp_lo": 0.5, "vol_clamp_hi": 1.5,
 		"macro_lead_days": 5, "macro_event_day_scale": 0.30,
-		"llm_bearish_scale":      0.5,
-		"max_total_position_pct": 0.80, "max_drawdown_pct": 0.10,
+		"llm_bearish_scale": 0.5,
+		// §DYN-SIZE v4：max_total_position_pct 的默认从 0.80 抬到 **1.00**（语义已从"逐笔缩放乘子"
+		// 改为"目标仓位天花板"，owner 允许牛市满仓）；新增 per_trade_position_pct=0.10 作为单笔基准。
+		"max_total_position_pct": 1.00, "per_trade_position_pct": 0.10, "max_drawdown_pct": 0.10,
 		"stoploss_guard_count": 4, "stoploss_guard_window_days": 1,
 		"sl_offset_per_pct": 3, "sl_offset_cap": 4,
 		"tp_offset_per_pct": 3, "tp_offset_cap": 5,
@@ -618,5 +620,71 @@ func TestRegimeConfigEmptyBodyIsNoOp(t *testing.T) {
 	tiers, _ := sizing["tier_scales"].(map[string]any)
 	if got, _ := tiers["Red"].(float64); got != 0.20 {
 		t.Fatalf("空补丁动了已存值, got %v", tiers["Red"])
+	}
+}
+
+// TestRegimeConfigSizingTSubKeys §DYN-T（方案 §4 同步面 / §6.1 config 组）：
+// `sizing.t` 必须**按键**往返——面板只发一个键时同段兄弟键不能被抹平；GET 必须回显
+// **区间校验后的生效值**（越界值落回出厂默认，绝不能把脏值原样送回去让引擎再猜一遍）。
+// English: the T block merges per key and GET reports range-validated effective values.
+func TestRegimeConfigSizingTSubKeys(t *testing.T) {
+	s, admin, _ := newRegimeTestServer(t)
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"t":{"vwap_dev_pct":1.2,"loss_breaker_pct":0.0}}}`))
+	if rr.Code != 200 {
+		t.Fatalf("写 t 段应 200，got %d body=%s", rr.Code, rr.Body.String())
+	}
+	rr2 := adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
+	_, sizing, _ := decodeRegime(t, rr2.Body.String())
+	tv, ok := sizing["t"].(map[string]any)
+	if !ok {
+		t.Fatalf("GET 未回显 sizing.t：%T", sizing["t"])
+	}
+	if got, _ := tv["vwap_dev_pct"].(float64); got != 1.2 {
+		t.Fatalf("vwap_dev_pct 应写入 1.2，got %v", tv["vwap_dev_pct"])
+	}
+	// 越界值（熔断 0＝永不熔断）不得原样回显：必须是回落后的 3.0。
+	if got, _ := tv["loss_breaker_pct"].(float64); got != 3.0 {
+		t.Fatalf("loss_breaker_pct 越界应回显回落后的 3.0，got %v", tv["loss_breaker_pct"])
+	}
+	// 兄弟键必须回显出厂生效值（不是零值）：面板显示 0 而引擎按 2.5 跑就是"页面写的≠引擎吃的"。
+	for key, want := range map[string]float64{
+		"min_amplitude_pct":           2.5,
+		"min_market_scale":            0.4,
+		"sell_env_min_market_scale":   0.2,
+		"intraday_sell_cap_total_pct": 20,
+		"near_extreme_pct":            0.3,
+		"stop_guard_pct":              1.5,
+		"intraday_cap_pct":            50,
+		"min_spread_pct":              2.0,
+	} {
+		if got, _ := tv[key].(float64); got != want {
+			t.Fatalf("GET t.%s 应回显默认生效值 %v，got %v", key, want, tv[key])
+		}
+	}
+	if on, _ := tv["enabled"].(bool); !on {
+		t.Fatal("§DYN-T（六轮 T4-12）：实盘 T 生产打开，t.enabled 必须回显 true")
+	}
+	if mode, _ := tv["mode"].(string); mode != "both" {
+		t.Fatalf("t.mode 出厂应为 both（正反都做），got %v", mode)
+	}
+	if rounds, _ := tv["max_rounds_per_code_per_day"].(float64); rounds != 1 {
+		t.Fatalf("五轮 T5-2：灰度期发版值必须是 1，got %v", rounds)
+	}
+
+	// 第二次只发一个键：第一例写入的 vwap_dev_pct 必须保留（键级合并，不是整段替换）。
+	rr3 := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/regime",
+		`{"sizing":{"t":{"min_amplitude_pct":3.5}}}`))
+	if rr3.Code != 200 {
+		t.Fatalf("写第二个 t 键应 200，got %d", rr3.Code)
+	}
+	rr4 := adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/regime", ""))
+	_, sizing2, _ := decodeRegime(t, rr4.Body.String())
+	tv2, _ := sizing2["t"].(map[string]any)
+	if got, _ := tv2["vwap_dev_pct"].(float64); got != 1.2 {
+		t.Fatalf("第二次写入抹掉了 vwap_dev_pct，got %v", tv2["vwap_dev_pct"])
+	}
+	if got, _ := tv2["min_amplitude_pct"].(float64); got != 3.5 {
+		t.Fatalf("min_amplitude_pct 应更新为 3.5，got %v", tv2["min_amplitude_pct"])
 	}
 }

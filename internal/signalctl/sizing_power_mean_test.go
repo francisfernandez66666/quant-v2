@@ -98,24 +98,35 @@ func TestComputeSizingPowerMeanPZero(t *testing.T) {
 }
 
 // TestComputeSizingPowerMeanCapMin 上限类仍取 min，且只写 <1 的上限理由。
+// §DYN-SIZE v4：总仓位上限已移出合成（它现在是目标仓位的定义），故改用权益回撤上限做同形断言。
 func TestComputeSizingPowerMeanCapMin(t *testing.T) {
 	r := baseRegime()
 	r.SizeCfg.Mode = "power_mean"
-	r.Account.TotalPosPct = 0.9 // limit 0.8 → cap 0.8/0.9 = 0.8889
+	r.Account.EquityDrawdown = 0.2 // MaxDrawdownPct 默认 0.10 → cap 0.10/0.20 = 0.5
 
 	res := ComputeSizing(r, baseSig())
-	want := 0.8 / 0.9
+	want := 0.5
 	if math.Abs(res.Scale-want) > 1e-9 {
 		t.Fatalf("上限应取 min=%.6f，got %.6f", want, res.Scale)
 	}
-	if !strings.Contains(strings.Join(res.Reasons, "|"), "总仓位上限×0.89") {
+	if !strings.Contains(strings.Join(res.Reasons, "|"), "权益回撤×0.50") {
 		t.Fatalf("上限理由缺失: %v", res.Reasons)
+	}
+	// 账户级上限属于**市场组**（目标仓位侧），个股组读数不得被它拖动。
+	if math.Abs(res.StockScale-1.0) > 1e-12 {
+		t.Fatalf("个股组不该含账户上限，got %.4f", res.StockScale)
+	}
+	if math.Abs(res.MarketScale-0.5) > 1e-12 {
+		t.Fatalf("市场组应含账户上限 0.50，got %.4f", res.MarketScale)
 	}
 }
 
 // TestComputeSizingProductPathUnchanged §6.3：旧 product 路径逐字保留，不被 power_mean 污染。
 func TestComputeSizingProductPathUnchanged(t *testing.T) {
 	r := baseRegime()
+	// §DYN-SIZE v4 起出厂默认已是 power_mean（owner 裁决），所以这条"旧路径逐字保留"的锁
+	// 必须**显式**把 Mode 写回 product——否则它测的是新路径，锁会假绿。
+	r.SizeCfg.Mode = "product"
 	r.EmotionPhase = "退潮" // 0.50
 	res := ComputeSizing(r, baseSig())
 	if math.Abs(res.Scale-0.50) > 1e-12 {

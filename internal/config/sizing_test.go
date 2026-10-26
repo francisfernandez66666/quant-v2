@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -24,8 +25,11 @@ func TestSizingConfigDefaultsSafe(t *testing.T) {
 	if d.BudgetModeOf() != "dynamic" || !d.DynamicBudgetOn() {
 		t.Fatalf("§DYN-GLOBAL 后出厂默认必须 budget_mode=dynamic，got %q", d.BudgetMode)
 	}
-	if d.ModeOf() != "product" {
-		t.Fatalf("Q1 裁决：本批只切是否生效、不切怎么算，Mode 必须仍是 product，got %q", d.ModeOf())
+	// §DYN-SIZE v4（2026-10-26 owner 裁决）：**推翻旧 Q1**「本批只切是否生效、不切怎么算」，
+	// 出厂默认直接切 power_mean（同组因子惩罚不叠加；product≈0.378 vs power_mean≈0.79 的差别
+	// 在新模型里就是目标仓位 38% vs 79%）。这条断言因此改口为"必须是 power_mean"。
+	if d.ModeOf() != "power_mean" {
+		t.Fatalf("v4 裁决：出厂默认 Mode 必须是 power_mean，got %q", d.ModeOf())
 	}
 	if !d.RiskBudgetKeepOn() {
 		t.Fatalf("放宽止损默认必须强制同比例缩仓（owner 裁决）")
@@ -243,7 +247,7 @@ func TestSizingPowerPSemantics(t *testing.T) {
 // TestSizingBudgetModeAndGroupFloors §DYN-SIZE-v3 §7 + §DYN-GLOBAL：新键默认值与归一化。
 func TestSizingBudgetModeAndGroupFloors(t *testing.T) {
 	d := DefaultSizingConfig()
-	if d.BudgetModeOf() != "dynamic" || d.ModeOf() != "product" {
+	if d.BudgetModeOf() != "dynamic" || d.ModeOf() != "power_mean" {
 		t.Fatalf("§DYN-GLOBAL 后默认口径应为 dynamic/product，got %s/%s", d.BudgetModeOf(), d.ModeOf())
 	}
 	if !d.DynamicBudgetOn() {
@@ -278,5 +282,143 @@ func TestSizingBudgetModeAndGroupFloors(t *testing.T) {
 	over := SizingConfig{GroupFloors: map[string]float64{"market": 1.5}}
 	if got := over.GroupFloor("market"); got != 1 {
 		t.Fatalf("分组 floor 应钳到 1，got %v", got)
+	}
+}
+
+// f64Ptr 给三态数值键造指针（测试专用；生产代码由 JSON 反序列化产生）。
+func f64Ptr(v float64) *float64 { return &v }
+
+// TestTConfigRangeFallbacks §DYN-T（方案 §8.8 / §6.1 锁 13）：保护阈值改为配置后，
+// 保护由"合法区间 + 非对称封顶 + 回落可观测"承担。每个键都构造越界/NaN/负值形态，
+// 断言实际生效值落回默认，并且 TFallbacks 能把回落事实报出来（否则面板会以为按配入值在跑）。
+func TestTConfigRangeFallbacks(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func(*TConfig)
+		get  func(*TConfig) float64
+		want float64
+	}{
+		{"偏离门越上界", func(c *TConfig) { c.VWAPDevPct = 99 }, func(c *TConfig) float64 { return c.VWAPDevPctOf() }, defaultTVWAPDevPct},
+		{"偏离门NaN", func(c *TConfig) { c.VWAPDevPct = math.NaN() }, func(c *TConfig) float64 { return c.VWAPDevPctOf() }, defaultTVWAPDevPct},
+		{"振幅门越下界", func(c *TConfig) { c.MinAmplitudePct = 0.5 }, func(c *TConfig) float64 { return c.TMinAmplitudePctOf() }, defaultTMinAmplitudePct},
+		{"近极值带越下界", func(c *TConfig) { c.NearExtremePct = 0.01 }, func(c *TConfig) float64 { return c.TNearExtremePctOf() }, defaultTNearExtremePct},
+		{"涨跌停距离越下界", func(c *TConfig) { c.LimitDistancePct = 0.05 }, func(c *TConfig) float64 { return c.TLimitDistancePctOf() }, defaultTLimitDistancePct},
+		{"冷静期过小", func(c *TConfig) { c.OpenCoolingMin = 1 }, func(c *TConfig) float64 { return c.TOpenCoolingMinOf() }, defaultTOpenCoolingMin},
+		{"否决门越下界", func(c *TConfig) { c.StopGuardPct = 0.05 }, func(c *TConfig) float64 { return c.TStopGuardPctOf() }, defaultTStopGuardPct},
+		{"熔断配成0.2（等于永不熔断）", func(c *TConfig) { c.LossBreakerPct = 0.2 }, func(c *TConfig) float64 { return c.TLossBreakerPctOf() }, defaultTLossBreakerPct},
+		{"总量帽越上界", func(c *TConfig) { c.IntradaySellCapTotalPct = 90 }, func(c *TConfig) float64 { return c.TIntradaySellCapTotalPctOf() }, defaultTIntradaySellCapTotalPct},
+		{"成交额负值", func(c *TConfig) { c.MinAmountWan = f64Ptr(-1) }, func(c *TConfig) float64 { return c.TMinAmountWanOf() }, defaultTMinAmountWan},
+		{"换手越上界", func(c *TConfig) { c.MinTurnoverPct = f64Ptr(90) }, func(c *TConfig) float64 { return c.TMinTurnoverPctOf() }, defaultTMinTurnoverPct},
+		{"上市天数越上界", func(c *TConfig) { c.MinListedDays = f64Ptr(9999) }, func(c *TConfig) float64 { return c.TMinListedDaysOf() }, defaultTMinListedDays},
+		{"校验容差越下界", func(c *TConfig) { c.VWAPCheckTolPct = 0.001 }, func(c *TConfig) float64 { return c.TVWAPCheckTolPctOf() }, defaultTVWAPCheckTolPct},
+		{"急跌配成正值", func(c *TConfig) { c.MarketPlungePct = f64Ptr(2) }, func(c *TConfig) float64 { return c.TMarketPlungePctOf() }, defaultTMarketPlungePct},
+		{"正T环境门越界", func(c *TConfig) { c.MinMarketScale = f64Ptr(1.5) }, func(c *TConfig) float64 { return c.TMinMarketScaleOf() }, defaultTMinMarketScale},
+		{"急跌越下界", func(c *TConfig) { c.MarketPlungePct = f64Ptr(-50) }, func(c *TConfig) float64 { return c.TMarketPlungePctOf() }, defaultTMarketPlungePct},
+		{"反T门越上界", func(c *TConfig) { c.SellEnvMinMarketScale = f64Ptr(2) }, func(c *TConfig) float64 { return c.TSellEnvMinMarketScaleOf() }, defaultTSellEnvMinMarketScale},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := &TConfig{}
+			c.set(cfg)
+			if got := c.get(cfg); got != c.want {
+				t.Fatalf("%s：应回落默认 %.4f，got %.4f", c.name, c.want, got)
+			}
+			if fb := cfg.TFallbacks(); len(fb) == 0 {
+				t.Fatalf("%s：回落必须可观测（TFallbacks 为空）", c.name)
+			}
+		})
+	}
+}
+
+// TestTConfigLegalValuesPassThrough 收紧方向必须放行：合法区间内的值不得被"好心"改回默认。
+func TestTConfigLegalValuesPassThrough(t *testing.T) {
+	cfg := &TConfig{}
+	cfg.MinAmplitudePct = 6         // 收紧（更不容易开腿）
+	cfg.LossBreakerPct = 1.5        // 收紧（更早熔断）
+	cfg.MinAmountWan = f64Ptr(8000) // 收紧（流动性更好）
+	cfg.MinMarketScale = f64Ptr(0)  // 合法：0＝不设环境门
+	if got := cfg.TMinAmplitudePctOf(); got != 6 {
+		t.Fatalf("合法收紧值应放行，got %.2f", got)
+	}
+	if got := cfg.TLossBreakerPctOf(); got != 1.5 {
+		t.Fatalf("合法收紧值应放行，got %.2f", got)
+	}
+	if got := cfg.TMinAmountWanOf(); got != 8000 {
+		t.Fatalf("合法收紧值应放行，got %.2f", got)
+	}
+	if got := cfg.TMinMarketScaleOf(); got != 0 {
+		t.Fatalf("0 是合法配置（不设门），got %.2f", got)
+	}
+	if fb := cfg.TFallbacks(); len(fb) != 0 {
+		t.Fatalf("全部合法时不应有回落记录：%v", fb)
+	}
+}
+
+// TestTLastOpenHM 最后开腿时刻：非法格式回落 1400；**晚于 1445 钳到 1445**（唯一保留的硬顶）；
+// 早于 945 视为配错回落 1400。
+func TestTLastOpenHM(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", "1400"}, {"1400", "1400"}, {"1330", "1330"},
+		{"1455", "1445"}, {"1500", "1445"}, // 放宽方向封顶
+		{"0930", "1400"}, // 早于开盘冷静期下界 → 回落默认
+		{"9aa5", "1400"}, {"140", "1400"}, {"14000", "1400"},
+	}
+	for _, c := range cases {
+		cfg := &TConfig{LastOpenAt: c.in}
+		if got := cfg.TLastOpenHM(); got != c.want {
+			t.Fatalf("last_open_at=%q 应得 %q，got %q", c.in, c.want, got)
+		}
+	}
+}
+
+// TestTSellEnvNotAboveBuyEnv 反 T 环境门若被配得高于正 T，按两者较小值生效并记回落：
+// 否则会出现"低吸比高抛更难"这种反直觉配置。
+func TestTSellEnvNotAboveBuyEnv(t *testing.T) {
+	cfg := &TConfig{MinMarketScale: f64Ptr(0.30), SellEnvMinMarketScale: f64Ptr(0.80)}
+	if got := cfg.TSellEnvMinMarketScaleOf(); got != 0.30 {
+		t.Fatalf("反 T 门应被夹到正 T 门 0.30，got %.2f", got)
+	}
+	if fb := cfg.TFallbacks(); fb["sell_env_min_market_scale"] != 0.30 {
+		t.Fatalf("应记录回落事实：%v", fb)
+	}
+}
+
+// TestTConfigDefaultsUnset 全部未配置（老账号）时，每个访问器都必须给出方案 §8.8 的默认值，
+// 且**不产生回落记录**（没配 ≠ 配错）。
+func TestTConfigDefaultsUnset(t *testing.T) {
+	cfg := &TConfig{}
+	wants := map[string]float64{
+		"vwap_dev":    cfg.VWAPDevPctOf(),
+		"amplitude":   cfg.TMinAmplitudePctOf(),
+		"buy_env":     cfg.TMinMarketScaleOf(),
+		"sell_env":    cfg.TSellEnvMinMarketScaleOf(),
+		"sell_cap":    cfg.TIntradaySellCapTotalPctOf(),
+		"near":        cfg.TNearExtremePctOf(),
+		"limit":       cfg.TLimitDistancePctOf(),
+		"cooling":     cfg.TOpenCoolingMinOf(),
+		"guard":       cfg.TStopGuardPctOf(),
+		"breaker":     cfg.TLossBreakerPctOf(),
+		"amount":      cfg.TMinAmountWanOf(),
+		"turnover":    cfg.TMinTurnoverPctOf(),
+		"listed":      cfg.TMinListedDaysOf(),
+		"check_tol":   cfg.TVWAPCheckTolPctOf(),
+		"plunge":      cfg.TMarketPlungePctOf(),
+		"intradaycap": cfg.TIntradayCapPct(),
+		"spread":      cfg.TMinSpreadPct(),
+	}
+	if wants["vwap_dev"] != defaultTVWAPDevPct || wants["amplitude"] != defaultTMinAmplitudePct ||
+		wants["buy_env"] != defaultTMinMarketScale || wants["sell_env"] != defaultTSellEnvMinMarketScale ||
+		wants["sell_cap"] != defaultTIntradaySellCapTotalPct || wants["breaker"] != defaultTLossBreakerPct ||
+		wants["intradaycap"] != defaultTIntradayCapPct || wants["spread"] != defaultTMinSpreadPct {
+		t.Fatalf("未配置时的默认值与方案 §8.8 不符：%v", wants)
+	}
+	if wants["intradaycap"] != 50 {
+		t.Fatalf("单票 T 帽默认应已提到 50（owner 裁决留 50~70%% 底仓），got %.0f", wants["intradaycap"])
+	}
+	if wants["spread"] != 2.0 {
+		t.Fatalf("配对价差默认应已提到 2.0（日内 2%% 及以上才做 T），got %.1f", wants["spread"])
+	}
+	if fb := cfg.TFallbacks(); len(fb) != 0 {
+		t.Fatalf("未配置（零值）不应记回落，否则每个老账号每轮都刷假回落：%v", fb)
 	}
 }

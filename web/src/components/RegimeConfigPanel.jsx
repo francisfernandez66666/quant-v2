@@ -20,11 +20,20 @@
 // 纪律与战法/D1 面板一致：读取失败=禁止保存（红条 + 重载）；数字缺失不折叠成 0；
 // 保存走稀疏 merge（只提交本面板负责的键）。执行层不读这些开关——它们只影响信号长什么样。
 //
+// §DYN-T（2026-10-26）：做 T（日内回转）的全部阈值键进入本面板（方案 §8.8 的 22 个键），
+// 并且是**唯一**的页面入口。T 段比其他键多一条纪律——提交必须按键级稀疏：GET 回显走的是
+// `WithTEffective()`（把出厂默认填成生效值，为的是让面板显示"引擎真在按多少跑"），
+// 若把这份回显原样 POST 回去，今天的出厂默认就变成该账号的显式配置，日后调默认再也传不下去。
+// 因此 T 段只提交与首屏基线不同的键（见 tEffectiveToPatch），其余 sizing 键仍走整块提交。
+// English: the §DYN-T block is submitted key-by-key against the first-screen baseline, because the
+// GET echo carries effective (default-filled) values and round-tripping them would pin today's
+// defaults as this account's explicit config.
+//
 // English: admin panel for the signal-generation risk switches plus every fine-grained SizingConfig
 // knob (collapsible). Load failure disables saving; numbers never silently fold to 0; writes are
 // sparse merges of the keys owned here, and reads show the defaults-filled effective values.
 import React, { useCallback, useEffect, useState } from 'react'
-import { Button, Card, InputNumber, Tag } from 'tdesign-react'
+import { Button, Card, Input, InputNumber, Tag } from 'tdesign-react'
 import ToggleSw from './ToggleSw'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
@@ -78,7 +87,11 @@ const DEFAULTS = {
   leadDays: 5,
   eventDay: 0.30,
   llmBearish: 0.5,
-  maxPos: 0.80,
+  // §DYN-SIZE v4：`max_total_position_pct` 的语义从"逐笔缩放乘子"改成"目标仓位天花板"，
+  // 出厂值随之从 0.80 抬到 1.00（旧值作为逐笔乘子在半仓时恒等于 1.0、永不约束，正是"一笔打满"
+  // 的根因之一）。这里的兜底值必须与后端 DefaultSizingConfig 同值，否则面板显示一个数、引擎跑另一个数。
+  maxPos: 1.00,
+  perTrade: 0.10,
   maxDD: 0.10,
   guardCount: 4,
   guardWindow: 1,
@@ -180,6 +193,23 @@ function NumRow({ label, hint, value, min = 0.01, max = 2, step = 0.01, precisio
   )
 }
 
+// StrRow 文本参数行（HHMM 时刻这类"必须逐字符核对"的值）。
+// 为什么不用 InputNumber：1450 写进数字框会被显示成 1450/1,450 之类，且 0945 这种
+// 前导零时刻一旦丢掉零就变成 945，后端按"4 位 HHMM"判格式直接回落默认——
+// 用户看到的效果是"我明明配了 9:45，程序却在按 14:00 跑"。文本框原样传字符串最诚实。
+// English: plain text for HHMM values — a numeric box drops leading zeros (0945→945) and the
+// backend then silently falls back to the default.
+function StrRow({ label, hint, value, onChange, testId }) {
+  return (
+    <div style={rowStyle}>
+      <span style={labelStyle}>{label}</span>
+      <Input data-testid={testId} value={value} maxLength={4} placeholder="HHMM"
+        onChange={(v) => onChange(String(v ?? '').trim())} style={{ width: 110 }} />
+      {hint && <span style={hintStyle}>{hint}</span>}
+    </div>
+  )
+}
+
 // SwitchRow 精细参数开关行：标签 + 开关 + 说明。
 function SwitchRow({ label, hint, checked, onChange }) {
   return (
@@ -189,6 +219,56 @@ function SwitchRow({ label, hint, checked, onChange }) {
       {hint && <span style={hintStyle}>{hint}</span>}
     </div>
   )
+}
+
+// tEffectiveToPatch 生成 §DYN-T 的**稀疏提交补丁**：只带与首屏基线不同的键。
+//
+// 为什么必须稀疏：GET 回显的是 WithTEffective 填好的生效值（含出厂默认），把它原样 POST 回去
+// 等于把今天的出厂默认逐键写成这个账号的显式配置——日后调默认（比如把 min_spread 从 2.0 提到 2.5）
+// 对这个账号永远不生效，正是 §1.7 里 `mode`/`max_total_position_pct` 被物化坑过的那一次。
+// 参数 base 是首屏归一化后的表单值（键名与 form 同为 camelCase），value 按 wire 键名输出。
+// 数字比较统一走 Number + 有限性判断：`0` 与 `false` 在这里都是合法配置，不能用 `||` 短路掉。
+// English: emits only keys the operator actually changed (compared against the first-screen form
+// values); round-tripping the effective echo would pin today's factory defaults as this account's
+// explicit config — the §1.7 materialization trap.
+function tEffectiveToPatch(base, form) {
+  // [wire 键名, 表单字段名, 取值器]
+  const spec = [
+    ['enabled', 'tOn', (f) => !!f.tOn],
+    ['mode', 'tMode', (f) => f.tMode],
+    ['max_rounds_per_code_per_day', 'tMaxRounds', (f) => f.tMaxRounds],
+    ['intraday_cap_pct', 'tCapPct', (f) => f.tCapPct],
+    ['min_spread_pct', 'tMinSpread', (f) => f.tMinSpread],
+    ['force_unwind_at', 'tForceUnwind', (f) => f.tForceUnwind],
+    ['last_open_at', 'tLastOpen', (f) => f.tLastOpen],
+    ['vwap_dev_pct', 'tVwapDev', (f) => f.tVwapDev],
+    ['min_amplitude_pct', 'tMinAmp', (f) => f.tMinAmp],
+    ['near_extreme_pct', 'tNearExtreme', (f) => f.tNearExtreme],
+    ['limit_distance_pct', 'tLimitDist', (f) => f.tLimitDist],
+    ['open_cooling_min', 'tCooling', (f) => f.tCooling],
+    ['min_market_scale', 'tMinMS', (f) => f.tMinMS],
+    ['sell_env_min_market_scale', 'tSellEnvMS', (f) => f.tSellEnvMS],
+    ['market_plunge_pct', 'tPlunge', (f) => f.tPlunge],
+    ['intraday_sell_cap_total_pct', 'tSellCapTotal', (f) => f.tSellCapTotal],
+    ['stop_guard_pct', 'tStopGuard', (f) => f.tStopGuard],
+    ['loss_breaker_pct', 'tLossBreaker', (f) => f.tLossBreaker],
+    ['min_amount_wan', 'tMinAmount', (f) => f.tMinAmount],
+    ['min_turnover_pct', 'tMinTurnover', (f) => f.tMinTurnover],
+    ['min_listed_days', 'tMinListed', (f) => f.tMinListed],
+    ['vwap_check_tol_pct', 'tVwapTol', (f) => f.tVwapTol],
+  ]
+  const same = (a, b) => {
+    if (typeof a === 'boolean' || typeof b === 'boolean') return !!a === !!b
+    const na = Number(a), nb = Number(b)
+    if (Number.isFinite(na) && Number.isFinite(nb)) return na === nb
+    return String(a) === String(b)
+  }
+  const out = {}
+  for (const [wire, field, read] of spec) {
+    const next = read(form)
+    if (base[field] === undefined || !same(base[field], next)) out[wire] = next
+  }
+  return out
 }
 
 /** 风险与仓位设置面板（仅管理员挂载，与 /api/config/regime 的 adminMiddleware 同门槛）。 */
@@ -203,6 +283,9 @@ export default function RegimeConfigPanel() {
   const [accountId, setAccountId] = useState('')
   const [accounts, setAccounts] = useState([])
   const [hasOverride, setHasOverride] = useState(false)
+  // §DYN-T 稀疏提交基线：GET 回显的 T 段生效值（含出厂默认）。补丁只带与它不同的键。
+  // English: the effective T echo — the patch carries only keys that differ from it.
+  const [tBaseline, setTBaseline] = useState({})
 
   const set = useCallback((patch) => setForm((f) => ({ ...f, ...patch })), [])
 
@@ -265,6 +348,8 @@ export default function RegimeConfigPanel() {
         indexScales: mapNums(sz.index_scale_thresholds, DEFAULT_INDEX),
         llmBearish: num(sz.llm_bearish_scale, DEFAULTS.llmBearish),
         maxPos: num(sz.max_total_position_pct, DEFAULTS.maxPos),
+        // §DYN-SIZE v4 新增：单笔基准仓位（占总资产比例）。缺键时后端补 0.10，这里同口径。
+        perTrade: num(sz.per_trade_position_pct, DEFAULTS.perTrade),
         maxDD: num(sz.max_drawdown_pct, DEFAULTS.maxDD),
         guardCount: intNum(sz.stoploss_guard_count, DEFAULTS.guardCount),
         guardWindow: intNum(sz.stoploss_guard_window_days, DEFAULTS.guardWindow),
@@ -296,6 +381,34 @@ export default function RegimeConfigPanel() {
         // English: evolution switch defaults OFF (nil=off), unlike the factors — hence `=== true`.
         evoOn: ((sz.evo || {}).enabled) === true,
         evoAutoPromote: ((sz.evo || {}).auto_promote) === true,
+        // ── §DYN-T 日内回转（做 T）全部阈值键（方案 §8.8） ──
+        // 读的是 GET 回显里的**生效值**（后端 WithTEffective 已把出厂默认填进来），
+        // 提交走稀疏口径：只有与回显不同的键才进 body——把回显原样 POST 回来会把今天的
+        // 出厂默认物化成该账号的显式配置，日后改默认再也传不下去（§1.7 的物化陷阱）。
+        // English: the GET echoes effective values; the POST is sparse, so untouched keys never
+        // get materialized into this account and later default changes still propagate.
+        tOn: (sz.t || {}).enabled !== false,
+        tMode: String((sz.t || {}).mode || 'both').toLowerCase(),
+        tMaxRounds: intNum((sz.t || {}).max_rounds_per_code_per_day, 1),
+        tCapPct: num((sz.t || {}).intraday_cap_pct, 50),
+        tMinSpread: num((sz.t || {}).min_spread_pct, 2.0),
+        tForceUnwind: String((sz.t || {}).force_unwind_at || '1450'),
+        tLastOpen: String((sz.t || {}).last_open_at || '1400'),
+        tVwapDev: num((sz.t || {}).vwap_dev_pct, 0.8),
+        tMinAmp: num((sz.t || {}).min_amplitude_pct, 2.5),
+        tNearExtreme: num((sz.t || {}).near_extreme_pct, 0.3),
+        tLimitDist: num((sz.t || {}).limit_distance_pct, 1.0),
+        tCooling: num((sz.t || {}).open_cooling_min, 15),
+        tMinMS: signedNum((sz.t || {}).min_market_scale, 0.40),
+        tSellEnvMS: signedNum((sz.t || {}).sell_env_min_market_scale, 0.20),
+        tPlunge: signedNum((sz.t || {}).market_plunge_pct, -2.0),
+        tSellCapTotal: num((sz.t || {}).intraday_sell_cap_total_pct, 20),
+        tStopGuard: num((sz.t || {}).stop_guard_pct, 1.5),
+        tLossBreaker: num((sz.t || {}).loss_breaker_pct, 3.0),
+        tMinAmount: signedNum((sz.t || {}).min_amount_wan, 3000),
+        tMinTurnover: signedNum((sz.t || {}).min_turnover_pct, 1.5),
+        tMinListed: signedNum((sz.t || {}).min_listed_days, 60),
+        tVwapTol: num((sz.t || {}).vwap_check_tol_pct, 0.1),
         // §C4 / §C6 / §C1-V2（系统级）
         techKdjMax: num(tech.kdj_j_max, 0),
         techMa: String(tech.ma_filter || 'off'),
@@ -308,6 +421,11 @@ export default function RegimeConfigPanel() {
       }
       setForm(next)
       setBaseline(JSON.stringify(next))
+      // 稀疏提交基线＝**首屏归一化后的表单值**（不是 raw cfg.sizing.t）：
+      // 后端回显已经把出厂默认填进 T 段，raw 与归一值本来等价，但用 raw 时"键在回显里缺失"
+      // 会被判成"改动"并把出厂默认写进账号——那正是 §1.7 的物化陷阱。用首屏表单值当基线，
+      // owner 没碰过的键永远不进补丁，改过又改回来的键也不进（值相同＝没改）。
+      setTBaseline(next)
       setHasOverride(cfg.sizing_has_override === true)
       setState('loaded')
     } catch (e) {
@@ -397,6 +515,7 @@ export default function RegimeConfigPanel() {
 
     pos('LLM 利空缩放', f.llmBearish, 2)
     ratio('总仓位上限', f.maxPos)
+    ratio('单笔基准仓位', f.perTrade)
     ratio('权益回撤熔断比例', f.maxDD)
     intIn('连续止损熔断次数', f.guardCount, 1, 100)
     intIn('连续止损回看窗', f.guardWindow, 1, 20)
@@ -443,6 +562,44 @@ export default function RegimeConfigPanel() {
     // R9 阈值：>100 无意义（弃权率不可能超过 100%）；负数合法（=关闭），只挡非数与非有限值。
     const ap = Number(f.flowAbstainPct)
     if (!Number.isFinite(ap) || ap > 100) bad.push('弃权率告警阈值（须 ≤100，负数=关闭）')
+
+    // ── §DYN-T 做 T 阈值：区间与后端 tClamp 逐键对齐（方案 §8.8）──
+    // 后端对越界值是"忽略并回落默认 + TFallbacks 上报"，前端在提交前就挡住：
+    // 让 owner 看到"这一项没进去"比让他以为配好了却在每轮被悄悄回落更诚实。
+    const tPos = (name, v, lo, hi) => {
+      const n = Number(v)
+      if (!Number.isFinite(n) || n < lo || n > hi) bad.push(`${name}（须 ${lo}~${hi}）`)
+    }
+    const tHHMM = (name, v) => {
+      const s = String(v || '').trim()
+      if (!/^\d{4}$/.test(s)) { bad.push(`${name}（须为 4 位 HHMM）`); return }
+      const hh = Number(s.slice(0, 2)), mm = Number(s.slice(2))
+      if (hh < 0 || hh > 23 || mm < 0 || mm > 59) bad.push(`${name}（HHMM 非法）`)
+    }
+    tPos('单码单日回转上限', f.tMaxRounds, 1, 5)
+    tPos('机动仓上限%', f.tCapPct, 5, 100)
+    tPos('最小价差%', f.tMinSpread, 0.2, 10)
+    tPos('现价偏离分时均线%', f.tVwapDev, 0.3, 5)
+    tPos('日内振幅下限%', f.tMinAmp, 1, 10)
+    tPos('近极值带%', f.tNearExtreme, 0.1, 2)
+    tPos('距涨跌停距离%', f.tLimitDist, 0.5, 5)
+    tPos('开盘冷静期(分钟)', f.tCooling, 10, 60)
+    tPos('正T环境门 MS', f.tMinMS, 0, 1)
+    tPos('反T环境门 MS', f.tSellEnvMS, 0, 1)
+    tPos('当日反T卖腿市值帽%', f.tSellCapTotal, 5, 50)
+    tPos('反T否决门距离%', f.tStopGuard, 0.5, 5)
+    tPos('买回熔断阈值%', f.tLossBreaker, 1, 10)
+    tPos('分时均线校验容差%', f.tVwapTol, 0.05, 1)
+    // 三个"0 合法（＝不设该条）"的流动性门与大盘急跌停门用允许 0/负值的判据，不走 tPos 的正数假设。
+    tPos('流动性成交额下限(万)', f.tMinAmount, 0, 1000000)
+    tPos('流动性换手率下限%', f.tMinTurnover, 0, 25)
+    tPos('流动性上市天数下限', f.tMinListed, 0, 3650)
+    const pl = Number(f.tPlunge)
+    if (!Number.isFinite(pl) || pl > 0 || pl < -10) bad.push('大盘急跌停阈值（须为 -10~0，0=不设门）')
+    tHHMM('尾盘强制配平时刻', f.tForceUnwind)
+    tHHMM('最后开新腿时刻', f.tLastOpen)
+    // 尾盘必须晚于最后开腿，否则会出现"刚开腿就被强制配平"的一腿过夜窗口。
+    if (!(Number(f.tLastOpen) < Number(f.tForceUnwind))) bad.push('最后开新腿时刻须早于尾盘强制配平时刻')
     return bad
   }
 
@@ -501,6 +658,8 @@ export default function RegimeConfigPanel() {
           index_scale_thresholds: { ...form.indexScales },
           llm_bearish_scale: Number(form.llmBearish),
           max_total_position_pct: Number(form.maxPos),
+          // §DYN-SIZE v4：单笔基准仓位（旧模型没有这个数，中性 1.0 时单笔可用满权益）。
+          per_trade_position_pct: Number(form.perTrade),
           max_drawdown_pct: Number(form.maxDD),
           stoploss_guard_count: Number(form.guardCount),
           stoploss_guard_window_days: Number(form.guardWindow),
@@ -541,8 +700,13 @@ export default function RegimeConfigPanel() {
           block_momentum: !!form.blockMomentum,
         },
       }
+      // §DYN-T 稀疏补丁：只把 owner 真改过的 T 键写进 sizing.t（空对象就整段不发，
+      // 后端 mergeStructPatch 对缺席的键保持原值，出厂默认也因此还能继续传下去）。
+      const tPatch = tEffectiveToPatch(tBaseline, form)
+      if (Object.keys(tPatch).length > 0) body.sizing.t = tPatch
       await api.setRegimeConfig(body, accountId || undefined)
       setBaseline(JSON.stringify(form))
+      setTBaseline(form) // 补丁已生效，基线随之推进到当前表单（否则下次保存会把同一批键再发一遍）
       setHasOverride(true)
       showToast('风控与仓位配置已保存，热更新即时生效', 'success')
     } catch (e) {
@@ -886,6 +1050,52 @@ export default function RegimeConfigPanel() {
                 onChange={(v) => set({ evoAutoPromote: v })}
               />
 
+              <div style={groupStyle}>日内回转（§DYN-T 做 T，出厂开；阈值全部可配）</div>
+              <SwitchRow
+                label="做 T 总开关"
+                hint="默认开（2026-10-26 六轮裁决：实盘与模拟盘同时生效）。关掉＝两本账当轮都不开腿，是一键止血位"
+                checked={form.tOn}
+                onChange={(v) => set({ tOn: v })}
+              />
+              <div style={rowStyle}>
+                <span style={labelStyle}>允许方向</span>
+                <select
+                  data-testid="t-mode"
+                  value={form.tMode}
+                  onChange={(e) => set({ tMode: e.target.value })}
+                  style={{ minWidth: 220, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--app-border, #ddd)', background: 'var(--app-bg, #fff)' }}
+                >
+                  <option value="both">both 正反都做（默认）</option>
+                  <option value="buy_first">buy_first 只做正 T（先买后卖）</option>
+                  <option value="sell_first">sell_first 只做反 T（先卖后买）</option>
+                </select>
+                <span style={hintStyle}>认不出的取值按"都不做"处理（资金路径宁可不做）</span>
+              </div>
+              <NumRow label="单码单日回转上限" hint="默认 1（灰度期一票一次）；硬顶 5。一次＝两腿都成交" value={form.tMaxRounds} min={1} max={5} step={1} precision={0} onChange={(v) => set({ tMaxRounds: v })} />
+              <NumRow label="机动仓上限（占持仓%）" hint="默认 50（六轮把 30 提到 50）" value={form.tCapPct} min={5} max={100} step={1} onChange={(v) => set({ tCapPct: v })} />
+              <NumRow label="最小价差（%）" hint="默认 2.0：第二腿要有利的变动达到该幅度才配对（两方向共用）" value={form.tMinSpread} min={0.2} max={10} step={0.1} onChange={(v) => set({ tMinSpread: v })} />
+              <StrRow label="尾盘强制配平时刻" hint="默认 1450。正 T 买腿到点无条件卖出等量底仓（敞口过夜要许可，减敞口不要）" value={form.tForceUnwind} onChange={(v) => set({ tForceUnwind: v })} />
+              <StrRow label="最后开新腿时刻" hint="默认 1400；晚于 1445 一律钳到 1445。必须早于尾盘配平时刻" value={form.tLastOpen} onChange={(v) => set({ tLastOpen: v })} />
+              <NumRow label="现价偏离分时均线（%）" hint="默认 0.8：发起点门——正 T 要跌到均线下方、反 T 要站上均线上方达到该幅度" value={form.tVwapDev} min={0.3} max={5} step={0.1} onChange={(v) => set({ tVwapDev: v })} />
+              <NumRow label="日内振幅下限（%）" hint="默认 2.5：振幅不够就没有配对空间，宁可不开腿" value={form.tMinAmp} min={1} max={10} step={0.1} onChange={(v) => set({ tMinAmp: v })} />
+              <NumRow label="近极值带（%）" hint={`默认 0.3：贴着日内高/低点不开腿（下限 0.1，防「贴边也敢开」）`} value={form.tNearExtreme} min={0.1} max={2} step={0.05} onChange={(v) => set({ tNearExtreme: v })} />
+              <NumRow label="距涨/跌停最小距离（%）" hint="默认 1.0：太靠近涨跌停成交不确定，两方向都不开" value={form.tLimitDist} min={0.5} max={5} step={0.1} onChange={(v) => set({ tLimitDist: v })} />
+              <NumRow label="开盘冷静期（分钟）" hint="默认 15：早盘样本太少，日内口径（均线/振幅/极值）这时不可信" value={form.tCooling} min={10} max={60} step={1} onChange={(v) => set({ tCooling: v })} />
+              <NumRow label="正 T 环境门 MS" hint="默认 0.40：市场组缩放低于此值不开买腿；填 0＝不设门" value={form.tMinMS} min={0} max={1} step={0.05} onChange={(v) => set({ tMinMS: v })} />
+              <NumRow label="反 T 环境门 MS" hint="默认 0.20（六轮：极端弱势就是不做 T）。高于正 T 门时后端按两者较小值生效" value={form.tSellEnvMS} min={0} max={1} step={0.05} onChange={(v) => set({ tSellEnvMS: v })} />
+              <NumRow label="大盘急跌停正 T（%）" hint="默认 -2.0：大盘跌到该幅度当天不开买腿；填 0＝不设该门" value={form.tPlunge} min={-10} max={0} step={0.1} onChange={(v) => set({ tPlunge: v })} />
+              <NumRow label="当日反 T 卖腿市值帽（%）" hint="默认 20，分母是 min(总资产, 持仓市值)（五轮 T5-2 改的口径）" value={form.tSellCapTotal} min={5} max={50} step={1} onChange={(v) => set({ tSellCapTotal: v })} />
+              <NumRow label="反 T 否决门距离（%）" hint="默认 1.5：距止盈/止损线小于该幅度就不做高抛（让位给信号执行）" value={form.tStopGuard} min={0.5} max={5} step={0.1} onChange={(v) => set({ tStopGuard: v })} />
+              <NumRow label="买回熔断阈值（%）" hint="默认 3.0：反 T 卖飞了这么多就熔断买回通道，转战略减仓并告警（下限 1，不许设成 0＝永不熔断）" value={form.tLossBreaker} min={1} max={10} step={0.1} onChange={(v) => set({ tLossBreaker: v })} />
+              <NumRow label="流动性：成交额下限（万元）" hint={`默认 3000；填 0＝不设该条。读数拿不到按「不过」处理`} value={form.tMinAmount} min={0} max={1000000} step={100} precision={0} onChange={(v) => set({ tMinAmount: v })} />
+              <NumRow label="流动性：换手率下限（%）" hint="默认 1.5；填 0＝不设该条" value={form.tMinTurnover} min={0} max={25} step={0.1} onChange={(v) => set({ tMinTurnover: v })} />
+              <NumRow label="流动性：上市天数下限" hint="默认 60；填 0＝不设该条（次新日内波动不具可比性）" value={form.tMinListed} min={0} max={3650} step={1} precision={0} onChange={(v) => set({ tMinListed: v })} />
+              <NumRow label="分时均线校验容差（%）" hint="默认 0.1：主源与分钟链复算差过该值即视为读数不可信，本轮不开腿" value={form.tVwapTol} min={0.05} max={1} step={0.05} onChange={(v) => set({ tVwapTol: v })} />
+              <div style={hintStyle}>
+                越界值后端不会报错，而是**忽略该键并回落出厂值**，同时经 TFallbacks 逐轮上报——
+                这里的区间与后端 tClamp 一一对应，提交前先挡住，避免"配了但没生效"。
+              </div>
+
               <div style={groupStyle}>宏观事件前瞻（按交易日）</div>
               <NumRow
                 label="事件前瞻交易日数"
@@ -936,7 +1146,8 @@ export default function RegimeConfigPanel() {
 
               <div style={groupStyle}>利空与仓位上限</div>
               <NumRow label="LLM 利空缩放" hint="个股 LLM 利空时的买入乘子（默认 0.5）" value={form.llmBearish} max={2} step={0.05} onChange={(v) => set({ llmBearish: v })} />
-              <NumRow label="总仓位上限" hint="账户总仓位比例上限（默认 0.80）；参与上限类取 min" value={form.maxPos} max={1} step={0.05} onChange={(v) => set({ maxPos: v })} />
+              <NumRow label="总仓位上限" hint="目标仓位天花板（默认 1.00，v4 起不再逐笔相乘）：目标仓位＝基准×min(市场缩放, 本值)" value={form.maxPos} max={1} step={0.05} onChange={(v) => set({ maxPos: v })} />
+              <NumRow label="单笔基准仓位" hint="默认 0.10（占总资产）：单笔上限＝基准×本值×市场缩放×个股缩放，再与目标剩余空间取小" value={form.perTrade} max={1} step={0.01} onChange={(v) => set({ perTrade: v })} />
               <NumRow label="权益回撤熔断比例" hint="回撤达此比例按 risk_overlay 缩仓（默认 0.10）" value={form.maxDD} max={1} step={0.01} onChange={(v) => set({ maxDD: v })} />
 
               <div style={groupStyle}>连续止损熔断与止损/止盈偏移</div>

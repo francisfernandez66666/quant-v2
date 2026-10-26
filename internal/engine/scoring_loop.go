@@ -377,6 +377,21 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		e.dispatchLive(buys, quotes, true, time.Now())
 	}
 
+	// §DYN-T 批 8（W8-B）实盘日内回转的每轮驱动，位置**刻意在这条链的最末**（本轮战略买入分发
+	// dispatchLive 与战略卖出 pushRealAdvice 都已跑完）：
+	//   - §8.7 优先级表要求「强买卖信号执行 > 做 T」——T 只能吃信号执行剩下的额度与票，
+	//     放在分发之前会让一条日内低吸腿在同一轮里抢在战略买入前面；
+	//   - §8.4.3 的一次性消费也依赖这个次序：战略先消费本轮判定，T 后消费（引擎侧
+	//     tMarkStrategicConsumed 在 dispatchLive/autoPlaceScaled 里记账）；
+	//   - 与纸面钩子（registry.dispatchPaperMark 的 runIntradayT）同频率，但**每轮无条件拨**：
+	//     正 T 的第二腿等的是价差不是信号，本轮无信号时配对/收摊照样要推进。
+	// English: the live round-trip driver, deliberately last — after this round's strategic buy/sell
+	// dispatch (signal execution outranks T), and unconditionally each round (pairing waits for a
+	// spread, not a signal).
+	if ctrl := e.QMTController(); ctrl != nil {
+		e.runIntradayTLive(e.primaryMember(), ctrl, quotes)
+	}
+
 	// §SELLPOINT-UNIFY P3 模拟盘并轨：5s 轮同样推进纸面双账统一卖出裁决（与主循环 13e-pre
 	// 共享同一 (通道,账号,代码) 状态机，窗口以真实时钟推进；close/trim 各自幂等去重，双轮
 	// 叠加不会重复卖）。放在撮合分发之外无条件跑——本轮无信号也要推进观察窗。
@@ -864,7 +879,12 @@ func pureTsCode(tsCode string) string {
 // English: §P1-4 — sell orders now carry CurrentPrice/PrevClose so the limit-up/down risk gate
 // (which fail-opens on PrevClose<=0) actually sees market context; without quotes the gate stays
 // fail-open (positions remain exitable) instead of blocking protective sells.
-func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string) (int, error) {
+//
+// intradayT §DYN-T 批 8（W8-B 不变量 12）：可选位参，**仅日内回转编排传 true**。
+// 为什么加在这里而不是另写一条卖出腿：这条函数是实盘部分卖的唯一原语（行情上下文、拒单不假成功、
+// 实际报出量回报三件事都只有一份实现），复制一份就意味着有一天两份会漂移——而漂移的那一份
+// 恰好是管着真金白银的那一份。卖出方向的净额语义由 T 编排自己保证，风控侧只把标志当留痕。
+func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string, intradayT ...bool) (int, error) {
 	cfg := ctrl.Config()
 	if qty <= 0 || price <= 0 {
 		return 0, nil
@@ -881,6 +901,10 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		Amount:      price * float64(qty),
 		CreatedAt:   time.Now().Format(time.RFC3339),
 		StalenessMs: e.quoteStalenessMs(p.TsCode),
+	}
+	// §DYN-T 批 8：日内回转的卖腿带留痕标志（可选位参不传＝战略/纪律卖出，保持 false）。
+	if len(intradayT) > 0 {
+		req.IntradayT = intradayT[0]
 	}
 	// §P1-4（2026-09-15）：直接取 fetcher 最近一轮实时快照注入 CurrentPrice/PrevClose——
 	// 此前卖出单只填 StalenessMs，风控闸 checkLimitPrice 因 PrevClose<=0 恒 fail-open，

@@ -109,6 +109,10 @@ func TestEvoRecordDecisionsWritesLive(t *testing.T) {
 func TestEvoRecordDecisionsShadow(t *testing.T) {
 	e := evoTestEngine(t)
 	pol := evoTestPolicy(t)
+	// 显式钉 product：本例的因果链是「kelly_lambda 0.5→0.2 ⇒ 该因子从 ~1.0 压到 ~0.6 ⇒ scale 显著下降」，
+	// 这是连乘路径的线性可推性。§DYN-SIZE v4 出厂默认已是 power_mean，同一改动会被组间幂平均稀释，
+	// 断言"shadow < live"就测不到它想测的东西（灰度候选比较必须同模式才有意义）。
+	pol.Regime.SizeCfg.Mode = "product"
 	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.Local)
 	// 状态库：一条灰度候选（kelly 压到 0.2，scale 应显著小于 live）。
 	tr := e.evoTrackerRef()

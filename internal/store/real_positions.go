@@ -22,6 +22,24 @@ import (
 
 // RealPosition 实盘持仓行。
 // （RealPosition is one row of the live book.）
+// 锚点来源枚举（§DYN-T 批 8 实盘侧补齐）。字面量与 `internal/paper/anchor_backfill.go` 的同名
+// 常量必须逐字一致：影子对照表、回填报告、面板与实盘 T 闸门都是跨两本账比对这个值，
+// 改一边就等于把合格票判成不合格（或反之），而这类漂移在两本账里看起来都像"数据本来就有差异"。
+// 为什么不用一个共享常量包：paper 单向不依赖 store，把枚举挪到 store 让 paper 反向引用会成环，
+// 所以两侧各留一份，并由门禁 §127 按字面量逐一对齐（等值锁，不是靠注释约定）。
+// English: anchor provenance enum; the literals must stay byte-identical with the paper book's
+// copies, and the repo gate asserts that instead of trusting a comment.
+const (
+	// AnchorSourceFirstLot 层账最早批次可证的首买价（纸面账本口径）。
+	AnchorSourceFirstLot = "first_lot"
+	// AnchorSourceFirstBuyOrder 买入首成交建行时冻结的锚点（实盘账本口径）。
+	AnchorSourceFirstBuyOrder = "first_buy_order"
+	// AnchorSourceCostFallback 摊薄成本回落档：可以判风险线，**不可以**开日内回转腿。
+	AnchorSourceCostFallback = "cost_fallback"
+	// AnchorSourceNone 任何一档都取不到价（不判线、不开 T）。
+	AnchorSourceNone = "none"
+)
+
 type RealPosition struct {
 	TsCode    string  `json:"ts_code"`    // TS代码
 	Name      string  `json:"name"`       // 名称
@@ -70,6 +88,16 @@ type RealPosition struct {
 	// that write. cost_price stays the P&L basis (add-ons must dilute it); the anchor is the risk-line
 	// basis. 0 = unknown (legacy rows / snapshot-created rows), named in the shadow table, backfilled in W3.
 	AnchorPrice float64 `json:"anchor_price,omitempty"`
+	// AnchorSource §DYN-T（批 8 补齐）锚点来源：与 paper 账本同枚举
+	// （first_lot / first_buy_order / cost_fallback / none，空串=未知）。
+	// 为什么实盘也必须有这一列：§8.4.5 的口径是"只有来源可证的锚点才允许开日内回转腿"。
+	// 只存 anchor_price 而不存来源，回填过的成本档与建仓即冻结的首买价档在库里**长得一模一样**，
+	// 于是"用摊薄成本冒充锚点"这条被裁决二终结的路径会从实盘 T 侧绕回来。
+	// 写入点只有两处：买入首成交建行（first_buy_order）与存量回填（cost_fallback）；
+	// 对账快照一律不覆盖，与 anchor_price 同一条"永久不覆盖"纪律。
+	// English: §DYN-T — where the anchor came from; the live T gate needs it because a cost-derived
+	// anchor is fine for risk lines but must never justify an intraday round-trip.
+	AnchorSource string `json:"anchor_source,omitempty"`
 	// CurPrice §前端实盘持仓现价/盈亏展示用：由 handleRealPositions 装配实时行情快照填充，
 	// 网关回报本身不含实时价（仅 cost_price）。English: live price for the real-position table;
 	// filled from the quote snapshot by handleRealPositions, not carried in gateway reports.
@@ -100,6 +128,13 @@ type RealOrder struct {
 	// §C2 软回踩单按单超时秒数（0=沿用全局 cancel_stale_sec）。
 	// English: §C2 per-order timeout for pullback entries (0 = global cancel_stale_sec).
 	TimeoutSec int `json:"timeout_sec,omitempty"`
+	// IntradayT §DYN-T（批7/W8-A）：本委托是日内回转（正反 T）的一腿，不是战略建仓/减仓。
+	// 消费方有两处，且都必须把"漏标"当成错账而不是小事：
+	// ① 目标仓位的 CurStrat 要把它剔出去（否则一笔日内低吸会吃掉战略剩余空间）；
+	// ② 集中度闸按净额判 T 买腿（配套的可卖量复核在 risk 侧，复核不过退回全额口径）。
+	// English: marks a live order as one leg of an intraday round-trip, consumed by the target-position
+	// model and the concentration gate.
+	IntradayT bool `json:"intraday_t,omitempty"`
 }
 
 // RealFill 实盘成交回报行。
@@ -201,6 +236,42 @@ func (d *DB) ensureAnchorPriceColumn() error {
 	return nil
 }
 
+// AnchorTicket 这笔实盘持仓有没有"开日内回转腿"的资格（§8.4.5 锚点前置，与 paper 侧
+// `Position.AnchorTicket()` 同一判据的实盘形态）。
+//
+// 为什么有 anchor_price 还不够：`cost_fallback` 与 `none` 两档的锚点是**算得出风险线**用的
+// （摊薄成本能支撑止盈止损判定），但摊薄成本会被加仓与日内腿改动，把它当天花板/地板的依据
+// 等于让一笔日内低吸悄悄改写自己的退出基准——那正是裁决二终结过的缺陷从实盘侧绕回来。
+// 所以只有"首成交建行"那一档（first_buy_order，与本仓层账 first_lot 同性质）才给 T 资格；
+// anchor_source 为空＝这列上线前的存量行，宁可不开腿（保守方向，事后回查有理由）。
+// English: a cost-derived anchor is good enough to compute risk lines but never to justify an
+// intraday round-trip; only a first-buy provenance grants the ticket, empty counts as unknown.
+func (p RealPosition) AnchorTicket() bool {
+	if p.AnchorPrice <= 0 {
+		return false
+	}
+	return p.AnchorSource == AnchorSourceFirstBuyOrder || p.AnchorSource == AnchorSourceFirstLot
+}
+
+// ensureAnchorSourceColumn §DYN-T：real_positions.anchor_source 的幂等补列（TEXT NOT NULL DEFAULT ”）。
+// 与 ensureAnchorPriceColumn 同族（惰性 DDL，不进集中迁移清单），存量行落 ”＝来源未知。
+// ” 与 'none' 在门判上同义（都不可开 T 腿），区别只在语义来源：” 是"这列上线前的行"，
+// 'none' 是"回填时明确算过、任何一档都取不到价"。
+// English: idempotent lazy column for the anchor provenance; legacy rows read as "unknown".
+func (d *DB) ensureAnchorSourceColumn() error {
+	has, err := d.hasColumn("real_positions", "anchor_source")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := d.db.Exec(`ALTER TABLE real_positions ADD COLUMN anchor_source TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("store migrate real_positions add anchor_source: %w", err)
+	}
+	return nil
+}
+
 // costBasisDropped §N-6（2026-09-22 傍晚批复验，裁决 11=本地含费优先）守卫**留痕**判定：
 // 本轮对账快照的 cost_price 是否会被保护丢弃。它不参与落库——保护由 upsert 里的 CASE 完成，
 // 本函数只负责让保护不再"自身静默"（本批主题是静默失效）。两处口径必须逐项一致：
@@ -255,6 +326,12 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 	if err := d.ensureAnchorPriceColumn(); err != nil {
 		return 0, err
 	}
+	// §DYN-T：anchor_source 同步补列。本入口与 ReconcilePositionsForUser 是同一口径的孪生语句
+	// （函数注释已登记"改动两边同步"），少补一列就会变成"测试路径报 no such column、
+	// 生产路径正常"这种永远复现不到现网的红。
+	if err := d.ensureAnchorSourceColumn(); err != nil {
+		return 0, err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
@@ -283,8 +360,12 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				p.TsCode, p.UserID, p.CostPrice, localCost)
 		}
 		_, err := tx.Exec(`INSERT INTO real_positions
-			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, can_use_qty, anchor_price)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			-- §DYN-T：anchor_source 出现在 INSERT 列（建行时知道就带上），
+			-- 但**整条缺席下面的 SET 列表**——与 anchor_price 同一条「快照永不覆盖锚点」纪律：
+			-- 对账通道不认识来源，让它写就等于给成本档持仓伪造一个可证来源。
+			-- English: provenance is stamped when a row is created and never rewritten by a snapshot.
+			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, can_use_qty, anchor_price, anchor_source)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				-- §M4（2026-09-22 PM 批）空名快照不得抹空已有名称：券商持仓快照常不带 name，
 				-- 旧实现 excluded.name('') 直覆盖 → 实盘持仓页只剩代码。与同语句 strategy 的
@@ -322,7 +403,7 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				-- which only keeps its old value when this round carries none).
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
-			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty, p.AnchorPrice)
+			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty, p.AnchorPrice, p.AnchorSource)
 		if err != nil {
 			return 0, fmt.Errorf("upsert real position %s: %w", p.TsCode, err)
 		}
@@ -417,9 +498,15 @@ func (d *DB) BackfillRealPositionAnchors() (filled, remaining int64, err error) 
 	if err := d.ensureAnchorPriceColumn(); err != nil {
 		return 0, 0, err
 	}
+	// 回填同时写来源：成本档**只能用于判线，不能用于开 T 腿**（§8.4.5）。
+	// 来源与锚点必须同一条 UPDATE 落库——分两条语句就会出现"锚点已写、来源还是空"的半态，
+	// 而那个半态在门判上等价于 none，等于把刚回填好的基准又判回未知。
+	if err := d.ensureAnchorSourceColumn(); err != nil {
+		return 0, 0, err
+	}
 	res, err := d.db.Exec(`UPDATE real_positions
-		SET anchor_price = cost_price
-		WHERE (anchor_price IS NULL OR anchor_price <= 0) AND cost_price > 0`)
+		SET anchor_price = cost_price, anchor_source = ?
+		WHERE (anchor_price IS NULL OR anchor_price <= 0) AND cost_price > 0`, AnchorSourceCostFallback)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -459,6 +546,10 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 	if err := d.ensureAnchorPriceColumn(); err != nil {
 		return 0, err
 	}
+	// §DYN-T：anchor_source 同一时刻确保（快照建行也要带得上这列，否则 INSERT 报 no such column）。
+	if err := d.ensureAnchorSourceColumn(); err != nil {
+		return 0, err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
@@ -495,8 +586,12 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 			})
 		}
 		_, err := tx.Exec(`INSERT INTO real_positions
-			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, can_use_qty, anchor_price)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			-- §DYN-T：anchor_source 出现在 INSERT 列（建行时知道就带上），
+			-- 但**整条缺席下面的 SET 列表**——与 anchor_price 同一条「快照永不覆盖锚点」纪律：
+			-- 对账通道不认识来源，让它写就等于给成本档持仓伪造一个可证来源。
+			-- English: provenance is stamped when a row is created and never rewritten by a snapshot.
+			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, can_use_qty, anchor_price, anchor_source)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				-- §M4（2026-09-22 PM 批）与 UpsertRealPositions 同口径：空名快照不抹空已有名称。
 				name=COALESCE(NULLIF(excluded.name,''), real_positions.name),
@@ -544,7 +639,7 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 				-- which only keeps its old value when this round carries none).
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
-			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty, p.AnchorPrice)
+			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty, p.AnchorPrice, p.AnchorSource)
 		if err != nil {
 			return 0, fmt.Errorf("reconcile real position %s: %w", p.TsCode, err)
 		}
@@ -603,7 +698,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 		return nil, err
 	}
 	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty, COALESCE(anchor_price,0) FROM real_positions ORDER BY ts_code`)
+		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty, COALESCE(anchor_price,0), COALESCE(anchor_source,'') FROM real_positions ORDER BY ts_code`)
 	if err != nil {
 		return nil, err
 	}
@@ -612,7 +707,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 	for rows.Next() {
 		var p RealPosition
 		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty, &p.AnchorPrice); err != nil {
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty, &p.AnchorPrice, &p.AnchorSource); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -633,7 +728,7 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 		return nil, err
 	}
 	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,''), can_use_qty, COALESCE(anchor_price,0) FROM real_positions
+		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,''), can_use_qty, COALESCE(anchor_price,0), COALESCE(anchor_source,'') FROM real_positions
 		WHERE user_id = '' OR user_id = ? ORDER BY ts_code`, userID)
 	if err != nil {
 		return nil, err
@@ -643,7 +738,7 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 	for rows.Next() {
 		var p RealPosition
 		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate, &p.CanUseQty, &p.AnchorPrice); err != nil {
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate, &p.CanUseQty, &p.AnchorPrice, &p.AnchorSource); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -664,9 +759,9 @@ func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 		return p, err
 	}
 	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty, COALESCE(anchor_price,0) FROM real_positions WHERE ts_code=?`, code).
+		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty, COALESCE(anchor_price,0), COALESCE(anchor_source,'') FROM real_positions WHERE ts_code=?`, code).
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty, &p.AnchorPrice)
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty, &p.AnchorPrice, &p.AnchorSource)
 	return p, err
 }
 
@@ -683,10 +778,10 @@ func (d *DB) RealPositionByCodeForUser(userID, code string) (RealPosition, error
 		return p, err
 	}
 	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty, COALESCE(anchor_price,0) FROM real_positions
+		strategy, signal_id, updated_at, COALESCE(user_id,''), can_use_qty, COALESCE(anchor_price,0), COALESCE(anchor_source,'') FROM real_positions
 		WHERE ts_code=? AND (user_id = '' OR user_id = ?)`, code, userID).
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty, &p.AnchorPrice)
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.CanUseQty, &p.AnchorPrice, &p.AnchorSource)
 	return p, err
 }
 
@@ -700,6 +795,9 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	// §ANCHOR-FIRST：本函数是 anchor_price 的**唯一**生产写入点（只在买入首成交建行时落值），
 	// 因此惰性补列必须在这里确保——否则老库上的建行 INSERT 会直接报「no such column」。
 	if err := d.ensureAnchorPriceColumn(); err != nil {
+		return err
+	}
+	if err := d.ensureAnchorSourceColumn(); err != nil {
 		return err
 	}
 	tx, err := d.db.Begin()
@@ -745,11 +843,14 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			// 成交推算"正是本缺陷成因）。此处建行缺列= NULL=未知，闸自动退回本地推算，不误拦。
 			// §ANCHOR-FIRST（裁决二）建仓即冻结的锚点＝这笔首成交的**含费**每股成本
 			// （与 cost_price 同源同值；此后 cost_price 会被加仓摊薄，锚点不会）。
+			// anchor_source 与 anchor_price 同批落值：这笔首成交就是"来源可证"的那一档，
+			// 不写来源等于让实盘 T 腿闸门看不到证据而一律拒绝（保守方向正确，但会把合格票也挡掉）。
 			_, err = tx.Exec(`INSERT INTO real_positions
-				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date, anchor_price)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date, anchor_price, anchor_source)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				f.Code, f.Name, f.Qty, buyCostPerShare, amountWithFee, f.Price, "", f.SignalID,
-				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate, buyCostPerShare)
+				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate, buyCostPerShare,
+				AnchorSourceFirstBuyOrder)
 		}
 	case err == nil:
 		now := time.Now().Format("2006-01-02 15:04:05")
@@ -953,6 +1054,12 @@ type PendingBuy struct {
 	Code   string  `json:"code"`
 	Price  float64 `json:"price"`
 	Remain int     `json:"remain"`
+	// IntradayT §DYN-T（批2/批7）：这笔在途买单是日内回转腿。
+	// 目标仓位模型的 `CurStrat` **必须**把它剔出去（T 腿不占战略剩余空间），
+	// 而行业/单票额度**必须继续计入**（漏算会让 T 腿成为更便宜的资金来源，正是 §8.4.6 明令禁止的旁路）。
+	// English: pending buy that belongs to an intraday round-trip; excluded from strategic CurStrat
+	// but still counted by the concentration rooms so a T leg can never act as cheaper capital.
+	IntradayT bool `json:"intraday_t,omitempty"`
 }
 
 // PendingBuys 返回某账号当日在途买单（已报/部成）的剩余量：已报按全额、部成按未成交余量。
@@ -968,7 +1075,7 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 	if len(day) == 8 {
 		day = day[:4] + "-" + day[4:6] + "-" + day[6:]
 	}
-	rows, err := d.db.Query(`SELECT code, signal_id, price, qty FROM orders
+	rows, err := d.db.Query(`SELECT code, signal_id, price, qty, COALESCE(intraday_t,0) FROM orders
 		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')
 		AND substr(created_at,1,10)=?`, userID, day)
 	if err != nil {
@@ -979,8 +1086,8 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 	for rows.Next() {
 		var code, sid string
 		var price float64
-		var qty int
-		if err := rows.Scan(&code, &sid, &price, &qty); err != nil {
+		var qty, it int
+		if err := rows.Scan(&code, &sid, &price, &qty, &it); err != nil {
 			continue
 		}
 		filled := d.SumFilledQty(userID, sid)
@@ -988,7 +1095,7 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 		if remain <= 0 || price <= 0 {
 			continue
 		}
-		out = append(out, PendingBuy{Code: code, Price: price, Remain: remain})
+		out = append(out, PendingBuy{Code: code, Price: price, Remain: remain, IntradayT: it != 0})
 	}
 	return out, rows.Err()
 }
@@ -1062,10 +1169,10 @@ func (d *DB) UpsertRealOrder(o RealOrder) (bool, error) {
 	// §W2-10 租户列：委托行打归属账号（存量行为空串=遗留全局）
 	res, err := d.db.Exec(`INSERT OR IGNORE INTO orders
 		(order_id, signal_id, code, side, status, price, qty, created_at, user_id,
-		 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec, intraday_t)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID,
-		o.MarketVWAP, o.VWAPSource, o.VWAPAsOf, o.SignalVWAPPremiumPct, o.TimeoutSec)
+		o.MarketVWAP, o.VWAPSource, o.VWAPAsOf, o.SignalVWAPPremiumPct, o.TimeoutSec, b2i(o.IntradayT))
 	if err != nil {
 		return false, err
 	}
@@ -1456,7 +1563,7 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 const realOrderSelectColumns = `order_id, signal_id, code, side, status, price, qty, created_at,
 	COALESCE(user_id,''), COALESCE(timeout_sec,0),
 	COALESCE(market_vwap,0), COALESCE(vwap_source,''), COALESCE(vwap_as_of,''),
-	COALESCE(signal_vwap_premium_pct,0)`
+	COALESCE(signal_vwap_premium_pct,0), COALESCE(intraday_t,0)`
 
 func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	// §C2-VWAP-READ（2026-10-26）：写入侧一直有 market_vwap/vwap_source/vwap_as_of/
@@ -1474,10 +1581,13 @@ func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	var out []RealOrder
 	for rows.Next() {
 		var o RealOrder
+		var it int
 		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID, &o.TimeoutSec,
-			&o.MarketVWAP, &o.VWAPSource, &o.VWAPAsOf, &o.SignalVWAPPremiumPct); err != nil {
+			&o.MarketVWAP, &o.VWAPSource, &o.VWAPAsOf, &o.SignalVWAPPremiumPct, &it); err != nil {
 			return nil, err
 		}
+		// §DYN-T 读侧必须把 0/1 还原成布尔，漏接会让 T 腿被当战略单计入目标仓位（由全字段回读锁兜）。
+		o.IntradayT = it != 0
 		out = append(out, o)
 	}
 	return out, rows.Err()
@@ -1606,10 +1716,10 @@ func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
 		// 本地无此单（网侧重放/回报先于下单回填到达）：补插完整委托行。
 		res, err := tx.Exec(`INSERT OR IGNORE INTO orders
 			(order_id, signal_id, code, side, status, price, qty, created_at, user_id,
-			 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec, intraday_t)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID,
-			o.MarketVWAP, o.VWAPSource, o.VWAPAsOf, o.SignalVWAPPremiumPct, o.TimeoutSec)
+			o.MarketVWAP, o.VWAPSource, o.VWAPAsOf, o.SignalVWAPPremiumPct, o.TimeoutSec, b2i(o.IntradayT))
 		if err != nil {
 			return "", err
 		}

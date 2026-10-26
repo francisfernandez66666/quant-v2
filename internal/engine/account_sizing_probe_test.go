@@ -212,11 +212,12 @@ func TestSizingConfigForBridgesLegacyTotalPosPct(t *testing.T) {
 		t.Fatalf("显式 sizing 值应优先, got=%v", got)
 	}
 
-	// ④ 两者都没写 → 出厂默认 0.80
+	// ④ 两者都没写 → 出厂默认 **1.00**（§DYN-SIZE v4：语义已从"逐笔缩放乘子"改为"目标仓位天花板"，
+	// owner 裁决大牛市可以满仓，弱市靠因子压低；0.80 作为天花板会把 20% 资金永久锁在账外）。
 	cm4 := config.NewManagerWithRules(&config.Rules{})
 	e4 := &Engine{userID: "u", cfgMgr: cm4}
-	if got := e4.sizingConfigFor("u").MaxTotalPositionPct; got != 0.80 {
-		t.Fatalf("都未设置应回落到出厂默认 0.80, got=%v", got)
+	if got := e4.sizingConfigFor("u").MaxTotalPositionPct; got != 1.00 {
+		t.Fatalf("都未设置应回落到出厂默认 1.00（目标天花板）, got=%v", got)
 	}
 }
 

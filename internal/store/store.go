@@ -487,6 +487,10 @@ func (d *DB) migrate() error {
 			vwap_as_of TEXT DEFAULT '',
 			signal_vwap_premium_pct REAL DEFAULT 0,
 			timeout_sec INTEGER DEFAULT 0,
+			-- §DYN-T（批7/W8-A）日内回转腿标记：0=战略单，1=T 腿。
+			-- 目标仓位模型的 CurStrat 必须把 T 腿剔出去（否则一笔日内低吸会吃掉战略空间），
+			-- 集中度闸也要按"净额"判 T 买腿，两个用途都依赖这一列，不能靠 signal_id 前缀猜。
+			intraday_t INTEGER DEFAULT 0,
 			UNIQUE (user_id, signal_id)
 		)`,
 
@@ -734,6 +738,12 @@ func (d *DB) migrate() error {
 		{"real_positions", "user_id", "ALTER TABLE real_positions ADD COLUMN user_id TEXT DEFAULT ''"},
 		// §W2-10 委托/成交流水补租户列：回报写入时打归属账号；存量行空串=遗留全局，读侧兼容
 		{"orders", "user_id", "ALTER TABLE orders ADD COLUMN user_id TEXT DEFAULT ''"},
+		// §DYN-T（批7/W8-A）存量库补日内回转腿标记列（幂等加列，默认 0=战略单）。
+		{"orders", "intraday_t", "ALTER TABLE orders ADD COLUMN intraday_t INTEGER DEFAULT 0"},
+		// §DYN-T（批8补齐）持仓行的锚点来源：进集中补列清单而不是只靠写路径的惰性 DDL——
+		// 读侧（卖出裁决、T 资格闸门、只读接口）在任何一次 Open 之后都可能立刻被调用，
+		// 而"先写一次成交才有列"会让老库上第一次读直接报 no such column。
+		{"real_positions", "anchor_source", "ALTER TABLE real_positions ADD COLUMN anchor_source TEXT NOT NULL DEFAULT ''"},
 		{"fills", "user_id", "ALTER TABLE fills ADD COLUMN user_id TEXT DEFAULT ''"},
 		// §GAP 二.3#5 回测断点缓存规则指纹：改参后旧缓存自动失效
 		{"backtest_event_results", "rule_fp", "ALTER TABLE backtest_event_results ADD COLUMN rule_fp TEXT DEFAULT ''"},
@@ -1201,14 +1211,17 @@ func (d *DB) migrateOrdersSignalUnique() error {
 			vwap_as_of TEXT DEFAULT '',
 			signal_vwap_premium_pct REAL DEFAULT 0,
 			timeout_sec INTEGER DEFAULT 0,
+			-- §DYN-T：重建必须带上 intraday_t，否则 P0-2 迁移会把刚补的 T 腿标记清掉
+			-- （同一件事 VWAP 四列已经踩过一次，注释就在上面几行）。
+			intraday_t INTEGER DEFAULT 0,
 			UNIQUE (user_id, signal_id)
 		);
 		INSERT OR REPLACE INTO orders_new
 			(order_id, signal_id, code, side, status, price, qty, created_at, user_id,
-			 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec)
+			 market_vwap, vwap_source, vwap_as_of, signal_vwap_premium_pct, timeout_sec, intraday_t)
 		SELECT order_id, signal_id, code, side, status, price, qty, created_at, COALESCE(user_id, ''),
 			COALESCE(market_vwap,0), COALESCE(vwap_source,''), COALESCE(vwap_as_of,''), COALESCE(signal_vwap_premium_pct,0),
-			COALESCE(timeout_sec,0)
+			COALESCE(timeout_sec,0), COALESCE(intraday_t,0)
 		FROM orders;
 		DROP TABLE orders;
 		ALTER TABLE orders_new RENAME TO orders;
@@ -1627,6 +1640,27 @@ func (d *DB) StockDelistDate(code string) (string, error) {
 	var v sql.NullString
 	err := d.db.QueryRow(
 		`SELECT COALESCE(delist_date,'') FROM stocks WHERE ts_code=? OR ts_code LIKE ? LIMIT 1`,
+		code, code+".%",
+	).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v.String, nil
+}
+
+// StockListDate 返回某代码的上市日（YYYYMMDD）；无记录/未装载返回空串。
+// §DYN-T（方案 §8.4.4b 流动性前置）：做日内回转要排除次新股——它们单日振幅经常 10% 以上，
+// 2.5% 的振幅门形同不设。查不到**不等于"没有上市日"**，调用方必须按"读数不可得"处理（fail-closed），
+// 不能把空值当"上市很久"放行。
+// English: list_date for a code (bare or ts_code); empty = unknown, which the T liquidity gate must
+// treat as "reading unavailable" (block), never as "old enough".
+func (d *DB) StockListDate(code string) (string, error) {
+	var v sql.NullString
+	err := d.db.QueryRow(
+		`SELECT COALESCE(list_date,'') FROM stocks WHERE ts_code=? OR ts_code LIKE ? LIMIT 1`,
 		code, code+".%",
 	).Scan(&v)
 	if err == sql.ErrNoRows {

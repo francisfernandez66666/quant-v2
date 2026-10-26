@@ -99,6 +99,9 @@ func TestRiskBudgetCapEnabledAgnostic(t *testing.T) {
 // 而非连乘——同一场股灾不得罚两次。
 func TestRiskBudgetCapIsCapNotWeight(t *testing.T) {
 	r := budgetRegime(3, 6)
+	// 上限类"取 min 不连乘"的语义在 product 路径上最直白；v4 默认已是 power_mean，
+	// 这里显式锁回 product，避免把组间幂平均误读成连乘。
+	r.SizeCfg.Mode = "product"
 	// 大盘 -2% → indexFactor 走 deep 档 0.40（带宽：≥-1% / (-2,-1) / ≤-2）；风险预算 0.667（上限类）。
 	r.IndexChangePct = -2
 	res := ComputeSizing(r, neutralSignal())

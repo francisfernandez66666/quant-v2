@@ -194,6 +194,37 @@
 # 说明：本机通常没有 pytest，脚本内 py_tests() 会自动退回标准库 unittest（CI 仍走 pytest）。
 set -euo pipefail
 
+# >>> GREP-Q-SAFE
+# ── 大文本判读的唯一姿势：grep_q <模式> <变量名> [F|B] ────────────────────────
+# 为什么不许再写 `printf '%s\n' "$x" | grep -q ...`：`grep -q` 命中第一条就退出并关闭管道，
+# 而 printf 在文本超过管道缓冲（64KB）时才写到一半，于是被 SIGPIPE 打死（退出码 141）；
+# `set -o pipefail` 把「匹配成功」读成「整条管道失败」——本段脚本的判红语义当场反向。
+# 2026-10-27 §114 V5 实录：镜像里破坏确实现形（输出里明明有 `× ... G1`），却被报成
+# 「反证 V5 破坏后 vitest 没让 G1 现形」并 GATE_EXIT=1。vitest 的兜底 DOM dump 大小随
+# 页面渲染内容浮动 ⇒ 同一段锁平时全绿、某天随机红，判据落在输出体积上而不是代码上。
+# 修法：待判文本先整体落临时文件，再按文件判读——写文件与 grep 之间没有管道，
+# grep 提前退出不可能回头打死写方。
+# 临时文件在函数**内部**首次调用时懒建：前言只许放函数定义（§111 的 CHECK 腿专点
+# 「前言里的非函数副作用语句」，因为 -collect 的内层脚本只搬函数、不搬前言语句——
+# 把 mktemp 写在前言＝collect 模式下 GREPQ_FILE 永远空 ⇒ 每枚 grep_q 都判不到＝假绿）。
+grep_q() { # $1=模式 $2=待判**变量名**（不带 $）$3=可选 F（字面）/B（BRE，等价原来的裸 grep -q），缺省 E
+	local _t
+	_t="${!2:-}"
+	[ -n "$_t" ] || return 1
+	if [ -z "${GREPQ_FILE:-}" ]; then
+		GREPQ_FILE="$(mktemp /tmp/gate-grepq-XXXXXX)" || return 1
+	fi
+	printf '%s\n' "$_t" > "$GREPQ_FILE" || return 1
+	if [ "${3:-}" = "F" ]; then
+		grep -qF -- "$1" "$GREPQ_FILE"
+	elif [ "${3:-}" = "B" ]; then
+		grep -q -- "$1" "$GREPQ_FILE"
+	else
+		grep -qE -- "$1" "$GREPQ_FILE"
+	fi
+}
+# <<< GREP-Q-SAFE
+
 # >>> GATE-COLLECT-DRIVER
 # ════════════════════════════════════════════════════════════════════════════
 # §P2-L（2026-10-07 修复批 波 4）`-collect` 收集模式驱动
@@ -1742,7 +1773,7 @@ echo "==> 51 §UX-TRUTH 前端错误呈现层与移动壳推送定向（2026-09-
 #     两次假红都只能靠人工复现定位，违反"红项当场可读"排障纪律）。
 UX_VITEST=$( cd web && npm test -- h2_positions_balance m9_error_tri_state m13_forbidden_poll --no-file-parallelism 2>&1 || true )
 printf '%s\n' "$UX_VITEST" | grep -E 'Test Files|Tests +[0-9]' || true
-if printf '%s\n' "$UX_VITEST" | /usr/bin/grep -qE '[1-9][0-9]* (failed|error)'; then
+if grep_q '[1-9][0-9]* (failed|error)' UX_VITEST; then
 	echo "--- FAIL: §51 §UX-TRUTH 前端行为锁（h2/m9/m13 三文件）判红，失败全段如下："
 	printf '%s\n' "$UX_VITEST" | sed -n '/Failed Tests/,$p' | head -80
 	exit 1
@@ -3713,10 +3744,10 @@ for need in '<StartBoundary>' 'trigger-not-upcoming' 'trigger-unreadable'; do
 done
 # ④ 离线实跑：预览模式一次网络都不碰（bogus IP 也要 0 退出），动手模式对不可达通道必须 fail-closed
 BR_PLAN=$(GZ_IP=127.0.0.1 "$BR_SH" 2>&1 || true)
-printf '%s\n' "$BR_PLAN" | grep -q 'BRIDGE_PLACE_PLAN' \
+grep_q 'BRIDGE_PLACE_PLAN' BR_PLAN B \
 	|| { echo '--- FAIL: §MINUTE-OPS 落位脚本预览模式没打 BRIDGE_PLACE_PLAN（缺省方向被改坏，或预览里混进了网络调用）'; exit 1; }
 OPS_PLAN=$(GZ_IP=127.0.0.1 "$OPS_SH" 2>&1 || true)
-printf '%s\n' "$OPS_PLAN" | grep -q 'MINUTE_OPS_PLAN' \
+grep_q 'MINUTE_OPS_PLAN' OPS_PLAN B \
 	|| { echo '--- FAIL: §MINUTE-OPS 回填脚本预览模式没打 MINUTE_OPS_PLAN（同上）'; exit 1; }
 # 动手分支必须"先本机自检、再连生产"，且连不上就判红（绝不落到可能挂起的密码认证）
 # ⚠ 本枚锁有一条**提交顺序依赖**（2026-10-07 波 2 实录，别把它当成代码坏了）：落位脚本 :89 的
@@ -3729,13 +3760,13 @@ printf '%s\n' "$OPS_PLAN" | grep -q 'MINUTE_OPS_PLAN' \
 #    真正的修法收进波 4 的 -collect：把这类"前置条件不满足"计成 SKIP-PRECONDITION 而不是 FAIL，
 #    并在末尾计数里单列（判据缺失要显形，不许静悄悄少跑一段）。
 BR_ARM=$(GZ_IP=127.0.0.1 "$BR_SH" -Apply 2>&1 || true)
-{ printf '%s\n' "$BR_ARM" | grep -q 'BRIDGE_PLACE_ARMED' && printf '%s\n' "$BR_ARM" | grep -q 'BatchMode'; } \
+{ grep_q 'BRIDGE_PLACE_ARMED' BR_ARM B && grep_q 'BatchMode' BR_ARM B; } \
 	|| { echo '--- FAIL: §MINUTE-OPS 落位脚本的 -Apply 分支不再「先 ASCII 自检后 BatchMode 预探测」（ARMED/预探测判红缺一：要么自检被绕过，要么会挂起）'; exit 1; }
 if GZ_IP=127.0.0.1 "$BR_SH" -Apply >/dev/null 2>&1; then
 	echo '--- FAIL: §MINUTE-OPS 落位脚本在通道不通时居然 0 退出（降级报成功，§M2 族）'; exit 1
 fi
 OPS_ARM=$(GZ_IP=127.0.0.1 MODE=status "$OPS_SH" 2>&1 || true)
-{ printf '%s\n' "$OPS_ARM" | grep -q 'MINUTE_OPS_ARMED' && printf '%s\n' "$OPS_ARM" | grep -q 'BatchMode'; } \
+{ grep_q 'MINUTE_OPS_ARMED' OPS_ARM B && grep_q 'BatchMode' OPS_ARM B; } \
 	|| { echo '--- FAIL: §MINUTE-OPS 回填脚本的状态分支不再「先自检后预探测」（同上）'; exit 1; }
 if GZ_IP=127.0.0.1 MODE=status "$OPS_SH" >/dev/null 2>&1; then
 	echo '--- FAIL: §MINUTE-OPS 回填脚本连不上生产却 0 退出（状态未知当成功）'; exit 1
@@ -5329,7 +5360,7 @@ echo "==> 105 §0927AUDIT D1/D2/D4/D5 修复批专项静态锁 + 独立UAT脚本
 
 # —— 行为腿：D1 已实现盈亏扣费回归（含方向锁用例，秒级）——
 RP=$(go test -count=1 ./internal/store/ -run 'TestTodayRealizedPnl' 2>&1 || true)
-if printf '%s\n' "$RP" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+if grep_q '^(--- FAIL|FAIL)' RP; then
 	echo "--- FAIL: §105 D1 行为腿判红（TodayRealizedPnl 扣费回归），全文如下："
 	printf '%s\n' "$RP" | head -40
 	exit 1
@@ -5893,12 +5924,12 @@ leg106() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	N106_LEG=$((N106_LEG + 1))
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
-	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+	if grep_q '^(--- FAIL|FAIL)' out; then
 		echo "--- FAIL: §106 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
-	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+	grep_q '^ok' out || {
 		echo "--- FAIL: §106 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
 		exit 1
 	}
@@ -5906,7 +5937,7 @@ leg106() { # $1=说明 $2=包 $3=-run 正则
 	#   （形如 `ok  pkg  0.005s [no tests to run]`），所以上面那枚"无 ok 行＝没跑到"判据
 	#   对这种形态是瞎的——本段头注原先声称"吃不到用例时也会判红"，实测不符（注释说有的判据
 	#   而判据不在＝比没有判据更坏，它让人以为验过）。这里按输出里的空跑标记补一刀。
-	if printf '%s\n' "$out" | /usr/bin/grep -qE '\[no tests to run\]'; then
+	if grep_q '\[no tests to run\]' out; then
 		echo "--- FAIL: §106 行为腿空跑（$1）：-run 正则「$3」在 $2 里一条用例都没吃到，ok 行是空跑的 ok＝这条腿没有射程"
 		exit 1
 	fi
@@ -6000,9 +6031,9 @@ leg106 'store 量纲抽检与筛池自适应' ./internal/store/ \
 # 夜间脚本离线自证：语法 + -Preview 必须零 SSH（预览与实跑同一条命令串，缺一环就是假绿温床）
 bash -n scripts/verify_nightly_guangzhou.sh || { echo "--- FAIL: §106 夜间验收脚本语法不过"; exit 1; }
 PV=$(GZ_IP=127.0.0.1 ./scripts/verify_nightly_guangzhou.sh -Preview 2>&1 || true)
-printf '%s\n' "$PV" | grep -q -- '-ActiveMax' \
+grep_q '-ActiveMax' PV B \
 	|| { echo "--- FAIL: §106 夜间验收 -Preview 未透传阈值（预览里看不到阈值＝实跑也带不上）"; exit 1; }
-printf '%s\n' "$PV" | grep -q 'C:/var/lib/quant-trading-v2' \
+grep_q 'C:/var/lib/quant-trading-v2' PV B \
 	|| { echo "--- FAIL: §106 夜间验收 -Preview 的 -DataDir 指错（应指数据目录而非部署目录——心跳文件与库都在数据目录）"; exit 1; }
 bash -n scripts/restore_drill.sh || { echo "--- FAIL: §106 恢复演练脚本语法不过"; exit 1; }
 # ── §CAL-COVER（2026-10-11 现网实录）夜间读数腿的**双态离线自证** ──
@@ -6659,12 +6690,12 @@ echo "ok - §107 语法锁（派生扫到 ${SYN_N} 个 shell 件，全部 bash -
 leg107() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
-	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+	if grep_q '^(--- FAIL|FAIL)' out; then
 		echo "--- FAIL: §107 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
-	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+	grep_q '^ok' out || {
 		echo "--- FAIL: §107 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
 		exit 1
 	}
@@ -6896,12 +6927,12 @@ echo "ok - §108 键空间可达性派生腿（K∪S==P 双向等值 + 四枚前
 leg108() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
-	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+	if grep_q '^(--- FAIL|FAIL)' out; then
 		echo "--- FAIL: §108 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
-	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+	grep_q '^ok' out || {
 		echo "--- FAIL: §108 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
 		exit 1
 	}
@@ -7203,12 +7234,12 @@ echo "ok - §109 结构腿（流水写点零出口 + 送达才记顺序锁）"
 
 # ── ③ 行为腿：pytest 15 条（Python 写侧 + 入口 + HTTP 桥补偿）+ Go 3 条（读取侧对照）──
 py_out=$(py_tests qmt_gateway/tests/test_sell_fill_decouple.py 2>&1 || true)
-if printf '%s\n' "$py_out" | /usr/bin/grep -qE 'FAILED|ERROR|ModuleNotFound|No such file'; then
+if grep_q 'FAILED|ERROR|ModuleNotFound|No such file' py_out; then
 	echo "--- FAIL: §109 pytest 行为腿判红（§SELLFILL-DECOUPLE 15 条），尾部如下："
 	printf '%s\n' "$py_out" | tail -30
 	exit 1
 fi
-printf '%s\n' "$py_out" | /usr/bin/grep -qE '15 (passed|tests)' || {
+grep_q '15 (passed|tests)' py_out || {
 	echo "--- FAIL: §109 pytest 行为腿没跑到 15 条（尾部如下；14 条＝有腿被删或改名，0 条＝导入/语法坏了）"
 	printf '%s\n' "$py_out" | tail -20
 	exit 1
@@ -7218,12 +7249,12 @@ echo "ok - §109 pytest 行为腿（无底仓卖出流水 / 幂等锚 / 持仓�
 leg109() { # $1=说明 $2=包 $3=-run 正则
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
-	if printf '%s\n' "$out" | /usr/bin/grep -qE '^(--- FAIL|FAIL)'; then
+	if grep_q '^(--- FAIL|FAIL)' out; then
 		echo "--- FAIL: §109 Go 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
-	printf '%s\n' "$out" | /usr/bin/grep -qE '^ok' || {
+	grep_q '^ok' out || {
 		echo "--- FAIL: §109 Go 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）"
 		exit 1
 	}
@@ -7935,7 +7966,7 @@ legnote110() { # $1=用例名 $2=期望 PASS|FAIL $3=判决必须点名串 $4=�
 	fi
 	# 第四臂是本腿存在的理由：判决对了不算完，**读数必须真的打印给看的人**
 	# （观测行只进内部变量、INFO 行被吞掉＝"加了仪表却没接线"，10-09 复盘的那条形态）。
-	printf '%s\n' "$all" | grep -qF -- "$4" || {
+	grep_q "$4" all F || {
 		echo "--- FAIL: §110 F1 ${1}：整段输出里没有「${4}」（判决对但读数没落地＝现网仍然查不到那一手信息）"; exit 1; }
 	echo "ok - §110 F1 ${1} => $(gate_clip 92 "$V")"
 }
@@ -8797,7 +8828,7 @@ out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT
 		LOCAL_DB="$WDF/db/trading.db" \
 	PULL_LOG="$WDF/logdir/ok.log" DRIFT_RC=0 \
 	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd7_rc=$?
-printf '%s\n' "$out110" | grep -qF 'overall=ok rc=0' \
+grep_q 'overall=ok rc=0' out110 F \
 	|| { echo "--- FAIL: §110 WD7a 摘留档后连 overall 都没了（破坏改变了别的东西，反证没落在点上）"; exit 1; }
 [ ! -s "$WDF/home/backups/quant/watchdog_record.jsonl" ] \
 	|| { echo "--- FAIL: §110 WD7a 摘掉 record_line 后留档仍非空（WD1 的留档断言不承重＝锁是装饰）"; exit 1; }
@@ -8814,7 +8845,7 @@ out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT
 	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd7b_rc=$?
 [ "$wd7b_rc" = "0" ] \
 	|| { echo "--- FAIL: §110 WD7b 钉死 exit 0 后仍退非零（破坏没落到退出码上，反证测的不是它声称的）"; exit 1; }
-printf '%s\n' "$out110" | grep -qF 'overall=alert rc=1' \
+grep_q 'overall=alert rc=1' out110 F \
 	|| { echo "--- FAIL: §110 WD7b 钉死 exit 0 后汇总行也变了（破坏改变了读数面，两枚反证纠缠）"; exit 1; }
 echo "ok - §110 WD7 摘 record_line ⇒ 留档空而 overall 照旧；钉死 exit ⇒ 退 0 而 overall 照旧（两枚反证各落各的点）"
 # WD8 发送重试：桩 curl 恒败 ⇒ 恰 ATTEMPTS 次外呼、失败文案带次数、腿级判决照常（退 1 不因发送失败升级＝重试只救通道不改判决）。
@@ -8885,7 +8916,7 @@ out110="$(env HOME="$WDF/home" LOG_DIR="$WDF/home/backups/quant" QUANT_REPO_ROOT
 		LOCAL_DB="$WDF/db/notadb.txt" \
 	PULL_LOG="$WDF/logdir/ok.log" DRIFT_RC=0 \
 	/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || wd11a_rc=$?
-printf '%s\n' "$out110" | grep -qF 'dbfresh=read' \
+grep_q 'dbfresh=read' out110 F \
 	|| { echo "--- FAIL: §110 WD11a 删掉根探针后坏库仍是 unreadable（破坏没落到点上，反证测的不是它声称的那一枚）"; exit 1; }
 [ "$wd11a_rc" = "0" ] \
 	|| { echo "--- FAIL: §110 WD11a 删根探针后仍退 ${wd11a_rc}（坏库被逐表 except 洗红＝本枚独有性不成立）"; exit 1; }
@@ -8905,7 +8936,7 @@ wd_mut_map() { # $1=被映射的 rc 变量名 $2=夹具 env $3=期望仍在的�
 		PULL_LOG="$WDF/logdir/ok.log" DRIFT_RC=0 $2 \
 		/bin/bash "$WDF/mut/check_mac_ops_watchdog.sh" 2>&1)" || rcx=$?
 	CNT110=$((CNT110 + 1))
-	printf '%s\n' "$o" | grep -qF -- "$3" \
+	grep_q "$3" o F \
 		|| { echo "--- FAIL: §110 WD11 $4：摘映射后连态名都没了（破坏牵连了读数面，两枚反证纠缠）"; exit 1; }
 	[ "$rcx" = "0" ] \
 		|| { echo "--- FAIL: §110 WD11 $4：摘掉汇总映射后仍退 ${rcx}（汇总那行不承重＝腿级态名与整体退出码本来就各判各的）"; exit 1; }
@@ -8920,7 +8951,7 @@ CNT110=$((CNT110 + 1))
 si_retire_rc=0
 si_out="$(env HOME="$WDF/home" PATH="$WDF/bin:/usr/bin:/bin" /bin/bash scripts/install_sync_agent.sh -Retire 2>&1)" || si_retire_rc=$?
 [ "$si_retire_rc" = "0" ] || { echo "--- FAIL: §110 退役入口 -Retire 退 ${si_retire_rc}（幂等支走不通＝在已退役的机器上重跑会红，而它本该可重跑）"; exit 1; }
-printf '%s\n' "$si_out" | grep -qF '既不在调度、也没有 plist' \
+grep_q '既不在调度、也没有 plist' si_out F \
 	|| { echo "--- FAIL: §110 退役入口复核句没出现（三步走完却没自证＝这条指令的绿没有证据面）：$(printf '%s\n' "$si_out" | tail -2)"; exit 1; }
 si_arm_rc=0
 env HOME="$WDF/home" PATH="$WDF/bin:/usr/bin:/bin" /bin/bash scripts/install_sync_agent.sh >/dev/null 2>&1 || si_arm_rc=$?
@@ -10288,7 +10319,7 @@ go_leg112() { # $1=包目录 $2=用例名竖线串 $3=应跑条数
 	local out pass fail
 	CNT112=$((CNT112 + 1))
 	out=$(go test -count=1 -v -run "^($2)$" "./$1/" 2>&1 || true)
-	if printf '%s\n' "$out" | grep -qE '\[build failed\]|build failed|cannot find package|^# '; then
+	if grep_q '\[build failed\]|build failed|cannot find package|^# ' out; then
 		echo "--- FAIL: §112 Go 行为腿 ${CNT112}（包 $1 编译不过，下面的 PASS/FAIL 计数全部无意义）："
 		printf '%s\n' "$out" | head -20
 		exit 1
@@ -10326,7 +10357,7 @@ py_leg112() { # $1=pytest 文件 $2=最少必须真跑过的条数（依赖无�
 	# **永远红**，而它的 7 条用例其实跑得好好的（6 skip + 1 ok）。
 	# 现在只有真·收集失败才会命中：pytest 的 FAILED/ERROR 顶格、Traceback 顶格、
 	# import 炸掉时的 ModuleNotFoundError 顶格、以及 OS 级文件缺失。
-	if printf '%s\n' "$out" | grep -qE '^(FAILED|ERROR)|^Traceback|^ModuleNotFoundError|No such file or directory'; then
+	if grep_q '^(FAILED|ERROR)|^Traceback|^ModuleNotFoundError|No such file or directory' out; then
 		echo "--- FAIL: §112 pytest 行为腿判红（${target}，派生 ${want} 条），尾部如下："
 		printf '%s\n' "$out" | tail -25
 		exit 1
@@ -10407,13 +10438,13 @@ CNT112=$((CNT112 + 1))
 BASE112=$( cd "$MIR112" && go test -count=1 -v -run "^(${BASE112_RUN})\$" ./internal/store/ ./cmd/dataload/ ./internal/trading/ 2>&1 || true )
 CNT112=$((CNT112 + 1))
 BASE_OK=$(printf '%s\n' "$BASE112" | grep -c '^ok' || true)
-if [ "${BASE_OK:-0}" != "3" ] || printf '%s\n' "$BASE112" | grep -qE '^--- FAIL|^FAIL'; then
+if [ "${BASE_OK:-0}" != "3" ] || grep_q '^--- FAIL|^FAIL' BASE112; then
 	echo "--- FAIL: §112 镜像基线不绿（三包应各有 1 条 ok，实得 ${BASE_OK:-0}）——镜像不可信时，任何「破坏后变红」都不构成证据"
 	printf '%s\n' "$BASE112" | tail -20
 	exit 1
 fi
 BASEPY112=$( cd "$MIR112" && py_tests "$PYT112" 2>&1 || true; printf 'SEP\n'; py_tests "$GWT112" 2>&1 || true )
-if printf '%s\n' "$BASEPY112" | grep -qE 'FAILED|ERROR'; then
+if grep_q 'FAILED|ERROR' BASEPY112; then
 	echo "--- FAIL: §112 镜像 pytest 基线判红（两条 pytest 腿在干净镜像里就该绿），尾部："; printf '%s\n' "$BASEPY112" | tail -20; exit 1
 fi
 echo "ok - §112 镜像基线自证（三 Go 包 ok + 两条 pytest 无红）"
@@ -10429,23 +10460,23 @@ dys112() { # $1=编号 $2=镜像相对文件 $3=python 变异片段（必须打�
 	fi
 	if [ "$kind" = go ]; then
 		out=$( cd "$MIR112" && go test -count=1 -v -run "^(${rx})\$" "$target" 2>&1 || true )
-		if printf '%s\n' "$out" | grep -qE '\[build failed\]|build failed|cannot find package|^# '; then
+		if grep_q '\[build failed\]|build failed|cannot find package|^# ' out; then
 			echo "--- FAIL: §112 反证 ${id} 变异后包编译不过（harness 坏了不是锁有牙），读数如下："
 			printf '%s\n' "$out" | head -20
 			exit 1
 		fi
 	else
 		out=$( cd "$MIR112" && py_tests "$target" 2>&1 || true )
-		if printf '%s\n' "$out" | grep -qE 'ModuleNotFoundError|ImportError|SyntaxError'; then
+		if grep_q 'ModuleNotFoundError|ImportError|SyntaxError' out; then
 			echo "--- FAIL: §112 反证 ${id} 变异后 import/语法坏（harness 坏了），尾部："; printf '%s\n' "$out" | tail -15; exit 1
 		fi
 	fi
-	if ! printf '%s\n' "$out" | grep -qE '^(--- FAIL|FAILED|FAIL: )|^FAIL'; then
+	if ! grep_q '^(--- FAIL|FAILED|FAIL: )|^FAIL' out; then
 		echo "--- FAIL: §112 反证 ${id} 没有让被测腿变红（${target}）——这条锁恒绿，是假锁；尾部："
 		printf '%s\n' "$out" | tail -15
 		exit 1
 	fi
-	if ! printf '%s\n' "$out" | grep -qF -- "$token"; then
+	if ! grep_q "$token" out F; then
 		echo "--- FAIL: §112 反证 ${id} 红了，但红文案里找不到本枚指定的归属串「${token}」（＝红在别处，成因归属不成立）"
 		printf '%s\n' "$out" | grep -E 'FAIL|Error|assert' | head -10
 		exit 1
@@ -10456,7 +10487,7 @@ dys112() { # $1=编号 $2=镜像相对文件 $3=python 变异片段（必须打�
 	else
 		out=$( cd "$MIR112" && py_tests "$target" 2>&1 || true )
 	fi
-	if printf '%s\n' "$out" | grep -qE '^(--- FAIL|FAILED|FAIL: )|^FAIL'; then
+	if grep_q '^(--- FAIL|FAILED|FAIL: )|^FAIL' out; then
 		echo "--- FAIL: §112 反证 ${id} 复位后仍红＝镜像被别处污染（或复位不是真复位），后续反证的读数全部作废"
 		exit 1
 	fi
@@ -11057,10 +11088,10 @@ CNT113=$((CNT113 + 1))
 [ -z "$MISS6113" ] || { echo "--- FAIL: §113 行为腿点名失效（清单派生自目录却仍缺文件，说明有半截文件）：${MISS6113}"; exit 1; }
 W6RUN113=$( cd web && NO_COLOR=1 npm test -- $W6T113 2>&1 | strip_ansi113 || true )
 CNT113=$((CNT113 + 1))
-printf '%s\n' "$W6RUN113" | grep -qE 'Test Files +'"$W6N113"' passed' \
+grep_q 'Test Files +'"$W6N113"' passed' W6RUN113 \
 	|| { echo "--- FAIL: §113 波 6 行为腿没跑满派生清单（应见「Test Files $W6N113 passed」）："; printf '%s\n' "$W6RUN113" | grep -E 'Test Files|Tests |FAIL|Cannot find|Error' | head -15; exit 1; }
 CNT113=$((CNT113 + 1))
-if printf '%s\n' "$W6RUN113" | grep -qE ' failed'; then
+if grep_q ' failed' W6RUN113; then
 	echo "--- FAIL: §113 波 6 行为腿判红："
 	printf '%s\n' "$W6RUN113" | grep -E 'FAIL|✗|×|AssertionError|Unable to find' | head -20
 	exit 1
@@ -11177,7 +11208,7 @@ dys113_vitest() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=测试文�
 		printf '%s\n' "$out" | tail -12
 		exit 1
 	fi
-	if ! printf '%s\n' "$out" | grep -qF -- "$token"; then
+	if ! grep_q "$token" out F; then
 		echo "--- FAIL: §113 反证 ${id} 红了，但红文案里找不到本枚指定的归属串「${token}」（＝红在别处，成因归属不成立）"
 		printf '%s\n' "$out" | grep -E 'FAIL|AssertionError|Unable to find|×' | head -10
 		exit 1
@@ -11400,10 +11431,10 @@ minc114() { # $1=rel $2=整串 $3=应≥ $4=说明 → 代码行命中下界（�
 # 少了这两枚，「代码行 log.Fatalf=0」既可能是"改干净了"也可能是"尺子安静地没出数"。
 CNT114=$((CNT114 + 1))
 _CODE_OK=$(code114 "$MAIN114")
-printf '%s\n' "$_CODE_OK" | grep -qF -- 'func run() int' \
+grep_q 'func run() int' _CODE_OK F \
 	|| { echo "--- FAIL: §114 剥注释尺子在 cmd/quant/main.go 上读不到「func run() int」（尺子坏了，本段全部代码行锁的读数不可信）：$(printf '%s\n' "$_CODE_OK" | head -3)"; exit 1; }
 CNT114=$((CNT114 + 1))
-if printf '%s\n' "$_CODE_OK" | grep -qF -- 'log.Fatalf'; then
+if grep_q 'log.Fatalf' _CODE_OK F; then
 	echo "--- FAIL: §114 尺子自检：main.go 的代码行里仍有 log.Fatalf（要么启动期又长出一条退出分支，要么 codeOnly 没剥掉注释而本段的负锁全是假的）"
 	exit 1
 fi
@@ -11610,13 +11641,13 @@ go_leg114() { # $1=说明 $2=包 $3=-run 正则
 	CNT114=$((CNT114 + 1))
 	local out
 	out=$(go test -count=1 "$2" -run "$3" 2>&1 || true)
-	if printf '%s\n' "$out" | grep -qE '^(--- FAIL|FAIL)'; then
+	if grep_q '^(--- FAIL|FAIL)' out; then
 		echo "--- FAIL: §114 行为腿判红（${1}），全文如下："
 		printf '%s\n' "$out" | head -40
 		exit 1
 	fi
 	CNT114=$((CNT114 + 1))
-	printf '%s\n' "$out" | grep -qE '^ok' \
+	grep_q '^ok' out \
 		|| { echo "--- FAIL: §114 行为腿没跑到（$1 无 ok 行＝包编译失败或用例被删）：$(printf '%s\n' "$out" | head -8)"; exit 1; }
 	echo "ok - §114 行为腿 $1"
 }
@@ -11634,7 +11665,7 @@ if [ -z "${N_PYTEST114:-}" ]; then
 	N_PYTEST114=$(printf '%s\n' "$PY_LEG114" | sed -n 's/^Ran \([0-9][0-9]*\) tests.*/\1/p' | head -1 || true)
 fi
 CNT114=$((CNT114 + 1))
-if printf '%s\n' "$PY_LEG114" | grep -qE ' failed|error'; then
+if grep_q ' failed|error' PY_LEG114; then
 	echo "--- FAIL: §114 网关映射行为腿判红："
 	printf '%s\n' "$PY_LEG114" | tail -30
 	exit 1
@@ -11647,7 +11678,7 @@ min114 'pytest 用例数下限（波 7 后本文件应有 ≥18 条：映射 4 +
 VT_LEG114=$( cd web && NO_COLOR=1 npm test -- w7g_positions_pnl_fallback 2>&1 || true )
 N_VT114=$(printf '%s\n' "$VT_LEG114" | grep -E 'Tests +[0-9]+ passed' | head -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
 CNT114=$((CNT114 + 1))
-if printf '%s\n' "$VT_LEG114" | grep -qE ' failed'; then
+if grep_q ' failed' VT_LEG114; then
 	echo "--- FAIL: §114 持仓页兜底行为腿判红："
 	printf '%s\n' "$VT_LEG114" | grep -E 'FAIL|AssertionError|Unable to find' | head -20
 	exit 1
@@ -11750,20 +11781,20 @@ vt_mir114() { # $1=测试文件名（不含扩展名）
 # 基线自证五条：镜像不可信时「破坏后变红」不是证据（§112/§113 同族）。
 BASE_TRG114=$(go_mir114 ./internal/trigger/ 'TestWindowBoundedBySec|TestWiderSecKeepsOlderBase')
 CNT114=$((CNT114 + 1))
-printf '%s\n' "$BASE_TRG114" | grep -qE '^ok' \
+grep_q '^ok' BASE_TRG114 \
 	|| { echo "--- FAIL: §114 Go 镜像基线不是绿的（trigger 包），尾部："; printf '%s\n' "$BASE_TRG114" | tail -20; exit 1; }
 BASE_MET114=$(go_mir114 ./internal/metrics/ 'TestDailySummarySurvivesRestart|TestPendingResolveSurvivesRestart|TestAnnouncedSurvivesRestart|TestProductionEntryPathHydratesGlobal')
 CNT114=$((CNT114 + 1))
-printf '%s\n' "$BASE_MET114" | grep -qE '^ok' \
+grep_q '^ok' BASE_MET114 \
 	|| { echo "--- FAIL: §114 Go 镜像基线不是绿的（metrics journal 族），尾部："; printf '%s\n' "$BASE_MET114" | tail -20; exit 1; }
 BASE_CMD114=$(go_mir114 ./cmd/quant/ 'TestStagingFailFastRefusesRealGateway|TestNonStagingNeverRefused')
 CNT114=$((CNT114 + 1))
-printf '%s\n' "$BASE_CMD114" | grep -qE '^ok' \
+grep_q '^ok' BASE_CMD114 \
 	|| { echo "--- FAIL: §114 Go 镜像基线不是绿的（cmd/quant 守卫族），尾部："; printf '%s\n' "$BASE_CMD114" | tail -20; exit 1; }
 BASE_PY114=$(py_mir114)
 CNT114=$((CNT114 + 1))
 BASE_PYN114=$(printf '%s\n' "$BASE_PY114" | grep -E '[0-9]+ passed' | head -1 | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1 || true)
-if printf '%s\n' "$BASE_PY114" | grep -qE ' failed|error'; then
+if grep_q ' failed|error' BASE_PY114; then
 	echo "--- FAIL: §114 Python 镜像基线就是红的（镜像不可信 ⇒ 后面「破坏后变红」不构成证据）："
 	printf '%s\n' "$BASE_PY114" | tail -15
 	exit 1
@@ -11773,7 +11804,7 @@ CNT114=$((CNT114 + 1))
 	|| { echo "--- FAIL: §114 Python 镜像基线没跑满（passed=${BASE_PYN114:-0} 应≥18，文件里用例定义=${N_DEFTEST114:-未算}）：收集阶段就出错＝这棵反证树没有 Python 腿"; printf '%s\n' "$BASE_PY114" | tail -15; exit 1; }
 BASE_VT114=$(vt_mir114 w7g_positions_pnl_fallback)
 CNT114=$((CNT114 + 1))
-printf '%s\n' "$BASE_VT114" | grep -qE 'Tests +4 passed' \
+grep_q 'Tests +4 passed' BASE_VT114 \
 	|| { echo "--- FAIL: §114 web 镜像基线不是「4 passed」（node_modules 软链或 vitest 配置在镜像里坏了）："; printf '%s\n' "$BASE_VT114" | grep -E 'Test Files|Tests |FAIL|Cannot' | head -10; exit 1; }
 echo "ok - §114 镜像基线自证（Go 三包 / pytest / vitest 在 /tmp 副本树里各自全绿）"
 
@@ -11785,12 +11816,12 @@ dys114_go() { # $1=编号 $2=镜像绝对文件 $3=old $4=new $5=包 $6=-run $7=
 	[ "$n" = "1" ] || { echo "--- FAIL: §114 反证 ${id} 变异落地数=${n}（应恰好 1；0＝靶串没命中，>1＝破坏面比本枚射程大，后面归因不成立）：${why}"; exit 1; }
 	out=$(go_mir114 "$pkg" "$rx")
 	rc=0
-	printf '%s\n' "$out" | grep -qE "^--- FAIL: ${red}" || rc=$?
+	grep_q "^--- FAIL: ${red}" out || rc=$?
 	CNT114=$((CNT114 + 1))
 	[ "$rc" = "0" ] || { echo "--- FAIL: §114 反证 ${id} 破坏后 ${red} 没有红（${why}）——锁/用例是装饰，全文尾部："; printf '%s\n' "$out" | tail -15; exit 1; }
 	if [ -n "$keep" ]; then
 		CNT114=$((CNT114 + 1))
-		if printf '%s\n' "$out" | grep -qE "^--- FAIL: ${keep}"; then
+		if grep_q "^--- FAIL: ${keep}" out; then
 			echo "--- FAIL: §114 反证 ${id} 把 ${keep} 也带红了（本枚要「独有」：连带红说明破坏面越出了这一条腿，归属读不出来）"
 			exit 1
 		fi
@@ -11798,7 +11829,7 @@ dys114_go() { # $1=编号 $2=镜像绝对文件 $3=old $4=new $5=包 $6=-run $7=
 	reset114 "$file" || exit 1
 	out=$(go_mir114 "$pkg" "$rx")
 	CNT114=$((CNT114 + 1))
-	printf '%s\n' "$out" | grep -qE '^ok' || { echo "--- FAIL: §114 反证 ${id} 复位后仍红＝镜像被别处污染，后续反证读数全部作废"; printf '%s\n' "$out" | tail -12; exit 1; }
+	grep_q '^ok' out || { echo "--- FAIL: §114 反证 ${id} 复位后仍红＝镜像被别处污染，后续反证读数全部作废"; printf '%s\n' "$out" | tail -12; exit 1; }
 	echo "ok - §114 反证 ${id}（${why}）：${red} 必红${keep:+ / ${keep} 仍绿} + 复位复绿"
 }
 dys114_go V1 "$GOMIR114/internal/trigger/trigger.go" \
@@ -11828,11 +11859,11 @@ local id="$1" file="$2" old="$3" new="$4" node="$5" keep="$6" why="$7" n out
 	[ "$n" = "1" ] || { echo "--- FAIL: §114 反证 ${id} 变异落地数=${n}（应恰好 1）：${why}"; exit 1; }
 	out=$(py_mir114)
 	CNT114=$((CNT114 + 1))
-	printf '%s\n' "$out" | grep -qF -- "$node" \
+	grep_q "$node" out F \
 		|| { echo "--- FAIL: §114 反证 ${id} 破坏后没让 ${node} 现形（${why}），尾部："; printf '%s\n' "$out" | tail -20; exit 1; }
-	printf '%s\n' "$out" | grep -qE ' failed' \
+	grep_q ' failed' out \
 		|| { echo "--- FAIL: §114 反证 ${id} 破坏后 pytest 一条都没红（${why}）——用例是装饰"; printf '%s\n' "$out" | tail -20; exit 1; }
-	if [ -n "$keep" ] && printf '%s\n' "$out" | grep -qF -- "$keep"; then
+	if [ -n "$keep" ] && grep_q "$keep" out F; then
 		echo "--- FAIL: §114 反证 ${id} 把 ${keep} 也带红了（本枚要「独有」：连带红＝破坏面越出这一条腿，归属读不出来）"
 		exit 1
 	fi
@@ -11840,7 +11871,7 @@ local id="$1" file="$2" old="$3" new="$4" node="$5" keep="$6" why="$7" n out
 	reset114 "$file" || exit 1
 	out=$(py_mir114)
 	CNT114=$((CNT114 + 1))
-	printf '%s\n' "$out" | grep -qE ' passed' && ! printf '%s\n' "$out" | grep -qE ' failed' \
+	{ grep_q ' passed' out && ! grep_q ' failed' out; } \
 		|| { echo "--- FAIL: §114 反证 ${id} 复位后仍红＝镜像污染"; printf '%s\n' "$out" | tail -12; exit 1; }
 	echo "ok - §114 反证 ${id}（${why}）：${node} 必红${keep:+ / ${keep} 仍绿} + 复位复绿"
 }
@@ -11861,12 +11892,15 @@ local id="$1" file="$2" old="$3" new="$4" tf="$5" want="$6" keep="$7" why="$8" n
 	[ "$n" = "1" ] || { echo "--- FAIL: §114 反证 ${id} 变异落地数=${n}（应恰好 1）：${why}"; exit 1; }
 	out=$(vt_mir114 "$tf")
 	CNT114=$((CNT114 + 1))
-	if ! { printf '%s\n' "$out" | grep -qE "× .*${want}" && printf '%s\n' "$out" | grep -qE 'Tests +[0-9]+ failed'; }; then
+	# 两条判读都走 grep_q（不要退回管道）：本枚正是 2026-10-27 那次假红的落点——vitest 把兜底
+	# DOM dump 打到 64KB 以上时，`printf | grep -q` 的写方被 SIGPIPE 打死、pipefail 记 141，
+	# 「× G1 明明在输出里」会被读成「破坏没现形」。
+	if ! { grep_q "× .*${want}" out && grep_q 'Tests +[0-9]+ failed' out; }; then
 		echo "--- FAIL: §114 反证 ${id} 破坏后 vitest 没让 ${want} 现形（${why}），尾部："
 		printf '%s\n' "$out" | grep -E 'Test Files|Tests |×' | head -14
 		exit 1
 	fi
-	if [ -n "$keep" ] && printf '%s\n' "$out" | grep -qE "× .*${keep}"; then
+	if [ -n "$keep" ] && grep_q "× .*${keep}" out; then
 		echo "--- FAIL: §114 反证 ${id} 把 ${keep} 也带红了（本枚要「独有」：连带红＝破坏面越出这一条腿，归属读不出来）"
 		exit 1
 	fi
@@ -11874,7 +11908,7 @@ local id="$1" file="$2" old="$3" new="$4" tf="$5" want="$6" keep="$7" why="$8" n
 	reset114 "$file" || exit 1
 	out=$(vt_mir114 "$tf")
 	CNT114=$((CNT114 + 1))
-	printf '%s\n' "$out" | grep -qE 'Tests +4 passed' \
+	grep_q 'Tests +4 passed' out \
 		|| { echo "--- FAIL: §114 反证 ${id} 复位后 vitest 没复绿＝镜像污染"; printf '%s\n' "$out" | grep -E 'Test Files|Tests |FAIL|×' | head -12; exit 1; }
 	echo "ok - §114 反证 ${id}（${why}）：${want} 必红${keep:+ / ${keep} 仍绿} + 复位复绿"
 }
@@ -12063,13 +12097,13 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 195 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 新增概念状态路由后 191→195）'
-eqkey115 CALLPATH_DERIVED 156 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 概念状态路由进账后 153→156）'
-eqkey115 CALLSITES_DERIVED 159 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 同批 156→159）'
+eqkey115 ROUTES_DERIVED 202 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202）'
+eqkey115 CALLPATH_DERIVED 162 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162）'
+eqkey115 CALLSITES_DERIVED 165 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 195 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
-eqkey115 COVERED_BY_WEB 156 '被前端覆盖的路由条数（2026-10-22 同批 153→156）'
-eqkey115 UNCALLED 39 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 两条兼容端点后 36→39）'
+eqkey115 LEDGER_ROWS 202 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
+eqkey115 COVERED_BY_WEB 162 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162）'
+eqkey115 UNCALLED 40 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
 eqkey115 NO_BASIS 0 '「无依据」档必须为空：说不清为什么还留着＝待决策，不许混进台账假装闭合'
@@ -12131,7 +12165,7 @@ CNT115=$((CNT115 + 1))
 [ "$MIRCOPY_OK" = "$MIRN115" ] || { echo "--- FAIL: §115 镜像拷贝只成功 ${MIRCOPY_OK}/${MIRN115} 个文件（残缺镜像上的任何「破坏后变红」都不构成证据）"; exit 1; }
 # 镜像里不许有凭据：清单派生自证据列，所以这条是「证据列本身不许指向凭据」的第二道闸。
 CNT115=$((CNT115 + 1))
-if printf '%s\n' "$MIRFILES115" | grep -qE '\.db$|\.log$|config[^/]*\.json$|admin_session_token|\.key$|\.pem$'; then
+if grep_q '\.db$|\.log$|config[^/]*\.json$|admin_session_token|\.key$|\.pem$' MIRFILES115; then
 	echo "--- FAIL: §115 镜像清单里出现凭据/数据库/日志形态的路径：$(printf '%s\n' "$MIRFILES115" | grep -E '\.db$|\.log$|config[^/]*\.json$|admin_session_token|\.key$|\.pem$' | head -2)（反证树不该带这些，凭据不外拷是硬纪律）"
 	exit 1
 fi
@@ -12140,8 +12174,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 195 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 195 '镜像基线：台账行数与主仓同值'
+eqkey115 ROUTES_DERIVED 202 '镜像基线：R 与主仓同值'
+eqkey115 LEDGER_ROWS 202 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -12182,7 +12216,7 @@ dys115() { # $1=编号 $2=镜像相对文件 $3=old $4=new $5=本枚独有读数
 	fi
 	got=$(lget115 "$key")
 	[ "$got" = "$want" ] || { echo "--- FAIL: §115 反证 ${id} 读数没按预期翻转（${key} 应=${want} 实得=${got:-<空>}）：${why}；FAIL 行：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -2)"; exit 1; }
-	printf '%s\n' "$LEDGER_OUT115" | grep -qE '^--- FAIL' || { echo "--- FAIL: §115 反证 ${id} 红了却没有 --- FAIL 行（rc 非 0 来自异常而不是判据：判据没跑起来不算验过）"; exit 1; }
+	grep_q '^--- FAIL' LEDGER_OUT115 || { echo "--- FAIL: §115 反证 ${id} 红了却没有 --- FAIL 行（rc 非 0 来自异常而不是判据：判据没跑起来不算验过）"; exit 1; }
 	cp "$REPO115/$rel" "$MIR115/$rel" || { echo "--- FAIL: §115 反证 ${id} 复位失败（${rel}）"; exit 1; }
 	run_ledger115 "$MIR115"
 	CNT115=$((CNT115 + 1))
@@ -14278,20 +14312,43 @@ done
 CNT124=$((CNT124 + 3))
 
 # —— ③ 写入冻结：anchor_price 只出现在建行 INSERT 列清单，绝不出现在任何 UPDATE SET ——
-SETA124=$(grep -rn --include='*.go' 'anchor_price=' internal/ 2>/dev/null | grep -v '_test\.go' | wc -l | tr -d ' ' || true)
+# 判据打在 **SQL 占位符形态**（anchor_price=?）上，不是打在「anchor_price=」这串字面量上：
+# 2026-10-27 实盘 T 的 step0 观测文案里有一句 `anchor_price=%.4f`（日志文本，不是写库），
+# 旧写法把它也数成「写进了 UPDATE SET」——一条判红文案能同时被日志、注释、格式化串踩到，
+# 这种锁下一次没人敢信。收窄成占位符形态后：写库必带 `?`（本仓 SQL 一律参数化），日志/文案踩不到；
+# 下面两枚自证分别钉住「真写库形态必须命中」与「日志形态必须不命中」，防止收窄变成新的失明。
+SETA124=$(grep -rnE --include='*.go' 'anchor_price[[:space:]]*=[[:space:]]*\?' internal/ 2>/dev/null | grep -v '_test\.go' | wc -l | tr -d ' ' || true)
 [ "${SETA124:-0}" = "0" ] ||
 	fail124 "anchor_price 被写进了 UPDATE SET（非测试代码 ${SETA124} 处）——券商对账快照没有锚点这个键，一次全量同步就会把首买价洗成摊薄成本/0"
+# 射程自证两枚（同一把尺子，两个方向都要有读数）：
+SET124_W=$(printf 'SET sellable_qty = ?, anchor_price = ? WHERE code = ?\n' | grep -cE 'anchor_price[[:space:]]*=[[:space:]]*\?' || true)
+[ "${SET124_W:-0}" = "1" ] ||
+	fail124 "③ 的尺子在**真写库形态**上读数为 ${SET124_W:-0}（应 1）：判红文案已经瞎了，上面那条绿没有任何含义"
+SET124_L=$(printf 'fmt.Sprintf("step0 锚点不可证(anchor_price=%.4f source=%q)")\n' | grep -cE 'anchor_price[[:space:]]*=[[:space:]]*\?' || true)
+[ "${SET124_L:-0}" = "0" ] ||
+	fail124 "③ 的尺子在**日志文案形态**上读数为 ${SET124_L:-0}（应 0）：窄到没收窄，观测文案仍会把这段判红（就是今天这次红的成因）"
+CNT124=$((CNT124 + 2))
 # 建行 INSERT 三处（实盘成交回报主路径 + 两条对账/测试专用入口）。等值锁：多＝有人新开了锚点写入口
 # （要按裁决二逐条核对是否仍「仅建仓时写」），少＝建行路径被删（锚点永远回填不上）。
-INSA124=$(grep -c 'anchor_price)' "$RP124" || true)
+# 2026-10-27 起锚点来源列与锚点价同进同出，列清单尾是 `anchor_price, anchor_source)`；判据跟着改成
+# 这一对（单独数 anchor_price 会把「只补了一列、漏了来源列」那种半截改动读成口数正常）。
+INSA124=$(grep -c 'anchor_price, anchor_source)' "$RP124" || true)
 [ "${INSA124:-0}" = "3" ] ||
-	fail124 "锚点建行 INSERT 口数漂移（got=${INSA124} 期望=3；重新数法 grep -n 'anchor_price)' ${RP124}）"
+	fail124 "锚点建行 INSERT 口数漂移（got=${INSA124} 期望=3；重新数法 grep -n 'anchor_price, anchor_source)' ${RP124}）"
+# 同口同序自证：不许有「只写价、不写出处」的建行口残留（`anchor_price)` 这一形态是加来源列**之前**
+# 的旧列清单尾巴）。§128 的实盘 T 闸门要的是「锚点不可证就不许开 T」，某条路径只落价不落 source
+# 就会让那道闸门拿到 0 出处、退化成看得到价看不到出处——所以这里钉 0 而不是钉「少一处也行」。
+INSA124B=$(grep -c 'anchor_price)' "$RP124" || true)
+[ "${INSA124B:-0}" = "0" ] ||
+	fail124 "还有 ${INSA124B} 口 INSERT 以 anchor_price 收尾（没带 anchor_source）：那条建行路径写得出锚点、写不出出处"
 # 读侧四口一律 COALESCE(anchor_price,0)：NULL=锚点未知，归一成 0 后由对照层点名「未回填」，
 # 绝不让 Go 侧 Scan 直接吃 NULL（那会是一条打不开的错误，而不是一行诚实的空白）。
-RDA124=$(grep -c 'COALESCE(anchor_price,0) FROM' "$RP124" || true)
+# 2026-10-27 起同一口必须同时归一来源列（`COALESCE(anchor_source,'')`）：判据打在**成对**的形态上，
+# 只补价不补来源的那半截改动会在 Scan 处直接把 NULL 吃成错误——正是这条锁要挡的形状。
+RDA124=$(grep -c "COALESCE(anchor_price,0), COALESCE(anchor_source,'') FROM" "$RP124" || true)
 [ "${RDA124:-0}" = "4" ] ||
-	fail124 "锚点读取口数漂移（got=${RDA124} 期望=4：全表／含买日／单标的／按账号四口；少一口＝那个读取方看不见锚点）"
-CNT124=$((CNT124 + 3))
+	fail124 "锚点读取口数漂移（got=${RDA124} 期望=4：全表／含买日／单标的／按账号四口，且每口价与来源成对；少一口＝那个读取方看不见锚点）"
+CNT124=$((CNT124 + 6))
 
 # —— ④ 影子装配三口齐备 + 落盘接线在位 ——
 ROWA124=$(grep -c 'AnchorPrice:' "$SHDW124" || true)
@@ -14371,7 +14428,7 @@ fi
 rm -rf "$W124M"
 CNT124=$((CNT124 + 3))
 
-echo "ok - §124 §ANCHOR-FIRST W2/W3 锁通过（默认基准未换锚 5 道：basis 默认 EntryPrice／换锚唯一门／算式走单一 basis／in.AnchorPrice 门数等值／射程自证 + 三本账字段 3 道 + 写入冻结 3 道 + 影子装配 7 道（三口账本标识逐个等值）+ 日志镜像 1 道 + 前端 4 道 + 行为腿 5 包共 ${LEG124_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT124}；W2 只影子、W3 切硬开关默认关，等 Q10 签认）"
+echo "ok - §124 §ANCHOR-FIRST W2/W3 锁通过（默认基准未换锚 5 道：basis 默认 EntryPrice／换锚唯一门／算式走单一 basis／in.AnchorPrice 门数等值／射程自证 + 三本账字段 3 道 + 写入冻结 8 道（SQL 占位符形态判红 + 同尺两向自证：写库形态必中／日志形态必不中 + 建行 INSERT 价源成对 3 口 + 残留旧尾巴 0 口 + 读侧成对 4 口） + 影子装配 7 道（三口账本标识逐个等值）+ 日志镜像 1 道 + 前端 4 道 + 行为腿 5 包共 ${LEG124_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT124}；W2 只影子、W3 切硬开关默认关，等 Q10 签认）"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # §125 §T1-PARTIAL（2026-10-24 owner 裁决三）模拟盘层账 / 减量成交 / 残量意图 / 真实减仓
@@ -14539,11 +14596,18 @@ M126=cmd/quant/main.go
 # —— ① 配置面 4 道：账号级 TConfig 存在、默认关、七个访问器齐全、出厂阈值可派生 ——
 grep -q 'json:"t,omitempty"' "$C126" ||
 	fail126 "SizingConfig 缺 T 字段：做 T 参数必须与预算口径同键空间（Q5 的耦合前提）"
-grep -q 'func (c TConfig) TEnabled() bool { return c.Enabled != nil && \*c.Enabled }' "$C126" ||
-	fail126 "TEnabled 必须是**只有显式 true 才开**（nil 读成开＝默认就动了资金路径）"
-TA126=$(grep -c 'func (c TConfig) T' "$C126" || true)
-[ "${TA126:-0}" -ge 7 ] ||
-	fail126 "TConfig 访问器不足 7 个（got ${TA126}）：缺一个就等于某个阈值没有兜底默认"
+# 判据方向已按 2026-10-26 六轮裁决 T4-12 翻转（owner：「T 生产打开」，推翻 Q14 的"先只在模拟盘开"）：
+# Enabled 现在是 **nil＝开**，只有显式 false 才关。锁的是这个字面量本身——
+# 若有人把默认拨回"nil＝关"，补偿控制（一键止血/降档 buy_first/当日签字回退）就失去了意义，
+# 因为止血位变成出厂态、没人会去开它。
+grep -q 'func (c TConfig) TEnabled() bool { return c.Enabled == nil || \*c.Enabled }' "$C126" ||
+	fail126 "TEnabled 必须是 nil＝出厂开、显式 false 才关（六轮 T4-12）：读反一次就等于实盘 T 静默停摆"
+# 值接收者与指针接收者**都要数**：§8.8 的 22 键里绝大多数是 `func (c *TConfig) T…Of()`，
+# 旧needle 只认 `func (c TConfig) T` → 数到 5，而代码里其实有 23——这条锁自称「缺一个就等于某个
+# 阈值没有兜底默认」，却在 18 个访问器上根本看不见，属于「判据比它守的东西瞎」。
+TA126=$(grep -cE 'func \(c \*?TConfig\) T' "$C126" || true)
+[ "${TA126:-0}" -ge 20 ] ||
+	fail126 "TConfig 访问器不足 20 个（got ${TA126}）：缺一个就等于某个阈值没有兜底默认"
 grep -q 'defaultTForceUnwindAt' "$C126" && grep -q '"1450"' "$C126" ||
 	fail126 "尾盘强制配平时刻的出厂默认 1450 缺失（机动仓不隔夜靠它）"
 CNT126=$((CNT126 + 4))
@@ -14581,23 +14645,29 @@ grep -q 'e.runIntradayT(e.primaryMember(), pe, quotes)' internal/engine/engine.g
 	fail126 "单机回退路径没挂做 T 钩子：两套部署形态会行为分叉"
 CNT126=$((CNT126 + 3))
 
-# —— ④ 回填面 4 道：三本账各一处 + 启动装配一处（切硬前必须把存量补上） ——
-grep -q 'p.AnchorPrice = p.CostPrice' "$P126" ||
-	fail126 "模拟盘账本缺存量锚点回填（W3 切硬后这批持仓会永远走回落成本）"
+# —— ④ 回填面 6 道：模拟盘四级判据（2 道）+ 三本账各一处 + 启动装配一处（切硬前必须把存量补上） ——
+# 回填的判据不再是"直接把成本写成锚点"（那是 W3 最初的一档口径，六轮 §1.6a 已收紧成四级回落），
+# 而是三件事同时在场：四级来源常量、成本档必须显式允许、以及 T 资格与来源绑定。
+grep -q 'anchorSourceCostFallback = "cost_fallback"' "$P126" ||
+	fail126 "缺 cost_fallback 档常量：四级锚点回落（first_lot/first_buy_order/cost_fallback/none）塌回一档就丢了签字面"
+grep -q 'allowCostFallback bool' "$P126" ||
+	fail126 "回填计划缺 allowCostFallback 入参：加载期回填必须**不带**成本档，否则打开账本就绕过 owner 签字"
+grep -q 'func (p \*Position) AnchorTicket() bool' "$P126" ||
+	fail126 "缺 AnchorTicket：开 T 腿的资格必须绑「锚点来源可证」，不能只看 AnchorPrice 非零"
 grep -q 'l.AnchorPrice = l.EntryPrice' "$R126" ||
 	fail126 "持仓账（ExecLog）缺存量锚点回填：退出引擎读的就是这本账"
 grep -q 'SET anchor_price = cost_price' "$S126" ||
 	fail126 "实盘账本缺存量锚点回填 SQL"
 grep -q 'BackfillRealPositionAnchors()' "$M126" ||
 	fail126 "启动装配没调实盘锚点回填：函数写了但没人调＝死代码"
-CNT126=$((CNT126 + 4))
+CNT126=$((CNT126 + 6))
 
 # —— ⑤ 行为腿：4 组真跑，条数与源码派生对拍（少跑＝-run 没覆盖新增用例） ——
 W126=$(mktemp -d "${TMPDIR:-/tmp}/gate126.XXXXXX") || fail126 "行为腿工作目录建不起来"
 LEG126_TOTAL=0
 for spec126 in \
 	"internal/paper:TestTRound" \
-	"internal/paper:TestBackfillAnchorsLegacyPaper" \
+	"internal/paper:TestBackfill" \
 	"internal/report:TestBackfillAnchorsLegacyReport" \
 	"internal/store:TestBackfillRealPositionAnchorsLegacy"; do
 	D126D=${spec126%%:*}
@@ -14641,6 +14711,515 @@ grep -q 'trimDone' "$W126M/fake_trim.go" ||
 rm -rf "$W126M"
 CNT126=$((CNT126 + 3))
 
-echo "ok - §126 §T-MODE + W3 回填锁通过（配置面 4 道 + 编排面 7 道 + 驱动面 3 道 + 回填面 4 道 + 行为腿 4 组共 ${LEG126_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT126}）"
+echo "ok - §126 §T-MODE + 锚点回填锁通过（配置面 4 道 + 编排面 7 道 + 驱动面 3 道 + 回填面 6 道 + 行为腿 4 组共 ${LEG126_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT126}）"
 
+
+# ============================================================================
+# §127 §DYN-SIZE v4（目标仓位模型）+ §DYN-T 配置契约/签字面/做 T 收益独立口径
+#
+# 射程：2026-10-26 实盘三条 bug 的修复批（owner 报「动态仓位一笔打满 / 委托价远低于现价 /
+# 竞价时段挂不进」）与 T 仓分账的 v4 收口。这一段刻意只锁**改错方向就必红**的形态：
+# 目标模型的分母、缺失封顶、上限类不连乘、配置区间回落、签字门、做 T 收益不并整仓。
+# English: §127 locks the v4 target-position model, the T config contract, the
+# sign-off gate for the one-time migrations, and the standalone T P&L caliber.
+# ============================================================================
+echo "==> 127 §DYN-SIZE v4 目标仓位 + §DYN-T 配置契约/签字面/做 T 收益（六轮裁决全量）..."
+fail127() {
+	echo "--- FAIL: §127 $*"
+	FAIL=1
+}
+CNT127=0
+C127=internal/config/config.go
+V127=internal/config/sizing_v4_migration.go
+S127=internal/signalctl/sizing.go
+E127=internal/engine/engine.go
+TP127=internal/paper/t_rounds.go
+API127=internal/server/t_rounds_api.go
+SIGN127=internal/server/signoff_api.go
+MAIN127=cmd/quant/main.go
+SRV127=internal/server/server.go
+FE127=web/src/components/TRoundsCard.jsx
+FEF127=web/src/components/RegimeConfigPanel.jsx
+
+# —— ① 目标模型 6 道：MS/SS 拆分、缺失封顶、上限类只向下、旧"总仓位上限连乘"必须消失 ——
+# 结构体字段判一律用 `[[:space:]]+` 而不是单空格：gofmt 按列对齐字段，「MarketScale float64」这种
+# 字面量在 gofmt 之后根本不存在（本批首次全量跑就是这样红了四条）。判据打在**形状**上，
+# 不打在某个人的对齐结果上。
+grep -qE 'MarketScale[[:space:]]+float64' "$S127" ||
+	fail127 "SizingResult 缺 MarketScale：把缩放当预算倍数用正是「一笔打满」的第一条根因"
+grep -qE 'StockScale[[:space:]]+float64' "$S127" ||
+	fail127 "SizingResult 缺 StockScale：市场组与个股组不可分离时，目标仓位与单笔金额会被同一个数双重决定"
+grep -q 'func (s SizingResult) BuyScale() float64' "$S127" ||
+	fail127 "缺 BuyScale()：调用点各自乘 MS×SS 会写出第二套口径"
+grep -q 'const missingKeyTargetCap = 0.50' "$S127" ||
+	fail127 "缺关键读数缺失封顶 0.50（owner：关键指标缺失时默认半仓）——数据盲区比熊市更激进就是这么来的"
+# 负向锁（只看代码行，注释里"总仓位上限"是用来解释为什么删的）：
+if grep -E '"总仓位上限", totalPosCap\(' "$S127" | grep -vE '^[[:space:]]*//' | grep -q .; then
+	fail127 "上限类里又出现 totalPosCap 连乘：它派生自同一个状态机，再乘一次＝同一风险双罚，且会把目标模型的分母偷偷改掉"
+fi
+if grep -E 'scale := math\.Min\(w, m\)' "$S127" | grep -vE '^[[:space:]]*//' | grep -q .; then
+	:
+else
+	fail127 "缺「权重连乘与上限取 min 再分层」的合成收尾：目标模型的前提是上限只向下约束"
+fi
+CNT127=$((CNT127 + 6))
+
+# —— ② 引擎接线 5 道：上下文同源、目标剩余空间、影子基准、T 腿净额双向、fail-closed ——
+grep -q 'type dynBudgetCtx struct' "$E127" ||
+	fail127 "缺 dynBudgetCtx：买入与 T 腿分头算 MarketScale 会让目标与实际下单吃两个数"
+grep -q 'TargetRoom' internal/ordbudget/ordbudget.go ||
+	fail127 "ordbudget 不吃目标剩余空间（TargetRoom）：Room 不参与取小，单笔仍能在中性缩放下吃满权益"
+grep -q 'TargetRoomSet' "$E127" ||
+	fail127 "引擎没把目标剩余空间交给 ordbudget（Room 不参与取小＝单笔仍能吃满权益）"
+grep -q 'const shadowTargetRatio = 0.50' "$E127" ||
+	fail127 "影子期目标读数基准必须是固定 0.50，用真实 MS 会让影子与正式两份日志无法区分"
+grep -q 'stratVal - tBuyVal + tSellVal' "$E127" ||
+	fail127 "战略当前数缺 T 腿净额（减买腿、加卖腿）：T 腿算进战略会吃掉目标空间，完全不算则打满缺陷换入口复现"
+CNT127=$((CNT127 + 5))
+
+# —— ③ §8.8 配置契约 6 道：全部键走区间校验、回落可观测、六个"0 合法"的键必须三态 ——
+# 9 是把 §8.8 表里"有数值区间"的键逐个点完得到的条数（区间非对称、越界回落并上报）。
+# 判据刻意用 ≥9 而不是等值：再加一个可配阈值时这里不该红，但**少一个**必须红
+# ——少一个键就等于那条保护没有合法区间，越界值会直接进资金路径。
+TC127=$(grep -c 'c.tClamp("' "$C127" || true)
+[ "${TC127:-0}" -ge 9 ] ||
+	fail127 "T 阈值走 tClamp 的键数不足（got ${TC127}，应≥9）：少一个键＝那条保护没有合法区间，越界值会直接进资金路径"
+grep -q 'func (c \*TConfig) TFallbacks() map\[string\]float64' "$C127" ||
+	fail127 "缺 TFallbacks：owner 四轮裁决要求「保护换成区间 + 非法回落 + 回落必须可观测」，不报出来的回落等于静默改配置"
+PTR127=$(grep -cE '^[[:space:]]*(MinMarketScale|SellEnvMinMarketScale|MarketPlungePct|MinAmountWan|MinTurnoverPct|MinListedDays)[[:space:]]+\*float64' "$C127" || true)
+[ "${PTR127:-0}" = "6" ] ||
+	fail127 "六个「0 是合法配置」的键必须是指针三态（got ${PTR127}）：平面字段分不清没配过与配了 0，出厂默认就永远传不下去"
+grep -q 'func (c \*TConfig) FillEffective()' "$C127" ||
+	fail127 "缺 FillEffective（只用于回显）：面板要显示生效值，但回显值一旦落盘就把今天的默认钉成账号显式配置"
+grep -q 'func (c SizingConfig) WithTEffective()' "$C127" ||
+	fail127 "缺 WithTEffective：GET 回显与写盘路径必须走两个方法，合并成一个就是物化陷阱"
+grep -q 'defaultTIntradayCapPct = 50.0' "$C127" && grep -q 'defaultTMinSpreadPct   = 2.0' "$C127" ||
+	fail127 "六轮把机动仓帽 30→50、最小价差 1.0→2.0 的出厂值缺失：改默认值必须同时改这里，否则灰度参数与文档分叉"
+CNT127=$((CNT127 + 6))
+
+# —— ④ 迁移与签字面 7 道：dry-run 不写盘、只迁旧物化默认、token 单一来源、四个路由都在 ——
+grep -q 'func (m \*Manager) MigrateSizingToV4(userIDs \[\]string, apply bool)' "$V127" ||
+	fail127 "v4 迁移入口缺 apply 参数：没有 dry-run 就没法「未签字不写盘」"
+grep -q 'if !apply {' "$V127" ||
+	fail127 "迁移里没有 apply 分支：dry-run 与落盘走同一条代码＝报告接口一被点就改资金参数"
+grep -qE 'legacyMaterializedCapPct[[:space:]]+=[[:space:]]+0\.80' "$V127" ||
+	fail127 "迁移判据必须写死「逐字等于旧物化默认 0.80」：用归一化值判会把 owner 手调过的保守档一起抬走"
+grep -q 'SizingV2Row{UserID: uid, Layer: "follower"' "$V127" ||
+	fail127 "无账号文档的账号必须记成自动跟随且**不建键**：凭空建键等于把「跟随全局」冻结成当前值"
+grep -q 'const SignoffV4Token = v4SignoffToken' "$SIGN127" ||
+	fail127 "签字 token 只许一处定义：env 路径与 HTTP 路径各写一个字面量就会出现「环境变量签了但接口说没签字」"
+grep -q 'os.Getenv("QUANT_SIZING_V4_APPLY") == server.SignoffV4Token' "$MAIN127" ||
+	fail127 "启动链的 v4 迁移必须默认 dry-run、仅凭 token 落盘：把「忘了摘的环境变量」当授权就是静默改写资金参数"
+for rt127 in "GET /api/config/sizing-v4-plan" "POST /api/config/sizing-v4-apply" "GET /api/paper/anchor-backfill-plan" "POST /api/paper/anchor-backfill" "GET /api/paper/t-rounds" "GET /api/t-live/rounds"; do
+	grep -q "$rt127" "$SRV127" || fail127 "签字/读数路由没注册：$rt127"
+done
+CNT127=$((CNT127 + 7 + 6))
+
+# —— ⑤ 做 T 收益独立口径 5 道：只统计 done、不并整仓、前端单独成卡、面板稀疏提交 ——
+grep -q 'func (e \*Engine) TRoundNetPnL()' "$TP127" ||
+	fail127 "缺 TRoundNetPnL：六轮 T6-5 要求「盈亏不计整仓、单独算一个做 T 收益」"
+if grep -A 24 'func (e \*Engine) TRoundNetPnL()' "$TP127" | grep -qE 'r\.State != tRStateDone'; then
+	:
+else
+	fail127 "TRoundNetPnL 没先滤掉非 done 轮：unwound/converted 的腿已经并回普通持仓口径，再计一次就是重复记账"
+fi
+grep -q '"t_pnl_net"' "$API127" ||
+	fail127 "接口必须透出净额字段名 t_pnl_net（前端与排障脚本按这个键取数）"
+grep -q 'TRoundsCard' web/src/pages/Paper.jsx ||
+	fail127 "做 T 收益没上屏：owner 要能在面板看到「今日/累计做 T 净额」与被拦 step 分布，否则灰度期无法签字"
+grep -q 'function tEffectiveToPatch(base, form)' "$FEF127" ||
+	fail127 "T 段必须按**键级稀疏**提交（tEffectiveToPatch）：把 WithTEffective 的回显原样 POST 回去等于把今天的默认钉成账号显式配置"
+CNT127=$((CNT127 + 5))
+
+# —— ⑥ 行为腿：四组真跑，条数与源码派生对拍（少跑＝-run 没覆盖新增用例，这条绿不算全绿） ——
+W127=$(mktemp -d "${TMPDIR:-/tmp}/gate127.XXXXXX") || fail127 "行为腿工作目录建不起来"
+LEG127_TOTAL=0
+for spec127 in \
+	"internal/config:TestV4Migration" \
+	"internal/signalctl:TestSizingMarketStockSplit|TestSizingBuyScaleMatchesLegacyScale|TestSizingMissingKeyInputCapsTarget|TestSizingTotalPosCapMovedOut" \
+	"internal/server:TestLiveTRoundsAPI|TestPaperTRoundsAPIWithoutEngine|TestSizingV4SignoffAPI|TestAnchorBackfillSignoffAPI" \
+	"internal/paper:TestTRoundNetPnlIsIndependentOfCost|TestTRoundSellCapUsesMinDenominator|TestTRoundFrozenCashIsReservedForBuyBack" \
+	"internal/engine:TestDynV4"; do
+	D127D=${spec127%%:*}
+	PAT127=${spec127#*:}
+	LOG127="$W127/$(printf '%s' "$D127D" | tr '/' '_').log"
+	# 派生期望：正则里每个 | 分支都必须至少命中一条用例，否则 -run 写错了也照样"全绿"。
+	WANT127=$(grep -hE "^func ($(printf '%s' "$PAT127" | tr '|' '|'))" "$D127D"/*_test.go 2>/dev/null | wc -l | tr -d ' ' || true)
+	[ "${WANT127:-0}" -ge 1 ] ||
+		{ rm -rf "$W127"; fail127 "$D127D 一条本批用例都没有（pattern=${PAT127}）：派生期望为 0＝判据没射程，不是全绿"; }
+	if ! go test -v -run "$PAT127" "./$D127D/" -count=1 >"$LOG127" 2>&1; then
+		tail -20 "$LOG127"
+		rm -rf "$W127"
+		fail127 "$D127D 行为腿非零退出（上面贴出末 20 行归因）"
+	fi
+	GOT127=$(grep -c '^--- PASS' "$LOG127" || true)
+	BAD127=$(grep -c '^--- FAIL' "$LOG127" || true)
+	[ "${BAD127:-0}" = "0" ] || { tail -20 "$LOG127"; rm -rf "$W127"; fail127 "$D127D 用例 FAIL=${BAD127}"; }
+	[ "${GOT127:-0}" -ge "${WANT127}" ] || {
+		rm -rf "$W127"
+		fail127 "$D127D 跑到的条数少于源码派生（PASS=${GOT127} 应有≥${WANT127}）"
+	}
+	LEG127_TOTAL=$((LEG127_TOTAL + GOT127))
+done
+rm -rf "$W127"
+CNT127=$((CNT127 + 4))
+
+# —— ⑦ 反证 4 枚：四种"看起来实现了、其实改错方向"的坏形态，上面的判据必须抓得住 ——
+W127M=$(mktemp -d "${TMPDIR:-/tmp}/gate127m.XXXXXX") || fail127 "反证工作目录建不起来"
+# 坏形态 A：把 Scale 当预算倍数（没有 MS/SS 拆分）——目标模型的前提就没了
+printf '%s\n' 'type SizingResult struct { Scale float64 }' > "$W127M/fake_split.go"
+if grep -q 'MarketScale float64' "$W127M/fake_split.go"; then
+	fail127 "反证不自洽：不拆 MS/SS 的坏形态也满足拆分判据"
+fi
+# 坏形态 B：缺失读数当"安全中性"（不封顶）
+printf '%s\n' 'if res.MissingKeyInput { _ = 0 }' > "$W127M/fake_missing.go"
+grep -q 'missingKeyTargetCap = 0.50' "$W127M/fake_missing.go" &&
+	fail127 "反证失效：不封顶的坏形态不该匹配到封顶常量判据"
+# 坏形态 C：收益聚合遍历全部轮（把收摊腿也算进 T 收益）
+printf '%s\n' 'for i := range e.tRounds {' 'sum += e.tRounds[i].TPnlNet' '}' > "$W127M/fake_pnl.go"
+if grep -A 24 'func (e \*Engine) TRoundNetPnL()' "$W127M/fake_pnl.go" | grep -qE 'r\.State != tRStateDone'; then
+	fail127 "反证失效：漏滤非 done 轮的坏形态也满足过滤判据"
+fi
+# 坏形态 D：迁移把"没配过"也写成显式配置（物化默认值）
+printf '%s\n' 'next.Mode = migratedMode' 'next.PolicyVersion = sizingPolicyVersionV4' > "$W127M/fake_materialize.go"
+grep -q 'legacyMaterializedMode' "$W127M/fake_materialize.go" &&
+	fail127 "反证失效：无条件写 mode 的坏形态不该匹配到「逐字等于旧默认」判据"
+rm -rf "$W127M"
+CNT127=$((CNT127 + 4))
+
+echo "ok - §127 §DYN-SIZE v4 + §DYN-T 契约/签字面/收益口径锁通过（目标模型 6 + 引擎接线 5 + 配置契约 6 + 迁移签字 13 + 收益口径 5 + 行为腿 4 组共 ${LEG127_TOTAL} 条用例 + 反证 4 枚，累计判定点 ${CNT127}）"
+
+# ============================================================================
+# §128 §DYN-T 实盘日内回转（W8-A~D）：闸门净额 / 状态机 / 对手方不变量 / 观测
+#
+# 这一段与 §126/§127 的分工：§126 管纸面账本的编排语义，§127 管 v4 目标模型与配置契约，
+# 本段只管**实盘钱路径新长出来的那一截**。判据全部按"故意改错方向必红"设计：
+# 实盘 T 是本仓第一次在真金白银上做日内双向操作，任何"看起来接了但方向反了"的实现
+# 都不会让功能测试变红（少一条腿只是少一次机会），只会让资金承担不该承担的方向性风险。
+# English: locks for the live intraday round-trip path — the first time this repo trades both
+# directions with real money, so every lock below must be able to catch a wrong-direction edit.
+# ============================================================================
+echo "==> 128 §DYN-T 实盘回转（净额闸 / 两腿串行 / 跨账号互斥 / 锚点来源 / 报撤比总账）..."
+fail128() {
+	echo "--- FAIL: §128 $*"
+	FAIL=1
+}
+CNT128=0
+LV128=internal/engine/intraday_t_live.go
+ST128=internal/engine/tlive_state.go
+RG128=internal/risk/gate.go
+CO128=internal/trading/controller.go
+EX128=internal/trading/executor.go
+SP128=internal/store/real_positions.go
+SRV128=internal/server/t_rounds_api.go
+
+# —— ① 标志贯通 5 道：请求体 → controller → 风控 → 落库列，任何一环断掉都是静默失效 ——
+grep -q 'IntradayT bool `json:"intraday_t,omitempty"`' "$EX128" ||
+	fail128 "OrderRequest 缺 IntradayT：T 腿与战略单在风控/落库里无法区分（净额闸形同虚设）"
+grep -q 'IntradayT:  *req.IntradayT' "$CO128" ||
+	fail128 "controller 没把标志透传给 risk.LiveOrder：集中度会按全额拦掉正 T 买腿，灰度账号稍集中就永远开不了 T"
+grep -q 'IntradayT:  *req.IntradayT' "$CO128" && grep -q 'IntradayT' "$SP128" ||
+	fail128 "占位委托行没落 intraday_t 列：目标仓位模型读不到在途 T 腿，CurStrat 会把低吸算成战略建仓"
+grep -q 'func (g \*Gate) tPairingCovered(o LiveOrder) bool' "$RG128" ||
+	fail128 "缺可卖量复核 tPairingCovered：只要打上 T 标就净额化＝给一笔真加仓发通行证"
+grep -q 'netAmount = 0' "$RG128" ||
+	fail128 "集中度里没有净额分支（netAmount=0）：净额闸没实现，T 买腿会被当全额敞口拦下"
+CNT128=$((CNT128 + 5))
+
+# —— ② 负向锁 4 道（只看代码行，注释里提到这些名字是在解释为什么不用它们） ——
+for bad128 in "sellAllLocked" "trimDone\[" "realTrimDone\[" "delete(e.positions"; do
+	HIT128=$(grep -E "$bad128" "$LV128" | grep -vE '^[[:space:]]*//' | wc -l | tr -d ' ' || true)
+	[ "${HIT128:-0}" = "0" ] ||
+		fail128 "实盘 T 编排里出现 ${bad128}（代码行 ${HIT128} 处）：一次回转会关掉生命周期/烧掉当日退出槽/抹掉持仓行"
+done
+CNT128=$((CNT128 + 4))
+
+# —— ③ 次序与幂等 4 道：配对先于开新腿、跨日先收敛、对账不可得就不动钱、两腿不同键 ——
+PAIR128=$(grep -n 'r\.pair(rnd)' "$LV128" | head -1 | cut -d: -f1 || true)
+OPEN128=$(grep -n 'r\.openPass()' "$LV128" | head -1 | cut -d: -f1 || true)
+[ -n "$PAIR128" ] && [ -n "$OPEN128" ] && [ "$PAIR128" -lt "$OPEN128" ] ||
+	fail128 "配对必须先于开新腿（pair@${PAIR128:-?} open@${OPEN128:-?}）：反序会让两条腿在同一轮里时间重叠"
+grep -q 'r\.rollStaleOpen()' "$LV128" ||
+	fail128 "缺跨日收敛：昨日 open 会被当今日在途腿继续配对（敞口过夜且幂等键跨日失效）"
+grep -q '本轮不动钱' "$LV128" ||
+	fail128 "对账读数不可得时必须整轮不动钱——这条文案是那条分支的锚点，改了实现也要留着它"
+grep -q 'tLPairSuffix = ":p"' "$LV128" ||
+	fail128 "配对腿缺 :p 后缀：第二腿会与第一腿同幂等键，被自家唯一键拦成 duplicate、当日永远配不上"
+CNT128=$((CNT128 + 4))
+
+# —— ④ 对手方不变量（合规红线：对敲不申请、不做）3 道 ——
+grep -q 'func (rg \*tLiveRegistry) oppositeOpenLeg' "$ST128" ||
+	fail128 "缺跨账号同码反向互斥：两本账各开一条反向腿就是自实控账户互买互卖的形态，绝不接受"
+grep -q '按互斥命中' "$ST128" ||
+	fail128 "跨账号读数不可得必须按互斥命中（fail-closed）：读不到就放行等于把不变量降级成尽力而为"
+grep -q '对敲不申请、不做\|对敲不申请,不做' "$LV128" ||
+	fail128 "文件头必须留"对敲不申请、不做"这句红线：柜台勾选不改变法律性质，注释是唯一防止有人"顺手加个对手方参数"的地方"
+CNT128=$((CNT128 + 3))
+
+# —— ⑤ 锚点来源与保护阈值 4 道 ——
+grep -q 'func (p RealPosition) AnchorTicket() bool' "$SP128" ||
+	fail128 "实盘持仓缺 AnchorTicket：只判 anchor_price>0 会让成本回落档获得开 T 资格（裁决二终结过的缺陷从实盘绕回来）"
+grep -q '!pos.AnchorTicket()' "$LV128" ||
+	fail128 "开腿链没查锚点来源：回填过的存量票会带着摊薄成本去开日内腿"
+grep -q 'defaultTSellEnvMinMarketScale' internal/config/config.go ||
+	fail128 "缺反 T 环境门出厂值（六轮 T6-1：极端弱势就是不做 T）"
+grep -q 'TIntradaySellCapTotalPctOf' internal/config/config.go ||
+	fail128 "缺当日反 T 总量帽键（四轮第 4 条；分母必须是 min(总资产,持仓市值)）"
+CNT128=$((CNT128 + 4))
+
+# —— ⑥ 观测 3 道：日志前缀、被拦分布落盘、报撤比总账 ——
+grep -q 'tLLogTag = "\[t-live\]"' "$LV128" ||
+	fail128 "实盘回转日志必须带 [t-live] 前缀（与纸面 [paper] §T-MODE 区分，否则灰度期分不出是哪本账）"
+grep -q '"blocks,omitempty"' "$ST128" ||
+	fail128 "被拦分布必须随状态文件落盘：只在内存里，重启一次就把上午的拦截证据抹掉，灰度签字没有依据"
+grep -q '每日总账' "$LV128" && grep -q 'func (d \*DB) TLegOrderLedger' internal/store/fill_first_buy.go ||
+	fail128 "缺当日委托笔数与报撤比总账（§6.3 B 组第 19 条：这是给券商异常交易观察留的量化证据）"
+CNT128=$((CNT128 + 3))
+
+# —— ⑦ 行为腿：真跑三组，条数按源码派生对拍 ——
+W128=$(mktemp -d "${TMPDIR:-/tmp}/gate128.XXXXXX") || fail128 "行为腿工作目录建不起来"
+LEG128_TOTAL=0
+for spec128 in \
+	"internal/engine:TestTLive" \
+	"internal/store:TestTLegOrderLedger|TestEarliestBuyFillPrice|TestRealPositionAnchorTicket" \
+	"internal/risk:TestGateConcentrationIntradayNet"; do
+	# 三组的用例名从源码派生（WANT128 那一步），名单本身只定**归属**：engine 的编排状态机、
+	# store 的三本账证据（委托计数／首买价／锚点票）、risk 的净额闸。§128 ① 面锁的就是净额闸，
+	# 所以这一条腿必须落在 gate_test.go 里那条真判据上，不是同名就好。
+	D128D=${spec128%%:*}
+	PAT128=${spec128#*:}
+	LOG128="$W128/$(printf '%s' "$D128D" | tr '/' '_').log"
+	WANT128=$(grep -hE "^func ($PAT128)" "$D128D"/*_test.go 2>/dev/null | wc -l | tr -d ' ' || true)
+	[ "${WANT128:-0}" -ge 1 ] ||
+		{ rm -rf "$W128"; fail128 "$D128D 没有命中任何本批用例（pattern=${PAT128}）：派生期望为 0＝判据没射程，不是全绿"; }
+	if ! go test -v -run "$PAT128" "./$D128D/" -count=1 >"$LOG128" 2>&1; then
+		tail -20 "$LOG128"
+		rm -rf "$W128"
+		fail128 "$D128D 行为腿非零退出（上面贴出末 20 行归因）"
+	fi
+	GOT128=$(grep -c '^--- PASS' "$LOG128" || true)
+	BAD128=$(grep -c '^--- FAIL' "$LOG128" || true)
+	[ "${BAD128:-0}" = "0" ] || { tail -20 "$LOG128"; rm -rf "$W128"; fail128 "$D128D 用例 FAIL=${BAD128}"; }
+	[ "${GOT128:-0}" -ge "${WANT128}" ] || {
+		rm -rf "$W128"
+		fail128 "$D128D 跑到的条数少于源码派生（PASS=${GOT128} 应有≥${WANT128}）"
+	}
+	LEG128_TOTAL=$((LEG128_TOTAL + GOT128))
+done
+rm -rf "$W128"
+CNT128=$((CNT128 + 3))
+
+# —— ⑧ 反证 4 枚：坏形态必须被上面的判据抓住（抓不住说明锁没有区分度） ——
+W128M=$(mktemp -d "${TMPDIR:-/tmp}/gate128m.XXXXXX") || fail128 "反证工作目录建不起来"
+# A：先开新腿后配对（两腿时间重叠）
+printf '%s\n' 'r.openPass()' 'for _, rnd := range opens {' 'r.pair(rnd)' > "$W128M/fake_order.go"
+P128=$(grep -n 'r\.pair(rnd)' "$W128M/fake_order.go" | head -1 | cut -d: -f1 || true)
+O128=$(grep -n 'r\.openPass()' "$W128M/fake_order.go" | head -1 | cut -d: -f1 || true)
+[ "${P128:-0}" -gt "${O128:-0}" ] || fail128 "反证不自洽：坏次序用例自己没构造出"先开后配""
+# B：只判 anchor_price>0（不看来源）
+printf '%s\n' 'if pos.AnchorPrice <= 0 {' 'return "", 0, "锚点缺失"' > "$W128M/fake_anchor.go"
+grep -q 'AnchorTicket()' "$W128M/fake_anchor.go" && fail128 "反证失效：只看价格的坏形态不该匹配到来源闸门判据"
+# C：净额闸无复核（打上标志就免检）
+printf '%s\n' 'if o.IntradayT { netAmount = 0 }' > "$W128M/fake_net.go"
+grep -q 'tPairingCovered' "$W128M/fake_net.go" && fail128 "反证失效：无复核的坏形态不该匹配到复核判据"
+# D：跨账号读不到就放行
+printf '%s\n' 'if err != nil { return false, "" }' > "$W128M/fake_cross.go"
+grep -q '按互斥命中' "$W128M/fake_cross.go" && fail128 "反证失效：fail-open 的坏形态不该匹配到 fail-closed 判据"
+rm -rf "$W128M"
+CNT128=$((CNT128 + 4))
+
+echo "ok - §128 §DYN-T 实盘回转锁通过（标志贯通 5 + 负向 4 + 次序幂等 4 + 对手方不变量 3 + 锚点与保护 4 + 观测 3 + 行为腿 3 组共 ${LEG128_TOTAL} 条用例 + 反证 4 枚，累计判定点 ${CNT128}）"
+
+# ============================================================================
+# §129 §GATE-PIPEFAIL 门禁自纠：大文本判读只许走 grep_q
+#
+# 缺陷本体不在业务代码里，在**门禁自己**：grep -q 命中第一条就退出并关闭管道，而 printf 要到写完
+# （待判文本超过 64KB 管道缓冲时它才写到一半）才停手，于是被 SIGPIPE 打死（退出码 141）；
+# 本脚本顶部的 `set -o pipefail` 把「匹配成功」读成「整条管道失败」——判红语义当场反向。
+# 2026-10-27 §114 V5 实录：镜像里的破坏确实现形（输出里明明有 `× … G1`），却被报成
+# 「反证 V5 破坏后 vitest 没让 G1 现形」并 GATE_EXIT=1。红项文案与真相相反，人会去改代码，
+# 而代码是对的——这种锁比没有锁更糟，它把注意力精确地引向错误的地方。
+# 触发条件是**被测输出的体积**（vitest 的兜底 DOM dump 随页面内容浮动），不是代码：同一把尺子
+# 平时全绿、某天随机红，所以必须钉一枚打在体积上的行为腿，光改完不收口等于没修。
+# 本段三面：① 姿势（新增的直接管道一律判红，允许活着的链式形状由尺子按形状派生，不写死数字）
+# ② 语义＋对照（E/F/B 三档、空文本都在 300KB 文本上真跑，并断旧写法在同一文本上必须死于 141，
+# 证明修法打在成因上而不是打在被判文本上）③ 装配（-collect 的内层脚本只搬前言里的**函数定义**，
+# 临时文件若建在前言语句上，collect 模式永远取不到路径 ⇒ 每一枚 grep_q 都判不到＝整批假绿）。
+# English: the gate's own read posture was inverted by SIGPIPE+pipefail on large test output;
+# this section locks the posture, the semantics on an oversized payload, and the collect assembly.
+# ============================================================================
+echo "==> 129 §GATE-PIPEFAIL grep_q 姿势锁（printf 管道 + SIGPIPE + pipefail 反向判红家族）..."
+fail129() {
+	echo "--- FAIL: §129 $*"
+	FAIL=1
+}
+CNT129=0
+GS129=scripts/verify_changes.sh
+W129=$(mktemp -d /tmp/gate129-XXXXXX) || { echo "--- FAIL: §129 工作目录建不出来（反证没有落点，宁可红不许跳）"; exit 1; }
+
+# 被禁形状写在 ruler129.py 里（heredoc 正文由掩码排除），本段代码行一律只引用变量名：
+# 任何一条**门禁代码行**同时凑出那两个形状，本段的锁就会自己命中自己——静态负锁被自身文案
+# 弄红是本仓反复交过学费的一族（§110/§120 同族教训）。
+cat > "$W129/ruler129.py" <<'RULE129'
+import importlib.util, sys
+# §129 ① 面的尺子：只数「非注释、非 heredoc」代码行里的被禁形状。
+# 为什么单独成文件而不是两处内联：反证 R1 必须用**同一把尺子**量被破坏的副本——
+# 另起一把尺子的反证只能证明「两把尺子读数不同」，证明不了「这把尺子有牙」。
+spec = importlib.util.spec_from_file_location('gs', 'scripts/gate_sections.py')
+gs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gs)
+lines = gs.read_lines(sys.argv[1])
+mask = gs.heredoc_mask(lines)
+A = "printf '%s" + chr(92) + "n'"
+B = "| grep" + " -q"
+C = '| grep "'
+direct = chain = 0
+for i, ln in enumerate(lines):
+    if mask[i] or ln.strip().startswith('#'):
+        continue
+    if A in ln and B in ln:
+        direct += 1
+        if C in ln:
+            chain += 1
+print('%d %d' % (direct, chain))
+RULE129
+
+# —— ① 姿势面：整份测试原文不许再直接管道给 grep -q；链式前缀判读（先筛行、再判命中）允许活着 ——
+# 链式之所以安全：第一段 grep 把 300KB 筛成 KEY=VALUE 几行，够不到管道缓冲，SIGPIPE 打不中写方。
+# 判据写成「两个读数相等」而不是「等于 3」：数字由形状派生，后来人新增一处直接管道 ⇒ 两数分叉 ⇒ 红；
+# 写死 3 的那把尺子对第 4 处天生失明（§89 计数锁同族教训）。
+N_P129=$(python3 "$W129/ruler129.py" "$GS129" 2>&1 || true)
+read -r N_DIRECT129 N_CHAIN129 <<RPN129
+${N_P129:-0 0}
+RPN129
+CNT129=$((CNT129 + 1))
+case "$N_DIRECT129" in
+	'' | *[!0-9]*) fail129 "尺子读数不是数字（「${N_P129:-空}」＝python 没跑起来或尺子崩了，宁可红不许按 0 放行）" ;;
+esac
+[ "${N_DIRECT129:-0}" = "${N_CHAIN129:-0}" ] \
+	|| fail129 "有 $((N_DIRECT129 - N_CHAIN129)) 处把整份测试原文直接管道给 grep -q（直接 ${N_DIRECT129}／链式 ${N_CHAIN129}）：超过 64KB 时 grep 提前退出会打死写方、pipefail 把命中记成判红——本段开头那条 §114 V5 假红就是这么来的，判读一律改走 grep_q"
+
+# —— ② 语义面：三档判读 + 两个负例，全部落在一份**真超限**文本上 ——
+# 文本必须真的大于管道缓冲，否则这条腿只是在测「小文本恰好不会红」，判据没打在成因（体积）上。
+BIG129=$(printf '%s\n' '× aaa G1 命中在最前面'; head -c 300000 /dev/zero | tr '\0' 'a'; printf '\nTests  2 failed | 2 passed (4)\n')
+CNT129=$((CNT129 + 1))
+[ "${#BIG129}" -gt 200000 ] \
+	|| fail129 "构造的超限文本只有 ${#BIG129} 字节（应 >200000）＝②面在空转，体积这条成因根本没进判据路径"
+grep_q '× .*G1' BIG129 || fail129 "ERE 档在超限文本上判不到**最前面**那条命中＝grep_q 的落盘/判读断了（① 面赖以成立的那把尺子坏了）"
+grep_q 'Tests +[0-9]+ failed' BIG129 || fail129 "第二枚并列判据判不到（§114 V5 那条 if 正是两枚并列，缺一枚都会假红）"
+grep_q '× aaa G1 命中在最前面' BIG129 F || fail129 "F 档（字面）判不到：迁移时把 F 档写成 ERE，带元字符的 token 会恒不命中（§110 归属锁那一族）"
+grep_q '× aaa.G1.*前面' BIG129 B || fail129 "B 档（BRE，等价原来的裸 grep -q）判不到：原来不带 -E 的调用点被换成 ERE 后语义漂移，元字符少转义就是另一种假绿"
+if grep_q '一定不存在的东西XYZQ' BIG129; then fail129 "负例判成命中＝grep_q 恒真，本段所有反证与 ① 面的读数全部失去意义"; fi
+EMPTY129=''
+if grep_q 'x' EMPTY129; then fail129 "空文本判成命中：以后任何「输出为空」都会被读成「判据通过」（§111 的 I1 腿专门反证过这个形状）"; fi
+CNT129=$((CNT129 + 5))
+
+# —— ②b 对照腿：同一份文本、同一个 needle，旧写法必须死于 SIGPIPE（141）——
+# 这枚是「修法打在成因上」的证据：旧写法若在同一文本上也能干净判到，说明体积没进判据路径，
+# 上面那五条语义腿只是自我表扬；现网真红那次恰恰是 rc=141，所以把 141 钉成期望值而不是钉文案。
+cat > "$W129/old_form.sh" <<'OLDF129'
+#!/usr/bin/env bash
+set -euo pipefail
+# 夹具：复刻 2026-10-27 之前的判读姿势（整份输出直接管道给 grep -q，命中在第一条）。
+# 待判文本由环境变量递进来，不在夹具里内联 300KB。
+printf '%s\n' "$(cat "$BIG129_TXT")" | grep -qE '× .*G1'
+echo "OLD-FORM-MATCHED rc=0"
+OLDF129
+printf '%s\n' "$BIG129" > "$W129/big.txt"
+rc129=0
+BIG129_TXT="$W129/big.txt" bash "$W129/old_form.sh" > "$W129/old.out" 2>&1 || rc129=$?
+CNT129=$((CNT129 + 1))
+[ "$rc129" = "141" ] \
+	|| fail129 "旧写法在同一份超限文本上退出码=${rc129}（期望 141＝写方被 SIGPIPE 打死）：要么本机管道缓冲不是 64KB、要么 pipefail 没生效——两种情况下 ①/② 面锁的都是一个不存在的成因，本段判红而不是放绿"
+
+# —— ③ 装配面：grep_q 的临时文件必须懒建在函数内部 ——
+# -collect 的内层脚本只搬「前言里的函数定义」，不搬前言里的普通语句（§111 的 CHECK 腿专门管这个名字）。
+# mktemp 若被挪回前言：单遍跑一切正常，collect 模式下 GREPQ_FILE 恒空 ⇒ 每枚 grep_q 都判不到
+# ⇒ 整个 §11x 反证族安静地变成假绿——「少搬一句」这件事从来不会自己显形。
+grep -A8 '^grep_q() {' "$GS129" | grep -qF -- 'GREPQ_FILE="$(mktemp' \
+	|| fail129 "grep_q 函数内部的懒建 mktemp 不见了（被挪到前言＝collect 内层不搬，门禁在收集模式下整批假绿）"
+CNT129=$((CNT129 + 1))
+CHK129=$(python3 scripts/gate_sections.py check "$GS129" 2>&1 || true)
+grep_q 'CHECK[[:space:]]+OK' CHK129 \
+	|| fail129 "前言自检不 OK（新加的语句落在了前言＝collect 少搬一步，读数不属于那段）：$(printf '%s\n' "$CHK129" | tail -2 | tr '\n' ' ')"
+CNT129=$((CNT129 + 1))
+
+# —— ④ 反证两枚：本段的尺子必须真能翻 ——
+# R1 姿势面：把一处已收口的调用退回旧姿势（在 /tmp 副本上动手，主文件零改动）⇒ ① 面两读数必须分叉。
+cp "$GS129" "$W129/gate_r1.sh"
+N129R1=$(python3 - "$W129/gate_r1.sh" <<'R1PY'
+import sys
+# 坏法：还原一处调用。被禁形状与**靶串本身**都用切片拼——靶串整串写出来时，副本里的 R1PY 正文
+# 自己就含一处 good，落地数变 2（>1＝命中面比预期宽，红了不知道红在哪）；被禁形状写全则副本里
+# 多出一处违例，① 面会同时把「好」和「坏」都判红，归属读不出来。
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+good = "grep_q 'Tests +4 passed' BAS" + "E_VT114"
+bad = "printf '%s" + chr(92) + "n' \"" + "$BASE_VT114\" | grep" + " -qE 'Tests +4 passed'"
+n = s.count(good)
+if n:
+    open(p, 'w', encoding='utf-8').write(s.replace(good, bad))
+print(n)
+R1PY
+) || true
+CNT129=$((CNT129 + 1))
+[ "${N129R1:-0}" = "1" ] \
+	|| fail129 "反证 R1 变异落地数=${N129R1:-0}（应恰好 1）：0＝靶串没命中，这枚等于没跑；>1＝命中面比预期宽，红了也不知道红在哪"
+N_P129R1=$(python3 "$W129/ruler129.py" "$W129/gate_r1.sh" 2>&1 || true)
+read -r D129R1 C129R1 <<RPN129R1
+${N_P129R1:-0 0}
+RPN129R1
+CNT129=$((CNT129 + 1))
+[ "${D129R1:-0}" != "${C129R1:-0}" ] \
+	|| fail129 "反证 R1 失效：退回旧姿势后 ① 面两把计数仍然相等（${D129R1:-0}/${C129R1:-0}）＝这枚锁是装饰，下一次同样的假红照样没人拦"
+# R2 装配面：把懒建 mktemp 挪回前言（副本上做）⇒ gate_sections.py check 必须点名 OFFENDER。
+cp "$GS129" "$W129/gate_r2.sh"
+N129R2=$(python3 - "$W129/gate_r2.sh" <<'R2PY'
+import importlib.util, sys
+# 坏法：函数内的懒建改成前言里的一句赋值——正是 §111 CHECK 腿负责拦的那一形状。
+# 落点必须按 parse 的 prologue_end 取，不能"就近插在 grep_q 上面"：grep_q 定义本身落在
+# GATE-COLLECT-DRIVER 标记区内，而 check 把驱动区整段豁免（实测插在那里自检照样报 OK＝假反证）。
+p = sys.argv[1]
+spec = importlib.util.spec_from_file_location('gs', 'scripts/gate_sections.py')
+gs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gs)
+lines = gs.read_lines(p)
+_good = chr(9) * 2 + 'GREPQ_FILE="' + '$(mktemp /tmp/gate-grepq-XXXXXX)" || return 1'
+_n = sum(1 for ln in lines if ln == _good)
+_lines = [ln if ln != _good else chr(9) * 2 + ':' for ln in lines]
+_sections, _pe, _funcs = gs.parse(_lines)
+_lines.insert(_pe, 'GREPQ_FILE=$' + '(mktemp /tmp/gate-grepq-r2)')
+if _n:
+    open(p, 'w', encoding='utf-8').write('\n'.join(_lines))
+print(_n)
+R2PY
+) || true
+CNT129=$((CNT129 + 1))
+[ "${N129R2:-0}" = "1" ] || fail129 "反证 R2 变异落地数=${N129R2:-0}（应恰好 1）：0＝函数里那段懒建不是这个形状，③ 面与 R2 的归属都读不出来"
+CHK129R2=$(python3 scripts/gate_sections.py check "$W129/gate_r2.sh" 2>&1 || true)
+CNT129=$((CNT129 + 1))
+if grep_q 'CHECK[[:space:]]+OK' CHK129R2; then
+	fail129 "反证 R2 失效：mktemp 被挪进前言后自检仍报 OK（读数：$(printf '%s\n' "$CHK129R2" | tail -2 | tr '\n' ' ')）——collect 会安静地少搬这一句，本段判读在收集模式下恒不命中"
+fi
+rm -rf "$W129"
+
+# 覆盖面账的诚实读数：不带换行那一族还剩几处没收口（本枚不判它，只把数字如实报出来——
+# 写死「77 处」这种数对下一个新增调用点天生失明，§89 计数锁同族教训）。
+N_SHORT129=$(python3 - "$GS129" <<'SHPY129'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('gs', 'scripts/gate_sections.py')
+gs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gs)
+lines = gs.read_lines(sys.argv[1])
+mask = gs.heredoc_mask(lines)
+A = "printf '%s'"
+B = "| grep" + " -q"
+print(sum(1 for i, ln in enumerate(lines)
+          if not mask[i] and not ln.strip().startswith('#') and A in ln and B in ln))
+SHPY129
+) || true
+CNT129=$((CNT129 + 1))
+echo "INFO - §129 覆盖面账：不带换行的那一族管道判读（printf 百分号 s 直出，本段实测 ${N_SHORT129} 处）不在本枚射程内——它们判的是短输出（部署预览文本、单条 JSON 正文、fixture 的一次运行日志），够不到 64KB 管道缓冲；真要连它们一起收口，得把 §110/§111 内嵌 heredoc 夹具里的同款写法一并改写，那是另一批的射程（收口时机：②b 对照腿哪天在某一族真实输出上读出 rc=141）。三处链式前缀判读（jline113 与 §113 的两枚归属腿）由尺子按形状放行，判读对象是 KEY=VALUE 读数而不是测试原文。grep_q 自身的落盘写入没有反证（写坏成写 /dev/null 时，② 面五条语义腿会一起红，归属仍可读）。"
+
+echo "ok - §129 §GATE-PIPEFAIL 姿势锁通过（姿势等值 1 + 语义 6 + 超限对照 1 + 装配 2 + 反证 2 枚共 4 道，累计判定点 ${CNT129}）"
 echo "==> 全部通过"

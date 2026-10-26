@@ -2,6 +2,7 @@ package signalctl
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,17 @@ import (
 // baseRegime 基准态快照：配置为出厂默认，其余读数全部零值（= 全部因子弃权）。
 func baseRegime() Regime { return Regime{SizeCfg: config.DefaultSizingConfig()} }
 
+// productRegime 与 baseRegime 同构，但把合成模式钉回 **product**。
+// 为什么需要它：§DYN-SIZE v4 把出厂默认切成了 power_mean（owner 裁决），
+// 而 product 路径上的"连乘/取 min/地板"这一批旧锁必须按旧语义断言；
+// 用 baseRegime 会让它们静默测到新路径，锁失去区分力。
+// English: pins the legacy product synthesis so the byte-identity locks keep testing what they claim.
+func productRegime() Regime {
+	r := baseRegime()
+	r.SizeCfg.Mode = "product"
+	return r
+}
+
 // baseSig 基准态信号：无置信度/无 ATR/无利空/无质量权重 → 个股侧因子全部弃权。
 func baseSig() combat_agent.Signal {
 	return combat_agent.Signal{Code: "600000", Name: "浦发银行", Strategy: "龙头", StrategyType: "dragon"}
@@ -21,7 +33,11 @@ func boolPtr(b bool) *bool { return &b }
 
 // TestComputeSizingBaseline 基准态反证（方案 §5 第一锁）：全因子未命中 ⇒ Scale==1.0、不降级、无原因。
 func TestComputeSizingBaseline(t *testing.T) {
-	res := ComputeSizing(baseRegime(), baseSig())
+	r := baseRegime()
+	// v4 出厂默认是 power_mean，其理由串恒定包含"市场组/个股组"三行留痕；
+	// "无命中因子"这条旧锁在 product 路径上才有意义，故显式锁 product。
+	r.SizeCfg.Mode = "product"
+	res := ComputeSizing(r, baseSig())
 	if res.Downgrade {
 		t.Fatalf("基准态不应降级，reasons=%v", res.Reasons)
 	}
@@ -30,6 +46,19 @@ func TestComputeSizingBaseline(t *testing.T) {
 	}
 	if len(res.Reasons) != 0 {
 		t.Fatalf("基准态不应有命中因子，got %v", res.Reasons)
+	}
+
+	// 同一基准态在 power_mean（v4 出厂默认）下也必须 Scale=1.0、不降级、不触封顶：
+	// 组行留痕允许存在，但**不许出现惩罚因子或封顶理由**——否则默认一切换就悄悄开始降权。
+	r2 := baseRegime()
+	res2 := ComputeSizing(r2, baseSig())
+	if res2.Downgrade || math.Abs(res2.Scale-1.0) > 1e-12 || res2.MissingKeyInput {
+		t.Fatalf("power_mean 基准态必须中性，got scale=%.4f downgrade=%v missing=%v", res2.Scale, res2.Downgrade, res2.MissingKeyInput)
+	}
+	for _, rs := range res2.Reasons {
+		if strings.Contains(rs, "×0.") || strings.Contains(rs, "触地板") || strings.Contains(rs, "封顶") {
+			t.Fatalf("power_mean 基准态不该出现惩罚/封顶留痕：%v", res2.Reasons)
+		}
 	}
 }
 
@@ -112,7 +141,7 @@ func TestSizingWeightFactors(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r, s := baseRegime(), baseSig()
+			r, s := productRegime(), baseSig()
 			c.mut(&r, &s)
 			res := ComputeSizing(r, s)
 			if res.Downgrade {
@@ -167,19 +196,17 @@ func TestSizingAbstain(t *testing.T) {
 // TestSizingLayeredSynthesis 分层合成（方案 §5 第二锁）：权重类连乘、上限类取 min，同一风险不双罚。
 func TestSizingLayeredSynthesis(t *testing.T) {
 	// 权重 0.5 × 0.5 = 0.25；上限 0.5 ⇒ 结果 = min(0.25, 0.5) = 0.25。
-	r := baseRegime()
-	r.EmotionPhase = "退潮"       // 0.50
-	r.MarketState = "range"     // 0.70 → 0.50*0.70 = 0.35
-	r.Account.TotalPosPct = 1.6 // 0.80/1.60 = 0.50
+	r := productRegime()
+	r.EmotionPhase = "退潮"   // 0.50
+	r.MarketState = "range" // 0.70 → 0.50*0.70 = 0.35
 	res := ComputeSizing(r, baseSig())
 	want := 0.50 * 0.70
 	if math.Abs(res.Scale-want) > 1e-9 {
-		t.Fatalf("期望 min(0.35, 0.50)=%.4f，got %.4f", want, res.Scale)
+		t.Fatalf("期望权重连乘 %.4f，got %.4f", want, res.Scale)
 	}
 
-	// 两个上限因子并存时取 min（不连乘）。
-	r2 := baseRegime()
-	r2.Account.TotalPosPct = 1.6     // 0.50
+	// 上限类与权重取 min（不连乘）；§DYN-SIZE v4 起总仓位上限不再参与合成。
+	r2 := productRegime()
 	r2.Account.EquityDrawdown = 0.40 // 0.10/0.40 = 0.25
 	res2 := ComputeSizing(r2, baseSig())
 	if math.Abs(res2.Scale-0.25) > 1e-9 {
@@ -190,7 +217,7 @@ func TestSizingLayeredSynthesis(t *testing.T) {
 // TestSizingFloorCap 地板/上限（方案 §5 第四锁）。
 func TestSizingFloorCap(t *testing.T) {
 	// 多重利空叠加 → 触地板 0.15。
-	r := baseRegime()
+	r := productRegime()
 	r.EmotionPhase = "退潮"                                                         // 0.50
 	r.MarketState = "bear"                                                        // 0.40
 	r.RiskTier = combat_agent.RiskTierYellow                                      // 0.60
@@ -203,7 +230,7 @@ func TestSizingFloorCap(t *testing.T) {
 	}
 
 	// 进攻档：强信号 + 低波动 → 但受 Cap 1.15 限制。
-	r2 := baseRegime()
+	r2 := productRegime()
 	s2 := baseSig()
 	s2.Confidence = 1.0           // Kelly → 1.15（内部已 clamp）
 	s2.ATR, s2.Price = 0.5, 100.0 // atrPct 0.5% → 2.0/0.5 = 4.0 → clamp 1.5
@@ -238,7 +265,7 @@ func TestSizingKelly(t *testing.T) {
 	mk := func(p float64) float64 {
 		s := baseSig()
 		s.Confidence = p
-		return ComputeSizing(baseRegime(), s).Scale
+		return ComputeSizing(productRegime(), s).Scale
 	}
 	if got := mk(0.0); got != 1.0 {
 		t.Fatalf("p=0（置信度不可得）期望弃权 1.0，got %.4f", got)
@@ -295,7 +322,7 @@ func TestSizingTradingDayLeadCurve(t *testing.T) {
 	}
 	// T-5 必须等于曲线首点（0.90），T-1 等于尾点（0.50）。
 	for d, want := range map[int]float64{5: 0.90, 4: 0.85, 3: 0.80, 2: 0.70, 1: 0.50} {
-		r := baseRegime()
+		r := productRegime()
 		r.MacroEvents = []MacroEventView{{Level: "cpi", Impact: "high", DaysToEvent: d}}
 		if got := ComputeSizing(r, baseSig()).Scale; math.Abs(got-want) > 1e-9 {
 			t.Fatalf("T-%d 期望 %.2f，got %.4f", d, want, got)
@@ -326,6 +353,8 @@ func TestAdmitSizingEnabledApplies(t *testing.T) {
 	c := New()
 	cfg := config.DefaultSizingConfig()
 	cfg.Enabled, cfg.Shadow = boolPtr(true), boolPtr(false)
+	// 这条锁断言的是 product 的"连乘即缩放"语义；v4 出厂默认已是 power_mean，显式锁回 product。
+	cfg.Mode = "product"
 	pol := Policy{Discipline: config.DisciplineConfig{}}
 	pol.Regime = Regime{SizeCfg: cfg, EmotionPhase: "退潮"}
 	sig := baseSig()
@@ -336,6 +365,11 @@ func TestAdmitSizingEnabledApplies(t *testing.T) {
 	}
 	if math.Abs(d.BuyScale-0.50) > 1e-9 {
 		t.Fatalf("期望 BuyScale=0.50，got %.4f", d.BuyScale)
+	}
+	// §DYN-SIZE v4：拆分读数必须**一并带出**，执行层靠它算目标仓位与单笔基准；
+	// 漏带会让目标层拿不到市场组读数（退潮 0.50 → 目标应为 50%）。
+	if math.Abs(d.MarketScale-0.50) > 1e-9 || math.Abs(d.StockScale-1.0) > 1e-9 {
+		t.Fatalf("Decision 应带出拆分读数 MS/SS，got %.4f/%.4f", d.MarketScale, d.StockScale)
 	}
 	if len(d.SizingReasons) == 0 {
 		t.Fatalf("应带定权原因")
@@ -375,5 +409,123 @@ func TestComputeSizingZeroConfigSafe(t *testing.T) {
 	res := ComputeSizing(Regime{}, baseSig())
 	if res.Scale != 1.0 {
 		t.Fatalf("零配置快照应恒 1.0，got %.4f", res.Scale)
+	}
+}
+
+// TestSizingMarketStockSplit §DYN-SIZE v4（方案 §1.4）：市场组决定目标仓位、个股组只决定单笔大小。
+// 根因回顾：旧 Scale 把两组混在一起，逐票漂移 ⇒ 账户级目标与 T 池都无法定义。
+// English: the v4 split — market group drives the account target, stock group drives this trade only.
+func TestSizingMarketStockSplit(t *testing.T) {
+	base := productRegime()
+	base.EmotionPhase = "退潮" // 市场组 0.50
+	base.IndexChangePct = 0  // 已知中性（避免 NaN 触发缺失判定）
+	baseRes := ComputeSizing(base, baseSig())
+	if math.Abs(baseRes.MarketScale-0.50) > 1e-12 {
+		t.Fatalf("市场组应为 0.50，got %.4f reasons=%v", baseRes.MarketScale, baseRes.Reasons)
+	}
+
+	// 同一市场下换成高波动票：StockScale 显著缩小，MarketScale 与目标仓位一分不动。
+	s := baseSig()
+	s.Price = 10
+	s.ATR = 0.6 // 6% 波动 → volFactor = VolTargetPct(2)/6 ≈ 0.333
+	wigRes := ComputeSizing(base, s)
+	if math.Abs(wigRes.MarketScale-baseRes.MarketScale) > 1e-12 {
+		t.Fatalf("个股因子不得拖动市场组：base=%.4f got=%.4f", baseRes.MarketScale, wigRes.MarketScale)
+	}
+	if math.Abs(wigRes.StockScale-1.0) < 1e-9 {
+		t.Fatalf("高波动票的 StockScale 必须小于 1.0，got %.4f", wigRes.StockScale)
+	}
+	// 期望值＝波动率目标因子按 [VolClampLo, VolClampHi] 夹取后的结果（夹取是刻意的，写死数字会随默认档漂移）
+	c := base.SizeCfg
+	want := c.VolTargetPct / 6.0
+	if want < c.VolClampLo {
+		want = c.VolClampLo
+	}
+	if want > c.VolClampHi {
+		want = c.VolClampHi
+	}
+	if math.Abs(wigRes.StockScale-want) > 1e-6 {
+		t.Fatalf("StockScale 应等于夹取后的波动率因子 %.4f，got %.4f", want, wigRes.StockScale)
+	}
+}
+
+// TestSizingBuyScaleMatchesLegacyScale §6.1 回归锁：product 路径在上限未触发时 BuyScale ≡ Scale。
+func TestSizingBuyScaleMatchesLegacyScale(t *testing.T) {
+	cases := []struct{ emotion, state string }{
+		{"", ""},
+		{"退潮", "range"},
+		{"发酵", "bull"},
+		{"高潮", "bear"},
+	}
+	for _, c := range cases {
+		r := productRegime()
+		r.EmotionPhase, r.MarketState, r.IndexChangePct = c.emotion, c.state, 0
+		res := ComputeSizing(r, baseSig())
+		if math.Abs(res.BuyScale()-res.Scale) > 1e-12 {
+			t.Fatalf("%s/%s BuyScale 应与改造前 Scale 逐字一致：buy=%.6f scale=%.6f",
+				c.emotion, c.state, res.BuyScale(), res.Scale)
+		}
+	}
+}
+
+// TestSizingMissingKeyInputCapsTarget §1.4 覆盖检查：关键市场读数缺失 ⇒ 目标封顶 0.50。
+// 反例（不封顶）：维度被 owner 主动关闭、或只是广度缺失（已另有 0.90 小降权，再计一次即双罚）。
+func TestSizingMissingKeyInputCapsTarget(t *testing.T) {
+	// 大盘断供（NaN）。
+	r := baseRegime()
+	r.IndexChangePct = math.NaN()
+	res := ComputeSizing(r, baseSig())
+	if !res.MissingKeyInput || math.Abs(res.MarketScale-0.50) > 1e-12 {
+		t.Fatalf("大盘 NaN 应封顶 0.50，got missing=%v ms=%.4f reasons=%v", res.MissingKeyInput, res.MarketScale, res.Reasons)
+	}
+	if math.Abs(res.StockScale-1.0) > 1e-12 {
+		t.Fatalf("封顶只作用于市场组，不该动个股组，got %.4f", res.StockScale)
+	}
+
+	// 状态机已启用却没有读数（真盲区）。
+	r2 := baseRegime()
+	r2.IndexChangePct, r2.MarketStateEnabled = 0, true
+	res2 := ComputeSizing(r2, baseSig())
+	if !res2.MissingKeyInput || math.Abs(res2.MarketScale-0.50) > 1e-12 {
+		t.Fatalf("状态机开启但无读数应封顶，got missing=%v ms=%.4f", res2.MissingKeyInput, res2.MarketScale)
+	}
+
+	// 情绪探测已配置但本轮未产出。
+	r3 := baseRegime()
+	r3.IndexChangePct, r3.EmotionEnabled = 0, true
+	res3 := ComputeSizing(r3, baseSig())
+	if !res3.MissingKeyInput {
+		t.Fatalf("情绪维度启用且缺失应标记 MissingKeyInput")
+	}
+
+	// 广度缺失不计关键缺失。
+	r4 := baseRegime()
+	r4.IndexChangePct, r4.BreadthUpRatio = 0, math.NaN()
+	res4 := ComputeSizing(r4, baseSig())
+	if res4.MissingKeyInput {
+		t.Fatalf("广度缺失不该触发关键输入封顶：reasons=%v", res4.Reasons)
+	}
+
+	// 两维都被主动关闭 ⇒ 不封顶（关功能 ≠ 看不清水位）。
+	r5 := baseRegime()
+	r5.IndexChangePct = 0
+	res5 := ComputeSizing(r5, baseSig())
+	if res5.MissingKeyInput || math.Abs(res5.MarketScale-1.0) > 1e-12 {
+		t.Fatalf("未启用的维度不应封顶，got missing=%v ms=%.4f", res5.MissingKeyInput, res5.MarketScale)
+	}
+}
+
+// TestSizingTotalPosCapMovedOut §1.6：总仓位上限不再是缩放乘子。
+// 它现在是目标仓位的定义（Tgt＝总资产×min(MS,1)），账户级拦截由 ordbudget 的 TargetRoom 负责；
+// 留在合成里会让半仓时恒等于 1.0（永不约束）而满仓时又把同一件事罚两次。
+func TestSizingTotalPosCapMovedOut(t *testing.T) {
+	r := baseRegime()
+	r.Account.TotalPosPct = 1.6 // 旧口径会把缩放压到 0.50
+	res := ComputeSizing(r, baseSig())
+	if math.Abs(res.Scale-1.0) > 1e-12 {
+		t.Fatalf("总仓位上限已移出合成，Scale 应保持 1.0，got %.4f reasons=%v", res.Scale, res.Reasons)
+	}
+	if strings.Contains(strings.Join(res.Reasons, "|"), "总仓位上限") {
+		t.Fatalf("理由串不应再出现总仓位上限：%v", res.Reasons)
 	}
 }
