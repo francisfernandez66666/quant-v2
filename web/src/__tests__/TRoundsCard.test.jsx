@@ -40,6 +40,11 @@ function paperView() {
       { step: 'step2', code: '600000', n: 3 },
     ],
     pnl: { net: 186.4, gross: 200.0, done_rounds: 2, fee_est_share: 0.5 },
+    // §T-COST B1/B5：成本分解与影子段（默认不可用＝没有对照，不是"做 T 没影响"）。
+    cost: { gross: 200, fee_buy: 5, fee_sell: 6.1, stamp_tax: 2.5, slip_cost: 1.2, net: 186.4,
+      fills: 4, unfilled: 0, fee_estimate_share: 0.5, participation_pct_p50: 0.02, participation_pct_max: 0.05 },
+    shadow_no_t: { day: '20261026', available: false, enabled: false,
+      reason: '当日没有影子账（sizing.t.shadow_no_t 未开启或开关开启后尚未采样）' },
   }
 }
 
@@ -111,6 +116,34 @@ describe('§DYN-T 做 T 卡：收益独立口径 / 损坏态 / 被拦分布', ()
     const idx4 = text().indexOf('日内口径不给')
     const idx2 = text().indexOf('当日次数已用尽')
     expect(idx4).toBeLessThan(idx2)
+  })
+
+  it('T7 成本分解一栏：毛/佣金/印花/滑点/净与 estimate 占比同屏', async () => {
+    render(<TRoundsCard />)
+    await settle()
+    expect(text()).toContain('佣金 11.10')
+    expect(text()).toContain('印花 2.50')
+    expect(text()).toContain('滑点成本 1.20')
+    expect(text()).toContain('净 186.40')
+    expect(text()).toContain('费用为估算入账占比 50%')
+  })
+
+  it('T8 做 T 归因：可用时画两线，不可用时只说"没有对照"而不是画一条 0 线', async () => {
+    render(<TRoundsCard />)
+    await settle()
+    expect(text()).toContain('做 T 归因不可得')
+    cleanup()
+    const base = paperView()
+    base.shadow_no_t = { day: '20261026', available: true, enabled: true, base_equity: 100000,
+      equity_real: 100186.4, equity_shadow: 100000, t_attribution: 186.4, t_attribution_pct: 0.1864,
+      mirrored: 2, skipped_t_legs: 2,
+      series: [{ ts: '2026-10-26T09:35:00+08:00', real: 100000, shadow: 100000 },
+        { ts: '2026-10-26T10:00:00+08:00', real: 100186.4, shadow: 100000 }] }
+    state.impl = { ...stubs('ok'), fetchPaperTRounds: () => base }
+    render(<TRoundsCard />)
+    await settle()
+    expect(text()).toContain('做 T 归因（真实−影子）：186.40')
+    expect(document.querySelectorAll('svg polyline').length).toBe(2)
   })
 
   it('T5 未注入定权时显示"本轮尚未定权"，绝不把 market_scale=0 渲染成中性 1.00', async () => {

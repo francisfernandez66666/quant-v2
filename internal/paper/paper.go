@@ -26,6 +26,7 @@ import (
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/ordbudget"
+	"quant-trading-v2/internal/signalctl"
 )
 
 // LimitUpPct §R6 分板块涨停封板近似阈值（实时涨幅 ≥ 该值视为封板拒买）。
@@ -584,6 +585,13 @@ type Engine struct {
 	// (fill stream) and orders (order lifecycle) because it answers a third question: whether two fills
 	// belong to the same round and what spread was locked.
 	tRounds []TRound
+	// shadowNoTOn / shadowNoT §T-COST B5（2026-10-27）"不做 T"影子账开关与状态。
+	// 开关由 engine 每轮从账号级 sizing.t.shadow_no_t 注入（热生效）；状态只被镜像/采样/读数组装
+	// 触碰，**任何判定（Room/预算/风控）都不得读取**——那是这套对照实验成立的前提。
+	// English: §T-COST B5 no-T shadow switch/state; never read by any decision path, only mirroring,
+	// sampling and the readout (see t_shadow_no_t.go).
+	shadowNoTOn bool
+	shadowNoT   *tShadowNoTBook
 	// tCfgWarnDay §8.8 配置自洽告警（min_spread 与振幅门打架）的每日一次去重。刻意与下面的
 	// tWarnDay 分开：两把闸在同一个启动日各自都可能要出声，共用一个 latch 会让先响的那条把后响的吞掉。
 	tCfgWarnDay string
@@ -1500,6 +1508,10 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 				fmt.Sprintf("%v", err))
 			continue
 		}
+		// B5：策略信号买入是"非 T 成交"的主力，影子账按成交价/股数逐笔镜像（显式调用点）。
+		if p := e.positions[s.Code]; p != nil {
+			e.tShadowMirrorBuyLocked(s.Code, e.applyBuyPriceLocked(price), p.Qty, now)
+		}
 		// 买入拒绝去重表同步清除：该码已成交，后续同码不再按旧原因去重。
 		// English: clear the reject-dedup entry — this code filled, later rejects must re-audit.
 		if e.lastBuyReject != nil {
@@ -1582,6 +1594,8 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 			// 残量登记为次日无条件执行的退出意图（Q6：退出是风险裁决，敞口挂着比卖早了更贵）。
 			e.recordPendingExitLocked(s.Code, want-sold, pendingExitClose, reason, time.Now())
 		}
+		// B5：卖出裁决执行是非 T 成交（影子账只跳过 T 腿，不跳过退出）。
+		e.tShadowMirrorSellLocked(s.Code, e.applySellPriceLocked(price), sold, time.Now())
 	case "trim":
 		today := cntime.DayCompactOf(time.Now()) // §TZ1
 		if e.trimDone[s.Code] == today {
@@ -1634,6 +1648,8 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 		}
 		e.recordOrderLocked(func() Order { o := mkOrder("partial", sold); o.Price = price; return o }())
 		e.trimDone[s.Code] = today
+		// B5：减仓同属卖出裁决执行，影子账镜像。
+		e.tShadowMirrorSellLocked(s.Code, e.applySellPriceLocked(price), sold, time.Now())
 		// 残量槽与 trimDone 互不吞（3.3）：本日的减仓槽已被这半仓用掉，残量走独立意图队列次日执行。
 		if sold < half {
 			e.recordPendingExitLocked(s.Code, half-sold, pendingExitTrim, reason, time.Now())
@@ -1703,10 +1719,19 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 	if cash <= 0 {
 		return 0, "池现金不足"
 	}
-	scale := 1.0
+	// k = 信号带下来的合成因子（BuyScale = MS×SS）。0 与 1.0 都表示"没有缩放"（中性）：
+	// 0 是 Signal 的零值（未定权），1.0 是显式中性——两者必须同义，否则"没定权"会被读成
+	// "因子全灭"，单笔从 30% 掉到 10%（flow_scale_test 钉的就是这条）。
+	k := 1.0
 	if e.cfg.SizingEnabled && !e.cfg.SizingShadow && sizeScale > 0 {
-		scale = sizeScale
+		k = sizeScale
 	}
+	// §B0 单笔占比：与实盘同一实现点（signalctl.PerTradePctOf），**不再** `perTradePct × k`。
+	// 旧的 `0.10 × MS×SS` 是二次计权（eff 里已经含 k），同一条信号纸面 6.7%、实盘 23%，
+	// 两本账的金额差 3 倍而各自的收益曲线都"正常"——那种漂移无法从读数上发现。
+	perTradeLo, perTradeHi := perTradeBandOf(e.sizingCtx)
+	perTradePct := signalctl.PerTradePctOf(k, perTradeLo, perTradeHi)
+	e.sizingCtx.LastK = k // 只服务展示面（面板回显"这一轮实际按多少买"）
 	ind := ""
 	if e.industryOf != nil {
 		ind = strings.TrimSpace(e.industryOf(code))
@@ -1765,10 +1790,6 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 	if room < 0 {
 		room = 0
 	}
-	perTradePct := e.sizingCtx.PerTradePct
-	if perTradePct <= 0 || perTradePct > 1 {
-		perTradePct = 0.10 // 与出厂默认同值；>1 是把 10% 写成 10 的手滑，钳回默认而不是放大成满池
-	}
 	// 影子期 / 关键输入缺失 / engine 未注入 MS ⇒ **不收紧**（只留痕）：观察期不是执法期，
 	// 未注入时保持 v3 行为可回归（老测试与纯内存账本走这条路）。
 	roomSet := e.cfg.SizingEnabled && !e.cfg.SizingShadow && !e.sizingCtx.MissingKey && ms > 0
@@ -1778,9 +1799,10 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 		avail = 0
 	}
 	res := ordbudget.Compute(ordbudget.Inputs{
-		Base:              base,
-		CapEquity:         capEq,
-		Scale:             perTradePct * scale,
+		Base:      base,
+		CapEquity: capEq,
+		// §B0：Scale 直接就是 eff（含 k），**不许**再乘 k——那是二次计权（见上面 perTradePct 的注释）。
+		Scale:             perTradePct,
 		Price:             price,
 		Cash:              avail,
 		Lot:               ordbudget.DefaultLot,
@@ -1802,16 +1824,52 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 // paperSizingCtx engine 每轮注入的定权上下文（见 Engine.sizingCtx）。
 type paperSizingCtx struct {
 	MarketScale float64 // 市场组读数（目标仓位与 T 额度由它派生）；0=未注入
-	PerTradePct float64 // 单笔基准仓位（占池权益）
-	Ceiling     float64 // 目标仓位天花板（默认 1.00）
-	MissingKey  bool    // 关键市场读数缺失（目标封顶半仓、日内 T 关闭）
+	// PerTradeLo/PerTradeHi 单笔占比的动态区间（§B0：owner 2026-10-27 定 10%~30%）。
+	// 生效值 = signalctl.PerTradePctOf(k, lo, hi)，k = 信号上带下来的 BuyScale（= MS×SS）。
+	// 为什么纸面也要这条：两本账的单笔口径必须同源，否则纸面按 10%×MS×SS、实盘按 23%~26%，
+	// 同一条信号在两本账里买到差 3 倍的金额——纸面读数就无法用来解释实盘（§11.3 的"两套口径"禁忌）。
+	PerTradeLo float64
+	PerTradeHi float64
+	// LastK 最近一笔信号带下来的合成因子 k（只服务展示面：面板要回显"这一轮实际按多少买"）。
+	// 0 = 还没见过任何带缩放的信号，展示面按中性 k=1.0 算并标注"最近一笔"。
+	LastK      float64
+	Ceiling    float64 // 目标仓位天花板（默认 1.00）
+	MissingKey bool    // 关键市场读数缺失（目标封顶半仓、日内 T 关闭）
+}
+
+// perTradeBandOf 归一单笔占比区间的两端（纸面唯一实现点，下单路径与展示面共用）。
+//
+// 归一规则与实盘 dynamicBuyQty 逐字同参：`lo<=0 || lo>1 → 0.10`、`hi<=0 → 0.30`。
+// 为什么 >1 回落 0.10 而不是钳到 0.50：把"10%"写成"10"是手滑，按 0.50 执行等于把一次手滑
+// 放大成"单笔半个账户"——资金参数的手滑必须往**小**的方向兜，这与 PerTradePctOf 内部的
+// 硬夹（≤0.50）分工不同：那个夹是防上游算出离谱值，这里的回落是防人填错。
+// hi<lo 时抬 hi 到 lo（区间反了不把单笔缩成 0，与 PerTradePctOf 同向）。
+// English: normalizes the per-trade band exactly like the live path; a typo'd lo (>1) falls back
+// to 0.10 rather than the 0.50 hard clamp, because a funds typo must fail small.
+func perTradeBandOf(ctx paperSizingCtx) (lo, hi float64) {
+	lo, hi = ctx.PerTradeLo, ctx.PerTradeHi
+	if lo <= 0 || lo > 1 {
+		lo = 0.10
+	}
+	if hi <= 0 {
+		hi = 0.30
+	}
+	if hi > 1 {
+		hi = 0.50 // 硬边界：单笔不过半仓（与 PerTradePctOf 的夹取同值）
+	}
+	if hi < lo {
+		hi = lo
+	}
+	return lo, hi
 }
 
 // SetSizingContext 注入本轮定权上下文（engine 的纸面通道每轮调用）。
 // 刻意不持久化：它描述的是"这一轮的市场"，不是"用户的配置"。
-func (e *Engine) SetSizingContext(ms, perTradePct, ceiling float64, missingKey bool) {
+// lo/hi 是单笔占比的动态区间；传 0 表示该端缺失，由 perTradeBandOf 回落到出厂值（10% / 30%）。
+func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool) {
 	e.mu.Lock()
-	e.sizingCtx = paperSizingCtx{MarketScale: ms, PerTradePct: perTradePct, Ceiling: ceiling, MissingKey: missingKey}
+	e.sizingCtx = paperSizingCtx{MarketScale: ms, PerTradeLo: perTradeLo, PerTradeHi: perTradeHi,
+		Ceiling: ceiling, MissingKey: missingKey}
 	e.mu.Unlock()
 }
 
@@ -2080,6 +2138,8 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 				Kind: "手动加仓", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 			return err
 		}
+		// B5：非 T 加仓镜像（显式调用点；T 腿走 addToPositionLocked 的另一条调用路径，不在这里）。
+		e.tShadowMirrorBuyLocked(code, e.applyBuyPriceLocked(price), q, time.Now())
 		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: p.StrategyType, Side: "buy",
 			Kind: "手动加仓", SignalPrice: signalPrice, Price: price, Qty: q, Status: "filled", Reason: "动态仓位加仓"})
 		e.mirrorOpenLocked(p)
@@ -2108,6 +2168,8 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 		Kind: "手动买入", SignalPrice: signalPrice, Price: price, Qty: e.positions[code].Qty,
 		Status: "filled", Reason: reason})
+	// B5：手动买入同样是非 T 成交，影子账必须逐笔对齐（否则对照的前提当场不成立）。
+	e.tShadowMirrorBuyLocked(code, e.applyBuyPriceLocked(price), e.positions[code].Qty, time.Now())
 	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil
@@ -2144,7 +2206,11 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	defer e.mu.Unlock()
 	// 已持有则加仓；满仓/手数非法/无价时拒绝，价格缺省取 quote 实时价。
 	if p, held := e.positions[code]; held {
-		return e.addToPositionLocked(p, code, name, strategy, signalPrice, price, qty, "手动模拟加仓")
+		if err := e.addToPositionLocked(p, code, name, strategy, signalPrice, price, qty, "手动模拟加仓"); err != nil {
+			return err
+		}
+		e.tShadowMirrorBuyLocked(code, e.applyBuyPriceLocked(price), qty, time.Now())
+		return nil
 	}
 	if !e.dynamicBudgetOn() && e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 		return errMaxPos
@@ -2180,6 +2246,8 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 		Kind: "手动买入", SignalPrice: signalPrice, Price: price, Qty: e.positions[code].Qty,
 		Status: "filled", Reason: reason})
+	// B5：手动买入同样是非 T 成交，影子账必须逐笔对齐（否则对照的前提当场不成立）。
+	e.tShadowMirrorBuyLocked(code, e.applyBuyPriceLocked(price), e.positions[code].Qty, time.Now())
 	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil
@@ -2316,6 +2384,11 @@ func (e *Engine) Snapshot(now time.Time) {
 	// §SHORT-3 净值并入做空侧（shortCash + 担保占用 + 浮动盈亏，见 shortEquityLocked）。
 	// English: §SHORT-3 — total equity includes the short book (cash + frozen margin + floating P&L).
 	val := e.cash + mv + e.shortEquityLocked()
+	// §T-COST B5：每轮估值给影子账落一个点（与真实净值同频）。放在"值没变就不写"之前——
+	// 真实权益不动时影子账仍可能因跳过 T 腿而偏离，早退会让归因曲线出现整段空洞。
+	if e.shadowNoTOn {
+		e.tShadowSampleLocked(now)
+	}
 	if len(e.equity) > 0 && e.equity[len(e.equity)-1].Date == date {
 		last := &e.equity[len(e.equity)-1]
 		if last.Value == val && last.Cash == e.cash {
@@ -2371,6 +2444,8 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 		}
 		e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
 			Side: "sell", Kind: "手动卖出", Price: price, Qty: sold, Status: status, Reason: "手动模拟卖出"})
+		// B5：手动卖出也是非 T 成交，影子账逐笔镜像（否则对照前提不成立）。
+		e.tShadowMirrorSellLocked(code, e.applySellPriceLocked(price), sold, time.Now())
 		e.persist()
 	}
 	return err
@@ -2418,6 +2493,7 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 			}
 			e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
 				Side: "sell", Kind: "手动卖出", Price: price, Qty: sold, Status: status, Reason: "手动模拟卖出"})
+			e.tShadowMirrorSellLocked(code, e.applySellPriceLocked(price), sold, time.Now())
 			e.persist()
 		}
 		return err
@@ -2426,16 +2502,25 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 	if err == nil {
 		e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
 			Side: "sell", Kind: "手动减仓", Price: price, Qty: sold, Status: "partial", Reason: "手动模拟减仓"})
+		e.tShadowMirrorSellLocked(code, e.applySellPriceLocked(price), sold, time.Now())
 		e.persist()
 	}
 	return err
 }
 
-// applySellPriceLocked §R2 卖出滑点下浮成交（与买入上浮对称；0=不启用）。
-// English: applies sell-side slippage (price marked down, symmetric to the buy-side markup).
+// applySellPriceLocked 卖出滑点（价下浮）；返回成交价（须持锁调用）。
 func (e *Engine) applySellPriceLocked(price float64) float64 {
 	if e.cfg.SlippageBps > 0 {
 		return price * (1 - e.cfg.SlippageBps/10000.0)
+	}
+	return price
+}
+
+// applyBuyPriceLocked 买入滑点（价上浮）；返回成交价（须持锁调用）。
+// B5 影子镜像要用**与真实成交同一口径**的价格：直接搬 quote 价会让"非 T 成交逐笔相等"假红。
+func (e *Engine) applyBuyPriceLocked(price float64) float64 {
+	if e.cfg.SlippageBps > 0 {
+		return price * (1 + e.cfg.SlippageBps/10000.0)
 	}
 	return price
 }

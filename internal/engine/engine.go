@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"quant-trading-v2/internal/cluster"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
@@ -80,6 +81,14 @@ type Engine struct {
 	// English: test seam for industry lookup used by the v3 dynamic budget; production leaves it nil
 	// and falls back to marketAPI.GetStockIndustry.
 	industryFn func(code string) string
+	// clusterCache §T-COST B3 日收益序列的日级缓存（见 cluster_gate.go）。
+	// 独立锁：这里要发 SQL，不能把引擎主锁按在磁盘 IO 上。
+	// English: §T-COST B3 per-trading-day cache of daily returns; own lock because it does SQL.
+	clusterCache clusterReturnCache
+	// clusterLoad §T-COST B3 收益序列加载的测试缝：非空时替代 loadClusterSeries
+	// （生产恒 nil，走真实日线；单测用它构造"两只高度相关/一只缺数据"的确定性场景）。
+	// English: test seam replacing the daily-return loader; production leaves it nil.
+	clusterLoad func(code string) (cluster.Series, bool, bool)
 	// §MARKET_RISK_GATE P0 风险盘口主源：注入多源协调器后，涨停池等盘口统计走 hithink 主源、
 	// 东财兜底；未注入（nil）或 riskHithink=false 时全部回落旧的 e.marketAPI 东财直连。
 	// English: multi-source coordinator for the risk boards — once injected, board stats route
@@ -1667,6 +1676,20 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 
 	targetInd := industryOf(sig.Code)
 
+	// ── §T-COST B3 相关性簇（2026-10-27）──────────────────────────────────────────
+	// 单票 35% / 行业 35% 管不住"不同行业、走势却几乎一样"的三四只票（同一轮主题的
+	// 龙头/跟风/补涨）。簇帽把"同一注赌注"的合计敞口钉在 ClusterCapPct（默认 40%）。
+	// 值口径与上面两道帽**完全同源**（stockVal 已含在途与 T 腿），所以四道帽之间不会
+	// 出现"这个算 T 腿、那个不算"的口径分裂。
+	// 取小不叠乘：ordbudget 里簇额度与其它三道帽是 min 关系，不是乘积（见那里的注释）。
+	// English: §T-COST B3 cluster cap — same value basis as the industry/stock caps, min()'d
+	// with them in ordbudget (never multiplied).
+	clusterCap := sizingCfg.ClusterCapPctOf()
+	clusterRead := clusterGateRead{Reason: "cluster_cap_pct=0（关闭）"}
+	if clusterCap > 0 {
+		clusterRead = e.clusterGateFor(sig.Code, stockVal, industryOf, clusterCap, sizingCfg.ClusterRhoOf())
+	}
+
 	// ── §DYN-SIZE v4：目标仓位层（方案 §1.4）────────────────────────────────────────
 	// 把"市场组决定目标总仓位、个股组决定这一笔大小"分开算，是本批的核心修复：
 	// 旧模型里 Scale 既当预算倍数又混着个股因子，中性 1.0 时一笔可吃掉半个账户。
@@ -1745,6 +1768,11 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		FeeBufferPct:      0.6,
 		TargetRoom:        room,
 		TargetRoomSet:     targetRoomSet,
+		// §T-COST B3：簇额度（与上面三道帽取小）。ClusterSet 单列是因为"簇值恰为 0"
+		// 是有效读数（这簇还没有别的仓位），不能与"未启用"混为一谈。
+		ClusterCapPct: clusterCap,
+		ClusterValue:  clusterRead.Value,
+		ClusterSet:    clusterRead.Applied,
 	})
 	// §DYN-TARGET 留痕：目标/当前/剩余/拆分缩放一次打全，事后能否解释"为什么只买了这些"全靠这行。
 	log.Printf("[qmt] %s(%s) §DYN-TARGET 总资产=%.0f MS=%.3f SS=%.3f 缩放=%.3f 目标=%.0f(占比%.3f 天花板%.2f) 战略当前=%.0f 正T买腿=%.0f 反T卖腿=%.0f 剩余=%.0f 单笔基准=%.2f 影子目标占比=%.2f 缺失关键输入=%v",
@@ -1757,16 +1785,25 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		log.Printf("[qmt] %s(%s) §DYN-TARGET 影子期读数：目标=%.0f 剩余=%.0f（不收紧，仅留痕）", sig.Code, sig.Name, targetVal, room)
 	}
 	if res.SkipReason != "" {
-		log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 跳过：%s（总资产=%.0f 缩放=%.3f 行业=%q 行业额度=%.0f 单票额度=%.0f 现金=%.0f）",
-			sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash)
+		log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 跳过：%s（总资产=%.0f 缩放=%.3f 行业=%q 行业额度=%.0f 单票额度=%.0f 现金=%.0f 簇额度=%.0f 簇已用=%.0f）",
+			sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash,
+			res.ClusterRoom, clusterRead.Value)
 		opslog.DayOnce("dynbudget-skip:"+sig.Code, func() {
-			opslog.Logf("quant", "§DYN-SIZE-v3 跳过 %s(%s) 原因=%s 总资产=%.0f 缩放=%.3f 行业=%s 行业额度=%.0f 单票额度=%.0f 现金=%.0f 策略=%s/%s",
-				sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash, sig.StrategyID, sig.Strategy)
+			opslog.Logf("quant", "§DYN-SIZE-v3 跳过 %s(%s) 原因=%s 总资产=%.0f 缩放=%.3f 行业=%s 行业额度=%.0f 单票额度=%.0f 现金=%.0f 簇额度=%.0f 簇已用=%.0f 策略=%s/%s",
+				sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash,
+				res.ClusterRoom, clusterRead.Value, sig.StrategyID, sig.Strategy)
 		})
 		return 0
 	}
 	log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 预算 qty=%d 金额=%.0f（总资产=%.0f 缩放=%.3f 约束=%s 行业=%q 行业额度=%.0f 单票额度=%.0f）",
 		sig.Code, sig.Name, res.Qty, res.Notional, total, scale, res.CappedBy, targetInd, res.IndustryRoom, res.StockRoom)
+	// §T-COST B3 簇帽留痕：只在"真参与了预算"时打一行，把簇 id / 成员 / 已用值 / 剩余额度一次写全。
+	// 事后要回答"这单为什么被拦"必须能只看这一行（簇帽的判据是别的票，不是这只票本身）。
+	if clusterRead.Applied {
+		log.Printf("[qmt] %s(%s) §T-CLUSTER 簇=%s 成员=%s 簇已用=%.0f 簇额度=%.0f 上限=%.0f%% 缺读数对=%d 约束=%s",
+			sig.Code, sig.Name, clusterRead.ClusterID, strings.Join(clusterRead.Members, ","),
+			clusterRead.Value, res.ClusterRoom, clusterCap, clusterRead.Unknown, res.CappedBy)
+	}
 	opslog.DayOnce("dynbudget:"+sig.Code, func() {
 		opslog.Logf("quant", "§DYN-SIZE-v3 预算 %s(%s) qty=%d 金额=%.0f 总资产=%.0f 缩放=%.3f 约束=%s 行业=%s 行业额度=%.0f 单票额度=%.0f 策略=%s/%s",
 			sig.Code, sig.Name, res.Qty, res.Notional, total, scale, res.CappedBy, targetInd, res.IndustryRoom, res.StockRoom, sig.StrategyID, sig.Strategy)

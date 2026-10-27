@@ -51,7 +51,7 @@ func TestTargetReadoutScaleIsNotFaked(t *testing.T) {
 	}
 
 	// ② 注入正常读数：目标 = 总资产 × min(MS, 天花板)，Room = 目标 − 战略当前。
-	e.SetSizingContext(0.60, 0.10, 1.00, false)
+	e.SetSizingContext(0.60, 0.10, 0.30, 1.00, false)
 	r := e.TargetReadout()
 	if r.MarketScale != 0.60 || r.RatioUsed != 0.60 {
 		t.Fatalf("MS 应原样透出并按 min 生效，got ms=%.3f ratio=%.3f", r.MarketScale, r.RatioUsed)
@@ -72,18 +72,27 @@ func TestTargetReadoutScaleIsNotFaked(t *testing.T) {
 	}
 
 	// ③ 天花板归一必须与下单路径同参：>1 是"把 100% 写成 100"的手滑，钳回 1.0 而不是当成 100 倍。
-	e.SetSizingContext(0.60, 0.10, 100, false)
+	e.SetSizingContext(0.60, 0.10, 0.30, 100, false)
 	if r2 := e.TargetReadout(); r2.Ceiling != 1.00 || r2.RatioUsed != 0.60 {
 		t.Fatalf("天花板 >1 必须钳回 1.0（与 dynamicPaperQtyLocked 同参），got ceiling=%.2f ratio=%.3f", r2.Ceiling, r2.RatioUsed)
 	}
-	// 单笔基准 >1 同样是手滑，但它钳回的是**出厂 0.10**而不是 1.0——按 1.0 就等于允许单笔吃满全账户。
-	e.SetSizingContext(0.60, 10, 1.00, false)
-	if r3 := e.TargetReadout(); r3.PerTradePct != 0.10 {
-		t.Fatalf("per_trade_pct>1 必须钳回出厂 0.10，got %.3f", r3.PerTradePct)
+	// 单笔占比 >1 是手滑（把 10% 写成 10）：下限必须回落到**出厂 0.10**而不是按 1.0 执行，
+	// 上限则被硬夹在 0.50（单笔不过半仓）。两端的兜底方向必须相反：手滑往小兜、越界往边界夹。
+	e.SetSizingContext(0.60, 10, 10, 1.00, false)
+	if r3 := e.TargetReadout(); r3.PerTradeLo != 0.10 || r3.PerTradeHi != 0.50 {
+		t.Fatalf("单笔区间 >1 应 lo→0.10 / hi→0.50，got lo=%.3f hi=%.3f", r3.PerTradeLo, r3.PerTradeHi)
 	}
-	e.SetSizingContext(0.60, 0, 0, false)
-	if r4 := e.TargetReadout(); r4.Ceiling != 1.00 || r4.PerTradePct != 0.10 {
-		t.Fatalf("两键缺失都必须吃到厂默认（1.00 / 0.10），got ceiling=%.2f per=%.2f", r4.Ceiling, r4.PerTradePct)
+	// 两键缺失 ⇒ 吃到厂默认区间 10%~30%，eff 按中性 k=1.0 取上限 0.30（与实盘"读数全缺→eff=hi"同向）。
+	e.SetSizingContext(0.60, 0, 0, 0, false)
+	if r4 := e.TargetReadout(); r4.Ceiling != 1.00 || r4.PerTradeLo != 0.10 || r4.PerTradeHi != 0.30 {
+		t.Fatalf("两键缺失都必须吃到厂默认（天花板 1.00 / 区间 0.10~0.30），got ceiling=%.2f lo=%.2f hi=%.2f",
+			r4.Ceiling, r4.PerTradeLo, r4.PerTradeHi)
+	}
+	// eff 回显的是**生效值**：k 未观测（LastK=0）按中性 1.0 ⇒ eff=hi=0.30，而 per_trade 随之放大。
+	// 旧口径回显 0.10 而实际按 30% 买，正是本批要消灭的面板假读数。
+	if r5 := e.TargetReadout(); r5.PerTradePct != 0.30 || r5.PerTrade != round2(r5.Total*0.30) {
+		t.Fatalf("per_trade 必须回显 eff（0.30）且等于 Total×eff，got pct=%.3f per=%.2f total=%.2f",
+			r5.PerTradePct, r5.PerTrade, r5.Total)
 	}
 }
 
@@ -96,7 +105,7 @@ func TestTargetReadoutSellCapDenominatorIsMinTotalAndValue(t *testing.T) {
 	e.mu.Lock()
 	e.cash = 60
 	e.mu.Unlock()
-	e.SetSizingContext(0.80, 0.10, 1.00, false)
+	e.SetSizingContext(0.80, 0.10, 0.30, 1.00, false)
 	r := e.TargetReadout()
 	if r.Total != 100 || r.MarketValue != 40 {
 		t.Fatalf("账本前提不符（应 总资产100/市值40），got total=%.2f mv=%.2f", r.Total, r.MarketValue)
@@ -111,7 +120,7 @@ func TestTargetReadoutSellCapDenominatorIsMinTotalAndValue(t *testing.T) {
 	e2.mu.Lock()
 	e2.cash = 5
 	e2.mu.Unlock()
-	e2.SetSizingContext(0.80, 0.10, 1.00, false)
+	e2.SetSizingContext(0.80, 0.10, 0.30, 1.00, false)
 	if r2 := e2.TargetReadout(); r2.SellCapBase != 95 {
 		t.Fatalf("高仓形态分母仍应取较小值（持仓市值 95），got %.2f", r2.SellCapBase)
 	}
@@ -131,7 +140,7 @@ func TestTargetReadoutCountsOpenTLegsBothDirections(t *testing.T) {
 			LegQty: 2000, LegPrice: 9.0, State: tRStateOpen, Day: "20261027", FrozenCash: 18108},
 	}
 	e.mu.Unlock()
-	e.SetSizingContext(0.80, 0.10, 1.00, false)
+	e.SetSizingContext(0.80, 0.10, 0.30, 1.00, false)
 
 	r := e.TargetReadout()
 	if r.OpenBuyLegs != 12000 || r.OpenSellLegs != 18000 {
@@ -155,7 +164,7 @@ func TestTargetReadoutCountsOpenTLegsBothDirections(t *testing.T) {
 		t.Fatalf("当日开腿/在途计数应各为 2，got opened=%d open=%d", r.RoundsOpened, r.OpenLegs)
 	}
 	// 盲区（关键读数缺失）要如实透出，面板据此显示"今日不做 T"而不是照算目标。
-	e.SetSizingContext(0.80, 0.10, 1.00, true)
+	e.SetSizingContext(0.80, 0.10, 0.30, 1.00, true)
 	if r2 := e.TargetReadout(); !r2.MissingKeyInput {
 		t.Fatalf("missing_key_input 必须原样透出，got %v", r2.MissingKeyInput)
 	}

@@ -4,7 +4,7 @@
 //
 //	raw       = Base × Scale
 //	if raw < OneLot: raw = OneLot
-//	room      = min(raw, 目标仓位剩余空间, 行业剩余额度, 单票剩余额度)
+//	room      = min(raw, 目标仓位剩余空间, 行业剩余额度, 单票剩余额度, 相关性簇剩余额度)
 //	if room < OneLot: 跳过
 //	qty       = floor(room / Price / Lot) × Lot
 //	qty       = min(qty, 现金可负担整手)
@@ -12,8 +12,9 @@
 // 关键纪律：
 //   - 1 手地板不能突破任何额度（含目标仓位剩余空间）；额度不足 1 手就跳过；
 //   - 行业未知时禁用行业额度，但单票额度始终参与；
+//   - 四道额度**一律取小**，绝不连乘（连乘会把多个帽同时收紧数倍，那是另一种事故）；
 //   - 所有金额向下取整到整手；
-//   - 纯函数、无 IO，调用方负责把在途委托计入 TargetRoom/IndustryValue/StockValue。
+//   - 纯函数、无 IO，调用方负责把在途委托计入 TargetRoom/IndustryValue/StockValue/ClusterValue。
 //
 // English: shared pure buy-budget calculator for live and paper. Dynamic sizing is the sole
 // budget authority; 35% industry/single-stock rooms shrink the order instead of rejecting it,
@@ -68,6 +69,18 @@ type Inputs struct {
 	// English: enables TargetRoom; a bool is required because an exact zero is a valid
 	// "no room left, skip" reading and must not collide with the disabled zero value.
 	TargetRoomSet bool
+	// ClusterCapPct §T-COST B3 相关性簇上限百分数（默认 40）；<=0 表示不启用。
+	// 簇＝"同一注赌注"（ρ≥0.7 或同行业，见 internal/cluster），它管的是单票/行业帽管不到的
+	// "不同行业、走势却一样"的集中。
+	// English: §T-COST B3 correlation-cluster cap (default 40%); <=0 disables it.
+	ClusterCapPct float64
+	// ClusterValue 该簇当前市值（含在途委托，**不含**本次要买的那只）。
+	ClusterValue float64
+	// ClusterSet 是否启用簇额度。与 TargetRoomSet 同理：簇值恰为 0 是"这簇还没有仓位"的
+	// 有效读数，不能和"未启用"混为一谈。
+	// English: enables the cluster room; a bool is required because an exact zero is a valid
+	// "no cluster exposure yet" reading.
+	ClusterSet bool
 }
 
 // Result 预算结果。
@@ -83,13 +96,15 @@ type Result struct {
 	StockRoom float64
 	// TargetRoom 目标仓位剩余空间（未启用为 0）。
 	TargetRoom float64
+	// ClusterRoom 相关性簇剩余额度（未启用为 0）。
+	ClusterRoom float64
 	// Budget 最终预算（= Notional）。
 	Budget float64
 	// Qty 最终整手股数。
 	Qty int
 	// Notional 最终成交额（Qty×Price）。
 	Notional float64
-	// CappedBy 最终约束来源：dynamic / one_lot_floor / industry / stock / target / cash / none。
+	// CappedBy 最终约束来源：dynamic / one_lot_floor / industry / stock / target / cluster / cash / none。
 	CappedBy string
 	// SkipReason 非空表示不下单（额度不足1手/现金不足/参数不可得）。
 	SkipReason string
@@ -163,6 +178,21 @@ func Compute(in Inputs) Result {
 		}
 	}
 
+	// 相关性簇额度（§T-COST B3）：与上面三道帽**取小、不连乘**。
+	// 为什么必须取小：簇帽 40% 与行业帽 35% 连乘＝14%，等于把两个帽同时收紧三倍——那是另一种事故，
+	// 而且事后从日志上只会看到"额度莫名其妙只剩一点"。取小的语义才是"哪条先撞上就用哪条"。
+	// 簇值恰为 0 是有效读数（这簇还没有仓位），因此用 ClusterSet 而不是 >0 判断是否启用。
+	// English: the cluster room takes the min with the other three caps — never a product
+	// (40%×35% = 14% would silently tighten both caps threefold). An exact zero is valid.
+	if in.ClusterSet && in.ClusterCapPct > 0 {
+		room := roomOf(in.ClusterCapPct, in.CapEquity, in.ClusterValue)
+		res.ClusterRoom = room
+		if room < budget {
+			budget = room
+			capped = "cluster"
+		}
+	}
+
 	// 额度不足 1 手 → 跳过：1 手地板只是抬升 raw 的手段，绝不允许反噬 35% 额度。
 	// English: below one lot the buy is skipped — the one-lot floor may raise raw but can never
 	// override the 35% rooms.
@@ -171,9 +201,14 @@ func Compute(in Inputs) Result {
 		res.CappedBy = capped
 		// 目标空间不足 1 手时给出可读原因；否则沿用额度不足文案。
 		// English: a target-room shortfall gets its own reason so "already at target" is visible.
-		if capped == "target" {
+		switch capped {
+		case "target":
 			res.SkipReason = "已达动态目标仓位"
-		} else {
+		case "cluster":
+			// 簇额度不足单独给原因：面板上"因为同一注赌注已经够了"和"额度不够 1 手"是两件事，
+			// 混成一句会让 owner 无从判断该调簇帽还是调单票帽。
+			res.SkipReason = "已达相关性簇上限"
+		default:
 			res.SkipReason = "额度不足1手"
 		}
 		return res

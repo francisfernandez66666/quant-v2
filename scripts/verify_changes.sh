@@ -15608,4 +15608,414 @@ rm -rf "$W132"
 echo "INFO - §132 覆盖面账：① 指数日线 MA 斜率的**本地兜底**（读 index_daily 算斜率）本批未做——今天东方财富 K 线接口在本机与现网都返回空，斜率只能弃权；状态机的质量闸已经把这种情况降级为 range，斜率本身并进 B2 的数据面一起修。② 日内急杀目前用「当日累计跌幅」近似，30 分钟窗口的加速度判据（与 T 的 market_plunge 完全同源）也要等 B2 的分时读数。③ 状态机质量目前只进日志与 /api/status 语义，前端徽标未加（避免本批再动契约）。"
 echo "ok - §132 §BUG-INDEX/STATE/SIGPRICE 锁通过（静态 19 道 + 行为腿 5 枚 + 反证 2 枚，累计判定点 ${CNT132}）"
 [ "$B132_FAILED" = "0" ] || exit 1
+# ============================================================================
+# §133 §T-COST B1 T 成本分解锁（十字段 / 分项自洽 / 滑点符号 / 分母口径 / 机会成本不进净额）
+#
+# 这一段只锁"账本能不能回答『这轮 T 的钱花在哪』"，**不改任何判定**——B1 的定位就是只加字段。
+# 五条：
+#   ① 两本账（纸面 TRound / 实盘 TRoundLive）的十字段 json tag 必须**完全同集**。一边加、
+#      另一边没加，面板上就会出现"实盘有成本分解、纸面没有"，复盘时两个数字对不上；
+#   ② 分项自洽：net = gross − fee_buy − fee_sell − stamp_tax。写成"gross − 合计费用"就不算：
+#      那样三个分项里任何一个算错都看不出来（合计对得上就行），分项等于白记；
+#   ③ 滑点符号**按腿取**：买腿成交价高于决策价是不利（正），卖腿反之。一刀切会让反 T 整片
+#      "负滑点"，而负滑点会被读成"执行比决策更好"——最容易被当成好消息的假读数；
+#   ④ 参与率分母＝开腿当时**已累计**的当日成交额，不是全天量（全天量是未来数据，
+#      拿它当分母会把每一腿都系统性算小）；
+#   ⑤ 未成交的"机会成本"绝不进净额：反事实不可观测，只在 B2 离线标定里估（§2.2）。
+#
+# English: B1 locks — ten-field parity across both ledgers, itemised net, per-leg slip sign,
+# running-turnover denominator, and no opportunity cost inside the net.
+# ============================================================================
+echo "==> 133 §T-COST B1 T 成本分解（十字段 / 分项自洽 / 滑点符号 / 分母口径 / 机会成本不进净额）..."
+B133_FAILED=0
+fail133() {
+	echo "--- FAIL: §133 $*"
+	FAIL=1
+	B133_FAILED=1
+}
+CNT133=0
+TR133=internal/paper/t_rounds.go
+TL133=internal/engine/tlive_state.go
+IL133=internal/engine/intraday_t_live.go
+PT133=internal/paper/t_cost_calib_b1_test.go
+ET133=internal/engine/t_cost_calib_b1_test.go
+
+# —— ① 两本账十字段同集（判据 3）——
+# 用 python 抽两边的 json tag 再比集合：grep 只能验"存在"，验不了"同集"（一边多一个字段照样过）。
+B1P133=$(python3 - "$TR133" "$TL133" <<'PY133'
+import re, sys
+want = ['decision_price', 'slip_bps', 'fee_buy', 'fee_sell', 'stamp_tax',
+        'fee_source', 'latency_ms', 'unfilled', 'unfilled_reason', 'participation_pct']
+sets = []
+for p in sys.argv[1:3]:
+    s = open(p, encoding='utf-8').read()
+    tags = set(re.findall(r'`json:"([a-z_0-9]+)', s))
+    sets.append(set(want) & tags)
+miss_p = [k for k in want if k not in sets[0]]
+miss_l = [k for k in want if k not in sets[1]]
+if miss_p or miss_l:
+    print('MISS paper=%s live=%s' % (','.join(miss_p), ','.join(miss_l)))
+elif sets[0] != sets[1]:
+    print('DIFF paper=%s live=%s' % (','.join(sorted(sets[0])), ','.join(sorted(sets[1]))))
+else:
+    print('OK')
+PY133
+)
+[ "$B1P133" = "OK" ] ||
+	fail133 "两本账 B1 字段不同集（$B1P133）：一边加了另一边没加，成本分解只会在一边出现"
+CNT133=$((CNT133 + 1))
+
+# —— ② 分项自洽：净额必须逐项相减（两本账各一道）——
+grep -q 'r.TPnlNet = round2(gross - (r.FeeBuy + r.FeeSell + r.StampTax))' "$TR133" ||
+	fail133 "纸面净额不是『毛 − 三项分项』（写成毛 − 合计费用时，任何一项算错都看不出来）"
+grep -q 'rnd.TPnlNet = tLRound2(rnd.TPnlGross - (rnd.FeeBuy + rnd.FeeSell + rnd.StampTax))' "$IL133" ||
+	fail133 "实盘净额不是『毛 − 三项分项』（判据 1 会退化成恒等式）"
+CNT133=$((CNT133 + 2))
+
+# —— ③ 滑点符号按腿取（两本账各一道）——
+grep -q 'if leg == tRLegSell {' "$TR133" ||
+	fail133 "纸面滑点没有按腿取符号（一刀切会让反 T 整片负滑点）"
+grep -q 'v = -v // 卖腿：成交低于决策价才是对我不利（正数）' "$IL133" ||
+	fail133 "实盘滑点没有按腿取符号（卖腿不取反 ⇒ 反 T 的滑点符号整体反了）"
+CNT133=$((CNT133 + 2))
+
+# —— ④ 参与率分母口径（两本账各一道 + 负锁：不得出现"全天量"字段）——
+grep -q 'r.ParticipationPct = round4(amt / dayAmountYuan \* 100)' "$TR133" ||
+	fail133 "纸面参与率的分母不是开腿时已累计成交额（拿全天量当分母＝用未来数据）"
+grep -q 'rnd.ParticipationPct = tLRound4(price \* float64(qty) / q.Amount \* 100)' "$IL133" ||
+	fail133 "实盘参与率的分母不是开腿时已累计成交额（q.Amount 才是当时读数）"
+if grep -qE 'AmountAll|amountAll|DayAmountAll' "$TR133" "$IL133"; then
+	fail133 "出现了『全天成交额』字段被参与率使用（全天量是未来数据，会系统性低估参与率）"
+fi
+CNT133=$((CNT133 + 3))
+
+# —— ⑤ 机会成本不得进净额（负锁：这两个文件里不许有 opportunity 标识符）——
+if grep -qi 'opportunit' "$TR133" "$IL133"; then
+	fail133 "净额里出现了机会成本项（反事实不可观测，只能在 B2 离线标定里估）"
+fi
+CNT133=$((CNT133 + 1))
+
+# —— 行为腿：纸面 3 条 + 实盘 4 条，真跑 ——
+B1N133=$({ grep -c '^func Test' "$PT133" "$ET133" 2>/dev/null || true; } | awk -F: '{s+=$2} END {print s+0}')
+[ "${B1N133:-0}" -ge 7 ] ||
+	fail133 "§B1 行为腿用例数按源码派生只有 ${B1N133:-0}（应 ≥7：纸面 3 + 实盘 4）"
+B1OUT133=$(go test ./internal/paper/ ./internal/engine/ -count=1 -run 'TestTRoundCostBreakdownSelfConsistent|TestTRoundSlipSignByLeg|TestTRoundCostReverseSellFirst|TestTRoundCostFieldsParity|TestTLiveSlipSignByLeg|TestTLiveDailyCostSelfConsistent|TestTLiveUnfilledReason' 2>&1 || true)
+grep_q '^ok' B1OUT133 ||
+	{ fail133 "§B1 行为腿非绿：$(printf '%s\n' "$B1OUT133" | grep -E 'FAIL|_test\.go' | head -3 | tr '\n' ' ')"; }
+CNT133=$((CNT133 + 2))
+
+# —— 反证两枚（镜子法，只镜像 internal/paper 与 internal/engine）——
+W133=$(mktemp -d /tmp/gate133-XXXXXX) || { echo "--- FAIL: §133 建不出反证工作目录"; exit 1; }
+mkdir -p "$W133/mirror/internal" || exit 1
+for _e in "$PWD"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in internal | cmd) continue ;; esac
+	ln -s "$_e" "$W133/mirror/$_b" || exit 1
+done
+for _e in "$PWD"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in paper | engine) continue ;; esac
+	ln -s "$_e" "$W133/mirror/internal/$_b" || exit 1
+done
+cp -R "$PWD/internal/paper" "$W133/mirror/internal/paper" || exit 1
+cp -R "$PWD/internal/engine" "$W133/mirror/internal/engine" || exit 1
+mut133() { # $1=相对镜像路径 $2=old $3=new → 打印落地次数
+	python3 - "$W133/mirror/$1" "$2" "$3" <<'PY133M'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PY133M
+}
+# R1：纸面净额漏掉印花税 ⇒ 分项自洽用例必红（证明它验的是"三项都被算进去"而不是恒等式）。
+N133R1=$(mut133 internal/paper/t_rounds.go 'r.TPnlNet = round2(gross - (r.FeeBuy + r.FeeSell + r.StampTax))' 'r.TPnlNet = round2(gross - (r.FeeBuy + r.FeeSell))' || true)
+CNT133=$((CNT133 + 1))
+[ "${N133R1:-0}" = "1" ] || fail133 "反证 R1 变异落地数=${N133R1:-0}（应 1）：靶串不在位，本枚等于没跑"
+R1133=$(cd "$W133/mirror" && go test ./internal/paper/ -count=1 -run 'TestTRoundCostBreakdownSelfConsistent' 2>&1 || true)
+CNT133=$((CNT133 + 1))
+grep_q '^--- FAIL: TestTRoundCostBreakdownSelfConsistent' R1133 ||
+	{ fail133 "反证 R1 失效：净额漏掉印花税后那条用例仍绿（分项白记）：$(printf '%s\n' "$R1133" | tail -3 | tr '\n' ' ')"; }
+# R2：实盘滑点去掉卖腿取反 ⇒ 符号用例必红。
+N133R2=$(mut133 internal/engine/intraday_t_live.go '	if rnd.Dir == tLDirSell {
+		v = -v' '	if false && rnd.Dir == tLDirSell {
+		v = -v' || true)
+CNT133=$((CNT133 + 1))
+[ "${N133R2:-0}" = "1" ] || fail133 "反证 R2 变异落地数=${N133R2:-0}（应 1）：靶串不在位"
+R2133=$(cd "$W133/mirror" && go test ./internal/engine/ -count=1 -run 'TestTLiveSlipSignByLeg' 2>&1 || true)
+CNT133=$((CNT133 + 1))
+grep_q '^--- FAIL: TestTLiveSlipSignByLeg' R2133 ||
+	{ fail133 "反证 R2 失效：卖腿不取反后符号用例仍绿（反 T 的滑点符号没人盯着）"; }
+rm -rf "$W133"
+
+echo "INFO - §133 覆盖面账：本段锁的是**字段与口径**，不含「成本是否该进决策」——B1 明确不改任何判定，净额公式与判定前的 gross 逐字一致。另：机会成本的反事实读数（若成交能赚多少）只在 B2 的 tcalib 里估，本仓任何线上路径都不许出现该字段。"
+[ "$B133_FAILED" = "0" ] || exit 1
+echo "ok - §133 §T-COST B1 成本分解锁通过（静态 9 道 + 行为腿 ${B1N133} 条 + 反证 2 枚，累计判定点 ${CNT133}）"
+# ============================================================================
+# §134 §T-COST B5 影子对照账锁（非 T 成交集合相等 / 影子只读 / 跳腿计数 / 镜像点显式）
+#
+# 对照实验最容易做成自欺：只要影子账与真实账共用了**任何一次**"T 腿带来的现金/持仓变化"，
+# 归因就是恒 0 或虚高。所以这一段的三条一致性判据是**验收前置**，不是补充说明：
+#   ① 非 T 成交逐笔相等（同票同向同量同价）——影子只该看到策略动作；
+#   ② 影子**只读**：它的权益/持仓不得被任何判定读取（ordbudget / signalctl / engine 三处零引用）；
+#   ③ 跳腿计数相等：skipped_t_legs == 当日 T 腿数（少跳＝漏镜像，多跳＝误把策略单当 T）。
+# 镜像规则按**调用点**显式传，不许在共享原语里靠"战法名是不是 §T-MODE"猜——那是把两件事焊死。
+#
+# English: B5 locks — non-T fill parity, read-only shadow, skipped-leg count, explicit mirror points.
+# ============================================================================
+echo "==> 134 §T-COST B5 影子对照账（非 T 成交相等 / 影子只读 / 跳腿计数 / 镜像点显式）..."
+B134_FAILED=0
+fail134() {
+	echo "--- FAIL: §134 $*"
+	FAIL=1
+	B134_FAILED=1
+}
+CNT134=0
+SH134=internal/paper/t_shadow_no_t.go
+PB134=internal/paper/paper.go
+ST134=internal/paper/t_shadow_no_t_test.go
+
+# —— ① 影子账结构与落盘在位 ——
+grep -q 't_shadow_no_t.json' "$SH134" ||
+	fail134 "影子账落盘文件名不是 t_shadow_no_t.json（与 t_rounds_live.json 同根是方案 §3.1 的约定）"
+grep -q 'func (e \*Engine) tShadowMirrorBuyLocked' "$SH134" ||
+	fail134 "影子账缺镜像买入原语（策略买入无法被对照）"
+grep -q 'func (e \*Engine) tShadowSkipTLegLocked' "$SH134" ||
+	fail134 "影子账缺跳腿计数原语（判据 3 无法成立）"
+grep -q 'book.SkippedLeg += n' "$SH134" ||
+	fail134 "跳腿计数没落到账本（+= n 是判据 3 的唯一写入口）"
+CNT134=$((CNT134 + 4))
+
+# —— ② 影子只读静态锁：三处判定层零引用 ——
+SHHIT134=$(grep -lE 'shadowNoT|ShadowNoT|shadow_no_t' \
+	internal/ordbudget/ordbudget.go internal/signalctl/sizing.go internal/engine/engine.go 2>/dev/null || true)
+[ -z "$SHHIT134" ] ||
+	fail134 "影子账被判定层引用了（$SHHIT134）：影子一旦进入 Room/预算/风控，归因就恒 0 或虚高"
+CNT134=$((CNT134 + 1))
+
+# —— ③ 镜像点显式：买/卖/跳腿三个调用点都在 paper.go（策略动作处）——
+grep -q 'tShadowMirrorBuyLocked(' "$PB134" ||
+	fail134 "paper.go 没有镜像买入的调用点（影子账永远是空账）"
+grep -q 'tShadowMirrorSellLocked(' "$PB134" ||
+	fail134 "paper.go 没有镜像卖出的调用点（卖出裁决执行不会被对照）"
+# 跳腿计数的调用点在 t_rounds.go（T 腿的开/平/撤都发生在那条账本里），不在 paper.go：
+# 判据 3 比的是"影子跳过的腿数"与"当日真实 T 腿数"，所以必须钉在 T 账本那一侧。
+grep -q 'tShadowSkipTLegLocked(' internal/paper/t_rounds.go ||
+	fail134 "t_rounds.go 没有跳腿计数调用点（判据 3 无从比较：影子会漏跳 T 腿）"
+CNT134=$((CNT134 + 3))
+
+# —— ④ 开关默认关（观察期由 owner 显式打开；默认开＝凭空多一份落盘与 CPU）——
+grep -q 'ShadowNoT bool `json:"shadow_no_t,omitempty"`' internal/config/config.go ||
+	fail134 "配置缺 shadow_no_t（或类型不对）：布尔零值必须读成「关」，不能读成「没配」"
+CNT134=$((CNT134 + 1))
+
+# —— 行为腿：5 条，真跑 ——
+# 计数按 §GATE-COUNT-LOCK：零命中 grep -c 会退 1，`set -e` 下整条赋值会静默中止整轮 verify，
+# 所以首段自带 `|| true`。单文件时 grep -c 输出没有"文件名:"前缀 ⇒ 取 $NF 才两种形态都对。
+B5N134=$({ grep -c '^func Test' "$ST134" 2>/dev/null || true; } | awk -F: '{s+=$NF} END {print s+0}')
+[ "${B5N134:-0}" -ge 5 ] ||
+	fail134 "§B5 行为腿用例数按源码派生只有 ${B5N134:-0}（应 ≥5：成交相等/读数帧/关开关/序列上限/只读锁）"
+B5OUT134=$(go test ./internal/paper/ -count=1 -run 'TestShadowNoT' 2>&1 || true)
+grep_q '^ok' B5OUT134 ||
+	{ fail134 "§B5 行为腿非绿：$(printf '%s\n' "$B5OUT134" | grep -E 'FAIL|_test\.go' | head -3 | tr '\n' ' ')"; }
+CNT134=$((CNT134 + 2))
+
+# —— 反证两枚（镜子法，镜像 internal/paper 与 internal/ordbudget）——
+# ordbudget 也要复制成真目录：只读锁的变异靶点在**判定层**（预算层），
+# 把令牌写进 paper 包是不会被判据看见的（那条用例只扫 ordbudget/signalctl/engine.go）。
+W134=$(mktemp -d /tmp/gate134-XXXXXX) || { echo "--- FAIL: §134 建不出反证工作目录"; exit 1; }
+mkdir -p "$W134/mirror/internal" || exit 1
+for _e in "$PWD"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in internal | cmd) continue ;; esac
+	ln -s "$_e" "$W134/mirror/$_b" || exit 1
+done
+for _e in "$PWD"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in paper | ordbudget) continue ;; esac
+	ln -s "$_e" "$W134/mirror/internal/$_b" || exit 1
+done
+cp -R "$PWD/internal/paper" "$W134/mirror/internal/paper" || exit 1
+cp -R "$PWD/internal/ordbudget" "$W134/mirror/internal/ordbudget" || exit 1
+mut134() { # $1=相对镜像路径 $2=old $3=new → 打印落地次数
+	python3 - "$W134/mirror/$1" "$2" "$3" <<'PY134M'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PY134M
+}
+# R1：跳腿计数不累加（等价"漏记 T 腿"）⇒ 判据 3 的等式必红。
+N134R1=$(mut134 internal/paper/t_shadow_no_t.go 'book.SkippedLeg += n' 'book.SkippedLeg += 0' || true)
+CNT134=$((CNT134 + 1))
+[ "${N134R1:-0}" = "1" ] || fail134 "反证 R1 变异落地数=${N134R1:-0}（应 1）：靶串不在位"
+R1134=$(cd "$W134/mirror" && go test ./internal/paper/ -count=1 -run 'TestShadowNoTNonTFillsEqual' 2>&1 || true)
+CNT134=$((CNT134 + 1))
+grep_q '^--- FAIL: TestShadowNoTNonTFillsEqual' R1134 ||
+	{ fail134 "反证 R1 失效：跳腿不累加后等式仍绿（漏镜像没人盯着）"; }
+# R2：让判定层"看得见"影子账 ⇒ 只读静态锁用例必红。
+# 变异只加一个字符串字面量（不引字段、不改语义），保证包仍能编译——否则编译失败会被
+# 判据读成"仍绿"，锁就自己瞎了（§132 反证 R2 踩过的同一坑）。
+N134R2=$(python3 - "$W134/mirror/internal/ordbudget/ordbudget.go" <<'PY134A'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+tok = 'var _shadowNoTProbe = "shadowNoT"'
+if tok in s:
+    print(0)
+else:
+    open(p, "w", encoding="utf-8").write(s + "\n" + tok + "\n")
+    print(1)
+PY134A
+)
+CNT134=$((CNT134 + 1))
+[ "${N134R2:-0}" = "1" ] || fail134 "反证 R2 变异落地数=${N134R2:-0}（应 1）：无法把影子令牌写进镜像"
+R2134=$(cd "$W134/mirror" && go test ./internal/paper/ -count=1 -run 'TestShadowNoTNotReadByDecisions' 2>&1 || true)
+CNT134=$((CNT134 + 1))
+grep_q '^--- FAIL: TestShadowNoTNotReadByDecisions' R2134 ||
+	{ fail134 "反证 R2 失效：影子令牌进了纸面包后只读锁仍绿（判定层引用影子这件事没人盯着）"; }
+rm -rf "$W134"
+
+echo "INFO - §134 覆盖面账：影子账当前只覆盖**纸面**引擎（实盘 T 腿走 r.ctrl.PlaceOrder 直连、与纸面不是同一条撮合路径，实盘侧对照要等实盘 T 账本满一个月再单独做）。另：影子账落盘文件只读回放，不参与任何启动决策；关开关即停镜像，已落盘文件保留（§3.5 的回滚口径）。"
+[ "$B134_FAILED" = "0" ] || exit 1
+echo "ok - §134 §T-COST B5 影子对照账锁通过（静态 9 道 + 行为腿 ${B5N134} 条 + 反证 2 枚，累计判定点 ${CNT134}）"
+# ============================================================================
+# §135 §T-COST B3 相关性簇帽锁（簇帽拦单 / 取小不叠乘 / 读缺失按命中 / 三态配置）
+#
+# 单票 35% / 行业 35% 管不住"不同行业、走势却几乎一样"的三四只票（同一轮主题的龙头/跟风/补涨）。
+# 簇帽把"同一注赌注"的合计敞口钉在 cluster_cap_pct（默认 40%）。四条：
+#   ① 簇帽真的拦单：ρ=0.9 的第二只票必须被点名 cluster 跳过（不是"额度小一点"，是明确原因）；
+#   ② **取小不叠乘**：40% 簇帽 + 30% 行业帽 ⇒ 可用 30%，不是 12%。连乘等于把两个帽同时收紧
+#      三倍，而且事后从日志上只会看到"额度莫名其妙只剩一点"；
+#   ③ 读数缺失 fail-closed（按同簇），但**整批不可用**时跳过并告警：一条序列都没有时
+#      "按同簇"会让 40% 退化成全账户总敞口帽，与 86.5% 的目标仓位直接打架 ⇒ 全面停止开仓，
+#      那是把数据层故障伪装成风险决策；
+#   ④ 配置三态：缺键＝出厂 40，显式 0＝关闭（用指针而不是 float64 的零值判断）。
+#
+# English: B3 locks — the cap actually blocks, min() instead of product, fail-closed on missing
+# readings (but skip-with-alarm when nothing is available at all), and the tri-state config.
+# ============================================================================
+echo "==> 135 §T-COST B3 相关性簇帽（簇帽拦单 / 取小不叠乘 / 读缺失按命中 / 三态配置）..."
+B135_FAILED=0
+fail135() {
+	echo "--- FAIL: §135 $*"
+	FAIL=1
+	B135_FAILED=1
+}
+CNT135=0
+CL135=internal/cluster/cluster.go
+OB135=internal/ordbudget/ordbudget.go
+CG135=internal/engine/cluster_gate.go
+EG135=internal/engine/engine.go
+CF135=internal/config/config.go
+CT135=internal/cluster/cluster_test.go
+BT135=internal/engine/t_cost_calib_b3_test.go
+
+# —— ① 簇包：阈值与双轨合并口径 ——
+grep -q 'DefaultRho = 0.70' "$CL135" ||
+	fail135 "簇相关性阈值不是 0.70（owner 2026-10-27 拍板值，改它等于改判定）"
+grep -q 'DefaultMinObs = 40' "$CL135" ||
+	fail135 "有效样本下限不是 40 天（<40 天必须 fail-closed，见判据 3）"
+grep -q 'func Pearson(' "$CL135" ||
+	fail135 "缺 Pearson 实现（相关性只剩「同行业」一条轨，双轨取严就没了）"
+CNT135=$((CNT135 + 3))
+
+# —— ② 取小不叠乘（本段最核心的一条）——
+grep -q 'if in.ClusterSet && in.ClusterCapPct > 0 {' "$OB135" ||
+	fail135 "ordbudget 没有簇额度分支（或用了 >0 判断 ClusterValue：簇值恰为 0 是有效读数）"
+grep -q 'room := roomOf(in.ClusterCapPct, in.CapEquity, in.ClusterValue)' "$OB135" ||
+	fail135 "簇额度不是 roomOf(cap, equity, used) 的形状（换算法＝与其它三道帽不同源）"
+grep -q 'res.ClusterRoom = room' "$OB135" ||
+	fail135 "簇额度没回填到 Result.ClusterRoom（面板与日志读不到）"
+# 负锁：ordbudget 里不许出现任何 `budget *= ` 形态——帽之间只允许取小。
+if grep -q 'budget \*= ' "$OB135"; then
+	fail135 "ordbudget 出现了 budget 连乘（两个帽连乘＝同时收紧数倍，正是本段要防的形态）"
+fi
+CNT135=$((CNT135 + 4))
+
+# —— ③ 读缺失的两条分支都要在：整批不可用跳过 + 单对缺失按同簇 ——
+grep -q 'if len(rets) == 0 {' "$CG135" ||
+	fail135 "缺「整批序列不可用 ⇒ 跳过并告警」的例外条款（没有它，数据故障会伪装成全面停止开仓）"
+grep -q 'cluster.Build(codes, rets, inds, rho, 0)' "$CG135" ||
+	fail135 "簇构建没把 minObs 交给 cluster.Build（传 0＝用包内默认 40，写死别的数会静默改判据）"
+grep -q 'Applied:   true,' "$CG135" ||
+	fail135 "clusterGateRead 没有 Applied 标记（面板/日志无法回答「这条帽这轮到底生效没有」）"
+CNT135=$((CNT135 + 3))
+
+# —— ④ 配置三态 + 引擎装配 ——
+grep -q 'ClusterCapPct \*float64' "$CF135" ||
+	fail135 "cluster_cap_pct 不是指针（用 float64 零值就分不清「没配」与「显式关闭」）"
+grep -q 'defaultClusterCapPct = 40' "$CF135" ||
+	fail135 "簇帽出厂默认不是 40%（owner 拍板值）"
+# 接收者名字不做假设（本仓既有 `(c SizingConfig)` 也有 `(s SizingConfig)` 两种写法）。
+grep -qE 'func \([a-z] SizingConfig\) ClusterCapPctOf\(\) float64' "$CF135" ||
+	fail135 "缺 ClusterCapPctOf（三态判据必须有单一实现点，不能在引擎里各写一份）"
+grep -q 'clusterRead = e.clusterGateFor(sig.Code, stockVal, industryOf, clusterCap, sizingCfg.ClusterRhoOf())' "$EG135" ||
+	fail135 "引擎装配簇读数的形状变了（值口径必须用 stockVal：与行业/单票帽同源，含在途与 T 腿）"
+grep -q 'ClusterSet:' "$EG135" ||
+	fail135 "引擎没把 ClusterSet 交给 ordbudget（簇值 0 会被误判成「未启用」）"
+CNT135=$((CNT135 + 5))
+
+# —— 行为腿：簇包 4 条 + 引擎 4 条，真跑 ——
+B3N135=$({ grep -c '^func Test' "$CT135" "$BT135" 2>/dev/null || true; } | awk -F: '{s+=$2} END {print s+0}')
+[ "${B3N135:-0}" -ge 8 ] ||
+	fail135 "§B3 行为腿用例数按源码派生只有 ${B3N135:-0}（应 ≥8：簇包 4 + 引擎 4）"
+B3OUT135=$(go test ./internal/cluster/ ./internal/engine/ -count=1 -run 'TestPearsonOverlapAndNaN|TestBuildTwoTracks|TestBuildFailClosedOnMissing|TestValueOfExcludesTarget|TestB3' 2>&1 || true)
+grep_q '^ok' B3OUT135 ||
+	{ fail135 "§B3 行为腿非绿：$(printf '%s\n' "$B3OUT135" | grep -E 'FAIL|_test\.go' | head -3 | tr '\n' ' ')"; }
+CNT135=$((CNT135 + 2))
+
+# —— 反证两枚（镜子法，只镜像 internal/ordbudget 与 internal/engine）——
+W135=$(mktemp -d /tmp/gate135-XXXXXX) || { echo "--- FAIL: §135 建不出反证工作目录"; exit 1; }
+mkdir -p "$W135/mirror/internal" || exit 1
+for _e in "$PWD"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in internal | cmd) continue ;; esac
+	ln -s "$_e" "$W135/mirror/$_b" || exit 1
+done
+for _e in "$PWD"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in ordbudget | engine) continue ;; esac
+	ln -s "$_e" "$W135/mirror/internal/$_b" || exit 1
+done
+cp -R "$PWD/internal/ordbudget" "$W135/mirror/internal/ordbudget" || exit 1
+cp -R "$PWD/internal/engine" "$W135/mirror/internal/engine" || exit 1
+mut135() { # $1=相对镜像路径 $2=old $3=new → 打印落地次数
+	python3 - "$W135/mirror/$1" "$2" "$3" <<'PY135M'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PY135M
+}
+# R1：簇帽分支失效（等价 cluster_cap_pct=100/关）⇒ "簇帽拦单"必红。
+N135R1=$(mut135 internal/ordbudget/ordbudget.go 'if in.ClusterSet && in.ClusterCapPct > 0 {' 'if false && in.ClusterSet && in.ClusterCapPct > 0 {' || true)
+CNT135=$((CNT135 + 1))
+[ "${N135R1:-0}" = "1" ] || fail135 "反证 R1 变异落地数=${N135R1:-0}（应 1）：靶串不在位"
+R1135=$(cd "$W135/mirror" && go test ./internal/engine/ -count=1 -run 'TestB3ClusterCapBlocksCorrelatedBuy' 2>&1 || true)
+CNT135=$((CNT135 + 1))
+grep_q '^--- FAIL: TestB3ClusterCapBlocksCorrelatedBuy' R1135 ||
+	{ fail135 "反证 R1 失效：簇帽分支失效后仍绿（拦截可能来自行业帽，不是簇帽）"; }
+# R2：删掉"整批不可用就跳过"的例外条款 ⇒ 数据故障会被当成风险决策（全面停止开仓）。
+N135R2=$(mut135 internal/engine/cluster_gate.go 'if len(rets) == 0 {' 'if false && len(rets) == 0 {' || true)
+CNT135=$((CNT135 + 1))
+[ "${N135R2:-0}" = "1" ] || fail135 "反证 R2 变异落地数=${N135R2:-0}（应 1）：靶串不在位"
+R2135=$(cd "$W135/mirror" && go test ./internal/engine/ -count=1 -run 'TestB3ClusterSkipsWhenReadingUnavailable' 2>&1 || true)
+CNT135=$((CNT135 + 1))
+grep_q '^--- FAIL: TestB3ClusterSkipsWhenReadingUnavailable' R2135 ||
+	{ fail135 "反证 R2 失效：删掉例外条款后仍绿——「数据层故障冻结全部开仓」这件事没人盯着"; }
+rm -rf "$W135"
+
+echo "INFO - §135 覆盖面账：簇帽当前只作用于**信号买入路径**（T 腿走 r.ctrl.PlaceOrder 直连，不经 ordbudget，天然不受影响——这与 §B0 的最小成交额闸同一分工）。另：簇的收益序列读的是 HfqBars（后复权），与因子打分同一套复权体系；停牌日剔除而不补零（补零会把相关性系统性压低，等于让簇帽在最需要的时候失效）。极端行情下整池 ρ→1 会让「能买的票变少」，这是设计意图不是 bug（§10 风险 2）。"
+[ "$B135_FAILED" = "0" ] || exit 1
+echo "ok - §135 §T-COST B3 相关性簇帽锁通过（静态 15 道 + 行为腿 ${B3N135} 条 + 反证 2 枚，累计判定点 ${CNT135}）"
+
 echo "==> 全部通过"

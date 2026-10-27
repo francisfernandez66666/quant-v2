@@ -1733,6 +1733,18 @@ type SizingConfig struct {
 	// English: per-trade upper bound (default 30%); the effective share is
 	// lo + (hi−lo)×(MS×SS) clamped into [lo,hi] (owner 2026-10-27: 10%~30% by factors).
 	PerTradePositionMaxPct float64 `json:"per_trade_position_max_pct"`
+	// ClusterCapPct §T-COST B3 相关性簇上限（占**总资产**百分数，默认 40；显式 0=关）。
+	// 簇＝"同一注赌注"：近 60 日收益 ρ≥ClusterRho 或同行业（见 internal/cluster）。
+	// 它管的是单票 35% / 行业 35% 管不到的形态——不同行业、走势却几乎一样的三四只票。
+	// 用指针而不是 float64 是必须的：**缺键**要读成出厂 40（新账号默认有这条帽），
+	// **显式 0** 要读成"关"（热生效回滚位）。平面 float 分不开这两件事——那正是
+	// `enabled *bool` 在 TConfig 里用指针的同一个理由。
+	// English: pointer on purpose — an absent key means the factory 40, an explicit 0 means off.
+	ClusterCapPct *float64 `json:"cluster_cap_pct,omitempty"`
+	// ClusterRho 相关性簇的合并阈值（默认 0.70；≤0 走出厂默认）。
+	// 0.7 是 owner 2026-10-27 拍板值：低于它多是"同板块轮动"，高于它才像"同一注"。
+	// English: correlation threshold for merging two codes into one cluster (default 0.70).
+	ClusterRho float64 `json:"cluster_rho"`
 	// MaxDrawdownPct 账户权益回撤熔断（默认 0.10；0=不启用）：回撤达此比例时按 pysystemtrade
 	// risk_overlay 口径缩仓（mult = limit/max(limit, drawdown)）。
 	MaxDrawdownPct float64 `json:"max_drawdown_pct"`
@@ -1796,6 +1808,12 @@ type TConfig struct {
 	// from "off by default" to hot-stop plus same-day acceptance checks.
 	// 注意 nil 与显式 false 必须可分：面板要能区分"没配过"与"owner 主动关掉"。
 	Enabled *bool `json:"enabled,omitempty"`
+	// ShadowNoT §T-COST B5（2026-10-27）"做 T vs 不做 T"影子账开关（默认 false，观察期由 owner 打开）。
+	// 影子账与真实账同信号/同资金/同仓位模型，唯一差别是不执行 T 腿；它**不参与任何判定**，
+	// 打开无资金风险（Room/预算/风控零引用，由纸面包的静态扫描测试兜底）。关掉即停镜像。
+	// English: §T-COST B5 no-T shadow switch (default off). The shadow book mirrors every non-T fill
+	// and skips T legs only; it never feeds Room/budget/risk decisions.
+	ShadowNoT bool `json:"shadow_no_t,omitempty"`
 	// Mode 允许的方向：""/"both"＝正反都做；"buy_first"＝只做正 T（先买后卖）；
 	// "sell_first"＝只做反 T（先卖后买）。无法识别的取值按"都不做"处理（资金路径宁可不做）。
 	// English: which directions are allowed — ""/both, buy_first, sell_first; unknown means neither.
@@ -1871,6 +1889,9 @@ const (
 // 关仍然是热生效的止血路径：引擎每轮重读配置，下一轮即停开新腿，在途腿照常配平/收摊。
 // English: nil now means on (shipped default); an explicit false is the one-key stop.
 func (c TConfig) TEnabled() bool { return c.Enabled == nil || *c.Enabled }
+
+// TShadowNoTOf 影子对照账开关（B5）。布尔无区间可钳，缺失即 false（观察期由 owner 显式打开）。
+func (c TConfig) TShadowNoTOf() bool { return c.ShadowNoT }
 
 // TBuyFirst 是否允许正 T（先买后卖）。空串/"both" 都允许，未知取值一律不允许。
 // English: whether buy-first rounds are allowed (""/"both" yes, unknown no).
@@ -2236,6 +2257,10 @@ func refOf(v float64) *float64 { return &v }
 // English: pointer factory for the tri-state bool switches (explicit on/off vs absent).
 func sizingBool(v bool) *bool { return &v }
 
+// sizingFloat 指针化浮点的辅助（与 sizingBool 同族：三态字段的出厂值注入点）。
+// English: pointer helper for tri-state floats, same family as sizingBool.
+func sizingFloat(v float64) *float64 { return &v }
+
 // DefaultSizingConfig §DYN-SIZE 出厂默认。
 //
 // §DYN-GLOBAL（2026-10-24 owner 裁决一「dynamic 全局，legacy 开关账户级别」）把三把下发键从
@@ -2284,7 +2309,12 @@ func DefaultSizingConfig() SizingConfig {
 		PerTradePositionPct:  0.10,
 		// §B0（owner 2026-10-27）：单笔上限 30%。下限 10% + 因子 k=MS×SS 线性映射，
 		// 目的是让"信号仓的单笔"随行情/个股质量在 10%~30% 之间动，而不是固定 10% 切出一堆碎单。
-		PerTradePositionMaxPct:  0.30,
+		PerTradePositionMaxPct: 0.30,
+		// §T-COST B3：相关性簇帽 40%（owner 2026-10-27 拍板）+ 合并阈值 0.70。
+		// 出厂即开是有意的：这条帽只在"多只票其实是同一注"时才拦单，常态下不参与；
+		// 关掉它的热开关是显式写 `cluster_cap_pct=0`（见 ClusterCapPctOf 的注释）。
+		ClusterCapPct:           sizingFloat(defaultClusterCapPct),
+		ClusterRho:              0.70,
 		MaxDrawdownPct:          0.10,
 		StoplossGuardCount:      4,
 		StoplossGuardWindowDays: 1,
@@ -2422,6 +2452,39 @@ func (s SizingConfig) HolidayBlockNewOn() bool { return s.HolidayBlockNew != nil
 // English: whether loosening the stop must shrink the position proportionally (nil = true).
 func (s SizingConfig) RiskBudgetKeepOn() bool {
 	return s.SLOffsetRiskBudgetKeep == nil || *s.SLOffsetRiskBudgetKeep
+}
+
+// defaultClusterCapPct §T-COST B3 相关性簇帽的出厂值（40%，owner 2026-10-27 拍板）。
+const defaultClusterCapPct = 40.0
+
+// ClusterCapPctOf 相关性簇帽的生效值（百分数）：**缺键 ⇒ 出厂 40**，显式 0 ⇒ 关闭（返回 0）。
+// 为什么不用 `<=0 → 40` 这种兜底：显式 0 是回滚位（§9 回滚矩阵），兜成 40 会让"关掉这条帽"
+// 在配置层根本表达不出来——那正是本仓在 breadth/scale 那几个键上反复踩过的坑。
+// 负数与脏值（>100）按关闭/夹取处理：>100 的帽等于没有，夹到 100 比留着 300 更诚实。
+// English: the effective cluster cap in percent — an absent key means the factory 40, an explicit
+// 0 means off. Negative or dirty values are treated as off/100 rather than silently reopened.
+func (s SizingConfig) ClusterCapPctOf() float64 {
+	if s.ClusterCapPct == nil {
+		return defaultClusterCapPct
+	}
+	v := *s.ClusterCapPct
+	if v <= 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+// ClusterRhoOf 相关性簇的合并阈值（缺键/脏值 ⇒ 0.70）。
+// English: the cluster merge threshold (absent or dirty values fall back to 0.70).
+func (s SizingConfig) ClusterRhoOf() float64 {
+	v := s.ClusterRho
+	if v <= 0 || v > 1 {
+		return 0.70
+	}
+	return v
 }
 
 // SellBoostLevelOf 归一化卖出加权档位：返回 "L1"/"L2"/"L3"，空串表示**显式关闭**（"off"/"none"/"0"）。

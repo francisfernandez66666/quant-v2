@@ -1,7 +1,8 @@
 // 多因子研究工具（B3/B5）：对一批股票计算 7 大类因子并输出 IC/IR/分层验证报告；
 // B5 提供 optimize（权重优化产出候选）/ list（候选列表）/ approve（审批应用）；
 // scan-depth 实时扫描研究池盘口，识别托单/压单并产出候选。
-// 用法：research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|risk-daily-backfill|list|approve|event-layers|prune-stale-checkpoints
+// 用法：research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|risk-daily-backfill|list|approve|event-layers|prune-stale-checkpoints|tcalib
+// tcalib 是 §T-COST-CALIB B2 的只读阈值标定子命令（见 tcalib.go 文件头）。
 //
 //	flags：--db（默认 ~/.quant-trading-v2/trading.db）、--start（YYYYMMDD，默认 20200101）、
 //	--end（YYYYMMDD，默认今天）、--h（前瞻天数，默认 5）、--quantiles（默认 5）、
@@ -45,7 +46,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|risk-daily-backfill|lifecycle-eval|lifecycle|event-layers|prune-stale-checkpoints")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|risk-daily-backfill|lifecycle-eval|lifecycle|event-layers|prune-stale-checkpoints|tcalib")
 	}
 	cmd := args[0]
 
@@ -133,6 +134,10 @@ func main() {
 		// §ADJ-BASIS 清理改前旧口径断点（缺省 dry-run 只报统计，--apply 才删；见子命令文件头运维口径）。
 		// English: prune pre-basis research checkpoints (dry-run by default, --apply to delete).
 		cmdPruneStaleCheckpoints(db, args[1:])
+	case "tcalib":
+		// §T-COST-CALIB B2 离线阈值标定：只读分钟线，产出建议阈值（不写配置，签字后才落）。
+		// English: B2 offline threshold calibration — read-only, produces suggestions only.
+		cmdTCalib(db, args[1:])
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}

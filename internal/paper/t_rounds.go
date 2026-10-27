@@ -125,6 +125,34 @@ type TRound struct {
 	TPnlNet   float64 `json:"t_pnl_net,omitempty"`
 	QMatched  int     `json:"q_matched,omitempty"`
 	FeeEst    bool    `json:"t_fee_est,omitempty"`
+
+	// ── §T-COST B1（2026-10-27）成本分解：与 engine.TRoundLive **同名同义** ────────────────
+	// 这十个字段只记账、不改任何判定。两本账必须字段同集（门禁用 reflect 比 json tag），
+	// 否则会出现"纸面能算、实盘算不了"的半截实现——那种分叉在复盘时最难发现。
+	// DecisionPrice 开腿判定时用的报价（＝openLegForCodeLocked 里那个 q.Price）。
+	// 只锚**第一腿**：第二腿由价差阈值触发，没有"判定报价"这回事，硬给它编一个只会让滑点口径含混。
+	DecisionPrice float64 `json:"decision_price,omitempty"`
+	// SlipBps (fill − decision)/decision×1e4；买腿取正、卖腿取负后**再取正**（正数＝对我不利）。
+	// 纸面的 fill 已含配置的 SlippageBps，所以这里读到的是"模拟器口径的滑点"，与实盘同义不同源。
+	SlipBps float64 `json:"slip_bps,omitempty"`
+	// FeeBuy/FeeSell 分腿费用（佣金，含最低佣金封底）；StampTax 仅卖出腿的印花税。
+	// 三者之和必须等于 TPnlGross − TPnlNet（容差 0.01），这是 B1 的第一条判据。
+	FeeBuy   float64 `json:"fee_buy,omitempty"`
+	FeeSell  float64 `json:"fee_sell,omitempty"`
+	StampTax float64 `json:"stamp_tax,omitempty"`
+	// FeeSource broker / estimate / mixed：纸面恒 estimate（模拟成交没有券商回报）。
+	FeeSource string `json:"fee_source,omitempty"`
+	// LatencyMs 判定 → 委托落库的毫秒。纸面恒 0：模拟是即时撮合，没有"委托在途"这个阶段。
+	LatencyMs int `json:"latency_ms"`
+	// Unfilled 该轮是否有"下了单但没成交/被撤"的腿。纸面恒 false：拒单根本不会生成回转记录，
+	// 配对失败则保持 open 等下一轮——这两者在纸面都不是"已下单未成交"的形态。
+	Unfilled bool `json:"unfilled"`
+	// UnfilledReason 撤单/废单/超时原因码（纸面为空；实盘由委托台账的终态填充）。
+	UnfilledReason string `json:"unfilled_reason,omitempty"`
+	// ParticipationPct 该腿成交额 / **开腿时已累计的当日成交额** × 100（B4 的观察量）。
+	// 分母口径写死：用当时累计额（q.Amount），不是全天成交额——盘中的"全天量"是未来数据，
+	// 拿它当分母会系统性低估参与率，读数越"安全"越接近自欺。
+	ParticipationPct float64 `json:"participation_pct,omitempty"`
 }
 
 // TParams 一轮做 T 的执行参数——由 engine 侧从账号级配置解析后注入。
@@ -523,6 +551,8 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 		e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 			StrategyType: pos.StrategyType, Side: "sell", Kind: "正T卖出", Price: fill,
 			Qty: sold, Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
+		// B5：配对腿成交＝又一条被影子账跳过的 T 腿（判据：skip == 当日 T 腿数）。
+		e.tShadowSkipTLegLocked(1, now)
 		return
 	}
 
@@ -594,6 +624,8 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 	e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 		StrategyType: pos.StrategyType, Side: "buy", Kind: "反T买回", Price: fill, Qty: need,
 		Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
+	// B5：反 T 买回腿同样是被跳过的 T 腿。
+	e.tShadowSkipTLegLocked(1, now)
 	if r.UsedSignalID != "" && p.ConsumeSignal != nil {
 		p.ConsumeSignal(r.UsedSignalID)
 	}
@@ -624,7 +656,12 @@ func (e *Engine) finishTRoundLocked(r *TRound, state string, pairQty int, pairPr
 			gross = (r.LegPrice - pairPrice) * float64(matched)
 		}
 		r.TPnlGross = round2(gross)
-		r.TPnlNet = round2(gross - e.tRoundFeeLocked(r, pairPrice, matched))
+		// B1：费用在终态一次性按**两腿口径**重算并留库（开腿时只落了首腿那半截）。
+		// 分项之和必须等于毛−净（判据 1）；未成交的机会成本**绝不**减进来——那是不可观测的反事实，
+		// 只在 B2 的离线标定里估（方案 §2.2）。
+		feeBuy, feeSell, stamp := e.tRoundFeeSplitLocked(r, pairPrice, matched)
+		r.FeeBuy, r.FeeSell, r.StampTax = round2(feeBuy), round2(feeSell), round2(stamp)
+		r.TPnlNet = round2(gross - (r.FeeBuy + r.FeeSell + r.StampTax))
 	}
 	log.Printf("[paper] §T-MODE 回转 %s %s(%s) 第%d轮 终态=%s 腿=%s %d股@%.2f 配对%d股@%.2f 毛%.2f 净%.2f 原因=%s",
 		r.ID, r.Mode, r.Name, r.Seq, state, r.Leg, r.LegQty, r.LegPrice, pairQty, pairPrice,
@@ -633,20 +670,86 @@ func (e *Engine) finishTRoundLocked(r *TRound, state string, pairQty int, pairPr
 	e.persist()
 }
 
-// tRoundFeeLocked 一条回转两腿的费用合计——**复用**账本既有的 `buyFeeLocked/sellFeeLocked`，
+// tRoundFeeLocked 一条回转两腿的费用合计——**复用**账本既有的费率口径，
 // 不新造费率常量：否则"做 T 收益"里的费用和现金里真实扣掉的钱会变成两套口径。
+// B1 起它只是分项口径的合计视图；落库的是 FeeBuy/FeeSell/StampTax 三个分项。
 func (e *Engine) tRoundFeeLocked(r *TRound, pairPrice float64, matched int) float64 {
-	buyCost, sellProceeds := 0.0, 0.0
-	if r.Leg == tRLegBuy {
-		buyCost, sellProceeds = r.LegPrice*float64(matched), pairPrice*float64(matched)
-	} else {
-		sellProceeds, buyCost = r.LegPrice*float64(matched), pairPrice*float64(matched)
+	feeBuy, feeSell, stamp := e.tRoundFeeSplitLocked(r, pairPrice, matched)
+	return feeBuy + feeSell + stamp
+}
+
+// tRoundFeeSplitLocked 一条回转两腿的费用分项（佣金买/佣金卖/印花税）。
+// 口径与 buyFeeLocked/sellFeeLocked 逐字同源：卖出那条腿的"佣金"是从 sellFeeLocked 里
+// 减去印花税得到的，而不是另写一遍 max(额×费率, 最低佣金)——两处各写一份费率是最常见的漂移来源。
+func (e *Engine) tRoundFeeSplitLocked(r *TRound, pairPrice float64, matched int) (feeBuy, feeSell, stamp float64) {
+	if r == nil || matched <= 0 || r.LegPrice <= 0 || pairPrice <= 0 {
+		return 0, 0, 0
 	}
-	fee := e.buyFeeLocked(buyCost) + e.sellFeeLocked(sellProceeds)
-	if math.IsNaN(fee) || fee < 0 {
+	buyAmt, sellAmt := 0.0, 0.0
+	if r.Leg == tRLegBuy {
+		buyAmt, sellAmt = r.LegPrice*float64(matched), pairPrice*float64(matched)
+	} else {
+		sellAmt, buyAmt = r.LegPrice*float64(matched), pairPrice*float64(matched)
+	}
+	feeBuy = e.buyFeeLocked(buyAmt)
+	stamp = e.stampTaxLocked(sellAmt)
+	feeSell = e.sellFeeLocked(sellAmt) - stamp
+	if feeSell < 0 {
+		feeSell = 0 // 费率配置异常时的防守：分项不得为负（宁可少记费用，也不制造负费用）
+	}
+	return feeBuy, feeSell, stamp
+}
+
+// applyOpenLegCostLocked 开腿时落 B1 的首腿成本读数（须持锁调用）。
+// 为什么开腿就写而不是等配平：决策价是**那一瞬间**的报价，过了这一刻就再也取不回来了；
+// 费用分项在终态会按两腿重算，但滑点只能锚在开腿这一步。
+func (e *Engine) applyOpenLegCostLocked(r *TRound, decision, fill float64, qty int, dayAmountYuan float64) {
+	if r == nil || decision <= 0 || qty <= 0 {
+		return
+	}
+	r.DecisionPrice = round4(decision)
+	r.SlipBps = round2(tSlipBpsOf(r.Leg, decision, fill))
+	r.FeeSource = tRFeeSourceEstimate // 纸面永远估算：模拟撮合没有券商回报
+	amt := fill * float64(qty)
+	if r.Leg == tRLegBuy {
+		r.FeeBuy = round2(e.buyFeeLocked(amt))
+	} else {
+		r.StampTax = round2(e.stampTaxLocked(amt))
+		r.FeeSell = round2(e.sellFeeLocked(amt) - e.stampTaxLocked(amt))
+	}
+	// 分母＝**开腿当时已累计**的当日成交额（q.Amount），不是全天量：后者是未来数据，
+	// 拿它算参与率会把每一腿都系统性算小（方案 §2.1 的分母口径锁）。
+	if dayAmountYuan > 0 {
+		r.ParticipationPct = round4(amt / dayAmountYuan * 100)
+	}
+}
+
+// tRFeeSourceEstimate/Broker/Mixed 费用来源三态（与实盘同名，前端与日汇总按字面量读）。
+const (
+	tRFeeSourceBroker   = "broker"
+	tRFeeSourceEstimate = "estimate"
+	tRFeeSourceMixed    = "mixed"
+)
+
+// tSlipBpsOf 单腿滑点（bp，正数＝对我不利）。
+// 买腿：成交高于决策价是不利 ⇒ (fill−decision)/decision；卖腿：成交低于决策价是不利 ⇒ (decision−fill)/decision。
+// 这个符号约定是 B1 判据 2 的靶子：写成不带方向的一刀切，反 T 会整片"负滑点"。
+func tSlipBpsOf(leg string, decision, fill float64) float64 {
+	if decision <= 0 {
 		return 0
 	}
-	return fee
+	if leg == tRLegSell {
+		return (decision - fill) / decision * 1e4
+	}
+	return (fill - decision) / decision * 1e4
+}
+
+// stampTaxLocked 卖出印花税（仅卖出，无最低）；费率 ≤0 视为不收（与 sellFeeLocked 同源）。
+func (e *Engine) stampTaxLocked(proceeds float64) float64 {
+	if e.cfg.StampTaxRate <= 0 || proceeds <= 0 {
+		return 0
+	}
+	return proceeds * e.cfg.StampTaxRate
 }
 
 // trimTRoundsLocked 只保留最近 tRKeepRounds 条（账本体积，不影响判定）。
@@ -959,8 +1062,8 @@ func (e *Engine) openLegForCodeLocked(code string, quotes map[string]*data.Stock
 		amp = (q.High - q.Low) / base * 100
 	}
 	rd := tReadings{v: v, vmin: vmin, checkDev: checkDev, dev: (price - v) / v * 100,
-		high: q.High, low: q.Low, amp: amp, amountWan: q.Amount / 10000.0, turnover: q.Turnover,
-		ms: p.MarketScale}
+		high: q.High, low: q.Low, amp: amp, amountWan: q.Amount / 10000.0, amountYuan: q.Amount,
+		turnover: q.Turnover, ms: p.MarketScale}
 	if rd.dev < 0 && p.BuyFirst {
 		sigID := ""
 		if p.NewBuySignal != nil {
@@ -998,6 +1101,10 @@ type tReadings struct {
 	v, vmin, checkDev, dev  float64
 	high, low, amp          float64
 	amountWan, turnover, ms float64
+	// amountYuan 开腿时刻**已累计**的当日成交额（元），只服务 B1 的 participation_pct 分母。
+	// 与 amountWan 是同一个 q.Amount 的两种单位，刻意并存：一个是展示读数（万元），
+	// 一个是参与率分母（元），换算散落在调用点会让分母口径漂移。
+	amountYuan float64
 }
 
 // openBuyFirstLocked 正 T 第一腿：买入机动仓。
@@ -1018,9 +1125,13 @@ func (e *Engine) openBuyFirstLocked(pos *Position, baseQty, qty int, price float
 	r := e.newTRoundLocked(pos, TRModeBuyFirst, tRLegBuy, qty, fill, baseQty, day, now, rd, sigID,
 		fmt.Sprintf("低吸触发：现价在分时均线下方 %.2f%%", rd.dev))
 	r.AnchorPrice = pos.AnchorPrice
+	// B1：开腿即落决策价/滑点/首腿费用与参与率（分母＝当时累计成交额，见字段注释）。
+	e.applyOpenLegCostLocked(r, price, fill, qty, rd.amountYuan)
 	e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 		StrategyType: pos.StrategyType, Side: "buy", Kind: "正T买入", Price: fill, Qty: qty,
 		Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
+	// B5：正 T 首腿成交 ⇒ 影子账跳过的 T 腿 +1（影子账不执行任何 T 腿）。
+	e.tShadowSkipTLegLocked(1, now)
 	if sigID != "" && p.ConsumeSignal != nil {
 		p.ConsumeSignal(sigID)
 	}
@@ -1040,6 +1151,8 @@ func (e *Engine) openSellFirstLocked(pos *Position, baseQty, qty int, price floa
 	r := e.newTRoundLocked(pos, TRModeSellFirst, tRLegSell, sold, fill, baseQty, day, now, rd, "",
 		fmt.Sprintf("高抛触发：现价在分时均线上方 %.2f%%", rd.dev))
 	r.AnchorPrice = pos.AnchorPrice
+	// B1：反 T 的首腿是卖出，滑点取"决策价高于成交价"为正（正数＝对我不利）。
+	e.applyOpenLegCostLocked(r, price, fill, sold, rd.amountYuan)
 	// 冻结款＝max(卖腿回款, 现价×买回量) + 费用缓冲：买回价高于卖价时也要有钱等着，
 	// 否则"尾盘有信号却不回补"会变成现金不足造成的半态，而不是决策。
 	proceeds := fill * float64(sold)
@@ -1055,6 +1168,8 @@ func (e *Engine) openSellFirstLocked(pos *Position, baseQty, qty int, price floa
 	e.recordOrderLocked(Order{Code: pos.Code, Name: pos.Name, Strategy: pos.Strategy,
 		StrategyType: pos.StrategyType, Side: "sell", Kind: "反T卖出", Price: fill, Qty: sold,
 		Status: "filled", Reason: tRStrategies + " " + r.ID, CreatedAt: now})
+	// B5：反 T 首腿成交 ⇒ 影子账跳过的 T 腿 +1。
+	e.tShadowSkipTLegLocked(1, now)
 }
 
 // newTRoundLocked 登记一条 open 态回转并落盘（须持锁调用）。
@@ -1179,6 +1294,9 @@ func tLimitPrices(code, name string, prevClose float64) (up, down float64) {
 // round3 三位小数：分时均线类读数要能看出分厘差，账本既有的 round2（两位）不复用，避免把 V 抹成现价。
 func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
 
+// round4 四位小数：参与率读数常在 0.01% 量级，用 round2 会把 B4 的观察量整片抹成 0。
+func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
+
 // TRounds 全部回转记录的只读快照（返回副本：调用方在锁外遍历时不能共享正在 append 的底层数组）。
 func (e *Engine) TRounds() []TRound {
 	e.mu.Lock()
@@ -1228,6 +1346,27 @@ func (e *Engine) TRoundNetPnL() (net, gross float64, done int, feeEstShare float
 	return round2(net), round2(gross), done, feeEstShare
 }
 
+// TCostDaily 当日做 T 的成本分解（B1 §2.3；扩展现有 day ledger，不新增接口）。
+// 字段口径：
+//   - Gross/Net 只统计 done 轮（与 TPnlGross/TPnlNet 同源），SlipCost 覆盖所有有首腿成交的轮；
+//   - SlipCost = Σ |fill − decision| × 成交股数（元，绝对值和，不区分买卖方向）；
+//   - Fills 是**成交腿数**（done 轮＝2，只成了首腿的轮＝1），不是轮数；
+//   - FeeEstimateShare = 费用来源非 broker 且有成交的轮数 / 有成交的轮数（对账稳定性的核心读数）；
+//   - ParticipationPct* 只统计参与率可得的轮（分母缺失的轮不补 0，避免把"没有读数"混进中位数）。
+type TCostDaily struct {
+	Gross               float64 `json:"gross"`
+	FeeBuy              float64 `json:"fee_buy"`
+	FeeSell             float64 `json:"fee_sell"`
+	StampTax            float64 `json:"stamp_tax"`
+	SlipCost            float64 `json:"slip_cost"`
+	Net                 float64 `json:"net"`
+	Fills               int     `json:"fills"`
+	Unfilled            int     `json:"unfilled"`
+	FeeEstimateShare    float64 `json:"fee_estimate_share"`
+	ParticipationPctP50 float64 `json:"participation_pct_p50"`
+	ParticipationPctMax float64 `json:"participation_pct_max"`
+}
+
 // TRoundDayStats 当日回转汇总（开/配对/收摊/转换/熔断 + 做 T 收益 + 被拦分布）。
 type TRoundDayStats struct {
 	Day          string         `json:"day"`
@@ -1243,6 +1382,8 @@ type TRoundDayStats struct {
 	SellNotional float64        `json:"sell_notional"`
 	ConvertedQty int            `json:"converted_qty"` // 未回补而转战略减仓的股数（底仓磨薄的直接读数）
 	BlockByStep  map[string]int `json:"block_by_step"`
+	// Cost B1 成本分解（毛/佣金/印花/滑点/净 + 估算占比 + 参与率分位）。
+	Cost TCostDaily `json:"cost"`
 }
 
 // TRoundDay 返回某日（空串＝今天）的回转汇总，供接口与每日总账使用。
@@ -1256,12 +1397,41 @@ func (e *Engine) TRoundDay(day string) TRoundDayStats {
 	for k, v := range e.tBlock {
 		st.BlockByStep[k] = v
 	}
+	// B1 日汇总的成本分项：与上面的结局分布同一次遍历取数，避免"收益按一个过滤、成本按另一个"。
+	filledRounds, estimateRounds := 0, 0
+	participation := make([]float64, 0, 4)
 	for i := range e.tRounds {
 		r := &e.tRounds[i]
 		if r.Day != day {
 			continue
 		}
 		st.Opened++
+		anyFill := r.LegQty > 0 || r.PairQty > 0
+		if r.LegQty > 0 {
+			st.Cost.Fills++
+		}
+		if r.PairQty > 0 {
+			st.Cost.Fills++
+		}
+		if anyFill {
+			filledRounds++
+			if r.FeeSource != "" && r.FeeSource != tRFeeSourceBroker {
+				estimateRounds++ // estimate 或 mixed：只要不是纯券商值，就算"这轮的数不全是券商给的"
+			}
+		}
+		if r.Unfilled {
+			st.Cost.Unfilled++
+		}
+		if r.DecisionPrice > 0 && r.LegQty > 0 {
+			// 滑点成本只算首腿（decision_price 只锚首腿，见字段注释）：绝对值和，不区分方向。
+			st.Cost.SlipCost += math.Abs(r.LegPrice-r.DecisionPrice) * float64(r.LegQty)
+		}
+		if r.ParticipationPct > 0 {
+			participation = append(participation, r.ParticipationPct)
+			if r.ParticipationPct > st.Cost.ParticipationPctMax {
+				st.Cost.ParticipationPctMax = r.ParticipationPct
+			}
+		}
 		switch r.State {
 		case tRStateDone:
 			st.Done++
@@ -1282,8 +1452,30 @@ func (e *Engine) TRoundDay(day string) TRoundDayStats {
 		if r.Leg == tRLegSell {
 			st.SellNotional += r.LegPrice * float64(r.LegQty)
 		}
+		st.Cost.Gross += r.TPnlGross
+		st.Cost.Net += r.TPnlNet
+		st.Cost.FeeBuy += r.FeeBuy
+		st.Cost.FeeSell += r.FeeSell
+		st.Cost.StampTax += r.StampTax
+	}
+	if filledRounds > 0 {
+		st.Cost.FeeEstimateShare = float64(estimateRounds) / float64(filledRounds)
+	}
+	if n := len(participation); n > 0 {
+		sort.Float64s(participation)
+		if n%2 == 1 {
+			st.Cost.ParticipationPctP50 = participation[n/2]
+		} else {
+			st.Cost.ParticipationPctP50 = (participation[n/2-1] + participation[n/2]) / 2
+		}
 	}
 	st.NetPnl, st.GrossPnl = round2(st.NetPnl), round2(st.GrossPnl)
 	st.FrozenCash, st.SellNotional = round2(st.FrozenCash), round2(st.SellNotional)
+	st.Cost.Gross, st.Cost.Net = round2(st.Cost.Gross), round2(st.Cost.Net)
+	st.Cost.FeeBuy, st.Cost.FeeSell = round2(st.Cost.FeeBuy), round2(st.Cost.FeeSell)
+	st.Cost.StampTax, st.Cost.SlipCost = round2(st.Cost.StampTax), round2(st.Cost.SlipCost)
+	st.Cost.FeeEstimateShare = round4(st.Cost.FeeEstimateShare)
+	st.Cost.ParticipationPctP50 = round4(st.Cost.ParticipationPctP50)
+	st.Cost.ParticipationPctMax = round4(st.Cost.ParticipationPctMax)
 	return st
 }

@@ -107,10 +107,14 @@ type tLiveReaders struct {
 // tLiveLegFact 一条腿（一个幂等键）在 fills 表里的客观成交事实。
 // 成交真相只来自这里：状态账本说的是"意图"，回报才是"事实"，两者不一致时以事实为准（§8.6）。
 type tLiveLegFact struct {
-	qty     int
-	amount  float64 // Σ成交额（用于加权均价）
-	fee     float64 // Σ真实回报费用（佣金+印花税）
-	hasFee  bool    // 是否拿到过**券商口径**的费用（决定 FeeEst）
+	qty    int
+	amount float64 // Σ成交额（用于加权均价）
+	fee    float64 // Σ真实回报费用（佣金+印花税，兼容旧口径）
+	// comm/stamp 分项：B1 要把佣金与印花税分开记（fee_buy/fee_sell/stamp_tax）。
+	// 没有分项就只能在净额里看到一个总数，无法回答"成本里最大的一项是哪个"（一个月后复盘四问之一）。
+	comm    float64
+	stamp   float64
+	hasFee  bool // 是否拿到过**券商口径**的费用（决定 FeeEst）
 	orders  []store.RealOrder
 	anyFill bool
 }
@@ -143,6 +147,8 @@ func (f *tLiveLegFact) add(o *tLiveLegFact) {
 	f.qty += o.qty
 	f.amount += o.amount
 	f.fee += o.fee
+	f.comm += o.comm
+	f.stamp += o.stamp
 	f.hasFee = f.hasFee || o.hasFee
 	f.anyFill = f.anyFill || o.anyFill
 	f.orders = append(f.orders, o.orders...)
@@ -416,6 +422,7 @@ func (r *tLiveRound) logDailyLedger() {
 	r.st.ledgerLogged = true
 	r.st.mu.Unlock()
 	opened, done, unwound, converted, openNow, pnlNet, pnlGross := r.st.dayLedger()
+	cost := r.st.dayCost()
 	placed, canceled, filled, err := r.db.TLegOrderLedger(r.uid, r.dash)
 	ratio := 0.0
 	if placed > 0 {
@@ -427,9 +434,11 @@ func (r *tLiveRound) logDailyLedger() {
 			tLLogTag, opened, done, unwound, converted, openNow, pnlNet, pnlGross, err)
 		return
 	}
-	log.Printf("%s 每日总账 账号=%s 开腿%d 配对%d 收摊%d 转战略%d 在途%d 做T净=%.2f 做T毛=%.2f｜委托%d笔 撤%d笔 成交%d笔 报撤比%.1f%%",
+	log.Printf("%s 每日总账 账号=%s 开腿%d 配对%d 收摊%d 转战略%d 在途%d 做T净=%.2f 做T毛=%.2f｜委托%d笔 撤%d笔 成交%d笔 报撤比%.1f%%｜成本 佣金买%.2f 佣金卖%.2f 印花%.2f 滑点%.2f 估算占比%.0f%% 参与率中位%.4f%% 最大%.4f%%",
 		tLLogTag, r.uid, opened, done, unwound, converted, openNow, pnlNet, pnlGross,
-		placed, canceled, filled, ratio)
+		placed, canceled, filled, ratio,
+		cost.FeeBuy, cost.FeeSell, cost.StampTax, cost.SlipCost, cost.FeeEstimateShare*100,
+		cost.ParticipationPctP50, cost.ParticipationPctMax)
 }
 
 // facts 某交易日的 T 腿成交/委托索引（按前缀过滤，只捞 t0: 键）。
@@ -464,8 +473,11 @@ func (r *tLiveRound) facts(dayCompact string) (map[string]*tLiveLegFact, error) 
 		acc.qty += f.Qty
 		acc.amount += amt
 		acc.anyFill = true
-		if fee := f.Fee + f.StampTax; fee > 0 {
-			acc.fee += fee
+		// 分项聚合（B1）：fills 表的 Fee 是佣金、StampTax 是印花税；任一 >0 就说明这一腿有券商口径。
+		if f.Fee > 0 || f.StampTax > 0 {
+			acc.comm += f.Fee
+			acc.stamp += f.StampTax
+			acc.fee += f.Fee + f.StampTax
 			acc.hasFee = true
 		}
 	}
@@ -519,6 +531,8 @@ func (r *tLiveRound) pairFact(id string) *tLiveLegFact {
 			out.qty += f.qty
 			out.amount += f.amount
 			out.fee += f.fee
+			out.comm += f.comm
+			out.stamp += f.stamp
 			out.hasFee = out.hasFee || f.hasFee
 			out.anyFill = out.anyFill || f.anyFill
 			out.orders = append(out.orders, f.orders...)
@@ -613,6 +627,9 @@ func (r *tLiveRound) seal(rnd *TRoundLive, state, reason string) {
 	if r.roundMatched(rnd) {
 		r.fillPnl(rnd)
 	}
+	// 跨日收敛同样要补 B1 读数（否则昨日腿的滑点/未成交原因永远缺一截）。
+	r.refreshSlip(rnd)
+	r.markUnfilled(rnd)
 	if err := r.st.sealStale(rnd); err != nil {
 		log.Printf("%s 跨日收摊落盘失败 %s：%v", tLLogTag, rnd.ID, err)
 	}
@@ -649,6 +666,7 @@ func (r *tLiveRound) reconcile(rnd *TRoundLive) {
 		return
 	}
 	if changed {
+		r.refreshSlip(rnd)
 		if err := r.st.put(rnd); err != nil {
 			log.Printf("%s 对账落盘失败 %s：%v", tLLogTag, rnd.ID, err)
 		}
@@ -1369,6 +1387,9 @@ func (r *tLiveRound) strategicRoom() float64 {
 // 的窗口里留下一条没人认领的委托。先落账的代价是可能留下幽灵 open，而那条路径有对账收敛（锁 13）。
 // 同步下单被明确拒绝时立刻标终态（不留半态）；异步排队时保持 open，由下一轮对账裁定。
 func (r *tLiveRound) openLeg(code, dir string, qty int) {
+	// B1 时延读数：判定时刻＝进入开腿落账；"委托落库"在本层只能观察到受理（异步队列入队或网关返回），
+	// 柜台真正入库的时刻在网关侧不可观测——这里记的是**我们能诚实拿到的那一段**，注释同源。
+	decidedAt := time.Now()
 	pos := r.positions[code]
 	q := r.quotes[code]
 	price := q.Price
@@ -1399,6 +1420,12 @@ func (r *tLiveRound) openLeg(code, dir string, qty int) {
 		TurnoverPct:   tLRound2(q.Turnover),
 		MarketScaleAt: r.p.MarketScale,
 		OpenedAt:      r.now.Format(time.RFC3339),
+		// B1：决策价与参与率在开腿瞬间落库。参与率分母＝**当时已累计**的当日成交额（q.Amount），
+		// 不是全天量——盘中的"全天量"是未来数据，用它当分母会系统性低估参与率。
+		DecisionPrice: tLRound4(price),
+	}
+	if q.Amount > 0 {
+		rnd.ParticipationPct = tLRound4(price * float64(qty) / q.Amount * 100)
 	}
 	if dir == tLDirSell {
 		// 冻结回购专款 = 现价×量 + 费用缓冲：买回价高于卖价时也要有钱等着，
@@ -1428,12 +1455,19 @@ func (r *tLiveRound) openLeg(code, dir string, qty int) {
 	} else {
 		_, err = r.sellLeg(pos, qty, id, price, "反T卖出腿（高抛）")
 	}
+	// 判定 → 委托受理的毫秒（无论成否都记：被拒的时延同样是执行链路的读数）。
+	rnd.LatencyMs = int(time.Since(decidedAt).Milliseconds())
 	if err != nil {
 		// 开腿被拦 ⇒ 不留半态：立即标终态并释放冻结款（§8.4.6 step8「被拦 → 不开，不留半态」）。
 		// 不重试、不换键重放：重试就是同一判断买/卖两次，换键重放则绕过了 orders 唯一键这层去重。
 		r.st.noteBlock("step8", "开腿被拒: "+err.Error(), code)
 		r.finish(rnd, tLStatusUnwound, "开腿被拦（不留半态）："+err.Error())
 		return
+	}
+	// 时延是下单之后才有的读数：补一次落盘（覆盖率上 fail-open——时延丢了不影响判定，
+	// 但丢了"这一腿从判定到受理用了多久"这个证据，滑点归因就少一半）。
+	if perr := r.st.put(rnd); perr != nil {
+		log.Printf("%s 时延读数落盘失败 %s：%v", tLLogTag, id, perr)
 	}
 	if dir == tLDirBuy && rnd.UsedSignalID != "" && r.e != nil {
 		r.e.tMarkTConsumed(rnd.UsedSignalID)
@@ -1558,6 +1592,9 @@ func (r *tLiveRound) finish(rnd *TRoundLive, state, reason string) {
 	if state == tLStatusDone && r.roundMatched(rnd) {
 		r.fillPnl(rnd)
 	}
+	// B1：首腿滑点在终态补一次（成交价来自对账，开腿那一刻还没有），未成交腿留原因码。
+	r.refreshSlip(rnd)
+	r.markUnfilled(rnd)
 	rnd.FrozenCash = 0
 	if err := r.st.put(rnd); err != nil {
 		log.Printf("%s 终态落盘失败 %s：%v", tLLogTag, rnd.ID, err)
@@ -1573,6 +1610,9 @@ func (r *tLiveRound) finish(rnd *TRoundLive, state, reason string) {
 //   - q = min(买腿成交量, 卖腿成交量)，未成交部分不参与盈亏；
 //   - 费用优先取券商成交回报，取不到才按纸面同公式估算并标 FeeEst=true；
 //   - **不回写任何基准**：这两个数不进 EntryPrice/持仓成本，也不进卖出裁决的分母。
+//
+// B1（§2.2）：未成交的机会成本**绝不**进 t_pnl_net。净额公式固定为
+// gross − fee_buy − fee_sell − stamp_tax；反事实只在 B2 的离线标定里估。
 func (r *tLiveRound) fillPnl(rnd *TRoundLive) {
 	q := rnd.BuyFilled
 	if rnd.SellFilled < q {
@@ -1584,31 +1624,117 @@ func (r *tLiveRound) fillPnl(rnd *TRoundLive) {
 	gross := (rnd.SellPrice - rnd.BuyPrice) * float64(q)
 	buyAmt := rnd.BuyPrice * float64(q)
 	sellAmt := rnd.SellPrice * float64(q)
-	fee, est := r.roundFee(rnd, buyAmt, sellAmt)
+	feeBuy, feeSell, stamp, source := r.roundFee(rnd, buyAmt, sellAmt)
 	rnd.QMatched = q
 	rnd.TPnlGross = tLRound2(gross)
-	rnd.TPnlNet = tLRound2(gross - fee)
-	rnd.FeeEst = est
+	// 先落分项、再按**分项之和**算净额：这样 |gross − 三项和 − net| < 0.01 由构造保证，
+	// 判据 1 验的是"分项确实被算进去了"，而不是一个恒等式（反证：滑点置 0 时它会红）。
+	rnd.FeeBuy, rnd.FeeSell, rnd.StampTax = tLRound2(feeBuy), tLRound2(feeSell), tLRound2(stamp)
+	rnd.TPnlNet = tLRound2(rnd.TPnlGross - (rnd.FeeBuy + rnd.FeeSell + rnd.StampTax))
+	rnd.FeeSource = source
+	rnd.FeeEst = source != tLFeeSourceBroker
 }
 
-// roundFee 该轮两腿费用合计：真实回报优先，两条腿的回报费用都拿不到才估算。
-// FeeEst 的语义必须是"这一轮的数不是券商给的"，灰度期靠它回答"对账口径稳不稳"。
-func (r *tLiveRound) roundFee(rnd *TRoundLive, buyAmt, sellAmt float64) (float64, bool) {
+// roundFee 该轮两腿费用分项：**逐腿**取券商回报，哪条腿没有就用估算补哪条腿，
+// 并在来源不一致时标 mixed——把"一条实测+一条估算"混成一个 broker 数是本批明令禁止的混算。
+// 返回 (买腿佣金, 卖腿佣金, 卖腿印花税, 来源 broker/estimate/mixed)。
+func (r *tLiveRound) roundFee(rnd *TRoundLive, buyAmt, sellAmt float64) (feeBuy, feeSell, stamp float64, source string) {
 	first := r.fact(rnd.ID)
 	pair := r.pairFact(rnd.ID)
-	// 只有**两腿都有**券商回报费用时才敢说这轮的数是实测的：单边有、单边估会把
-	// net 变成一个说不清来源的混合数，而 §8.9a 要的正是"估算占比"这个读数可解释。
-	if real := first.fee + pair.fee; real > 0 && first.hasFee && pair.hasFee {
-		return real, false
+	// 首腿／配对腿各自对应买还是卖，由方向决定（正 T 首腿买、反 T 首腿卖）。
+	buyFact, sellFact := first, pair
+	if rnd.Dir == tLDirSell {
+		buyFact, sellFact = pair, first
 	}
-	// 佣金 max(额×0.025%, 5)（买卖各一笔）+ 卖出印花税 0.05%：与 paper.buyFeeLocked/sellFeeLocked 同式。
-	buyFee := math.Max(buyAmt*tLCommissionRate, tLMinCommission)
-	sellFee := math.Max(sellAmt*tLCommissionRate, tLMinCommission) + sellAmt*tLStampTaxRate
-	fee := buyFee + sellFee
-	if math.IsNaN(fee) || fee < 0 {
-		return 0, true
+	// 估算腿（与 paper.buyFeeLocked/sellFeeLocked 同式）：佣金 max(额×0.025%, 5)，印花税 0.05%。
+	estBuy := math.Max(buyAmt*tLCommissionRate, tLMinCommission)
+	estSell := math.Max(sellAmt*tLCommissionRate, tLMinCommission)
+	estStamp := sellAmt * tLStampTaxRate
+	buyBroker := buyFact != nil && buyFact.hasFee
+	sellBroker := sellFact != nil && sellFact.hasFee
+	if buyBroker {
+		feeBuy = buyFact.comm
+	} else {
+		feeBuy = estBuy
 	}
-	return fee, true
+	if sellBroker {
+		feeSell, stamp = sellFact.comm, sellFact.stamp
+	} else {
+		feeSell, stamp = estSell, estStamp
+	}
+	switch {
+	case buyBroker && sellBroker:
+		source = tLFeeSourceBroker
+	case !buyBroker && !sellBroker:
+		source = tLFeeSourceEstimate
+	default:
+		source = tLFeeSourceMixed
+	}
+	if math.IsNaN(feeBuy+feeSell+stamp) || feeBuy < 0 || feeSell < 0 || stamp < 0 {
+		return 0, 0, 0, tLFeeSourceEstimate
+	}
+	return feeBuy, feeSell, stamp, source
+}
+
+// 费用来源三态（与纸面同名，前端/日汇总按字面量读）。
+const (
+	tLFeeSourceBroker   = "broker"
+	tLFeeSourceEstimate = "estimate"
+	tLFeeSourceMixed    = "mixed"
+)
+
+// refreshSlip 用**首腿成交均价**对决策价算滑点（B1 判据 2 的数据来源）。
+// 只锚首腿：配对腿由价差阈值触发，没有"判定报价"；给它编一个决策价等于把两件事焊在一起。
+func (r *tLiveRound) refreshSlip(rnd *TRoundLive) {
+	if rnd == nil || rnd.DecisionPrice <= 0 {
+		return
+	}
+	px, qty := rnd.BuyPrice, rnd.BuyFilled
+	if rnd.Dir == tLDirSell {
+		px, qty = rnd.SellPrice, rnd.SellFilled
+	}
+	if qty <= 0 || px <= 0 {
+		return
+	}
+	v := (px - rnd.DecisionPrice) / rnd.DecisionPrice * 1e4
+	if rnd.Dir == tLDirSell {
+		v = -v // 卖腿：成交低于决策价才是对我不利（正数）
+	}
+	rnd.SlipBps = tLRound2(v)
+}
+
+// markUnfilled 终态时归纳"下了单但没成交/被撤"的腿及原因码。
+// **只记事实，不算机会成本**：反事实（若成交能赚多少）不可观测，只在 B2 离线标定里估（§2.2）。
+func (r *tLiveRound) markUnfilled(rnd *TRoundLive) {
+	if rnd == nil {
+		return
+	}
+	first := r.fact(rnd.ID)
+	pair := r.pairFact(rnd.ID)
+	legs := []*tLiveLegFact{first, pair}
+	rnd.Unfilled, rnd.UnfilledReason = false, ""
+	for _, f := range legs {
+		if f == nil || f.qty > 0 || len(f.orders) == 0 {
+			continue // 没下过单不算"未成交"；成交了当然也不算
+		}
+		rnd.Unfilled = true
+		rnd.UnfilledReason = tLUnfilledReasonOf(f)
+		return
+	}
+}
+
+// tLUnfilledReasonOf 从委托终态归纳原因码：canceled（撤单）/ rejected（废单）/ timeout（超时未成）/ no_fill。
+// 顺序上"撤/废"优先于"超时"：一条被撤的单也是"等了很久"，但它有更具体的原因。
+func tLUnfilledReasonOf(f *tLiveLegFact) string {
+	for _, o := range f.orders {
+		switch {
+		case strings.Contains(o.Status, "撤"):
+			return "canceled"
+		case strings.Contains(o.Status, "废") || strings.Contains(o.Status, "拒"):
+			return "rejected"
+		}
+	}
+	return "timeout"
 }
 
 // ── 供判定链使用的引擎侧读数 ──────────────────────────────────────────────────────────
@@ -1759,6 +1885,9 @@ func tLRound2(v float64) float64 { return math.Round(v*100) / 100 }
 
 // tLRound3 三位小数：分时均线类读数要能看出分厘差，两位会把 V 抹成现价。
 func tLRound3(v float64) float64 { return math.Round(v*1000) / 1000 }
+
+// tLRound4 四位小数：参与率常在 0.01% 量级（B1/B4 的观察量），两位会把整列抹成 0。
+func tLRound4(v float64) float64 { return math.Round(v*10000) / 10000 }
 
 func tLPrevCloseOf(q *data.StockInfo) float64 {
 	if q == nil {

@@ -33,11 +33,12 @@ func dynQuotes(codes ...string) map[string]*data.StockInfo {
 // TestPaperDynamicManualBuyIgnoresQtyAndCaps 手填股数与持仓数量上限都不再生效，预算由 dynamic 口径决定。
 //
 // §DYN-SIZE v4：出厂单笔基准是 10%（10 万 → 1 万 → 1000 股），那样 35% 单票额度根本不参与，
-// 这条锁要证的"额度/手填数都不起作用"就失去区分度。所以这里把单笔基准临时放大到 100%，
-// 让**单票 35% 额度**重新成为唯一约束（3500 股），锁的靶心不变。
+// 这条锁要证的"额度/手填数都不起作用"就失去区分度。所以这里把单笔区间临时放大到上限 50%
+// （§B0 起单笔硬边界就是半仓，写 100% 会被夹回 0.50），让**单票 35% 额度**重新成为约束
+// （5 万预算被 3.5 万额度截断 → 3500 股），锁的靶心不变。
 func TestPaperDynamicManualBuyIgnoresQtyAndCaps(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(1.0, 1.0, 1.0, false)
+	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false)
 	quotes := dynQuotes("600000.SH")
 	// 显式传 100 股：dynamic 下必须忽略，按 10 万×100% 基准再被 35% 单票额度截到 3500 股。
 	if err := pe.BuyExInPool("600000.SH", "浦发", "龙头", "", 10, 0, 100, quotes); err != nil {
@@ -60,7 +61,7 @@ func TestPaperDynamicManualBuyIgnoresQtyAndCaps(t *testing.T) {
 func TestPaperDynamicPoolBaseAndWholeBookDenominator(t *testing.T) {
 	pe := New(dynPaperConfig(300000), "")
 	// 同 v4 说明：单笔基准放大到 100%，本例才考得到"集中度分母是**全盘权益**而不是池权益"。
-	pe.SetSizingContext(1.0, 1.0, 1.0, false)
+	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false)
 	pe.SetStrategyPools([]string{"dragon"}) // 现金均分：dragon=150000，其他池=150000
 	quotes := dynQuotes("600000.SH")
 	if err := pe.BuyInPool("600000.SH", "浦发", "龙头", "dragon", 10, quotes); err != nil {
@@ -70,10 +71,10 @@ func TestPaperDynamicPoolBaseAndWholeBookDenominator(t *testing.T) {
 	if len(poses) != 1 {
 		t.Fatalf("应有 1 笔持仓, got %d", len(poses))
 	}
-	// 池权益 15 万 → raw 15 万；全盘 35% = 10.5 万 → 10500 股。
-	// 若错误地用池权益做分母会得到 15万×35%=5.25万（5250 股）。
-	if poses[0].Qty != 10500 {
-		t.Fatalf("35%% 分母应为全盘权益（10500 股），got %d", poses[0].Qty)
+	// 池权益 15 万 × eff(0.50) = 7.5 万 → 7500 股；全盘 35% = 10.5 万不参与（7.5 万 < 10.5 万）。
+	// 若错误地用池权益做分母（15万×35%=5.25万）会得到 5250 股 —— 那才是本条要抓的形态。
+	if poses[0].Qty != 7500 {
+		t.Fatalf("单笔基准应按池权益计（7500 股），got %d", poses[0].Qty)
 	}
 }
 
@@ -103,7 +104,7 @@ func TestPaperDynamicManualSellClosesAll(t *testing.T) {
 // English: consecutive buys shrink to the remaining 35% room, and the third skips below one lot.
 func TestPaperDynamicConcentrationShrinksThenSkips(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(1.0, 1.0, 1.0, false) // 单笔基准放大，让单票 35% 额度成为约束（见上一条注释）
+	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false) // 单笔基准放大（lo=hi=1.0→硬夹 0.50），让单票 35% 额度成为约束
 	// 第一笔：3500 股（吃满单票额度）。
 	if err := pe.Buy("600000.SH", "浦发", "龙头", 10, dynQuotes("600000.SH")); err != nil {
 		t.Fatalf("第一笔 Buy: %v", err)

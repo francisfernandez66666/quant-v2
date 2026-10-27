@@ -93,6 +93,10 @@ const DEFAULTS = {
   maxPos: 1.00,
   perTrade: 0.10,
   perTradeMax: 0.30,
+  // §T-CLUSTER：相关性簇帽（%，0=关）与相关性阈值。与 internal/config 的
+  // defaultClusterCapPct / ClusterRhoOf 同源，改这里必须同步改后端。
+  clusterCap: 40,
+  clusterRho: 0.70,
   maxDD: 0.10,
   guardCount: 4,
   guardWindow: 1,
@@ -352,6 +356,11 @@ export default function RegimeConfigPanel() {
         // §DYN-SIZE v4 新增：单笔基准仓位（占总资产比例）。缺键时后端补 0.10，这里同口径。
         perTrade: num(sz.per_trade_position_pct, DEFAULTS.perTrade),
         perTradeMax: num(sz.per_trade_position_max_pct, DEFAULTS.perTradeMax),
+        // §T-CLUSTER：cluster_cap_pct 是**三态**（缺键=出厂 40；显式 0=关闭），
+        // 所以必须用 signedNum——num() 的 n>0 判据会把"显式关闭"读回 40，
+        // 等于每次打开面板都把 owner 关掉的簇帽又打开。
+        clusterCap: signedNum(sz.cluster_cap_pct, DEFAULTS.clusterCap),
+        clusterRho: num(sz.cluster_rho, DEFAULTS.clusterRho),
         maxDD: num(sz.max_drawdown_pct, DEFAULTS.maxDD),
         guardCount: intNum(sz.stoploss_guard_count, DEFAULTS.guardCount),
         guardWindow: intNum(sz.stoploss_guard_window_days, DEFAULTS.guardWindow),
@@ -522,6 +531,12 @@ export default function RegimeConfigPanel() {
     // §B0：区间反了（上限 < 下限）会让后端把它们收敛到同值，等于静默改了 owner 的配置，
     // 所以在面板就拦下——这是资金参数，不接受"保存后才发现生效值不是填的值"。
     if (Number(f.perTradeMax) < Number(f.perTrade)) bad.push('单笔上限(必须 ≥ 单笔基准)')
+    // §T-CLUSTER：簇帽 0=关，>0 时按百分比；相关性阈值必须落在 (0,1]——
+    // ρ=0 会把每只票都判成"与谁都不同簇"，簇帽直接失效且毫无提示。
+    const ccap = Number(f.clusterCap)
+    if (!Number.isFinite(ccap) || ccap < 0 || ccap > 100) bad.push('相关性簇帽(0=关，0~100)')
+    const crho = Number(f.clusterRho)
+    if (!Number.isFinite(crho) || crho <= 0 || crho > 1) bad.push('相关性阈值(0~1)')
     ratio('权益回撤熔断比例', f.maxDD)
     intIn('连续止损熔断次数', f.guardCount, 1, 100)
     intIn('连续止损回看窗', f.guardWindow, 1, 20)
@@ -667,6 +682,8 @@ export default function RegimeConfigPanel() {
           // §DYN-SIZE v4：单笔基准仓位（旧模型没有这个数，中性 1.0 时单笔可用满权益）。
           per_trade_position_pct: Number(form.perTrade),
           per_trade_position_max_pct: Number(form.perTradeMax),
+          cluster_cap_pct: Number(form.clusterCap),
+          cluster_rho: Number(form.clusterRho),
           max_drawdown_pct: Number(form.maxDD),
           stoploss_guard_count: Number(form.guardCount),
           stoploss_guard_window_days: Number(form.guardWindow),
@@ -1156,6 +1173,22 @@ export default function RegimeConfigPanel() {
               <NumRow label="总仓位上限" hint="目标仓位天花板（默认 1.00，v4 起不再逐笔相乘）：目标仓位＝基准×min(市场缩放, 本值)" value={form.maxPos} max={1} step={0.05} onChange={(v) => set({ maxPos: v })} />
               <NumRow label="单笔基准仓位" hint="默认 0.10（占总资产）：这是**下限**。生效单笔占比 = 下限 + (上限−下限)×(市场缩放×个股缩放)，硬夹在两者之间" value={form.perTrade} max={1} step={0.01} onChange={(v) => set({ perTrade: v })} />
               <NumRow label="单笔上限" hint="默认 0.30：因子越好单笔越大（§B0，替代过去固定 10% 切出的碎单）。两者都不得超过 0.50（单笔不过半仓）" value={form.perTradeMax} max={0.5} step={0.01} onChange={(v) => set({ perTradeMax: v })} />
+              <NumRow
+                label="相关性簇帽"
+                hint="默认 40（%，0=关）：同簇（ρ≥阈值 **或** 同行业）持仓合计不超过总资产该比例。与其他帽**取小不叠乘**——40% 簇帽 + 30% 行业帽 ⇒ 可用 30%，不是 12%。极端行情下它会主动减少可买票数，这是设计意图"
+                value={form.clusterCap}
+                max={100}
+                step={5}
+                onChange={(v) => set({ clusterCap: v })}
+              />
+              <NumRow
+                label="相关性阈值"
+                hint="默认 0.70：60 个交易日日收益 Pearson ρ 达到该值即判同簇（与「同行业」双轨合并，取严）。样本不足 40 天按同簇处理（fail-closed）"
+                value={form.clusterRho}
+                max={1}
+                step={0.05}
+                onChange={(v) => set({ clusterRho: v })}
+              />
               <NumRow label="权益回撤熔断比例" hint="回撤达此比例按 risk_overlay 缩仓（默认 0.10）" value={form.maxDD} max={1} step={0.01} onChange={(v) => set({ maxDD: v })} />
 
               <div style={groupStyle}>连续止损熔断与止损/止盈偏移</div>

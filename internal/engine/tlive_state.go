@@ -78,6 +78,30 @@ type TRoundLive struct {
 	TPnlNet   float64 `json:"t_pnl_net,omitempty"`
 	QMatched  int     `json:"q_matched,omitempty"`
 	FeeEst    bool    `json:"t_fee_est,omitempty"`
+
+	// ── §T-COST B1（2026-10-27）成本分解：与 paper.TRound **同名同义** ─────────────────────
+	// 字段集必须与纸面逐字一致（门禁用 reflect 比 json tag）：一边加另一边没加，
+	// 就会出现"纸面能算、实盘算不了"的半截实现。
+	// DecisionPrice 开腿判定时用的报价（openLeg 里的 q.Price）；只锚第一腿（配对腿由价差触发，
+	// 没有"判定报价"这回事）。
+	DecisionPrice float64 `json:"decision_price,omitempty"`
+	// SlipBps 首腿滑点（bp，正数＝对我不利）：买腿 (fill−decision)/decision，卖腿取反。
+	SlipBps float64 `json:"slip_bps,omitempty"`
+	// FeeBuy/FeeSell/StampTax 分腿费用（佣金/佣金/印花税）；有券商回报时取实测，否则估算。
+	FeeBuy   float64 `json:"fee_buy,omitempty"`
+	FeeSell  float64 `json:"fee_sell,omitempty"`
+	StampTax float64 `json:"stamp_tax,omitempty"`
+	// FeeSource broker / estimate / mixed：两腿来源不同时必须标 mixed（绝不混算成一个"实测"数）。
+	FeeSource string `json:"fee_source,omitempty"`
+	// LatencyMs 判定 → 委托受理的毫秒（异步队列入队/网关返回；柜台落库时刻在网关侧不可观测）。
+	LatencyMs int `json:"latency_ms"`
+	// Unfilled 终态时是否存在"下了单但没成交/被撤"的腿；反事实收益**绝不**进 t_pnl_net。
+	Unfilled bool `json:"unfilled"`
+	// UnfilledReason 撤单/废单/无成交原因码（终态结算时从委托台账归纳）。
+	UnfilledReason string `json:"unfilled_reason,omitempty"`
+	// ParticipationPct 首腿成交额 / **开腿时已累计的当日成交额** × 100（B4 观察量）。
+	// 分母是 q.Amount（当时累计），不是全天量——后者是未来数据，会系统性低估参与率。
+	ParticipationPct float64 `json:"participation_pct,omitempty"`
 	// UnwindReason 收摊/转换原因（loss_breaker / no_signal / insufficient_sellable / manual…）。
 	UnwindReason string `json:"unwind_reason,omitempty"`
 	// OpenedAt/UpdatedAt 时间戳（RFC3339）。
@@ -100,6 +124,92 @@ type tLiveState struct {
 	Rounds   []*TRoundLive  `json:"rounds"`
 	BlockDay string         `json:"block_day,omitempty"`
 	Blocks   map[string]int `json:"blocks,omitempty"` // 键＝"step|code"，与纸面侧 tBlock 同形
+	// Cost 当日成本分解（B1 §2.3：扩展现有 day ledger，不新增接口/路由）。
+	// 只由 save() 在锁内从**当日** byID 现算（历史留档不参与）；接口侧仍按明细重算一遍，
+	// 因为"写成什么样"可以旧，明细才是唯一事实。
+	Cost *tLiveCostDaily `json:"cost,omitempty"`
+}
+
+// tLiveCostDaily 当日成本分解（与 paper.TCostDaily 同名字段同语义，前端一套渲染）。
+type tLiveCostDaily struct {
+	Gross               float64 `json:"gross"`
+	FeeBuy              float64 `json:"fee_buy"`
+	FeeSell             float64 `json:"fee_sell"`
+	StampTax            float64 `json:"stamp_tax"`
+	SlipCost            float64 `json:"slip_cost"`
+	Net                 float64 `json:"net"`
+	Fills               int     `json:"fills"`
+	Unfilled            int     `json:"unfilled"`
+	FeeEstimateShare    float64 `json:"fee_estimate_share"`
+	ParticipationPctP50 float64 `json:"participation_pct_p50"`
+	ParticipationPctMax float64 `json:"participation_pct_max"`
+}
+
+// tLiveCostOf 从当日回转集合算成本分项（调用方负责只传当日记录与已排序副本）。
+// 口径与 paper.TRoundDayStats.Cost 逐字一致：滑点只算首腿、Fills 是成交腿数、
+// 估算占比的分母是"有成交轮数"、参与率只统计读数可得的轮。
+func tLiveCostOf(rounds []*TRoundLive) tLiveCostDaily {
+	var out tLiveCostDaily
+	filledRounds, estimateRounds := 0, 0
+	part := make([]float64, 0, len(rounds))
+	for _, r := range rounds {
+		if r == nil {
+			continue
+		}
+		if r.BuyFilled > 0 {
+			out.Fills++
+		}
+		if r.SellFilled > 0 {
+			out.Fills++
+		}
+		if r.BuyFilled > 0 || r.SellFilled > 0 {
+			filledRounds++
+			if r.FeeSource != "" && r.FeeSource != tLFeeSourceBroker {
+				estimateRounds++
+			}
+		}
+		if r.Unfilled {
+			out.Unfilled++
+		}
+		if r.DecisionPrice > 0 {
+			px, qty := r.BuyPrice, r.BuyFilled
+			if r.Dir == tLDirSell {
+				px, qty = r.SellPrice, r.SellFilled
+			}
+			if qty > 0 && px > 0 {
+				out.SlipCost += math.Abs(px-r.DecisionPrice) * float64(qty)
+			}
+		}
+		if r.ParticipationPct > 0 {
+			part = append(part, r.ParticipationPct)
+			if r.ParticipationPct > out.ParticipationPctMax {
+				out.ParticipationPctMax = r.ParticipationPct
+			}
+		}
+		out.Gross += r.TPnlGross
+		out.Net += r.TPnlNet
+		out.FeeBuy += r.FeeBuy
+		out.FeeSell += r.FeeSell
+		out.StampTax += r.StampTax
+	}
+	if filledRounds > 0 {
+		out.FeeEstimateShare = float64(estimateRounds) / float64(filledRounds)
+	}
+	if n := len(part); n > 0 {
+		sort.Float64s(part)
+		if n%2 == 1 {
+			out.ParticipationPctP50 = part[n/2]
+		} else {
+			out.ParticipationPctP50 = (part[n/2-1] + part[n/2]) / 2
+		}
+	}
+	out.Gross, out.Net = tLRound2(out.Gross), tLRound2(out.Net)
+	out.FeeBuy, out.FeeSell = tLRound2(out.FeeBuy), tLRound2(out.FeeSell)
+	out.StampTax, out.SlipCost = tLRound2(out.StampTax), tLRound2(out.SlipCost)
+	out.FeeEstimateShare = tLRound4(out.FeeEstimateShare)
+	out.ParticipationPctP50 = tLRound4(out.ParticipationPctP50)
+	out.ParticipationPctMax = tLRound4(out.ParticipationPctMax)
+	return out
 }
 
 // tLiveStore 按账号持有的 T 账本。锁刻意独立于 Engine.mu：
@@ -152,6 +262,20 @@ func (s *tLiveStore) dayLedger() (opened, done, unwound, converted, openNow int,
 		}
 	}
 	return opened, done, unwound, converted, openNow, pnlNet, pnlGross
+}
+
+// dayCost 当日成本分项快照（B1 每日总账的一行素材；只数当日 byID）。
+func (s *tLiveStore) dayCost() tLiveCostDaily {
+	if s == nil {
+		return tLiveCostDaily{}
+	}
+	s.mu.RLock()
+	rounds := make([]*TRoundLive, 0, len(s.byID))
+	for _, r := range s.byID {
+		rounds = append(rounds, r)
+	}
+	s.mu.RUnlock()
+	return tLiveCostOf(rounds)
 }
 
 // tLiveKeepLegacy 历史留档条数上限（账本体积；不影响判定）。
@@ -327,9 +451,14 @@ func (s *tLiveStore) save() error {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	today := make([]*TRoundLive, 0, len(s.byID))
 	for _, id := range ids {
 		st.Rounds = append(st.Rounds, s.byID[id])
+		today = append(today, s.byID[id])
 	}
+	// B1：日成本分项随文件落一盘（当日 byID 现算；历史留档刻意不计——它不是"今天的账"）。
+	cost := tLiveCostOf(today)
+	st.Cost = &cost
 	// 留档历史一并写回（跨日收摊的痕迹是唯一能解释"仓位为什么少了一块"的出处）。
 	for _, r := range s.legacy {
 		if r != nil && r.ID != "" {

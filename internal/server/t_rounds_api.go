@@ -40,14 +40,20 @@ const tRoundsMaxLimit = 500
 
 // tRoundsView 纸面账本响应：日汇总 + 明细 + 被拦分布 + 独立收益口径。
 type tRoundsView struct {
-	Book       string                 `json:"book"`        // paper / live（同一接口两面，前端按此分栏）
-	Day        string                 `json:"day"`         // 汇总所属交易日 YYYYMMDD
-	DayStats   *paper.TRoundDayStats  `json:"day_stats"`   // 当日开/配对/收摊/转换/熔断 + 收益
-	Rounds     []paper.TRound         `json:"rounds"`      // 明细（新→旧）
-	BlockSteps []tBlockStepView       `json:"block_steps"` // 当日"拦在哪一步"的分布（按次数倒序）
-	PnL        tPnlView               `json:"pnl"`         // 独立做 T 收益（累计只算 done 轮）
-	Enabled    bool                   `json:"enabled"`     // 该账号做 T 总开关的生效值
-	Extra      map[string]interface{} `json:"extra,omitempty"`
+	Book       string                `json:"book"`        // paper / live（同一接口两面，前端按此分栏）
+	Day        string                `json:"day"`         // 汇总所属交易日 YYYYMMDD
+	DayStats   *paper.TRoundDayStats `json:"day_stats"`   // 当日开/配对/收摊/转换/熔断 + 收益
+	Rounds     []paper.TRound        `json:"rounds"`      // 明细（新→旧）
+	BlockSteps []tBlockStepView      `json:"block_steps"` // 当日"拦在哪一步"的分布（按次数倒序）
+	PnL        tPnlView              `json:"pnl"`         // 独立做 T 收益（累计只算 done 轮）
+	// Cost B1 成本分解：纸面取自同日 day_stats.cost（引擎同一帧算好），实盘按明细现算。
+	// 放在顶层是为了让前端两本账共用一套渲染；day_stats 里那份仍保留（不回退旧调用方）。
+	Cost *paper.TCostDaily `json:"cost,omitempty"`
+	// ShadowNoT §T-COST B5：做 T vs 不做 T 的对照读数（同一路由新增段落，不新增路由）。
+	// available=false 时 reason 必须原样上屏："没有对照"不等于"做 T 没有影响"。
+	ShadowNoT *paper.TShadowNoTReadout `json:"shadow_no_t,omitempty"`
+	Enabled   bool                     `json:"enabled"` // 该账号做 T 总开关的生效值
+	Extra     map[string]interface{}   `json:"extra,omitempty"`
 }
 
 // tBlockStepView 一条"被拦步骤"读数（step 编号 + 代码 + 次数）。
@@ -82,6 +88,9 @@ func (s *Server) handlePaperTRounds(w http.ResponseWriter, r *http.Request) {
 	stats := pe.TRoundDay(day)
 	view.DayStats = &stats
 	view.Day = stats.Day
+	// B1：成本分解随同日 day ledger 一起透出（不新增路由）；指针指向副本，避免调用方改到引擎内存。
+	costCopy := stats.Cost
+	view.Cost = &costCopy
 	// 明细按"当日优先、再按 ID 倒序"：ID 形如 t0:<code>:<方向>:<YYYYMMDD>:<seq>，
 	// 直接倒序字典序就能把今天的多轮排在历史之前（同码同日的 seq 是末段，故同码内倒序也成立）。
 	all := pe.TRounds()
@@ -122,6 +131,9 @@ func (s *Server) handlePaperTRounds(w http.ResponseWriter, r *http.Request) {
 
 	net, gross, done, feeEst := pe.TRoundNetPnL()
 	view.PnL = tPnlView{Net: net, Gross: gross, DoneRounds: done, FeeEstShare: feeEst}
+	// B5：影子对照读数（开关关闭/无当日影子账时 available=false + reason，绝不回一条恒 0 的假曲线）。
+	shadow, _ := pe.TShadowNoTReadout()
+	view.ShadowNoT = &shadow
 	// 开关与影子态都从**账号级 sizing** 读（配置真源），不问引擎：paper.TParams 是 engine 侧
 	// 每轮组装的执行参数，接口若在这里重算一遍 MarketScale 就等于把"读数"变成"第二次判定"。
 	sc, _ := s.cfg.GetSizingConfigFor(uid)
@@ -179,7 +191,7 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		// 前端一律直接 map/取字段，回 null 会让页面崩在渲染期，而"崩"和"没有记录"是两件事。
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"book": "live", "account": uid, "state": state, "reason": reason,
-			"day": day, "rounds": []json.RawMessage{}, "pnl": tPnlView{},
+			"day": day, "rounds": []json.RawMessage{}, "pnl": tPnlView{}, "cost": tCostView{},
 		})
 		return
 	}
@@ -197,7 +209,7 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"book": "live", "account": uid, "state": "corrupt",
 			"reason": "实盘回转账本解析失败（原文件未改动，等待人工核对）",
-			"day":    day, "rounds": []json.RawMessage{}, "pnl": tPnlView{},
+			"day":    day, "rounds": []json.RawMessage{}, "pnl": tPnlView{}, "cost": tCostView{},
 		})
 		return
 	}
@@ -211,14 +223,33 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 	var net, gross float64
 	done, estCnt, kept := 0, 0, 0
 	filtered := make([]json.RawMessage, 0, limit)
+	// B1 成本分项按"目标日"累加（day 参数优先，其次账本自己的当日）：
+	// 与明细过滤同一个日子，避免出现"明细是今天、成本是累计"的拼接读数。
+	targetCostDay := day
+	if targetCostDay == "" {
+		targetCostDay = st.Day
+	}
+	acc := &tCostAccumulator{}
 	for i := len(st.Rounds) - 1; i >= 0; i-- { // 新→旧（文件按 ID 升序落盘）
-		// 只解聚合需要的四个字段：明细原样透传（json.RawMessage），server 不复制 engine 的结构体。
+		// 只解聚合需要的字段：明细原样透传（json.RawMessage），server 不复制 engine 的结构体。
 		var one struct {
-			Day       string  `json:"day"`
-			Status    string  `json:"status"`
-			TPnlNet   float64 `json:"t_pnl_net"`
-			TPnlGross float64 `json:"t_pnl_gross"`
-			FeeEst    bool    `json:"t_fee_est"`
+			Day              string  `json:"day"`
+			Dir              string  `json:"dir"`
+			Status           string  `json:"status"`
+			TPnlNet          float64 `json:"t_pnl_net"`
+			TPnlGross        float64 `json:"t_pnl_gross"`
+			FeeEst           bool    `json:"t_fee_est"`
+			BuyFilled        int     `json:"buy_filled"`
+			SellFilled       int     `json:"sell_filled"`
+			BuyPrice         float64 `json:"buy_price"`
+			SellPrice        float64 `json:"sell_price"`
+			DecisionPrice    float64 `json:"decision_price"`
+			FeeBuy           float64 `json:"fee_buy"`
+			FeeSell          float64 `json:"fee_sell"`
+			StampTax         float64 `json:"stamp_tax"`
+			FeeSource        string  `json:"fee_source"`
+			ParticipationPct float64 `json:"participation_pct"`
+			Unfilled         bool    `json:"unfilled"`
 		}
 		// 单行解不开就跳过：坏一行不该让整张卡读不出，但也不给它编一个 0 收益（收益只加能解开的行）。
 		if json.Unmarshal(st.Rounds[i], &one) != nil {
@@ -232,6 +263,16 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 			if one.FeeEst {
 				estCnt++
 			}
+		}
+		// 成本段只累加目标日的轮（收益段刻意不按日过滤，见上面注释里的口径分割）。
+		if targetCostDay == "" || one.Day == targetCostDay {
+			firstFilled, firstPrice, pairFilled := one.BuyFilled, one.BuyPrice, one.SellFilled
+			if one.Dir == "sell_first" {
+				firstFilled, firstPrice, pairFilled = one.SellFilled, one.SellPrice, one.BuyFilled
+			}
+			acc.add(firstFilled, firstPrice, one.DecisionPrice,
+				one.FeeBuy, one.FeeSell, one.StampTax, one.ParticipationPct,
+				one.TPnlGross, one.TPnlNet, pairFilled, one.FeeSource, one.Unfilled)
 		}
 		// 明细过滤只看 day，收益不受 day 过滤影响（见上面注释里的口径分割）。
 		if day != "" && one.Day != day {
@@ -289,6 +330,7 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		"rounds":      filtered,
 		"block_steps": blockViews,
 		"ledger":      ledger,
+		"cost":        acc.finalize(),
 		"pnl": tPnlView{Net: round2(net), Gross: round2(gross),
 			DoneRounds: done, FeeEstShare: feeEstShare},
 	})

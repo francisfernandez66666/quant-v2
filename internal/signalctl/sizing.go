@@ -92,6 +92,20 @@ func (s SizingResult) BuyScale() float64 {
 // 只有上限时弱市也满额——两端都要钉住。
 // English: effective per-trade share = lo + (hi−lo)×(MS×SS), clamped into [lo,hi].
 func PerTradePct(marketScale, stockScale, lo, hi float64) float64 {
+	return PerTradePctOf(marketScale*stockScale, lo, hi)
+}
+
+// PerTradePctOf 已知**合成因子 k**（= BuyScale = MarketScale × StockScale）时的单笔占比。
+//
+// 为什么要这个入口：纸面通道（paper.dynamicPaperQtyLocked）拿到的只有信号上带下来的
+// BuyScale 一个数，拆不出 MS/SS；若让它自己写 `lo + (hi−lo)×k`，本公式就有两份实现，
+// 日后调映射（例如改成幂函数）必然漏改一处——纸面与实盘的单笔差一倍，而两本账的收益曲线
+// 都还是"正常"的，这种漂移最难发现。所以拆出 k 版，PerTradePct 只是它的薄包装。
+//
+// 入参归一化（lo/hi 区间、k 夹到 [0,1]、出口再夹一次）全部在这里，两个入口共享同一套护栏。
+// English: the k-based entry point — paper only has BuyScale and cannot split MS/SS, so the mapping
+// lives here once and PerTradePct is a thin wrapper over it.
+func PerTradePctOf(k, lo, hi float64) float64 {
 	// 两端先各自收进合法区间：≤0 回落出厂值，>0.50 一律钳到半仓（单笔不过半仓是硬边界）。
 	// 这一步必须在下限/上限比较之前做，否则"lo=0.8, hi=0.9"会先被当成合法区间再双双钳掉，
 	// 收敛结果依赖判断顺序（那种顺序依赖正是配置类缺陷的温床）。
@@ -111,7 +125,6 @@ func PerTradePct(marketScale, stockScale, lo, hi float64) float64 {
 		hi = lo // 区间反了：抬上限而不是压下限，保证"配置错了也不会把单笔缩成 0"
 	}
 	// k = 市场组×个股组（都在 (0,1]）：越界一律夹到 [0,1]，负值是弃权分支返回异常的形态。
-	k := marketScale * stockScale
 	if k < 0 {
 		k = 0
 	}

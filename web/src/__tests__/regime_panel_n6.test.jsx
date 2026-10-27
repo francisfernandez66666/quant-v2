@@ -165,8 +165,12 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
     expect(Object.keys(body.concept).sort()).toEqual(['enabled', 'max_staleness_hours', 'min_coverage_pct', 'shadow'])
     // §SIZING-FINE（2026-10-22）：面板现在负责 sizing 的**全量**键（精细参数折叠区也在内），
     // 逐键等值锁住键集——多一个未定义键会被后端稀疏 merge 写进配置，少一个键等于某组精细参数失踪。
+    // §T-CLUSTER（2026-10-27）：新增相关性簇帽两键。cluster_cap_pct 是**三态**
+    // （缺键=出厂 40；显式 0=关闭），所以它必须在键集里——面板不提交它就等于
+    // owner 无法关闭簇帽；而回显读错（num() 的 n>0）会把 0 读回 40，见 cluster 专项用例。
     expect(Object.keys(body.sizing).sort()).toEqual([
-      'bear_sl_tighten_pt', 'breadth_missing_scale', 'budget_mode', 'cap', 'emotion_scales', 'enabled', 'evo',
+      'bear_sl_tighten_pt', 'breadth_missing_scale', 'budget_mode', 'cap', 'cluster_cap_pct', 'cluster_rho',
+      'emotion_scales', 'enabled', 'evo',
       'flow_factor', 'floor', 'group_floors', 'holiday_block_new', 'holiday_scales', 'index_scale_thresholds',
       'kelly_lambda', 'kelly_min_prob',
       'llm_bearish_scale', 'macro_event_day_scale', 'macro_lead_curve', 'macro_lead_days',

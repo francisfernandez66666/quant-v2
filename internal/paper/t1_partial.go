@@ -362,6 +362,8 @@ func (e *Engine) runPendingExitsLocked(quotes map[string]*data.StockInfo, now ti
 		e.recordOrderLocked(Order{Code: p.Code, Name: p.Name, Strategy: p.Strategy,
 			StrategyType: p.StrategyType, Side: "sell", Kind: "残量退出", Price: price, Qty: sold,
 			Status: status, Reason: reason, CreatedAt: now})
+		// B5：残量退出是卖出裁决的延续（非 T 成交），影子账同样镜像。
+		e.tShadowMirrorSellLocked(code, e.applySellPriceLocked(price), sold, time.Now())
 		// 本轮没卖完的剩余量**回到同一把意图上继续追**（合并保留最初触发日与到期日，所以有效期不会被
 		// 无限顺延）。若不这样处理，本轮可卖量小于意图量时（例如残量里还夹着另一天买的批次）就会
 		// 删掉意图、把退出裁决静默丢弃——正是裁决三要收掉的那类"该卖的没卖、也没人知道"。

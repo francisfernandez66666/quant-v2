@@ -49,6 +49,20 @@ function fmtTime(s) {
   return t.slice(5, 19).replace('T', ' ')
 }
 
+// buildPolyline §T-COST B5：把"真实 vs 影子"两列净值点画成简线（不引图表库）。
+// 纵向范围取两列合并的 min/max，两条线才在同一坐标系里可比；点少于 2 个时返回空串（画不出形状）。
+function buildPolyline(series, key, width, height, lo, hi) {
+  if (!Array.isArray(series) || series.length < 2 || !(hi > lo)) return ''
+  const span = hi - lo
+  return series
+    .map((p, i) => {
+      const x = (i / (series.length - 1)) * width
+      const y = height - ((Number(p[key]) - lo) / span) * height
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+}
+
 export default function TRoundsCard() {
   const [tab, setTab] = useState('paper')
   const [loading, setLoading] = useState(true)
@@ -127,6 +141,20 @@ export default function TRoundsCard() {
     },
     { colKey: 'v', title: '分时均线', width: 90, cell: ({ row }) => <span>{fmtNum(row.v, 3)}</span> },
     { colKey: 'dev_pct', title: '偏离%', width: 80, cell: ({ row }) => <span>{fmtNum(row.dev_pct)}</span> },
+    // B1 成本分解（§T-COST）：滑点取首腿（decision_price 只锚首腿），正数＝对我不利；
+    // 费用来源 broker/estimate/mixed 必须原样显示——把 estimate 涂成 broker 是本批明令禁止的混算。
+    { colKey: 'slip_bps', title: '滑点bp', width: 80, cell: ({ row }) => {
+      const v = Number(row.slip_bps)
+      if (!Number.isFinite(v) || v === 0) return <span>—</span>
+      return <span style={{ color: v > 0 ? 'var(--app-down)' : 'var(--app-up)' }}>{v.toFixed(1)}</span>
+    } },
+    { colKey: 'fee_source', title: '费用来源', width: 90, cell: ({ row }) => {
+      const src = row.fee_source
+      if (!src) return <span>—</span>
+      const theme = src === 'broker' ? 'success' : src === 'mixed' ? 'warning' : 'default'
+      const label = src === 'broker' ? '券商' : src === 'mixed' ? '混合' : '估算'
+      return <Tag size="small" theme={theme}>{label}</Tag>
+    } },
     { colKey: 'frozen_cash', title: '冻结资金', width: 90, cell: ({ row }) => <span>{fmtNum(row.frozen_cash)}</span> },
     { colKey: 'used_signal_id', title: '消费信号', width: 120, ellipsis: true, cell: ({ row }) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{row.used_signal_id || '—'}</span> },
     { colKey: 'leg_at', title: '开腿时刻', width: 120, cell: ({ row }) => <span>{fmtTime(row.leg_at || row.opened_at)}</span> },
@@ -145,6 +173,18 @@ export default function TRoundsCard() {
   }, [paperView])
 
   const pnl = (view && view.pnl) || { net: 0, gross: 0, done_rounds: 0, fee_est_share: 0 }
+  // B1 成本分解：纸面取 view.cost（引擎同日汇总的副本），实盘取接口按明细现算的同形结构。
+  // 两本账共用一套字段名，所以这里不再按 tab 分支——分支一多就会出现"纸面看到、实盘看不到"的列。
+  const cost = (view && view.cost) || null
+  // B5 影子对照：只有纸面账本带这一段（实盘不做影子，避免"实盘也有一条对照"的误读）。
+  const shadow = tab === 'paper' && paperView ? paperView.shadow_no_t : null
+  const shadowSeries = (shadow && Array.isArray(shadow.series)) ? shadow.series : []
+  const shadowLo = shadowSeries.length
+    ? Math.min(...shadowSeries.map((p) => Math.min(Number(p.real) || 0, Number(p.shadow) || 0)))
+    : 0
+  const shadowHi = shadowSeries.length
+    ? Math.max(...shadowSeries.map((p) => Math.max(Number(p.real) || 0, Number(p.shadow) || 0)))
+    : 0
   const liveState = liveView && liveView.state
 
   return (
@@ -184,6 +224,66 @@ export default function TRoundsCard() {
               </span>
             )}
           </div>
+          {/* B1 成本分解一栏（§T-COST）：毛 − 佣金 − 印花 − 滑点 = 净 的展示面。
+              滑点是首腿口径（元，绝对值和），不是"净额再扣一次"——净额公式里没有滑点项，
+              这里并排显示只为回答"赚的价差被哪一项吃掉多少"。 */}
+          {cost && (
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', margin: '4px 0 10px', fontSize: 13 }}>
+              <span>毛 {fmtNum(cost.gross)}</span>
+              <span>佣金 {fmtNum(Number(cost.fee_buy || 0) + Number(cost.fee_sell || 0))}</span>
+              <span>印花 {fmtNum(cost.stamp_tax)}</span>
+              <span>滑点成本 {fmtNum(cost.slip_cost)}</span>
+              <span style={{ fontWeight: 600 }}>净 {fmtNum(cost.net)}</span>
+              <span className="muted">成交腿数 {Number(cost.fills) || 0}</span>
+              {Number(cost.unfilled) > 0 && <Tag size="small" theme="warning">未成交腿 {Number(cost.unfilled)}</Tag>}
+              {Number(cost.fee_estimate_share) > 0 && (
+                <Tag size="small" variant="light" theme={Number(cost.fee_estimate_share) >= 1 ? 'warning' : 'default'}>
+                  费用为估算入账占比 {(Number(cost.fee_estimate_share) * 100).toFixed(0)}%
+                </Tag>
+              )}
+              {/* 参与率分母＝开腿时已累计的当日成交额（不是全天量），读数天然偏保守。 */}
+              {Number(cost.participation_pct_max) > 0 && (
+                <span className="muted">
+                  参与率 中位 {fmtNum(cost.participation_pct_p50, 4)}% / 最大 {fmtNum(cost.participation_pct_max, 4)}%
+                </span>
+              )}
+            </div>
+          )}
+          {/* B5 "做 T 归因"（真实 vs 影子）：两账同信号同资金，唯一差别是影子不执行 T 腿，
+              所以两条线之差就是当日 T 的归因。available=false 时只说"没有对照"——那不等于
+              "做 T 没有影响"（把没有样本画成 0 正是本项目反复吃亏的假绿）。 */}
+          {tab === 'paper' && shadow && (
+            <div style={{ border: '1px dashed var(--app-border, #e7e7e7)', borderRadius: 6, padding: '8px 10px', marginBottom: 10 }}>
+              {shadow.available ? (
+                <>
+                  <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 13, marginBottom: 6 }}>
+                    <span>做 T 归因（真实−影子）：<b style={{ color: Number(shadow.t_attribution) >= 0 ? 'var(--app-up)' : 'var(--app-down)' }}>{fmtNum(shadow.t_attribution)}</b> 元</span>
+                    <span>占起始权益 {fmtNum(shadow.t_attribution_pct, 3)}%</span>
+                    <span className="muted">真实 {fmtNum(shadow.equity_real)} / 影子 {fmtNum(shadow.equity_shadow)}</span>
+                    <span className="muted">镜像 {Number(shadow.mirrored) || 0} 笔 · 跳过 T 腿 {Number(shadow.skipped_t_legs) || 0}</span>
+                    {shadow.enabled === false && <Tag size="small" theme="default">影子开关已关（曲线为关停前最后一段）</Tag>}
+                  </div>
+                  {shadowSeries.length >= 2 ? (
+                    <svg viewBox="0 0 600 120" preserveAspectRatio="none" style={{ width: '100%', height: 120 }}>
+                      <polyline fill="none" stroke="var(--app-up, #2ba471)" strokeWidth="1.5"
+                        points={buildPolyline(shadowSeries, 'real', 600, 120, shadowLo, shadowHi)} />
+                      <polyline fill="none" stroke="var(--app-warning, #e37318)" strokeWidth="1.5" strokeDasharray="4 3"
+                        points={buildPolyline(shadowSeries, 'shadow', 600, 120, shadowLo, shadowHi)} />
+                    </svg>
+                  ) : (
+                    <div className="muted" style={{ fontSize: 12 }}>影子账当日点数不足（至少两轮估值后才有曲线）</div>
+                  )}
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    绿实线＝真实账，橙虚线＝不做 T 的影子账；两线重合说明当日 T 没有改变权益
+                  </div>
+                </>
+              ) : (
+                <div className="muted" style={{ fontSize: 12 }}>
+                  做 T 归因不可得：{shadow.reason || '当日没有影子账（sizing.t.shadow_no_t 未开启）'}
+                </div>
+              )}
+            </div>
+          )}
           {/* 目标仓位一帧读数（§8.8 面板展示）：由账本引擎按下单同一条式子算出，接口原样搬出来。
               market_scale 缺失（=0）时必须显式说"本轮尚未定权"，不能显示 1.00——
               把"不知道"画成"满额目标"正是本批要消灭的那类假读数。 */}

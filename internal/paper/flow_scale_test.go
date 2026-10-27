@@ -6,8 +6,8 @@
 // 因子层单测全绿也发现不了。方案 §2.10 的「执行层」一行就是要求这条链路有断言。
 //
 // 口径（与 §DYN-SIZE-v3 一致）：
-//   - dynamic 模式下 scale 直接乘在**池权益基数**上（不是乘最终股数），所以
-//     0.5 → 权益基数 10 万×0.5 = 5 万 → 受 35% 单票上限 → 1.75 万 → 1750 股；
+//   - dynamic 模式下 k 进的是**单笔占比**（§B0：eff = lo+(hi−lo)×k），再乘池权益基数，
+//     所以 0.5 → eff=0.30 → 5 万×0.30 = 1.5 万 → 1500 股（不再乘最终股数）；
 //   - sizeScale=0 或 1.0 都表示"不缩放"（0 是 Signal 的零值，绝不能理解成"买 0 股"）；
 //   - SizingShadow=true 时只留痕不下发 → 股数与 1.0 基线完全一致。
 //
@@ -42,7 +42,9 @@ func flowFillQty(t *testing.T, cfg Config, sizeScale float64) int {
 	// §DYN-SIZE v4：出厂单笔基准 10%（1000 股上限），那样"scale 乘在基数上"与"35% 额度截断"
 	// 两条约束会同时看不出差别。这里把基准临时放大到 100%，让本文件原有的 scale 敏感性对照继续有效
 	// ——锁的靶心是"scale 有没有落到执行层"，不是"基准是多少"（基准本身由 §1.4 的用例锁）。
-	e.SetSizingContext(1.0, 1.0, 1.0, false)
+	// §B0 起单笔占比 = lo + (hi−lo)×k（k = SizeScale），所以这里必须给一个**有宽度**的区间
+	// （10%~50%）才看得见 scale 的敏感性；lo=hi 会让 eff 变成常数、本文件全部用例同时失效。
+	e.SetSizingContext(1.0, 0.10, 0.50, 1.0, false)
 	e.SetStrategyPools([]string{"dragon"}) // OnSignals 按战法池入账：不设池则无池可买
 	quotes := map[string]*data.StockInfo{"600000.SH": {Code: "600000.SH", Price: 10, ChangePct: 1}}
 	e.OnSignals([]combat_agent.Signal{flowBuySignal("600000.SH", sizeScale)}, quotes)
@@ -56,34 +58,31 @@ func flowFillQty(t *testing.T, cfg Config, sizeScale float64) int {
 // TestDynamicBuyScaleChangesFillQty dynamic 模式下 scale 真的改变成交股数。
 //
 // 读数的正确解释（数字本身就是口径说明，改动前先看懂这段）：
-//   - 单池 dragon 分到 5 万池权益，全盘 10 万 → 35% 单票上限 = 3.5 万 = 3500 股；
-//   - scale=1.0 时基数 5 万 > 上限 3.5 万 ⇒ **上限生效**，成交 3500 股；
-//   - scale=0.5 时基数 5 万×0.5 = 2.5 万 < 上限 ⇒ **基数生效**，成交 2500 股；
-//   - scale=0.25 时 1.25 万 ⇒ 1250 股（与 0.5 恰好成 2:1，证明缩放是乘在基数上的）；
-//   - scale=0（Signal 零值）必须与 1.0 同义 —— 绝不能理解成"买 0 股"。
+//   - 单池 dragon 分到 5 万池权益；单笔占比区间取 10%~50%（见 flowFillQty 的注入）；
+//   - k=1.0 ⇒ eff=0.50 ⇒ 5 万×0.50 = 2.5 万 ⇒ **2500 股**（35% 单票上限 3.5 万不参与）；
+//   - k=0.5 ⇒ eff=0.30 ⇒ 1.5 万 ⇒ 1500 股；
+//   - k=0.25 ⇒ eff=0.20 ⇒ 1.0 万 ⇒ 1000 股（与 0.5 恰好成 3:2，证明 k 真的进了占比）；
+//   - k=0（Signal 零值）必须与 1.0 同义 ⇒ 2500 股 —— 绝不能理解成"买 0 股"。
 //
-// 反证靶心：若 dynamicPaperQtyLocked 丢掉 scale 参数，上面四条会全部读成 3500。
+// 反证靶心：若 dynamicPaperQtyLocked 丢掉 k（或又把它乘一遍），上面四条会同时读到 2500 或全不成立。
 // English: in dynamic mode the scale multiplies the pool-equity base (the 35% single-stock cap
 // binds at scale=1 but not below), so 0.5 → 2500 and 0.25 → 1250 prove the multiplication is real.
 func TestDynamicBuyScaleChangesFillQty(t *testing.T) {
 	cfg := dynPaperConfig(100000)
-	if got := flowFillQty(t, cfg, 1.0); got != 3500 {
-		t.Fatalf("scale=1.0 受 35%% 单票上限约束应买 3500 股, got %d", got)
+	if got := flowFillQty(t, cfg, 1.0); got != 2500 {
+		t.Fatalf("k=1.0 ⇒ eff=0.50 ⇒ 应买 2500 股, got %d", got)
 	}
-	if got := flowFillQty(t, cfg, 0.5); got != 2500 {
-		t.Fatalf("scale=0.5 应按池权益基数（5万×0.5）买 2500 股, got %d（scale 未落到执行层）", got)
+	if got := flowFillQty(t, cfg, 0.5); got != 1500 {
+		t.Fatalf("k=0.5 ⇒ eff=0.30 ⇒ 应买 1500 股, got %d（k 未落到执行层）", got)
 	}
-	// 0.25 档：理论 1250 股，预算器按整手向下取整并预留费用缓冲后落在 1200 股附近。
-	// 断言用**区间**而不是精确值：这里要证明的是"scale 乘在基数上"（忽略 scale 会读成 3500），
-	// 不是把 ordbudget 的取整细节焊死在用例里。
-	// English: assert a range — the point is that the scale multiplies the base (ignoring it would
-	// read 3500), not to freeze the budget calculator's lot-rounding detail.
-	if got := flowFillQty(t, cfg, 0.25); got < 1150 || got > 1250 {
-		t.Fatalf("scale=0.25 应买约 1250 股（整手取整后 1150~1250）, got %d", got)
+	// 0.25 档：eff=0.20 ⇒ 1.0 万 ⇒ 1000 股（整手无取整损失，所以这里可以用精确值）。
+	// English: k=0.25 → eff=0.20 → 10k → 1000 shares (no lot rounding loss, exact value ok).
+	if got := flowFillQty(t, cfg, 0.25); got != 1000 {
+		t.Fatalf("k=0.25 ⇒ eff=0.20 ⇒ 应买 1000 股, got %d", got)
 	}
 	// 零值与 1.0 同义：Signal 的零值字段绝不能理解成"买 0 股"。
-	if zero := flowFillQty(t, cfg, 0); zero != 3500 {
-		t.Fatalf("sizeScale=0 应与 1.0 同义（3500 股）, got %d", zero)
+	if zero := flowFillQty(t, cfg, 0); zero != 2500 {
+		t.Fatalf("sizeScale=0 应与 1.0 同义（2500 股）, got %d", zero)
 	}
 }
 
@@ -92,8 +91,9 @@ func TestDynamicBuyScaleChangesFillQty(t *testing.T) {
 func TestDynamicBuyScaleShadowKeepsQty(t *testing.T) {
 	cfg := dynPaperConfig(100000)
 	cfg.SizingShadow = true
-	if got := flowFillQty(t, cfg, 0.5); got != 3500 {
-		t.Fatalf("影子模式不得改变成交股数（应 3500）, got %d", got)
+	// 影子模式下 k 恒按中性 1.0 计 ⇒ eff=0.50 ⇒ 与基线（k=1.0）完全一致。
+	if got := flowFillQty(t, cfg, 0.5); got != 2500 {
+		t.Fatalf("影子模式不得改变成交股数（应 2500）, got %d", got)
 	}
 }
 

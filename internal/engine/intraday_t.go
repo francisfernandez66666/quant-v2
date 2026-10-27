@@ -421,6 +421,9 @@ func (e *Engine) runIntradayT(uid string, pe *paper.Engine, quotes map[string]*d
 	}
 	sc := e.sizingConfigFor(uid)
 	tc := sc.T
+	// §T-COST B5：影子开关**先于** enabled 判断注入——"确认开关关掉"也要把影子停住（镜像不再增长），
+	// 而不是让它在 T 关闭期间继续镜像出一本说不清口径的账。
+	pe.SetShadowNoT(tc.TShadowNoTOf())
 	if !tc.TEnabled() {
 		return
 	}
@@ -430,15 +433,21 @@ func (e *Engine) runIntradayT(uid string, pe *paper.Engine, quotes map[string]*d
 	p, ms, missing := e.tParamsFor(uid, tc, sc.ShadowOn())
 	// 顺手把定权上下文喂给纸面目标模型：一笔买入与一条 T 腿必须吃同一个 MS，
 	// 分头计算会让"目标 70%、单笔却按 85% 算"这类漂移无声发生。
-	perTrade := sc.PerTradePositionPct
-	if perTrade <= 0 || perTrade > 1 {
-		perTrade = 0.10
+	// §B0：单笔占比传**区间两端**（lo/hi），纸面自己按 k 调 signalctl.PerTradePctOf——
+	// 与实盘同一个纯函数，两本账的金额口径从此同源（旧写法只传 lo，纸面单笔只有实盘的 1/3）。
+	perTradeLo := sc.PerTradePositionPct
+	if perTradeLo <= 0 || perTradeLo > 1 {
+		perTradeLo = 0.10
+	}
+	perTradeHi := sc.PerTradePositionMaxPct
+	if perTradeHi <= 0 {
+		perTradeHi = 0.30
 	}
 	ceiling := sc.MaxTotalPositionPct
 	if ceiling <= 0 || ceiling > 1 {
 		ceiling = 1.0
 	}
-	pe.SetSizingContext(ms, perTrade, ceiling, missing)
+	pe.SetSizingContext(ms, perTradeLo, perTradeHi, ceiling, missing)
 	e.wireTCallbacks(uid, pe, &p)
 	pe.RunIntradayT(quotes, p)
 }
