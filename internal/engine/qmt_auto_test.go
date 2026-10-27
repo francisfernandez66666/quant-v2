@@ -77,6 +77,15 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 	cfg.GatewayURL = srv.URL
 	cfg.FixedAmount = 10000
 	cfg.MissHeartbeatSec = 5
+	// §B6：软回踩出厂 1% 会让"行情快照缺 Amount/Volume"的用例走 vwapQuoteFor 的**网络兜底**，
+	// 离线测试因此打真外网（首个踩中的用例直接 panic 在 http.Client.Do）。基线钉成关闭，
+	// 需要回踩的用例自己显式打开并给足 VWAP 输入。
+	// English: pullback on by default would make offline tests hit the network VWAP fallback; the
+	// harness pins it off and pullback tests opt in explicitly.
+	cfg.EntryPullbackPct = 0
+	// §B0：最小成交额闸在 dynamic 下已恢复生效（默认 1 万）。本 harness 的用例大量是"小额成交"
+	// 主题（幂等/限次/额度），统一显式关掉；闸本身由 TestB0MinOrderBlocksDynamic 专门钉。
+	cfg.MinOrderAmount = -1
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -645,20 +654,69 @@ func TestM8PeakResetsWhenFlat(t *testing.T) {
 // English: plan-C locks — order price is current price plus one tick rounded to 0.01, the retired
 // pullback knob can no longer move the quote, and the VWAP ceiling is judged on the order price.
 func TestVWAPPlanCOrderPrice(t *testing.T) {
-	t.Run("回踩配置不再生效且按tick加价", func(t *testing.T) {
+	t.Run("回踩生效但被让价上限夹住", func(t *testing.T) {
+		old := isContinuousTrade
+		isContinuousTrade = func(time.Time) bool { return true } // 钉死连续竞价
+		defer func() { isContinuousTrade = old }()
 		e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) {
 			c.FixedAmount = 20000
-			c.EntryPullbackPct = 3 // 旧生产值：本批起只是"配着"，不再影响报价
+			c.EntryPullbackPct = 3         // 目标 = VWAP 下 3% = 97
+			c.EntryPullbackMaxGapPct = 1.0 // 但最多只比现价低 1% = 99.99
 			c.MaxSignalVWAPPremiumPct = 0
 		})
-		// VWAP=100、现价=101：旧实现会挂 97（买不进）；新实现挂 101.01。
 		sig := combat_agent.Signal{ID: "PC1", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 101}
 		e.autoPlace(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 101, Amount: 100 * 1e6, Volume: 1e6}})
 		if len(*orders) != 1 {
 			t.Fatalf("应下 1 单，got %d", len(*orders))
 		}
+		// 没有让价上限时这里会是 97（10-26 那排「已撤」的形态）；v2 的判据是"最多让到 99.99"。
+		if p, _ := (*orders)[0]["price"].(float64); p != 99.99 {
+			t.Fatalf("让价上限 1%% 应把委托价夹到 99.99（不是 VWAP 下的 97），got %v", p)
+		}
+		if to, _ := (*orders)[0]["timeout_sec"].(float64); to != 120 {
+			t.Fatalf("回踩单必须带超时（默认 120s），got %v", to)
+		}
+	})
+
+	t.Run("非连续竞价不回踩且按tick加价", func(t *testing.T) {
+		old := isContinuousTrade
+		isContinuousTrade = func(time.Time) bool { return false } // 集合竞价/收盘竞价
+		defer func() { isContinuousTrade = old }()
+		e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) {
+			c.FixedAmount = 20000
+			c.EntryPullbackPct = 1
+			c.EntryPullbackMaxGapPct = 1.0
+		})
+		sig := combat_agent.Signal{ID: "PC1b", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 101}
+		e.autoPlace(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 101, Amount: 100 * 1e6, Volume: 1e6}})
+		if len(*orders) != 1 {
+			t.Fatalf("应下 1 单，got %d", len(*orders))
+		}
 		if p, _ := (*orders)[0]["price"].(float64); p != 101.01 {
-			t.Fatalf("委托价应为现价+1tick=101.01（绝不能是 97 的回踩价），got %v", p)
+			t.Fatalf("非连续竞价应现价+1tick=101.01，got %v", p)
+		}
+		if to, _ := (*orders)[0]["timeout_sec"].(float64); to != 0 {
+			t.Fatalf("非回踩单不应带回踩超时，got %v", to)
+		}
+	})
+
+	t.Run("现价已低于VWAP时不等待，按tick加价", func(t *testing.T) {
+		old := isContinuousTrade
+		isContinuousTrade = func(time.Time) bool { return true }
+		defer func() { isContinuousTrade = old }()
+		e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) {
+			c.FixedAmount = 20000
+			c.EntryPullbackPct = 1
+			c.EntryPullbackMaxGapPct = 1.0
+		})
+		// VWAP=104、现价=101：回踩目标 102.96 反而高于现价+1tick ⇒ 只在下面让，不往上追。
+		sig := combat_agent.Signal{ID: "PC1c", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 101}
+		e.autoPlace(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 101, Amount: 104 * 1e6, Volume: 1e6}})
+		if len(*orders) != 1 {
+			t.Fatalf("应下 1 单，got %d", len(*orders))
+		}
+		if p, _ := (*orders)[0]["price"].(float64); p != 101.01 {
+			t.Fatalf("现价已在 VWAP 下方时不该挂更高的回踩价，got %v", p)
 		}
 	})
 

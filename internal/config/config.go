@@ -510,12 +510,21 @@ type QMTConfig struct {
 	// if 0 meant "off"); negative = explicitly disable. Read via EffectiveMinBuyPrice.
 	// 最低买入价
 	MinBuyPrice float64 `json:"min_buy_price"`
-	// EntryPullbackPct §C2 软回踩：>0 时挂单价 = min(信号价, VWAP×(1−pct/100))；0=关（默认）。
-	// 只改限价参考，不改变股数上限；未成交仍由既有超时撤单兜底。
-	// English: §C2 soft pullback — limit price = min(signal, VWAP×(1−pct/100)); 0 = off.
+	// EntryPullbackPct 软回踩 v2 目标（%，默认 1.0；0=关）。
+	// 委托价 = max(VWAP×(1−p), 现价×(1−max_gap))，再被现价+1tick 封顶；只在连续竞价挂。
+	// **旧实现（min(信号价, VWAP×(1−p))）已在 2026-10-26 下线**：没有让价上限、没有时段门，
+	// 委托价最远可以比现价低 8%，生产上留下 14:06–14:10 一整排「已撤」。v2 必须同时有
+	// EntryPullbackMaxGapPct 与时段门，缺一个就退回事故形态。
+	// English: soft pullback target in percent (default 1.0; 0 = off). v2 pricing is
+	// max(VWAP×(1−p), price×(1−max_gap)) capped at price+1tick, continuous session only.
 	EntryPullbackPct float64 `json:"entry_pullback_pct"`
-	// EntryTimeoutSec §C2 软回踩单超时秒数（0=沿用 qmt.cancel_stale_sec 的既有撤单闭环）。
-	// English: §C2 pullback order timeout (0 = use the existing cancel_stale_sec sweep).
+	// EntryPullbackMaxGapPct 让价上限（%，默认 1.0）：委托价最多比现价低这么多。
+	// 0=出厂默认 1.0；负数=显式取消上限（**等同恢复 10-26 的事故形态，只允许显式写**）。
+	// English: max distance below the current price (default 1.0); 0 → default; negative = explicit no cap.
+	EntryPullbackMaxGapPct float64 `json:"entry_pullback_max_gap_pct"`
+	// EntryTimeoutSec 回踩单超时秒数（默认 120）：到点未成交即撤，同日同票同战法不重挂
+	// （靠既有 buy 幂等键）。0=出厂默认 120；负数=沿用 qmt.cancel_stale_sec 的旧撤单闭环。
+	// English: pullback order timeout (default 120s); negative = fall back to cancel_stale_sec sweep.
 	EntryTimeoutSec int `json:"entry_timeout_sec"`
 	// MaxSignalVWAPPremiumPct §C2 硬过滤：信号价高于 VWAP 超过该 % 时放弃本次买入；0=关（默认）。
 	// 上线前先影子统计误杀率。
@@ -533,7 +542,8 @@ type QMTConfig struct {
 	// 负数=显式关闭本闸。生效读数走 EffectiveMinOrderAmount。
 	// English: per-order minimum notional floor (owner ruling 2026-10-12) — notional = price × FINAL
 	// lot count, checked AFTER the cash-downgrade block and BEFORE order assembly. 0 = factory
-	// default 5000; negative = explicitly disable. Read via EffectiveMinOrderAmount.
+	// default 10000 (owner 2026-10-27 raised it from 5000: sub-10k orders are the "碎单" shape);
+	// negative = explicitly disable. Applies to add-ons too (no held exemption).
 	// 单笔最低成交额
 	MinOrderAmount float64 `json:"min_order_amount"`
 	// AutoSellAllSources §B7（owner 2026-10-22）全卖出自动化开关（nil/false=保持旧行为）：
@@ -1011,14 +1021,24 @@ func DefaultQMTConfig() QMTConfig {
 		DailyMaxBuys:      20,
 		DailyBudgetAmount: 100000,
 		MinBuyPrice:       5,
-		MinOrderAmount:    5000,
-		AutoSell:          true,
+		MinOrderAmount:    10000,
+		// §B6（owner 2026-10-27）：软回踩 v2 出厂开 1%，让价上限 1%，超时 120s。
+		// 三个数一起出厂才安全：只给 pct 不给 max_gap，就是 10-26 那次「已撤」的形态。
+		EntryPullbackPct:       1.0,
+		EntryPullbackMaxGapPct: 1.0,
+		EntryTimeoutSec:        120,
+		AutoSell:               true,
 		Advice: QMTAdviceConfig{
 			AddReopenDrawdownPct: -5,
 			AddSignalActive:      true,
 			HoldMinProfitPct:     0,
 		},
 		Discipline: DefaultDisciplineConfig(),
+		// §C1-V2 概念敞口上限出厂 **40%**（owner 2026-10-27：「概念库已经 100% 了，可以实装了」）。
+		// 语义（已在 risk.Gate 实现）：多概念取**命中的最大敞口概念**检查、不做重叠求和；
+		// 覆盖率 <95% / 概念未知 / 总资产不可得 一律弃权；影子开关仍按既有约定（nil=只留痕），
+		// 要真拦需显式 concept_value_shadow=false——默认先留痕是既有灰度纪律，不因本批推翻。
+		RiskGate: RiskGateConfig{ConceptValuePct: 40},
 	}
 }
 
@@ -1703,6 +1723,16 @@ type SizingConfig struct {
 	// 再乘 MarketScale×StockScale，最后与目标剩余空间取小。
 	// English: the per-trade base weight (share of total assets) that anchors one order before scaling.
 	PerTradePositionPct float64 `json:"per_trade_position_pct"`
+	// PerTradePositionMaxPct 单笔上限（占**总资产**比例，默认 0.30）。
+	// owner 2026-10-27：「单笔占比按因子在 10%~30% 之间动」——下限是本键上一行的
+	// PerTradePositionPct，生效值由 signalctl.PerTradePct 算出：
+	// eff = lo + (hi−lo)×(MarketScale×StockScale)，再硬夹 [lo,hi]。
+	// 为什么必须有上限：只有下限时，因子再好也只是 10%——账户小的时候单笔偏碎；
+	// 只有上限时，弱市也会满额——所以两端都要钉住。两值都钳到 ≤0.5：
+	// 单笔超过半仓在任何风控口径下都没有意义。
+	// English: per-trade upper bound (default 30%); the effective share is
+	// lo + (hi−lo)×(MS×SS) clamped into [lo,hi] (owner 2026-10-27: 10%~30% by factors).
+	PerTradePositionMaxPct float64 `json:"per_trade_position_max_pct"`
 	// MaxDrawdownPct 账户权益回撤熔断（默认 0.10；0=不启用）：回撤达此比例时按 pysystemtrade
 	// risk_overlay 口径缩仓（mult = limit/max(limit, drawdown)）。
 	MaxDrawdownPct float64 `json:"max_drawdown_pct"`
@@ -2228,30 +2258,33 @@ func DefaultSizingConfig() SizingConfig {
 		// 代价如实登记：目标上移、T 池相应变小；控制项＝迁移 dry-run 未签字不写盘、回滚只改配置。
 		// English: shipped default is power_mean now (owner overturned the earlier "mode in a later batch" ruling);
 		// it de-stacks penalties so the target reflects the factor set rather than their product.
-		Mode:                    "power_mean",
-		Shadow:                  sizingBool(false),
-		PowerP:                  &defaultP,
-		GroupFloors:             map[string]float64{"market": 0.45, "stock": 0.35},
-		Floor:                   0.15,
-		Cap:                     1.15,
-		KellyLambda:             0.5,
-		KellyMinProb:            0.52,
-		VolTargetPct:            2.0,
-		VolClampLo:              0.5,
-		VolClampHi:              1.5,
-		EmotionScales:           map[string]float64{"退潮": 0.50, "背离": 0.60, "高潮": 0.80, "发酵": 1.00, "启动": 1.00},
-		StateScales:             map[string]float64{"bull": 1.00, "range": 0.70, "bear": 0.40},
-		TierScales:              map[string]float64{"Yellow": 0.60, "Red": 0.30},
-		BreadthMissingScale:     0.90,
-		MacroWindowScales:       map[string]float64{"high": 0.50, "medium": 0.80, "low": 1.00},
-		MacroLeadDays:           5,
-		MacroLeadCurve:          []float64{0.90, 0.85, 0.80, 0.70, 0.50},
-		MacroEventDayScale:      0.30,
-		HolidayScales:           map[string]float64{"weekend": 0.85, "small1": 0.70, "small2": 0.85, "long1": 0.40, "long2": 0.60, "long3": 0.75},
-		IndexScaleThresholds:    map[string]float64{"-1": 1.00, "-2": 0.70, "deep": 0.40},
-		LLMBearishScale:         0.5,
-		MaxTotalPositionPct:     1.00, // 目标仓位天花板（v4：不再是逐笔乘子）
-		PerTradePositionPct:     0.10,
+		Mode:                 "power_mean",
+		Shadow:               sizingBool(false),
+		PowerP:               &defaultP,
+		GroupFloors:          map[string]float64{"market": 0.45, "stock": 0.35},
+		Floor:                0.15,
+		Cap:                  1.15,
+		KellyLambda:          0.5,
+		KellyMinProb:         0.52,
+		VolTargetPct:         2.0,
+		VolClampLo:           0.5,
+		VolClampHi:           1.5,
+		EmotionScales:        map[string]float64{"退潮": 0.50, "背离": 0.60, "高潮": 0.80, "发酵": 1.00, "启动": 1.00},
+		StateScales:          map[string]float64{"bull": 1.00, "range": 0.70, "bear": 0.40},
+		TierScales:           map[string]float64{"Yellow": 0.60, "Red": 0.30},
+		BreadthMissingScale:  0.90,
+		MacroWindowScales:    map[string]float64{"high": 0.50, "medium": 0.80, "low": 1.00},
+		MacroLeadDays:        5,
+		MacroLeadCurve:       []float64{0.90, 0.85, 0.80, 0.70, 0.50},
+		MacroEventDayScale:   0.30,
+		HolidayScales:        map[string]float64{"weekend": 0.85, "small1": 0.70, "small2": 0.85, "long1": 0.40, "long2": 0.60, "long3": 0.75},
+		IndexScaleThresholds: map[string]float64{"-1": 1.00, "-2": 0.70, "deep": 0.40},
+		LLMBearishScale:      0.5,
+		MaxTotalPositionPct:  1.00, // 目标仓位天花板（v4：不再是逐笔乘子）
+		PerTradePositionPct:  0.10,
+		// §B0（owner 2026-10-27）：单笔上限 30%。下限 10% + 因子 k=MS×SS 线性映射，
+		// 目的是让"信号仓的单笔"随行情/个股质量在 10%~30% 之间动，而不是固定 10% 切出一堆碎单。
+		PerTradePositionMaxPct:  0.30,
 		MaxDrawdownPct:          0.10,
 		StoplossGuardCount:      4,
 		StoplossGuardWindowDays: 1,
@@ -2487,6 +2520,17 @@ func (s SizingConfig) WithDefaults() SizingConfig {
 	}
 	if out.PerTradePositionPct > 1 {
 		out.PerTradePositionPct = 1
+	}
+	// §B0：单笔上限。≤0 补默认；>0.5 钳到 0.5；小于下限时**抬到下限**
+	// （区间反了会让 eff 变成负数或恒等于上限，那是比不配更糟的形态）。
+	if out.PerTradePositionMaxPct <= 0 {
+		out.PerTradePositionMaxPct = d.PerTradePositionMaxPct
+	}
+	if out.PerTradePositionMaxPct > 0.5 {
+		out.PerTradePositionMaxPct = 0.5
+	}
+	if out.PerTradePositionPct > out.PerTradePositionMaxPct {
+		out.PerTradePositionPct = out.PerTradePositionMaxPct
 	}
 	if out.MaxDrawdownPct <= 0 {
 		out.MaxDrawdownPct = d.MaxDrawdownPct
@@ -4757,7 +4801,9 @@ func (c QMTConfig) EffectiveMinBuyPrice() float64 {
 	return 5
 }
 
-// EffectiveMinOrderAmount 单笔买入最低成交额闸的生效读数（单点收敛）：>0=闸开；0=关闭。缺省 5000 元。
+// EffectiveMinOrderAmount 单笔买入最低成交额闸的生效读数（单点收敛）：>0=闸开；0=关闭。
+// 缺省 **10000 元**（owner 2026-10-27：「不满 1 万的小单碎单」正是要拒的形状）。
+// **本闸对加仓同样生效**（owner 同一裁决：闸不豁免加仓，小额一律由 T 腿承担）。
 // 判据口径=股价×**最终**买入股数（现金降档之后核算），与 owner 原话「成交额=股价*手数」一致。
 // English: effective per-order minimum notional floor (>0 = gate on; 0 = off; default 5000).
 // Notional = price × FINAL lot count (checked after the cash downgrade), matching the owner's
@@ -4769,7 +4815,34 @@ func (c QMTConfig) EffectiveMinOrderAmount() float64 {
 	case c.MinOrderAmount < 0:
 		return 0
 	}
-	return 5000
+	return 10000
+}
+
+// EffectiveEntryPullbackMaxGapPct 回踩让价上限的生效读数（%）：>0=最多比现价低这么多；
+// 0=出厂默认 1.0；负数=显式取消上限（等同恢复 10-26 的事故形态，只允许显式写）。
+// 为什么必须有这个数：回踩目标锚在 VWAP 上，而 VWAP 可能离现价很远；没有上限时委托价
+// 会落在"永远不可能成交"的位置——那正是 2026-10-26 14:06–14:10 整批已撤的成因。
+// English: effective max pullback distance below the current price (default 1.0%; negative = no cap).
+func (c QMTConfig) EffectiveEntryPullbackMaxGapPct() float64 {
+	switch {
+	case c.EntryPullbackMaxGapPct > 0:
+		return c.EntryPullbackMaxGapPct
+	case c.EntryPullbackMaxGapPct < 0:
+		return 0 // 显式取消上限（0 在调用侧表示"不设下限价"，见 autoPlaceScaled）
+	}
+	return 1.0
+}
+
+// EffectiveEntryTimeoutSec 回踩单超时秒数：>0 用它；0=出厂默认 120；负数=沿用 cancel_stale_sec 旧闭环。
+// English: pullback order timeout (default 120s; negative = fall back to cancel_stale_sec).
+func (c QMTConfig) EffectiveEntryTimeoutSec() int {
+	switch {
+	case c.EntryTimeoutSec > 0:
+		return c.EntryTimeoutSec
+	case c.EntryTimeoutSec < 0:
+		return 0
+	}
+	return 120
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。

@@ -170,7 +170,7 @@ describe('§N6-RISK 风控与仓位面板：读回显 / 写载荷 / 读失败禁
       'flow_factor', 'floor', 'group_floors', 'holiday_block_new', 'holiday_scales', 'index_scale_thresholds',
       'kelly_lambda', 'kelly_min_prob',
       'llm_bearish_scale', 'macro_event_day_scale', 'macro_lead_curve', 'macro_lead_days',
-      'macro_window_scales', 'max_drawdown_pct', 'max_total_position_pct', 'mode', 'per_trade_position_pct', 'power_p', 'sell_boost_level', 'shadow',
+      'macro_window_scales', 'max_drawdown_pct', 'max_total_position_pct', 'mode', 'per_trade_position_max_pct', 'per_trade_position_pct', 'power_p', 'sell_boost_level', 'shadow',
       'sl_offset_cap', 'sl_offset_min_index_drop', 'sl_offset_per_pct', 'sl_offset_risk_budget_keep',
       'state_scales', 'stoploss_guard_count', 'stoploss_guard_window_days', 'tier_scales', 'tp_offset_cap',
       'tp_offset_per_pct', 'vol_clamp_hi', 'vol_clamp_lo', 'vol_target_pct',

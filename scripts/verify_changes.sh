@@ -5983,7 +5983,9 @@ eq106 internal/config/config.go 'MinOrderAmount float64' 1 '⑪-7 单笔最低�
 eq106 internal/config/config.go 'func (c QMTConfig) EffectiveMinBuyPrice() float64' 1 '⑪-7 最低价生效读数单点收敛（下单路径只吃这里）'
 eq106 internal/config/config.go 'func (c QMTConfig) EffectiveMinOrderAmount() float64' 1 '⑪-7 成交额生效读数单点收敛'
 eq106 internal/config/config.go 'MinBuyPrice:       5,' 1 '⑪-7 出厂默认最低价 5 元'
-eq106 internal/config/config.go 'MinOrderAmount:    5000,' 1 '⑪-7 出厂默认成交额 5000 元'
+# §B0（owner 2026-10-27）：出厂默认 5000 → 10000（「不满 1 万的碎单」正是要拒的形状）。
+# 判据跟着抬到 1 万；只改这一处数值，判据形状（等值 1 次出现）不变。
+eq106 internal/config/config.go 'MinOrderAmount:    10000,' 1 '⑪-7 出厂默认成交额 10000 元（§B0 起）'
 eq106 internal/config/config.go 'MaxExtends: 2,' 1 '⑪-7 延持上限出厂默认 2 次（owner 裁决）'
 eq106 internal/signalctl/sell.go 'maxExt: 2}' 1 '⑪-7 sellParams 缺省兜 2（存量纪律快照缺键=兜默认，不是无限延持）'
 eq106 internal/signalctl/sell.go 'case cfg.MaxExtends > 0:' 1 '⑪-7 显式配置分支在位'
@@ -13975,7 +13977,9 @@ grep -q '"Red": 0.30' internal/config/config.go || failrisk "Red 默认金额权
 grep -q 'r.RiskTier == combat_agent.RiskTierRed && r.RedBlockNewBuy' internal/signalctl/sizing.go || failrisk "sizingHardBlock 仍无条件硬拦 Red"
 # ④ 广度缺失小幅降权 0.90（不整档降级）。
 grep -q 'BreadthMissingScale float64 `json:"breadth_missing_scale"`' internal/config/config.go || failrisk "breadth_missing_scale 配置缺失"
-grep -q 'BreadthMissingScale:     0.90' internal/config/config.go || failrisk "广度缺失默认 0.90 缺失"
+# 结构体字面量一律用 [[:space:]]+：gofmt 按列对齐，新增字段会改变填充宽度，
+# 写死空格数的判据会被「别人加了一个键」弄红（§B0 加 per_trade_position_max_pct 时实锤）。
+grep -qE 'BreadthMissingScale:[[:space:]]+0\.90' internal/config/config.go || failrisk "广度缺失默认 0.90 缺失"
 grep -q 'math.IsNaN(up)' internal/signalctl/sizing.go || failrisk "广度 NaN 未走缺失降权"
 # ⑤ Regime 透传应急阀 + 引擎装配。
 grep -q 'RedBlockNewBuy bool `json:"red_block_new_buy,omitempty"`' internal/signalctl/regime.go || failrisk "Regime 未携带 red_block_new_buy"
@@ -15049,9 +15053,11 @@ echo "ok - §128 §DYN-T 实盘回转锁通过（标志贯通 5 + 负向 4 + 次
 # this section locks the posture, the semantics on an oversized payload, and the collect assembly.
 # ============================================================================
 echo "==> 129 §GATE-PIPEFAIL grep_q 姿势锁（printf 管道 + SIGPIPE + pipefail 反向判红家族）..."
+B129_FAILED=0
 fail129() {
 	echo "--- FAIL: §129 $*"
 	FAIL=1
+	B129_FAILED=1
 }
 CNT129=0
 GS129=scripts/verify_changes.sh
@@ -15221,5 +15227,243 @@ SHPY129
 CNT129=$((CNT129 + 1))
 echo "INFO - §129 覆盖面账：不带换行的那一族管道判读（printf 百分号 s 直出，本段实测 ${N_SHORT129} 处）不在本枚射程内——它们判的是短输出（部署预览文本、单条 JSON 正文、fixture 的一次运行日志），够不到 64KB 管道缓冲；真要连它们一起收口，得把 §110/§111 内嵌 heredoc 夹具里的同款写法一并改写，那是另一批的射程（收口时机：②b 对照腿哪天在某一族真实输出上读出 rc=141）。三处链式前缀判读（jline113 与 §113 的两枚归属腿）由尺子按形状放行，判读对象是 KEY=VALUE 读数而不是测试原文。grep_q 自身的落盘写入没有反证（写坏成写 /dev/null 时，② 面五条语义腿会一起红，归属仍可读）。"
 
+[ "$B129_FAILED" = "0" ] || exit 1
 echo "ok - §129 §GATE-PIPEFAIL 姿势锁通过（姿势等值 1 + 语义 6 + 超限对照 1 + 装配 2 + 反证 2 枚共 4 道，累计判定点 ${CNT129}）"
+# ============================================================================
+# §130 §B0 碎单治理锁（owner 2026-10-27：T 腿可以小单，信号仓不可以）
+#
+# 三条口径 + 一条本批修掉的漏项：
+#   ① 单笔占比 = 下限 lo 到上限 hi 之间按因子线性动（不再固定 10%）——碎单的第一条根因；
+#   ② 最小成交额闸在 **dynamic 下也生效**（旧实现用 !dynamicBudget 整段跳过它）；
+#   ③ 实盘持仓数上限只拦新票（已持仓票的加仓不受限）；
+#   ④ **已有持仓必须计入 CurStrat**——poses 循环里漏了 stratVal 累加，Room 被系统性高估。
+#
+# English: anti-crumb locks — factor-driven per-trade share, min-notional active in dynamic mode,
+# position cap blocking only NEW codes, and held positions counted in CurStrat.
+# ============================================================================
+echo "==> 130 §B0 碎单治理（单笔区间 / 最小成交额 / 持仓数上限 / CurStrat 漏项）..."
+B130_FAILED=0
+fail130() {
+	echo "--- FAIL: §130 $*"
+	FAIL=1
+	B130_FAILED=1
+}
+CNT130=0
+SZ130=internal/signalctl/sizing.go
+PT130=internal/signalctl/per_trade_pct_test.go
+EG130=internal/engine/engine.go
+BT130=internal/engine/dynbudget_b0_test.go
+
+# —— ① 单笔占比：单一实现点 + 调用点在位 + 旧的"基准×缩放"不得复活 ——
+grep -q 'func PerTradePct(marketScale, stockScale, lo, hi float64) float64' "$SZ130" ||
+	fail130 "signalctl.PerTradePct 不见（单笔区间的唯一实现点）：纸面与实盘会各写一份，两套口径迟早分家"
+grep -c 'signalctl\.PerTradePct(' "$EG130" | grep -q '^1$' ||
+	fail130 "engine 里 PerTradePct 的调用点不是恰好 1 处（多一处＝两个口径，少一处＝硬编码回来了）"
+grep -q 'Scale:             perTradePct,' "$EG130" ||
+	fail130 "ordbudget 的 Scale 不再是 eff（若写成 perTradePct * scale 就是二次计权：因子被乘两遍）"
+grep -q 'PerTradePositionMaxPct' internal/config/config.go ||
+	fail130 "配置缺 per_trade_position_max_pct（单笔上限没有配置面＝owner 改不了）"
+CNT130=$((CNT130 + 4))
+
+# —— ② 最小成交额闸：dynamic 下必须生效（负锁：不许再出现 !dynamicBudget 那个条件）——
+grep -q 'if minAmt := cfg.EffectiveMinOrderAmount(); minAmt > 0 && float64(qty)\*price < minAmt {' "$EG130" ||
+	fail130 "最小成交额闸的判据形状变了（应去掉 !dynamicBudget 且保留「降档后核算」的位置）"
+if grep -q '!dynamicBudget && minAmt' "$EG130"; then
+	fail130 "最小成交额闸又被 !dynamicBudget 跳过（这正是 5k~10k 碎单全部放行的原因）"
+fi
+grep -q 'MinOrderAmount:    10000,' internal/config/config.go ||
+	fail130 "出厂默认最小成交额不是 1 万（owner：不满 1 万的碎单正是要拒的形状）"
+CNT130=$((CNT130 + 3))
+
+# —— ③ 持仓数上限：读配置 + held 豁免两件都在 ——
+grep -q 'if maxPos := ctrl.Config().MaxPositions; maxPos > 0 {' "$EG130" ||
+	fail130 "实盘买入路径没读 max_positions（配置写死了也没人执行——这正是「实盘无持仓数上限」的老洞）"
+grep -q '!held\[code\] && len(held) >= maxPos' "$EG130" ||
+	fail130 "持仓数上限的判据里没有 held 豁免（会把「持仓满就永不补仓」变成政策）"
+CNT130=$((CNT130 + 2))
+
+# —— ④ CurStrat 漏项：底仓必须累加（本批修）——
+grep -qE '^[[:space:]]*stratVal \+= v$' "$EG130" ||
+	fail130 "poses 循环里没有 stratVal 累加（已有持仓不计入战略当前仓位 ⇒ Room 高估 ⇒ 越满越敢买）"
+grep -q 'func clampCapPct(v float64) float64' "$EG130" ||
+	fail130 "仓位帽钳制没抽成函数（写在下单路径里时会被单笔上限遮蔽，永远测不到）"
+CNT130=$((CNT130 + 2))
+
+# —— 行为腿：口径与执行两条真跑（-run 覆盖 test 文件里全部用例，条数按源码派生）——
+# 计数一律按 §GATE-COUNT-LOCK：零命中 grep -c 会退 1，`set -e` 下整条赋值静默中止整轮 verify，
+# 所以管道首段必须自带 `|| true`——判红交给下面的 ≥8 等值判断（不是交给 grep 的退出码）。
+B0N130=$({ grep -c '^func Test' "$PT130" "$BT130" 2>/dev/null || true; } | awk -F: '{s+=$2} END {print s+0}')
+[ "${B0N130:-0}" -ge 8 ] ||
+	fail130 "§B0 行为腿用例数按源码派生只有 ${B0N130:-0}（应 ≥8：区间 3 + 执行 5），判据可能没落盘"
+B0OUT130=$(go test ./internal/signalctl/ ./internal/engine/ -count=1 -run 'TestPerTradePct|TestClampCapPct|TestB0' 2>&1 || true)
+grep_q '^(ok|.*no test files)' B0OUT130 ||
+	{ fail130 "§B0 行为腿非零退出：$(printf '%s\n' "$B0OUT130" | tail -5 | tr '\n' ' ')"; }
+grep_q '^ok' B0OUT130 ||
+	fail130 "§B0 行为腿没有 ok 行（-run 没匹配到用例＝判据空转）"
+CNT130=$((CNT130 + 2))
+
+# —— 反证两枚：镜子法（/tmp 副本，主仓零改动）——
+W130=$(mktemp -d /tmp/gate130-XXXXXX) || { echo "--- FAIL: §130 建不出反证工作目录"; exit 1; }
+mkdir -p "$W130/mirror" || exit 1
+for _e in "$PWD"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in internal | cmd) continue ;; esac
+	ln -s "$_e" "$W130/mirror/$_b" || exit 1
+done
+mkdir -p "$W130/mirror/internal" || exit 1
+for _e in "$PWD"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in engine | signalctl) continue ;; esac
+	ln -s "$_e" "$W130/mirror/internal/$_b" || exit 1
+done
+cp -R "$PWD/internal/engine" "$W130/mirror/internal/engine" || exit 1
+cp -R "$PWD/internal/signalctl" "$W130/mirror/internal/signalctl" || exit 1
+mut130() { # $1=相对镜像路径 $2=old $3=new → 打印落地次数
+	python3 - "$W130/mirror/$1" "$2" "$3" <<'PY130'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PY130
+}
+# R1：删掉底仓累加 ⇒ "已有持仓计入 CurStrat" 那条必红（缺口正是本批修的那处漏项）。
+N130R1=$(mut130 internal/engine/engine.go '		stratVal += v
+		if ind := industryOf(code); ind != "" {' '		if ind := industryOf(code); ind != "" {' || true)
+CNT130=$((CNT130 + 1))
+[ "${N130R1:-0}" = "1" ] || fail130 "反证 R1 变异落地数=${N130R1:-0}（应 1）：靶串不在位，本枚等于没跑"
+R1OUT130=$(cd "$W130/mirror" && go test ./internal/engine/ -count=1 -run 'TestB0HeldPositionsCountInCurStrat' 2>&1 || true)
+CNT130=$((CNT130 + 1))
+grep_q '^--- FAIL: TestB0HeldPositionsCountInCurStrat' R1OUT130 ||
+	{ fail130 "反证 R1 失效：删掉 stratVal 累加后那条用例仍绿（Room 高估这件事没人盯着）：$(printf '%s\n' "$R1OUT130" | tail -3 | tr '\n' ' ')"; }
+# R2：把 !dynamicBudget 条件加回最小成交额闸 ⇒ "dynamic 下闸生效"必红。
+N130R2=$(mut130 internal/engine/engine.go 'if minAmt := cfg.EffectiveMinOrderAmount(); minAmt > 0 &&' 'if minAmt := cfg.EffectiveMinOrderAmount(); !dynamicBudget && minAmt > 0 &&' || true)
+CNT130=$((CNT130 + 1))
+[ "${N130R2:-0}" = "1" ] || fail130 "反证 R2 变异落地数=${N130R2:-0}（应 1）：靶串不在位"
+R2OUT130=$(cd "$W130/mirror" && go test ./internal/engine/ -count=1 -run 'TestB0MinOrderBlocksDynamic' 2>&1 || true)
+CNT130=$((CNT130 + 1))
+grep_q '^--- FAIL: TestB0MinOrderBlocksDynamic' R2OUT130 ||
+	{ fail130 "反证 R2 失效：把 dynamic 旁路加回去后那条用例仍绿（碎单闸没人盯着）"; }
+rm -rf "$W130"
+
+echo "INFO - §130 覆盖面账：本段锁的是「信号仓」路径；纸面（paper）仍用固定 per_trade_position_pct（它的定权上下文里没有个股缩放通道），因此纸面单笔会小于实盘（实盘 eff 含 SS）——差异由 B5 对照实验落地时一并对齐，本批不顺手改（改纸面会把既有纸面对照读数整体挪位）。另：概念敞口闸（§C1-V2，默认 40%、影子开关沿用 nil=只留痕）本批只把它接通并加了四条行为腿，语义仍是「命中最大敞口概念检查、覆盖率<95% 弃权」。"
+[ "$B130_FAILED" = "0" ] || exit 1
+echo "ok - §130 §B0 碎单治理锁通过（静态 11 道 + 行为腿 ${B0N130} 条 + 反证 2 枚，累计判定点 ${CNT130}）"
+# ============================================================================
+# §131 §B6 VWAP 软回踩 v2 锁（owner 2026-10-27：默认 1%、直接生效、超时 120s）
+#
+# 10-26 的事故形态是"委托价锚到 VWAP 下方 8%、无时段门、挂上永不撤"。本段按三道护栏入锁：
+#   ① 让价上限 max_gap（没它 → 委托价永远不可能成交）；
+#   ② 连续竞价时段门（集合竞价挂回踩＝另一条旧 bug）；
+#   ③ 超时撤单（到点撤、同日同票同战法不重挂）。
+# 另有一条口径锁：回踩只往下让，现价已在 VWAP 下方时不许挂更高的价（不许为成交往上追）。
+#
+# English: soft-pullback v2 locks — twenty-percent cap, session gate, timeout, and "never chase up".
+# ============================================================================
+echo "==> 131 §B6 VWAP 软回踩 v2（让价上限 / 时段门 / 超时撤单 / 不追高）..."
+B131_FAILED=0
+fail131() {
+	echo "--- FAIL: §131 $*"
+	FAIL=1
+	B131_FAILED=1
+}
+CNT131=0
+EG131=internal/engine/engine.go
+CF131=internal/config/config.go
+VT131=internal/engine/qmt_auto_test.go
+
+# —— ① 定价公式与三道护栏（静态：形状必须在，且旧的自杀式写法不得复活）——
+grep -q 'pct := cfg.EntryPullbackPct; pct > 0 && vwapOK && isContinuousTrade(time.Now())' "$EG131" ||
+	fail131 "回踩定价的入口条件缺时段门或 VWAP 前置（少了任一，回踩就会在集合竞价/无 VWAP 时乱挂价）"
+grep -q 'pbTarget = vwap \* (1 - pct/100)' "$EG131" ||
+	fail131 "回踩目标价公式不见（应为 VWAP×(1−pct)）"
+grep -q 'if gap := cfg.EffectiveEntryPullbackMaxGapPct(); gap > 0 {' "$EG131" ||
+	fail131 "让价上限没接进定价（10-26 那排「已撤」的根因就是没有这个上限）"
+grep -q 'if want > 0 && want < orderPrice {' "$EG131" ||
+	fail131 "回踩只许往下让的判据不见（缺它会出现「回踩价高于现价+1tick」，等于往上追）"
+grep -q 'var isContinuousTrade = data.IsContinuousTrade' "$EG131" ||
+	fail131 "时段门没有可钉死的接缝（用例会依赖跑测试的时刻：凌晨绿、开盘红）"
+CNT131=$((CNT131 + 5))
+
+# —— ② 超时：回踩单必须带回踩超时，非回踩单必须为 0 ——
+grep -q 'entryTimeout = cfg.EffectiveEntryTimeoutSec()' "$EG131" ||
+	fail131 "回踩单没设超时（挂上不成交就永远挂着，报撤比与资金占用双输）"
+grep -q 'TimeoutSec: entryTimeout,' "$EG131" ||
+	fail131 "订单没把回踩超时带出去（配置算了但没落到订单＝不生效）"
+CNT131=$((CNT131 + 2))
+
+# —— ③ 配置面：默认 1% / 让价上限 1% / 超时 120，且三者都有访问器兜底 ——
+grep -q 'EntryPullbackPct:       1.0,' "$CF131" ||
+	fail131 "软回踩出厂默认不是 1%（owner 拍板）"
+grep -qE 'EntryPullbackMaxGapPct:[[:space:]]+1.0,' "$CF131" ||
+	fail131 "让价上限出厂默认不是 1%"
+grep -qE 'EntryTimeoutSec:[[:space:]]+120,' "$CF131" ||
+	fail131 "回踩超时出厂默认不是 120s"
+grep -q 'func (c QMTConfig) EffectiveEntryPullbackMaxGapPct() float64' "$CF131" ||
+	fail131 "让价上限缺访问器（0=默认、负数=显式取消，两态必须与"未配置"分开）"
+CNT131=$((CNT131 + 4))
+
+# —— 行为腿：三条子用例（让价上限 / 时段门 / 不追高）真跑 ——
+VTN131=$(grep -cE 't\.Run\("(回踩生效但被让价上限夹住|非连续竞价不回踩且按tick加价|现价已低于VWAP时不等待，按tick加价)' "$VT131" || true)
+[ "${VTN131:-0}" -eq 3 ] ||
+	fail131 "回踩行为腿子用例数=${VTN131:-0}（应恰好 3）：让价上限/时段门/不追高三件缺一不可"
+VTOUT131=$(go test ./internal/engine/ -count=1 -run 'TestVWAPPlanCOrderPrice' -v 2>&1 || true)
+grep_q '^--- PASS: TestVWAPPlanCOrderPrice' VTOUT131 ||
+	{ fail131 "回踩行为腿非绿：$(printf '%s\n' "$VTOUT131" | grep -E 'FAIL|委托价' | head -3 | tr '\n' ' ')"; }
+if grep_q '让价上限 1% 应把委托价夹到 99.99' VTOUT131; then
+	fail131 "行为腿把断言文案打进了通过路径（说明用例失败被吞了）"
+fi
+CNT131=$((CNT131 + 2))
+
+# —— 反证两枚（镜子法）——
+W131=$(mktemp -d /tmp/gate131-XXXXXX) || { echo "--- FAIL: §131 建不出反证工作目录"; exit 1; }
+mkdir -p "$W131/mirror" || exit 1
+for _e in "$PWD"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in internal | cmd) continue ;; esac
+	ln -s "$_e" "$W131/mirror/$_b" || exit 1
+done
+mkdir -p "$W131/mirror/internal" || exit 1
+for _e in "$PWD"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in engine) continue ;; esac
+	ln -s "$_e" "$W131/mirror/internal/$_b" || exit 1
+done
+cp -R "$PWD/internal/engine" "$W131/mirror/internal/engine" || exit 1
+mut131() { # $1=相对镜像路径 $2=old $3=new → 打印落地次数
+	python3 - "$W131/mirror/$1" "$2" "$3" <<'PY131'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PY131
+}
+# R1：把让价上限整个删掉（回到 10-26 的形态）⇒ 委托价会掉到 VWAP 下方 3% 的 97 ⇒ 行为腿必红。
+N131R1=$(mut131 internal/engine/engine.go 'if gap := cfg.EffectiveEntryPullbackMaxGapPct(); gap > 0 {
+			pbFloor = price * (1 - gap/100)
+		}' '' || true)
+CNT131=$((CNT131 + 1))
+[ "${N131R1:-0}" = "1" ] || fail131 "反证 R1 变异落地数=${N131R1:-0}（应 1）：靶串不在位，本枚等于没跑"
+R1OUT131=$(cd "$W131/mirror" && go test ./internal/engine/ -count=1 -run 'TestVWAPPlanCOrderPrice/回踩生效但被让价上限夹住' 2>&1 || true)
+CNT131=$((CNT131 + 1))
+grep_q '^--- FAIL' R1OUT131 ||
+	{ fail131 "反证 R1 失效：删掉让价上限后行为腿仍绿（这道护栏没人盯着，10-26 事故会原样复现）"; }
+# R2：去掉"只往下让"的条件 ⇒ 现价低于 VWAP 时会把委托价挂到现价之上 ⇒ 对应子用例必红。
+N131R2=$(mut131 internal/engine/engine.go 'if want > 0 && want < orderPrice {' 'if want > 0 {' || true)
+CNT131=$((CNT131 + 1))
+[ "${N131R2:-0}" = "1" ] || fail131 "反证 R2 变异落地数=${N131R2:-0}（应 1）：靶串不在位"
+R2OUT131=$(cd "$W131/mirror" && go test ./internal/engine/ -count=1 -run 'TestVWAPPlanCOrderPrice/现价已低于VWAP时不等待，按tick加价' 2>&1 || true)
+CNT131=$((CNT131 + 1))
+grep_q '^--- FAIL' R2OUT131 ||
+	{ fail131 "反证 R2 失效：去掉「只往下让」后仍绿（回踩会变成追高通道）"; }
+rm -rf "$W131"
+
+echo "INFO - §131 覆盖面账：回踩的「本会成交价 vs 实际成交价」只落在日志/opslog（§B6 v1），没有进 orders 表；要做两周后的「1% 是否合适」分析需要按票回捞日志，或用 B1 批统一加的成本分解列（那时一并落库）。另：回踩只在实盘信号买入路径生效，T 腿与纸面不受影响（T 有自己的定价）。"
+[ "$B131_FAILED" = "0" ] || exit 1
+echo "ok - §131 §B6 软回踩 v2 锁通过（静态 13 道 + 行为腿 3 子用例 + 反证 2 枚，累计判定点 ${CNT131}）"
 echo "==> 全部通过"

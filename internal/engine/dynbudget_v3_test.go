@@ -59,7 +59,10 @@ func TestLiveDynamicBudgetIgnoresLegacyKnobs(t *testing.T) {
 		c.StrategyAmounts = map[string]float64{"龙头": 999999}
 		c.DailyMaxBuys = 1
 		c.DailyBudgetAmount = 1
-		c.MinOrderAmount = 1_000_000
+		// §B0（owner 2026-10-27）：最小成交额闸在 dynamic 下**已恢复生效**（旧实现用
+		// !dynamicBudget 把它整段跳过）。本用例要测的是"旧预算键不让位"，所以把它显式关掉
+		// （负数=关）；闸本身的行为由 TestB0MinOrderBlocksDynamic 单独钉。
+		c.MinOrderAmount = -1
 		c.RiskGate.RiskPerTradePct = 50
 		c.RiskGate.SectorValuePct = 35
 		c.RiskGate.SingleStockValuePct = 35
@@ -74,11 +77,11 @@ func TestLiveDynamicBudgetIgnoresLegacyKnobs(t *testing.T) {
 	if len(*orders) != 1 {
 		t.Fatalf("应下 1 单，got %d", len(*orders))
 	}
-	// §DYN-SIZE v4：单笔基准 10% 生效 → 10 万 × 10% × 0.82 = 8200 元 → 800 股。
-	// 旧模型这里是 82000 元（被 35% 额度截到 35000＝3500 股）——"Scale 当预算倍数"正是
-	// owner 报的"半仓之上一笔打满"的第一条代码事实（方案 §1.2 事实 1），本批按 §1.4 改掉。
-	if qty := (*orders)[0]["qty"].(float64); qty != 800 {
-		t.Fatalf("v4 单笔基准 10%% 应为 800 股，got %v（旧键仍在影响股数或基准未生效）", qty)
+	// §B0（2026-10-27）起单笔占比是"下限 10% → 上限 30% 按因子线性动"：ctx 未注入时
+	// MS=SS=1 ⇒ eff=30% ⇒ 10 万×30%=3 万；行业/单票 35%、目标剩余 100% 都不拦 ⇒ 3000 股。
+	// 旧的固定 10%（800 股）是 owner 报"碎单"的口径，已被替换；本用例只证明旧预算键不再影响股数。
+	if qty := (*orders)[0]["qty"].(float64); qty != 3000 {
+		t.Fatalf("单笔占比 eff=30%% 应为 3000 股，got %v（旧键仍在影响股数或 eff 未生效）", qty)
 	}
 }
 
@@ -212,10 +215,10 @@ func TestLiveDynamicBudgetUnknownIndustryFallsBackToStockCap(t *testing.T) {
 	if len(*orders) != 1 {
 		t.Fatalf("行业未知时单票 35%% 仍应放行，got %d 单", len(*orders))
 	}
-	// v4 基准 10% ⇒ 8200 元 < 单票 35000 额度，因此额度不再是本例的约束项；
-	// 这条锁要证的仍是"行业未知不跳过、单票额度兜底"，故把基准临时放大到 100% 让额度重新成为约束。
-	if qty := (*orders)[0]["qty"].(float64); qty != 800 {
-		t.Fatalf("行业未知应由单票额度兜底出 800 股，got %v", qty)
+	// §B0 起单笔占比 = 0.10+0.20×(MS×SS)；ctx 未注入 ⇒ 30% ⇒ 3 万 < 单票 3.5 万额度，
+	// 本例要证的是"行业未知不跳过"（额度没被行业分支清零），不是额度截断。
+	if qty := (*orders)[0]["qty"].(float64); qty != 3000 {
+		t.Fatalf("行业未知应放行（单笔 30%% ⇒ 3000 股），got %v", qty)
 	}
 }
 
@@ -286,8 +289,9 @@ func TestLiveDynamicBudgetCapsClampedTo100(t *testing.T) {
 	if len(*orders) != 1 {
 		t.Fatalf("应下 1 单，got %d", len(*orders))
 	}
-	// 上限 100% = 10 万；动态预算 8.2 万 更小 → 8200 股。若未钳制会按 150% 变成 12300 股。
-	if qty := (*orders)[0]["qty"].(float64); qty != 8200 {
-		t.Fatalf("上限 >100 应钳到 100%%，期望 8200 股，got %v", qty)
+	// §B0 之后单笔占比被硬夹在 50%：本例能证的只是"caps>100 时不跳过、仍按上限内出单"。
+	// 钳制本身（150 → 100）由 TestClampCapPct 直接钉——写在下单路径里会被 50% 单笔上限遮蔽。
+	if qty := (*orders)[0]["qty"].(float64); qty != 5000 {
+		t.Fatalf("单笔占比 50%% 上限下应出 5000 股，got %v", qty)
 	}
 }

@@ -1042,6 +1042,7 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		"auto_risk_caution":              cfg.AutoCautionOn(),
 		"sell_unified_mode":              cfg.SellUnifiedMode,
 		"entry_pullback_pct":             cfg.EntryPullbackPct,
+		"entry_pullback_max_gap_pct":     cfg.EntryPullbackMaxGapPct,
 		"entry_timeout_sec":              cfg.EntryTimeoutSec,
 		"max_signal_vwap_premium_pct":    cfg.MaxSignalVWAPPremiumPct,
 		"max_signal_vwap_premium_shadow": cfg.VWAPPremiumShadowOn(),
@@ -1096,7 +1097,7 @@ type setQMTConfigReq struct {
 	MaxOrderAmount *float64 `json:"max_order_amount"`
 	// owner 2026-10-12 裁决两闸 + 延持上限（指针=nil 本次不改；0=出厂默认，负数=显式关闭）。
 	MinBuyPrice    *float64 `json:"min_buy_price"`    // 最低买入价（元，默认 5）
-	MinOrderAmount *float64 `json:"min_order_amount"` // 单笔最低成交额（元，默认 5000）
+	MinOrderAmount *float64 `json:"min_order_amount"` // 单笔最低成交额（元，默认 10000，§B0 起）
 	MaxExtends     *int     `json:"max_extends"`      // 卖出延持次数上限（默认 2，负数=无上限）
 	// §B7 全卖出自动化：true=战法自带止盈/减仓也自动执行（默认 false）。
 	AutoSellAllSources *bool `json:"auto_sell_all_sources"`
@@ -1105,7 +1106,9 @@ type setQMTConfigReq struct {
 	// §SELLPOINT-UNIFY 卖出统一裁决模式（shadow/on/off；空=shadow 缺省语义）。
 	SellUnifiedMode *string `json:"sell_unified_mode"`
 	// §C2 VWAP 执行质量（0=关）。
-	EntryPullbackPct        *float64 `json:"entry_pullback_pct"`
+	EntryPullbackPct *float64 `json:"entry_pullback_pct"`
+	// §B6 让价上限（%）：回踩委托价最多比现价低这么多；0=出厂默认 1.0；负数=显式取消上限。
+	EntryPullbackMaxGapPct  *float64 `json:"entry_pullback_max_gap_pct"`
 	EntryTimeoutSec         *int     `json:"entry_timeout_sec"`
 	MaxSignalVWAPPremiumPct *float64 `json:"max_signal_vwap_premium_pct"`
 	// §C2 VWAP 硬过滤影子模式（nil=不改）。
@@ -1221,6 +1224,14 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 			return
 		}
 		cfg.EntryPullbackPct = *req.EntryPullbackPct
+	}
+	if req.EntryPullbackMaxGapPct != nil {
+		// 上限只允许 -1（显式取消）或 0~100：0=出厂默认 1%。>100 没有意义（等于不限）。
+		if *req.EntryPullbackMaxGapPct < -1 || *req.EntryPullbackMaxGapPct > 100 {
+			writeError(w, 400, "entry_pullback_max_gap_pct 超出范围（-1 或 0-100）")
+			return
+		}
+		cfg.EntryPullbackMaxGapPct = *req.EntryPullbackMaxGapPct
 	}
 	if req.EntryTimeoutSec != nil {
 		if *req.EntryTimeoutSec < 0 {

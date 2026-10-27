@@ -1375,6 +1375,26 @@ func (e *Engine) IgnoreSignal(code, strategy string) int {
 	return n
 }
 
+// clampCapPct 仓位帽钳制：≤0 按默认 35；>100 一律 100（配置可绕过前端直接写入，这里钳死）。
+// 抽成函数是为了让"上限 >100 必须钳到 100"能被单测直接钉住——写在下单路径里时，
+// 它会被单笔占比上限遮蔽（0.5×权益 先命中），集成用例根本走不到这条分支。
+// English: clamp position caps (<=0 → 35, >100 → 100); extracted so the clamp itself is testable.
+func clampCapPct(v float64) float64 {
+	if v <= 0 {
+		return 35
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+// isContinuousTrade 连续竞价时段门（§B6 软回踩）。做成包级变量是为了让单测能把
+// "集合竞价 / 收盘竞价"钉死——否则用例的通过与否会依赖跑测试的时刻（凌晨跑通、开盘跑红）。
+// 生产装配期不覆盖它，永远等于 data.IsContinuousTrade。
+// English: session gate seam for the pullback rule; tests pin it, production keeps data.IsContinuousTrade.
+var isContinuousTrade = data.IsContinuousTrade
+
 // autoPlace AUTO_TRADING_PLAN M1：qmt.enabled + mode=auto 时把做多买入信号直连网关下单。
 // 幂等：signal_id 唯一键（Orders 表 UNIQUE），熔断中跳过；现价缺省时用信号触发价。
 // 金额按 fixed_amount（受 max_positions 预检约束）；code 补后缀便于网关识别交易所。
@@ -1524,21 +1544,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 
 	// 行业/单票额度分母=总资产；上限默认 35%，账号配置为正数时以配置为准。
 	qcfg := ctrl.Config()
-	indCap := qcfg.RiskGate.SectorValuePct
-	if indCap <= 0 {
-		indCap = 35
-	}
-	stockCap := qcfg.RiskGate.SingleStockValuePct
-	if stockCap <= 0 {
-		stockCap = 35
-	}
-	// §DYN-SIZE-v3 §5.6：单票/行业上限不得高于 100（配置可绕过前端直接写入，这里钳死）。
-	if indCap > 100 {
-		indCap = 100
-	}
-	if stockCap > 100 {
-		stockCap = 100
-	}
+	indCap := clampCapPct(qcfg.RiskGate.SectorValuePct)
+	stockCap := clampCapPct(qcfg.RiskGate.SingleStockValuePct)
 
 	// 聚合当前市值：持仓 + 在途买单（已报全额/部成未成交余量）。
 	// §DYN-SIZE v4 新增两条纪律（方案 §1.5）：
@@ -1590,6 +1597,12 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		v := px * float64(p.Qty)
 		stockVal[code] += v
 		posPrices[code] = px
+		// §DYN-SIZE v4 定义的 CurStrat 第一项就是"Σ底仓"——这一行以前漏了，等于把**已有持仓**
+		// 整个当成 0：目标剩余空间被系统性高估，账户越满越敢买（"半仓之上一笔打满"的另一半根因）。
+		// T 腿由下方 tLive book 单独调账（stratVal 含 T 买腿 → 减去 tBuyVal），不会双计。
+		// English: held positions are part of CurStrat; this accumulation was missing, which made
+		// Room systematically too large on a full book.
+		stratVal += v
 		if ind := industryOf(code); ind != "" {
 			indVal[ind] += v
 		}
@@ -1621,6 +1634,26 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		tSellVal += book.SellLegValue
 		frozenCash += book.FrozenCash
 	}
+	// §B0 实盘持仓数上限（owner 2026-10-27 定 6）：只拦**新票**，已持仓票的加仓不受限
+	// （否则"持仓满就永不补仓"）。计数口径＝有持仓的代码 ∪ 在途买单的代码——两本账都在上面，
+	// 不再新增一次查询；T 腿持有同一代码时也算一个持仓（它确实是仓）。
+	// 0=不设限（旧行为），负数同 0。判据只看"这一单会不会新开一只票"。
+	if maxPos := ctrl.Config().MaxPositions; maxPos > 0 {
+		held := map[string]bool{}
+		for code, v := range stockVal {
+			if v > 0 {
+				held[code] = true
+			}
+		}
+		if code := pureTsCode(sig.Code); !held[code] && len(held) >= maxPos {
+			log.Printf("[qmt] %s(%s) §B0 持仓数已达上限 %d（当前 %d 只），不新开仓", sig.Code, sig.Name, maxPos, len(held))
+			opslog.DayOnce("maxpos:"+sig.Code, func() {
+				opslog.Logf("quant", "§B0 持仓数上限 %s(%s) 上限=%d 当前=%d 总资产=%.0f 策略=%s/%s",
+					sig.Code, sig.Name, maxPos, len(held), total, sig.StrategyID, sig.Strategy)
+			})
+			return 0
+		}
+	}
 	if curUnknown {
 		log.Printf("[qmt] %s §DYN-TARGET 跳过：有持仓无法定价（fail-closed）总资产=%.0f", sig.Code, total)
 		opslog.DayOnce("dyntarget-posprice:"+sig.Code, func() {
@@ -1645,11 +1678,20 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	if stockScale <= 0 {
 		stockScale = 1.0
 	}
-	// 单笔基准仓位：总资产 × per_trade_position_pct × (MarketScale × StockScale)。
-	perTradePct := sizingCfg.PerTradePositionPct
-	if perTradePct <= 0 || perTradePct > 1 {
-		perTradePct = 0.10 // 与出厂默认同值；越界（把 10% 写成 10）按默认，不让它放大成单笔满仓
+	// 单笔占比（§B0，owner 2026-10-27）：不再是固定 10%，而是按因子在 [lo,hi] 之间线性动。
+	// 旧口径 = perTradePct × MS × SS（0.10×0.67≈6.7%），9.5 万账户每笔只有 6~8k，
+	// 目标仓位被切成一堆碎单——这正是 owner 报的"仓位管理非常累"。
+	// 新口径 eff = lo + (hi−lo)×(MS×SS)（signalctl.PerTradePct 单一实现点 + 硬夹），
+	// 且**不再额外乘 MS×SS**（那会二次计权）。
+	perTradeLo := sizingCfg.PerTradePositionPct
+	if perTradeLo <= 0 || perTradeLo > 1 {
+		perTradeLo = 0.10 // 与出厂默认同值；越界（把 10% 写成 10）按默认，不让它放大成单笔满仓
 	}
+	perTradeHi := sizingCfg.PerTradePositionMaxPct
+	if perTradeHi <= 0 {
+		perTradeHi = 0.30 // 与出厂默认同值；0/缺失一律按 30% 上限
+	}
+	perTradePct := signalctl.PerTradePct(marketScale, stockScale, perTradeLo, perTradeHi)
 	ceiling := sizingCfg.MaxTotalPositionPct
 	if ceiling <= 0 || ceiling > 1 {
 		ceiling = 1.0 // 天花板语义：>1 是配置手滑，钳到 1.0（总资产上限）
@@ -1685,9 +1727,10 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		antiCash = 0
 	}
 	res := ordbudget.Compute(ordbudget.Inputs{
-		Base:              total,
-		CapEquity:         total,
-		Scale:             perTradePct * scale,
+		Base:      total,
+		CapEquity: total,
+		// §B0：perTradePct 已是"eff"（含 lo/hi 夹取），这里**不许**再乘 MS×SS（二次计权）。
+		Scale:             perTradePct,
 		Price:             price,
 		Cash:              antiCash,
 		Lot:               ordbudget.DefaultLot,
@@ -1704,6 +1747,9 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	log.Printf("[qmt] %s(%s) §DYN-TARGET 总资产=%.0f MS=%.3f SS=%.3f 缩放=%.3f 目标=%.0f(占比%.3f 天花板%.2f) 战略当前=%.0f 正T买腿=%.0f 反T卖腿=%.0f 剩余=%.0f 单笔基准=%.2f 影子目标占比=%.2f 缺失关键输入=%v",
 		sig.Code, sig.Name, total, marketScale, stockScale, scale, targetVal, targetRatio, ceiling,
 		stratVal, tBuyVal, tSellVal, room, perTradePct, shadowRatio, ctx.MissingKeyInput)
+	// §B0：单笔占比的区间与生效值单独一行（区间写错时这里一眼能看出来）。
+	log.Printf("[qmt] %s(%s) §B0 单笔占比 lo=%.3f hi=%.3f eff=%.3f（MS=%.3f SS=%.3f，金额≈%.0f）",
+		sig.Code, sig.Name, perTradeLo, perTradeHi, perTradePct, marketScale, stockScale, total*perTradePct)
 	if !targetRoomSet && sizingCfg.ShadowOn() {
 		log.Printf("[qmt] %s(%s) §DYN-TARGET 影子期读数：目标=%.0f 剩余=%.0f（不收紧，仅留痕）", sig.Code, sig.Name, targetVal, room)
 	}
@@ -1840,20 +1886,46 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	// ② 硬闸改用**委托价**判偏离，超过 VWAP+阈值就不追高；
 	// ③ `entry_pullback_pct` 保留解析但**不再影响报价**（标废弃，配置面同步显示），
 	//    将来若要恢复回踩，必须同时加 `data.IsContinuousTrade` 时段门与让价上限（方案 §3.2）。
-	if cfg.EntryPullbackPct > 0 {
-		log.Printf("[qmt] %s(%s) §C2 软回踩已废弃（entry_pullback_pct=%.2f 不再影响报价），按现价+1tick 挂单",
-			sig.Code, sig.Name, cfg.EntryPullbackPct)
-		opslog.DayOnce("vwap-pullback-deprecated:"+sig.Code, func() {
-			opslog.Logf("quant", "§C2 软回踩配置仍为 %.2f%% 但本批起不再生效（方案C）%s(%s) 策略=%s/%s",
-				cfg.EntryPullbackPct, sig.Code, sig.Name, sig.StrategyID, sig.Strategy)
-		})
-	}
 	// A 股最小变动价位统一按 0.01 元；ETF/REITs 是 0.001，本系统自动买入只做个股，
 	// 这里刻意不做分品种 tick 表：多一张表就多一处会写错的地方，而写错的后果是**报价低于现价**。
 	const minTick = 0.01
 	orderPrice := math.Round((price+minTick)*100) / 100
 	if orderPrice <= 0 {
 		orderPrice = price
+	}
+	// ── §B6 VWAP 软回踩 v2（owner 2026-10-27：默认 1%、直接生效、超时 120s）──────────────
+	// 定价：target = VWAP×(1−p)；floor = 现价×(1−max_gap)；委托价 = max(target, floor)，
+	// 再被"现价+1tick"封顶——回踩只往下让，绝不为成交往上追。
+	// 三道护栏缺一不可（缺哪一条都会退回 2026-10-26 的形态：14:06–14:10 整批「已撤」）：
+	//   ① 让价上限：VWAP 可能离现价很远，没有上限的委托价永远不可能成交；
+	//   ② 时段门：只在连续竞价挂回踩，集合竞价一律现价+1tick（9:15–9:25 挂错价是那次事故的另一半）；
+	//   ③ 超时撤单：到点未成交就撤，同日同票同战法不重挂（靠既有 buy 幂等键，无需新状态）。
+	pullbackOn := false
+	pbTarget, pbFloor := 0.0, 0.0
+	if pct := cfg.EntryPullbackPct; pct > 0 && vwapOK && isContinuousTrade(time.Now()) {
+		pbTarget = vwap * (1 - pct/100)
+		if gap := cfg.EffectiveEntryPullbackMaxGapPct(); gap > 0 {
+			pbFloor = price * (1 - gap/100)
+		}
+		want := pbTarget
+		if pbFloor > want {
+			want = pbFloor
+		}
+		want = math.Round(want*100) / 100
+		if want > 0 && want < orderPrice {
+			orderPrice = want
+			pullbackOn = true
+		}
+	}
+	entryTimeout := 0
+	if pullbackOn {
+		entryTimeout = cfg.EffectiveEntryTimeoutSec()
+		log.Printf("[qmt] %s(%s) §B6 软回踩 目标=%.2f（VWAP %.3f×(1−%.2f%%)） 让价下限=%.2f（现价 %.2f） 委托=%.2f 超时=%ds",
+			sig.Code, sig.Name, pbTarget, vwap, cfg.EntryPullbackPct, pbFloor, price, orderPrice, entryTimeout)
+		opslog.DayOnce("pullback:"+sig.Code, func() {
+			opslog.Logf("quant", "§B6 软回踩 %s(%s) 目标=%.2f 下限=%.2f 委托=%.2f 现价=%.2f VWAP=%.3f pct=%.2f timeout=%ds 策略=%s/%s",
+				sig.Code, sig.Name, pbTarget, pbFloor, orderPrice, price, vwap, cfg.EntryPullbackPct, entryTimeout, sig.StrategyID, sig.Strategy)
+		})
 	}
 	if vwapOK {
 		// 硬闸判定价：委托价（不是信号价、不是现价）——"我实际挂出去多少钱"才是会被成交的价格。
@@ -2052,10 +2124,12 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	// FINAL lot count, checked AFTER the cash downgrade (the degraded lot is what actually hits
 	// the counter), before order assembly. Factory default 5000; zero falls back to the default,
 	// negative disables.
-	// §DYN-SIZE-v3：dynamic 模式下“最低成交额”不再作为拒买闸——1 手碎单由 35% 额度与现金决定。
-	if minAmt := cfg.EffectiveMinOrderAmount(); !dynamicBudget && minAmt > 0 && float64(qty)*price < minAmt {
-		log.Printf("[qmt] %s(%s) 单笔成交额 %.0f 元（%d股×%.2f）低于最低成交额 %.0f 元，拒买跳过",
-			sig.Code, sig.Name, float64(qty)*price, qty, price, minAmt)
+	// §B0（owner 2026-10-27）：dynamic 模式下本闸**恢复生效**。旧实现用 `!dynamicBudget` 把这里
+	// 整段跳过，注释理由是「1 手碎单由 35% 额度与现金决定」——但额度帽只封上限、管不住下限，
+	// 结果 5k~10k 的单全部放行。加仓同样受本闸约束（owner：闸不豁免加仓，小额一律由 T 腿承担）。
+	if minAmt := cfg.EffectiveMinOrderAmount(); minAmt > 0 && float64(qty)*price < minAmt {
+		log.Printf("[qmt] %s(%s) 单笔成交额 %.0f 元（%d股×%.2f）低于最低成交额 %.0f 元，拒买跳过（dynamic=%v）",
+			sig.Code, sig.Name, float64(qty)*price, qty, price, minAmt, dynamicBudget)
 		opslog.DayOnce("minamount:"+sig.Code, func() {
 			opslog.Logf("quant", "碎单拒买 %s(%s) 成交额=%.0f（%d股×%.2f）最低成交额=%.0f 策略=%s/%s",
 				sig.Code, sig.Name, float64(qty)*price, qty, price, minAmt, sig.StrategyID, sig.Strategy)
@@ -2112,9 +2186,9 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		VWAPSource:           vwapSource,
 		VWAPAsOf:             vwapAsOf,
 		SignalVWAPPremiumPct: premium,
-		// TimeoutSec 只服务软回踩单（按单超时撤挂单）；方案 C 之后不再有回踩单，
-		// 字段与 orders.timeout_sec 列保留（回滚即恢复），此处恒 0=沿用全局 cancel_stale_sec。
-		TimeoutSec: 0,
+		// TimeoutSec 只服务软回踩单（按单超时撤挂单）：§B6 起回踩恢复，非回踩单仍为 0
+		// （0=沿用全局 cancel_stale_sec 的既有撤单闭环）。
+		TimeoutSec: entryTimeout,
 		// §DYN-SIZE-v3：标记本单由动态预算生成，让旧数量/每日/行业拒买闸让位。
 		DynamicBudget: dynamicBudget,
 	}

@@ -63,10 +63,11 @@ func TestBuyFloorMinPriceConfiguredThreshold(t *testing.T) {
 	}
 }
 
-// TestBuyFloorMinOrderAmountDefaultRejectsCrumb 成交额闸默认开：预算 6000 元、现价 40 元
-// → 整手折算 100 股 = 4000 元 < 5000 → 拒买（旧口径会照报这笔碎单）。
+// TestBuyFloorMinOrderAmountDefaultRejectsCrumb 成交额闸默认开（§B0 起默认 1 万）：预算 6000 元、
+// 现价 40 元 → 整手折算 100 股 = 4000 元 < 10000 → 拒买（旧口径会照报这笔碎单）。
+// 注意：harness 统一把闸关掉了（`MinOrderAmount=-1`），本例显式写 0＝回到出厂默认。
 func TestBuyFloorMinOrderAmountDefaultRejectsCrumb(t *testing.T) {
-	e, _, _, orders := newQMTEngine(t, func(cfg *config.QMTConfig) { cfg.FixedAmount = 6000 })
+	e, _, _, orders := newQMTEngine(t, func(cfg *config.QMTConfig) { cfg.FixedAmount = 6000; cfg.MinOrderAmount = 0 })
 	e.autoPlace(buyFloorSig("600012", "碎单股", 40), map[string]*data.StockInfo{})
 	if len(*orders) != 0 {
 		t.Fatalf("成交额 4000<5000 应被默认闸拦下，实得 %d 单: %+v", len(*orders), *orders)
@@ -77,7 +78,7 @@ func TestBuyFloorMinOrderAmountDefaultRejectsCrumb(t *testing.T) {
 // 预算 10000/现价 40 本应折 200 股（8000 元达标），但可用资金只有 6000 → 降档成 100 股
 // （4000 元）→ 必须在降档后被闸拦下，而不是拿降档前的名义金额放行。
 func TestBuyFloorMinOrderAmountAfterCashDowngrade(t *testing.T) {
-	e, db, _, orders := newQMTEngine(t, nil)
+	e, db, _, orders := newQMTEngine(t, func(cfg *config.QMTConfig) { cfg.MinOrderAmount = 0 })
 	// 覆写账户现金为 6000（harness 默认播种 1000 万；时刻口径与 cntime.Loc 一致保新鲜）。
 	if err := db.UpsertRealAccount(store.RealAccount{
 		UserID: "u_1", AvailableCash: 6000,

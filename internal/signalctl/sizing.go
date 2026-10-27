@@ -79,6 +79,56 @@ func (s SizingResult) BuyScale() float64 {
 	return s.MarketScale * s.StockScale
 }
 
+// PerTradePct 单笔占比的生效值（owner 2026-10-27：「单笔占比按因子在 10%~30% 之间动」）。
+//
+//	eff = lo + (hi − lo) × k，k = MarketScale × StockScale（已有读数，不新造因子）
+//	再硬夹 [lo, hi]（并先把 lo/hi/k 各自收进合法区间）
+//
+// 为什么这样映射：k=0（因子全灭）退到下限 lo——极端弱势仍允许按最小单位买（开不开仓由
+// 其它闸决定）；k=1（全因子中性以上）到上限 hi；中间线性，不引入新自由度。
+// 为什么必须硬夹：k 是多因子连乘，历史上出现过 >1（配置手滑）与负值（弃权分支返回异常）；
+// 这是资金参数，越界必须由本函数兜住，而不是"相信上游"。
+// 为什么要上下限两个数：只有下限时因子再好也只买 10%（小账户切出一堆碎单）；
+// 只有上限时弱市也满额——两端都要钉住。
+// English: effective per-trade share = lo + (hi−lo)×(MS×SS), clamped into [lo,hi].
+func PerTradePct(marketScale, stockScale, lo, hi float64) float64 {
+	// 两端先各自收进合法区间：≤0 回落出厂值，>0.50 一律钳到半仓（单笔不过半仓是硬边界）。
+	// 这一步必须在下限/上限比较之前做，否则"lo=0.8, hi=0.9"会先被当成合法区间再双双钳掉，
+	// 收敛结果依赖判断顺序（那种顺序依赖正是配置类缺陷的温床）。
+	if lo <= 0 {
+		lo = 0.10
+	}
+	if lo > 0.50 {
+		lo = 0.50
+	}
+	if hi <= 0 {
+		hi = 0.30
+	}
+	if hi > 0.50 {
+		hi = 0.50
+	}
+	if hi < lo {
+		hi = lo // 区间反了：抬上限而不是压下限，保证"配置错了也不会把单笔缩成 0"
+	}
+	// k = 市场组×个股组（都在 (0,1]）：越界一律夹到 [0,1]，负值是弃权分支返回异常的形态。
+	k := marketScale * stockScale
+	if k < 0 {
+		k = 0
+	}
+	if k > 1 {
+		k = 1
+	}
+	// 线性映射 + 出口再夹一次：入参合法时这是恒等，入参异常时保证返回值永远落在 [lo,hi]。
+	eff := lo + (hi-lo)*k
+	if eff < lo {
+		eff = lo
+	}
+	if eff > hi {
+		eff = hi
+	}
+	return eff
+}
+
 // ComputeSizing §DYN-SIZE 主入口：对一条买入信号算动态仓位缩放。
 //
 // 纯函数：同一 (Regime, Signal) 必得同一结果，可 100% 单测。基准态（全部因子未命中）恒返回

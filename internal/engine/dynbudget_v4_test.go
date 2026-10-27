@@ -61,9 +61,11 @@ func TestDynV4HalfBookSizedByRoom(t *testing.T) {
 	sig := combat_agent.Signal{ID: "SIG-V4A", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	e.autoPlaceScaled(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}, 0, true,
 		dynBudgetCtx{MarketScale: 0.70, StockScale: 1.0}, dynSizingCfg())
-	// 目标 7 万 − 当前 5.5 万 = 1.5 万；单笔基准 = 10 万×10%×0.70×1.0 = 7000 ⇒ 取小者 7000 → 700 股。
-	if q := (*orders)[0]["qty"].(float64); q != 700 {
-		t.Fatalf("第一笔应受单笔基准约束（700 股），got %v", q)
+	// 目标 7 万 − 当前 5.5 万 = 1.5 万；单笔占比 eff = 0.10+0.20×0.70 = 24% ⇒ 2.4 万，
+	// 取小者 1.5 万 → 1500 股。**这正是 §B0 要的形状**：碎单被 Room 与更大的单笔基准夹住后，
+	// 剩余空间一次性买到位，而不是切成 7 笔各 700 股。
+	if q := (*orders)[0]["qty"].(float64); q != 1500 {
+		t.Fatalf("第一笔应受目标剩余空间约束（1500 股），got %v", q)
 	}
 }
 
@@ -106,9 +108,10 @@ func TestDynV4PendingStrategicBuyCounted(t *testing.T) {
 	sig := combat_agent.Signal{ID: "SIG-V4C", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	e.autoPlaceScaled(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}, 0, true,
 		dynBudgetCtx{MarketScale: 0.70, StockScale: 1.0}, dynSizingCfg())
-	// 单笔基准 7000 < 剩余空间 5.2 万 ⇒ 仍下 700 股；把基准调到 100% 才能验证在途被计入（下一例）。
-	if q := (*orders)[0]["qty"].(float64); q != 700 {
-		t.Fatalf("基准约束下应为 700 股，got %v", q)
+	// §B0 起单笔占比 eff=0.10+0.20×0.70=24% ⇒ 2.4 万 < 剩余空间 5.2 万 ⇒ 2400 股；
+	// 在途是否被计入，由下一例（把单笔上限顶到 50%、让 Room 成为唯一约束）验。
+	if q := (*orders)[0]["qty"].(float64); q != 2400 {
+		t.Fatalf("基准约束下应为 2400 股，got %v", q)
 	}
 }
 
@@ -122,7 +125,9 @@ func TestDynV4TargetRoomIsTheBindingCap(t *testing.T) {
 	seedDynAccount(t, db)
 	if _, err := db.UpsertRealOrder(store.RealOrder{
 		OrderID: "OID-V4P2", SignalID: "SIG-V4P2", Code: "600001", Side: "买入", Status: "已报",
-		Price: 10, Qty: 900, CreatedAt: tdDash() + " 10:00:00", UserID: "u_1",
+		// §B0 之后单笔上限被硬夹在 50%（5 万），所以要让"目标剩余空间"成为唯一约束，
+		// 在途必须大于 2 万：9 千的在途只让 Room 掉到 6.1 万，会被 5 万单笔上限遮蔽。
+		Price: 10, Qty: 3000, CreatedAt: tdDash() + " 10:00:00", UserID: "u_1",
 	}); err != nil {
 		t.Fatalf("seed pending: %v", err)
 	}
@@ -132,8 +137,8 @@ func TestDynV4TargetRoomIsTheBindingCap(t *testing.T) {
 	sig := combat_agent.Signal{ID: "SIG-V4D", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	e.autoPlaceScaled(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}, 0, true,
 		dynBudgetCtx{MarketScale: 0.70, StockScale: 1.0}, sc)
-	if q := (*orders)[0]["qty"].(float64); q != 6100 {
-		t.Fatalf("目标剩余空间应截到 6100 股（7万−9000），got %v", q)
+	if q := (*orders)[0]["qty"].(float64); q != 4000 {
+		t.Fatalf("目标剩余空间应截到 4000 股（7万−3万），got %v", q)
 	}
 }
 
@@ -156,7 +161,7 @@ func TestDynV4IntradayLegsExcludedFromStrategicCur(t *testing.T) {
 	seedDynAccount(t, db1)
 	if _, err := db1.UpsertRealOrder(store.RealOrder{
 		OrderID: "OID-V4T-A", SignalID: "t0:600001:buy_first:" + tdNow() + ":1", Code: "600001", Side: "买入",
-		Status: "已报", Price: 10, Qty: 5000, CreatedAt: tdDash() + " 10:00:00", UserID: "u_1", IntradayT: true,
+		Status: "已报", Price: 10, Qty: 6000, CreatedAt: tdDash() + " 10:00:00", UserID: "u_1", IntradayT: true,
 	}); err != nil {
 		t.Fatalf("seed T leg: %v", err)
 	}
@@ -166,8 +171,10 @@ func TestDynV4IntradayLegsExcludedFromStrategicCur(t *testing.T) {
 	sigA := combat_agent.Signal{ID: "SIG-V4A", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	e1.autoPlaceScaled(sigA, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}, 0, true,
 		dynBudgetCtx{MarketScale: 0.80, StockScale: 1.0}, sc)
-	if q := qtyOf(t, orders1); q != 5000 {
-		t.Fatalf("行业额度必须计入 T 腿（剩 5 万 → 5000 股），got %v", q)
+	// §B0 起单笔占比硬夹 50%（5 万）；这里 T 腿 6 万 ⇒ 行业额度 4 万 < 5 万 ⇒ 4000 股，
+	// 与"看不见 T 腿"的侧①（5 万 → 5000 股）分得开。
+	if q := qtyOf(t, orders1); q != 4000 {
+		t.Fatalf("行业额度必须计入 T 腿（剩 4 万 → 4000 股），got %v", q)
 	}
 
 	// ── 侧①：战略剩余空间必须看不见 T 腿 ──
@@ -178,7 +185,7 @@ func TestDynV4IntradayLegsExcludedFromStrategicCur(t *testing.T) {
 	seedDynAccount(t, db2)
 	if _, err := db2.UpsertRealOrder(store.RealOrder{
 		OrderID: "OID-V4T-B", SignalID: "t0:600001:buy_first:" + tdNow() + ":2", Code: "600001", Side: "买入",
-		Status: "已报", Price: 10, Qty: 5000, CreatedAt: tdDash() + " 10:00:00", UserID: "u_1", IntradayT: true,
+		Status: "已报", Price: 10, Qty: 6000, CreatedAt: tdDash() + " 10:00:00", UserID: "u_1", IntradayT: true,
 	}); err != nil {
 		t.Fatalf("seed T leg: %v", err)
 	}
@@ -195,8 +202,8 @@ func TestDynV4IntradayLegsExcludedFromStrategicCur(t *testing.T) {
 	sigB := combat_agent.Signal{ID: "SIG-V4B", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	e2.autoPlaceScaled(sigB, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}, 0, true,
 		dynBudgetCtx{MarketScale: 0.80, StockScale: 1.0}, sc)
-	if q := qtyOf(t, orders2); q != 8000 {
-		t.Fatalf("T 腿不该占战略剩余空间（目标 8 万 → 8000 股），got %v；误计入 CurStrat 会掉到 3000", q)
+	if q := qtyOf(t, orders2); q != 5000 {
+		t.Fatalf("T 腿不该占战略剩余空间（单笔 50%% → 5000 股），got %v；误计入 CurStrat 会掉到 2000", q)
 	}
 }
 
@@ -256,10 +263,10 @@ func TestDynV4ShadowLeavesSizingUntouched(t *testing.T) {
 	sig := combat_agent.Signal{ID: "SIG-V4I", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
 	e.autoPlaceScaled(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}, 0, true,
 		dynBudgetCtx{MarketScale: 0.40, StockScale: 1.0}, sc)
-	// 影子期：TargetRoom 不参与、scale 回落中性 1.0 ⇒ 单笔 = 10 万×1.0×1.0 = 10 万 → 1 万股。
+	// 影子期：TargetRoom 不参与 ⇒ 单笔 = 10 万×50%（§B0 硬夹）= 5 万 → 5000 股。
 	// 若影子误执法，MS 0.40 的目标 4 万会把本单截到 4000 股——观察期变成执法期。
-	if q := qtyOf(t, orders); q != 10000 {
-		t.Fatalf("影子期不得收紧，期望 10000 股，got %v（被目标截断会是 4000）", q)
+	if q := qtyOf(t, orders); q != 5000 {
+		t.Fatalf("影子期不得收紧，期望 5000 股，got %v（被目标截断会是 4000）", q)
 	}
 }
 

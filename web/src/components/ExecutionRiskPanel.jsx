@@ -73,14 +73,16 @@ export default function ExecutionRiskPanel() {
         autoSellAllSources: cfg.auto_sell_all_sources === true,
         autoRiskCaution: cfg.auto_risk_caution === true,
         sellUnifiedMode: String(cfg.sell_unified_mode || 'shadow'),
-        minOrderAmount: num(cfg.min_order_amount, 5000),
-        entryPullback: num(cfg.entry_pullback_pct, 0),
-        entryTimeout: num(cfg.entry_timeout_sec, 0),
+        minOrderAmount: num(cfg.min_order_amount, 10000),
+        maxPositions: num(cfg.max_positions, 0),
+        entryPullback: num(cfg.entry_pullback_pct, 1),
+        entryPullbackMaxGap: num(cfg.entry_pullback_max_gap_pct, 1),
+        entryTimeout: num(cfg.entry_timeout_sec, 120),
         maxVwapPremium: num(cfg.max_signal_vwap_premium_pct, 0),
         vwapShadow: cfg.max_signal_vwap_premium_shadow !== false,
         sectorPct: num(rg.sector_value_pct, 0),
         sectorShadow: rg.sector_value_shadow !== false,
-        conceptPct: num(rg.concept_value_pct, 0),
+        conceptPct: num(rg.concept_value_pct, 40),
         conceptShadow: rg.concept_value_shadow !== false,
         riskPerTrade: num(rg.risk_per_trade_pct, 0),
         riskBudgetShadow: rg.risk_budget_shadow !== false,
@@ -135,6 +137,9 @@ export default function ExecutionRiskPanel() {
     pct('软回踩比例', form.entryPullback)
     if (!Number.isFinite(Number(form.staleQuoteMs)) || Number(form.staleQuoteMs) < 0) bad.push('行情新鲜度阈值')
     if (!Number.isFinite(Number(form.entryTimeout)) || Number(form.entryTimeout) < 0) bad.push('软回踩超时')
+    // 让价上限：-1=显式取消上限，0=出厂默认 1%，其余 0~100。
+    if (!Number.isFinite(Number(form.entryPullbackMaxGap)) || Number(form.entryPullbackMaxGap) < -1 || Number(form.entryPullbackMaxGap) > 100) bad.push('回踩让价上限')
+    if (!Number.isFinite(Number(form.maxPositions)) || Number(form.maxPositions) < 0 || Number(form.maxPositions) > 50) bad.push('持仓数上限')
     if (!Number.isFinite(Number(form.minOrderAmount)) || Number(form.minOrderAmount) < 0) bad.push('最低成交额')
     if (bad.length) {
       showToast(`以下参数无效，禁止保存：${bad.join('、')}`, 'error')
@@ -151,7 +156,9 @@ export default function ExecutionRiskPanel() {
         auto_risk_caution: !!form.autoRiskCaution,
         sell_unified_mode: form.sellUnifiedMode,
         min_order_amount: Number(form.minOrderAmount),
+        max_positions: Number(form.maxPositions),
         entry_pullback_pct: Number(form.entryPullback),
+        entry_pullback_max_gap_pct: Number(form.entryPullbackMaxGap),
         entry_timeout_sec: Number(form.entryTimeout),
         max_signal_vwap_premium_pct: Number(form.maxVwapPremium),
         max_signal_vwap_premium_shadow: !!form.vwapShadow,
@@ -287,16 +294,22 @@ export default function ExecutionRiskPanel() {
           <Row label="行情新鲜度阈值 ms" hint="0=关；超过该陈旧度拒单。">
             <InputNumber min={0} max={600000} step={1000} value={form.staleQuoteMs} onChange={(v) => set({ staleQuoteMs: num(v, 0) })} />
           </Row>
-          <Row label="单笔最低成交额 元" hint="默认 5000；默认 budget_mode=dynamic 下不再作为拒买闸；切回 legacy 才恢复该闸。">
-            <InputNumber min={0} max={1000000} step={1000} value={form.minOrderAmount} onChange={(v) => set({ minOrderAmount: num(v, 5000) })} />
+          <Row label="单笔最低成交额 元" hint="默认 10000（§B0：不满 1 万的信号仓碎单一律拒买）。dynamic 下同样生效，且**加仓同样受约束**；小额需求由做 T 承担。负数=显式关闭。">
+            <InputNumber min={-1} max={1000000} step={1000} value={form.minOrderAmount} onChange={(v) => set({ minOrderAmount: num(v, 10000) })} />
+          </Row>
+          <Row label="实盘持仓数上限 只" hint="默认 0=不设限（旧行为）。>0 时只拦**新开仓**：持仓数达上限即跳过；已持仓票的加仓不受限。建议 6（￥9.5 万账户约 3~4 只即建满目标）。">
+            <InputNumber min={0} max={50} step={1} value={form.maxPositions} onChange={(v) => set({ maxPositions: num(v, 0) })} />
           </Row>
 
           <div style={groupStyle}>VWAP 执行质量（C2，默认只落库）</div>
-          <Row label="软回踩比例 %" hint="0=关；挂单价 = min(信号价, VWAP×(1−该比例))。">
-            <InputNumber min={0} max={100} step={0.1} value={form.entryPullback} onChange={(v) => set({ entryPullback: num(v, 0) })} />
+          <Row label="软回踩比例 %" hint="默认 1（§B6 v2 定价）：委托价 = max(VWAP×(1−该比例), 现价×(1−让价上限))，只在连续竞价挂。0=关。">
+            <InputNumber min={0} max={100} step={0.1} value={form.entryPullback} onChange={(v) => set({ entryPullback: num(v, 1) })} />
           </Row>
-          <Row label="软回踩超时撤单 秒" hint="0=沿用既有 cancel_stale_sec 撤单闭环。">
-            <InputNumber min={0} max={3600} step={10} value={form.entryTimeout} onChange={(v) => set({ entryTimeout: num(v, 0) })} />
+          <Row label="回踩让价上限 %" hint="默认 1：委托价最多比现价低这么多（没有它＝10-26 那排「已撤」的成因）。0=出厂默认 1%，-1=显式取消上限（不建议）。">
+            <InputNumber min={-1} max={100} step={0.1} value={form.entryPullbackMaxGap} onChange={(v) => set({ entryPullbackMaxGap: num(v, 1) })} />
+          </Row>
+          <Row label="软回踩超时撤单 秒" hint="默认 120：到点未成交即撤；撤单后同日同票同战法不重挂（靠既有 buy 幂等键）。负数=沿用 cancel_stale_sec 旧闭环。">
+            <InputNumber min={-1} max={3600} step={10} value={form.entryTimeout} onChange={(v) => set({ entryTimeout: num(v, 120) })} />
           </Row>
           <Row label="信号价高于 VWAP 硬过滤 %" hint="0=关；先影子统计误杀率，不建议直接硬开。">
             <InputNumber min={0} max={100} step={0.1} value={form.maxVwapPremium} onChange={(v) => set({ maxVwapPremium: num(v, 0) })} />
