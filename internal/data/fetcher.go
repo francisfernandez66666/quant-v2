@@ -133,6 +133,29 @@ func (f *Fetcher) UpdateHotStocks(stocks []string) {
 	f.hotStocks = stocks
 }
 
+// TrackStock 只把代码加入监控池，**不立即取价**（下一次 5s 刷新统一拉）。
+//
+// 为什么不能复用 EnsureStock：那个函数会**立刻单独打一次上游**。展示侧一轮要补的代码
+// 是几十到上百个（现网 205 个信号里 177 个不在池里），用 EnsureStock 就是把这 177 次
+// 请求从"批量超时"变成"逐票轰炸"——正是 §SIGBATCH 当初要消灭的形态。
+// 这里只登记，请求数不变，下一轮刷新后这些代码零网络命中快照。
+// English: pool-only registration (no immediate per-code fetch) so warming N displayed symbols
+// never recreates the per-symbol upstream hammering that §SIGBATCH removed.
+func (f *Fetcher) TrackStock(code string) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.baseStocks {
+		if s == code {
+			return
+		}
+	}
+	f.baseStocks = append(f.baseStocks, code)
+}
+
 // EnsureStock 确保某只股票在监控列表中，立即获取其行情并合并到当前快照。
 // 用于前端添加自选后立即获得名称/价格，无需等待下一个 scanCycle。
 // EnsureStock adds a symbol to the monitor pool and immediately merges its quote

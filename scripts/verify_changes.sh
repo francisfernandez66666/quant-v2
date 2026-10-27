@@ -12466,7 +12466,10 @@ eq116 "$HND116" "func (s *Server) displayQuotes(codes []string) (map[string]*dat
 eq116 "$HND116" "func (s *Server) topUpQuotes(codes []string, got map[string]*data.StockInfo) (map[string]*data.StockInfo, int) {" 1 '补齐腿入口签名：第二个返回值＝真的打了几次逐票（用 len(结果) 计数会把「打出去但补不到价」抹成 0，读数就成了谎话）'
 eq116 "$HND116" "func (s *Server) degradeQuote(code string) *data.StockInfo {" 1 '补齐腿的缝包装（与 batchQuotes 同形：判据先缝后真源，用例数到的次数才代表真实路径）'
 eq116 "$HND116" "func (s *Server) logDisplayQuotes(endpoint string, st displayQuoteStats) {" 1 '读数单出口（五面共用一条格式）'
-eq116 "$HND116" "现价补齐 唯一代码=%d 快照命中=%d 批量代码=%d 批量请求=%d 批量命中=%d 逐票补齐=%d 补齐命中=%d 等待=%dms 放弃等待=%v 原因=%s" 1 '读数格式恰一枚实现，且补齐腿的两个计数必须在格式里（抄成两份会分家；漏掉计数＝这条腿哪天顶到上限也没人看得见）'
+# §132（2026-10-27）同批加了一段「池预热=%d」：现网 205 个代码快照只命中 28，
+# 缺价的 177 个被钉进 fetcher 快照池——不加这个读数就看不出"下一轮会不会好"。
+# 等值锁跟着改整串（格式只有一份，改一处即可；漏改＝读数与实际字段脱节）。
+eq116 "$HND116" "现价补齐 唯一代码=%d 快照命中=%d 批量代码=%d 批量请求=%d 批量命中=%d 逐票补齐=%d 补齐命中=%d 池预热=%d 等待=%dms 放弃等待=%v 原因=%s" 1 '读数格式恰一枚实现，且补齐腿的两个计数必须在格式里（抄成两份会分家；漏掉计数＝这条腿哪天顶到上限也没人看得见）'
 eq116 "$HND116" "	timer := time.NewTimer(displayQuoteBatchWait)" 1 '上限真的接进了 select（只有常量没有 timer＝注释级承诺）'
 eq116 "$HND116" "	case <-timer.C:" 1 '到点分支在岗（缺它＝主腿只能等上游，等于没有时限）'
 eq116 "$HND116" "	done := make(chan batchQuoteOutcome, 1)" 1 'cap=1 channel：主腿返回后晚到的 goroutine 不阻塞也不写共享 map'
@@ -12546,13 +12549,15 @@ SNAP116 2
 
 # ── ③ 测试资产在位 + 两组行为腿（断的是「实跑并通过的用例数」，不是「包里打了 ok」）──
 re116 "$DT116" '^func Test' 6 '数据层批量用例枚数（6 枚：分片/去重别名/分片失败隔离/零价/客户端零价/无客户端）'
-re116 "$ST116" '^func TestSigBatch' 8 '展示层用例枚数（8 枚：①一次调用 ②快照零调用 ③失败保列表 ④有界等待 ⑤三面各一次 ⑥行语义分家 ⑦五面读数上屏 ⑧补齐腿次数上限）'
+# §132（2026-10-27）同批新增第 9 枚：缺价代码必须钉进 fetcher 快照池（池预热）。
+re116 "$ST116" '^func TestSigBatch' 9 '展示层用例枚数（9 枚：①一次调用 ②快照零调用 ③失败保列表 ④有界等待 ⑤三面各一次 ⑥行语义分家 ⑦五面读数 ⑧池预热上屏 ⑧补齐腿次数上限）'
 eq116 "$DT116" "func TestBatchQuotesChunked(t *testing.T) {" 1 '「只打 N 次」这一维的数据层用例在位'
 eq116 "$ST116" "func TestSigBatchDisplayBoundedWait(t *testing.T) {" 1 '「有界等待」用例在位（上限常量等值锁之外的机制证明）'
 eq116 "$ST116" "func TestSigBatchDisplaySoloTopUpCapped(t *testing.T) {" 1 '「补齐腿次数上限」用例在位（displayQuoteSoloMax 常量等值锁之外的机制证明：三态全覆盖/缺 20/整片没覆盖）'
 SEAMTEST116=$(grep -cE 's\.batchQuoteFn = ' internal/server/sigbatch_display_test.go 2>/dev/null || true)
 CNT116=$((CNT116 + 1))
-[ "${SEAMTEST116:-0}" = "8" ] || { echo "--- FAIL: §116 测试文件里 batchQuoteFn 注入点读到 ${SEAMTEST116:-0}，预演 8（八个用例各一次）：某个用例不再注入缝＝它其实在测真实上游或根本没测到批量这一维"; exit 1; }
+# §132（2026-10-27）新增第 9 枚展示层用例（池预热），注入点随之 8→9。
+[ "${SEAMTEST116:-0}" = "9" ] || { echo "--- FAIL: §116 测试文件里 batchQuoteFn 注入点读到 ${SEAMTEST116:-0}，预演 9（九个用例各一次）：某个用例不再注入缝＝它其实在测真实上游或根本没测到批量这一维"; exit 1; }
 SEAMTESTD116=$(grep -cE 's\.degradeQuoteFn = ' internal/server/sigbatch_display_test.go 2>/dev/null || true)
 CNT116=$((CNT116 + 1))
 [ "${SEAMTESTD116:-0}" = "1" ] || { echo "--- FAIL: §116 测试文件里 degradeQuoteFn 注入点读到 ${SEAMTESTD116:-0}，预演 1（只有 ⑧ 数补齐次数）：枚数涨到 2 说明有人开始用补齐缝测别的东西而那条用例的判据还在 ⑧ 手里；掉到 0 说明补齐腿的用证消失，上限锁会变成纯字节锁"; exit 1; }
@@ -15466,4 +15471,141 @@ rm -rf "$W131"
 echo "INFO - §131 覆盖面账：回踩的「本会成交价 vs 实际成交价」只落在日志/opslog（§B6 v1），没有进 orders 表；要做两周后的「1% 是否合适」分析需要按票回捞日志，或用 B1 批统一加的成本分解列（那时一并落库）。另：回踩只在实盘信号买入路径生效，T 腿与纸面不受影响（T 有自己的定价）。"
 [ "$B131_FAILED" = "0" ] || exit 1
 echo "ok - §131 §B6 软回踩 v2 锁通过（静态 13 道 + 行为腿 3 子用例 + 反证 2 枚，累计判定点 ${CNT131}）"
+# ============================================================================
+# ============================================================================
+# §132 §BUG-INDEX / §BUG-STATE / §BUG-SIGPRICE（2026-10-27 现网三连带）
+#
+# 当天暴露的三件事，是同一族「看着有数、其实是错数/缺数」：
+#   ① 指数取数走个股链：`GetIndexQuote("000001")` 返回的是**平安银行**（实测），
+#      而正确的 "sh000001" 在个股三源全 no data ⇒ 大盘跌幅/趋势破位/止损偏移一直在看一只银行股；
+#      该票偶发取不到时 IndexChangePct=NaN ⇒ 被当成"关键输入缺失"⇒ 目标半仓 + 当天 T 全关。
+#   ② 状态机没有"当日价格"输入，广度与指数斜率又双双缺失 ⇒ 只用 2/6 票就给出 bull 60%。
+#   ③ 信号列表现价大量「—」：205 个代码里快照只命中 28（池里只有买入信号），
+#      批量 177 个一次请求 >3s 被放弃；而 K 线/五档走别的接口，所以看起来"明明有行情"。
+#
+# English: three connected production bugs — wrong index instrument, a state machine voting on
+# 2/6 signals without saying so, and display prices missing because the snapshot pool only
+# covered buy signals while the 177-symbol batch request timed out.
+# ============================================================================
+echo "==> 132 §BUG-INDEX/STATE/SIGPRICE（指数专用通道 / 研判质量闸 / 现价池预热）..."
+fail132() {
+	echo "--- FAIL: §132 $*"
+	FAIL=1
+	B132_FAILED=1
+}
+B132_FAILED=0
+CNT132=0
+MK132=internal/data/market.go
+RS132=internal/research/market_state.go
+EG132=internal/engine/engine.go
+HF132=internal/server/handlers_fix.go
+FT132=internal/data/fetcher.go
+
+# —— ① 指数必须走专用通道，且不许回退到个股链 ——
+grep -q 'func (m \*MarketAPI) GetIndexLiveQuote(code string) (\*IndexLiveQuote, error)' "$MK132" ||
+	fail132 "缺 GetIndexLiveQuote：指数读数没有专用通道（只能回到个股链，000001 会变成平安银行）"
+grep -q 'indexSecID(code)' "$MK132" ||
+	fail132 "指数专用通道没用 indexSecID（secid 前缀错了就又是深市同码个股）"
+if grep -A3 'func (m \*MarketAPI) GetIndexQuote(code string) (\*StockInfo, error) {' "$MK132" | grep -q 'return m.GetRealtimeQuote(code)'; then
+	fail132 "GetIndexQuote 又直接调 GetRealtimeQuote 了（用个股链接指数＝数字全错且没人看得出来）"
+fi
+grep -q 'GetIndexLiveQuote("000001")' "$EG132" ||
+	fail132 "引擎的指数涨跌幅没走专用通道（fillIndexReadings/状态机都会退回错载体）"
+grep -q 'func (e \*Engine) indexChangePctNow(now time.Time) (float64, string, bool)' "$EG132" ||
+	fail132 "缺 indexChangePctNow：指数涨跌幅没有 30s TTL + LKG 的统一入口（每处各取一次会漂移）"
+grep -q 'last-known-good' "$MK132" ||
+	fail132 "指数专用通道没有 LKG 回退说明（单次抖动就 NaN ⇒ 半仓+停 T 的老路）"
+CNT132=$((CNT132 + 6))
+
+# —— ② 状态机：第六票 + 输入完整性 + 急杀降档 + 质量读数 ——
+grep -q 'IndexChangePct float64' "$RS132" ||
+	fail132 "状态机快照没有 IndexChangePct（当日价格仍然不进研判）"
+grep -q 'MinVotes int' "$RS132" ||
+	fail132 "状态机没有 MinVotes（输入不全时会继续按 2/6 票定档）"
+grep -q 'PlungePct float64' "$RS132" ||
+	fail132 "状态机没有急杀线（bull 不会被当日急杀降档）"
+grep -q 'func ClassifyWithQuality(sn StateSnapshot, cfg StateConfig) (MarketState, int, int)' "$RS132" ||
+	fail132 "缺 ClassifyWithQuality（拿不到有效票数 ⇒ 质量闸无从下手）"
+grep -q 'if present < t.cfg.MinVotes && want != StateRange {' "$RS132" ||
+	fail132 "安全阀①（输入不全→range）不在 Observe 里"
+grep -q 'sn.IndexChangePct <= t.cfg.PlungePct' "$RS132" ||
+	fail132 "安全阀②（急杀→最多 range）不在 Observe 里"
+grep -q 'func (t \*StateTracker) Quality() (int, int)' "$RS132" ||
+	fail132 "状态机没有 Quality 读数（「研判质量 2/6」就只能靠猜）"
+grep -q 'IndexChangePct: idxPct,' "$EG132" ||
+	fail132 "引擎没把指数涨跌幅喂进状态机（第六票空转）"
+grep -q '研判质量=%d/%d 票' "$EG132" ||
+	fail132 "引擎日志没打研判质量（本次排查最费力的就是这一项不可见）"
+CNT132=$((CNT132 + 9))
+
+# —— ③ 展示侧现价：把被展示的代码钉进快照池，且**不许**在展示路径用 EnsureStock ——
+grep -q 'func (f \*Fetcher) TrackStock(code string)' "$FT132" ||
+	fail132 "缺 TrackStock（只登记不取价）：数百个展示代码没法进池，只能每轮重打批量"
+grep -q 's.fetcher.TrackStock(code)' "$HF132" ||
+	fail132 "displayQuotes 没把缺价代码钉进池（下一轮还会是一片「—」）"
+# 负锁只看 displayQuotes 的函数体：EnsureStock 在"下单成功把票钉进池"那一处是合法用法，
+# 全文扫会把合法点也判红（§100 家族教训：负锁的射程要按函数边界收，不按文件收）。
+DISP132=$(awk '/^func \(s \*Server\) displayQuotes\(/{f=1} f{print} f&&/^}$/{exit}' "$HF132")
+grep_q 'EnsureStock\(' DISP132 &&
+	fail132 "displayQuotes 里用了 EnsureStock（它会逐票立刻打上游）：上百个代码＝一次轰炸，正是 §SIGBATCH 要消灭的形态"
+grep -q '池预热=%d' "$HF132" ||
+	fail132 "现价补齐读数没有「池预热」计数（「这轮为什么一片 —、下一轮会不会好」又不可见）"
+CNT132=$((CNT132 + 4))
+
+# —— 行为腿：状态机三枚 + 展示预热一枚，真跑 ——
+B132OUT=$(go test ./internal/research/ ./internal/server/ -count=1 -run 'TestStateQualityGateDowngradesToRange|TestStatePlungeDowngradesBull|TestStateIndexChangeVotesBear|TestStateIndexChangeNeutralAbstains|TestSigBatchDisplayWarmsFetcherPool' 2>&1 || true)
+grep_q '^ok' B132OUT ||
+	{ fail132 "§132 行为腿非绿：$(printf '%s\n' "$B132OUT" | grep -E 'FAIL|_test' | head -3 | tr '\n' ' ')"; }
+CNT132=$((CNT132 + 1))
+
+# —— 反证两枚（镜子法，只镜像 internal/research）——
+W132=$(mktemp -d /tmp/gate132-XXXXXX) || { echo "--- FAIL: §132 建不出反证工作目录"; exit 1; }
+mkdir -p "$W132/mirror/internal" || exit 1
+for _e in "$PWD"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in internal | cmd) continue ;; esac
+	ln -s "$_e" "$W132/mirror/$_b" || exit 1
+done
+for _e in "$PWD"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in research) continue ;; esac
+	ln -s "$_e" "$W132/mirror/internal/$_b" || exit 1
+done
+cp -R "$PWD/internal/research" "$W132/mirror/internal/research" || exit 1
+mut132() { # $1=相对镜像路径 $2=old $3=new → 打印落地次数
+	python3 - "$W132/mirror/$1" "$2" "$3" <<'PY132'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PY132
+}
+# R1：拆掉质量闸 ⇒ 2/6 票那帧又会回到 bull。
+N132R1=$(mut132 internal/research/market_state.go 'if present < t.cfg.MinVotes && want != StateRange {
+		want = StateRange
+	}' '' || true)
+CNT132=$((CNT132 + 1))
+[ "${N132R1:-0}" = "1" ] || fail132 "反证 R1 变异落地数=${N132R1:-0}（应 1）：靶串不在位"
+R132OUT1=$(cd "$W132/mirror" && go test ./internal/research/ -count=1 -run 'TestStateQualityGateDowngradesToRange' 2>&1 || true)
+CNT132=$((CNT132 + 1))
+grep_q '^--- FAIL|build failed|undefined:' R132OUT1 ||
+	{ fail132 "反证 R1 失效：拆掉质量闸后仍绿——2/6 票定 bull 这件事没人盯着"; }
+# R2：拆掉急杀降档 ⇒ 指数 −1.2% 仍会给出 bull。
+# 反证必须让包**仍能编译**：直接删掉这块会让 math 变成 unused import，编译失败会被后面
+# 的 grep '^--- FAIL' 读成"仍绿"（判据自己瞎了，不是锁有牙）。
+N132R2=$(mut132 internal/research/market_state.go 'if want == StateBull && !math.IsNaN(sn.IndexChangePct) && sn.IndexChangePct <= t.cfg.PlungePct {' 'if false && want == StateBull && !math.IsNaN(sn.IndexChangePct) && sn.IndexChangePct <= t.cfg.PlungePct {' || true)
+CNT132=$((CNT132 + 1))
+[ "${N132R2:-0}" = "1" ] || fail132 "反证 R2 变异落地数=${N132R2:-0}（应 1）：靶串不在位"
+R132OUT2=$(cd "$W132/mirror" && go test ./internal/research/ -count=1 -run 'TestStatePlungeDowngradesBull' 2>&1 || true)
+CNT132=$((CNT132 + 1))
+grep_q '^--- FAIL|build failed|undefined:' R132OUT2 ||
+	{ fail132 "反证 R2 失效：拆掉急杀降档后仍绿——「下午急杀却按牛市定档」会原样复现"; }
+rm -rf "$W132"
+
+echo "INFO - §132 覆盖面账：① 指数日线 MA 斜率的**本地兜底**（读 index_daily 算斜率）本批未做——今天东方财富 K 线接口在本机与现网都返回空，斜率只能弃权；状态机的质量闸已经把这种情况降级为 range，斜率本身并进 B2 的数据面一起修。② 日内急杀目前用「当日累计跌幅」近似，30 分钟窗口的加速度判据（与 T 的 market_plunge 完全同源）也要等 B2 的分时读数。③ 状态机质量目前只进日志与 /api/status 语义，前端徽标未加（避免本批再动契约）。"
+echo "ok - §132 §BUG-INDEX/STATE/SIGPRICE 锁通过（静态 19 道 + 行为腿 5 枚 + 反证 2 枚，累计判定点 ${CNT132}）"
+[ "$B132_FAILED" = "0" ] || exit 1
 echo "==> 全部通过"

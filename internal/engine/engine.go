@@ -86,6 +86,9 @@ type Engine struct {
 	// through hithink primary + EastMoney fallback; nil or riskHithink=false reverts to EM-direct.
 	coordinator *data.DataCoordinator
 	riskHithink bool
+	// §BUG-STATE 最近一帧市场状态机的研判质量（有效票/总票）：0/0=还没跑过。
+	lastStateVotes      int
+	lastStateVotesTotal int
 	// §MARKET_RISK_GATE P2 指数均线斜率日级缓存（趋势斜率日内不变，避免每轮重复拉指数日K）：
 	// maSlopeDay 记录已算交易日，跨日才重算；未注入源/取数失败时保持 NaN 弃权。
 	// English: daily cache of index MA slopes (trend slope is intraday-invariant; recompute only on a
@@ -6005,6 +6008,9 @@ func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, u
 	}
 	tracker := e.marketTracker
 	e.mu.Unlock()
+	// §BUG-STATE：把**当日指数涨跌幅**作为第六票喂进状态机（此前状态机没有任何"当日价格"输入，
+	// 于是"大盘急杀"在研判里不可见）。同时取研判质量（有效票/总票）供日志与安全阀。
+	idxPct, _, _ := e.indexChangePctNow(time.Now())
 	st := tracker.Observe(research.StateSnapshot{
 		LimitUpCount:   limitUpCount,
 		LadderHeight:   ladderHeight,
@@ -6012,14 +6018,20 @@ func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, u
 		UpRatio:        upRatio,
 		IndexMA20Slope: ma20Slope,
 		IndexMA60Slope: ma60Slope,
+		IndexChangePct: idxPct,
 	}, time.Now())
 	cap := tracker.MaxPosPct()
+	present, total := tracker.Quality()
+	e.mu.Lock()
+	e.lastStateVotes, e.lastStateVotesTotal = present, total
+	e.mu.Unlock()
 	e.mu.Lock()
 	e.lastMarketState, e.lastMaxPosPct = string(st), cap
 	e.mu.Unlock()
-	if st != research.StateRange {
-		log.Printf("[engine] §P2.3 市场状态=%s 仓位档=%.0f%%（涨停%d 连板%d 炸板率%.0f%% 上涨占比%.0f%%）",
-			st, cap*100, limitUpCount, ladderHeight, breakRate, upRatio)
+	// 质量必须一起打：2026-10-27 的教训是"结论看起来正常、其实是 2/6 票得出的"。
+	if st != research.StateRange || present < total {
+		log.Printf("[engine] §P2.3 市场状态=%s 仓位档=%.0f%% 研判质量=%d/%d 票（涨停%d 连板%d 炸板率%.0f%% 上涨占比%.0f%% MA20=%.4f MA60=%.4f 指数涨跌=%.2f%%）",
+			st, cap*100, present, total, limitUpCount, ladderHeight, breakRate, upRatio, ma20Slope, ma60Slope, idxPct)
 	}
 	return st, cap
 }
@@ -6365,16 +6377,41 @@ func (e *Engine) fillIndexReadings(r *signalctl.Regime, now time.Time) {
 		r.IndexChangePct, r.IndexChangeDay = quotePct, quoteDay
 		return
 	}
-	pct := math.NaN()
+	_ = market
+	pct, day2, stale := e.indexChangePctNow(now)
+	if stale {
+		// 陈旧回退要可见：否则"用 10 分钟前的指数"这件事只活在一行 debug 日志里。
+		log.Printf("[engine] §BUG-INDEX 指数涨跌幅为 last-known-good（主链失败）：%.2f%%", pct)
+	}
+	r.IndexChangePct, r.IndexChangeDay = pct, day2
+}
+
+// indexChangePctNow 当日**上证指数**涨跌幅（30s 短 TTL + last-known-good）。
+//
+// §BUG-INDEX（2026-10-27）：旧实现走 GetRealtimeQuote("000001")——那是深市平安银行，不是指数；
+// 而 "sh000001" 在个股三源里全是 no data。现在统一走 data.GetIndexLiveQuote（东财指数 secid）。
+// 返回 NaN 只代表"连 LKG 都没有"（真·全断），短暂抖动一律用 LKG 并标 stale——单次取数失败
+// 不该让全账户目标半仓、当天 T 全关。
+// English: real SH-index change pct with 30s TTL and LKG; NaN means "no LKG either".
+func (e *Engine) indexChangePctNow(now time.Time) (float64, string, bool) {
+	today := data.TradingDayDate(now)
+	e.mu.RLock()
+	day, pct, at := e.idxQuoteDay, e.idxQuotePct, e.idxQuoteAt
+	market := e.marketAPI
+	e.mu.RUnlock()
+	if day == today && !at.IsZero() && now.Sub(at) < 30*time.Second {
+		return pct, day, false
+	}
+	np, stale := math.NaN(), false
 	if market != nil {
-		if q, err := market.GetIndexQuote("000001"); err == nil && q != nil {
-			pct = q.ChangePct
+		if q, err := market.GetIndexLiveQuote("000001"); err == nil && q != nil {
+			np, stale = q.ChangePct, q.Stale
 		}
 	}
 	e.mu.Lock()
-	e.idxQuoteDay, e.idxQuotePct, e.idxQuoteAt = today, pct, now
+	e.idxQuoteDay, e.idxQuotePct, e.idxQuoteAt = today, np, now
 	e.mu.Unlock()
-	r.IndexChangePct, r.IndexChangeDay = pct, today
+	return np, today, stale
 }
 
 // fillMacroEvents 填充宏观事件视图：影响期标记 + **交易日**前瞻距离。

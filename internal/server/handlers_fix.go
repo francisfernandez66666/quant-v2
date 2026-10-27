@@ -1801,7 +1801,10 @@ type displayQuoteStats struct {
 	soloHits  int           // 逐票补齐里真拿到可用价的数量
 	elapsed   time.Duration // 批量请求实际等待时长
 	dropped   bool          // 是否因超过 displayQuoteBatchWait 而放弃等待（结果晚到也不采用）
-	err       string        // 批量失败原因（空＝本轮无错）
+	// warmed 本轮仍缺价、被钉进 fetcher 快照池的代码数（§BUG-SIGPRICE）：下一次 5s 刷新后
+	// 这些代码就能零网络命中快照。它是"这轮为什么一片「—」、下一轮会不会好"的唯一读数。
+	warmed int
+	err    string // 批量失败原因（空＝本轮无错）
 }
 
 // failReason 批量补价失败原因；无错时给「无」，保证日志行每次都是完整读数。
@@ -1976,6 +1979,22 @@ func (s *Server) displayQuotes(codes []string) (map[string]*data.StockInfo, disp
 		st.dropped = true
 		st.err = fmt.Sprintf("批量补价超过 %s，本轮放弃等待（列表照常返回，现价按缺数渲染）", displayQuoteBatchWait)
 	}
+	// §BUG-SIGPRICE（2026-10-27）：快照池里**只有买入信号**会被钉进去（见下方注释），
+	// 于是"观察/静默"信号的现价只能靠每轮批量补价——现网 205 个代码里快照只有 28 个、
+	// 批量 177 个一次请求超过 3s 被放弃，页面上就是一大片「—」。
+	// 处置：把本轮仍缺价的代码钉进 fetcher 快照池（EnsureStock，零额外请求），
+	// 下一次 5s 刷新它们就进快照，后续轮询直接命中。这是"让池子覆盖被展示的东西"，
+	// 而不是"每次轮询都重打一次 177 只的批量"。
+	for _, code := range misses {
+		if si := quotes[code]; si != nil && si.Price > 0 {
+			continue
+		}
+		if s.fetcher != nil {
+			// 只登记不取价（TrackStock）：EnsureStock 会立刻逐票打上游，上百个代码就是一次轰炸。
+			s.fetcher.TrackStock(code)
+			st.warmed++
+		}
+	}
 	return quotes, st
 }
 
@@ -1988,8 +2007,8 @@ func (s *Server) displayQuotes(codes []string) (map[string]*data.StockInfo, disp
 // per-request upstream call count stays comparable day over day; divergent copies are how
 // this incident stayed invisible.）
 func (s *Server) logDisplayQuotes(endpoint string, st displayQuoteStats) {
-	log.Printf("[server] %s 现价补齐 唯一代码=%d 快照命中=%d 批量代码=%d 批量请求=%d 批量命中=%d 逐票补齐=%d 补齐命中=%d 等待=%dms 放弃等待=%v 原因=%s",
-		endpoint, st.unique, st.snapshot, st.batched, st.chunks, st.hits, st.soloCalls, st.soloHits, st.elapsed.Milliseconds(), st.dropped, st.failReason())
+	log.Printf("[server] %s 现价补齐 唯一代码=%d 快照命中=%d 批量代码=%d 批量请求=%d 批量命中=%d 逐票补齐=%d 补齐命中=%d 池预热=%d 等待=%dms 放弃等待=%v 原因=%s",
+		endpoint, st.unique, st.snapshot, st.batched, st.chunks, st.hits, st.soloCalls, st.soloHits, st.warmed, st.elapsed.Milliseconds(), st.dropped, st.failReason())
 }
 
 // handleFixSnapshot 处理 GET /api/snapshot 请求，返回指定个股或全部自选股的实时快照数据。

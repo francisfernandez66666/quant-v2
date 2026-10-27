@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -567,5 +568,58 @@ func TestSigBatchDisplaySoloTopUpCapped(t *testing.T) {
 	if !strings.Contains(text, want) {
 		t.Fatalf("读数里看不见补齐腿（缺「%s」）：批量覆盖不住时这条腿是唯一还在给价的来源，"+
 			"不摊开计数就等于又是一次「慢/缺在日志里不可见」的事故（已捕获=%.300s）", want, text)
+	}
+}
+
+// TestSigBatchDisplayWarmsFetcherPool ⑧（§BUG-SIGPRICE，2026-10-27 现网实测）。
+//
+// 现网形态：205 个信号代码里快照只命中 28 个（池里只有买入信号），批量 177 个一次请求 >3s
+// 被放弃 ⇒ 页面上大片「—」而 K 线/五档都正常（那两条走的是别的接口）。
+// 处置不是"每次轮询重打 177 只"，而是**把被展示的代码钉进快照池**（EnsureStock，零额外请求）：
+// 下一次 5s 刷新后这些代码就进快照，后续轮询零网络命中。
+// 本用例锁两件事：① 本轮仍缺价的代码必须全部进池；② 读数里要能看见"预热了几个"。
+func TestSigBatchDisplayWarmsFetcherPool(t *testing.T) {
+	sigs := sbSignals(5)
+	s, admin := sbServer(t, sigs)
+	f := data.NewFetcher(nil, data.NewMarketAPI(), nil)
+	f.IngestSnapshot(&data.MarketSnapshot{Stocks: map[string]*data.StockInfo{}, Time: time.Now()})
+	s.fetcher = f
+	// 批量一个价都不给：模拟上游超时/部分失败。
+	s.batchQuoteFn = func(codes []string) (map[string]*data.StockInfo, error) {
+		return map[string]*data.StockInfo{}, nil
+	}
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+	_, rows, _ := sbGetSignals(t, s, admin)
+	if len(rows) != 5 {
+		t.Fatalf("缺价不得清空列表：返回行数=%d，期望 5", len(rows))
+	}
+	// 池里可能带交易所后缀（600000.SH），这里按裸 6 位比较，避免把归一形态写成断言。
+	bareOf := func(c string) string {
+		c = strings.TrimSpace(c)
+		if i := strings.IndexByte(c, '.'); i > 0 {
+			return c[:i]
+		}
+		if len(c) > 6 {
+			return c[len(c)-6:]
+		}
+		return c
+	}
+	watched := map[string]bool{}
+	for _, c := range f.WatchCodes() {
+		watched[bareOf(c)] = true
+	}
+	missing := 0
+	for _, sg := range sigs {
+		if !watched[sg.Code] {
+			missing++
+		}
+	}
+	if missing != 0 {
+		t.Fatalf("有 %d 个缺价代码没进快照池（下一次刷新仍会显示「—」）：池=%v", missing, f.WatchCodes())
+	}
+	if !strings.Contains(logBuf.String(), "池预热=") {
+		t.Fatalf("现价补齐读数里没有「池预热=N」，这轮为什么一片「—」、下一轮会不会好就没人知道：%s", logBuf.String())
 	}
 }

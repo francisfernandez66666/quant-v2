@@ -136,6 +136,15 @@ type MarketAPI struct {
 	// upstream); within a short window a failed round serves the stale-but-real value loudly.
 	indexLKG   *indexLKGEntry // 上一份成功的指数行情（nil=从未成功）
 	indexLKGMu sync.Mutex     // 保护 indexLKG 读写
+	// §BUG-INDEX：指数实时读数与日线斜率的独立缓存（与 indexLKG 分家：那个是"指数行情+广度"整包，
+	// 这里的实时读数只服务"当日涨跌幅"这一件事，回退窗口同为 indexLKGMaxAge）。
+	idxLiveMu  sync.Mutex
+	idxLiveLKG *idxLiveLKGEntry
+	// 日线斜率当日成功值：同一天内失败轮次回退它，跨日才允许重新变 NaN。
+	idxMAMu  sync.Mutex
+	idxMADay string
+	idxMA20  float64
+	idxMA60  float64
 
 	// §DATA-RELIABILITY（2026-10-26）：资金流日线历史的本地快照目录。
 	// 东财是唯一源；盘中失败时回退同日最近一次成功快照（跨重启仍可用），
@@ -2416,8 +2425,22 @@ func (m *MarketAPI) GetBreadth() (up, down int, err error) {
 // never fabricated.
 func (m *MarketAPI) GetIndexMASlopes() (ma20Slope, ma60Slope float64) {
 	ma20Slope, ma60Slope = math.NaN(), math.NaN()
+	// §BUG-INDEX：日线斜率失败时不该"全天弃权"（当天状态机就只剩情绪票）。
+	// 这里缓存**当日最后一次成功值**：同一天内失败轮次直接回退它；跨日才允许变回 NaN。
+	today := time.Now().Format("20060102")
+	m.idxMAMu.Lock()
+	cachedDay, c20, c60 := m.idxMADay, m.idxMA20, m.idxMA60
+	m.idxMAMu.Unlock()
+	if cachedDay == today && !math.IsNaN(c20) && !math.IsNaN(c60) {
+		// 命中当日缓存：还要看它是不是本轮取的（30 分钟内的成功值足够——日线级读数不会分钟级变化）。
+		// 为了不把"每轮都打东财"变成常态，成功值直接复用，失败才需要重取。
+		return c20, c60
+	}
 	klines, err := m.klineBySecID(indexSecID("000001"), "101", 90)
 	if err != nil || len(klines) < 65 {
+		if cachedDay == today && !math.IsNaN(c20) && !math.IsNaN(c60) {
+			return c20, c60
+		}
 		return
 	}
 	closes := make([]float64, len(klines))
@@ -2426,6 +2449,11 @@ func (m *MarketAPI) GetIndexMASlopes() (ma20Slope, ma60Slope float64) {
 	}
 	ma20Slope = masLowSlope(closes, 20, 5)
 	ma60Slope = masLowSlope(closes, 60, 5)
+	if !math.IsNaN(ma20Slope) && !math.IsNaN(ma60Slope) {
+		m.idxMAMu.Lock()
+		m.idxMADay, m.idxMA20, m.idxMA60 = today, ma20Slope, ma60Slope
+		m.idxMAMu.Unlock()
+	}
 	return
 }
 
@@ -2513,7 +2541,96 @@ func masLowSlope(closes []float64, maLen, lookback int) float64 {
 // 用于策略评估中的基准对比。
 // GetIndexQuote returns a live index quote for baseline comparison in strategies.
 func (m *MarketAPI) GetIndexQuote(code string) (*StockInfo, error) {
-	return m.GetRealtimeQuote(code)
+	// §BUG-INDEX（2026-10-27）：旧实现直接调 GetRealtimeQuote——"000001" 被当成**深市个股**，
+	// 返回的是平安银行（实测 price=11.50 name="平安银行"），不是上证指数；而正确的 "sh000001"
+	// 在 sina/tencent/eastmoney 三源全是 no data（个股链不认识指数代码）。
+	// 后果有两层：① 大盘跌幅因子/趋势破位/止损偏移一直在看一只银行股；
+	// ② 那只票一旦取不到，IndexChangePct=NaN ⇒ 被当成"关键输入缺失"⇒ 目标半仓 + 当天 T 全关。
+	// 现在改走指数专用通道（东财 secid 1.000001，与 GetIndexData 同源），并带 last-known-good。
+	q, err := m.GetIndexLiveQuote(code)
+	if err != nil {
+		return nil, err
+	}
+	return &StockInfo{Code: code, Name: "上证指数", Price: q.Price, PrevClose: q.PrevClose, ChangePct: q.ChangePct}, nil
+}
+
+// IndexLiveQuote 指数实时读数（点位 / 昨收 / 涨跌幅 / 取数时刻 / 是否陈旧回退）。
+// English: live index reading (level/prev close/change% / timestamp / stale-from-LKG flag).
+type IndexLiveQuote struct {
+	Price     float64
+	PrevClose float64
+	ChangePct float64
+	At        time.Time
+	Stale     bool
+}
+
+// idxLiveLKG 指数实时读数的 last-known-good（主链失败的回退窗口见 indexLKGMaxAge）。
+type idxLiveLKGEntry struct {
+	q  IndexLiveQuote
+	at time.Time
+}
+
+// GetIndexLiveQuote 指数专用实时读数：**不走个股四级链**，只用东财指数 secid。
+//
+// 为什么必须独立：指数代码在个股链里要么被解析成同码个股（000001 → 平安银行），要么三源全 no data
+// （sh000001）。用个股链接指数是"看起来能跑、数字全错"的最坏形态——没人会在绿日志里发现。
+// 涨跌幅由 (price−prevClose)/prevClose 自己算，不依赖上游的百分比字段（口径可自证）。
+// 主链失败时回退 10 分钟内的 last-known-good 并标 Stale；连 LKG 都没有才返回错误（上层才判缺失）。
+// English: index-only live quote via EastMoney secid; change% is derived from price/prevClose;
+// falls back to a 10-minute last-known-good with Stale=true, errors only when there is none.
+func (m *MarketAPI) GetIndexLiveQuote(code string) (*IndexLiveQuote, error) {
+	if strings.TrimSpace(code) == "" {
+		code = "000001"
+	}
+	sid := indexSecID(code)
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f60,f58", sid)
+	EastMoneyLimiter.Wait()
+	var q IndexLiveQuote
+	err := func() error {
+		resp, err := m.getWithHeaders(url, emReferer)
+		if err != nil {
+			return fmt.Errorf("eastmoney index-live http: %w", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("eastmoney index-live read: %w", err)
+		}
+		var raw struct {
+			Data struct {
+				F43 float64 `json:"f43"` // 最新点位（原始值 ×100）
+				F60 float64 `json:"f60"` // 昨收（原始值 ×100）
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &raw); err != nil {
+			return fmt.Errorf("eastmoney index-live json: %w", err)
+		}
+		if raw.Data.F43 <= 0 || raw.Data.F60 <= 0 {
+			return fmt.Errorf("eastmoney index-live: 点位/昨收不可得（f43=%.0f f60=%.0f）", raw.Data.F43, raw.Data.F60)
+		}
+		q.Price = raw.Data.F43 / 100
+		q.PrevClose = raw.Data.F60 / 100
+		q.ChangePct = (q.Price - q.PrevClose) / q.PrevClose * 100
+		q.At = time.Now()
+		return nil
+	}()
+	if err == nil {
+		m.idxLiveMu.Lock()
+		m.idxLiveLKG = &idxLiveLKGEntry{q: q, at: q.At}
+		m.idxLiveMu.Unlock()
+		return &q, nil
+	}
+	m.idxLiveMu.Lock()
+	lkg := m.idxLiveLKG
+	m.idxLiveMu.Unlock()
+	if lkg != nil && time.Since(lkg.at) <= indexLKGMaxAge {
+		stale := lkg.q
+		stale.Stale = true
+		log.Printf("[market] §BUG-INDEX 指数实时主链失败，回退 %v 前的 last-known-good（点位 %.2f %.2f%%）: %v",
+			time.Since(lkg.at).Round(time.Second), stale.Price, stale.ChangePct, err)
+		return &stale, nil
+	}
+	return nil, err
 }
 
 // ── 资金流向 ──
