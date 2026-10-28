@@ -488,6 +488,12 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	}
 	// 幂等键构造：客户端 UUID 合法（格式/长度通过）则以 clientID 组键（重试复用同键防重复下单）；
 	// 缺省/非法回退秒级时间戳键（兼容旧客户端，双击跨秒会各自成单——旧行为）。
+	// §CANCEL-STATE（2026-10-28）禁挂单窗口闸：集合竞价/尾盘窗口内交易所不接受新委托，
+	// 直接 409（而不是让 PlaceOrder 的一般性拒单文案吞掉"现在不能挂单"这个可操作信息）。
+	if blocked, label := ctrl.NewOrderBlockedByWindow(time.Now()); blocked {
+		writeError(w, 409, trading.ErrNoNewOrderWindow(label).Error())
+		return
+	}
 	clientID := ""
 	if cid := strings.TrimSpace(req.ClientID); cid != "" && len(cid) <= 64 && regClientID.MatchString(cid) {
 		clientID = cid
@@ -1770,6 +1776,11 @@ func (s *Server) handleQMTSettleHistory(w http.ResponseWriter, r *http.Request) 
 // 撤销指定网关委托并把本地行推进为"已撤"；失败（已成交/已撤/网关不可达）如实返回 409/502。
 // English: §R4-1 manual cancel endpoint (admin) — cancels one gateway order; failures surface
 // honestly (409 filled/cancelled, 502 gateway unreachable).
+//
+// §CANCEL-STATE（2026-10-28）两处语义更正：
+//  1. 成功不再回 200「已撤」，而是 **202 + {status:"撤单中"}**——网关返回 ok 只代表撤单请求
+//     被客户端受理，交易所可能拒绝（收盘集合竞价/已成交）；终态由回报/快照推进。
+//  2. 禁撤窗口内直接 409，不向网关发请求（发出去注定被拒，还可能拿到一次假受理）。
 func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 	orderID := r.PathValue("order_id")
 	if strings.TrimSpace(orderID) == "" {
@@ -1779,6 +1790,11 @@ func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.qmtCtrlFor(userIDFor(r))
 	if ctrl == nil {
 		writeError(w, 503, "real book not available")
+		return
+	}
+	// §CANCEL-STATE 禁撤窗口闸：集合竞价期间交易所不接受撤单。
+	if blocked, label := ctrl.CancelBlockedByWindow(time.Now()); blocked {
+		writeError(w, 409, trading.ErrNoCancelWindow(label).Error())
 		return
 	}
 	if err := ctrl.CancelOrder(orderID); err != nil {
@@ -1792,8 +1808,9 @@ func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "撤单失败(已成交/已撤/不可撤): "+msg)
 		return
 	}
-	log.Printf("[trading] 手动撤单成功 %s (用户=%s)", orderID, userIDFor(r))
-	writeJSON(w, 200, map[string]string{"ok": "1"})
+	log.Printf("[trading] 手动撤单请求已发出 %s (用户=%s)，状态=撤单中，等待交易所确认", orderID, userIDFor(r))
+	// 202：请求已受理，终态未到。前端据此把该行显示为「撤单中」并禁用撤单按钮。
+	writeJSON(w, 202, map[string]string{"ok": "1", "status": "撤单中", "order_id": orderID})
 }
 
 // handleQMTBroker 返回网关 active 通道与双路径状态（GET /api/qmt/broker，登录可见）。

@@ -38,6 +38,71 @@ log = logging.getLogger("qmt_gateway.broker")
 # 不引入任何重试语义。
 VALID_SIDES = ("买入", "卖出")
 
+# §CANCEL-STATE（2026-10-28）禁撤窗口（北京时间）——**入队侧兜底**。
+#
+# 与 Go 侧 rules.qmt.no_cancel_windows 同值（默认 09:20-09:30,14:57-15:00，见 §138）。
+# 为什么网关还要有一份：Go 侧 Controller.CancelOrder 已按窗口拒（409），这里是**兜底**——
+# 任何绕过 Go 的撤单路径（手工重试、旧版引擎、直接打网关）都不该把"必然被交易所拒"的请求
+# 排进派发队列，再回一个"受理成功"的假回执（600362 事故的根因之一就是"受理=撤成"）。
+# 兜底只**拒绝入队**，不改变任何在途委托的状态；紧急停止（HaltAll）在窗口内仍会尝试，
+# 失败明细照旧逐条回显（owner 拍板：停止的优先级高于窗口）。
+#
+# 桥侧另有一份同口径实现（qmt_bridge_strategy.py，ASCII 版）——那是最后一道闸：
+# 命令已入队、但执行时窗口才开始的情况由它挡。两份实现刻意各自独立（桥是单文件沙箱），
+# 口径必须与 Go 侧一致；改这里请同步改那一份与 Go 侧配置。
+DEFAULT_NO_CANCEL_WINDOWS = "09:20-09:30,14:57-15:00"
+
+
+def parse_session_windows(spec):
+    """把 'HH:MM-HH:MM[,...]' 解析成 [(起分钟, 止分钟)] 列表。
+
+    无法解析的片段直接跳过（fail-open 于**配置解析**、fail-close 于**判定**）：
+    解析不出时刻的窗口段当成"没有这条窗口"，宁可少拦也不要用一个瞎猜的窗口去拦真单。
+    English: parses 'HH:MM-HH:MM[,...]' into (start_min, end_min) pairs; unparsable
+    fragments are skipped rather than guessed.
+    """
+    out = []
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        left, _, right = part.partition("-")
+        try:
+            lh, lm = [int(x) for x in left.strip().split(":")[:2]]
+            rh, rm = [int(x) for x in right.strip().split(":")[:2]]
+        except Exception:  # noqa: BLE001 — 配置片段不合法就跳过这一段
+            continue
+        out.append((lh * 60 + lm, rh * 60 + rm))
+    return out
+
+
+def no_cancel_window_now(windows, now_minutes):
+    """判定当前是否落在禁撤窗口内，返回 (是否拦, 窗口标签)。
+
+    窗口口径是**左闭右开** [起, 止)：14:57:00 起拦，15:00:00 放行。
+    English: returns (blocked, label); windows are half-open [start, end).
+    """
+    if windows is None:
+        windows = DEFAULT_NO_CANCEL_WINDOWS
+    cur = int(now_minutes)
+    for start, end in parse_session_windows(windows):
+        if start <= cur < end:
+            return True, "%02d:%02d-%02d:%02d" % (start // 60, start % 60, end // 60, end % 60)
+    return False, ""
+
+
+def _now_cn_minutes():
+    """当前北京时间的"分钟数"（自 00:00 起），用于时段闸判定。
+
+    取时区用 store 的 CN_TZ（显式 UTC+8），不依赖本机 TZ——网关部署在首尔 UAT 时
+    用本机钟面会把窗口整体偏移 1 小时（那正是 §TZ 修复批根掉的那类错）。
+    English: minutes since midnight in Beijing time (explicit UTC+8, never local TZ).
+    """
+    from store import CN_TZ
+    from datetime import datetime
+    now = datetime.now(CN_TZ)
+    return now.hour * 60 + now.minute
+
 
 def is_valid_side(value):
     """§SIDEGATE-PY 方向是否合法：必须逐字等于买入/卖出（不做 strip/大小写归一）。"""
@@ -655,18 +720,23 @@ class QueuedBroker(Broker):
     bridge snapshot, and cancels resolve seq refs to exchange order ids first.
     """
 
-    def __init__(self, store, account="", heartbeat_timeout_sec=15, user_id=""):
+    def __init__(self, store, account="", heartbeat_timeout_sec=15, user_id="",
+                 no_cancel_windows=""):
         """构造本地派发队列通道。
 
         :param store: 本地 SQLite 账本（Store 实例，dispatch/bridge_state 表）。
         :param account: 券商资金账号（仅透出，实际执行在桥侧）。
         :param heartbeat_timeout_sec: 桥心跳新鲜窗口（秒），超时视为离线。
         :param user_id: 多账号归属标识（派发/落库统一携带）。
+        :param no_cancel_windows: §CANCEL-STATE 禁撤窗口（'HH:MM-HH:MM[,...]'）。
+            空串＝用出厂默认（DEFAULT_NO_CANCEL_WINDOWS）；显式传 "" 且 want_default=False
+            可关闭兜底（仅测试用，生产不要关）。
         """
         self.store = store
         self.account = account
         self.heartbeat_timeout_sec = heartbeat_timeout_sec
         self.user_id = user_id
+        self.no_cancel_windows = no_cancel_windows or DEFAULT_NO_CANCEL_WINDOWS
         self.handler = None
 
     def connect(self):
@@ -704,7 +774,19 @@ class QueuedBroker(Broker):
         return True, seq, ""
 
     def cancel(self, order_id):
-        """把撤单请求写入派发队列。仅当交易所委托号已回报（或直接传入真实号）才可撤。"""
+        """把撤单请求写入派发队列。仅当交易所委托号已回报（或直接传入真实号）才可撤。
+
+        §CANCEL-STATE（2026-10-28）禁撤窗口**入队前**兜底：窗口内不发起撤单请求——
+        交易所在集合竞价期不接撤单，发出去必然被拒，而"请求已受理"会被上层读成"已撤"（600362 事故）。
+        这里只拒绝**入队**，不动任何在途委托的状态；紧急停止在窗口内仍会尝试（失败明细回显原因）。
+        English: enqueues a cancel request; refuses to enqueue inside the no-cancel window
+        (the exchange rejects cancels during the auction sessions, and an "accepted"
+        request would be misread as "cancelled").
+        """
+        blocked, label = no_cancel_window_now(self.no_cancel_windows, _now_cn_minutes())
+        if blocked:
+            log.info("[queued] cancel refused (no-cancel window %s) order=%s", label, order_id)
+            return False, ("禁撤窗口（%s）内不发起撤单请求：交易所不接撤单，发出去必被拒" % label)
         oid = str(order_id or "")
         exchange_id, signal_id, code, side = self._resolve_cancel_target(oid)
         if not exchange_id:
@@ -773,6 +855,8 @@ def build_brokers(cfg, store):
         account=cfg.get("account", ""),
         heartbeat_timeout_sec=cfg.get("bridge_heartbeat_timeout_sec", 15),
         user_id=cfg.get("user_id", ""),
+        # §CANCEL-STATE 禁撤窗口（入队侧兜底）；配置缺省用出厂默认，与 Go 侧同值。
+        no_cancel_windows=cfg.get("no_cancel_windows", "") or DEFAULT_NO_CANCEL_WINDOWS,
     )
     brokers = {"xt": xt, "queued": queued}
     active = kind if kind in brokers else "xt"

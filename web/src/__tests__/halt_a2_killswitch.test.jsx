@@ -2,8 +2,11 @@
 // 缺陷本体：HaltAll 撤单失败只 log+continue，前端只拿到 cancelled 成功计数——
 // "停止交易"按下后有几笔没撤掉，操作者看不到（「降级报成功」）。后端已把 failed 明细
 // 随 /api/qmt/halt 响应回传（恒为数组），本用例锁定消费端两半契约：
-//   1. 有失败：结果提示必须走 warning 文案，含「N 笔未撤成」与逐笔单号清单；
+//   1. 有失败：结果提示必须走 warning 文案，含「N 笔撤单请求未发出」与逐笔单号清单；
 //   2. 全成功（failed=[]）：仍走原 success 文案，不得误报失败。
+// §CANCEL-STATE（2026-10-28）语义收窄：后端 cancelled 现为"撤单请求已发出笔数"
+// （撤没撤成以交易所确认为准），故文案断言同步改为「已发出 N 笔撤单请求」——
+// 不再声称"已撤销 N 笔"（受理≠撤成，600362 事故的根因之一）。
 // English: §0925EVE-A2 — the Quant page kill-switch toast must surface the per-order
 // cancellation failure list (count + order ids) instead of a success-only count.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -77,13 +80,13 @@ describe('Quant 页 kill-switch 撤单失败回显（§0925EVE-A2）', () => {
     await settle()
     expect(mocks.message.warning).toHaveBeenCalledTimes(1)
     const text = String(mocks.message.warning.mock.calls[0][0])
-    expect(text).toContain('1 笔未撤成')
+    expect(text).toContain('1 笔撤单请求未发出')
     expect(text).toContain('GW-A2-9') // 单号清单：操作者据此去柜台/撤单闭环逐笔处置
-    expect(text).toContain('撤销 2 笔') // 成功计数保留，不被失败明细挤掉
+    expect(text).toContain('已发出 2 笔撤单请求') // 请求已发出的计数保留，不被失败明细挤掉
     expect(mocks.message.success).not.toHaveBeenCalled()
   })
 
-  it('反证：failed 为空数组（全撤成）时仍是原 success 文案', async () => {
+  it('反证：failed 为空数组（撤单请求全部发出）时仍是 success 文案', async () => {
     api.qmtHalt.mockResolvedValueOnce({ ok: '1', halted: true, cancelled: 3, failed: [] })
     render(<Quant />)
     await waitFor(() => expect(screen.getByRole('button', { name: '紧急停止' })).toBeInTheDocument())
@@ -93,6 +96,6 @@ describe('Quant 页 kill-switch 撤单失败回显（§0925EVE-A2）', () => {
     await settle()
     expect(mocks.message.warning).not.toHaveBeenCalled()
     expect(mocks.message.success).toHaveBeenCalledTimes(1)
-    expect(String(mocks.message.success.mock.calls[0][0])).toContain('撤销 3 笔')
+    expect(String(mocks.message.success.mock.calls[0][0])).toContain('已发出 3 笔撤单请求')
   })
 })

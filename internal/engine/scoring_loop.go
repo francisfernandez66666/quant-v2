@@ -190,6 +190,13 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// 快照里的热点/新闻池个股仅纳入主循环已评过分（存在于 lastD1Scores）的：它们已有事件/D1 上下文，
 	// 避免对无新闻支撑的热点股误发战法信号；持仓/自选/跟踪池始终纳入。
 	td := data.TradingDayDate(time.Now())
+
+	// §FUNDS-TODAY（2026-10-28）信号仓侧资金帧在此发布（去重 10s）。
+	// 位置说明（方案 §7.1）：必须在**打分池为空之前**——池空（无持仓无自选）不能成为
+	// "今日尚未定权"的理由，定权与做 T 开不开无关；也必须在会话门禁之后（盘后不定权）。
+	// 这样 sizing.t.enabled=false 或当天没做一笔 T 的日子，卡片照样有 MS/目标/剩余。
+	e.publishSignalFunds(e.primaryMember(), quotes)
+
 	// §P1-2 按账号过滤持仓池与自选池：多账号共享 rpt/wlMgr 时只取本账号数据。
 	pool := mergeCodes(
 		e.rpt.HeldPositionCodesFor(e.userID),

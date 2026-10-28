@@ -613,7 +613,7 @@ export default function Quant() {
     if (killBusy) return
     const engage = !halted
     const msg = engage
-      ? '确认紧急停止（kill-switch）？\n将立即拒绝一切新下单（自动+手动），并撤销全部在途未成交委托。'
+      ? '确认紧急停止（kill-switch）？\n将立即拒绝一切新下单（自动+手动），并对全部在途未成交委托发出撤单请求（是否撤成以交易所确认为准）。'
       : '确认解除紧急停止？\n解除后恢复正常下单（熔断仍按健康探测独立生效）。'
     if (!(await confirmDialog(msg, engage ? '紧急停止确认' : '解除停止确认'))) return
     setKillBusy(true)
@@ -623,12 +623,18 @@ export default function Quant() {
       // 部分失败后端仍回 200（紧急停止动作本身已生效），但"撤销 N 笔"再也不能冒充
       // "全部撤干净"——有未撤成的单就换 warning 文案点名笔数与单号清单，操作者当场可决策。
       // 全成功时后端保证 failed 是空数组（非 null），这里仍防御性判一次，兼容旧版响应体。
+      // §CANCEL-STATE（2026-10-28）：后端 cancelled 的含义已收窄为"撤单请求已发出笔数"
+      // （交易所是否撤成要等回报/快照），故文案改为"已发出撤单请求，等待交易所确认"，
+      // 不再声称"已撤销 N 笔"——那会把受理当成交。
+      // 失败侧措辞与 SSE 运维告警腿（web/src/utils.js）保持同一句「N 笔撤单请求未发出」：
+      // failed 的事实是"撤单请求根本没发出去"，委托仍挂在券商那边；两边同词，
+      // 操作者扫一眼 Toast 与全局告警不会读成两件事。
       const failed = engage && r && Array.isArray(r.failed) ? r.failed : []
       if (failed.length) {
         const ids = failed.map((f) => (f && f.order_id ? f.order_id : '-')).join('、')
-        MessagePlugin.warning(`已置位紧急停止，同步撤销 ${r.cancelled != null ? r.cancelled : 0} 笔，但 ${failed.length} 笔未撤成（${ids}）——仍在途，请人工处置`)
+        MessagePlugin.warning(`已置位紧急停止，已发出 ${r.cancelled != null ? r.cancelled : 0} 笔撤单请求（等待交易所确认），但 ${failed.length} 笔撤单请求未发出（${ids}）——仍在途，请人工处置`)
       } else {
-        MessagePlugin.success(engage ? `已置位紧急停止，同步撤销 ${r && r.cancelled != null ? r.cancelled : 0} 笔在途委托` : '紧急停止已解除')
+        MessagePlugin.success(engage ? `已置位紧急停止，已发出 ${r && r.cancelled != null ? r.cancelled : 0} 笔撤单请求，等待交易所确认` : '紧急停止已解除')
       }
       await loadConfig()
       await loadOrders()
@@ -640,11 +646,15 @@ export default function Quant() {
   }
 
   // §U-2 手动撤单：仅未成交委托（已报/部成/部成待撤等）可撤；终态由后端 409 拒绝并如实回显。
+  // §CANCEL-STATE（2026-10-28）：后端语义改为 **202 + {status:"撤单中"}**——撤单请求被受理
+  // 不等于交易所已撤成功（集合竞价/已成交会被交易所拒），终态由回报/快照推进。
+  // 因此前端不再提示"已提交"就算完，而是明示"等待交易所确认"，并把该行刷成撤单中。
   async function cancelOrder(orderId) {
     if (!(await confirmDialog(`确认撤单 ${orderId}？\n已成交/已撤/废单将返回错误。`, '撤单确认'))) return
     try {
-      await api.qmtCancel(orderId)
-      MessagePlugin.success('撤单请求已提交')
+      const r = await api.qmtCancel(orderId)
+      const st = (r && r.status) ? r.status : '撤单中'
+      MessagePlugin.success(`撤单请求已发出（状态：${st}），等待交易所确认`)
       await loadOrders()
     } catch (e) {
       MessagePlugin.error('撤单失败：' + (e && e.message ? e.message : e))
@@ -1361,7 +1371,7 @@ export default function Quant() {
             {halted ? '解除停止' : '紧急停止'}
           </Button>
           <span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 8 }}>
-            {halted ? '当前拒绝一切下单（自动+手动）' : '立即拒绝一切新下单并撤销在途未成交委托'}
+            {halted ? '当前拒绝一切下单（自动+手动）' : '立即拒绝一切新下单并对在途未成交委托发出撤单请求（待交易所确认）'}
           </span>
         </>)}
         {row('下行探测', probe)}
@@ -1372,11 +1382,26 @@ export default function Quant() {
   }
 
   // §U-2 委托可撤状态集（未成交/在途形态）；终态（已成/已撤/部撤/废单/发送失败）不显示撤单按钮
+  // §CANCEL-STATE（2026-10-28）：**「撤单中」刻意不在此集合**——撤单请求已发出但交易所尚未
+  // 确认，再点一次只是重复发撤单（交易所会拒），反而把"已请求"与"已撤成"两个事实搅在一起。
+  // 该行要等交易所回报或委托表快照推进到 已撤/部撤/已成（或 §CANCEL-REJECT 退回已报）才恢复可撤。
   const CANCELABLE = new Set(['已报', '部成', '已报待撤', '部成待撤'])
-  // 委托状态 Tag 配色：终态绿/灰，在途蓝
+  // 委托状态 Tag 配色：终态绿/灰，在途蓝；「撤单中」用橙（等待交易所确认，非终态）
   const orderTagTheme = (st) => (
-    st === '已成' ? 'success' : (st === '已撤' || st === '部撤' || st === '废单' || st === '发送失败') ? 'danger' : 'primary'
+    st === '已成' ? 'success'
+      : (st === '已撤' || st === '部撤' || st === '废单' || st === '发送失败') ? 'danger'
+        : (st === '撤单中' || st === '已报待撤' || st === '部成待撤') ? 'warning'
+          : 'primary'
   )
+  // §CANCEL-STATE 撤单请求留痕：把"何时、谁（manual/sweep/halt）发的撤单请求"挂在状态标签上，
+  // 操作者据此区分"我撤的、等确认"与"系统例行撤的、也在等确认"，不必翻日志。
+  const cancelTraceText = (row) => {
+    const at = String(row.cancel_requested_at || '').replace('T', ' ').slice(0, 19)
+    const src = String(row.cancel_source || '')
+    if (!at && !src) return ''
+    const who = { manual: '手动', sweep: '例行超时/收盘清场', halt: '紧急停止', gateway: '网关回报' }[src] || src
+    return `撤单请求：${at}${who ? '（来源：' + who + '）' : ''}${row.cancel_reason ? ' 原因：' + row.cancel_reason : ''}`
+  }
 
   /* §U-2 渲染"当日委托"卡：order_id/代码/方向/价格/数量/状态 + 未成交行的撤单按钮。
      数据 10s 轮询（与链路状态同频）；成交推进依赖网关回报（order 事件单调状态机 §R4-4）。 */
@@ -1396,7 +1421,10 @@ export default function Quant() {
       { colKey: 'side', title: '方向', width: 70, cell: ({ row }) => <span style={{ color: row.side === '买入' ? 'var(--app-up)' : 'var(--app-down)' }}>{row.side}</span> },
       { colKey: 'price', title: '价格', width: 80 },
       { colKey: 'qty', title: '数量', width: 70 },
-      { colKey: 'status', title: '状态', width: 90, cell: ({ row }) => <Tag size="small" theme={orderTagTheme(row.status)}>{row.status}</Tag> },
+      { colKey: 'status', title: '状态', width: 90, cell: ({ row }) => (
+        // §CANCEL-STATE：撤单中/已报待撤/部成待撤带「撤单请求」留痕提示（title 属性）
+        <Tag size="small" theme={orderTagTheme(row.status)} title={cancelTraceText(row) || undefined}>{row.status}</Tag>
+      ) },
       { colKey: 'created_at', title: '时间', width: 130, cell: ({ row }) => <span style={{ fontSize: 12 }}>{(row.created_at || '').replace('T', ' ').slice(5, 19)}</span> },
       {
         // 操作列：仅在可撤状态（CANCELABLE）显示撤单按钮，终态显示占位"—"
@@ -1408,7 +1436,7 @@ export default function Quant() {
     ]
     return (
       <Card title="当日委托" style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤），并每 10s 与券商当日委托表对账（手动单标记「手动」）；未成交委托可撤，10s 刷新</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤），并每 10s 与券商当日委托表对账（手动单标记「手动」）；撤单请求发出后显示「撤单中」，须等交易所确认才转已撤/部撤/已成（期间不可重复撤单）；10s 刷新</div>
         {/* §M-9（2026-09-22 修复批）三态分离：loading（orders==null 且无错误）/
             error（可重试提示，不再无限「加载中」）/ 空（今日暂无委托）/ 有数据（表格）。 */}
         {orders == null && ordersError ? (

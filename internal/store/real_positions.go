@@ -135,6 +135,15 @@ type RealOrder struct {
 	// English: marks a live order as one leg of an intraday round-trip, consumed by the target-position
 	// model and the concentration gate.
 	IntradayT bool `json:"intraday_t,omitempty"`
+	// CancelRequestedAt/CancelSource/CancelReason §CANCEL-STATE（2026-10-28）：撤单请求的留痕。
+	// 「撤单中」不是终态：请求发出只证明客户端受理，交易所可能拒绝（收盘集合竞价/已成交），
+	// 所以把请求时刻与来源单独记下来，终态仍由回报/快照裁决。
+	// English: audit columns for the cancel request itself (request ≠ exchange confirmation).
+	CancelRequestedAt string `json:"cancel_requested_at,omitempty"`
+	CancelSource      string `json:"cancel_source,omitempty"`
+	CancelReason      string `json:"cancel_reason,omitempty"`
+	// Reason 本次回报携带的拒因（不落列，只用于状态迁移判定，例如 §CANCEL-REJECT 回退）。
+	Reason string `json:"-"`
 }
 
 // RealFill 实盘成交回报行。
@@ -1076,7 +1085,8 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 		day = day[:4] + "-" + day[4:6] + "-" + day[6:]
 	}
 	rows, err := d.db.Query(`SELECT code, signal_id, price, qty, COALESCE(intraday_t,0) FROM orders
-		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')
+		WHERE user_id=? AND side='买入'
+		  AND status IN ('已报','部成','撤单中','已报待撤','部成待撤')
 		AND substr(created_at,1,10)=?`, userID, day)
 	if err != nil {
 		return nil, err
@@ -1105,8 +1115,11 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 // English: the single implementation behind both public entry points; an empty strategy key means
 // "all strategies" (the global ledger).
 func (d *DB) localBuyFrozen(userID, day, strategyKey string) (float64, error) {
+	// §CANCEL-STATE：撤单中/旧待撤 仍占用资金——撤单未确认前交易所可能成交，
+	// 把它从冻结账里剔掉会低估敞口（与「请求≠已撤」同一纪律）。
 	q := `SELECT signal_id, status, price, qty FROM orders
-		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')
+		WHERE user_id=? AND side='买入'
+		  AND status IN ('已报','部成','撤单中','已报待撤','部成待撤')
 		AND substr(created_at,1,10)=?`
 	args := []interface{}{userID, day}
 	if strategyKey != "" {
@@ -1153,7 +1166,8 @@ func (d *DB) SweepStaleBuyOrders(userID, beforeDay string) (int64, error) {
 		return 0, nil
 	}
 	res, err := d.db.Exec(`UPDATE orders SET status='废单'
-		WHERE user_id=? AND side='买入' AND status IN ('已报','部成')
+		WHERE user_id=? AND side='买入'
+		  AND status IN ('已报','部成','撤单中','已报待撤','部成待撤')
 		AND substr(created_at,1,10) <> '' AND substr(created_at,1,10) < ?`,
 		userID, beforeDay)
 	if err != nil {
@@ -1323,7 +1337,7 @@ func (d *DB) SumOpenSellQty(userID, tsCode, day string) int {
 		FROM orders o
 		WHERE (o.user_id = '' OR o.user_id = ?) AND o.code = ? AND o.side = '卖出'
 		  AND o.created_at LIKE ?||'%'
-		  AND o.status IN ('已报','部成','已报待撤','部成待撤')`,
+		  AND o.status IN ('已报','部成','撤单中','已报待撤','部成待撤')`,
 		userID, tsCode, day)
 	if err != nil {
 		// 与旧实现同为 fail-open（回 0 = 不占额度），但不再静默：本函数是「卖出剩余量」与
@@ -1563,7 +1577,8 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 const realOrderSelectColumns = `order_id, signal_id, code, side, status, price, qty, created_at,
 	COALESCE(user_id,''), COALESCE(timeout_sec,0),
 	COALESCE(market_vwap,0), COALESCE(vwap_source,''), COALESCE(vwap_as_of,''),
-	COALESCE(signal_vwap_premium_pct,0), COALESCE(intraday_t,0)`
+	COALESCE(signal_vwap_premium_pct,0), COALESCE(intraday_t,0),
+	COALESCE(cancel_requested_at,''), COALESCE(cancel_source,''), COALESCE(cancel_reason,'')`
 
 func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	// §C2-VWAP-READ（2026-10-26）：写入侧一直有 market_vwap/vwap_source/vwap_as_of/
@@ -1583,7 +1598,8 @@ func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 		var o RealOrder
 		var it int
 		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID, &o.TimeoutSec,
-			&o.MarketVWAP, &o.VWAPSource, &o.VWAPAsOf, &o.SignalVWAPPremiumPct, &it); err != nil {
+			&o.MarketVWAP, &o.VWAPSource, &o.VWAPAsOf, &o.SignalVWAPPremiumPct, &it,
+			&o.CancelRequestedAt, &o.CancelSource, &o.CancelReason); err != nil {
 			return nil, err
 		}
 		// §DYN-T 读侧必须把 0/1 还原成布尔，漏接会让 T 腿被当战略单计入目标仓位（由全字段回读锁兜）。
@@ -1601,6 +1617,8 @@ func orderStatusRank(status string) int {
 	switch status {
 	case "已成", "已撤", "部撤", "废单", "已废":
 		return 6
+	case "撤单中":
+		return 5
 	case "部成待撤":
 		return 4
 	case "部成":
@@ -1641,6 +1659,15 @@ func orderStatusAdvance(cur, next string) bool {
 	if orderStatusRank(next) == 6 {
 		return true
 	}
+	// §CANCEL-STATE（2026-10-28）：撤单请求把在途单推进到「撤单中」（含旧别名）。
+	// 它仍是非终态：冻结/额度照常占用，直到交易所结果回来。
+	if next == "撤单中" {
+		switch cur {
+		case "已报", "部成", "已报待撤", "部成待撤":
+			return true
+		}
+		return false
+	}
 	if cur == "已报" && next == "发送失败" {
 		return true
 	}
@@ -1651,6 +1678,52 @@ func orderStatusAdvance(cur, next string) bool {
 		return false
 	}
 	return orderStatusRank(next) > orderStatusRank(cur)
+}
+
+// ensureOrderCancelColumns §CANCEL-STATE（2026-10-28）：orders 补撤单留痕三列（幂等）。
+func (d *DB) ensureOrderCancelColumns() error {
+	cols := map[string]string{
+		"cancel_requested_at": "TEXT DEFAULT ''",
+		"cancel_source":       "TEXT DEFAULT ''",
+		"cancel_reason":       "TEXT DEFAULT ''",
+	}
+	for name, typ := range cols {
+		has, err := d.hasColumn("orders", name)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		if _, err := d.db.Exec(`ALTER TABLE orders ADD COLUMN ` + name + ` ` + typ); err != nil {
+			return fmt.Errorf("store migrate orders add %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// MarkRealOrderCancelRequested §CANCEL-STATE（2026-10-28）：撤单请求已发出 → 状态置「撤单中」。
+//
+// 铁律：请求被受理 ≠ 交易所已撤。调用方只能在**请求发出成功**后调用本函数；终态（已撤/部撤/已成）
+// 一律由回报/快照推进。CAS 更新保证并发下不会把已成/已撤的行改回撤单中。
+//
+// 返回 true=已在撤单中或本次推进；false=行不存在/已终态（调用方据此提示"无需撤/已终结"）。
+func (d *DB) MarkRealOrderCancelRequested(userID, orderID, source, reason string) (bool, error) {
+	if orderID == "" {
+		return false, nil
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	res, err := d.db.Exec(`UPDATE orders SET status='撤单中', cancel_requested_at=?, cancel_source=?, cancel_reason=?
+		WHERE order_id=? AND (user_id='' OR user_id=?) AND status IN ('已报','部成','已报待撤','部成待撤','撤单中')`,
+		now, source, reason, orderID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // AdvanceRealOrderStatus §R4-4 带单调守卫的委托状态推进（按 signal_id 定位）：
@@ -1736,7 +1809,29 @@ func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
 	switch err {
 	case nil:
 		// 本地有行：仅允许推进（秩守卫 + 发送失败/已报两条例外，见 orderStatusAdvance）。
-		if !orderStatusAdvance(cur, o.Status) {
+		allow := orderStatusAdvance(cur, o.Status)
+		if !allow {
+			// §CANCEL-STATE 纠错①：已撤/部撤是终态，但若本地已有成交证据（fills），说明
+			// 「撤单成功」是误判（今天的 600362 就是这样：15:00 集合竞价成交、15:00:03 撤单被拒）。
+			// 允许按成交量把它纠正为 部成/已成——只有成交事实能推翻撤单终态，延迟的「已报」不行。
+			if orderStatusRank(cur) == 6 && (o.Status == "部成" || o.Status == "已成") {
+				var n int
+				qerr := tx.QueryRow(`SELECT COUNT(1) FROM fills WHERE code=? AND (order_id=? OR (signal_id<>'' AND signal_id=?)) AND (user_id=? OR user_id='')`,
+					o.Code, o.OrderID, o.SignalID, o.UserID).Scan(&n)
+				if qerr != nil {
+					return "", qerr
+				}
+				allow = n > 0
+			}
+			// §CANCEL-STATE 纠错②：撤单被交易所明确拒绝（网关带 §CANCEL-REJECT 前缀），
+			// 撤单中/旧待撤 退回在途态。没有这个显式事件，任何迟到快照都不许把撤单中改回已报。
+			if !allow && strings.HasPrefix(o.Reason, "§CANCEL-REJECT") &&
+				(cur == "撤单中" || cur == "已报待撤" || cur == "部成待撤") &&
+				(o.Status == "已报" || o.Status == "部成") {
+				allow = true
+			}
+		}
+		if !allow {
 			return OrderReportIgnored, nil // defer Rollback：无写入
 		}
 		if o.UserID == "" {
@@ -1746,6 +1841,22 @@ func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
 		}
 		if err != nil {
 			return "", err
+		}
+		// §CANCEL-STATE 留痕：进入撤单中时补请求时刻（回报路径没有请求时刻，用回报到达时刻）；
+		// 被拒时把拒因写进 cancel_reason。终态不改这两列（历史证据保留）。
+		if o.Status == "撤单中" {
+			if o.UserID == "" {
+				_, _ = tx.Exec(`UPDATE orders SET cancel_requested_at=CASE WHEN COALESCE(cancel_requested_at,'')='' THEN ? ELSE cancel_requested_at END, cancel_source=CASE WHEN COALESCE(cancel_source,'')='' THEN 'gateway' ELSE cancel_source END WHERE signal_id=? AND user_id=''`, o.CreatedAt, o.SignalID)
+			} else {
+				_, _ = tx.Exec(`UPDATE orders SET cancel_requested_at=CASE WHEN COALESCE(cancel_requested_at,'')='' THEN ? ELSE cancel_requested_at END, cancel_source=CASE WHEN COALESCE(cancel_source,'')='' THEN 'gateway' ELSE cancel_source END WHERE signal_id=? AND user_id=?`, o.CreatedAt, o.SignalID, o.UserID)
+			}
+		}
+		if strings.HasPrefix(o.Reason, "§CANCEL-REJECT") {
+			if o.UserID == "" {
+				_, _ = tx.Exec(`UPDATE orders SET cancel_reason=? WHERE signal_id=? AND user_id=''`, o.Reason, o.SignalID)
+			} else {
+				_, _ = tx.Exec(`UPDATE orders SET cancel_reason=? WHERE signal_id=? AND user_id=?`, o.Reason, o.SignalID, o.UserID)
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return "", err

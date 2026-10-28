@@ -589,6 +589,16 @@ type QMTConfig struct {
 	// English: §R4-1 close-list time (Beijing HHMM) — cancels all unfilled 已报 orders of the day
 	// (0 = default 1452; -1 disables).
 	CloseSweepAt int `json:"close_sweep_at"`
+	// NoCancelWindows §CANCEL-STATE（2026-10-28）禁撤单时段（北京时间，"HH:MM-HH:MM" 逗号分隔）：
+	// 开盘集合竞价后段与收盘集合竞价期间交易所不接受撤单，系统不应发起（发起只会被拒）。
+	// 空串＝用出厂默认（见 trading.DefaultNoCancelWindows）。**不要**为了"让撤单通过"而清空：
+	// 清空后本地会重演 2026-10-28 的 600362 事故（请求受理即标已撤，实际成交丢失）。
+	// English: time windows during which cancel requests must not be sent (Beijing time).
+	NoCancelWindows string `json:"no_cancel_windows,omitempty"`
+	// NoNewOrderWindows §CANCEL-STATE（2026-10-28）禁新挂单时段（北京时间，格式同上）：
+	// 集合竞价期间与尾盘收盘清单之后不再产生新委托。空串＝用出厂默认。
+	// English: time windows during which new orders must not be placed (Beijing time).
+	NoNewOrderWindows string `json:"no_new_order_windows,omitempty"`
 	// EnforceT1 §WS-A T+1 可卖量守卫开关：nil=默认开启（A 股 T+1 制度恒真）；显式 false 关闭，
 	// 退回券商柜台终裁（当日买入误卖会收到废单回报，不作为本地硬闸）。
 	// English: §WS-A T+1 sell-guard switch — nil means enabled by default (A-share T+1 is universal);
@@ -1039,6 +1049,11 @@ func DefaultQMTConfig() QMTConfig {
 		// 覆盖率 <95% / 概念未知 / 总资产不可得 一律弃权；影子开关仍按既有约定（nil=只留痕），
 		// 要真拦需显式 concept_value_shadow=false——默认先留痕是既有灰度纪律，不因本批推翻。
 		RiskGate: RiskGateConfig{ConceptValuePct: 40},
+		// §CANCEL-STATE（owner 2026-10-28 拍板）：禁撤/禁挂时段出厂值。
+		// 出厂即开启是刻意的：默认安全 > 默认方便。这两个窗口堵住的是「请求受理即标已撤」
+		// 这类资损形态（2026-10-28 的 600362 尾盘单），关掉闸门等于把闸门撤了。
+		NoCancelWindows:   "09:20-09:30,14:57-15:00",
+		NoNewOrderWindows: "09:20-09:30,14:52-15:00",
 	}
 }
 

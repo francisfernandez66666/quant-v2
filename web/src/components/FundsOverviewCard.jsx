@@ -11,7 +11,9 @@
 //   2) 实盘 cash_t 与纸面 cash_t 公式不同（实盘扣战略剩余空间，纸面不扣），这里各自展示事实值
 //      并标注差异，不在前端重算第二套；
 //   3) 资金快照时刻 cash_at 一并显示：金额没变 ≠ 快照没更新；
-//   4) 非 admin 访问 403 时整卡不渲染（该接口是 admin 观测面，不在普通成员页制造噪音）。
+//   4) 两半各自带取数时刻：at＝信号仓侧、t_at＝T 侧。T 侧没跑过时**保持上一帧**并标出
+//      “未更新”，绝不把 0 画成“T 仓真的是空的”（§FUNDS-TODAY 方案 §7.1）；
+//   5) 非 admin 访问 403 时整卡不渲染（该接口是 admin 观测面，不在普通成员页制造噪音）。
 import React, { useEffect, useState } from 'react'
 import { Card, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
@@ -28,6 +30,29 @@ function pct(v) {
   const n = Number(v)
   if (!Number.isFinite(n)) return '—'
   return (n * 100).toFixed(1) + '%'
+}
+
+/** 时刻串 → “HH:MM:SS”；空/非法返回空串。 */
+function hhmmss(v) {
+  const s = String(v || '').replace('T', ' ')
+  return s.length >= 19 ? s.slice(11, 19) : s.slice(0, 8)
+}
+
+/**
+ * T 侧读数的新鲜度：返回 'fresh' | 'stale' | 'idle'。
+ *
+ * - idle：T 侧从没跑过（t_at 为空）——做 T 停用/当天没做 T，不是"零额度"；
+ * - stale：t_at 比本帧的取数时刻旧超过 60s——T 循环可能停了，数字不能当现状看；
+ * - fresh：T 侧刚更新过。
+ */
+function tSideFreshness(funds, frameAt) {
+  const tAt = String((funds && funds.t_at) || '')
+  if (!tAt) return 'idle'
+  const t = Date.parse(tAt)
+  const base = Date.parse(String(frameAt || ''))
+  if (!Number.isFinite(t)) return 'stale'
+  if (!Number.isFinite(base)) return 'fresh'
+  return base - t > 60 * 1000 ? 'stale' : 'fresh'
 }
 
 /** 行渲染（左标签右数值），空值统一“—”。 */
@@ -108,6 +133,8 @@ export default function FundsOverviewCard() {
   const total = funds ? funds.total_asset : (account ? account.total_asset : null)
   const mv = funds ? funds.market_value : (account ? account.market_value : null)
   const cashAt = (funds && funds.cash_at) || (account && account.cash_at) || ''
+  // T 侧新鲜度：T 循环没跑过（idle）与跑了但已停（stale）都**不是**“T 仓为零”。
+  const tFresh = tSideFreshness(funds, data && data.at)
 
   return (
     <Card title={(
@@ -118,7 +145,8 @@ export default function FundsOverviewCard() {
     )} style={{ marginTop: 16 }}>
       <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 8 }}>
         数据日 {data ? data.day : '—'}
-        {data && data.at ? ` · 取数 ${String(data.at).replace('T', ' ').slice(5, 19)}` : ''}
+        {funds && funds.at ? ` · 信号仓取数 ${hhmmss(funds.at)}` : ''}
+        {data && data.at ? ` · 接口时刻 ${String(data.at).replace('T', ' ').slice(5, 19)}` : ''}
         {cashAt ? ` · 券商资金快照 ${String(cashAt).slice(5, 19)}` : ''}
         {pending ? ' · 引擎尚未写下今日资金帧（新交易日首帧前属正常）' : ''}
       </div>
@@ -144,9 +172,17 @@ export default function FundsOverviewCard() {
               </>
             )}
         </Column>
-        <Column title="T 仓（实盘）" tags={funds && Number(funds.open_legs) > 0
-          ? <Tag size="small" theme="warning">在途 {Number(funds.open_legs)} 条腿</Tag>
-          : null}>
+        <Column title="T 仓（实盘）" tags={<>
+          {funds && Number(funds.open_legs) > 0
+            ? <Tag size="small" theme="warning">在途 {Number(funds.open_legs)} 条腿</Tag>
+            : null}
+          {tFresh === 'idle'
+            ? <Tag size="small" theme="default">T 侧未运行</Tag>
+            : null}
+          {tFresh === 'stale'
+            ? <Tag size="small" theme="warning">T 侧读数未更新</Tag>
+            : null}
+        </>}>
           <Row label="T 额度">{funds ? money(funds.t_quota) : '—'}</Row>
           <Row label="可用 T 现金" hint="已扣战略剩余空间">{funds ? money(funds.cash_t) : '—'}</Row>
           <Row label="反 T 冻结">{funds ? money(funds.t_frozen_cash) : '—'}</Row>
@@ -154,6 +190,7 @@ export default function FundsOverviewCard() {
           <Row label="在途反 T 卖腿">{funds ? money(funds.open_sell_legs) : '—'}</Row>
           <Row label="完成轮数">{funds ? Number(funds.done_rounds) || 0 : '—'}</Row>
           <Row label="当日 T 净额" hint="仅 done 轮，独立口径">{funds ? money(funds.pnl_net) : '—'}</Row>
+          <Row label="T 侧取数时刻">{funds && funds.t_at ? hhmmss(funds.t_at) : '—'}</Row>
         </Column>
         <Column title="纸面（对照）" tags={paper && paper.available ? null : <Tag size="small" theme="default">未接入</Tag>}>
           {paper && paper.available && paperR ? (

@@ -103,6 +103,16 @@ type Controller struct {
 
 	// 通知回调（告警熔断/恢复）：由上层注入（SSE/notify）。
 	onAlert func(level, title, content string) // 告警回调（可空）
+
+	// windows §CANCEL-STATE（2026-10-28）：禁挂单/禁撤单时段闸。
+	// 为什么挂在控制器而不是散落在各调用点：闸门必须"一处生效"——自动下单、手动下单、
+	// 例行撤单、紧急停止四条路径都要过同一张表；散落实现必然出现某条路径漏掉的口子。
+	// 用指针持有是因为它需要随配置热替换（配置串改了要重建窗口表）。
+	windows *SessionWindows
+
+	// nowFn §CANCEL-STATE：可注入时钟（默认 time.Now）。时段闸是"按钟点拒绝"的逻辑，
+	// 不注入时钟就没法在测试里稳定复现 09:20/14:52/14:57 三个边界——只能靠真实等到那个点。
+	nowFn func() time.Time
 }
 
 // NewController 创建控制器。onAlert 可空。
@@ -120,7 +130,48 @@ func NewController(exec Executor, db *store.DB, userID string, cfg config.QMTCon
 	c.exec.Store(execHolder{exec}) // §FIX#7 executor 走原子引用
 	// §WS-C 风控闸：告警回调复用 onAlert（新闸高优告警；存量守卫静默）。
 	c.gate = risk.NewGate(db, userID, onAlert)
+	// §CANCEL-STATE：时段闸随配置构建（配置串非法时回退出厂默认并告警，见 NewSessionWindows）。
+	c.windows = c.buildWindows(cfg)
+	// 可注入时钟默认取系统时间；测试用 SetNow 固定时刻。
+	c.nowFn = time.Now
 	return c
+}
+
+// SetNow §CANCEL-STATE：注入时钟（测试专用）。传 nil 恢复系统时间。
+func (c *Controller) SetNow(fn func() time.Time) {
+	c.mu.Lock()
+	if fn == nil {
+		c.nowFn = time.Now
+	} else {
+		c.nowFn = fn
+	}
+	c.mu.Unlock()
+}
+
+// now 取当前时刻（走可注入时钟）。
+func (c *Controller) now() time.Time {
+	c.mu.RLock()
+	fn := c.nowFn
+	c.mu.RUnlock()
+	if fn == nil {
+		return time.Now()
+	}
+	return fn()
+}
+
+// buildWindows 按配置串构建时段闸；配置非法时回退出厂默认并把问题显式告警。
+// 为什么不让"配置写错"变成"闸门静默失效"：静默失效＝回到 2026-10-28 的事故形态，
+// 而告警至少让人知道配置没生效。
+// English: builds the session-window guard; malformed config falls back to defaults and alerts.
+func (c *Controller) buildWindows(cfg config.QMTConfig) *SessionWindows {
+	sw, err := NewSessionWindows(cfg.NoCancelWindows, cfg.NoNewOrderWindows)
+	if err != nil {
+		log.Printf("[trading] §CANCEL-STATE 时段窗口配置异常，已回退出厂默认: %v", err)
+		if c.onAlert != nil {
+			c.onAlert("warning", "时段窗口配置异常", err.Error())
+		}
+	}
+	return sw
 }
 
 // execRef 返回当前生效的下单执行器（原子读；nil 兜底 Noop）。
@@ -144,8 +195,13 @@ func (c *Controller) execRef() Executor {
 // take effect right away, bypassing the queue. Only updates c.cfg; the executor type is decided at
 // build or by ApplyPendingConfig.
 func (c *Controller) UpdateConfig(cfg config.QMTConfig) {
+	// §CANCEL-STATE：时段闸随配置重建（配置串改了必须立刻生效，否则闸门与配置口径漂移）。
+	// 构建在锁外做（纯函数，只读 cfg），换指针在锁内做——windowsRef() 每轮下单都要读这个指针，
+	// 锁外赋值会与它构成 data race（-race 可复现），闸门因此可能在某一轮读到半个指针。
+	sw := c.buildWindows(cfg)
 	c.mu.Lock()
 	c.cfg = cfg
+	c.windows = sw
 	c.mu.Unlock()
 }
 
@@ -188,7 +244,38 @@ func (c *Controller) ApplyPendingConfig() bool {
 		c.exec.Store(execHolder{NoopExecutor{}})
 		log.Printf("[trading] QMT 实盘已停用，executor 回退 Noop")
 	}
+	// §CANCEL-STATE：时段闸随待生效配置一起重建（配置热更新的唯一生效点之一）。
+	c.windows = c.buildWindows(cfg)
 	return true
+}
+
+// windowsRef 返回当前时段闸（nil 安全：未构建时按出厂默认判定）。
+func (c *Controller) windowsRef() *SessionWindows {
+	c.mu.RLock()
+	sw := c.windows
+	c.mu.RUnlock()
+	if sw == nil {
+		return DefaultSessionWindows()
+	}
+	return sw
+}
+
+// SessionWindowsSnapshot 供运维面回显当前生效的禁挂/禁撤窗口规则。
+func (c *Controller) SessionWindowsSnapshot() map[string]string {
+	return c.windowsRef().Describe()
+}
+
+// NewOrderBlockedByWindow §CANCEL-STATE：报告当前是否处于禁挂单窗口。
+// 供 HTTP 层在调用 PlaceOrder **之前**判一次并映射 409（而不是让 PlaceOrder 的通用
+// 400 "order rejected" 吞掉窗口语义——窗口是"现在不能做"，与"这笔单被拒"是两回事）。
+// English: whether a new order is currently blocked by the session windows (HTTP 409 mapping).
+func (c *Controller) NewOrderBlockedByWindow(now time.Time) (bool, string) {
+	return c.windowsRef().NewOrderBlocked(now)
+}
+
+// CancelBlockedByWindow §CANCEL-STATE：报告当前是否处于禁撤单窗口（HTTP 409 映射）。
+func (c *Controller) CancelBlockedByWindow(now time.Time) (bool, string) {
+	return c.windowsRef().CancelBlocked(now)
 }
 
 // Enabled 是否启用实盘链路。
@@ -546,6 +633,14 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	if cfg.Halted {
 		return nil, fmt.Errorf("qmt kill-switch engaged (halted=true)：人工紧急停止中，拒绝一切新下单")
 	}
+	// §CANCEL-STATE（2026-10-28）禁挂单时段闸：集合竞价/尾盘窗口内交易所不接受（或不接受新的）
+	// 委托，system 不该发起。这里挡的是**发起**，不是"发起后被拒"——被拒的委托会在柜台留痕，
+	// 并让本地状态机多一个需要解释的非终态（2026-10-28 的 600362 正是 14:57:48 的尾盘新单）。
+	// 拦在风控闸之前：窗口拒绝是"现在不能下单"，比任何风控理由更早成立。
+	// English: refuse new orders inside the no-new-order windows (auction/close sessions).
+	if blocked, label := c.windowsRef().NewOrderBlocked(c.now()); blocked {
+		return nil, ErrNoNewOrderWindow(label)
+	}
 	if c.store == nil {
 		return nil, fmt.Errorf("qmt store not set")
 	}
@@ -822,6 +917,12 @@ func (c *Controller) MaybeReconcile(interval time.Duration) {
 // （网关 409=已成交/已撤/无法撤，交由回报线程推进状态），绝不吞掉失败让首尔误判成功。
 // English: §R4-1 manual cancel — cancels at the gateway and marks the local row 已撤 on success;
 // failures surface as errors (gateway 409 = filled/cancelled/uncancellable → let report thread progress).
+//
+// §CANCEL-STATE（2026-10-28）语义更正：本函数**不再**把本地行直接写成「已撤」。
+// 网关返回 ok 只代表"撤单请求被客户端受理"，交易所可能拒绝（收盘集合竞价、已成交）；
+// 把它当终态就是 2026-10-28 600362 事故的成因（实际成交丢失、买入列表没有该票）。
+// 现在只写「撤单中」（非终态，冻结照算），终态由回报/快照推进。
+// 同时加禁撤窗口闸：集合竞价期间交易所不接受撤单，发出去注定被拒，不发。
 func (c *Controller) CancelOrder(orderID string) error {
 	c.mu.RLock()
 	enabled := c.cfg.Enabled
@@ -829,14 +930,20 @@ func (c *Controller) CancelOrder(orderID string) error {
 	if !enabled {
 		return fmt.Errorf("qmt disabled")
 	}
+	// §CANCEL-STATE 禁撤窗口闸：窗口内直接拒绝（不向网关发请求）。
+	// 为什么不"发了让交易所拒"：那会拿到一次"受理成功"的假回执，正是本次事故的形态。
+	if blocked, label := c.windowsRef().CancelBlocked(c.now()); blocked {
+		return ErrNoCancelWindow(label)
+	}
 	if err := c.execRef().Cancel(orderID); err != nil {
 		return err
 	}
 	if c.store != nil {
-		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, orderID, "已撤"); err != nil {
+		// 请求已发出但交易所未确认 → 置「撤单中」；返回 false 表示行已终态/不存在（无需再撤）。
+		if ok, err := c.store.MarkRealOrderCancelRequested(c.userID, orderID, "manual", "手动撤单请求已发出，等待交易所确认"); err != nil {
 			log.Printf("[trading] cancel mark local %s: %v", orderID, err)
 		} else if !ok {
-			log.Printf("[trading] cancel mark local %s skipped: already at same/higher rank", orderID)
+			log.Printf("[trading] cancel mark local %s skipped: 已终态或不存在", orderID)
 		}
 	}
 	return nil
@@ -854,10 +961,14 @@ type HaltAllFailure struct {
 // HaltAllResult §0925EVE-A2：HaltAll 的结构化返回。
 // Cancelled 保留旧"成功笔数"语义（HTTP 响应字段名不变，向后兼容）；Failed 是新增的
 // 失败明细数组——恒非 nil（JSON 序列化成 []而非 null），前端据此无条件渲染。
-// English: structured HaltAll result; Cancelled keeps the old meaning, Failed is always
-// non-nil so the JSON contract shows an empty array (not null) on full success.
+//
+// §CANCEL-STATE（2026-10-28）语义收窄：Cancelled 现在的含义是"**撤单请求已发出**笔数"
+// （本地行进入「撤单中」等交易所确认），不再是"已确认撤成"。字段名保持不变以免破坏前端契约，
+// 但前端文案已同步改成"已发出撤单请求，等待交易所确认"。
+// English: structured HaltAll result; Cancelled counts cancel requests accepted by the gateway
+// (orders now sit in 撤单中 awaiting exchange confirmation), Failed is always non-nil.
 type HaltAllResult struct {
-	Cancelled int              `json:"cancelled"` // 成功撤销并推进本地行为"已撤"的笔数
+	Cancelled int              `json:"cancelled"` // 撤单请求已发出的笔数（等待交易所确认）
 	Failed    []HaltAllFailure `json:"failed"`    // 撤单失败明细（空数组=全部撤成）
 }
 
@@ -891,7 +1002,9 @@ func (c *Controller) HaltAll() HaltAllResult {
 	}
 	for _, o := range orders {
 		// §P1-7 kill-switch 同样覆盖部成，撤销剩余未成交部分。
-		if (o.Status != "已报" && o.Status != "部成") || strings.HasPrefix(o.OrderID, "pend:") {
+		// §CANCEL-STATE（2026-10-28）：撤单中/旧待撤别名也算在途（还没确认撤成），
+		// 紧急停止要把它们一并再撤一次（幂等：网关对已撤单返回明确失败，进 Failed 明细）。
+		if !isCancellableStatus(o.Status) || strings.HasPrefix(o.OrderID, "pend:") {
 			continue
 		}
 		if err := c.execRef().Cancel(o.OrderID); err != nil {
@@ -901,7 +1014,9 @@ func (c *Controller) HaltAll() HaltAllResult {
 			res.Failed = append(res.Failed, HaltAllFailure{OrderID: o.OrderID, Reason: err.Error()})
 			continue
 		}
-		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, o.OrderID, "已撤"); err == nil && ok {
+		// §CANCEL-STATE：撤单请求已发出 ≠ 已撤。置「撤单中」等交易所确认；
+		// 窗口内被交易所拒绝的（收盘集合竞价）由网关回执/快照回退，失败明细由本轮返回。
+		if ok, err := c.store.MarkRealOrderCancelRequested(c.userID, o.OrderID, "halt", "紧急停止撤单请求已发出，等待交易所确认"); err == nil && ok {
 			res.Cancelled++
 		}
 	}
@@ -917,6 +1032,10 @@ type SweepResult struct {
 	Skipped    int  // 时间不可解析等跳过数
 	Errors     int  // 撤单失败笔数（已成交被拒/网关暂不可撤等，留回报线程处理）
 	CloseSweep bool // 本轮是否执行了收盘清单
+	// WindowSkipped §CANCEL-STATE（2026-10-28）：因落在禁撤窗口而**未发出**撤单请求的笔数。
+	// 单列出来而不是并进 Skipped：Skipped 是"这单不需要撤"，WindowSkipped 是"想撤但现在不能撤"，
+	// 两者在排障时的含义完全不同（后者说明该单还挂在柜台上）。
+	WindowSkipped int // 禁撤窗口内被跳过的撤单笔数
 }
 
 // SweepOrders §R4-1 撤单闭环主入口（30s 节流，由引擎 5s 循环调用）：
@@ -983,12 +1102,16 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	if closeAt == 0 {
 		closeAt = 1452
 	}
+	// §CANCEL-STATE（2026-10-28）禁撤窗口闸：集合竞价期间交易所不接受撤单，整轮网关撤单跳过。
+	// 为什么要在这里（而不是循环内）判断：收盘清单的"当日一次"标记必须在被窗口挡掉时**不消费**，
+	// 否则这一轮被跳过之后，当天就再也不会执行收盘清单（标记已置位），悬置单只能等次日兜底。
+	windowBlocked, windowLabel := c.windowsRef().CancelBlocked(now)
 	closeSweep := false
 	if closeAt > 0 && hhmm >= closeAt && data.IsTradingDay(bj) {
 		c.mu.RLock()
 		lastDay := c.lastCloseSweepDay
 		c.mu.RUnlock()
-		if lastDay != day {
+		if lastDay != day && !windowBlocked {
 			c.mu.Lock()
 			c.lastCloseSweepDay = day
 			c.mu.Unlock()
@@ -1007,6 +1130,9 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	res := &SweepResult{CloseSweep: closeSweep}
 	for _, o := range orders {
 		// §P1-7 超时撤单范围扩展到部成：已报/部成 均可能剩余未成交，需自动撤销。
+		// §CANCEL-STATE（2026-10-28）：「撤单中」不重复发撤单请求——它已经有一笔在途的撤单请求，
+		// 再发就是重复撤（交易所对已撤单会回失败，徒增噪声）。它的收敛交给网关的快照路径
+		// （撤单生效→终态；连续 N 轮未生效→§CANCEL-REJECT 回退在途态）。
 		if o.Status != "已报" && o.Status != "部成" {
 			continue
 		}
@@ -1044,6 +1170,12 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		if !((orderStale > 0 && age > orderStaleAfter) || closeSweep) {
 			continue
 		}
+		// §CANCEL-STATE 禁撤窗口闸：集合竞价期间交易所不接受撤单，整轮不发撤单请求。
+		// 占位行降级（纯本地账）不受影响——它压根没到柜台。
+		if windowBlocked {
+			res.WindowSkipped++
+			continue
+		}
 		if err := c.execRef().Cancel(o.OrderID); err != nil {
 			res.Errors++
 			// 典型失败：交易所委托号尚未回报（网关暂不可撤）/ 已成交（撤单被拒）——
@@ -1052,14 +1184,20 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 				o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), err)
 			continue
 		}
-		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, o.OrderID, "已撤"); err != nil || !ok {
+		// §CANCEL-STATE：撤单请求已发出 ≠ 已撤。置「撤单中」等交易所/快照确认。
+		if ok, err := c.store.MarkRealOrderCancelRequested(c.userID, o.OrderID, "sweep", "例行超时撤单/收盘清单撤单请求已发出，等待交易所确认"); err != nil || !ok {
 			res.Errors++
 			continue
 		}
 		res.Cancelled++
 		metrics.OrdersCancelled() // §R4-9 撤单计数
-		log.Printf("[trading] 自动撤单成功 %s %s %s qty=%d (滞留%s, 收盘清单=%v)",
+		log.Printf("[trading] 自动撤单请求已发出 %s %s %s qty=%d (滞留%s, 收盘清单=%v, 状态=撤单中)",
 			o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), closeSweep)
+	}
+	if windowBlocked {
+		// 窗口内不发撤单请求，但整轮节流/占位降级等仍照常；留痕让运维能看到"这段时间没撤单"。
+		log.Printf("[trading] §CANCEL-STATE 禁撤窗口(%s)生效：本轮跳过 %d 笔网关撤单（占位降级不受影响）",
+			windowLabel, res.WindowSkipped)
 	}
 	if res.Cancelled+res.Demoted > 0 || closeSweep {
 		log.Printf("[trading] 撤单闭环本轮: 撤销=%d 占位降级=%d 失败=%d 跳过=%d 收盘清单=%v",

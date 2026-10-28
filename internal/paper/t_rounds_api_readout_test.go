@@ -19,6 +19,8 @@ package paper
 import (
 	"testing"
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // seedTPositionsForReadout 直接搭账本内部态（持仓 + 一条在途腿），避免测试借道撮合链。
@@ -132,12 +134,17 @@ func TestTargetReadoutCountsOpenTLegsBothDirections(t *testing.T) {
 	seedTPositionsForReadout(t, e, "600000", 1000, 12.0)
 	seedTPositionsForReadout(t, e, "600001", 6000, 9.0)
 	// 回转账本直接搭内部态：SetSizingContext 要另取一次锁，所以它必须排在解锁之后。
+	// §日期口径（2026-10-28 修）：回转记录的 Day 必须等于引擎的"当日"（TRoundDay 用
+	// cntime.DayCompactOf(clockNow()) 过滤），硬编某个日期会让这条用例**只在那天绿**
+	// （2026-10-27 写死的旧版在 10-28 当天就红了：当日计数恒为 0）。改成按引擎时钟取当日，
+	// 用例就与"跑测试那天是哪天"无关了。
+	today := cntime.DayCompactOf(e.clockNow())
 	e.mu.Lock()
 	e.tRounds = []TRound{
-		{ID: "t0:600000:正T:20261027:1", Code: "600000", Mode: TRModeBuyFirst, Leg: tRLegBuy,
-			LegQty: 1000, LegPrice: 12.0, State: tRStateOpen, Day: "20261027"},
-		{ID: "t0:600001:反T:20261027:1", Code: "600001", Mode: TRModeSellFirst, Leg: tRLegSell,
-			LegQty: 2000, LegPrice: 9.0, State: tRStateOpen, Day: "20261027", FrozenCash: 18108},
+		{ID: "t0:600000:正T:" + today + ":1", Code: "600000", Mode: TRModeBuyFirst, Leg: tRLegBuy,
+			LegQty: 1000, LegPrice: 12.0, State: tRStateOpen, Day: today},
+		{ID: "t0:600001:反T:" + today + ":1", Code: "600001", Mode: TRModeSellFirst, Leg: tRLegSell,
+			LegQty: 2000, LegPrice: 9.0, State: tRStateOpen, Day: today, FrozenCash: 18108},
 	}
 	e.mu.Unlock()
 	e.SetSizingContext(0.80, 0.10, 0.30, 1.00, false)

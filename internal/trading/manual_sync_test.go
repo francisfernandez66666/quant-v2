@@ -45,8 +45,10 @@ func TestSweepOrdersSkipsManualOrders(t *testing.T) {
 	for _, o := range orders {
 		got[o.SignalID] = o.Status
 	}
-	if got["buy:600000:fac_1:20261028"] != "已撤" {
-		t.Fatalf("系统单应被自动撤, got %s", got["buy:600000:fac_1:20261028"])
+	if got["buy:600000:fac_1:20261028"] != "撤单中" {
+		// §CANCEL-STATE：撤单请求已发出 ≠ 交易所已撤。本地先进「撤单中」，
+		// 终态由回报/快照推进（见 store 层 status 迁移用例）。
+		t.Fatalf("系统单应进入撤单中, got %s", got["buy:600000:fac_1:20261028"])
 	}
 	if got["ext:12345"] != "已报" {
 		t.Fatalf("手动单不得被例行自动撤单误杀, got %s", got["ext:12345"])

@@ -115,14 +115,15 @@ func TestSweepOrdersStaleCancel(t *testing.T) {
 	if res.Cancelled != 1 || res.Demoted != 1 {
 		t.Fatalf("期望 撤销=1 降级=1, got %+v", res)
 	}
-	// 本地状态核验：GW-1 → 已撤；pend:SIG-SW-P → 发送失败；GW-2 保持已报；GW-3 已成不动
+	// 本地状态核验：GW-1 → 撤单中（§CANCEL-STATE：请求已发出≠已撤）；pend:SIG-SW-P → 发送失败；
+	// GW-2 保持已报；GW-3 已成不动
 	orders, _ := db.RealOrders()
 	got := map[string]string{}
 	for _, o := range orders {
 		got[o.SignalID] = o.Status
 	}
-	if got["SIG-SW-A"] != "已撤" {
-		t.Fatalf("GW-1 应已撤, got %s", got["SIG-SW-A"])
+	if got["SIG-SW-A"] != "撤单中" {
+		t.Fatalf("GW-1 应进入撤单中, got %s", got["SIG-SW-A"])
 	}
 	if got["SIG-SW-P"] != "发送失败" {
 		t.Fatalf("pend 行应降级发送失败, got %s", got["SIG-SW-P"])
@@ -214,8 +215,11 @@ func TestCancelPathMonotonic(t *testing.T) {
 				t.Fatalf("已撤单应保持已撤, got %s", o.Status)
 			}
 		case "SIG-REPORTED":
-			if o.Status != "已撤" {
-				t.Fatalf("已报单撤单后应变已撤, got %s", o.Status)
+			// §CANCEL-STATE（2026-10-28）：撤单请求被受理后本地只到「撤单中」，
+			// 终态"已撤"必须等交易所确认（回报/快照）。旧实现直接写"已撤"，
+			// 于是"撤单被拒但实际成交"的单被当成已撤——600362 事故就是这个形态。
+			if o.Status != "撤单中" {
+				t.Fatalf("已报单撤单后应进入撤单中, got %s", o.Status)
 			}
 		}
 	}

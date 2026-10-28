@@ -86,6 +86,11 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// §CANCEL-STATE：老库补三列（幂等）。放在 Open 里而不是各写路径里，避免"只在某条路径才建列"的半态。
+	if err := d.ensureOrderCancelColumns(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// §SCHEMA-VERSION（2026-10-26，旧审计 F10）：所有迁移都是幂等加列；用 PRAGMA user_version
 	// 给库一个可读版本号。旧库(0)自动抬到当前；未来版本(>current)拒绝启动，避免旧二进制
 	// 对着新 schema 静默跑。English: stamp PRAGMA user_version after idempotent migrations;
@@ -491,6 +496,11 @@ func (d *DB) migrate() error {
 			-- 目标仓位模型的 CurStrat 必须把 T 腿剔出去（否则一笔日内低吸会吃掉战略空间），
 			-- 集中度闸也要按"净额"判 T 买腿，两个用途都依赖这一列，不能靠 signal_id 前缀猜。
 			intraday_t INTEGER DEFAULT 0,
+			-- §CANCEL-STATE（2026-10-28）撤单请求留痕：请求时刻/来源/原因。状态「撤单中」不是终态，
+			-- 只有交易所回报/快照给出终态后才改写；这三列用于回答"什么时候、谁、为什么发的撤单"。
+			cancel_requested_at TEXT DEFAULT '',
+			cancel_source TEXT DEFAULT '',
+			cancel_reason TEXT DEFAULT '',
 			UNIQUE (user_id, signal_id)
 		)`,
 

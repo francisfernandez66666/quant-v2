@@ -1368,6 +1368,17 @@ def _handle_cmd(cmd, seen):
             _trace("order_result seq=%s ok=%s oid=%s confirmed=%s" % (
                 seq, ok, order_id, result.get("order_confirmed")))
         elif kind == "cancel":
+            # CANCEL-STATE (2026-10-28): never even send a cancel inside the no-cancel
+            # window -- the exchange rejects it, and an accepted request would be
+            # reported upstream as "cancelled" (the 600362 incident). The gateway
+            # refuses to enqueue too; this is the last gate for commands enqueued
+            # just before the window opened.
+            blocked, wlabel = _no_cancel_window()
+            if blocked:
+                err = "no-cancel window %s: cancel request not sent" % wlabel
+                _report({"type": "cancel_result", "seq": seq, "ok": False, "err": err})
+                _trace("cancel refused (no-cancel window) seq=%s window=%s" % (seq, wlabel))
+                return True
             try:
                 ok, err = _xt().cancel(seq, cmd.get("order_id"), cmd.get("code"))
             except Exception as e:
@@ -1416,7 +1427,9 @@ def _handle_cmd(cmd, seen):
 
 _TICK = {"cfg": None, "seen": None, "last_cmd_ts": 0.0, "n": 0,
          "last_pos": 0.0, "last_hb": 0.0, "pos_sec": 30.0, "hb_sec": 5.0,
-         "last_orders": 0.0, "orders_sec": 10.0}
+         "last_orders": 0.0, "orders_sec": 10.0,
+         # CLOSE-RECON: day of the last real tick ("" = the bridge has never ticked).
+         "last_tick_day": ""}
 
 
 def _bridge_tick():
@@ -1448,6 +1461,10 @@ def _bridge_tick():
     cfg = st["cfg"]
     seen = st["seen"]
     st["n"] += 1
+    # CLOSE-RECON: remember the day of the last real tick -- the bridge only ticks on
+    # market days, so "no tick today" is the honest non-trading-day signal the
+    # 15:01 probe uses to stay quiet on weekends/holidays.
+    st["last_tick_day"] = _now_cn_str("%Y-%m-%d")
     now = time.time()
     # 1) heartbeat (gateway drives queued_connected from this)
     if now - st["last_hb"] >= st["hb_sec"]:
@@ -1543,9 +1560,273 @@ def _bridge_tick():
             _trace("orders snapshot error: " + repr(e))
 
 
+# ===========================================================================
+# CANCEL-STATE (2026-10-28) -- no-cancel session window, LAST gate on the bridge.
+#
+# The gateway already refuses to enqueue a cancel inside the window
+# (qmt_gateway/broker.py, same default values). This is the final gate: a cancel
+# command enqueued just before the window opened must NOT be executed inside it --
+# the exchange rejects cancels during the auction sessions, and an "accepted"
+# request is read upstream as "cancelled" (the 600362 incident: the local row said
+# cancelled while the order had actually filled).
+#
+# Keep in sync with: Go rules.qmt.no_cancel_windows (default 09:20-09:30,14:57-15:00)
+# and qmt_gateway/broker.py::DEFAULT_NO_CANCEL_WINDOWS.
+#
+# NOTE: this file must stay pure ASCII (it runs inside the QMT GBK sandbox).
+# ===========================================================================
+DEFAULT_NO_CANCEL_WINDOWS = "09:20-09:30,14:57-15:00"
+
+
+def _parse_windows(spec):
+    """Parse 'HH:MM-HH:MM[,...]' into [(start_min, end_min)]; skip unparsable parts."""
+    out = []
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        left, _, right = part.partition("-")
+        try:
+            lh, lm = [int(x) for x in left.strip().split(":")[:2]]
+            rh, rm = [int(x) for x in right.strip().split(":")[:2]]
+        except Exception:
+            continue
+        out.append((lh * 60 + lm, rh * 60 + rm))
+    return out
+
+
+def _now_cn_minutes():
+    """Beijing wall clock as minutes since midnight (the sandbox clock is not Beijing)."""
+    hm = _now_cn_str("%H:%M")
+    try:
+        h, m = [int(x) for x in hm.split(":")[:2]]
+        return h * 60 + m
+    except Exception:
+        return -1
+
+
+def _no_cancel_window(cfg=None):
+    """Return (blocked, label) for the no-cancel window, in Beijing time."""
+    c = cfg if cfg is not None else (_TICK.get("cfg") or {})
+    spec = str(c.get("no_cancel_windows", "") or "").strip() or DEFAULT_NO_CANCEL_WINDOWS
+    return _no_cancel_window_at(spec, _now_cn_minutes())
+
+
+def _no_cancel_window_at(spec, minutes):
+    """Same judgment on an explicit minute-of-day (half-open [start, end)).
+
+    Split out from _no_cancel_window so the window math is testable without a clock.
+    """
+    cur = int(minutes)
+    if cur < 0:
+        return False, ""
+    for s, e in _parse_windows(spec):
+        if s <= cur < e:
+            return True, "%02d:%02d-%02d:%02d" % (s // 60, s % 60, e // 60, e % 60)
+    return False, ""
+
+
+# ===========================================================================
+# CLOSE-RECON (2026-10-28) -- end-of-day snapshot from inside the bridge.
+#
+# Why: miniQMT is closed by the broker now (only the QMT bridge channel is left),
+# and the bridge's last tick is ~15:00:03 -- so the closing-auction fills never
+# reach the engine on the same day (600362: the order row said "cancelled", there
+# were no fills and no position, and the buy list never showed the stock).
+#
+# Design (docs/PLAN_CANCEL_STATE_20261028.md 4.3):
+#   1. init() registers a QMT timed callback at 15:01 ("1nDay"). The callback FIRST
+#      probes whether the trade-detail tables are readable on the timer thread
+#      (thread identity + row counts). The bridge's own history says gtdd is only
+#      visible on the model MAIN thread; if the timer thread reads 0 rows the leg
+#      is unusable and we must NOT feed an empty snapshot downstream (that would
+#      trip the position-clearing guard and fake-cancel live orders).
+#   2. Usable -> emit ONE close snapshot (orders + deals + positions + account)
+#      tagged close_snapshot=true. Idempotent per day via the state file.
+#   3. Unusable -> log the fallback: the next morning's first snapshot back-fills
+#      positions, and the operator is told the 15:00-15:05 fills must be reconciled
+#      from the broker statement.
+#
+# NOTE: this file must stay pure ASCII (it runs inside the QMT GBK sandbox).
+# ===========================================================================
+CLOSE_STATE_PATH = _p("bridge_close_state.json")
+CLOSE_SNAPSHOT_AT = "15:01:00"
+# _MAIN_THREAD remembers the model main thread identity: gtdd rows are only visible there.
+_MAIN_THREAD = {"ident": None, "name": ""}
+
+
+def _mark_main_thread():
+    """Remember the model main thread identity (gtdd is only readable there)."""
+    try:
+        import threading
+        _MAIN_THREAD["ident"] = threading.get_ident()
+        _MAIN_THREAD["name"] = str(getattr(threading.current_thread(), "name", "") or "")
+    except Exception:
+        pass
+
+
+def _read_close_state():
+    """Read the close-reconciliation state file (empty dict on any failure)."""
+    import json
+    try:
+        raw = open(CLOSE_STATE_PATH, "rb").read()
+        for enc in ("utf-8-sig", "utf-8", "gbk"):
+            try:
+                return json.loads(raw.decode(enc))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {}
+
+
+def _write_close_state(state):
+    """Persist the close-reconciliation state file atomically (tmp + replace)."""
+    import json
+    try:
+        if not _dir_ready(CLOSE_STATE_PATH):
+            return
+        tmp = CLOSE_STATE_PATH + ".tmp"
+        f = open(tmp, "wb")
+        f.write(json.dumps(state, ensure_ascii=True).encode("ascii", errors="replace"))
+        f.close()
+        try:
+            os.replace(tmp, CLOSE_STATE_PATH)
+        except Exception:
+            os.rename(tmp, CLOSE_STATE_PATH)
+    except Exception as e:
+        _trace("close state write fail: " + repr(e))
+
+
+def close_snapshot_probe(ContextInfo):
+    """QMT timed callback (15:01 daily): probe table visibility, snapshot if usable.
+
+    QMT resolves the callback by NAME in the strategy's global namespace, so this
+    function must keep its global, underscore-free name.
+    """
+    try:
+        _xt()._ctx = ContextInfo
+    except Exception:
+        pass
+    day = _now_cn_str("%Y-%m-%d")
+    state = _read_close_state()
+    if str(state.get("snapshot_day", "") or "") == day:
+        _trace("close snapshot already done for %s, skip" % day)
+        return
+    try:
+        import threading
+        ident = threading.get_ident()
+        tname = str(getattr(threading.current_thread(), "name", "") or "")
+    except Exception:
+        ident, tname = -1, ""
+    same_thread = (ident != -1 and ident == _MAIN_THREAD.get("ident"))
+    counts = {}
+    try:
+        adapter = _xt()
+        for table in ("ORDER", "DEAL", "POSITION"):
+            try:
+                counts[table] = len(adapter._gtdd(table))
+            except Exception:
+                counts[table] = -1
+    except Exception as e:
+        _trace("close probe table read fail: " + repr(e))
+        counts = {}
+    # Usable when we are on the main thread (tables readable there) OR when the timer
+    # thread could read at least one row (the embed exposes them anyway).
+    usable = bool(same_thread) or any(v > 0 for v in counts.values())
+    _trace("CLOSE_PROBE day=%s thread=%s main_thread=%s n_orders=%s n_deals=%s n_pos=%s usable=%s"
+           % (day, tname, _MAIN_THREAD.get("name", ""), counts.get("ORDER"), counts.get("DEAL"),
+              counts.get("POSITION"), usable))
+    # Non-trading day guard: the bridge only ticks on market days, so "no tick today" means
+    # "no trading today" -- there is nothing to reconcile and nothing to warn about.
+    # Without this guard a weekend probe (timer thread, empty tables) would register a
+    # pending reconciliation and cry wolf on Monday morning.
+    last_tick_day = str(_TICK.get("last_tick_day", "") or "")
+    if last_tick_day and last_tick_day != day:
+        _trace("CLOSE_PROBE_SKIP day=%s (no bridge tick on that day; not a trading day)" % day)
+        return
+    if not usable:
+        # Unusable leg: never feed an empty snapshot downstream. Fall back to the next
+        # morning's first snapshot and tell the operator the closing fills need the
+        # broker statement (fills cannot be invented).
+        state["probe_day"] = day
+        state["probe_usable"] = False
+        state["pending_recon_day"] = day
+        _write_close_state(state)
+        _trace("CLOSE_RECON_FALLBACK day=%s probe unusable (the timer thread cannot read "
+               "the trade-detail tables); positions will be back-filled by the next-morning "
+               "snapshot, but the 15:00-15:05 fills must be reconciled from the broker "
+               "statement" % day)
+        return
+    _close_snapshot(day)
+
+
+def _close_snapshot(day):
+    """Emit ONE end-of-day snapshot (orders + deals + positions + account)."""
+    try:
+        adapter = _xt()
+        try:
+            orows, osynced = adapter.query_orders()
+            _report({"type": "orders_snapshot", "orders": orows,
+                     "synced": bool(osynced), "data_ts": _now_cn_str(),
+                     "close_snapshot": True})
+        except Exception as e:
+            _trace("close snapshot orders error: " + repr(e))
+        try:
+            for trow in adapter.query_trades():
+                _report({"type": "trade", "close_snapshot": True, **trow})
+        except Exception as e:
+            _trace("close snapshot trades error: " + repr(e))
+        try:
+            poss = adapter.query_positions()
+            # Same convention as the periodic leg: an empty read is published with
+            # synced=false (the counter session may simply be down) -- never as "flat book".
+            _report({"type": "positions", "positions": poss,
+                     "synced": bool(poss), "data_ts": _now_cn_str(),
+                     "close_snapshot": True})
+        except Exception as e:
+            _trace("close snapshot positions error: " + repr(e))
+        try:
+            asset = adapter.query_asset()
+            if asset:
+                _report({"type": "account", "asset": asset, "synced": True,
+                         "data_ts": _now_cn_str(), "close_snapshot": True})
+        except Exception as e:
+            _trace("close snapshot asset error: " + repr(e))
+        state = _read_close_state()
+        state["snapshot_day"] = day
+        state["snapshot_at"] = _now_cn_str()
+        state["probe_usable"] = True
+        _write_close_state(state)
+        _trace("CLOSE_SNAPSHOT day=%s at=%s done" % (day, state.get("snapshot_at", "")))
+    except Exception as e:
+        _trace("close snapshot fatal: " + repr(e))
+
+
+def _close_recon_morning_alert():
+    """Once per morning: say that a close reconciliation is still missing.
+
+    Tied to the known-unusable probe (pending_recon_day) instead of calendar
+    arithmetic -- the bridge has no trading calendar, so "yesterday" would be a guess.
+    """
+    day = _now_cn_str("%Y-%m-%d")
+    state = _read_close_state()
+    pending = str(state.get("pending_recon_day", "") or "")
+    if not pending or pending >= day:
+        return
+    if str(state.get("alert_day", "") or "") == day:
+        return
+    state["alert_day"] = day
+    _write_close_state(state)
+    _trace("CLOSE_RECON_MISSING day=%s last_close_snapshot_day=%s -- the closing-auction "
+           "fills of %s are not in the engine; reconcile them from the broker statement "
+           "(the next-morning snapshot only back-fills positions)" % (day, pending, pending))
+
+
 def init(ContextInfo):
     """QMT strategy init: inject ContextInfo into the adapter and probe the session."""
     _trace("init called (handlebar-tick mode)")
+    _mark_main_thread()
     try:
         _xt()._ctx = ContextInfo
     except Exception as e:
@@ -1554,12 +1835,26 @@ def init(ContextInfo):
         _xt().probe_embed()
     except Exception as e:
         _trace("probe error: " + repr(e))
+    # CLOSE-RECON (2026-10-28): register the 15:01 daily timer that probes the
+    # trade-detail tables and, if they are readable, emits the end-of-day snapshot.
+    # Registration failure is not fatal -- the fallback (next-morning snapshot +
+    # broker-statement reconciliation) still applies.
+    try:
+        ContextInfo.run_time("close_snapshot_probe", "1nDay", CLOSE_SNAPSHOT_AT)
+        _trace("close snapshot timer registered at %s" % CLOSE_SNAPSHOT_AT)
+    except Exception as e:
+        _trace("close snapshot timer register fail: " + repr(e))
 
 
 def handlebar(ContextInfo):
     """QMT per-bar entry point: re-bind ContextInfo and run one bridge tick."""
     try:
         _xt()._ctx = ContextInfo
+        _mark_main_thread()
+    except Exception:
+        pass
+    try:
+        _close_recon_morning_alert()
     except Exception:
         pass
     try:

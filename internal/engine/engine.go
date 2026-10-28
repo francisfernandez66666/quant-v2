@@ -171,9 +171,14 @@ type Engine struct {
 	tMinuteCache *tMinuteCache
 	// tSellVerdicts 该码最近一次活跃卖出/退出裁决的时刻（反 T 否决门用，5 分钟内有效）。
 	tSellVerdicts map[string]time.Time
-	cfgMgr        *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
-	longEnabled   bool            // 利好开关（做多分支）
-	shortEnabled  bool            // 利空开关（做空分支）
+	// sizingCtxCache §FUNDS-TODAY 定权上下文（MS/盲区/指数涨跌）的短窗缓存（见 sizingContextFor）。
+	// 同一轮里"资金帧发布"与"T 参数解析"都要用 MS，两处各算一次就有"同轮两个 MS"的漂移风险。
+	sizingCtxCache map[string]sizingCtx
+	// fundsPublishedAt §FUNDS-TODAY 资金帧最近一次发布时刻（按账号，去重 10s）。
+	fundsPublishedAt map[string]time.Time
+	cfgMgr           *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
+	longEnabled      bool            // 利好开关（做多分支）
+	shortEnabled     bool            // 利空开关（做空分支）
 
 	m8PeakTotal float64 // §GAP1.2 实盘组合市值峰值（M8 回撤兜底基线；e.mu 保护，平仓后归零重计）
 
@@ -2173,17 +2178,36 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		}
 	}
 	qty := 0
+	var dec *dynBuyReadout
 	if dynamicBudget {
-		var dec *dynBuyReadout
 		qty, dec = e.dynamicBuyQty(sig, price, buyScale, sizingCfg, ctrl, ctx)
-		// §DECISION-TODAY：无论放行还是被拦都落一行快照（"没买"也必须有解释）。
-		e.persistDynBuyDecision(sig, dec)
-		if qty <= 0 {
-			// 具体原因在 dynamicBuyQty 内已按 DayOnce 留痕；这里只结束本单。
-			return
-		}
 	} else {
 		qty = int(amount/price/100) * 100
+	}
+	// §CANCEL-STATE（2026-10-28）禁挂单窗口闸：集合竞价/尾盘窗口内交易所不接受新委托。
+	// 放在"算完之后、下单之前"而不是函数最前面，是为了保留完整读数（MS/目标/剩余/受限于）——
+	// 用户要回答的是"这只票按什么算的、为什么今天没买"，窗口原因必须和计算过程一起出现，
+	// 而不是只留一句"没下单"。决策快照 qty 归零 + 原因写明窗口 ⇒ §DECISION-TODAY 显示 stage=skipped。
+	// English: refuse new orders inside the session windows, but keep the full sizing readout
+	// so the decision snapshot explains *why* nothing was placed.
+	if blocked, label := ctrl.NewOrderBlockedByWindow(e.nowTime()); blocked {
+		if dec != nil {
+			dec.Qty = 0
+			dec.Notional = 0
+			dec.SkipReason = "禁挂时段（" + label + "）：集合竞价/尾盘窗口不接新委托，本轮未下单"
+		}
+		e.persistDynBuyDecision(sig, dec)
+		log.Printf("[qmt] %s(%s) §CANCEL-STATE 禁挂窗口(%s)生效：本轮不下单（读数已落决策快照）", sig.Code, sig.Name, label)
+		opslog.DayOnce("auto-window:"+label+":"+sig.Code, func() {
+			opslog.Logf("quant", "自动下单跳过 %s(%s) 原因=禁挂时段(%s)", sig.Code, sig.Name, label)
+		})
+		return
+	}
+	// §DECISION-TODAY：无论放行还是被拦都落一行快照（"没买"也必须有解释）。
+	e.persistDynBuyDecision(sig, dec)
+	if dynamicBudget && qty <= 0 {
+		// 具体原因在 dynamicBuyQty 内已按 DayOnce 留痕；这里只结束本单。
+		return
 	}
 	// §C3 ATR 风险预算：用“账户权益 × 单笔风险% / (ATR×止损倍数)”倒推股数，与金额股数取 min。
 	// 影子期只记录原本会缩到多少；正式期才真正收紧。缺 ATR/权益时整条弃权。

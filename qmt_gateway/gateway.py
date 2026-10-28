@@ -97,6 +97,8 @@ from store import (  # noqa: E402
     Store, is_placeholder_order_id, json_default, _now_cn, CN_TZ,
     # §CLAIMRELEASE 第三态字面量与派发队列重复入队的可识别异常（分流与告警两条路都要认它）
     UNRESOLVED_STATUS, DispatchDuplicateSignal,
+    # §CANCEL-STATE（2026-10-28）撤单中状态与撤单被拒事件前缀（在途谓词与状态迁移共用同一份字面量）
+    CANCEL_PENDING_STATUS, CANCEL_REJECT_PREFIX, IN_FLIGHT_STATUSES,
 )
 from ids import Idempotency  # noqa: E402
 from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
@@ -320,9 +322,19 @@ class Gateway:
         self._orders_snap = {"by_id": {}, "ts": 0.0, "data_ts": "", "n": 0}
         self._order_miss = {}
         self._orders_snap_skipped_unknown = 0
+        # §CLOSE-RECON（2026-10-28）收盘对账观测位：桥在 15:01 的收盘快照打 close_snapshot=true，
+        # 网关只记"最近一次收盘快照的时刻/行数"——它回答"当天收盘那 3 分钟的成交有没有回传"，
+        # 是 600362 事故（委托行说已撤、实际成交没回传）的唯一现网信号。
+        self._close_snap = {"at": "", "day": "", "ts": 0.0, "n": 0, "positions": 0, "trades": 0}
         # §M-3/§MANUAL-SYNC 未确认单观察项：signal_id -> 首次判未确认的时刻。
         # 委托表快照里一旦出现它的 remark 就消项；宽限期内始终没出现 → 回写发送失败。
         self._order_unconfirmed = {}
+        # §CANCEL-STATE（2026-10-28）撤单被拒判定：order_id -> 连续几轮快照显示"仍在途"。
+        # 撤单请求发出后本地是「撤单中」；若券商委托表连着 N 轮都还显示它在途（已报/部成），
+        # 说明撤单**没有生效**（收盘集合竞价/已成交/柜台拒单），需要显式回退并告警。
+        # 为什么不能靠快照直接回退：那样"撤单请求还在飞"与"交易所没撤成"两件事会混成一次
+        # 静默回退，操作人看不到"我发的撤单被拒了"。所以要走计数 + 显式 §CANCEL-REJECT 事件。
+        self._cancel_pending_miss = {}
 
     def switch_broker(self, key, reason=""):
         """原子切换 active 通道（xt/queued/mock）。返回 (ok:bool, err:str)。"""
@@ -1185,6 +1197,10 @@ class Gateway:
             if etype == "heartbeat":
                 self.store.bridge_heartbeat()
                 return 200, {"ok": True, "err": ""}
+            # §CLOSE-RECON：收盘快照事件打 close_snapshot=true，这里先记一笔观测位
+            # （各事件类型随后走各自的处理分支）。
+            if req.get("close_snapshot"):
+                self._note_close_snapshot(etype, req)
             if etype == "positions":
                 poss = req.get("positions") or []
                 synced = req.get("synced")
@@ -1225,6 +1241,42 @@ class Gateway:
     # §MANUAL-SYNC：本地在途单在柜台委托表里连续缺失多少次才判终态（6×10s≈60s 宽限，
     # 避免刚报出去/刚撤掉的单被下一轮快照误杀）。
     ORDER_MISS_LIMIT = 6
+
+    def _note_close_snapshot(self, etype, req):
+        """§CLOSE-RECON 记录桥侧收盘快照的观测位（时刻/行数/日期）。
+
+        为什么要有这个位：miniQMT 已关停，收盘那 3 分钟（15:00-15:05）的成交只能靠
+        桥在 15:01 打的收盘快照回传。快照没来 ⇒ 那几分钟的成交不在账上，必须靠对账单勘误。
+        「最近一次收盘快照在哪天、有多少行」是这条链是否健康的唯一现网信号。
+        English: records the bridge close-of-day snapshot (when, how many rows) so the
+        operator can see whether the closing-auction fills could be reconciled at all.
+        """
+        data_ts = str(req.get("data_ts", "") or "")
+        day = data_ts[:10] if data_ts else ""
+        try:
+            n = 0
+            pos = 0
+            trades = 0
+            if etype == "orders_snapshot":
+                n = len(req.get("orders") or [])
+            elif etype == "trade":
+                trades = 1
+            elif etype == "positions":
+                pos = len(req.get("positions") or [])
+            self._close_snap = {
+                "at": data_ts, "day": day, "ts": time.time(),
+                "n": int(self._close_snap.get("n", 0) or 0) + n,
+                "positions": int(self._close_snap.get("positions", 0) or 0) + pos,
+                "trades": int(self._close_snap.get("trades", 0) or 0) + trades,
+            }
+        except Exception:  # noqa: BLE001 — 观测位坏了绝不影响事件处理
+            log.warning("[gateway] §CLOSE-RECON 收盘快照观测位更新失败", exc_info=True)
+
+    # §CANCEL-STATE（2026-10-28）：撤单请求发出后，券商委托表连着几轮仍显示该委托在途，
+    # 才判定"撤单没生效"并回退在途态（默认 3 轮 ≈ 30s，快照 10s 一轮）。
+    # 为什么要有这个窗口：撤单请求发出到柜台真正落状态之间有延迟，第一轮快照看到"还在途"
+    # 是正常的；立刻回退会造成"发了撤单又被说没撤 → 再撤一次"的抖动。
+    CANCEL_REJECT_LIMIT = 3
 
     def _apply_orders_snapshot(self, req):
         """§MANUAL-SYNC（2026-10-28）券商当日委托表快照：补手动单 / 推进我方单 / 收敛消失单。
@@ -1327,6 +1379,35 @@ class Gateway:
             side = str(r.get("side", "") or "")
         # order_by_signal 返回 sqlite3.Row（按下标/列名取值，没有 .get）
         cur = self.store.order_by_signal(sid)
+        # §CANCEL-STATE（2026-10-28）撤单中 × 委托表快照的三态分叉：
+        #   ① 快照给终态（已撤/部撤/已成/废单）→ 撤单生效，正常推进；
+        #   ② 快照仍是已报/部成（还在途）→ 撤单**没生效**。此时**不能**直接推快照状态
+        #      （那会把「撤单中」无声无息改回已报，操作人看不到"我发的撤单被拒了"），
+        #      改为计数；连续 N 轮仍在途 → 显式推 §CANCEL-REJECT 拒因并回退在途态；
+        #   ③ 快照给的是别的在途态 → 同上处理。
+        if cur is not None and str(cur["status"] or "") == CANCEL_PENDING_STATUS:
+            if status in ("已撤", "部撤", "废单", "已废", "已成"):
+                self._cancel_pending_miss.pop(oid, None)  # 撤单生效，计数清零
+            elif status in IN_FLIGHT_STATUSES:
+                n = self._cancel_pending_miss.get(oid, 0) + 1
+                self._cancel_pending_miss[oid] = n
+                limit = int(self.cfg.get("cancel_reject_miss_limit", self.CANCEL_REJECT_LIMIT) or 0)
+                if limit <= 0 or n < limit:
+                    return  # 还在观察窗内：保持「撤单中」，不推任何状态
+                log.warning("[gateway] §CANCEL-STATE 撤单未生效（连续 %d 轮委托表仍在途）oid=%s signal=%s "
+                            "→ 推送撤单被拒并回退在途态", n, oid, sid)
+                self._cancel_pending_miss.pop(oid, None)
+                self.handler.on_order({
+                    "order_id": oid, "signal_id": sid, "code": code, "side": side,
+                    "status": status,
+                    "price": float(r.get("price", 0) or 0),
+                    "qty": int(r.get("qty", 0) or 0),
+                    "created_at": created or _now_cn(),
+                    "reason": "%s 券商委托表连续 %d 轮显示该委托仍在途，撤单未生效"
+                              % (CANCEL_REJECT_PREFIX, n),
+                    "at": _now_cn(),
+                })
+                return
         if (cur is not None and str(cur["status"] or "") == status
                 and str(cur["order_id"] or "") == oid):
             return  # 状态与单号都没变：快照重放，不重复上报
@@ -1358,7 +1439,9 @@ class Gateway:
         for row in self.store.list_orders():
             oid = str(row.get("order_id", "") or "")
             status = str(row.get("status", "") or "")
-            if status not in ("已报", "部成", "已报待撤", "部成待撤"):
+            # §CANCEL-STATE：「撤单中」也在在途集合里——它在柜台委托表里消失说明撤单生效了
+            #（该走终态判定），不能因为"状态不是已报/部成"就把它当成非在途直接跳过。
+            if status not in IN_FLIGHT_STATUSES:
                 self._order_miss.pop(oid, None)
                 continue
             if not oid or oid.startswith("pending:") or oid.startswith("seq:"):
@@ -1524,7 +1607,16 @@ class Gateway:
         return 200, {"ok": True, "err": ""}
 
     def _apply_cancel_result(self, req):
-        """撤单结果回报：ok→已撤；失败→保持已报并透出原因。"""
+        """撤单结果回报：ok→「撤单中」；失败→带 §CANCEL-REJECT 拒因退回在途态。
+
+        §CANCEL-STATE（2026-10-28）语义更正：网关回的 ok=True 只代表"QMT 客户端受理了
+        撤单调用"，**不是交易所确认撤成**。旧实现直接推「已撤」，于是 2026-10-28 的
+        600362（15:00 集合竞价成交、撤单被交易所拒绝）在本地被记成"已撤"，实际成交
+        既没有 fills 也没有持仓。现在只推「撤单中」，终态由券商委托表快照裁决。
+
+        失败（ok=False）→ 推在途态并带 §CANCEL-REJECT 前缀：这是**唯一**允许把「撤单中」
+        退回在途态的显式事件（迟到的快照不许回退，否则会陷入"撤→快照说还在途→再撤"循环）。
+        """
         seq = str(req.get("seq", "") or "")
         ok = bool(req.get("ok"))
         err = str(req.get("err", "") or "")
@@ -1535,12 +1627,25 @@ class Gateway:
         if not signal_id:
             return 200, {"ok": True, "err": ""}
         ts = _now_cn()  # §TZ
-        self.handler.on_order({
-            "order_id": row.get("order_id") or seq, "signal_id": signal_id, "code": row.get("code"),
-            "side": row.get("side"), "status": "已撤" if ok else "已报",
-            "price": 0.0, "qty": 0, "reason": err,
-            "created_at": row.get("created_at") or ts, "at": ts,
-        })
+        if ok:
+            # 请求已受理、交易所未确认 → 「撤单中」（非终态，冻结照算）
+            self.handler.on_order({
+                "order_id": row.get("order_id") or seq, "signal_id": signal_id, "code": row.get("code"),
+                "side": row.get("side"), "status": CANCEL_PENDING_STATUS,
+                "price": 0.0, "qty": 0,
+                "reason": "§CANCEL-STATE 撤单请求已被客户端受理，等待交易所确认",
+                "created_at": row.get("created_at") or ts, "at": ts,
+            })
+        else:
+            # 撤单被拒（收盘集合竞价/已成交/柜台拒单）：显式拒因，允许回退在途态
+            reason = "%s 撤单被拒: %s" % (CANCEL_REJECT_PREFIX, err or "网关未给出原因")
+            log.warning("[gateway] §CANCEL-STATE 撤单被拒 seq=%s signal=%s err=%s", seq, signal_id, err)
+            self.handler.on_order({
+                "order_id": row.get("order_id") or seq, "signal_id": signal_id, "code": row.get("code"),
+                "side": row.get("side"), "status": "已报",
+                "price": 0.0, "qty": 0, "reason": reason,
+                "created_at": row.get("created_at") or ts, "at": ts,
+            })
         return 200, {"ok": True, "err": ""}
 
     def _apply_trade(self, req):
@@ -1806,6 +1911,16 @@ class Gateway:
             "miss_pending": len(self._order_miss),
             "unknown_status_skipped": int(self._orders_snap_skipped_unknown),
             "miss_limit": int(self.cfg.get("manual_sync_miss_limit", self.ORDER_MISS_LIMIT) or 0),
+        }
+        # §CLOSE-RECON 观察位：最近一次收盘快照（桥 15:01 定时任务打的那一帧）。
+        # day 为空＝桥从来没打过收盘快照 ⇒ 收盘那 3 分钟的成交不在账上，
+        # 只能靠对账单勘误；这是 600362 事故的现网判据。
+        payload["close_snapshot"] = {
+            "day": str(self._close_snap.get("day", "") or ""),
+            "at": str(self._close_snap.get("at", "") or ""),
+            "orders_n": int(self._close_snap.get("n", 0) or 0),
+            "positions_n": int(self._close_snap.get("positions", 0) or 0),
+            "trades_n": int(self._close_snap.get("trades", 0) or 0),
         }
         return 200, payload
 

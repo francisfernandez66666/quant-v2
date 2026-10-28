@@ -30,7 +30,6 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/paper"
-	"quant-trading-v2/internal/signalctl"
 )
 
 // tMinuteTTLOf 分时均线校验腿的缓存时长。
@@ -339,13 +338,10 @@ func (e *Engine) tSellVerdictActive(code string) bool {
 // 第二个返回值是本轮定权上下文（MS/盲区），由调用方顺手喂给 paper 的目标仓位模型，
 // 省掉"同一轮算两次 MarketScale"的漂移风险。
 func (e *Engine) tParamsFor(uid string, tc config.TConfig, shadow bool) (paper.TParams, float64, bool) {
-	r := e.regimeForAccount(uid)
-	// 市场组读数与个股无关：用零值信号只求市场组（个股因子全部弃权，不污染 MS）。
-	res := signalctl.ComputeSizing(r, combat_agent.Signal{})
-	ms := res.MarketScale
-	if ms <= 0 {
-		ms = 1.0
-	}
+	// 定权上下文走唯一出口（funds_today.go sizingContextFor）：短窗缓存 ⇒ 同一轮里
+	// 资金帧发布与 T 参数解析拿到的是同一个 MS/盲区/指数读数（§FUNDS-TODAY 方案 §7.1）。
+	ctx := e.sizingContextFor(uid)
+	ms := ctx.MS
 	p := paper.TParams{
 		Enabled:                 tc.TEnabled(),
 		BuyFirst:                tc.TBuyFirst(),
@@ -355,9 +351,9 @@ func (e *Engine) tParamsFor(uid string, tc config.TConfig, shadow bool) (paper.T
 		MinSpreadPct:            tc.TMinSpreadPct(),
 		ForceUnwindHM:           tc.TForceUnwindHM(),
 		MarketScale:             ms,
-		MissingKeyInput:         res.MissingKeyInput,
+		MissingKeyInput:         ctx.Missing,
 		Shadow:                  shadow,
-		IndexChangePct:          r.IndexChangePct,
+		IndexChangePct:          ctx.IndexPct,
 		FeeBufferPct:            0.6,
 		VWAPDevPct:              tc.VWAPDevPctOf(),
 		MinAmplitudePct:         tc.TMinAmplitudePctOf(),
@@ -394,7 +390,7 @@ func (e *Engine) tParamsFor(uid string, tc config.TConfig, shadow bool) (paper.T
 		}
 		log.Printf("[t-config-fallback] 账号=%s 本轮越界/非法键已回落生效值：%s", uid, strings.Join(parts, " "))
 	}
-	return p, ms, res.MissingKeyInput
+	return p, ms, ctx.Missing
 }
 
 // TParamsForAccount 供纸面通道与只读接口复用（避免两处各写一遍阈值解析）。

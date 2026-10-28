@@ -106,10 +106,13 @@ export function sseOpsAlert(msg) {
       // §0925EVE-A2（2026-09-25）：撤单失败明细随 SSE 一起下发（后端 qmt.go failed 数组）。
       // 只报"撤销 N 笔"就是把"没撤干净"藏进成功计数里——失败笔仍挂在网关，全局 Toast 必须
       // 当场点名单号清单，这是操作者不盯页面也能反应的最后一条腿。failed 恒为数组，防御性判一下。
+      // §CANCEL-STATE（2026-10-28）：后端 cancelled 的含义已收窄为"撤单请求已发出笔数"
+      // （交易所是否撤成要等回报/快照），所以成功侧也不再说"撤销 N 笔"——那会把受理当撤成。
+      // 失败侧的 failed 是"撤单请求根本没发出去"，故措辞是"撤单请求未发出"（这几笔确实没撤成）。
       const failed = Array.isArray(msg.failed) ? msg.failed : []
-      let body = '实盘已紧急停止，在途委托撤销 ' + (msg.cancelled || 0) + ' 笔' + (msg.time ? '（' + msg.time + '）' : '')
+      let body = '实盘已紧急停止，已发出 ' + (msg.cancelled || 0) + ' 笔撤单请求（等待交易所确认）' + (msg.time ? '（' + msg.time + '）' : '')
       if (failed.length) {
-        body += '；' + failed.length + ' 笔未撤成（' + failed.map((f) => (f && f.order_id ? f.order_id : '-')).join('、') + '），仍在途，请立即人工处置'
+        body += '；' + failed.length + ' 笔撤单请求未发出（' + failed.map((f) => (f && f.order_id ? f.order_id : '-')).join('、') + '），仍在途，请立即人工处置'
       }
       return { key: 'qmt_halt', title: '量仔 实盘熔断', tone: 'error', body }
     }

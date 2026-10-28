@@ -84,16 +84,30 @@ def order_id_rank(oid):
 # 为什么网关自己的 orders 表也要秩守卫：券商委托表快照（orders_snapshot）会每 10s
 # 重放整本委托，迟到/乱序的低阶行不能把已成/已撤回退成已报，否则 Go 侧资金与可撤
 # 判定会跟着回退。口径与 internal/store/real_positions.go orderStatusRank 对齐，
-# 两个例外必须保留：
+# 三个例外必须保留：
 #   ① 已报 → 发送失败：柜台委托表连续缺失/未确认，是「其实没到券商」的新事实；
-#   ② 发送失败 → 已报/部成：迟到的真实回报证明券商确实有这笔单（比停在发送失败更真）。
+#   ② 发送失败 → 已报/部成：迟到的真实回报证明券商确实有这笔单（比停在发送失败更真）；
+#   ③ §CANCEL-STATE（2026-10-28）撤单中 → 已报/部成：只有**显式**的 §CANCEL-REJECT
+#      撤单被拒事件才允许回退（迟到的委托表快照不许把撤单中改回已报，否则会出现
+#      "撤单请求还在飞 → 快照说还在途 → 系统以为没撤 → 再撤一次"的循环）。
 _TERMINAL_STATUSES = ("已成", "已撤", "部撤", "废单", "已废")
+
+# §CANCEL-STATE：撤单中（非终态）——撤单请求已发出、交易所尚未确认。
+CANCEL_PENDING_STATUS = "撤单中"
+
+# §CANCEL-STATE：撤单被交易所明确拒绝的事件前缀（唯一允许「撤单中 → 在途态」回退的钥匙）。
+CANCEL_REJECT_PREFIX = "§CANCEL-REJECT"
+
+# 仍在途（可被撤单请求命中）的委托状态集合。
+IN_FLIGHT_STATUSES = ("已报", "部成", CANCEL_PENDING_STATUS, "已报待撤", "部成待撤")
 
 
 def order_status_rank(status):
-    """委托状态单调等级（越小越早，终态=6）。未登记值一律 0。"""
+    """委托状态单调等级（越小越早，终态=7）。未登记值一律 0。"""
     s = str(status or "")
     if s in _TERMINAL_STATUSES:
+        return 7
+    if s == CANCEL_PENDING_STATUS:
         return 6
     if s == "部成":
         return 5
@@ -108,8 +122,12 @@ def order_status_rank(status):
     return 0  # pending / 待核对 / 未知(...)
 
 
-def order_status_advance(cur, new):
-    """新状态 new 是否允许覆盖当前 cur（同状态允许刷新价/量，但绝不回退终态）。"""
+def order_status_advance(cur, new, reason=""):
+    """新状态 new 是否允许覆盖当前 cur（同状态允许刷新价/量，但绝不回退终态）。
+
+    §CANCEL-STATE：reason 携带 §CANCEL-REJECT 前缀时，「撤单中」允许回退到在途态；
+    没有这个显式事件，任何快照/回报都不许把撤单中改回已报。
+    """
     cur = str(cur or "")
     new = str(new or "")
     if not cur or cur == new:
@@ -120,6 +138,10 @@ def order_status_advance(cur, new):
         return False  # 终态不再改写（含 已成 → 已撤 这类乱序）
     if new in _TERMINAL_STATUSES:
         return True
+    if new == CANCEL_PENDING_STATUS and cur in IN_FLIGHT_STATUSES:
+        return True  # 撤单请求已发出：进入「撤单中」等交易所确认
+    if cur == CANCEL_PENDING_STATUS and new in ("已报", "部成"):
+        return str(reason or "").startswith(CANCEL_REJECT_PREFIX)
     if cur == "已报" and new == "发送失败":
         return True
     if cur == "发送失败" and new in ("已报", "部成"):
@@ -508,8 +530,10 @@ class Store:
                 final_oid = new_oid
             # §MANUAL-SYNC：状态同样只升不降（同状态允许刷新价/量）。快照腿每 10s 重放
             # 整本委托表，没有这道守卫时一条迟到/乱序的低阶行会把已成/已撤改回已报。
+            # §CANCEL-STATE：reason 一并传入——「撤单中 → 已报/部成」只有显式的
+            # §CANCEL-REJECT 撤单被拒事件才放行（否则迟到的快照会把撤单中改回已报）。
             new_status = order.get("status") or row["status"]
-            if not order_status_advance(row["status"], new_status):
+            if not order_status_advance(row["status"], new_status, order.get("reason", "")):
                 log.warning("[store] 委托状态回退已拦截 signal=%s：%s -> %s（保留原状态）",
                             sid, row["status"], new_status)
                 new_status = row["status"]

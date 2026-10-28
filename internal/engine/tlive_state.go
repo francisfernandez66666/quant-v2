@@ -142,7 +142,11 @@ type tLiveState struct {
 // 每日清零：Day 与账本同日才有效；新交易日首帧之前没有本帧（前端显示待定权）。
 type tLiveFunds struct {
 	Day string `json:"day"`
-	At  string `json:"at"` // 取数时刻（RFC3339，北京时间）
+	At  string `json:"at"` // 信号仓侧取数时刻（RFC3339，北京时间）
+	// TAt T 侧取数时刻（RFC3339，北京时间）。
+	// T 循环没跑时（做 T 停用 / 当天没做 T）**保持上一帧的值**——前端据此判"T 侧读数已过期"，
+	// 而不是把 0 当成"T 侧真的为零"。不伪造 0 是这一层的硬纪律（方案 §7.1）。
+	TAt string `json:"t_at"`
 
 	// ── 信号仓（账户 + 目标仓位）─────────────────────────────────────────
 	Cash        float64 `json:"cash"`         // 券商可用现金（快照）
@@ -326,12 +330,43 @@ func (s *tLiveStore) dayCost() tLiveCostDaily {
 // 内存读数对它们永远不可见；同时资金帧必须与"这一轮 T 账本"同文件同帧，重启后仍能回答
 // "上一帧是什么时候、当时用了哪些数"。写盘失败只打日志不抛：资金帧是观测面，不能反过来
 // 阻断做 T 的资金路径（账本本身另有更关键的原子写保护）。
+//
+// 整帧覆盖只用于"一次性写入完整帧"的场合；两侧各有写者时（信号仓侧＝打分循环、T 侧＝T 循环）
+// 必须走 updateFunds 的读—改—写，否则会互相覆盖。
 func (s *tLiveStore) setFunds(f *tLiveFunds) {
 	if s == nil || f == nil {
 		return
 	}
 	s.mu.Lock()
 	s.funds = f
+	s.mu.Unlock()
+	if err := s.save(); err != nil {
+		log.Printf("[t-live] 资金帧落盘失败（本轮读数仅内存可见）：%v", err)
+	}
+}
+
+// updateFunds 以「读—改—写」方式更新当日资金帧：mutate 拿到当前帧（当日还没有则给一帧空的），
+// 改完整体覆盖并落盘。
+//
+// 为什么不是整帧覆盖：信号仓侧（打分循环写）与 T 侧（T 循环写）是两个写者，各占一半字段。
+// 整帧覆盖会出现"信号仓侧刚写完、被 T 侧整帧盖回去"的空窗——卡片上就出现"MS 没了"或
+// "T 侧被清零"。读—改—写在同一把锁内完成，两侧互不踩。
+//
+// 跨日不复活：当日还没有帧时新建一帧（Day=当日）；跨日 load 已把昨日帧清掉（见 load）。
+func (s *tLiveStore) updateFunds(mutate func(f *tLiveFunds)) {
+	if s == nil || mutate == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.day == "" {
+		// 账本还没绑定交易日（纯内存环境）：不落帧，避免写出 Day 为空的假帧。
+		s.mu.Unlock()
+		return
+	}
+	if s.funds == nil || s.funds.Day != s.day {
+		s.funds = &tLiveFunds{Day: s.day}
+	}
+	mutate(s.funds)
 	s.mu.Unlock()
 	if err := s.save(); err != nil {
 		log.Printf("[t-live] 资金帧落盘失败（本轮读数仅内存可见）：%v", err)

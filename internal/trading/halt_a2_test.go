@@ -81,14 +81,16 @@ func TestHaltAllReportsCancelFailures(t *testing.T) {
 	if res.Failed[0].OrderID != "GW-A2-2" || !strings.Contains(res.Failed[0].Reason, "409") {
 		t.Fatalf("失败明细应指向 GW-A2-2 且含网关原因, got %+v", res.Failed[0])
 	}
-	// 本地账本核验：撤成的推进为已撤；撤失败的保持原状（留给 SweepOrders/人工，不得假撤）
+	// 本地账本核验：撤成单进入「撤单中」（§CANCEL-STATE：请求已发出但交易所未确认，
+	// 不得直接落终态"已撤"——那正是 2026-10-28 600362 事故的成因）；
+	// 撤失败的保持原状（留给 SweepOrders/人工，不得假撤）。
 	statuses := map[string]string{}
 	orders, _ := db.RealOrdersForUser("u_a2")
 	for _, o := range orders {
 		statuses[o.OrderID] = o.Status
 	}
-	if statuses["GW-A2-1"] != "已撤" || statuses["GW-A2-3"] != "已撤" {
-		t.Fatalf("撤成单应落 已撤, got %+v", statuses)
+	if statuses["GW-A2-1"] != "撤单中" || statuses["GW-A2-3"] != "撤单中" {
+		t.Fatalf("撤成单应落 撤单中, got %+v", statuses)
 	}
 	if statuses["GW-A2-2"] != "已报" {
 		t.Fatalf("撤失败单本地不得被推进, got %s", statuses["GW-A2-2"])

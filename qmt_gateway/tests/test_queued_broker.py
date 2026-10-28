@@ -265,7 +265,11 @@ class TestQueuedHTTP(unittest.TestCase):
         self.assertEqual(state["positions"], [])
 
     def test_cancel_flow_via_bridge(self):
-        """撤单：/cancel → 桥取到 cancel 项 → cancel_result → 委托已撤。"""
+        """撤单：/cancel → 桥取到 cancel 项 → cancel_result → 「撤单中」→ 快照确认才「已撤」。
+
+        §CANCEL-STATE（2026-10-28）：撤单回报 ok=True 只代表"客户端受理了撤单请求"，
+        不是交易所确认。所以网关只推「撤单中」；终态要等券商委托表快照给出。
+        """
         self._bridge_online()
         status, body = self._req("POST", "/order", {
             "signal_id": "S3", "code": "600519.SH", "side": "买入",
@@ -283,10 +287,20 @@ class TestQueuedHTTP(unittest.TestCase):
         cancels = [i for i in pend["items"] if i["kind"] == "cancel"]
         self.assertEqual(len(cancels), 1)
         self.assertEqual(cancels[0]["order_id"], "999")
-        # 桥回报撤单成功
+        # 桥回报撤单成功（受理）
         status, _ = self._req("POST", "/dispatch/result", {
             "type": "cancel_result", "seq": cancels[0]["seq"], "ok": True, "err": ""})
         self.assertEqual(status, 200)
+        _, state = self._req("GET", "/state")
+        # 受理 ≠ 交易所确认：本地停在「撤单中」
+        self.assertEqual(state["orders"][0]["status"], "撤单中")
+        # 券商委托表快照给出终态（已撤）才推进
+        status, sbody = self._req("POST", "/dispatch/result", {
+            "type": "orders_snapshot", "synced": True, "data_ts": "2026-10-28 14:58:00",
+            "orders": [{"order_id": "999", "code": "600519.SH", "side": "买入",
+                        "status": "已撤", "price": 1510, "qty": 100,
+                        "remark": "S3", "created_at": "20261028140000"}]})
+        self.assertEqual(status, 200, sbody)
         _, state = self._req("GET", "/state")
         self.assertEqual(state["orders"][0]["status"], "已撤")
 

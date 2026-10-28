@@ -3480,11 +3480,13 @@ grep -qF 'BRIDGE_DIR = os.environ.get("QMT_BRIDGE_DIR") or r' "$BS" \
 	|| { echo '--- FAIL: §BRIDGE-PATH 桥目录不再读 QMT_BRIDGE_DIR（测试会话只能靠它指到临时目录）'; exit 1; }
 grep -qF 'or r"C:\qmt\quant-trading-v2\qmt_gateway"' "$BS" \
 	|| { echo '--- FAIL: §BRIDGE-PATH 桥目录默认值被改（广州那台机器没有这个环境变量，靠默认值接线上桥；改默认值＝seen 判重账本搬家）'; exit 1; }
-# ② 五个桥文件常量一律经 _p()（os.path.join）：数量必须正好 5。少一个就是那一处退回字面反斜杠相加，
+# ② 六个桥文件常量一律经 _p()（os.path.join）：数量必须正好 6。少一个就是那一处退回字面反斜杠相加，
 #    而"哪一处"正是要命的地方——report/seen 少一处就是资金通道被写到 CWD。
+#    （§CLOSE-RECON 2026-10-28 起第 6 个是 CLOSE_STATE_PATH：收盘对账按日幂等账本，
+#    与其余五个同目录同源；计数锁随本批同批同步，不许绕过 _p() 直拼。）
 PC=$(grep -c '= _p(' "$BS" || true)
-[ "$PC" = "5" ] \
-	|| { echo "--- FAIL: 走 _p() 拼路径的桥文件常量不是 5 个（读到 ${PC}；TRACE/REPORT/CFG/CMD/SEEN 必须同源一个目录）"; exit 1; }
+[ "$PC" = "6" ] \
+	|| { echo "--- FAIL: 走 _p() 拼路径的桥文件常量不是 6 个（读到 ${PC}；TRACE/REPORT/CFG/CMD/SEEN/CLOSE_STATE 必须同源一个目录）"; exit 1; }
 # ③ 负锁：字面反斜杠拼接不得复活（同 §SIGID-TRUNC 的"单一截断点"写法锁口径；注释里的说明文本不算）。
 if grep -n 'BRIDGE_DIR +' "$BS" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
 	echo '--- FAIL: 桥路径又出现 BRIDGE_DIR + 字符串相加（POSIX 上反斜杠不是分隔符，会在 CWD 造出带反斜杠的文件）'; exit 1
@@ -4535,8 +4537,11 @@ fi
 # 全量评价批（docs/FIX_PLAN_20260925EVE.md）第一波的落地锁，一物一锁防复活：
 # ① §A2 kill-switch 撤单失败明细：HaltAll 必须返回 HaltAllResult（成功数+失败数组，
 #    Failed 恒非 nil），量规 halt_cancel_fail_count 每轮覆写（含清零供 resolved），
-#    p1 规则+路由+HTTP/SSE 两腿+前端「笔未撤成」回显全在位——旧 `HaltAll() int`
+#    p1 规则+路由+HTTP/SSE 两腿+前端「笔撤单请求未发出」回显全在位——旧 `HaltAll() int`
 #    裸计数签名（「降级报成功」在安全闸上的最后残留）钉死为 0 次。
+#    措辞随 §CANCEL-STATE（2026-10-28）语义收窄同批更新：cancelled 现为"撤单请求已发出笔数"，
+#    failed 是"撤单请求根本没发出去"，故回显锁定字样改为「笔撤单请求未发出」——
+#    锁的是"失败明细必须点名笔数与单号"这件事，不是某句文案。
 # ② §B1 财务续传键：季度→期末日必须是显式映射表（0331/0630/0930/1231），旧三元
 #    嵌套（季度序号错放月份位 ⇒ Q3 键 YYYY0331 撞 Q1 真期被永久跳过）负锁为 0；
 #    装载器与夜间验证都必须按报告期打印 distinct 分布（COUNT(*) 单值看不见整季塌方）；
@@ -4574,8 +4579,8 @@ ev_chk "halt_cancel_failed 路由 RoutePush" "$(grep -Ec '"halt_cancel_failed":[
 ev_min "HTTP/SSE 腿消费失败明细（qmt.go HaltAllFailure）" "$(grep -c 'HaltAllFailure' internal/server/qmt.go || true)" "2"
 ev_chk "A2 后端用例文件在位" "$(test -f internal/trading/halt_a2_test.go && echo 1 || echo 0)" "1"
 ev_min "A2 用例数（主用例+全成功反证）" "$(grep -c '^func Test' internal/trading/halt_a2_test.go || true)" "2"
-ev_min "前端 Quant 页失败回显文案" "$(grep -c '笔未撤成' web/src/pages/Quant.jsx || true)" "1"
-ev_min "SSE 运维告警腿消费 failed 明细" "$(grep -c '笔未撤成' web/src/utils.js || true)" "1"
+ev_min "前端 Quant 页失败回显文案" "$(grep -c '笔撤单请求未发出' web/src/pages/Quant.jsx || true)" "1"
+ev_min "SSE 运维告警腿消费 failed 明细" "$(grep -c '笔撤单请求未发出' web/src/utils.js || true)" "1"
 
 # ── ② §B1 财务续传键 ──
 ev_chk "季度→期末日显式映射表（四值字面量唯一落点）" "$(grep -c 'QUARTER_END_MMDD = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}' scripts/load_finance.py || true)" "1"
@@ -16171,8 +16176,10 @@ grep -q 'func (s \*tLiveStore) setFunds' "$TS137" ||
 	fail137 "缺 setFunds（帧写完必须原子落盘）"
 grep -q 's.funds = nil // 跨日不复活' "$TS137" ||
 	fail137 "跨日 load 没有清资金帧（昨日读数会顶替今日“尚未定权”）"
-grep -q 'func (r \*tLiveRound) publishFunds' "$TL137" ||
-	fail137 "缺 publishFunds（引擎每轮不写帧，接口永远为空）"
+# §FUNDS-PUBLISH（2026-10-28 收官批）起发布点拆成双写者：T 侧 publishTFunds（原 publishFunds 改名，
+# 只写 T 侧字段）+ 信号仓侧 publishSignalFunds（打分循环，见 §139 发布点锁）。计数锁同批同步。
+grep -q 'func (r \*tLiveRound) publishTFunds' "$TL137" ||
+	fail137 "缺 publishTFunds（T 侧每轮不写帧，T 列读数永远为空）"
 grep -q 'targetCurRoom' "$TL137" ||
 	fail137 "缺 targetCurRoom（剩余空间必须有单一出口，不能展示/判定各算一套）"
 CNT137=$((CNT137 + 6))
@@ -16223,5 +16230,399 @@ CNT137=$((CNT137 + 1))
 echo "INFO - §137 覆盖面账：本批动态仓位快照只覆盖**实盘买入评估**（纸面通道的定权在 paper 侧另算，channel 列已预留 paper）；卖出裁决仍走 verdicts 留痕，未并入本表。资金帧由 T 循环每轮发布，T 循环未跑（停用/非交易时段）时 /api/funds/today 仍给 live.account 兜底，但不给 target/room（那是“没有帧”，不是 0）。"
 [ "$B137_FAILED" = "0" ] || exit 1
 echo "ok - §137 §FUNDS-TODAY + §DECISION-TODAY 锁通过（资金帧 6 + 接口 4 + 快照 8 + 前端 2 + 行为腿 1，累计判定点 ${CNT137}）"
+
+# §138 §CANCEL-STATE 撤单中状态机 + 禁挂/禁撤时段闸锁（2026-10-28）
+#
+# 事故本体（600362 江西铜业）：14:57:48 尾盘挂买单 → 15:00:03 想撤 → 撞上收盘集合竞价被交易所拒 →
+# 本地把「撤单请求被受理」记成「已撤」→ 实际成交既没有 fills 也没有持仓，委托行永远挂在已撤。
+# 两个洞必须一起堵，本段把它们钉死：
+#   ① 时段闸：禁挂 09:20-09:30/14:52-15:00、禁撤 09:20-09:30/14:57-15:00（北京时），
+#      窗口内**不发起**（不是发起后被拒——那会拿到一次"受理成功"的假回执）；
+#   ② 状态闸：撤单请求发出 ⇒「撤单中」（非终态，冻结照算），只有交易所回报/快照才转终态；
+#      「撤单中」退回在途态只认一条显式事件（§CANCEL-REJECT），迟到快照不许回退。
+# 另锁：在途谓词（冻结/待成交买单/可卖量/跨日清场）必须把「撤单中」算进去——撤单未确认前
+# 交易所仍可能成交，剔出冻结账＝低估敞口。
+# English: §CANCEL-STATE locks the session-window guard, the 撤单中 state machine, the
+# explicit-reject-only revert path, and the in-flight predicates that must count 撤单中.
+# ============================================================================
+echo "==> 138 §CANCEL-STATE 撤单中状态机 + 禁挂/禁撤时段闸..."
+B138_FAILED=0
+fail138() {
+	echo "--- FAIL: §138 $*"
+	FAIL=1
+	B138_FAILED=1
+}
+CNT138=0
+SG138=internal/trading/session_guard.go
+CFG138=internal/config/config.go
+CT138=internal/trading/controller.go
+RP138=internal/store/real_positions.go
+EG138=internal/engine/engine.go
+TL138=internal/engine/intraday_t_live.go
+SV138=internal/server/qmt.go
+ST138=qmt_gateway/store.py
+GW138=qmt_gateway/gateway.py
+QX138=web/src/pages/Quant.jsx
+
+# —— ① 时段闸：出厂窗口 + 判定器 + 配置项 + 两端接线 ——
+grep -qF 'DefaultNoCancelWindows = "09:20-09:30,14:57-15:00"' "$SG138" ||
+	fail138 "禁撤窗口默认值不是 09:20-09:30,14:57-15:00（owner 拍板口径漂了）"
+grep -qF 'DefaultNoNewOrderWindows = "09:20-09:30,14:52-15:00"' "$SG138" ||
+	fail138 "禁挂窗口默认值不是 09:20-09:30,14:52-15:00（owner 拍板口径漂了）"
+grep -qF 'func (sw *SessionWindows) CancelBlocked' "$SG138" ||
+	fail138 "缺 CancelBlocked（禁撤判定没有出口）"
+grep -qF 'func (sw *SessionWindows) NewOrderBlocked' "$SG138" ||
+	fail138 "缺 NewOrderBlocked（禁挂判定没有出口）"
+grep -qF 'func ErrNoCancelWindow' "$SG138" ||
+	fail138 "缺禁撤拒绝文案（前端要能直接展示给用户看）"
+grep -qF 'func ErrNoNewOrderWindow' "$SG138" ||
+	fail138 "缺禁挂拒绝文案"
+grep -qF 'NoCancelWindows string `json:"no_cancel_windows,omitempty"`' "$CFG138" ||
+	fail138 "配置项 no_cancel_windows 不在（窗口不可调＝出问题时只能改代码发版）"
+grep -qF 'NoNewOrderWindows string `json:"no_new_order_windows,omitempty"`' "$CFG138" ||
+	fail138 "配置项 no_new_order_windows 不在"
+grep -qF 'NoCancelWindows:   "09:20-09:30,14:57-15:00"' "$CFG138" ||
+	fail138 "配置出厂默认没落禁撤窗口"
+grep -qF 'NoNewOrderWindows: "09:20-09:30,14:52-15:00"' "$CFG138" ||
+	fail138 "配置出厂默认没落禁挂窗口"
+grep -qF 'return nil, ErrNoNewOrderWindow(label)' "$CT138" ||
+	fail138 "placeOrder 没挂禁挂闸（所有下单路径都从这里过，漏挂＝闸形同虚设）"
+grep -qF 'return ErrNoCancelWindow(label)' "$CT138" ||
+	fail138 "CancelOrder 没挂禁撤闸"
+grep -qF 'WindowSkipped int' "$CT138" ||
+	fail138 "禁撤窗口跳过的撤单笔数没有单列（想撤但撤不了会被算成“不需要撤”）"
+grep -qF '禁挂时段（' "$EG138" ||
+	fail138 "买入评估没接禁挂闸（禁挂时段仍会算出委托并发出）"
+grep -qF '禁挂时段（' "$TL138" ||
+	fail138 "T 回合没接禁挂闸（两腿串行时第一腿发出去第二腿被闸＝裸仓）"
+CNT138=$((CNT138 + 14))
+
+# —— ② 状态闸：撤单中状态 + 显式拒因唯一回退钥匙 + 202 语义 ——
+grep -qF 'func (d *DB) MarkRealOrderCancelRequested' "$RP138" ||
+	fail138 "缺 MarkRealOrderCancelRequested（撤单请求发出后本地行永远停在已报）"
+grep -qF "status='撤单中'" "$RP138" ||
+	fail138 "撤单请求没有把状态推进到撤单中"
+grep -qF 'cancel_requested_at' "$RP138" ||
+	fail138 "撤单留痕列不在（无法区分“我撤的等确认”与“系统撤的等确认”）"
+grep -qF 'case "撤单中":' "$RP138" ||
+	fail138 "秩表里没有撤单中（单调推进会把它当未知值处理）"
+grep -qF 'if next == "撤单中" {' "$RP138" ||
+	fail138 "推进矩阵没有「在途 → 撤单中」这一腿"
+grep -qF 'CANCEL_PENDING_STATUS = "撤单中"' "$ST138" ||
+	fail138 "网关没有撤单中状态常量"
+grep -qF 'CANCEL_REJECT_PREFIX = "§CANCEL-REJECT"' "$ST138" ||
+	fail138 "网关没有显式拒因钥匙（撤单中会被迟到快照无声回退，陷入“撤→还在途→再撤”循环）"
+grep -qF 'CANCEL_REJECT_LIMIT = 3' "$GW138" ||
+	fail138 "网关没有撤单被拒的连续轮次阈值（撤单中会被立刻判死或永不判死）"
+grep -qF 'writeJSON(w, 202, map[string]string{"ok": "1", "status": "撤单中"' "$SV138" ||
+	fail138 "手动撤单接口不是 202+撤单中（前端会继续把受理当撤成）"
+CNT138=$((CNT138 + 9))
+
+# —— ③ 在途谓词必须含撤单中（冻结/待成交买单/可卖量/跨日清场共 4 处）——
+N138=$(grep -c "status IN ('已报','部成','撤单中','已报待撤','部成待撤')" "$RP138" || true)
+[ "${N138:-0}" -ge 4 ] ||
+	fail138 "在途谓词只有 ${N138:-0} 处含撤单中（应 ≥4：冻结/待成交买单/可卖量/跨日清场；漏一处＝撤单未确认期间的敞口被低估）"
+CNT138=$((CNT138 + 1))
+
+# —— ④ 前端：撤单中要能看见、且不能重复撤 ——
+grep -qF "const CANCELABLE = new Set(['已报', '部成', '已报待撤', '部成待撤'])" "$QX138" ||
+	fail138 "CANCELABLE 集合被改动（撤单中必须不在可撤集合里：重复发撤单只会再被交易所拒一次）"
+grep -qF "st === '撤单中'" "$QX138" ||
+	fail138 "撤单中没有单独配色（操作者看不出这一行在等交易所确认）"
+grep -qF '等待交易所确认' "$QX138" ||
+	fail138 "撤单提示没有改成“等待交易所确认”（受理被当成撤成＝事故复发）"
+CNT138=$((CNT138 + 3))
+
+# —— 行为腿：Go 窗口闸/状态机 + 网关状态机 + 前端渲染，真跑 ——
+G138=$(go test ./internal/trading/ ./internal/store/ -count=1 -run 'TestSessionWindow|TestPlaceOrderBlockedInNoNewOrderWindow|TestPlaceOrderAllowedOutsideWindow|TestCancelOrderBlockedInNoCancelWindow|TestCancelOrderSuccessMarksCancelPending|TestSweepOrdersSkippedInNoCancelWindow|TestHaltAllStillAttemptsInNoCancelWindow|TestMarkRealOrderCancelRequested|TestCancelPending|TestCancelledTerminal' 2>&1 || true)
+grep_q '^ok' G138 ||
+	{ fail138 "§CANCEL-STATE Go 行为腿非绿：$(printf '%s\n' "$G138" | grep -E 'FAIL|_test\.go' | head -3 | tr '\n' ' ')"; }
+grep_q 'FAIL' G138 &&
+	fail138 "§CANCEL-STATE Go 行为腿出现 FAIL（上面的 ok 可能来自另一个包，不能只看 ok）"
+CNT138=$((CNT138 + 1))
+P138=$(py_tests qmt_gateway/tests/test_cancel_state.py 2>&1 || true)
+# 判读姿势（§114 V5 同坑）：pytest 的失败摘要是「1 failed, 8 passed」——**含 "passed"**，
+# 只 grep 'passed' 会把红读成绿。故正向锚必须落在行首「N passed」，并另设失败行反锁。
+grep_q '^[0-9]+ passed' P138 || grep_q '^OK' P138 ||
+	{ fail138 "§CANCEL-STATE 网关行为腿非绿：$(printf '%s\n' "$P138" | grep -E 'FAILED|FAIL:|Error' | head -3 | tr '\n' ' ')"; }
+grep_q 'failed|FAILED|ERROR|Traceback' P138 &&
+	fail138 "§CANCEL-STATE 网关行为腿出现失败行（摘要里的 passed 可能来自同批别的用例，不能只看 passed）"
+CNT138=$((CNT138 + 1))
+FX138=$( ( cd web && npm test -- cancel_state_20261028 --no-file-parallelism 2>&1 || true ) | sed $'s/\033\\[[0-9;]*m//g' )
+grep_q 'Tests +[0-9]+ passed' FX138 ||
+	{ fail138 "§CANCEL-STATE 前端行为腿非绿：$(printf '%s\n' "$FX138" | grep -E 'FAIL|failed' | head -3 | tr '\n' ' ')"; }
+grep_q 'FAIL' FX138 &&
+	fail138 "§CANCEL-STATE 前端行为腿出现 FAIL（摘要里的 passed 可能来自别的文件，不能只看 passed）"
+CNT138=$((CNT138 + 1))
+
+# —— 反证一枚（Go）：把镜像副本的尾盘禁撤窗口删掉，闸门必须不再拦（证明判据是承重的）——
+W138=$(mktemp -d /tmp/gate138-XXXXXX) || { echo "--- FAIL: §138 建不出反证工作目录"; exit 1; }
+mkdir -p "$W138/cntime" "$W138/trading"
+cp internal/cntime/cntime.go "$W138/cntime/cntime.go" || exit 1
+sed 's#quant-trading-v2/internal/cntime#gate138/cntime#' internal/trading/session_guard.go > "$W138/trading/session_guard.go" || exit 1
+printf 'module gate138\n\ngo 1.26\n' > "$W138/go.mod" || exit 1
+cat > "$W138/main.go" <<'GO138M'
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"gate138/cntime"
+	"gate138/trading"
+)
+
+func bj(h, m int) time.Time {
+	return time.Date(2026, 10, 28, h, m, 0, 0, cntime.Loc)
+}
+
+func main() {
+	sw := trading.DefaultSessionWindows()
+	cb, _ := sw.CancelBlocked(bj(14, 58))
+	nb, _ := sw.NewOrderBlocked(bj(14, 55))
+	cb2, _ := sw.CancelBlocked(bj(10, 0))
+	fmt.Printf("CANCEL_TAIL=%v NEWORDER_TAIL=%v CANCEL_MORNING=%v\n", cb, nb, cb2)
+}
+GO138M
+R138=$( ( cd "$W138" && GOTOOLCHAIN=local go run . 2>&1 ) || true )
+CNT138=$((CNT138 + 1))
+grep_q 'CANCEL_TAIL=true' R138 ||
+	fail138 "反证基线不成立：出厂窗口都没拦住 14:58 的撤单（镜子没跑起来）"
+# 变异：删掉尾盘禁撤窗口（09:20-09:30,14:57-15:00 → 09:20-09:30），闸门必须立刻不再拦
+python3 - "$W138/trading/session_guard.go" <<'PY138M'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = 'DefaultNoCancelWindows = "09:20-09:30,14:57-15:00"'
+new = 'DefaultNoCancelWindows = "09:20-09:30"'
+if s.count(old) == 1:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+PY138M
+V138=$( ( cd "$W138" && GOTOOLCHAIN=local go run . 2>&1 ) || true )
+CNT138=$((CNT138 + 1))
+grep_q 'CANCEL_TAIL=true' V138 &&
+	fail138 "反证失效：删掉尾盘禁撤窗口后闸门仍然拦——窗口常量没被真正判据吃进去"
+rm -rf "$W138"
+
+# —— 反证二枚（Python）：去掉显式拒因钥匙，撤单中必须能被无声回退（证明那把钥匙承重）——
+V138P=$(mktemp -d /tmp/gate138p-XXXXXX) || { echo "--- FAIL: §138 建不出反证工作目录"; exit 1; }
+cp -R qmt_gateway "$V138P/qmt_gateway" || exit 1
+python3 - "$V138P/qmt_gateway/store.py" <<'PY138N'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = 'return str(reason or "").startswith(CANCEL_REJECT_PREFIX)'
+new = 'return True'
+if s.count(old) == 1:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+PY138N
+R138P=$( ( cd "$V138P" && python3 -c 'import sys; sys.path.insert(0, "qmt_gateway")
+import store
+assert store.order_status_advance("撤单中", "已报", "") is False
+assert store.order_status_advance("撤单中", "已报", "§CANCEL-REJECT 撤单被拒: x") is True
+print("EXPECTED_FALSE")' ) 2>&1 || true )
+CNT138=$((CNT138 + 1))
+grep_q 'EXPECTED_FALSE' R138P &&
+	fail138 "反证失效：去掉 §CANCEL-REJECT 钥匙后撤单中仍不能被回退——那把钥匙没被真正判据吃进去"
+rm -rf "$V138P"
+
+echo "INFO - §138 覆盖面账：本段锁「撤单请求发出 ≠ 交易所撤成」与「窗口内不发起」两条主线；窗口按北京时判定（cntime），宿主机时区无关。紧急停止在禁撤窗口内**仍尝试**发出撤单请求（owner 拍板：停止的优先级高于窗口），失败明细照旧回显。旧状态字面量「已报待撤」「部成待撤」保留为别名识别，新写入只用「撤单中」；两套字面量的历史行仍能被正确归类。收盘回补（15:05 快照 + 次日 08:45 兜底）属另一批（§CLOSE-RECON），本段未锁。"
+[ "$B138_FAILED" = "0" ] || exit 1
+echo "ok - §138 §CANCEL-STATE 锁通过（时段闸 14 + 状态闸 9 + 在途谓词 1 + 前端 3 + 行为腿 3 + 反证 4 枚，累计判定点 ${CNT138}）"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §139 §FUNDS-PUBLISH + §CLOSE-RECON（2026-10-28）
+#
+# 三件事一起锁（它们是同一条链的两端）：
+#  ① 资金帧**信号仓侧发布点前移**（方案 §7.1 首日实测缺陷）：
+#     原先把资金帧挂在实盘 T 循环里，于是 sizing.t.enabled=false 或当天没做一笔 T 的日子，
+#     卡片永远是「今日尚未定权」——而信号仓的定权与 T 开不开毫无关系（盘中 stderr 明明有 MS=0.765）。
+#     修法：信号仓侧改由**打分循环**每轮发布（去重 10s），T 侧仍由 T 循环发布；
+#     两半各带自己的取数时刻（at / t_at），T 没跑时**保持上一帧**并标出新鲜度，不伪造 0；
+#     帧的写入必须是「读—改—写」（两侧各有写者，整帧覆盖会互相冲掉）。
+#  ② 目标/当前/剩余只有**一个公式**（信号仓帧与 T 额度共用），且 MS 的计算只有**一个出口**
+#     （短窗缓存）——同一轮里两个 MS 会让"卡片上的目标"与"实际开腿用的额度"对不上。
+#  ③ §CANCEL-STATE 入队侧兜底 + §CLOSE-RECON 收盘对账：
+#     禁撤窗口内**不发起**撤单（网关入队侧 + 桥执行侧两道闸，口径与 Go 侧同值）；
+#     桥在 15:01 做收盘快照（先做能力探针：定时线程读不到交易表就**不发**空快照，
+#     退化为次日 08:45 回补 + 告警），网关 /admin/status 暴露收盘快照观察位。
+# English: §139 locks the funds-frame publish split (signal side from the scoring loop, T side
+# from the T loop, each with its own timestamp), the single shared sizing formula, the enqueue-side
+# no-cancel backstop on both the gateway and the bridge, and the close-of-day reconciliation probe.
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 139 §FUNDS-PUBLISH + §CLOSE-RECON（资金帧发布点前移 + 入队侧窗口兜底 + 收盘对账）..."
+B139_FAILED=0
+fail139() {
+	echo "--- FAIL: §139 $*"
+	FAIL=1
+	B139_FAILED=1
+}
+CNT139=0
+FT139=internal/engine/funds_today.go
+TL139=internal/engine/intraday_t_live.go
+TS139=internal/engine/tlive_state.go
+SL139=internal/engine/scoring_loop.go
+BK139=qmt_gateway/broker.py
+BQ139=qmt_gateway/qmt_bridge_strategy.py
+GW139=qmt_gateway/gateway.py
+
+# —— ① 资金帧两侧分工与发布点 ——
+grep -qF 'func (e *Engine) publishSignalFunds' "$FT139" ||
+	fail139 "缺 publishSignalFunds（信号仓侧没有发布点，做 T 停用的日子又变成"尚未定权"）"
+grep -qF 'func (r *tLiveRound) publishTFunds' "$TL139" ||
+	fail139 "缺 publishTFunds（T 侧没有自己的写者）"
+grep -qF 'e.publishSignalFunds(e.primaryMember(), quotes)' "$SL139" ||
+	fail139 "打分循环没调用 publishSignalFunds（发布点没前移，T 没开的日子仍然没有资金帧）"
+grep -qF 'TAt string `json:"t_at"`' "$TS139" ||
+	fail139 "帧里没有 t_at（T 侧新鲜度无处透出，前端只能把陈旧数字当现状）"
+grep -qF 'func (s *tLiveStore) updateFunds' "$TS139" ||
+	fail139 "缺 updateFunds（整帧覆盖会让两侧写者互相冲掉）"
+N139=$(grep -c 'setFunds' "$TL139" || true)
+[ "${N139:-0}" -eq "0" ] ||
+	fail139 "T 侧仍在整帧覆盖写资金帧（setFunds 出现 ${N139} 次：会冲掉信号仓侧刚写的 MS/目标）"
+CNT139=$((CNT139 + 7))
+
+# —— ② 唯一公式与唯一 MS 出口 ——
+grep -qF 'func fundsTargetCurRoom' "$FT139" ||
+	fail139 "缺唯一的目标/当前/剩余公式（信号仓帧与 T 额度会各算一套）"
+grep -qF 'func (e *Engine) sizingContextFor' "$FT139" ||
+	fail139 "缺定权上下文的唯一出口（同一轮两个 MS ⇒ 卡片目标与开腿额度对不上）"
+grep -qF 'fundsTargetCurRoom(r.total, r.p.MarketScale, ceiling, r.positions, r.prices, pend, r.book)' "$TL139" ||
+	fail139 "T 侧没走共享公式（T 额度与资金卡不是同一套数）"
+grep -qF 'ctx := e.sizingContextFor(uid)' internal/engine/intraday_t.go ||
+	fail139 "T 参数解析没走定权上下文出口（同一轮两套 MS）"
+CNT139=$((CNT139 + 4))
+
+# —— ③ 入队侧窗口兜底（网关 + 桥）——
+grep -qF 'DEFAULT_NO_CANCEL_WINDOWS = "09:20-09:30,14:57-15:00"' "$BK139" ||
+	fail139 "网关侧禁撤窗口默认值不对（与 Go 侧 rules.qmt.no_cancel_windows 漂了）"
+grep -qF 'def no_cancel_window_now' "$BK139" ||
+	fail139 "网关侧没有窗口判定器"
+grep -qF 'def parse_session_windows' "$BK139" ||
+	fail139 "网关侧没有窗口解析器"
+grep -qF 'no_cancel_window_now(self.no_cancel_windows, _now_cn_minutes())' "$BK139" ||
+	fail139 "QueuedBroker.cancel 没挂窗口闸（窗口内仍把撤单排进队＝受理即注定被拒）"
+grep -qF 'DEFAULT_NO_CANCEL_WINDOWS = "09:20-09:30,14:57-15:00"' "$BQ139" ||
+	fail139 "桥侧禁撤窗口默认值与网关/Go 侧不一致"
+grep -qF 'def _no_cancel_window_at' "$BQ139" ||
+	fail139 "桥侧没有窗口判定器"
+grep -qF 'cancel refused (no-cancel window)' "$BQ139" ||
+	fail139 "桥侧执行撤单前没有窗口闸（命令已入队、窗口后开的那些单会被打出去）"
+CNT139=$((CNT139 + 7))
+
+# —— ④ 收盘对账（探针 + 快照 + 观察位）——
+grep -qF 'def close_snapshot_probe' "$BQ139" ||
+	fail139 "桥侧没有收盘对账探针（15:00-15:05 的成交永远回不来＝600362 复发）"
+grep -qF 'ContextInfo.run_time("close_snapshot_probe", "1nDay", CLOSE_SNAPSHOT_AT)' "$BQ139" ||
+	fail139 "桥侧没有注册 15:01 定时回调"
+grep -qF 'CLOSE_RECON_FALLBACK' "$BQ139" ||
+	fail139 "探针不可用时没有兜底告警（退化为次日回补但没人知道）"
+grep -qF 'CLOSE_SNAPSHOT day=' "$BQ139" ||
+	fail139 "收盘快照没有留痕行（运维看不见它跑没跑）"
+grep -qF 'payload["close_snapshot"]' "$GW139" ||
+	fail139 "网关 /admin/status 没有收盘快照观察位"
+# 桥文件必须纯 ASCII（QMT 的 GBK 沙箱会吃掉非 ASCII 字节）
+A139=$(python3 -c "
+import sys
+b = open('$BQ139','rb').read()
+print(sum(1 for c in b if c > 127))
+" 2>/dev/null || echo "-1")
+[ "${A139:-0}" -eq "0" ] ||
+	fail139 "桥文件含非 ASCII 字节（${A139} 个）——QMT 的 GBK 沙箱会把它吃掉"
+CNT139=$((CNT139 + 6))
+
+# —— 行为腿：Go 资金帧 + 网关/桥窗口与收盘对账 + 前端资金卡，真跑 ——
+G139=$(go test ./internal/engine/ -count=1 -run 'TestFunds' 2>&1 || true)
+grep_q '^ok' G139 ||
+	{ fail139 "§FUNDS-PUBLISH Go 行为腿非绿：$(printf '%s\n' "$G139" | grep -E 'FAIL|_test\.go' | head -3 | tr '\n' ' ')"; }
+grep_q 'FAIL' G139 &&
+	fail139 "§FUNDS-PUBLISH Go 行为腿出现 FAIL（ok 可能来自另一个包，不能只看 ok）"
+CNT139=$((CNT139 + 1))
+P139=$(py_tests qmt_gateway/tests/test_session_window_close_recon.py 2>&1 || true)
+# 判读姿势（§114 V5 同坑）：pytest 的失败摘要是「1 failed, 8 passed」——含 "passed"，
+# 只 grep 'passed' 会把红读成绿。故正向锚落在行首「N passed」，并另设失败行反锁。
+grep_q '^[0-9]+ passed' P139 || grep_q '^OK' P139 ||
+	{ fail139 "§CLOSE-RECON Python 行为腿非绿：$(printf '%s\n' "$P139" | grep -E 'FAILED|FAIL:|Error' | head -3 | tr '\n' ' ')"; }
+grep_q 'failed|FAILED|ERROR|Traceback' P139 &&
+	fail139 "§CLOSE-RECON Python 行为腿出现失败行（摘要里的 passed 可能来自同批别的用例）"
+CNT139=$((CNT139 + 1))
+FX139=$( ( cd web && npm test -- funds_publish_20261028 --no-file-parallelism 2>&1 || true ) | sed $'s/\033\\[[0-9;]*m//g' )
+grep_q 'Tests +[0-9]+ passed' FX139 ||
+	{ fail139 "§FUNDS-PUBLISH 前端行为腿非绿：$(printf '%s\n' "$FX139" | grep -E 'FAIL|failed' | head -3 | tr '\n' ' ')"; }
+grep_q 'FAIL' FX139 &&
+	fail139 "§FUNDS-PUBLISH 前端行为腿出现 FAIL（摘要里的 passed 可能来自别的文件）"
+CNT139=$((CNT139 + 1))
+
+# —— 反证一枚（Go 镜像）：把发布点挪回 T 循环，资金帧行为腿必须变红 ——
+W139=$(mktemp -d /tmp/gate139-XXXXXX) || { echo "--- FAIL: §139 建不出反证工作目录"; exit 1; }
+mkdir -p "$W139/mir/internal" "$W139/mir/cmd" "$W139/py" || { echo "--- FAIL: §139 镜像骨架建不出来"; exit 1; }
+for _e in "$PWD"/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	internal | cmd | web | qmt_gateway) continue ;;
+	esac
+	ln -s "$_e" "$W139/mir/$_b" || { echo "--- FAIL: §139 镜像软链 ${_b} 失败"; exit 1; }
+done
+for _e in "$PWD"/internal/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	engine) continue ;;
+	esac
+	ln -s "$_e" "$W139/mir/internal/$_b" || { echo "--- FAIL: §139 镜像软链 internal/${_b} 失败"; exit 1; }
+done
+for _e in "$PWD"/cmd/*; do
+	_b=$(basename "$_e")
+	case "$_b" in
+	quant) continue ;;
+	esac
+	ln -s "$_e" "$W139/mir/cmd/$_b" || { echo "--- FAIL: §139 镜像软链 cmd/${_b} 失败"; exit 1; }
+done
+cp -R "$PWD/internal/engine" "$W139/mir/internal/engine" || { echo "--- FAIL: §139 镜像实体化 internal/engine 失败"; exit 1; }
+cp -R "$PWD/cmd/quant" "$W139/mir/cmd/quant" || { echo "--- FAIL: §139 镜像实体化 cmd/quant 失败"; exit 1; }
+B139=$( ( cd "$W139/mir" && go test ./internal/engine/ -count=1 -run 'TestFundsSignalSidePublishedWithoutT|TestFundsPublishPointIsScoringLoop' 2>&1 ) || true )
+CNT139=$((CNT139 + 1))
+grep_q '^ok' B139 ||
+	{ echo "--- FAIL: §139 反证基线不成立：镜像里的资金帧行为腿就不是绿的（镜子没跑起来）"; rm -rf "$W139"; exit 1; }
+python3 - "$W139/mir/internal/engine/scoring_loop.go" <<'PY139M'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = "e.publishSignalFunds(e.primaryMember(), quotes)"
+new = "_ = e.primaryMember() // 反证：把发布点摘掉"
+if s.count(old) == 1:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+PY139M
+V139=$( ( cd "$W139/mir" && go test ./internal/engine/ -count=1 -run 'TestFundsSignalSidePublishedWithoutT|TestFundsPublishPointIsScoringLoop' 2>&1 ) || true )
+CNT139=$((CNT139 + 1))
+grep_q '^ok' V139 &&
+	fail139 "反证失效：摘掉打分循环的发布点后资金帧行为腿仍然绿——发布点没被真正判据吃进去"
+rm -rf "$W139"
+
+# —— 反证二枚（Python 镜像）：去掉桥侧窗口闸，窗口用例必须变红 ——
+V139P=$(mktemp -d /tmp/gate139p-XXXXXX) || { echo "--- FAIL: §139 建不出反证工作目录"; exit 1; }
+cp -R qmt_gateway "$V139P/qmt_gateway" || exit 1
+BASE139P=$( ( cd "$V139P" && python3 -m pytest -q qmt_gateway/tests/test_session_window_close_recon.py 2>&1 ) || true )
+CNT139=$((CNT139 + 1))
+grep_q '^[0-9]+ passed' BASE139P ||
+	{ echo "--- FAIL: §139 反证基线不成立：镜像里的窗口/收盘用例不是绿的（镜子没跑起来）"; rm -rf "$V139P"; exit 1; }
+python3 - "$V139P/qmt_gateway/qmt_bridge_strategy.py" <<'PY139N'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = 'blocked, wlabel = _no_cancel_window()'
+new = 'blocked, wlabel = (False, "")'
+if s.count(old) == 1:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+PY139N
+R139P=$( ( cd "$V139P" && python3 -m pytest -q qmt_gateway/tests/test_session_window_close_recon.py 2>&1 ) || true )
+CNT139=$((CNT139 + 1))
+# 变异必须让用例**变红**；仍然绿＝那道闸根本没被用例判据吃进去（反证失效）。
+grep_q 'failed' R139P ||
+	fail139 "反证失效：摘掉桥侧窗口闸后窗口用例仍然绿——那道闸没被真正判据吃进去"
+rm -rf "$V139P"
+
+echo "INFO - §139 覆盖面账：本段锁「信号仓侧发布点前移 + T 侧不伪造 0 + 目标公式唯一 + MS 出口唯一」与「入队侧窗口兜底（网关/桥两道）+ 收盘对账探针」两条主线。资金帧两侧各有写者（信号仓侧＝打分循环、T 侧＝T 循环），帧的写入是读—改—写，at/t_at 两个时刻戳分别透出两侧新鲜度。窗口按北京时间判定，网关/桥/Go 三处默认值必须同值（改一处要同批改三处）。收盘对账：桥 15:01 定时回调先探针（定时线程读不到交易表就不发空快照），可用则发一次收盘快照，不可用则退化为次日 08:45 回补 + 告警；网关 /admin/status 的 close_snapshot 是唯一现网观察位。"
+[ "$B139_FAILED" = "0" ] || exit 1
+echo "ok - §139 §FUNDS-PUBLISH + §CLOSE-RECON 锁通过（发布点 7 + 公式/MS 出口 4 + 入队兜底 7 + 收盘对账 6 + 行为腿 3 + 反证 2 枚，累计判定点 ${CNT139}）"
 
 echo "==> 全部通过"

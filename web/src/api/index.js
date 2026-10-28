@@ -1024,6 +1024,9 @@ export async function qmtHalt(halted) {
 /** 实盘：手动撤单（§R4-1/§U-2，仅未成交委托可撤；已成交/已撤回 409） */
 /** Live: manually cancel one order (unfilled only; terminal → 409) */
 // 对应 POST /api/qmt/cancel/{order_id}
+// §CANCEL-STATE（2026-10-28）：成功返回 **202 {ok:'1', status:'撤单中', order_id}**——
+// 受理撤单请求 ≠ 交易所已撤成（集合竞价/已成交会被拒），终态由回报/委托表快照推进。
+// 禁撤窗口内后端直接 409（不发请求），错误体含窗口标签。
 export async function qmtCancel(orderId) {
   return request('/api/qmt/cancel/' + encodeURIComponent(orderId), { method: 'POST', data: {} })
 }

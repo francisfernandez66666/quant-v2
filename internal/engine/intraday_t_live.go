@@ -283,6 +283,10 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 	r.capBase = math.Min(r.totalAssetsOf(db), holdValue)
 	r.book = st.bookValue(r.prices)
 	r.cash, r.cashOK = ctrl.AvailableCash()
+	// §CANCEL-STATE（2026-10-28）禁挂单窗口闸：T 的两腿是**串行**的（先买后卖或先卖后买），
+	// 第二腿若撞上窗口被拒，第一腿已经成交 → 裸腿（只买没卖/只卖没买），这是最坏的形态。
+	// 所以窗口闸必须落在"开第一腿之前"，而不是指望 PlaceOrder 逐腿兜住。
+	windowBlocked, windowLabel := ctrl.NewOrderBlockedByWindow(now)
 	blocked, blockWhy := r.dayLossBlocked()
 	r.dayBlocked = blocked
 	// 开新腿的许可：止血开关 / 方向都没配 / 影子期 / 关键输入缺失 / 熔断日 / 权益或资金口径不可得。
@@ -290,6 +294,8 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 	switch {
 	case !p.Enabled:
 		r.canOpen, r.openWhy = false, "t.enabled=false 一键止血：只推进在途腿，不开新腿"
+	case windowBlocked:
+		r.canOpen, r.openWhy = false, "禁挂时段（"+windowLabel+"）：交易所不接新委托，本轮不开新腿（避免两腿只成其一）"
 	case !p.BuyFirst && !p.SellFirst:
 		r.canOpen, r.openWhy = false, "t.mode 未放行任何方向"
 	case p.Shadow:
@@ -318,44 +324,45 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 		strategicBusy: r.strategicBusy,
 		oppositeLeg:   e.tLiveOppositeLeg,
 	}
-	// §FUNDS-TODAY：每轮把「信号仓 + T 仓」资金事实写成一帧落盘（接口只搬不算）。
+	// §FUNDS-TODAY：每轮把「T 侧」资金事实写成一帧落盘（接口只搬不算）。
 	// 放在读数源接好之后：这一帧描述的是"本轮真正要用来判定的那组数"，不是另取一套。
-	r.publishFunds()
+	r.publishTFunds()
 	return r, ""
 }
 
-// publishFunds 组装并落盘当日资金帧（信号仓 + T 仓）。
+// publishTFunds 组装并落盘当日资金帧的**T 侧**（信号仓侧由打分循环写，见 funds_today.go）。
+//
+// 分工（§FUNDS-TODAY 方案 §7.1）：
+//   - 信号仓侧（账户资金 + MS/目标/当前/剩余）：打分循环每轮发布（去重 10s）——
+//     它与做 T 开不开无关，挂在 T 循环上会让 sizing.t.enabled=false 的日子永远"尚未定权"；
+//   - T 侧（本函数）：额度/可用 T 现金/反 T 冻结/在途腿/当日 T 收益——只有 T 循环算得出来。
 //
 // 口径纪律：
 //   - 全部复用本轮已取好的读数（cash/total/book/targetCurRoom/cashForT/dayLedger），不在这里另算公式；
-//   - 账户冻结/市值取券商快照（含手动委托冻结），与"可用资金"同一张快照的 updated_at 一并透出，
-//     前端据此区分"金额没变"与"快照没更新"；
+//   - T 没跑时**不动** T 侧字段（保持上一帧并由 t_at 标出取数时刻），不伪造 0；
 //   - 每日清零：帧带 Day，跨日 load 不复活；新交易日首帧之前接口返回 null。
-func (r *tLiveRound) publishFunds() {
+func (r *tLiveRound) publishTFunds() {
 	if r == nil || r.st == nil {
 		return
 	}
-	target, cur, room, _ := r.targetCurRoom()
 	tQuota := 0.0
 	if ms := math.Min(r.p.MarketScale, 1.0); ms < 1 {
 		tQuota = r.total * (1 - ms)
 	}
 	cashT, _ := r.cashForT() // 口径不可得时回 0（cash_ok 字段已经说明"不可得"，不拿 0 冒充）
 	_, done, _, _, openNow, pnlNet, pnlGross := r.st.dayLedger()
-	var acc store.RealAccount
-	if a, err := r.db.GetRealAccount(r.uid); err == nil {
-		acc = a
-	}
-	r.st.setFunds(&tLiveFunds{
-		Day: r.day, At: r.now.Format(time.RFC3339),
-		Cash: r.cash, FrozenCash: acc.FrozenCash, TotalAsset: r.total,
-		MarketValue: acc.MarketValue, CashAt: acc.UpdatedAt, CashOK: r.cashOK,
-		Target: target, CurStrat: cur, Room: room,
-		MarketScale: r.p.MarketScale, MissingKey: r.p.MissingKeyInput,
-		TQuota: tQuota, CashT: cashT, TFrozenCash: r.book.FrozenCash,
-		OpenBuyLegs: r.book.BuyLegValue, OpenSellLegs: r.book.SellLegValue,
-		OpenLegs: openNow, DoneRounds: done,
-		PnlNet: pnlNet, PnlGross: pnlGross,
+	at := r.now.Format(time.RFC3339)
+	r.st.updateFunds(func(f *tLiveFunds) {
+		f.TAt = at
+		f.TQuota = tQuota
+		f.CashT = cashT
+		f.TFrozenCash = r.book.FrozenCash
+		f.OpenBuyLegs = r.book.BuyLegValue
+		f.OpenSellLegs = r.book.SellLegValue
+		f.OpenLegs = openNow
+		f.DoneRounds = done
+		f.PnlNet = pnlNet
+		f.PnlGross = pnlGross
 	})
 }
 
@@ -1393,39 +1400,14 @@ func (r *tLiveRound) strategicRoom() float64 {
 func (r *tLiveRound) targetCurRoom() (target, cur, room float64, ok bool) {
 	sc := r.e.sizingConfigFor(r.uid)
 	ceiling := sc.MaxTotalPositionPct
-	if ceiling <= 0 || ceiling > 1 {
-		ceiling = 1.0
-	}
-	ratio := math.Min(r.p.MarketScale, ceiling)
-	target = r.total * ratio
-	var strat float64
-	for code, pos := range r.positions {
-		px := r.prices[code]
-		if px <= 0 {
-			px = pos.CostPrice
-		}
-		strat += px * float64(pos.Qty)
-	}
-	// 在途战略买单（非 t0: 前缀）同样占用目标空间；T 腿由账本按净额口径给。
 	pend, err := r.db.PendingBuys(r.uid, data.TradingDayDate(r.now))
 	if err != nil {
-		// 在途读不到时不放大 T 额度，也不把战略空间当已花（与旧 strategicRoom 同口径）。
-		return target, strat, math.Max(0, target-strat), false
+		// 在途读不到时不放大 T 额度，也不把战略空间当已花（与旧 strategicRoom 同口径）：
+		// 这一分支**不套 T 腿净额**（旧实现是提前 return，腿净额在其后），保持口径逐字不变。
+		target, cur, room, _ = fundsTargetCurRoom(r.total, r.p.MarketScale, ceiling, r.positions, r.prices, nil, tLiveBook{})
+		return target, cur, room, false
 	}
-	for _, pb := range pend {
-		if pb.IntradayT {
-			continue
-		}
-		strat += pb.Price * float64(pb.Remain)
-	}
-	strat = strat - r.book.BuyLegValue + r.book.SellLegValue
-	if strat < 0 {
-		strat = 0
-	}
-	if target-strat > 0 {
-		room = target - strat
-	}
-	return target, strat, room, true
+	return fundsTargetCurRoom(r.total, r.p.MarketScale, ceiling, r.positions, r.prices, pend, r.book)
 }
 
 // ── 开腿与落账 ────────────────────────────────────────────────────────────────────────
