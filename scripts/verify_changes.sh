@@ -16756,7 +16756,17 @@ CNT140=$((CNT140 + 1))
 grep -qF '"types"' qmt_gateway/contract/order_fields.json ||
 	fail140 "契约 golden 缺少 types（类型漂移不会被发现）"
 
+# —— ⑬ 源码不得留明文凭据（§FIX-20261028-F00a） ——
+CNT140=$((CNT140 + 1))
+if grep -rqF 'Pass1234' --include='*.py' . 2>/dev/null; then
+	fail140 "*.py 里仍有明文口令字面量（聚宽凭据只许从 env 读）"
+fi
+CNT140=$((CNT140 + 1))
+if grep -rqF '17621136687' --include='*.py' . 2>/dev/null; then
+	fail140 "*.py 里仍有明文账号字面量（聚宽账号只许从 env 读）"
+fi
+
 [ "$B140_FAILED" = "0" ] || exit 1
-echo "ok - §140 §FIX-20261028 锁通过（跨账号 3 + 资金帧 2 + 桥 2 + 分码 2 + 观测面 3 + 收盘对账 2 + 自选 2 + 留痕 3 + 分页 2 + 删号 2 + 账本 2 + 契约 1，累计判定点 ${CNT140}）"
+echo "ok - §140 §FIX-20261028 锁通过（跨账号 3 + 资金帧 2 + 桥 2 + 分码 2 + 观测面 3 + 收盘对账 2 + 自选 2 + 留痕 3 + 分页 2 + 删号 2 + 账本 2 + 契约 1 + 源码凭据 2，累计判定点 ${CNT140}）"
 
 echo "==> 全部通过"
