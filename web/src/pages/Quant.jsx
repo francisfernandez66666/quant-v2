@@ -10,6 +10,8 @@
 //          settlement_diff/positions_clear_guard）驱动即时刷新 + 四类定时器 60s 兜底轮询
 //          （对齐 §F5 统一口径，替代原 链路状态/当日委托 10s、交易流水 30s 高频轮）；
 //          配置修改提交后待交易时段生效。
+//          §MANUAL-SYNC（2026-10-28）：当日委托里券商 App 手下的单以 ext:<委托号> 落账并标「手动」；
+//          状态由网关每 10s 与券商委托表对账推进，例行自动撤单不碰手动单（紧急停止仍全撤）。
 //          §M13（2026-09-22 修复批 K）：权限判定改走 api.isForbidden()（HTTP 状态码），
 //          且任一 admin 端点回 403 时立即停掉全部轮询定时器——成员停在本页不再持续刷 403 灌 opslog。
 // 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
@@ -1329,12 +1331,20 @@ export default function Quant() {
         {/* §M12-A（2026-09-22）资金三态横幅：口径不可得（对账回报超30分钟/未接账本）时自动买入
             已 fail-close 暂停——不提示的话运维侧只会看到"没有买入"，容易误判成没有信号。
             English: §M12-A banner — auto-buy is fail-closed while the cash basis is stale/unknown. */}
-        {state.cash_stale ? row('可用资金', <span style={{ fontSize: 12 }}>
-          <Tag theme="warning">口径不可得</Tag>
-          <span style={{ marginLeft: 8, color: 'var(--app-up)' }}>
-            对账回报过期，自动买入已暂停（手动下单不受影响）；最近原始值 {Number(state.cash || 0).toFixed(2)}
-          </span>
-        </span>) : null}
+        {/* §MANUAL-SYNC（2026-10-28）资金快照行：恒显示最近值与快照时刻——资金/持仓已 10s 一采，
+            只给「过期」横幅会让「没变化」与「没更新」分不清；cash_at 为空（未接账本/读失败）时不出时刻。
+            English: always render the cash basis with its snapshot timestamp so a static value is not
+            mistaken for a stalled feed; cash_at is omitted when the ledger is unavailable. */}
+        {row('可用资金', <span style={{ fontSize: 12 }}>
+          {state.cash_stale ? <Tag theme="warning">口径不可得</Tag> : null}
+          <span style={{ marginLeft: 8, color: 'var(--app-up)' }}>{Number(state.cash || 0).toFixed(2)}</span>
+          {state.cash_stale
+            ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>对账回报过期，自动买入已暂停（手动下单不受影响）</span>
+            : null}
+          {state.cash_at
+            ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>快照 {String(state.cash_at).slice(11, 19)}</span>
+            : null}
+        </span>)}
         {/* §U-2 kill-switch（人工紧急停止）状态与入口：置位=拒绝一切新单+撤销在途委托，立即生效 */}
         {row('紧急停止', <>
           {halted ? <Tag theme="danger">已置位</Tag> : <Tag theme="success">未启用</Tag>}
@@ -1371,7 +1381,16 @@ export default function Quant() {
      数据 10s 轮询（与链路状态同频）；成交推进依赖网关回报（order 事件单调状态机 §R4-4）。 */
   function renderOrdersCard() {
     const cols = [
-      { colKey: 'order_id', title: '委托号', width: 120, cell: ({ row }) => <span style={{ fontSize: 12 }}>{row.order_id}</span> },
+      { colKey: 'order_id', title: '委托号', width: 140, cell: ({ row }) => (
+        <span style={{ fontSize: 12 }}>
+          {row.order_id}
+          {/* §MANUAL-SYNC：券商 App 手动单以 ext:<委托号> 落账（网关从柜台委托表同步），
+              标记出来避免和系统单混淆；例行自动撤单不碰它们，紧急停止仍会全撤。 */}
+          {String(row.signal_id || '').startsWith('ext:')
+            ? <Tag size="small" theme="warning" style={{ marginLeft: 4 }}>手动</Tag>
+            : null}
+        </span>
+      ) },
       { colKey: 'code', title: '代码', width: 100 },
       { colKey: 'side', title: '方向', width: 70, cell: ({ row }) => <span style={{ color: row.side === '买入' ? 'var(--app-up)' : 'var(--app-down)' }}>{row.side}</span> },
       { colKey: 'price', title: '价格', width: 80 },
@@ -1388,7 +1407,7 @@ export default function Quant() {
     ]
     return (
       <Card title="当日委托" style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤）；未成交委托可撤，10s 刷新</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤），并每 10s 与券商当日委托表对账（手动单标记「手动」）；未成交委托可撤，10s 刷新</div>
         {/* §M-9（2026-09-22 修复批）三态分离：loading（orders==null 且无错误）/
             error（可重试提示，不再无限「加载中」）/ 空（今日暂无委托）/ 有数据（表格）。 */}
         {orders == null && ordersError ? (

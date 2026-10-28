@@ -1418,7 +1418,7 @@ func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string)
 	}
 	// §U-1：仅"严格更低秩"才视为回退并跳过；等秩（占位行与回填同为"已报"）放行——
 	// 这正是首次网关单号回填的唯一命中路径，旧 `<=` 把它误杀导致 order_id 永驻 pend:。
-	if orderStatusRank(status) < orderStatusRank(cur) {
+	if status != cur && !orderStatusAdvance(cur, status) {
 		return nil // 低秩回报晚到（已成/部成后被晚到的"已报"回填）：绝不回退真实进度
 	}
 	if userID == "" {
@@ -1594,12 +1594,12 @@ func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 }
 
 // orderStatusRank §R4-4 委托状态单调推进秩：回报乱序/重放时绝不回退真实进度。
-// 终态（已成/已撤/部撤/废单）秩最高；未报/待报视同初始已报。
+// 终态（已成/已撤/部撤/废单/已废）秩最高；未报/待报/发送失败/未知视同初始档。
 // English: §R4-4 monotonic rank for order-report statuses so out-of-order/replayed reports
 // never roll real progress back; terminal states rank highest.
 func orderStatusRank(status string) int {
 	switch status {
-	case "已成", "已撤", "部撤", "废单":
+	case "已成", "已撤", "部撤", "废单", "已废":
 		return 6
 	case "部成待撤":
 		return 4
@@ -1609,9 +1609,48 @@ func orderStatusRank(status string) int {
 		return 2
 	case "已报":
 		return 1
-	default: // 未报/待报/未知 → 初始档
+	default: // 未报/待报/发送失败/未知 → 初始档
 		return 1
 	}
+}
+
+// orderStatusAdvance §MANUAL-SYNC（2026-10-28）委托状态是否允许由 cur 推进到 next：
+// 秩守卫之外保留两条必须双向放行的真实语义例外，其余仍严格只升不降。
+//   - 已报 → 发送失败：券商委托表连续缺失/柜台未确认，是「其实没到券商」的新事实，
+//     放行后同日幂等键才能按发送失败重放（否则僵尸行永久占住预算）；
+//   - 发送失败 → 已报/部成：迟到的真实回报证明券商确有此单，停在发送失败反而会诱导重发；
+//   - 终态（已是成交/撤单/废单）永不被任何回报改写；
+//   - 「未知(…)」不冒充已知态、不覆盖任何已有状态。
+//
+// English: §MANUAL-SYNC — the monotonic guard plus the two legitimate bidirectional
+// transitions (accepted→send-failed and back) so a phantom "accepted" row can be corrected
+// in both directions while terminal rows stay immutable.
+func orderStatusAdvance(cur, next string) bool {
+	if cur == "" {
+		return true
+	}
+	if cur == next {
+		return false // 等秩重放不是推进（幂等 no-op）
+	}
+	if cur == "pending" || cur == "待核对" {
+		return true // 占位/待核对是瞬态，任何回报都该推进它
+	}
+	if orderStatusRank(cur) == 6 {
+		return false
+	}
+	if orderStatusRank(next) == 6 {
+		return true
+	}
+	if cur == "已报" && next == "发送失败" {
+		return true
+	}
+	if cur == "发送失败" && (next == "已报" || next == "部成") {
+		return true
+	}
+	if next == "发送失败" || strings.HasPrefix(next, "未知") {
+		return false
+	}
+	return orderStatusRank(next) > orderStatusRank(cur)
 }
 
 // AdvanceRealOrderStatus §R4-4 带单调守卫的委托状态推进（按 signal_id 定位）：
@@ -1636,7 +1675,7 @@ func (d *DB) AdvanceRealOrderStatus(userID, signalID, status string) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	if orderStatusRank(status) <= orderStatusRank(cur) {
+	if !orderStatusAdvance(cur, status) {
 		return false, nil // 乱序/重放/回退：忽略
 	}
 	var res sql.Result
@@ -1696,8 +1735,8 @@ func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
 	}
 	switch err {
 	case nil:
-		// 本地有行：仅高秩才推进（与 AdvanceRealOrderStatus 同守卫）。
-		if orderStatusRank(o.Status) <= orderStatusRank(cur) {
+		// 本地有行：仅允许推进（秩守卫 + 发送失败/已报两条例外，见 orderStatusAdvance）。
+		if !orderStatusAdvance(cur, o.Status) {
 			return OrderReportIgnored, nil // defer Rollback：无写入
 		}
 		if o.UserID == "" {
@@ -1758,7 +1797,7 @@ func (d *DB) UpdateRealOrderStatusMonotonic(userID, orderID, status string) (boo
 	if err != nil {
 		return false, err
 	}
-	if orderStatusRank(status) <= orderStatusRank(cur) {
+	if !orderStatusAdvance(cur, status) {
 		return false, nil
 	}
 	var res sql.Result

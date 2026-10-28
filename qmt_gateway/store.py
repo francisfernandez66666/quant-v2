@@ -80,6 +80,55 @@ def order_id_rank(oid):
     return 2
 
 
+# ── §MANUAL-SYNC 委托状态单调等级（2026-10-28）────────────────────────────────
+# 为什么网关自己的 orders 表也要秩守卫：券商委托表快照（orders_snapshot）会每 10s
+# 重放整本委托，迟到/乱序的低阶行不能把已成/已撤回退成已报，否则 Go 侧资金与可撤
+# 判定会跟着回退。口径与 internal/store/real_positions.go orderStatusRank 对齐，
+# 两个例外必须保留：
+#   ① 已报 → 发送失败：柜台委托表连续缺失/未确认，是「其实没到券商」的新事实；
+#   ② 发送失败 → 已报/部成：迟到的真实回报证明券商确实有这笔单（比停在发送失败更真）。
+_TERMINAL_STATUSES = ("已成", "已撤", "部撤", "废单", "已废")
+
+
+def order_status_rank(status):
+    """委托状态单调等级（越小越早，终态=6）。未登记值一律 0。"""
+    s = str(status or "")
+    if s in _TERMINAL_STATUSES:
+        return 6
+    if s == "部成":
+        return 5
+    if s == "部成待撤":
+        return 4
+    if s == "已报待撤":
+        return 3
+    if s == "已报":
+        return 2
+    if s in ("未报", "待报", "发送失败"):
+        return 1
+    return 0  # pending / 待核对 / 未知(...)
+
+
+def order_status_advance(cur, new):
+    """新状态 new 是否允许覆盖当前 cur（同状态允许刷新价/量，但绝不回退终态）。"""
+    cur = str(cur or "")
+    new = str(new or "")
+    if not cur or cur == new:
+        return True
+    if cur in ("pending", UNRESOLVED_STATUS):
+        return True  # 占位/待核对是瞬态，任何回报都该推进它
+    if cur in _TERMINAL_STATUSES:
+        return False  # 终态不再改写（含 已成 → 已撤 这类乱序）
+    if new in _TERMINAL_STATUSES:
+        return True
+    if cur == "已报" and new == "发送失败":
+        return True
+    if cur == "发送失败" and new in ("已报", "部成"):
+        return True
+    if new == "发送失败" or new.startswith("未知"):
+        return False
+    return order_status_rank(new) > order_status_rank(cur)
+
+
 class Store:
     """SQLite 账本。"""
 
@@ -457,6 +506,13 @@ class Store:
             final_oid = row["order_id"]
             if order_id_rank(new_oid) > order_id_rank(final_oid):
                 final_oid = new_oid
+            # §MANUAL-SYNC：状态同样只升不降（同状态允许刷新价/量）。快照腿每 10s 重放
+            # 整本委托表，没有这道守卫时一条迟到/乱序的低阶行会把已成/已撤改回已报。
+            new_status = order.get("status") or row["status"]
+            if not order_status_advance(row["status"], new_status):
+                log.warning("[store] 委托状态回退已拦截 signal=%s：%s -> %s（保留原状态）",
+                            sid, row["status"], new_status)
+                new_status = row["status"]
             self._conn.execute(
                 """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?, user_id=?
                    WHERE signal_id=?""",
@@ -464,7 +520,7 @@ class Store:
                 # user_id 缺省时回退存量值，qty 为 0 时保留存量（通道未报量≠清零）
                 (
                     final_oid,
-                    order.get("status", row["status"]),
+                    new_status,
                     float(order.get("price", 0) or row["price"] or 0),
                     int(order.get("qty", 0) or 0) or row["qty"] or 0,
                     order.get("created_at", "") or row["created_at"],
@@ -1140,6 +1196,44 @@ class Store:
                 "SELECT * FROM dispatch WHERE status = 'inflight' "
                 "AND COALESCE(NULLIF(inflight_at, ''), created_at) <> '' "
                 "AND CAST(strftime('%s', COALESCE(NULLIF(inflight_at, ''), created_at)) AS INTEGER) < ?",
+                (threshold,),
+            ).fetchall()
+            if not rows:
+                return []
+            for r in rows:
+                merged = {}
+                if r["result"]:
+                    try:
+                        merged.update(json.loads(r["result"]))
+                    except ValueError:  # noqa: BLE001 — 脏 result 行直接覆盖
+                        pass
+                merged.update({"ok": False, "err": reason, "reaped": True})
+                self._conn.execute(
+                    "UPDATE dispatch SET status='done', result=? WHERE id=?",
+                    (json.dumps(merged, ensure_ascii=False, default=json_default), r["id"]))
+            self._conn.commit()
+            return [dict(r) for r in rows]
+
+    def dispatch_reap_stale_pending(self, max_age_sec, reason="pending 超时未下发，网关收割"):
+        """§MANUAL-SYNC（2026-10-28）：收割从未被桥取走的 pending 派发项。
+
+        缺陷：运行期只收割 inflight（§M16），`pending` 行没有任何超时出口——命令文件
+        连续写失败（§P2-G）或桥长期离线时，这些单永远停在 pending，同 signal_id 的
+        重试在 dispatch_enqueue_order 的 NOT EXISTS 判重上恒得 500，表现为「前端有单、
+        券商没有、新买入发不下去」。此处按 created_at 超龄把它们判 done（不重排，
+        绝不回到 pending），由网关调用方回写量仔「发送失败」（柜台确无此单）。
+        返回被收割行的结算前快照列表。max_age_sec<=0 表示关闭。
+        English: reaps dispatch rows stuck in `pending` (never consumed by the bridge);
+        they are settled as failed, never re-queued, so the same signal can be retried
+        and the stuck "accepted but the broker never saw it" row stops hanging.
+        """
+        import time as _time  # noqa: PLC0415
+        threshold = (_time.time() - max_age_sec) if max_age_sec > 0 else 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dispatch WHERE status = 'pending' "
+                "AND created_at <> '' "
+                "AND CAST(strftime('%s', created_at) AS INTEGER) < ?",
                 (threshold,),
             ).fetchall()
             if not rows:

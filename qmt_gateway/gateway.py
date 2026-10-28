@@ -314,6 +314,15 @@ class Gateway:
         # §CLAIMRELEASE 第三态「待核对」告警的去重集（同一 signal_id 每进程只主动 error 一次，
         # 之后由 /admin/status 与超龄巡检持续可见）——巡检 60s 一轮，无去重会刷屏。
         self._unresolved_alerted = set()
+        # §MANUAL-SYNC（2026-10-28）券商当日委托表快照 + 消失计数：
+        #   _orders_snap 缓存最新快照（by_id 供成交方向背书），
+        #   _order_miss 记录"本地在途但柜台表里连续没看见"的次数（达到阈值才判终态）。
+        self._orders_snap = {"by_id": {}, "ts": 0.0, "data_ts": "", "n": 0}
+        self._order_miss = {}
+        self._orders_snap_skipped_unknown = 0
+        # §M-3/§MANUAL-SYNC 未确认单观察项：signal_id -> 首次判未确认的时刻。
+        # 委托表快照里一旦出现它的 remark 就消项；宽限期内始终没出现 → 回写发送失败。
+        self._order_unconfirmed = {}
 
     def switch_broker(self, key, reason=""):
         """原子切换 active 通道（xt/queued/mock）。返回 (ok:bool, err:str)。"""
@@ -793,7 +802,47 @@ class Gateway:
         # 放在这里而不是新开线程：巡检本来就是"本地占位体检"的唯一收敛点，两条共用 60s 节奏，
         # 且第三态绝不能被上面的 release 顺手清掉——两条 SQL 的 status 谓词天然互斥。
         self._alert_unresolved_pending(where or "周期巡检")
+        # §MANUAL-SYNC：派发队列里从未被桥取走的 pending 行也要有出口，否则同 signal_id
+        # 的重试在 enqueue 判重处恒 500（前端有单、券商没有、新买入发不出去）。
+        try:
+            self._reap_stale_pending_dispatch(where or "周期巡检")
+        except Exception:  # noqa: BLE001 — 收割失败不影响其余巡检，下轮重试
+            log.exception("[gateway] §MANUAL-SYNC pending 派发收割失败")
         return n
+
+    def _reap_stale_pending_dispatch(self, where=""):
+        """§MANUAL-SYNC（2026-10-28）：收割从未被桥取走的 pending 派发项。
+
+        pending 行意味着命令还在网关侧、桥从未取走（§P2-G 写文件失败 / 桥长期离线），
+        所以柜台确定没有这笔单：判 done 后回写量仔「发送失败」（可重试），绝不回到
+        pending（重排＝可能是重复下单）。阈值 dispatch_pending_reap_sec，<=0 关闭。
+        English: settles dispatch rows still pending past the timeout as failed (never
+        re-queued), which unblocks same-signal retries and the stuck budget row.
+        """
+        sec = int(self.cfg.get("dispatch_pending_reap_sec", 600) or 0)
+        if sec <= 0:
+            return 0
+        reason = "pending 超时（>%ds）未被桥取走，网关收割（§MANUAL-SYNC%s）" % (
+            sec, ("，" + where) if where else "")
+        rows = self.store.dispatch_reap_stale_pending(sec, reason=reason)
+        for r in rows:
+            log.warning("[gateway] §MANUAL-SYNC 收割超龄 pending 派发项 seq=%s kind=%s signal=%s code=%s",
+                        r.get("seq"), r.get("kind"), r.get("signal_id"), r.get("code"))
+            if r.get("kind") == "order" and r.get("signal_id"):
+                ts = _now_cn()
+                try:
+                    # 「发送失败」是唯一能解开同 signal_id 幂等的可重试终态（Go 侧
+                    # ResetFailedRealOrder 只放行发送失败 / 零成交已撤）。
+                    self.handler.on_order({
+                        "order_id": r.get("order_id") or r.get("seq"), "signal_id": r.get("signal_id"),
+                        "code": r.get("code"), "side": r.get("side"), "status": "发送失败",
+                        "reason": reason,
+                        "price": float(r.get("price", 0) or 0), "qty": int(r.get("qty", 0) or 0),
+                        "created_at": r.get("created_at") or ts, "at": ts,
+                    })
+                except Exception:  # noqa: BLE001 — 回写失败已有派发判废留痕，不阻断其余收割
+                    log.exception("[gateway] §MANUAL-SYNC pending 收割回写失败 seq=%s", r.get("seq"))
+        return len(rows)
 
     def _alert_unresolved_pending(self, where=""):
         """§CLAIMRELEASE 第三态「待核对」占位的滞留告警：**只告警、绝不自动删行**。
@@ -1156,6 +1205,8 @@ class Gateway:
                 return 200, {"ok": True, "err": ""}
             if etype == "order_result":
                 return self._apply_order_result(req)
+            if etype == "orders_snapshot":
+                return self._apply_orders_snapshot(req)
             if etype == "cancel_result":
                 return self._apply_cancel_result(req)
             if etype == "trade":
@@ -1170,6 +1221,233 @@ class Gateway:
         except Exception as e:  # noqa: BLE001
             log.exception("[gateway] dispatch result failed: %s", etype)
             return 500, {"ok": False, "err": "dispatch result error: %s" % e}
+
+    # §MANUAL-SYNC：本地在途单在柜台委托表里连续缺失多少次才判终态（6×10s≈60s 宽限，
+    # 避免刚报出去/刚撤掉的单被下一轮快照误杀）。
+    ORDER_MISS_LIMIT = 6
+
+    def _apply_orders_snapshot(self, req):
+        """§MANUAL-SYNC（2026-10-28）券商当日委托表快照：补手动单 / 推进我方单 / 收敛消失单。
+
+        为什么需要这条腿：委托状态此前只有推送（回调动/桥回执）。手动在券商 App 下单或
+        撤单不会产生任何回报；桥只在动笔后 8s 查一次 ORDER，之后只轮成交。结果是本地行
+        永远停在「已报」，继续占住买入冻结额度与同票同日幂等键，新买入被门控拦死。
+        ORDER 表是柜台自己的当日委托账（账号级），每 10s 全量拉一次即可让两侧收敛。
+
+        安全边界（宁可晚收敛，绝不误杀真实在途单）：
+          - synced=false（查询失败）→ 只告警，本轮不推进、不判定消失；
+          - 空快照 → 不判定消失（"今天没委托"与"会话没同步"在桥上不可区分）；
+          - 消失判定附加条件：当日单 + 连续缺失 ≥ ORDER_MISS_LIMIT 次 + order_id 是真实
+            交易所单号（pending:/seq: 占位从未到券商，不在本函数职责内）；
+          - 消失时的终态按已成交量决定：满量→已成、部分→部撤、零量→已撤。
+        English: reconciles the counter's own ORDER table (account scoped) against the local
+        book — adopts hand-placed orders under ext:<order_id>, advances statuses through the
+        monotonic guard, and closes rows that keep missing from a trusted snapshot. This is
+        the only way to observe a hand-cancel, which produces no callback at all.
+        """
+        rows = req.get("orders") or []
+        if req.get("synced") is False:
+            log.warning("[gateway] §MANUAL-SYNC 委托表快照未同步（查询失败），本轮不推进状态、不做消失判定")
+            return 200, {"ok": True, "err": ""}
+        by_id = {}
+        for r in rows:
+            oid = str((r or {}).get("order_id", "") or "")
+            if oid:
+                by_id[oid] = r
+        self._orders_snap = {
+            "by_id": by_id, "ts": time.time(),
+            "data_ts": str(req.get("data_ts", "") or ""), "n": len(by_id),
+        }
+        for oid, r in by_id.items():
+            self._order_miss.pop(oid, None)
+            try:
+                self._apply_order_snapshot_row(oid, r)
+            except Exception:  # noqa: BLE001 — 单行失败不拖垮整轮快照
+                log.exception("[gateway] §MANUAL-SYNC 快照行应用失败 oid=%s", oid)
+        try:
+            self._resolve_missing_orders(by_id)
+        except Exception:  # noqa: BLE001
+            log.exception("[gateway] §MANUAL-SYNC 消失对账失败")
+        return 200, {"ok": True, "err": ""}
+
+    @staticmethod
+    def _norm_snap_created(raw):
+        """柜台时间串 → 量仔口径 "YYYY-MM-DD HH:MM:SS"。
+
+        为什么必须归一：桥的 m_strInsertDate 是 8 位紧凑日期（20261028），而量仔的
+        「当日委托」过滤、在途冻结/日期作用域全部按 "YYYY-MM-DD" 前缀匹配——
+        不转格式，手动单会落库但永远不出现在列表里、也不进冻结账（看起来就像没回传）。
+        """
+        s = str(raw or "").strip()
+        if not s:
+            return ""
+        head = s[:8]
+        if len(s) >= 8 and head.isdigit():
+            rest = s[8:].strip().replace("T", " ").strip()
+            if not rest:
+                rest = "00:00:00"
+            elif rest.isdigit():
+                rest = rest.zfill(6)[:6]
+                rest = "%s:%s:%s" % (rest[:2], rest[2:4], rest[4:6])
+            return "%s-%s-%s %s" % (head[:4], head[4:6], head[6:8], rest)
+        return s
+
+    def _apply_order_snapshot_row(self, oid, r):
+        """快照行 → 委托事件：归因（备注 wire 形态 → 派发项前缀 → 交易所委托号），
+        命中派发项用派发方向（权威），未命中按手动单挂 ext:<委托号>。状态未变化不重推。"""
+        code = str(r.get("code", "") or "")
+        remark = str(r.get("remark", "") or "")
+        created = self._norm_snap_created(r.get("created_at", ""))
+        day = created[:10]
+        status = str(r.get("status", "") or "")
+        if not status or status.startswith("未知"):
+            # 读不懂的状态不冒充任何已知态（§W7-C 同姿势），计数留痕等人工核对
+            self._orders_snap_skipped_unknown += 1
+            log.warning("[gateway] §MANUAL-SYNC 委托表状态不可读，跳过 oid=%s code=%s status=%s",
+                        oid, code, status)
+            return
+        drow = None
+        if remark:
+            drow = self.store.dispatch_by_signal_id(remark)
+            if drow is None:
+                drow, _why = self.store.dispatch_by_signal_prefix(remark, code, day)
+        if drow is None:
+            drow = self.store.dispatch_by_order_id(oid)
+        if drow:
+            sid = str(drow.get("signal_id", "") or "")
+            if not sid:
+                return
+            # 柜台委托表里出现了这笔单 → 未确认观察项消项（§M-3 自我纠正）
+            self._order_unconfirmed.pop(sid, None)
+            side = str(drow.get("side", "") or r.get("side", "") or "")
+        else:
+            # 手动单：xt/Go 侧手工单的既有约定就是 ext:<order_id>（orders.signal_id UNIQUE），
+            # 两侧同形，后续状态推进与撤单都按同一把键收敛。
+            sid = "ext:" + oid
+            side = str(r.get("side", "") or "")
+        # order_by_signal 返回 sqlite3.Row（按下标/列名取值，没有 .get）
+        cur = self.store.order_by_signal(sid)
+        if (cur is not None and str(cur["status"] or "") == status
+                and str(cur["order_id"] or "") == oid):
+            return  # 状态与单号都没变：快照重放，不重复上报
+        reason = ""
+        if status in ("已撤", "部撤", "废单"):
+            reason = "§MANUAL-SYNC 券商委托表状态=%s" % status
+        self.handler.on_order({
+            "order_id": oid, "signal_id": sid, "code": code, "side": side,
+            "status": status,
+            "price": float(r.get("price", 0) or 0),
+            "qty": int(r.get("qty", 0) or 0),
+            "created_at": created or _now_cn(),
+            "reason": reason, "at": _now_cn(),
+        })
+
+    def _resolve_missing_orders(self, by_id):
+        """本地「在途」单在可信快照里连续缺失 → 按成交量落终态（§MANUAL-SYNC）。
+
+        为什么需要：手动撤单没有回报，行会永远停在已报；另外「网关已受理、柜台其实
+        没有这笔单」的形态也只有靠柜台委托表证伪。判定条件见 _apply_orders_snapshot。
+        """
+        if not by_id:
+            log.info("[gateway] §MANUAL-SYNC 委托表快照为空，跳过消失判定（不可信快照）")
+            return
+        limit = int(self.cfg.get("manual_sync_miss_limit", self.ORDER_MISS_LIMIT) or 0)
+        if limit <= 0:
+            return  # 运维可关闭消失判定（只保留"补齐/推进"，不做终态收敛）
+        today = _now_cn()[:10]
+        for row in self.store.list_orders():
+            oid = str(row.get("order_id", "") or "")
+            status = str(row.get("status", "") or "")
+            if status not in ("已报", "部成", "已报待撤", "部成待撤"):
+                self._order_miss.pop(oid, None)
+                continue
+            if not oid or oid.startswith("pending:") or oid.startswith("seq:"):
+                continue  # 占位引用本就不在券商表里：交给 §M16 / pending 收割
+            if str(row.get("created_at", "") or "")[:10] != today:
+                continue
+            if oid in by_id:
+                continue
+            n = self._order_miss.get(oid, 0) + 1
+            self._order_miss[oid] = n
+            if n < limit:
+                continue
+            qty = int(row.get("qty", 0) or 0)
+            try:
+                filled = int(self.store.order_filled_qty(oid) or 0)
+            except Exception:  # noqa: BLE001
+                filled = 0
+            if qty > 0 and filled >= qty:
+                new_status = "已成"
+            elif filled > 0:
+                new_status = "部撤"
+            else:
+                new_status = "已撤"
+            reason = "§MANUAL-SYNC 券商委托表连续 %d 次缺失（疑似手动撤单/柜台未受理）" % n
+            log.warning("[gateway] §MANUAL-SYNC 委托在柜台委托表中消失 oid=%s signal=%s code=%s "
+                        "本地=%s（已成交 %d/%d）→ %s",
+                        oid, row.get("signal_id"), row.get("code"), status, filled, qty, new_status)
+            self.handler.on_order({
+                "order_id": oid, "signal_id": row.get("signal_id", ""),
+                "code": row.get("code", ""), "side": row.get("side", ""),
+                "status": new_status,
+                "price": float(row.get("price", 0) or 0), "qty": qty,
+                "created_at": row.get("created_at", "") or _now_cn(),
+                "reason": reason, "at": _now_cn(),
+            })
+            self._order_miss.pop(oid, None)
+        self._resolve_unconfirmed_orders(by_id)
+
+    def _resolve_unconfirmed_orders(self, by_id):
+        """§M-3/§MANUAL-SYNC：未获柜台确认的单，宽限期后收敛为「发送失败」。
+
+        为什么需要：桥的 passorder 不抛异常就报 ok，但柜台可能事后拒单；这类单的
+        order_result 已经结算（§M16 的 inflight 收割够不到），如果没有这条出口，
+        本地行会永挂「已报」——既占买入冻结，又把同票同日的幂等键占死，新买入被拦。
+        安全边界：
+          - 只在可信（非空）快照轮次里判，且给宽限期（默认 60s）等柜台入表；
+          - 快照里若存在「同代码+同方向+同数量」的无备注行，无法证伪就不收敛
+            （remark 可能被柜台吞掉，宁可留待人工也不误判成未到券商）；
+          - 只回写可重试的「发送失败」，绝不重发。
+        English: after a grace window, an order the counter never confirmed is settled as
+        send-failed (retryable) unless an unattributed same-shape row exists in the snapshot.
+        """
+        grace = float(self.cfg.get("manual_sync_unconfirmed_grace_sec", 60) or 0)
+        if grace <= 0 or not self._order_unconfirmed:
+            return
+        now = time.time()
+        # 无备注（无法归因）的柜台行指纹集：能对上就不许判"未到券商"
+        unattributed = set()
+        for r in by_id.values():
+            if str(r.get("remark", "") or ""):
+                continue
+            unattributed.add((str(r.get("code", "") or ""), str(r.get("side", "") or ""),
+                              int(r.get("qty", 0) or 0)))
+        for sid, since in list(self._order_unconfirmed.items()):
+            if now - since < grace:
+                continue
+            row = self.store.order_by_signal(sid)
+            if row is None:
+                self._order_unconfirmed.pop(sid, None)
+                continue
+            status = str(row["status"] or "")
+            if status not in ("已报", "已报待撤"):
+                self._order_unconfirmed.pop(sid, None)
+                continue
+            fp = (str(row["code"] or ""), str(row["side"] or ""), int(row["qty"] or 0))
+            if fp in unattributed:
+                continue  # 证伪不了：柜台有同形无备注行，留人工核对
+            reason = ("§MANUAL-SYNC 柜台委托表 %d 秒内始终没有这笔委托且下单未获确认，"
+                      "视为未到券商（可重试）" % int(grace))
+            log.warning("[gateway] §MANUAL-SYNC 未确认单收敛为发送失败 signal=%s order=%s code=%s",
+                        sid, row["order_id"], row["code"])
+            self.handler.on_order({
+                "order_id": row["order_id"], "signal_id": sid,
+                "code": row["code"], "side": row["side"], "status": "发送失败",
+                "price": float(row["price"] or 0), "qty": int(row["qty"] or 0),
+                "created_at": row["created_at"] or _now_cn(),
+                "reason": reason, "at": _now_cn(),
+            })
+            self._order_unconfirmed.pop(sid, None)
 
     def _apply_order_result(self, req):
         """下单结果回报：结算派发项；ok→已报（回填交易所委托号），失败→已废（带拒因）。
@@ -1215,6 +1493,14 @@ class Gateway:
             return 200, {"ok": True, "err": ""}
         ts = _now_cn()  # §TZ
         if ok:
+            # §MANUAL-SYNC：下单被客户端受理但柜台 ORDER 表没见到这笔单（§M-3 未确认），
+            # 记一笔带时刻的观察项——后续每轮委托表快照里若始终没有它的 remark，就在
+            # 宽限期后回写「发送失败」解锁同 signal 重试（否则这行会永挂已报：
+            # order_result 已结算，§M16 的 inflight 收割也够不到它）。
+            if not confirmed:
+                self._order_unconfirmed[signal_id] = time.time()
+            else:
+                self._order_unconfirmed.pop(signal_id, None)
             if not confirmed:
                 log.warning("[gateway] §M-3 委托腿未获柜台确认 seq=%s signal=%s code=%s side=%s "
                             "ref=%s —— 上报 reason 已标注未确认，状态字面量保持已报（见 §M-3 说明）",
@@ -1374,7 +1660,28 @@ class Gateway:
         # 也不许再出现"静默采信猜测"）。命中者显式剥除该键——既有已证路径的字段面零变化。
         # English: only a dispatch row carrying a side can vouch for the direction; anything
         # else is marked side_unverified and routed to the unresolved channel (positions untouched).
-        _side_vouched = bool(drow) and bool(str((drow or {}).get("side", "") or ""))
+        #
+        # §MANUAL-SYNC（2026-10-28）手动成交回传：未命中派发行的成交此前一律进「待核对」，
+        # 于是券商 App 里手买的票永远不进成交/盈亏账。现在补一个**独立第二来源**：
+        # 券商委托表里同一委托号的方向若与成交行推断方向一致（两个柜台字段族互相印证，
+        # 不是单源猜测），就按外部成交入账，信号键用 ext:<委托号>（与 Go 侧手工单占位键同形）。
+        # 两源不一致/查不到 → 维持待核对（绝不拿单源猜测动持仓账）。
+        _manual_vouched = False
+        if drow is None:
+            _moid = str(req.get("order_id", "") or "")
+            _msnap = (self._orders_snap.get("by_id") or {}).get(_moid) or {}
+            _minferred = str(req.get("side", "") or "")
+            _mside = str(_msnap.get("side", "") or "")
+            if (_moid and _minferred in ("买入", "卖出") and _mside == _minferred):
+                _manual_vouched = True
+                req["signal_id"] = "ext:" + _moid
+                if not req.get("code"):
+                    req["code"] = _msnap.get("code", "")
+                log.info("[gateway] §MANUAL-SYNC 外部（手动）成交入账：oid=%s code=%s side=%s qty=%s"
+                         "（委托表方向与成交行一致）",
+                         _moid, req.get("code"), _minferred, req.get("qty"))
+        _side_vouched = (bool(drow) and bool(str((drow or {}).get("side", "") or ""))) \
+            or _manual_vouched
         if _side_vouched:
             req.pop("side_unverified", None)
         else:
@@ -1489,6 +1796,16 @@ class Gateway:
         payload["unknown_status"] = {
             "total": int(getattr(self.handler, "unknown_status_total", 0) or 0),
             "last": str(getattr(self.handler, "last_unknown_status", "") or ""),
+        }
+        # §MANUAL-SYNC 观察位：委托表快照是否在跑、最新快照行数/时刻、跳过多少不可读状态。
+        # 「快照 n=0 且盘中有我方在途单」＝桥侧 ORDER 表不可见（会话未同步/构建差异），
+        # 是手动单无法回传的唯一外部前提，必须能一眼看到。
+        payload["orders_sync"] = {
+            "snapshot_n": int(self._orders_snap.get("n", 0) or 0),
+            "snapshot_ts": str(self._orders_snap.get("data_ts", "") or ""),
+            "miss_pending": len(self._order_miss),
+            "unknown_status_skipped": int(self._orders_snap_skipped_unknown),
+            "miss_limit": int(self.cfg.get("manual_sync_miss_limit", self.ORDER_MISS_LIMIT) or 0),
         }
         return 200, payload
 
@@ -1810,6 +2127,9 @@ class Gateway:
         }
         # §QMT-DUAL 透出 active 通道名，便于量仔/前端展示当前执行路径
         payload["broker_mode"] = self.active_key
+        # §MANUAL-SYNC：透出委托表快照的规模与时刻，运维据此判断手动单是否已进来
+        payload["orders_snapshot_at"] = str(self._orders_snap.get("data_ts", "") or "")
+        payload["orders_snapshot_n"] = int(self._orders_snap.get("n", 0) or 0)
         return 200, payload
 
     def _do_settlement(self, request_handler=None):

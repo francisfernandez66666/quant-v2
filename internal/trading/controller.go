@@ -313,6 +313,12 @@ type StateSnapshot struct {
 	// degradation banner; cash is the raw last-known value (informational while stale).
 	Cash      float64 `json:"cash"`
 	CashStale bool    `json:"cash_stale"`
+	// CashAt §MANUAL-SYNC（2026-10-28）：最近一次券商资金快照的落库时刻（北京时间墙钟串）。
+	// 为什么需要：资金/持仓已改为 10s 一采，前端只有"过期"横幅、没有"几点同步的"，
+	// 用户分不清「没变化」与「没更新」——这一格把快照时刻直接摆出来，与 cash_stale 互补。
+	// English: §MANUAL-SYNC — wall-clock timestamp of the last broker cash snapshot, so the UI can
+	// tell "value unchanged" from "value not updating".
+	CashAt string `json:"cash_at"`
 	// PendingEnabled §FIX-2：待生效队列中的 enabled（§QMT-PENDING）。非 nil 表示存在一笔尚未在
 	// 交易时段被 ApplyPendingConfig 消费的开关变更——前端据此显示"已配置，将于下一交易时段生效"，
 	// 而不是把延迟生效误判为"开关没打开"。为 nil 表示当前无待生效变更（已收敛到 c.cfg.Enabled）。
@@ -334,6 +340,13 @@ func (c *Controller) Snapshot() StateSnapshot {
 	}
 	// §M12-A：资金三态随快照暴露（AvailableCash 不取锁，此处 RLock 内调用安全）。
 	cash, cashFresh := c.AvailableCash()
+	// §MANUAL-SYNC：附带快照落库时刻（读失败/未接账本时为空串，前端不显示该格）。
+	cashAt := ""
+	if c.store != nil {
+		if acc, err := c.store.GetRealAccount(c.userID); err == nil {
+			cashAt = acc.UpdatedAt
+		}
+	}
 	return StateSnapshot{
 		Enabled:        c.cfg.Enabled,
 		Mode:           c.cfg.Mode,
@@ -348,6 +361,7 @@ func (c *Controller) Snapshot() StateSnapshot {
 		LastReportKind: c.lastReportKind,
 		Cash:           cash, // §M12-A 原始最近值（过期时仅供参考）
 		CashStale:      !cashFresh,
+		CashAt:         cashAt,
 		PendingEnabled: pendingEnabled,
 	}
 }
@@ -994,6 +1008,12 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	for _, o := range orders {
 		// §P1-7 超时撤单范围扩展到部成：已报/部成 均可能剩余未成交，需自动撤销。
 		if o.Status != "已报" && o.Status != "部成" {
+			continue
+		}
+		// §MANUAL-SYNC（2026-10-28）手动委托不参与例行自动撤单/收盘清场：
+		// 券商 App 里手下的单（signal_id=ext:<委托号>）是用户自己的动作，超时 120s
+		// 就被系统撤掉属于越权误杀；紧急停止（HaltAll）仍会连它们一起撤。
+		if strings.HasPrefix(o.SignalID, "ext:") {
 			continue
 		}
 		at, perr := time.Parse(time.RFC3339, o.CreatedAt)

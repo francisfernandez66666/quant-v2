@@ -11,8 +11,10 @@ Chinese commentary for both sides of this bridge.
 
 Transport: local files in BRIDGE_DIR (sandbox TCP is unavailable - no _socket pyd).
   bridge_report.jsonl  (bridge -> gateway, appended lines): heartbeat / order_result
-    / cancel_result / trade / positions / account  (same JSON schema as the old
-    POST /dispatch/result contract; gateway sidecar applies them verbatim).
+    / cancel_result / trade / positions / account / orders_snapshot (MANUAL-SYNC:
+    the counter's own today-order table, so hand-placed/hand-cancelled orders become
+    visible; same JSON schema as the old POST /dispatch/result contract, gateway
+    sidecar applies them verbatim).
   bridge_cmd.json      (gateway -> bridge, atomic rewrite): {"ts":..., "cmds":[...]}
     rows from the gateway dispatch queue; each is executed via the embedded
     xttrader API (dry_run -> ack-only).
@@ -326,6 +328,44 @@ def _deal_side(t, op_buy=BUY_CONST_FALLBACK, op_sell=SELL_CONST_FALLBACK):
     return SELL, desc
 
 
+# ---------------------------------------------------------------------------
+# ORDER-table status codes -> Chinese ledger literals (MANUAL-SYNC 2026-10-28).
+# Same code space as qmt_gateway/handler.py XT_STATUS_CODES on purpose: the
+# decision side matches these literals exactly (frozen cash / cancellable set),
+# so both entry points must speak ONE vocabulary. Codes are the counter's own
+# m_nOrderStatus enum; anything unreadable stays explicit instead of being
+# faked as "accepted" (same fail-closed posture as handler._status).
+# (Unicode escapes: this file must stay ASCII for the GBK sandbox.)
+# ---------------------------------------------------------------------------
+_ORD_STATUS = {
+    48: "\u672a\u62a5",  # weibao
+    49: "\u5f85\u62a5",  # daibao
+    50: "\u5df2\u62a5",  # yibao
+    51: "\u5df2\u62a5\u5f85\u64a4",  # yibao-daiche
+    52: "\u90e8\u6210\u5f85\u64a4",  # bucheng-daiche
+    53: "\u90e8\u64a4",  # buche
+    54: "\u5df2\u64a4",  # yiche
+    55: "\u90e8\u6210",  # bucheng
+    56: "\u5df2\u6210",  # yicheng
+    57: "\u5e9f\u5355",  # feidan
+}
+_UNKNOWN_STATUS_PREFIX = "\u672a\u77e5"  # unknown
+
+
+def _order_status(raw):
+    """ORDER row status -> ledger literal; unreadable values stay 'unknown(<raw>)' with the raw code kept."""
+    if raw is None:
+        return _UNKNOWN_STATUS_PREFIX + "(\u7f3a\u5931)"  # unknown(missing)
+    s = str(raw).strip()
+    if not s:
+        return _UNKNOWN_STATUS_PREFIX + "(\u7f3a\u5931)"
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        return _UNKNOWN_STATUS_PREFIX + "(%s)" % s
+    return _ORD_STATUS.get(n) or (_UNKNOWN_STATUS_PREFIX + "(%s)" % s)
+
+
 class _XtOps:
     """canonical embedded adapter (XtQuantTrader instance), lazy at first non-dry call.
     On start/connect failure the trader MUST be stop()ed to avoid leaking one set of
@@ -553,6 +593,72 @@ class _XtOps:
 
     def embed_orders(self):
         return self._gtdd("ORDER")
+
+    def embed_orders_norm(self):
+        """Account ORDER table -> normalized snapshot rows (MANUAL-SYNC 2026-10-28).
+
+        Why this exists: order status used to be pushed ONLY by callbacks/receipts, so
+        an order cancelled (or placed) by hand in the broker app never reached the
+        decision side -- the local book stayed "accepted" forever, kept its cash/frozen
+        budget and blocked same-day re-orders. The ORDER table is the counter's own
+        today-book and is account scoped, so polling it is the missing reconciliation
+        source. Rows are emitted verbatim-ish; attribution and reconciliation live in
+        the gateway (it owns the dispatch table).
+
+        Field families are probed (counter builds differ), never assumed:
+          order id   m_strOrderSysID / order_id
+          volume     m_nOrderVolume / order_volume / volume
+          filled     m_nVolumeTraded / traded_volume / filled_volume
+          price      m_dOrderPrice / m_dPrice / price
+          remark     m_strRemark / order_remark / remark (our userOrderId wire form)
+          time       m_strInsertDate+m_strInsertTime / order_time / "" (gateway stamps)
+        """
+        xtc = self._xtc
+        buy_c = int(getattr(xtc, "STOCK_BUY", BUY_CONST_FALLBACK))
+        sell_c = int(getattr(xtc, "STOCK_SELL", SELL_CONST_FALLBACK))
+        rows = self._gtdd("ORDER")
+        if rows and not getattr(self, "_ord_attrs_seen", False):
+            # One-time field probe: the exact attr names of this counter build end up
+            # in bridge_boot.log, which is how enum/field drift gets diagnosed later.
+            self._ord_attrs_seen = True
+            try:
+                _trace("ORDER attrs: %s" % ",".join(
+                    sorted(a for a in dir(rows[0]) if a.startswith("m_") or
+                           a in ("order_id", "order_volume", "order_status"))))
+            except Exception:
+                pass
+        out = []
+        for o in rows:
+            code = self._obj_code(o)
+            oid = str(getattr(o, "m_strOrderSysID", "") or getattr(o, "order_id", "") or "")
+            if not oid or not code:
+                continue  # no identity / no code: cannot attribute or cancel
+            side, _src = _deal_side(o, buy_c, sell_c)
+            raw_status = getattr(o, "m_nOrderStatus", None)
+            if raw_status is None:
+                raw_status = getattr(o, "order_status", None)
+            qty = int(getattr(o, "m_nOrderVolume", 0) or getattr(o, "order_volume", 0) or
+                      getattr(o, "volume", 0) or 0)
+            filled = int(getattr(o, "m_nVolumeTraded", 0) or
+                         getattr(o, "traded_volume", 0) or
+                         getattr(o, "filled_volume", 0) or 0)
+            price = float(getattr(o, "m_dOrderPrice", 0) or getattr(o, "m_dPrice", 0) or
+                          getattr(o, "price", 0) or 0)
+            remark = str(getattr(o, "m_strRemark", "") or getattr(o, "order_remark", "") or
+                         getattr(o, "remark", "") or "")
+            created = str(getattr(o, "m_strInsertDate", "") or "")
+            ins_time = str(getattr(o, "m_strInsertTime", "") or "")
+            if created and ins_time:
+                created = "%s %s" % (created, ins_time)
+            if not created:
+                created = str(getattr(o, "order_time", "") or "")
+            out.append({
+                "order_id": oid, "code": code, "side": side,
+                "status": _order_status(raw_status),
+                "qty": qty, "filled_qty": filled, "price": price,
+                "remark": remark, "created_at": created,
+            })
+        return out
 
     def embed_trades_rows(self):
         """Raw DEAL rows mapped to the bridge trade-event shape (side via _deal_side)."""
@@ -1050,6 +1156,53 @@ class _XtOps:
             })
         return out
 
+    def query_orders(self):
+        """Today's ORDER table -> (rows, synced). synced=False means the query itself failed.
+
+        Why a tuple: an empty list is a legitimate snapshot (no orders today) and the
+        gateway must never read "query error" as "every local order vanished" -- that
+        would mass-close live orders. So the caller publishes whether the read really
+        succeeded, exactly like the positions/account `synced` legs.
+        """
+        if self.dry_run:
+            return [], True
+        if self.embed_usable():
+            try:
+                return self.embed_orders_norm(), True
+            except Exception as e:
+                _trace("embed orders error: " + repr(e))
+        try:
+            self.ensure()
+        except Exception as e:
+            # No session at all -> we genuinely do not know today's orders.
+            _trace("query orders session error: " + repr(e))
+            return [], False
+        try:
+            raw = self._trader.query_stock_orders(self._acc) or []
+        except Exception as e:
+            _trace("query orders error: " + repr(e))
+            return [], False
+        xtc = self._xtc
+        buy_c = int(getattr(xtc, "STOCK_BUY", BUY_CONST_FALLBACK))
+        sell_c = int(getattr(xtc, "STOCK_SELL", SELL_CONST_FALLBACK))
+        out = []
+        for o in raw:
+            code = self._obj_code(o)
+            oid = str(getattr(o, "order_id", "") or "")
+            if not oid or not code:
+                continue
+            side, _src = _deal_side(o, buy_c, sell_c)
+            out.append({
+                "order_id": oid, "code": code, "side": side,
+                "status": _order_status(getattr(o, "order_status", None)),
+                "qty": int(getattr(o, "order_volume", 0) or 0),
+                "filled_qty": int(getattr(o, "traded_volume", 0) or 0),
+                "price": float(getattr(o, "price", 0) or 0),
+                "remark": str(getattr(o, "order_remark", "") or getattr(o, "remark", "") or ""),
+                "created_at": str(getattr(o, "order_time", "") or ""),
+            })
+        return out, True
+
 
 import time  # noqa: E402  (canonical adapter needs time for connect sleep / order polling)
 
@@ -1260,7 +1413,8 @@ def _handle_cmd(cmd, seen):
 
 
 _TICK = {"cfg": None, "seen": None, "last_cmd_ts": 0.0, "n": 0,
-         "last_pos": 0.0, "last_hb": 0.0, "pos_sec": 30.0, "hb_sec": 5.0}
+         "last_pos": 0.0, "last_hb": 0.0, "pos_sec": 30.0, "hb_sec": 5.0,
+         "last_orders": 0.0, "orders_sec": 10.0}
 
 
 def _bridge_tick():
@@ -1277,8 +1431,14 @@ def _bridge_tick():
     if st["cfg"] is None:
         cfg = _read_cfg()
         st["cfg"] = cfg
-        st["pos_sec"] = float(cfg.get("positions_sec", 30.0) or 30.0)
+        # MANUAL-SYNC 2026-10-28: positions/asset cadence tightened 30s -> 10s so manual
+        # trades show up in the ledger (and the cash gate) within one poll, not half a minute.
+        st["pos_sec"] = float(cfg.get("positions_sec", 10.0) or 10.0)
         st["hb_sec"] = float(cfg.get("heartbeat_sec", 5.0) or 5.0)
+        # MANUAL-SYNC 2026-10-28: the ORDER-table snapshot is the reconciliation source
+        # for hand-placed / hand-cancelled orders; its cadence is separate (and faster)
+        # because order status is what unblocks the cash/budget gates.
+        st["orders_sec"] = float(cfg.get("orders_sec", 10.0) or 10.0)
         _trace("cfg loaded: dry=" + str(cfg.get("dry_run")))
     if st["seen"] is None:
         st["seen"] = _load_seen()
@@ -1366,6 +1526,19 @@ def _bridge_tick():
                 _report({"type": "trade", **trow})
         except Exception as e:
             _trace("trades snapshot error: " + repr(e))
+    # 4) ORDER-table snapshot (MANUAL-SYNC 2026-10-28) -- the only leg that makes
+    # hand-placed / hand-cancelled orders visible to the decision side. Sent on its
+    # own cadence because order status is what releases frozen cash and same-day
+    # re-order blocks. `synced` is published so an empty/erroring read is never
+    # mistaken for "every order vanished" by the gateway reconciler.
+    if now - st["last_orders"] >= st["orders_sec"]:
+        st["last_orders"] = now
+        try:
+            orows, osynced = _xt().query_orders()
+            _report({"type": "orders_snapshot", "orders": orows,
+                     "synced": bool(osynced), "data_ts": _now_cn_str()})
+        except Exception as e:
+            _trace("orders snapshot error: " + repr(e))
 
 
 def init(ContextInfo):

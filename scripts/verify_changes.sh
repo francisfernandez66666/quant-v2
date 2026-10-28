@@ -16018,4 +16018,115 @@ echo "INFO - §135 覆盖面账：簇帽当前只作用于**信号买入路径**
 [ "$B135_FAILED" = "0" ] || exit 1
 echo "ok - §135 §T-COST B3 相关性簇帽锁通过（静态 15 道 + 行为腿 ${B3N135} 条 + 反证 2 枚，累计判定点 ${CNT135}）"
 
+
+# §136 §MANUAL-SYNC 手动委托/撤单/成交回传锁（2026-10-28）
+#
+# 缺陷族：委托状态此前**只靠推送**——手动在券商 App 下单/撤单不产生任何回报，桥只在动笔后
+# 8s 查一次 ORDER；本地行永远停在「已报」，继续占住买入冻结与同票同日幂等键，新买入被拦死。
+# 本段锁四件事，缺一条这条链就断：
+#   ① 桥必须每 10s 上送券商当日委托表快照（orders_snapshot，带 synced 新鲜度）；
+#   ② 网关必须有三条安全边界：synced=false 不推进、空快照不做消失判定、消失要连续 N 次；
+#   ③ 状态守卫必须保留「已报⇄发送失败」两条真实语义例外（否则僵尸行清不掉/迟到回报补不回）；
+#   ④ 例行自动撤单必须跳过手动单（signal_id=ext:），紧急停止仍全撤。
+# English: §MANUAL-SYNC locks the counter ORDER-table snapshot leg, its three safety guards,
+# the bidirectional send-failed transition, and the manual-order opt-out from routine sweeps.
+# ============================================================================
+echo "==> 136 §MANUAL-SYNC 手动委托/撤单/成交回传锁（委托表快照 + 安全边界 + 状态例外 + 撤单范围）..."
+B136_FAILED=0
+fail136() {
+	echo "--- FAIL: §136 $*"
+	FAIL=1
+	B136_FAILED=1
+}
+CNT136=0
+BR136=qmt_gateway/qmt_bridge_strategy.py
+GW136=qmt_gateway/gateway.py
+ST136=qmt_gateway/store.py
+RP136=internal/store/real_positions.go
+CT136=internal/trading/controller.go
+
+# —— ① 桥侧：ORDER 表快照上报（独立节拍 + synced 新鲜度）——
+grep -q 'def query_orders' "$BR136" ||
+	fail136 "桥缺 query_orders（没有它就永远只有推送，手动单不可能回传）"
+grep -q '"type": "orders_snapshot"' "$BR136" ||
+	fail136 "桥没有上报 orders_snapshot（委托表快照未上线）"
+grep -q 'orders_sec' "$BR136" ||
+	fail136 "委托表快照没有独立节拍 orders_sec（与 30s 持仓同频会让撤单感知太迟）"
+CNT136=$((CNT136 + 3))
+
+# —— ② 网关侧：路由 + 三条安全边界 ——
+grep -q 'etype == "orders_snapshot"' "$GW136" ||
+	fail136 "网关没有接 orders_snapshot（桥报了也没人用）"
+grep -q 'if req.get("synced") is False' "$GW136" ||
+	fail136 "缺「快照未同步不推进」守卫（会话抖动会被当成真实终态）"
+grep -q 'if not by_id:' "$GW136" ||
+	fail136 "缺「空快照不做消失判定」守卫（空读会被当成全部撤单）"
+grep -q 'manual_sync_miss_limit' "$GW136" ||
+	fail136 "消失判定的连续缺失阈值没有可配开关（无法关闭/调参）"
+grep -q 'dispatch_reap_stale_pending' "$GW136" ||
+	fail136 "pending 派发行没有超时出口（同 signal_id 重试会恒 500）"
+grep -q 'def _resolve_unconfirmed_orders' "$GW136" ||
+	fail136 "缺「柜台始终没见到这笔单」的收敛出口（未确认单会永挂已报、占住预算与幂等键）"
+grep -q 'manual_sync_unconfirmed_grace_sec' "$GW136" ||
+	fail136 "未确认单收敛没有宽限期开关（无宽限会误杀刚报出去的单）"
+CNT136=$((CNT136 + 7))
+
+# —— ③ 状态守卫：两条真实语义例外 + 网关 upsert 接入 ——
+grep -q 'func orderStatusAdvance' "$RP136" ||
+	fail136 "Go 缺 orderStatusAdvance（状态推进必须收口到单一裁决点）"
+grep -q 'cur == "已报" && next == "发送失败"' "$RP136" ||
+	fail136 "缺「已报→发送失败」例外（僵尸行清不掉，预算永久被占）"
+grep -q 'cur == "发送失败" && (next == "已报" || next == "部成")' "$RP136" ||
+	fail136 "缺「发送失败→已报/部成」例外（迟到真实回报补不回，会诱导重发）"
+grep -q 'order_status_advance' "$ST136" ||
+	fail136 "网关 store 没有秩守卫（快照重放会把已成/已撤改回已报）"
+CNT136=$((CNT136 + 4))
+
+# —— ④ 例行撤单不碰手动单 ——
+grep -q 'strings.HasPrefix(o.SignalID, "ext:")' "$CT136" ||
+	fail136 "SweepOrders 没跳过手动单（120s 超时/收盘清场会误杀用户手下的单）"
+CNT136=$((CNT136 + 1))
+
+# —— 行为腿：Go 状态/撤单范围 + 网关快照/成交/收割，真跑 ——
+G136=$(go test ./internal/store/ ./internal/trading/ -count=1 -run 'TestOrderStatusAdvanceManualSync|TestApplyOrderReportZombieToSendFailed|TestManualOrderExtRowLifecycle|TestSweepOrdersSkipsManualOrders' 2>&1 || true)
+grep_q '^ok' G136 ||
+	{ fail136 "§MANUAL-SYNC Go 行为腿非绿：$(printf '%s\n' "$G136" | grep -E 'FAIL|_test\.go' | head -3 | tr '\n' ' ')"; }
+CNT136=$((CNT136 + 1))
+P136=$(py_tests qmt_gateway/tests/test_manual_sync.py 2>&1 || true)
+grep_q 'passed' P136 || grep_q '^OK' P136 ||
+	{ fail136 "§MANUAL-SYNC 网关行为腿非绿：$(printf '%s\n' "$P136" | grep -E 'FAILED|FAIL:' | head -3 | tr '\n' ' ')"; }
+CNT136=$((CNT136 + 1))
+
+# —— 反证一枚：拿掉「已报→发送失败」例外后，状态矩阵必须红（镜子法，只镜像 qmt_gateway）——
+W136=$(mktemp -d /tmp/gate136-XXXXXX) || { echo "--- FAIL: §136 建不出反证工作目录"; exit 1; }
+cp -R qmt_gateway "$W136/qmt_gateway" || exit 1
+N136=$(python3 - "$W136/qmt_gateway/store.py" <<'PY136M'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = 'if cur == "已报" and new == "发送失败":\n        return True'
+new = 'if False:\n        return True'
+n = s.count(old)
+if n == 1:
+    open(p, "w", encoding="utf-8").write(s.replace(old, new))
+print(n)
+PY136M
+)
+CNT136=$((CNT136 + 1))
+[ "${N136:-0}" = "1" ] || fail136 "反证变异落地数=${N136:-0}（应 1）：靶串不在位"
+# 判读用最小内联断言（不依赖 pytest/unittest 的收集与工作目录），镜子目录里 import 的就是被变异的 store。
+R136=$( ( cd "$W136" && python3 -c 'import sys; sys.path.insert(0, "qmt_gateway")
+import store
+assert store.order_status_advance("已报", "发送失败") is True
+assert store.order_status_advance("发送失败", "已报") is True
+print("EXPECTED_TRUE")' ) 2>&1 || true )
+CNT136=$((CNT136 + 1))
+grep_q 'EXPECTED_TRUE' R136 &&
+	fail136 "反证失效：去掉 已报→发送失败 例外后状态推进仍放行——僵尸行清理没人盯着"
+rm -rf "$W136"
+
+echo "INFO - §136 覆盖面账：本段锁「手动动作能被看见」；手动成交**方向**仍需成交行与委托表两源一致才入账（不一致继续走 §SIDE-AUTH-2 待核对），这是刻意保留的保守面。另：券商 ORDER 表是否包含手机 App 委托取决于柜台构建，首日看 /admin/status 的 orders_sync.snapshot_n 与 bridge_boot.log 的 ORDER attrs 才能确认；不可见时本方案降级为「消失检测」。"
+[ "$B136_FAILED" = "0" ] || exit 1
+echo "ok - §136 §MANUAL-SYNC 锁通过（桥快照 3 + 网关边界 7 + 状态例外 4 + 撤单范围 1 + 行为腿 2 + 反证 2 枚，累计判定点 ${CNT136}）"
+
 echo "==> 全部通过"
