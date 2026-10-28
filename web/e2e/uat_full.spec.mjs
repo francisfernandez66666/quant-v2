@@ -1669,10 +1669,31 @@ test.describe('修复回归 · 0925EVE 撤单失败明细与第三态人工收�
       await btn.click()
       const dlg = page.locator('.t-dialog')
       await expect(dlg, '置位二次确认').toContainText('确认紧急停止', { timeout: 5000 })
+      // §FIX-20261028-F15⑦（2026-10-29）：toast 是 ~3s 自动消失的瞬时控件，用"点完再找 DOM"
+      // 会与它赛跑（页面加载稍慢就必红；失败现场快照里文案明明出现过）。改为**点击前挂观察器**
+      // 收集本期出现过的全部 message 文本，再断言"其中出现过点名 + 单号"——判据不变、不再 flaky。
+      await page.evaluate(() => {
+        window.__uatMsgs = []
+        const obs = new MutationObserver((muts) => {
+          for (const m of muts) {
+            for (const n of m.addedNodes) {
+              if (n.nodeType === 1 && /t-message/.test(String(n.className || ''))) {
+                window.__uatMsgs.push(String(n.innerText || ''))
+              }
+            }
+          }
+        })
+        obs.observe(document.body, { childList: true, subtree: true })
+      })
       await dlg.getByRole('button', { name: /确认|确定/ }).first().click()
-      const toast = page.locator('.t-message', { hasText: '笔未撤成' }).first()
-      await expect(toast, 'warning toast 点名「N 笔未撤成」').toBeVisible({ timeout: 10000 })
-      await expect(toast, 'toast 带未撤成单号（操作者当场可决策）').toContainText(oid, { timeout: 5000 })
+      await page.waitForTimeout(2500)
+      const msgs = await page.evaluate(() => window.__uatMsgs || [])
+      // §FIX-20261028-F15⑧：§CANCEL-STATE（10-28）已把文案收窄成「N 笔撤单请求未发出」
+      // （受理≠确认，旧句「未撤成」把请求发出说成结果），本条断言仍找旧词 ⇒ 恒红。
+      // 以 §98 锁定标记串为准，不再认旧文案。
+      const hitMsg = msgs.find((t) => /笔撤单请求未发出/.test(t))
+      expect(hitMsg, 'warning toast 点名「N 笔撤单请求未发出」（本期 message 实录=' + JSON.stringify(msgs).slice(0, 300) + '）').toBeTruthy()
+      expect(hitMsg, 'toast 带未撤成单号（操作者当场可决策）').toContain(oid)
       await page.screenshot({ path: `${SHOT}/branch-eve-a2-cancel-fail.png` })
     } finally {
       await page.request.post('/api/qmt/halt', { headers: hdr, data: { halted: false } })
@@ -2165,6 +2186,9 @@ test.describe('§DYN-T 做 T 与 §DYN-SIZE v4：读数面 + 签字门（2026-10
   // §FIX-20261028-F15④：`request` fixture 只带 storageState 的 cookie/localStorage，
   // 而本产品鉴权走 Bearer 头 ⇒ 旧写法这四条 GET 恒 401（"报告类接口只读不改配置"这条
   // 资金安全判据在 CI 里形同不存在）。这里按需登录一次并缓存 header。
+  // §FIX-20261028-F15④：本 describe 作用域内没有外层 API 常量（它在别的 describe 里），
+  // 必须就地定义——否则 login 那行直接 ReferenceError（首跑就是这么红的）。
+  const API = process.env.E2E_API || 'http://localhost:18080'
   let dynAuth = null
   const apiGet = async (request, path) => {
     if (!dynAuth) {
@@ -2220,8 +2244,14 @@ test.describe('§DYN-T 做 T 与 §DYN-SIZE v4：读数面 + 签字门（2026-10
     const afterGet = await apiGet(request, '/api/config/regime')
     expect((afterGet.body.sizing || {}).mode, 'GET 报告不得改动落盘的合成口径').toBe(modeBefore)
 
-    const unsigned = await request.post('/api/config/sizing-v4-apply', { data: { authorize: '我看过了' } })
-    expect(unsigned.status(), '错误 token 必须 400').toBe(400)
+    // §FIX-20261028-F15⑥（2026-10-29）：这里要验的是**签字 token 闸门**（业务 token 错 → 400），
+    // 而不是"未登录"（那会被 adminMiddleware 先拦成 401——上一轮该用例在 GET 就 401 死掉，
+    // 从未跑到这一行，所以一直是假绿/假红混合）。现在补上 admin Bearer，让请求真的走到闸门。
+    const applyHdr = dynAuth
+    const unsigned = await request.post('/api/config/sizing-v4-apply', {
+      headers: applyHdr, data: { authorize: '我看过了' },
+    })
+    expect(unsigned.status(), '已登录但签字 token 错误必须 400（未登录是 401，另一回事）').toBe(400)
     const afterBad = await apiGet(request, '/api/config/regime')
     expect((afterBad.body.sizing || {}).mode, '未签字的 POST 不得改动资金参数').toBe(modeBefore)
   })
