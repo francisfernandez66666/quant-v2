@@ -12105,12 +12105,12 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 202 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202）'
-eqkey115 CALLPATH_DERIVED 162 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162）'
-eqkey115 CALLSITES_DERIVED 165 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165）'
+eqkey115 ROUTES_DERIVED 204 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204）'
+eqkey115 CALLPATH_DERIVED 164 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164）'
+eqkey115 CALLSITES_DERIVED 167 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 202 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
-eqkey115 COVERED_BY_WEB 162 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162）'
+eqkey115 LEDGER_ROWS 204 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
+eqkey115 COVERED_BY_WEB 164 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164）'
 eqkey115 UNCALLED 40 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
@@ -12182,8 +12182,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 202 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 202 '镜像基线：台账行数与主仓同值'
+eqkey115 ROUTES_DERIVED 204 '镜像基线：R 与主仓同值'
+eqkey115 LEDGER_ROWS 204 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
