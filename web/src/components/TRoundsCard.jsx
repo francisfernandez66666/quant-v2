@@ -186,6 +186,9 @@ export default function TRoundsCard() {
     ? Math.max(...shadowSeries.map((p) => Math.max(Number(p.real) || 0, Number(p.shadow) || 0)))
     : 0
   const liveState = liveView && liveView.state
+  // §FUNDS-TODAY：实盘页签也把「T 仓资金」摆出来（与资金总览卡同源，都是引擎写下的 funds 帧）；
+  // 帧缺失（新交易日首帧前/引擎未跑）时不显示，绝不拿昨日数顶上。
+  const liveFunds = (tab === 'live' && liveView && liveView.funds) ? liveView.funds : null
 
   return (
     <Card style={{ marginTop: 16 }} title={(
@@ -213,6 +216,14 @@ export default function TRoundsCard() {
             <p style={{ color: 'var(--app-danger, #d54941)' }}>
               {(liveView && liveView.reason) || '实盘回转账本文件损坏（接口未改动原文件，需人工核对）'}
             </p>
+          )}
+          {liveFunds && (
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 8, fontSize: 13 }}>
+              <span>可用 T 现金 {fmtNum(liveFunds.cash_t)}</span>
+              <span>反 T 冻结 {fmtNum(liveFunds.t_frozen_cash)}</span>
+              <span>在途腿（买/卖）{fmtNum(liveFunds.open_buy_legs)} / {fmtNum(liveFunds.open_sell_legs)}</span>
+              {liveFunds.day ? <span className="muted">数据日 {liveFunds.day}</span> : null}
+            </div>
           )}
           <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', margin: '10px 0' }}>
             <span>做 T 净额（累计 done 轮）：<b>{fmtNum(pnl.net)}</b> 元</span>

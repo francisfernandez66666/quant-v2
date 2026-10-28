@@ -1228,6 +1228,8 @@ class Store:
         and the stuck "accepted but the broker never saw it" row stops hanging.
         """
         import time as _time  # noqa: PLC0415
+        # 收割线：created_at 早于 (now − max_age_sec) 的 pending 行才算卡死；<=0 时阈值取 0（一条不删）。
+        # 用现网时钟而非本机时钟：部署机与网关机可能不同步，牌期/龄判据必须同源。
         threshold = (_time.time() - max_age_sec) if max_age_sec > 0 else 0
         with self._lock:
             rows = self._conn.execute(

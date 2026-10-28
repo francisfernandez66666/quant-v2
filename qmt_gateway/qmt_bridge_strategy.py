@@ -633,6 +633,8 @@ class _XtOps:
             oid = str(getattr(o, "m_strOrderSysID", "") or getattr(o, "order_id", "") or "")
             if not oid or not code:
                 continue  # no identity / no code: cannot attribute or cancel
+            # Field families are probed one by one (counter builds differ); missing values
+            # stay 0/"" and the gateway decides what that means -- never fabricate here.
             side, _src = _deal_side(o, buy_c, sell_c)
             raw_status = getattr(o, "m_nOrderStatus", None)
             if raw_status is None:

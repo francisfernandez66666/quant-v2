@@ -128,6 +128,45 @@ type tLiveState struct {
 	// 只由 save() 在锁内从**当日** byID 现算（历史留档不参与）；接口侧仍按明细重算一遍，
 	// 因为"写成什么样"可以旧，明细才是唯一事实。
 	Cost *tLiveCostDaily `json:"cost,omitempty"`
+	// Funds §FUNDS-TODAY（2026-10-28）当日资金一帧：信号仓（账户/目标/剩余）与 T 仓
+	// （额度/可用 T 现金/冻结/在途腿/当日 T 收益）。由引擎每轮计算后原样落盘，
+	// 接口只搬不算——多一处重算就多一套会漂移的账。
+	// Day 与文件同日才可信；跨日不复活（新交易日首帧前接口返回 null＝"今日尚未定权"）。
+	Funds *tLiveFunds `json:"funds,omitempty"`
+}
+
+// tLiveFunds 当日资金一帧（信号仓 + T 仓），只表达引擎本轮**实际使用**的读数。
+//
+// 为什么把账户资金和 T 资金放进同一帧：两者必须同一时刻快照。分两次取会出现
+// "战略剩余用旧现金、T 冻结用新腿"的拼接读数，看起来正常但对不上账。
+// 每日清零：Day 与账本同日才有效；新交易日首帧之前没有本帧（前端显示待定权）。
+type tLiveFunds struct {
+	Day string `json:"day"`
+	At  string `json:"at"` // 取数时刻（RFC3339，北京时间）
+
+	// ── 信号仓（账户 + 目标仓位）─────────────────────────────────────────
+	Cash        float64 `json:"cash"`         // 券商可用现金（快照）
+	FrozenCash  float64 `json:"frozen_cash"`  // 券商冻结资金（含在途委托，账户级）
+	TotalAsset  float64 `json:"total_asset"`  // 总资产
+	MarketValue float64 `json:"market_value"` // 持仓市值
+	CashAt      string  `json:"cash_at"`      // 资金快照落库时刻（空=不可得）
+	CashOK      bool    `json:"cash_ok"`      // 资金口径可用（30min 内新鲜）
+	Target      float64 `json:"target"`       // 目标市值 = 总资产 × min(MS, 天花板)
+	CurStrat    float64 `json:"cur_strat"`    // 战略当前数（持仓 − 正T买腿 + 反T卖腿 + 战略在途）
+	Room        float64 `json:"room"`         // 战略剩余空间
+	MarketScale float64 `json:"market_scale"` // 本轮市场缩放（0=尚未定权）
+	MissingKey  bool    `json:"missing_key_input"`
+
+	// ── T 仓 ────────────────────────────────────────────────────────────
+	TQuota       float64 `json:"t_quota"`        // T 额度（总资产 × max(0, 1−min(MS,1))）
+	CashT        float64 `json:"cash_t"`         // 可用 T 现金（实盘口径：现金−战略剩余−T冻结）
+	TFrozenCash  float64 `json:"t_frozen_cash"`  // 反 T 冻结专款
+	OpenBuyLegs  float64 `json:"open_buy_legs"`  // 在途正 T 买腿市值
+	OpenSellLegs float64 `json:"open_sell_legs"` // 在途反 T 卖腿市值
+	OpenLegs     int     `json:"open_legs"`      // 在途腿数
+	DoneRounds   int     `json:"done_rounds"`    // 当日已完成轮数
+	PnlNet       float64 `json:"pnl_net"`        // 当日 T 已实现净额（仅 done 轮）
+	PnlGross     float64 `json:"pnl_gross"`      // 当日 T 已实现毛额
 }
 
 // tLiveCostDaily 当日成本分解（与 paper.TCostDaily 同名字段同语义，前端一套渲染）。
@@ -233,6 +272,9 @@ type tLiveStore struct {
 	// ledgerLogged 每日总账的一行落点（按日一次性，跨日由 load 自然重置）。
 	// 刻意只在内存：它防的是"同一轮/同一天的重复刷屏"，不是需要审计的事实本身。
 	ledgerLogged bool
+	// funds 当日资金帧（§FUNDS-TODAY）：引擎每轮 setFunds 覆盖，save 时随文件落盘；
+	// load 只接受 Day 与当日一致的帧（跨日不复活）。
+	funds *tLiveFunds
 }
 
 // dayLedger 当日回转的结局分布（做 T 每日总账的一行素材）：只数当日记录，历史留档不参与。
@@ -276,6 +318,38 @@ func (s *tLiveStore) dayCost() tLiveCostDaily {
 	}
 	s.mu.RUnlock()
 	return tLiveCostOf(rounds)
+}
+
+// setFunds 覆盖当日资金帧并落盘（§FUNDS-TODAY）。
+//
+// 为什么落盘而不是只留内存：只读接口（/api/funds/today、/api/t-live/rounds）刻意不 import engine，
+// 内存读数对它们永远不可见；同时资金帧必须与"这一轮 T 账本"同文件同帧，重启后仍能回答
+// "上一帧是什么时候、当时用了哪些数"。写盘失败只打日志不抛：资金帧是观测面，不能反过来
+// 阻断做 T 的资金路径（账本本身另有更关键的原子写保护）。
+func (s *tLiveStore) setFunds(f *tLiveFunds) {
+	if s == nil || f == nil {
+		return
+	}
+	s.mu.Lock()
+	s.funds = f
+	s.mu.Unlock()
+	if err := s.save(); err != nil {
+		log.Printf("[t-live] 资金帧落盘失败（本轮读数仅内存可见）：%v", err)
+	}
+}
+
+// fundsSnapshot 返回当日资金帧副本（nil=今日尚未定权/跨日已清）。
+func (s *tLiveStore) fundsSnapshot() *tLiveFunds {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.funds == nil || s.funds.Day != s.day {
+		return nil
+	}
+	cp := *s.funds
+	return &cp
 }
 
 // tLiveKeepLegacy 历史留档条数上限（账本体积；不影响判定）。
@@ -407,6 +481,7 @@ func (s *tLiveStore) load(day string) {
 	s.day = day
 	s.byID = map[string]*TRoundLive{}
 	s.legacy = nil
+	s.funds = nil // 跨日不复活：昨天的资金帧不得顶替今天的"尚未定权"
 	b, err := os.ReadFile(s.path)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -425,6 +500,9 @@ func (s *tLiveStore) load(day string) {
 			log.Printf("[t-live] 状态文件损坏且留证失败，按空账本起步：%v", rerr)
 		}
 		return
+	}
+	if st.Funds != nil && st.Funds.Day == day {
+		s.funds = st.Funds
 	}
 	for _, r := range st.Rounds {
 		if r == nil || r.ID == "" {
@@ -459,6 +537,10 @@ func (s *tLiveStore) save() error {
 	// B1：日成本分项随文件落一盘（当日 byID 现算；历史留档刻意不计——它不是"今天的账"）。
 	cost := tLiveCostOf(today)
 	st.Cost = &cost
+	// 资金帧同日才写（跨日残留一律不落，避免把昨日读数带进新一天）。
+	if s.funds != nil && s.funds.Day == s.day {
+		st.Funds = s.funds
+	}
 	// 留档历史一并写回（跨日收摊的痕迹是唯一能解释"仓位为什么少了一块"的出处）。
 	for _, r := range s.legacy {
 		if r != nil && r.ID != "" {

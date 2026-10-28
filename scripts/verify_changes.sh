@@ -3759,6 +3759,12 @@ grep_q 'MINUTE_OPS_PLAN' OPS_PLAN B \
 #    因此本枚不做放宽（改安全阀方向＝拿验证便利换资金安全）；正确处置是按上面的顺序跑，
 #    真正的修法收进波 4 的 -collect：把这类"前置条件不满足"计成 SKIP-PRECONDITION 而不是 FAIL，
 #    并在末尾计数里单列（判据缺失要显形，不许静悄悄少跑一段）。
+# §93 前置：落位脚本的第一道守卫是「本机源文件必须与 HEAD 一致」，改过桥策略却未提交时
+# 它在 ARMED 之前就 exit 1——这是安全阀按设计工作，不是本段缺陷。收集模式记 SKIP-PRECONDITION，
+# 默认模式仍 FAIL（半成品不许进实盘加载位）。提交后再跑即绿。
+BR93_DIRTY=$(git status --porcelain -- qmt_gateway/qmt_bridge_strategy.py 2>/dev/null | wc -l | tr -d ' ')
+gate_need 93 "$([ "${BR93_DIRTY:-0}" = "0" ] && echo 1 || echo 0)" \
+	"桥策略文件有未提交改动：落位脚本按设计拒绝 -Apply（先提交再跑门禁）"
 BR_ARM=$(GZ_IP=127.0.0.1 "$BR_SH" -Apply 2>&1 || true)
 { grep_q 'BRIDGE_PLACE_ARMED' BR_ARM B && grep_q 'BatchMode' BR_ARM B; } \
 	|| { echo '--- FAIL: §MINUTE-OPS 落位脚本的 -Apply 分支不再「先 ASCII 自检后 BatchMode 预探测」（ARMED/预探测判红缺一：要么自检被绕过，要么会挂起）'; exit 1; }
@@ -15662,7 +15668,7 @@ else:
 PY133
 )
 [ "$B1P133" = "OK" ] ||
-	fail133 "两本账 B1 字段不同集（$B1P133）：一边加了另一边没加，成本分解只会在一边出现"
+	fail133 "两本账 B1 字段不同集（${B1P133}）：一边加了另一边没加，成本分解只会在一边出现"
 CNT133=$((CNT133 + 1))
 
 # —— ② 分项自洽：净额必须逐项相减（两本账各一道）——
@@ -15792,7 +15798,7 @@ CNT134=$((CNT134 + 4))
 SHHIT134=$(grep -lE 'shadowNoT|ShadowNoT|shadow_no_t' \
 	internal/ordbudget/ordbudget.go internal/signalctl/sizing.go internal/engine/engine.go 2>/dev/null || true)
 [ -z "$SHHIT134" ] ||
-	fail134 "影子账被判定层引用了（$SHHIT134）：影子一旦进入 Room/预算/风控，归因就恒 0 或虚高"
+	fail134 "影子账被判定层引用了（${SHHIT134}）：影子一旦进入 Room/预算/风控，归因就恒 0 或虚高"
 CNT134=$((CNT134 + 1))
 
 # —— ③ 镜像点显式：买/卖/跳腿三个调用点都在 paper.go（策略动作处）——
@@ -16128,5 +16134,94 @@ rm -rf "$W136"
 echo "INFO - §136 覆盖面账：本段锁「手动动作能被看见」；手动成交**方向**仍需成交行与委托表两源一致才入账（不一致继续走 §SIDE-AUTH-2 待核对），这是刻意保留的保守面。另：券商 ORDER 表是否包含手机 App 委托取决于柜台构建，首日看 /admin/status 的 orders_sync.snapshot_n 与 bridge_boot.log 的 ORDER attrs 才能确认；不可见时本方案降级为「消失检测」。"
 [ "$B136_FAILED" = "0" ] || exit 1
 echo "ok - §136 §MANUAL-SYNC 锁通过（桥快照 3 + 网关边界 7 + 状态例外 4 + 撤单范围 1 + 行为腿 2 + 反证 2 枚，累计判定点 ${CNT136}）"
+
+
+# §137 §FUNDS-TODAY + §DECISION-TODAY 资金/动态仓位展示锁（2026-10-28）
+#
+# 两条新展示面各自有一处"很容易写成第二本账"的地方，本段只钉这两件事：
+#   ① 实盘资金帧必须由引擎写、接口只透传（server 若重算 cashT/target，就会和判定漂移）；
+#   ② 动态仓位快照必须 day-keyed 且被拦也落（只看成功单等于"没买永远没有解释"）。
+# 另锁：两者都有"新交易日首帧前＝尚未定权"的口径（不能回放昨日读数）。
+# ============================================================================
+echo "==> 137 §FUNDS-TODAY + §DECISION-TODAY（信号仓/T仓资金 + 今日动态仓位）..."
+B137_FAILED=0
+fail137() {
+	echo "--- FAIL: §137 $*"
+	FAIL=1
+	B137_FAILED=1
+}
+CNT137=0
+TS137=internal/engine/tlive_state.go
+TL137=internal/engine/intraday_t_live.go
+EG137=internal/engine/engine.go
+SD137=internal/store/signal_decisions.go
+STO137=internal/store/store.go
+SVR137=internal/server/server.go
+TRA137=internal/server/t_rounds_api.go
+SDA137=internal/server/signal_decisions_api.go
+FC137=web/src/components/FundsOverviewCard.jsx
+DC137=web/src/components/SignalDecisionsCard.jsx
+
+# —— ① 实盘资金帧：类型/落盘/同日守卫 + 引擎每轮发布 ——
+grep -q 'type tLiveFunds struct' "$TS137" ||
+	fail137 "缺 tLiveFunds（资金帧类型不在 = 展示面只能前端重算）"
+grep -q 'Funds \*tLiveFunds' "$TS137" ||
+	fail137 "账本状态没有 Funds 字段（帧无法随文件落盘，接口读不到）"
+grep -q 'func (s \*tLiveStore) setFunds' "$TS137" ||
+	fail137 "缺 setFunds（帧写完必须原子落盘）"
+grep -q 's.funds = nil // 跨日不复活' "$TS137" ||
+	fail137 "跨日 load 没有清资金帧（昨日读数会顶替今日“尚未定权”）"
+grep -q 'func (r \*tLiveRound) publishFunds' "$TL137" ||
+	fail137 "缺 publishFunds（引擎每轮不写帧，接口永远为空）"
+grep -q 'targetCurRoom' "$TL137" ||
+	fail137 "缺 targetCurRoom（剩余空间必须有单一出口，不能展示/判定各算一套）"
+CNT137=$((CNT137 + 6))
+
+# —— ② 接口只透传 + 新聚合只读面 ——
+grep -qE '"funds":[[:space:]]+st\.Funds' "$TRA137" ||
+	fail137 "/api/t-live/rounds 没有透传 funds（帧写了但前端拿不到）"
+grep -q 'func (s \*Server) handleFundsToday' "$TRA137" ||
+	fail137 "缺 /api/funds/today 处理器"
+grep -qF 'live["state"] = "pending"' "$TRA137" ||
+	fail137 "缺“今日尚未定权”的 pending 态（会拿旧的数冒充今天）"
+grep -q 'GET /api/funds/today' "$SVR137" ||
+	fail137 "/api/funds/today 未注册路由"
+CNT137=$((CNT137 + 4))
+
+# —— ③ 动态仓位快照：day-keyed 表 + last-write + 被拦也落 ——
+grep -q 'CREATE TABLE IF NOT EXISTS signal_decisions' "$STO137" ||
+	fail137 "缺 signal_decisions 表（计算过程仍只活在日志里）"
+grep -q 'PRIMARY KEY (user_id, day, channel, code, strategy_key, signal_id)' "$STO137" ||
+	fail137 "快照主键不是 day-keyed 的 last-write 口径（会出现同日多行/跨日串账）"
+grep -q 'func (d \*DB) SignalDecisionsForDay' "$SD137" ||
+	fail137 "缺按日读取（接口无法只回当日）"
+grep -q 'type dynBuyReadout struct' "$EG137" ||
+	fail137 "dynamicBuyQty 没有读数结构（数量之外的中间量仍然丢失）"
+grep -q 'persistDynBuyDecision' "$EG137" ||
+	fail137 "缺快照落库调用（算了但不留痕）"
+grep -q 'stage = "skipped"' "$EG137" ||
+	fail137 "被拦信号没有单独阶段（“没买”仍无解释）"
+grep -q 'GET /api/signals/decisions' "$SVR137" ||
+	fail137 "/api/signals/decisions 未注册路由"
+grep -q 'func (s \*Server) handleSignalDecisions' "$SDA137" ||
+	fail137 "缺动态仓位只读处理器"
+CNT137=$((CNT137 + 8))
+
+# —— ④ 前端两张卡确实接了接口（不是摆样子） ——
+grep -q 'fetchFundsToday' "$FC137" ||
+	fail137 "资金卡没调 /api/funds/today"
+grep -q 'fetchSignalDecisions' "$DC137" ||
+	fail137 "动态仓位卡没调 /api/signals/decisions"
+CNT137=$((CNT137 + 2))
+
+# —— 行为腿：store 快照读写/日隔离/保留期 + 引擎资金帧落盘/跨日清零 ——
+R137=$(go test ./internal/store/ ./internal/engine/ -count=1 -run 'TestSignalDecision|TestFundsFrame' 2>&1 || true)
+grep_q '^ok' R137 ||
+	{ fail137 "§FUNDS/DECISION 行为腿非绿：$(printf '%s\n' "$R137" | grep -E 'FAIL|_test\.go' | head -3 | tr '\n' ' ')"; }
+CNT137=$((CNT137 + 1))
+
+echo "INFO - §137 覆盖面账：本批动态仓位快照只覆盖**实盘买入评估**（纸面通道的定权在 paper 侧另算，channel 列已预留 paper）；卖出裁决仍走 verdicts 留痕，未并入本表。资金帧由 T 循环每轮发布，T 循环未跑（停用/非交易时段）时 /api/funds/today 仍给 live.account 兜底，但不给 target/room（那是“没有帧”，不是 0）。"
+[ "$B137_FAILED" = "0" ] || exit 1
+echo "ok - §137 §FUNDS-TODAY + §DECISION-TODAY 锁通过（资金帧 6 + 接口 4 + 快照 8 + 前端 2 + 行为腿 1，累计判定点 ${CNT137}）"
 
 echo "==> 全部通过"

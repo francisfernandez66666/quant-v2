@@ -318,7 +318,45 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 		strategicBusy: r.strategicBusy,
 		oppositeLeg:   e.tLiveOppositeLeg,
 	}
+	// §FUNDS-TODAY：每轮把「信号仓 + T 仓」资金事实写成一帧落盘（接口只搬不算）。
+	// 放在读数源接好之后：这一帧描述的是"本轮真正要用来判定的那组数"，不是另取一套。
+	r.publishFunds()
 	return r, ""
+}
+
+// publishFunds 组装并落盘当日资金帧（信号仓 + T 仓）。
+//
+// 口径纪律：
+//   - 全部复用本轮已取好的读数（cash/total/book/targetCurRoom/cashForT/dayLedger），不在这里另算公式；
+//   - 账户冻结/市值取券商快照（含手动委托冻结），与"可用资金"同一张快照的 updated_at 一并透出，
+//     前端据此区分"金额没变"与"快照没更新"；
+//   - 每日清零：帧带 Day，跨日 load 不复活；新交易日首帧之前接口返回 null。
+func (r *tLiveRound) publishFunds() {
+	if r == nil || r.st == nil {
+		return
+	}
+	target, cur, room, _ := r.targetCurRoom()
+	tQuota := 0.0
+	if ms := math.Min(r.p.MarketScale, 1.0); ms < 1 {
+		tQuota = r.total * (1 - ms)
+	}
+	cashT, _ := r.cashForT() // 口径不可得时回 0（cash_ok 字段已经说明"不可得"，不拿 0 冒充）
+	_, done, _, _, openNow, pnlNet, pnlGross := r.st.dayLedger()
+	var acc store.RealAccount
+	if a, err := r.db.GetRealAccount(r.uid); err == nil {
+		acc = a
+	}
+	r.st.setFunds(&tLiveFunds{
+		Day: r.day, At: r.now.Format(time.RFC3339),
+		Cash: r.cash, FrozenCash: acc.FrozenCash, TotalAsset: r.total,
+		MarketValue: acc.MarketValue, CashAt: acc.UpdatedAt, CashOK: r.cashOK,
+		Target: target, CurStrat: cur, Room: room,
+		MarketScale: r.p.MarketScale, MissingKey: r.p.MissingKeyInput,
+		TQuota: tQuota, CashT: cashT, TFrozenCash: r.book.FrozenCash,
+		OpenBuyLegs: r.book.BuyLegValue, OpenSellLegs: r.book.SellLegValue,
+		OpenLegs: openNow, DoneRounds: done,
+		PnlNet: pnlNet, PnlGross: pnlGross,
+	})
 }
 
 // totalAssetsOf 总资产：优先券商快照口径（与 dynamicBuyQty 同优先级），回落账本合计。
@@ -893,7 +931,7 @@ func (r *tLiveRound) strategicAllowedQty(rnd *TRoundLive, price float64, qty int
 	}
 	sc := r.e.sizingConfigFor(r.uid)
 	sig := combat_agent.Signal{Code: rnd.Code, Name: rnd.Name, Direction: "做多", Action: "buy", Price: price}
-	allowed := r.e.dynamicBuyQty(sig, price, 0, sc, r.ctrl,
+	allowed, _ := r.e.dynamicBuyQty(sig, price, 0, sc, r.ctrl,
 		dynBudgetCtx{MarketScale: r.p.MarketScale, StockScale: 1.0, MissingKeyInput: r.p.MissingKeyInput})
 	if allowed > qty {
 		allowed = qty
@@ -1342,13 +1380,24 @@ func (r *tLiveRound) cashForT() (float64, string) {
 // 不调 dynamicBuyQty 是因为它含"单笔基准 10%×SS"与行业/单票额度，那是战略建仓的帽，
 // T 腿刻意不占它（§8.3 隔离纪律 1），拿来缩 T 腿会把日内手法当成第二套战略预算。
 func (r *tLiveRound) strategicRoom() float64 {
+	_, _, room, _ := r.targetCurRoom()
+	return room
+}
+
+// targetCurRoom 目标 / 战略当前 / 剩余（一次算出，供 T 可用现金与「今日资金」读数共用）。
+//
+// 为什么抽出来：同一个式子若在 strategicRoom 和资金帧里各写一遍，某天调了 T 腿净额口径
+// 就会出现"资金卡显示剩余 3 万、T 腿按剩余 2 万算"的双账；抽成一个出口后，
+// 面板看到的和开腿用的是同一组数。
+// 返回 ok=false 表示在途委托读数不可得（此时 room 仍按"只算持仓"给保守值，调用方自行决定是否动钱）。
+func (r *tLiveRound) targetCurRoom() (target, cur, room float64, ok bool) {
 	sc := r.e.sizingConfigFor(r.uid)
 	ceiling := sc.MaxTotalPositionPct
 	if ceiling <= 0 || ceiling > 1 {
 		ceiling = 1.0
 	}
 	ratio := math.Min(r.p.MarketScale, ceiling)
-	target := r.total * ratio
+	target = r.total * ratio
 	var strat float64
 	for code, pos := range r.positions {
 		px := r.prices[code]
@@ -1360,7 +1409,8 @@ func (r *tLiveRound) strategicRoom() float64 {
 	// 在途战略买单（非 t0: 前缀）同样占用目标空间；T 腿由账本按净额口径给。
 	pend, err := r.db.PendingBuys(r.uid, data.TradingDayDate(r.now))
 	if err != nil {
-		return math.Max(0, target-strat) // 在途读不到时不放大 T 额度，也不把战略空间当已花
+		// 在途读不到时不放大 T 额度，也不把战略空间当已花（与旧 strategicRoom 同口径）。
+		return target, strat, math.Max(0, target-strat), false
 	}
 	for _, pb := range pend {
 		if pb.IntradayT {
@@ -1372,11 +1422,10 @@ func (r *tLiveRound) strategicRoom() float64 {
 	if strat < 0 {
 		strat = 0
 	}
-	room := target - strat
-	if room < 0 {
-		return 0
+	if target-strat > 0 {
+		room = target - strat
 	}
-	return room
+	return target, strat, room, true
 }
 
 // ── 开腿与落账 ────────────────────────────────────────────────────────────────────────

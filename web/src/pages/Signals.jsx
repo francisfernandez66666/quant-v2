@@ -15,6 +15,7 @@ import { on } from '../sseBus.js'
 // English: §0925EVE-W3-I — shared TDesign confirmDialog; Android WebView shells silently
 // swallow window.prompt/confirm/alert, so the paper-buy flow moves to the site-wide dialog idiom.
 import { Loading, confirmDialog } from '../ui.jsx'
+import SignalDecisionsCard from '../components/SignalDecisionsCard.jsx' // §DECISION-TODAY 今日动态仓位计算过程
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
 const FILTERS = [
@@ -555,6 +556,9 @@ export default function Signals() {
           <Button size="small" variant="outline" theme="warning" onClick={load}>重试</Button>
         </div>
       )}
+
+      {/* §DECISION-TODAY：今日动态仓位计算过程（因子→目标→额度帽→结果/拒因；含被拦信号） */}
+      <SignalDecisionsCard />
 
       {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板 */}
       <Card>

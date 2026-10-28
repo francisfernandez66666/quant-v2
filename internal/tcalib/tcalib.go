@@ -799,6 +799,9 @@ func aggregate(samples []sample, tierCount int, win WindowInfo, p Params) []Tier
 			st.MinAmplitudePct = round6(math.Max(percentile(amps, 60), minSpread))
 		}
 
+		// 第 1/2 轮收益与 30/60 分钟命中率的分位数汇总：样本只含当日可捕获价差的交易日
+		// （calib 已按成本过滤过），因此这里的分位数就是"这套参数在可做样本上的真实分布"。
+		// 空样本时 median 返回 0，前面的 Note 已显式声明"样本里没有能做的日子"，不会静默成 0。
 		r1 := make([]float64, 0, len(calib))
 		r2 := make([]float64, 0, len(calib))
 		hit30, hit60 := 0, 0

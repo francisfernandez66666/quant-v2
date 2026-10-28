@@ -133,6 +133,16 @@ func TestSellShadowSingleBearNeverHardClears(t *testing.T) {
 	}
 	cases["single级"].bearTier = map[string]bearTierEntry{"600580": {verified: signalctl.BearVerifiedSingle, at: time.Now()}}
 	cases["超龄dual"].bearTier = map[string]bearTierEntry{"600580": {verified: signalctl.BearVerifiedDual, at: time.Now().Add(-bearTierTTL - time.Minute)}}
+	for _, e := range cases {
+		// §SELLBOOST-TEST-ISO（2026-10-28）：本用例锁的是「卖出加权未开启时，单源/超龄 dual 只 hold」。
+		// 但 regime 的宏观影响期（事件日 ±3 天，如每月末 PCE）会把 L2 加权打开，而 L2 对
+		// BearVerifiedSingle 的既定口径就是「单源即硬清」（signalctl/sell_boost_test 正锁）。
+		// 不隔离就会随日历忽红忽绿（2026-10-28 在 PCE 窗口内恒红）。这里显式关掉加权，
+		// 让用例回到它本来要证明的那件事；生产口径一行不动。
+		e.cfgMgr = config.NewManagerWithRules(&config.Rules{
+			Sizing: config.SizingConfig{SellBoostLevel: "off"},
+		})
+	}
 	for name, e := range cases {
 		e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, bear, e.sellUnifiedModeEngine())
 		if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictPass); n != 0 {

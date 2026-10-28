@@ -20,6 +20,7 @@ import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按
 import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
 import MinuteView from '../components/MinuteView.jsx'
 import TRoundsCard from '../components/TRoundsCard.jsx' // §DYN-T 日内回转：做 T 收益独立口径 + 被拦分布
+import FundsOverviewCard from '../components/FundsOverviewCard.jsx' // §FUNDS-TODAY 信号仓/T仓资金一帧
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
 
@@ -1311,6 +1312,8 @@ export default function Paper() {
       {/* §DYN-T 日内回转（做 T）卡：收益独立口径 + 当日被拦分布，纸面/实盘两本账分栏。
           刻意放在三张表之后、弹窗之前：它自带一次独立取数，不参与本页的轮询刷新链。 */}
       <TRoundsCard />
+      {/* §FUNDS-TODAY：当日资金一帧（admin 观测面；普通成员该接口 403 时组件自动不渲染） */}
+      <FundsOverviewCard />
 
       {/* 移动端：持仓行操作菜单 */}
       <Dialog visible={!!sheetPos} header={sheetPos ? sheetPos.code + ' ' + sheetPos.name : ''} onClose={() => setSheetPos(null)} footer={null}>

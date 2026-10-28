@@ -32,6 +32,7 @@ import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢
 import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
 import { fmtCNY2 } from '../utils'
 import { verdictDisplay, sizingDisplay } from './quantVerdicts.js'
+import FundsOverviewCard from '../components/FundsOverviewCard.jsx' // §FUNDS-TODAY 信号仓/T仓资金一帧
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
@@ -1560,6 +1561,9 @@ export default function Quant() {
 
       {/* 链路状态卡片：显示网关地址/熔断状态/紧急停止(kill-switch)/运行模式/执行路径切换 */}
       {renderChainStatusCard()}
+
+      {/* §FUNDS-TODAY：当日信号仓 / T 仓资金（实盘取引擎 funds 帧，纸面取 TargetReadout） */}
+      <FundsOverviewCard />
 
       {/* §U-2 当日委托卡：撤单按钮的宿主（order_id 数据源） */}
       {renderOrdersCard()}

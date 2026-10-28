@@ -742,6 +742,9 @@ func (s *Server) registerRoutes() {
 	// English: read-only §DYN-T surface — paper book from the engine, live book from its file.
 	s.mux.HandleFunc("GET /api/paper/t-rounds", s.authMiddleware(s.handlePaperTRounds))
 	s.mux.HandleFunc("GET /api/t-live/rounds", s.adminMiddleware(s.handleLiveTRounds))
+	// §FUNDS-TODAY（2026-10-28）当日「信号仓 / T 仓」资金一帧：实盘取引擎写下的 funds 帧，
+	// 纸面取 TargetReadout；两者都 day-keyed，新交易日首帧前返回 pending（今日尚未定权）。
+	s.mux.HandleFunc("GET /api/funds/today", s.adminMiddleware(s.handleFundsToday))
 	// §DYN-SIZE v4 目标仓位一帧读数（§8.8 面板展示的唯一出口，全部由账本引擎按下单同式算出）。
 	s.mux.HandleFunc("GET /api/paper/target", s.authMiddleware(s.handlePaperTargetReadout))
 	// §SIGNAL_CONTROLLER 模拟盘战法开关（白名单语义与实盘 /api/config/qmt.strategies 同构）：
@@ -779,6 +782,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/kline", s.authMiddleware(s.handleFixKLine))
 	s.mux.HandleFunc("GET /api/minute", s.authMiddleware(s.handleFixMinute))
 	s.mux.HandleFunc("GET /api/signals", s.authMiddleware(s.handleFixSignals))
+	// §DECISION-TODAY（2026-10-28）今日动态仓位计算过程（只读；被拦/未下单也返回）。
+	s.mux.HandleFunc("GET /api/signals/decisions", s.adminMiddleware(s.handleSignalDecisions))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
 	s.mux.HandleFunc("GET /api/engine_health", s.authMiddleware(s.handleFixEngineHealth))
 	// 消息中心：列表对所有登录用户可读（运营数据系统级共享）；清空/删除为写操作，仅管理员可操作。

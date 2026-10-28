@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/paper"
 )
 
@@ -192,6 +193,7 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"book": "live", "account": uid, "state": state, "reason": reason,
 			"day": day, "rounds": []json.RawMessage{}, "pnl": tPnlView{}, "cost": tCostView{},
+			"funds": nil,
 		})
 		return
 	}
@@ -202,6 +204,9 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		Rounds   []json.RawMessage `json:"rounds"`
 		BlockDay string            `json:"block_day"` // 被拦分布所属日（与 rounds 同日才可信）
 		Blocks   map[string]int    `json:"blocks"`    // 键＝"step|code"，与纸面侧 tBlock 同形
+		// Funds §FUNDS-TODAY：引擎每轮写下的资金帧（原样透传，server 不重算）。
+		// Day 与文件同日才可信；跨日文件里没有有效帧（engine 落盘时已清）。
+		Funds json.RawMessage `json:"funds"`
 	}
 	if err := json.Unmarshal(raw, &st); err != nil {
 		// 解析失败与读取失败同样只报不修：改名、清空、"尽力解析上半段"都是替操作人做决定，
@@ -210,6 +215,7 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 			"book": "live", "account": uid, "state": "corrupt",
 			"reason": "实盘回转账本解析失败（原文件未改动，等待人工核对）",
 			"day":    day, "rounds": []json.RawMessage{}, "pnl": tPnlView{}, "cost": tCostView{},
+			"funds": nil,
 		})
 		return
 	}
@@ -331,6 +337,7 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		"block_steps": blockViews,
 		"ledger":      ledger,
 		"cost":        acc.finalize(),
+		"funds":       st.Funds,
 		"pnl": tPnlView{Net: round2(net), Gross: round2(gross),
 			DoneRounds: done, FeeEstShare: feeEstShare},
 	})
@@ -391,4 +398,77 @@ func dayOfQueryOrToday(raw string) string {
 		return d[0:4] + "-" + d[4:6] + "-" + d[6:8]
 	}
 	return time.Now().Format("2006-01-02")
+}
+
+// handleFundsToday 处理 GET /api/funds/today（admin）：当日「信号仓 / T 仓」资金一帧。
+//
+// 数据来源刻意分成两条，server 只做搬运：
+//   - 实盘：读 `<dataDir>/accounts/<uid>/t_rounds_live.json` 的 funds 帧（引擎每轮写下的
+//     "本轮实际使用的读数"；本接口不重算，避免第二套公式）；
+//   - 纸面：`paper.Engine.TargetReadout()`（与 /api/paper/target 同一个出口）。
+//
+// 每日清零与诚实性：
+//   - 帧自带 Day，只有与当日一致才返回（引擎跨日已清，文件里不会带昨日数）；
+//   - 新交易日首帧之前 state=pending（"今日尚未定权"），**不回落到昨日**；
+//   - 实盘 T 循环未跑（非交易时段/未启用）时仍给 `live.account`（券商资金快照）兜底，
+//     并同时给 `cash_at`，让前端能区分"金额没变"与"快照没更新"。
+//
+// English: one read-only frame of "signal book vs T book" funds for today. Live comes from the
+// engine-published funds frame in the T ledger file (never recomputed here); paper comes from the
+// paper engine's TargetReadout. A new trading day reports pending until the first frame exists.
+func (s *Server) handleFundsToday(w http.ResponseWriter, r *http.Request) {
+	uid := requestUserID(r)
+	if uid == "" || filepath.Base(uid) != uid || strings.ContainsAny(uid, `/\`) {
+		writeError(w, http.StatusForbidden, "无法确定账号")
+		return
+	}
+	if s.cacheDir == "" {
+		writeError(w, http.StatusServiceUnavailable, "数据目录未接入")
+		return
+	}
+	day := cntime.DayCompactOf(cntime.Now())
+	live := map[string]interface{}{"state": "missing", "day": day, "funds": nil,
+		"reason": "该账号还没有实盘回转记录（做 T 未开、或从未成交一条腿）"}
+	path := filepath.Join(s.cacheDir, "accounts", uid, "t_rounds_live.json")
+	if b, err := os.ReadFile(path); err == nil {
+		var st struct {
+			Day   string          `json:"day"`
+			Funds json.RawMessage `json:"funds"`
+		}
+		if uerr := json.Unmarshal(b, &st); uerr != nil {
+			live["state"] = "corrupt"
+			live["reason"] = "实盘回转账本解析失败（原文件未改动，等待人工核对）"
+		} else if len(st.Funds) > 0 && string(st.Funds) != "null" {
+			live["state"] = "ok"
+			live["day"] = st.Day
+			live["funds"] = st.Funds
+			live["reason"] = ""
+		} else {
+			// 文件在但今日还没有资金帧：新交易日首帧前 / 当日尚未进入交易时段。
+			// 这里必须显式说"尚未定权"，不能拿账本里昨日的数顶上。
+			live["state"] = "pending"
+			live["reason"] = "今日尚未定权：引擎还没有写下当日资金帧"
+		}
+	} else if !os.IsNotExist(err) {
+		live["state"] = "corrupt"
+		live["reason"] = "实盘回转账本读取失败（原文件未改动）"
+	}
+	// 账户级兜底：T 循环没跑也要能看到券商资金快照（含手动委托冻结）。
+	if db := s.realDB(); db != nil {
+		if acc, err := db.GetRealAccount(uid); err == nil && acc.UpdatedAt != "" {
+			live["account"] = map[string]interface{}{
+				"cash": acc.AvailableCash, "frozen_cash": acc.FrozenCash,
+				"total_asset": acc.TotalAsset, "market_value": acc.MarketValue,
+				"cash_at": acc.UpdatedAt,
+			}
+		}
+	}
+	paperView := map[string]interface{}{"available": false, "reason": "模拟盘引擎未接入：目标仓位读数不可得（不是 0，也不是满额）"}
+	if pe := s.paperEngineFor(s.operatorID()); pe != nil {
+		paperView = map[string]interface{}{"available": true, "readout": pe.TargetReadout()}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"day": day, "at": cntime.Now().Format(time.RFC3339),
+		"live": live, "paper": paperView,
+	})
 }

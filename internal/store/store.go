@@ -494,6 +494,41 @@ func (d *DB) migrate() error {
 			UNIQUE (user_id, signal_id)
 		)`,
 
+		// §DECISION-TODAY（2026-10-28）信号仓「动态仓位计算过程」快照：一天一条信号一行（last-write），
+		// 记录因子→目标→额度帽→结果/拒因。为什么单独建表而不给 orders 加列：被拦/未下单也要能看见，
+		// 且这些字段是"当次计算的读数"而不是委托事实；混进 orders 会让订单表既长又语义漂移。
+		// day 为北京时间交易日（YYYYMMDD）：每日重新定权，跨日不复活、不累计。
+		// English: per-day, per-signal snapshot of the dynamic sizing computation (including rejected
+		// signals); day-keyed because the allocation is re-derived every trading day, never carried over.
+		`CREATE TABLE IF NOT EXISTS signal_decisions (
+			user_id TEXT NOT NULL DEFAULT '',
+			day TEXT NOT NULL,
+			channel TEXT NOT NULL DEFAULT 'live',
+			signal_id TEXT NOT NULL DEFAULT '',
+			code TEXT NOT NULL,
+			strategy_key TEXT NOT NULL DEFAULT '',
+			at TEXT NOT NULL,
+			stage TEXT NOT NULL DEFAULT '',
+			market_scale REAL DEFAULT 0,
+			stock_scale REAL DEFAULT 0,
+			per_trade_pct REAL DEFAULT 0,
+			total REAL DEFAULT 0,
+			cash REAL DEFAULT 0,
+			target REAL DEFAULT 0,
+			cur_strat REAL DEFAULT 0,
+			room REAL DEFAULT 0,
+			industry_room REAL DEFAULT 0,
+			stock_room REAL DEFAULT 0,
+			cluster_room REAL DEFAULT 0,
+			capped_by TEXT DEFAULT '',
+			qty INTEGER DEFAULT 0,
+			notional REAL DEFAULT 0,
+			missing_key_input INTEGER DEFAULT 0,
+			cash_stale INTEGER DEFAULT 0,
+			reason TEXT DEFAULT '',
+			PRIMARY KEY (user_id, day, channel, code, strategy_key, signal_id)
+		)`,
+
 		// 实盘成交回报：网关成交事件逐条落库（对账/研究用）。
 		// English: real fill reports — one row per gateway trade event (reconciliation/research).
 		`CREATE TABLE IF NOT EXISTS fills (

@@ -2004,6 +2004,19 @@ export async function fetchLiveTRounds(params = {}) {
   return request(`/api/t-live/rounds?${q.toString()}`)
 }
 
+/** 获取当日「动态仓位」计算快照（只读；含被拦/未下单信号，day 缺省今天）。 */
+export async function fetchSignalDecisions(day) {
+  const q = new URLSearchParams()
+  if (day) q.set('day', String(day))
+  // 查询串与路径同段（与 fetchLiveTRounds 同姿势）：§115 的派生按“? 之前才是路径”识别。
+  return request(`/api/signals/decisions?${q.toString()}`)
+}
+
+/** 获取当日「信号仓 / T 仓」资金一帧（只读；实盘取引擎 funds 帧，纸面取 TargetReadout）。 */
+export async function fetchFundsToday() {
+  return request('/api/funds/today')
+}
+
 // §DYN-SIZE v4 / §ANCHOR-FIRST 签字面（六轮 T4-8/B8：dry-run 未签字不写盘）。
 // 两个 GET 永远只读、可反复查；两个 POST 必须带 authorize=签字 token 才写资金参数。
 // token 的唯一真源在后端（internal/server/signoff_api.go 的 v4SignoffToken），前端只从

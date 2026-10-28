@@ -1518,7 +1518,34 @@ func (e *Engine) tLiveFor(uid string) *tLiveStore {
 	return rg.get(uid)
 }
 
-func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64, sizingCfg config.SizingConfig, ctrl *trading.Controller, ctx dynBudgetCtx) int {
+// dynBuyReadout §DECISION-TODAY（2026-10-28）一次动态预算计算的读数快照。
+//
+// 只看"这一笔为什么是这个量/为什么没买"需要的数：定权拆分（MS/SS/单笔占比）→ 账户目标层
+// （总资产/现金/目标/当前/剩余）→ 三道额度帽（行业/单票/簇）→ 结果（数量/受限项/拒因）。
+// 它只描述当次计算，不参与判定；调用方负责落 signal_decisions（被拦也落）。
+type dynBuyReadout struct {
+	At              time.Time
+	MarketScale     float64
+	StockScale      float64
+	PerTradePct     float64
+	Total           float64
+	Cash            float64
+	Target          float64
+	CurStrat        float64
+	Room            float64
+	IndustryRoom    float64
+	StockRoom       float64
+	ClusterRoom     float64
+	CappedBy        string
+	SkipReason      string
+	Qty             int
+	Notional        float64
+	MissingKeyInput bool
+	CashStale       bool
+}
+
+func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64, sizingCfg config.SizingConfig, ctrl *trading.Controller, ctx dynBudgetCtx) (int, *dynBuyReadout) {
+	out := &dynBuyReadout{At: time.Now(), MissingKeyInput: ctx.MissingKeyInput}
 	e.mu.RLock()
 	st := e.realStore
 	uid := e.userID
@@ -1529,7 +1556,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	}
 	if st == nil || uid == "" || mkt == nil {
 		log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：账本/账号/行情未就绪", sig.Code)
-		return 0
+		out.SkipReason = "账本/账号/行情未就绪"
+		return 0, out
 	}
 	// 基数优先用券商 total_asset（与方案一致）；缺失才回落账本合计。
 	total := 0.0
@@ -1538,20 +1566,26 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	} else if v, err := st.TotalAssets(uid); err == nil && v > 0 {
 		total = v
 	}
+	out.Total = total
 	if total <= 0 {
 		log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：总资产不可得", sig.Code)
 		opslog.DayOnce("dynbudget-equity:"+sig.Code, func() {
 			opslog.Logf("quant", "§DYN-SIZE-v3 总资产不可得，跳过 %s(%s)", sig.Code, sig.Name)
 		})
-		return 0
+		out.SkipReason = "总资产不可得"
+		return 0, out
 	}
 	cash, fresh := ctrl.AvailableCash()
+	out.Cash = cash
+	out.CashStale = !fresh
 	if !fresh {
 		log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：可用资金口径不可得", sig.Code)
 		opslog.DayOnce("dynbudget-cash:"+sig.Code, func() {
 			opslog.Logf("quant", "§DYN-SIZE-v3 可用资金不可得，跳过 %s(%s)", sig.Code, sig.Name)
 		})
-		return 0
+		out.CashStale = true
+		out.SkipReason = "可用资金口径不可得"
+		return 0, out
 	}
 
 	// 行业/单票额度分母=总资产；上限默认 35%，账号配置为正数时以配置为准。
@@ -1588,7 +1622,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		opslog.DayOnce("dyntarget-posread:"+sig.Code, func() {
 			opslog.Logf("quant", "§DYN-TARGET 持仓读取失败跳过 %s 原因=%v", sig.Code, err)
 		})
-		return 0
+		out.SkipReason = "持仓读取失败（fail-closed）"
+		return 0, out
 	}
 	posPrices := map[string]float64{} // 供 T 腿按同一轮行情折市值（与底仓同源，不另取快照）
 	for _, p := range poses {
@@ -1625,7 +1660,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		opslog.DayOnce("dyntarget-pendread:"+sig.Code, func() {
 			opslog.Logf("quant", "§DYN-TARGET 在途买单读取失败跳过 %s 原因=%v", sig.Code, err)
 		})
-		return 0
+		out.SkipReason = "在途买单读取失败"
+		return 0, out
 	}
 	for _, pb := range pend {
 		code := pureTsCode(pb.Code)
@@ -1663,7 +1699,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 				opslog.Logf("quant", "§B0 持仓数上限 %s(%s) 上限=%d 当前=%d 总资产=%.0f 策略=%s/%s",
 					sig.Code, sig.Name, maxPos, len(held), total, sig.StrategyID, sig.Strategy)
 			})
-			return 0
+			out.SkipReason = fmt.Sprintf("持仓数已达上限 %d（当前 %d 只）", maxPos, len(held))
+			return 0, out
 		}
 	}
 	if curUnknown {
@@ -1671,7 +1708,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		opslog.DayOnce("dyntarget-posprice:"+sig.Code, func() {
 			opslog.Logf("quant", "§DYN-TARGET 持仓缺价跳过 %s 总资产=%.0f", sig.Code, total)
 		})
-		return 0
+		out.SkipReason = "有持仓无法定价（fail-closed）"
+		return 0, out
 	}
 
 	targetInd := industryOf(sig.Code)
@@ -1735,6 +1773,9 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	if room < 0 {
 		room = 0
 	}
+	out.MarketScale, out.StockScale = marketScale, stockScale
+	out.PerTradePct = perTradePct
+	out.Target, out.CurStrat, out.Room = targetVal, curStrat, room
 	// 缩放：影子/未开启时中性 1.0；否则用 MarketScale×StockScale（定权未跑时回落控制器给的 buyScale）。
 	scale := 1.0
 	if sizingCfg.EnabledOn() && !sizingCfg.ShadowOn() {
@@ -1784,6 +1825,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	if !targetRoomSet && sizingCfg.ShadowOn() {
 		log.Printf("[qmt] %s(%s) §DYN-TARGET 影子期读数：目标=%.0f 剩余=%.0f（不收紧，仅留痕）", sig.Code, sig.Name, targetVal, room)
 	}
+	out.IndustryRoom, out.StockRoom, out.ClusterRoom = res.IndustryRoom, res.StockRoom, res.ClusterRoom
+	out.CappedBy, out.SkipReason = res.CappedBy, res.SkipReason
 	if res.SkipReason != "" {
 		log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 跳过：%s（总资产=%.0f 缩放=%.3f 行业=%q 行业额度=%.0f 单票额度=%.0f 现金=%.0f 簇额度=%.0f 簇已用=%.0f）",
 			sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash,
@@ -1793,7 +1836,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 				sig.Code, sig.Name, res.SkipReason, total, scale, targetInd, res.IndustryRoom, res.StockRoom, cash,
 				res.ClusterRoom, clusterRead.Value, sig.StrategyID, sig.Strategy)
 		})
-		return 0
+		out.Qty, out.Notional = 0, 0
+		return 0, out
 	}
 	log.Printf("[qmt] %s(%s) §DYN-SIZE-v3 预算 qty=%d 金额=%.0f（总资产=%.0f 缩放=%.3f 约束=%s 行业=%q 行业额度=%.0f 单票额度=%.0f）",
 		sig.Code, sig.Name, res.Qty, res.Notional, total, scale, res.CappedBy, targetInd, res.IndustryRoom, res.StockRoom)
@@ -1808,7 +1852,56 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		opslog.Logf("quant", "§DYN-SIZE-v3 预算 %s(%s) qty=%d 金额=%.0f 总资产=%.0f 缩放=%.3f 约束=%s 行业=%s 行业额度=%.0f 单票额度=%.0f 策略=%s/%s",
 			sig.Code, sig.Name, res.Qty, res.Notional, total, scale, res.CappedBy, targetInd, res.IndustryRoom, res.StockRoom, sig.StrategyID, sig.Strategy)
 	})
-	return res.Qty
+	out.Qty, out.Notional = res.Qty, res.Notional
+	return res.Qty, out
+}
+
+// persistDynBuyDecision §DECISION-TODAY（2026-10-28）把一次动态预算计算落成当日快照。
+//
+// 粒度：同账号、同日、同代码、同战法一天一行（last-write）——用户要回答的是
+// "今天这只票按什么算的/为什么没买"，而不是每次扫描的时间序列。
+// 落库失败只告警不阻断下单：观测面不能反过来拦资金路径。
+// 保留期：启动不清理，日切时按 45 天自然日清一次（30 个交易日量级）。
+func (e *Engine) persistDynBuyDecision(sig combat_agent.Signal, d *dynBuyReadout) {
+	if d == nil {
+		return
+	}
+	e.mu.RLock()
+	st := e.realStore
+	uid := e.userID
+	e.mu.RUnlock()
+	if st == nil || uid == "" {
+		return
+	}
+	day := data.TradingDayDate(d.At)
+	stage := "evaluated"
+	if d.Qty <= 0 {
+		stage = "skipped"
+	}
+	reason := d.SkipReason
+	if reason == "" && d.CappedBy != "" {
+		reason = "受限于 " + d.CappedBy
+	}
+	if err := st.UpsertSignalDecision(store.SignalDecision{
+		UserID: uid, Day: day, Channel: "live",
+		Code: pureTsCode(sig.Code), Strategy: signalctl.StrategyKeyOf(sig),
+		At: d.At.Format(time.RFC3339), Stage: stage,
+		MarketScale: d.MarketScale, StockScale: d.StockScale, PerTradePct: d.PerTradePct,
+		Total: d.Total, Cash: d.Cash, Target: d.Target, CurStrat: d.CurStrat, Room: d.Room,
+		IndustryRoom: d.IndustryRoom, StockRoom: d.StockRoom, ClusterRoom: d.ClusterRoom,
+		CappedBy: d.CappedBy, Qty: d.Qty, Notional: d.Notional,
+		MissingKeyInput: d.MissingKeyInput, CashStale: d.CashStale, Reason: reason,
+	}); err != nil {
+		log.Printf("[qmt] %s §DECISION-TODAY 决策快照落库失败（不阻断下单）：%v", sig.Code, err)
+		return
+	}
+	opslog.DayOnce("sd-prune:"+day, func() {
+		if cutoff, err := time.Parse("20060102", day); err == nil {
+			if _, perr := st.PruneSignalDecisions(cutoff.AddDate(0, 0, -45).Format("20060102")); perr != nil {
+				log.Printf("[qmt] §DECISION-TODAY 保留期清理失败（下次日切再试）：%v", perr)
+			}
+		}
+	})
 }
 
 // autoPlaceScaled §DYN-SIZE 执行层入口（带动态仓位缩放）。
@@ -2081,7 +2174,10 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	}
 	qty := 0
 	if dynamicBudget {
-		qty = e.dynamicBuyQty(sig, price, buyScale, sizingCfg, ctrl, ctx)
+		var dec *dynBuyReadout
+		qty, dec = e.dynamicBuyQty(sig, price, buyScale, sizingCfg, ctrl, ctx)
+		// §DECISION-TODAY：无论放行还是被拦都落一行快照（"没买"也必须有解释）。
+		e.persistDynBuyDecision(sig, dec)
 		if qty <= 0 {
 			// 具体原因在 dynamicBuyQty 内已按 DayOnce 留痕；这里只结束本单。
 			return
