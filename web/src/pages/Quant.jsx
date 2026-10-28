@@ -183,6 +183,15 @@ export default function Quant() {
   // English: §M-9 — a failed orders fetch sets ordersError so the card shows a retryable
   // error instead of hanging on the loading placeholder forever.
   const [ordersError, setOrdersError] = useState('')
+  // §FIX-20261028-F05（2026-10-29）：生效的禁撤/禁挂窗口（北京时间，来自 /api/config/qmt）。
+  // 缺陷本体：窗口只在事后 409 文案里出现，客户点撤单前完全看不到"现在不许撤"。
+  // 缺键时保持空对象（不渲染该段），绝不渲染 undefined。
+  const [qmtWindows, setQmtWindows] = useState({})
+  // §FIX-20261028-F06（2026-10-29）：收盘对账读数（透传网关 /admin/status 的 close_snapshot）。
+  // 三态严格分离：null+err=查询失败（可见）／available:false=尚未产出／available:true=读数在。
+  // 失败与"没产出"绝不渲染成 0 笔——那是把"不知道"说成"没有成交"。
+  const [closeRecon, setCloseRecon] = useState(null)
+  const [closeReconErr, setCloseReconErr] = useState('')
   // §0925EVE-W3-G（FIX_PLAN ⑫ C3）第三态「待核对委托」面板：网关对「已交给通道、结算结果不明」
   // 的委托保留「待核对」占位，此前只能 curl 打网关 /admin/status + /admin/order-confirm 收敛。
   // 三态分离沿用 §M-9 教训：pendingReview==null 且 pendingReviewError 非空 =「查询失败」
@@ -232,6 +241,8 @@ export default function Quant() {
   // §N-09：四条 admin 只读轮询统一走 usePolling——后台暂停、恢复补一次、卸载/止血清理。
   usePolling(loadState, 60000, pollingActive)
   usePolling(loadOrders, 60000, pollingActive)
+  // §FIX-20261028-F06：收盘对账同频刷新（收盘后才有值；盘中也照询，读到 available:false 即"未产出"）
+  usePolling(loadCloseRecon, 60000, pollingActive)
   usePolling(loadPendingReview, 60000, pollingActive)
   usePolling(loadTrades, 60000, pollingActive)
   // §0926E2E-17A：实盘链路 SSE 事件的取消订阅句柄（挂载注册、stopPolling/卸载回收）
@@ -418,6 +429,12 @@ export default function Quant() {
       writeCachedForm(nextForm)
       // §U-2 kill-switch 当前态随配置回显（config.halted），供紧急停止按钮显示"置位/解除"
       setHalted(!!c.halted)
+      // §FIX-20261028-F05：窗口串随配置一起回显（服务端回的是**生效值**，不是配置原文；
+      // 空串即"该侧没有额外配置"，界面按缺省不渲染）。脏守卫分支也回填——它只读安全态。
+      setQmtWindows({
+        no_cancel_windows: c.no_cancel_windows || '',
+        no_new_order_windows: c.no_new_order_windows || '',
+      })
       // 后端 known_strategies 可能为对象数组 [{id,name,kind}]（新）或纯 ID 数组（旧），统一归一
       let list = []
       if (Array.isArray(c.known_strategies)) {
@@ -604,6 +621,19 @@ export default function Quant() {
         // 不再让「加载委托列表…」无限转圈冒充加载态。
         setOrdersError(e && e.message ? String(e.message) : '委托列表加载失败（网络/服务异常）')
       }
+    }
+  }
+
+  // 拉取收盘对账读数（§FIX-20261028-F06）。403 走无权限面板；502/503 记可见错误。
+  // 注意：读失败与 available:false 必须分开——前者是"读不到"，后者是"还没产出"。
+  async function loadCloseRecon() {
+    try {
+      const r = await api.fetchCloseSnapshot()
+      setCloseRecon(r || null)
+      setCloseReconErr('')
+    } catch (e) {
+      if (noteForbidden(e)) return
+      setCloseReconErr(e && e.message ? String(e.message) : '收盘对账读数不可得')
     }
   }
 
@@ -1437,6 +1467,14 @@ export default function Quant() {
     return (
       <Card title="当日委托" style={{ marginBottom: 14 }}>
         <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤），并每 10s 与券商当日委托表对账（手动单标记「手动」）；撤单请求发出后显示「撤单中」，须等交易所确认才转已撤/部撤/已成（期间不可重复撤单）；10s 刷新</div>
+        {/* §FIX-20261028-F05：把**生效的**禁撤/禁挂窗口摆到操作者眼前。
+            此前窗口只在事后 409 文案里出现（14:57 点撤单才知道"这个时段不能撤"）。
+            缺键（旧后端/未接实盘）时整段不渲染——不渲染 undefined，也不编造窗口。 */}
+        {(qmtWindows.no_cancel_windows || qmtWindows.no_new_order_windows) ? (
+          <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>
+            时段闸（北京时间）：禁撤窗口 {qmtWindows.no_cancel_windows || '—'}；禁挂窗口 {qmtWindows.no_new_order_windows || '—'}。窗口内的请求会被直接拒绝，不会送到交易所。
+          </div>
+        ) : null}
         {/* §M-9（2026-09-22 修复批）三态分离：loading（orders==null 且无错误）/
             error（可重试提示，不再无限「加载中」）/ 空（今日暂无委托）/ 有数据（表格）。 */}
         {orders == null && ordersError ? (
@@ -1452,7 +1490,26 @@ export default function Quant() {
         ) : (
           <div style={{ padding: '8px 2px', color: 'var(--app-text-2)', fontSize: 13 }}>今日暂无实盘委托</div>
         )}
-      </Card>
+        {/* §FIX-20261028-F06：收盘对账读数（透传网关 close_snapshot）。
+            三态严格分开：失败（可见）／尚未产出（available:false）／读数在。
+            任何一态都不允许渲染成 "orders=0"——"没读/没产出"与"0 笔"是两件事。 */}
+        <div style={{ fontSize: 11, marginTop: 10, paddingTop: 8, borderTop: '1px solid var(--app-border-2, #e5e6eb)', color: 'var(--app-text-2)' }}>
+          {closeReconErr ? (
+            <span style={{ color: 'var(--td-warning-color)' }}>⚠ 收盘对账：{closeReconErr}</span>
+          ) : !closeRecon ? (
+            <span>收盘对账：读取中…</span>
+          ) : !closeRecon.available ? (
+            <span>收盘对账：{closeRecon.reason || '尚未产出'}</span>
+          ) : (
+            <span>
+              收盘对账：{closeRecon.snapshot?.day || '—'} {String(closeRecon.snapshot?.at || '').replace('T', ' ').slice(5, 19)}
+              {' · '}委托 {closeRecon.snapshot?.orders_n ?? '—'}
+              {' · '}持仓 {closeRecon.snapshot?.positions_n ?? '—'}
+              {' · '}成交 {closeRecon.snapshot?.trades_n ?? '—'}
+            </span>
+          )}
+        </div>
+      </Card >
     )
   }
 

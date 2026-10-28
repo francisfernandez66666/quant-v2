@@ -346,6 +346,10 @@ export default function Watchlist() {
   }
 
   // 删除指定自选股
+  //
+  // §FIX-20261028-F11（2026-10-29）：后端现在会如实回 404 not_in_watchlist（那条码本来就不在
+  // 自选里）。此前的"成功即本地移除"会把"没删掉"也画成已移除，刷新后又回来——现在 404 分支
+  // **不做本地移除**并明确告知，界面与服务端不再分叉。
   async function remove(code) {
     try {
       await api.removeWatchlist(code)
@@ -355,7 +359,13 @@ export default function Watchlist() {
       if (next.length) persistCache(next, lastQuoteAtRef.current)
       else clearCache()
       MessagePlugin.success('已移除 ' + code)
-    } catch (e) { MessagePlugin.error('删除失败: ' + (e.message || '')) }
+    } catch (e) {
+      if (e && e.status === 404) {
+        MessagePlugin.warning('该代码不在自选中（未做本地移除）')
+        return
+      }
+      MessagePlugin.error('删除失败: ' + (e.message || ''))
+    }
   }
 
   // 展开/收起指定代码的分时图

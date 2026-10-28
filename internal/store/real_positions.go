@@ -1726,6 +1726,36 @@ func (d *DB) MarkRealOrderCancelRequested(userID, orderID, source, reason string
 	return n > 0, nil
 }
 
+// SetCancelTrace §FIX-20261028-F14（2026-10-29）：**只写撤单留痕三列**，不碰状态、不带状态守卫。
+//
+// 缺陷本体：MarkRealOrderCancelRequested 的 UPDATE 带 `status IN ('已报','部成',…)` 守卫，
+// 撤单请求发出后若**终态回报先到**（快速受理/秒撤的柜台、或 sweep 批量），CAS 落空、只打一行日志，
+// 于是 cancel_requested_at/source/reason 三列永远为空 —— 事故复盘问"这单谁在几点撤的"没有据。
+// 本地 UAT 实测：8 条真撤单行的三列全空（mock 秒回）。
+//
+// 本函数专治这个竞态：调用方在**请求发出成功后**调用，只补三列，行已被推成终态也照写。
+// 已有值不覆盖：用 `CASE WHEN ...='' OR ... IS NULL`（**不能用 COALESCE**——这三列默认写空串，
+// COALESCE 只处理 NULL，写空串时它会认为"有值"从而拒绝写入，等于没修）。
+func (d *DB) SetCancelTrace(userID, orderID, source, reason string) (bool, error) {
+	if orderID == "" {
+		return false, nil
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	res, err := d.db.Exec(`UPDATE orders SET
+		cancel_requested_at = CASE WHEN cancel_requested_at = '' OR cancel_requested_at IS NULL THEN ? ELSE cancel_requested_at END,
+		cancel_source       = CASE WHEN cancel_source = ''       OR cancel_source IS NULL       THEN ? ELSE cancel_source END,
+		cancel_reason       = CASE WHEN cancel_reason = ''       OR cancel_reason IS NULL       THEN ? ELSE cancel_reason END
+		WHERE order_id=? AND (user_id='' OR user_id=?)`, now, source, reason, orderID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // AdvanceRealOrderStatus §R4-4 带单调守卫的委托状态推进（按 signal_id 定位）：
 // 仅当回报状态的秩高于本地当前秩时才更新——修掉"回报 部成/已成/已撤 被 INSERT OR IGNORE
 // 静默吞掉、本地永远停留已报"的状态机断链（该断链会让自动撤单误撤已成交单，资损级前置）。
@@ -1843,12 +1873,24 @@ func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
 			return "", err
 		}
 		// §CANCEL-STATE 留痕：进入撤单中时补请求时刻（回报路径没有请求时刻，用回报到达时刻）；
-		// 被拒时把拒因写进 cancel_reason。终态不改这两列（历史证据保留）。
+		// 被拒时把拒因写进 cancel_reason。
+		//
+		// §FIX-20261028-F14（2026-10-29）：终态（已撤/部撤）同样要补**来源**——否则"回报先于
+		// 本地留痕到达"时三列全空，复盘问"谁撤的"没有据。但终态**不补时刻**：此刻并不知道真实
+		// 撤单时刻，拿委托创建时刻冒充就是伪造读数（本仓底线）。只写 source/reason。
 		if o.Status == "撤单中" {
 			if o.UserID == "" {
 				_, _ = tx.Exec(`UPDATE orders SET cancel_requested_at=CASE WHEN COALESCE(cancel_requested_at,'')='' THEN ? ELSE cancel_requested_at END, cancel_source=CASE WHEN COALESCE(cancel_source,'')='' THEN 'gateway' ELSE cancel_source END WHERE signal_id=? AND user_id=''`, o.CreatedAt, o.SignalID)
 			} else {
 				_, _ = tx.Exec(`UPDATE orders SET cancel_requested_at=CASE WHEN COALESCE(cancel_requested_at,'')='' THEN ? ELSE cancel_requested_at END, cancel_source=CASE WHEN COALESCE(cancel_source,'')='' THEN 'gateway' ELSE cancel_source END WHERE signal_id=? AND user_id=?`, o.CreatedAt, o.SignalID, o.UserID)
+			}
+		}
+		// §FIX-20261028-F14：终态回报兜底——只补来源与说明，不补时刻（不伪造撤单时间）。
+		if o.Status == "已撤" || o.Status == "部撤" {
+			if o.UserID == "" {
+				_, _ = tx.Exec(`UPDATE orders SET cancel_source=CASE WHEN COALESCE(cancel_source,'')='' THEN 'gateway' ELSE cancel_source END, cancel_reason=CASE WHEN COALESCE(cancel_reason,'')='' THEN '网关回报终态（回报未携带撤单请求时刻）' ELSE cancel_reason END WHERE signal_id=? AND user_id=''`, o.SignalID)
+			} else {
+				_, _ = tx.Exec(`UPDATE orders SET cancel_source=CASE WHEN COALESCE(cancel_source,'')='' THEN 'gateway' ELSE cancel_source END, cancel_reason=CASE WHEN COALESCE(cancel_reason,'')='' THEN '网关回报终态（回报未携带撤单请求时刻）' ELSE cancel_reason END WHERE signal_id=? AND user_id=?`, o.SignalID, o.UserID)
 			}
 		}
 		if strings.HasPrefix(o.Reason, "§CANCEL-REJECT") {

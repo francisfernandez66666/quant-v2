@@ -148,7 +148,10 @@ export default function FundsOverviewCard() {
         {funds && funds.at ? ` · 信号仓取数 ${hhmmss(funds.at)}` : ''}
         {data && data.at ? ` · 接口时刻 ${String(data.at).replace('T', ' ').slice(5, 19)}` : ''}
         {cashAt ? ` · 券商资金快照 ${String(cashAt).slice(5, 19)}` : ''}
-        {pending ? ' · 引擎尚未写下今日资金帧（新交易日首帧前属正常）' : ''}
+        {/* §FIX-20261028-F07（2026-10-29）：pending 时优先显示**接口给的原因**（live.reason），
+            没有才回落到固定句。缺陷本体：后端已经分好 pending/missing 与具体原因，界面却用
+            一句固定的"属正常"顶替 ⇒ 运维在屏上读不到真因（现网 pending 与本地 missing 同形）。 */}
+        {pending ? ` · ${live.reason || '引擎尚未写下今日资金帧（新交易日首帧前属正常）'}` : ''}
       </div>
       {error ? <div style={{ color: 'var(--td-warning-color)', fontSize: 12 }}>⚠ {error}</div> : null}
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>

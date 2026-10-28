@@ -13,6 +13,9 @@ import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
+// §FIX-20261028-F09：读取失败按腿记账（共享 hook + 共享红条，testid 全站唯一）
+import { useLoadLedger } from '../utils/loadLedger.js'
+import LoadFailBanner from '../components/LoadFailBanner.jsx'
 // §H-2（2026-09-22 修复批）：editBalanceSave 的失败分支调用 showToast，但导入区一直没有
 // ui.jsx —— 保存可用资金一旦失败即抛 ReferenceError（异步未捕获、用户零提示）。补齐导入。
 // English: §H-2 — showToast was called without being imported; the save-failure branch died
@@ -25,6 +28,7 @@ const CACHE_KEY = 'pos_cache_v1'
 
 // 将持仓与资金缓存到 localStorage
 function persistCache(holdings, balance) {
+  // §P2-J 可吞：本地缓存写入失败（配额满/隐私模式）不影响主流程，下一次成功写入即覆盖。
   try { localStorage.setItem(CACHE_KEY, JSON.stringify({ holdings, balance })) } catch (_) {}
 }
 // 从 localStorage 读取持仓与资金缓存
@@ -35,7 +39,7 @@ function loadCache() {
     if (d) {
       return { holdings: Array.isArray(d.holdings) ? d.holdings : [], balance: d.balance || 0 }
     }
-  } catch (_) {}
+  } catch (_) {} // §P2-J 可吞：缓存损坏按"无缓存"处理（随后回源取数），不需要打扰用户
   return { holdings: [], balance: 0 }
 }
 
@@ -199,6 +203,8 @@ export default function Positions() {
   // admin 守卫（server.go:629-634/660-662）；成员点击必 403。前端按 admin 收敛写入口、
   // 实盘 tab 显示无权限面板（此前 403 被 loadReal 的 catch 静默吞成"空表"，误导为无持仓）。
   const admin = api.isAdmin()
+  // §FIX-20261028-F09：实盘三段拉取的失败台账（失败请名到腿、成功即销案、不清旧读数）
+  const ledger = useLoadLedger()
 
   // §N-09：纸面/实盘两条轮询统一走 usePolling——后台暂停、恢复补一次、卸载清理。
   // 实盘只在 admin 且当前标签为「实盘」时轮询（与旧 switchBook 的启停语义一致）。
@@ -366,7 +372,8 @@ export default function Positions() {
         setServerReadingStale(false)
       }
     } catch (_) {
-      // 不弹 toast：这条是 60s 轮询，持续故障时会每分钟刷一条；页头徽标常驻更合适。
+      // §P2-J 可吞：不弹 toast（60s 轮询持续故障会每分钟刷屏），改为页头徽标常驻 stale
+      // ——失败可见性由"服务端读数字样 + 徽标"承担，属于本页既有的显式降级口径。
       setServerReadingStale(true)
     }
   }
@@ -436,7 +443,7 @@ export default function Positions() {
       const data = await api.fetchStockLookup(c)
       if (data && data.name) { setLookupName(data.name); setLookupPrice(data.price || 0) }
       else { setLookupName('未找到'); setLookupPrice(0) }
-    } catch (_) { setLookupName('') }
+    } catch (_) { setLookupName('') } // §P2-J 可吞：查名失败只影响输入框的名称提示，价格/数量照常提交
   }
 
   // 清空新增/编辑持仓表单（代码、成本、数量、查得名称/现价、止盈止损归零）
@@ -523,7 +530,7 @@ export default function Positions() {
     try {
       const data = await api.fetchStockLookup(code)
       if (data && data.price > 0) { setLotCurrentPrice(data.price); setLotFormPrice(data.price) }
-    } catch (_) {}
+    } catch (_) {} // §P2-J 可吞：弹窗预填价取不到时用户仍可手输，提交时后端会再校验
   }
   // 确认加/减仓操作并同步后端
   async function confirmLot() {
@@ -618,22 +625,40 @@ export default function Positions() {
     }
   }
   // 加载 QMT 状态与实盘持仓
+  //
+  // §FIX-20261028-F09（2026-10-29）：三段此前都是 `catch (_) {}`——请求失败后什么都不留，
+  // 界面照常显示上一轮读数或空表。用户会把"读不到实盘"读成"实盘没有持仓"（本轮 UAT 用
+  // page.route 阻断 /api/positions/real 复现：屏上零失败提示）。
+  // 现在接仓里统一的"按腿记账"设施（useLoadLedger）：失败只点名那一腿、不清旧数据，
+  // 成功即销案；页头用共享的 LoadFailBanner 渲染（testid=load-ledger 全站唯一）。
   async function loadReal() {
     if (!admin) return // §PERM-GATE：成员无实盘读权限（admin 守卫），不发起必 403 的请求
     const token = realGuard.current.begin() // §M-10 本轮代号（三段拉取共用一次判定）
-    try { const st = await api.fetchQMTState(); if (st && !realGuard.current.isStale(token)) setQmtState(st) } catch (_) {}
+    const failMsg = (e) => (e && e.message ? String(e.message) : '请求失败')
+    try {
+      const st = await api.fetchQMTState()
+      if (st && !realGuard.current.isStale(token)) { setQmtState(st); ledger.clear('实盘状态') }
+    } catch (e) {
+      ledger.mark('实盘状态', failMsg(e))
+    }
     try {
       const data = await api.fetchRealPositions()
       if (realGuard.current.isStale(token)) return
       if (data && Array.isArray(data.positions)) setRealPositions(data.positions)
       if (data && data.account) setRealAccount(data.account)
-    } catch (_) {}
+      ledger.clear('实盘持仓')
+    } catch (e) {
+      ledger.mark('实盘持仓', failMsg(e))
+    }
     // §F1 实盘整体盈亏（已实现+浮动）：页头优先展示，无实盘才回落纸面
     try {
       const t = await api.fetchQMTTrades()
       if (realGuard.current.isStale(token)) return
       if (t && t.summary) setRealTrades(t.summary)
-    } catch (_) {}
+      ledger.clear('实盘成交')
+    } catch (e) {
+      ledger.mark('实盘成交', failMsg(e))
+    }
   }
   // 取实盘持仓的有效现价（无效价返回 0，避免展示脏数据）
   function curPrice(p) { return (p.cur_price && p.cur_price > 0) ? p.cur_price : 0 }
@@ -733,7 +758,9 @@ export default function Positions() {
         await submit(base)
       } catch (e) {
         const msg = String((e && e.message) || '')
-        if (!msg.includes('无法获取实时现价')) throw e
+        // §P2-J 可吞（非吞错）：这里不是"吃掉错误"——非"无现价"类错误原样 throw 给调用方；
+      // 只有"取不到实时现价"会走 confirmNoQuote() 弹二次确认，由用户决定是否仍要下单。
+      if (!msg.includes('无法获取实时现价')) throw e
         await confirmNoQuote()
         await submit({ ...base, confirm_no_quote: true })
       }
@@ -816,7 +843,7 @@ export default function Positions() {
     if (admin) {
       api.fetchRealAdvice().then((r) => {
         if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices)
-      }).catch(() => {})
+      }).catch(() => {}) // §P2-J 可吞：建议列是增强信息，失败时保留上一轮映射（§F-6 口径）
     }
     // 卸载时清理：轮询由 usePolling 负责，这里只取消 SSE 订阅
     return () => {
@@ -903,6 +930,8 @@ export default function Positions() {
 
   return (
     <div className="page">
+      {/* §FIX-20261028-F09：实盘读腿失败必须可见（否则"读不到"被画成"实盘无持仓"） */}
+      <LoadFailBanner fails={ledger.fails} page="Positions" />
       <Card style={{ marginBottom: 16 }}>
         <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>持仓管理</h2>

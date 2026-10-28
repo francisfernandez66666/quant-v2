@@ -764,10 +764,16 @@ async function requestInner(path, opts = {}) {
  * @returns {Promise<object>} { token, account, expires_at }
  */
 // §F-09：登录失败的中文话术表。原始英文串继续进控制台（可诊断性不换），只把对客文案中文化。
+// §FIX-20261028-F04（2026-10-29）：后端对"账号到期/停用"改为回 403 + {error:"account_expired"|
+// "account_disabled"}（不再与口令错同形），这里必须同批登记，否则新码会落到兜底句
+// 「登录失败，请稍后重试」，用户仍然看不到"该续期了"。防枚举口径不变：口令错/用户不存在
+// 仍是 401 invalid credentials，文案仍是「账号或密码不正确」。
 const LOGIN_ERR_TEXT = {
   'invalid credentials': '账号或密码不正确',
   'username and password required': '请填写账号和密码',
   'invalid request body': '请求格式不正确，请重试',
+  'account_expired': '账号已过期，请联系管理员续期',
+  'account_disabled': '账号已停用，请联系管理员',
 }
 function loginErrorMessage(raw, status) {
   const key = String(raw || '').trim()
@@ -1011,6 +1017,21 @@ export async function fetchQMTOrders() {
   return request('/api/qmt/orders')
 }
 
+/**
+ * 收盘对账读数（§CLOSE-RECON 的产品出口，§FIX-20261028-F06）。
+ *
+ * 对应 GET /api/qmt/close-snapshot（admin），返回三态：
+ *   { available:true,  snapshot:{ day, at, orders_n, positions_n, trades_n } }
+ *   { available:false, reason:"网关尚未产出收盘对账…" }
+ *   502/503 时 request() 会抛出带后端文案的错误（调用方必须渲染失败态，不得显示 0）。
+ * 为什么要这个包装：读数来自网关 /admin/status，Go 侧只透传不重算；界面拿到
+ * available:false 与 502 是两件事（"还没产出" vs "网关读不到"），前端要分开显示。
+ * English: close-reconciliation readout passthrough (available:false is NOT "zero trades").
+ */
+export async function fetchCloseSnapshot() {
+  return request('/api/qmt/close-snapshot')
+}
+
 /** 实盘 kill-switch：置位/解除人工紧急停止（§R4-1/§U-2；资损级，仅 admin） */
 /** Live kill-switch: engage/release manual emergency halt (admin only) */
 // 对应 POST /api/qmt/halt，body { halted: true|false }，返回 { ok, halted, cancelled, failed }
@@ -1117,8 +1138,38 @@ export async function fetchPaperTrades() {
 /** 模拟盘：订单生命周期记录（信号→订单→成交/拒绝 全留痕，最新在前） */
 /** Paper order-lifecycle records (signal→order→outcome audit, newest first) */
 // 对应 GET /api/paper/orders，返回当日全部订单生命周期留痕记录（最新在前）
-export async function fetchPaperOrders() {
-  return request('/api/paper/orders')
+// §FIX-20261028-F13（2026-10-29）：服务端已做**传输层**分页（响应体仍是裸数组，
+// 总数走响应头 X-Total-Count）。这里透传 limit/offset，并把总数以 `total` 暴露给调用方——
+// 不传参数时服务端缺省 500 行，旧调用点无需改动即可受益（600KB → <200KB）。
+// 注意：`request()` 目前只返回 body，所以总数通过第二个返回值给出；调用方按需取用。
+export async function fetchPaperOrders(limit, offset) {
+  const q = []
+  if (limit !== undefined && limit !== null) q.push('limit=' + encodeURIComponent(limit))
+  if (offset !== undefined && offset !== null) q.push('offset=' + encodeURIComponent(offset))
+  const path = '/api/paper/orders' + (q.length ? '?' + q.join('&') : '')
+  return request(path)
+}
+
+// §FIX-20261028-F13：需要总数时用这个变体（返回 { orders, total }）。
+// 为什么单独一个函数：主调用点（Paper.jsx 的委托表）只要数组，改它的返回形状会波及 3 处 setState；
+// 需要分页信息的调用方显式选这个。
+export async function fetchPaperOrdersPage(limit, offset) {
+  const q = []
+  if (limit !== undefined) q.push('limit=' + encodeURIComponent(limit))
+  if (offset !== undefined) q.push('offset=' + encodeURIComponent(offset))
+  const path = '/api/paper/orders' + (q.length ? '?' + q.join('&') : '')
+  // 走 fetch 直连才能读响应头（request() 只解 body）。鉴权头与 baseUrl 与 request() 同源。
+  // 鉴权头与 request() 同源：本地有 token 就带 Bearer（只读 GET，不需要 Content-Type）
+  const token = getToken() || ''
+  const headers = token ? { Authorization: 'Bearer ' + token } : {}
+  const res = await fetch(baseUrl() + path, { headers })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || ('委托列表读取失败（HTTP ' + res.status + '）'))
+  }
+  const orders = await res.json()
+  const total = Number(res.headers.get('X-Total-Count'))
+  return { orders: Array.isArray(orders) ? orders : [], total: Number.isFinite(total) ? total : null }
 }
 
 /** 模拟盘：净值曲线 */

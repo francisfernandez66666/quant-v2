@@ -221,6 +221,52 @@ func (c *Controller) gatewayAdminClient() (*QMTClient, error) {
 	return gc, nil
 }
 
+// CloseSnapshotResult 收盘对账读数（§CLOSE-RECON 的 product 出口）。
+//
+// §FIX-20261028-F06（2026-10-29）：收盘对账此前只有网关 /admin/status 能看到，
+// Go 侧无透传、界面无入口 —— 对账成没成只能 SSH 上机。这里只做**原样透传**，
+// 不做任何重算；网关没有该键时显式回 available=false + reason，
+// 绝不回空对象或零值（"没有对账结果"与"对账结果是 0 笔"是两件事）。
+// Snapshot 用 RawMessage 保留网关原始字段，避免 Go 侧再造一套字段口径。
+// English: verbatim passthrough of the gateway close_snapshot object; absence is explicit.
+type CloseSnapshotResult struct {
+	Available bool            `json:"available"`
+	Reason    string          `json:"reason,omitempty"`
+	Snapshot  json.RawMessage `json:"snapshot,omitempty"`
+}
+
+// CloseSnapshot 读取网关 /admin/status 的 close_snapshot 子对象（只读、不重试）。
+func (c *QMTClient) CloseSnapshot(ctx context.Context) (*CloseSnapshotResult, error) {
+	status, body, err := c.adminDo(ctx, http.MethodGet, "/admin/status", nil)
+	if err != nil {
+		return nil, fmt.Errorf("gateway %s %s: %w", http.MethodGet, "/admin/status", err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("gateway GET /admin/status: HTTP %d: %s", status, truncate(string(body), 200))
+	}
+	var raw struct {
+		CloseSnapshot json.RawMessage `json:"close_snapshot"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decode gateway /admin/status: %w: %s", err, truncate(string(body), 200))
+	}
+	if len(raw.CloseSnapshot) == 0 || string(raw.CloseSnapshot) == "null" {
+		return &CloseSnapshotResult{Available: false, Reason: "网关尚未产出收盘对账（今日尚未到 15:01 或该日非交易日）"}, nil
+	}
+	return &CloseSnapshotResult{Available: true, Snapshot: raw.CloseSnapshot}, nil
+}
+
+// GatewayCloseSnapshot Controller 出口（server 层 admin 端点消费），超时口径同 pending-review。
+func (c *Controller) GatewayCloseSnapshot() (*CloseSnapshotResult, error) {
+	gc, err := c.gatewayAdminClient()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gc.timeout)
+	defer cancel()
+	return gc.CloseSnapshot(ctx)
+}
+
 // GatewayPendingReview 查询网关待核对清单（Controller 出口，server 层 admin 端点消费）。
 // 超时口径与 broker 状态查询一致（8s），失败原因原样上抛不吞。
 // English: controller-level entry for the unresolved list query.

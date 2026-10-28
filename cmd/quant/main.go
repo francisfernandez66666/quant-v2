@@ -228,6 +228,10 @@ func run() int {
 	// LLM 配置解析统一走 §UI-AUTHORITATIVE 权威链（UI 保存 > env > 全局auth > config.json），
 	// 与 cmd/backtest、cmd/news_signal_latency 共用 internal/llmcfg，杜绝各入口口径分叉。
 	llmCfg := llmcfg.Resolve(cfgMgr, authMgr)
+	// §FIX-20261028-F17：进程级用量账本（跨 Client 热重建与进程重启存活，按北京交易日重置）。
+	// 建在这一层而不是 Client 内部：llmRecreate 每次保存配置都会重建 Client，账本必须比它活得久。
+	llmUsageLedger := llm.NewUsageLedger(filepath.Join(dataDir, "llm_usage.json"))
+	llmCfg.UsageLedger = llmUsageLedger
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
 	// §启动顺序 2：llmCfg 已按权威链解析完毕，此处仅在有可用 Key 时才创建客户端。
@@ -617,6 +621,7 @@ func run() int {
 		// "预算形同虚设"缺陷在热更新路径上的复现点。
 		opCfg := *cfgMgr.GetLLMConfigFor(authMgr.AdminID()) // 取值拷贝（GetLLMConfigFor 别名警告）
 		lc := llm.New(llm.Config{
+			UsageLedger:       llmUsageLedger, // §FIX-20261028-F17：热重建沿用同一本账
 			APIKeys:           apiKeys,
 			APIURL:            apiURL,
 			Model:             model,

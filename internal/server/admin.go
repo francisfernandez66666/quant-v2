@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -358,11 +360,22 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[admin] 删号自选已备份并清理 user=%s backup=%s", id, backup)
 		}
 	}
+	// §FIX-20261028-F18（2026-10-29）：追加"账号私有数据"清理。
+	//   · 删：accounts/<uid>/ 目录（纸面账 paper.json、T 账本等私有状态）——先挪到备份区，
+	//     挪成功才算删；signal_decisions 按 uid（当日解释快照，非凭证）。
+	//   · **保留**：orders/fills/trades/结算等资金流水（审计与对账证据链），删号不清。
+	// 资金流水不可删是硬底线：账本里"每笔钱属于谁、什么时候动过"不能被一次删号抹掉。
+	accState, accErr := s.purgeAccountDir(id)
+	decN, decErr := int64(0), error(nil)
+	if db := s.realDB(); db != nil {
+		decN, decErr = db.DeleteSignalDecisionsForUser(id)
+	}
 	// watchlist 为 nil 的测试/精简装配：没有自选管理器就没有该账号的自选文件可清，
 	// 按 missing 记账而不是把整次删号判成失败。
-	result := fmt.Sprintf("configs=%d wl=%s", cfgN, wlState)
-	if cfgErr != nil || wlErr != nil {
-		result = fmt.Sprintf("configs=%d wl=%s cfg_err=%v wl_err=%v", cfgN, wlState, cfgErr, wlErr)
+	result := fmt.Sprintf("configs=%d wl=%s accounts=%s decisions=%d audit_kept=true", cfgN, wlState, accState, decN)
+	if cfgErr != nil || wlErr != nil || accErr != nil || decErr != nil {
+		result = fmt.Sprintf("configs=%d wl=%s accounts=%s decisions=%d audit_kept=true cfg_err=%v wl_err=%v acc_err=%v dec_err=%v",
+			cfgN, wlState, accState, decN, cfgErr, wlErr, accErr, decErr)
 		opslog.Audit("user_delete", userIDFor(r), id, result)
 		log.Printf("[admin] 用户 %s 已删除，但账号级数据清理不完整：%s", id, result)
 		writeError(w, 500, "user deleted but data cleanup incomplete: "+result)
@@ -372,7 +385,17 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	// 单删通道此前反而无痕），补齐；被删用户名留作事后取证线索。
 	opslog.Audit("user_delete", userIDFor(r), id, result)
 	log.Printf("[admin] 已删除用户 %s（%s）", id, result)
-	writeJSON(w, 200, map[string]interface{}{"status": "ok", "configs": cfgN, "watchlist": wlState})
+	// §FIX-20261028-F18：响应把"清了什么、留了什么"一并回给调用方——
+	// audit_kept=true 是给操作者的明确承诺（资金流水按设计保留），不是装饰。
+	writeJSON(w, 200, map[string]interface{}{
+		"status":     "ok",
+		"configs":    cfgN,
+		"watchlist":  wlState,
+		"accounts":   accState,
+		"decisions":  decN,
+		"audit_kept": true,
+		"result":     result,
+	})
 }
 
 // ── 管理员代配他人账号配置 ──
@@ -678,4 +701,46 @@ func (s *Server) handleAdminSetQMTConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.applySetQMTConfig(w, userIDFor(r), id, req)
+}
+
+// purgeAccountDir §FIX-20261028-F18：把 accounts/<uid>/ 挪进备份区（等同"先备份再删"）。
+//
+// 口径：
+//   - uid 必须通过路径校验（与 watchlist.Delete 同族：拒空、拒分隔符、拒 ..）；
+//   - 目录不存在 ⇒ "missing"（不是错误：从未产生过纸面账的账号本来就没有）；
+//   - 挪到 <cacheDir>/deleted_accounts/<uid>-<时间戳>/ 后回验源目录已不存在 ⇒ "moved"；
+//   - cacheDir 未接入（测试/精简装配）⇒ 不挪，返回 "skipped_no_datadir" 并**不**判失败，
+//     因为此时根本没有账号目录可清（数据目录都没接）。
+//
+// 为什么用"挪"而不是 os.RemoveAll：删号不可逆，而"这个账号的钱怎么动过"是审计要回答的问题；
+// 挪到备份区既能立刻从活动数据里消失，又留了一条人工可恢复的路。
+func (s *Server) purgeAccountDir(uid string) (string, error) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" || strings.ContainsAny(uid, `/\`) || strings.Contains(uid, "..") {
+		return "rejected_bad_uid", fmt.Errorf("invalid user id for account dir purge")
+	}
+	if strings.TrimSpace(s.cacheDir) == "" {
+		return "skipped_no_datadir", nil
+	}
+	src := filepath.Join(s.cacheDir, "accounts", uid)
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return "missing", nil
+		}
+		return "stat_error", err
+	}
+	dstRoot := filepath.Join(s.cacheDir, "deleted_accounts")
+	if err := os.MkdirAll(dstRoot, 0o755); err != nil {
+		return "mkdir_error", err
+	}
+	dst := filepath.Join(dstRoot, uid+"-"+time.Now().Format("20060102-150405"))
+	if err := os.Rename(src, dst); err != nil {
+		return "move_error", err
+	}
+	// 回验：源目录必须真的不在了（否则"已清理"是假话）
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		return "verify_failed", fmt.Errorf("account dir still present after move: %s", src)
+	}
+	log.Printf("[admin] 删号私有目录已移入备份区 user=%s dst=%s", uid, dst)
+	return "moved", nil
 }

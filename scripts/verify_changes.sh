@@ -16625,4 +16625,138 @@ echo "INFO - §139 覆盖面账：本段锁「信号仓侧发布点前移 + T �
 [ "$B139_FAILED" = "0" ] || exit 1
 echo "ok - §139 §FUNDS-PUBLISH + §CLOSE-RECON 锁通过（发布点 7 + 公式/MS 出口 4 + 入队兜底 7 + 收盘对账 6 + 行为腿 3 + 反证 2 枚，累计判定点 ${CNT139}）"
 
+# ════════════════════════════════════════════════════════════════════════════
+# §140 §FIX-20261028（2026-10-29 终轮 UAT 修复锁）
+#
+# 本段只锁"修完别再改回去"的不变量（字面量/计数），行为正确性由同批的
+# Go/vitest/pytest 用例负责——门禁绿≠功能对，本段防的是口径漂移。
+#   ① 跨账号读面收口  ② 资金帧去重基线  ③ 桥收盘快照不标假完成  ④ 登录分码(前后端)
+#   ⑤ 时段闸回显      ⑥ 收盘对账透传    ⑦ 自选补价/删除语义      ⑧ 撤单留痕空串语义
+#   ⑨ 分页形状        ⑩ 删号不得清资金流水  ⑪ 用量账本  ⑫ 契约类型锁
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 140 §FIX-20261028（跨账号收口/资金帧基线/桥快照/登录分码/观测面/分页/留痕/删号/账本/契约类型）..."
+B140_FAILED=0
+fail140() {
+	echo "--- FAIL: §140 $*"
+	FAIL=1
+	B140_FAILED=1
+}
+CNT140=0
+
+# —— ① 跨账号读面 ——
+CNT140=$((CNT140 + 1))
+if grep -qF 'PaperForUser(s.operatorID())' internal/server/*.go; then
+	fail140 "纸面引擎仍被写死成运营账号（paperEngineFor 必须按请求者取）"
+fi
+CNT140=$((CNT140 + 1))
+# 三处读面（positions/holdings/alerts）里，全量读之后都必须紧跟"按账号过滤"判据；
+# 只锁"存在 ListFor 空 uid"会误伤注释与测试，故锁每个函数体内必须出现 owner 归一判据。
+for FN140 in handleListPositions paperPnlTotals handleFixAlerts; do
+	BODY140=$(awk "/func \\(s \\*Server\\) ${FN140}\\(/,/^}/" internal/server/*.go)
+	grep_q 'owner = s.operatorID\(\)' BODY140 ||
+		fail140 "${FN140} 缺少遗留行归属归一判据（owner = operatorID）"
+done
+CNT140=$((CNT140 + 1))
+grep -qF 'if userID != "" && owner != userID {' internal/server/handlers_fix.go ||
+	fail140 "paperPnlTotals 的账号过滤判据不见了（跨账号读面会复发）"
+
+# —— ② 资金帧去重基线 ——
+CNT140=$((CNT140 + 1))
+grep -qF 'func (e *Engine) markFundsPublished' internal/engine/funds_today.go ||
+	fail140 "markFundsPublished 缺失（基线写入点必须唯一）"
+DUE140=$(awk '/func \(e \*Engine\) fundsPublishDue/,/^}/' internal/engine/funds_today.go)
+CNT140=$((CNT140 + 1))
+grep_q 'fundsPublishedAt\[uid\] =' DUE140 &&
+	fail140 "fundsPublishDue 仍在写基线（5s 节拍会永久饿死）"
+
+# —— ③ 桥收盘快照不标假完成 ——
+CNT140=$((CNT140 + 1))
+grep -qF 'if failed_tables:' qmt_gateway/qmt_bridge_strategy.py ||
+	fail140 "桥收盘快照缺少 failed_tables 门（部分失败仍会标 done）"
+CNT140=$((CNT140 + 1))
+grep -qF 'CLOSE_SNAPSHOT_PARTIAL' qmt_gateway/qmt_bridge_strategy.py ||
+	fail140 "桥缺少 CLOSE_SNAPSHOT_PARTIAL 留痕（缺口会被静默）"
+
+# —— ④ 登录分码（前后端两处） ——
+CNT140=$((CNT140 + 1))
+grep -qF '"account_expired"' internal/server/server.go ||
+	fail140 "后端 loginFailureCode 未登记 account_expired"
+CNT140=$((CNT140 + 1))
+grep -qF "'account_expired'" web/src/api/index.js ||
+	fail140 "前端 LOGIN_ERR_TEXT 未登记 account_expired（新码会落到兜底句）"
+
+# —— ⑤ 时段闸回显 ——
+CNT140=$((CNT140 + 1))
+grep -qF '"no_cancel_windows"' internal/server/qmt.go ||
+	fail140 "qmtConfigView 未回显禁撤窗口"
+CNT140=$((CNT140 + 1))
+grep -qF 'SessionWindowsSnapshot()' internal/server/qmt.go ||
+	fail140 "handler 未复用 Controller.SessionWindowsSnapshot（另写一套必分叉）"
+CNT140=$((CNT140 + 1))
+grep -qF 'if strings.TrimSpace(cancel) == "" {' internal/trading/session_guard.go ||
+	fail140 "Describe 未把空配置回落成出厂默认（界面会显示空窗口）"
+
+# —— ⑥ 收盘对账透传 ——
+CNT140=$((CNT140 + 1))
+grep -qF 'GET /api/qmt/close-snapshot' internal/server/server.go ||
+	fail140 "收盘对账透传路由缺失"
+CNT140=$((CNT140 + 1))
+grep -qF 'GET	/api/qmt/close-snapshot' scripts/contract_ledger.tsv ||
+	fail140 "契约台账缺少 close-snapshot 行（§115 双向相等会红）"
+
+# —— ⑦ 自选补价/删除语义 ——
+ADD140=$(awk '/func \(s \*Server\) handleFixAddWatchlist/,/^}/' internal/server/handlers_fix.go)
+CNT140=$((CNT140 + 1))
+grep_q ':=\s*s\.quote\(' ADD140 &&
+	fail140 "handleFixAddWatchlist 仍在同步打上游（应走 quoteDisplayBounded）"
+CNT140=$((CNT140 + 1))
+grep -qF 'not_in_watchlist' internal/server/handlers_fix.go ||
+	fail140 "删除自选未如实回 404（删不掉也会报成功）"
+
+# —— ⑧ 撤单留痕空串语义 ——
+CNT140=$((CNT140 + 1))
+grep -qF 'func (d *DB) SetCancelTrace' internal/store/real_positions.go ||
+	fail140 "SetCancelTrace 缺失（终态行留痕会为空）"
+CNT140=$((CNT140 + 1))
+grep -qF "cancel_requested_at = CASE WHEN cancel_requested_at = ''" internal/store/real_positions.go ||
+	fail140 "SetCancelTrace 未用 CASE WHEN 处理空串（COALESCE 对空串无效）"
+CNT140=$((CNT140 + 1))
+TRACE140=$(grep -cF 'SetCancelTrace(' internal/trading/controller.go || true)
+[ "${TRACE140:-0}" -ge 3 ] ||
+	fail140 "controller 里 SetCancelTrace 调用点少于 3（manual/halt/sweep 都要先写留痕）"
+
+# —— ⑨ 分页形状 ——
+CNT140=$((CNT140 + 1))
+grep -qF 'X-Total-Count' internal/server/paper.go ||
+	fail140 "纸面委托缺少 X-Total-Count（分页元信息无处可读）"
+CNT140=$((CNT140 + 1))
+grep -qF 'func pageWindow(' internal/server/paper.go ||
+	fail140 "pageWindow 纯函数缺失（分页边界无法被单测钉住）"
+
+# —— ⑩ 删号不得清资金流水 ——
+DEL140=$(awk '/func \(s \*Server\) handleDeleteUser/,/^}/' internal/server/admin.go)
+CNT140=$((CNT140 + 1))
+if grep_q 'DELETE FROM orders|DELETE FROM fills|DELETE FROM trades' DEL140 B; then
+	fail140 "删号清理链里出现资金流水表删除（审计凭证绝不可删）"
+fi
+CNT140=$((CNT140 + 1))
+grep -qF 'audit_kept' internal/server/admin.go ||
+	fail140 "删号响应缺少 audit_kept 自证"
+
+# —— ⑪ 用量账本 ——
+CNT140=$((CNT140 + 1))
+[ -f internal/llm/usage_ledger.go ] ||
+	fail140 "用量账本 usage_ledger.go 缺失（重启/热换都会丢当日计数）"
+CNT140=$((CNT140 + 1))
+grep -qF 'cntime.DayCompactOf' internal/llm/usage_ledger.go ||
+	fail140 "用量账本日键未走北京时（cntime），异地部署会错位"
+
+# —— ⑫ 契约类型锁 ——
+CNT140=$((CNT140 + 1))
+grep -qF '"types"' qmt_gateway/contract/order_fields.json ||
+	fail140 "契约 golden 缺少 types（类型漂移不会被发现）"
+
+[ "$B140_FAILED" = "0" ] || exit 1
+echo "ok - §140 §FIX-20261028 锁通过（跨账号 3 + 资金帧 2 + 桥 2 + 分码 2 + 观测面 3 + 收盘对账 2 + 自选 2 + 留痕 3 + 分页 2 + 删号 2 + 账本 2 + 契约 1，累计判定点 ${CNT140}）"
+
 echo "==> 全部通过"

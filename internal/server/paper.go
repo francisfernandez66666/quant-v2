@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,14 +19,23 @@ import (
 // English: returns the injected global paper engine (legacy single-engine fallback; nil when not set).
 func (s *Server) paperEngine() *paper.Engine { return s.paper }
 
-// paperEngineFor 返回模拟盘账本引擎。§20260916 起模拟盘账本为系统级共享（运营账本）：
-// 恒返回操作者账号的引擎，入参 userID 仅作调用点上下文留痕，不参与账本路由。
-// （§F-9 注释修正：旧注释宣称"按账号懒加载"是账户级时代的残留，与实现矛盾易误读。）
-// English: returns the shared (operator-scoped) paper engine; the userID parameter is retained
-// for call-site context only and does NOT route books per account anymore (§F-9 comment fix).
+// paperEngineFor 返回**请求者账号**的模拟盘引擎。
+//
+// §FIX-20261028-F01（2026-10-29）：此函数此前忽略入参、恒取 `s.operatorID()` 的纸面账，
+// 导致任何普通账号打开模拟盘页看到的都是运营账号的持仓与成交（跨账号读面泄漏，UAT 实弹实录：
+// 新建成品号 GET /api/paper/positions 拿到运营账号 163 行纸面仓）。
+// 现按入参取；只有 uid 为空（内部调用/未登录装配）才回落到运营账号，保证"没有身份"的老调用点行为不变。
+// 旧注释"模拟盘账本为系统级共享（运营账本）"已随本条修复废弃——账本本就按账号隔离
+// （registry.PaperForUser 每账号独立 paper.json），是这一行把路由写死成了运营账号。
+// English: returns the requester's own paper engine; empty uid falls back to the operator book.
+// The former "shared operator-scoped book" wording is obsolete: books were always per-account
+// (registry.PaperForUser), and this single line used to hard-wire them to the operator.
 func (s *Server) paperEngineFor(userID string) *paper.Engine {
 	if s.registry != nil {
-		return s.registry.PaperForUser(s.operatorID())
+		if strings.TrimSpace(userID) == "" {
+			userID = s.operatorID()
+		}
+		return s.registry.PaperForUser(userID)
 	}
 	return s.paperEngine()
 }
@@ -96,15 +106,87 @@ func (s *Server) handlePaperTrades(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePaperOrders 返回模拟盘订单生命周期记录（阶段1.3：信号→订单→成交/拒绝 全留痕，最新在前）。
-// English: returns paper order-lifecycle records (signal→order→outcome audit, newest first).
+//
+// §FIX-20261028-F13（2026-10-29）：单账号实测 616,493B / 2000 行且 `?limit` 被忽略
+// （浏览器与 APK 每次打开模拟盘页都要搬 600KB）。这里做**传输层**分页：
+//
+//	· 响应体**保持裸数组**（前端 fetchPaperOrders → setOrders 直接按数组用，改形状会当场崩）；
+//	· 元信息走响应头 X-Total-Count（跨域时由 CORS 的 Expose-Headers 放行）；
+//	· limit 缺省 500、上限 2000；limit<=0 或 offset<0 一律 400（不静默改语义）。
+//
+// 引擎内存侧不动（paper.Engine.Orders 仍是全量复制+排序）——见 FIX_PLAN §十一 Q4。
+// English: transport-layer paging that keeps the bare-array body and reports X-Total-Count.
 func (s *Server) handlePaperOrders(w http.ResponseWriter, r *http.Request) {
+	// 先把请求形态校验完再判断引擎：非法分页参数是**请求错**（400），
+	// 不该因为"这台机器没接纸面引擎"就变成 200（那会让客户端以为参数被接受）。
+	q := r.URL.Query()
+	limit, offset := paperOrdersPageDefault, 0
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 || n > paperOrdersPageMax {
+			writeError(w, http.StatusBadRequest, "limit 必须是 1..2000 的整数")
+			return
+		}
+		limit = n
+	}
+	if raw := strings.TrimSpace(q.Get("offset")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "offset 必须是非负整数")
+			return
+		}
+		offset = n
+	}
+	// 总数始终照实回（即便本次切片为空）：前端据 X-Total-Count 判断"还有更早的记录"，
+	// 缺了它分页就退化成"翻不到底"。
 	pe := s.paperEngineFor(requestUserID(r))
 	if pe == nil {
+		// 没有纸面引擎 ⇒ 空账本（合法），总数 0；形状仍是裸数组。
+		w.Header().Set("X-Total-Count", "0")
 		writeJSON(w, 200, []paper.Order{})
 		return
 	}
-	writeJSON(w, 200, pe.Orders())
+	all := pe.Orders()
+	total := len(all)
+	w.Header().Set("X-Total-Count", strconv.Itoa(total))
+	start, end := pageWindow(total, limit, offset)
+	if start >= end {
+		// offset 越过末尾 ⇒ 空数组（不是 404、也不是 400）：合法的"翻过了最后一页"。
+		writeJSON(w, 200, []paper.Order{})
+		return
+	}
+	writeJSON(w, 200, all[start:end])
 }
+
+// pageWindow 把 (total, limit, offset) 归一成可安全切片的 [start,end)。
+//
+// 抽成纯函数是为了让边界（末页收口、offset 越界）能被单测直接钉住——
+// 写在 handler 里就只能靠"造 2000 条订单"来测，成本高且容易假绿。
+func pageWindow(total, limit, offset int) (start, end int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = paperOrdersPageDefault
+	}
+	start = offset
+	if start > total {
+		start = total
+	}
+	end = start + limit
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+// 分页缺省值与上限（§FIX-20261028-F13）。
+// 取值理由：2000 是现有单账号的实测上限（约 600KB），缺省 500 把首屏压到 <200KB；
+// 上限与"limit 必须 1..2000"的报错文案必须同值，改一个就要改另一个。
+const (
+	paperOrdersPageDefault = 500
+	paperOrdersPageMax     = 2000
+)
 
 // handlePaperEquity 返回模拟盘净值曲线。
 // English: returns the paper equity curve.

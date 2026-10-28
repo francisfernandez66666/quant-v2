@@ -62,4 +62,10 @@ type Config struct {
 	// 全体用户咨询共用运营账号 key 计费（ctrlFor 恒指向运营引擎），总日预算之外再给咨询单独
 	// 封顶，防"子账号刷咨询"吃光主链路（新闻归因/D1）当日配额。
 	ConsultDailyCalls int64
+
+	// UsageLedger §FIX-20261028-F17：进程级当日用量账本（可空=纯内存）。
+	// 为什么要从外面注入而不是 Client 自建：LLM 配置每保存一次都会重建 Client
+	//（server.go:156/426 → llm_apply.go:364-370），若每个 Client 自带计数器，
+	// 改一次配置就把当日用量清零一次；进程重启同理。
+	UsageLedger *UsageLedger
 }

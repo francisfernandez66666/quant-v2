@@ -43,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
@@ -845,7 +846,21 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, item)
 	}
+	// §FIX-20261028-F01（2026-10-29，第 4 处）：提醒流此前把**全部账号**的持仓记录
+	// 转成「持仓提示」条目——成员打开消息中心就能看到别人的代码/名称/盈亏。
+	// 这里与 /api/positions、/api/holdings 同口径：只取本账号（遗留空 user_id 行归运营账号）。
+	alertUID := requestUserID(r)
+	if alertUID == "" {
+		alertUID = s.operatorID()
+	}
 	for _, l := range s.rpt.ListFor("") {
+		owner := strings.TrimSpace(l.UserID)
+		if owner == "" {
+			owner = s.operatorID()
+		}
+		if owner != alertUID {
+			continue
+		}
 		// 仅展示持仓中或已平仓的记录，平仓记录用当前盈亏补全提示文本
 		if l.Status == "持仓中" || l.ExitAt != nil {
 			alertType := "持仓提示"
@@ -984,10 +999,17 @@ type fixHolding struct {
 // pnl_offset 查库失败时 total_pnl 输出 null + pnl_offset_error 文案：绝不把"读数不可得"
 // 折成 0 校准的假总数（§N-5 姿势），前端据此显示"—"。
 func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
-	// 自选股/持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 读取。
+	// §FIX-20261028-F01（2026-10-29）：本端点此前固定按运营账号返回（`s.operatorID()`），
+	// 任何登录账号都能看到运营账号的持仓与可用资金（UAT 实弹：成员号与 admin 的读数
+	// 逐字节同指纹，还拿到了 available_balance=42806.96）。现在按**请求者**取；
+	// 无身份（内部调用/未登录装配）才回落运营账号。
+	// 运营全量视角需要时走 /api/positions?scope=all（admin），本端点不再提供隐式全量。
 	// §P1-11（2026-09-15）：available_balance 从 real_account 行读取（管理员手动改资金 /
 	// 网关 account 回报共用一表），不再硬编码 0——此前编辑可用资金存不进、刷新即回 0。
-	userID := s.operatorID()
+	userID := requestUserID(r)
+	if userID == "" {
+		userID = s.operatorID()
+	}
 	acc, _ := s.realDB().GetRealAccount(userID)
 	holdings, realized, unrealized, offset, offErr := s.paperPnlTotals(userID)
 	resp := map[string]interface{}{
@@ -1011,11 +1033,24 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 // 浮盈按**下发给前端的同一批字段**（r2 舍入后的 cost/cur/quantity）累加——保证前端把列表行
 // 逐行相加与后端汇总**逐分对齐**，"单轨"才有可验证的含义。
 // 返回值 offset 为当前生效的显示校准值；其查库错误单独回传（调用方决定降级展示，不静默折 0）。
+//
+// §FIX-20261028-F01（2026-10-29）：循环此前读 `ListFor("")` 后**不按账号过滤**，
+// 于是 /api/holdings 对任何登录账号都返回全部账号的持仓行（UAT 实弹：成员号与 admin 的
+// holdings 逐字节同指纹）。现在只取本账号；遗留 `user_id=”` 的旧行归属运营账号
+// （读时归一，不做数据迁移）。
+// English: rows are scoped to userID; legacy rows with empty user_id belong to the operator.
 func (s *Server) paperPnlTotals(userID string) (holdings []fixHolding, realized, unrealized, offset float64, offsetErr error) {
 	logs := s.rpt.ListFor("")
 	holdings = make([]fixHolding, 0)
 	for _, l := range logs {
 		if l.Status != "持仓中" {
+			continue
+		}
+		owner := strings.TrimSpace(l.UserID)
+		if owner == "" {
+			owner = s.operatorID() // 账号级改造前的遗留行：按运营账号算
+		}
+		if userID != "" && owner != userID {
 			continue
 		}
 		holdings = append(holdings, s.buildHolding(l, userID))
@@ -2688,22 +2723,26 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"status": "ok", "duplicate": true})
 		return
 	}
-	// 把新自选股纳入 fetcher 5s 监控池，使其后续进入快照（下一次轮询即补齐行情），
-	// 避免本请求真打行情接口（数据源被限流占满时阻塞 → 前端添加失败）。
-	// (Add the symbol to the fetcher's 5s monitor pool so its quote arrives on the next poll;
-	// this avoids a live upstream call in the add request, which would block while the
-	// rate limiter is saturated and make the frontend "add" fail on timeout.)
+	// §FIX-20261028-F10（2026-10-29）：把新自选股纳入 fetcher 5s 监控池，并**只做有界补价**。
+	// 缺陷本体：旧注释声称"避免本请求真打行情接口"，实现却调 `quoteDisplay`——它在 5s 快照
+	// 未命中时降级为逐票**同步打上游**（quote 直连）；新加的票此刻必然不在快照池里，于是
+	// 每次加新票都真打一次上游：健康时 2.6–3.1s，行情链劣化时 >15s，前端 10s 超时判失败，
+	// 而 Add 已经落库 ⇒ 用户看到"添加失败"、重试却得到 duplicate:true（幽灵写入）。
+	// 现在：只在快照池里等一小会儿（addQuoteWait，上限 1.2s），拿不到就返回 quote:"pending"，
+	// 由前端按缺价占位渲染，下一次 5s 轮询自然补齐。
 	if s.fetcher != nil {
 		s.fetcher.EnsureStock(code)
 	}
-	info := s.quoteDisplay(code)
+	info := s.quoteDisplayBounded(code, addQuoteWait)
 	name := code
 	price := 0.0
 	chg := 0.0
+	quoteState := "pending"
 	if info != nil {
 		name = info.Name
 		price = info.Price
 		chg = info.ChangePct
+		quoteState = "ok"
 	}
 	// 加自选后同步消息中心该股的名称（旧名/空名刷新为权威名）
 	if name != "" {
@@ -2711,10 +2750,40 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 			c.RefreshMessageName(code, name)
 		}
 	}
+	// quote 键显式告知"这一行还没有行情"（而不是让前端把 0 当现价）。
+	// 不改既有四键，只加一个键：旧前端忽略它，新前端用它决定是否显示「—」。
 	writeJSON(w, 200, map[string]interface{}{
 		"status": "ok",
+		"quote":  quoteState,
 		"stock":  map[string]interface{}{"code": code, "name": name, "price": price, "change_pct": chg},
 	})
+}
+
+// addQuoteWait 添加自选时等待快照池补价的上限。
+//
+// 取值理由：前端请求超时 10s（api/index.js REQUEST_TIMEOUT），这里必须远小于它；
+// 同时 5s 快照轮询在多数情况下赶不上一次请求，所以"等不到"是常态而不是异常——
+// 稳定的做法是快速返回 quote:"pending"，让下一次轮询补齐，绝不为了填一个数字去打上游。
+const addQuoteWait = 1200 * time.Millisecond
+
+// quoteDisplayBounded 有界补价：只读 5s 快照池，最多等 wait，**绝不调 s.quote 打上游**。
+// English: bounded quote lookup that only reads the 5s snapshot pool (never hits upstream).
+func (s *Server) quoteDisplayBounded(code string, wait time.Duration) *data.StockInfo {
+	if si := s.quoteSnapshot(code); si != nil {
+		return si
+	}
+	if wait <= 0 {
+		return nil
+	}
+	deadline := time.Now().Add(wait)
+	tick := 50 * time.Millisecond
+	for time.Now().Before(deadline) {
+		time.Sleep(tick)
+		if si := s.quoteSnapshot(code); si != nil {
+			return si
+		}
+	}
+	return nil
 }
 
 // handleFixRemoveWatchlist 处理 DELETE /api/watchlist 请求，从自选股中移除个股。
@@ -2734,8 +2803,15 @@ func (s *Server) handleFixRemoveWatchlist(w http.ResponseWriter, r *http.Request
 	if norm, err := normalizeWatchStockCode(code); err == nil {
 		code = norm
 	}
-	s.watchlist.Remove(requestUserID(r), code)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	// §FIX-20261028-F11（2026-10-29）：旧实现丢弃 Remove 的返回值、恒回 {"status":"ok"}，
+	// 于是"代码形态对不上（历史脏数据/后缀差异）而实际没删"也报成功；前端又按成功做本地移除
+	// ⇒ 客户看到「已移除」、刷新后又回来（本轮 UAT 里 EU-03/H-16 的红项就是被这条放大成
+	// "站点删不掉"的）。现在如实回：删掉了 200+removed:true，没这个码 404 not_in_watchlist。
+	if s.watchlist.Remove(requestUserID(r), code) {
+		writeJSON(w, 200, map[string]interface{}{"status": "ok", "removed": true})
+		return
+	}
+	writeError(w, http.StatusNotFound, "not_in_watchlist")
 }
 
 // handleFixAction 处理 POST /api/action 请求，接收用户手动操作指令（买入/卖出等）。
@@ -2862,6 +2938,11 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[action] %s %s(%s) qty=%d price=%.2f → %+v", side, req.Code, s.stockName(req.Code), qty, price, res)
+		// §FIX-20261028-F19a（2026-10-29）：手动直发单也要落一条决策快照，否则"今日动态仓位"
+		// 永远只有引擎自动买入的行（本轮现网连续三日 0 行，客户看不到自己手动下单的依据）。
+		// 口径必须诚实：这条路径**不经过**动态预算，所以 MS/SS/目标/剩余一律留 0，
+		// reason 写明"不经动态预算"——绝不拿账户级读数凑一个看起来像引擎算出来的 MS。
+		s.persistManualDecision(user, req.Code, qty, price, side, signalID, res.OrderID)
 		// §H3（2026-09-22 修复批）：手动实盘指令必须落操作人审计（旧实现只进 stdout 日志，
 		// 进程重启即失忆；ignore 分支本有 opslog.Audit，此路补齐同姿势）。
 		opslog.Audit("live_order", user.ID, req.Code, fmt.Sprintf("action=%s qty=%d price=%.2f signal=%s order=%s",
@@ -2875,6 +2956,37 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 	// status=noop with an explicit reason so the frontend can tell the user nothing was placed.
 	log.Printf("[action] %s %s (qmt 未启用/非 manual，noop)", action, req.Code)
 	writeJSON(w, 200, map[string]string{"status": "noop", "reason": "实盘链路未启用或非手动模式；模拟成交请使用模拟买入"})
+}
+
+// persistManualDecision 落一条 channel=manual 的当日决策快照（§FIX-20261028-F19a）。
+//
+// 只写"实际发生的下单事实 + 诚实的空读数"：数量/金额取本次请求实际下出的值；
+// 动态定权字段（MS/SS/单笔/目标/当前/剩余）在该路径上不存在，一律留 0 并在 reason 说明。
+// 落库失败只 log，不阻断下单（观测面不得反过来拦资金路径——与 engine 侧同一纪律）。
+func (s *Server) persistManualDecision(user *auth.User, code string, qty int, price float64, side, signalID, orderID string) {
+	if user == nil {
+		return
+	}
+	db := s.realDB()
+	if db == nil {
+		return
+	}
+	day := data.TradingDayDate(time.Now())
+	if err := db.UpsertSignalDecision(store.SignalDecision{
+		UserID:   user.ID,
+		Day:      day,
+		Channel:  "manual",
+		SignalID: signalID,
+		Code:     normalizeTsCode(code),
+		Strategy: "manual",
+		At:       time.Now().Format(time.RFC3339),
+		Stage:    "manual",
+		Qty:      qty,
+		Notional: float64(qty) * price,
+		Reason:   "手动直发，不经动态预算（无 MS/SS/目标读数）；方向=" + side + " 委托号=" + orderID,
+	}); err != nil {
+		log.Printf("[action] 手动单决策快照落库失败（不阻断下单）: code=%s err=%v", code, err)
+	}
 }
 
 // handleFixNotifyTest 处理 POST /api/notify-test 请求，通知测试接口。

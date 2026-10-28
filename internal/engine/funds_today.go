@@ -212,18 +212,36 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 		f.MarketScale = ctx.MS
 		f.MissingKey = ctx.Missing
 	})
+	// §FIX-20261028-F02：帧写成功之后才推进去重基线（此前基线在 due 判定里无条件前进，
+	// 导致 5s 节拍下几乎不再发帧）。放在 updateFunds 之后，任何早退都不会误推进基线。
+	e.markFundsPublished(uid, now)
 }
 
 // fundsPublishDue 判断该账号是否到了再发一帧的时刻（去重 10s）。
+//
+// §FIX-20261028-F02（2026-10-29）：本函数是**纯只读判定**，绝不推进去重基线。
+// 旧实现在这里（含返回 false 的分支）写 `fundsPublishedAt[uid]=now`，而调用节拍是打分循环的
+// 5s ticker ⇒ `now-last≈5s` 永远小于 10s 窗口 ⇒ 除首帧外几乎不会再发布，盘中"今日资金"卡
+// 长期停留在上午的帧而接口 `at` 却是新的（假新鲜）。
+// 基线只能由 markFundsPublished 在**帧真正写成功之后**推进——与帧写入同生共死，
+// 否则下方 `db==nil` / 持仓读失败这两处早退会让"基线前进但帧没写"，换一种姿势继续饿死。
+// English: read-only gate; the baseline is advanced only after a frame is actually written.
 func (e *Engine) fundsPublishDue(uid string, now time.Time) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	last, ok := e.fundsPublishedAt[uid]
+	return !ok || now.Sub(last) >= 10*time.Second
+}
+
+// markFundsPublished 记录"这一帧真的写成功了"，推进去重基线（唯一写入点）。
+// English: advances the de-dup baseline; the only place allowed to write fundsPublishedAt.
+func (e *Engine) markFundsPublished(uid string, now time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.fundsPublishedAt == nil {
 		e.fundsPublishedAt = map[string]time.Time{}
 	}
-	last, ok := e.fundsPublishedAt[uid]
 	e.fundsPublishedAt[uid] = now
-	return !ok || now.Sub(last) >= 10*time.Second
 }
 
 // realStoreForFunds 取实盘账本（资金帧的持仓/资金读数源）。

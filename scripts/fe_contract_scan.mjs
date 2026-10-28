@@ -165,6 +165,9 @@ export function pollCoverage(root) {
 // console.error/warn **不算**：控制台的失败用户看不见。
 const ERR_MARKS = [
   /markLoadFail/,
+  // §FIX-20261028-F09：§P2-J 台账写入本身就该算"用户看得见"——LoadFailBanner 会把
+  // ledger.mark 记的腿名渲染成红条。此前判据不认识这种新形态，接台账的页面反而被报"吞错"。
+  /\bledger\.mark\(/,
   /markFail/,
   /showToast/,
   /showFeedback/,

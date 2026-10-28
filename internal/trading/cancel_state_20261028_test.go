@@ -266,3 +266,39 @@ func (c *countingExec) Cancel(orderID string) error {
 	c.cancelCalls++
 	return nil
 }
+
+// ── §FIX-20261028-F05（2026-10-29）：窗口回显必须是"生效值" ──
+//
+// 缺陷本体：Describe() 回的是配置原文（rawCancel/rawNewOrder），配置为空串时生效的是出厂默认
+//（NewSessionWindows 的回落分支），界面却会显示「禁撤 （空）」这种无意义读数——
+// 客户看到的规则和真正执行的规则不是同一个。
+
+// TestDescribeFallsBackToDefaultsWhenRawEmpty 空配置回显出厂默认串（不是空串）。
+func TestDescribeFallsBackToDefaultsWhenRawEmpty(t *testing.T) {
+	sw, err := NewSessionWindows("", "")
+	if err != nil {
+		t.Fatalf("空配置不应报错: %v", err)
+	}
+	got := sw.Describe()
+	if got["no_cancel_windows"] != DefaultNoCancelWindows {
+		t.Fatalf("禁撤窗口空配置应回出厂默认 %q，实到 %q", DefaultNoCancelWindows, got["no_cancel_windows"])
+	}
+	if got["no_new_order_windows"] != DefaultNoNewOrderWindows {
+		t.Fatalf("禁挂窗口空配置应回出厂默认 %q，实到 %q", DefaultNoNewOrderWindows, got["no_new_order_windows"])
+	}
+}
+
+// TestDescribeKeepsCustomSpec 自定义配置原样回显（不得被默认值覆盖）。
+func TestDescribeKeepsCustomSpec(t *testing.T) {
+	sw, err := NewSessionWindows("09:25-09:31", "14:50-15:00")
+	if err != nil {
+		t.Fatalf("自定义配置应可解析: %v", err)
+	}
+	got := sw.Describe()
+	if got["no_cancel_windows"] != "09:25-09:31" {
+		t.Fatalf("自定义禁撤窗口应原样回显，实到 %q", got["no_cancel_windows"])
+	}
+	if got["no_new_order_windows"] != "14:50-15:00" {
+		t.Fatalf("自定义禁挂窗口应原样回显，实到 %q", got["no_new_order_windows"])
+	}
+}

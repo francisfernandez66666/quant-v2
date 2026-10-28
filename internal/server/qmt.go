@@ -1015,12 +1015,28 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.GetQMTConfigFor(userIDFor(r))
 	// 诊断日志：排查「开关刷新后变回关闭」——记录每次读取的真实账号与 enabled 值。
 	log.Printf("[diag-qmt] GET /api/config/qmt user=%s operator=%s enabled=%v", userIDFor(r), s.operatorID(), cfg.Enabled)
-	writeJSON(w, 200, qmtConfigView(cfg, s.knownStrategyList()))
+	view := qmtConfigView(cfg, s.knownStrategyList())
+	// §FIX-20261028-F05（2026-10-29）：把**生效的**禁撤/禁挂窗口一并回显。
+	// 此前视图里根本没有这两个键，界面也就无从提示——14:57 点撤单只能收到事后 409。
+	// 取值真源是控制器里那份 SessionWindows（Describe 已把空串回落成出厂默认）；
+	// 未接实盘的账号回落到出厂默认，保证"没有控制器"也能看到规则本身。
+	if ctrl := s.qmtCtrlFor(userIDFor(r)); ctrl != nil {
+		for k, v := range ctrl.SessionWindowsSnapshot() {
+			view[k] = v
+		}
+	} else {
+		for k, v := range trading.DefaultSessionWindows().Describe() {
+			view[k] = v
+		}
+	}
+	writeJSON(w, 200, view)
 }
 
 // qmtConfigView 把 QMT 实盘配置渲染为对外响应形状（token 脱敏、附已知战法列表）。
 // English: renders a QMT live-trading config as the API response shape (token masked).
 func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]interface{} {
+	// 注：§FIX-20261028-F05 的两个窗口键默认值也在这里给出（handler 会用控制器的生效快照
+	// 覆盖），这样"拿不到控制器"的装配与单测也能看到非空窗口，不会出现缺键。
 	tokenMasked := ""
 	if cfg.Token != "" {
 		tokenMasked = maskSecret(cfg.Token)
@@ -1070,7 +1086,10 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		// §R4-1 kill-switch 与撤单闭环参数
 		"halted":           cfg.Halted,
 		"cancel_stale_sec": cfg.CancelStaleSec,
-		"close_sweep_at":   cfg.CloseSweepAt,
+		// §FIX-20261028-F05：生效窗口的默认值（handler 会用控制器快照覆盖为真实生效值）
+		"no_cancel_windows":    trading.DefaultNoCancelWindows,
+		"no_new_order_windows": trading.DefaultNoNewOrderWindows,
+		"close_sweep_at":       cfg.CloseSweepAt,
 		// §AUDIT-PM 2026-09-15 单笔金额绝对帽（风控闸 risk_gate.max_order_amount，0=关）
 		"max_order_amount": cfg.RiskGate.MaxOrderAmount,
 		"known_strategies": known,

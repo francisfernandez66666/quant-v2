@@ -867,6 +867,8 @@ func (s *Server) registerRoutes() {
 	// 委托终态是特权动作，每次尝试落 opslog.Audit）：清单透传 + 确认转发网关。
 	// English: admin-only pending-review list and manual order-confirm passthrough.
 	s.mux.HandleFunc("GET /api/qmt/pending-review", s.adminMiddleware(s.handleQMTPendingReview))
+	// §FIX-20261028-F06：收盘对账读数（透传网关 /admin/status 的 close_snapshot）
+	s.mux.HandleFunc("GET /api/qmt/close-snapshot", s.adminMiddleware(s.handleQMTCloseSnapshot))
 	s.mux.HandleFunc("POST /api/qmt/order-confirm", s.adminMiddleware(s.handleQMTOrderConfirm))
 	// §WS-B：券商交割单三方对账（触发 + 历史查询，仅 admin）
 	s.mux.HandleFunc("POST /api/qmt/settle", s.adminMiddleware(s.handleQMTSettle))
@@ -1156,6 +1158,11 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", allow)
 		}
 		// §N-05：方法/请求头只在预检分支写，不再挂在所有 GET/POST 响应上
+		// §FIX-20261028-F13：分页元信息走响应头，跨域（APK 内嵌页 → 服务端）必须放行读取，
+		// 否则前端永远读不到 X-Total-Count（同源部署不受影响，但 APK 是跨域）。
+		if allow != "" {
+			w.Header().Set("Access-Control-Expose-Headers", "X-Total-Count")
+		}
 		if r.Method == "OPTIONS" {
 			w.Header().Add("Vary", "Access-Control-Request-Method")
 			w.Header().Add("Vary", "Access-Control-Request-Headers")
@@ -1238,6 +1245,27 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// loginFailureCode 把 auth.Manager.Login 的错误串映射成"可对客户言明"的分码。
+//
+// §FIX-20261028-F04（2026-10-29）：到期/停用与口令错同形是 UAT 里真实踩到的锁死形态
+//（账号到期 → 屏上只显示"账号或密码不正确" → 用户与管理員都不知道该续期）。
+// 返回空 code 表示"必须保持 401 invalid credentials"（用户名不存在/口令错/临时号），
+// 防枚举底线不变：只有用户名存在且口令正确才会走到这里的分码分支。
+// 抽成纯函数是为了让分码规则可被单测直接钉住（不必为测试去改 auth 的建号 API）。
+func loginFailureCode(err error) (code, message string) {
+	if err == nil {
+		return "", ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "account expired"):
+		return "account_expired", "账号已过期，请联系管理员续期"
+	case strings.Contains(msg, "account disabled"):
+		return "account_disabled", "账号已停用，请联系管理员"
+	}
+	return "", ""
+}
+
 // writeError 以标准错误结构 {"error": msg} 写入响应。
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
@@ -1317,6 +1345,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	user, err := s.auth.Login(req.Username, req.Password)
 	if err != nil {
+		// §FIX-20261028-F04（2026-10-29）：账号"到期/停用"与"口令错"必须**分码**。
+		// 旧实现把 auth 已经分好的三种失败（Manager.Login 返回 account expired / account disabled /
+		// wrong password，见 auth.go:873-883）整体丢掉，统一写 401 invalid credentials ⇒
+		// 账号到期时用户看到的是"账号或密码不正确"，没有任何续期引导（本轮 UAT 就因此把自己
+		// 锁在门外 15 分钟）。
+		// 防枚举底线不变：**只有"用户名存在且口令正确"才会出现 403 分码**，
+		// 用户名不存在/口令错一律 401 invalid credentials（保持同形）。
+		if code, text := loginFailureCode(err); code != "" {
+			opslog.Audit("login", clientIP(r), req.Username, "fail:"+code)
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": code, "message": text})
+			return
+		}
 		// §A4 统一文案：不区分"用户不存在/密码错"，阻断用户名枚举
 		// §WS-F C1 审计：登录失败留痕（actor 用 clientIP 而非用户名，防枚举用户名单）
 		opslog.Audit("login", clientIP(r), req.Username, "fail")
@@ -2177,11 +2217,45 @@ func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-// handleListPositions 处理 GET /api/positions：返回当前账号的持仓记录与交易统计指标。
+// handleListPositions 处理 GET /api/positions：返回持仓记录与交易统计指标。
+//
+// §FIX-20261028-F01（2026-10-29）：本端点此前固定按运营账号返回**全量**运营账本
+// （`ListFor("")`），任何登录账号都能读到全部持仓行——UAT 实弹里成员号拿到的行内
+// 还带着别人的 user_id。现在默认只看本账号；admin 需要运营全量视角时必须显式带
+// `?scope=all`（非 admin 带该参数一律忽略，不报错也不放行）。
+// 遗留 `user_id=''` 的旧行按"归属运营账号"处理（读时归一，不做数据迁移）。
+// English: scoped to the requester by default; admins opt into the operator-wide view via
+// ?scope=all. Legacy rows with empty user_id are attributed to the operator account.
 func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
-	// 持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 读取统计与列表。
-	uid := s.operatorID()
-	logs := s.rpt.ListFor("")
+	uid := requestUserID(r)
+	if uid == "" {
+		uid = s.operatorID()
+	}
+	// 全量视角：仅 admin 且显式 ?scope=all 时开启
+	scopeAll := false
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("scope")), "all") {
+		if u := userFromContext(r); u != nil && u.Role == auth.RoleAdmin {
+			scopeAll = true
+		}
+	}
+	all := s.rpt.ListFor("")
+	logs := make([]report.ExecLog, 0, len(all))
+	for _, l := range all {
+		if scopeAll {
+			logs = append(logs, l)
+			continue
+		}
+		owner := strings.TrimSpace(l.UserID)
+		if owner == "" {
+			owner = s.operatorID() // 遗留全局行归属运营账号
+		}
+		if owner == uid {
+			logs = append(logs, l)
+		}
+	}
+	if scopeAll {
+		uid = s.operatorID() // 统计口径与列表口径必须同源
+	}
 	reportStats := map[string]interface{}{}
 	total, holding, win, wr, avgW, avgL := s.rpt.StatsFor(uid)
 	reportStats["total"] = total
@@ -2190,10 +2264,11 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	reportStats["win_rate"] = wr
 	reportStats["avg_win_pct"] = avgW
 	reportStats["avg_loss_pct"] = avgL
-	reportStats["by_strategy"] = s.rpt.StatsByStrategy(uid) // 按运营账号、按战法分组的胜率明细
+	reportStats["by_strategy"] = s.rpt.StatsByStrategy(uid) // 按账号、按战法分组的胜率明细
 	writeJSON(w, 200, map[string]interface{}{
 		"positions": logs,
 		"stats":     reportStats,
+		"scope":     map[bool]string{true: "all", false: "self"}[scopeAll],
 	})
 }
 

@@ -1651,6 +1651,8 @@ def _no_cancel_window_at(spec, minutes):
 # ===========================================================================
 CLOSE_STATE_PATH = _p("bridge_close_state.json")
 CLOSE_SNAPSHOT_AT = "15:01:00"
+# FIX-20261028-F03: throttle for same-day partial-snapshot retries (seconds).
+CLOSE_RETRY_GAP_SEC = 60
 # _MAIN_THREAD remembers the model main thread identity: gtdd rows are only visible there.
 _MAIN_THREAD = {"ident": None, "name": ""}
 
@@ -1762,20 +1764,40 @@ def close_snapshot_probe(ContextInfo):
 
 
 def _close_snapshot(day):
-    """Emit ONE end-of-day snapshot (orders + deals + positions + account)."""
+    """Emit ONE end-of-day snapshot (orders + deals + positions + account).
+
+    FIX-20261028-F03 (2026-10-29) "partial failure still marked done".
+    The old implementation wrapped each of the four tables in its own try/except that only
+    left a _trace line, then UNCONDITIONALLY wrote snapshot_day and logged "done". Result:
+    if the trades table read failed at 15:01 (busy counter / settlement switch), the closing
+    fill gap was masked as success, the day was never retried, and the morning alert (which
+    only looks at pending_recon_day) never fired -- the repo's core theme
+    "degrade-and-report-success" recurring once more.
+
+    New contract:
+      * any failed table read => collect into failed_tables, do NOT write snapshot_day,
+        set pending_recon_day / failed_tables instead;
+      * a later handlebar tick re-enters via _close_recon_retry_if_pending() -- the only
+        idempotency gate is "snapshot_day already equals today";
+      * no hard-coded retry time (the earlier draft's "15:20" had no basis and was dropped).
+    ASCII-only: this file is loaded by the QMT editor under GBK.
+    """
     try:
         adapter = _xt()
+        failed_tables = []
         try:
             orows, osynced = adapter.query_orders()
             _report({"type": "orders_snapshot", "orders": orows,
                      "synced": bool(osynced), "data_ts": _now_cn_str(),
                      "close_snapshot": True})
         except Exception as e:
+            failed_tables.append("orders")
             _trace("close snapshot orders error: " + repr(e))
         try:
             for trow in adapter.query_trades():
                 _report({"type": "trade", "close_snapshot": True, **trow})
         except Exception as e:
+            failed_tables.append("trades")
             _trace("close snapshot trades error: " + repr(e))
         try:
             poss = adapter.query_positions()
@@ -1785,6 +1807,7 @@ def _close_snapshot(day):
                      "synced": bool(poss), "data_ts": _now_cn_str(),
                      "close_snapshot": True})
         except Exception as e:
+            failed_tables.append("positions")
             _trace("close snapshot positions error: " + repr(e))
         try:
             asset = adapter.query_asset()
@@ -1792,15 +1815,69 @@ def _close_snapshot(day):
                 _report({"type": "account", "asset": asset, "synced": True,
                          "data_ts": _now_cn_str(), "close_snapshot": True})
         except Exception as e:
+            failed_tables.append("account")
             _trace("close snapshot asset error: " + repr(e))
+
         state = _read_close_state()
+        if failed_tables:
+            # PARTIAL: never mark the day done (that would kill retry AND the morning alert).
+            state["pending_recon_day"] = day
+            state["failed_tables"] = failed_tables
+            state["partial_at"] = _now_cn_str()
+            _write_close_state(state)
+            _trace("CLOSE_SNAPSHOT_PARTIAL day=%s tables=%s (not marked done; retry on later "
+                   "tick, morning alert will see the gap)" % (day, ",".join(failed_tables)))
+            return
         state["snapshot_day"] = day
         state["snapshot_at"] = _now_cn_str()
         state["probe_usable"] = True
+        # Clear the gap markers only on a fully successful pass.
+        state.pop("failed_tables", None)
+        state.pop("pending_recon_day", None)
+        state.pop("partial_at", None)
         _write_close_state(state)
         _trace("CLOSE_SNAPSHOT day=%s at=%s done" % (day, state.get("snapshot_at", "")))
     except Exception as e:
         _trace("close snapshot fatal: " + repr(e))
+
+
+def _close_recon_retry_if_pending(ContextInfo):
+    """FIX-20261028-F03 same-day retry for a PARTIAL close snapshot.
+
+    Called on every handlebar tick. Only re-knocks the 15:01 probe's door when:
+      * Beijing wall clock is at/after the close-snapshot time (CLOSE_SNAPSHOT_AT);
+      * today is NOT already marked done (the probe itself also guards this);
+      * today is still flagged pending (partial failure), NOT the "probe unusable" case
+        (that one is resolved by the next-morning snapshot, never retried here);
+      * at least CLOSE_RETRY_GAP_SEC seconds passed since the last retry (throttle: a
+        handlebar can fire every bar; without it a broken table would spam _trace).
+    ASCII-only.
+    """
+    try:
+        now_hm = _now_cn_str("%H:%M:%S")
+        if now_hm < str(CLOSE_SNAPSHOT_AT):
+            return
+        day = _now_cn_str("%Y-%m-%d")
+        state = _read_close_state()
+        if str(state.get("snapshot_day", "") or "") == day:
+            return
+        if str(state.get("pending_recon_day", "") or "") != day:
+            return
+        if not state.get("failed_tables"):
+            return
+        last = str(state.get("retry_at", "") or "")
+        if last:
+            try:
+                lt = time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%S+08:00"))
+                if time.time() + 8 * 3600 - lt < CLOSE_RETRY_GAP_SEC:
+                    return
+            except Exception:
+                pass
+        state["retry_at"] = _now_cn_str()
+        _write_close_state(state)
+        close_snapshot_probe(ContextInfo)
+    except Exception as e:
+        _trace("close snapshot retry error: " + repr(e))
 
 
 def _close_recon_morning_alert():
@@ -1855,6 +1932,11 @@ def handlebar(ContextInfo):
         pass
     try:
         _close_recon_morning_alert()
+    except Exception:
+        pass
+    # FIX-20261028-F03: retry a PARTIAL close snapshot on a later tick (idempotent inside).
+    try:
+        _close_recon_retry_if_pending(ContextInfo)
     except Exception:
         pass
     try:

@@ -98,11 +98,17 @@ class TestManualOrderSnapshot(_GatewayCase):
         self.assertEqual(self.store.order_by_signal("ext:M1")["status"], "已撤")
 
     def test_compact_counter_timestamp_normalized(self):
-        """柜台 8 位紧凑日期必须归一成 YYYY-MM-DD HH:MM:SS——否则量仔「当日」过滤永远看不到手动单。"""
-        self._snap([self._order_row(order_id="M7", created_at="20261028 093100")])
+        """柜台 8 位紧凑日期必须归一成 YYYY-MM-DD HH:MM:SS——否则量仔「当日」过滤永远看不到手动单。
+
+        §FIX-20261028：旧用例把日期写死成 20261028，而断言里的"今天"取的是运行时北京日，
+        跨过零点（或隔天跑）就必红——时间敏感的采集器缺陷，不是被测逻辑坏。
+        现在两边都从 `self._today()` 派生，语义不变、跨日稳定。
+        """
+        compact = self._today().replace("-", "") + " 093100"
+        self._snap([self._order_row(order_id="M7", created_at=compact)])
         row = self.store.order_by_signal("ext:M7")
         self.assertIsNotNone(row)
-        self.assertEqual(row["created_at"], "2026-10-28 09:31:00")
+        self.assertEqual(row["created_at"], self._today() + " 09:31:00")
         self.assertTrue(row["created_at"].startswith(self._today()))
 
     def test_unsynced_and_empty_snapshot_do_nothing(self):

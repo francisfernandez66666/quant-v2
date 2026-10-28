@@ -498,7 +498,11 @@ test.describe('交易相关分支', () => {
       await expect(klineBtn, '收起后回到分时态').toBeVisible()
       recordApiWarnings('signals-kline', ['分支=有行(展开/收起双腿已走)', 'rowCount=' + rowCount])
     } else {
-      await expect(page.locator('.t-table__empty').first(), '零信号时表格必须显式空态「暂无信号」（不是静默无控件）')
+      // §FIX-20261028-F15②：页面上现在有两张表（信号表 + §DECISION-TODAY 的"今日动态仓位"卡），
+      // `.t-table__empty` 的 first() 会命中小卡的空态（文案是"今日尚未定权…"）——判据必须
+      // 限定在**信号表作用域**内，否则红的是选择器而不是站点。
+      const signalTable = page.locator('.t-table').filter({ has: page.locator('th', { hasText: '总分' }) })
+      await expect(signalTable.locator('.t-table__empty').first(), '零信号时表格必须显式空态「暂无信号」（不是静默无控件）')
         .toContainText('暂无信号', { timeout: 8000 })
       recordApiWarnings('signals-kline', ['分支=零行(走空态断言，分时展开腿未走)', '空态文案=暂无信号'])
       test.info().annotations.push({ type: 'signals-empty-pool', description: '本栈信号池为空，分时展开分支未走；空态分支已断言' })
@@ -956,7 +960,9 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
   // U-5 运维入口回归：当日委托卡/日终结算卡渲染 + 「立即对账」可触发（成功/失败 toast 均算通）
   test('Quant：当日委托卡渲染 + 日终结算卡 + 对账可触发', async ({ page }) => {
     await page.goto('/#/quant')
-    await expect(page.getByText('当日委托'), '当日委托卡标题').toBeVisible({ timeout: 10000 })
+    // §FIX-20261028-F15③：卡头说明句（§CANCEL-STATE 起）也含"当日委托"四个字，
+    // getByText('当日委托') 会 strict violation（解析到 2 个元素）。锁到卡片标题本体。
+    await expect(page.locator('.t-card__title').filter({ hasText: /^当日委托$/ }).first(), '当日委托卡标题').toBeVisible({ timeout: 10000 })
     await page.waitForTimeout(1500)
     await page.screenshot({ path: `${SHOT}/branch-qmt-orders.png`, fullPage: true })
     // 终态委托行撤单栏为 —；仅在途单有按钮（数量取决于当日真实单，不断言条数，断言行存在）
@@ -1623,7 +1629,9 @@ test.describe('修复回归 · 0925EVE 撤单失败明细与第三态人工收�
     if (!oid) return
     await page.request.post(`${MOCK_URL}/admin/mock-force-status`, { headers: mockHdr(), data: { order_id: oid, status: '已报' } })
     const c = await page.request.post(`/api/qmt/cancel/${oid}`, { headers: hdr, data: {} })
-    expect([200, 404, 409, 502], `残留单收敛调用有明确响应（got ${c.status()}）`).toContain(c.status())
+    // §FIX-20261028-F15①：§CANCEL-STATE 把"撤单受理"从 200 改成 **202 + {status:"撤单中"}**，
+    // 这条收敛腿的允许码集必须同步——否则夜跑恒红，而红的原因是我们没跟上语义（不是站点坏）。
+    expect([200, 202, 404, 409, 502], `残留单收敛调用有明确响应（got ${c.status()}）`).toContain(c.status())
   }
 
   // EVE-A2：撤单失败必须出现在 halt 响应 failed[]（带网关原始报错）与 UI warning toast
@@ -2154,8 +2162,18 @@ test.describe('§C7 行情来源契约（故障注入）', () => {
 // English: UAT for the §DYN-T book, the v4 sizing keys and the two sign-off reports. The
 // load-bearing assertion on every report endpoint is that reading it changes nothing at all.
 test.describe('§DYN-T 做 T 与 §DYN-SIZE v4：读数面 + 签字门（2026-10-27）', () => {
+  // §FIX-20261028-F15④：`request` fixture 只带 storageState 的 cookie/localStorage，
+  // 而本产品鉴权走 Bearer 头 ⇒ 旧写法这四条 GET 恒 401（"报告类接口只读不改配置"这条
+  // 资金安全判据在 CI 里形同不存在）。这里按需登录一次并缓存 header。
+  let dynAuth = null
   const apiGet = async (request, path) => {
-    const res = await request.get(path)
+    if (!dynAuth) {
+      const lr = await request.post(API + '/api/auth/login', { data: { username: ADMIN.u, password: ADMIN.p } })
+      expect(lr.status(), 'DYN 段登录（admin）').toBe(200)
+      const lj = await lr.json()
+      dynAuth = { Authorization: 'Bearer ' + lj.token }
+    }
+    const res = await request.get(path, { headers: dynAuth })
     return { status: res.status(), body: await res.json().catch(() => null) }
   }
 

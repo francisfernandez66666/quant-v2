@@ -328,7 +328,7 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		// 台账读不到不等于 0 笔：这条读数本身就是证据，缺了必须说出来（静默给 0 ＝假绿）。
 		ledger["error"] = lerr.Error()
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	view := map[string]interface{}{
 		"book":        "live",
 		"account":     uid,
 		"state":       "ok",
@@ -340,7 +340,14 @@ func (s *Server) handleLiveTRounds(w http.ResponseWriter, r *http.Request) {
 		"funds":       st.Funds,
 		"pnl": tPnlView{Net: round2(net), Gross: round2(gross),
 			DoneRounds: done, FeeEstShare: feeEstShare},
-	})
+	}
+	// §FIX-20261028-F08（2026-10-29）：空账本必须给 reason，否则前端只能渲染成"今天 0 轮 T"
+	// ——而真相可能是"T 侧今天根本没运行"。文案保持中立：不从 t_at 推断轮次状态
+	//（t_at 只是 T 循环最后一次写帧的时刻，据此说"已全部收摊"是凭空断言）。
+	if len(filtered) == 0 {
+		view["reason"] = "当日无回转轮记录（T 侧未运行或今日未开腿）"
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 // parseTRoundsLimit 解析 limit（缺省/非法都退回默认值；上限 500 条）。

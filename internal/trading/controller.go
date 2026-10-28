@@ -939,11 +939,17 @@ func (c *Controller) CancelOrder(orderID string) error {
 		return err
 	}
 	if c.store != nil {
+		// §FIX-20261028-F14（2026-10-29）：先补**留痕三列**（不带状态守卫），再推进状态。
+		// 顺序很重要：留痕走 SetCancelTrace 时行可能已被回报推成终态，照样能写进去；
+		// 若先 Mark（带 `status IN (…)` 守卫）就会 CAS 落空、三列永远为空（本地实测 8/8 全空）。
+		if _, err := c.store.SetCancelTrace(c.userID, orderID, "manual", "手动撤单请求已发出，等待交易所确认"); err != nil {
+			log.Printf("[trading] cancel trace %s: %v", orderID, err)
+		}
 		// 请求已发出但交易所未确认 → 置「撤单中」；返回 false 表示行已终态/不存在（无需再撤）。
 		if ok, err := c.store.MarkRealOrderCancelRequested(c.userID, orderID, "manual", "手动撤单请求已发出，等待交易所确认"); err != nil {
 			log.Printf("[trading] cancel mark local %s: %v", orderID, err)
 		} else if !ok {
-			log.Printf("[trading] cancel mark local %s skipped: 已终态或不存在", orderID)
+			log.Printf("[trading] cancel mark local %s skipped: 已终态或不存在（留痕已单独补齐）", orderID)
 		}
 	}
 	return nil
@@ -1016,6 +1022,10 @@ func (c *Controller) HaltAll() HaltAllResult {
 		}
 		// §CANCEL-STATE：撤单请求已发出 ≠ 已撤。置「撤单中」等交易所确认；
 		// 窗口内被交易所拒绝的（收盘集合竞价）由网关回执/快照回退，失败明细由本轮返回。
+		// §FIX-20261028-F14：留痕先写（终态行也要留），再推进状态。
+		if _, err := c.store.SetCancelTrace(c.userID, o.OrderID, "halt", "紧急停止撤单请求已发出，等待交易所确认"); err != nil {
+			log.Printf("[trading] halt cancel trace %s: %v", o.OrderID, err)
+		}
 		if ok, err := c.store.MarkRealOrderCancelRequested(c.userID, o.OrderID, "halt", "紧急停止撤单请求已发出，等待交易所确认"); err == nil && ok {
 			res.Cancelled++
 		}
@@ -1185,6 +1195,10 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 			continue
 		}
 		// §CANCEL-STATE：撤单请求已发出 ≠ 已撤。置「撤单中」等交易所/快照确认。
+		// §FIX-20261028-F14：留痕先写（终态行也要留），再推进状态。
+		if _, err := c.store.SetCancelTrace(c.userID, o.OrderID, "sweep", "例行超时撤单/收盘清单撤单请求已发出，等待交易所确认"); err != nil {
+			log.Printf("[trading] sweep cancel trace %s: %v", o.OrderID, err)
+		}
 		if ok, err := c.store.MarkRealOrderCancelRequested(c.userID, o.OrderID, "sweep", "例行超时撤单/收盘清单撤单请求已发出，等待交易所确认"); err != nil || !ok {
 			res.Errors++
 			continue

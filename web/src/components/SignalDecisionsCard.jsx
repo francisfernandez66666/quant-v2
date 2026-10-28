@@ -70,6 +70,13 @@ export default function SignalDecisionsCard() {
   const items = (data && Array.isArray(data.items)) ? data.items : []
   const columns = [
     { colKey: 'at', title: '计算时刻', width: 110, cell: ({ row }) => <span style={{ fontSize: 12 }}>{String(row.at || '').replace('T', ' ').slice(11, 19) || '—'}</span> },
+    // §FIX-20261028-F19a：通道列（实盘自动 / 手动直发 / 纸面）。此前三个通道在屏上无法区分，
+    // 客户看到一行无法判断"这是引擎算的还是我手点的"。manual 行的定权列显示「—」（不伪造 MS/SS）。
+    { colKey: 'channel', title: '通道', width: 80, cell: ({ row }) => {
+      const map = { live: ['实盘', 'primary'], manual: ['手动', 'warning'], paper: ['纸面', 'default'] }
+      const [label, theme] = map[row.channel] || ['实盘', 'primary']
+      return <Tag size="small" theme={theme} variant="light">{label}</Tag>
+    } },
     { colKey: 'code', title: '代码', width: 95 },
     { colKey: 'strategy_key', title: '战法', width: 90, ellipsis: true, cell: ({ row }) => <span style={{ fontSize: 12 }}>{row.strategy_key || '—'}</span> },
     { colKey: 'stage', title: '阶段', width: 90, cell: ({ row }) => stageTag(row.stage) },
@@ -77,7 +84,11 @@ export default function SignalDecisionsCard() {
       colKey: 'scale', title: '定权 MS / SS / 单笔', width: 150,
       cell: ({ row }) => (
         <span style={{ fontSize: 12 }}>
-          {`${Number(row.market_scale || 0).toFixed(3)} / ${Number(row.stock_scale || 0).toFixed(3)} / ${(Number(row.per_trade_pct || 0) * 100).toFixed(1)}%`}
+          {/* §FIX-20261028-F19a：手动直发不经动态预算 ⇒ 这三列对它没有意义，显示「—」
+              而不是 0.000/0.0%（0 会被读成"算出来是 0"）。 */}
+          {row.channel === 'manual'
+            ? '—'
+            : `${Number(row.market_scale || 0).toFixed(3)} / ${Number(row.stock_scale || 0).toFixed(3)} / ${(Number(row.per_trade_pct || 0) * 100).toFixed(1)}%`}
         </span>
       ),
     },
@@ -129,7 +140,7 @@ export default function SignalDecisionsCard() {
         columns={columns}
         size="small"
         bordered
-        empty="今日尚未定权（或该账号今天还没有买入评估）"
+        empty="今日尚无决策快照（自动买入评估未触发；手动直发单会以「手动」通道出现）"
       />
     </Card>
   )

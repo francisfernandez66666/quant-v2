@@ -55,6 +55,28 @@ func (s *Server) handleQMTPendingReview(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// handleQMTCloseSnapshot 处理 GET /api/qmt/close-snapshot（admin）。
+//
+// §FIX-20261028-F06（2026-10-29）：把网关 /admin/status 的 close_snapshot 读数搬到产品面。
+// 错误口径与 pending-review 完全一致（本仓"读失败绝不冒充空/零"的纪律）：
+//   - 未接实盘 ⇒ 503；
+//   - 网关不可达/非 200 ⇒ 502 + 明确原因（绝不回空对象）；
+//   - 网关 200 但尚无该键 ⇒ 200 + {available:false, reason:…}（"还没产出"是事实，不是 0 笔）。
+// English: relays the gateway close-snapshot readout; absence is explicit, never a fake zero.
+func (s *Server) handleQMTCloseSnapshot(w http.ResponseWriter, r *http.Request) {
+	ctrl := s.qmtCtrlFor(userIDFor(r))
+	if ctrl == nil {
+		writeError(w, 503, "未接入 QMT 实盘：无法读取收盘对账（空读数不代表当日无成交）")
+		return
+	}
+	res, err := ctrl.GatewayCloseSnapshot()
+	if err != nil {
+		writeError(w, 502, "网关收盘对账查询失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, res)
+}
+
 // qmtOrderConfirmReq POST /api/qmt/order-confirm 请求体。
 // wire_ref 为前端契约里的「待核对单锚点」，即网关下单幂等键 signal_id
 // （兼容直传 signal_id 的调用方，两键取先非空者）。

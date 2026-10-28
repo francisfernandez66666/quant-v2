@@ -246,3 +246,68 @@ func TestFundsPublishDedup(t *testing.T) {
 		t.Fatalf("超过去重窗口后没有刷新: %q", third.At)
 	}
 }
+
+// ── §FIX-20261028-F02（2026-10-29）：去重基线与帧写入同生共死 ──
+//
+// 缺陷本体：fundsPublishDue 每次调用（含返回 false 那次）都写 fundsPublishedAt[uid]=now，
+// 而调用节拍是打分循环 5s ticker ⇒ now-last≈5s 恒小于 10s 窗口 ⇒ 除首帧外几乎永不发布；
+// 盘中"今日资金"卡长期停在上午的帧、接口 at 却是新的（假新鲜）。
+// 下面三条锁住新口径：判定只读、基线只在真发布后推进、早退不推进基线。
+
+// TestFundsPublishDueIsReadOnly 判定不得推进基线（连判两次都要为 true）。
+func TestFundsPublishDueIsReadOnly(t *testing.T) {
+	f := newFundsFix(t)
+	t0 := f.now
+	if !f.e.fundsPublishDue(f.uid, t0) {
+		t.Fatal("首帧应判定为 due")
+	}
+	// 不调用 markFundsPublished ⇒ 基线未前进 ⇒ 后续判定仍为 true（5s 后也一样）。
+	for i := 1; i <= 2; i++ {
+		at := t0.Add(time.Duration(i*5) * time.Second)
+		if !f.e.fundsPublishDue(f.uid, at) {
+			t.Fatalf("第 %d 次判定应为 true：判定函数不许推进去重基线", i)
+		}
+	}
+}
+
+// TestPublishDueUnderFiveSecondCadence 5s 节拍 + 真发布后 mark ⇒ 每 10s 放行一帧。
+// 期望序列：[true,false,true,false,true,false,true]（t=0,5,10,15,20,25,30）。
+func TestPublishDueUnderFiveSecondCadence(t *testing.T) {
+	f := newFundsFix(t)
+	t0 := f.now
+	var got []bool
+	for i := 0; i < 7; i++ {
+		at := t0.Add(time.Duration(i*5) * time.Second)
+		due := f.e.fundsPublishDue(f.uid, at)
+		got = append(got, due)
+		if due {
+			f.e.markFundsPublished(f.uid, at)
+		}
+	}
+	want := []bool{true, false, true, false, true, false, true}
+	if len(got) != len(want) {
+		t.Fatalf("判定次数不对: %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("5s 节拍下的放行序列应为 %v，实到 %v", want, got)
+		}
+	}
+}
+
+// TestFundsPublishDueNotAdvancedOnEarlyReturn 早退（实盘账本不可得）不得推进基线。
+//
+// 这是初版修法的关键回归：若把时间戳写在 due 判定里，db==nil 这处早退会让"基线前进但帧没写"，
+// 5s 节拍下又变成另一种饿死（专挑持仓读不到的时刻）。基线必须只在 updateFunds 之后推进。
+func TestFundsPublishDueNotAdvancedOnEarlyReturn(t *testing.T) {
+	f := newFundsFix(t)
+	// 拔掉实盘账本：publishSignalFunds 会在 db==nil 处早退（不进 updateFunds）。
+	f.e.mu.Lock()
+	f.e.realStore = nil
+	f.e.mu.Unlock()
+	f.e.publishSignalFunds(f.uid, nil)
+	// 5s 后仍应判定为 due（早退没有推进基线）。
+	if !f.e.fundsPublishDue(f.uid, f.now.Add(5*time.Second)) {
+		t.Fatal("早退不许推进去重基线：否则 5s 节拍下会永久饿死")
+	}
+}

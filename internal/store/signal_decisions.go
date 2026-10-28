@@ -114,6 +114,23 @@ func (d *DB) SignalDecisionsForDay(userID, day string) ([]SignalDecision, error)
 
 // PruneSignalDecisions 删除早于 beforeDay（YYYYMMDD）的快照，返回删除行数。
 // 只做保留期收缩，不参与判定；调用方按日一次即可。
+// DeleteSignalDecisionsForUser §FIX-20261028-F18：删号时清该账号的**私有观测快照**。
+//
+// 只删 signal_decisions（"为什么买/为什么没买"的当日解释快照，非资金凭证）；
+// orders/fills/trades 等资金流水**一律不删**——那是审计与对账的证据链，删号也不该抹掉。
+// 空 uid 直接拒绝：那会把平台级的遗留行一起删掉。
+func (d *DB) DeleteSignalDecisionsForUser(userID string) (int64, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return 0, fmt.Errorf("refuse to delete signal_decisions for empty user id")
+	}
+	res, err := d.db.Exec(`DELETE FROM signal_decisions WHERE user_id = ?`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (d *DB) PruneSignalDecisions(beforeDay string) (int64, error) {
 	if strings.TrimSpace(beforeDay) == "" {
 		return 0, nil

@@ -16,6 +16,8 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+
+	"quant-trading-v2/internal/cntime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,7 +54,10 @@ type Client struct {
 	// §FIX-7(20260919) 咨询单独当日预算计数：全体用户共用运营 key，总预算之外咨询再封顶。
 	consultCalls  atomic.Int64 // 当日咨询调用数
 	consultBudget atomic.Int64 // 咨询日调用预算（0=不设限）
-	keyCoolUntil  []atomic.Int64
+	// usageLedger §FIX-20261028-F17：进程级共享账本（空=只用本实例 atomic，测试兼容）。
+	// 每次计费点同时写本实例 atomic（保留既有读数路径）与账本（跨重建/重启存活）。
+	usageLedger  *UsageLedger
+	keyCoolUntil []atomic.Int64
 }
 
 // DefaultBatchConcurrency 未显式配置时的批量分析默认并发批次。
@@ -261,6 +266,15 @@ func New(cfg Config) *Client {
 		classifierModel:    cfg.ClassifierModel,
 	}
 	c.usageDay.Store(llmToday())
+	// §FIX-20261028-F17：绑定进程级账本并回填当日计数（同一天才回填，跨日从 0 起）。
+	if cfg.UsageLedger != nil {
+		c.usageLedger = cfg.UsageLedger
+		if d, calls, tokens, consult := cfg.UsageLedger.Snapshot(); d == cntime.DayCompactOf(time.Now()) {
+			c.usageCalls.Store(calls)
+			c.usageTokens.Store(tokens)
+			c.consultCalls.Store(consult)
+		}
+	}
 	c.callBudget.Store(cfg.DailyCallBudget)
 	c.tokenBudget.Store(cfg.DailyTokenBudget)
 	c.consultBudget.Store(cfg.ConsultDailyCalls) // §FIX-7
@@ -432,9 +446,17 @@ func (e *UpstreamError) Error() string {
 }
 
 // llmToday 返回本地日期戳 yyyymmdd（预算跨日归零依据）。
+// llmToday 当日日键（yyyymmdd）。
+//
+// §FIX-20261028-F17：改用**北京时间交易日**（cntime.DayCompactOf）。旧实现取服务器本地
+// Year/Month/Day，与仓内其它日键（data.TradingDayDate / cntime）不同源——异地部署
+// （如 deploy_seoul 的 KST）会出现"文件名是北京日、计数按本地日重置"的错位。
 func llmToday() int64 {
-	t := time.Now()
-	return int64(t.Year())*10000 + int64(t.Month())*100 + int64(t.Day())
+	n, err := strconv.ParseInt(cntime.DayCompactOf(time.Now()), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // rollUsageDay 跨日归零计数（CAS 保证只由翻日者清一次）。
@@ -464,6 +486,9 @@ func (c *Client) preFlight() error {
 		return fmt.Errorf("LLM 日 token 预算已用尽(%d)，次日自动恢复: %w", b, ErrBudgetExceeded)
 	}
 	c.usageCalls.Add(1)
+	if c.usageLedger != nil {
+		c.usageLedger.AddCalls(1) // §FIX-20261028-F17：跨 Client 重建/重启都不断账
+	}
 	return nil
 }
 
@@ -475,6 +500,9 @@ func (c *Client) preFlightConsult() error {
 		return fmt.Errorf("咨询日调用预算已用尽(%d 次)，次日自动恢复: %w", b, ErrBudgetExceeded)
 	}
 	c.consultCalls.Add(1)
+	if c.usageLedger != nil {
+		c.usageLedger.AddConsult(1) // §FIX-20261028-F17
+	}
 	return nil
 }
 
@@ -485,6 +513,9 @@ func (c *Client) recordUsage(prompt, completion int64) {
 	}
 	c.rollUsageDay()
 	c.usageTokens.Add(prompt + completion)
+	if c.usageLedger != nil {
+		c.usageLedger.AddTokens(prompt + completion) // §FIX-20261028-F17
+	}
 }
 
 // UsageStats 当日用量快照（/api/llm-debug 与成本观测消费）。

@@ -31,9 +31,10 @@ func TestOrderContractGolden(t *testing.T) {
 		t.Fatalf("读取 golden 失败（网关契约文件缺失？）: %v", err)
 	}
 	var doc struct {
-		Fields            []string `json:"fields"`
-		ConsumedByGateway []string `json:"consumed_by_gateway"`
-		IgnoredByGateway  []string `json:"ignored_by_gateway"`
+		Fields            []string          `json:"fields"`
+		Types             map[string]string `json:"types"`
+		ConsumedByGateway []string          `json:"consumed_by_gateway"`
+		IgnoredByGateway  []string          `json:"ignored_by_gateway"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("golden JSON 解析失败: %v", err)
@@ -45,6 +46,7 @@ func TestOrderContractGolden(t *testing.T) {
 	if os.Getenv("ORDER_CONTRACT_UPDATE") == "1" {
 		out, merr := json.MarshalIndent(map[string]any{
 			"source": "internal/trading/executor.go OrderRequest", "fields": goFields,
+			"types":               orderJSONTypes(t, OrderRequest{}),
 			"consumed_by_gateway": doc.ConsumedByGateway, "ignored_by_gateway": doc.IgnoredByGateway,
 		}, "", "  ")
 		if merr != nil {
@@ -57,6 +59,16 @@ func TestOrderContractGolden(t *testing.T) {
 	}
 
 	assertSameFieldSet(t, "OrderRequest(反射) vs golden.fields", goFields, doc.Fields)
+
+	// §FIX-20261028-F16（2026-10-29）：契约锁补"类型/指针性"。
+	// 旧锁只比字段名集合——把 price 从 float64 改成 string、或把 qty 从 int 改成 *int，
+	// 三向校验照样全绿，而网关会静默解析成 0（本仓"字段在≠语义对"的同族）。
+	// 现在 golden.types 与 Go 反射类型逐字段等值：改类型就必须同步 golden，否则这里红。
+	if len(doc.Types) == 0 {
+		t.Fatalf("golden.types 缺失：契约类型锁未启用（用 ORDER_CONTRACT_UPDATE=1 重新生成后再提交）")
+	}
+	goTypes := orderJSONTypes(t, OrderRequest{})
+	assertSameTypeMap(t, goTypes, doc.Types)
 	assertSameFieldSet(t, "golden.fields vs consumed∪ignored",
 		doc.Fields, append(append([]string{}, doc.ConsumedByGateway...), doc.IgnoredByGateway...))
 
@@ -114,5 +126,59 @@ func assertSameFieldSet(t *testing.T, what string, a, b []string) {
 	}
 	if len(missing) > 0 || len(extra) > 0 {
 		t.Errorf("%s 字段集不一致: 仅前者有=%v 仅后者有=%v", what, extra, missing)
+	}
+}
+
+// orderJSONTypes 反射提取 "json 字段名 → 类型串"（指针记 ptr:，slice 记 slice:）。
+//
+// §FIX-20261028-F16：类型串只用于"契约两侧是否同型"的等值比较，不做跨语言类型推导——
+// Go 的 int/int64、float64 与 Python 的 int/float 本来就不同名，网关侧只校验"键集一致 + 值在允许集合"。
+func orderJSONTypes(t *testing.T, v any) map[string]string {
+	t.Helper()
+	tp := reflect.TypeOf(v)
+	out := make(map[string]string, tp.NumField())
+	for i := 0; i < tp.NumField(); i++ {
+		f := tp.Field(i)
+		name := f.Tag.Get("json")
+		if name == "" || name == "-" {
+			continue
+		}
+		if idx := strings.IndexByte(name, ','); idx >= 0 {
+			name = name[:idx]
+		}
+		out[name] = goTypeString(f.Type)
+	}
+	return out
+}
+
+// goTypeString 把 reflect.Type 归成稳定的类型串（指针/切片加前缀，其余用 Kind 名）。
+func goTypeString(ft reflect.Type) string {
+	switch ft.Kind() {
+	case reflect.Pointer:
+		return "ptr:" + goTypeString(ft.Elem())
+	case reflect.Slice:
+		return "slice:" + goTypeString(ft.Elem())
+	default:
+		return ft.Kind().String()
+	}
+}
+
+// assertSameTypeMap 逐字段比类型串，缺一/多一/不同型都算红。
+func assertSameTypeMap(t *testing.T, got, want map[string]string) {
+	t.Helper()
+	for k, wv := range want {
+		gv, ok := got[k]
+		if !ok {
+			t.Errorf("golden.types 多出字段 %q（Go 结构体已无此字段）", k)
+			continue
+		}
+		if gv != wv {
+			t.Errorf("字段 %q 类型漂移：Go=%s golden=%s（改类型必须同步 golden 并通知网关）", k, gv, wv)
+		}
+	}
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			t.Errorf("golden.types 缺字段 %q（Go 结构体新增字段必须在 golden 里登记类型）", k)
+		}
 	}
 }
