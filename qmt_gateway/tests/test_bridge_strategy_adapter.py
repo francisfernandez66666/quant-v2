@@ -50,6 +50,38 @@ class TestXtOpsContract(unittest.TestCase):
         self.assertIsNone(ops.query_asset())
         self.assertEqual(ops.query_trades(), [])
 
+    def test_embed_cancel_non_numeric_order_id_still_tries_str_legs(self):
+        """撤单参数阶梯必须惰性构造（2026-10-29 14:31:30 实录）。
+
+        排队通道自己生成的委托号是 `xt<ts>` 形态（桥下的单几乎全是这种），把
+        int(oid) 写在参数列表里会在任何一次尝试之前抛 ValueError，于是文档里的
+        4 参 cancel 形态根本没被拨到——线上表现就是「同类两笔撤单，一笔成、一笔
+        ValueError」。这里钉住：非数字委托号下必须仍走 4 参/字符串形态。
+        """
+        ops = bs._XtOps(account="ACC", dry_run=False, xt_path="", session_id=2)
+        calls = []
+
+        def _fake_builtin(name):
+            def _cancel(*args):
+                calls.append(args)
+                if len(args) != 4:
+                    raise TypeError("signature mismatch")
+            return _cancel
+
+        real_builtin = ops._builtin
+        real_acct = ops._embed_acct
+        ops._builtin = _fake_builtin
+        ops._embed_acct = lambda: "ACC"
+        ops._ctx = object()  # 4 参形态需要 ContextInfo
+        try:
+            ok, err = ops.embed_cancel("xt1477443588", "600362.SH")
+        finally:
+            ops._builtin = real_builtin
+            ops._embed_acct = real_acct
+        self.assertTrue(ok, "非数字委托号不该让整条阶梯炸掉：%s" % err)
+        self.assertEqual(len(calls[0]), 4, "首个尝试必须是文档里的 4 参 cancel 形态")
+        self.assertEqual(calls[0][0], "xt1477443588", "委托号要原样传，不能被 int() 化")
+
     def test_read_cfg_encodings(self):
         """cfg 读取兼容 utf-8-sig(BOM)/utf-8/gbk 三种写法（运维脚本改写后不炸桥）。"""
         import tempfile, json as _json

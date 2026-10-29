@@ -813,11 +813,17 @@ class _XtOps:
             return False, "cancel needs exchange order_id"
         acct = self._embed_acct()
         ctx = getattr(self, "_ctx", None)
+        # FIX-20261029-CANCELID: the numeric-arg leg must be built INSIDE the loop. The old
+        # ladder did int(oid) while constructing the list, so a non-numeric exchange id
+        # (the queued channel mints "xt<ts>" ids -- i.e. every order the bridge itself
+        # places) raised ValueError BEFORE any attempt ran, and the documented 4-arg forms
+        # below never got a chance: 2026-10-29 14:31:30 went
+        # "cancel error: ValueError(...'xt1477443588')" while the sibling order cancelled ok.
         attempts = [
             ("4s", (oid, acct, "STOCK", ctx)),
             ("4l", (oid, acct, "stock", ctx)),
             ("3", (oid, acct, "STOCK")),
-            ("2i", (int(oid), acct)),
+            ("2i", None),
             ("2s", (oid, acct)),
         ]
         errs = []
