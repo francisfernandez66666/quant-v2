@@ -393,7 +393,7 @@ func (d *DB) FillAmendmentByID(id int64) (*FillAmendment, error) {
 }
 
 // ListFillAmendments 按状态（空=全部）倒序列出勘误，供前端把"已提交待批准/已生效"挂到成交行上。
-// English: lists amendments (all statuses when status=”) newest first.
+// English: lists amendments (all statuses when status=<空串>) newest first.
 func (d *DB) ListFillAmendments(status string, limit int) ([]FillAmendment, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -442,7 +442,7 @@ func scanAmendment(sc interface{ Scan(...any) error }) (*FillAmendment, error) {
 }
 
 // RawFillForUser 按 ID 读**原始**成交行（不走视图），并套用与成交簿展示一致的可见性规则：
-// 归属本账号的行 + 遗留全局行（user_id=”）。
+// 归属本账号的行 + 遗留全局行（user_id=<空串>）。
 // 为什么 HTTP 层需要它：勘误入口拿的是 fills.id，若直接按 id 建勘误，多账号部署下任一管理员
 // 都能改到别人账上的成交（越权面）。这里先把"这笔是否可见"钉住，再谈勘误。
 // English: reads the RAW fill row by id with the same visibility rule the trade ledger uses

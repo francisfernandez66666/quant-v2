@@ -224,7 +224,7 @@ func TestRunChain(t *testing.T) {
 // TestChainCheckpointCarriesAdjBasis §ADJ-BASIS（2026-09-23）候选断点缓存必须带当前复权口径位。
 // 锁的是"链 ↔ 存储层"的接线：store 侧只认调用方传进来的口径串，而串单点定义在
 // research.AdjBaselineVersion（本包能 import research，store 不能）。断三件事：
-//  1. 落库的每一行 adj_basis 都 == 当前口径（既不是改前哨兵 ”，也不是别的口径）；
+//  1. 落库的每一行 adj_basis 都 == 当前口径（既不是改前哨兵 <空串>，也不是别的口径）；
 //  2. 同参重跑逐事件命中缓存（行数不增、报告一致）——口径进键没把命中路径写坏；
 //  3. 换一个口径串读同一批键全部未命中（数值口径变了就必须重算）。
 func TestChainCheckpointCarriesAdjBasis(t *testing.T) {

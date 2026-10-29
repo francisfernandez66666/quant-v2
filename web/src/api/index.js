@@ -1143,21 +1143,25 @@ export async function fetchPaperTrades() {
 // 不传参数时服务端缺省 500 行，旧调用点无需改动即可受益（600KB → <200KB）。
 // 注意：`request()` 目前只返回 body，所以总数通过第二个返回值给出；调用方按需取用。
 export async function fetchPaperOrders(limit, offset) {
+  return request('/api/paper/orders' + paperOrdersQuery(limit, offset))
+}
+
+// §FIX-20261028-F13 查询串拼装单独一个函数：契约台账派生（§115）要求 request() 首参
+// 直接以路径字面量开头，路径整段落进变量会让该调用点脱离射程（Q1/Q3 双双失明）。
+// English: keep the literal path inline in request() so the contract-ledger derivation
+// still sees the call site; only the query string is computed.
+function paperOrdersQuery(limit, offset) {
   const q = []
   if (limit !== undefined && limit !== null) q.push('limit=' + encodeURIComponent(limit))
   if (offset !== undefined && offset !== null) q.push('offset=' + encodeURIComponent(offset))
-  const path = '/api/paper/orders' + (q.length ? '?' + q.join('&') : '')
-  return request(path)
+  return q.length ? '?' + q.join('&') : ''
 }
 
 // §FIX-20261028-F13：需要总数时用这个变体（返回 { orders, total }）。
 // 为什么单独一个函数：主调用点（Paper.jsx 的委托表）只要数组，改它的返回形状会波及 3 处 setState；
 // 需要分页信息的调用方显式选这个。
 export async function fetchPaperOrdersPage(limit, offset) {
-  const q = []
-  if (limit !== undefined) q.push('limit=' + encodeURIComponent(limit))
-  if (offset !== undefined) q.push('offset=' + encodeURIComponent(offset))
-  const path = '/api/paper/orders' + (q.length ? '?' + q.join('&') : '')
+  const path = '/api/paper/orders' + paperOrdersQuery(limit, offset)
   // 走 fetch 直连才能读响应头（request() 只解 body）。鉴权头与 baseUrl 与 request() 同源。
   // 鉴权头与 request() 同源：本地有 token 就带 Bearer（只读 GET，不需要 Content-Type）
   const token = getToken() || ''

@@ -137,7 +137,7 @@ type rowScanner interface {
 // §RFIX-4 复活：本函数此前是死代码（research_tasks 启动接管只覆盖任务队列表，
 // backtest_jobs 僵尸行无人回收，生产 id=3 running 挂死近一月）；现由 researchd 与
 // quant 双启动路径调用（同一 trading.db，幂等）。finished_at 用 NULLIF 容空串——
-// 本表以 ”（非 NULL）落库空值，旧 COALESCE 永远不回填。
+// 本表以 <空串>（非 NULL）落库空值，旧 COALESCE 永远不回填。
 // English: marks every leftover running job as interrupted (startup recovery for crashed runs).
 // Returns how many jobs were flagged.
 func (d *DB) MarkRunningInterrupted() (int, error) {

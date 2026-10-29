@@ -1036,7 +1036,7 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 //
 // §FIX-20261028-F01（2026-10-29）：循环此前读 `ListFor("")` 后**不按账号过滤**，
 // 于是 /api/holdings 对任何登录账号都返回全部账号的持仓行（UAT 实弹：成员号与 admin 的
-// holdings 逐字节同指纹）。现在只取本账号；遗留 `user_id=”` 的旧行归属运营账号
+// holdings 逐字节同指纹）。现在只取本账号；遗留 `user_id=<空串>` 的旧行归属运营账号
 // （读时归一，不做数据迁移）。
 // English: rows are scoped to userID; legacy rows with empty user_id belong to the operator.
 func (s *Server) paperPnlTotals(userID string) (holdings []fixHolding, realized, unrealized, offset float64, offsetErr error) {

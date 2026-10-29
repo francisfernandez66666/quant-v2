@@ -535,7 +535,7 @@ func TestHandleQMTReportPositionsClearGuard(t *testing.T) {
 }
 
 // TestHandleQMTReportPositionsInvalidTsCode400 §F2（2026-09-22 修复批）HTTP 面：
-// positions 上报混入 ts_code=” 或非法格式行 → 整批拒 400，账本一行不动（含批内合法行）。
+// positions 上报混入 ts_code=<空串> 或非法格式行 → 整批拒 400，账本一行不动（含批内合法行）。
 // 合法快照不受影响；「本地有仓+空快照 409」守卫保留（见 TestHandleQMTReportPositionsClearGuard）。
 // English: §F2 — a snapshot containing any invalid ts_code is rejected wholesale with 400
 // and nothing lands; valid snapshots keep flowing.

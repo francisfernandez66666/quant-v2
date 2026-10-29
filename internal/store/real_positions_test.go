@@ -221,7 +221,7 @@ func TestApplyRealFillEdge(t *testing.T) {
 }
 
 // TestRealPositionsForUser §GAP1.10 回归：持仓按归属账号过滤；
-// 遗留全局行（user_id=”）对所有人可见；UpsertRealPositions 写入 user_id。
+// 遗留全局行（user_id=<空串>）对所有人可见；UpsertRealPositions 写入 user_id。
 func TestRealPositionsForUser(t *testing.T) {
 	db := testDB(t)
 	if _, err := db.UpsertRealPositions([]RealPosition{
@@ -254,11 +254,11 @@ func TestRealPositionsForUser(t *testing.T) {
 }
 
 // TestReconcileLegacyRowPrunedWhenNotInSnapshot P2#17 回归：非空快照对账分支必须把
-// 不在快照中的遗留全局行（user_id=”）一并清理——旧实现只删本账号 scoped 行，遗留行
+// 不在快照中的遗留全局行（user_id=<空串>）一并清理——旧实现只删本账号 scoped 行，遗留行
 // 既未被声明归属又不在快照中，成为对全账号可见的永驻残影（虚报对账计数/前向看起来像持仓）。
 // 同时已验证真正的 scoped 行（其他账号）与快照内行不受影响。
 // English: P2#17 regression — the non-empty snapshot reconcile branch must also purge legacy global rows
-// (user_id=”) absent from the snapshot. The old code deleted only this account's scoped rows, so an
+// (user_id=<空串>) absent from the snapshot. The old code deleted only this account's scoped rows, so an
 // unclaimed legacy row lingered indefinitely (a phantom visible to every account / inflating counts).
 // Genuine scoped rows of other accounts and snapshot-present rows stay untouched.
 func TestReconcileLegacyRowPrunedWhenNotInSnapshot(t *testing.T) {
@@ -789,7 +789,7 @@ func TestApplyRealFillBuyCostIncludesFee(t *testing.T) {
 
 // TestReconcileRejectsInvalidTsCode §F2（2026-09-22 修复批）：对账入口字段级校验——
 // 任一行 ts_code 为空或非法格式 → 整批拒收（ErrInvalidPositionReport），一行都不落库。
-// 锤实形态：一行 ts_code=” 垃圾行会让上层「本地有仓+空快照 409 守卫」永久误触发，
+// 锤实形态：一行 ts_code=<空串> 垃圾行会让上层「本地有仓+空快照 409 守卫」永久误触发，
 // 真实全平无法经对账通道落账；且空主键行本身即脏数据。
 // English: §F2 — any blank/malformed ts_code rejects the whole snapshot, nothing is written.
 func TestReconcileRejectsInvalidTsCode(t *testing.T) {
@@ -1040,7 +1040,7 @@ func TestReconcileKeepsFeeInclusiveCost(t *testing.T) {
 }
 
 // TestRaiseRealPositionHighOnlyUp §N-7 账本侧单调语义：只增不减、无有效锚点（≤0）绝不落库、
-// 遗留全局行（user_id=”）对账号查询同样可回写。
+// 遗留全局行（user_id=<空串>）对账号查询同样可回写。
 // English: §N-7 — the anchor write-back is strictly monotonic, refuses non-positive highs, and
 // still reaches legacy global rows.
 func TestRaiseRealPositionHighOnlyUp(t *testing.T) {
@@ -1160,7 +1160,7 @@ func TestRealPositionCanUseQty(t *testing.T) {
 		t.Fatalf("④ 列表读取口丢腿, got %+v", all[0].CanUseQty)
 	}
 	// 全表读取口同样带腿。行数=1 是既有 P2#17 语义：ReconcilePositionsForUser 会把
-	// 不在本账号快照内的遗留全局行（早前 UpsertRealPositions 建的 600000 行，user_id=”）
+	// 不在本账号快照内的遗留全局行（早前 UpsertRealPositions 建的 600000 行，user_id=<空串>）
 	// 一并清除，此处只余 u1 的 000001 行。
 	if all2, err := db.RealPositions(); err != nil || len(all2) != 1 {
 		t.Fatalf("④ RealPositions 全表读取口: n=%d err=%v", len(all2), err)

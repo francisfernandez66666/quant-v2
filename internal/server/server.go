@@ -1248,7 +1248,7 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 // loginFailureCode 把 auth.Manager.Login 的错误串映射成"可对客户言明"的分码。
 //
 // §FIX-20261028-F04（2026-10-29）：到期/停用与口令错同形是 UAT 里真实踩到的锁死形态
-//（账号到期 → 屏上只显示"账号或密码不正确" → 用户与管理員都不知道该续期）。
+// （账号到期 → 屏上只显示"账号或密码不正确" → 用户与管理員都不知道该续期）。
 // 返回空 code 表示"必须保持 401 invalid credentials"（用户名不存在/口令错/临时号），
 // 防枚举底线不变：只有用户名存在且口令正确才会走到这里的分码分支。
 // 抽成纯函数是为了让分码规则可被单测直接钉住（不必为测试去改 auth 的建号 API）。
@@ -2223,7 +2223,7 @@ func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 // （`ListFor("")`），任何登录账号都能读到全部持仓行——UAT 实弹里成员号拿到的行内
 // 还带着别人的 user_id。现在默认只看本账号；admin 需要运营全量视角时必须显式带
 // `?scope=all`（非 admin 带该参数一律忽略，不报错也不放行）。
-// 遗留 `user_id=''` 的旧行按"归属运营账号"处理（读时归一，不做数据迁移）。
+// 遗留 `user_id=<空串>` 的旧行按"归属运营账号"处理（读时归一，不做数据迁移）。
 // English: scoped to the requester by default; admins opt into the operator-wide view via
 // ?scope=all. Legacy rows with empty user_id are attributed to the operator account.
 func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {

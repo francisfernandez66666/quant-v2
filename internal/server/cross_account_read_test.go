@@ -7,7 +7,7 @@
 //
 // 本文件锁三件事（读面，不涉及写面）：
 //  1. /api/positions 默认只回本账号；admin 带 ?scope=all 才看全量；非 admin 带该参数不放行；
-//  2. 遗留 user_id='' 的旧行归属运营账号（读时归一，不迁移数据）；
+//  2. 遗留 user_id=<空串> 的旧行归属运营账号（读时归一，不迁移数据）；
 //  3. /api/holdings 同样按账号过滤。
 //
 // English: regression for the cross-account read scoping — self by default, operator-wide only

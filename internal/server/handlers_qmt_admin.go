@@ -62,6 +62,7 @@ func (s *Server) handleQMTPendingReview(w http.ResponseWriter, r *http.Request) 
 //   - 未接实盘 ⇒ 503；
 //   - 网关不可达/非 200 ⇒ 502 + 明确原因（绝不回空对象）；
 //   - 网关 200 但尚无该键 ⇒ 200 + {available:false, reason:…}（"还没产出"是事实，不是 0 笔）。
+//
 // English: relays the gateway close-snapshot readout; absence is explicit, never a fake zero.
 func (s *Server) handleQMTCloseSnapshot(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.qmtCtrlFor(userIDFor(r))

@@ -207,8 +207,8 @@ func (sw *SessionWindows) NewOrderBlocked(now time.Time) (bool, string) {
 // Describe 供运维面回显**当前生效**的窗口规则。
 //
 // §FIX-20261028-F05（2026-10-29）：raw 是配置原文，配置为空串时生效的是出厂默认
-//（见 NewSessionWindows 的回落分支），而旧实现把空串原样回出去 ⇒ 界面会显示
-//「禁撤 （空）」这种无意义读数。现在空串回落该侧的默认串——回显的必须是**判定真正用的值**。
+// （见 NewSessionWindows 的回落分支），而旧实现把空串原样回出去 ⇒ 界面会显示
+// 「禁撤 （空）」这种无意义读数。现在空串回落该侧的默认串——回显的必须是**判定真正用的值**。
 // English: echoes the EFFECTIVE windows (empty raw config falls back to factory defaults),
 // because the UI must show what the guard actually enforces.
 func (sw *SessionWindows) Describe() map[string]string {

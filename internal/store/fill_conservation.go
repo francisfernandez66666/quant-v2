@@ -88,7 +88,7 @@ type ConservationReport struct {
 //	   expected = 期初资金 − Σ买入成交额 − Σ佣金 + Σ卖出成交额 − Σ印花税
 //	   要求 expected == real_account.available_cash（券商回报口径）
 //
-// 范围与账号可见性：本自检刻意比风控闸**更宽**——成交与持仓都按 (user_id = ? OR user_id = ”)
+// 范围与账号可见性：本自检刻意比风控闸**更宽**——成交与持仓都按 (user_id = ? OR user_id = <空串>)
 // 取（遗留全局行对所有人可见，与 RealPositionsForUser/GetRealAccount 同口径）。理由：这是排障
 // 工具，把遗留全局行藏在视野外会让"账上有仓、成交簿无凭"这一类真实缺陷正好查不出来；
 // 风控闸走严格 user_id=? 是权限隔离要求，两者目的不同，不视为口径不一致。

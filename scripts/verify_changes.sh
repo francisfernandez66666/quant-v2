@@ -12116,12 +12116,12 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 204 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204）'
-eqkey115 CALLPATH_DERIVED 164 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164）'
-eqkey115 CALLSITES_DERIVED 167 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167）'
+eqkey115 ROUTES_DERIVED 205 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205）'
+eqkey115 CALLPATH_DERIVED 165 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165）'
+eqkey115 CALLSITES_DERIVED 168 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 204 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类）'
-eqkey115 COVERED_BY_WEB 164 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164）'
+eqkey115 LEDGER_ROWS 205 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205）'
+eqkey115 COVERED_BY_WEB 165 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程 →165）'
 eqkey115 UNCALLED 40 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
@@ -12193,8 +12193,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 204 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 204 '镜像基线：台账行数与主仓同值'
+eqkey115 ROUTES_DERIVED 205 '镜像基线：R 与主仓同值'
+eqkey115 LEDGER_ROWS 205 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -12527,12 +12527,13 @@ BODYADD116="$W116/body_add.txt"
 BODYADDC116="$W116/body_add_code.txt"
 body116 "$HND116" "func (s *Server) handleFixAddWatchlist(" > "$BODYADD116" || { echo "--- FAIL: §116 取不出 handleFixAddWatchlist 函数体（正对照失效：上面五枚恒零负锁就没有反证了）"; exit 1; }
 body116 "$CODEHND116" "func (s *Server) handleFixAddWatchlist(" > "$BODYADDC116" || { echo "--- FAIL: §116 取不出 handleFixAddWatchlist 的剥注释体（正对照跑在空气上）"; exit 1; }
-eq116 "$BODYADDC116" "s.quoteDisplay(" 1 '正对照：单只新增自选仍走逐票入口（同一把尺子在合法处看得见真目标，五枚恒零才是证据）'
-re116 "$HND116" 's\.quoteDisplay\(' 2 '本文件逐票取价只剩两处：新增自选（单只，合理）+ degradeQuote（补齐腿的唯一出口，受 displayQuoteSoloMax 上限管）。展示面里偷偷加回第三处时这里先红'
+eq116 "$BODYADDC116" "s.quoteDisplayBounded(" 1 '正对照（§FIX-20261028-F10 改形）：新增自选这一腿仍在体里看得见，只是入口换成有界补价——尺子把整段吃掉时上面五枚恒零就是空气'
+eq116 "$BODYADDC116" "s.quoteDisplay(" 0 '新增自选体内不许再出现逐票入口（`quoteDisplay` 未命中即同步打上游，实测 2.6–15s，前端 10s 超时后 Add 已落库＝幽灵写入）'
+re116 "$HND116" 's\.quoteDisplay\(' 1 '本文件逐票取价只剩 degradeQuote 一处（补齐腿的唯一出口，受 displayQuoteSoloMax 上限管）：§F10 把新增自选改走 quoteDisplayBounded 后，这里读到 2 就说明那条腿又接回上游'
 re116 "$HND116" 's\.topUpQuotes\(' 1 '补齐腿在全文件只有一个调用点（displayQuotes 的 goroutine 内）：多处调用＝上限是按请求算的还是全局算的读不出来，洪峰又能长回来'
 PKGQD116=$(grep -rn 's\.quoteDisplay(' internal/server --include='*.go' 2>/dev/null | grep -v '_test\.go' | grep -c . || true)
 CNT116=$((CNT116 + 1))
-[ "${PKGQD116:-0}" = "5" ] || { echo "--- FAIL: §116 internal/server 非测试文件逐票取价读到 ${PKGQD116:-0} 处，预演 5（自选新增 1 + degradeQuote 补齐腿唯一出口 1 + 模拟盘持仓 1 + 实盘持仓 2）：持仓侧那三处按 owner 口径保留（买入票会被钉进快照池、数量是个位数），新增第六处必须在这里现形"; exit 1; }
+[ "${PKGQD116:-0}" = "4" ] || { echo "--- FAIL: §116 internal/server 非测试文件逐票取价读到 ${PKGQD116:-0} 处，预演 4（degradeQuote 补齐腿唯一出口 1 + 模拟盘持仓 1 + 实盘持仓 2；自选新增已在 §FIX-20261028-F10 改走 quoteDisplayBounded）：持仓侧那三处按 owner 口径保留（买入票会被钉进快照池、数量是个位数），新增第五处必须在这里现形"; exit 1; }
 re116 "$HND116" '^	quotes, qst := s\.displayQuotes\(' 5 '五个面的补价入口同形状（一处写成别的形态就会绕掉下面那批体级锁）'
 re116 "$HND116" '^	s\.logDisplayQuotes\("' 5 '五面各一条读数：这枚是「有代码无调度/漏一面」的家族锁，等值而非下界（多一面也红，见 N7）'
 # 顺序锁（本批五枚）：缝先于真源、快照先于批量、timer 先于到点分支、补齐先于主腿计时、上限检查先于真正打出去。
@@ -12679,8 +12680,12 @@ OV_OLD116="	timer := time.NewTimer(displayQuoteBatchWait)"
 OV_NEW116="	timer := time.NewTimer(time.Hour)"
 dys116 N2 ./internal/server/ "$HND116" TestSigBatchDisplayBoundedWait TestSigBatchDisplayFailureKeepsList '上限常量接线被摘＝响应交回上游 30s 客户端超时，正是把信号 tab 拖死的最后那一段'
 # N3：快照优先判据失效 ⇒ 「快照覆盖全部代码时零上游调用」必红，「271 条只打一次」仍绿。
-OV_OLD116="		if si := s.quoteSnapshot(code); si != nil {"
-OV_NEW116="		if si := s.quoteSnapshot(code); false {"
+# 锚点带上一行 `st.unique++`：§FIX-20261028-F10 新增的 quoteDisplayBounded 里有一枚同形状的
+# `if si := s.quoteSnapshot(code); si != nil {`，只写这一行会落进两处、变异器按「非唯一即 0」判红。
+OV_OLD116="		st.unique++
+		if si := s.quoteSnapshot(code); si != nil {"
+OV_NEW116="		st.unique++
+		if si := s.quoteSnapshot(code); false {"
 dys116 N3 ./internal/server/ "$HND116" TestSigBatchDisplaySnapshotOnlyNoUpstream TestSigBatchDisplayOneCallPerRequest '先批量后快照＝盘中每 20s 都把已经在池子里的票再打一遍上游，白送的流量'
 # N4：把「缺价留行」改成「缺价抹行」⇒ 行语义分家那条必红，三面各一次那条仍绿。
 OV_OLD116="			sigActive = sc.SignalActive
@@ -12749,7 +12754,7 @@ min116 "§116 反证枚数派生读数（六枚行为 overlay + 三枚副本静�
 SNAP116 4
 
 # ── 覆盖面诚实账（不判红，只把「今天还落在锁外面的东西」如实记下来）──
-echo "INFO - §116 覆盖面账：① 五面的批量编排只锁到「调用次数＋有界等待＋读数」这一维，**现价新鲜度**没有锁：3s 到点放弃等待时页面会整批退回触发价/0 价渲染，而用例判定的是「列表不塌」，没人断「这条现价是几秒前的」——那需要上游时间戳进读数，本批不加现网新面（加了就得同批改 §88 的 INFO 计数与 §106 的判数）。② 持仓侧三处逐票取价（模拟盘 1 + 实盘 2）按 owner 口径保留在包级等值锁的 5 里，它们没有反证：买入票会被 EnsureStock 钉进快照池、持仓是个位数，洪峰形状不成立，但**这只在持仓规模小时成立**，若哪天持仓涨到上百只，本段的锁不会替我们喊红。③ 数据层批量入口对「上游返回部分代码」只做了分片级隔离（某片失败不影响别片），没有断言「缺哪些代码」——缺数清单在前端表现为现价空，日志里只有计数。④ 观察件是否应进快照池（改洪峰的根，而不是改取价方式）不在本批承诺内：owner 已裁观察件保留，而进池意味着 fetcher 要为纯观察票常驻打上游，与「快照优先零网络」相冲，这条留给下一次信号数继续上涨时裁决。⑤ N2 的反证把 timer 抬到一小时，破坏形态靠用例自己的 6s 判定，**没有**验证「上限常量与前端 20s 预算的比值」这件事——那把尺子跨语言（Go 常量 vs JS 字面量），门禁里只有两条等值锁并列，换算关系写在注释里而不是判据里。⑥ 二批的补齐腿只锁到「一次请求内最多 30 次」这一维：**上限是按请求算的，不是按进程累计的**——自选页一轮刷新并发三个面，最坏情况是 3×30 次逐票，本段没有跨面/跨秒的总预算闸（要做就得引入请求间共享的令牌桶，那是另一个形状，本批不动）。同时 30 这个数是按「一轮请求里批量覆盖不住的代码量通常远小于它」选的，选型依据没有进判据；哪天现网读数天天顶到 30，说明该改的是批量源的覆盖（北交所/停牌那两片），不是把上限调大。再记一笔代价：**「逐票补齐」打的是尝试数而不是命中数**，所以批量整片失败时每轮都会把 30 次打完（缺价代码排在前面就先补）——这是有意的兜底，响应仍受 3s 上限保护，但上游确实会吃到最多 30 次/请求/面。⑦ 补齐腿「补到的价真到了前端」这件事由 §2 的 e2e 契约腿（fixture MarketAPI，断 600580 现价＝36.86）证，本段 ⑧ 证的是次数与读数；两条腿各证一维，缺一条另一条都替换不了。"
+echo "INFO - §116 覆盖面账：① 五面的批量编排只锁到「调用次数＋有界等待＋读数」这一维，**现价新鲜度**没有锁：3s 到点放弃等待时页面会整批退回触发价/0 价渲染，而用例判定的是「列表不塌」，没人断「这条现价是几秒前的」——那需要上游时间戳进读数，本批不加现网新面（加了就得同批改 §88 的 INFO 计数与 §106 的判数）。② 持仓侧三处逐票取价（模拟盘 1 + 实盘 2）按 owner 口径保留在包级等值锁的 4 里（第 5 处是新增自选，§FIX-20261028-F10 已改走 quoteDisplayBounded），它们没有反证：买入票会被 EnsureStock 钉进快照池、持仓是个位数，洪峰形状不成立，但**这只在持仓规模小时成立**，若哪天持仓涨到上百只，本段的锁不会替我们喊红。③ 数据层批量入口对「上游返回部分代码」只做了分片级隔离（某片失败不影响别片），没有断言「缺哪些代码」——缺数清单在前端表现为现价空，日志里只有计数。④ 观察件是否应进快照池（改洪峰的根，而不是改取价方式）不在本批承诺内：owner 已裁观察件保留，而进池意味着 fetcher 要为纯观察票常驻打上游，与「快照优先零网络」相冲，这条留给下一次信号数继续上涨时裁决。⑤ N2 的反证把 timer 抬到一小时，破坏形态靠用例自己的 6s 判定，**没有**验证「上限常量与前端 20s 预算的比值」这件事——那把尺子跨语言（Go 常量 vs JS 字面量），门禁里只有两条等值锁并列，换算关系写在注释里而不是判据里。⑥ 二批的补齐腿只锁到「一次请求内最多 30 次」这一维：**上限是按请求算的，不是按进程累计的**——自选页一轮刷新并发三个面，最坏情况是 3×30 次逐票，本段没有跨面/跨秒的总预算闸（要做就得引入请求间共享的令牌桶，那是另一个形状，本批不动）。同时 30 这个数是按「一轮请求里批量覆盖不住的代码量通常远小于它」选的，选型依据没有进判据；哪天现网读数天天顶到 30，说明该改的是批量源的覆盖（北交所/停牌那两片），不是把上限调大。再记一笔代价：**「逐票补齐」打的是尝试数而不是命中数**，所以批量整片失败时每轮都会把 30 次打完（缺价代码排在前面就先补）——这是有意的兜底，响应仍受 3s 上限保护，但上游确实会吃到最多 30 次/请求/面。⑦ 补齐腿「补到的价真到了前端」这件事由 §2 的 e2e 契约腿（fixture MarketAPI，断 600580 现价＝36.86）证，本段 ⑧ 证的是次数与读数；两条腿各证一维，缺一条另一条都替换不了。"
 
 # ── 分组自证（本段最后两道锁）──
 CNT116=$((CNT116 + 1))

@@ -198,7 +198,7 @@ var realTsCodeRe = regexp.MustCompile(`^[0-9]{6}\.(SH|SZ|BJ)$`)
 
 // ErrInvalidPositionReport §F2：对账快照字段级校验失败的哨兵错误——任一行 ts_code 为空或
 // 非法格式即整批拒收（不落库），上层（handleQMTReport）据 errors.Is 映射为 HTTP 400。
-// 锤实背景（FIX_PLAN §6.2）：一行 ts_code=” 的垃圾行会永久误触发「本地有仓+空快照 409
+// 锤实背景（FIX_PLAN §6.2）：一行 ts_code=<空串> 的垃圾行会永久误触发「本地有仓+空快照 409
 // 守卫」，真实全平再也无法经对账通道落账；且主键 (ts_code,user_id) 下的空串行本身就是脏数据。
 // English: §F2 sentinel — any invalid ts_code rejects the whole snapshot before any write;
 // the HTTP layer maps it to 400 via errors.Is.
@@ -262,9 +262,9 @@ func (p RealPosition) AnchorTicket() bool {
 	return p.AnchorSource == AnchorSourceFirstBuyOrder || p.AnchorSource == AnchorSourceFirstLot
 }
 
-// ensureAnchorSourceColumn §DYN-T：real_positions.anchor_source 的幂等补列（TEXT NOT NULL DEFAULT ”）。
-// 与 ensureAnchorPriceColumn 同族（惰性 DDL，不进集中迁移清单），存量行落 ”＝来源未知。
-// ” 与 'none' 在门判上同义（都不可开 T 腿），区别只在语义来源：” 是"这列上线前的行"，
+// ensureAnchorSourceColumn §DYN-T：real_positions.anchor_source 的幂等补列（TEXT NOT NULL DEFAULT <空串>）。
+// 与 ensureAnchorPriceColumn 同族（惰性 DDL，不进集中迁移清单），存量行落 <空串>＝来源未知。
+// <空串> 与 'none' 在门判上同义（都不可开 T 腿），区别只在语义来源：<空串> 是"这列上线前的行"，
 // 'none' 是"回填时明确算过、任何一档都取不到价"。
 // English: idempotent lazy column for the anchor provenance; legacy rows read as "unknown".
 func (d *DB) ensureAnchorSourceColumn() error {
@@ -530,7 +530,7 @@ func (d *DB) BackfillRealPositionAnchors() (filled, remaining int64, err error) 
 
 // ReconcilePositionsForUser §R3-8 P1-G 用户隔离的全量对账写入（Controller.Reconcile 专用）：
 //   - 每行打 UserID 归属后 upsert；
-//   - 删除范围限定在 本账号行 ∪ 遗留全局行（user_id=”）——绝不动其他账号的 scoped 行
+//   - 删除范围限定在 本账号行 ∪ 遗留全局行（user_id=<空串>）——绝不动其他账号的 scoped 行
 //     （旧 UpsertRealPositions 空集合分支是 DELETE FROM real_positions 全表，多租户下是清库炸弹）；
 //   - pos 为空 = 网关全平，调用方必须已做「通道在线」守卫（网关 /state 断连时也返回空列表，
 //     不可信快照禁止清账）。
@@ -724,7 +724,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 	return out, rows.Err()
 }
 
-// RealPositionsForUser §GAP1.10 按账号过滤实盘持仓：返回 user_id 匹配或遗留全局行（user_id=”）。
+// RealPositionsForUser §GAP1.10 按账号过滤实盘持仓：返回 user_id 匹配或遗留全局行（user_id=<空串>）。
 // §A1（20260925EVE-W2）：补读 can_use_qty（NULL=nil=未知）。
 // §ANCHOR-FIRST（2026-10-24 裁决二）：补读 anchor_price（NULL=0=未知）——本口是卖出裁决
 // live 持仓的来源，锚点只有从这里读出来才可能进入影子对照。
@@ -774,7 +774,7 @@ func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 	return p, err
 }
 
-// RealPositionByCodeForUser §P0-3 按账号返回单只实盘持仓；遗留全局行（user_id=”）对查询账号可见。
+// RealPositionByCodeForUser §P0-3 按账号返回单只实盘持仓；遗留全局行（user_id=<空串>）对查询账号可见。
 // §A1（20260925EVE-W2）：补读 can_use_qty——本函数是风控闸 checkT1Sellable 的持仓取数口，
 // 柜台 T+1 可卖量自本批起进入卖出判定（改前：CanUseQty 恒 nil，判定全靠本地推算）。
 // English: user-scoped single position lookup; legacy global rows are visible to any caller.
@@ -1002,7 +1002,7 @@ func (d *DB) TodayBoughtQty(userID, tsCode, day string) int {
 }
 
 // BuyableQtyForUserSell §WS-A T+1：返回某账号某代码"可立即卖出"的数量（持仓 − 当日买入）。
-// 遗留全局行（user_id=”）对该账号可见。English: WS-A T+1 sellable qty = held − todayBought.
+// 遗留全局行（user_id=<空串>）对该账号可见。English: WS-A T+1 sellable qty = held − todayBought.
 func (d *DB) BuyableQtyForUserSell(userID, tsCode, day string) int {
 	p, err := d.RealPositionByCodeForUser(userID, tsCode)
 	if err != nil {
@@ -1570,7 +1570,7 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 	return out, rows.Err()
 }
 
-// RealOrdersForUser §P0-3 按账号返回实盘委托单；遗留全局行（user_id=”）对查询账号可见。
+// RealOrdersForUser §P0-3 按账号返回实盘委托单；遗留全局行（user_id=<空串>）对查询账号可见。
 // English: user-scoped live orders; legacy global rows are visible to any caller.
 // realOrderSelectColumns RealOrder 的读取列单一清单：RealOrdersForUser 与全字段回读测试共用。
 // 新增 RealOrder 字段时只改这里 + Scan，并由 TestRealOrderReadRoundTripAllFields 证明没漏。
@@ -1734,7 +1734,7 @@ func (d *DB) MarkRealOrderCancelRequested(userID, orderID, source, reason string
 // 本地 UAT 实测：8 条真撤单行的三列全空（mock 秒回）。
 //
 // 本函数专治这个竞态：调用方在**请求发出成功后**调用，只补三列，行已被推成终态也照写。
-// 已有值不覆盖：用 `CASE WHEN ...='' OR ... IS NULL`（**不能用 COALESCE**——这三列默认写空串，
+// 已有值不覆盖：用 `CASE WHEN ...=<空串> OR ... IS NULL`（**不能用 COALESCE**——这三列默认写空串，
 // COALESCE 只处理 NULL，写空串时它会认为"有值"从而拒绝写入，等于没修）。
 func (d *DB) SetCancelTrace(userID, orderID, source, reason string) (bool, error) {
 	if orderID == "" {

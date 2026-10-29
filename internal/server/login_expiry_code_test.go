@@ -23,8 +23,8 @@ import (
 	"strings"
 	"testing"
 
-	"quant-trading-v2/internal/auth"
 	"errors"
+	"quant-trading-v2/internal/auth"
 )
 
 // loginBody 登录响应里本测试关心的字段。
@@ -50,7 +50,7 @@ func postLogin(t *testing.T, s *Server, user, pass string) (int, loginBody) {
 // TestLoginFailureCodeMapping 分码映射的表驱动断言（到期/停用给码，其余一律空码）。
 //
 // 为什么不造一个"真过期账号"来打端点：auth.CreateUser 与 auth.SetExpiry 都拒绝负数天数
-//（运维面本来就没有"立即置过期"的入口，停用走 SetEnabled），为测试去加一条产品 API 不划算。
+// （运维面本来就没有"立即置过期"的入口，停用走 SetEnabled），为测试去加一条产品 API 不划算。
 // 分码规则本身是纯函数，直接钉住；"Login 真的会返回这三条错误串"由 auth 包的同名契约测试锁。
 func TestLoginFailureCodeMapping(t *testing.T) {
 	cases := []struct {
