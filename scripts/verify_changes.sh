@@ -339,7 +339,13 @@ gate_collect_main() {
 	# 首段起点从派生清单取：编号口径与装配器一致（数字＋可选小写字母后缀，§GATE-SELFACC）。
 	#   只认纯数字的话，哪天第一段被写成 `1b` 形态，这里派生不出起点、整轮 collect 直接判红——
 	#   宁可红也要红在"口径不一致"这件事本身上，而不是让两处各自认一半。
-	start=$(python3 "$GATE_SECTIONS_PY" sections "$GATE_SELF_ABS" 2> "$work/sections.err" | awk -F'\t' '$1 ~ /^[0-9]+[a-z]?$/ {print $1; exit}') || start=""
+	# §FIX-20261028-F15⑨（2026-10-29）：先把派生结果**落文件**再 awk，不走管道。
+	# 实录：`python3 … | awk … exit` 在 `set -o pipefail` 下会被 awk 的 SIGPIPE 打成非零退出
+	# （Python 侧打出 "Exception ignored on flushing sys.stdout"），`|| start=""` 于是把起点清空
+	# ⇒ 整轮 collect 以「派生不出段清单」秒退（本轮第二轮就是这样假红的，代码与派生器都正常）。
+	# 与 §114 V5「grep -q 命中即退 → SIGPIPE → 判红语义反向」同族，这里一并按两段式钉死。
+	python3 "$GATE_SECTIONS_PY" sections "$GATE_SELF_ABS" > "$work/sections.txt" 2> "$work/sections.err" || true
+	start=$(awk -F'\t' '$1 ~ /^[0-9]+[a-z]?$/ {print $1; exit}' "$work/sections.txt" 2>/dev/null) || start=""
 	if [ -z "$start" ]; then
 		echo "--- FAIL: §P2-L -collect 派生不出段清单（首段都没有＝装配器与脚本格式脱节）：$(head -1 "$work/sections.err" 2>/dev/null)"
 		return 1
