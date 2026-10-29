@@ -29,7 +29,8 @@ const CACHE_KEY = 'pos_cache_v1'
 // 将持仓与资金缓存到 localStorage
 function persistCache(holdings, balance) {
   // §P2-J 可吞：本地缓存写入失败（配额满/隐私模式）不影响主流程，下一次成功写入即覆盖。
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ holdings, balance })) } catch (_) {}
+  // 但仍留一行 console 诊断——静默吞错与"已知可吞"是两件事（§113 空吞负锁要求此处不得为空块）。
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ holdings, balance })) } catch (e) { console.warn('[positions] 缓存写入失败（可吞）:', e) }
 }
 // 从 localStorage 读取持仓与资金缓存
 function loadCache() {
@@ -39,7 +40,7 @@ function loadCache() {
     if (d) {
       return { holdings: Array.isArray(d.holdings) ? d.holdings : [], balance: d.balance || 0 }
     }
-  } catch (_) {} // §P2-J 可吞：缓存损坏按"无缓存"处理（随后回源取数），不需要打扰用户
+  } catch (e) { console.warn('[positions] 缓存解析失败（按无缓存处理）:', e) } // §P2-J 可吞：随后回源取数，不打扰用户
   return { holdings: [], balance: 0 }
 }
 
@@ -530,7 +531,11 @@ export default function Positions() {
     try {
       const data = await api.fetchStockLookup(code)
       if (data && data.price > 0) { setLotCurrentPrice(data.price); setLotFormPrice(data.price) }
-    } catch (_) {} // §P2-J 可吞：弹窗预填价取不到时用户仍可手输，提交时后端会再校验
+    } catch (e) {
+      // §P2-J 可吞：预填价取不到时用户仍可手输，提交时后端会再校验；显式清零预填值避免残留上一笔。
+      setLotCurrentPrice(0)
+      console.warn('[positions] 弹窗预填价不可得（可吞）:', e)
+    }
   }
   // 确认加/减仓操作并同步后端
   async function confirmLot() {
