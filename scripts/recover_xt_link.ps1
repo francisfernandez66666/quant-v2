@@ -178,6 +178,46 @@ switch ($Phase) {
     Get-Process | Where-Object { $_.ProcessName -match '^Xt' } |
       ForEach-Object { Write-Output ("CLIENT pid=" + $_.Id + " name=" + $_.ProcessName + " start=" + $_.StartTime.ToString('HH:mm:ss')) }
   }
+  'cfgload' {
+    $f = 'C:\qmt\quant-trading-v2\qmt_gateway\bridge_boot.log'
+    $hits = Select-String -Path $f -Pattern 'cfg loaded' | Select-Object -Last 4
+    Write-Output ("cfg_loaded_hits=" + (Select-String -Path $f -Pattern 'cfg loaded').Count)
+    foreach ($h in $hits) {
+      $t = $h.Line; if ($t.Length -gt 80) { $t = $t.Substring(0, 80) }
+      Write-Output ("CL line=" + $h.LineNumber + " " + $t)
+    }
+  }
+  'baklist' {
+    $root = (Get-ChildItem 'C:\Program Files (x86)' -Directory | Where-Object { $_.Name -like '*QMT*' } | Select-Object -First 1).FullName
+    $pydir = Join-Path $root 'python'
+    Get-ChildItem $pydir -Filter '*.bak-*' | Sort-Object LastWriteTime -Descending |
+      ForEach-Object { Write-Output ("BAK " + $_.LastWriteTime.ToString('MM-dd HH:mm:ss') + " size=" + $_.Length + " name=" + $_.Name) }
+    Get-ChildItem $pydir -Filter '*.py' |
+      ForEach-Object { Write-Output ("PY mtime=" + $_.LastWriteTime.ToString('MM-dd HH:mm:ss') + " size=" + $_.Length + " name=" + $_.Name) }
+  }
+  'closerecon' {
+    $f = 'C:\qmt\quant-trading-v2\qmt_gateway\bridge_boot.log'
+    $hits = Select-String -Path $f -Pattern 'CLOSE_PROBE', 'CLOSE_SNAPSHOT', 'close snapshot due', 'CLOSE_RECON' | Select-Object -Last 8
+    Write-Output ("closerecon_hits_total=" + (Select-String -Path $f -Pattern 'CLOSE_PROBE', 'CLOSE_SNAPSHOT', 'close snapshot due', 'CLOSE_RECON').Count)
+    foreach ($h in $hits) {
+      $t = $h.Line; if ($t.Length -gt 190) { $t = $t.Substring(0, 190) }
+      Write-Output ("CR " + $t)
+    }
+  }
+  'tailreport' {
+    $f = 'C:\qmt\quant-trading-v2\qmt_gateway\bridge_report.jsonl'
+    Get-Content $f -Tail 60 | ForEach-Object {
+      $t = $_
+      if ($t.Length -gt 240) { $t = $t.Substring(0, 240) }
+      Write-Output ("T " + $t)
+    }
+  }
+  'lastsnap' {
+    $f = 'C:\qmt\quant-trading-v2\qmt_gateway\bridge_report.jsonl'
+    $line = Get-Content $f -Tail 400 | Select-String -Pattern 'orders_snapshot' | Select-Object -Last 1
+    if ($line) { Set-Content -Path 'C:\qmt\last_snap.txt' -Value $line.Line -Encoding UTF8; Write-Output ("SNAP written len=" + $line.Line.Length) }
+    else { Write-Output 'SNAP none' }
+  }
   'report' {
     try {
       $h = Invoke-RestMethod -Uri 'http://127.0.0.1:8789/health' -TimeoutSec 6

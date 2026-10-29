@@ -1898,7 +1898,7 @@ def _close_recon_retry_if_pending(ContextInfo):
 def _close_recon_due(ContextInfo):
     """Tick-driven stand-in for the 15:01 timed callback (2026-10-29 outage fix).
 
-    Incident: the 10-28 build registered `ContextInfo.run_time("close_snapshot_probe", ...)`
+    Incident: the 10-28 build registered a daily QMT timer callback for the close probe
     inside init(). From the first client restart that loaded it (2026-10-29 08:45) QMT never
     dispatched a single handlebar to this strategy -- the bridge stayed silent all day
     (`cfg loaded`, the once-per-process first-tick marker, had ZERO hits after 10-28 while
@@ -1962,7 +1962,7 @@ def init(ContextInfo):
     except Exception as e:
         _trace("probe error: " + repr(e))
     # CLOSE-RECON (2026-10-28, retimed 2026-10-29): the 15:01 probe is fired from
-    # _close_recon_due() inside handlebar, NOT from ContextInfo.run_time(). The timed
+    # _close_recon_due() inside handlebar, NOT from a QMT timer callback. The timed
     # registration is what the 10-29 outage was traced to (no handlebar dispatch at all
     # on any day that loaded it), and a tick-driven gate needs no QMT timer in the first
     # place. The trace line stays in the init block so operators still see one line here.

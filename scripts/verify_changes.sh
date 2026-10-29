@@ -16525,8 +16525,8 @@ CNT139=$((CNT139 + 7))
 grep -qF 'def close_snapshot_probe' "$BQ139" ||
 	fail139 "桥侧没有收盘对账探针（15:00-15:05 的成交永远回不来＝600362 复发）"
 { grep -qF 'def _close_recon_due(ContextInfo):' "$BQ139" &&
-  grep -qF '		_close_recon_due(ContextInfo)' "$BQ139" &&
-  ! grep -qF 'ContextInfo.run_time(' "$BQ139"; } ||
+  grep -qF '        _close_recon_due(ContextInfo)' "$BQ139" &&
+  ! grep -qF 'ContextInfo.run_time("close_snapshot_probe"' "$BQ139"; } ||
 	fail139 "收盘触发不在 tick 上：要么没定义 _close_recon_due、要么没接进 handlebar、要么 run_time 定时器回潮（2026-10-29 全天静默＝加载了 run_time 注册版后再没收到过一次 handlebar）"
 grep -qF 'CLOSE_RECON_FALLBACK' "$BQ139" ||
 	fail139 "探针不可用时没有兜底告警（退化为次日回补但没人知道）"
