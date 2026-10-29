@@ -1651,6 +1651,15 @@ def _no_cancel_window_at(spec, minutes):
 # ===========================================================================
 CLOSE_STATE_PATH = _p("bridge_close_state.json")
 CLOSE_SNAPSHOT_AT = "15:01:00"
+# FIX-20261029-CLOSERECON: earliest wall-clock time at which a handlebar tick may fire the
+# close snapshot. Why 15:00:00 and not CLOSE_SNAPSHOT_AT (15:01:00): the bridge is driven by
+# market-data calls only, and those stop with the closing auction -- 2026-10-29 the last
+# report write was 15:00:06, so a 15:01 gate can never be reached by a tick. 15:00:00 is the
+# first tick after the closing auction, and the ORDER/DEAL tables already carry the auction
+# fills at that point (2026-10-28 the last tick was 15:00:03 with the auction deals in place).
+# Residual risk: a deal that lands after our last tick is missed and rides the next-morning
+# snapshot + broker-statement reconciliation, which is the documented fallback.
+CLOSE_SNAPSHOT_TICK_FROM = "15:00:00"
 # FIX-20261028-F03: throttle for same-day partial-snapshot retries (seconds).
 CLOSE_RETRY_GAP_SEC = 60
 # _MAIN_THREAD remembers the model main thread identity: gtdd rows are only visible there.
@@ -1855,7 +1864,7 @@ def _close_recon_retry_if_pending(ContextInfo):
     """
     try:
         now_hm = _now_cn_str("%H:%M:%S")
-        if now_hm < str(CLOSE_SNAPSHOT_AT):
+        if now_hm < str(CLOSE_SNAPSHOT_TICK_FROM):
             return
         day = _now_cn_str("%Y-%m-%d")
         state = _read_close_state()
@@ -1900,7 +1909,7 @@ def _close_recon_due(ContextInfo):
     ASCII-only.
     """
     try:
-        if _now_cn_str("%H:%M:%S") < str(CLOSE_SNAPSHOT_AT):
+        if _now_cn_str("%H:%M:%S") < str(CLOSE_SNAPSHOT_TICK_FROM):
             return
         day = _now_cn_str("%Y-%m-%d")
         state = _read_close_state()

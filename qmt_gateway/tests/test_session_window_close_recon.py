@@ -298,6 +298,66 @@ class TestCloseReconBridge(unittest.TestCase):
             bs._close_recon_morning_alert()
             self.assertEqual(bs._read_close_state().get("alert_day"), day1)
 
+    # ---- 2026-10-29：收盘触发从 run_time 定时器改到 tick 侧时间门 ----
+    #
+    # 事故：run_time 注册版在 10-29 全天一次 handlebar 都没收到；退役后 tick 回来了，但
+    # tick 在 15:00:0x 就停（收盘后没有行情），所以时间门必须落在 15:00:00，不能是 15:01。
+
+    def test_tick_gate_is_post_auction_not_after_last_tick(self):
+        """tick 侧时间门必须 ≤ 15:00:00：收盘后就没有 tick 了，15:01 的门永远等不到。"""
+        self.assertEqual(bs.CLOSE_SNAPSHOT_TICK_FROM, "15:00:00")
+        self.assertLess(bs.CLOSE_SNAPSHOT_TICK_FROM, bs.CLOSE_SNAPSHOT_AT)
+
+    def test_due_skips_before_gate_time(self):
+        """15:00:00 之前（含盘中任意 tick）不得触发收盘快照。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            bs.CLOSE_STATE_PATH = os.path.join(td, "bridge_close_state.json")
+            bs._write_close_state({})
+            called = []
+            real_now = bs._now_cn_str
+            real_probe = bs.close_snapshot_probe
+            bs._now_cn_str = lambda fmt="%Y-%m-%dT%H:%M:%S+08:00": (
+                "2026-10-29" if fmt == "%Y-%m-%d" else "14:59:59")
+            try:
+                bs.close_snapshot_probe = lambda ctx: called.append("probe")
+                bs._close_recon_due(None)
+            finally:
+                bs._now_cn_str = real_now
+                bs.close_snapshot_probe = real_probe
+            self.assertEqual(called, [], "盘中 tick 不得提前做收盘快照")
+            self.assertFalse(bs._read_close_state().get("probe_day"))
+
+    def test_due_fires_once_after_gate_time(self):
+        """过 15:00:00 的第一跳触发一次；第二次 tick 因 probe_day/snapshot_day 不再重入。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            bs.CLOSE_STATE_PATH = os.path.join(td, "bridge_close_state.json")
+            bs._write_close_state({})
+            called = []
+            real_now = bs._now_cn_str
+
+            def _now(fmt="%Y-%m-%dT%H:%M:%S+08:00"):
+                return {"%Y-%m-%d": "2026-10-29", "%H:%M:%S": "15:00:03"}.get(fmt, "x")
+
+            def _probe(ctx):
+                called.append("probe")
+                st = bs._read_close_state()
+                st["probe_day"] = "2026-10-29"
+                bs._write_close_state(st)
+
+            real_probe = bs.close_snapshot_probe
+            bs._now_cn_str = _now
+            bs.close_snapshot_probe = _probe
+            try:
+                bs._close_recon_due(None)
+                bs._close_recon_due(None)
+            finally:
+                bs._now_cn_str = real_now
+                bs.close_snapshot_probe = real_probe
+            self.assertEqual(called, ["probe"], "同一交易日只允许触发一次")
+
+
 
 class TestCloseReconGateway(unittest.TestCase):
     """网关侧收盘快照观测位。"""
