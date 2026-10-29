@@ -1880,6 +1880,40 @@ def _close_recon_retry_if_pending(ContextInfo):
         _trace("close snapshot retry error: " + repr(e))
 
 
+def _close_recon_due(ContextInfo):
+    """Tick-driven stand-in for the 15:01 timed callback (2026-10-29 outage fix).
+
+    Incident: the 10-28 build registered `ContextInfo.run_time("close_snapshot_probe", ...)`
+    inside init(). From the first client restart that loaded it (2026-10-29 08:45) QMT never
+    dispatched a single handlebar to this strategy -- the bridge stayed silent all day
+    (`cfg loaded`, the once-per-process first-tick marker, had ZERO hits after 10-28 while
+    the model engine kept computing bars every minute). Rolling the timer registration out
+    of init() is the cheapest way to rule it out and it is also strictly more robust: the
+    bridge already lives on handlebar ticks, so a wall-clock gate inside the tick needs no
+    QMT timer at all.
+
+    Fires at most once per day: `close_snapshot_probe` itself skips when snapshot_day is
+    already today, and probe_day guards the "probe unusable" verdict from being re-run on
+    every tick (that case is retried by _close_recon_retry_if_pending's own pending path and
+    back-filled by the next-morning snapshot).
+
+    ASCII-only.
+    """
+    try:
+        if _now_cn_str("%H:%M:%S") < str(CLOSE_SNAPSHOT_AT):
+            return
+        day = _now_cn_str("%Y-%m-%d")
+        state = _read_close_state()
+        if str(state.get("snapshot_day", "") or "") == day:
+            return
+        if str(state.get("probe_day", "") or "") == day:
+            return
+        _trace("close snapshot due at %s (tick-driven, no run_time)" % _now_cn_str("%H:%M:%S"))
+        close_snapshot_probe(ContextInfo)
+    except Exception as e:
+        _trace("close snapshot due error: " + repr(e))
+
+
 def _close_recon_morning_alert():
     """Once per morning: say that a close reconciliation is still missing.
 
@@ -1912,15 +1946,12 @@ def init(ContextInfo):
         _xt().probe_embed()
     except Exception as e:
         _trace("probe error: " + repr(e))
-    # CLOSE-RECON (2026-10-28): register the 15:01 daily timer that probes the
-    # trade-detail tables and, if they are readable, emits the end-of-day snapshot.
-    # Registration failure is not fatal -- the fallback (next-morning snapshot +
-    # broker-statement reconciliation) still applies.
-    try:
-        ContextInfo.run_time("close_snapshot_probe", "1nDay", CLOSE_SNAPSHOT_AT)
-        _trace("close snapshot timer registered at %s" % CLOSE_SNAPSHOT_AT)
-    except Exception as e:
-        _trace("close snapshot timer register fail: " + repr(e))
+    # CLOSE-RECON (2026-10-28, retimed 2026-10-29): the 15:01 probe is fired from
+    # _close_recon_due() inside handlebar, NOT from ContextInfo.run_time(). The timed
+    # registration is what the 10-29 outage was traced to (no handlebar dispatch at all
+    # on any day that loaded it), and a tick-driven gate needs no QMT timer in the first
+    # place. The trace line stays in the init block so operators still see one line here.
+    _trace("close snapshot trigger=handlebar-tick at %s (run_time retired)" % CLOSE_SNAPSHOT_AT)
 
 
 def handlebar(ContextInfo):
@@ -1943,3 +1974,9 @@ def handlebar(ContextInfo):
         _bridge_tick()
     except Exception as e:
         _trace("tick fatal: " + repr(e))
+    # FIX-20261029-CLOSERECON: the 15:01 snapshot now rides the tick clock (after _bridge_tick
+    # so _TICK["last_tick_day"] is already today when the probe checks the trading-day guard).
+    try:
+        _close_recon_due(ContextInfo)
+    except Exception:
+        pass
