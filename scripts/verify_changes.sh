@@ -9292,7 +9292,7 @@ CNT141=$((CNT141 + 1))
 CNT141=$((CNT141 + 1))
 PB141="$(fnbody141 "$ITL" 'premiseGone(')"
 for g in 'r.force' 'hasPendingPair' 'tLPremiseGrace' 'p.Enabled'; do
-	printf '%s\n' "$PB141" | grep -q "$g" || fail141 "premiseGone 少了守卫 $g：尾盘/在途腿/腿龄不足/止血轮任一漏判都可能造无主成交或误结腿"
+	printf '%s\n' "$PB141" | grep -q "$g" || fail141 "premiseGone 少了守卫 ${g}：尾盘/在途腿/腿龄不足/止血轮任一漏判都可能造无主成交或误结腿"
 done
 CNT141=$((CNT141 + 1))
 [ "$(grep -cE '\.Status[[:space:]]*=[^=]' "$ITL")" = "2" ] || fail141 "终态写点不止两处 ⇒ 冻结款可能永久泄漏（只允许 seal() 与 finish() 写 Status）"
@@ -9325,7 +9325,7 @@ CNT141=$((CNT141 + 1))
 SB141="$(fnbody141 "$ITL" 'roundSpreadPctNow(')"
 for bad in 'roundFee(' 'tLCommissionRate' 'tLStampTaxRate'; do
 	printf '%s\n' "$SB141" | grep -q "$bad" || continue
-	fail141 "止损口径里掺进了费用（$bad）：口径就不再是价差，且与 fillPnl 的费用来源打架（v2 版就是这么被推翻的）"
+	fail141 "止损口径里掺进了费用（${bad}）：口径就不再是价差，且与 fillPnl 的费用来源打架（v2 版就是这么被推翻的）"
 done
 
 # —— ㉒㉓ 读数新鲜度与缓存成败分治 ——
