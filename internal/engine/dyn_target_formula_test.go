@@ -131,7 +131,7 @@ func TestInFlightTBuyLegDoesNotOccupySpace(t *testing.T) {
 // F3（裁决 R2）：已成交正 T 买腿 ⇒ room 减少其市值，且**只减一次**。
 func TestFilledTBuyLegIsDeductedOnce(t *testing.T) {
 	// 目标要高于当前仓位，否则 room 被 max(0,·) 压成 0，两种口径都看不出差别（第一版就踩了这个坑）。
-	const total, ms, ceiling = 400000.0, 0.6, 1.0 // 目标 24 万
+	const total, ms, ceiling = 400000.0, 0.6, 1.0                                         // 目标 24 万
 	positions := map[string]store.RealPosition{"600000": dynPos("600000", 13000, 10, 10)} // 底仓 1000 + 机动 300 已进券商持仓
 	prices := map[string]float64{"600000": 10}
 	_, _, roomNoBook, _ := fundsTargetCurRoom(total, ms, ceiling, positions, prices, nil, tLiveBook{})
