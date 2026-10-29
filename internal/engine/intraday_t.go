@@ -368,10 +368,19 @@ func (e *Engine) tParamsFor(uid string, tc config.TConfig, shadow bool) (paper.T
 		IntradaySellCapTotalPct: tc.TIntradaySellCapTotalPctOf(),
 		StopGuardPct:            tc.TStopGuardPctOf(),
 		LossBreakerPct:          tc.TLossBreakerPctOf(),
+		RoundStopPct:            tc.TRoundStopPctOf(),
 		MinAmountWan:            tc.TMinAmountWanOf(),
 		MinTurnoverPct:          tc.TMinTurnoverPctOf(),
 		MinListedDays:           tc.TMinListedDaysOf(),
 	}
+	// §W-09 行情门：三个新键一次性接好，实盘与纸面同时生效（TParamsForAccount 也走这里）。
+	// 读数是 **T 专属**的 lastTMarketState，不是定权用的 lastMarketState——读了后者等于把
+	// enhance.market_state_enabled 这个全局开关绑回 T 门上，默认 true 又变成默认关。
+	p.VolRatioMax = tc.TVolRatioMaxOf()
+	p.VolRatio = e.tVolRatioOf
+	st, at, votes, votesTotal := e.tRegimeNow()
+	p.MarketState, p.MarketStateAt = st, at
+	p.MarketStateVotes, p.MarketStateVotesTotal = votes, votesTotal
 	// §8.8 三条硬纪律里的第③条：**回落后的实际生效值必须出声**。
 	// 越界值被 tClamp 挡掉是保护，但"保护悄悄生效"就是另一个缺陷——运维会一直以为自己配的那个数在跑
 	// （本仓历史上"配置写错被当成网络抖动"的亏吃过多次）。这里每轮排空一次队列并逐键打出来；

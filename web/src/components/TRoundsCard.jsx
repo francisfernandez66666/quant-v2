@@ -63,8 +63,10 @@ function buildPolyline(series, key, width, height, lo, hi) {
     .join(' ')
 }
 
-export default function TRoundsCard() {
-  const [tab, setTab] = useState('paper')
+// §W-04 defaultTab：量化页「T 仓」子页传 'live'（看实盘账本），模拟盘页保持默认 'paper'。
+// 默认值留在 paper，是为了让 Paper.jsx 的既有行为与 e2e DYN-P1 用例不受影响。
+export default function TRoundsCard({ defaultTab = 'paper' }) {
+  const [tab, setTab] = useState(defaultTab)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [paperView, setPaperView] = useState(null)

@@ -115,15 +115,22 @@ echo "[5/5] 打包 APK (${MODE})..."
 export JAVA_HOME="$JAVA_HOME_DIR"
 export ANDROID_HOME="$ANDROID_SDK"
 if [ "$MODE" = "release" ]; then
-    # 签名配置：keystore 默认 mobile/keystore.jks。
+    # 签名配置：keystore 默认 mobile/keystore-v2.jks。
+    # §W-01（2026-10-29）：旧 keystore.jks 的口令曾随 gradle.properties 进过 git 历史 ⇒
+    # 已视为泄露，默认切到 v2（2026-09-22 生成，口令只在本地 keystore.pass）。
+    # 回滚手段保留：MOBILE_KEYSTORE=$APP_DIR/mobile/keystore.jks 可显式指回旧库，
+    # 但那等于继续使用已泄露口令，只允许临时用并在运维日志写明。
     # §GAP2-W1（P0）：密码不再有任何硬编码默认值——旧默认口令已随 gradle.properties 入 git 泄漏，
     # 必须通过环境变量 MOBILE_KEYSTORE_PASS 提供；首次生成新 keystore 时自动创建随机强口令
     # 并保存到本地不入库的 mobile/keystore.pass（chmod 600）。
-    KS="${MOBILE_KEYSTORE:-$APP_DIR/mobile/keystore.jks}"
+    KS="${MOBILE_KEYSTORE:-$APP_DIR/mobile/keystore-v2.jks}"
     PASSFILE="$APP_DIR/mobile/keystore.pass"
     if [ -n "${MOBILE_KEYSTORE_PASS:-}" ]; then
         KSPASS="$MOBILE_KEYSTORE_PASS"
-    elif [ -f "$PASSFILE" ] && [ "$KS" = "$APP_DIR/mobile/keystore.jks" ]; then
+    # 按 basename 比对而不是整路径：显式传 MOBILE_KEYSTORE 时路径形态可能不同
+    # （绝对路径 / 相对路径 / 符号链接），整路径比对会让"复用本机口令"这条分支静默失效，
+    # 于是每次构建都重新生成随机口令 ⇒ 新装的包与上一版签名不一致（覆盖安装必失败）。
+    elif [ -f "$PASSFILE" ] && [ "$(basename "$KS")" = "keystore-v2.jks" ]; then
         # 复用首跑生成的随机口令（文件仅本机，已被 .gitignore 覆盖）
         KSPASS="$(cat "$PASSFILE")"
     else

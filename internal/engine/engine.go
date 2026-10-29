@@ -105,6 +105,13 @@ type Engine struct {
 	maSlopeDay string
 	maSlope20  float64
 	maSlope60  float64
+	// §W-09：炸板率 60 秒 TTL 缓存。T 行情门默认开启后，这个函数从"只在定权开关打开时才跑"
+	// 变成**每轮都跑**，不加缓存就是 5 秒一次打 PoolLimitBreak。炸板率一分钟内不会变。
+	// 失败（NaN）也按"这一分钟内问过了"缓存，避免上游抖动时反而被打得更凶。
+	// English: 60s TTL cache for the break rate — it now runs every cycle with the T gate on by default.
+	brkRateAt  time.Time // 上次真实取数时刻
+	brkRateVal float64   // 上次取数结果（含 NaN）
+	brkRateDay string    // 交易日（跨日丢弃，避免昨天的读数关掉今天的 T）
 	// ── §DYN-SIZE 动态仓位快照与读数缓存 ────────────────────────────────────────────
 	// 全部由 assembleRegime 装配，live/paper 策略快照经 currentRegime 共享（短 TTL）。
 	// 指数读数日级/短 TTL 缓存，绝不逐信号打上游（§SIGBATCH 教训）。
@@ -169,6 +176,8 @@ type Engine struct {
 	tSignals *tSignalLedger
 	// tMinuteCache 分时均线的分钟链校验腿缓存（60s TTL，按代码）。
 	tMinuteCache *tMinuteCache
+	// tVolCache 个股折算量比缓存（§W-09 行情门；成功 30 分钟 / 失败 60 秒，按代码且跨日丢弃）。
+	tVolCache *tVolCache
 	// tSellVerdicts 该码最近一次活跃卖出/退出裁决的时刻（反 T 否决门用，5 分钟内有效）。
 	tSellVerdicts map[string]time.Time
 	// sizingCtxCache §FUNDS-TODAY 定权上下文（MS/盲区/指数涨跌）的短窗缓存（见 sizingContextFor）。
@@ -238,6 +247,16 @@ type Engine struct {
 	// consumed by the risk-tier synthesizer (B3).
 	lastMarketState string  // bull/range/bear（状态机关闭时为空串=不展示）
 	lastMaxPosPct   float64 // 状态机建议最大仓位比例（0=未启用）
+	// §W-09 T 专属行情读数：**与上面两个定权字段严格分家**。
+	// 理由（本批最重要的一条负锁，H18/门禁 #27 钉住）：`sizing.go` 的 stateFactor 只判断
+	// `MarketState == ""`、**不看 `MarketStateEnabled`**，所以只要 lastMarketState 非空，
+	// 定权就会乘 state_scales（range×0.70 / bear×0.40）⇒ "只给 T 开行情门"会变成
+	// "全账户仓位打七折"且无人察觉。T 的读数必须落在自己的字段里，定权那两个字一个都不许碰。
+	// English: T-only market-state readings, deliberately separate from the sizing fields above.
+	lastTMarketState     string    // bull/range/bear（T 行情门关闭或读数未产生时为空串）
+	lastTMarketStateAt   time.Time // 该读数的时刻；零值=从未写过（老引擎/没跑过 ⇒ 弃权，不许当成"刚更新"）
+	lastTStateVotes      int       // 研判有效票数（只进日志，不做门——见 §W-09「0b」）
+	lastTStateVotesTotal int       // 研判总票数
 	// §MARKET_RISK_GATE P3：最近一轮合成的市场风险档（空/Yellow/Red）+ 触发原因，供 SSE 徽标/自动买谨慎层/持仓预警。
 	// English: the latest synthesized risk tier (empty/Yellow/Red) + reasons, used by the SSE badge, the
 	// auto-buy caution layer, and held-position alerts.
@@ -679,6 +698,7 @@ func New(
 		// 靠 nil 兜底会让某条路径静默失去候选 B 判定（最危险的失败模式是"看起来在跑，其实没数"）。
 		tSignals:          newTSigLedger(),
 		tMinuteCache:      newTMinuteCache(),
+		tVolCache:         newTVolCache(),
 		tSellVerdicts:     map[string]time.Time{},
 		marketAPI:         marketAPI,
 		newsAgent:         newsAgent,
@@ -948,26 +968,42 @@ func (e *Engine) riskBreadth() (up, down int, valid bool) {
 	return u, d, true
 }
 
+// riskBreakRateTTL 炸板率缓存时长（§W-09）。60 秒的依据：主循环是分钟级，
+// 一分钟内炸板率不会变；取 60 秒而不是更短，是因为它现在是**每轮都跑**（T 行情门默认开）。
+const riskBreakRateTTL = 60 * time.Second
+
 // riskBreakRate 真实炸板率（§P2）：炸板池数/(涨停池+炸板池)*100。炸板池仅 hithink 提供，
 // 无协调器或取数失败时返回 NaN 弃权（绝不用 V1 的近似口径冒充实测）。
 // English: true break rate = break/(limitUp+break)*100. The break pool is hithink-only; NaN abstain when
 // no coordinator or on failure (never passing off the V1 approximation as measured).
 func (e *Engine) riskBreakRate(limitUpCount int) float64 {
+	now := time.Now()
+	day := data.TradingDayDate(now)
 	e.mu.RLock()
 	dc, useHithink := e.coordinator, e.riskHithink
+	cached := e.brkRateDay == day && now.Sub(e.brkRateAt) < riskBreakRateTTL
+	cachedVal := e.brkRateVal
 	e.mu.RUnlock()
+	if cached {
+		return cachedVal
+	}
 	if !useHithink || dc == nil {
 		return math.NaN()
 	}
+	// 取数不在持锁区间内做（网络调用持有 e.mu 会把整台引擎卡住）。
 	brk, err := dc.PoolLimitBreak("")
-	if err != nil {
-		return math.NaN()
+	val := math.NaN()
+	if err == nil {
+		if denom := limitUpCount + len(brk.Stocks); denom > 0 {
+			val = float64(len(brk.Stocks)) / float64(denom) * 100
+		}
 	}
-	denom := limitUpCount + len(brk.Stocks)
-	if denom <= 0 {
-		return math.NaN()
-	}
-	return float64(len(brk.Stocks)) / float64(denom) * 100
+	e.mu.Lock()
+	e.brkRateAt, e.brkRateVal, e.brkRateDay = now, val, day
+	e.mu.Unlock()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.brkRateVal
 }
 
 // indexMASlopes 指数 MA20/MA60 斜率（§P2，日级缓存：跨交易日才重算，避免每轮拉指数日K）。
@@ -1607,8 +1643,11 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	//    前者防止一笔日内低吸吃掉战略剩余空间，后者防止 T 腿变成"更便宜的资金来源"（§8.4.6）。
 	stockVal := map[string]float64{} // 集中度口径的当前市值（含 T 腿，一行都不许少）
 	indVal := map[string]float64{}
-	var stratVal, tBuyVal, tSellVal, frozenCash float64 // 战略仓位 / 正T买腿 / 反T卖腿 / 冻结回购款
-	curUnknown := false                                 // 有仓位读不到定价 → 本轮 fail-closed
+	// posByCode / posPrices 是喂给 fundsTargetCurRoom 的两份输入（§W-06 算式合一）：
+	// 持仓按纯码索引，价格只放"能定出价"的（缺价的持仓让 curUnknown fail-closed，不进这里）。
+	posByCode := map[string]store.RealPosition{}
+	var frozenCash float64 // 冻结回购款（反 T 专款）
+	curUnknown := false    // 有仓位读不到定价 → 本轮 fail-closed
 	e.mu.RLock()
 	industryFn := e.industryFn
 	e.mu.RUnlock()
@@ -1649,12 +1688,11 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		v := px * float64(p.Qty)
 		stockVal[code] += v
 		posPrices[code] = px
-		// §DYN-SIZE v4 定义的 CurStrat 第一项就是"Σ底仓"——这一行以前漏了，等于把**已有持仓**
-		// 整个当成 0：目标剩余空间被系统性高估，账户越满越敢买（"半仓之上一笔打满"的另一半根因）。
-		// T 腿由下方 tLive book 单独调账（stratVal 含 T 买腿 → 减去 tBuyVal），不会双计。
-		// English: held positions are part of CurStrat; this accumulation was missing, which made
-		// Room systematically too large on a full book.
-		stratVal += v
+		posByCode[code] = p
+		// §W-06 算式合一：Σ底仓这一项**不再就地累加**，交给 fundsTargetCurRoom 统一算。
+		// 以前这里手写 stratVal += v、下面手写 curStrat = stratVal − tBuyVal + tSellVal，
+		// 与资金卡那套各算一遍，漂移了也没有任何报警（本次修的就是这个）。
+		// English: the held-position term now feeds fundsTargetCurRoom instead of a local copy.
 		if ind := industryOf(code); ind != "" {
 			indVal[ind] += v
 		}
@@ -1676,17 +1714,20 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 			indVal[ind] += v
 		}
 		if pb.IntradayT {
-			tBuyVal += v // 战略口径：正 T 买腿（在途）不是战略建仓
+			// §W-06-R1（owner 2026-10-29 21:53 裁决）：**在途**正 T 买腿不占战略空间。
+			// 这里以前写 `tBuyVal += v`，但 stratVal 在这行之前就 continue 了、从没加过这笔，
+			// 随后 `curStrat = stratVal − tBuyVal` 等于把它扣了第二次 ⇒ room 偏小（多扣）。
+			// 裁决 R1 是"中性"，不是"负贡献"。删掉这行，只留 continue。
+			// 已成交的 T 买腿在下面按 book.BuyLegValue 扣一次（那是 R2，别跟着一起删）。
+			// English: an in-flight T buy leg was never added to stratVal, so subtracting it here
+			// double-counted it; R1 removes the subtraction only.
 			continue
 		}
-		stratVal += v
 	}
 	// 已成交的 T 腿从回转账本取：买腿要减、卖腿（欠着买回）要加回，冻结款要留出。
-	if book := e.tLiveFor(uid).bookValue(posPrices); book.OpenCount > 0 {
-		tBuyVal += book.BuyLegValue
-		tSellVal += book.SellLegValue
-		frozenCash += book.FrozenCash
-	}
+	// §W-06：book 原样交给 fundsTargetCurRoom，不再在这里拆成 tBuyVal/tSellVal 两个局部量。
+	book := e.tLiveFor(uid).bookValue(posPrices)
+	frozenCash += book.FrozenCash
 	// §B0 实盘持仓数上限（owner 2026-10-27 定 6）：只拦**新票**，已持仓票的加仓不受限
 	// （否则"持仓满就永不补仓"）。计数口径＝有持仓的代码 ∪ 在途买单的代码——两本账都在上面，
 	// 不再新增一次查询；T 腿持有同一代码时也算一个持仓（它确实是仓）。
@@ -1765,18 +1806,20 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	if ceiling <= 0 || ceiling > 1 {
 		ceiling = 1.0 // 天花板语义：>1 是配置手滑，钳到 1.0（总资产上限）
 	}
-	targetRatio := marketScale
-	if targetRatio > ceiling {
-		targetRatio = ceiling
-	}
-	curStrat := stratVal - tBuyVal + tSellVal
-	if curStrat < 0 {
-		curStrat = 0 // 全是 T 腿的极端态里战略仓位为负无意义，按 0 处理（Room 由目标决定）
-	}
-	targetVal := total * targetRatio
-	room := targetVal - curStrat
-	if room < 0 {
-		room = 0
+	// ── §W-06 算式合一：目标/当前/剩余只走一个出口 ────────────────────────────────
+	// 这里以前就地重算目标占比 / curStrat / targetVal / room，与 fundsTargetCurRoom
+	// （资金卡那条路径）是同一算式的两份实现 ⇒ 可以各自漂移且没有任何报警。
+	// 现在两条路径共用同一个函数，差异只剩**输入**（价格源、缺价策略），而这两项是刻意保留的
+	// （执法 fail-closed 不买、卡片必须有读数），见 §W-06「另外两处差异」。
+	// 注意：marketScale 未做 min(ceiling) —— 这一步在函数里做（math.Min 只允许一处）。
+	targetVal, curStrat, room, _ := fundsTargetCurRoom(
+		total, marketScale, ceiling, posByCode, posPrices, pend, book)
+	// 日志用的"目标占比"直接由 target 反推，不再自己写一遍 min(MS, ceiling)——
+	// 那正是本批要消灭的第二份实现（门禁 #11 钉住本文件里不许再出现那几个局部量名——
+	// 注释里也不能写，否则 grep 锁会被注释命中，看起来像"还在算"）。
+	targetPct := 0.0
+	if total > 0 {
+		targetPct = targetVal / total
 	}
 	out.MarketScale, out.StockScale = marketScale, stockScale
 	out.PerTradePct = perTradePct
@@ -1821,9 +1864,10 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		ClusterSet:    clusterRead.Applied,
 	})
 	// §DYN-TARGET 留痕：目标/当前/剩余/拆分缩放一次打全，事后能否解释"为什么只买了这些"全靠这行。
+	// 正T买腿/反T卖腿直接取 book 的两个分量（不再有 tBuyVal/tSellVal 两个局部量）。
 	log.Printf("[qmt] %s(%s) §DYN-TARGET 总资产=%.0f MS=%.3f SS=%.3f 缩放=%.3f 目标=%.0f(占比%.3f 天花板%.2f) 战略当前=%.0f 正T买腿=%.0f 反T卖腿=%.0f 剩余=%.0f 单笔基准=%.2f 影子目标占比=%.2f 缺失关键输入=%v",
-		sig.Code, sig.Name, total, marketScale, stockScale, scale, targetVal, targetRatio, ceiling,
-		stratVal, tBuyVal, tSellVal, room, perTradePct, shadowRatio, ctx.MissingKeyInput)
+		sig.Code, sig.Name, total, marketScale, stockScale, scale, targetVal, targetPct, ceiling,
+		curStrat, book.BuyLegValue, book.SellLegValue, room, perTradePct, shadowRatio, ctx.MissingKeyInput)
 	// §B0：单笔占比的区间与生效值单独一行（区间写错时这里一眼能看出来）。
 	log.Printf("[qmt] %s(%s) §B0 单笔占比 lo=%.3f hi=%.3f eff=%.3f（MS=%.3f SS=%.3f，金额≈%.0f）",
 		sig.Code, sig.Name, perTradeLo, perTradeHi, perTradePct, marketScale, stockScale, total*perTradePct)
@@ -1873,11 +1917,15 @@ func (e *Engine) persistDynBuyDecision(sig combat_agent.Signal, d *dynBuyReadout
 	}
 	e.mu.RLock()
 	st := e.realStore
-	uid := e.userID
 	e.mu.RUnlock()
-	if st == nil || uid == "" {
+	if st == nil {
 		return
 	}
+	// §W-03：按**逐成员**落行，不是只写 e.userID 一个。
+	// 引擎是按配置指纹在 coreUsers 多账号间共享的（registry.go），只写单值 ⇒
+	// 共享引擎下除主账号外所有成员打开「今日动态仓位」恒空，而前端本来就按 user_id 过滤，
+	// 多写的行不会串号。空 uid 跳过（旧装配的空账号不落行）。
+	uids := e.memberIDs()
 	day := data.TradingDayDate(d.At)
 	stage := "evaluated"
 	if d.Qty <= 0 {
@@ -1887,19 +1935,28 @@ func (e *Engine) persistDynBuyDecision(sig combat_agent.Signal, d *dynBuyReadout
 	if reason == "" && d.CappedBy != "" {
 		reason = "受限于 " + d.CappedBy
 	}
-	if err := st.UpsertSignalDecision(store.SignalDecision{
-		UserID: uid, Day: day, Channel: "live",
-		Code: pureTsCode(sig.Code), Strategy: signalctl.StrategyKeyOf(sig),
-		At: d.At.Format(time.RFC3339), Stage: stage,
-		MarketScale: d.MarketScale, StockScale: d.StockScale, PerTradePct: d.PerTradePct,
-		Total: d.Total, Cash: d.Cash, Target: d.Target, CurStrat: d.CurStrat, Room: d.Room,
-		IndustryRoom: d.IndustryRoom, StockRoom: d.StockRoom, ClusterRoom: d.ClusterRoom,
-		CappedBy: d.CappedBy, Qty: d.Qty, Notional: d.Notional,
-		MissingKeyInput: d.MissingKeyInput, CashStale: d.CashStale, Reason: reason,
-	}); err != nil {
-		log.Printf("[qmt] %s §DECISION-TODAY 决策快照落库失败（不阻断下单）：%v", sig.Code, err)
-		return
+	// 落库失败只告警不阻断下单（既有纪律，保留）。逐成员写：每个 uid 一次，
+	// 失败只影响那一个账号，不让别人的快照跟着丢。
+	for _, uid := range uids {
+		if uid == "" {
+			continue
+		}
+		if err := st.UpsertSignalDecision(store.SignalDecision{
+			UserID: uid, Day: day, Channel: "live",
+			Code: pureTsCode(sig.Code), Strategy: signalctl.StrategyKeyOf(sig),
+			At: d.At.Format(time.RFC3339), Stage: stage,
+			MarketScale: d.MarketScale, StockScale: d.StockScale, PerTradePct: d.PerTradePct,
+			Total: d.Total, Cash: d.Cash, Target: d.Target, CurStrat: d.CurStrat, Room: d.Room,
+			IndustryRoom: d.IndustryRoom, StockRoom: d.StockRoom, ClusterRoom: d.ClusterRoom,
+			CappedBy: d.CappedBy, Qty: d.Qty, Notional: d.Notional,
+			MissingKeyInput: d.MissingKeyInput, CashStale: d.CashStale, Reason: reason,
+		}); err != nil {
+			log.Printf("[qmt] %s §DECISION-TODAY 决策快照落库失败（不阻断下单）uid=%s：%v", sig.Code, uid, err)
+		}
 	}
+	// §W-03：清理的 key **保持按天**（不补 uid）。PruneSignalDecisions 是按 cutoff 全局剪的，
+	// 逐账号各清一次只是重复劳动；上面改成逐成员写之后，这里若也按 uid 反而会在日志里
+	// 造出"清理了 N 次"的假象。写快照逐成员、清理按天，两者的去重粒度本就不同。
 	opslog.DayOnce("sd-prune:"+day, func() {
 		if cutoff, err := time.Parse("20060102", day); err == nil {
 			if _, perr := st.PruneSignalDecisions(cutoff.AddDate(0, 0, -45).Format("20060102")); perr != nil {
@@ -4303,6 +4360,9 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// and the state machine. A failed breadth fetch yields up/down=0 (correction abstains, upRatio=NaN);
 	// the break pool is hithink-only (no source → NaN abstain), never a fabricated neutral.
 	stateOn := e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState })
+	// §W-09：T 行情门是**独立开关**（默认 true），与定权开关各管各的。两者都要"取数"，
+	// 但只有 stateOn 会把结果写进定权字段（见 MarketStateObserve 的分字段写回）。
+	tRegimeOn := e.tRegimeGateEnabled()
 	riskBrUp, riskBrDown, riskBrValid := 0, 0, false
 	if e.emotionConfigured() || stateOn {
 		riskBrUp, riskBrDown, riskBrValid = e.riskBreadth()
@@ -4312,7 +4372,9 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		riskUpRatio = float64(riskBrUp) / float64(riskBrUp+riskBrDown)
 	}
 	riskBreakRate, riskMA20, riskMA60 := math.NaN(), math.NaN(), math.NaN()
-	if stateOn {
+	// §W-09：T 行情门默认开（t.regime_gate_enabled 默认 true）⇒ 即使 enhance 开关关着，
+	// 炸板率/指数斜率也要取，否则 T 门拿不到输入、只能永远弃权。
+	if stateOn || tRegimeOn {
 		riskBreakRate = e.riskBreakRate(len(pool))
 		riskMA20, riskMA60 = e.indexMASlopes()
 	}
@@ -6146,16 +6208,45 @@ func (e *Engine) sectorLinkageObserve(pool []data.LimitUpStock) {
 	}
 }
 
+// tConfig 取本引擎的账号级 TConfig（§W-09：给"引擎级"的开关读数用，例如行情门总开关）。
+//
+// **只用于引擎级读数**，逐账号的执行参数一律走 `tParamsFor`（那边每个成员各自解析，
+// 共享引擎下不会拿主成员的配置去给别人做 T，见 §W-03 的同源纪律）。共享引擎取主成员，
+// 因为行情门是"这一台引擎跑的市场状态"，不是某个账号的偏好。
+// English: account-level TConfig for engine-scoped reads (e.g. the regime gate master switch).
+func (e *Engine) tConfig() config.TConfig {
+	return e.sizingConfigFor(e.primaryMember()).T
+}
+
+// tRegimeGateEnabled T 行情门总开关（§W-09，默认 true）。
+// 单独一个访问器而不是让调用方写 `e.tConfig().TRegimeGateEnabledOf()`：后者是**指针方法**，
+// 而 tConfig() 返回值 ⇒ Go 会直接编译不过（"cannot call pointer method on config.TConfig"），
+// 到那时最容易的"修法"是把它改成取地址再调，于是共享引擎的临时副本语义就悄悄变了。
+func (e *Engine) tRegimeGateEnabled() bool {
+	tc := e.tConfig()
+	return tc.TRegimeGateEnabledOf()
+}
+
 // MarketStateObserve 市场状态机观察（§P2.3）：Enhance.MarketState 开启时按快照更新状态机的
 // 牛/震荡/熊判定与仓位档位。喂入数据由调用方（主循环已有涨停池/连板/炸板等）装配。
-// 关闭或快照空时零操作。返回当前状态与仓位档位上限。
-// English: market-state observation (P2.3). When enabled, feeds a snapshot into the bull/range/
-// bear tracker and updates the max position cap. No-op when disabled or the snapshot is empty.
-// Returns the current state and the max position fraction.
+// 返回当前状态与仓位档位上限。
+//
+// **§W-09 改动（行为分叉，务必看清）**：本函数现在有**两个**启用条件——
+// `enhance.market_state_enabled`（定权用）与 `t.regime_gate_enabled`（T 行情门用，默认 true）。
+// 任一为真都照跑 tracker，但**写回的目标字段不同**：
+//   - `lastMarketState/lastMaxPosPct` 只在 enhance 开关为真时写（关闭时照旧清零，F2 不展示徽标）；
+//   - `lastTMarketState/At/Votes/Total` 只要 tracker 跑过就写（T 门默认开，必须有自己的读数）。
+//
+// 分两个字段而不是共用一个，是为了让"给 T 开行情门"不会连带把全账户仓位打七折——见字段处注释。
+// English: two enable conditions now (sizing switch vs T gate). Either runs the tracker, but results
+// are written back to **different** fields so the T gate never leaks into position sizing.
 func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, upRatio, ma20Slope, ma60Slope float64) (research.MarketState, float64) {
-	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState }) {
+	stateOn := e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState })
+	tRegimeOn := e.tRegimeGateEnabled()
+	if !stateOn && !tRegimeOn {
 		e.mu.Lock()
 		e.lastMarketState, e.lastMaxPosPct = "", 0 // 状态机关闭：清缓存，F2 不展示状态徽标
+		e.lastTMarketState, e.lastTMarketStateAt = "", time.Time{}
 		e.mu.Unlock()
 		return research.StateRange, 0
 	}
@@ -6179,11 +6270,19 @@ func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, u
 	}, time.Now())
 	cap := tracker.MaxPosPct()
 	present, total := tracker.Quality()
+	// §W-09：四个字段一次写完（同一个锁内），避免"状态与时间戳跨两次加锁"读出中间态。
+	// 时间戳是 T 门的新鲜度门唯一依据（regimeBlock/accelReason 共用 tRegimeStale），
+	// 少了它 T 门会拿几小时前的读数去关掉今天的 T。
 	e.mu.Lock()
 	e.lastStateVotes, e.lastStateVotesTotal = present, total
-	e.mu.Unlock()
-	e.mu.Lock()
-	e.lastMarketState, e.lastMaxPosPct = string(st), cap
+	e.lastTMarketState, e.lastTMarketStateAt = string(st), time.Now()
+	e.lastTStateVotes, e.lastTStateVotesTotal = present, total
+	if stateOn {
+		e.lastMarketState, e.lastMaxPosPct = string(st), cap
+	} else {
+		// enhance 开关关闭但 T 门开着：定权字段保持清零（不清会让全账户仓位变七折）。
+		e.lastMarketState, e.lastMaxPosPct = "", 0
+	}
 	e.mu.Unlock()
 	// 质量必须一起打：2026-10-27 的教训是"结论看起来正常、其实是 2/6 票得出的"。
 	if st != research.StateRange || present < total {
@@ -6191,6 +6290,21 @@ func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, u
 			st, cap*100, present, total, limitUpCount, ladderHeight, breakRate, upRatio, ma20Slope, ma60Slope, idxPct)
 	}
 	return st, cap
+}
+
+// tRegimeNow T 行情门的读数快照（§W-09）。返回状态串、读数时刻、研判票数。
+//
+// **只读 T 专属字段**（lastTMarketState*），绝不读 lastMarketState——那是定权的读数，
+// 读它就等于把 `enhance.market_state_enabled` 这个全局开关重新绑回 T 门上，
+// 于是"T 行情门默认开"又会变成"默认关"。见字段处注释与门禁 #27。
+//
+// 不复用 MarketEnvSnapshot：它返回 5 个值，取一个要解构 4 个弃用值，后人加字段时
+// 最容易把顺序写反（本仓已经有过 EmotionPhase/MarketState 位置写反的历史）。
+// English: T-gate reading snapshot; reads the T-only fields and never the sizing ones.
+func (e *Engine) tRegimeNow() (state string, at time.Time, votes, votesTotal int) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastTMarketState, e.lastTMarketStateAt, e.lastTStateVotes, e.lastTStateVotesTotal
 }
 
 // MarketEnvSnapshot 返回市场环境条（F2）所需的最近一轮快照：情绪相位 + 市场状态（关=空串）+ 仓位档

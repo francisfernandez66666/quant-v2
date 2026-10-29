@@ -77,6 +77,20 @@ const (
 
 	tLTick = 0.01 // A 股个股最小变动价位（与 §C2 方案 C 同源，只买个股，不做分品种 tick 表）
 
+	// tLPremiseGrace 腿龄门（§W-06-R4）：开腿后这么久之内不许判"本笔止损"。
+	// 2 分钟的依据：覆盖一笔委托从报出到首笔回报的正常延迟，并大于幽灵宽限 tLGhostGrace(90s)。
+	// 没有这道门，开腿瞬间的报价抖动 + 成交回填延迟会让止损用错价格基准（买价还是 0、或现价是上一笔）。
+	tLPremiseGrace = 2 * time.Minute
+	// tRegimeStale 行情读数的**新鲜度门**（§W-09）：超过这么久没更新 ⇒ 弃权，不许拿旧结论做动作。
+	// 15 分钟的依据：主循环是分钟级，15 分钟等于"连续 15 轮没更新"，那已经不是抖动而是停了。
+	// 出口（accelReason）比入口（regimeBlock）更依赖它——入口过期只是"照常做 T"，
+	// 出口误触发是**真金白银的成交**。
+	tRegimeStale = 15 * time.Minute
+	// tRegimeMinVotes 研判质量的"够了"线，必须与 research 状态机的 MinVotes 一致。
+	// **只用于日志分档，不做门**：票数不足时状态机已把结论降级成 range（放行档），
+	// 再拦一次等于把放行又收回去（owner 2026-10-29 第 3 条裁决）。
+	tRegimeMinVotes = 4
+
 	tLLogTag = "[t-live]"
 )
 
@@ -291,6 +305,11 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 	r.dayBlocked = blocked
 	// 开新腿的许可：止血开关 / 方向都没配 / 影子期 / 关键输入缺失 / 熔断日 / 权益或资金口径不可得。
 	// 全部是"这一轮不许开新腿"，没有一条影响已开腿的配对与收摊。
+	//
+	// §W-09：行情门**先算再 switch，且无条件算一次**。写进 case 条件里的话，
+	// 某个前置 case（如 !p.Enabled）命中时它根本不会被调用 ⇒ 弃权日志永远不打，
+	// 于是"牛熊关闭 T 到底生效了没有"在日志里查不到证据。
+	regimeWhy := r.regimeBlock()
 	switch {
 	case !p.Enabled:
 		r.canOpen, r.openWhy = false, "t.enabled=false 一键止血：只推进在途腿，不开新腿"
@@ -302,6 +321,11 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 		r.canOpen, r.openWhy = false, "影子期：目标不可信，不做日内双向操作"
 	case missing:
 		r.canOpen, r.openWhy = false, "关键市场输入缺失（数据盲区）：目标不可信，不做日内双向操作"
+	case regimeWhy != "":
+		// §W-09 形态门：位置在 missing 之后、dayBlocked 之前——它和 missing/Shadow 是同一类
+		// （"环境不可信"），而 dayBlocked/cash/total 是"今天的账户状态"。归因顺序上先报环境、
+		// 后报账户，排障时 openWhy 才指向真正的原因。
+		r.canOpen, r.openWhy = false, regimeWhy
 	case r.dayBlocked:
 		r.canOpen, r.openWhy = false, "熔断日两向都不开新腿（在途腿按收摊处理）："+blockWhy
 	case !r.cashOK:
@@ -432,6 +456,16 @@ func (r *tLiveRound) execute() {
 		if rnd.Status != tLStatusOpen {
 			continue
 		}
+		// P3：熔断日封买回通道 ⇒ 反 T 只能转战略减仓（唯一还会改终态的规则）。
+		// 撤在途委托必须**先于**转终态：否则终态写下去、委托还挂着，晚到的成交就是无主成交
+		// （仓位变了，但没有一条腿认领它）。
+		if state, why := r.premiseGone(rnd); state != "" {
+			r.cancelOpenKeys(rnd)
+			r.finish(rnd, state, why)
+			continue
+		}
+		// 其余三个触发源（stop / verdict / regime）不在这里——它们是"提前配平"，
+		// 由 pair() 内部的 accelReason 处理，不改终态语义。
 		r.pair(rnd)
 	}
 	if !r.canOpen {
@@ -724,11 +758,18 @@ func (r *tLiveRound) reconcile(rnd *TRoundLive) {
 // olderThanGrace 开腿是否已过幽灵判定宽限期（OpenedAt 解析失败按"已过"处理：
 // 一条时间戳都读不出来的记录没有资格被当成新腿继续等）。
 func (r *tLiveRound) olderThanGrace(rnd *TRoundLive) bool {
+	return r.olderThan(rnd, tLGhostGrace)
+}
+
+// olderThan 开腿是否已超过 d（§W-06-R4 抽取：腿龄门有两个用途——幽灵宽限与本笔止损的腿龄门，
+// 第二份时间戳解析逻辑一旦出现，两处的"解析失败算什么"就会各自漂移）。
+// 解析失败按"已过"处理，与 olderThanGrace 同口径。
+func (r *tLiveRound) olderThan(rnd *TRoundLive, d time.Duration) bool {
 	at, err := time.Parse(time.RFC3339, rnd.OpenedAt)
 	if err != nil {
 		return true
 	}
-	return r.now.Sub(at) > tLGhostGrace
+	return r.now.Sub(at) > d
 }
 
 // roundMatched 两腿是否已按等量配平（只有配平才谈"做 T 收益"）。
@@ -796,10 +837,17 @@ func (r *tLiveRound) pairBuyFirst(rnd *TRoundLive, price float64, force bool) {
 	if need <= 0 {
 		return // 对账环节会收尾
 	}
+	// §W-06-R4 加速配平：三个触发源共用一个出口（跳过价差门，立即发第二腿）。
+	// accelTag 同时用于日志归因与失败分支的处置（加速失败即收摊，不许回去继续扛）。
+	accelTag := ""
 	if !force {
-		fav := (price - rnd.BuyPrice) / rnd.BuyPrice * 100
-		if fav < r.p.MinSpreadPct {
-			return // 价差没到：继续等（不追高卖）
+		if accel := r.accelReason(rnd, price); accel == "" {
+			fav := (price - rnd.BuyPrice) / rnd.BuyPrice * 100
+			if fav < r.p.MinSpreadPct {
+				return // 价差没到：继续等（不追高卖）
+			}
+		} else {
+			accelTag = accel
 		}
 	}
 	if r.hasPendingPair(rnd) {
@@ -821,6 +869,14 @@ func (r *tLiveRound) pairBuyFirst(rnd *TRoundLive, price float64, force bool) {
 				"尾盘强制配平失败：底仓可卖 %d < 需卖 %d ⇒ 机动仓被迫隔夜（次日战略仓位含它）", sellable, need))
 			return
 		}
+		// 裁决 A：加速的语义是"不能再等"，失败就收摊，不许回去继续扛——
+		// "stop" 的含义是"价差已亏到线，不许再扛"，失败后保持 open 会让它扛到 −8%。
+		if accelTag != "" {
+			r.finish(rnd, tLStatusUnwound, fmt.Sprintf(
+				"加速配平失败（accel=%s）：底仓可卖 %d < 需卖 %d ⇒ 收摊不追（机动仓隔夜，次日战略仓位含它）",
+				accelTag, sellable, need))
+			return
+		}
 		r.markBlocked(rnd, "step7", fmt.Sprintf("配对可卖量不足 %d<%d", sellable, need))
 		return
 	}
@@ -830,11 +886,17 @@ func (r *tLiveRound) pairBuyFirst(rnd *TRoundLive, price float64, force bool) {
 			r.finish(rnd, tLStatusUnwound, "配对卖腿被拒："+err.Error())
 			return
 		}
+		if accelTag != "" {
+			r.finish(rnd, tLStatusUnwound, "加速配平失败（accel="+accelTag+"）：配对卖腿被拒："+err.Error())
+			return
+		}
 		log.Printf("%s 正T配对卖腿被拒 %s: %v（回转保持 open，下一轮再试）", tLLogTag, rnd.Code, err)
 		r.markBlocked(rnd, "step8", "配对卖腿被拒: "+err.Error())
 		return
 	}
-	log.Printf("%s 正T配对卖腿已报 %s %d股@%.2f（回转 %s，等待回报）", tLLogTag, rnd.Code, placed, price, rnd.ID)
+	// accelTag ∈ {"", "stop", "verdict", "regime"}：首周复盘必须按这三个标签**分组**算平均价差，
+	// 成因完全不同（止损 / 让位信号 / 行情翻转），混在一起会得出"这套规则到底亏了多少"的错误结论。
+	log.Printf("%s 正T配对卖腿已报 %s %d股@%.2f（回转 %s，等待回报，accel=%s）", tLLogTag, rnd.Code, placed, price, rnd.ID, accelTag)
 }
 
 // pairSellFirst 反 T 的第二腿：买回等量底仓。
@@ -851,6 +913,8 @@ func (r *tLiveRound) pairSellFirst(rnd *TRoundLive, price float64, force bool) {
 	if need <= 0 {
 		return
 	}
+	// §W-06-R4：与 pairBuyFirst 同一出口（三个触发源共用），accelTag 落日志与失败文案。
+	accelTag := ""
 	if force {
 		// 尾盘两态判定：买回需要许可，减敞口不需要（正 T 那一半的时钟义务保留）。
 		why, allowed := r.allowBuyBack(rnd, price, need)
@@ -864,9 +928,13 @@ func (r *tLiveRound) pairSellFirst(rnd *TRoundLive, price float64, force bool) {
 			return
 		}
 	} else {
-		fav := (rnd.SellPrice - price) / rnd.SellPrice * 100
-		if fav < r.p.MinSpreadPct {
-			return // 盘中配对只看价差
+		if accel := r.accelReason(rnd, price); accel == "" {
+			fav := (rnd.SellPrice - price) / rnd.SellPrice * 100
+			if fav < r.p.MinSpreadPct {
+				return // 盘中配对只看价差
+			}
+		} else {
+			accelTag = accel
 		}
 	}
 	if r.hasPendingPair(rnd) {
@@ -878,12 +946,12 @@ func (r *tLiveRound) pairSellFirst(rnd *TRoundLive, price float64, force bool) {
 	// 买回的钱是开腿时就冻好的专款（§8.3 纪律 3）；专款不够 ⇒ 按 §8.6 收摊，不去动战略现金。
 	if r.cashOK && r.cash < float64(need)*price*(1+r.p.FeeBufferPct/100) {
 		r.finish(rnd, tLStatusUnwound, fmt.Sprintf(
-			"买回被拦：可用现金 %.0f 不足 %d股@%.2f（专款之外不与战略买入抢钱，不追买）", r.cash, need, price))
+			"买回被拦：可用现金 %.0f 不足 %d股@%.2f（专款之外不与战略买入抢钱，不追买）%s", r.cash, need, price, tLAccelSuffix(accelTag)))
 		return
 	}
 	if err := r.buyLeg(rnd, r.nextPairKey(rnd.ID), need, price, "反T买回腿"); err != nil {
 		// 不变量 6：买回被拦一律显式留痕收摊，**绝不重试**——重试就是"隔夜追买"的前一天形态。
-		r.finish(rnd, tLStatusUnwound, "买回被拦，收摊不追买："+err.Error())
+		r.finish(rnd, tLStatusUnwound, "买回被拦，收摊不追买："+err.Error()+tLAccelSuffix(accelTag))
 		return
 	}
 	log.Printf("%s 反T买回腿已报 %s %d股@%.2f（回转 %s）", tLLogTag, rnd.Code, need, price, rnd.ID)
@@ -895,12 +963,19 @@ func (r *tLiveRound) allowBuyBack(rnd *TRoundLive, price float64, need int) (str
 	if r.dayBlocked {
 		return "熔断日：买回通道关闭 ⇒ 在途反 T 卖腿收摊（两向都不开新动作，不追买）", false
 	}
-	lossPct := (price - rnd.SellPrice) / rnd.SellPrice * 100
-	if r.p.LossBreakerPct > 0 && lossPct > r.p.LossBreakerPct {
+	// §W-06-R4：尾盘买回熔断统一改用 round_stop_pct（**原为 loss_breaker_pct=3.0，现 2.0**），
+	// 且算式换成 roundSpreadPctNow（整笔价差率）而不是单腿价差率——
+	// 全系统只剩**一个**止损算式：accelReason 的 "stop" 与本处共用它（门禁 #26 钉住）。
+	// 口径仍是纯价差不含费；差异只出现在"第二腿已部成"的情形（旧口径忽略已配平部分）。
+	pct, _, okSpread := r.roundSpreadPctNow(rnd, price)
+	if !okSpread {
+		return "买回熔断判定不可得：本笔价差率算不出（首腿未成交/本金为 0）⇒ 封买回通道，转战略减仓", false
+	}
+	if r.p.RoundStopPct > 0 && pct <= -r.p.RoundStopPct {
 		// 亏损一律封买回通道：这条腿不再是"T 买回"，只剩转战略这一条路，而那条路要另走闸门。
-		log.Printf("%s t-buyback-breaker 熔断 %s(%s) 卖%.3f 现%.3f 亏%.2f%% 阈值%.2f%%",
-			tLLogTag, rnd.Code, rnd.Name, rnd.SellPrice, price, lossPct, r.p.LossBreakerPct)
-		return fmt.Sprintf("买回熔断：亏损 %.2f%% > 阈值 %.2f%% ⇒ 封买回通道，转战略减仓", lossPct, r.p.LossBreakerPct), false
+		log.Printf("%s t-buyback-breaker 熔断 %s(%s) 价差率%.2f%% 阈值-%.2f%%",
+			tLLogTag, rnd.Code, rnd.Name, pct, r.p.RoundStopPct)
+		return fmt.Sprintf("买回熔断：价差率 %.2f%% ≤ −%.2f%% ⇒ 封买回通道，转战略减仓", pct, r.p.RoundStopPct), false
 	}
 	openedAt, err := time.Parse(time.RFC3339, rnd.OpenedAt)
 	if err != nil {
@@ -1104,6 +1179,12 @@ func (r *tLiveRound) openPlan(code string) (string, int, string) {
 	}
 	if why := r.liquidityBlock(code, q); why != "" {
 		return "", 0, "step0.5 " + why
+	}
+	// §W-09 量能门：位置在流动性前置之后、跨账号互斥之前——它与流动性前置是同一类
+	// （"这只票今天适不适合做 T"），而互斥是合规红线，归因顺序上先报适配性、再报红线。
+	// 形态门在 canOpen 那条链上（全市场一票否决），不在这里。
+	if why := r.volumeBlock(code); why != "" {
+		return "", 0, "step0.6 " + why
 	}
 	// 跨账号同码反向互斥（§8.4.5 对手方不变量，合规红线：对敲不申请、不做）。
 	if r.readers.oppositeLeg != nil {
@@ -1972,3 +2053,200 @@ func splitTLStep(s string) (string, string) {
 // tLFeeBufferPctDefault 冻结款费用缓冲的兜底值（与 paper.TParams.FeeBufferPct 的出厂值同数）：
 // 配置层给不出该值时用它，而不是给 0——0 缓冲会让"差几毛钱买不回"变成一次半态。
 const tLFeeBufferPctDefault = 0.6
+
+// ── §W-09 行情门：形态门（入口）+ 量能门（逐票）────────────────────────────────
+//
+// 两道门回答的是同一个问题的两面："现在这种行情该不该做 T"。
+// 现有的 MS 数值门（MinMarketScale / SellEnvMinMarketScale）与大盘急跌门**都留着**，
+// 它们管的是"该买多少"与"今天是不是在砸"，表达不了"盘整还是趋势"——
+// 牛市里 MS 可以很高（该重仓但不该做 T），震荡市里 MS 也可以中等（该做 T）。
+
+// regimeBlock 行情门·形态（§W-09）：只有盘整行情才做 T；牛/熊一律关闭。
+//
+// **弃权而不是 fail-closed**：读数为空串（T 行情门关 / 状态机从未产生读数）时放行并出声。
+// 若空串按"不通过"处理，默认配置下所有账号的 T 会立刻全停，而现象是"T 不做了"
+// 这种最难归因的形态。owner 关掉状态机是显式选择，不能反过来把 T 永久关死。
+// 反过来 `default` 分支（未知状态字符串）必须 fail-closed——那不是"没配"，是"配了但值不认识"。
+//
+// 读数来源是 **T 专属字段** MarketState/MarketStateAt（来自 tRegimeNow，不是定权的 lastMarketState）。
+// 读后者等于把 enhance.market_state_enabled 这个全局开关重新绑回 T 门上。
+//
+// 本函数只管**入口**（不开新腿）。出口由 accelReason 的 "regime" 分支负责，动作是**配平**
+// 不是"结掉"——熊市里把正 T 腿结掉＝少卖一笔等量底仓＝敞口反而变大（§W-09「两个出口」）。
+// 两个函数共用同一个读数与新鲜度门，但**不许合并**：合并就会有人把"结掉"当成"配平"。
+func (r *tLiveRound) regimeBlock() string {
+	st, at := r.p.MarketState, r.p.MarketStateAt
+	if st != "" && (at.IsZero() || r.now.Sub(at) > tRegimeStale) {
+		r.st.noteBlock("step0", fmt.Sprintf(
+			"行情门弃权：市场状态读数过期（%q，%.0f 分钟前，票 %d/%d）——主循环可能已停",
+			st, r.now.Sub(at).Minutes(), r.p.MarketStateVotes, r.p.MarketStateVotesTotal), "")
+		return ""
+	}
+	switch st {
+	case "range":
+		// 票数不足时状态机已把结论降级成 range（research/market_state.go 的安全阀）——放行结论不变，
+		// 但要留一行，否则复盘时分不清"真震荡"和"票太少"。这就是 owner 第 3 条裁决的全部落地。
+		// **零票单独一条**：votes==0 是兜底 range（状态机无任何有效输入），比 2/6 更不可信、
+		// 也更安静。写成 `votes > 0 && ...` 就会把它静默放行，于是"数据源全挂"看起来像"真震荡"。
+		switch {
+		case r.p.MarketStateVotes == 0:
+			r.st.noteBlock("step0", "行情门放行（**零票**：状态机无任何有效输入 ⇒ 这是兜底 range，不是真震荡）——先查炸板池/指数斜率/广度数据源", "")
+		case r.p.MarketStateVotes < tRegimeMinVotes:
+			r.st.noteBlock("step0", fmt.Sprintf(
+				"行情门放行（研判质量不足：票 %d/%d < %d ⇒ 状态机已降级为 range，非真震荡）",
+				r.p.MarketStateVotes, r.p.MarketStateVotesTotal, tRegimeMinVotes), "")
+		}
+		return ""
+	case "bull", "bear":
+		return fmt.Sprintf("行情门：市场状态=%s，非盘整行情不做 T", st)
+	case "":
+		r.st.noteBlock("step0", "行情门弃权：T 行情门已关（t.regime_gate_enabled=false）或读数从未产生，牛熊关闭 T 未生效", "")
+		return ""
+	default:
+		return fmt.Sprintf("行情门：未知市场状态 %q，按不做 T 处理（fail-closed）", st)
+	}
+}
+
+// volumeBlock 行情门·量能（§W-09）：放量的票不做 T。
+//
+// 读数不可得 ⇒ 不做该票的 T——与流动性前置同一纪律（"读不到"不按"没放量"放行）。
+// 与 minuteBasis 的降级**刻意不同**（分钟链自己取不到只降级、不拦）：那条是**校验腿**，
+// 这条是**准入判据**。判据缺了就不能判"通过"，校验腿缺了只是少一道复核。
+//
+// 只收 code、不收 q：量比是"当日累计量 ÷ 20 日均量"，累计量从读数源里取（与快照同源），
+// 这里再传一个 q 会让后人以为用的是 q.Volume 直算（那样就不折算时间窗了，早盘的放量永远测不出来）。
+func (r *tLiveRound) volumeBlock(code string) string {
+	if r.p.VolRatioMax <= 0 {
+		return "" // 0 合法＝不设该条（整条门的开关）
+	}
+	if r.p.VolRatio == nil {
+		return "量比读数无源（未接 VolRatio），按不过处理"
+	}
+	ratio, ok := r.p.VolRatio(code)
+	if !ok || ratio <= 0 {
+		return "量比读数不可得，按不过处理"
+	}
+	if ratio >= r.p.VolRatioMax {
+		return fmt.Sprintf("放量：折算量比 %.2f ≥ %.2f（放量行情不做 T）", ratio, r.p.VolRatioMax)
+	}
+	return ""
+}
+
+// ── §W-06-R4 盘中加速配平（三个触发源、一个出口）────────────────────────────────
+//
+// 三个触发源共用一个出口，因为**动作完全相同**：发第二腿、回到开腿前的敞口、不等价差。
+// 分开写三份判断只会让"到底谁触发的"在日志里分不清，而复盘时这三个的成本完全不同
+// （止损是成本、让位信号是成本、行情翻转是成本，但成因不同，混在一起会得出错误结论）。
+
+// roundSpreadPctNow 假设此刻按 price 平掉本笔 T，这笔 T 的价差率（%）与本金。
+// ok=false：首腿未成交 / 本金 ≤ 0（没有"这笔 T"可算）。
+//
+// 口径（§W-06-R4 v3，owner 2026-10-29 22:40 定调「做 T 的唯一口径是价差」）：
+//
+//	价差   = 卖额 − 买额（已配平部分按成交价、未配平部分按 price 折算）
+//	本金   = 首腿成交额（正 T 用买额、反 T 用卖额）
+//	价差率 = 价差 / 本金 × 100
+//
+// **不含费用**。费用模型是 fillPnl 的事，混进来就变成第二份口径（v2 版就是这么被推翻的）：
+// 门禁 #21 与 ACC-16 一起钉住"本函数体不得出现 roundFee / 费率常量"。
+// 正反 T 同一算式：卖额−买额 对两侧都成立，不需要按方向分分支（v1 版两条分支、符号相反，
+// 抄反一个就静默失效，那是它被废掉的原因）。
+func (r *tLiveRound) roundSpreadPctNow(rnd *TRoundLive, price float64) (pct, notional float64, ok bool) {
+	if rnd == nil || price <= 0 {
+		return 0, 0, false
+	}
+	matched := rnd.BuyFilled
+	if rnd.SellFilled < matched {
+		matched = rnd.SellFilled
+	}
+	var buyAmt, sellAmt float64
+	if rnd.Dir == tLDirBuy {
+		if rnd.BuyFilled <= 0 || rnd.BuyPrice <= 0 {
+			return 0, 0, false
+		}
+		buyAmt = rnd.BuyPrice * float64(rnd.BuyFilled)
+		sellAmt = rnd.SellPrice*float64(matched) + price*float64(rnd.BuyFilled-matched)
+		notional = buyAmt
+	} else {
+		if rnd.SellFilled <= 0 || rnd.SellPrice <= 0 {
+			return 0, 0, false
+		}
+		sellAmt = rnd.SellPrice * float64(rnd.SellFilled)
+		buyAmt = rnd.BuyPrice*float64(matched) + price*float64(rnd.SellFilled-matched)
+		notional = sellAmt
+	}
+	if notional <= 0 {
+		return 0, 0, false
+	}
+	return (sellAmt - buyAmt) / notional * 100, notional, true
+}
+
+// accelReason 该腿此刻是否值得"跳过价差门、立即配平"（§W-06-R4 v3）。
+// 返回 ""（照常等价差）/ "stop"（本笔价差率跌破止损线）/ "verdict"（有卖出裁决）/
+//
+//	"regime"（行情已离开 range）。
+//
+// 这里**只读**，不判"该不该卖"：裁决的生成是 combat_agent 的事，行情判定是状态机的事。
+// T 层再判一次"该不该卖"就是第二份卖出逻辑（门禁 #25 钉住本函数不得引 combat_agent/Disposal）。
+//
+// 腿龄门只加在 "stop" 上（防开腿瞬间的报价抖动被当成止损），不加在 verdict/regime 上——
+// 刚开腿就出现裁决或行情翻转，正是最该立刻配平的情形。
+func (r *tLiveRound) accelReason(rnd *TRoundLive, price float64) string {
+	if rnd == nil {
+		return ""
+	}
+	// S1：本笔止损。与入口的"止损线"同口径（纯价差率），且必须先过**止血门 + 腿龄门**。
+	// 止血（!p.Enabled）期间不许走这条：§8.11.5 的止血是"停开新腿、在途腿照常收摊"，
+	// 而"因为亏到线主动卖底仓"是一个**新动作**。漏了这个判断 ⇒ ACC-4 红。
+	// 注意 verdict/regime 在止血期间**仍然生效**——它们不是止损，是"回到开腿前"。
+	if r.p.Enabled && r.p.RoundStopPct > 0 && r.olderThan(rnd, tLPremiseGrace) {
+		if pct, _, ok := r.roundSpreadPctNow(rnd, price); ok && pct <= -r.p.RoundStopPct {
+			return "stop"
+		}
+	}
+	// S2：卖出裁决（TTL 5min，tSellVerdictActive 内部判）。
+	if r.e != nil && r.e.tSellVerdictActive(rnd.Code) {
+		return "verdict"
+	}
+	// S3：行情翻转。与 regimeBlock 同一读数、同一新鲜度门（过期的 bear 不许拿来配平）。
+	st, at := r.p.MarketState, r.p.MarketStateAt
+	if st != "" && !at.IsZero() && r.now.Sub(at) <= tRegimeStale {
+		if st == "bull" || st == "bear" {
+			return "regime"
+		}
+	}
+	return ""
+}
+
+// premiseGone 盘中"必须改终态"的判定（§W-06-R4 v3）。返回 ("", "") 表示"继续按 T 处理"。
+//
+// **只处理 P3（熔断日反 T）**：那是"买回通道被关、配平做不了"的情形，只能转战略减仓。
+// 其余三个触发源（stop/verdict/regime）都是"提前配平"，在 accelReason 里，不走这里。
+// **不许把它们留一份在这里**——那就有两个入口，同一 tick 里会抢同一笔腿；
+// 更致命的是写在这里的动作是"结掉"（不卖底仓），熊市里等于**敞口变大**（§W-09「两个出口」）。
+//
+// 守卫（每一条都是资损方向）：
+//  1. 尾盘（force=true）⇒ 不判：尾盘那条路是为"不隔夜"设计的，动作与文案都不同；
+//  2. 第二腿在途 ⇒ 不判（撤单与成交有竞态，早转会造无主成交）；
+//  3. 腿龄 < tLPremiseGrace ⇒ 不判（报价抖动 + 成交回填延迟会拿错价格基准）；
+//  4. t.enabled=false 的止血轮 ⇒ 不判（止血停新动作，不是提前结掉在途腿）。
+func (r *tLiveRound) premiseGone(rnd *TRoundLive) (state, why string) {
+	if r.force || !r.p.Enabled || r.hasPendingPair(rnd) || !r.olderThan(rnd, tLPremiseGrace) {
+		return "", ""
+	}
+	// P3：熔断日。尾盘的 allowBuyBack 对 dayBlocked 一律封买回通道，盘中不提前封会自相矛盾
+	// （同一笔腿"盘中买回、尾盘不许买回"）。只对反 T：正 T 在熔断日提前结掉＝不卖底仓＝敞口更大。
+	if rnd.Dir == tLDirSell && r.dayBlocked && rnd.SellFilled > 0 {
+		return tLStatusUnwound, "盘中收摊：熔断日买回通道关闭 ⇒ 反T卖腿转战略减仓（与尾盘 allowBuyBack 的 dayBlocked 分支同口径）"
+	}
+	return "", ""
+}
+
+// tLAccelSuffix 失败文案的加速标签后缀（§W-06-R4）。空标签返回空串，
+// 于是非加速路径的既有文案**逐字不变**（ACC-12 的反向断言依赖这一点）。
+func tLAccelSuffix(accelTag string) string {
+	if accelTag == "" {
+		return ""
+	}
+	return "（accel=" + accelTag + "）"
+}

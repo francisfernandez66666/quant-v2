@@ -25,7 +25,7 @@ func TestIntradayVolumeRatioTimeNormalized(t *testing.T) {
 	}
 	// 归一后：折算全天等值 = 200 万 ×(240/30) = 1600 万 → 量比 16（远大于老口径 2）
 	now := time.Date(2026, 9, 4, 10, 0, 0, 0, cntime.Loc)
-	normRatio := intradayVolumeRatio(now, cumVol, avgDay)
+	normRatio := IntradayVolumeRatio(now, cumVol, avgDay)
 	if normRatio <= rawRatio*5 {
 		t.Fatalf("早盘 30 分钟量比应显著放大(30min/240min 折算): norm=%.2f raw=%.2f", normRatio, rawRatio)
 	}
@@ -39,7 +39,7 @@ func TestIntradayVolumeRatioTimeNormalized(t *testing.T) {
 func TestIntradayVolumeRatioCloseConsistent(t *testing.T) {
 	now := time.Date(2026, 9, 4, 15, 0, 0, 0, cntime.Loc)
 	// 收盘后到 15:00 为止累计 240 分钟 → 折算因子 240/240=1
-	if r := intradayVolumeRatio(now, 2_000_000, 1_000_000); r != 2 {
+	if r := IntradayVolumeRatio(now, 2_000_000, 1_000_000); r != 2 {
 		t.Fatalf("收盘时刻量比应等于原始 2.0, got %.2f", r)
 	}
 }
@@ -48,7 +48,7 @@ func TestIntradayVolumeRatioCloseConsistent(t *testing.T) {
 // （归一保守：不给盘前零量虚高量比，避免竞价抢跑误触发）。
 func TestIntradayVolumeRatioPreMarketConservative(t *testing.T) {
 	now := time.Date(2026, 9, 4, 9, 20, 0, 0, cntime.Loc)
-	r := intradayVolumeRatio(now, 500_000, 1_000_000)
+	r := IntradayVolumeRatio(now, 500_000, 1_000_000)
 	if r <= 0 {
 		t.Fatalf("盘前不应为 0（保守但不放大）, got %.2f", r)
 	}

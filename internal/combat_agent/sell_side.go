@@ -106,7 +106,7 @@ func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Sco
 		kl := md.KLines
 		if len(kl) >= 21 {
 			avgV := avgVol(kl[:len(kl)-1], 20)
-			ratio := intradayVolumeRatio(now, q.Volume, avgV)
+			ratio := IntradayVolumeRatio(now, q.Volume, avgV)
 			if avgV > 0 && q.Volume >= avgV && ratio > distributionRatioThreshold(now) && md.ChangePct <= -1.5 {
 				factors = append(factors, sellSideFactor{
 					kind:   kindDistribution,

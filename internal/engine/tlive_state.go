@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"quant-trading-v2/internal/data"
 )
 
 // TRoundLive 一笔实盘日内回转的完整状态（两腿 + 结局）。
@@ -407,7 +409,12 @@ func newTLiveRegistry(accountsRoot string) *tLiveRegistry {
 		byUser:       map[string]*tLiveStore{},
 		loadDay:      map[string]string{},
 		nowFn:        time.Now,
-		dayOfFn:      func(t time.Time) string { return t.Format("20060102") },
+		// §W-07：日键必须走 data.TradingDayDate（内部 cntime.In 归北京时），不许用服务器本地钟。
+		// 本地钟在广州 +08 看不出问题，但 deploy_seoul.sh 存在 ⇒ KST 下日切会错位一小时
+		// （北京 23:30 时 KST 已是次日 00:30，账本会提前一天换、当天的在途腿被当成"昨日记录"）。
+		// 已接受的语义变化：周末/休市日打开页面看到的是**上一交易日**的账本（与资金帧、信号决策、
+		// cntime 日键一致），不再是"当日空账"。G3 钉住这一点，别当成 bug 改回去。
+		dayOfFn: func(t time.Time) string { return data.TradingDayDate(t) },
 	}
 }
 

@@ -1866,11 +1866,30 @@ type TConfig struct {
 	LimitDistancePct        float64  `json:"limit_distance_pct,omitempty"`          // 距涨/跌停最小距离（%）
 	OpenCoolingMin          float64  `json:"open_cooling_min,omitempty"`            // 开盘冷静期（分钟）
 	StopGuardPct            float64  `json:"stop_guard_pct,omitempty"`              // 反 T 否决门的止盈止损距离（%）
-	LossBreakerPct          float64  `json:"loss_breaker_pct,omitempty"`            // 买回熔断阈值（%）
-	MinAmountWan            *float64 `json:"min_amount_wan,omitempty"`              // 流动性前置：当日成交额（万元；0＝不设该条）
-	MinTurnoverPct          *float64 `json:"min_turnover_pct,omitempty"`            // 流动性前置：换手率（%；0＝不设该条）
-	MinListedDays           *float64 `json:"min_listed_days,omitempty"`             // 流动性前置：上市天数（0＝不设该条）
-	VWAPCheckTolPct         float64  `json:"vwap_check_tol_pct,omitempty"`          // 分时均线主源与分钟链复算的允许偏差（%）
+	LossBreakerPct          float64  `json:"loss_breaker_pct,omitempty"`            // 买回熔断阈值（%）—— §W-06 起**降级为兼容键**，判定侧不再读取
+	// RoundStopPct 本笔 T 止损（**价差率 %，不含费用**）。§W-06-R4（owner 2026-10-29）新增：
+	// 价差率 ≤ −该值 ⇒ 跳过价差门立即配平（accelReason 的 "stop"），尾盘买回许可也改读它。
+	// 口径是"纯价差"，不是到手盈亏——真实到手还要再减约 0.05~0.1% 的费用。
+	// 赔率：min_spread_pct=2.0 与它 2.0 相等 ⇒ 1:1，打平需胜率 50%。
+	// English: per-round stop-loss in **spread %** (fees excluded); drives accelReason's "stop"
+	// trigger and the end-of-day buy-back permit. Odds are 1:1 against min_spread_pct=2.0.
+	RoundStopPct float64 `json:"round_stop_pct,omitempty"`
+	// VolRatioMax 个股量能门（§W-09）：折算量比 ≥ 该值 ⇒ 不做该票的 T。**0 合法＝不设该条**。
+	// 默认 1.8 = 本仓既有分档的"显著放量"线（position_review.go:215-222），刻意不取 1.2——
+	// 1.2 会把"温和放量"也拦掉，盘整市里大半时间都开不了腿。
+	// English: per-name volume gate (0 = disabled); 1.8 matches the repo's "significant expansion" tier.
+	VolRatioMax *float64 `json:"vol_ratio_max,omitempty"`
+	// RegimeGateEnabled T 行情门总开关（§W-09，**默认 true**）。**必须是 *bool**：
+	// bool 分不清"没配"与"配了 false"，默认 true 就变成永远 true、关不掉。
+	// 它只管 T，与 enhance.market_state_enabled（全局定权维度）是两个东西——后者一旦打开
+	// 会让全账户仓位乘 state_scales（range×0.70 / bear×0.40），不是 T 的开关。
+	// English: T-only regime gate switch (default true). Deliberately *bool so "unset" stays
+	// distinguishable from "explicitly off"; unrelated to enhance.market_state_enabled.
+	RegimeGateEnabled *bool    `json:"regime_gate_enabled,omitempty"`
+	MinAmountWan      *float64 `json:"min_amount_wan,omitempty"`     // 流动性前置：当日成交额（万元；0＝不设该条）
+	MinTurnoverPct    *float64 `json:"min_turnover_pct,omitempty"`   // 流动性前置：换手率（%；0＝不设该条）
+	MinListedDays     *float64 `json:"min_listed_days,omitempty"`    // 流动性前置：上市天数（0＝不设该条）
+	VWAPCheckTolPct   float64  `json:"vwap_check_tol_pct,omitempty"` // 分时均线主源与分钟链复算的允许偏差（%）
 	// ForceUnwindAt 尾盘强制配平时刻（HHMM，默认 "1450"）：正 T 的买腿到点仍未配对 ⇒ 卖出等量
 	// 底仓回到原仓位，绝不把机动仓留过夜（机动仓的定义就是"当日买、当日平"）。
 	// 反 T 的卖腿到点仍未买回 ⇒ 按 Q8 收摊（不追买），所以这个时刻对它只是"停止新开"的界线。
@@ -2009,10 +2028,19 @@ const (
 	defaultTOpenCoolingMin   = 15.0
 	defaultTStopGuardPct     = 1.5
 	defaultTLossBreakerPct   = 3.0
-	defaultTMinAmountWan     = 3000.0
-	defaultTMinTurnoverPct   = 1.5
-	defaultTMinListedDays    = 60.0
-	defaultTVWAPCheckTolPct  = 0.1
+	// defaultTRoundStopPct §W-06-R4（owner 2026-10-29 第 7 条追加裁决）：本笔 T 止损 2.0（价差率）。
+	// 定 2.0 而不是 2.5 的理由是**赔率**：min_spread_pct 也是 2.0，一笔好 T 赚 2.0、一笔坏 T 亏 2.5
+	// ⇒ 打平需胜率 55.6%（1:1.25 的赔率倒挂）；改成 2.0 后是 1:1、打平需 50%。
+	defaultTRoundStopPct = 2.0
+	// defaultTVolRatioMax §W-09：1.8 = 既有分档的"显著放量"线。0 合法（＝不设该条）。
+	defaultTVolRatioMax = 1.8
+	// defaultTRegimeGateEnabled §W-09：行情门默认生效（owner 2026-10-29 裁决"默认改成 true"）。
+	// 注意这不是 enhance.market_state_enabled 的默认值——那个键改不得，见 §W-09「0）」。
+	defaultTRegimeGateEnabled = true
+	defaultTMinAmountWan      = 3000.0
+	defaultTMinTurnoverPct    = 1.5
+	defaultTMinListedDays     = 60.0
+	defaultTVWAPCheckTolPct   = 0.1
 	// tLastOpenAtHardTopHM 唯一保留的硬顶：14:45 之后开腿基本配不上对，只能带半态进收盘竞价。
 	// 它由竞价结构决定而非风险偏好，因此**不随"保护阈值改配置"一起放开**（方案 §8.4.4）。
 	tLastOpenAtHardTopHM = 1445
@@ -2171,8 +2199,45 @@ func (c *TConfig) TStopGuardPctOf() float64 {
 }
 
 // TLossBreakerPctOf 买回熔断阈值（%）：下限 1，杜绝"设成 0 = 永不熔断"这种放宽。
+//
+// Deprecated: §W-06（2026-10-29）起已并入 TRoundStopPctOf，**判定侧不再读取本键**。
+// 字段与访问器保留只为兼容历史配置与前端表单（删了会让老配置反序列化丢字段、
+// 前端取值变 undefined、regime_config_api_test 直接红）。
 func (c *TConfig) TLossBreakerPctOf() float64 {
 	return c.tClamp("loss_breaker_pct", c.LossBreakerPct, tRange{defaultTLossBreakerPct, 1, 10})
+}
+
+// TRoundStopPctOf 本笔 T 止损（**价差率 %，不含费用**）。§W-06-R4 新增，全系统唯一的止损口径。
+// 用 tClamp：0/未配 ⇒ 默认 2.0；越界/NaN ⇒ 回落并出声（TFallbacks 会带出来）。
+func (c *TConfig) TRoundStopPctOf() float64 {
+	return c.tClamp("round_stop_pct", c.RoundStopPct, tRange{defaultTRoundStopPct, 0.5, 5})
+}
+
+// TVolRatioMaxOf 个股量能门阈值（§W-09）。**0 合法＝不设该条**，所以不能用 tClamp
+// （tClamp 会把 0 钳到下限，等于把"关掉这条门"变成"设成 1.0 最严"）。照 TMinAmountWanOf 手写。
+func (c *TConfig) TVolRatioMaxOf() float64 {
+	v := c.VolRatioMax
+	if v == nil {
+		return defaultTVolRatioMax
+	}
+	// 合法域 = 0 或 [1.0, 6.0]。0 与负数是两件事：负数一律回落（那是手滑），0 是显式关闭。
+	if *v == 0 {
+		return 0
+	}
+	if math.IsNaN(*v) || *v < 1.0 || *v > 6.0 {
+		c.noteFallback("vol_ratio_max", defaultTVolRatioMax)
+		return defaultTVolRatioMax
+	}
+	return *v
+}
+
+// TRegimeGateEnabledOf T 行情门是否生效（§W-09）。nil ⇒ 默认 true（"没配"＝按出厂默认生效）。
+// 注意：**不能**用 tClamp（那是 float 区间钳制，bool 没有越界概念）。
+func (c *TConfig) TRegimeGateEnabledOf() bool {
+	if c.RegimeGateEnabled == nil {
+		return defaultTRegimeGateEnabled
+	}
+	return *c.RegimeGateEnabled
 }
 
 // TMinAmountWanOf 流动性前置：当日成交额下限（万元）。0 合法＝不设该条。
@@ -2251,6 +2316,8 @@ func (c *TConfig) FillEffective() {
 	c.OpenCoolingMin = c.TOpenCoolingMinOf()
 	c.StopGuardPct = c.TStopGuardPctOf()
 	c.LossBreakerPct = c.TLossBreakerPctOf()
+	c.RoundStopPct = c.TRoundStopPctOf()
+	c.VolRatioMax = refOf(c.TVolRatioMaxOf())
 	c.MinAmountWan = refOf(c.TMinAmountWanOf())
 	c.MinTurnoverPct = refOf(c.TMinTurnoverPctOf())
 	c.MinListedDays = refOf(c.TMinListedDaysOf())

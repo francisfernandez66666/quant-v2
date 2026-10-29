@@ -90,6 +90,7 @@ func tParams() TParams {
 		OpenCoolingMin: 15, LastOpenHM: "1400", VWAPCheckTolPct: 0.1,
 		MinMarketScale: 0.40, SellEnvMinMarketScale: 0.20, MarketPlungePct: -2.0,
 		IntradaySellCapTotalPct: 20, StopGuardPct: 1.5, LossBreakerPct: 3.0,
+		RoundStopPct: 2.0,
 		MinAmountWan: 3000, MinTurnoverPct: 1.5, MinListedDays: 60,
 		MinuteBasis:       func(code string) (float64, bool) { return minuteVOf(code) },
 		NewBuySignal:      func(code string, since time.Time) (string, bool) { return sigFor(since) },

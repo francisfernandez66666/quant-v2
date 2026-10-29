@@ -45,12 +45,16 @@ func tradingMinutesElapsed(now time.Time) float64 {
 	}
 }
 
-// intradayVolumeRatio 盘中时间窗归一的量比：今日实时累计量折算全天等值后 ÷ 前 N 日均量。
+// IntradayVolumeRatio 盘中时间窗归一的量比：今日实时累计量折算全天等值后 ÷ 前 N 日均量。
 // elapsed<=0（盘前）或 now 非交易日/停牌缺口按 1 处理（保守：不放大）。
-// English: time-window-normalized intraday volume ratio: today's cumulative volume prorated to a
-// full-day equivalent, divided by the prior N-day average volume. Before the open (elapsed<=0) the
-// ratio is conservative (no amplification).
-func intradayVolumeRatio(now time.Time, cumVol, avgDailyVol float64) float64 {
+//
+// §W-09（2026-10-29）导出：T 行情门的个股量能门要复用它。本仓已有三处消费
+// （momentum.go / sell_side.go / nwave.go），加上 T 门是第四处——**必须同一份实现**：
+// 自己写 `q.Volume / avg20` 会漏掉"按已流逝交易分钟折算"，结果是**上午的放量永远测不出来**
+// （09:35 的累计量只有全日的零头），门形同不设；更糟的是同一分钟两个读数互相矛盾。
+//
+// English: exported for the T regime gate so all four consumers share one proration rule.
+func IntradayVolumeRatio(now time.Time, cumVol, avgDailyVol float64) float64 {
 	if avgDailyVol <= 0 || cumVol <= 0 {
 		return 0
 	}

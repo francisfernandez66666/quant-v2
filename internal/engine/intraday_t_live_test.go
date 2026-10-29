@@ -184,6 +184,9 @@ func (f *tLiveFix) params(tweak func(*paper.TParams)) paper.TParams {
 		LimitDistancePct: 1.0, OpenCoolingMin: 15, VWAPCheckTolPct: 0.1,
 		MinMarketScale: 0.40, SellEnvMinMarketScale: 0.20, MarketPlungePct: -2.0,
 		IntradaySellCapTotalPct: 20, StopGuardPct: 1.5, LossBreakerPct: 3.0,
+		// §W-06-R4：止损键换成 round_stop_pct（默认 2.0）。LossBreakerPct 保留只为兼容历史配置，
+		// 判定侧已不再读它——夹具两个都给，是为了让老配置里的 3.0 不再生效这件事有据可查。
+		RoundStopPct: 2.0,
 		MinAmountWan: 3000, MinTurnoverPct: 1.5, MinListedDays: 60,
 		IndexChangePct: 0.5, FeeBufferPct: 0.6,
 	}

@@ -315,6 +315,26 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 			pe.SetConceptExposure(q.RiskGate.ConceptValuePct, q.RiskGate.ConceptValueShadowOn(), cc.MinCoverage(), coverageFn, conceptsFn)
 		}
 	}
+	// §W-02 纸面决策快照：注入写库回调（Channel="paper"）。
+	// 与实盘 persistDynBuyDecision 同一张表、同一套字段，只差 Channel——
+	// 「今日动态仓位」按 user_id 过滤，两通道混在一张表里反而便于对照（否则要再建一张表，
+	// 加表还会牵动 schemaVersion，那是 W-05 的领地）。
+	// 落库失败只告警：决策快照是观测面，绝不能因为写不下日志就阻断撮合。
+	if st := r.opts.RealStore; st != nil {
+		pe.SetDecisionRecorder(func(rec paper.DecisionRecord) {
+			if err := st.UpsertSignalDecision(store.SignalDecision{
+				UserID: userID, Day: rec.Day, Channel: "paper", Code: pureTsCode(rec.Code),
+				Strategy: rec.Strategy, At: rec.At.Format(time.RFC3339), Stage: rec.Stage,
+				MarketScale: rec.MarketScale, StockScale: rec.StockScale, PerTradePct: rec.PerTradePct,
+				Total: rec.Total, Cash: rec.Cash, Target: rec.Target, CurStrat: rec.CurStrat, Room: rec.Room,
+				IndustryRoom: rec.IndustryRoom, StockRoom: rec.StockRoom,
+				CappedBy: rec.CappedBy, Qty: rec.Qty, Notional: rec.Notional,
+				MissingKeyInput: rec.MissingKeyInput != "", Reason: rec.Reason,
+			}); err != nil {
+				log.Printf("[paper] §W-02 纸面决策快照落库失败（不阻断撮合）：%v", err)
+			}
+		})
+	}
 	// §SIGNAL_CONTROLLER 20260917：统一纪律（买入确认窗）注入已随 paper 状态机删除——
 	// rules.paper.discipline 现由引擎 paperSignalPolicy 装配进信号控制器 paper 通道裁定。
 	// English: discipline injection moved to the signal controller's paper policy builder.

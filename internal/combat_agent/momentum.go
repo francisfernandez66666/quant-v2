@@ -90,7 +90,7 @@ func volumePriceRatio(md *strategy_engine.StockMarketData) float64 {
 	// wrongly throttled early in the session.
 	volScore := 0.0
 	if avgV > 0 {
-		ratio := intradayVolumeRatio(time.Now(), q.Volume, avgV)
+		ratio := IntradayVolumeRatio(time.Now(), q.Volume, avgV)
 		switch {
 		case ratio >= 2:
 			volScore = 1.0

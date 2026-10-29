@@ -541,6 +541,9 @@ type Engine struct {
 	// full closes (partial trims excluded).
 	onOpen  func(p Position)
 	onClose func(code string, price, qty float64, reason string)
+	// onDecision §W-02：每次动态预算算完播一条决策快照（nil=不记录）。
+	// 与 onOpen/onClose 同款：**不得**在回调里取 e.mu（调用方持锁，会自锁）。
+	onDecision func(DecisionRecord)
 	// trimDone 当日减仓去重：code → "YYYYMMDD"（同一交易日同一持仓只响应一次减仓类信号，
 	// 防止多轮告警把仓位反复减半）。清仓类无需去重（平仓后自然 no-op）。
 	// English: same-day trim dedup — code → "YYYYMMDD"; trim-type signals act at most once per code per
@@ -1816,9 +1819,57 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 		TargetRoomSet:     roomSet,
 	})
 	if res.SkipReason != "" {
+		e.emitDecisionLocked(poolKey, code, price, perTradePct, base, cash, targetRatio, curStrat, room,
+			res.CappedBy, "skipped", res.SkipReason, 0)
 		return 0, res.SkipReason
 	}
+	e.emitDecisionLocked(poolKey, code, price, perTradePct, base, cash, targetRatio, curStrat, room,
+		res.CappedBy, "placed", "", res.Qty)
 	return res.Qty, ""
+}
+
+// emitDecisionLocked 把本轮动态预算的结果播给记录器（§W-02）。
+//
+// **调用方持 e.mu**（dynamicPaperQtyLocked 的约定），所以这里只读快照、不再加锁：
+// 回调是外部注入的，它里面若去取 e.mu 就是自锁——B3 用例专门用 -race 盯这条。
+// 记录器为 nil 时整体 no-op，纯内存账本/单测不受影响。
+func (e *Engine) emitDecisionLocked(poolKey, code string, price, perTradePct, base, cash, targetRatio,
+	curStrat, room float64, cappedBy, stage, reason string, qty int) {
+	fn := e.onDecision
+	if fn == nil {
+		return
+	}
+	// 关键输入缺失要**标出来**而不是留 0——面板上 0 与"没算"是两件事，
+	// 显示成 0.000 会造假读数（前端 B5 用例为此把缺项改渲染 —）。
+	missing := ""
+	if e.sizingCtx.MarketScale <= 0 {
+		missing = "market_scale"
+	}
+	if e.sizingCtx.MissingKey {
+		if missing != "" {
+			missing += ","
+		}
+		missing += "market_key_input"
+	}
+	fn(DecisionRecord{
+		Day:             cntime.DayCompactOf(cntime.Now()),
+		At:              cntime.Now(),
+		Code:            code,
+		Strategy:        poolKey,
+		Stage:           stage,
+		MarketScale:     e.sizingCtx.MarketScale,
+		PerTradePct:     perTradePct,
+		Total:           base,
+		Cash:            cash,
+		Target:          base * targetRatio,
+		CurStrat:        curStrat,
+		Room:            room,
+		CappedBy:        cappedBy,
+		Reason:          reason,
+		MissingKeyInput: missing,
+		Qty:             qty,
+		Notional:        float64(qty) * price,
+	})
 }
 
 // paperSizingCtx engine 每轮注入的定权上下文（见 Engine.sizingCtx）。

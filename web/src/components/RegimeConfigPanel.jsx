@@ -257,6 +257,10 @@ function tEffectiveToPatch(base, form) {
     ['intraday_sell_cap_total_pct', 'tSellCapTotal', (f) => f.tSellCapTotal],
     ['stop_guard_pct', 'tStopGuard', (f) => f.tStopGuard],
     ['loss_breaker_pct', 'tLossBreaker', (f) => f.tLossBreaker],
+    // §W-06-R4 / §W-09 三个新键（round_stop_pct / vol_ratio_max / regime_gate_enabled）。
+    ['round_stop_pct', 'tRoundStop', (f) => f.tRoundStop],
+    ['vol_ratio_max', 'tVolRatioMax', (f) => f.tVolRatioMax],
+    ['regime_gate_enabled', 'tRegimeGate', (f) => !!f.tRegimeGate],
     ['min_amount_wan', 'tMinAmount', (f) => f.tMinAmount],
     ['min_turnover_pct', 'tMinTurnover', (f) => f.tMinTurnover],
     ['min_listed_days', 'tMinListed', (f) => f.tMinListed],
@@ -416,6 +420,13 @@ export default function RegimeConfigPanel() {
         tSellCapTotal: num((sz.t || {}).intraday_sell_cap_total_pct, 20),
         tStopGuard: num((sz.t || {}).stop_guard_pct, 1.5),
         tLossBreaker: num((sz.t || {}).loss_breaker_pct, 3.0),
+        // §W-06-R4：本笔 T 止损（价差率%）。默认 2.0 的理由是**赔率**——min_spread_pct 也是 2.0，
+        // 一笔好 T 赚 2.0、一笔坏 T 亏 2.5 的赔率是 1:1.25，打平需胜率 55.6%（长期负期望）。
+        tRoundStop: num((sz.t || {}).round_stop_pct, 2.0),
+        // §W-09：放量门。0 合法＝不设该条（后端 TVolRatioMaxOf 专门留了这个语义）。
+        tVolRatioMax: num((sz.t || {}).vol_ratio_max, 1.8),
+        // §W-09：T 行情门总开关，默认**开**（nil⇒true，后端用 *bool 表达"没配"与"配了 false"）。
+        tRegimeGate: (sz.t || {}).regime_gate_enabled !== false,
         tMinAmount: signedNum((sz.t || {}).min_amount_wan, 3000),
         tMinTurnover: signedNum((sz.t || {}).min_turnover_pct, 1.5),
         tMinListed: signedNum((sz.t || {}).min_listed_days, 60),
@@ -610,6 +621,9 @@ export default function RegimeConfigPanel() {
     tPos('当日反T卖腿市值帽%', f.tSellCapTotal, 5, 50)
     tPos('反T否决门距离%', f.tStopGuard, 0.5, 5)
     tPos('买回熔断阈值%', f.tLossBreaker, 1, 10)
+    tPos('本笔T止损%', f.tRoundStop, 0.5, 5)
+    // 量比门允许 0（＝不设该条），所以不走 tPos 的正数假设。
+    if (Number(f.tVolRatioMax) !== 0) tPos('放量门量比', f.tVolRatioMax, 1, 6)
     tPos('分时均线校验容差%', f.tVwapTol, 0.05, 1)
     // 三个"0 合法（＝不设该条）"的流动性门与大盘急跌停门用允许 0/负值的判据，不走 tPos 的正数假设。
     tPos('流动性成交额下限(万)', f.tMinAmount, 0, 1000000)
@@ -1110,7 +1124,25 @@ export default function RegimeConfigPanel() {
               <NumRow label="大盘急跌停正 T（%）" hint="默认 -2.0：大盘跌到该幅度当天不开买腿；填 0＝不设该门" value={form.tPlunge} min={-10} max={0} step={0.1} onChange={(v) => set({ tPlunge: v })} />
               <NumRow label="当日反 T 卖腿市值帽（%）" hint="默认 20，分母是 min(总资产, 持仓市值)（五轮 T5-2 改的口径）" value={form.tSellCapTotal} min={5} max={50} step={1} onChange={(v) => set({ tSellCapTotal: v })} />
               <NumRow label="反 T 否决门距离（%）" hint="默认 1.5：距止盈/止损线小于该幅度就不做高抛（让位给信号执行）" value={form.tStopGuard} min={0.5} max={5} step={0.1} onChange={(v) => set({ tStopGuard: v })} />
-              <NumRow label="买回熔断阈值（%）" hint="默认 3.0：反 T 卖飞了这么多就熔断买回通道，转战略减仓并告警（下限 1，不许设成 0＝永不熔断）" value={form.tLossBreaker} min={1} max={10} step={0.1} onChange={(v) => set({ tLossBreaker: v })} />
+              {/* §W-06-R4：旧键已并入「本笔 T 止损」，判定侧不再读它。
+                  输入框 disabled + hint 写明"已并入"——不给 disable 就是留一个"改了没反应"的坑，
+                  那比直接删掉更糟（用户以为自己在调止损）。 */}
+              <NumRow disabled label="买回熔断阈值（%）——已并入「本笔 T 止损」，此键仅兼容历史配置"
+                hint="默认 3.0（历史值）。2026-10-29 起判定侧统一读 round_stop_pct（2.0，价差率口径）；本键保留只为老配置反序列化不丢字段，改它不再影响任何判定"
+                value={form.tLossBreaker} min={1} max={10} step={0.1} onChange={(v) => set({ tLossBreaker: v })} />
+              <NumRow label="本笔 T 止损（价差率%，不含费用）"
+                hint="默认 2.0：这一笔的价差率跌破 −2.0% 就跳过价差门立即配平（尾盘买回熔断也读它）。口径是**纯价差**，真实到手还要再减约 0.05~0.1% 的费用；定 2.0 而不是 2.5 是为了赔率——min_spread_pct 也是 2.0，赚 2.0 亏 2.5 的赔率要 55.6% 胜率才打平"
+                value={form.tRoundStop} min={0.5} max={5} step={0.1} onChange={(v) => set({ tRoundStop: v })} />
+              <NumRow label="放量门：折算量比上限"
+                hint="默认 1.8（本仓既有分档的「显著放量」线；1.2 会把温和放量也拦掉，盘整市里大半时间开不了腿）。填 0＝不设该条。量比按已流逝交易分钟折算全天，早盘也能测出放量"
+                value={form.tVolRatioMax} min={0} max={6} step={0.1} onChange={(v) => set({ tVolRatioMax: v })} />
+              <ToggleSw label="T 行情门（牛/熊关闭做 T）" checked={!!form.tRegimeGate}
+                onChange={(v) => set({ tRegimeGate: !!v })} />
+              <div style={hintStyle}>
+                行情门默认**开**：只认盘整（range）行情，牛/熊一律不开新腿，已开的腿立即配平回到开腿前。
+                它与「市场状态机」那个全局开关是两件事——后者一开会让全账户仓位乘 state_scales（震荡 ×0.70、熊 ×0.40），
+                所以 T 用自己的开关，不动那个。读数超过 15 分钟没更新时本门**弃权**（不会静默把 T 关掉）。
+              </div>
               <NumRow label="流动性：成交额下限（万元）" hint={`默认 3000；填 0＝不设该条。读数拿不到按「不过」处理`} value={form.tMinAmount} min={0} max={1000000} step={100} precision={0} onChange={(v) => set({ tMinAmount: v })} />
               <NumRow label="流动性：换手率下限（%）" hint="默认 1.5；填 0＝不设该条" value={form.tMinTurnover} min={0} max={25} step={0.1} onChange={(v) => set({ tMinTurnover: v })} />
               <NumRow label="流动性：上市天数下限" hint="默认 60；填 0＝不设该条（次新日内波动不具可比性）" value={form.tMinListed} min={0} max={3650} step={1} precision={0} onChange={(v) => set({ tMinListed: v })} />

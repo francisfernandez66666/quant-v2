@@ -109,8 +109,12 @@ func Open(dbPath string) (*DB, error) {
 }
 
 // schemaVersion 当前 schema 版本（迁移全部幂等加列，版本号用于读侧自证与防旧二进制开新库）。
-// 每次新增不可逆/语义变更的迁移时递增。English: bump on incompatible/semantic migrations.
-const schemaVersion = 1
+//
+// 规则（§W-05，2026-10-29）：**每次新增列/表/或语义变更必须 +1；只加索引不加。**
+// 从 1 起一直没动过而迁移一直在加列 ⇒ "拒绝旧代码开新库"这道守卫此前从未生效
+// （旧二进制 + 新 schema 静默共存）。2 = 本批（T 回合新增 regime/vol/stop 字段的语义位）。
+// English: bump on incompatible/semantic migrations (new column/table/semantics); index-only changes do not bump.
+const schemaVersion = 2
 
 // ensureSchemaVersion 读 PRAGMA user_version：旧库抬到当前；新库直接拒绝。
 func (d *DB) ensureSchemaVersion() error {
@@ -126,6 +130,16 @@ func (d *DB) ensureSchemaVersion() error {
 	}
 	if _, err := d.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return fmt.Errorf("store schema version set: %w", err)
+	}
+	// §W-05 自检：写完必须读回等于当前版本。放在这里而不是 migrate() 末尾——调用顺序是
+	// migrate() → ensureOrderCancelColumns() → 本函数，migrate 结束时版本号还没写，放那儿必然误报。
+	// 这条挡的是"PRAGMA 静默没生效"（只读库/被包装的驱动），那会让下一轮又当老库重跑迁移。
+	var after int
+	if err := d.db.QueryRow(`PRAGMA user_version`).Scan(&after); err != nil {
+		return fmt.Errorf("store schema version verify: %w", err)
+	}
+	if after != schemaVersion {
+		return fmt.Errorf("store schema version 写入未生效：期望 %d 实得 %d", schemaVersion, after)
 	}
 	return nil
 }

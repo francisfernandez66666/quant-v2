@@ -134,7 +134,7 @@ func (t *WaveTracker) Eval(code string, md *strategy_engine.StockMarketData) (le
 		// English: P2#26 — time-normalize the intraday cumulative volume to a full-day equivalent before
 		// comparing with the daily average; otherwise a morning breakout's volume ratio is diluted ~5x
 		// and the 一突 signal is wrongly killed early in the session.
-		volRatio = intradayVolumeRatio(time.Now(), md.Quote.Volume, avgDailyVol)
+		volRatio = IntradayVolumeRatio(time.Now(), md.Quote.Volume, avgDailyVol)
 	}
 	isFirst := cur > prevHigh*firstBreakPct && cumVol > 0 && volRatio >= firstBreakRatio
 	if isFirst {

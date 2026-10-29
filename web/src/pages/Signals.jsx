@@ -3,7 +3,7 @@
 // 确认买入/忽略操作、模拟买入归池、一键收藏自选、展开分时+盘口。
 // 纯 TDesign React（Card / Table / Tag / Button / Select / Dialog），无自定义 CSS。
 import React, { useState, useEffect, useRef } from 'react'
-import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin, Input } from 'tdesign-react'
+import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin, Input, Tabs } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import MinuteView from '../components/MinuteView.jsx'
@@ -16,6 +16,7 @@ import { on } from '../sseBus.js'
 // swallow window.prompt/confirm/alert, so the paper-buy flow moves to the site-wide dialog idiom.
 import { Loading, confirmDialog } from '../ui.jsx'
 import SignalDecisionsCard from '../components/SignalDecisionsCard.jsx' // §DECISION-TODAY 今日动态仓位计算过程
+import { useSearchParams } from 'react-router-dom' // §W-04 子页签写进 URL，刷新不丢、可分享
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
 const FILTERS = [
@@ -99,6 +100,10 @@ export function sorterNum(key) {
  * @returns {JSX.Element}
  */
 export default function Signals() {
+  // §W-04：与量化页同款——子页签写进 URL，刷新后仍停在「动态仓位」。
+  const [sp, setSp] = useSearchParams()
+  const tab = sp.get('tab') === 'decisions' ? 'decisions' : 'signals'
+  const setTab = (v) => setSp(v === 'decisions' ? { tab: 'decisions' } : {}, { replace: true })
   // 策略信号列表
   const [signals, setSignals] = useState([])
   // 已展开分时图的信号代码集合
@@ -520,6 +525,10 @@ export default function Signals() {
   {/* 页面整体布局：顶部筛选工具栏 + 信号表格 + 移动端底部操作面板 + 确认弹窗 + 日志弹窗 */}
   return (
     <div className="page">
+      {/* §W-04 子页签：宽表「今日动态仓位」原本压在信号表上方，把信号列表挤到首屏之外。
+          destroyOnHide 保证切走即卸载（该卡自带轮询，不在后台偷跑）。 */}
+      <Tabs value={tab} onChange={setTab}>
+        <Tabs.TabPanel value="signals" label="信号列表">
       {/* 工具栏卡片：页面标题 + 等级筛选按钮组 + 战法下拉筛选 + 日志入口 */}
       <Card style={{ marginBottom: 16 }}>
         <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
@@ -557,8 +566,6 @@ export default function Signals() {
         </div>
       )}
 
-      {/* §DECISION-TODAY：今日动态仓位计算过程（因子→目标→额度帽→结果/拒因；含被拦信号） */}
-      <SignalDecisionsCard />
 
       {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板 */}
       <Card>
@@ -587,8 +594,18 @@ export default function Signals() {
           empty={loading ? '加载信号中…' : loadErr ? '信号加载失败，请点上方「重试」' : '暂无信号'}
         />
       </Card>
+        </Tabs.TabPanel>
 
-      {/* 移动端底部操作面板：点击行时弹出，提供买入/模拟买入/忽略/收藏/分时等快捷操作 */}
+        <Tabs.TabPanel value="decisions" label="动态仓位" destroyOnHide>
+          {/* §DECISION-TODAY：今日动态仓位计算过程（因子→目标→额度帽→结果/拒因；含被拦信号）。
+              原在信号列表上方，宽表把列表挤到首屏之外；owner 2026-10-29 要求单独开一个子页。 */}
+          <SignalDecisionsCard />
+        </Tabs.TabPanel>
+      </Tabs>
+
+      {/* 移动端底部操作面板：点击行时弹出，提供买入/模拟买入/忽略/收藏/分时等快捷操作。
+          §W-04：面板与两个 Dialog 留在 Tabs **外层**——它们不属于任何一页，
+          跟着页面生命周期走（切页签时买入弹窗不该被卸载）。 */}
       {sheetSignal && (
         <div style={{
           position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(0,0,0,0.6)',

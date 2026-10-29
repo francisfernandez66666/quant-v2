@@ -192,6 +192,25 @@ type TParams struct {
 	// ── 否决与熔断（§8.4.2/§8.5.2）──
 	StopGuardPct   float64 // 距止盈/止损线小于该值 ⇒ 否决反 T
 	LossBreakerPct float64 // 亏损超过该值 ⇒ 封买回通道
+	// RoundStopPct 本笔 T 止损（**价差率 %，不含费用**）。§W-06-R4 新增，全系统唯一的止损口径：
+	// 盘中 accelReason 的 "stop" 触发源与尾盘买回许可（allowBuyBack 同款）都读它。
+	// Deprecated 的是上面那个 LossBreakerPct —— 字段保留只为兼容历史配置与前端表单，
+	// 判定侧一个字都不许再引用它（门禁 #26 按"判定表达式"计数，注释里也别写出那个写法）。
+	RoundStopPct float64
+	// ── §W-09 行情门（形态 + 量能；实盘与纸面共用同一组字段与文案）──
+	// VolRatioMax 放量门阈值：折算量比 ≥ 该值 ⇒ 不做该票的 T。**0 合法＝不设该条**。
+	VolRatioMax float64
+	// VolRatio 折算量比读数（nil=无源 ⇒ 按"读不到"处理，不按"没放量"放行）。
+	VolRatio func(code string) (float64, bool)
+	// MarketState bull/range/bear；""=T 行情门已关或读数从未产生 ⇒ **弃权**（不是拦）。
+	// 与 MarketScale 是两回事：MS 是"该买多少"的定权标量，表达不了"盘整还是趋势"。
+	MarketState string
+	// MarketStateAt 该读数的时刻（零值=从未写过）⇒ 新鲜度门用，过期按弃权处理。
+	MarketStateAt time.Time
+	// MarketStateVotes/Total 研判票数，**只进日志不做门**：票数不足时状态机已把结论降级成 range
+	// （research/market_state.go），而 range 正是放行档 ⇒ 再拦一次等于把放行又收回去。
+	MarketStateVotes      int
+	MarketStateVotesTotal int
 	// ── 流动性前置（§8.4.4b）──
 	MinAmountWan   float64
 	MinTurnoverPct float64
@@ -272,6 +291,16 @@ func (e *Engine) runIntradayTLocked(quotes map[string]*data.StockInfo, p TParams
 
 	// step1：状态收敛。有 open 腿的票本轮只处理这条腿，处理完结束（绝不叠腿）。
 	for _, code := range e.tOpenCodesLocked() {
+		// §W-06-R4 P3：与实盘 premiseGone 同判据（熔断日反 T 只能转战略减仓）。
+		// 纸面守卫比实盘少两条（在途委托 / 腿龄）：纸面是同步撮合、没有委托在途态，
+		// 且 paper.TRound 没有 OpenedAt —— 不存在"异步回报导致价格基准陈旧"。
+		if state, why := e.premiseGoneLocked(code, p); state != "" {
+			r := e.openTRoundFor(code)
+			if r != nil {
+				e.finishTRoundLocked(r, state, 0, 0, 0, why, now, 0)
+			}
+			continue
+		}
 		e.pairTRoundLocked(code, quotes, p, e.tForceReached(now, p.ForceUnwindHM), now)
 	}
 	// 尾盘判定时刻之后**不再开新腿**（旧实现是"尾盘只收摊"，但配平时刻与停开时刻是两个概念：
@@ -527,20 +556,41 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 
 	if r.Leg == tRLegBuy {
 		need := r.LegQty
+		// §W-06-R4 加速配平：与实盘同一出口（三个触发源共用），accelTag 落原因与日志。
+		accelTag := ""
 		fav := (price - r.LegPrice) / r.LegPrice * 100
-		if !force && fav < p.MinSpreadPct {
-			return // 价差没到：继续等（不追高卖）
+		if !force {
+			if accel := e.accelReasonLocked(r, price, p); accel == "" {
+				if fav < p.MinSpreadPct {
+					return // 价差没到：继续等（不追高卖）
+				}
+			} else {
+				accelTag = accel
+			}
 		}
 		sellable := e.sellableQtyLocked(pos, now)
 		if sellable < need {
 			if force {
 				e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0,
 					fmt.Sprintf("尾盘强制配平失败：可卖%d<需卖%d，机动仓将隔夜", sellable, need), now, 0)
+				return
+			}
+			// 裁决 A：加速路径失败即收摊（语义是"不能再等"），非加速路径保持既有行为
+			// （保持 open、下一轮再试）一个字不动。
+			if accelTag != "" {
+				e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0,
+					fmt.Sprintf("加速配平失败（accel=%s）：可卖%d<需卖%d ⇒ 收摊不追（机动仓隔夜）",
+						accelTag, sellable, need), now, 0)
 			}
 			return
 		}
 		sold, err := e.sellQtyLocked(pos, price, need, tRStrategies+" 正T卖出腿 "+r.ID)
 		if err != nil {
+			if accelTag != "" {
+				e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0,
+					"加速配平失败（accel="+accelTag+"）：配对卖腿被拒："+err.Error(), now, 0)
+				return
+			}
 			log.Printf("[paper] §T-MODE 正T卖出腿被拒 %s: %v（回转保持 open，下一轮再试）", code, err)
 			return
 		}
@@ -559,14 +609,24 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 	// 反 T：第一腿已卖出，第二腿是买回。
 	fav := (r.LegPrice - price) / r.LegPrice * 100
 	need := r.LegQty
+	// §W-06-R4：与正 T 同一出口；反 T 的两处失败本来就无条件收摊，这里只补加速标签便于复盘分组。
+	accelRT := ""
 	if force {
-		lossPct := (price - r.LegPrice) / r.LegPrice * 100 // 正数＝买回更贵＝这轮是亏的
-		if p.LossBreakerPct > 0 && lossPct > p.LossBreakerPct {
+		// §W-06-R4：与实盘 allowBuyBack 换成**同一个口径**（整笔价差率 + round_stop_pct）。
+		// 旧口径是单腿价差率 + loss_breaker_pct(3.0)；两侧必须同批换，否则纸面与实盘的
+		// converted/done 分布不可比，灰度期唯一的对照物就废了。
+		pct, _, okSpread := tRoundSpreadPct(r, price)
+		if !okSpread {
 			e.finishTRoundLocked(r, tRStateConvert, 0, 0, 0,
-				fmt.Sprintf("买回熔断：亏损 %.2f%% > 阈值 %.2f%% ⇒ 封买回通道，转战略减仓并告警",
-					lossPct, p.LossBreakerPct), now, 0)
-			log.Printf("[paper] §T-MODE t-buyback-breaker 熔断 %s(%s) 卖%.2f 现%.2f 亏%.2f%% 阈值%.2f%%",
-				r.Code, r.Name, r.LegPrice, price, lossPct, p.LossBreakerPct)
+				"买回熔断判定不可得：本笔价差率算不出（首腿未成交/本金为 0）⇒ 封买回通道，转战略减仓", now, 0)
+			return
+		}
+		if p.RoundStopPct > 0 && pct <= -p.RoundStopPct {
+			e.finishTRoundLocked(r, tRStateConvert, 0, 0, 0,
+				fmt.Sprintf("买回熔断：价差率 %.2f%% ≤ −%.2f%% ⇒ 封买回通道，转战略减仓并告警",
+					pct, p.RoundStopPct), now, 0)
+			log.Printf("[paper] §T-MODE t-buyback-breaker 熔断 %s(%s) 价差率%.2f%% 阈值-%.2f%%",
+				r.Code, r.Name, pct, p.RoundStopPct)
 			return
 		}
 		sigID, hasSig := "", false
@@ -602,8 +662,14 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 			return
 		}
 		r.UsedSignalID = sigID
-	} else if fav < p.MinSpreadPct {
-		return // 盘中配对只看价差
+	} else {
+		if accel := e.accelReasonLocked(r, price, p); accel == "" {
+			if fav < p.MinSpreadPct {
+				return // 盘中配对只看价差
+			}
+		} else {
+			accelRT = accel
+		}
 	}
 	if err := e.addToPositionLocked(pos, pos.Code, pos.Name, pos.Strategy, price, price, need,
 		tRStrategies+" 反T买回腿 "+r.ID); err != nil {
@@ -611,7 +677,7 @@ func (e *Engine) pairTRoundLocked(code string, quotes map[string]*data.StockInfo
 			StrategyType: pos.StrategyType, Side: "buy", Kind: "反T买回", Price: price, Qty: need,
 			Status: "rejected", Reason: "买回被拦，按战略减仓收摊: " + err.Error(), CreatedAt: now})
 		e.finishTRoundLocked(r, tRStateUnwound, 0, 0, 0,
-			"买回被拦，按战略减仓收摊（不追买）: "+err.Error(), now, 0)
+			"买回被拦，按战略减仓收摊（不追买）: "+err.Error()+tPaperAccelSuffix(accelRT), now, 0)
 		return
 	}
 	fill := price
@@ -826,8 +892,19 @@ func (e *Engine) tOpenBlockReason(code string, quotes map[string]*data.StockInfo
 	if buyDir && p.MarketPlungePct < 0 && p.IndexChangePct <= p.MarketPlungePct {
 		return fmt.Sprintf("step0 大盘急跌 %.2f%% ≤ %.2f%%，停正T", p.IndexChangePct, p.MarketPlungePct)
 	}
+	// §W-09 形态门：与实盘 regimeBlock 同口径、同位置（环境类判定之后、流动性之前）。
+	// 只判**入口**（不开新腿）；出口（在途腿加速配平）在 accelReasonLocked。
+	if why := e.tRegimeBlockReason(p, now); why != "" {
+		return "step0 " + why
+	}
 	if why := e.tLiquidityBlock(code, q, p); why != "" {
 		return "step0.5 " + why
+	}
+	// §W-09 量能门：位置与实盘 openPlan 的 step0.6 对齐（流动性前置之后、限次之前）。
+	// 文案与 step 标签逐字一致——两边都是"这只票今天适不适合做 T"，不一致就会在复盘时
+	// 出现同一个原因两种说法（§127 的字面量一致纪律）。
+	if why := e.tVolumeBlock(code, p); why != "" {
+		return "step0.6 " + why
 	}
 	if p.MaxRounds > 0 && e.tRoundsUsedLocked(code, day) >= p.MaxRounds {
 		return fmt.Sprintf("step2 单码当日回转次数已满(%d/%d)", e.tRoundsUsedLocked(code, day), p.MaxRounds)
@@ -1479,3 +1556,150 @@ func (e *Engine) TRoundDay(day string) TRoundDayStats {
 	st.Cost.ParticipationPctMax = round4(st.Cost.ParticipationPctMax)
 	return st
 }
+
+// ── §W-06-R4 / §W-09 纸面侧：与实盘**同口径**，不另立一套 ────────────────────────
+//
+// 纸面不是"简化版实盘"，它是灰度期唯一能回答"按这套规则跑会怎样"的对照物。
+// 两侧终态分布一旦不可比，标定（B1/B2/B3）就失去意义——这不是统计口径问题，是证据失效。
+
+// tRoundSpreadPct 与实盘 roundSpreadPctNow **同式**：价差=(卖额−买额)/首腿成交额×100。
+// 纸面 LegQty 是首腿成交量、PairQty 是第二腿已成交量（open 态下为 0 ⇒ 全部按现价折算）。
+// 同样**不含费用**（费用模型是 fillPnl 的事）。
+func tRoundSpreadPct(r *TRound, price float64) (pct, notional float64, ok bool) {
+	if r == nil || price <= 0 || r.LegQty <= 0 || r.LegPrice <= 0 {
+		return 0, 0, false
+	}
+	matched := r.PairQty
+	if matched > r.LegQty {
+		matched = r.LegQty
+	}
+	var buyAmt, sellAmt float64
+	if r.Leg == tRLegBuy {
+		buyAmt = r.LegPrice * float64(r.LegQty)
+		sellAmt = r.PairPrice*float64(matched) + price*float64(r.LegQty-matched)
+		notional = buyAmt
+	} else {
+		sellAmt = r.LegPrice * float64(r.LegQty)
+		buyAmt = r.PairPrice*float64(matched) + price*float64(r.LegQty-matched)
+		notional = sellAmt
+	}
+	if notional <= 0 {
+		return 0, 0, false
+	}
+	return (sellAmt - buyAmt) / notional * 100, notional, true
+}
+
+// tPaperAccelSuffix 失败原因里的加速标签（空标签⇒空串，非加速路径文案逐字不变）。
+func tPaperAccelSuffix(tag string) string {
+	if tag == "" {
+		return ""
+	}
+	return "（accel=" + tag + "）"
+}
+
+// accelReasonLocked 纸面侧的三个触发源，判据与实盘 accelReason **逐条对应**：
+// "stop"（价差率 ≤ −round_stop_pct）/ "verdict"（有活跃卖出裁决）/ "regime"（离开 range）。
+//
+// 比实盘**少一个腿龄门**：纸面 LegPrice 就是成交价，不存在"异步回报导致价格基准陈旧"，
+// 而且 paper.TRound 没有 OpenedAt 字段，硬加一个还会动 /api/paper/t-rounds 的返回体。
+// 这不是漏写——漏了腿龄门在纸面没有任何可防守的风险。
+func (e *Engine) accelReasonLocked(r *TRound, price float64, p TParams) string {
+	if r == nil {
+		return ""
+	}
+	if p.RoundStopPct > 0 {
+		if pct, _, ok := tRoundSpreadPct(r, price); ok && pct <= -p.RoundStopPct {
+			return "stop"
+		}
+	}
+	if p.ActiveSellVerdict != nil && p.ActiveSellVerdict(r.Code) {
+		return "verdict"
+	}
+	if p.MarketState != "" && !p.MarketStateAt.IsZero() &&
+		time.Since(p.MarketStateAt) <= tPaperRegimeStale {
+		if p.MarketState == "bull" || p.MarketState == "bear" {
+			return "regime"
+		}
+	}
+	return ""
+}
+
+// tPaperRegimeStale 与实盘 tRegimeStale 同值（15 分钟）：主循环分钟级，
+// 15 分钟没更新就是"停了"而不是抖动；出口误触发是真金白银的成交，宁可弃权。
+const tPaperRegimeStale = 15 * time.Minute
+
+// premiseGoneLocked 纸面侧"必须改终态"的判定（§W-06-R4 v3）。判据与实盘**同口径**，
+// 同样**只剩 P3**：stop/verdict/regime 三个触发源都是"提前配平"，落在 accelReasonLocked。
+// 写进这里就退化成"结掉不管"——熊市里结掉正 T 腿＝不卖底仓＝敞口变大，方向反。
+func (e *Engine) premiseGoneLocked(code string, p TParams) (state, why string) {
+	r := e.openTRoundFor(code)
+	if r == nil || r.Leg != tRLegSell || r.LegQty <= 0 {
+		return "", ""
+	}
+	if p.MarketPlungePct < 0 && p.IndexChangePct <= p.MarketPlungePct {
+		// 纸面没有"熔断日"这个账户级判定（dayBlocked 由实盘的日亏闸门给出），
+		// 用大盘急跌这个**同向**读数兜底：两者都是"回补通道被关"。
+		// 与实盘 P3 一样只作用于反 T：正 T 提前结掉＝不卖底仓＝敞口更大。
+		return tRStateUnwound, fmt.Sprintf(
+			"盘中收摊：大盘急跌 %.2f%% ≤ %.2f%% ⇒ 反T卖腿转战略减仓（与实盘熔断日 P3 同向）",
+			p.IndexChangePct, p.MarketPlungePct)
+	}
+	return "", ""
+}
+
+// tVolumeBlock 纸面侧量能门（§W-09）。判据与文案与实盘 volumeBlock **逐字一致**
+// （§127 字面量一致纪律），包括"读数不可得按不过"这一条。
+func (e *Engine) tVolumeBlock(code string, p TParams) string {
+	if p.VolRatioMax <= 0 {
+		return "" // 0 合法＝不设该条
+	}
+	if p.VolRatio == nil {
+		return "量比读数无源（未接 VolRatio），按不过处理"
+	}
+	ratio, ok := p.VolRatio(code)
+	if !ok || ratio <= 0 {
+		return "量比读数不可得，按不过处理"
+	}
+	if ratio >= p.VolRatioMax {
+		return fmt.Sprintf("放量：折算量比 %.2f ≥ %.2f（放量行情不做 T）", ratio, p.VolRatioMax)
+	}
+	return ""
+}
+
+// tRegimeBlockReason 纸面侧形态门（§W-09）。与实盘 regimeBlock 同口径：
+// range 放行（票数不足只记日志）、bull/bear 关闭、空串弃权、未知值 fail-closed。
+//
+// 返回值是"原因"（非空＝拦），与实盘 regimeBlock 的返回语义一致，便于两侧共用断言常量。
+func (e *Engine) tRegimeBlockReason(p TParams, now time.Time) string {
+	st := p.MarketState
+	if st != "" && (p.MarketStateAt.IsZero() || now.Sub(p.MarketStateAt) > tPaperRegimeStale) {
+		e.tNoteBlockLocked("step0", fmt.Sprintf(
+			"行情门弃权：市场状态读数过期（%q，%.0f 分钟前，票 %d/%d）——主循环可能已停",
+			st, now.Sub(p.MarketStateAt).Minutes(), p.MarketStateVotes, p.MarketStateVotesTotal), "")
+		return ""
+	}
+	switch st {
+	case "range":
+		// 与实盘同：票数不足时状态机已降级成 range（放行档），放行结论不变但**必须留一行**，
+		// 否则复盘分不清"真震荡"和"票太少"。零票单独一条（兜底 range 更不可信也更安静）。
+		switch {
+		case p.MarketStateVotes == 0:
+			e.tNoteBlockLocked("step0", "行情门放行（**零票**：状态机无任何有效输入 ⇒ 兜底 range，不是真震荡）——先查数据源", "")
+		case p.MarketStateVotes < tPaperRegimeMinVotes:
+			e.tNoteBlockLocked("step0", fmt.Sprintf(
+				"行情门放行（研判质量不足：票 %d/%d < %d ⇒ 状态机已降级为 range，非真震荡）",
+				p.MarketStateVotes, p.MarketStateVotesTotal, tPaperRegimeMinVotes), "")
+		}
+		return ""
+	case "bull", "bear":
+		return fmt.Sprintf("行情门：市场状态=%s，非盘整行情不做 T", st)
+	case "":
+		e.tNoteBlockLocked("step0", "行情门弃权：T 行情门已关（t.regime_gate_enabled=false）或读数从未产生，牛熊关闭 T 未生效", "")
+		return ""
+	default:
+		return fmt.Sprintf("行情门：未知市场状态 %q，按不做 T 处理（fail-closed）", st)
+	}
+}
+
+// tPaperRegimeMinVotes 与实盘 tRegimeMinVotes 同值（= research 状态机的 MinVotes 默认 4）。
+const tPaperRegimeMinVotes = 4
