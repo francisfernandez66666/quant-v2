@@ -91,6 +91,14 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 	}
 	exec := trading.NewQMTClient(srv.URL, "", 2*time.Second, 0)
 	ctrl := trading.NewController(exec, db, "u_1", cfg, nil)
+	// §FIX-20261028-F15⑩（2026-10-29）：**把时钟钉到非窗口时刻（当日 10:30）**。
+	// 缺陷本体：这些自动卖出用例走真实 time.Now()，而 §CANCEL-STATE 的时段闸会在
+	// 09:20–09:30 / 14:52–15:00 直接拒绝新委托 ⇒ 每天这两个窗口内跑全量 go test 必假红
+	// （实测 09:28 四条 AutoExecuteRealSells* 全红、09:32 全绿，代码未改）。
+	// 只固定时分、保留当日日期：day-keyed 的幂等键与结算口径不受影响。
+	_now := time.Now()
+	_fixed := time.Date(_now.Year(), _now.Month(), _now.Day(), 10, 30, 0, 0, _now.Location())
+	ctrl.SetNow(func() time.Time { return _fixed })
 	e := &Engine{}
 	e.SetQMT(ctrl, db)
 	// §DYN-GLOBAL（2026-10-24 owner 裁决一）把出厂默认抬成 dynamic 之后，本 harness 必须显式
