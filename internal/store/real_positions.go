@@ -1435,12 +1435,31 @@ func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string)
 	if status != cur && !orderStatusAdvance(cur, status) {
 		return nil // 低秩回报晚到（已成/部成后被晚到的"已报"回填）：绝不回退真实进度
 	}
+	// §ORDER-STATE-PULL（2026-10-30）：状态与委托号**分两步写**。
+	// 旧实现是单条 `UPDATE ... SET order_id=?, status=?`，而 order_id 是主键：
+	// 跨日委托号复用时整条失败——状态跟着一起丢，行停在 "pend:"+已报，
+	// 后续会被当"没发出去"重发（重复真实敞口）。现在先落状态，再尽力升级号。
 	if userID == "" {
-		_, err = d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=''`, orderID, status, signalID)
+		_, err = d.db.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=''`, status, signalID)
 	} else {
-		_, err = d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=?`, orderID, status, signalID, userID)
+		_, err = d.db.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=?`, status, signalID, userID)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if userID == "" {
+		_, err = d.db.Exec(`UPDATE orders SET order_id=? WHERE signal_id=? AND user_id=''`, orderID, signalID)
+	} else {
+		_, err = d.db.Exec(`UPDATE orders SET order_id=? WHERE signal_id=? AND user_id=?`, orderID, signalID, userID)
+	}
+	if err != nil {
+		// 号撞主键（历史行占用）：状态已落库，这里只告警、不再上抛——
+		// 上抛会让调用方以为整条回填失败，而事实是"状态已正确、只是引用没升级"。
+		log.Printf("[store] §ORDER-STATE-PULL 回填委托号失败 signal=%s order=%s（状态 %s 已落库）: %v",
+			signalID, orderID, status, err)
+		return nil
+	}
+	return nil
 }
 
 // MarkRealOrderSendFailed §GAP2-W1 占位行降级：下单请求发送失败（网关超时/5xx/断连）时把占位行
@@ -1507,7 +1526,7 @@ func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
 	// matcher as SumFilledQty — a counter-truncated fill id used to read as "never filled", which
 	// re-sent a real order that had already partially executed.
 	// （谓词由 fillSignalMatchSQL 现算，不再是编译期常量；仍在本函数内一次求值、两条语句共用。）
-	eligibleWhere := `signal_id=? AND user_id=? AND (status='发送失败'
+	eligibleWhere := `signal_id=? AND user_id=? AND COALESCE(retry_blocked,0)=0 AND (status='发送失败'
 		OR (status='已撤' AND NOT EXISTS (
 			SELECT 1 FROM fills f WHERE f.user_id=orders.user_id AND ` +
 		fillSignalMatchSQL("f.signal_id", "f.traded_at", "orders.signal_id") + "))) "
@@ -1678,6 +1697,115 @@ func orderStatusAdvance(cur, next string) bool {
 		return false
 	}
 	return orderStatusRank(next) > orderStatusRank(cur)
+}
+
+// ensureOrderRetryBlockColumn §ORDER-STATE-PULL（2026-10-30）：orders 补重发禁令列（幂等）。
+// 与撤单留痕同姿势：列在 Open 时补齐，任何写路径都不必自己建列。
+func (d *DB) ensureOrderRetryBlockColumn() error {
+	has, err := d.hasColumn("orders", "retry_blocked")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := d.db.Exec(`ALTER TABLE orders ADD COLUMN retry_blocked INTEGER DEFAULT 0`); err != nil {
+		return fmt.Errorf("store migrate orders add retry_blocked: %w", err)
+	}
+	return nil
+}
+
+// IsTerminalOrderStatus 该状态是否为终态（与 orderStatusRank 同一份口径）。
+func IsTerminalOrderStatus(status string) bool { return orderStatusRank(status) == 6 }
+
+// RealOrderStatusForUser 读某 signal_id 的本地状态；行不存在返回空串（不是错误）。
+func (d *DB) RealOrderStatusForUser(userID, signalID string) (string, error) {
+	var st string
+	var err error
+	if userID == "" {
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=''`, signalID).Scan(&st)
+	} else {
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=?`, signalID, userID).Scan(&st)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return st, err
+}
+
+// IsOrderRetryBlocked 该 signal_id 当日是否已被禁止重发（网关判定终态后置位）。
+func (d *DB) IsOrderRetryBlocked(userID, signalID string) (bool, error) {
+	var n int
+	var err error
+	if userID == "" {
+		err = d.db.QueryRow(`SELECT COALESCE(retry_blocked,0) FROM orders WHERE signal_id=? AND user_id=''`, signalID).Scan(&n)
+	} else {
+		err = d.db.QueryRow(`SELECT COALESCE(retry_blocked,0) FROM orders WHERE signal_id=? AND user_id=?`, signalID, userID).Scan(&n)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return n != 0, nil
+}
+
+// FinalizeTerminalSignal §ORDER-STATE-PULL：网关判定「该 signal_id 已终态」后的本地收口。
+//
+// 两件事必须在同一事务里做完：
+//   - 行落到终态（只在本地还不是终态时写，终态绝不被改写）；
+//   - 置 retry_blocked=1 —— Go 的「零成交已撤可重放」规则会把它再放行，
+//     不置禁令就等于每分钟重发一次、每次都被网关 409 拒（002415 的 09:39 就是这样）。
+//
+// English: finalize a signal the gateway reports as terminal and block same-day re-sends.
+func (d *DB) FinalizeTerminalSignal(userID, signalID, status, reason string) error {
+	if signalID == "" || status == "" {
+		return nil
+	}
+	if err := d.ensureOrderRetryBlockColumn(); err != nil {
+		return err
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var cur string
+	if userID == "" {
+		err = tx.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=''`, signalID).Scan(&cur)
+	} else {
+		err = tx.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=?`, signalID, userID).Scan(&cur)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if cur == "" {
+		return nil // 本地无此单：不凭空造行（对账腿只收敛已有行）
+	}
+	if !IsTerminalOrderStatus(cur) {
+		if userID == "" {
+			_, err = tx.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=''`, status, signalID)
+		} else {
+			_, err = tx.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=?`, status, signalID, userID)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if userID == "" {
+		_, err = tx.Exec(`UPDATE orders SET retry_blocked=1,
+			cancel_reason=CASE WHEN COALESCE(cancel_reason,'')='' THEN ? ELSE cancel_reason END
+			WHERE signal_id=? AND user_id=''`, reason, signalID)
+	} else {
+		_, err = tx.Exec(`UPDATE orders SET retry_blocked=1,
+			cancel_reason=CASE WHEN COALESCE(cancel_reason,'')='' THEN ? ELSE cancel_reason END
+			WHERE signal_id=? AND user_id=?`, reason, signalID, userID)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ensureOrderCancelColumns §CANCEL-STATE（2026-10-28）：orders 补撤单留痕三列（幂等）。

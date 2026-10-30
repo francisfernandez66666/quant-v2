@@ -16,6 +16,7 @@ import (
 	"log" // §0925EVE-W3-E：/admin/status 不可达时的读不到留痕告警
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -151,6 +152,61 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// GatewayOrderState 网关侧一笔当日委托的只读状态（§ORDER-STATE-PULL）。
+// English: read-only view of one of the gateway's same-day orders.
+type GatewayOrderState struct {
+	OrderID   string  `json:"order_id"`
+	SignalID  string  `json:"signal_id"`
+	Code      string  `json:"code"`
+	Side      string  `json:"side"`
+	Status    string  `json:"status"`
+	Price     float64 `json:"price"`
+	Qty       int     `json:"qty"`
+	CreatedAt string  `json:"created_at"`
+}
+
+// OrderStates 拉取网关当日委托状态（§ORDER-STATE-PULL，只读对账源）。
+//
+// 为什么需要它：终态在链路上只有推送一条腿（网关 → outbox → Go），任何一次丢失都会让本地
+// 永久停在在途态，「撤单中」于是无限占用战略额度。这条拉取腿让 Go 能"用事实纠正本地"。
+// day 用 "YYYY-MM-DD"（与 gateway 侧 created_at 前 10 位同口径）。
+func (c *QMTClient) OrderStates(ctx context.Context, day string) ([]GatewayOrderState, error) {
+	var out struct {
+		OK     bool                `json:"ok"`
+		Orders []GatewayOrderState `json:"orders"`
+	}
+	path := "/orders"
+	if day != "" {
+		path += "?day=" + url.QueryEscape(day)
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Orders, nil
+}
+
+// GatewayTerminalRejection §ORDER-STATE-PULL：网关是否明确回了「该 signal_id 已终态」（409 +
+// code=terminal）。与普通 4xx 拒单的区别：终态意味着**这个键今天不能再下单**，
+// 调用方必须保持终态并禁止重发，而不是降级成可重试的「发送失败」。
+// English: distinguishes the gateway's "already terminal" 409 from ordinary rejections.
+func GatewayTerminalRejection(err error) (status string, ok bool) {
+	var he *gatewayHTTPError
+	if !errors.As(err, &he) || he.Status != http.StatusConflict {
+		return "", false
+	}
+	var body struct {
+		Code   string `json:"code"`
+		Status string `json:"status"`
+	}
+	if json.Unmarshal([]byte(he.Body), &body) != nil {
+		return "", false
+	}
+	if body.Code != "terminal" {
+		return "", false
+	}
+	return body.Status, true
 }
 
 // PlaceBuy 买入下单。

@@ -92,6 +92,9 @@ def order_id_rank(oid):
 #      "撤单请求还在飞 → 快照说还在途 → 系统以为没撤 → 再撤一次"的循环）。
 _TERMINAL_STATUSES = ("已成", "已撤", "部撤", "废单", "已废")
 
+# 终态集合的公开别名（gateway.py 的 /order 幂等分支要用它判「这单已经死了」）。
+TERMINAL_STATUSES = _TERMINAL_STATUSES
+
 # §CANCEL-STATE：撤单中（非终态）——撤单请求已发出、交易所尚未确认。
 CANCEL_PENDING_STATUS = "撤单中"
 
@@ -494,40 +497,69 @@ class Store:
 
         §G2 语义：status/price/qty/created_at 随最新事件刷新；order_id 只在「存量是占位
         且新值是真实委托号」时替换一次（pending:→seq:→交易所委托号），真实委托号互不覆盖。
+
+        §ORDER-ID-REUSE（2026-10-30 事故）：QMT 的交易所委托号**跨日会复用**，而本表
+        order_id 是主键、历史行又长期保留，于是「占位号升级为真实号」的 UPDATE 会撞上
+        另一天的旧行主键。旧实现在这里抛 sqlite3.IntegrityError，被 handler.on_order
+        的 except 吞掉——**终态回报整条丢失**（10-30 300502 的「废单」就是这样丢的，
+        Go 侧永久停在「撤单中」，锁死 3.6 万战略额度）。
+        现在的语义：撞键**不是错误**，而是"这个号属于另一笔历史委托"：
+          - 保留本行的占位/旧号（不升级），状态/价/量照常落库并返回成功；
+          - 由上层把事件继续推给决策端——状态这条事实比委托号重要得多。
+        真实券商号仍会写进事件与日志，人工排障能对上（本表暂不额外加列）。
+        English: an order_id collision with an older day's row must not abort the event; keep the
+        placeholder/old reference, persist the status, and let the caller push it downstream.
         """
         # 取 signal_id 与待写入的 order_id（可能是占位串或真实委托号）
         sid = order.get("signal_id", "")
         new_oid = str(order.get("order_id", "") or "")
+        placeholder = "pending:" + sid
         with self._lock:
             # 查现存行：无则插入新订单，有则按等级规则升级 order_id
             row = self._conn.execute(
                 "SELECT * FROM orders WHERE signal_id = ?", (sid,)
             ).fetchone()
             if row is None:
-                self._conn.execute(
-                    """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
-                    # 实参对齐列序 order_id,signal_id,code,side,status,price,qty,
-                    # created_at,user_id：拿不到真实委托号时先写 "pending:<sid>" 占位，
-                    # 后续事件按 order_id_rank 逐级升级（占位 → seq → 交易所号）
-                    (
-                        new_oid or ("pending:" + sid),
-                        sid,
-                        order.get("code", ""),
-                        order.get("side", ""),
-                        order.get("status", ""),
-                        float(order.get("price", 0) or 0),
-                        int(order.get("qty", 0) or 0),
-                        order.get("created_at", ""),
-                        order.get("user_id", ""),
-                    ),
+                ins_sql = """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
+                       VALUES(?,?,?,?,?,?,?,?,?)"""
+                ins_args = (
+                    new_oid or placeholder,
+                    sid,
+                    order.get("code", ""),
+                    order.get("side", ""),
+                    order.get("status", ""),
+                    float(order.get("price", 0) or 0),
+                    int(order.get("qty", 0) or 0),
+                    order.get("created_at", ""),
+                    order.get("user_id", ""),
                 )
+                try:
+                    self._conn.execute(ins_sql, ins_args)
+                except sqlite3.IntegrityError:
+                    # 新信号的「真实号」撞上历史行：降级为占位号落库（状态照落）
+                    if not new_oid or new_oid == placeholder:
+                        raise
+                    log.warning(
+                        "[store] §ORDER-ID-REUSE 新单真实委托号 %s 已被历史行占用（signal=%s），"
+                        "改以占位号落库；状态=%s 照常记录",
+                        new_oid, sid, order.get("status", ""))
+                    self._conn.execute(ins_sql, (placeholder,) + ins_args[1:])
                 self._conn.commit()
                 return True
             # 仅在「新引用等级高于存量（占位→seq→真实号）」时才替换 order_id，真实号互不覆盖
             final_oid = row["order_id"]
             if order_id_rank(new_oid) > order_id_rank(final_oid):
-                final_oid = new_oid
+                # 目标号是否已属于另一笔委托（跨日复用）——是则放弃升级，保留旧引用
+                other = self._conn.execute(
+                    "SELECT signal_id FROM orders WHERE order_id = ?", (new_oid,)
+                ).fetchone()
+                if other is not None and str(other["signal_id"] or "") != sid:
+                    log.warning(
+                        "[store] §ORDER-ID-REUSE 真实委托号 %s 已属于历史委托 signal=%s，"
+                        "本行 signal=%s 保留旧引用 %s；状态=%s 照常推进",
+                        new_oid, other["signal_id"], sid, final_oid, order.get("status", ""))
+                else:
+                    final_oid = new_oid
             # §MANUAL-SYNC：状态同样只升不降（同状态允许刷新价/量）。快照腿每 10s 重放
             # 整本委托表，没有这道守卫时一条迟到/乱序的低阶行会把已成/已撤改回已报。
             # §CANCEL-STATE：reason 一并传入——「撤单中 → 已报/部成」只有显式的
@@ -537,23 +569,71 @@ class Store:
                 log.warning("[store] 委托状态回退已拦截 signal=%s：%s -> %s（保留原状态）",
                             sid, row["status"], new_status)
                 new_status = row["status"]
-            self._conn.execute(
-                """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?, user_id=?
-                   WHERE signal_id=?""",
-                # 实参对齐 SET 顺序：order_id=按等级挑定的最终号，status/price/created_at/
-                # user_id 缺省时回退存量值，qty 为 0 时保留存量（通道未报量≠清零）
-                (
-                    final_oid,
-                    new_status,
-                    float(order.get("price", 0) or row["price"] or 0),
-                    int(order.get("qty", 0) or 0) or row["qty"] or 0,
-                    order.get("created_at", "") or row["created_at"],
-                    order.get("user_id", row["user_id"]),
-                    sid,
-                ),
+            upd_sql = """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?, user_id=?
+                   WHERE signal_id=?"""
+            upd_args = (
+                final_oid,
+                new_status,
+                float(order.get("price", 0) or row["price"] or 0),
+                int(order.get("qty", 0) or 0) or row["qty"] or 0,
+                order.get("created_at", "") or row["created_at"],
+                order.get("user_id", row["user_id"]),
+                sid,
             )
+            try:
+                self._conn.execute(upd_sql, upd_args)
+            except sqlite3.IntegrityError:
+                # 兜底：即便上面的占用检查因并发/历史脏数据漏判，也绝不丢状态——
+                # 回退为「保留原 order_id」再写一次（只更新状态/价/量）。
+                log.warning(
+                    "[store] §ORDER-ID-REUSE 升级 order_id=%s 撞主键（signal=%s），"
+                    "回退为保留 %s 并照常落状态=%s",
+                    final_oid, sid, row["order_id"], new_status)
+                self._conn.execute(upd_sql, (row["order_id"],) + upd_args[1:])
             self._conn.commit()
             return False
+
+    def purge_stale_orders(self, today, terminal_days=3, open_days=10):
+        """清理跨日历史委托行（§ORDER-ID-REUSE 配套，2026-10-30）。
+
+        为什么必须清：order_id 是主键而 QMT 委托号跨日复用，历史行越多、撞键概率越高；
+        今天 300502 就撞上了 9-22 的一条旧行。清理口径按状态分两档：
+          - 终态行：早于 terminal_days 个自然日即可删（它们已无任何收敛/幂等价值）；
+          - 非终态行：早于 open_days 个自然日才删（A 股委托当日失效，10 天前的"已报"
+            必然是僵尸行；留长窗口是为了不误删跨日排查所需的近期证据）。
+        每删一批记一行日志（含条数与日期边界），不逐行刷屏。
+        English: purge cross-day rows — order ids are reused across days, so stale rows turn into
+        primary-key collisions that used to swallow whole status events.
+        """
+        today = str(today or "")[:10]
+        if len(today) != 10:
+            return 0
+        try:
+            base = datetime.strptime(today, "%Y-%m-%d")
+        except ValueError:
+            return 0
+        term_before = (base - timedelta(days=max(0, int(terminal_days)))).strftime("%Y-%m-%d")
+        open_before = (base - timedelta(days=max(0, int(open_days)))).strftime("%Y-%m-%d")
+        removed = 0
+        with self._lock:
+            term_ph = ",".join("?" for _ in _TERMINAL_STATUSES)
+            cur = self._conn.execute(
+                "DELETE FROM orders WHERE substr(created_at,1,10) <> '' "
+                "AND substr(created_at,1,10) < ? AND status IN (%s)" % term_ph,
+                (term_before,) + tuple(_TERMINAL_STATUSES),
+            )
+            removed += int(cur.rowcount or 0)
+            cur2 = self._conn.execute(
+                "DELETE FROM orders WHERE substr(created_at,1,10) <> '' "
+                "AND substr(created_at,1,10) < ? AND status NOT IN (%s)" % term_ph,
+                (open_before,) + tuple(_TERMINAL_STATUSES),
+            )
+            removed += int(cur2.rowcount or 0)
+            self._conn.commit()
+        if removed:
+            log.warning("[store] §ORDER-ID-REUSE 清理历史委托行 %d 条（终态<%s / 在途<%s）",
+                        removed, term_before, open_before)
+        return removed
 
     def order_by_signal(self, signal_id):
         """按 signal_id 查委托（幂等键）。"""

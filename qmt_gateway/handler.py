@@ -532,7 +532,14 @@ class ReportHandler:
                 return
             # §P1-9 落库携带归属账号 ID（多账号隔离）
             ev["user_id"] = self.user_id
-            self.store.upsert_order(ev)
+            # §ORDER-ID-REUSE（2026-10-30）：落库失败**不许拖累转发**。
+            # 旧实现把 upsert_order 和 _push 包在同一个 try 里：一次 UNIQUE 撞键（跨日委托号
+            # 复用）就把整个事件丢弃，终态永远到不了决策端——10-30 300502 的「废单」就是这样
+            # 丢的，Go 停在「撤单中」并无限占用战略额度。状态是资金事实，落库只是本地副本。
+            try:
+                self.store.upsert_order(ev)
+            except Exception:  # noqa: BLE001
+                log.exception("[handler] on_order 落库失败，仍继续上报（状态不得静默丢失）: %s", ev)
             self._push({"type": "order", **ev})
         except Exception:  # noqa: BLE001
             log.exception("[handler] on_order failed, event skipped: %s", ev)

@@ -189,9 +189,13 @@ type Engine struct {
 	sizingCtxCache map[string]sizingCtx
 	// fundsPublishedAt §FUNDS-TODAY 资金帧最近一次发布时刻（按账号，去重 10s）。
 	fundsPublishedAt map[string]time.Time
-	cfgMgr           *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
-	longEnabled      bool            // 利好开关（做多分支）
-	shortEnabled     bool            // 利空开关（做空分支）
+	// fundsLoopOn §FUNDS-TODAY（2026-10-30）资金帧心跳 goroutine 的幂等启动标记（e.mu 保护）。
+	// 为什么要把发布从打分循环里摘出来：单轮 scoreCycle 在行情源降级时可达 4~15 分钟，
+	// 发布点绑在它顶部 ⇒ 资金卡最长 15 分钟不刷新，撤单已释放的资金在页面上仍显示冻结。
+	fundsLoopOn  bool
+	cfgMgr       *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
+	longEnabled  bool            // 利好开关（做多分支）
+	shortEnabled bool            // 利空开关（做空分支）
 
 	m8PeakTotal float64 // §GAP1.2 实盘组合市值峰值（M8 回撤兜底基线；e.mu 保护，平仓后归零重计）
 

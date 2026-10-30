@@ -91,6 +91,11 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// §ORDER-STATE-PULL（2026-10-30）：重发闸列（终态信号的当日重发禁令），与撤单留痕同批补列。
+	if err := d.ensureOrderRetryBlockColumn(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// §SCHEMA-VERSION（2026-10-26，旧审计 F10）：所有迁移都是幂等加列；用 PRAGMA user_version
 	// 给库一个可读版本号。旧库(0)自动抬到当前；未来版本(>current)拒绝启动，避免旧二进制
 	// 对着新 schema 静默跑。English: stamp PRAGMA user_version after idempotent migrations;
@@ -515,6 +520,9 @@ func (d *DB) migrate() error {
 			cancel_requested_at TEXT DEFAULT '',
 			cancel_source TEXT DEFAULT '',
 			cancel_reason TEXT DEFAULT '',
+			-- §ORDER-STATE-PULL（2026-10-30）：当日重发禁令。网关判定该 signal_id 已终态后置 1，
+			-- ResetFailedRealOrder 不再放行，避免"重发→409→再重发"的死循环。
+			retry_blocked INTEGER DEFAULT 0,
 			UNIQUE (user_id, signal_id)
 		)`,
 

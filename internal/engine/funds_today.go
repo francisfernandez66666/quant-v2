@@ -20,6 +20,7 @@
 package engine
 
 import (
+	"context"
 	"math"
 	"time"
 
@@ -118,6 +119,45 @@ func fundsTargetCurRoom(total, ms, ceiling float64,
 		room = target - strat
 	}
 	return target, strat, room, true
+}
+
+// StartFundsLoop §FUNDS-TODAY（2026-10-30）：资金帧的独立 10s 心跳。
+//
+// 为什么必须从打分循环里摘出来：2026-10-30 实测单轮 scoreCycle 在行情源降级/东财熔断时
+// 被拉长到 4~15 分钟，而发布点原本在 scoreCycle 顶部 ⇒ 资金卡上的"可用资金/冻结"最长
+// 十几分钟不刷新；期间券商已撤单释放资金、页面仍显示冻结，操作人据此判断"没释放"。
+// 资金帧只需要账户快照 + 持仓 + 在途委托（三次小查询）和一份行情快照，与打分重活完全无关。
+//
+// 幂等：每个引擎只起一条 goroutine（fundsLoopOn 标记）；10s 去重仍在 publishSignalFunds 内，
+// 与打分轮的发布互不重复写盘。非交易时段不刷新（保持上一帧，由 at/cash_at 标出取数时刻）。
+// English: a dedicated 10s ticker for the funds frame, decoupled from the (sometimes multi-minute)
+// scoring cycle; idempotent per engine and gated to active sessions.
+func (e *Engine) StartFundsLoop(ctx context.Context) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.fundsLoopOn {
+		e.mu.Unlock()
+		return
+	}
+	e.fundsLoopOn = true
+	e.mu.Unlock()
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if !data.IsActiveSession(time.Now()) {
+					continue
+				}
+				e.publishSignalFunds(e.primaryMember(), e.snapshotQuotes())
+			}
+		}
+	}()
 }
 
 // publishSignalFunds 发布当日资金帧的**信号仓侧**。

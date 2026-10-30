@@ -99,6 +99,8 @@ from store import (  # noqa: E402
     UNRESOLVED_STATUS, DispatchDuplicateSignal,
     # §CANCEL-STATE（2026-10-28）撤单中状态与撤单被拒事件前缀（在途谓词与状态迁移共用同一份字面量）
     CANCEL_PENDING_STATUS, CANCEL_REJECT_PREFIX, IN_FLIGHT_STATUSES,
+    # §ORDER-ID-REUSE（2026-10-30）终态集合：/order 幂等回显必须能识别"这个键已经死了"
+    TERMINAL_STATUSES,
 )
 from ids import Idempotency  # noqa: E402
 from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
@@ -376,6 +378,16 @@ class Gateway:
             log.warning("[gateway] 清理残留 pending 失败: %s", _e)
         if released:
             log.warning("[gateway] 已释放 %d 个超时残留 pending 占位（崩溃恢复，避免 signal_id 永久死锁）", released)
+        # §ORDER-ID-REUSE（2026-10-30）：清理跨日历史委托行。QMT 的交易所委托号会跨日复用，
+        # 而 orders.order_id 是主键——历史行越多，撞键概率越高（今天撞上了 9-22 的一条旧行，
+        # 终态回报因此被吞）。终态行留 3 天、非终态留 10 天（A 股委托当日失效，更早的"在途"
+        # 必是僵尸行）。清理失败只告警，不阻断启动。
+        try:
+            purged = self.store.purge_stale_orders(_now_cn()[:10])
+            if purged:
+                log.warning("[gateway] §ORDER-ID-REUSE 启动清理历史委托行 %d 条", purged)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("[gateway] §ORDER-ID-REUSE 启动清理失败: %s", _e)
         # 仍存在的 pending（10 分钟内、可能对应真实在途委托）仅告警，不自动释放，需人工核对券商侧。
         for p in self.store.list_pending():
             log.warning("[gateway] STALE pending order (within 10min, verify against broker): signal_id=%s "
@@ -1085,6 +1097,10 @@ class Gateway:
             # §ENH-5 批E：只读行情通道放在 broker 连接闸之前——xtdata 与 xttrader 是
             # 两条独立通道，交易断连时行情应照常可查（行情可用性绝不与交易熔断互相污染）
             return self._do_quotes(request_handler)
+        if path == "/orders" and method == "GET":
+            # §ORDER-STATE-PULL（2026-10-30）：当日委托状态的只读对账源。放在连接闸之前：
+            # 断线/熔断时决策端最需要"最后已知状态"来纠正停滞行，不能因为通道断开就拒答。
+            return self._do_orders(request_handler)
         if not self.active_broker.is_connected():
             return 503, {"ok": False, "err": "broker not connected"}
         if path == "/order" and method == "POST":
@@ -1122,6 +1138,43 @@ class Gateway:
             "feed_connected": self.feed.is_connected(),
             "feed_age_sec": self.feed.age_sec(),
         }
+
+    def _do_orders(self, request_handler=None):
+        """GET /orders?day=YYYY-MM-DD：当日委托状态只读快照（§ORDER-STATE-PULL，2026-10-30）。
+
+        为什么要有这个端点：委托终态原本只有"网关 → outbox → 决策端"的**推送**一条腿，
+        落库失败/事件丢失/进程重启都会让决策端永久停在「撤单中」，而在途态是全额占用
+        战略额度的（10-30 300502 的「废单」被撞键吞掉，锁死 3.6 万空间）。
+        本端点让决策端能主动拉"网关已知的全部状态"来纠正本地，而不是干等一次推送。
+
+        安全：与其余端点同一 Bearer 鉴权；只读；单账号（网关本身单账号）；
+        `day` 只做格式校验后做前缀过滤，不接受 SQL。空 day 返回全部（人工排障用）。
+        English: read-only same-day order-state snapshot for the decision side's pull reconciliation.
+        """
+        query = ""
+        if request_handler is not None:
+            query = urlparse(getattr(request_handler, "path", "") or "").query
+        params = parse_qs(query or "")
+        day = str((params.get("day") or [""])[0] or "").strip()
+        if day and (len(day) != 10 or day[4] != "-" or day[7] != "-"):
+            return 400, {"ok": False, "err": "day must be YYYY-MM-DD"}
+        out = []
+        for row in self.store.list_orders():
+            r = dict(row)
+            created = str(r.get("created_at") or "")
+            if day and created[:10] != day:
+                continue
+            out.append({
+                "order_id": str(r.get("order_id") or ""),
+                "signal_id": str(r.get("signal_id") or ""),
+                "code": str(r.get("code") or ""),
+                "side": str(r.get("side") or ""),
+                "status": str(r.get("status") or ""),
+                "price": float(r.get("price") or 0),
+                "qty": int(r.get("qty") or 0),
+                "created_at": created,
+            })
+        return 200, {"ok": True, "day": day, "n": len(out), "orders": out}
 
     def _health_payload(self):
         """组装 /health 响应：进程存活 + 通道就绪 + 双通道（xt/queued）状态。
@@ -2089,10 +2142,21 @@ class Gateway:
         if not claimed:
             existing = existing or {}
             oid = existing.get("order_id") or ""
+            status = str(existing.get("status") or "")
+            # §ORDER-ID-REUSE（2026-10-30）：**终态行不许假成功**。
+            # 旧实现把"不是占位号"一律回 200 + 原单号，于是决策端重发一笔已撤/已废的信号时
+            # 会拿到"受理成功"，把本地行改回「已报」并再次撤单——造出一笔券商根本不存在的
+            # 在途单（10-30 002415 的 09:39 就是这样，之后没有任何回报能收敛它）。
+            # 现在明确回 409 + code=terminal，调用方据此把该 signal_id 记为当日终结。
+            if status in TERMINAL_STATUSES:
+                log.warning("[gateway] §ORDER-ID-REUSE signal=%s 重发被拒：该键已终态(%s, order=%s)，"
+                            "不重复下单", signal_id, status, oid)
+                return 409, {"ok": False, "code": "terminal", "status": status,
+                             "err": "signal_id already terminal (%s); not re-placed" % status}
             # §CLAIMRELEASE 第三态单独一条错误文案：普通 in-flight 与「已交给通道但结果未知」
             # 在处置上完全不同（前者等一等就好，后者必须人工核对柜台），共用一句
             # "duplicate signal_id in-flight" 会让运维与首尔侧都看不出差别。
-            if existing.get("status") == UNRESOLVED_STATUS:
+            if status == UNRESOLVED_STATUS:
                 log.error("[gateway] §CLAIMRELEASE signal=%s 处于「结果未知/待核对」态，本次 /order "
                           "直接拒绝（该行代表订单可能已在券商侧，宁可拒单也不重复下单）；"
                           "请核对柜台委托后用 POST /admin/order-confirm 收敛", signal_id)

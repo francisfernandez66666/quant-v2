@@ -39,6 +39,8 @@ func (e *Engine) RunScoringLoop(ctx context.Context) {
 		return
 	}
 	log.Printf("[engine] 近实时 8a/8b 打分循环启动: 5s 节奏")
+	// §FUNDS-TODAY（2026-10-30）：资金帧独立心跳，不再依赖本循环的轮次时长。
+	e.StartFundsLoop(ctx)
 	ticker := time.NewTicker(5 * time.Second) // 固定 5s 心跳：与快照源刷新节奏对齐
 	defer ticker.Stop()
 	for { // select 主循环：ctx 取消即退出，取不到 tick 就继续等，绝不 busy-loop
@@ -57,6 +59,7 @@ func (e *Engine) RunScoringLoop(ctx context.Context) {
 // 5s scheduler).
 func (e *Engine) RunScoringLoopOnce(ctx context.Context) {
 	e.StartBuyDispatcher(4) // §A+B 异步下单分发器（幂等启动）
+	e.StartFundsLoop(ctx)   // §FUNDS-TODAY 资金帧独立心跳（幂等启动）
 	e.scoreCycle(ctx)
 }
 

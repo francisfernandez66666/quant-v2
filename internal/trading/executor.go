@@ -87,6 +87,11 @@ type OrderResult struct {
 	// 0 表示未经过 controller 的钳位回填（老调用方/直连 executor 的路径）。
 	// English: §T1-PARTIAL-W5 — the qty actually sent to the broker after risk clamping (0 = not filled in).
 	PlacedQty int `json:"placed_qty,omitempty"`
+	// Retired §ORDER-STATE-PULL（2026-10-30）：网关判定该 signal_id **已终态**、本次没有下单。
+	// 与普通拒单（资金不足/风控）必须区分：普通拒单会降级「发送失败」并可同键重试，
+	// 终态拒单必须保持终态并禁止当日重发，否则就是"重发→409→再重发"的死循环。
+	// English: gateway says this signal id is already terminal — do NOT retry it today.
+	Retired bool `json:"retired,omitempty"`
 }
 
 // GatewayState 网关状态快照（/state）。

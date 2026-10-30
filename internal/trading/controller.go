@@ -7,6 +7,7 @@
 package trading
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -77,6 +78,10 @@ type Controller struct {
 	// §C1b 跨日陈旧买单无条件清扫的独立节流戳（mu 保护）：不受 Enabled/Tripped 管辖，
 	// 故不能复用 lastSweepAt（后者在早退分支之前不被推进）。
 	lastStaleSweepAt time.Time
+
+	// §ORDER-STATE-PULL（2026-10-30）：网关当日委托状态拉取的独立节流戳（mu 保护）。
+	// 为什么要有这条腿：终态只有"推"一条路，推丢/推失败就永久分叉（当天两笔卡单事故）。
+	lastOrderReconAt time.Time
 
 	// §WS-B 交割单对账节流：lastSettleDay 记录最近对账交易日（每日一次，mu 保护）
 	// §D4（2026-09-22 修复批）语义收紧：**只在 SettleDay 成功后**才写本字段（失败回滚/不置位），
@@ -727,6 +732,13 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		return nil, err
 	}
 	if existed {
+		// §ORDER-STATE-PULL（2026-10-30）：网关已判该 signal_id 终态的，当日不再重发。
+		// 必须挡在 ResetFailedRealOrder 之前——那个函数会把「零成交已撤」重置为已报放行，
+		// 而网关侧这条 signal_id 已是终态，重发只会拿到 409（002415 的 09:39 就这样白跑）。
+		if blocked, berr := c.store.IsOrderRetryBlocked(c.userID, req.SignalID); berr == nil && blocked {
+			return &OrderResult{OK: false, Retired: true,
+				Err: "signal retired today (gateway reported terminal)"}, nil
+		}
 		reset, rerr := c.store.ResetFailedRealOrder(c.userID, req.SignalID)
 		if rerr != nil {
 			return nil, rerr
@@ -751,6 +763,21 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		res, err = c.execRef().PlaceBuy(req)
 	}
 	if err != nil {
+		// §ORDER-STATE-PULL（2026-10-30）：网关判定该 signal_id 已终态（409 + code=terminal）。
+		// 这不是"发送失败"：下单请求根本没被受理，且这个键今天不该再出现。
+		// 处理：行落终态 + 置当日重发禁令（同事务），返回 Retired 让调用方按"已终结"跳过，
+		// 绝不走下面的 MarkRealOrderSendFailed（那会把行降级成可重试的"发送失败"）。
+		if termStatus, ok := GatewayTerminalRejection(err); ok {
+			reason := "§ORDER-STATE-PULL 网关判定信号已终态（" + termStatus + "），当日不再重发"
+			if ferr := c.store.FinalizeTerminalSignal(c.userID, req.SignalID, termStatus, reason); ferr != nil {
+				log.Printf("[trading] §ORDER-STATE-PULL 终态收口失败 %s: %v", req.SignalID, ferr)
+			}
+			log.Printf("[trading] %s 网关判定已终态(%s)，当日不再重发", req.SignalID, termStatus)
+			opslog.Logf("quant", "信号已终态不再重发 %s %s %s qty=%d 网关状态=%s",
+				req.SignalID, req.Side, req.Code, req.Qty, termStatus)
+			return &OrderResult{OK: false, Retired: true,
+				Err: "signal already terminal (" + termStatus + ")"}, nil
+		}
 		// §GAP2-W1 发送失败降级：占位行从"已报"改为"发送失败"——
 		// ①不再冒充已报污染买入纪律统计（幽灵单虚耗当日预算的根因）；
 		// ②同 signal_id 下次重试经 ResetFailedRealOrder 放行，止损自动单不会因一次网络抖动被封死整天。
@@ -1048,6 +1075,84 @@ type SweepResult struct {
 	WindowSkipped int // 禁撤窗口内被跳过的撤单笔数
 }
 
+// ReconcileOrderStates §ORDER-STATE-PULL（2026-10-30）：用网关当日委托状态校正本地在途单。
+//
+// 为什么需要这条腿：终态（已撤/废单/已成）在整条链上只有**推送**一条路——网关落库失败、
+// outbox 丢事件、进程重启都会让 Go 永久停在「撤单中」，而「撤单中」按设计全额占用战略额度。
+// 2026-10-30 的两笔卡单（300502 撞键丢终态 / 002415 重发幻影）就是这样锁死了 3.6 万空间。
+//
+// 本函数**只应用终态**（阶段一）：
+//   - 不做"网关查无此单 → 判终态"的推断——那个方向等于放预算，误判就是多买；
+//   - 本地不存在的 signal_id 不补行（对账不是建账）；
+//   - 本地已是终态的不改写（秩守卫在 ApplyOrderReportTx 里还有一层）。
+//
+// English: pull the gateway's same-day order states and apply TERMINAL statuses only. No
+// "missing ⇒ terminal" inference in phase one (that direction releases budget and can over-buy).
+func (c *Controller) ReconcileOrderStates(now time.Time) {
+	if c == nil || c.store == nil {
+		return
+	}
+	c.mu.Lock()
+	if !c.lastOrderReconAt.IsZero() && now.Sub(c.lastOrderReconAt) < 30*time.Second {
+		c.mu.Unlock()
+		return
+	}
+	c.lastOrderReconAt = now
+	c.mu.Unlock()
+
+	gc := c.gatewayClient()
+	if gc == nil {
+		return
+	}
+	day := cntime.In(now).Format("2006-01-02")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	rows, err := gc.OrderStates(ctx, day)
+	if err != nil {
+		// 网关不可达是常态（熔断/重启）：不刷屏，排障时能看到最近一次失败即可。
+		log.Printf("[trading] §ORDER-STATE-PULL 拉取网关委托状态失败(day=%s): %v", day, err)
+		return
+	}
+	fixed := 0
+	for _, row := range rows {
+		if row.SignalID == "" || !store.IsTerminalOrderStatus(row.Status) {
+			continue
+		}
+		cur, qerr := c.store.RealOrderStatusForUser(c.userID, row.SignalID)
+		if qerr != nil || cur == "" || store.IsTerminalOrderStatus(cur) {
+			continue
+		}
+		reason := "§ORDER-STATE-PULL 网关委托状态对账（" + row.Status + "）"
+		action, aerr := c.store.ApplyOrderReportTx(store.RealOrder{
+			OrderID:   row.OrderID,
+			SignalID:  row.SignalID,
+			Code:      row.Code,
+			Side:      row.Side,
+			Status:    row.Status,
+			Price:     row.Price,
+			Qty:       row.Qty,
+			CreatedAt: row.CreatedAt,
+			UserID:    c.userID,
+			Reason:    reason,
+		})
+		if aerr != nil {
+			log.Printf("[trading] §ORDER-STATE-PULL 收敛失败 signal=%s -> %s: %v", row.SignalID, row.Status, aerr)
+			continue
+		}
+		if action != store.OrderReportAdvanced {
+			continue
+		}
+		fixed++
+		log.Printf("[trading] §ORDER-STATE-PULL 本地单收敛 signal=%s %s: %s -> %s",
+			row.SignalID, row.Code, cur, row.Status)
+		opslog.Logf("quant", "订单状态对账收敛 %s %s %s → %s（本地曾停滞）",
+			row.SignalID, row.Code, cur, row.Status)
+	}
+	if fixed > 0 {
+		log.Printf("[trading] §ORDER-STATE-PULL 本轮收敛 %d 笔停滞委托（day=%s）", fixed, day)
+	}
+}
+
 // SweepOrders §R4-1 撤单闭环主入口（30s 节流，由引擎 5s 循环调用）：
 //  1. 未成交超时自动撤：orders 表 状态=已报 且滞留超过 cancel_stale_sec（默认 120s）→
 //     调网关撤单，成功即把本地行推进为"已撤"。撤单被拒（已成交/交易所号未回报）不重试强撤，
@@ -1063,6 +1168,9 @@ type SweepResult struct {
 // §C1b：函数最前面有一段**不受** Enabled/Tripped/cancel_stale_sec 管辖的跨日陈旧买单无条件
 // 降级（纯本地账），下面的网关撤单主循环才受既有早退约束。
 func (c *Controller) SweepOrders(now time.Time) *SweepResult {
+	// §ORDER-STATE-PULL（2026-10-30）：先用网关当日委托状态校正本地在途单。
+	// 放在所有早退之前：熔断/关闭时更需要它（那时推送腿本身可能就是断的）。
+	c.ReconcileOrderStates(now)
 	// §C1b（2026-09-22 修复批）跨日陈旧买单无条件清扫：A 股委托收盘即失效，前日的
 	// 已报/部成 买单必然是僵尸行；此路解冻不依赖网关可达（旧行为在熔断/关闭/
 	// cancel_stale_sec=-1 下整体早退，网关崩溃遗留挂单永无兜底）。30s 独立节流。
