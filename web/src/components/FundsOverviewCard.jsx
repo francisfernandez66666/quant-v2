@@ -173,7 +173,9 @@ export default function FundsOverviewCard() {
                 <Row label="底仓市值">{funds ? money(funds.market_value) : '—'}</Row>
                 <Row label="在途买单" hint={funds && funds.pending_buy_note ? funds.pending_buy_note : '占住战略剩余空间'}>
                   {funds
-                    ? `${money(funds.pending_buy_amount)}${Number(funds.pending_buy_n) > 0 ? `（${Number(funds.pending_buy_n)} 笔）` : ''}`
+                    // §P1-3：旧帧（本次部署前发布）没有这两个字段——缺字段按 0 显示，
+                    // 不给"破折号"让人误以为读数坏了；真正的在途由交易时段的新帧覆盖。
+                    ? `${money(funds.pending_buy_amount ?? 0)}${Number(funds.pending_buy_n) > 0 ? `（${Number(funds.pending_buy_n)} 笔）` : ''}`
                     : '—'}
                 </Row>
                 <Row label="剩余空间">{funds ? money(funds.room) : '—'}</Row>

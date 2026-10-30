@@ -66,6 +66,20 @@ describe('FundsOverviewCard §P1-3 拆口径与 T 额度文案', () => {
     expect(text).toContain('300502 ×100 撤单中 0.9 分钟')
   })
 
+  it('旧帧缺 pending 字段时按 0 显示（不给破折号，避免误判读数坏了）', async () => {
+    const f = frame()
+    delete f.live.funds.pending_buy_amount
+    delete f.live.funds.pending_buy_n
+    delete f.live.funds.pending_buy_note
+    mocks.fetchFundsToday.mockResolvedValue(f)
+    render(<FundsOverviewCard />)
+    await waitFor(() => expect(screen.getByText(/目标仓位/)).toBeTruthy())
+    await settle()
+    const text = document.body.textContent
+    expect(text).toContain('在途买单')
+    expect(text).toContain('0.00')
+  })
+
   it('T 额度改名为「T 可动用额度」并说明不是已做 T', async () => {
     mocks.fetchFundsToday.mockResolvedValue(frame())
     render(<FundsOverviewCard />)
