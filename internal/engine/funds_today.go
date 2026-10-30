@@ -21,7 +21,9 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
@@ -29,6 +31,28 @@ import (
 	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 )
+
+// pendingAgeSec §P1-1 在途单已滞留秒数：优先按撤单请求时刻，其次按委托创建时刻。
+// 两个时间串都兼容 RFC3339 与 "2006-01-02 15:04:05" 两种存量格式；解析失败返回 0
+// （宁可不显示时长，也不编一个假数字）。
+func pendingAgeSec(now time.Time, pb store.PendingBuy) float64 {
+	raw := pb.CancelRequestedAt
+	if raw == "" {
+		raw = pb.CreatedAt
+	}
+	if raw == "" {
+		return 0
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05"} {
+		if t, err := time.ParseInLocation(layout, raw, time.Local); err == nil {
+			if sec := now.Sub(t).Seconds(); sec > 0 {
+				return sec
+			}
+			return 0
+		}
+	}
+	return 0
+}
 
 // sizingCtxTTL 定权上下文的缓存窗口。
 //
@@ -119,6 +143,26 @@ func fundsTargetCurRoom(total, ms, ceiling float64,
 		room = target - strat
 	}
 	return target, strat, room, true
+}
+
+// pendingBuysNote §P1-1：在途买单的一句话摘要（最多 4 笔），供决策快照的「原因」点名占用来源。
+// T 腿不在此列（它有自己的读数区，混进来会把两种占用混成一句话）。
+func pendingBuysNote(pend []store.PendingBuy) string {
+	var parts []string
+	for _, pb := range pend {
+		if pb.IntradayT {
+			continue
+		}
+		tag := "在途"
+		if pb.CancelRequestedAt != "" {
+			tag = "撤单中"
+		}
+		parts = append(parts, fmt.Sprintf("%s×%d@%.2f %s", pureTsCode(pb.Code), pb.Remain, pb.Price, tag))
+		if len(parts) >= 4 {
+			break
+		}
+	}
+	return strings.Join(parts, "；")
 }
 
 // StartFundsLoop §FUNDS-TODAY（2026-10-30）：资金帧的独立 10s 心跳。
@@ -238,6 +282,33 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 	sc := e.sizingConfigFor(uid)
 	target, cur, room, _ := fundsTargetCurRoom(total, ctx.MS, sc.MaxTotalPositionPct, positions, prices, pending, book)
 
+	// §P1-1（2026-10-30）：把"战略当前"里的在途买单单独拆出来（含最久一笔的状态/时长）。
+	// 事故当天 cur=58,838 而持仓只有 22,238，卡片上却看不出差额是谁占的。
+	var pendAmt float64
+	pendN := 0
+	pendNote := ""
+	var oldestSec float64
+	for _, pb := range pending {
+		if pb.IntradayT {
+			continue // T 腿有独立读数区，不混进战略在途
+		}
+		pendAmt += pb.Price * float64(pb.Remain)
+		pendN++
+		ageSec := pendingAgeSec(now, pb)
+		if pendNote == "" || ageSec > oldestSec {
+			oldestSec = ageSec
+			status := "在途"
+			if pb.CancelRequestedAt != "" {
+				status = "撤单中"
+			}
+			if ageSec > 0 {
+				pendNote = fmt.Sprintf("%s ×%d %s %.1f 分钟", pureTsCode(pb.Code), pb.Remain, status, ageSec/60)
+			} else {
+				pendNote = fmt.Sprintf("%s ×%d %s", pureTsCode(pb.Code), pb.Remain, status)
+			}
+		}
+	}
+
 	st.updateFunds(func(f *tLiveFunds) {
 		f.At = now.Format(time.RFC3339)
 		f.Cash = cash
@@ -251,6 +322,9 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 		f.Room = room
 		f.MarketScale = ctx.MS
 		f.MissingKey = ctx.Missing
+		f.PendingBuyAmount = pendAmt
+		f.PendingBuyN = pendN
+		f.PendingBuyNote = pendNote
 	})
 	// §FIX-20261028-F02：帧写成功之后才推进去重基线（此前基线在 due 判定里无条件前进，
 	// 导致 5s 节拍下几乎不再发帧）。放在 updateFunds 之后，任何早退都不会误推进基线。

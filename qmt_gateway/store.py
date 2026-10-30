@@ -221,7 +221,11 @@ class Store:
                 price      REAL,
                 qty        INTEGER,
                 created_at TEXT,
-                user_id       TEXT           -- P1-9：多账号隔离归属
+                user_id       TEXT,          -- P1-9：多账号隔离归属
+                -- §ORDER-ID-REUSE（2026-10-30）：券商真实委托号的审计列。
+                -- order_id 是主键且被跨日复用（撞键时保留占位号），真实号放这里，
+                -- 撤单/对账/人工排障仍能对上；空串=从未拿到过真实号。
+                broker_order_id TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS fills (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -290,6 +294,11 @@ class Store:
             if "user_id" not in cols:
                 self._conn.execute(
                     "ALTER TABLE %s ADD COLUMN user_id TEXT DEFAULT ''" % t)
+            # §ORDER-ID-REUSE（2026-10-30）：老库补真实委托号审计列。
+            # 撞键时 order_id 保留占位号，真实号写这里（撤单/对账/排障的唯一对账键）。
+            if t == "orders" and "broker_order_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE orders ADD COLUMN broker_order_id TEXT DEFAULT ''")
             if t == "fills" and "trade_id" not in cols:
                 # §修复 G1（2026-08-29）：唯一成交编号列，用于去重（避免部成重复丢单）
                 self._conn.execute(
@@ -520,8 +529,9 @@ class Store:
                 "SELECT * FROM orders WHERE signal_id = ?", (sid,)
             ).fetchone()
             if row is None:
-                ins_sql = """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
-                       VALUES(?,?,?,?,?,?,?,?,?)"""
+                broker_oid = new_oid if order_id_rank(new_oid) >= 2 else ""
+                ins_sql = """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at, user_id, broker_order_id)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)"""
                 ins_args = (
                     new_oid or placeholder,
                     sid,
@@ -532,6 +542,7 @@ class Store:
                     int(order.get("qty", 0) or 0),
                     order.get("created_at", ""),
                     order.get("user_id", ""),
+                    broker_oid,
                 )
                 try:
                     self._conn.execute(ins_sql, ins_args)
@@ -569,7 +580,9 @@ class Store:
                 log.warning("[store] 委托状态回退已拦截 signal=%s：%s -> %s（保留原状态）",
                             sid, row["status"], new_status)
                 new_status = row["status"]
-            upd_sql = """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?, user_id=?
+            broker_oid = new_oid if order_id_rank(new_oid) >= 2 else ""
+            upd_sql = """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?, user_id=?,
+                   broker_order_id=COALESCE(NULLIF(?, ''), broker_order_id)
                    WHERE signal_id=?"""
             upd_args = (
                 final_oid,
@@ -578,6 +591,7 @@ class Store:
                 int(order.get("qty", 0) or 0) or row["qty"] or 0,
                 order.get("created_at", "") or row["created_at"],
                 order.get("user_id", row["user_id"]),
+                broker_oid,
                 sid,
             )
             try:
@@ -593,15 +607,49 @@ class Store:
             self._conn.commit()
             return False
 
-    def purge_stale_orders(self, today, terminal_days=3, open_days=10):
+    def stuck_cancel_stats(self, day=None):
+        """§P1-4（2026-10-30）撤单中卡单观察位：返回 (笔数, 最久滞留秒数)。
+
+        为什么网关也要有一份：决策端有 Go 账本口径，但网关本地账是"终态到没到"的第一现场；
+        两边的卡单数对不上，恰恰说明事件在链路上丢了（这正是 10-30 事故的形态）。
+        day 缺省=北京今日；created_at 缺失的行不计入（无法判龄）。
+        English: observe how many local orders are stuck in 「撤单中」 and for how long.
+        """
+        day = str(day or _now_cn()[:10])
+        n = 0
+        oldest_sec = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT created_at FROM orders WHERE status IN ('撤单中','已报待撤','部成待撤') "
+                "AND substr(created_at,1,10)=?", (day,)).fetchall()
+        now = time.time()
+        for r in rows:
+            raw = str(r["created_at"] or "")
+            if not raw:
+                continue
+            n += 1
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+                try:
+                    t = datetime.strptime(raw, fmt)
+                    if t.tzinfo is not None:
+                        t = t.astimezone(CN_TZ).replace(tzinfo=None)
+                    age = now - t.replace(tzinfo=CN_TZ).timestamp()
+                    if age > oldest_sec:
+                        oldest_sec = int(age)
+                    break
+                except ValueError:
+                    continue
+        return n, oldest_sec
+
+    def purge_stale_orders(self, today, terminal_days=3, open_days=5):
         """清理跨日历史委托行（§ORDER-ID-REUSE 配套，2026-10-30）。
 
         为什么必须清：order_id 是主键而 QMT 委托号跨日复用，历史行越多、撞键概率越高；
         今天 300502 就撞上了 9-22 的一条旧行。清理口径按状态分两档：
           - 终态行：早于 terminal_days 个自然日即可删（它们已无任何收敛/幂等价值）；
-          - 非终态行：早于 open_days 个自然日才删（A 股委托当日失效，10 天前的"已报"
-            必然是僵尸行；留长窗口是为了不误删跨日排查所需的近期证据）。
-        每删一批记一行日志（含条数与日期边界），不逐行刷屏。
+          - 非终态行：早于 open_days 个自然日才删（A 股委托当日失效，5 天前的"已报"
+            必然是僵尸行；方案 §8.5 要求这类行单独按 5 个交易日清，不能与终态同窗）。
+        删除前把被删行的 order_id 取出来（最多 20 条）写进日志，便于事后复核"删掉的不是活单"。
         English: purge cross-day rows — order ids are reused across days, so stale rows turn into
         primary-key collisions that used to swallow whole status events.
         """
@@ -623,6 +671,12 @@ class Store:
                 (term_before,) + tuple(_TERMINAL_STATUSES),
             )
             removed += int(cur.rowcount or 0)
+            stale_open = []
+            for r in self._conn.execute(
+                    "SELECT order_id FROM orders WHERE substr(created_at,1,10) <> '' "
+                    "AND substr(created_at,1,10) < ? AND status NOT IN (%s)" % term_ph,
+                    (open_before,) + tuple(_TERMINAL_STATUSES)).fetchall():
+                stale_open.append(str(r["order_id"]))
             cur2 = self._conn.execute(
                 "DELETE FROM orders WHERE substr(created_at,1,10) <> '' "
                 "AND substr(created_at,1,10) < ? AND status NOT IN (%s)" % term_ph,
@@ -631,8 +685,9 @@ class Store:
             removed += int(cur2.rowcount or 0)
             self._conn.commit()
         if removed:
-            log.warning("[store] §ORDER-ID-REUSE 清理历史委托行 %d 条（终态<%s / 在途<%s）",
-                        removed, term_before, open_before)
+            log.warning("[store] §ORDER-ID-REUSE 清理历史委托行 %d 条（终态<%s / 在途<%s）"
+                        " 在途僵尸样例=%s", removed, term_before, open_before,
+                        ",".join(stale_open[:20]) if stale_open else "-")
         return removed
 
     def order_by_signal(self, signal_id):

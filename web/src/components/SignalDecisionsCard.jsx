@@ -109,11 +109,14 @@ export default function SignalDecisionsCard() {
     {
       colKey: 'reason', title: '受限项 / 原因', ellipsis: true,
       cell: ({ row }) => {
-        const txt = row.reason || row.capped_by || '—'
+        // §P1-3（2026-10-30）：在途买单占用单独点名。事故当天这里只有 target，
+        // 看不出 3.6 万是被两笔卡在「撤单中」的买单占着的。
+        const pending = row.pending_note ? `在途占用：${row.pending_note}` : ''
+        const txt = [row.reason, pending].filter(Boolean).join('；') || row.capped_by || '—'
         return (
           <span title={txt} style={{ fontSize: 12 }}>
             {row.capped_by ? <Tag size="small" variant="light" style={{ marginRight: 4 }}>{row.capped_by}</Tag> : null}
-            <span title={row.reason || ''}>{row.reason || (row.capped_by ? '' : '—')}</span>
+            <span title={txt}>{txt}</span>
           </span>
         )
       },

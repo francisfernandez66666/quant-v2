@@ -1206,6 +1206,12 @@ class Gateway:
         # xtdata 断连绝不参与交易熔断判定（计划铁律：行情面不得污染 §GAP2-W1 fail-closed 面）
         payload["feed_connected"] = self.feed.is_connected()
         payload["feed_age_sec"] = self.feed.age_sec()
+        # §P1-4（2026-10-30）：委托事件落库失败累计 + 委托表快照新鲜度。
+        # 前者非零=终态回报曾写不进本地副本（已推给决策端的不受影响，但必须有人看）；
+        # 后者 -1=从未收到过快照（撤单终态的唯一权威源断了），秒数过大=桥/通道停了。
+        payload["order_fail_total"] = int(getattr(self.handler, "_order_store_fail_total", 0))
+        snap_ts = float(((getattr(self, "_orders_snap", None) or {}).get("ts", 0)) or 0)
+        payload["orders_snapshot_age"] = (max(0, int(time.time() - snap_ts)) if snap_ts > 0 else -1)
         # §0926E2E-W2D：回报 outbox 观察面。溢出语义已从"删最旧"改为"冻结+只吵"，
         # 深度必须可见（daily_ops_check/看门狗按 outbox_overflow 排人），人工收敛走
         # outbox_admin.py --yes。读库失败记 -1 本身即观察信号，绝不让 /health 因它 500。
@@ -1937,6 +1943,13 @@ class Gateway:
                  str(r.get("signal_id", "") or ""))}
             for r in unresolved[:20]]
         payload["unresolved_count"] = len(unresolved)
+        # §P1-4（2026-10-30）撤单中卡单观察位：网关本地账口径（与 Go 侧 funds 帧的
+        # pending_buy_n 对照，两边对不上就说明事件在链路上丢了）。
+        try:
+            stuck_n, stuck_age = self.store.stuck_cancel_stats()
+        except Exception:  # noqa: BLE001 — 观察位坏了不影响状态端点
+            stuck_n, stuck_age = -1, 0
+        payload["stuck_cancel_orders"] = {"n": int(stuck_n), "oldest_age_sec": int(stuck_age)}
         payload["dispatch_signal_guard"] = bool(getattr(self.store, "dispatch_signal_guard", False))
         # §P2-G 观察位：命令文件写失败（单仍 pending、下轮重推）的三个计数。
         # streak>0 = 此刻还在失败，total 只用于区分抖动与系统性故障（磁盘满/目录权限/

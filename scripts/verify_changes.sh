@@ -16966,4 +16966,98 @@ grep_q 'SwitchRow label="T 行情门' RGW141 || fail141 "行情门开关退回�
 [ "$B141_FAILED" = "0" ] || exit 1
 echo "ok - §141 §W-20261029 锁通过（子页签 6 + 决策快照 3 + 版本与日键 2 + 算式 2 + 凭据 2 + 释放守卫 2 + 行情门 2 + 量比 1 + 新键与口径 3 + 新鲜度与缓存 2 + 加速配平 2 + 止损 1 + 字段分家 1 + 开关 1 + 面板禁用与标签 2，累计判定点 ${CNT141}）"
 
+
+echo "==> 142 §ORDER-STATE-PULL（终态必达/拉取对账/当日不重发/资金帧心跳）..."
+B142_FAILED=0
+fail142() {
+	echo "--- FAIL: §142 $*"
+	FAIL=1
+	B142_FAILED=1
+}
+CNT142=0
+
+# —— ① 网关撞键不许吞事件（终态回报必须落到本地副本）——
+CNT142=$((CNT142 + 1))
+grep -q '§ORDER-ID-REUSE' qmt_gateway/store.py || fail142 "网关 upsert_order 没有撞键降级分支（跨日委托号复用会再次吞掉终态）"
+grep -q 'except sqlite3.IntegrityError' qmt_gateway/store.py || fail142 "upsert_order 未捕获 IntegrityError ⇒ 一次撞键就丢整条状态"
+CNT142=$((CNT142 + 1))
+grep -q '仍继续上报' qmt_gateway/handler.py || fail142 "on_order 落库失败仍必须 _push（本地副本失败不得阻断上报）"
+awk '/def on_order\(/,/def on_trade\(/' qmt_gateway/handler.py | grep -q 'self._push({"type": "order"' || fail142 "on_order 里找不到推送语句"
+
+# —— ② 终态 signal_id 不许假成功 ——
+CNT142=$((CNT142 + 1))
+grep -q 'code": "terminal"' qmt_gateway/gateway.py || fail142 "/order 对终态 signal_id 没有 409+code=terminal（重发会再造幻影在途单）"
+grep -q 'TerminalRejection' internal/trading/qmt_client.go || fail142 "Go 侧没有终态 409 的识别器"
+CNT142=$((CNT142 + 1))
+grep -q 'IsOrderRetryBlocked' internal/trading/controller.go && grep -q 'FinalizeTerminalSignal' internal/trading/controller.go || fail142 "终态拒单没走「落终态+当日禁令」收口"
+grep -q 'COALESCE(retry_blocked,0)=0' internal/store/real_positions.go || fail142 "ResetFailedRealOrder 未排除 retry_blocked ⇒ 当日重发禁令形同虚设"
+grep -q 'retry_blocked INTEGER DEFAULT 0' internal/store/store.go || fail142 "orders 表没有 retry_blocked 列定义"
+
+# —— ③ 拉取对账（终态只有推送一条腿＝推丢即永久分叉）——
+CNT142=$((CNT142 + 1))
+grep -q 'def _do_orders' qmt_gateway/gateway.py && grep -q 'path == "/orders"' qmt_gateway/gateway.py || fail142 "网关缺 GET /orders 只读对账源"
+grep -q 'func (c \*QMTClient) OrderStates' internal/trading/qmt_client.go || fail142 "Go 客户端没有 OrderStates"
+grep -q 'func (c \*Controller) ReconcileOrderStates' internal/trading/controller.go || fail142 "Go 控制器没有拉取对账入口"
+grep -q 'c.ReconcileOrderStates(now)' internal/trading/controller.go || fail142 "对账入口没接进巡检（写了不调＝没这条腿）"
+if awk '/func \(c \*Controller\) ReconcileOrderStates/,/^}/' internal/trading/controller.go | grep -q 'Status == "废单"\|查无此单'; then
+	fail142 "阶段一不许推断「查无此单→终态」（方向是放预算，误判即多买）"
+fi
+
+# —— ④ 跨日历史行清理（撞键根因）——
+CNT142=$((CNT142 + 1))
+grep -q 'def purge_stale_orders' qmt_gateway/store.py || fail142 "网关没有历史委托行清理"
+grep -q 'purge_stale_orders(_now_cn()' qmt_gateway/gateway.py || fail142 "清理没在启动时调用"
+
+# —— ⑤ 资金帧与打分主循环解耦（主循环 4~15 分钟一轮时卡片必须照常刷新）——
+CNT142=$((CNT142 + 1))
+grep -q 'func (e \*Engine) StartFundsLoop' internal/engine/funds_today.go || fail142 "资金帧没有独立心跳"
+grep -q 'StartFundsLoop(ctx)' internal/engine/scoring_loop.go || fail142 "资金帧心跳没被启动"
+grep -q 't := time.NewTicker(10 \* time.Second)' internal/engine/funds_today.go || fail142 "资金帧心跳不是 10s 节奏"
+
+# —— ⑥ 回归测试在位（行为正确性由单测保证，这里只锁文件存在）——
+CNT142=$((CNT142 + 1))
+[ -f qmt_gateway/tests/test_order_state_pull.py ] || fail142 "缺网关侧回归测试 test_order_state_pull.py"
+[ -f internal/trading/order_state_pull_test.go ] || fail142 "缺 Go 控制器侧回归测试 order_state_pull_test.go"
+[ -f internal/store/order_state_pull_test.go ] || fail142 "缺 Go 账本侧回归测试 order_state_pull_test.go"
+[ -f internal/engine/buy_reserve_test.go ] || fail142 "缺 P0-5 预算预占回归测试 buy_reserve_test.go"
+
+# —— ⑦ P0-5 同轮并发预占（不能用"发送前才复核"代替：预占必须发生在定量处）——
+CNT142=$((CNT142 + 1))
+grep -q 'func (e \*Engine) reserveBuyBudget' internal/engine/buy_reserve.go || fail142 "缺预算预占实现"
+grep -q 'e.reserveBuyBudget(e.budgetUID(), id' internal/engine/engine.go || fail142 "定量后没有预占（并发窗口仍在）"
+grep -q 'e.reservedBuyAmount(uid)' internal/engine/engine.go || fail142 "定量时没扣预占"
+grep -q 'e.sendRoomGuard(uid, req.Amount' internal/engine/engine.go || fail142 "发送前没有剩余空间复核"
+grep -q 'defer e.releaseBuyBudget' internal/engine/engine.go || fail142 "worker 结束时没有释放预占"
+
+# —— ⑧ P1-1 卡单可见性 + 收盘终局核对 + 账本拆口径 ——
+CNT142=$((CNT142 + 1))
+grep -q 'CancelRequestedAt' internal/store/real_positions.go || fail142 "PendingBuy 没带撤单时刻"
+grep -q 'func (d \*DB) CountStuckCancelBuys' internal/store/real_positions.go || fail142 "缺卡单统计"
+grep -q 'CANCEL_UNRESOLVED' internal/trading/controller.go || fail142 "收盘终局核对没有告警留痕"
+grep -q 'PendingBuyAmount' internal/engine/tlive_state.go || fail142 "资金帧没有拆出在途买单金额"
+grep -q 'pending_note' internal/store/signal_decisions.go || fail142 "决策快照没有在途占用明细列"
+
+# —— ⑨ P1-3 前端文案与拆口径 ——
+CNT142=$((CNT142 + 1))
+grep -q 'T 可动用额度' web/src/components/FundsOverviewCard.jsx || fail142 "T 额度文案没改（仍会被读成「已做 T」）"
+grep -q '底仓市值' web/src/components/FundsOverviewCard.jsx || fail142 "资金卡没有拆出底仓市值"
+grep -q '在途买单' web/src/components/FundsOverviewCard.jsx || fail142 "资金卡没有拆出在途买单"
+grep -q 'pending_note' web/src/components/SignalDecisionsCard.jsx || fail142 "决策表没有在途占用明细"
+
+# —— ⑩ P1-5 真实委托号审计列 + 阶段二显式开关 ——
+CNT142=$((CNT142 + 1))
+grep -q 'broker_order_id TEXT DEFAULT' internal/store/store.go || fail142 "Go orders 缺 broker_order_id 列"
+grep -q 'broker_order_id' qmt_gateway/store.py || fail142 "网关 orders 缺 broker_order_id 列"
+grep -q 'OrderStatePullCloseMissing' internal/config/config.go || fail142 "阶段二开关没进配置（默认关）"
+grep -q 'reconcileMissingOrders' internal/trading/controller.go || fail142 "阶段二实现缺失"
+
+# —— ⑪ 观测位（/health 与 /api/qmt/state 两边口径）——
+CNT142=$((CNT142 + 1))
+grep -q 'order_fail_total' qmt_gateway/gateway.py || fail142 "网关 /health 缺 order_fail_total"
+grep -q 'orders_snapshot_age' qmt_gateway/gateway.py || fail142 "网关 /health 缺 orders_snapshot_age"
+grep -q 'stuck_cancel_orders' internal/trading/controller.go || fail142 "Go 状态快照缺 stuck_cancel_orders"
+
+[ "$B142_FAILED" = "0" ] || exit 1
+echo "ok - §142 §ORDER-STATE-PULL 锁通过（撞键 2 + 终态 2 + 拉取 1 + 清理 1 + 资金帧 1 + 测试 1 + 预算预占 1 + 卡单 1 + 前端 1 + 审计列 1 + 观测位 1，累计判定点 ${CNT142}）"
+
 echo "==> 全部通过"

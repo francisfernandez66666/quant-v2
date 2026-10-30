@@ -1063,6 +1063,13 @@ type PendingBuy struct {
 	Code   string  `json:"code"`
 	Price  float64 `json:"price"`
 	Remain int     `json:"remain"`
+	// CancelRequestedAt §ORDER-STATE-PULL/P1-1（2026-10-30）：撤单请求留痕时刻（空=未发过撤单）。
+	// 为什么在途单要带它：卡单事故里操作人只看到「受限项=target」，看不出是谁占着额度；
+	// 带上"撤单中 X 分钟未确认"才能在卡片/决策快照里点名到具体代码与时长。
+	// English: when the cancel was requested — makes a stuck 「撤单中」 visible by code and age.
+	CancelRequestedAt string `json:"cancel_requested_at,omitempty"`
+	// CreatedAt §P1-1 委托创建时刻（在途时长兜底：没发过撤单的单只能按它算）。
+	CreatedAt string `json:"created_at,omitempty"`
 	// IntradayT §DYN-T（批2/批7）：这笔在途买单是日内回转腿。
 	// 目标仓位模型的 `CurStrat` **必须**把它剔出去（T 腿不占战略剩余空间），
 	// 而行业/单票额度**必须继续计入**（漏算会让 T 腿成为更便宜的资金来源，正是 §8.4.6 明令禁止的旁路）。
@@ -1084,7 +1091,7 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 	if len(day) == 8 {
 		day = day[:4] + "-" + day[4:6] + "-" + day[6:]
 	}
-	rows, err := d.db.Query(`SELECT code, signal_id, price, qty, COALESCE(intraday_t,0) FROM orders
+	rows, err := d.db.Query(`SELECT code, signal_id, price, qty, COALESCE(intraday_t,0), COALESCE(cancel_requested_at,''), COALESCE(created_at,'') FROM orders
 		WHERE user_id=? AND side='买入'
 		  AND status IN ('已报','部成','撤单中','已报待撤','部成待撤')
 		AND substr(created_at,1,10)=?`, userID, day)
@@ -1094,10 +1101,10 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 	defer rows.Close()
 	var out []PendingBuy
 	for rows.Next() {
-		var code, sid string
+		var code, sid, cancelAt, createdAt string
 		var price float64
 		var qty, it int
-		if err := rows.Scan(&code, &sid, &price, &qty, &it); err != nil {
+		if err := rows.Scan(&code, &sid, &price, &qty, &it, &cancelAt, &createdAt); err != nil {
 			continue
 		}
 		filled := d.SumFilledQty(userID, sid)
@@ -1105,9 +1112,37 @@ func (d *DB) PendingBuys(userID, day string) ([]PendingBuy, error) {
 		if remain <= 0 || price <= 0 {
 			continue
 		}
-		out = append(out, PendingBuy{Code: code, Price: price, Remain: remain, IntradayT: it != 0})
+		out = append(out, PendingBuy{Code: code, Price: price, Remain: remain, IntradayT: it != 0,
+			CancelRequestedAt: cancelAt, CreatedAt: createdAt})
 	}
 	return out, rows.Err()
+}
+
+// CountStuckCancelBuys 当日仍停在「撤单中」的买单数量与最久滞留时长（§P1-1 收盘终局核对/观测用）。
+// 只读；duration 以撤单请求时刻起算，缺失（回报路径进来的撤单中）按委托创建时刻起算。
+func (d *DB) CountStuckCancelBuys(userID, day string) (int, time.Duration, error) {
+	var n int
+	var oldest string
+	err := d.db.QueryRow(`SELECT COUNT(1), COALESCE(MIN(CASE WHEN COALESCE(cancel_requested_at,'')<>''
+			THEN cancel_requested_at ELSE created_at END), '')
+		FROM orders
+		WHERE user_id=? AND side='买入' AND status IN ('撤单中','已报待撤','部成待撤')
+		  AND substr(created_at,1,10)=?`, userID, day).Scan(&n, &oldest)
+	if err != nil {
+		return 0, 0, err
+	}
+	if n == 0 || oldest == "" {
+		return n, 0, nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
+		if t, perr := time.ParseInLocation(layout, oldest, time.Local); perr == nil {
+			if age := time.Since(t); age > 0 {
+				return n, age, nil
+			}
+			return n, 0, nil
+		}
+	}
+	return n, 0, nil
 }
 
 // localBuyFrozen 冻结账的唯一实现（strategyKey 为空＝不限战法）。
@@ -1457,9 +1492,29 @@ func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string)
 		// 上抛会让调用方以为整条回填失败，而事实是"状态已正确、只是引用没升级"。
 		log.Printf("[store] §ORDER-STATE-PULL 回填委托号失败 signal=%s order=%s（状态 %s 已落库）: %v",
 			signalID, orderID, status, err)
+		// §P1-5：撞键时把真实号写进审计列，撤单/对账仍能对上柜台单号。
+		if userID == "" {
+			_, _ = d.db.Exec(`UPDATE orders SET broker_order_id=? WHERE signal_id=? AND user_id=''`, orderID, signalID)
+		} else {
+			_, _ = d.db.Exec(`UPDATE orders SET broker_order_id=? WHERE signal_id=? AND user_id=?`, orderID, signalID, userID)
+		}
 		return nil
 	}
+	// 回填成功也记一份到审计列（后续 order_id 若再被复用/改写，历史仍可查）。
+	if userID == "" {
+		_, _ = d.db.Exec(`UPDATE orders SET broker_order_id=? WHERE signal_id=? AND user_id=''`, orderID, signalID)
+	} else {
+		_, _ = d.db.Exec(`UPDATE orders SET broker_order_id=? WHERE signal_id=? AND user_id=?`, orderID, signalID, userID)
+	}
 	return nil
+}
+
+// OrderConvergenceStats 当日委托总数与终态数（§P1-4 终态收敛率观测，只读）。
+func (d *DB) OrderConvergenceStats(userID, day string) (total, terminal int, err error) {
+	err = d.db.QueryRow(`SELECT COUNT(1),
+		COALESCE(SUM(CASE WHEN status IN ('已成','已撤','部撤','废单','已废') THEN 1 ELSE 0 END), 0)
+		FROM orders WHERE user_id=? AND substr(created_at,1,10)=?`, userID, day).Scan(&total, &terminal)
+	return total, terminal, err
 }
 
 // MarkRealOrderSendFailed §GAP2-W1 占位行降级：下单请求发送失败（网关超时/5xx/断连）时把占位行
@@ -1706,11 +1761,21 @@ func (d *DB) ensureOrderRetryBlockColumn() error {
 	if err != nil {
 		return err
 	}
-	if has {
-		return nil
+	if !has {
+		if _, err := d.db.Exec(`ALTER TABLE orders ADD COLUMN retry_blocked INTEGER DEFAULT 0`); err != nil {
+			return fmt.Errorf("store migrate orders add retry_blocked: %w", err)
+		}
 	}
-	if _, err := d.db.Exec(`ALTER TABLE orders ADD COLUMN retry_blocked INTEGER DEFAULT 0`); err != nil {
-		return fmt.Errorf("store migrate orders add retry_blocked: %w", err)
+	// §P1-5（2026-10-30）：券商真实委托号的审计列。order_id 是主键且会跨日复用，
+	// 回填撞键时保留占位号，真实号落这里——撤单/对账/人工排障仍对得上。
+	hasBroker, err := d.hasColumn("orders", "broker_order_id")
+	if err != nil {
+		return err
+	}
+	if !hasBroker {
+		if _, err := d.db.Exec(`ALTER TABLE orders ADD COLUMN broker_order_id TEXT DEFAULT ''`); err != nil {
+			return fmt.Errorf("store migrate orders add broker_order_id: %w", err)
+		}
 	}
 	return nil
 }

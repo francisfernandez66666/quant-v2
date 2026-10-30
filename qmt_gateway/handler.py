@@ -189,6 +189,9 @@ class ReportHandler:
         self.report_url = report_url
         self.report_token = report_token
         self.user_id = user_id
+        # §ORDER-ID-REUSE（2026-10-30）：委托事件落库失败累计次数（/health order_fail_total）。
+        # 非零=终态回报曾写不进本地副本，必须去看网关日志；已推给决策端的事实不受影响。
+        self._order_store_fail_total = 0
         # 断线标记：供首尔侧感知通道状态
         self.disconnected = False
         # §G5 连续空快照计数（对账清空守卫）
@@ -539,6 +542,7 @@ class ReportHandler:
             try:
                 self.store.upsert_order(ev)
             except Exception:  # noqa: BLE001
+                self._order_store_fail_total += 1
                 log.exception("[handler] on_order 落库失败，仍继续上报（状态不得静默丢失）: %s", ev)
             self._push({"type": "order", **ev})
         except Exception:  # noqa: BLE001

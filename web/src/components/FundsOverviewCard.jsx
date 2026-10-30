@@ -167,7 +167,15 @@ export default function FundsOverviewCard() {
                 <Row label="目标仓位" hint={funds && Number(funds.market_scale) > 0 ? `MS ${Number(funds.market_scale).toFixed(3)}` : 'MS 未注入'}>
                   {funds ? money(funds.target) : '—'}
                 </Row>
-                <Row label="当前战略仓位">{funds ? money(funds.cur_strat) : '—'}</Row>
+                <Row label="当前战略仓位" hint="底仓 + 在途买单 − 正T买腿 + 反T卖腿">{funds ? money(funds.cur_strat) : '—'}</Row>
+                {/* §P1-3（2026-10-30）：把「战略当前」拆开显示。事故当天卡片只有一个总数，
+                    操作人看不出差额是持仓还是卡在柜台上的买单。 */}
+                <Row label="底仓市值">{funds ? money(funds.market_value) : '—'}</Row>
+                <Row label="在途买单" hint={funds && funds.pending_buy_note ? funds.pending_buy_note : '占住战略剩余空间'}>
+                  {funds
+                    ? `${money(funds.pending_buy_amount)}${Number(funds.pending_buy_n) > 0 ? `（${Number(funds.pending_buy_n)} 笔）` : ''}`
+                    : '—'}
+                </Row>
                 <Row label="剩余空间">{funds ? money(funds.room) : '—'}</Row>
                 {funds && funds.missing_key_input
                   ? <Tag size="small" theme="warning">关键读数缺失：目标封顶半仓且今日不做 T</Tag>
@@ -186,7 +194,14 @@ export default function FundsOverviewCard() {
             ? <Tag size="small" theme="warning">T 侧读数未更新</Tag>
             : null}
         </>}>
-          <Row label="T 额度">{funds ? money(funds.t_quota) : '—'}</Row>
+          {/* §P1-3（2026-10-30）：T 额度 = 总资产 − 目标仓位，是"战略让出来的空间"，
+              不是"今天做过 T"。旧文案让用户以为系统凭空给了一笔 T 额度。 */}
+          <Row label="T 可动用额度" hint="战略让出的空间，不是已做 T">
+            {funds ? money(funds.t_quota) : '—'}
+          </Row>
+          {funds && Number(funds.done_rounds) === 0
+            ? <div style={{ fontSize: 12, color: 'var(--app-text-secondary, #888)' }}>今日未做 T，该额度为战略未占用的空间</div>
+            : null}
           <Row label="可用 T 现金" hint="已扣战略剩余空间">{funds ? money(funds.cash_t) : '—'}</Row>
           <Row label="反 T 冻结">{funds ? money(funds.t_frozen_cash) : '—'}</Row>
           <Row label="在途正 T 买腿">{funds ? money(funds.open_buy_legs) : '—'}</Row>

@@ -82,6 +82,9 @@ type Controller struct {
 	// §ORDER-STATE-PULL（2026-10-30）：网关当日委托状态拉取的独立节流戳（mu 保护）。
 	// 为什么要有这条腿：终态只有"推"一条路，推丢/推失败就永久分叉（当天两笔卡单事故）。
 	lastOrderReconAt time.Time
+	// orderMissingHits 阶段二（默认关）的"连续查无此单"计数：signal_id → 连续轮数。
+	// 只对真实委托号（非 pend:/seq: 占位）计数；看到一次就清零。
+	orderMissingHits map[string]int
 
 	// §WS-B 交割单对账节流：lastSettleDay 记录最近对账交易日（每日一次，mu 保护）
 	// §D4（2026-09-22 修复批）语义收紧：**只在 SettleDay 成功后**才写本字段（失败回滚/不置位），
@@ -411,6 +414,11 @@ type StateSnapshot struct {
 	// English: §MANUAL-SYNC — wall-clock timestamp of the last broker cash snapshot, so the UI can
 	// tell "value unchanged" from "value not updating".
 	CashAt string `json:"cash_at"`
+	// StuckCancelN/StuckCancelOldestSec §P1-4（2026-10-30）：Go 账本口径的"撤单中卡单"读数。
+	// 与网关 /admin/status 的同名字段对照：两边数字对不上＝事件在链路上丢了（10-30 事故形态）。
+	// English: Go-book view of stuck 「撤单中」 orders, cross-checked against the gateway's own count.
+	StuckCancelN         int `json:"stuck_cancel_orders"`
+	StuckCancelOldestSec int `json:"stuck_cancel_oldest_sec"`
 	// PendingEnabled §FIX-2：待生效队列中的 enabled（§QMT-PENDING）。非 nil 表示存在一笔尚未在
 	// 交易时段被 ApplyPendingConfig 消费的开关变更——前端据此显示"已配置，将于下一交易时段生效"，
 	// 而不是把延迟生效误判为"开关没打开"。为 nil 表示当前无待生效变更（已收敛到 c.cfg.Enabled）。
@@ -434,27 +442,34 @@ func (c *Controller) Snapshot() StateSnapshot {
 	cash, cashFresh := c.AvailableCash()
 	// §MANUAL-SYNC：附带快照落库时刻（读失败/未接账本时为空串，前端不显示该格）。
 	cashAt := ""
+	stuckN, stuckAge := 0, 0
 	if c.store != nil {
 		if acc, err := c.store.GetRealAccount(c.userID); err == nil {
 			cashAt = acc.UpdatedAt
 		}
+		day := cntime.Now().Format("2006-01-02")
+		if n, age, err := c.store.CountStuckCancelBuys(c.userID, day); err == nil {
+			stuckN, stuckAge = n, int(age.Seconds())
+		}
 	}
 	return StateSnapshot{
-		Enabled:        c.cfg.Enabled,
-		Mode:           c.cfg.Mode,
-		Tripped:        c.tripped,
-		TripReason:     c.tripReason,
-		TripAt:         c.tripAt,
-		GatewayURL:     c.cfg.GatewayURL,
-		LastProbeAt:    c.lastHealthAt,
-		LastProbeOK:    c.lastHealthy,
-		LastLatencyMs:  c.lastLatencyMs,
-		LastReportAt:   c.lastReportAt,
-		LastReportKind: c.lastReportKind,
-		Cash:           cash, // §M12-A 原始最近值（过期时仅供参考）
-		CashStale:      !cashFresh,
-		CashAt:         cashAt,
-		PendingEnabled: pendingEnabled,
+		Enabled:              c.cfg.Enabled,
+		Mode:                 c.cfg.Mode,
+		Tripped:              c.tripped,
+		TripReason:           c.tripReason,
+		TripAt:               c.tripAt,
+		GatewayURL:           c.cfg.GatewayURL,
+		LastProbeAt:          c.lastHealthAt,
+		LastProbeOK:          c.lastHealthy,
+		LastLatencyMs:        c.lastLatencyMs,
+		LastReportAt:         c.lastReportAt,
+		LastReportKind:       c.lastReportKind,
+		Cash:                 cash, // §M12-A 原始最近值（过期时仅供参考）
+		CashStale:            !cashFresh,
+		CashAt:               cashAt,
+		PendingEnabled:       pendingEnabled,
+		StuckCancelN:         stuckN,
+		StuckCancelOldestSec: stuckAge,
 	}
 }
 
@@ -808,8 +823,10 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 			req.SignalID, req.Side, req.Code, req.Qty, req.Price, res.Err)
 		return res, nil
 	}
-	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）
-	if res.OrderID != "" {
+	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）。
+	// §P1-2（2026-10-30）：网关回显的就是本地占位号时不必回填——那种"单号"不指向任何柜台委托，
+	// 写回只会让人误以为拿到了真实引用（终态 409 已经挡住了真正的假成功）。
+	if res.OrderID != "" && res.OrderID != "pend:"+req.SignalID {
 		if err := c.store.UpdateRealOrderBySignalID(c.userID, req.SignalID, res.OrderID, "已报"); err != nil {
 			log.Printf("[trading] backfill order id: %v", err)
 		}
@@ -1089,11 +1106,17 @@ type SweepResult struct {
 // English: pull the gateway's same-day order states and apply TERMINAL statuses only. No
 // "missing ⇒ terminal" inference in phase one (that direction releases budget and can over-buy).
 func (c *Controller) ReconcileOrderStates(now time.Time) {
+	c.reconcileOrderStates(now, false)
+}
+
+// reconcileOrderStates force=true 跳过 30s 节流（收盘终局核对必须立刻拿到最新状态）。
+// English: force skips the 30s throttle (used by the close-time final check).
+func (c *Controller) reconcileOrderStates(now time.Time, force bool) {
 	if c == nil || c.store == nil {
 		return
 	}
 	c.mu.Lock()
-	if !c.lastOrderReconAt.IsZero() && now.Sub(c.lastOrderReconAt) < 30*time.Second {
+	if !force && !c.lastOrderReconAt.IsZero() && now.Sub(c.lastOrderReconAt) < 30*time.Second {
 		c.mu.Unlock()
 		return
 	}
@@ -1150,6 +1173,77 @@ func (c *Controller) ReconcileOrderStates(now time.Time) {
 	}
 	if fixed > 0 {
 		log.Printf("[trading] §ORDER-STATE-PULL 本轮收敛 %d 笔停滞委托（day=%s）", fixed, day)
+	}
+	c.reconcileMissingOrders(day, rows)
+}
+
+// reconcileMissingOrders §ORDER-STATE-PULL 阶段二（2026-10-30，**默认关**）：
+// 本地「撤单中」且持有真实委托号的单，连续 N 轮在网关当日委托状态里查无此单 → 判废单释放额度。
+//
+// 安全边界（与方案 §8.3 一致）：
+//   - 只对真实委托号生效（pend:/seq: 占位本来就是本地引用，不在网关账里）；
+//   - 要求本轮快照非空（空表可能是网关库被重置，不可信）；
+//   - N 与网关 manual_sync_miss_limit 同值（6 轮 ≈ 3 分钟），远长于正常回报延迟；
+//   - 开关默认关，打开后每条收敛都写 opslog，便于复盘时改回。
+func (c *Controller) reconcileMissingOrders(day string, rows []GatewayOrderState) {
+	c.mu.RLock()
+	cfg := c.cfg
+	c.mu.RUnlock()
+	if !cfg.OrderStatePullCloseMissing || len(rows) == 0 {
+		return
+	}
+	present := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if r.SignalID != "" {
+			present[r.SignalID] = true
+		}
+	}
+	all, err := c.store.RealOrdersForUser(c.userID)
+	if err != nil {
+		return
+	}
+	const missLimit = 6
+	now := time.Now()
+	c.mu.Lock()
+	if c.orderMissingHits == nil {
+		c.orderMissingHits = map[string]int{}
+	}
+	type demote struct{ sid, code, oid string }
+	var toDemote []demote
+	for _, o := range all {
+		if o.Status != "撤单中" && o.Status != "已报待撤" && o.Status != "部成待撤" {
+			delete(c.orderMissingHits, o.SignalID)
+			continue
+		}
+		if !strings.HasPrefix(o.CreatedAt, day) {
+			continue
+		}
+		if strings.HasPrefix(o.OrderID, "pend:") || strings.HasPrefix(o.OrderID, "seq:") || o.OrderID == "" {
+			continue
+		}
+		if present[o.SignalID] {
+			delete(c.orderMissingHits, o.SignalID)
+			continue
+		}
+		c.orderMissingHits[o.SignalID]++
+		if c.orderMissingHits[o.SignalID] >= missLimit {
+			toDemote = append(toDemote, demote{sid: o.SignalID, code: o.Code, oid: o.OrderID})
+			delete(c.orderMissingHits, o.SignalID)
+		}
+	}
+	c.mu.Unlock()
+	for _, d := range toDemote {
+		reason := "§ORDER-STATE-PULL 连续 6 轮网关查无此单（阶段二，默认关的显式开关）"
+		if _, err := c.store.ApplyOrderReportTx(store.RealOrder{
+			OrderID: d.oid, SignalID: d.sid, Code: d.code, Side: SideBuy,
+			Status: "废单", CreatedAt: now.Format(time.RFC3339), UserID: c.userID, Reason: reason,
+		}); err != nil {
+			log.Printf("[trading] §ORDER-STATE-PULL 阶段二收敛失败 %s: %v", d.sid, err)
+			continue
+		}
+		log.Printf("[trading] §ORDER-STATE-PULL 阶段二：%s %s 连续 %d 轮查无此单，判废单", d.sid, d.code, missLimit)
+		opslog.Logf("quant", "订单状态阶段二收敛 %s %s 连续 %d 轮网关查无此单 → 废单",
+			d.sid, d.code, missLimit)
 	}
 }
 
@@ -1320,6 +1414,30 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		// 窗口内不发撤单请求，但整轮节流/占位降级等仍照常；留痕让运维能看到"这段时间没撤单"。
 		log.Printf("[trading] §CANCEL-STATE 禁撤窗口(%s)生效：本轮跳过 %d 笔网关撤单（占位降级不受影响）",
 			windowLabel, res.WindowSkipped)
+	}
+	// §P1-1（2026-10-30）收盘终局核对：收盘清单跑完后，再强制拉一次网关状态，
+	// 然后对仍停在「撤单中」的单点名告警。拿不到终态的**保留在途态**（绝不猜"已撤"），
+	// 由次日晨间报表与 CANCEL_UNRESOLVED 告警交人工核对——这正是 10-30 两笔卡单
+	// 只有到次日才被清掉的形态，现在当天收盘就会留下可查的告警。
+	if closeSweep {
+		c.reconcileOrderStates(now, true)
+		day := cntime.In(now).Format("2006-01-02")
+		if n, age, err := c.store.CountStuckCancelBuys(c.userID, day); err != nil {
+			log.Printf("[trading] §P1-1 收盘卡单统计失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[trading] §P1-1 CANCEL_UNRESOLVED 收盘仍有 %d 笔撤单中未确认（最久 %s）",
+				n, age.Round(time.Second))
+			opslog.Logf("quant", "CANCEL_UNRESOLVED 收盘仍有 %d 笔撤单中未确认（最久 %s，账户=%s）——次日晨间须核对柜台委托",
+				n, age.Round(time.Second), c.userID)
+		}
+		// §P1-4 每日一行终态收敛率：终态数/当日委托数。低于 100% 就是"当天还有单没落地"，
+		// 比逐条日志更适合次日复盘（10-30 卡单当天没有任何一条汇总读数）。
+		if total, terminal, serr := c.store.OrderConvergenceStats(c.userID, day); serr == nil && total > 0 {
+			opslog.DayOnce("order-convergence:"+day, func() {
+				opslog.Logf("quant", "当日订单终态收敛率 %d/%d（%.1f%%）账户=%s",
+					terminal, total, float64(terminal)*100/float64(total), c.userID)
+			})
+		}
 	}
 	if res.Cancelled+res.Demoted > 0 || closeSweep {
 		log.Printf("[trading] 撤单闭环本轮: 撤销=%d 占位降级=%d 失败=%d 跳过=%d 收盘清单=%v",

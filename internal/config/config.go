@@ -483,6 +483,13 @@ type QMTConfig struct {
 	// TimeoutSec 下单请求超时秒数（默认 10）。
 	// 超时秒数
 	TimeoutSec int `json:"timeout_sec"`
+	// OrderStatePullCloseMissing §ORDER-STATE-PULL 阶段二（2026-10-30，**默认关**）：
+	// 本地「撤单中」的真实委托号连续 N 轮在网关当日委托状态里查无此单时，判终态释放额度。
+	// 为什么默认关：这个判断直接决定"放不放预算"，误判方向是多买；阶段一的终态对账
+	// 已能自愈 300502/002415 两族问题，阶段二只覆盖"网关整行都没了"的极端形态。
+	// English: phase 2 of the pull reconciliation (default OFF) — demote a stuck cancel when the
+	// gateway has no row for its real order id across N trusted snapshots (budget-releasing guess).
+	OrderStatePullCloseMissing bool `json:"order_state_pull_close_missing,omitempty"`
 	// MissHeartbeatSec 心跳超时秒数：网关 /health 连续失联超过该值 → 熔断暂停下单并告警（默认 120）。
 	// 心跳超时秒数
 	MissHeartbeatSec int `json:"miss_heartbeat_sec"`

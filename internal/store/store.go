@@ -96,6 +96,11 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// §P1-1（2026-10-30）：signal_decisions 补在途占用明细列（老库）。
+	if err := d.ensureSignalDecisionColumns(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// §SCHEMA-VERSION（2026-10-26，旧审计 F10）：所有迁移都是幂等加列；用 PRAGMA user_version
 	// 给库一个可读版本号。旧库(0)自动抬到当前；未来版本(>current)拒绝启动，避免旧二进制
 	// 对着新 schema 静默跑。English: stamp PRAGMA user_version after idempotent migrations;
@@ -523,6 +528,8 @@ func (d *DB) migrate() error {
 			-- §ORDER-STATE-PULL（2026-10-30）：当日重发禁令。网关判定该 signal_id 已终态后置 1，
 			-- ResetFailedRealOrder 不再放行，避免"重发→409→再重发"的死循环。
 			retry_blocked INTEGER DEFAULT 0,
+			-- §P1-5（2026-10-30）：券商真实委托号审计列（order_id 主键跨日复用，撞键时真实号落这里）。
+			broker_order_id TEXT DEFAULT '',
 			UNIQUE (user_id, signal_id)
 		)`,
 
@@ -558,6 +565,9 @@ func (d *DB) migrate() error {
 			missing_key_input INTEGER DEFAULT 0,
 			cash_stale INTEGER DEFAULT 0,
 			reason TEXT DEFAULT '',
+			-- §P1-1（2026-10-30）：在途买单占用明细（空=无在途）。与 reason 分列：
+			-- 受限于 target 时 reason 只有"受限于 target"，看不出是谁占的额度。
+			pending_note TEXT DEFAULT '',
 			PRIMARY KEY (user_id, day, channel, code, strategy_key, signal_id)
 		)`,
 

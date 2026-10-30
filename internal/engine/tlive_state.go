@@ -162,6 +162,12 @@ type tLiveFunds struct {
 	Room        float64 `json:"room"`         // 战略剩余空间
 	MarketScale float64 `json:"market_scale"` // 本轮市场缩放（0=尚未定权）
 	MissingKey  bool    `json:"missing_key_input"`
+	// §P1-1（2026-10-30）在途买单拆口径：战略当前数里到底有多少是"还挂在柜台上的买单"。
+	// 事故当天卡片只显示 cur 一个总数，操作人看不出 3.6 万是持仓还是卡单。
+	PendingBuyAmount float64 `json:"pending_buy_amount"` // 非 T 腿在途买单占用（元）
+	PendingBuyN      int     `json:"pending_buy_n"`      // 非 T 腿在途买单笔数
+	// PendingBuyNote 最久那笔在途单的说明（如「300502 ×100 撤单中 4.2 分钟」），空=无在途。
+	PendingBuyNote string `json:"pending_buy_note,omitempty"`
 
 	// ── T 仓 ────────────────────────────────────────────────────────────
 	TQuota       float64 `json:"t_quota"`        // T 额度（总资产 × max(0, 1−min(MS,1))）

@@ -13,10 +13,12 @@ upsert_order 抛 UNIQUE → handler.on_order 把整条终态回报丢弃 → Go 
 """
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import gateway as gw_mod  # noqa: E402
 from tests.test_manual_sync import _GatewayCase, new_db_path  # noqa: E402,F401
 
 SID = "buy:300502:fac_150:20261030"
@@ -58,6 +60,18 @@ class TestOrderIdReuse(_GatewayCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "已报")
         self.assertEqual(row["order_id"], "pending:buy:000333:fac_117:20261030")
+
+    def test_broker_order_id_audit_column(self):
+        """§P1-5：撞键保留占位号时，真实号必须落审计列。"""
+        self.store.upsert_order({"order_id": "xt1", "signal_id": "old-signal",
+                                 "code": "301226.SZ", "side": "买入", "status": "已报",
+                                 "price": 1, "qty": 100, "created_at": "2026-09-22 10:00:00",
+                                 "user_id": ""})
+        self.store.upsert_order(_row())
+        self.store.upsert_order(_row(order_id="xt1", status="废单"))
+        row = self.store.order_by_signal(SID)
+        self.assertEqual(row["order_id"], "seq:9")
+        self.assertEqual(row["broker_order_id"], "xt1", "真实委托号必须留在审计列")
 
     def test_purge_stale_orders(self):
         self.store.upsert_order({"order_id": "old-t", "signal_id": "s-old-t", "code": "600000.SH",
@@ -111,6 +125,26 @@ class TestOrderTerminalIdempotency(_GatewayCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload.get("ok"))
         self.assertEqual(payload.get("order_id"), "3632")
+
+
+class TestObservabilityFields(_GatewayCase):
+    """§P1-4：/health 与 /admin/status 的卡单与失败观测位。"""
+
+    def test_health_fields(self):
+        self.gw._orders_snap = {"by_id": {}, "ts": time.time() - 7, "data_ts": "", "n": 0}
+        self.gw.handler._order_store_fail_total = 3
+        payload = self.gw._health_payload()
+        self.assertEqual(payload["order_fail_total"], 3)
+        self.assertGreaterEqual(payload["orders_snapshot_age"], 6)
+        self.gw._orders_snap = {}
+        self.assertEqual(self.gw._health_payload()["orders_snapshot_age"], -1)
+
+    def test_admin_status_stuck_cancel(self):
+        self.store.upsert_order(_row(status="撤单中", created_at=gw_mod._now_cn()[:10] + " 09:31:53"))
+        status, payload = self.gw._do_admin_status()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["stuck_cancel_orders"]["n"], 1)
+        self.assertGreater(payload["stuck_cancel_orders"]["oldest_age_sec"], 0)
 
 
 class TestOrdersEndpoint(_GatewayCase):

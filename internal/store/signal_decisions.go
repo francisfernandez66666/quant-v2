@@ -45,6 +45,25 @@ type SignalDecision struct {
 	MissingKeyInput bool    `json:"missing_key_input"`
 	CashStale       bool    `json:"cash_stale"`
 	Reason          string  `json:"reason"`
+	// PendingNote §P1-1（2026-10-30）在途买单占用明细（如「300502×100@195.01 撤单中」）。
+	// 事故当天「受限项=target」只有一个词，看不出 3.6 万是被卡单占的；本列把占用来源点名。
+	PendingNote string `json:"pending_note,omitempty"`
+}
+
+// ensureSignalDecisionColumns §P1-1（2026-10-30）：老库补 pending_note 列（幂等）。
+// 列在 Open 时补齐，写路径不必自己建列；缺列时 INSERT 会直接报 no such column。
+func (d *DB) ensureSignalDecisionColumns() error {
+	has, err := d.hasColumn("signal_decisions", "pending_note")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	if _, err := d.db.Exec(`ALTER TABLE signal_decisions ADD COLUMN pending_note TEXT DEFAULT ''`); err != nil {
+		return fmt.Errorf("store migrate signal_decisions add pending_note: %w", err)
+	}
+	return nil
 }
 
 // UpsertSignalDecision 写入/覆盖一条当日快照（同 (user,day,channel,code,strategy,signal) 幂等）。
@@ -65,8 +84,8 @@ func (d *DB) UpsertSignalDecision(x SignalDecision) error {
 		(user_id, day, channel, signal_id, code, strategy_key, at, stage,
 		 market_scale, stock_scale, per_trade_pct, total, cash, target, cur_strat, room,
 		 industry_room, stock_room, cluster_room, capped_by, qty, notional,
-		 missing_key_input, cash_stale, reason)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 missing_key_input, cash_stale, reason, pending_note)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(user_id, day, channel, code, strategy_key, signal_id) DO UPDATE SET
 		 at=excluded.at, stage=excluded.stage,
 		 market_scale=excluded.market_scale, stock_scale=excluded.stock_scale,
@@ -76,11 +95,11 @@ func (d *DB) UpsertSignalDecision(x SignalDecision) error {
 		 cluster_room=excluded.cluster_room, capped_by=excluded.capped_by,
 		 qty=excluded.qty, notional=excluded.notional,
 		 missing_key_input=excluded.missing_key_input, cash_stale=excluded.cash_stale,
-		 reason=excluded.reason`,
+		 reason=excluded.reason, pending_note=excluded.pending_note`,
 		x.UserID, x.Day, orDefaultStr(x.Channel, "live"), pk(), x.Code, x.Strategy,
 		x.At, x.Stage, x.MarketScale, x.StockScale, x.PerTradePct, x.Total, x.Cash,
 		x.Target, x.CurStrat, x.Room, x.IndustryRoom, x.StockRoom, x.ClusterRoom,
-		x.CappedBy, x.Qty, x.Notional, b2i(x.MissingKeyInput), b2i(x.CashStale), x.Reason)
+		x.CappedBy, x.Qty, x.Notional, b2i(x.MissingKeyInput), b2i(x.CashStale), x.Reason, x.PendingNote)
 	return err
 }
 
@@ -89,7 +108,7 @@ func (d *DB) SignalDecisionsForDay(userID, day string) ([]SignalDecision, error)
 	rows, err := d.db.Query(`SELECT user_id, day, channel, signal_id, code, strategy_key, at, stage,
 		market_scale, stock_scale, per_trade_pct, total, cash, target, cur_strat, room,
 		industry_room, stock_room, cluster_room, capped_by, qty, notional,
-		missing_key_input, cash_stale, reason
+		missing_key_input, cash_stale, reason, COALESCE(pending_note,'')
 		FROM signal_decisions WHERE user_id=? AND day=? ORDER BY at DESC, code ASC`, userID, day)
 	if err != nil {
 		return nil, err
@@ -102,7 +121,7 @@ func (d *DB) SignalDecisionsForDay(userID, day string) ([]SignalDecision, error)
 		if err := rows.Scan(&x.UserID, &x.Day, &x.Channel, &x.SignalID, &x.Code, &x.Strategy,
 			&x.At, &x.Stage, &x.MarketScale, &x.StockScale, &x.PerTradePct, &x.Total, &x.Cash,
 			&x.Target, &x.CurStrat, &x.Room, &x.IndustryRoom, &x.StockRoom, &x.ClusterRoom,
-			&x.CappedBy, &x.Qty, &x.Notional, &mk, &cs, &x.Reason); err != nil {
+			&x.CappedBy, &x.Qty, &x.Notional, &mk, &cs, &x.Reason, &x.PendingNote); err != nil {
 			return nil, err
 		}
 		x.MissingKeyInput = mk != 0

@@ -192,7 +192,10 @@ type Engine struct {
 	// fundsLoopOn §FUNDS-TODAY（2026-10-30）资金帧心跳 goroutine 的幂等启动标记（e.mu 保护）。
 	// 为什么要把发布从打分循环里摘出来：单轮 scoreCycle 在行情源降级时可达 4~15 分钟，
 	// 发布点绑在它顶部 ⇒ 资金卡最长 15 分钟不刷新，撤单已释放的资金在页面上仍显示冻结。
-	fundsLoopOn  bool
+	fundsLoopOn bool
+	// buyReserve §P0-5（2026-10-30）同轮并发下单的预算预占（见 buy_reserve.go）。
+	// 键 = uid|signal_id，值带 TTL；e.mu 保护。
+	buyReserve   map[string]buyReserveEntry
 	cfgMgr       *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
 	longEnabled  bool            // 利好开关（做多分支）
 	shortEnabled bool            // 利空开关（做空分支）
@@ -1591,6 +1594,9 @@ type dynBuyReadout struct {
 	Notional        float64
 	MissingKeyInput bool
 	CashStale       bool
+	// PendingNote §P1-1（2026-10-30）在途买单占用的一句话摘要（空=无在途）。
+	// 事故当天「受限项=target」看不出是谁占的，这条把代码/数量/状态点出来。
+	PendingNote string
 }
 
 func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64, sizingCfg config.SizingConfig, ctrl *trading.Controller, ctx dynBudgetCtx) (int, *dynBuyReadout) {
@@ -1820,8 +1826,19 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	// 现在两条路径共用同一个函数，差异只剩**输入**（价格源、缺价策略），而这两项是刻意保留的
 	// （执法 fail-closed 不买、卡片必须有读数），见 §W-06「另外两处差异」。
 	// 注意：marketScale 未做 min(ceiling) —— 这一步在函数里做（math.Min 只允许一处）。
+	out.PendingNote = pendingBuysNote(pend)
 	targetVal, curStrat, room, _ := fundsTargetCurRoom(
 		total, marketScale, ceiling, posByCode, posPrices, pend, book)
+	// §P0-5（2026-10-30）：扣掉"已定量、还没落库"的同轮预占。
+	// 不加这一句，同一轮的多笔信号会各自按同一份余额定量，合计穿透目标仓位
+	// （当天实测：三笔 52,497 对剩余 40,915，最终超目标 11,616）。
+	if reserved := e.reservedBuyAmount(uid); reserved > 0 {
+		room -= reserved
+		if room < 0 {
+			room = 0
+		}
+		log.Printf("[qmt] %s(%s) §P0-5 预算预占 已占=%.0f 剩余=%.0f", sig.Code, sig.Name, reserved, room)
+	}
 	// 日志用的"目标占比"直接由 target 反推，不再自己写一遍 min(MS, ceiling)——
 	// 那正是本批要消灭的第二份实现（门禁 #11 钉住本文件里不许再出现那几个局部量名——
 	// 注释里也不能写，否则 grep 锁会被注释命中，看起来像"还在算"）。
@@ -1943,6 +1960,14 @@ func (e *Engine) persistDynBuyDecision(sig combat_agent.Signal, d *dynBuyReadout
 	if reason == "" && d.CappedBy != "" {
 		reason = "受限于 " + d.CappedBy
 	}
+	// §P1-1：被目标仓位拦住、或被其它原因跳过时，把在途买单占用一并写进「原因」——
+	// 这样信号表的「受限项/原因」不再只有一个 target，而是能点到具体代码与状态。
+	if d.PendingNote != "" && (stage == "skipped" || d.CappedBy == "target") {
+		if reason != "" {
+			reason += "；"
+		}
+		reason += "在途买单占用：" + d.PendingNote
+	}
 	// 落库失败只告警不阻断下单（既有纪律，保留）。逐成员写：每个 uid 一次，
 	// 失败只影响那一个账号，不让别人的快照跟着丢。
 	for _, uid := range uids {
@@ -1958,6 +1983,7 @@ func (e *Engine) persistDynBuyDecision(sig combat_agent.Signal, d *dynBuyReadout
 			IndustryRoom: d.IndustryRoom, StockRoom: d.StockRoom, ClusterRoom: d.ClusterRoom,
 			CappedBy: d.CappedBy, Qty: d.Qty, Notional: d.Notional,
 			MissingKeyInput: d.MissingKeyInput, CashStale: d.CashStale, Reason: reason,
+			PendingNote: d.PendingNote,
 		}); err != nil {
 			log.Printf("[qmt] %s §DECISION-TODAY 决策快照落库失败（不阻断下单）uid=%s：%v", sig.Code, uid, err)
 		}
@@ -2387,6 +2413,10 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	// one merged admission yet carried two distinct buy keys (theoretical double-order per day).
 	stratKey := signalctl.StrategyKeyOf(sig)
 	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), stratKey, data.TradingDayDate(time.Now()))
+	// §P0-5（2026-10-30）：入队前占住本单金额。占位动作必须与"定量"同 goroutine——
+	// 下一笔信号在同一轮里定量时才能看见它（async 落库前的那段空窗就是当天穿透的根因）。
+	// worker 完成/失败即释放；进程异常退出的残留在 TTL 后自动过期。
+	e.reserveBuyBudget(e.budgetUID(), id, float64(qty)*entryPrice)
 	// 组装买入订单请求：金额按数量×价格计算，幂等键随信号 ID 传递。
 	// §WS-C 行情上下文装配：StalenessMs（fetcher 快照陈旧度）/ CurrentPrice / PrevClose 供
 	// risk.Gate 的行情新鲜度、集中度与涨跌停不可追单闸消费（缺失时对应闸 fail-open）。
@@ -2474,6 +2504,10 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 // business rejections feed a per-code exponential backoff so a doomed order is no longer re-dialed
 // every scoring cycle; transport errors stay retryable and success clears the ledger.
 func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal) {
+	// §P0-5：worker 离开即释放预算预占（成功/失败/异常都走这一条），
+	// 之后该单占用由 orders 表的 PendingBuys 接管，不重复计。
+	uid := e.budgetUID()
+	defer e.releaseBuyBudget(uid, req.SignalID)
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
 	e.mu.RUnlock()
@@ -2481,6 +2515,17 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 		return
 	}
 	if !e.buyRejectAllow(req.Code) {
+		return
+	}
+	// §P0-5 兜底：发送前用最新读数复核剩余空间（含他人预占）。超了就跳过并留痕，
+	// 不再让"定量时的余额"一路带到柜台。读数不可得时放行（见 sendRoomGuard 说明）。
+	if ok, limit := e.sendRoomGuard(uid, req.Amount, req.SignalID); !ok {
+		log.Printf("[qmt] %s(%s) §P0-5 发送前复核不通过：本单 %.0f 超剩余 %.0f，跳过",
+			sig.Code, sig.Name, req.Amount, limit)
+		opslog.DayOnce("p05-sendguard:"+sig.Code, func() {
+			opslog.Logf("quant", "§P0-5 发送前复核拦截 %s(%s) 金额=%.0f 剩余=%.0f（并发预占/仓位变化）",
+				sig.Code, sig.Name, req.Amount, limit)
+		})
 		return
 	}
 	res, err := ctrl.PlaceOrder(req)

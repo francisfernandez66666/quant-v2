@@ -109,3 +109,80 @@ func TestUpdateRealOrderBackfillKeepsStatusOnIDCollision(t *testing.T) {
 		}
 	}
 }
+
+// TestPendingBuysExposeCancelAge §P1-1：在途买入必须带撤单时刻，卡单统计能算出滞留时长。
+func TestPendingBuysExposeCancelAge(t *testing.T) {
+	db := openTestDB(t)
+	uid := "u_p1"
+	day := time.Now().Format("2006-01-02")
+	if _, err := db.UpsertRealOrder(RealOrder{
+		OrderID: "seq:1", SignalID: "buy:300502:fac_150:20261030", Code: "300502.SZ",
+		Side: "买入", Status: "撤单中", Price: 195.01, Qty: 100,
+		CreatedAt: day + " 09:31:53", UserID: uid,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.db.Exec(`UPDATE orders SET cancel_requested_at=? WHERE signal_id=? AND user_id=?`,
+		day+" 09:37:42", "buy:300502:fac_150:20261030", uid); err != nil {
+		t.Fatalf("set cancel time: %v", err)
+	}
+	pend, err := db.PendingBuys(uid, day)
+	if err != nil || len(pend) != 1 {
+		t.Fatalf("PendingBuys: n=%d err=%v", len(pend), err)
+	}
+	if pend[0].CancelRequestedAt != day+" 09:37:42" {
+		t.Fatalf("在途单必须带撤单时刻, got %q", pend[0].CancelRequestedAt)
+	}
+	n, age, err := db.CountStuckCancelBuys(uid, day)
+	if err != nil || n != 1 {
+		t.Fatalf("卡单统计: n=%d err=%v", n, err)
+	}
+	if age <= 0 {
+		t.Fatalf("卡单滞留时长应大于 0, got %v", age)
+	}
+}
+
+// TestUpdateRealOrderWritesBrokerID §P1-5：回填必须把真实委托号写进审计列。
+func TestUpdateRealOrderWritesBrokerID(t *testing.T) {
+	db := openTestDB(t)
+	uid := "u_p5"
+	sid := "SIG-P5"
+	if _, err := db.UpsertRealOrder(RealOrder{
+		OrderID: "pend:" + sid, SignalID: sid, Code: "600000.SH", Side: "买入",
+		Status: "已报", Price: 10, Qty: 100,
+		CreatedAt: time.Now().Format(time.RFC3339), UserID: uid,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := db.UpdateRealOrderBySignalID(uid, sid, "xt123", "已报"); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	var broker string
+	if err := db.db.QueryRow(`SELECT COALESCE(broker_order_id,'') FROM orders WHERE signal_id=? AND user_id=?`, sid, uid).Scan(&broker); err != nil {
+		t.Fatalf("read broker id: %v", err)
+	}
+	if broker != "xt123" {
+		t.Fatalf("broker_order_id 应为 xt123, got %q", broker)
+	}
+	// 撞键路径也要落审计号
+	sid2 := "SIG-P5B"
+	if _, err := db.UpsertRealOrder(RealOrder{
+		OrderID: "pend:" + sid2, SignalID: sid2, Code: "600001.SH", Side: "买入",
+		Status: "已报", Price: 10, Qty: 100,
+		CreatedAt: time.Now().Format(time.RFC3339), UserID: uid,
+	}); err != nil {
+		t.Fatalf("seed2: %v", err)
+	}
+	if err := db.UpdateRealOrderBySignalID(uid, sid2, "xt123", "部成"); err != nil {
+		t.Fatalf("collision backfill 不应上抛: %v", err)
+	}
+	if err := db.db.QueryRow(`SELECT COALESCE(broker_order_id,'') FROM orders WHERE signal_id=? AND user_id=?`, sid2, uid).Scan(&broker); err != nil {
+		t.Fatalf("read broker id2: %v", err)
+	}
+	if broker != "xt123" {
+		t.Fatalf("撞键时真实号仍须落审计列, got %q", broker)
+	}
+	if st, _ := db.RealOrderStatusForUser(uid, sid2); st != "部成" {
+		t.Fatalf("撞键时状态仍须落库, got %q", st)
+	}
+}

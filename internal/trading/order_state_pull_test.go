@@ -130,10 +130,65 @@ func TestPlaceOrderTerminalRejectionRetiresSignal(t *testing.T) {
 	if blocked, _ := db.IsOrderRetryBlocked(uid, sid); !blocked {
 		t.Fatal("终态后必须置当日重发禁令")
 	}
-	if _, err := ctrl.PlaceOrder(buyReq(sid, 1000)); err != nil {
-		t.Fatalf("重复调用不应报错: %v", err)
+	// 连发 5 轮：只允许第一轮打到网关（方案 §8.1 的"重发 5 轮只发一次"）。
+	for i := 0; i < 5; i++ {
+		if _, err := ctrl.PlaceOrder(buyReq(sid, 1000)); err != nil {
+			t.Fatalf("重复调用不应报错: %v", err)
+		}
 	}
 	if stub.calls != 1 {
 		t.Fatalf("置禁令后不得再打网关, calls=%d", stub.calls)
+	}
+}
+
+// TestReconcileMissingOrdersPhase2 §8.3 阶段二（默认关）：连续 6 轮查无此单 → 废单；
+// 开关关着时同样的输入**一笔都不动**（这条是"放预算"的推断，必须显式开）。
+func TestReconcileMissingOrdersPhase2(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 非空快照里只有一笔无关委托：本地的卡单在网关账里"查无此单"
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true,
+			"orders": []map[string]any{
+				{"order_id": "other1", "signal_id": "OTHER", "code": "600000.SH", "side": "买入", "status": "已报"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	db := testDB(t)
+	uid := "u_p2"
+	sid := "buy:300502:fac_150:20261030"
+	if _, err := db.UpsertRealOrder(store.RealOrder{
+		OrderID: "xt999", SignalID: sid, Code: "300502.SZ", Side: SideBuy,
+		Status: "撤单中", Price: 195.01, Qty: 100,
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"), UserID: uid,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.GatewayURL = srv.URL
+	cfg.Token = "tk"
+	ctrl := NewController(guardServer(), db, uid, cfg, nil)
+
+	// 开关关：6 轮后仍停在撤单中
+	base := time.Now()
+	for i := 0; i < 6; i++ {
+		ctrl.ReconcileOrderStates(base.Add(time.Duration(i) * 31 * time.Second))
+	}
+	if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {
+		t.Fatalf("阶段二默认关时不得改动状态, got %q", st)
+	}
+
+	// 打开开关：再 6 轮 → 废单
+	cfg2 := cfg
+	cfg2.OrderStatePullCloseMissing = true
+	ctrl.UpdateConfig(cfg2)
+	base = base.Add(10 * time.Minute)
+	for i := 0; i < 6; i++ {
+		ctrl.ReconcileOrderStates(base.Add(time.Duration(i) * 31 * time.Second))
+	}
+	if st, _ := db.RealOrderStatusForUser(uid, sid); st != "废单" {
+		t.Fatalf("阶段二开启后连续 6 轮查无此单应判废单, got %q", st)
 	}
 }
