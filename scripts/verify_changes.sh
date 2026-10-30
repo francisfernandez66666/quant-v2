@@ -2945,6 +2945,128 @@ if [ "$B143_V3" != "0" ]; then
 	B143_FAILED=1
 fi
 echo "ok - §143 反证 V3（src5 写侧只认 owner 条目；注入全文替换、摘掉 -Uid 两处全红）"
+# 反证腿 V4（驱动判读：今天新加的两条判据必须"摘了会红"，2026-10-31）。
+# 为什么单独立一条：写侧改完之后，运维会不会踩坑取决于**驱动的判读**——
+# ①认不认缺省形态的 ALIGN_NO_SPREAD（不认就把"一条都没写"报成"半态待回滚"）；
+# ②写后复读只判 owner_fp（回到"每个指纹都要等于对齐值"会逼着去洗别人的在册钥匙＝资损面）。
+# 这两条原先只有静态 grep 锚点：把 case 里那条 `*)` 判红分支整段删掉，锚点照样绿＝摆设。
+B143_V4=0
+python3 - scripts/rotate_qmt_token_guangzhou.sh <<'PYV4' || B143_V4=1
+import re, sys
+
+NEED = {
+    '缺省形态识别（ALIGN_NO_SPREAD 那条 grep）': r"grep -qF 'ALIGN_NO_SPREAD'",
+    'owner_fp 四态判读的 case 头': r'case "\$OFP" in',
+    'owner_fp 与对齐值一致那条腿': r'"owner_fp=sha256:\$\{NEWFP\}"',
+    'owner_fp 不匹配必判红的兜底分支': r'\*\)\s+echo "X 写后复读 owner_fp != 本轮对齐值',
+}
+FORBID = {
+    # 旧判据「src5 出现的每个指纹都必须等于对齐值」——逐账号形态下这是逼着去洗别人的钥匙
+    '又回到"src5 全部指纹必须同值"的旧判据': r'src5 快照指纹仍含非对齐值',
+}
+
+
+def check(t):
+    for name, pat in NEED.items():
+        if not re.search(pat, t):
+            return '驱动判读缺一条：' + name
+    for name, pat in FORBID.items():
+        if re.search(pat, t):
+            return name
+    return None
+
+
+t = open(sys.argv[1], encoding='utf-8').read()
+red = check(t)
+if red is not None:
+    print('POSITIVE_FAILED: ' + red)
+    raise SystemExit(1)
+m = re.search(r'    \*\)\s+echo "X 写后复读 owner_fp != 本轮对齐值[^"]*"[^\n]*\n', t)
+if not m:
+    print('ANCHOR_MISSING: 抓不到 owner_fp 的 *) 分支，反证没法注入')
+    raise SystemExit(1)
+# 反证①：摘掉兜底判红分支（换成一行了事）⇒ 必红
+if check(t[:m.start()] + '    *)         echo "ok - 兜底被摘掉（反证注入）"\n' + t[m.end():]) is None:
+    print('MUTATION_STILL_GREEN: 摘掉 owner_fp 不匹配的判红分支后仍判绿')
+    raise SystemExit(1)
+# 反证②：缺省形态识别永不匹配（＝驱动不认这条锚点）⇒ 必红
+if check(t.replace("grep -qF 'ALIGN_NO_SPREAD'", "grep -qF 'NEVER_MATCH_ZZ_V4'", 1)) is None:
+    print('MUTATION_STILL_GREEN: 驱动不再认 ALIGN_NO_SPREAD 也照样判绿')
+    raise SystemExit(1)
+# 反证③：把旧判据那行注回去 ⇒ 必红（负锁真的在守，不是写在纸上）
+if check(t.replace('  echo "ok - 写后复读一致：',
+                   '  echo "X 写后复读 src5 快照指纹仍含非对齐值"\n  echo "ok - 写后复读一致：', 1)) is None:
+    print('MUTATION_STILL_GREEN: 旧的"全部指纹同值"判据被注回仍判绿')
+    raise SystemExit(1)
+raise SystemExit(0)
+PYV4
+if [ "$B143_V4" != "0" ]; then
+	echo "--- FAIL: §143 反证 V4（驱动判读缺一条，或摘掉判红分支/永不匹配/注回旧判据后仍判绿＝这条锁是摆设）"
+	FAIL=1
+	B143_FAILED=1
+fi
+echo "ok - §143 反证 V4（驱动认 ALIGN_NO_SPREAD 与只判 owner_fp；摘兜底、永不匹配、注回旧判据三处全红）"
+# 反证腿 V4（驱动侧那两条新判据必须"删了会红"，2026-10-31 拆枪配套）。
+# 为什么单独立一条：ps1 的写形改完之后，真正决定运维会不会踩坑的是**驱动的判读**——
+# ①认不认缺省形态的 ALIGN_NO_SPREAD（不认就把"一条都没写"报成"半态待回滚"）；
+# ②写后复读只判 owner_fp（改成"每个指纹都要等于对齐值"会去逼着洗别人的在册钥匙＝资损面）。
+# 这两条原来只有静态 grep 锚点：把 case 里那条 `*)` 判红分支整段删掉，锚点照样绿＝摆设。
+B143_V4=0
+python3 - scripts/rotate_qmt_token_guangzhou.sh <<'PYV4'
+import re, sys
+
+NEED = {
+    '缺省形态识别（ALIGN_NO_SPREAD 那条 grep）': r"grep -qF 'ALIGN_NO_SPREAD'",
+    'owner_fp 判读四态的 case 头': r'case "\$OFP" in',
+    'owner_fp 一致那条腿': r'"owner_fp=sha256:\$\{NEWFP\}"',
+    'owner_fp 不匹配必判红的兜底分支': r'\*\)\s+echo "X 写后复读 owner_fp != 本轮对齐值',
+}
+FORBID = {
+    # 旧判据"src5 出现的每个指纹都必须等于对齐值"——逐账号形态下这是逼着去洗别人的钥匙
+    '又回到"src5 全部指纹必须同值"的旧判据': r'src5 快照指纹仍含非对齐值',
+}
+
+
+def check(t):
+    for name, pat in NEED.items():
+        if not re.search(pat, t):
+            return '驱动判读缺一条：' + name
+    for name, pat in FORBID.items():
+        if re.search(pat, t):
+            return name
+    return None
+
+
+t = open(sys.argv[1], encoding='utf-8').read()
+red = check(t)
+if red is not None:
+    print('POSITIVE_FAILED: ' + red)
+    raise SystemExit(1)
+# 反证①：摘掉 owner_fp 不匹配的兜底判红分支（改成"照打一行 ok"）⇒ 必红
+m = re.search(r'    \*\)\s+echo "X 写后复读 owner_fp != 本轮对齐值[^"]*"[^\n]*', t)
+if not m:
+    print('ANCHOR_MISSING: 抓不到 owner_fp 的 *) 分支，反证没法注入')
+    raise SystemExit(1)
+if check(t[:m.start()] + '    *)         echo "ok - 兜底被摘掉（反证注入）"\n' + t[m.end():]) is None:
+    print('MUTATION_STILL_GREEN: 摘掉 owner_fp 不匹配的判红分支后仍判绿')
+    raise SystemExit(1)
+# 反证②：把缺省形态识别改成永不匹配 ⇒ 必红（等价于"驱动不认这条锚点"）
+if check(t.replace("grep -qF 'ALIGN_NO_SPREAD'", "grep -qF 'NEVER_MATCH_ZZ_V4'", 1)) is None:
+    print('MUTATION_STILL_GREEN: 驱动不再认 ALIGN_NO_SPREAD 也照样判绿')
+    raise SystemExit(1)
+# 反证③：把旧判据那行注回去 ⇒ 必红（负锁真的在守）
+if check(t.replace('  echo "ok - 写后复读一致：',
+                   '  echo "X 写后复读 src5 快照指纹仍含非对齐值"\n  echo "ok - 写后复读一致：', 1)) is None:
+    print('MUTATION_STILL_GREEN: 旧的"全部指纹同值"判据被注回仍判绿')
+    raise SystemExit(1)
+raise SystemExit(0)
+PYV4
+if [ "$B143_V4" != "0" ]; then
+	echo "--- FAIL: §143 反证 V4（驱动那两条新判据不成立，或摘掉判红分支/永不匹配/注回旧判据后仍判绿＝这条锁是摆设）"
+	FAIL=1
+	B143_FAILED=1
+fi
+echo "ok - §143 反证 V4（驱动认 ALIGN_NO_SPREAD 与只判 owner_fp；摘兜底、永不匹配、注回旧判据三处全红）"
 # 负锁：轮换脚本不得把新 token 明文写进任何输出（本仓库铁律：输出只准键名/计数/指纹）。
 if grep -qE '\+ \$newToken|\$\{newToken\}' deploy/qmt-win/rotate_qmt_token.ps1; then
 	echo "--- FAIL: 轮换脚本出现回显新 token 明文的路径"; exit 1; fi
@@ -17407,6 +17529,6 @@ if grep -q 'authStaleVals\|stale_kinds' deploy/qmt-win/rotate_qmt_token.ps1; the
 fi
 
 [ "$B143_FAILED" = "0" ] || exit 1
-echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1 + 拆 first-match 与拆枪 1 + 反证 V3（旧枪注回/摘掉 -Uid 必红）1，累计判定点 ${CNT143}）"
+echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1 + 拆 first-match 与拆枪 1 + 反证 V3（旧枪注回/摘掉 -Uid 必红）1 + 反证 V4（驱动判读三处摘锁必红）1，累计判定点 ${CNT143}）"
 
 echo "==> 全部通过"
