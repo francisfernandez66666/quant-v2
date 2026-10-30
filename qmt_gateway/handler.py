@@ -172,13 +172,15 @@ class ReportHandler:
     # §清算 Guard 阈值：账户持仓市值低于该值视为"事实上无持仓"允许清账本（元）。
     CLEAR_GUARD_MIN_MV = 1.0
 
-    def __init__(self, store, report_url, report_token, user_id="", max_outbox=5000):
+    def __init__(self, store, report_url, report_token, user_id="", max_outbox=5000, token_for=None):
         """构造回报处理器。
 
         :param store: 本地 SQLite 账本（Store 实例）。
         :param report_url: 首尔回报接收地址（引擎 /api/qmt/report）。
         :param report_token: 回报鉴权 token（与首尔侧配置一致）。
         :param user_id: 多账号归属标识（§P1-9），回报/落库统一携带。
+        :param token_for: 可选回调 `uid -> report token`（§TOKEN-PERAACCT）：出向按事件归属账号
+            用那一把在册钥匙上报，让首尔侧"钥匙→账号"的既有归属逻辑天然分开；返回空=用默认钥匙。
         :param max_outbox: outbox 落库行数**告警水位**——§0926E2E-W2D 起超限只告警冻结、
             不自动删除（旧语义"裁剪最旧"会静默销毁最早的成交回报，资金事实不可再生）。
             人工收敛：python outbox_admin.py --store <db> --keep N --yes。
@@ -189,6 +191,11 @@ class ReportHandler:
         self.report_url = report_url
         self.report_token = report_token
         self.user_id = user_id
+        # §TOKEN-PERAACCT（2026-10-30）出向钥匙按事件归属账号选取：`token_for(uid)` 由网关
+        # 用入向同一把注册表反查提供。回退语义是硬要求——**找不到对应钥匙就照旧用默认那把发**，
+        # 绝不因为"归属对不上"就把成交/委托回报扣在本地（那是把可观测的错变成静默的丢账）。
+        self._token_for = token_for
+        self._report_token_fallback = 0
         # §ORDER-ID-REUSE（2026-10-30）：委托事件落库失败累计次数（/health order_fail_total）。
         # 非零=终态回报曾写不进本地副本，必须去看网关日志；已推给决策端的事实不受影响。
         self._order_store_fail_total = 0
@@ -259,7 +266,22 @@ class ReportHandler:
                 log.error("[handler] outbox row %s unparsable — dropped", oid)
                 self.store.outbox_delete(oid)
                 continue
-            ok, status = post_report_status(self.report_url, self.report_token, payload)
+            # §TOKEN-PERAACCT：出向钥匙按事件归属账号选（首尔侧仍只认"这把钥匙属于哪个账号"，
+            # 回报体里的 user_id 继续一律不信——归属靠钥匙，不靠自报）。
+            # 取不到对应钥匙就退回默认钥匙并计数：扣着不发是丢账，发错钥匙最多是被 401 后重试。
+            # 计数只在"事件确实标了归属、但注册表里没有那把钥匙"时上涨；无归属事件走默认是常态。
+            tok = self.report_token
+            ev_uid = str(payload.get("user_id") or "")
+            try:
+                if self._token_for is not None and ev_uid:
+                    picked = self._token_for(ev_uid)
+                    if picked:
+                        tok = picked
+                    else:
+                        self._report_token_fallback += 1
+            except Exception:  # noqa: BLE001 — 钥匙解析绝不允许卡死回报队列
+                log.exception("[handler] §TOKEN-PERAACCT 出向钥匙解析失败，回退默认钥匙")
+            ok, status = post_report_status(self.report_url, tok, payload)
             if ok:
                 self.store.outbox_delete(oid)
                 backoff = 2
@@ -518,6 +540,39 @@ class ReportHandler:
         return "%s(%s)" % (UNKNOWN_STATUS_PREFIX, raw)
 
     # ── 事件落库 + 推送 ──
+    def _resolve_uid(self, signal_id="", order_id=""):
+        """委托/成交事件的归属账号（§TOKEN-PERAACCT，2026-10-30）。
+
+        顺序：网关自己的 orders 行（下单时由入向钥匙写下）→ dispatch 派发行（同一把钥匙写的）
+        → 处理器级账号（owner）。
+        为什么必须有兜底而不是留空：回报体的归属最终由"这把钥匙属于谁"决定，空归属会让
+        首尔侧回退到 users 顺序里第一个命中者——那正是 10-30 双份账（下单方自己那行没人推进）的成因。
+        English: resolves which app account an order/fill event belongs to, preferring the
+        ledger rows written under that account's own inbound token, falling back to the
+        ledger owner — never an empty attribution.
+        """
+        for name, arg in (("order_by_signal", signal_id),
+                          ("dispatch_by_signal_id", signal_id),
+                          ("dispatch_by_order_id", order_id)):
+            if not arg:
+                continue
+            try:
+                # 按名字取再调用：替身 store 可能没有这两个方法，方法名绑定不能写在 try 外
+                fn = getattr(self.store, name)
+                row = fn(arg)
+            except Exception:  # noqa: BLE001 — 归属解析失败绝不影响事件本身
+                log.warning("[handler] §TOKEN-PERAACCT 归属解析查询失败 %s arg=%s", name, arg)
+                continue
+            if row is None:
+                continue
+            try:
+                uid = str((dict(row) if not isinstance(row, dict) else row).get("user_id") or "")
+            except Exception:  # noqa: BLE001
+                continue
+            if uid:
+                return uid
+        return self.user_id
+
     def on_order(self, ev):
         """委托回报回调：落库并推送首尔。无 signal_id 的委托忽略（无法归因/幂等）。
 
@@ -533,8 +588,8 @@ class ReportHandler:
             if not ev.get("signal_id"):
                 log.info("[handler] order without signal_id, skip: %s", ev)
                 return
-            # §P1-9 落库携带归属账号 ID（多账号隔离）
-            ev["user_id"] = self.user_id
+            # §P1-9 落库携带归属账号 ID；§TOKEN-PERAACCT 起按下单账号解析（回退 owner）
+            ev["user_id"] = self._resolve_uid(ev.get("signal_id", ""), ev.get("order_id", ""))
             # §ORDER-ID-REUSE（2026-10-30）：落库失败**不许拖累转发**。
             # 旧实现把 upsert_order 和 _push 包在同一个 try 里：一次 UNIQUE 撞键（跨日委托号
             # 复用）就把整个事件丢弃，终态永远到不了决策端——10-30 300502 的「废单」就是这样
@@ -577,8 +632,8 @@ class ReportHandler:
         # §修复 G3（2026-08-29）：回调异常保护（见 on_order 说明）。
         try:
             # 成交先落库并去重；重复重放不推送，避免持仓翻倍
-            # §P1-9 落库携带归属账号 ID（多账号隔离）
-            ev["user_id"] = self.user_id
+            # §P1-9 落库携带归属账号 ID；§TOKEN-PERAACCT 起按这笔成交所属委托的账号解析
+            ev["user_id"] = self._resolve_uid(ev.get("signal_id", ""), ev.get("order_id", ""))
             # §SIDE-AUTH-2（2026-09-23 夜间批）方向未经派发行证实的成交：本地账走
             # 「待核对」通道（store.apply_fill 落 fills 但不动 real_positions），
             # 上报载荷原样带 side_unverified 供首尔侧留痕拒入账本。为什么不能照常落账：
@@ -697,7 +752,10 @@ class ReportHandler:
         # 未配置上报地址则直接丢弃（本地联调场景）
         if not self.report_url:
             return
-        payload["user_id"] = self.user_id
+        # 归属账号：事件装配方已按真实下单账号写明就保留（§TOKEN-PERAACCT），
+        # 没有归属信息（持仓/资金这类账户级事实，或手动单）才落回处理器级账号。
+        if not payload.get("user_id"):
+            payload["user_id"] = self.user_id
         # §ROBUST 先落库后发送：崩溃/重启不丢回报
         self.store.outbox_enqueue(payload)
         # §0926E2E-W2D 冻结语义：超限只吵（跨阈值即时告警 + 每加深 50 行追一条），绝不删。

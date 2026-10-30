@@ -4,7 +4,8 @@
 # 用法（普通或管理员 PowerShell 均可）：
 #   powershell -ExecutionPolicy Bypass -File setup_windows.ps1                        # 交互式
 #   powershell -ExecutionPolicy Bypass -File setup_windows.ps1 -Account 8800661234 -SelfTest
-# 说明：token 生成后要同步到首尔侧 rules.qmt.token（三处一致：token / report_token / 首尔账号配置）。
+# 说明（§TOKEN-PERAACCT 2026-10-30 改口径）：token 生成后只同步到**持有实盘那一个账号**的配置快照，
+# 不再写引擎全局 rules.qmt.token——全局兜底位一旦持有实盘凭证，所有没有自己快照的账号都会继承它。
 param(
     [string]$Account = "",         # 东莞证券资金账号（留空则交互输入）
     [string]$Token = "",           # 网关 Bearer token（留空则自动生成 48 位 hex）
@@ -108,7 +109,7 @@ $cfg = [ordered]@{
     user_id        = ""                           # 回报归属由 token 解析（§GAP2-W1），无需填写
     db             = "data.db"
     report_url     = "https://quant-trading.top"  # 首尔生产（Caddy 反代 /api）
-    report_token   = $Token                       # 必须与首尔侧 rules.qmt.token 一致
+    report_token   = $Token                       # 回报鉴权钥匙（与 owner 账号快照里的 token 同源，不是全局兜底位）
     reconcile_sec  = 60
     max_positions  = 10
     seed           = @()
@@ -122,7 +123,7 @@ Ok "已生成 $cfgPath"
 
 Write-Host ""
 Write-Host "==============================================================" -ForegroundColor Magenta
-Info "请记录 token（三处一致）：config.xt.json 的 token/report_token = 首尔侧 rules.qmt.token"
+Info "请记录 token：config.xt.json 的 token/report_token 与 owner 账号快照的 qmt.token 同源（全局 rules.qmt.token 保持为空，见 RUNBOOK §3.5）"
 Write-Host "    $Token" -ForegroundColor Magenta
 Write-Host "==============================================================" -ForegroundColor Magenta
 Write-Host ""

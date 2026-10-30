@@ -37,9 +37,15 @@
 #      .disabled-* 不算在位）且 :8799 无该目标监听；②**安全阀态**——落盘的 decommission_qmt_mock.ps1
 #      确实是"缺省预览 + 显式 -Apply 才动手"。判据 ② 是本次改缺省方向后新增的，理由见探针正文注释。
 #      判据明细全 ASCII：PS→SSH→bash 回传按 GBK 解码，任何中文明细的 grep 都是永久性假绿。
-#  13) §QMT-TOKENROT（2026-09-23，第 20 探针）：网关 token 四源指纹分歧检测（只比 sha256 前
-#      8 位，绝不回显值）。四源=①config.xt.json ②服务 AppEnvironmentExtra 的 QUANT_GATEWAY_*
-#      覆盖（注册表直读）③引擎 config.json rules.qmt.token ④桥进程 --token/cmdline。
+#  13) §QMT-TOKENROT（2026-09-23 建，2026-10-30 §TOKEN-PERAACCT 改判据，第 20 探针）：
+#      网关实盘凭证的**集合自洽**复核（只比 sha256 前 8 位，绝不回显值）。
+#      旧判据"所有可读源（含引擎全局 rules.qmt.token 与每个账号快照）必须同值"已废止——
+#      那条判据本身就在要求把一把实盘钥匙铺给所有账号，正是 10-30 现网七个账号共用一把、
+#      回报恒归 users 顺序第一个（admin）、下单方自己那行没人推进的成因。
+#      新判据三条：R1 网关侧三条腿（①config.xt.json ②服务 env ④桥 cmdline）必须同值；
+#      R2 持有这把在册凭证的账号快照至多一条（snapshot_holders≤1）；
+#      R3 ③引擎全局 rules.qmt.token 不得等于任何一把在册凭证（global_holds_live=0）。
+#      ③b 各账号快照里"不属于本网关在册凭证"的 token 合法（那账号连的是别的网关），不判红。
 #
 #  14) §FILL-AMEND（2026-09-23 夜批，第 21 探针）：勘误/守恒三条新端点路由在位且受 admin 收权——
 #      未鉴权 GET /api/qmt/fill-amendments、/api/qmt/fills/conservation 必须 401，
@@ -766,7 +772,7 @@ if (Test-Path $tk3Path) {
 # 诚实边界：多账号本就允许各配各的网关与口令，所以**只有"全部快照恰好收敛到同一个指纹"时**才把它
 # 当成可比对的源；两个以上不同指纹时记 multi-account(N) 参与展示、不参与判红（绝不凭空造红）。
 $tkAuthPath = $DataDir + "\auth.json"
-$tk3Auth = "no-file"; $tkAccFps = @()
+$tk3Auth = "no-file"; $tkAccFps = @(); $tkAccOwners = @{}
 if (Test-Path $tkAuthPath) {
     try {
         $tkAj = Get-Content -Path $tkAuthPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -778,7 +784,13 @@ if (Test-Path $tkAuthPath) {
             try {
                 $tkR = "$($tkC.value)" | ConvertFrom-Json
                 $tkFp = TokFp([string]$tkR.qmt.token)
-                if ($tkFp) { $tkAccFps += $tkFp; $tk3Auth = "readable" }
+                if ($tkFp) {
+                    $tkAccFps += $tkFp; $tk3Auth = "readable"
+                    # §TOKEN-PERAACCT：记下"这把钥匙被几个账号持有"——一把钥匙两个主人就是
+                    # 今天现网的形态（回报只能按 users 顺序猜归属）。
+                    if (-not $tkAccOwners.ContainsKey($tkFp)) { $tkAccOwners[$tkFp] = @() }
+                    $tkAccOwners[$tkFp] += [string]$tkC.user_id
+                }
             } catch { $tk3Auth = "parse-error" }
         }
     } catch { $tk3Auth = "parse-error" }
@@ -797,8 +809,17 @@ try {
         }
     }
 } catch { $tk4 = "unknown" }
-# 可比对的源 = 真的读出指纹的那些（③b 只在单指纹时进来自证，multi-account 不进判据）。
-$tkPres = @($tk1, $tk2, $tk3, $tk3b, $tk4 | Where-Object { $_ -match '^sha256:' })
+# 可比对的源 = 真的读出指纹的那些。§TOKEN-PERAACCT（2026-10-30）将本探针的判据语义从
+# 「五源同值」改为「凭证集合自洽」——旧判据本身就是缺陷：它要求**全局兜底**和**每一个账号快照**
+# 都等于网关那把真钥匙，等于把实盘凭证按定义铺给全部账号（现网七个账号共用一把、回报只能按
+# users 顺序猜归属，就是这条判据逼出来的形态）。新判据三条：
+#   R1 网关侧三条腿（①文件 / ②服务 env / ④桥命令行）读到的必须是**同一把**（还是老语义：一把钥匙多份副本）；
+#   R2 持有这把在册凭证的**账号快照至多一条**（owner 那一把）——两个账号同指纹＝归属含糊，红；
+#   R3 ③ 引擎**全局** rules.qmt.token 不得等于在册凭证（N1：兜底位不是实盘凭证），红则点名。
+# 快照持有数>1 与 R2 同源；③b 里"不属于任何在册凭证"的快照是合法的（那账号连的是别的网关），不判红。
+$tkRegistry = @($tk1, $tk2, $tk4 | Where-Object { $_ -match '^sha256:' })
+$tkRegistryU = @($tkRegistry | Sort-Object -Unique)
+$tkPres = @($tkRegistry)
 $tkGroups = @($tkPres | Group-Object | Sort-Object -Property Count -Descending)
 $tkAgreeN = 0
 if ($tkGroups.Count -ge 1) { $tkAgreeN = [int]$tkGroups[0].Count }
@@ -807,10 +828,17 @@ if (($tkGroups | Measure-Object).Count -gt 1) { $tkBad += ("token_diverged disti
 $tkRep = @(@($tk1r, $tk2r) | Where-Object { $_ -match '^sha256:' }) | Where-Object { $_ }
 if (($tkRep | Sort-Object -Unique | Measure-Object).Count -gt 1) { $tkBad += "report_token_diverged" }
 if ($tkPres.Count -eq 0) { $tkBad += "no readable source" }
+# R2：在册凭证被几个账号快照持有（明细回显 holders=N，N>1 即红并给出条数，不回显任何明文/uid）
+$tkHolders = 0
+foreach ($fpU in $tkRegistryU) { if ($tkAccOwners.ContainsKey($fpU)) { $tkHolders += @($tkAccOwners[$fpU]).Count } }
+if ($tkHolders -gt 1) { $tkBad += ("live_credential_holders=" + $tkHolders) }
+# R3：全局兜底位还持有实盘凭证 ⇒ 红（这是"任何账号点一次保存就抄走钥匙"的根）
+$tkGlobalHolds = "0"
+if (($tk3 -match '^sha256:') -and ($tkRegistryU -contains $tk3)) { $tkGlobalHolds = "1"; $tkBad += "global_rules_qmt_holds_live_credential" }
 # 明细必须能自证"为什么读不到"：每条腿的空态分开写（no-file / empty-file / empty-field /
 # key-absent / no-bridge-proc / unknown(异常类型)），再给出"本次可读源数 / 期望源数"。
 # 09-23 那两次红只留下一串 `missing`，分不清"探针读法瞎"还是"现网真没配"，白付一晚排查。
-$tkDetail = "token_fp_agree=" + $tkAgreeN + "/" + $tkPres.Count + " readable=" + $tkPres.Count + "/expect=" + $tkExpectReadable + " file=" + $tk1 + $tk1Why + " env=" + $tk2 + $tk2Why + " engine=" + $tk3 + $tk3Why + " engineAuth=" + $tk3b + "(auth=" + $tk3Auth + ")" + " bridge=" + $tk4 + " report_file=" + $(if ($tk1r) { $tk1r } else { "none" }) + " report_env=" + $(if ($tk2r) { $tk2r } else { "none" }) + " miss=" + $(if ($tkBad.Count) { ($tkBad -join ",") } else { "none" })
+$tkDetail = "token_fp_agree=" + $tkAgreeN + "/" + $tkPres.Count + " readable=" + $tkPres.Count + "/expect=" + $tkExpectReadable + " registry=" + $tkRegistryU.Count + " snapshot_holders=" + $tkHolders + " global_holds_live=" + $tkGlobalHolds + " file=" + $tk1 + $tk1Why + " env=" + $tk2 + $tk2Why + " engine=" + $tk3 + $tk3Why + " engineAuth=" + $tk3b + "(auth=" + $tk3Auth + ")" + " bridge=" + $tk4 + " report_file=" + $(if ($tk1r) { $tk1r } else { "none" }) + " report_env=" + $(if ($tk2r) { $tk2r } else { "none" }) + " miss=" + $(if ($tkBad.Count) { ($tkBad -join ",") } else { "none" })
 Probe "qmt:token fp agree across readable sources" ($tkBad.Count -eq 0) $tkDetail
 
 # 14)（对应文件头清单第 15 项）§SIGNAL-DIST（2026-09-24，第 22 个 Probe 调用点／展开后第 22 探针）：

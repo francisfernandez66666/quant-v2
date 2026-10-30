@@ -3594,6 +3594,23 @@ func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
 	return &m.Get().QMT
 }
 
+// StoredQMTConfigFor 返回该账号**自己落过盘**的 QMT 配置（第二返回值 false=它没有自己的文档，
+// 现在读到的都是继承来的：运营账号覆盖或全局 rules.qmt）。§TOKEN-PERAACCT（2026-10-30）
+// 专用于配置写面判断"这份凭证是不是这个账号自己的"——继承来的实盘钥匙绝不允许被顺手抄进
+// 该账号的快照（一次保存就把生产凭证扩散到一个新账号，正是 10-30 现网七个账号共用一把的成因）。
+// English: returns the account's own persisted QMT config (bool=false ⇒ it has none and is reading
+// an inherited one); used by the config-write surface to refuse cloning inherited credentials.
+func (m *Manager) StoredQMTConfigFor(userID string) (QMTConfig, bool) {
+	if m.store == nil || userID == "" {
+		return m.Get().QMT, false
+	}
+	r, ok := m.storedUserRules(userID)
+	if !ok {
+		return QMTConfig{}, false
+	}
+	return r.QMT, true
+}
+
 // SetQMTConfigFor 更新指定账号的 QMT 实盘配置并持久化到该账号的规则快照（5s 热加载生效）。
 // §2026-09-07 从「运营账号系统级共享」改为「按账号落库」：管理员经
 // /api/admin/users/{id}/config/qmt 逐账号配置；账号所有者经 /api/config/qmt 配自己的。

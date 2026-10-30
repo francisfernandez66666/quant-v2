@@ -768,7 +768,10 @@ class QueuedBroker(Broker):
         """
         if not is_valid_side(req.get("side", "")):
             return side_reject(req.get("side", ""))
-        seq = self.store.dispatch_enqueue_order(req, user_id=self.user_id)
+        # §TOKEN-PERAACCT：派发归属优先认请求里带的下单账号（网关按入向钥匙写入），
+        # 没带才回退通道级配置账号——派发行是"谁下的单"的第一手留痕，不能一律记成 owner。
+        seq = self.store.dispatch_enqueue_order(
+            req, user_id=str(req.get("user_id") or self.user_id or ""))
         log.info("[queued] order enqueued %s seq=%s signal=%s", req.get("side"), seq,
                  req.get("signal_id"))
         return True, seq, ""

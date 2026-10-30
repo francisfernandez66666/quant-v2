@@ -48,7 +48,31 @@ param(
     # 以源1（config.xt.json，网关真源）现值为权威，把它复制到源3（引擎 config.json rules.qmt.token）、
     # 源4（config.bridge.json，如在位）与源5（auth.json 账号快照 .qmt.token，§0926ROT-SRC5）。
     # 值只在服务器本地函数栈里过，输出一律指纹。
-    [switch]$Align
+    [switch]$Align,
+    # §TOKEN-PERAACCT（2026-10-30）：一把钥匙铺给所有账号的旧对齐语义就此止步——
+    #  - LegacySpread 是把"源3/源5 仍按源1 复制"的旧路径显式留住的历史开关，**缺省关闭**；
+    #    关闭时 -Align 只对齐源4（桥，物理上必须与网关同钥匙），源3/源5 改为"报告 + 指引签发通道"。
+    #  - RegisterAccount：把一把**已由引擎侧签发到该账号快照**的钥匙登记进网关 account_tokens 注册表；
+    #    钥匙从 stdin 读入（不进命令行、不进日志、不回显），只打印指纹。
+    #  - ShowRegistry：只读列出网关注册表与引擎侧各账号快照的持有关系（一把钥匙两个主人＝红）。
+    # English: per-account credentials — -Align no longer spreads one key to every account unless
+    # -LegacySpread is passed explicitly; -RegisterAccount adds a key from stdin; -ShowRegistry audits holders.
+    [switch]$LegacySpread,
+    [string]$RegisterAccount = "",
+    # §TOKEN-PERAACCT 撤销通道：把某账号快照里的实盘凭证清掉（只动它自己那一条），
+    # 以及把引擎全局 rules.qmt.token 清空（N1：兜底位不该持有实盘凭证）。
+    # 两者都是"摘钥匙"而不是"换钥匙"：摘掉后该账号即使打开实盘开关，敲到网关也只是 401。
+    # §TOKEN-PERAACCT 逐账号签发：生成一把新钥匙并同时落到**两侧**
+    # （网关 account_tokens 注册表 + 该账号自己的配置快照 .qmt.token）。明文只在服务器本地函数栈里过，
+    # 输出一律指纹——这也是为什么没有"生成后打印一次给用户抄"的形态（那会把实盘凭证落进控制台历史）。
+    [string]$Issue = "",
+    [switch]$WriteSnapshot,
+    [switch]$TokenFromGenerate,
+    [string]$RevokeAccount = "",
+    # 撤销时默认只清"等于网关现钥匙"的那把；该账号连的是别的网关时需显式确认才清空
+    [switch]$RevokeAnyToken,
+    [switch]$ClearGlobal,
+    [switch]$ShowRegistry
 )
 $ErrorActionPreference = "Stop"
 
@@ -123,6 +147,254 @@ $cfg = $null
 try { $cfg = Get-Content -Path $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("config.xt.json 解析失败: " + $_.Exception.Message) }
 if ($null -eq $cfg) { Die "config.xt.json 内容为空" }
 Info ("src1 config_file   token=" + (FpLabel([string]$cfg.token)) + " report_token=" + (FpLabel([string]$cfg.report_token)))
+# §TOKEN-PERAACCT：引擎侧账号快照的路径要在**各写模式之前**就定好——旧版把它留在源5 读侧
+# （本行之后几百行），于是 -Issue 里取到的是 $null ⇒ Test-Path 直接抛（22:40 副本实测）。
+# 就地重复定义一次，读侧那行保持原样（§102 的 src5 锚点计数依赖它）。
+$authPath = Join-Path $DataDir "auth.json"
+
+# ── §TOKEN-PERAACCT（2026-10-30）网关注册表通道：只读检视 + 逐账号登记 ──────────────
+# 为什么需要它：一把 `token` 铺给所有 App 账号时，"这把钥匙属于谁"在网关侧不可判定，
+# 回报只能按账号表顺序猜（现网七个账号同一把 ⇒ 下单方自己那行永远没人推进）。
+# 从这一刻起每账号一把钥匙登记进 `account_tokens`，网关鉴权按钥匙反查账号。
+# 边界（刻意的）：本脚本**不碰 auth.json**——引擎侧账号快照是引擎的私有数据，
+# 由它自己的 API/设置页写（有写前快照、写后复读与审计），这里只负责网关这一侧。
+function Get-AuthTokenRegistry($obj) {
+    $items = @()
+    foreach ($t in @($obj.account_tokens)) {
+        if ($null -eq $t) { continue }
+        $tkT = [string]$t.token; $tkU = [string]$t.user_id
+        if ($tkT -and $tkU) { $items += [pscustomobject]@{ user_id = $tkU; token = $tkT; src = "account_tokens" } }
+    }
+    if ([string]$obj.token) {
+        $legacyUid = [string]$obj.owner_user_id
+        if (-not $legacyUid) { $legacyUid = [string]$obj.user_id }
+        $items += [pscustomobject]@{ user_id = $legacyUid; token = [string]$obj.token; src = "legacy_token" }
+    }
+    return ,@($items)
+}
+# -Issue 是"登记 + 生成 + 落两侧"的组合别名：走的是同一个写模式分支（同一套拒判与自证），
+# 不另开第二条写路径——两条写路径迟早漂移，出事时没人知道哪条是真的。
+if ($Issue) {
+    if ($RegisterAccount -and $RegisterAccount -ne $Issue) { Die "Issue refused: -Issue 与 -RegisterAccount 同时给了且不一致" }
+    $RegisterAccount = $Issue
+    $TokenFromGenerate = $true
+    $WriteSnapshot = $true
+}
+
+# ── 账号快照 token 的条目窗口手术（§TOKEN-PERAACCT 的签发/撤销共用）──────────────
+# auth.json 的 configs[] 每条是 {key, value, user_id}，而 value 是**字符串化的整棵 Rules**
+# （内层引号带反斜杠）。所以不能整文件反序列化重排（PS5.1 的 ConvertTo-Json 会把没动过的字段
+# 也洗一遍形态），只能"在目标条目窗口内原文替换"。
+# 唯一性按 **(key, user_id)** 判：一个账号在 configs[] 里本来就有 llm_api_key/consult_pro_mode
+# 等多条，只按 uid 找必然"命中多处"——那是判据写错，不是数据有问题。
+function Get-SnapshotTokenWindow {
+    param([string]$Raw, [string]$Uid)
+    $needle = '"user_id":"' + $Uid + '"'
+    if ($Raw.IndexOf($needle) -lt 0) { $needle = '"user_id": "' + $Uid + '"' }
+    if ($Raw.IndexOf($needle) -lt 0) { throw ("auth.json 原文里没有 user_id=" + $Uid + " 的配置条目") }
+    $cands = @()
+    $scan = 0
+    while (($scan = $Raw.IndexOf($needle, $scan)) -ge 0) {
+        $anyKey = $Raw.LastIndexOf('"key":"', $scan)
+        if ($anyKey -lt 0) { $anyKey = $Raw.LastIndexOf('"key": "', $scan) }
+        $qKey = $Raw.LastIndexOf('"key":"quant_config_json_v1"', $scan)
+        if ($qKey -lt 0) { $qKey = $Raw.LastIndexOf('"key": "quant_config_json_v1"', $scan) }
+        if ($qKey -ge 0 -and $qKey -eq $anyKey) { $cands += [pscustomobject]@{ k = $qKey; n = $scan } }
+        $scan += $needle.Length
+    }
+    if (@($cands).Count -ne 1) {
+        throw ("(quant_config_json_v1, " + $Uid + ") 命中 " + @($cands).Count + " 条（应为恰 1，无法唯一确定条目）")
+    }
+    $kIdx = [int]$cands[0].k
+    # 右边界从**这一条自己的** uid 锚点往后找：第一次命中可能属于同账号的另一条配置
+    $eIdx = $Raw.IndexOf('}', [int]$cands[0].n + $needle.Length)
+    if ($eIdx -lt 0) { throw "条目右边界没找到（形态不认识）" }
+    return @{ start = $kIdx; end = $eIdx; win = $Raw.Substring($kIdx, $eIdx - $kIdx + 1) }
+}
+
+function Set-SnapshotTokenRaw {
+    param([string]$Raw, [string]$Uid, [string]$OldTok, [string]$NewTok)
+    $w = Get-SnapshotTokenWindow -Raw $Raw -Uid $Uid
+    $escOld = '\"token\":\"' + $OldTok + '\"'
+    $n = ([regex]::Matches($w.win, [regex]::Escape($escOld))).Count
+    if ($n -ne 1) {
+        throw ("条目内旧钥匙命中 " + $n + " 次（应为恰 1）——不猜该改哪一处")
+    }
+    $winNew = $w.win.Replace($escOld, ('\"token\":\"' + $NewTok + '\"'))
+    return @{ text = $Raw.Substring(0, $w.start) + $winNew + $Raw.Substring($w.end + 1); delta = $winNew.Length - $w.win.Length }
+}
+
+if ($ShowRegistry) {
+    $reg0 = Get-AuthTokenRegistry $cfg
+    Info ("registry entries=" + @($reg0).Count)
+    foreach ($r in @($reg0)) {
+        Info ("  uid=" + $r.user_id + " token_fp=" + (FpLabel $r.token) + " src=" + $r.src)
+        if (-not $r.user_id) { Warn "  该条没有 user_id ⇒ 网关无法据这把钥匙归因，请补齐或删掉" }
+    }
+    foreach ($g in (@($reg0) | Where-Object { $_.user_id } | Group-Object token)) {
+        if (@($g.Group).Count -gt 1) {
+            Warn ("同一把钥匙挂 " + @($g.Group).Count + " 个账号 fp=" + (FpLabel $g.Name) + " ⇒ 归属不可判定，请撤销多余那条")
+        }
+    }
+    exit 0
+}
+if ($RegisterAccount) {
+    # user_id 只允许安全字符集：它要被拼进 JSON 字面量，不接受"顺手传个引号"
+    if ($RegisterAccount -notmatch '^[A-Za-z0-9_.:@-]{1,64}$') {
+        Die "RegisterAccount refused: user_id 形态非法（只允许字母数字与 . _ : @ -）"
+    }
+    # 钥匙来源二选一：① stdin 读入（不进命令行、不进日志、不回显）；
+    # ② 本地生成 48 位 hex（-Issue 走这条；明文只进函数栈，绝不打印——打印就等于把实盘凭证
+    #    落进 PS 控制台历史与 SSH 会话记录）。
+    $rtok = ""
+    if ($TokenFromGenerate) {
+        # 用 RandomNumberGenerator（CSP 实现），**不要**写 [System.Security.Cryptography+RNGCryptoServiceProvider]：
+        # 那个 `+` 是 C# 的嵌套类型写法，PS5.1 认不出来 ⇒ New-Object 直接 TypeNotFound，
+        # 而本脚本非终止错误形态下会带着空钥匙继续往下走——正是"生成失败却像成功"的形状。
+        try {
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            $buf = New-Object 'byte[]' 24
+            $rng.GetBytes($buf)
+            $rng.Dispose()
+            $rtok = -join ($buf | ForEach-Object { $_.ToString("x2") })
+        } catch {
+            Die ("RegisterAccount refused: 本地生成钥匙失败（" + $_.Exception.Message + "）——拒绝用空钥匙登记")
+        }
+        if ($rtok.Length -lt 32) { Die "RegisterAccount refused: 生成的钥匙长度异常，停手" }
+    } else {
+        $rtokRaw = [Console]::In.ReadLine()
+        $rtok = ("$rtokRaw").Trim()
+    }
+    if (-not $rtok) { Die "RegisterAccount refused: 没拿到钥匙（stdin 空；-Issue 生成失败）——拒绝空登记" }
+    if ($rtok -notmatch '^[A-Za-z0-9]{32,128}$') { Die "RegisterAccount refused: 钥匙形态异常（要求 32-128 位字母数字；明文不回显）" }
+    $rtFp = FpLabel $rtok
+    # 签发的前置确认（顺序有意义）：要落两侧，就先验**引擎侧那一半落得下去**，
+    # 再去改网关注册表。反过来的失败形态是"网关多出一条谁都用不上的钥匙"——
+    # 不致命，但会让 -ShowRegistry 的读数骗人（看着像已签发完成）。
+    $snProp = $null
+    $snObj0 = $null
+    $snRaw = ""
+    if ($WriteSnapshot) {
+        if (-not (Test-Path $authPath)) { Die ("RegisterAccount refused: -Issue 需要引擎侧快照，但 auth.json 不在位 " + $authPath) }
+        $snRaw = Get-Content -LiteralPath $authPath -Raw -Encoding UTF8
+        try { $snObj0 = $snRaw | ConvertFrom-Json } catch {
+            Die ("RegisterAccount refused: auth.json 解析失败（" + $_.Exception.Message + "）——结构不可信，网关侧也一并停手")
+        }
+        # 现值从**解析出的对象**里取（不在原文上正则捞：22:41 副本实测那种捞法在转义层不稳）
+        $snOld = ""
+        $snFound = $false
+        foreach ($e0 in @($snObj0.configs)) {
+            if ([string]$e0.user_id -ne $RegisterAccount -or [string]$e0.key -ne 'quant_config_json_v1') { continue }
+            $v0 = $null
+            try { $v0 = "$($e0.value)" | ConvertFrom-Json } catch { Die "RegisterAccount refused: 该账号快照 value 解析失败（形态不认识，停手）" }
+            $snOld = [string]$v0.qmt.token; $snFound = $true
+        }
+        if (-not $snFound) {
+            Die ("RegisterAccount refused: 该账号还没有 quant_config_json_v1 快照——先在设置页保存一次它的 QMT 配置" +
+                 "（由引擎建快照）再签发；本次网关侧与引擎侧都一个字未改")
+        }
+        try { $snProp = Set-SnapshotTokenRaw -Raw $snRaw -Uid $RegisterAccount -OldTok $snOld -NewTok $rtok } catch {
+            Die ("RegisterAccount refused: " + $_.Exception.Message + " —— 提案算不出来，两侧都不改")
+        }
+        $snChk0 = $null
+        try { $snChk0 = $snProp.text | ConvertFrom-Json } catch { Die "RegisterAccount refused: 快照提案文本解析不过（手术切坏形态，拒写）" }
+        if (($snProp.text.Length - $snRaw.Length) -ne $snProp.delta) { Die "RegisterAccount refused: 快照提案字节差与预测不符（存在计划外命中）" }
+        $snHit = ""; $snMoved = 0
+        foreach ($e1 in @($snChk0.configs)) {
+            if ($null -eq $e1 -or [string]$e1.key -ne 'quant_config_json_v1') { continue }
+            $v1 = $null
+            try { $v1 = "$($e1.value)" | ConvertFrom-Json } catch { Die ("RegisterAccount refused: 提案里 " + [string]$e1.user_id + " 的 value 解析不过") }
+            if ([string]$e1.user_id -eq $RegisterAccount) { $snHit = [string]$v1.qmt.token; continue }
+            $o0 = $null
+            foreach ($e0 in @($snObj0.configs)) { if ([string]$e0.user_id -eq [string]$e1.user_id -and [string]$e0.key -eq 'quant_config_json_v1') { $o0 = $e0 } }
+            if ($null -ne $o0) {
+                $ov = $null
+                try { $ov = "$($o0.value)" | ConvertFrom-Json } catch { $ov = $null }
+                if ((FpLabel([string]$ov.qmt.token)) -ne (FpLabel([string]$v1.qmt.token))) { $snMoved++ }
+            }
+        }
+        if ((FpLabel $snHit) -ne $rtFp) { Die "RegisterAccount refused: 提案里目标账号的钥匙指纹不匹配（切错位置嫌疑）" }
+        if ($snMoved -gt 0) { Die ("RegisterAccount refused: 有 " + $snMoved + " 个其它账号的凭证被连带改动（只允许动目标账号）") }
+    }
+    $reg1 = Get-AuthTokenRegistry $cfg
+    foreach ($r in @($reg1)) {
+        if ((FpLabel $r.token) -eq $rtFp -and $r.user_id -ne $RegisterAccount) {
+            Die ("RegisterAccount refused: 这把钥匙已属于账号 " + $r.user_id + "（一把钥匙只能一个主人）")
+        }
+    }
+    # 组装新的 account_tokens：保留既有条目（含别的账号），本账号存在则替换、不存在则追加
+    $kept = @($reg1 | Where-Object { $_.user_id -and $_.user_id -ne $RegisterAccount })
+    $arr = @()
+    foreach ($k in $kept) { $arr += ('{"user_id":"' + $k.user_id + '","token":"' + $k.token + '"}') }
+    $arr += ('{"user_id":"' + $RegisterAccount + '","token":"' + $rtok + '"}')
+    $newArray = '"account_tokens": [' + ($arr -join ",") + ']'
+    $xtRaw = Get-Content -Path $ConfigFile -Raw -Encoding UTF8
+    if ($xtRaw -match '"account_tokens"\s*:\s*\[[^\]]*\]') {
+        $xtNew = [regex]::Replace($xtRaw, '"account_tokens"\s*:\s*\[[^\]]*\]', { param($m) $newArray })
+    } else {
+        # 老库形态（没有这个键）：插到 "report_token" 之后，逗号由替换文本自带。
+        # 注意必须用**实例方法**的计数重载：[regex]::Replace(input, pattern, evaluator, 1) 的第 4 个
+        # 参数绑的是 RegexOptions（1=IgnoreCase）而不是"只换一次"⇒ 会在每一处匹配都插一遍，
+        # 造出两个同名 account_tokens 键；JSON 解析器静默取最后一个，自证还照样过——假成功。
+        $reIns = [regex]'("(?:report_token|token)"\s*:\s*"[^"]*")'
+        $xtNew = $reIns.Replace($xtRaw, { param($m) $m.Groups[1].Value + ", " + $newArray }, 1)
+    }
+    $xtChk = $null
+    try { $xtChk = $xtNew | ConvertFrom-Json } catch { Die ("RegisterAccount refused: 提案文本解析不过（手术切坏形态，拒写）：" + $_.Exception.Message) }
+    # 三重自证：①新键里本账号命中这把钥匙；②既有条目一条都没丢；③除 account_tokens 外其它字段原样
+    $hit = @($xtChk.account_tokens | Where-Object { [string]$_.user_id -eq $RegisterAccount })
+    if (@($hit).Count -ne 1) { Die "RegisterAccount refused: 提案里本账号出现 " + @($hit).Count + " 次（应为恰 1）" }
+    if ((FpLabel([string]$hit[0].token)) -ne $rtFp) { Die "RegisterAccount refused: 提案里本账号的钥匙指纹不匹配（切错位置嫌疑）" }
+    foreach ($k in $kept) {
+        if (-not (@($xtChk.account_tokens | Where-Object { [string]$_.user_id -eq $k.user_id -and (FpLabel([string]$_.token)) -eq (FpLabel $k.token) }).Count -eq 1)) {
+            Die ("RegisterAccount refused: 既有账号 " + $k.user_id + " 的条目在提案里丢了或变了")
+        }
+    }
+    if (@($xtChk.account_tokens).Count -ne ($kept.Count + 1)) { Die "RegisterAccount refused: 提案条目数与预测不符" }
+    foreach ($f in @('token', 'report_token', 'broker', 'account', 'report_url', 'db')) {
+        if ([string]$xtChk.$f -ne [string]$cfg.$f) { Die ("RegisterAccount refused: 字段 " + $f + " 在提案里变了——手术刀不干净，拒写") }
+    }
+    if (-not $Apply) {
+        Ok ("register plan uid=" + $RegisterAccount + " token_fp=" + $rtFp + " entries=" + ($kept.Count + 1) + " (未写，加 -Apply 落地)")
+        exit 0
+    }
+    $stamp2 = Get-Date -Format "yyyyMMddHHmmss"
+    $xtBak = $ConfigFile + ".pre-register-" + $stamp2
+    Copy-Item -LiteralPath $ConfigFile -Destination $xtBak -Force
+    $xtTmp = $ConfigFile + ".registering-" + $stamp2
+    [System.IO.File]::WriteAllText($xtTmp, $xtNew, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $xtTmp -Destination $ConfigFile -Force
+    $xtNow = $null
+    try { $xtNow = Get-Content -Path $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("RegisterAccount read-back parse failed（回滚副本: " + $xtBak + "）") }
+    $rb = @($xtNow.account_tokens | Where-Object { [string]$_.user_id -eq $RegisterAccount })
+    if (@($rb).Count -ne 1 -or (FpLabel([string]$rb[0].token)) -ne $rtFp) { Die ("RegisterAccount read-back mismatch（回滚副本: " + $xtBak + "）") }
+    Ok ("register done uid=" + $RegisterAccount + " token_fp=" + $rtFp + " entries=" + @($xtNow.account_tokens).Count + " backup=" + $xtBak)
+    if (-not $WriteSnapshot) {
+        Info "生效前提：网关重启后载入注册表；引擎侧那把同名钥匙必须由设置页或 POST /api/admin/users/{id}/config/qmt 落进该账号快照"
+        exit 0
+    }
+    # —— 签发另一半：把前置算好并通过自证的提案落到 auth.json（这一段不再做任何判断）——
+    $bakS = $authPath + ".pre-issue-" + $stamp2
+    Copy-Item -LiteralPath $authPath -Destination $bakS -Force
+    $tmpS = $authPath + ".issuing-" + $stamp2
+    [System.IO.File]::WriteAllText($tmpS, $snProp.text, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmpS -Destination $authPath -Force
+    $backS = $null
+    try { $backS = Get-Content -LiteralPath $authPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {
+        Die ("Issue read-back parse failed（auth 回滚副本: " + $bakS + "；网关侧回滚副本: " + $xtBak + "）")
+    }
+    $rbTok = ""
+    foreach ($e in @($backS.configs)) {
+        if ([string]$e.user_id -ne $RegisterAccount -or [string]$e.key -ne 'quant_config_json_v1') { continue }
+        $bv = $null
+        try { $bv = "$($e.value)" | ConvertFrom-Json } catch { Die ("Issue read-back value parse failed（auth 回滚副本: " + $bakS + "）") }
+        $rbTok = [string]$bv.qmt.token
+    }
+    if ((FpLabel $rbTok) -ne $rtFp) { Die ("Issue read-back mismatch：快照里的钥匙与网关注册表不同源（auth 回滚副本: " + $bakS + "）") }
+    Ok ("issue done uid=" + $RegisterAccount + " token_fp=" + $rtFp + " 两侧同源自证通过 backup_gw=" + $xtBak + " backup_auth=" + $bakS)
+    Info "生效前提：重启 qmt_gateway（载入注册表）+ 重启 quant（auth store 只在启动时载入）；跑完两侧再拨部署探针第 20 看 snapshot_holders 是否 =1"
+    exit 0
+}
 
 # 注册表直读服务 AppEnvironmentExtra（REG_MULTI_SZ 原生 string[]，无编码/折行/NUL 歧义）。
 # 形状复刻 register_engine_services.ps1:Get-ExistingEnvExtra —— 唯一允许的 env 读取口径。
@@ -315,7 +587,152 @@ function Set-JsonStringFieldRaw {
     # 仓库侧括号平衡扫描恰好抵平未拦，现网首跑 ParserError 才炸。此形已入 §102 负向锁。
     throw ('no accepted replace candidate for field "' + $Field + '" after anchor "' + $Anchor + '"（锚点全撞了错误位或字段不存在——停手）')
 }
+if ($RevokeAccount) {
+    # §TOKEN-PERAACCT 撤销通道：把某账号快照里的实盘凭证清掉——**只动它自己那一条**。
+    # 为什么必须做：一把钥匙扩散到多个账号时，网关与首尔都无法判断"这笔是谁的"（现网 admin 与
+    # test01 快照里是同一把 ⇒ 回报恒归 users 顺序第一个，test01 自己那行永远停在撤单中）。
+    # 写形：auth.json 的 configs[].value 是**字符串化 JSON**（内层引号带反斜杠），
+    # 因此按"该条目窗口内的转义 token 字段"原文替换；命中数不是恰好 1 就拒写（不猜）。
+    if ($RevokeAccount -notmatch '^[A-Za-z0-9_.:@-]{1,64}$') { Die "RevokeAccount refused: user_id 形态非法" }
+    if (-not (Test-Path $authPath)) { Die ("RevokeAccount refused: auth.json 不在位 " + $authPath) }
+    $aRaw = Get-Content -LiteralPath $authPath -Raw -Encoding UTF8
+    $aObj0 = $null
+    try { $aObj0 = $aRaw | ConvertFrom-Json } catch { Die ("RevokeAccount refused: auth.json 解析失败（" + $_.Exception.Message + "）——结构不可信，一个字节都不写") }
+    # 只清这把**在册实盘凭证**：别的字段（llm 的 api_key、tushare token 等）不在本通道职责内
+    $liveTok = [string]$cfg.token
+    if (-not $liveTok) { Die "RevokeAccount refused: 网关现钥匙读不到（src1 失明），无法判定要清哪把" }
+    $wR = $null
+    try { $wR = Get-SnapshotTokenWindow -Raw $aRaw -Uid $RevokeAccount } catch { Die ("RevokeAccount refused: " + $_.Exception.Message + "（停手）") }
+    $win = $wR.win
+    $scopeAll = $false
+    $oldTok = $liveTok
+    if (([regex]::Matches($win, [regex]::Escape(('\"token\":\"' + $liveTok + '\"')))).Count -eq 0) {
+        # 该账号持有的不是网关现钥匙（连的是别的网关）：只有显式 -RevokeAnyToken 才允许清空
+        $reAny = [regex]::Matches($win, '\\"token\\":\\"([^\\]{1,200})\\"')
+        if (@($reAny).Count -ne 1) { Die ("RevokeAccount refused: 条目内 token 命中数=" + @($reAny).Count + "（不是恰好 1，不猜该清哪把）") }
+        if (-not $RevokeAnyToken) { Die "RevokeAccount refused: 该账号的钥匙不是网关现钥匙（可能是别的网关）；确要清空请加 -RevokeAnyToken" }
+        # 取捕获组，不用字符串剥前缀：剥前缀要在"PS 字面量 / 正则 / JSON 转义"三层里数反斜杠，
+        # 数错一层就拿着带尾巴的值去替换 ⇒ 命中 0 次（22:43 副本实测就是这个形态）。
+        $oldTok = $reAny[0].Groups[1].Value
+        $scopeAll = $true
+    }
+    $prop = $aRaw
+    $delta = 0
+    try {
+        $sR = Set-SnapshotTokenRaw -Raw $aRaw -Uid $RevokeAccount -OldTok $oldTok -NewTok ''
+        $prop = $sR.text; $delta = $sR.delta
+    } catch { Die ("RevokeAccount refused: " + $_.Exception.Message) }
+    $pObj = $null
+    try { $pObj = $prop | ConvertFrom-Json } catch { Die ("RevokeAccount refused: 提案文本解析不过（手术切坏形态，拒写）：" + $_.Exception.Message) }
+    if (($prop.Length - $aRaw.Length) -ne $delta) { Die "RevokeAccount refused: 提案字节差与预测不符（存在计划外命中）" }
+    # 逐条自证：目标条目清空、**其它条目一把钥匙都没动**、users 与 configs 条数不变
+    $chkN = 0; $rbN = 0
+    foreach ($e in @($aObj0.configs)) { if ([string]$e.key -eq 'quant_config_json_v1') { $chkN++ } }
+    foreach ($e in @($pObj.configs)) { if ([string]$e.key -eq 'quant_config_json_v1') { $rbN++ } }
+    if ($rbN -ne $chkN) { Die ("RevokeAccount refused: 快照条目数变了（" + $rbN + " != " + $chkN + "）") }
+    if (@($pObj.users).Count -ne @($aObj0.users).Count) { Die "RevokeAccount refused: users 条数变了（手术刀切到账号表，拒写）" }
+    foreach ($e in @($pObj.configs)) {
+        if ($null -eq $e -or [string]$e.key -ne 'quant_config_json_v1') { continue }
+        $vv = $null
+        try { $vv = "$($e.value)" | ConvertFrom-Json } catch { Die ("RevokeAccount refused: 提案里 " + [string]$e.user_id + " 的 value 解析不过") }
+        $tkNow = [string]$vv.qmt.token
+        if ([string]$e.user_id -eq $RevokeAccount) {
+            if ($tkNow) { Die ("RevokeAccount refused: 提案里目标账号 token 仍未清空（fp=" + (FpLabel $tkNow) + "）") }
+        } else {
+            $orig = $null
+            foreach ($o in @($aObj0.configs)) { if ([string]$o.user_id -eq [string]$e.user_id -and [string]$o.key -eq 'quant_config_json_v1') { $orig = $o } }
+            if ($null -ne $orig) {
+                $ov = $null
+                try { $ov = "$($orig.value)" | ConvertFrom-Json } catch { $ov = $null }
+                if ((FpLabel([string]$ov.qmt.token)) -ne (FpLabel $tkNow)) {
+                    Die ("RevokeAccount refused: 账号 " + [string]$e.user_id + " 的凭证被连带改动（只允许动目标账号）")
+                }
+            }
+        }
+    }
+    Info ("revoke plan uid=" + $RevokeAccount + " target_fp=" + (FpLabel $liveTok) +
+          " scope=" + $(if ($scopeAll) { "any-token(显式)" } else { "live-credential" }) + " entries=" + $rbN)
+    if (-not $Apply) { Ok "revoke plan-only（未写；加 -Apply 落地）"; exit 0 }
+    $stampR = Get-Date -Format "yyyyMMddHHmmss"
+    $bakR = $authPath + ".pre-revoke-" + $stampR
+    Copy-Item -LiteralPath $authPath -Destination $bakR -Force
+    $tmpR = $authPath + ".revoking-" + $stampR
+    [System.IO.File]::WriteAllText($tmpR, $prop, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmpR -Destination $authPath -Force
+    $backR = $null
+    try { $backR = Get-Content -LiteralPath $authPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("RevokeAccount read-back parse failed（回滚副本: " + $bakR + "）") }
+    foreach ($e in @($backR.configs)) {
+        if ([string]$e.user_id -ne $RevokeAccount -or [string]$e.key -ne 'quant_config_json_v1') { continue }
+        $bv = $null
+        try { $bv = "$($e.value)" | ConvertFrom-Json } catch { Die ("RevokeAccount read-back value parse failed（回滚副本: " + $bakR + "）") }
+        if ((FpLabel([string]$bv.qmt.token)) -ne (FpLabel "")) { Die ("RevokeAccount read-back mismatch（回滚副本: " + $bakR + "）") }
+    }
+    Ok ("revoke done uid=" + $RevokeAccount + " backup=" + $bakR + "（auth store 启动时载入：必须重启 quant 服务方吃到）")
+    exit 0
+}
+if ($ClearGlobal) {
+    # §TOKEN-PERAACCT N1：引擎全局 rules.qmt.token 不是实盘凭证——它等于网关现钥匙时，
+    # 任何**没有自己快照**的账号（成员号）都会继承这把钥匙并回 401 之外真正下单。
+    # 这里把它清空；写形与源3 对齐同款（锚点窗口外科替换 + 提案自证 + 备份 + 复读）。
+    if (-not (Test-Path $engPath)) { Die ("ClearGlobal refused: engine config 不在位 " + $engPath) }
+    $gRaw = Get-Content -LiteralPath $engPath -Raw -Encoding UTF8
+    $gObj = $null
+    try { $gObj = $gRaw | ConvertFrom-Json } catch { Die ("ClearGlobal refused: config.json 解析失败（" + $_.Exception.Message + "）——结构不可信，一个字都不写") }
+    if (-not $gObj.rules -or -not $gObj.rules.qmt) { Die "ClearGlobal refused: rules.qmt 节点不在（不猜结构）" }
+    $gWas = [string]$gObj.rules.qmt.token
+    if (-not $gWas) { Ok "clear global done action=same (全局 rules.qmt.token 本就是空)"; exit 0 }
+    if ((FpLabel $gWas) -ne (FpLabel([string]$cfg.token))) {
+        Info ("clear global note 全局现值 fp=" + (FpLabel $gWas) + " 并不等于网关现钥匙 fp=" + (FpLabel([string]$cfg.token)) + "（本就不是在册凭证，仍按要求清空）")
+    }
+    $gNew = $null
+    try { $gNew = Set-JsonStringFieldRaw -Text $gRaw -Anchor '"qmt"' -Field 'token' -Value '' -Check { param($o) ([string]$o.rules.qmt.token) -eq '' } } catch { Die ("ClearGlobal refused: " + $_.Exception.Message) }
+    $gChk = $null
+    try { $gChk = $gNew | ConvertFrom-Json } catch { Die "ClearGlobal refused: 提案文本解析不过（手术切坏形态，拒写）" }
+    foreach ($f in @('gateway_url', 'price_type', 'mode')) {
+        if ([string]$gChk.rules.qmt.$f -ne [string]$gObj.rules.qmt.$f) { Die ("ClearGlobal refused: 字段 " + $f + " 在提案里变了——手术刀不干净，拒写") }
+    }
+    Info ("clear global plan was=" + (FpLabel $gWas) + " to=empty")
+    if (-not $Apply) { Ok "clear global plan-only（未写；加 -Apply 落地）"; exit 0 }
+    $stampG = Get-Date -Format "yyyyMMddHHmmss"
+    $bakG = $engPath + ".pre-clear-" + $stampG
+    Copy-Item -LiteralPath $engPath -Destination $bakG -Force
+    $tmpG = $engPath + ".clearing-" + $stampG
+    [System.IO.File]::WriteAllText($tmpG, $gNew, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmpG -Destination $engPath -Force
+    $backG = $null
+    try { $backG = Get-Content -LiteralPath $engPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("ClearGlobal read-back parse failed（回滚副本: " + $bakG + "）") }
+    if ([string]$backG.rules.qmt.token) { Die ("ClearGlobal read-back mismatch：全局 token 仍在（回滚副本: " + $bakG + "）") }
+    Ok ("clear global done action=written backup=" + $bakG + "（必须重启 quant：内存里的全局规则仍是旧值，5s 热加载不会重读磁盘）")
+    exit 0
+}
 if ($Align) {
+    # §TOKEN-PERAACCT 默认语义变更（2026-10-30）：**一把钥匙不再铺给所有账号**。
+    # 旧 -Align 把源1复制到源3（引擎全局 rules.qmt.token）与源5（每个账号快照），
+    # 现网七个账号共用同一把实盘凭证、回报只能按 users 顺序猜归属，正是这条通道造成的。
+    # 现在缺省只对齐源4（桥与网关物理同机同钥匙，必须一致），源3/源5 改为"报告 + 指向签发通道"；
+    # 确需恢复旧行为（例如回滚）才显式加 -LegacySpread。
+    if (-not $LegacySpread) {
+        Info ("align src1 truth fp=" + (FpLabel([string]$cfg.token)) + " （本轮只对齐源4，源3/源5 不再复制）")
+        $spreadHolders = @()
+        foreach ($hc in @($authSnapVals)) { if ((FpLabel $hc) -eq (FpLabel([string]$cfg.token))) { $spreadHolders += "match" } }
+        Info ("align src3 plan engine_cfg will_write=False action=SKIPPED was=" + (FpLabel $engToken) +
+              "（N1：全局兜底位不该持有实盘凭证；若它等于源1，部署第 20 探针会判红）")
+        Info ("align src5 plan auth_snapshots action=SKIPPED holders=" + @($spreadHolders).Count +
+              "（N2：在册凭证的快照持有者至多 1；逐账号签发走 -RegisterAccount，撤销走 -RevokeAccount）")
+        $bridgeOnly = Join-Path $GatewayDir "config.bridge.json"
+        # 锚点与 -LegacySpread 路径同名（align src4 plan bridge action=…）：驱动侧的计划完整性
+        # 判据不必分叉（scripts/rotate_qmt_token_guangzhou.sh 认的就是这一串）。
+        $brActionOnly = "absent"
+        if (Test-Path $bridgeOnly) { $brActionOnly = if ((FpLabel $brToken) -ne (FpLabel([string]$cfg.token))) { "write" } else { "same" } }
+        Info ("align src4 plan bridge action=" + $brActionOnly + " (absent=桥未落位，落位时写源1同值即可)")
+        if (Test-Path $bridgeOnly) {
+            if ((FpLabel $brToken) -ne (FpLabel([string]$cfg.token))) { Warn "align src4 bridge fp != src1（桥必须与网关同钥匙，见下方写侧）" }
+            else { Ok "align src4 bridge same-as-src1" }
+        } else { Info "align src4 bridge absent (桥未落位，落位时写源1 同值)" }
+        if (-not $Apply) { Info "ALIGN_DRY plan-only（默认不写源3/源5）" }
+        else { Ok "align done（默认形态：只检视+对齐源4，源3/源5 未写；确需旧扩散请显式加 -LegacySpread）" }
+        exit 0
+    }
     $alignTok = [string]$cfg.token
     if (-not $alignTok) { Die "align refused: src1 token empty, no truth source to align to" }
     $alignFp = FpLabel $alignTok

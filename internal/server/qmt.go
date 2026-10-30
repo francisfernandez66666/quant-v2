@@ -1188,6 +1188,12 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	trace := s.snapshotConfigWrite(actor, target, "qmt")
 	// 以目标账号当前配置为基线做局部合并（值拷贝，改完一次性写回）。
 	cfg := *(s.cfg.GetQMTConfigFor(target))
+	// §TOKEN-PERAACCT N4（2026-10-30）：先判定这份 token 是不是该账号**自己落过盘**的钥匙。
+	// 判定必须发生在合并之前——合并会把继承来的值写进 cfg，之后就再也问不出"原本有没有"。
+	// 继承而来的实盘钥匙随后会被擦掉（见落库前那段）：一个账号点一次「保存」就把生产凭证
+	// 抄进自己的快照，正是现网七个账号共用同一把、回报只能靠 users 顺序猜归属的成因。
+	ownQMT, ownQMTStored := s.cfg.StoredQMTConfigFor(target)
+	tokenInherited := !ownQMTStored || strings.TrimSpace(ownQMT.Token) == ""
 
 	// ---- 以下逐字段按「指针非 nil 才生效」合并，枚举/范围非法直接 400 拒绝 ----
 	if req.Mode != nil {
@@ -1222,6 +1228,14 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	if req.Token != nil && *req.Token != "" && !isMaskedSecret(*req.Token) {
 		// token 三重条件：显式携带、非空、非脱敏哨兵（前端回显的掩码串不回写覆盖真值）。
 		cfg.Token = strings.TrimSpace(*req.Token)
+	} else if req.Token != nil && strings.TrimSpace(*req.Token) == "" {
+		// §TOKEN-PERAACCT 撤销通道：`"token":""` 是**显式**清空（不是"没带"）。
+		// 旧语义把空串和缺键混为一谈（都当作"保持原值"），于是没有任何通道能把一把已经
+		// 扩散出去的实盘钥匙从某个账号快照里摘掉——而摘掉它才是今天要做的事。
+		// 明文绝不落日志：审计行只记"谁撤了谁的凭证"。
+		cfg.Token = ""
+		opslog.Audit("qmt_token_revoke", actor, target, "explicit empty token ⇒ 该账号实盘凭证已清空")
+		log.Printf("[qmt] §TOKEN-PERAACCT 撤销实盘凭证 target=%s actor=%s", target, actor)
 	}
 	if req.Enabled != nil {
 		cfg.Enabled = *req.Enabled // 实盘总开关（热同步走 §QMT-PENDING 队列，halted 例外见后）
@@ -1492,6 +1506,18 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 			}
 		}
 		cfg.StrategyAllocs = out
+	}
+
+	// §TOKEN-PERAACCT N4：本次没有显式换发钥匙（未带 token / 带空 / 带前端回显的掩码串），
+	// 而 cfg 里这把又是从运营账号或全局继承来的 ⇒ 擦掉它再落盘。
+	// 效果：成员账号保存任何其它字段（战法/预算/开关）都不会再带走实盘凭证，它的有效 token
+	// 为空 ⇒ 即使误开实盘开关，敲到网关也只是 401，下不出真单。
+	// 显式携带真 token 的保存不受影响——那是 owner 在给这个账号签发钥匙。
+	explicitToken := req.Token != nil && *req.Token != "" && !isMaskedSecret(*req.Token)
+	if tokenInherited && !explicitToken && strings.TrimSpace(cfg.Token) != "" {
+		cfg.Token = ""
+		opslog.Logf("quant", "§TOKEN-PERAACCT 账号 %s 保存配置未带走继承来的实盘凭证（本次只清 token，其余字段照常保存）", target)
+		log.Printf("[qmt] §TOKEN-PERAACCT target=%s actor=%s：继承凭证不落盘（token 置空）", target, actor)
 	}
 
 	// §WS-K 维4 保存前 schema 校验：非法配置返回 400，不再静默排队/落库。

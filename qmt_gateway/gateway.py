@@ -118,6 +118,12 @@ DEFAULT_CONFIG = {
     "account": "MOCK0001",
     "db": "data.db",
     "user_id": "",             # 回报归属账号 ID（首尔侧 /api/qmt/report 归因用，建议显式配置）
+    "owner_user_id": "",       # §TOKEN-PERAACCT 资金账号账本持有人：持仓/资金这类账户级事件归它
+    # §TOKEN-PERAACCT（2026-10-30）入向凭证从"一把共享钥匙"改为"一账号一把"：
+    # [{"user_id": "u_xxx", "token": "...", "label": "可选备注"}]。
+    # 上面的 `token` 继续有效并映射到 owner_user_id（缺省回退 user_id），所以 account_tokens
+    # 缺失或为空时鉴权行为与今天逐字节一致——不留"配置改了但网关注册表空着"的半态。
+    "account_tokens": [],
     "report_url": "",          # 首尔服务器地址（如 http://43.108.86.140:8080），留空不推送
     "report_token": "",        # 推送 /api/qmt/report 的 token（默认同 token）
     "reconcile_sec": 60,       # 周期全量对账间隔（0=关闭）
@@ -278,8 +284,56 @@ class Gateway:
         self.store = Store(cfg["db"])
         self.ids = Idempotency(self.store)
         self.user_id = cfg.get("user_id", "")  # §P1-9 多账号归属：落库/上报统一带此 ID
+        # §TOKEN-PERAACCT（2026-10-30）入向凭证注册表：token → user_id（一账号一把钥匙）。
+        # owner_user_id = 这个资金账号账本的持有人（缺省回退旧 user_id 键，保持单账号形态不变）。
+        # 旧键 cfg["token"] 继续在册并映射到 owner：account_tokens 缺失/为空时鉴权与今天逐字节一致，
+        # 绝不制造"配置改了但注册表是空的"那种所有账号一起 401 的半态。
+        self.owner_user_id = str(cfg.get("owner_user_id") or self.user_id or "")
+        self._auth_tokens = {}
+        for item in (cfg.get("account_tokens") or []):
+            if not isinstance(item, dict):
+                log.warning("[gateway] §TOKEN-PERAACCT 忽略非对象的 account_tokens 项: %r", item)
+                continue
+            tk = str(item.get("token") or "")
+            uid = str(item.get("user_id") or "")
+            if not tk or not uid:
+                log.warning("[gateway] §TOKEN-PERAACCT 忽略缺 token/user_id 的 account_tokens 项")
+                continue
+            prev = self._auth_tokens.get(tk)
+            if prev and prev != uid:
+                # 同一把钥匙挂两个账号：归属不可判定，后到的那条直接丢弃（宁可少一把也不制造歧义）
+                log.error("[gateway] §TOKEN-PERAACCT 重复 token 冲突（已挂 %s，忽略 %s）——"
+                          "每把实盘钥匙只允许属于一个账号", prev, uid)
+                continue
+            self._auth_tokens[tk] = uid
+        if self._auth_tokens and not self.owner_user_id:
+            log.error("[gateway] §TOKEN-PERAACCT 配了 account_tokens 但没有 owner_user_id/user_id："
+                      "持仓与资金这类账户级事件将无账号可归")
+        if cfg.get("token"):
+            self._auth_tokens.setdefault(str(cfg["token"]), self.owner_user_id)
+        # 反向表 uid → 那把在册钥匙：出向回报据此选钥匙（§TOKEN-PERAACCT）。
+        # 同一账号配了多条时取第一条并告警——归属靠钥匙，钥匙含糊就等于归属含糊。
+        self._tokens_by_uid = {}
+        for tk, uid in self._auth_tokens.items():
+            if uid in self._tokens_by_uid:
+                log.warning("[gateway] §TOKEN-PERAACCT 账号 %s 在册多把钥匙，出向固定用 %s",
+                            uid, str(self._tokens_by_uid[uid])[:6] + "…")
+                continue
+            self._tokens_by_uid[uid] = tk
+
+        def _report_token_for(uid):
+            # 空归属（历史事件/账户级事实）走默认钥匙；有归属但注册表里没有 ⇒ 返回空串，
+            # 由处理器回退默认钥匙并计数——**绝不因为对不上号就不发**。
+            if not uid:
+                return ""
+            return self._tokens_by_uid.get(uid, "")
+
         self.handler = ReportHandler(
-            self.store, cfg.get("report_url", ""), cfg.get("report_token", ""), self.user_id,
+            self.store, cfg.get("report_url", ""), cfg.get("report_token", ""),
+            # 处理器级归属＝owner：持仓/资金这类"资金账号自己的账"永远归账本持有人，
+            # 下单类事件则在 _resolve_uid 里回查成真实下单账号（§TOKEN-PERAACCT N3）。
+            self.owner_user_id or self.user_id,
+            token_for=_report_token_for,
         )
         # §QMT-DUAL 双通道装配：mock 单通道；xt/queued 双通道且 active 原子切换
         self.active_broker, self.brokers, self.active_key = build_brokers(cfg, self.store)
@@ -1106,9 +1160,10 @@ class Gateway:
         if not self.active_broker.is_connected():
             return 503, {"ok": False, "err": "broker not connected"}
         if path == "/order" and method == "POST":
-            return self._do_order(body)
+            # §TOKEN-PERAACCT：下单方账号由入向钥匙确定，落进幂等占位行与委托行
+            return self._do_order(body, getattr(request_handler, "_caller_uid", ""))
         if path == "/cancel" and method == "POST":
-            return self._do_cancel(body)
+            return self._do_cancel(body, getattr(request_handler, "_caller_uid", ""))
         if path == "/state" and method == "GET":
             return self._do_state()
         return 404, {"ok": False, "err": "not found"}
@@ -1160,11 +1215,22 @@ class Gateway:
         day = str((params.get("day") or [""])[0] or "").strip()
         if day and (len(day) != 10 or day[4] != "-" or day[7] != "-"):
             return 400, {"ok": False, "err": "day must be YYYY-MM-DD"}
+        # §TOKEN-PERAACCT：对账源按调用方账号收窄——别人下的单不进你的账（历史上所有行
+        # user_id 为空，故今天这个过滤是恒等的；签发之后才真正分流）。
+        # 无归属行（手动单 ext:/历史遗留）对所有在册账号可见：宁可多看一条，也不让谁
+        # 因为归属缺失就把自己那笔停滞单救不回来。owner 可显式 ?scope=all 看全量。
+        caller = str(getattr(request_handler, "_caller_uid", "") or "") if request_handler is not None else ""
+        scope_all = (str((params.get("scope") or [""])[0]).strip() == "all"
+                     and caller == self.owner_user_id)
         out = []
         for row in self.store.list_orders():
             r = dict(row)
             created = str(r.get("created_at") or "")
             if day and created[:10] != day:
+                continue
+            row_uid = str(r.get("user_id") or "")
+            # 只在"调用方账号明确"时分流；空 caller（旧调用点/直连测试）保持今天的恒等行为
+            if not scope_all and caller and row_uid and row_uid != caller:
                 continue
             out.append({
                 "order_id": str(r.get("order_id") or ""),
@@ -1220,6 +1286,12 @@ class Gateway:
         # 前者非零=终态回报曾写不进本地副本（已推给决策端的不受影响，但必须有人看）；
         # 后者 -1=从未收到过快照（撤单终态的唯一权威源断了），秒数过大=桥/通道停了。
         payload["order_fail_total"] = int(getattr(self.handler, "_order_store_fail_total", 0))
+        # §TOKEN-PERAACCT 观测位：在册钥匙数（>1 才叫真"一账号一把"）、owner 是否声明、
+        # 以及"事件有归属但注册表没这把钥匙"的回退次数——回退非零就说明引擎侧钥匙与网关注册表
+        # 漂移了（配置发出去没登记），那些事件会被首尔按默认钥匙归到 owner 名下。
+        payload["credential_accounts"] = len(self._tokens_by_uid)
+        payload["owner_uid_set"] = bool(self.owner_user_id)
+        payload["report_token_fallback_total"] = int(getattr(self.handler, "_report_token_fallback", 0))
         snap_ts = float(((getattr(self, "_orders_snap", None) or {}).get("ts", 0)) or 0)
         payload["orders_snapshot_age"] = (max(0, int(time.time() - snap_ts)) if snap_ts > 0 else -1)
         # §0926E2E-W2D：回报 outbox 观察面。溢出语义已从"删最旧"改为"冻结+只吵"，
@@ -2059,8 +2131,10 @@ class Gateway:
                     sid, status, oid or "(未提供，沿用占位引用)")
         return 200, {"ok": True, "status": status, "err": ""}
 
-    def _do_order(self, body):
+    def _do_order(self, body, caller_uid=""):
         """处理 POST /order 下单：参数校验 → 幂等占位 → 真实下单 → 回填委托号。
+
+        :param caller_uid: 入向钥匙解析出的下单账号（§TOKEN-PERAACCT）；空=回退 owner（旧形态）。
 
         校验 code/qty/signal_id（非空）、限价单必须有价格；按板块整手规则校验买入数量；
         signal_id 为空一律拒绝（幂等与审计唯一锚点，§G2）；同 signal_id 幂等去重。
@@ -2162,11 +2236,17 @@ class Gateway:
                              "err": "strategy %s not in gateway whitelist" % stype}
 
         # §G1 原子占位：抢不到 = 已处理过（幂等返回）或正在下单中（409 防并发穿透）
+        # §TOKEN-PERAACCT：这一行归属**下单方账号**（入向钥匙解出来的 uid），解不出来才回退 owner。
+        # 它是后续回报归属的锚：网关推给决策端时按这条行的 user_id 决定"这单是谁的"。
+        # §TOKEN-PERAACCT：这一行的归属就是"用哪把钥匙进来的人"——请求体里自带 user_id 一律**覆盖**，
+        # 绝不采信客户端自报（自报归属等于把记账权交给调用方）。解不出钥匙时才回退通道级账号。
+        place_uid = str(caller_uid or self.user_id or "")
+        req["user_id"] = place_uid
         draft = {
             "signal_id": signal_id, "code": code, "side": side,
             "price": price, "qty": qty,
             "created_at": req.get("created_at") or "",
-            "user_id": self.user_id,  # §P1-9 多账号隔离归属
+            "user_id": place_uid,  # §P1-9 多账号隔离归属（§TOKEN-PERAACCT 起为真实下单账号）
         }
         _t0 = time.time()  # §PERF 下单 accept 延迟埋点（性能门禁 G3 数据源）
         claimed, existing = self.ids.claim(draft)
@@ -2243,7 +2323,7 @@ class Gateway:
                 "order_id": order_ref, "signal_id": signal_id, "code": code, "side": side,
                 "status": "已报", "price": price, "qty": qty,
                 "created_at": req.get("created_at") or _now_cn(),
-                "user_id": self.user_id,  # §P1-9 多账号隔离归属
+                "user_id": place_uid,  # §P1-9 / §TOKEN-PERAACCT：与占位行同一归属，不中途换人
             })
             accepted = True
             log.info("[gateway] order accept: signal=%s code=%s side=%s qty=%s ref=%s "
@@ -2304,10 +2384,12 @@ class Gateway:
             log.exception("[gateway] §CLAIMRELEASE 占位收尾失败 signal_id=%s "
                           "（sent_to_broker=%s，等待巡检兜底）", signal_id, sent_to_broker)
 
-    def _do_cancel(self, body):
+    def _do_cancel(self, body, caller_uid=""):
         """处理 POST /cancel 撤单：校验委托引用后委托 broker，结果如实返回。
 
         失败返回 409 且不吞掉错误——让首尔侧继续跟踪该委托并告警，避免误判成功。
+        :param caller_uid: 发起撤单的账号（§TOKEN-PERAACCT，只用于留痕——撤单作用的委托归属
+            仍按 orders 行判定，A 账号撤不动 B 账号的单由 broker 侧委托引用天然约束）。
         English: handles POST /cancel — validates the order ref and delegates to the broker,
         returning failures honestly so the decision side keeps tracking the order.
         """
@@ -2315,6 +2397,9 @@ class Gateway:
         order_ref = str((body or {}).get("order_id", "") or "")
         if not order_ref:
             return 400, {"ok": False, "err": "order_id required"}
+        if caller_uid:
+            log.info("[gateway] §TOKEN-PERAACCT 撤单请求 ref=%s 由账号 %s 发起",
+                     order_ref, caller_uid)
         # §修复：撤单结果不再被吞——失败让首尔侧继续跟踪该委托并告警
         ok, err = self.active_broker.cancel(order_ref)
         if ok:
@@ -2427,16 +2512,30 @@ class _Handler(BaseHTTPRequestHandler):
             return False, 403, "source IP not allowed"
         return True, 200, ""
 
+    def _auth_caller(self):
+        """Bearer 鉴权并解析调用方账号（§TOKEN-PERAACCT，2026-10-30）。
+
+        返回 (ok, user_id)。在册钥匙是一把集合而不是一条常量：每个 App 账号持有自己那一把，
+        网关据此知道"这笔委托是谁下的"（此前所有人共用一把，回报只能砸给 users 顺序里的
+        第一个命中者，下单方自己那行永远没人推进——10-30 的 test01 双份账就是这么来的）。
+        常量时间比较逐把做（hmac.compare_digest），绝不因比对顺序泄露哪把先命中。
+        English: authenticates against the per-account token registry and returns the caller's
+        user id; the legacy single token stays valid (mapped to the owner account).
+        """
+        auth = self.headers.get("Authorization", "")
+        for tk, uid in self.gateway._auth_tokens.items():
+            if hmac.compare_digest(auth, "Bearer " + tk):
+                return True, uid
+        return False, ""
+
     def _auth_ok(self):
         """Bearer token 双向鉴权（常量时间比较，防时序侧信道）。
 
         校验用 token 优先来自环境变量 QUANT_GATEWAY_TOKEN，未设置时回退配置文件明文。
+        §TOKEN-PERAACCT 起它只是 `_auth_caller` 的布尔外壳（既有调用点与用例语义不变）。
         """
-        auth = self.headers.get("Authorization", "")
-        token = self.gateway.cfg.get("token", "")
-        expected = "Bearer " + token
-        # hmac.compare_digest 对字符串做常量时间比较，避免 == 的短路时序泄露
-        return hmac.compare_digest(auth, expected)
+        ok, _ = self._auth_caller()
+        return ok
 
     def _respond(self, status, payload):
         """写 HTTP JSON 响应：UTF-8 编码、ensure_ascii=False 保留中文，串化兜底。"""
@@ -2471,8 +2570,13 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._respond(400, {"ok": False, "err": "bad JSON body"})
         # /health 免鉴权（但已受 IP 限制）；其余端点需 Bearer token
-        if parsed.path != "/health" and not self._auth_ok():
-            return self._respond(401, {"ok": False, "err": "unauthorized"})
+        self._caller_uid = ""
+        if parsed.path != "/health":
+            ok, uid = self._auth_caller()
+            if not ok:
+                return self._respond(401, {"ok": False, "err": "unauthorized"})
+            # 调用方账号随请求落到 handler 上，handle() 及其下游据此记账（§TOKEN-PERAACCT）。
+            self._caller_uid = uid
         try:
             status, payload = self.gateway.handle(self.command, parsed.path, body, self)
         except Exception as e:  # noqa: BLE001

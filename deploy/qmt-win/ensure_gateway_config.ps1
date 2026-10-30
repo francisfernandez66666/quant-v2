@@ -125,7 +125,12 @@ icacls $cfgPath /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | O
 Ok "已生成 $cfgPath (broker=$($cfg.broker), listen=$($cfg.listen))，ACL 已收敛（Administrators+SYSTEM）"
 
 Write-Host ""
-Info "token 需与引擎侧 rules.qmt.token 一致（三处一致：token / report_token / 引擎账号配置）："
+Info "token 需要与**持有实盘的那个账号**的快照一致（§TOKEN-PERAACCT，2026-10-30 改口径）："
+Info "  · 旧口径「三处一致：token / report_token / 引擎**全局** rules.qmt.token」已废止——"
+Info "    写进全局 rules.qmt.token 等于让所有没有自己快照的账号都继承这把实盘凭证（现网七个账号共用一把即此成因）；"
+Info "  · 现在：引擎侧只写 owner 账号的快照（设置页或 POST /api/admin/users/{id}/config/qmt），"
+Info "    并给这份 config.xt.json 补 owner_user_id；别的账号要实盘就各自发一把并 -RegisterAccount 登记；"
+Info "    全局 rules.qmt.token 保持为空（部署第 20 探针会判它不得等于在册凭证）。详见 RUNBOOK §3.5。"
 if ($tokenGenerated) {
     Write-Host "    $Token" -ForegroundColor Magenta
     Warn "该 token 为本次现场随机生成——请立即抄存，并同步到引擎设置页的 QMT 配置"

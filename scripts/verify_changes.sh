@@ -2729,16 +2729,107 @@ PY
 grep -qE 'decommission_qmt_mock\.ps1 -Apply' scripts/deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 部署步 [3d] 未显式带 -Apply（退役根本不会发生，却在打 OK）"; exit 1; }
 # 轮换=缺省 dry-run：写盘动作必须排在 $DryRun 早退之后。
+# §TOKEN-PERAACCT（2026-10-30）本锁**随实现结构同步、一条没放宽**（反而更严）：
+# 原判据用 `t.index(原语)` 只看**第一处**出现，且假定"只有轮换主链路会写盘"这一单线性形态。
+# 现在 -RegisterAccount / -RevokeAccount / -ClearGlobal 是三个独立入口，各自在分支里带显式出口；
+# 继续按"第一处 + 全局位置"判，要么误判红，要么把主链路的写盘整个看漏（第一处落在新分支里，
+# 主链路那几处就再没人查＝锁成摆设）。所以改成：**逐处出现**枚举 + **逐分支**判定：
+#   ①每个写模式分支内，第一条写盘原语之前必须出现它自己的 `if (-not $Apply) … exit`；
+#   ②不属于任何写模式分支的写盘（含轮换主链路与 -Align），必须晚于全局 $DryRun 早退。
 python3 - deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || { echo "--- FAIL: rotate 的 dry-run 早退不再先于写盘（不加 -Apply 也会改配置）"; exit 1; }
 import re, sys
 t = open(sys.argv[1], encoding='utf-8').read()
 assert re.search(r'if \(-not \$Apply\) \{ \$DryRun = \$true \}', t), '缺省即 dry-run 的归一语句丢失'
 early = re.search(r'if \(\$DryRun\) \{.*?exit 0', t, re.S)
 assert early, 'dry-run 早退分支丢失'
-writes = [t.index(x) for x in ('Copy-Item -LiteralPath $ConfigFile', '[System.IO.File]::WriteAllText') if x in t]
-assert writes, '写盘原语都不见了（本锁与实现同时失配，请同步）'
-assert early.end() < min(writes), '写盘动作排在 dry-run 早退之前'
+WRITE_PRIMS = ('Copy-Item -LiteralPath', '[System.IO.File]::WriteAllText', 'Move-Item -LiteralPath')
+writes = sorted({m.start() for x in WRITE_PRIMS for m in re.finditer(re.escape(x), t)})
+assert len(writes) >= 20, '写盘原语数量骤减（本锁与实现同时失配，或写侧被藏起来了，请同步）'
+TOPS = sorted({mm.start() for mm in re.finditer(r'^if \(', t, re.M)})
+MODES = ('RegisterAccount', 'RevokeAccount', 'ClearGlobal')
+spans = {}
+for mode in MODES:
+    m = re.search(r'^if \(\$' + mode + r'\) \{', t, re.M)
+    assert m, mode + ' 写模式入口丢失（本锁与实现同时失配，请同步）'
+    guard = re.search(r'if \(-not \$Apply\).*?exit 0', t[m.end():], re.S)
+    assert guard, mode + ' 缺「不带 -Apply 就退出」的显式出口（缺省就会改现网文件）'
+    nxt = min([q for q in TOPS if q > m.start()] + [len(t)])
+    spans[mode] = (m.start(), m.end() + guard.end(), nxt)
+covered = set()
+for mode, (mstart, guard_end, nxt) in spans.items():
+    for w in writes:
+        if mstart < w < nxt:
+            covered.add(w)
+            assert guard_end < w, mode + ' 的写盘原语排在它自己的 -Apply 出口之前（缺省调用就会改现网）'
+outside = [w for w in writes if w not in covered]
+assert len(outside) >= 10, '主链路写盘点位数异常（新分支把主链路的写也圈进来了？本锁需同步）'
+for w in outside:
+    assert early.end() < w, '主链路写盘动作排在 dry-run 早退之前（不加 -Apply 也会改配置）'
 PY
+# 反证腿 V1（改坏必须变红：只能变绿的锁等于没有锁，永远红的同样是摆设）。
+# 正向＝现网原文必须过判据；V1＝往三个写模式分支的**开头**各注入一条写盘原语
+# （等价于"不带 -Apply 也会动现网文件"）⇒ 三处都必须红。
+# 判据与主锁同源同形：改主锁必须同步这条腿，否则它测的是想象中的锁。
+B143_DRILL=0
+python3 - deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || B143_DRILL=1
+import re, sys
+PRIMS = ('Copy-Item -LiteralPath', '[System.IO.File]::WriteAllText', 'Move-Item -LiteralPath')
+MODES = ('RegisterAccount', 'RevokeAccount', 'ClearGlobal')
+
+
+def check(t):
+    # 主锁的判定；返回红因字符串，绿返回 None（反证要的就是"改坏一定能红"）。
+    early = re.search(r'if \(\$DryRun\) \{.*?exit 0', t, re.S)
+    if not early:
+        return 'dry-run 早退分支丢失'
+    writes = sorted({m.start() for x in PRIMS for m in re.finditer(re.escape(x), t)})
+    if len(writes) < 20:
+        return '写盘原语数量骤减'
+    tops = sorted({mm.start() for mm in re.finditer(r'^if \(', t, re.M)})
+    spans = {}
+    for mode in MODES:
+        m = re.search(r'^if \(\$' + mode + r'\) \{', t, re.M)
+        if not m:
+            return mode + ' 写模式入口丢失'
+        g = re.search(r'if \(-not \$Apply\).*?exit 0', t[m.end():], re.S)
+        if not g:
+            return mode + ' 缺「不带 -Apply 就退出」的显式出口'
+        nxt = min([q for q in tops if q > m.start()] + [len(t)])
+        spans[mode] = (m.start(), m.end() + g.end(), nxt)
+    covered = set()
+    for mode, (a, b, nx) in spans.items():
+        for w in writes:
+            if a < w < nx:
+                covered.add(w)
+                if b > w:
+                    return mode + ' 的写盘原语排在它自己的 -Apply 出口之前'
+    outside = [w for w in writes if w not in covered]
+    if len(outside) < 10:
+        return '主链路写盘点数骤减'
+    for w in outside:
+        if early.end() > w:
+            return '主链路写盘动作排在 dry-run 早退之前'
+    return None
+
+
+t = open(sys.argv[1], encoding='utf-8').read()
+if check(t) is not None:
+    print('POSITIVE_FAILED: ' + check(t))
+    raise SystemExit(1)
+INJ = '    Copy-Item -LiteralPath $ConfigFile -Destination $env:TMP -Force\n'
+for mode in MODES:
+    m = re.search(r'^if \(\$' + mode + r'\) \{', t, re.M)
+    if check(t[:m.end()] + "\n" + INJ + t[m.end():]) is None:
+        print('MUTATION_STILL_GREEN: ' + mode)
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+if [ "$B143_DRILL" != "0" ]; then
+	echo "--- FAIL: §143 反证 V1（往写模式开头注入写盘原语后，dry-run 顺序锁仍判绿＝这条锁只能变绿）"
+	FAIL=1
+	B143_FAILED=1
+fi
+echo "ok - §143 反证 V1（原文必过 + 三个写模式开头注入写盘原语三处全红）"
 # 负锁：轮换脚本不得把新 token 明文写进任何输出（本仓库铁律：输出只准键名/计数/指纹）。
 if grep -qE '\+ \$newToken|\$\{newToken\}' deploy/qmt-win/rotate_qmt_token.ps1; then
 	echo "--- FAIL: 轮换脚本出现回显新 token 明文的路径"; exit 1; fi
@@ -17080,5 +17171,100 @@ grep -q '当日订单终态收敛率' internal/trading/controller.go || fail142 
 
 [ "$B142_FAILED" = "0" ] || exit 1
 echo "ok - §142 §ORDER-STATE-PULL 锁通过（撞键 2 + 终态 2 + 拉取 1 + 清理 1 + 资金帧 1 + 测试 1 + 预算预占 1 + 卡单 1 + 前端 1 + 审计列 1 + 观测位 1 + T心跳 1 + 快照门 1 + 收敛率 1，累计判定点 ${CNT142}）"
+
+echo "==> 143 §TOKEN-PERAACCT（每账号一把实盘凭证 / 继承凭证不落盘 / 显式撤销 / 一把钥匙一个主人）..."
+B143_FAILED=0
+fail143() {
+	echo "--- FAIL: §143 $*"
+	FAIL=1
+	B143_FAILED=1
+}
+CNT143=0
+
+# —— ① 网关入向：凭证是一把**集合**，每把属于一个账号 ——
+CNT143=$((CNT143 + 1))
+grep -q '"account_tokens": \[\]' qmt_gateway/gateway.py || fail143 "网关注册表键没进默认配置（多把钥匙无处登记）"
+grep -q 'def _auth_caller' qmt_gateway/gateway.py || fail143 "_auth_caller 缺失：鉴权仍只认一把 token"
+grep -q 'self._auth_tokens.setdefault(str(cfg\["token"\])' qmt_gateway/gateway.py || fail143 "legacy token 没并入注册表（升级即出现所有账号一起 401 的半态）"
+grep -q '重复 token 冲突' qmt_gateway/gateway.py || fail143 "缺「一把钥匙只允许一个主人」判定（归属不可判定的形态没被拦）"
+CNT143=$((CNT143 + 1))
+grep -q '_caller_uid' qmt_gateway/gateway.py || fail143 "调用方账号没随请求传下去（下单归属仍只能猜）"
+
+# —— ② 下单归属以**入向钥匙**为准，客户端自报一律覆盖 ——
+CNT143=$((CNT143 + 1))
+grep -q 'def _do_order(self, body, caller_uid="")' qmt_gateway/gateway.py || fail143 "/order 没接调用方账号"
+grep -q 'req\["user_id"\] = place_uid' qmt_gateway/gateway.py || fail143 "请求体自报的 user_id 没被入向钥匙覆盖（记账权交给了调用方）"
+grep -q 'req.get("user_id") or self.user_id' qmt_gateway/broker.py || fail143 "派发行仍只写通道级账号（谁下的单在网关账上看不出来）"
+
+# —— ③ 回报按事件归属账号选钥匙；Go 侧「只认钥匙不认自报」一字不动 ——
+CNT143=$((CNT143 + 1))
+grep -q 'token_for=_report_token_for' qmt_gateway/gateway.py || fail143 "出向没接按归属选钥匙的回调"
+grep -q '_report_token_fallback' qmt_gateway/handler.py || fail143 "缺「对不上号就回退默认钥匙」的计数（回潮成静默丢账没人知道）"
+grep -q 'def _resolve_uid' qmt_gateway/handler.py || fail143 "事件归属没从网关自己的账回查（回报仍会全砸 owner）"
+# 无条件覆盖必须变成"只在没归属时补"——否则下单方的事件会被记到 owner 名下（10-30 双份账的形态）
+grep -q 'if not payload.get("user_id"):' qmt_gateway/handler.py || fail143 "_push 仍无条件把事件归属改成处理器级账号"
+grep -q '§安全 T1' internal/server/qmt.go || fail143 "§安全 T1 锚点消失（回报归属改回信任请求体＝越权写面复活）"
+grep -q 'owner := uid' internal/server/qmt.go || fail143 "回报归属不再是 token 解析出的 uid（本批刻意不改这条）"
+
+# —— ④ Go 配置写面：继承凭证不落盘 + 显式撤销通道 ——
+CNT143=$((CNT143 + 1))
+grep -q 'func (m \*Manager) StoredQMTConfigFor' internal/config/config.go || fail143 "缺「这份凭证是不是账号自己的」判定入口"
+grep -q 'tokenInherited := ' internal/server/qmt.go || fail143 "applySetQMTConfig 没在合并前判定继承（改完就问不出原本有没有）"
+grep -q 'explicitToken' internal/server/qmt.go || fail143 "缺「本次没显式带钥匙就不落继承凭证」那一步（一次保存即扩散）"
+grep -q 'qmt_token_revoke' internal/server/qmt.go || fail143 "显式撤销没有审计留痕"
+grep -q 'func TestMemberSaveDoesNotCloneInheritedToken' internal/server/token_per_account_test.go || fail143 "N4 没有回归锁"
+grep -q 'func TestExplicitEmptyTokenRevokesCredential' internal/server/token_per_account_test.go || fail143 "N1 撤销通道没有回归锁"
+grep -q 'def test_per_account_tokens' qmt_gateway/tests/test_token_per_account.py || fail143 "网关注册表没有回归锁"
+
+# —— ⑤ 轮换通道：一把钥匙不再铺给所有账号；签发走登记 + 引擎快照 ——
+CNT143=$((CNT143 + 1))
+grep -q '\[switch\]\$LegacySpread' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "-Align 的扩散语义没有被显式开关锁住（默认必须不铺）"
+grep -q 'align src3 plan engine_cfg will_write=False action=SKIPPED' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "-Align 缺省仍可能写全局 rules.qmt.token（N1 会被这条运维通道反复回潮）"
+grep -q 'align src5 plan auth_snapshots action=SKIPPED holders=' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "-Align 缺省仍可能把所有账号快照对齐到一把钥匙（N2 的直接违例，且不报持有数）"
+grep -q '\[string\]\$RegisterAccount' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺逐账号登记通道"
+grep -q 'RegisterAccount refused' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "登记通道缺拒判（明文长度/uid 形态/一把钥匙两个主人/条目丢失都不拦）"
+grep -q '\[switch\]\$ShowRegistry' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺只读检视（运维看不出哪把钥匙挂了几个账号）"
+grep -q '\[string\]\$RevokeAccount' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺撤销通道（一把钥匙扩散出去后没有摘回来的正规通道）"
+grep -q '(quant_config_json_v1, ' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "撤销的唯一性没按 (key,user_id) 判（同账号多条配置必然误判或误伤）"
+grep -q '\[switch\]\$ClearGlobal' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺「清空全局 rules.qmt.token」通道（N1 落不了地）"
+grep -q 'revoke done\|clear global done' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "撤销/清空缺写后复读自证锚点"
+grep -q 'pre-register-' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "登记写侧没有写前备份（改坏 config.xt.json 无从回滚）"
+grep -q 'read-back mismatch' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "登记写侧缺写后复读自证"
+# 撤销与清空全局：摘钥匙的正规通道（没有它们就只能手改 auth.json/config.json，切错一条=误伤别人）
+CNT143=$((CNT143 + 1))
+grep -q 'RevokeAccount refused' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺撤销通道（一把钥匙扩散出去后没人能安全摘回来）"
+grep -q 'ClearGlobal refused' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺「清空全局 rules.qmt.token」通道（N1 无法落地）"
+grep -q 'pre-revoke-' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "撤销写侧没有写前备份"
+grep -q 'pre-clear-' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "清空全局没有写前备份"
+grep -q '@($cands).Count -ne 1' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "撤销/签发没按 (key,user_id) 唯一确定条目（同账号多条配置会切错）"
+# —— ⑤b §TOKEN-PERAACCT 逐账号签发（两侧同源，缺一不可）——
+CNT143=$((CNT143 + 1))
+grep -q '\[string\]\$Issue' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "逐账号签发入口丢失（方案 §3 分层清单第 3 条）"
+grep -q 'RandomNumberGenerator' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "签发用了非 CSP 随机源（弱随机钥匙）"
+grep -q '生成的钥匙长度异常，停手' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "生成失败没有停手（22:41 副本实测：PS 里 New-Object 失败是非终止错误，会带着空钥匙继续写）"
+grep -q 'issue done uid=' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "签发缺『两侧同源自证通过』的完成锚点"
+grep -q 'Issue read-back mismatch' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "签发没有写后复读比对网关注册表与账号快照同值（各写一半＝该账号实盘当场断）"
+if grep -q "New-Object 'System.Security.Cryptography+" deploy/qmt-win/rotate_qmt_token.ps1; then
+	fail143 "又用回 [System.Security.Cryptography+RNGCryptoServiceProvider]（PS5.1 认不出这个类型名，TypeNotFound 后带空钥匙继续跑）"
+fi
+
+# —— ⑥ 部署探针：判据从「五源同值」换成「凭证集合自洽」 ——
+CNT143=$((CNT143 + 1))
+grep -q 'live_credential_holders' scripts/verify_deploy_guangzhou.sh || fail143 "探针没判「一把在册凭证被几个账号持有」"
+grep -q 'global_rules_qmt_holds_live_credential' scripts/verify_deploy_guangzhou.sh || fail143 "探针没判「全局兜底还持有实盘凭证」（N1 没人守）"
+grep -q 'snapshot_holders=' scripts/verify_deploy_guangzhou.sh || fail143 "探针明细缺持有数读数（红了也看不出是几条）"
+if grep -q '^\$tkPres = @($tk1, $tk2, $tk3, $tk3b, $tk4' scripts/verify_deploy_guangzhou.sh; then
+	fail143 "探针判据改回了「五源同值」——那条判据本身就是把凭证铺给所有账号的成因"
+fi
+
+# —— ⑦ owner 声明与观测位（漂移必须看得见）——
+CNT143=$((CNT143 + 1))
+grep -q 'self.owner_user_id = str(cfg.get("owner_user_id")' qmt_gateway/gateway.py || fail143 "owner（资金账号账本持有人）没有显式声明位"
+grep -q 'self.owner_user_id or self.user_id,' qmt_gateway/gateway.py || fail143 "账户级事件的归属没落到 owner（持仓/资金会跟着通道级账号漂）"
+grep -q 'payload\["credential_accounts"\]' qmt_gateway/gateway.py || fail143 "/health 没报在册钥匙数（一把铺给所有账号的旧形态就看不见）"
+grep -q 'payload\["report_token_fallback_total"\]' qmt_gateway/gateway.py || fail143 "/health 没报出向钥匙回退次数（引擎与网关注册表漂移会静默）"
+
+[ "$B143_FAILED" = "0" ] || exit 1
+echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1，累计判定点 ${CNT143}）"
 
 echo "==> 全部通过"
