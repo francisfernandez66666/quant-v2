@@ -58,6 +58,9 @@ param(
     # English: per-account credentials — -Align no longer spreads one key to every account unless
     # -LegacySpread is passed explicitly; -RegisterAccount adds a key from stdin; -ShowRegistry audits holders.
     [switch]$LegacySpread,
+    # §TOKEN-PERAACCT：把"这个资金账号的账归谁"写进网关配置（持仓/资金这类账户级事件的归属），
+    # 而不是靠 `user_id` 空串回退到"users 顺序第一个命中者"猜。
+    [string]$SetOwner = "",
     [string]$RegisterAccount = "",
     # §TOKEN-PERAACCT 撤销通道：把某账号快照里的实盘凭证清掉（只动它自己那一条），
     # 以及把引擎全局 rules.qmt.token 清空（N1：兜底位不该持有实盘凭证）。
@@ -224,6 +227,46 @@ function Set-SnapshotTokenRaw {
     return @{ text = $Raw.Substring(0, $w.start) + $winNew + $Raw.Substring($w.end + 1); delta = $winNew.Length - $w.win.Length }
 }
 
+if ($SetOwner) {
+    # 只改一个字符串字段，形与 -ClearGlobal 同款（锚点窗口外科替换 + 提案自证 + 备份 + 复读）。
+    if ($SetOwner -notmatch '^[A-Za-z0-9_.:@-]{1,64}$') { Die "SetOwner refused: user_id 形态非法" }
+    $oRaw = Get-Content -LiteralPath $ConfigFile -Raw -Encoding UTF8
+    $oObj = $null
+    try { $oObj = $oRaw | ConvertFrom-Json } catch { Die ("SetOwner refused: config.xt.json 解析失败（" + $_.Exception.Message + "）") }
+    if ((FpLabel([string]$oObj.owner_user_id)) -eq (FpLabel $SetOwner)) {
+        Ok ("set owner done action=same uid=" + $SetOwner); exit 0
+    }
+    $oNew = $null
+    if ($oRaw -match '"owner_user_id"') {
+        try { $oNew = Set-JsonStringFieldRaw -Text $oRaw -Anchor '' -Field 'owner_user_id' -Value $SetOwner -Check { param($o) ([string]$o.owner_user_id) -eq $SetOwner } } catch { Die ("SetOwner refused: " + $_.Exception.Message) }
+    } else {
+        # 键不存在：插到 "user_id" 之后（没有该键就插到 "account" 之后），逗号由替换文本自带
+        $reIns = [regex]'("(?:user_id|account)"\s*:\s*"[^"]*")'
+        $mIns = $reIns.Match($oRaw)
+        if (-not $mIns.Success) { Die "SetOwner refused: 找不到可插入的锚点键（user_id/account 都不在，形态不认识，停手）" }
+        $oNew = $oRaw.Substring(0, $mIns.Index + $mIns.Length) + (', "owner_user_id": "' + $SetOwner + '"') + $oRaw.Substring($mIns.Index + $mIns.Length)
+    }
+    $oChk = $null
+    try { $oChk = $oNew | ConvertFrom-Json } catch { Die "SetOwner refused: 提案文本解析不过（手术切坏形态，拒写）" }
+    if ([string]$oChk.owner_user_id -ne $SetOwner) { Die "SetOwner refused: 提案里 owner 未命中目标值（切错位置嫌疑）" }
+    foreach ($f in @('token', 'report_token', 'broker', 'account', 'report_url', 'db')) {
+        if ([string]$oChk.$f -ne [string]$oObj.$f) { Die ("SetOwner refused: 字段 " + $f + " 在提案里变了——手术刀不干净，拒写") }
+    }
+    Info ("set owner plan was=" + (FpLabel([string]$oObj.owner_user_id)) + " to=" + (FpLabel $SetOwner) + "（uid 不是秘密，明文可回显但这里仍只报指纹）")
+    if (-not $Apply) { Ok "set owner plan-only（未写；加 -Apply 落地）"; exit 0 }
+    $stampO = Get-Date -Format "yyyyMMddHHmmss"
+    $bakO = $ConfigFile + ".pre-setowner-" + $stampO
+    Copy-Item -LiteralPath $ConfigFile -Destination $bakO -Force
+    $tmpO = $ConfigFile + ".settingowner-" + $stampO
+    [System.IO.File]::WriteAllText($tmpO, $oNew, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmpO -Destination $ConfigFile -Force
+    $backO = $null
+    try { $backO = Get-Content -LiteralPath $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("SetOwner read-back parse failed（回滚副本: " + $bakO + "）") }
+    if ([string]$backO.owner_user_id -ne $SetOwner) { Die ("SetOwner read-back mismatch（回滚副本: " + $bakO + "）") }
+    Ok ("set owner done action=written uid=" + $SetOwner + " backup=" + $bakO)
+    Info "生效前提：重启 qmt_gateway 后，持仓/资金这类账户级事件才按这个账号归因（restart_gateway.ps1 / QMT-Gateway-Ensure）"
+    exit 0
+}
 if ($ShowRegistry) {
     $reg0 = Get-AuthTokenRegistry $cfg
     Info ("registry entries=" + @($reg0).Count)

@@ -2746,7 +2746,7 @@ WRITE_PRIMS = ('Copy-Item -LiteralPath', '[System.IO.File]::WriteAllText', 'Move
 writes = sorted({m.start() for x in WRITE_PRIMS for m in re.finditer(re.escape(x), t)})
 assert len(writes) >= 20, '写盘原语数量骤减（本锁与实现同时失配，或写侧被藏起来了，请同步）'
 TOPS = sorted({mm.start() for mm in re.finditer(r'^if \(', t, re.M)})
-MODES = ('RegisterAccount', 'RevokeAccount', 'ClearGlobal')
+MODES = ('RegisterAccount', 'RevokeAccount', 'ClearGlobal', 'SetOwner')
 spans = {}
 for mode in MODES:
     m = re.search(r'^if \(\$' + mode + r'\) \{', t, re.M)
@@ -2767,14 +2767,14 @@ for w in outside:
     assert early.end() < w, '主链路写盘动作排在 dry-run 早退之前（不加 -Apply 也会改配置）'
 PY
 # 反证腿 V1（改坏必须变红：只能变绿的锁等于没有锁，永远红的同样是摆设）。
-# 正向＝现网原文必须过判据；V1＝往三个写模式分支的**开头**各注入一条写盘原语
+# 正向＝现网原文必须过判据；V1＝往四个写模式分支的**开头**各注入一条写盘原语
 # （等价于"不带 -Apply 也会动现网文件"）⇒ 三处都必须红。
 # 判据与主锁同源同形：改主锁必须同步这条腿，否则它测的是想象中的锁。
 B143_DRILL=0
 python3 - deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || B143_DRILL=1
 import re, sys
 PRIMS = ('Copy-Item -LiteralPath', '[System.IO.File]::WriteAllText', 'Move-Item -LiteralPath')
-MODES = ('RegisterAccount', 'RevokeAccount', 'ClearGlobal')
+MODES = ('RegisterAccount', 'RevokeAccount', 'ClearGlobal', 'SetOwner')
 
 
 def check(t):
@@ -2829,7 +2829,7 @@ if [ "$B143_DRILL" != "0" ]; then
 	FAIL=1
 	B143_FAILED=1
 fi
-echo "ok - §143 反证 V1（原文必过 + 三个写模式开头注入写盘原语三处全红）"
+echo "ok - §143 反证 V1（原文必过 + 四个写模式开头各注入写盘原语，四处全红）"
 # 负锁：轮换脚本不得把新 token 明文写进任何输出（本仓库铁律：输出只准键名/计数/指纹）。
 if grep -qE '\+ \$newToken|\$\{newToken\}' deploy/qmt-win/rotate_qmt_token.ps1; then
 	echo "--- FAIL: 轮换脚本出现回显新 token 明文的路径"; exit 1; fi
@@ -17224,6 +17224,8 @@ grep -q 'align src5 plan auth_snapshots action=SKIPPED holders=' deploy/qmt-win/
 grep -q '\[string\]\$RegisterAccount' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺逐账号登记通道"
 grep -q 'RegisterAccount refused' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "登记通道缺拒判（明文长度/uid 形态/一把钥匙两个主人/条目丢失都不拦）"
 grep -q '\[switch\]\$ShowRegistry' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺只读检视（运维看不出哪把钥匙挂了几个账号）"
+grep -q '\[string\]\$SetOwner' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺 owner 声明通道（持仓/资金归谁只能靠空串回退＝又回到按 users 顺序猜）"
+grep -q 'pre-setowner-' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "owner 声明写侧没有写前备份"
 grep -q '\[string\]\$RevokeAccount' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺撤销通道（一把钥匙扩散出去后没有摘回来的正规通道）"
 grep -q '(quant_config_json_v1, ' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "撤销的唯一性没按 (key,user_id) 判（同账号多条配置必然误判或误伤）"
 grep -q '\[switch\]\$ClearGlobal' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺「清空全局 rules.qmt.token」通道（N1 落不了地）"
