@@ -51,7 +51,8 @@ param(
     [switch]$Align,
     # §TOKEN-PERAACCT（2026-10-30）：一把钥匙铺给所有账号的旧对齐语义就此止步——
     #  - LegacySpread 是把"源3/源5 仍按源1 复制"的旧路径显式留住的历史开关，**缺省关闭**；
-    #    关闭时 -Align 只对齐源4（桥，物理上必须与网关同钥匙），源3/源5 改为"报告 + 指引签发通道"。
+    #    关闭时 -Align **一条都不写**：源3/源5 明确报 SKIPPED，源4（桥）只报差异（report-only），
+    #    收尾打 ALIGN_NO_SPREAD；要把钥匙落到某个账号，走 -Issue/-RegisterAccount 逐账号签发。
     #  - RegisterAccount：把一把**已由引擎侧签发到该账号快照**的钥匙登记进网关 account_tokens 注册表；
     #    钥匙从 stdin 读入（不进命令行、不进日志、不回显），只打印指纹。
     #  - ShowRegistry：只读列出网关注册表与引擎侧各账号快照的持有关系（一把钥匙两个主人＝红）。
@@ -752,10 +753,12 @@ if ($Align) {
     # §TOKEN-PERAACCT 默认语义变更（2026-10-30）：**一把钥匙不再铺给所有账号**。
     # 旧 -Align 把源1复制到源3（引擎全局 rules.qmt.token）与源5（每个账号快照），
     # 现网七个账号共用同一把实盘凭证、回报只能按 users 顺序猜归属，正是这条通道造成的。
-    # 现在缺省只对齐源4（桥与网关物理同机同钥匙，必须一致），源3/源5 改为"报告 + 指向签发通道"；
+    # 现在缺省**只检视、一条都不写**：源3/源5 按 N1/N2 明确 SKIPPED，源4（桥）只报出差异——
+    # 桥与网关物理同机、确实该同钥匙，但"把源1 复制给谁"这件事在逐账号形态下必须是一次显式决定，
+    # 所以要么显式加 -LegacySpread 走旧扩散写侧，要么用 -RegisterAccount/-Issue 逐账号落。
     # 确需恢复旧行为（例如回滚）才显式加 -LegacySpread。
     if (-not $LegacySpread) {
-        Info ("align src1 truth fp=" + (FpLabel([string]$cfg.token)) + " （本轮只对齐源4，源3/源5 不再复制）")
+        Info ("align src1 truth fp=" + (FpLabel([string]$cfg.token)) + " （默认形态：只检视，源3/源4/源5 一条都不写）")
         $spreadHolders = @()
         foreach ($hc in @($authSnapVals)) { if ((FpLabel $hc) -eq (FpLabel([string]$cfg.token))) { $spreadHolders += "match" } }
         Info ("align src3 plan engine_cfg will_write=False action=SKIPPED was=" + (FpLabel $engToken) +
@@ -763,17 +766,18 @@ if ($Align) {
         Info ("align src5 plan auth_snapshots action=SKIPPED holders=" + @($spreadHolders).Count +
               "（N2：在册凭证的快照持有者至多 1；逐账号签发走 -RegisterAccount，撤销走 -RevokeAccount）")
         $bridgeOnly = Join-Path $GatewayDir "config.bridge.json"
-        # 锚点与 -LegacySpread 路径同名（align src4 plan bridge action=…）：驱动侧的计划完整性
+        # 锚点前缀与 -LegacySpread 路径同名（align src4 plan bridge action=…）：驱动侧的计划完整性
         # 判据不必分叉（scripts/rotate_qmt_token_guangzhou.sh 认的就是这一串）。
+        # action 取 report-only/write-diff/same/absent：这里只报差异，绝不暗示本轮会写桥。
         $brActionOnly = "absent"
-        if (Test-Path $bridgeOnly) { $brActionOnly = if ((FpLabel $brToken) -ne (FpLabel([string]$cfg.token))) { "write" } else { "same" } }
-        Info ("align src4 plan bridge action=" + $brActionOnly + " (absent=桥未落位，落位时写源1同值即可)")
+        if (Test-Path $bridgeOnly) { $brActionOnly = if ((FpLabel $brToken) -ne (FpLabel([string]$cfg.token))) { "write-diff" } else { "same" } }
+        Info ("align src4 plan bridge action=" + $brActionOnly + " report-only (absent=桥未落位；差异要落地请显式 -LegacySpread 或逐账号签发)")
         if (Test-Path $bridgeOnly) {
-            if ((FpLabel $brToken) -ne (FpLabel([string]$cfg.token))) { Warn "align src4 bridge fp != src1（桥必须与网关同钥匙，见下方写侧）" }
+            if ((FpLabel $brToken) -ne (FpLabel([string]$cfg.token))) { Warn "align src4 bridge fp != src1（桥与网关同机同钥匙才通；本轮不写，见上面的 action）" }
             else { Ok "align src4 bridge same-as-src1" }
-        } else { Info "align src4 bridge absent (桥未落位，落位时写源1 同值)" }
-        if (-not $Apply) { Info "ALIGN_DRY plan-only（默认不写源3/源5）" }
-        else { Ok "align done（默认形态：只检视+对齐源4，源3/源5 未写；确需旧扩散请显式加 -LegacySpread）" }
+        } else { Info "align src4 bridge absent (桥未落位，落位时按签发通道对齐)" }
+        if (-not $Apply) { Info "ALIGN_DRY plan-only（默认形态：一条都不写）" }
+        else { Ok "ALIGN_NO_SPREAD default-form done written=0（源3/源4/源5 均未写；逐账号签发走 -Issue/-RegisterAccount，确需旧扩散请显式加 -LegacySpread）" }
         exit 0
     }
     $alignTok = [string]$cfg.token

@@ -30,8 +30,8 @@
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh              # 预览（零连接）
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -DryRun      # 远端只读：四源指纹读数
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Apply       # 真轮换（只动源1+源2）
-#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align       # §0926ROT-ALIGN 远端只读：对齐计划（源3/源4 会动什么）
-#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align -Apply # 对齐落地：源1 现值→源3/源4/源5（不生成新 token）
+#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align       # §TOKEN-PERAACCT 远端只读：对齐计划（默认形态三条腿都只报数）
+#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align -Apply # 默认形态=一条都不写（ALIGN_NO_SPREAD）；旧扩散需再加 -LegacySpread
 # 可选环境变量：
 #   GZ_USER      默认 Administrator
 #   ROTATE_PS1   远端 ps1 路径，默认 C:/opt/quant/qmt-win/rotate_qmt_token.ps1（部署清单落点）
@@ -56,8 +56,10 @@ for a in "$@"; do
 done
 # §0926ROT-ALIGN（owner 令「我授权你来统一改」）：-Align 是对齐轴，与读/写轴正交。
 # 两轴合成四个生效方向（preview/dryrun/apply + aligndry/alignapply）：
-#   -Align          = 远端只读对齐计划（src3/src4 会动什么，逐一列出；ps1 缺省即 dry-run）
-#   -Align -Apply   = 对齐落地（源1 现值复制到源3/源4/源5，**不生成新 token**；src5 落位后需重启 quant 服务）
+#   -Align          = 远端只读对齐计划（src3/src4/src5 各会动什么，逐一列出；ps1 缺省即 dry-run）
+#   -Align -Apply   = §TOKEN-PERAACCT 后**默认一条都不写**：src3/src5 明确 SKIPPED、src4 report-only，
+#                     收尾打 ALIGN_NO_SPREAD（下面这条分支据此判"计划完整、未写"，而不是"半态待回滚"）。
+#                     确需旧的源1→源3/源4/源5 扩散（回滚形态）在远端命令里显式加 -LegacySpread。
 #   -Align -DryRun  = 同 -Align（显式只读）。-DryRun/-Apply 单独出现仍是原轮换读/写方向。
 # 这里直接折叠进 MODE 单一命名空间（不另设 R_MODE：少一个变量就少一处"哪个才是真模式"的漂移）。
 if [ "$ALIGN" = "1" ]; then
@@ -103,14 +105,17 @@ if [ "$MODE" = "preview" ]; then
   echo "  将执行的远端命令（现在**没有**执行）："
   echo "    -DryRun 读四源指纹：powershell -File ${ROTATE_PS1} -DryRun"
   echo "    -Apply  只动源1+源2：powershell -File ${ROTATE_PS1} -Apply"
-  echo "    -Align  只读对齐计划：powershell -File ${ROTATE_PS1} -Align"
-  echo "    -Align -Apply 源1现值→源3/源4（不生成新 token）：powershell -File ${ROTATE_PS1} -Align -Apply"
+  echo "    -Align  只读对齐计划（默认形态只检视）：powershell -File ${ROTATE_PS1} -Align"
+  echo "    -Align -Apply §TOKEN-PERAACCT 后默认**一条都不写**（源3/源5 SKIPPED、源4 report-only，"
+  echo "                  收尾打 ALIGN_NO_SPREAD）；要逐账号落钥匙走 -Issue/-RegisterAccount"
+  echo "    -Align -Apply -LegacySpread 才是旧的源1→源3/源4/源5 扩散（回滚形态，显式才生效）"
   echo "  安全口径（ps1 既有铁律，本通道原样继承）："
   echo "    写侧①先落 config.xt.json 时间戳副本再原子写；写侧②服务 env 并集写不整体替换；"
   echo "    全程只打 sha256 前 8 位指纹；回传过本脚本的 40+hex 明文闸。"
-  echo "  轮换（-Apply）之后仍欠的源3/源4 两条腿——§0926ROT-ALIGN 后有一条机器腿："
-  echo "    跑 -Align -Apply 把源1 现值在服务器本地复制到引擎 config.json（rules.qmt.token）"
-  echo "    与在位的 config.bridge.json；设置页仍是源3 的权威写入方，之后若从设置页改值需再对齐一次。"
+  echo "  轮换（-Apply）之后仍欠的源3/源4 两条腿——§TOKEN-PERAACCT 后的正规形态："
+  echo "    源3（全局 rules.qmt.token）按 N1 不该再持有实盘凭证，用 -ClearGlobal 摘掉；"
+  echo "    源5（各账号快照）按 N2 至多一条持有，谁的实盘谁用 -Issue/-RegisterAccount 单独落；"
+  echo "    源4（config.bridge.json）落位后按签发通道对齐一次。"
   echo "    owner 手工形态依旧可用：[a] 设置页改 rules.qmt.token；[b] 桥侧 config.bridge.json --token 同步。"
   echo "  时序红线不变：三侧同值之前**不要重启网关进程**。"
   echo "  复核腿：verify_deploy_guangzhou.sh 第 20 探针（token fp agree across readable sources）。"
@@ -224,8 +229,28 @@ if [ "$MODE" = "aligndry" ]; then
   exit 0
 fi
 
-# ── alignapply（-Align -Apply）：源1 现值→源3/源4/源5 落地复核，不生成新 token ──
+# ── alignapply（-Align -Apply）：§TOKEN-PERAACCT 后分两种形态 ──────────────────────────
+# 缺省形态（不带 -LegacySpread）在服务器本地**一条都不写**，只回显 src3/src5 SKIPPED + src4
+# report-only 的计划，并以 ALIGN_NO_SPREAD 收尾——这条分支据此判"计划完整、未写"，
+# 不再拿旧扩散的三条 done 判定行去要求它（那会把"什么都没写"误报成"半态待回滚"）。
+# 显式 -LegacySpread 才是旧的源1→源3/源4/源5 扩散，判据保持逐字不变。
 if [ "$MODE" = "alignapply" ]; then
+  if printf '%s\n' "$LAST_OUT" | grep -qF 'ALIGN_NO_SPREAD'; then
+    for anchor in 'align src3 plan engine_cfg will_write=False action=SKIPPED' 'align src5 plan auth_snapshots action=SKIPPED holders=' 'align src4 plan bridge action='; do
+      if ! printf '%s\n' "$LAST_OUT" | grep -qF "$anchor"; then
+        echo "X 默认形态的对齐计划缺锚点「${anchor}」——三条腿没报全就宣称未写，判失败。" >&2
+        exit 1
+      fi
+    done
+    if [ "$LAST_RC" -ne 0 ]; then
+      echo "X -Align -Apply（默认形态）退出码非 0（rc=${LAST_RC}），详见 ${LOG}" >&2
+      exit 1
+    fi
+    printf '%s\n' "$LAST_OUT" | grep -E '^\[ ?(rot|ok|warn) ?\] ' || true
+    echo "ALIGN_APPLIED written=0 mode=default_no_spread log=${LOG}"
+    echo "ok - 默认形态按逐账号凭证收口：源3/源4/源5 均未写（要签发走 -Issue/-RegisterAccount，确需旧扩散显式加 -LegacySpread）"
+    exit 0
+  fi
   for anchor in 'align src3 done token_fp=' 'align src4 done ' 'align src5 done ' 'ALIGN_APPLIED'; do
     if ! printf '%s\n' "$LAST_OUT" | grep -qF "$anchor"; then
       echo "X 对齐判定行缺失「${anchor}」——源3/源4/源5 写腿（外科替换+回读自证）没有全过，" >&2

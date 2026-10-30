@@ -2830,6 +2830,74 @@ if [ "$B143_DRILL" != "0" ]; then
 	B143_FAILED=1
 fi
 echo "ok - §143 反证 V1（原文必过 + 四个写模式开头各注入写盘原语，四处全红）"
+# 反证腿 V2（§TOKEN-PERAACCT 方案 §5 最后一条：缺省 -Align 走不到源3/源5 写侧）。
+# 为什么不能只 grep「action=SKIPPED」：那句话是**打印**出来的，谁都能在真写了文件之后照打不误
+# （10-30 双份账里"降级报成功"就是这个家族）。判据改成结构性的：把 `if (-not $LegacySpread) {`
+# 这一支按大括号配对整段切出来，段内任何写盘原语都不许出现，且必须以 exit 收尾——
+# 缺省形态因此**在语法上**就不可能动现网文件，而不是靠一句自述。
+B143_V2=0
+python3 - deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || B143_V2=1
+import re, sys
+# 与 V1/§102 同源的写盘原语集，另加三条只在"往文件里落东西"这层出现的形态
+PRIMS = ('Copy-Item -LiteralPath', '[System.IO.File]::WriteAllText', 'Move-Item -LiteralPath',
+         'Set-Content', 'Out-File', 'Set-SnapshotTokenRaw', 'Set-JsonStringFieldRaw', 'Remove-Item')
+
+
+def default_branch(t):
+    """缺省 -Align 那一支的整段文本（大括号配对）；找不到入口返回 None。"""
+    i = t.index('if ($Align) {')
+    m = re.search(r'if \(-not \$LegacySpread\) \{', t[i:])
+    if not m:
+        return None
+    j = i + m.end()
+    depth, k = 1, j
+    while k < len(t) and depth:
+        c = t[k]
+        depth += (c == '{') - (c == '}')
+        k += 1
+    if depth:
+        return None  # 括号不配对：结构不可信，按红处置
+    return t[j:k]
+
+
+def check(t):
+    body = default_branch(t)
+    if body is None:
+        return '缺省 -Align 分支（if (-not $LegacySpread)）入口丢失或括号不配对'
+    hits = [w for x in PRIMS for w in re.finditer(re.escape(x), body)]
+    if hits:
+        return '缺省分支里出现写盘原语（本分支必须只检视）：' + hits[0].group(0)
+    if 'exit 0' not in body:
+        return '缺省分支没有自己的出口：往下走就落进 -LegacySpread 写侧'
+    if 'action=SKIPPED' not in body:
+        return '缺省分支不再如实报 src3/src5 SKIPPED（N1/N2 的读数没了）'
+    return None
+
+
+t = open(sys.argv[1], encoding='utf-8').read()
+red = check(t)
+if red is not None:
+    print('POSITIVE_FAILED: ' + red)
+    raise SystemExit(1)
+# 反证 ①：往缺省分支开头注入一条写盘 ⇒ 必红（等价于"默认也铺钥匙"回潮）
+m = re.search(r'if \(-not \$LegacySpread\) \{\n', t)
+inj = '    Copy-Item -LiteralPath $authPath -Destination $authPath.bak -Force\n'
+if check(t[:m.end()] + inj + t[m.end():]) is None:
+    print('MUTATION_STILL_GREEN: 缺省分支注入写盘后仍判绿')
+    raise SystemExit(1)
+# 反证 ②：删掉分支自己的 exit（让它掉进 LegacySpread 写侧）⇒ 必红
+body = default_branch(t)
+if check(t.replace(body, body.replace('exit 0', 'Info "no exit"', 1))) is None:
+    print('MUTATION_STILL_GREEN: 摘掉 exit 后仍判绿')
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+if [ "$B143_V2" != "0" ]; then
+	echo "--- FAIL: §143 反证 V2（缺省 -Align 分支的「只检视」判据不成立，或注入写盘/摘掉出口后仍判绿＝这条锁是摆设）"
+	FAIL=1
+	B143_FAILED=1
+fi
+echo "ok - §143 反证 V2（缺省 -Align 分支整段无写盘原语 + 必须自带 exit；注入写盘、摘掉出口两处全红）"
 # 负锁：轮换脚本不得把新 token 明文写进任何输出（本仓库铁律：输出只准键名/计数/指纹）。
 if grep -qE '\+ \$newToken|\$\{newToken\}' deploy/qmt-win/rotate_qmt_token.ps1; then
 	echo "--- FAIL: 轮换脚本出现回显新 token 明文的路径"; exit 1; fi
@@ -17214,6 +17282,9 @@ grep -q 'explicitToken' internal/server/qmt.go || fail143 "缺「本次没显式
 grep -q 'qmt_token_revoke' internal/server/qmt.go || fail143 "显式撤销没有审计留痕"
 grep -q 'func TestMemberSaveDoesNotCloneInheritedToken' internal/server/token_per_account_test.go || fail143 "N4 没有回归锁"
 grep -q 'func TestExplicitEmptyTokenRevokesCredential' internal/server/token_per_account_test.go || fail143 "N1 撤销通道没有回归锁"
+# §5 清单里那两枚"行为腿"：钥匙→账号唯一命中、回报不信自报归属（缺一枚就等于方案说做完而实际没做完）
+grep -q 'func TestReportAttributionFollowsTheToken' internal/server/token_per_account_test.go || fail143 "多把在册钥匙下的归属唯一性没有回归锁"
+grep -q 'func TestForgedBodyUidCannotMoveTheBook' internal/server/token_per_account_test.go || fail143 "§安全 T1 只剩文字锁（没人真打过一条冒名回报）"
 grep -q 'def test_per_account_tokens' qmt_gateway/tests/test_token_per_account.py || fail143 "网关注册表没有回归锁"
 
 # —— ⑤ 轮换通道：一把钥匙不再铺给所有账号；签发走登记 + 引擎快照 ——
@@ -17221,6 +17292,11 @@ CNT143=$((CNT143 + 1))
 grep -q '\[switch\]\$LegacySpread' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "-Align 的扩散语义没有被显式开关锁住（默认必须不铺）"
 grep -q 'align src3 plan engine_cfg will_write=False action=SKIPPED' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "-Align 缺省仍可能写全局 rules.qmt.token（N1 会被这条运维通道反复回潮）"
 grep -q 'align src5 plan auth_snapshots action=SKIPPED holders=' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "-Align 缺省仍可能把所有账号快照对齐到一把钥匙（N2 的直接违例，且不报持有数）"
+# 缺省形态"一条都不写"必须有完成锚点，且驱动必须认它——否则运维看到的就是
+# 「对齐判定行缺失＝半态待回滚」这种假故障（10-30 改判据后驱动没跟上，实测会误报）。
+grep -q 'ALIGN_NO_SPREAD default-form done written=0' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺省 -Align 的完成锚点丢失（写了没写只能靠猜）"
+grep -q 'ALIGN_NO_SPREAD' scripts/rotate_qmt_token_guangzhou.sh || fail143 "驱动不认缺省 -Align 的完成锚点（把「未写」误报成「半态待回滚」）"
+grep -q 'ALIGN_APPLIED written=0 mode=default_no_spread' scripts/rotate_qmt_token_guangzhou.sh || fail143 "驱动的缺省形态机器可读读数丢失（事后无法区分两条对齐路径）"
 grep -q '\[string\]\$RegisterAccount' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺逐账号登记通道"
 grep -q 'RegisterAccount refused' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "登记通道缺拒判（明文长度/uid 形态/一把钥匙两个主人/条目丢失都不拦）"
 grep -q '\[switch\]\$ShowRegistry' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "缺只读检视（运维看不出哪把钥匙挂了几个账号）"

@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -144,11 +145,23 @@ class TestObservabilityFields(_GatewayCase):
         self.assertEqual(self.gw._health_payload()["orders_snapshot_age"], -1)
 
     def test_admin_status_stuck_cancel(self):
-        self.store.upsert_order(_row(status="撤单中", created_at=gw_mod._now_cn()[:10] + " 09:31:53"))
+        # 种「今天且已经过去」的时刻：写死 09:31:53 这种钟面在零点后跑等于把 created_at 种到未来，
+        # 判龄（now - created_at）只会得到 0，红的是用例自己而不是产品。
+        now_dt = datetime.strptime(gw_mod._now_cn()[:19], "%Y-%m-%dT%H:%M:%S")
+        seeded = now_dt - timedelta(seconds=95)
+        expected_age = 95
+        if seeded.date() != now_dt.date():
+            # 跨零点的小窗口：退回今日 0 点，此时卡单龄 = 今日已过秒数（00:00:00 时可为 0）
+            seeded = now_dt.replace(hour=0, minute=0, second=0)
+            expected_age = int((now_dt - seeded).total_seconds())
+        self.store.upsert_order(_row(status="撤单中",
+                                     created_at=seeded.strftime("%Y-%m-%d %H:%M:%S")))
         status, payload = self.gw._do_admin_status()
         self.assertEqual(status, 200)
         self.assertEqual(payload["stuck_cancel_orders"]["n"], 1)
-        self.assertGreater(payload["stuck_cancel_orders"]["oldest_age_sec"], 0)
+        # 锁的是「按 created_at 算出了年龄、量级对得上」，不是恒正的废话断言
+        self.assertGreaterEqual(payload["stuck_cancel_orders"]["oldest_age_sec"], expected_age)
+        self.assertLess(payload["stuck_cancel_orders"]["oldest_age_sec"], expected_age + 60)
 
 
 class TestOrdersEndpoint(_GatewayCase):

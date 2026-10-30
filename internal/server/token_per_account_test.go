@@ -14,10 +14,15 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/store"
 )
 
 // seedGlobalQMTKey 把全局兜底位写成一把"生产钥匙"，复现现网形态（成员账号无覆盖 ⇒ 继承它）。
@@ -142,6 +147,142 @@ func TestExplicitEmptyTokenRevokesCredential(t *testing.T) {
 	}
 	if s.cfg.GetQMTConfigFor(member.ID).Mode != "manual" {
 		t.Fatalf("普通保存应照常落 mode")
+	}
+}
+
+// TestReportAttributionFollowsTheToken 方案 §5：多把在册钥匙下，回报归属必须由钥匙本身决定。
+// 旧形态的坑不在"按 token 反查账号"这件事，而在**所有账号的 token 是同一把**：
+// 遍历 users 时命中的是顺序里的第一个（现网=admin），于是 test01 下的单、admin 收的回报，
+// 两个账号各记一本账，谁也推不动谁那行。钥匙逐账号唯一之后，first-match 才等价于唯一命中——
+// 所以这里锁的是"第二把钥匙不会解析成第一个账号"，而不只是"能解析出账号"。
+// 顺带锁住两条边界：未登记的钥匙必须解析为空（宁可 401，不许蒙一个账号）；
+// 请求不带 token 时不许匹配到"快照里 token 为空"的账号（否则匿名请求就变成某个人的账）。
+func TestReportAttributionFollowsTheToken(t *testing.T) {
+	s, admin := newAdminTestServer(t)
+	seedGlobalQMTKey(t, s, "PROD-KEY")
+	u2, err := s.auth.CreateUser("u2", "pw-u2", "user", nil, 0)
+	if err != nil {
+		t.Fatalf("create u2: %v", err)
+	}
+	u3, err := s.auth.CreateUser("u3", "pw-u3", "user", nil, 0)
+	if err != nil {
+		t.Fatalf("create u3: %v", err)
+	}
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost,
+		"/api/admin/users/"+u2.ID+"/config/qmt", `{"token":"KEY-U2","enabled":true}`)); rr.Code != 200 {
+		t.Fatalf("签发 u2 期望 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost,
+		"/api/admin/users/"+u3.ID+"/config/qmt", `{"token":"KEY-U3","enabled":true}`)); rr.Code != 200 {
+		t.Fatalf("签发 u3 期望 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 自证前提：两把钥匙各自唯一落进两个账号快照（不落在 admin 名下——admin 排在 users 第一个，
+	// 若这里也能抄到继承值，下面的断言就退化成"命中第一个"了）
+	if got := s.cfg.GetQMTConfigFor(u2.ID).Token; got != "KEY-U2" {
+		t.Fatalf("前置条件不成立：u2 快照 token=%q", got)
+	}
+	if got := s.cfg.GetQMTConfigFor(u3.ID).Token; got != "KEY-U3" {
+		t.Fatalf("前置条件不成立：u3 快照 token=%q", got)
+	}
+	if got := s.userForQMTToken("KEY-U2"); got != u2.ID {
+		t.Fatalf("§TOKEN-PERAACCT：u2 的钥匙解析成 %q（应为 u2；解析成 admin 就是双本账的成因）", got)
+	}
+	if got := s.userForQMTToken("KEY-U3"); got != u3.ID {
+		t.Fatalf("§TOKEN-PERAACCT：u3 的钥匙解析成 %q（first-match 退回了 users 顺序）", got)
+	}
+	// 没登记的钥匙一律空：让中间件回 401，而不是"猜一个账号"
+	if got := s.userForQMTToken("KEY-NOBODY"); got != "" {
+		t.Fatalf("未登记的钥匙必须无匹配, got %q", got)
+	}
+	// 请求不带 token 时不许匹配任何人：没配钥匙的账号一堆，它们的 token 都是空串，命中谁全凭顺序
+	if got := s.userForQMTToken(""); got != "" {
+		t.Fatalf("空 token 不许匹配到账号, got %q", got)
+	}
+	// 残留形状（如实标注，不当已修）：全局兜底位一旦有值，**没有自有覆盖的账号全部继承同一把**，
+	// 反查仍是 first-match。本用例不锁"它该解析成谁"（那是顺序决定的，锁了就是把缺陷认成规格），
+	// 只锁它不许串到已有自有钥匙的账号头上——自有钥匙必须赢过继承。
+	if got := s.userForQMTToken("PROD-KEY"); got == u2.ID || got == u3.ID {
+		t.Fatalf("§TOKEN-PERAACCT：全局继承钥匙解析成了持有自有钥匙的账号 %q（两本账会互相串）", got)
+	}
+}
+
+// TestForgedBodyUidCannotMoveTheBook §安全 T1 的行为腿（此前只有文字锁）。
+// §TOKEN-PERAACCT 之后网关注册表里可以有很多把钥匙，每个账号敲进来的是**自己那把**；
+// 于是"回报体自带的 user_id 算不算数"从理论问题变成日常问题：A 号（或任何持有 A 号钥匙的人）
+// 只要把 body 里的 user_id 写成 B，就能把自己的成交记到 B 名下、或把空持仓快照砸到 B 头上。
+// 本用例锁两件事：委托行的归属只认 token 解析出的账号（body 自报被丢），
+// 以及持仓对账的作用范围同理——被冒名的那个账号一行都不许动。
+func TestForgedBodyUidCannotMoveTheBook(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	// 归属来自 qmtReportMiddleware 用钥匙反查后写进上下文的那个 uid，这里直接扮演它
+	const holder = "u_holder" // 持有这把实盘钥匙的账号
+	const victim = "u_victim" // 回报体想冒用的另一个账号
+	sid := "buy:600519:fac_1:20261031"
+	// 先给被冒名账号落一行委托 + 一手持仓，作为"没被动过"的对照
+	if _, err := db.ApplyOrderReportTx(store.RealOrder{
+		OrderID: "XT-VICTIM", SignalID: sid, Code: "600519.SH", Side: "买入",
+		Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-10-31T09:30:00+08:00", UserID: victim}); err != nil {
+		t.Fatalf("seed victim order: %v", err)
+	}
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 10, UserID: victim}}); err != nil {
+		t.Fatalf("seed victim position: %v", err)
+	}
+
+	// ① 委托回报：钥匙属于 holder，body 却自报 victim ⇒ 归属必须是 holder
+	reqBody := `{"type":"order","order_id":"XT-NEW","signal_id":"` + sid + `","code":"600519.SH",` +
+		`"side":"买入","status":"已成","price":10,"qty":100,"at":"2026-10-31T09:31:00+08:00",` +
+		`"created_at":"2026-10-31T09:30:00+08:00","user_id":"` + victim + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))
+	req = req.WithContext(context.WithValue(req.Context(), ctxUserKey{}, &auth.User{ID: holder}))
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("回报应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	stHolder, err := db.RealOrderStatusForUser(holder, sid)
+	if err != nil {
+		t.Fatalf("读 holder 侧委托: %v", err)
+	}
+	if stHolder == "" {
+		t.Fatalf("§安全 T1 违例：token 账号名下没有落这条委托（回报被记到了自报的 %s？）", victim)
+	}
+	stVictim, err := db.RealOrderStatusForUser(victim, sid)
+	if err != nil {
+		t.Fatalf("读 victim 侧委托: %v", err)
+	}
+	if stVictim != "已报" {
+		t.Fatalf("§安全 T1 违例：自报 victim 的回报推进了被冒名账号的委托行, got %q", stVictim)
+	}
+
+	// ② 持仓对账：同一条冒名 body 的 user_id 不许把作用范围切到 victim
+	posBody := `{"type":"positions","user_id":"` + victim + `","positions":[{"ts_code":"000001.SZ",` +
+		`"name":"平安银行","qty":200,"cost_price":12}]}`
+	req2 := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(posBody))
+	req2 = req2.WithContext(context.WithValue(req2.Context(), ctxUserKey{}, &auth.User{ID: holder}))
+	rr2 := httptest.NewRecorder()
+	s.handleQMTReport(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("持仓回报应 200, got %d body=%s", rr2.Code, rr2.Body.String())
+	}
+	all, err := db.RealPositions()
+	if err != nil {
+		t.Fatalf("读持仓: %v", err)
+	}
+	var victimQty, holderQty int
+	for _, p := range all {
+		if p.UserID == victim {
+			victimQty += p.Qty
+		}
+		if p.UserID == holder {
+			holderQty += p.Qty
+		}
+	}
+	if victimQty != 100 {
+		t.Fatalf("§安全 T1 违例：被冒名账号的持仓被动过（应仍是 100 股, got %v）", victimQty)
+	}
+	if holderQty != 200 {
+		t.Fatalf("对账应落在持钥匙的账号名下（holder 应 200 股, got %v）", holderQty)
 	}
 }
 

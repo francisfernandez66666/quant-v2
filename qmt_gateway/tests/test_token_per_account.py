@@ -17,6 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gateway as gw_mod  # noqa: E402
+from store import Store  # noqa: E402
 from tests.test_manual_sync import new_db_path  # noqa: E402
 
 OWNER = "u_owner"
@@ -91,10 +92,10 @@ class TestInboundAttribution(unittest.TestCase):
             {"user_id": MEMBER, "token": TK_MEMBER},
         ]))
 
-    def _place(self, uid, sid):
+    def _place(self, uid, sid, created="2026-10-30 09:30:00"):
         return self.gw._do_order({"code": "600000.SH", "side": "买入", "qty": 100,
                                   "price": 10.0, "signal_id": sid,
-                                  "created_at": "2026-10-30 09:30:00"}, caller_uid=uid)
+                                  "created_at": created}, caller_uid=uid)
 
     def test_order_row_belongs_to_placing_account(self):
         # ③ 谁下的单落谁名下（此前所有人都落网关配置里那一个 user_id）
@@ -112,11 +113,14 @@ class TestInboundAttribution(unittest.TestCase):
 
     def test_orders_endpoint_scoped_by_caller(self):
         # ⑤ 对账源按调用方收窄，但无归属行不许凭空消失
-        self._place(MEMBER, "buy:600002:fac_1:20261030")
+        # 日期一律取"今天"再拼 created_at：跨零点跑测试时，写死 2026-10-30 的行会被 day 过滤掉，
+        # 断言就成了假失败（2026-10-31 00:0x 实测就是这样）。
+        day = gw_mod._now_cn()[:10]
+        sid_mine = "buy:600002:fac_1:" + day.replace("-", "")
+        self._place(MEMBER, sid_mine, created=day + " 09:30:00")
         self.gw.store.upsert_order({"order_id": "x1", "signal_id": "ext:x1", "code": "600003.SH",
                                     "side": "买入", "status": "已报", "price": 1, "qty": 100,
-                                    "created_at": "2026-10-30 09:31:00", "user_id": ""})
-        day = gw_mod._now_cn()[:10]
+                                    "created_at": day + " 09:31:00", "user_id": ""})
 
         class _R:
             def __init__(self, uid):
@@ -124,8 +128,7 @@ class TestInboundAttribution(unittest.TestCase):
                 self._caller_uid = uid
 
         mine = self.gw._do_orders(_R(MEMBER))[1]["orders"]
-        self.assertEqual({o["signal_id"] for o in mine},
-                         {"buy:600002:fac_1:20261030", "ext:x1"})
+        self.assertEqual({o["signal_id"] for o in mine}, {sid_mine, "ext:x1"})
         theirs = self.gw._do_orders(_R(OWNER))[1]["orders"]
         self.assertEqual({o["signal_id"] for o in theirs}, {"ext:x1"})
         # owner 显式全量视角
@@ -133,7 +136,7 @@ class TestInboundAttribution(unittest.TestCase):
             path = "/orders?day=" + day + "&scope=all"
             _caller_uid = OWNER
 
-        self.assertIn("buy:600002:fac_1:20261030",
+        self.assertIn(sid_mine,
                       [o["signal_id"] for o in self.gw._do_orders(_RA())[1]["orders"]])
         # 非 owner 带 scope=all 不生效：它看到的仍只是自己那批 + 无归属行
         class _RM:
@@ -141,8 +144,49 @@ class TestInboundAttribution(unittest.TestCase):
             _caller_uid = MEMBER
 
         scoped = self.gw._do_orders(_RM())[1]["orders"]
-        self.assertEqual({o["signal_id"] for o in scoped},
-                         {"buy:600002:fac_1:20261030", "ext:x1"})
+        self.assertEqual({o["signal_id"] for o in scoped}, {sid_mine, "ext:x1"})
+
+
+class TestDispatchAttribution(unittest.TestCase):
+    """派发行落**下单账号**（§TOKEN-PERAACCT）：桥回报回来时只能靠这一列归因。
+
+    为什么单独测 queued 通道：`/order` 的 orders 行归属已经在
+    TestInboundAttribution 里钉住，但真正交付给桥的是 **dispatch 行**——
+    `store.dispatch_enqueue_order(req, user_id=...)` 此前恒写通道级配置账号，
+    于是"谁下的单"在派发这一层是丢掉的（10-30 的错归属就是从这里开始的）。
+    """
+
+    def setUp(self):
+        from broker import QueuedBroker  # 与 gateway 同一 store 语义，避免起整条网关
+        self.store = Store(new_db_path())
+        self.broker = QueuedBroker(self.store, account="2069008957", user_id=OWNER)
+
+    def _place(self, req):
+        ok, ref, err = self.broker.place_order(req)
+        self.assertTrue(ok, err)
+        return ref
+
+    def test_dispatch_row_uses_caller_uid(self):
+        self._place({"code": "600000.SH", "side": "买入", "qty": 100, "price": 10.0,
+                     "signal_id": "buy:600000:fac_9:20261031", "user_id": MEMBER})
+        row = self.store.dispatch_by_signal_id("buy:600000:fac_9:20261031")
+        self.assertEqual(row["user_id"], MEMBER, "派发行必须写着入向钥匙解出的下单账号")
+
+    def test_dispatch_row_falls_back_to_channel_uid(self):
+        # 没带 caller（旧调用形态/别的客户端）时回退通道级账号——行为与今天一致，不许变空
+        self._place({"code": "600001.SH", "side": "买入", "qty": 100, "price": 10.0,
+                     "signal_id": "buy:600001:fac_9:20261031"})
+        row = self.store.dispatch_by_signal_id("buy:600001:fac_9:20261031")
+        self.assertEqual(row["user_id"], OWNER)
+
+    def test_self_declared_uid_in_request_is_overridden_upstream(self):
+        # 网关层覆盖自报（_do_order 里 req["user_id"]=place_uid），到 broker 时已是钥匙解出的值；
+        # 这里锁住 broker 的取值优先级：req 里有值就用 req 的（网关已保证那是入向账号），否则用通道配置。
+        ref = self._place({"code": "600002.SH", "side": "卖出", "qty": 100, "price": 10.0,
+                           "signal_id": "sell:600002:fac_9:20261031", "user_id": "u_other"})
+        row = self.store.dispatch_by_signal_id("sell:600002:fac_9:20261031")
+        self.assertEqual(row["user_id"], "u_other")
+        self.assertTrue(str(ref).startswith("seq:"))
 
 
 class TestOutboundToken(unittest.TestCase):

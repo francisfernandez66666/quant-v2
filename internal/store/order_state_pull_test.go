@@ -111,34 +111,48 @@ func TestUpdateRealOrderBackfillKeepsStatusOnIDCollision(t *testing.T) {
 }
 
 // TestPendingBuysExposeCancelAge §P1-1：在途买入必须带撤单时刻，卡单统计能算出滞留时长。
+// 种的时间一律从"现在"往前推：写死 09:31:53 这种钟面在午夜后跑等于把 cancel_requested_at
+// 种到未来，time.Since 得负数、判龄归 0（10-31 00:44 实测就是这个假失败）。
 func TestPendingBuysExposeCancelAge(t *testing.T) {
 	db := openTestDB(t)
 	uid := "u_p1"
-	day := time.Now().Format("2006-01-02")
+	now := time.Now()
+	day := now.Format("2006-01-02")
+	created := now.Add(-120 * time.Second)
+	cancelAt := now.Add(-60 * time.Second)
+	if created.Format("2006-01-02") != day {
+		// 跨零点的极小窗口：退回今日 0 点之后，保证 substr(created_at,1,10) 仍命中本日的 day
+		created = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 1, 0, time.Local)
+		cancelAt = now
+	}
+	createdStr := created.Format("2006-01-02 15:04:05")
+	cancelStr := cancelAt.Format("2006-01-02 15:04:05")
 	if _, err := db.UpsertRealOrder(RealOrder{
 		OrderID: "seq:1", SignalID: "buy:300502:fac_150:20261030", Code: "300502.SZ",
 		Side: "买入", Status: "撤单中", Price: 195.01, Qty: 100,
-		CreatedAt: day + " 09:31:53", UserID: uid,
+		CreatedAt: createdStr, UserID: uid,
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := db.db.Exec(`UPDATE orders SET cancel_requested_at=? WHERE signal_id=? AND user_id=?`,
-		day+" 09:37:42", "buy:300502:fac_150:20261030", uid); err != nil {
+		cancelStr, "buy:300502:fac_150:20261030", uid); err != nil {
 		t.Fatalf("set cancel time: %v", err)
 	}
 	pend, err := db.PendingBuys(uid, day)
 	if err != nil || len(pend) != 1 {
 		t.Fatalf("PendingBuys: n=%d err=%v", len(pend), err)
 	}
-	if pend[0].CancelRequestedAt != day+" 09:37:42" {
+	if pend[0].CancelRequestedAt != cancelStr {
 		t.Fatalf("在途单必须带撤单时刻, got %q", pend[0].CancelRequestedAt)
 	}
 	n, age, err := db.CountStuckCancelBuys(uid, day)
 	if err != nil || n != 1 {
 		t.Fatalf("卡单统计: n=%d err=%v", n, err)
 	}
-	if age <= 0 {
-		t.Fatalf("卡单滞留时长应大于 0, got %v", age)
+	// 判龄必须对得上种下去的那 60 秒（不是"恒正"这种废话断言）：判的是"用的是撤单时刻、
+	// 而且真按秒算"，写死成 >0 的话种到未来也能蒙绿。
+	if age < 55*time.Second || age > 5*time.Minute {
+		t.Fatalf("卡单滞留时长应与种下的撤单时刻一致（期望 ≈60s）, got %v", age)
 	}
 }
 
