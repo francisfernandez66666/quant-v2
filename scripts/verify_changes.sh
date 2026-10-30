@@ -3213,7 +3213,7 @@ gm=$(grep -c 'func fillSignalMatchSQL' internal/store/real_positions.go || true)
 gu=$(grep -c 'fillSignalMatchSQL(' internal/store/real_positions.go || true)
 # 1 处定义 + 2 处调用（SumFilledQty / ResetFailedRealOrder）：少一处调用就等于两条资金查询又各写一份 SQL。
 [ "$gu" = "3" ] || { echo "--- FAIL: 配对谓词调用点 ≠ 2（计数=$gu 含定义行；两处钱查询必须同源）"; exit 1; }
-grep -q 'eligibleWhere := `signal_id=? AND user_id=? AND (status=' internal/store/real_positions.go \
+grep -q 'eligibleWhere := `signal_id=? AND user_id=? AND COALESCE(retry_blocked,0)=0 AND (status=' internal/store/real_positions.go \
 	|| { echo "--- FAIL: 「已撤+零成交可重放」的谓词不再现算配对 SQL（退回编译期常量即漏掉反向腿）"; exit 1; }
 if grep -qE 'const eligibleWhere' internal/store/real_positions.go; then
 	echo "--- FAIL: eligibleWhere 又变回 const（常量拼不进运行期双向谓词）"; exit 1; fi
@@ -4670,7 +4670,9 @@ ew_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
 # ── ① §E C5 交割归因 ──
 ew_min "无归因行显式前缀常量（不再虚构 settle:+day）" "$(grep -c 'settleUnattributedPrefix' internal/trading/settlement.go || true)" "2"
 ew_absent "旧虚构归因赋值 SignalID: \"settle:\"（活代码）" "$(ew_code_hits internal/trading/settlement.go 'SignalID: "settle:"')"
-ew_chk "SettlementTrade 解码网关 signal_id" "$(grep -c 'json:"signal_id"' internal/trading/qmt_client.go || true)" "1"
+# §ORDER-STATE-PULL（2026-10-30）：同文件新增了委托状态对账结构（GatewayOrderState 也解 signal_id），
+# 计数改为**只数 SettlementTrade 结构体内**的那一个，保住"交割归因必须解 signal_id"的原判据。
+ew_chk "SettlementTrade 解码网关 signal_id" "$(awk '/type SettlementTrade struct/,/^}/' internal/trading/qmt_client.go | grep -c 'json:"signal_id"' || true)" "1"
 # ── ① §E C4 BrokerStatus 双腿 ──
 ew_min "BrokerStatus 走 /admin/status 专腿" "$(grep -c '/admin/status' internal/trading/qmt_client.go || true)" "1"
 ew_min "读不到不冒充：AdminStatusOK 三态标记" "$(grep -c 'AdminStatusOK' internal/trading/qmt_client.go || true)" "2"
