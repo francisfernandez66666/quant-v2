@@ -641,17 +641,20 @@ class Store:
                     continue
         return n, oldest_sec
 
-    def purge_stale_orders(self, today, terminal_days=3, open_days=5):
+    def purge_stale_orders(self, today, terminal_days=3, open_days=5,
+                           broker_ids=None):
         """清理跨日历史委托行（§ORDER-ID-REUSE 配套，2026-10-30）。
 
         为什么必须清：order_id 是主键而 QMT 委托号跨日复用，历史行越多、撞键概率越高；
         今天 300502 就撞上了 9-22 的一条旧行。清理口径按状态分两档：
           - 终态行：早于 terminal_days 个自然日即可删（它们已无任何收敛/幂等价值）；
-          - 非终态行：早于 open_days 个自然日才删（A 股委托当日失效，5 天前的"已报"
-            必然是僵尸行；方案 §8.5 要求这类行单独按 5 个交易日清，不能与终态同窗）。
-        删除前把被删行的 order_id 取出来（最多 20 条）写进日志，便于事后复核"删掉的不是活单"。
-        English: purge cross-day rows — order ids are reused across days, so stale rows turn into
-        primary-key collisions that used to swallow whole status events.
+          - 非终态行：**只有在拿到可信的券商委托表快照时才清**（broker_ids 非 None），
+            且必须"早于 open_days 个自然日 **且不在快照里**"（方案 §8.5）。
+            为什么加这道门：非终态行可能对应真实在途单；启动时还没有快照，
+            那时按日期一刀切等于"没核对柜台就删证据"，方向错了。
+        删除前把被删的在途行 order_id 逐条写日志（最多 20 条），便于事后复核。
+        English: purge cross-day rows; non-terminal rows are only purged against a trusted broker
+        order-table snapshot (absent from it) — never by date alone at startup.
         """
         today = str(today or "")[:10]
         if len(today) != 10:
@@ -672,22 +675,25 @@ class Store:
             )
             removed += int(cur.rowcount or 0)
             stale_open = []
-            for r in self._conn.execute(
-                    "SELECT order_id FROM orders WHERE substr(created_at,1,10) <> '' "
-                    "AND substr(created_at,1,10) < ? AND status NOT IN (%s)" % term_ph,
-                    (open_before,) + tuple(_TERMINAL_STATUSES)).fetchall():
-                stale_open.append(str(r["order_id"]))
-            cur2 = self._conn.execute(
-                "DELETE FROM orders WHERE substr(created_at,1,10) <> '' "
-                "AND substr(created_at,1,10) < ? AND status NOT IN (%s)" % term_ph,
-                (open_before,) + tuple(_TERMINAL_STATUSES),
-            )
-            removed += int(cur2.rowcount or 0)
+            if broker_ids is not None:
+                # 只清「旧且不在柜台委托表里」的在途行；仍是活单的一律保留。
+                for r in self._conn.execute(
+                        "SELECT order_id, signal_id, code, status FROM orders "
+                        "WHERE substr(created_at,1,10) <> '' AND substr(created_at,1,10) < ? "
+                        "AND status NOT IN (%s)" % term_ph,
+                        (open_before,) + tuple(_TERMINAL_STATUSES)).fetchall():
+                    oid = str(r["order_id"] or "")
+                    if oid in broker_ids:
+                        continue
+                    stale_open.append(oid)
+                    self._conn.execute("DELETE FROM orders WHERE order_id=?", (oid,))
+                    removed += 1
+                    log.warning("[store] §ORDER-ID-REUSE 清理在途僵尸行 oid=%s signal=%s code=%s status=%s"
+                                "（早于 %s 且不在券商委托表快照中）",
+                                oid, r["signal_id"], r["code"], r["status"], open_before)
             self._conn.commit()
-        if removed:
-            log.warning("[store] §ORDER-ID-REUSE 清理历史委托行 %d 条（终态<%s / 在途<%s）"
-                        " 在途僵尸样例=%s", removed, term_before, open_before,
-                        ",".join(stale_open[:20]) if stale_open else "-")
+        if removed and not stale_open:
+            log.warning("[store] §ORDER-ID-REUSE 清理历史委托行 %d 条（终态<%s）", removed, term_before)
         return removed
 
     def order_by_signal(self, signal_id):

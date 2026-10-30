@@ -390,6 +390,61 @@ func (r *tLiveRound) publishTFunds() {
 	})
 }
 
+// publishTFundsHeartbeat §FUNDS-TODAY（2026-10-30）：T 侧资金帧的 10s 心跳。
+//
+// 为什么需要：T 侧原本只在 T 轮（挂在打分主循环里）发布。2026-10-30 实测单轮打分在行情源降级时
+// 可被拉到 4~15 分钟，于是 t_at 长时间不更新，卡片一直显示「T 侧读数未更新」——而 T 侧的额度/
+// 在途腿/收益都是账本读数，与打分重活无关。现在构造一个**只读**的临时轮次，复用 publishTFunds
+// 的同一套公式与落盘路径（不算判定、不下单），让 T 侧也按 10s 刷新。
+//
+// 输入来源与真实 T 轮完全同源：tParamsFor（MS/盲区）、totalAssetsOf（券商快照优先）、
+// AvailableCash（30 分钟新鲜度口径）、bookValue（账本腿）、dayLedger（当日收益）。
+func (e *Engine) publishTFundsHeartbeat(uid string) {
+	if e == nil {
+		return
+	}
+	if uid == "" {
+		uid = e.primaryMember()
+	}
+	st := e.tLiveFor(uid)
+	ctrl := e.QMTController()
+	e.mu.RLock()
+	db := e.realStore
+	e.mu.RUnlock()
+	if st == nil || ctrl == nil || db == nil {
+		return
+	}
+	now := e.nowTime()
+	sc := e.sizingConfigFor(uid)
+	p, _, missing := e.tParamsFor(uid, sc.T, sc.ShadowOn())
+	p.MissingKeyInput = missing
+	quotes := e.snapshotQuotes()
+	r := &tLiveRound{
+		e: e, uid: uid, db: db, st: st, p: p, now: now, quotes: quotes,
+		positions: map[string]store.RealPosition{}, prices: map[string]float64{},
+	}
+	poses, err := db.RealPositionsForUser(uid)
+	if err != nil {
+		return // 持仓读不到：保持上一帧，不伪造
+	}
+	for _, pos := range poses {
+		if pos.Qty <= 0 {
+			continue
+		}
+		code := pureTsCode(pos.TsCode)
+		r.positions[code] = pos
+		if q := quotes[code]; q != nil && q.Price > 0 {
+			r.prices[code] = q.Price
+		} else if pos.CurPrice > 0 {
+			r.prices[code] = pos.CurPrice
+		}
+	}
+	r.total = r.totalAssetsOf(db)
+	r.cash, r.cashOK = ctrl.AvailableCash()
+	r.book = st.bookValue(r.prices)
+	r.publishTFunds()
+}
+
 // totalAssetsOf 总资产：优先券商快照口径（与 dynamicBuyQty 同优先级），回落账本合计。
 func (r *tLiveRound) totalAssetsOf(db *store.DB) float64 {
 	if acc, err := db.GetRealAccount(r.uid); err == nil && acc.TotalAsset > 0 {

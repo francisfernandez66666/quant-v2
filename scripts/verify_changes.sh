@@ -17059,7 +17059,22 @@ grep -q 'order_fail_total' qmt_gateway/gateway.py || fail142 "网关 /health 缺
 grep -q 'orders_snapshot_age' qmt_gateway/gateway.py || fail142 "网关 /health 缺 orders_snapshot_age"
 grep -q 'stuck_cancel_orders' internal/trading/controller.go || fail142 "Go 状态快照缺 stuck_cancel_orders"
 
+# —— ⑫ T 侧资金帧心跳（慢轮时 t_at 不许长时间不动）——
+CNT142=$((CNT142 + 1))
+grep -q 'func (e \*Engine) publishTFundsHeartbeat' internal/engine/intraday_t_live.go || fail142 "缺 T 侧资金帧心跳"
+grep -q 'publishTFundsHeartbeat' internal/engine/funds_today.go || fail142 "T 侧心跳没接进 10s 资金循环"
+
+# —— ⑬ 历史行清理必须过券商快照门（非终态行不许按日期单独删）——
+CNT142=$((CNT142 + 1))
+grep -q 'broker_ids=None' qmt_gateway/store.py || fail142 "purge_stale_orders 没有券商快照入参"
+grep -q 'if oid in broker_ids' qmt_gateway/store.py || fail142 "非终态清理没有「不在快照里才删」判据"
+grep -q '_order_purge_day' qmt_gateway/gateway.py || fail142 "网关没有快照后清理的当日标记"
+
+# —— ⑭ 终态收敛率留档 ——
+CNT142=$((CNT142 + 1))
+grep -q '当日订单终态收敛率' internal/trading/controller.go || fail142 "缺每日终态收敛率读数"
+
 [ "$B142_FAILED" = "0" ] || exit 1
-echo "ok - §142 §ORDER-STATE-PULL 锁通过（撞键 2 + 终态 2 + 拉取 1 + 清理 1 + 资金帧 1 + 测试 1 + 预算预占 1 + 卡单 1 + 前端 1 + 审计列 1 + 观测位 1，累计判定点 ${CNT142}）"
+echo "ok - §142 §ORDER-STATE-PULL 锁通过（撞键 2 + 终态 2 + 拉取 1 + 清理 1 + 资金帧 1 + 测试 1 + 预算预占 1 + 卡单 1 + 前端 1 + 审计列 1 + 观测位 1 + T心跳 1 + 快照门 1 + 收敛率 1，累计判定点 ${CNT142}）"
 
 echo "==> 全部通过"

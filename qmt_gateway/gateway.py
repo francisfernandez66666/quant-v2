@@ -293,6 +293,8 @@ class Gateway:
         # 桥以 JSONL 文件上报事件（bridge_report.jsonl 追加行），由本线程读文件
         # 并复用 _do_dispatch_result 语义（心跳/快照/派发回报/推量仔零改动）。
         self._file_bridge_thread = None
+        # §ORDER-ID-REUSE：非终态僵尸行的当日清理标记（只在拿到可信委托表快照后清一次）。
+        self._order_purge_day = ""
         # §N-01（2026-10-20）：最近一次 xt 连接失败时刻（北京时间字符串，空=从未失败）。
         # 只记录发生时刻，不记录错误原文——/health 免鉴权，内部异常串不得外泄。
         self._xt_last_fail_at = ""
@@ -378,10 +380,10 @@ class Gateway:
             log.warning("[gateway] 清理残留 pending 失败: %s", _e)
         if released:
             log.warning("[gateway] 已释放 %d 个超时残留 pending 占位（崩溃恢复，避免 signal_id 永久死锁）", released)
-        # §ORDER-ID-REUSE（2026-10-30）：清理跨日历史委托行。QMT 的交易所委托号会跨日复用，
+        # §ORDER-ID-REUSE（2026-10-30）：启动时只清**终态**历史行。QMT 的交易所委托号会跨日复用，
         # 而 orders.order_id 是主键——历史行越多，撞键概率越高（今天撞上了 9-22 的一条旧行，
-        # 终态回报因此被吞）。终态行留 3 天、非终态留 10 天（A 股委托当日失效，更早的"在途"
-        # 必是僵尸行）。清理失败只告警，不阻断启动。
+        # 终态回报因此被吞）。非终态行可能对应真实在途单：**必须等拿到可信的券商委托表快照**
+        # 再按"旧且不在快照里"清（见 _apply_orders_snapshot），启动时按日期一刀切是错的方向。
         try:
             purged = self.store.purge_stale_orders(_now_cn()[:10])
             if purged:
@@ -1369,6 +1371,15 @@ class Gateway:
             "by_id": by_id, "ts": time.time(),
             "data_ts": str(req.get("data_ts", "") or ""), "n": len(by_id),
         }
+        # §ORDER-ID-REUSE / §8.5：拿到可信快照后，当日清一次"旧且不在柜台委托表里"的在途僵尸行。
+        # 只做一次（每天首次可信快照），且逐行写日志，绝不按日期单独删在途行。
+        today = _now_cn()[:10]
+        if by_id and self._order_purge_day != today:
+            try:
+                self.store.purge_stale_orders(today, broker_ids=set(by_id.keys()))
+                self._order_purge_day = today
+            except Exception:  # noqa: BLE001 — 清理失败不影响快照处理
+                log.warning("[gateway] §ORDER-ID-REUSE 快照后清理失败", exc_info=True)
         for oid, r in by_id.items():
             self._order_miss.pop(oid, None)
             try:

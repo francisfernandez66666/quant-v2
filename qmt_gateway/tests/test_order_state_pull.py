@@ -81,8 +81,12 @@ class TestOrderIdReuse(_GatewayCase):
                                  "side": "买入", "status": "已报", "price": 1, "qty": 100,
                                  "created_at": "2026-09-01 10:00:00", "user_id": ""})
         self.store.upsert_order(_row())
-        n = self.store.purge_stale_orders("2026-10-30")
-        self.assertEqual(n, 2, "终态>3天与在途>10天的跨日行都应被清理")
+        # 启动时（无券商快照）：只清终态，非终态一律保留
+        self.assertEqual(self.store.purge_stale_orders("2026-10-30"), 1)
+        self.assertIsNotNone(self.store.order_by_signal("s-old-o"), "无快照时不得按日期删在途行")
+        # 拿到可信快照后：旧且不在快照里的在途行才清
+        self.assertEqual(self.store.purge_stale_orders("2026-10-30", broker_ids=set()), 1)
+        self.assertIsNone(self.store.order_by_signal("s-old-o"))
         self.assertIsNotNone(self.store.order_by_signal(SID), "当日行不得被清")
 
 

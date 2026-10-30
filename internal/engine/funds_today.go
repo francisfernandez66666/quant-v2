@@ -199,6 +199,8 @@ func (e *Engine) StartFundsLoop(ctx context.Context) {
 					continue
 				}
 				e.publishSignalFunds(e.primaryMember(), e.snapshotQuotes())
+				// §FUNDS-TODAY：T 侧也走同一心跳——它原本挂在打分轮上，慢轮时 t_at 会长时间不动。
+				e.publishTFundsHeartbeat(e.primaryMember())
 			}
 		}
 	}()
