@@ -483,13 +483,17 @@ type QMTConfig struct {
 	// TimeoutSec 下单请求超时秒数（默认 10）。
 	// 超时秒数
 	TimeoutSec int `json:"timeout_sec"`
-	// OrderStatePullCloseMissing §ORDER-STATE-PULL 阶段二（2026-10-30，**默认关**）：
-	// 本地「撤单中」的真实委托号连续 N 轮在网关当日委托状态里查无此单时，判终态释放额度。
-	// 为什么默认关：这个判断直接决定"放不放预算"，误判方向是多买；阶段一的终态对账
-	// 已能自愈 300502/002415 两族问题，阶段二只覆盖"网关整行都没了"的极端形态。
-	// English: phase 2 of the pull reconciliation (default OFF) — demote a stuck cancel when the
-	// gateway has no row for its real order id across N trusted snapshots (budget-releasing guess).
-	OrderStatePullCloseMissing bool `json:"order_state_pull_close_missing,omitempty"`
+	// OrderStatePullCloseMissing §ORDER-STATE-PULL 阶段二（2026-10-30，owner 裁决**默认开**）：
+	// 本地「撤单中」且持有真实委托号的单，连续 N 轮在网关当日委托状态里查无此单时判终态放额度。
+	// nil=开（今天之前的形态是"没有任何一条腿能收掉这种幻影单"，代价是整天锁死额度）。
+	// 默认开的前提是三道质量闸（见 Controller.reconcileMissingOrders）：
+	//   ① 只认真实委托号（pend:/seq: 占位不参与）；
+	//   ② 必须有**新鲜且非空**的券商委托表快照（snapshot_n>0 且 snapshot_age 在窗口内），
+	//      网关整本委托表都可能被重置/未落地时，"缺失"不是证据；
+	//   ③ 单轮只收零星几笔；一次要收 3 笔以上＝更像网关账坏了而不是幻影，改为只告警不动。
+	// English: phase 2 of the pull reconciliation, default ON (owner ruling 2026-10-30), gated on
+	// real order ids, a fresh non-empty broker order-table snapshot, and a per-round cap.
+	OrderStatePullCloseMissing *bool `json:"order_state_pull_close_missing,omitempty"`
 	// MissHeartbeatSec 心跳超时秒数：网关 /health 连续失联超过该值 → 熔断暂停下单并告警（默认 120）。
 	// 心跳超时秒数
 	MissHeartbeatSec int `json:"miss_heartbeat_sec"`
@@ -679,6 +683,16 @@ type QMTConfig struct {
 	// state-machine MaxPosPct takes precedence when >0).
 	// Yellow 档降额系数
 	YellowPosScale float64 `json:"yellow_pos_scale,omitempty"`
+}
+
+// OrderStatePullCloseMissingOn §ORDER-STATE-PULL 阶段二是否生效：未配置（nil）=生效
+// （2026-10-30 owner 裁决默认开）。为什么用 *bool：裸 bool 的 false 分不清"没配"与
+// "显式关掉"，那样默认值就成了永远关不掉/永远打不开的一端。
+func (q QMTConfig) OrderStatePullCloseMissingOn() bool {
+	if q.OrderStatePullCloseMissing == nil {
+		return true
+	}
+	return *q.OrderStatePullCloseMissing
 }
 
 // AutoCautionOn P4 自动买谨慎层是否启用（nil 默认 false=保守关闭，需显式开启）。

@@ -8,6 +8,7 @@ package trading
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -141,54 +142,135 @@ func TestPlaceOrderTerminalRejectionRetiresSignal(t *testing.T) {
 	}
 }
 
-// TestReconcileMissingOrdersPhase2 §8.3 阶段二（默认关）：连续 6 轮查无此单 → 废单；
-// 开关关着时同样的输入**一笔都不动**（这条是"放预算"的推断，必须显式开）。
-func TestReconcileMissingOrdersPhase2(t *testing.T) {
+// pullServer 造一个网关：返回固定 rows + 指定的委托表快照可信度（阶段二的信任前提）。
+func pullServer(t *testing.T, rows []map[string]any, snapshotN, snapshotAge int) *httptest.Server {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 非空快照里只有一笔无关委托：本地的卡单在网关账里"查无此单"
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok": true,
-			"orders": []map[string]any{
-				{"order_id": "other1", "signal_id": "OTHER", "code": "600000.SH", "side": "买入", "status": "已报"},
-			},
+			"ok": true, "orders": rows, "n": len(rows),
+			"snapshot_n": snapshotN, "snapshot_age": snapshotAge,
 		})
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
 
-	db := testDB(t)
-	uid := "u_p2"
-	sid := "buy:300502:fac_150:20261030"
+// seedStuckBuy 落一笔「撤单中 + 真实委托号」的买单（阶段二的唯一作用对象）。
+func seedStuckBuy(t *testing.T, db interface {
+	UpsertRealOrder(store.RealOrder) (bool, error)
+}, uid, sid, oid string) {
+	t.Helper()
 	if _, err := db.UpsertRealOrder(store.RealOrder{
-		OrderID: "xt999", SignalID: sid, Code: "300502.SZ", Side: SideBuy,
+		OrderID: oid, SignalID: sid, Code: "300502.SZ", Side: SideBuy,
 		Status: "撤单中", Price: 195.01, Qty: 100,
 		CreatedAt: time.Now().Format("2006-01-02 15:04:05"), UserID: uid,
 	}); err != nil {
-		t.Fatalf("seed: %v", err)
+		t.Fatalf("seed %s: %v", sid, err)
+	}
+}
+
+// pullSixRounds 跑满 6 轮拉取（每轮间隔超过 30s 节流）。
+func pullSixRounds(ctrl *Controller) {
+	base := time.Now().Add(10 * time.Minute)
+	for i := 0; i < 6; i++ {
+		ctrl.ReconcileOrderStates(base.Add(time.Duration(i) * 31 * time.Second))
+	}
+}
+
+// TestReconcileMissingOrdersPhase2 阶段二（owner 2026-10-30 裁决**默认开**）：
+// 可信快照下连续 6 轮查无此单 → 判废单。
+func TestReconcileMissingOrdersPhase2(t *testing.T) {
+	srv := pullServer(t, []map[string]any{
+		{"order_id": "other1", "signal_id": "OTHER", "code": "600000.SH", "side": "买入", "status": "已报"},
+	}, 3, 12)
+	db := testDB(t)
+	uid := "u_p2"
+	sid := "buy:300502:fac_150:20261030"
+	seedStuckBuy(t, db, uid, sid, "xt999")
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.GatewayURL = srv.URL
+	cfg.Token = "tk"
+	ctrl := NewController(guardServer(), db, uid, cfg, nil)
+	if !cfg.OrderStatePullCloseMissingOn() {
+		t.Fatal("阶段二必须默认开（未配置=生效）")
+	}
+	pullSixRounds(ctrl)
+	if st, _ := db.RealOrderStatusForUser(uid, sid); st != "废单" {
+		t.Fatalf("连续 6 轮查无此单应判废单, got %q", st)
+	}
+}
+
+// TestReconcileMissingOrdersPhase2Off 显式关掉时同样的输入一笔都不动。
+func TestReconcileMissingOrdersPhase2Off(t *testing.T) {
+	srv := pullServer(t, []map[string]any{
+		{"order_id": "other1", "signal_id": "OTHER", "code": "600000.SH", "side": "买入", "status": "已报"},
+	}, 3, 12)
+	db := testDB(t)
+	uid := "u_p2off"
+	sid := "buy:300502:fac_150:20261030"
+	seedStuckBuy(t, db, uid, sid, "xt999")
+	off := false
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.GatewayURL = srv.URL
+	cfg.Token = "tk"
+	cfg.OrderStatePullCloseMissing = &off
+	ctrl := NewController(guardServer(), db, uid, cfg, nil)
+	pullSixRounds(ctrl)
+	if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {
+		t.Fatalf("显式关闭后不得动状态, got %q", st)
+	}
+}
+
+// TestReconcileMissingOrdersNeedsTrustedSnapshot 质量闸②：快照为空/陈旧时"缺失"不是证据。
+func TestReconcileMissingOrdersNeedsTrustedSnapshot(t *testing.T) {
+	for i, tc := range []struct {
+		name   string
+		n, age int
+	}{
+		{"无快照", 0, -1},
+		{"快照陈旧", 3, 900},
+	} {
+		srv := pullServer(t, []map[string]any{
+			{"order_id": "other1", "signal_id": "OTHER", "code": "600000.SH", "side": "买入", "status": "已报"},
+		}, tc.n, tc.age)
+		db := testDB(t)
+		uid := "u_p2gate"
+		sid := "buy:300502:fac_150:20261030"
+		seedStuckBuy(t, db, uid, sid, "xt999")
+		cfg := config.DefaultQMTConfig()
+		cfg.Enabled = true
+		cfg.GatewayURL = srv.URL
+		cfg.Token = "tk"
+		ctrl := NewController(guardServer(), db, uid, cfg, nil)
+		pullSixRounds(ctrl)
+		if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {
+			t.Fatalf("用例 %d（%s）快照不可信时不得判死, got %q", i, tc.name, st)
+		}
+	}
+}
+
+// TestReconcileMissingOrdersMassMissingSkips 质量闸③：单轮成片缺失按"网关账异常"处理，只告警不动钱。
+func TestReconcileMissingOrdersMassMissingSkips(t *testing.T) {
+	srv := pullServer(t, []map[string]any{
+		{"order_id": "other1", "signal_id": "OTHER", "code": "600000.SH", "side": "买入", "status": "已报"},
+	}, 5, 10)
+	db := testDB(t)
+	uid := "u_p2mass"
+	sids := []string{"buy:300502:fac_150:20261030", "buy:002415:fac_150:20261030", "buy:002594:fac_150:20261030"}
+	for i, sid := range sids {
+		seedStuckBuy(t, db, uid, sid, fmt.Sprintf("xt900%d", i))
 	}
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.GatewayURL = srv.URL
 	cfg.Token = "tk"
 	ctrl := NewController(guardServer(), db, uid, cfg, nil)
-
-	// 开关关：6 轮后仍停在撤单中
-	base := time.Now()
-	for i := 0; i < 6; i++ {
-		ctrl.ReconcileOrderStates(base.Add(time.Duration(i) * 31 * time.Second))
-	}
-	if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {
-		t.Fatalf("阶段二默认关时不得改动状态, got %q", st)
-	}
-
-	// 打开开关：再 6 轮 → 废单
-	cfg2 := cfg
-	cfg2.OrderStatePullCloseMissing = true
-	ctrl.UpdateConfig(cfg2)
-	base = base.Add(10 * time.Minute)
-	for i := 0; i < 6; i++ {
-		ctrl.ReconcileOrderStates(base.Add(time.Duration(i) * 31 * time.Second))
-	}
-	if st, _ := db.RealOrderStatusForUser(uid, sid); st != "废单" {
-		t.Fatalf("阶段二开启后连续 6 轮查无此单应判废单, got %q", st)
+	pullSixRounds(ctrl)
+	for _, sid := range sids {
+		if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {
+			t.Fatalf("成片缺失（3 笔）时不得动钱, %s got %q", sid, st)
+		}
 	}
 }

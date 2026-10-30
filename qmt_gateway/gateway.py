@@ -1176,7 +1176,15 @@ class Gateway:
                 "qty": int(r.get("qty") or 0),
                 "created_at": created,
             })
-        return 200, {"ok": True, "day": day, "n": len(out), "orders": out}
+        # 快照可信度随本响应一起下发：决策端阶段二**只有在新鲜且非空的委托表快照下**才允许
+        # 按"查无此单"判终态（网关账被重置/桥刚起来时 snapshot_n=0，缺失就不是证据）。
+        snap = getattr(self, "_orders_snap", None) or {}
+        snap_ts = float(snap.get("ts", 0) or 0)
+        return 200, {
+            "ok": True, "day": day, "n": len(out), "orders": out,
+            "snapshot_n": int(snap.get("n", 0) or 0),
+            "snapshot_age": (max(0, int(time.time() - snap_ts)) if snap_ts > 0 else -1),
+        }
 
     def _health_payload(self):
         """组装 /health 响应：进程存活 + 通道就绪 + 双通道（xt/queued）状态。

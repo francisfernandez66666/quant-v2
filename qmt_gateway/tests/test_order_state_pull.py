@@ -168,6 +168,13 @@ class TestOrdersEndpoint(_GatewayCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["n"], 1)
         self.assertEqual(payload["orders"][0]["signal_id"], SID)
+        # 没拿到券商委托表快照时必须报 0/-1（决策端阶段二据此拒绝按"查无此单"判死）
+        self.assertEqual(payload["snapshot_n"], 0)
+        self.assertEqual(payload["snapshot_age"], -1)
+        self.gw._orders_snap = {"by_id": {}, "ts": time.time(), "data_ts": "", "n": 7}
+        _, payload = self.gw._do_orders(self._req("/orders?day=2026-10-30"))
+        self.assertEqual(payload["snapshot_n"], 7)
+        self.assertGreaterEqual(payload["snapshot_age"], 0)
 
     def test_orders_rejects_bad_day(self):
         status, _ = self.gw._do_orders(self._req("/orders?day=20261030"))

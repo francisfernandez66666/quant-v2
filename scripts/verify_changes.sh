@@ -17050,8 +17050,12 @@ grep -q 'pending_note' web/src/components/SignalDecisionsCard.jsx || fail142 "�
 CNT142=$((CNT142 + 1))
 grep -q 'broker_order_id TEXT DEFAULT' internal/store/store.go || fail142 "Go orders 缺 broker_order_id 列"
 grep -q 'broker_order_id' qmt_gateway/store.py || fail142 "网关 orders 缺 broker_order_id 列"
-grep -q 'OrderStatePullCloseMissing' internal/config/config.go || fail142 "阶段二开关没进配置（默认关）"
+grep -q 'func (q QMTConfig) OrderStatePullCloseMissingOn() bool' internal/config/config.go || fail142 "阶段二开关没进配置（owner 2026-10-30 裁决默认开）"
 grep -q 'reconcileMissingOrders' internal/trading/controller.go || fail142 "阶段二实现缺失"
+# 默认开之后，三道质量闸就是全部防线——少一道都等于"按缺失放预算"没有兜底
+grep -q 'if !cfg.OrderStatePullCloseMissingOn()' internal/trading/controller.go || fail142 "阶段二没走默认开的判据"
+grep -q 'states.SnapshotN <= 0' internal/trading/controller.go || fail142 "阶段二缺「快照可信」闸（网关账被重置时会成片误判）"
+grep -q 'len(toDemote) >= 3' internal/trading/controller.go || fail142 "阶段二缺「成片缺失不动钱」闸"
 
 # —— ⑪ 观测位（/health 与 /api/qmt/state 两边口径）——
 CNT142=$((CNT142 + 1))

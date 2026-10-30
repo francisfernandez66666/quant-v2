@@ -1130,12 +1130,13 @@ func (c *Controller) reconcileOrderStates(now time.Time, force bool) {
 	day := cntime.In(now).Format("2006-01-02")
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	rows, err := gc.OrderStates(ctx, day)
-	if err != nil {
+	states, err := gc.OrderStates(ctx, day)
+	if err != nil || states == nil {
 		// 网关不可达是常态（熔断/重启）：不刷屏，排障时能看到最近一次失败即可。
 		log.Printf("[trading] §ORDER-STATE-PULL 拉取网关委托状态失败(day=%s): %v", day, err)
 		return
 	}
+	rows := states.Orders
 	fixed := 0
 	for _, row := range rows {
 		if row.SignalID == "" || !store.IsTerminalOrderStatus(row.Status) {
@@ -1174,26 +1175,35 @@ func (c *Controller) reconcileOrderStates(now time.Time, force bool) {
 	if fixed > 0 {
 		log.Printf("[trading] §ORDER-STATE-PULL 本轮收敛 %d 笔停滞委托（day=%s）", fixed, day)
 	}
-	c.reconcileMissingOrders(day, rows)
+	c.reconcileMissingOrders(day, states)
 }
 
-// reconcileMissingOrders §ORDER-STATE-PULL 阶段二（2026-10-30，**默认关**）：
+// reconcileMissingOrders §ORDER-STATE-PULL 阶段二（2026-10-30，owner 裁决**默认开**）：
 // 本地「撤单中」且持有真实委托号的单，连续 N 轮在网关当日委托状态里查无此单 → 判废单释放额度。
 //
-// 安全边界（与方案 §8.3 一致）：
-//   - 只对真实委托号生效（pend:/seq: 占位本来就是本地引用，不在网关账里）；
-//   - 要求本轮快照非空（空表可能是网关库被重置，不可信）；
+// 默认开的代价是"缺失"成了放预算的证据，所以配了三道质量闸（见下面 ①②③ 注释，方案 §8.3）：
+//   - ① 只对真实委托号生效（pend:/seq: 占位本来就是本地引用，不在网关账里）；
+//   - ② 必须有新鲜且非空的券商委托表快照（网关没看到柜台时，查无 ≠ 不存在）；
+//   - ③ 单轮待收敛 ≥3 笔视为网关账异常，只告警不动钱；
 //   - N 与网关 manual_sync_miss_limit 同值（6 轮 ≈ 3 分钟），远长于正常回报延迟；
-//   - 开关默认关，打开后每条收敛都写 opslog，便于复盘时改回。
-func (c *Controller) reconcileMissingOrders(day string, rows []GatewayOrderState) {
+//     每条收敛都写 opslog，便于复盘。显式关闭：rules.qmt.order_state_pull_close_missing=false。
+func (c *Controller) reconcileMissingOrders(day string, states *GatewayOrderStates) {
 	c.mu.RLock()
 	cfg := c.cfg
 	c.mu.RUnlock()
-	if !cfg.OrderStatePullCloseMissing || len(rows) == 0 {
+	if !cfg.OrderStatePullCloseMissingOn() || states == nil || len(states.Orders) == 0 {
 		return
 	}
-	present := make(map[string]bool, len(rows))
-	for _, r := range rows {
+	// 质量闸②：必须有一张**新鲜且非空**的券商委托表快照。没有它，"网关账里没有"只是
+	// "网关今天没看到柜台"，不是"柜台没有这笔单"（网关库被重置/桥刚起来都会是这个形态）。
+	// 窗口取 180s：委托表快照正常节拍 10~30s，3 分钟仍无新快照就当不可信。
+	if states.SnapshotN <= 0 || states.SnapshotAge < 0 || states.SnapshotAge > 180 {
+		log.Printf("[trading] §ORDER-STATE-PULL 阶段二跳过：券商委托表快照不可信 n=%d age=%ds",
+			states.SnapshotN, states.SnapshotAge)
+		return
+	}
+	present := make(map[string]bool, len(states.Orders))
+	for _, r := range states.Orders {
 		if r.SignalID != "" {
 			present[r.SignalID] = true
 		}
@@ -1208,7 +1218,9 @@ func (c *Controller) reconcileMissingOrders(day string, rows []GatewayOrderState
 	if c.orderMissingHits == nil {
 		c.orderMissingHits = map[string]int{}
 	}
-	type demote struct{ sid, code, oid string }
+	type demote struct {
+		sid, code, oid string
+	}
 	var toDemote []demote
 	for _, o := range all {
 		if o.Status != "撤单中" && o.Status != "已报待撤" && o.Status != "部成待撤" {
@@ -1218,6 +1230,7 @@ func (c *Controller) reconcileMissingOrders(day string, rows []GatewayOrderState
 		if !strings.HasPrefix(o.CreatedAt, day) {
 			continue
 		}
+		// 质量闸①：占位引用本来就不在柜台委托表里，按缺失判终态等于凭空放预算。
 		if strings.HasPrefix(o.OrderID, "pend:") || strings.HasPrefix(o.OrderID, "seq:") || o.OrderID == "" {
 			continue
 		}
@@ -1232,8 +1245,16 @@ func (c *Controller) reconcileMissingOrders(day string, rows []GatewayOrderState
 		}
 	}
 	c.mu.Unlock()
+	// 质量闸③：单轮要收 3 笔以上，更像"网关那本账坏了"而不是"同时有三笔幻影单"——
+	// 这种情况下不动钱，只把现象喊出来（放预算的方向错一次就是多买一笔）。
+	if len(toDemote) >= 3 {
+		opslog.Logf("quant", "§ORDER-STATE-PULL 阶段二**未执行**：单轮待收敛 %d 笔（成片缺失按网关账异常处理），day=%s 快照 n=%d age=%ds",
+			len(toDemote), day, states.SnapshotN, states.SnapshotAge)
+		log.Printf("[trading] §ORDER-STATE-PULL 阶段二跳过：单轮待收敛 %d 笔（成片缺失不动钱，请核网关账）", len(toDemote))
+		return
+	}
 	for _, d := range toDemote {
-		reason := "§ORDER-STATE-PULL 连续 6 轮网关查无此单（阶段二，默认关的显式开关）"
+		reason := "§ORDER-STATE-PULL 连续 6 轮网关查无此单（阶段二，默认开；真实号+可信快照+非成片缺失）"
 		if _, err := c.store.ApplyOrderReportTx(store.RealOrder{
 			OrderID: d.oid, SignalID: d.sid, Code: d.code, Side: SideBuy,
 			Status: "废单", CreatedAt: now.Format(time.RFC3339), UserID: c.userID, Reason: reason,

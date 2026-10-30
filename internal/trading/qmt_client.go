@@ -167,16 +167,22 @@ type GatewayOrderState struct {
 	CreatedAt string  `json:"created_at"`
 }
 
+// GatewayOrderStates 网关当日委托状态 + **它自己的委托表快照新鲜度**。
+// 后两个字段是阶段二的信任前提：网关没拿到券商委托表时，"查无此单"不等于"单不存在"。
+type GatewayOrderStates struct {
+	Day         string              `json:"day"`
+	SnapshotN   int                 `json:"snapshot_n"`
+	SnapshotAge int                 `json:"snapshot_age"` // 秒；-1=从没收到过快照
+	Orders      []GatewayOrderState `json:"orders"`
+}
+
 // OrderStates 拉取网关当日委托状态（§ORDER-STATE-PULL，只读对账源）。
 //
 // 为什么需要它：终态在链路上只有推送一条腿（网关 → outbox → Go），任何一次丢失都会让本地
 // 永久停在在途态，「撤单中」于是无限占用战略额度。这条拉取腿让 Go 能"用事实纠正本地"。
 // day 用 "YYYY-MM-DD"（与 gateway 侧 created_at 前 10 位同口径）。
-func (c *QMTClient) OrderStates(ctx context.Context, day string) ([]GatewayOrderState, error) {
-	var out struct {
-		OK     bool                `json:"ok"`
-		Orders []GatewayOrderState `json:"orders"`
-	}
+func (c *QMTClient) OrderStates(ctx context.Context, day string) (*GatewayOrderStates, error) {
+	var out GatewayOrderStates
 	path := "/orders"
 	if day != "" {
 		path += "?day=" + url.QueryEscape(day)
@@ -184,7 +190,7 @@ func (c *QMTClient) OrderStates(ctx context.Context, day string) ([]GatewayOrder
 	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
 	}
-	return out.Orders, nil
+	return &out, nil
 }
 
 // GatewayTerminalRejection §ORDER-STATE-PULL：网关是否明确回了「该 signal_id 已终态」（409 +
