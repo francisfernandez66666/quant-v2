@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/paper"
 )
 
@@ -185,6 +187,48 @@ func TestTRegimeGateDefaultOn(t *testing.T) {
 	c := config.TConfig{RegimeGateEnabled: &off}
 	if c.TRegimeGateEnabledOf() {
 		t.Fatal("显式配 false ⇒ 必须关得掉（bool 做不到这点，所以类型是 *bool）")
+	}
+}
+
+// H17 全局 enhance 开关关着、T 门开着 ⇒ tracker 照跑，T 字段有值，定权字段仍空。
+// 这条是 §W-09「0）」的行为侧证明：两个开关各管各的，不是"随手把 enhance 打开"。
+func TestTRegimeGateIgnoresGlobalEnhanceSwitch(t *testing.T) {
+	cm := config.NewManagerWithRules(&config.Rules{})
+	e := &Engine{}
+	e.SetCfgMgr(cm)
+	e.MarketStateObserve(50, 3, 2, 60, 0.01, 0.01)
+	e.mu.RLock()
+	tState, live := e.lastTMarketState, e.lastMarketState
+	e.mu.RUnlock()
+	if tState == "" {
+		t.Fatal("T 门默认开 ⇒ 即使 enhance.market_state_enabled=false，T 专属读数也必须产生")
+	}
+	if live != "" {
+		t.Fatalf("enhance 开关关着 ⇒ 定权字段必须保持空串（否则全账户仓位会被 state_scales 打折），实得 %q", live)
+	}
+}
+
+// H20 炸板率 60 秒缓存：默认开启后 riskBreakRate 每 5s 一轮会打上游，必须有 TTL。
+// 观测方式：把缓存预置成"30 秒前"，coordinator 留 nil——若判据没命中缓存，就会走到
+// `dc == nil` 返回 NaN；连续 5 次都是缓存值即证明没有打上游。过期后必须回到取数分支。
+func TestBreakRateCached60s(t *testing.T) {
+	now := time.Now()
+	e := &Engine{
+		riskHithink: true,
+		brkRateDay:  data.TradingDayDate(now),
+		brkRateAt:   now.Add(-30 * time.Second),
+		brkRateVal:  1.23,
+	}
+	for i := 0; i < 5; i++ {
+		if got := e.riskBreakRate(100); got != 1.23 {
+			t.Fatalf("60s 内应命中缓存（第 %d 次实得 %v，NaN 说明又去打上游了）", i+1, got)
+		}
+	}
+	e.mu.Lock()
+	e.brkRateAt = now.Add(-61 * time.Second)
+	e.mu.Unlock()
+	if got := e.riskBreakRate(100); !math.IsNaN(got) {
+		t.Fatalf("超过 60s 必须重新取数（无 coordinator 时取数失败=NaN），实得 %v", got)
 	}
 }
 

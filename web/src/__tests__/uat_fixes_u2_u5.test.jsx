@@ -37,10 +37,11 @@ vi.mock('../api/index.js', () => ({
 }))
 
 import Quant from '../pages/Quant.jsx'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 describe('Quant 页 §U-2 运维三件套入口', () => {
   it('渲染紧急停止按钮、当日委托撤单按钮、日终结算对账卡', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     // kill-switch：链路状态卡内的"紧急停止"行 + 按钮（行标签与按钮文案同字面，用 getAllByText）
     await waitFor(() => expect(screen.getAllByText('紧急停止').length).toBeGreaterThanOrEqual(1))
     expect(screen.getByRole('button', { name: '紧急停止' })).toBeInTheDocument()

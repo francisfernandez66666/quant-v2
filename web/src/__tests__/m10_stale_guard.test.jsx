@@ -34,6 +34,7 @@ vi.mock('../api/index.js', async () => {
 })
 
 import Signals from '../pages/Signals.jsx'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 describe('§M-10 轮询请求代号守卫', () => {
   // U1 begin 单调递增，各自独立实例互不串扰
@@ -99,7 +100,7 @@ describe('§M-10 轮询请求代号守卫', () => {
         if (calls === 1) return new Promise((r) => { resolveSlow = r }) // 挂载首轮：挂起
         return Promise.resolve([{ code: '600001', name: '新轮信号', direction: '做多', price: 10 }])
       }
-      render(<Signals />)
+      render(<MemoryRouter><Signals /></MemoryRouter>)
       await act(async () => { vi.advanceTimersByTime(21000) }) // 20s 轮询触发第 2 轮（快，微任务内即结算）
       // 第 2 轮数据已渲染（fake timers 下不用 findBy：waitFor 依赖真实计时器会挂死）
       expect(screen.getByText('新轮信号')).toBeInTheDocument()

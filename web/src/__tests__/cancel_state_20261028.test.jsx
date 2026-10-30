@@ -63,6 +63,7 @@ vi.mock('../api/index.js', () => ({
 
 import Quant from '../pages/Quant.jsx'
 import * as api from '../api/index.js'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 describe('Quant 页「撤单中」状态（§CANCEL-STATE）', () => {
   beforeEach(() => {
@@ -73,7 +74,7 @@ describe('Quant 页「撤单中」状态（§CANCEL-STATE）', () => {
   })
 
   it('「撤单中」行不可重复撤单，且状态标签带撤单请求留痕提示', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await waitFor(() => expect(screen.getByText('当日委托')).toBeInTheDocument())
     expect(await screen.findByText('GW-CANCELING')).toBeInTheDocument()
 
@@ -90,7 +91,7 @@ describe('Quant 页「撤单中」状态（§CANCEL-STATE）', () => {
   })
 
   it('点撤单：提示「等待交易所确认」而不是宣称已撤成', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await waitFor(() => expect(screen.getByText('当日委托')).toBeInTheDocument())
     await screen.findByText('GW-OPEN')
     screen.getAllByRole('button', { name: '撤单' })[0].click()

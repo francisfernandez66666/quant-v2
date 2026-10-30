@@ -2201,18 +2201,18 @@ func (r *tLiveRound) accelReason(rnd *TRoundLive, price float64) string {
 	// 注意 verdict/regime 在止血期间**仍然生效**——它们不是止损，是"回到开腿前"。
 	if r.p.Enabled && r.p.RoundStopPct > 0 && r.olderThan(rnd, tLPremiseGrace) {
 		if pct, _, ok := r.roundSpreadPctNow(rnd, price); ok && pct <= -r.p.RoundStopPct {
-			return "stop"
+			return paper.TAccelStop
 		}
 	}
 	// S2：卖出裁决（TTL 5min，tSellVerdictActive 内部判）。
 	if r.e != nil && r.e.tSellVerdictActive(rnd.Code) {
-		return "verdict"
+		return paper.TAccelVerdict
 	}
 	// S3：行情翻转。与 regimeBlock 同一读数、同一新鲜度门（过期的 bear 不许拿来配平）。
 	st, at := r.p.MarketState, r.p.MarketStateAt
 	if st != "" && !at.IsZero() && r.now.Sub(at) <= tRegimeStale {
 		if st == "bull" || st == "bear" {
-			return "regime"
+			return paper.TAccelRegime
 		}
 	}
 	return ""

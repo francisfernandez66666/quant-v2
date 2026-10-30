@@ -55,6 +55,7 @@ vi.mock('../api/index.js', async () => {
 })
 
 import Signals, { dimValueText, dimNaMode } from '../pages/Signals.jsx'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 describe('§0929DIM2 四维格显示口径', () => {
   beforeEach(() => {
@@ -94,14 +95,14 @@ describe('§0929DIM2 四维格显示口径', () => {
 
   // H4 因子行两个格子各打一次「不适用」＝恰 2（多打/漏打都算红）
   it('H4 挂载后「不适用」恰出现在因子行的 D3/D4 两格', async () => {
-    await act(async () => { render(<Signals />) })
+    await act(async () => { render(<MemoryRouter><Signals /></MemoryRouter>) })
     await act(async () => { await new Promise((r) => setTimeout(r, 30)) })
     expect(screen.getAllByText('不适用').length).toBe(2)
   })
 
   // H5 真四维行不得被连坐：整表只出现因子行那 2 个标注（负向清零）
   it('H5 龙头行不出现「不适用」，四维依据文本照常显示', async () => {
-    await act(async () => { render(<Signals />) })
+    await act(async () => { render(<MemoryRouter><Signals /></MemoryRouter>) })
     await act(async () => { await new Promise((r) => setTimeout(r, 30)) })
     expect(screen.getByText('龙头股')).toBeTruthy()
     expect(screen.getAllByText('不适用').length).toBe(2)
@@ -110,7 +111,7 @@ describe('§0929DIM2 四维格显示口径', () => {
 
   // H6 那个 0.62 必须真在界面上（不是被抹成空白，也不是显示成 0）
   it('H6 因子行强度值以 0.62 原样呈现', async () => {
-    await act(async () => { render(<Signals />) })
+    await act(async () => { render(<MemoryRouter><Signals /></MemoryRouter>) })
     await act(async () => { await new Promise((r) => setTimeout(r, 30)) })
     expect(screen.getAllByText(/0\.62/).length).toBeGreaterThanOrEqual(1)
   })

@@ -57,9 +57,10 @@ vi.mock('../api/index.js', async () => {
 })
 
 import Signals from '../pages/Signals.jsx'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 async function mount() {
-  await act(async () => { render(<Signals />) })
+  await act(async () => { render(<MemoryRouter><Signals /></MemoryRouter>) })
   await act(async () => { await new Promise((r) => setTimeout(r, 30)) })
 }
 

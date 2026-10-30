@@ -107,6 +107,16 @@ function inputByLabel(text) {
   return input
 }
 
+// §W-06-R4：兼容键那一行的 label 后面追加了「已并入…」说明，精确匹配取不到，按前缀取。
+function inputByLabelPrefix(prefix) {
+  const span = [...document.querySelectorAll('span')].find((n) => (n.textContent || '').trim().startsWith(prefix))
+  if (!span) throw new Error(`未找到以「${prefix}」开头的标签`)
+  const row = span.closest('div')
+  const input = row && row.querySelector('input')
+  if (!input) throw new Error(`标签「${prefix}」所在行没有输入框`)
+  return input
+}
+
 async function savedBody() {
   const api = await import('../api/index.js')
   const calls = api.setRegimeConfig.mock.calls
@@ -166,8 +176,9 @@ describe('§DYN-T 做 T 阈值：稀疏提交 / 单键补丁 / 越界拒绝', ()
     render(<RegimeConfigPanel />)
     await settle()
     await openFine()
-    // 买回熔断 0.2 < 下限 1（后端会静默回落 3.0，页面必须先拦住）
-    fireEvent.change(inputByLabel('买回熔断阈值（%）'), { target: { value: '0.2' } })
+    // §W-06-R4：买回熔断那个旧键已经 disabled（判定侧不再读它），拿它测越界只会测到"改了没反应"。
+    // 改用真正生效的「本笔 T 止损」测下限。
+    fireEvent.change(inputByLabel('本笔 T 止损（价差率%，不含费用）'), { target: { value: '0.2' } })
     // 最后开新腿时刻写成 9:45（3 位），后端按 4 位 HHMM 判格式会回落 1400
     fireEvent.change(inputByLabel('最后开新腿时刻'), { target: { value: '945' } })
     await settle()
@@ -176,7 +187,27 @@ describe('§DYN-T 做 T 阈值：稀疏提交 / 单键补丁 / 越界拒绝', ()
     const api = await import('../api/index.js')
     expect(api.setRegimeConfig.mock.calls.length).toBe(0)
     const text = document.body.textContent || ''
-    expect(text).toContain('买回熔断阈值%（须 1~10）')
+    expect(text).toContain('本笔T止损%（须 0.5~5）')
     expect(text).toContain('最后开新腿时刻（须为 4 位 HHMM）')
+  })
+
+  // §W-06-R4 / §W-09：旧键在屏上必须"看得见但改不动"，三个新键必须真能提交。
+  it('T5 兼容键禁用 + 三个新键（round_stop_pct / vol_ratio_max / regime_gate_enabled）进补丁', async () => {
+    render(<RegimeConfigPanel />)
+    await settle()
+    await openFine()
+    const legacy = inputByLabelPrefix('买回熔断阈值（%）')
+    expect(legacy.disabled).toBe(true)
+    fireEvent.change(inputByLabel('本笔 T 止损（价差率%，不含费用）'), { target: { value: '1.8' } })
+    fireEvent.change(inputByLabel('放量门：折算量比上限'), { target: { value: '0' } })
+    fireEvent.click(switchByLabel('T 行情门（牛/熊关闭做 T）'))
+    await settle()
+    fireEvent.click(btn('保存风控配置'))
+    await settle()
+    const body = await savedBody()
+    expect(body.sizing.t.round_stop_pct).toBe(1.8)
+    // 0 是合法值（＝不设该条），不许被当成"没改"而丢掉
+    expect(body.sizing.t.vol_ratio_max).toBe(0)
+    expect(body.sizing.t.regime_gate_enabled).toBe(false)
   })
 })

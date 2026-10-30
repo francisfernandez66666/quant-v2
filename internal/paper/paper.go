@@ -1716,10 +1716,14 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 	base := e.poolEquityLocked(poolKey)
 	capEq := e.totalPaperEquityLocked()
 	if base <= 0 || capEq <= 0 || price <= 0 {
+		// §W-02：早退也要播快照——否则「跳过的这笔为什么没买」在页面上完全看不见，
+		// 而这正是决策卡要回答的第一个问题。B1 用例钉住这条。
+		e.emitSkipDecisionLocked(poolKey, code, "池权益/价格不可得", base, e.pools[poolKey])
 		return 0, "池权益/价格不可得"
 	}
 	cash := e.pools[poolKey]
 	if cash <= 0 {
+		e.emitSkipDecisionLocked(poolKey, code, "池现金不足", base, cash)
 		return 0, "池现金不足"
 	}
 	// k = 信号带下来的合成因子（BuyScale = MS×SS）。0 与 1.0 都表示"没有缩放"（中性）：
@@ -1870,6 +1874,13 @@ func (e *Engine) emitDecisionLocked(poolKey, code string, price, perTradePct, ba
 		Qty:             qty,
 		Notional:        float64(qty) * price,
 	})
+}
+
+// emitSkipDecisionLocked 预算入口就失败（池权益/价格不可得、池现金不足）时的精简快照。
+// 这三条早退发生在单笔占比算出之前，所以只带池权益/池现金与原因；其余字段留 0，
+// 由 MissingKeyInput 说明"不是算出来 0"（前端 B5 对缺项渲染 —）。
+func (e *Engine) emitSkipDecisionLocked(poolKey, code, reason string, base, cash float64) {
+	e.emitDecisionLocked(poolKey, code, 0, 0, base, cash, 0, 0, 0, "", "skipped", reason, 0)
 }
 
 // paperSizingCtx engine 每轮注入的定权上下文（见 Engine.sizingCtx）。

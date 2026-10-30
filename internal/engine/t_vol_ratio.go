@@ -78,7 +78,8 @@ func (c *tVolCache) put(code, day string, now time.Time, v float64, ok bool) {
 // 缓存按 code 落、跨日丢弃。成功与失败分开缓存（两个 TTL），理由见常量处注释。
 // English: per-name time-prorated volume ratio with a split-TTL cache; ok=false means "unreadable".
 func (e *Engine) tVolRatioOf(code string) (float64, bool) {
-	now := time.Now()
+	// 走引擎统一时钟（SetClock），测试才能"跨日"而不依赖真实日期；生产默认 time.Now。
+	now := e.nowTime()
 	day := data.TradingDayDate(now)
 	if e.tVolCache != nil {
 		if v, ok, hit := e.tVolCache.get(code, day, now); hit {
@@ -97,11 +98,22 @@ func (e *Engine) tVolRatioCompute(code string, now time.Time, day string) (float
 	e.mu.RLock()
 	dc := e.coordinator
 	f := e.fetcher
+	klineFn := e.tKLineFn
+	cumVolFn := e.tCumVolFn
 	e.mu.RUnlock()
-	if dc == nil {
+	if dc == nil && klineFn == nil {
 		return 0, false
 	}
-	kl, err := dc.GetKLine(code, "101", tVolRatioNeed+4) // 101=日线；多取几根留余量
+	var (
+		kl  []data.KLine
+		err error
+	)
+	if klineFn != nil {
+		// 测试注入点：与 dc.GetKLine 同一签名、同一"101=日线"口径，生产路径不走这里。
+		kl, err = klineFn(code, "101", tVolRatioNeed+4)
+	} else {
+		kl, err = dc.GetKLine(code, "101", tVolRatioNeed+4) // 101=日线；多取几根留余量
+	}
 	if err != nil || len(kl) < tVolRatioNeed {
 		// 新股/停牌复牌/源失败 ⇒ 不拿 10 根冒充"20 日均量"。
 		return 0, false
@@ -125,7 +137,9 @@ func (e *Engine) tVolRatioCompute(code string, now time.Time, day string) (float
 	}
 	// 当日累计量取本轮快照（与 T 的其他读数同源，不另取一次快照）。
 	var cumVol float64
-	if f != nil {
+	if cumVolFn != nil {
+		cumVol, _ = cumVolFn(code)
+	} else if f != nil {
 		if q := f.SnapshotQuote(code); q != nil {
 			cumVol = q.Volume
 		}

@@ -178,6 +178,65 @@ func TestPriceSourceDifferenceIsExplained(t *testing.T) {
 	}
 }
 
+// F7（前提 A）：已成交的 T 买腿必须真的在 real_positions 里。
+//
+// 公式的"扣一次"是把 T 账本的 BuyLegValue 与券商持仓去重：若回报路径按 `t0:` 前缀跳过建仓，
+// 那笔腿就只存在于 T 账本里，R2 的扣减就成了"凭空扣"——room 变小但账上没有对应持仓，
+// 战略买入会被一条不存在的仓位长期压着。本用例在 store 层直接证明 t0: 单不被过滤。
+func TestFilledTLegIsInPositions(t *testing.T) {
+	db, err := store.Open(t.TempDir() + "/live.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	code := "600000.SH"
+	key := "t0:600000:buy_first:20261029:1"
+	if err := db.ApplyRealFill(store.RealFill{
+		OrderID: "GW-" + key, Code: code, Name: "浦发", Side: "买入",
+		Price: 10, Qty: 300, Amount: 3000, SignalID: key, UserID: "u_1",
+		TradedAt: "2026-10-29 10:30:00",
+	}); err != nil {
+		t.Fatalf("ApplyRealFill: %v", err)
+	}
+	poses, err := db.RealPositionsForUser("u_1")
+	if err != nil {
+		t.Fatalf("RealPositionsForUser: %v", err)
+	}
+	var qty int
+	for _, p := range poses {
+		if p.TsCode == code {
+			qty = p.Qty
+		}
+	}
+	if qty <= 0 {
+		t.Fatalf("t0: 前缀的 T 买腿成交后必须在 real_positions 里（否则 R2 是凭空扣减），实得 qty=%d", qty)
+	}
+	book := (&tLiveStore{byID: map[string]*TRoundLive{key: {
+		ID: key, Code: "600000", Dir: tLDirBuy, Status: tLStatusOpen,
+		BuyFilled: 300, BuyPrice: 10, Qty: 300,
+	}}}).bookValue(map[string]float64{"600000": 10})
+	if book.BuyLegValue <= 0 {
+		t.Fatalf("同一笔腿在 T 账本里必须计入 BuyLegValue，实得 %.2f", book.BuyLegValue)
+	}
+}
+
+// F9（前提 C）：现金只在预算层扣一次（antiCash = 券商可用现金 − 反 T 冻结款）。
+//
+// 目标公式本身不收现金参数（F1 已证），所以"二次扣现金"只可能发生在调用点。
+// 源码级断言两件事：AvailableCash() 只读一次；antiCash 只有"定义 + 传入 ordbudget"两处。
+func TestNoDoubleCountCash(t *testing.T) {
+	body := funcBody(t, "engine.go", "dynamicBuyQty")
+	if got := strings.Count(body, "AvailableCash()"); got != 1 {
+		t.Fatalf("dynamicBuyQty 只能读一次券商可用现金（多读一次就可能各扣一次），实得 %d", got)
+	}
+	if got := strings.Count(body, "antiCash :="); got != 1 {
+		t.Fatalf("antiCash（券商现金 − 反 T 冻结）只许定义一次，实得 %d（多处即为第二处扣现金）", got)
+	}
+	if !strings.Contains(body, "Cash:              antiCash") && !strings.Contains(body, "Cash: antiCash") {
+		t.Fatalf("预算层的 Cash 必须直接传 antiCash（券商现金 − 反 T 冻结），不允许再叠加扣减")
+	}
+}
+
 // F9（前提 C）：现金不在这个公式里扣——冻结款只在预算层扣一次（engine 的 antiCash = cash − frozenCash）。
 // 源码级断言：函数体里不许出现 cash / FrozenCash，否则就是"第二处扣现金"。
 func TestFormulaNeverTouchesCash(t *testing.T) {

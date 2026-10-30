@@ -62,6 +62,7 @@ vi.mock('../api/index.js', () => ({
 
 import Quant from '../pages/Quant.jsx'
 import * as api from '../api/index.js'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 describe('Quant 页 kill-switch 撤单失败回显（§0925EVE-A2）', () => {
   beforeEach(() => {
@@ -72,7 +73,7 @@ describe('Quant 页 kill-switch 撤单失败回显（§0925EVE-A2）', () => {
   })
 
   it('响应含 failed 明细：warning 文案点明笔数与单号清单，不走成功文案', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await waitFor(() => expect(screen.getByRole('button', { name: '紧急停止' })).toBeInTheDocument())
     await settle()
     screen.getByRole('button', { name: '紧急停止' }).click()
@@ -88,7 +89,7 @@ describe('Quant 页 kill-switch 撤单失败回显（§0925EVE-A2）', () => {
 
   it('反证：failed 为空数组（撤单请求全部发出）时仍是 success 文案', async () => {
     api.qmtHalt.mockResolvedValueOnce({ ok: '1', halted: true, cancelled: 3, failed: [] })
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await waitFor(() => expect(screen.getByRole('button', { name: '紧急停止' })).toBeInTheDocument())
     await settle()
     screen.getByRole('button', { name: '紧急停止' }).click()

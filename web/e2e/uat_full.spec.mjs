@@ -498,9 +498,9 @@ test.describe('交易相关分支', () => {
       await expect(klineBtn, '收起后回到分时态').toBeVisible()
       recordApiWarnings('signals-kline', ['分支=有行(展开/收起双腿已走)', 'rowCount=' + rowCount])
     } else {
-      // §FIX-20261028-F15②：页面上现在有两张表（信号表 + §DECISION-TODAY 的"今日动态仓位"卡），
-      // `.t-table__empty` 的 first() 会命中小卡的空态（文案是"今日尚未定权…"）——判据必须
-      // 限定在**信号表作用域**内，否则红的是选择器而不是站点。
+      // §W-04（2026-10-30）：默认面板现在**只有信号表**（"今日动态仓位"卡已迁到独立子页）。
+      // 作用域过滤仍然保留：将来同页再加表时，`.t-table__empty` 的 first() 不会误命中别人的空态，
+      // 判据也不会再次变成"选择器问题"而不是站点问题。
       const signalTable = page.locator('.t-table').filter({ has: page.locator('th', { hasText: '总分' }) })
       await expect(signalTable.locator('.t-table__empty').first(), '零信号时表格必须显式空态「暂无信号」（不是静默无控件）')
         .toContainText('暂无信号', { timeout: 8000 })
@@ -2279,6 +2279,23 @@ test.describe('§DYN-T 做 T 与 §DYN-SIZE v4：读数面 + 签字门（2026-10
     await page.screenshot({ path: `${SHOT}/dyn-t-card.png`, fullPage: false })
     const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
     expect(fatal, '做 T 卡渲染不得有未捕获 JS 错误: ' + fatal.join('|')).toHaveLength(0)
+  })
+
+  test('DYN-D1 信号页：动态仓位独立子页可直达，卡片表头在场', async ({ page }) => {
+    const errs = watch(page)
+    await page.goto('/#/signals')
+    await expect(page.locator('.app-main .page').first()).toBeVisible({ timeout: 15000 })
+    // 默认页：决策卡不在场（宽表已迁走，信号列表回到首屏）。
+    await expect(page.getByText('今日动态仓位（信号仓）', { exact: false })).toHaveCount(0)
+    await page.getByText('动态仓位', { exact: true }).first().click()
+    await expect(page.getByText('今日动态仓位（信号仓）', { exact: false }).first(),
+      '切到「动态仓位」子页后决策卡必须可见').toBeVisible({ timeout: 15000 })
+    // 表头是 DYN-D1 的落点判据：卡片真的渲染了决策表，而不是只有标题。
+    await expect(page.getByText('定权 MS / SS / 单笔', { exact: false }).first()).toBeVisible({ timeout: 10000 })
+    await page.waitForTimeout(1200)
+    await page.screenshot({ path: `${SHOT}/dyn-decisions-tab.png`, fullPage: false })
+    const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+    expect(fatal, '动态仓位子页渲染不得有未捕获 JS 错误: ' + fatal.join('|')).toHaveLength(0)
   })
 
   test('DYN-P2 设置页：v4 阈值表单与签字单卡；未输 token 时应用按钮禁用', async ({ page }) => {

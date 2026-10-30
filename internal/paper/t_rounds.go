@@ -290,18 +290,21 @@ func (e *Engine) runIntradayTLocked(quotes map[string]*data.StockInfo, p TParams
 	e.rollTRoundsLocked(day, now, p)
 
 	// step1：状态收敛。有 open 腿的票本轮只处理这条腿，处理完结束（绝不叠腿）。
+	// force 先算一次：它同时是 premiseGone 的守卫（尾盘不判）与 pair 的强制配平开关，
+	// 两处各算一次会在分钟边界上读出不同的值（一个说 14:49、一个说 14:50）。
+	force := e.tForceReached(now, p.ForceUnwindHM)
 	for _, code := range e.tOpenCodesLocked() {
 		// §W-06-R4 P3：与实盘 premiseGone 同判据（熔断日反 T 只能转战略减仓）。
 		// 纸面守卫比实盘少两条（在途委托 / 腿龄）：纸面是同步撮合、没有委托在途态，
 		// 且 paper.TRound 没有 OpenedAt —— 不存在"异步回报导致价格基准陈旧"。
-		if state, why := e.premiseGoneLocked(code, p); state != "" {
+		if state, why := e.premiseGoneLocked(code, p, force); state != "" {
 			r := e.openTRoundFor(code)
 			if r != nil {
 				e.finishTRoundLocked(r, state, 0, 0, 0, why, now, 0)
 			}
 			continue
 		}
-		e.pairTRoundLocked(code, quotes, p, e.tForceReached(now, p.ForceUnwindHM), now)
+		e.pairTRoundLocked(code, quotes, p, force, now)
 	}
 	// 尾盘判定时刻之后**不再开新腿**（旧实现是"尾盘只收摊"，但配平时刻与停开时刻是两个概念：
 	// last_open_at 之后开的腿大概率当天配不上对，只能带着半态进收盘竞价）。
@@ -1597,6 +1600,14 @@ func tPaperAccelSuffix(tag string) string {
 	return "（accel=" + tag + "）"
 }
 
+// 加速配平触发源的标签（§W-06-R4）。导出是为了让两侧测试引用**同一份期望常量**，
+// 而不是各写一份字符串字面量——两份文案一旦漂移，"纸面与实盘同规则"就只剩注释。
+const (
+	TAccelStop    = "stop"
+	TAccelVerdict = "verdict"
+	TAccelRegime  = "regime"
+)
+
 // accelReasonLocked 纸面侧的三个触发源，判据与实盘 accelReason **逐条对应**：
 // "stop"（价差率 ≤ −round_stop_pct）/ "verdict"（有活跃卖出裁决）/ "regime"（离开 range）。
 //
@@ -1609,16 +1620,16 @@ func (e *Engine) accelReasonLocked(r *TRound, price float64, p TParams) string {
 	}
 	if p.RoundStopPct > 0 {
 		if pct, _, ok := tRoundSpreadPct(r, price); ok && pct <= -p.RoundStopPct {
-			return "stop"
+			return TAccelStop
 		}
 	}
 	if p.ActiveSellVerdict != nil && p.ActiveSellVerdict(r.Code) {
-		return "verdict"
+		return TAccelVerdict
 	}
 	if p.MarketState != "" && !p.MarketStateAt.IsZero() &&
 		time.Since(p.MarketStateAt) <= tPaperRegimeStale {
 		if p.MarketState == "bull" || p.MarketState == "bear" {
-			return "regime"
+			return TAccelRegime
 		}
 	}
 	return ""
@@ -1631,7 +1642,12 @@ const tPaperRegimeStale = 15 * time.Minute
 // premiseGoneLocked 纸面侧"必须改终态"的判定（§W-06-R4 v3）。判据与实盘**同口径**，
 // 同样**只剩 P3**：stop/verdict/regime 三个触发源都是"提前配平"，落在 accelReasonLocked。
 // 写进这里就退化成"结掉不管"——熊市里结掉正 T 腿＝不卖底仓＝敞口变大，方向反。
-func (e *Engine) premiseGoneLocked(code string, p TParams) (state, why string) {
+func (e *Engine) premiseGoneLocked(code string, p TParams, force bool) (state, why string) {
+	// 守卫①（与实盘同）：尾盘 force 分支本来就走 allowBuyBack 那套"买回/转战略"，
+	// 这里再判一次会让同一 tick 里两个入口抢同一条腿，且文案/动作都不一样。
+	if force {
+		return "", ""
+	}
 	r := e.openTRoundFor(code)
 	if r == nil || r.Leg != tRLegSell || r.LegQty <= 0 {
 		return "", ""

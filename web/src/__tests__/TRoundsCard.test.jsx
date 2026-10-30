@@ -167,4 +167,12 @@ describe('§DYN-T 做 T 卡：收益独立口径 / 损坏态 / 被拦分布', ()
     expect(text()).toContain('已配对')
     expect(text()).toContain('在途')
   })
+
+  // D5 §W-04：量化页的 T 子页要首屏看实盘账本；默认值仍是 paper，模拟盘页既有行为不变。
+  it('D5 defaultTab="live" ⇒ 首屏实盘账本，纸面专段不出现', async () => {
+    render(<TRoundsCard defaultTab="live" />)
+    await settle()
+    expect(text()).toContain('600002') // 实盘账本的样例行
+    expect(text()).not.toContain('为什么没做 T')
+  })
 })

@@ -51,6 +51,7 @@ vi.mock('../api/index.js', async () => {
 
 import Quant from '../pages/Quant.jsx'
 import { dispatch, __reset as resetBus } from '../sseBus.js'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 // 假时钟下排空微任务链（同 §M13 口径：不用 waitFor，避免墙钟依赖）。
 async function flushMicrotasks() {
@@ -94,7 +95,7 @@ describe('§0926E2E-17A 轮询统一（SSE 事件驱动 + 60s 兜底）', () => 
   // P1：qmt_report 事件到达 → 链路状态/当日委托/待核对/流水四路立即重拉（零定时器推进）
   it('P1 SSE 事件即时刷新：dispatch 后四路数据端点调用数增长且从未推进时钟', async () => {
     const api = await stubs()
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.queryByText(/无权限访问量化交易/), '前置：admin 正常态').not.toBeInTheDocument()
     // 清掉首屏调用，只看事件驱动的增量
@@ -116,7 +117,7 @@ describe('§0926E2E-17A 轮询统一（SSE 事件驱动 + 60s 兜底）', () => 
     const api = await stubs()
     const ZH403 = Object.assign(new Error('无权限'), { status: 403 })
     api.fetchQMTState.mockImplementation(async () => { throw ZH403 })
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     expect(screen.getByText(/无权限访问量化交易/), '前置：无权限面板已落地').toBeInTheDocument()

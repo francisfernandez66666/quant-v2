@@ -87,7 +87,7 @@ describe('§M-9 三态分离：后端 500 不得伪装成空态/加载态', () =
   // E1 Signals：fetchSignals 500 → 出现可重试错误提示，绝不出现「暂无信号」
   it('E1 Signals 首载 500 → 错误态独立渲染（不出现「暂无信号」空态）', async () => {
     state.impl.fetchSignals = () => { throw ERR500('信号接口 500') }
-    render(<Signals />)
+    render(<MemoryRouter><Signals /></MemoryRouter>)
     // 错误横幅与表格空行 error 分支都含「信号加载失败」字样：分别按精确文本断言，
     // 且「暂无信号」空态文案必须缺席（修复前 catch 吞错直接落空态，必红）。
     const banner = await screen.findByText(/⚠ 信号加载失败：/, {}, { timeout: 5000 })
@@ -110,7 +110,7 @@ describe('§M-9 三态分离：后端 500 不得伪装成空态/加载态', () =
   // E3 Quant：loadOrders 500（非 403）→ 委托卡渲染错误+重试，不再永远「加载委托列表…」
   it('E3 Quant 委托 500 → 错误态独立渲染（不永远卡在「加载委托列表…」）', async () => {
     state.impl.fetchQMTOrders = () => { throw ERR500('委托服务暂不可用') }
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     const err = await screen.findByText(/委托服务暂不可用/, {}, { timeout: 5000 })
     expect(err).toBeInTheDocument()
     expect(screen.queryByText('加载委托列表…'), '§M-9：错误不得伪装成永久加载态').not.toBeInTheDocument()

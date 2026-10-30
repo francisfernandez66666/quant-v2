@@ -85,6 +85,7 @@ vi.mock('../api/index.js', async () => {
 
 import Quant from '../pages/Quant.jsx'
 import Paper from '../pages/Paper.jsx'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 // flushMicrotasks：fake timers 下把 Promise 链跑干（不推进定时器）。
 async function flushMicrotasks() {
@@ -146,7 +147,7 @@ describe('§M13 前端权限一致性（403 停轮询 + 状态码判定）', () 
   it('L1 成员进 Quant 页 403 后：admin 端点轮询请求数不再增长', async () => {
     const api = await import('../api/index.js')
     await denyAll(ZH403)
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     // 无权限面板已渲染（面板文案含 emoji 与插值，故用正则匹配）
     expect(screen.getByText(/无权限访问量化交易/)).toBeInTheDocument()
@@ -173,7 +174,7 @@ describe('§M13 前端权限一致性（403 停轮询 + 状态码判定）', () 
   it('L2a 英文 no permission 的 403 同样判定为无权限（状态码判定，非文案判定）', async () => {
     const api = await import('../api/index.js')
     await denyAll(EN403)
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.getByText(/无权限访问量化交易/)).toBeInTheDocument()
     // 且同样止血：轮询已停
@@ -187,7 +188,7 @@ describe('§M13 前端权限一致性（403 停轮询 + 状态码判定）', () 
   it('L2b 中文文案 + 非 403 状态码不再被当成无权限', async () => {
     const api = await import('../api/index.js')
     api.fetchQMTConfig.mockRejectedValue(Object.assign(new Error('服务端提示：无权限（文案样本）'), { status: 500 }))
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.queryByText(/无权限访问量化交易/)).not.toBeInTheDocument()
     // 走的是"本机缓存不可信"告警分支，而不是权限面板
@@ -270,7 +271,7 @@ describe('§M-6 在飞链止血（链尾不漏发 + 挂载壳端点 403/非 403 
     let resolveTrades
     api.fetchQMTTrades.mockImplementation(() => new Promise((res) => { resolveTrades = res }))
     api.fetchQMTState.mockImplementation(async () => { throw ZH403() })
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle() // 让 state 的 403 完成 noteForbidden → stopPolling + pollingDeadRef 置位
     expect(screen.getByText(/无权限访问量化交易/), '前置：无权限面板已落地').toBeInTheDocument()
     // 此刻链第一步仍 pending；修复前它 release 后会连发 verdicts + risk/gates（链尾漏发）
@@ -290,7 +291,7 @@ describe('§M-6 在飞链止血（链尾不漏发 + 挂载壳端点 403/非 403 
     // ① 只让 fetchShortStatus 回英文 403，其余 admin 端点全部正常——旧实现 catch(()=>{})
     //    会把它整个吞掉：面板不出、轮询不停（§M-6 修的正是这类"链外 403 漏判"）。
     api.fetchShortStatus.mockRejectedValue(EN403())
-    const { unmount } = render(<Quant />)
+    const { unmount } = render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.getByText(/无权限访问量化交易/), 'fetchShortStatus 的 403 必须触发无权限面板').toBeInTheDocument()
     const before = api.fetchQMTState.mock.calls.length
@@ -304,7 +305,7 @@ describe('§M-6 在飞链止血（链尾不漏发 + 挂载壳端点 403/非 403 
     await resetStubs()
     api.fetchShortStatus.mockRejectedValue(Object.assign(new Error('short/status 炸了'), { status: 500 }))
     api.fetchPaperState.mockRejectedValue(Object.assign(new Error('paper/state 不可用'), { status: 503 }))
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.queryByText(/无权限访问量化交易/), '500/503 绝不能分流成无权限（§M-6）').not.toBeInTheDocument()
     // 且轮询照常活着（未被误杀）：推进 60s，state 至少又打了 5 次
@@ -372,7 +373,7 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
   // L8：成员挂载 → admin 只读零请求 + 无权限面板在场 + 成员可读端点照常
   it('L8 成员态：admin 只读一次都不发，壳端点仍照常拉（预过滤不等于整页失明）', async () => {
     const api = await import('../api/index.js')
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     expect(screen.getByText(/无权限访问量化交易/), '成员态应落无权限面板').toBeInTheDocument()
@@ -394,7 +395,7 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
   it('L9 重试反证：服务器仍回 member 时零请求（本地缓存不能自我授权）', async () => {
     const api = await import('../api/index.js')
     api.refreshMe.mockImplementation(async () => ({ role: 'user' }))
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     fireEvent.click(screen.getByText('刷新身份并重试'))
@@ -415,7 +416,7 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
       localStorage.setItem('liangzai_role', 'admin')
       return { role: 'admin' }
     })
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     for (const name of ADMIN_READS) {

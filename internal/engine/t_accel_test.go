@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/paper"
+	"quant-trading-v2/internal/trading"
 )
 
 // tAccelFnSource 取某个函数的源码（到行首 } 为止），供"源码级负锁"判据使用。
@@ -70,7 +71,7 @@ func TestAccelStopSellsEarly(t *testing.T) {
 	f, r := accelFix(t, 10, 30)
 	rnd := buyRoundAt(f.now, 3*time.Minute, 1000, 10.0)
 	// 现价 9.60 ⇒ 价差率 −4.00% ≤ −2.0%
-	if got := r.accelReason(rnd, 9.60); got != "stop" {
+	if got := r.accelReason(rnd, 9.60); got != paper.TAccelStop {
 		t.Fatalf("价差 −4%% 应触发 stop，实得 %q", got)
 	}
 	// 端到端：价差门（min_spread 2.0）没到，但加速必须把卖腿发出去。
@@ -97,7 +98,7 @@ func TestAccelStopBuysBack(t *testing.T) {
 	f, r := accelFix(t, 10, 30)
 	rnd := sellRoundAt(f.now, 3*time.Minute, 400, 10.0)
 	// 现价 10.40 ⇒ 卖额 4000 − 买额 4160 ⇒ −4.00%（与正 T 完全同一算式）
-	if got := r.accelReason(rnd, 10.40); got != "stop" {
+	if got := r.accelReason(rnd, 10.40); got != paper.TAccelStop {
 		t.Fatalf("反 T 价差 −4%% 应触发 stop（正反同算式，无方向分支），实得 %q", got)
 	}
 	code := "600000"
@@ -120,7 +121,7 @@ func TestAccelStopRespectsLegGrace(t *testing.T) {
 		t.Fatalf("腿龄 30s < tLPremiseGrace，止损不许判（开腿抖动会拿错价格基准），实得 %q", got)
 	}
 	old := buyRoundAt(f.now, 3*time.Minute, 1000, 10.0)
-	if got := r.accelReason(old, 9.60); got != "stop" {
+	if got := r.accelReason(old, 9.60); got != paper.TAccelStop {
 		t.Fatalf("腿龄 3min 应判止损，实得 %q", got)
 	}
 }
@@ -136,7 +137,7 @@ func TestAccelStopRespectsDisabled(t *testing.T) {
 	}
 	// 同一条腿：裁决出现 ⇒ 仍然触发（止血停的是新动作，不是收摊）
 	f.e.tSellVerdicts = map[string]time.Time{"600000": time.Now()}
-	if got := r.accelReason(rnd, 9.60); got != "verdict" {
+	if got := r.accelReason(rnd, 9.60); got != paper.TAccelVerdict {
 		t.Fatalf("止血期间裁决仍应触发配平（不是止损），实得 %q", got)
 	}
 }
@@ -146,7 +147,7 @@ func TestAccelVerdictSellsEarly(t *testing.T) {
 	f, r := accelFix(t, 10, 30)
 	f.e.tSellVerdicts = map[string]time.Time{"600000": f.now}
 	rnd := buyRoundAt(f.now, 3*time.Minute, 1000, 10.0)
-	if got := r.accelReason(rnd, 10.05); got != "verdict" {
+	if got := r.accelReason(rnd, 10.05); got != paper.TAccelVerdict {
 		t.Fatalf("有活跃卖出裁决应触发 verdict（价差 +0.5%% 还没到门），实得 %q", got)
 	}
 }
@@ -172,7 +173,7 @@ func TestAccelRegimeFlip(t *testing.T) {
 			p.MarketStateAt = f.now.Add(-1 * time.Minute)
 		})
 		r := f.round(p, f.quotes())
-		if got := r.accelReason(rnd, 10.05); got != "regime" {
+		if got := r.accelReason(rnd, 10.05); got != paper.TAccelRegime {
 			t.Fatalf("%s 且读数新鲜 ⇒ 在途腿应立刻配平（不是挂到下午），实得 %q", st, got)
 		}
 	}
@@ -300,6 +301,120 @@ func TestPremiseGoneIgnoresSellVerdict(t *testing.T) {
 	if st, _ := r.premiseGone(buyRoundAt(f.now, 3*time.Minute, 1000, 10.0)); st != "" {
 		t.Fatalf("裁决活跃 ⇒ premiseGone 仍应为空（出口动作是配平不是结掉），实得 %q", st)
 	}
+}
+
+// ACC-11 第二腿已在柜台挂着 ⇒ 加速也不许叠单。
+//
+// 撤单与成交有竞态：撤单指令在途时成交回报仍可能到达，此时再发一条同向腿就会造出
+// **无主成交**（仓位变了，但没有一条腿认领它）。所以"跳过价差门"只跳价差，不跳在途检查。
+func TestAccelStillRespectsPendingPair(t *testing.T) {
+	f, _ := accelFix(t, 10, 30)
+	code := "600000"
+	f.seedPosition(code, "浦发", 1000, 10, 10)
+	key := tLiveKey(code, "buy_first", 1)
+	f.legFill(key, code, "买入", 1000, 10.0, 0)
+	f.openRound(&TRoundLive{ID: key, Code: code, Name: "浦发", Dir: tLDirBuy, Qty: 1000}, 1000, 10.0)
+	// 第二腿已报未成交：账本事实里有这一条在途委托。
+	f.legOrder(key+tLPairSuffix, code, "卖出", 1000, 10.0, "已报", "GW-"+key+tLPairSuffix)
+	p := f.params(func(p *paper.TParams) { p.RoundStopPct = 2.0 })
+	f.round(p, f.quotes(f.quote(code, "浦发", 9.60, 10.0, 10.6, 9.5, 10.0))).execute()
+	f.mustCount(0)
+	if got := f.ledger().roundOf(key); got == nil || got.Status != tLStatusOpen {
+		t.Fatalf("第二腿在途时加速不许叠单（等它成交或尾盘 force），实得 %+v", got)
+	}
+}
+
+// ACC-12 加速路径失败即收摊：①② 是行为变更（现状是 markBlocked + 继续等），③ 本来就是收摊。
+//
+// 关键反向断言：同一组输入**去掉加速** ⇒ ①② 必须仍是 markBlocked 且 Status=open。
+// 否则就是"顺手把既有行为一起改了"，F 系列断言会连锁变化。
+func TestAccelFailureUnwinds(t *testing.T) {
+	t.Run("正T底仓可卖不足", func(t *testing.T) {
+		newFix := func(price float64, minSpread float64) (*tLiveFix, string) {
+			f, _ := accelFix(t, 10, 30)
+			code := "600000"
+			// 底仓 500 + 当日 T 买 1000 ⇒ 可卖 500 < 需卖 1000（T+1）。
+			f.seedPosition(code, "浦发", 500, 10, 10)
+			key := tLiveKey(code, "buy_first", 1)
+			f.legFill(key, code, "买入", 1000, 10.0, 0)
+			f.openRound(&TRoundLive{ID: key, Code: code, Name: "浦发", Dir: tLDirBuy, Qty: 1000}, 1000, 10.0)
+			p := f.params(func(p *paper.TParams) { p.RoundStopPct = 2.0; p.MinSpreadPct = minSpread })
+			f.round(p, f.quotes(f.quote(code, "浦发", price, 10.0, 10.6, 9.5, 10.0))).execute()
+			return f, key
+		}
+		// 加速（价差 −4% ⇒ stop）：失败必须收摊。
+		f, key := newFix(9.60, 2.0)
+		got := f.ledger().roundOf(key)
+		if got == nil || got.Status != tLStatusUnwound {
+			t.Fatalf("加速配平失败应记 unwound，实得 %+v", got)
+		}
+		if !strings.Contains(got.UnwindReason, "加速配平失败") {
+			t.Fatalf("失败原因应含「加速配平失败」以便复盘分组，实得 %q", got.UnwindReason)
+		}
+		// 非加速（价差已过门但无触发源）：既有行为原样保留。
+		f2, key2 := newFix(10.05, 0.2)
+		got2 := f2.ledger().roundOf(key2)
+		if got2 == nil || got2.Status != tLStatusOpen {
+			t.Fatalf("非加速路径不许被这次改动带跑：应保持 open，实得 %+v", got2)
+		}
+		if !strings.Contains(got2.LastBlockStep, "step7") {
+			t.Fatalf("非加速路径应仍走 markBlocked(step7)，实得 %q", got2.LastBlockStep)
+		}
+	})
+
+	t.Run("正T卖腿被拒", func(t *testing.T) {
+		newFix := func(price float64, minSpread float64, badGateway bool) (*tLiveFix, string) {
+			f, _ := accelFix(t, 10, 30)
+			if badGateway {
+				// 柜台不可达：连接被拒 ⇒ sellLeg 返回 error（与柜台拒单同一条失败分支）。
+				cfg := f.ctrl.Config()
+				f.ctrl = trading.NewController(
+					trading.NewQMTClient("http://127.0.0.1:1", "", 200*time.Millisecond, 0), f.db, "u_1", cfg, nil)
+				f.e.SetQMT(f.ctrl, f.db)
+			}
+			code := "600000"
+			f.seedPosition(code, "浦发", 1000, 10, 10)
+			key := tLiveKey(code, "buy_first", 1)
+			f.legFill(key, code, "买入", 1000, 10.0, 0)
+			f.openRound(&TRoundLive{ID: key, Code: code, Name: "浦发", Dir: tLDirBuy, Qty: 1000}, 1000, 10.0)
+			p := f.params(func(p *paper.TParams) { p.RoundStopPct = 2.0; p.MinSpreadPct = minSpread })
+			f.round(p, f.quotes(f.quote(code, "浦发", price, 10.0, 10.6, 9.5, 10.0))).execute()
+			return f, key
+		}
+		f, key := newFix(9.60, 2.0, true)
+		got := f.ledger().roundOf(key)
+		if got == nil || got.Status != tLStatusUnwound || !strings.Contains(got.UnwindReason, "加速配平失败") {
+			t.Fatalf("加速路径卖腿被拒应收摊（unwound + 加速配平失败），实得 %+v", got)
+		}
+		f2, key2 := newFix(10.05, 0.2, true)
+		got2 := f2.ledger().roundOf(key2)
+		if got2 == nil || got2.Status != tLStatusOpen || !strings.Contains(got2.LastBlockStep, "step8") {
+			t.Fatalf("非加速路径卖腿被拒应仍 markBlocked(step8) 且保持 open，实得 %+v", got2)
+		}
+	})
+
+	t.Run("反T专款不足", func(t *testing.T) {
+		f, _ := accelFix(t, 10, 30)
+		f.seedAccount(100000, 100) // 专款之外的可用现金只剩 100 元
+		code := "600000"
+		// 底仓 2000、反 T 卖 1000：剩 1000 仍在持仓里（round 构造时按持仓取价，
+		// 全卖光会让 r.prices 没有这只有效价，配对链在"无价"分支提前返回，测不到现金腿）。
+		f.seedPosition(code, "浦发", 2000, 10, 10)
+		key := tLiveKey(code, "sell_first", 1)
+		f.legFill(key, code, "卖出", 1000, 10.0, 0)
+		f.openRound(&TRoundLive{ID: key, Code: code, Name: "浦发", Dir: tLDirSell, Qty: 1000}, 1000, 10.0)
+		p := f.params(func(p *paper.TParams) { p.RoundStopPct = 2.0 })
+		f.round(p, f.quotes(f.quote(code, "浦发", 10.40, 10.0, 10.6, 9.5, 10.0))).execute()
+		got := f.ledger().roundOf(key)
+		if got == nil || got.Status != tLStatusUnwound {
+			t.Fatalf("反 T 专款不足应无条件收摊，实得 %+v", got)
+		}
+		// 反 T 侧文案是「买回被拦…（accel=stop）」：状态语义与 ①② 相同，只是不带
+		// 「加速配平失败」前缀（方案要求"状态语义不动"，这里钉住标签仍在，复盘能分组）。
+		if !strings.Contains(got.UnwindReason, "accel=stop") {
+			t.Fatalf("反 T 加速失败也应带 accel 标签，实得 %q", got.UnwindReason)
+		}
+	})
 }
 
 // ACC-15 源码级：premiseGone 不许出现行情/止损读数（写进来就退化成"结掉不管"，方向反）。

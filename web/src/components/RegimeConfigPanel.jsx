@@ -180,7 +180,7 @@ function toNum(v) {
 }
 
 // NumRow 精细参数行：标签 + 数字输入 + 说明。测试按标签文案定位本行（不按顺序）。
-function NumRow({ label, hint, value, min = 0.01, max = 2, step = 0.01, precision, onChange, testId }) {
+function NumRow({ label, hint, value, min = 0.01, max = 2, step = 0.01, precision, onChange, testId, disabled }) {
   return (
     <div style={rowStyle}>
       <span style={labelStyle}>{label}</span>
@@ -190,6 +190,9 @@ function NumRow({ label, hint, value, min = 0.01, max = 2, step = 0.01, precisio
         max={max}
         step={step}
         precision={precision}
+        // §W-06-R4：兼容键那一行必须真的禁用。只写 <NumRow disabled> 而不往下传，
+        // 屏上看起来是灰的（靠 label 文案），实际还能改——正是"改了没反应"那个坑。
+        disabled={!!disabled}
         value={value}
         onChange={(v) => onChange(toNum(v))}
       />
@@ -1136,13 +1139,12 @@ export default function RegimeConfigPanel() {
               <NumRow label="放量门：折算量比上限"
                 hint="默认 1.8（本仓既有分档的「显著放量」线；1.2 会把温和放量也拦掉，盘整市里大半时间开不了腿）。填 0＝不设该条。量比按已流逝交易分钟折算全天，早盘也能测出放量"
                 value={form.tVolRatioMax} min={0} max={6} step={0.1} onChange={(v) => set({ tVolRatioMax: v })} />
-              <ToggleSw label="T 行情门（牛/熊关闭做 T）" checked={!!form.tRegimeGate}
+              {/* §W-09：开关必须带标签。原先写的是 <ToggleSw label=…>，而 ToggleSw 不接 label，
+                  屏上只剩下面那段说明——用户看不出这个开关管的是哪一件事，也没法用标签把它找出来。 */}
+              <SwitchRow label="T 行情门（牛/熊关闭做 T）"
+                hint="默认**开**：只认盘整（range）行情，牛/熊一律不开新腿，已开的腿立即配平回到开腿前。它与「市场状态机」那个全局开关是两件事——后者一开会让全账户仓位乘 state_scales（震荡 ×0.70、熊 ×0.40），所以 T 用自己的开关，不动那个。读数超过 15 分钟没更新时本门**弃权**（不会静默把 T 关掉）"
+                checked={!!form.tRegimeGate}
                 onChange={(v) => set({ tRegimeGate: !!v })} />
-              <div style={hintStyle}>
-                行情门默认**开**：只认盘整（range）行情，牛/熊一律不开新腿，已开的腿立即配平回到开腿前。
-                它与「市场状态机」那个全局开关是两件事——后者一开会让全账户仓位乘 state_scales（震荡 ×0.70、熊 ×0.40），
-                所以 T 用自己的开关，不动那个。读数超过 15 分钟没更新时本门**弃权**（不会静默把 T 关掉）。
-              </div>
               <NumRow label="流动性：成交额下限（万元）" hint={`默认 3000；填 0＝不设该条。读数拿不到按「不过」处理`} value={form.tMinAmount} min={0} max={1000000} step={100} precision={0} onChange={(v) => set({ tMinAmount: v })} />
               <NumRow label="流动性：换手率下限（%）" hint="默认 1.5；填 0＝不设该条" value={form.tMinTurnover} min={0} max={25} step={0.1} onChange={(v) => set({ tMinTurnover: v })} />
               <NumRow label="流动性：上市天数下限" hint="默认 60；填 0＝不设该条（次新日内波动不具可比性）" value={form.tMinListed} min={0} max={3650} step={1} precision={0} onChange={(v) => set({ tMinListed: v })} />

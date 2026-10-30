@@ -85,8 +85,10 @@ export default function SignalDecisionsCard() {
       cell: ({ row }) => (
         <span style={{ fontSize: 12 }}>
           {/* §FIX-20261028-F19a：手动直发不经动态预算 ⇒ 这三列对它没有意义，显示「—」
-              而不是 0.000/0.0%（0 会被读成"算出来是 0"）。 */}
-          {row.channel === 'manual'
+              而不是 0.000/0.0%（0 会被读成"算出来是 0"）。
+              §W-02（B5）：纸面行没有个股缩放（StockScale 恒 0，表里留 0 并由 MissingKeyInput 标），
+              同样显示「—」——0.000 会被读成"个股因子算出来是 0"，那是假读数。 */}
+          {row.channel === 'manual' || (row.channel === 'paper' && !(Number(row.stock_scale) > 0))
             ? '—'
             : `${Number(row.market_scale || 0).toFixed(3)} / ${Number(row.stock_scale || 0).toFixed(3)} / ${(Number(row.per_trade_pct || 0) * 100).toFixed(1)}%`}
         </span>

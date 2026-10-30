@@ -42,10 +42,11 @@ vi.mock('../api/index.js', () => ({
 }))
 
 import Quant from '../pages/Quant.jsx'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 describe('Quant 页挂载（§链路状态卡回归）', () => {
   it('渲染链路状态卡关键行，不再因 renderChainStatusCard 缺失而抛错', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     // 卡片与各行标签存在
     expect(screen.getByText('链路状态')).toBeInTheDocument()
     await settle()
@@ -65,7 +66,7 @@ describe('Quant 页挂载（§链路状态卡回归）', () => {
 describe('Quant 页单笔金额绝对帽字段（§AUDIT-PM）', () => {
   it('渲染标签与服务端值回填，保存 payload 携带该字段', async () => {
     const api = await import('../api/index.js')
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.getByText('单笔金额绝对帽(元)')).toBeInTheDocument()
     await settle()

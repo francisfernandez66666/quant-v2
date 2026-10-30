@@ -178,6 +178,10 @@ type Engine struct {
 	tMinuteCache *tMinuteCache
 	// tVolCache 个股折算量比缓存（§W-09 行情门；成功 30 分钟 / 失败 60 秒，按代码且跨日丢弃）。
 	tVolCache *tVolCache
+	// tKLineFn / tCumVolFn 量比取数注入点（仅测试用；nil = 走 coordinator 的日 K 与 fetcher 快照）。
+	// 生产不设置，行为与直调一致；有了它们，H7/H8/H9/H15 才能钉住"剔除今日 K 线 / 只打一次上游"。
+	tKLineFn  func(code, period string, n int) ([]data.KLine, error)
+	tCumVolFn func(code string) (float64, bool)
 	// tSellVerdicts 该码最近一次活跃卖出/退出裁决的时刻（反 T 否决门用，5 分钟内有效）。
 	tSellVerdicts map[string]time.Time
 	// sizingCtxCache §FUNDS-TODAY 定权上下文（MS/盲区/指数涨跌）的短窗缓存（见 sizingContextFor）。

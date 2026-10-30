@@ -9225,156 +9225,6 @@ echo "==> 7 末段..."
 echo "ok - fixture s7"
 
 echo ""
-echo "==> 141 §W-20261029 夜批（T 子页/纸面决策/schema 版本/日键/算式合一/加速配平/行情门）..."
-B141_FAILED=0
-fail141() {
-	echo "--- FAIL: §141 $*"
-	FAIL=1
-	B141_FAILED=1
-}
-CNT141=0
-# fnbody141 取函数体（到行首 } 为止）。判"某串只许出现在某个函数里"必须用函数体，
-# 全文件 grep 会被注释与其他同名调用命中——本批要防的正是"方向性错误"，假绿比假红更危险。
-# 用 index() 而不是正则匹配函数名：调用方传的是 'xxx('，裸括号在 awk 动态正则里是分组元字符，
-# 未闭合会让整条匹配静默失效（本次就是这么假绿过一次——函数体取空，判据当然不命中）。
-fnbody141() {
-	awk -v pat="$2" '
-		/^func / && index($0, pat) { inFn = 1 }
-		inFn { print }
-		inFn && $0 == "}" { exit }
-	' "$1" 2>/dev/null
-}
-EG141="internal/engine/engine.go"
-ITL="internal/engine/intraday_t_live.go"
-PTN="internal/paper/t_rounds.go"
-
-# —— ①~⑤ W-04 前端子页签 ——
-CNT141=$((CNT141 + 1))
-grep -q 'value="t"' web/src/pages/Quant.jsx || fail141 "量化页没有 T 仓子页（资金卡/T 回合应收敛进子页，不占主页面）"
-CNT141=$((CNT141 + 1))
-grep -q 'destroyOnHide' web/src/pages/Quant.jsx || fail141 "T 仓子页缺 destroyOnHide：切走不卸载 ⇒ 两个 10s 轮询器打同一个 /api/funds/today"
-CNT141=$((CNT141 + 1))
-[ "$(grep -c '<FundsOverviewCard' web/src/pages/Quant.jsx)" = "1" ] || fail141 "量化页把资金卡挂了两处 ⇒ 两个轮询器，且两处缓存互不可见"
-CNT141=$((CNT141 + 1))
-grep -q 'value="decisions"' web/src/pages/Signals.jsx || fail141 "信号页没有「动态仓位」子页（宽表压在信号表上方会把列表挤出首屏）"
-CNT141=$((CNT141 + 1))
-[ "$(grep -c '<SignalDecisionsCard' web/src/pages/Signals.jsx)" = "1" ] || fail141 "信号页把决策卡挂了两处"
-CNT141=$((CNT141 + 1))
-grep -q "defaultTab = 'paper'" web/src/components/TRoundsCard.jsx || fail141 "TRoundsCard 的 defaultTab 默认值变了 ⇒ 模拟盘页既有行为与 DYN-P1 用例受影响"
-
-# —— ⑥~⑧ W-02/W-03 决策快照 ——
-CNT141=$((CNT141 + 1))
-grep -rq 'SetDecisionRecorder' internal/paper || fail141 "纸面没有决策快照注入点 ⇒ 纸面自动交易跑再多，「今日动态仓位」恒空"
-CNT141=$((CNT141 + 1))
-grep -q 'Channel: "paper"' internal/engine/registry.go || fail141 "纸面决策落库没带 Channel=paper ⇒ 与实盘行无法区分"
-CNT141=$((CNT141 + 1))
-fnbody141 "$EG141" 'persistDynBuyDecision(' | grep -q 'memberIDs()' || fail141 "决策快照仍只写单个 userID ⇒ 共享引擎下其他成员打开「今日动态仓位」恒空"
-
-# —— ⑨⑩ W-05/W-07 ——
-CNT141=$((CNT141 + 1))
-grep -q 'const schemaVersion = 2' internal/store/store.go || fail141 "schemaVersion 没自增 ⇒ 「拒绝旧代码开新库」这道守卫形同虚设（旧二进制+新 schema 静默共存）"
-CNT141=$((CNT141 + 1))
-! grep -q 'Format("20060102")' internal/engine/tlive_state.go || fail141 "T 账本日键用服务器本地钟 ⇒ 异地部署（KST）日切错位一小时"
-
-# —— ⑪ 算式只剩一份 ——
-CNT141=$((CNT141 + 1))
-! grep -q 'targetRatio' "$EG141" || fail141 "engine.go 又出现就地重算的目标占比 ⇒ 与资金卡两套算式（§W-06 修的就是这个）"
-CNT141=$((CNT141 + 1))
-[ "$(grep -c 'math.Min' internal/engine/funds_today.go)" = "1" ] || fail141 "min(MS, 天花板) 的实现不止一处 ⇒ 两处可各自漂移"
-
-# —— ⑫⑬ W-08 凭据覆盖面 / W-01 签名配置 ——
-CNT141=$((CNT141 + 1))
-grep -q "include='\*.md'" scripts/verify_changes.sh || fail141 "凭据锁只扫 *.py：文档里顺手粘的账号/口令查不出来（bt_jq/README.md 就是这么发现的）"
-CNT141=$((CNT141 + 1))
-! grep -q 'password=' mobile/gradle.properties || fail141 "mobile/gradle.properties 又出现明文签名口令（只许从环境变量进）"
-
-# —— ⑭⑮ W-06-R4 盘中释放的守卫与终态写点 ——
-CNT141=$((CNT141 + 1))
-PB141="$(fnbody141 "$ITL" 'premiseGone(')"
-for g in 'r.force' 'hasPendingPair' 'tLPremiseGrace' 'p.Enabled'; do
-	printf '%s\n' "$PB141" | grep -q "$g" || fail141 "premiseGone 少了守卫 ${g}：尾盘/在途腿/腿龄不足/止血轮任一漏判都可能造无主成交或误结腿"
-done
-CNT141=$((CNT141 + 1))
-[ "$(grep -cE '\.Status[[:space:]]*=[^=]' "$ITL")" = "2" ] || fail141 "终态写点不止两处 ⇒ 冻结款可能永久泄漏（只允许 seal() 与 finish() 写 Status）"
-fnbody141 "$ITL" 'seal(' | grep -qE '\.Status[[:space:]]*=[^=]' || fail141 "seal() 里没有终态写点"
-fnbody141 "$ITL" 'finish(' | grep -qE '\.Status[[:space:]]*=[^=]' || fail141 "finish() 里没有终态写点"
-
-# —— ⑯ 行情门在入口与出口、但不在释放路径 ——
-CNT141=$((CNT141 + 1))
-grep -q 'regimeBlock(' "$ITL" && grep -q 'accelReason(' "$ITL" || fail141 "行情门缺入口或出口：只有入口 ⇒ 在途腿在熊市里挂一下午"
-# 负锁：命中才红。**必须**写成 if 而不是 `grep -q && fail`——本脚本是 set -euo pipefail，
-# 后一种写法在"没命中"（正确情形）时整条返回 1 ⇒ 静默中止、既无 FAIL 也无 ok（假绿的极端形态）。
-if printf '%s\n' "$PB141" | grep -q 'MarketState'; then
-	fail141 "行情翻转写进了 premiseGone ⇒ 熊市里正 T 腿被「结掉」而不是配平 ⇒ 少卖一笔底仓 ⇒ 敞口变大"
-fi
-
-# —— ⑰⑱ 量能门与量比唯一实现 ——
-CNT141=$((CNT141 + 1))
-grep -q 'volumeBlock(' "$ITL" || fail141 "实盘开腿链上没有量能门"
-grep -q 'step0.6' "$PTN" || fail141 "纸面开腿链上没有量能门 ⇒ 纸面与实盘的终态分布不可比，灰度期唯一对照物失效"
-CNT141=$((CNT141 + 1))
-! grep -rq --include='*.go' 'intradayVolumeRatio(' internal/engine internal/paper internal/strategy_engine 2>/dev/null || fail141 "combat_agent 包外还在用未导出的量比 ⇒ 同一指标两份实现（折算口径分歧后早盘放量测不出来）"
-
-# —— ⑲⑳㉑ 三个新键与止损口径 ——
-CNT141=$((CNT141 + 1))
-grep -q 'vol_ratio_max' web/src/components/RegimeConfigPanel.jsx || fail141 "面板上没放量能门的输入框（后端有键、面板没框＝配不了）"
-grep -q 'defaultTVolRatioMax' internal/config/config.go || fail141 "config.go 缺 vol_ratio_max 的默认值"
-CNT141=$((CNT141 + 1))
-grep -q 'defaultTRoundStopPct' internal/config/config.go && grep -q 'round_stop_pct' web/src/components/RegimeConfigPanel.jsx || fail141 "本笔 T 止损键没有前后端闭环"
-CNT141=$((CNT141 + 1))
-SB141="$(fnbody141 "$ITL" 'roundSpreadPctNow(')"
-for bad in 'roundFee(' 'tLCommissionRate' 'tLStampTaxRate'; do
-	printf '%s\n' "$SB141" | grep -q "$bad" || continue
-	fail141 "止损口径里掺进了费用（${bad}）：口径就不再是价差，且与 fillPnl 的费用来源打架（v2 版就是这么被推翻的）"
-done
-
-# —— ㉒㉓ 读数新鲜度与缓存成败分治 ——
-CNT141=$((CNT141 + 1))
-grep -q 'lastTMarketStateAt' "$EG141" || fail141 "T 行情读数没有时间戳 ⇒ 新鲜度门无从判（拿几小时前的状态关今天的 T）"
-fnbody141 "$ITL" 'regimeBlock(' | grep -q 'tRegimeStale' || fail141 "入口没做新鲜度门"
-fnbody141 "$ITL" 'accelReason(' | grep -q 'tRegimeStale' || fail141 "出口没做新鲜度门：出口误触发是真金白银的成交，比入口更严"
-CNT141=$((CNT141 + 1))
-grep -q 'tVolRatioTTLOk' internal/engine/t_vol_ratio.go && grep -q 'tVolRatioTTLErr' internal/engine/t_vol_ratio.go || fail141 "量比缓存成败没分治：失败缓存 30 分钟 ⇒ 一次抖动让该票半天做不了 T；不缓存 ⇒ 源挂了每秒打上游"
-
-# —— ㉔㉕ 加速配平的落点与不自造信号 ——
-CNT141=$((CNT141 + 1))
-fnbody141 "$ITL" 'pairBuyFirst(' | grep -q 'accelReason(' || fail141 "正 T 配对链没接加速配平"
-fnbody141 "$ITL" 'pairSellFirst(' | grep -q 'accelReason(' || fail141 "反 T 配对链没接加速配平"
-if printf '%s\n' "$PB141" | grep -q 'accelReason'; then
-	fail141 "加速配平写进了 premiseGone ⇒ 退化成「释放」，比让 T 自己配平多留敞口"
-fi
-CNT141=$((CNT141 + 1))
-AB141="$(fnbody141 "$ITL" 'accelReason(')"
-printf '%s\n' "$AB141" | grep -q 'tSellVerdictActive(' || fail141 "accelReason 没有卖出裁决触发源"
-printf '%s\n' "$AB141" | grep -q 'MarketState' || fail141 "accelReason 没有行情翻转触发源"
-if printf '%s\n' "$AB141" | grep -qE 'combat_agent|Disposal'; then
-	fail141 "accelReason 里又判了一次「该不该卖」⇒ T 层出现第二份卖出逻辑"
-fi
-
-# —— ㉖ 止损只有一个算式 ——
-CNT141=$((CNT141 + 1))
-fnbody141 "$ITL" 'allowBuyBack(' | grep -q 'roundSpreadPctNow(' || fail141 "尾盘买回熔断没复用 roundSpreadPctNow ⇒ 全系统出现第二个止损算式"
-[ "$(grep -c 'p\.LossBreakerPct' "$ITL" "$PTN" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')" = "0" ] || fail141 "判定侧还在引用老止损键：两个止损数字会打架（字段定义不算，别逼着人删字段）"
-
-# —— ㉗ T 行情读数与定权读数分字段 ——
-CNT141=$((CNT141 + 1))
-grep -q 'lastTMarketState' "$EG141" || fail141 "T 没有自己的行情读数字段"
-if fnbody141 "$EG141" 'assembleRegime(' | grep -q 'lastTMarketState'; then
-	fail141 "T 的行情读数漏进定权 ⇒ state_scales 生效 ⇒ 全账户仓位变七折且无人察觉"
-fi
-if fnbody141 "$ITL" 'regimeBlock(' | grep -q 'lastMarketState'; then
-	fail141 "T 门读了定权的读数 ⇒ 又把 enhance.market_state_enabled 绑回 T 门上（默认 true 变成默认关）"
-fi
-
-# —— ㉘ 行情门默认开且关得掉 ——
-CNT141=$((CNT141 + 1))
-grep -q 'defaultTRegimeGateEnabled = true' internal/config/config.go || fail141 "T 行情门默认没开"
-grep -q 'RegimeGateEnabled \*bool' internal/config/config.go || fail141 "regime_gate_enabled 不是 *bool ⇒ bool 分不清「没配」与「配了 false」，默认 true 会变成永远关不掉"
-grep -q 'regime_gate_enabled' web/src/components/RegimeConfigPanel.jsx || fail141 "面板上没有行情门开关（关不掉＝只能改代码）"
-
-[ "$B141_FAILED" = "0" ] || exit 1
-echo "ok - §141 §W-20261029 锁通过（子页签 6 + 决策快照 3 + 版本与日键 2 + 算式 2 + 凭据 2 + 释放守卫 2 + 行情门 2 + 量比 1 + 新键与口径 3 + 新鲜度与缓存 2 + 加速配平 2 + 止损 1 + 字段分家 1 + 开关 1，累计判定点 ${CNT141}）"
-
 echo "==> 全部通过"
 P2LB_ONE
 ;;
@@ -15514,8 +15364,7 @@ PY130
 # R1：删掉底仓累加 ⇒ "已有持仓计入 CurStrat" 那条必红（缺口正是本批修的那处漏项）。
 # §W-06：靶串从 stratVal 累加换成"喂参那一行"——变异仍是同一件事：拿掉底仓项，
 # "已有持仓计入 CurStrat"那条用例必须转红。
-N130R1=$(mut130 internal/engine/engine.go '		posByCode[code] = p
-		if ind := industryOf(code); ind != "" {' '		if ind := industryOf(code); ind != "" {' || true)
+N130R1=$(mut130 internal/engine/engine.go '		posByCode[code] = p' '		posByCode[code] = store.RealPosition{}' || true)
 CNT130=$((CNT130 + 1))
 [ "${N130R1:-0}" = "1" ] || fail130 "反证 R1 变异落地数=${N130R1:-0}（应 1）：靶串不在位，本枚等于没跑"
 R1OUT130=$(cd "$W130/mirror" && go test ./internal/engine/ -count=1 -run 'TestB0HeldPositionsCountInCurStrat' 2>&1 || true)
@@ -16930,15 +16779,191 @@ grep -qF '"types"' qmt_gateway/contract/order_fields.json ||
 # §W-08（2026-10-29）：覆盖面从 *.py 扩到 *.md/*.sh——账号字面量这次是在 bt_jq/README.md 里
 # 找到的，只扫 py 等于"文档不算源码"，而文档恰恰是最容易顺手粘凭据的地方。
 CNT140=$((CNT140 + 1))
-if grep -rqF 'Pass1234' --include='*.py' --include='*.md' --include='*.sh' . 2>/dev/null; then
+# §W-08 修正（2026-10-30）：射程从「整棵工作树」收回到「入库源码 + 本地 bt_jq」。
+# 原写法 `grep -r .` 会连 docs/（本地审计证据，历史报告**引用**了当时发现的凭据）、.qoder/ 代理
+# 工作树、runs/ 证据一起扫——那些命中是"证据里引用了泄露值"，不是"代码里又写了一遍"，
+# 红因与发版面无关，还会随本地证据目录增减而漂移。W-08 的原靶 bt_jq/README.md **不在 git 里**，
+# 所以必须单独把 bt_jq 加回射程；其余本地 scratch 目录一律不扫。
+cred_hit() { # $1=字面量 → 命中返回 0
+	# 必须排除门禁脚本自身：它按字面量判红，天然包含这两个串；不排除就是"自己判自己红"。
+	git grep -qF -- "$1" -- '*.py' '*.md' '*.sh' ':(exclude)scripts/verify_changes.sh' 2>/dev/null && return 0
+	if [ -d bt_jq ]; then
+		grep -rqF --include='*.py' --include='*.md' --include='*.sh' -- "$1" bt_jq 2>/dev/null && return 0
+	fi
+	return 1
+}
+CNT140=$((CNT140 + 1))
+if cred_hit 'Pass1234'; then
 	fail140 "源码/文档/脚本里仍有明文口令字面量（聚宽凭据只许从 env 读）"
 fi
 CNT140=$((CNT140 + 1))
-if grep -rqF '17621136687' --include='*.py' --include='*.md' --include='*.sh' . 2>/dev/null; then
+if cred_hit '17621136687'; then
 	fail140 "源码/文档/脚本里仍有明文账号字面量（聚宽账号只许从 env 读）"
 fi
 
 [ "$B140_FAILED" = "0" ] || exit 1
 echo "ok - §140 §FIX-20261028 锁通过（跨账号 3 + 资金帧 2 + 桥 2 + 分码 2 + 观测面 3 + 收盘对账 2 + 自选 2 + 留痕 3 + 分页 2 + 删号 2 + 账本 2 + 契约 1 + 源码凭据 2，累计判定点 ${CNT140}）"
+
+echo "==> 141 §W-20261029 夜批（T 子页/纸面决策/schema 版本/日键/算式合一/加速配平/行情门）..."
+B141_FAILED=0
+fail141() {
+	echo "--- FAIL: §141 $*"
+	FAIL=1
+	B141_FAILED=1
+}
+CNT141=0
+# fnbody141 取函数体（到行首 } 为止）。判"某串只许出现在某个函数里"必须用函数体，
+# 全文件 grep 会被注释与其他同名调用命中——本批要防的正是"方向性错误"，假绿比假红更危险。
+# 用 index() 而不是正则匹配函数名：调用方传的是 'xxx('，裸括号在 awk 动态正则里是分组元字符，
+# 未闭合会让整条匹配静默失效（本次就是这么假绿过一次——函数体取空，判据当然不命中）。
+fnbody141() {
+	awk -v pat="$2" '
+		/^func / && index($0, pat) { inFn = 1 }
+		inFn { print }
+		inFn && $0 == "}" { exit }
+	' "$1" 2>/dev/null
+}
+EG141="internal/engine/engine.go"
+ITL="internal/engine/intraday_t_live.go"
+PTN="internal/paper/t_rounds.go"
+
+# —— ①~⑤ W-04 前端子页签 ——
+CNT141=$((CNT141 + 1))
+grep -q 'value="t"' web/src/pages/Quant.jsx || fail141 "量化页没有 T 仓子页（资金卡/T 回合应收敛进子页，不占主页面）"
+CNT141=$((CNT141 + 1))
+grep -q 'destroyOnHide' web/src/pages/Quant.jsx || fail141 "T 仓子页缺 destroyOnHide：切走不卸载 ⇒ 两个 10s 轮询器打同一个 /api/funds/today"
+CNT141=$((CNT141 + 1))
+[ "$(grep -c '<FundsOverviewCard' web/src/pages/Quant.jsx)" = "1" ] || fail141 "量化页把资金卡挂了两处 ⇒ 两个轮询器，且两处缓存互不可见"
+CNT141=$((CNT141 + 1))
+grep -q 'value="decisions"' web/src/pages/Signals.jsx || fail141 "信号页没有「动态仓位」子页（宽表压在信号表上方会把列表挤出首屏）"
+CNT141=$((CNT141 + 1))
+[ "$(grep -c '<SignalDecisionsCard' web/src/pages/Signals.jsx)" = "1" ] || fail141 "信号页把决策卡挂了两处"
+CNT141=$((CNT141 + 1))
+grep -q "defaultTab = 'paper'" web/src/components/TRoundsCard.jsx || fail141 "TRoundsCard 的 defaultTab 默认值变了 ⇒ 模拟盘页既有行为与 DYN-P1 用例受影响"
+
+# —— ⑥~⑧ W-02/W-03 决策快照 ——
+CNT141=$((CNT141 + 1))
+grep -rq 'SetDecisionRecorder' internal/paper || fail141 "纸面没有决策快照注入点 ⇒ 纸面自动交易跑再多，「今日动态仓位」恒空"
+CNT141=$((CNT141 + 1))
+grep -q 'Channel: "paper"' internal/engine/registry.go || fail141 "纸面决策落库没带 Channel=paper ⇒ 与实盘行无法区分"
+CNT141=$((CNT141 + 1))
+fnbody141 "$EG141" 'persistDynBuyDecision(' | grep -q 'memberIDs()' || fail141 "决策快照仍只写单个 userID ⇒ 共享引擎下其他成员打开「今日动态仓位」恒空"
+
+# —— ⑨⑩ W-05/W-07 ——
+CNT141=$((CNT141 + 1))
+grep -q 'const schemaVersion = 2' internal/store/store.go || fail141 "schemaVersion 没自增 ⇒ 「拒绝旧代码开新库」这道守卫形同虚设（旧二进制+新 schema 静默共存）"
+CNT141=$((CNT141 + 1))
+! grep -q 'Format("20060102")' internal/engine/tlive_state.go || fail141 "T 账本日键用服务器本地钟 ⇒ 异地部署（KST）日切错位一小时"
+
+# —— ⑪ 算式只剩一份 ——
+CNT141=$((CNT141 + 1))
+! grep -q 'targetRatio' "$EG141" || fail141 "engine.go 又出现就地重算的目标占比 ⇒ 与资金卡两套算式（§W-06 修的就是这个）"
+CNT141=$((CNT141 + 1))
+[ "$(grep -c 'math.Min' internal/engine/funds_today.go)" = "1" ] || fail141 "min(MS, 天花板) 的实现不止一处 ⇒ 两处可各自漂移"
+
+# —— ⑫⑬ W-08 凭据覆盖面 / W-01 签名配置 ——
+CNT141=$((CNT141 + 1))
+grep -q "include='\*.md'" scripts/verify_changes.sh || fail141 "凭据锁只扫 *.py：文档里顺手粘的账号/口令查不出来（bt_jq/README.md 就是这么发现的）"
+CNT141=$((CNT141 + 1))
+! grep -q 'password=' mobile/gradle.properties || fail141 "mobile/gradle.properties 又出现明文签名口令（只许从环境变量进）"
+
+# —— ⑭⑮ W-06-R4 盘中释放的守卫与终态写点 ——
+CNT141=$((CNT141 + 1))
+PB141="$(fnbody141 "$ITL" 'premiseGone(')"
+for g in 'r.force' 'hasPendingPair' 'tLPremiseGrace' 'p.Enabled'; do
+	grep_q "$g" PB141 F || fail141 "premiseGone 少了守卫 ${g}：尾盘/在途腿/腿龄不足/止血轮任一漏判都可能造无主成交或误结腿"
+done
+CNT141=$((CNT141 + 1))
+[ "$(grep -cE '\.Status[[:space:]]*=[^=]' "$ITL")" = "2" ] || fail141 "终态写点不止两处 ⇒ 冻结款可能永久泄漏（只允许 seal() 与 finish() 写 Status）"
+fnbody141 "$ITL" 'seal(' | grep -qE '\.Status[[:space:]]*=[^=]' || fail141 "seal() 里没有终态写点"
+fnbody141 "$ITL" 'finish(' | grep -qE '\.Status[[:space:]]*=[^=]' || fail141 "finish() 里没有终态写点"
+
+# —— ⑯ 行情门在入口与出口、但不在释放路径 ——
+CNT141=$((CNT141 + 1))
+grep -q 'regimeBlock(' "$ITL" && grep -q 'accelReason(' "$ITL" || fail141 "行情门缺入口或出口：只有入口 ⇒ 在途腿在熊市里挂一下午"
+# 负锁：命中才红。**必须**写成 if 而不是 `grep -q && fail`——本脚本是 set -euo pipefail，
+# 后一种写法在"没命中"（正确情形）时整条返回 1 ⇒ 静默中止、既无 FAIL 也无 ok（假绿的极端形态）。
+if grep_q 'MarketState' PB141; then
+	fail141 "行情翻转写进了 premiseGone ⇒ 熊市里正 T 腿被「结掉」而不是配平 ⇒ 少卖一笔底仓 ⇒ 敞口变大"
+fi
+
+# —— ⑰⑱ 量能门与量比唯一实现 ——
+CNT141=$((CNT141 + 1))
+grep -q 'volumeBlock(' "$ITL" || fail141 "实盘开腿链上没有量能门"
+grep -q 'step0.6' "$PTN" || fail141 "纸面开腿链上没有量能门 ⇒ 纸面与实盘的终态分布不可比，灰度期唯一对照物失效"
+CNT141=$((CNT141 + 1))
+! grep -rq --include='*.go' 'intradayVolumeRatio(' internal/engine internal/paper internal/strategy_engine 2>/dev/null || fail141 "combat_agent 包外还在用未导出的量比 ⇒ 同一指标两份实现（折算口径分歧后早盘放量测不出来）"
+
+# —— ⑲⑳㉑ 三个新键与止损口径 ——
+CNT141=$((CNT141 + 1))
+grep -q 'vol_ratio_max' web/src/components/RegimeConfigPanel.jsx || fail141 "面板上没放量能门的输入框（后端有键、面板没框＝配不了）"
+grep -q 'defaultTVolRatioMax' internal/config/config.go || fail141 "config.go 缺 vol_ratio_max 的默认值"
+CNT141=$((CNT141 + 1))
+grep -q 'defaultTRoundStopPct' internal/config/config.go && grep -q 'round_stop_pct' web/src/components/RegimeConfigPanel.jsx || fail141 "本笔 T 止损键没有前后端闭环"
+CNT141=$((CNT141 + 1))
+SB141="$(fnbody141 "$ITL" 'roundSpreadPctNow(')"
+for bad in 'roundFee(' 'tLCommissionRate' 'tLStampTaxRate'; do
+	grep_q "$bad" SB141 F || continue
+	fail141 "止损口径里掺进了费用（${bad}）：口径就不再是价差，且与 fillPnl 的费用来源打架（v2 版就是这么被推翻的）"
+done
+
+# —— ㉒㉓ 读数新鲜度与缓存成败分治 ——
+CNT141=$((CNT141 + 1))
+grep -q 'lastTMarketStateAt' "$EG141" || fail141 "T 行情读数没有时间戳 ⇒ 新鲜度门无从判（拿几小时前的状态关今天的 T）"
+fnbody141 "$ITL" 'regimeBlock(' | grep -q 'tRegimeStale' || fail141 "入口没做新鲜度门"
+fnbody141 "$ITL" 'accelReason(' | grep -q 'tRegimeStale' || fail141 "出口没做新鲜度门：出口误触发是真金白银的成交，比入口更严"
+CNT141=$((CNT141 + 1))
+grep -q 'tVolRatioTTLOk' internal/engine/t_vol_ratio.go && grep -q 'tVolRatioTTLErr' internal/engine/t_vol_ratio.go || fail141 "量比缓存成败没分治：失败缓存 30 分钟 ⇒ 一次抖动让该票半天做不了 T；不缓存 ⇒ 源挂了每秒打上游"
+
+# —— ㉔㉕ 加速配平的落点与不自造信号 ——
+CNT141=$((CNT141 + 1))
+fnbody141 "$ITL" 'pairBuyFirst(' | grep -q 'accelReason(' || fail141 "正 T 配对链没接加速配平"
+fnbody141 "$ITL" 'pairSellFirst(' | grep -q 'accelReason(' || fail141 "反 T 配对链没接加速配平"
+if grep_q 'accelReason' PB141; then
+	fail141 "加速配平写进了 premiseGone ⇒ 退化成「释放」，比让 T 自己配平多留敞口"
+fi
+CNT141=$((CNT141 + 1))
+AB141="$(fnbody141 "$ITL" 'accelReason(')"
+grep_q 'tSellVerdictActive(' AB141 F || fail141 "accelReason 没有卖出裁决触发源"
+grep_q 'MarketState' AB141 || fail141 "accelReason 没有行情翻转触发源"
+if grep_q 'combat_agent|Disposal' AB141; then
+	fail141 "accelReason 里又判了一次「该不该卖」⇒ T 层出现第二份卖出逻辑"
+fi
+
+# —— ㉖ 止损只有一个算式 ——
+CNT141=$((CNT141 + 1))
+fnbody141 "$ITL" 'allowBuyBack(' | grep -q 'roundSpreadPctNow(' || fail141 "尾盘买回熔断没复用 roundSpreadPctNow ⇒ 全系统出现第二个止损算式"
+[ "$(grep -c 'p\.LossBreakerPct' "$ITL" "$PTN" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')" = "0" ] || fail141 "判定侧还在引用老止损键：两个止损数字会打架（字段定义不算，别逼着人删字段）"
+
+# —— ㉗ T 行情读数与定权读数分字段 ——
+CNT141=$((CNT141 + 1))
+grep -q 'lastTMarketState' "$EG141" || fail141 "T 没有自己的行情读数字段"
+if fnbody141 "$EG141" 'assembleRegime(' | grep -q 'lastTMarketState'; then
+	fail141 "T 的行情读数漏进定权 ⇒ state_scales 生效 ⇒ 全账户仓位变七折且无人察觉"
+fi
+if fnbody141 "$ITL" 'regimeBlock(' | grep -q 'lastMarketState'; then
+	fail141 "T 门读了定权的读数 ⇒ 又把 enhance.market_state_enabled 绑回 T 门上（默认 true 变成默认关）"
+fi
+
+# —— ㉘ 行情门默认开且关得掉 ——
+CNT141=$((CNT141 + 1))
+grep -q 'defaultTRegimeGateEnabled = true' internal/config/config.go || fail141 "T 行情门默认没开"
+grep -q 'RegimeGateEnabled \*bool' internal/config/config.go || fail141 "regime_gate_enabled 不是 *bool ⇒ bool 分不清「没配」与「配了 false」，默认 true 会变成永远关不掉"
+grep -q 'regime_gate_enabled' web/src/components/RegimeConfigPanel.jsx || fail141 "面板上没有行情门开关（关不掉＝只能改代码）"
+
+# —— ㉙㉚ 面板两处"看着有、其实没生效"（2026-10-30 收尾批实锤的两个前端缺陷）——
+CNT141=$((CNT141 + 1))
+# NumRow 收了 disabled 却没往下传给 InputNumber ⇒ 兼容键那一行照样能改，正是方案禁止的
+# "改了没反应"的坑（比删掉更糟：用户以为自己在调止损）。等值锁判"确实传下去了"。
+NR141=$(awk '/^function NumRow\(/,/^\}/' web/src/components/RegimeConfigPanel.jsx)
+grep_q 'disabled={!!disabled}' NR141 || fail141 "NumRow 没把 disabled 转给 InputNumber ⇒ 面板上的「已并入、仅兼容」输入框其实还能改，改了静默无效"
+# 行情门开关必须走带标签的 SwitchRow：裸 ToggleSw 不接 label，屏上只剩下面那段说明，
+# 用户看不出这个开关管的是哪件事（也无法按标签在测试/无障碍树里定位它）。
+CNT141=$((CNT141 + 1))
+RGW141=$(awk '/§W-09：开关必须带标签|T 行情门（牛\/熊关闭做 T）/{print}' web/src/components/RegimeConfigPanel.jsx | head -2)
+grep_q 'SwitchRow label="T 行情门' RGW141 || fail141 "行情门开关退回裸 ToggleSw（无标签）⇒ 屏上看不出它管什么，方案要求的面板项名存实亡"
+
+[ "$B141_FAILED" = "0" ] || exit 1
+echo "ok - §141 §W-20261029 锁通过（子页签 6 + 决策快照 3 + 版本与日键 2 + 算式 2 + 凭据 2 + 释放守卫 2 + 行情门 2 + 量比 1 + 新键与口径 3 + 新鲜度与缓存 2 + 加速配平 2 + 止损 1 + 字段分家 1 + 开关 1 + 面板禁用与标签 2，累计判定点 ${CNT141}）"
 
 echo "==> 全部通过"

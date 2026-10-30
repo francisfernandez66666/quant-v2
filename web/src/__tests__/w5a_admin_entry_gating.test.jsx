@@ -57,6 +57,7 @@ vi.mock('../api/index.js', async () => {
 
 import Quant from '../pages/Quant.jsx'
 import { __reset as resetBus } from '../sseBus.js'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 async function settle(ms = 100) {
   await act(async () => { await vi.advanceTimersByTimeAsync(ms) })
@@ -107,7 +108,7 @@ describe('§0926E2E-17d 成员可见 admin 入口灰化', () => {
   it('G1 成员态：可见写入口 disabled+tooltip，点击「保存网关参数」零请求', async () => {
     const api = await stubs()
     setRole('user')
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.getByText(/无权限访问量化交易/), '前置：无权限面板').toBeInTheDocument()
     // §0929GATE-403 行为腿：成员态下这些 admin 只读一次都没发（预过滤生效，而不是发了才被拒）
@@ -164,7 +165,7 @@ describe('§0926E2E-17d 成员可见 admin 入口灰化', () => {
     // 否则页面走的是"按角色跳过取数"分支，写控件被 forbidden 灰化——那条红会被误读成
     // "灰化逻辑坏了"，而真实成因是本批新加的预过滤（同文件 G1 就是它的正证）。
     setRole('admin')
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     expect(screen.queryByText(/无权限访问量化交易/), '前置：admin 正常态').not.toBeInTheDocument()
     // 反向确认预过滤没有把 admin 一起拦掉：首屏确实拉过实盘配置与链路状态

@@ -76,6 +76,7 @@ vi.mock('../api/index.js', async () => {
 import Quant from '../pages/Quant.jsx'
 import * as api from '../api/index.js'
 import { dispatch, __reset as resetBus } from '../sseBus.js'
+import { MemoryRouter } from 'react-router-dom' // §W-04 子页签读 URL query，测试必须有 Router 上下文
 
 async function flushMicrotasks() {
   await act(async () => {
@@ -116,7 +117,7 @@ describe('§0929FILL-NAME 成交流水名称旁证列', () => {
 
   // T1：命中给名字、缺失给「—」，且绝不把代码复读成名字。
   it('T1 命中行显示股票名，查不到的行显示「—」', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     expect(screen.getAllByText('浦发银行'), '命中的 600000.SH 两笔都要显示股票名').toHaveLength(2)
@@ -127,7 +128,7 @@ describe('§0929FILL-NAME 成交流水名称旁证列', () => {
 
   // T2：一次刷新一个批量请求，同码两笔只问一次（防成 N 行打 N 次的洪峰形态）。
   it('T2 一批代码只发一个请求，重复代码去重', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     expect(api.fetchStockNames).toHaveBeenCalledTimes(1)
@@ -138,7 +139,7 @@ describe('§0929FILL-NAME 成交流水名称旁证列', () => {
 
   // T3：SSE 事件再触发 loadTrades → 已问过的代码不得重复拨号。
   it('T3 事件驱动二次刷新不再重复问同一批代码', async () => {
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     expect(api.fetchStockNames).toHaveBeenCalledTimes(1)
@@ -151,7 +152,7 @@ describe('§0929FILL-NAME 成交流水名称旁证列', () => {
   // T4：名称通道故障＝流水照常、轮询照常、不触发 403 止血。
   it('T4 名称查询失败只让该列退化，不牵动流水与轮询', async () => {
     api.fetchStockNames.mockImplementation(async () => { throw Object.assign(new Error('boom'), { status: 500 }) })
-    render(<Quant />)
+    render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
     await flushMicrotasks()
     expect(screen.getByText('交易流水与整体盈亏')).toBeInTheDocument()
