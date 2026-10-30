@@ -570,7 +570,13 @@ Info ("src4 bridge        token=" + $(if ($brToken -and $brToken -notmatch '^\('
 # 读法与 verify ③b 腿同型：逐条解析 value，只收非空 token；明文只进本地数组供写侧替换，打印一律指纹。
 $authPath = Join-Path $DataDir "auth.json"
 $authSnapVals = @()   # 各快照 token 原值（函数栈内；绝不回显）
+# §TOKEN-PERAACCT 拆枪（2026-10-31）：对齐写侧要按**账号**判，光有值数组不够——
+# 旧形态"每个不同旧值整体替换成源1"会把别人的在册钥匙一起洗掉，这里补一张 uid→token 表供逐条自证。
+$authSnapByUid = @{}  # user_id -> 该账号快照里的 token 原值（同样绝不回显，只打指纹）
 $authParseErr = $false
+# owner（这把实盘凭证在引擎侧的落点）：config.xt.json 的 owner_user_id，缺省回退旧 user_id 键。
+$alignOwner = [string]$cfg.owner_user_id
+if (-not $alignOwner) { $alignOwner = [string]$cfg.user_id }
 if (Test-Path $authPath) {
     $authObj = $null
     try { $authObj = Get-Content -Path $authPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $authObj = $null }
@@ -586,10 +592,15 @@ if (Test-Path $authPath) {
             try { $ar = "$($ac.value)" | ConvertFrom-Json } catch { $ar = $null }
             if ($null -eq $ar) { continue }
             $at = [string]$ar.qmt.token
-            if ($at) { $authSnapVals += $at }
+            $au = [string]$ac.user_id
+            if ($at) { $authSnapVals += $at; if ($au) { $authSnapByUid[$au] = $at } }
         }
         $authFps = @($authSnapVals | ForEach-Object { FpLabel $_ } | Sort-Object -Unique)
-        Info ("src5 auth_snap     n=" + @($authSnapVals).Count + " tokens=" + $(if ($authFps.Count) { $authFps -join "," } else { "none" }) + " (引擎按账号取令牌的权威源；-Align 按源1补齐，改后需重启 quant 服务方吃到——auth store 启动时载入)")
+        $ownerNowTok = ""
+        if ($alignOwner -and $authSnapByUid.ContainsKey($alignOwner)) { $ownerNowTok = [string]$authSnapByUid[$alignOwner] }
+        $otherHoldersNow = 0
+        foreach ($ok2 in $authSnapByUid.Keys) { if ($ok2 -ne $alignOwner) { $otherHoldersNow++ } }
+        Info ("src5 auth_snap     n=" + @($authSnapVals).Count + " tokens=" + $(if ($authFps.Count) { $authFps -join "," } else { "none" }) + " owner_fp=" + (FpLabel $ownerNowTok) + " other_holders=" + $otherHoldersNow + " (引擎按账号取令牌的权威源；-Align 只写 owner 那一条，改后需重启 quant 服务方吃到——auth store 启动时载入)")
     }
 } else { Info "src5 auth_snap     no-file (auth.json 不在位——读侧如实标注，-Align 不判红)" }
 
@@ -795,16 +806,24 @@ if ($Align) {
     if (Test-Path $bridgePath) { $brAction = if ((FpLabel $brToken) -ne $alignFp) { "write" } else { "same" } }
     Info ("align src3 plan engine_cfg will_write=" + $wantEng + " was=" + (FpLabel $engToken) + " target_fp=" + $alignFp)
     Info ("align src4 plan bridge action=" + $brAction + " (absent=桥未落位，落位时写源1同值即可)")
-    # 源5 计划（§0926ROT-SRC5）：快照里任何与源1不同指纹的 token 都是"待刷"值；
-    # 文件在位却解析失败＝结构不可信，计划阶段直接拒判（一个字都不写），不许带病落地。
-    $authStaleVals = @()
-    foreach ($av in ($authSnapVals | Sort-Object -Unique)) { if ((FpLabel $av) -ne $alignFp) { $authStaleVals += $av } }
+    # 源5 计划（§TOKEN-PERAACCT 拆枪后：owner-only，2026-10-31）
+    # 旧判据（§0926ROT-SRC5）把"快照里任何与源1不同指纹的值"都算待刷 ⇒ 一次把源1 铺给所有账号，
+    # 那正是 N2 的违例形态。现在只问一句话：**owner 那一条要不要刷**。
+    # 其它账号的在册钥匙是它们自己的事（签发走 -Issue/-RegisterAccount，撤销走 -RevokeAccount），
+    # 本条腿一律不碰；文件在位却解析失败＝结构不可信，计划阶段直接拒判（一个字都不写）。
+    $ownerTok5 = ""
+    if ($alignOwner -and $authSnapByUid.ContainsKey($alignOwner)) { $ownerTok5 = [string]$authSnapByUid[$alignOwner] }
+    $authOtherHolders = 0
+    foreach ($ok3 in $authSnapByUid.Keys) { if ($ok3 -ne $alignOwner) { $authOtherHolders++ } }
     $authAction5 = "same"
     if ($authParseErr) { $authAction5 = "parse-error" }
-    elseif (@($authSnapVals).Count -eq 0) { $authAction5 = "absent" }
-    elseif ($authStaleVals.Count -gt 0) { $authAction5 = "write" }
-    Info ("align src5 plan auth_snapshots action=" + $authAction5 + " n=" + @($authSnapVals).Count + " stale_kinds=" + @($authStaleVals).Count + " target_fp=" + $alignFp)
+    elseif (-not $alignOwner) { $authAction5 = "no-owner" }
+    elseif ($authSnapByUid.Count -eq 0 -or -not $ownerTok5) { $authAction5 = "absent" }
+    elseif ((FpLabel $ownerTok5) -eq $alignFp) { $authAction5 = "same" }
+    else { $authAction5 = "owner-write" }
+    Info ("align src5 plan auth_snapshots action=" + $authAction5 + " n=" + @($authSnapVals).Count + " owner_only=True other_holders=" + $authOtherHolders + " target_fp=" + $alignFp)
     if ($authAction5 -eq "parse-error") { Die "align src5 refused: auth.json 解析失败——结构不可信，一个字节都不写（读侧失明已标注）" }
+    if ($authAction5 -eq "no-owner") { Die "align src5 refused: config.xt.json 既没 owner_user_id 也没 user_id——不知道这把属于谁（先跑 -SetOwner <uid>）" }
     if ($DryRun) {
         Info "ALIGN_DRY plan-only above, nothing written. To really align rerun with -Align -Apply."
         exit 0
@@ -858,30 +877,34 @@ if ($Align) {
         }
         default   { Ok ("align src4 done token_fp=" + $alignFp + " action=absent (bridge not provisioned; write src1 value when it is)") }
     }
-    # ── 源5：auth.json 账号快照（§0926ROT-SRC5 写侧，2026-09-26 发版实录补腿）───────────
-    # 写形选择与源3 同 posture 但更简单：快照 value 是字符串化 JSON（内层引号全部转义），
-    # PS 反序列化重排会把整文件字段格式洗掉 ⇒ 一律**原文精确替换旧值**：token 是高熵字面量，
-    # 整文本 Replace 无误撞面；替换后仍三重自证——①提案可解析；②提案里带 token 的快照条数
-    # 不变且每条指纹命中源1；③字节差=计划预测量（出现计划外命中即拒写）。全过才落
-    # .pre-align 副本+原子写+复读自证。生效前提：auth store 启动时载入内存 ⇒ 必须重启 quant。
+    # ── 源5：auth.json 账号快照（§TOKEN-PERAACCT 拆枪后的 owner-only 写侧，2026-10-31）─────
+    # 旧写形＝"把原文里每个不同的旧 token 整体替换成源1，并要求提案里每条快照都命中源1"。
+    # 那是"一把铺给所有账号"时代的正确做法，在逐账号形态下**跑一次就同时违 N1/N2**：
+    # 别人的在册钥匙会被顺带洗成同一把，回报归属又回到按 users 顺序猜。
+    # 现在这条腿只做一件事：把 owner 那一条刷成源1。四道自证全过才落盘——
+    #   ① 复用 -Issue/-RevokeAccount 那把 uid 窗口刀（Set-SnapshotTokenRaw），条目外切不到；
+    #   ② 提案字节差 == 刀预测的 delta（计划外命中即拒）；
+    #   ③ 提案可解析 + owner 条目命中源1 + **每条非 owner 快照与读入时同指纹**（一条都不许被动）；
+    #   ④ 写后复读再走一遍 ③ 同样的逐条判据。
+    # owner 没有快照时不猜、不新建（那是引擎侧的写面）：拒判并指向设置页 / -Issue。
+    # 生效前提不变：auth store 只在启动时载入 ⇒ 真写过必须重启 quant。
     switch ($authAction5) {
-        "absent" { Ok ("align src5 done token_fp=" + $alignFp + " action=absent (auth.json 不在位或无带 token 快照)") }
-        "same"   { Ok ("align src5 done token_fp=" + $alignFp + " action=same (全部快照已与源1同值)") }
-        "write"  {
+        "absent"      { Ok ("align src5 done token_fp=" + $alignFp + " action=absent (auth.json 不在位、无带 token 快照，或 owner 那条还没有快照)") }
+        "same"        { Ok ("align src5 done token_fp=" + $alignFp + " action=same (owner 快照已与源1同值；其余条目是各自的在册钥匙，本轮不动)") }
+        "owner-write" {
+            if (-not $alignOwner) { Die "align src5 refused: owner 为空——不知道这把属于谁（先跑 -SetOwner <uid>）" }
             if (-not (Test-Path $authPath)) { Die ("align src5 refused: auth.json not found at " + $authPath + "（快照计数>0 而文件消失＝竞态形态，停手）") }
+            if (-not $ownerTok5) { Die ("align src5 refused: owner 在 auth.json 里没有带 token 的 quant_config_json_v1 快照——本脚本不猜也不新建（先去设置页保存或跑 -Issue）") }
             $authRaw5 = Get-Content -Path $authPath -Raw -Encoding UTF8
-            $authProp = $authRaw5
-            $authDeltaPlan = 0
-            foreach ($ov in ($authStaleVals | Sort-Object -Unique)) {
-                $oc = ([regex]::Matches($authRaw5, [regex]::Escape($ov))).Count
-                if ($oc -lt 1) { Die "align src5 refused: 旧值在原文中不出现（读写链不一致，拒写）" }
-                $authDeltaPlan += $oc * ($alignTok.Length - $ov.Length)
-                $authProp = $authProp.Replace($ov, $alignTok)
-            }
+            $authRes5 = $null
+            try { $authRes5 = Set-SnapshotTokenRaw -Raw $authRaw5 -Uid $alignOwner -OldTok $ownerTok5 -NewTok $alignTok }
+            catch { Die ("align src5 refused: " + $_.Exception.Message) }
+            $authProp = [string]$authRes5.text
+            if (($authProp.Length - $authRaw5.Length) -ne [int]$authRes5.delta) { Die "align src5 refused: 提案字节差与刀预测量不符（手术刀切到条目外，停手）" }
             $authChkObj = $null
             try { $authChkObj = $authProp | ConvertFrom-Json } catch { Die "align src5 refused: 提案文本解析不过（手术切坏形态，拒写）" }
-            if (($authProp.Length - $authRaw5.Length) -ne $authDeltaPlan) { Die "align src5 refused: 提案字节差与预测量不符（存在计划外命中，停手）" }
-            $chkN5 = 0
+            $chkOwn5 = 0
+            $chkOther5 = 0
             foreach ($cc in @($authChkObj.configs)) {
                 if ($null -eq $cc) { continue }
                 if ([string]$cc.key -ne 'quant_config_json_v1') { continue }
@@ -890,12 +913,20 @@ if ($Align) {
                 try { $cv = "$($cc.value)" | ConvertFrom-Json } catch { $cv = $null }
                 if ($null -eq $cv) { continue }
                 $ct = [string]$cv.qmt.token
-                if ($ct) {
-                    $chkN5++
-                    if ((FpLabel $ct) -ne $alignFp) { Die ("align src5 refused: 账号 " + [string]$cc.user_id + " 快照 token 在提案中仍未命中源1（手术刀不干净，拒写）") }
+                if (-not $ct) { continue }
+                $cu = [string]$cc.user_id
+                if ($cu -eq $alignOwner) {
+                    $chkOwn5++
+                    if ((FpLabel $ct) -ne $alignFp) { Die "align src5 refused: owner 快照在提案中未命中源1（切错位置嫌疑，拒写）" }
+                } elseif ($authSnapByUid.ContainsKey($cu)) {
+                    $chkOther5++
+                    if ((FpLabel $ct) -ne (FpLabel([string]$authSnapByUid[$cu]))) {
+                        Die ("align src5 refused: 账号 " + $cu + " 的在册钥匙被顺带改动——逐账号形态下这一条绝不允许（拒写，停手）")
+                    }
                 }
             }
-            if ($chkN5 -ne @($authSnapVals).Count) { Die ("align src5 refused: 提案中 token 快照条数变了（" + $chkN5 + " != " + @($authSnapVals).Count + "）") }
+            if ($chkOwn5 -ne 1) { Die ("align src5 refused: 提案里 owner 快照条数=" + $chkOwn5 + "（应为恰 1，无法唯一确定条目）") }
+            if ($chkOther5 -ne $authOtherHolders) { Die ("align src5 refused: 非 owner 快照条数变了（" + $chkOther5 + " != 读入时 " + $authOtherHolders + "）") }
             $authBak5 = $authPath + ".pre-align-" + $stamp
             Copy-Item -LiteralPath $authPath -Destination $authBak5 -Force
             $authTmp5 = $authPath + ".aligning-" + $stamp
@@ -903,7 +934,8 @@ if ($Align) {
             Move-Item -LiteralPath $authTmp5 -Destination $authPath -Force
             $authNow5 = $null
             try { $authNow5 = Get-Content -Path $authPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Die ("align src5 read-back parse failed（回滚副本: " + $authBak5 + "）") }
-            $rbN5 = 0
+            $rbOwn5 = 0
+            $rbOther5 = 0
             foreach ($rc in @($authNow5.configs)) {
                 if ($null -eq $rc) { continue }
                 if ([string]$rc.key -ne 'quant_config_json_v1') { continue }
@@ -912,13 +944,21 @@ if ($Align) {
                 try { $rv = "$($rc.value)" | ConvertFrom-Json } catch { $rv = $null }
                 if ($null -eq $rv) { continue }
                 $rt = [string]$rv.qmt.token
-                if ($rt) {
-                    $rbN5++
-                    if ((FpLabel $rt) -ne $alignFp) { Die ("align src5 read-back mismatch（回滚副本: " + $authBak5 + "）") }
+                if (-not $rt) { continue }
+                $ru = [string]$rc.user_id
+                if ($ru -eq $alignOwner) {
+                    $rbOwn5++
+                    if ((FpLabel $rt) -ne $alignFp) { Die ("align src5 read-back owner mismatch（回滚副本: " + $authBak5 + "）") }
+                } elseif ($authSnapByUid.ContainsKey($ru)) {
+                    $rbOther5++
+                    if ((FpLabel $rt) -ne (FpLabel([string]$authSnapByUid[$ru]))) {
+                        Die ("align src5 read-back 非 owner 条目变了（账号 " + $ru + "，回滚副本: " + $authBak5 + "）")
+                    }
                 }
             }
-            if ($rbN5 -ne @($authSnapVals).Count) { Die ("align src5 read-back count mismatch（回滚副本: " + $authBak5 + "）") }
-            Ok ("align src5 done token_fp=" + $alignFp + " action=written read-back confirmed, backup=.pre-align-" + $stamp + " (提醒：auth store 启动时载入，重启 quant 服务后方吃到新快照)")
+            if ($rbOwn5 -ne 1) { Die ("align src5 read-back owner 条数=" + $rbOwn5 + "（应为恰 1，回滚副本: " + $authBak5 + "）") }
+            if ($rbOther5 -ne $authOtherHolders) { Die ("align src5 read-back 非 owner 条数不符（" + $rbOther5 + " != " + $authOtherHolders + "，回滚副本: " + $authBak5 + "）") }
+            Ok ("align src5 done token_fp=" + $alignFp + " action=written owner_only=True others_untouched=" + $authOtherHolders + ", backup=.pre-align-" + $stamp + " (提醒：auth store 启动时载入，重启 quant 服务后方吃到新快照)")
         }
         default { Die ("align src5 refused: unknown action=" + $authAction5) }
     }

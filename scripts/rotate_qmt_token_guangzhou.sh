@@ -298,21 +298,32 @@ if [ "$MODE" = "alignapply" ]; then
     echo "  行内容：${SRC1_LINE:-取不到}"
     exit 1
   fi
-  # src5 复读腿（§0926ROT-SRC5）：写后 src5 行的指纹集合要么为空（tokens=none，无快照），
-  # 要么只含本轮对齐值——残留其它指纹＝账号级权威源没洗干净，周一会拿旧口令敲新网关，判失败。
+  # src5 复读腿（§TOKEN-PERAACCT 拆枪后：只判 owner 那一条，2026-10-31）
+  # 旧判据要求"src5 行里出现的每个指纹都等于对齐值"——那是"一把铺给所有账号"时代的口径，
+  # 在逐账号形态下会把别人合法的在册钥匙误判成分歧（红），或反过来逼着脚本去洗它们（资损面）。
+  # 现在只问：owner 那一条吃到源1 了没有？非 owner 的持有数如实回显，不参与判红。
   SRC5_LINE="$(printf '%s\n' "$LAST_OUT" | grep -m1 '\[rot\] src5 ' || true)"
   [ -n "$SRC5_LINE" ] || { echo "X 写后复读拿不到 src5 行——复核没做到，判失败。" >&2; exit 1; }
-  if printf '%s' "$SRC5_LINE" | grep -q 'tokens=sha256:'; then
-    if printf '%s' "$SRC5_LINE" | grep -oE 'sha256:[0-9a-f]{8}' | grep -v "sha256:${NEWFP}" | grep -q .; then
-      echo "X 写后复读 src5 快照指纹仍含非对齐值——分歧未清（取证：auth.json.pre-align-* 副本在位），判失败。" >&2
-      echo "  行内容：${SRC5_LINE}"
-      exit 1
-    fi
-  fi
-  echo "ok - 写后复读一致：源1==源3==源5(如有快照)==sha256:${NEWFP}（桥腿 ${BR_ACT:-unknown}，absent=未落位、落位时同法补齐）"
+  OFP="$(printf '%s' "$SRC5_LINE" | { grep -oE 'owner_fp=[^ ]+' || true; })"
+  OH="$(printf '%s' "$SRC5_LINE" | { grep -oE 'other_holders=[0-9]+' || true; })"
+  case "$OFP" in
+    "")        echo "X 写后复读的 src5 行没有 owner_fp= 读数——脚本与驱动的口径脱节（ps1 未随仓库落位？），判失败。" >&2
+               echo "  行内容：${SRC5_LINE}"
+               exit 1 ;;
+    "owner_fp=-")
+               echo "! src5 owner_fp 为空：owner 在 auth.json 里没有带 token 的快照（本轮 src5 属 absent）。"
+               echo "  这条不是对齐失败，但**该账号的实盘链路还没落上钥匙**——签发请走 -Issue 或设置页保存。" ;;
+    "owner_fp=sha256:${NEWFP}")
+               echo "ok - src5 owner 复读一致：owner_fp=sha256:${NEWFP}（${OH:-other_holders=?}）" ;;
+    *)         echo "X 写后复读 owner_fp != 本轮对齐值 sha256:${NEWFP}——owner 快照没吃到源1（取证：auth.json.pre-align-* 副本在位），判失败。" >&2
+               echo "  行内容：${SRC5_LINE}"
+               exit 1 ;;
+  esac
+  echo "ok - 写后复读一致：源1==源3==源5(owner 那一条)==sha256:${NEWFP}（桥腿 ${BR_ACT:-unknown}，absent=未落位、落位时同法补齐；非 owner 快照 ${OH:-?} 条按逐账号在册不动）"
   echo ""
   echo "  ── 对齐后的收尾口径 ──"
-  echo "  [1] 设置页此后仍是源3 的权威写入方：若再从设置页改 token，改完必须重跑本通道 -Align -Apply 复对齐（快照 src5 一并洗）；"
+  echo "  [1] 设置页仍是各账号快照的权威写入方：改了某个账号的 token 后，**只对那一个账号**补一次"
+  echo "      （-RegisterAccount <uid> 登记那把，或 -Issue <uid> 直接签发并两侧落）——不再有"把快照一并洗"这种动作；"
   echo "  [2] 桥落位（config.bridge.json 出现）后重跑一次 -Align -Apply 即补齐源4；"
   echo "  [3] 时序红线：网关/引擎进程重启必须晚于五侧同值确认——复核腿 verify 第 20 探针 token_fp_agree；"
   echo "  [4] 本轮 src5 真写过（action=write）⇒ 引擎的 auth store 只在启动时载入，须重启 quant 服务账号快照才吃到（跑一次 scripts/deploy_guangzhou.sh -s 即拉起）。"

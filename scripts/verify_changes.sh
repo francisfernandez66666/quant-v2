@@ -2898,6 +2898,53 @@ if [ "$B143_V2" != "0" ]; then
 	B143_FAILED=1
 fi
 echo "ok - §143 反证 V2（缺省 -Align 分支整段无写盘原语 + 必须自带 exit；注入写盘、摘掉出口两处全红）"
+# 反证腿 V3（§TOKEN-PERAACCT 拆枪：src5 写侧只能刷 owner 那一条）。
+# 判据与 ⑧ 那组同源：出现"把所有不同旧值整体替换成源1"的任何一种写法 ⇒ 红。
+# 为什么不能只 grep 一句中文注释：旧枪的本体是**数据流**（收集 stale 值 → 全文 Replace →
+# 要求每条快照等于源1），换个注释它照样能跑。
+B143_V3=0
+python3 - deploy/qmt-win/rotate_qmt_token.ps1 <<'PYV3' || B143_V3=1
+import re, sys
+
+SPREAD = (r'authStaleVals', r'\$authProp\s*=\s*\$authProp\.Replace\(', r'stale_kinds')
+OWNER_ONLY = (r'Set-SnapshotTokenRaw -Raw \$authRaw5 -Uid \$alignOwner',
+              r'owner_fp=', r'action=written owner_only=True')
+
+
+def check(t):
+    for pat in SPREAD:
+        if re.search(pat, t):
+            return 'src5 写侧又出现"把所有快照洗成源1"的形态：' + pat
+    for pat in OWNER_ONLY:
+        if not re.search(pat, t):
+            return 'owner-only 判据缺一枚：' + pat
+    return None
+
+
+t = open(sys.argv[1], encoding='utf-8').read()
+red = check(t)
+if red is not None:
+    print('POSITIVE_FAILED: ' + red)
+    raise SystemExit(1)
+m = re.search(r'\$authRaw5 = Get-Content -Path \$authPath -Raw -Encoding UTF8\n', t)
+if not m:
+    print('ANCHOR_MISSING: 找不到 src5 写侧入口那行，反证没法注入')
+    raise SystemExit(1)
+inj = '            $authStaleVals = @()\n            $authProp = $authProp.Replace($ov, $alignTok)\n'
+if check(t[:m.end()] + inj + t[m.end():]) is None:
+    print('MUTATION_STILL_GREEN: 把旧枪的收集+全文替换注回去仍然判绿')
+    raise SystemExit(1)
+if check(t.replace('Set-SnapshotTokenRaw -Raw $authRaw5 -Uid $alignOwner', 'Set-SnapshotTokenRaw -Raw $authRaw5', 1)) is None:
+    print('MUTATION_STILL_GREEN: 摘掉 -Uid（不再按 owner 条目切）仍然判绿')
+    raise SystemExit(1)
+raise SystemExit(0)
+PYV3
+if [ "$B143_V3" != "0" ]; then
+	echo "--- FAIL: §143 反证 V3（src5 owner-only 判据不成立，或注入旧枪/摘掉 -Uid 后仍判绿＝这条锁是摆设）"
+	FAIL=1
+	B143_FAILED=1
+fi
+echo "ok - §143 反证 V3（src5 写侧只认 owner 条目；注入全文替换、摘掉 -Uid 两处全红）"
 # 负锁：轮换脚本不得把新 token 明文写进任何输出（本仓库铁律：输出只准键名/计数/指纹）。
 if grep -qE '\+ \$newToken|\$\{newToken\}' deploy/qmt-win/rotate_qmt_token.ps1; then
 	echo "--- FAIL: 轮换脚本出现回显新 token 明文的路径"; exit 1; fi
@@ -17342,7 +17389,24 @@ grep -q 'self.owner_user_id or self.user_id,' qmt_gateway/gateway.py || fail143 
 grep -q 'payload\["credential_accounts"\]' qmt_gateway/gateway.py || fail143 "/health 没报在册钥匙数（一把铺给所有账号的旧形态就看不见）"
 grep -q 'payload\["report_token_fallback_total"\]' qmt_gateway/gateway.py || fail143 "/health 没报出向钥匙回退次数（引擎与网关注册表漂移会静默）"
 
+# —— ⑧ 拆 first-match 那半颗雷（Go 归属两趟）+ 拆 -LegacySpread 那把枪（src5 owner-only）——
+CNT143=$((CNT143 + 1))
+grep -q 'StoredQMTConfigFor(u.ID)' internal/server/qmt.go || fail143 "归属解析没有'先认自有钥匙'那一趟（全局兜底一有值就退回按 users 顺序猜）"
+grep -q 'tokenInheritedAttributionWarn' internal/server/qmt.go || fail143 "继承那条腿不再有名留痕（N1 被破坏时现场看不见）"
+grep -q 'func TestOwnedTokenWinsOverInheritedMatch' internal/server/token_per_account_test.go || fail143 "自有钥匙优先于继承这条没有回归锁"
+grep -q 'func TestReportAttributionFollowsTheToken' internal/server/token_per_account_test.go || fail143 "多把在册钥匙唯一命中没有回归锁"
+if grep -q 'cfgToken := s.cfg.GetRulesFor(u.ID).QMT.Token' internal/server/qmt.go; then
+	fail143 "userForQMTToken 又回到单趟 GetRulesFor（继承值能冒充自有钥匙＝first-match 复活）"
+fi
+# 轮换脚本的 src5 写侧：只许刷 owner 那一条；旧的"每个不同旧值整体替换成源1"就是那把枪本体
+grep -q 'Set-SnapshotTokenRaw -Raw $authRaw5 -Uid $alignOwner' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "-Align 的 src5 写侧不再按 owner 条目切（回到整文件 Replace＝一次铺给所有账号）"
+grep -q 'owner_fp=' deploy/qmt-win/rotate_qmt_token.ps1 || fail143 "src5 读侧不再单独报 owner 指纹（驱动只能靠'全部同值'这种旧判据）"
+grep -q 'owner_fp=sha256:${NEWFP}' scripts/rotate_qmt_token_guangzhou.sh || fail143 "驱动写后复读不再判 owner 那一条（两侧口径脱节，或把别人的在册钥匙误判成分歧）"
+if grep -q 'authStaleVals\|stale_kinds' deploy/qmt-win/rotate_qmt_token.ps1; then
+	fail143 "拆掉的旧枪又回来了（authStaleVals/stale_kinds 是'把所有快照洗成源1'的判据与写形）"
+fi
+
 [ "$B143_FAILED" = "0" ] || exit 1
-echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1，累计判定点 ${CNT143}）"
+echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1 + 拆 first-match 与拆枪 1 + 反证 V3（旧枪注回/摘掉 -Uid 必红）1，累计判定点 ${CNT143}）"
 
 echo "==> 全部通过"

@@ -286,6 +286,43 @@ func TestForgedBodyUidCannotMoveTheBook(t *testing.T) {
 	}
 }
 
+// TestOwnedTokenWinsOverInheritedMatch §TOKEN-PERAACCT 拆 first-match 那半颗雷（2026-10-31）。
+// 旧实现只有一趟：`GetRulesFor()` 对没落过覆盖的账号回退全局兜底，所以全局有值时
+// **所有无覆盖账号都"持有"同一把**，归属命中谁全看 users 顺序。现分两趟：
+// ① 这把钥匙写在谁的自有快照里 → 归谁（不受顺序影响）；
+// ② 谁都没有这把、只有兜底位有 → 仍按老形态解析（单账号旧部署不许因为这次改动变成 401）。
+func TestOwnedTokenWinsOverInheritedMatch(t *testing.T) {
+	s, admin := newAdminTestServer(t)
+	seedGlobalQMTKey(t, s, "PROD-KEY")
+	member, err := s.auth.CreateUser("member4", "pw-member4", "user", nil, 0)
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	// admin 排在 users 第一个且不落自己的快照 ⇒ 旧实现里它靠继承就能抢走归属
+	if got := s.cfg.GetQMTConfigFor(admin.ID).Token; got != "PROD-KEY" {
+		t.Fatalf("前置条件不成立：admin 应仍是继承形态（读得到 PROD-KEY）, got %q", got)
+	}
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost,
+		"/api/admin/users/"+member.ID+"/config/qmt", `{"token":"PROD-KEY"}`)); rr.Code != 200 {
+		t.Fatalf("显式签发 PROD-KEY 给 member 期望 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := s.userForQMTToken("PROD-KEY"); got != member.ID {
+		t.Fatalf("§TOKEN-PERAACCT：自有这把钥匙的账号被继承账号抢走归属（got=%q want=%q）", got, member.ID)
+	}
+
+	// ② 纯继承形态：把 member 那把摘掉，此刻只有全局兜底持有它 ⇒ 仍必须能解析出某个账号
+	if rr := adminDo(s, adminReq(s, admin, http.MethodPost,
+		"/api/admin/users/"+member.ID+"/config/qmt", `{"token":""}`)); rr.Code != 200 {
+		t.Fatalf("撤销 member 期望 200, got %d", rr.Code)
+	}
+	if got := s.userForQMTToken("PROD-KEY"); got == "" {
+		t.Fatalf("兼容腿破了：旧形态（只有全局兜底有值）现在解析不出账号 ⇒ 现网升级即所有回报 401")
+	}
+	if got := s.userForQMTToken("KEY-NOBODY"); got != "" {
+		t.Fatalf("未登记的钥匙必须无匹配, got %q", got)
+	}
+}
+
 // TestMaskedTokenEchoDoesNotWipeOwnKey 前端回显的掩码串既不改写真值，也不触发撤销。
 func TestMaskedTokenEchoDoesNotWipeOwnKey(t *testing.T) {
 	s, admin := newAdminTestServer(t)

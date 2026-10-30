@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/auth"
@@ -136,24 +137,56 @@ func (s *Server) qmtReportMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// tokenInheritedAttributionWarn 守"归属走了继承那条腿"这条告警只打一次（进程级）。
+// 为什么必须一次性：旧形态单账号部署里每条回报都会走继承腿，逐条打会把日志刷满、
+// 反而把真正的一次性异常淹掉；持续告警的活儿属于部署第 20 探针 R3，不属于这里。
+var tokenInheritedAttributionWarn sync.Once
+
 // userForQMTToken 返回持有给定 QMT 网关 token 的账号 ID（遍历账号的 QMT 配置）；无匹配返回空串。
 // §GAP2-W1 比对方式改为 subtle.ConstantTimeCompare（常量时间），与 auth.go 的 token 校验同口径，
 // 消除字节级时序侧信道；同时跳过未配置 token 的账号（空串配置不应匹配空请求头之外的任何值）。
 // English: returns the account ID whose QMT config carries the given gateway token; "" when none.
 // §GAP2-W1: comparison switched to subtle.ConstantTimeCompare (constant-time, same as auth.go),
 // removing the byte-level timing side channel; accounts without a configured token are skipped.
+//
+// §TOKEN-PERAACCT（2026-10-31，拆 first-match 那半颗雷）：**先只认"这把钥匙写在这个账号自己的
+// 快照里"**——那是逐账号形态的正常来源。旧实现只有一趟 `GetRulesFor()`，而它对"没落过账号覆盖"的
+// 账号会回退到系统级键/全局 `rules.qmt`（[internal/config/config.go:3354](../internal/config/config.go#L3354)），
+// 于是全局兜底位一旦有值，**所有无覆盖的账号都"持有"同一把**，反查命中谁全看 users 顺序——
+// 10-30 双份账就是这么归到 admin 名下的。现把两趟分开：自有钥匙优先；只有谁也自有这把钥匙时
+// 才允许走继承那条老路（单账号旧部署的行为一字不变，不制造"改了配置就 401"的半态）。
+// 继承命中同时打一条日志：它等于 N1（全局兜底不该持有实盘凭证）被破坏的现场信号，
+// 现网正常情况下永远不该出现这条（第 20 探针 R3 也会判红）。
 func (s *Server) userForQMTToken(token string) string {
 	if s.cfg == nil || token == "" {
 		return "" // 配置层未接入/请求未带 token：直接无匹配
 	}
-	// 遍历所有账号：取每个账号 rules.qmt.token 与请求 token 常量时间比对。
-	// 账号量级有限（<百），线性扫描可接受；命中即返回（token 与账号一一对应）。
+	// 第一趟：账号**自己落过盘**的那把钥匙才算归属（逐账号形态）。
 	for _, u := range s.auth.ListUsers() {
-		cfgToken := s.cfg.GetRulesFor(u.ID).QMT.Token
-		if cfgToken == "" {
-			continue // 未配置网关 token 的账号不参与比对（避免空值误配）
+		own, stored := s.cfg.StoredQMTConfigFor(u.ID)
+		if !stored || strings.TrimSpace(own.Token) == "" {
+			continue // 它没有自有凭证，参与比对只会把继承值当成"它的钥匙"
 		}
-		if subtle.ConstantTimeCompare([]byte(cfgToken), []byte(token)) == 1 {
+		if subtle.ConstantTimeCompare([]byte(own.Token), []byte(token)) == 1 {
+			return u.ID
+		}
+	}
+	// 第二趟：兼容"只有全局兜底、没有任何账号覆盖"的旧形态（单账号部署）。
+	for _, u := range s.auth.ListUsers() {
+		if own, stored := s.cfg.StoredQMTConfigFor(u.ID); stored && strings.TrimSpace(own.Token) != "" {
+			continue // 已有自有钥匙的账号不参与继承匹配，免得抢走别人的归属
+		}
+		eff := strings.TrimSpace(s.cfg.GetRulesFor(u.ID).QMT.Token)
+		if eff == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(eff), []byte(token)) == 1 {
+			// 只打一次：旧形态单账号部署里**每条回报**都会走这条腿，逐条打会把日志刷满
+			// 反而看不见真正的一次性异常；持续告警由第 20 探针 R3 负责，不是靠这里刷日志。
+			tokenInheritedAttributionWarn.Do(func() {
+				log.Printf("[qmt] §TOKEN-PERAACCT 归属走的是**继承**那条腿 target=%s：全局/系统级兜底位"+
+					"仍持有这把凭证（N1 被破坏的现场信号，应 -ClearGlobal；持续判定交给第 20 探针 R3）", u.ID)
+			})
 			return u.ID
 		}
 	}
