@@ -2484,7 +2484,29 @@ grep -qE 'param\(\[string\]\$Exe, \[string\[\]\]\$CmdArgs\)' deploy/qmt-win/back
 # 任何位置（含注释）都会诱导人工去转行尾、制造仓库与现网字节不一致（§BOM-REPO 同族）。
 if grep -qF 'ps1_bom 归一（UTF-8 单 BOM + CRLF）' deploy/qmt-win/backup_snapshot.ps1; then
 	echo "--- FAIL: backup_snapshot.ps1 重新声称 ps1_bom 会转 CRLF"; exit 1; fi
-echo "ok - §P0-B-HEADROOM 守卫通过（探针正锁 2 + 阈值等值锁 1 + 负锁 3）"
+# §PRUNE-EXEBAK（2026-10-31 owner 令「安全扩大每日清理范围」）：清理面变大＝权限变大，逐条钉死。
+# 为什么不只锁"脚本还在"：这组一旦跑偏，删掉的是**回滚件**（quant.exe.bak 就是上一次部署留的退路），
+# 而后果要到下一次想回滚时才发现——那种"当时绿、事后才知道坏"的锁本仓已吃过多次。
+PRUNE_PS1=deploy/qmt-win/prune_logs.ps1
+grep -qE '\[int\]\$ExeBakKeep = 2' "$PRUNE_PS1" \
+	|| { echo "--- FAIL: §72 二进制备份每组保留数默认值丢了（ExeBakKeep=2＝留最近两份可回滚）"; exit 1; }
+grep -qE '\[int\]\$ExeBakMinAgeDays = 7' "$PRUNE_PS1" \
+	|| { echo "--- FAIL: §72 二进制备份年龄闸丢了（不足 7 天不删＝刚做的那次回滚件安全）"; exit 1; }
+grep -qF -- '-ne "C:\opt\quant"' "$PRUNE_PS1" \
+	|| { echo "--- FAIL: §72 第三组的根目录硬护栏丢失（删除面必须锁死在 C:\opt\quant）"; exit 1; }
+grep -qF -- "-notmatch '\.db|\.jsonl|\.json'" "$PRUNE_PS1" \
+	|| { echo "--- FAIL: §72 第三组的文件名复筛丢失（将来有人改 -Filter 时会把库/账本一起卷进来）"; exit 1; }
+# 负锁：这组不许伸手去拿"别人有主的轮转件"——task_logs 归调度器 §P1-12（30 天），
+# verdicts-*.jsonl 归周日 lifecycle（JsonlKeepDays=14）。两处各管各的＝两本账，本仓反复判过的形态。
+if grep -qE 'Get-ChildItem[^\n]*(task_logs|verdicts-)' "$PRUNE_PS1"; then
+	echo "--- FAIL: §72 prune_logs 又把删除面扩到 task_logs / verdicts（那两个各有自己的轮转，叠层必成两本账）"; exit 1; fi
+# 两侧同源：RUNBOOK 的运维表必须写明这组的族/年龄闸，数字与脚本等值（照抄数字进文档不算锁）。
+grep -qF 'ExeBakKeep=2' docs/RUNBOOK_QMT_DAILY.md \
+	|| { echo "--- FAIL: §72 RUNBOOK 未同步 exe.bak 的保留口径（ExeBakKeep=2）"; exit 1; }
+grep -qF 'ExeBakMinAgeDays=7' docs/RUNBOOK_QMT_DAILY.md \
+	|| { echo "--- FAIL: §72 RUNBOOK 未同步 exe.bak 的年龄闸（ExeBakMinAgeDays=7）"; exit 1; }
+echo "ok - §72 清理扩围锁通过（第三组默认值 2 + 根目录护栏 1 + 复筛 1 + 负锁 1 + 两侧同源 2）"
+echo "ok - §P0-B-HEADROOM 守卫通过（探针正锁 2 + 阈值等值锁 1 + 负锁 3 + 清理扩围 6）"
 
 # ── 73. §SNAP-LOCK 快照单写者锁（2026-09-23 当日自曝缺陷的收口 + 防"保护自己变成新停更入口"）──
 # 现象：部署步 [2e] 里直跑的一次首跑被 SSH 中断留下孤儿 powershell，随后计划任务又被触发，第二次的
@@ -3002,67 +3024,6 @@ raise SystemExit(0)
 PYV4
 if [ "$B143_V4" != "0" ]; then
 	echo "--- FAIL: §143 反证 V4（驱动判读缺一条，或摘掉判红分支/永不匹配/注回旧判据后仍判绿＝这条锁是摆设）"
-	FAIL=1
-	B143_FAILED=1
-fi
-echo "ok - §143 反证 V4（驱动认 ALIGN_NO_SPREAD 与只判 owner_fp；摘兜底、永不匹配、注回旧判据三处全红）"
-# 反证腿 V4（驱动侧那两条新判据必须"删了会红"，2026-10-31 拆枪配套）。
-# 为什么单独立一条：ps1 的写形改完之后，真正决定运维会不会踩坑的是**驱动的判读**——
-# ①认不认缺省形态的 ALIGN_NO_SPREAD（不认就把"一条都没写"报成"半态待回滚"）；
-# ②写后复读只判 owner_fp（改成"每个指纹都要等于对齐值"会去逼着洗别人的在册钥匙＝资损面）。
-# 这两条原来只有静态 grep 锚点：把 case 里那条 `*)` 判红分支整段删掉，锚点照样绿＝摆设。
-B143_V4=0
-python3 - scripts/rotate_qmt_token_guangzhou.sh <<'PYV4'
-import re, sys
-
-NEED = {
-    '缺省形态识别（ALIGN_NO_SPREAD 那条 grep）': r"grep -qF 'ALIGN_NO_SPREAD'",
-    'owner_fp 判读四态的 case 头': r'case "\$OFP" in',
-    'owner_fp 一致那条腿': r'"owner_fp=sha256:\$\{NEWFP\}"',
-    'owner_fp 不匹配必判红的兜底分支': r'\*\)\s+echo "X 写后复读 owner_fp != 本轮对齐值',
-}
-FORBID = {
-    # 旧判据"src5 出现的每个指纹都必须等于对齐值"——逐账号形态下这是逼着去洗别人的钥匙
-    '又回到"src5 全部指纹必须同值"的旧判据': r'src5 快照指纹仍含非对齐值',
-}
-
-
-def check(t):
-    for name, pat in NEED.items():
-        if not re.search(pat, t):
-            return '驱动判读缺一条：' + name
-    for name, pat in FORBID.items():
-        if re.search(pat, t):
-            return name
-    return None
-
-
-t = open(sys.argv[1], encoding='utf-8').read()
-red = check(t)
-if red is not None:
-    print('POSITIVE_FAILED: ' + red)
-    raise SystemExit(1)
-# 反证①：摘掉 owner_fp 不匹配的兜底判红分支（改成"照打一行 ok"）⇒ 必红
-m = re.search(r'    \*\)\s+echo "X 写后复读 owner_fp != 本轮对齐值[^"]*"[^\n]*', t)
-if not m:
-    print('ANCHOR_MISSING: 抓不到 owner_fp 的 *) 分支，反证没法注入')
-    raise SystemExit(1)
-if check(t[:m.start()] + '    *)         echo "ok - 兜底被摘掉（反证注入）"\n' + t[m.end():]) is None:
-    print('MUTATION_STILL_GREEN: 摘掉 owner_fp 不匹配的判红分支后仍判绿')
-    raise SystemExit(1)
-# 反证②：把缺省形态识别改成永不匹配 ⇒ 必红（等价于"驱动不认这条锚点"）
-if check(t.replace("grep -qF 'ALIGN_NO_SPREAD'", "grep -qF 'NEVER_MATCH_ZZ_V4'", 1)) is None:
-    print('MUTATION_STILL_GREEN: 驱动不再认 ALIGN_NO_SPREAD 也照样判绿')
-    raise SystemExit(1)
-# 反证③：把旧判据那行注回去 ⇒ 必红（负锁真的在守）
-if check(t.replace('  echo "ok - 写后复读一致：',
-                   '  echo "X 写后复读 src5 快照指纹仍含非对齐值"\n  echo "ok - 写后复读一致：', 1)) is None:
-    print('MUTATION_STILL_GREEN: 旧的"全部指纹同值"判据被注回仍判绿')
-    raise SystemExit(1)
-raise SystemExit(0)
-PYV4
-if [ "$B143_V4" != "0" ]; then
-	echo "--- FAIL: §143 反证 V4（驱动那两条新判据不成立，或摘掉判红分支/永不匹配/注回旧判据后仍判绿＝这条锁是摆设）"
 	FAIL=1
 	B143_FAILED=1
 fi
