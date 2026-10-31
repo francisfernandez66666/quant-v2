@@ -22,6 +22,7 @@ import LoadFailBanner from '../components/LoadFailBanner.jsx'
 // with an uncaught ReferenceError (no toast at all). Import added.
 import { showToast } from '../ui.jsx'
 import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（cost 不再冒充现价）
+import { canStrict } from '../utils/perm.js'
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -203,14 +204,15 @@ export default function Positions() {
   // closeHolding/sellHoldingLot/holdings/balance）与实盘读（/api/positions/real 系）后端均为
   // admin 守卫（server.go:629-634/660-662）；成员点击必 403。前端按 admin 收敛写入口、
   // 实盘 tab 显示无权限面板（此前 403 被 loadReal 的 catch 静默吞成"空表"，误导为无持仓）。
-  const admin = api.isAdmin()
+  const canFundsWrite = canStrict('funds_admin')
+  const canTrading = canStrict('trading_admin')
   // §FIX-20261028-F09：实盘三段拉取的失败台账（失败请名到腿、成功即销案、不清旧读数）
   const ledger = useLoadLedger()
 
   // §N-09：纸面/实盘两条轮询统一走 usePolling——后台暂停、恢复补一次、卸载清理。
   // 实盘只在 admin 且当前标签为「实盘」时轮询（与旧 switchBook 的启停语义一致）。
   usePolling(load, 60000, bookTab === 'paper')
-  usePolling(loadReal, 60000, admin && bookTab === 'real')
+  usePolling(loadReal, 60000, canTrading && bookTab === 'real')
 
   // 纸面持仓轮询定时器（30s）
   // 纸面/实盘轮询均交给 §N-09 的 usePolling，不再使用页面级定时器 ref
@@ -637,7 +639,7 @@ export default function Positions() {
   // 现在接仓里统一的"按腿记账"设施（useLoadLedger）：失败只点名那一腿、不清旧数据，
   // 成功即销案；页头用共享的 LoadFailBanner 渲染（testid=load-ledger 全站唯一）。
   async function loadReal() {
-    if (!admin) return // §PERM-GATE：成员无实盘读权限（admin 守卫），不发起必 403 的请求
+    if (!canTrading) return // §PERM-GATE：无 trading_admin 不发起必 403 的实盘读
     const token = realGuard.current.begin() // §M-10 本轮代号（三段拉取共用一次判定）
     const failMsg = (e) => (e && e.message ? String(e.message) : '请求失败')
     try {
@@ -845,7 +847,7 @@ export default function Positions() {
     // §0929GATE-403：这条此前是本页唯一没走 admin 预过滤的实盘读——GET /api/positions/advice
     // 在 adminMiddleware 下（server.go:772），成员一挂载就吃一条 403 并被 catch 静默吞掉
     // （既灌 opslog 又让人不知道发生了什么）。与 loadReal() 的 §PERM-GATE 同口径早退。
-    if (admin) {
+    if (canTrading) {
       api.fetchRealAdvice().then((r) => {
         if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices)
       }).catch(() => {}) // §P2-J 可吞：建议列是增强信息，失败时保留上一轮映射（§F-6 口径）
@@ -896,11 +898,11 @@ export default function Positions() {
     // 操作列：加减仓/改成本/明细/编辑/清仓（写操作 admin 守卫，成员仅留只读明细/分时）
     { colKey: 'actions', title: '操作', width: 230, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center', flexWrap: 'wrap' }}>
-        {admin && <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openAddLot(row) }}>加减仓</Button>}
-        {admin && <Button size="small" variant="outline" theme="warning" onClick={(e) => { e.stopPropagation(); openSetCost(row) }}>改成本</Button>}
+        {canFundsWrite && <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openAddLot(row) }}>加减仓</Button>}
+        {canFundsWrite && <Button size="small" variant="outline" theme="warning" onClick={(e) => { e.stopPropagation(); openSetCost(row) }}>改成本</Button>}
         <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); showLotsFor(row) }}>明细</Button>
-        {admin && <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); editHolding(row) }}>编辑</Button>}
-        {admin && <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); openCloseHolding(row) }}>清仓</Button>}
+        {canFundsWrite && <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); editHolding(row) }}>编辑</Button>}
+        {canFundsWrite && <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); openCloseHolding(row) }}>清仓</Button>}
       </div>
     ) },
   ]
@@ -975,14 +977,14 @@ export default function Positions() {
                     （testid 两处互斥同值，UAT §E1 展示腿不依赖栈内是否有实盘数据）。 */}
                 <div data-testid="paper-pnl-summary" className={totalPnl == null || totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
                   总盈亏: {paperPnlShown}
-                  {admin && (
+                  {canFundsWrite && (
                     <Button size="small" variant="outline" theme="default" onClick={resetPnl}
                       title={`点击后按后端算式把总盈亏校准为 0（偏移 ¥${(pnlOffset || 0).toFixed(2)} → 当前总盈亏，入库留痕）`}
                       style={{ marginLeft: 8 }}>清零</Button>
                   )}
                 </div>
                 {!editingBalance
-                  ? (admin
+                  ? (canFundsWrite
                     ? <div onClick={editBalanceStart} style={{ cursor: 'pointer' }}>可用资金: ¥{availableBalance.toFixed(2)} ✏️</div>
                     : <div>可用资金: ¥{availableBalance.toFixed(2)}</div>)
                   : <InputNumber value={balanceInputVal} min={0} step={0.01} onBlur={editBalanceSave} onEnter={editBalanceSave} onChange={(v) => setBalanceInputVal(Number(v) || 0)} style={{ width: 160 }} autoFocus />}
@@ -1005,7 +1007,7 @@ export default function Positions() {
                 {dirtyCodes.size} 项未落库
               </Tag>
             )}
-            {admin && <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>}
+            {canFundsWrite && <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>}
           </div>
         </div>
       </Card>
@@ -1024,7 +1026,7 @@ export default function Positions() {
                 <span className="muted" style={{ fontSize: 12, marginRight: 4 }}>纸面</span>
                 总盈亏: {paperPnlShown}
               </span>
-              {admin && (
+              {canFundsWrite && (
                 <Button size="small" variant="outline" theme="default" onClick={resetPnl}
                   title="点击后按后端算式把纸面总盈亏校准为 0（偏移入库留痕）">清零</Button>
               )}
@@ -1085,7 +1087,7 @@ export default function Positions() {
         <Tabs.TabPanel value="real" label={realTripped ? '实盘持仓 !' : '实盘持仓'}>
           {/* §PERM-GATE 20260918：实盘读端点均 admin 守卫（server.go:660-662），成员 403 曾被
               loadReal 的 catch 静默吞成"空表"——改为显式无权限面板，与 Quant 页姿势一致 */}
-          {!admin ? (
+          {!canTrading ? (
             <Card>
               <div style={{ padding: 18, borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
                 🔒 无权限访问实盘持仓：当前登录「{api.getAccount() || '未知'}」为普通用户，实盘账本仅管理员账号可见。
@@ -1149,11 +1151,11 @@ export default function Positions() {
       <Dialog visible={!!sheetHolding} header={(sheetHolding ? sheetHolding.code : '') + ' ' + (sheetHolding ? sheetHolding.name : '')} onClose={() => setSheetHolding(null)} footer={false}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <Button variant="outline" theme="primary" onClick={() => { if (sheetHolding) toggleKline(sheetHolding.code); setSheetHolding(null) }}>{sheetHolding && klineOpen.has(sheetHolding.code) ? '收起分时' : '展开分时'}</Button>
-          {admin && <Button variant="outline" theme="primary" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openAddLot(h) }}>加减仓</Button>}
-          {admin && <Button variant="outline" theme="warning" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openSetCost(h) }}>改成本</Button>}
+          {canFundsWrite && <Button variant="outline" theme="primary" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openAddLot(h) }}>加减仓</Button>}
+          {canFundsWrite && <Button variant="outline" theme="warning" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openSetCost(h) }}>改成本</Button>}
           <Button variant="outline" theme="default" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) showLotsFor(h) }}>加仓明细</Button>
-          {admin && <Button variant="outline" theme="default" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) editHolding(h) }}>编辑持仓</Button>}
-          {admin && <Button variant="outline" theme="danger" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openCloseHolding(h) }}>清仓</Button>}
+          {canFundsWrite && <Button variant="outline" theme="default" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) editHolding(h) }}>编辑持仓</Button>}
+          {canFundsWrite && <Button variant="outline" theme="danger" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openCloseHolding(h) }}>清仓</Button>}
           <Button theme="default" onClick={() => setSheetHolding(null)}>取消</Button>
         </div>
       </Dialog>

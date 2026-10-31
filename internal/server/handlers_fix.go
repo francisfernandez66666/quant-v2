@@ -1010,7 +1010,7 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 	if userID == "" {
 		userID = s.operatorID()
 	}
-	acc, _ := s.realDB().GetRealAccount(userID)
+	acc, _ := s.realAccountFor(userID)
 	holdings, realized, unrealized, offset, offErr := s.paperPnlTotals(userID)
 	resp := map[string]interface{}{
 		"holdings":             holdings,
@@ -1084,7 +1084,12 @@ func (s *Server) handleFixPnlOffset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	userID := s.operatorID()
+	// §MULTI-ADMIN：账户级写面按请求者归属，不再落到运营账号 operatorID。
+	userID := requestUserID(r)
+	if userID == "" {
+		writeError(w, http.StatusForbidden, "无法确定账号")
+		return
+	}
 	_, realized, unrealized, oldOff, offErr := s.paperPnlTotals(userID)
 	if offErr != nil {
 		writeError(w, 500, "当前偏移量读数失败，拒绝校准（避免把错误读数摞进留痕账）: "+offErr.Error())
@@ -1108,7 +1113,7 @@ func (s *Server) handleFixPnlOffset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 留痕双写：DB 行为主账，opslog 让"有人动过盈亏读数"在日常运维日志里也看得见
-	opslog.Logf("quant", "§E1 纸面盈亏校准：账号 %s 偏移 %.2f → %.2f（%s）", userID, oldOff, rec.Offset, note)
+	opslog.Logf("quant", "§E1 纸面盈亏校准：actor=%s target=%s 偏移 %.2f → %.2f（%s）", userID, userID, oldOff, rec.Offset, note)
 	writeJSON(w, 200, map[string]interface{}{"status": "ok", "pnl_offset": rec.Offset, "id": rec.ID})
 }
 
@@ -1133,8 +1138,13 @@ func (s *Server) handleFixSetBalance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "available_balance must be >= 0")
 		return
 	}
-	uid := s.operatorID()
-	acc, _ := s.realDB().GetRealAccount(uid)
+	// §MULTI-ADMIN：写面按请求者归属；运营账号保留 legacy 全局行兜底，其他账号只看自己的行。
+	uid := requestUserID(r)
+	if uid == "" {
+		writeError(w, http.StatusForbidden, "无法确定账号")
+		return
+	}
+	acc, _ := s.realAccountFor(uid)
 	// 只改可用资金，保留冻结/总资产/市值（下一次网关 account 回报会整体覆盖，网关优先）
 	acc.UserID = uid
 	acc.AvailableCash = req.AvailableBalance
@@ -1142,7 +1152,18 @@ func (s *Server) handleFixSetBalance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "save balance failed: "+err.Error())
 		return
 	}
+	opslog.Audit("holdings_balance_set", uid, uid, fmt.Sprintf("available_balance=%.2f", r2(acc.AvailableCash)))
 	writeJSON(w, 200, map[string]interface{}{"status": "ok", "available_balance": r2(acc.AvailableCash)})
+}
+
+// realAccountFor 账户级资金读取：运营账号保留 user_id=” 的遗留全局行兜底；
+// 其他账号只读自己的行，避免“没有自己的 real_account 行时读到运营/遗留资金”。
+// English: account-scoped cash lookup — legacy global row only for the operator, own row otherwise.
+func (s *Server) realAccountFor(uid string) (store.RealAccount, error) {
+	if uid != "" && uid == s.operatorID() {
+		return s.realDB().GetRealAccount(uid)
+	}
+	return s.realDB().GetRealAccountOwn(uid)
 }
 
 // holdingSource §C7 持仓价格来源三态：有有效行情=live；无行情但成本>0=cost（不是现价）；
@@ -1276,9 +1297,13 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// 自选股/持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 写入与隔离。
-	uid := s.operatorID()
-	// 手动持仓 ID 按运营账号隔离：code_operatorID_fix（空账号兼容旧格式 code_fix）
+	// §MULTI-ADMIN：持仓写面按请求者归属；第二个 admin/成员不得改写运营账号的持仓。
+	uid := requestUserID(r)
+	if uid == "" {
+		writeError(w, http.StatusForbidden, "无法确定账号")
+		return
+	}
+	// 手动持仓 ID 按请求者账号隔离：code_<uid>_fix（空账号兼容旧格式 code_fix）
 	fixSuffix := "_fix"
 	if uid != "" {
 		fixSuffix = "_" + uid + "_fix"
@@ -1349,6 +1374,7 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 回执本次被丢弃的字段：让"传了但没生效"在契约上是**可发现**的，而不是靠人读代码。
+	opslog.Audit("holdings_set", uid, uid, fmt.Sprintf("n=%d", len(req.Holdings)))
 	writeJSON(w, 200, map[string]any{"status": "ok", "ignored_fields": ignoredFields})
 }
 

@@ -235,8 +235,13 @@ func (d *DB) costBasisFor(userID, code, day string) float64 {
 // value (live price preferred, cost price fallback). When broker cash is unreported only the held
 // value is returned, letting callers skip the concentration gate.
 func (d *DB) TotalAssets(userID string) (float64, error) {
+	return d.TotalAssetsScoped(userID, true)
+}
+
+// TotalAssetsScoped 账户总资产（现金+持仓市值）；allowLegacyGlobal 决定是否读 user_id=” 遗留行。
+func (d *DB) TotalAssetsScoped(userID string, allowLegacyGlobal bool) (float64, error) {
 	total := 0.0
-	if acc, err := d.GetRealAccount(userID); err == nil && acc.AvailableCash > 0 {
+	if acc, err := d.GetRealAccountScoped(userID, allowLegacyGlobal); err == nil && acc.AvailableCash > 0 {
 		total += acc.AvailableCash
 	}
 	poses, err := d.RealPositionsForUser(userID)

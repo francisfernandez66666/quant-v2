@@ -17,6 +17,7 @@
 import React, { useEffect, useState } from 'react'
 import { Card, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
+import { canStrict } from '../utils/perm.js'
 
 /** 金额：千分位 + 两位小数；非法/缺失显示“—”。 */
 function money(v) {
@@ -90,6 +91,7 @@ export default function FundsOverviewCard() {
   useEffect(() => {
     let alive = true
     const load = async () => {
+      if (!canStrict('funds_admin')) { setForbidden(true); return }
       try {
         const res = await api.fetchFundsToday()
         if (!alive) return

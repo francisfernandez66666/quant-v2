@@ -54,7 +54,7 @@ const { OK_PAYLOADS } = vi.hoisted(() => ({
     // §0929FILL-NAME：名称旁证列的批量读（auth 面，成员也可读，不参与预过滤计数断言）
     fetchStockNames: () => ({ names: {} }),
     // §0929GATE-403「刷新身份并重试」的角色重确认腿
-    refreshMe: () => ({ role: 'admin' }),
+    refreshMe: () => ({ role: 'admin', perms: ['trading_admin'] }),
     fetchRiskGates: () => ({ gates: [], switches: {} }),
     fetchShortStatus: () => ({ short_enabled: false }),
     fetchPaperState: () => ({ enabled: false, is_admin: true, short_book: { enabled: false } }),
@@ -414,7 +414,8 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     // 与真实 refreshMe 的写侧契约同形：重确认成功后把角色写回本地缓存（否则页面判据不会翻转）
     api.refreshMe.mockImplementation(async () => {
       localStorage.setItem('liangzai_role', 'admin')
-      return { role: 'admin' }
+      localStorage.setItem('liangzai_perms', JSON.stringify(['trading_admin']))
+      return { role: 'admin', perms: ['trading_admin'] }
     })
     render(<MemoryRouter><Quant /></MemoryRouter>)
     await settle()
@@ -439,9 +440,9 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     const read = (rel) => stripComments(fs.readFileSync(path.join(HERE, '..', rel), 'utf8'))
     const quant = read('pages/Quant.jsx')
     // ① 单入口：角色判据只在 adminReadsAllowed 里出现一次，挂载与 SSE 回调都调它
-    expect(quant).toMatch(/function adminReadsAllowed\(\) \{\s*return api\.isAdmin\(\)/)
+    expect(quant).toMatch(/function adminReadsAllowed\(\) \{\s*return canStrict\('trading_admin'\)/)
     expect(quant).toMatch(/if \(adminReadsAllowed\(\)\) \{\s*startAdminReads\(\)/)
-    expect(quant.match(/api\.isAdmin\(\)/g) || [], 'Quant.jsx 里 api.isAdmin() 只该有一处（判据单入口）').toHaveLength(1)
+    expect(quant.match(/api\.isAdmin\(\)/g) || [], 'Quant.jsx 不得自行读角色（判据单入口=canStrict）').toHaveLength(0)
     // ② 出口：重试走服务器重确认，不是本地改角色
     expect(quant).toMatch(/await api\.refreshMe\(\)/)
     // ③ FillAmendPanel 收上层结论，自己不读角色
@@ -451,13 +452,13 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     expect(amend.match(/api\.isAdmin\(\)/g) || [], 'FillAmendPanel 不得自行读角色缓存').toHaveLength(0)
     expect(quant).toMatch(/canQuery=\{adminReadsAllowed\(\)\}/)
     // ④ 其余三页 + App 全局轮询的早退接线
-    expect(read('pages/Dashboard.jsx')).toMatch(/async function loadQMT\(\) \{\s*if \(!api\.isAdmin\(\)\) return/)
+    expect(read('pages/Dashboard.jsx')).toMatch(/async function loadQMT\(\) \{\s*if \(!canStrict\('trading_admin'\)\) return/)
     expect(read('pages/MsgCenter.jsx')).toMatch(/async function load\(\) \{\s*if \(!admin\) \{/)
     expect(read('pages/Consult.jsx')).toMatch(/if \(!admin\) \{\s*setLlmGated\(true\)/)
     expect(read('App.jsx')).toMatch(/if \(api\.isAdmin\(\)\) \{\s*try \{\s*const alerts = await api\.fetchAlerts\(\)/)
     // ⑤ Positions：实盘建议回填并入既有 §PERM-GATE 的 admin 早退
     const pos = read('pages/Positions.jsx')
-    expect(pos).toMatch(/if \(!admin\) return \/\/ §PERM-GATE/)
-    expect(pos).toMatch(/if \(admin\) \{\s*api\.fetchRealAdvice\(\)/)
+    expect(pos).toMatch(/if \(!canTrading\) return \/\/ §PERM-GATE/)
+    expect(pos).toMatch(/if \(canTrading\) \{\s*api\.fetchRealAdvice\(\)/)
   })
 })

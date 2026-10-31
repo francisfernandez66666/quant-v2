@@ -3,6 +3,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/store"
 )
@@ -339,6 +341,79 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// paperAdjustReq 一次性纸面持仓修复请求（§10.5；仅用于 UAT 残留补回，不是通用交易入口）。
+type paperAdjustReq struct {
+	AccountID string  `json:"account_id"`
+	Code      string  `json:"code"`
+	Qty       int     `json:"qty"`
+	Price     float64 `json:"price"`
+	Reason    string  `json:"reason"`
+	Confirm   string  `json:"confirm"`
+}
+
+// handlePaperAdjust 处理 POST /api/paper/adjust：显式 qty/price 的纸面持仓修复。
+// dynamic 模式下普通 /api/paper/buy 会忽略 qty，无法用于“000683 100→200”这类一次性补回；
+// 本端点用 BuyExInPool 直接按给定 qty/price 加仓到已存在持仓，并落审计。仅 owner 使用。
+func (s *Server) handlePaperAdjust(w http.ResponseWriter, r *http.Request) {
+	var req paperAdjustReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	target := strings.TrimSpace(req.AccountID)
+	code := strings.TrimSpace(req.Code)
+	if target == "" || code == "" {
+		writeError(w, 400, "account_id/code required")
+		return
+	}
+	if strings.TrimSpace(req.Confirm) != "RESTORE-000683" {
+		writeError(w, 400, "confirm 必须为 RESTORE-000683（一次性纸面修复）")
+		return
+	}
+	if req.Qty <= 0 || req.Qty%100 != 0 {
+		writeError(w, 400, "qty 必须为 100 的整数倍")
+		return
+	}
+	if req.Price <= 0 {
+		writeError(w, 400, "price 必须为正数（补回按指定价记账，不按现价猜）")
+		return
+	}
+	pe := s.paperEngineFor(target)
+	if pe == nil {
+		writeError(w, 503, "目标账号模拟盘引擎未接入")
+		return
+	}
+	// 只允许对已存在持仓补回：本端点不是“新建仓位”的通用入口。
+	var held *paper.Position
+	for _, p := range pe.Positions() {
+		if p.Code == code {
+			cp := p
+			held = &cp
+			break
+		}
+	}
+	if held == nil {
+		writeError(w, 400, "目标账号无该持仓；本端点只做已持仓补回，不新建仓位")
+		return
+	}
+	quotes := s.liveQuotes(code)
+	if err := pe.BuyExInPool(code, held.Name, held.Strategy, held.StrategyType,
+		held.SignalPrice, req.Price, req.Qty, quotes); err != nil {
+		writeError(w, 400, "纸面补回失败: "+err.Error())
+		return
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "一次性纸面修复"
+	}
+	opslog.Audit("paper_adjust", userIDFor(r), target,
+		fmt.Sprintf("code=%s qty=%d price=%.2f reason=%s", code, req.Qty, req.Price, reason))
+	writeJSON(w, 200, map[string]any{
+		"status": "ok", "account_id": target, "code": code,
+		"qty": req.Qty, "price": req.Price, "positions": pe.Positions(),
+	})
 }
 
 // ExportPaperToResearch 盘后把某账号模拟盘的当日成交与每日快照导出到研究库（供自动研究消费）。

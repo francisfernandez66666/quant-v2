@@ -35,6 +35,12 @@ function okPayloads() {
     getAccount: () => 'admin',
     getToken: () => 'tok',
     getRole: () => 'member', // 非 admin：跳过配置历史卡，减少挂载面
+    // §MULTI-ADMIN：本文件只测战法表单，仍需 config_admin 才渲染配置区；
+    // trading_admin 置 false 让执行风控面板保持不挂载。
+    hasStrictPerm: (perm) => perm === 'config_admin',
+    isAdmin: () => false,
+    fetchConfigHistory: () => ({ snapshots: [] }),
+    fetchStrategySnapshots: () => ({ snapshots: [] }),
     fetchStatus: () => ({}),
     fetchLLMConfig: () => ({ api_url: '', api_keys: [] }),
     fetchNewsShowAllStatus: () => ({ news_show_all: false }),

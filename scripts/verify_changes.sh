@@ -1346,9 +1346,9 @@ echo "==> 31 §H3 全局写端点收权 admin（/api/action + news showall/reana
 # 运营信号簿、reanalyze 烧全局 LLM 额度），路由整体升 adminMiddleware + 前端按钮隐藏 +
 # 实盘下单受理 opslog.Audit("live_order") 留痕。
 go test -count=1 ./internal/server/ -run 'TestH3ActionAdminOnly|TestH3NewsShowAllAndReanalyzeAdminOnly' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-grep -q 'POST /api/action", s.adminMiddleware(s.handleFixAction)' internal/server/server.go || { echo "--- FAIL: /api/action 路由回退 authMiddleware（§H3 越权复活）"; exit 1; }
-grep -q 'POST /api/news/reanalyze", s.adminMiddleware(s.handleNewsReanalyze)' internal/server/server.go || { echo "--- FAIL: reanalyze 路由回退 authMiddleware（§H3）"; exit 1; }
-grep -q 'POST /api/news/showall", s.adminMiddleware(s.handleNewsShowAllToggle)' internal/server/server.go || { echo "--- FAIL: showall 路由回退 authMiddleware（§H3）"; exit 1; }
+grep -q 'POST /api/action", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleFixAction)' internal/server/server.go || { echo "--- FAIL: /api/action 路由回退 authMiddleware/adminMiddleware（§H3 越权复活）"; exit 1; }
+grep -q 'POST /api/news/reanalyze", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleNewsReanalyze)' internal/server/server.go || { echo "--- FAIL: reanalyze 路由回退 authMiddleware/adminMiddleware（§H3）"; exit 1; }
+grep -q 'POST /api/news/showall", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleNewsShowAllToggle)' internal/server/server.go || { echo "--- FAIL: showall 路由回退 authMiddleware/adminMiddleware（§H3）"; exit 1; }
 grep -q 'admin && row.can_open' web/src/pages/Signals.jsx || { echo "--- FAIL: 信号页买入/忽略按钮管理员门控丢失（§H3 前端面）"; exit 1; }
 grep -q 'api.isAdmin() &&' web/src/pages/Hotspot.jsx || { echo "--- FAIL: 资讯页手动补推按钮管理员门控丢失（§H3 前端面）"; exit 1; }
 echo "ok - §H3 专项守卫通过（行为回归 1 组 + 静态锁 5 道）"
@@ -2111,7 +2111,7 @@ echo "==> 65 §NOTIFYADMIN 全局推送探测端点抬档 + 频控（傍晚批 N
 # 用噪声淹没真告警（告警通道本身成为攻击面）。修法：抬 adminMiddleware + 全进程 60s 最小间隔
 # （探测打的是 server 级单例通道，按账号限流挡不住多管理员合流）+ 全路径 opslog 审计。
 go test -count=1 ./internal/server/ -run 'TestNotifyTestAdminOnlyAndRateLimited' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-grep -q '"POST /api/notify-test", s.adminMiddleware' internal/server/server.go || { echo "--- FAIL: §N-2 notify-test 抬档丢失（成员可轰炸 owner 推送通道）"; exit 1; }
+grep -q '"POST /api/notify-test", s.strictPermMiddleware(auth.PermOpsAdmin' internal/server/server.go || { echo "--- FAIL: §N-2 notify-test 抬档丢失（成员可轰炸 owner 推送通道）"; exit 1; }
 if grep -q '"POST /api/notify-test", s.authMiddleware' internal/server/server.go; then
 	echo "--- FAIL: §N-2 notify-test 又回退 authMiddleware"; exit 1; fi
 grep -q 'Retry-After' internal/server/handlers_fix.go || { echo "--- FAIL: §N-2 频控未回 Retry-After（429 无语义，调用方盲重试）"; exit 1; }
@@ -3416,10 +3416,10 @@ grep -q "SELECT COUNT(\*) FROM fills WHERE trade_id=?" internal/store/real_posit
 	|| { echo "--- FAIL: ApplyRealFill 的 trade_id 判重不再查原始 fills（双倍记账入口）"; exit 1; }
 grep -q "SELECT COUNT(\*) FROM fills WHERE order_id=? AND traded_at=? AND price=? AND qty=?" internal/store/settlement.go \
 	|| { echo "--- FAIL: FillExists 的事实键判重不再查原始 fills"; exit 1; }
-# 端点收口：五条路由全在 adminMiddleware 下（实盘账本写端点，§M-14 同口径）。
+# 端点收口：五条路由全在 trading_admin 严格权限下（实盘账本写端点，§M-14 同口径）。
 for r in 'GET /api/qmt/fill-amendments' 'POST /api/qmt/fill-amendments' 'POST /api/qmt/fill-amendments/{id}/apply' 'POST /api/qmt/fill-amendments/{id}/revoke' 'GET /api/qmt/fills/conservation'; do
-	grep -qF "s.mux.HandleFunc(\"$r\", s.adminMiddleware(" internal/server/server.go \
-		|| { echo "--- FAIL: $r 未挂 adminMiddleware（勘误是资金账写端点）"; exit 1; }
+	grep -qF "s.mux.HandleFunc(\"$r\", s.strictPermMiddleware(auth.PermTradingAdmin," internal/server/server.go \
+		|| { echo "--- FAIL: $r 未挂 trading_admin 严格权限（勘误是资金账写端点）"; exit 1; }
 done
 # 锚点单源：提交体只有 fill_id（前端自报锚点=可造匹配不到成交的死勘误）。
 grep -q 'FillID  int64  `json:"fill_id"`' internal/server/fill_amendments.go \
@@ -11335,8 +11335,8 @@ CNT113=$((CNT113 + 1))
 SNAP113 2
 
 # ── ③ §P2-H M1/M2：后端两条路由与面板接线（前端调用点的两端都得在位）──
-eq113 "$SRV113" 's.mux.HandleFunc("GET /api/config/d1", s.adminMiddleware(s.handleGetD1Config))' 1 'M1：GET 路由带 admin 门（面板挂载门槛与它同口径）'
-eq113 "$SRV113" 's.mux.HandleFunc("POST /api/config/d1", s.adminMiddleware(s.handleSetD1Config))' 1 'M1：POST 路由带 admin 门'
+eq113 "$SRV113" 's.mux.HandleFunc("GET /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetD1Config))' 1 'M1：GET 路由带 config_admin 严格门（面板挂载门槛与它同口径）'
+eq113 "$SRV113" 's.mux.HandleFunc("POST /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetD1Config))' 1 'M1：POST 路由带 config_admin 严格门'
 eqj113 "$API113" 'export async function fetchD1Config()' 1 'M2：GET 出口声明恰好一处'
 eqj113 "$API113" "return request('/api/config/d1')" 1 'M2：GET 请求串（斜杠开头＝绝对路径，不是拼出来的相对串）'
 eqj113 "$API113" 'export async function setD1Config(cfg)' 1 'M2：POST 出口声明恰好一处'
@@ -11348,7 +11348,7 @@ eqj113 "$PNL113" "if (loadState !== 'loaded') return" 1 'M2：非 loaded 态直�
 eqj113 "$PNL113" "'D1 配置保存失败" 1 'M2：保存失败走可见 toast（静默 catch＝用户以为已经落库）'
 eqj113 "$PNL113" "{loadState === 'error' && (" 1 'M2：红条出口恰好一处（只加不减的台账会变成永久红）'
 eqj113 "$PNL113" 'setEffectiveSource(typeof cfg.effective_source' 1 'effective_source 回显接上（§0929CFG-D1 的自证字段，前端不显示等于白回）'
-eqj113 "$SET113" "const d1Admin = api.getRole() === 'admin'" 1 'M2：挂载门槛与两条 admin 路由同口径（非管理员拿 403 只会得到一块红条噪声）'
+eqj113 "$SET113" "const d1Admin = canConfig" 1 'M2：挂载门槛与两条 config_admin 路由同口径（非 config_admin 拿 403 只会得到一块红条噪声）'
 eqj113 "$SET113" '{d1Admin && <D1ConfigPanel />}' 1 'M2：面板真被页面 render'
 negj113 "$SET113" '{<D1ConfigPanel />}' '无条件挂载形态禁止复活（与后端 adminMiddleware 口径矛盾的门，会让成员看到一块打不开的板）'
 SNAP113 3
@@ -12510,13 +12510,13 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 205 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205）'
+eqkey115 ROUTES_DERIVED 206 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206）'
 eqkey115 CALLPATH_DERIVED 165 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165）'
 eqkey115 CALLSITES_DERIVED 168 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 205 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205）'
+eqkey115 LEDGER_ROWS 206 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§MULTI-ADMIN 000683 修复端点入账 →206）'
 eqkey115 COVERED_BY_WEB 165 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程 →165）'
-eqkey115 UNCALLED 40 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40）'
+eqkey115 UNCALLED 41 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
 eqkey115 NO_BASIS 0 '「无依据」档必须为空：说不清为什么还留着＝待决策，不许混进台账假装闭合'
@@ -12587,8 +12587,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 205 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 205 '镜像基线：台账行数与主仓同值'
+eqkey115 ROUTES_DERIVED 206 '镜像基线：R 与主仓同值'
+eqkey115 LEDGER_ROWS 206 '镜像基线：台账行数与主仓同值'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -17632,5 +17632,172 @@ fi
 
 [ "$B143_FAILED" = "0" ] || exit 1
 echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1 + 拆 first-match 与拆枪 1 + 拆源3 写腿（N1 结构性）1 + 反证 V3（旧枪注回/摘掉 -Uid 必红）1 + 反证 V4（驱动判读三处摘锁必红）1，累计判定点 ${CNT143}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §144 §MULTI-ADMIN（2026-10-31）：五权限位 + 严格路由 + 写面按请求者 + P1 资金口径 + UAT 工装
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 144 §MULTI-ADMIN（五权限/严格路由/写面身份/P1 资金口径/UAT 工装）..."
+B144_FAILED=0
+fail144() {
+	echo "--- FAIL: §144 $*"
+	FAIL=1
+	B144_FAILED=1
+}
+CNT144=0
+
+# —— ① 五权限常量/显式判定/迁移 ——
+CNT144=$((CNT144 + 1))
+for P144 in PermFundsAdmin PermTradingAdmin PermUserAdmin PermConfigAdmin PermOpsAdmin; do
+	grep -qF "$P144" internal/auth/auth.go || fail144 "auth 缺少权限位 $P144"
+done
+CNT144=$((CNT144 + 1))
+grep -qF 'func (u *User) HasExplicitPerm' internal/auth/auth.go || fail144 "缺少 HasExplicitPerm（admin 隐式放行会复活）"
+CNT144=$((CNT144 + 1))
+grep -qF 'const schemaVersion = 3' internal/auth/auth.go || fail144 "auth schemaVersion 未升到 3"
+CNT144=$((CNT144 + 1))
+grep -qF 'grantOwnerPermsLocked' internal/auth/auth.go || fail144 "缺少 owner 五权限授予 helper"
+CNT144=$((CNT144 + 1))
+grep -qF 'grantOwnerPermsLocked(&user)' internal/auth/auth.go || fail144 "SetupInitialAdmin/CreateUser 首次 admin 未授予五权限位"
+CNT144=$((CNT144 + 1))
+grep -qF 'backupBeforeMigration' internal/auth/auth.go || fail144 "迁移前 auth.json 备份丢失"
+CNT144=$((CNT144 + 1))
+grep -qF 'func TestAdminPermsMigration' internal/auth/auth_test.go || fail144 "缺迁移回归锁"
+grep -qF 'func TestSetupInitialAdminGetsPerms' internal/auth/auth_test.go || fail144 "缺 /setup 首次 admin 权限锁"
+grep -qF 'func TestCreateFirstAdminGetsPerms' internal/auth/auth_test.go || fail144 "缺管理端首 admin 权限锁"
+grep -qF 'func TestHasExplicitPerm' internal/auth/auth_test.go || fail144 "缺显式权限判定锁"
+CNT144=$((CNT144 + 1))
+grep -qF 'unknown permission' internal/auth/auth.go || fail144 "SetPerms 缺权限位白名单校验"
+grep -qF 'func TestSetPermsWhitelist' internal/auth/auth_test.go || fail144 "缺 SetPerms 白名单回归锁"
+
+# —— ② 三处写面按请求者；读面同源 ——
+for FN144 in handleFixSetBalance handleFixPnlOffset handleFixSetHoldings; do
+	BODY144=$(awk "/func \\(s \\*Server\\) ${FN144}\\(/,/^}/" internal/server/handlers_fix.go)
+	CODE144=$(printf '%s\n' "$BODY144" | sed 's://.*$::')
+	CNT144=$((CNT144 + 1))
+	grep_q 'requestUserID\(r\)' CODE144 || fail144 "${FN144} 未按请求者取账号"
+	CNT144=$((CNT144 + 1))
+	if grep_q 'operatorID\(\)' CODE144; then
+		fail144 "${FN144} 仍含 operatorID()（D-04 会复发）"
+	fi
+done
+CNT144=$((CNT144 + 1))
+grep -qF 'func (s *Server) realAccountFor' internal/server/handlers_fix.go || fail144 "缺 realAccountFor 账号口径"
+CNT144=$((CNT144 + 1))
+grep -qF 'GetRealAccountOwn' internal/store/real_account.go || fail144 "store 缺 GetRealAccountOwn"
+CNT144=$((CNT144 + 1))
+grep -qF 'GetRealAccountScoped' internal/store/real_account.go || fail144 "store 缺 GetRealAccountScoped"
+CNT144=$((CNT144 + 1))
+# 只锁 handleFundsToday 函数体：同文件 handlePaperTargetReadout 是运营账号专用的目标仓位只读面，
+# 全文件负锁会把那条合法用法当成回潮（2026-11-01 §144 首跑就是这么假红的）。
+BODY144F=$(awk '/func \(s \*Server\) handleFundsToday\(/,/^}/' internal/server/t_rounds_api.go)
+grep_q 'paperEngineFor\(uid\)' BODY144F || fail144 "funds/today 的 paperView 未按请求者 uid"
+CNT144=$((CNT144 + 1))
+if grep_q 'paperEngineFor\(s\.operatorID\(\)\)' BODY144F; then
+	fail144 "funds/today 仍用运营账号取纸面读数"
+fi
+CNT144=$((CNT144 + 1))
+grep -qF 'req.Enabled != nil && *req.Enabled && target != s.operatorID()' internal/server/qmt.go || fail144 "非运营账号显式启用实盘缺自有 token 护栏"
+CNT144=$((CNT144 + 1))
+grep -qF 'POST /api/paper/adjust' internal/server/server.go || fail144 "缺 000683 一次性纸面修复端点"
+CNT144=$((CNT144 + 1))
+grep -qF 'RESTORE-000683' internal/server/paper.go || fail144 "000683 修复端点缺 confirm 守卫"
+
+# —— ③ P1 资金读取 strict ——
+CNT144=$((CNT144 + 1))
+grep -qF 'legacyCashGlobal' internal/trading/controller.go || fail144 "Controller 缺 legacyCashGlobal 口径"
+CNT144=$((CNT144 + 1))
+grep -qF 'SetLegacyCashGlobal' internal/risk/gate.go || fail144 "risk.Gate 缺 legacy 开关"
+CNT144=$((CNT144 + 1))
+grep -qF 'func (e *Engine) cashAccount' internal/engine/cash_scope.go || fail144 "Engine 缺 cashAccount 账号口径"
+CNT144=$((CNT144 + 1))
+grep -qF 'GetRealAccountScoped' internal/trading/settlement.go || fail144 "settlement 现金差仍走 legacy GetRealAccount"
+CNT144=$((CNT144 + 1))
+grep -qF 'func TestRealAccountScoped' internal/store/real_account_scope_test.go || fail144 "缺 store 资金口径回归锁"
+grep -qF 'func TestGateCashScope' internal/risk/cash_scope_test.go || fail144 "缺 risk 资金口径回归锁"
+grep -qF 'func TestControllerCashScope' internal/trading/cash_scope_test.go || fail144 "缺 controller 资金口径回归锁"
+
+# —— ④ 严格路由矩阵（计数是当前实现的派生值；改路线必须同批改这里） ——
+CNT144=$((CNT144 + 1))
+N144=$(grep -cF 'strictPermMiddleware(auth.PermFundsAdmin' internal/server/server.go || true)
+[ "$N144" -eq 8 ] || fail144 "funds_admin 严格路由应为 8，实得 $N144"
+CNT144=$((CNT144 + 1))
+N144=$(grep -cF 'strictPermMiddleware(auth.PermTradingAdmin' internal/server/server.go || true)
+[ "$N144" -eq 24 ] || fail144 "trading_admin 严格路由应为 24，实得 $N144"
+CNT144=$((CNT144 + 1))
+N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server.go || true)
+[ "$N144" -eq 14 ] || fail144 "user_admin 严格路由应为 14，实得 $N144"
+CNT144=$((CNT144 + 1))
+N144=$(grep -cF 'strictPermMiddleware(auth.PermConfigAdmin' internal/server/server.go || true)
+[ "$N144" -eq 18 ] || fail144 "config_admin 严格路由应为 18，实得 $N144"
+CNT144=$((CNT144 + 1))
+N144=$(grep -cF 'strictPermMiddleware(auth.PermOpsAdmin' internal/server/server.go || true)
+[ "$N144" -eq 9 ] || fail144 "ops_admin 严格路由应为 9，实得 $N144"
+CNT144=$((CNT144 + 1))
+# signal-logs 是各账号自己的信号批次读面（handler 按请求者取引擎），收成运营特权面会误伤普通账号。
+if grep -qF 'strictPermMiddleware(auth.PermOpsAdmin, s.handleSignalLogs)' internal/server/server.go; then
+	fail144 "signal-logs 是账号级读面，不许收成 ops_admin"
+fi
+CNT144=$((CNT144 + 1))
+grep -qF 'strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermTradingAdmin' internal/server/server.go || fail144 "跨账号 QMT 配置未要求 user_admin+trading_admin"
+CNT144=$((CNT144 + 1))
+grep -qF 'strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin' internal/server/server.go || fail144 "跨账号策略配置未要求 user_admin+config_admin"
+CNT144=$((CNT144 + 1))
+STRICT144=$(awk '/func \(s \*Server\) strictPermMiddleware/,/^}/' internal/server/server.go)
+grep_q 'HasExplicitPerm' STRICT144 || fail144 "strictPermMiddleware 未用 HasExplicitPerm"
+if grep_q 'HasPerm\(' STRICT144; then
+	fail144 "strictPermMiddleware 回落到 HasPerm（admin 隐式全部，权限位失效）"
+fi
+
+# —— ⑤ 前端严格门控与消费面 ——
+CNT144=$((CNT144 + 1))
+grep -qF 'export function hasStrictPerm' web/src/api/index.js || fail144 "前端缺 hasStrictPerm"
+CNT144=$((CNT144 + 1))
+grep -qF 'export function canStrict' web/src/utils/perm.js || fail144 "前端缺 canStrict 兼容层"
+CNT144=$((CNT144 + 1))
+grep -qF "canStrict('funds_admin')" web/src/pages/Positions.jsx || fail144 "持仓页未按 funds_admin 收敛写入口"
+CNT144=$((CNT144 + 1))
+grep -qF "canStrict('trading_admin')" web/src/pages/Quant.jsx || fail144 "量化页未按 trading_admin 收敛"
+CNT144=$((CNT144 + 1))
+grep -qF "canStrict('user_admin')" web/src/pages/Admin.jsx || fail144 "用户管理页未按 user_admin 收敛"
+CNT144=$((CNT144 + 1))
+grep -qF "canStrict('funds_admin')" web/src/components/FundsOverviewCard.jsx || fail144 "FundsOverviewCard 未按 funds_admin 收敛"
+CNT144=$((CNT144 + 1))
+grep -qF "canStrict('trading_admin')" web/src/components/ExecutionRiskPanel.jsx || fail144 "ExecutionRiskPanel 未按 trading_admin 收敛"
+CNT144=$((CNT144 + 1))
+grep -qF "canStrict('trading_admin')" web/src/pages/Dashboard.jsx || fail144 "Dashboard QMT 卡未按 trading_admin 收敛"
+CNT144=$((CNT144 + 1))
+grep -qF 'strictPerm="user_admin"' web/src/App.jsx || fail144 "用户管理路由缺 strictPerm=user_admin"
+grep -qF 'strictPerm="trading_admin"' web/src/App.jsx || fail144 "量化路由缺 strictPerm=trading_admin"
+grep -qF "strictAny={['config_admin', 'trading_admin']}" web/src/App.jsx || fail144 "设置路由缺 config_admin/trading_admin 任一严格门控"
+CNT144=$((CNT144 + 1))
+grep -qF "canStrict('config_admin')" web/src/pages/Settings.jsx || fail144 "设置页配置区未按 config_admin 收敛"
+grep -qF 'strictPerm="ops_admin"' web/src/App.jsx || fail144 "LLM 诊断路由缺 strictPerm=ops_admin"
+CNT144=$((CNT144 + 1))
+grep -qF 'func TestMultiAdminSetBalanceIsolation' internal/server/multi_admin_identity_test.go || fail144 "缺双 admin 资金隔离回归锁"
+grep -qF 'func TestFundsTodayAccountIsolation' internal/server/multi_admin_identity_test.go || fail144 "缺 funds/today 账户隔离回归锁"
+grep -qF 'func TestStrictPermissionSurface' internal/server/multi_admin_identity_test.go || fail144 "缺严格权限 403 回归锁"
+CNT144=$((CNT144 + 1))
+grep -qF 'func TestPaperAdjustRestoresHeldPosition' internal/server/multi_admin_identity_test.go || fail144 "缺 000683 补回成功路径回归锁"
+CNT144=$((CNT144 + 1))
+grep -qF 'hasStrictPerm' web/src/__tests__/strict_perm_api.test.js || fail144 "缺前端显式权限单测"
+grep -qF 'multi_admin_perm_gate' web/src/__tests__/multi_admin_perm_gate.test.jsx || fail144 "缺资金卡零请求测试"
+
+# —— ⑥ 行为腿：auth/server/store/risk/trading 真跑 ——
+CNT144=$((CNT144 + 1))
+go test ./internal/auth -run 'TestAdminPermsMigration|TestSetupInitialAdminGetsPerms|TestCreateFirstAdminGetsPerms|TestHasExplicitPerm|TestSetPermsWhitelist' -count=1 \
+	> /tmp/gate144_auth.log 2>&1 || fail144 "auth 权限/迁移用例未过"
+CNT144=$((CNT144 + 1))
+go test ./internal/server -run 'TestMultiAdmin|TestFundsTodayAccountIsolation|TestStrictPermissionSurface|TestPaperAdjust' -count=1 \
+	> /tmp/gate144_server.log 2>&1 || fail144 "双 admin/严格权限用例未过"
+CNT144=$((CNT144 + 1))
+go test ./internal/store -run TestRealAccountScoped -count=1 > /tmp/gate144_store.log 2>&1 || fail144 "store 资金口径用例未过"
+CNT144=$((CNT144 + 1))
+go test ./internal/risk -run TestGateCashScope -count=1 > /tmp/gate144_risk.log 2>&1 || fail144 "risk 资金口径用例未过"
+CNT144=$((CNT144 + 1))
+go test ./internal/trading -run TestControllerCashScope -count=1 > /tmp/gate144_trading.log 2>&1 || fail144 "controller 资金口径用例未过"
+
+[ "$B144_FAILED" = "0" ] || exit 1
+echo "ok - §144 §MULTI-ADMIN 锁通过（五权限/迁移、三写面身份、P1 资金口径、严格路由矩阵、前端门控、行为腿；累计判定点 ${CNT144}）"
 
 echo "==> 全部通过"

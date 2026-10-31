@@ -447,11 +447,11 @@ func (e *Engine) publishTFundsHeartbeat(uid string) {
 
 // totalAssetsOf 总资产：优先券商快照口径（与 dynamicBuyQty 同优先级），回落账本合计。
 func (r *tLiveRound) totalAssetsOf(db *store.DB) float64 {
-	if acc, err := db.GetRealAccount(r.uid); err == nil && acc.TotalAsset > 0 {
+	if acc, err := r.ctrl.GetRealAccountFor(r.uid); err == nil && acc.TotalAsset > 0 {
 		r.total = acc.TotalAsset
 		return r.total
 	}
-	if v, err := db.TotalAssets(r.uid); err == nil && v > 0 {
+	if v, err := r.ctrl.TotalAssetsFor(r.uid); err == nil && v > 0 {
 		r.total = v
 		return r.total
 	}
@@ -475,7 +475,7 @@ func (r *tLiveRound) dayLossBlocked() (bool, string) {
 	}
 	base := r.total
 	if base <= 0 {
-		if v, verr := r.db.TotalAssets(r.uid); verr == nil && v > 0 {
+		if v, verr := r.ctrl.TotalAssetsFor(r.uid); verr == nil && v > 0 {
 			base = v
 		}
 	}

@@ -10,6 +10,7 @@ import RegimeConfigPanel from '../components/RegimeConfigPanel.jsx' // §N6-RISK
 import MigrationSignoffCard from '../components/MigrationSignoffCard.jsx' // §DYN-SIZE v4 / §ANCHOR-FIRST 发版签字单
 import ExecutionRiskPanel from '../components/ExecutionRiskPanel.jsx' // §C1/C2/C3/C5/C6/B7 执行层风控与执行质量
 import * as api from '../api/index.js'
+import { canStrict } from '../utils/perm.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
 
@@ -159,12 +160,16 @@ export default function Settings() {
   const [histDiff, setHistDiff] = useState(null) // {snapshot_ts, diff} | null
   const [histRollback, setHistRollback] = useState(null) // {kind:'rules'|'strategy', ts} | null（确认弹窗目标）
   const [histLoading, setHistLoading] = useState(false)
-  const histAdmin = api.getRole() === 'admin'
+  // §MULTI-ADMIN：配置类面板只认 config_admin；执行风控面板属于 trading_admin。
+  // 只有 trading_admin 的账号仍可进本页，但只渲染执行风控（见渲染前提前返回）。
+  const canConfig = canStrict('config_admin')
+  const canTrading = canStrict('trading_admin')
+  const histAdmin = canConfig
   // §P2-H：D1 面板与配置历史同一道角色门槛（GET/POST /api/config/d1 都是 adminMiddleware）。
   // 单独起一个名字而不是复用 histAdmin，是因为两者的**含义**不同：histAdmin 管的是快照台账卡，
   // d1Admin 管的是 D1 读写卡；写成同一个变量名，日后给其中一个换门槛就会顺带换掉另一个。
   // English: §P2-H — the D1 panel gets its own role flag (same rule, different meaning).
-  const d1Admin = api.getRole() === 'admin'
+  const d1Admin = canConfig
 
   // 拉取两类快照列表（进卡/回滚后刷新）
   async function loadHist() {
@@ -476,24 +481,26 @@ export default function Settings() {
         await api.fetchStatus()
         setServerOnline(true)
       } catch (_) { setServerOnline(false) }
-      // 2) 读取 LLM 配置回填到表单
-      try {
-        const cfg = await api.fetchLLMConfig()
-        // 回填口径统一走 applyLLMCfgToForm（与回滚后回读共用，避免两处各写一遍而分叉）
-        if (cfg) applyLLMCfgToForm(cfg)
-      } catch (e) {
-        // §A5：首个 admin 数据端点即 403=服务端权威角色非管理员，跳统一 403 页
-        if (api.isForbidden(e)) navigate('/403')
+      // 2) 读取 LLM 配置回填到表单（config_admin 专属；纯 trading_admin 不发起必 403 的请求）
+      if (canConfig) {
+        try {
+          const cfg = await api.fetchLLMConfig()
+          // 回填口径统一走 applyLLMCfgToForm（与回滚后回读共用，避免两处各写一遍而分叉）
+          if (cfg) applyLLMCfgToForm(cfg)
+        } catch (e) {
+          // §A5：首个 admin 数据端点即 403=服务端权威角色非管理员，跳统一 403 页
+          if (api.isForbidden(e)) navigate('/403')
+        }
+        // 3) 读取战法参数（§N-4 三态加载，统一走 loadStrategyCfg：失败=禁保存+红条）
+        await loadStrategyCfg()
+        // 4) 读取"显示全部资讯"开关状态
+        try {
+          const ns = await api.fetchNewsShowAllStatus()
+          if (ns && typeof ns.news_show_all === 'boolean') setNewsShowAll(ns.news_show_all)
+        } catch (_) {}
       }
-      // 3) 读取战法参数（§N-4 三态加载，统一走 loadStrategyCfg：失败=禁保存+红条）
-      await loadStrategyCfg()
-      // 4) 读取"显示全部资讯"开关状态
-      try {
-        const ns = await api.fetchNewsShowAllStatus()
-        if (ns && typeof ns.news_show_all === 'boolean') setNewsShowAll(ns.news_show_all)
-      } catch (_) {}
     })()
-  }, [])
+  }, [canConfig])
 
   // §F33 修复：dirty 计算 + beforeunload 拦截 + 保存按钮未保存标记
   // 基线未加载完成时视为不 dirty（避免首帧误闪）
@@ -543,6 +550,17 @@ export default function Settings() {
         theme="column"
         style={{ width: 200 }}
       />
+    )
+  }
+
+  // §MULTI-ADMIN：只有 trading_admin 的账号不渲染配置表单（那会触发一串 403），
+  // 只保留执行层风控面板；路由守卫已保证至少持有 config_admin 或 trading_admin 之一。
+  if (!canConfig) {
+    return (
+      <div className="page">
+        <SectionLabel>设置</SectionLabel>
+        {canTrading && <ExecutionRiskPanel />}
+      </div>
     )
   }
 

@@ -136,9 +136,9 @@ func (e *Engine) sendRoomGuard(uid string, amount float64, signalID string) (boo
 		return true, 0
 	}
 	total := 0.0
-	if acc, err := st.GetRealAccount(uid); err == nil && acc.TotalAsset > 0 {
+	if acc, err := e.cashAccount(uid); err == nil && acc.TotalAsset > 0 {
 		total = acc.TotalAsset
-	} else if v, err := st.TotalAssets(uid); err == nil && v > 0 {
+	} else if v := e.totalAssetsFor(uid); v > 0 {
 		total = v
 	}
 	if total <= 0 {

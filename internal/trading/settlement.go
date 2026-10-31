@@ -298,7 +298,7 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, SettleO
 	}
 
 	// 现金差（券商交割口径 vs 本地 real_account）
-	if acc, aerr := c.store.GetRealAccount(c.userID); aerr == nil && acc.AvailableCash > 0 {
+	if acc, aerr := c.store.GetRealAccountScoped(c.userID, c.legacyCashGlobal); aerr == nil && acc.AvailableCash > 0 {
 		if brokerCash := resp.Cash["cash"]; brokerCash > 0 {
 			diff.CashDiff = brokerCash - acc.AvailableCash
 		}

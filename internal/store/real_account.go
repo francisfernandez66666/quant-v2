@@ -54,18 +54,41 @@ func (d *DB) UpsertRealAccount(acc RealAccount) error {
 	return err
 }
 
-// GetRealAccount 返回指定账号的账户资产（含遗留全局行兜底）；不存在返回零值行。
-// （GetRealAccount returns the account assets for a user (legacy global row as fallback);
-// a zero row when absent.）
-func (d *DB) GetRealAccount(userID string) (RealAccount, error) {
+// GetRealAccountScoped 账户资金读取的唯一底层实现。
+// allowLegacyGlobal=true 时保留 `user_id=”` 的遗留全局行兜底（运营账号/旧部署）；
+// false 时只读该账号自己的行，读不到返回零值行（不报错）。
+// English: the single cash-lookup primitive; the legacy empty-user row is only visible when
+// allowLegacyGlobal is true (operator/legacy deployments).
+func (d *DB) GetRealAccountScoped(userID string, allowLegacyGlobal bool) (RealAccount, error) {
 	var acc RealAccount
 	acc.UserID = userID
-	err := d.db.QueryRow(`SELECT available_cash, frozen_cash, total_asset, market_value, updated_at
-		FROM real_account WHERE user_id = ? OR user_id = '' ORDER BY user_id DESC LIMIT 1`, userID).
+	// 非运营账号且没有目标 ID：不把全局行当自己的资金。
+	if userID == "" && !allowLegacyGlobal {
+		return acc, nil
+	}
+	query := `SELECT available_cash, frozen_cash, total_asset, market_value, updated_at
+		FROM real_account WHERE user_id = ? LIMIT 1`
+	if allowLegacyGlobal {
+		query = `SELECT available_cash, frozen_cash, total_asset, market_value, updated_at
+			FROM real_account WHERE user_id = ? OR user_id = '' ORDER BY user_id DESC LIMIT 1`
+	}
+	err := d.db.QueryRow(query, userID).
 		Scan(&acc.AvailableCash, &acc.FrozenCash, &acc.TotalAsset, &acc.MarketValue, &acc.UpdatedAt)
 	if err != nil {
 		// 表不存在或查不到：返回零值（不报错，前端显示 0/—）
 		return acc, nil
 	}
 	return acc, nil
+}
+
+// GetRealAccount 返回指定账号的账户资产（含遗留全局行兜底）；不存在返回零值行。
+// 兼容旧调用方；新代码应按账号归属传 allowLegacyGlobal（见 GetRealAccountScoped）。
+func (d *DB) GetRealAccount(userID string) (RealAccount, error) {
+	return d.GetRealAccountScoped(userID, true)
+}
+
+// GetRealAccountOwn 只读该账号自己的 real_account 行，**不**做 user_id=” 兜底。
+// 供非运营账号的账户级读/写使用，避免读到运营/遗留资金。
+func (d *DB) GetRealAccountOwn(userID string) (RealAccount, error) {
+	return d.GetRealAccountScoped(userID, false)
 }

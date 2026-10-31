@@ -40,11 +40,12 @@ type Controller struct {
 	// 只串行化下单路径（HealthCheck/StateSnapshot 等读路径不取该锁），单实盘账户场景无吞吐损失。
 	orderMu sync.Mutex // 下单路径互斥锁
 
-	exec            atomic.Value     // 下单执行器（真实网关 / noop）——§修复 FIX#7 原子引用，持 Executor 接口
-	store           *store.DB        // 研究库（real_positions/orders/fills 落库）
-	cfg             config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
-	userID          string           // 归属账号（多账号模式下各引擎独立控制器）
-	lastReconcileAt time.Time        // §W6-a 上次主动对账时间（节流用）
+	exec             atomic.Value     // 下单执行器（真实网关 / noop）——§修复 FIX#7 原子引用，持 Executor 接口
+	store            *store.DB        // 研究库（real_positions/orders/fills 落库）
+	cfg              config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
+	userID           string           // 归属账号（多账号模式下各引擎独立控制器）
+	legacyCashGlobal bool             // 是否允许读 user_id='' 遗留资金行（仅 owner/旧部署）
+	lastReconcileAt  time.Time        // §W6-a 上次主动对账时间（节流用）
 
 	// §QMT-PENDING 待生效配置（开关队列）：普通配置变更（enabled/mode/白名单/纪律）先入队，
 	// 由引擎在交易时段（scoreCycle 的 IsActiveSession 门控内）调用 ApplyPendingConfig 才真正
@@ -154,6 +155,39 @@ func (c *Controller) SetNow(fn func() time.Time) {
 		c.nowFn = fn
 	}
 	c.mu.Unlock()
+}
+
+// SetLegacyCashGlobal 设置资金读取是否允许 legacy 全局行（owner/旧部署=true；其他账号=false）。
+// English: toggles the legacy empty-user cash fallback for this account's controller.
+func (c *Controller) SetLegacyCashGlobal(v bool) {
+	c.mu.Lock()
+	c.legacyCashGlobal = v
+	c.mu.Unlock()
+	if c.gate != nil {
+		c.gate.SetLegacyCashGlobal(v)
+	}
+}
+
+// GetRealAccountFor 按控制器资金口径读账户：本账号遵循 legacy 开关，其他账号只读自己的行。
+func (c *Controller) GetRealAccountFor(uid string) (store.RealAccount, error) {
+	if c.store == nil {
+		return store.RealAccount{}, fmt.Errorf("real book not available")
+	}
+	if uid == c.userID {
+		return c.store.GetRealAccountScoped(uid, c.legacyCashGlobal)
+	}
+	return c.store.GetRealAccountOwn(uid)
+}
+
+// TotalAssetsFor 总资产读取（现金+持仓市值），口径同 GetRealAccountFor。
+func (c *Controller) TotalAssetsFor(uid string) (float64, error) {
+	if c.store == nil {
+		return 0, fmt.Errorf("real book not available")
+	}
+	if uid == c.userID {
+		return c.store.TotalAssetsScoped(uid, c.legacyCashGlobal)
+	}
+	return c.store.TotalAssetsScoped(uid, false)
 }
 
 // now 取当前时刻（走可注入时钟）。
@@ -319,7 +353,7 @@ func (c *Controller) AvailableCash() (float64, bool) {
 	if c.store == nil {
 		return 0, false // 未接账本库=资金口径不可得（§M12-A：调用方 fail-close，不自动买）
 	}
-	acc, err := c.store.GetRealAccount(c.userID)
+	acc, err := c.store.GetRealAccountScoped(c.userID, c.legacyCashGlobal)
 	if err != nil {
 		return 0, false // 查询失败同为口径不可得
 	}
@@ -444,7 +478,7 @@ func (c *Controller) Snapshot() StateSnapshot {
 	cashAt := ""
 	stuckN, stuckAge := 0, 0
 	if c.store != nil {
-		if acc, err := c.store.GetRealAccount(c.userID); err == nil {
+		if acc, err := c.store.GetRealAccountScoped(c.userID, c.legacyCashGlobal); err == nil {
 			cashAt = acc.UpdatedAt
 		}
 		day := cntime.Now().Format("2006-01-02")

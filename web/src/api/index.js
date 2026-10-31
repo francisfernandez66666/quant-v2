@@ -493,6 +493,16 @@ export function hasPerm(perm) {
 }
 
 /**
+ * 当前用户是否显式持有指定权限位（admin 不隐式放行）。
+ * 资金/交易/用户/配置/运维五组敏感动作使用；research_approve 继续用 hasPerm 兼容旧口径。
+ * Whether the user explicitly holds the bit (no admin-role bypass).
+ * @param {string} perm - 权限位名
+ */
+export function hasStrictPerm(perm) {
+  return getPerms().indexOf(perm) >= 0
+}
+
+/**
  * 拉取并缓存当前登录用户信息（角色/权限位）
  * Fetches and caches the current user's profile (role / permission bits)
  * 对应后端 GET /api/auth/me；成功后把 role/perms 写回 localStorage，

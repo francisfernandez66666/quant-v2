@@ -13,7 +13,6 @@ import { showToast, confirmDialog } from '../ui.jsx'
 
 // 从 api 模块导入权限判断工具：isAdmin() 读取 localStorage 中缓存的 role（由 App 的 refreshMe 写入）
 // 守卫判断来源：web/src/api/index.js 的 isAdmin()（基于 STORAGE_ROLE），与 App.jsx 中侧边栏 canAdmin 一致
-import { isAdmin } from '../api/index.js'
 // §P2-I（2026-10-06 修复批 波 6）轮询「后到丢弃」统一入口：本文件 30s 轮询的运行日志正文
 // 由「定时器 + 日期切换 + 手动刷新」三驱动交错，上一轮在途时下一轮已发出，旧响应迟到会把
 // 刚刷出来的日志盖回上一轮值——用这一个 hook 持有跨渲染稳定的守卫实例（内部 useRef 惰性初始化，
@@ -24,9 +23,17 @@ import { useStaleGuard } from '../utils/staleGuard.js' // §P2-I 轮询后到丢
 import { useLoadLedger } from '../utils/loadLedger.js' // §P2-J 读取失败按腿记账（共用台账）
 // §P2-J 台账红条单实现：页面只管记账与摆放位置，文案/testid 都在组件里，不在页内抄 div。
 import LoadFailBanner from '../components/LoadFailBanner.jsx' // §P2-J 台账红条（单实现，testid 只有一处）
+import { canStrict } from '../utils/perm.js'
 
 // 权限位中文标签映射：把后端下发的英文权限标识翻译为界面可读文案（当前仅"研究审批"一项）
-const PERM_LABELS = { research_approve: '研究审批' }
+const PERM_LABELS = {
+  research_approve: '研究审批',
+  funds_admin: '资金管理',
+  trading_admin: '交易管理',
+  user_admin: '用户管理',
+  config_admin: '配置管理',
+  ops_admin: '运维诊断',
+}
 
 // 战法参数分组定义（与 Vue 版 Settings/Admin 一致）；每个 group 的 fields 决定代配弹窗中展示的输入框与步长
 const strategyGroups = [
@@ -226,7 +233,7 @@ export default function Admin() {
   // 的交错窗口，接了反而是空转代号，故此处判为不接。
   async function loadUsers() {
     // 守卫二次校验：不是管理员则直接中止数据加载
-    if (!isAdmin()) return
+    if (!canStrict('user_admin')) return
     try {
       const res = await api.fetchAdminUsers()
       setUsers(res.users || [])
@@ -658,7 +665,7 @@ export default function Admin() {
 
   // 权限守卫：非管理员（api.isAdmin() 返回 false）直接渲染"无权限访问"，
   // 既禁止通过 URL 直接访问，也避免越权渲染管理界面（数据由 loadUsers 守卫拦截）
-  if (!isAdmin()) {
+  if (!canStrict('user_admin')) {
     return (
       <div className="page" style={{ textAlign: 'center', paddingTop: 80 }}>
         <h2 style={{ fontSize: 18, fontWeight: 600 }}>无权限访问</h2>

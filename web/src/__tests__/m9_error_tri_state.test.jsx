@@ -57,7 +57,8 @@ vi.mock('../api/index.js', async () => {
   for (const name of Object.keys(okPayloads())) {
     stubs[name] = vi.fn(async (...args) => state.impl[name](...args))
   }
-  return { ...actual, ...stubs }
+  // §MULTI-ADMIN：本用例锁定错误三态，不测权限面；给同步的 hasStrictPerm 桩，避免 actual 按空 perms 隐藏页面。
+  return { ...actual, ...stubs, hasStrictPerm: () => true }
 })
 
 import Signals from '../pages/Signals.jsx'

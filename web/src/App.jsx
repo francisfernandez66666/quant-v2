@@ -34,6 +34,7 @@ const APP_BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMI
 
 import Dashboard from './pages/Dashboard.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
+import { canStrict } from './utils/perm.js'
 
 // §R4-10 路由级代码分割：除首屏落地页 Dashboard 外，其余页面全部 React.lazy 按需加载，
 // Vite 自动按页面拆 chunk——首屏 bundle 只含外壳+Dashboard，进入对应路由时才拉取该页代码
@@ -82,7 +83,7 @@ function Forbidden() {
 //   admin 壳先渲染、逐屏吃 403 的窗口期。
 //   English: §A5 — guarded routes stay on a loading placeholder until the authoritative role
 //   from GET /api/auth/me has been reconciled into storage.
-function ProtectedRoute({ admin, perm, checked, children }) {
+function ProtectedRoute({ admin, perm, strictPerm, strictAny, checked, children }) {
   // §P1-13 路由守卫：未登录先跳转登录页（/ 由顶层 loggedIn 切换为登录视图），
   // 已登录但权限/角色不足才落到 /403，避免未登录直接暴露 401 空页面。
   if (!api.isLoggedIn()) {
@@ -91,7 +92,8 @@ function ProtectedRoute({ admin, perm, checked, children }) {
   if (!checked) {
     return <PageFallback />
   }
-  const allowed = admin ? api.isAdmin() : perm ? api.hasPerm(perm) : true
+  // strictAny 用于「任一显式权限位即可」的页面（设置页：config_admin 或 trading_admin）。
+  const allowed = admin ? api.isAdmin() : strictPerm ? canStrict(strictPerm) : strictAny ? strictAny.some((p) => canStrict(p)) : perm ? api.hasPerm(perm) : true
   return allowed ? children : <Navigate to="/403" replace />
 }
 
@@ -125,6 +127,10 @@ export default function App() {
   const [shortEnabled, setShortEnabled] = useState(false)
   const [canResearch, setCanResearch] = useState(false)
   const [canAdmin, setCanAdmin] = useState(false)
+  const [canUserAdmin, setCanUserAdmin] = useState(false)
+  const [canTrading, setCanTrading] = useState(false)
+  const [canConfig, setCanConfig] = useState(false)
+  const [canOps, setCanOps] = useState(false)
   // §A5（20260918 审计批）服务端权威角色对账完成位：ProtectedRoute 在其为 false 前不放行
   const [meChecked, setMeChecked] = useState(false)
   // §A7（20260918 审计批）版本漂移告警文案：refreshStatus 比对本地构建指纹与 /api/status
@@ -170,6 +176,10 @@ export default function App() {
   function applyRoleGates() {
     setCanResearch(api.hasPerm('research_approve'))
     setCanAdmin(api.isAdmin())
+    setCanUserAdmin(canStrict('user_admin'))
+    setCanTrading(canStrict('trading_admin'))
+    setCanConfig(canStrict('config_admin'))
+    setCanOps(canStrict('ops_admin'))
   }
 
   // 初始化时校验本地 token，若有效则恢复登录态并刷新角色
@@ -509,20 +519,20 @@ export default function App() {
     { to: '/emotion', icon: <ChartLineIcon size="18px" />, label: '情绪回看' },
     { to: '/msgcenter', icon: <NotificationIcon size="18px" />, label: '消息', badge: alertCount },
     { to: '/positions', icon: <WalletIcon size="18px" />, label: '持仓' },
-    { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' },
+    canTrading ? { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' } : null,
     // §PAPER-CFG-DESYNC：管理员即使模拟盘当前关闭也保留入口——启用开关在本页「⚙ 设置」内，
     // 只按 enabled 隐藏会让关掉后无法再打开。
     shouldShowPaperTab(paperEnabled, canAdmin)
       ? { to: '/paper', icon: <RocketIcon size="18px" />, label: '模拟盘' }
       : null,
-    canAdmin ? { to: '/settings', icon: <SettingIcon size="18px" />, label: '设置' } : null,
+    (canConfig || canTrading) ? { to: '/settings', icon: <SettingIcon size="18px" />, label: '设置' } : null,
     // §PERM-GATE 20260918：LLM 诊断两个主数据源均为 admin 守卫（server.go:683/692），
     // 成员常显入口进页必 403 —— 收敛为仅管理员可见。
-    canAdmin ? { to: '/llm-debug', icon: <TerminalIcon size="18px" />, label: 'LLM诊断' } : null,
+    canOps ? { to: '/llm-debug', icon: <TerminalIcon size="18px" />, label: 'LLM诊断' } : null,
     { to: '/consult', icon: <ChatBubble1Icon size="18px" />, label: '股票咨询' },
     canResearch ? { to: '/research', icon: <SearchIcon size="18px" />, label: '自动研究' } : null,
     // 条件项为 null 时由下方 filter(Boolean) 剔除，实现入口按权限显隐
-    canAdmin ? { to: '/admin', icon: <UsergroupIcon size="18px" />, label: '用户管理' } : null,
+    canUserAdmin ? { to: '/admin', icon: <UsergroupIcon size="18px" />, label: '用户管理' } : null,
   ].filter(Boolean)
 
   // §安全 F1（2026-08-29）：全局 ErrorBoundary 包裹整个应用（登录页/顶部栏/侧边栏/路由出口），
@@ -720,7 +730,7 @@ export default function App() {
                     <Route path="/positions" element={<Positions />} />
                     {/*
                      * 量化交易页：策略运行与调仓入口 */}
-                    <Route path="/quant" element={<Quant />} />
+                    <Route path="/quant" element={<ProtectedRoute strictPerm="trading_admin" checked={meChecked}><Quant /></ProtectedRoute>} />
                     {/*
                      * 热点页：热点板块/评分排名/宏观日历/IPO/资讯 */}
                     <Route path="/hotspot" element={<Hotspot />} />
@@ -729,11 +739,11 @@ export default function App() {
                     <Route path="/msgcenter" element={<MsgCenter />} />
                     {/*
                      * 设置页：仅管理员（ProtectedRoute admin 守卫） */}
-                    <Route path="/settings" element={<ProtectedRoute admin checked={meChecked}><Settings /></ProtectedRoute>} />
+                    <Route path="/settings" element={<ProtectedRoute strictAny={['config_admin', 'trading_admin']} checked={meChecked}><Settings /></ProtectedRoute>} />
                     {/*
                      * LLM 诊断页：查看大模型调用与结构化输出
                      * §PERM-GATE 20260918：数据源 admin 守卫，套 ProtectedRoute admin 与侧栏一致 */}
-                    <Route path="/llm-debug" element={<ProtectedRoute admin checked={meChecked}><LLMDebug /></ProtectedRoute>} />
+                    <Route path="/llm-debug" element={<ProtectedRoute strictPerm="ops_admin" checked={meChecked}><LLMDebug /></ProtectedRoute>} />
                     {/*
                      * 股票咨询页：自然语言问询个股/板块 */}
                     <Route path="/consult" element={<Consult />} />
@@ -742,7 +752,7 @@ export default function App() {
                     <Route path="/research" element={<ProtectedRoute perm="research_approve" checked={meChecked}><Research /></ProtectedRoute>} />
                     {/*
                      * 用户管理页：仅管理员 */}
-                    <Route path="/admin" element={<ProtectedRoute admin checked={meChecked}><Admin /></ProtectedRoute>} />
+                    <Route path="/admin" element={<ProtectedRoute strictPerm="user_admin" checked={meChecked}><Admin /></ProtectedRoute>} />
                     {/*
                      * 模拟盘页：纸面交易记账/自动撮合（入口受 paperEnabled 开关控制） */}
                     <Route path="/paper" element={<Paper />} />

@@ -462,7 +462,7 @@ func (s *Server) handleFundsToday(w http.ResponseWriter, r *http.Request) {
 	}
 	// 账户级兜底：T 循环没跑也要能看到券商资金快照（含手动委托冻结）。
 	if db := s.realDB(); db != nil {
-		if acc, err := db.GetRealAccount(uid); err == nil && acc.UpdatedAt != "" {
+		if acc, err := s.realAccountFor(uid); err == nil && acc.UpdatedAt != "" {
 			live["account"] = map[string]interface{}{
 				"cash": acc.AvailableCash, "frozen_cash": acc.FrozenCash,
 				"total_asset": acc.TotalAsset, "market_value": acc.MarketValue,
@@ -471,7 +471,7 @@ func (s *Server) handleFundsToday(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	paperView := map[string]interface{}{"available": false, "reason": "模拟盘引擎未接入：目标仓位读数不可得（不是 0，也不是满额）"}
-	if pe := s.paperEngineFor(s.operatorID()); pe != nil {
+	if pe := s.paperEngineFor(uid); pe != nil {
 		paperView = map[string]interface{}{"available": true, "readout": pe.TargetReadout()}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{

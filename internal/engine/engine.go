@@ -1495,8 +1495,8 @@ func (e *Engine) atrRiskBudgetQty(sig combat_agent.Signal, price, riskPct float6
 	if st == nil || uid == "" {
 		return 0, 0, false
 	}
-	total, err := st.TotalAssets(uid)
-	if err != nil || total <= 0 {
+	total := e.totalAssetsFor(uid)
+	if total <= 0 {
 		return 0, 0, false
 	}
 	mult := 2.5
@@ -1616,9 +1616,9 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	}
 	// 基数优先用券商 total_asset（与方案一致）；缺失才回落账本合计。
 	total := 0.0
-	if acc, err := st.GetRealAccount(uid); err == nil && acc.TotalAsset > 0 {
+	if acc, err := e.cashAccount(uid); err == nil && acc.TotalAsset > 0 {
 		total = acc.TotalAsset
-	} else if v, err := st.TotalAssets(uid); err == nil && v > 0 {
+	} else if v := e.totalAssetsFor(uid); v > 0 {
 		total = v
 	}
 	out.Total = total
@@ -6603,7 +6603,7 @@ func (e *Engine) recordDailyEquitySnapshot() {
 	if done {
 		return
 	}
-	acc, err := st.GetRealAccount(uid)
+	acc, err := e.cashAccount(uid)
 	if err != nil || acc.TotalAsset <= 0 {
 		return // 券商未回报 → 本轮不落点（下一轮再试），绝不把"未知"写成 0
 	}

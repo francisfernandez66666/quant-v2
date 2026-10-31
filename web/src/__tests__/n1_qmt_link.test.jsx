@@ -17,6 +17,7 @@ const { state } = vi.hoisted(() => ({ state: {} }))
 function okPayloads() {
   return {
     isAdmin: () => false,
+    hasStrictPerm: () => true, // §MULTI-ADMIN：本用例锁定 QMT 链路渲染，不测权限面
     getAccount: () => 'admin',
     fetchStatus: () => ({ session: 'test', signal_count: 0 }),
     setLastSession: () => {},

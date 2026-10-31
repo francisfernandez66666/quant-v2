@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../api/index.js', () => ({
   fetchFundsToday: mocks.fetchFundsToday,
   isForbidden: (e) => !!(e && e.status === 403),
+  hasStrictPerm: () => true, // §MULTI-ADMIN：本用例锁定资金帧展示，权限由 strict_perm_api 单测覆盖
 }))
 
 /** 造一帧资金（信号仓侧有值；T 侧按 t_at 的有无区分"没跑过"/"跑过"）。 */

@@ -111,6 +111,8 @@ type Gate struct {
 	st *store.DB
 	// userID 归属资金账号（账本查询与 risk_gates 留痕均按账号过滤）。
 	userID string
+	// legacyCashGlobal 是否允许读 user_id='' 遗留资金行（仅 owner/旧部署）。
+	legacyCashGlobal bool
 	// now 时间源（可注入便于测试；交易日期与券商快照新鲜度判定均基于此）。
 	now func() time.Time
 	// onGate 告警回调（可空；仅 alert=true 的新闸命中时以 high 级别触发）。
@@ -152,6 +154,25 @@ type Gate struct {
 // English: NewGate builds a risk gate; onGate may be nil (new gates alert high, legacy guards don't).
 func NewGate(st *store.DB, userID string, onGate func(level, title, content string)) *Gate {
 	return &Gate{st: st, userID: userID, now: time.Now, onGate: onGate}
+}
+
+// SetLegacyCashGlobal 设置资金读取是否允许 legacy 全局行（与 Controller 同口径）。
+func (g *Gate) SetLegacyCashGlobal(v bool) { g.legacyCashGlobal = v }
+
+// cashAccount 按闸的资金口径读账户（owner 允许 legacy；其他账号只看自己的行）。
+func (g *Gate) cashAccount() (store.RealAccount, error) {
+	if g.st == nil {
+		return store.RealAccount{}, nil
+	}
+	return g.st.GetRealAccountScoped(g.userID, g.legacyCashGlobal)
+}
+
+// totalAssets 读取总资产（现金+持仓市值），口径同 cashAccount。
+func (g *Gate) totalAssets() (float64, error) {
+	if g.st == nil {
+		return 0, nil
+	}
+	return g.st.TotalAssetsScoped(g.userID, g.legacyCashGlobal)
 }
 
 // SetCrossPriceSource §XCHECK 2026-09-22 C批：注入价格复核闸的独立复核源（可空=闸保持跳过，
@@ -569,7 +590,7 @@ func (g *Gate) checkDayLoss(cfg config.QMTConfig, o LiveOrder) string {
 	}
 	// 分母（总资产）优先取账本实时口径，不可得时回落初始本金；两者皆无则跳过（fail-open）。
 	base := 0.0
-	if total, terr := g.st.TotalAssets(g.userID); terr == nil && total > 0 {
+	if total, terr := g.totalAssets(); terr == nil && total > 0 {
 		base = total
 	} else if cfg.InitialCapital > 0 {
 		base = cfg.InitialCapital
@@ -601,7 +622,7 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 		return ""
 	}
 	// 总资产不可得（账本缺失或 ≤0）时失败跳过 —— 以草率分母算出的比例不可信。
-	total, err := g.st.TotalAssets(g.userID)
+	total, err := g.totalAssets()
 	if err != nil || total <= 0 {
 		return ""
 	}
@@ -680,7 +701,7 @@ func (g *Gate) checkSectorExposure(cfg config.QMTConfig, o LiveOrder) string {
 		return "" // 行业未知 → 弃权，不把“取不到”当 0 敞口
 	}
 	// 总资产不可得（账本缺失或 ≤0）→ 弃权：用不可信分母算出的比例没有意义。
-	total, err := g.st.TotalAssets(g.userID)
+	total, err := g.totalAssets()
 	if err != nil || total <= 0 {
 		return ""
 	}
@@ -760,7 +781,7 @@ func (g *Gate) checkConceptExposure(cfg config.QMTConfig, o LiveOrder) string {
 		return "" // 概念未知 → 弃权
 	}
 	// 总资产不可得 → 弃权；概念敞口的分母必须是可信总资产。
-	assets, err := g.st.TotalAssets(g.userID)
+	assets, err := g.totalAssets()
 	if err != nil || assets <= 0 {
 		return ""
 	}
@@ -996,7 +1017,7 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	if cfg.InitialCapital > 0 {
 		// 券商账户快照 10 分钟内视为新鲜；新鲜时直接用券商口径，跳过本地近似估算。
 		brokerFresh := false
-		if acc, aerr := g.st.GetRealAccount(g.userID); aerr == nil && acc.AvailableCash > 0 {
+		if acc, aerr := g.cashAccount(); aerr == nil && acc.AvailableCash > 0 {
 			if at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc); perr == nil &&
 				g.now().Sub(at) <= 10*time.Minute {
 				brokerFresh = true
@@ -1048,7 +1069,7 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 		}
 	}
 	// 闸4：券商口径可用资金双闸（§R4-3）——在近似口径之外，用券商上报的可用现金再校验一次。
-	if acc, err := g.st.GetRealAccount(g.userID); err == nil && acc.AvailableCash > 0 {
+	if acc, err := g.cashAccount(); err == nil && acc.AvailableCash > 0 {
 		at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc)
 		if perr == nil {
 			// 快照新鲜用全额；陈旧（>10 分钟）保守折算 50%，防止过期余额放行超额单。

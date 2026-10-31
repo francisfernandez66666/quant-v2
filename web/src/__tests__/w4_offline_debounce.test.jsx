@@ -25,6 +25,7 @@ function apiMockBase(fetchStatusImpl) {
     setStoredServer: () => {},
     hasPerm: () => false,
     isAdmin: () => false,
+    hasStrictPerm: () => true, // §MULTI-ADMIN：本用例锁定离线去抖，不测权限面
     refreshMe: vi.fn(async () => ({ role: 'user', perms: [] })),
     login: vi.fn(async () => ({})),
     logout: vi.fn(),

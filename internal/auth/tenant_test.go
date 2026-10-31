@@ -51,8 +51,8 @@ func TestTenantLegacyMigration(t *testing.T) {
 	if len(ts) != 1 || ts[0].ID != DefaultTenantID || !ts[0].Enabled {
 		t.Fatalf("应自动补齐 t_default, got %+v", ts)
 	}
-	if m.SchemaVersion() != 2 {
-		t.Errorf("升级后 schema 应为 2, got %d", m.SchemaVersion())
+	if m.SchemaVersion() != 3 {
+		t.Errorf("升级后 schema 应为 3, got %d", m.SchemaVersion())
 	}
 	// 落盘复核（重启幂等不再改动）
 	raw, _ := os.ReadFile(filepath.Join(dir, "auth.json"))

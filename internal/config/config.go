@@ -3304,6 +3304,13 @@ func (m *Manager) SetOperatorID(id string) {
 	m.mu.Unlock()
 }
 
+// OperatorID 返回运营数据归属账号 ID（main 在装配期注入；空串表示未注入）。
+func (m *Manager) OperatorID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.operatorID
+}
+
 // ownerOf 返回运营数据归属账号：已注入 operatorID 时优先，否则回退到调用方传入的 userID。
 // 这是“运营数据系统级共享、后端按角色鉴权”的核心：所有账号看到的量化/模拟盘/看板/告警/LLM
 // 都是同一份（归属管理员），前端只负责展示，权限由后端在接口层判定。

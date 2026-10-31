@@ -523,3 +523,142 @@ func TestMultiSession(t *testing.T) {
 		t.Errorf("新密码应可登录: %v", err)
 	}
 }
+
+// TestHasExplicitPerm 显式权限位与 admin 隐式全量必须分开：
+// 五个敏感位只认 Perms；research_approve 继续保留 admin 隐式兼容。
+func TestHasExplicitPerm(t *testing.T) {
+	m := newTestMgr(t)
+	owner, err := m.CreateUser("owner", "pw", RoleAdmin, nil, 0)
+	if err != nil {
+		t.Fatalf("CreateUser(owner): %v", err)
+	}
+	second, err := m.CreateUser("second", "pw", RoleAdmin, []string{PermResearchApprove}, 0)
+	if err != nil {
+		t.Fatalf("CreateUser(second): %v", err)
+	}
+	for _, p := range []string{PermFundsAdmin, PermTradingAdmin, PermUserAdmin, PermConfigAdmin, PermOpsAdmin} {
+		if !m.HasExplicitPerm(owner.ID, p) {
+			t.Errorf("首个 admin 应有显式权限位 %s", p)
+		}
+		if m.HasExplicitPerm(second.ID, p) {
+			t.Errorf("第二个 admin 不应有显式权限位 %s", p)
+		}
+	}
+	if !m.HasExplicitPerm(second.ID, PermResearchApprove) {
+		t.Error("第二个 admin 应保留 research_approve")
+	}
+	if !m.HasPerm(second.ID, PermFundsAdmin) {
+		t.Error("HasPerm 对 admin 仍应隐式放行（兼容旧接入口径）")
+	}
+}
+
+// TestSetPermsWhitelist SetPerms 只接受登记过的权限位，未知字符串必须报错。
+func TestSetPermsWhitelist(t *testing.T) {
+	m := newTestMgr(t)
+	u, err := m.CreateUser("member", "pw", RoleUser, nil, 0)
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := m.SetPerms(u.ID, []string{PermFundsAdmin}); err != nil {
+		t.Fatalf("白名单内权限应保存成功: %v", err)
+	}
+	if !m.HasExplicitPerm(u.ID, PermFundsAdmin) {
+		t.Error("设置后应持有 funds_admin")
+	}
+	if err := m.SetPerms(u.ID, []string{"root_everything"}); err == nil {
+		t.Error("未知权限位应被拒绝")
+	}
+}
+
+// TestSetupInitialAdminGetsPerms /setup 首次初始化不走 schema 迁移，必须显式授予五个敏感位。
+func TestSetupInitialAdminGetsPerms(t *testing.T) {
+	m := NewManager(t.TempDir())
+	if err := m.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	u, err := m.SetupInitialAdmin("admin", "pw")
+	if err != nil {
+		t.Fatalf("SetupInitialAdmin: %v", err)
+	}
+	for _, p := range []string{PermFundsAdmin, PermTradingAdmin, PermUserAdmin, PermConfigAdmin, PermOpsAdmin} {
+		if !u.HasExplicitPerm(p) {
+			t.Errorf("/setup 首个 admin 应有显式权限位 %s", p)
+		}
+	}
+	second, err := m.CreateUser("second", "pw", RoleAdmin, []string{PermResearchApprove}, 0)
+	if err != nil {
+		t.Fatalf("CreateUser(second): %v", err)
+	}
+	if second.HasExplicitPerm(PermFundsAdmin) {
+		t.Error("第二个 admin 不应获得 funds_admin")
+	}
+}
+
+// TestCreateFirstAdminGetsPerms 管理端建号路径的首个 admin 同样要授予五个敏感位。
+func TestCreateFirstAdminGetsPerms(t *testing.T) {
+	m := newTestMgr(t)
+	first, err := m.CreateUser("first", "pw", RoleAdmin, nil, 0)
+	if err != nil {
+		t.Fatalf("CreateUser(first): %v", err)
+	}
+	for _, p := range []string{PermFundsAdmin, PermTradingAdmin, PermUserAdmin, PermConfigAdmin, PermOpsAdmin} {
+		if !first.HasExplicitPerm(p) {
+			t.Errorf("首个 admin 应有显式权限位 %s", p)
+		}
+	}
+	second, err := m.CreateUser("second", "pw", RoleAdmin, []string{PermResearchApprove}, 0)
+	if err != nil {
+		t.Fatalf("CreateUser(second): %v", err)
+	}
+	if second.HasExplicitPerm(PermFundsAdmin) {
+		t.Error("第二个 admin 不应获得 funds_admin")
+	}
+}
+
+// TestAdminPermsMigration 老库 version=2 升级到 3：给首个 admin 补五组权限位，
+// 第二个 admin/test01 不变；迁移前备份必须落盘；再次 Init 幂等。
+func TestAdminPermsMigration(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	if err := m.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	owner, err := m.CreateUser("admin", "pw", RoleAdmin, nil, 0)
+	if err != nil {
+		t.Fatalf("CreateUser(owner): %v", err)
+	}
+	second, err := m.CreateUser("test01", "pw", RoleAdmin, []string{PermResearchApprove}, 0)
+	if err != nil {
+		t.Fatalf("CreateUser(second): %v", err)
+	}
+	for _, p := range []string{PermFundsAdmin, PermTradingAdmin, PermUserAdmin, PermConfigAdmin, PermOpsAdmin} {
+		if err := m.RevokePerm(owner.ID, p); err != nil {
+			t.Fatalf("RevokePerm(%s): %v", p, err)
+		}
+	}
+	m.mu.Lock()
+	m.db.SchemaVersion = 2
+	err = m.save()
+	m.mu.Unlock()
+	if err != nil {
+		t.Fatalf("save version=2: %v", err)
+	}
+	if err := m.Init(); err != nil {
+		t.Fatalf("re-Init: %v", err)
+	}
+	if got := m.SchemaVersion(); got != 3 {
+		t.Fatalf("迁移后 schema 应为 3, got %d", got)
+	}
+	for _, p := range []string{PermFundsAdmin, PermTradingAdmin, PermUserAdmin, PermConfigAdmin, PermOpsAdmin} {
+		if !m.HasExplicitPerm(owner.ID, p) {
+			t.Errorf("迁移后首个 admin 应有 %s", p)
+		}
+		if m.HasExplicitPerm(second.ID, p) {
+			t.Errorf("迁移后 test01 不应有 %s", p)
+		}
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "auth.json.pre-migrate-*"))
+	if len(matches) == 0 {
+		t.Fatal("迁移前备份 auth.json.pre-migrate-* 未落盘")
+	}
+}

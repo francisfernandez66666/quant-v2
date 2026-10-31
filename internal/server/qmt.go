@@ -256,7 +256,7 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	}
 	ctrl := s.qmtCtrlFor(userIDFor(r))
 	// §可用资金：广州实盘账户资产（可用/冻结/总值/市值），随持仓接口一并返回供前端展示。
-	acc, _ := db.GetRealAccount(userIDFor(r))
+	acc, _ := s.realAccountFor(userIDFor(r))
 	// §实盘账户兜底：网关未上报 account 事件（或上报异常）时 GetRealAccount 返回零值行，
 	// 前端"可用资金 ¥0.00/总值 ¥0.00"失真。此时用持仓市值（实时价优先、缺则成本价）补总值/
 	// 市值，可用资金未知则保持 0（无法凭空造现金，前端按 updated_at 区分展示）。
@@ -754,7 +754,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 		// 空快照 + 券商仍报有市值 → 推断会话未同步（桥侧可能漏报 synced，不能就此清账）。
 		if len(ev.Positions) == 0 {
-			if acc, aerr := db.GetRealAccount(owner); aerr == nil && acc.MarketValue > 0 {
+			if acc, aerr := s.realAccountFor(owner); aerr == nil && acc.MarketValue > 0 {
 				log.Printf("[trading] ⚠ positions 空快照但账户市值 %.0f>0(用户=%s)——推断未同步，跳过对账", acc.MarketValue, owner)
 				opslog.DayOnce("positions-empty-mv:"+owner, func() {
 					opslog.Logf("quant", "持仓空快照但账户市值 %.0f>0 用户=%s，推断会话未同步，跳过对账", acc.MarketValue, owner)
@@ -1551,6 +1551,18 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		cfg.Token = ""
 		opslog.Logf("quant", "§TOKEN-PERAACCT 账号 %s 保存配置未带走继承来的实盘凭证（本次只清 token，其余字段照常保存）", target)
 		log.Printf("[qmt] §TOKEN-PERAACCT target=%s actor=%s：继承凭证不落盘（token 置空）", target, actor)
+	}
+
+	// §MULTI-ADMIN：非运营账号启用实盘必须持有**自己的**网关 token；空凭证/继承凭证一律拒绝。
+	// 运营账号（owner admin）保留 legacy 全局兜底，兼容单账号旧部署。
+	if req.Enabled != nil && *req.Enabled && target != s.operatorID() {
+		own, stored := s.cfg.StoredQMTConfigFor(target)
+		hasOwn := stored && strings.TrimSpace(own.Token) != ""
+		if !hasOwn && !explicitToken {
+			writeError(w, http.StatusBadRequest,
+				"启用实盘前必须先为该账号配置自己的网关 token（不接受继承/空凭证）")
+			return
+		}
 	}
 
 	// §WS-K 维4 保存前 schema 校验：非法配置返回 400，不再静默排队/落库。

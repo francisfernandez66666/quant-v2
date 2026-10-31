@@ -19,6 +19,9 @@ vi.mock('../api/index.js', () => ({
   setStoredServer: vi.fn(),
   getAccount: () => 'admin',
   getRole: () => ROLE,
+  // §MULTI-ADMIN：设置页配置区改按显式权限位收敛，mock 必须与角色同步。
+  hasStrictPerm: (perm) => ROLE === 'admin' && perm === 'config_admin',
+  isAdmin: () => ROLE === 'admin',
   // §NATIVEAUTH（2026-09-22 C批）：Settings 诊断行改走 api.getToken() 统一读取点，mock 须补齐该导出
   getToken: () => 'tok',
   fetchStatus: vi.fn(async () => ({})),

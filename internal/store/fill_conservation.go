@@ -203,7 +203,7 @@ func (d *DB) CheckBookConservation(userID, day string, initialCapital float64) (
 	// 净占用现金：买入 − (卖出 − 费用/印花税腿)。指令钉的就是这个口径，单独回显便于人工复核。
 	cash.NetSpend = cash.BuyAmount - (cash.SellAmount - cash.FeeTotal - cash.StampTaxTotal)
 	cash.ExpectedCash = initialCapital - cash.BuyAmount - cash.FeeTotal + cash.SellAmount - cash.StampTaxTotal
-	acc, err := d.GetRealAccount(userID)
+	acc, err := d.GetRealAccountOwn(userID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("read cash book: %w", err)
 	}

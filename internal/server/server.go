@@ -614,35 +614,35 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/auth/me", s.authMiddleware(s.handleAuthMe))
 
 	// 用户/账号管理（仅 admin）
-	s.mux.HandleFunc("GET /api/admin/users", s.adminMiddleware(s.handleListUsers))
+	s.mux.HandleFunc("GET /api/admin/users", s.strictPermMiddleware(auth.PermUserAdmin, s.handleListUsers))
 	// §D7-B 注册已关闭，邀请码端点随之下线（auth 层能力保留以备将来重开）
-	s.mux.HandleFunc("POST /api/admin/users", s.adminMiddleware(s.handleCreateUser))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/role", s.adminMiddleware(s.handleSetUserRole))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/perms", s.adminMiddleware(s.handleSetUserPerms))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/password", s.adminMiddleware(s.handleSetUserPassword))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/enabled", s.adminMiddleware(s.handleSetUserEnabled))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/expiry", s.adminMiddleware(s.handleSetUserExpiry))
-	s.mux.HandleFunc("DELETE /api/admin/users/{id}", s.adminMiddleware(s.handleDeleteUser))
+	s.mux.HandleFunc("POST /api/admin/users", s.strictPermMiddleware(auth.PermUserAdmin, s.handleCreateUser))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/role", s.strictPermMiddleware(auth.PermUserAdmin, s.handleSetUserRole))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/perms", s.strictPermMiddleware(auth.PermUserAdmin, s.handleSetUserPerms))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/password", s.strictPermMiddleware(auth.PermUserAdmin, s.handleSetUserPassword))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/enabled", s.strictPermMiddleware(auth.PermUserAdmin, s.handleSetUserEnabled))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/expiry", s.strictPermMiddleware(auth.PermUserAdmin, s.handleSetUserExpiry))
+	s.mux.HandleFunc("DELETE /api/admin/users/{id}", s.strictPermMiddleware(auth.PermUserAdmin, s.handleDeleteUser))
 	// §U-5 脏账号批量清理（temp_/过期）。static 段 "cleanup" 优先于 {id}，二者路径段数不同不冲突。
-	s.mux.HandleFunc("POST /api/admin/users/cleanup", s.adminMiddleware(s.handleCleanupUsers))
+	s.mux.HandleFunc("POST /api/admin/users/cleanup", s.strictPermMiddleware(auth.PermUserAdmin, s.handleCleanupUsers))
 	// §MT 多租户：租户管理（平台运营者）+ 本租户用量 + 跨租户迁移
-	s.mux.HandleFunc("GET /api/tenants", s.adminMiddleware(s.handleListTenants))
-	s.mux.HandleFunc("POST /api/tenants", s.adminMiddleware(s.handleCreateTenant))
-	s.mux.HandleFunc("PUT /api/tenants/{id}", s.adminMiddleware(s.handleUpdateTenant))
-	s.mux.HandleFunc("GET /api/tenant/usage", s.adminMiddleware(s.handleTenantUsage))
-	s.mux.HandleFunc("PUT /api/admin/users/{id}/tenant", s.adminMiddleware(s.handleMoveUserTenant))
+	s.mux.HandleFunc("GET /api/tenants", s.strictPermMiddleware(auth.PermUserAdmin, s.handleListTenants))
+	s.mux.HandleFunc("POST /api/tenants", s.strictPermMiddleware(auth.PermUserAdmin, s.handleCreateTenant))
+	s.mux.HandleFunc("PUT /api/tenants/{id}", s.strictPermMiddleware(auth.PermUserAdmin, s.handleUpdateTenant))
+	s.mux.HandleFunc("GET /api/tenant/usage", s.strictPermMiddleware(auth.PermUserAdmin, s.handleTenantUsage))
+	s.mux.HandleFunc("PUT /api/admin/users/{id}/tenant", s.strictPermMiddleware(auth.PermUserAdmin, s.handleMoveUserTenant))
 	// 管理员代配他人账号配置（strategy / d1 / longshort / llm）
-	s.mux.HandleFunc("GET /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminGetStrategyConfig))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminSetStrategyConfig))
-	s.mux.HandleFunc("GET /api/admin/users/{id}/config/d1", s.adminMiddleware(s.handleAdminGetD1Config))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/config/d1", s.adminMiddleware(s.handleAdminSetD1Config))
-	s.mux.HandleFunc("GET /api/admin/users/{id}/config/longshort", s.adminMiddleware(s.handleAdminGetLongShortConfig))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/config/longshort", s.adminMiddleware(s.handleAdminSetLongShortConfig))
-	s.mux.HandleFunc("GET /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminGetLLMConfig))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminSetLLMConfig))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/strategy", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetStrategyConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/strategy", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetStrategyConfig))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/d1", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetD1Config))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/d1", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetD1Config))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/longshort", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetLongShortConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/longshort", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetLongShortConfig))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/llm", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetLLMConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/llm", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetLLMConfig))
 	// §2026-09-07 多账号实盘：管理员逐账号配置 QMT 实盘（每账号独立 gateway/token/资金）。
-	s.mux.HandleFunc("GET /api/admin/users/{id}/config/qmt", s.adminMiddleware(s.handleAdminGetQMTConfig))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/config/qmt", s.adminMiddleware(s.handleAdminSetQMTConfig))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/qmt", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermTradingAdmin)(s.handleAdminGetQMTConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/qmt", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermTradingAdmin)(s.handleAdminSetQMTConfig))
 
 	// §E-1（20260917 全量对账）运维/机器端点无 UI 消费方属**有意设计**（curl/监控脚本/网关回调），
 	// 不算前端断链；新增前端调用前先确认页面归属。
@@ -657,25 +657,25 @@ func (s *Server) registerRoutes() {
 	// 等运维端点鉴权口径一致。另锤实：本服务只听自有 mux（muxWithJSONErrors），
 	// expvar 包 init 注册的 http.DefaultServeMux /debug/vars 从未被挂载/监听，无第二暴露面；
 	// 路由守卫测试见 expvar_admin_guard_test.go（含 /debug/vars 404 现状锁）。
-	s.mux.HandleFunc("GET /api/metrics", s.adminMiddleware(http.HandlerFunc(expvar.Handler().ServeHTTP)))
+	s.mux.HandleFunc("GET /api/metrics", s.strictPermMiddleware(auth.PermOpsAdmin, http.HandlerFunc(expvar.Handler().ServeHTTP)))
 	// §WS-L 维5 Prometheus text 导出（admin 鉴权，promtool 可校验）+ 阈值告警状态
-	s.mux.HandleFunc("GET /api/metrics/prometheus", s.adminMiddleware(s.handlePrometheusMetrics))
-	s.mux.HandleFunc("GET /api/metrics/alerts", s.adminMiddleware(s.handleAlertState))
+	s.mux.HandleFunc("GET /api/metrics/prometheus", s.strictPermMiddleware(auth.PermOpsAdmin, s.handlePrometheusMetrics))
+	s.mux.HandleFunc("GET /api/metrics/alerts", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleAlertState))
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
 	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
 	// §ANCHOR-FIRST W2：影子对照表只读面（admin；仅读账号目录，不触发取样/不写文件）。
-	s.mux.HandleFunc("GET /api/anchor-shadow", s.adminMiddleware(s.handleAnchorShadow))
+	s.mux.HandleFunc("GET /api/anchor-shadow", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleAnchorShadow))
 	// §DYN-SIZE v4 / §ANCHOR-FIRST 签字面：GET 只出报告（任何时候可查），POST 才写资金参数。
 	// 四个端点全部限 admin——它们改的是判线基准与合成口径，不是展示层配置。
 	// English: the sign-off surface for the v4 sizing migration and the anchor backfill:
 	// GET reports only, POST writes, admin-only in both directions.
-	s.mux.HandleFunc("GET /api/config/sizing-v4-plan", s.adminMiddleware(s.handleSizingV4Plan))
-	s.mux.HandleFunc("POST /api/config/sizing-v4-apply", s.adminMiddleware(s.handleSizingV4Apply))
-	s.mux.HandleFunc("GET /api/paper/anchor-backfill-plan", s.adminMiddleware(s.handleAnchorBackfillPlan))
-	s.mux.HandleFunc("POST /api/paper/anchor-backfill", s.adminMiddleware(s.handleAnchorBackfillApply))
+	s.mux.HandleFunc("GET /api/config/sizing-v4-plan", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSizingV4Plan))
+	s.mux.HandleFunc("POST /api/config/sizing-v4-apply", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSizingV4Apply))
+	s.mux.HandleFunc("GET /api/paper/anchor-backfill-plan", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleAnchorBackfillPlan))
+	s.mux.HandleFunc("POST /api/paper/anchor-backfill", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleAnchorBackfillApply))
 	// §OBSERVABILITY（2026-10-26）：前端错误上报（登录用户；载荷限长+指纹去重）与运行用量看板（admin）。
 	s.mux.HandleFunc("POST /api/client-errors", s.authMiddleware(s.handleClientError))
-	s.mux.HandleFunc("GET /api/usage", s.adminMiddleware(s.handleUsage))
+	s.mux.HandleFunc("GET /api/usage", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleUsage))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
 	// §Dashboard 情绪面板 A：日级情绪/风险档历史（近 30 交易日色带 + 关键指标）
 	// English: sentiment card backend — daily emotion/market-state series for the Dashboard.
@@ -685,29 +685,29 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/research/emotion-strategy-matrix", s.authMiddleware(s.handleEmotionStrategyMatrix))
 	// ── 做多/做空开关：属运营配置，仅管理员可切换；状态对所有登录用户可读（看板展示用）。──
 	// （Long/short toggles are operator config: only admin may toggle; status is readable by all.）
-	s.mux.HandleFunc("POST /api/long/toggle", s.adminMiddleware(s.handleLongToggle))
+	s.mux.HandleFunc("POST /api/long/toggle", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleLongToggle))
 	s.mux.HandleFunc("GET /api/long/status", s.authMiddleware(s.handleLongStatus))
-	s.mux.HandleFunc("POST /api/short/toggle", s.adminMiddleware(s.handleShortToggle))
+	s.mux.HandleFunc("POST /api/short/toggle", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleShortToggle))
 	s.mux.HandleFunc("GET /api/short/status", s.authMiddleware(s.handleShortStatus))
 	// ── 策略/D1/LLM 配置：运营配置系统级共享、仅管理员可读写（写会热替换全部账号引擎/新闻管线客户端）。──
 	// （Strategy/D1/LLM configs are operator-owned: admin-only read+write.）
-	s.mux.HandleFunc("GET /api/config/strategy", s.adminMiddleware(s.handleGetStrategyConfig))
+	s.mux.HandleFunc("GET /api/config/strategy", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetStrategyConfig))
 	// §GAP2-W2 权限收口：全局战法参数影响所有账号的实盘/模拟决策，写权限收敛到 admin
 	// （此前任意 14 天临时账号可改全局止盈止损）。English: §GAP2-W2 — global strategy writes are admin-only.
-	s.mux.HandleFunc("POST /api/config/strategy", s.adminMiddleware(s.handleSetStrategyConfig))
-	s.mux.HandleFunc("GET /api/config/d1", s.adminMiddleware(s.handleGetD1Config))
+	s.mux.HandleFunc("POST /api/config/strategy", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetStrategyConfig))
+	s.mux.HandleFunc("GET /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetD1Config))
 	// §GAP2-W2 权限收口：D1 规则同为全局决策面，写权限收敛到 admin。
-	s.mux.HandleFunc("POST /api/config/d1", s.adminMiddleware(s.handleSetD1Config))
-	s.mux.HandleFunc("GET /api/config/llm", s.adminMiddleware(s.handleGetLLMConfig))
+	s.mux.HandleFunc("POST /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetD1Config))
+	s.mux.HandleFunc("GET /api/config/llm", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetLLMConfig))
 	// §GAP2-W2 权限收口（P1-3）：普通用户保存自己的 LLM 配置会经 llmRecreate 热替换【全部账号】
 	// 引擎与新闻管线的客户端（归因上下文外送/计费劫持），故写权限收敛到 admin；普通用户 GET 只读。
-	s.mux.HandleFunc("POST /api/config/llm", s.adminMiddleware(s.handleSetLLMConfig))
+	s.mux.HandleFunc("POST /api/config/llm", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetLLMConfig))
 	// LLM 通道自检：盘中"现在到底能不能用"的唯一快速手段（此前只能读日志或重启进程）。
 	// 只读、不改任何状态，支持带候选配置探测（与 POST /api/config/llm 同形，含脱敏哨兵回填）。
-	s.mux.HandleFunc("POST /api/config/llm/probe", s.adminMiddleware(s.handleProbeLLMConfig))
+	s.mux.HandleFunc("POST /api/config/llm/probe", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleProbeLLMConfig))
 	// 一键回滚：热更新翻车（例如强制应用了一个其实不能用的配置）时回到上一个已验证可用的配置，
 	// 不必重启、不必回忆上次填了什么。与写接口同权限（会改运行时与落库）。
-	s.mux.HandleFunc("POST /api/config/llm/rollback", s.adminMiddleware(s.handleRollbackLLMConfig))
+	s.mux.HandleFunc("POST /api/config/llm/rollback", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleRollbackLLMConfig))
 
 	// QMT 实盘配置：运营数据统一归属管理员（系统级共享），仅管理员可读写。
 	// 子账号不拥有/不操作量化交易，后端据此鉴权，前端不自行判定权限。
@@ -718,11 +718,11 @@ func (s *Server) registerRoutes() {
 	// English: §A0 — sizing is account-scoped now, so the route only requires auth and the handler
 	// enforces admin-or-self; adminMiddleware would block self-service edits.
 	// §C1-V2 概念库状态（覆盖率/最后同步/失败概念）；admin 只读。
-	s.mux.HandleFunc("GET /api/config/concept/status", s.adminMiddleware(s.handleConceptStatus))
+	s.mux.HandleFunc("GET /api/config/concept/status", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleConceptStatus))
 	s.mux.HandleFunc("GET /api/config/regime", s.authMiddleware(s.handleGetRegimeConfig))
 	s.mux.HandleFunc("POST /api/config/regime", s.authMiddleware(s.handleSetRegimeConfig))
-	s.mux.HandleFunc("GET /api/config/qmt", s.adminMiddleware(s.handleGetQMTConfig))
-	s.mux.HandleFunc("POST /api/config/qmt", s.adminMiddleware(s.handleSetQMTConfig))
+	s.mux.HandleFunc("GET /api/config/qmt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleGetQMTConfig))
+	s.mux.HandleFunc("POST /api/config/qmt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleSetQMTConfig))
 
 	// 模拟盘（纸面交易）：运营数据统一归属管理员（系统级共享），仅管理员可读写；
 	// 子账号不操作模拟盘，后端鉴权，前端只负责展示与交互。
@@ -744,7 +744,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/t-live/rounds", s.adminMiddleware(s.handleLiveTRounds))
 	// §FUNDS-TODAY（2026-10-28）当日「信号仓 / T 仓」资金一帧：实盘取引擎写下的 funds 帧，
 	// 纸面取 TargetReadout；两者都 day-keyed，新交易日首帧前返回 pending（今日尚未定权）。
-	s.mux.HandleFunc("GET /api/funds/today", s.adminMiddleware(s.handleFundsToday))
+	s.mux.HandleFunc("GET /api/funds/today", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFundsToday))
 	// §DYN-SIZE v4 目标仓位一帧读数（§8.8 面板展示的唯一出口，全部由账本引擎按下单同式算出）。
 	s.mux.HandleFunc("GET /api/paper/target", s.authMiddleware(s.handlePaperTargetReadout))
 	// §SIGNAL_CONTROLLER 模拟盘战法开关（白名单语义与实盘 /api/config/qmt.strategies 同构）：
@@ -762,6 +762,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/signalctl/verdicts", s.authMiddleware(s.handleSignalVerdicts))
 	s.mux.HandleFunc("POST /api/paper/sell", s.adminMiddleware(s.handlePaperSell))
 	s.mux.HandleFunc("POST /api/paper/buy", s.adminMiddleware(s.handlePaperBuy))
+	// §MULTI-ADMIN：一次性纸面持仓修复（仅 owner；显式 qty/price + confirm，审计留痕）。
+	s.mux.HandleFunc("POST /api/paper/adjust", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermFundsAdmin)(s.handlePaperAdjust))
 	// §SHORT-4 融券做空手动端点（开仓/买回）
 	s.mux.HandleFunc("POST /api/paper/short_open", s.adminMiddleware(s.handlePaperShortOpen))
 	s.mux.HandleFunc("POST /api/paper/short_cover", s.adminMiddleware(s.handlePaperShortCover))
@@ -792,13 +794,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.adminMiddleware(s.handleDeleteAlert))
 	// 自选股/持仓：读对所有登录用户开放（系统级共享的大盘自选）；写仅管理员可操作。
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
-	s.mux.HandleFunc("POST /api/holdings", s.adminMiddleware(s.handleFixSetHoldings))
-	s.mux.HandleFunc("POST /api/holdings/balance", s.adminMiddleware(s.handleFixSetBalance))   // §P1-11 窄口径改资金
-	s.mux.HandleFunc("POST /api/holdings/pnl-offset", s.adminMiddleware(s.handleFixPnlOffset)) // §E1 盈亏校准入库留痕（清零按钮的正规后端）
-	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.adminMiddleware(s.handleFixAddHoldingLot))
-	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.adminMiddleware(s.handleFixSetCost))
-	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.adminMiddleware(s.handleFixSellHolding))
-	s.mux.HandleFunc("POST /api/holdings/{code}/close", s.adminMiddleware(s.handleFixCloseHolding))
+	s.mux.HandleFunc("POST /api/holdings", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetHoldings))
+	s.mux.HandleFunc("POST /api/holdings/balance", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetBalance))   // §P1-11 窄口径改资金
+	s.mux.HandleFunc("POST /api/holdings/pnl-offset", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixPnlOffset)) // §E1 盈亏校准入库留痕（清零按钮的正规后端）
+	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixAddHoldingLot))
+	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetCost))
+	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSellHolding))
+	s.mux.HandleFunc("POST /api/holdings/{code}/close", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixCloseHolding))
 	s.mux.HandleFunc("GET /api/sector/hot", s.authMiddleware(s.handleFixSectorHot))
 	s.mux.HandleFunc("GET /api/sector/hot/records", s.authMiddleware(s.handleSectorHotRecords))
 	s.mux.HandleFunc("GET /api/snapshot", s.authMiddleware(s.handleFixSnapshot))
@@ -816,9 +818,9 @@ func (s *Server) registerRoutes() {
 	// 补推（成本/状态污染）。与 /api/action 一起升 adminMiddleware（GET showall 只读不动）。
 	// English: §H3 — global-state write endpoints (news showall toggle, reanalyze, manual action)
 	// now require admin: they mutate the operator account's in-process engine regardless of caller.
-	s.mux.HandleFunc("POST /api/news/showall", s.adminMiddleware(s.handleNewsShowAllToggle))
+	s.mux.HandleFunc("POST /api/news/showall", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleNewsShowAllToggle))
 	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
-	s.mux.HandleFunc("POST /api/news/reanalyze", s.adminMiddleware(s.handleNewsReanalyze))
+	s.mux.HandleFunc("POST /api/news/reanalyze", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleNewsReanalyze))
 	// §M-14（2026-09-22 PM 批清扫）：test-attribution 是运营引擎 Stage2 的手动试跑口，
 	// 每次调用消耗老板 LLM key 配额且前端零调用——旧路由只挂 authMiddleware，普通成员
 	// 可无限把任意新闻推进 Stage2。与 §H3 同族收权 adminMiddleware（保留端点供 admin 排障，
@@ -833,7 +835,7 @@ func (s *Server) registerRoutes() {
 	// §H3：/api/action 的 ignore 分支写运营账号引擎信号簿（墓碑全局生效）、buy/sell 分支
 	// 触实盘下单（内部本已 admin 闸）——路由整体升 adminMiddleware，成员点「忽略」不再能
 	// 静默改写他人信号簿；前端信号页忽略按钮对成员隐藏（见 web 侧 isForbidden 兜底）。
-	s.mux.HandleFunc("POST /api/action", s.adminMiddleware(s.handleFixAction))
+	s.mux.HandleFunc("POST /api/action", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleFixAction))
 	// §N-2（2026-09-22 傍晚批 §NOTIFYADMIN）档位抬升：/api/notify-test 打的是 server 级单例
 	// 通知器（全局 Webhook/推送网关/ntfy 通道，非本用户配置），消息级 LevelHigh——此前只挂
 	// authMiddleware，任何登录成员一次 POST 就能向 owner 全部推送通道发实弹，可用噪声淹没真
@@ -841,54 +843,54 @@ func (s *Server) registerRoutes() {
 	// 现网流程；配套进程内 60s 最小间隔频控 + opslog 审计（见 handleFixNotifyTest）。
 	// English: §N-2 — raised to adminMiddleware: the probe fires on the GLOBAL notifier channels
 	// with LevelHigh; any logged-in member could previously flood the owner's push channels.
-	s.mux.HandleFunc("POST /api/notify-test", s.adminMiddleware(s.handleFixNotifyTest))
+	s.mux.HandleFunc("POST /api/notify-test", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleFixNotifyTest))
 	// 实盘交易（AUTO_TRADING_PLAN M1）：持仓页实盘 tab 拉真实持仓/建议/执行 + 网关回报/状态。
 	// English: live trading (AUTO_TRADING_PLAN M1) — live tab real positions/advice/execute + gateway report/state.
 	// §GAP1.8/1.10 实盘端点收权：实盘账本/建议/手动执行仅 admin（单一实盘账户归属老板账号，
 	// 堵住"任意登录用户看同一份实盘持仓/临时账号触发真实下单"的越权面）。
 	// English: §GAP1.8/1.10 — real-book endpoints are admin-only (single live account owned by the
 	// admin), closing the any-user-reads-real-positions / temp-account-fires-orders surface.
-	s.mux.HandleFunc("GET /api/positions/real", s.adminMiddleware(s.handleRealPositions))
-	s.mux.HandleFunc("GET /api/positions/advice", s.adminMiddleware(s.handleRealAdvice))
-	s.mux.HandleFunc("POST /api/positions/execute", s.adminMiddleware(s.handleExecuteAction))
+	s.mux.HandleFunc("GET /api/positions/real", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRealPositions))
+	s.mux.HandleFunc("GET /api/positions/advice", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRealAdvice))
+	s.mux.HandleFunc("POST /api/positions/execute", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleExecuteAction))
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
 	// QMT 实盘状态/成交：运营数据系统级共享，仅管理员可读（子账号无量化交易权限）。
-	s.mux.HandleFunc("GET /api/qmt/state", s.adminMiddleware(s.handleQMTState))
-	s.mux.HandleFunc("GET /api/qmt/trades", s.adminMiddleware(s.handleQMTTrades))
+	s.mux.HandleFunc("GET /api/qmt/state", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTState))
+	s.mux.HandleFunc("GET /api/qmt/trades", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTTrades))
 	// §U-2 当日委托列表（撤单 UI 的 order_id 来源，admin 权限）
-	s.mux.HandleFunc("GET /api/qmt/orders", s.adminMiddleware(s.handleQMTOrders))
+	s.mux.HandleFunc("GET /api/qmt/orders", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTOrders))
 	// §R4-1 kill-switch 与手动撤单（admin 权限：紧急停止/撤单属资损级操作）
-	s.mux.HandleFunc("POST /api/qmt/halt", s.adminMiddleware(s.handleQMTHalt))
-	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.adminMiddleware(s.handleQMTCancel))
+	s.mux.HandleFunc("POST /api/qmt/halt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTHalt))
+	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTCancel))
 	// §QMT-DUAL：网关 active 通道（miniqmt=xt / qmt=queued）读取与切换（仅 admin）
-	s.mux.HandleFunc("GET /api/qmt/broker", s.adminMiddleware(s.handleQMTBroker))
-	s.mux.HandleFunc("POST /api/qmt/broker", s.adminMiddleware(s.handleQMTBrokerSwitch))
+	s.mux.HandleFunc("GET /api/qmt/broker", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTBroker))
+	s.mux.HandleFunc("POST /api/qmt/broker", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTBrokerSwitch))
 	// §0925EVE-W3-G（FIX_PLAN ⑫ C3）第三态「待核对」人工收敛出口（仅 admin：人工改判
 	// 委托终态是特权动作，每次尝试落 opslog.Audit）：清单透传 + 确认转发网关。
 	// English: admin-only pending-review list and manual order-confirm passthrough.
-	s.mux.HandleFunc("GET /api/qmt/pending-review", s.adminMiddleware(s.handleQMTPendingReview))
+	s.mux.HandleFunc("GET /api/qmt/pending-review", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTPendingReview))
 	// §FIX-20261028-F06：收盘对账读数（透传网关 /admin/status 的 close_snapshot）
-	s.mux.HandleFunc("GET /api/qmt/close-snapshot", s.adminMiddleware(s.handleQMTCloseSnapshot))
-	s.mux.HandleFunc("POST /api/qmt/order-confirm", s.adminMiddleware(s.handleQMTOrderConfirm))
+	s.mux.HandleFunc("GET /api/qmt/close-snapshot", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTCloseSnapshot))
+	s.mux.HandleFunc("POST /api/qmt/order-confirm", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTOrderConfirm))
 	// §WS-B：券商交割单三方对账（触发 + 历史查询，仅 admin）
-	s.mux.HandleFunc("POST /api/qmt/settle", s.adminMiddleware(s.handleQMTSettle))
-	s.mux.HandleFunc("GET /api/qmt/settle/history", s.adminMiddleware(s.handleQMTSettleHistory))
+	s.mux.HandleFunc("POST /api/qmt/settle", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTSettle))
+	s.mux.HandleFunc("GET /api/qmt/settle/history", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTSettleHistory))
 	// §FILL-AMEND（2026-09-23）历史错账的人工逐笔勘误 + 守恒自检（仅 admin：实盘账本族端点
 	// 本就 admin-only，且勘误是"人工改判账目口径"的资损级动作）。
 	// 提交→批准两步分离，批准前是影子态（不影响任何数字）；apply/revoke 各一条审计留痕。
 	// English: §FILL-AMEND — admin-only human correction channel (submit → approve → optional
 	// revoke) plus the read-only conservation self-check.
-	s.mux.HandleFunc("GET /api/qmt/fill-amendments", s.adminMiddleware(s.handleListFillAmendments))
-	s.mux.HandleFunc("POST /api/qmt/fill-amendments", s.adminMiddleware(s.handleCreateFillAmendment))
-	s.mux.HandleFunc("POST /api/qmt/fill-amendments/{id}/apply", s.adminMiddleware(s.handleApplyFillAmendment))
-	s.mux.HandleFunc("POST /api/qmt/fill-amendments/{id}/revoke", s.adminMiddleware(s.handleRevokeFillAmendment))
-	s.mux.HandleFunc("GET /api/qmt/fills/conservation", s.adminMiddleware(s.handleFillConservation))
+	s.mux.HandleFunc("GET /api/qmt/fill-amendments", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleListFillAmendments))
+	s.mux.HandleFunc("POST /api/qmt/fill-amendments", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleCreateFillAmendment))
+	s.mux.HandleFunc("POST /api/qmt/fill-amendments/{id}/apply", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleApplyFillAmendment))
+	s.mux.HandleFunc("POST /api/qmt/fill-amendments/{id}/revoke", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRevokeFillAmendment))
+	s.mux.HandleFunc("GET /api/qmt/fills/conservation", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleFillConservation))
 	// §WS-C：风控闸口状态（命中明细 + 开关状态，仅 admin）
-	s.mux.HandleFunc("GET /api/risk/gates", s.adminMiddleware(s.handleRiskGates))
+	s.mux.HandleFunc("GET /api/risk/gates", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRiskGates))
 	// §WS-E 敏感管线隔离：llm-debug / stage-records 含运营账号 LLM 密钥池与全链路日志，
 	// 仅管理员可见（子账号 403）。English: §WS-E sensitive-pipeline isolation — these endpoints expose
 	// the operator's LLM key pool and full pipeline logs, so they are admin-only.
-	s.mux.HandleFunc("GET /api/llm-debug", s.adminMiddleware(s.handleLLMDebug))
+	s.mux.HandleFunc("GET /api/llm-debug", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleLLMDebug))
 	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
 	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))
 	s.mux.HandleFunc("DELETE /api/consult/history", s.authMiddleware(s.handleClearConsultHistory))
@@ -897,7 +899,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/consult/pro-mode", s.authMiddleware(s.handleGetConsultProMode))
 	s.mux.HandleFunc("PUT /api/consult/pro-mode", s.authMiddleware(s.handleSetConsultProMode))
 	// §WS-E 敏感管线隔离：stage-records 暴露运营账号全链路 stage 记录，仅管理员可见（子账号 403）。
-	s.mux.HandleFunc("GET /api/stage-records", s.adminMiddleware(s.handleStageRecords))
+	s.mux.HandleFunc("GET /api/stage-records", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleStageRecords))
+	// signal-logs 是各账号自己的信号批次读面（handler 按请求者取引擎），不属运营特权面。
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
 	s.mux.HandleFunc("GET /api/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
@@ -953,8 +956,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/research/strategies/snapshots", s.authMiddleware(s.handleStrategySnapshots))
 	s.mux.HandleFunc("POST /api/research/strategies/rollback", s.adminMiddleware(s.handleStrategyRollback))
 	// §WS-K 维4 配置历史/回滚：快照+diff 列表（admin）、回滚恢复（admin）
-	s.mux.HandleFunc("GET /api/config/history", s.adminMiddleware(s.handleConfigHistory))
-	s.mux.HandleFunc("POST /api/config/rollback", s.adminMiddleware(s.handleConfigRollback))
+	s.mux.HandleFunc("GET /api/config/history", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleConfigHistory))
+	s.mux.HandleFunc("POST /api/config/rollback", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleConfigRollback))
 	// §WS-F C4a SSE 建链票据签发端点（需认证）；SSE 建链用 /api/events?ticket=xxx（60s 有效，§M5 起 TTL 内可复用）。
 	// ── SSE 事件流：建链端点自带票据校验（不走 authMiddleware，因 EventSource 无法带 Authorization 头）──
 	s.mux.HandleFunc("POST /api/events/ticket", s.authMiddleware(s.handleSSETicket))
@@ -1761,6 +1764,45 @@ func (s *Server) permMiddleware(perm string, next http.HandlerFunc) http.Handler
 		}
 		next(w, r)
 	})
+}
+
+// strictPermMiddleware 要求显式权限位：admin 角色不再隐式放行五组敏感动作。
+// 资金/交易/用户/配置/运维统一走这里；research_approve 继续走 permMiddleware（兼容旧口径）。
+// English: explicit-permission middleware for the five sensitive groups (no admin-role bypass).
+func (s *Server) strictPermMiddleware(perm string, next http.HandlerFunc) http.HandlerFunc {
+	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		user := userFromContext(r)
+		if user == nil || !user.HasExplicitPerm(perm) {
+			opslog.Logf("quant", "严格权限拒绝 uid=%s perm=%s %s %s",
+				userIDFor(r), perm, r.Method, r.URL.Path)
+			writeError(w, http.StatusForbidden, "no permission: "+perm)
+			return
+		}
+		next(w, r)
+	})
+}
+
+// strictAllPermsMiddleware 要求全部显式权限位命中（如跨账号 QMT 配置要 user_admin+trading_admin）。
+// English: requires every listed explicit permission bit.
+func (s *Server) strictAllPermsMiddleware(perms ...string) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+			user := userFromContext(r)
+			if user == nil {
+				writeError(w, http.StatusForbidden, "no permission")
+				return
+			}
+			for _, perm := range perms {
+				if !user.HasExplicitPerm(perm) {
+					opslog.Logf("quant", "严格权限拒绝 uid=%s perm=%s %s %s",
+						userIDFor(r), perm, r.Method, r.URL.Path)
+					writeError(w, http.StatusForbidden, "no permission: "+perm)
+					return
+				}
+			}
+			next(w, r)
+		})
+	}
 }
 
 // ── API handlers ──

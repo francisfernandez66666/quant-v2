@@ -145,14 +145,25 @@ const (
 const (
 	// PermResearchApprove 研究候选审批/驳回权限（自动研究 B5 的审批应用操作）。
 	PermResearchApprove = "research_approve"
+	// PermFundsAdmin 资金/持仓写权限（可用资金、盈亏校准、持仓整表/批次编辑）。
+	PermFundsAdmin = "funds_admin"
+	// PermTradingAdmin 实盘交易权限（QMT 配置/状态/委托/对账/通道切换）。
+	PermTradingAdmin = "trading_admin"
+	// PermUserAdmin 账号管理权限（建号/角色/权限位/密码/启停/删号）。
+	PermUserAdmin = "user_admin"
+	// PermConfigAdmin 配置管理权限（战法/D1/LLM/regime/sizing/配置历史与回滚）。
+	PermConfigAdmin = "config_admin"
+	// PermOpsAdmin 运维诊断权限（用量/LLM 调试/阶段记录/信号日志/通知探测）。
+	PermOpsAdmin = "ops_admin"
 )
-
-// PermResearchApprove 之外可按需扩展更多权限位。
 
 // AllPerms 返回当前定义的全体权限位（供前端渲染权限清单）。
 // （AllPerms returns all defined permission bits for frontend rendering.）
 func AllPerms() []string {
-	return []string{PermResearchApprove}
+	return []string{
+		PermResearchApprove, PermFundsAdmin, PermTradingAdmin,
+		PermUserAdmin, PermConfigAdmin, PermOpsAdmin,
+	}
 }
 
 // HasPerm 判断用户是否拥有指定权限位。
@@ -164,6 +175,17 @@ func (u *User) HasPerm(perm string) bool {
 	}
 	if u.Role == RoleAdmin {
 		return true
+	}
+	return u.HasExplicitPerm(perm)
+}
+
+// HasExplicitPerm 只认用户 Perms 里显式登记过的权限位，**不**因 admin 角色隐式放行。
+// 资金/交易/用户/配置/运维五组敏感动作使用这个判据：第二个 admin（如 test01）没有位就是 403，
+// 避免“role=admin 自动拥有一切”把权限模型架空。
+// English: explicit-only permission check (no admin-role bypass) for the five sensitive groups.
+func (u *User) HasExplicitPerm(perm string) bool {
+	if u == nil {
+		return false
 	}
 	for _, p := range u.Perms {
 		if p == perm {
@@ -294,6 +316,7 @@ func (m *Manager) Init() error {
 	// §A1 修复：迁移只在 SchemaVersion<1 时执行一次——此前每次启动都强制 Enabled=true，
 	// SetEnabled(false) 的封禁在重启后失效。新库版本≥1 永不再进此分支。
 	// English: one-time legacy migration gated by SchemaVersion so disabled accounts stay disabled.
+	oldVersion := m.db.SchemaVersion
 	migrated := false
 	adminPromoted := false
 	if m.db.SchemaVersion < 1 {
@@ -348,6 +371,28 @@ func (m *Manager) Init() error {
 		migrated = true
 	} // §A1 end SchemaVersion<1
 
+	// §MULTI-ADMIN（2026-10-31）：给首个正式 admin 追加五组显式权限位。
+	// 必须放在通用版本抬升之前——否则下面的 `ensureTenantsLocked || version<schemaVersion`
+	// 会先把 SchemaVersion 写成 3，本段恒假，权限永远不会授予。
+	// 新库不走这里（os.IsNotExist 分支直接返回）：首次 admin 由 SetupInitialAdmin /
+	// CreateUserInTenant 的授予覆盖。
+	if m.db.SchemaVersion < 3 {
+		target := firstAdminIDLocked(m.db.Users)
+		if target == "" {
+			log.Printf("[auth] §MULTI-ADMIN 迁移未找到首个 admin，新权限位未授予（等待人工处理）")
+		} else {
+			for i := range m.db.Users {
+				if m.db.Users[i].ID == target {
+					grantOwnerPermsLocked(&m.db.Users[i])
+					break
+				}
+			}
+			log.Printf("[auth] §MULTI-ADMIN 迁移给首个 admin %s 授予 funds/trading/user/config/ops", target)
+		}
+		m.db.SchemaVersion = 3
+		migrated = true
+	}
+
 	// §MT 租户兜底（幂等，每次加载都跑）：t_default 缺失则补建；空 TenantID 的
 	// 存量账号迁入 t_default。必须在 §A1 老迁移之后执行，避免抢先升版本吞掉老迁移。
 	// English: §MT tenant invariant runs after the §A1 legacy migration so it can never
@@ -357,6 +402,12 @@ func (m *Manager) Init() error {
 		migrated = true
 	}
 	if migrated {
+		// 结构版本变化才备份；单纯租户兜底（同版本）不制造噪声副本。
+		if m.db.SchemaVersion != oldVersion {
+			if err := m.backupBeforeMigration(); err != nil {
+				return err
+			}
+		}
 		if err := m.save(); err != nil {
 			return fmt.Errorf("migrate auth db: %w", err)
 		}
@@ -364,8 +415,8 @@ func (m *Manager) Init() error {
 	return nil
 }
 
-// schemaVersion 当前库结构版本（§MT 起为 2）。
-const schemaVersion = 2
+// schemaVersion 当前库结构版本（§MT=2；§MULTI-ADMIN=3）。
+const schemaVersion = 3
 
 // ensureTenantsLocked 幂等保证租户不变式（须持写锁）：
 //  1. t_default 恒存在且启用（平台运营者所在租户，不可删除）；
@@ -932,6 +983,9 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 		CreatedAt:    time.Now().Unix(),
 		TenantID:     DefaultTenantID,
 	}
+	// §MULTI-ADMIN：/setup 首次初始化不走 SchemaVersion=3 迁移（新库直接返回），
+	// 必须在创建对象上显式授予，否则首个 admin 没有 funds/trading/user/config/ops。
+	grantOwnerPermsLocked(&user)
 	token, err := issueSession(&user, tokenTTL) // 首个会话
 	if err != nil {
 		return nil, err
@@ -1192,6 +1246,10 @@ func (m *Manager) SetRole(userID, role string) error {
 			}
 		}
 		u.Role = role
+		// §MULTI-ADMIN：把首个 admin 提升上来时补授五组权限位；已有更早 admin 时不重复授予。
+		if role == RoleAdmin && firstAdminIDLocked(m.db.Users) == u.ID {
+			grantOwnerPermsLocked(u)
+		}
 		return nil
 	})
 }
@@ -1261,8 +1319,15 @@ func (m *Manager) RevokePerm(userID, perm string) error {
 	})
 }
 
-// SetPerms 整体覆盖用户的权限位列表。
+// SetPerms 整体覆盖用户权限位；只接受 AllPerms 白名单内的值。
+// 未知权限位会让前端勾选/审计留痕变得不可解释，直接拒绝而不是静默保存。
 func (m *Manager) SetPerms(userID string, perms []string) error {
+	allowed := AllPerms()
+	for _, p := range perms {
+		if !hasPermString(allowed, p) {
+			return fmt.Errorf("unknown permission: %s", p)
+		}
+	}
 	return m.updateUser(userID, func(u *User) error {
 		u.Perms = perms
 		return nil
@@ -1279,6 +1344,73 @@ func (m *Manager) HasPerm(userID, perm string) bool {
 		}
 	}
 	return false
+}
+
+// HasExplicitPerm 判断用户是否显式持有指定权限位（admin 不隐式放行）。
+func (m *Manager) HasExplicitPerm(userID, perm string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, u := range m.db.Users {
+		if u.ID == userID {
+			return u.HasExplicitPerm(perm)
+		}
+	}
+	return false
+}
+
+// hasPermString 判断权限位切片是否已包含目标值（调用方须持锁；仅内存比较）。
+func hasPermString(perms []string, want string) bool {
+	for _, p := range perms {
+		if p == want {
+			return true
+		}
+	}
+	return false
+}
+
+// grantOwnerPermsLocked 给 owner（首个正式 admin）追加五组显式权限位，保留原有 perms。
+// 只允许在已持写锁的路径调用（Init/Setup/CreateUser/SetRole）；幂等。
+// English: appends the five sensitive perms to the owner admin, preserving existing bits (idempotent).
+func grantOwnerPermsLocked(u *User) {
+	if u == nil {
+		return
+	}
+	for _, p := range []string{
+		PermFundsAdmin, PermTradingAdmin, PermUserAdmin, PermConfigAdmin, PermOpsAdmin,
+	} {
+		if !hasPermString(u.Perms, p) {
+			u.Perms = append(u.Perms, p)
+		}
+	}
+}
+
+// firstAdminIDLocked 返回首个正式 admin（排除 tmp_）的 ID；调用方须持锁。
+func firstAdminIDLocked(users []User) string {
+	for i := range users {
+		u := &users[i]
+		if u.Role == RoleAdmin && !strings.HasPrefix(u.ID, "tmp_") {
+			return u.ID
+		}
+	}
+	return ""
+}
+
+// backupBeforeMigration 在 auth 结构迁移落盘前复制一份 auth.json（0600），
+// 备份失败即拒绝启动（fail-closed：不允许无备份的特权变更）。
+func (m *Manager) backupBeforeMigration() error {
+	data, err := os.ReadFile(m.dbPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("backup auth db read: %w", err)
+	}
+	backup := m.dbPath + ".pre-migrate-" + time.Now().Format("20060102-150405")
+	if err := dataio.AtomicWrite(backup, data, 0o600); err != nil {
+		return fmt.Errorf("backup auth db write: %w", err)
+	}
+	log.Printf("[auth] §MULTI-ADMIN 迁移前备份 %s", backup)
+	return nil
 }
 
 // IsAdmin 判断用户是否为管理员。
@@ -1397,6 +1529,7 @@ func (m *Manager) CreateUserInTenant(tenantID, username, password, role string, 
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
+	beforeAdmin := firstAdminIDLocked(m.db.Users)
 	user := User{
 		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
 		Username:     username,
@@ -1406,6 +1539,17 @@ func (m *Manager) CreateUserInTenant(tenantID, username, password, role string, 
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
 		TenantID:     tenantID,
+	}
+	// §MULTI-ADMIN：管理端建号路径的首个 admin 也要有五组显式权限位；
+	// 之后创建的 test01/其他 admin 保持调用方传入的 perms。
+	if beforeAdmin == "" && role == RoleAdmin {
+		grantOwnerPermsLocked(&user)
+	} else if role == RoleAdmin && tenantID != DefaultTenantID {
+		// 租户 admin 只拿 user_admin（管理本租户成员）；不拿资金/QMT/配置/运维，
+		// 避免“租户管理员”越过自己的租户去碰运营账号的实盘。
+		if !hasPermString(user.Perms, PermUserAdmin) {
+			user.Perms = append(user.Perms, PermUserAdmin)
+		}
 	}
 	if expiresDays > 0 {
 		user.ExpiresAt = time.Now().AddDate(0, 0, expiresDays).Unix()

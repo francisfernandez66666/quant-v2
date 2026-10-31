@@ -234,7 +234,7 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 	// 账户级读数：可用资金走控制器（与 T 循环同一份券商快照 + 30min 新鲜度口径），
 	// 冻结/市值/总资产取账本快照（updated_at 一并透出，前端据此区分"金额没变"与"快照没更新"）。
 	var acc store.RealAccount
-	if a, err := db.GetRealAccount(uid); err == nil {
+	if a, err := e.cashAccount(uid); err == nil {
 		acc = a
 	}
 	cash, cashOK := 0.0, false
@@ -245,7 +245,7 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 	}
 	total := acc.TotalAsset
 	if total <= 0 {
-		if v, err := db.TotalAssets(uid); err == nil && v > 0 {
+		if v := e.totalAssetsFor(uid); v > 0 {
 			total = v
 		}
 	}

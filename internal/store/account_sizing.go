@@ -158,7 +158,7 @@ func (d *DB) AccountSizingReadings(userID, sinceDay, today string) (stopLosses i
 	// ③ 总仓位占比 = 持仓市值 / 总资产（券商回报口径；未回报/总资产非正 → 保持 0 = 弃权）。
 	// 为什么直接用 real_account 而不是自算：这两个数出自同一份券商回报，分子分母同刻同源，
 	// 自算（Σ持仓市值 / (现金+市值)）会在现金未回报时把分母算小、比例虚高。
-	if acc, err := d.GetRealAccount(userID); err == nil && acc.TotalAsset > 0 && acc.MarketValue >= 0 {
+	if acc, err := d.GetRealAccountOwn(userID); err == nil && acc.TotalAsset > 0 && acc.MarketValue >= 0 {
 		totalPosPct = acc.MarketValue / acc.TotalAsset
 		if totalPosPct < 0 {
 			totalPosPct = 0

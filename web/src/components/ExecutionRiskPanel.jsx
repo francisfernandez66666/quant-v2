@@ -14,6 +14,7 @@ import { Button, Card, InputNumber, Tag } from 'tdesign-react'
 import ToggleSw from './ToggleSw'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
+import { canStrict } from '../utils/perm.js'
 
 const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '7px 0', flexWrap: 'wrap' }
 const labelStyle = { width: 260, flexShrink: 0, color: 'var(--app-muted-2)', fontSize: 13 }
@@ -58,7 +59,9 @@ export default function ExecutionRiskPanel() {
 
   const set = useCallback((patch) => setForm((f) => ({ ...f, ...patch })), [])
 
+  const canTrading = canStrict('trading_admin')
   async function load() {
+    if (!canTrading) { setState('loaded'); return }
     setState('loading')
     setError('')
     try {
@@ -116,8 +119,11 @@ export default function ExecutionRiskPanel() {
     }
   }
 
-  useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { loadConcept() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (canTrading) load() }, [canTrading]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (canTrading) loadConcept() }, [canTrading]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 无 trading_admin：整块不渲染，也不打 /api/config/qmt 的 403。
+  if (!canTrading) return null
 
   const dirty = form && baseline && JSON.stringify(form) !== baseline
 

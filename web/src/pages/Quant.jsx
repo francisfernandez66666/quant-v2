@@ -35,6 +35,7 @@ import { verdictDisplay, sizingDisplay } from './quantVerdicts.js'
 import FundsOverviewCard from '../components/FundsOverviewCard.jsx' // §FUNDS-TODAY 信号仓/T仓资金一帧
 import TRoundsCard from '../components/TRoundsCard.jsx' // §W-04 T 仓子页：T 回合明细（实盘账本）
 import { useSearchParams } from 'react-router-dom' // §W-04 子页签写进 URL，刷新不丢、可分享
+import { canStrict } from '../utils/perm.js'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
@@ -350,7 +351,7 @@ export default function Quant() {
   // which is why the denial panel keeps a "refresh identity and retry" escape hatch, and why
   // write-side entries are untouched (already greyed out by §0926E2E-17d).
   function adminReadsAllowed() {
-    return api.isAdmin()
+    return canStrict('trading_admin')
   }
 
   // startAdminReads 拉起本页全部 admin-only 只读链路：首轮取数 + 60s 兜底轮询 + SSE 事件即时刷新。
@@ -388,7 +389,7 @@ export default function Quant() {
     setRetryBusy(true)
     try {
       const me = await api.refreshMe()
-      if (me && me.role === 'admin') {
+      if (me && Array.isArray(me.perms) && me.perms.includes('trading_admin')) {
         setForbidden(false)
         startAdminReads()
         MessagePlugin.success('身份已刷新为管理员，正在加载实盘数据')
