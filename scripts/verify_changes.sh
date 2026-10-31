@@ -17780,6 +17780,9 @@ grep -qF 'func TestStrictPermissionSurface' internal/server/multi_admin_identity
 CNT144=$((CNT144 + 1))
 grep -qF 'func TestPaperAdjustRestoresHeldPosition' internal/server/multi_admin_identity_test.go || fail144 "缺 000683 补回成功路径回归锁"
 CNT144=$((CNT144 + 1))
+grep -qF 'func TestQMTEnableRequiresOwnToken' internal/server/multi_admin_identity_test.go || fail144 "缺非运营账号启用实盘需自有 token 回归锁"
+grep -qF 'func TestFundsTodayPaperIsolation' internal/server/multi_admin_identity_test.go || fail144 "缺 funds/today paper 按请求者回归锁"
+CNT144=$((CNT144 + 1))
 grep -qF 'hasStrictPerm' web/src/__tests__/strict_perm_api.test.js || fail144 "缺前端显式权限单测"
 grep -qF 'multi_admin_perm_gate' web/src/__tests__/multi_admin_perm_gate.test.jsx || fail144 "缺资金卡零请求测试"
 
@@ -17788,7 +17791,7 @@ CNT144=$((CNT144 + 1))
 go test ./internal/auth -run 'TestAdminPermsMigration|TestSetupInitialAdminGetsPerms|TestCreateFirstAdminGetsPerms|TestHasExplicitPerm|TestSetPermsWhitelist' -count=1 \
 	> /tmp/gate144_auth.log 2>&1 || fail144 "auth 权限/迁移用例未过"
 CNT144=$((CNT144 + 1))
-go test ./internal/server -run 'TestMultiAdmin|TestFundsTodayAccountIsolation|TestStrictPermissionSurface|TestPaperAdjust' -count=1 \
+go test ./internal/server -run 'TestMultiAdmin|TestFundsToday|TestStrictPermissionSurface|TestPaperAdjust|TestQMTEnableRequiresOwnToken' -count=1 \
 	> /tmp/gate144_server.log 2>&1 || fail144 "双 admin/严格权限用例未过"
 CNT144=$((CNT144 + 1))
 go test ./internal/store -run TestRealAccountScoped -count=1 > /tmp/gate144_store.log 2>&1 || fail144 "store 资金口径用例未过"

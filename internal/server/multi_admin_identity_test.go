@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/store"
@@ -169,6 +170,99 @@ func TestFundsTodayAccountIsolation(t *testing.T) {
 	}
 	if got := readCash(owner); math.Abs(got-50000) > 0.005 {
 		t.Fatalf("owner 的 funds/today 应 50000, got %.2f", got)
+	}
+}
+
+// multiAdminPaperRegistry 双账号纸面引擎注册表：只实现 funds/today 需要的 PaperForUser。
+type multiAdminPaperRegistry struct {
+	ownerID, secondID string
+	owner, second     *paper.Engine
+}
+
+// 以下为 EngineRegistry 的测试桩方法：本用例只关心 PaperForUser 的账号分流，
+// 其余能力一律空实现（不触发真实引擎/复盘/热同步）。
+func (r *multiAdminPaperRegistry) GetController(string) EngineController     { return nil }
+func (r *multiAdminPaperRegistry) InitStatusJSON(string) map[string]any      { return nil }
+func (r *multiAdminPaperRegistry) AllControllers() []EngineController        { return nil }
+func (r *multiAdminPaperRegistry) Len() int                                  { return 2 }
+func (r *multiAdminPaperRegistry) SetPaperPools([]string)                    {}
+func (r *multiAdminPaperRegistry) SetPaperConfig(paper.Config)               {}
+func (r *multiAdminPaperRegistry) SetPaperLabelResolver(func(string) string) {}
+func (r *multiAdminPaperRegistry) TriggerPositionReview(string) (int, error) { return 0, nil }
+func (r *multiAdminPaperRegistry) OpenPositionStrategyCounts() combat_agent.HeldStrategyKeys {
+	return nil
+}
+func (r *multiAdminPaperRegistry) PaperForUser(uid string) *paper.Engine {
+	switch uid {
+	case r.ownerID:
+		return r.owner
+	case r.secondID:
+		return r.second
+	}
+	return nil
+}
+
+// TestFundsTodayPaperIsolation /api/funds/today 的 paper 读数必须取请求者自己的引擎，
+// 不能回落到运营账号（旧实现恒取 operatorID，成员会看到 owner 的纸面目标仓位）。
+func TestFundsTodayPaperIsolation(t *testing.T) {
+	s, owner, second, _ := newMultiAdminTestServer(t)
+	if err := s.auth.GrantPerm(second.ID, auth.PermFundsAdmin); err != nil {
+		t.Fatalf("grant funds: %v", err)
+	}
+	newPaper := func(capital float64, name string) *paper.Engine {
+		cfg := paper.ConfigFromRules(s.cfg.Get().Paper)
+		cfg.Enabled = true
+		cfg.AutoSell = false
+		cfg.InitialCapital = capital
+		return paper.New(cfg, filepath.Join(t.TempDir(), name+".json"))
+	}
+	peOwner, peSecond := newPaper(100000, "owner"), newPaper(200000, "second")
+	s.SetEngineRegistry(&multiAdminPaperRegistry{ownerID: owner.ID, secondID: second.ID, owner: peOwner, second: peSecond})
+
+	// readPaperCash 用指定账号请求 funds/today，取 paper.readout.cash 断言拿到的是谁的账。
+	readPaperCash := func(u *auth.User) float64 {
+		rr := adminDo(s, adminReq(s, u, http.MethodGet, "/api/funds/today", ""))
+		if rr.Code != 200 {
+			t.Fatalf("GET funds/today who=%s got %d body=%s", u.Username, rr.Code, rr.Body.String())
+		}
+		var body struct {
+			Paper struct {
+				Available bool `json:"available"`
+				Readout   struct {
+					Cash float64 `json:"cash"`
+				} `json:"readout"`
+			} `json:"paper"`
+		}
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if !body.Paper.Available {
+			t.Fatalf("%s 的 paper 读数应可用", u.Username)
+		}
+		return body.Paper.Readout.Cash
+	}
+	if got, want := readPaperCash(second), peSecond.Stats().Cash; math.Abs(got-want) > 0.005 {
+		t.Fatalf("test01 应读自己的纸面账 %.2f, got %.2f", want, got)
+	}
+	if got, want := readPaperCash(owner), peOwner.Stats().Cash; math.Abs(got-want) > 0.005 {
+		t.Fatalf("owner 应读自己的纸面账 %.2f, got %.2f", want, got)
+	}
+}
+
+// TestQMTEnableRequiresOwnToken 非运营账号启用实盘必须持有自己的网关 token；
+// 空凭证/继承凭证一律 400，显式带 token 才放行（防止一把钥匙被顺手共享）。
+func TestQMTEnableRequiresOwnToken(t *testing.T) {
+	s, owner, second, _ := newMultiAdminTestServer(t)
+	path := "/api/admin/users/" + second.ID + "/config/qmt"
+	// 无自有 token、也不显式带 token ⇒ 拒绝启用。
+	rr := adminDo(s, adminReq(s, owner, http.MethodPost, path, `{"enabled":true}`))
+	if rr.Code != 400 {
+		t.Fatalf("无自有 token 启用实盘应 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 显式带一把自己的 token ⇒ 允许启用（配置合法字段一并给全）。
+	body := `{"enabled":true,"mode":"auto","gateway_url":"http://127.0.0.1:8790","token":"own-secret",` +
+		`"price_type":"market","fixed_amount":50000,"max_positions":8,"initial_capital":200000}`
+	rr = adminDo(s, adminReq(s, owner, http.MethodPost, path, body))
+	if rr.Code != 200 {
+		t.Fatalf("显式自有 token 启用应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 
