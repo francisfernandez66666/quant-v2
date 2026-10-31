@@ -34,7 +34,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1            # 预演
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Apply     # 真写
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align     # §0926ROT-ALIGN 对齐计划（只读，不生成新 token）
-#   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align -Apply  # 对齐落地：源1 现值→源3/源4/源5
+#   powershell -NoProfile -ExecutionPolicy Bypass -File C:\opt\quant\qmt-win\rotate_qmt_token.ps1 -Align -Apply  # 对齐落地（§TOKEN-PERAACCT：缺省一条都不写；显式 -LegacySpread 只写源4 与 owner 那一条快照，**源3 全局兜底位永不写**）
 param(
     [string]$GatewayDir = "",        # 留空取 §C7 单源 $SvcGatewayDir（缺失回退 C:\qmt\quant-trading-v2\qmt_gateway）
     [string]$ConfigFile = "",        # 留空取 <GatewayDir>\config.xt.json
@@ -45,13 +45,17 @@ param(
     [switch]$DryRun,
     [switch]$Apply,
     # §0926ROT-ALIGN（2026-09-26 owner 令「我授权你来统一改」）：对齐模式——不生成新 token，
-    # 以源1（config.xt.json，网关真源）现值为权威，把它复制到源3（引擎 config.json rules.qmt.token）、
-    # 源4（config.bridge.json，如在位）与源5（auth.json 账号快照 .qmt.token，§0926ROT-SRC5）。
+    # 以源1（config.xt.json，网关真源）现值为权威做**检视**：逐条比对源3（引擎 config.json
+    # rules.qmt.token）/源4（config.bridge.json）/源5（auth.json 账号快照 .qmt.token）。
+    # §TOKEN-PERAACCT（2026-10-31）起本模式**缺省一个字都不写**；要写必须显式 -LegacySpread，
+    # 且它只剩两条腿——源4（桥，与网关物理同机该同钥匙）与源5 里 **owner 那一条**快照。
+    # 源3 的写侧已从代码里删除：全局兜底位装了实盘凭证＝任何账号点一次保存就抄走钥匙（N1）。
     # 值只在服务器本地函数栈里过，输出一律指纹。
     [switch]$Align,
     # §TOKEN-PERAACCT（2026-10-30）：一把钥匙铺给所有账号的旧对齐语义就此止步——
-    #  - LegacySpread 是把"源3/源5 仍按源1 复制"的旧路径显式留住的历史开关，**缺省关闭**；
-    #    关闭时 -Align **一条都不写**：源3/源5 明确报 SKIPPED，源4（桥）只报差异（report-only），
+    #  - LegacySpread 是显式留住的历史开关（**源4 + 源5 的 owner 那一条**），**缺省关闭**；
+    #    源3（全局 rules.qmt.token）不在它的能力里——写侧代码已删，计划/完成两条读数都打
+    #    action=FORBIDDEN_BY_N1；关闭时 -Align **一条都不写**：源3/源5 明确报 SKIPPED，源4（桥）只报差异（report-only），
     #    收尾打 ALIGN_NO_SPREAD；要把钥匙落到某个账号，走 -Issue/-RegisterAccount 逐账号签发。
     #  - RegisterAccount：把一把**已由引擎侧签发到该账号快照**的钥匙登记进网关 account_tokens 注册表；
     #    钥匙从 stdin 读入（不进命令行、不进日志、不回显），只打印指纹。
@@ -510,7 +514,7 @@ if (Test-Path $engPath) {
         if ($ej.rules -and $ej.rules.qmt) { $engToken = [string]$ej.rules.qmt.token }
     } catch { }
 }
-Info ("src3 engine_cfg    rules.qmt.token=" + (FpLabel $engToken) + " (权威写入方＝设置页；-Align 模式本脚本可按源1补齐，热加载 5s 吃到)")
+Info ("src3 engine_cfg    rules.qmt.token=" + (FpLabel $engToken) + " (权威写入方＝设置页；本脚本**任何模式都不写这一格**＝N1，要清空走 -ClearGlobal，热加载 5s 吃到)")
 
 # ── [诊断] §0926-ROT：env 腿写后读回 mismatch 的结构取证（纯注册表直读、只报计数/键名/读法，
 # 零值外泄）。两个疑点一次拆掉：①NSSM 可能把参数写在 Services\<svc>\Parameters 子键（两份路径
@@ -606,7 +610,7 @@ if (Test-Path $authPath) {
 
 # ── 1z. §0926ROT-ALIGN 对齐模式（2026-09-26 owner 令「我授权你来统一改」）────────────────
 # 语义：**不生成新 token**。源1（config.xt.json）是网关鉴权的真源，本模式把它的现值在服务器
-# 本地复制到源3（引擎 config.json 的 rules.qmt.token）与源4（config.bridge.json，如在位）。
+# 本地复制到源4（config.bridge.json，如在位）；源3 的复制腿已于 §TOKEN-PERAACCT 拆掉（只读不写）。
 # 明文只在函数栈里过（写入值＝读到的源1值），所有输出仍是 sha256 前 8 位指纹——与轮换同一铁律。
 # 写形选择：引擎 config.json 由 Go 侧序列化维护，结构大且格式敏感 ⇒ **绝不整文件反序列化重排**
 # （PS5.1 ConvertTo-Json 会重排/改数值形态，动没动过的字段都可能变），改为"锚点后的首个
@@ -763,6 +767,7 @@ if ($ClearGlobal) {
 if ($Align) {
     # §TOKEN-PERAACCT 默认语义变更（2026-10-30）：**一把钥匙不再铺给所有账号**。
     # 旧 -Align 把源1复制到源3（引擎全局 rules.qmt.token）与源5（每个账号快照），
+    # （2026-10-31 拆最后一颗：源3 那条写腿在 -LegacySpread 路径里也已删除，见下方 FORBIDDEN_BY_N1）
     # 现网七个账号共用同一把实盘凭证、回报只能按 users 顺序猜归属，正是这条通道造成的。
     # 现在缺省**只检视、一条都不写**：源3/源5 按 N1/N2 明确 SKIPPED，源4（桥）只报出差异——
     # 桥与网关物理同机、确实该同钥匙，但"把源1 复制给谁"这件事在逐账号形态下必须是一次显式决定，
@@ -788,7 +793,7 @@ if ($Align) {
             else { Ok "align src4 bridge same-as-src1" }
         } else { Info "align src4 bridge absent (桥未落位，落位时按签发通道对齐)" }
         if (-not $Apply) { Info "ALIGN_DRY plan-only（默认形态：一条都不写）" }
-        else { Ok "ALIGN_NO_SPREAD default-form done written=0（源3/源4/源5 均未写；逐账号签发走 -Issue/-RegisterAccount，确需旧扩散请显式加 -LegacySpread）" }
+        else { Ok "ALIGN_NO_SPREAD default-form done written=0（源3/源4/源5 均未写；逐账号签发走 -Issue/-RegisterAccount，确需旧扩散请显式加 -LegacySpread——它也只写源4 与 owner 快照，源3 永不写）" }
         exit 0
     }
     $alignTok = [string]$cfg.token
@@ -800,11 +805,12 @@ if ($Align) {
     } else {
         Info "align src2 svc_env same-as-src1 (redundant leg confirmed by fingerprint)"
     }
-    $wantEng = ((FpLabel $engToken) -ne $alignFp)
+    # 源3 的计划行**永远报 will_write=False**：这条腿的写侧已被结构性删掉（N1），
+    # 保留这行是为了让驱动与人工都能在计划阶段就看到"源3 不会被动"，而不是事后猜。
     $bridgePath = Join-Path $GatewayDir "config.bridge.json"
     $brAction = "absent"
     if (Test-Path $bridgePath) { $brAction = if ((FpLabel $brToken) -ne $alignFp) { "write" } else { "same" } }
-    Info ("align src3 plan engine_cfg will_write=" + $wantEng + " was=" + (FpLabel $engToken) + " target_fp=" + $alignFp)
+    Info ("align src3 plan engine_cfg will_write=False action=FORBIDDEN_BY_N1 was=" + (FpLabel $engToken) + " target_fp=" + $alignFp + "（N1：源1 永不复制进全局兜底位，摘历史残留走 -ClearGlobal）")
     Info ("align src4 plan bridge action=" + $brAction + " (absent=桥未落位，落位时写源1同值即可)")
     # 源5 计划（§TOKEN-PERAACCT 拆枪后：owner-only，2026-10-31）
     # 旧判据（§0926ROT-SRC5）把"快照里任何与源1不同指纹的值"都算待刷 ⇒ 一次把源1 铺给所有账号，
@@ -829,31 +835,18 @@ if ($Align) {
         exit 0
     }
     $stamp = Get-Date -Format "yyyyMMddHHmmss"
-    # ── 源3：引擎 config.json rules.qmt.token ──
-    if (-not $wantEng) {
-        Ok ("align src3 done token_fp=" + $alignFp + " changed=False (already same as src1)")
+    # ── 源3：引擎 config.json 的 rules.qmt.token ⇒ **这条腿永久不写**（§TOKEN-PERAACCT N1，2026-10-31 owner 令拆最后一颗）──
+    # 旧形态在这里把源1 复制进**全局兜底位**。那格子的语义是"没有自己快照的账号就用它"，
+    # 于是任何账号在设置页点一次保存就把真钥匙抄进自己的快照 ⇒ 七账号一把 ⇒ 回报归属只能按
+    # users 顺序猜（10-30 那两笔 600362「撤单中」挂死 3.6 万额度的根就在这里）。
+    # 拆掉写侧之后这条腿只剩**读数与告警**：全局若已等于源1（历史扩散残留），如实报
+    # `global_holds_live=1` 并指向唯一允许的写＝`-ClearGlobal`（只把它清空，永不写回真钥匙）。
+    $glHoldsLive = 0
+    if ((FpLabel $engToken) -eq $alignFp) { $glHoldsLive = 1 }
+    if ($glHoldsLive -eq 1) {
+        Warn ("align src3 done token_fp=" + $alignFp + " action=FORBIDDEN_BY_N1 will_write=False global_holds_live=1（违 N1：全局兜底位还持有实盘凭证。本模式不写也不清它——摘除请显式跑 -ClearGlobal 并重启 quant）")
     } else {
-        if (-not (Test-Path $engPath)) { Die ("align src3 refused: engine config not found at " + $engPath) }
-        $engRaw = Get-Content -Path $engPath -Raw -Encoding UTF8
-        $engObj = $null
-        try { $engObj = $engRaw | ConvertFrom-Json } catch { Die ("align src3 refused: config.json 解析失败（" + $_.Exception.Message + "）——结构不可信，一个字节都不写") }
-        if (-not $engObj.rules -or -not $engObj.rules.qmt) { Die "align src3 refused: rules.qmt node missing in config.json（引擎侧结构不猜，停手）" }
-        $engNew = $null
-        try { $engNew = Set-JsonStringFieldRaw -Text $engRaw -Anchor '"qmt"' -Field 'token' -Value $alignTok -Check { param($o) (FpLabel([string]$o.rules.qmt.token)) -eq $alignFp } } catch { Die ("align src3 refused: " + $_.Exception.Message) }
-        $engChk = $null
-        try { $engChk = $engNew | ConvertFrom-Json } catch { Die "align src3 refused: 提案文本解析不过（手术切坏形态，拒写）" }
-        if ((FpLabel([string]$engChk.rules.qmt.token)) -ne $alignFp) { Die "align src3 refused: 提案自证不过——rules.qmt.token 未命中锚点块（切错位置嫌疑）" }
-        foreach ($f in @('gateway_url', 'price_type', 'mode')) {
-            if ([string]$engChk.rules.qmt.$f -ne [string]$engObj.rules.qmt.$f) { Die ("align src3 refused: 字段 " + $f + " 在提案里变了——手术刀不干净，拒写") }
-        }
-        $engBak = $engPath + ".pre-align-" + $stamp
-        Copy-Item -LiteralPath $engPath -Destination $engBak -Force
-        $engTmp = $engPath + ".aligning-" + $stamp
-        [System.IO.File]::WriteAllText($engTmp, $engNew, (New-Object System.Text.UTF8Encoding($false)))
-        Move-Item -LiteralPath $engTmp -Destination $engPath -Force
-        $engNow = (Get-Content -Path $engPath -Raw -Encoding UTF8 | ConvertFrom-Json)
-        if ((FpLabel([string]$engNow.rules.qmt.token)) -ne $alignFp) { Die ("align src3 read-back mismatch（回滚副本: " + $engBak + "）") }
-        Ok ("align src3 done token_fp=" + $alignFp + " changed=True was=" + (FpLabel $engToken) + " read-back confirmed, backup=.pre-align-" + $stamp)
+        Ok ("align src3 done token_fp=" + $alignFp + " action=FORBIDDEN_BY_N1 will_write=False global_holds_live=0 was=" + (FpLabel $engToken))
     }
     # ── 源4：桥配置如在位则同写（当前现网 absent——落位时由部署步写源1同值）──
     switch ($brAction) {
@@ -1062,10 +1055,10 @@ if ($gwProcState -ne "restarted(file value in effect)") {
     Warn "§C7 重启后复验：重跑本脚本（dry-run 即可）看 src1 与 self-check(b) 是否为 restarted；最终复核＝verify_deploy_guangzhou.sh 第 20 探针 token_fp_agree"
 }
 
-# ── 5. 人工步清单（轮换模式仍不自动写源3/源4；§0926ROT-ALIGN 起，源3 可由 -Align -Apply 按源1补齐，源4 在桥落位时写源1同值）──
+# ── 5. 人工步清单（轮换模式不自动写源3/源4；§TOKEN-PERAACCT 后**源3 任何模式都不写**——全局兜底位只许 -ClearGlobal 清空，源4 在桥落位时写源1同值）──
 Write-Host ""
 Info "remaining manual steps (both must move to the SAME new token before the next report/order):"
-Info "  [1] web 设置页 -> QMT 配置 rules.qmt.token 改为新 token（权威写入方是设置页；或跑本脚本 -Align -Apply 由机器按源1补齐，二者取其一勿并行）"
+Info "  [1] web 设置页 -> QMT 配置 rules.qmt.token（权威写入方只有设置页；本脚本不再将源1 复制到这一格＝N1，历史残留请跑 -ClearGlobal 清空后重启 quant）"
 Info "  [2] qmt_bridge.py 启动参数 --token 改新值（或同目录 config.bridge.json）并重启桥（该文件在位时 -Align 会一并核对/同写）"
 Info "  [3] 重启网关进程载入新 config（§C7 单径：restart_gateway.ps1 杀旧进程 → 交互任务 $SvcTaskGatewayEnsure 拉起；env 腿对网关是冗余，别指望重启服务）"
 Info "  [4] 复核：GZ_IP=... ./scripts/verify_deploy_guangzhou.sh 第 20 探针 token_fp_agree=4/4"

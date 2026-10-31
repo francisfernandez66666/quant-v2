@@ -31,7 +31,7 @@
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -DryRun      # 远端只读：四源指纹读数
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Apply       # 真轮换（只动源1+源2）
 #   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align       # §TOKEN-PERAACCT 远端只读：对齐计划（默认形态三条腿都只报数）
-#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align -Apply # 默认形态=一条都不写（ALIGN_NO_SPREAD）；旧扩散需再加 -LegacySpread
+#   GZ_IP=81.71.69.17 ./scripts/rotate_qmt_token_guangzhou.sh -Align -Apply # 默认形态=一条都不写（ALIGN_NO_SPREAD）；旧扩散（源4+源5 owner）需再加 -LegacySpread；源3 任何形态都不写
 # 可选环境变量：
 #   GZ_USER      默认 Administrator
 #   ROTATE_PS1   远端 ps1 路径，默认 C:/opt/quant/qmt-win/rotate_qmt_token.ps1（部署清单落点）
@@ -59,7 +59,8 @@ done
 #   -Align          = 远端只读对齐计划（src3/src4/src5 各会动什么，逐一列出；ps1 缺省即 dry-run）
 #   -Align -Apply   = §TOKEN-PERAACCT 后**默认一条都不写**：src3/src5 明确 SKIPPED、src4 report-only，
 #                     收尾打 ALIGN_NO_SPREAD（下面这条分支据此判"计划完整、未写"，而不是"半态待回滚"）。
-#                     确需旧的源1→源3/源4/源5 扩散（回滚形态）在远端命令里显式加 -LegacySpread。
+#                     确需旧的扩散（**只剩源4 与源5 的 owner 那一条**）在远端命令里显式加 -LegacySpread；
+#                     源3（引擎全局 rules.qmt.token）的写侧已从 ps1 删除，任何形态都写不到它（N1）。
 #   -Align -DryRun  = 同 -Align（显式只读）。-DryRun/-Apply 单独出现仍是原轮换读/写方向。
 # 这里直接折叠进 MODE 单一命名空间（不另设 R_MODE：少一个变量就少一处"哪个才是真模式"的漂移）。
 if [ "$ALIGN" = "1" ]; then
@@ -108,7 +109,7 @@ if [ "$MODE" = "preview" ]; then
   echo "    -Align  只读对齐计划（默认形态只检视）：powershell -File ${ROTATE_PS1} -Align"
   echo "    -Align -Apply §TOKEN-PERAACCT 后默认**一条都不写**（源3/源5 SKIPPED、源4 report-only，"
   echo "                  收尾打 ALIGN_NO_SPREAD）；要逐账号落钥匙走 -Issue/-RegisterAccount"
-  echo "    -Align -Apply -LegacySpread 才是旧的源1→源3/源4/源5 扩散（回滚形态，显式才生效）"
+  echo "    -Align -Apply -LegacySpread 才是旧的扩散形态（**只写源4 与源5 的 owner 那一条**；源3 全局兜底位任何形态都不写＝N1）"
   echo "  安全口径（ps1 既有铁律，本通道原样继承）："
   echo "    写侧①先落 config.xt.json 时间戳副本再原子写；写侧②服务 env 并集写不整体替换；"
   echo "    全程只打 sha256 前 8 位指纹；回传过本脚本的 40+hex 明文闸。"
@@ -251,10 +252,10 @@ if [ "$MODE" = "alignapply" ]; then
     echo "ok - 默认形态按逐账号凭证收口：源3/源4/源5 均未写（要签发走 -Issue/-RegisterAccount，确需旧扩散显式加 -LegacySpread）"
     exit 0
   fi
-  for anchor in 'align src3 done token_fp=' 'align src4 done ' 'align src5 done ' 'ALIGN_APPLIED'; do
+  for anchor in 'align src3 done token_fp=' 'align src4 done ' 'align src5 done ' 'action=FORBIDDEN_BY_N1' 'ALIGN_APPLIED'; do
     if ! printf '%s\n' "$LAST_OUT" | grep -qF "$anchor"; then
-      echo "X 对齐判定行缺失「${anchor}」——源3/源4/源5 写腿（外科替换+回读自证）没有全过，" >&2
-      echo "  按半态处置：不要重启网关，config.json 与 auth.json 旁有 .pre-align-* 副本可回滚，详见 ${LOG}。" >&2
+      echo "X 对齐判定行缺失「${anchor}」——源4/源5 写腿（外科替换+回读自证）或「源3 不写」的自证没有全过，" >&2
+      echo "  按半态处置：不要重启网关，config.bridge.json 与 auth.json 旁有 .pre-align-* 副本可回滚，详见 ${LOG}。" >&2
       exit 1
     fi
   done
@@ -285,13 +286,19 @@ if [ "$MODE" = "alignapply" ]; then
   case "$LAST_OUT" in
     *'[fail]'*) echo "X 写后复读远端判死——详见 ${LOG}。" >&2; exit 1 ;;
   esac
+  # src3 复读腿（§TOKEN-PERAACCT 拆最后一颗，2026-10-31 owner 令）：**判据方向反过来**。
+  # 旧判据要 src3 等于对齐指纹（"五源同值"的遗产），那条判据本身就是把凭证铺给所有账号的成因：
+  # 全局兜底位装了实盘钥匙 ⇒ 任何没有自有快照的账号点一次保存就抄走它。
+  # 现在这条腿只认一句话：**全局兜底位不许等于源1**；等于就是 N1 被破坏（无论是本轮写的还是历史残留）。
   SRC3_LINE="$(printf '%s\n' "$LAST_OUT" | grep -m1 '\[rot\] src3 ' || true)"
   [ -n "$SRC3_LINE" ] || { echo "X 写后复读拿不到 src3 行——复核没做到，判失败。" >&2; exit 1; }
-  if ! printf '%s' "$SRC3_LINE" | grep -qF "sha256:${NEWFP}"; then
-    echo "X 写后复读 src3 指纹 != 本轮对齐值 sha256:${NEWFP}——引擎配置可能被并发改写/回滚，判失败。" >&2
+  if printf '%s' "$SRC3_LINE" | grep -qF "sha256:${NEWFP}"; then
+    echo "X 写后复读 src3（引擎全局 rules.qmt.token）仍等于实盘钥匙 sha256:${NEWFP}——违 N1，判失败。" >&2
+    echo "  这条腿现在**不写也不清**全局位；摘除请显式跑 -ClearGlobal（写前自动备份、写后复读自证）再重启 quant。" >&2
     echo "  行内容：${SRC3_LINE}"
     exit 1
   fi
+  echo "ok - src3 复核：全局兜底位不等于实盘钥匙（N1 成立，本模式结构性不写它）"
   SRC1_LINE="$(printf '%s\n' "$LAST_OUT" | grep -m1 '\[rot\] src1 ' || true)"
   if [ -z "$SRC1_LINE" ] || ! printf '%s' "$SRC1_LINE" | grep -qF "sha256:${NEWFP}"; then
     echo "X 写后复读 src1 指纹 != 对齐指纹——真源在落地后被改动，判失败（先取证再动任何重启）。" >&2
@@ -319,13 +326,13 @@ if [ "$MODE" = "alignapply" ]; then
                echo "  行内容：${SRC5_LINE}"
                exit 1 ;;
   esac
-  echo "ok - 写后复读一致：源1==源3==源5(owner 那一条)==sha256:${NEWFP}（桥腿 ${BR_ACT:-unknown}，absent=未落位、落位时同法补齐；非 owner 快照 ${OH:-?} 条按逐账号在册不动）"
+  echo "ok - 写后复读一致：源1==源4（如在位）==源5(owner 那一条)==sha256:${NEWFP}；源3 已复核为**不等于**实盘钥匙（非 owner 快照 ${OH:-?} 条按逐账号在册不动）"
   echo ""
   echo "  ── 对齐后的收尾口径 ──"
   echo "  [1] 设置页仍是各账号快照的权威写入方：改了某个账号的 token 后，**只对那一个账号**补一次"
   echo "      （-RegisterAccount <uid> 登记那把，或 -Issue <uid> 直接签发并两侧落）——不再有"把快照一并洗"这种动作；"
-  echo "  [2] 桥落位（config.bridge.json 出现）后重跑一次 -Align -Apply 即补齐源4；"
-  echo "  [3] 时序红线：网关/引擎进程重启必须晚于五侧同值确认——复核腿 verify 第 20 探针 token_fp_agree；"
+  echo "  [2] 桥落位（config.bridge.json 出现）后重跑一次 -Align -Apply -LegacySpread 即补齐源4（缺省形态只报差异不写）；"
+  echo "  [3] 时序红线：网关/引擎进程重启必须晚于同源确认——复核腿 verify 第 20 探针（R1 网关三条腿同值 / R2 snapshot_holders≤1 / R3 全局不持有实盘凭证）；"
   echo "  [4] 本轮 src5 真写过（action=write）⇒ 引擎的 auth store 只在启动时载入，须重启 quant 服务账号快照才吃到（跑一次 scripts/deploy_guangzhou.sh -s 即拉起）。"
   exit 0
 fi

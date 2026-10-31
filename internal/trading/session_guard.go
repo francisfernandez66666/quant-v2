@@ -230,6 +230,17 @@ func ErrNoCancelWindow(label string) error {
 	return fmt.Errorf("当前处于不可撤单时段（%s）：集合竞价期间交易所不接受撤单，请稍后重试", label)
 }
 
+// ErrMarketClosed 休市日（非交易日）的拒绝文案。
+//
+// §CANCEL-STATE 补的**交易日维度**（2026-10-31 owner 质疑「禁挂窗口不应该是交易日吗」）：
+// 窗口判定只看钟点（inWindow），周六/节假日的 09:20–09:30 也会被它拒，而
+// 「集合竞价期间交易所不接受新委托，请稍后重试」在休市日是**假话**——那天根本没有集合竞价，
+// 操作人等 09:30 再试还是白等。现在休市日一律以本条如实拒，交易日的窗口语义一字不变。
+// English: honest refusal for non-trading days, distinct from the session-window refusal.
+func ErrMarketClosed(action string) error {
+	return fmt.Errorf("今日休市（非交易日）：%s不受理——交易所不开盘，与禁挂/禁撤时段无关，请交易日再操作", action)
+}
+
 // ErrNoNewOrderWindow 禁挂窗口的拒绝文案。
 func ErrNoNewOrderWindow(label string) error {
 	return fmt.Errorf("当前处于不可挂单时段（%s）：集合竞价/尾盘窗口不再接受新委托，请稍后重试", label)

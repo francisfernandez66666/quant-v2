@@ -2784,7 +2784,10 @@ for mode, (mstart, guard_end, nxt) in spans.items():
             covered.add(w)
             assert guard_end < w, mode + ' 的写盘原语排在它自己的 -Apply 出口之前（缺省调用就会改现网）'
 outside = [w for w in writes if w not in covered]
-assert len(outside) >= 10, '主链路写盘点位数异常（新分支把主链路的写也圈进来了？本锁需同步）'
+# 地板＝9（2026-10-31 §TOKEN-PERAACCT 拆源3 写腿时从 12 同步下来）：那三条是
+# align 段里「备份 / 原子写 / 改名」引擎 config.json 的写盘原语，写侧代码已删 ⇒ 主链路只剩 9 处。
+# 这条地板的意义是"别悄悄少"，不是"必须是 12"；再动主链路写侧请连同这条与 V1 一起改。
+assert len(outside) >= 9, '主链路写盘点位数异常（新分支把主链路的写也圈进来了？本锁需同步）'
 for w in outside:
     assert early.end() < w, '主链路写盘动作排在 dry-run 早退之前（不加 -Apply 也会改配置）'
 PY
@@ -2826,7 +2829,8 @@ def check(t):
                 if b > w:
                     return mode + ' 的写盘原语排在它自己的 -Apply 出口之前'
     outside = [w for w in writes if w not in covered]
-    if len(outside) < 10:
+    # 与上面主锁同形同数：9＝拆掉源3 三条写腿之后的主链路面（2026-10-31 同步）
+    if len(outside) < 9:
         return '主链路写盘点数骤减'
     for w in outside:
         if early.end() > w:
@@ -3028,6 +3032,98 @@ if [ "$B143_V4" != "0" ]; then
 	B143_FAILED=1
 fi
 echo "ok - §143 反证 V4（驱动认 ALIGN_NO_SPREAD 与只判 owner_fp；摘兜底、永不匹配、注回旧判据三处全红）"
+# 反证腿 V5（§TOKEN-PERAACCT 拆最后一颗：`-LegacySpread` 也不再写源3，2026-10-31 owner 令）。
+# 为什么不能只 grep「action=FORBIDDEN_BY_N1」这句话：那是**打印**出来的，谁都能在真写了
+# config.json 之后照打不误（本仓 10-30 那一双份账就是"降级报成功"这个家族）。
+# 判据因此是结构性的两半：①把 `if ($Align) {` 这一支按顶层 `if (` 边界整段切出来，
+# 段内**任何**引擎写盘原语都不许出现（含旧的 $engRaw 手术刀那条腿），并必须自带
+# global_holds_live 读数；②驱动的 src3 复读必须**反过来判**——全局位等于实盘钥匙才是失败。
+B143_V5=0
+python3 - deploy/qmt-win/rotate_qmt_token.ps1 scripts/rotate_qmt_token_guangzhou.sh <<'PYV5' || B143_V5=1
+import re, sys
+
+# 源3（引擎全局 rules.qmt.token）写腿的本体形态：读原文→外科替换→备份→原子写→复读
+ENG_PRIMS = ('Copy-Item -LiteralPath $engPath', '[System.IO.File]::WriteAllText($engTmp',
+             'Move-Item -LiteralPath $engTmp', 'Set-JsonStringFieldRaw -Text $engRaw')
+# 驱动旧判据：src3 **必须等于**对齐指纹才绿（"五源同值"的遗产，本身就是逼凭证铺进全局位）
+OLD_DRV = ('  if ! printf \'%s\' "$SRC3_LINE" | grep -qF "sha256:${NEWFP}"; then\n'
+           '    echo "X 写后复读 src3 指纹 != 本轮对齐值 sha256:${NEWFP}" >&2\n')
+
+
+def align_section(t):
+    """-Align 那一支的整段文本（到下一个顶层 if ( 为止）；找不到入口返回 None。"""
+    i = t.find('if ($Align) {')
+    if i < 0:
+        return None
+    tops = [m.start() for m in re.finditer(r'^if \(', t, re.M)]
+    nxt = min([q for q in tops if q > i] + [len(t)])
+    return t[i:nxt]
+
+
+def check_ps1(t):
+    seg = align_section(t)
+    if seg is None:
+        return '找不到 -Align 段（这条反证没有射程）'
+    if 'action=FORBIDDEN_BY_N1' not in seg:
+        return 'align 段不再声明源3 写不了（N1 退回"靠报警"）'
+    if 'global_holds_live=' not in seg:
+        return 'align 段不回显 global_holds_live（全局位被历史残留占着时现场失明）'
+    for prim in ENG_PRIMS:
+        if prim in seg:
+            return 'align 段里出现源3 的写盘原语：' + prim
+    return None
+
+
+def check_drv(t):
+    if 'action=FORBIDDEN_BY_N1' not in t:
+        return '驱动不认「源3 不写」锚点（脚本与驱动口径脱节）'
+    if not re.search(r'if printf \'%s\' "\$SRC3_LINE" \| grep -qF "sha256:\$\{NEWFP\}"; then\s*\n\s*echo "X [^"]*违 N1', t):
+        return '驱动的 src3 复读没有反着判（全局位等于实盘钥匙应当判失败）'
+    if 'if ! printf \'%s\' "$SRC3_LINE" | grep -qF "sha256:${NEWFP}"' in t:
+        return '驱动又回到「src3 必须等于对齐值」的旧判据'
+    return None
+
+
+ps1 = open(sys.argv[1], encoding='utf-8').read()
+drv = open(sys.argv[2], encoding='utf-8').read()
+r1, r2 = check_ps1(ps1), check_drv(drv)
+if r1 is not None or r2 is not None:
+    print('POSITIVE_FAILED: ' + '; '.join(x for x in (r1, r2) if x))
+    raise SystemExit(1)
+# 反证①：把旧的源3 写盘原语注回 align 段 ⇒ 必红
+m = re.search(r'if \(\$Align\) \{', ps1)
+inj = ps1[:m.end()] + '\n' + ENG_PRIMS[0] + '\n' + ps1[m.end():]
+if check_ps1(inj) is None:
+    print('MUTATION_STILL_GREEN: 注回源3 写盘原语后仍判绿')
+    raise SystemExit(1)
+# 反证②：删掉「源3 不写」的自证锚点（只留一句无关回显）⇒ 必红
+if check_ps1(ps1.replace('action=FORBIDDEN_BY_N1', 'action=ZzZ')) is None:
+    print('MUTATION_STILL_GREEN: 摘掉 action=FORBIDDEN_BY_N1 后仍判绿')
+    raise SystemExit(1)
+# 反证③：摘掉 global_holds_live 读数 ⇒ 必红
+if check_ps1(ps1.replace('global_holds_live=', 'zz_holds=')) is None:
+    print('MUTATION_STILL_GREEN: 不回显 global_holds_live 也照样判绿')
+    raise SystemExit(1)
+# 反证④：驱动判读反回「src3 必须等于对齐值」⇒ 必红
+mm = re.search(r'  if printf \'%s\' "\$SRC3_LINE" \| grep -qF "sha256:\$\{NEWFP\}"; then\n', drv)
+if not mm:
+    print('ANCHOR_MISSING: 抓不到驱动的 src3 复读那条腿，反证没法注入')
+    raise SystemExit(1)
+if check_drv(drv[:mm.start()] + OLD_DRV + drv[mm.end():]) is None:
+    print('MUTATION_STILL_GREEN: 驱动回到旧判据（要求 src3 等于对齐值）仍判绿')
+    raise SystemExit(1)
+# 反证⑤：驱动不认「源3 不写」锚点 ⇒ 必红（两侧同源这条不是纸面话）
+if check_drv(drv.replace('action=FORBIDDEN_BY_N1', 'action=ZzZ', 1)) is None:
+    print('MUTATION_STILL_GREEN: 驱动不再认 action=FORBIDDEN_BY_N1 也照样判绿')
+    raise SystemExit(1)
+raise SystemExit(0)
+PYV5
+if [ "$B143_V5" != "0" ]; then
+\techo "--- FAIL: §143 反证 V5（源3 写腿的结构判据不成立，或五处破坏里有任何一处仍判绿＝这条锁只能变绿）"
+\tFAIL=1
+\tB143_FAILED=1
+fi
+echo "ok - §143 反证 V5（-Align 段内零引擎写盘原语 + 驱动 src3 反判；注回写盘、摘锚点、去读数、判读反回、不认同源锚点五处全红）"
 # 负锁：轮换脚本不得把新 token 明文写进任何输出（本仓库铁律：输出只准键名/计数/指纹）。
 if grep -qE '\+ \$newToken|\$\{newToken\}' deploy/qmt-win/rotate_qmt_token.ps1; then
 	echo "--- FAIL: 轮换脚本出现回显新 token 明文的路径"; exit 1; fi
@@ -5276,6 +5372,10 @@ fi
 #    源3 引擎 config.json/源4 桥配置，不生成新 token）——新判定名 ALIGN_READOUT/ALIGN_APPLIED
 #    各恰 1、开关映射锁、驱动锚与 ps1 写行两侧同源（含"提案自证"拒判腿），离网两形态
 #    （-Align / -Align -Apply）必须死在预探测且判定名一条都不许出现；判定名与轮换互不借用。
+#    > 后续（§TOKEN-PERAACCT，2026-10-31 拆最后一颗）：**源3 的写侧已从 ps1 删除**，任何形态都
+#    > 写不到全局兜底位（计划/完成两行打 action=FORBIDDEN_BY_N1 + global_holds_live 读数），
+#    > 驱动 [4b] 的 src3 复读判据同批**反过来**（全局位等于实盘钥匙＝判失败）。原文留档是为了
+#    > 保住"当初为什么要补这条腿"的判断依据；新锁见 §143 ⑧b 与反证 V5。
 # ⑤ §0926ROT-SRC5（2026-09-26 深夜发版实录）：-Align 补源5＝auth.json 账号级快照
 #    （configs[]→quant_config_json_v1→.qmt.token，GetQMTConfigFor 的账号覆盖层——09-26 实录：
 #    只对齐源3 时 verify ③b 腿仍红 engineAuth 分歧＝真实下单链拿旧口令）。三态判定行
@@ -5351,7 +5451,10 @@ rt_min "驱动 aligndry 计划锚含 src5（计划读数不完整即停）" "$(g
 rt_min "驱动写后复读 src5 腿在位（取值+判读≥4 处，残留非对齐指纹必拦停）" "$(grep -Fc 'SRC5_LINE' "$RT_SCR" || true)" "4"
 rt_min "驱动干跑五源锚行在位（'[rot] src5 ' 进锚点表）" "$(grep -Fc "[rot] src5 " "$RT_SCR" || true)" "1"
 rt_min "verify 第 20 探针 env 腿两级读法在位（both-paths-unreadable 自证串恰 1）" "$(grep -Fc 'both-paths-unreadable' scripts/verify_deploy_guangzhou.sh || true)" "1"
-rt_min "ps1 侧对齐写前三重拒判之「提案自证」在位（指纹不命中锚点块即一个字都不写）" "$(grep -Fc '提案自证不过' "$RT_PS1" || true)" "2"
+# 地板 2→1（2026-10-31 §TOKEN-PERAACCT 拆源3 写腿时同步）：这条三重拒判原本 src3/src4 各一份，
+# src3 那份随写侧代码一起删了；剩下的这份仍守着"提案自证不过就一个字都不写"（src4 与 src5 同款自证）。
+# 再往 align 里加写腿时，请把这份自证一并加上，而不是把地板抬回去当摆设。
+rt_min "ps1 侧对齐写前三重拒判之「提案自证」在位（指纹不命中锚点块即一个字都不写）" "$(grep -Fc '提案自证不过' "$RT_PS1" || true)" "1"
 # 09-26 对齐批实锤的假绿补洞：仓内词法扫描把反斜杠当普通字符，反斜杠贴引号恰好抵平括号照样
 # PASS，但 PS5.1 不认反斜杠转义——现网首跑 ParserError。形态锁：该串在 rotate ps1 出现即红。
 rt_absent "rotate ps1 反斜杠贴双引号形态清零（PS 转义只认反引号，C 形写法＝引号语境翻转炸弹）" "$(grep -Fc '\""' "$RT_PS1" || true)"
@@ -16603,7 +16706,30 @@ grep -qF '禁挂时段（' "$EG138" ||
 	fail138 "买入评估没接禁挂闸（禁挂时段仍会算出委托并发出）"
 grep -qF '禁挂时段（' "$TL138" ||
 	fail138 "T 回合没接禁挂闸（两腿串行时第一腿发出去第二腿被闸＝裸仓）"
-CNT138=$((CNT138 + 14))
+# —— ①b 交易日维度（2026-10-31 owner 质疑「禁挂窗口不应该是交易日吗」）——
+# 手动入口（HTTP 挂单 / 手动委托 / 撤单）先判今天开不开市：休市日给「今日休市」，交易日才谈窗口。
+# 为什么只动这一层：控制器 PlaceOrder/CancelOrder 与引擎自动链保持原语义——自动链本来就被
+# scoring_loop 的 IsActiveSession 挡在非交易日之外；给执行点再加日历会把整片"按当天日期下单"
+# 的用例变成周末假红（实测 09:5x 一次加错，internal/{trading,server} 共 30+ 条红）。那是形状错，
+# 不是缺保护。时钟必须走 ctrl.Now()：否则用例钉不住"周六 09:25"与"周三 09:25"两种形状。
+grep -qF 'func ErrMarketClosed' "$SG138" ||
+	fail138 "缺休市拒绝文案（休市日只能复用'集合竞价期间'那句假话）"
+grep -qF 'func (c *Controller) ManualOrderRefusal' "$CT138" ||
+	fail138 "缺手动入口统一闸（三处各写一套判定＝文案必然再次分叉）"
+grep -qF 'if !data.IsTradingDay(now) {' "$CT138" ||
+	fail138 "手动入口闸不判交易日（周六 09:25 仍会给'集合竞价'）"
+if grep -qF 'if !data.IsTradingDay(c.now()) {' "$CT138"; then
+	fail138 "交易日维度又加回控制器执行点（周末会把整片下单用例判红，紧急停止的边界也更脆）"
+fi
+[ "$(grep -Fc 'ctrl.ManualOrderRefusal(ctrl.Now()' "$SV138" || true)" = "2" ] ||
+	fail138 "qmt.go 两处手动入口没接统一闸（挂单/撤单；且时钟必须走 ctrl.Now() 才钉得住）"
+[ "$(grep -Fc 'ctrl.ManualOrderRefusal(ctrl.Now()' internal/server/handlers_fix.go || true)" = "1" ] ||
+	fail138 "手动委托那条入口没接统一闸"
+grep -qF 'func TestManualOrderRefusalHonestOnNonTradingDay' internal/trading/market_closed_20261031_test.go ||
+	fail138 "休市日如实拒绝没有行为锁"
+grep -qF 'func TestHaltAllStillCancelsOnNonTradingDay' internal/trading/market_closed_20261031_test.go ||
+	fail138 "紧急停止仍全撤的止损不变量没有锁（给闸加维度时最容易被顺手挡掉）"
+CNT138=$((CNT138 + 22))
 
 # —— ② 状态闸：撤单中状态 + 显式拒因唯一回退钥匙 + 202 语义 ——
 grep -qF 'func (d *DB) MarkRealOrderCancelRequested' "$RP138" ||
@@ -17489,7 +17615,22 @@ if grep -q 'authStaleVals\|stale_kinds' deploy/qmt-win/rotate_qmt_token.ps1; the
 	fail143 "拆掉的旧枪又回来了（authStaleVals/stale_kinds 是'把所有快照洗成源1'的判据与写形）"
 fi
 
+# —— ⑧b 拆最后一颗：`-LegacySpread` 也不许写源3（N1 从"靠报警"变成"做不到"，2026-10-31 owner 令）——
+CNT143=$((CNT143 + 1))
+grep -q 'action=FORBIDDEN_BY_N1' deploy/qmt-win/rotate_qmt_token.ps1 \
+	|| fail143 "源3 那条腿不再声明自己写不了（N1 的结构性保证丢了——只剩'靠探针事后判红'那道防线）"
+grep -q 'global_holds_live=' deploy/qmt-win/rotate_qmt_token.ps1 \
+	|| fail143 "align 不回显 global_holds_live 读数（全局兜底位被历史扩散占着时，现场看不见）"
+grep -q 'action=FORBIDDEN_BY_N1' scripts/rotate_qmt_token_guangzhou.sh \
+	|| fail143 "驱动不认「源3 不写」这条锚点（两侧口径脱节＝脚本没落位也能自称收口）"
+if grep -qE '\$engRaw' deploy/qmt-win/rotate_qmt_token.ps1; then
+	fail143 "源3 的写盘原语又回来了（把源1 复制进引擎全局 rules.qmt.token＝这次事故的成因本体）"
+fi
+if grep -q '写后复读 src3 指纹 != 本轮对齐值' scripts/rotate_qmt_token_guangzhou.sh; then
+	fail143 "驱动的 src3 复读判据又回到「必须等于对齐值」（那条判据本身在逼凭证铺进全局兜底位）"
+fi
+
 [ "$B143_FAILED" = "0" ] || exit 1
-echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1 + 拆 first-match 与拆枪 1 + 反证 V3（旧枪注回/摘掉 -Uid 必红）1 + 反证 V4（驱动判读三处摘锁必红）1，累计判定点 ${CNT143}）"
+echo "ok - §143 §TOKEN-PERAACCT 锁通过（注册表 2 + 入站归属 1 + 出向选钥匙与 T1 不动 1 + Go 写面 1 + 轮换通道 1 + 签发两侧同源 1 + 探针判据 1 + 拆 first-match 与拆枪 1 + 拆源3 写腿（N1 结构性）1 + 反证 V3（旧枪注回/摘掉 -Uid 必红）1 + 反证 V4（驱动判读三处摘锁必红）1，累计判定点 ${CNT143}）"
 
 echo "==> 全部通过"

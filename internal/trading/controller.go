@@ -967,6 +967,37 @@ func (c *Controller) MaybeReconcile(interval time.Duration) {
 // 把它当终态就是 2026-10-28 600362 事故的成因（实际成交丢失、买入列表没有该票）。
 // 现在只写「撤单中」（非终态，冻结照算），终态由回报/快照推进。
 // 同时加禁撤窗口闸：集合竞价期间交易所不接受撤单，发出去注定被拒，不发。
+// ManualOrderRefusal 手动入口（HTTP）的统一前置闸：**先判今天开不开市，再判窗口**。
+// 与 placeOrder/CancelOrder 内部那条同来源（同一个 data.IsTradingDay + 同一份窗口配置），
+// 免得出现"handler 放行、控制器拒单"两套文案（10-28 的回显对不上就是这么来的）。
+// 返回空串＝放行；非空串＝直接把这句作为 409 正文回给操作人。
+// English: the manual-entry gate — market-closed first, then the session window; empty means allow.
+// Now 返回控制器当前时刻（测试可用 SetNow 注入）。
+// 手动入口闸用它判"今天开不开市"：时钟走控制器而不是各自 time.Now()，
+// 用例才能钉出"周六 09:25"与"周三 09:25"两种形状，而不必看跑测试的那天是星期几。
+// English: the controller clock, exposed so the manual-entry gate is test-pinnable.
+func (c *Controller) Now() time.Time { return c.now() }
+
+func (c *Controller) ManualOrderRefusal(now time.Time, forCancel bool) string {
+	if !data.IsTradingDay(now) {
+		action := "挂单"
+		if forCancel {
+			action = "撤单"
+		}
+		return ErrMarketClosed(action).Error()
+	}
+	if forCancel {
+		if blocked, label := c.windowsRef().CancelBlocked(now); blocked {
+			return ErrNoCancelWindow(label).Error()
+		}
+		return ""
+	}
+	if blocked, label := c.windowsRef().NewOrderBlocked(now); blocked {
+		return ErrNoNewOrderWindow(label).Error()
+	}
+	return ""
+}
+
 func (c *Controller) CancelOrder(orderID string) error {
 	c.mu.RLock()
 	enabled := c.cfg.Enabled

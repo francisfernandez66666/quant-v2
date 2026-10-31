@@ -26,11 +26,21 @@ import (
 // 满窗放行并清探针；高置信走快车道（30s）。参数取 DefaultQMTConfig().Discipline（5min/30s）。
 // English: dispatchLive confirm window — first probe holds, persistence under the window holds,
 // at-window passes and clears; high-confidence takes the 30s fast lane.
+// liveTestNow 把 dispatchLive 用例的时钟钉到**当日 10:30**（§FIX-20261031，与 qmt_auto_test.go
+// 里 AutoExecuteRealSells* 的手法同源）。缺陷本体：传入的 now 还要再过一遍 §CANCEL-STATE 的禁挂闸
+// （09:20–09:30 / 14:52–15:00 直接拒绝新委托），原先这三条用例用真实 time.Now() ⇒ 每天那两段里
+// 跑全量 go test 必假红（实测 10-31 09:28 三条全红、09:32 全绿，代码一字未改）。
+// 只钉时分、保留当日日期：day-keyed 的幂等键与探针去重口径不受影响。
+func liveTestNow() time.Time {
+	n := time.Now()
+	return time.Date(n.Year(), n.Month(), n.Day(), 10, 30, 0, 0, n.Location())
+}
+
 func TestDispatchLiveBuyConfirmWindow(t *testing.T) {
 	e, _, _, orders := newQMTEngine(t, nil)
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
 	sig := combat_agent.Signal{ID: "S1", Code: "600000", Name: "浦发", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
-	now := time.Now()
+	now := liveTestNow()
 
 	e.dispatchLive([]combat_agent.Signal{sig}, live, true, now) // 首探针 → hold
 	if len(*orders) != 0 {
@@ -73,7 +83,7 @@ func TestDispatchLivePruneOnAbsence(t *testing.T) {
 	a := combat_agent.Signal{ID: "A", Code: "600000", Name: "A", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
 	b := combat_agent.Signal{ID: "B", Code: "600001", Name: "B", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}, "600001": {Code: "600001", Price: 10}}
-	now := time.Now()
+	now := liveTestNow()
 
 	e.dispatchLive([]combat_agent.Signal{a}, live, true, now)                    // A 首探针
 	e.dispatchLive([]combat_agent.Signal{b}, live, true, now.Add(8*time.Minute)) // B 的活跃集缺席 A → A 探针清理

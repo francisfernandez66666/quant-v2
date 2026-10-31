@@ -232,7 +232,8 @@ func TestAutoPlaceIdempotencyKeyC6Unified(t *testing.T) {
 // 动量（momentum）即使在"全部开启"（空白名单）下也不放行，必须显式列名（09-17 事故回归）。
 // English: whitelist adjudication now lives in the controller; autoPlace stays pure execution.
 func TestDispatchLiveSkipsWhitelist(t *testing.T) {
-	now := time.Now()
+	// §FIX-20261031：本用例的 now 同样要过禁挂闸，钉到当日 10:30（见 discipline_real_test.go 的 liveTestNow）
+	now := liveTestNow()
 	live := map[string]*data.StockInfo{"000001": {Code: "000001", Price: 10}, "000002": {Code: "000002", Price: 10}}
 	dragon := combat_agent.Signal{ID: "S1", Code: "000001", Name: "平安", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
 	nshape := combat_agent.Signal{ID: "S2", Code: "000002", Name: "万科", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10}

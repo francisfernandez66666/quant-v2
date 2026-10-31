@@ -18,10 +18,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
@@ -102,6 +104,10 @@ func newExecuteTestServer(t *testing.T) (*Server, *auth.User, *execCountStub) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	ctrl := trading.NewController(exec, db, admin.Username, cfg, nil)
+	// §CANCEL-STATE 交易日维度（2026-10-31）：手动入口闸会先判"今天开不开市"。
+	// 用例的时钟必须钉在**交易日 10:30**（2026-11-04 周三）——否则周末跑全量时整片下单用例
+	// 都会被"今日休市"判红（那是日历，不是代码）。同理也别钉在 09:20–09:30/14:52–15:00 窗口里。
+	ctrl.SetNow(func() time.Time { return time.Date(2026, 11, 4, 10, 30, 0, 0, cntime.Loc) })
 	s.SetEngineController(fakeCtrl{qmt: ctrl})
 	s.market = data.NewMarketAPI()
 	s.market.SetTransport(sinaStubTransport{})

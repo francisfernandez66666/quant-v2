@@ -521,10 +521,10 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	}
 	// 幂等键构造：客户端 UUID 合法（格式/长度通过）则以 clientID 组键（重试复用同键防重复下单）；
 	// 缺省/非法回退秒级时间戳键（兼容旧客户端，双击跨秒会各自成单——旧行为）。
-	// §CANCEL-STATE（2026-10-28）禁挂单窗口闸：集合竞价/尾盘窗口内交易所不接受新委托，
-	// 直接 409（而不是让 PlaceOrder 的一般性拒单文案吞掉"现在不能挂单"这个可操作信息）。
-	if blocked, label := ctrl.NewOrderBlockedByWindow(time.Now()); blocked {
-		writeError(w, 409, trading.ErrNoNewOrderWindow(label).Error())
+	// §CANCEL-STATE（2026-10-28）+ 交易日维度（2026-10-31）：手动挂单走统一前置闸——
+	// 休市日给"今日休市"、交易日给窗口原文案（不让 PlaceOrder 的一般性拒单吞掉可操作信息）。
+	if msg := ctrl.ManualOrderRefusal(ctrl.Now(), false); msg != "" {
+		writeError(w, 409, msg)
 		return
 	}
 	clientID := ""
@@ -1870,9 +1870,10 @@ func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "real book not available")
 		return
 	}
-	// §CANCEL-STATE 禁撤窗口闸：集合竞价期间交易所不接受撤单。
-	if blocked, label := ctrl.CancelBlockedByWindow(time.Now()); blocked {
-		writeError(w, 409, trading.ErrNoCancelWindow(label).Error())
+	// §CANCEL-STATE 禁撤闸 + 交易日维度（2026-10-31）：休市日的理由必须是"今日休市"，
+	// 不是"集合竞价期间不接受撤单"——后者会让人白等 09:30。紧急停止不走这条路（HaltAll 直发）。
+	if msg := ctrl.ManualOrderRefusal(ctrl.Now(), true); msg != "" {
+		writeError(w, 409, msg)
 		return
 	}
 	if err := ctrl.CancelOrder(orderID); err != nil {

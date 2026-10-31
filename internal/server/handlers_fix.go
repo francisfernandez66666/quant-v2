@@ -2922,10 +2922,10 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 		if signalID == "" {
 			signalID = "manual@" + req.Code + "@" + time.Now().Format("20060102150405")
 		}
-		// §CANCEL-STATE（2026-10-28）禁挂单窗口闸：集合竞价/尾盘窗口内交易所不接受新委托，
-		// 直接 409 并说明原因（"现在不能挂单"与"这笔单被风控拒"是两回事，必须让操作人分得清）。
-		if blocked, label := ctrl.NewOrderBlockedByWindow(time.Now()); blocked {
-			writeError(w, 409, trading.ErrNoNewOrderWindow(label).Error())
+		// §CANCEL-STATE（2026-10-28）+ 交易日维度（2026-10-31）：手动委托走统一前置闸
+		//（"现在不能挂单"与"这笔单被风控拒"是两回事；休市日更不是"等 09:30 再试"）。
+		if msg := ctrl.ManualOrderRefusal(ctrl.Now(), false); msg != "" {
+			writeError(w, 409, msg)
 			return
 		}
 		res, err := ctrl.PlaceOrder(trading.OrderRequest{
