@@ -301,6 +301,21 @@ func TestStrictPermissionSurface(t *testing.T) {
 	}
 }
 
+// TestPaperAdjustRejectsNewPosition 修复端点只补已持仓：对未持有的代码必须 400，
+// 不能借它新建仓位（避免把一次性数据修复变成通用开仓入口）。
+func TestPaperAdjustRejectsNewPosition(t *testing.T) {
+	s, owner, second, _ := newMultiAdminTestServer(t)
+	cfg := paper.ConfigFromRules(s.cfg.Get().Paper)
+	cfg.Enabled = true
+	cfg.AutoSell = false
+	s.SetPaper(paper.New(cfg, filepath.Join(t.TempDir(), "paper.json")))
+	body := `{"account_id":"` + second.ID + `","code":"000001","qty":100,"price":10,"confirm":"RESTORE-000683"}`
+	rr := adminDo(s, adminReq(s, owner, http.MethodPost, "/api/paper/adjust", body))
+	if rr.Code != 400 {
+		t.Fatalf("未持有代码应 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestPaperAdjustRequiresEngineAndConfirm(t *testing.T) {
 	s, owner, _, _ := newMultiAdminTestServer(t)
 	// 没有 paper engine：confirm 正确时应 503（不是 200 假成功）。
