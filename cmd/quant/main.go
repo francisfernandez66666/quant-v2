@@ -476,19 +476,47 @@ func run() int {
 	// Staleness 自然增长，交易熔断判定（/health ok&&broker_connected）不含行情态。
 	// English: §ENH-5 Level-1 quote feed (off by default; production decision machine only).
 	// Failures are silent — the 5s Sina chain keeps running and health trading-gates stay untouched.
-	if cfgMgr.Get().Runtime.QMTFeedEnabled && cfgMgr.Get().QMT.GatewayURL != "" {
-		intervalSec := cfgMgr.Get().Runtime.QMTFeedIntervalSec
+	// §SUBSCRIPTION-A（2026-11-01）三处修正，都是实测出来的形状：
+	//  ① 凭据：旧实现只吃**全局** rules.qmt.token，而 10-30 那批把全局位清空了（全局不留实盘凭证），
+	//     加上 QMTClient 在 token 为空时干脆不发 Authorization 头 ⇒ 照旧步骤"开开关"的结果是
+	//     每 3s 一次 401、feed 永不连接、新浪照旧兜底、日志 60s 节流——最难发现的静默无效。
+	//     现按 owner 裁决取**运营账号在册快照那把钥匙**（不多发一种凭证），全局位只作本地/测试兜底；
+	//  ② 缺 gateway_url 或一把钥匙都拿不到时，必须打一条**状态**日志（不是静默 return）；
+	//  ③ 策略（主源档/覆盖率阈值/量纲/池上限）在装配点一次性灌给 Fetcher，
+	//     绝不在 NewQMTFeed 之后补赋值——漏装配点的表现是"重启后失效"。
+	rt := cfgMgr.Get().Runtime
+	if rt.QMTFeedEnabled && cfgMgr.Get().QMT.GatewayURL != "" {
+		intervalSec := rt.QMTFeedIntervalSec
 		if intervalSec <= 0 {
 			intervalSec = 3
 		}
-		feedClient := trading.NewQMTClient(cfgMgr.Get().QMT.GatewayURL, cfgMgr.Get().QMT.Token, 3*time.Second, 0)
-		qmtFeed := data.NewQMTFeed(fetcher, feedClient, time.Duration(intervalSec)*time.Second, 30*time.Second, 1)
-		go qmtFeed.Start()
-		defer qmtFeed.Stop()
-		log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds", cfgMgr.Get().QMT.GatewayURL, intervalSec)
-	} else if cfgMgr.Get().Runtime.QMTFeedEnabled {
+		feedToken, tokenFrom := feedCredential(cfgMgr)
+		if feedToken == "" {
+			// 一把钥匙都拿不到：显式停用并说明原因。静默启动一个每轮 401 的 feed 是本批要消灭的形态。
+			log.Printf("[main] §SUBSCRIPTION-A qmt_feed_enabled=true 但运营账号快照与全局都没有可用钥匙，" +
+				"feed 保持停用（行情走现行链兜底；请在设置页确认 QMT 凭证）")
+		} else {
+			fetcher.SetFeedPolicy(data.FeedPolicy{
+				Primary:        rt.QMTFeedPrimary,
+				CoverageMinPct: rt.EffectiveFeedCoverageMinPct(),
+				HotPoolCap:     rt.EffectiveMonitorPoolHotMax(),
+				MaxAge:         30 * time.Second,
+				VolumeToShares: rt.EffectiveFeedVolumeToShares(),
+			})
+			feedClient := trading.NewQMTClient(cfgMgr.Get().QMT.GatewayURL, feedToken, 3*time.Second, 0)
+			qmtFeed := data.NewQMTFeed(fetcher, feedClient, time.Duration(intervalSec)*time.Second, 30*time.Second, rt.EffectiveFeedVolumeToShares())
+			qmtFeed.SetPrimary(rt.QMTFeedPrimary)
+			go qmtFeed.Start()
+			defer qmtFeed.Stop()
+			log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds, 凭据来源=%s, 主源档=%v",
+				cfgMgr.Get().QMT.GatewayURL, intervalSec, tokenFrom, rt.QMTFeedPrimary)
+		}
+	} else if rt.QMTFeedEnabled {
 		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
 	}
+	// §3.5 追加裁决 15：开关关着也要留痕——启动时打一份逐键状态清单，
+	// 让"这里有个功能、它没开"在日志里当场可见，而不是靠人记住这批上了哪些键。
+	logRuntimeSwitches(cfgMgr)
 	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
 	srv.SetCoordinator(dc)    // HTTP 展示层统一走该降级链，保证跨页价格一致
 	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器

@@ -268,6 +268,49 @@ type RuntimeConfig struct {
 	// QMTFeedIntervalSec L1 feed 轮询间隔（秒，默认 0 → 取 3s；建议 1~3）。
 	// English: L1 feed polling interval in seconds (0 → 3s default; 1-3 recommended).
 	QMTFeedIntervalSec int `json:"qmt_feed_interval_sec"`
+	// QMTFeedPrimary §SUBSCRIPTION-A（2026-11-01 裁决 1/5 + 本批「要开关」）：券商 L1 是否
+	// **改写**行情快照里的价格。
+	// 缺省 false＝观察模式：feed 照轮询、照报覆盖率/新鲜度/降级状态，但一个价格都不改，
+	// 快照仍完全由现行链（hithink→新浪→腾讯→东财）决定。
+	// 为什么要这一档而不是"enabled 一档定生死"：`enabled=true` 就直接接管价格，等于把
+	// "先连上看看数对不对"和"让它当家"绑成同一个动作，出问题时分不清是通道坏还是判据错。
+	// 上线阶梯（docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md §5）：enabled 观察几天 →
+	// 覆盖率/量纲/降级读数达标 → 再开 primary。
+	// English: whether broker Level-1 ticks may override snapshot prices. Default off = observe mode
+	// (poll and report coverage/freshness/degradation without touching a single price), so enabling
+	// the feed and promoting it to primary are two separately reversible steps.
+	QMTFeedPrimary bool `json:"qmt_feed_primary"`
+	// QMTFeedCoverageMinPct §SUBSCRIPTION-A：券商 feed 覆盖率（有效 tick 只数 ÷ 当日可交易标的数）
+	// 达到该百分比才允许刷新**全局**行情新鲜度基线（lastOK）。
+	// 缺陷本体：整条链只有一个"最近成功时刻"，而旧实现只要命中 **1 只**就整份注入并把它归零
+	// （internal/data/fetcher.go IngestSnapshot），可它喂的是发单前的行情新鲜度硬闸
+	// （StalenessMs → executor.StaleQuoteGuard）——**一只票的新鲜替全池 200 只作了保**，
+	// 闸以为行情刚更新过，实际别的票是几分钟前的。这与 §M2 修过的"全挂仍换快照+归零新鲜度"
+	// 是同族第二个入口。
+	// 0＝取出厂默认 80（owner 裁决 4）；负数＝显式关闭阈值判断（回到旧行为，只用于排障对比）。
+	// English: minimum broker-feed coverage (hits ÷ tradable universe) required to refresh the GLOBAL
+	// quote-freshness baseline. 0 = factory default 80 (owner ruling); negative = explicitly disable
+	// the gate (legacy behavior, for A/B troubleshooting only).
+	QMTFeedCoverageMinPct int `json:"qmt_feed_coverage_min_pct"`
+	// QMTFeedVolumeToShares §SUBSCRIPTION-A 量纲系数：券商 tick 的 volume 字段 → 股 的换算倍数。
+	// 这条是钱的问题不是洁癖：VWAP＝成交额÷成交量（data.VWAPOf），而 VWAP 喂给委托装配、
+	// 做 T 成本分解与滑点符号、纸面买卖点，以及"VWAP 不合理就不买"那条 fail-closed 闸。
+	// 真值算一遍量级：现价 7.30 元、成交 73 万股、额 532.9 万元 ⇒ 正确 VWAP 7.30；
+	// 若券商 volume 是手（7300）而系数留 1 ⇒ VWAP＝5329000÷7300＝**730 元**，差 100 倍。
+	// 取值必须由盘中探针判读（scripts/probe_xtquant.py 的 amount/(price*volume) 比值）固化，
+	// 不许拍脑袋：0＝取默认 1（＝按"单位是股"处理，与现行链一致），100＝单位是手。
+	// English: broker tick volume → shares factor. It feeds VWAP (amount/volume) and therefore the
+	// order-assembly audit trail, T-cost slippage and paper buy/sell points; the value must come from
+	// the intraday probe reading, never from a guess. 0 = default 1 (shares), 100 = lots.
+	QMTFeedVolumeToShares float64 `json:"qmt_feed_volume_to_shares"`
+	// MonitorPoolHotMax §SUBSCRIPTION-A（owner 裁决 12）：券商为主源时的热点监控池上限。
+	// 缺省 0 → 出厂 400；降级档（现行链当家时）仍是既有常数 60——扩容只在券商这条本地通道扛得住
+	// 的时候发生，退回外部源就收回，因为新浪是 80 只一片、池越大后备链请求越多。
+	// 扩池慢、收池快（迟滞 ≥5 分钟稳定）：源在两个档位之间抖会让热点池每轮换血、缺价代码进进出出。
+	// English: hot-pool cap while broker quotes are primary (default 400); the fallback tier keeps
+	// the historical 60 because external sources batch at 80 codes per request. Expansion is slow
+	// (5 min stability) while shrinking is immediate.
+	MonitorPoolHotMax int `json:"monitor_pool_hot_max"`
 	// ScoringIntervalSec 近实时 8a/8b 打分循环间隔（秒，默认 0 → 回退 5s）。
 	// 降低可让战法信号翻转更快被检出并触发下单（信号→交易链路优化 A+B 之 B）。
 	// English: near-realtime 8a/8b scoring-loop interval in seconds (0 → fallback 5s). Lowering it
@@ -292,6 +335,63 @@ type RuntimeConfig struct {
 // ReviewOn §DAILY_REVIEW 盘后复盘是否启用（*bool 语义：未配置=默认开启，显式 false 关闭）。
 // English: §DAILY_REVIEW switch — nil (absent in config) means ON; explicit false disables.
 func (r RuntimeConfig) ReviewOn() bool { return r.ReviewEnabled == nil || *r.ReviewEnabled }
+
+// ── §SUBSCRIPTION-A（2026-11-01）行情中间件三个生效读数的单点口径 ──────────────────
+// 与 EffectiveMinBuyPrice 同一取向：**兜底只写一处**，否则"存量配置缺键＝0"这件事会在
+// 每个消费点被解释成不同含义（0 到底是"关"还是"默认值"），而这类歧义正是静默失效的入口。
+
+// FeedCoverageDefault 券商 feed 覆盖率的出厂阈值（owner 裁决 4：先按 80%）。
+const FeedCoverageDefault = 80
+
+// EffectiveFeedCoverageMinPct 覆盖率阈值的生效值：0→80；负数→-1（＝关闭阈值判断，
+// 命中 1 只就刷新鲜度的旧行为，只用于排障对比）；>100 夹紧到 100（100% 要求全池覆盖）。
+// English: effective coverage threshold — 0 → 80, negative → -1 (gate disabled, legacy behavior),
+// values above 100 clamped to 100.
+func (r RuntimeConfig) EffectiveFeedCoverageMinPct() int {
+	if r.QMTFeedCoverageMinPct < 0 {
+		return -1
+	}
+	if r.QMTFeedCoverageMinPct == 0 {
+		return FeedCoverageDefault
+	}
+	if r.QMTFeedCoverageMinPct > 100 {
+		return 100
+	}
+	return r.QMTFeedCoverageMinPct
+}
+
+// EffectiveFeedVolumeToShares 量纲系数的生效值：0→1（股）；负数或荒谬值（>1000）→1。
+// 只接受"单位是股(1)或手(100)"这一物理事实区间，其它值一律退回默认并让调用方告警
+// ——系数错是资损相关（VWAP 差 100 倍），宁可按已知安全的旧口径跑，也不要按一个填错的数跑。
+// English: effective volume→shares factor; 0 → 1, implausible values fall back to 1 (the factor
+// feeds VWAP, so a typo is a money-path error — better to keep the known legacy unit).
+func (r RuntimeConfig) EffectiveFeedVolumeToShares() float64 {
+	if r.QMTFeedVolumeToShares <= 0 || r.QMTFeedVolumeToShares > 1000 {
+		return 1
+	}
+	return r.QMTFeedVolumeToShares
+}
+
+// FeedHotPoolDefault 券商主源档的热点池出厂上限（owner 裁决 12：先 400）。
+const FeedHotPoolDefault = 400
+
+// EffectiveMonitorPoolHotMax 扩容档的生效值：0→400；下限夹到 60（不得比降级档还小，
+// 否则"开了券商源反而池子更小"）；上限 2000（后备链 80 只一片，2000 只＝每轮 25 个请求，
+// 未实测前不放更宽）。
+// English: effective hot-pool cap for the broker tier: 0 → 400, floored at the 60 fallback tier,
+// capped at 2000 (fallback chain batches 80 codes per request; wider is unmeasured).
+func (r RuntimeConfig) EffectiveMonitorPoolHotMax() int {
+	if r.MonitorPoolHotMax <= 0 {
+		return FeedHotPoolDefault
+	}
+	if r.MonitorPoolHotMax < 60 {
+		return 60
+	}
+	if r.MonitorPoolHotMax > 2000 {
+		return 2000
+	}
+	return r.MonitorPoolHotMax
+}
 
 // ReviewMax §DAILY_REVIEW 单次复盘股票数上限（<=0 回退默认 24，硬上限 50 护栏）。
 // English: review universe cap per run; <=0 → default 24, hard-capped at 50.

@@ -18512,5 +18512,132 @@ fi
 [ "$B160_FAILED" = "0" ] || exit 1
 echo "ok - §160 §SUBSCRIPTION 锁通过（判据单源 4 + 网关顺序与去重 3 + 观测位 1 + 读面不隐藏 4 + 撤单护栏 2 + 对账 1 + 开关缺省 4 + golden 与同源引用 4 + 测试在册 3 + 文档同源 1 + 负锁 3，累计判定点 ${CNT160}）"
 
-echo "==> 全部通过"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §161 §SUBSCRIPTION-A（2026-11-01）：行情装配层（券商 L1 主源 + 覆盖率闸 + 池分档）锁
+#   判据本体：全局新鲜度不再由"命中 1 只"伪造；主源档缺省关；降级只认券商自身读数。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 161 §SUBSCRIPTION-A（行情装配单点 / 覆盖率闸 / 观察档缺省关 / 降级只认自身读数 / 池分档迟滞）..."
+B161_FAILED=0
+fail161() {
+	echo "--- FAIL: §161 $*"
+	FAIL=1
+	B161_FAILED=1
+}
+CNT161=0
+
+# ① 装配单点文件在位，四个关键入口齐备（缺一个就说明"两个写者"回来了）
+CNT161=$((CNT161 + 1))
+[ -f internal/data/quote_feed_hub.go ] || fail161 "internal/data/quote_feed_hub.go 不在位（行情装配的收口点丢了）"
+CNT161=$((CNT161 + 1))
+for tok in 'func (f *Fetcher) IngestFeedRound' 'func coverageGateOK' 'func (f *Fetcher) applyFeedOverlay' 'type FeedPolicy struct'; do
+	grep -qF "$tok" internal/data/quote_feed_hub.go || fail161 "装配层缺入口：$tok"
+done
+
+# ② 全局基线的刷新点必须只有具名那几处（旧缺陷就是"谁都敢归零它"）
+CNT161=$((CNT161 + 1))
+LASTOK_FETCHER=$(grep -c 'lastOK.Store' internal/data/fetcher.go)
+[ "$LASTOK_FETCHER" = "3" ] || fail161 "fetcher.go 的 lastOK.Store 应为 3 处（采集成功轮 / 覆盖达标轮 / 持久化恢复），现测 $LASTOK_FETCHER"
+CNT161=$((CNT161 + 1))
+LASTOK_HUB=$(grep -c 'lastOK.Store' internal/data/quote_feed_hub.go)
+[ "$LASTOK_HUB" = "1" ] || fail161 "装配层应只有一个基线刷新点（coverageGateOK 之后），现测 $LASTOK_HUB"
+
+# ③ 负锁：feed 不许再"整份注入快照"（那是伪造新鲜度与价格互顶的源头）
+CNT161=$((CNT161 + 1))
+if grep -qE 'IngestSnapshot\(' internal/data/qmt_feed.go; then
+	fail161 "qmt_feed.go 又直接调 IngestSnapshot（整份注入＝命中 1 只替全池作保的旧形状）"
+fi
+
+# ④ 每票新鲜时刻：StalenessMs(code) 必须吃 overlay 证据，且保留 -1＝未知的语义
+CNT161=$((CNT161 + 1))
+grep -qF 'f.feedFreshMs(code)' internal/data/fetcher.go || fail161 "StalenessMs(code) 没接每票时刻：闸仍在被整份基线一个人作保"
+CNT161=$((CNT161 + 1))
+grep -qF 'var best int64 = -1' internal/data/fetcher.go || fail161 "陈旧度的「未知=-1」哨兵被摘（§M2：没数据绝不冒充新鲜）"
+
+# ⑤ 出厂阈值两处同源（装配点兜一次、装配缺省再兜一次，两个数不一致就是设置页与实际两张皮）
+CNT161=$((CNT161 + 1))
+grep -qE 'FeedCoverageDefault = 80' internal/config/config.go || fail161 "config 侧出厂阈值 80 丢了"
+CNT161=$((CNT161 + 1))
+grep -qE 'feedCoverageDefault = 80' internal/data/quote_feed_hub.go || fail161 "data 侧出厂阈值 80 丢了（必须与 config 同值）"
+
+# ⑥ 池分档：迟滞窗口在位、降档即刻、既有截断常数不许消失
+CNT161=$((CNT161 + 1))
+grep -qE 'feedSteadyExpand = 5 \* time.Minute' internal/data/quote_feed_hub.go || fail161 "扩池迟滞窗口丢了（源一抖池子就换血）"
+CNT161=$((CNT161 + 1))
+grep -qF '		h.live = false' internal/data/quote_feed_hub.go || fail161 "降档不再是即刻（缩池必须立刻，那是安全方向）"
+CNT161=$((CNT161 + 1))
+grep -qF 'if len(stocks) > cap {' internal/data/fetcher.go || fail161 "热点池截断逻辑消失＝降级态把后备链打爆（80 只一片）"
+CNT161=$((CNT161 + 1))
+grep -qE 'maxWatchStocks = 60' internal/data/fetcher.go || fail161 "降级档常数 60 丢了——分档不是取消上限"
+
+# ⑦ 降级只认券商自身读数（owner 裁决 5）：J1/J2/J3 三枚都在位，且没有任何"与新浪比"的形状
+CNT161=$((CNT161 + 1))
+# J1 由装配层记（通道失败），J2/J3 由 feed 轮内记（读数不可用）：两条腿都要在
+for j in '"J1"' '"J2"' '"J3"'; do
+	grep -qF "$j" internal/data/qmt_feed.go internal/data/quote_feed_hub.go || fail161 "降级判据 $j 丢了（J1=通道不通 / J2=集体陈旧 / J3=读数不自洽）"
+done
+CNT161=$((CNT161 + 1))
+if grep -qE 'Degrade = "J[0-9]"' internal/data/quote_feed_hub.go && grep -qE 'sina|Sina|新浪' <<<"$(grep -E 'Degrade = ' internal/data/qmt_feed.go)"; then
+	fail161 "降级判据掺进了与外部源比较的形状：多源不一致必须以券商为准，只有券商自身读数不成立才降级"
+fi
+
+# ⑧ 主源档缺省关 + 凭据取值优先运营账号在册快照（D1 那个"开着但每次 401"的静默无效必须被结构性堵住）
+CNT161=$((CNT161 + 1))
+grep -qF 'QMTFeedPrimary bool `json:"qmt_feed_primary"`' internal/config/config.go || fail161 "qmt_feed_primary 键丢了"
+CNT161=$((CNT161 + 1))
+grep -qF 'StoredQMTConfigFor(cfgMgr.OperatorID())' cmd/quant/runtime_switches.go || fail161 "feed 凭据不再优先取运营账号在册快照钥匙"
+CNT161=$((CNT161 + 1))
+if grep -qE 'cfgMgr\.Get\(\)\.QMT\.Token' cmd/quant/main.go; then
+	fail161 "main.go 的 feed 构造又只吃全局 rules.qmt.token（全局位生产为空 ⇒ 静默 401，本批要消灭的形状）"
+fi
+
+# ⑨ 行为用例在册（覆盖率闸含边界、观察档不改价、券商赢在价差、J3 不误判合法单位档、迟滞、钉住码）
+CNT161=$((CNT161 + 1))
+for tn in TestStaleGateNotForgedByPartialFeed TestStaleGateThresholdBoundary TestObserveModeNeverChangesPrices TestBrokerWinsOnPriceConflict TestDegradeJ3OnlyWhenUnitImplausible TestHotPoolTierHysteresis TestPinnedCodesSurviveShrink TestFeedFailureDropsTierAndNeverRefreshes; do
+	grep -rqF "func $tn" internal/data/ || fail161 "装配层用例 $tn 不在册"
+done
+
+[ "$B161_FAILED" = "0" ] || exit 1
+echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1，累计判定点 ${CNT161}）"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §162 §3.5 关态留痕（2026-11-01 追加裁决 15）：开关关着也必须可观测
+#   判据本体：「关」不等于「不存在」。启动逐键清单 + 关着也统计 would_*。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 162 §关态留痕（启动开关清单逐键 / would-label 两侧留痕 / 新增键漏进清单即红）..."
+B162_FAILED=0
+fail162() {
+	echo "--- FAIL: §162 $*"
+	FAIL=1
+	B162_FAILED=1
+}
+CNT162=0
+
+CNT162=$((CNT162 + 1))
+[ -f cmd/quant/runtime_switches.go ] || fail162 "runtime_switches.go 不在位（关态留痕的启动清单丢了）"
+CNT162=$((CNT162 + 1))
+grep -qF 'logRuntimeSwitches(cfgMgr)' cmd/quant/main.go || fail162 "启动清单没被调用（写了等于没写）"
+# 清单条数与"本批开关数"等值：新增一个开关却不进清单 ⇒ 这条当场红
+CNT162=$((CNT162 + 1))
+SWITCH_LINES=$(grep -c '§SWITCH 状态' cmd/quant/runtime_switches.go)
+[ "$SWITCH_LINES" = "8" ] || fail162 "启动清单应逐键 8 条，现测 $SWITCH_LINES（新增开关漏进清单，或清单被删短）"
+# 关着也统计：网关 would_label 与 Go 读面 would-label 两条腿都必须在
+CNT162=$((CNT162 + 1))
+grep -qF 'self._orders_sub_would_label_seen.add(oid)' qmt_gateway/gateway.py || fail162 "网关关态的 would_label 计数丢了"
+CNT162=$((CNT162 + 1))
+grep -qF 'logSubscriptionWouldLabel' internal/server/qmt.go || fail162 "Go 读面关态的 would-label 留痕丢了"
+# 留痕只打代码与计数：不许把凭据/账户信息写进日志，也不许逐票刷屏
+CNT162=$((CNT162 + 1))
+if grep -qE 'Token|token' <<<"$(sed -n '/func logSubscriptionWouldLabel/,/^}/p' internal/server/qmt.go)"; then
+	fail162 "关态留痕日志里出现了 token 字样（留痕只许打代码与计数）"
+fi
+CNT162=$((CNT162 + 1))
+grep -qF 'now-prev < 60' internal/server/qmt.go || fail162 "关态留痕没有 60s 节流（400 只 × 每 3s 的刷屏形状）"
+CNT162=$((CNT162 + 1))
+# 只数 .py 源文件：tests/__pycache__ 里的 .pyc 也会命中同一串，不过滤会把 1 个数成 2
+FOUND162=$(grep -rlF --include='*.py' 'test_off_state_still_counts_would_label' qmt_gateway/tests | wc -l | tr -d ' ')
+[ "$FOUND162" = "1" ] || fail162 "关态留痕的网关用例不在册（命中 $FOUND162 个源文件）"
+
+[ "$B162_FAILED" = "0" ] || exit 1
+echo "ok - §162 §关态留痕锁通过（清单文件与调用 2 + 条数等值 1 + 两侧 would-label 2 + 不含凭据与节流 2 + 用例在册 1，累计判定点 ${CNT162}）"echo "==> 全部通过"
 

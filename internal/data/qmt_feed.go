@@ -1,17 +1,33 @@
-// qmt_feed.go — §ENH-5 批E：QMT Level-1 全推行情注入器。
+// qmt_feed.go — §ENH-5 批E：QMT Level-1 全推行情注入器（§SUBSCRIPTION-A 起改为 overlay 语料生产者）。
 // 生产决策机上由 qmt_gateway(/quotes, xtdata) 提供 L1 tick；本文件按 1~3s 轮询
 // QuoteFeedSource（由 internal/trading.QMTClient 实现、经接口注入避免 data→trading 反向依赖），
-// 命中代码合并覆盖 Fetcher 快照（Source="QMT-L1"），未命中/失败保持静默——
-// 既有 5s 新浪批量链自兜底，Staleness 自然增长，绝不伪造新鲜度解除 §WS-C 陈旧行情闸。
-// English: batch-E Level-1 quote feed — polls the gateway /quotes (xtdata-backed) every 1-3s and
-// merge-injects hits into the Fetcher snapshot with Source="QMT-L1"; misses/failures stay silent so
-// the existing 5s Sina chain keeps working and staleness keeps growing (never fakes freshness).
+// 把命中的 tick 交给 Fetcher 的行情装配层（quote_feed_hub.go），**不再自己整份塞快照**。
+//
+// 为什么必须改这一刀（2026-11-01，docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md A4/A5）：
+//
+//	① 旧实现命中 ≥1 只就整份注入并刷新全局 lastOK，而那个基线喂的是发单前的行情新鲜度硬闸
+//	   ⇒ 一只票的新鲜替全池 200 只作了保（伪造新鲜，比熔断污染更危险）；
+//	② 5s 采集链每轮重建整份快照，feed 事后注入的券商价下一轮就被外部源顶掉
+//	   ⇒ "主源"名不副实，价格每 5s 来回抖（双写者谁都没赢，只有抖）。
+//
+// 现在：feed 只产 tick + 每轮读数，合并由采集链在写快照前单点完成（applyFeedOverlay），
+// 全局基线只在覆盖率达标时才刷（coverageGateOK）。
+//
+// 三档行为（缺省全关＝今天字节一致）：
+//
+//	qmt_feed_enabled=false      → 本文件根本不启动（现网今天就是这一档）
+//	enabled=true, primary=false → 观察模式：轮询、统计覆盖率/降级读数，**一个价格都不改写**
+//	enabled=true, primary=true  → 主源模式：写 overlay，覆盖率达标才刷全局新鲜度
+//
+// English: L1 feed poller turned into an overlay producer; observe mode records numbers without
+// touching a single price, primary mode merges through the single-writer path in Fetcher.
 package data
 
 import (
 	"context"
 	"log"
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,7 +42,7 @@ type QMTTick struct {
 	High      float64 `json:"high"`      // 最高（元）
 	Low       float64 `json:"low"`       // 最低（元）
 	PrevClose float64 `json:"prevClose"` // 昨收（元，§P1-5 口径统一用 PrevClose）
-	Volume    float64 `json:"volume"`    // 成交量（网关原样透传，单位换算见 QMTFeed.volumeToShares）
+	Volume    float64 `json:"volume"`    // 成交量（网关原样透传，单位换算见 FeedPolicy.VolumeToShares）
 	Amount    float64 `json:"amount"`    // 成交额（元）
 	TickTime  int64   `json:"tickTime"`  // tick 时间戳（毫秒；0=网关未提供）
 }
@@ -40,23 +56,25 @@ type QuoteFeedSource interface {
 	Quotes(ctx context.Context, codes []string) (map[string]QMTTick, error)
 }
 
-// QMTFeed L1 行情轮询注入器。生命周期与 Fetcher 平行：Start 阻塞、Stop 停。
+// QMTFeed L1 行情轮询器。生命周期与 Fetcher 平行：Start 阻塞、Stop 停。
 // English: L1 feed poller with the same lifecycle shape as Fetcher (blocking Start, Stop to end).
 type QMTFeed struct {
-	fetcher  *Fetcher        // 注入目标快照的采集器
+	fetcher  *Fetcher        // 装配目标（overlay/覆盖率/降级读数都落在它身上）
 	src      QuoteFeedSource // tick 数据源（网关客户端）
 	interval time.Duration   // 轮询间隔（1~3s 量级）
 	maxAge   time.Duration   // tick 新鲜度上限：超龄 tick 丢弃（默认 30s）
-	// volumeToShares tick.volume→StockInfo.Volume（股）的换算系数。
-	// ⚠ 单位口径（§FIX-1 教训）：仓库内不存在 xtdata volume 字段的权威单位证据，
-	// 部署 Windows 决策机时须先跑 scripts/probe_xtquant.py 打印原始 volume 并与新浪同日成交量比对，
-	// 确认后用 SetVolumeToShares 固化（默认 1，即按"volume 单位=股"处理，与新浪链一致）。
-	volumeToShares atomic.Uint64 // float64 位模式存储
-	volFallback    float64       // 未显式设置时的回退系数
-	loggedFirst    atomic.Bool   // 首轮命中只打一条 INFO，之后降为静默
-	errorAt        atomic.Int64  // 错误日志节流（unix 秒）
-	stopCh         chan struct{}
-	stopOnce       sync.Once
+	// 量纲系数 tick.volume→股。⚠ 单位口径（§FIX-1 教训）：仓库内不存在 xtdata volume 字段的
+	// 权威单位证据，必须由盘中探针（scripts/probe_xtquant.py 的 amount/(price*volume) 判读）
+	// 确认后固化；错 100 倍会把 VWAP（=Amount/Volume）算成 730 元这种量级，直接进钱的路径。
+	// English: volume→shares factor; must be pinned by the intraday probe — a 100x error lands
+	// straight on VWAP and therefore on order assembly and T slippage.
+	volFallback float64
+	volAtomic   atomic.Uint64 // float64 位模式存储，热更换不重开 goroutine
+	loggedFirst atomic.Bool   // 首轮命中只打一条 INFO，之后降为静默
+	errorAt     atomic.Int64  // 错误日志节流（unix 秒）
+	failStreak  atomic.Int64  // 连续失败轮次（J1 通道不通的判据输入）
+	stopCh      chan struct{}
+	stopOnce    sync.Once
 }
 
 // NewQMTFeed 构造 feed：interval<=0 取 3s，maxAge<=0 取 30s，volToShares<=0 取 1。
@@ -79,21 +97,50 @@ func NewQMTFeed(fetcher *Fetcher, src QuoteFeedSource, interval, maxAge time.Dur
 		volFallback: volToShares,
 		stopCh:      make(chan struct{}),
 	}
-	f.volumeToShares.Store(math.Float64bits(volToShares))
+	f.volAtomic.Store(math.Float64bits(volToShares))
 	return f
 }
 
 // SetVolumeToShares 单位校准后固化 tick.volume→股 的换算系数（0 忽略）。
-// English: pins the tick.volume → shares factor once verified on the production machine.
+// 同时写进 Fetcher 的策略，采集链合并 overlay 时读的是同一份数——两处必须同源，
+// 否则会出现"feed 按 100 折、快照按 1 折"那种同一条链两个口径的形状（VWAP 直接差 100 倍）。
+// English: pins the tick.volume → shares factor in BOTH the feed and the fetcher policy so the
+// merge path and the producer path can never disagree about VWAP's denominator.
 func (f *QMTFeed) SetVolumeToShares(v float64) {
-	if v > 0 {
-		f.volumeToShares.Store(math.Float64bits(v))
+	if v <= 0 {
+		return
+	}
+	f.volAtomic.Store(math.Float64bits(v))
+	p := f.fetcher.feedPolicyNow()
+	p.VolumeToShares = v
+	f.fetcher.SetFeedPolicy(p)
+}
+
+// SetPrimary 决定券商 tick 是否可以改写快照价格（缺省 false＝观察模式，一个价都不动）。
+// English: SetPrimary promotes the feed from observe-only to price-authoritative (default off).
+func (f *QMTFeed) SetPrimary(on bool) {
+	p := f.fetcher.feedPolicyNow()
+	p.Primary = on
+	if p.MaxAge <= 0 {
+		p.MaxAge = f.maxAge
+	}
+	if p.VolumeToShares <= 0 {
+		p.VolumeToShares = f.volFactor()
+	}
+	f.fetcher.SetFeedPolicy(p)
+	if on {
+		thr := p.CoverageMinPct
+		if thr == 0 {
+			thr = feedCoverageDefault // 日志必须打生效值：打 0 会被读成"没设阈值"，而实际按 80 判
+		}
+		log.Printf("[qmt_feed] §SUBSCRIPTION-A 券商 L1 已提升为主源（覆盖率阈值 %d%%，量纲系数 %.0f）",
+			thr, p.VolumeToShares)
 	}
 }
 
 // volFactor 读取当前换算系数（位模式还原，无浮点原子则回退构造值）。
 func (f *QMTFeed) volFactor() float64 {
-	if bits := f.volumeToShares.Load(); bits != 0 {
+	if bits := f.volAtomic.Load(); bits != 0 {
 		return math.Float64frombits(bits)
 	}
 	return f.volFallback
@@ -106,9 +153,9 @@ func (f *QMTFeed) Stop() {
 }
 
 // Start 阻塞轮询：仅活跃交易时段拉取（休市用 DurationToNextActiveSession 长睡，
-// 省网关与 xtdata 负载）；每轮 WatchCodes() 动态取监控池，命中则合并注入。
+// 省网关与 xtdata 负载）；每轮 WatchCodes() 动态取监控池，命中则交给装配层。
 // English: blocking poll loop — only during active sessions (idle sleeps until the next one),
-// refreshing the watch pool each round and merge-injecting hits.
+// refreshing the watch pool each round.
 func (f *QMTFeed) Start() {
 	ticker := time.NewTicker(f.interval)
 	defer ticker.Stop()
@@ -136,8 +183,10 @@ func (f *QMTFeed) Start() {
 	}
 }
 
-// pollOnce 单轮：取池→拉 tick→合并注入；任何失败仅记日志（节流），绝不 panic。
-// English: one round: pool -> fetch ticks -> merge inject; failures are throttled logs only.
+// pollOnce 单轮：取池→拉 tick→交给装配层；任何失败只记日志（节流），绝不 panic。
+// 失败轮必须把 J1 计数递上去并**立刻收回主源档**：后备链一直在跑，缩池是安全方向。
+// English: one round. Failures feed the J1 counter and drop the pool tier immediately (shrinking
+// is the safe direction); they never refresh freshness.
 func (f *QMTFeed) pollOnce() {
 	codes := f.fetcher.WatchCodes()
 	if len(codes) == 0 {
@@ -147,71 +196,172 @@ func (f *QMTFeed) pollOnce() {
 	defer cancel()
 	ticks, err := f.src.Quotes(ctx, codes)
 	if err != nil {
-		f.logThrottled("qmt_feed: /quotes 拉取失败（新浪链继续兜底，不影响行情可用性）: %v", err)
+		n := f.failStreak.Add(1)
+		f.logThrottled("qmt_feed: /quotes 拉取失败（第 %d 轮，新浪链继续兜底，不影响行情可用性）: %v", n, err)
+		f.fetcher.NoteFeedFailure(int(n))
 		return
 	}
-	if n := f.applyTicks(ticks); n > 0 && !f.loggedFirst.Swap(true) {
-		log.Printf("[qmt_feed] §ENH-5 L1 行情已生效: 命中 %d/%d 只, Source=QMT-L1", n, len(codes))
+	f.failStreak.Store(0)
+	if n := f.applyTicks(ticks, len(codes)); n > 0 && !f.loggedFirst.Swap(true) {
+		log.Printf("[qmt_feed] §SUBSCRIPTION-A L1 读数: 命中 %d/%d 只（primary=%v）", n, len(codes), f.isPrimary())
 	}
 }
 
-// applyTicks 把有效 tick 合并进当前快照并整体注入。
-// 三个关键约束：
-//  1. Fetcher.Snapshot() 只做浅拷贝，*StockInfo 与内部快照共享指针——必须复制新 struct 再改，
-//     否则与 5s 采集循环并发写同一指针（-race 可抓到）；
-//  2. 仅命中 >=1 只时才调 IngestSnapshot——该调用会刷新 lastOK，无条件注入会掩盖
-//     新浪链断流并误解除 §WS-C 陈旧行情闸（反向污染，比熔断污染更危险）；
-//  3. Name/Sector/NetInflow/HasFlow 等 tick 不携带的字段一律保留原值，不清零。
+// isPrimary 当前是否主源模式（读数与日志用，不改行为）。
+func (f *QMTFeed) isPrimary() bool { return f.fetcher.feedPolicyNow().Primary }
+
+// applyTicks 把一轮 tick 变成 overlay 语料 + 本轮读数，交给 Fetcher 的唯一入口。
 //
-// English: merges valid ticks into a snapshot copy and injects once. Only injects on >=1 hit
-// (injection refreshes lastOK, so unconditional use would mask Sina outages and disarm the
-// staleness gate); StockInfo entries are copied before mutation because Snapshot shares pointers.
-func (f *QMTFeed) applyTicks(ticks map[string]QMTTick) int {
-	if len(ticks) == 0 {
-		return 0
-	}
-	base := f.fetcher.Snapshot()
-	if base == nil {
-		return 0 // 首轮采集还没跑：不注入空壳快照，等新浪链建立基线
-	}
-	if base.Stocks == nil {
-		base.Stocks = make(map[string]*StockInfo, len(ticks))
-	}
+// 四个关键约束（前两条是 §ENH-5 原班约束，后两条是本批新增）：
+//  1. 只把 lastPrice>0 的 tick 计为命中：停牌/无 tick 时券商回 0 是常态，必须保留外部源的值，
+//     也绝不能因为"拿到了回包"就把这些票算进覆盖率分子（那是自欺）；
+//  2. 超龄 tick（TickTime 比 now 老过 maxAge）丢弃：feed 断流时网关仍会回缓存，
+//     宁可退回新浪值，不许拿陈旧 tick 冒充新鲜；
+//  3. 覆盖率分母**不是池总数**，而是"当日可交易标的数"的近似＝本轮任一源给出有效价的只数；
+//     分母不可信（0 只）才退回池总数并标 denominator=pool。
+//     为什么：池一扩（400 只）停牌/无 tick 的占比自然抬头，按池总数算会把正常交易日误判成
+//     "feed 没达标"，进而让全池显示陈旧、把发单闸拦死——收紧方向误伤正常状态是更坏的选择；
+//  4. 读数不自洽（J3）：用券商自己的数验自己——amount/(lastPrice*volume) 的中位数应当落在
+//     1（股）或 100（手）附近。既不≈1 也不≈100 ⇒ 单位/口径不成立 ⇒ 判 J3。
+//     注意这**不是**"两源价格对不上"：owner 裁决 5 明确多源不一致以券商为准，只有券商
+//     完全不通才降级；J3 抓的是"这个数根本不成立"，与行情差异是两件事。
+//
+// English: turns one poll into overlay material plus round statistics. Coverage denominator is the
+// tradable universe (not the raw pool) so suspensions cannot fake a failure; J3 self-validates the
+// broker's own numbers instead of comparing against Sina.
+func (f *QMTFeed) applyTicks(ticks map[string]QMTTick, pool int) int {
 	now := time.Now()
-	factor := f.volFactor()
-	hits := 0
+	base := f.fetcher.Snapshot()
+
+	entries := make(map[string]QMTTick, len(ticks))
+	merged := f.copySnapshotForMerge(base) // 主源模式下才用得到（浅拷贝 + 逐条复制条目）
+	missingPrice := 0
+	ratios := make([]float64, 0, len(ticks))
 	for code, tk := range ticks {
 		if tk.LastPrice <= 0 {
-			continue // 停牌/无 tick：lastPrice=0 是常态，跳过保留新浪值
+			missingPrice++
+			continue // 约束 ①
 		}
 		if tk.TickTime > 0 && now.Sub(time.UnixMilli(tk.TickTime)) > f.maxAge {
-			continue // 超龄 tick：feed 断流时网关仍会回缓存，宁可退回新浪
+			continue // 约束 ②
 		}
-		old := base.Stocks[code]
-		cp := StockInfo{Code: code}
-		if old != nil {
-			cp = *old // 保留 Name/Sector/资金流等 tick 没有的字段
+		entries[code] = tk
+		// amount/(price*volume)：单位是股时≈1，是手时≈100
+		if tk.Volume > 0 && tk.Amount > 0 {
+			ratios = append(ratios, tk.Amount/(tk.LastPrice*tk.Volume))
 		}
-		cp.Price = tk.LastPrice
-		cp.Open = tk.Open
-		cp.High = tk.High
-		cp.Low = tk.Low
-		cp.PrevClose = tk.PrevClose
-		cp.Volume = tk.Volume * factor
-		cp.Amount = tk.Amount
-		if tk.PrevClose > 0 {
-			cp.ChangePct = (tk.LastPrice/tk.PrevClose - 1) * 100
-		}
-		base.Stocks[code] = &cp
-		hits++
 	}
-	if hits == 0 {
+
+	st := FeedStats{
+		Hits:            len(entries),
+		Pool:            pool,
+		Degrade:         "",
+		MissingPricePct: 0,
+	}
+	if len(ticks) > 0 {
+		st.MissingPricePct = float64(missingPrice) / float64(len(ticks)) * 100
+	}
+
+	// 约束 ③：分母取"任一源本轮给出有效价的只数"∪命中数（命中数是券商给的证据，也算有价）。
+	denom, denomSource := 0, "tradable"
+	if base != nil {
+		for _, si := range base.Stocks {
+			if si != nil && si.Price > 0 {
+				denom++
+			}
+		}
+	}
+	for code := range entries {
+		if base == nil || base.Stocks[code] == nil || base.Stocks[code].Price <= 0 {
+			denom++ // 命中但外部源没有有效价 ⇒ 这条证据只有券商有，计入分母也计入分子
+		}
+	}
+	if denom <= 0 {
+		denom, denomSource = pool, "pool" // 分母不可信：退回池总数并如实标注，不静默用旧口径
+	}
+	st.Denominator = denom
+	st.DenominatorSource = denomSource
+	if denom > 0 {
+		st.CoveragePct = float64(st.Hits) / float64(denom) * 100
+	}
+
+	// J2：一条都没命中但回包非空 ⇒ 拿到的全是超龄/零价 tick ＝通道在读旧数据，判降级。
+	if len(ticks) > 0 && st.Hits == 0 {
+		st.Degrade = "J2"
+	}
+	// J3：中位数既不≈1 也不≈100 ⇒ 单位/口径不成立。合法单位档（1 或 100）绝不触发——
+	// 那种情形该做的是配系数（SetVolumeToShares），不是判通道坏。
+	if r := medianRatio(ratios); r > 0 && !(within(r, 1, 0.15) || within(r, 100, 15)) {
+		st.Degrade = "J3"
+	}
+
+	if st.Degrade != "" {
+		// 本轮不产 overlay、不刷基线；池档即刻收回（与 J1 同方向）。
+		f.fetcher.NoteFeedDegrade(st)
+		f.logThrottled("qmt_feed: §SUBSCRIPTION-A 判定券商读数不可用 degrade=%s hits=%d/%d median_ratio=%.2f missing_price_pct=%.1f",
+			st.Degrade, st.Hits, denom, medianRatio(ratios), st.MissingPricePct)
 		return 0
 	}
-	base.Source = QuoteSourceQMTL1 // §M1 枚举常量（/api/status quote_source 契约单源化）
-	base.Time = now
-	f.fetcher.IngestSnapshot(base)
-	return hits
+
+	// 主源模式才做逐票合并（观察模式一个价都不改）；合并后的副本交给装配层落。
+	if f.isPrimary() && merged != nil && st.Hits > 0 {
+		merged.Source = QuoteSourceQMTL1 // §M1 枚举常量：本轮由券商价当家（整份单值 Source 的每票化是下一批 A3）
+		factor := f.volFactor()
+		p := f.fetcher.feedPolicyNow()
+		p.VolumeToShares = factor
+		for code, tk := range entries {
+			si := merged.Stocks[code]
+			if si == nil {
+				si = &StockInfo{Code: code} // 池里有但外部源没给价的票：由券商补上这一条
+				if merged.Stocks == nil {
+					merged.Stocks = map[string]*StockInfo{}
+				}
+			}
+			cp := *si // 约束：复制后再改（Snapshot 是浅拷贝，条目指针与内部快照共享）
+			if applyTickTo(&cp, tk, p) {
+				merged.Stocks[code] = &cp
+			}
+		}
+	}
+	f.fetcher.IngestFeedRound(merged, entries, st)
+	return st.Hits
+}
+
+// copySnapshotForMerge 取当前快照的"可安全改写"副本：map 本身新建，条目指针沿用
+// （真正的写在 applyTicks 里逐条复制 StockInfo，绝不改共享指针）。base==nil 时返回 nil——
+// 首轮采集还没跑：不注入空壳快照，等现行链建立基线（§ENH-5 原约束保持）。
+func (f *QMTFeed) copySnapshotForMerge(base *MarketSnapshot) *MarketSnapshot {
+	if base == nil {
+		return nil
+	}
+	out := &MarketSnapshot{Source: base.Source, Time: base.Time, Stocks: make(map[string]*StockInfo, len(base.Stocks))}
+	for code, si := range base.Stocks {
+		out.Stocks[code] = si
+	}
+	if base.Sector != nil {
+		out.Sector = base.Sector
+	}
+	return out
+}
+
+// medianRatio 取比值中位数（偶数取中间两数均值）；空集回 0（＝不判 J3）。
+// 为什么用中位数而不是均值：一两只异常票不该把整条通道判死。
+func medianRatio(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	cp := append([]float64(nil), xs...)
+	sort.Float64s(cp)
+	n := len(cp)
+	if n%2 == 1 {
+		return cp[n/2]
+	}
+	return (cp[n/2-1] + cp[n/2]) / 2
+}
+
+// within 判断 v 是否落在 [target±tol]。
+func within(v, target, tol float64) bool {
+	return v >= target-tol && v <= target+tol
 }
 
 // logThrottled feed 专属错误日志节流（60s 一条），不复用采集链的 lastStaleWarn。

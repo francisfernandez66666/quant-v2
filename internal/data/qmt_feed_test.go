@@ -1,6 +1,11 @@
-// qmt_feed_test.go — §ENH-5 批E 回归：L1 tick 合并注入语义。
+// qmt_feed_test.go — §ENH-5 批E 回归：L1 tick 合并语义（§SUBSCRIPTION-A 起为 overlay 主源语义）。
 // 锁四条关键约束：命中才注入（防掩盖断流）、共享指针复制（防 -race）、
 // tick 缺失字段保留（Name/资金流）、超龄/停牌 tick 丢弃。
+//
+// 2026-11-01 改动带来的两处必改：applyTicks 现在要带池规模（覆盖率分母的可信性判断要用），
+// 且价格改写挂在 `SetPrimary(true)` 上——缺省（false）是观察模式，一个价都不动。
+// 这些用例因此显式提升主源档，证的是"主源模式下语义没变"，另见 quote_feed_hub_test.go 的
+// 「观察模式与降级」用例族（本文件的用例不许顺手把 primary 设成缺省，那会让四条约束变成假绿）。
 package data
 
 import (
@@ -58,7 +63,8 @@ func TestQMTFeedMergeInject(t *testing.T) {
 		"300750": freshTick(200.5),
 	}}
 	feed := NewQMTFeed(f, src, time.Second, 30*time.Second, 1)
-	if n := feed.applyTicks(src.ticks); n != 2 {
+	feed.SetPrimary(true) // 主源档：本用例证的是改写价格的语义
+	if n := feed.applyTicks(src.ticks, 2); n != 2 {
 		t.Fatalf("应命中 2 只, got %d", n)
 	}
 	snap := f.Snapshot()
@@ -97,6 +103,7 @@ func TestQMTFeedNoBlindInjection(t *testing.T) {
 	}
 	for _, tc := range cases {
 		feed := NewQMTFeed(f, tc.src, time.Second, 30*time.Second, 1)
+		feed.SetPrimary(true) // 主源档下才谈"不盲注入"；观察模式本来就不改价，证不到这条
 		feed.pollOnce()
 		if f.Snapshot().Source != "新浪" {
 			t.Fatalf("%s: 不应覆盖快照 Source", tc.name)
@@ -112,7 +119,8 @@ func TestQMTFeedPointerIsolation(t *testing.T) {
 	f := seedBase(t)
 	old := f.Snapshot().Stocks["600000"] // 与内部快照共享指针的旧对象
 	feed := NewQMTFeed(f, &fakeFeedSource{}, time.Second, 30*time.Second, 1)
-	feed.applyTicks(map[string]QMTTick{"600000": freshTick(11.1)})
+	feed.SetPrimary(true)
+	feed.applyTicks(map[string]QMTTick{"600000": freshTick(11.1)}, 2)
 	if old.Price != 9.9 {
 		t.Fatalf("旧 StockInfo 被原地改写（并发竞态隐患）: %v", old.Price)
 	}
@@ -125,15 +133,17 @@ func TestQMTFeedPointerIsolation(t *testing.T) {
 func TestQMTFeedVolumeUnit(t *testing.T) {
 	f := seedBase(t)
 	feed := NewQMTFeed(f, &fakeFeedSource{}, time.Second, 30*time.Second, 1)
-	feed.applyTicks(map[string]QMTTick{"600000": freshTick(10)})
+	feed.SetPrimary(true)
+	feed.applyTicks(map[string]QMTTick{"600000": freshTick(10)}, 2)
 	if v := f.Snapshot().Stocks["600000"].Volume; v != 200000 {
 		t.Fatalf("默认系数应为 1, got %v", v)
 	}
 	f2 := seedBase(t)
 	feed2 := NewQMTFeed(f2, &fakeFeedSource{}, time.Second, 30*time.Second, 0) // 0 → 回退 1
 	feed2.SetVolumeToShares(100)
+	feed2.SetPrimary(true)
 	tk := freshTick(10)
-	feed2.applyTicks(map[string]QMTTick{"600000": tk})
+	feed2.applyTicks(map[string]QMTTick{"600000": tk}, 2)
 	if v := f2.Snapshot().Stocks["600000"].Volume; v != tk.Volume*100 {
 		t.Fatalf("手→股系数应生效, got %v", v)
 	}

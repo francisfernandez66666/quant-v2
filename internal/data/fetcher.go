@@ -68,6 +68,13 @@ type Fetcher struct {
 	persistTick int
 	// §A+B 行情刷新间隔（秒）：默认 0 → 回退 5s。降低可缩短"行情变化→信号检测"感知延迟。
 	refreshInterval time.Duration
+	// §SUBSCRIPTION-A（2026-11-01）券商 L1 主源的装配状态（overlay / 覆盖率 / 池分档 / 迟滞）。
+	// 单点收口在 quote_feed_hub.go：这里只挂指针，状态与锁都在 hub 内部，
+	// 免得又出现"两个写者各自塞快照"那种谁都不知道自己赢了谁的形状。
+	// English: broker-feed assembly state (overlay/coverage/pool tier); state and its own lock live
+	// in quote_feed_hub.go so this struct only holds the pointer.
+	hubOnce sync.Once     // 懒建 hub（不能借 f.mu：UpdateHotStocks/StalenessMs 等都在持 f.mu 时取档）
+	hubRef  *feedHubState // 券商 feed 的装配状态（overlay / 覆盖率 / 池分档 / 迟滞）
 }
 
 // allStocks 返回去重合并后的完整监控列表（base + hot）。
@@ -124,14 +131,46 @@ func (f *Fetcher) SetBaseStocks(stocks []string) {
 // 热点股票随板块扫描周期替换，旧热点股票被移除。
 // UpdateHotStocks replaces the hot-stock watch list (capped at 60),
 // rotated with each sector scan cycle.
+//
+// §SUBSCRIPTION-A（owner 裁决 12）上限改成**按源分档**：券商主源稳定时可用配置值（出厂 400），
+// 退回后备源时仍是既有常数 60——新浪是 80 只一片，池越大后备链请求越多（400 只≈每轮 5 个请求）。
+// 两条形状锁在这里：
+//  1. 截断逻辑不许消失（负锁盯的是"顺手把上限去掉"，那会在降级态把后备链打爆）；
+//  2. 被钉住的代码（持仓/在途委托/§132 池预热注入的缺价代码）**必须留在池里**，
+//     收池不许把它们踢掉——做 T 的一只票因为池缩而看不见价，是最坏的一种降级。
+//
+// English: the cap is now tiered by source (broker-steady → configured ceiling, fallback → the
+// historical 60). Truncation must never disappear, and pinned codes always survive a shrink.
 func (f *Fetcher) UpdateHotStocks(stocks []string) {
+	// 先算档（hub() 自己会取 f.mu，绝不能持 f.mu 时调用）
+	cap := f.hotPoolCapNow()
+	pinned := f.pinnedCodes()
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(stocks) > maxWatchStocks {
-		stocks = stocks[:maxWatchStocks]
+	if len(stocks) > cap {
+		// 保留钉住的代码：先看它们在这轮热点里能不能占位，占不到就直接补进池尾，
+		// 保证"截断"永远不会把被引用的票截掉（数量级远小于 cap，不改变池的规模语义）。
+		kept := make([]string, 0, cap+len(pinned))
+		seen := make(map[string]bool, cap+len(pinned))
+		for _, s := range stocks[:cap] {
+			kept = append(kept, s)
+			seen[s] = true
+		}
+		for _, s := range stocks[cap:] {
+			if pinned[s] && !seen[s] {
+				kept = append(kept, s)
+				seen[s] = true
+			}
+		}
+		stocks = kept
 	}
 	f.hotStocks = stocks
 }
+
+// hotPoolCapNow 返回当前档位的热点池上限（降级档＝既有常数 maxWatchStocks=60）。
+// 单独抽出来是因为 UpdateHotStocks 持 f.mu，而 hub() 也要 f.mu —— 取档必须在加锁前完成。
+func (f *Fetcher) hotPoolCapNow() int { return f.hotPoolCap() }
 
 // TrackStock 只把代码加入监控池，**不立即取价**（下一次 5s 刷新统一拉）。
 //
@@ -147,13 +186,17 @@ func (f *Fetcher) TrackStock(code string) {
 		return
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	for _, s := range f.baseStocks {
 		if s == code {
+			f.mu.Unlock()
 			return
 		}
 	}
 	f.baseStocks = append(f.baseStocks, code)
+	f.mu.Unlock()
+	// §SUBSCRIPTION-A：进池即钉住。被引用的代码不许因为热点轮换或收池被截掉
+	// （做 T 的一只票看不见价，比多占一个池位危险得多）。
+	f.pinCode(code)
 }
 
 // EnsureStock 确保某只股票在监控列表中，立即获取其行情并合并到当前快照。
@@ -173,6 +216,7 @@ func (f *Fetcher) EnsureStock(code string) {
 		f.baseStocks = append(f.baseStocks, code)
 	}
 	f.mu.Unlock()
+	f.pinCode(code) // §SUBSCRIPTION-A：补价即钉住，理由同 TrackStock
 
 	// 不等下一轮 scanCycle：立刻单独补拉一次行情再合并进快照，
 	// 让前端刚加完自选就能看到名称与价格。取价失败只记日志，
@@ -502,6 +546,13 @@ func (f *Fetcher) fetch() {
 		return
 	}
 
+	// §SUBSCRIPTION-A（2026-11-01）写快照**之前**合并券商 overlay：单写者语义。
+	// 旧形状是 feed 事后整份注入 ⇒ 本轮刚拿到的券商价会在下一轮被外部源重建顶掉，
+	// "主源"名不副实且价格每 5s 来回抖。合并数只影响本轮快照内容，不改 lastOK 的口径
+	// （全局新鲜度仍由"外部链成功一轮"来刷新，overlay 的每票时刻走 StalenessMs(code)）。
+	if n := f.applyFeedOverlay(snapshot, time.Now()); n > 0 {
+		snapshot.Source = QuoteSourceQMTL1 // 本轮有券商价参与（整份单值 Source 的语义见 A3：每票源下沉是下一批）
+	}
 	f.mu.Lock()
 	f.snapshot = snapshot
 	f.mu.Unlock()
@@ -633,17 +684,33 @@ func (f *Fetcher) Staleness() time.Duration {
 	return time.Since(time.Unix(ts, 0))
 }
 
-// StalenessMs §WS-C 行情新鲜度硬闸用：返回当前快照陈旧度（毫秒；-1=从未采集）。
-// 快照采集是全局的（全池一轮一起刷），故单 code 与全局陈旧度一致，code 参数保留
-// 供未来按源/分片精细化的接口形态。English: quote staleness in ms for the §WS-C hard gate
-// (-1 when never fetched). The snapshot refresh is global, so per-code staleness equals the global
-// value; the code param reserves the shape for future per-source staleness.
+// StalenessMs §WS-C 行情新鲜度硬闸用：返回**这一只票**的陈旧度（毫秒；-1＝从未有证据）。
+//
+// §SUBSCRIPTION-A（2026-11-01）语义升级：这里开始吃每票自己的新鲜时刻。
+// 旧实现只读全局 lastOK，而全局基线会被"feed 命中 1 只"归零——那只票的新鲜替全池作了保，
+// 硬闸以为行情刚更新过，实际同池其它票可能已是几分钟前的（本文件 IngestSnapshot 那条洞）。
+// 现在的规则是**取两个证据里更新的一个**：
+//   - 有券商 overlay 时刻 ⇒ 参与比较；
+//   - 没有 ⇒ 只按全局；
+//   - 两者都没有 ⇒ -1（未知，消费端绝不当 0/新鲜用，§M2 那条方向不许破）。
+//
+// 注意"更新的"不等于"更宽松的"：全局基线现在只在覆盖率达标时才刷新（见 IngestFeedRound），
+// 所以拿不到券商 tick 的那些票，陈旧度照样持续增长、照样被闸拦下。
+//
+// English: per-code quote staleness for the §WS-C hard gate. Takes the freshest of the code's own
+// broker-tick timestamp and the global baseline; -1 (unknown) when neither exists — never 0.
 func (f *Fetcher) StalenessMs(code string) int64 {
-	ts := f.lastOK.Load()
-	if ts == 0 {
-		return -1
+	var best int64 = -1
+	if ts := f.lastOK.Load(); ts != 0 {
+		best = time.Since(time.Unix(ts, 0)).Milliseconds()
 	}
-	return time.Since(time.Unix(ts, 0)).Milliseconds()
+	if ms := f.feedFreshMs(code); ms > 0 {
+		d := time.Since(time.UnixMilli(ms)).Milliseconds()
+		if best < 0 || d < best {
+			best = d
+		}
+	}
+	return best
 }
 
 // inAuctionWindow 当前是否处于集合竞价注入窗口（9:15-9:26，Asia/Shanghai）。
