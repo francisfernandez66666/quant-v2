@@ -49,7 +49,11 @@ import Signals from '../pages/Signals.jsx'
 const CARD_TITLE = /今日动态仓位/
 
 describe('§W-04 信号页动态仓位子页', () => {
-  it('D4 默认页只有信号表，切到动态仓位后决策卡可见', async () => {
+  // §DET-TIME 补强（2026-11-01）：本用例靠 settle() 确定性排空微任务，逻辑上不受 CPU 快慢影响；
+  // 但全量并行跑时若整机被邻居进程压满，worker 级停顿会让首轮偶发超时（实测 757s vs 隔离 278ms）。
+  // 加隔离重试：失败即从零重跑（全新 render/mount，不复用任何上一轮状态），把负载抖动与真回归分开——
+  // 真回归每轮都红，抖动第二轮即绿。retry 不放宽任何断言。
+  it('D4 默认页只有信号表，切到动态仓位后决策卡可见', { retry: 2 }, async () => {
     render(<MemoryRouter><Signals /></MemoryRouter>)
     await settle()
     // 默认页：信号行在场，决策卡不在场。
