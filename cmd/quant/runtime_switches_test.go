@@ -160,3 +160,52 @@ func TestSwitchInventoryExplicitFalseIsDisabled(t *testing.T) {
 		}
 	}
 }
+
+// TestFeedEndpointAddressFollowsKeyHolder 钥匙与网关地址必须取自**同一个持有者**。
+// 现网实测（2026-11-01 23:5x）：全局 rules.qmt.gateway_url 是本机公网 IP
+// `http://81.71.69.17:8789`，而腾讯云 NAT 下实例访问自己的公网 IP 直接超时；在册钥匙落在
+// 运营账号快照的 `http://127.0.0.1:8789` 那一行。旧写法"钥匙取快照、地址吃全局"的
+// 结果就是出厂开的 feed 永远连不上，而交易链照常跑（控制器按账号自己的 gateway_url 走）——
+// 静默失效只会由 broker_feed_unavailable 在盘中报出来，装配当场就该修掉。
+func TestFeedEndpointAddressFollowsKeyHolder(t *testing.T) {
+	cfgMgr, opID := newCfgWithStore(t)
+	cfg := cfgMgr.Get()
+	cfg.QMT.GatewayURL = "http://198.51.100.7:8789" // 全局位：现网是同机公网 IP（NAT 内不可达）
+	cfg.QMT.Token = "global-key"
+	if err := cfgMgr.Save(); err != nil {
+		t.Fatalf("save global rules: %v", err)
+	}
+	if err := cfgMgr.SetQMTConfigFor(opID, &config.QMTConfig{
+		Token: "operator-stored-key", GatewayURL: "http://127.0.0.1:8789", Enabled: true}); err != nil {
+		t.Fatalf("set operator qmt config: %v", err)
+	}
+
+	url, tok, from := feedEndpoint(cfgMgr)
+	if tok != "operator-stored-key" || from != "运营账号在册快照" {
+		t.Fatalf("钥匙仍应取在册快照: tok=%q from=%q", tok, from)
+	}
+	if url != "http://127.0.0.1:8789" {
+		t.Fatalf("地址必须跟着钥匙的持有者走（否则现网永远连不上）, got %q", url)
+	}
+}
+
+// TestFeedEndpointAddressFallsBackWhenSnapshotHasNoURL 快照只落了钥匙、没登记地址（历史形态）时
+// 地址回退全局位，但钥匙**绝不**因此换成全局那把——两件事分家，回退只发生在地址这一侧。
+func TestFeedEndpointAddressFallsBackWhenSnapshotHasNoURL(t *testing.T) {
+	cfgMgr, opID := newCfgWithStore(t)
+	cfg := cfgMgr.Get()
+	cfg.QMT.GatewayURL = "http://198.51.100.7:8789"
+	if err := cfgMgr.Save(); err != nil {
+		t.Fatalf("save global rules: %v", err)
+	}
+	if err := cfgMgr.SetQMTConfigFor(opID, &config.QMTConfig{Token: "operator-stored-key", Enabled: true}); err != nil {
+		t.Fatalf("set operator qmt config: %v", err)
+	}
+	url, tok, from := feedEndpoint(cfgMgr)
+	if url != "http://198.51.100.7:8789" {
+		t.Fatalf("快照没登记地址时应回退全局地址, got %q", url)
+	}
+	if tok != "operator-stored-key" || from != "运营账号在册快照" {
+		t.Fatalf("地址回退不得连带把钥匙换成全局那把: tok=%q from=%q", tok, from)
+	}
+}

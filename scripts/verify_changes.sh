@@ -18713,8 +18713,22 @@ CNT161=$((CNT161 + 1))
 BUILDER_COPY=$(grep -rlE 'data\.FeedPolicy\{|FeedPolicy\{$' --include='*.go' cmd internal | grep -v _test | tr '\n' ' ')
 [ "$BUILDER_COPY" = "internal/data/quote_feed_hub.go " ] || fail161 "FeedPolicy 字面量构造点应只剩 data 侧一处，实测：$BUILDER_COPY"
 
+# 地址与钥匙同源（2026-11-01 现网实测的最后一颗雷）：全局 gateway_url 是本机公网 IP，
+# 腾讯云 NAT 下实例访问自己的公网 IP 直接超时；在册钥匙落在账号快照的 127.0.0.1 那一行。
+# 旧写法"钥匙取快照、地址吃全局"＝出厂开的 feed 永远连不上，而交易链照常（控制器按账号地址走）。
+CNT161=$((CNT161 + 1))
+grep -qF 'feedURL, feedToken, credFrom := feedEndpoint(cfgMgr)' cmd/quant/main.go || fail161 "装配点没走 feedEndpoint（钥匙与地址必须同源）"
+CNT161=$((CNT161 + 1))
+if grep -qE 'NewQMTClient\(cfgMgr\.Get\(\)\.QMT\.GatewayURL' cmd/quant/main.go; then
+	fail161 "行情 feed 又用全局 gateway_url 建客户端（现网那是本机公网 IP，NAT 内不可达＝静默连不上）"
+fi
+CNT161=$((CNT161 + 1))
+for tok in 'TestFeedEndpointAddressFollowsKeyHolder' 'TestFeedEndpointAddressFallsBackWhenSnapshotHasNoURL'; do
+	grep -qF "func $tok" cmd/quant/runtime_switches_test.go || fail161 "地址同源的行为用例缺 $tok"
+done
+
 [ "$B161_FAILED" = "0" ] || exit 1
-echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 每票源标记 3 + 量纲自动对齐 2 + 咨询链快照优先 5 + 探针形状 4 + 出厂开语义 4 + 通畅自证 9，累计判定点 ${CNT161}）"
+echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 每票源标记 3 + 量纲自动对齐 2 + 咨询链快照优先 5 + 探针形状 4 + 出厂开语义 4 + 通畅自证 9 + 地址与钥匙同源 4，累计判定点 ${CNT161}）"
 
 # ════════════════════════════════════════════════════════════════════════════
 # §162 §3.5 关态留痕（2026-11-01 追加裁决 15）：开关关着也必须可观测

@@ -12,27 +12,57 @@ package main
 
 import (
 	"log"
+	"strings"
 
 	"quant-trading-v2/internal/config"
 )
 
-// feedCredential 取行情 feed 用的钥匙：优先运营账号**自己落过盘**的在册快照钥匙，
-// 其次才是全局位（只可能出现在本地/测试环境——生产的全局位按 N1 不该有值）。
-// 返回的 from 串会进启动日志，让"这把钥匙到底从哪来"变成一个读数而不是考古题。
-// English: the operator's own stored snapshot key first, global only as a local/test fallback;
-// the provenance is logged so credential questions are answered by a reading, not by archaeology.
-func feedCredential(cfgMgr *config.Manager) (token, from string) {
+// feedEndpoint 一次性取出行情 feed 的**网关地址与钥匙**，两者必须同源。
+//
+// 为什么地址也要跟着取值（2026-11-01 现网实测的阻塞）：旧写法只从在册快照取钥匙，
+// 地址仍固定吃全局 `rules.qmt.gateway_url`。现网全局值是**本机公网 IP** `http://81.71.69.17:8789`，
+// 而腾讯云那层是 NAT，实例内部访问自己的公网 IP 直接超时（同机实测：127.0.0.1 秒回 200、
+// 公网 IP 6 秒超时）；各账号快照里落的是 `http://127.0.0.1:8789`。于是"出厂开"的 feed
+// 会永远连不上，交易链照旧（控制器按账号自己的 gateway_url 走），只有行情这条腿静默失效。
+// 一把钥匙属于哪个账号，就该用那个账号登记的网关地址——地址与钥匙分家取，等于自己造 401/超时。
+//
+// 取值顺序（三条，与 §TOKEN-PERAACCT 一致，绝不借别人的钥匙）：
+//  1. 运营账号**自己落过盘**的在册快照：token+gateway_url 成对取；
+//  2. 快照有钥匙但没登记地址（历史形态）→ 地址回退全局位，钥匙不回退；
+//  3. 全局兜底只可能出现在本地/测试环境（生产全局位按 N1 为空），命中时单独打一条。
+//     拿不到钥匙 ⇒ 返回空 token，调用方必须**显式停用**并打状态日志，不许硬启一个每轮失败的循环。
+//
+// English: resolve the feed's gateway URL and key **from the same holder** — the global URL on this
+// box is the instance's own public IP, which is unreachable from inside a Tencent Cloud NAT, so a
+// key taken from the operator snapshot while the address came from the global section could never
+// connect. No borrowing another account's key; no key means an explicit stop, not a silent retry loop.
+func feedEndpoint(cfgMgr *config.Manager) (url, token, from string) {
+	global := cfgMgr.Get().QMT
 	if q, stored := cfgMgr.StoredQMTConfigFor(cfgMgr.OperatorID()); stored && q.Token != "" {
-		return q.Token, "运营账号在册快照"
+		url = global.GatewayURL
+		if strings.TrimSpace(q.GatewayURL) != "" {
+			url = strings.TrimSpace(q.GatewayURL)
+		} else {
+			// 快照只落了钥匙、地址仍在历史全局位：地址可以回退，钥匙绝不因此换成别人的。
+			log.Printf("[main] §SUBSCRIPTION-A 运营账号在册快照未登记 gateway_url，行情 feed 地址回退全局位（钥匙仍用自己的在册快照）")
+		}
+		return url, q.Token, "运营账号在册快照"
 	}
 	if g := cfgMgr.Get().QMT; g.Token != "" {
 		// 全局位兜底只对本机/联调有意义：现网这里是空串（N1），命中这行说明配置回到了旧扩散形态，
 		// 必须看得见——所以它单独打一条，而不是静默当正常路径。
 		log.Printf("[main] §SUBSCRIPTION-A 行情 feed 用了全局 rules.qmt.token 兜底（运营账号快照没有在册钥匙；" +
 			"生产不该出现这条，见 AGENTS 的凭证三条）")
-		return g.Token, "全局兜底"
+		return strings.TrimSpace(g.GatewayURL), g.Token, "全局兜底"
 	}
-	return "", "无可用钥匙"
+	return strings.TrimSpace(global.GatewayURL), "", "无可用钥匙"
+}
+
+// feedCredential 只取钥匙（保留给既有测试与调用点；语义见 feedEndpoint）。
+// Deprecated: 装配点请改用 feedEndpoint，钥匙与地址必须同源。
+func feedCredential(cfgMgr *config.Manager) (token, from string) {
+	_, token, from = feedEndpoint(cfgMgr)
+	return token, from
 }
 
 // logRuntimeSwitches 启动时打印本批全部相关开关的**生效**读数（不是原始配置值）。

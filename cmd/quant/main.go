@@ -474,23 +474,30 @@ func run() int {
 	// §ENH-5 批E：QMT Level-1 全推行情 feed（默认关，生产决策机开启）。
 	// 命中代码合并覆盖快照 Source=QMT-L1；任何失败静默——5s 新浪链照常兜底，
 	// Staleness 自然增长，交易熔断判定（/health ok&&broker_connected）不含行情态。
-	// English: §ENH-5 Level-1 quote feed (off by default; production decision machine only).
-	// Failures are silent — the 5s Sina chain keeps running and health trading-gates stay untouched.
-	// §SUBSCRIPTION-A（2026-11-01）三处修正，都是实测出来的形状：
+	// English: §ENH-5 Level-1 quote feed. Since the 2026-11-01 owner ruling it is factory-on
+	// (absent config key = on); failures stay silent for *trading* — the 5s external chain keeps
+	// running and health trading-gates never look at quote state — but they are no longer invisible:
+	// the feed reports state/rounds and the broker_feed_unavailable alert fires in-session.
+	// §SUBSCRIPTION-A（2026-11-01）四处修正，都是实测出来的形状：
 	//  ① 凭据：旧实现只吃**全局** rules.qmt.token，而 10-30 那批把全局位清空了（全局不留实盘凭证），
 	//     加上 QMTClient 在 token 为空时干脆不发 Authorization 头 ⇒ 照旧步骤"开开关"的结果是
 	//     每 3s 一次 401、feed 永不连接、新浪照旧兜底、日志 60s 节流——最难发现的静默无效。
 	//     现按 owner 裁决取**运营账号在册快照那把钥匙**（不多发一种凭证），全局位只作本地/测试兜底；
 	//  ② 缺 gateway_url 或一把钥匙都拿不到时，必须打一条**状态**日志（不是静默 return）；
 	//  ③ 策略（主源档/覆盖率阈值/量纲/池上限）在装配点一次性灌给 Fetcher，
-	//     绝不在 NewQMTFeed 之后补赋值——漏装配点的表现是"重启后失效"。
+	//     绝不在 NewQMTFeed 之后补赋值——漏装配点的表现是"重启后失效"；
+	//  ④ **地址与钥匙同源**（同日现网实测）：全局 gateway_url 是本机公网 IP，腾讯云 NAT 下实例
+	//     访问自己的公网 IP 直接超时（127.0.0.1 秒回 200），而在册钥匙登记在账号快照的
+	//     127.0.0.1 那一行。装配点因此改走 feedEndpoint，取"这把钥匙所属账号"登记的网关地址；
+	//     否则出厂开的结果就是永远连不上，而交易链照常（它按账号自己的 gateway_url 走）——
+	//     只有行情这条腿静默失效，正是 broker_feed_unavailable 要抓的形态。
 	rt := cfgMgr.Get().Runtime
-	if rt.QMTFeedOn() && cfgMgr.Get().QMT.GatewayURL != "" {
+	feedURL, feedToken, credFrom := feedEndpoint(cfgMgr)
+	if rt.QMTFeedOn() && feedURL != "" {
 		intervalSec := rt.QMTFeedIntervalSec
 		if intervalSec <= 0 {
 			intervalSec = 3
 		}
-		feedToken, tokenFrom := feedCredential(cfgMgr)
 		if feedToken == "" {
 			// 一把钥匙都拿不到：显式停用并说明原因。静默启动一个每轮 401 的 feed 是本批要消灭的形态。
 			log.Printf("[main] §SUBSCRIPTION-A qmt_feed_enabled=true 但运营账号快照与全局都没有可用钥匙，" +
@@ -498,13 +505,13 @@ func run() int {
 		} else {
 			// 策略装配走 data 侧唯一构建器（设置页热更走同一个）：两条路各写一份兜底必然漂开。
 			fetcher.SetFeedPolicy(data.FeedPolicyFromRuntime(rt))
-			feedClient := trading.NewQMTClient(cfgMgr.Get().QMT.GatewayURL, feedToken, 3*time.Second, 0)
+			feedClient := trading.NewQMTClient(feedURL, feedToken, 3*time.Second, 0)
 			qmtFeed := data.NewQMTFeed(fetcher, feedClient, time.Duration(intervalSec)*time.Second, 30*time.Second, rt.EffectiveFeedVolumeToShares())
 			qmtFeed.SetPrimary(rt.QMTFeedPrimaryOn())
 			go qmtFeed.Start()
 			defer qmtFeed.Stop()
 			log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds, 凭据来源=%s, 主源档=%v",
-				cfgMgr.Get().QMT.GatewayURL, intervalSec, tokenFrom, rt.QMTFeedPrimaryOn())
+				feedURL, intervalSec, credFrom, rt.QMTFeedPrimaryOn())
 		}
 	} else if rt.QMTFeedOn() {
 		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
