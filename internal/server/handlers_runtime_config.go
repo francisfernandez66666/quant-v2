@@ -40,6 +40,7 @@ type runtimeConfigPatch struct {
 	QMTFeedCoverageMinPct *int     `json:"qmt_feed_coverage_min_pct"`
 	QMTFeedVolumeToShares *float64 `json:"qmt_feed_volume_to_shares"`
 	MonitorPoolHotMax     *int     `json:"monitor_pool_hot_max"`
+	QuotePerCodeSource    *bool    `json:"quote_per_code_source"`
 	QMTFeedIntervalSec    *int     `json:"qmt_feed_interval_sec"`
 }
 
@@ -60,8 +61,11 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		"monitor_pool_hot_max":           rt.MonitorPoolHotMax,
 		"monitor_pool_hot_max_effective": rt.EffectiveMonitorPoolHotMax(),
 		"qmt_feed_interval_sec":          rt.QMTFeedIntervalSec,
+		"quote_per_code_source":          rt.QuotePerCodeSource,
 		// hot_keys 明示哪些键保存即生效，其余按 restart_required 处理（前端据此提示，不靠人记）
-		"hot_keys":         []string{"qmt_feed_primary", "qmt_feed_coverage_min_pct", "qmt_feed_volume_to_shares", "monitor_pool_hot_max"},
+		"hot_keys": []string{"qmt_feed_primary", "qmt_feed_coverage_min_pct", "qmt_feed_volume_to_shares", "monitor_pool_hot_max",
+			// 逐票源标记也走热更：它只改快照里的字段，不改任何价格，开与关都不影响在途判定
+			"quote_per_code_source"},
 		"restart_required": restart,
 	}
 	// 行情通道现状一并回显：设置页要能回答"现在到底连着没有、覆盖率多少"，
@@ -151,6 +155,9 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 	if req.MonitorPoolHotMax != nil {
 		rt.MonitorPoolHotMax = *req.MonitorPoolHotMax
 	}
+	if req.QuotePerCodeSource != nil {
+		rt.QuotePerCodeSource = *req.QuotePerCodeSource
+	}
 	if req.QMTFeedIntervalSec != nil {
 		rt.QMTFeedIntervalSec = *req.QMTFeedIntervalSec
 	}
@@ -173,6 +180,7 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 		{"qmt_feed_coverage_min_pct", req.QMTFeedCoverageMinPct != nil},
 		{"qmt_feed_volume_to_shares", req.QMTFeedVolumeToShares != nil},
 		{"monitor_pool_hot_max", req.MonitorPoolHotMax != nil},
+		{"quote_per_code_source", req.QuotePerCodeSource != nil},
 		{"qmt_feed_interval_sec", req.QMTFeedIntervalSec != nil},
 	} {
 		if kv.set {
@@ -214,6 +222,7 @@ func feedPolicyFromRuntime(rt config.RuntimeConfig) data.FeedPolicy {
 		Primary:        rt.QMTFeedPrimary,
 		CoverageMinPct: rt.EffectiveFeedCoverageMinPct(),
 		HotPoolCap:     rt.EffectiveMonitorPoolHotMax(),
+		PerCodeSource:  rt.QuotePerCodeSource,
 		MaxAge:         30 * time.Second,
 		VolumeToShares: rt.EffectiveFeedVolumeToShares(),
 	}

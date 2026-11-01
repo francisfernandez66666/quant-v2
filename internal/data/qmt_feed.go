@@ -341,6 +341,10 @@ func (f *QMTFeed) applyTicks(ticks map[string]QMTTick, pool int) int {
 			}
 			cp := *si // 约束：复制后再改（Snapshot 是浅拷贝，条目指针与内部快照共享）
 			if applyTickTo(&cp, tk, p) {
+				if p.PerCodeSource {
+					cp.Src = QuoteSourceQMTL1
+					cp.AsOfMs = tk.TickTime // 0＝网关没给时间戳：留空，绝不折成"现在"（消费端按未知处理）
+				}
 				merged.Stocks[code] = &cp
 			}
 		}

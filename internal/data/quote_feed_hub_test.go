@@ -124,7 +124,7 @@ func TestObserveModeNeverChangesPrices(t *testing.T) {
 	if f.lastOK.Load() != beforeOK {
 		t.Fatal("观察模式刷新了全局基线")
 	}
-	if f.applyFeedOverlay(f.Snapshot(), time.Now()) != 0 {
+	if len(f.applyFeedOverlay(f.Snapshot(), time.Now())) != 0 {
 		t.Fatal("非主源档不许在采集链里合并 overlay")
 	}
 }
@@ -440,5 +440,96 @@ func TestQuoteFeedStateNilSafeWhenNeverPolled(t *testing.T) {
 	}
 	if got := f.QuoteFeedState(); got != "ok" {
 		t.Fatalf("状态位缺省应为 ok（由 present 判「从没跑过」），got %q", got)
+	}
+}
+
+// TestPerCodeSourceOffKeepsFieldsEmpty 缺省档（关闭）：Src/AsOfMs 一律留空。
+// 这两个字段是 omitempty ⇒ 关闭时快照落盘文件与 SSE 载荷的字节形状与今天一致；
+// 开着才逐票标。摘掉开关判断（无条件打标）会让这条当场红。
+func TestPerCodeSourceOffKeepsFieldsEmpty(t *testing.T) {
+	f, codes := hubBase(t, 200)
+	p := f.feedPolicyNow()
+	p.Primary = true // 主源开、逐票标记关：只有 overlay 那一路开标记才够，必须两开关独立
+	f.SetFeedPolicy(p)
+	hits := map[string]QMTTick{}
+	for _, c := range codes[:100] {
+		hits[c] = hubTick(12, 200000)
+	}
+	feed, _ := newPrimaryFeed(f, hits)
+	feed.applyTicks(hits, 200)
+	f.applyFeedOverlay(f.Snapshot(), time.Now())
+	for _, c := range codes {
+		si := f.Snapshot().Stocks[c]
+		if si == nil {
+			continue
+		}
+		if si.Src != "" || si.AsOfMs != 0 {
+			t.Fatalf("关闭逐票标记却写了来源: code=%s src=%q as_of=%d", c, si.Src, si.AsOfMs)
+		}
+	}
+}
+
+// TestPerCodeSourceMarksWhoGaveThisPrice 打开后：券商给的票标 QMT-L1，其余标本轮后备源；
+// 且后备源那部分**不许**被整份标称源（QMT-L1）冒充——这正是混源时说谎的地方。
+func TestPerCodeSourceMarksWhoGaveThisPrice(t *testing.T) {
+	f, codes := hubBase(t, 200)
+	p := f.feedPolicyNow()
+	p.Primary = true
+	p.PerCodeSource = true
+	f.SetFeedPolicy(p)
+	hits := map[string]QMTTick{}
+	for _, c := range codes[:120] {
+		hits[c] = hubTick(12, 200000)
+	}
+	feed, _ := newPrimaryFeed(f, hits)
+	feed.applyTicks(hits, 200)
+	// 复刻 fetch() 的次序：先记外部源名 → 合并 overlay → 逐票标记 → 最后才改整份 Source。
+	// 次序错了（先改 Source 再标记）就会把后备票也标成券商，混源恒 0——那正是本用例要抓的。
+	ext := f.Snapshot().Source
+	if ext == QuoteSourceQMTL1 {
+		ext = "新浪"
+	}
+	overlaid := f.applyFeedOverlay(f.Snapshot(), time.Now())
+	f.stampSnapshotSources(f.Snapshot(), overlaid, ext)
+	if len(overlaid) == 0 {
+		t.Fatal("overlay 没合并出任何票，标记无从谈起")
+	}
+	mixed := 0
+	for _, c := range codes {
+		si := f.Snapshot().Stocks[c]
+		if si == nil {
+			continue
+		}
+		if _, ok := overlaid[c]; ok {
+			if si.Src != QuoteSourceQMTL1 || si.AsOfMs <= 0 {
+				t.Fatalf("券商给价的票标记缺失: code=%s src=%q as_of=%d", c, si.Src, si.AsOfMs)
+			}
+		}
+		if si.Src != "" && si.Src != QuoteSourceQMTL1 {
+			mixed++
+		}
+	}
+	if mixed == 0 {
+		t.Fatal("混源计数为 0：整份 Source 说券商、每票 Source 却说没人兜底，两者必有一个在撒谎")
+	}
+}
+
+// TestStampSnapshotSourcesNeverOverwritesBrokerTime 后备源标记只补"没被 overlay 过"的票：
+// 拿整份时间戳去覆盖券商给的时刻，等于把 3 秒前的 tick 说成 5 秒前的采集时刻。
+func TestStampSnapshotSourcesNeverOverwritesBrokerTime(t *testing.T) {
+	f, codes := hubBase(t, 4)
+	p := f.feedPolicyNow()
+	p.PerCodeSource = true
+	f.SetFeedPolicy(p)
+	snap := f.Snapshot()
+	snap.Stocks[codes[0]].Src = QuoteSourceQMTL1
+	snap.Stocks[codes[0]].AsOfMs = 1234567 // 券商时刻（哨兵值，便于断言没被改）
+	overlaid := map[string]int64{codes[0]: 1234567}
+	f.stampSnapshotSources(snap, overlaid, "新浪")
+	if got := snap.Stocks[codes[0]]; got.AsOfMs != 1234567 || got.Src != QuoteSourceQMTL1 {
+		t.Fatalf("被 overlay 的票的时刻被后备源覆盖了: %+v", got)
+	}
+	if got := snap.Stocks[codes[3]]; got.Src == "" || got.AsOfMs == 0 {
+		t.Fatalf("后备源票没被标记: %+v", got)
 	}
 }

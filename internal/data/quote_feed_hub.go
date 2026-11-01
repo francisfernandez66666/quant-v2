@@ -54,6 +54,7 @@ const feedCoverageDefault = 80
 // English: effective feed policy assembled from RuntimeConfig's Effective* readings.
 type FeedPolicy struct {
 	Primary        bool          // 券商 tick 是否可改写快照价格
+	PerCodeSource  bool          // 是否逐票标 Src/AsOfMs（缺省 false ⇒ 字段留空，落盘/SSE 与今天同形）
 	CoverageMinPct int           // 覆盖率阈值：-1＝关闭判断（旧行为）；0/缺省由装配点兜成 80
 	HotPoolCap     int           // 券商主源档的热点池上限
 	MaxAge         time.Duration // 单票 tick 超龄上限（超龄退回后备源值）
@@ -361,13 +362,13 @@ func (f *Fetcher) feedFreshMs(code string) int64 {
 // English: merges fresh broker ticks into the externally-sourced snapshot under ONE writer, before
 // the snapshot is published. Entries are copied (Snapshot shares pointers), stale/zero-price ticks
 // are skipped, and tick-absent fields are preserved.
-func (f *Fetcher) applyFeedOverlay(snap *MarketSnapshot, now time.Time) int {
+func (f *Fetcher) applyFeedOverlay(snap *MarketSnapshot, now time.Time) map[string]int64 {
 	if snap == nil {
-		return 0
+		return nil
 	}
 	p := f.feedPolicyNow()
 	if !p.Primary {
-		return 0 // 观察模式：一个价格都不改写（缺省档＝与今天字节一致）
+		return nil // 观察模式：一个价格都不改写（缺省档＝与今天字节一致）
 	}
 	maxAge := p.MaxAge
 	if maxAge <= 0 {
@@ -383,7 +384,7 @@ func (f *Fetcher) applyFeedOverlay(snap *MarketSnapshot, now time.Time) int {
 	}
 	h.mu.Unlock()
 
-	applied := 0
+	applied := map[string]int64{}
 	f.mu.Lock()
 	for code, e := range entries {
 		old := snap.Stocks[code]
@@ -392,12 +393,42 @@ func (f *Fetcher) applyFeedOverlay(snap *MarketSnapshot, now time.Time) int {
 		}
 		cp := *old // 复制后再改（约束 ①）
 		if applyTickTo(&cp, e.tk, p) {
+			if p.PerCodeSource {
+				cp.Src = QuoteSourceQMTL1 // 这一只现在的价是券商给的（不是整份快照的标称源）
+				cp.AsOfMs = e.at.UnixMilli()
+			}
 			snap.Stocks[code] = &cp
-			applied++
+			applied[code] = cp.AsOfMs
 		}
 	}
 	f.mu.Unlock()
 	return applied
+}
+
+// stampSnapshotSources 在 overlay 之后给"本轮其余票"补上后备源标记（只有开关开着才做）。
+// extSource 必须是**外部链本轮的源名**，不能读 snap.Source —— 那个字段在 overlay 之后会被改成
+// "QMT-L1"（整份标称源），拿它去标后备票就把新浪兜的票也写成券商给的，混源计数恒 0，
+// 而这两处恰恰必须互相矛盾着才能被发现。参数化就是为了堵这个。
+// English: stamps the fallback tier with the round's *external* source name, never the
+// post-overlay snapshot.Source (which by then reads QMT-L1 and would erase the mixing).
+func (f *Fetcher) stampSnapshotSources(snap *MarketSnapshot, overlaid map[string]int64, extSource string) {
+	if snap == nil || !f.feedPolicyNow().PerCodeSource {
+		return
+	}
+	ms := snap.Time.UnixMilli()
+	if ms <= 0 {
+		ms = time.Now().UnixMilli()
+	}
+	for code, si := range snap.Stocks {
+		if si == nil {
+			continue
+		}
+		if _, ok := overlaid[code]; ok {
+			continue // 已由券商给价，别拿整份的时间戳去冒充它的时刻
+		}
+		si.Src = extSource
+		si.AsOfMs = ms
+	}
 }
 
 // applyTickTo 把一个券商 tick 打到 StockInfo 副本上；未命中有效价格返回 false（不动原值）。

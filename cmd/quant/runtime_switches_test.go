@@ -106,6 +106,7 @@ func TestSwitchInventoryCoversEveryKey(t *testing.T) {
 		"runtime.qmt_feed_coverage_min_pct",
 		"runtime.qmt_feed_volume_to_shares",
 		"runtime.monitor_pool_hot_max",
+		"runtime.quote_per_code_source",
 		"rules.qmt.subscription_recognize",
 		"rules.qmt.subscription_cancel_guard",
 		"网关侧 subscription_recognize",

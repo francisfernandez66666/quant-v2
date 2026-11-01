@@ -550,8 +550,13 @@ func (f *Fetcher) fetch() {
 	// 旧形状是 feed 事后整份注入 ⇒ 本轮刚拿到的券商价会在下一轮被外部源重建顶掉，
 	// "主源"名不副实且价格每 5s 来回抖。合并数只影响本轮快照内容，不改 lastOK 的口径
 	// （全局新鲜度仍由"外部链成功一轮"来刷新，overlay 的每票时刻走 StalenessMs(code)）。
-	if n := f.applyFeedOverlay(snapshot, time.Now()); n > 0 {
-		snapshot.Source = QuoteSourceQMTL1 // 本轮有券商价参与（整份单值 Source 的语义见 A3：每票源下沉是下一批）
+	// 先记下外部本轮的源名：下面整份 Source 可能被改成 QMT-L1，之后再问就问不出来了
+	extSource := snapshot.Source
+	overlaid := f.applyFeedOverlay(snapshot, time.Now())
+	// 混源诚实化：开关开着时逐票标"谁给的价、几点给的"，/api/status 才能报出"其中 N 只是后备源"。
+	f.stampSnapshotSources(snapshot, overlaid, extSource)
+	if len(overlaid) > 0 {
+		snapshot.Source = QuoteSourceQMTL1 // 整份标称源：本轮由券商主导；逐票真实来源见 StockInfo.Src
 	}
 	f.mu.Lock()
 	f.snapshot = snapshot

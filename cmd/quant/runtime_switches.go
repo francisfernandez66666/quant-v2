@@ -46,17 +46,18 @@ func logRuntimeSwitches(cfgMgr *config.Manager) {
 	if qm != nil {
 		rec, guard = qm.SubscriptionRecognize, qm.SubscriptionCancelGuard
 	}
-	log.Printf("[main] §SWITCH 状态 1/8 runtime.qmt_feed_enabled=%s", yesNo(rt.QMTFeedEnabled))
-	log.Printf("[main] §SWITCH 状态 2/8 runtime.qmt_feed_primary=%s（关＝观察模式：只统计不改写价格）", yesNo(rt.QMTFeedPrimary))
-	log.Printf("[main] §SWITCH 状态 3/8 runtime.qmt_feed_coverage_min_pct=%d（出厂 80；-1＝关闭阈值判断＝旧行为）",
+	log.Printf("[main] §SWITCH 状态 1/9 runtime.qmt_feed_enabled=%s", yesNo(rt.QMTFeedEnabled))
+	log.Printf("[main] §SWITCH 状态 2/9 runtime.qmt_feed_primary=%s（关＝观察模式：只统计不改写价格）", yesNo(rt.QMTFeedPrimary))
+	log.Printf("[main] §SWITCH 状态 3/9 runtime.qmt_feed_coverage_min_pct=%d（出厂 80；-1＝关闭阈值判断＝旧行为）",
 		rt.EffectiveFeedCoverageMinPct())
-	log.Printf("[main] §SWITCH 状态 4/8 runtime.qmt_feed_volume_to_shares=%.0f（必须由盘中探针判读固化；错 100 倍即 VWAP 错 100 倍）",
+	log.Printf("[main] §SWITCH 状态 4/9 runtime.qmt_feed_volume_to_shares=%.0f（必须由盘中探针判读固化；错 100 倍即 VWAP 错 100 倍）",
 		rt.EffectiveFeedVolumeToShares())
-	log.Printf("[main] §SWITCH 状态 5/8 runtime.monitor_pool_hot_max=%d（券商主源档；降级档仍是常数 60）",
+	log.Printf("[main] §SWITCH 状态 5/9 runtime.monitor_pool_hot_max=%d（券商主源档；降级档仍是常数 60）",
 		rt.EffectiveMonitorPoolHotMax())
-	log.Printf("[main] §SWITCH 状态 6/8 rules.qmt.subscription_recognize=%s（关＝申购行仍不可见、unknown 计数仍被注水）", yesNo(rec))
-	log.Printf("[main] §SWITCH 状态 7/8 rules.qmt.subscription_cancel_guard=%s（关＝紧急停止与今天一致，全发撤单）", yesNo(guard))
-	log.Printf("[main] §SWITCH 状态 8/8 网关侧 subscription_recognize 由 qmt_gateway/config.xt.json 自持，" +
+	log.Printf("[main] §SWITCH 状态 6/9 rules.qmt.subscription_recognize=%s（关＝申购行仍不可见、unknown 计数仍被注水）", yesNo(rec))
+	log.Printf("[main] §SWITCH 状态 7/9 rules.qmt.subscription_cancel_guard=%s（关＝紧急停止与今天一致，全发撤单）", yesNo(guard))
+	log.Printf("[main] §SWITCH 状态 8/9 runtime.quote_per_code_source=%s（关＝快照里不带每票来源与时刻，混源时整份 Source 仍是唯一读数）", yesNo(rt.QuotePerCodeSource))
+	log.Printf("[main] §SWITCH 状态 9/9 网关侧 subscription_recognize 由 qmt_gateway/config.xt.json 自持，" +
 		"现值看网关 /admin/status 的 orders_sync.subscription_recognize（两个键都要开才见效；只开一边最坏是少标注）")
 }
 

@@ -303,6 +303,12 @@ type RuntimeConfig struct {
 	// order-assembly audit trail, T-cost slippage and paper buy/sell points; the value must come from
 	// the intraday probe reading, never from a guess. 0 = default 1 (shares), 100 = lots.
 	QMTFeedVolumeToShares float64 `json:"qmt_feed_volume_to_shares"`
+	// QuotePerCodeSource §SUBSCRIPTION-A（裁决 1/5）：是否给每只票标"这个价来自哪个源、几秒前"。
+	// 混源是"券商为主 + 现行链为后备"的必然结果（客户端 15:05 关、盘前未起、随时可能断），
+	// 而整份快照只有一个 Source ⇒ 它会说整份都是 QMT-L1，其实有几十只来自新浪。
+	// 缺省 false：两个新字段omitempty ⇒ 快照落盘、SSE、行情接口的字节形状与今天一致。
+	// English: stamp per-symbol source/as-of provenance; off by default keeps payloads identical.
+	QuotePerCodeSource bool `json:"quote_per_code_source"`
 	// MonitorPoolHotMax §SUBSCRIPTION-A（owner 裁决 12）：券商为主源时的热点监控池上限。
 	// 缺省 0 → 出厂 400；降级档（现行链当家时）仍是既有常数 60——扩容只在券商这条本地通道扛得住
 	// 的时候发生，退回外部源就收回，因为新浪是 80 只一片、池越大后备链请求越多。

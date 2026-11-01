@@ -18617,6 +18617,14 @@ CNT161=$((CNT161 + 1))
 HEALTH_EXEMPT=$(grep -cE 'parsed.path != "/health"' qmt_gateway/gateway.py)
 [ "${HEALTH_EXEMPT:-0}" = "1" ] || fail161 "网关免鉴权豁免位不再是唯一一处 /health（现测 $HEALTH_EXEMPT 处；裁决 14 不接受给 /quotes 开鉴权豁口）"
 
+# ⑫b 每票源标记（A3）：字段、开关、后备源标记次序三处都在，且缺省关时字段为 omitempty
+CNT161=$((CNT161 + 1))
+grep -qE 'Src[[:space:]]+string[[:space:]]+`json:"src,omitempty"`' internal/data/types.go || fail161 "StockInfo 的每票来源字段丢了（混源只能靠它证伪；gofmt 会调列间距，故按空格宽松匹配）"
+CNT161=$((CNT161 + 1))
+grep -qF 'f.stampSnapshotSources(snapshot, overlaid, extSource)' internal/data/fetcher.go || fail161 "采集链没给后备源票逐票标记（整份 Source 会替它们撒谎）"
+CNT161=$((CNT161 + 1))
+grep -qE 'QuotePerCodeSource[[:space:]]+bool[[:space:]]+`json:"quote_per_code_source"`' internal/config/config.go || fail161 "quote_per_code_source 开关丢了"
+
 # ⑬ 盘中探针必须是"只读行情、不建 trader 会话"：10-29 那次每次 connect 占一个 writer 槽
 #    且不回收，713 连败把 QMT 客户端 3~6 分钟拖崩一次。负锁只看**可执行行**——
 #    脚本的说明注释里本来就要提这个名字，全文匹配会把好代码判红（§负锁锚串的同族坑）。
@@ -18634,7 +18642,7 @@ CNT161=$((CNT161 + 1))
 grep -qE 'from xtquant import xtdata' scripts/probe_qmt_feed.py || fail161 "探针没走 xtdata 只读通道"
 
 [ "$B161_FAILED" = "0" ] || exit 1
-echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 探针形状 4，累计判定点 ${CNT161}）"
+echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 每票源标记 3 + 探针形状 4，累计判定点 ${CNT161}）"
 
 # ════════════════════════════════════════════════════════════════════════════
 # §162 §3.5 关态留痕（2026-11-01 追加裁决 15）：开关关着也必须可观测
@@ -18656,7 +18664,7 @@ grep -qF 'logRuntimeSwitches(cfgMgr)' cmd/quant/main.go || fail162 "启动清单
 # 清单条数与"本批开关数"等值：新增一个开关却不进清单 ⇒ 这条当场红
 CNT162=$((CNT162 + 1))
 SWITCH_LINES=$(grep -c '§SWITCH 状态' cmd/quant/runtime_switches.go)
-[ "$SWITCH_LINES" = "8" ] || fail162 "启动清单应逐键 8 条，现测 $SWITCH_LINES（新增开关漏进清单，或清单被删短）"
+[ "$SWITCH_LINES" = "9" ] || fail162 "启动清单应逐键 9 条（新增开关必须同批进清单），现测 $SWITCH_LINES"
 # 关着也统计：网关 would_label 与 Go 读面 would-label 两条腿都必须在
 CNT162=$((CNT162 + 1))
 grep -qF 'self._orders_sub_would_label_seen.add(oid)' qmt_gateway/gateway.py || fail162 "网关关态的 would_label 计数丢了"

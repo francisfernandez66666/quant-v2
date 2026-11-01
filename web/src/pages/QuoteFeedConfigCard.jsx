@@ -56,6 +56,7 @@ export default function QuoteFeedConfigCard() {
   const save = async () => {
     const patch = {}
     if (form.qmt_feed_primary !== !!cfg.qmt_feed_primary) patch.qmt_feed_primary = form.qmt_feed_primary
+    if (form.quote_per_code_source !== !!cfg.quote_per_code_source) patch.quote_per_code_source = form.quote_per_code_source
     if (form.qmt_feed_coverage_min_pct !== cfg.qmt_feed_coverage_min_pct) patch.qmt_feed_coverage_min_pct = Number(form.qmt_feed_coverage_min_pct)
     if (form.qmt_feed_volume_to_shares !== cfg.qmt_feed_volume_to_shares) patch.qmt_feed_volume_to_shares = Number(form.qmt_feed_volume_to_shares)
     if (form.monitor_pool_hot_max !== cfg.monitor_pool_hot_max) patch.monitor_pool_hot_max = Number(form.monitor_pool_hot_max)
@@ -94,6 +95,16 @@ export default function QuoteFeedConfigCard() {
             onChange={(e) => setForm({ ...form, qmt_feed_primary: e.target.checked })} />
           <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>
             关＝观察模式（只统计不改价）；开＝券商 L1 成为主源
+          </span>
+        </label>
+        <label style={{ fontSize: 13 }}>
+          每票来源与时刻标记（quote_per_code_source）
+          <input type="checkbox" checked={!!form.quote_per_code_source} style={{ marginLeft: 8 }}
+            onChange={(e) => setForm({ ...form, quote_per_code_source: e.target.checked })} />
+          {/* 混源是"券商为主 + 后备链兜底"的必然结果。不开这个，整份快照只有一个源名，
+              "其中几十只其实是新浪兜的"在现场看不出来——那正是我们出过事的那类谎。 */}
+          <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>
+            开＝快照逐票带 src/as_of_ms（当前 {cfg.quote_source_mixed ?? 0} 只与整份源名不同）
           </span>
         </label>
         <label style={{ fontSize: 13 }}>覆盖率阈值 %（生效 {cfg.coverage_min_pct_effective}）
