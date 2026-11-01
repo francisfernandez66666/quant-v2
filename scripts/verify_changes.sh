@@ -18597,8 +18597,43 @@ for tn in TestStaleGateNotForgedByPartialFeed TestStaleGateThresholdBoundary Tes
 	grep -rqF "func $tn" internal/data/ || fail161 "装配层用例 $tn 不在册"
 done
 
+# ⑩ 鉴权失败必须走哨兵分类，不许回到"猜状态码字符串"（§0925EVE-W3-E 的口径）
+CNT161=$((CNT161 + 1))
+grep -qF 'errors.Is(err, ErrQuoteUnauthorized)' internal/data/qmt_feed.go || fail161 "feed 侧不再用哨兵判鉴权失败（回潮成字符串猜测就没法与网关挂了分形）"
+CNT161=$((CNT161 + 1))
+grep -qF 'data.ErrQuoteUnauthorized' internal/trading/qmt_client.go || fail161 "trading 侧没把 401/403 包成哨兵（data 不能 import trading，包装只能在这里做）"
+
+# ⑪ 观测面：撤钥匙 / 降级 / 未启用 三种情形必须在 GET /api/status 里是三个不同读数。
+#    旧形状只有一条 60s 节流日志 ⇒ "开着但每轮 401" 与 "根本没开" 在现网看不出区别（静默无效）。
+CNT161=$((CNT161 + 1))
+grep -qE '"quote_feed":[[:space:]]+quoteFeed' internal/server/handlers_fix.go || fail161 "/api/status 没暴露行情通道状态"
+CNT161=$((CNT161 + 1))
+grep -qF 'return "auth_failed"' internal/data/quote_feed_hub.go || fail161 "auth_failed 状态值丢了（裁决 14：补凭证与查网关是两种处置，不能混成一个值）"
+
+# ⑫ 负锁：不许为行情通道开免鉴权豁口（裁决 14 明确不接受这条路）
+CNT161=$((CNT161 + 1))
+# wc -l 会带前导空格，必须先去掉再做数值比较（本仓 §P2-L 那类"读数被格式骗"的同族坑）
+HEALTH_EXEMPT=$(grep -cE 'parsed.path != "/health"' qmt_gateway/gateway.py)
+[ "${HEALTH_EXEMPT:-0}" = "1" ] || fail161 "网关免鉴权豁免位不再是唯一一处 /health（现测 $HEALTH_EXEMPT 处；裁决 14 不接受给 /quotes 开鉴权豁口）"
+
+# ⑬ 盘中探针必须是"只读行情、不建 trader 会话"：10-29 那次每次 connect 占一个 writer 槽
+#    且不回收，713 连败把 QMT 客户端 3~6 分钟拖崩一次。负锁只看**可执行行**——
+#    脚本的说明注释里本来就要提这个名字，全文匹配会把好代码判红（§负锁锚串的同族坑）。
+CNT161=$((CNT161 + 1))
+[ -f scripts/probe_qmt_feed.py ] || fail161 "只读探针脚本不在位（明天盘中要用它定量纲/五档/指数/K 线）"
+CNT161=$((CNT161 + 1))
+if grep -vE '^[[:space:]]*#' scripts/probe_qmt_feed.py | grep -qE 'XtQuantTrader|xttrader'; then
+	fail161 "探针脚本里有 trader 会话（writer 槽不回收＝10-29 崩客户端的元凶；只准用 xtdata）"
+fi
+CNT161=$((CNT161 + 1))
+if grep -vE '^[[:space:]]*#' scripts/probe_qmt_feed.py | grep -qE 'while[[:space:]]+True'; then
+	fail161 "探针进了循环（盘中一次都不该循环跑）"
+fi
+CNT161=$((CNT161 + 1))
+grep -qE 'from xtquant import xtdata' scripts/probe_qmt_feed.py || fail161 "探针没走 xtdata 只读通道"
+
 [ "$B161_FAILED" = "0" ] || exit 1
-echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1，累计判定点 ${CNT161}）"
+echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 探针形状 4，累计判定点 ${CNT161}）"
 
 # ════════════════════════════════════════════════════════════════════════════
 # §162 §3.5 关态留痕（2026-11-01 追加裁决 15）：开关关着也必须可观测
@@ -18638,6 +18673,18 @@ CNT162=$((CNT162 + 1))
 FOUND162=$(grep -rlF --include='*.py' 'test_off_state_still_counts_would_label' qmt_gateway/tests | wc -l | tr -d ' ')
 [ "$FOUND162" = "1" ] || fail162 "关态留痕的网关用例不在册（命中 $FOUND162 个源文件）"
 
+# feed 侧的关态读数（追加裁决 15 的 L2 另一半）：观察模式必须报"本可以改写/是否可开主源"
+CNT162=$((CNT162 + 1))
+grep -qF 'feed_observed' internal/data/qmt_feed.go || fail162 "观察模式没有关态读数（能不能开 primary 又要靠人翻日志数轮次）"
+CNT162=$((CNT162 + 1))
+# 小写串是 JSON 键与日志格式串（大写的是 Go 字段名）：锁观测面的两处落点
+for tok in 'would_override' 'ready_to_promote'; do
+	grep -qF "$tok" internal/server/handlers_fix.go || fail162 "/api/status 的关态读数缺字段 $tok"
+done
+# L3：开关翻转必须进配置写审计（diff 是递归 JSON 对比；有人改成白名单枚举就会在这里红）
+CNT162=$((CNT162 + 1))
+grep -rqF 'func TestDiffRulesSurfacesSubscriptionSwitchFlip' internal/config/ || fail162 "开关翻转的审计用例不在册"
+
 [ "$B162_FAILED" = "0" ] || exit 1
-echo "ok - §162 §关态留痕锁通过（清单文件与调用 2 + 条数等值 1 + 两侧 would-label 2 + 不含凭据与节流 2 + 用例在册 1，累计判定点 ${CNT162}）"echo "==> 全部通过"
+echo "ok - §162 §关态留痕锁通过（清单文件与调用 2 + 条数等值 1 + 两侧 would-label 2 + 不含凭据与节流 2 + 用例在册 1 + feed 侧关态读数 3 + L3 审计用例 1，累计判定点 ${CNT162}）"echo "==> 全部通过"
 

@@ -22,10 +22,20 @@
 package data
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ErrQuoteUnauthorized 是"行情通道被鉴权拒绝"的可判定错误哨兵（401/403）。
+// 为什么必须由 data 侧定义、trading 侧包装：feed 只能看见接口返回的 error，而 §0925EVE-W3-E
+// 早就定过"判据不许靠 Contains 猜状态码"；网关的 gatewayHTTPError 是 trading 包内未导出类型，
+// data 侧既不能命名它、也不该去 import trading（会成环）。哨兵让"钥匙被撤/无效"与
+// "网关挂了/网络抖"成为两个不同读数——owner 裁决 14 要的就是这个区分。
+// English: sentinel so "credential revoked/invalid" is distinguishable from "gateway down"
+// without string sniffing and without an import cycle.
+var ErrQuoteUnauthorized = errors.New("quote feed unauthorized")
 
 // feedHubTickInterval 是迟滞判定的最小时间粒度（只做时间比较，不做定时器）。
 // feedSteadyExpand 升档（扩容/接管）需要的连续稳定时长；降档（退回后备源）**即刻生效**。
@@ -62,6 +72,10 @@ type FeedStats struct {
 	DenominatorSource string  // tradable / pool（pool＝分母不可信，退回池总数）
 	RefreshedGlobal   bool    // 本轮是否刷新了全局新鲜度基线（覆盖率达标才有）
 	Degrade           string  // 空＝正常；J1 通道不通 / J2 集体陈旧 / J3 读数不自洽
+	AuthFailed        bool    // 最近一轮被 401/403 拒（钥匙被撤/无效）——与"网关挂了"必须分形
+	WouldOverride     bool    // 观察模式下：本轮覆盖率已达标，**本可以**改写价格（但开关没开）
+	ReadyToPromote    bool    // 连续达标轮次 >=3 ⇒ "可以开 primary 了"的现场依据，不靠人盯日志
+	CoverageRounds    int     // 连续达标轮数（ReadyToPromote 的输入）
 	ConsecutiveFail   int     // 连续失败轮次（J1 判据输入）
 	MissingPricePct   float64 // 本轮 lastPrice<=0 的占比（J3 判据输入）
 }
@@ -84,6 +98,7 @@ type feedHubState struct {
 	// 迟滞状态：healthy 连续区间的起点，与当前是否处于主源档
 	healthySince time.Time
 	live         bool
+	okRounds     int // 连续覆盖率达标轮数（ReadyToPromote 的输入）
 }
 
 func (f *Fetcher) hub() *feedHubState {
@@ -111,6 +126,9 @@ func (f *Fetcher) feedPolicyNow() FeedPolicy {
 	defer h.mu.Unlock()
 	return h.policy
 }
+
+// FeedPolicyNow 导出版读数（观测面测试与装配热改用；内部一律走 feedPolicyNow）。
+func (f *Fetcher) FeedPolicyNow() FeedPolicy { return f.feedPolicyNow() }
 
 // FeedStatsNow 返回最近一轮 feed 读数（观测面）。
 func (f *Fetcher) FeedStatsNow() FeedStats {
@@ -153,7 +171,18 @@ func (f *Fetcher) IngestFeedRound(merged *MarketSnapshot, entries map[string]QMT
 	h := f.hub()
 	p := f.feedPolicyNow()
 	if !p.Primary {
+		// 观察模式：不写 overlay、不动快照、不刷全局基线，但 L2 读数（本可以改写多少只、
+		// 是否已连续达标可开主源）照样算——"能不能开"必须由读数回答，不能靠人翻日志。
 		h.mu.Lock()
+		st.WouldOverride = coverageGateOK(p, st)
+		if coverageGateOK(p, st) {
+			h.okRounds++
+		} else {
+			h.okRounds = 0
+		}
+		st.CoverageRounds = h.okRounds
+		st.ReadyToPromote = h.okRounds >= 3
+		st.RefreshedGlobal = false // 观察模式绝不刷新基线（这是它与主源档唯一的行为差）
 		h.stats = st
 		h.mu.Unlock()
 		return
@@ -167,6 +196,16 @@ func (f *Fetcher) IngestFeedRound(merged *MarketSnapshot, entries map[string]QMT
 		h.ents[code] = feedEntry{tk: tk, at: now}
 	}
 	st.RefreshedGlobal = coverageGateOK(p, st)
+	// 追加裁决 15 的 L2 半边（观察模式）：关着也要把"本可以做什么"记成读数。
+	// 没有它，"能不能开 primary"就只能靠人翻日志数轮次——那正是我们要消灭的"感觉式"上线。
+	st.WouldOverride = !p.Primary && coverageGateOK(p, st)
+	if coverageGateOK(p, st) {
+		h.okRounds++
+	} else {
+		h.okRounds = 0
+	}
+	st.CoverageRounds = h.okRounds
+	st.ReadyToPromote = h.okRounds >= 3 // 连续 3 轮达标（≈9 秒）才算"可开"，单轮尖峰不算
 	h.stats = st
 	h.mu.Unlock()
 	// 健康位：主源档（扩池）只在"确实由券商当家且本轮没判降级"时才升；
@@ -188,12 +227,16 @@ func (f *Fetcher) IngestFeedRound(merged *MarketSnapshot, entries map[string]QMT
 // 失败轮**绝不**刷新 lastOK——否则"什么都拿不到"也会让全池显示新鲜（§M2 同族方向）。
 // English: records a failed round for the J1 counter and drops the pool tier; never refreshes
 // the global baseline, so "nothing arrived" can never masquerade as "everything is fresh".
-func (f *Fetcher) NoteFeedFailure(consecutiveFail int) {
+func (f *Fetcher) NoteFeedFailure(consecutiveFail int, authFailed bool) {
 	h := f.hub()
 	h.mu.Lock()
 	st := h.stats
 	st.ConsecutiveFail = consecutiveFail
 	st.Degrade = "J1"
+	st.AuthFailed = authFailed // 钥匙问题与网关问题必须分形（裁决 14）
+	st.CoverageRounds = 0
+	st.ReadyToPromote = false
+	h.okRounds = 0
 	h.stats = st
 	healthy := consecutiveFail == 0
 	h.mu.Unlock()
@@ -208,6 +251,10 @@ func (f *Fetcher) NoteFeedDegrade(st FeedStats) {
 	h := f.hub()
 	h.mu.Lock()
 	st.ConsecutiveFail = 0 // 不是通道失败，J1 计数归零
+	st.AuthFailed = false
+	st.CoverageRounds = 0
+	st.ReadyToPromote = false
+	h.okRounds = 0
 	h.stats = st
 	h.mu.Unlock()
 	f.setFeedHealth(false)
@@ -376,4 +423,21 @@ func applyTickTo(dst *StockInfo, tk QMTTick, p FeedPolicy) bool {
 		dst.ChangePct = (tk.LastPrice/tk.PrevClose - 1) * 100
 	}
 	return true
+}
+
+// QuoteFeedState 给观测面用：把"这条通道现在是什么状态"折成一个字符串读数。
+// 取值 ok / auth_failed / degraded:J1 / degraded:J2 / degraded:J3。
+// 为什么 auth_failed 优先于 J1：钥匙被撤在 HTTP 层也是"通道不通"，但对运维来说
+// 两者的处置动作完全不同（补钥匙 vs 查网关进程），混成一个值就是让人盲操作。
+// English: single observable state; auth_failed is kept distinct from a generic channel failure
+// because the operator's action differs (re-issue the key vs. restart the gateway).
+func (f *Fetcher) QuoteFeedState() string {
+	st := f.FeedStatsNow()
+	if st.AuthFailed {
+		return "auth_failed"
+	}
+	if st.Degrade != "" {
+		return "degraded:" + st.Degrade
+	}
+	return "ok"
 }

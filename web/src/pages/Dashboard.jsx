@@ -502,6 +502,25 @@ export default function Dashboard() {
                 行情源：{status.quote_source || '未就绪（盘外/降级）'}
                 {hasAge ? ` · ${age}s 前` : ''}
                 {stale ? <Tag theme="warning" size="small" style={{ marginLeft: 6 }}>数据可能过期</Tag> : null}
+                {/* §SUBSCRIPTION-A（2026-11-01）券商行情通道状态上屏。
+                    三个值必须互不相同：没开（字段为 null，整段不渲染）/ 被鉴权拒（auth_failed＝去补凭证）/
+                    降级（degraded:J1|J2|J3＝去查网关与读数）。旧形状只有一条 60s 节流日志，
+                    "开着但每轮 401"和"根本没开"在页面上看不出区别——那正是静默无效。
+                    观察模式额外报「本可接管」：开不开主源由这个读数决定，不靠人盯日志。 */}
+                {(() => {
+                  const qf = status.quote_feed
+                  if (!qf) return null
+                  if (qf.state === 'auth_failed') {
+                    return <Tag theme="danger" size="small" style={{ marginLeft: 6 }} title="行情通道被网关鉴权拒绝：确认运营账号在册凭证（与网关进程故障是两回事）">券商行情未认证</Tag>
+                  }
+                  if (qf.state && qf.state !== 'ok') {
+                    return <Tag theme="warning" size="small" style={{ marginLeft: 6 }} title={`命中 ${qf.hits}/${qf.denominator} 只，连续失败 ${qf.consecutive_fail || 0} 轮`}>券商行情降级（{qf.state}）</Tag>
+                  }
+                  if (qf.would_override) {
+                    return <Tag theme="default" size="small" style={{ marginLeft: 6 }} title={`覆盖率 ${Number(qf.coverage_pct || 0).toFixed(1)}%（分母口径 ${qf.denominator_source}）`}>{qf.ready_to_promote ? '券商行情本可接管（尚未开启）' : '券商行情观察中'}</Tag>
+                  }
+                  return null
+                })()}
               </span>
             )
           })()}

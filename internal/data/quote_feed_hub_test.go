@@ -11,6 +11,7 @@
 package data
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -318,7 +319,7 @@ func TestFeedFailureDropsTierAndNeverRefreshes(t *testing.T) {
 	h.mu.Unlock()
 
 	before := f.lastOK.Load()
-	f.NoteFeedFailure(3)
+	f.NoteFeedFailure(3, false)
 	if f.feedLive() {
 		t.Fatal("通道失败后必须立刻收回主源档")
 	}
@@ -327,5 +328,117 @@ func TestFeedFailureDropsTierAndNeverRefreshes(t *testing.T) {
 	}
 	if st := f.FeedStatsNow(); st.Degrade != "J1" || st.ConsecutiveFail != 3 {
 		t.Fatalf("J1 读数没记上: %+v", st)
+	}
+}
+
+// authSource 是一个只会返回"鉴权被拒"的假源（包装 data.ErrQuoteUnauthorized，
+// 与 trading.QMTClient.Quotes 在 401/403 时的包装同形）。
+type authSource struct{ calls int }
+
+func (a *authSource) Quotes(_ context.Context, _ []string) (map[string]QMTTick, error) {
+	a.calls++
+	return nil, fmtErrWrapped()
+}
+
+// fmtErrWrapped 造一条 %w 包装链上的哨兵错误（等价于 trading 侧的 fmt.Errorf("%w: HTTP %d", ...)）。
+func fmtErrWrapped() error { return fmt.Errorf("%w: HTTP 401", ErrQuoteUnauthorized) }
+
+// TestAuthFailureIsDistinguishable 裁决 14 的核心：撤钥匙后的状态必须是 auth_failed，
+// 而不是和"网关挂了"混成同一个 degraded:J1——两者处置动作完全不同（补凭证 vs 查进程）。
+func TestAuthFailureIsDistinguishable(t *testing.T) {
+	f, _ := hubBase(t, 10)
+	p := f.feedPolicyNow()
+	p.Primary = true
+	f.SetFeedPolicy(p)
+	src := &authSource{}
+	feed := NewQMTFeed(f, src, time.Second, 30*time.Second, 1)
+	feed.pollOnce()
+	feed.pollOnce()
+
+	if got := f.QuoteFeedState(); got != "auth_failed" {
+		t.Fatalf("撤钥匙后状态应是 auth_failed（与网关挂了分形），got %q", got)
+	}
+	st := f.FeedStatsNow()
+	if st.ConsecutiveFail != 2 {
+		t.Fatalf("连续失败轮次应 2, got %d", st.ConsecutiveFail)
+	}
+	if !st.AuthFailed {
+		t.Fatal("AuthFailed 读数没置位：观测面会把它显示成普通通道故障")
+	}
+	if f.feedLive() {
+		t.Fatal("鉴权失败后必须当轮收回主源档（缩池是安全方向）")
+	}
+}
+
+// TestAuthRestoredClearsState 钥匙恢复后下一轮即回到 ok，不需要重启进程
+// （否则"换钥匙=重启才生效"会变成又一条静默失效的路）。
+func TestAuthRestoredClearsState(t *testing.T) {
+	f, codes := hubBase(t, 10)
+	p := f.feedPolicyNow()
+	p.Primary = true
+	p.HotPoolCap = 400
+	f.SetFeedPolicy(p)
+	badSrc := &authSource{}
+	feed := NewQMTFeed(f, badSrc, time.Second, 30*time.Second, 1)
+	feed.pollOnce()
+	if f.QuoteFeedState() != "auth_failed" {
+		t.Fatalf("前置：应先进入 auth_failed, got %q", f.QuoteFeedState())
+	}
+	hits := map[string]QMTTick{}
+	for _, c := range codes {
+		hits[c] = hubTick(11, 200000)
+	}
+	feed.src = &fakeFeedSource{ticks: hits} // 换回好源（等价于重新配上钥匙）
+	feed.pollOnce()
+	if got := f.QuoteFeedState(); got != "ok" {
+		t.Fatalf("恢复后应回 ok, got %q", got)
+	}
+	if f.FeedStatsNow().AuthFailed {
+		t.Fatal("成功轮之后 AuthFailed 位必须清掉（否则会一直显示成钥匙问题）")
+	}
+}
+
+// TestObserveModeReportsWouldOverrideAndPromote 追加裁决 15 的 L2 半边（feed 侧）：
+// 观察模式不改写价格，但必须把"本可以改写"与"已连续达标、可以开主源"记成读数。
+// 没有它，"能不能开 primary"就只能靠人翻日志数轮次——那还是感觉式上线。
+func TestObserveModeReportsWouldOverrideAndPromote(t *testing.T) {
+	f, codes := hubBase(t, 200)
+	hits := map[string]QMTTick{}
+	for _, c := range codes { // 全覆盖，观察模式下覆盖率必然达标
+		hits[c] = hubTick(12, 200000)
+	}
+	src := &fakeFeedSource{ticks: hits}
+	feed := NewQMTFeed(f, src, time.Second, 30*time.Second, 1)
+	// 不调 SetPrimary ⇒ 缺省观察档
+	feed.applyTicks(hits, 200)
+	st := f.FeedStatsNow()
+	if !st.WouldOverride {
+		t.Fatalf("观察模式下覆盖率达标就该报 would_override（本可以改写）: %+v", st)
+	}
+	if f.Snapshot().Stocks[codes[0]].Price != 10 {
+		t.Fatal("would_override 是读数，不是改写许可：观察档价格必须一动不动")
+	}
+	// 连续 3 轮达标 ⇒ ready_to_promote；第 1、2 轮不许提前报
+	if st.ReadyToPromote {
+		t.Fatal("第 1 轮就 ready_to_promote＝迟滞没生效（单轮尖峰不算达标）")
+	}
+	feed.applyTicks(hits, 200)
+	feed.applyTicks(hits, 200)
+	st = f.FeedStatsNow()
+	if !st.ReadyToPromote || st.CoverageRounds < 3 {
+		t.Fatalf("连续 3 轮达标后应 ready_to_promote, got %+v", st)
+	}
+}
+
+// TestQuoteFeedStateNilSafeWhenNeverPolled 从没跑过时不能报 ok（"没数据"不许冒充"正常"，
+// 与 §M2 的 -1=未知 同一方向）；状态位可以回 ok，但 Pool/Hits 全 0 必须由消费端判"未启用"。
+func TestQuoteFeedStateNilSafeWhenNeverPolled(t *testing.T) {
+	f, _ := hubBase(t, 10)
+	st := f.FeedStatsNow()
+	if st.Pool != 0 || st.Hits != 0 || st.ConsecutiveFail != 0 {
+		t.Fatalf("从没轮询过却已有读数: %+v", st)
+	}
+	if got := f.QuoteFeedState(); got != "ok" {
+		t.Fatalf("状态位缺省应为 ok（由 present 判「从没跑过」），got %q", got)
 	}
 }

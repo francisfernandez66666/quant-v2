@@ -25,6 +25,7 @@ package data
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math"
 	"sort"
@@ -71,6 +72,7 @@ type QMTFeed struct {
 	volFallback float64
 	volAtomic   atomic.Uint64 // float64 位模式存储，热更换不重开 goroutine
 	loggedFirst atomic.Bool   // 首轮命中只打一条 INFO，之后降为静默
+	observedAt  atomic.Int64  // 观察模式关态读数（feed_observed）的 60s 节流位（与错误日志各自的位点）
 	errorAt     atomic.Int64  // 错误日志节流（unix 秒）
 	failStreak  atomic.Int64  // 连续失败轮次（J1 通道不通的判据输入）
 	stopCh      chan struct{}
@@ -197,13 +199,33 @@ func (f *QMTFeed) pollOnce() {
 	ticks, err := f.src.Quotes(ctx, codes)
 	if err != nil {
 		n := f.failStreak.Add(1)
-		f.logThrottled("qmt_feed: /quotes 拉取失败（第 %d 轮，新浪链继续兜底，不影响行情可用性）: %v", n, err)
-		f.fetcher.NoteFeedFailure(int(n))
+		// 钥匙被撤/无效（401/403）与"网关挂了"必须分形：前者要补凭证、后者要查进程。
+		// 判据走哨兵 errors.Is，不猜状态码字符串（§0925EVE-W3-E 的口径）。
+		authFailed := errors.Is(err, ErrQuoteUnauthorized)
+		if authFailed {
+			f.logThrottled("qmt_feed: /quotes 被鉴权拒绝（第 %d 轮）——**行情主源没在用**，"+
+				"请确认运营账号在册凭证；行情照旧走现行链，不影响交易链路: %v", n, err)
+		} else {
+			f.logThrottled("qmt_feed: /quotes 拉取失败（第 %d 轮，新浪链继续兜底，不影响行情可用性）: %v", n, err)
+		}
+		f.fetcher.NoteFeedFailure(int(n), authFailed)
 		return
 	}
 	f.failStreak.Store(0)
-	if n := f.applyTicks(ticks, len(codes)); n > 0 && !f.loggedFirst.Swap(true) {
-		log.Printf("[qmt_feed] §SUBSCRIPTION-A L1 读数: 命中 %d/%d 只（primary=%v）", n, len(codes), f.isPrimary())
+	n := f.applyTicks(ticks, len(codes))
+	if n > 0 && !f.loggedFirst.Swap(true) {
+		log.Printf("[qmt_feed] §SUBSCRIPTION-A L1 首次命中: %d/%d 只（primary=%v）", n, len(codes), f.isPrimary())
+	}
+	// 观察模式每 60s 打一行 feed_observed：覆盖率、本可以改写多少只、是否已连续达标可开 primary。
+	// 没有这行，"能不能开"就只能靠人翻日志数轮次——那是感觉式上线，正是本批要换掉的。
+	if !f.isPrimary() {
+		st := f.fetcher.FeedStatsNow()
+		if st.Hits > 0 {
+			f.logObservedThrottled("qmt_feed: feed_observed hits=%d/%d coverage=%.1f%% denom_src=%s "+
+				"would_override=%d ready_to_promote=%d rounds=%d（观察模式，未改写任何价格）",
+				st.Hits, st.Denominator, st.CoveragePct, st.DenominatorSource,
+				boolInt(st.WouldOverride), boolInt(st.ReadyToPromote), st.CoverageRounds)
+		}
 	}
 }
 
@@ -362,6 +384,23 @@ func medianRatio(xs []float64) float64 {
 // within 判断 v 是否落在 [target±tol]。
 func within(v, target, tol float64) bool {
 	return v >= target-tol && v <= target+tol
+}
+
+// boolInt 把布尔打成 0/1（日志里用数字，便于 grep 统计，不用 true/false 混着读）。
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// logObservedThrottled 观察模式关态读数的节流出口（60s 一条，与错误日志各自的位点）。
+func (f *QMTFeed) logObservedThrottled(format string, args ...any) {
+	now := time.Now().Unix()
+	prev := f.observedAt.Swap(now)
+	if now-prev >= 60 {
+		log.Printf("[qmt_feed] "+format, args...)
+	}
 }
 
 // logThrottled feed 专属错误日志节流（60s 一条），不复用采集链的 lastStaleWarn。

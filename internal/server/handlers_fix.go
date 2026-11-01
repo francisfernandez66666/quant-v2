@@ -679,6 +679,8 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	// §ENH-5 批E：行情快照来源回显（"QMT-L1"=Level-1 feed 生效；其余为新浪/同花顺等降级链）
 	// 与快照陈旧度——供 nightly/Playwright 断言 feed 链路，纯观察不参与任何判定。
 	quoteSource := ""
+	// quoteFeed §SUBSCRIPTION-A 行情通道状态（nil＝这条通道从没跑过，前端按"未启用"显示）
+	quoteFeed := map[string]interface{}(nil)
 	quoteAgeSec := 0.0
 	breakers := map[string]map[string]any{}
 	if s.dc != nil {
@@ -698,6 +700,27 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 			quoteSource = snap.Source
 		}
 		quoteAgeSec = s.fetcher.Staleness().Seconds()
+		// §SUBSCRIPTION-A（追加裁决 14/15）：行情通道必须有一个**状态位**可读。
+		// 缺陷本体：旧实现里 feed 的成败只剩一条 60s 节流日志 ⇒ "开着但每次 401"与"根本没开"
+		// 在现网看不出区别（静默无效），而运维要区分的是"补钥匙"还是"查网关进程"。
+		// 现在把状态、覆盖率、分母来源与"观察模式本可以改写多少只/是否已连续达标可开主源"
+		// 一次性摆出来：开不开 primary 由读数决定，不由感觉决定。
+		if st := s.fetcher.FeedStatsNow(); st.Pool > 0 || st.Hits > 0 || st.ConsecutiveFail > 0 {
+			quoteFeed = map[string]interface{}{
+				"state":              s.fetcher.QuoteFeedState(), // ok / auth_failed / degraded:J1|J2|J3
+				"hits":               st.Hits,
+				"denominator":        st.Denominator,
+				"pool":               st.Pool,
+				"coverage_pct":       st.CoveragePct,
+				"denominator_source": st.DenominatorSource, // tradable / pool（pool＝分母不可信，如实标）
+				"refreshed_global":   st.RefreshedGlobal,
+				"would_override":     st.WouldOverride,  // 观察模式下：本轮本可以改写价格
+				"ready_to_promote":   st.ReadyToPromote, // 连续达标 ≥3 轮 ⇒ 可以考虑开 primary
+				"coverage_rounds":    st.CoverageRounds,
+				"consecutive_fail":   st.ConsecutiveFail,
+				"missing_price_pct":  st.MissingPricePct,
+			}
+		}
 	}
 	now := time.Now()
 	// 交易时段判定统一走 data 包（含周末/休市）：9:15 集合竞价开盘，15:30 收盘后进入静默释放期。
@@ -708,14 +731,17 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	inTrade := cur == data.SessionMorningTrade || cur == data.SessionAfternoonTrade
 	active := data.IsFullTradingHours(now)
 	writeJSON(w, 200, map[string]interface{}{
-		"uptime":               uptime,
-		"session":              session,
-		"session_label":        cur.String(),
-		"in_trade_time":        inTrade,
-		"active":               active,
-		"signal_count":         finalCount,
-		"quote_source":         quoteSource,
-		"quote_age_sec":        quoteAgeSec,
+		"uptime":        uptime,
+		"session":       session,
+		"session_label": cur.String(),
+		"in_trade_time": inTrade,
+		"active":        active,
+		"signal_count":  finalCount,
+		"quote_source":  quoteSource,
+		"quote_age_sec": quoteAgeSec,
+		// §SUBSCRIPTION-A 行情通道状态；nil=这条通道从没跑过（feed 未启用），前端按"未启用"显示，
+		// 不许把 nil 折成 ok（同 §M2 的 -1=未知 取向）。
+		"quote_feed":           quoteFeed,
 		"data_source_breakers": breakers,
 		// §A7（20260918 审计批）：下发后端二进制 git 指纹。部署脚本对后端与前端 dist 用同一
 		// checkout 构建（deploy_seoul.sh LDFLAGS 同源），故该值即"服务端配套前端版本"；

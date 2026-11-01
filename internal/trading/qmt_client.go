@@ -499,6 +499,12 @@ func (c *QMTClient) Quotes(ctx context.Context, codes []string) (map[string]data
 	}
 	path := "/quotes?codes=" + strings.Join(suffixed, ",")
 	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		// 401/403 包成 data.ErrQuoteUnauthorized：调用方（行情 feed）要能区分"钥匙被撤"与
+		// "网关挂了"，两者的处置动作完全不同（补凭证 vs 查进程），而 gatewayHTTPError 是本包
+		// 未导出类型、data 侧也 import 不了 trading（成环），所以哨兵在这里打。
+		if gerr := (*gatewayHTTPError)(nil); errors.As(err, &gerr) && (gerr.Status == http.StatusUnauthorized || gerr.Status == http.StatusForbidden) {
+			return nil, fmt.Errorf("%w: HTTP %d", data.ErrQuoteUnauthorized, gerr.Status)
+		}
 		return nil, err
 	}
 	ticks := make(map[string]data.QMTTick, len(out.Ticks))
