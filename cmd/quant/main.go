@@ -312,8 +312,14 @@ func run() int {
 	// §F-4（20260917 缺陷修复批）装配逻辑收敛到 paper.ConfigFromRules（零值归一口径不变），
 	// 与 POST /api/paper/config 热更新共用同一构建器，消灭"只有重启才生效"的独一份内联。
 	// §DYN-SIZE-v3：同时把操作员账号的 sizing 口径（legacy/dynamic）注入模拟盘引擎。
+	// §F-4（2026-11-01）：再把操作员账号的 risk_gate 交给同一个构建器——单笔金额绝对帽在
+	// 纸面与实盘必须是同一个阈值，否则同一笔单一个成交一个被拒（两本账连持仓都对不上）。
 	paperSizing, _ := cfgMgr.GetSizingConfigFor(authMgr.AdminID())
-	paperEngine := paper.New(paper.ConfigFromRules(paperCfg, paperSizing), filepath.Join(dataDir, "paper.json"))
+	paperGate := config.RiskGateConfig{}
+	if q := cfgMgr.GetQMTConfigFor(authMgr.AdminID()); q != nil {
+		paperGate = q.RiskGate
+	}
+	paperEngine := paper.New(paper.ConfigFromRules(paperCfg, paperGate, paperSizing), filepath.Join(dataDir, "paper.json"))
 	srv.SetPaper(paperEngine)
 	if paperEngine.Enabled() {
 		log.Printf("[paper] 模拟盘已启用: 每票%.0f元 上限%d仓 初始%.0f元",

@@ -87,6 +87,18 @@ type Config struct {
 	// cap reuses SetSectorExposure.
 	SingleStockCapPct float64 `json:"single_stock_cap_pct,omitempty"`
 
+	// MaxOrderAmount §F-4（2026-11-01）单笔委托金额绝对帽（元，0=关）：与实盘
+	// risk.checkMaxOrderAmount 同阈值、同语义——本单成交额（qty×成交价，含滑点上浮后）超帽即拒。
+	// 值由 paper.ConfigFromRules 从账号的 qmt.risk_gate.max_order_amount 装配，纸面不另设一套阈值。
+	//
+	// 为什么纸面也必须吃这道帽：纸面账本的意义是"实盘能做成什么样"。实盘这道帽是硬拒（胖手误的
+	// 最后防线），若纸面不拦，同一笔 100 万的单在纸面成交、在实盘被拒，两本账从此一个持仓一个没有——
+	// 这比"金额差一点"更难解释。故这里选**拒单**而不是减额（减额同样是分歧：纸面有仓、实盘没有）。
+	// English: §F-4 — the absolute per-order notional cap, same threshold and semantics as the live
+	// risk gate (reject, not shrink), fed from the account's qmt.risk_gate.max_order_amount. A paper
+	// book that fills what live would refuse stops being evidence about live.
+	MaxOrderAmount float64 `json:"max_order_amount,omitempty"`
+
 	// §SHORT-3 纸面融券做空（模拟盘做空侧，决策④）：做空战法信号 → 融券卖出开仓（负持仓），
 	// 下跌买回平仓获利、上涨触发做空止损；独立做空资金池 shortCash，与做多池完全隔离，
 	// 净值并入总账户。ShortCapital=0 即整条做空侧关闭（默认，影子期安全）。
@@ -1710,9 +1722,13 @@ func (e *Engine) totalPaperEquityLocked() float64 {
 
 // dynamicPaperQtyLocked 模拟盘动态预算：池权益 × 缩放，再受全盘 35% 行业/单票额度与池现金约束。
 // 返回 (股数, 跳过原因)；跳过原因为空表示成功。调用方须持 e.mu。
+//
+// maxQty §F-4（2026-11-01）：手动委托带显式股数时传进来，作为**上限**（0=不设）。
+// 之前 dynamic 分支把显式股数整个丢掉：用户点"买入 100 股"，引擎按池权益 35% 算成 3500 股，
+// 页面显示与实际成交差几十倍，而且没有任何提示。现在显式股数只压不抬，理由见 ordbudget.MaxQty。
 // English: paper dynamic budget — pool equity × scale, capped by whole-book 35% industry/stock
-// rooms and pool cash. Caller must hold e.mu.
-func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale float64) (int, *BudgetError) {
+// rooms and pool cash. maxQty carries a manual order's explicit share count as an upper bound.
+func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale float64, maxQty int) (int, *BudgetError) {
 	base := e.poolEquityLocked(poolKey)
 	capEq := e.totalPaperEquityLocked()
 	if base <= 0 || capEq <= 0 || price <= 0 {
@@ -1821,6 +1837,10 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 		FeeBufferPct:      0,
 		TargetRoom:        room,
 		TargetRoomSet:     roomSet,
+		// §F-4：手动委托的显式股数是意图上限，只压不抬（0=不设上限，自动通道走这条路）。
+		MaxQty: maxQty,
+		// §F-4：单笔成交额绝对帽在预算层判——否则决策快照会先记一笔 placed、随后被 fill 层拒掉。
+		MaxNotional: e.cfg.MaxOrderAmount,
 	})
 	if res.SkipReason != "" {
 		e.emitDecisionLocked(poolKey, code, price, perTradePct, base, cash, targetRatio, curStrat, room,
@@ -1977,12 +1997,52 @@ func (e *Engine) PositionPoolAndMark(code string) (poolKey string, price float64
 func (e *Engine) StrategicBuyRoom(poolKey, code string, price float64) (int, string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	q, be := e.dynamicPaperQtyLocked(poolKey, code, price, 1.0)
+	q, be := e.dynamicPaperQtyLocked(poolKey, code, price, 1.0, 0)
 	if be != nil {
 		// §F-4：调用方只要原因串，结构化信息在此收窄（本函数签名保持 (int, string) 不变）。
 		return q, be.Reason
 	}
 	return q, ""
+}
+
+// maxOrderAmountErrLocked §F-4（2026-11-01）单笔委托金额绝对帽：与实盘
+// risk.checkMaxOrderAmount 同阈值、同语义（超帽即拒），阈值 ≤0 视为未启用（放行一切）。
+//
+// 位置很关键：必须在**滑点上浮之后、扣款之前**调用。滑点前判，会让"价格刚好卡在帽下"的单
+// 在滑点后实际超帽成交（纸面比实盘多成交一笔）；扣款后判则已经改过池现金与持仓，拒单只能
+// 留下一本已经被污染的账。
+//
+// 为什么是拒单而不是减额：纸面账本的意义是"实盘能做成什么样"。实盘这道帽是硬拒，纸面若减额，
+// 同一笔单在纸面有仓、在实盘被拒——两个账本连"有没有这个持仓"都不一致，比金额差更难解释。
+// 纸面其余预算帽（行业/单票/目标/簇）之所以减额，是因为它们在实盘侧也是预算层减额；
+// 只有这道是实盘闸门层的硬拒，口径必须跟着它。
+// English: the absolute per-order notional cap — same threshold and semantics as the live risk
+// gate (reject, not shrink). Runs after the slippage uplift and before any cash/position mutation,
+// so a rejection can never leave a half-written book.
+func (e *Engine) maxOrderAmountErrLocked(qty int, price, cash float64) error {
+	cap := e.cfg.MaxOrderAmount
+	if cap <= 0 || qty <= 0 || price <= 0 {
+		return nil
+	}
+	amt := float64(qty) * price
+	if amt <= cap {
+		return nil
+	}
+	// 帽内最多能买多少股一并算出来：只报"超限 120000 > 帽 20000"等于让用户自己试错，
+	// 而"帽内最多 1800 股"是可执行的下一步（§F-4 的可执行错误口径）。
+	maxQty := int(cap/price/100) * 100
+	log.Printf("[paper] §F-4 单笔金额绝对帽拒绝 %d股×%.2f=%.0f > 帽 %.0f（帽内最多 %d 股）",
+		qty, price, amt, cap, maxQty)
+	return &BudgetError{
+		Reason: fmt.Sprintf("成交额 %.2f 元 > 绝对帽 %.2f 元（%d股 × %.2f元；帽内最多 %d 股）",
+			amt, cap, qty, price, maxQty),
+		CappedBy:   "max_order_amount",
+		Budget:     cap,
+		OneLotCost: price * 100,
+		Price:      price,
+		Cash:       cash,
+		Prefix:     "单笔金额超限",
+	}
 }
 
 // fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
@@ -2023,10 +2083,16 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 			return fmt.Errorf("再入场冷却中(%.0f/%.0f分钟)", elapsed, float64(e.cfg.ReentryCooldownMin))
 		}
 	}
-	// §DYN-SIZE-v3：dynamic 模式忽略显式股数与固定金额，统一走池权益×缩放；legacy 保持旧路径。
+	// §DYN-SIZE-v3：dynamic 模式忽略固定金额，统一走池权益×缩放；legacy 保持旧路径。
+	// §F-4（2026-11-01）：**显式股数不再是"忽略"而是"上限"**——手动通道把它传进预算层参与取小
+	// （只压不抬），自动通道传 0。此前 dynamic 下整段丢掉，100 股会被放大成池权益 35% 那么多股。
 	explicitQty := qty > 0 && !e.dynamicBudgetOn()
 	if e.dynamicBudgetOn() {
-		q, berr := e.dynamicPaperQtyLocked(poolKey, code, price, sizeScale)
+		maxQty := 0
+		if manual && qty > 0 {
+			maxQty = qty
+		}
+		q, berr := e.dynamicPaperQtyLocked(poolKey, code, price, sizeScale, maxQty)
 		if q <= 0 {
 			// §F-4：把结构化拒绝原样往上抛（不再包成一句话），由 server 展开成 {error, detail}。
 			if berr == nil {
@@ -2055,6 +2121,12 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	// §R0.5 滑点模型：SlippageBps > 0 时买入价上浮；0 = 不启用（兼容既有测试/用户）
 	if e.cfg.SlippageBps > 0 {
 		price = price * (1 + e.cfg.SlippageBps/10000.0)
+	}
+
+	// §F-4 单笔金额绝对帽：必须在滑点上浮之后、扣款之前判（见 maxOrderAmountErrLocked 的注释）。
+	// 自动通道同样过这道帽——实盘闸门对自动单也是双向硬拒（§AUDIT-PM 2026-09-15 定位）。
+	if err := e.maxOrderAmountErrLocked(qty, price, e.pools[poolKey]); err != nil {
+		return err
 	}
 
 	cost := float64(qty) * price
@@ -2214,7 +2286,7 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 		return errNoQuote
 	}
 	if held {
-		q, berr := e.dynamicPaperQtyLocked(p.StrategyType, code, price, 1.0)
+		q, berr := e.dynamicPaperQtyLocked(p.StrategyType, code, price, 1.0, 0)
 		if q <= 0 {
 			// §F-4：结构化拒绝原样上抛；落库原因用 Error()（已含"动态仓位:"前缀与差额说明）。
 			if berr == nil {
@@ -2295,6 +2367,22 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// §F-4（2026-11-01）修：价格解析必须提到"已持仓"分支**之前**。
+	// 旧顺序是先 addToPositionLocked(p, ..., price=0, ...) 再回退实时价 ⇒ 手输价模式（price=0）
+	// 下的手动加仓按 **0 元成本**入账：持仓股数加了、成本没加，均价被凭空稀释（实测 200 股@10
+	// 加 300 股后均价变 4.00），净值曲线与盈亏全部失真，且没有任何报错。
+	// English: price resolution moved before the held-position branch — a typed-price add-on
+	// (price=0) used to be booked at zero cost, diluting the average price with no error at all.
+	if qty <= 0 {
+		return errLotTooSmall
+	}
+	if price <= 0 {
+		if q, ok := quotes[code]; ok && q != nil && q.Price > 0 {
+			price = q.Price
+		} else {
+			return errNoQuote
+		}
+	}
 	// 已持有则加仓；满仓/手数非法/无价时拒绝，价格缺省取 quote 实时价。
 	if p, held := e.positions[code]; held {
 		if err := e.addToPositionLocked(p, code, name, strategy, signalPrice, price, qty, "手动模拟加仓"); err != nil {
@@ -2305,16 +2393,6 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	}
 	if !e.dynamicBudgetOn() && e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 		return errMaxPos
-	}
-	if qty <= 0 {
-		return errLotTooSmall
-	}
-	if price <= 0 {
-		if q, ok := quotes[code]; ok && q != nil && q.Price > 0 {
-			price = q.Price
-		} else {
-			return errNoQuote
-		}
 	}
 	if _, ok := e.pools[poolKey]; !ok {
 		// §健壮性：未知池 key 显式报错（同 BuyInPool），不静默回退其他池。
@@ -2360,6 +2438,11 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	// 同一票加仓比首买"便宜"，成本口径失真。
 	if e.cfg.SlippageBps > 0 {
 		price = price * (1 + e.cfg.SlippageBps/10000.0)
+	}
+	// §F-4 单笔金额绝对帽：加仓与首买同闸。不加这一条，帽可以靠"先买一笔、再加一笔"绕过——
+	// 实盘闸门是逐笔判的，加仓同样是独立一笔委托。
+	if err := e.maxOrderAmountErrLocked(qty, price, e.pools[p.StrategyType]); err != nil {
+		return err
 	}
 	cost := float64(qty) * price
 	fee := e.buyFeeLocked(cost)

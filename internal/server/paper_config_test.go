@@ -25,7 +25,7 @@ func newPaperConfigServer(t *testing.T) *Server {
 	//（rename ./...tmp 不存在），端点却因吞错照回 200＝假绿；错误链接通后该形态当场红。
 	s := &Server{cfg: config.NewManager(filepath.Join(t.TempDir(), "config.json"))}
 	// paper.json 放进 t.TempDir()：落盘路径随测试结束自动清理，用例间互不污染
-	s.SetPaper(paper.New(paper.ConfigFromRules(s.cfg.Get().Paper), filepath.Join(t.TempDir(), "paper.json"))) // §0925EVE-D1：字段转私有，读取走加锁访问器
+	s.SetPaper(paper.New(paper.ConfigFromRules(s.cfg.Get().Paper, config.RiskGateConfig{}), filepath.Join(t.TempDir(), "paper.json"))) // §0925EVE-D1：字段转私有，读取走加锁访问器
 	return s
 }
 
@@ -42,6 +42,28 @@ func getPaperConfig(t *testing.T, s *Server) paperConfigView {
 		t.Fatal(err)
 	}
 	return v
+}
+
+// TestPaperRiskGatePerAccount §F-4（2026-11-01）：纸面装配取的是该账号实盘控制器面对的同一道闸。
+//
+// 解析链是 GetQMTConfigFor（自身 → 运营账号 → 全局），**继承是有意的**：该账号的实盘委托就是
+// 按这条链取到的闸门判的，纸面必须同源。反证靶心是"改成只认自身、否则零值"——那样成员账号的
+// 纸面会在实盘有帽时裸奔，而纸面页只显示 enabled/fixed_amount，从读数上看不出来。
+func TestPaperRiskGatePerAccount(t *testing.T) {
+	s := newPaperConfigServer(t)
+	if err := s.cfg.SetQMTConfigFor("u_gate", &config.QMTConfig{
+		RiskGate: config.RiskGateConfig{MaxOrderAmount: 30000},
+	}); err != nil {
+		t.Fatalf("设置账号 QMT 配置: %v", err)
+	}
+	// 该账号（未自配时按解析链继承）读到的帽必须原样进纸面装配。
+	if got := s.paperRiskGate("u_gate").MaxOrderAmount; got != 30000 {
+		t.Fatalf("paperRiskGate 应透出解析链上的帽 30000，got %v", got)
+	}
+	// 空身份不参与装配（内部调用点），必须是零值而不是随便拿一份。
+	if got := s.paperRiskGate("").MaxOrderAmount; got != 0 {
+		t.Fatalf("空身份应为零值，got %v", got)
+	}
 }
 
 // TestPaperConfigGet 验证 GET 默认形状：未做过任何 POST 时，总开关与引擎侧开关都应回显未启用；

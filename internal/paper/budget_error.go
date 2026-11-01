@@ -38,6 +38,13 @@ type BudgetError struct {
 	Cash        float64 `json:"cash"`
 	Room        float64 `json:"room"`
 	PerTradePct float64 `json:"per_trade_pct"`
+	// Prefix 人类可读文案的前缀；空＝"动态仓位"（历史口径）。
+	// §F-4（2026-11-01）：单笔金额绝对帽不是动态预算裁出来的（它是 risk_gate 的绝对阈值），
+	// 套上"动态仓位:"会把排障引到错的地方——用户会去调动态仓位开关，而该调的是绝对帽。
+	// 默认空值保持既有前缀不变，消费点按 "动态仓位:" 分流的历史行为不受影响。
+	// English: overridable human prefix; empty keeps the historical "动态仓位" so existing
+	// consumers keep working, while a non-budget cap can label itself honestly.
+	Prefix string `json:"-"`
 }
 
 // Error 保持人类可读，且**保留原来的前缀**——既有前端/日志按 "动态仓位:" 分流，不能悄悄改口径。
@@ -46,16 +53,20 @@ func (e *BudgetError) Error() string {
 	if reason == "" {
 		reason = "动态预算不足"
 	}
+	prefix := e.Prefix
+	if prefix == "" {
+		prefix = "动态仓位"
+	}
 	// 带上"差多少"：只报"额度不足1手"等于让用户自己猜该改哪个参数。
 	if e.OneLotCost > 0 && e.Budget < e.OneLotCost {
-		return fmt.Sprintf("动态仓位: %s（单笔额度 %.2f 元 < 一手成本 %.2f 元）", reason, e.Budget, e.OneLotCost)
+		return fmt.Sprintf("%s: %s（单笔额度 %.2f 元 < 一手成本 %.2f 元）", prefix, reason, e.Budget, e.OneLotCost)
 	}
-	return fmt.Sprintf("动态仓位: %s", reason)
+	return fmt.Sprintf("%s: %s", prefix, reason)
 }
 
 // newBudgetError 从 ordbudget.Result 组装结构化原因（不重算任何数）。
 func newBudgetError(res ordbudget.Result, price, perTradePct, cash, room float64) *BudgetError {
-	return &BudgetError{
+	be := &BudgetError{
 		Reason:      res.SkipReason,
 		CappedBy:    res.CappedBy,
 		Budget:      res.Budget,
@@ -65,4 +76,13 @@ func newBudgetError(res ordbudget.Result, price, perTradePct, cash, room float64
 		Room:        room,
 		PerTradePct: perTradePct,
 	}
+	// §F-4：绝对帽不是动态预算裁出来的（它是 risk_gate 的绝对阈值），套上"动态仓位:"会把排障
+	// 引到错的方向——用户会去调动态仓位开关，而该调的是单笔绝对帽。前缀在这里统一改写，
+	// 与 fill 层的 maxOrderAmountErrLocked 用同一句话，两条路径的文案不会漂移。
+	// English: the notional cap is not a dynamic-budget decision, so it relabels its own prefix —
+	// same sentence as the fill-layer path, so the two reject paths cannot drift apart.
+	if res.CappedBy == "max_order_amount" {
+		be.Prefix = "单笔金额超限"
+	}
+	return be
 }

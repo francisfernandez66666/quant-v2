@@ -376,8 +376,8 @@ type paperAdjustReq struct {
 }
 
 // handlePaperAdjust 处理 POST /api/paper/adjust：显式 qty/price 的纸面持仓修复。
-// dynamic 模式下普通 /api/paper/buy 会忽略 qty，无法用于“000683 100→200”这类一次性补回；
-// 本端点用 BuyExInPool 直接按给定 qty/price 加仓到已存在持仓，并落审计。仅 owner 使用。
+// 走独立端点是**审计与一次性**的需要（confirm 口令 + opslog paper_adjust），不是买入口径问题：
+// §F-4 起 /api/paper/buy 已尊重显式股数（只压不抬），但常规买入不留"这是历史错账补回"的痕迹。
 func (s *Server) handlePaperAdjust(w http.ResponseWriter, r *http.Request) {
 	var req paperAdjustReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

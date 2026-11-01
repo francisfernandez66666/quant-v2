@@ -146,10 +146,12 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[paper] 账号 %s 模拟盘配置已保存 %s", uid, trace.detail())
 	// 热同步：以落库后的账号规则重建引擎配置（装配口径与 main.go 完全一致）。
 	// ConfigFromRules 会把 AutoSell/ShortEnabled 的 nil 归一为默认值，得到引擎可直接消费的 Config。
+	// §F-4（2026-11-01）：risk_gate 一并交给构建器——热更走的是同一份 Config，帽必须跟着一起来，
+	// 否则"改一次模拟盘配置"会把单笔金额绝对帽悄悄清成 0（热更即失效，从读数上看不出来）。
 	pc := paper.Config{}
 	if rules := s.cfg.GetRulesFor(uid); rules != nil {
 		sc, _ := s.cfg.GetSizingConfigFor(uid)
-		pc = paper.ConfigFromRules(rules.Paper, sc)
+		pc = paper.ConfigFromRules(rules.Paper, s.paperRiskGate(uid), sc)
 	}
 	// 热同步第①层：全局模板引擎（旧单引擎路径）立即换用新配置，不动持仓/账本数据。
 	if s.paperEngine() != nil {
@@ -194,7 +196,7 @@ func (s *Server) syncPaperSizing(target string) {
 		return
 	}
 	sc, _ := s.cfg.GetSizingConfigFor(target)
-	pc := paper.ConfigFromRules(rules.Paper, sc)
+	pc := paper.ConfigFromRules(rules.Paper, s.paperRiskGate(target), sc)
 	if s.paperEngine() != nil {
 		s.paperEngine().UpdateConfig(pc)
 	}
@@ -203,4 +205,23 @@ func (s *Server) syncPaperSizing(target string) {
 	}
 	log.Printf("[paper] §DYN-SIZE-v3 模拟盘预算口径已热更新: budget_mode=%s sizing_enabled=%v shadow=%v",
 		pc.BudgetMode, pc.SizingEnabled, pc.SizingShadow)
+}
+
+// paperRiskGate §F-4（2026-11-01）：取某账号的 qmt.risk_gate，供纸面装配使用。
+//
+// 解析链刻意与实盘控制器**完全一致**（GetQMTConfigFor：账号自身 → 运营账号 → 全局 rules.qmt）。
+// 这不是"顺手复用"，而是口径要求：该账号的实盘委托面对的正是这条链解析出来的闸门。若改成
+// "只认账号自身、否则零值"，成员账号的纸面就会在实盘有帽的情况下裸奔——两本账的单笔上限不同，
+// 而纸面页只显示 enabled/fixed_amount，从任何读数上都看不出来。
+// English: resolves through the same chain as the live controller (own → operator → global),
+// because that is the gate this account's live orders actually face; a zero-value fallback would
+// let paper run uncapped while live is capped, invisibly.
+func (s *Server) paperRiskGate(uid string) config.RiskGateConfig {
+	if s.cfg == nil || uid == "" {
+		return config.RiskGateConfig{}
+	}
+	if q := s.cfg.GetQMTConfigFor(uid); q != nil {
+		return q.RiskGate
+	}
+	return config.RiskGateConfig{}
 }

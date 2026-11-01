@@ -17805,4 +17805,476 @@ go test ./internal/trading -run TestControllerCashScope -count=1 > /tmp/gate144_
 [ "$B144_FAILED" = "0" ] || exit 1
 echo "ok - §144 §MULTI-ADMIN 锁通过（五权限/迁移、三写面身份、P1 资金口径、严格路由矩阵、前端门控、行为腿；累计判定点 ${CNT144}）"
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# §145 §F4-MAXORDER-ASSEMBLY（2026-11-01）：单笔金额绝对帽进 paper.Config，且只从 risk_gate 来
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 145 §F4-MAXORDER 装配（Config 字段 / 单一构建器取值 / 负值归零 / 出厂关）..."
+B145_FAILED=0
+fail145() {
+	echo "--- FAIL: §145 $*"
+	FAIL=1
+	B145_FAILED=1
+}
+CNT145=0
+
+# —— ① Config 有字段，且默认零值 = 闸关 ——
+CNT145=$((CNT145 + 1))
+grep -qF 'MaxOrderAmount float64 `json:"max_order_amount,omitempty"`' internal/paper/paper.go \
+	|| fail145 "paper.Config 缺 MaxOrderAmount 字段"
+CNT145=$((CNT145 + 1))
+# 出厂默认必须是 0（闸关）：纸面不该凭空多出一道帽，配置从 risk_gate 来。
+if awk '/^func DefaultConfig\(\) Config \{/,/^\}/' internal/paper/paper.go | grep -qF 'MaxOrderAmount'; then
+	fail145 "DefaultConfig 里出现了 MaxOrderAmount（出厂帽会掩盖 risk_gate 的真实配置）"
+fi
+
+# —— ② 单一构建器：签名收整份 RiskGate，取值带负值归零 ——
+CNT145=$((CNT145 + 1))
+grep -qF 'func ConfigFromRules(rp config.PaperConfig, rg config.RiskGateConfig, sizing ...config.SizingConfig) Config {' internal/paper/config_rules.go \
+	|| fail145 "ConfigFromRules 未接收 risk_gate（纸面拿不到实盘同一阈值）"
+CNT145=$((CNT145 + 1))
+grep -qF 'MaxOrderAmount: max0(rg.MaxOrderAmount),' internal/paper/config_rules.go \
+	|| fail145 "ConfigFromRules 没有从 RiskGate.MaxOrderAmount 取值"
+CNT145=$((CNT145 + 1))
+grep -qF 'func max0(v float64) float64 {' internal/paper/config_rules.go \
+	|| fail145 "缺负值归零 helper（-1 会被当成极小的帽，把所有单子拒光）"
+
+# —— ③ 反证：仓里不许再有"两参"的旧调用（漏改一处＝那处永远拿不到帽）——
+CNT145=$((CNT145 + 1))
+LEGACY145="$(grep -rnE 'ConfigFromRules\([^,()]+\)' --include=*.go internal cmd 2>/dev/null || true)"
+if [ -n "$LEGACY145" ]; then
+	echo "$LEGACY145" | head -5
+	fail145 "仍有只传 rules 的旧调用点（该处装配出来的 Config 帽恒 0）"
+fi
+
+[ "$B145_FAILED" = "0" ] || exit 1
+echo "ok - §145 §F4-MAXORDER 装配锁通过（字段/构建器取值/负值归零/旧调用清零，累计判定点 ${CNT145}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §146 §F4-ASSEMBLY-POINTS（2026-11-01）：四个装配点全部把账号 risk_gate 交给同一个构建器
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 146 §F4 装配点（main / registry 懒加载 / paper 热更 / sizing 热更）..."
+B146_FAILED=0
+fail146() {
+	echo "--- FAIL: §146 $*"
+	FAIL=1
+	B146_FAILED=1
+}
+CNT146=0
+
+# —— ① main.go：操作员账号的闸门进模板引擎 ——
+CNT146=$((CNT146 + 1))
+grep -qF 'paperGate := config.RiskGateConfig{}' cmd/quant/main.go || fail146 "main.go 没有取操作员 risk_gate"
+grep -qF 'paper.ConfigFromRules(paperCfg, paperGate, paperSizing)' cmd/quant/main.go \
+	|| fail146 "main.go 仍按两参装配（模板引擎的帽恒 0）"
+grep -qF 'cfgMgr.GetQMTConfigFor(authMgr.AdminID())' cmd/quant/main.go \
+	|| fail146 "main.go 取的不是操作员账号的 QMT 配置"
+
+# —— ② registry.GetPaper：读闸门必须在 paper.New 之前 ——
+CNT146=$((CNT146 + 1))
+grep -qF 'cfg = paper.ConfigFromRules(rules.Paper, rg, sc)' internal/engine/registry.go \
+	|| fail146 "registry 懒加载没有把 rg 交给构建器"
+grep -qF 'cfg.MaxOrderAmount = rg.MaxOrderAmount' internal/engine/registry.go \
+	|| fail146 "模板回退分支没有同步帽（没配过模拟盘的账号会带着 0 帽跑）"
+CNT146=$((CNT146 + 1))
+# 顺序锁：GetQMTConfigFor 的行号必须小于同一函数里 paper.New 的行号。
+# 反了就是"先建引擎、事后补配置"——那正是热更会漏掉帽的形态。
+LN146_Q=$(awk '/^func \(r \*Registry\) GetPaper\(/{f=1} f&&/GetQMTConfigFor\(userID\)/{print NR; exit}' internal/engine/registry.go)
+LN146_N=$(awk '/^func \(r \*Registry\) GetPaper\(/{f=1} f&&/pe := paper\.New\(/{print NR; exit}' internal/engine/registry.go)
+if [ -z "$LN146_Q" ] || [ -z "$LN146_N" ] || [ "$LN146_Q" -ge "$LN146_N" ]; then
+	fail146 "GetPaper 里 risk_gate 的读取不在 paper.New 之前（Q=${LN146_Q:-无} N=${LN146_N:-无}）"
+fi
+
+# —— ③ server 侧两处热更 + 解析链 helper ——
+CNT146=$((CNT146 + 1))
+grep -qF 'func (s *Server) paperRiskGate(uid string) config.RiskGateConfig {' internal/server/paper_config.go \
+	|| fail146 "缺 paperRiskGate（热更没有统一取值口）"
+grep -qF 'pc = paper.ConfigFromRules(rules.Paper, s.paperRiskGate(uid), sc)' internal/server/paper_config.go \
+	|| fail146 "POST /api/paper/config 热更没有带帽（改一次配置就把帽清成 0）"
+grep -qF 'pc := paper.ConfigFromRules(rules.Paper, s.paperRiskGate(target), sc)' internal/server/paper_config.go \
+	|| fail146 "sizing 热更没有带帽"
+CNT146=$((CNT146 + 1))
+# 解析链必须与实盘控制器同源（GetQMTConfigFor），不能自己造一条"只认自有、否则零值"的链。
+grep -qF 'if q := s.cfg.GetQMTConfigFor(uid); q != nil {' internal/server/paper_config.go \
+	|| fail146 "paperRiskGate 没走 GetQMTConfigFor（与实盘控制器不同源）"
+
+[ "$B146_FAILED" = "0" ] || exit 1
+echo "ok - §146 §F4 装配点锁通过（main/registry/热更两处/解析链同源，累计判定点 ${CNT146}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §147 §F4-MANUAL-QTY（2026-11-01）：手动显式股数＝意图上限（只压不抬）
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 147 §F4 手动股数上限（MaxQty 语义 / dynamic 分支传参 / capped_by=manual）..."
+B147_FAILED=0
+fail147() {
+	echo "--- FAIL: §147 $*"
+	FAIL=1
+	B147_FAILED=1
+}
+CNT147=0
+
+# —— ① 预算层的"只压不抬" ——
+CNT147=$((CNT147 + 1))
+grep -qF 'MaxQty int' internal/ordbudget/ordbudget.go || fail147 "ordbudget 缺 MaxQty 输入"
+grep -qF 'if in.MaxQty > 0 && qty > in.MaxQty {' internal/ordbudget/ordbudget.go \
+	|| fail147 "MaxQty 没有参与取小（显式股数会顶开额度）"
+grep -qF 'capped = "manual"' internal/ordbudget/ordbudget.go \
+	|| fail147 "显式股数生效时没有标记 capped_by=manual（面板分不清是谁在约束）"
+grep -qF '显式股数不足1手' internal/ordbudget/ordbudget.go \
+	|| fail147 "显式股数不足 1 手没有独立跳过原因（会被四舍五入成 1 手）"
+
+# —— ② dynamic 分支必须把手动股数传下去（旧行为是整段丢掉）——
+CNT147=$((CNT147 + 1))
+grep -qF 'func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale float64, maxQty int) (int, *BudgetError) {' internal/paper/paper.go \
+	|| fail147 "dynamicPaperQtyLocked 没有 maxQty 入参"
+grep -qF 'if manual && qty > 0 {' internal/paper/paper.go \
+	|| fail147 "fillLocked 没有区分手动/自动通道"
+grep -qF 'maxQty = qty' internal/paper/paper.go \
+	|| fail147 "fillLocked 没把手动股数当上限传下去（100 股会被放大成额度那么多）"
+grep -qF 'MaxQty: maxQty,' internal/paper/paper.go \
+	|| fail147 "预算输入没接 MaxQty"
+
+# —— ③ 其余三个调用点显式传 0（自动/战略/加仓不许被误当成手动）——
+CNT147=$((CNT147 + 1))
+CNT147_ZERO="$(grep -cE 'dynamicPaperQtyLocked\([^)]*, 0\)' internal/paper/paper.go || true)"
+if [ "${CNT147_ZERO:-0}" -lt 2 ]; then
+	fail147 "自动/战略/加仓调用点没有显式传 maxQty=0（实得 ${CNT147_ZERO:-0} 处）"
+fi
+
+[ "$B147_FAILED" = "0" ] || exit 1
+echo "ok - §147 §F4 手动股数上限锁通过（MaxQty 语义/传参/三处自动通道归零，累计判定点 ${CNT147}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §148 §F4-MAXORDER-REJECT（2026-11-01）：单笔金额绝对帽＝拒单，预算层与 fill 层双闸
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 148 §F4 绝对帽拒单（预算层 MaxNotional / fill 层新开与加仓 / 扣款前判定）..."
+B148_FAILED=0
+fail148() {
+	echo "--- FAIL: §148 $*"
+	FAIL=1
+	B148_FAILED=1
+}
+CNT148=0
+
+# —— ① 预算层：dynamic 分支的决策快照必须能看到"被帽拒"（否则先记 placed 再拒＝假读数）——
+CNT148=$((CNT148 + 1))
+grep -qF 'MaxNotional float64' internal/ordbudget/ordbudget.go || fail148 "ordbudget 缺 MaxNotional 输入"
+grep -qF 'if in.MaxNotional > 0 {' internal/ordbudget/ordbudget.go || fail148 "预算层没判绝对帽"
+grep -qF 'res.CappedBy = "max_order_amount"' internal/ordbudget/ordbudget.go \
+	|| fail148 "预算层拒单没有标 capped_by=max_order_amount"
+grep -qF 'MaxNotional: e.cfg.MaxOrderAmount,' internal/paper/paper.go \
+	|| fail148 "paper 没把 Config.MaxOrderAmount 交给预算层"
+CNT148=$((CNT148 + 1))
+# 语义锁：预算是"超帽即拒"，不许退化成减额（减额＝纸面有仓、实盘没有）。
+if awk '/if in.MaxNotional > 0 \{/,/^\t\}/' internal/ordbudget/ordbudget.go | grep -qF 'qty = '; then
+	fail148 "绝对帽在预算层被写成减额（实盘闸门是硬拒，两本账会一个持仓一个没有）"
+fi
+
+# —— ② fill 层：新开与加仓两处都要有 ——
+CNT148=$((CNT148 + 1))
+grep -qF 'func (e *Engine) maxOrderAmountErrLocked(qty int, price, cash float64) error {' internal/paper/paper.go \
+	|| fail148 "缺 maxOrderAmountErrLocked"
+grep -qF 'if err := e.maxOrderAmountErrLocked(qty, price, e.pools[poolKey]); err != nil {' internal/paper/paper.go \
+	|| fail148 "fillLocked 没判绝对帽（legacy 自动单与手动新开都漏）"
+grep -qF 'if err := e.maxOrderAmountErrLocked(qty, price, e.pools[p.StrategyType]); err != nil {' internal/paper/paper.go \
+	|| fail148 "加仓没判绝对帽（先买一笔、再加一笔即可绕过）"
+CNT148=$((CNT148 + 1))
+grep -qF 'if cap <= 0 || qty <= 0 || price <= 0 {' internal/paper/paper.go \
+	|| fail148 "帽未配置（0）时没有放行分支（0 会被当成'帽为 0 元'拒光所有单）"
+
+# —— ③ 顺序锁：帽必须在滑点之后、扣款之前 ——
+CNT148=$((CNT148 + 1))
+LN148_CAP=$(awk '/if err := e.maxOrderAmountErrLocked\(qty, price, e.pools\[poolKey\]\)/{print NR; exit}' internal/paper/paper.go)
+LN148_SLIP=$(awk '/§R0.5 滑点模型：SlippageBps > 0 时买入价上浮/{print NR; exit}' internal/paper/paper.go)
+LN148_PAY=$(awk '/e.pools\[poolKey\] = pool - cost - fee/{print NR; exit}' internal/paper/paper.go)
+if [ -z "$LN148_CAP" ] || [ -z "$LN148_SLIP" ] || [ -z "$LN148_PAY" ]; then
+	fail148 "顺序锁取不到行号（CAP=${LN148_CAP:-无} SLIP=${LN148_SLIP:-无} PAY=${LN148_PAY:-无}）"
+elif [ "$LN148_CAP" -le "$LN148_SLIP" ] || [ "$LN148_CAP" -ge "$LN148_PAY" ]; then
+	fail148 "帽的判定点不在「滑点后、扣款前」（CAP=$LN148_CAP SLIP=$LN148_SLIP PAY=$LN148_PAY）"
+fi
+
+[ "$B148_FAILED" = "0" ] || exit 1
+echo "ok - §148 §F4 绝对帽拒单锁通过（预算层 MaxNotional/fill 层两处/0=关/顺序锁，累计判定点 ${CNT148}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §149 §F4-ERR-SHAPE（2026-11-01）：拒绝文案前缀可覆盖，且 error 键不许被换掉
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 149 §F4 拒绝形状（Prefix 覆盖 / detail 展开 / error 键保留）..."
+B149_FAILED=0
+fail149() {
+	echo "--- FAIL: §149 $*"
+	FAIL=1
+	B149_FAILED=1
+}
+CNT149=0
+
+CNT149=$((CNT149 + 1))
+grep -qF 'Prefix string `json:"-"`' internal/paper/budget_error.go || fail149 "BudgetError 缺可覆盖前缀"
+grep -qF 'prefix := e.Prefix' internal/paper/budget_error.go || fail149 "Error() 没读 Prefix"
+grep -qF 'prefix = "动态仓位"' internal/paper/budget_error.go \
+	|| fail149 "空前缀没有回落「动态仓位」（既有前端按该前缀分流会失效）"
+CNT149=$((CNT149 + 1))
+grep -qF 'be.Prefix = "单笔金额超限"' internal/paper/budget_error.go \
+	|| fail149 "预算层拒单没有改写前缀（会套上「动态仓位:」把排障引到动态开关）"
+grep -qF 'Prefix:     "单笔金额超限",' internal/paper/paper.go \
+	|| fail149 "fill 层拒单没有改写前缀（两条路文案会漂移）"
+CNT149=$((CNT149 + 1))
+grep -qF '"error":  err.Error(),' internal/server/paper.go || fail149 "写面没保留 error 键"
+grep -qF '"detail": be,' internal/server/paper.go || fail149 "写面没有 detail 展开"
+grep -qF 'errors.As(err, &be)' internal/server/paper.go || fail149 "写面没按 *BudgetError 分流"
+CNT149=$((CNT149 + 1))
+# 反证：把 error 键换成对象/只回 detail，既有前端当场炸——不许出现这种写法。
+if grep -qE 'writeJSON\(w, http\.StatusBadRequest, map\[string\]interface\{\}\{"detail"' internal/server/paper.go; then
+	fail149 "写面只回 detail 不回 error（既有消费点按 error 分流）"
+fi
+
+[ "$B149_FAILED" = "0" ] || exit 1
+echo "ok - §149 §F4 拒绝形状锁通过（前缀覆盖/error 键保留/detail 展开，累计判定点 ${CNT149}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §150 §F4-TESTS-EXIST（2026-11-01）：F3–F6 与配套回归锁必须在册，旧口径名字必须消失
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 150 §F4 用例在册（F3/F4/F5/F6 + ordbudget + registry + server）..."
+B150_FAILED=0
+fail150() {
+	echo "--- FAIL: §150 $*"
+	FAIL=1
+	B150_FAILED=1
+}
+CNT150=0
+
+CNT150=$((CNT150 + 1))
+grep -qF 'func TestF3ConfigFromRulesTakesMaxOrderAmount' internal/paper/f4_manual_qty_cap_test.go \
+	|| fail150 "缺 F3 装配用例"
+grep -qF 'func TestF4DynamicManualBuyHonoursTypedQty' internal/paper/f4_manual_qty_cap_test.go \
+	|| fail150 "缺 F4 显式股数被尊重用例"
+grep -qF 'func TestF5TypedQtyCappedByDynamicRoom' internal/paper/f4_manual_qty_cap_test.go \
+	|| fail150 "缺 F5 显式股数受帽用例"
+grep -qF 'func TestF6MaxOrderAmountCapRejects' internal/paper/f4_manual_qty_cap_test.go \
+	|| fail150 "缺 F6 绝对帽拒单用例"
+grep -qF 'func TestF6MaxOrderAmountCapAppliesToLegacyAuto' internal/paper/f4_manual_qty_cap_test.go \
+	|| fail150 "缺 F6b legacy 自动通道用例（关掉动态仓位即可绕过帽）"
+CNT150=$((CNT150 + 1))
+grep -qF 'func TestMaxQtyOnlyShrinks' internal/ordbudget/ordbudget_test.go || fail150 "缺 MaxQty 纯函数锁"
+grep -qF 'func TestMaxNotionalRejects' internal/ordbudget/ordbudget_test.go || fail150 "缺 MaxNotional 纯函数锁"
+CNT150=$((CNT150 + 1))
+grep -qF 'func TestGetPaperSyncsMaxOrderAmount' internal/engine/registry_paper_cfg_test.go \
+	|| fail150 "缺 registry 帽同步用例"
+grep -qF 'func TestPaperRiskGatePerAccount' internal/server/paper_config_test.go \
+	|| fail150 "缺 server 解析链用例"
+CNT150=$((CNT150 + 1))
+# 旧口径的名字必须消失：留着它会让人以为"忽略手填股数"还是契约。
+if grep -rqF 'TestPaperDynamicManualBuyIgnoresQtyAndCaps' internal/paper/; then
+	fail150 "旧用例名 TestPaperDynamicManualBuyIgnoresQtyAndCaps 仍在（口径已作废，名字会误导）"
+fi
+grep -qF 'func TestPaperDynamicManualBuyRespectsTypedQty' internal/paper/dynbudget_v3_test.go \
+	|| fail150 "改口径后的 dynamic 手动买入用例丢失"
+
+[ "$B150_FAILED" = "0" ] || exit 1
+echo "ok - §150 §F4 用例在册锁通过（F3–F6 + 三包配套 + 旧口径名清零，累计判定点 ${CNT150}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §151 §F4-BEHAVIOR（2026-11-01）：真跑——上面那些锚点只是"写了"，这里证明"跑得过"
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 151 §F4 行为腿（paper F3–F6 / ordbudget / engine / server 定向真跑）..."
+B151_FAILED=0
+fail151() {
+	echo "--- FAIL: §151 $*"
+	FAIL=1
+	B151_FAILED=1
+}
+CNT151=0
+
+CNT151=$((CNT151 + 1))
+go test ./internal/paper -run 'TestF3|TestF4|TestF5|TestF6' -count=1 > /tmp/gate151_paper.log 2>&1 \
+	|| fail151 "paper 的 F3–F6 未过（见 /tmp/gate151_paper.log）"
+CNT151=$((CNT151 + 1))
+go test ./internal/paper -run 'TestPaperDynamicManualBuyRespectsTypedQty|TestPaperDynamicConcentrationShrinksThenSkips|TestPaperLegacyStillUsesFixedAmount' -count=1 \
+	> /tmp/gate151_paper_dyn.log 2>&1 || fail151 "dynamic/legacy 既有口径用例未过（改口径不该动它们）"
+CNT151=$((CNT151 + 1))
+go test ./internal/ordbudget -run 'TestMaxQtyOnlyShrinks|TestMaxNotionalRejects|TestComputeNormalBudgets' -count=1 \
+	> /tmp/gate151_ordbudget.log 2>&1 || fail151 "ordbudget 纯函数用例未过"
+CNT151=$((CNT151 + 1))
+go test ./internal/engine -run 'TestGetPaperSyncsMaxOrderAmount|TestGetPaperUsesAccountPaperRules' -count=1 \
+	> /tmp/gate151_engine.log 2>&1 || fail151 "registry 装配用例未过"
+CNT151=$((CNT151 + 1))
+go test ./internal/server -run 'TestPaperRiskGatePerAccount|TestPaperConfig' -count=1 \
+	> /tmp/gate151_server.log 2>&1 || fail151 "server 热更/解析链用例未过"
+
+[ "$B151_FAILED" = "0" ] || exit 1
+echo "ok - §151 §F4 行为腿通过（5 组定向真跑全绿，累计判定点 ${CNT151}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §152 §F4-LEGACY-PARITY（2026-11-01）：改口径不许动 legacy，加仓记账缺陷顺带修
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 152 §F4 legacy 口径与加仓记账（固定金额不变 / 超池不静默缩减 / 价格解析顺序）..."
+B152_FAILED=0
+fail152() {
+	echo "--- FAIL: §152 $*"
+	FAIL=1
+	B152_FAILED=1
+}
+CNT152=0
+
+CNT152=$((CNT152 + 1))
+grep -qF 'amount := e.cfg.FixedAmount * e.applyPoolIRLocked(poolKey)' internal/paper/paper.go \
+	|| fail152 "legacy 自动金额口径被改动（固定金额×池 IR 是既有契约）"
+grep -qF 'return errCash // 手动指定手数超出池内资金（含费），不静默缩减' internal/paper/paper.go \
+	|| fail152 "手动显式股数超池时又开始静默缩减了"
+CNT152=$((CNT152 + 1))
+# 加仓价格解析顺序（本轮顺带修的真缺陷）：qty/price 的兜底必须在"已持仓"分支之前，
+# 否则手输价（price=0）的加仓按 0 元成本入账，均价被稀释且不报错。
+LN152_QTY=$(awk '/^func \(e \*Engine\) BuyExInPool\(/{f=1} f&&/return errLotTooSmall/{print NR; exit}' internal/paper/paper.go)
+LN152_HELD=$(awk '/^func \(e \*Engine\) BuyExInPool\(/{f=1} f&&/if p, held := e\.positions\[code\]; held \{/{print NR; exit}' internal/paper/paper.go)
+if [ -z "$LN152_QTY" ] || [ -z "$LN152_HELD" ] || [ "$LN152_QTY" -ge "$LN152_HELD" ]; then
+	fail152 "BuyExInPool 的价格/股数解析不在「已持仓」分支之前（price=0 的加仓会按 0 元记账，QTY=${LN152_QTY:-无} HELD=${LN152_HELD:-无}）"
+fi
+CNT152=$((CNT152 + 1))
+grep -qF '价格解析必须提到' internal/paper/paper.go || fail152 "缺加仓记账缺陷的定点注释（下一个人会把它改回去）"
+
+[ "$B152_FAILED" = "0" ] || exit 1
+echo "ok - §152 §F4 legacy 口径锁通过（固定金额/不静默缩减/加仓价格顺序，累计判定点 ${CNT152}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §153 §F4-ORDER-RECORD（2026-11-01）：拒单要留痕，成交记录的数量必须是"实际成交"
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 153 §F4 委托留痕（拒单 rejected 记录 / 成交记录用实际持仓数）..."
+B153_FAILED=0
+fail153() {
+	echo "--- FAIL: §153 $*"
+	FAIL=1
+	B153_FAILED=1
+}
+CNT153=0
+
+CNT153=$((CNT153 + 1))
+CNT153_REJ="$(grep -cF 'Status: "rejected", Reason: fmt.Sprintf("%v", err)' internal/paper/paper.go || true)"
+if [ "${CNT153_REJ:-0}" -lt 2 ]; then
+	fail153 "拒单没有落 rejected 记录（实得 ${CNT153_REJ:-0} 处，新开与加仓各需一处）"
+fi
+CNT153=$((CNT153 + 1))
+CNT153_FILL="$(grep -cF 'Price: price, Qty: e.positions[code].Qty,' internal/paper/paper.go || true)"
+if [ "${CNT153_FILL:-0}" -lt 2 ]; then
+	fail153 "成交记录没有用实际持仓数（实得 ${CNT153_FILL:-0} 处；手填股数被帽住时记录必须写实际成交）"
+fi
+CNT153=$((CNT153 + 1))
+# 决策快照的 Qty/Notional 必须来自最终 qty（与成交一致），不能拿请求值另算一份。
+grep -qF 'Qty:             qty,' internal/paper/paper.go || fail153 "决策快照没有透出最终 qty"
+grep -qF 'Notional:        float64(qty) * price,' internal/paper/paper.go || fail153 "决策快照的成交额不是最终 qty×价"
+
+[ "$B153_FAILED" = "0" ] || exit 1
+echo "ok - §153 §F4 委托留痕锁通过（rejected×2 / 成交用实际数 / 快照同源，累计判定点 ${CNT153}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §154 §F4-DOCS（2026-11-01）：口径变更必须落在文档与 AGENTS.md，旧表述必须清掉
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 154 §F4 文档（施工记录 / AGENTS.md / 旧口径不得残留）..."
+B154_FAILED=0
+fail154() {
+	echo "--- FAIL: §154 $*"
+	FAIL=1
+	B154_FAILED=1
+}
+CNT154=0
+
+CNT154=$((CNT154 + 1))
+grep -qF '§F-4 手动股数上限' docs/FIX_IMPL_20261101.md || fail154 "施工记录缺 §F-4 手动股数上限章节"
+grep -qF 'max_order_amount' docs/FIX_IMPL_20261101.md || fail154 "施工记录没写绝对帽的取值来源"
+grep -qF 'RiskGateConfig' docs/FIX_IMPL_20261101.md || fail154 "施工记录没写构建器签名变更"
+CNT154=$((CNT154 + 1))
+grep -qF 'max_order_amount' AGENTS.md || fail154 "AGENTS.md 没记录纸面也吃单笔绝对帽"
+CNT154=$((CNT154 + 1))
+if grep -qF '手动买入忽略手填股数' docs/FIX_IMPL_20261101.md AGENTS.md 2>/dev/null; then
+	fail154 "文档里仍留着「手动买入忽略手填股数」的旧口径"
+fi
+
+[ "$B154_FAILED" = "0" ] || exit 1
+echo "ok - §154 §F4 文档锁通过（施工记录/AGENTS.md/旧口径清零，累计判定点 ${CNT154}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §155 §F4-ANTI-REGRESSION（2026-11-01）：反证——把三处改动逐个改回去，锁必须变红
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 155 §F4 反证（改回旧形状：丢显式股数 / 摘掉 fill 层帽 / 摘掉预算层帽）..."
+B155_FAILED=0
+fail155() {
+	echo "--- FAIL: §155 $*"
+	FAIL=1
+	B155_FAILED=1
+}
+CNT155=0
+
+# 为什么要有这一段：§147/§148 的锚点全是"某串文本还在"。把 `maxQty = qty` 改成 `maxQty = 0`
+# 照样能编译、照样有那串字（改成别的写法也能凑），锚点绿而行为已回退＝摆设。
+# 所以这里把三处行为判据写成可注入的函数，逐个注入旧形状，要求判据变红。
+CNT155=$((CNT155 + 1))
+B155_PY=0
+python3 - <<'PY155' || B155_PY=$?
+import re
+import sys
+
+paper = open('internal/paper/paper.go', encoding='utf-8').read()
+budget = open('internal/ordbudget/ordbudget.go', encoding='utf-8').read()
+
+# 行为判据（与 §147/§148 的意图一一对应，但判的是"语义还在不在"，不是"某串字在不在"）
+def check(paper_txt, budget_txt):
+    # ① dynamic 分支必须把手动股数当上限传下去
+    if not re.search(r'if manual && qty > 0 \{\s*\n\s*maxQty = qty', paper_txt):
+        return 'dynamic 分支没有把手动股数当上限（回到"忽略手填股数"）'
+    if 'MaxQty: maxQty,' not in paper_txt:
+        return '预算输入没有接 MaxQty'
+    # ② 预算层的绝对帽必须是拒单，不能退化成减额
+    m = re.search(r'if in\.MaxNotional > 0 \{(.*?)\n\t\}', budget_txt, re.S)
+    if not m:
+        return '预算层没有绝对帽判定'
+    if 'qty =' in m.group(1):
+        return '绝对帽被写成减额（实盘是硬拒）'
+    if 'res.CappedBy = "max_order_amount"' not in m.group(1):
+        return '绝对帽拒单没有标 capped_by'
+    # ③ fill 层两道闸都要在（新开 + 加仓）
+    if paper_txt.count('e.maxOrderAmountErrLocked(qty, price,') < 2:
+        return 'fill 层只剩一处绝对帽（加仓可绕过）'
+    return None
+
+if check(paper, budget) is not None:
+    print('POSITIVE_FAILED: ' + check(paper, budget))
+    raise SystemExit(1)
+
+# 注入①：把"手动股数当上限"改回"永远不设上限"（旧行为）
+if check(paper.replace('maxQty = qty', 'maxQty = 0', 1), budget) is None:
+    print('MUTATION_STILL_GREEN: 把 maxQty = qty 改回 0（忽略显式股数）仍然判绿')
+    raise SystemExit(1)
+
+# 注入②：摘掉 fill 层新开那一道帽
+if check(paper.replace('if err := e.maxOrderAmountErrLocked(qty, price, e.pools[poolKey]); err != nil {',
+                       'if false {', 1), budget) is None:
+    print('MUTATION_STILL_GREEN: 摘掉 fill 层新开那道帽仍然判绿')
+    raise SystemExit(1)
+
+# 注入③：把预算层的绝对帽改成减额（qty 截断）——这是最容易被"顺手优化"掉的方向
+mut = budget.replace('res.CappedBy = "max_order_amount"',
+                     'qty = int(in.MaxNotional/in.Price/float64(lot)) * lot\n\t\t\tres.CappedBy = "max_order_amount"', 1)
+if check(paper, mut) is None:
+    print('MUTATION_STILL_GREEN: 把绝对帽改成减额仍然判绿')
+    raise SystemExit(1)
+
+raise SystemExit(0)
+PY155
+if [ "$B155_PY" != "0" ]; then
+	fail155 "反证未通过（判据本身不成立，或注入旧形状后仍判绿＝这条锁是摆设）"
+fi
+
+[ "$B155_FAILED" = "0" ] || exit 1
+echo "ok - §155 §F4 反证通过（丢显式股数 / 摘 fill 层帽 / 帽改减额 三处注入全红，累计判定点 ${CNT155}）"
+
+
 echo "==> 全部通过"

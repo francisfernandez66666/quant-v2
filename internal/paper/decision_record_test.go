@@ -76,7 +76,7 @@ func TestDecisionRecordNoDeadlock(t *testing.T) {
 	})
 	for i := 0; i < 1000; i++ {
 		pe.mu.Lock()
-		_, _ = pe.dynamicPaperQtyLocked("", "600000.SH", 10, 1.0)
+		_, _ = pe.dynamicPaperQtyLocked("", "600000.SH", 10, 1.0, 0)
 		pe.mu.Unlock()
 	}
 	mu.Lock()

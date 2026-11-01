@@ -267,11 +267,28 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	// /api/paper/config 读账号级 rules 显示 enabled=true，但引擎实跑 enabled=false，前端菜单
 	// 又按引擎值隐藏 ⇒ 关掉一次后再也进不了模拟盘页去重新打开。此处与 POST /api/paper/config
 	// 的热同步共用 paper.ConfigFromRules 同一构建器，保证读、写、运行时三处同源。
+	//
+	// §F-4（2026-11-01）：账号的 risk_gate 必须在**建引擎之前**读到——单笔金额绝对帽要随配置一起
+	// 交给 paper.New，事后再补一句 pe.UpdateConfig 就等于多出第二个装配点（热更时又会漏）。
+	// 这段正是"registry 同步"的落点：两条配置来源（账号 rules / 模板引擎）都要带上账号自己的帽。
+	var rg config.RiskGateConfig
+	if r.opts.CfgMgr != nil {
+		if q := r.opts.CfgMgr.GetQMTConfigFor(userID); q != nil {
+			rg = q.RiskGate
+		}
+	}
 	cfg := r.opts.Paper.Cfg()
 	if r.opts.CfgMgr != nil {
 		if rules := r.opts.CfgMgr.GetRulesFor(userID); rules != nil {
 			sc, _ := r.opts.CfgMgr.GetSizingConfigFor(userID)
-			cfg = paper.ConfigFromRules(rules.Paper, sc)
+			cfg = paper.ConfigFromRules(rules.Paper, rg, sc)
+		} else {
+			// 账号没有 rules 时沿用模板引擎配置，但帽仍按该账号的 risk_gate 同步——
+			// 否则"没配过模拟盘的账号"会带着别人的（或零）帽跑，且从读数上看不出来。
+			cfg.MaxOrderAmount = rg.MaxOrderAmount
+			if cfg.MaxOrderAmount < 0 {
+				cfg.MaxOrderAmount = 0
+			}
 		}
 	}
 	pe := paper.New(cfg, r.paperPath(userID))

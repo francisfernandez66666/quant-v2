@@ -221,4 +221,4 @@ GET	/livez	兼容端点	internal/server/server.go:604:GET /livez	匿名存活探
 GET	/readyz	兼容端点	internal/server/server.go:605:GET /readyz	匿名依赖就绪探针（§F-13），无 UI；evidence 为 server.go 注册行
 GET	/setup	运维 curl	scripts/monitor_test.sh:208:"${BASE_URL}/setup"	初始化状态读数（监控脚本用它区分「服务活着」与「还没初始化」）；Web 无安装向导页
 POST	/setup	运维 curl	scripts/monitor_test.sh:231:"POST" "/setup" 200	首次抢跑守卫：只在初始化态由运维脚本写入管理员；带 SETUP_TOKEN 守卫（deploy_seoul.sh:32）
-POST	/api/paper/adjust	运维 curl	internal/server/paper.go:381:handlePaperAdjust	000683 一次性纸面修复（dynamic 下普通买入忽略 qty）：owner 带 admin token 用 curl 调用，confirm=RESTORE-000683，落 paper_adjust 审计
+POST	/api/paper/adjust	运维 curl	internal/server/paper.go:381:handlePaperAdjust	000683 一次性纸面修复（补历史错账要留 paper_adjust 审计痕迹，普通买入不留）：owner 带 admin token 用 curl 调用，confirm=RESTORE-000683

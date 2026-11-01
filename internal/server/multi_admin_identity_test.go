@@ -11,6 +11,7 @@ import (
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/store"
@@ -210,7 +211,7 @@ func TestFundsTodayPaperIsolation(t *testing.T) {
 		t.Fatalf("grant funds: %v", err)
 	}
 	newPaper := func(capital float64, name string) *paper.Engine {
-		cfg := paper.ConfigFromRules(s.cfg.Get().Paper)
+		cfg := paper.ConfigFromRules(s.cfg.Get().Paper, config.RiskGateConfig{})
 		cfg.Enabled = true
 		cfg.AutoSell = false
 		cfg.InitialCapital = capital
@@ -305,7 +306,7 @@ func TestStrictPermissionSurface(t *testing.T) {
 // 不能借它新建仓位（避免把一次性数据修复变成通用开仓入口）。
 func TestPaperAdjustRejectsNewPosition(t *testing.T) {
 	s, owner, second, _ := newMultiAdminTestServer(t)
-	cfg := paper.ConfigFromRules(s.cfg.Get().Paper)
+	cfg := paper.ConfigFromRules(s.cfg.Get().Paper, config.RiskGateConfig{})
 	cfg.Enabled = true
 	cfg.AutoSell = false
 	s.SetPaper(paper.New(cfg, filepath.Join(t.TempDir(), "paper.json")))
@@ -327,15 +328,16 @@ func TestPaperAdjustRequiresEngineAndConfirm(t *testing.T) {
 }
 
 // TestPaperAdjustRestoresHeldPosition 000683 已持有 100 股时，受控端点只加仓、不新建仓位，
-// 并按显式 qty/price 记账（dynamic 下普通买入会忽略 qty，故不能走 /api/paper/buy）。
+// 并按显式 qty/price 记账（§F-4 起普通买入也尊重显式股数，但补账要留审计痕迹，故仍走本端点）。
 func TestPaperAdjustRestoresHeldPosition(t *testing.T) {
 	s, owner, second, _ := newMultiAdminTestServer(t)
-	cfg := paper.ConfigFromRules(s.cfg.Get().Paper)
+	cfg := paper.ConfigFromRules(s.cfg.Get().Paper, config.RiskGateConfig{})
 	cfg.Enabled = true
 	cfg.AutoSell = false
 	pe := paper.New(cfg, filepath.Join(t.TempDir(), "paper.json"))
 	s.SetPaper(pe)
-	// 夹具先按 R-01 残留形态建 000683 100 股（绕过 HTTP 买入，因为 dynamic 忽略 qty）。
+	// 夹具先按 R-01 残留形态建 000683 100 股（绕过 HTTP 买入：本用例测的是补账端点，
+	// 夹具不该顺带考一遍买入通道的预算口径）。
 	if err := pe.BuyExInPool("000683", "远兴能源", "手动", "", 5.54, 5.54, 100, nil); err != nil {
 		t.Fatalf("种子建仓失败: %v", err)
 	}

@@ -249,3 +249,68 @@ func TestRoomOf(t *testing.T) {
 		t.Fatalf("超限应钳到 0，got %v", got)
 	}
 }
+
+// TestMaxQtyOnlyShrinks §F-4（2026-11-01）：显式股数上限只压不抬。
+//
+// 三种形态一次锁全：
+//   - 上限小于预算 → 按上限成交（capped_by=manual）
+//   - 上限大于预算 → 预算说了算（capped_by 保持额度来源，不能被误标 manual）
+//   - 上限不足 1 手 → 跳过（不能四舍五入成 1 手，那会突破用户意图）
+func TestMaxQtyOnlyShrinks(t *testing.T) {
+	// 基线：10 万 × 0.82 → 行业 35% 截到 3500 股。
+	in := baseInput()
+	in.MaxQty = 500
+	res := Compute(in)
+	if res.Qty != 500 || res.CappedBy != "manual" {
+		t.Fatalf("上限 500 < 预算 3500 时应成交 500 且 capped_by=manual，got %+v", res)
+	}
+	if res.Notional != 5000 {
+		t.Fatalf("成交额应回写为 500×10=5000，got %v", res.Notional)
+	}
+
+	// 上限大于预算：预算仍是约束，capped_by 不能被改成 manual（否则面板会把"额度不够"
+	// 说成"你只买了这些"，两种完全不同的处置）。
+	in2 := baseInput()
+	in2.MaxQty = 999900
+	res2 := Compute(in2)
+	if res2.Qty != 3500 || res2.CappedBy != "industry" {
+		t.Fatalf("上限大于预算时应保持预算口径 3500/industry，got %+v", res2)
+	}
+
+	// 上限不足 1 手：跳过，不抬到 1 手。
+	in3 := baseInput()
+	in3.MaxQty = 50
+	res3 := Compute(in3)
+	if res3.SkipReason == "" || res3.Qty != 0 {
+		t.Fatalf("上限不足 1 手应跳过，got %+v", res3)
+	}
+}
+
+// TestMaxNotionalRejects §F-4：单笔成交额绝对帽是**拒单**（不是减额），且恰好等于帽要放行。
+func TestMaxNotionalRejects(t *testing.T) {
+	in := baseInput()
+	in.MaxNotional = 2000 // 股价 10 → 200 股以内
+	res := Compute(in)
+	if res.SkipReason == "" || res.Qty != 0 {
+		t.Fatalf("3500 股×10=35000 > 帽 2000，应拒单，got %+v", res)
+	}
+	if res.CappedBy != "max_order_amount" {
+		t.Fatalf("capped_by 应为 max_order_amount，got %q", res.CappedBy)
+	}
+
+	// 显式股数先把单子压到帽内 → 必须放行（顺序：先取小、再判帽）。
+	in2 := baseInput()
+	in2.MaxNotional = 2000
+	in2.MaxQty = 200
+	res2 := Compute(in2)
+	if res2.SkipReason != "" || res2.Qty != 200 {
+		t.Fatalf("显式 200 股恰好等于帽 2000 元，应放行，got %+v", res2)
+	}
+
+	// 0 = 未配置 = 闸关。
+	in3 := baseInput()
+	in3.MaxNotional = 0
+	if res3 := Compute(in3); res3.SkipReason != "" {
+		t.Fatalf("帽未配置时不应拦单，got %+v", res3)
+	}
+}

@@ -8,6 +8,7 @@
 //	if room < OneLot: 跳过
 //	qty       = floor(room / Price / Lot) × Lot
 //	qty       = min(qty, 现金可负担整手)
+//	qty       = min(qty, 显式股数上限)   ← 仅手动委托（§F-4）
 //
 // 关键纪律：
 //   - 1 手地板不能突破任何额度（含目标仓位剩余空间）；额度不足 1 手就跳过；
@@ -21,7 +22,10 @@
 // and the one-lot floor may never break those rooms.
 package ordbudget
 
-import "math"
+import (
+	"fmt"
+	"math"
+)
 
 // DefaultLot A 股一手股数。
 const DefaultLot = 100
@@ -81,6 +85,27 @@ type Inputs struct {
 	// English: enables the cluster room; a bool is required because an exact zero is a valid
 	// "no cluster exposure yet" reading.
 	ClusterSet bool
+	// MaxQty §F-4（2026-11-01）显式股数上限（股，0=不设）：手动委托带明确股数时，那个股数是
+	// **用户意图的上限**，动态预算只能往下压、绝不能往上放大。
+	//
+	// 为什么必须是"上限"而不是"直接用"：v3 之前 dynamic 分支把 qty 整个丢掉，用户点"买入 100 股"
+	// 实际按池权益 35% 买入（600519 一手 15 万，池 10 万 → 直接拒单；而池 100 万时买 3500 股），
+	// 页面上的数字与实际成交差 35 倍。反过来也不能让显式股数越过动态额度——那等于手动入口
+	// 绕过所有帽。取小是唯一同时满足两边的语义。
+	// English: §F-4 — an explicit manual share count is an upper bound on intent, not a mandate:
+	// the dynamic budget may only shrink it, never inflate it, and it may never override the caps.
+	MaxQty int
+	// MaxNotional §F-4（2026-11-01）单笔成交额绝对帽（元，0=不设）：与实盘
+	// risk.checkMaxOrderAmount 同阈值。**超帽是拒单而不是减额**——实盘闸门在这一条上是硬拒，
+	// 纸面若减额就会"纸面有仓、实盘没有"，两本账连持仓都对不上（比金额差更难解释）。
+	//
+	// 为什么放在预算层而不是只在 fill 层判：dynamic 分支的决策快照（signal_decisions）是在
+	// 本函数里 emit 的。若帽放在 fill 层，快照会先记一笔 stage=placed 的成交意图、随后被拒，
+	// 面板上就出现"记了 3500 股但账上没有"的假读数——这正是本仓反复修的那类问题。
+	// English: absolute per-order notional cap; exceeding it is a REJECT, not a shrink, mirroring
+	// the live gate. Kept inside the budget so the emitted decision snapshot can never claim a fill
+	// that the cap will refuse.
+	MaxNotional float64
 }
 
 // Result 预算结果。
@@ -104,7 +129,7 @@ type Result struct {
 	Qty int
 	// Notional 最终成交额（Qty×Price）。
 	Notional float64
-	// CappedBy 最终约束来源：dynamic / one_lot_floor / industry / stock / target / cluster / cash / none。
+	// CappedBy 最终约束来源：dynamic / one_lot_floor / industry / stock / target / cluster / cash / manual / max_order_amount / none。
 	CappedBy string
 	// SkipReason 非空表示不下单（额度不足1手/现金不足/参数不可得）。
 	SkipReason string
@@ -242,6 +267,37 @@ func Compute(in Inputs) Result {
 		res.CappedBy = capped
 		res.SkipReason = "现金不足"
 		return res
+	}
+
+	// §F-4 显式股数上限：手动委托的股数只能把结果往下压，不能把它抬上去。
+	// 放在现金帽**之后**：现金帽已经可能把 qty 压到显式股数以下，这时显式股数不再参与，
+	// CappedBy 必须如实报 cash（否则面板会把"钱不够"说成"你只买了这些"）。
+	// English: the explicit share count only shrinks the result, and only when it is the binding
+	// constraint — a cash-capped qty keeps CappedBy=cash so the panel does not mislabel it.
+	if in.MaxQty > 0 && qty > in.MaxQty {
+		qty = in.MaxQty / lot * lot // 显式股数同样向下取整到整手（150 → 100）
+		if qty <= 0 {
+			res.Budget = budget
+			res.CappedBy = "manual"
+			res.SkipReason = "显式股数不足1手"
+			return res
+		}
+		capped = "manual"
+	}
+
+	// §F-4 单笔成交额绝对帽：超帽即拒（不减额），与实盘闸门同语义。
+	// 放在显式股数之后：先由"用户要多少"与"额度允许多少"取小，再用绝对帽判这笔最终单子，
+	// 顺序反了会把"其实是被显式股数压小的单"错报成超帽。
+	// English: the absolute notional cap rejects (never shrinks); evaluated last so the reported
+	// reason is about the final order, not an intermediate budget.
+	if in.MaxNotional > 0 {
+		amt := float64(qty) * in.Price
+		if amt > in.MaxNotional+moneyEpsilon {
+			res.Budget = amt
+			res.CappedBy = "max_order_amount"
+			res.SkipReason = fmt.Sprintf("成交额 %.2f 元 > 绝对帽 %.2f 元", amt, in.MaxNotional)
+			return res
+		}
 	}
 
 	// 成交额回写：Budget 与 Notional 恒等（便于审计对账）。

@@ -37,7 +37,7 @@ func newUnitsPaperServer(t *testing.T) (*Server, string) {
 func newUnitsPaperServerMode(t *testing.T, budgetMode string) (*Server, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "paper.json")
-	cfg := paper.ConfigFromRules(config.NewManager("").Get().Paper)
+	cfg := paper.ConfigFromRules(config.NewManager("").Get().Paper, config.RiskGateConfig{})
 	cfg.Enabled = true
 	cfg.AutoSell = false // 卖出断言不受自动卖出干扰
 	cfg.BudgetMode = budgetMode
@@ -47,12 +47,12 @@ func newUnitsPaperServerMode(t *testing.T, budgetMode string) (*Server, string) 
 }
 
 // seedPaperPosition 直接用引擎 API 建仓（指定价+股数），绕过 HTTP 买入入口。
-// 为什么必须绕：dynamic 口径下 /api/paper/buy 与 fillLocked 都刻意忽略显式股数（§DYN-SIZE-v3
-// 走池权益×缩放），而单测没有行情源也算不出动态量 ⇒ 种子仓只能在 **非 dynamic 口径**下建。
+// 为什么必须绕：单测没有行情源，/api/paper/buy 走自动通道算不出动态量；而 §F-4 起显式股数虽被
+// 尊重（只压不抬），仍要与池权益×单票额度取小 ⇒ 想种出**确定的**股数只能在非 dynamic 口径下建。
 // 只做夹具，不测买入语义；建完用 newDynamicPaperServerFrom 切回被测口径。
-// English: seeds a position through the engine API because dynamic mode deliberately ignores an explicit
-// share count (v3 sizes from pool equity × scale) and unit tests have no quotes. Seeding therefore runs
-// on the non-dynamic branch; newDynamicPaperServerFrom then switches to the mode under test.
+// English: seeds a position through the engine API because unit tests have no quotes; since §F-4 an
+// explicit share count is an upper bound still min()'d with the pool/stock rooms, so a deterministic
+// seed runs on the non-dynamic branch. newDynamicPaperServerFrom then switches to the mode under test.
 func seedPaperPosition(t *testing.T, s *Server, code, name string, price float64, qty int) {
 	t.Helper()
 	if err := s.paperEngine().BuyExInPool(code, name, "手动", "", 0, price, qty, nil); err != nil {
@@ -66,7 +66,7 @@ func seedPaperPosition(t *testing.T, s *Server, code, name string, price float64
 // for §DYN-TRIM.
 func newDynamicPaperServerFrom(t *testing.T, path string) *Server {
 	t.Helper()
-	cfg := paper.ConfigFromRules(config.NewManager("").Get().Paper)
+	cfg := paper.ConfigFromRules(config.NewManager("").Get().Paper, config.RiskGateConfig{})
 	cfg.Enabled = true
 	cfg.AutoSell = false
 	cfg.BudgetMode = "dynamic"
@@ -135,7 +135,7 @@ func backdatePaperFills(t *testing.T, s *Server, path string) {
 	}
 	// 重建引擎触发 load()：持仓以隔日 filled_at 恢复
 	rules := config.NewManager("").Get().Paper
-	cfg := paper.ConfigFromRules(rules)
+	cfg := paper.ConfigFromRules(rules, config.RiskGateConfig{})
 	cfg.Enabled = true
 	cfg.AutoSell = false
 	s.SetPaper(paper.New(cfg, path))

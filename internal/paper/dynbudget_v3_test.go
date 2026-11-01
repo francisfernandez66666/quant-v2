@@ -1,10 +1,12 @@
 // dynbudget_v3_test.go — 模拟盘 dynamic 预算锁（v3 §9.2）。
 //
-// 验证：手动买入忽略手填股数、池权益为基数、全盘权益为 35% 分母、持仓数量上限让位、
-// 手动卖出按清仓处理。
+// 验证：池权益为基数、全盘权益为 35% 分母、持仓数量上限让位、手动卖出按清仓处理。
+// §F-4（2026-11-01）起"手动买入忽略手填股数"这条口径已作废：手填股数改为**意图上限**
+// （只压不抬），见 TestPaperDynamicManualBuyRespectsTypedQty 与 f4_manual_qty_cap_test.go。
 //
-// English: paper-book locks for the v3 dynamic budget — manual buys ignore typed qty, pool equity
-// is the base, whole-book equity is the 35% denominator, position caps yield, manual sells close.
+// English: paper-book locks for the v3 dynamic budget — pool equity is the base, whole-book equity
+// is the 35% denominator, position caps yield, manual sells close. Since §F-4 a typed share count is
+// an upper bound instead of being ignored.
 package paper
 
 import (
@@ -30,23 +32,27 @@ func dynQuotes(codes ...string) map[string]*data.StockInfo {
 	return out
 }
 
-// TestPaperDynamicManualBuyIgnoresQtyAndCaps 手填股数与持仓数量上限都不再生效，预算由 dynamic 口径决定。
+// TestPaperDynamicManualBuyRespectsTypedQty §F-4（2026-11-01）改口径：手填股数从"被忽略"
+// 改为"意图上限（只压不抬）"。
 //
-// §DYN-SIZE v4：出厂单笔基准是 10%（10 万 → 1 万 → 1000 股），那样 35% 单票额度根本不参与，
-// 这条锁要证的"额度/手填数都不起作用"就失去区分度。所以这里把单笔区间临时放大到上限 50%
-// （§B0 起单笔硬边界就是半仓，写 100% 会被夹回 0.50），让**单票 35% 额度**重新成为约束
-// （5 万预算被 3.5 万额度截断 → 3500 股），锁的靶心不变。
-func TestPaperDynamicManualBuyIgnoresQtyAndCaps(t *testing.T) {
+// 旧行为（本文件原断言，现已作废）：dynamic 下手填 100 股被整个丢掉，引擎按 10 万×50% 再被
+// 35% 单票额度截到 3500 股 —— 用户点"买 100 股"，账上多出 35 倍，页面显示与实际成交对不上，
+// 且没有任何提示。新行为：100 股就是 100 股（F4 用例），填得比额度大时按额度截断（F5 用例）。
+//
+// 本条只保留"持仓数量上限让位"这半：MaxPositions=1 在 dynamic 下仍然退场。
+// English: §F-4 — the typed share count is now an upper bound (shrunk by the budget, never
+// inflated). Only the "position-count cap yields" half of the old case survives here.
+func TestPaperDynamicManualBuyRespectsTypedQty(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
 	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false)
 	quotes := dynQuotes("600000.SH")
-	// 显式传 100 股：dynamic 下必须忽略，按 10 万×100% 基准再被 35% 单票额度截到 3500 股。
+	// 显式传 100 股：dynamic 下按 100 股成交（旧行为是 3500 股）。
 	if err := pe.BuyExInPool("600000.SH", "浦发", "龙头", "", 10, 0, 100, quotes); err != nil {
 		t.Fatalf("BuyExInPool: %v", err)
 	}
 	poses := pe.Positions()
-	if len(poses) != 1 || poses[0].Qty != 3500 {
-		t.Fatalf("dynamic 应忽略手填 100 股并按 35%% 额度买 3500 股，got %+v", poses)
+	if len(poses) != 1 || poses[0].Qty != 100 {
+		t.Fatalf("dynamic 下手填 100 股应原样成交 100 股（只压不抬），got %+v", poses)
 	}
 	// MaxPositions=1：dynamic 下继续开第二只不受数量上限限制。
 	if err := pe.BuyExInPool("600001.SH", "华夏", "龙头", "", 10, 0, 100, dynQuotes("600001.SH")); err != nil {
