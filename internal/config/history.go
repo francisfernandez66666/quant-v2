@@ -586,6 +586,10 @@ var configSurfaces = map[string]bool{
 	// leg lives in its own account key and therefore has a dedicated "regime_sizing" surface.
 	"regime":        true,
 	"regime_sizing": true,
+	// §SUBSCRIPTION-A（2026-11-01）：/api/config/runtime 写的是**全局** config.json 的 rules.runtime
+	// （resolveWriteScope 的 default 组＝target "global"）。不登记就会出现"写照样落库、每次变更
+	// 都没有回滚点、日志刷一条 P1"的无快照写入——本表注释警告过的那条野路。
+	"runtime": true,
 }
 
 // resolveWriteScope 判定"这次写入替换的是哪本文档"，返回 (账号, KV 键, 目标描述)。

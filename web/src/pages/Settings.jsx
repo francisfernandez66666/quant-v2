@@ -13,6 +13,7 @@ import * as api from '../api/index.js'
 import { canStrict } from '../utils/perm.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
+import QuoteFeedConfigCard from './QuoteFeedConfigCard.jsx'
 
 // 五大战法参数分组定义：每个 group 含标题与字段列表（k=后端字段名, label=展示名, step=步进, type=控件类型, hint=悬浮说明）
 const strategyGroups = [
@@ -868,6 +869,10 @@ export default function Settings() {
         </Card>
       )}
 
+      {/* §SUBSCRIPTION-A（2026-11-01 裁决 4/12）行情通道开关：只挂到 config_admin。
+          这批键管的是"行情从哪来、多旧能用"，与资金动作无关；单独成卡也避免把整页配置
+          的 dirty 判定搅在一起（各管各的保存，失败互不牵连）。 */}
+      {canConfig && <QuoteFeedConfigCard />}
       <Card title="系统" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>版本</span>

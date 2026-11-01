@@ -1952,6 +1952,22 @@ export async function fetchD1Config() {
   return request('/api/config/d1')
 }
 
+/**
+ * 行情通道运行时配置（§SUBSCRIPTION-A，2026-11-01 裁决 4/12）
+ * GET/POST /api/config/runtime，权限位 config_admin；POST 是**稀疏 merge**：
+ * 只发想改的键，没发的键后端保留旧值（绝不用整段对象覆盖，那会把没显示的键清零）。
+ * 返回体同时给"原始值 + 生效值"两栏与 restart_required：保存≠生效的键由后端点名，
+ * 前端不猜。feed_state 是通道现状（ok/auth_failed/degraded:J1|J2|J3/not_wired）。
+ */
+/** Quote-feed runtime config (broker L1 switches); sparse-merge POST. */
+export async function fetchRuntimeConfig() {
+  return request('/api/config/runtime')
+}
+
+export async function updateRuntimeConfig(patch) {
+  return request('/api/config/runtime', { method: 'POST', data: patch })
+}
+
 /** 保存全局 D1 事件规则与软加成配置（POST /api/config/d1，admin，稀疏 merge） */
 export async function setD1Config(cfg) {
   return request('/api/config/d1', { method: 'POST', data: cfg })

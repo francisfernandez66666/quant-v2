@@ -728,6 +728,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/config/regime", s.authMiddleware(s.handleSetRegimeConfig))
 	s.mux.HandleFunc("GET /api/config/qmt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleGetQMTConfig))
 	s.mux.HandleFunc("POST /api/config/qmt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleSetQMTConfig))
+	// §SUBSCRIPTION-A（2026-11-01 裁决 4/12）runtime 段行情开关的读写面：覆盖率阈值、量纲系数、
+	// 热点池上限、主源档都要能在后台改（改完热更，不必改文件重启）。权限走 config_admin——
+	// 这批键管的是"行情从哪来、多旧能用"，不管资金动作；放 trading_admin 会让运维面越扩越宽。
+	s.mux.HandleFunc("GET /api/config/runtime", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetRuntimeConfig))
+	s.mux.HandleFunc("POST /api/config/runtime", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetRuntimeConfig))
 
 	// 模拟盘（纸面交易）：运营数据统一归属管理员（系统级共享），仅管理员可读写；
 	// 子账号不操作模拟盘，后端鉴权，前端只负责展示与交互。

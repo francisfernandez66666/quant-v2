@@ -4322,6 +4322,32 @@ func (m *Manager) SetD1Config(cfg *D1Config) {
 	m.Save()
 }
 
+// RuntimeConfigForWrite 返回 runtime 段的**值拷贝**（写面前先取拷贝，再整体替换回去）。
+// 为什么要单独一个取拷贝口而不是让调用方改 Get() 的结果：Get() 交出的是活体 rules 指针，
+// 就地改等于绕过锁写配置（§0925EVE-D1 那一族），而这条通道管的是"能不能让券商改写行情价"。
+// English: returns a copy of the runtime section so callers never mutate the live rules pointer.
+func (m *Manager) RuntimeConfigForWrite() RuntimeConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rules.Runtime
+}
+
+// SetRuntimeConfig 更新全局 runtime 段并持久化（§SUBSCRIPTION-A 的写面通道）。
+// 为什么必须走 setter 而不是改 Get() 返回的活体指针：Get 交出的是 m.rules 本体，
+// 调用方就地改字段等于绕过锁写活配置（§0925EVE-D1 修的就是这一族），
+// 而 runtime 段里现在住着行情开关——写坏了会让主源档在不该开的时候被打开。
+// English: replaces the global runtime section under m.mu and persists it; mutating the pointer
+// returned by Get() would be an unlocked write into live config.
+func (m *Manager) SetRuntimeConfig(rc *RuntimeConfig) error {
+	if rc == nil {
+		return errors.New("SetRuntimeConfig: nil runtime config")
+	}
+	m.mu.Lock()
+	m.rules.Runtime = *rc
+	m.mu.Unlock()
+	return m.Save()
+}
+
 // MergeD1Config §0929CFG-D1（09-29 全量审计批 P1-1，owner 令照推荐项执行）：
 // D1 规则通道的**稀疏 merge**——「没传=保留旧值」，与 §N-4/§CFGSMASH 的战法参数通道同族同口径。
 //

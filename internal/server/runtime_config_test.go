@@ -1,0 +1,172 @@
+// runtime_config_test.go — §SUBSCRIPTION-A（2026-11-01 裁决 4/12）runtime 行情开关写面的行为锁。
+//
+// 四条各对一个真实风险：
+//
+//	① 稀疏 merge：只发一个键，别的键必须原样留着。旧式"typed struct 整体解码再保存"会把
+//	   没传的键折成零值——那正是"保存一个开关顺手把别的参数清零"那一族缺陷的成因。
+//	② 非法值整批拒收且不落盘：夹到边界保存会让设置页显示的数字和你填的不是一个数。
+//	   量纲系数量级错 100 倍直接进 VWAP，所以这里连"只接受 1/100/0"都是刻意的窄。
+//	③ 生效值与原始值两栏并列：0 的含义是"没填"（实际按出厂 80 判），只显示原值会骗人。
+//	④ 热更与重启如实区分：保存即生效的键和"要重启才生效"的键分开报，前端不许自己猜。
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+
+	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/data"
+)
+
+// runtimeGet 读一次 GET /api/config/runtime。
+func runtimeGet(t *testing.T, s *Server, admin *auth.User) map[string]any {
+	t.Helper()
+	rr := adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/runtime", ""))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/config/runtime → %d body=%s", rr.Code, rr.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析失败: %v body=%s", err, rr.Body.String())
+	}
+	return out
+}
+
+// runtimePost 发一次 POST，返回 (状态码, 响应体)。
+func runtimePost(t *testing.T, s *Server, admin *auth.User, body string) (int, map[string]any) {
+	t.Helper()
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/config/runtime", body))
+	var out map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &out) // 400/500 的响应体可能不是完整视图，解不动就算了
+	return rr.Code, out
+}
+
+// newRuntimeTestServer 带一个可注入的采集器（热更断言要看它身上的策略）。
+func newRuntimeTestServer(t *testing.T) (*Server, *auth.User, *data.Fetcher) {
+	t.Helper()
+	s, admin := newAdminTestServer(t)
+	f := data.NewFetcher([]string{"600000"}, &data.MarketAPI{}, nil)
+	s.SetFetcher(f)
+	return s, admin, f
+}
+
+// TestRuntimeConfigGetShape 出厂态：原始值为 0 时也必须给出**生效值**，且 restart_required 点名那两个键。
+func TestRuntimeConfigGetShape(t *testing.T) {
+	s, admin, _ := newRuntimeTestServer(t)
+	got := runtimeGet(t, s, admin)
+	if got["qmt_feed_coverage_min_pct"] != float64(0) {
+		t.Fatalf("原始值应如实回 0（没填过）, got %v", got["qmt_feed_coverage_min_pct"])
+	}
+	if got["coverage_min_pct_effective"] != float64(80) {
+		t.Fatalf("生效值必须是出厂 80，只显原始值会骗人, got %v", got["coverage_min_pct_effective"])
+	}
+	if got["volume_to_shares_effective"] != float64(1) {
+		t.Fatalf("量纲生效值应为 1（股）, got %v", got["volume_to_shares_effective"])
+	}
+	if got["monitor_pool_hot_max_effective"] != float64(400) {
+		t.Fatalf("池上限生效值应为出厂 400, got %v", got["monitor_pool_hot_max_effective"])
+	}
+	rs, _ := got["restart_required"].([]any)
+	joined := ""
+	for _, v := range rs {
+		joined += toString(v) + ","
+	}
+	if !strings.Contains(joined, "qmt_feed_enabled") {
+		t.Fatalf("qmt_feed_enabled 属重启类（决定启动时是否建轮询协程），必须点名: %v", got["restart_required"])
+	}
+	if got["feed_state"] == nil {
+		t.Fatal("通道现状必须一并回显：改完键要能当场看到有没有连着")
+	}
+}
+
+// TestRuntimeConfigSparseMergeAndHotApply 只发覆盖率一个键：其余键原样保留，且策略即时灌给采集器。
+func TestRuntimeConfigSparseMergeAndHotApply(t *testing.T) {
+	s, admin, f := newRuntimeTestServer(t)
+	code, resp := runtimePost(t, s, admin, `{"qmt_feed_coverage_min_pct":70}`)
+	if code != http.StatusOK {
+		t.Fatalf("合法保存应 200, got %d resp=%v", code, resp)
+	}
+	if got := f.FeedPolicyNow().CoverageMinPct; got != 70 {
+		t.Fatalf("未热更：装配层阈值仍是 %d（保存要下一轮生效，不必重启）", got)
+	}
+	again := runtimeGet(t, s, admin)
+	if again["qmt_feed_coverage_min_pct"] != float64(70) {
+		t.Fatalf("没落盘：读回 %v", again["qmt_feed_coverage_min_pct"])
+	}
+	if again["qmt_feed_primary"] != false {
+		t.Fatalf("稀疏 merge 把没发的键改了：qmt_feed_primary=%v（必须仍是出厂 false）", again["qmt_feed_primary"])
+	}
+	if again["monitor_pool_hot_max"] != float64(0) {
+		t.Fatalf("稀疏 merge 把没发的键改了：monitor_pool_hot_max=%v", again["monitor_pool_hot_max"])
+	}
+	changed, _ := resp["changed"].([]any)
+	if len(changed) != 1 || toString(changed[0]) != "qmt_feed_coverage_min_pct" {
+		t.Fatalf("审计要如实说这次只动了一个键, got %v", resp["changed"])
+	}
+	// 主源档热更：这是行为面最大的一次改写，必须能在不重启的情况下开/关
+	if _, _ = runtimePost(t, s, admin, `{"qmt_feed_primary":true}`); f.FeedPolicyNow().Primary != true {
+		t.Fatal("qmt_primary 热更没生效")
+	}
+	if got := runtimeGet(t, s, admin)["qmt_feed_coverage_min_pct"]; got != float64(70) {
+		t.Fatalf("第二次保存把上一次的键冲掉了：%v", got)
+	}
+}
+
+// TestRuntimeConfigRejectsIllegalValues 非法值整批拒收、一个键都不落盘（部分成功比全部失败更难排查）。
+func TestRuntimeConfigRejectsIllegalValues(t *testing.T) {
+	s, admin, f := newRuntimeTestServer(t)
+	for _, body := range []string{
+		`{"qmt_feed_coverage_min_pct":101}`,                              // 阈值越界
+		`{"qmt_feed_coverage_min_pct":-5}`,                               // 只有 -1 才是"关闭判断"
+		`{"qmt_feed_volume_to_shares":5}`,                                // 量纲只认 1/100/0：错一档 VWAP 差 100 倍
+		`{"monitor_pool_hot_max":30}`,                                    // 低于降级档常数 60
+		`{"monitor_pool_hot_max":5000}`,                                  // 上限之外后备链没实测过
+		`{"qmt_feed_interval_sec":600}`,                                  // 轮询节拍越界
+		`{"qmt_feed_coverage_min_pct":90,"qmt_feed_volume_to_shares":7}`, // 混合批次里有非法项 ⇒ 整批不落
+	} {
+		code, _ := runtimePost(t, s, admin, body)
+		if code != http.StatusBadRequest {
+			t.Fatalf("非法值必须 400：%s → %d", body, code)
+		}
+	}
+	// 关键判据：整批都拒了，装配层就一个键都不该被碰过。
+	// 注意出厂态是**零值策略**（阈值兜底发生在 Effective* 读数处，不预写进 policy），
+	// 所以这里断的是"仍是零值"，不是"等于 80"——写成 80 会把"兜底在读数侧"这个事实误当成回归。
+	st := f.FeedPolicyNow()
+	if st.CoverageMinPct != 0 || st.HotPoolCap != 0 || st.VolumeToShares != 0 || st.Primary {
+		t.Fatalf("非法批次仍然改到了运行态: %+v", st)
+	}
+	got := runtimeGet(t, s, admin)
+	if got["qmt_feed_coverage_min_pct"] != float64(0) {
+		t.Fatalf("非法批次仍然落盘了: %v", got["qmt_feed_coverage_min_pct"])
+	}
+}
+
+// TestRuntimeRoutesAreConfigAdminOnly 两条路由必须挂 config_admin 严格权限位。
+// 这批键管"行情从哪来、多旧能用"，不给 trading_admin：能让成员号自己把券商价设成主源，
+// 等于把行情判据的开关撒到执行面账号上，方向不对。
+func TestRuntimeRoutesAreConfigAdminOnly(t *testing.T) {
+	raw, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatalf("读 server.go 失败: %v", err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.Contains(line, "/api/config/runtime") {
+			continue
+		}
+		if !strings.Contains(line, `strictPermMiddleware(auth.PermConfigAdmin`) {
+			t.Fatalf("runtime 路由没挂 config_admin 严格权限位: %s", strings.TrimSpace(line))
+		}
+	}
+}
+
+// toString 小工具：JSON 解出来是 any，断言里要拿字符串比较。
+func toString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}

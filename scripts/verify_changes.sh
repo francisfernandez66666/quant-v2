@@ -12513,12 +12513,12 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 206 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206）'
-eqkey115 CALLPATH_DERIVED 165 'C 的规范化路径条数（前端真拨得出去的地址；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165）'
-eqkey115 CALLSITES_DERIVED 169 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169）'
+eqkey115 ROUTES_DERIVED 208 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208）'
+eqkey115 CALLPATH_DERIVED 167 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167）'
+eqkey115 CALLSITES_DERIVED 171 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 206 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§MULTI-ADMIN 000683 修复端点入账 →206）'
-eqkey115 COVERED_BY_WEB 165 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程 →165）'
+eqkey115 LEDGER_ROWS 208 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208）'
+eqkey115 COVERED_BY_WEB 167 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167）'
 eqkey115 UNCALLED 41 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
@@ -12590,8 +12590,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 206 '镜像基线：R 与主仓同值'
-eqkey115 LEDGER_ROWS 206 '镜像基线：台账行数与主仓同值'
+eqkey115 ROUTES_DERIVED 208 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208）'
+eqkey115 LEDGER_ROWS 208 '镜像基线：台账行数与主仓同值（206→208 同批）'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -14520,7 +14520,7 @@ grep -q 'GetSignalLogsRange' internal/engine/engine.go || fail1022 "引擎缺跨
 grep -q 'signalarchive.ReadRange' internal/server/server.go || fail1022 "服务端未接按天归档（跨天复盘只能看内存当日）"
 grep -q 'signal_records_archive' internal/engine/engine.go || fail1022 "引擎未装配归档目录"
 [ -f internal/signalarchive/signalarchive.go ] || fail1022 "按天归档实现缺失"
-grep -q "days=' + q" web/src/api/index.js || fail1022 "前端未把回溯范围传给服务端"
+grep -q "days=' + d" web/src/api/index.js || fail1022 "前端未把回溯范围传给服务端（fetchSignalLogs 必须把 days 拼进查询串；§PAYLOAD-BOUND 把它从 q 改成带钳制的 d，锚串同批跟着改）"
 # ⑤ 行为腿：冻结语义（nil≠0）、归档读边界（内存空回落当日归档）、days 解析、精细参数读写往返。
 if ! go test -count=1 ./internal/combat_agent -run 'TestFreezeQuote|TestFreezeMarketQuote|TestFreezeStockQuote|TestSignalChangePctJSON' >/dev/null 2>&1; then
 	fail1022 "行情冻结回归测试未通过（缺价/平盘/派生昨收/JNil 与 0 的 JSON 区分任一丢失）"
@@ -17732,7 +17732,8 @@ N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server
 [ "$N144" -eq 14 ] || fail144 "user_admin 严格路由应为 14，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermConfigAdmin' internal/server/server.go || true)
-[ "$N144" -eq 21 ] || fail144 "config_admin 严格路由应为 21，实得 $N144"
+# 21→23：§SUBSCRIPTION-A 裁决 4/12 开了 GET/POST /api/config/runtime（runtime 段行情开关写面）
+[ "$N144" -eq 23 ] || fail144 "config_admin 严格路由应为 23，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermOpsAdmin' internal/server/server.go || true)
 [ "$N144" -eq 14 ] || fail144 "ops_admin 严格路由应为 14，实得 $N144"
