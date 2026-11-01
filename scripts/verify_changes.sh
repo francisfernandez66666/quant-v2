@@ -6420,14 +6420,18 @@ leg106 'engine 买入两闸（低价默认拦/负数关闭/压线阈值/碎单�
 	'TestBuyFloor'
 
 # 三件套等值闸：路由表条目数 == DefaultAlertRules 条数（本批 15→18，§107 再 +1＝19，两侧同批动）
-# §W7-COUNT-SYNC（2026-10-09 波 7）：现**实数 20**（必推 12 / 日汇总 8，两个集合名字逐一对齐）。
+# §W7-COUNT-SYNC（2026-10-09 波 7）：当时**实数 20**（必推 12 / 日汇总 8，两个集合名字逐一对齐）。
+# §SUBSCRIPTION-A（2026-11-01 改判 16）：+1 条 `broker_feed_unavailable` ⇒ **现数 21**（必推 13 / 日汇总 8）。
+#   加这条不是"越界型"新功能，而是出厂开的**配套自证腿**：默认开之后最坏结局是"开关开着、
+#   通道一秒都没喂"，而它在页面上与"没开"长得一样。判据只在盘中给（盘前 QMT 客户端没起、
+#   休市日空闲都是正常态），量规用 0=不适用，规则用 ge 2 ⇒ 0/1 都不触发，不会假红。
 #   多出来的那一条是波 5 §P2-E 的 settlement_not_verified——它入表时只加了路由条目和规则注册，
 #   没动这里的文案，于是「（19 条）」在本批之前一直是**过时读数**（同 §0929「加腿没同步计数」家族）。
 #   取向：文案里的数字不是判据（判据是 TestRoutingCoversAllDefaultRules 里的等值比较，它按
 #   len(DefaultAlertRules()) 派生，加一条规则不需要改测试），所以这里只做**说明同步**；
 #   真正的锁面是 §114 里那枚「说明里的条数必须等于源码派生条数」的等值锁——下次再加规则却忘了
 #   同步文案时，红的是这枚锁而不是读者的眼睛。
-leg106 'metrics 路由覆盖全规则（20 条：必推 12 / 日汇总 8）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
+leg106 'metrics 路由覆盖全规则（21 条：必推 13 / 日汇总 8）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
 leg106 'engine 零信号心跳（判据/成对反证/非实盘不落笔/接线）' ./internal/engine/ \
 	'TestSignalHeartbeatAgePredicate|TestFeedSignalHeartbeatZeroAndPinnedPair|TestFeedSignalHeartbeatNonLiveDoesNotWrite|TestSignalHeartbeatRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
 leg106 'trading 已实现盈亏心跳（配对/孤儿卖出/非实盘不落笔/键名对齐）' ./internal/trading/ \

@@ -126,11 +126,12 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 20 条：
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 21 条：
 // §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条、§0929HB-1/-2/-3
 // 加入三条"应有值缺失"型业务心跳、§0929HB-4 加入休市日增量型心跳＝第 19 条、
-// §P2-E（波 5）加入 settlement_not_verified＝第 20 条；2026-10-09 波 7 按脚本实数把这段的
-// "现 19 条"同步成 20，门禁 §106 那条行为腿文案里的 19 也一并跟上，两侧同批动），
+// §P2-E（波 5）加入 settlement_not_verified＝第 20 条；§SUBSCRIPTION-A 改判 16 加入
+// broker_feed_unavailable＝第 21 条（券商行情出厂开之后的通畅自证腿，必推），
+// 门禁 §106/§114 的文案与 RUNBOOK 的「业务心跳」条与 §3.7 运维卡同批同步——这段文案本身就被等值锁盯着），
 // alert_routing_test 有等值锁（路由条数 == 规则条数），漏一条即判红）。
 // English: factory routing table covering all DefaultAlertRules() entries.
 func DefaultAlertRouting() AlertRoutingConfig {
