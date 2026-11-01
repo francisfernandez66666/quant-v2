@@ -9621,6 +9621,7 @@ echo "==> 7 末段..."
 echo "ok - fixture s7"
 
 echo ""
+
 echo "==> 全部通过"
 P2LB_ONE
 ;;
@@ -18382,4 +18383,134 @@ grep -qF '605999' web/e2e/uat_full.spec.mjs || fail159 "合法股票码 605999 �
 echo "ok - §159 §UAT-FIXTURE 锁通过（lots 递归 / WLTEST 清零 / 合法码在位，累计判定点 ${CNT159}）"
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# §160 §SUBSCRIPTION（2026-11-01）：申购类委托「识别 + 标注 + 不进撤单/对账」锁
+#   判据本体：识别锚在「代码段」，与状态码能否读懂无关（docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md B1-B6）。
+#   本段只锁"别改回去"的形状：判据顺序、标注不过滤、护栏两路都在、开关缺省＝旧行为、
+#   两端段表与 RUNBOOK 同源、86 不许被造中文语义。行为正确性由同批单测负责。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 160 §SUBSCRIPTION（申购识别：判据顺序 / 标注不隐藏 / 撤单护栏 / 开关缺省关）..."
+B160_FAILED=0
+fail160() {
+	echo "--- FAIL: §160 $*"
+	FAIL=1
+	B160_FAILED=1
+}
+CNT160=0
+
+# ① 判据单源在 Go 侧存在，且三段语义齐备（仅申购段 / 同段 / 依据串）
+CNT160=$((CNT160 + 1))
+[ -f internal/trading/subscription.go ] || fail160 "internal/trading/subscription.go 不在位（判据单源丢了）"
+CNT160=$((CNT160 + 1))
+grep -qF 'subscriptionOnlyPrefixes' internal/trading/subscription.go || fail160 "「仅申购段」表丢了"
+CNT160=$((CNT160 + 1))
+grep -qF 'subscriptionSharedPrefixes' internal/trading/subscription.go || fail160 "「与正股同段」表丢了（00/30 那一半必须有上市证据才判定）"
+CNT160=$((CNT160 + 1))
+grep -qF 'known && !listed' internal/trading/subscription.go || fail160 "同段判定的三态守卫丢了：数据不足必须落回不判定（裁决 8）"
+
+# ② 网关侧段表与计数分家在位，且**识别早于**「未知状态」那条分支
+CNT160=$((CNT160 + 1))
+grep -qF 'SUBSCRIPTION_ONLY_PREFIXES' qmt_gateway/gateway.py || fail160 "网关段表丢了"
+SUB_ROW_LINE=$(grep -n 'if subscription_only_segment(code):' qmt_gateway/gateway.py | head -1 | cut -d: -f1)
+UNK_LINE=$(grep -n 'if not status or status.startswith("未知"):' qmt_gateway/gateway.py | head -1 | cut -d: -f1)
+CNT160=$((CNT160 + 1))
+[ -n "${SUB_ROW_LINE:-}" ] && [ -n "${UNK_LINE:-}" ] && [ "$SUB_ROW_LINE" -lt "$UNK_LINE" ] \
+	|| fail160 "识别必须早于「未知状态」分支（顺序反了 86 那批仍走 unknown 计数，本批等于白做）：sub=$SUB_ROW_LINE unknown=$UNK_LINE"
+CNT160=$((CNT160 + 1))
+grep -qF 'self._orders_sub_rows_seen.add(oid)' qmt_gateway/gateway.py || fail160 "申购行计数未按委托号去重（每 10s 重放会按轮次虚增）"
+
+# ③ 观测位三键齐备（关着也要留痕那条是追加裁决 15 的落点）
+CNT160=$((CNT160 + 1))
+for k in '"subscription_rows"' '"subscription_would_label"' '"subscription_recognize"'; do
+	grep -qF "$k" qmt_gateway/gateway.py || fail160 "orders_sync 缺键 $k"
+done
+
+# ④ 读面**标注不隐藏**：关路径写全量列表、开路径逐行入视图、按日过滤只有一处
+CNT160=$((CNT160 + 1))
+grep -qF 'writeJSON(w, 200, out)' internal/server/qmt.go || fail160 "开关关着时不再输出原列表（隐藏形状的早期信号）"
+CNT160=$((CNT160 + 1))
+grep -qF 'labeled = append(labeled, qmtOrderView{RealOrder: o' internal/server/qmt.go || fail160 "开路径不再逐行入视图＝开始丢行了"
+CNT160=$((CNT160 + 1))
+# 只数 handleQMTOrders 函数体内（从函数头到下一个顶格 func）：全文计数会把别的列表读面也算进来
+H160_BODY=$(awk '/^func \(s \*Server\) handleQMTOrders\(/ {f=1} f && /^}/ {print; exit} f {print}' internal/server/qmt.go)
+APPEND_OUT=$(printf '%s\n' "$H160_BODY" | grep -c 'out = append(out')
+[ "$APPEND_OUT" = "1" ] || fail160 "当日委托读面的 out 追加点应为 1 处（只剩按日过滤），现测 $APPEND_OUT 处＝多了一道过滤（裁决 7：申购行要能看见）"
+CNT160=$((CNT160 + 1))
+grep -qF '`json:"subscription"`' internal/server/qmt.go || fail160 "响应视图缺 subscription 标注字段"
+
+# ⑤ 撤单护栏两路都在（紧急停止 + 例行/收盘），且共用同一个判据函数
+CNT160=$((CNT160 + 1))
+GUARD_HITS=$(grep -c 'SubscriptionCancelGuard && CancelSkipsSubscriptionRow' internal/trading/controller.go)
+[ "$GUARD_HITS" = "2" ] || fail160 "撤单护栏应恰好两处（HaltAll 与 SweepOrders），现测 $GUARD_HITS 处"
+CNT160=$((CNT160 + 1))
+grep -qF 'SubscriptionSkipped int' internal/trading/controller.go || fail160 "SweepResult 的跳过计数丢了（并进 Skipped 会把两种含义混成一件事）"
+
+# ⑥ 交割单 0 值行不进事实键匹配，且挂在开关后面（关＝与今天一致）
+CNT160=$((CNT160 + 1))
+grep -qF 'SubscriptionRecognize && (t.Qty <= 0 || t.Price <= 0)' internal/trading/settlement.go || fail160 "对账侧的 0 值登记行跳过丢了／或它被摘出了开关控制"
+
+# ⑦ 开关缺省必须是关（本批「要做开关、不能直接上」的硬要求；四个装配点同源）
+CNT160=$((CNT160 + 1))
+grep -qE 'SubscriptionRecognize[[:space:]]+\*bool `json:"subscription_recognize"`' internal/server/qmt.go || fail160 "设置页写面没把开关做成指针（nil＝本次不改，值语义会被抹平）"
+CNT160=$((CNT160 + 1))
+grep -qE 'SubscriptionCancelGuard[[:space:]]+\*bool `json:"subscription_cancel_guard"`' internal/server/qmt.go || fail160 "撤单护栏开关没进设置页写面"
+CNT160=$((CNT160 + 1))
+grep -qF '"subscription_recognize": False' qmt_gateway/gateway.py || fail160 "网关侧开关缺省不是 false（＝发版即生效，违反本批纪律）"
+CNT160=$((CNT160 + 1))
+KEYSites=$(grep -c 'subscription_recognize' internal/server/qmt.go internal/config/config.go qmt_gateway/gateway.py | grep -c ':')
+[ "$KEYSites" = "3" ] || fail160 "subscription_recognize 必须三处同源（config 定义 / server 写读 / gateway 默认），现测 $KEYSites 个文件"
+
+# ⑧ golden 契约文件在位，且新文件已进部署清单（历史上漏落新文件直接把网关起不来）
+CNT160=$((CNT160 + 1))
+[ -f qmt_gateway/contract/subscription_codes.json ] || fail160 "段表 golden 丢了"
+CNT160=$((CNT160 + 1))
+# golden 必须被两端测试同时引用（Go 常量锁 + 网关段表锁）——只有一端引用＝另一端可以随便漂
+grep -qF 'subscription_codes.json' internal/trading/subscription_test.go || fail160 "Go 侧没引用段表 golden"
+CNT160=$((CNT160 + 1))
+grep -qF 'subscription_codes.json' qmt_gateway/tests/test_subscription_codes.py || fail160 "网关侧没引用段表 golden"
+CNT160=$((CNT160 + 1))
+# 负锁：运行时**绝不读** golden 文件。Go 与网关在两个目录树，运行时读文件＝新增落位依赖，
+# 且读失败的方向是"空表 ⇒ 永不识别 ⇒ 静默无效"（代码是源、JSON 是锁，照 quote_sources.json 的姿势）
+if grep -qE 'open\(.*subscription_codes|read_text\(.*subscription_codes' qmt_gateway/gateway.py; then
+	fail160 "网关在运行时读取段表文件（应当内联 + 测试锁；读失败会静默变成永不识别）"
+fi
+
+# ⑨ 测试在册（行为正确性由它们负责，本段只保证"没人把测试悄悄删了"）
+CNT160=$((CNT160 + 1))
+for tn in TestClassifyMatrix TestSubscriptionGoldenMatchesConsts TestCancelGuardWhitelistShape TestHaltAllCancelsUnknownSignalIdPrefix TestHaltAllEqualsLegacyWhenGuardOff; do
+	grep -rqF "func $tn" internal/trading/ || fail160 "Go 用例 $tn 不在册"
+done
+CNT160=$((CNT160 + 1))
+for tn in TestQMTOrdersMarksNotHides TestQMTOrdersEqualsLegacyWhenSwitchOff TestSubscriptionSwitchesRoundTripAndEcho; do
+	grep -rqF "func $tn" internal/server/ || fail160 "Go 用例 $tn 不在册"
+done
+CNT160=$((CNT160 + 1))
+grep -qF 'def test_never_fakes_status_label' qmt_gateway/tests/test_subscription_codes.py || fail160 "网关"状态不许造假语义"用例丢了"
+CNT160=$((CNT160 + 1))
+grep -qF '申购行照常列出并标「申购」' web/src/__tests__/subscription_orders_ui_20261101.test.jsx || fail160 "前端标注/不隐藏用例丢了"
+
+# ⑩ RUNBOOK 与 payload 键名同源（文档说的和代码给的是同一本账）
+CNT160=$((CNT160 + 1))
+for tok in subscription_rows subscription_would_label subscription_recognize; do
+	grep -qF "$tok" docs/RUNBOOK_QMT_DAILY.md || fail160 "RUNBOOK 缺 $tok 的运维说明（键名必须与网关 payload 同源）"
+done
+
+# ⑪ 负锁：三处"别改回去"的形状
+CNT160=$((CNT160 + 1))
+if grep -qE 'Subscription|ClassifySubscription' internal/store/real_positions.go; then
+	fail160 "分类逻辑伸进了账本读取层：隐藏/过滤只许在 handler 读面，store 层一改就把对账与预算一起改掉"
+fi
+CNT160=$((CNT160 + 1))
+if grep -qE '^ *86: *"' qmt_gateway/qmt_bridge_strategy.py; then
+	fail160 "桥侧给状态码 86 造了中文语义（owner 裁定不映射不追；识别靠代码段，不靠状态码）"
+fi
+CNT160=$((CNT160 + 1))
+if grep -qE '^ *"86": *"' qmt_gateway/handler.py; then
+	fail160 "网关 handler 给 86 造了中文语义（同上）"
+fi
+
+[ "$B160_FAILED" = "0" ] || exit 1
+echo "ok - §160 §SUBSCRIPTION 锁通过（判据单源 4 + 网关顺序与去重 3 + 观测位 1 + 读面不隐藏 4 + 撤单护栏 2 + 对账 1 + 开关缺省 4 + golden 与同源引用 4 + 测试在册 3 + 文档同源 1 + 负锁 3，累计判定点 ${CNT160}）"
+
 echo "==> 全部通过"
+

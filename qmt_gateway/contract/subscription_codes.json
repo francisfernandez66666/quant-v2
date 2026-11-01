@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "calibration": "pending",
+  "calibration_note": "owner 2026-11-01 裁决 9：段表先用一天真实委托表校准再固化。校准完成前本文件标 pending；取证通道见 docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md B1（网关日志「委托表状态不可读，跳过」行为主源，bridge_report.jsonl 有 5MB 轮转窗口约 50 分钟）。",
+  "only_segments": ["730", "732", "787", "754", "733", "783", "370", "380", "07", "08"],
+  "only_segments_meaning": {
+    "730/732": "沪市新股申购（主板）",
+    "787": "沪市新股申购（科创板）",
+    "754/733/783": "沪市新债（可转债）申购与配售",
+    "370/380": "深市新债申购/配售",
+    "07/08": "深市申购与配号（六位码 07xxxx/08xxxx 永不作为可交易正股出现）"
+  },
+  "shared_segments": ["00", "30"],
+  "shared_segments_meaning": "深市新股申购与正股同段，必须靠 IPO 日历证实未上市才判定；数据不足一律不判定（裁决 8）。",
+  "unverified_segments": ["889", "810", "920"],
+  "unverified_segments_reason": "北交所挂牌公司代码本身 4/8 开头、920 段是正股，把这三段当「永不交易」有把真持仓票误标成申购的实际风险。原方案表里有 889/810（标注待校准）——校准前刻意不进 only_segments，留在不判定一侧。",
+  "samples": [
+    {"code": "370181.SZ", "qty": 0, "price": 0, "listed": "unknown", "expect_subscription": true, "expect_reason": "only-segment", "note": "2026-10-29 现网实录：深市新债申购，状态码 86"},
+    {"code": "730899", "qty": 1000, "price": 50, "listed": "unknown", "expect_subscription": true, "expect_reason": "only-segment", "note": "段优先：价量正常也判申购"},
+    {"code": "080123", "qty": 10, "price": 100, "listed": "unknown", "expect_subscription": true, "expect_reason": "only-segment"},
+    {"code": "002961", "qty": 500, "price": 12.5, "listed": "listed", "expect_subscription": false, "expect_reason": "", "note": "同段但已上市＝真实委托，绝不标注"},
+    {"code": "301099", "qty": 100, "price": 8.8, "listed": "unlisted", "expect_subscription": true, "expect_reason": "unlisted", "note": "同段 + IPO 日历证实未上市"},
+    {"code": "001399", "qty": 100, "price": 8.8, "listed": "unknown", "expect_subscription": false, "expect_reason": "", "note": "裁决 8：数据不足 ⇒ 保留，不判定"},
+    {"code": "600000.SH", "qty": 0, "price": 0, "listed": "unknown", "expect_subscription": false, "expect_reason": "", "note": "裁决 ③：0 值单独绝不构成判定"},
+    {"code": "920001", "qty": 0, "price": 0, "listed": "unknown", "expect_subscription": false, "expect_reason": "", "note": "校准前 920 段不判（北交所正股段）"},
+    {"code": "abc123", "qty": 0, "price": 0, "listed": "unknown", "expect_subscription": false, "expect_reason": "", "note": "脏代码 ⇒ 不判定"},
+    {"code": "430139", "qty": 0, "price": 0, "listed": "unknown", "expect_subscription": false, "expect_reason": "", "note": "北交所 4 开头挂牌段绝不进仅申购段表"}
+  ],
+  "consumers": {
+    "go": "internal/trading/subscription.go（subscriptionOnlyPrefixes / subscriptionSharedPrefixes）",
+    "python": "qmt_gateway/gateway.py（SUBSCRIPTION_ONLY_PREFIXES / SUBSCRIPTION_SHARED_PREFIXES）",
+    "lock": "internal/trading/subscription_test.go 与 qmt_gateway/tests/test_subscription_codes.py 各自做双向等值锁"
+  },
+  "asymmetry": "网关侧只认 only_segments，shared_segments 一律不判定（它没有 IPO 日历，不猜上市状态）。这个不对称是刻意的，被两侧测试各自锁住。"
+}

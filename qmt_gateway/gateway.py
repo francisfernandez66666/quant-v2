@@ -152,6 +152,12 @@ DEFAULT_CONFIG = {
     # §ENH-5 批E 只读 L1 行情通道（xtdata get_full_tick 轮询；与交易链路完全隔离）
     "quote_feed": True,             # feed 总开关（xtdata 缺失环境自动静默停用）
     "feed_poll_sec": 3,             # 轮询间隔（秒，下限 1s）
+    # §SUBSCRIPTION（2026-11-01 裁决 7 + 追加裁决「这批改动要做开关」）申购行识别总开关。
+    # 缺省 False＝与今天逐字节一致：申购行仍被"状态读不懂"那条分支吞掉，只多一个
+    # subscription_would_label 计数（关着也留痕）。打开后这些行才照常上报落库、并计入
+    # subscription_rows。Go 侧对应键是 rules.qmt.subscription_recognize，两个键漂移的
+    # 方向是"网关吞行、Go 没得标"＝少标注，不会标错，属 fail-safe 一侧。
+    "subscription_recognize": False,
     "max_order_amount": 0,              # 单笔金额绝对帽（元，买卖双向；amount 缺失回退 qty×price）
     "allowed_strategies": [],           # 战法白名单（非空时买入单 strategy_type 必须命中）
     "strict_fields": False,             # 白名单启用时缺 strategy_type 是否 fail-close 拒单
@@ -181,6 +187,58 @@ CONTRACT_IGNORED_FIELDS = {
 # 绝不允许「按买入校验、下成卖单」。
 # English: the only legal order sides accepted at the gateway door — everything else is a 400.
 ORDER_SIDES = ("买入", "卖出")
+
+# §SUBSCRIPTION（2026-11-01 裁决 6/7/9）新股/新债「申购类委托行」的识别段表。
+#
+# 为什么要换锚：旧形状是「状态读不懂 ⇒ 整行吞掉并计入 unknown_status_skipped」。申购行的形态是
+# 「申购代码段 + qty=0 + price=0」，状态码 86 桥侧读不懂（owner 裁定不给它造中文语义），
+# 于是每个申购日都在给"柜台有一种我们读不懂的状态码"这个唯一现网告警位注水；更要命的是
+# 排除的锚挂在"读不懂"而不是"这是申购"上——哪天有人按 RUNBOOK 补了映射，同一批行就会
+# 出现在委托列表并被撤单循环当在途单发撤单（柜台必拒）。
+# 本批把锚换正：识别只依赖代码段，与状态码能否读懂无关。
+#
+# 与 Go 侧 internal/trading/subscription.go 逐项一致（golden：contract/subscription_codes.json，
+# 两端各有双向等值用例）。运行时不读文件：Go 与网关在两个目录树，读失败的方向会是
+# 「空表 ⇒ 永不识别 ⇒ 静默无效」，所以照 quote_sources.json 的既有姿势——代码是源、JSON 是锁。
+#
+# 网关侧刻意只认 only_segments：shared_segments（深市 00/30 与正股同段）需要 IPO 日历证实
+# 「未上市」才敢判定，网关没有那份日历 ⇒ 按裁决 8「数据不足 ⇒ 不判定」留在噪声侧。
+# English: gateway-side recognition uses only the never-tradable segments; the shared 00/30
+# segments require IPO-calendar evidence the gateway does not have, so they are never decided here.
+SUBSCRIPTION_ONLY_PREFIXES = ("730", "732", "787", "754", "733", "783", "370", "380", "07", "08")
+SUBSCRIPTION_SHARED_PREFIXES = ("00", "30")  # 仅登记在表供等值锁，网关不据此判定
+
+
+def _bare_code(code):
+    """任意写法（600519 / 600519.SH / sh600519）归一为裸六位码；非六位纯数字回空串。
+
+    空串＝脏代码，调用方据此一律判"不是申购"（fail-safe：脏值不许被分类掉）。
+    """
+    s = str(code or "").strip()
+    if not s:
+        return ""
+    if "." in s:
+        s = s.split(".", 1)[0]
+    if len(s) == 8 and s[:2].lower() in ("sh", "sz", "bj"):
+        s = s[2:]
+    return s if len(s) == 6 and s.isdigit() else ""
+
+
+def subscription_only_segment(code):
+    """是否命中「仅申购段」——该段永不作为可交易正股出现，命中即可判定，不需要上市状态。"""
+    bare = _bare_code(code)
+    if not bare:
+        return False
+    return any(bare.startswith(p) for p in SUBSCRIPTION_ONLY_PREFIXES)
+
+
+def subscription_registration_form(qty, price):
+    """登记形态佐证（0 量或 0 价）。**只允许与"仅申购段"一起用**，单独不构成任何判定。"""
+    try:
+        return int(qty or 0) <= 0 or float(price or 0) <= 0
+    except (TypeError, ValueError):
+        return True  # 读数本身坏了 ⇒ 保守（只在"仅申购段"命中时被消费，非申购段走不到这里）
+
 
 # §A4（2026-09-22 修复批）文件桥"逐行推进位点"的重试计数表里，末段无换行残段的特殊键。
 # 用不会与任何 JSON 行文本相等的前缀键，避免和正常行的计数互相污染。
@@ -380,6 +438,13 @@ class Gateway:
         self._orders_snap = {"by_id": {}, "ts": 0.0, "data_ts": "", "n": 0}
         self._order_miss = {}
         self._orders_snap_skipped_unknown = 0
+        # §SUBSCRIPTION（2026-11-01）申购行识别计数：委托表每 10s 重放一次，同一 oid 会被
+        # 反复看到，所以两个计数都**按 oid 去重**（集合存 oid），否则数字会按轮次虚增、
+        # 运维拿它对照"当日申购笔数"就永远对不上。would_label 是开关关着时的留痕
+        # （追加裁决 15：关≠不存在），rows 是开关打开后真实上报的笔数。
+        self._orders_sub_rows_seen = set()
+        self._orders_sub_would_label_seen = set()
+        self._orders_sub_row_warned_at = 0.0  # 留痕日志的 60s 节流位（不逐票刷屏）
         # §CLOSE-RECON（2026-10-28）收盘对账观测位：桥在 15:01 的收盘快照打 close_snapshot=true，
         # 网关只记"最近一次收盘快照的时刻/行数"——它回答"当天收盘那 3 分钟的成交有没有回传"，
         # 是 600362 事故（委托行说已撤、实际成交没回传）的唯一现网信号。
@@ -1502,12 +1567,36 @@ class Gateway:
         created = self._norm_snap_created(r.get("created_at", ""))
         day = created[:10]
         status = str(r.get("status", "") or "")
+        # §SUBSCRIPTION 识别必须**早于**"状态读不懂"那条分支（顺序是判据本体：
+        # 挪到后面，86 那批仍走 unknown 计数，本批等于白做）。
+        # 计数按 oid 去重（委托表每 10s 重放），日志按 60s 节流——两条形都不能反。
+        if subscription_only_segment(code):
+            if bool(self.cfg.get("subscription_recognize", False)):
+                self._orders_sub_rows_seen.add(oid)
+                log.info("[gateway] §SUBSCRIPTION 申购行识别并照常上报 oid=%s code=%s status=%s "
+                         "qty=%s price=%s（状态原样透传，绝不造中文语义）",
+                         oid, code, status, r.get("qty"), r.get("price"))
+            else:
+                # 追加裁决 15：开关关着也要留痕——记"本来会标注什么"，
+                # 这份样本同时是段表校准（裁决 9）的取证通道之一。
+                self._orders_sub_would_label_seen.add(oid)
+                now_ts = time.time()
+                if now_ts - self._orders_sub_row_warned_at >= 60:
+                    self._orders_sub_row_warned_at = now_ts
+                    log.info("[gateway] §SUBSCRIPTION 识别开关未启用，本应标注的申购行样本 "
+                             "code=%s status=%s qty=%s price=%s（计数仍在累加，日志 60s 节流一条）",
+                             code, status, r.get("qty"), r.get("price"))
         if not status or status.startswith("未知"):
-            # 读不懂的状态不冒充任何已知态（§W7-C 同姿势），计数留痕等人工核对
-            self._orders_snap_skipped_unknown += 1
-            log.warning("[gateway] §MANUAL-SYNC 委托表状态不可读，跳过 oid=%s code=%s status=%s",
-                        oid, code, status)
-            return
+            if subscription_only_segment(code) and bool(self.cfg.get("subscription_recognize", False)):
+                # 申购行不再被这条分支吞掉：它要落进委托账、要被看见（裁决 7）。
+                # 注意这里**不**改写 status——未知就是未知，owner 裁定不给 86 造中文语义。
+                pass
+            else:
+                # 读不懂的状态不冒充任何已知态（§W7-C 同姿势），计数留痕等人工核对
+                self._orders_snap_skipped_unknown += 1
+                log.warning("[gateway] §MANUAL-SYNC 委托表状态不可读，跳过 oid=%s code=%s status=%s",
+                            oid, code, status)
+                return
         drow = None
         if remark:
             drow = self.store.dispatch_by_signal_id(remark)
@@ -2068,6 +2157,15 @@ class Gateway:
             "miss_pending": len(self._order_miss),
             "unknown_status_skipped": int(self._orders_snap_skipped_unknown),
             "miss_limit": int(self.cfg.get("manual_sync_miss_limit", self.ORDER_MISS_LIMIT) or 0),
+            # §SUBSCRIPTION 三个读数（裁决 7 + 追加裁决「关着也留痕」）：
+            #   subscription_rows          开关已开、真实上报的申购行数（按 oid 去重）
+            #   subscription_would_label   开关关着、本应标注的行数——正常可以 >0 且**不告警**，
+            #                              它是段表校准的取证源，也是"开了会多几笔"的预量
+            #   subscription_recognize     开关此刻的真实状态，运维不必猜现网是哪种形态
+            # unknown_status_skipped 从此只表示"真有一种读不懂的码"（开关开后的语义分家）。
+            "subscription_rows": len(self._orders_sub_rows_seen),
+            "subscription_would_label": len(self._orders_sub_would_label_seen),
+            "subscription_recognize": bool(self.cfg.get("subscription_recognize", False)),
         }
         # §CLOSE-RECON 观察位：最近一次收盘快照（桥 15:01 定时任务打的那一帧）。
         # day 为空＝桥从来没打过收盘快照 ⇒ 收盘那 3 分钟的成交不在账上，

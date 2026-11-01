@@ -140,21 +140,26 @@ type EngineController interface {
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
 type Server struct {
-	auth        *auth.Manager                                                                                                              // 认证管理器：注册/登录/临时账号/token 校验
-	agg         *display.Aggregator                                                                                                        // 看板数据聚合器（读取实时看板快照）
-	cfg         *config.Manager                                                                                                            // 配置管理器（策略/D1/LLM 参数）
-	rpt         *report.Report                                                                                                             // 交易持仓报告（开仓/平仓/统计）
-	mux         *http.ServeMux                                                                                                             // 路由注册表
-	market      *data.MarketAPI                                                                                                            // 行情数据 API（实时报价/板块/IPO 等）
-	ths         *data.THSClient                                                                                                            // 同花顺客户端（板块行情表）
-	fetcher     *data.Fetcher                                                                                                              // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
-	dc          *data.DataCoordinator                                                                                                      // 行情统一数据源（新浪→同花顺→东财 三级降级链）
-	paper       *paper.Engine                                                                                                              // 模拟盘引擎（独立纸面交易，nil=未启用）
-	watchlist   *data.WatchlistManager                                                                                                     // 自选股管理器
-	sse         *SSEBroker                                                                                                                 // SSE 事件广播器（向前端实时推送）
-	startTime   time.Time                                                                                                                  // 服务启动时间（用于 uptime 统计）
-	llmRecreate func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) // 热重建 LLM 客户端
-	ctrl        EngineController                                                                                                           // 引擎控制面（做多/做空开关、流水线调试数据等）
+	auth      *auth.Manager          // 认证管理器：注册/登录/临时账号/token 校验
+	agg       *display.Aggregator    // 看板数据聚合器（读取实时看板快照）
+	cfg       *config.Manager        // 配置管理器（策略/D1/LLM 参数）
+	rpt       *report.Report         // 交易持仓报告（开仓/平仓/统计）
+	mux       *http.ServeMux         // 路由注册表
+	market    *data.MarketAPI        // 行情数据 API（实时报价/板块/IPO 等）
+	ths       *data.THSClient        // 同花顺客户端（板块行情表）
+	fetcher   *data.Fetcher          // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
+	dc        *data.DataCoordinator  // 行情统一数据源（新浪→同花顺→东财 三级降级链）
+	paper     *paper.Engine          // 模拟盘引擎（独立纸面交易，nil=未启用）
+	watchlist *data.WatchlistManager // 自选股管理器
+	sse       *SSEBroker             // SSE 事件广播器（向前端实时推送）
+	// §SUBSCRIPTION（2026-11-01）上市状态问询腿的进程内单例（懒构造，见 subscription_listing.go）。
+	// 用 Once + 指针而不是在 New 里构造：DataCoordinator 是启动后期由 SetCoordinator 注入的，
+	// 构造期抓指针会永远是 nil。
+	subListingOnce sync.Once                                                                                                                  // 申购上市问询腿的单例锁
+	subListing     *subListingProbe                                                                                                           // 申购上市问询腿（缓存 30min）
+	startTime      time.Time                                                                                                                  // 服务启动时间（用于 uptime 统计）
+	llmRecreate    func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) // 热重建 LLM 客户端
+	ctrl           EngineController                                                                                                           // 引擎控制面（做多/做空开关、流水线调试数据等）
 
 	researchDB  *store.DB // B5 研究候选库（optimize 产出入库；web 审批读写）
 	researchDir string    // B5 应用目录（applied_rules.json 落盘处）

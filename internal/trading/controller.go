@@ -1122,6 +1122,17 @@ func (c *Controller) HaltAll() HaltAllResult {
 		if !isCancellableStatus(o.Status) || strings.HasPrefix(o.OrderID, "pend:") {
 			continue
 		}
+		// §SUBSCRIPTION（2026-11-01 裁决 6，缺省关）撤单护栏：仅申购段 ∧ 0 值登记形态的行不发撤单
+		// （柜台不接受撤它，发过去只得到拒单 + Failed 明细 + 前端「笔撤单请求未发出」）。
+		// 白名单形状：判据只在「仅申购段 ∧ 0 值」这一类成立时跳过，其余（含字段脏的真实委托、
+		// 陌生前缀）一律照撤——紧急停止不许因为一个新护栏静默漏撤真单。
+		// 既有规矩「紧急停止仍撤全部可撤真实委托」的口径随之明确为"可撤的真实委托"，
+		// 见 docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md B4。
+		if c.cfg.SubscriptionCancelGuard && CancelSkipsSubscriptionRow(o.Code, o.Qty, o.Price) {
+			log.Printf("[trading] §SUBSCRIPTION 申购登记行不发撤单（紧急停止）order=%s code=%s qty=%d price=%.2f",
+				o.OrderID, o.Code, o.Qty, o.Price)
+			continue
+		}
 		if err := c.execRef().Cancel(o.OrderID); err != nil {
 			// §0925EVE-A2：失败不再只 log——记入明细，随响应回传前端并进 p1 量规。
 			// 本地行状态不动（可能仍"已报"），撤不掉的留给 SweepOrders 闭环/人工处置。
@@ -1155,6 +1166,12 @@ type SweepResult struct {
 	// 单列出来而不是并进 Skipped：Skipped 是"这单不需要撤"，WindowSkipped 是"想撤但现在不能撤"，
 	// 两者在排障时的含义完全不同（后者说明该单还挂在柜台上）。
 	WindowSkipped int // 禁撤窗口内被跳过的撤单笔数
+	// SubscriptionSkipped §SUBSCRIPTION（2026-11-01 裁决 6）：因是申购登记行（仅申购段 ∧ 0 值）
+	// 而未发撤单的笔数。开关关闭时恒 0（护栏不生效），所以这个数字本身就是"护栏开着且真拦到了"
+	// 的证据，运维可据此判断开关键有没有按下。
+	// English: cancels skipped because the row is an IPO-subscription registration (guard only;
+	// stays 0 while the switch is off, which doubles as proof of the switch state).
+	SubscriptionSkipped int // 申购登记行未发撤单的笔数
 }
 
 // ReconcileOrderStates §ORDER-STATE-PULL（2026-10-30）：用网关当日委托状态校正本地在途单。
@@ -1438,6 +1455,13 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		// 券商 App 里手下的单（signal_id=ext:<委托号>）是用户自己的动作，超时 120s
 		// 就被系统撤掉属于越权误杀；紧急停止（HaltAll）仍会连它们一起撤。
 		if strings.HasPrefix(o.SignalID, "ext:") {
+			continue
+		}
+		// §SUBSCRIPTION（2026-11-01 裁决 6，缺省关）例行超时撤单/收盘清场同样跳过申购登记行。
+		// 单列一个计数而不并进 Skipped：Skipped 是"这单不需要撤"，SubscriptionSkipped 是
+		// "这类行压根不是可撤对象"，两者在排障时的含义不同（同 WindowSkipped 的分列理由）。
+		if c.cfg.SubscriptionCancelGuard && CancelSkipsSubscriptionRow(o.Code, o.Qty, o.Price) {
+			res.SubscriptionSkipped++
 			continue
 		}
 		at, perr := time.Parse(time.RFC3339, o.CreatedAt)

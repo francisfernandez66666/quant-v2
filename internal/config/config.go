@@ -494,6 +494,27 @@ type QMTConfig struct {
 	// English: phase 2 of the pull reconciliation, default ON (owner ruling 2026-10-30), gated on
 	// real order ids, a fresh non-empty broker order-table snapshot, and a per-round cap.
 	OrderStatePullCloseMissing *bool `json:"order_state_pull_close_missing,omitempty"`
+	// SubscriptionRecognize §SUBSCRIPTION（2026-11-01 裁决 7 + 本批「要开关、不能直接上」）：
+	// 是否识别申购类委托行并让它们在委托列表里可见（带 subscription 标注）。
+	// **缺省 false＝与今天逐字节一致**：申购行仍被网关"状态读不懂"那条分支吞掉，Go 侧读面
+	// 也不加字段。打开后申购行才落进委托账并带 `subscription`/`subscription_reason` 标注。
+	// 与网关 config.xt.json 的同名键是两个独立开关（两边都缺省 false）；漂移的方向是
+	// 「网关吞行、Go 没得标」＝少标注，绝不会标错，属 fail-safe 一侧。
+	// English: recognize IPO-subscription order rows and expose them (labeled) in the order list.
+	// Default false keeps today's byte-for-byte behavior; drift between the two switches can only
+	// under-label, never mis-label.
+	// 申购行识别开关
+	SubscriptionRecognize bool `json:"subscription_recognize"`
+	// SubscriptionCancelGuard §SUBSCRIPTION（2026-11-01 裁决 6）：撤单护栏——紧急停止与例行
+	// 超时撤单/收盘清场不再对「仅申购段 ∧ 0 值登记形态」的行发撤单（柜台不接受撤它，发过去
+	// 只得到拒单噪声）。**判据是白名单跳过**（只这一类可以不撤），陌生前缀、字段脏的真实委托
+	// 一律照撤，防止把"跳过申购"换成"紧急停止漏撤一笔真单"。
+	// 缺省 false＝今天行为（全都发撤单），与"紧急停止仍撤全部可撤真实委托"那条既有规矩同形。
+	// 单独成键而不并进 SubscriptionRecognize：标注是无损的，护栏碰撤单路径，回滚半径不同。
+	// English: cancel-path guard for subscription registration rows, default off (= today's
+	// behavior). Its own key because labeling is lossless while this one touches the cancel path.
+	// 撤单护栏开关
+	SubscriptionCancelGuard bool `json:"subscription_cancel_guard"`
 	// MissHeartbeatSec 心跳超时秒数：网关 /health 连续失联超过该值 → 熔断暂停下单并告警（默认 120）。
 	// 心跳超时秒数
 	MissHeartbeatSec int `json:"miss_heartbeat_sec"`

@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quant-trading-v2/internal/auth"
@@ -1101,6 +1102,10 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		"entry_timeout_sec":              cfg.EntryTimeoutSec,
 		"max_signal_vwap_premium_pct":    cfg.MaxSignalVWAPPremiumPct,
 		"max_signal_vwap_premium_shadow": cfg.VWAPPremiumShadowOn(),
+		// §SUBSCRIPTION 两个开关必须回显**生效值**（F-05 的教训：只接受写入而不回显，
+		// 前端就会显示一个没人验证过的默认态，用户以为开了其实没开）。
+		"subscription_recognize":    cfg.SubscriptionRecognize,
+		"subscription_cancel_guard": cfg.SubscriptionCancelGuard,
 		"risk_gate": map[string]interface{}{
 			"sector_value_pct":       cfg.RiskGate.SectorValuePct,
 			"sector_value_shadow":    cfg.RiskGate.SectorValueShadowOn(),
@@ -1171,6 +1176,11 @@ type setQMTConfigReq struct {
 	MaxSignalVWAPPremiumPct *float64 `json:"max_signal_vwap_premium_pct"`
 	// §C2 VWAP 硬过滤影子模式（nil=不改）。
 	MaxSignalVWAPPremiumShadow *bool `json:"max_signal_vwap_premium_shadow"`
+	// §SUBSCRIPTION（2026-11-01）申购识别与撤单护栏两个开关（nil=本次不改，显式 true/false 落库）。
+	// 两个键分开而不是一把总闸：标注是无损的，护栏碰撤单路径（紧急停止），回滚半径不同。
+	// 缺省都是 false＝今天的字节行为，所以"没点开的账号"不会因本批改变任何行为。
+	SubscriptionRecognize   *bool `json:"subscription_recognize"`
+	SubscriptionCancelGuard *bool `json:"subscription_cancel_guard"`
 	// §C1/C3 风控闸参数（嵌套对象，指针=nil 本次不改）。
 	RiskGate *riskGatePatch `json:"risk_gate"`
 }
@@ -1321,6 +1331,15 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	}
 	if req.MaxSignalVWAPPremiumShadow != nil {
 		cfg.MaxSignalVWAPPremiumShadow = req.MaxSignalVWAPPremiumShadow
+	}
+	// §SUBSCRIPTION（2026-11-01）两个开关按"指针非 nil 才生效"合并，与其它键同一姿势。
+	// 这里不做任何"顺手默认打开"的处理：缺省 false 是 owner「这批要做开关、不能直接上」的兑现点，
+	// 也是每条 EqualsLegacyWhenOff 用例的前提。
+	if req.SubscriptionRecognize != nil {
+		cfg.SubscriptionRecognize = *req.SubscriptionRecognize
+	}
+	if req.SubscriptionCancelGuard != nil {
+		cfg.SubscriptionCancelGuard = *req.SubscriptionCancelGuard
 	}
 	if p := req.RiskGate; p != nil {
 		// pct 百分比字段的统一校验闭包：nil＝本次不改（返回 true 继续），越界＝回 400 并返回 false，
@@ -1684,7 +1703,81 @@ func (s *Server) handleQMTOrders(w http.ResponseWriter, r *http.Request) {
 		out = out[start:end]
 	}
 	setPaginationHeaders(w, total, page, size)
-	writeJSON(w, 200, out)
+
+	// §SUBSCRIPTION（2026-11-01 裁决 7 + 本批「要开关」）：申购行**要能看见，不许隐藏**，
+	// 所以这里只做标注、不做过滤——隐藏形状一律不许复活（门禁有负锁盯着 continue 掉申购行的写法）。
+	// 开关关闭时响应体与今天**逐字节一致**（不追加任何字段），这是"关≠新行为"的可验证边界；
+	// 同时留一条 would-label 观测（追加裁决 15：关≠不存在），它还是段表校准（裁决 9）的取证源之一。
+	//
+	// 标注走 handler 层派生而不是给 orders 表加列：分类是 (code, qty, price) 的纯函数（同段那一半
+	// 才查上市状态），落列会留下"行里写的语义与判据不同步"的第二本账，还要动 live.db DDL 与列清单。
+	// English: label, never hide. Switch-off output is byte-identical to today's; classification is
+	// derived at read time instead of persisted to avoid a second source of truth.
+	uid := userIDFor(r)
+	recognize := false
+	if q := s.cfg.GetQMTConfigFor(uid); q != nil {
+		recognize = q.SubscriptionRecognize
+	}
+	var src trading.ListingSource
+	if recognize {
+		src = s.subscriptionSource()
+	}
+	labeled := make([]qmtOrderView, 0, len(out))
+	wouldLabel := 0
+	for _, o := range out {
+		isSub, reason := trading.ClassifySubscription(o.Code, o.Qty, o.Price, src)
+		if !recognize {
+			if isSub {
+				wouldLabel++
+			}
+			continue
+		}
+		labeled = append(labeled, qmtOrderView{RealOrder: o, Subscription: isSub, SubscriptionReason: reason})
+	}
+	if !recognize {
+		if wouldLabel > 0 {
+			logSubscriptionWouldLabel(wouldLabel, out)
+		}
+		writeJSON(w, 200, out)
+		return
+	}
+	writeJSON(w, 200, labeled)
+}
+
+// qmtOrderView §SUBSCRIPTION 委托列表的响应视图：内嵌 store.RealOrder 让既有字段逐字节不变，
+// 只在其上追加两个标注字段。绝不给 store.RealOrder 加瞬态字段——那张结构体与读取列清单
+// （realOrderSelectColumns + TestRealOrderReadRoundTripAllFields）是一一对应的，混进非持久字段
+// 会把那条全字段回读锁判红。
+type qmtOrderView struct {
+	store.RealOrder
+	Subscription       bool   `json:"subscription"`                  // 该行是否申购类（true 也只是标注，不是过滤条件）
+	SubscriptionReason string `json:"subscription_reason,omitempty"` // 判定依据：only-segment / unlisted
+}
+
+// subWouldLabelLoggedAt 是"开关关着时的标注样本"日志节流位（60s 一条）。
+// 单进程一份即可：委托列表读面本来就同一个 server 实例，跨实例竞争最多多打一条，不构成噪声形态。
+var subWouldLabelLoggedAt atomic.Int64
+
+// logSubscriptionWouldLabel 追加裁决 15 的 L2 留痕：识别逻辑关着也在跑，记"本来会标注几行、
+// 都是什么代码与状态"。这些样本正是段表校准的取证通道（不依赖 bridge_report.jsonl 那个约 50 分钟的
+// 5MB 轮转窗口）。只打代码与计数，**绝不打账户号/委托金额明细**，且 60s 节流、样本最多 5 个。
+func logSubscriptionWouldLabel(n int, rows []store.RealOrder) {
+	now := time.Now().Unix()
+	prev := subWouldLabelLoggedAt.Swap(now)
+	if now-prev < 60 {
+		return
+	}
+	samples := make([]string, 0, 5)
+	for _, o := range rows {
+		if isSub, _ := trading.ClassifySubscription(o.Code, o.Qty, o.Price, nil); isSub {
+			samples = append(samples, o.Code)
+			if len(samples) >= 5 {
+				break
+			}
+		}
+	}
+	log.Printf("[qmt] §SUBSCRIPTION 识别开关未启用，本应标注的申购行 n=%d samples=%s（计数继续累加，日志 60s 一条）",
+		n, strings.Join(samples, ","))
 }
 
 // handleQMTHalt §R4-1 kill-switch 端点（POST /api/qmt/halt，admin 权限）：

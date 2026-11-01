@@ -1054,6 +1054,10 @@ export async function fetchQMTTrades(page = 1, pageSize = 100) {
 /** 实盘：当日委托列表（§U-2 撤单 UI 数据源；仅当日，含 order_id 供撤单） */
 /** Live: today's order tickets (data source for the cancel UI) */
 // 对应 GET /api/qmt/orders，返回 [{ order_id, signal_id, code, side, status, price, qty, created_at }]
+// §SUBSCRIPTION（2026-11-01）：后端识别开关打开后，每行还会带 `subscription`（是否申购类）与
+// `subscription_reason`（only-segment / unlisted）。**这是标注字段，不是过滤条件**——
+// 申购行照常出现在列表里（owner 裁决 7：能看，不隐藏）；开关关闭时两个键根本不下发，
+// 所以前端必须按"字段缺席＝未知"处理，不许把 undefined 当成 false 之外的任何含义。
 export async function fetchQMTOrders() {
   return request('/api/qmt/orders')
 }

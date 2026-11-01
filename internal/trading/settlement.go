@@ -234,6 +234,17 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, SettleO
 		if side == "" {
 			continue // 无法归一：跳过（记录在 diff）
 		}
+		// §SUBSCRIPTION（2026-11-01 裁决 7/9，开关缺省关）交割单里的 0 值登记行不进事实键匹配：
+		// 申购/配号那类行不是成交事实，放进多重集合就会造出"券商有、本地无"的假差异，
+		// 让对账在申购日恒红（红因是我们的匹配集合混进了非成交行，而不是账坏了）。
+		// 这是**防御性**跳过，只在识别开关打开后生效——关状态必须与今天逐字节一致。
+		// English: skip zero-qty/zero-price registration rows from the fact-key multiset (guard
+		// applies only while the recognition switch is on; default-off keeps today's behavior).
+		if c.cfg.SubscriptionRecognize && (t.Qty <= 0 || t.Price <= 0) {
+			log.Printf("[settle] §SUBSCRIPTION 交割单 0 值登记行不参与匹配 code=%s qty=%d price=%.2f order=%s",
+				t.TsCode, t.Qty, t.Price, t.OrderID)
+			continue
+		}
 		bt := brokerTrade{
 			Code: t.TsCode, Side: side, Price: t.Price, Qty: t.Qty,
 			Fee: t.Fee + t.StampTax, OrderID: t.OrderID, TradedAt: t.TradedAt, Serial: t.Serial,

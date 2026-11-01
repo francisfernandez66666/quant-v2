@@ -1453,6 +1453,13 @@ export default function Quant() {
           {String(row.signal_id || '').startsWith('ext:')
             ? <Tag size="small" theme="warning" style={{ marginLeft: 4 }}>手动</Tag>
             : null}
+          {/* §SUBSCRIPTION（2026-11-01 裁决 7）：申购类委托行**要能看见，不隐藏**，只标注。
+              券商 App 里的新股/新债申购也会被列进当日委托表（qty/price 常为 0），
+              标出来是为了"这行不是系统漏撤的在途单"，而不是把它藏起来。
+              标注来自后端派生（订阅开关打开后才有该字段），前端不自己猜代码段。 */}
+          {row.subscription
+            ? <Tag size="small" theme="default" style={{ marginLeft: 4 }} title={`判定依据：${row.subscription_reason || 'only-segment'}`}>申购</Tag>
+            : null}
         </span>
       ) },
       { colKey: 'code', title: '代码', width: 100 },
@@ -1466,15 +1473,19 @@ export default function Quant() {
       { colKey: 'created_at', title: '时间', width: 130, cell: ({ row }) => <span style={{ fontSize: 12 }}>{(row.created_at || '').replace('T', ' ').slice(5, 19)}</span> },
       {
         // 操作列：仅在可撤状态（CANCELABLE）显示撤单按钮，终态显示占位"—"
+        // §SUBSCRIPTION：申购登记行不显示撤单按钮——后端护栏（缺省关）本来就不会对它发撤单，
+        // 按钮能点而请求必被柜台拒，那是"UI 承诺了后端不兑现"的形状。护栏开相关闭同源。
         colKey: 'op', title: '操作', width: 90,
-        cell: ({ row }) => (CANCELABLE.has(row.status)
-          ? <Button size="xs" variant="outline" theme="danger" disabled={forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => cancelOrder(row.order_id)}>撤单</Button>
-          : <span style={{ color: 'var(--app-muted-2)', fontSize: 12 }}>—</span>),
+        cell: ({ row }) => (row.subscription
+          ? <span style={{ color: 'var(--app-muted-2)', fontSize: 12 }} title="申购登记行不参与撤单（柜台不接受撤它）">—</span>
+          : CANCELABLE.has(row.status)
+            ? <Button size="xs" variant="outline" theme="danger" disabled={forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => cancelOrder(row.order_id)}>撤单</Button>
+            : <span style={{ color: 'var(--app-muted-2)', fontSize: 12 }}>—</span>),
       },
     ]
     return (
       <Card title="当日委托" style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤），并每 10s 与券商当日委托表对账（手动单标记「手动」）；撤单请求发出后显示「撤单中」，须等交易所确认才转已撤/部撤/已成（期间不可重复撤单）；10s 刷新</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤），并每 10s 与券商当日委托表对账（手动单标记「手动」）；撤单请求发出后显示「撤单中」，须等交易所确认才转已撤/部撤/已成（期间不可重复撤单）；10s 刷新。券商委托表里的新股/新债申购行标成「申购」并照常列出（不隐藏，但不参与撤单与成交对账）。</div>
         {/* §FIX-20261028-F05：把**生效的**禁撤/禁挂窗口摆到操作者眼前。
             此前窗口只在事后 409 文案里出现（14:57 点撤单才知道"这个时段不能撤"）。
             缺键（旧后端/未接实盘）时整段不渲染——不渲染 undefined，也不编造窗口。 */}
