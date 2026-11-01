@@ -18621,7 +18621,7 @@ HEALTH_EXEMPT=$(grep -cE 'parsed.path != "/health"' qmt_gateway/gateway.py)
 CNT161=$((CNT161 + 1))
 grep -qE 'Src[[:space:]]+string[[:space:]]+`json:"src,omitempty"`' internal/data/types.go || fail161 "StockInfo 的每票来源字段丢了（混源只能靠它证伪；gofmt 会调列间距，故按空格宽松匹配）"
 CNT161=$((CNT161 + 1))
-grep -qF 'f.stampSnapshotSources(snapshot, overlaid, extSource)' internal/data/fetcher.go || fail161 "采集链没给后备源票逐票标记（整份 Source 会替它们撒谎）"
+grep -qF 'f.stampSnapshotSources(snapshot, overlaid, extSource)' internal/data/fetcher.go && grep -qF '"quote_source_mixed"' internal/server/handlers_fix.go || fail161 "采集链没给后备源票逐票标记，或混源计数没上观测面（整份 Source 会替它们撒谎）"
 CNT161=$((CNT161 + 1))
 grep -qE 'QuotePerCodeSource[[:space:]]+bool[[:space:]]+`json:"quote_per_code_source"`' internal/config/config.go || fail161 "quote_per_code_source 开关丢了"
 

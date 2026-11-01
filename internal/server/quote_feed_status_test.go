@@ -120,3 +120,33 @@ func TestStatusObserveModeExposesWouldOverride(t *testing.T) {
 		t.Fatalf("观察档通道本身正常，状态应为 ok, got %v", got["state"])
 	}
 }
+
+// statusBody 取整个 /api/status 响应（混源计数在顶层，不在 quote_feed 子对象里）。
+func statusBody(t *testing.T, f *data.Fetcher) map[string]any {
+	t.Helper()
+	s := &Server{startTime: time.Now(), agg: &display.Aggregator{}}
+	s.SetFetcher(f)
+	rr := httptest.NewRecorder()
+	s.handleFixStatus(rr, httptest.NewRequest("GET", "/api/status", nil))
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("响应非合法 JSON: %v", err)
+	}
+	return out
+}
+
+// TestStatusCountsMixedSources 混源必须可数：整份标称 QMT-L1、其中一只是新浪兜的 ⇒ mixed=1。
+// 关着逐票标记时必须是 0（不许把"没标记"报成"全都一致"以外的任何含义，也不许编一个数）。
+func TestStatusCountsMixedSources(t *testing.T) {
+	f := newStatusFetcher(3)
+	snap := f.Snapshot()
+	codes := f.WatchCodes()
+	snap.Source = data.QuoteSourceQMTL1
+	snap.Stocks[codes[0]].Src = data.QuoteSourceQMTL1
+	snap.Stocks[codes[1]].Src = "新浪"
+	snap.Stocks[codes[2]].Src = "" // 没标记的票不参与计数（关着就是这个形状）
+	f.IngestSnapshot(snap)
+	if got := statusBody(t, f)["quote_source_mixed"]; got != float64(1) {
+		t.Fatalf("混源计数应为 1（一只是后备源），got %v", got)
+	}
+}

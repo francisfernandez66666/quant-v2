@@ -679,6 +679,8 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	// §ENH-5 批E：行情快照来源回显（"QMT-L1"=Level-1 feed 生效；其余为新浪/同花顺等降级链）
 	// 与快照陈旧度——供 nightly/Playwright 断言 feed 链路，纯观察不参与任何判定。
 	quoteSource := ""
+	// quoteMixed §SUBSCRIPTION-A3：与整份标称源不一致的票数（逐票标记关闭时恒 0）
+	quoteMixed := 0
 	// quoteFeed §SUBSCRIPTION-A 行情通道状态（nil＝这条通道从没跑过，前端按"未启用"显示）
 	quoteFeed := map[string]interface{}(nil)
 	quoteAgeSec := 0.0
@@ -698,6 +700,14 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		if snap := s.fetcher.Snapshot(); snap != nil {
 			monitored = len(snap.Stocks)
 			quoteSource = snap.Source
+			// §SUBSCRIPTION-A3 混源诚实账：整份 Source 只能说"本轮谁主导"，后备源兜了几只必须单独报。
+			// 否则"券商为主源"在现场无法证伪——上次"现价一片「—」"三连带、两个页面价格不一致，根因都是
+			// 装配点分散 + 单一源名，缺的就是这个第一现场读数。逐票标记关着时恒 0（不编造）。
+			for _, si := range snap.Stocks {
+				if si != nil && si.Src != "" && si.Src != snap.Source {
+					quoteMixed++
+				}
+			}
 		}
 		quoteAgeSec = s.fetcher.Staleness().Seconds()
 		// §SUBSCRIPTION-A（追加裁决 14/15）：行情通道必须有一个**状态位**可读。
@@ -731,14 +741,15 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	inTrade := cur == data.SessionMorningTrade || cur == data.SessionAfternoonTrade
 	active := data.IsFullTradingHours(now)
 	writeJSON(w, 200, map[string]interface{}{
-		"uptime":        uptime,
-		"session":       session,
-		"session_label": cur.String(),
-		"in_trade_time": inTrade,
-		"active":        active,
-		"signal_count":  finalCount,
-		"quote_source":  quoteSource,
-		"quote_age_sec": quoteAgeSec,
+		"uptime":             uptime,
+		"session":            session,
+		"session_label":      cur.String(),
+		"in_trade_time":      inTrade,
+		"active":             active,
+		"signal_count":       finalCount,
+		"quote_source":       quoteSource,
+		"quote_source_mixed": quoteMixed,
+		"quote_age_sec":      quoteAgeSec,
 		// §SUBSCRIPTION-A 行情通道状态；nil=这条通道从没跑过（feed 未启用），前端按"未启用"显示，
 		// 不许把 nil 折成 ok（同 §M2 的 -1=未知 取向）。
 		"quote_feed":           quoteFeed,
