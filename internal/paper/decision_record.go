@@ -33,10 +33,19 @@ type DecisionRecord struct {
 	Target      float64 // 目标金额
 	CurStrat    float64 // 战略当前
 	Room        float64 // 剩余空间
-	// IndustryRoom / StockRoom 行业与单票两帽的剩余量。
-	// 纸面只有行业/单票两帽，**簇帽（ClusterRoom）未实现** ⇒ 恒 0，由 MissingKeyInput 标出。
+	// IndustryRoom / StockRoom / ClusterRoom 行业、单票、相关性簇三帽的剩余额度。
+	//
+	// §F-3-E5（2026-11-01）：这三个字段**此前从未被赋值**（恒 0），而 DB 表 signal_decisions 与
+	// 前端「今日动态仓位」都按列读它们 ⇒ 面板上"行业/单票剩余"永远是 0，是**静默的假读数**。
+	// 现改为从 ordbudget.Compute 的结果逐项透传（见 dynamicPaperQtyLocked）。
+	// 簇帽仍会是 0：纸面当前没有把簇上限传进 Compute（行业/单票传了，簇没传），
+	// 属"未接线"而非"没有限制"——这一点由 UI 的 missing_key_input 提示，不许当 0 解释成"无上限"。
+	// English: these three were never assigned (always 0) while both the DB row and the UI read them
+	// as real numbers. Now passed through from ordbudget.Compute; the cluster cap is still not wired
+	// into the paper path, which is "not connected" rather than "no limit".
 	IndustryRoom    float64
 	StockRoom       float64
+	ClusterRoom     float64
 	CappedBy        string
 	Reason          string
 	MissingKeyInput string

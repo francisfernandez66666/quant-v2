@@ -122,6 +122,10 @@ export default function LogModal({ visible, onClose }) {
   const [activeSigStrategy, setActiveSigStrategy] = useState('all')
   // 信号批次回溯天数（含今日）：1=仅当日；跨日历史来自后端每日归档
   const [sigDays, setSigDays] = useState(5)
+  // §PAYLOAD-BOUND（2026-11-01）：后端已把单次响应的批次数封顶（缺省 20 / 上限 200）。
+  // 「加载更早」用 before 游标往更早翻，避免"选了 30 天却只看到最近 20 批"的复盘退化。
+  const [sigOlder, setSigOlder] = useState(false)
+  const [sigLoadingOlder, setSigLoadingOlder] = useState(false)
 
   const firstLoad = useRef(false) // 是否已完成首次加载（避免重复请求）
 
@@ -217,6 +221,21 @@ export default function LogModal({ visible, onClose }) {
   }
 
   /**
+   * batchesForDays 把"回溯几天"换算成"要多少批"。
+   *
+   * 为什么不是固定 20：一个交易日实测约 96–106 批，固定 20 批连当天的一小半都盖不住，
+   * 选「近 30 个交易日」只会看到最近两小时——那不是复盘。
+   * 为什么不是无限：批次是体积的唯一来源（单批可达 42 KB），必须封顶。
+   * 折中：days×40，夹在 [20, 200]；更早的历史交给「加载更早」的 before 游标逐页翻。
+   * @param {number} days 回溯交易日数
+   * @returns {number} 请求的批次数上限
+   */
+  function batchesForDays(days) {
+    const n = Number(days) > 0 ? Number(days) : 5
+    return Math.min(200, Math.max(20, Math.floor(n) * 40))
+  }
+
+  /**
    * 并行拉取 LLM 分析记录与信号批次日志（任一失败不影响另一部分展示）。
    * 成功时回填对应 state；全部为空时标记 NoData。
    * @param {number} [days] 信号批次回溯天数（含今日）；缺省/非数字（如 onClick 事件）沿用当前选择
@@ -226,9 +245,13 @@ export default function LogModal({ visible, onClose }) {
     if (loading) return
     // 事件对象与空值一律回落到当前选择，避免把 SyntheticEvent 当天数发给后端
     const n = Number(days) > 0 ? Number(days) : sigDays
+    const wantBatches = batchesForDays(n)
     setLoading(true)
     // 并发请求两类日志，使用 allSettled 避免一方失败阻断另一方
-    const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs(n)])
+    const [srRes, slRes] = await Promise.allSettled([
+      api.fetchStageRecords(),
+      api.fetchSignalLogs(n, { batches: wantBatches }),
+    ])
     if (srRes.status === 'fulfilled' && Array.isArray(srRes.value) && srRes.value.length) {
       setLlmRecords(srRes.value)
       setLlmIdx(0)
@@ -268,12 +291,47 @@ export default function LogModal({ visible, onClose }) {
       const r = slRes.value[0]
       setSigData(r || null)
       setSigNoData(!r)
+      // 拿满一页 ⇒ 很可能还有更早的批次（后端按批次封顶，没满就是到底了）
+      setSigOlder(slRes.value.length >= wantBatches)
     } else {
       setSigRecords([])
       setSigData(null)
       setSigNoData(true)
+      setSigOlder(false)
     }
     setLoading(false)
+  }
+
+  /**
+   * loadOlder 用 before 游标往更早翻一页，把结果**追加**到现有列表尾部。
+   *
+   * before 取"本页最老那批"的毫秒戳：返回数组是倒序（最新在前），故末条即本页最老。
+   * 失败时**不清空**既有读数——与 §P2-J 铁律一致：读取失败不得冒充"没有更多"。
+   * @returns {Promise<void>}
+   */
+  async function loadOlder() {
+    if (sigLoadingOlder || loading || !sigRecords.length) return
+    const oldest = sigRecords[sigRecords.length - 1]
+    const beforeMs = Date.parse(oldest && oldest.process_time)
+    if (!Number.isFinite(beforeMs)) return
+    setSigLoadingOlder(true)
+    try {
+      const wantBatches = batchesForDays(sigDays)
+      const more = await api.fetchSignalLogs(sigDays, { batches: wantBatches, before: beforeMs })
+      const add = Array.isArray(more) ? more : []
+      if (!add.length) {
+        setSigOlder(false)
+        return
+      }
+      // 去重：翻页边界上同一批次可能因时间戳并列被重复返回，按 process_time 挡掉
+      const seen = new Set(sigRecords.map((r) => r.process_time))
+      setSigRecords(sigRecords.concat(add.filter((r) => !seen.has(r.process_time))))
+      setSigOlder(add.length >= wantBatches)
+    } catch (_) {
+      // 翻页失败保持原列表与按钮可用，由用户重试
+    } finally {
+      setSigLoadingOlder(false)
+    }
   }
 
   // 弹窗每次变为可见时重新拉取最新日志
@@ -648,6 +706,20 @@ export default function LogModal({ visible, onClose }) {
                 </select>
               )}
               <button className="btn-refresh" onClick={() => load()} disabled={loading}>刷新</button>
+              {
+                // §PAYLOAD-BOUND：单次响应按批次封顶，更早的历史用 before 游标逐页翻。
+                // 只在「本页拿满」时出现——没满说明已经到底，显示按钮会误导。
+              }
+              {sigOlder && !sigFiltering && (
+                <button
+                  className="btn-refresh"
+                  onClick={loadOlder}
+                  disabled={sigLoadingOlder || loading}
+                  title="继续往前加载更早的信号批次"
+                >
+                  {sigLoadingOlder ? '加载中…' : '加载更早'}
+                </button>
+              )}
             </div>
 
             {

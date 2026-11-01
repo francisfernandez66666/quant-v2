@@ -648,8 +648,8 @@ func (s *Server) registerRoutes() {
 	// 不算前端断链；新增前端调用前先确认页面归属。
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
 	// §DAILY_OPSLOG 每日系统运行日志（管理员只读）：日期列表 + 按日内容（tail 截尾）
-	s.mux.HandleFunc("GET /api/opslog/dates", s.adminMiddleware(s.handleOpslogDates))
-	s.mux.HandleFunc("GET /api/opslog", s.adminMiddleware(s.handleOpslog))
+	s.mux.HandleFunc("GET /api/opslog/dates", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleOpslogDates))
+	s.mux.HandleFunc("GET /api/opslog", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleOpslog))
 	// §R4-9 指标面（鉴权后导出 expvar：下单/熔断/撤单/LLM 降级等关键事件计数）
 	// §EXPVAR（2026-09-22 LOW 族收口）：expvar.Handler() 即 /debug/vars 的整套默认注册表
 	// （含 cmdline/memstats/全部业务计数器），属运维面数据，此前仅 authMiddleware——
@@ -741,7 +741,7 @@ func (s *Server) registerRoutes() {
 	// 实盘账本读账号私有文件（server 不依赖 engine，损坏如实报 corrupt）。
 	// English: read-only §DYN-T surface — paper book from the engine, live book from its file.
 	s.mux.HandleFunc("GET /api/paper/t-rounds", s.authMiddleware(s.handlePaperTRounds))
-	s.mux.HandleFunc("GET /api/t-live/rounds", s.adminMiddleware(s.handleLiveTRounds))
+	s.mux.HandleFunc("GET /api/t-live/rounds", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleLiveTRounds))
 	// §FUNDS-TODAY（2026-10-28）当日「信号仓 / T 仓」资金一帧：实盘取引擎写下的 funds 帧，
 	// 纸面取 TargetReadout；两者都 day-keyed，新交易日首帧前返回 pending（今日尚未定权）。
 	s.mux.HandleFunc("GET /api/funds/today", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFundsToday))
@@ -751,33 +751,33 @@ func (s *Server) registerRoutes() {
 	// 读对已登录账号开放，写限管理员（模拟盘为运营数据）。
 	// English: paper strategy whitelist endpoints (read for authed users, write admin-only).
 	s.mux.HandleFunc("GET /api/paper/strategies", s.authMiddleware(s.handleGetPaperStrategies))
-	s.mux.HandleFunc("POST /api/paper/strategies", s.adminMiddleware(s.handleSetPaperStrategies))
+	s.mux.HandleFunc("POST /api/paper/strategies", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetPaperStrategies))
 	// §F-4（20260917 缺陷修复批）模拟盘撮合配置读写：总开关/自动卖出/单笔资金/初始资金/做空预算
 	// 改后即热同步（main.go 与 Registry.SetPaperConfig 共用 paper.ConfigFromRules，重启不再是
 	// 唯一生效路径）。GET 登录可见，POST 限管理员。
 	s.mux.HandleFunc("GET /api/paper/config", s.authMiddleware(s.handleGetPaperConfig))
-	s.mux.HandleFunc("POST /api/paper/config", s.adminMiddleware(s.handleSetPaperConfig))
+	s.mux.HandleFunc("POST /api/paper/config", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetPaperConfig))
 	// 信号控制器裁定留痕审计（"提醒了为何没成交"一屏定位）。
 	// English: signal-controller verdict audit endpoint.
 	s.mux.HandleFunc("GET /api/signalctl/verdicts", s.authMiddleware(s.handleSignalVerdicts))
-	s.mux.HandleFunc("POST /api/paper/sell", s.adminMiddleware(s.handlePaperSell))
-	s.mux.HandleFunc("POST /api/paper/buy", s.adminMiddleware(s.handlePaperBuy))
+	s.mux.HandleFunc("POST /api/paper/sell", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperSell))
+	s.mux.HandleFunc("POST /api/paper/buy", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperBuy))
 	// §MULTI-ADMIN：一次性纸面持仓修复（仅 owner；显式 qty/price + confirm，审计留痕）。
 	s.mux.HandleFunc("POST /api/paper/adjust", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermFundsAdmin)(s.handlePaperAdjust))
 	// §SHORT-4 融券做空手动端点（开仓/买回）
-	s.mux.HandleFunc("POST /api/paper/short_open", s.adminMiddleware(s.handlePaperShortOpen))
-	s.mux.HandleFunc("POST /api/paper/short_cover", s.adminMiddleware(s.handlePaperShortCover))
-	s.mux.HandleFunc("POST /api/paper/reset", s.adminMiddleware(s.handlePaperReset))
-	s.mux.HandleFunc("POST /api/paper/pool/reset", s.adminMiddleware(s.handlePaperPoolReset))
-	s.mux.HandleFunc("POST /api/paper/pool/config", s.adminMiddleware(s.handlePaperPoolConfig))
+	s.mux.HandleFunc("POST /api/paper/short_open", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperShortOpen))
+	s.mux.HandleFunc("POST /api/paper/short_cover", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperShortCover))
+	s.mux.HandleFunc("POST /api/paper/reset", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperReset))
+	s.mux.HandleFunc("POST /api/paper/pool/reset", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperPoolReset))
+	s.mux.HandleFunc("POST /api/paper/pool/config", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperPoolConfig))
 	// 持仓（运营账本）：读对所有登录用户开放（系统级共享的大盘持仓）；写仅管理员可操作。
 	// （Positions: readable by all; writes are admin-only.）
 	// §E-1 对账：/api/positions 台账 CRUD/exit 系运营账本 API（前端持仓页实际走 /api/holdings 系），
 	// 当前无 UI 调用方；保留供脚本/后续台账页使用（非断链）。
-	s.mux.HandleFunc("POST /api/positions", s.adminMiddleware(s.handleCreatePosition))
-	s.mux.HandleFunc("PUT /api/positions/{id}", s.adminMiddleware(s.handleUpdatePosition))
-	s.mux.HandleFunc("DELETE /api/positions/{id}", s.adminMiddleware(s.handleDeletePosition))
-	s.mux.HandleFunc("POST /api/positions/{id}/exit", s.adminMiddleware(s.handleExitPosition))
+	s.mux.HandleFunc("POST /api/positions", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleCreatePosition))
+	s.mux.HandleFunc("PUT /api/positions/{id}", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleUpdatePosition))
+	s.mux.HandleFunc("DELETE /api/positions/{id}", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleDeletePosition))
+	s.mux.HandleFunc("POST /api/positions/{id}/exit", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleExitPosition))
 	s.mux.HandleFunc("GET /api/positions", s.authMiddleware(s.handleListPositions))
 
 	// fix 兼容端点
@@ -785,13 +785,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/minute", s.authMiddleware(s.handleFixMinute))
 	s.mux.HandleFunc("GET /api/signals", s.authMiddleware(s.handleFixSignals))
 	// §DECISION-TODAY（2026-10-28）今日动态仓位计算过程（只读；被拦/未下单也返回）。
-	s.mux.HandleFunc("GET /api/signals/decisions", s.adminMiddleware(s.handleSignalDecisions))
+	s.mux.HandleFunc("GET /api/signals/decisions", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleSignalDecisions))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
 	s.mux.HandleFunc("GET /api/engine_health", s.authMiddleware(s.handleFixEngineHealth))
 	// 消息中心：列表对所有登录用户可读（运营数据系统级共享）；清空/删除为写操作，仅管理员可操作。
 	s.mux.HandleFunc("GET /api/alerts", s.authMiddleware(s.handleFixAlerts))
-	s.mux.HandleFunc("DELETE /api/alerts", s.adminMiddleware(s.handleClearAlerts))
-	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.adminMiddleware(s.handleDeleteAlert))
+	s.mux.HandleFunc("DELETE /api/alerts", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleClearAlerts))
+	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleDeleteAlert))
 	// 自选股/持仓：读对所有登录用户开放（系统级共享的大盘自选）；写仅管理员可操作。
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
 	s.mux.HandleFunc("POST /api/holdings", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetHoldings))
@@ -827,7 +827,7 @@ func (s *Server) registerRoutes() {
 	// 不删——能力尺寸在，权限收口）。
 	// English: §M-14 — Stage2 attribution test endpoint burns LLM quota and has zero frontend
 	// callers; raised from authMiddleware to adminMiddleware (kept for admin debugging, gated).
-	s.mux.HandleFunc("POST /api/news/test-attribution", s.adminMiddleware(s.handleNewsTestAttribution))
+	s.mux.HandleFunc("POST /api/news/test-attribution", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleNewsTestAttribution))
 	s.mux.HandleFunc("GET /api/engine/init-status", s.authMiddleware(s.handleEngineInitStatus))
 	s.mux.HandleFunc("GET /api/watchlist", s.authMiddleware(s.handleFixGetWatchlist))
 	s.mux.HandleFunc("POST /api/watchlist", s.authMiddleware(s.handleFixAddWatchlist))
@@ -915,7 +915,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest))
 	s.mux.HandleFunc("GET /api/research/backtest/{id}", s.authMiddleware(s.handleBacktestStatus))
 	// §D-1 夜间信号质量研究报告历史（正文跨账号聚合，admin-only）
-	s.mux.HandleFunc("GET /api/research/paper-reports", s.adminMiddleware(s.handlePaperResearchReports))
+	s.mux.HandleFunc("GET /api/research/paper-reports", s.strictPermMiddleware(auth.PermTradingAdmin, s.handlePaperResearchReports))
 	// 阶段3.2 回测运行控制：取消（kill+interrupted，断点缓存可续跑）/ 暂停（SIGSTOP）/ 继续（SIGCONT）
 	s.mux.HandleFunc("POST /api/research/backtest/{id}/cancel", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestCancel))
 	s.mux.HandleFunc("POST /api/research/backtest/{id}/pause", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestPause))
@@ -954,14 +954,14 @@ func (s *Server) registerRoutes() {
 	// §WS-H C2 参数版本化：历史快照列表（auth 可见）+ 回滚（admin 专属，原子恢复+审计）
 	// §E-1 对账：配置快照/回滚 API 面已就绪但 UI 未接（docs/DEFECT_FIX_PLAN_20260917 E-1 台账），按需接。
 	s.mux.HandleFunc("GET /api/research/strategies/snapshots", s.authMiddleware(s.handleStrategySnapshots))
-	s.mux.HandleFunc("POST /api/research/strategies/rollback", s.adminMiddleware(s.handleStrategyRollback))
+	s.mux.HandleFunc("POST /api/research/strategies/rollback", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleStrategyRollback))
 	// §WS-K 维4 配置历史/回滚：快照+diff 列表（admin）、回滚恢复（admin）
 	s.mux.HandleFunc("GET /api/config/history", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleConfigHistory))
 	s.mux.HandleFunc("POST /api/config/rollback", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleConfigRollback))
 	// §WS-F C4a SSE 建链票据签发端点（需认证）；SSE 建链用 /api/events?ticket=xxx（60s 有效，§M5 起 TTL 内可复用）。
 	// ── SSE 事件流：建链端点自带票据校验（不走 authMiddleware，因 EventSource 无法带 Authorization 头）──
 	s.mux.HandleFunc("POST /api/events/ticket", s.authMiddleware(s.handleSSETicket))
-	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
+	s.mux.HandleFunc("GET /api/events", s.sseTicketMiddleware(s.handleFixSSE))
 }
 
 // maxBodyBytes 请求体大小上限：64KB（防超大 body 打爆内存，正常业务请求远小于此）。
@@ -1738,10 +1738,17 @@ func bearerToken(r *http.Request) string {
 }
 
 // adminMiddleware 管理员中间件：在认证基础上要求当前用户为管理员角色，否则返回 403。
-// 仅包裹用户/账号管理与全局配置等管理类接口。
-// §WS-E 审计：越权访问（子账号请求 admin 端点）记 opslog，配合 WS-F 审计日志。
-// English: admin middleware — requires the admin role after auth, else 403; §WS-E audits unauthorized
-// (non-admin) attempts to opslog for the WS-F audit trail.
+//
+// ⚠️ §F-6（2026-11-01）：**本中间件已无任何路由使用**（注册面清零，见 perm_surface_test.go I1）。
+// 保留它的原因只有一条：它是"角色级"语义的唯一实现，将来若真需要"任何管理员可进"的运维口，
+// 必须在这里显式加回来并说明为什么角色级是对的——而不是像过去那样靠"没人想清楚"默认挂上。
+// 新路由请用 strictPermMiddleware（显式权限位）：`role=admin` 不隐式授予任何能力。
+//
+// 为什么淘汰角色级：迁移只给**首个** admin 发五权限位，第二个 admin 可以零权限位却仍叫 admin；
+// 角色级门槛会把这种账号当成"能看一切"，而敏感端点在严格位下对它一律 403——两套口径互相打脸。
+// English: §F-6 — no route uses this any more; kept only as the one implementation of the role-level
+// semantics, to be re-added explicitly (with justification) if such a gate is ever truly needed.
+// New routes must use strictPermMiddleware: `role=admin` grants nothing implicitly.
 func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		user := userFromContext(r)
@@ -3381,6 +3388,106 @@ func signalLogDays(r *http.Request) int {
 	return v
 }
 
+// §PAYLOAD-BOUND（2026-11-01）大响应面治理：`days` 只夹天数，**没有批次数闸**——
+// 归档窗口 30 天、每交易日约 100 批，`days=30` 实测一次返回 3183 批
+// （未压缩 16.2 MB / gzip 1.9 MB / 4.2 s），而前端缺省 days=5 也有 591 批 / 902 KB。
+// 这里补三道闸：批次上限、游标翻页、响应预算。三者独立，缺一不可：
+//   - 只限批次不限预算 ⇒ 单批信号多时仍会爆（单批实测可达 42 KB）；
+//   - 只限预算不限批次 ⇒ 序列化 3000 批的开销仍然先付掉，白烧 CPU；
+//   - 无游标 ⇒ 截断后更早的批次永久不可达，"复盘"这个功能就没了。
+//
+// English: §PAYLOAD-BOUND — batch cap + cursor paging + response budget for /api/signal-logs.
+const (
+	// signalLogDefaultBatches 缺省返回的批次数：约等于"今天最近 20 轮"，覆盖前端日志弹窗首屏。
+	signalLogDefaultBatches = 20
+	// signalLogMaxBatches 单次请求的批次硬上限：防止 ?batches=99999 绕过预算闸把序列化成本打满。
+	signalLogMaxBatches = 200
+	// maxSignalLogBytes 单次响应的字节预算（512 KB）：超限从**最老**的批次开始丢。
+	// 512 KB ≈ 缺省档（20 批）的 1/2，留出单批偏大的余量，又不至于让手机 WebView 卡顿。
+	maxSignalLogBytes = 512 * 1024
+)
+
+// signalLogQuery 是 /api/signal-logs 的三个查询参数解析结果。
+//
+//	days       交易日窗口（复用 signalLogDays，1..30，语义一字不改）
+//	maxBatches 批次数上限（?batches=，缺省 20，上限 200，非正数/非法一律回落缺省）
+//	cursor     毫秒时间戳，**增量**语义：只返回比它**更新**的批次（轮询刷新用）
+//	before     毫秒时间戳，**翻页**语义：只返回比它**更老**的批次（「加载更早」用）
+//
+// 为什么 cursor 与 before 必须两个方向：方案原稿只设计了 `> cursor` 一个方向，那是"给我比某时刻
+// 更新的"——用于轮询补新，**不能**用来往更早翻（越翻越空）。而复盘天然要往更早翻。
+// 两个参数互斥使用；同时给时以 before 为准（翻页是更强的意图）。
+//
+// English: `cursor` = incremental (newer than), `before` = paging (older than). One direction cannot
+// serve both: the plan's `> cursor` alone makes "load older" return nothing.
+type signalLogQuery struct {
+	days       int
+	maxBatches int
+	cursor     int64
+	before     int64
+}
+
+// signalLogParams 解析查询参数。非法/非正数一律回落缺省，绝不静默变成"不限"。
+// English: parses the query; invalid/non-positive values fall back to defaults, never to "unlimited".
+func signalLogParams(r *http.Request) signalLogQuery {
+	q := signalLogQuery{days: signalLogDays(r), maxBatches: signalLogDefaultBatches}
+	if v, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("batches"))); err == nil && v > 0 {
+		q.maxBatches = v
+	}
+	if q.maxBatches > signalLogMaxBatches {
+		q.maxBatches = signalLogMaxBatches
+	}
+	if v, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("cursor")), 10, 64); err == nil && v > 0 {
+		q.cursor = v
+	}
+	if v, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("before")), 10, 64); err == nil && v > 0 {
+		q.before = v
+	}
+	return q
+}
+
+// trimSignalLogsToBudget 在**已倒序（最新在前）**的批次上按字节预算裁剪：从尾部（最老）丢，
+// 直到整包 JSON 不超过 budget。返回裁剪后的切片与"是否真的丢过"。
+//
+// 实现要点：先逐批 Marshal 量体积，再从头累加——**不是**"整体序列化后反复重试"。
+// 后者在 200 批时是 O(n²) 的重复序列化，实测会到秒级，正好把这个端点的病治成另一个病。
+// 至少保留 1 批：返回空数组会让前端把"预算裁剪"误读成"今天没有信号"。
+//
+// English: trims from the oldest end under a byte budget; sizes are measured per batch to keep it O(n).
+func trimSignalLogsToBudget(recs []combat_agent.SignalLog, budget int) ([]combat_agent.SignalLog, bool) {
+	if len(recs) == 0 {
+		return recs, false
+	}
+	sizes := make([]int, len(recs))
+	for i := range recs {
+		b, err := json.Marshal(recs[i])
+		if err != nil {
+			// 单批序列化失败不当作 0 体积放行——按"很大"计，宁可早裁也不返回坏包。
+			sizes[i] = budget
+			continue
+		}
+		sizes[i] = len(b)
+	}
+	used := 2 // 外层数组的 "[]"
+	keep := 0
+	for i := 0; i < len(recs); i++ {
+		need := sizes[i]
+		if i > 0 {
+			need++ // 批次之间的逗号
+		}
+		// keep == 0 时无条件收下第一批：宁可单批超预算，也不能返回空包。
+		if keep > 0 && used+need > budget {
+			break
+		}
+		used += need
+		keep++
+	}
+	if keep >= len(recs) {
+		return recs, false
+	}
+	return recs[:keep], true
+}
+
 // signalLogRangeProvider 引擎的可选跨天读能力：实现则按 days 合并归档，未实现退回当日内存。
 // 单独做可选断言而不是加进 EngineController：测试里的 fake controller 嵌入 nil 接口，
 // 强加方法会把「没被触碰」的路径变成 panic 源。
@@ -3400,7 +3507,8 @@ func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
-	days := signalLogDays(r)
+	q := signalLogParams(r)
+	days, maxBatches := q.days, q.maxBatches
 	recs := c.GetSignalLogs()
 	if p, ok := c.(signalLogRangeProvider); ok {
 		recs = p.GetSignalLogsRange(days)
@@ -3412,10 +3520,37 @@ func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
 			src = "disk"
 		}
 	}
-	log.Printf("[llm-diag] uid=%s signal-logs: src=%s days=%d recs=%d", uid, src, days, len(recs))
 	if recs == nil {
 		recs = []combat_agent.SignalLog{}
 	}
+	// §PAYLOAD-BOUND 第一道闸：时间过滤。recs 是升序（旧→新），两个方向互斥：
+	//   before>0 ⇒ 只留**更老**的（复盘「加载更早」翻页；取本页最老一批的毫秒戳当下一页的 before）
+	//   cursor>0 ⇒ 只留**更新**的（轮询增量刷新）
+	// 同时给时以 before 为准：翻页是更强的意图，混用只会得到难以解释的交集。
+	if q.before > 0 || q.cursor > 0 {
+		kept := make([]combat_agent.SignalLog, 0, len(recs))
+		for _, rec := range recs {
+			ms := rec.ProcessTime.UnixMilli()
+			if q.before > 0 {
+				if ms < q.before {
+					kept = append(kept, rec)
+				}
+				continue
+			}
+			if ms > q.cursor {
+				kept = append(kept, rec)
+			}
+		}
+		recs = kept
+	}
+	// §PAYLOAD-BOUND 第二道闸：只留**最新** maxBatches 批。recs 升序 ⇒ 截尾即"最新的 N 批"。
+	// 翻页（before>0）时同样取该页里最新的 N 批：一页之内仍以"最新在前"呈现，语义一致。
+	// 这一步必须**早于**下面的瘦身与倒序：先砍批次能把后续 Marshal 的量级从 3000 批降到 200 批。
+	if len(recs) > maxBatches {
+		recs = recs[len(recs)-maxBatches:]
+	}
+	log.Printf("[llm-diag] uid=%s signal-logs: src=%s days=%d batches=%d cursor=%d before=%d recs=%d",
+		uid, src, days, maxBatches, q.cursor, q.before, len(recs))
 	// §FIX-0921d 响应瘦身：仅最近 5 批保留完整信号明细，更早批次截断到前 20 条（批次时间/
 	// 原始条数保留，复盘仍可辨认）。
 	const fullDetailKeep = 5
@@ -3430,5 +3565,15 @@ func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
 	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
 		recs[i], recs[j] = recs[j], recs[i]
 	}
+	// §PAYLOAD-BOUND 第三道闸：字节预算。倒序之后尾部是最老的批次，从尾部丢不会破坏"最新在前"。
+	recs, truncated := trimSignalLogsToBudget(recs, maxSignalLogBytes)
+	// 两个响应头是**契约**（不是调试信息）：前端据此判断"还有更早的批次"并决定是否显示
+	// 「已截断」提示。缺了它们，裁剪就会变成静默丢数据。
+	w.Header().Set("X-Signal-Logs-Batches", strconv.Itoa(len(recs)))
+	truncFlag := "0"
+	if truncated {
+		truncFlag = "1"
+	}
+	w.Header().Set("X-Signal-Logs-Truncated", truncFlag)
 	writeJSON(w, 200, recs)
 }

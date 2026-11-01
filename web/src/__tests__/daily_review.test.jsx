@@ -37,6 +37,8 @@ vi.mock('../api/index.js', async (orig) => {
       code: '600519',
       created_at: '2026-09-14 15:05:00',
     }]),
+    // §PAGING-DEFAULT：导航角标改走 fetchAlertTotal（只取 1 条 + X-Total-Count）
+    fetchAlertTotal: vi.fn(async () => 1),
     fetchShortStatus: vi.fn(async () => ({ short_enabled: false })),
     reviewPositions: vi.fn(async () => ({ reviewed: 1 })),
     deleteAlert: vi.fn(async () => ({})),

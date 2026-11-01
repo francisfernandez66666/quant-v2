@@ -1674,8 +1674,10 @@ func (s *Server) handleQMTOrders(w http.ResponseWriter, r *http.Request) {
 			out = append(out, o)
 		}
 	}
-	// §F9：page/page_size 可选；缺省 size=0 保持旧行为（返回全部），但响应头始终带 total。
-	page, size := parsePageParams(r, 0, 500)
+	// §PAGING-DEFAULT（2026-11-01）：与 /api/alerts 同款缺陷——缺省 size=0 让分页等于没有。
+	// 委托列表按当日过滤后仍可能上千行（高频策略 + 撤单重发），缺省改 50；上限仍 500。
+	// English: same defect as /api/alerts — default 0 meant "no paging at all"; now defaults to 50.
+	page, size := parsePageParams(r, 50, 500)
 	total := len(out)
 	start, end, _ := pageBounds(total, page, size)
 	if size > 0 {

@@ -47,6 +47,10 @@ func (s *Server) handleRiskGates(w http.ResponseWriter, r *http.Request) {
 			switches["limit_down_block_sell"] = rg.LimitDownBlockSellEnabled()
 			// §AUDIT-PM 2026-09-15 单笔金额绝对帽开关（保存即生效，不走开关队列）
 			switches["max_order_amount"] = rg.MaxOrderAmount > 0
+			// §GATES-COVERAGE（2026-11-01）：行业/概念敞口与六道同族（零值即不评估），
+			// 之前既不在 switches 也不在 disabled_gates ⇒ 前端标签组与黄条都看不见它们。
+			switches["sector_exposure"] = rg.SectorValuePct > 0
+			switches["concept_exposure"] = rg.ConceptValuePct > 0
 			disabled = rg.DisabledGates()
 			configUnset = rg.GatesConfigUnset()
 		}

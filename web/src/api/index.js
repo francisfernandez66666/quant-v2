@@ -753,7 +753,15 @@ async function requestInner(path, opts = {}) {
     throw err
   }
   // 成功响应：解析 JSON 返回给调用方（后端接口约定均为 JSON 体）
-  return res.json()
+  const body = await res.json()
+  // §PAGING（2026-11-01）：需要读分页响应头（X-Total-Count / X-Has-More / X-Page-Size）的
+  // 调用方传 opts.withMeta=true，拿 { data, headers }；**默认仍返回裸 body**，
+  // 既有全部调用点行为一字不变（改默认形状会当场炸掉几十个消费点）。
+  // English: opt-in { data, headers } for paged endpoints; default shape stays the bare body.
+  if (opts.withMeta) {
+    return { data: body, headers: res.headers }
+  }
+  return body
 }
 
 // ── 认证接口 ──
@@ -898,8 +906,31 @@ export async function fetchEngineHealth() {
 /** Fetch all reminder/alert messages */
 // 对应 GET /api/alerts，返回消息数组；消息中心据此展示，未读数用于导航角标
 // Maps to GET /api/alerts; returns an array of messages shown by the message center; unread count feeds the nav badge
-export async function fetchAlerts() {
-  return request('/api/alerts')
+//
+// §PAGING-DEFAULT（2026-11-01）：后端缺省已改为 50 条/页（此前缺省 0 = 全量，现网实测一次
+// 1,900,221 B / 4352 条 / 2.1 s）。需要更多请**显式**传 page_size（上限 5000）。
+// 不传 = 只要第一页 50 条，这是安全的默认；想要全量必须自己说清楚。
+// opts: { page, page_size, withMeta }；withMeta=true 时返回 { data, headers } 而非裸数组。
+export async function fetchAlerts(opts = {}) {
+  const page = Number(opts && opts.page) > 0 ? Math.floor(Number(opts.page)) : 1
+  const rawSize = Number(opts && opts.page_size)
+  const size = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 5000) : 0
+  const q = size > 0 ? '?page=' + page + '&page_size=' + size : ''
+  return request('/api/alerts' + q, { timeout: 15000, withMeta: !!(opts && opts.withMeta) })
+}
+
+/** 只取告警总数（导航角标用） */
+/** Fetch only the alert total (for the nav badge) */
+// §PAGING-DEFAULT：角标只要一个数字。旧写法把 4352 条全拉下来再 .length——而且是在
+// App 的**全局状态轮询**里每轮都做一次，等于每轮搬 249 KB（gzip）。改成取 1 条 + 读响应头。
+// 头缺失（老后端/中间代理吞头）时退回按返回条数计：宁可角标偏小，也不让整轮轮询失败。
+export async function fetchAlertTotal() {
+  const res = await request('/api/alerts?page=1&page_size=1', { timeout: 15000, withMeta: true })
+  const h = res && res.headers
+  const raw = h && typeof h.get === 'function' ? h.get('X-Total-Count') : null
+  const total = Number(raw)
+  if (raw !== null && raw !== '' && Number.isFinite(total) && total >= 0) return total
+  return Array.isArray(res && res.data) ? res.data.length : 0
 }
 
 /** 清空消息中心全部消息 */
@@ -1963,16 +1994,27 @@ export async function fetchStageRecords() {
 
 /** 获取信号批次记录（默认当日，可按天数跨交易日回溯，供复盘） */
 /** Fetch signal batch records (today by default; cross-trading-day history via days, for review) */
-// 对应 GET /api/signal-logs?days=N：N 含今日（1=仅当日），后端默认 5、上限 30。
+// 对应 GET /api/signal-logs?days=N&batches=M[&before=ms]：
+//   days    含今日（1=仅当日），后端默认 5、上限 30 —— 只决定"看几天"
+//   batches 批次数上限，缺省 20、上限 200 —— **真正决定体积的是它**，不是 days
+//   before  毫秒时间戳，只取比它**更老**的批次（「加载更早」翻页用）
+// §PAYLOAD-BOUND（2026-11-01）：此前只传 days，后端没有批次闸 ⇒ days=30 一次返回 3183 批
+// （未压缩 16.2 MB / gzip 1.9 MB / 4.2 s），缺省 days=5 也有 591 批 / 902 KB。现在两个参数都传。
 // 跨日历史来自每日归档文件（signal_records_archive/day.json），旧批次不含实时行情，
 // 涨跌幅按生成时刻冻结值展示，取不到就显示「—」。
-// Maps to GET /api/signal-logs?days=N (N includes today; server default 5, max 30). Cross-day
-// history comes from per-day archive files; old batches never get live prices backfilled.
-export async function fetchSignalLogs(days = 5) {
+// Maps to GET /api/signal-logs?days=N&batches=M[&before=ms]; `batches` — not `days` — is what bounds
+// the payload. `before` pages backwards (older batches) for the review dialog.
+export async function fetchSignalLogs(days = 5, opts = {}) {
   const n = Number(days)
-  const q = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 30) : 5
+  const d = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 30) : 5
+  const rawB = Number(opts && opts.batches)
+  const b = Number.isFinite(rawB) && rawB > 0 ? Math.min(Math.floor(rawB), 200) : 20
+  const rawBefore = Number(opts && opts.before)
+  const beforeQ = Number.isFinite(rawBefore) && rawBefore > 0 ? '&before=' + Math.floor(rawBefore) : ''
+  // 路径必须**内联字面量**：契约台账的派生器靠 request() 的首参字面量前缀认路由，
+  // 拼进变量再传会让这条调用在派生里"消失"（实测会让 LEDGER_LIES 从 0 变 1）。
   // §FIX-0921b 复盘类接口同样放宽 30s（信号批次含全量信号明细，弱网同理）
-  return request('/api/signal-logs?days=' + q, { timeout: 30000 })
+  return request('/api/signal-logs?days=' + d + '&batches=' + b + beforeQ, { timeout: 30000 })
 }
 
 // ── 做空开关 ──

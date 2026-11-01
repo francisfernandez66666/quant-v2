@@ -290,8 +290,9 @@ export default function App() {
     // endpoint for members; the badge stays 0 exactly as it did behind the swallowed 403.
     if (api.isAdmin()) {
       try {
-        const alerts = await api.fetchAlerts()
-        setAlertCount(alerts?.length || 0)
+        // §PAGING-DEFAULT（2026-11-01）：只取总数（1 条 + 读 X-Total-Count），不再为算角标
+        // 把 4352 条全拉下来——旧写法在**全局轮询**里每轮搬 249 KB（gzip），是常驻成本。
+        setAlertCount(await api.fetchAlertTotal())
       } catch (_) {}
     } else {
       setAlertCount(0)

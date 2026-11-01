@@ -327,7 +327,7 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 				Strategy: rec.Strategy, At: rec.At.Format(time.RFC3339), Stage: rec.Stage,
 				MarketScale: rec.MarketScale, StockScale: rec.StockScale, PerTradePct: rec.PerTradePct,
 				Total: rec.Total, Cash: rec.Cash, Target: rec.Target, CurStrat: rec.CurStrat, Room: rec.Room,
-				IndustryRoom: rec.IndustryRoom, StockRoom: rec.StockRoom,
+				IndustryRoom: rec.IndustryRoom, StockRoom: rec.StockRoom, ClusterRoom: rec.ClusterRoom,
 				CappedBy: rec.CappedBy, Qty: rec.Qty, Notional: rec.Notional,
 				MissingKeyInput: rec.MissingKeyInput != "", Reason: rec.Reason,
 			}); err != nil {
@@ -500,6 +500,9 @@ func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInf
 		}
 		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
 			if inSession {
+				// §F-3（方案甲）：定权上下文在**估值轮**注入，与 T 开关无关——
+				// 否则 T 关着时 ms 恒 0、目标仓位永不执法（详见 engine.injectPaperSizing）。
+				e.injectPaperSizing(uid, pe)
 				// §纸面估值修复：与 engine.paperMark 同口径——快照缺价的持仓用最近收盘价回填估值。
 				// English: same backfill as engine.paperMark — held codes missing from the snapshot get
 				// marked with their last daily close.

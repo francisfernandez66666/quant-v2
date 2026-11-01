@@ -67,6 +67,8 @@ const { OK_PAYLOADS } = vi.hoisted(() => ({
     fetchSignalVerdicts: () => ({ verdicts: [] }),
     // §0929GATE-403：消息中心未读提醒（L12 用它证明"成员态一条都不拨"）
     fetchAlerts: () => [],
+    // §PAGING-DEFAULT：导航角标改走 fetchAlertTotal（只取 1 条 + X-Total-Count）
+    fetchAlertTotal: () => 0,
   },
 }))
 
@@ -455,7 +457,9 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     expect(read('pages/Dashboard.jsx')).toMatch(/async function loadQMT\(\) \{\s*if \(!canStrict\('trading_admin'\)\) return/)
     expect(read('pages/MsgCenter.jsx')).toMatch(/async function load\(\) \{\s*if \(!admin\) \{/)
     expect(read('pages/Consult.jsx')).toMatch(/if \(!admin\) \{\s*setLlmGated\(true\)/)
-    expect(read('App.jsx')).toMatch(/if \(api\.isAdmin\(\)\) \{\s*try \{\s*const alerts = await api\.fetchAlerts\(\)/)
+    // §PAGING-DEFAULT（2026-11-01）：角标改走 fetchAlertTotal()（只取 1 条 + X-Total-Count），
+    // 判据的意图不变——**仍是「admin 才轮询、且必须早退」**，只是取数函数换了。
+    expect(read('App.jsx')).toMatch(/if \(api\.isAdmin\(\)\) \{\s*try \{\s*(?:\/\/[^\n]*\n\s*)*setAlertCount\(await api\.fetchAlertTotal\(\)\)/)
     // ⑤ Positions：实盘建议回填并入既有 §PERM-GATE 的 admin 早退
     const pos = read('pages/Positions.jsx')
     expect(pos).toMatch(/if \(!canTrading\) return \/\/ §PERM-GATE/)

@@ -31,6 +31,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -760,8 +761,13 @@ func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 // 未接入引擎时回退到实时看板 + 持仓日志。结果按时间倒序排列。
 func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
-	// §F9：page/page_size 可选；缺省 size=0 返回全部（旧行为），响应头始终带 total。
-	page, size := parsePageParams(r, 0, 500)
+	// §PAGING-DEFAULT（2026-11-01）：缺省 size 曾是 0，而 pageBounds 对 size<=0 返回 [0,total)
+	// ⇒ 「分页机制存在、缺省行为等于没分页」。现网实测 /api/alerts 一次 1,900,221 B / 4352 条 /
+	// 2.1 s，而消息中心首屏只用得上最近几十条。
+	// 缺省改 50；上限放到 5000 是给「消息中心一次要看全量做本地筛选」的既有调用留的显式出口——
+	// 想拿全量必须**明写** page_size，不能再靠"不传参"默认拿到。
+	// English: default 50 (was 0 = no paging); callers that truly need everything must say page_size explicitly.
+	page, size := parsePageParams(r, 50, 5000)
 	writePaged := func(out []map[string]interface{}) {
 		total := len(out)
 		start, end, _ := pageBounds(total, page, size)
@@ -3105,43 +3111,79 @@ func (s *Server) handleSSETicket(w http.ResponseWriter, r *http.Request) {
 // 用于向前端推送实时事件更新。需要 token 认证。
 // 连接建立后：15 秒发送一次心跳保活，有数据时立即推送。
 // 账号隔离：按 token 解析 userID，仅订阅该账号定向事件；断线续传：读取 Last-Event-ID 补发漏掉的事件。
-func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
-	// §WS-F C4a 鉴权：优先短时效票据（推荐，URL 不留长期 token；§M5 起 TTL 内可复用，
-	// 原生重连不再必然 401）；兼容旧客户端 token query 回退。无票据亦无 token → 401；
-	// 票据过期/伪造 → 401。
-	// §0926E2E-W2B：token query 回退带**退役截止**（sseQueryTokenDeadline，2026-10-15 CST）——
-	// 长期凭证进 URL 的形态不能无限期存在，到期后该分支只拒不鉴。
-	// English: SSE auth prefers the 60s ticket (reusable within its TTL since §M5, so native
-	// reconnect works); legacy token query fallback still works until the §0926E2E-W2B deadline.
-	userID := ""
+// ctxSSEUserKey SSE 建链已认证账号的上下文键（由 sseTicketMiddleware 写入）。
+//
+// §P2-1（2026-11-01）：此前鉴权写在 handleFixSSE 体内，**注册层看不出它有鉴权**——
+// `s.mux.HandleFunc("GET /api/events", s.handleFixSSE)` 和一条完全公开的路由长得一模一样，
+// 未来新增同风格路由时极易漏检。现在把解析提到中间件层，注册行自己就说明了它有门槛。
+type ctxSSEUserKey struct{}
+
+// sseUserIDFromContext 取中间件已解析的账号；空串表示未经中间件（直调/测试路径）。
+func sseUserIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxSSEUserKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// resolveSSEUserID 解析 SSE 建链凭证，返回 (账号ID, 失败文案)；账号为空即失败。
+//
+// §WS-F C4a 鉴权：优先短时效票据（推荐，URL 不留长期 token；§M5 起 TTL 内可复用，
+// 原生重连不再必然 401）；兼容旧客户端 token query 回退。无票据亦无 token → 401；
+// 票据过期/伪造 → 401。
+// §0926E2E-W2B：token query 回退带**退役截止**（sseQueryTokenDeadline，2026-10-15 CST）——
+// 长期凭证进 URL 的形态不能无限期存在，到期后该分支只拒不鉴。
+// English: resolves the SSE credential — 60s ticket first (reusable within TTL since §M5), then the
+// legacy `?token=` fallback until its retirement deadline. Empty id means rejected.
+func (s *Server) resolveSSEUserID(r *http.Request) (string, string) {
 	if tk := r.URL.Query().Get("ticket"); tk != "" {
 		s.sweepSSETickets()
-		if uid, ok := s.useSSETicket(tk); ok {
-			userID = uid
+		if uid, ok := s.useSSETicket(tk); ok && uid != "" {
+			return uid, ""
 		}
-		if userID == "" {
-			writeError(w, 401, "invalid or expired ticket")
-			return
-		}
-	} else if tokenStr := r.URL.Query().Get("token"); tokenStr != "" {
+		return "", "invalid or expired ticket"
+	}
+	if tokenStr := r.URL.Query().Get("token"); tokenStr != "" {
 		// §0926E2E-W2B 退场闸：过截止点后**不再走 ValidateToken**——即便手里是有效长期凭证也 401。
 		// 每次命中打 [security] 告警日志（带截止日与 IP）：退役若误伤未升级客户端，日志是
 		// 唯一的取证面；owner 按该日志确认零残留前不得再放宽（宁缺勿滥的收口纪律）。
 		if !sseQueryTokenDeadline.After(time.Now()) {
 			log.Printf("[security] SSE 遗留 ?token= 通道已到期退役（deadline=%s）：ip=%s 仍在使用，请升级客户端改走 /api/events/ticket",
 				sseQueryTokenDeadline.Format("2006-01-02 15:04:05 MST"), clientIP(r))
-			writeError(w, 401, "token query channel retired; use POST /api/events/ticket")
-			return
+			return "", "token query channel retired; use POST /api/events/ticket"
 		}
 		if u := s.auth.ValidateToken(tokenStr); u != nil {
-			userID = u.ID
-		} else {
-			writeError(w, 401, "invalid token")
+			return u.ID, ""
+		}
+		return "", "invalid token"
+	}
+	return "", "missing ticket or token"
+}
+
+// sseTicketMiddleware 把 SSE 建链鉴权提到注册层：解析失败即 401，成功则把账号写进上下文。
+// 行为与原 handler 内联实现逐字一致（fail-closed、票据优先、遗留 token 有退役截止）。
+func (s *Server) sseTicketMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid, msg := s.resolveSSEUserID(r)
+		if uid == "" {
+			writeError(w, http.StatusUnauthorized, msg)
 			return
 		}
-	} else {
-		writeError(w, 401, "missing ticket or token")
-		return
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxSSEUserKey{}, uid)))
+	}
+}
+
+func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
+	// §P2-1：正常路径由 sseTicketMiddleware 注入；直调（测试/旧注册形态）时在此兜底解析，
+	// 保证"注册层有门槛"与"handler 自身也不会裸奔"两件事同时成立。
+	userID := sseUserIDFromContext(r.Context())
+	if userID == "" {
+		uid, msg := s.resolveSSEUserID(r)
+		if uid == "" {
+			writeError(w, http.StatusUnauthorized, msg)
+			return
+		}
+		userID = uid
 	}
 
 	flusher, ok := w.(http.Flusher)

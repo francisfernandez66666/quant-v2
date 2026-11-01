@@ -1712,19 +1712,19 @@ func (e *Engine) totalPaperEquityLocked() float64 {
 // 返回 (股数, 跳过原因)；跳过原因为空表示成功。调用方须持 e.mu。
 // English: paper dynamic budget — pool equity × scale, capped by whole-book 35% industry/stock
 // rooms and pool cash. Caller must hold e.mu.
-func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale float64) (int, string) {
+func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale float64) (int, *BudgetError) {
 	base := e.poolEquityLocked(poolKey)
 	capEq := e.totalPaperEquityLocked()
 	if base <= 0 || capEq <= 0 || price <= 0 {
 		// §W-02：早退也要播快照——否则「跳过的这笔为什么没买」在页面上完全看不见，
 		// 而这正是决策卡要回答的第一个问题。B1 用例钉住这条。
 		e.emitSkipDecisionLocked(poolKey, code, "池权益/价格不可得", base, e.pools[poolKey])
-		return 0, "池权益/价格不可得"
+		return 0, &BudgetError{Reason: "池权益/价格不可得", Cash: e.pools[poolKey]}
 	}
 	cash := e.pools[poolKey]
 	if cash <= 0 {
 		e.emitSkipDecisionLocked(poolKey, code, "池现金不足", base, cash)
-		return 0, "池现金不足"
+		return 0, &BudgetError{Reason: "池现金不足", Cash: cash}
 	}
 	// k = 信号带下来的合成因子（BuyScale = MS×SS）。0 与 1.0 都表示"没有缩放"（中性）：
 	// 0 是 Signal 的零值（未定权），1.0 是显式中性——两者必须同义，否则"没定权"会被读成
@@ -1824,12 +1824,14 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 	})
 	if res.SkipReason != "" {
 		e.emitDecisionLocked(poolKey, code, price, perTradePct, base, cash, targetRatio, curStrat, room,
-			res.CappedBy, "skipped", res.SkipReason, 0)
-		return 0, res.SkipReason
+			res.CappedBy, "skipped", res.SkipReason, 0, res)
+		// §F-4：返回**结构化**拒绝（带 capped_by/预算/一手成本/现金/剩余空间），
+		// 由 server 侧展开成 {error, detail}——只回一句"额度不足1手"等于让用户自己猜该改哪个参数。
+		return 0, newBudgetError(res, price, perTradePct, cash, room)
 	}
 	e.emitDecisionLocked(poolKey, code, price, perTradePct, base, cash, targetRatio, curStrat, room,
-		res.CappedBy, "placed", "", res.Qty)
-	return res.Qty, ""
+		res.CappedBy, "placed", "", res.Qty, res)
+	return res.Qty, nil
 }
 
 // emitDecisionLocked 把本轮动态预算的结果播给记录器（§W-02）。
@@ -1838,16 +1840,23 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 // 回调是外部注入的，它里面若去取 e.mu 就是自锁——B3 用例专门用 -race 盯这条。
 // 记录器为 nil 时整体 no-op，纯内存账本/单测不受影响。
 func (e *Engine) emitDecisionLocked(poolKey, code string, price, perTradePct, base, cash, targetRatio,
-	curStrat, room float64, cappedBy, stage, reason string, qty int) {
+	curStrat, room float64, cappedBy, stage, reason string, qty int, rooms ordbudget.Result) {
 	fn := e.onDecision
 	if fn == nil {
 		return
 	}
 	// 关键输入缺失要**标出来**而不是留 0——面板上 0 与"没算"是两件事，
 	// 显示成 0.000 会造假读数（前端 B5 用例为此把缺项改渲染 —）。
+	//
+	// §F-3（方案甲，2026-11-01）：把「未注入」与「注入但为 0」分开报。
+	// 旧写法两者都归成 "market_scale"，前端无法区分"引擎没喂"和"市场真的平"——
+	// 前者应该提示"引擎未注入（观察期）"，后者才是真读数。
 	missing := ""
-	if e.sizingCtx.MarketScale <= 0 {
-		missing = "market_scale"
+	if !e.sizingCtx.Injected {
+		missing = "market_scale_not_injected"
+	} else if e.sizingCtx.MarketScale <= 0 {
+		// 注入过但读数就是 0：这是**真实读数**，不是缺项。仍标出来，避免前端把 0 当"没算"。
+		missing = "market_scale_zero"
 	}
 	if e.sizingCtx.MissingKey {
 		if missing != "" {
@@ -1856,18 +1865,22 @@ func (e *Engine) emitDecisionLocked(poolKey, code string, price, perTradePct, ba
 		missing += "market_key_input"
 	}
 	fn(DecisionRecord{
-		Day:             cntime.DayCompactOf(cntime.Now()),
-		At:              cntime.Now(),
-		Code:            code,
-		Strategy:        poolKey,
-		Stage:           stage,
-		MarketScale:     e.sizingCtx.MarketScale,
-		PerTradePct:     perTradePct,
-		Total:           base,
-		Cash:            cash,
-		Target:          base * targetRatio,
-		CurStrat:        curStrat,
-		Room:            room,
+		Day:         cntime.DayCompactOf(cntime.Now()),
+		At:          cntime.Now(),
+		Code:        code,
+		Strategy:    poolKey,
+		Stage:       stage,
+		MarketScale: e.sizingCtx.MarketScale,
+		PerTradePct: perTradePct,
+		Total:       base,
+		Cash:        cash,
+		Target:      base * targetRatio,
+		CurStrat:    curStrat,
+		Room:        room,
+		// §F-3-E5：三帽剩余额度逐项透传（此前恒 0，DB 与前端都当假读数在展示）。
+		IndustryRoom:    rooms.IndustryRoom,
+		StockRoom:       rooms.StockRoom,
+		ClusterRoom:     rooms.ClusterRoom,
 		CappedBy:        cappedBy,
 		Reason:          reason,
 		MissingKeyInput: missing,
@@ -1880,7 +1893,9 @@ func (e *Engine) emitDecisionLocked(poolKey, code string, price, perTradePct, ba
 // 这三条早退发生在单笔占比算出之前，所以只带池权益/池现金与原因；其余字段留 0，
 // 由 MissingKeyInput 说明"不是算出来 0"（前端 B5 对缺项渲染 —）。
 func (e *Engine) emitSkipDecisionLocked(poolKey, code, reason string, base, cash float64) {
-	e.emitDecisionLocked(poolKey, code, 0, 0, base, cash, 0, 0, 0, "", "skipped", reason, 0)
+	// 早退发生在 ordbudget.Compute 之前，三帽读数尚不可得 ⇒ 传零值 Result，
+	// 由 MissingKeyInput 说明"不是算出来 0"（前端对缺项渲染 —）。
+	e.emitDecisionLocked(poolKey, code, 0, 0, base, cash, 0, 0, 0, "", "skipped", reason, 0, ordbudget.Result{})
 }
 
 // paperSizingCtx engine 每轮注入的定权上下文（见 Engine.sizingCtx）。
@@ -1897,6 +1912,13 @@ type paperSizingCtx struct {
 	LastK      float64
 	Ceiling    float64 // 目标仓位天花板（默认 1.00）
 	MissingKey bool    // 关键市场读数缺失（目标封顶半仓、日内 T 关闭）
+	// Injected §F-3（方案甲，2026-11-01）：engine 本轮**是否真的注入过**。
+	// 为什么需要它：MarketScale 的零值与"注入了一个 0"在纸面这一侧长得一模一样，
+	// 而两者含义相反——前者是"引擎没喂"（不该收紧，也不该让用户以为有仓位上限），
+	// 后者是"市场读数确实是 0"。不区分就无法在 /api/signals/decisions 里说清楚。
+	// English: whether the engine actually injected this round. A zero MarketScale from "never
+	// injected" and a genuine zero reading must not be reported as the same thing.
+	Injected bool
 }
 
 // perTradeBandOf 归一单笔占比区间的两端（纸面唯一实现点，下单路径与展示面共用）。
@@ -1931,7 +1953,7 @@ func perTradeBandOf(ctx paperSizingCtx) (lo, hi float64) {
 func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool) {
 	e.mu.Lock()
 	e.sizingCtx = paperSizingCtx{MarketScale: ms, PerTradeLo: perTradeLo, PerTradeHi: perTradeHi,
-		Ceiling: ceiling, MissingKey: missingKey}
+		Ceiling: ceiling, MissingKey: missingKey, Injected: true}
 	e.mu.Unlock()
 }
 
@@ -1955,7 +1977,12 @@ func (e *Engine) PositionPoolAndMark(code string) (poolKey string, price float64
 func (e *Engine) StrategicBuyRoom(poolKey, code string, price float64) (int, string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.dynamicPaperQtyLocked(poolKey, code, price, 1.0)
+	q, be := e.dynamicPaperQtyLocked(poolKey, code, price, 1.0)
+	if be != nil {
+		// §F-4：调用方只要原因串，结构化信息在此收窄（本函数签名保持 (int, string) 不变）。
+		return q, be.Reason
+	}
+	return q, ""
 }
 
 // fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
@@ -1999,12 +2026,13 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	// §DYN-SIZE-v3：dynamic 模式忽略显式股数与固定金额，统一走池权益×缩放；legacy 保持旧路径。
 	explicitQty := qty > 0 && !e.dynamicBudgetOn()
 	if e.dynamicBudgetOn() {
-		q, why := e.dynamicPaperQtyLocked(poolKey, code, price, sizeScale)
+		q, berr := e.dynamicPaperQtyLocked(poolKey, code, price, sizeScale)
 		if q <= 0 {
-			if why == "" {
-				why = "动态预算不足"
+			// §F-4：把结构化拒绝原样往上抛（不再包成一句话），由 server 展开成 {error, detail}。
+			if berr == nil {
+				berr = &BudgetError{Reason: "动态预算不足"}
 			}
-			return fmt.Errorf("动态仓位: %s", why)
+			return berr
 		}
 		qty = q
 	} else if !explicitQty {
@@ -2186,14 +2214,15 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 		return errNoQuote
 	}
 	if held {
-		q, why := e.dynamicPaperQtyLocked(p.StrategyType, code, price, 1.0)
+		q, berr := e.dynamicPaperQtyLocked(p.StrategyType, code, price, 1.0)
 		if q <= 0 {
-			if why == "" {
-				why = "动态预算不足"
+			// §F-4：结构化拒绝原样上抛；落库原因用 Error()（已含"动态仓位:"前缀与差额说明）。
+			if berr == nil {
+				berr = &BudgetError{Reason: "动态预算不足"}
 			}
 			e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: p.StrategyType, Side: "buy",
-				Kind: "手动加仓", SignalPrice: signalPrice, Status: "rejected", Reason: "动态仓位: " + why})
-			return fmt.Errorf("动态仓位: %s", why)
+				Kind: "手动加仓", SignalPrice: signalPrice, Status: "rejected", Reason: berr.Error()})
+			return berr
 		}
 		if err := e.addToPositionLocked(p, code, name, strategy, signalPrice, price, q, "手动模拟加仓(动态仓位)"); err != nil {
 			e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: p.StrategyType, Side: "buy",

@@ -435,26 +435,64 @@ func (e *Engine) runIntradayT(uid string, pe *paper.Engine, quotes map[string]*d
 	if !data.IsActiveSession(time.Now()) {
 		return
 	}
-	p, ms, missing := e.tParamsFor(uid, tc, sc.ShadowOn())
-	// 顺手把定权上下文喂给纸面目标模型：一笔买入与一条 T 腿必须吃同一个 MS，
-	// 分头计算会让"目标 70%、单笔却按 85% 算"这类漂移无声发生。
-	// §B0：单笔占比传**区间两端**（lo/hi），纸面自己按 k 调 signalctl.PerTradePctOf——
-	// 与实盘同一个纯函数，两本账的金额口径从此同源（旧写法只传 lo，纸面单笔只有实盘的 1/3）。
-	perTradeLo := sc.PerTradePositionPct
+	p, _, _ := e.tParamsFor(uid, tc, sc.ShadowOn())
+	// §F-3（方案甲，2026-11-01）：定权上下文改由 injectPaperSizing 在**估值轮**统一注入，
+	// 此处不再重复。原因见 injectPaperSizing 的注释：注入点原本挂在本函数内，而本函数前面有
+	// 「T 开关」与「交易时段」两道早退 ⇒ T 关着时 ms 恒 0、目标仓位永不执法。
+	e.wireTCallbacks(uid, pe, &p)
+	pe.RunIntradayT(quotes, p)
+}
+
+// paperSizingParams 解析该账号的纸面定权参数（单笔占比区间两端 + 目标仓位天花板）。
+//
+// 归一规则与 runIntradayT 旧实现逐字一致（lo<=0||lo>1 → 0.10；hi<=0 → 0.30；ceiling 缺省 1.0），
+// 抽出来是为了让"注入"与"T 参数"吃同一份值——两处各算一套就会重演 §B0 的单笔口径漂移。
+// English: resolves the paper sizing band/ceiling; extracted so injection and T params share one source.
+func (e *Engine) paperSizingParams(uid string) (perTradeLo, perTradeHi, ceiling float64) {
+	sc := e.sizingConfigFor(uid)
+	perTradeLo = sc.PerTradePositionPct
 	if perTradeLo <= 0 || perTradeLo > 1 {
 		perTradeLo = 0.10
 	}
-	perTradeHi := sc.PerTradePositionMaxPct
+	perTradeHi = sc.PerTradePositionMaxPct
 	if perTradeHi <= 0 {
 		perTradeHi = 0.30
 	}
-	ceiling := sc.MaxTotalPositionPct
+	ceiling = sc.MaxTotalPositionPct
 	if ceiling <= 0 || ceiling > 1 {
 		ceiling = 1.0
 	}
-	pe.SetSizingContext(ms, perTradeLo, perTradeHi, ceiling, missing)
-	e.wireTCallbacks(uid, pe, &p)
-	pe.RunIntradayT(quotes, p)
+	return perTradeLo, perTradeHi, ceiling
+}
+
+// injectPaperSizing 把定权上下文注入纸面引擎——**每个估值轮都注入**，与 T 开关、交易时段无关。
+//
+// §F-3（方案甲，2026-11-01）根因：SetSizingContext 全仓唯一调用点原本在 runIntradayT 内，
+// 而 runIntradayT 前面有两道早退（`!tc.TEnabled()`、`!data.IsActiveSession()`）。
+// 结果：T 关着 ⇒ sizingCtx 永远是零值 ⇒ paper 的 `roomSet = ... && ms > 0` 恒 false ⇒
+// 目标仓位/行业簇这一整套机制**代码在、线上一次都没跑过**（`/api/signals/decisions` 里
+// market_scale 恒 0、missing_key_input 恒 true 就是这么来的）。
+//
+// 方案甲把注入点从"T 的附属动作"提成"估值轮的基本动作"：一笔战略买入与一条 T 腿必须吃同一个 MS，
+// 这个约束与 T 开不开无关。T 自己的环境门（开关/时段）仍留在 runIntradayT 内，一字未动。
+//
+// ⚠️ **行为变更**：注入生效后，SizingEnabled=true 且 SizingShadow=false 的账号会**真的**按目标
+// 仓位收紧（room 用完即拒新买）。要退回"只留痕不执法"，把该账号的 sizing 影子开关置 true 即可，
+// 不需要改代码。
+// English: injects the sizing context every valuation round, independent of the T switch. This is the
+// behaviour change of 方案甲 — accounts with SizingEnabled && !SizingShadow will now actually enforce
+// the target room; set the sizing shadow switch to true to fall back to observe-only.
+func (e *Engine) injectPaperSizing(uid string, pe *paper.Engine) {
+	if pe == nil {
+		return
+	}
+	if uid == "" {
+		uid = e.primaryMember()
+	}
+	lo, hi, ceiling := e.paperSizingParams(uid)
+	// sizingContextFor 带 10s 短窗缓存，同一轮里 T 参数与本次注入拿到的是同一个 MS/盲区读数。
+	ctx := e.sizingContextFor(uid)
+	pe.SetSizingContext(ctx.MS, lo, hi, ceiling, ctx.Missing)
 }
 
 // wireTCallbacks 把读数回调接到引擎的真实数据源上（全部"取不到就说取不到"）。

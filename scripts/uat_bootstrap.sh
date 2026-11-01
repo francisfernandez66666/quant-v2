@@ -462,6 +462,12 @@ for path in files:
     positions = st.get("positions") or {}
     for pos in positions.values():
         pos["filled_at"] = old
+        # §UAT-FIXTURE（2026-11-01）：产品按**每笔 lot 的成交时间**分层算可卖量
+        # （internal/paper/t1_partial.go LayersOfPosition → canSellToday(l.FilledAt)）。
+        # 只改 pos["filled_at"] 而不改 lots[].filled_at，会让 sellable_qty 恒为 0
+        # ⇒ 卖出一律被 T+1 拦下 ⇒ 卖出分支在自举栈里**永远跑不到**（UAT 真空洞）。
+        for lot in (pos.get("lots") or []):
+            lot["filled_at"] = old
         n += 1
     if positions:
         json.dump(st, open(path, "w"))

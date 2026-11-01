@@ -30,6 +30,7 @@ vi.mock('../api/index.js', async () => {
     fetchPaperState: async () => ({ enabled: false }),
     fetchShortStatus: async () => ({ short_enabled: false }),
     fetchAlerts: async () => [],
+    fetchAlertTotal: async () => 0,
     fetchSignalDecisions: async () => ({
       day: '20261030',
       items: [{

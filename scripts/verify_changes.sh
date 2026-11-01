@@ -1933,7 +1933,9 @@ go test -count=1 ./internal/notify/ -run 'TestNtfyBreaker|TestPushGatewayShortCi
 go test -count=1 ./internal/engine/ -run 'TestAutoPlaceIdempotencyKey' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 py_tests qmt_gateway/tests/test_trading_calendar.py
 # M-14 静态锁：test-attribution 必须挂 adminMiddleware（负锁：authMiddleware 形态绝迹）。
-grep -E 'test-attribution.*adminMiddleware' internal/server/server.go >/dev/null || { echo "--- FAIL: §M-14 test-attribution 收权丢失（成员又可无限烧 LLM Stage2）"; exit 1; }
+# §F-6（2026-11-01）：收口从"角色级 adminMiddleware"升级为"显式权限位 ops_admin"——
+# 判据随之改口径，但**意图一字不变**：成员不得触发该端点（无 ops_admin 即 403）。
+grep -E 'test-attribution.*strictPermMiddleware\(auth\.PermOpsAdmin' internal/server/server.go >/dev/null || { echo "--- FAIL: §M-14 test-attribution 收权丢失（成员又可无限烧 LLM Stage2）"; exit 1; }
 if grep -qE '"POST /api/news/test-attribution", s\.authMiddleware' internal/server/server.go; then
 	echo "--- FAIL: §M-14 又回退成 authMiddleware（普通成员可越权写全局信号簿）"; exit 1; fi
 # C6 静态锁：买入幂等键战法分量必须由 StrategyKeyOf 单点派生；旧 StrategyID?:Strategy 分叉形态绝迹。
@@ -17720,19 +17722,19 @@ grep -qF 'func TestControllerCashScope' internal/trading/cash_scope_test.go || f
 # —— ④ 严格路由矩阵（计数是当前实现的派生值；改路线必须同批改这里） ——
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermFundsAdmin' internal/server/server.go || true)
-[ "$N144" -eq 8 ] || fail144 "funds_admin 严格路由应为 8，实得 $N144"
+[ "$N144" -eq 19 ] || fail144 "funds_admin 严格路由应为 19，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermTradingAdmin' internal/server/server.go || true)
-[ "$N144" -eq 24 ] || fail144 "trading_admin 严格路由应为 24，实得 $N144"
+[ "$N144" -eq 27 ] || fail144 "trading_admin 严格路由应为 27，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server.go || true)
 [ "$N144" -eq 14 ] || fail144 "user_admin 严格路由应为 14，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermConfigAdmin' internal/server/server.go || true)
-[ "$N144" -eq 18 ] || fail144 "config_admin 严格路由应为 18，实得 $N144"
+[ "$N144" -eq 21 ] || fail144 "config_admin 严格路由应为 21，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermOpsAdmin' internal/server/server.go || true)
-[ "$N144" -eq 9 ] || fail144 "ops_admin 严格路由应为 9，实得 $N144"
+[ "$N144" -eq 14 ] || fail144 "ops_admin 严格路由应为 14，实得 $N144"
 CNT144=$((CNT144 + 1))
 # signal-logs 是各账号自己的信号批次读面（handler 按请求者取引擎），收成运营特权面会误伤普通账号。
 if grep -qF 'strictPermMiddleware(auth.PermOpsAdmin, s.handleSignalLogs)' internal/server/server.go; then

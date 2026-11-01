@@ -16,6 +16,8 @@ vi.mock('../api/index.js', async (orig) => {
       id: 'a1', level: '清仓', title: '止盈提醒·600580', body: 'body',
       code: '600580.SH', name: '卧龙电驱', created_at: '2026-09-18 15:05:00',
     }]),
+    // §PAGING-DEFAULT：导航角标改走 fetchAlertTotal（只取 1 条 + X-Total-Count）
+    fetchAlertTotal: vi.fn(async () => 1),
     fetchShortStatus: vi.fn(async () => ({ short_enabled: false })),
     deleteAlert: vi.fn(async () => ({})),
     clearAlerts: vi.fn(async () => ({})),

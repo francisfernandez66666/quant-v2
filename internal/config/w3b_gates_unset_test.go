@@ -18,7 +18,9 @@ func TestW3bZeroConfigIsFlaggedUnset(t *testing.T) {
 	if !rg.GatesConfigUnset() {
 		t.Fatal("零值配置必须判『缺配置』——默认关六闸全关正是缺陷4的现网形态")
 	}
-	want := []string{"day_loss", "concentration", "stale_quote", "limit_up_block_buy", "max_order_amount", "cross_check"}
+	// §GATES-COVERAGE（2026-11-01）：八道（原六道 + 行业/概念敞口）。
+	want := []string{"day_loss", "concentration", "stale_quote", "limit_up_block_buy",
+		"max_order_amount", "cross_check", "sector_exposure", "concept_exposure"}
 	got := rg.DisabledGates()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("缺配置时关闭闸清单=%v，期望六闸全列 %v", got, want)
@@ -41,7 +43,9 @@ func TestW3bOneGateOnClearsUnset(t *testing.T) {
 	if rg.GatesConfigUnset() {
 		t.Fatal("只要配开任一默认关闸就不再是『一条没配』——告警必须熄（不误伤已配账号）")
 	}
-	want := []string{"day_loss", "concentration", "stale_quote", "limit_up_block_buy", "cross_check"}
+	// 开了一个（max_order_amount）⇒ 其余七道
+	want := []string{"day_loss", "concentration", "stale_quote", "limit_up_block_buy",
+		"cross_check", "sector_exposure", "concept_exposure"}
 	if got := rg.DisabledGates(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("半配状态关闭清单=%v，期望其余五闸 %v", got, want)
 	}
@@ -68,8 +72,10 @@ func TestW3bExplicitLimitDownOffIsCountedClosed(t *testing.T) {
 
 func TestW3bDisabledGatesJSONFriendlyOrdering(t *testing.T) {
 	// DisabledGates 返回非 nil 空切片（前端直接 .length 不怕 null——§F-5 null 崩页先例）。
+	// §GATES-COVERAGE：八道全配开（原六道 + 行业/概念敞口），缺一道清单就不空。
 	rg := RiskGateConfig{DayLossLimitPct: 3, SingleStockValuePct: 30, StaleQuoteMs: 3000,
-		LimitUpBlockBuy: true, MaxOrderAmount: 20000, CrossCheckPct: 2}
+		LimitUpBlockBuy: true, MaxOrderAmount: 20000, CrossCheckPct: 2,
+		SectorValuePct: 35, ConceptValuePct: 25}
 	if rg.GatesConfigUnset() {
 		t.Fatal("全配开状态不得报缺配置（反证：闸不误伤常态）")
 	}
@@ -79,5 +85,48 @@ func TestW3bDisabledGatesJSONFriendlyOrdering(t *testing.T) {
 	}
 	if string(b) != "[]" {
 		t.Fatalf("全配开时清单应为 JSON 空数组（不能是 null），实得 %s", b)
+	}
+}
+
+// TestW3bSectorConceptExposureCountedClosed §GATES-COVERAGE（2026-11-01）：
+// 行业/概念敞口与六道同族（零值即不评估，见 risk/gate.go:696/:759），必须进关闭清单。
+// 反证靶心：只配了 max_order_amount 时，界面曾只亮 5 道黄条，实际裸奔 7 道。
+func TestW3bSectorConceptExposureCountedClosed(t *testing.T) {
+	rg := RiskGateConfig{MaxOrderAmount: 20000}
+	got := rg.DisabledGates()
+	has := func(k string) bool {
+		for _, x := range got {
+			if x == k {
+				return true
+			}
+		}
+		return false
+	}
+	for _, k := range []string{"sector_exposure", "concept_exposure"} {
+		if !has(k) {
+			t.Fatalf("未配置的 %s 必须计入关闭清单，实得 %v", k, got)
+		}
+	}
+	// 配开行业敞口后它应离开清单（证明判定闭包真的读的是 SectorValuePct）。
+	// 注意 has() 闭包捕获的是 got，必须重取一次再判，否则判的是旧快照。
+	rg.SectorValuePct = 30
+	got = rg.DisabledGates()
+	if has("sector_exposure") {
+		t.Fatalf("sector_value_pct=30 后不应再判关闭，实得 %v", got)
+	}
+}
+
+// TestW3bRiskPerTradePctIsNotAGate §GATES-COVERAGE：RiskPerTradePct 是仓位算法参数
+// （engine.go:2308 按 ATR 风险预算缩股数），**不是** checks 链里的拒单闸。
+// 它单独配开时 AnyEnabled 不得报 true —— 否则"一道闸都没开"会被展示成"至少一闸开着"。
+func TestW3bRiskPerTradePctIsNotAGate(t *testing.T) {
+	rg := RiskGateConfig{RiskPerTradePct: 0.5, LimitDownBlockSell: mustUnsetFalse()}
+	if rg.AnyEnabled() {
+		t.Fatal("只配 risk_per_trade_pct（且跌停闸显式关）时不得报 AnyEnabled —— 它不是闸")
+	}
+	// 反向：配开一道真闸，AnyEnabled 必须 true
+	rg.MaxOrderAmount = 20000
+	if !rg.AnyEnabled() {
+		t.Fatal("配开 max_order_amount 后 AnyEnabled 应为 true")
 	}
 }

@@ -849,20 +849,31 @@ func (r RiskGateConfig) LimitDownBlockSellEnabled() bool {
 // AnyEnabled 是否开启了至少一道 RiskGate（供 UI/健康展示与短路）。
 // 注意：跌停追卖闸自 §A5-常开起默认生效，故零值配置下 AnyEnabled 恒为 true——
 // 该值只表示"至少一道闸开"，不再等价于"全部闸关"。
+//
+// §GATES-COVERAGE（2026-11-01）：**RiskPerTradePct 已从这里移除**。它是 engine.go:2308 的
+// **仓位算法参数**（按 ATR 风险预算缩减股数），不是 checks 链里的拒单闸；留在 AnyEnabled 里
+// 会让"只配了单笔风险预算、一道闸都没开"被误报成"至少一道闸开着"。
 // English: AnyEnabled reports whether at least one risk gate is enabled. Since §A5-always-on the
 // limit-down gate defaults to on, so zero config now reports true — the flag means "at least one
-// gate active", no longer "all gates off".
+// gate active", no longer "all gates off". §GATES-COVERAGE: RiskPerTradePct was removed — it is a
+// position-sizing input (engine.go:2308), not a rejecting gate in the checks chain.
 func (r RiskGateConfig) AnyEnabled() bool {
 	return r.DayLossLimitPct > 0 || r.SingleStockValuePct > 0 || r.StaleQuoteMs > 0 ||
 		r.LimitUpBlockBuy || r.LimitDownBlockSellEnabled() || r.MaxOrderAmount > 0 ||
-		r.CrossCheckPct > 0 || r.SectorValuePct > 0 || r.ConceptValuePct > 0 || r.RiskPerTradePct > 0
+		r.CrossCheckPct > 0 || r.SectorValuePct > 0 || r.ConceptValuePct > 0
 }
 
-// defaultOffGateEntries §0926E2E-4B（2026-09-26 全量评价批，裁决=选项B）：六道"出厂默认关"
+// defaultOffGateEntries §0926E2E-4B（2026-09-26 全量评价批，裁决=选项B）：八道"出厂默认关"
 // 风控闸的键名与判定闭包（键名与 /api/risk/gates 的 switches 口径逐一对齐，前端按键取中文名）。
 // 跌停追卖闸不列入默认关组——§A5-常开起其未配置即生效，"没配置"≠"没防守"。
-// English: the six factory-default-closed gates (key + closed-predicate); the limit-down gate is
-// excluded because since §A5 it is always-on unless explicitly disabled.
+//
+// §GATES-COVERAGE（2026-11-01）：原表只有六道，**漏了行业敞口与概念敞口**——这两道在
+// internal/risk/gate.go 的 checks 链里同样是"零值即 return ""（不评估）"（:696 / :759），
+// 与六道同族，却没进健康信号。后果：owner 只配了 max_order_amount 时，界面亮 5 道黄条，
+// 实际裸奔 7 道——**裸奔程度被低报 2 道**。现补齐为八道。
+// English: the eight factory-default-closed gates. §GATES-COVERAGE adds sector/concept exposure,
+// which were gated by the same "zero means skip" rule (gate.go:696/:759) but missing from the
+// health signal — under-reporting the unguarded surface by two.
 var defaultOffGateEntries = []struct {
 	Key    string
 	Closed func(r RiskGateConfig) bool
@@ -873,6 +884,9 @@ var defaultOffGateEntries = []struct {
 	{"limit_up_block_buy", func(r RiskGateConfig) bool { return !r.LimitUpBlockBuy }},
 	{"max_order_amount", func(r RiskGateConfig) bool { return r.MaxOrderAmount <= 0 }},
 	{"cross_check", func(r RiskGateConfig) bool { return r.CrossCheckPct <= 0 }},
+	// §GATES-COVERAGE 新增两道：与 gate.go 的 checkSectorExposure / checkConceptExposure 同判据。
+	{"sector_exposure", func(r RiskGateConfig) bool { return r.SectorValuePct <= 0 }},
+	{"concept_exposure", func(r RiskGateConfig) bool { return r.ConceptValuePct <= 0 }},
 }
 
 // DisabledGates 返回当前**关闭**的风控闸键名（默认关六闸按现值判定；跌停追卖闸仅在显式

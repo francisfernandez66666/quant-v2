@@ -29,15 +29,23 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "unauthorized")
 		return
 	}
+	// §F-6（2026-11-01）：effective_perms 是**该账号实际持有**的权限位——与 perms 同值，
+	// 但语义被写死成契约：`role=admin` 不再隐式授予任何能力（HasExplicitPerm 只认 perms 数组）。
+	// 为什么要多一个同值字段：`role=admin` + 零权限位是一个**真实存在的状态**（迁移只给首个 admin
+	// 发五权限位），运维看到 role=admin 极易误读成"能看一切"，实际敏感端点全部 403。
+	// 前端据此渲染"此账号无管理权限"，而不是照常显示管理入口。
+	// English: effective_perms documents the contract that `role=admin` grants nothing implicitly —
+	// it equals perms, and exists so the UI can stop treating the role as a capability.
 	writeJSON(w, 200, map[string]interface{}{
-		"id":          user.ID,
-		"username":    user.Username,
-		"role":        user.Role,
-		"perms":       user.Perms,
-		"enabled":     user.Enabled,
-		"expires_at":  user.ExpiresAt,
-		"tenant_id":   s.auth.TenantOf(user.ID), // §MT 所属租户
-		"tenant_name": s.auth.TenantName(s.auth.TenantOf(user.ID)),
+		"id":              user.ID,
+		"username":        user.Username,
+		"role":            user.Role,
+		"perms":           user.Perms,
+		"effective_perms": user.Perms,
+		"enabled":         user.Enabled,
+		"expires_at":      user.ExpiresAt,
+		"tenant_id":       s.auth.TenantOf(user.ID), // §MT 所属租户
+		"tenant_name":     s.auth.TenantName(s.auth.TenantOf(user.ID)),
 	})
 }
 

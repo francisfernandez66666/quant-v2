@@ -552,7 +552,12 @@ test.describe('权限与登录分支', () => {
     await page.getByText('纸面持仓', { exact: true }).first().click(); await page.waitForTimeout(500)
     await expect(page.getByText('+ 新增持仓'), '成员无新增持仓入口').toHaveCount(0)
     await page.goto('/#/quant'); await page.waitForTimeout(2500)
-    await expect(page.locator('.app-main'), '量化页显示无权限提示').toContainText('无权限', { timeout: 15000 })
+    // §UAT-FIXTURE（2026-11-01）：旧断言等的是「页内无权限面板」的文案，而现行设计是
+    // ProtectedRoute(strictPerm) 整页跳 /403，页面渲染的是「403 · 无访问权限」。
+    // 注意「无访问权限」**不含**连续子串「无权限」（无-访-问-权-限），所以旧断言必红。
+    // 判据改成 403 页面的真实文案，并同时确认确实落到了 /403 路由。
+    await expect(page.locator('.app-main'), '量化页应整页跳 403 并显示无访问权限').toContainText('无访问权限', { timeout: 15000 })
+    expect(new URL(page.url()).hash, 'tester 访问 /#/quant 应被重定向到 /#/403').toContain('/403')
     await page.screenshot({ path: `${SHOT}/branch-tester-quant403.png`, fullPage: true })
     await page.goto('/#/settings'); await page.waitForTimeout(1000)
     await expect(page.locator('.app-main')).toContainText('403')
@@ -912,7 +917,16 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
         headers: hdr, data: { code: '300750', side: '买入', action: '建仓', qty: 100, price: live, strategy: 'manual' },
       })
       expect(exec.status(), 'halted 置位时下单被拒').toBeGreaterThanOrEqual(400)
-      expect(JSON.stringify(await exec.json()), '拒单原因含 kill-switch').toContain('kill-switch')
+      // §UAT-FIXTURE（2026-11-01）：非交易日时 session_guard 先于 kill-switch 拦下，拒因如实是
+      // 「今日休市（非交易日）」。此时"拒因含 kill-switch"这条断言**无从验证**——
+      // 让它在周日恒红等于每周白红两天，而把它改成无条件接受休市又会让交易日失去覆盖。
+      // 故按日历分支：休市日断言拒因是休市（证明闸链顺序正确），交易日才断言 kill-switch。
+      const execBody = JSON.stringify(await exec.json())
+      if (execBody.includes('今日休市')) {
+        expect(execBody, '非交易日拒因应为休市').toContain('非交易日')
+      } else {
+        expect(execBody, '拒单原因含 kill-switch').toContain('kill-switch')
+      }
       // 解除还原（UI 链路验证；服务端兜底复位在 finally）
       await page.reload()
       const release = page.locator('.t-card', { hasText: '链路状态' }).getByRole('button', { name: '解除停止' })
@@ -1142,9 +1156,15 @@ test.describe('修复回归 · WL-FIX 20260917 自选股', () => {
     await page.goto('/#/')
     await page.waitForTimeout(500)
     const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
-    // 用确定性测试代码 WLTEST8888.SZ（行情缺失行走快照缺失补全/评估回退分支）
-    const code = 'WLTEST8888.SZ'
-    await page.request.post('/api/watchlist', { headers: hdr, data: { code } })
+    // §UAT-FIXTURE（2026-11-01）：旧用例用 WLTEST8888.SZ —— 服务端 normalizeWatchStockCode
+    // 要求「6 位 ASCII 数字 + A 股板块前缀」，字母码被合法拒绝（400），代码从未入库。
+    // 改用格式合法但几乎不可能真实持有的 605999（605 段属沪市）。
+    // ⚠️ 断言必须用**归一化后**的 6 位码：后端把 '605999.SH' 拆成 code='605999' + market='SH'
+    // 存储与展示（Watchlist.jsx 渲染 row.code），带后缀的字符串在表格里永远找不到。
+    const code = '605999'
+    const addRes = await page.request.post('/api/watchlist', { headers: hdr, data: { code: code + '.SH' } })
+    // 夹具自身失败要当场炸，而不是等 15s 超时后再猜原因（这正是本用例当初红得莫名其妙的地方）
+    expect(addRes.status(), `新增自选应 200，实得 ${addRes.status()} body=${await addRes.text()}`).toBe(200)
     try {
       await page.goto('/#/watchlist')
       // §WL-FIX 回归点：整表合并不再被 ReferenceError 炸掉（修复前必渲染「暂无自选股」）
@@ -1163,8 +1183,11 @@ test.describe('修复回归 · WL-FIX 20260917 自选股', () => {
     await page.goto('/#/')
     await page.waitForTimeout(500)
     const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
-    const code = 'WLTEST7777.SZ'
-    await page.request.post('/api/watchlist', { headers: hdr, data: { code } })
+    // §UAT-FIXTURE（2026-11-01）：同 WL-1，改用格式合法（003 段属深市）的 003999；
+    // 断言用归一化后的 6 位码（后端剥掉 .SZ 后缀存储与展示）。
+    const code = '003999'
+    const addRes = await page.request.post('/api/watchlist', { headers: hdr, data: { code: code + '.SZ' } })
+    expect(addRes.status(), `新增自选应 200，实得 ${addRes.status()} body=${await addRes.text()}`).toBe(200)
     try {
       await page.goto('/#/watchlist')
       await expect(page.getByText(code).first(), '添加后可见').toBeVisible({ timeout: 15000 })
@@ -1610,6 +1633,10 @@ test.describe('修复回归 · 0925EVE 撤单失败明细与第三态人工收�
         txt = await exec.text()
       }
       // 白名单口径：strategy 必须内置四形态之一（manual 会被 risk.Gate 兜底拒——2026-09-25 实测）
+      // §UAT-FIXTURE（2026-11-01）：非交易日时 session_guard 先于一切下单闸拦下，
+      // 造不出「账本已报 / 网关已成」的在途单。此时返回空串让调用方 skip，
+      // 而不是在 `live 下单应 200` 上假红（旧写法每周休市两天必红，且红因与用例意图无关）。
+      if (txt.includes('今日休市')) return ''
       expect(exec.status(), `live 下单应 200（dragon 在白名单默认全集内）body=${txt}`).toBe(200)
       const oid = JSON.parse(txt).order_id
       expect(oid, '下单回网关委托号').toMatch(/^MOCK\d+$/)
@@ -1649,6 +1676,11 @@ test.describe('修复回归 · 0925EVE 撤单失败明细与第三态人工收�
     let oid = ''
     try {
       oid = await placeStuckOrder(page, hdr)
+      // §UAT-FIXTURE：非交易日造不出在途单 —— 显式跳过并说明原因（不是失败，也不是静默放行）
+      if (!oid) {
+        test.skip(true, '非交易日：无法造「账本已报/网关已成」的在途单，撤单链路需交易日复测')
+        return
+      }
       // ① API 腿：halt 置位 → failed[] 含本单，reason 带网关 409 原文（不吞、不改写）
       const halt = await page.request.post('/api/qmt/halt', { headers: hdr, data: { halted: true } })
       expect(halt.status(), 'halt 置位应 200').toBe(200)
@@ -2305,9 +2337,18 @@ test.describe('§DYN-T 做 T 与 §DYN-SIZE v4：读数面 + 签字门（2026-10
     const sheet = page.getByText('发版签字单', { exact: false }).first()
     await expect(sheet, '签字单卡必须挂在设置页（admin）').toBeVisible({ timeout: 15000 })
     // 两个应用按钮在没有 token 时必须禁用——一次误触就改资金参数是不可接受的。
-    const applyBtn = page.getByRole('button', { name: /签字并应用 v4 迁移/ })
-    await expect(applyBtn).toBeVisible()
-    await expect(applyBtn, '未输 token 不得可点').toBeDisabled()
+    // §UAT-FIXTURE（2026-11-01）：TDesign 的 disabled Button 渲染成
+    // `<div class="t-button t-is-disabled">`——**没有 role、没有 tabindex**，
+    // 所以 getByRole('button') 恒 0 命中，toBeDisabled() 也不适用（它只认表单控件与 aria-disabled）。
+    // 判据改成三相：tag=DIV + class 含 t-is-disabled + 点击后不产生任何新消息（onClick 已被摘掉）。
+    const applyBtn = page.locator('.t-button', { hasText: /签字并应用 v4 迁移/ }).first()
+    await expect(applyBtn, '签字单卡的应用按钮必须渲染').toBeVisible({ timeout: 10000 })
+    expect(await applyBtn.evaluate((el) => el.tagName), '禁用态应渲染成 DIV 而不是 button').toBe('DIV')
+    await expect(applyBtn, '未输 token 不得可点').toHaveClass(/t-is-disabled/)
+    const msgBefore = await page.locator('.t-message').count()
+    await applyBtn.click({ force: true })
+    await page.waitForTimeout(400)
+    expect(await page.locator('.t-message').count(), '禁用按钮点击不得触发任何提示（onClick 已被摘掉）').toBe(msgBefore)
     // T 段阈值表单：展开精细参数后必须能看到"做 T 总开关"与至少三个阈值键（区间与后端 tClamp 同值）。
     await page.getByRole('button', { name: /展开精细参数/ }).click()
     await expect(page.getByText('做 T 总开关').first()).toBeVisible({ timeout: 10000 })

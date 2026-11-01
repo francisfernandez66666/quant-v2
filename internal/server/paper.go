@@ -3,6 +3,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,6 +17,27 @@ import (
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/store"
 )
+
+// writePaperOpError §F-4（2026-11-01）：模拟盘写面的统一错误出口。
+//
+// 动态预算拒绝（*paper.BudgetError）会带上完整裁定上下文（capped_by / 预算 / 一手成本 /
+// 现金 / 剩余空间 / 单笔占比），这里把它展开成 `{error, detail}`。
+// **保留 error 键**：既有前端按 error 文案分流，把形状从"字符串"改成"对象"会当场炸掉消费点。
+//
+// 非预算类错误走原样 writeError，行为一字不变。
+// English: §F-4 — expands a structured budget rejection into {error, detail}; the `error` key stays
+// so existing consumers keep working.
+func writePaperOpError(w http.ResponseWriter, err error) {
+	var be *paper.BudgetError
+	if errors.As(err, &be) {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error":  err.Error(),
+			"detail": be,
+		})
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
+}
 
 // paperEngine 返回注入的全局模拟盘引擎（旧单引擎回退；未注入时返回 nil）。
 // English: returns the injected global paper engine (legacy single-engine fallback; nil when not set).
@@ -322,7 +344,7 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 	// English: in v3 dynamic mode manual buys ignore the typed qty and always use dynamic sizing.
 	if strings.EqualFold(strings.TrimSpace(pe.Cfg().BudgetMode), "dynamic") {
 		if err := pe.BuyInPool(req.Code, req.Name, req.Strategy, poolKey, req.SignalPrice, quotes); err != nil {
-			writeError(w, 400, err.Error())
+			writePaperOpError(w, err)
 			return
 		}
 	} else if req.Qty > 0 {
@@ -330,13 +352,13 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 		// English: typed price + share count: fills as specified (price=0 falls back to the live quote
 		// but still respects the typed share count).
 		if err := pe.BuyExInPool(req.Code, req.Name, req.Strategy, poolKey, req.SignalPrice, req.Price, req.Qty, quotes); err != nil {
-			writeError(w, 400, err.Error())
+			writePaperOpError(w, err)
 			return
 		}
 	} else {
 		// 旧行为：固定金额整手，实时价成交
 		if err := pe.BuyInPool(req.Code, req.Name, req.Strategy, poolKey, req.SignalPrice, quotes); err != nil {
-			writeError(w, 400, err.Error())
+			writePaperOpError(w, err)
 			return
 		}
 	}
@@ -555,7 +577,7 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 		err = pe.Sell(req.Code, s.liveQuotes(req.Code))
 	}
 	if err != nil {
-		writeError(w, 400, err.Error())
+		writePaperOpError(w, err)
 		return
 	}
 	// 成交后重读：sold = 卖出前持仓 − 卖出后持仓（整仓清掉时为全量，不依赖 SellEx 的返回值）。

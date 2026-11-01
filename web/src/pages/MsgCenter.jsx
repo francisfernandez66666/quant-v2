@@ -167,7 +167,12 @@ export default function MsgCenter() {
     // §P2-I：本轮代号在发起请求前盖章，回写前两处判据各自到位
     const token = loadGuard.begin()
     try {
-      const all = await api.fetchAlerts()
+      // §PAGING-DEFAULT（2026-11-01）：后端缺省已改为 50 条/页，而本页的分级/战法筛选与
+      // 分页都在**客户端**做（filteredAlerts → slice），所以这里必须显式要全量，否则只能看到
+      // 最近 50 条、筛选器形同废掉。上限由后端 5000 兜住（超出时后端会截断并给 X-Total-Count）。
+      // 这是**有意的例外**：想拿全量的调用点必须自己写出来，不能再靠"不传参"白拿。
+      // TODO(P1-C)：把筛选与分页改到服务端后，这里应退回按页取数。
+      const all = await api.fetchAlerts({ page: 1, page_size: 5000 })
       if (loadGuard.isStale(token)) return // §P2-I 后到的旧轮次：列表与错误态一并作废
       setAlerts((all || []).filter(a => a.code !== 'CAL' && !(a.level && a.level.startsWith('日历'))))
       setAlertsError('')

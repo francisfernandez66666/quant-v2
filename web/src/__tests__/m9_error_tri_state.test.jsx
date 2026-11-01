@@ -27,6 +27,7 @@ function okPayloads() {
     fetchPaperState: () => ({ enabled: false }),
     fetchShortStatus: () => ({ short_enabled: false }),
     fetchAlerts: () => [],
+    fetchAlertTotal: () => 0,
     // Quant
     fetchQMTConfig: () => ({ enabled: false, known_strategies: [], strategies: [] }),
     fetchQMTState: () => ({ enabled: false, tripped: false }),

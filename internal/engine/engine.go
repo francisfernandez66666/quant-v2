@@ -2642,6 +2642,9 @@ func (e *Engine) paperMark(quotes map[string]*data.StockInfo) {
 		return
 	}
 	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
+		// §F-3（方案甲）：单机回退账本同样每轮注入定权上下文（与共享引擎路径同口径，
+		// 避免两套部署形态在"目标仓位是否执法"上分叉）。
+		e.injectPaperSizing(e.primaryMember(), pe)
 		// §纸面估值修复：持仓不在 5s 快照池时用最近收盘价回填估值价，避免 Mark 恒 0 → 现价0/浮亏-100%。
 		// English: backfill marks from the last daily close for held codes missing from the live snapshot,
 		// so a held position never displays 0.00 / -100%.
