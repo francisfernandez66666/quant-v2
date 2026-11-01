@@ -18516,9 +18516,10 @@ echo "ok - §160 §SUBSCRIPTION 锁通过（判据单源 4 + 网关顺序与去�
 
 # ════════════════════════════════════════════════════════════════════════════
 # §161 §SUBSCRIPTION-A（2026-11-01）：行情装配层（券商 L1 主源 + 覆盖率闸 + 池分档）锁
-#   判据本体：全局新鲜度不再由"命中 1 只"伪造；主源档缺省关；降级只认券商自身读数。
+#   判据本体：全局新鲜度不再由"命中 1 只"伪造；行情四键出厂开（owner 同日改判），观察档保留为回滚位；
+#   降级只认券商自身读数。
 # ════════════════════════════════════════════════════════════════════════════
-echo "==> 161 §SUBSCRIPTION-A（行情装配单点 / 覆盖率闸 / 观察档缺省关 / 降级只认自身读数 / 池分档迟滞）..."
+echo "==> 161 §SUBSCRIPTION-A（行情装配单点 / 覆盖率闸 / 四键出厂开 / 降级只认自身读数 / 池分档迟滞）..."
 B161_FAILED=0
 fail161() {
 	echo "--- FAIL: §161 $*"
@@ -18584,7 +18585,9 @@ fi
 
 # ⑧ 主源档缺省关 + 凭据取值优先运营账号在册快照（D1 那个"开着但每次 401"的静默无效必须被结构性堵住）
 CNT161=$((CNT161 + 1))
-grep -qF 'QMTFeedPrimary bool `json:"qmt_feed_primary"`' internal/config/config.go || fail161 "qmt_feed_primary 键丢了"
+grep -qE 'QMTFeedPrimary[[:space:]]+\*bool[[:space:]]+`json:"qmt_feed_primary,omitempty"`' internal/config/config.go || fail161 "qmt_feed_primary 丢了或退回裸 bool（零值会被读成关，达不到「缺省开」）"
+CNT161=$((CNT161 + 1))
+grep -qF 'func feedOn(v *bool) bool' internal/config/config.go || fail161 "缺省开的指针位读数口丢了"
 CNT161=$((CNT161 + 1))
 grep -qF 'StoredQMTConfigFor(cfgMgr.OperatorID())' cmd/quant/runtime_switches.go || fail161 "feed 凭据不再优先取运营账号在册快照钥匙"
 CNT161=$((CNT161 + 1))
@@ -18617,17 +18620,26 @@ CNT161=$((CNT161 + 1))
 HEALTH_EXEMPT=$(grep -cE 'parsed.path != "/health"' qmt_gateway/gateway.py)
 [ "${HEALTH_EXEMPT:-0}" = "1" ] || fail161 "网关免鉴权豁免位不再是唯一一处 /health（现测 $HEALTH_EXEMPT 处；裁决 14 不接受给 /quotes 开鉴权豁口）"
 
-# ⑫b 每票源标记（A3）：字段、开关、后备源标记次序三处都在，且缺省关时字段为 omitempty
+# ⑫b 每票源标记（A3）：字段、开关、后备源标记次序三处都在，且显式关时字段为 omitempty
 CNT161=$((CNT161 + 1))
 grep -qE 'Src[[:space:]]+string[[:space:]]+`json:"src,omitempty"`' internal/data/types.go || fail161 "StockInfo 的每票来源字段丢了（混源只能靠它证伪；gofmt 会调列间距，故按空格宽松匹配）"
 CNT161=$((CNT161 + 1))
 grep -qF 'f.stampSnapshotSources(snapshot, overlaid, extSource)' internal/data/fetcher.go && grep -qF '"quote_source_mixed"' internal/server/handlers_fix.go || fail161 "采集链没给后备源票逐票标记，或混源计数没上观测面（整份 Source 会替它们撒谎）"
 CNT161=$((CNT161 + 1))
-grep -qE 'QuotePerCodeSource[[:space:]]+bool[[:space:]]+`json:"quote_per_code_source"`' internal/config/config.go || fail161 "quote_per_code_source 开关丢了"
+grep -qE 'QuotePerCodeSource[[:space:]]+\*bool[[:space:]]+`json:"quote_per_code_source,omitempty"`' internal/config/config.go || fail161 "quote_per_code_source 开关丢了或退回裸 bool（零值会被读成关，达不到「出厂开」）"
+
+# ⑬b 量纲自动对齐（券商源默认开的前置）：观测单位与配置系数不一致时，本轮绝不接管量/额。
+#     为什么必须有：J3 天生抓不到「系数配错一档」——比值≈1 与 ≈100 都是合法单位档，
+#     于是「以券商为准 + 系数留 1」会把 VWAP（成交额÷成交量）整体带偏 100 倍，直接进委托装配、
+#     做 T 成本分解与那条 VWAP fail-closed 闸。缺这两枚锁就等于把已知风险推上线。
+CNT161=$((CNT161 + 1))
+grep -qF 'st.VolumeAligned = observed > 0 && observed == factor' internal/data/qmt_feed.go || fail161 "量纲自动对齐判据丢了"
+CNT161=$((CNT161 + 1))
+grep -qF 'if tk.Volume > 0 {' internal/data/quote_feed_hub.go || fail161 "applyTickTo 仍可把 0 量写进快照（未对齐时必须保留外部源的量/额）"
 
 # ⑭ 咨询链快照优先（裁决 13）：键、策略、两处消费点都在，且合并绝不碰资金流字段
 CNT161=$((CNT161 + 1))
-grep -qE 'QuoteHubConsult[[:space:]]+bool[[:space:]]+`json:"quote_hub_consult"`' internal/config/config.go || fail161 "quote_hub_consult 开关丢了"
+grep -qE 'QuoteHubConsult[[:space:]]+\*bool[[:space:]]+`json:"quote_hub_consult,omitempty"`' internal/config/config.go || fail161 "quote_hub_consult 开关丢了或退回裸 bool（零值会被读成关，达不到「出厂开」）"
 CNT161=$((CNT161 + 1))
 grep -qF 'func (f *Fetcher) HubQuote' internal/data/quote_feed_hub.go || fail161 "快照优先入口丢了"
 CNT161=$((CNT161 + 1))
@@ -18655,8 +18667,50 @@ fi
 CNT161=$((CNT161 + 1))
 grep -qE 'from xtquant import xtdata' scripts/probe_qmt_feed.py || fail161 "探针没走 xtdata 只读通道"
 
+# ⑮ 出厂开语义（2026-11-01 owner 改判「默认把券商信息源开关打开」）：四枚指针位必须
+#    ① 共用同一个 feedOn（缺键=开），② 设置页读面下发生效值而不是原始指针。
+#    为什么单独锁：视图里漏一枚（本次实测漏掉 quote_hub_consult）表现为前端收到 null、
+#    开关"看起来坏了"——而日志里它其实是开着的，这种形状最容易被人改完代码就忘掉。
+CNT161=$((CNT161 + 1))
+grep -qF 'func feedOn(v *bool) bool { return v == nil || *v }' internal/config/config.go || fail161 "出厂开的判据 feedOn 丢了或被逐键改写（四枚指针位必须同源）"
+CNT161=$((CNT161 + 1))
+for k in QMTFeedOn QMTFeedPrimaryOn QuotePerCodeSourceOn QuoteHubConsultOn; do
+	grep -qF "func (r RuntimeConfig) ${k}() bool { return feedOn(r." internal/config/config.go || fail161 "生效值访问器 $k 丢了或不走 feedOn"
+done
+CNT161=$((CNT161 + 1))
+for pair in 'qmt_feed_enabled.QMTFeedOn' 'qmt_feed_primary.QMTFeedPrimaryOn' 'quote_per_code_source.QuotePerCodeSourceOn' 'quote_hub_consult.QuoteHubConsultOn'; do
+	key=${pair%%.*}; acc=${pair##*.}
+	grep -qE "\"${key}\":[[:space:]]+rt\.${acc}\(\)" internal/server/handlers_runtime_config.go || fail161 "设置页读面 $key 没下发生效值（下发原始指针 ⇒ 出厂态显示成 null，开关看着像坏的）"
+done
+CNT161=$((CNT161 + 1))
+if grep -qE '"(qmt_feed_enabled|qmt_feed_primary|quote_per_code_source|quote_hub_consult)":[[:space:]]+rt\.(QMTFeedEnabled|QMTFeedPrimary|QuotePerCodeSource|QuoteHubConsult)[,)]' internal/server/handlers_runtime_config.go; then
+	fail161 "设置页读面把指针位原样下发（出厂态会变 null）——四枚开关必须走 *On() 生效值"
+fi
+
+# ⑯ 通畅自证（owner 2026-11-01「默认打开＋要保证数据源通畅、功能如预期上线」）：
+#    出厂开的代价是"开着但一秒都没喂进来"没有现场证据，所以必须有量规→规则→路由三件套，
+#    并且状态位不许把"从没跑过"折成 ok（§M2 同族：没数据不得冒充正常）。
+CNT161=$((CNT161 + 1))
+grep -qF 'metrics.SetGauge("feed_broker_state", feedCode)' internal/engine/scoring_loop.go || fail161 "券商行情通畅量规没喂数（规则会退化成永不触发的死规则，§DEADGAUGE 同族）"
+CNT161=$((CNT161 + 1))
+grep -qF '{Name: "broker_feed_unavailable", Metric: "feed_broker_state", Op: "ge", Threshold: 2' internal/metrics/alerter.go || fail161 "broker_feed_unavailable 规则丢了或判据被改（ge 2 才能让 0=不适用/1=健康 都不触发）"
+CNT161=$((CNT161 + 1))
+grep -qE '"broker_feed_unavailable":[[:space:]]*RoutePush' internal/metrics/alert_routing.go || fail161 "broker_feed_unavailable 没进必推路由（缺条目会掉进 DefaultRoute，但文案与冷却口径必须写实）"
+CNT161=$((CNT161 + 1))
+grep -qF 'return "not_polled"' internal/data/quote_feed_hub.go || fail161 "状态位不再区分「从没跑过」（ok 会替静默无效撒谎）"
+CNT161=$((CNT161 + 1))
+grep -qF 'h.rounds++' internal/data/quote_feed_hub.go || fail161 "轮询总轮次不再累计（0 轮与跑过但没结果就分不开了）"
+# 装配构建器单点：两条路各写一份兜底必然漂开（AGENTS 纸面配置那条教训的同族）
+CNT161=$((CNT161 + 1))
+grep -qF 'fetcher.SetFeedPolicy(data.FeedPolicyFromRuntime(rt))' cmd/quant/main.go || fail161 "启动装配没走唯一构建器 FeedPolicyFromRuntime"
+CNT161=$((CNT161 + 1))
+grep -qF 'return data.FeedPolicyFromRuntime(rt)' internal/server/handlers_runtime_config.go || fail161 "设置页热更没走唯一构建器 FeedPolicyFromRuntime"
+CNT161=$((CNT161 + 1))
+BUILDER_COPY=$(grep -rlE 'data\.FeedPolicy\{|FeedPolicy\{$' --include='*.go' cmd internal | grep -v _test | tr '\n' ' ')
+[ "$BUILDER_COPY" = "internal/data/quote_feed_hub.go " ] || fail161 "FeedPolicy 字面量构造点应只剩 data 侧一处，实测：$BUILDER_COPY"
+
 [ "$B161_FAILED" = "0" ] || exit 1
-echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 每票源标记 3 + 咨询链快照优先 5 + 探针形状 4，累计判定点 ${CNT161}）"
+echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 每票源标记 3 + 量纲自动对齐 2 + 咨询链快照优先 5 + 探针形状 4 + 出厂开语义 4 + 通畅自证 9，累计判定点 ${CNT161}）"
 
 # ════════════════════════════════════════════════════════════════════════════
 # §162 §3.5 关态留痕（2026-11-01 追加裁决 15）：开关关着也必须可观测

@@ -117,6 +117,14 @@ func DefaultAlertRules() []AlertRule {
 		// 那种成因归上面的 no_enabled 那条 p1，文案严格分家）。阈值 14 日历日=夜间寻优/审批链
 		// 停摆两周；变更本身由 §0929LIB-WATCH 的热加载+审计行负责，这条只补"长期没有变更"。
 		{Name: "library_stale_days", Metric: "library_stale_days", Op: "gt", Threshold: 14, For: "0s", Level: "p2", Message: "已应用战法库 14 天以上未更新：夜间寻优/审批链可能整段停摆，引擎仍在按旧规则出信号（§0929LIB-WATCH 只在库真的变了才动，看不见「一直没变」）；查 quant-research 夜间任务与候选审批队列"},
+		// HB-5 券商行情主源不通（§SUBSCRIPTION-A，2026-11-01 owner 改判「默认把券商信息源开关打开，
+		// 要保证券商的数据源通畅、功能如预期上线」）：行情四键出厂开之后，最需要防的是
+		// "开关是开的、通道是死的"——旧实现只剩一条 60s 节流日志，现网看不出区别（静默无效）。
+		// 量规 feed_broker_state 由 engine/scoring_loop.go refreshStalenessGauges 在盘中每 30s 喂：
+		// 0 不适用（未启用/未装配/非盘中）、1 活着、2 被 401/403 拒、3 自身读数不可用（J1/J2/J3）、
+		// 4 启用了却一轮都没跑。规则用 ge 2 ⇒ 0/1 都在阈值下，启动到首轮之间不假红。
+		// For=300s：QMT 客户端重启、行情瞬时断流都在一两分钟内自愈，与 quote_stale 同口径给恢复窗。
+		{Name: "broker_feed_unavailable", Metric: "feed_broker_state", Op: "ge", Threshold: 2, For: "300s", Level: "p2", Message: "券商行情主源盘中不可用（值=2 钥匙被撤/无效→补钥匙；值=3 通道或自身读数不可用→查网关进程与 xtdata 推送；值=4 启用了却一轮没跑→feed 轮询没起来，改过 qmt_feed_enabled 需重启 quant）：价格已退回后备外部源，覆盖率/逐票来源读数见 /api/status.quote_feed"},
 		// HB-4 休市日仍有当日新固化信号（§0929HB-4，与 HB-1 反向）：量规是"今天不是交易日、
 		// 但 GeneratedAt 落在今天的固化信号条数"（交易日恒写 0，见 internal/engine/heartbeat.go
 		// closedDayPinnedCount）。现场成因＝09-25 中秋休市当日固化数 470→481：休市判定

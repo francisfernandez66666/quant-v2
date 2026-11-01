@@ -4,7 +4,7 @@
 //  1. **不许伪造新鲜度**：feed 命中一小撮票时，全局基线不能归零（旧实现命中 1 只就刷，
 //     那只票的新鲜替全池作了保，而它喂的是发单前的行情硬闸）；
 //  2. **覆盖率阈值含边界**：80% 达标、差一只不达标（防实现成 `>`）；
-//  3. **观察模式不改写任何价格**（缺省档，本批"要做开关、不能直接上"的兑现点）；
+//  3. **观察模式不改写任何价格**（这是显式关 primary 的回滚位；出厂档是主源模式，两档都必须可证）；
 //  4. **多源价格不一致以券商为准**，只有券商自身读数不成立才降级（owner 裁决 5 的字面测试）；
 //  5. **合法单位档不误判**：比值≈100（手）时该配系数，不该判通道坏；
 //  6. **热点池按源分档 + 不对称迟滞 + 被钉住的代码收池不踢**（owner 裁决 12）。
@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"quant-trading-v2/internal/config"
 )
 
 // hubBase 造一个"外部链已建立基线"的 Fetcher：n 只票全部有有效价（当日可交易分母的近似）。
@@ -102,7 +104,7 @@ func TestStaleGateThresholdBoundary(t *testing.T) {
 	}
 }
 
-// TestObserveModeNeverChangesPrices 缺省档（primary=false）：一个价格都不改写、不动基线。
+// TestObserveModeNeverChangesPrices 回滚档（显式 primary=false）：一个价格都不改写、不动基线。
 // 这是"发版≠生效"的读面证据：只把 feed 连上看几天数，快照与今天完全同值。
 func TestObserveModeNeverChangesPrices(t *testing.T) {
 	f, codes := hubBase(t, 200)
@@ -116,7 +118,7 @@ func TestObserveModeNeverChangesPrices(t *testing.T) {
 		t.Fatalf("观察模式仍应统计命中数, got %d", hits)
 	}
 	if got := f.Snapshot().Stocks[codes[0]].Price; got != beforePrice {
-		t.Fatalf("观察模式改写了价格 %v → %v：缺省档必须与今天逐字节一致", beforePrice, got)
+		t.Fatalf("观察模式改写了价格 %v → %v：显式关 primary 必须与旧形状逐字节一致", beforePrice, got)
 	}
 	if f.Snapshot().Source != beforeSource {
 		t.Fatalf("观察模式改了 Source：%v → %v", beforeSource, f.Snapshot().Source)
@@ -431,19 +433,22 @@ func TestObserveModeReportsWouldOverrideAndPromote(t *testing.T) {
 }
 
 // TestQuoteFeedStateNilSafeWhenNeverPolled 从没跑过时不能报 ok（"没数据"不许冒充"正常"，
-// 与 §M2 的 -1=未知 同一方向）；状态位可以回 ok，但 Pool/Hits 全 0 必须由消费端判"未启用"。
+// 与 §M2 的 -1=未知 同一方向）。
+// 判据口径于 2026-11-01 改严：以前靠消费端看 Pool/Hits 全 0 来折"未启用"，而出厂开之后
+// "启用了却一轮都没跑"恰恰是 Pool 也为 0 的那一态，状态位若还是 ok，前端就只会显示"未启用"，
+// 把本批要抓的静默无效藏回原处。现在状态位自己说 not_polled。
 func TestQuoteFeedStateNilSafeWhenNeverPolled(t *testing.T) {
 	f, _ := hubBase(t, 10)
 	st := f.FeedStatsNow()
-	if st.Pool != 0 || st.Hits != 0 || st.ConsecutiveFail != 0 {
+	if st.Pool != 0 || st.Hits != 0 || st.ConsecutiveFail != 0 || st.Rounds != 0 {
 		t.Fatalf("从没轮询过却已有读数: %+v", st)
 	}
-	if got := f.QuoteFeedState(); got != "ok" {
-		t.Fatalf("状态位缺省应为 ok（由 present 判「从没跑过」），got %q", got)
+	if got := f.QuoteFeedState(); got != "not_polled" {
+		t.Fatalf("从没轮询应如实说 not_polled（不许冒充 ok），got %q", got)
 	}
 }
 
-// TestPerCodeSourceOffKeepsFieldsEmpty 缺省档（关闭）：Src/AsOfMs 一律留空。
+// TestPerCodeSourceOffKeepsFieldsEmpty 显式关闭（出厂是开）：Src/AsOfMs 一律留空。
 // 这两个字段是 omitempty ⇒ 关闭时快照落盘文件与 SSE 载荷的字节形状与今天一致；
 // 开着才逐票标。摘掉开关判断（无条件打标）会让这条当场红。
 func TestPerCodeSourceOffKeepsFieldsEmpty(t *testing.T) {
@@ -585,5 +590,77 @@ func TestApplyHubPriceNeverTouchesFlowFields(t *testing.T) {
 	}
 	if ApplyHubPrice(dst, &StockInfo{Price: 0}) {
 		t.Fatal("hub 无有效价也合并：那会把好值换成 0")
+	}
+}
+
+// TestFeedAlertCodeFiveStates 通畅自证量规的五个取值必须各自可达且互不混同。
+// 这批把券商源改成出厂开，最坏结局是"开关开着、通道死了、日志只剩一条节流行"，
+// 所以这里逐档钉：未启用=0 / 一轮没跑=4 / 被鉴权拒=2 / 自身读数不可用=3 / 健康=1。
+// 尤其 2 与 3 不许并成一个值：处置动作不同（补钥匙 vs 查网关进程）。
+func TestFeedAlertCodeFiveStates(t *testing.T) {
+	f, codes := hubBase(t, 10)
+	// 档 0：策略没启用（出厂开的语义只在装配后成立，未装配时不得告警）
+	if got := f.FeedAlertCode(); got != FeedAlertNotApplicable {
+		t.Fatalf("未启用应写 0（不触发），got %d", got)
+	}
+	f.SetFeedPolicy(FeedPolicy{Enabled: true, Primary: true, CoverageMinPct: 80, MaxAge: 30 * time.Second})
+	// 档 4：启用了但一轮都没跑
+	if got := f.FeedAlertCode(); got != FeedAlertNeverPolled {
+		t.Fatalf("启用未轮询应写 4，got %d", got)
+	}
+	// 档 1：跑过一轮且读数可用
+	feed, src := newPrimaryFeed(f, map[string]QMTTick{})
+	f.SetFeedPolicy(FeedPolicy{Enabled: true, Primary: true, CoverageMinPct: -1, MaxAge: 30 * time.Second})
+	src.ticks = map[string]QMTTick{codes[0]: hubTick(11, 1000)}
+	feed.pollOnce()
+	if st := f.FeedStatsNow(); st.Rounds <= 0 {
+		t.Fatalf("轮询后必须累计轮次, got %d", st.Rounds)
+	}
+	if got := f.FeedAlertCode(); got != FeedAlertAlive {
+		t.Fatalf("健康轮应写 1，got %d", got)
+	}
+	// 档 2：鉴权失败（与通道挂必须分形）
+	f.NoteFeedFailure(1, true)
+	if got := f.FeedAlertCode(); got != FeedAlertAuthFailed {
+		t.Fatalf("401/403 应写 2，got %d", got)
+	}
+	// 档 3：自身读数不可用（J1/J2/J3 都归这一档）
+	f.NoteFeedFailure(2, false)
+	if got := f.FeedAlertCode(); got != FeedAlertDegraded {
+		t.Fatalf("通道连续失败应写 3，got %d", got)
+	}
+	// 恢复后回到 1（规则用 ge 2，回落才能成对销案）
+	feed.pollOnce()
+	if got := f.FeedAlertCode(); got != FeedAlertAlive {
+		t.Fatalf("恢复后应回到 1，got %d", got)
+	}
+}
+
+// TestFeedPolicyFromRuntimeFactoryOn 唯一构建器必须把四枚指针位的**生效值**灌进策略，
+// 而不是原始指针（缺键时原始 *bool 是 nil，直接赋值等于"出厂关"——与裁决相反）。
+// 同时锁 Enabled 与 Primary 同源：告警腿判"本该在跑"，靠的就是它跟着 qmt_feed_enabled。
+func TestFeedPolicyFromRuntimeFactoryOn(t *testing.T) {
+	var rt config.RuntimeConfig
+	p := FeedPolicyFromRuntime(rt)
+	if !p.Enabled || !p.Primary || !p.PerCodeSource || !p.Consult {
+		t.Fatalf("零值配置（缺键）四档必须全为生效开: %+v", p)
+	}
+	if p.CoverageMinPct != feedCoverageDefault || p.VolumeToShares != 1 || p.HotPoolCap == 0 {
+		t.Fatalf("Effective* 兜底没走: %+v", p)
+	}
+	if !p.VolumeAutoAlign {
+		t.Fatal("量纲自动对齐不得随配置缺省而关（出厂开是这条改动的前置条件）")
+	}
+	off := false
+	// 四枚键彼此独立：只关 qmt_feed_enabled 时 primary 仍是"开"（轮询没起来而已，
+	// 不代表操作员改判过主源档）。构建器不许把一键关折成整组关。
+	rt2 := config.RuntimeConfig{QMTFeedEnabled: &off}
+	if p2 := FeedPolicyFromRuntime(rt2); p2.Enabled || !p2.Primary {
+		t.Fatalf("显式 false 只关对应那枚键: %+v", p2)
+	}
+	rt3 := config.RuntimeConfig{QMTFeedEnabled: &off, QMTFeedPrimary: &off,
+		QuotePerCodeSource: &off, QuoteHubConsult: &off}
+	if p3 := FeedPolicyFromRuntime(rt3); p3.Enabled || p3.Primary || p3.PerCodeSource || p3.Consult {
+		t.Fatalf("四键显式 false 必须全落成关（＝今天的字节形状）: %+v", p3)
 	}
 }

@@ -36,9 +36,13 @@ func feedCredential(cfgMgr *config.Manager) (token, from string) {
 }
 
 // logRuntimeSwitches 启动时打印本批全部相关开关的**生效**读数（不是原始配置值）。
-// 缺省全关＝今天的字节行为；这份清单是"上了但没开"与"开了但没上"的唯一现场答案。
-// English: prints the effective value of every switch introduced in this batch at boot, so
-// "shipped but not enabled" is visible without archaeology.
+// 行情四键（feed 总开关/主源档/逐票源标记/咨询走 hub）自 2026-11-01 owner 改判起是**出厂即开**
+// （指针位：config 里没有这个键＝开，显式写 false 才关）；申购识别与撤单护栏仍默认关，
+// 等 11-02 盘中探针与段表校准。清单逐键点名正是为了区分这两类：
+// "上了但没开"看得见，"出厂就开"也不必靠人记。
+// English: prints the effective value of every switch introduced in this batch at boot. The four
+// quote-path keys are factory-on (pointer bool: absent = on); the subscription pair stays off until
+// the in-market probe and segment-table calibration land.
 func logRuntimeSwitches(cfgMgr *config.Manager) {
 	rt := cfgMgr.Get().Runtime
 	qm := cfgMgr.GetQMTConfigFor(cfgMgr.OperatorID())
@@ -46,8 +50,8 @@ func logRuntimeSwitches(cfgMgr *config.Manager) {
 	if qm != nil {
 		rec, guard = qm.SubscriptionRecognize, qm.SubscriptionCancelGuard
 	}
-	log.Printf("[main] §SWITCH 状态 1/10 runtime.qmt_feed_enabled=%s", yesNo(rt.QMTFeedEnabled))
-	log.Printf("[main] §SWITCH 状态 2/10 runtime.qmt_feed_primary=%s（关＝观察模式：只统计不改写价格）", yesNo(rt.QMTFeedPrimary))
+	log.Printf("[main] §SWITCH 状态 1/10 runtime.qmt_feed_enabled=%s（出厂开：配置无此键即轮询，显式 false 才停）", yesNo(rt.QMTFeedOn()))
+	log.Printf("[main] §SWITCH 状态 2/10 runtime.qmt_feed_primary=%s（出厂开；关＝观察模式：只统计不改写价格；开＝券商价为当前价）", yesNo(rt.QMTFeedPrimaryOn()))
 	log.Printf("[main] §SWITCH 状态 3/10 runtime.qmt_feed_coverage_min_pct=%d（出厂 80；-1＝关闭阈值判断＝旧行为）",
 		rt.EffectiveFeedCoverageMinPct())
 	log.Printf("[main] §SWITCH 状态 4/10 runtime.qmt_feed_volume_to_shares=%.0f（必须由盘中探针判读固化；错 100 倍即 VWAP 错 100 倍）",
@@ -56,8 +60,8 @@ func logRuntimeSwitches(cfgMgr *config.Manager) {
 		rt.EffectiveMonitorPoolHotMax())
 	log.Printf("[main] §SWITCH 状态 6/10 rules.qmt.subscription_recognize=%s（关＝申购行仍不可见、unknown 计数仍被注水）", yesNo(rec))
 	log.Printf("[main] §SWITCH 状态 7/10 rules.qmt.subscription_cancel_guard=%s（关＝紧急停止与今天一致，全发撤单）", yesNo(guard))
-	log.Printf("[main] §SWITCH 状态 8/10 runtime.quote_per_code_source=%s（关＝快照里不带每票来源与时刻，混源时整份 Source 仍是唯一读数）", yesNo(rt.QuotePerCodeSource))
-	log.Printf("[main] §SWITCH 状态 9/10 runtime.quote_hub_consult=%s（关＝咨询与自选补价仍每次现拉外部源）", yesNo(rt.QuoteHubConsult))
+	log.Printf("[main] §SWITCH 状态 8/10 runtime.quote_per_code_source=%s（出厂开；关＝快照里不带每票来源与时刻，混源时整份 Source 仍是唯一读数）", yesNo(rt.QuotePerCodeSourceOn()))
+	log.Printf("[main] §SWITCH 状态 9/10 runtime.quote_hub_consult=%s（出厂开；关＝咨询与自选补价仍每次现拉外部源）", yesNo(rt.QuoteHubConsultOn()))
 	log.Printf("[main] §SWITCH 状态 10/10 网关侧 subscription_recognize 由 qmt_gateway/config.xt.json 自持，" +
 		"现值看网关 /admin/status 的 orders_sync.subscription_recognize（两个键都要开才见效；只开一边最坏是少标注）")
 }

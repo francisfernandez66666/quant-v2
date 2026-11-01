@@ -5,14 +5,20 @@
 // 三条展示取向都是为了避免"看起来保存了其实没生效"这类我们反复出事的地方：
 //   ① 每个键同时显示**原始值与生效值**（0 的含义是"没填"，实际按出厂值跑，只显一个会骗人）；
 //   ② 保存后按后端返回的 restart_required 明确标"需重启才生效"的键，前端不自己猜；
-//   ③ 通道现状（feed_state / 覆盖率 / 是否已达可接管条件）直接显示在卡上——
+//   ③ 通道现状（feed_state / 轮询轮次 / 覆盖率 / 量纲是否已确认可接管）直接显示在卡上——
 //      开主源档这个动作应当由读数决定，不该靠人翻日志。
+// 2026-11-01 owner 改判：行情四键（enabled/primary/per_code_source/hub_consult）**出厂即开**，
+// 所以勾选框初值必须取自后端下发的**生效值**（不是本地 false 起步）——否则用户一进卡就点保存，
+// 稀疏 merge 会把"没显示的键"当成改动发出去，等于把出厂开悄悄关掉。这一条有专项用例盯着。
 import React, { useEffect, useState } from 'react'
 import { Button, Card, InputNumber, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
 
 const STATE_LABEL = {
   ok: ['正常', 'success'],
+  // 启用了却一轮都没跑：这是出厂开之后最需要看见的一态（改过 qmt_feed_enabled 没重启、
+  // 或装配被停），显示成"未启用/正常"都会把人引向错误的处置动作。
+  not_polled: ['已启用但一轮都没跑（需重启 quant）', 'warning'],
   auth_failed: ['未认证（去确认运营账号在册凭证）', 'danger'],
   not_wired: ['未接采集器', 'default'],
 }
@@ -41,6 +47,8 @@ export default function QuoteFeedConfigCard() {
       setCfg(r)
       setForm({
         qmt_feed_primary: !!r.qmt_feed_primary,
+        quote_per_code_source: !!r.quote_per_code_source,
+        quote_hub_consult: !!r.quote_hub_consult,
         qmt_feed_coverage_min_pct: r.qmt_feed_coverage_min_pct ?? 0,
         qmt_feed_volume_to_shares: r.qmt_feed_volume_to_shares ?? 0,
         monitor_pool_hot_max: r.monitor_pool_hot_max ?? 0,
@@ -57,6 +65,7 @@ export default function QuoteFeedConfigCard() {
     const patch = {}
     if (form.qmt_feed_primary !== !!cfg.qmt_feed_primary) patch.qmt_feed_primary = form.qmt_feed_primary
     if (form.quote_per_code_source !== !!cfg.quote_per_code_source) patch.quote_per_code_source = form.quote_per_code_source
+    if (form.quote_hub_consult !== !!cfg.quote_hub_consult) patch.quote_hub_consult = form.quote_hub_consult
     if (form.qmt_feed_coverage_min_pct !== cfg.qmt_feed_coverage_min_pct) patch.qmt_feed_coverage_min_pct = Number(form.qmt_feed_coverage_min_pct)
     if (form.qmt_feed_volume_to_shares !== cfg.qmt_feed_volume_to_shares) patch.qmt_feed_volume_to_shares = Number(form.qmt_feed_volume_to_shares)
     if (form.monitor_pool_hot_max !== cfg.monitor_pool_hot_max) patch.monitor_pool_hot_max = Number(form.monitor_pool_hot_max)
@@ -84,8 +93,12 @@ export default function QuoteFeedConfigCard() {
   return (
     <Card title="行情通道（券商 L1）" style={{ marginBottom: 16 }}>
       <div style={{ fontSize: 12, color: 'var(--app-text-2)', marginBottom: 10 }}>
-        通道状态：{stateTag(cfg.feed_state)} · 命中 {cfg.feed_hits ?? 0}/{cfg.feed_denominator ?? 0} 只
+        通道状态：{stateTag(cfg.feed_state)} · 累计轮询 {cfg.feed_rounds ?? 0} 轮 · 命中 {cfg.feed_hits ?? 0}/{cfg.feed_denominator ?? 0} 只
         {Number(cfg.feed_coverage_pct || 0) > 0 ? `（覆盖率 ${Number(cfg.feed_coverage_pct).toFixed(1)}%）` : ''}
+        {/* 量纲没对齐时后端不接管量/额（VWAP＝额÷量，错一档差 100 倍）：这条必须当场可见，
+            否则"价对了、量错了"要到成交均价对不上才发现。 */}
+        {cfg.feed_volume_aligned ? <Tag theme="success" size="small" style={{ marginLeft: 6 }} title="观测单位档与配置系数一致">量纲一致</Tag>
+          : <Tag theme="warning" size="small" style={{ marginLeft: 6 }} title={`观测档 ${cfg.feed_volume_observed_unit ?? 0}，配置系数 ${cfg.volume_to_shares_effective}`}>量纲未确认（不接管量/额）</Tag>}
         {cfg.feed_ready_to_promote ? <Tag theme="primary" size="small" style={{ marginLeft: 6 }} title="已连续达标：可以打开主源档">本可接管</Tag> : null}
       </div>
       <div style={{ display: 'grid', gap: 10, maxWidth: 560 }}>
@@ -94,7 +107,7 @@ export default function QuoteFeedConfigCard() {
           <input type="checkbox" checked={!!form.qmt_feed_primary} style={{ marginLeft: 8 }}
             onChange={(e) => setForm({ ...form, qmt_feed_primary: e.target.checked })} />
           <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>
-            关＝观察模式（只统计不改价）；开＝券商 L1 成为主源
+            出厂开＝券商 L1 成为主源；关＝观察模式（只统计不改价，现场回滚位）
           </span>
         </label>
         <label style={{ fontSize: 13 }}>
@@ -104,8 +117,16 @@ export default function QuoteFeedConfigCard() {
           {/* 混源是"券商为主 + 后备链兜底"的必然结果。不开这个，整份快照只有一个源名，
               "其中几十只其实是新浪兜的"在现场看不出来——那正是我们出过事的那类谎。 */}
           <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>
-            开＝快照逐票带 src/as_of_ms（当前 {cfg.quote_source_mixed ?? 0} 只与整份源名不同）
+            出厂开＝快照逐票带 src/as_of_ms（当前 {cfg.quote_source_mixed ?? 0} 只与整份源名不同）
           </span>
+        </label>
+        <label style={{ fontSize: 13 }}>
+          咨询/自选价走 hub（quote_hub_consult）
+          <input type="checkbox" checked={!!form.quote_hub_consult} style={{ marginLeft: 8 }}
+            onChange={(e) => setForm({ ...form, quote_hub_consult: e.target.checked })} />
+          {/* 裁决 13：不做这件事，同一只票在咨询面板、自选卡、量化页上会来自不同源不同时刻。
+              开着只改"价从哪读"，资金流等字段仍由原行情链给（券商没有净流入）。 */}
+          <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>出厂开＝快照优先（按这一只票的时刻判新鲜）；关＝每问一次现拉外部源</span>
         </label>
         <label style={{ fontSize: 13 }}>覆盖率阈值 %（生效 {cfg.coverage_min_pct_effective}）
           <InputNumber value={form.qmt_feed_coverage_min_pct} min={-1} max={100} style={{ width: 140, marginLeft: 8 }}
@@ -128,7 +149,7 @@ export default function QuoteFeedConfigCard() {
       </div>
       <div style={{ marginTop: 10, fontSize: 11, color: 'var(--app-muted-2)' }}>
         保存即生效的键：{(cfg.hot_keys || []).join('、')}；需重启：{(cfg.restart_required || []).join('、')}。
-        总开关 qmt_feed_enabled 属重启类（决定启动时是否创建轮询），本卡不代改。
+        总开关 qmt_feed_enabled 出厂即开（配置里没这个键＝开，显式写 false 才停），属重启类（决定启动时是否创建轮询），本卡不代改。
       </div>
     </Card>
   )

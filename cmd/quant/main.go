@@ -485,7 +485,7 @@ func run() int {
 	//  ③ 策略（主源档/覆盖率阈值/量纲/池上限）在装配点一次性灌给 Fetcher，
 	//     绝不在 NewQMTFeed 之后补赋值——漏装配点的表现是"重启后失效"。
 	rt := cfgMgr.Get().Runtime
-	if rt.QMTFeedEnabled && cfgMgr.Get().QMT.GatewayURL != "" {
+	if rt.QMTFeedOn() && cfgMgr.Get().QMT.GatewayURL != "" {
 		intervalSec := rt.QMTFeedIntervalSec
 		if intervalSec <= 0 {
 			intervalSec = 3
@@ -496,24 +496,17 @@ func run() int {
 			log.Printf("[main] §SUBSCRIPTION-A qmt_feed_enabled=true 但运营账号快照与全局都没有可用钥匙，" +
 				"feed 保持停用（行情走现行链兜底；请在设置页确认 QMT 凭证）")
 		} else {
-			fetcher.SetFeedPolicy(data.FeedPolicy{
-				Primary:        rt.QMTFeedPrimary,
-				CoverageMinPct: rt.EffectiveFeedCoverageMinPct(),
-				HotPoolCap:     rt.EffectiveMonitorPoolHotMax(),
-				PerCodeSource:  rt.QuotePerCodeSource,
-				Consult:        rt.QuoteHubConsult,
-				MaxAge:         30 * time.Second,
-				VolumeToShares: rt.EffectiveFeedVolumeToShares(),
-			})
+			// 策略装配走 data 侧唯一构建器（设置页热更走同一个）：两条路各写一份兜底必然漂开。
+			fetcher.SetFeedPolicy(data.FeedPolicyFromRuntime(rt))
 			feedClient := trading.NewQMTClient(cfgMgr.Get().QMT.GatewayURL, feedToken, 3*time.Second, 0)
 			qmtFeed := data.NewQMTFeed(fetcher, feedClient, time.Duration(intervalSec)*time.Second, 30*time.Second, rt.EffectiveFeedVolumeToShares())
-			qmtFeed.SetPrimary(rt.QMTFeedPrimary)
+			qmtFeed.SetPrimary(rt.QMTFeedPrimaryOn())
 			go qmtFeed.Start()
 			defer qmtFeed.Stop()
 			log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds, 凭据来源=%s, 主源档=%v",
-				cfgMgr.Get().QMT.GatewayURL, intervalSec, tokenFrom, rt.QMTFeedPrimary)
+				cfgMgr.Get().QMT.GatewayURL, intervalSec, tokenFrom, rt.QMTFeedPrimaryOn())
 		}
-	} else if rt.QMTFeedEnabled {
+	} else if rt.QMTFeedOn() {
 		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
 	}
 	// §3.5 追加裁决 15：开关关着也要留痕——启动时打一份逐键状态清单，

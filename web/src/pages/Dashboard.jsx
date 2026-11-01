@@ -513,6 +513,11 @@ export default function Dashboard() {
                   if (qf.state === 'auth_failed') {
                     return <Tag theme="danger" size="small" style={{ marginLeft: 6 }} title="行情通道被网关鉴权拒绝：确认运营账号在册凭证（与网关进程故障是两回事）">券商行情未认证</Tag>
                   }
+                  // 出厂开之后最坏的一态：开关是开的、轮询一次都没跑（改过 qmt_feed_enabled 没重启，
+                  // 或装配被停）。它不是"降级"（降级至少跑过），文案必须指向重启这条处置动作。
+                  if (qf.state === 'not_polled') {
+                    return <Tag theme="warning" size="small" style={{ marginLeft: 6 }} title="qmt_feed_enabled 已开但轮询没起来：改过该键需重启 quant；仍未起则查网关地址与运营账号在册凭证">券商行情未开始轮询</Tag>
+                  }
                   if (qf.state && qf.state !== 'ok') {
                     return <Tag theme="warning" size="small" style={{ marginLeft: 6 }} title={`命中 ${qf.hits}/${qf.denominator} 只，连续失败 ${qf.consecutive_fail || 0} 轮`}>券商行情降级（{qf.state}）</Tag>
                   }

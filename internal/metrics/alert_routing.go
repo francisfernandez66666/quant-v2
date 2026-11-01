@@ -137,11 +137,14 @@ func DefaultAlertRouting() AlertRoutingConfig {
 	return AlertRoutingConfig{
 		Routes: map[string]AlertRoute{
 			// —— 必推：此刻正在疼 ——
-			"breaker_open":          RoutePush, // 熔断：实盘网关停止下单
-			"order_fail_rate":       RoutePush, // 下单链路降级
-			"quote_stale":           RoutePush, // 行情新鲜度降级
-			"uplink_stale":          RoutePush, // 网关→引擎上行回报停摆（§UPDLINK）
-			"sse_broadcast_skipped": RoutePush, // SSE 广播锁超预算丢推送（§UPDLINK 同族）
+			"breaker_open":    RoutePush, // 熔断：实盘网关停止下单
+			"order_fail_rate": RoutePush, // 下单链路降级
+			"quote_stale":     RoutePush, // 行情新鲜度降级
+			// §SUBSCRIPTION-A（2026-11-01 出厂开）：券商主源盘中不通＝行情降级，与 quote_stale
+			// 同一条纪律（"此刻正疼"，且持续破线由 Firing 态去重 + 冷却窗限频，不会刷屏）。
+			"broker_feed_unavailable": RoutePush,
+			"uplink_stale":            RoutePush, // 网关→引擎上行回报停摆（§UPDLINK）
+			"sse_broadcast_skipped":   RoutePush, // SSE 广播锁超预算丢推送（§UPDLINK 同族）
 			// §0929HB-1/-2（2026-09-29 全量审计批 ⑪-4）：两条"缺失型"心跳都属"今天就要处理"——
 			// 零固化信号意味着当天决策面空转（收盘再知道已经晚了），已实现盈亏恒 0 意味着
 			// 亏损熔断闸当天放水。持续破线由评估器 Firing 态去重 + 30 分钟冷却窗挡刷屏，

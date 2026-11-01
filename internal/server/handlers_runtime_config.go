@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
@@ -53,8 +52,8 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 	// 轮询 goroutine 在启动时按 enabled/interval 决定是否创建、以什么节拍创建 ⇒ 这两键保存≠生效
 	restart := []string{"qmt_feed_enabled", "qmt_feed_interval_sec"}
 	view := map[string]interface{}{
-		"qmt_feed_enabled":               rt.QMTFeedEnabled,
-		"qmt_feed_primary":               rt.QMTFeedPrimary,
+		"qmt_feed_enabled":               rt.QMTFeedOn(),
+		"qmt_feed_primary":               rt.QMTFeedPrimaryOn(),
 		"qmt_feed_coverage_min_pct":      rt.QMTFeedCoverageMinPct,
 		"coverage_min_pct_effective":     rt.EffectiveFeedCoverageMinPct(),
 		"qmt_feed_volume_to_shares":      rt.QMTFeedVolumeToShares,
@@ -62,7 +61,10 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		"monitor_pool_hot_max":           rt.MonitorPoolHotMax,
 		"monitor_pool_hot_max_effective": rt.EffectiveMonitorPoolHotMax(),
 		"qmt_feed_interval_sec":          rt.QMTFeedIntervalSec,
-		"quote_per_code_source":          rt.QuotePerCodeSource,
+		"quote_per_code_source":          rt.QuotePerCodeSourceOn(),
+		// 咨询链取价是否优先走 hub：同为指针位，出厂态＝开，必须下发生效值，
+		// 直接给 rt.QuoteHubConsult 会让前端在"没填过"时收到 null，开关看起来像坏了。
+		"quote_hub_consult": rt.QuoteHubConsultOn(),
 		// hot_keys 明示哪些键保存即生效，其余按 restart_required 处理（前端据此提示，不靠人记）
 		"hot_keys": []string{"qmt_feed_primary", "qmt_feed_coverage_min_pct", "qmt_feed_volume_to_shares", "monitor_pool_hot_max",
 			// 逐票源标记也走热更：它只改快照里的字段，不改任何价格，开与关都不影响在途判定
@@ -78,6 +80,11 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		view["feed_denominator"] = st.Denominator
 		view["feed_coverage_pct"] = st.CoveragePct
 		view["feed_ready_to_promote"] = st.ReadyToPromote
+		// 通畅自证三栏：轮询总轮次（0＝启用了却没跑）与量纲判定（未对齐时后端不接管量/额）。
+		// 出厂开之后这三栏是"功能如预期上线"的唯一现场答案，缺一个就会退化成"靠日志感觉"。
+		view["feed_rounds"] = st.Rounds
+		view["feed_volume_observed_unit"] = st.VolumeObservedUnit
+		view["feed_volume_aligned"] = st.VolumeAligned
 	} else {
 		view["feed_state"] = "not_wired" // 采集器未注入（测试/降级装配）：如实说，不折成 ok
 	}
@@ -142,10 +149,10 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 	// （§0925EVE-D1 修的就是这一族），而这个通道管的正是"能不能让券商改写行情价"。
 	rt := s.cfg.RuntimeConfigForWrite()
 	if req.QMTFeedEnabled != nil {
-		rt.QMTFeedEnabled = *req.QMTFeedEnabled
+		rt.QMTFeedEnabled = req.QMTFeedEnabled
 	}
 	if req.QMTFeedPrimary != nil {
-		rt.QMTFeedPrimary = *req.QMTFeedPrimary
+		rt.QMTFeedPrimary = req.QMTFeedPrimary
 	}
 	if req.QMTFeedCoverageMinPct != nil {
 		rt.QMTFeedCoverageMinPct = *req.QMTFeedCoverageMinPct
@@ -157,10 +164,10 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 		rt.MonitorPoolHotMax = *req.MonitorPoolHotMax
 	}
 	if req.QuotePerCodeSource != nil {
-		rt.QuotePerCodeSource = *req.QuotePerCodeSource
+		rt.QuotePerCodeSource = req.QuotePerCodeSource
 	}
 	if req.QuoteHubConsult != nil {
-		rt.QuoteHubConsult = *req.QuoteHubConsult
+		rt.QuoteHubConsult = req.QuoteHubConsult
 	}
 	if req.QMTFeedIntervalSec != nil {
 		rt.QMTFeedIntervalSec = *req.QMTFeedIntervalSec
@@ -223,13 +230,5 @@ func logSwitchChange(uid string, on bool) {
 // 存量 config.json 缺这些键时反序列化得 0，0 的含义是"没填"，不是"阈值 0＝谁都达标"）。
 // main.go 与热更两条路共用它，避免两处各写一份兜底而漂开。
 func feedPolicyFromRuntime(rt config.RuntimeConfig) data.FeedPolicy {
-	return data.FeedPolicy{
-		Primary:        rt.QMTFeedPrimary,
-		CoverageMinPct: rt.EffectiveFeedCoverageMinPct(),
-		HotPoolCap:     rt.EffectiveMonitorPoolHotMax(),
-		PerCodeSource:  rt.QuotePerCodeSource,
-		Consult:        rt.QuoteHubConsult,
-		MaxAge:         30 * time.Second,
-		VolumeToShares: rt.EffectiveFeedVolumeToShares(),
-	}
+	return data.FeedPolicyFromRuntime(rt)
 }

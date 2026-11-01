@@ -1353,6 +1353,22 @@ func (e *Engine) refreshStalenessGauges() {
 	}
 	metrics.SetGauge("quote_staleness_sec", quoteAge)
 
+	// §SUBSCRIPTION-A（2026-11-01 出厂开）：券商 L1 主源的"通畅自证"量规。
+	// 这批把开关默认打开，代价是"开着但一秒都没喂进来"从此没有现场证据——旧形状只剩一条
+	// 60s 节流日志。判据只在盘中给（盘前 QMT 客户端还没起、休市日整天空闲都是正常态，
+	// 全天候写值就是每天一条假故障，与 quote_staleness_sec「只在盘中采集」同一条纪律）；
+	// 非盘中/未启用/未装配一律写 0，规则用 ge 2 判，0 与 1（健康）都不触发。
+	feedCode := int64(0)
+	if data.IsTradingDay(time.Now()) && data.IsContinuousTrade(time.Now()) {
+		e.mu.RLock()
+		ff := e.fetcher
+		e.mu.RUnlock()
+		if ff != nil {
+			feedCode = ff.FeedAlertCode()
+		}
+	}
+	metrics.SetGauge("feed_broker_state", feedCode)
+
 	uplinkAge := int64(0)
 	// QMTController/Snapshot 各自取锁，且本函数在 scoreCycle 顶部调用时 e.mu 已释放，无重入死锁。
 	if c := e.QMTController(); c != nil {

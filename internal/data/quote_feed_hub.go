@@ -12,13 +12,18 @@
 // 本文件把这两件事收成一套状态机：feed 只写 **overlay**（带时刻的 tick 补丁），由 5s 链在写快照前
 // 统一合并（单写者）；全局 lastOK 只在**覆盖率达标**时刷新，每只票另有自己的新鲜时刻。
 //
-// 三个开关决定这里的分支（缺省全部关＝与今天字节一致，见 docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md A9）：
+// 本批四枚开关都是**出厂开**的指针位（2026-11-01 owner 改判「默认把券商信息源开关打开，
+// 要保证券商的数据源通畅、功能如预期上线」；见 docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md A9/§0.2）：
 //
-//	runtime.qmt_feed_enabled          —— feed 是否轮询（既有键）
-//	runtime.qmt_feed_primary          —— 券商 tick 是否允许改写快照价格（本批新增，缺省 false＝观察模式：
-//	                                      只统计覆盖率/降级状态，一个价格都不动）
+//	runtime.qmt_feed_enabled          —— feed 是否轮询（缺键=开；显式 false 停）
+//	runtime.qmt_feed_primary          —— 券商 tick 是否允许改写快照价格（缺键=开；显式 false＝观察模式：
+//	                                      只统计覆盖率/降级状态，一个价格都不动，这是现场回滚位）
 //	runtime.qmt_feed_coverage_min_pct —— 覆盖率阈值（0→出厂 80；负数→关闭判断＝旧行为）
 //	runtime.monitor_pool_hot_max      —— 券商主源档的热点池上限（0→出厂 400；降级档仍是常数 60）
+//
+// "默认开"必须有自证腿，否则开在一个连不通的通道上等于静默无效：FeedPolicy.Enabled 记录
+// "这条通道本该在跑"，FeedAlertCode 据此把"从没轮询/被鉴权拒/自身读数不可用"编码成量规值，
+// 由 metrics 的 broker_feed_unavailable 规则在盘中持续破线时告警（见 internal/metrics/alerter.go）。
 package data
 
 import (
@@ -26,6 +31,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"quant-trading-v2/internal/config"
 )
 
 // ErrQuoteUnauthorized 是"行情通道被鉴权拒绝"的可判定错误哨兵（401/403）。
@@ -53,33 +60,38 @@ const feedCoverageDefault = 80
 // FeedPolicy 行情装配的生效策略（由 config.RuntimeConfig 的 Effective* 读数装配，整体替换、无锁读旧值）。
 // English: effective feed policy assembled from RuntimeConfig's Effective* readings.
 type FeedPolicy struct {
-	Primary        bool          // 券商 tick 是否可改写快照价格
-	PerCodeSource  bool          // 是否逐票标 Src/AsOfMs（缺省 false ⇒ 字段留空，落盘/SSE 与今天同形）
-	Consult        bool          // 裁决 13：咨询与自选补价是否"快照优先"（缺省 false＝今天每问一次打一次外部源）
-	CoverageMinPct int           // 覆盖率阈值：-1＝关闭判断（旧行为）；0/缺省由装配点兜成 80
-	HotPoolCap     int           // 券商主源档的热点池上限
-	MaxAge         time.Duration // 单票 tick 超龄上限（超龄退回后备源值）
-	VolumeToShares float64       // 量纲系数：券商 tick 的 volume → 股（0→1；由 Effective* 兜底）
-	SteadyWindow   time.Duration // 升档所需连续稳定时长（<=0 → feedSteadyExpand）
+	Enabled         bool          // 这条通道本该在跑（runtime.qmt_feed_enabled 的生效值）：告警自证腿的前提，缺省 false＝不告警
+	Primary         bool          // 券商 tick 是否可改写快照价格（出厂开；关＝观察模式，现场回滚位）
+	PerCodeSource   bool          // 是否逐票标 Src/AsOfMs（出厂开；关时字段留空，落盘/SSE 与旧形状同形）
+	VolumeAutoAlign bool          // 量纲自动对齐（默认开）：观测单位与配置系数不一致时不接管量/额，见 VolumeObservedUnit
+	Consult         bool          // 裁决 13：咨询与自选补价是否"快照优先"（出厂开；关＝每问一次打一次外部源，回滚位）
+	CoverageMinPct  int           // 覆盖率阈值：-1＝关闭判断（旧行为）；0/缺省由装配点兜成 80
+	HotPoolCap      int           // 券商主源档的热点池上限
+	MaxAge          time.Duration // 单票 tick 超龄上限（超龄退回后备源值）
+	VolumeToShares  float64       // 量纲系数：券商 tick 的 volume → 股（0→1；由 Effective* 兜底）
+	SteadyWindow    time.Duration // 升档所需连续稳定时长（<=0 → feedSteadyExpand）
 }
 
 // FeedStats 一轮 feed 的读数（观测面：覆盖率、分母来源、降级状态、连续失败轮次）。
 // 这些数字是"能不能把主源交给券商"的唯一现场依据——不许用日志感觉代替它们。
 // English: per-round feed observations; the only现场 basis for promoting broker quotes to primary.
 type FeedStats struct {
-	Hits              int     // 本轮有效 tick 只数
-	Denominator       int     // 覆盖率分母（当日可交易标的数，取不到时退回池总数）
-	Pool              int     // 监控池只数
-	CoveragePct       float64 // Hits/Denominator*100
-	DenominatorSource string  // tradable / pool（pool＝分母不可信，退回池总数）
-	RefreshedGlobal   bool    // 本轮是否刷新了全局新鲜度基线（覆盖率达标才有）
-	Degrade           string  // 空＝正常；J1 通道不通 / J2 集体陈旧 / J3 读数不自洽
-	AuthFailed        bool    // 最近一轮被 401/403 拒（钥匙被撤/无效）——与"网关挂了"必须分形
-	WouldOverride     bool    // 观察模式下：本轮覆盖率已达标，**本可以**改写价格（但开关没开）
-	ReadyToPromote    bool    // 连续达标轮次 >=3 ⇒ "可以开 primary 了"的现场依据，不靠人盯日志
-	CoverageRounds    int     // 连续达标轮数（ReadyToPromote 的输入）
-	ConsecutiveFail   int     // 连续失败轮次（J1 判据输入）
-	MissingPricePct   float64 // 本轮 lastPrice<=0 的占比（J3 判据输入）
+	Hits               int     // 本轮有效 tick 只数
+	Denominator        int     // 覆盖率分母（当日可交易标的数，取不到时退回池总数）
+	Pool               int     // 监控池只数
+	CoveragePct        float64 // Hits/Denominator*100
+	DenominatorSource  string  // tradable / pool（pool＝分母不可信，退回池总数）
+	RefreshedGlobal    bool    // 本轮是否刷新了全局新鲜度基线（覆盖率达标才有）
+	Degrade            string  // 空＝正常；J1 通道不通 / J2 集体陈旧 / J3 读数不自洽
+	AuthFailed         bool    // 最近一轮被 401/403 拒（钥匙被撤/无效）——与"网关挂了"必须分形
+	WouldOverride      bool    // 观察模式下：本轮覆盖率已达标，**本可以**改写价格（但开关没开）
+	VolumeObservedUnit float64 // 本轮由"成交额/(价×量)"观测到的单位档（1=股、100=手、0=不成立）
+	VolumeAligned      bool    // 观测档与配置系数一致 ⇒ 量/额可以接管
+	ReadyToPromote     bool    // 连续达标轮次 >=3 ⇒ "可以开 primary 了"的现场依据，不靠人盯日志
+	CoverageRounds     int     // 连续达标轮数（ReadyToPromote 的输入）
+	ConsecutiveFail    int     // 连续失败轮次（J1 判据输入）
+	MissingPricePct    float64 // 本轮 lastPrice<=0 的占比（J3 判据输入）
+	Rounds             int64   // 进程内累计轮询轮次（0＝这条通道从没跑过）：区分"开着但静默无效"与"没开"的唯一依据
 }
 
 // feedEntry 单票 overlay 条目：原始 tick + 到达时刻。
@@ -100,7 +112,8 @@ type feedHubState struct {
 	// 迟滞状态：healthy 连续区间的起点，与当前是否处于主源档
 	healthySince time.Time
 	live         bool
-	okRounds     int // 连续覆盖率达标轮数（ReadyToPromote 的输入）
+	okRounds     int   // 连续覆盖率达标轮数（ReadyToPromote 的输入）
+	rounds       int64 // 累计轮询轮次（FeedStats.Rounds 的来源；只在锁内自增）
 }
 
 func (f *Fetcher) hub() *feedHubState {
@@ -110,6 +123,38 @@ func (f *Fetcher) hub() *feedHubState {
 		f.hubRef = &feedHubState{ents: map[string]feedEntry{}, pinned: map[string]bool{}}
 	})
 	return f.hubRef
+}
+
+// bumpRound 把本轮计入进程内总轮次，并把累计值写进读数（调用方必须持 h.mu）。
+// 为什么需要一个总数而不只看 Hits/失败位：Stats 里每个零值都有两种成因——
+// "一轮都没跑"（feed 没装配/钥匙为空被显式停用）与"跑了但什么都没拿到"。
+// 出厂开之后这两种在现场的处置完全不同（查装配 vs 查通道），必须能分开。
+// English: counts polled rounds so "never polled" is distinguishable from "polled, got nothing".
+func (h *feedHubState) bumpRound(st *FeedStats) {
+	h.rounds++
+	st.Rounds = h.rounds
+}
+
+// FeedPolicyFromRuntime 是 runtime 配置 → 装配策略的**唯一构建器**（启动装配与设置页热更共用）。
+// 为什么必须单点：这两条路各写一份兜底时，"改设置页保存后生效值与重启后不一样"是必然结局
+// （AGENTS 里纸面配置那条教训的同族）。取值一律走 Effective*——存量 config.json 缺键反序列化得 0，
+// 0 的含义是"没填"，不是"阈值 0＝谁都达标"。
+// Enabled 直接取 qmt_feed_enabled 的生效值：它是 broker_feed_unavailable 告警的前提——
+// 「本该在跑却一轮都没跑」与「没启用」必须能分开，否则出厂开之后静默无效没人知道。
+// English: the single builder from runtime config to the assembly policy (startup + hot-update share it),
+// so the two paths can no longer drift; Enabled carries the effective feed switch the alert leg needs.
+func FeedPolicyFromRuntime(rt config.RuntimeConfig) FeedPolicy {
+	return FeedPolicy{
+		Enabled:         rt.QMTFeedOn(),
+		Primary:         rt.QMTFeedPrimaryOn(),
+		CoverageMinPct:  rt.EffectiveFeedCoverageMinPct(),
+		HotPoolCap:      rt.EffectiveMonitorPoolHotMax(),
+		PerCodeSource:   rt.QuotePerCodeSourceOn(),
+		Consult:         rt.QuoteHubConsultOn(),
+		VolumeAutoAlign: true, // 量纲未对齐时不接管量/额（默认开）：见本文件量纲对齐段
+		MaxAge:          30 * time.Second,
+		VolumeToShares:  rt.EffectiveFeedVolumeToShares(),
+	}
 }
 
 // SetFeedPolicy 装配/热更换行情策略（main.go 启动与设置页热更都走这里，单点入口）。
@@ -185,6 +230,7 @@ func (f *Fetcher) IngestFeedRound(merged *MarketSnapshot, entries map[string]QMT
 		st.CoverageRounds = h.okRounds
 		st.ReadyToPromote = h.okRounds >= 3
 		st.RefreshedGlobal = false // 观察模式绝不刷新基线（这是它与主源档唯一的行为差）
+		h.bumpRound(&st)
 		h.stats = st
 		h.mu.Unlock()
 		return
@@ -208,6 +254,7 @@ func (f *Fetcher) IngestFeedRound(merged *MarketSnapshot, entries map[string]QMT
 	}
 	st.CoverageRounds = h.okRounds
 	st.ReadyToPromote = h.okRounds >= 3 // 连续 3 轮达标（≈9 秒）才算"可开"，单轮尖峰不算
+	h.bumpRound(&st)
 	h.stats = st
 	h.mu.Unlock()
 	// 健康位：主源档（扩池）只在"确实由券商当家且本轮没判降级"时才升；
@@ -239,6 +286,7 @@ func (f *Fetcher) NoteFeedFailure(consecutiveFail int, authFailed bool) {
 	st.CoverageRounds = 0
 	st.ReadyToPromote = false
 	h.okRounds = 0
+	h.bumpRound(&st)
 	h.stats = st
 	healthy := consecutiveFail == 0
 	h.mu.Unlock()
@@ -257,6 +305,7 @@ func (f *Fetcher) NoteFeedDegrade(st FeedStats) {
 	st.CoverageRounds = 0
 	st.ReadyToPromote = false
 	h.okRounds = 0
+	h.bumpRound(&st)
 	h.stats = st
 	h.mu.Unlock()
 	f.setFeedHealth(false)
@@ -369,7 +418,7 @@ func (f *Fetcher) applyFeedOverlay(snap *MarketSnapshot, now time.Time) map[stri
 	}
 	p := f.feedPolicyNow()
 	if !p.Primary {
-		return nil // 观察模式：一个价格都不改写（缺省档＝与今天字节一致）
+		return nil // 观察模式（显式关 primary 的回滚位）：一个价格都不改写，与旧形状逐字节一致
 	}
 	maxAge := p.MaxAge
 	if maxAge <= 0 {
@@ -449,8 +498,14 @@ func applyTickTo(dst *StockInfo, tk QMTTick, p FeedPolicy) bool {
 	if tk.PrevClose > 0 {
 		dst.PrevClose = tk.PrevClose
 	}
-	dst.Volume = tk.Volume * factor
-	dst.Amount = tk.Amount
+	// 量与额只在"单位已对齐"时才接管：applyTickTo 拿不到整轮观测，故约定
+	// **volume==0 表示调用方已按未对齐把这两项抹掉**，此处保留外部源的值（见 qmt_feed.go 的对齐段）。
+	if tk.Volume > 0 {
+		dst.Volume = tk.Volume * factor
+	}
+	if tk.Amount > 0 {
+		dst.Amount = tk.Amount
+	}
 	if tk.PrevClose > 0 {
 		dst.ChangePct = (tk.LastPrice/tk.PrevClose - 1) * 100
 	}
@@ -458,13 +513,18 @@ func applyTickTo(dst *StockInfo, tk QMTTick, p FeedPolicy) bool {
 }
 
 // QuoteFeedState 给观测面用：把"这条通道现在是什么状态"折成一个字符串读数。
-// 取值 ok / auth_failed / degraded:J1 / degraded:J2 / degraded:J3。
+// 取值 not_polled / auth_failed / degraded:J1 / degraded:J2 / degraded:J3 / ok。
 // 为什么 auth_failed 优先于 J1：钥匙被撤在 HTTP 层也是"通道不通"，但对运维来说
 // 两者的处置动作完全不同（补钥匙 vs 查网关进程），混成一个值就是让人盲操作。
-// English: single observable state; auth_failed is kept distinct from a generic channel failure
-// because the operator's action differs (re-issue the key vs. restart the gateway).
+// 为什么要有 not_polled：一轮都没跑时"ok"是**编的**——它和"跑过且健康"在读数上无法区分，
+// 而这正是出厂开之后最需要看见的那一态（同 §M2 的"没数据不许冒充新鲜"）。
+// English: single observable state; auth_failed stays distinct from a generic channel failure and a
+// feed that never polled says so instead of claiming ok.
 func (f *Fetcher) QuoteFeedState() string {
 	st := f.FeedStatsNow()
+	if st.Rounds <= 0 {
+		return "not_polled"
+	}
 	if st.AuthFailed {
 		return "auth_failed"
 	}
@@ -472,6 +532,41 @@ func (f *Fetcher) QuoteFeedState() string {
 		return "degraded:" + st.Degrade
 	}
 	return "ok"
+}
+
+// 行情通道告警编码（broker_feed_unavailable 规则的唯一数据源）。
+// 口径与仓内其他"应有值缺失"型心跳一致：**不适用一律写 0**，而规则用 ge 2 判定，
+// 所以 0 与 1 都在阈值之下——启动后、盘前、休市、通道没启用都不会假红
+// （§CAL-GATE/§P2-E 的判例：必须回落的判据若把"还没开始"算成异常，第一天就刷屏）。
+const (
+	FeedAlertNotApplicable = 0 // 通道未启用 / 采集器未装配 / 不在盘中：不参与判定
+	FeedAlertAlive         = 1 // 至少跑过一轮且自身读数可用（观察模式也算活着，那是刻意档）
+	FeedAlertAuthFailed    = 2 // 被 401/403 拒：钥匙被撤或无效，处置＝补钥匙
+	FeedAlertDegraded      = 3 // J1/J2/J3：通道或自身读数不可用，处置＝查网关进程/行情推送
+	FeedAlertNeverPolled   = 4 // 启用了却一轮都没跑：装配断了或每轮 panic，最难发现的一种静默无效
+)
+
+// FeedAlertCode 把通道状态折成告警量规值（盘中由引擎每 30s 喂一次，见 engine.refreshStalenessGauges）。
+// 为什么在 data 侧算而不是引擎侧判字符串：取值集合（auth_failed / degraded:Jx）是本包的定义，
+// 引擎再 Contains 一遍就是"靠猜状态码"那类判据（§0925EVE-W3-E）。
+// English: encodes the feed's health for the broker_feed_unavailable gauge; computed here because
+// the state vocabulary belongs to this package — callers must not sniff strings.
+func (f *Fetcher) FeedAlertCode() int64 {
+	p := f.feedPolicyNow()
+	if !p.Enabled {
+		return FeedAlertNotApplicable
+	}
+	st := f.FeedStatsNow()
+	switch {
+	case st.Rounds <= 0:
+		return FeedAlertNeverPolled
+	case st.AuthFailed:
+		return FeedAlertAuthFailed
+	case st.Degrade != "":
+		return FeedAlertDegraded
+	default:
+		return FeedAlertAlive
+	}
 }
 
 // HubQuoteTTL 快照优先的可用窗口：超过它就当"没拿到"，走原链现拉。

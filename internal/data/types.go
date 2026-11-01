@@ -47,9 +47,10 @@ type StockInfo struct {
 	// Src / AsOfMs §SUBSCRIPTION-A（2026-11-01 裁决 1/5）：这一只票**当前这个价**是谁给的、几秒给的。
 	// 整份快照只有一个 Source 时，混源就是谎话：券商覆盖 160 只、后备链兜 40 只，
 	// 而 /api/status 会说整份是 QMT-L1。开启 quote_per_code_source 后逐票落这两个字段；
-	// 缺省关 ⇒ 两字段留空（omitempty ⇒ 落盘与 SSE 与今天逐字节一致，这条由测试证明，不靠注释）。
-	// English: per-symbol provenance (which source produced THIS price and when); absent by default
-	// so the on-disk/SSE payload stays byte-identical until the switch is on.
+	// 开关是出厂开的指针位（2026-11-01 owner 改判），只有显式 false 才留空（omitempty ⇒ 落盘与 SSE
+	// 回到旧字节形状，这条由测试证明，不靠注释）。
+	// English: per-symbol provenance (which source produced THIS price and when); the switch is
+	// factory-on, and only an explicit false leaves both fields absent so payloads stay as before.
 	Src       string  `json:"src,omitempty"`      // 本票当前价的来源名（取值必须在 AllQuoteSources 枚举内）
 	AsOfMs    int64   `json:"as_of_ms,omitempty"` // 本票价的时刻（unixMilli；0=未知，消费端不许当新鲜用）
 	NetInflow float64 `json:"net_inflow"`         // 主力净流入（元），东方财富口径

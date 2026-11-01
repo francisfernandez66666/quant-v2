@@ -259,27 +259,36 @@ type RuntimeConfig struct {
 	// market-change → signal-detection latency (signal→trade optimization A+B / B: fast executor).
 	// Too-low values raise upstream request rate & CPU; validate against server resources in prod.
 	FeedIntervalSec int `json:"feed_interval_sec"`
-	// QMTFeedEnabled §ENH-5 批E：QMT Level-1 全推行情 feed 总开关（默认 false）。
-	// 开启且 qmt.gateway_url 非空时，引擎按 qmt_feed_interval_sec 轮询网关 /quotes，
+	// QMTFeedEnabled §ENH-5 批E：QMT Level-1 全推行情 feed 总开关。
+	// §SUBSCRIPTION-A（2026-11-01 owner 改判）出厂默认 **开**：券商是自有账户通道，
+	// 价格直接来自交易所推送，比第三方网页源少一层；配套的量纲自动对齐、覆盖率闸、
+	// J1/J2/J3 自身读数判据与 auth_failed 状态位是这次"默认开"的前置条件，缺一条都不许开。
+	// 注意存量 config.json 里显式写了 false 的账号仍是关（稀疏语义），改现网值要走设置页/配置文件。
+	// 开启（缺省即开启，指针位）且 qmt.gateway_url 非空时，引擎按 qmt_feed_interval_sec 轮询网关 /quotes，
 	// 命中代码覆盖行情快照（Source=QMT-L1）；feed 故障静默回退既有 5s 新浪链，不参与交易熔断。
-	// 仅生产决策机（Windows + qmt_gateway + xtquant）有意义，mac 开发态保持关闭。
-	// English: §ENH-5 master switch for the QMT Level-1 quote feed (default off, prod-only).
-	QMTFeedEnabled bool `json:"qmt_feed_enabled"`
+	// 仅生产决策机（Windows + qmt_gateway + xtquant）有实际数据可喂；mac 开发态连上网关也只是
+	// 覆盖率 0、由降级判据自动退回现行链，不需要额外按键。
+	// English: §ENH-5 master switch for the QMT Level-1 quote feed. Factory-on per the owner ruling of
+	// 2026-11-01 (pointer bool: absent key = on, explicit false = off); an existing config.json that
+	// literally says false stays off. Prod decision machine only in practice; elsewhere it just reports
+	// zero coverage and the degradation rules hand pricing back to the existing chain.
+	QMTFeedEnabled *bool `json:"qmt_feed_enabled,omitempty"`
 	// QMTFeedIntervalSec L1 feed 轮询间隔（秒，默认 0 → 取 3s；建议 1~3）。
 	// English: L1 feed polling interval in seconds (0 → 3s default; 1-3 recommended).
 	QMTFeedIntervalSec int `json:"qmt_feed_interval_sec"`
-	// QMTFeedPrimary §SUBSCRIPTION-A（2026-11-01 裁决 1/5 + 本批「要开关」）：券商 L1 是否
+	// QMTFeedPrimary §SUBSCRIPTION-A（2026-11-01 裁决 1/5；同日改判「出厂默认开」）：券商 L1 是否
 	// **改写**行情快照里的价格。
-	// 缺省 false＝观察模式：feed 照轮询、照报覆盖率/新鲜度/降级状态，但一个价格都不改，
+	// 指针位＝缺键开、显式 false 关。关时是观察模式：feed 照轮询、照报覆盖率/新鲜度/降级状态，但一个价格都不改，
 	// 快照仍完全由现行链（hithink→新浪→腾讯→东财）决定。
 	// 为什么要这一档而不是"enabled 一档定生死"：`enabled=true` 就直接接管价格，等于把
 	// "先连上看看数对不对"和"让它当家"绑成同一个动作，出问题时分不清是通道坏还是判据错。
-	// 上线阶梯（docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md §5）：enabled 观察几天 →
-	// 覆盖率/量纲/降级读数达标 → 再开 primary。
-	// English: whether broker Level-1 ticks may override snapshot prices. Default off = observe mode
-	// (poll and report coverage/freshness/degradation without touching a single price), so enabling
-	// the feed and promoting it to primary are two separately reversible steps.
-	QMTFeedPrimary bool `json:"qmt_feed_primary"`
+	// 出厂档（2026-11-01 owner 改判「默认把这破券商的信息源开关打开」）＝开；这一档保留的是
+	// **回滚通道**：现场发现券商价不对，设置页关掉即可退回观察模式，不用回退二进制。
+	// 关掉后的观察读数（覆盖率/新鲜度/降级状态）与开时完全一样，见 docs/IMPL_QMT_DATA_SUBSCRIPTION_20261101.md §5。
+	// English: whether broker Level-1 ticks may override snapshot prices. Factory-on per the owner
+	// ruling of 2026-11-01; the off mode remains the one-click rollback (observe mode: poll and report
+	// coverage/freshness/degradation without touching a single price).
+	QMTFeedPrimary *bool `json:"qmt_feed_primary,omitempty"`
 	// QMTFeedCoverageMinPct §SUBSCRIPTION-A：券商 feed 覆盖率（有效 tick 只数 ÷ 当日可交易标的数）
 	// 达到该百分比才允许刷新**全局**行情新鲜度基线（lastOK）。
 	// 缺陷本体：整条链只有一个"最近成功时刻"，而旧实现只要命中 **1 只**就整份注入并把它归零
@@ -306,16 +315,17 @@ type RuntimeConfig struct {
 	// QuotePerCodeSource §SUBSCRIPTION-A（裁决 1/5）：是否给每只票标"这个价来自哪个源、几秒前"。
 	// 混源是"券商为主 + 现行链为后备"的必然结果（客户端 15:05 关、盘前未起、随时可能断），
 	// 而整份快照只有一个 Source ⇒ 它会说整份都是 QMT-L1，其实有几十只来自新浪。
-	// 缺省 false：两个新字段omitempty ⇒ 快照落盘、SSE、行情接口的字节形状与今天一致。
-	// English: stamp per-symbol source/as-of provenance; off by default keeps payloads identical.
-	QuotePerCodeSource bool `json:"quote_per_code_source"`
-	// QuoteHubConsult §SUBSCRIPTION-A（owner 裁决 13）：咨询与自选补价是否"快照优先"。
+	// 指针位：缺键=开。显式关掉时两个字段为空（omitempty）⇒ 快照落盘、SSE、行情接口回到今天的字节形状。
+	// English: stamp per-symbol source/as-of provenance; factory-on (absent key = on). Explicitly
+	// disabled leaves both fields empty (omitempty) so payloads stay byte-identical to the old shape.
+	QuotePerCodeSource *bool `json:"quote_per_code_source,omitempty"`
+	// QuoteHubConsult §SUBSCRIPTION-A（owner 裁决 13；同日改判出厂默认开）：咨询与自选补价走"快照优先"。
 	// 不做这件事，同一个票在自选卡、量化页、咨询面板上会来自不同源不同时刻——那正是
 	// "现价一片「—」"与"两个页面价格不一致"两连带的根因（装配点分散 + 无单一出口）。
-	// 缺省 false＝每问一次仍打一次外部 HTTP（与今天逐字节一致）。
-	// English: snapshot-first for consult and watchlist price filling; off by default keeps the
-	// per-question upstream fetch exactly as today.
-	QuoteHubConsult bool `json:"quote_hub_consult"`
+	// 指针位：缺键=开；显式 false＝每问一次仍打一次外部 HTTP（今天的形态，保留作回滚位）。
+	// English: snapshot-first for consult and watchlist price filling; factory-on (absent key = on).
+	// Explicit false keeps today's per-question upstream fetch as the rollback position.
+	QuoteHubConsult *bool `json:"quote_hub_consult,omitempty"`
 	// MonitorPoolHotMax §SUBSCRIPTION-A（owner 裁决 12）：券商为主源时的热点监控池上限。
 	// 缺省 0 → 出厂 400；降级档（现行链当家时）仍是既有常数 60——扩容只在券商这条本地通道扛得住
 	// 的时候发生，退回外部源就收回，因为新浪是 80 只一片、池越大后备链请求越多。
@@ -354,6 +364,27 @@ func (r RuntimeConfig) ReviewOn() bool { return r.ReviewEnabled == nil || *r.Rev
 // 每个消费点被解释成不同含义（0 到底是"关"还是"默认值"），而这类歧义正是静默失效的入口。
 
 // FeedCoverageDefault 券商 feed 覆盖率的出厂阈值（owner 裁决 4：先按 80%）。
+// ── §SUBSCRIPTION-A（2026-11-01 owner 改判"券商信息源默认开"）四个开关的生效读数 ──
+// 用指针位而不是裸 bool：照 OrderStatePullCloseMissing 的先例——**缺键=开、显式 false=关**。
+// 为什么不能用裸 bool：裸 bool 零值是 false，那要么让「没配过的老配置」整个关掉（达不到默认开），
+// 要么逼每个消费点自己写"零值当 true"（零值歧义正是本仓静默失效的老根）。
+// 显式关掉仍然有效：回滚只需把设置页那一个开关拨回关闭，不必回退发版。
+// English: pointer switches — absent keys mean ON, an explicit false means OFF, so rollback is a
+// config flip rather than a redeploy.
+func feedOn(v *bool) bool { return v == nil || *v }
+
+// QMTFeedOn 行情 feed 是否轮询（缺省开）。
+func (r RuntimeConfig) QMTFeedOn() bool { return feedOn(r.QMTFeedEnabled) }
+
+// QMTFeedPrimaryOn 券商 tick 是否可改写快照价格（缺省开）。
+func (r RuntimeConfig) QMTFeedPrimaryOn() bool { return feedOn(r.QMTFeedPrimary) }
+
+// QuotePerCodeSourceOn 是否逐票标 Src/AsOfMs（缺省开；混源时不说谎的前提）。
+func (r RuntimeConfig) QuotePerCodeSourceOn() bool { return feedOn(r.QuotePerCodeSource) }
+
+// QuoteHubConsultOn 咨询与自选价是否走快照优先（缺省开）。
+func (r RuntimeConfig) QuoteHubConsultOn() bool { return feedOn(r.QuoteHubConsult) }
+
 const FeedCoverageDefault = 80
 
 // EffectiveFeedCoverageMinPct 覆盖率阈值的生效值：0→80；负数→-1（＝关闭阈值判断，

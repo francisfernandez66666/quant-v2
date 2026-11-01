@@ -116,11 +116,47 @@ func TestSwitchInventoryCoversEveryKey(t *testing.T) {
 			t.Fatalf("启动清单缺键 %q（新增开关必须同批进清单，门禁 §162 另有 8 条等值锁）:\n%s", k, out)
 		}
 	}
-	// 缺省态必须逐项写成 disabled / 出厂值，让人一眼看出"上了但没开"
-	if !strings.Contains(out, "runtime.qmt_feed_primary=disabled") {
-		t.Fatalf("缺省档必须显式写成 disabled（不是让人猜默认值）:\n%s", out)
+	// 出厂态必须逐项写成 enabled/disabled，让人一眼看出这项到底跑不跑（2026-11-01 owner 改判：
+	// 行情四键出厂开＝券商数据源要"通畅地上线"，申购两键仍出厂关＝等盘中探针与段表校准）。
+	for _, k := range []string{
+		"runtime.qmt_feed_enabled=enabled",
+		"runtime.qmt_feed_primary=enabled",
+		"runtime.quote_per_code_source=enabled",
+		"runtime.quote_hub_consult=enabled",
+	} {
+		if !strings.Contains(out, k) {
+			t.Fatalf("行情四键出厂态必须是 enabled（缺键=开，指针位语义）: 缺 %q:\n%s", k, out)
+		}
 	}
 	if !strings.Contains(out, "subscription_recognize=disabled") {
 		t.Fatalf("申购开关缺省态没写进清单:\n%s", out)
+	}
+}
+
+// TestSwitchInventoryExplicitFalseIsDisabled 显式写 false 必须打成 disabled——
+// 指针位的"出厂开"不能把"人明确关掉"也读成开，否则设置页的关是假关。
+func TestSwitchInventoryExplicitFalseIsDisabled(t *testing.T) {
+	cfgMgr, _ := newCfgWithStore(t)
+	off := false
+	rt := cfgMgr.Get().Runtime
+	rt.QMTFeedPrimary = &off
+	rt.QuoteHubConsult = &off
+	if err := cfgMgr.SetRuntimeConfig(&rt); err != nil {
+		t.Fatalf("set runtime: %v", err)
+	}
+
+	var buf bytes.Buffer
+	origOut, origFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	logRuntimeSwitches(cfgMgr)
+	log.SetOutput(origOut)
+	log.SetFlags(origFlags)
+
+	out := buf.String()
+	for _, k := range []string{"runtime.qmt_feed_primary=disabled", "runtime.quote_hub_consult=disabled"} {
+		if !strings.Contains(out, k) {
+			t.Fatalf("显式 false 必须打成 disabled:\n%s", out)
+		}
 	}
 }

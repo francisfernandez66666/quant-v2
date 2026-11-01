@@ -53,10 +53,16 @@ func newRuntimeTestServer(t *testing.T) (*Server, *auth.User, *data.Fetcher) {
 	return s, admin, f
 }
 
-// TestRuntimeConfigGetShape 出厂态：原始值为 0 时也必须给出**生效值**，且 restart_required 点名那两个键。
+// TestRuntimeConfigGetShape 出厂态：原始值为 0 时也必须给出**生效值**；四个行情开关出厂为开
+// （owner 2026-11-01 改判）；restart_required 点名那两个"保存≠生效"的键。
 func TestRuntimeConfigGetShape(t *testing.T) {
 	s, admin, _ := newRuntimeTestServer(t)
 	got := runtimeGet(t, s, admin)
+	for _, k := range []string{"qmt_feed_enabled", "qmt_feed_primary", "quote_per_code_source", "quote_hub_consult"} {
+		if got[k] != true {
+			t.Fatalf("出厂态 %s 应为 true（缺键=开；显式 false 才关）, got %v", k, got[k])
+		}
+	}
 	if got["qmt_feed_coverage_min_pct"] != float64(0) {
 		t.Fatalf("原始值应如实回 0（没填过）, got %v", got["qmt_feed_coverage_min_pct"])
 	}
@@ -96,8 +102,9 @@ func TestRuntimeConfigSparseMergeAndHotApply(t *testing.T) {
 	if again["qmt_feed_coverage_min_pct"] != float64(70) {
 		t.Fatalf("没落盘：读回 %v", again["qmt_feed_coverage_min_pct"])
 	}
-	if again["qmt_feed_primary"] != false {
-		t.Fatalf("稀疏 merge 把没发的键改了：qmt_feed_primary=%v（必须仍是出厂 false）", again["qmt_feed_primary"])
+	// 出厂即开（owner 2026-11-01 改判"券商信息源默认开"）：没发这个键时它必须仍是 true。
+	if again["qmt_feed_primary"] != true {
+		t.Fatalf("稀疏 merge 动了没发的键：qmt_feed_primary=%v（缺省应为 true，只有显式 false 才关）", again["qmt_feed_primary"])
 	}
 	if again["monitor_pool_hot_max"] != float64(0) {
 		t.Fatalf("稀疏 merge 把没发的键改了：monitor_pool_hot_max=%v", again["monitor_pool_hot_max"])
@@ -106,9 +113,13 @@ func TestRuntimeConfigSparseMergeAndHotApply(t *testing.T) {
 	if len(changed) != 1 || toString(changed[0]) != "qmt_feed_coverage_min_pct" {
 		t.Fatalf("审计要如实说这次只动了一个键, got %v", resp["changed"])
 	}
-	// 主源档热更：这是行为面最大的一次改写，必须能在不重启的情况下开/关
-	if _, _ = runtimePost(t, s, admin, `{"qmt_feed_primary":true}`); f.FeedPolicyNow().Primary != true {
-		t.Fatal("qmt_primary 热更没生效")
+	// 主源档热更（默认开之后更要能**关得掉**）：显式 false 必须即时停用券商改写价格，
+	// 这是"回滚只翻一个键、不必回退发版"的兑现点。
+	if _, _ = runtimePost(t, s, admin, `{"qmt_feed_primary":false}`); f.FeedPolicyNow().Primary {
+		t.Fatal("显式 false 没关掉主源档（指针位退化成了零值语义）")
+	}
+	if _, _ = runtimePost(t, s, admin, `{"qmt_feed_primary":true}`); !f.FeedPolicyNow().Primary {
+		t.Fatal("qmt_feed_primary 热更没生效")
 	}
 	if got := runtimeGet(t, s, admin)["qmt_feed_coverage_min_pct"]; got != float64(70) {
 		t.Fatalf("第二次保存把上一次的键冲掉了：%v", got)

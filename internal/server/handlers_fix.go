@@ -710,14 +710,19 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		quoteAgeSec = s.fetcher.Staleness().Seconds()
-		// §SUBSCRIPTION-A（追加裁决 14/15）：行情通道必须有一个**状态位**可读。
+		// §SUBSCRIPTION-A（追加裁决 14/15 + 2026-11-01「出厂开必须能自证通畅」）：行情通道必须有一个
+		// **状态位**可读。
 		// 缺陷本体：旧实现里 feed 的成败只剩一条 60s 节流日志 ⇒ "开着但每次 401"与"根本没开"
 		// 在现网看不出区别（静默无效），而运维要区分的是"补钥匙"还是"查网关进程"。
-		// 现在把状态、覆盖率、分母来源与"观察模式本可以改写多少只/是否已连续达标可开主源"
-		// 一次性摆出来：开不开 primary 由读数决定，不由感觉决定。
-		if st := s.fetcher.FeedStatsNow(); st.Pool > 0 || st.Hits > 0 || st.ConsecutiveFail > 0 {
+		// 现在把状态、轮次、覆盖率、分母来源、量纲对齐判定与"观察模式本可以改写多少只/是否已连续达标
+		// 可开主源"一次性摆出来：开不开 primary、开得到没开成，都由读数回答，不由感觉回答。
+		// 判"该不该出这个对象"以**策略是否启用**为准，而不是以有没有读数为准：
+		// 出厂开却一轮都没跑（装配断/需重启）时，若这里还是 nil，前端就只能显示"未启用"——
+		// 那正好把本批要抓的静默无效藏回去了。nil 只留给"确实没开"这一态。
+		if st := s.fetcher.FeedStatsNow(); s.fetcher.FeedPolicyNow().Enabled || st.Rounds > 0 || st.Pool > 0 || st.Hits > 0 || st.ConsecutiveFail > 0 {
 			quoteFeed = map[string]interface{}{
 				"state":              s.fetcher.QuoteFeedState(), // ok / auth_failed / degraded:J1|J2|J3
+				"rounds":             st.Rounds,                  // 进程内累计轮询轮次；0＝启用了却一轮都没跑
 				"hits":               st.Hits,
 				"denominator":        st.Denominator,
 				"pool":               st.Pool,
@@ -729,6 +734,11 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 				"coverage_rounds":    st.CoverageRounds,
 				"consecutive_fail":   st.ConsecutiveFail,
 				"missing_price_pct":  st.MissingPricePct,
+				// 量纲两栏是"券商价当家"的最后一道未知数：观测单位档与配置系数是否一致。
+				// 不一致时本轮不接管量/额（VWAP＝额÷量，错一档就是错 100 倍，直接进委托装配），
+				// 现场必须看得见这个判定，而不是等到成交均价对不上再回头查。
+				"volume_observed_unit": st.VolumeObservedUnit,
+				"volume_aligned":       st.VolumeAligned,
 			}
 		}
 	}

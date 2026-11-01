@@ -13,11 +13,11 @@
 // 现在：feed 只产 tick + 每轮读数，合并由采集链在写快照前单点完成（applyFeedOverlay），
 // 全局基线只在覆盖率达标时才刷（coverageGateOK）。
 //
-// 三档行为（缺省全关＝今天字节一致）：
+// 三档行为（2026-11-01 owner 改判后，出厂档＝第三档「主源模式」；前两档都保留为显式关掉时的回滚位）：
 //
-//	qmt_feed_enabled=false      → 本文件根本不启动（现网今天就是这一档）
+//	qmt_feed_enabled=false      → 本文件根本不启动（显式写 false 才到这档）
 //	enabled=true, primary=false → 观察模式：轮询、统计覆盖率/降级读数，**一个价格都不改写**
-//	enabled=true, primary=true  → 主源模式：写 overlay，覆盖率达标才刷全局新鲜度
+//	enabled=true, primary=true  → 主源模式（出厂档）：写 overlay，覆盖率达标才刷全局新鲜度
 //
 // English: L1 feed poller turned into an overlay producer; observe mode records numbers without
 // touching a single price, primary mode merges through the single-writer path in Fetcher.
@@ -118,8 +118,11 @@ func (f *QMTFeed) SetVolumeToShares(v float64) {
 	f.fetcher.SetFeedPolicy(p)
 }
 
-// SetPrimary 决定券商 tick 是否可以改写快照价格（缺省 false＝观察模式，一个价都不动）。
-// English: SetPrimary promotes the feed from observe-only to price-authoritative (default off).
+// SetPrimary 决定券商 tick 是否可以改写快照价格（false＝观察模式，一个价都不动）。
+// 这里零值是 false 是"结构体未装配"的安全态；生产走的是配置层出厂开（RuntimeConfig.QMTFeedPrimaryOn，
+// 缺键=开），装配点 main.go 将生效值灌进来——两者不是一回事，别在这里改默认去"表达"出厂档。
+// English: promote the feed from observe-only to price-authoritative; the zero value here is the
+// un-assembled safe state, while the factory-on ruling lives in the config accessor wired at startup.
 func (f *QMTFeed) SetPrimary(on bool) {
 	p := f.fetcher.feedPolicyNow()
 	p.Primary = on
@@ -313,8 +316,33 @@ func (f *QMTFeed) applyTicks(ticks map[string]QMTTick, pool int) int {
 	}
 	// J3：中位数既不≈1 也不≈100 ⇒ 单位/口径不成立。合法单位档（1 或 100）绝不触发——
 	// 那种情形该做的是配系数（SetVolumeToShares），不是判通道坏。
-	if r := medianRatio(ratios); r > 0 && !(within(r, 1, 0.15) || within(r, 100, 15)) {
-		st.Degrade = "J3"
+	observed := float64(0)
+	if r := medianRatio(ratios); r > 0 {
+		switch {
+		case within(r, 1, 0.15):
+			observed = 1
+		case within(r, 100, 15):
+			observed = 100
+		default:
+			st.Degrade = "J3"
+		}
+	}
+	// 量纲自动对齐（**券商源默认开的安全前提**）：观测档与配置系数不一致时，
+	// 这一轮抹掉量/额、只并价格类字段 ⇒ VWAP（成交额÷成交量）继续用外部源的自洽值。
+	// 为什么必须有这段：J3 天生抓不到"系数配错一档"——≈1 与 ≈100 都是合法单位档，
+	// 于是"以券商为准 + 系数留 1"会把 VWAP 整体放大/缩小 100 倍，直接进委托装配、
+	// 做 T 成本分解与那条"VWAP 不合理就不买"的 fail-closed 闸。
+	st.VolumeObservedUnit = observed
+	factor := f.volFactor()
+	st.VolumeAligned = observed > 0 && observed == factor
+	if p := f.fetcher.feedPolicyNow(); p.VolumeAutoAlign && !st.VolumeAligned && observed > 0 && factor == 1 {
+		for code, tk := range entries {
+			tk.Volume, tk.Amount = 0, 0 // applyTickTo 见 0 即保留外部源的量/额
+			entries[code] = tk
+		}
+		f.logObservedThrottled("qmt_feed: §SUBSCRIPTION-A 量纲未对齐（观测=%d 配置系数=%.0f）⇒ "+
+			"本轮只并价格、不接管量/额（VWAP 保持外部源口径），请把 runtime.qmt_feed_volume_to_shares 配成 %d",
+			int(observed), factor, int(observed))
 	}
 
 	if st.Degrade != "" {
