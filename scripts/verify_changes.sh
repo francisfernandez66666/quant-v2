@@ -18277,4 +18277,109 @@ fi
 echo "ok - §155 §F4 反证通过（丢显式股数 / 摘 fill 层帽 / 帽改减额 三处注入全红，累计判定点 ${CNT155}）"
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# §156 §PAYLOAD-BOUND（2026-11-01，方案 F-1）：signal-logs 批次上限 + 响应预算
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 156 §PAYLOAD-BOUND（signal-logs 批次上限 20/200 + 响应预算 + 响应头 + 前端 batches）..."
+B156_FAILED=0
+fail156() {
+	echo "--- FAIL: §156 $*"
+	FAIL=1
+	B156_FAILED=1
+}
+CNT156=0
+CNT156=$((CNT156 + 1))
+grep -qF 'signalLogDefaultBatches = 20' internal/server/server.go || fail156 "缺省批次数不是 20（改了＝首屏预算闸被关掉）"
+CNT156=$((CNT156 + 1))
+grep -qF 'signalLogMaxBatches = 200' internal/server/server.go || fail156 "批次硬上限不是 200（?batches=99999 会绕过预算）"
+CNT156=$((CNT156 + 1))
+grep -qF 'maxSignalLogBytes' internal/server/server.go || fail156 "缺响应字节预算常量 maxSignalLogBytes"
+CNT156=$((CNT156 + 1))
+grep -qF 'signalLogParams(r)' internal/server/server.go || fail156 "handleSignalLogs 未调用 signalLogParams（批次/游标不生效）"
+CNT156=$((CNT156 + 1))
+grep -qF 'X-Signal-Logs-Batches' internal/server/server.go || fail156 "缺 X-Signal-Logs-Batches 响应头"
+CNT156=$((CNT156 + 1))
+grep -qF 'X-Signal-Logs-Truncated' internal/server/server.go || fail156 "缺 X-Signal-Logs-Truncated 响应头"
+CNT156=$((CNT156 + 1))
+grep -qF 'batches' web/src/api/index.js || fail156 "前端 fetchSignalLogs 未带 batches（仍按 days 拉全量）"
+CNT156=$((CNT156 + 1))
+go test -count=1 ./internal/server/ -run 'TestSignalLog' > /tmp/gate156.log 2>&1
+grep -qE '^ok' /tmp/gate156.log || fail156 "signal-logs 行为腿未全绿"
+[ "$B156_FAILED" = "0" ] || exit 1
+echo "ok - §156 §PAYLOAD-BOUND 锁通过（默认20/上限200/预算/参数/响应头/前端batches/行为腿，累计判定点 ${CNT156}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §157 §PAGING-DEFAULT（2026-11-01，方案 F-2）：列表端点必须真分页（默认值非 0 + 元断言）
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 157 §PAGING-DEFAULT（alerts/orders 默认非 0 + 元断言 + 行为腿）..."
+B157_FAILED=0
+fail157() {
+	echo "--- FAIL: §157 $*"
+	FAIL=1
+	B157_FAILED=1
+}
+CNT157=0
+CNT157=$((CNT157 + 1))
+grep -qF 'parsePageParams(r, 50, 5000)' internal/server/handlers_fix.go || fail157 "alerts 分页缺省不是 (50,5000)（0=不分页=全量返回）"
+CNT157=$((CNT157 + 1))
+grep -qF 'parsePageParams(r, 50, 500)' internal/server/qmt.go || fail157 "qmt orders 分页缺省不是 (50,500)"
+CNT157=$((CNT157 + 1))
+go test -count=1 ./internal/server/ -run 'TestPaginationDefaultsNeverZero' > /tmp/gate157a.log 2>&1
+grep -qE '^ok' /tmp/gate157a.log || fail157 "分页默认值元断言未全绿（新加 defaultSize=0 的调用点会红）"
+CNT157=$((CNT157 + 1))
+go test -count=1 ./internal/server/ -run 'TestAlerts' > /tmp/gate157b.log 2>&1
+grep -qE '^ok' /tmp/gate157b.log || fail157 "alerts 分页行为腿未全绿"
+[ "$B157_FAILED" = "0" ] || exit 1
+echo "ok - §157 §PAGING-DEFAULT 锁通过（alerts/orders 默认非0 + 元断言 + 行为腿，累计判定点 ${CNT157}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §158 §SIZING-INJECT（2026-11-01，方案 F-3）：动态仓位注入点与缺失原因口径
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 158 §SIZING-INJECT（缺失原因区分 / registry+engine 两处注入 / 行为腿）..."
+B158_FAILED=0
+fail158() {
+	echo "--- FAIL: §158 $*"
+	FAIL=1
+	B158_FAILED=1
+}
+CNT158=0
+CNT158=$((CNT158 + 1))
+grep -qF 'market_scale_not_injected' internal/paper/paper.go || fail158 "缺 market_scale_not_injected（未注入与值为0被混为一谈）"
+CNT158=$((CNT158 + 1))
+grep -qF 'injectPaperSizing' internal/engine/registry.go || fail158 "registry 估值轮未注入 sizing（T 关时目标仓位永不执法）"
+CNT158=$((CNT158 + 1))
+grep -qF 'injectPaperSizing' internal/engine/engine.go || fail158 "单机回退账本未注入 sizing"
+CNT158=$((CNT158 + 1))
+go test -count=1 ./internal/paper/ -run 'TestSizingContext' > /tmp/gate158.log 2>&1
+grep -qE '^ok' /tmp/gate158.log || fail158 "sizing 缺失原因行为腿未全绿"
+[ "$B158_FAILED" = "0" ] || exit 1
+echo "ok - §158 §SIZING-INJECT 锁通过（缺失原因/两处注入/行为腿，累计判定点 ${CNT158}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §159 §UAT-FIXTURE（2026-11-01，方案 F-7）：UAT 夹具与断言对齐产品口径
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 159 §UAT-FIXTURE（lots 递归回写 / WLTEST 非法码清零 / 合法码在位）..."
+B159_FAILED=0
+fail159() {
+	echo "--- FAIL: §159 $*"
+	FAIL=1
+	B159_FAILED=1
+}
+CNT159=0
+CNT159=$((CNT159 + 1))
+grep -qF 'lots' scripts/uat_bootstrap.sh || fail159 "uat_bootstrap 未递归进 lots[]（只改 pos.filled_at ⇒ sellable_qty 恒 0）"
+CNT159=$((CNT159 + 1))
+# 负锁：WLTEST 非法码不得出现在**非注释行**（注释里作为历史说明允许保留）。
+if grep -n 'WLTEST' web/e2e/uat_full.spec.mjs 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
+	fail159 "uat_full.spec.mjs 仍有 WLTEST 非法股票码（非注释行）"
+fi
+CNT159=$((CNT159 + 1))
+grep -qF '605999' web/e2e/uat_full.spec.mjs || fail159 "合法股票码 605999 不在位（WLTEST 替换未完成）"
+[ "$B159_FAILED" = "0" ] || exit 1
+echo "ok - §159 §UAT-FIXTURE 锁通过（lots 递归 / WLTEST 清零 / 合法码在位，累计判定点 ${CNT159}）"
+
+
 echo "==> 全部通过"
