@@ -76,6 +76,8 @@ func TestDecisionRecordNoDeadlock(t *testing.T) {
 	})
 	for i := 0; i < 1000; i++ {
 		pe.mu.Lock()
+		// §F-4（2026-11-01）：dynamicPaperQtyLocked 增 maxQty 入参（手动显式股数上限）；
+		// 本用例走自动通道，传 0 = 不设上限。
 		_, _ = pe.dynamicPaperQtyLocked("", "600000.SH", 10, 1.0, 0)
 		pe.mu.Unlock()
 	}
