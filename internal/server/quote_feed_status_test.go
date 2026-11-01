@@ -150,3 +150,25 @@ func TestStatusCountsMixedSources(t *testing.T) {
 		t.Fatalf("混源计数应为 1（一只是后备源），got %v", got)
 	}
 }
+
+// TestServerQuoteUsesHubWhenEnabled 裁决 13 在 server 层的落点：开关开着且这一只票新鲜时，
+// 展示/自选价由 HubQuote 给出——注意这里**没接任何外部行情源**（dc/market 都是 nil），
+// 能拿到价就证明它没有偷偷走降级链；新鲜度与被拒的语义在 data 层用例里断
+// （lastOK 是包内字段，跨包去掰它只会把测试写成对实现的抄袭）。
+func TestServerQuoteUsesHubWhenEnabled(t *testing.T) {
+	f := newStatusFetcher(3)
+	s := &Server{startTime: time.Now(), agg: &display.Aggregator{}}
+	s.SetFetcher(f)
+	codes := f.WatchCodes()
+
+	f.SetFeedPolicy(data.FeedPolicy{Consult: true})
+	si, err := s.quote(codes[0])
+	if err != nil || si == nil || si.Price <= 0 {
+		t.Fatalf("开关开且快照新鲜时应由 hub 命中（本用例没接任何外部源）: si=%+v err=%v", si, err)
+	}
+	// 交出的是拷贝：调用方就地改字段不许污染采集器自己的快照
+	si.Price = 999
+	if got := f.Snapshot().Stocks[codes[0]].Price; got == 999 {
+		t.Fatal("quote() 交出了共享指针：读路径会写坏采集器的账")
+	}
+}

@@ -533,3 +533,57 @@ func TestStampSnapshotSourcesNeverOverwritesBrokerTime(t *testing.T) {
 		t.Fatalf("后备源票没被标记: %+v", got)
 	}
 }
+
+// TestHubQuoteRequiresSwitchAndFreshness 快照优先读法的双闸：开关关 ⇒ 一律不命中（今天的行为）；
+// 开关开但这一只票的时刻过期 ⇒ 也不命中（宁可不答，也不拿旧价冒充此刻）。
+func TestHubQuoteRequiresSwitchAndFreshness(t *testing.T) {
+	f, codes := hubBase(t, 3)
+	if _, ok := f.HubQuote(codes[0], HubQuoteTTL); ok {
+		t.Fatal("开关关着却命中了快照优先（裁决 13 要求缺省＝今天每问一次打一次外部源）")
+	}
+	p := f.feedPolicyNow()
+	p.Consult = true
+	f.SetFeedPolicy(p)
+	f.lastOK.Store(time.Now().Unix())
+	si, ok := f.HubQuote(codes[0], HubQuoteTTL)
+	if !ok || si == nil || si.Price <= 0 {
+		t.Fatalf("开关开且新鲜时应命中: %+v ok=%v", si, ok)
+	}
+	// 属性断言而不是指针比对：调用方（自选补价、咨询装配）拿到后会就地改字段，
+	// 若交出的是快照里的共享对象，采集器自己的账就被读路径写脏了。
+	si.Price = 999
+	if got := f.Snapshot().Stocks[codes[0]].Price; got == 999 {
+		t.Fatal("HubQuote 交出的对象与快照共享：读路径改字段写坏了采集器的账")
+	}
+	si = func() *StockInfo { x, _ := f.HubQuote(codes[0], HubQuoteTTL); return x }()
+	if si == nil || si.Price != 10 {
+		t.Fatalf("快照账本被污染或取回异常: %+v", si)
+	}
+	f.lastOK.Store(time.Now().Add(-time.Hour).Unix())
+	if _, ok := f.HubQuote(codes[0], HubQuoteTTL); ok {
+		t.Fatal("陈旧快照仍被判为可用：旧价冒充此刻价，正是咨询语义最不能容的形态")
+	}
+}
+
+// TestApplyHubPriceNeverTouchesFlowFields 合并只动价格类字段（底线 8）。
+// 摘掉这一条，"为了换个更新鲜的价"就把东财的净流入清零——咨询里的主力口径当场失真。
+func TestApplyHubPriceNeverTouchesFlowFields(t *testing.T) {
+	dst := &StockInfo{Code: "600000", Price: 10, Name: "浦发银行", Sector: "银行",
+		NetInflow: 1234.5, HasFlow: true, FloatShares: 9e8, Turnover: 1.2}
+	before := *dst
+	hub := &StockInfo{Code: "600000", Price: 10.5, Open: 10.1, High: 10.7, Low: 10.0,
+		PrevClose: 10.2, Volume: 200000, Amount: 2.1e6, Src: QuoteSourceQMTL1, AsOfMs: 123}
+	if !ApplyHubPrice(dst, hub) {
+		t.Fatal("合并应成功")
+	}
+	if dst.Price != 10.5 || dst.Src != QuoteSourceQMTL1 || dst.AsOfMs != 123 {
+		t.Fatalf("价格类字段没并进来: %+v", dst)
+	}
+	if dst.NetInflow != before.NetInflow || dst.HasFlow != before.HasFlow || dst.Name != before.Name ||
+		dst.Sector != before.Sector || dst.FloatShares != before.FloatShares || dst.Turnover != before.Turnover {
+		t.Fatalf("非价格字段被覆盖/清零: %+v", dst)
+	}
+	if ApplyHubPrice(dst, &StockInfo{Price: 0}) {
+		t.Fatal("hub 无有效价也合并：那会把好值换成 0")
+	}
+}

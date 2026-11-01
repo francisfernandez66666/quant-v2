@@ -1820,6 +1820,15 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 // 缺失时走 DataCoordinator 新浪→同花顺→东财 三级降级链。
 // 所有展示价格的 handler 一律调用本函数，保证跨页同一时刻价格一致。
 func (s *Server) quote(code string) (*data.StockInfo, error) {
+	// §SUBSCRIPTION-A（owner 裁决 13）快照优先：开关开着时改走 HubQuote —— 它按**这一只票**的
+	// 时刻判新鲜（混源时整份快照时间是错的），并且返回深拷贝：本函数的调用方（自选补价、
+	// 展示装配）常就地改字段，直接交出快照里的共享指针等于让读路径写坏采集器自己的账。
+	// 缺省关＝下面的旧路径逐字节不变（每问一次仍打一次外部源）。
+	if s.fetcher != nil {
+		if si, ok := s.fetcher.HubQuote(code, 0); ok {
+			return si, nil
+		}
+	}
 	if s.fetcher != nil {
 		if snap := s.fetcher.Snapshot(); snap != nil {
 			if si, ok := snap.Stocks[code]; ok && si != nil && si.Price > 0 {

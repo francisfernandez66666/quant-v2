@@ -55,6 +55,7 @@ const feedCoverageDefault = 80
 type FeedPolicy struct {
 	Primary        bool          // 券商 tick 是否可改写快照价格
 	PerCodeSource  bool          // 是否逐票标 Src/AsOfMs（缺省 false ⇒ 字段留空，落盘/SSE 与今天同形）
+	Consult        bool          // 裁决 13：咨询与自选补价是否"快照优先"（缺省 false＝今天每问一次打一次外部源）
 	CoverageMinPct int           // 覆盖率阈值：-1＝关闭判断（旧行为）；0/缺省由装配点兜成 80
 	HotPoolCap     int           // 券商主源档的热点池上限
 	MaxAge         time.Duration // 单票 tick 超龄上限（超龄退回后备源值）
@@ -471,4 +472,84 @@ func (f *Fetcher) QuoteFeedState() string {
 		return "degraded:" + st.Degrade
 	}
 	return "ok"
+}
+
+// HubQuoteTTL 快照优先的可用窗口：超过它就当"没拿到"，走原链现拉。
+// 为什么不是"有价就用"：咨询语义一直是"照此刻的价格回答"，快照最快也是 3~5 秒前；
+// 给了窗口又如实带 Src/AsOfMs，用户看到的才是一个**有时刻的价**，而不是"看起来实时"。
+const HubQuoteTTL = 5 * time.Second
+
+// HubQuote 快照优先读法（裁决 13）：命中且逐票新鲜才返回**深拷贝**。
+// 返回拷贝是必须的——快照里的 *StockInfo 与在用的快照共享指针，调用方（咨询装配、自选补价）
+// 拿到后往往就地改字段，那就等于从读路径写坏了采集器自己的账。
+// English: snapshot-first lookup; returns a deep copy only when the per-symbol evidence is fresh.
+func (f *Fetcher) HubQuote(code string, ttl time.Duration) (*StockInfo, bool) {
+	p := f.feedPolicyNow()
+	if !p.Consult {
+		return nil, false
+	}
+	if ttl <= 0 {
+		ttl = HubQuoteTTL
+	}
+	bare := code
+	if i := strings.IndexByte(bare, '.'); i > 0 {
+		bare = bare[:i]
+	}
+	snap := f.Snapshot()
+	if snap == nil {
+		return nil, false
+	}
+	si := snap.Stocks[bare]
+	if si == nil || si.Price <= 0 {
+		return nil, false
+	}
+	// 新鲜度按这一只票算（overlay 时刻优先，其次全局基线），不看整份快照——混源时整份时间是错的
+	asOf := f.feedFreshMs(bare)
+	if asOf <= 0 {
+		if ts := f.lastOK.Load(); ts != 0 {
+			asOf = ts * 1000
+		}
+	}
+	if asOf <= 0 || time.Since(time.UnixMilli(asOf)) > ttl {
+		return nil, false
+	}
+	cp := *si
+	if cp.Src == "" {
+		cp.Src = snap.Source
+	}
+	if cp.AsOfMs == 0 {
+		cp.AsOfMs = asOf
+	}
+	return &cp, true
+}
+
+// ApplyHubPrice 把 hub（快照/券商）给出的**价格类**字段并到 dst 上，其余字段一律不动。
+// 这是裁决 13 与底线 8 的交叉点：咨询要资金流（东财 f62），而券商没有资金流——
+// 于是"现价来自 hub、净流入来自原链"必须允许分家，但绝不能因为合并把 dst 的
+// NetInflow/HasFlow/Name/Sector/FloatShares/Turnover 清成零值（那等于为了换价格而丢数据）。
+// English: merges only price-class fields; flow/name/sector fields survive untouched —
+// the broker has no net-inflow, so mixing sources must never zero out what the other source provided.
+func ApplyHubPrice(dst, hub *StockInfo) bool {
+	if dst == nil || hub == nil || hub.Price <= 0 {
+		return false
+	}
+	dst.Price = hub.Price
+	dst.Open = hub.Open
+	dst.High = hub.High
+	dst.Low = hub.Low
+	if hub.PrevClose > 0 {
+		dst.PrevClose = hub.PrevClose
+	}
+	if hub.Volume > 0 {
+		dst.Volume = hub.Volume
+	}
+	if hub.Amount > 0 {
+		dst.Amount = hub.Amount
+	}
+	if hub.PrevClose > 0 {
+		dst.ChangePct = (hub.Price/hub.PrevClose - 1) * 100
+	}
+	dst.Src = hub.Src
+	dst.AsOfMs = hub.AsOfMs
+	return true
 }

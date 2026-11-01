@@ -309,6 +309,13 @@ type RuntimeConfig struct {
 	// 缺省 false：两个新字段omitempty ⇒ 快照落盘、SSE、行情接口的字节形状与今天一致。
 	// English: stamp per-symbol source/as-of provenance; off by default keeps payloads identical.
 	QuotePerCodeSource bool `json:"quote_per_code_source"`
+	// QuoteHubConsult §SUBSCRIPTION-A（owner 裁决 13）：咨询与自选补价是否"快照优先"。
+	// 不做这件事，同一个票在自选卡、量化页、咨询面板上会来自不同源不同时刻——那正是
+	// "现价一片「—」"与"两个页面价格不一致"两连带的根因（装配点分散 + 无单一出口）。
+	// 缺省 false＝每问一次仍打一次外部 HTTP（与今天逐字节一致）。
+	// English: snapshot-first for consult and watchlist price filling; off by default keeps the
+	// per-question upstream fetch exactly as today.
+	QuoteHubConsult bool `json:"quote_hub_consult"`
 	// MonitorPoolHotMax §SUBSCRIPTION-A（owner 裁决 12）：券商为主源时的热点监控池上限。
 	// 缺省 0 → 出厂 400；降级档（现行链当家时）仍是既有常数 60——扩容只在券商这条本地通道扛得住
 	// 的时候发生，退回外部源就收回，因为新浪是 80 只一片、池越大后备链请求越多。

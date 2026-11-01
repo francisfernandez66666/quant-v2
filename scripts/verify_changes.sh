@@ -18625,6 +18625,20 @@ grep -qF 'f.stampSnapshotSources(snapshot, overlaid, extSource)' internal/data/f
 CNT161=$((CNT161 + 1))
 grep -qE 'QuotePerCodeSource[[:space:]]+bool[[:space:]]+`json:"quote_per_code_source"`' internal/config/config.go || fail161 "quote_per_code_source 开关丢了"
 
+# ⑭ 咨询链快照优先（裁决 13）：键、策略、两处消费点都在，且合并绝不碰资金流字段
+CNT161=$((CNT161 + 1))
+grep -qE 'QuoteHubConsult[[:space:]]+bool[[:space:]]+`json:"quote_hub_consult"`' internal/config/config.go || fail161 "quote_hub_consult 开关丢了"
+CNT161=$((CNT161 + 1))
+grep -qF 'func (f *Fetcher) HubQuote' internal/data/quote_feed_hub.go || fail161 "快照优先入口丢了"
+CNT161=$((CNT161 + 1))
+grep -qF 's.fetcher.HubQuote(code, 0)' internal/server/handlers_fix.go || fail161 "自选/展示价没接快照优先（同一价格两处不同源的老病根）"
+CNT161=$((CNT161 + 1))
+grep -qF 'e.fetcher.HubQuote(code, 0)' internal/engine/consult.go || fail161 "咨询装配没接快照优先"
+CNT161=$((CNT161 + 1))
+if grep -qE 'dst\.(NetInflow|HasFlow|Turnover|FloatShares|Name|Sector)[[:space:]]*=' internal/data/quote_feed_hub.go; then
+	fail161 "合并函数碰了非价格字段：券商没有净流入/换手这些项，覆盖等于把原链给的数据清掉"
+fi
+
 # ⑬ 盘中探针必须是"只读行情、不建 trader 会话"：10-29 那次每次 connect 占一个 writer 槽
 #    且不回收，713 连败把 QMT 客户端 3~6 分钟拖崩一次。负锁只看**可执行行**——
 #    脚本的说明注释里本来就要提这个名字，全文匹配会把好代码判红（§负锁锚串的同族坑）。
@@ -18642,7 +18656,7 @@ CNT161=$((CNT161 + 1))
 grep -qE 'from xtquant import xtdata' scripts/probe_qmt_feed.py || fail161 "探针没走 xtdata 只读通道"
 
 [ "$B161_FAILED" = "0" ] || exit 1
-echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 每票源标记 3 + 探针形状 4，累计判定点 ${CNT161}）"
+echo "ok - §161 §SUBSCRIPTION-A 锁通过（装配单点 5 + 基线刷新点 2 + 负锁整份注入 1 + 每票时刻 2 + 出厂阈值同源 2 + 池分档 4 + 降级判据 2 + 主源档与凭据 3 + 用例在册 1 + 鉴权哨兵 2 + 观测面 2 + 免鉴权负锁 1 + 每票源标记 3 + 咨询链快照优先 5 + 探针形状 4，累计判定点 ${CNT161}）"
 
 # ════════════════════════════════════════════════════════════════════════════
 # §162 §3.5 关态留痕（2026-11-01 追加裁决 15）：开关关着也必须可观测
@@ -18664,7 +18678,7 @@ grep -qF 'logRuntimeSwitches(cfgMgr)' cmd/quant/main.go || fail162 "启动清单
 # 清单条数与"本批开关数"等值：新增一个开关却不进清单 ⇒ 这条当场红
 CNT162=$((CNT162 + 1))
 SWITCH_LINES=$(grep -c '§SWITCH 状态' cmd/quant/runtime_switches.go)
-[ "$SWITCH_LINES" = "9" ] || fail162 "启动清单应逐键 9 条（新增开关必须同批进清单），现测 $SWITCH_LINES"
+[ "$SWITCH_LINES" = "10" ] || fail162 "启动清单应逐键 10 条（新增开关必须同批进清单），现测 $SWITCH_LINES"
 # 关着也统计：网关 would_label 与 Go 读面 would-label 两条腿都必须在
 CNT162=$((CNT162 + 1))
 grep -qF 'self._orders_sub_would_label_seen.add(oid)' qmt_gateway/gateway.py || fail162 "网关关态的 would_label 计数丢了"

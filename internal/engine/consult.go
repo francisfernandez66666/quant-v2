@@ -544,6 +544,7 @@ func (e *Engine) evictConsultBlocksLocked() {
 // buildStockBlockUncached 组装单只股票的实时行情数据块（无缓存，直调行情源）。
 func (e *Engine) buildStockBlockUncached(code, name string) string {
 	var b strings.Builder
+	hubMerged := false // 只用于下面那一行"现价来自哪个源、几秒前"的诚实标注
 	b.WriteString(fmt.Sprintf("\n—— 股票 %s", code))
 	if name != "" {
 		b.WriteString(" " + name)
@@ -558,9 +559,27 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		return b.String()
 	}
 	si, err := e.marketAPI.GetRealtimeQuoteWithFlow(code)
+	// §SUBSCRIPTION-A（owner 裁决 13 + 底线「tick 不携带的字段永不被覆盖」）：
+	// 咨询要主力净流入（东财 f62），而券商根本没有这一项 ⇒ 两边**允许分家**：
+	// 现价用快照/券商的更新值，净流入、名称、板块、流通股本、换手一律留原链给的值。
+	// ApplyHubPrice 只写价格类字段正是为此；合并后把来源与时刻一并写给模型看，
+	// 免得"照此刻价格回答"这句假话进 prompt（上次模型规范复述被审计当编造，就是这类口径事故）。
+	if si != nil && e.fetcher != nil {
+		if hub, ok := e.fetcher.HubQuote(code, 0); ok {
+			if data.ApplyHubPrice(si, hub) {
+				hubMerged = true
+			}
+		}
+	}
 	if err == nil && si != nil && si.Price > 0 {
 		if si.Name != "" {
 			name = si.Name
+		}
+		if hubMerged && si.AsOfMs > 0 {
+			// 把价的来源与时刻交给模型，而不是让它以为"这是此刻的价"——prompt 里少一句时点，
+			// 事后审计就会出现"模型复述的价格与页面差一档"这类无法自证的争议（§FIX-5 同族）。
+			b.WriteString(fmt.Sprintf("现价来源：%s，%d 秒前快照（资金流等字段仍来自原行情链，两者时点可能不同）\n",
+				si.Src, int(time.Since(time.UnixMilli(si.AsOfMs)).Seconds())))
 		}
 		// §FIX-5(1)：今开/最高/最低/昨收统一带"元"单位（旧格式无单位，模型规范复述
 		// "今开 36.10 元"反被审计当编造替换）；涨跌幅同时输出带符号叙述锚"（即下跌5.67%）"，

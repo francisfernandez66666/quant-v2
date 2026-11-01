@@ -501,6 +501,7 @@ func run() int {
 				CoverageMinPct: rt.EffectiveFeedCoverageMinPct(),
 				HotPoolCap:     rt.EffectiveMonitorPoolHotMax(),
 				PerCodeSource:  rt.QuotePerCodeSource,
+				Consult:        rt.QuoteHubConsult,
 				MaxAge:         30 * time.Second,
 				VolumeToShares: rt.EffectiveFeedVolumeToShares(),
 			})
