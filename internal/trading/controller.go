@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -86,6 +87,12 @@ type Controller struct {
 	// orderMissingHits 阶段二（默认关）的"连续查无此单"计数：signal_id → 连续轮数。
 	// 只对真实委托号（非 pend:/seq: 占位）计数；看到一次就清零。
 	orderMissingHits map[string]int
+
+	// §ORDER-STATE-PULL-STALE（2026-11-02，缺省关）：跨交易日在途行的独立节流戳与缺失计数。
+	// 计数与当日那份（orderMissingHits）**刻意分开**：两者查的是不同日的网关账本，混在一本里
+	// 会出现"当日快照看到过、历史日查无"被算成看到过——放额度的证据链就被自己污染了。
+	lastStalePullAt time.Time
+	stalePullMiss   map[string]int
 
 	// §WS-B 交割单对账节流：lastSettleDay 记录最近对账交易日（每日一次，mu 保护）
 	// §D4（2026-09-22 修复批）语义收紧：**只在 SettleDay 成功后**才写本字段（失败回滚/不置位），
@@ -1258,6 +1265,182 @@ func (c *Controller) reconcileOrderStates(now time.Time, force bool) {
 		log.Printf("[trading] §ORDER-STATE-PULL 本轮收敛 %d 笔停滞委托（day=%s）", fixed, day)
 	}
 	c.reconcileMissingOrders(day, states)
+	// §ORDER-STATE-PULL-STALE（2026-11-02，缺省关）：阶段一/二的候选都来自**当日**委托表，
+	// 历史日的在途行永远进不了判据——现网两笔 10-30 的「撤单中」因此挂了三个交易日。
+	// 这一腿按自己的节流走（10 分钟一次），开关关时直接返回，今天行为逐字节不变。
+	c.reconcileStaleLocalOrders(now)
+}
+
+// staleRow 一条跨交易日仍未收敛的本地委托行（§ORDER-STATE-PULL-STALE 的候选单元）。
+type staleRow struct {
+	orderID, signalID, code, status, day, side string
+}
+
+// stalePullEvery §ORDER-STATE-PULL-STALE 的节流：跨日行不急，10 分钟一趟足够。
+// 为什么不用阶段一的 30s：每趟要按**每个历史日**各拉一次网关账，代价高一个量级，
+// 而这些行的正确性只关系到"账面残留与额度释放"，不关系到当日发单。
+const stalePullEvery = 10 * time.Minute
+
+// staleMissLimit 连续多少轮"该日网关账里没有这笔"才判废单。与阶段二同值（6），
+// 保持"放额度"这条方向上的证据强度一致，不因为换了个日就放宽。
+const staleMissLimit = 6
+
+// stalePullMaxDays 最多回溯几个历史交易日：只清最近挂着的账，不去翻几个月前的老行。
+const stalePullMaxDays = 5
+
+// reconcileStaleLocalOrders §ORDER-STATE-PULL-STALE（2026-11-02，owner 令，缺省关）：
+// 把拉取对账用到**跨交易日**的本地非终态行上。
+//
+// 成因（不是猜测，是现网读数）：reconcileOrderStates 拉的是 `day=今天`，阶段二的候选又按
+// `strings.HasPrefix(o.CreatedAt, day)` 过滤，所以 10-30 那两笔 600362「撤单中」在 11-02
+// 既进不了阶段一（当日账里没有它的终态），也进不了阶段二（当日过滤把它挡掉）——
+// 结构上永远不会被收敛，运维面只剩一条 CANCEL_UNRESOLVED。
+//
+// 三条边界与阶段二同源，一条都不许放宽：
+//   - ① 只认真实委托号：pend:/seq:/空 引用本来就不在柜台账里，按缺失判终态＝凭空放预算；
+//   - ② 该日的网关账必须**非空**：整天零行时"查无此单"不是证据（库被重置/归档/那天就没上送），
+//     与阶段二的"新鲜且非空快照"同一条取向，只是历史日没有 age 可判，所以只判非空；
+//   - ③ 单日一轮要收 ≥3 笔视为"那本账坏了"而不是"同时有三笔幻影"，只告警不动钱。
+//
+// 方向性说明：先应用网关给出的**真实终态**（零推断），只有连续 6 轮查无此单才判废单；
+// 两者都写 opslog，复盘能看出是哪条腿放的额度。
+// English: reconcile non-terminal local rows from previous trading days against the gateway's
+// per-day ledger. Default off; reuses phase two's three quality gates without relaxing any.
+func (c *Controller) reconcileStaleLocalOrders(now time.Time) {
+	if c == nil || c.store == nil {
+		return
+	}
+	c.mu.RLock()
+	cfg := c.cfg
+	last := c.lastStalePullAt
+	c.mu.RUnlock()
+	if !cfg.OrderStatePullStaleOn() {
+		return // 缺省＝今天行为：一次网关请求都不多发
+	}
+	if !last.IsZero() && now.Sub(last) < stalePullEvery {
+		return
+	}
+	gc := c.gatewayClient()
+	if gc == nil {
+		return
+	}
+	all, err := c.store.RealOrdersForUser(c.userID)
+	if err != nil {
+		return
+	}
+	today := cntime.In(now).Format("2006-01-02")
+	// 候选：非终态 + 创建日是**过去**的交易日 + 真实委托号（闸①）。
+	byDay := map[string][]staleRow{}
+	for _, o := range all {
+		if store.IsTerminalOrderStatus(o.Status) {
+			continue
+		}
+		created := strings.TrimSpace(o.CreatedAt)
+		if len(created) < 10 {
+			continue
+		}
+		d := created[:10]
+		if d >= today {
+			continue // 当日行归阶段一/二，这里只处理跨日的，两套判据不许互相重叠
+		}
+		if o.OrderID == "" || strings.HasPrefix(o.OrderID, "pend:") || strings.HasPrefix(o.OrderID, "seq:") {
+			continue // 闸①
+		}
+		byDay[d] = append(byDay[d], staleRow{orderID: o.OrderID, signalID: o.SignalID, code: o.Code, status: o.Status, day: d, side: o.Side})
+	}
+	if len(byDay) == 0 {
+		c.mu.Lock()
+		c.lastStalePullAt = now // 没有候选也要推进节流戳，否则每 30s 全表扫一遍 orders
+		c.mu.Unlock()
+		return
+	}
+	days := make([]string, 0, len(byDay))
+	for d := range byDay {
+		days = append(days, d)
+	}
+	sort.Strings(days)
+	if len(days) > stalePullMaxDays {
+		days = days[len(days)-stalePullMaxDays:] // 回溯上限：只清最近的，不翻旧账
+	}
+	c.mu.Lock()
+	c.lastStalePullAt = now
+	c.mu.Unlock()
+
+	for _, d := range days {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		states, err := gc.OrderStates(ctx, d)
+		cancel()
+		if err != nil || states == nil {
+			log.Printf("[trading] §ORDER-STATE-PULL-STALE 该日账拉不到（day=%s），不动钱: %v", d, err)
+			continue
+		}
+		// 闸②：整日零行＝"那天网关本上没东西"，不是"这笔单不存在"。
+		if len(states.Orders) == 0 {
+			log.Printf("[trading] §ORDER-STATE-PULL-STALE 跳过 day=%s：网关该日账为空（查无此单不构成证据）", d)
+			continue
+		}
+		present := make(map[string]GatewayOrderState, len(states.Orders))
+		for _, r := range states.Orders {
+			if r.SignalID != "" {
+				present[r.SignalID] = r
+			}
+		}
+		var toVoid []staleRow
+		c.mu.Lock()
+		if c.stalePullMiss == nil {
+			c.stalePullMiss = map[string]int{}
+		}
+		for _, row := range byDay[d] {
+			key := d + "|" + row.signalID // 分日计数：同一把 signal 在不同日各自独立
+			gw, ok := present[row.signalID]
+			if !ok {
+				c.stalePullMiss[key]++
+				if c.stalePullMiss[key] >= staleMissLimit {
+					toVoid = append(toVoid, row)
+					delete(c.stalePullMiss, key)
+				}
+				continue
+			}
+			delete(c.stalePullMiss, key) // 看到一次就清零（与阶段二同款，防"见过一次就永远计数"）
+			if !store.IsTerminalOrderStatus(gw.Status) {
+				continue // 网关也还没终态：这笔确实还在途，什么都不做
+			}
+			// 真实终态优先：零推断，直接把网关的事实写回本地。
+			if _, aerr := c.store.ApplyOrderReportTx(store.RealOrder{
+				OrderID: row.orderID, SignalID: row.signalID, Code: row.code, Side: row.side,
+				Status: gw.Status, Price: gw.Price, Qty: gw.Qty, CreatedAt: gw.CreatedAt,
+				UserID: c.userID,
+				Reason: "§ORDER-STATE-PULL-STALE 网关 " + d + " 日账终态对账（" + gw.Status + "）",
+			}); aerr != nil {
+				log.Printf("[trading] §ORDER-STATE-PULL-STALE 应用终态失败 %s -> %s: %v", row.signalID, gw.Status, aerr)
+				continue
+			}
+			log.Printf("[trading] §ORDER-STATE-PULL-STALE 跨日收敛：%s %s %s → %s（day=%s）",
+				row.signalID, row.code, row.status, gw.Status, d)
+			opslog.Logf("quant", "跨日委托终态对账收敛 %s %s %s → %s（day=%s）", row.signalID, row.code, row.status, gw.Status, d)
+		}
+		c.mu.Unlock()
+		// 闸③：单日一轮要收 ≥3 笔缺失＝更像那本账坏了，不动钱。
+		if len(toVoid) >= 3 {
+			opslog.Logf("quant", "§ORDER-STATE-PULL-STALE **未执行**判废：day=%s 单轮成片缺失 %d 笔（按网关账异常处理）", d, len(toVoid))
+			log.Printf("[trading] §ORDER-STATE-PULL-STALE 跳过判废 day=%s：单轮缺失 %d 笔（成片缺失不动钱）", d, len(toVoid))
+			continue
+		}
+		for _, row := range toVoid {
+			if _, err := c.store.ApplyOrderReportTx(store.RealOrder{
+				OrderID: row.orderID, SignalID: row.signalID, Code: row.code,
+				Status: "废单", CreatedAt: now.Format(time.RFC3339), UserID: c.userID,
+				Reason: "§ORDER-STATE-PULL-STALE 连续 6 轮网关 " + d + " 日账查无此单（真实号+该日账非空+非成片缺失）",
+			}); err != nil {
+				log.Printf("[trading] §ORDER-STATE-PULL-STALE 判废失败 %s: %v", row.signalID, err)
+				continue
+			}
+			log.Printf("[trading] §ORDER-STATE-PULL-STALE：跨日 %s %s 连续 %d 轮查无此单，判废单（day=%s）",
+				row.signalID, row.code, staleMissLimit, d)
+			opslog.Logf("quant", "跨日委托判废 %s %s 连续 %d 轮网关查无此单 → 废单（day=%s）",
+				row.signalID, row.code, staleMissLimit, d)
+		}
+	}
 }
 
 // reconcileMissingOrders §ORDER-STATE-PULL 阶段二（2026-10-30，owner 裁决**默认开**）：

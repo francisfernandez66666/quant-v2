@@ -92,6 +92,13 @@ type FeedStats struct {
 	ConsecutiveFail    int     // 连续失败轮次（J1 判据输入）
 	MissingPricePct    float64 // 本轮 lastPrice<=0 的占比（J3 判据输入）
 	Rounds             int64   // 进程内累计轮询轮次（0＝这条通道从没跑过）：区分"开着但静默无效"与"没开"的唯一依据
+	// Returned 本轮网关**回包**里的 tick 只数（与 Hits 不同：Hits 还要求价>0 且不超龄）。
+	// 单列它是为了把"回包为空"与"回包非空但都是旧价/零价"分开——后者是 J2，前者今天没有任何一档。
+	Returned int
+	// EmptyRounds 连续空回包轮数（池非空、HTTP 成功、回包零条）。
+	// 现网 2026-11-02 的形态就是它：网关在、/quotes 回 200、`ticks:{}`，因为上游 xtdata 根本没有
+	// 行情服务可连 ⇒ Rounds 一直涨、Hits 恒 0、Degrade 恒空 ⇒ 告警编码器判成"健康"。
+	EmptyRounds int
 }
 
 // feedEntry 单票 overlay 条目：原始 tick + 到达时刻。
@@ -114,6 +121,8 @@ type feedHubState struct {
 	live         bool
 	okRounds     int   // 连续覆盖率达标轮数（ReadyToPromote 的输入）
 	rounds       int64 // 累计轮询轮次（FeedStats.Rounds 的来源；只在锁内自增）
+	// emptyRounds 连续"池非空、HTTP 成功、回包零条"的轮数（只在锁内改）。
+	emptyRounds int
 }
 
 func (f *Fetcher) hub() *feedHubState {
@@ -130,9 +139,19 @@ func (f *Fetcher) hub() *feedHubState {
 // "一轮都没跑"（feed 没装配/钥匙为空被显式停用）与"跑了但什么都没拿到"。
 // 出厂开之后这两种在现场的处置完全不同（查装配 vs 查通道），必须能分开。
 // English: counts polled rounds so "never polled" is distinguishable from "polled, got nothing".
+// bumpRound 是"一轮跑完了"的唯一记账点（观察档与主源档都走它，否则两档的轮数会各自漂移）。
+// 顺带在此维护连续空回包计数：判据放在这里而不是 qmt_feed 里，是因为只有这里同时拿得到
+// 池只数与回包只数——空回包必须是"该有票、请求成功、却一条都没回"，三者缺一都不算。
 func (h *feedHubState) bumpRound(st *FeedStats) {
 	h.rounds++
 	st.Rounds = h.rounds
+	// st.Pool <= 0 是"没东西可问"（收池/盘前），不是故障；回包非零条也不是（那是 J2 的领地）。
+	if st.Pool > 0 && st.Returned == 0 {
+		h.emptyRounds++
+	} else {
+		h.emptyRounds = 0
+	}
+	st.EmptyRounds = h.emptyRounds
 }
 
 // FeedPolicyFromRuntime 是 runtime 配置 → 装配策略的**唯一构建器**（启动装配与设置页热更共用）。
@@ -528,10 +547,34 @@ func (f *Fetcher) QuoteFeedState() string {
 	if st.AuthFailed {
 		return "auth_failed"
 	}
-	if st.Degrade != "" {
-		return "degraded:" + st.Degrade
+	if d := feedDegradeView(st); d != "" {
+		return "degraded:" + d
 	}
 	return "ok"
+}
+
+// feedEmptyAlertRounds 连续多少轮空回包才判不可用（3s 轮询 ⇒ 约 60 秒）。
+// 为什么不是一轮就报：网关刚重启、池刚轮换、收盘前最后一轮都可能出现单轮空回包，
+// 一轮就报会把正常运维动作刷成告警（与 ReadyToPromote 要连续 3 轮同一条取向）。
+const feedEmptyAlertRounds = 20
+
+// feedDegradeView 给出**只供读数与告警编码**的降级档：本体 Degrade（J1/J2/J3）优先，
+// 本体为空但连续空回包成档时给 J0。
+//
+// 关键取舍（owner 令：券商不通必须自动退回现有源、不许推翻现有链路规则）：
+// J0 **不写进 st.Degrade** ——那个字段会带动主源健康线（setFeedHealth）与池分档迟滞，
+// 属于数据面行为。空回包时数据面本来就已经在正确地退回：命中才改写、覆盖率闸要求 Hits>0
+// 所以全局新鲜度基线根本不推进、连续失败即刻缩池。缺的只是"看得见"，不是"退回去"。
+// English: J0 is an observability-only tier; the fallback behaviour it describes already happens,
+// so we surface it without touching the data-path fields that drive pool tiers and health.
+func feedDegradeView(st FeedStats) string {
+	if st.Degrade != "" {
+		return st.Degrade
+	}
+	if st.EmptyRounds >= feedEmptyAlertRounds {
+		return "J0"
+	}
+	return ""
 }
 
 // 行情通道告警编码（broker_feed_unavailable 规则的唯一数据源）。
@@ -542,15 +585,20 @@ const (
 	FeedAlertNotApplicable = 0 // 通道未启用 / 采集器未装配 / 不在盘中：不参与判定
 	FeedAlertAlive         = 1 // 至少跑过一轮且自身读数可用（观察模式也算活着，那是刻意档）
 	FeedAlertAuthFailed    = 2 // 被 401/403 拒：钥匙被撤或无效，处置＝补钥匙
-	FeedAlertDegraded      = 3 // J1/J2/J3：通道或自身读数不可用，处置＝查网关进程/行情推送
+	FeedAlertDegraded      = 3 // J1/J2/J3/J0：通道或自身读数不可用，处置＝查网关进程与 xtdata
 	FeedAlertNeverPolled   = 4 // 启用了却一轮都没跑：装配断了或每轮 panic，最难发现的一种静默无效
 )
 
 // FeedAlertCode 把通道状态折成告警量规值（盘中由引擎每 30s 喂一次，见 engine.refreshStalenessGauges）。
 // 为什么在 data 侧算而不是引擎侧判字符串：取值集合（auth_failed / degraded:Jx）是本包的定义，
 // 引擎再 Contains 一遍就是"靠猜状态码"那类判据（§0925EVE-W3-E）。
-// English: encodes the feed's health for the broker_feed_unavailable gauge; computed here because
-// the state vocabulary belongs to this package — callers must not sniff strings.
+//
+// 2026-11-02 补的 J0 档：`Returned==0`（回包为空）**过去任何一档都不沾**——J2 的判据写的是
+// "一条都没命中但回包非空"。于是现网"网关活着、每 3 秒回 200、`ticks:{}`、因为上游 xtdata
+// 根本没有行情服务可连"这一形被编码成 Alive=1：必推规则一次都没响
+// （alert_router_state.json 里 broker_feed_unavailable 连键都没有，同期 order_fail_rate 10:57 已 fire）。
+// English: an empty reply matched no tier, so a gateway answering 200 with zero ticks while its
+// upstream quote service is dead was encoded as healthy; it now reports 3 → "check gateway/xtdata".
 func (f *Fetcher) FeedAlertCode() int64 {
 	p := f.feedPolicyNow()
 	if !p.Enabled {
@@ -562,7 +610,7 @@ func (f *Fetcher) FeedAlertCode() int64 {
 		return FeedAlertNeverPolled
 	case st.AuthFailed:
 		return FeedAlertAuthFailed
-	case st.Degrade != "":
+	case feedDegradeView(st) != "":
 		return FeedAlertDegraded
 	default:
 		return FeedAlertAlive

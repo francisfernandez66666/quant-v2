@@ -18750,7 +18750,7 @@ grep -qF 'logRuntimeSwitches(cfgMgr)' cmd/quant/main.go || fail162 "启动清单
 # 清单条数与"本批开关数"等值：新增一个开关却不进清单 ⇒ 这条当场红
 CNT162=$((CNT162 + 1))
 SWITCH_LINES=$(grep -c '§SWITCH 状态' cmd/quant/runtime_switches.go)
-[ "$SWITCH_LINES" = "10" ] || fail162 "启动清单应逐键 10 条（新增开关必须同批进清单），现测 $SWITCH_LINES"
+[ "$SWITCH_LINES" = "11" ] || fail162 "启动清单应逐键 11 条（新增开关必须同批进清单），现测 $SWITCH_LINES"
 # 关着也统计：网关 would_label 与 Go 读面 would-label 两条腿都必须在
 CNT162=$((CNT162 + 1))
 grep -qF 'self._orders_sub_would_label_seen.add(oid)' qmt_gateway/gateway.py || fail162 "网关关态的 would_label 计数丢了"
@@ -18874,5 +18874,86 @@ grep -rqF 'func TestFeedStartPollsThroughGuard(' internal/data/ || fail163 "行�
 
 [ "$B163_FAILED" = "0" ] || exit 1
 echo "ok - §163 §OBS-GUARD 锁通过（装配必带 ctrl 与 day/dash 2 + 缓存两处等值 1 + 死参数负锁 1 + 三腿守卫 7〔资金跳 2／行情轮 2／行情裸调用负锁 1／板块单任务 1／概念 1〕 + 用例在册 3，累计判定点 ${CNT163}）"
+# ─────────────────────────────────────────────────────────────────────────────
+# §164 §STARVE-STALE（2026-11-02 下午批：行情零回包不再算健康 / 跨日在途行可收敛）
+# 两件事都来自同一天的现网读数，不是推测：
+#   ① 网关每 3 秒回 200 但 `ticks:{}`（上游 xtdata 根本没有行情服务可连）过去**任何一档都不沾**
+#      ——J2 写的是"回包非空但都是旧价"，于是被编码成 Alive=1，必推规则一次没响
+#      （alert_router_state.json 里没有 broker_feed_unavailable 这个键，同期 order_fail_rate 已 fire）。
+#   ② 阶段一拉的是网关**当日**账、阶段二候选又被当日过滤挡住 ⇒ 历史日非终态行结构上永远收不掉
+#      （账上实测两笔 10-30 的 600362「撤单中」挂了三个交易日）。
+# 取向是 owner 定的两条：补"看得见"，但**不推翻现有退回链**；新腿挂开关且缺省＝今天行为。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 164 §STARVE-STALE（零回包 J0 档只进读数 / 跨日收敛缺省关与三条闸 / 用例在册）..."
+B164_FAILED=0
+fail164() {
+	echo "--- FAIL: §164 $*"
+	FAIL=1
+	B164_FAILED=1
+}
+CNT164=0
+
+QH=internal/data/quote_feed_hub.go
+QF164=internal/data/qmt_feed.go
+HF=internal/server/handlers_fix.go
+CTL=internal/trading/controller.go
+CFG=internal/config/config.go
+
+# ① J0 档在位：只读的降级视图 + 连续空回包计数在唯一记账点维护
+CNT164=$((CNT164 + 1))
+grep -qF 'func feedDegradeView(st FeedStats) string' "$QH" || fail164 "缺 feedDegradeView（零回包这形又没有一档，就是今天的静默）"
+CNT164=$((CNT164 + 1))
+grep -qF 'const feedEmptyAlertRounds = 20' "$QH" || fail164 "空回包轮次阈值不在位（单轮就报＝把网关重启刷成告警；永不报＝今天的静默）"
+CNT164=$((CNT164 + 1))
+SEG164B=$(awk '/^func \(h \*feedHubState\) bumpRound\(/,/^\}/' "$QH")
+printf '%s\n' "$SEG164B" | grep -qF 'h.emptyRounds++' || fail164 "bumpRound 没维护空回包计数（计数不落在两档共用的唯一记账点上，观察档与主源档会各自漂移）"
+CNT164=$((CNT164 + 1))
+grep -qF 'Returned:        len(ticks),' "$QF164" || fail164 "applyTicks 没登记回包只数 Returned（J0 判据的唯一输入）"
+
+# ② 负锁：J0 不许写进 st.Degrade —— 那个字段带动主源健康线与池分档，属于数据面
+CNT164=$((CNT164 + 1))
+if grep -rqE 'Degrade[[:space:]]*=[[:space:]]*"J0"' internal/data/; then
+	fail164 "J0 被写进了 st.Degrade（＝动了数据面：券商不通要自动退回现有源，不许被一档告警顺手改掉）"
+fi
+CNT164=$((CNT164 + 1))
+for tok in '"returned"' '"empty_rounds"'; do
+	grep -qF "$tok" "$HF" || fail164 "/api/status 的行情通道读数缺字段 $tok（面板看不见就仍是靠人翻日志）"
+done
+
+# ③ 跨日收敛：开关缺省必须是关（这条腿的方向是放额度），判定式只认显式 true
+CNT164=$((CNT164 + 1))
+grep -qF 'func (q QMTConfig) OrderStatePullStaleOn() bool {' "$CFG" || fail164 "缺 OrderStatePullStaleOn（缺省语义没实现＝无法证明今天行为不变）"
+CNT164=$((CNT164 + 1))
+SEG164G=$(awk '/func \(q QMTConfig\) OrderStatePullStaleOn\(\)/,/^\}/' "$CFG")
+printf '%s\n' "$SEG164G" | grep -qF 'return q.OrderStatePullStale != nil && *q.OrderStatePullStale' || fail164 "跨日收敛的缺省不是关（nil 必须＝不生效；这条腿误判一次就是多买一笔）"
+
+# ④ 四条边界与阶段二同源，一条都不许放宽
+CNT164=$((CNT164 + 1))
+SEG164S=$(awk '/^func \(c \*Controller\) reconcileStaleLocalOrders\(/,/^\}/' "$CTL")
+[ -n "$SEG164S" ] || fail164 "找不到 reconcileStaleLocalOrders（本锁的对照点失效，请同批更新）"
+for tok in 'pend:' 'seq:' '网关该日账为空' 'len(toVoid) >= 3' 'staleMissLimit' 'OrderStatePullStaleOn()'; do
+	printf '%s\n' "$SEG164S" | grep -qF "$tok" || fail164 "跨日收敛缺边界/接线 $tok（真实号／该日账非空／非成片缺失／连续 6 轮／接开关——缺一条都不许动钱）"
+done
+CNT164=$((CNT164 + 1))
+# 分日计数：与当日那本（orderMissingHits）必须分开，否则"当日见过"会清零历史缺失、或反向提前放额度
+grep -qF 'stalePullMiss[key]++' "$CTL" || fail164 "跨日缺失计数没独立成账"
+if printf '%s\n' "$SEG164S" | grep -qF 'orderMissingHits'; then
+	fail164 "跨日收敛复用了当日那本缺失计数（两套判据查的是不同日的账，混账＝证据链被自己污染）"
+fi
+
+# ⑤ 用例在册（缺省即今天行为 + 四条闸 + J0 档）
+CNT164=$((CNT164 + 1))
+for tc in TestStalePullDefaultOffIsLegacy TestStalePullAppliesRealTerminal TestStalePullVoidsAfterSixMissingRounds TestStalePullSkipsEmptyDayLedger TestStalePullSkipsBulkMissing TestStalePullIgnoresPlaceholderRefs; do
+	grep -rqF "func ${tc}(" internal/trading/ || fail164 "跨日收敛用例 ${tc} 不在册"
+done
+CNT164=$((CNT164 + 1))
+grep -rqF 'func TestFeedAlertCodeStarvedEmptyReplies(' internal/data/ || fail164 "J0 用例不在册（今天这条静默就是这么漏过去的）"
+
+# ⑥ 新键必须同批进启动清单（§162 锁条数＝11，这里锁"点名的就是它"）
+CNT164=$((CNT164 + 1))
+grep -qF 'order_state_pull_stale' cmd/quant/runtime_switches.go || fail164 "跨日收敛没进启动清单（关着与没这功能在日志里又长成同一个样子）"
+
+[ "$B164_FAILED" = "0" ] || exit 1
+echo "ok - §164 §STARVE-STALE 锁通过（J0 视图与计数 4 + 数据面负锁 1 + 观测位 1 + 缺省关 2 + 边界接线 2 + 分账负锁 1 + 用例在册 2 + 清单点名 1，累计判定点 ${CNT164}）"
 echo "==> 全部通过"
 

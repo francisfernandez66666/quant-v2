@@ -638,6 +638,17 @@ type QMTConfig struct {
 	// English: phase 2 of the pull reconciliation, default ON (owner ruling 2026-10-30), gated on
 	// real order ids, a fresh non-empty broker order-table snapshot, and a per-round cap.
 	OrderStatePullCloseMissing *bool `json:"order_state_pull_close_missing,omitempty"`
+	// OrderStatePullStale §ORDER-STATE-PULL-STALE（2026-11-02 owner 令）：是否把拉取收敛也用到
+	// **跨交易日**的历史在途行上。
+	// 为什么需要：阶段一与阶段二的候选集合都来自网关**当日**委托表（controller.go 里 day=今天），
+	// 于是历史日的非终态行永远进不了判据——现网实测两笔 10-30 的 600362「撤单中」挂了三个交易日
+	// 没收敛，运维面只剩一条 CANCEL_UNRESOLVED 告警，没有后续动作。
+	// 缺省**关**（nil=false＝今天行为逐字节不变）：这条腿的方向是"放额度"，误判就是多买一笔，
+	// 必须 owner 在场按下；三条安全边界（真实号／该日网关账非空／非成片缺失）与阶段二同源。
+	// English: also reconcile local non-terminal rows from *previous* trading days against the
+	// gateway's per-day ledger. Default OFF (nil = today's exact behaviour) because the direction
+	// releases budget; reuses phase-two's three quality gates.
+	OrderStatePullStale *bool `json:"order_state_pull_stale,omitempty"`
 	// SubscriptionRecognize §SUBSCRIPTION（2026-11-01 裁决 7 + 本批「要开关、不能直接上」）：
 	// 是否识别申购类委托行并让它们在委托列表里可见（带 subscription 标注）。
 	// **缺省 false＝与今天逐字节一致**：申购行仍被网关"状态读不懂"那条分支吞掉，Go 侧读面
@@ -858,6 +869,13 @@ func (q QMTConfig) OrderStatePullCloseMissingOn() bool {
 		return true
 	}
 	return *q.OrderStatePullCloseMissing
+}
+
+// OrderStatePullStaleOn 跨交易日在途行的拉取收敛是否生效。
+// 未配置（nil）＝**不生效**＝今天行为：这条腿放额度，缺省必须保守（与阶段二缺省开相反，
+// 因为阶段二只收当日、这里要收历史日，证据链更长一档）。显式 true 才开。
+func (q QMTConfig) OrderStatePullStaleOn() bool {
+	return q.OrderStatePullStale != nil && *q.OrderStatePullStale
 }
 
 // AutoCautionOn P4 自动买谨慎层是否启用（nil 默认 false=保守关闭，需显式开启）。

@@ -721,9 +721,16 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		// 那正好把本批要抓的静默无效藏回去了。nil 只留给"确实没开"这一态。
 		if st := s.fetcher.FeedStatsNow(); s.fetcher.FeedPolicyNow().Enabled || st.Rounds > 0 || st.Pool > 0 || st.Hits > 0 || st.ConsecutiveFail > 0 {
 			quoteFeed = map[string]interface{}{
-				"state":              s.fetcher.QuoteFeedState(), // ok / auth_failed / degraded:J1|J2|J3
-				"rounds":             st.Rounds,                  // 进程内累计轮询轮次；0＝启用了却一轮都没跑
-				"hits":               st.Hits,
+				"state":  s.fetcher.QuoteFeedState(), // ok / auth_failed / degraded:J1|J2|J3|J0
+				"rounds": st.Rounds,                  // 进程内累计轮询轮次；0＝启用了却一轮都没跑
+				"hits":   st.Hits,
+				// returned/empty_rounds 是 2026-11-02 补的"看得见"两栏：回包零条（网关活着、HTTP 200、
+				// ticks:{}，上游 xtdata 没有服务可连）过去在任何一档都不沾，于是被编码成健康。
+				// 连续空到档 ⇒ state 显示 degraded:J0、告警值 3（处置＝查网关与 xtdata）。
+				// 注意 J0 只进读数与告警：数据面的退回本来就在发生（命中才改写、覆盖率闸要求 hits>0
+				// 所以全局基线不推进、连续失败即刻缩池），这里不改变它。
+				"returned":           st.Returned,
+				"empty_rounds":       st.EmptyRounds,
 				"denominator":        st.Denominator,
 				"pool":               st.Pool,
 				"coverage_pct":       st.CoveragePct,

@@ -80,20 +80,27 @@ func logRuntimeSwitches(cfgMgr *config.Manager) {
 	if qm != nil {
 		rec, guard = qm.SubscriptionRecognize, qm.SubscriptionCancelGuard
 	}
-	log.Printf("[main] §SWITCH 状态 1/10 runtime.qmt_feed_enabled=%s（出厂开：配置无此键即轮询，显式 false 才停）", yesNo(rt.QMTFeedOn()))
-	log.Printf("[main] §SWITCH 状态 2/10 runtime.qmt_feed_primary=%s（出厂开；关＝观察模式：只统计不改写价格；开＝券商价为当前价）", yesNo(rt.QMTFeedPrimaryOn()))
-	log.Printf("[main] §SWITCH 状态 3/10 runtime.qmt_feed_coverage_min_pct=%d（出厂 80；-1＝关闭阈值判断＝旧行为）",
+	log.Printf("[main] §SWITCH 状态 1/11 runtime.qmt_feed_enabled=%s（出厂开：配置无此键即轮询，显式 false 才停）", yesNo(rt.QMTFeedOn()))
+	log.Printf("[main] §SWITCH 状态 2/11 runtime.qmt_feed_primary=%s（出厂开；关＝观察模式：只统计不改写价格；开＝券商价为当前价）", yesNo(rt.QMTFeedPrimaryOn()))
+	log.Printf("[main] §SWITCH 状态 3/11 runtime.qmt_feed_coverage_min_pct=%d（出厂 80；-1＝关闭阈值判断＝旧行为）",
 		rt.EffectiveFeedCoverageMinPct())
-	log.Printf("[main] §SWITCH 状态 4/10 runtime.qmt_feed_volume_to_shares=%.0f（必须由盘中探针判读固化；错 100 倍即 VWAP 错 100 倍）",
+	log.Printf("[main] §SWITCH 状态 4/11 runtime.qmt_feed_volume_to_shares=%.0f（必须由盘中探针判读固化；错 100 倍即 VWAP 错 100 倍）",
 		rt.EffectiveFeedVolumeToShares())
-	log.Printf("[main] §SWITCH 状态 5/10 runtime.monitor_pool_hot_max=%d（券商主源档；降级档仍是常数 60）",
+	log.Printf("[main] §SWITCH 状态 5/11 runtime.monitor_pool_hot_max=%d（券商主源档；降级档仍是常数 60）",
 		rt.EffectiveMonitorPoolHotMax())
-	log.Printf("[main] §SWITCH 状态 6/10 rules.qmt.subscription_recognize=%s（关＝申购行仍不可见、unknown 计数仍被注水）", yesNo(rec))
-	log.Printf("[main] §SWITCH 状态 7/10 rules.qmt.subscription_cancel_guard=%s（关＝紧急停止与今天一致，全发撤单）", yesNo(guard))
-	log.Printf("[main] §SWITCH 状态 8/10 runtime.quote_per_code_source=%s（出厂开；关＝快照里不带每票来源与时刻，混源时整份 Source 仍是唯一读数）", yesNo(rt.QuotePerCodeSourceOn()))
-	log.Printf("[main] §SWITCH 状态 9/10 runtime.quote_hub_consult=%s（出厂开；关＝咨询与自选补价仍每次现拉外部源）", yesNo(rt.QuoteHubConsultOn()))
-	log.Printf("[main] §SWITCH 状态 10/10 网关侧 subscription_recognize 由 qmt_gateway/config.xt.json 自持，" +
+	log.Printf("[main] §SWITCH 状态 6/11 rules.qmt.subscription_recognize=%s（关＝申购行仍不可见、unknown 计数仍被注水）", yesNo(rec))
+	log.Printf("[main] §SWITCH 状态 7/11 rules.qmt.subscription_cancel_guard=%s（关＝紧急停止与今天一致，全发撤单）", yesNo(guard))
+	log.Printf("[main] §SWITCH 状态 8/11 runtime.quote_per_code_source=%s（出厂开；关＝快照里不带每票来源与时刻，混源时整份 Source 仍是唯一读数）", yesNo(rt.QuotePerCodeSourceOn()))
+	log.Printf("[main] §SWITCH 状态 9/11 runtime.quote_hub_consult=%s（出厂开；关＝咨询与自选补价仍每次现拉外部源）", yesNo(rt.QuoteHubConsultOn()))
+	log.Printf("[main] §SWITCH 状态 10/11 网关侧 subscription_recognize 由 qmt_gateway/config.xt.json 自持，" +
 		"现值看网关 /admin/status 的 orders_sync.subscription_recognize（两个键都要开才见效；只开一边最坏是少标注）")
+	// §ORDER-STATE-PULL-STALE（2026-11-02）：跨交易日在途行的拉取收敛。缺省**关**是刻意的——
+	// 这条腿的方向是"放额度"，误判就是多买一笔，必须 owner 在场按下；
+	// 但它同时是"两笔 10-30 的「撤单中」为什么挂到今天"的成因位，所以清单必须点名这一态，
+	// 否则"关着"和"没这个功能"在启动日志里又长成同一个样子（§关态留痕 同一条纪律）。
+	staleOn := qm != nil && qm.OrderStatePullStaleOn()
+	log.Printf("[main] §SWITCH 状态 11/11 rules.qmt.order_state_pull_stale=%s（关＝只收当日在途行，跨日非终态永远不收敛；开＝按网关该日账补终态/判废，三条安全边界同阶段二）",
+		yesNo(staleOn))
 }
 
 // yesNo 把布尔开关打成可读文本（清单里用 enabled/disabled，不用 true/false：

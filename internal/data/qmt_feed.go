@@ -298,6 +298,7 @@ func (f *QMTFeed) applyTicks(ticks map[string]QMTTick, pool int) int {
 		Pool:            pool,
 		Degrade:         "",
 		MissingPricePct: 0,
+		Returned:        len(ticks), // 回包只数（含零价/超龄的）——空回包档位 J0 的唯一输入，见 feedDegradeView
 	}
 	if len(ticks) > 0 {
 		st.MissingPricePct = float64(missingPrice) / float64(len(ticks)) * 100

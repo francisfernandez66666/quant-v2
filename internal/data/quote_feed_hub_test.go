@@ -636,6 +636,71 @@ func TestFeedAlertCodeFiveStates(t *testing.T) {
 	}
 }
 
+// TestFeedAlertCodeStarvedEmptyReplies J0 档：连续空回包必须算"不可用"，但**只改读数不改数据面**。
+//
+// 现网 2026-11-02 的真实形态就是这一形：xtdata 在本机扫不到任何行情服务端点，网关 `/quotes`
+// 照常回 200 但 `ticks:{}` ⇒ Rounds 一路涨、Hits 恒 0、Degrade 恒空 ⇒ 旧判据编码成 Alive=1，
+// 必推规则 broker_feed_unavailable 一次都没响（alert_router_state.json 里它连键都没有，
+// 同期 order_fail_rate 10:57 已经 fire 过）。
+//
+// 三条一起钉死，缺一不可：
+//  1. 连续 20 轮（约 60s）空回包 ⇒ 3；**单轮/19 轮不许报**（网关重启、池轮换、收盘前最后一轮
+//     都会出现正常空回包，一轮就报是把运维动作刷成告警）；
+//  2. J0 只进告警编码与 state 读数，**不写 st.Degrade** ——那个字段会带动主源健康线与池分档迟滞，
+//     而"券商不通就自动退回现有源"是 owner 定死的链路规则，不许被一檔告警顺手改掉；
+//  3. 池为空时不算（没东西可问 ≠ 通道坏），一旦回包恢复即刻归零（规则用 ge 2，回落才能成对销案）。
+func TestFeedAlertCodeStarvedEmptyReplies(t *testing.T) {
+	f, _ := hubBase(t, 10)
+	// 覆盖率闸用出厂的 80，不用 -1：`-1` 是"显式关闭判断＝命中即刷全局基线"的旧行为排障档，
+	// 拿它来验"零条回包不许替全池作保"会自证失败（第一版我就踩在这里，红的是测试不是实现）。
+	f.SetFeedPolicy(FeedPolicy{Enabled: true, Primary: true, CoverageMinPct: 80, MaxAge: 30 * time.Second})
+	feed, src := newPrimaryFeed(f, map[string]QMTTick{})
+	src.ticks = map[string]QMTTick{} // 网关活着、HTTP 成功、回包零条
+
+	lastOKBefore := f.lastOK.Load()
+	for i := 1; i < feedEmptyAlertRounds; i++ {
+		feed.pollOnce()
+		if got := f.FeedAlertCode(); got != FeedAlertAlive {
+			t.Fatalf("第 %d 轮空回包不该就报（正常轮换/重启窗口也会有），got %d", i, got)
+		}
+	}
+	feed.pollOnce() // 第 20 轮
+	st := f.FeedStatsNow()
+	if st.EmptyRounds < feedEmptyAlertRounds {
+		t.Fatalf("连续空回包没累计起来, got %d", st.EmptyRounds)
+	}
+	if st.Degrade != "" {
+		t.Fatalf("J0 不许写进 st.Degrade（那会带动主源健康线与池档＝改了退回链）, got %q", st.Degrade)
+	}
+	if got := f.FeedAlertCode(); got != FeedAlertDegraded {
+		t.Fatalf("连续空回包应写 3（处置＝查网关与 xtdata），got %d", got)
+	}
+	if s := f.QuoteFeedState(); s != "degraded:J0" {
+		t.Fatalf("观测面 state 应显式说出 degraded:J0（不能让面板继续报 ok），got %q", s)
+	}
+	// 数据面纪律：空回包期间全局新鲜度基线**不许被推进**（覆盖率闸要求 Hits>0，这里是行为复核）
+	if f.lastOK.Load() != lastOKBefore {
+		t.Fatalf("零条回包却刷新了全局基线＝拿没收到的东西替全池作保")
+	}
+	// 恢复：回包来一条即归零并回到 1，规则才能成对销案
+	src.ticks = map[string]QMTTick{"600000": hubTick(11, 1000)}
+	feed.pollOnce()
+	if st := f.FeedStatsNow(); st.EmptyRounds != 0 {
+		t.Fatalf("恢复后空回包计数没归零, got %d", st.EmptyRounds)
+	}
+	if got := f.FeedAlertCode(); got != FeedAlertAlive {
+		t.Fatalf("恢复后应回到 1，got %d", got)
+	}
+	if s := f.QuoteFeedState(); s != "ok" {
+		t.Fatalf("恢复后 state 应回到 ok，got %q", s)
+	}
+	// 池为空这一形不算故障（"没东西可问"与"通道坏"必须分形，同 not_polled 与 ok 的分形取向）
+	feed.applyTicks(map[string]QMTTick{}, 0)
+	if got := f.FeedAlertCode(); got == FeedAlertDegraded {
+		t.Fatalf("池为 0 时的空回包被当成了通道故障")
+	}
+}
+
 // TestFeedPolicyFromRuntimeFactoryOn 唯一构建器必须把四枚指针位的**生效值**灌进策略，
 // 而不是原始指针（缺键时原始 *bool 是 nil，直接赋值等于"出厂关"——与裁决相反）。
 // 同时锁 Enabled 与 Primary 同源：告警腿判"本该在跑"，靠的就是它跟着 qmt_feed_enabled。
