@@ -304,8 +304,17 @@ type Engine struct {
 	paperMarkFn      func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
 	paperSellJudgeFn func(feed sellJudgeFeed, sellMode string)                                                       // §SELLPOINT-UNIFY P3：按账号遍历模拟盘账本的统一卖出裁决（registry 注入；nil=回退全局 e.paper 单账本）；sellMode=§M9 轮首快照透传
 	paperHeldCodes   func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
-	lastBaseLog      time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
-	lastTrim         time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
+	// friendLegAgg §FRIEND-LEG（2026-11-02）：跨账号"远端执行腿最坏档"聚合函数（registry 注入）。
+	// 为什么要注入而不是在本引擎上算：metrics.SetGauge 没有标签，进程级只有一个数，
+	// 而每条远端腿各挂在各账号自己的控制器上——每个引擎只喂自己的那份就会互相覆盖，
+	// 最坏的那条腿会被随后写入的健康腿悄悄盖掉。故由注册表给出全账号取 max 的聚合闭包，
+	// nil（旧单引擎部署 / 未注入）时回退本引擎自己的控制器。
+	// English: §FRIEND-LEG cross-account "worst remote execution leg" aggregator injected by the
+	// registry (SetGauge has no labels, so per-engine writes would overwrite each other); nil falls
+	// back to this engine's own controller.
+	friendLegAgg func() int64 // §FRIEND-LEG 全账号远端腿最坏档（registry 注入；nil=只看本引擎控制器）
+	lastBaseLog  time.Time    // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
+	lastTrim     time.Time    // 盘后内存释放最近一次执行时间（节流用）
 	// §DAILY_REVIEW 盘后持仓综合复盘：reviewGuardDay 记录本引擎最近一次复盘的交易日（YYYY-MM-DD），
 	// 保证每日只自动跑一次（盘后休眠分支每 ~15min 唤醒亦触发，靠此去重）；reviewRunning 防自动/手动并发重入；
 	// reviewDailyK / reviewAsk 为可注入依赖（默认取 e.marketAPI.GetSinaKLine 与 e.llmClient.Chat），
@@ -1170,6 +1179,37 @@ func (e *Engine) SetPaperHeldCodesFn(fn func() []string) {
 	e.mu.Lock()
 	e.paperHeldCodes = fn
 	e.mu.Unlock()
+}
+
+// SetFriendLegAggregator §FRIEND-LEG（2026-11-02）注入"全账号远端执行腿最坏档"聚合闭包。
+// 只由注册表在构建引擎时注入（多账号形态）；nil＝旧单引擎部署，喂量规时回退本引擎自己的
+// 控制器读数。装配点唯一，避免"每个引擎各写各的进程级量规"互相覆盖。
+// English: §FRIEND-LEG injects the cross-account worst-remote-leg aggregator (registry only);
+// nil keeps the legacy single-engine behavior of reading this engine's own controller.
+func (e *Engine) SetFriendLegAggregator(fn func() int64) {
+	e.mu.Lock()
+	e.friendLegAgg = fn
+	e.mu.Unlock()
+}
+
+// WorstFriendLegState §FRIEND-LEG 取本进程可见的最坏远端腿档位（已注入聚合闭包时＝全账号取
+// max；否则只看本引擎控制器）。**纯读**：不发 HTTP、不动熔断/降级/下单判定（owner 边界）。
+// 返回值恒 ≥0；0 表示"这台机器上没有任何远端腿"，所以运营单机部署永不报红。
+// English: the process-visible worst remote-leg code (all accounts via the injected aggregator,
+// else this engine only); read-only, 0 means "no remote leg here".
+func (e *Engine) WorstFriendLegState() int64 {
+	e.mu.RLock()
+	agg := e.friendLegAgg
+	e.mu.RUnlock()
+	if agg != nil {
+		// 聚合闭包由注册表提供，内部会各引擎各取一次控制器读数；此处**不得**持 e.mu 调用它
+		// （它会再去拿别的引擎与注册表自己的锁；持锁跨包回调是重入死锁的经典形状）。
+		return agg()
+	}
+	if c := e.QMTController(); c != nil {
+		return int64(c.FriendLegState())
+	}
+	return 0
 }
 
 // SetQMT 注入 QMT 实盘执行控制器与实盘账本 store（AUTO_TRADING_PLAN M1）。

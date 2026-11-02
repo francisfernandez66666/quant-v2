@@ -14,7 +14,7 @@ import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
 import SentimentCard from '../components/SentimentCard.jsx'
 import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（live/trigger/cost/none）
-import { canStrict } from '../utils/perm.js'
+import { canLiveTrading } from '../utils/perm.js'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
 function ipoCountdown(c) {
@@ -179,7 +179,10 @@ export default function Dashboard() {
   // English: §0929GATE-403 — members no longer dial the admin-only QMT state endpoint;
   // the local role cache only decides whether to send, the backend remains the sole authority.
   async function loadQMT() {
-    if (!canStrict('trading_admin')) return
+    // §MULTI-ACCT-B 批5：判据换成 canLiveTrading()（trading_admin 或 quant_trade）——
+    // GET /api/qmt/state 按请求者取账号自己的控制器，成员凭新位读到的就是自己那一本，
+    // 早退语义（§0929GATE-403 不空打 403）一条没变。
+    if (!canLiveTrading()) return
     const token = qmtGuard.current.begin()
     try {
       const st = await api.fetchQMTState()

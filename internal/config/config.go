@@ -805,6 +805,23 @@ type QMTConfig struct {
 	// English: §R4-1 kill switch — when true every new order (auto & manual) is rejected;
 	// unfilled tickets are handled by the cancel sweep / close list. Toggled via POST /api/qmt/halt.
 	Halted bool `json:"halted"`
+	// RemoteLeg §FRIEND-LEG（2026-11-02）：该账号的执行腿是否在**远端机器**上
+	// （朋友自己那台机器上的 QMT + 网关，决策机只能经 overlay 链路打过去）。
+	// 缺省 false＝今天形态逐字节不变（本机腿）：不产生任何新读数、不喂任何新量规，
+	// 现网 config.json / 账号快照里没有 remote_leg 这个键时走的就是这一档。
+	// 为什么只做观测位、不碰下单/熔断/健康线：远端腿独有的失效形态是
+	// 「它还在往上报成交与持仓（数字看着很新），但指令已经送不到」——本机腿不存在这一族
+	// （连不上就等于下不了单，读数与事实同源）。所以要补的是**看得见**，不是新闸门；
+	// 观测腿一律不许有停机权限（§OBS-GUARD 同规），也不许写 st.Degrade / /health.ok / 熔断语义。
+	// 用裸 bool 而不是 *bool：false 与"没配"在这里是同一个意思（都不产生读数），
+	// 分不清反而无害——与 OrderStatePullStaleOn 那种"两端处置方向不同"的键正相反。
+	// English: §FRIEND-LEG — marks this account's execution leg as living on a remote machine
+	// (the friend's own QMT + gateway, reachable only through the overlay link). Default false keeps
+	// today's byte-for-byte behavior (local leg, no new readout at all). Observability only: it never
+	// touches order placement, the circuit breaker, or /health.ok, because the remote-specific failure
+	// mode is "it keeps reporting fresh fills while instructions no longer arrive".
+	// 远端执行腿标记（仅观测）
+	RemoteLeg bool `json:"remote_leg,omitempty"`
 	// CancelStaleSec §R4-1 未成交自动撤单阈值（秒）：已报超过该秒数仍未成交/未推进状态即自动撤单
 	//（0=默认 120；-1=关闭自动撤单，仅保留收盘清单）。
 	// English: §R4-1 stale-order auto-cancel threshold in seconds (0 = default 120; -1 disables).
@@ -919,6 +936,15 @@ func (q QMTConfig) OrderStatePullStaleOn() bool {
 // AutoCautionOn P4 自动买谨慎层是否启用（nil 默认 false=保守关闭，需显式开启）。
 // English: whether the P4 auto-buy caution layer is on (nil = false, conservative; must be enabled explicitly).
 func (q QMTConfig) AutoCautionOn() bool { return q.AutoRiskCaution != nil && *q.AutoRiskCaution }
+
+// RemoteLegOn §FRIEND-LEG（2026-11-02）该账号的执行腿是否在远端机器上（朋友自己的 QMT+网关）。
+// 缺省 false＝今天形态（本机腿，不产生任何新读数）：本函数只是**读数的分档入口**，
+// 消费点唯一（trading.Controller.FriendLegState），不参与下单、熔断或健康线判定——
+// 观测腿不许有停机权限（§OBS-GUARD 同规）。
+// English: §FRIEND-LEG — whether this account's execution leg sits on a remote machine; false keeps
+// today's local-leg behavior with no new readout. Consumed only by FriendLegState (observability),
+// never by the order/breaker paths.
+func (q QMTConfig) RemoteLegOn() bool { return q.RemoteLeg }
 
 // VWAPPremiumShadowOn §C2 VWAP 硬过滤是否仍处影子期（nil/true=只记录）。
 // English: §C2 whether the VWAP premium hard filter is shadow-only (nil/true = record only).

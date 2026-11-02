@@ -33,6 +33,10 @@ const PERM_LABELS = {
   user_admin: '用户管理',
   config_admin: '配置管理',
   ops_admin: '运维诊断',
+  // §MULTI-ACCT-B 批5（2026-11-02）第六枚位：只看/只动**自己的**实盘账（状态/委托/成交/持仓/
+  // 今日资金/动态仓位/T 回合/自己的 QMT 配置/急停/撤自己的单）；勘误、通道切换、人工改判、
+  // 结算、风险闸、跨账号一律不在其内——勾选项由后端 AllPerms() 下发，这里只补人看得懂的文案。
+  quant_trade: '量化交易',
 }
 
 // 战法参数分组定义（与 Vue 版 Settings/Admin 一致）；每个 group 的 fields 决定代配弹窗中展示的输入框与步长

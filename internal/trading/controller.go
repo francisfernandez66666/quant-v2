@@ -392,6 +392,61 @@ func (c *Controller) TripInfo() (tripped bool, reason string, at time.Time) {
 	return c.tripped, c.tripReason, c.tripAt
 }
 
+// FriendLegState §FRIEND-LEG（2026-11-02）远端执行腿（朋友机器上的 QMT+网关）的可达性读数。
+//
+// 要抓的形态（本机腿不存在这一族）：远端腿**继续往上报成交与持仓**（所以上行的钱数看着很新，
+// 上行新鲜度告警 uplink_stale 也不响），而**下行指令已经送不到**——健康探测走的是决策机→那台
+// 机器的另一条腿，只有它会把"送不到"这件事单独暴露出来。本机腿连不上时下单当场就失败、
+// 熔断器就在替它说话，所以这条读数只对 remote_leg=true 的账号存在。
+//
+// 分档（值即处置方向，告警文案与 metrics.friend_leg_state 量规同源）：
+//   - 0 不是远端腿：没配 remote_leg 键（缺省 false＝今天形态）或实盘未启用。
+//     运营那台单机部署永远落在这一档 ⇒ 今天现网一个字节都没改配置时，这条量规恒 0、
+//     规则（ge 2）恒不触发，**equals-legacy 的读数面**。
+//   - 1 远端腿可达/健康：最近一次 /health 探测成功且未熔断（含"已 kill-switch 停掉且腿仍可达"
+//     ——那种组合的处置方向是"按停"而不是"失联"，不该并进 2）。
+//   - 2 不可达：最近一次健康探测失败或已熔断。处置方向＝查链路：那台机器是否开机、
+//     QMT/网关进程是否起着、overlay（WireGuard）是否通。
+//   - 3 撤销未触达：该账号已被 kill-switch 停掉（cfg.Halted）**同时**腿仍不可达。
+//     为什么必须与 2 分开（两者读的是同一份可达性判据，差别只在 Halted）：
+//     2 的处置是"修链路"，3 的处置是"链路修不好就得有人去把那台机器彻底停掉/清待发"——
+//     钥匙已经在这侧撤了，但那台机器收不到这个动作，它照旧持有当日在途委托与待发队列，
+//     **钱还在它手上**。把 3 折进 2 就是让人去 ping 一个 ping 得通但不听命令的链路，
+//     而真正需要的动作（停机清待发）没人被提示去做。
+//
+// 纪律（owner 边界，§OBS-GUARD / §STARVE-STALE 同规）：
+//   - **纯读**，不发任何 HTTP、不建客户端、不推进任何状态字。本函数由打分循环的喂量规腿
+//     每 30s 调用一次，观测腿自己发请求会与 HealthCheck 的节流打架，还会把"观测"变成"依赖"；
+//   - **不写** st.Degrade / 熔断态 / /health.ok / 下单判定，只产出一个整数读数；
+//   - 可达性只取控制器**已经有**的三个状态字（cfg.Halted / lastHealthy / tripped），
+//     不引入新判据源——tripped 也要判是因为网关断线回报走 SetTripped 直接熔，
+//     那条路径不会把 lastHealthy 置假（只看 lastHealthy 会把已熔断的腿报成健康）。
+//
+// English: §FRIEND-LEG — read-only reachability code for a remote execution leg (0 = not a remote
+// leg / legacy default, 1 = reachable, 2 = unreachable, 3 = kill-switch applied but the leg is
+// unreachable, i.e. the revocation never reached that machine). Kept separate from 2 because the
+// disposal action differs. It reads only state the controller already holds and performs no HTTP.
+func (c *Controller) FriendLegState() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// 0：这台机器上没有任何远端腿（未配键 / 实盘整体停用）——单机部署恒此档，永不报红。
+	if !c.cfg.RemoteLegOn() || !c.cfg.Enabled {
+		return 0
+	}
+	// 可达性判据：探测成功且未熔断。lastHealthy 的初值是 false，所以"进程刚起、还没探过"
+	// 也读成不可达——这不是假红而是如实（没证据就不许冒充健康，与 FeedStats.Rounds 的
+	// not_polled 态同取向）；实盘腿的健康探测在首个循环节拍就会发生，短暂 2 由规则侧
+	// For=300s 的持续窗吃掉，健康腿几秒内翻回 1。
+	reachable := c.lastHealthy && !c.tripped
+	if reachable {
+		return 1
+	}
+	if c.cfg.Halted {
+		return 3 // 撤销未触达：见上面"为什么 3 不等于 2"
+	}
+	return 2
+}
+
 // SetLastReport 记录最近一次网关回报（上行通道 广州→首尔 的新鲜度证据，供 /api/qmt/state
 // 与仪表盘-系统互通健康行展示；kind ∈ trade/order/positions/disconnect）。
 // English: records the latest gateway report kind/time — evidence of the uplink (gateway→Seoul)

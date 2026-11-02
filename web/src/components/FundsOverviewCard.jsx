@@ -17,7 +17,12 @@
 import React, { useEffect, useState } from 'react'
 import { Card, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
-import { canStrict } from '../utils/perm.js'
+import { canStrictAny } from '../utils/perm.js'
+
+// FUNDS_READ_PERMS — 今日资金一帧的读判据（§MULTI-ACCT-B 批5，与后端路由严格对齐）：
+// GET /api/funds/today 放行条件是「funds_admin 或 quant_trade」——
+// 后者只读**自己账号**的 funds 帧（handler 按请求者取账），拿不到别人的钱。
+const FUNDS_READ_PERMS = ['funds_admin', 'quant_trade']
 import BlindTag from './BlindTag.jsx'
 
 /** 金额：千分位 + 两位小数；非法/缺失显示“—”。 */
@@ -92,7 +97,10 @@ export default function FundsOverviewCard() {
   useEffect(() => {
     let alive = true
     const load = async () => {
-      if (!canStrict('funds_admin')) { setForbidden(true); return }
+      // §MULTI-ACCT-B 批5：GET /api/funds/today 后端本批改判为「funds_admin 或 quant_trade」，
+      // 前端这一档必须同步——否则只持量化交易位的成员会被本地判据挡在"无权限"卡片外，
+      // 而接口其实回 200（页面判据比后端严＝把新位做成哑权限）。
+      if (!canStrictAny(FUNDS_READ_PERMS)) { setForbidden(true); return }
       try {
         const res = await api.fetchFundsToday()
         if (!alive) return

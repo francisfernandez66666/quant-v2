@@ -22,7 +22,7 @@ import LoadFailBanner from '../components/LoadFailBanner.jsx'
 // with an uncaught ReferenceError (no toast at all). Import added.
 import { showToast } from '../ui.jsx'
 import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（cost 不再冒充现价）
-import { canStrict } from '../utils/perm.js'
+import { canStrict, canLiveTrading } from '../utils/perm.js'
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -206,13 +206,16 @@ export default function Positions() {
   // 实盘 tab 显示无权限面板（此前 403 被 loadReal 的 catch 静默吞成"空表"，误导为无持仓）。
   const canFundsWrite = canStrict('funds_admin')
   const canTrading = canStrict('trading_admin')
+  // §MULTI-ACCT-B 批5：实盘**读**三腿（/api/qmt/state、/api/positions/real、/api/qmt/trades）
+  // 本批对 quant_trade 开放；canTrading 继续只管运营专属腿（建议回填 advice、execute 下单）。
+  const canLive = canLiveTrading()
   // §FIX-20261028-F09：实盘三段拉取的失败台账（失败请名到腿、成功即销案、不清旧读数）
   const ledger = useLoadLedger()
 
   // §N-09：纸面/实盘两条轮询统一走 usePolling——后台暂停、恢复补一次、卸载清理。
   // 实盘只在 admin 且当前标签为「实盘」时轮询（与旧 switchBook 的启停语义一致）。
   usePolling(load, 60000, bookTab === 'paper')
-  usePolling(loadReal, 60000, canTrading && bookTab === 'real')
+  usePolling(loadReal, 60000, canLive && bookTab === 'real')
 
   // 纸面持仓轮询定时器（30s）
   // 纸面/实盘轮询均交给 §N-09 的 usePolling，不再使用页面级定时器 ref
@@ -639,7 +642,10 @@ export default function Positions() {
   // 现在接仓里统一的"按腿记账"设施（useLoadLedger）：失败只点名那一腿、不清旧数据，
   // 成功即销案；页头用共享的 LoadFailBanner 渲染（testid=load-ledger 全站唯一）。
   async function loadReal() {
-    if (!canTrading) return // §PERM-GATE：无 trading_admin 不发起必 403 的实盘读
+    // §MULTI-ACCT-B 批5：这一腿是实盘**读**（state / positions/real / trades 三条，本批都按
+    // 请求者取账），判据从 canTrading 换成 canLive（trading_admin 或 quant_trade）。
+    // 运营专属腿（advice 建议回填、execute 下单）仍是 canTrading，见下方同族早退与操作列。
+    if (!canLive) return // §PERM-GATE：无实盘读权限不发起必 403 的请求
     const token = realGuard.current.begin() // §M-10 本轮代号（三段拉取共用一次判定）
     const failMsg = (e) => (e && e.message ? String(e.message) : '请求失败')
     try {
@@ -924,15 +930,18 @@ export default function Positions() {
     { colKey: 'pnl', title: '持仓盈亏', width: 90, sorter: (a, b) => realPnlPct(a) - realPnlPct(b), cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
     { colKey: 'highest_price', title: '最高价', width: 90, sorter: (a, b) => (a.highest_price || 0) - (b.highest_price || 0), cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
     { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: 'var(--app-border)' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
-    //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用） 
-    { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (
+    //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用）
+    //  §MULTI-ACCT-B 批5：这四个按钮打的是 POST /api/positions/execute（**本批刻意没对
+    //  quant_trade 开放**——手动下真实单属运营动作），因此按 canTrading 隐藏，
+    //  只持 quant_trade 的成员看到的是同一张表、少了操作列，不会"能点却必 403"。
+    { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (!canTrading ? <span style={{ color: 'var(--app-border)' }}>—</span> : (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
         <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'add') }}>加仓</Button>
         <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'reduce') }}>减仓</Button>
         <Button size="small" variant="outline" theme="warning" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'tp') }}>止盈</Button>
         <Button size="small" variant="outline" theme="danger" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'close') }}>清仓</Button>
       </div>
-    ) },
+    )) },
   ]
 
   return (
@@ -1085,9 +1094,12 @@ export default function Positions() {
         </Tabs.TabPanel>
 
         <Tabs.TabPanel value="real" label={realTripped ? '实盘持仓 !' : '实盘持仓'}>
-          {/* §PERM-GATE 20260918：实盘读端点均 admin 守卫（server.go:660-662），成员 403 曾被
-              loadReal 的 catch 静默吞成"空表"——改为显式无权限面板，与 Quant 页姿势一致 */}
-          {!canTrading ? (
+          {/* §PERM-GATE 20260918：实盘读端点原为 admin 守卫，成员 403 曾被 loadReal 的 catch
+              静默吞成"空表"——改为显式无权限面板，与 Quant 页姿势一致。
+              §MULTI-ACCT-B 批5：判据换成 canLive（trading_admin 或 quant_trade）——
+              持有量化交易位的成员读的是**自己账号**的实盘账，不再是无权限面板；
+              零权限位的成员仍走这一面板（e2e uat_full 的"成员实盘 Tab 显示无权限"腿据此仍成立）。 */}
+          {!canLive ? (
             <Card>
               <div style={{ padding: 18, borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
                 🔒 无权限访问实盘持仓：当前登录「{api.getAccount() || '未知'}」为普通用户，实盘账本仅管理员账号可见。

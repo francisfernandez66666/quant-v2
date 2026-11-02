@@ -155,14 +155,33 @@ const (
 	PermConfigAdmin = "config_admin"
 	// PermOpsAdmin 运维诊断权限（用量/LLM 调试/阶段记录/信号日志/通知探测）。
 	PermOpsAdmin = "ops_admin"
+	// PermQuantTrade 「量化交易」权限（§MULTI-ACCT-B 批5，2026-11-02）：
+	// 让朋友的**自己账号**能看到并操作**自己的**实盘账，而不必给他 trading_admin。
+	// 授予范围（只看/只动自己的实盘）：
+	//   实盘状态、当日委托、成交流水、实盘持仓、今日资金帧、动态仓位决策快照、
+	//   实盘回转折次（T 回合）、自己的 QMT 配置读写、紧急停止（只作用于自己账号）、
+	//   撤自己的单。
+	// 明确**不**授予（这些一律仍要 trading_admin 或对应位）：
+	//   委托勘误（fill-amendments）、通道切换（/api/qmt/broker）、待核对清单与收盘快照
+	//   的人工改判（pending-review / close-snapshot / order-confirm）、结算对账（settle*）、
+	//   风险闸配置（/api/risk/gates）、信号动作（/api/action）、手动执行（positions 的
+	//   advice/execute），以及**任何跨账号能力**（代他人配置、代他人读账、scope=all 全量视图）。
+	// 语义上它是 trading_admin 的**子集**，路由侧以"持有 trading_admin 或 quant_trade 之一"
+	// 放行（见 internal/server/server.go:strictAnyPermsMiddleware）。
+	// English: the sixth bit — a member's own live book (state/orders/fills/positions/funds/
+	// decisions/T-rounds/own QMT config/halt/cancel-own). It never grants corrections, channel
+	// switching, manual re-adjudication, settlement, risk-gate config, or any cross-account power.
+	PermQuantTrade = "quant_trade"
 )
 
 // AllPerms 返回当前定义的全体权限位（供前端渲染权限清单）。
+// 第六位 quant_trade（§MULTI-ACCT-B 批5）必须同批进这个白名单，否则 SetPerms 会把它
+// 当未知位拒 400，用户管理页的勾选框也就永远存不下去。
 // （AllPerms returns all defined permission bits for frontend rendering.）
 func AllPerms() []string {
 	return []string{
 		PermResearchApprove, PermFundsAdmin, PermTradingAdmin,
-		PermUserAdmin, PermConfigAdmin, PermOpsAdmin,
+		PermUserAdmin, PermConfigAdmin, PermOpsAdmin, PermQuantTrade,
 	}
 }
 

@@ -570,6 +570,36 @@ func (r *Registry) allPaperHeldCodes() []string {
 	return out
 }
 
+// worstFriendLegState §FRIEND-LEG（2026-11-02）：全账号远端执行腿的**最坏档**（max）。
+// 为什么必须在注册表算而不是各引擎各喂一次：metrics.SetGauge 没有标签，`friend_leg_state`
+// 在整个进程里只有一个数；打分循环是每个引擎各跑一轮，各写各的就会后写盖先写——
+// 朋友那条已经送不到指令的腿会被运营账号那档 0 覆盖掉，告警恒不触发。
+// 为什么遍历 cores（All）而不是 byUser：QMT 段在引擎指纹里（§FIX#11），不同实盘配置的账号
+// 必然落在不同 core、各挂各的控制器，所以按 core 去重遍历既不漏腿也不会把同一条腿数两遍。
+// 纯读：只调 Controller.FriendLegState()（它自己只读三个状态字，不发 HTTP），
+// 不建客户端、不动熔断/降级/下单判定（owner 边界：观测腿不许有停机权限，§OBS-GUARD 同规）。
+// 锁序：All() 自带注册表锁并在返回时释放，控制器的读锁在**注册表锁之外**取，无跨锁重入。
+// English: §FRIEND-LEG — the process-wide worst (max) remote-leg code across all accounts. The gauge
+// has no labels, so per-engine writes would let a healthy/local leg overwrite the broken remote one.
+// Iterates deduplicated cores (the QMT segment is part of the engine fingerprint, so every distinct
+// live config owns its own controller). Read-only.
+func (r *Registry) worstFriendLegState() int64 {
+	var worst int64
+	for _, e := range r.All() {
+		if e == nil {
+			continue
+		}
+		c := e.QMTController()
+		if c == nil {
+			continue
+		}
+		if s := int64(c.FriendLegState()); s > worst {
+			worst = s
+		}
+	}
+	return worst
+}
+
 // paperEngineSnapshot 取"当前全部模拟盘账本"快照：已懒加载的各账号引擎 + 全局模板账本 opts.Paper。
 // §QUOTE_POOL_SPLIT 预创建：纸面引擎是懒加载的——若只读 r.papers，重启后未触发过 HTTP 的账号
 // 持仓会全部缺失（监控钉入与 §EXIT-RETAIN 的持仓判定都会漏账）。故先对 auto-paper 账号锁外幂等
@@ -1030,6 +1060,12 @@ func (r *Registry) build(userID string) *Engine {
 	// English: inject the all-accounts paper-held aggregator so the base-pool rebuild pins every
 	// account's paper holdings into perpetual quote monitoring.
 	e.SetPaperHeldCodesFn(r.allPaperHeldCodes)
+	// §FRIEND-LEG（2026-11-02）：注入"全账号远端执行腿最坏档"聚合闭包——量规是进程级单个数
+	// （SetGauge 无标签），每个引擎只喂自己那条腿就会被后写的健康腿覆盖，最坏的远端腿正好被盖掉。
+	// 与上面 allPaperHeldCodes 同一装配形状（注册表持全表，引擎只拿一个只读闭包）。
+	// English: §FRIEND-LEG injects the all-accounts worst-case remote-leg aggregator (the gauge is a
+	// single process-level number, so per-engine writes would mask the worst leg).
+	e.SetFriendLegAggregator(r.worstFriendLegState)
 	// 实盘交易（AUTO_TRADING_PLAN M1）：QMT 执行控制器 + 实盘账本 store（独立于纸面账本）。
 	// 引擎每 5s 把 qmt 配置热同步给控制器（syncAccountConfig），熔断/健康探测随分析循环节流执行。
 	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the

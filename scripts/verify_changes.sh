@@ -6437,7 +6437,7 @@ leg106 'engine 买入两闸（低价默认拦/负数关闭/压线阈值/碎单�
 #   len(DefaultAlertRules()) 派生，加一条规则不需要改测试），所以这里只做**说明同步**；
 #   真正的锁面是 §114 里那枚「说明里的条数必须等于源码派生条数」的等值锁——下次再加规则却忘了
 #   同步文案时，红的是这枚锁而不是读者的眼睛。
-leg106 'metrics 路由覆盖全规则（23 条：必推 14 / 日汇总 9）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
+leg106 'metrics 路由覆盖全规则（24 条：必推 15 / 日汇总 9）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
 leg106 'engine 零信号心跳（判据/成对反证/非实盘不落笔/接线）' ./internal/engine/ \
 	'TestSignalHeartbeatAgePredicate|TestFeedSignalHeartbeatZeroAndPinnedPair|TestFeedSignalHeartbeatNonLiveDoesNotWrite|TestSignalHeartbeatRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
 leg106 'trading 已实现盈亏心跳（配对/孤儿卖出/非实盘不落笔/键名对齐）' ./internal/trading/ \
@@ -19848,7 +19848,151 @@ fi
 
 [ "$B169_FAILED" = "0" ] || exit 1
 echo "ok - §169 §LEG-CONTRACT-GATE 锁通过（指纹真源与 fail-closed 2 + 缺省不比对 1 + 拒单位置与范围 2 + 拒单体读数 1 + 健康四读数与不污染负锁 2 + Go 分类接线与三态字段 3 + 用例等值在册 2 + py 反证 1 + Go 反证 1，累计判定点 ${CNT169}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §170 §MULTI-ACCT-B-OPS（2026-11-02 夜批·批5：「量化交易」权限位 + 远端腿可达性观测）
+# 两件一起锁，因为它们是同一句话的两半——"朋友能看自己的账、也能知道自己腿坏了"，
+# 而两边都不许顺手拿到运营面：
+#   ① 权限位是**并集不是替代**：11 条实盘读/控路由认 `trading_admin` 或 `quant_trade` 之一；
+#      勘误 / 通道切换 / 待核对 / 收盘改判 / 结算 / 守恒自检 / 风险闸 / advice / execute
+#      必须仍是 `trading_admin` 独占——"朋友能急停自己、不能替别人下单或改账"是这一位的唯一目的。
+#   ② 腿可达性只进观测：`friend_leg_state` 走 metrics 量规 + 一条必推规则，
+#      绝不进 st.Degrade、不碰 /health.ok、不参与熔断判定（既有令：观测 ≠ 数据面）。
+# 权限位这条**不做存量自动授予**，schemaVersion 保持 3：升级即授权＝把新能力悄悄铺给所有人。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 170 §MULTI-ACCT-B-OPS（权限位并集 / 运营面独占负锁 / 腿状态只进观测 / 三处告警文案等值 / 反证）..."
+B170_FAILED=0
+fail170() {
+	echo "--- FAIL: §170 $*"
+	FAIL=1
+	B170_FAILED=1
+}
+CNT170=0
+
+AU170=internal/auth/auth.go
+SV170=internal/server/server.go
+QC170=internal/config/config.go
+CTL170=internal/trading/controller.go
+SL170=internal/engine/scoring_loop.go
+AL170=internal/metrics/alerter.go
+AR170=internal/metrics/alert_routing.go
+MJ170=cmd/quant/main.go
+
+# ① 权限位在位、共六位、无自动授予
+CNT170=$((CNT170 + 1))
+grep -qF 'PermQuantTrade = "quant_trade"' "$AU170" || fail170 "缺 PermQuantTrade 常量"
+CNT170=$((CNT170 + 1))
+SEG170A=$(awk 'f&&/^}/{exit} /func AllPerms\(/{f=1} f' "$AU170")
+grep_q 'PermQuantTrade' SEG170A F || fail170 "AllPerms() 没含 quant_trade（前端渲染与 SetPerms 白名单都读这一份）"
+# 逐个点名比"数个数"稳：常量列表是一行三项的排版，任何按行/按词的正则计数都会被折行牵动；
+# 且管道里 grep 无匹配会让赋值命令替换在非零码下把 set -e 的整段静默带走（§89 那把 || true 的同族坑）。
+N170_MISS=""
+for tok in PermResearchApprove PermFundsAdmin PermTradingAdmin PermUserAdmin PermConfigAdmin PermOpsAdmin PermQuantTrade; do
+	printf '%s\n' "$SEG170A" | grep -qF "$tok," || N170_MISS="${N170_MISS} ${tok}"
+done
+[ -z "$N170_MISS" ] || fail170 "AllPerms 列表缺：${N170_MISS}"
+CNT170=$((CNT170 + 1))
+if grep -nE 'PermQuantTrade' "$AU170" | grep -qE 'migrat|ensure|grant|Append.*Perms'; then
+	fail170 "权限位出现自动授予路径（本批令：后台可配、逐人手工开、升级即授权＝悄悄铺给所有人）"
+fi
+
+# ② 并集中间件 + 11 条路由接线等值
+CNT170=$((CNT170 + 1))
+grep -qF 'func (s *Server) strictAnyPermsMiddleware(perms ...string)' "$SV170" || fail170 "缺 strictAnyPermsMiddleware"
+CNT170=$((CNT170 + 1))
+N170R=$(grep -c 'strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)\|strictAnyPermsMiddleware(auth.PermFundsAdmin, auth.PermQuantTrade)' "$SV170" || true)
+[ "${N170R:-0}" -eq 11 ] || fail170 "开放给 quant_trade 的路由数是 ${N170R}（应为 11：config/qmt GET+POST、t-live/rounds、funds/today、signals/decisions、positions/real、qmt/state|trades|orders、qmt/halt、qmt/cancel）"
+
+# ③ 负锁：运营面仍被 trading_admin 独占
+CNT170=$((CNT170 + 1))
+for r in '/api/positions/advice' '/api/positions/execute' '/api/qmt/broker' '/api/qmt/order-confirm' '/api/qmt/pending-review' '/api/qmt/fill-amendments' '/api/risk/gates'; do
+	if grep -E "\"(GET|POST) ${r}" "$SV170" | grep -q "PermQuantTrade"; then
+		fail170 "运营面 ${r} 被开放给 quant_trade（越界：朋友不该有改账/切通道/跨账号能力）"
+	fi
+done
+if grep -E '"/api/opslog' "$SV170" | grep -q PermQuantTrade; then
+	fail170 "opslog 被开放给 quant_trade"
+fi
+
+# ④ 腿状态：配置键 + 四态判读 + 喂数量规 + 会话门
+CNT170=$((CNT170 + 1))
+for tok in 'json:"remote_leg,omitempty"' 'func (q QMTConfig) RemoteLegOn() bool'; do
+	grep -qF "$tok" "$QC170" || fail170 "config 缺 ${tok}（缺省必须＝不是远端腿＝什么都不报）"
+done
+CNT170=$((CNT170 + 1))
+grep -qF 'func (c *Controller) FriendLegState() int' "$CTL170" || fail170 "缺 FriendLegState"
+SEG170S=$(awk 'f&&/^}/{exit} /func \(c \*Controller\) FriendLegState\(/{f=1} f' "$CTL170")
+for tok in 'RemoteLegOn()' 'Halted' 'return 3' 'return 2' 'return 1' 'return 0'; do
+	grep_q "$tok" SEG170S F || fail170 "四态判读缺 ${tok}（3＝撤销未触达与 2＝连不上处置方向不同，折成一个数就会让人去查链路而真因是那台机器还带着待发单）"
+done
+CNT170=$((CNT170 + 1))
+grep -qF 'metrics.SetGauge("friend_leg_state"' "$SL170" || fail170 "friend_leg_state 没人喂（有规则没量规＝规则永不响，比不报更坏）"
+LN170G=$(grep -n 'SetGauge("friend_leg_state"' "$SL170" | head -1 | cut -d: -f1 || true)
+[ -n "${LN170G:-}" ] || { fail170 "找不到 friend_leg_state 的喂数行（锁的对照物失效，请同批更新）"; LN170G=1; }
+SEG170G=$(sed -n "$((LN170G - 14)),${LN170G}p" "$SL170")
+grep_q 'IsTradingDay' SEG170G F || fail170 "量规没会话门（休市日那台客户端本来就没起，会天天报红）"
+
+# ⑤ 负锁：观测不得进数据面（本批唯一真正的"越界方向"）
+CNT170=$((CNT170 + 1))
+if grep -rn 'friend_leg_state' internal/ cmd/ --include="*.go" | grep -v "_test.go" | grep -iE 'Degrade|health\.ok|PlaceOrder|setTripped'; then
+	fail170 "friend_leg_state 进了数据面/熔断（owner 既有令：补『看得见』不许推翻现有链路规则）"
+fi
+
+# ⑥ 告警：规则 + 必推 + 三处文案与源码派生等值
+CNT170=$((CNT170 + 1))
+grep -qF 'Name: "friend_leg_unavailable", Metric: "friend_leg_state", Op: "ge", Threshold: 2, For: "300s"' "$AL170" || \
+	fail170 "缺 friend_leg_unavailable 规则（或阈值/时长被改：For=300s 是给重启与瞬时断流留恢复窗）"
+grep -qF '"friend_leg_unavailable": RoutePush' "$AR170" || fail170 "该规则没进必推（腿断了不发push＝无人值守时没人知道）"
+N170RULES=$(grep -cE '^\s+\{Name: "' "$AL170" || true)
+N170PUSH=$(grep -cE '[a-z_]+": *RoutePush' "$AR170" || true)
+N170DAILY=$(grep -cE '[a-z_]+": *RouteDaily' "$AR170" || true)
+[ "${N170RULES:-0}" -eq 24 ] || fail170 "规则实数 ${N170RULES}≠24"
+[ $((N170PUSH + N170DAILY)) -eq "$N170RULES" ] || fail170 "分桶不闭合：必推 ${N170PUSH} + 日汇总 ${N170DAILY} ≠ 规则 ${N170RULES}"
+CNT170=$((CNT170 + 1))
+for f in "$AR170" "$MJ170"; do
+	grep -qE "现 24 条|24 条：必推 15|必推 15 条" "$f" || fail170 "${f} 的告警条数文案没同步到 24/15（这段文案被等值锁盯着，漂开就红在自家计数上）"
+done
+
+# ⑦ 用例在册（四份新测试 + 关键用例名）
+CNT170=$((CNT170 + 1))
+for f in internal/auth/quant_trade_perm_test.go internal/server/quant_trade_perm_test.go \
+	internal/trading/friend_leg_state_test.go internal/metrics/friend_leg_alert_test.go \
+	internal/config/friend_leg_remote_test.go internal/engine/friend_leg_gauge_test.go; do
+	[ -f "$f" ] || fail170 "缺测试文件 $f"
+done
+for tc in TestFriendLegStateDefaultIsLegacyZero TestFriendLegStateIssuesNoHTTP TestAllPermsIncludesQuantTrade TestNoAutoGrantQuantTradeOnCreate TestQuantTradeMemberOpensSelfLiveRoutes TestQuantTradeMemberStillBlockedOnPrivilegedRoutes; do
+	grep -rqF "func ${tc}(" internal/ || fail170 "关键用例 ${tc} 不在册"
+done
+
+# ⑧ 常驻反证：把 quant_trade 从 AllPerms 摘掉 ⇒ 权限测试必须红
+CNT170=$((CNT170 + 1))
+W170=$(mktemp -d /tmp/gate170.XXXXXX)
+if [ -d "$W170" ]; then
+	mkdir -p "$W170/mirror"
+	rsync -a go.mod go.sum internal "$W170/mirror/" 2>/dev/null || true
+	MU170=$(python3 - "$W170/mirror/internal/auth/auth.go" <<'PYR' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "PermUserAdmin, PermConfigAdmin, PermOpsAdmin, PermQuantTrade,"
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "PermUserAdmin, PermConfigAdmin, PermOpsAdmin,", 1))
+print(n)
+PYR
+)
+	[ "${MU170:-0}" -ge 1 ] || fail170 "反证没改动任何字节（AllPerms 锚串漂了＝这条锁没有牙）"
+	( cd "$W170/mirror" && go test ./internal/auth/ -run 'QuantTrade|Perms' -count=1 ) >/tmp/gate170_r.log 2>&1 || true
+	if grep -qE '^ok[[:space:]]' /tmp/gate170_r.log; then
+		fail170 "反证失效：摘掉 quant_trade 位后权限用例仍绿（说明没人在守这第六位）"
+	fi
+	echo "   [§170 R1] MUTATED=${MU170} 反证按预期转红"
+	rm -rf "$W170"
+fi
+
+[ "$B170_FAILED" = "0" ] || exit 1
+echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1，累计判定点 ${CNT170}）"
 echo "==> 全部通过"
+
 
 
 

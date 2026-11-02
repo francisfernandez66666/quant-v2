@@ -441,9 +441,21 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
       .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
     const read = (rel) => stripComments(fs.readFileSync(path.join(HERE, '..', rel), 'utf8'))
     const quant = read('pages/Quant.jsx')
-    // ① 单入口：角色判据只在 adminReadsAllowed 里出现一次，挂载与 SSE 回调都调它
+    // ① 单入口：角色判据只在 adminReadsAllowed / liveReadsAllowed 两个函数里各出现一次，
+    //    挂载与 SSE 回调都调它们，页面不许自行读角色缓存。
+    //    §MULTI-ACCT-B 批5：进页判据换成 liveReadsAllowed（trading_admin 或 quant_trade），
+    //    运营专属腿（待核对/对账历史/通道态/风险闸）仍在各自 loader 内按 adminReadsAllowed 早退——
+    //    两档都必须存在：合并成一档要么让 quant_trade 成员连打注定 403 的运营请求（§0929GATE-403
+    //    回潮），要么把新位做成哑权限（进不了页）。
     expect(quant).toMatch(/function adminReadsAllowed\(\) \{\s*return canStrict\('trading_admin'\)/)
-    expect(quant).toMatch(/if \(adminReadsAllowed\(\)\) \{\s*startAdminReads\(\)/)
+    expect(quant).toMatch(/function liveReadsAllowed\(\) \{\s*return canLiveTrading\(\)/)
+    expect(quant).toMatch(/if \(liveReadsAllowed\(\)\) \{\s*startAdminReads\(\)/)
+    for (const fn of ['loadPendingReview', 'loadSettleHistory', 'loadBroker', 'loadCloseRecon']) {
+      expect(quant, `§MULTI-ACCT-B 批5：${fn} 必须按 adminReadsAllowed 早退（运营专属腿不吃 quant_trade）`)
+        .toContain(`async function ${fn}() {`)
+    }
+    const guarded = (quant.match(/if \(!adminReadsAllowed\(\)\) return/g) || []).length
+    expect(guarded, '运营专属腿的早退守卫至少四处（待核对/对账历史/通道态/风险闸链尾）+收盘对账').toBeGreaterThanOrEqual(5)
     expect(quant.match(/api\.isAdmin\(\)/g) || [], 'Quant.jsx 不得自行读角色（判据单入口=canStrict）').toHaveLength(0)
     // ② 出口：重试走服务器重确认，不是本地改角色
     expect(quant).toMatch(/await api\.refreshMe\(\)/)
@@ -454,15 +466,23 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     expect(amend.match(/api\.isAdmin\(\)/g) || [], 'FillAmendPanel 不得自行读角色缓存').toHaveLength(0)
     expect(quant).toMatch(/canQuery=\{adminReadsAllowed\(\)\}/)
     // ④ 其余三页 + App 全局轮询的早退接线
-    expect(read('pages/Dashboard.jsx')).toMatch(/async function loadQMT\(\) \{\s*if \(!canStrict\('trading_admin'\)\) return/)
+    //    §MULTI-ACCT-B 批5：Dashboard 的实盘指示读 GET /api/qmt/state（本批放行给 quant_trade），
+    //    判据随之从 canStrict('trading_admin') 换成 canLiveTrading()——**早退本身不许消失**，
+    //    零权限位成员仍然一条请求都不发（§0929GATE-403 的立意不变）。
+    expect(read('pages/Dashboard.jsx')).toMatch(/async function loadQMT\(\) \{\s*(?:\/\/[^\n]*\n\s*)*if \(!canLiveTrading\(\)\) return/)
     expect(read('pages/MsgCenter.jsx')).toMatch(/async function load\(\) \{\s*if \(!admin\) \{/)
     expect(read('pages/Consult.jsx')).toMatch(/if \(!admin\) \{\s*setLlmGated\(true\)/)
     // §PAGING-DEFAULT（2026-11-01）：角标改走 fetchAlertTotal()（只取 1 条 + X-Total-Count），
     // 判据的意图不变——**仍是「admin 才轮询、且必须早退」**，只是取数函数换了。
     expect(read('App.jsx')).toMatch(/if \(api\.isAdmin\(\)\) \{\s*try \{\s*(?:\/\/[^\n]*\n\s*)*setAlertCount\(await api\.fetchAlertTotal\(\)\)/)
-    // ⑤ Positions：实盘建议回填并入既有 §PERM-GATE 的 admin 早退
+    // ⑤ Positions：§MULTI-ACCT-B 批5 把「实盘读」与「运营动作」拆成两档判据——
+    //    loadReal（state / positions/real / trades 三条本批已放行给 quant_trade）走 canLive；
+    //    建议回填 advice 与 execute 下单**继续**走 canTrading（本批刻意没放）。
     const pos = read('pages/Positions.jsx')
-    expect(pos).toMatch(/if \(!canTrading\) return \/\/ §PERM-GATE/)
+    expect(pos).toMatch(/if \(!canLive\) return \/\/ §PERM-GATE/)
     expect(pos).toMatch(/if \(canTrading\) \{\s*api\.fetchRealAdvice\(\)/)
+    expect(pos.match(/if \(!canLive\) return/g) || [], '实盘读早退必须存在（判据单点=canLive）')
+      .toHaveLength(1)
+    expect(pos, '实盘操作列（execute）必须仍按 canTrading 判').toMatch(/colKey: 'actions'[\s\S]{0,80}\(!canTrading \?/)
   })
 })

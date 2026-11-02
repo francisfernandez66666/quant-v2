@@ -35,7 +35,7 @@ import { verdictDisplay, sizingDisplay } from './quantVerdicts.js'
 import FundsOverviewCard from '../components/FundsOverviewCard.jsx' // §FUNDS-TODAY 信号仓/T仓资金一帧
 import TRoundsCard from '../components/TRoundsCard.jsx' // §W-04 T 仓子页：T 回合明细（实盘账本）
 import { useSearchParams } from 'react-router-dom' // §W-04 子页签写进 URL，刷新不丢、可分享
-import { canStrict } from '../utils/perm.js'
+import { canStrict, canLiveTrading, LIVE_TRAADING_PERMS } from '../utils/perm.js'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
@@ -354,7 +354,20 @@ export default function Quant() {
     return canStrict('trading_admin')
   }
 
-  // startAdminReads 拉起本页全部 admin-only 只读链路：首轮取数 + 60s 兜底轮询 + SSE 事件即时刷新。
+  // §MULTI-ACCT-B 批5（2026-11-02）liveReadsAllowed：本页的**进页判据**与**运营判据**分成两个入口。
+  //   · adminReadsAllowed()＝trading_admin＝运营级：待核对清单/人工改判、交割单对账、
+  //     通道切换、勘误台账、风险闸读数（/api/risk/gates 仍锁在 trading_admin）；
+  //   · liveReadsAllowed()＝trading_admin 或 quant_trade：链路状态、当日委托、成交流水、
+  //     自己的 QMT 配置（本批后端刚把这 11 条换成"任一位放行"）。
+  // 为什么必须分开而不是把 adminReadsAllowed 直接放宽：放宽一处会让 quant_trade 成员一挂载
+  // 就连打 pending-review / settle/history / broker 三条注定 403 的请求，noteForbidden 当场
+  // 把整页判成"无权限"并停轮询——那正是 §0929GATE-403 花一整批消灭的形态。
+  // 判据仍然单点：两条都只在 perm.js 里读显式位，页面不碰 localStorage 角色。
+  function liveReadsAllowed() {
+    return canLiveTrading()
+  }
+
+  // startAdminReads 拉起本页全部实盘只读链路：首轮取数 + 60s 兜底轮询 + SSE 事件即时刷新。
   // 幂等：先 stopPolling 再重建，「刷新身份并重试」重复点击不会叠出两套定时器（§M13 同族）。
   function startAdminReads() {
     stopPolling()
@@ -367,12 +380,13 @@ export default function Quant() {
     loadSettleHistory()
     loadBroker()
     loadTrades()
-    // §0926E2E-17A：订阅实盘链路 SSE 事件（后端早已对当前账号定向广播）。
-    // 回调里再核一次角色：成员会话即便收到事件也不得借回调去拉 admin 端点。
+    // §N-09：订阅实盘链路 SSE 事件（后端早已对当前账号定向广播）。
+    // §MULTI-ACCT-B 批5：这里换成 liveReadsAllowed——quant_trade 成员的事件只刷新自己的
+    // 状态/委托/流水；待核对那一腿在自己的 loader 里按 adminReadsAllowed 早退，不会漏发。
     sseQmtUnsub.current = sseOn(
       ['qmt_report', 'real_order', 'qmt_halt', 'settlement_diff', 'positions_clear_guard'],
       () => {
-        if (pollingDeadRef.current || !adminReadsAllowed()) return // §M13/§0929GATE-403
+        if (pollingDeadRef.current || !liveReadsAllowed()) return // §M13/§0929GATE-403
         loadState(); loadOrders(); loadPendingReview(); loadTrades()
       },
     )
@@ -382,19 +396,22 @@ export default function Quant() {
     })
   }
 
-  // retryAsAdmin 「刷新身份并重试」：向服务器重新确认角色（缓存可能是旧值），升管理员即拉起取数链。
-  // 这里刻意不"乐观地点亮页面"——只有 /api/auth/me 真回 admin 才解除预过滤。
+  // retryAsAdmin 「刷新身份并重试」：向服务器重新确认权限位（缓存可能是旧值），命中即拉起取数链。
+  // 这里刻意不"乐观地点亮页面"——只有 /api/auth/me 真回相应权限位才解除预过滤。
   async function retryAsAdmin() {
     if (retryBusy) return
     setRetryBusy(true)
     try {
       const me = await api.refreshMe()
-      if (me && Array.isArray(me.perms) && me.perms.includes('trading_admin')) {
+      // §MULTI-ACCT-B 批5：判定从"含 trading_admin"换成"含实盘读位之一（trading_admin 或
+      // quant_trade）"，与挂载入口 liveReadsAllowed 同一判据源（perm.js），不在这里各抄一份。
+      const perms = (me && Array.isArray(me.perms)) ? me.perms : []
+      if (perms.some((p) => LIVE_TRAADING_PERMS.indexOf(p) >= 0)) {
         setForbidden(false)
         startAdminReads()
-        MessagePlugin.success('身份已刷新为管理员，正在加载实盘数据')
+        MessagePlugin.success('身份已刷新，正在加载实盘数据')
       } else {
-        MessagePlugin.warning('服务器确认当前账号仍为普通用户，实盘数据不开放')
+        MessagePlugin.warning('服务器确认当前账号无实盘权限，实盘数据不开放')
       }
     } catch (e) {
       MessagePlugin.error('身份刷新失败：' + (e && e.message ? e.message : e))
@@ -523,6 +540,9 @@ export default function Quant() {
     }
     // §F-5 风控闸口状态（非 admin/无实盘账本时后端 403/503，静默降级不显示卡片）
     // §M13：其中 403 不再"静默"——它是权限判定信号，必须参与停轮询；503 等其他错误仍降级。
+    // §MULTI-ACCT-B 批5：/api/risk/gates 属运营面（风险闸配置读数），本批没对 quant_trade 开放，
+    // 因此这一步整段跳过——不跳过就会在链尾发一条注定 403 的请求，把刚进来的成员整页打回无权限面板。
+    if (!adminReadsAllowed()) return
     try {
       const g = await api.fetchRiskGates()
       if (pollingDeadRef.current) return // §M-6：链尾响应落地时已失效则不再回写 state
@@ -608,6 +628,9 @@ export default function Quant() {
 
   // §QMT-DUAL 拉取网关 active 通道与双路径在线态（broker/xt_connected/queued_connected）
   async function loadBroker() {
+    // §MULTI-ACCT-B 批5：GET /api/qmt/broker 是**通道态**（active/xt/queued），属运营面，
+    // 本批没对 quant_trade 开放——早退，不发注定 403 的请求。
+    if (!adminReadsAllowed()) return
     try { setBroker(await api.fetchQMTBroker()) } catch (e) { noteForbidden(e) } // §M13 同上
   }
 
@@ -635,6 +658,9 @@ export default function Quant() {
   // 拉取收盘对账读数（§FIX-20261028-F06）。403 走无权限面板；502/503 记可见错误。
   // 注意：读失败与 available:false 必须分开——前者是"读不到"，后者是"还没产出"。
   async function loadCloseRecon() {
+    // §MULTI-ACCT-B 批5：GET /api/qmt/close-snapshot（收盘对账读数）**不在**放行的 11 条里
+    // （它是收盘人工对账的一部分），按 adminReadsAllowed 早退。
+    if (!adminReadsAllowed()) return
     try {
       const r = await api.fetchCloseSnapshot()
       setCloseRecon(r || null)
@@ -704,6 +730,9 @@ export default function Quant() {
   // 其余失败（502 网关读失败 / 503 未接入）记入 pendingReviewError——**可见的失败态**，
   // 绝不清空清单冒充「没有待核对单」（清单为空是有资金安全含义的断言）。
   async function loadPendingReview() {
+    // §MULTI-ACCT-B 批5：GET /api/qmt/pending-review **不在**放行的 11 条里（人工改判属运营），
+    // 早退而不是发出去吃 403——轮询与 SSE 都经过这里，一处守卫覆盖全部触发源（§0929GATE-403 同族）。
+    if (!adminReadsAllowed()) return
     // §P2-I：待核对清单是资金安全断言（清单为空＝"没有在途悬单"），旧轮次迟到把已改判完的
     // 一条又画回来，会让人重走一次人工改判；故同样纳入后到丢弃。
     const token = pendingGuard.begin()
@@ -769,6 +798,8 @@ export default function Quant() {
 
   // 对账历史（最近差异快照）
   async function loadSettleHistory() {
+    // §MULTI-ACCT-B 批5：GET /api/qmt/settle/history（交割单三方对账历史）属运营面，早退。
+    if (!adminReadsAllowed()) return
     try {
       const h = await api.fetchQMTSettleHistory()
       if (h && Array.isArray(h.diffs)) setSettle((s) => ({ ...(s || {}), history: h.diffs }))
@@ -918,10 +949,13 @@ export default function Quant() {
     // 这两条挂在 authMiddleware 下（成员同样可读），因此**不参与** §0929GATE-403 的预过滤。
     api.fetchShortStatus().then((r) => { if (!pollingDeadRef.current) setShortEnabled(!!r.short_enabled) }).catch((e) => { noteForbidden(e) })
     api.fetchPaperState().then((r) => { if (!pollingDeadRef.current) setShortPoolOn(!!(r.short_book && r.short_book.enabled)) }).catch((e) => { noteForbidden(e) })
-    // §0929GATE-403：admin-only 只读链路按角色决定是否拉起（成员直接落无权限面板，零请求）。
+    // §0929GATE-403：只读链路按权限位决定是否拉起（零权限位成员直接落无权限面板，零请求）。
     // 判据只有这一个入口（startAdminReads），不在定时器回调里各写一份——两处判据分叉
     // 就是"有时加载有时不加载"的哑故障形态。
-    if (adminReadsAllowed()) {
+    // §MULTI-ACCT-B 批5：入口判据从 adminReadsAllowed 换成 liveReadsAllowed（含 quant_trade）；
+    // 运营专属的三条腿（待核对/对账历史/通道态）在各自 loader 内按 adminReadsAllowed 再早退，
+    // 所以"进得来页"与"看得见运营面"是两道独立闸，不是一句 isAdmin。
+    if (liveReadsAllowed()) {
       startAdminReads()
     } else {
       setForbidden(true)
@@ -946,6 +980,12 @@ export default function Quant() {
   // 灰化≠删除：入口尺寸原样保留（读面板照常），只是按已锤实的 403 证据禁用并给出 tooltip 原因；
   // 管理员会话 forbidden 恒 false，一切行为与改前逐字节一致。
   const ADMIN_ONLY_HINT = '仅管理员可操作：当前账号对这些端点无权限（403）'
+  // §MULTI-ACCT-B 批5：operatorOnly＝只持 quant_trade（进得了页，但运营专属面不适用）。
+  // forbidden 与 operatorOnly 的区别必须留着不能合并：前者是"整页无权限"（隐藏数据、灰化全页），
+  // 后者只灰化**通道切换**这一类运营动作——本页的其余写口（保存配置/紧急停止/撤自己的单）
+  // 正是本批后端放行给 quant_trade 的，灰化它们等于把新位做成哑权限。
+  const operatorOnly = !adminReadsAllowed()
+  const operatorHint = '仅交易管理（trading_admin）可操作：当前账号的量化交易权限不含通道切换'
   const forbiddenHintProps = forbidden
     ? { disabled: true, title: ADMIN_ONLY_HINT, style: { opacity: 0.5, cursor: 'not-allowed' } }
     : {}
@@ -1414,7 +1454,10 @@ export default function Quant() {
         </>)}
         {row('下行探测', probe)}
         {row('上行回报', report)}
-        {row('执行路径', path)}
+        {/* §MULTI-ACCT-B 批5：整行（双通道在线态 + 切换按钮）只在 trading_admin 下渲染——
+            GET/POST /api/qmt/broker 都不在本批放行的 11 条里，只持 quant_trade 时 broker 恒为
+            空读数；画一对"○○ + 当前 miniQMT兼容"是在**编造**通道状态，宁可不显示。 */}
+        {!operatorOnly && row('执行路径', path)}
       </Card>
     )
   }
@@ -1513,7 +1556,11 @@ export default function Quant() {
             三态严格分开：失败（可见）／尚未产出（available:false）／读数在。
             任何一态都不允许渲染成 "orders=0"——"没读/没产出"与"0 笔"是两件事。 */}
         <div style={{ fontSize: 11, marginTop: 10, paddingTop: 8, borderTop: '1px solid var(--app-border-2, #e5e6eb)', color: 'var(--app-text-2)' }}>
-          {closeReconErr ? (
+          {/* §MULTI-ACCT-B 批5：只持 quant_trade 时 loader 直接早退（closeRecon 恒 null），
+              若仍走 !closeRecon 分支就永远显示"读取中…"——那是**冒充在读**。这一态单独点名。 */}
+          {operatorOnly ? (
+            <span>收盘对账：当前权限（量化交易）不含该读数</span>
+          ) : closeReconErr ? (
             <span style={{ color: 'var(--td-warning-color)' }}>⚠ 收盘对账：{closeReconErr}</span>
           ) : !closeRecon ? (
             <span>收盘对账：读取中…</span>
@@ -1674,8 +1721,10 @@ export default function Quant() {
       {/* §U-2 当日委托卡：撤单按钮的宿主（order_id 数据源） */}
       {renderOrdersCard()}
 
-      {/* §0925EVE-W3-G 待核对委托卡：第三态人工改判入口（网关 /admin/* 的产品化出口） */}
-      {renderPendingReviewCard()}
+      {/* §0925EVE-W3-G 待核对委托卡：第三态人工改判入口（网关 /admin/* 的产品化出口）。
+          §MULTI-ACCT-B 批5：人工改判不在 quant_trade 权限内（清单与 order-confirm 都锁在
+          trading_admin），整卡隐藏而不是画一个"加载中"的空壳——loader 已按位早退，永远等不到值。 */}
+      {!operatorOnly && renderPendingReviewCard()}
 
       {/* 总开关与执行方式卡片：实盘开关、执行模式、委托价格、自动卖出等配置 */}
       <Card title="总开关与执行方式" style={{ marginBottom: 14 }}>
@@ -1821,8 +1870,9 @@ export default function Quant() {
         onCloseTarget={() => setAmendTarget(null)} onChanged={loadTrades}
         canQuery={adminReadsAllowed()} />
 
-      {/* §U-2/§WS-B 日终结算对账卡（三方比对 + 差异历史） */}
-      {renderSettleCard()}
+      {/* §U-2/§WS-B 日终结算对账卡（三方比对 + 差异历史）。
+          §MULTI-ACCT-B 批5：/api/qmt/settle* 属运营面（对券商交割单动账本口径），不随 quant_trade 开放。 */}
+      {!operatorOnly && renderSettleCard()}
         </Tabs.TabPanel>
 
         <Tabs.TabPanel value="t" label="T 仓" destroyOnHide>

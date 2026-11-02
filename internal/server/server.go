@@ -726,8 +726,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/config/concept/status", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleConceptStatus))
 	s.mux.HandleFunc("GET /api/config/regime", s.authMiddleware(s.handleGetRegimeConfig))
 	s.mux.HandleFunc("POST /api/config/regime", s.authMiddleware(s.handleSetRegimeConfig))
-	s.mux.HandleFunc("GET /api/config/qmt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleGetQMTConfig))
-	s.mux.HandleFunc("POST /api/config/qmt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleSetQMTConfig))
+	s.mux.HandleFunc("GET /api/config/qmt", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleGetQMTConfig))
+	s.mux.HandleFunc("POST /api/config/qmt", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleSetQMTConfig))
 	// §SUBSCRIPTION-A（2026-11-01 裁决 4/12）runtime 段行情开关的读写面：覆盖率阈值、量纲系数、
 	// 热点池上限、主源档都要能在后台改（改完热更，不必改文件重启）。权限走 config_admin——
 	// 这批键管的是"行情从哪来、多旧能用"，不管资金动作；放 trading_admin 会让运维面越扩越宽。
@@ -751,10 +751,12 @@ func (s *Server) registerRoutes() {
 	// 实盘账本读账号私有文件（server 不依赖 engine，损坏如实报 corrupt）。
 	// English: read-only §DYN-T surface — paper book from the engine, live book from its file.
 	s.mux.HandleFunc("GET /api/paper/t-rounds", s.authMiddleware(s.handlePaperTRounds))
-	s.mux.HandleFunc("GET /api/t-live/rounds", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleLiveTRounds))
+	s.mux.HandleFunc("GET /api/t-live/rounds", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleLiveTRounds))
 	// §FUNDS-TODAY（2026-10-28）当日「信号仓 / T 仓」资金一帧：实盘取引擎写下的 funds 帧，
 	// 纸面取 TargetReadout；两者都 day-keyed，新交易日首帧前返回 pending（今日尚未定权）。
-	s.mux.HandleFunc("GET /api/funds/today", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFundsToday))
+	// §MULTI-ACCT-B 批5：这条读面按请求者取账（handler 内部 requestUserID 过滤），
+	// 所以 quant_trade 与 funds_admin 任一即可——它读不到别人的钱。
+	s.mux.HandleFunc("GET /api/funds/today", s.strictAnyPermsMiddleware(auth.PermFundsAdmin, auth.PermQuantTrade)(s.handleFundsToday))
 	// §DYN-SIZE v4 目标仓位一帧读数（§8.8 面板展示的唯一出口，全部由账本引擎按下单同式算出）。
 	s.mux.HandleFunc("GET /api/paper/target", s.authMiddleware(s.handlePaperTargetReadout))
 	// §SIGNAL_CONTROLLER 模拟盘战法开关（白名单语义与实盘 /api/config/qmt.strategies 同构）：
@@ -795,7 +797,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/minute", s.authMiddleware(s.handleFixMinute))
 	s.mux.HandleFunc("GET /api/signals", s.authMiddleware(s.handleFixSignals))
 	// §DECISION-TODAY（2026-10-28）今日动态仓位计算过程（只读；被拦/未下单也返回）。
-	s.mux.HandleFunc("GET /api/signals/decisions", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleSignalDecisions))
+	// §MULTI-ACCT-B 批5：handler 按 userIDFor(r) 取**自己账号**的决策快照，故 quant_trade 可放行。
+	s.mux.HandleFunc("GET /api/signals/decisions", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleSignalDecisions))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
 	s.mux.HandleFunc("GET /api/engine_health", s.authMiddleware(s.handleFixEngineHealth))
 	// 消息中心：列表对所有登录用户可读（运营数据系统级共享）；清空/删除为写操作，仅管理员可操作。
@@ -860,18 +863,28 @@ func (s *Server) registerRoutes() {
 	// 堵住"任意登录用户看同一份实盘持仓/临时账号触发真实下单"的越权面）。
 	// English: §GAP1.8/1.10 — real-book endpoints are admin-only (single live account owned by the
 	// admin), closing the any-user-reads-real-positions / temp-account-fires-orders surface.
-	s.mux.HandleFunc("GET /api/positions/real", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRealPositions))
+	// §MULTI-ACCT-B 批5（2026-11-02）量化交易权限位 quant_trade：
+	// 下面这组「自己的实盘读面 + 自己的实盘动作」由 strictPermMiddleware(trading_admin)
+	// 换成 strictAnyPermsMiddleware(trading_admin, quant_trade)（funds/today 那一枚配的是
+	// funds_admin，同批换成 funds_admin 或 quant_trade）。
+	// **不变量：路由条数一条不减、handler 一个不动，只换中间件**——
+	// 运营账号（持 trading_admin）的可达面与此前逐字节一致，区别只在于成员号凭 quant_trade
+	// 也能进自己那一本账。勘误/通道切换/人工改判/结算/风险闸/advice/execute/跨账号
+	// 仍锁在 trading_admin（或 user_admin+trading_admin），见下方未改的那几条。
+	s.mux.HandleFunc("GET /api/positions/real", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleRealPositions))
 	s.mux.HandleFunc("GET /api/positions/advice", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRealAdvice))
 	s.mux.HandleFunc("POST /api/positions/execute", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleExecuteAction))
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
-	// QMT 实盘状态/成交：运营数据系统级共享，仅管理员可读（子账号无量化交易权限）。
-	s.mux.HandleFunc("GET /api/qmt/state", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTState))
-	s.mux.HandleFunc("GET /api/qmt/trades", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTTrades))
-	// §U-2 当日委托列表（撤单 UI 的 order_id 来源，admin 权限）
-	s.mux.HandleFunc("GET /api/qmt/orders", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTOrders))
-	// §R4-1 kill-switch 与手动撤单（admin 权限：紧急停止/撤单属资损级操作）
-	s.mux.HandleFunc("POST /api/qmt/halt", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTHalt))
-	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTCancel))
+	// QMT 实盘状态/成交：§MULTI-ACCT-B 批5 起 quant_trade 也能读**自己账号**的这两本账
+	// （handler 全按 userIDFor(r) 过滤，跨账号视图仍只有运营侧的 trading_admin 拿得到）。
+	s.mux.HandleFunc("GET /api/qmt/state", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTState))
+	s.mux.HandleFunc("GET /api/qmt/trades", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTTrades))
+	// §U-2 当日委托列表（撤单 UI 的 order_id 来源）
+	s.mux.HandleFunc("GET /api/qmt/orders", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTOrders))
+	// §R4-1 kill-switch 与手动撤单：资损级动作，但**作用域只有当前登录账号**
+	// （halted 落账号级配置、撤单走该账号自己的控制器），所以 quant_trade 与 trading_admin 同级放行。
+	s.mux.HandleFunc("POST /api/qmt/halt", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTHalt))
+	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTCancel))
 	// §QMT-DUAL：网关 active 通道（miniqmt=xt / qmt=queued）读取与切换（仅 admin）
 	s.mux.HandleFunc("GET /api/qmt/broker", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTBroker))
 	s.mux.HandleFunc("POST /api/qmt/broker", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTBrokerSwitch))
@@ -1818,6 +1831,43 @@ func (s *Server) strictAllPermsMiddleware(perms ...string) func(http.HandlerFunc
 				}
 			}
 			next(w, r)
+		})
+	}
+}
+
+// strictAnyPermsMiddleware 要求**任一**显式权限位命中（§MULTI-ACCT-B 批5，2026-11-02）。
+//
+// 为什么要有"any"这一档：quant_trade（「量化交易」）的语义是"只看见、只动**自己的**实盘账"，
+// 而 trading_admin 是运营级的大权限（含勘误/通道切换/人工改判/结算/风险闸）。
+// 朋友账号拿到 quant_trade 之后**不该**再被迫申请 trading_admin——那等于把一个只能管自己账的
+// 人升级成能改别人账的人；这批就是把 11 条"自己的实盘读面 + 自己的实盘动作"路由改成
+// 「trading_admin 或 quant_trade 之一」。
+//
+// 为什么**不**改成按 role 放行：本仓的权限模型是"role 不授予任何能力"（§F-6 已把注册面的
+// adminMiddleware 清零，见 perm_surface_test.go I1），退回角色级会让第二个 admin 零权限位
+// 也能进实盘面，正是上一批辛苦收口掉的那颗雷。所以只加"任一显式位"，判定仍走 HasExplicitPerm。
+//
+// 拒绝时的日志必须点名**这一次尝试要求的全部位**——运维排障看到的是一条 403，
+// 如果只打第一个位，会误判成"缺 trading_admin"，而真实缺口可能是两个位都没有。
+//
+// English: explicit "any of these bits" gate (no role bypass), used to open the self-scoped
+// live-trading surface to quant_trade as an alternative to trading_admin.
+func (s *Server) strictAnyPermsMiddleware(perms ...string) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+			user := userFromContext(r)
+			if user != nil {
+				for _, perm := range perms {
+					if user.HasExplicitPerm(perm) {
+						next(w, r)
+						return
+					}
+				}
+			}
+			opslog.Logf("quant", "严格权限拒绝 uid=%s perms=%s %s %s",
+				userIDFor(r), strings.Join(perms, "|"), r.Method, r.URL.Path)
+			writeError(w, http.StatusForbidden, "no permission: "+strings.Join(perms, "|"))
+			return
 		})
 	}
 }

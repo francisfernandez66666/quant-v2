@@ -147,6 +147,18 @@ func DefaultAlertRules() []AlertRule {
 		// 天天弹窗会把人训练成忽略真告警；它该出现在日汇总里（连续几天就说明出厂开的多源腿
 		// 其实一直没生效），而不是和"钱被挡住"共用一个通道。For=900s：盘中偶发一次退避不算事。
 		{Name: "market_data_stale", Metric: "sizing_blind_state", Op: "ge", Threshold: 2, For: "900s", Level: "p2", Message: "大盘指数读数长期来自后备腿或 last-known-good（值=2）：点位仍真实，但主链在退，查 push2/镜像可达性与熔断明细 /api/status.data_source_breakers"},
+		// HB-8 远端执行腿失联（§FRIEND-LEG，2026-11-02）：朋友机器上的 QMT+网关那条执行腿。
+		// 为什么要单独一条（而不是靠 uplink_stale / breaker_open）：远端腿最坏的形态是
+		// 「它还在往上报成交与持仓（上行数字看着完全新、breaker 也不熔），而下行指令已经送不到」
+		// ——上行那两条告警看的都是"有没有回报"，恰好都被这形态喂得好好的。
+		// 量规 friend_leg_state 由 engine/scoring_loop.go refreshStalenessGauges 在盘中每 30s 喂，
+		// 取**全部账号控制器里的最坏档**（SetGauge 无标签，进程级只有一个数）；
+		// 赋值点是 trading.Controller.FriendLegState()，纯读、不发 HTTP。
+		// 规则用 ge 2 ⇒ 0（这台机器上没有远端腿，运营单机部署恒此档）与 1（远端腿可达）都在阈值下，
+		// 启动到首轮探测之间那几秒的 2 由 For=300s 吃掉，不假红。
+		// For=300s：那台机器重启客户端/瞬时断 overlay 都在一两分钟内自愈，与 broker_feed_unavailable
+		// 同口径给恢复窗。本条**只是读数**：不许在这里动下单判定、熔断语义或 /health.ok（owner 边界）。
+		{Name: "friend_leg_unavailable", Metric: "friend_leg_state", Op: "ge", Threshold: 2, For: "300s", Level: "p2", Message: "远端执行腿（朋友机器上的 QMT+网关）异常（值=2 腿连不上→查那台机器是否开机、QMT/网关进程是否起了、overlay 链路是否通；值=3 钥匙已撤但未触达→该账号当日不再推新单，按 RUNBOOK 手动停腿清待发，钱还在对面手上）：本读数只报不断，下单侧仍由熔断器与 kill-switch 各自说话"},
 	}
 }
 

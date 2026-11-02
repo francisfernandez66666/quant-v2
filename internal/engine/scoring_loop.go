@@ -1379,6 +1379,24 @@ func (e *Engine) refreshStalenessGauges() {
 	}
 	metrics.SetGauge("sizing_blind_state", blindCode)
 
+	// §FRIEND-LEG（2026-11-02）远端执行腿可达性量规：0 不是远端腿 / 1 可达 / 2 不可达 / 3 撤销未触达。
+	// 同一条盘中纪律（与 feed_broker_state / sizing_blind_state 同源）——非交易日与非盘中一律写 0：
+	// 那台机器晚上关机、周末不开 QMT、长假整段空闲都是**正常态**，全天候写值就是每天一条假故障。
+	// 取的是**全账号最坏档**（e.WorstFriendLegState 经注册表聚合，见 registry.worstFriendLegState）：
+	// SetGauge 没有标签，进程级只有一个数，各引擎各写各的会把坏腿盖成好腿。
+	// 0 的含义写死在这里：**"这台机器上没有任何远端腿"**——运营那台单机部署（remote_leg 键从没
+	// 配过）恒 0，因此本批上线后现网一个配置都不改时这条规则永不报红（equals-legacy 的读数面）。
+	// 本腿只是读数：不碰降级账本字段（st.Degrade 那一族）、不碰健康线 ok 判定、不碰熔断语义、
+	// 不碰下单判定（owner 边界，§OBS-GUARD / §STARVE-STALE 同规）。
+	// English: §FRIEND-LEG remote-execution-leg reachability gauge, sampled only during the session
+	// and always the worst code across accounts (the gauge is label-free). 0 means "this machine has
+	// no remote leg at all", so today's single-machine deployment never turns red.
+	friendLeg := int64(0)
+	if data.IsTradingDay(time.Now()) && data.IsContinuousTrade(time.Now()) {
+		friendLeg = e.WorstFriendLegState()
+	}
+	metrics.SetGauge("friend_leg_state", friendLeg)
+
 	uplinkAge := int64(0)
 	// QMTController/Snapshot 各自取锁，且本函数在 scoreCycle 顶部调用时 e.mu 已释放，无重入死锁。
 	if c := e.QMTController(); c != nil {

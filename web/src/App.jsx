@@ -34,7 +34,7 @@ const APP_BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMI
 
 import Dashboard from './pages/Dashboard.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
-import { canStrict } from './utils/perm.js'
+import { canStrict, canLiveTrading } from './utils/perm.js'
 
 // §R4-10 路由级代码分割：除首屏落地页 Dashboard 外，其余页面全部 React.lazy 按需加载，
 // Vite 自动按页面拆 chunk——首屏 bundle 只含外壳+Dashboard，进入对应路由时才拉取该页代码
@@ -129,6 +129,10 @@ export default function App() {
   const [canAdmin, setCanAdmin] = useState(false)
   const [canUserAdmin, setCanUserAdmin] = useState(false)
   const [canTrading, setCanTrading] = useState(false)
+  // §MULTI-ACCT-B 批5（2026-11-02）：canTrading 继续只认 trading_admin（设置页/执行风控属运营面），
+  // 「量化交易」入口另判 canLiveTrading()（trading_admin 或 quant_trade）——
+  // 两条若合成一条，quant_trade 的成员会连「设置」都能看到，而那一页背后全是运营端点。
+  const [canLiveTrade, setCanLiveTrade] = useState(false)
   const [canConfig, setCanConfig] = useState(false)
   const [canOps, setCanOps] = useState(false)
   // §A5（20260918 审计批）服务端权威角色对账完成位：ProtectedRoute 在其为 false 前不放行
@@ -178,6 +182,8 @@ export default function App() {
     setCanAdmin(api.isAdmin())
     setCanUserAdmin(canStrict('user_admin'))
     setCanTrading(canStrict('trading_admin'))
+    // §MULTI-ACCT-B 批5：量化页入口按「实盘可读」判据放行（含 quant_trade），判据单点在 perm.js。
+    setCanLiveTrade(canLiveTrading())
     setCanConfig(canStrict('config_admin'))
     setCanOps(canStrict('ops_admin'))
   }
@@ -520,7 +526,9 @@ export default function App() {
     { to: '/emotion', icon: <ChartLineIcon size="18px" />, label: '情绪回看' },
     { to: '/msgcenter', icon: <NotificationIcon size="18px" />, label: '消息', badge: alertCount },
     { to: '/positions', icon: <WalletIcon size="18px" />, label: '持仓' },
-    canTrading ? { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' } : null,
+    // §MULTI-ACCT-B 批5：入口改按 canLiveTrade（trading_admin 或 quant_trade）——
+    // 只有 quant_trade 的成员现在能进量化页看**自己的**实盘账；设置页入口不变（仍要运营位）。
+    canLiveTrade ? { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' } : null,
     // §PAPER-CFG-DESYNC：管理员即使模拟盘当前关闭也保留入口——启用开关在本页「⚙ 设置」内，
     // 只按 enabled 隐藏会让关掉后无法再打开。
     shouldShowPaperTab(paperEnabled, canAdmin)
@@ -730,8 +738,11 @@ export default function App() {
                      * 持仓页：实盘持仓管理 */}
                     <Route path="/positions" element={<Positions />} />
                     {/*
-                     * 量化交易页：策略运行与调仓入口 */}
-                    <Route path="/quant" element={<ProtectedRoute strictPerm="trading_admin" checked={meChecked}><Quant /></ProtectedRoute>} />
+                     * 量化交易页：策略运行与调仓入口
+                     * §MULTI-ACCT-B 批5：守卫从 strictPerm="trading_admin" 换成 strictAny
+                     * （trading_admin 或 quant_trade）——后者只能进**自己账号**的实盘读面与动作，
+                     * 页面内运营专属的面板（待核对/结算/通道切换/勘误）另按 trading_admin 隐藏。 */}
+                    <Route path="/quant" element={<ProtectedRoute strictAny={['trading_admin', 'quant_trade']} checked={meChecked}><Quant /></ProtectedRoute>} />
                     {/*
                      * 热点页：热点板块/评分排名/宏观日历/IPO/资讯 */}
                     <Route path="/hotspot" element={<Hotspot />} />
