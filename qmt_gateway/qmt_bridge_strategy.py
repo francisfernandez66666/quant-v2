@@ -1949,8 +1949,91 @@ def _close_recon_morning_alert():
            "(the next-morning snapshot only back-fills positions)" % (day, pending, pending))
 
 
+_QCAP_DONE = False
+
+
+def probe_quote_capability(ContextInfo):
+    """R3 step-1 (2026-11-02): capability probe for the in-process market-data surface.
+
+    Why this exists: the broker L1 quote feed (rules.runtime.qmt_feed_*) reads ticks through
+    xtdata running in the *gateway* process, and on this machine there is no quote service to
+    connect to (xtconn.scan_available_server_addr() returns [], 127.0.0.1:58610 is closed, and
+    the broker disabled XtMiniQmt on 2026-09-23). XtItClient's own port 58600 accepts the
+    xtquant handshake but has no getFullTick handler (ErrorID 200005). So the only remaining
+    place that can still see broker quotes is *inside* the client, i.e. here.
+
+    This function only proves that. It is log-only: no orders, no state change, no report, and
+    nothing downstream reads its output. It runs at most once per process, and every call shape
+    is individually guarded, because a strategy that throws on load costs us the trading link.
+
+    Kept pure ASCII on purpose: the file header says `#encoding:gbk` and the deployed copy is
+    byte-for-byte ASCII. A single CJK byte can make the client's GBK decode fail and take the
+    whole strategy down -- that is an outage, not a style preference.
+
+    English: proves whether the model-strategy ContextInfo can reach quote data at all, which is
+    the make-or-break premise of the bridge-fed quote leg. Read-only, once per process.
+    """
+    global _QCAP_DONE
+    if _QCAP_DONE:
+        return
+    _QCAP_DONE = True
+    try:
+        names = sorted([a for a in dir(ContextInfo) if any(
+            k in a.lower() for k in ("tick", "market", "quote", "full_tick"))])
+        _trace("qcap surface=%s" % (",".join(names)[:400] if names else "NONE"))
+    except Exception as e:
+        _trace("qcap surface fail: " + repr(e)[:160])
+        return
+    codes = ["600588.SH", "001258.SZ", "600000.SH", "600519.SH"]
+    for api in ("get_full_tick", "get_last_tick", "get_market_data_ex", "get_market_data"):
+        if api not in names:
+            _trace("qcap api=%s result=ABSENT" % api)
+            continue
+        try:
+            fn = getattr(ContextInfo, api)
+        except Exception as e:
+            _trace("qcap api=%s result=BIND_FAIL err=%s" % (api, repr(e)[:140]))
+            continue
+        res = None
+        try:
+            try:
+                res = fn(codes)
+            except TypeError:
+                # The *_ex family needs a field/period signature; try the documented shape last,
+                # so a wrong-arity guess never hides the fact that the API itself is callable.
+                res = fn([], codes, period="1m", count=1)
+        except Exception as e:
+            _trace("qcap api=%s result=CALL_FAIL err=%s" % (api, repr(e)[:160]))
+            continue
+        try:
+            if isinstance(res, dict):
+                keys = list(res.keys())[:6]
+                one = res[keys[0]] if keys else None
+                _trace("qcap api=%s result=OK n=%d keys=%s sample_keys=%s" % (
+                    api, len(res), ",".join(str(k) for k in keys),
+                    ",".join(sorted([str(x) for x in (one.keys() if hasattr(one, "keys") else [])]))[:260]))
+                if hasattr(one, "get"):
+                    lp = one.get("lastPrice")
+                    vol = one.get("volume")
+                    amt = one.get("amount")
+                    tt = one.get("time")
+                    try:
+                        ratio = (float(amt) / (float(lp) * float(vol))) if (lp and vol and amt) else -1
+                        # vol_ratio ~1 means volume is in shares, ~100 means it is in lots. This is
+                        # the reading qmt_feed_volume_to_shares is supposed to be pinned with; a
+                        # wrong unit here silently skews VWAP by 100x, so it is printed, not guessed.
+                        _trace("qcap api=%s price=%s vol=%s amount=%s tick_time=%s vol_ratio=%.4f" % (
+                            api, lp, vol, amt, tt, ratio))
+                    except Exception as e:
+                        _trace("qcap api=%s ratio fail: %s" % (api, repr(e)[:120]))
+            else:
+                _trace("qcap api=%s result=OK type=%s" % (api, type(res).__name__))
+        except Exception as e:
+            _trace("qcap api=%s result=OK but shape unread: %s" % (api, repr(e)[:140]))
+
+
 def init(ContextInfo):
-    """QMT strategy init: inject ContextInfo into the adapter and probe the session."""
+    """QMT strategy init: inject ContextInfo into the probe and probe the session."""
     _trace("init called (handlebar-tick mode)")
     _mark_main_thread()
     try:
@@ -1961,6 +2044,11 @@ def init(ContextInfo):
         _xt().probe_embed()
     except Exception as e:
         _trace("probe error: " + repr(e))
+    # R3 step-1: prove the in-process quote surface before we build a bridge-fed quote leg.
+    try:
+        probe_quote_capability(ContextInfo)
+    except Exception as e:
+        _trace("qcap error: " + repr(e)[:160])
     # CLOSE-RECON (2026-10-28, retimed 2026-10-29): the 15:01 probe is fired from
     # _close_recon_due() inside handlebar, NOT from a QMT timer callback. The timed
     # registration is what the 10-29 outage was traced to (no handlebar dispatch at all
