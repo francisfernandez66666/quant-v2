@@ -207,7 +207,7 @@ GET	/api/metrics	运维 curl	internal/metrics/metrics.go:2:经 /api/metrics（�
 GET	/api/metrics/alerts	运维 curl	internal/server/metrics_handler.go:21:handleAlertState	阈值告警状态机读数（规则来自 metrics.DefaultAlertRules）：运维 curl 观察；页面告警卡走 /api/alerts 系
 GET	/api/metrics/prometheus	运维 curl	internal/server/metrics_handler.go:11:handlePrometheusMetrics	Prometheus text 导出（§WS-L 维5，promtool 可校验）：给外部抓取器/人工 curl，本仓无面板也无抓取配置
 POST	/api/news/test-attribution	运维 curl	scripts/verify_deploy_guangzhou.sh:20:/api/news/test-attribution	发版探针按「未鉴权必 401」拨它做收权复核（§M-14）；Stage2 手动试跑口保留给 admin 排障，会烧 LLM 配额
-POST	/api/notify-test	无 UI 待补	internal/server/server.go:853:handleFixNotifyTest	§C9 把空 stub 升级成逐通道实弹探测：前端零调用，但删了就没有人工验证 ntfy/极光通道的入口（§N-2 已收权 admin）
+POST	/api/notify-test	无 UI 待补	internal/server/handlers_fix.go:3101:handleFixNotifyTest	§C9 把空 stub 升级成逐通道实弹探测：前端零调用，但删了就没有人工验证 ntfy/极光通道的入口（§N-2 已收权 admin）
 POST	/api/paper/short_open	无 UI 待补	internal/server/server.go:778:handlePaperShortOpen	做空开仓缺页面入口（买回 /api/paper/short_cover 已有调用点）＝功能未完，不是死码，保留后端尺寸
 GET	/api/positions	运维 curl	scripts/monitor_test.sh:308:"/api/positions" 200	监控脚本每轮读大盘持仓做存活+响应体抽检（持仓页本身走 /api/holdings 系，§E-1 对账已记）
 POST	/api/positions	运维 curl	scripts/monitor_test.sh:369:"/api/positions" 201	监控脚本建仓腿：造一条测试持仓再平掉，验证运营账本写路径整条通

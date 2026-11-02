@@ -17732,10 +17732,10 @@ grep -qF 'func TestControllerCashScope' internal/trading/cash_scope_test.go || f
 
 # —— ④ 严格路由矩阵（计数是当前实现的派生值；改路线必须同批改这里） ——
 CNT144=$((CNT144 + 1))
-N144=$(grep -cF 'strictPermMiddleware(auth.PermFundsAdmin' internal/server/server.go || true)
+N144=$(grep -cE 'strict(All)?Perm(s)?Middleware\(auth\.PermFundsAdmin|strictAnyPermsMiddleware\(auth\.PermFundsAdmin' internal/server/server.go || true)
 [ "$N144" -eq 19 ] || fail144 "funds_admin 严格路由应为 19，实得 $N144"
 CNT144=$((CNT144 + 1))
-N144=$(grep -cF 'strictPermMiddleware(auth.PermTradingAdmin' internal/server/server.go || true)
+N144=$(grep -cE 'strict(All)?Perm(s)?Middleware\(auth\.PermTradingAdmin|strictAnyPermsMiddleware\(auth\.PermTradingAdmin' internal/server/server.go || true)
 [ "$N144" -eq 27 ] || fail144 "trading_admin 严格路由应为 27，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server.go || true)
@@ -17775,11 +17775,18 @@ grep -qF "canStrict('trading_admin')" web/src/pages/Quant.jsx || fail144 "量化
 CNT144=$((CNT144 + 1))
 grep -qF "canStrict('user_admin')" web/src/pages/Admin.jsx || fail144 "用户管理页未按 user_admin 收敛"
 CNT144=$((CNT144 + 1))
-grep -qF "canStrict('funds_admin')" web/src/components/FundsOverviewCard.jsx || fail144 "FundsOverviewCard 未按 funds_admin 收敛"
+# 共现锁（不是数据流证明）：文件既要点名这一枚权限位，又要真的调用严格权限判据；
+# 上一版把判据写成"canStrictAny\(['funds_admin'…]"的单行形状，遇到"权限数组提到常量里"就假红。
+grep -qE "'funds_admin'" web/src/components/FundsOverviewCard.jsx \
+	&& grep -qE "canStrict(Any)?\(|canLive[A-Za-z]*\(" web/src/components/FundsOverviewCard.jsx \
+	|| fail144 "FundsOverviewCard 缺 funds_admin 判据（要么没点名权限位，要么根本没调严格权限函数＝无判据渲染）"
 CNT144=$((CNT144 + 1))
 grep -qF "canStrict('trading_admin')" web/src/components/ExecutionRiskPanel.jsx || fail144 "ExecutionRiskPanel 未按 trading_admin 收敛"
 CNT144=$((CNT144 + 1))
-grep -qF "canStrict('trading_admin')" web/src/pages/Dashboard.jsx || fail144 "Dashboard QMT 卡未按 trading_admin 收敛"
+grep -qE "canStrict(Any)?\(|canLiveTrading\(" web/src/pages/Dashboard.jsx \
+	|| fail144 "Dashboard QMT 卡没调任何严格权限判据（判据可以封装进 utils/perm.js，但不能不调）"
+grep -qE "trading_admin" web/src/utils/perm.js \
+	|| fail144 "perm.js 的实盘判据定义里没有 trading_admin（封装可以，摘掉条件不行——这条守的是"页面还在调、定义却被掏空"）"
 CNT144=$((CNT144 + 1))
 grep -qF 'strictPerm="user_admin"' web/src/App.jsx || fail144 "用户管理路由缺 strictPerm=user_admin"
 grep -qF 'strictPerm="trading_admin"' web/src/App.jsx || fail144 "量化路由缺 strictPerm=trading_admin"
@@ -19888,7 +19895,7 @@ grep_q 'PermQuantTrade' SEG170A F || fail170 "AllPerms() 没含 quant_trade（�
 # 且管道里 grep 无匹配会让赋值命令替换在非零码下把 set -e 的整段静默带走（§89 那把 || true 的同族坑）。
 N170_MISS=""
 for tok in PermResearchApprove PermFundsAdmin PermTradingAdmin PermUserAdmin PermConfigAdmin PermOpsAdmin PermQuantTrade; do
-	printf '%s\n' "$SEG170A" | grep -qF "$tok," || N170_MISS="${N170_MISS} ${tok}"
+	grep_q "$tok," SEG170A F || N170_MISS="${N170_MISS} ${tok}"
 done
 [ -z "$N170_MISS" ] || fail170 "AllPerms 列表缺：${N170_MISS}"
 CNT170=$((CNT170 + 1))
