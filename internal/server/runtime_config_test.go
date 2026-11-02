@@ -181,3 +181,59 @@ func toString(v any) string {
 	}
 	return ""
 }
+
+// TestRuntimeConfigIndexKeys §INDEX-BLIND（2026-11-02）三枚指数键的写面契约。
+//
+// 三条各对一个真实形状：
+//
+//	① 出厂态必须下发**生效值 true**（指针位原样下发会在前端变 null，开关看起来像坏了——
+//	   §161 那条负锁就是为这个立的，这里把它行为化）；
+//	② 稀疏 merge：只发一枚，其余两枚必须原样留着（把没传的键折成 false＝悄悄关掉出厂开）；
+//	③ 段序读数跟着开关走：关掉降级链时 index_legs_actual 只剩东财——
+//	   卡面不许自己列一份，否则两处会漂成"卡上说三条、实际试两条"。
+func TestRuntimeConfigIndexKeys(t *testing.T) {
+	s, admin, _ := newRuntimeTestServer(t)
+	got := runtimeGet(t, s, admin)
+	for _, k := range []string{"index_fallback_sources", "index_breaker_scope", "quote_feed_index_enabled"} {
+		if got[k] != true {
+			t.Fatalf("出厂态 %s 应为 true（缺键=开），got %v", k, got[k])
+		}
+	}
+	legs, _ := got["index_legs"].([]any)
+	if len(legs) != 3 || legs[0] != "eastmoney" {
+		t.Fatalf("段序应三条且东财在前, got %v", got["index_legs"])
+	}
+	hot, _ := got["hot_keys"].([]any)
+	var inHot bool
+	for _, h := range hot {
+		if h == "index_fallback_sources" {
+			inHot = true
+		}
+	}
+	if !inHot {
+		t.Fatalf("降级链键没进 hot_keys（保存即生效的键必须点名，前端不许自己猜）：%v", hot)
+	}
+
+	// 只发一枚 ⇒ changed 只能有这一枚，另两枚保持 true
+	code, body := runtimePost(t, s, admin, `{"index_fallback_sources":false}`)
+	if code != http.StatusOK {
+		t.Fatalf("保存失败 → %d body=%v", code, body)
+	}
+	changed, _ := body["changed"].([]any)
+	if len(changed) != 1 || changed[0] != "index_fallback_sources" {
+		t.Fatalf("审计只应点名被改的那一枚, got %v", body["changed"])
+	}
+	after := runtimeGet(t, s, admin)
+	if after["index_fallback_sources"] != false {
+		t.Fatalf("降级链没落盘, got %v", after["index_fallback_sources"])
+	}
+	for _, k := range []string{"index_breaker_scope", "quote_feed_index_enabled"} {
+		if after[k] != true {
+			t.Fatalf("没发过的键被折成 false 了：%s=%v（稀疏 merge 不许覆盖出厂开）", k, after[k])
+		}
+	}
+	actual, _ := after["index_legs_actual"].([]any)
+	if len(actual) != 1 || actual[0] != "eastmoney" {
+		t.Fatalf("关掉降级链后实际段序应只剩东财, got %v", after["index_legs_actual"])
+	}
+}

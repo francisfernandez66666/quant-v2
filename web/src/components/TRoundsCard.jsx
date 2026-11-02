@@ -14,6 +14,7 @@
 // corrupt rather than as "no rounds today".
 import React, { useEffect, useMemo, useState } from 'react'
 import { Card, Table, Tag, Tabs } from 'tdesign-react'
+import BlindTag from './BlindTag.jsx'
 import * as api from '../api/index.js'
 
 // 终态配色：done＝配对完成（唯一计收益的态）；converted＝未回补转战略减仓（仓位主动变更）；
@@ -310,9 +311,8 @@ export default function TRoundsCard({ defaultTab = 'paper' }) {
               <span>目标 {fmtNum(paperView.extra.target.target)} / 当前 {fmtNum(paperView.extra.target.cur_strat)} / 剩余 {fmtNum(paperView.extra.target.room)}</span>
               <span>T 额度 {fmtNum(paperView.extra.target.t_quota)} · 可用 T 现金 {fmtNum(paperView.extra.target.cash_t)}</span>
               <span>反T冻结 {fmtNum(paperView.extra.target.frozen_cash)}</span>
-              {paperView.extra.target.missing_key_input && (
-                <Tag size="small" theme="danger">关键读数缺失：目标封顶半仓且今日不做 T</Tag>
-              )}
+              {/* §INDEX-BLIND：三态标签（盲区点名维度 / 兜底中报来源 / 健康不渲染） */}
+              <BlindTag readout={paperView.extra.target} />
             </div>
           )}
           {tab === 'paper' && dayStats && (

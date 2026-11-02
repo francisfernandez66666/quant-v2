@@ -42,6 +42,12 @@ type runtimeConfigPatch struct {
 	QuotePerCodeSource    *bool    `json:"quote_per_code_source"`
 	QuoteHubConsult       *bool    `json:"quote_hub_consult"`
 	QMTFeedIntervalSec    *int     `json:"qmt_feed_interval_sec"`
+	// §INDEX-BLIND（2026-11-02）大盘指数三枚键。都是"缺键=开"的指针位（feedOn 语义），
+	// 这里必须继续用指针而不是裸 bool：裸 bool 的 false 会被 merge 当成"用户显式关了"，
+	// 一进卡点保存就把出厂开悄悄改掉——那正是行情四键出厂开时锁过的事故形状。
+	IndexFallbackSources  *bool `json:"index_fallback_sources"`
+	IndexBreakerScope     *bool `json:"index_breaker_scope"`
+	QuoteFeedIndexEnabled *bool `json:"quote_feed_index_enabled"`
 }
 
 // runtimeConfigView 下发"原始值 + 生效值"两栏。
@@ -65,10 +71,24 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		// 咨询链取价是否优先走 hub：同为指针位，出厂态＝开，必须下发生效值，
 		// 直接给 rt.QuoteHubConsult 会让前端在"没填过"时收到 null，开关看起来像坏了。
 		"quote_hub_consult": rt.QuoteHubConsultOn(),
+		// §INDEX-BLIND 三枚键一律下发**生效值**（指针位原样下发会让"没配过"在前端变成 null，
+		// 开关看起来像坏了——§161 那条出厂开语义的等值锁就是为这个形状立的）。
+		"index_fallback_sources":   rt.IndexFallbackSourcesOn(),
+		"index_breaker_scope":      rt.IndexBreakerScopeOn(),
+		"quote_feed_index_enabled": rt.QuoteFeedIndexOn(),
+		// 实际会依次试谁（真源 config.IndexFallbackOrder，卡面不许自己列一份）：
+		// 现场要能一眼回答"东财断了现在谁给点位"，而不是让人推算开关系没开。
+		"index_legs":        config.IndexFallbackOrder(),
+		"index_legs_actual": indexLegsActual(rt),
 		// hot_keys 明示哪些键保存即生效，其余按 restart_required 处理（前端据此提示，不靠人记）
 		"hot_keys": []string{"qmt_feed_primary", "qmt_feed_coverage_min_pct", "qmt_feed_volume_to_shares", "monitor_pool_hot_max",
 			// 逐票源标记也走热更：它只改快照里的字段，不改任何价格，开与关都不影响在途判定
-			"quote_per_code_source", "quote_hub_consult"},
+			"quote_per_code_source", "quote_hub_consult",
+			// §INDEX-BLIND：降级链与熔断域都是"每次请求现读"，不需要重启
+			"index_fallback_sources", "index_breaker_scope",
+			// 券商侧指数白名单走 feed 的策略装配（SetFeedPolicy 即热更），同样不需重启；
+			// 现网这条通道此刻不通，按下也不产生价格影响——但键必须可回显，否则"上了没人知道"。
+			"quote_feed_index_enabled"},
 		"restart_required": restart,
 	}
 	// 行情通道现状一并回显：设置页要能回答"现在到底连着没有、覆盖率多少"，
@@ -93,6 +113,16 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		view["feed_state"] = "not_wired" // 采集器未注入（测试/降级装配）：如实说，不折成 ok
 	}
 	return view
+}
+
+// indexLegsActual 本轮**实际**会试的段序（受 index_fallback_sources 控制）。
+// 与 index_legs（出厂全集）分两栏是给值班的人看的：开关关掉时"卡上列三条、实际只试一条"
+// 这种分家必须当场可见，而不是等出事再推算。
+func indexLegsActual(rt config.RuntimeConfig) []string {
+	if rt.IndexFallbackSourcesOn() {
+		return config.IndexFallbackOrder()
+	}
+	return []string{data.IndexSourceEastMoney}
 }
 
 // handleGetRuntimeConfig GET /api/config/runtime（config_admin）。
@@ -176,6 +206,16 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 	if req.QMTFeedIntervalSec != nil {
 		rt.QMTFeedIntervalSec = *req.QMTFeedIntervalSec
 	}
+	// §INDEX-BLIND 三枚指数键（同样只在"请求里出现过"时才写，稀疏 merge）
+	if req.IndexFallbackSources != nil {
+		rt.IndexFallbackSources = req.IndexFallbackSources
+	}
+	if req.IndexBreakerScope != nil {
+		rt.IndexBreakerScope = req.IndexBreakerScope
+	}
+	if req.QuoteFeedIndexEnabled != nil {
+		rt.QuoteFeedIndexEnabled = req.QuoteFeedIndexEnabled
+	}
 	if err := s.cfg.SetRuntimeConfig(&rt); err != nil {
 		// 未落盘就不审计"已变更"（否则审计变成假账），并如实回 500
 		writeError(w, 500, "runtime 配置保存失败（未落盘）: "+err.Error())
@@ -185,7 +225,7 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 
 	// 审计要回答的是"这次到底动了哪几个键"，所以逐键判"指针是否非 nil"（=请求里出现没出现），
 	// 而不是把整段配置打进去：后者会把没改的键也写成"变更"，审计立刻退化成噪声。
-	changed := make([]string, 0, 6)
+	changed := make([]string, 0, 11)
 	for _, kv := range []struct {
 		name string
 		set  bool
@@ -198,6 +238,9 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 		{"quote_per_code_source", req.QuotePerCodeSource != nil},
 		{"quote_hub_consult", req.QuoteHubConsult != nil},
 		{"qmt_feed_interval_sec", req.QMTFeedIntervalSec != nil},
+		{"index_fallback_sources", req.IndexFallbackSources != nil},
+		{"index_breaker_scope", req.IndexBreakerScope != nil},
+		{"quote_feed_index_enabled", req.QuoteFeedIndexEnabled != nil},
 	} {
 		if kv.set {
 			changed = append(changed, kv.name)
@@ -213,6 +256,16 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 			logSwitchChange(uid, *req.QMTFeedPrimary)
 		}
 	}
+	// §INDEX-BLIND：指数降级链与独立熔断域同样热更（每次取数现读，不需重启）。
+	// 走 Coordinator 这一个口注入——与启动装配同一个方法，两处各写一套就会漂。
+	if req.IndexFallbackSources != nil || req.IndexBreakerScope != nil {
+		submittedFallback := req.IndexFallbackSources != nil
+		submittedScope := req.IndexBreakerScope != nil
+		opslog.Logf("quant", "§INDEX-BLIND 指数开关热更（本次提交 降级链=%v 熔断域=%v）生效值：降级链=%s 独立熔断域=%s 段序=%v 操作者=%s",
+			submittedFallback, submittedScope, switchStateOf(rt.IndexFallbackSourcesOn()), switchStateOf(rt.IndexBreakerScopeOn()),
+			indexLegsActual(rt), uid)
+		s.dc.SetIndexSourcePolicy(rt.IndexFallbackSourcesOn(), rt.IndexBreakerScopeOn())
+	}
 	resp := s.runtimeConfigView()
 	resp["status"] = "ok"
 	resp["changed"] = changed
@@ -227,6 +280,15 @@ func logSwitchChange(uid string, on bool) {
 		state = "开启（券商 L1 开始改写行情快照）"
 	}
 	opslog.Logf("quant", "§SUBSCRIPTION-A qmt_feed_primary=%s 操作者=%s", state, uid)
+}
+
+// switchStateOf 把开关生效值打成 enabled/disabled（与启动清单同一口径：
+// 日志是给值班的人看的，"true" 说的是配置，"enabled" 说的是行为）。
+func switchStateOf(on bool) string {
+	if on {
+		return "enabled"
+	}
+	return "disabled"
 }
 
 // 编译期确保 auth 被引用（路由权限位在 server.go 注册处使用，这里只作文档性引用）

@@ -140,6 +140,20 @@ type MarketAPI struct {
 	// 这里的实时读数只服务"当日涨跌幅"这一件事，回退窗口同为 indexLKGMaxAge）。
 	idxLiveMu  sync.Mutex
 	idxLiveLKG *idxLiveLKGEntry
+	// §INDEX-BLIND（2026-11-02）两枚指数开关，**按"是否被显式关掉"存**（零值＝出厂开）：
+	// 测试与老装配点用 `&data.MarketAPI{}` 构造，存"开"的裸 bool 零值会变成关＝
+	// "没装配"静默等同于"功能被关掉"，正是本仓反复踩的那类形状。写入点只有 SetIndexSourcePolicy。
+	// English: negation-stored switches so a zero-value MarketAPI stays factory-on.
+	idxSwitchMu sync.Mutex
+	idxLiveOff  bool // true＝显式关掉新浪/腾讯两段兜底
+	idxScopeOff bool // true＝指数回到与个股共享熔断名额（今天的形态）
+	// idxLiveLastSrc 上一次成功给出指数量读数的来源：只在**来源换了**时打一行日志。
+	// 每轮都打＝盘中 30s 一条刷屏；一条都不打＝"现在到底是谁在给点位"没有现场答案
+	// （11-02 那次只能靠时间线反推，就是这个缺口花掉的时间）。
+	idxLiveLastSrc string
+	// idxBrokerSrc §A7-3 券商侧指数点位的注入来源（nil=没装配，指数腿直接跳过这一段）。
+	// 用闭包而不是持 *Fetcher：data 里 Fetcher 已指向 MarketAPI，反向再握一次成环，且测试无法替换。
+	idxBrokerSrc func(code string) (*IndexLiveQuote, bool)
 	// 日线斜率当日成功值：同一天内失败轮次回退它，跨日才允许重新变 NaN。
 	idxMAMu  sync.Mutex
 	idxMADay string
@@ -387,6 +401,12 @@ func (m *MarketAPI) emRecord(scope string, err error) {
 	b := m.emBreakers[scope]
 	if b == nil {
 		b = &emBreaker{}
+		if m.emBreakers == nil {
+			// 零值 MarketAPI（`&MarketAPI{}`，测试与老装配点会这样构造）没有这张表：
+			// 读 nil map 不 panic、**写** nil map 才 panic——第一次东财失败就会打死进程。
+			// 这里自愈建表（与 §OBS-GUARD 那批"两张缓存等值自愈赋值"同一条纪律）。
+			m.emBreakers = make(map[string]*emBreaker)
+		}
 		m.emBreakers[scope] = b
 	}
 	if err == nil {
@@ -495,14 +515,25 @@ func emFailoverURLs(raw string) []string {
 // geo-blocking / anti-crawler filters, wrapped with the single-point circuit breaker so callers
 // can fast-fail during outages; on primary-host failure it degrades to the mirror host.
 func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) {
+	return m.getWithHeadersScoped(url, referer, "")
+}
+
+// getWithHeadersScoped 与 getWithHeaders 同一条链，只是允许把这一格请求归入**独立熔断域**。
+// §INDEX-BLIND（2026-11-02）：指数量与个股实时价同 host 同 path `/api/qt/stock/get`，
+// 而 scope=host+path ⇒ 个股每轮几百次的连败会把指数这条腿一起 fast-fail 掉
+// （现网 14:33:11 的错误原文即 `circuit-breaker open (push2delay.eastmoney.com/api/qt/stock/get)`）。
+// suffix 传 "#index" 即另起一格；传空串＝今天的共享名额（开关关掉时的回滚位）。
+// English: same chain with an optional breaker-scope suffix, so per-stock failures no longer burn
+// the index leg's quota.
+func (m *MarketAPI) getWithHeadersScoped(url, referer, scopeSuffix string) (*http.Response, error) {
 	cands := emFailoverURLs(url)
 	var lastErr error
 	for i, cand := range cands {
-		// 熔断 scope = 主机 + 路径：主机维度隔离保证"主域名熔断不吃掉镜像的取数机会"，
+		// 熔断 scope = 主机 + 路径（+ 可选域后缀）：主机维度隔离保证"主域名熔断不吃掉镜像的取数机会"，
 		// 路径维度隔离沿用既有语义（单接口故障不拖垮其他接口）。
 		scope := cand
 		if u, perr := urlpkg.Parse(cand); perr == nil {
-			scope = u.Host + u.Path
+			scope = u.Host + u.Path + scopeSuffix
 		}
 		// 熔断窗口内直接快速失败，触发上层既有降级/缓存路径，不发起网络请求。
 		if !m.emAllow(scope) {
@@ -2562,6 +2593,9 @@ type IndexLiveQuote struct {
 	ChangePct float64
 	At        time.Time
 	Stale     bool
+	// Source 这一份点位是谁给的（eastmoney|sina|tencent）。§INDEX-BLIND 补的现场读数：
+	// 处置方向取决于"哪条腿断了"，而 LKG 回退时它回答的是"这份陈旧值当初是谁给的"。
+	Source string
 }
 
 // idxLiveLKG 指数实时读数的 last-known-good（主链失败的回退窗口见 indexLKGMaxAge）。
@@ -2582,43 +2616,33 @@ func (m *MarketAPI) GetIndexLiveQuote(code string) (*IndexLiveQuote, error) {
 	if strings.TrimSpace(code) == "" {
 		code = "000001"
 	}
-	sid := indexSecID(code)
-	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f60,f58", sid)
-	EastMoneyLimiter.Wait()
-	var q IndexLiveQuote
-	err := func() error {
-		resp, err := m.getWithHeaders(url, emReferer)
-		if err != nil {
-			return fmt.Errorf("eastmoney index-live http: %w", err)
+	// §INDEX-BLIND（2026-11-02）本函数从"东财单点 + 一层 LKG"变成**编排器**：
+	// 段序东财 →（开关开时）新浪 → 腾讯，每段产同构的 IndexLiveQuote 并自带 Source。
+	// 三条不可让步的形状：
+	//  1. 只要有一段给出**成立**的读数（点位与昨收都为正）就立刻刷 LKG 并返回——
+	//     11-02 那次是东财一族连败 10 分钟过窗，整机没有任何一条腿可试，直接判盲区封顶半仓；
+	//  2. 全段失败才回退 LKG（≤ indexLKGMaxAge），且 Source 保留"这份陈旧值当初是谁给的"，不写成 lkg
+	//     （处置方向要看是谁断，不是看有没有兜住）；
+	//  3. 连 LKG 都没有才返回错误——上层据此判"关键读数缺失"，这条 fail-closed 取向没被放宽。
+	var fails []string
+	for _, leg := range m.indexLegs() {
+		q, err := leg.Fetch(code)
+		if err == nil && q != nil && q.Price > 0 && q.PrevClose > 0 {
+			m.idxLiveMu.Lock()
+			m.idxLiveLKG = &idxLiveLKGEntry{q: *q, at: q.At}
+			prev := m.idxLiveLastSrc
+			m.idxLiveLastSrc = q.Source
+			m.idxLiveMu.Unlock()
+			// 只在来源真的换了时出声（每轮都打＝盘中 30s 一条刷屏；从不打＝"现在谁在给点位"没现场答案）。
+			if prev != "" && prev != q.Source {
+				log.Printf("[market] §BUG-INDEX 指数实时来源切换：%s → %s（点位 %.2f %.2f%%）", prev, q.Source, q.Price, q.ChangePct)
+			}
+			return q, nil
 		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("eastmoney index-live read: %w", err)
+		if err == nil {
+			err = fmt.Errorf("读数不成立（点位 %.2f 昨收 %.2f）", q.Price, q.PrevClose)
 		}
-		var raw struct {
-			Data struct {
-				F43 float64 `json:"f43"` // 最新点位（原始值 ×100）
-				F60 float64 `json:"f60"` // 昨收（原始值 ×100）
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(body, &raw); err != nil {
-			return fmt.Errorf("eastmoney index-live json: %w", err)
-		}
-		if raw.Data.F43 <= 0 || raw.Data.F60 <= 0 {
-			return fmt.Errorf("eastmoney index-live: 点位/昨收不可得（f43=%.0f f60=%.0f）", raw.Data.F43, raw.Data.F60)
-		}
-		q.Price = raw.Data.F43 / 100
-		q.PrevClose = raw.Data.F60 / 100
-		q.ChangePct = (q.Price - q.PrevClose) / q.PrevClose * 100
-		q.At = time.Now()
-		return nil
-	}()
-	if err == nil {
-		m.idxLiveMu.Lock()
-		m.idxLiveLKG = &idxLiveLKGEntry{q: q, at: q.At}
-		m.idxLiveMu.Unlock()
-		return &q, nil
+		fails = append(fails, leg.Name+": "+err.Error())
 	}
 	m.idxLiveMu.Lock()
 	lkg := m.idxLiveLKG
@@ -2626,11 +2650,15 @@ func (m *MarketAPI) GetIndexLiveQuote(code string) (*IndexLiveQuote, error) {
 	if lkg != nil && time.Since(lkg.at) <= indexLKGMaxAge {
 		stale := lkg.q
 		stale.Stale = true
-		log.Printf("[market] §BUG-INDEX 指数实时主链失败，回退 %v 前的 last-known-good（点位 %.2f %.2f%%）: %v",
-			time.Since(lkg.at).Round(time.Second), stale.Price, stale.ChangePct, err)
+		log.Printf("[market] §BUG-INDEX 指数实时全段失败，回退 %v 前的 last-known-good（%s 给的，点位 %.2f %.2f%%）：%s",
+			time.Since(lkg.at).Round(time.Second), stale.Source, stale.Price, stale.ChangePct, strings.Join(fails, " | "))
 		return &stale, nil
 	}
-	return nil, err
+	// 走到这里就是"三条腿全断且没有可回退的真实旧值"——今天以前这条路径**一行日志都不打**，
+	// 于是现网只看得见"回退中"的尾巴，缺了哪一维只能靠时间线反推（本批补的就是这一行）。
+	log.Printf("[market] §BUG-INDEX 指数实时全段失败且无可用 last-known-good（窗口 %v 已过）：%s",
+		indexLKGMaxAge, strings.Join(fails, " | "))
+	return nil, fmt.Errorf("index live: 全部 %d 段不可用（%s）", len(fails), strings.Join(fails, "; "))
 }
 
 // ── 资金流向 ──

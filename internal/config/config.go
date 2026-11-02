@@ -326,6 +326,33 @@ type RuntimeConfig struct {
 	// English: snapshot-first for consult and watchlist price filling; factory-on (absent key = on).
 	// Explicit false keeps today's per-question upstream fetch as the rollback position.
 	QuoteHubConsult *bool `json:"quote_hub_consult,omitempty"`
+	// IndexFallbackSources §INDEX-BLIND（2026-11-02 owner 裁决「出厂即开」）：大盘指数实时不再只吃东财一族，
+	// 主链失败后依次试新浪、腾讯的**指数专用**腿（指数字段位次与个股逐位相同，但市场前缀必须独立判定）。
+	// 成因是现网读数，不是设想：11-02 东财 push2/push2delay 对这台机器间歇 TLS 重置（EOF），
+	// 而指数量只有东财一条腿 + 10 分钟 last-known-good ⇒ 14:36 起 IndexChangePct=NaN，
+	// 目标仓位封顶半仓、当天不做 T，全天 545/859 条决策快照在盲区态；同机实测新浪与腾讯的指数接口都 200。
+	// 指针位：缺键=开（与行情四键同语义，回滚＝设置页拨回关闭，不必回退发版）。
+	// English: multi-source live index readings (EastMoney first, then Sina and Tencent via an
+	// index-only code prefix); factory-on. Without it a transient EastMoney outage silently caps the
+	// target position at half and disables intraday T for the whole day.
+	IndexFallbackSources *bool `json:"index_fallback_sources,omitempty"`
+	// IndexBreakerScope §INDEX-BLIND（owner 裁决 1）：指数请求走**独立熔断域**。
+	// 东财熔断的 scope 是 host+path（getWithHeaders），而指数 URL 与个股实时价同 host 同 path
+	// `/api/qt/stock/get` ⇒ 个股那几百次/轮的连败会把指数这条腿一起 fast-fail 掉
+	// （11-02 14:33:11 现网错误原文就是 circuit-breaker open (.../api/qt/stock/get): fast-fail (cooldown)）。
+	// 指针位：缺键=开；关掉＝回到今天共享名额的形态。
+	// English: give live-index requests their own breaker scope so per-stock failures no longer burn the
+	// index leg's quota; factory-on, explicit false restores the shared-counter behavior.
+	IndexBreakerScope *bool `json:"index_breaker_scope,omitempty"`
+	// QuoteFeedIndexEnabled §A7-3（owner 裁决 4：白名单与用例先写、开关打开，等 QMT 行情服务起来）：
+	// 券商 L1 侧按**独立指数后缀白名单**取上证指数点位，与个股后缀函数（000001→.SZ＝平安银行）彻底分家。
+	// 现网这条通道此刻不通（/quotes 回 ticks:{}、xtdata_connect=FAIL），所以本开关**今天不产生任何价格影响**；
+	// 它先到位是为了等 QMT 起来那天能当场判读，而不是再补一轮施工。
+	// 指针位：缺键=开；指数 tick 只走独立通道，**不进监控池、不进覆盖率分母、不进混源账**。
+	// English: broker-side (QMT L1) index quotes via an index-only suffix whitelist, kept off the
+	// monitor pool so it never dilutes the coverage denominator; factory-on but inert until the
+	// broker's quote service is reachable (measured blocked on 2026-11-02).
+	QuoteFeedIndexEnabled *bool `json:"quote_feed_index_enabled,omitempty"`
 	// MonitorPoolHotMax §SUBSCRIPTION-A（owner 裁决 12）：券商为主源时的热点监控池上限。
 	// 缺省 0 → 出厂 400；降级档（现行链当家时）仍是既有常数 60——扩容只在券商这条本地通道扛得住
 	// 的时候发生，退回外部源就收回，因为新浪是 80 只一片、池越大后备链请求越多。
@@ -364,11 +391,13 @@ func (r RuntimeConfig) ReviewOn() bool { return r.ReviewEnabled == nil || *r.Rev
 // 每个消费点被解释成不同含义（0 到底是"关"还是"默认值"），而这类歧义正是静默失效的入口。
 
 // FeedCoverageDefault 券商 feed 覆盖率的出厂阈值（owner 裁决 4：先按 80%）。
-// ── §SUBSCRIPTION-A（2026-11-01 owner 改判"券商信息源默认开"）四个开关的生效读数 ──
+// ── §SUBSCRIPTION-A（2026-11-01 owner 改判"券商信息源默认开"）开关的生效读数 ──
 // 用指针位而不是裸 bool：照 OrderStatePullCloseMissing 的先例——**缺键=开、显式 false=关**。
 // 为什么不能用裸 bool：裸 bool 零值是 false，那要么让「没配过的老配置」整个关掉（达不到默认开），
 // 要么逼每个消费点自己写"零值当 true"（零值歧义正是本仓静默失效的老根）。
 // 显式关掉仍然有效：回滚只需把设置页那一个开关拨回关闭，不必回退发版。
+// §INDEX-BLIND（2026-11-02 owner 裁决「出厂即开」）新增的三枚指数键共用同一个 feedOn，
+// 因此这一条纪律**同批扩到七枚**：行情四键 + 降级链 + 独立熔断域 + 券商侧指数白名单。
 // English: pointer switches — absent keys mean ON, an explicit false means OFF, so rollback is a
 // config flip rather than a redeploy.
 func feedOn(v *bool) bool { return v == nil || *v }
@@ -384,6 +413,20 @@ func (r RuntimeConfig) QuotePerCodeSourceOn() bool { return feedOn(r.QuotePerCod
 
 // QuoteHubConsultOn 咨询与自选价是否走快照优先（缺省开）。
 func (r RuntimeConfig) QuoteHubConsultOn() bool { return feedOn(r.QuoteHubConsult) }
+
+// IndexFallbackSourcesOn 指数实时是否允许多源兜底（缺省开，§INDEX-BLIND）。
+func (r RuntimeConfig) IndexFallbackSourcesOn() bool { return feedOn(r.IndexFallbackSources) }
+
+// IndexBreakerScopeOn 指数请求是否走独立熔断域（缺省开，§INDEX-BLIND）。
+func (r RuntimeConfig) IndexBreakerScopeOn() bool { return feedOn(r.IndexBreakerScope) }
+
+// QuoteFeedIndexOn 券商 L1 侧是否请求指数点位（缺省开，§A7-3；通道不通时不产生价格影响）。
+func (r RuntimeConfig) QuoteFeedIndexOn() bool { return feedOn(r.QuoteFeedIndexEnabled) }
+
+// IndexFallbackOrder 指数降级链的段序（读面与装配共用的单点口径）。
+// 为什么把顺序写进 config 而不是散在 data 层：设置卡要如实回显「现在会依次试谁」，
+// 而两处各列一份就会漂成「卡上说三条、实际只试两条」——那是本批要防的同一族静默。
+func IndexFallbackOrder() []string { return []string{"eastmoney", "sina", "tencent"} }
 
 const FeedCoverageDefault = 80
 

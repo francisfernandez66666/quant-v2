@@ -14,7 +14,7 @@ import (
 // B1：池现金不足 ⇒ 回调必须收到 skipped（带原因、Qty=0），不是静默丢弃。
 func TestDecisionRecordOnSkip(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(1, 0.1, 0.3, 1, false)
+	pe.SetSizingContext(1, 0.1, 0.3, 1, false, nil)
 	var got []DecisionRecord
 	pe.SetDecisionRecorder(func(r DecisionRecord) { got = append(got, r) })
 
@@ -41,7 +41,7 @@ func TestDecisionRecordOnSkip(t *testing.T) {
 // B2：正常买入 ⇒ placed，且 Notional 恰等于 Qty×成交价。
 func TestDecisionRecordOnPlaced(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(1, 0.1, 0.3, 1, false)
+	pe.SetSizingContext(1, 0.1, 0.3, 1, false, nil)
 	var rec DecisionRecord
 	got := false
 	pe.SetDecisionRecorder(func(r DecisionRecord) { rec = r; got = true })
@@ -66,7 +66,7 @@ func TestDecisionRecordOnPlaced(t *testing.T) {
 // B3：回调在 e.mu 内执行，回调里不许再取锁——这里用 -race 跑 1000 次证明不会自锁。
 func TestDecisionRecordNoDeadlock(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(1, 0.1, 0.3, 1, false)
+	pe.SetSizingContext(1, 0.1, 0.3, 1, false, nil)
 	var mu sync.Mutex
 	n := 0
 	pe.SetDecisionRecorder(func(DecisionRecord) {

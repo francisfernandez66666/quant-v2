@@ -448,6 +448,12 @@ func run() int {
 		log.Printf("[main] 同花顺(新)hithink 未启用(降级链不受影响): %v", hkErr)
 	}
 	fetcher := data.NewFetcher(baseStocks, marketAPI, dc)
+	// §A7-3（owner 裁决 4「独立白名单与用例先写好、开关打开，再等 QMT 服务器」）：
+	// 把券商侧指数点位注入指数降级链的**最前一段**（owner 既有裁决是"行情以券商为准"，
+	// 本地 L1 比三条外部腿都新）。通道此刻不通（11-02 实测 /quotes 回 ticks:{}），
+	// 注入本身不产生任何价格影响：拿不到就照旧落到东财→新浪→腾讯，外部腿一字不动；
+	// QMT 行情服务起来那天不必改代码，读数自己会说话（/api/funds/today 的 index_source 变 QMT-L1）。
+	marketAPI.SetIndexBrokerSource(fetcher.HubIndexQuote)
 	// §GAP3.2/3.3 快照落盘（同日重启恢复）+ 盘中陈旧度告警
 	fetcher.SetDataDir(dataDir)
 	fetcher.LoadPersistedSnapshot(dataDir)
@@ -492,6 +498,11 @@ func run() int {
 	//     否则出厂开的结果就是永远连不上，而交易链照常（它按账号自己的 gateway_url 走）——
 	//     只有行情这条腿静默失效，正是 broker_feed_unavailable 要抓的形态。
 	rt := cfgMgr.Get().Runtime
+	// §INDEX-BLIND（2026-11-02 owner 裁决「出厂即开」）：大盘指数不再只吃东财一族——
+	// 多源兜底腿与"指数独立熔断域"两枚开关在装配期注入，设置页热更走同一个入口（handlers_runtime_config）。
+	// 两键都是 feedOn 语义（配置里没有＝开）；显式写 false 才回到今天的形态（只试东财主域+镜像、
+	// 且与个股共享 `/api/qt/stock/get` 那一格熔断名额）。成因见 internal/data/market_index.go 文件头。
+	marketAPI.SetIndexSourcePolicy(rt.IndexFallbackSourcesOn(), rt.IndexBreakerScopeOn())
 	feedURL, feedToken, credFrom := feedEndpoint(cfgMgr)
 	if rt.QMTFeedOn() && feedURL != "" {
 		intervalSec := rt.QMTFeedIntervalSec
@@ -524,9 +535,11 @@ func run() int {
 	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
 	// §高-3（2026-09-23 修复批）指标型告警出口接线。此前 internal/metrics 的评估器只
 	// `log.Printf` 一条就返回，9 条指标规则**从不出站**（R7 验收单 D1/维5 却打了 ✅，属
-	// 「声称已做」）。路由表与冷却窗在 metrics 包内自持（现 21 条规则全覆盖：必推 13 条 /
-	// 日汇总 8 条，2026-10-09 波 7 按脚本实数同步；2026-11-01 §SUBSCRIPTION-A 改判 16 加第 21 条
-	// （broker_feed_unavailable，必推 +1）时两侧同批同步。旧文案写的「6 条 / 4 条」是 §0929HB 之前
+	// 「声称已做」）。路由表与冷却窗在 metrics 包内自持（现 23 条规则全覆盖：必推 14 条 /
+	// 日汇总 9 条，2026-10-09 波 7 按脚本实数同步；2026-11-01 §SUBSCRIPTION-A 改判 16 加第 21 条
+	// （broker_feed_unavailable，必推 +1）时两侧同批同步；2026-11-02 §INDEX-BLIND owner 裁决 3
+	// 加第 22/23 条（market_data_blind 必推 +1、market_data_stale 日汇总 +1——关键读数盲区与
+	// "主链在退但点位仍真实"是两种处置，绝不能折成一句）。旧文案写的「6 条 / 4 条」是 §0929HB 之前
 	// 的世代），这里只提供出口闭包：p1→LevelHigh 走既有高优通道、其余→LevelMedium。
 	// 一律经 Push —— M8 已把 WS/Webhook/推送网关三路内聚在 Push 里，绝不再直调
 	// PushGateway，否则就是当日「双发」事故的同族复犯。

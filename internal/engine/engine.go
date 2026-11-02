@@ -122,6 +122,10 @@ type Engine struct {
 	idxQuoteDay    string           // 大盘涨跌幅读数所属交易日 YYYYMMDD
 	idxQuotePct    float64          // 大盘最近一个交易日涨跌幅 %（NaN=未取到）
 	idxQuoteAt     time.Time        // 大盘读数取数时刻（短 TTL，防每轮打上游）
+	idxQuoteSrc    string           // §INDEX-BLIND 这份点位是谁给的（eastmoney|sina|tencent；空=没取到）
+	idxQuoteStale  bool             // §INDEX-BLIND 是否为 last-known-good 回退值（陈旧但真实 ≠ 盲区）
+	blindLogKey    string           // §INDEX-BLIND 上次打 §DYN-BLIND 时的维度组合（组合变了要立刻出声）
+	blindLogAt     time.Time        // §INDEX-BLIND 上次打 §DYN-BLIND 的时刻（60s 节流，防每轮刷屏）
 	idxTrendBroken bool             // 大盘趋势破位（日级缓存，止损两态判别用）
 	idxTrendDay    string           // idxTrendBroken 的缓存交易日
 	holidayDay     string           // 节前窗口读数缓存交易日
@@ -1536,6 +1540,9 @@ type dynBudgetCtx struct {
 	StockScale  float64
 	// MissingKeyInput 数据盲区标志（目标封顶半仓，且日内 T 层整体关闭，§1.5）。
 	MissingKeyInput bool
+	// MissingKeyDims §INDEX-BLIND：与上面那枚 bool 同组的"缺了哪几维"。
+	// 构造点必须一起带（漏带＝卡片只能显示"缺失"两个字，处置方向又得靠猜）。
+	MissingKeyDims []string
 }
 
 // hasSplit 是否带了有效拆分读数。
@@ -1593,14 +1600,16 @@ type dynBuyReadout struct {
 	Qty             int
 	Notional        float64
 	MissingKeyInput bool
-	CashStale       bool
+	// MissingKeyDims §INDEX-BLIND：这一笔定权时缺的到底是哪几维（进决策快照的 reason）。
+	MissingKeyDims []string
+	CashStale      bool
 	// PendingNote §P1-1（2026-10-30）在途买单占用的一句话摘要（空=无在途）。
 	// 事故当天「受限项=target」看不出是谁占的，这条把代码/数量/状态点出来。
 	PendingNote string
 }
 
 func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64, sizingCfg config.SizingConfig, ctrl *trading.Controller, ctx dynBudgetCtx) (int, *dynBuyReadout) {
-	out := &dynBuyReadout{At: time.Now(), MissingKeyInput: ctx.MissingKeyInput}
+	out := &dynBuyReadout{At: time.Now(), MissingKeyInput: ctx.MissingKeyInput, MissingKeyDims: ctx.MissingKeyDims}
 	e.mu.RLock()
 	st := e.realStore
 	uid := e.userID
@@ -1890,9 +1899,12 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	})
 	// §DYN-TARGET 留痕：目标/当前/剩余/拆分缩放一次打全，事后能否解释"为什么只买了这些"全靠这行。
 	// 正T买腿/反T卖腿直接取 book 的两个分量（不再有 tBuyVal/tSellVal 两个局部量）。
-	log.Printf("[qmt] %s(%s) §DYN-TARGET 总资产=%.0f MS=%.3f SS=%.3f 缩放=%.3f 目标=%.0f(占比%.3f 天花板%.2f) 战略当前=%.0f 正T买腿=%.0f 反T卖腿=%.0f 剩余=%.0f 单笔基准=%.2f 影子目标占比=%.2f 缺失关键输入=%v",
+	log.Printf("[qmt] %s(%s) §DYN-TARGET 总资产=%.0f MS=%.3f SS=%.3f 缩放=%.3f 目标=%.0f(占比%.3f 天花板%.2f) 战略当前=%.0f 正T买腿=%.0f 反T卖腿=%.0f 剩余=%.0f 单笔基准=%.2f 影子目标占比=%.2f 缺失关键输入=%v%s",
 		sig.Code, sig.Name, total, marketScale, stockScale, scale, targetVal, targetPct, ceiling,
-		curStrat, book.BuyLegValue, book.SellLegValue, room, perTradePct, shadowRatio, ctx.MissingKeyInput)
+		curStrat, book.BuyLegValue, book.SellLegValue, room, perTradePct, shadowRatio, ctx.MissingKeyInput,
+		// §INDEX-BLIND：缺失时把维度一并打出来（只有 true/false 的那些年，
+		// "该去查状态机、情绪还是指数"全靠对时间线，而这行本来就是解释金额用的主留痕）。
+		paper.MissingDimsSuffix(ctx.MissingKeyDims))
 	// §B0：单笔占比的区间与生效值单独一行（区间写错时这里一眼能看出来）。
 	log.Printf("[qmt] %s(%s) §B0 单笔占比 lo=%.3f hi=%.3f eff=%.3f（MS=%.3f SS=%.3f，金额≈%.0f）",
 		sig.Code, sig.Name, perTradeLo, perTradeHi, perTradePct, marketScale, stockScale, total*perTradePct)
@@ -1959,6 +1971,17 @@ func (e *Engine) persistDynBuyDecision(sig combat_agent.Signal, d *dynBuyReadout
 	reason := d.SkipReason
 	if reason == "" && d.CappedBy != "" {
 		reason = "受限于 " + d.CappedBy
+	}
+	// §INDEX-BLIND（2026-11-02）：盲区态下「受限项/原因」必须点名缺的是哪一维。
+	// 为什么不加表列：signal_decisions 加列会牵动 schemaVersion（那是 W-05 的领地，
+	// store/schema_version_bump_test.go 有 !=2 即 Fatal 的断言锁），而这一列今天已有承载位。
+	// 现网教训：11-02 全天 545/859 行都写着同一句"已达动态目标仓位"，
+	// 看不出那 84 行其实是"因为看不见大盘而被封顶"——原因与结论混在同一句话里才是可解释的账。
+	if d.MissingKeyInput {
+		if reason != "" {
+			reason += "；"
+		}
+		reason += "关键读数缺失" + paper.MissingDimsSuffix(d.MissingKeyDims)
 	}
 	// §P1-1：被目标仓位拦住、或被其它原因跳过时，把在途买单占用一并写进「原因」——
 	// 这样信号表的「受限项/原因」不再只有一个 target，而是能点到具体代码与状态。
@@ -6734,19 +6757,24 @@ func (e *Engine) indexChangePctNow(now time.Time) (float64, string, bool) {
 	today := data.TradingDayDate(now)
 	e.mu.RLock()
 	day, pct, at := e.idxQuoteDay, e.idxQuotePct, e.idxQuoteAt
+	wasStale := e.idxQuoteStale
 	market := e.marketAPI
 	e.mu.RUnlock()
 	if day == today && !at.IsZero() && now.Sub(at) < 30*time.Second {
-		return pct, day, false
+		// 命中短窗时**如实带上这份是不是回退值**：旧实现一律报 false，于是"用 10 分钟前的
+		// 陈旧点位"这件事在 30s 窗口内被洗成新鲜读数——§INDEX-BLIND 要的就是这个区分。
+		// 注意这只是把陈旧说出来，回退窗口与覆盖语义一个字都没动（owner 裁决 2「LKG 不动」）。
+		return pct, day, wasStale
 	}
-	np, stale := math.NaN(), false
+	np, stale, nsrc := math.NaN(), false, ""
 	if market != nil {
 		if q, err := market.GetIndexLiveQuote("000001"); err == nil && q != nil {
-			np, stale = q.ChangePct, q.Stale
+			np, stale, nsrc = q.ChangePct, q.Stale, q.Source
 		}
 	}
 	e.mu.Lock()
 	e.idxQuoteDay, e.idxQuotePct, e.idxQuoteAt = today, np, now
+	e.idxQuoteSrc, e.idxQuoteStale = nsrc, stale
 	e.mu.Unlock()
 	return np, today, stale
 }

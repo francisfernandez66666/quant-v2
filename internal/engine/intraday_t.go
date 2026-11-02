@@ -352,6 +352,7 @@ func (e *Engine) tParamsFor(uid string, tc config.TConfig, shadow bool) (paper.T
 		ForceUnwindHM:           tc.TForceUnwindHM(),
 		MarketScale:             ms,
 		MissingKeyInput:         ctx.Missing,
+		MissingKeyDims:          ctx.MissingDims,
 		Shadow:                  shadow,
 		IndexChangePct:          ctx.IndexPct,
 		FeeBufferPct:            0.6,
@@ -492,7 +493,7 @@ func (e *Engine) injectPaperSizing(uid string, pe *paper.Engine) {
 	lo, hi, ceiling := e.paperSizingParams(uid)
 	// sizingContextFor 带 10s 短窗缓存，同一轮里 T 参数与本次注入拿到的是同一个 MS/盲区读数。
 	ctx := e.sizingContextFor(uid)
-	pe.SetSizingContext(ctx.MS, lo, hi, ceiling, ctx.Missing)
+	pe.SetSizingContext(ctx.MS, lo, hi, ceiling, ctx.Missing, ctx.MissingDims)
 }
 
 // wireTCallbacks 把读数回调接到引擎的真实数据源上（全部"取不到就说取不到"）。

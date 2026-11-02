@@ -20,6 +20,13 @@ const factoryView = () => ({
   qmt_feed_primary: true,
   quote_per_code_source: true,
   quote_hub_consult: true,
+  // §INDEX-BLIND（2026-11-02）三枚指数键同为出厂开：后端下发的是**生效值**（不是 null），
+  // 卡上的勾选框必须照它勾上——从本地 false 起步就是"一进卡点保存＝悄悄关掉出厂开"。
+  index_fallback_sources: true,
+  index_breaker_scope: true,
+  quote_feed_index_enabled: true,
+  index_legs: ['eastmoney', 'sina', 'tencent'],
+  index_legs_actual: ['eastmoney', 'sina', 'tencent'],
   qmt_feed_coverage_min_pct: 0,
   coverage_min_pct_effective: 80,
   qmt_feed_volume_to_shares: 0,
@@ -65,12 +72,27 @@ describe('行情通道开关卡（出厂开语义）', () => {
     api.updateRuntimeConfig.mockImplementation(updateRuntimeConfig)
   })
 
-  it('三枚开关按后端生效值勾选（缺键=true，不得从 false 起步）', async () => {
+  it('六枚勾选框按后端生效值勾选（缺键=true，不得从 false 起步）', async () => {
     render(<QuoteFeedConfigCard />)
     await waitFor(() => expect(screen.getByText(/行情通道（券商 L1）/)).toBeInTheDocument())
     const boxes = screen.getAllByRole('checkbox')
-    expect(boxes.length).toBeGreaterThanOrEqual(3)
-    expect(boxes.map((b) => b.checked)).toEqual([true, true, true])
+    // 3 枚行情勾选（主源档/逐票源/走 hub；总开关 qmt_feed_enabled 属重启类、不在本卡）
+    // + 3 枚指数勾选（§INDEX-BLIND 降级链/独立熔断域/券商侧指数）。等值而不是"至少"：
+    // 少一枚＝有键没上卡，多一枚＝有人加了勾选框却没写进这条契约。
+    expect(boxes.length).toBe(6)
+    expect(boxes.map((b) => b.checked)).toEqual([true, true, true, true, true, true])
+  })
+
+  it('指数段序按后端实际段序渲染，关掉后备腿时当场标出来', async () => {
+    // 卡上不许自己列一份段序：两处各列就会漂成"卡上说三条、实际试两条"
+    api.fetchRuntimeConfig.mockImplementation(async () => ({
+      ...factoryView(),
+      index_fallback_sources: false,
+      index_legs_actual: ['eastmoney'],
+    }))
+    render(<QuoteFeedConfigCard />)
+    await waitFor(() => expect(screen.getByText(/指数降级段序：eastmoney/)).toBeInTheDocument())
+    expect(screen.getByText(/后备腿已被关掉/)).toBeInTheDocument()
   })
 
   it('什么都没动就点保存 ⇒ 一次写请求都不发（稀疏 merge 不得把出厂开悄悄关掉）', async () => {

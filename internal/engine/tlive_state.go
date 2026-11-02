@@ -162,6 +162,16 @@ type tLiveFunds struct {
 	Room        float64 `json:"room"`         // 战略剩余空间
 	MarketScale float64 `json:"market_scale"` // 本轮市场缩放（0=尚未定权）
 	MissingKey  bool    `json:"missing_key_input"`
+	// MissingKeyDims §INDEX-BLIND（2026-11-02）：缺的到底是哪几维（机读码 market_state /
+	// emotion_phase / index_change）。只有 MissingKey 的那一天，值班的人面对的是
+	// "封顶半仓 + 不做 T"这句结论，却要自己判断该去查状态机、情绪还是指数——
+	// 而这三条的处置方向完全不同（本批就是靠对时间线才认出掉的是大盘指数）。
+	MissingKeyDims []string `json:"missing_key_dims,omitempty"`
+	// IndexSource / IndexStale 本轮点位的来源（eastmoney|sina|tencent，空=没取到）与是否回退值。
+	// 分形是刻意的：**后备腿接管**与**三条全断**不是一件事，折成一句就是让人盲操作
+	// （同 §STARVE-STALE 里 J0 与 J2 必须各有自己的文案那条）。
+	IndexSource string `json:"index_source,omitempty"`
+	IndexStale  bool   `json:"index_stale,omitempty"`
 	// §P1-1（2026-10-30）在途买单拆口径：战略当前数里到底有多少是"还挂在柜台上的买单"。
 	// 事故当天卡片只显示 cur 一个总数，操作人看不出 3.6 万是持仓还是卡单。
 	PendingBuyAmount float64 `json:"pending_buy_amount"` // 非 T 腿在途买单占用（元）

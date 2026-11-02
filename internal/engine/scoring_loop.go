@@ -1369,6 +1369,16 @@ func (e *Engine) refreshStalenessGauges() {
 	}
 	metrics.SetGauge("feed_broker_state", feedCode)
 
+	// §INDEX-BLIND（2026-11-02）关键读数盲区量规：0 不适用 / 1 齐 / 2 兜底中（后备腿或 LKG）/ 3 真盲区。
+	// 同一条盘中纪律——非交易日与非盘中一律写 0（那种时段拿不到指数是正常态，写出来就是每天一条假故障）。
+	// 判档函数是 e.blindAlertCode 单点（规则文案与用例都断同一套档），且本腿只是读数：
+	// **不许**在这里动降级链、健康线或下单判定（owner 边界，§STARVE-STALE 的 J0 同规）。
+	blindCode := int64(0)
+	if data.IsTradingDay(time.Now()) && data.IsContinuousTrade(time.Now()) {
+		blindCode = e.blindAlertCode(e.sizingContextFor(""))
+	}
+	metrics.SetGauge("sizing_blind_state", blindCode)
+
 	uplinkAge := int64(0)
 	// QMTController/Snapshot 各自取锁，且本函数在 scoreCycle 顶部调用时 e.mu 已释放，无重入死锁。
 	if c := e.QMTController(); c != nil {

@@ -133,6 +133,20 @@ func DefaultAlertRules() []AlertRule {
 		// 阈值取 gt 0 而不是"多少条才算"：休市日的正确读数只有一个值——0。For=600s 只防
 		// 一轮毛刺/重启回填竞态，不改变"任何一条都是异常"的口径。
 		{Name: "signal_pinned_on_closed_day", Metric: "signal_closed_day_pinned", Op: "gt", Threshold: 0, For: "600s", Level: "p2", Message: "休市日仍有当日新固化信号：日历判定 fail-open 或行情源仍在供数，引擎在不是交易日的那天照常扫描出信号（新信号会并进上一交易日那一桶，前端看不出来）。查 trading_calendar_loaded 是否为 0、行情源休市闸门；09-25 中秋 470→481 即此形态"},
+		// HB-6 关键市场读数盲区（§INDEX-BLIND，2026-11-02 owner 裁决 3「再加一个日汇总档」）。
+		// 成因是现网账，不是设想：11-02 大盘指数只有东财一条腿 + 10 分钟 last-known-good，
+		// 东财族 14:17 起对本机间歇 TLS 重置 ⇒ 14:36 起 IndexChangePct=NaN，目标封顶半仓、
+		// 当天不做 T，全天 545/859 条决策快照在盲区态，而**没有任何一条告警响过**
+		// （同期 broker_feed_unavailable 13:05 倒是 fire 了，说明通道是活的，缺的就是这条规则）。
+		// 判据用 ge 3：值 2（后备腿接管或吃 LKG，陈旧但真实）在阈值下——那一档该去查"谁在退"，
+		// 不是"钱被挡住了"，把它混进必推就会天天响（与 J0/J2 必须分形是同一条纪律）。
+		// For=300s：单次取数抖动与熔断 30s 冷却窗都会在一两分钟内自愈，与 quote_stale 同口径给恢复窗。
+		{Name: "market_data_blind", Metric: "sizing_blind_state", Op: "ge", Threshold: 3, For: "300s", Level: "p2", Message: "关键市场读数缺失（盲区）：目标仓位已封顶 50%、当日日内 T 整体关闭。dims 看 /api/funds/today.missing_key_dims、点位来源看 index_source——缺大盘指数先查东财族/新浪/腾讯三条腿谁断了，缺市场状态/情绪先查状态机与涨停池；不是闸门坏了，也别去翻风控"},
+		// HB-7 指数读数长期靠后备腿/陈旧值（同量规值=2，进日汇总不即时推送，owner 裁决 3）。
+		// 为什么单独一条而不是把上面那条的阈值降到 2：2 档的处置方向是"主链在退，还能交易"，
+		// 天天弹窗会把人训练成忽略真告警；它该出现在日汇总里（连续几天就说明出厂开的多源腿
+		// 其实一直没生效），而不是和"钱被挡住"共用一个通道。For=900s：盘中偶发一次退避不算事。
+		{Name: "market_data_stale", Metric: "sizing_blind_state", Op: "ge", Threshold: 2, For: "900s", Level: "p2", Message: "大盘指数读数长期来自后备腿或 last-known-good（值=2）：点位仍真实，但主链在退，查 push2/镜像可达性与熔断明细 /api/status.data_source_breakers"},
 	}
 }
 

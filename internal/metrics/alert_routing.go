@@ -126,11 +126,13 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 21 条：
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 23 条：
 // §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条、§0929HB-1/-2/-3
 // 加入三条"应有值缺失"型业务心跳、§0929HB-4 加入休市日增量型心跳＝第 19 条、
 // §P2-E（波 5）加入 settlement_not_verified＝第 20 条；§SUBSCRIPTION-A 改判 16 加入
-// broker_feed_unavailable＝第 21 条（券商行情出厂开之后的通畅自证腿，必推），
+// broker_feed_unavailable＝第 21 条（券商行情出厂开之后的通畅自证腿，必推）；
+// §INDEX-BLIND（2026-11-02 owner 裁决 3）加入 market_data_blind（第 22 条，必推）与
+// market_data_stale（第 23 条，日汇总）＝关键读数盲区两档，
 // 门禁 §106/§114 的文案与 RUNBOOK 的「业务心跳」条与 §3.7 运维卡同批同步——这段文案本身就被等值锁盯着），
 // alert_routing_test 有等值锁（路由条数 == 规则条数），漏一条即判红）。
 // English: factory routing table covering all DefaultAlertRules() entries.
@@ -187,6 +189,13 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			// 每 30 分钟一条刷满长假。而且休市日网关不下单，异常不会当场变成钱损，
 			// 属于"当天要知道、不必当天几点都知道"。与 trading_calendar_not_loaded 同路由。
 			"signal_pinned_on_closed_day": RouteDaily,
+			// —— §INDEX-BLIND（2026-11-02）关键读数盲区两档，处置方向不同所以分路由 ——
+			// market_data_blind＝真盲区（目标已封顶半仓、当日 T 整体关闭）：钱此刻正被挡住了，必推。
+			// market_data_stale＝后备腿/陈旧值在扛（点位仍真实）：属于"当天要知道、不必当天几点都知道"，
+			// 与 signal_pinned_on_closed_day / library_stale_days 同一族（持续状态走日汇总，
+			// 否则主链一退就是每 30 分钟一条，把真告警训练成噪音）。
+			"market_data_blind": RoutePush,
+			"market_data_stale": RouteDaily,
 			// —— 必推：§ADJ-BASIS-2 战法参数基线失效（不推就是"owner 永远不知道这批权重的历史依据没了"）——
 			"applied_factor_stale_basis":  RoutePush,
 			"applied_pattern_stale_basis": RoutePush, // §ADJ-BASIS-2P 形态侧同规

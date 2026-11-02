@@ -1902,7 +1902,7 @@ func (e *Engine) emitDecisionLocked(poolKey, code string, price, perTradePct, ba
 		StockRoom:       rooms.StockRoom,
 		ClusterRoom:     rooms.ClusterRoom,
 		CappedBy:        cappedBy,
-		Reason:          reason,
+		Reason:          paperBlindSuffix(reason, e.sizingCtx),
 		MissingKeyInput: missing,
 		Qty:             qty,
 		Notional:        float64(qty) * price,
@@ -1932,6 +1932,9 @@ type paperSizingCtx struct {
 	LastK      float64
 	Ceiling    float64 // 目标仓位天花板（默认 1.00）
 	MissingKey bool    // 关键市场读数缺失（目标封顶半仓、日内 T 关闭）
+	// MissingDims §INDEX-BLIND：缺的是哪几维（机读码，由 SetSizingContext 同批注入）。
+	// 与 MissingKey 同组：只带 bool 就回到「知道封顶了、不知道查谁」。
+	MissingDims []string
 	// Injected §F-3（方案甲，2026-11-01）：engine 本轮**是否真的注入过**。
 	// 为什么需要它：MarketScale 的零值与"注入了一个 0"在纸面这一侧长得一模一样，
 	// 而两者含义相反——前者是"引擎没喂"（不该收紧，也不该让用户以为有仓位上限），
@@ -1970,10 +1973,18 @@ func perTradeBandOf(ctx paperSizingCtx) (lo, hi float64) {
 // SetSizingContext 注入本轮定权上下文（engine 的纸面通道每轮调用）。
 // 刻意不持久化：它描述的是"这一轮的市场"，不是"用户的配置"。
 // lo/hi 是单笔占比的动态区间；传 0 表示该端缺失，由 perTradeBandOf 回落到出厂值（10% / 30%）。
-func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool) {
+//
+// missingDims §INDEX-BLIND（2026-11-02）新增末位参数：**为什么改签名而不是加一个可选 setter**——
+// 保留旧签名再补一个 SetSizingDims 会留下"漏调第二个赞默无息"的形状（本批的靶子恰恰是
+// "缺了一项没人知道"）；而可变参数（...[]string）同样允许漏传。加一个必传参数会逼所有调用点
+// 当场表态，包括测试——这是唯一能防漏的形态。missingKey 仍保留：它同时驱动"是否收紧额度"，
+// 语义与"清单为空"并不总是一致（比如注入了但 dims 没算出来时不许悄悄放宽）。
+// English: dims is a mandatory trailing parameter — an optional setter or variadic would both
+// allow a silent miss, which is exactly the failure class this batch is closing.
+func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims []string) {
 	e.mu.Lock()
 	e.sizingCtx = paperSizingCtx{MarketScale: ms, PerTradeLo: perTradeLo, PerTradeHi: perTradeHi,
-		Ceiling: ceiling, MissingKey: missingKey, Injected: true}
+		Ceiling: ceiling, MissingKey: missingKey, MissingDims: append([]string(nil), missingDims...), Injected: true}
 	e.mu.Unlock()
 }
 

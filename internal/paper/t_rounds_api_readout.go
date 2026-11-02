@@ -37,8 +37,11 @@ type TargetReadout struct {
 	PerTradeHi      float64 `json:"per_trade_pct_hi"`  // 单笔占比区间上限（默认 30%）
 	PerTradeK       float64 `json:"per_trade_k"`       // 算 eff 用的合成因子 k（0=还没有带缩放的信号，按中性 1.0 算）
 	MissingKeyInput bool    `json:"missing_key_input"` // 关键市场读数缺失（目标封顶半仓 + 当天不做 T）
-	Shadow          bool    `json:"shadow"`            // 影子期：只留痕不执法
-	Enabled         bool    `json:"sizing_enabled"`
+	// MissingKeyDims §INDEX-BLIND：缺的是哪几维（机读码）。与上面那枚 bool 同组下发：
+	// 卡片要说得出"去查状态机、情绪还是指数"，不能只说"缺失"。
+	MissingKeyDims []string `json:"missing_key_dims,omitempty"`
+	Shadow         bool     `json:"shadow"` // 影子期：只留痕不执法
+	Enabled        bool     `json:"sizing_enabled"`
 
 	Total       float64 `json:"total"`        // 账本权益（现金 + 持仓市值）
 	Cash        float64 `json:"cash"`         // 现金
@@ -135,6 +138,7 @@ func (e *Engine) TargetReadout() TargetReadout {
 		PerTradeHi:      perTradeHi,
 		PerTradeK:       ctx.LastK,
 		MissingKeyInput: ctx.MissingKey,
+		MissingKeyDims:  append([]string(nil), ctx.MissingDims...),
 		Shadow:          shadow,
 		Enabled:         enabled,
 		Total:           round2(total),

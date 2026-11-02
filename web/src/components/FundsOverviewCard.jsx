@@ -18,6 +18,7 @@ import React, { useEffect, useState } from 'react'
 import { Card, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { canStrict } from '../utils/perm.js'
+import BlindTag from './BlindTag.jsx'
 
 /** 金额：千分位 + 两位小数；非法/缺失显示“—”。 */
 function money(v) {
@@ -181,9 +182,9 @@ export default function FundsOverviewCard() {
                     : '—'}
                 </Row>
                 <Row label="剩余空间">{funds ? money(funds.room) : '—'}</Row>
-                {funds && funds.missing_key_input
-                  ? <Tag size="small" theme="warning">关键读数缺失：目标封顶半仓且今日不做 T</Tag>
-                  : null}
+                {/* §INDEX-BLIND：三态标签（盲区点名维度 / 兜底中报来源 / 健康不渲染），
+                    文案单点在 utils/blindDims.js，别在这里再写一份中文。 */}
+                <BlindTag readout={funds} />
               </>
             )}
         </Column>

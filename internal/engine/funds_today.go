@@ -66,10 +66,19 @@ const sizingCtxTTL = 10 * time.Second
 
 // sizingCtx 一份定权上下文：市场缩放、关键读数缺失标记、大盘指数涨跌。
 type sizingCtx struct {
-	MS       float64 // 市场缩放（目标仓位的乘数；<=0 视为尚未定权，回落 1.0）
-	Missing  bool    // 关键市场读数缺失（数据盲区）：目标封顶半仓且当天不做 T
-	IndexPct float64 // 大盘指数涨跌（%），T 的环境门用它
-	At       time.Time
+	MS      float64 // 市场缩放（目标仓位的乘数；<=0 视为尚未定权，回落 1.0）
+	Missing bool    // 关键市场读数缺失（数据盲区）：目标封顶半仓且当天不做 T
+	// MissingDims 缺的是哪几维（signalctl.MissingDim* 机读码）。§INDEX-BLIND：
+	// 只有 Missing 的现场，操作者得自己猜"该去查状态机、情绪还是指数"——
+	// 11-02 那次三键里掉的是大盘指数，而这句话只能靠对时间线反推出来。
+	MissingDims []string
+	// IndexSource / IndexStale 这一轮点位的来源与"是否回退值"（空=没取到；stale=陈旧但真实）。
+	// 处置方向取决于**谁断了**：eastmoney 断→查上游可达性；sina/tencent 接管→说明主链在退；
+	// 全空→三条腿一起断，那才是盲区。
+	IndexSource string
+	IndexStale  bool
+	IndexPct    float64 // 大盘指数涨跌（%），T 的环境门用它
+	At          time.Time
 }
 
 // sizingContextFor 取该账号的定权上下文（短窗缓存）。
@@ -96,7 +105,29 @@ func (e *Engine) sizingContextFor(uid string) sizingCtx {
 	if ms <= 0 {
 		ms = 1.0 // 未定权时的安全回落：与 T 参数解析旧行为逐字一致（目标按满额算，不凭空缩仓）
 	}
-	c = sizingCtx{MS: ms, Missing: res.MissingKeyInput, IndexPct: r.IndexChangePct, At: time.Now()}
+	// §INDEX-BLIND：来源与陈旧位与本轮 MS 同源取（引擎侧 30s 短窗缓存的伴随字段），
+	// 这样卡片上的"谁给的点位"与"据此定的权"一定是同一份，不会一处新一处旧。
+	e.mu.RLock()
+	idxSrc, idxStale := e.idxQuoteSrc, e.idxQuoteStale
+	e.mu.RUnlock()
+	c = sizingCtx{
+		MS:          ms,
+		Missing:     res.MissingKeyInput,
+		MissingDims: res.MissingKeyDims,
+		IndexSource: idxSrc,
+		IndexStale:  idxStale,
+		IndexPct:    r.IndexChangePct,
+		At:          time.Now(),
+	}
+	// 盲区必须当场出声：NaN 这条路径今天**一行日志都不打**（只有回退成功才打 §BUG-INDEX），
+	// 于是"整天封顶半仓"在日志里只留下"回退中"的尾巴，缺哪一维要靠对时间线反推。
+	// 节流判据与推进基线分成两个函数（只读判定不许顺手把基线推走，§FIX-20261028-F02 同一条纪律）。
+	if res.MissingKeyInput && e.blindLogDue(res.MissingKeyDims, c.At) {
+		e.markBlindLogged(res.MissingKeyDims, c.At)
+		log.Printf("[engine] §DYN-BLIND 关键读数缺失：dims=%v 目标封顶 %.0f%% 且当天不做 T；"+
+			"index_source=%q index_stale=%v（60s 节流；先查这三条腿谁断了，别查闸门）",
+			res.MissingKeyDims, signalctl.MissingKeyTargetCap()*100, idxSrc, idxStale)
+	}
 	e.mu.Lock()
 	if e.sizingCtxCache == nil {
 		e.sizingCtxCache = map[string]sizingCtx{}
@@ -104,6 +135,52 @@ func (e *Engine) sizingContextFor(uid string) sizingCtx {
 	e.sizingCtxCache[uid] = c
 	e.mu.Unlock()
 	return c
+}
+
+// blindLogThrottle §DYN-BLIND 的节流窗：60s 一条。
+// 不节流就是每轮一条（打分 5s + 资金心跳 10s + T 参数各调一次），一天几万条把 stderr 冲烂；
+// 完全节流又不行——盲区持续 3 小时与持续 30 秒在日志里必须看得出来，所以**维度组合变了立刻出声**。
+const blindLogThrottle = 60 * time.Second
+
+// blindLogDue 只读判定：这一组维度该不该出声（不推进任何基线）。
+// 拆成"只读判定 + 唯一写入点"两个函数是 §FIX-20261028-F02 的纪律：
+// 判定里顺手推基线，会让"因早退没打日志"也把下次出声的机会吃掉的（10-28 那天就是这样几乎不再发帧）。
+func (e *Engine) blindLogDue(dims []string, now time.Time) bool {
+	key := strings.Join(dims, "|")
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if key != e.blindLogKey {
+		return true
+	}
+	return e.blindLogAt.IsZero() || now.Sub(e.blindLogAt) >= blindLogThrottle
+}
+
+// markBlindLogged 推进出声基线的**唯一**写入点（与 blindLogDue 成对，用例盯这对形状）。
+func (e *Engine) markBlindLogged(dims []string, now time.Time) {
+	e.mu.Lock()
+	e.blindLogKey = strings.Join(dims, "|")
+	e.blindLogAt = now
+	e.mu.Unlock()
+}
+
+// blindAlertCode §INDEX-BLIND 告警量规的取值单点（0 不适用 / 1 齐 / 2 兜底中 / 3 真盲区）。
+// 为什么把判据抽成函数而不是在喂数处现算：规则文案与用例都要能断同一套档位，
+// 两处各写一遍就会出现"卡片说兜底、告警说盲区"的分家。
+//   - 2（陈旧但真实）＝点位来自后备腿或 last-known-good 回退——该查"主链为什么在退"，钱照定权；
+//   - 3（真盲区）＝关键读数缺失、目标已封顶半仓且当天不做 T——这才是需要立刻动手的那一档。
+func (e *Engine) blindAlertCode(c sizingCtx) int64 {
+	switch {
+	case c.Missing:
+		return 3 // 真盲区：目标封顶半仓、当日 T 整体关闭，钱正被挡住
+	case c.IndexStale:
+		return 2 // 吃 last-known-good：点位真实但旧，该查主链为什么在退
+	case c.IndexSource == "":
+		return 0 // 本轮没取到过指数读数（未装配/非盘中）：如实"不适用"，不冒充健康
+	case c.IndexSource == data.IndexSourceEastMoney || c.IndexSource == data.IndexSourceBroker:
+		return 1 // 主源在位（东财现取，或 §A7-3 的券商 L1）：健康
+	default:
+		return 2 // sina/tencent 外部后备腿接管：仍真实，但主链在退
+	}
 }
 
 // fundsTargetCurRoom 目标仓位 / 战略当前仓位 / 战略剩余空间 的**唯一公式**。
@@ -344,6 +421,10 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 		f.Room = room
 		f.MarketScale = ctx.MS
 		f.MissingKey = ctx.Missing
+		// §INDEX-BLIND：维度与来源同帧写出去（读改写同一个 f，字段互不覆盖的分工不变）。
+		f.MissingKeyDims = append([]string(nil), ctx.MissingDims...)
+		f.IndexSource = ctx.IndexSource
+		f.IndexStale = ctx.IndexStale
 		f.PendingBuyAmount = pendAmt
 		f.PendingBuyN = pendN
 		f.PendingBuyNote = pendNote

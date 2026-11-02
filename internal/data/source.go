@@ -171,6 +171,23 @@ func (dc *DataCoordinator) SetHithink(h *HithinkClient) {
 	dc.mu.Unlock()
 }
 
+// SetIndexSourcePolicy 把两枚指数开关转发给底层 MarketAPI（§INDEX-BLIND 的设置页热更入口）。
+// 为什么走 Coordinator 而不是让 server 直接握着 MarketAPI：展示层与咨询链的唯一行情出口就是 dc，
+// 热更也从这一个口进，才不会又造出"两处各注入一套、其中一处忘了改"的漂移。
+// English: single hot-update funnel for the index switches, so no second injection point can drift.
+func (dc *DataCoordinator) SetIndexSourcePolicy(fallbackOn, scopeOn bool) {
+	if dc == nil {
+		return
+	}
+	dc.mu.RLock()
+	api := dc.eastMoney
+	dc.mu.RUnlock()
+	if api == nil {
+		return // 未注入（纯内存/测试装配）：如实什么都不做，不假装"设置成功"
+	}
+	api.SetIndexSourcePolicy(fallbackOn, scopeOn)
+}
+
 // 同花顺操作域标识：熔断按域隔离（见 DataCoordinator.thsDeadlines 注释）。
 // THS operation domains used as circuit-breaker keys.
 const (

@@ -85,7 +85,8 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 		// §DYN-SIZE v4：把定权层的拆分读数（MS/SS/数据盲区标志）原样带进执行层——
 		// 目标仓位与单笔基准必须同源，且盲区标志还要供日内 T 层关闭使用（§1.5）。
 		e.autoPlaceScaled(buys[i], live, d.BuyScale, sizingOn,
-			dynBudgetCtx{MarketScale: d.MarketScale, StockScale: d.StockScale, MissingKeyInput: d.MissingKeyInput},
+			dynBudgetCtx{MarketScale: d.MarketScale, StockScale: d.StockScale,
+				MissingKeyInput: d.MissingKeyInput, MissingKeyDims: d.MissingKeyDims},
 			pol.Regime.SizeCfg)
 	}
 }

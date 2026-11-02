@@ -54,12 +54,19 @@ const (
 // (stock factors → this trade's size only) and MissingKeyInput (any key market reading abstained →
 // target capped at 0.50, because abstentions would otherwise lean the product toward 1.0 = full).
 type SizingResult struct {
-	Scale           float64  `json:"scale"`
-	MarketScale     float64  `json:"market_scale,omitempty"`
-	StockScale      float64  `json:"stock_scale,omitempty"`
-	MissingKeyInput bool     `json:"missing_key_input,omitempty"`
-	Downgrade       bool     `json:"downgrade,omitempty"`
-	Reasons         []string `json:"reasons,omitempty"`
+	Scale           float64 `json:"scale"`
+	MarketScale     float64 `json:"market_scale,omitempty"`
+	StockScale      float64 `json:"stock_scale,omitempty"`
+	MissingKeyInput bool    `json:"missing_key_input,omitempty"`
+	// MissingKeyDims 缺的到底是哪几维（市场状态/情绪相位/大盘指数），§INDEX-BLIND（2026-11-02）补的出口。
+	// 为什么不算重复：MissingKeyInput 只回答"封顶没封顶"，回答不了"该去查谁"。
+	// 11-02 现网整天封顶半仓，而三键里掉的是大盘指数——这句话当时只能靠对时间线反推，
+	// 因为 applyMissingKeyCap 明明算出了 missing，出口却只剩一枚 bool 和拼进 Reasons 的字符串。
+	// English: which key readings are absent (not merely that some are) — the bool answers
+	// "capped?", this answers "go check what".
+	MissingKeyDims []string `json:"missing_key_dims,omitempty"`
+	Downgrade      bool     `json:"downgrade,omitempty"`
+	Reasons        []string `json:"reasons,omitempty"`
 }
 
 // BuyScale 单笔金额缩放（新模型口径）＝ MarketScale × StockScale。
@@ -276,31 +283,65 @@ func clampGroup(v, cap float64, cfg config.SizingConfig) float64 {
 // English: the three readings that define "how much to hold today"; breadth is deliberately excluded
 // (it already takes its own haircut, counting it here would double-penalize one gap).
 func applyMissingKeyCap(r Regime, cfg config.SizingConfig, res *SizingResult) {
-	var missing []string
+	var codes []string
 	// 只在"该维度被启用却拿不到读数"时计缺失；owner 主动关掉维度不算盲区（见 Regime 的 *Enabled 注释）。
 	if r.MarketStateEnabled && r.MarketState == "" {
-		missing = append(missing, "市场状态")
+		codes = append(codes, MissingDimMarketState)
 	}
 	if r.EmotionEnabled && r.EmotionPhase == "" {
-		missing = append(missing, "情绪相位")
+		codes = append(codes, MissingDimEmotionPhase)
 	}
 	if math.IsNaN(r.IndexChangePct) {
-		missing = append(missing, "大盘指数")
+		codes = append(codes, MissingDimIndexChange)
 	}
-	if len(missing) == 0 {
+	if len(codes) == 0 {
 		return
 	}
 	res.MissingKeyInput = true
+	// 深拷贝一份：调用方（资金帧、决策快照、告警取值）会各自持有这枚切片，
+	// 直接暴露内部 slice 就等于允别人在后面 append 时改到本函数的语义。
+	res.MissingKeyDims = append([]string(nil), codes...)
+	// 机读码进 JSON，人读标签进 Reasons：同源一张表（missingDimLabel），两处各写中文必漂。
+	labels := make([]string, 0, len(codes))
+	for _, c := range codes {
+		labels = append(labels, missingDimLabel(c))
+	}
 	// 封顶值用常量而非配置：这条是数据盲区的安全垫，不给"放宽成 0.9"的口子（§8.8 之外的少数硬编码）。
 	if cap := missingKeyTargetCap; res.MarketScale > cap {
 		res.MarketScale = cap
 	}
 	res.Reasons = append(res.Reasons, fmt.Sprintf("关键输入缺失(%s)→目标封顶%.0f%%",
-		strings.Join(missing, "|"), missingKeyTargetCap*100))
+		strings.Join(labels, "|"), missingKeyTargetCap*100))
+}
+
+// 三枚关键读数的机读码（§INDEX-BLIND：进 JSON、进告警文案、进前端标签的唯一口径）。
+const (
+	MissingDimMarketState  = "market_state"
+	MissingDimEmotionPhase = "emotion_phase"
+	MissingDimIndexChange  = "index_change"
+)
+
+// missingDimLabel 机读码 → 现场人读的中文名。新增维度只改这一处，Reasons 与卡片不会分家。
+func missingDimLabel(code string) string {
+	switch code {
+	case MissingDimMarketState:
+		return "市场状态"
+	case MissingDimEmotionPhase:
+		return "情绪相位"
+	case MissingDimIndexChange:
+		return "大盘指数"
+	}
+	// 未知码原样回显：宁可得出一句看不懂的文案，也不许编一个中文维度名指错处置方向。
+	return code
 }
 
 // missingKeyTargetCap 关键市场读数缺失时的目标仓位封顶（0.50＝半仓，owner 2026-10-26 裁决）。
 const missingKeyTargetCap = 0.50
+
+// MissingKeyTargetCap 同一枚封顶值的导出读数：出声腿（§DYN-BLIND 日志与告警文案）要报"封顶到多少"，
+// 而自己再写一份 0.50 就是"同一个量在两个地方各算一遍"——那正是本仓锤过的双账形态。
+// English: exported view of the same cap so logging/alerting never re-declares the constant.
+func MissingKeyTargetCap() float64 { return missingKeyTargetCap }
 
 // sizingFactor 一个已求值的仓位因子（v<=0 表示弃权）。
 // English: one evaluated sizing factor; v<=0 means abstain.

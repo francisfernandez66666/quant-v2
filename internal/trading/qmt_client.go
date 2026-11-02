@@ -516,3 +516,47 @@ func (c *QMTClient) Quotes(ctx context.Context, codes []string) (map[string]data
 	}
 	return ticks, nil
 }
+
+// IndexQuotes §A7-3（2026-11-02）：按**已带后缀的指数代码**取 tick，返回 key 保留后缀。
+//
+// 为什么不复用 Quotes：那个函数出向吃 data.ExchangeSuffix、入向把 key 剥回裸码——
+// 对个股是对的（裸码是 Fetcher.Stocks 的键口径），对指数就是致命的：
+// `000001.SH`（上证指数）与 `000001.SZ`（平安银行）剥完是同一个键，
+// 谁覆盖谁取决于回包顺序，而这正是 §BUG-INDEX 那一族"看起来有数、数字全错"的形状。
+// 所以这一段：出向原样透传（后缀由 data.IndexSuffix 白名单给定）、入向**不剥后缀**、
+// 并且只接受指数白名单里的代码（个股代码进来直接拒掉，避免有人图省事把池子并进这里）。
+//
+// English: index-only tick fetch that keeps exchange suffixes in both directions; the stock path
+// normalizes keys to bare codes, which would collide 000001.SH (SSE index) with 000001.SZ (a bank).
+func (c *QMTClient) IndexQuotes(ctx context.Context, codes []string) (map[string]data.QMTTick, error) {
+	allowed := make(map[string]bool, 8)
+	for _, sfx := range data.BrokerIndexCodes() {
+		allowed[sfx] = true
+	}
+	req := make([]string, 0, len(codes))
+	for _, code := range codes {
+		if !allowed[code] {
+			// 不在指数白名单：宁可不请求，也不让它混进指数账（键空间与语义都只属于指数）。
+			continue
+		}
+		req = append(req, code)
+	}
+	if len(req) == 0 {
+		return map[string]data.QMTTick{}, nil
+	}
+	var out struct {
+		OK    bool                    `json:"ok"`
+		Ticks map[string]data.QMTTick `json:"ticks"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/quotes?codes="+strings.Join(req, ","), nil, &out); err != nil {
+		return nil, err
+	}
+	ticks := make(map[string]data.QMTTick, len(out.Ticks))
+	for k, v := range out.Ticks {
+		if !allowed[k] {
+			continue // 网关回包多给了别的代码：一律不收进指数账
+		}
+		ticks[k] = v
+	}
+	return ticks, nil
+}

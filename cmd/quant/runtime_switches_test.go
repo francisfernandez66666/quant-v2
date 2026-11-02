@@ -110,6 +110,11 @@ func TestSwitchInventoryCoversEveryKey(t *testing.T) {
 		"rules.qmt.subscription_recognize",
 		"rules.qmt.subscription_cancel_guard",
 		"网关侧 subscription_recognize",
+		// §INDEX-BLIND（2026-11-02）三枚指数键必须逐键点名：新增开关不进清单＝
+		// "这里有个功能、它没开"又只能靠人记住，正是 §关态留痕 要消灭的形态。
+		"runtime.index_fallback_sources",
+		"runtime.index_breaker_scope",
+		"runtime.quote_feed_index_enabled",
 	}
 	for _, k := range want {
 		if !strings.Contains(out, k) {
@@ -123,6 +128,12 @@ func TestSwitchInventoryCoversEveryKey(t *testing.T) {
 		"runtime.qmt_feed_primary=enabled",
 		"runtime.quote_per_code_source=enabled",
 		"runtime.quote_hub_consult=enabled",
+		// §INDEX-BLIND（owner 裁决 1「出厂即开」）：三枚指数键的出厂态也必须是 enabled。
+		// 这条断言是"缺省档方向"的唯一现场证据——若哪天有人把指针位改成裸 bool，
+		// 清单会立刻打 disabled，而这条用例先红。
+		"runtime.index_fallback_sources=enabled",
+		"runtime.index_breaker_scope=enabled",
+		"runtime.quote_feed_index_enabled=enabled",
 	} {
 		if !strings.Contains(out, k) {
 			t.Fatalf("行情四键出厂态必须是 enabled（缺键=开，指针位语义）: 缺 %q:\n%s", k, out)

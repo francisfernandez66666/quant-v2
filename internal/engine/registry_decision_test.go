@@ -40,7 +40,7 @@ func TestPaperDecisionWritesPerUser(t *testing.T) {
 	if pe == nil {
 		t.Fatal("GetPaper 返回 nil")
 	}
-	pe.SetSizingContext(1, 0.1, 0.3, 1, false)
+	pe.SetSizingContext(1, 0.1, 0.3, 1, false, nil)
 	quotes := map[string]*data.StockInfo{
 		"600000.SH": {Code: "600000.SH", Name: "浦发", Price: 10, ChangePct: 1},
 	}

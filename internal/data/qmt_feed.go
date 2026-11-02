@@ -231,6 +231,14 @@ func (f *QMTFeed) pollOnce() {
 		return
 	}
 	f.failStreak.Store(0)
+	// §A7-3 指数段：另发一次**只含指数**的请求（独立后缀白名单，不进上面的池与分母）。
+	// 为什么不并进同一次请求：客户端会把返回 key 剥成裸码（qmt_client.go:511），
+	// 那样 000001.SH（上证指数）与 000001.SZ（平安银行）会撞成同一个键；而且指数一旦进了
+	// entries，覆盖率分母与逐票混源账都会被一只没有"可交易价"的东西污染（owner 裁决 12 的账）。
+	// 失败只打节流日志，**不**记进 feed 的 J1 连败：通道断没断由主池那一次判定，
+	// 指数这只拿不到时外部三条腿照常当家（行情可用性不因它而变，这是本批的边界）。
+	f.pollIndexCodes(ctx)
+	f.failStreak.Store(0)
 	n := f.applyTicks(ticks, len(codes))
 	if n > 0 && !f.loggedFirst.Swap(true) {
 		log.Printf("[qmt_feed] §SUBSCRIPTION-A L1 首次命中: %d/%d 只（primary=%v）", n, len(codes), f.isPrimary())
@@ -460,4 +468,38 @@ func (f *QMTFeed) logThrottled(format string, args ...any) {
 	if now-prev >= 60 {
 		log.Printf("[qmt_feed] "+format, args...)
 	}
+}
+
+// indexQuoteSource 可选能力：按**已带后缀**的指数代码取 tick（§A7-3）。
+// 做成可选接口而不是给 QuoteFeedSource 加必传方法：现有测试桩与 mock 都只实现 Quotes，
+// 强行加签名会把"指数这条腿"变成所有装配点的破坏性改动；断言式可选才是可回滚的形状。
+type indexQuoteSource interface {
+	IndexQuotes(ctx context.Context, codes []string) (map[string]QMTTick, error)
+}
+
+// pollIndexCodes 一轮里顺带取指数（策略关或源不支持即整段跳过，一次请求都不发）。
+// 本方法**永不**影响主池的读数：它只写 fetcher 的指数分账（NoteFeedIndexTicks），
+// 覆盖率分母、J1/J2/J3 判定、混源账一律不碰——行情可用性判定不许被一只指数带偏。
+func (f *QMTFeed) pollIndexCodes(ctx context.Context) {
+	if !f.fetcher.feedPolicyNow().IndexEnabled {
+		return
+	}
+	ics, ok := f.src.(indexQuoteSource)
+	if !ok {
+		// 源没有这个能力（老客户端/测试桩）：如实跳过，不编一个"券商给了点位"。
+		return
+	}
+	codes := BrokerIndexCodes()
+	if len(codes) == 0 {
+		return
+	}
+	ticks, err := ics.IndexQuotes(ctx, codes)
+	if err != nil {
+		// 通道不通是**当前现网常态**（xtdata 无行情服务可连），所以这条只节流、不告警：
+		// 真正的"券商行情断了"由主池那一条 broker_feed_unavailable 负责，两条会重复说同一件事。
+		f.logThrottled("qmt_feed: §A7-3 指数侧 /quotes 拉取失败（外部三条腿照常当家，不影响行情可用性）: %v", err)
+		f.fetcher.NoteFeedIndexTicks(nil)
+		return
+	}
+	f.fetcher.NoteFeedIndexTicks(ticks)
 }

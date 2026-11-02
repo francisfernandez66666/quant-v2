@@ -54,6 +54,11 @@ export default function QuoteFeedConfigCard() {
         qmt_feed_primary: !!r.qmt_feed_primary,
         quote_per_code_source: !!r.quote_per_code_source,
         quote_hub_consult: !!r.quote_hub_consult,
+        // §INDEX-BLIND 三枚指数键同样是出厂开（缺键=开）：初值必须取后端下发的生效值，
+        // 从本地 false 起步会让“一进卡就点保存”把出厂开悄悄关掉（用例专盯这条）。
+        index_fallback_sources: !!r.index_fallback_sources,
+        index_breaker_scope: !!r.index_breaker_scope,
+        quote_feed_index_enabled: !!r.quote_feed_index_enabled,
         qmt_feed_coverage_min_pct: r.qmt_feed_coverage_min_pct ?? 0,
         qmt_feed_volume_to_shares: r.qmt_feed_volume_to_shares ?? 0,
         monitor_pool_hot_max: r.monitor_pool_hot_max ?? 0,
@@ -71,6 +76,9 @@ export default function QuoteFeedConfigCard() {
     if (form.qmt_feed_primary !== !!cfg.qmt_feed_primary) patch.qmt_feed_primary = form.qmt_feed_primary
     if (form.quote_per_code_source !== !!cfg.quote_per_code_source) patch.quote_per_code_source = form.quote_per_code_source
     if (form.quote_hub_consult !== !!cfg.quote_hub_consult) patch.quote_hub_consult = form.quote_hub_consult
+    if (form.index_fallback_sources !== !!cfg.index_fallback_sources) patch.index_fallback_sources = form.index_fallback_sources
+    if (form.index_breaker_scope !== !!cfg.index_breaker_scope) patch.index_breaker_scope = form.index_breaker_scope
+    if (form.quote_feed_index_enabled !== !!cfg.quote_feed_index_enabled) patch.quote_feed_index_enabled = form.quote_feed_index_enabled
     if (form.qmt_feed_coverage_min_pct !== cfg.qmt_feed_coverage_min_pct) patch.qmt_feed_coverage_min_pct = Number(form.qmt_feed_coverage_min_pct)
     if (form.qmt_feed_volume_to_shares !== cfg.qmt_feed_volume_to_shares) patch.qmt_feed_volume_to_shares = Number(form.qmt_feed_volume_to_shares)
     if (form.monitor_pool_hot_max !== cfg.monitor_pool_hot_max) patch.monitor_pool_hot_max = Number(form.monitor_pool_hot_max)
@@ -109,6 +117,15 @@ export default function QuoteFeedConfigCard() {
           : <Tag theme="warning" size="small" style={{ marginLeft: 6 }} title={`观测档 ${cfg.feed_volume_observed_unit ?? 0}，配置系数 ${cfg.volume_to_shares_effective}`}>量纲未确认（不接管量/额）</Tag>}
         {cfg.feed_ready_to_promote ? <Tag theme="primary" size="small" style={{ marginLeft: 6 }} title="已连续达标：可以打开主源档">本可接管</Tag> : null}
       </div>
+      {/* §INDEX-BLIND：指数这一段必须自己报"现在会依次试谁"——卡上只写开关名，
+          现场还是不知道东财断了到底有没有人接。实际段序由后端按开关算（index_legs_actual），
+          前端不另列一份，否则两处会漂成"卡上说三条、实际试两条"。 */}
+      <div style={{ fontSize: 12, color: 'var(--app-text-2)', marginBottom: 10 }}>
+        指数降级段序：{(cfg.index_legs_actual || cfg.index_legs || []).join(' → ') || '未知'}
+        {cfg.index_legs_actual && cfg.index_legs && cfg.index_legs_actual.length !== cfg.index_legs.length
+          ? <Tag theme="warning" size="small" style={{ marginLeft: 6 }}>后备腿已被关掉</Tag>
+          : null}
+      </div>
       <div style={{ display: 'grid', gap: 10, maxWidth: 560 }}>
         <label style={{ fontSize: 13 }}>
           券商价改写快照（qmt_feed_primary）
@@ -135,6 +152,35 @@ export default function QuoteFeedConfigCard() {
           {/* 裁决 13：不做这件事，同一只票在咨询面板、自选卡、量化页上会来自不同源不同时刻。
               开着只改"价从哪读"，资金流等字段仍由原行情链给（券商没有净流入）。 */}
           <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>出厂开＝快照优先（按这一只票的时刻判新鲜）；关＝每问一次现拉外部源</span>
+        </label>
+        {/* ── §INDEX-BLIND（2026-11-02）大盘指数的三条腿 ──────────────────────────
+            这段的存在理由：11-02 现网整天"目标封顶半仓 + 不做 T"，而卡上只有“缺失”两个字，
+            看不出掉的是大盘指数、也看不出当时有几条腿可退。三枚开关都出厂开。 */}
+        <label style={{ fontSize: 13 }}>
+          指数多源兜底（index_fallback_sources）
+          <input type="checkbox" checked={!!form.index_fallback_sources} style={{ marginLeft: 8 }}
+            onChange={(e) => setForm({ ...form, index_fallback_sources: e.target.checked })} />
+          <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>
+            出厂开＝东财主域/镜像失败后依次试新浪、腾讯；关＝只试东财一族，10 分钟兜底过窗即判盲区
+          </span>
+        </label>
+        <label style={{ fontSize: 13 }}>
+          指数独立熔断域（index_breaker_scope）
+          <input type="checkbox" checked={!!form.index_breaker_scope} style={{ marginLeft: 8 }}
+            onChange={(e) => setForm({ ...form, index_breaker_scope: e.target.checked })} />
+          <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>
+            出厂开＝指数有自己的熔断名额；关＝与个股共用 push2 .../stock/get 那一格（个股连败会把指数一起挡掉）
+          </span>
+        </label>
+        <label style={{ fontSize: 13 }}>
+          券商侧指数点位（quote_feed_index_enabled）
+          <input type="checkbox" checked={!!form.quote_feed_index_enabled} style={{ marginLeft: 8 }}
+            onChange={(e) => setForm({ ...form, quote_feed_index_enabled: e.target.checked })} />
+          {/* 现网这条通道此刻不通（xtdata 无行情服务可连），开着也不产生价格影响；
+              键先到位，等 QMT 起来当天只看读数判读，不必再改代码。 */}
+          <span style={{ marginLeft: 8, color: 'var(--app-muted-2)' }}>
+            出厂开＝按独立指数后缀白名单请求（000001.SH 是上证，000001.SZ 是平安银行，两者绝不共用键）；不进覆盖率分母
+          </span>
         </label>
         <label style={{ fontSize: 13 }}>覆盖率阈值 %（生效 {cfg.coverage_min_pct_effective}）
           <InputNumber value={form.qmt_feed_coverage_min_pct} min={-1} max={100} style={{ width: 140, marginLeft: 8 }}

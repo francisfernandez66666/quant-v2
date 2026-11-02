@@ -44,7 +44,7 @@ func flowFillQty(t *testing.T, cfg Config, sizeScale float64) int {
 	// ——锁的靶心是"scale 有没有落到执行层"，不是"基准是多少"（基准本身由 §1.4 的用例锁）。
 	// §B0 起单笔占比 = lo + (hi−lo)×k（k = SizeScale），所以这里必须给一个**有宽度**的区间
 	// （10%~50%）才看得见 scale 的敏感性；lo=hi 会让 eff 变成常数、本文件全部用例同时失效。
-	e.SetSizingContext(1.0, 0.10, 0.50, 1.0, false)
+	e.SetSizingContext(1.0, 0.10, 0.50, 1.0, false, nil)
 	e.SetStrategyPools([]string{"dragon"}) // OnSignals 按战法池入账：不设池则无池可买
 	quotes := map[string]*data.StockInfo{"600000.SH": {Code: "600000.SH", Price: 10, ChangePct: 1}}
 	e.OnSignals([]combat_agent.Signal{flowBuySignal("600000.SH", sizeScale)}, quotes)

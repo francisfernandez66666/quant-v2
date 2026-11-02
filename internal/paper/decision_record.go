@@ -61,3 +61,22 @@ func (e *Engine) SetDecisionRecorder(fn func(DecisionRecord)) {
 	e.onDecision = fn
 	e.mu.Unlock()
 }
+
+// paperBlindSuffix 盲区态在「原因」里点名缺了哪一维（§INDEX-BLIND，2026-11-02）。
+//
+// 为什么不加表列：signal_decisions 加列会牵动 schemaVersion（store/schema_version_bump_test.go
+// 断言 !="2" 即 Fatal，那是 W-05 的领地），而本文件的设计约束第 1 条就写着"不改账本语义"；
+// 「原因」这一列本来就是给人看的解释文本，维度属于解释的一部分。
+// 与实盘侧 persistDynBuyDecision 用同一句后缀（MissingDimsSuffix），两本账才对照得起来。
+// English: the blind-state dimension rides on the human-readable reason column instead of
+// widening the schema; live and paper sides share one suffix wording.
+func paperBlindSuffix(reason string, ctx paperSizingCtx) string {
+	if !ctx.MissingKey {
+		return reason
+	}
+	suffix := "关键读数缺失" + MissingDimsSuffix(ctx.MissingDims)
+	if reason == "" {
+		return suffix
+	}
+	return reason + "；" + suffix
+}

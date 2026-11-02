@@ -60,16 +60,20 @@ const feedCoverageDefault = 80
 // FeedPolicy 行情装配的生效策略（由 config.RuntimeConfig 的 Effective* 读数装配，整体替换、无锁读旧值）。
 // English: effective feed policy assembled from RuntimeConfig's Effective* readings.
 type FeedPolicy struct {
-	Enabled         bool          // 这条通道本该在跑（runtime.qmt_feed_enabled 的生效值）：告警自证腿的前提，缺省 false＝不告警
-	Primary         bool          // 券商 tick 是否可改写快照价格（出厂开；关＝观察模式，现场回滚位）
-	PerCodeSource   bool          // 是否逐票标 Src/AsOfMs（出厂开；关时字段留空，落盘/SSE 与旧形状同形）
-	VolumeAutoAlign bool          // 量纲自动对齐（默认开）：观测单位与配置系数不一致时不接管量/额，见 VolumeObservedUnit
-	Consult         bool          // 裁决 13：咨询与自选补价是否"快照优先"（出厂开；关＝每问一次打一次外部源，回滚位）
-	CoverageMinPct  int           // 覆盖率阈值：-1＝关闭判断（旧行为）；0/缺省由装配点兜成 80
-	HotPoolCap      int           // 券商主源档的热点池上限
-	MaxAge          time.Duration // 单票 tick 超龄上限（超龄退回后备源值）
-	VolumeToShares  float64       // 量纲系数：券商 tick 的 volume → 股（0→1；由 Effective* 兜底）
-	SteadyWindow    time.Duration // 升档所需连续稳定时长（<=0 → feedSteadyExpand）
+	Enabled         bool // 这条通道本该在跑（runtime.qmt_feed_enabled 的生效值）：告警自证腿的前提，缺省 false＝不告警
+	Primary         bool // 券商 tick 是否可改写快照价格（出厂开；关＝观察模式，现场回滚位）
+	PerCodeSource   bool // 是否逐票标 Src/AsOfMs（出厂开；关时字段留空，落盘/SSE 与旧形状同形）
+	VolumeAutoAlign bool // 量纲自动对齐（默认开）：观测单位与配置系数不一致时不接管量/额，见 VolumeObservedUnit
+	Consult         bool // 裁决 13：咨询与自选补价是否"快照优先"（出厂开；关＝每问一次打一次外部源，回滚位）
+	// IndexEnabled §A7-3（2026-11-02 owner 裁决 4「白名单与用例先写好、开关打开，等 QMT」）：
+	// 是否向券商侧请求指数点位（独立后缀白名单，绝不吃个股后缀函数）。
+	// 关掉＝一次都不请求；开着而通道不通＝每轮多一次空响应，外部三条腿照常当家（不影响行情可用性）。
+	IndexEnabled   bool
+	CoverageMinPct int           // 覆盖率阈值：-1＝关闭判断（旧行为）；0/缺省由装配点兜成 80
+	HotPoolCap     int           // 券商主源档的热点池上限
+	MaxAge         time.Duration // 单票 tick 超龄上限（超龄退回后备源值）
+	VolumeToShares float64       // 量纲系数：券商 tick 的 volume → 股（0→1；由 Effective* 兜底）
+	SteadyWindow   time.Duration // 升档所需连续稳定时长（<=0 → feedSteadyExpand）
 }
 
 // FeedStats 一轮 feed 的读数（观测面：覆盖率、分母来源、降级状态、连续失败轮次）。
@@ -113,8 +117,14 @@ type feedHubState struct {
 
 	policy FeedPolicy
 	ents   map[string]feedEntry // 裸码 → 最近一次有效 tick
-	stats  FeedStats            // 最近一轮读数
-	pinned map[string]bool      // 被引用的裸码（持仓/在途委托/在途 T 腿）：收池与热点轮换都不许踢掉
+	// idxEnts §A7-3：**带后缀**的指数代码 → 最近一次有效 tick。
+	// 为什么单独一本账并且键带后缀：券商侧 000001.SH 是上证指数、000001.SZ 是平安银行，
+	// 而 feed 主链的键在客户端就被剥成裸码（qmt_client.go:511）——同一个键装两只，
+	// 谁赢取决于回包顺序，那正是 §BUG-INDEX 的形状。指数因此走独立的请求与独立的键空间，
+	// 并且**不进 ents、不进覆盖率分母、不进混源账**（见 QMTFeed 的指数段注释）。
+	idxEnts map[string]QMTTick
+	stats   FeedStats       // 最近一轮读数
+	pinned  map[string]bool // 被引用的裸码（持仓/在途委托/在途 T 腿）：收池与热点轮换都不许踢掉
 
 	// 迟滞状态：healthy 连续区间的起点，与当前是否处于主源档
 	healthySince time.Time
@@ -129,7 +139,7 @@ func (f *Fetcher) hub() *feedHubState {
 	// 用 sync.Once 而不是 f.mu：UpdateHotStocks / StalenessMs 这些调用方自己持 f.mu，
 	// 借同一把锁会当场自锁死（本仓 §R3-2 那类"锁内取撕裂切片头"的同族坑）。
 	f.hubOnce.Do(func() {
-		f.hubRef = &feedHubState{ents: map[string]feedEntry{}, pinned: map[string]bool{}}
+		f.hubRef = &feedHubState{ents: map[string]feedEntry{}, pinned: map[string]bool{}, idxEnts: map[string]QMTTick{}}
 	})
 	return f.hubRef
 }
@@ -170,6 +180,7 @@ func FeedPolicyFromRuntime(rt config.RuntimeConfig) FeedPolicy {
 		HotPoolCap:      rt.EffectiveMonitorPoolHotMax(),
 		PerCodeSource:   rt.QuotePerCodeSourceOn(),
 		Consult:         rt.QuoteHubConsultOn(),
+		IndexEnabled:    rt.QuoteFeedIndexOn(),
 		VolumeAutoAlign: true, // 量纲未对齐时不接管量/额（默认开）：见本文件量纲对齐段
 		MaxAge:          30 * time.Second,
 		VolumeToShares:  rt.EffectiveFeedVolumeToShares(),
@@ -181,6 +192,14 @@ func FeedPolicyFromRuntime(rt config.RuntimeConfig) FeedPolicy {
 func (f *Fetcher) SetFeedPolicy(p FeedPolicy) {
 	h := f.hub()
 	h.mu.Lock()
+	// §A7-3：关掉券商指数时**同批清空指数分账**，而不是等下一次拉取才发现没清。
+	// 残留的后果很具体：用户拨回开关→重启→第一次拉取之前，卡片仍会报 index_source=QMT-L1
+	// 并拿着旧点位定权——"刚做的回滚在读数上看不见"正是本批要消灭的那类形状。
+	if !p.IndexEnabled {
+		for k := range h.idxEnts {
+			delete(h.idxEnts, k)
+		}
+	}
 	h.policy = p
 	h.mu.Unlock()
 }

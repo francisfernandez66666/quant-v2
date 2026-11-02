@@ -64,7 +64,7 @@ func TestF3ConfigFromRulesTakesMaxOrderAmount(t *testing.T) {
 // 决策快照的 capped_by 必须如实报 manual —— 是"用户要这么多"在约束，不是额度在约束。
 func TestF4DynamicManualBuyHonoursTypedQty(t *testing.T) {
 	pe := New(f4Gate(0), "")
-	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false) // 单笔基准放大，让额度本来允许 3500 股
+	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false, nil) // 单笔基准放大，让额度本来允许 3500 股
 	var recs []DecisionRecord
 	pe.SetDecisionRecorder(func(r DecisionRecord) { recs = append(recs, r) })
 	if err := pe.BuyExInPool("600000.SH", "浦发", "龙头", "", 10, 0, 100, dynQuotes("600000.SH")); err != nil {
@@ -91,7 +91,7 @@ func TestF4DynamicManualBuyHonoursTypedQty(t *testing.T) {
 // 这是"只压不抬"的另一半：若实现成"直接用显式股数"，手动入口就绕过了 35% 单票额度。
 func TestF5TypedQtyCappedByDynamicRoom(t *testing.T) {
 	pe := New(f4Gate(0), "")
-	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false) // 10 万×50% → 5 万，再被 35% 单票额度截到 3.5 万 = 3500 股
+	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false, nil) // 10 万×50% → 5 万，再被 35% 单票额度截到 3.5 万 = 3500 股
 	if err := pe.BuyExInPool("600000.SH", "浦发", "龙头", "", 10, 0, 999900, dynQuotes("600000.SH")); err != nil {
 		t.Fatalf("BuyExInPool: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestF5TypedQtyCappedByDynamicRoom(t *testing.T) {
 func TestF6MaxOrderAmountCapRejects(t *testing.T) {
 	// ① 手动新开仓：300 股 × 10 元 = 3000 > 帽 2000 → 拒，且不得留下任何持仓。
 	pe := New(f4Gate(2000), "")
-	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false)
+	pe.SetSizingContext(1.0, 1.0, 1.0, 1.0, false, nil)
 	err := pe.BuyExInPool("600000.SH", "浦发", "龙头", "", 10, 0, 300, dynQuotes("600000.SH"))
 	if err == nil {
 		t.Fatal("3000 元 > 绝对帽 2000 元，应拒单")
@@ -138,7 +138,7 @@ func TestF6MaxOrderAmountCapRejects(t *testing.T) {
 
 	// ④ 帽=0（未配置）时同一笔必须放行：零值语义是"这道闸关着"，不是"帽为 0 元"。
 	open := New(f4Gate(0), "")
-	open.SetSizingContext(1.0, 1.0, 1.0, 1.0, false)
+	open.SetSizingContext(1.0, 1.0, 1.0, 1.0, false, nil)
 	if err := open.BuyExInPool("600000.SH", "浦发", "龙头", "", 10, 0, 300, dynQuotes("600000.SH")); err != nil {
 		t.Fatalf("帽未配置（0）时不应拦单: %v", err)
 	}

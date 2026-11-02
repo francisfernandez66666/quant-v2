@@ -6047,7 +6047,7 @@ done
 # ── ⑪-4 心跳三件套：量规键名 / 规则 / 路由 / 接线，四者缺一即死规则或裸量规 ──
 # 全部用「Name: "x"」「"x":」这类带引号/带字段名的锚：反证实测过只写裸标识符时，
 # 把规则改名成 x_v2 仍是子串命中，等值锁会放过去（同批 STAYED-GREEN 6 条的根因）。
-for r in signal_zero_in_session realized_pnl_zero_with_sells library_stale_days; do
+for r in signal_zero_in_session realized_pnl_zero_with_sells library_stale_days market_data_blind market_data_stale; do
 	eq106 internal/metrics/alerter.go "Name: \"$r\"" 1 "⑪-4 规则 ${r} 在 DefaultAlertRules 注册（恰一条）"
 	eq106 internal/metrics/alert_routing.go "\"$r\":" 1 "⑪-4 规则 ${r} 在路由表有条目（缺＝走默认路由，owner 改路由时会被漏掉）"
 done
@@ -6421,7 +6421,13 @@ leg106 'engine 买入两闸（低价默认拦/负数关闭/压线阈值/碎单�
 
 # 三件套等值闸：路由表条目数 == DefaultAlertRules 条数（本批 15→18，§107 再 +1＝19，两侧同批动）
 # §W7-COUNT-SYNC（2026-10-09 波 7）：当时**实数 20**（必推 12 / 日汇总 8，两个集合名字逐一对齐）。
-# §SUBSCRIPTION-A（2026-11-01 改判 16）：+1 条 `broker_feed_unavailable` ⇒ **现数 21**（必推 13 / 日汇总 8）。
+# §SUBSCRIPTION-A（2026-11-01 改判 16）：+1 条 `broker_feed_unavailable` ⇒ 21（必推 13 / 日汇总 8）。
+# §INDEX-BLIND（2026-11-02 owner 裁决 3）：+2 条 ⇒ **现数 23**（必推 14 / 日汇总 9）。
+#   market_data_blind（值=3 真盲区：目标封顶半仓、当日 T 整体关闭——钱正被挡住，必推）与
+#   market_data_stale（值=2 点位来自后备腿或 last-known-good，仍真实：主链在退，日汇总）。
+#   分两条而不是把阈值降到 2：这两档处置方向不同，混成一条就是「每天响的那条把人训练成忽略真告警」
+#   （同 J0 与 J2 必须各有自己的文案那条纪律）。11-02 现网整天封顶而告警一次没响，同期
+#   broker_feed_unavailable 倒是响过——缺的不是通道，是这条规则。
 #   加这条不是"越界型"新功能，而是出厂开的**配套自证腿**：默认开之后最坏结局是"开关开着、
 #   通道一秒都没喂"，而它在页面上与"没开"长得一样。判据只在盘中给（盘前 QMT 客户端没起、
 #   休市日空闲都是正常态），量规用 0=不适用，规则用 ge 2 ⇒ 0/1 都不触发，不会假红。
@@ -6431,7 +6437,7 @@ leg106 'engine 买入两闸（低价默认拦/负数关闭/压线阈值/碎单�
 #   len(DefaultAlertRules()) 派生，加一条规则不需要改测试），所以这里只做**说明同步**；
 #   真正的锁面是 §114 里那枚「说明里的条数必须等于源码派生条数」的等值锁——下次再加规则却忘了
 #   同步文案时，红的是这枚锁而不是读者的眼睛。
-leg106 'metrics 路由覆盖全规则（21 条：必推 13 / 日汇总 8）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
+leg106 'metrics 路由覆盖全规则（23 条：必推 14 / 日汇总 9）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
 leg106 'engine 零信号心跳（判据/成对反证/非实盘不落笔/接线）' ./internal/engine/ \
 	'TestSignalHeartbeatAgePredicate|TestFeedSignalHeartbeatZeroAndPinnedPair|TestFeedSignalHeartbeatNonLiveDoesNotWrite|TestSignalHeartbeatRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
 leg106 'trading 已实现盈亏心跳（配对/孤儿卖出/非实盘不落笔/键名对齐）' ./internal/trading/ \
@@ -15933,7 +15939,7 @@ FT132=internal/data/fetcher.go
 # —— ① 指数必须走专用通道，且不许回退到个股链 ——
 grep -q 'func (m \*MarketAPI) GetIndexLiveQuote(code string) (\*IndexLiveQuote, error)' "$MK132" ||
 	fail132 "缺 GetIndexLiveQuote：指数读数没有专用通道（只能回到个股链，000001 会变成平安银行）"
-grep -q 'indexSecID(code)' "$MK132" ||
+grep -q 'indexSecID(code)' "$MK132" internal/data/market_index.go ||
 	fail132 "指数专用通道没用 indexSecID（secid 前缀错了就又是深市同码个股）"
 if grep -A3 'func (m \*MarketAPI) GetIndexQuote(code string) (\*StockInfo, error) {' "$MK132" | grep -q 'return m.GetRealtimeQuote(code)'; then
 	fail132 "GetIndexQuote 又直接调 GetRealtimeQuote 了（用个股链接指数＝数字全错且没人看得出来）"
@@ -18416,8 +18422,8 @@ grep -qF 'known && !listed' internal/trading/subscription.go || fail160 "同段�
 # ② 网关侧段表与计数分家在位，且**识别早于**「未知状态」那条分支
 CNT160=$((CNT160 + 1))
 grep -qF 'SUBSCRIPTION_ONLY_PREFIXES' qmt_gateway/gateway.py || fail160 "网关段表丢了"
-SUB_ROW_LINE=$(grep -n 'if subscription_only_segment(code):' qmt_gateway/gateway.py | head -1 | cut -d: -f1)
-UNK_LINE=$(grep -n 'if not status or status.startswith("未知"):' qmt_gateway/gateway.py | head -1 | cut -d: -f1)
+SUB_ROW_LINE=$(grep -n 'if subscription_only_segment(code):' qmt_gateway/gateway.py | head -1 | cut -d: -f1 || true)
+UNK_LINE=$(grep -n 'if not status or status.startswith("未知"):' qmt_gateway/gateway.py | head -1 | cut -d: -f1 || true)
 CNT160=$((CNT160 + 1))
 [ -n "${SUB_ROW_LINE:-}" ] && [ -n "${UNK_LINE:-}" ] && [ "$SUB_ROW_LINE" -lt "$UNK_LINE" ] \
 	|| fail160 "识别必须早于「未知状态」分支（顺序反了 86 那批仍走 unknown 计数，本批等于白做）：sub=$SUB_ROW_LINE unknown=$UNK_LINE"
@@ -18438,14 +18444,14 @@ grep -qF 'labeled = append(labeled, qmtOrderView{RealOrder: o' internal/server/q
 CNT160=$((CNT160 + 1))
 # 只数 handleQMTOrders 函数体内（从函数头到下一个顶格 func）：全文计数会把别的列表读面也算进来
 H160_BODY=$(awk '/^func \(s \*Server\) handleQMTOrders\(/ {f=1} f && /^}/ {print; exit} f {print}' internal/server/qmt.go)
-APPEND_OUT=$(printf '%s\n' "$H160_BODY" | grep -c 'out = append(out')
+APPEND_OUT=$(printf '%s\n' "$H160_BODY" | grep -c 'out = append(out' || true)
 [ "$APPEND_OUT" = "1" ] || fail160 "当日委托读面的 out 追加点应为 1 处（只剩按日过滤），现测 $APPEND_OUT 处＝多了一道过滤（裁决 7：申购行要能看见）"
 CNT160=$((CNT160 + 1))
 grep -qF '`json:"subscription"`' internal/server/qmt.go || fail160 "响应视图缺 subscription 标注字段"
 
 # ⑤ 撤单护栏两路都在（紧急停止 + 例行/收盘），且共用同一个判据函数
 CNT160=$((CNT160 + 1))
-GUARD_HITS=$(grep -c 'SubscriptionCancelGuard && CancelSkipsSubscriptionRow' internal/trading/controller.go)
+GUARD_HITS=$(grep -c 'SubscriptionCancelGuard && CancelSkipsSubscriptionRow' internal/trading/controller.go || true)
 [ "$GUARD_HITS" = "2" ] || fail160 "撤单护栏应恰好两处（HaltAll 与 SweepOrders），现测 $GUARD_HITS 处"
 CNT160=$((CNT160 + 1))
 grep -qF 'SubscriptionSkipped int' internal/trading/controller.go || fail160 "SweepResult 的跳过计数丢了（并进 Skipped 会把两种含义混成一件事）"
@@ -18462,7 +18468,7 @@ grep -qE 'SubscriptionCancelGuard[[:space:]]+\*bool `json:"subscription_cancel_g
 CNT160=$((CNT160 + 1))
 grep -qF '"subscription_recognize": False' qmt_gateway/gateway.py || fail160 "网关侧开关缺省不是 false（＝发版即生效，违反本批纪律）"
 CNT160=$((CNT160 + 1))
-KEYSites=$(grep -c 'subscription_recognize' internal/server/qmt.go internal/config/config.go qmt_gateway/gateway.py | grep -c ':')
+KEYSites=$(grep -c 'subscription_recognize' internal/server/qmt.go internal/config/config.go qmt_gateway/gateway.py | grep -c ':' || true)
 [ "$KEYSites" = "3" ] || fail160 "subscription_recognize 必须三处同源（config 定义 / server 写读 / gateway 默认），现测 $KEYSites 个文件"
 
 # ⑧ golden 契约文件在位，且新文件已进部署清单（历史上漏落新文件直接把网关起不来）
@@ -18542,10 +18548,10 @@ done
 
 # ② 全局基线的刷新点必须只有具名那几处（旧缺陷就是"谁都敢归零它"）
 CNT161=$((CNT161 + 1))
-LASTOK_FETCHER=$(grep -c 'lastOK.Store' internal/data/fetcher.go)
+LASTOK_FETCHER=$(grep -c 'lastOK.Store' internal/data/fetcher.go || true)
 [ "$LASTOK_FETCHER" = "3" ] || fail161 "fetcher.go 的 lastOK.Store 应为 3 处（采集成功轮 / 覆盖达标轮 / 持久化恢复），现测 $LASTOK_FETCHER"
 CNT161=$((CNT161 + 1))
-LASTOK_HUB=$(grep -c 'lastOK.Store' internal/data/quote_feed_hub.go)
+LASTOK_HUB=$(grep -c 'lastOK.Store' internal/data/quote_feed_hub.go || true)
 [ "$LASTOK_HUB" = "1" ] || fail161 "装配层应只有一个基线刷新点（coverageGateOK 之后），现测 $LASTOK_HUB"
 
 # ③ 负锁：feed 不许再"整份注入快照"（那是伪造新鲜度与价格互顶的源头）
@@ -18621,7 +18627,7 @@ grep -qF 'return "auth_failed"' internal/data/quote_feed_hub.go || fail161 "auth
 # ⑫ 负锁：不许为行情通道开免鉴权豁口（裁决 14 明确不接受这条路）
 CNT161=$((CNT161 + 1))
 # wc -l 会带前导空格，必须先去掉再做数值比较（本仓 §P2-L 那类"读数被格式骗"的同族坑）
-HEALTH_EXEMPT=$(grep -cE 'parsed.path != "/health"' qmt_gateway/gateway.py)
+HEALTH_EXEMPT=$(grep -cE 'parsed.path != "/health"' qmt_gateway/gateway.py || true)
 [ "${HEALTH_EXEMPT:-0}" = "1" ] || fail161 "网关免鉴权豁免位不再是唯一一处 /health（现测 $HEALTH_EXEMPT 处；裁决 14 不接受给 /quotes 开鉴权豁口）"
 
 # ⑫b 每票源标记（A3）：字段、开关、后备源标记次序三处都在，且显式关时字段为 omitempty
@@ -18678,17 +18684,17 @@ grep -qE 'from xtquant import xtdata' scripts/probe_qmt_feed.py || fail161 "探�
 CNT161=$((CNT161 + 1))
 grep -qF 'func feedOn(v *bool) bool { return v == nil || *v }' internal/config/config.go || fail161 "出厂开的判据 feedOn 丢了或被逐键改写（四枚指针位必须同源）"
 CNT161=$((CNT161 + 1))
-for k in QMTFeedOn QMTFeedPrimaryOn QuotePerCodeSourceOn QuoteHubConsultOn; do
+for k in QMTFeedOn QMTFeedPrimaryOn QuotePerCodeSourceOn QuoteHubConsultOn IndexFallbackSourcesOn IndexBreakerScopeOn QuoteFeedIndexOn; do
 	grep -qF "func (r RuntimeConfig) ${k}() bool { return feedOn(r." internal/config/config.go || fail161 "生效值访问器 $k 丢了或不走 feedOn"
 done
 CNT161=$((CNT161 + 1))
-for pair in 'qmt_feed_enabled.QMTFeedOn' 'qmt_feed_primary.QMTFeedPrimaryOn' 'quote_per_code_source.QuotePerCodeSourceOn' 'quote_hub_consult.QuoteHubConsultOn'; do
+for pair in 'qmt_feed_enabled.QMTFeedOn' 'qmt_feed_primary.QMTFeedPrimaryOn' 'quote_per_code_source.QuotePerCodeSourceOn' 'quote_hub_consult.QuoteHubConsultOn' 'index_fallback_sources.IndexFallbackSourcesOn' 'index_breaker_scope.IndexBreakerScopeOn' 'quote_feed_index_enabled.QuoteFeedIndexOn'; do
 	key=${pair%%.*}; acc=${pair##*.}
 	grep -qE "\"${key}\":[[:space:]]+rt\.${acc}\(\)" internal/server/handlers_runtime_config.go || fail161 "设置页读面 $key 没下发生效值（下发原始指针 ⇒ 出厂态显示成 null，开关看着像坏的）"
 done
 CNT161=$((CNT161 + 1))
-if grep -qE '"(qmt_feed_enabled|qmt_feed_primary|quote_per_code_source|quote_hub_consult)":[[:space:]]+rt\.(QMTFeedEnabled|QMTFeedPrimary|QuotePerCodeSource|QuoteHubConsult)[,)]' internal/server/handlers_runtime_config.go; then
-	fail161 "设置页读面把指针位原样下发（出厂态会变 null）——四枚开关必须走 *On() 生效值"
+if grep -qE '"(qmt_feed_enabled|qmt_feed_primary|quote_per_code_source|quote_hub_consult|index_fallback_sources|index_breaker_scope|quote_feed_index_enabled)":[[:space:]]+rt\.(QMTFeedEnabled|QMTFeedPrimary|QuotePerCodeSource|QuoteHubConsult|IndexFallbackSources|IndexBreakerScope|QuoteFeedIndexEnabled)[,)]' internal/server/handlers_runtime_config.go; then
+	fail161 "设置页读面把指针位原样下发（出厂态会变 null）——七枚开关（含 §INDEX-BLIND 三枚指数键）必须走 *On() 生效值"
 fi
 
 # ⑯ 通畅自证（owner 2026-11-01「默认打开＋要保证数据源通畅、功能如预期上线」）：
@@ -18710,7 +18716,7 @@ grep -qF 'fetcher.SetFeedPolicy(data.FeedPolicyFromRuntime(rt))' cmd/quant/main.
 CNT161=$((CNT161 + 1))
 grep -qF 'return data.FeedPolicyFromRuntime(rt)' internal/server/handlers_runtime_config.go || fail161 "设置页热更没走唯一构建器 FeedPolicyFromRuntime"
 CNT161=$((CNT161 + 1))
-BUILDER_COPY=$(grep -rlE 'data\.FeedPolicy\{|FeedPolicy\{$' --include='*.go' cmd internal | grep -v _test | tr '\n' ' ')
+BUILDER_COPY=$(grep -rlE 'data\.FeedPolicy\{|FeedPolicy\{$' --include='*.go' cmd internal | grep -v _test | tr '\n' ' ' || true)
 [ "$BUILDER_COPY" = "internal/data/quote_feed_hub.go " ] || fail161 "FeedPolicy 字面量构造点应只剩 data 侧一处，实测：$BUILDER_COPY"
 
 # 地址与钥匙同源（2026-11-01 现网实测的最后一颗雷）：全局 gateway_url 是本机公网 IP，
@@ -18749,8 +18755,8 @@ CNT162=$((CNT162 + 1))
 grep -qF 'logRuntimeSwitches(cfgMgr)' cmd/quant/main.go || fail162 "启动清单没被调用（写了等于没写）"
 # 清单条数与"本批开关数"等值：新增一个开关却不进清单 ⇒ 这条当场红
 CNT162=$((CNT162 + 1))
-SWITCH_LINES=$(grep -c '§SWITCH 状态' cmd/quant/runtime_switches.go)
-[ "$SWITCH_LINES" = "11" ] || fail162 "启动清单应逐键 11 条（新增开关必须同批进清单），现测 $SWITCH_LINES"
+SWITCH_LINES=$(grep -c '§SWITCH 状态' cmd/quant/runtime_switches.go || true)
+[ "$SWITCH_LINES" = "14" ] || fail162 "启动清单应逐键 14 条（新增开关必须同批进清单并整表重编号），现测 $SWITCH_LINES"
 # 关着也统计：网关 would_label 与 Go 读面 would-label 两条腿都必须在
 CNT162=$((CNT162 + 1))
 grep -qF 'self._orders_sub_would_label_seen.add(oid)' qmt_gateway/gateway.py || fail162 "网关关态的 would_label 计数丢了"
@@ -18765,7 +18771,7 @@ CNT162=$((CNT162 + 1))
 grep -qF 'now-prev < 60' internal/server/qmt.go || fail162 "关态留痕没有 60s 节流（400 只 × 每 3s 的刷屏形状）"
 CNT162=$((CNT162 + 1))
 # 只数 .py 源文件：tests/__pycache__ 里的 .pyc 也会命中同一串，不过滤会把 1 个数成 2
-FOUND162=$(grep -rlF --include='*.py' 'test_off_state_still_counts_would_label' qmt_gateway/tests | wc -l | tr -d ' ')
+FOUND162=$(grep -rlF --include='*.py' 'test_off_state_still_counts_would_label' qmt_gateway/tests | wc -l | tr -d ' ' || true)
 [ "$FOUND162" = "1" ] || fail162 "关态留痕的网关用例不在册（命中 $FOUND162 个源文件）"
 
 # feed 侧的关态读数（追加裁决 15 的 L2 另一半）：观察模式必须报"本可以改写/是否可开主源"
@@ -18853,7 +18859,7 @@ CNT163=$((CNT163 + 1))
 # 取"同步调用点往上 16 行"这段窗口：defer/recover 就写在 goroutine 开头、紧贴调用点。
 # 用 awk 区间从全文第一个 `go func() {` 起算会框进无关 goroutine（恒假红，本次实测踩过），
 # 按行号取窗口与 gofmt 的重排也无关。
-LN163C=$(grep -n 'dc.SyncConcepts(st, 0)' "$EG" | head -1 | cut -d: -f1)
+LN163C=$(grep -n 'dc.SyncConcepts(st, 0)' "$EG" | head -1 | cut -d: -f1 || true)
 [ -n "$LN163C" ] || fail163 "概念库日同步调用点找不到了（§C1-V2 搬迁了，本锁需同批更新）"
 if [ -n "$LN163C" ]; then
 	SEG163C=$(sed -n "$((LN163C - 16)),${LN163C}p" "$EG")
@@ -18985,5 +18991,279 @@ grep -qF '"Xt" "QuantTrader"' scripts/probe_qmt_feed.py || fail164 "探针判据
 
 [ "$B164_FAILED" = "0" ] || exit 1
 echo "ok - §164 §STARVE-STALE 锁通过（J0 视图与计数 4 + 数据面负锁 1 + 观测位 1 + 缺省关 2 + 边界接线 2 + 分账负锁 1 + 用例在册 2 + 清单点名 1 + 设置页回显 1 + 前端分形 3 + 探针双自锁 4，累计判定点 ${CNT164}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §165 §INDEX-BLIND（2026-11-02 晚批：大盘指数多源腿 + 盲区维度指认 + 盲区告警）
+# 成因不是推测，是当天现网的读数：东财 push2/push2delay 对这台机器间歇 TLS 重置（EOF），
+# 而"大盘指数"这一维只有东财一族 + 10 分钟 last-known-good ⇒ 14:36 起 IndexChangePct=NaN，
+# 目标封顶半仓、当日 T 整体关闭，全天 545/859 条决策快照在盲区态；同期告警一次没响
+# （broker_feed_unavailable 13:05 倒是 fire 过 ⇒ 通道活着，缺的就是这条规则）。
+# owner 四条裁决落在这里：① 三枚键出厂即开；② LKG 行为不动（只把"陈旧"如实报出来）；
+# ③ 盲区两档（必推 + 日汇总）；④ §A7-3 券商侧白名单与用例先到位、开关打开、等 QMT。
+# 本段所有计数赋值都带 || true（§89 那把尺子在本批之前命中 12 处裸赋值，已同批加固）。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 165 §INDEX-BLIND（指数段序与独立熔断域 / 个股函数不被污染 / 维度出口全链 / 告警两条 / 常驻反证）..."
+B165_FAILED=0
+fail165() {
+	echo "--- FAIL: §165 $*"
+	FAIL=1
+	B165_FAILED=1
+}
+CNT165=0
+
+MI165=internal/data/market_index.go
+MK165=internal/data/market.go
+EG165=internal/engine/engine.go
+FT165=internal/engine/funds_today.go
+TL165=internal/engine/tlive_state.go
+SZ165=internal/signalctl/sizing.go
+SC165=internal/signalctl/signalctl.go
+CFG165=internal/config/config.go
+RT165=internal/server/handlers_runtime_config.go
+SW165=cmd/quant/runtime_switches.go
+SL165=internal/engine/scoring_loop.go
+QC165=internal/trading/qmt_client.go
+QF165=internal/data/qmt_feed.go
+HUB165=internal/data/quote_feed_hub.go
+
+# ① 三枚指数键是"缺键=开"的指针位，且默认值表里不许出现它们（写了值＝给回滚留第二真源）
+CNT165=$((CNT165 + 1))
+DECL165=$(grep -cE '^[[:space:]]*(IndexFallbackSources|IndexBreakerScope|QuoteFeedIndexEnabled) \*bool .json:"(index_fallback_sources|index_breaker_scope|quote_feed_index_enabled),omitempty"' "$CFG165" || true)
+[ "$DECL165" = "3" ] || fail165 "三枚指数键不是各占一行的 omitempty 指针位（实得 $DECL165；裸 bool 会把「没填」读成 false＝出厂关）"
+CNT165=$((CNT165 + 1))
+RUNTIME_DEFAULT=$(awk '/Runtime: RuntimeConfig\{/,/\}/' "$CFG165" | grep -cE 'Index|QuoteFeedIndex' || true)
+[ "${RUNTIME_DEFAULT:-0}" = "0" ] || fail165 "DefaultRules 的 Runtime 段里写了指数键（$RUNTIME_DEFAULT 处）——出厂开必须靠「配置里没有这个键」，写进默认值等于造第二个真源"
+CNT165=$((CNT165 + 1))
+for acc in IndexFallbackSourcesOn IndexBreakerScopeOn QuoteFeedIndexOn; do
+	grep -qF "func (r RuntimeConfig) ${acc}() bool { return feedOn(r." "$CFG165" || fail165 "生效值访问器 ${acc} 丢了或不走 feedOn（出厂开语义必须与行情四键同源）"
+done
+
+# ② 个股前缀/解析函数一个字都不许带上指数分支（被下单/风控/涨跌停共用）
+CNT165=$((CNT165 + 1))
+[ -f "$MI165" ] || fail165 "market_index.go 不在位（指数腿不独立成文件，早晚会长回个股函数里）"
+CNT165=$((CNT165 + 1))
+SEG165SIN=$(awk '/^func sinaQuoteURL\(/,/^\}/' "$MK165" || true)
+SEG165TXQ=$(awk '/^func \(m \*MarketAPI\) getTencentQuotes\(/,/^\}/' "$MK165" || true)
+SEG165TXP=$(awk '/^func tencentPrefix\(/,/^\}/' internal/data/tencent.go || true)
+for pair in "sinaQuoteURL|$SEG165SIN" "getTencentQuotes|$SEG165TXQ" "tencentPrefix|$SEG165TXP"; do
+	fn165=${pair%%|*}; body165=${pair#*|}
+	[ -n "$body165" ] || { fail165 "取不到 ${fn165} 函数体（锚漂了＝这条锁是摆设，§164 那枚静态负锁就是这么抓出来的）"; continue; }
+	CODE165=$(printf '%s\n' "$body165" | grep -vE '^[[:space:]]*//' || true)
+	if grep -qE 'index|Index|399|000001' <<<"$CODE165"; then
+		fail165 "${fn165} 里出现指数分支（个股前缀函数不许为指数改动）"
+	fi
+done
+
+# ③ 编排器：四段腿签名、指数不走个股 map、来源如实带出
+CNT165=$((CNT165 + 1))
+for fn in indexLiveFromEastMoney indexLiveFromSina indexLiveFromTencent indexBrokerLeg; do
+	grep -qE "func \(m \*MarketAPI\) ${fn}\(code string\) \(\*IndexLiveQuote, error\)" "$MI165" || fail165 "${fn} 签名不是「单值返回 + error」（返回 map 就会与个股同码撞键）"
+done
+CNT165=$((CNT165 + 1))
+SEG165ORG=$(awk '/^func \(m \*MarketAPI\) GetIndexLiveQuote\(/,/^\}/' "$MK165" || true)
+[ -n "$SEG165ORG" ] || fail165 "取不到 GetIndexLiveQuote 函数体（编排器被搬走或改名，本锁失明）"
+grep -qF 'indexLegs(' <<<"$SEG165ORG" || fail165 "GetIndexLiveQuote 不再走编排器（段序散回各源内部＝没人知道实际试了谁）"
+grep -qF 'return nil, fmt.Errorf' <<<"$SEG165ORG" || fail165 "三条腿全断且无 LKG 时必须返回 error——那是上层判盲区的唯一依据，不许被放宽成中性值"
+CNT165=$((CNT165 + 1))
+# 负锁只看**可执行行**：本文件头就写着"不许复用 getSinaQuotes/getTencentQuotes"这句说明，
+# 逐行判注释会把它自己判成违例（§164 的探针自检、§10-29 的 Python 缩进同族教训）。
+CODE165MI=$(grep -vE '^[[:space:]]*//' "$MI165" || true)
+if grep -qE 'map\[string\]\*StockInfo|getSinaQuotes\(|getTencentQuotes\(' <<<"$CODE165MI"; then
+	fail165 "指数腿复用个股批量解析（新浪/腾讯正则捕获裸 6 位码：000001 的指数与平安银行会互相覆盖）"
+fi
+CNT165=$((CNT165 + 1))
+grep -qF 'Source string' "$MK165" || fail165 "IndexLiveQuote 没有 Source 栏（谁给的点位必须可证伪）"
+
+# ④ 量纲：指数腿一律不带量/额（实测同日新浪与腾讯对指数回同一个 565372836，单位却不一致）
+CNT165=$((CNT165 + 1))
+SEG165ILQ=$(awk '/^type IndexLiveQuote struct/,/^\}/' "$MK165" || true)
+if grep -qE 'Volume|Amount' <<<"$SEG165ILQ"; then
+	fail165 "IndexLiveQuote 出现了量/额字段（VWAP/换手/流动性会把指数当个股吃）"
+fi
+CNT165=$((CNT165 + 1))
+if grep -qE '\.(Volume|Amount)[[:space:]]*=' "$MI165"; then
+	fail165 "指数腿给量/额赋值（单位对指数不可信，见本段文件头实测注）"
+fi
+
+# ⑤ §A7-3 券商侧：独立后缀白名单 + 独立键空间 + 不进分母 + 关掉即清空
+CNT165=$((CNT165 + 1))
+grep -qE 'func IndexSuffix\(code string\) \(string, bool\)' "$MI165" || fail165 "指数后缀白名单不在位（复用 ExchangeSuffix 就是把上证点位换成平安银行）"
+grep -qF 'func BrokerIndexCodes() []string' "$MI165" || fail165 "券商侧指数请求集合没有单点定义"
+CNT165=$((CNT165 + 1))
+grep -qF 'func (c *QMTClient) IndexQuotes(' "$QC165" || fail165 "客户端没有指数专用取数方法"
+SEG165IDX=$(awk '/^func \(c \*QMTClient\) IndexQuotes\(/,/^\}/' "$QC165" || true)
+[ -n "$SEG165IDX" ] || fail165 "取不到 IndexQuotes 函数体（锚漂了）"
+if grep -qF 'k = k[:i]' <<<"$SEG165IDX"; then
+	fail165 "IndexQuotes 把返回键剥成了裸码（000001.SH 与 000001.SZ 会撞成一个键，上证点位可能来自平安银行）"
+fi
+CNT165=$((CNT165 + 1))
+grep -qF 'IndexEnabled:    rt.QuoteFeedIndexOn(),' "$HUB165" || fail165 "券商指数开关没走 FeedPolicyFromRuntime 单点构建器（两条装配路各写一份必漂）"
+CNT165=$((CNT165 + 1))
+SEG165POL=$(awk '/^func \(f \*Fetcher\) SetFeedPolicy\(/,/^\}/' "$HUB165" || true)
+grep -qF 'delete(h.idxEnts, k)' <<<"$SEG165POL" || fail165 "关掉券商指数时没清分账（刚做的回滚在读数上看不见）"
+CNT165=$((CNT165 + 1))
+grep -qF 'f.pollIndexCodes(ctx)' "$QF165" || fail165 "feed 每轮没调指数段（写了不跑＝没有）"
+grep -qF 'denom++' "$QF165" || fail165 "覆盖率分母计数不在位（本锁要靠它确认指数没进分母）"
+if grep -qF 'idxEnts' "$QF165"; then
+	fail165 "指数分账伸进了主池/分母那段代码（一只没有可交易价的指数会稀释 coverage 并制造混源账）"
+fi
+
+# ⑥ 引擎侧：盲区出声、只读判定+唯一写入点、档位判据、量规喂数
+CNT165=$((CNT165 + 1))
+grep -qF '§DYN-BLIND' "$EG165" || fail165 "盲区不出声（今天 NaN 这条路径一行日志都没有，只能靠时间线反推）"
+CNT165=$((CNT165 + 1))
+grep -qF 'func (e *Engine) blindLogDue(' "$FT165" || fail165 "节流判定函数不在位"
+grep -qF 'func (e *Engine) markBlindLogged(' "$FT165" || fail165 "唯一写入点不在位（判定里顺手推基线＝§FIX-20261028-F02 的老形状）"
+CNT165=$((CNT165 + 1))
+grep -qF 'func (e *Engine) blindAlertCode(' "$FT165" || fail165 "盲区档位判据不在位（规则与卡片必须读同一套档）"
+CNT165=$((CNT165 + 1))
+grep -qF 'metrics.SetGauge("sizing_blind_state", blindCode)' "$SL165" || fail165 "盲区量规没喂数（规则退化成永不触发的死规则，§DEADGAUGE 同族）"
+CNT165=$((CNT165 + 1))
+SEG165GAUGE=$(awk '/^func \(e \*Engine\) refreshStalenessGauges\(/,/^\}/' "$SL165" || true)
+grep -qF 'IsContinuousTrade(' <<<"$SEG165GAUGE" || fail165 "盲区量规丢了盘中判据（全天候写值＝每天一条假故障）"
+
+# ⑦ 维度出口：定权结果 → 决策 → 定权上下文（一处漏填就静默丢维度）
+CNT165=$((CNT165 + 1))
+grep -qE 'MissingKeyDims[[:space:]]*\[\]string' "$SZ165" || fail165 "SizingResult 没带维度清单出口（applyMissingKeyCap 明明算得出来）"
+CNT165=$((CNT165 + 1))
+SEG165CAP=$(awk '/^func applyMissingKeyCap\(/,/^\}/' "$SZ165" || true)
+grep -qF 'res.MissingKeyDims = append([]string(nil)' <<<"$SEG165CAP" || fail165 "applyMissingKeyCap 没填维度清单（或没深拷贝）"
+CNT165=$((CNT165 + 1))
+CAPN165=$(grep -c 'applyMissingKeyCap(r, cfg, &res)' "$SZ165" || true)
+[ "$CAPN165" = "2" ] || fail165 "两个装配分支的封顶调用点不再是 2（实得 $CAPN165；只改一支＝默认一切换 power_mean 就丢维度）"
+CNT165=$((CNT165 + 1))
+grep -qF 'd.MissingKeyDims = append([]string(nil), res.MissingKeyDims...)' "$SC165" || fail165 "Decision 没把维度清单同组带出（执行层与快照就只剩一枚 bool）"
+CNT165=$((CNT165 + 1))
+SEG165CTX=$(awk '/^func \(e \*Engine\) sizingContextFor\(/,/^\}/' "$FT165" || true)
+for key in 'Missing:' 'MissingDims:' 'IndexSource:' 'IndexStale:' 'IndexPct:'; do
+	grep -qF "$key" <<<"$SEG165CTX" || fail165 "sizingCtx 字面量漏键 ${key}（§163「手搓字面量漏 ctrl 打死进程」同形状，这里漏的是维度与来源）"
+done
+
+# ⑧ 资金帧 / 纸面注入 / 决策原因
+CNT165=$((CNT165 + 1))
+for tok in 'missing_key_dims' 'index_source' 'index_stale'; do
+	grep -qF "$tok" "$TL165" || fail165 "资金帧缺字段 $tok（前端要显示维度就只能再靠时间线反推）"
+done
+CNT165=$((CNT165 + 1))
+grep -qE 'func \(e \*Engine\) SetSizingContext\(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims \[\]string\)' internal/paper/paper.go || fail165 "SetSizingContext 没把 dims 做成必传参数（可选 setter 或可变参数都允许漏传，而「漏传」正是本批的靶子）"
+CNT165=$((CNT165 + 1))
+INJECT165=$(grep -rl 'SetSizingContext(' --include='*.go' internal | grep -v _test | sort | tr '\n' ' ' || true)
+[ "$INJECT165" = "internal/engine/intraday_t.go internal/paper/paper.go " ] || fail165 "纸面注入点不再是「调用一处 + 定义一处」（实测：$INJECT165）——两处各注入一套就是 §F-3 漂移家族"
+CNT165=$((CNT165 + 1))
+grep -qF '关键读数缺失' "$EG165" || fail165 "决策原因里没拼维度名（signal_decisions 不加列：schemaVersion=2 有断言锁）"
+if grep -rqE 'ALTER TABLE signal_decisions ADD COLUMN (missing_key_dims|index_source)' internal/store/; then
+	fail165 "给 signal_decisions 加列了（本批明确走 reason 文本承载）"
+fi
+CNT165=$((CNT165 + 1))
+grep -qF 'MissingDimsSuffix' internal/paper/t_rounds.go || fail165 "维度后缀文案没有单点（纸面与实盘各写一份就对不上账）"
+
+# ⑨ 告警两条：判据、路由、数据面隔离
+CNT165=$((CNT165 + 1))
+grep -qF '{Name: "market_data_blind", Metric: "sizing_blind_state", Op: "ge", Threshold: 3' internal/metrics/alerter.go || fail165 "盲区必推规则丢了或判据被改（ge 3 才让「兜底中」的 2 不响）"
+grep -qF '{Name: "market_data_stale", Metric: "sizing_blind_state", Op: "ge", Threshold: 2' internal/metrics/alerter.go || fail165 "陈旧档规则丢了（owner 裁决 3 要的那一日汇总档）"
+CNT165=$((CNT165 + 1))
+grep -qE '"market_data_blind":[[:space:]]*RoutePush,' internal/metrics/alert_routing.go || fail165 "盲区规则没显式进必推（缺条目会掉进 DefaultRoute，§114 分桶闭合也红）"
+grep -qE '"market_data_stale":[[:space:]]*RouteDaily,' internal/metrics/alert_routing.go || fail165 "陈旧档没显式进日汇总"
+CNT165=$((CNT165 + 1))
+if grep -qE 'Degrade[[:space:]]*=|healthOK' <<<"$SEG165GAUGE"; then
+	fail165 "盲区告警写进了数据面/健康线（owner 边界：观测不带动降级链，§164 的 J0 同规）"
+fi
+
+# ⑩ 用例与写面在册
+CNT165=$((CNT165 + 1))
+for tc in TestIndexFallbackChainOrder TestIndexFallbackOffIsEastMoneyOnly TestIndexNotParsedAsStock TestIndexCarriesNoVolumeOrAmount TestIndexMarketPrefixWhitelist TestIndexSourceURLs TestIndexLKGKeepsOriginalSource TestIndexAllLegsFailPastLKGWindow TestIndexZeroValueMarketAPIStaysFactoryOn; do
+	grep -rqF "func ${tc}(" internal/data/ || fail165 "指数用例 ${tc} 不在册"
+done
+CNT165=$((CNT165 + 1))
+for tc in TestIndexSuffixNotPolluted TestBrokerIndexCodes TestBrokerIndexLedgerIsolated TestBrokerIndexStaleIsAbsent TestIndexBrokerLegFirstAndNotStock; do
+	grep -rqF "func ${tc}(" internal/data/ || fail165 "券商侧指数用例 ${tc} 不在册"
+done
+CNT165=$((CNT165 + 1))
+for tc in TestSizingCtxLiteralCarriesAllKeys TestFundsFrameCarriesDimsAndSource TestDynDecisionReasonNamesBlindDim TestBlindAlertCodeTiers TestBlindLogThrottleIsOneWritePoint TestBlindLineNamesDimension TestIndexCacheHitKeepsStaleFlag TestBlindGaugeRuleKeyAligned TestRefreshStalenessFeedsBlindGauge TestBlindAlertDoesNotTouchDataPlane; do
+	grep -rqF "func ${tc}(" internal/engine/ || fail165 "引擎侧用例 ${tc} 不在册"
+done
+CNT165=$((CNT165 + 1))
+for tc in TestMissingKeyDimsEnumeratesEachDimension TestMissingKeyDimsCoveredInBothSizingBranches TestMissingDimsAbsentMeansNotBlind TestDimsSliceIsDeepCopied; do
+	grep -rqF "func ${tc}(" internal/signalctl/ || fail165 "定权用例 ${tc} 不在册"
+done
+CNT165=$((CNT165 + 1))
+for tc in TestIndexQuotesKeepsSuffixedKeys TestQuotesStillStripsSuffix TestIndexQuotesEmptyRequestIsNoop; do
+	grep -rqF "func ${tc}(" internal/trading/ || fail165 "客户端键空间用例 ${tc} 不在册"
+done
+CNT165=$((CNT165 + 1))
+for tc in '盲区态显示缺失维度名' '陈旧兜底态不吃盲区文案，也不显示封顶结论'; do
+	grep -qF "$tc" web/src/__tests__/missing_key_dims_20261102.test.jsx || fail165 "前端用例缺一条：$tc"
+done
+CNT165=$((CNT165 + 1))
+for tok in 'index_fallback_sources' 'index_breaker_scope' 'quote_feed_index_enabled'; do
+	grep -qF "$tok" "$RT165" || fail165 "设置页写面缺键 $tok"
+	grep -qF "$tok" "$SW165" || fail165 "启动清单没点名 $tok（关着与没这功能在日志里会长成同一个样子）"
+done
+CNT165=$((CNT165 + 1))
+grep -qF 'index_fallback_sources' web/src/pages/QuoteFeedConfigCard.jsx || fail165 "设置卡缺降级链开关（初值必须取后端生效值）"
+grep -qF '指数降级段序' web/src/pages/QuoteFeedConfigCard.jsx || fail165 "设置卡不回显实际段序（卡上只写开关名，现场仍不知道东财断了有没有人接）"
+CNT165=$((CNT165 + 1))
+grep -qF '六枚勾选框按后端生效值勾选' web/src/__tests__/quote_feed_config_card_20261101.test.jsx || fail165 "设置卡「勾选框数=6」的契约用例没跟着本批改名（等值数是最容易漏的那一栏）"
+
+# ⑪ 常驻反证两枚（副本树里注入破坏 ⇒ 指定用例必须红；锚漂了当场叫出来，§130 同法）
+CNT165=$((CNT165 + 1))
+W165=$(mktemp -d /tmp/gate165-XXXXXX || true)
+if [ -z "$W165" ] || [ ! -d "$W165" ]; then
+	fail165 "反证工作目录建不出来（缺反证＝本段的绿只证明锁会绿，不证明它会红）"
+else
+	mkdir -p "$W165/mirror/internal" || fail165 "反证目录建不起来"
+	for _e in "$PWD"/*; do
+		_b=$(basename "$_e")
+		[ "$_b" = "internal" ] && continue
+		ln -s "$_e" "$W165/mirror/$_b" 2>/dev/null || true
+	done
+	for _e in "$PWD"/internal/*; do
+		_b=$(basename "$_e")
+		case "$_b" in data | engine) continue ;; esac
+		ln -s "$_e" "$W165/mirror/internal/$_b" 2>/dev/null || true
+	done
+	cp -R "$PWD/internal/data" "$W165/mirror/internal/data" || fail165 "反证副本没拷进 data 包"
+	cp -R "$PWD/internal/engine" "$W165/mirror/internal/engine" || fail165 "反证副本没拷进 engine 包"
+
+	# R1：编排器段表里摘掉新浪腿 ⇒ TestIndexFallbackChainOrder 必须红
+	python3 - "$W165/mirror/internal/data/market_index.go" <<'PYR1' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "\t\t\tindexLeg{IndexSourceSina, m.indexLiveFromSina},\n"
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+print("R1_MUTATED=%d" % n)
+PYR1
+	LEGS165=$(grep -c 'indexLeg{IndexSource' "$W165/mirror/internal/data/market_index.go" || true)
+	[ "${LEGS165:-0}" -lt 4 ] || fail165 "反证 R1 没改动任何字节（段表锚漂了，这条绿是假绿）"
+	( cd "$W165/mirror" && go test ./internal/data/ -run 'TestIndexFallbackChainOrder' -count=1 ) >/tmp/gate165_r1.log 2>&1 || true
+	if grep -qE '^ok[[:space:]]' /tmp/gate165_r1.log; then
+		fail165 "反证 R1 失效：摘掉新浪腿后 TestIndexFallbackChainOrder 仍绿（用例没真的在测段序）"
+	fi
+
+	CNT165=$((CNT165 + 1))
+	# R2：把 sizingContextFor 字面量里的 IndexSource 摘掉 ⇒ 装配腿用例必须红
+	python3 - "$W165/mirror/internal/engine/funds_today.go" <<'PYR2' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "\t\tIndexSource: idxSrc,\n"
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+print("R2_MUTATED=%d" % n)
+PYR2
+	HAS165=$(grep -c 'IndexSource:' "$W165/mirror/internal/engine/funds_today.go" || true)
+	WAS165=$(grep -c 'IndexSource:' "$FT165" || true)
+	[ "${HAS165:-0}" -lt "${WAS165:-0}" ] || fail165 "反证 R2 没改动任何字节（字面量锚漂了＝摆设锁，§163 那批的成因）"
+	( cd "$W165/mirror" && go test ./internal/engine/ -run 'TestSizingCtxLiteralCarriesAllKeys' -count=1 ) >/tmp/gate165_r2.log 2>&1 || true
+	if grep -qE '^ok[[:space:]]' /tmp/gate165_r2.log; then
+		fail165 "反证 R2 失效：摘掉 IndexSource 后装配腿用例仍绿（它没在看那个键）"
+	fi
+	rm -rf "$W165"
+fi
+
+[ "$B165_FAILED" = "0" ] || exit 1
+echo "ok - §165 §INDEX-BLIND 锁通过（指针位与出厂开 3 + 个股函数不被污染 2 + 编排器与键冲突 4 + 量纲 2 + 券商侧 A7-3 5 + 引擎出声 5 + 维度出口 5 + 资金帧与纸面 5 + 告警两条 3 + 用例与写面在册 9 + 常驻反证 2，累计判定点 ${CNT165}）"
 echo "==> 全部通过"
 

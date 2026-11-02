@@ -165,17 +165,18 @@ type TRound struct {
 // than degrading to the old cost basis.
 type TParams struct {
 	// ── 开关与环境 ──
-	Enabled         bool    // t.enabled（六轮：实盘也默认开）
-	BuyFirst        bool    // 允许正 T
-	SellFirst       bool    // 允许反 T
-	MaxRounds       int     // 单码单日最大回转组数（防抖主力，灰度期=1）
-	CapPct          float64 // 单票 T 上限（占该股当前持仓%）
-	MinSpreadPct    float64 // 第二腿配对价差%
-	ForceUnwindHM   string  // 尾盘判定时刻 HHMM
-	MarketScale     float64 // 本轮 MarketScale（账户级，逐票不漂）
-	MissingKeyInput bool    // 关键市场读数缺失 ⇒ 整个 T 关闭（§1.5）
-	Shadow          bool    // 影子期 ⇒ 整个 T 关闭
-	DayBlocked      bool    // 熔断日 ⇒ 两向都不开
+	Enabled         bool     // t.enabled（六轮：实盘也默认开）
+	BuyFirst        bool     // 允许正 T
+	SellFirst       bool     // 允许反 T
+	MaxRounds       int      // 单码单日最大回转组数（防抖主力，灰度期=1）
+	CapPct          float64  // 单票 T 上限（占该股当前持仓%）
+	MinSpreadPct    float64  // 第二腿配对价差%
+	ForceUnwindHM   string   // 尾盘判定时刻 HHMM
+	MarketScale     float64  // 本轮 MarketScale（账户级，逐票不漂）
+	MissingKeyInput bool     // 关键市场读数缺失 ⇒ 整个 T 关闭（§1.5）
+	MissingKeyDims  []string // §INDEX-BLIND：缺的是哪几维（机读码），与上面那枚 bool 同组带出
+	Shadow          bool     // 影子期 ⇒ 整个 T 关闭
+	DayBlocked      bool     // 熔断日 ⇒ 两向都不开
 	// ── 日内口径门槛（§8.4.1/§8.4.4）──
 	VWAPDevPct       float64 // 偏离门（现价相对分时均线）
 	MinAmplitudePct  float64 // 振幅门
@@ -255,7 +256,9 @@ func (e *Engine) RunIntradayT(quotes map[string]*data.StockInfo, p TParams) {
 		return
 	}
 	if p.Shadow || p.MissingKeyInput {
-		e.tNoteBlockLocked("step0", "影子期/关键输入缺失→本轮整体不做T", "")
+		// §INDEX-BLIND：把"缺的是哪一维"一并写进留痕——只有"关键输入缺失"四个字时，
+		// 值班看不出该去查状态机、情绪还是指数（11-02 那天掉的是大盘指数，靠对时间线才认出来）。
+		e.tNoteBlockLocked("step0", "影子期/关键输入缺失"+MissingDimsSuffix(p.MissingKeyDims)+"→本轮整体不做T", "")
 		return
 	}
 	// §8.8 配置自洽告警（**不阻塞**）：配对价差门若高过振幅下限的 80%，这条回转在数学上就几乎配不上对
@@ -1719,3 +1722,13 @@ func (e *Engine) tRegimeBlockReason(p TParams, now time.Time) string {
 
 // tPaperRegimeMinVotes 与实盘 tRegimeMinVotes 同值（= research 状态机的 MinVotes 默认 4）。
 const tPaperRegimeMinVotes = 4
+
+// MissingDimsSuffix 把缺失维度码折成一句后缀（空清单回空串，不写"(缺:)"那种噪音）。
+// 导出的原因：实盘 T 腿（internal/engine）与纸面 T 腿要用**同一句**文案，
+// 两处各拼一遍就会漂成"纸面说缺指数、实盘只说缺失"，而这两本账正是要能对照的。
+func MissingDimsSuffix(dims []string) string {
+	if len(dims) == 0 {
+		return ""
+	}
+	return "(缺:" + strings.Join(dims, "|") + ")"
+}

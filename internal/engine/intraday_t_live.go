@@ -320,7 +320,8 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 	case p.Shadow:
 		r.canOpen, r.openWhy = false, "影子期：目标不可信，不做日内双向操作"
 	case missing:
-		r.canOpen, r.openWhy = false, "关键市场输入缺失（数据盲区）：目标不可信，不做日内双向操作"
+		r.canOpen, r.openWhy = false, "关键市场输入缺失"+paper.MissingDimsSuffix(r.p.MissingKeyDims)+
+			"（数据盲区）：目标不可信，不做日内双向操作"
 	case regimeWhy != "":
 		// §W-09 形态门：位置在 missing 之后、dayBlocked 之前——它和 missing/Shadow 是同一类
 		// （"环境不可信"），而 dayBlocked/cash/total 是"今天的账户状态"。归因顺序上先报环境、
@@ -1088,7 +1089,8 @@ func (r *tLiveRound) strategicAllowedQty(rnd *TRoundLive, price float64, qty int
 	sc := r.e.sizingConfigFor(r.uid)
 	sig := combat_agent.Signal{Code: rnd.Code, Name: rnd.Name, Direction: "做多", Action: "buy", Price: price}
 	allowed, _ := r.e.dynamicBuyQty(sig, price, 0, sc, r.ctrl,
-		dynBudgetCtx{MarketScale: r.p.MarketScale, StockScale: 1.0, MissingKeyInput: r.p.MissingKeyInput})
+		dynBudgetCtx{MarketScale: r.p.MarketScale, StockScale: 1.0,
+			MissingKeyInput: r.p.MissingKeyInput, MissingKeyDims: r.p.MissingKeyDims})
 	if allowed > qty {
 		allowed = qty
 	}

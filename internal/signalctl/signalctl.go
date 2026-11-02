@@ -97,6 +97,10 @@ type Decision struct {
 	MarketScale     float64 `json:"market_scale,omitempty"`
 	StockScale      float64 `json:"stock_scale,omitempty"`
 	MissingKeyInput bool    `json:"missing_key_input,omitempty"`
+	// MissingKeyDims §INDEX-BLIND（2026-11-02）：与上面那枚 bool **同组**带出的维度清单
+	// （market_state / emotion_phase / index_change）。bool 只说"封顶了"，dims 才说"去查谁"——
+	// 分开传就等于允许其中一处漏掉，而漏掉的表现正是本批要消灭的"看得见结论、看不见原因"。
+	MissingKeyDims []string `json:"missing_key_dims,omitempty"`
 	// SizingReasons §DYN-SIZE 命中的定权/加权因子（买入侧"情绪相位×0.50"这类；卖出侧
 	// 卖出加权的触发条件"风险档=Red"这类），供前端 tooltip 与复盘。
 	// English: the sizing / sell-boost factors that fired, for the UI tooltip and post-trade review.
@@ -480,6 +484,9 @@ func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Polic
 	// §DYN-SIZE v4：拆分读数**无条件带出**（哪怕 Scale 恰好 1.0）——执行层的目标仓位与单笔基准
 	// 各自消费 MS/SS，用不到 BuyScale 的那条路径同样必须拿得到它们。
 	d.MarketScale, d.StockScale, d.MissingKeyInput = res.MarketScale, res.StockScale, res.MissingKeyInput
+	// §INDEX-BLIND：维度清单同样**无条件带出**（与 MS/SS 一条纪律），并做深拷贝——
+	// 决策对象会被多个消费方持有（执行层、快照落库、前端），共享底层数组就是互相写。
+	d.MissingKeyDims = append([]string(nil), res.MissingKeyDims...)
 	return false
 }
 
