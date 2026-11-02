@@ -419,9 +419,19 @@ func (e *Engine) publishTFundsHeartbeat(uid string) {
 	p, _, missing := e.tParamsFor(uid, sc.T, sc.ShadowOn())
 	p.MissingKeyInput = missing
 	quotes := e.snapshotQuotes()
+	// 这一轮是**只读轮次**：它只为资金帧取数，不开腿、不撤单、不收摊，所以 force/canOpen 刻意留零值。
+	// 但凡是轮次对象可能被读到的装配字段都必须填齐——2026-11-02 盘中实录：这里漏了 `ctrl`，
+	// §P1（bb85a36）之后 totalAssetsOf 改走 r.ctrl.GetRealAccountFor，nil 接收器解引用把整个
+	// 进程在 10s 心跳里打死，现网 130+ 次重启、整天零买入评估（打分循环从没跑到）。
+	// day/dash 与两张缓存同理：`dash=""` 会让按日过滤静默返回空账（把"读不到"伪装成"当日无盈亏"），
+	// nil map 一旦被写即 panic——留空等于给下一笔改动埋同一颗雷。
 	r := &tLiveRound{
-		e: e, uid: uid, db: db, st: st, p: p, now: now, quotes: quotes,
-		positions: map[string]store.RealPosition{}, prices: map[string]float64{},
+		e: e, uid: uid, ctrl: ctrl, db: db, st: st, p: p, now: now, quotes: quotes,
+		day: cntime.DayCompactOf(now), dash: cntime.DayOf(now),
+		positions:     map[string]store.RealPosition{},
+		prices:        map[string]float64{},
+		legFactsCache: map[string]map[string]*tLiveLegFact{},
+		ordersCache:   map[string]map[string][]store.RealOrder{},
 	}
 	poses, err := db.RealPositionsForUser(uid)
 	if err != nil {

@@ -22,12 +22,15 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 )
@@ -198,12 +201,29 @@ func (e *Engine) StartFundsLoop(ctx context.Context) {
 				if !data.IsActiveSession(time.Now()) {
 					continue
 				}
-				e.publishSignalFunds(e.primaryMember(), e.snapshotQuotes())
-				// §FUNDS-TODAY：T 侧也走同一心跳——它原本挂在打分轮上，慢轮时 t_at 会长时间不动。
-				e.publishTFundsHeartbeat(e.primaryMember())
+				// 只读观测腿**不许成为交易链的停机原因**：2026-11-02 盘中实录，这一腿里
+				// publishTFundsHeartbeat 踩到 nil 控制器，10s 一跳每跳必崩，现网 130+ 次重启、
+				// 整天零买入评估——资金帧少一帧只是卡片难看，进程被打死是没人在管持仓。
+				// recover 按**每一跳**收在循环内：挂在 goroutine 顶部只兜第一次，之后心跳静默
+				// 停摆＝另一种"降级报成功"（§读不到就说读不到 的同一条纪律）。
+				e.runFundsTickGuarded()
 			}
 		}
 	}()
+}
+
+// runFundsTickGuarded 一跳的取值与发布，panic 只丢这一跳（不丢心跳、更不丢进程）。
+// 栈原样落 stderr：今天的定位完全靠它，吞掉异常文本等于把下次排障退回盲猜。
+func (e *Engine) runFundsTickGuarded() {
+	defer func() {
+		if r := recover(); r != nil {
+			metrics.PanicRecovered()
+			log.Printf("[funds] 资金心跳 panic（本跳跳过，不影响下单链）: %v\n%s", r, debug.Stack())
+		}
+	}()
+	e.publishSignalFunds(e.primaryMember(), e.snapshotQuotes())
+	// §FUNDS-TODAY：T 侧也走同一心跳——它原本挂在打分轮上，慢轮时 t_at 会长时间不动。
+	e.publishTFundsHeartbeat(e.primaryMember())
 }
 
 // publishSignalFunds 发布当日资金帧的**信号仓侧**。
