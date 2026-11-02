@@ -32,7 +32,10 @@ export function blindTag(readout) {
       text: dims ? `关键读数缺失（${dims}）：目标封顶半仓且今日不做 T` : '关键读数缺失：目标封顶半仓且今日不做 T',
     }
   }
-  if (readout.index_stale || (readout.index_source && readout.index_source !== 'eastmoney')) {
+  // 主源档：东财现取与券商 L1 现取都算健康（QMT-L1 是 owner 定的第一优先源，
+  // 把它报成"兜底中"会让人以为主链在退——那是指错处置方向的假告警）。
+  const primary = readout.index_source === 'eastmoney' || readout.index_source === 'QMT-L1'
+  if (readout.index_stale || (readout.index_source && !primary)) {
     const src = readout.index_source || '未知源'
     return { theme: 'warning', text: `指数为兜底读数（来源 ${src}${readout.index_stale ? '，陈旧回退' : ''}）` }
   }

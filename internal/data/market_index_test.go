@@ -20,8 +20,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"quant-trading-v2/internal/config"
 )
 
 // fakeRT 按主机返回预制响应或错误，并记录每个主机的请求次数与最后一次请求行。
@@ -167,7 +165,7 @@ func TestIndexFallbackOffIsEastMoneyOnly(t *testing.T) {
 		t.Fatalf("开关关掉却仍拨腾讯 %d 次", n)
 	}
 	// 出厂态也必须与关掉时不同（证明"出厂开"真的是开），并顺手锁住出厂段序
-	if got := config.IndexFallbackOrder(); strings.Join(got, ",") != "eastmoney,sina,tencent" {
+	if got := IndexLegOrderFor(true, false); strings.Join(got, ",") != "eastmoney,sina,tencent" {
 		t.Fatalf("段序真源漂了：%v", got)
 	}
 	m2, _ := newFakeMarket(t, map[string][]byte{"hq.sinajs.cn": []byte(sinaIndexBody)}, true, true)
@@ -477,5 +475,28 @@ func TestIndexBrokerLegFirstAndNotStock(t *testing.T) {
 	m2.SetIndexSourcePolicy(true, true)
 	if q2, err := m2.GetIndexLiveQuote("000001"); err != nil || q2.Source != IndexSourceEastMoney {
 		t.Fatalf("未注入券商来源时应照走东财：%+v err=%v", q2, err)
+	}
+}
+
+// TestIndexLegOrderReflectsInjection 段序读数必须说真话：券商段只在**被注入**时出现在表里。
+// 为什么单独一条：设置卡回显的就是这个串；它按开关推算就会漏掉券商段，
+// 于是"卡上三条、实际四条"这种分家在现场完全看不出来（本批实测自己就踩过一次）。
+func TestIndexLegOrderReflectsInjection(t *testing.T) {
+	m := NewMarketAPI()
+	m.SetIndexSourcePolicy(true, true)
+	if got := strings.Join(m.IndexLegOrder(), ","); got != "eastmoney,sina,tencent" {
+		t.Fatalf("未注入券商段时段序应为三条外部腿，得 %s", got)
+	}
+	m.SetIndexBrokerSource(func(string) (*IndexLiveQuote, bool) {
+		return &IndexLiveQuote{Price: 3640, PrevClose: 3599, Source: IndexSourceBroker}, true
+	})
+	if got := strings.Join(m.IndexLegOrder(), ","); got != "QMT-L1,eastmoney,sina,tencent" {
+		t.Fatalf("注入后券商段必须排最前（owner 裁决：行情以券商为准），得 %s", got)
+	}
+	// 降级链关掉：只剩东财 + 券商（券商段不受这个键管，它受 quote_feed_index_enabled 管）
+	m2 := NewMarketAPI()
+	m2.SetIndexSourcePolicy(false, true)
+	if got := strings.Join(m2.IndexLegOrder(), ","); got != "eastmoney" {
+		t.Fatalf("关掉后备腿后应只剩东财，得 %s", got)
 	}
 }

@@ -188,6 +188,21 @@ func (dc *DataCoordinator) SetIndexSourcePolicy(fallbackOn, scopeOn bool) {
 	api.SetIndexSourcePolicy(fallbackOn, scopeOn)
 }
 
+// IndexLegOrder 转发底层 MarketAPI 的"实际指数降级段序"读数（只读，不改任何行为）。
+// 走 Coordinator 这一个口与 SetIndexSourcePolicy 对称：读面不许自己摸 MarketAPI。
+func (dc *DataCoordinator) IndexLegOrder() []string {
+	if dc == nil {
+		return nil
+	}
+	dc.mu.RLock()
+	api := dc.eastMoney
+	dc.mu.RUnlock()
+	if api == nil {
+		return nil // 未注入（测试/降级装配）：如实回 nil，让读面显示"未知"而不是编一条
+	}
+	return api.IndexLegOrder()
+}
+
 // 同花顺操作域标识：熔断按域隔离（见 DataCoordinator.thsDeadlines 注释）。
 // THS operation domains used as circuit-breaker keys.
 const (

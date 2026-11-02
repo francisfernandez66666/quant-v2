@@ -42,6 +42,14 @@ describe('关键读数盲区标签（三态）', () => {
     expect(container).toBeEmptyDOMElement()
   })
 
+  it('券商 L1 现取算主源健康，不被误报成"兜底中"', () => {
+    // QMT-L1 是 owner 定的第一优先源；把它报成后备态会让人以为主链在退（指错处置方向）。
+    const { container } = render(<BlindTag readout={{ missing_key_input: false, index_source: 'QMT-L1', index_stale: false }} />)
+    expect(container).toBeEmptyDOMElement()
+    // 但券商给的是陈旧值时仍要报出来——健康与否看的是新鲜度，不是来源名。
+    expect(blindTag({ index_source: 'QMT-L1', index_stale: true }).text).toContain('陈旧回退')
+  })
+
   it('旧帧没有 dims 字段时退回今天那句原文案（不渲染 undefined/空白）', () => {
     render(<BlindTag readout={{ missing_key_input: true }} />)
     expect(screen.getByText('关键读数缺失：目标封顶半仓且今日不做 T')).toBeInTheDocument()

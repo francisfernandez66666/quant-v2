@@ -21,7 +21,7 @@
 //     绝不允许进 VWAP、换手、流动性任何一处。
 //   - 指数结果**不进任何 `map[string]*StockInfo`**：两条链的解析正则捕获的是裸 6 位码，
 //     指数与平安银行同为 `000001`，共用 map 会让两只互相覆盖（谁赢取决于响应顺序）。
-//   - 降级链的段序只有一个真源（config.IndexFallbackOrder），卡面回显与实际试序不许各列一份。
+//   - 降级链的段序只有一个真源（IndexLegOrderFor），卡面回显与实际试序不许各列一份。
 //
 // English: index-only live quote legs (EastMoney → Sina → Tencent) behind one orchestrator.
 // Stock-side prefix helpers are deliberately untouched because 000001 must never resolve to
@@ -134,27 +134,60 @@ type indexLeg struct {
 	Fetch func(string) (*IndexLiveQuote, error)
 }
 
-// indexLegs 按开关装配本轮可用的段序。东财永远第一段（价格口径与既有账同源，动它等于换基准）；
-// 新浪/腾讯两段受 index_fallback_sources 管，出厂开。
-// 段序真源是 config.IndexFallbackOrder——卡面回显与实际试序不许各列一份，否则又会漂成
-// 「卡上说三条、实际只试两条」，那是本批要防的同一族静默。
-func (m *MarketAPI) indexLegs() []indexLeg {
-	legs := []indexLeg{{IndexSourceEastMoney, m.indexLiveFromEastMoney}}
-	if m.indexFallbackEnabled() {
-		legs = append(legs,
-			indexLeg{IndexSourceSina, m.indexLiveFromSina},
-			indexLeg{IndexSourceTencent, m.indexLiveFromTencent})
+// IndexLegOrderFor 段序的**唯一真源**：给两个事实（后备腿开不开、券商段注入没注入），
+// 返回"本轮会依次试谁"。东财永远在外部腿第一位（价格口径与既有账同源，动它等于换基准）。
+//
+// 为什么单独成函数而不是只挂在 MarketAPI 上：设置卡也要回显同一串，而"读面按开关再推一份"
+// 必然漏掉券商段（注入是运行期事实，配置里查不到）——11-02 施工时就是这么漂出来的。
+// 装配与读面共骑一个函数，才没有第二份可漂。
+// English: single source of the leg order, shared by the orchestrator and the settings readout.
+func IndexLegOrderFor(fallbackOn, brokerInjected bool) []string {
+	order := []string{IndexSourceEastMoney}
+	if fallbackOn {
+		order = append(order, IndexSourceSina, IndexSourceTencent)
 	}
-	// §A7-3：注入了券商侧来源（且开关开着）时排在**最前**——owner 的既有裁决是"行情以券商为准"，
-	// 而它是本地 L1、比三条外部腿都新。没接通时这一段每次都失败并落到后面的腿，
-	// 外部腿一字不动（现网 11-02 的实测就是通道不通，靠这个顺序才不会变成"只有券商才能给点位"）。
+	if brokerInjected {
+		// 券商段排最前：owner 的既有裁决是"行情以券商为准"，且本地 L1 比三条外部腿都新。
+		// 通道不通时它每次都失败并落到后面，外部腿一字不动（"先落地"不等于"依赖它"）。
+		order = append([]string{IndexSourceBroker}, order...)
+	}
+	return order
+}
+
+// IndexLegNames 指数腿的**全部合法名**（声明集，与实际段序分两栏回显）。
+// 为什么不复用快照 quote_source 的 golden：那是"个股价由谁给"的命名空间，
+// 指数腿是另一套语义（腾讯只做指数、不进个股快照）——11-02 在 e2e 里混用过一次，
+// 红在"tencent 不在 golden 里"，而代码是对的。
+func IndexLegNames() []string { return IndexLegOrderFor(true, true) }
+
+// indexLegs 按上面的单点段序装配本轮可用的腿（段序与段实现对齐，卡面读的就是这一份）。
+func (m *MarketAPI) indexLegs() []indexLeg {
 	m.idxSwitchMu.Lock()
 	hasBroker := m.idxBrokerSrc != nil
 	m.idxSwitchMu.Unlock()
-	if hasBroker {
-		legs = append([]indexLeg{{IndexSourceBroker, m.indexBrokerLeg}}, legs...)
+	byName := map[string]func(string) (*IndexLiveQuote, error){
+		IndexSourceBroker:    m.indexBrokerLeg,
+		IndexSourceEastMoney: m.indexLiveFromEastMoney,
+		IndexSourceSina:      m.indexLiveFromSina,
+		IndexSourceTencent:   m.indexLiveFromTencent,
+	}
+	order := IndexLegOrderFor(m.indexFallbackEnabled(), hasBroker)
+	legs := make([]indexLeg, 0, len(order))
+	for _, name := range order {
+		legs = append(legs, indexLeg{name, byName[name]})
 	}
 	return legs
+}
+
+// IndexLegOrder 本轮**实际**会依次试谁（直接取自编排器的段表，不另列一份）。
+// 设置卡要回显这件事：按开关推算必然漏掉券商段（注入与否是运行期事实）。
+func (m *MarketAPI) IndexLegOrder() []string {
+	legs := m.indexLegs()
+	out := make([]string, 0, len(legs))
+	for _, l := range legs {
+		out = append(out, l.Name)
+	}
+	return out
 }
 
 // indexEastMoneyURL 东财指数量 URL（现行主链，secid 由 indexSecID 给 1./0. 前缀）。

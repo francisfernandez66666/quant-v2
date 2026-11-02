@@ -76,10 +76,10 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		"index_fallback_sources":   rt.IndexFallbackSourcesOn(),
 		"index_breaker_scope":      rt.IndexBreakerScopeOn(),
 		"quote_feed_index_enabled": rt.QuoteFeedIndexOn(),
-		// 实际会依次试谁（真源 config.IndexFallbackOrder，卡面不许自己列一份）：
+		// 实际会依次试谁（真源 data.IndexLegOrderFor，卡面不许自己列一份）：
 		// 现场要能一眼回答"东财断了现在谁给点位"，而不是让人推算开关系没开。
-		"index_legs":        config.IndexFallbackOrder(),
-		"index_legs_actual": indexLegsActual(rt),
+		"index_legs":        data.IndexLegNames(),
+		"index_legs_actual": indexLegsActual(rt, s.dc),
 		// hot_keys 明示哪些键保存即生效，其余按 restart_required 处理（前端据此提示，不靠人记）
 		"hot_keys": []string{"qmt_feed_primary", "qmt_feed_coverage_min_pct", "qmt_feed_volume_to_shares", "monitor_pool_hot_max",
 			// 逐票源标记也走热更：它只改快照里的字段，不改任何价格，开与关都不影响在途判定
@@ -118,11 +118,16 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 // indexLegsActual 本轮**实际**会试的段序（受 index_fallback_sources 控制）。
 // 与 index_legs（出厂全集）分两栏是给值班的人看的：开关关掉时"卡上列三条、实际只试一条"
 // 这种分家必须当场可见，而不是等出事再推算。
-func indexLegsActual(rt config.RuntimeConfig) []string {
-	if rt.IndexFallbackSourcesOn() {
-		return config.IndexFallbackOrder()
+func indexLegsActual(rt config.RuntimeConfig, dc *data.DataCoordinator) []string {
+	// 有 Coordinator 就以它的段表为准（券商段只有被注入时才真的在表里）；
+	// 没有才回退到"按开关推算"，并如实按推算口径给。
+	if dc != nil {
+		if got := dc.IndexLegOrder(); len(got) > 0 {
+			return got
+		}
 	}
-	return []string{data.IndexSourceEastMoney}
+	// 回退分支同样走 data 的单点段序函数（这里没人注入券商段，故 brokerInjected=false）
+	return data.IndexLegOrderFor(rt.IndexFallbackSourcesOn(), false)
 }
 
 // handleGetRuntimeConfig GET /api/config/runtime（config_admin）。
@@ -263,7 +268,7 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 		submittedScope := req.IndexBreakerScope != nil
 		opslog.Logf("quant", "§INDEX-BLIND 指数开关热更（本次提交 降级链=%v 熔断域=%v）生效值：降级链=%s 独立熔断域=%s 段序=%v 操作者=%s",
 			submittedFallback, submittedScope, switchStateOf(rt.IndexFallbackSourcesOn()), switchStateOf(rt.IndexBreakerScopeOn()),
-			indexLegsActual(rt), uid)
+			indexLegsActual(rt, s.dc), uid)
 		s.dc.SetIndexSourcePolicy(rt.IndexFallbackSourcesOn(), rt.IndexBreakerScopeOn())
 	}
 	resp := s.runtimeConfigView()

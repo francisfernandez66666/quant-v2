@@ -199,9 +199,15 @@ func TestRuntimeConfigIndexKeys(t *testing.T) {
 			t.Fatalf("出厂态 %s 应为 true（缺键=开），got %v", k, got[k])
 		}
 	}
-	legs, _ := got["index_legs"].([]any)
-	if len(legs) != 3 || legs[0] != "eastmoney" {
-		t.Fatalf("段序应三条且东财在前, got %v", got["index_legs"])
+	// 两栏分职：index_legs 是**声明集**（四条，含 §A7-3 的券商腿），
+	// index_legs_actual 是本轮真的会依次试谁（未注入券商 ⇒ 三条，东财在前）。
+	declared, _ := got["index_legs"].([]any)
+	if len(declared) != 4 || declared[0] != "QMT-L1" {
+		t.Fatalf("声明集应为四条且券商腿在首位, got %v", got["index_legs"])
+	}
+	actual, _ := got["index_legs_actual"].([]any)
+	if len(actual) != 3 || actual[0] != "eastmoney" {
+		t.Fatalf("实际段序应三条且东财在前（本夹具没注入券商段）, got %v", got["index_legs_actual"])
 	}
 	hot, _ := got["hot_keys"].([]any)
 	var inHot bool
@@ -232,8 +238,8 @@ func TestRuntimeConfigIndexKeys(t *testing.T) {
 			t.Fatalf("没发过的键被折成 false 了：%s=%v（稀疏 merge 不许覆盖出厂开）", k, after[k])
 		}
 	}
-	actual, _ := after["index_legs_actual"].([]any)
-	if len(actual) != 1 || actual[0] != "eastmoney" {
+	actualOff, _ := after["index_legs_actual"].([]any)
+	if len(actualOff) != 1 || actualOff[0] != "eastmoney" {
 		t.Fatalf("关掉降级链后实际段序应只剩东财, got %v", after["index_legs_actual"])
 	}
 }

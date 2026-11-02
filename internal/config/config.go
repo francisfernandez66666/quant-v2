@@ -423,11 +423,6 @@ func (r RuntimeConfig) IndexBreakerScopeOn() bool { return feedOn(r.IndexBreaker
 // QuoteFeedIndexOn 券商 L1 侧是否请求指数点位（缺省开，§A7-3；通道不通时不产生价格影响）。
 func (r RuntimeConfig) QuoteFeedIndexOn() bool { return feedOn(r.QuoteFeedIndexEnabled) }
 
-// IndexFallbackOrder 指数降级链的段序（读面与装配共用的单点口径）。
-// 为什么把顺序写进 config 而不是散在 data 层：设置卡要如实回显「现在会依次试谁」，
-// 而两处各列一份就会漂成「卡上说三条、实际只试两条」——那是本批要防的同一族静默。
-func IndexFallbackOrder() []string { return []string{"eastmoney", "sina", "tencent"} }
-
 const FeedCoverageDefault = 80
 
 // EffectiveFeedCoverageMinPct 覆盖率阈值的生效值：0→80；负数→-1（＝关闭阈值判断，
