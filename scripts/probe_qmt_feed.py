@@ -22,6 +22,8 @@
     python probe_qmt_feed.py --codes-file C:\\opt\\quant\\pool.txt   # 一行一个裸码（明天可直接喂现网监控池）
 """
 import argparse
+import ast
+import io
 import json
 import os
 import statistics
@@ -35,6 +37,65 @@ CFG = r"C:\qmt\quant-trading-v2\qmt_gateway\config.xt.json"
 def kv(key, value):
     """机器可读单行（键=值），交付记录里可以直接粘这些行，不用重述。"""
     print("probe %s=%s" % (key, value))
+
+
+def _non_doc_lines(src):
+    """返回**可执行行**的集合：排除注释行与所有 docstring/字符串字面量覆盖的行号。
+
+    为什么要这么麻烦：本函数的任务就是"认出代码里有没有交易通道"，而它自己的说明文字里
+    必须点名那些类名（不然解释不了在防什么）。早期版本用逐行 strip 判 `#` 开头，结果
+    函数自己的 docstring 把它判成了违例——干净文件恒红（本仓 §负锁只看可执行行 的同一条坑，
+    这次踩在自己身上）。用 ast 拿 docstring 的行区间、tokenize 拿注释的行区间，两者都剔掉，
+    剩下的才是真正会被执行的部分。
+    English: only executable lines are scanned; comments and docstrings (which must name the
+    banned classes to explain the guard) are excluded via ast ranges + tokenize comment tokens.
+    """
+    banned_lines = set()
+    tree = ast.parse(src)
+
+    def add_span(node):
+        for ln in range(getattr(node, "lineno", 0), getattr(node, "end_lineno", 0) + 1):
+            banned_lines.add(ln)
+
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            doc = ast.get_docstring(n, clean=False)
+            if doc and isinstance(n.body[0], ast.Expr):
+                add_span(n.body[0])
+        elif isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
+            add_span(n)
+    import tokenize
+    with open(__file__, "rb") as fh:
+        for tok in tokenize.tokenize(fh.readline):
+            if tok.type == tokenize.COMMENT:
+                banned_lines.add(tok.start[0])
+    return [(i, ln) for i, ln in enumerate(src.splitlines(), 1) if i not in banned_lines]
+
+
+def ensure_no_trader_session():
+    """自锁（2026-11-02）：本脚本的"只碰行情、绝不碰交易通道"从意图升级为强制。
+
+    为什么必须强制：现网 2026-10-29 的实录是 xtquant **交易通道**的反复重连每次都在 QMT
+    客户端共享内存里占一个不回收的 writer 槽，713 次连败把客户端拖崩到 3~6 分钟一次；
+    本脚本要在盘中手工跑（明天的 qcap 也是同一台机）。一旦有人"顺手加一段 trader 连接做自检"，
+    一次取证就变成整条交易链的风险，而门禁的静态负锁只判文件里有没有那个串——
+    运行时这一刀补的是"在真机上、跑之前"就拒绝。
+    """
+    with open(__file__, encoding="utf-8") as fh:
+        src = fh.read()
+    banned = ("Xt" "QuantTrader", "xt" "trader",
+              "register" "_" "callback", "start" "_" "speedup")
+    hits = []
+    for ln, text in _non_doc_lines(src):
+        for b in banned:
+            if b in text:
+                hits.append("%s@L%d" % (b, ln))
+    if hits:
+        print("probe verdict=refused reason=trader_channel_in_source hits=%s" % ",".join(hits[:6]))
+        print("probe note=本脚本按设计只读行情（见 docstring 与 docs/POSTMORTEM_QMT_LINK_20261029.md）；"
+              "要交易通道的自检请另写脚本，别混进这条盘中探针")
+        sys.exit(1)
+    kv("selfcheck", "trader_channel_absent")
 
 
 def read_pool(args):
@@ -57,6 +118,7 @@ def suffixed(code):
 
 
 def main():
+    ensure_no_trader_session()  # 第一件事：先证明这脚本没长回交易通道（见函数 docstring）
     ap = argparse.ArgumentParser(description="QMT 行情只读探针（xtdata-only，一次不循环）")
     ap.add_argument("--codes", default="")
     ap.add_argument("--codes-file", default="")

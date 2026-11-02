@@ -18953,7 +18953,37 @@ grep -rqF 'func TestFeedAlertCodeStarvedEmptyReplies(' internal/data/ || fail164
 CNT164=$((CNT164 + 1))
 grep -qF 'order_state_pull_stale' cmd/quant/runtime_switches.go || fail164 "跨日收敛没进启动清单（关着与没这功能在日志里又长成同一个样子）"
 
+# ⑦ 设置页回显（卡的数据源是 /api/config/runtime，不是 /api/status：两处都要有这两个数）
+CNT164=$((CNT164 + 1))
+for tok in 'view["feed_returned"]' 'view["feed_empty_rounds"]'; do
+	grep -qF "$tok" internal/server/handlers_runtime_config.go || fail164 "设置页回显缺 $tok（后端有数、卡上看不见＝"看得见"只做到接口层）"
+done
+
+# ⑧ 前端：J0 必须有**自己的**文案，且不许被折成通用的"券商行情降级"
+CNT164=$((CNT164 + 1))
+grep -qF "'degraded:J0'" web/src/pages/QuoteFeedConfigCard.jsx || fail164 "前端没有 J0 的分形文案（J0 查券商通道、J2 查陈旧，折成一句就是让人盲操作）"
+CNT164=$((CNT164 + 1))
+grep -qF 'feed_empty_rounds' web/src/pages/QuoteFeedConfigCard.jsx || fail164 "前端不显示连续空回包轮数"
+CNT164=$((CNT164 + 1))
+for tc in '零回包（J0）显示独立文案并带上连续空回包轮数' '回包非空但零命中（J2）不吃 J0 文案，也不显示连续空轮数'; do
+	grep -qF "$tc" web/src/__tests__/quote_feed_config_card_20261101.test.jsx || fail164 "前端 J0 用例缺一条：$tc"
+done
+
+# ⑨ 盘中行情探针"只碰行情"从意图升级为强制：静态锁（形状）+ 运行时自锁（真机跑之前拒跑）
+CNT164=$((CNT164 + 1))
+grep -qF 'def ensure_no_trader_session():' scripts/probe_qmt_feed.py || fail164 "探针没有运行时自锁（只靠 §161 的静态 grep：被绕过时要到盘中才暴露）"
+CNT164=$((CNT164 + 1))
+grep -qF 'ensure_no_trader_session()' scripts/probe_qmt_feed.py || fail164 "探针自锁没被调用（写了不跑＝没有）"
+# 静态负锁与 §161 那条同源，但判"可执行行"：自检代码自己的说明文本必须点名被禁类名，
+# 逐行 strip 判 # 会把它自己判成违例（今天两次假红都是这个形状）。
+CNT164=$((CNT164 + 1))
+if grep -nE '^[^#]*([i]mport xttrader|XtQuantTrader[[(])' scripts/probe_qmt_feed.py >/dev/null 2>&1; then
+	fail164 "探针脚本里有交易通道调用（10-29 崩客户端的元凶就是它；盘中探针只准走 xtdata）"
+fi
+# 反向自锁不许误伤自己：判据表用相邻字面量拼开，源码里因此不存在完整的被禁串
+grep -qF '"Xt" "QuantTrader"' scripts/probe_qmt_feed.py || fail164 "探针判据表没有把被禁串拆开（自检会撞自己的字面量＝干净文件恒红）"
+
 [ "$B164_FAILED" = "0" ] || exit 1
-echo "ok - §164 §STARVE-STALE 锁通过（J0 视图与计数 4 + 数据面负锁 1 + 观测位 1 + 缺省关 2 + 边界接线 2 + 分账负锁 1 + 用例在册 2 + 清单点名 1，累计判定点 ${CNT164}）"
+echo "ok - §164 §STARVE-STALE 锁通过（J0 视图与计数 4 + 数据面负锁 1 + 观测位 1 + 缺省关 2 + 边界接线 2 + 分账负锁 1 + 用例在册 2 + 清单点名 1 + 设置页回显 1 + 前端分形 3 + 探针双自锁 4，累计判定点 ${CNT164}）"
 echo "==> 全部通过"
 

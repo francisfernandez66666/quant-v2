@@ -20,6 +20,11 @@ const STATE_LABEL = {
   // 或装配被停），显示成"未启用/正常"都会把人引向错误的处置动作。
   not_polled: ['已启用但一轮都没跑（需重启 quant）', 'warning'],
   auth_failed: ['未认证（去确认运营账号在册凭证）', 'danger'],
+  // 零回包（2026-11-02 补的 J0 档）：网关每 3 秒回 200 却一条 tick 都没有＝上游根本没有行情服务
+  // 可连（现网实测：xtquant 扫不到端点、XtItClient 的 58600 握手能过但无 getFullTick 处理函数）。
+  // 单独一句文案是有用的：J1 查网关进程、J2 查陈旧、J0 要查的是"券商行情通道本身通不通"，
+  // 三者处置动作不同，折成同一句"降级"就等于让人盲操作。
+  'degraded:J0': ['零回包（上游无行情服务，已自动退回外部源）', 'warning'],
   not_wired: ['未接采集器', 'default'],
 }
 
@@ -94,6 +99,9 @@ export default function QuoteFeedConfigCard() {
     <Card title="行情通道（券商 L1）" style={{ marginBottom: 16 }}>
       <div style={{ fontSize: 12, color: 'var(--app-text-2)', marginBottom: 10 }}>
         通道状态：{stateTag(cfg.feed_state)} · 累计轮询 {cfg.feed_rounds ?? 0} 轮 · 命中 {cfg.feed_hits ?? 0}/{cfg.feed_denominator ?? 0} 只
+        {/* 回包只数与连续空回包轮数是 2026-11-02 补的两栏：只有"命中 0"看不见病因——
+            回包非空但都是旧价（J2）与一条都没回（J0，上游没行情服务）是两件不同的事。 */}
+        {' '}· 本轮回包 {cfg.feed_returned ?? 0} 条{Number(cfg.feed_empty_rounds || 0) > 0 ? `（连续空回包 ${cfg.feed_empty_rounds} 轮）` : ''}
         {Number(cfg.feed_coverage_pct || 0) > 0 ? `（覆盖率 ${Number(cfg.feed_coverage_pct).toFixed(1)}%）` : ''}
         {/* 量纲没对齐时后端不接管量/额（VWAP＝额÷量，错一档差 100 倍）：这条必须当场可见，
             否则"价对了、量错了"要到成交均价对不上才发现。 */}

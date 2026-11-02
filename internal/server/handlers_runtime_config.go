@@ -85,6 +85,10 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		view["feed_rounds"] = st.Rounds
 		view["feed_volume_observed_unit"] = st.VolumeObservedUnit
 		view["feed_volume_aligned"] = st.VolumeAligned
+		// 回包只数与连续空回包轮数（2026-11-02 J0 档）：卡上只写"命中 0"分不出病因——
+		// 回包非空但都超龄（J2）与一条都没回（J0，上游没有行情服务）处置方向完全不同。
+		view["feed_returned"] = st.Returned
+		view["feed_empty_rounds"] = st.EmptyRounds
 	} else {
 		view["feed_state"] = "not_wired" // 采集器未注入（测试/降级装配）：如实说，不折成 ok
 	}
