@@ -28,6 +28,7 @@ import (
 	"errors"
 	"log"
 	"math"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -184,8 +185,23 @@ func (f *QMTFeed) Start() {
 			ticker.Reset(f.interval)
 			continue
 		}
-		f.pollOnce()
+		f.pollOnceGuarded()
 	}
+}
+
+// pollOnceGuarded 每轮包一层 recover：行情腿**不许成为交易链的停机原因**。
+// 2026-11-02 的教训是同形状的——资金心跳（也是只读观测腿）一次 nil 解引用把整个进程打死，
+// 现网 131 次重启、整天零买入评估。pollOnce 的注释本来就写了"绝不 panic"，但那是意图不是强制；
+// 这里补上强制，并把栈打出来（吞掉异常文本等于把下次排障退回盲猜）。
+// 守卫按**每一轮**收：挂在 Start 顶部只兜第一次，之后轮询静默停摆——那正是
+// FeedStats.Rounds 要防的"冒充在跑"形态，不能由我们的兜底手段自己造出来。
+func (f *QMTFeed) pollOnceGuarded() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[qmt-feed] 本轮行情轮询 panic（跳过本轮，不影响交易链）: %v\n%s", r, debug.Stack())
+		}
+	}()
+	f.pollOnce()
 }
 
 // pollOnce 单轮：取池→拉 tick→交给装配层；任何失败只记日志（节流），绝不 panic。

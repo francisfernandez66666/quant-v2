@@ -5492,15 +5492,25 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 		go func() {
 			defer wg.Done()
 			for nf := range jobs {
-				r := result{code: nf.code, bearish: nf.bearish}
-				if nf.bearish {
-					// 利空板块：双源各取一份成分名单（注入列表 THS 优先/东财兜底，与旧口径一致），
-					// 两份集合同时回传用于判定 双源(dual)/单源(single) 验证等级。
-					r.stocks, r.thsSet, r.emSet, r.err = e.sectorConstituentsDual(nf.code, nf.name, topN)
-				} else {
-					r.stocks, r.err = e.sectorConstituents(nf.code, topN)
-				}
-				results <- r
+				// 守卫按**单只票**收，而不是挂在 worker 顶部：worker 一旦带 panic 退出，
+				// 剩下的 jobs 没人消费，投喂侧 `jobs <- nf` 会永久阻塞——那才是真正打死打分轮的形状
+				// （scoreCycle 的 recover 救不了"阻塞"，只救"panic"）。少一份板块名单按既有 err 路径降级即可。
+				func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							log.Printf("[sector] 板块成分取数 panic %s(%s): %v\n%s", nf.code, nf.name, rec, debug.Stack())
+						}
+					}()
+					r := result{code: nf.code, bearish: nf.bearish}
+					if nf.bearish {
+						// 利空板块：双源各取一份成分名单（注入列表 THS 优先/东财兜底，与旧口径一致），
+						// 两份集合同时回传用于判定 双源(dual)/单源(single) 验证等级。
+						r.stocks, r.thsSet, r.emSet, r.err = e.sectorConstituentsDual(nf.code, nf.name, topN)
+					} else {
+						r.stocks, r.err = e.sectorConstituents(nf.code, topN)
+					}
+					results <- r
+				}()
 			}
 		}()
 	}
@@ -7012,6 +7022,14 @@ func (e *Engine) maybeSyncConcepts() {
 	e.conceptSyncDay = today
 	e.mu.Unlock()
 	go func() {
+		// 概念库同步是**每日一次的观测性补数**，它 panic 不许带走进程（同 2026-11-02 资金心跳的教训：
+		// 只读腿打死进程＝没人在管持仓，远比"今天概念库少一批成员"严重）。当天标记已置，
+		// 失败后次日再试——绝不在这个 goroutine 里重试，重试风暴会天天撞同一个 panic。
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[concept] §C1-V2 概念库同步 panic（今日跳过）: %v\n%s", rec, debug.Stack())
+			}
+		}()
 		res, err := dc.SyncConcepts(st, 0)
 		if err != nil {
 			log.Printf("[concept] §C1-V2 概念库同步失败: %v", err)

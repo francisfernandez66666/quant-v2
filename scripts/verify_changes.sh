@@ -18781,5 +18781,98 @@ CNT162=$((CNT162 + 1))
 grep -rqF 'func TestDiffRulesSurfacesSubscriptionSwitchFlip' internal/config/ || fail162 "开关翻转的审计用例不在册"
 
 [ "$B162_FAILED" = "0" ] || exit 1
-echo "ok - §162 §关态留痕锁通过（清单文件与调用 2 + 条数等值 1 + 两侧 would-label 2 + 不含凭据与节流 2 + 用例在册 1 + feed 侧关态读数 3 + L3 审计用例 1，累计判定点 ${CNT162}）"echo "==> 全部通过"
+echo "ok - §162 §关态留痕锁通过（清单文件与调用 2 + 条数等值 1 + 两侧 would-label 2 + 不含凭据与节流 2 + 用例在册 1 + feed 侧关态读数 3 + L3 审计用例 1，累计判定点 ${CNT162}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §163 §OBS-GUARD（2026-11-02 盘中事故：只读观测腿不许有停机权限）
+# 事故本体：资金心跳 publishTFundsHeartbeat 手搓 tLiveRound 漏了 ctrl，§P1（bb85a36）把
+# totalAssetsOf 从 db.GetRealAccount 改成 r.ctrl.GetRealAccountFor 之后，nil 接收器被真解引用；
+# 10-31/11-01 休市时 IsActiveSession 挡住这条腿 ⇒ 11-02 是第一实盘交易日，现网 quant.exe 每
+# 6~40 秒 panic 一次（当日 131 次启动 / 150 次 panic），打分轮从没跑到 ⇒ [qmt-gate] 0 行、
+# signal_decisions 今日 0 行，面板上的"信号"全是 10-30 存量。
+# 本段锁的是"这类形状别再回来"，不是复述用例：装配点必带 ctrl / 三条只读腿各自带守卫 /
+# 死参数不回潮 / 用例在册。反证在本机实测过（把 ctrl 装回 nil ⇒ 行为腿复现现网那条栈；
+# 把守卫挪回 goroutine 顶部 ⇒ 守卫腿红），故此处只需静态锚点与用例在册两道。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 163 §OBS-GUARD（只读观测腿的装配完整性 / 每轮守卫 / 死参数不回潮 / 用例在册）..."
+B163_FAILED=0
+fail163() {
+	echo "--- FAIL: §163 $*"
+	FAIL=1
+	B163_FAILED=1
+}
+CNT163=0
+
+ITL=internal/engine/intraday_t_live.go
+FT=internal/engine/funds_today.go
+QF=internal/data/qmt_feed.go
+EG=internal/engine/engine.go
+
+# ① 心跳装配必带 ctrl（2026-11-02 的成因位）
+# 必须**只看 publishTFundsHeartbeat 的函数体**：真实 T 轮的字面量前缀与它逐字相同
+# （`e: e, uid: uid, ctrl: ctrl, db: db, st: st…`），按整文件 grep 会把"只摘心跳那份"判成绿——
+# 实测过：摘掉心跳的 ctrl 后整文件锚串仍命中 1 次，锁当场变成只会绿的摆设。
+CNT163=$((CNT163 + 1))
+SEG163H=$(awk '/^func \(e \*Engine\) publishTFundsHeartbeat\(/,/^\}/' "$ITL")
+printf '%s\n' "$SEG163H" | grep -qF 'ctrl: ctrl' || fail163 "心跳的 tLiveRound 装配缺 ctrl（缺它＝totalAssetsOf 在 nil 控制器上解引用＝打死进程）"
+CNT163=$((CNT163 + 1))
+printf '%s\n' "$SEG163H" | grep -qF 'day: cntime.DayCompactOf(now), dash: cntime.DayOf(now)' || fail163 "心跳装配缺 day/dash（dash 空串会让按日过滤静默返回空账＝把读不到伪装成当日无盈亏）"
+CNT163=$((CNT163 + 1))
+[ "$(grep -c 'legFactsCache: map\[string\]map\[string\]\*tLiveLegFact{}' "$ITL")" = "2" ] || fail163 "两处 tLiveRound 装配应各自显式给出 legFactsCache（nil map 一写即 panic）"
+
+# ② 负锁：totalAssetsOf 的死参数不许回潮（§P1 改了函数体没改签名，留下的可 grep 痕迹）
+CNT163=$((CNT163 + 1))
+if grep -qE 'func \(r \*tLiveRound\) totalAssetsOf\(db' "$ITL"; then
+	fail163 "totalAssetsOf 又带上了 db 死参数（体内不读 db＝改了一半的形状回来）"
+fi
+
+# ③ 三条只读腿各自带"每轮/每任务"守卫（不是 goroutine 顶部那一次）
+CNT163=$((CNT163 + 1))
+grep -qF 'func (e *Engine) runFundsTickGuarded()' "$FT" || fail163 "资金心跳没有受保护跳（一次 panic 打死整个进程）"
+CNT163=$((CNT163 + 1))
+grep -qF 'e.runFundsTickGuarded()' "$FT" || fail163 "资金心跳循环没走受保护跳"
+CNT163=$((CNT163 + 1))
+grep -qF 'func (f *QMTFeed) pollOnceGuarded()' "$QF" || fail163 "券商行情轮询没有受保护轮（pollOnce 注释里的绝不 panic 只是意图）"
+CNT163=$((CNT163 + 1))
+grep -qF 'f.pollOnceGuarded()' "$QF" || fail163 "QMTFeed.Start 没走受保护轮"
+CNT163=$((CNT163 + 1))
+# 负锁必须只看 Start 的函数体：守卫本体自己就调 f.pollOnce()，按整文件判会自我误杀。
+# `pollOnce\(\)` 不会匹配 `pollOnceGuarded()`（尾串不同），所以这条只在"Start 里真留了裸调用"时红。
+SEG163S=$(awk '/^func \(f \*QMTFeed\) Start\(\)/,/^\}/' "$QF")
+if printf '%s\n' "$SEG163S" | grep -qE 'f\.pollOnce\(\)'; then
+	fail163 "Start 里仍有裸 pollOnce 调用（一轮 panic＝整个进程死）"
+fi
+# 板块 worker 的守卫必须在任务循环内（挂 goroutine 顶部＝worker 带病退出、jobs 无人消费、投喂侧永久阻塞）
+CNT163=$((CNT163 + 1))
+SEG163=$(awk '/for nf := range jobs \{/,/results <- r/' "$EG")
+case "$SEG163" in
+*"recover()"*) ;;
+*) fail163 "板块 worker 的单任务守卫被摘（守卫必须按任务收，不是按 goroutine 顶部收）";;
+esac
+CNT163=$((CNT163 + 1))
+# 取"同步调用点往上 16 行"这段窗口：defer/recover 就写在 goroutine 开头、紧贴调用点。
+# 用 awk 区间从全文第一个 `go func() {` 起算会框进无关 goroutine（恒假红，本次实测踩过），
+# 按行号取窗口与 gofmt 的重排也无关。
+LN163C=$(grep -n 'dc.SyncConcepts(st, 0)' "$EG" | head -1 | cut -d: -f1)
+[ -n "$LN163C" ] || fail163 "概念库日同步调用点找不到了（§C1-V2 搬迁了，本锁需同批更新）"
+if [ -n "$LN163C" ]; then
+	SEG163C=$(sed -n "$((LN163C - 16)),${LN163C}p" "$EG")
+	printf '%s\n' "$SEG163C" | grep -q 'recover()' || fail163 "概念库同步 goroutine 缺 recover（今天失败次日再试即可，绝不该打死进程）"
+fi
+
+# ④ 用例在册（行为腿 + 装配腿 + 守卫腿各一条，摘锁必红）
+CNT163=$((CNT163 + 1))
+for tc in TestFundsHeartbeatRoundCarriesController TestFundsHeartbeatLiteralHasAssemblyKeys TestFundsHeartbeatTickIsRecoverGuarded; do
+	grep -rqF "func ${tc}(" internal/engine/ || fail163 "资金心跳用例 ${tc} 不在册"
+done
+CNT163=$((CNT163 + 1))
+for tc in TestSectorWorkerJobsAreGuardedPerJob TestConceptSyncGoroutineGuarded TestTotalAssetsOfHasNoDeadParam; do
+	grep -rqF "func ${tc}(" internal/engine/ || fail163 "守卫用例 ${tc} 不在册"
+done
+CNT163=$((CNT163 + 1))
+grep -rqF 'func TestFeedStartPollsThroughGuard(' internal/data/ || fail163 "行情腿守卫用例不在册"
+
+[ "$B163_FAILED" = "0" ] || exit 1
+echo "ok - §163 §OBS-GUARD 锁通过（装配必带 ctrl 与 day/dash 2 + 缓存两处等值 1 + 死参数负锁 1 + 三腿守卫 7〔资金跳 2／行情轮 2／行情裸调用负锁 1／板块单任务 1／概念 1〕 + 用例在册 3，累计判定点 ${CNT163}）"
+echo "==> 全部通过"
 

@@ -294,7 +294,7 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 		// 缺价持仓**不进 prices**：判定链据此对该票 fail-closed（step0 无实时价），
 		// 但市值仍不能按 0 计进总量帽分母——帽的分母必须与 CurStrat 同一批读数（§8.4.5）。
 	}
-	r.capBase = math.Min(r.totalAssetsOf(db), holdValue)
+	r.capBase = math.Min(r.totalAssetsOf(), holdValue)
 	r.book = st.bookValue(r.prices)
 	r.cash, r.cashOK = ctrl.AvailableCash()
 	// §CANCEL-STATE（2026-10-28）禁挂单窗口闸：T 的两腿是**串行**的（先买后卖或先卖后买），
@@ -449,14 +449,14 @@ func (e *Engine) publishTFundsHeartbeat(uid string) {
 			r.prices[code] = pos.CurPrice
 		}
 	}
-	r.total = r.totalAssetsOf(db)
+	r.total = r.totalAssetsOf()
 	r.cash, r.cashOK = ctrl.AvailableCash()
 	r.book = st.bookValue(r.prices)
 	r.publishTFunds()
 }
 
 // totalAssetsOf 总资产：优先券商快照口径（与 dynamicBuyQty 同优先级），回落账本合计。
-func (r *tLiveRound) totalAssetsOf(db *store.DB) float64 {
+func (r *tLiveRound) totalAssetsOf() float64 {
 	if acc, err := r.ctrl.GetRealAccountFor(r.uid); err == nil && acc.TotalAsset > 0 {
 		r.total = acc.TotalAsset
 		return r.total
@@ -635,6 +635,15 @@ func (r *tLiveRound) facts(dayCompact string) (map[string]*tLiveLegFact, error) 
 		if strings.HasPrefix(key, tLKeyPrefix) {
 			bySignal[key] = append(bySignal[key], o)
 		}
+	}
+	// 两张缓存**自愈**：它们只是同一轮内的重复取数加速，缺了重建一份就行，
+	// 不该因为"某个装配点漏填字段"而让 nil map 赋值 panic（2026-11-02 心跳漏 ctrl
+	// 就是同一形状——那次打死的是整个进程，所以这里按"能自愈就不要炸"处置）。
+	if r.ordersCache == nil {
+		r.ordersCache = map[string]map[string][]store.RealOrder{}
+	}
+	if r.legFactsCache == nil {
+		r.legFactsCache = map[string]map[string]*tLiveLegFact{}
 	}
 	r.ordersCache[dayCompact] = bySignal
 	r.legFactsCache[dayCompact] = byKey
