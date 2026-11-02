@@ -95,3 +95,18 @@ def is_trading_day(dt):
     if days is not None and dt.strftime("%Y%m%d") in days:
         return False
     return True
+
+
+if __name__ == "__main__":
+    # §FRIEND-PROFILE 批 2：给远端看门狗一个"今天是否交易日"的只读判定入口。
+    # 真源必须留在这个文件里——让 ps1 自己判周末/节假日就是第三份日历，
+    # 漂开的时候没人红，代价是朋友的机器在休市日拉起柜台会话、或在交易日全天不动。
+    # 输出是**纯 ASCII**（中文经 PowerShell 管道会被码页换成 `?`，上层判读会恒假）；
+    # 退出码同义：0＝交易日，3＝休市（日历不可得时退化成"只看周末"，仍按此语义返回）。
+    import sys
+    from datetime import datetime as _dt
+
+    _on = 1 if is_trading_day(_dt.now()) else 0
+    print("TRADING_DAY=%d calendar=%s" % (_on, calendar_path()))
+    sys.exit(0 if _on else 3)
+

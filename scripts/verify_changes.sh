@@ -19281,5 +19281,289 @@ fi
 
 [ "$B165_FAILED" = "0" ] || exit 1
 echo "ok - §165 §INDEX-BLIND 锁通过（指针位与出厂开 3 + 个股函数不被污染 2 + 编排器与键冲突 4 + 量纲 2 + 券商侧 A7-3 7 + 引擎出声 5 + 维度出口 5 + 资金帧与纸面 5 + 告警两条 3 + 用例与写面在册 11 + 常驻反证 2，累计判定点 ${CNT165}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §166 §FRIEND-PROFILE（2026-11-02 夜批·多账号 B-α 批1：朋友机器网关的出厂自证）
+# 这批的靶子不是"配置写错"这种理论风险，而是三种现网已经发生过的形状：
+#   ① 归属含糊 ⇒ 回报按 users 顺序恒归 admin（10-30 七账号一把钥匙，两笔「撤单中」挂住 3.67 万）；
+#   ② 通道"看着活着"而实际半条命 ⇒ 上报照常、下单进不来（11-02 的 J0 同族：零回包曾被编码成健康）；
+#   ③ 判据被复制成两份 ⇒ 漂开那次没人红（§INDEX-BLIND 的"两份段序表"就是这个）。
+# 所以：判据真源只在 gateway.py 一处；违规是**拒绝启动**而不是 warning；缺省档（运营机）一字不做。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 166 §FRIEND-PROFILE（判据真源唯一 / 十项闸在位 / 缺省即今天 / ps1 不复制判据 / 常驻反证）..."
+B166_FAILED=0
+fail166() {
+	echo "--- FAIL: §166 $*"
+	FAIL=1
+	B166_FAILED=1
+}
+CNT166=0
+
+GW166=qmt_gateway/gateway.py
+TPL166=deploy/qmt-friend/config.xt.friend.template.json
+ENS166=deploy/qmt-friend/ensure_friend_gateway_config.ps1
+TST166=qmt_gateway/tests/test_friend_profile.py
+
+# ① 判据真源在网关里，且**调用点必须早于 Gateway() 构造**
+#    （晚一步就已经开了 SQLite/起了线程/建了订阅——那时再判就是"半态在跑"）
+CNT166=$((CNT166 + 1))
+grep -qF 'def validate_friend_profile(cfg, allowed_ips=None, bind_explicit=False):' "$GW166" || fail166 "缺 validate_friend_profile（判据没有唯一真源）"
+CNT166=$((CNT166 + 1))
+grep -qF 'def enforce_friend_profile(cfg, allowed_ips=None, bind_explicit=False):' "$GW166" || fail166 "缺 enforce_friend_profile"
+CNT166=$((CNT166 + 1))
+L_ENF=$(grep -n 'enforce_friend_profile(cfg, allowed_ips=allowed_ips, bind_explicit=bool(bind_env))' "$GW166" | head -1 | cut -d: -f1 || true)
+L_NEW=$(grep -n '^\s*gw = Gateway(cfg)$' "$GW166" | head -1 | cut -d: -f1 || true)
+[ -n "${L_ENF:-}" ] || fail166 "main() 里没有 enforce 调用点（写了不跑＝没有）"
+[ -n "${L_NEW:-}" ] || fail166 "找不到 Gateway(cfg) 构造点（本锁的对照物失效，请同批更新）"
+[ -n "${L_ENF:-}" ] && [ -n "${L_NEW:-}" ] && [ "$L_ENF" -lt "$L_NEW" ] || fail166 "enforce 调用点在 Gateway() 构造之后（违规时线程与库已开＝半态在跑）"
+
+# ② 十项判据的锚串逐个在位（少一项就少一种"看着正常、账在别人名下"的口子）
+CNT166=$((CNT166 + 1))
+SEG166V=$(awk '/^def validate_friend_profile\(/,/^def enforce_friend_profile\(/' "$GW166")
+for tok in 'len(toks) != 1' 'owner_user_id 不能为空' '必须等于 owner_user_id' 'user_id 与 owner_user_id 必须同值' 'failover_enable 必须为 false' 'broker 必须为 queued' 'report_url 主机必须是决策机' 'friend_allowed_roots' 'QUANT_GATEWAY_BIND' 'ALLOWED_IPS 必须非空' 'quotes_enabled 必须为 false' 'legacy token'; do
+	grep_q "$tok" SEG166V F || fail166 "出厂档缺判据 ${tok}（每一项对应一种现网形状，见本段头注）"
+done
+
+# ③ 回环监听必须被拒，且 IPv6 不能被 host 解析切成空串而溜过
+CNT166=$((CNT166 + 1))
+grep_q '"127.0.0.1", "::1", "localhost"' SEG166V F || fail166 "没拒回环监听（远端会长成'只上报不收单'的半条命形态）"
+CNT166=$((CNT166 + 1))
+grep_q '_listen.rsplit(":", 1)[0]' SEG166V F || fail166 "listen host 用 partition(':') 解析（'::1:8789' 会被切成空串 ⇒ 回环闸变成永不命中的摆设锁）"
+
+# ④ 缺省档一字不做：非 friend 时 enforce 立刻 return，且默认值就是空串
+CNT166=$((CNT166 + 1))
+grep -qF '"deploy_profile": "",' "$GW166" || fail166 "DEFAULT_CONFIG 里 deploy_profile 缺省不是空串（现网那台会被误判成远端档）"
+CNT166=$((CNT166 + 1))
+SEG166E=$(awk '/^def enforce_friend_profile\(/,/^[A-Z]/' "$GW166")
+grep_q '!= "friend"' SEG166E F || fail166 "enforce 没有'非 friend 即早退'的分支（运营机行为必须与今天逐字节一致）"
+CNT166=$((CNT166 + 1))
+grep_q 'raise SystemExit(2)' SEG166E F || fail166 "违规不是拒绝启动而是继续跑（结构性'不能'是 owner 一贯取向，报警没人看）"
+
+# ⑤ 行为腿：/quotes 在 friend 档必须真关门，且不许用"空 ticks + 200"表达
+#    （那个组合在今天的语义里是"feed 还没通"，折进来就是把两种事实读成一种）
+CNT166=$((CNT166 + 1))
+SEG166Q=$(awk '/^    def _do_quotes\(/,/^    def [^_]/' "$GW166")
+grep_q 'if not self.cfg.get("quotes_enabled", True):' SEG166Q F || fail166 "/quotes 没有 quotes_enabled 的闸（校验项 9 只停在配置层）"
+CNT166=$((CNT166 + 1))
+grep_q 'quotes_disabled_by_profile' SEG166Q F || fail166 "/quotes 关门回的是 200/空 ticks（必须 403 + 专属 err）"
+
+# ⑥ CLI 自证入口：判据唯一真源能被装填器调用，且锚点是纯 ASCII
+CNT166=$((CNT166 + 1))
+grep -qF '"--profile-check"' "$GW166" || fail166 "缺 --profile-check（装填器只能自己抄判据＝两份尺子）"
+CNT166=$((CNT166 + 1))
+grep -qF 'PROFILE_CHECK=PASS profile=' "$GW166" || fail166 "profile-check 没有 ASCII 锚点行（中文经 PS 管道会变 ? ⇒ 上层判读恒假）"
+CNT166=$((CNT166 + 1))
+if grep -nE 'print\("PROFILE_CHECK=[^"]*[^ -~]' "$GW166" >/dev/null 2>&1; then
+	fail166 "PROFILE_CHECK 锚点行里混进了非 ASCII 字符"
+fi
+
+# ⑦ 模板自洽（字段等值判，不是"文件存在"）：模板本身就是合法 friend 配置
+CNT166=$((CNT166 + 1))
+[ -f "$TPL166" ] || fail166 "缺 $TPL166"
+CNT166=$((CNT166 + 1))
+python3 - "$TPL166" <<'PYTPL' || fail166 "模板字段不自洽（见 §166 ⑦ 的等值清单）"
+import io, json, sys
+d = json.load(io.open(sys.argv[1], encoding="utf-8"))
+assert d["deploy_profile"] == "friend", "deploy_profile"
+assert d["broker"] == "queued", "broker"
+assert d["quotes_enabled"] is False, "quotes_enabled"
+assert d["failover_enable"] is False, "failover_enable"
+assert len(d["account_tokens"]) == 1, "account_tokens 必须恰好一条"
+assert d["account_tokens"][0]["token"] == "__TOKEN__" == d["token"] == d["report_token"], "占位符必须同一把"
+assert d["account_tokens"][0]["user_id"] == d["user_id"] == d["owner_user_id"] == "__USER_ID__", "归属三元组必须同值"
+assert any(d["db"].startswith(r) for r in d["friend_allowed_roots"]), "db 必须在允许根内"
+assert "__OVERLAY_IP__" in d["listen"], "listen 必须是占位 overlay 地址"
+assert "xt_path" not in d and "session_id" not in d, "远端档不该出现 xt 通道字段"
+PYTPL
+
+# ⑧ 负锁：ps1 不许复制判据（真源唯一）；但它必须把"起服务要带的两个环境变量"落盘
+CNT166=$((CNT166 + 1))
+if grep -qF 'account_tokens 必须恰好一条' "$ENS166"; then
+	fail166 "ensure_friend_gateway_config.ps1 里复制了网关的判据文案（两份尺子必然漂开）"
+fi
+CNT166=$((CNT166 + 1))
+for tok in 'QUANT_GATEWAY_BIND=' 'ALLOWED_IPS=' 'friend.env'; do
+	grep -qF "$tok" "$ENS166" || fail166 "ps1 缺 ${tok}（服务不带这两个值就会被收敛回 127.0.0.1）"
+done
+CNT166=$((CNT166 + 1))
+for tok in 'FRIENDCFG_RESULT=' 'REREAD_MATCH=' 'apply=0 written=0' 'pre-friendcfg-'; do
+	grep -qF "$tok" "$ENS166" || fail166 "ps1 缺锚点/备份纪律 ${tok}（缺省不写盘 + 写前备份 + 写后复读自证）"
+done
+
+# ⑨ 用例在册且条数等值（增删用例必须同批改这里——否则"用例数"这条读数会变瞎）
+CNT166=$((CNT166 + 1))
+N166=$(grep -c 'def test_' "$TST166" || true)
+[ "${N166:-0}" -eq 21 ] || fail166 "test_friend_profile.py 用例数是 ${N166}（应为 21：缺省即今天 3 + 归属 5 + 通道主机目录监听行情 6 + 致命性 2 + CLI 2 + 行情行为 2 + 合法通过 1）"
+CNT166=$((CNT166 + 1))
+for tc in test_absent_profile_key_does_nothing test_rejects_two_tokens test_rejects_broker_xt test_enforce_exits_with_code_2 test_disabled_returns_403 test_enabled_keeps_today_shape_empty_ticks_200; do
+	grep -qF "def ${tc}(" "$TST166" || fail166 "关键用例 ${tc} 不在册"
+done
+
+# ⑩ 常驻反证 R1：在副本树里摘掉 enforce 调用点 ⇒ 用例必须红（锚漂了就先红这条）
+CNT166=$((CNT166 + 1))
+W166=$(mktemp -d /tmp/gate166.XXXXXX)
+if [ -d "$W166" ]; then
+	mkdir -p "$W166/mirror"
+	rsync -a --exclude='*.db' --exclude='__pycache__' qmt_gateway/ "$W166/mirror/qmt_gateway/" 2>/dev/null || true
+	MU166=$(python3 - "$W166/mirror/qmt_gateway/gateway.py" <<'PYR1' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "    enforce_friend_profile(cfg, allowed_ips=allowed_ips, bind_explicit=bool(bind_env))"
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "    pass  # MUTATED", 1))
+print(n)
+PYR1
+)
+	[ "${MU166:-0}" -ge 1 ] || fail166 "反证 R1 没改动任何字节（锚串漂了＝这条锁今天没有牙）"
+	( cd "$W166/mirror/qmt_gateway" && python3 -m pytest tests/test_friend_profile.py -q -p no:cacheprovider ) >/tmp/gate166_r1.log 2>&1 || true
+	if ! grep -qE '[1-9][0-9]* failed' /tmp/gate166_r1.log; then
+		fail166 "反证 R1 失效：摘掉 enforce 调用点后用例仍全绿（说明没有任何一条用例在守调用点）"
+	fi
+	echo "   [§166 R1] MUTATED=${MU166} 反证按预期转红"
+	rm -rf "$W166"
+fi
+
+[ "$B166_FAILED" = "0" ] || exit 1
+echo "ok - §166 §FRIEND-PROFILE 锁通过（真源与装配顺序 3 + 十项判据 1 + 回环与 IPv6 2 + 缺省即今天 3 + 行情行为腿 2 + CLI 与 ASCII 锚点 3 + 模板等值 2 + ps1 负锁与接线 3 + 用例在册 2 + 常驻反证 1，累计判定点 ${CNT166}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §167 §FRIEND-CLOSE-GATE（2026-11-02 夜批·多账号 B-α 批2：远端"能不能关 QMT"的判据与看门狗）
+# 这批要的不是"15:30 自动关客户端"这个功能，而是别让它变成第 3 份判据：
+#   ① 终态口径已在 store.TERMINAL_STATUSES（与 Go 侧 orderStatusRank 同源）——本批第一版
+#      在 close_gate.py 里手写过一份三元组，漏了「部撤/已废」，后果是那天只要有任意一笔部撤
+#      门就永远不开、朋友的 QMT 天天整晚开着，而现场读起来像"网络问题"（就是这条锁要防的事）；
+#   ② 交易日口径已在 trading_calendar.is_trading_day（与 Go calendarCacheFilePath 同口径），
+#      ps1 自己判周末/节假日就是第三份日历；
+#   ③ 读不到读数一律判"不关"——"没数"和"没问题"必须是两种字（11-02 J0 那次把零回包编码成健康）。
+# 门不开就不关：A 股委托收盘即失效，硬关没有交易风险，但会把未收敛的账留在别人家里过夜
+#   ——2026-10-30 那两笔「撤单中」挂住 3.67 万战略额度的形状，只是这次没人核对。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 167 §FRIEND-CLOSE-GATE（判据真源不复制 / 读不到不关 / 超时不硬关 / ps1 三不越界 / 常驻反证）..."
+B167_FAILED=0
+fail167() {
+	echo "--- FAIL: §167 $*"
+	FAIL=1
+	B167_FAILED=1
+}
+CNT167=0
+
+CG167=qmt_gateway/close_gate.py
+ST167=qmt_gateway/store.py
+TC167=qmt_gateway/trading_calendar.py
+WD167=deploy/qmt-friend/watchdog.ps1
+IT167=deploy/qmt-friend/install_tasks.ps1
+CGT167=qmt_gateway/tests/test_close_gate_logic.py
+TCT167=qmt_gateway/tests/test_trading_calendar_cli.py
+
+# ① 判据真源：decide() + 三个"不关"码 + 两个"读不到"码 + 四个退出码常量
+CNT167=$((CNT167 + 1))
+grep -qF 'def decide(admin_status, orders_rows, day, elapsed_sec=0, hold_limit_sec=3600):' "$CG167" || fail167 "缺 decide（关闭门的判据没有唯一真源）"
+CNT167=$((CNT167 + 1))
+for tok in 'no_close_snapshot' 'stuck_cancel' 'nonterminal' 'status_unreadable' 'orders_unreadable' 'EXIT_ALLOWED' 'EXIT_HELD' 'EXIT_GIVE_UP' 'EXIT_UNREADABLE'; do
+	grep -qF "$tok" "$CG167" || fail167 "close_gate 缺判据/退出码 ${tok}"
+done
+
+# ② 终态口径必须复用 store 的那一份；本文件里再出现手写状态字面组就是复制真源
+CNT167=$((CNT167 + 1))
+grep -qF 'from store import TERMINAL_STATUSES' "$CG167" || fail167 "close_gate 没有复用 store.TERMINAL_STATUSES（第一版就是这么漏掉 部撤/已废 的）"
+CNT167=$((CNT167 + 1))
+if grep -nE '\("已(成|撤)", *"已(撤|废)"' "$CG167" >/dev/null 2>&1; then
+	fail167 "close_gate 里出现手写的终态字面组（判据出现第二份，漂开那次没人红）"
+fi
+
+# ③ 看门狗必须"调用"而不是"重算"这两条判据
+CNT167=$((CNT167 + 1))
+for tok in 'close_gate.py' 'trading_calendar.py' 'profile-check' 'schtasks /Run'; do
+	grep -qF "$tok" "$WD167" || fail167 "watchdog 缺接线 ${tok}（客户端只走计划任务＝10-29 的实证）"
+done
+
+# ④ 负锁：ps1 三不越界——不复制中文状态口径 / 不自判日历 / 不直起客户端
+CNT167=$((CNT167 + 1))
+if grep -vE '^[[:space:]]*#' "$WD167" | grep -qE '已成|已撤|部撤|废单|撤单中'; then
+	fail167 "watchdog 里出现委托状态中文串（终态口径的第二份）"
+fi
+CNT167=$((CNT167 + 1))
+if grep -nE 'DayOfWeek|Saturday|Sunday' "$WD167" >/dev/null 2>&1; then
+	fail167 "watchdog 自己判周末＝第三份交易日历（真源在 trading_calendar）"
+fi
+CNT167=$((CNT167 + 1))
+if grep -nE '^[^#]*Start-Process[^\r\n]*XtItClient' "$WD167" >/dev/null 2>&1; then
+	fail167 "watchdog 在会话里直起 QMT 客户端（进程随会话被杀＝10-29 实录）"
+fi
+# B-N5：看门狗只动本机，对广州零权限
+CNT167=$((CNT167 + 1))
+if grep -vE '^[[:space:]]*#' "$WD167" "$IT167" | grep -qE 'Invoke-Command|PSSession|-ComputerName|Enter-PSSession'; then
+	fail167 "远端脚本里出现远程执行通道（B-N5：对广州任何服务零权限）"
+fi
+
+# ⑤ 只有 decide 放行才关；超时/读不到一律不关
+CNT167=$((CNT167 + 1))
+SEG167C=$(awk '/"Close" \{/,/^    \}/' "$WD167")
+grep_q '$rc -eq 0' SEG167C F || fail167 "关闭动作没绑在退出码 0 上（超时或读不到也可能硬关＝带着未收敛的账关门）"
+CNT167=$((CNT167 + 1))
+for tok in 'AddHours(15)' 'AddMinutes(30)' 'HoldLimitSec'; do
+	grep -qF "$tok" "$WD167" || fail167 "缺 ${tok}（15:30 是最早可尝试时刻，等待上限转人工——两个都得在位）"
+done
+
+# ⑥ 交易日判定入口：ASCII 锚点 + 退出码语义（0 交易日 / 3 休市）
+CNT167=$((CNT167 + 1))
+grep -qF 'TRADING_DAY=%d calendar=%s' "$TC167" || fail167 "trading_calendar 没有 CLI 判定入口（ps1 只能自己再判一遍）"
+CNT167=$((CNT167 + 1))
+if grep -nE '^[^#]*print\("TRADING_DAY=[^"]*[^ -~]' "$TC167" >/dev/null 2>&1; then
+	fail167 "TRADING_DAY 锚点混入非 ASCII（PS 管道会换成 ? ⇒ 判读恒假）"
+fi
+
+# ⑦ 任务注册：四个名字齐、缺省 dry-run、注册后复读自证、卸载同四件
+CNT167=$((CNT167 + 1))
+for tok in 'QMTF-Client-Ensure' 'QMTF-Client-Start' 'QMTF-Gateway-Ensure' 'QMTF-Close'; do
+	grep -qF "$tok" "$IT167" || fail167 "缺任务定义 $tok"
+done
+CNT167=$((CNT167 + 1))
+for tok in 'WOULD_CREATE' 'TASKS_REREAD_MATCH=1' 'WOULD_DELETE'; do
+	grep -qF "$tok" "$IT167" || fail167 "install_tasks 缺 ${tok}（缺省不注册 + 写后复读 + 卸载分支）"
+done
+
+# ⑧ 用例在册且条数等值（增删用例同批改这里）
+CNT167=$((CNT167 + 1))
+N167A=$(grep -c 'def test_' "$CGT167" || true)
+[ "${N167A:-0}" -eq 19 ] || fail167 "test_close_gate_logic.py 用例数是 ${N167A}（应为 19：放行 2 + 不关 6 + 读不到保守 4 + 超时 2 + CLI 3 + 真源等值 2）"
+CNT167=$((CNT167 + 1))
+N167B=$(grep -c 'def test_' "$TCT167" || true)
+[ "${N167B:-0}" -eq 2 ] || fail167 "test_trading_calendar_cli.py 用例数是 ${N167B}（应为 2）"
+CNT167=$((CNT167 + 1))
+for tc in test_bu_che_allows_closing test_close_gate_uses_store_terminal_set test_orders_none_blocks test_over_limit_keeps_closed_false_and_give_up_code test_anchor_is_ascii_and_code_matches; do
+	grep -rqF "def ${tc}(" qmt_gateway/tests/ || fail167 "关键用例 ${tc} 不在册"
+done
+
+# ⑨ 常驻反证 R2：副本树里摘掉"非终态就挡住"这条判定 ⇒ 用例必须红
+CNT167=$((CNT167 + 1))
+W167=$(mktemp -d /tmp/gate167.XXXXXX)
+if [ -d "$W167" ]; then
+	mkdir -p "$W167/mirror"
+	rsync -a --exclude='*.db' --exclude='__pycache__' qmt_gateway/ "$W167/mirror/qmt_gateway/" 2>/dev/null || true
+	MU167=$(python3 - "$W167/mirror/qmt_gateway/close_gate.py" <<'PYR2' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '    if blocked:'
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "    if False and blocked:", 1))
+print(n)
+PYR2
+)
+	[ "${MU167:-0}" -ge 1 ] || fail167 "反证 R2 没改动任何字节（锚串漂了＝这条锁今天没有牙）"
+	( cd "$W167/mirror/qmt_gateway" && python3 -m pytest tests/test_close_gate_logic.py -q -p no:cacheprovider ) >/tmp/gate167_r2.log 2>&1 || true
+	if ! grep -qE '[1-9][0-9]* failed' /tmp/gate167_r2.log; then
+		fail167 "反证 R2 失效：摘掉非终态判定后用例仍绿（门开着也敢关 QMT）"
+	fi
+	echo "   [§167 R2] MUTATED=${MU167} 反证按预期转红"
+	rm -rf "$W167"
+fi
+
+[ "$B167_FAILED" = "0" ] || exit 1
+echo "ok - §167 §FRIEND-CLOSE-GATE 锁通过（判据真源 2 + 终态复用与负锁 2 + 看门狗接线 1 + 三不越界 4 + 关闭绑定与时刻 2 + 日历入口 2 + 任务注册 2 + 用例在册 3 + 常驻反证 1，累计判定点 ${CNT167}）"
 echo "==> 全部通过"
+
+
 

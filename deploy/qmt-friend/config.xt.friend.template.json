@@ -1,0 +1,24 @@
+{
+  "_comment": "§FRIEND-PROFILE（2026-11-02 多账号 B-α）朋友机器网关出厂模板。占位符 __ACCOUNT__/__USER_ID__/__TOKEN__/__OVERLAY_IP__ 由 ensure_friend_gateway_config.ps1 替换；写盘前后各判一次，最终由 gateway.py --profile-check 裁决（判据真源只有一份，本脚本不复制判定逻辑）。",
+  "_comment_broker": "broker 固定 queued：QMT 内置文件桥是唯一主接线，miniQMT/xt 通道券商已停申（现网 2026-09-23 退役），且 failover 必须关——每次 connect() 在客户端共享内存占一个 writer 槽，槽满拖崩 QMT 客户端（2026-10-29 实测 713 连败、3~6 分钟一崩）。",
+  "_comment_quotes": "quotes_enabled=false：远端只承担信号接收与交易数据交互；券商 L1 的钥匙与 feed 一律只在决策机那一路。",
+  "deploy_profile": "friend",
+  "broker": "queued",
+  "listen": "__OVERLAY_IP__:8789",
+  "token": "__TOKEN__",
+  "report_token": "__TOKEN__",
+  "account": "__ACCOUNT__",
+  "user_id": "__USER_ID__",
+  "owner_user_id": "__USER_ID__",
+  "account_tokens": [
+    { "user_id": "__USER_ID__", "token": "__TOKEN__" }
+  ],
+  "report_url": "https://quant-trading.top",
+  "db": "C:\\qmt\\quant-trading-v2\\qmt_gateway\\data.db",
+  "friend_allowed_roots": [ "C:\\qmt\\" ],
+  "quotes_enabled": false,
+  "failover_enable": false,
+  "bridge_heartbeat_timeout_sec": 15,
+  "reconcile_sec": 60,
+  "seed": []
+}

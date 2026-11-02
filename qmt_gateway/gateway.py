@@ -119,6 +119,20 @@ DEFAULT_CONFIG = {
     "db": "data.db",
     "user_id": "",             # 回报归属账号 ID（首尔侧 /api/qmt/report 归因用，建议显式配置）
     "owner_user_id": "",       # §TOKEN-PERAACCT 资金账号账本持有人：持仓/资金这类账户级事件归它
+    # §FRIEND-PROFILE（2026-11-02 多账号 B-α）部署档标记：
+    #   ""=缺省（现网运营机就是这个值）⇒ **一条校验都不做，启动行为与今天逐字节一致**；
+    #   "friend"=朋友机器 ⇒ 起服务前必须过 validate_friend_profile()，违规直接退出（不是告警）。
+    # 为什么宁可退出也不告警继续跑：远端形态下一处归属写错，代价是"朋友的成交记到运营账上"
+    # 或"朋友的腿执行运营的买单"——两者都是真钱，且现场看起来一切正常（10-30 七账号共用一把的教训）。
+    "deploy_profile": "",
+    # 远端机器只承担"信号接收 + 交易数据交互"（owner 裁决），行情一律由决策机的 feed 单例供给。
+    # 缺省 True＝今天（/quotes 照常应答）；friend 档必须显式 False（校验项 9）。
+    "quotes_enabled": True,
+    # friend 档下 `db` / `bridge_report_dir` 必须落在这些**本地盘前缀**之内（校验项 7）。
+    # 取向是"正向白名单"而不是"反向排除 UNC/映射盘"：Windows 下映射盘符与本地盘符同形，
+    # 反排根本判不准；而文件桥在共享盘上会**静默坏在下行**（os.replace 冲突、轮转删不掉、
+    # bridge_seen.jsonl 追加竞态——全仓没有任何文件锁），所以这里只认写死的本地根目录。
+    "friend_allowed_roots": ["C:\\qmt\\"],
     # §TOKEN-PERAACCT（2026-10-30）入向凭证从"一把共享钥匙"改为"一账号一把"：
     # [{"user_id": "u_xxx", "token": "...", "label": "可选备注"}]。
     # 上面的 `token` 继续有效并映射到 owner_user_id（缺省回退 user_id），所以 account_tokens
@@ -297,6 +311,123 @@ def load_config(path):
     elif not cfg.get("report_token"):
         cfg["report_token"] = cfg.get("token", "")
     return cfg
+
+
+# §FRIEND-PROFILE：friend 档下 report_url 允许的主机（决策机域名/公网 IP）。
+# 为什么写死而不是"任意 https 都行"：回报里带的是**朋友的成交与持仓**，指错一台就等于
+# 把他人的交易事实发到别人的服务器上；这类错只能靠"不认识就不起服务"挡住，事后报警没人看。
+FRIEND_REPORT_HOSTS = ("quant-trading.top", "81.71.69.17")
+
+
+def validate_friend_profile(cfg, allowed_ips=None, bind_explicit=False):
+    """校验"朋友机器"部署档的配置自洽性，返回违规清单（空清单＝通过）。纯函数，不写盘不联网。
+
+    调用方在 friend 档拿到非空清单时必须**拒绝启动**（结构性"不能"），不要改成 warning：
+    下面每一条都对应一种"链路照跑、账却错到别人名下"的现网形状，而不是理论风险。
+
+    逐项与成因：
+      1-3 一台网关只服务一个资金账号、且账户级事件（持仓/资金）归那一台的主人
+          ——漏了就是 10-30 的形态：七账号一把钥匙 ⇒ 回报按 users 顺序恒归 admin；
+      4   关掉主备翻转 —— 朋友的 miniQMT 通道券商已停申/下线，翻上去只会每次 connect()
+          占一个 writer 槽、槽满拖崩客户端（10-29 实测 713 连败、3~6 分钟一崩）；
+      5   只允许 queued（QMT 内置文件桥）这一条主接线，与现网一致；
+      6   回报只许发往决策机；
+      7   账本与文件桥目录必须在写死的本地盘根之下（共享盘上的坏法全在下行且静默）；
+      8   监听地址不许是 0.0.0.0/空，且必须配 ALLOWED_IPS —— 远端这台机器在别人的家里；
+      9   行情通道必须关（远端不吃行情、不装 feed，钥匙仍只在决策机那一路）；
+      10  legacy `token` 与 account_tokens 里那把必须同值 —— 两把不同钥匙等于"一台机器两个身份"。
+    """
+    bad = []
+    toks = cfg.get("account_tokens") or []
+    if not isinstance(toks, list) or len(toks) != 1:
+        bad.append("account_tokens 必须恰好一条（一台网关只服务一个资金账号；"
+                   "多把钥匙会让 /dispatch/pending 这类'不分主体取单'的通道变成跨账号通道）")
+        first = None
+    else:
+        item = toks[0]
+        first = item if isinstance(item, dict) else None
+        if first is None:
+            bad.append("account_tokens[0] 必须是 {user_id, token} 对象")
+
+    owner = str(cfg.get("owner_user_id") or "").strip()
+    uid = str(cfg.get("user_id") or "").strip()
+    if not owner:
+        bad.append("owner_user_id 不能为空（friend 档下账户级事件必须有主人，缺省会退到运营账号）")
+    if first is not None:
+        if str(first.get("user_id") or "").strip() != owner:
+            bad.append("account_tokens[0].user_id 必须等于 owner_user_id（钥匙属于谁＝这台机器的账归谁）")
+        if not str(first.get("token") or "").strip():
+            bad.append("account_tokens[0].token 不能为空")
+    if uid and owner and uid != owner:
+        bad.append("user_id 与 owner_user_id 必须同值（两把归属口径并存时，落库与上报会分叉）")
+
+    if cfg.get("failover_enable"):
+        bad.append("failover_enable 必须为 false（翻 xt 顶班在朋友机器上是纯风险：每次 connect() 占一个 writer 槽，槽满拖崩 QMT 客户端）")
+    if str(cfg.get("broker") or "") != "queued":
+        bad.append("broker 必须为 queued（QMT 内置文件桥是唯一主接线；miniQMT 通道券商已停申）")
+
+    ru = str(cfg.get("report_url") or "").strip()
+    host = urlparse(ru).hostname if ru else ""
+    if host not in FRIEND_REPORT_HOSTS:
+        bad.append("report_url 主机必须是决策机（当前=%r）；成交/持仓是别人的交易事实，指错一台等于外发" % (host,))
+
+    roots = [str(x) for x in (cfg.get("friend_allowed_roots") or [])]
+    for key in ("db", "bridge_report_dir"):
+        p = str(cfg.get(key) or "").strip()
+        if not p:
+            if key == "db":
+                bad.append("db 必须显式配置在本地盘根之下")
+            continue  # bridge_report_dir 允许留空（走网关脚本同目录），非空才判
+        if p.startswith("\\\\") or not any(p.lower().startswith(r.lower()) for r in roots):
+            bad.append("%s=%r 必须落在 friend_allowed_roots 之内（共享盘上文件桥的坏法全在下行且静默）" % (key, p))
+
+    # host 解析按"最后一个冒号切端口"而不是 partition(":")：
+    # 否则 IPv6 的 "::1:8789" 会被切成空串，被上面那条"不许 0.0.0.0/空"误收、
+    # 却让下面这条回环闸**永远判不到**（摆设锁的形状，§164 那条多转义 \\( 同族）。
+    _listen = str(cfg.get("listen") or "")
+    listen_host = _listen.rsplit(":", 1)[0] if _listen.count(":") >= 2 else _listen.partition(":")[0]
+    if listen_host in ("0.0.0.0", ""):
+        bad.append("listen 必须显式绑定 overlay 私网地址（不许 0.0.0.0：这台机器在别人的家里）")
+    # 回环也不行：那是一条"上报照常、下单进不来"的半条命通道——朋友的账在广州是新鲜的，
+    # 页面因此看起来一切正常，而 Q3 要的"急停/清场覆盖远端"结构上做不到（11-02 J0 同族形状：
+    # "看得见"和"发得出"是两件事，缺一个读数就会把后者冒充成前者）。
+    if listen_host in ("127.0.0.1", "::1", "localhost"):
+        bad.append("listen=%s 是回环地址：决策机进不来 ⇒ 远端变成'只上报不收单'，"
+                   "必须绑分配到的 overlay 地址" % (cfg.get("listen"),))
+    if not bind_explicit:
+        bad.append("必须显式设置 QUANT_GATEWAY_BIND（否则 main 会把监听收敛回 127.0.0.1，决策机进不来 ⇒ 朋友机器变成'只上报不收单'的半条命形态）")
+    if not (allowed_ips or []):
+        bad.append("ALLOWED_IPS 必须非空（friend 档只依赖一把钥匙防护不够；来源固定填决策机 overlay 地址）")
+
+    if cfg.get("quotes_enabled", True):
+        bad.append("quotes_enabled 必须为 false（远端不吃行情、不装 feed；券商 L1 钥匙只在决策机那一路）")
+
+    legacy = str(cfg.get("token") or "").strip()
+    if legacy and first is not None and legacy != str(first.get("token") or ""):
+        bad.append("legacy token 与 account_tokens[0].token 不同值 ⇒ 在册两把钥匙＝一台机器两个身份")
+    return bad
+
+
+def enforce_friend_profile(cfg, allowed_ips=None, bind_explicit=False):
+    """friend 档的执行腿：违规就打全清单并退出码 2；非 friend 档一字不做。
+
+    为什么是退出而不是"降级继续跑"：远端配置错误的现场形态是**链路活着、账错到别人名下**
+    （运营侧页面显示正常、朋友侧 /health 200），事后报警既没人看也判不出是哪条写错；
+    把判定放在装配当场是唯一能"不能发生"的位置（owner 一贯取向：结构性不能 > 开关+报警）。
+    """
+    if str(cfg.get("deploy_profile") or "").strip().lower() != "friend":
+        return
+    bad = validate_friend_profile(cfg, allowed_ips=allowed_ips, bind_explicit=bind_explicit)
+    if not bad:
+        log.info("[gateway] §FRIEND-PROFILE 出厂档校验通过：account=%s owner=%s broker=queued failover=off",
+                 str(cfg.get("account", ""))[-4:], cfg.get("owner_user_id", ""))
+        return
+    for item in bad:
+        log.error("[gateway] §FRIEND-PROFILE 出厂档违规：%s", item)
+    log.error("[gateway] §FRIEND-PROFILE 共 %d 条违规，拒绝启动（修 config.xt.json 后重起；"
+              "运营机不需要这个键——deploy_profile 缺省为空即完全不校验）", len(bad))
+    raise SystemExit(2)
+
 
 
 def _code_head(code):
@@ -1245,6 +1376,13 @@ class Gateway:
         query = ""
         if request_handler is not None:
             query = urlparse(getattr(request_handler, "path", "") or "").query
+        # §FRIEND-PROFILE 校验项 9 的行为腿：远端机器只承担"信号接收 + 交易数据交互"，
+        # 行情一律由决策机的 feed 单例供给 ⇒ quotes_enabled=False 时这条只读通道直接关门。
+        # 返回 403 而不是"空 ticks + 200"：后者在今天的语义里是"feed 还没通"的正常态，
+        # 拿它表达"这台机器根本不该供行情"会把两种完全不同的事实折成同一个读数。
+        if not self.cfg.get("quotes_enabled", True):
+            return 403, {"ok": False, "err": "quotes_disabled_by_profile",
+                         "hint": "远端执行腿不提供行情（quotes_enabled=false）；行情请走决策机那一路"}
         params = parse_qs(query or "")
         raw_codes = (params.get("codes") or [""])[0]
         codes = [c.strip() for c in raw_codes.split(",") if c.strip()]
@@ -2708,7 +2846,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="MiniQMT gateway (M2)")
     ap.add_argument("-c", "--config", default="", help="config JSON path")
     ap.add_argument("--listen", default="", help="override listen addr")
+    # §FRIEND-PROFILE：只跑出厂档自证然后退出（0=通过 / 2=违规），**不构造 Gateway、不开库不开线程**。
+    # 为什么要这个开关：装填器与看门狗都必须在"起服务之前"判一次配置自洽，
+    # 而判据的真源只能是本网关里这一份 validate_friend_profile——
+    # 让 PowerShell 再抄一份就是两份尺子，漂开的那次没人红（§INDEX-BLIND 段序表同形教训）。
+    ap.add_argument("--profile-check", action="store_true", dest="profile_check",
+                    help="validate deploy_profile and exit (0=ok, 2=violations) without starting")
     ap.add_argument("--verbose", action="store_true")
+
     args = ap.parse_args(argv)
 
     # stderr 基线日志先配置（basicConfig 在 root 已有 handler 时是 no-op，
@@ -2776,6 +2921,19 @@ def main(argv=None):
         log.info("[gateway] IP 白名单已启用，允许来源：%s", ", ".join(allowed_ips))
     else:
         log.warning("[gateway] 未设置 ALLOWED_IPS，敏感端点仅依赖 token 防护（建议配置决策机出口 IP）")
+
+    # §FRIEND-PROFILE：朋友机器档的装配当场自证——放在 bind_env/allowed_ips 都算完之后、
+    # Gateway() 构造之前：装配一旦开始就会开 SQLite/线程/订阅，到那时再判违规就是"半态在跑"。
+    # 运营机（deploy_profile 缺省空）在这里一字不做，行为与今天逐字节一致。
+    enforce_friend_profile(cfg, allowed_ips=allowed_ips, bind_explicit=bool(bind_env))
+
+    if args.profile_check:
+        # 给装填器/看门狗的机器可判读锚点：**纯 ASCII**（中文经 ssh 管道会被码页换成 `?`，
+        # 11-02 现网两次假象同源，那条纪律在这里同样成立），判据只认退出码与这一行。
+        print("PROFILE_CHECK=PASS profile=%s broker=%s account_tail=%s owner=%s quotes=off" % (
+            cfg.get("deploy_profile", ""), cfg.get("broker", ""),
+            str(cfg.get("account", ""))[-4:], str(cfg.get("owner_user_id", ""))[:8]))
+        return
 
     gw = Gateway(cfg)
     gw.allowed_ips = allowed_ips  # 注入白名单，供 _Handler 校验
