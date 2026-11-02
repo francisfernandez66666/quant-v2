@@ -286,8 +286,14 @@ def evidence_ok(evidence):
     if len(parts) < 2:
         return False, "evidence 不是 file:… 形态"
     rel = parts[0]
+    # 畸形三段格（`file::symbol`）以前会静默退化成"没给行号"，于是整条行号校验被跳过——
+    # 等于 evidence 可以随便填，而 §115 的锁看起来仍然全绿。行号要么给对，要么判红。
+    if len(parts) == 3 and not parts[1].isdigit():
+        return False, "evidence 三段式但行号非数字（file::symbol 会让行号校验整条失效）"
     needle = parts[2] if len(parts) == 3 else ""
     lineno = parts[1] if len(parts) == 3 and parts[1].isdigit() else ""
+    if len(parts) == 3 and not needle:
+        return False, "evidence 三段式但锚串为空（只剩 file:行号，等于没证据）"
     path = ROOT / rel
     if not path.exists():
         return False, "文件不存在"
