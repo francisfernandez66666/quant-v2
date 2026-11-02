@@ -19563,7 +19563,150 @@ fi
 
 [ "$B167_FAILED" = "0" ] || exit 1
 echo "ok - §167 §FRIEND-CLOSE-GATE 锁通过（判据真源 2 + 终态复用与负锁 2 + 看门狗接线 1 + 三不越界 4 + 关闭绑定与时刻 2 + 日历入口 2 + 任务注册 2 + 用例在册 3 + 常驻反证 1，累计判定点 ${CNT167}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §168 §FRIEND-LEG-OPS（2026-11-02 夜批·多账号 B-α 批3：证据包 / 停腿 / 一键卸载 / 装填鉴权）
+# 这批碰的是**证据**：Q9 把账本真源放在朋友机器上、广州不留副本，于是
+#   "导出的包能不能用" 与 "卸载有没有把唯一凭据顺手删掉" 是同一件事的两面。
+# 三段本批当场抓到的真问题（都在用例里，不靠人记）：
+#   ① 行数"数不出"必须 -1，不许折成 0——0 读起来像"这台机器当天什么都没做"；
+#   ② 导出正在被写的库必须走 SQLite 在线备份 API，`shutil.copy` 出来的副本可以是撕裂页＝假凭据；
+#   ③ manifest 的行数键名与 CLI 锚点必须同一组词汇，两份名字早晚有人换算错。
+# 判据真源一律在 qmt_gateway/leg_ops.py，ps1 只调用（与 §166/§167 同纪律）。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 168 §FRIEND-LEG-OPS（证据判据真源 / 备份 API 不是拷文件 / 卸载默认不碰账本 / 装填不新增路由 / 常驻反证）..."
+B168_FAILED=0
+fail168() {
+	echo "--- FAIL: §168 $*"
+	FAIL=1
+	B168_FAILED=1
+}
+CNT168=0
+
+LO168=qmt_gateway/leg_ops.py
+LOT168=qmt_gateway/tests/test_leg_ops.py
+EXP168=deploy/qmt-friend/export_ledger.ps1
+UN168=deploy/qmt-friend/uninstall.ps1
+SL168=deploy/qmt-friend/stop_leg.ps1
+EN168=deploy/qmt-friend/enroll.ps1
+
+# ① 三子命令 + 两个退出码 + "数不出=-1" 的初始态
+CNT168=$((CNT168 + 1))
+for tok in 'def cmd_verify(db_path)' 'def cmd_export(' 'def cmd_stop_cmd(cmd_path, db_path)' 'EXIT_REFUSED = 30' 'out = {t: -1 for t in TABLES}'; do
+	grep -qF "$tok" "$LO168" || fail168 "leg_ops 缺 ${tok}（判据真源不完整）"
+done
+
+# ② 备份必须走在线备份 API；负锁：不许出现"拷文件当凭据"
+CNT168=$((CNT168 + 1))
+grep -qF 'src.backup(dst)' "$LO168" || fail168 "导出没走 SQLite 在线备份（拷一个正在被写的库＝撕裂页假凭据）"
+if grep -vE '^[[:space:]]*(#|"")' "$LO168" | grep -qE 'shutil\.(copy|copyfile)'; then
+	fail168 "leg_ops 里出现 shutil.copy 形态的账本复制"
+fi
+
+# ③ 重名拒绝覆盖（默认），且 ps1 不把 --force 变成缺省
+CNT168=$((CNT168 + 1))
+grep -qF 'reason=refuse_overwrite' "$LO168" || fail168 "导出件重名时没拒绝（覆盖＝销毁一次取证）"
+CNT168=$((CNT168 + 1))
+if grep -nE '\-\-force' "$EXP168" | grep -qvE 'if \(\$Force\)'; then
+	fail168 "export_ledger.ps1 把 --force 变成缺省行为"
+fi
+
+# ④ manifest 与锚点同一组键名；负锁：不许回到"表名/简称各一套"
+CNT168=$((CNT168 + 1))
+grep -qF '"positions": counts["real_positions"]' "$LO168" || fail168 "manifest 行数键没与锚点同源"
+if grep -qF '"rows": counts,' "$LO168"; then
+	fail168 "manifest 又写回库内表名那套键（两套词汇早晚换算错）"
+fi
+
+# ⑤ 卸载的顺序与删除面（B-N9/B-N11）
+CNT168=$((CNT168 + 1))
+L_EXP=$(grep -n 'export_ledger.ps1' "$UN168" | head -1 | cut -d: -f1 || true)
+L_STOP=$(grep -n 'stop_leg.ps1' "$UN168" | head -1 | cut -d: -f1 || true)
+L_TSK=$(grep -n 'install_tasks.ps1' "$UN168" | head -1 | cut -d: -f1 || true)
+L_DEL=$(grep -n 'Remove-Item \$p -Force' "$UN168" | head -1 | cut -d: -f1 || true)
+for v in L_EXP L_STOP L_TSK L_DEL; do
+	[ -n "${!v:-}" ] || fail168 "卸载脚本缺对照物 ${v}（本锁的锚漂了，请同批更新）"
+done
+{ [ -n "${L_EXP:-0}" ] && [ -n "${L_STOP:-0}" ] && [ "$L_EXP" -lt "$L_STOP" ] && [ "$L_STOP" -lt "$L_TSK" ] && [ "$L_TSK" -lt "$L_DEL" ]; } || \
+	fail168 "卸载顺序错了：必须 导出 → 停腿 → 删任务 → 才动文件（先拆任务会把腿留在无人守护状态）"
+CNT168=$((CNT168 + 1))
+# 默认删除面里只有配置与钥匙，账本/日志只能走 -PurgeLedger + confirm
+SEG168U=$(awk '/^\$targets = /,/^\}/' "$UN168")
+if grep_q 'data\.db' SEG168U F; then
+	fail168 "默认删除面里出现 data.db（Q9 后账本真源就在这台机器，卸载不许顺手删证据）"
+fi
+grep -qF 'PURGE-{0}-{1}' "$UN168" || fail168 "清账本没有 confirm 串门槛"
+
+# ⑥ 停腿：先禁守护任务再杀进程，且必须调真源清命令文件
+CNT168=$((CNT168 + 1))
+L_DIS=$(grep -n 'DISABLE' "$SL168" | head -1 | cut -d: -f1 || true)
+L_KILL=$(grep -n 'Stop-Process' "$SL168" | head -1 | cut -d: -f1 || true)
+L_CLR=$(grep -n 'stop-cmd' "$SL168" | head -1 | cut -d: -f1 || true)
+{ [ -n "${L_DIS:-0}" ] && [ -n "${L_KILL:-0}" ] && [ -n "${L_CLR:-0}" ] && [ "$L_DIS" -lt "$L_KILL" ] && [ "$L_KILL" -lt "$L_CLR" ]; } || \
+	fail168 "停腿顺序错了：必须先禁守护任务（否则 5 分钟被自动拉起）→ 停进程 → 再清 bridge_cmd.json"
+CNT168=$((CNT168 + 1))
+if grep -vE '^[[:space:]]*#' "$SL168" | grep -qE 'Invoke-Command|PSSession|-ComputerName'; then
+	fail168 "停腿脚本里有远程执行通道（B-N5：对广州零权限）"
+fi
+
+# ⑦ 装填：不新增路由 + 未授权即无服务 + 双向连通自证 + 钥匙不回显
+CNT168=$((CNT168 + 1))
+for tok in '/api/auth/login' '/api/qmt/state' 'no_live_perm' 'account_tail_mismatch_two_registry'; do
+	grep -qF "$tok" "$EN168" || fail168 "enroll 缺 ${tok}（登录/权限断言/两处登记自证都是硬项）"
+done
+CNT168=$((CNT168 + 1))
+if grep -qE '/api/[a-z-]+/(enroll|device|register)' "$EN168"; then
+	fail168 "enroll 引入了新的服务端路由（本批契约：零新增路由，§144/§115/台账计数才能不动）"
+fi
+# 钥匙全文不许进任何输出（只允许 tail6）
+if grep -nE 'Write-Host[^\r\n]*\$token[^\r\n]*' "$EN168" | grep -qvE 'Mask' ; then
+	fail168 "enroll 把钥匙原文打进了输出"
+fi
+
+# ⑧ 用例在册且条数等值
+CNT168=$((CNT168 + 1))
+N168=$(grep -c 'def test_' "$LOT168" || true)
+[ "${N168:-0}" -eq 12 ] || fail168 "test_leg_ops.py 用例数是 ${N168}（应为 12：体检 3 + 导出 4 + 停腿 3 + CLI 锚点 2）"
+CNT168=$((CNT168 + 1))
+for tc in test_missing_db_is_not_zero test_export_contains_backup_that_passes_integrity test_refuses_overwrite_without_force test_empties_existing_cmd_file_atomically test_corrupt_db_is_refused; do
+	grep -qF "def ${tc}(" "$LOT168" || fail168 "关键用例 ${tc} 不在册"
+done
+
+# ⑨ 锚点行纯 ASCII（*_RESULT / step= / LEDGER_* / LEG_STOP 这些是 ps1 与 py 的机器判读面）
+CNT168=$((CNT168 + 1))
+if grep -nE '"(UNINSTALL_RESULT|ENROLL_RESULT|STOPLEG_RESULT|EXPORT_RESULT|LEDGER_VERIFY|LEDGER_EXPORT|LEG_STOP)[^"]*[^ -~]' "$UN168" "$EN168" "$SL168" "$EXP168" "$LO168" >/dev/null 2>&1; then
+	fail168 "机器判读的锚点串里混进非 ASCII（PS 管道会换成 ? ⇒ 判读恒假而流程照走）"
+fi
+
+# ⑩ 常驻反证 R3：副本树里摘掉"库坏就拒绝导出"⇒ 用例必须红
+CNT168=$((CNT168 + 1))
+W168=$(mktemp -d /tmp/gate168.XXXXXX)
+if [ -d "$W168" ]; then
+	mkdir -p "$W168/mirror"
+	rsync -a --exclude='*.db' --exclude='__pycache__' qmt_gateway/ "$W168/mirror/qmt_gateway/" 2>/dev/null || true
+	MU168=$(python3 - "$W168/mirror/qmt_gateway/leg_ops.py" <<'PYR3' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = '    if integ != "ok":'
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "    if False:", 1))
+print(n)
+PYR3
+)
+	[ "${MU168:-0}" -ge 1 ] || fail168 "反证 R3 没改动任何字节（锚串漂了＝这条锁没有牙）"
+	( cd "$W168/mirror/qmt_gateway" && python3 -m pytest tests/test_leg_ops.py -q -p no:cacheprovider ) >/tmp/gate168_r3.log 2>&1 || true
+	if ! grep -qE '[1-9][0-9]* failed' /tmp/gate168_r3.log; then
+		fail168 "反证 R3 失效：库坏也照样产出导出包（那就是假凭据，而它是唯一凭据）"
+	fi
+	echo "   [§168 R3] MUTATED=${MU168} 反证按预期转红"
+	rm -rf "$W168"
+fi
+
+[ "$B168_FAILED" = "0" ] || exit 1
+echo "ok - §168 §FRIEND-LEG-OPS 锁通过（真源 1 + 备份 API 1 + 重名与 force 2 + 键名同源 1 + 卸载顺序与删除面 2 + 停腿顺序 2 + 装填四项与负锁 2 + 用例在册 2 + ASCII 锚点 1 + 常驻反证 1，累计判定点 ${CNT168}）"
 echo "==> 全部通过"
+
 
 
 
