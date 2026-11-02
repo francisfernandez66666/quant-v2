@@ -145,6 +145,26 @@ func isDeterministicGatewayRejection(err error) bool {
 	return he.Status >= 400 && he.Status < 500
 }
 
+// GatewayContractMismatch §LEG-CONTRACT-GATE（批 4，2026-11-02）：网关回的 503 + code=contract_mismatch。
+// 为什么必须单独立一类而不是走 isDeterministicGatewayRejection：那条按状态码分家，
+// 503 属于 5xx ⇒ 被当成瞬态一路重试；而"契约/版本旧"重试一百次也不会变新，
+// 空转之外还会让日志把它读成"网络抖"，把处置方向从**升版**指到**查链路**上去。
+// English: classifies the gateway's "contract mismatch" refusal apart from generic 5xx retries —
+// the remedy is upgrading the leg, not probing the network.
+func GatewayContractMismatch(err error) bool {
+	var he *gatewayHTTPError
+	if !errors.As(err, &he) {
+		return false
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(he.Body), &body) != nil {
+		return false
+	}
+	return body.Code == "contract_mismatch"
+}
+
 // truncate 截断超长文本（日志/错误展示用）。
 // （truncate clips long text for logs/errors.）
 func truncate(s string, n int) string {
@@ -255,7 +275,8 @@ func (c *QMTClient) order(req OrderRequest) (*OrderResult, error) {
 		if err != nil {
 			lastErr = err
 			// §0925EVE-W3-E：确定性 4xx 直败（错误原样透传，网关 err 文案在 Body 里）。
-			if isDeterministicGatewayRejection(err) {
+			if isDeterministicGatewayRejection(err) || GatewayContractMismatch(err) {
+				// 契约不符也直败：不重试、不降级、不改熔断语义（见批 4 的"只报不接单"边界）
 				return nil, err
 			}
 			// §ROBUST 线性退避（250ms×序号）：跨网瞬断时紧背靠背重试只会三连败，
@@ -367,8 +388,14 @@ type GatewayBrokerStatus struct {
 	// English: §0925EVE-W3-E — failover_enable/dispatch are only served by /admin/status;
 	// the old /health parser left the admin observability panel permanently empty. A nil
 	// pointer now honestly means "not readable", never a zero-value masquerade.
-	FailoverEnable *bool `json:"failover_enable,omitempty"`
-	Dispatch       any   `json:"dispatch,omitempty"`
+	// §LEG-CONTRACT-GATE（批 4）：契约自证的三读数。ContractOK 用指针三态——
+	// nil=这版网关没发这个字段（老网关/别的部署），**不许**当成"契约没问题"；
+	// 与 FailoverEnable 同一姿势（§0925EVE-W3-E 的"读不到不装已知"）。
+	ContractFP     string `json:"contract_fp,omitempty"`
+	ContractOK     *bool  `json:"contract_ok,omitempty"`
+	GatewayVersion string `json:"gateway_version,omitempty"`
+	FailoverEnable *bool  `json:"failover_enable,omitempty"`
+	Dispatch       any    `json:"dispatch,omitempty"`
 	// AdminStatusOK /admin/status 两键读取是否成功（false=不可达/鉴权失败，见 AdminStatusErr）。
 	AdminStatusOK bool `json:"admin_status_ok"`
 	// AdminStatusErr 读取失败原因（成功时省略）；供前端区分"没有这功能"与"暂时读不到"。

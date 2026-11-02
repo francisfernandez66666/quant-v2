@@ -75,6 +75,7 @@ exception guard; broker chosen by config (xt/mock); reports pushed via outbox th
 ====================================================================================
 """
 import argparse
+import hashlib  # §LEG-CONTRACT-GATE：契约目录内容指纹（批 4）
 import hmac
 import json
 import logging
@@ -125,6 +126,14 @@ DEFAULT_CONFIG = {
     # 为什么宁可退出也不告警继续跑：远端形态下一处归属写错，代价是"朋友的成交记到运营账上"
     # 或"朋友的腿执行运营的买单"——两者都是真钱，且现场看起来一切正常（10-30 七账号共用一把的教训）。
     "deploy_profile": "",
+    # §LEG-CONTRACT-GATE（批 4）契约自证：期望的 contract/ 目录内容指纹。
+    #   空串＝不比对（缺省，＝今天行为）；非空且与本机实际不符 ⇒ **只拒单**（/order、/cancel 回 503
+    #   code=contract_mismatch），不改 /health.ok、不写 st.Degrade、不参与交易熔断——
+    #   "版本旧"和"通道坏"是两种事实，折成一个读数就会把 owner 的处置方向（升版 vs 查链路）指错。
+    #   取向来源：autoPlaceScaled 在 VWAP 缺失时跳过买入而不是按现价放行（fail-closed 优先于报警）。
+    "expected_contract_fp": "",
+    # 随包上报自身的版本串（装填/升版时写入）；只做观测透传，不在这台机器上判"新不新"。
+    "gateway_version": "",
     # 远端机器只承担"信号接收 + 交易数据交互"（owner 裁决），行情一律由决策机的 feed 单例供给。
     # 缺省 True＝今天（/quotes 照常应答）；friend 档必须显式 False（校验项 9）。
     "quotes_enabled": True,
@@ -429,6 +438,37 @@ def enforce_friend_profile(cfg, allowed_ips=None, bind_explicit=False):
     raise SystemExit(2)
 
 
+def contract_fingerprint(contract_dir):
+    """契约目录（qmt_gateway/contract/*.json）的内容指纹：文件名 + 内容，排序后 sha256 前 16 位。
+
+    为什么按"目录内容"而不是"文件数量/版本号"：远端腿的真风险是**字段口径**漂——
+    状态码表、申购段表、委托字段集改一个键，广州侧按新口径读旧腿的回包就是错账，
+    而"数量没变、版本没写对"这两种情况都会让它看起来一样。
+    目录缺失/读不到一律返回 "unreadable"：比对因此判不过（fail-closed），
+    绝不返回空串——空串等于"没指纹"，会被当成"没配期望值"而放行。
+    """
+    names = []
+    try:
+        names = sorted(n for n in os.listdir(contract_dir) if n.endswith(".json"))
+    except OSError:
+        return "unreadable"
+    if not names:
+        return "unreadable"
+    h = hashlib.sha256()
+    for n in names:
+        try:
+            with open(os.path.join(contract_dir, n), "rb") as f:
+                body = f.read()
+        except OSError:
+            return "unreadable"
+        h.update(n.encode("utf-8"))
+        h.update(b"\0")
+        h.update(body)
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
+
 
 def _code_head(code):
     """取证券代码数字头："600519.SH" → "600519"。"""
@@ -472,6 +512,20 @@ class Gateway:
         # 组装四大核心组件：本地账本 / 幂等守卫 / 交易通道 / 回报处理器
         self.store = Store(cfg["db"])
         self.ids = Idempotency(self.store)
+        # §LEG-CONTRACT-GATE（批 4）：本机契约指纹与"是否允许接单"的自证状态。
+        #   未配 expected_contract_fp ⇒ 不比对 ⇒ 与今天逐字节一致（现网那台就是这个形态）；
+        #   配了且不符 ⇒ 后面 _contract_guard 只挡 /order 与 /cancel，不动 /health.ok、
+        #   不动 st.Degrade、不参与熔断——版本旧要的是"升版"，通道坏要的是"查链路"。
+        self._contract_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "contract")
+        self._contract_fp = contract_fingerprint(self._contract_dir)
+        self._contract_expected = str(cfg.get("expected_contract_fp") or "").strip()
+        self._contract_checked = bool(self._contract_expected)
+        self._contract_ok = (not self._contract_checked) or (self._contract_fp == self._contract_expected)
+        if self._contract_checked and not self._contract_ok:
+            log.error("[gateway] §LEG-CONTRACT-GATE 契约指纹不符：本机=%s 期望=%s ⇒ "
+                      "本进程**只报不接单**（/order、/cancel 回 503 contract_mismatch），"
+                      "只读面照常；处置＝升版后重启，不是查网络",
+                      self._contract_fp, self._contract_expected)
         self.user_id = cfg.get("user_id", "")  # §P1-9 多账号归属：落库/上报统一带此 ID
         # §TOKEN-PERAACCT（2026-10-30）入向凭证注册表：token → user_id（一账号一把钥匙）。
         # owner_user_id = 这个资金账号账本的持有人（缺省回退旧 user_id 键，保持单账号形态不变）。
@@ -1315,6 +1369,23 @@ class Gateway:
         if queued.is_connected():
             self.switch_broker("queued", reason="auto-failback: bridge online")
 
+    def _contract_guard(self):
+        """契约不符时返回拒单的 (status, payload)；允许接单时返回 None。
+
+        拒的是资本动作，不是可读性：/health、/state、/orders、/settlement、/quotes 一律照常应答，
+        否则"版本旧"会连带把观测面一起关掉，排障时既看不到腿的账、也看不到腿的版本。
+        """
+        if self._contract_ok:
+            return None
+        return 503, {
+            "ok": False,
+            "code": "contract_mismatch",
+            "err": "契约指纹不符，本进程只报不接单（处置＝升版后重启，不是查网络）",
+            "contract_fp": self._contract_fp,
+            "expected_fp": self._contract_expected,
+            "gateway_version": str(self.cfg.get("gateway_version", "") or ""),
+        }
+
     def handle(self, method, path, body, request_handler):
         """路由分发。返回 (status, payload_dict)。
 
@@ -1353,6 +1424,13 @@ class Gateway:
             # §ORDER-STATE-PULL（2026-10-30）：当日委托状态的只读对账源。放在连接闸之前：
             # 断线/熔断时决策端最需要"最后已知状态"来纠正停滞行，不能因为通道断开就拒答。
             return self._do_orders(request_handler)
+        # §LEG-CONTRACT-GATE：拒单点只挡这两条资本动作，且**排在连接闸之前**——
+        # 版本旧时先回"通道没连"会把处置方向带跑（去查链路），而真正的答案是"升版后重启"。
+        # 拒的是 /order 与 /cancel：/health、/state、/orders、/settlement、/quotes 一律照常应答。
+        if path in ("/order", "/cancel"):
+            refusal = self._contract_guard()
+            if refusal is not None:
+                return refusal
         if not self.active_broker.is_connected():
             return 503, {"ok": False, "err": "broker not connected"}
         if path == "/order" and method == "POST":
@@ -1495,6 +1573,13 @@ class Gateway:
         payload["credential_accounts"] = len(self._tokens_by_uid)
         payload["owner_uid_set"] = bool(self.owner_user_id)
         payload["report_token_fallback_total"] = int(getattr(self.handler, "_report_token_fallback", 0))
+        # §LEG-CONTRACT-GATE（批 4）：契约自证的四个读数恒下发（未比对时 contract_ok=true、checked=false）。
+        # 关键纪律：**只加观测位，绝不动 ok/live_ready**——"版本旧"要的是升版，"通道坏"要的是查链路，
+        # 把两者折进一个布尔就把处置方向指错了；且拒单只发生在 /order 与 /cancel，只读面照常。
+        payload["contract_fp"] = self._contract_fp
+        payload["contract_ok"] = bool(self._contract_ok)
+        payload["contract_checked"] = bool(self._contract_checked)
+        payload["gateway_version"] = str(self.cfg.get("gateway_version", "") or "")
         snap_ts = float(((getattr(self, "_orders_snap", None) or {}).get("ts", 0)) or 0)
         payload["orders_snapshot_age"] = (max(0, int(time.time() - snap_ts)) if snap_ts > 0 else -1)
         # §0926E2E-W2D：回报 outbox 观察面。溢出语义已从"删最旧"改为"冻结+只吵"，

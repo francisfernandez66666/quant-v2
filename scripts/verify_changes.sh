@@ -19705,7 +19705,151 @@ fi
 
 [ "$B168_FAILED" = "0" ] || exit 1
 echo "ok - §168 §FRIEND-LEG-OPS 锁通过（真源 1 + 备份 API 1 + 重名与 force 2 + 键名同源 1 + 卸载顺序与删除面 2 + 停腿顺序 2 + 装填四项与负锁 2 + 用例在册 2 + ASCII 锚点 1 + 常驻反证 1，累计判定点 ${CNT168}）"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §169 §LEG-CONTRACT-GATE（2026-11-02 夜批·多账号 B-α 批4：契约不符则"只报不接单"）
+# 远端腿的 software 生命周期不归广州管（owner 令：朋友自己装 + 远程升版），
+# 于是"用旧契约的腿下新单"是必然会发生的一次——差别只在于发生时是**拒了**还是**静默记错账**。
+# 三条边界：
+#   ① 拒的是资本动作（/order、/cancel），不是可读性：/health、/state、/orders、/settlement、/quotes 照常，
+#      否则排障时既看不到腿的账、也看不到腿的版本；
+#   ② 不进健康线：`ok`/`live_ready` 不因契约不符而变——"版本旧"要升版、"通道坏"要查链路，
+#      折成一个布尔就把处置方向指错（同 §STARVE-STALE"观测面不污染数据面"的纪律）；
+#   ③ 决策端必须把它认成**确定性拒绝**：状态码是 5xx，走通用分支会被当瞬态一路重试，
+#      重试一百次也不会变新；Go 侧 ContractOK 用指针三态，老网关不发＝nil（不装"没问题"）。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 169 §LEG-CONTRACT-GATE（指纹真源与拒单位置 / 不污染健康线 / Go 分类与直败 / 双反证）..."
+B169_FAILED=0
+fail169() {
+	echo "--- FAIL: §169 $*"
+	FAIL=1
+	B169_FAILED=1
+}
+CNT169=0
+
+GW169=qmt_gateway/gateway.py
+QC169=internal/trading/qmt_client.go
+CT169=qmt_gateway/tests/test_contract_gate.py
+QT169=internal/trading/leg_contract_test.go
+
+# ① 指纹真源：按目录内容算，读不到给 "unreadable" 而不是空串（空串＝"没配期望值"，会被放行）
+CNT169=$((CNT169 + 1))
+grep -qF 'def contract_fingerprint(contract_dir):' "$GW169" || fail169 "缺 contract_fingerprint"
+CNT169=$((CNT169 + 1))
+SEG169F=$(awk 'f&&/^def /{exit} /^def contract_fingerprint\(/{f=1} f' "$GW169")
+grep_q 'return "unreadable"' SEG169F F || fail169 "契约目录读不到时没返回 unreadable（fail-open）"
+grep_q 'os.listdir(contract_dir)' SEG169F F || fail169 "指纹不是按目录实际内容算（硬编码文件清单必然与契约面漂开）"
+
+# ② 缺省不比对＝今天行为
+CNT169=$((CNT169 + 1))
+grep -qF '"expected_contract_fp": ""' "$GW169" || fail169 "DEFAULT_CONFIG 里 expected_contract_fp 缺省不是空串（现网那台会被误挡）"
+
+# ③ 拒单点：只挡两条资本动作，且排在连接闸**之前**（版本旧先说版本，不说"通道没连"）
+CNT169=$((CNT169 + 1))
+grep -qF 'if path in ("/order", "/cancel"):' "$GW169" || fail169 "拒单点没只圈 /order 与 /cancel"
+CNT169=$((CNT169 + 1))
+L_G169=$(grep -n 'refusal = self._contract_guard()' "$GW169" | head -1 | cut -d: -f1 || true)
+L_C169=$(grep -n 'if not self.active_broker.is_connected():' "$GW169" | head -1 | cut -d: -f1 || true)
+{ [ -n "${L_G169:-0}" ] && [ -n "${L_C169:-0}" ] && [ "$L_G169" -lt "$L_C169" ]; } || \
+	fail169 "契约拒单排在连接闸之后：版本旧会被先回成 'broker not connected'，处置方向被指到查链路"
+
+# ④ 只报不接单的边界：guard 里必须有 code 与两枚 fp 读数
+CNT169=$((CNT169 + 1))
+SEG169G=$(awk '/^    def _contract_guard\(/,/^    def handle\(/' "$GW169")
+for tok in '"code": "contract_mismatch"' '"contract_fp"' '"expected_fp"'; do
+	grep_q "$tok" SEG169G F || fail169 "拒单体缺 ${tok}（对侧没法分类，也没法告诉人改哪一份）"
+done
+
+# ⑤ 不污染健康线：/health 恒发三读数，且 ok/live_ready 的计算不看契约
+CNT169=$((CNT169 + 1))
+SEG169H=$(awk '/^    def _health_payload\(/,/^    def _do_dispatch_pending\(/' "$GW169")
+for tok in 'payload["contract_fp"]' 'payload["contract_ok"]' 'payload["contract_checked"]' 'payload["gateway_version"]'; do
+	grep_q "$tok" SEG169H F || fail169 "缺健康读数 ${tok}（腿的版本与契约状态必须一处能看全）"
+done
+CNT169=$((CNT169 + 1))
+if grep -qE 'payload\["ok"\][^\r\n]*contract|live_ready[^\r\n]*contract' "$GW169"; then
+	fail169 "契约判断进了 ok/live_ready（＝动了健康线与熔断输入，本批边界只许拒单）"
+fi
+
+# ⑥ Go 侧：分类函数 + 直败接线 + 指针三态字段
+CNT169=$((CNT169 + 1))
+grep -qF 'func GatewayContractMismatch(err error) bool' "$QC169" || fail169 "Go 缺契约不符的分类函数（会被当普通 5xx 一路重试）"
+CNT169=$((CNT169 + 1))
+grep -qF 'if isDeterministicGatewayRejection(err) || GatewayContractMismatch(err) {' "$QC169" || \
+	fail169 "order() 没把契约不符接进直败分支（重试不改变结果，只会把日志读成网络抖）"
+CNT169=$((CNT169 + 1))
+for tok in 'ContractOK[[:space:]]+\*bool' 'ContractFP[[:space:]]+string' 'GatewayVersion[[:space:]]+string'; do
+	grep -qE "$tok" "$QC169" || fail169 "Go 缺字段 ${tok}（老网关不发时必须读成 nil/空，不能零值冒充已知）"
+done
+
+# ⑦ 用例在册且条数等值
+CNT169=$((CNT169 + 1))
+N169P=$(grep -c 'def test_' "$CT169" || true)
+[ "${N169P:-0}" -eq 8 ] || fail169 "test_contract_gate.py 用例数是 ${N169P}（应为 8）"
+N169G=$(grep -c '^func Test' "$QT169" || true)
+[ "${N169G:-0}" -eq 4 ] || fail169 "leg_contract_test.go 用例数是 ${N169G}（应为 4）"
+CNT169=$((CNT169 + 1))
+for tc in TestDefaultIsToday TestMismatchRefusesOrders TestUnreadableIsFailClosed; do
+	grep -qF "class $tc(" "$CT169" || fail169 "py 用例组 ${tc} 不在册"
+done
+for tc in TestGatewayContractMismatchClassifies TestContractMismatchFailsFastWithoutRetry TestHealthContractFieldsAreThreeState TestContractFieldsJSONTagsStayStable; do
+	grep -qF "func ${tc}(" "$QT169" || fail169 "Go 用例 ${tc} 不在册"
+done
+
+# ⑧ 常驻反证 R1（py）：把 guard 改成"永远放行"⇒ py 用例必红
+CNT169=$((CNT169 + 1))
+W169=$(mktemp -d /tmp/gate169.XXXXXX)
+if [ -d "$W169" ]; then
+	mkdir -p "$W169/mirror"
+	rsync -a --exclude='*.db' --exclude='__pycache__' qmt_gateway/ "$W169/mirror/qmt_gateway/" 2>/dev/null || true
+	MU169A=$(python3 - "$W169/mirror/qmt_gateway/gateway.py" <<'PYR1' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "        if self._contract_ok:\n            return None"
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "        if True:\n            return None", 1))
+print(n)
+PYR1
+)
+	[ "${MU169A:-0}" -ge 1 ] || fail169 "反证 R1 没改动任何字节（guard 锚串漂了＝这条锁没有牙）"
+	( cd "$W169/mirror/qmt_gateway" && python3 -m pytest tests/test_contract_gate.py -q -p no:cacheprovider ) >/tmp/gate169_r1.log 2>&1 || true
+	if ! grep -qE '[1-9][0-9]* failed' /tmp/gate169_r1.log; then
+		fail169 "反证 R1 失效：guard 恒放行后 py 用例仍绿（旧腿会照下单）"
+	fi
+	echo "   [§169 R1] MUTATED=${MU169A} py 反证按预期转红"
+	rm -rf "$W169"
+fi
+
+# ⑨ 常驻反证 R2（Go）：摘掉 order() 的直败接线 ⇒ Go 用例必红
+CNT169=$((CNT169 + 1))
+W169G=$(mktemp -d /tmp/gate169go.XXXXXX)
+if [ -d "$W169G" ]; then
+	rsync -a go.mod go.sum internal "$W169G/mirror/" 2>/dev/null || true
+		--exclude='.uat-data' --exclude='__pycache__' --exclude='*.db' ./ "$W169G/mirror/" 2>/dev/null || true
+	MU169B=$(python3 - "$W169G/mirror/internal/trading/qmt_client.go" <<'PYR2' || true
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding="utf-8").read()
+old = "if isDeterministicGatewayRejection(err) || GatewayContractMismatch(err) {"
+n = s.count(old)
+io.open(p, "w", encoding="utf-8").write(s.replace(old, "if isDeterministicGatewayRejection(err) {", 1))
+print(n)
+PYR2
+)
+	[ "${MU169B:-0}" -ge 1 ] || fail169 "反证 R2 没改动任何字节（Go 直败锚串漂了）"
+	( cd "$W169G/mirror" && go test ./internal/trading/ -run 'TestContractMismatchFailsFastWithoutRetry' -count=1 ) >/tmp/gate169_r2.log 2>&1 || true
+	if grep -qE '^ok[[:space:]]' /tmp/gate169_r2.log; then
+		fail169 "反证 R2 失效：摘掉直败后 Go 用例仍绿（契约不符会被当瞬态重试）"
+	fi
+	echo "   [§169 R2] MUTATED=${MU169B} Go 反证按预期转红"
+	rm -rf "$W169G"
+fi
+
+[ "$B169_FAILED" = "0" ] || exit 1
+echo "ok - §169 §LEG-CONTRACT-GATE 锁通过（指纹真源与 fail-closed 2 + 缺省不比对 1 + 拒单位置与范围 2 + 拒单体读数 1 + 健康四读数与不污染负锁 2 + Go 分类接线与三态字段 3 + 用例等值在册 2 + py 反证 1 + Go 反证 1，累计判定点 ${CNT169}）"
 echo "==> 全部通过"
+
 
 
 
