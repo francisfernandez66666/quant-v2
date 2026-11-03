@@ -22,6 +22,8 @@ vi.mock('../api/index.js', async (importOriginal) => {
     hasStrictPerm: () => true,
     getRole: () => 'admin',
     isForbidden: (e) => !!(e && e.status === 403),
+    // 局部 mock 只覆盖 Dashboard 首屏真正会打的读面：漏一条就是 unhandled rejection
+    // 把整个文件带红，而红因不是产品缺陷（本仓同一族教训反复出现过）。
     fetchStatus: vi.fn(async () => ({ quote_source: 'sina', quote_age_sec: 2, in_trade_time: true, quote_feed: null })),
     fetchDashboard: vi.fn(async () => ({ signals: [], news_events: [], hot_sectors: [], final_signals: [] })),
     fetchSignals: vi.fn(async () => []),
@@ -35,6 +37,7 @@ vi.mock('../api/index.js', async (importOriginal) => {
 import Dashboard from '../pages/Dashboard.jsx'
 import * as apiMod from '../api/index.js'
 
+// 本账号自己的腿：四态之外的字段都取"通道正常"，这样文案差异只可能来自 friend_leg_state
 const base = { enabled: true, mode: 'auto', tripped: false, last_probe_ok: true, gateway_url: 'http://10.77.0.2:8789' }
 
 describe('Dashboard 远端执行腿三态文案（§MULTI-ACCT-B 批5）', () => {
