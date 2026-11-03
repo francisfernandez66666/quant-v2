@@ -192,11 +192,11 @@ test('§FRIEND-LEG ⑦ 契约不符只报不接单：读面三读数同现同缺
 // 安全边界（三条，一条都不能松）：
 //   1) **只在本机 UAT 栈跑**：这条要建号、授权、删号，是写面动作。E2E_BASE_URL 不是 localhost/127.0.0.1
 //      就 fixme 退出——现网永远不该被这条用例改账号表。
-//   2) 负面清单里**不许**放 `GET /api/qmt/broker`：它要不要并进并集还等 owner 裁（明细 §13.5 未验 1），
-//      把今天的 403 钉成断言＝把一个待裁决项焊死。
+//   2) 负面清单放的是 `POST /api/qmt/broker`（切通道）；`GET` 那条 11-03 由 owner 裁后进并集，
+//      已挪到正面清单——**没裁之前不要把当时的 403 钉成断言**（那会把一个待决项焊死，这次就是照那条写的）。
 //   3) 两条 POST 只做"进不进得来"的探测，**不带可执行载荷**：halt 送的是坏 JSON（必 400，永不落 halted），
 //      cancel 送的是一个不存在的委托号（必落到状态冲突分支，动不了真单）。
-test('§FRIEND-LEG ⑧ quant_trade 单票成员：并集十三条进得来、特权面一律 403（只在本机 UAT 栈）', async ({ request }) => {
+test('§FRIEND-LEG ⑧ quant_trade 单票成员：并集路由进得来、特权写面一律 403（只在本机 UAT 栈）', async ({ request }) => {
   if (!ADMIN.u || !ADMIN.p) {
     test.fail(true, '§FRIEND-LEG ⑧ 需要 E2E_USER/E2E_PASS（建号与授权要 admin），缺失时不许伪通过')
     return
@@ -235,6 +235,9 @@ test('§FRIEND-LEG ⑧ quant_trade 单票成员：并集十三条进得来、特
       ['GET', '/api/signals/decisions?day=2026-11-03'], ['GET', '/api/positions/real'],
       ['GET', '/api/qmt/state'], ['GET', '/api/qmt/trades'], ['GET', '/api/qmt/orders'],
       ['POST', '/api/qmt/halt'], ['POST', '/api/qmt/cancel/qtleg-bogus-order-id'],
+      // §FRIEND-LEG-READ（11-03 owner 裁）：读自己那台网关的通道态/契约三读数也进并集；
+      // 同路径的 POST（切通道）仍锁 trading_admin，落在下面的 denied 里。
+      ['GET', '/api/qmt/broker'],
     ]
     for (const [m, p] of admitted) {
       const r = m === 'GET'

@@ -1999,7 +1999,7 @@ func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]string{"ok": "1", "status": "撤单中", "order_id": orderID})
 }
 
-// handleQMTBroker 返回网关 active 通道与双路径状态（GET /api/qmt/broker，登录可见）。
+// handleQMTBroker 返回网关 active 通道与双路径状态（GET /api/qmt/broker，trading_admin 或 quant_trade）。
 // §QMT-DUAL：供 admin 面板读取当前执行路径（miniqmt=xt / qmt=queued）与兜底在线态。
 // 未接入实盘或网关不可达时返回 200 + {ok:false, err:...}（前端展示"未接入/不可达"）。
 // English: returns the gateway's active broker and dual-path liveness (GET /api/qmt/broker).

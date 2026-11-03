@@ -19903,20 +19903,31 @@ if grep -nE 'PermQuantTrade' "$AU170" | grep -qE 'migrat|ensure|grant|Append.*Pe
 	fail170 "权限位出现自动授予路径（本批令：后台可配、逐人手工开、升级即授权＝悄悄铺给所有人）"
 fi
 
-# ② 并集中间件 + 11 条路由接线等值
+# ② 并集中间件 + 12 条路由接线等值（11-03 owner 裁：GET /api/qmt/broker 也并进来）
 CNT170=$((CNT170 + 1))
 grep -qF 'func (s *Server) strictAnyPermsMiddleware(perms ...string)' "$SV170" || fail170 "缺 strictAnyPermsMiddleware"
 CNT170=$((CNT170 + 1))
 N170R=$(grep -c 'strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)\|strictAnyPermsMiddleware(auth.PermFundsAdmin, auth.PermQuantTrade)' "$SV170" || true)
-[ "${N170R:-0}" -eq 11 ] || fail170 "开放给 quant_trade 的路由数是 ${N170R}（应为 11：config/qmt GET+POST、t-live/rounds、funds/today、signals/decisions、positions/real、qmt/state|trades|orders、qmt/halt、qmt/cancel）"
+[ "${N170R:-0}" -eq 12 ] || fail170 "开放给 quant_trade 的路由数是 ${N170R}（应为 12：config/qmt GET+POST、t-live/rounds、funds/today、signals/decisions、positions/real、qmt/state|trades|orders、qmt/halt、qmt/cancel、GET qmt/broker）"
 
-# ③ 负锁：运营面仍被 trading_admin 独占
+# ③ 负锁：运营面仍被 trading_admin 独占（**按方法分条判**——同一路径 GET/POST 一边开放一边锁死
+#    才是这条的正确形状；整条路径进负锁会把"朋友看不见自己腿的契约读数"那半也一起焊死）
 CNT170=$((CNT170 + 1))
-for r in '/api/positions/advice' '/api/positions/execute' '/api/qmt/broker' '/api/qmt/order-confirm' '/api/qmt/pending-review' '/api/qmt/fill-amendments' '/api/risk/gates'; do
-	if grep -E "\"(GET|POST) ${r}" "$SV170" | grep -q "PermQuantTrade"; then
-		fail170 "运营面 ${r} 被开放给 quant_trade（越界：朋友不该有改账/切通道/跨账号能力）"
+for mr in 'GET /api/positions/advice' 'POST /api/positions/execute' 'POST /api/qmt/broker' \
+	'POST /api/qmt/order-confirm' 'GET /api/qmt/pending-review' 'GET /api/qmt/fill-amendments' 'GET /api/risk/gates'; do
+	m170=${mr%% *}; r170=${mr#* }
+	if grep -E "\"${m170} ${r170}\"" "$SV170" | grep -q "PermQuantTrade"; then
+		fail170 "运营面 ${m170} ${r170} 被开放给 quant_trade（越界：朋友不该有改账/切通道/跨账号能力）"
 	fi
 done
+# 同批的正锁：GET 那条必须真的在并集里（否则 §170 只锁住了"不扩 POST"，扩 GET 这件事没人守）
+CNT170=$((CNT170 + 1))
+if grep -E '"GET /api/qmt/broker"' "$SV170" | grep -q "strictPermMiddleware"; then
+	fail170 "GET /api/qmt/broker 还锁在单一位上（owner 11-03 已裁对 quant_trade 开放：朋友读不到自己腿的契约三读数）"
+fi
+if ! grep -E '"POST /api/qmt/broker"' "$SV170" | grep -q "strictPermMiddleware(auth.PermTradingAdmin"; then
+	fail170 "POST /api/qmt/broker（切通道）不再是 trading_admin 独占"
+fi
 if grep -E '"/api/opslog' "$SV170" | grep -q PermQuantTrade; then
 	fail170 "opslog 被开放给 quant_trade"
 fi
@@ -20013,6 +20024,13 @@ if grep -qF 'friend_leg_state === 0' web/src/pages/Dashboard.jsx; then
 	fail170 "state=0 也加了文案（运营单机的指示行必须与今天逐字一致）"
 fi
 [ -f web/src/__tests__/friend_leg_dashboard_labels_20261103.test.jsx ] || fail170 "前端三态用例文件不在册"
+# 11-03 owner 裁的两处前端接线（读面放开 + 契约三读数上屏）：漏一处就是"后端放行了但页面看不见"
+grep -qF "liveReadsAllowed() && row('执行路径'" web/src/pages/Quant.jsx \
+	|| fail170 "「执行路径」行还锁在运营档（GET /api/qmt/broker 已放开，朋友看不见自己腿的通道态）"
+grep -qF '契约未上报' web/src/pages/Quant.jsx \
+	|| fail170 "契约读数的第三态（该网关没发这个字段）没了——缺席会被读成'契约没问题'"
+grep -qF 'operatorHint' web/src/pages/Quant.jsx \
+	|| fail170 "通道切换按钮没有 quant_trade 的禁用提示（读放开不等于写放开）"
 CNT170=$((CNT170 + 1))
 SEG170N=$(awk '/^func \(e \*Engine\) pushFriendLegAlert\(/{f=1} f&&/^}/{exit} f' internal/engine/engine.go)
 grep_q 'Alias: uid' SEG170N F || fail170 "腿不可用没推给该账号本人（B-N10 只做到推运营＝朋友不知道自己在裸奔）"
@@ -20032,7 +20050,7 @@ for tc in '§FRIEND-LEG ① 读面契约：/api/qmt/state 带 friend_leg_state �
 	'§FRIEND-LEG ⑤ equals-legacy：值=0（运营单机形态）那行字与今天逐字一致，整页无「远端腿」' \
 	'§FRIEND-LEG ⑥ 反证腿：未定义的档位不许有任何一句话（证明分支不是 >= 形状）' \
 	'§FRIEND-LEG ⑦ 契约不符只报不接单：读面三读数同现同缺，不许拿零值冒充已知' \
-	'§FRIEND-LEG ⑧ quant_trade 单票成员：并集十三条进得来、特权面一律 403（只在本机 UAT 栈）'; do
+	'§FRIEND-LEG ⑧ quant_trade 单票成员：并集路由进得来、特权写面一律 403（只在本机 UAT 栈）'; do
 	grep -qF "$tc" "$E170" || fail170 "端到端契约用例缺一条：$tc"
 done
 # 等值数：加一条就要同批改这里——§165 那把尺子的同款（"存在即可"守不住覆盖退化）。
@@ -20066,7 +20084,7 @@ grep -qF 'E2E_QUOTE_SOURCE=${QUOTE_SOURCE}' scripts/uat_bootstrap.sh \
 	|| fail170 "自举的「跑 e2e」提示行没带 E2E_QUOTE_SOURCE（照抄就假红，见 §13.6）"
 
 [ "$B170_FAILED" = "0" ] || exit 1
-echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1 + 端到端契约用例在册 1 + overlay 只读探针与自举提示 1，累计判定点 ${CNT170}）"
+echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占（按方法分条）2 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1 + 端到端契约用例在册 1 + overlay 只读探针与自举提示 1，累计判定点 ${CNT170}）"
 # ─────────────────────────────────────────────────────────────────────────────
 # 171 §FRIEND-PKG —— 朋友侧一键解压安装包（2026-11-03 批 6）
 # 四条不许被后来人改坏的不变量：

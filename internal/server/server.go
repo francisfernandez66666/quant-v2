@@ -886,7 +886,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/qmt/halt", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTHalt))
 	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTCancel))
 	// §QMT-DUAL：网关 active 通道（miniqmt=xt / qmt=queued）读取与切换（仅 admin）
-	s.mux.HandleFunc("GET /api/qmt/broker", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTBroker))
+	// §FRIEND-LEG-READ（11-03 owner 裁）：GET 这条并进"任一"组——它按请求者取自己那台网关的
+	// 通道态（含批 4 的契约三读数），朋友只持 quant_trade 时也应当看得见"我这台腿契约符不符"；
+	// POST（切通道）继续 trading_admin 独占，注册面上一 GET 一 POST 挨着，负锁按方法分条判。
+	s.mux.HandleFunc("GET /api/qmt/broker", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTBroker))
 	s.mux.HandleFunc("POST /api/qmt/broker", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleQMTBrokerSwitch))
 	// §0925EVE-W3-G（FIX_PLAN ⑫ C3）第三态「待核对」人工收敛出口（仅 admin：人工改判
 	// 委托终态是特权动作，每次尝试落 opslog.Audit）：清单透传 + 确认转发网关。

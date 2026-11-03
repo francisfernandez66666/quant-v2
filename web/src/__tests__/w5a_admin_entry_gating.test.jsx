@@ -146,8 +146,11 @@ describe('§0926E2E-17d 成员可见 admin 入口灰化', () => {
       ['撤单', /disabled={forbidden} title={forbidden \? ADMIN_ONLY_HINT : undefined} onClick=\{\(\) => cancelOrder/],
       ['柜台无此单', /disabled={confirmBusy \|\| forbidden} title={forbidden \? ADMIN_ONLY_HINT : undefined} onClick=\{\(\) => confirmPendingOrder\(row, 'released'\)/],
       ['柜台有此单', /disabled={confirmBusy \|\| forbidden} title={forbidden \? ADMIN_ONLY_HINT : undefined} onClick=\{\(\) => confirmPendingOrder\(row, 'settled'\)/],
-      ['切到 miniQMT', /disabled={active === 'xt' \|\| forbidden}/],
-      ['切到 QMT桥', /disabled={active === 'queued' \|\| forbidden}/],
+      // §FRIEND-LEG-READ（11-03）：GET /api/qmt/broker 对 quant_trade 放开 ⇒ 这一行会渲染出来，
+      // 但**写**（切通道）仍锁 trading_admin，所以禁能条件多了一档 operatorOnly。
+      // 正则放宽等于承认"读放开、写不放开"这个新形状；收紧成必须两档都在，少一档就是写口漏禁。
+      ['切到 miniQMT', /disabled={active === 'xt' \|\| forbidden \|\| operatorOnly}/],
+      ['切到 QMT桥', /disabled={active === 'queued' \|\| forbidden \|\| operatorOnly}/],
       ['保存战法开关', /disabled={!strategyDirty \|\| saving \|\| forbidden}/],
       ['实盘总开关灰化', /checked={form.enabled} disabled={forbidden}/],
       ['自动卖出灰化', /checked={form.auto_sell} disabled={forbidden}/],

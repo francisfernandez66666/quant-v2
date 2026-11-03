@@ -30,7 +30,8 @@ type openedRoute struct {
 	body   string
 }
 
-// openedRoutes 批5 放行的 11 条：全部按**请求者**取账/动作（handler 内部 userIDFor(r) 过滤），
+// openedRoutes 放行的 12 条（批5 的 11 条 + 11-03 owner 裁的 GET /api/qmt/broker）：
+// 全部按**请求者**取账/动作（handler 内部 userIDFor(r) 过滤），
 // 所以"能进"不等于"能看别人的"。顺序与 server.go 注册面一致，方便逐条对照行号。
 var openedRoutes = []openedRoute{
 	{http.MethodGet, "/api/config/qmt", ""},
@@ -44,6 +45,8 @@ var openedRoutes = []openedRoute{
 	{http.MethodGet, "/api/qmt/orders", ""},
 	{http.MethodPost, "/api/qmt/halt", `{"halted":false}`},
 	{http.MethodPost, "/api/qmt/cancel/9001", ""},
+	// 11-03 扩的一枚：读自己那台网关的通道态（批 4 契约三读数就在里面）；写侧同路径仍锁着。
+	{http.MethodGet, "/api/qmt/broker", ""},
 }
 
 // lockedRoutes 本批**刻意不放**的路由：语义都是"改判别人的账 / 动全局通道 / 跨账号"，
@@ -52,7 +55,7 @@ var openedRoutes = []openedRoute{
 var lockedRoutes = []openedRoute{
 	{http.MethodGet, "/api/positions/advice", ""},
 	{http.MethodPost, "/api/positions/execute", `{}`},
-	{http.MethodPost, "/api/qmt/broker", `{}`},
+	{http.MethodPost, "/api/qmt/broker", `{}`}, // 只有 POST 锁着；GET 已随 11-03 裁决对 quant_trade 开放
 	{http.MethodGet, "/api/qmt/pending-review", ""},
 	{http.MethodPost, "/api/qmt/order-confirm", `{}`},
 	{http.MethodGet, "/api/opslog", ""},

@@ -358,7 +358,7 @@ export default function Quant() {
   //   · adminReadsAllowed()＝trading_admin＝运营级：待核对清单/人工改判、交割单对账、
   //     通道切换、勘误台账、风险闸读数（/api/risk/gates 仍锁在 trading_admin）；
   //   · liveReadsAllowed()＝trading_admin 或 quant_trade：链路状态、当日委托、成交流水、
-  //     自己的 QMT 配置（本批后端刚把这 11 条换成"任一位放行"）。
+  //     通道态读数（GET /api/qmt/broker）、自己的 QMT 配置（后端共 12 条换成"任一位放行"）。
   // 为什么必须分开而不是把 adminReadsAllowed 直接放宽：放宽一处会让 quant_trade 成员一挂载
   // 就连打 pending-review / settle/history / broker 三条注定 403 的请求，noteForbidden 当场
   // 把整页判成"无权限"并停轮询——那正是 §0929GATE-403 花一整批消灭的形态。
@@ -628,9 +628,10 @@ export default function Quant() {
 
   // §QMT-DUAL 拉取网关 active 通道与双路径在线态（broker/xt_connected/queued_connected）
   async function loadBroker() {
-    // §MULTI-ACCT-B 批5：GET /api/qmt/broker 是**通道态**（active/xt/queued），属运营面，
-    // 本批没对 quant_trade 开放——早退，不发注定 403 的请求。
-    if (!adminReadsAllowed()) return
+    // §FRIEND-LEG-READ（11-03 owner 裁）：GET /api/qmt/broker 对 quant_trade 开放——
+    // 它是**按请求者**取自己那台网关的通道态，其中批 4 的契约三读数（contract_fp/contract_ok/
+    // gateway_version）是朋友判断"我这台腿只报不接单"的唯一入口；**切通道（POST）仍要 trading_admin**。
+    if (!liveReadsAllowed()) return
     try { setBroker(await api.fetchQMTBroker()) } catch (e) { noteForbidden(e) } // §M13 同上
   }
 
@@ -1401,9 +1402,18 @@ export default function Quant() {
       <span style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
         <Tag theme={active === 'xt' ? 'primary' : 'default'}>miniQMT兼容{broker && broker.xt_connected ? ' ●' : ' ○'}</Tag>
         <Tag theme={active === 'queued' ? 'primary' : 'default'}>QMT桥兜底{broker && broker.queued_connected ? ' ●' : ' ○'}</Tag>
-        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'xt' || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => switchBrokerTo('xt')}>切到 miniQMT</Button>
-        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'queued' || forbidden} title={forbidden ? ADMIN_ONLY_HINT : undefined} onClick={() => switchBrokerTo('queued')}>切到 QMT桥</Button>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'xt' || forbidden || operatorOnly} title={forbidden ? ADMIN_ONLY_HINT : (operatorOnly ? operatorHint : undefined)} onClick={() => switchBrokerTo('xt')}>切到 miniQMT</Button>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'queued' || forbidden || operatorOnly} title={forbidden ? ADMIN_ONLY_HINT : (operatorOnly ? operatorHint : undefined)} onClick={() => switchBrokerTo('queued')}>切到 QMT桥</Button>
         <span style={{ color: 'var(--app-text-2)' }}>当前：{active === 'queued' ? 'QMT桥兜底' : 'miniQMT兼容'}</span>
+        {/* §LEG-CONTRACT-GATE 读面上屏（11-03）：契约三读数是指纹门禁的"报"那一半——
+            朋友只持 quant_trade 时，"我这台腿是不是只报不接单"只能从这里看见。
+            三态必须各给一句：键缺席=这版网关没发这个字段（**不许**当成"契约没问题"，
+            §0925EVE-W3-E 的"读不到不装已知"），false=只拒 /order /cancel 不碰健康线与熔断。 */}
+        {broker && broker.ok === true && (broker.contract_ok === true
+          ? <Tag theme="success">契约相符{broker.gateway_version ? `（${broker.gateway_version}）` : ''}</Tag>
+          : broker.contract_ok === false
+            ? <Tag theme="danger">契约不符：只报不接单，需升版后重启</Tag>
+            : <Tag theme="default">契约未上报（该网关未发此字段）</Tag>)}
       </span>
     )
     return (
@@ -1454,10 +1464,11 @@ export default function Quant() {
         </>)}
         {row('下行探测', probe)}
         {row('上行回报', report)}
-        {/* §MULTI-ACCT-B 批5：整行（双通道在线态 + 切换按钮）只在 trading_admin 下渲染——
-            GET/POST /api/qmt/broker 都不在本批放行的 11 条里，只持 quant_trade 时 broker 恒为
-            空读数；画一对"○○ + 当前 miniQMT兼容"是在**编造**通道状态，宁可不显示。 */}
-        {!operatorOnly && row('执行路径', path)}
+        {/* §FRIEND-LEG-READ（11-03 owner 裁）：这一行改成**按 liveReadsAllowed 渲染**——
+            GET /api/qmt/broker 已对 quant_trade 开放（它按请求者取自己那台网关），朋友需要看得见
+            自己的通道态与契约读数。批5 那版整行隐藏是当时权限面下的正确取舍（读不到还画"○○"
+            就是编造），不是缺陷。切换按钮仍锁 trading_admin：disabled + operatorHint。 */}
+        {liveReadsAllowed() && row('执行路径', path)}
       </Card>
     )
   }

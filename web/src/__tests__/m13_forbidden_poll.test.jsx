@@ -451,11 +451,16 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     expect(quant).toMatch(/function liveReadsAllowed\(\) \{\s*return canLiveTrading\(\)/)
     expect(quant).toMatch(/if \(liveReadsAllowed\(\)\) \{\s*startAdminReads\(\)/)
     for (const fn of ['loadPendingReview', 'loadSettleHistory', 'loadBroker', 'loadCloseRecon']) {
-      expect(quant, `§MULTI-ACCT-B 批5：${fn} 必须按 adminReadsAllowed 早退（运营专属腿不吃 quant_trade）`)
+      expect(quant, `§MULTI-ACCT-B 批5：${fn} 必须存在自己的入口判据（不许合并成一条）`)
         .toContain(`async function ${fn}() {`)
     }
+    // §FRIEND-LEG-READ（11-03）：loadBroker 从运营档移到自账档——**早退守卫本身不许消失**，
+    // 只是换成 liveReadsAllowed；剩下的四处（待核对/对账历史/收盘对账/风险闸链尾）仍按 adminReadsAllowed。
+    expect(quant, 'loadBroker 必须走 liveReadsAllowed 早退（GET /api/qmt/broker 已对 quant_trade 开放）')
+      .toMatch(/async function loadBroker\(\) \{[\s\S]{0,400}?if \(!liveReadsAllowed\(\)\) return/)
     const guarded = (quant.match(/if \(!adminReadsAllowed\(\)\) return/g) || []).length
-    expect(guarded, '运营专属腿的早退守卫至少四处（待核对/对账历史/通道态/风险闸链尾）+收盘对账').toBeGreaterThanOrEqual(5)
+    expect(guarded, '运营专属腿的早退守卫至少四处（待核对/对账历史/收盘对账/风险闸链尾）').toBeGreaterThanOrEqual(4)
+    expect(guarded, 'loadBroker 移到自账档后不许悄悄把守卫删光（少一处就是页面照打 403）').toBeLessThanOrEqual(4)
     expect(quant.match(/api\.isAdmin\(\)/g) || [], 'Quant.jsx 不得自行读角色（判据单入口=canStrict）').toHaveLength(0)
     // ② 出口：重试走服务器重确认，不是本地改角色
     expect(quant).toMatch(/await api\.refreshMe\(\)/)

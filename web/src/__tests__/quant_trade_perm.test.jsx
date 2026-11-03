@@ -80,8 +80,10 @@ function setPerms(perms) {
 }
 
 // 「本批放行的自账腿」与「仍在 trading_admin 名下的运营腿」——两份清单必须互斥且穷尽本页取数。
-const SELF_LIVE_READS = ['fetchQMTState', 'fetchQMTOrders', 'fetchQMTTrades', 'fetchQMTConfig']
-const OPERATOR_ONLY_READS = ['qmtPendingReview', 'fetchQMTBroker', 'fetchQMTSettleHistory', 'fetchRiskGates', 'fetchCloseSnapshot', 'fetchFillAmendments']
+// §FRIEND-LEG-READ（11-03 owner 裁）：fetchQMTBroker 从"运营专属"移到"自账可读"——
+// GET 这条按请求者取自己那台网关的通道态（含批 4 的契约三读数），POST 切通道仍锁 trading_admin。
+const SELF_LIVE_READS = ['fetchQMTState', 'fetchQMTOrders', 'fetchQMTTrades', 'fetchQMTConfig', 'fetchQMTBroker']
+const OPERATOR_ONLY_READS = ['qmtPendingReview', 'fetchQMTSettleHistory', 'fetchRiskGates', 'fetchCloseSnapshot', 'fetchFillAmendments']
 
 describe('§MULTI-ACCT-B 批5 quant_trade 权限接线', () => {
   beforeEach(() => {
@@ -126,11 +128,27 @@ describe('§MULTI-ACCT-B 批5 quant_trade 权限接线', () => {
     for (const n of OPERATOR_ONLY_READS) {
       expect(api[n].mock.calls.length, `运营专属腿 ${n} 不得被 quant_trade 拨出（§0929GATE-403）`).toBe(0)
     }
-    // 运营专属的三块面板（待核对人工改判 / 日终结算 / 通道切换行）整块不渲染，
+    // 运营专属的两块面板（待核对人工改判 / 日终结算）整块不渲染，
     // 而不是渲染成"加载中"或"○○"那种**冒充有读数**的空壳。
     expect(screen.queryByText(/待核对委托（第三态人工收敛）/)).not.toBeInTheDocument()
     expect(screen.queryByText('日终结算对账')).not.toBeInTheDocument()
-    expect(screen.queryByText('执行路径')).not.toBeInTheDocument()
+    // 11-03 起「执行路径」这一行**要**渲染（读的是自己那台腿），但切换按钮必须灰：
+    // 读与写分档——把行藏起来等于让朋友看不见"契约不符：只报不接单"这件事。
+    expect(screen.getByText('执行路径'), 'quant_trade 应看得见自己的通道态').toBeInTheDocument()
+    // 取按钮走"文本→closest('button')"：TDesign 的 Button 把文字包在内层 span 里，
+    // getByRole 的可及名匹配在这个封装上不成立（不是页面坏了，是查询方式选错）。
+    // TDesign 这版把 Button 渲染成 <div class="t-button … t-is-disabled">（不是原生 button），
+    // 所以 getByRole('button') 与 el.disabled 两把尺子都量不到——按类名判"禁用"，
+    // 并把原因写在断言消息里，免得以后有人把它当成"页面坏了"改掉。
+    const offBtn = (label) => screen.getByText(label).closest('.t-button')
+    for (const label of ['切到 miniQMT', '切到 QMT桥']) {
+      const btn = offBtn(label)
+      expect(btn, `「${label}」按钮必须在场（读面上屏）`).not.toBeNull()
+      expect(btn.className.includes('t-is-disabled'),
+        `只持 quant_trade 时「${label}」必须禁用（POST /api/qmt/broker 仍锁 trading_admin）`).toBe(true)
+    }
+    // 三态里最容易被拿零值冒充的一态：网关没发这个字段 ⇒ 报"契约未上报"，而不是"契约相符"。
+    expect(screen.getByText(/契约未上报/), 'contract_ok 缺席时必须如实报"未上报"').toBeInTheDocument()
     expect(screen.getByText(/收盘对账：当前权限（量化交易）不含该读数/), '收盘对账那一态必须如实说"不含"').toBeInTheDocument()
   })
 
