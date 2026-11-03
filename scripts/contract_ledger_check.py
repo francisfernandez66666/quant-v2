@@ -315,10 +315,18 @@ def evidence_ok(evidence):
     return True, ""
 
 
+# 两段式 evidence（`file:symbol`，没有行号）的**存量上限**——棘轮，不是许可：
+# 存量 0 行是历史欠账（只能靠锚串全文搜索，行号漂了不红），新增一行都必须带行号。
+# 为什么要上锁而不是"以后再说"：`evidence_ok` 对两段式只查"锚串在文件里存在"，
+# 于是同一份 evidence 可以在文件里漂到任何位置都仍然通过——它给的是"存在性"，不是"落点"。
+TWO_PART_CEILING = 0
+
+
 def check():
     routes = derive_routes()
     calls, unresolved = derive_calls()
     ledger = read_ledger()
+
     rset = {(m, norm(p)) for m, p in routes}
     rraw = set(routes)
     cset = {(m, p) for m, p, _, _ in calls}
@@ -327,6 +335,10 @@ def check():
     def lock(cond, msg):
         if not cond:
             fails.append(msg)
+
+    n_two_part = sum(1 for r in ledger if len(str(r[3]).split(":")) == 2)
+    lock(n_two_part <= TWO_PART_CEILING,
+         "两段式 evidence（无行号）从 %d 涨到 %d——新增必须写 file:行号:锚串" % (TWO_PART_CEILING, n_two_part))
 
     # Q2 前半：派生本身可信吗
     lock(len(routes) >= ROUTE_FLOOR,
