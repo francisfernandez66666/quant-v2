@@ -20155,13 +20155,18 @@ grep -qF 'reason=missing_files' "$PKG_SH" || fail171 "缺文件没有独立读�
 
 # ⑤ install.ps1：十步锚点齐、缺省是预览不是动手、ABORT 必带 step/reason、不写明文钥匙
 CNT171=$((CNT171 + 1))
-for k in 'STEP1_MANIFEST' 'STEP2_ENV' 'STEP4_LAYOUT' 'STEP5_BRIDGE' 'STEP6_OVERLAY' 'STEP7_ENROLL' 'STEP8_TASKS' 'STEP9_VERIFY' 'STEP10_DONE' 'LEG_INSTALL=ABORT' 'LEG_INSTALL=PASS'; do
+for k in 'STEP1_MANIFEST' 'STEP2_ENV' 'STEP4_LAYOUT' 'STEP5_BRIDGE' 'STEP6_OVERLAY' 'STEP7_ENROLL' 'STEP8_TASKS' 'STEP9_VERIFY' 'STEP10_DONE' 'LEG_INSTALL=ABORT' 'LEG_INSTALL=PASS' 'identity_files_in_payload=0' 'payload_carries_identity_files'; do
 	grep -qF "$k" "$INS_PS1" || fail171 "install.ps1 缺锚点 ${k}（上层与门禁都按这些行判，缺一行＝失明）"
 done
 grep -qF '[switch]$Apply' "$INS_PS1" || fail171 "install.ps1 没有 -Apply 开关（缺省必须只打印计划）"
 INS_CODE=$(grep -vE '^[[:space:]]*#' "$INS_PS1" || true)
 if grep_q 'token[[:space:]]*=[[:space:]]*"' INS_CODE B; then
 	fail171 "install.ps1 里出现钥匙字面量赋值（钥匙只能从 stdin/交互进来，B-N2）"
+fi
+# 第 4 步的身份文件判据必须是"拒装"，不许退回"看见就跳过并计数"那种**恒 0 的假锁**
+# （11-03 用 pwsh 真跑 -Apply 看穿：包内根本不该有这些文件，跳过分支永远不触发，计数永远是 0 还在日志里自称保护）。
+if grep -vE '^[[:space:]]*#' "$INS_PS1" | grep -qF 'preserved_config'; then
+	fail171 "install.ps1 又写回 preserved_config 那种"跳过并计数"的形状（该改成第 4 步拒装）"
 fi
 if grep_q 'SecureString' INS_CODE F; then :; else fail171 "install.ps1 没有 SecureString 那条腿（口令会以明文进历史）"; fi
 # BOM 用 cmp 判而不是 od：od -An -tx1 的字节间是**多个空格**，按单空格拼的锚串永远不匹配

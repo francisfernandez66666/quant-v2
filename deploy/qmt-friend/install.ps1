@@ -22,7 +22,7 @@
 # 判读锚点（纯 ASCII；中文经管道会被码页换成 ? ⇒ 上层与门禁一律按这些行判）：
 #   STEP1_MANIFEST files=NN mismatches=0 contract_fp=XXXX
 #   STEP2_ENV      ps=5.x python=C:\...\python.exe pyver=3.12.x qmt_root=...
-#   STEP4_LAYOUT   copied=NN preserved_config=0|1 backup=...
+#   STEP4_LAYOUT   copied=NN mirrored=NN identity_files_in_payload=0 backup=...
 #   STEP5_BRIDGE   placed=... manual=qmt_strategy_attach
 #   STEP6_OVERLAY  wg=absent|present|installed tunnel=missing|present|registered
 #   STEP7_ENROLL   ENROLL_RESULT=OK
@@ -134,7 +134,6 @@ Log ("STEP3_QMT root_ok=1")
 $gwDst = Join-Path $Root "qmt_gateway"
 $srcGw = Join-Path $payload "qmt_gateway"
 if (-not (Test-Path $srcGw)) { Abort 4 "payload_gateway_absent" }
-$preserved = 0
 $backup = ""
 if (-not $Apply) {
     Log ("STEP4_LAYOUT apply=0 would_copy_to=" + $gwDst)
@@ -146,6 +145,16 @@ if (-not $Apply) {
         $stamp = Get-Date -Format "yyyyMMddHHmmss"
         $backup = $gwDst + ".pre-pkginstall-" + $stamp
     }
+    # 身份与证据文件：**构建侧 deny 清单之外还要在装的一侧断言一次**。
+    # 原来这里是"看见就跳过并计数"——而包内永远不该有这些文件（构建侧拒收），所以那个计数恒 0，
+    # 是一枚**永远不会咬的假锁**（11-03 用 pwsh 真跑 -Apply 才看穿：preserved_config=0 却自以为在保护）。
+    # 现在的形状：包内一旦出现它们＝这份包是绕过 deny 手工拼的 ⇒ 第 4 步直接拒装，不写任何字节。
+    $forbidden = @(Get-ChildItem $srcGw -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq 'config.xt.json' -or $_.Name -eq 'data.db' -or $_.Name -eq 'auth.json' `
+                       -or $_.Name -like '*.pre-*' -or $_.Name -like '*.key' -or $_.Name -like '*.pem' })
+    if ($forbidden.Count -gt 0) {
+        Abort 4 ("payload_carries_identity_files=" + (($forbidden | ForEach-Object { $_.Name }) -join ','))
+    }
     $copied = 0
     $mirrored = 0
     foreach ($f in @(Get-ChildItem $srcGw -File -Recurse)) {
@@ -153,8 +162,6 @@ if (-not $Apply) {
         $dst = Join-Path $gwDst $rel
         $dir = Split-Path -Parent $dst
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        # 真配置与账本一律跳过——它们不是"待覆盖的旧文件"，而是这台腿的身份与证据链。
-        if ($f.Name -eq "config.xt.json" -or $f.Name -eq "data.db") { $preserved = $preserved + 1; continue }
         if (Test-Path $dst) {
             # 只镜像"这次真的会被覆盖的那一个文件"，不整目录改名：整目录改名会把 data.db 与
             # 在跑的网关一起搬走，那才是把自己搞成半态。回滚点按相对路径落在 backup 目录里。
@@ -167,7 +174,7 @@ if (-not $Apply) {
         Copy-Item $f.FullName $dst -Force
         $copied = $copied + 1
     }
-    Log ("STEP4_LAYOUT copied=" + $copied + " mirrored=" + $mirrored + " preserved_config=" + $preserved + " backup=" + $backup)
+    Log ("STEP4_LAYOUT copied=" + $copied + " mirrored=" + $mirrored + " identity_files_in_payload=0 backup=" + $backup)
 }
 
 # —— STEP 5：桥落位（QMT 模型沙箱里那份）——
