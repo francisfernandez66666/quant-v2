@@ -20067,6 +20067,167 @@ grep -qF 'E2E_QUOTE_SOURCE=${QUOTE_SOURCE}' scripts/uat_bootstrap.sh \
 
 [ "$B170_FAILED" = "0" ] || exit 1
 echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1 + 端到端契约用例在册 1 + overlay 只读探针与自举提示 1，累计判定点 ${CNT170}）"
+# ─────────────────────────────────────────────────────────────────────────────
+# 171 §FRIEND-PKG —— 朋友侧一键解压安装包（2026-11-03 批 6）
+# 四条不许被后来人改坏的不变量：
+#   ① 清单必须描述**真正压进包的那棵树**：SHA256 逐文件对得上、包里不许混本机字节码
+#      （首跑就抓到 import gateway 把 __pycache__ 列进清单又被压进包 ⇒ 朋友侧校验集体假红）；
+#   ② 契约指纹只许一把尺子：清单里那个值必须来自网关自己的 contract_fingerprint()，
+#      构建侧再算一份就必然漂，漂开的现场形态是"装完自检说契约不符"而代码是对的；
+#   ③ 白名单里出现禁止路径（真配置 / 账本 / 凭据）⇒ **拒绝构建，不是跳过**（跳过＝静默发出带凭证的包）；
+#      缺文件同样拒绝，不发"少一个文件"的包；
+#   ④ 三个 .bat 入口必须纯 ASCII（cmd 按 OEM 码页解 .bat，中文会变 ?）且可执行行走 -File 不走 -Command。
+# 分发状态：券商公告 11-05 关闭策略的文件读写与网络 ⇒ 本包目前"已构建、未分发"（SETUP.txt 首段写明），
+# 通道形态等 owner 定；这里锁的是"包本身不自欺"，不是"这条链已经能跑"。
+# ─────────────────────────────────────────────────────────────────────────────
+echo "==> 171 §FRIEND-PKG（清单=包体同源 / 缺文件与禁止路径一律拒绝 / 入口纯 ASCII 走 -File / 反证）..."
+B171_FAILED=0
+fail171() {
+	echo "--- FAIL: §171 $*"
+	FAIL=1
+	B171_FAILED=1
+}
+CNT171=0
+
+PKG_SH=scripts/build_friend_package.sh
+INS_PS1=deploy/qmt-friend/install.ps1
+PKGTEST=qmt_gateway/tests/test_friend_package.py
+
+# ① 入口三件 + 说明 + 构建脚本 + install.ps1 + 用例文件全部在册
+CNT171=$((CNT171 + 1))
+[ -s "$PKG_SH" ] || fail171 "构建脚本不在册（${PKG_SH}）"
+[ -x "$PKG_SH" ] || fail171 "构建脚本没有执行位"
+bash -n "$PKG_SH" || fail171 "构建脚本 bash -n 不过"
+[ -s "$INS_PS1" ] || fail171 "install.ps1 不在册"
+for b in install_entry.bat uninstall_entry.bat export_ledger.bat SETUP.txt; do
+	[ -s "deploy/qmt-friend/$b" ] || fail171 "包内入口缺失：$b"
+done
+
+# ② 三个 .bat：可执行行判 -File / 无 -Command / 无 CR 与 CRLF / 整文件纯 ASCII
+CNT171=$((CNT171 + 1))
+for b in install_entry.bat uninstall_entry.bat export_ledger.bat; do
+	f="deploy/qmt-friend/$b"
+	body=$(grep -vE '^[[:space:]]*(REM|@echo off)' "$f" || true)
+	grep_q 'ExecutionPolicy Bypass -File' body F || fail171 "${b} 可执行行没走 -File"
+	if grep_q '-Command' body F; then
+		fail171 "${b} 可执行行里出现 -Command（参数面会留在进程列表与转录里）"
+	fi
+	# 字符类里必须放行 \r：CRLF 文件按裸 [^ -~] 判会把**每一行**算成非 ASCII（11-03 首跑就是这样假红）。
+	na=$(LC_ALL=C grep -c $'[^ -~\r]' "$f" || true)
+	[ "${na:-0}" -eq 0 ] || fail171 "${b} 含非 ASCII 字节 ${na} 行（.bat 会被 OEM 码页换成 ?）"
+	crlf=$(grep -c $'\r' "$f" || true)
+	[ "${crlf:-0}" -ge 3 ] || fail171 "${b} 不是 CRLF（cmd 对裸 LF 的标签/多行行为不可靠）"
+done
+
+# ③ 一把尺子 + 不许往包里落字节码
+CNT171=$((CNT171 + 1))
+grep -qF 'import gateway' "$PKG_SH" || fail171 "构建侧没 import 网关（契约指纹就没有真源了）"
+grep -qF 'contract_fingerprint' "$PKG_SH" || fail171 "构建侧没调网关自己的 contract_fingerprint（自己算一份＝两把尺子）"
+NDB=$(grep -c 'sys.dont_write_bytecode = True' "$PKG_SH" || true)
+[ "${NDB:-0}" -ge 2 ] || fail171 "dont_write_bytecode 只有 ${NDB} 处（两段清单脚本都要：少一段就又会把 .pyc 列进清单）"
+grep -qF "__pycache__" "$PKG_SH" || fail171 "构建侧没有清字节码那一腿"
+
+# ④ deny 清单锚点齐全（少一枚就是放一类凭据进包）
+CNT171=$((CNT171 + 1))
+for tok in 'config.xt.json' 'data.db' 'auth.json' '*.pre-*' '*.token' '*.pem' '*.key'; do
+	grep -qF "$tok" "$PKG_SH" || fail171 "deny 清单少了锚点：${tok}"
+done
+grep -qF 'reason=deny_list_hit' "$PKG_SH" || fail171 "命中 deny 后没有独立读数（会被当成普通构建失败，没人知道包里有凭证）"
+grep -qF 'reason=missing_files' "$PKG_SH" || fail171 "缺文件没有独立读数"
+
+# ⑤ install.ps1：十步锚点齐、缺省是预览不是动手、ABORT 必带 step/reason、不写明文钥匙
+CNT171=$((CNT171 + 1))
+for k in 'STEP1_MANIFEST' 'STEP2_ENV' 'STEP4_LAYOUT' 'STEP5_BRIDGE' 'STEP6_OVERLAY' 'STEP7_ENROLL' 'STEP8_TASKS' 'STEP9_VERIFY' 'STEP10_DONE' 'LEG_INSTALL=ABORT' 'LEG_INSTALL=PASS'; do
+	grep -qF "$k" "$INS_PS1" || fail171 "install.ps1 缺锚点 ${k}（上层与门禁都按这些行判，缺一行＝失明）"
+done
+grep -qF '[switch]$Apply' "$INS_PS1" || fail171 "install.ps1 没有 -Apply 开关（缺省必须只打印计划）"
+INS_CODE=$(grep -vE '^[[:space:]]*#' "$INS_PS1" || true)
+if grep_q 'token[[:space:]]*=[[:space:]]*"' INS_CODE B; then
+	fail171 "install.ps1 里出现钥匙字面量赋值（钥匙只能从 stdin/交互进来，B-N2）"
+fi
+if grep_q 'SecureString' INS_CODE F; then :; else fail171 "install.ps1 没有 SecureString 那条腿（口令会以明文进历史）"; fi
+# BOM 用 cmp 判而不是 od：od -An -tx1 的字节间是**多个空格**，按单空格拼的锚串永远不匹配
+# （写完负锁先塞一次雷——本条第一次跑就是这么暴露它是摆设）。
+W171BOM="$(mktemp /tmp/gate171bom-XXXXXX)" || fail171 "建不了 BOM 对照临时文件"
+head -c 3 "$INS_PS1" > "$W171BOM"
+printf '\xef\xbb\xbf' > "$W171BOM.ref"
+cmp -s "$W171BOM" "$W171BOM.ref" || fail171 "install.ps1 没有 UTF-8 BOM（PS5.1 读中文注释与「新建策略文件.py」那个真文件名会漂）"
+rm -f "$W171BOM" "$W171BOM.ref" 2>/dev/null || true
+
+# ⑥ 用例在册 + 等值数
+CNT171=$((CNT171 + 1))
+for tc in test_01_build_writes_zip_and_manifest_hashes_match test_02_no_bytecode_junk_in_package \
+	test_03_contract_fp_uses_gateway_own_ruler test_04_missing_whitelist_file_refuses_build \
+	test_05_banned_path_in_whitelist_refuses_not_skips test_06_wireguard_requested_but_absent_refuses \
+	test_07_wireguard_embedded_shows_up_in_manifest test_08_bat_entries_are_ascii_and_use_file_not_command; do
+	grep -qF "def ${tc}(" "$PKGTEST" || fail171 "包构建用例缺一条：${tc}"
+done
+N171T=$(grep -c 'def test_' "$PKGTEST" 2>/dev/null || true)
+[ "${N171T:-0}" -eq 8 ] || fail171 "包构建用例实数 ${N171T}≠8（增减用例必须同批改这里与上面清单）"
+
+# ⑦ 常驻反证 R1：摘掉 deny 判据里的那枚 *data.db* ⇒ 第 05 条必须转红
+#    （不这么钉，"禁止路径拒绝构建"这条锁今天有没有牙，跟恒绿摆设看不出区别——§130 同法）
+CNT171=$((CNT171 + 1))
+W171=$(mktemp -d /tmp/gate171-XXXXXX || true)
+if [ -z "$W171" ] || [ ! -d "$W171" ]; then
+	fail171 "反证工作目录建不出来（缺反证＝本段的绿只证明锁会绿，不证明它会红）"
+else
+	cp "$PKG_SH" "$W171/neutered.sh" || fail171 "复制构建脚本失败"
+	chmod +x "$W171/neutered.sh"
+	MU171=$(python3 - "$W171/neutered.sh" <<'PY171'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding='utf-8').read()
+old = "*data.db* | "
+if old not in s:
+    print(0)
+    sys.exit(0)
+io.open(p, 'w', encoding='utf-8').write(s.replace(old, "", 1))
+print(1)
+PY171
+)
+	[ "${MU171:-0}" -ge 1 ] || fail171 "反证没改动任何字节（deny 锚串漂了＝这条锁没有牙）"
+	# 反证用绝对路径喂 PKG_BUILDER：拼 "$PWD/.." 那种类会随 cd 变义（$PWD 在 cd 之后才展开）。
+	R171=$(cd qmt_gateway && PKG_BUILDER="$W171/neutered.sh" \
+		python3 tests/test_friend_package.py TestFriendPackage.test_05_banned_path_in_whitelist_refuses_not_skips 2>&1 || true)
+	if grep_q 'OK' R171 F && ! grep_q 'FAILED' R171 F; then
+		fail171 "反证失效：摘掉 *data.db* 之后第 05 条仍绿（说明它没在守这条边界）"
+	fi
+	echo "   [§171 R1] MUTATED=${MU171} 反证按预期转红"
+	rm -rf "$W171" 2>/dev/null || true
+fi
+
+# ⑧ PowerShell 语法真解析（有 pwsh 就走这条腿；没有就**明说没走**，不静默放行）
+#    11-03 补上的能力：本机装了 pwsh 之后，全仓 150 份 .ps1 第一次被统一解析过（parse_errors=0），
+#    之前这些脚本的语法只在现网 PS5.1 上按单个文件验过。
+CNT171=$((CNT171 + 1))
+PWSH171=""
+for cand in pwsh /tmp/pwsh7/pwsh /opt/homebrew/bin/pwsh /usr/local/bin/pwsh; do
+	if command -v "$cand" >/dev/null 2>&1; then PWSH171="$cand"; break; fi
+done
+if [ -n "$PWSH171" ]; then
+	PS171OUT=$("$PWSH171" -NoProfile -Command '
+$bad = 0; $n = 0
+foreach ($f in @(Get-ChildItem -Path deploy, scripts, tools -Recurse -Filter *.ps1 -ErrorAction SilentlyContinue)) {
+  $t = $null; $e = $null
+  [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$t, [ref]$e) | Out-Null
+  $n = $n + 1
+  if ($e.Count -gt 0) { $bad = $bad + 1; Write-Output ("PARSE_FAIL " + $f.Name + " errors=" + $e.Count) }
+}
+Write-Output ("PS1_PARSED=" + $n + " PARSE_BAD=" + $bad)' 2>&1 || true)
+	printf '%s\n' "$PS171OUT" | grep -E "^(PARSE_FAIL|PS1_PARSED)" || true
+	if grep_q "PARSE_BAD=0" PS171OUT F; then
+		echo "   [§171 ⑧] pwsh 解析 $(printf '%s' "$PS171OUT" | grep -oE 'PS1_PARSED=[0-9]+' | tail -1) 份 .ps1，parse_errors=0"
+	else
+		fail171 "pwsh 在位却有 .ps1 解析失败（上面 PARSE_FAIL 逐条点了名）——朋友侧脚本从此不许带语法错出厂"
+	fi
+else
+	echo "INFO - §171 ⑧ 本机没有 pwsh：这份绿**不包含**任何 PowerShell 语法判定（PS 侧脚本仍需一台 Windows 或装 pwsh 才能真解析）"
+fi
+
+[ "$B171_FAILED" = "0" ] || exit 1
+echo "ok - §171 §FRIEND-PKG 锁通过（入口与脚本在册 1 + bat 姿势 1 + 一把尺子与字节码 1 + deny 锚点 1 + install 锚点与零明文 1 + 用例在册等值 1 + 常驻反证 1 + pwsh 语法解析 1，累计判定点 ${CNT171}）"
+
 echo "==> 全部通过"
 
 
