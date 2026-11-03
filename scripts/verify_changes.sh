@@ -19928,7 +19928,11 @@ for tok in 'json:"remote_leg,omitempty"' 'func (q QMTConfig) RemoteLegOn() bool'
 done
 CNT170=$((CNT170 + 1))
 grep -qF 'func (c *Controller) FriendLegState() int' "$CTL170" || fail170 "缺 FriendLegState"
-SEG170S=$(awk 'f&&/^}/{exit} /func \(c \*Controller\) FriendLegState\(/{f=1} f' "$CTL170")
+# 取"函数体 + 其下 40 行"而不是按第一个 `}` 截断：四态判据拆出持锁版本后，
+# 外层 FriendLegState 只剩一次转发、右花括号在第三行就出现，按花括号截会把整段判据切没（假红）。
+LN170S=$(grep -n 'func (c \*Controller) FriendLegState() int {' "$CTL170" | head -1 | cut -d: -f1 || true)
+[ -n "${LN170S:-}" ] || { fail170 "找不到 FriendLegState 定义（锁的对照物失效，请同批更新）"; LN170S=1; }
+SEG170S=$(sed -n "${LN170S},$((LN170S + 44))p" "$CTL170")
 for tok in 'RemoteLegOn()' 'Halted' 'return 3' 'return 2' 'return 1' 'return 0'; do
 	grep_q "$tok" SEG170S F || fail170 "四态判读缺 ${tok}（3＝撤销未触达与 2＝连不上处置方向不同，折成一个数就会让人去查链路而真因是那台机器还带着待发单）"
 done
@@ -19996,8 +20000,22 @@ PYR
 	rm -rf "$W170"
 fi
 
+# ⑨ 腿状态进快照 + 前端分形文案（批 5 尾巴：只有量规/告警时，朋友在页面上仍看不见自己那条腿）
+CNT170=$((CNT170 + 1))
+grep -qE 'FriendLegState[[:space:]]+int[[:space:]]+`json:"friend_leg_state"`' internal/trading/controller.go || fail170 "腿状态没进快照（前端只能另开一枪，读数与看板不同源）"
+grep -qF 'func (c *Controller) friendLegStateLocked() int' internal/trading/controller.go || fail170 "四态判据没拆出持锁版本（Snapshot 里直接调 FriendLegState 就是递归 RLock，写者排队时死锁）"
+N170T3=$(grep -cE '^[[:space:]]*return 3' internal/trading/controller.go || true)
+[ "${N170T3:-0}" -eq 1 ] || fail170 "四态判据出现第二份（return 3 命中 ${N170T3} 处）"
+CNT170=$((CNT170 + 1))
+grep -qF 'friend_leg_state === 2' web/src/pages/Dashboard.jsx || fail170 "Dashboard 没有 state=2 的分形文案"
+grep -qF 'friend_leg_state === 3' web/src/pages/Dashboard.jsx || fail170 "Dashboard 没有 state=3 的分形文案（与 2 的下一步不同，折成一句＝盲操作）"
+if grep -qF 'friend_leg_state === 0' web/src/pages/Dashboard.jsx; then
+	fail170 "state=0 也加了文案（运营单机的指示行必须与今天逐字一致）"
+fi
+[ -f web/src/__tests__/friend_leg_dashboard_labels_20261103.test.jsx ] || fail170 "前端三态用例文件不在册"
+
 [ "$B170_FAILED" = "0" ] || exit 1
-echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1，累计判定点 ${CNT170}）"
+echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2，累计判定点 ${CNT170}）"
 echo "==> 全部通过"
 
 

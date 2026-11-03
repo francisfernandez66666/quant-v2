@@ -167,6 +167,12 @@ export default function Dashboard() {
     parts.push(s.last_probe_ok ? '●' : '○')
     parts.push(s.mode === 'auto' ? '自动' : '手动')
     parts.push(s.tripped ? '⚠熔断' + (s.trip_reason ? ':' + s.trip_reason : '') : '正常')
+    // §MULTI-ACCT-B 批5：远端执行腿可达性分形文案。2 与 3 各有各的下一句话（一个去查链路，
+    // 一个已经撤了钥匙但没打到那台机器），折成"腿异常"一句就是让人盲操作；
+    // 0（这台机器没有远端腿）**不加任何词**——运营单机看到的那行字必须与今天一致。
+    if (s.friend_leg_state === 2) parts.push('⚠远端腿不可达：查那台机器是否开机、QMT 与网关是否在、overlay 是否通')
+    else if (s.friend_leg_state === 3) parts.push('⚠远端腿撤销未触达：当日已不再推新单，需人工停腿并清空待发指令')
+    else if (s.friend_leg_state === 1) parts.push('远端腿正常')
     return parts.join(' ')
   }, [qmtState])
 

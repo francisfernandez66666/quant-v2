@@ -429,6 +429,13 @@ func (c *Controller) TripInfo() (tripped bool, reason string, at time.Time) {
 func (c *Controller) FriendLegState() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.friendLegStateLocked()
+}
+
+// friendLegStateLocked 是四态判据的本体，**调用方必须已持有 c.mu**（读锁即可）。
+// 单独拆出来只为一个理由：Snapshot() 已在 RLock 内，若直接调 FriendLegState() 就是递归读锁，
+// Go 的 RWMutex 在有写者排队时递归 RLock 会死锁——而这里判据绝不允许有第二份。
+func (c *Controller) friendLegStateLocked() int {
 	// 0：这台机器上没有任何远端腿（未配键 / 实盘整体停用）——单机部署恒此档，永不报红。
 	if !c.cfg.RemoteLegOn() || !c.cfg.Enabled {
 		return 0
@@ -484,7 +491,11 @@ func (c *Controller) SetConceptPolicy(minCoveragePct float64, maxStalenessHours 
 // English: connectivity snapshot for the dashboard/system row and quant page — downlink probe
 // state plus uplink report freshness; zero times mean "never happened".
 type StateSnapshot struct {
-	Enabled        bool      `json:"enabled"`          // 是否启用
+	Enabled bool `json:"enabled"` // 是否启用
+	// §MULTI-ACCT-B 批5：远端执行腿可达性四态（0 不适用 / 1 活着 / 2 不可达 / 3 撤销未触达）。
+	// 走快照而不是新端点：这样每个账号看到的恒是**自己那台腿**（liveCtrlFor 已按请求者路由），
+	// 也避免"页面另开一枪"造成与看板不同源的第二个读数。
+	FriendLegState int       `json:"friend_leg_state"`
 	Mode           string    `json:"mode"`             // 执行模式
 	Tripped        bool      `json:"tripped"`          // 是否熔断
 	TripReason     string    `json:"trip_reason"`      // 熔断原因
@@ -535,6 +546,8 @@ func (c *Controller) Snapshot() StateSnapshot {
 		pendingEnabled = &v
 	}
 	// §M12-A：资金三态随快照暴露（AvailableCash 不取锁，此处 RLock 内调用安全）。
+	// 腿状态在持锁期内经同一份判据算出（见 friendLegStateLocked 的注释）
+	friendLeg := c.friendLegStateLocked()
 	cash, cashFresh := c.AvailableCash()
 	// §MANUAL-SYNC：附带快照落库时刻（读失败/未接账本时为空串，前端不显示该格）。
 	cashAt := ""
@@ -550,6 +563,7 @@ func (c *Controller) Snapshot() StateSnapshot {
 	}
 	return StateSnapshot{
 		Enabled:              c.cfg.Enabled,
+		FriendLegState:       friendLeg,
 		Mode:                 c.cfg.Mode,
 		Tripped:              c.tripped,
 		TripReason:           c.tripReason,
