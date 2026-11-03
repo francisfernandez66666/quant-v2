@@ -236,8 +236,12 @@ type Engine struct {
 	consultByUser map[string]*data.ConsultStore // §GAP2-W2 按账号隔离的咨询历史（accountsRoot/<uid>/consult_history.json）
 	confrontStore *data.ConfrontationStore      // 政策反制事件持久化存储（跨交易日清空）
 	notifier      *notify.Notifier              // 推送器（桌面/Webhook；P1 清仓强提醒用）
-	hotRecords    []data.HotRecord              // 当日热点板块轮次记录（固化到磁盘）
-	hotRecPath    string                        // 热点板块记录持久化文件路径
+	// §MULTI-ACCT-B 批5（B-N10）：远端执行腿不可用的"已推状态"记忆位。
+	// 只记最后一跳的值，是为了让 5s 一轮的刷新循环不至于把朋友手机刷爆；
+	// 归零（腿活了）也写回 0，这样同一条腿第二次掉线仍然会报。
+	friendLegPushed int
+	hotRecords      []data.HotRecord // 当日热点板块轮次记录（固化到磁盘）
+	hotRecPath      string           // 热点板块记录持久化文件路径
 
 	sectorEventTimes map[string]time.Time         // 板块事件时间戳（重复事件衰减状态）
 	emotionCfg       *config.EmotionConfig        // 情绪周期阈值（SSE 广播情绪阶段）
@@ -7507,4 +7511,33 @@ func (e *Engine) autoExitReportSells(sells []combat_agent.Signal, quotes map[str
 		}
 		log.Printf("[engine] report 账本自动%s %s(%s) 价%.2f act=%s", reason, pos.Code, pos.Name, q.Price, act)
 	}
+}
+
+// pushFriendLegAlert 在远端执行腿不可用时，同时通知**该账号本人**与**平台管理员**（B-N10）。
+// 只推 owner 手机是不够的：朋友的腿掉了他自己不知道，还在那儿等成交；
+// 只推给他一个人也不够：那台机器没人会去修。两条都要，且只在状态跳变时推。
+// 别名口径与 §GAP2-W2 一致（私有告警 Alias=归属账号 uid，公共告警走默认别名＝owner 手机）。
+// 纯读 + 幂等：不改变任何交易状态；notifier 未接入（测试/精简装配）时静默跳过。
+func (e *Engine) pushFriendLegAlert(state int) {
+	if state < 2 {
+		e.friendLegPushed = 0
+		return
+	}
+	if state == e.friendLegPushed {
+		return // 同一状态不重复推（5s 一轮会刷屏）
+	}
+	e.friendLegPushed = state
+	if e.notifier == nil {
+		return
+	}
+	uid := e.UserID()
+	what := "远端执行腿不可达"
+	doSth := "查那台机器是否开机、QMT 与网关进程是否在、overlay 隧道是否通"
+	if state == 3 {
+		what = "远端执行腿撤销未触达"
+		doSth = "钥匙已注销但没能打到那台机器：当日已不再推新单，需人工停腿并清空待发指令"
+	}
+	body := fmt.Sprintf("账号 %s：%s。%s（腿状态值=%d，读数见 /api/qmt/state.friend_leg_state）", uid, what, doSth, state)
+	e.notifier.Push(notify.Message{Level: notify.LevelHigh, Title: what, Content: body, Alias: uid})
+	e.notifier.Push(notify.Message{Level: notify.LevelHigh, Title: what + "（账号 " + uid + "）", Content: body, Alias: ""})
 }

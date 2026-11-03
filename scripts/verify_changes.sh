@@ -20013,9 +20013,16 @@ if grep -qF 'friend_leg_state === 0' web/src/pages/Dashboard.jsx; then
 	fail170 "state=0 也加了文案（运营单机的指示行必须与今天逐字一致）"
 fi
 [ -f web/src/__tests__/friend_leg_dashboard_labels_20261103.test.jsx ] || fail170 "前端三态用例文件不在册"
+CNT170=$((CNT170 + 1))
+SEG170N=$(awk '/^func \(e \*Engine\) pushFriendLegAlert\(/{f=1} f&&/^}/{exit} f' internal/engine/engine.go)
+grep_q 'Alias: uid' SEG170N F || fail170 "腿不可用没推给该账号本人（B-N10 只做到推运营＝朋友不知道自己在裸奔）"
+grep_q 'Alias: ""' SEG170N F || fail170 "腿不可用没推给平台管理员（默认别名）——没人去修那台机器"
+grep_q 'state == e.friendLegPushed' SEG170N F || fail170 "没做跳变判定（5s 一轮会刷屏，朋友手机被刷爆后就是全部静音）"
+[ -f internal/engine/friend_leg_gauge_test.go ] && grep -qF 'func TestPushFriendLegAlertOnlyOnTransition' internal/engine/friend_leg_gauge_test.go \
+	|| fail170 "跳变/恢复清零无回归锁"
 
 [ "$B170_FAILED" = "0" ] || exit 1
-echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2，累计判定点 ${CNT170}）"
+echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1，累计判定点 ${CNT170}）"
 echo "==> 全部通过"
 
 

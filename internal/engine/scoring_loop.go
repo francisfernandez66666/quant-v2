@@ -1396,6 +1396,11 @@ func (e *Engine) refreshStalenessGauges() {
 		friendLeg = e.WorstFriendLegState()
 	}
 	metrics.SetGauge("friend_leg_state", friendLeg)
+	// §MULTI-ACCT-B 批5（B-N10）：量规只到"运营看得到"，本人还得知道自己那条腿掉了。
+	// 每个账号的推送在自己的引擎里做（这里 e 就是本账号），运营那份走默认别名。
+	if own := e.QMTController(); own != nil {
+		e.pushFriendLegAlert(own.FriendLegState())
+	}
 
 	uplinkAge := int64(0)
 	// QMTController/Snapshot 各自取锁，且本函数在 scoreCycle 顶部调用时 e.mu 已释放，无重入死锁。

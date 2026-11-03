@@ -159,3 +159,30 @@ func TestFriendLegGaugeDoesNotTouchDataPlane(t *testing.T) {
 		t.Fatal("§FRIEND-LEG 那段没写 friend_leg_state 量规（规则永不触发）")
 	}
 }
+
+// §B-N10 推送腿的账：跳变才推、恢复清零、notifier 没接也不能 panic。
+// 这两条是"5s 一轮把朋友手机刷爆"和"精简装配下引擎崩掉"的直接防线——
+// 至于"两条都推（本人 + 运营）"由门禁 §170 的静态锁守（Alias=uid 与 Alias="" 各一处）。
+func TestPushFriendLegAlertOnlyOnTransition(t *testing.T) {
+	e := &Engine{userID: "u_friend"}
+	e.pushFriendLegAlert(0)
+	if e.friendLegPushed != 0 {
+		t.Fatal("state<2 应把已推位清零")
+	}
+	e.pushFriendLegAlert(2) // 无 notifier：只记跳变，不 panic
+	if e.friendLegPushed != 2 {
+		t.Fatalf("首次不可达应记为已推 2，实得 %d", e.friendLegPushed)
+	}
+	e.pushFriendLegAlert(2)
+	if e.friendLegPushed != 2 {
+		t.Fatal("同状态重复推会刷屏")
+	}
+	e.pushFriendLegAlert(3)
+	if e.friendLegPushed != 3 {
+		t.Fatal("2→3 是新的处置方向，必须再推一次")
+	}
+	e.pushFriendLegAlert(1)
+	if e.friendLegPushed != 0 {
+		t.Fatal("腿恢复后应清零，否则第二次掉线不报")
+	}
+}
