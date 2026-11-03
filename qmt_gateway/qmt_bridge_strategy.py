@@ -2032,6 +2032,194 @@ def probe_quote_capability(ContextInfo):
             _trace("qcap api=%s result=OK but shape unread: %s" % (api, repr(e)[:140]))
 
 
+# ---- R3 step-2 (2026-11-03): full data-plane capability probe ----------------
+# Why this exists: the Dongguan notice dated 2026-11-03 closes ALL strategy-side local file IO
+# and any network from 2026-11-05, so after that date the only data the in-client strategy can
+# reach is whatever ContextInfo itself exposes. Whether our factor set survives inside that
+# boundary is decided by the function inventory below -- and we have never actually dumped it:
+# the 11-02 probe filtered dir() on the tick/market/quote keywords only, so sector membership,
+# instrument detail (limit prices), financials, dividends and the trading calendar were never
+# printed at all. "the factors are too few" is an untested premise until this returns.
+#
+# It is log-only evidence. Read-only calls only, each individually guarded: no order call, no
+# subscribe, and nothing that can block (a download_history_data inside handlebar is how the
+# trading leg loses its tick -- the 10-29 outage). Blocked-capable APIs are name-checked only.
+# Pure ASCII again on purpose: one CJK byte and the GBK sandbox tears the whole strategy down.
+_CAP_DONE = False
+_CAP_RERUN_DONE = False
+_CAP_WINDOW = ("09:31:00", "09:34:00")
+_CAP_CODES = ["600588.SH", "001258.SZ", "600000.SH", "000001.SH"]
+# A-share universe sector names, escaped so this source stays byte-ASCII while the call gets
+# the real Chinese string the terminal expects.
+_CAP_SECTORS = [u"\u6caa\u6df1A\u80a1", u"\u4e0a\u8bc1A\u80a1", u"\u6df1\u8bc1A\u80a1"]
+_CAP_NAMECHECK = [
+    "download_history_data", "refresh_data", "subscribe_quote", "subscribe_whole_quote",
+    "unsubscribe_quote", "get_tick_timetag", "get_bar_timetag", "get_trading_dates",
+    "get_stock_list_in_sector", "get_sector_list", "get_sector_type", "get_index_weight",
+    "get_instrument_detail", "get_financial_data", "get_divid_factors", "get_market_data_ex",
+    "get_market_data", "get_full_tick", "passorder", "cancel", "get_trade_detail_data",
+]
+
+
+def _cap_shape(tag, obj):
+    """Log one ASCII-safe summary of a probe result: kind, size, first keys."""
+    try:
+        import json
+        if isinstance(obj, dict):
+            keys = sorted([str(k) for k in obj.keys()])[:40]
+            _trace("cap %s kind=dict n=%d keys=%s" % (
+                tag, len(obj), ",".join(keys)[:600]))
+            one = obj[list(obj.keys())[0]] if obj else None
+            if isinstance(one, dict):
+                _trace("cap %s entry_keys=%s" % (
+                    tag, ",".join(sorted([str(k) for k in one.keys()]))[:400]))
+            return True
+        if isinstance(obj, (list, tuple)):
+            _trace("cap %s kind=list n=%d head=%s" % (
+                tag, len(obj), json.dumps(list(obj[:3]), ensure_ascii=True, default=str)[:400]))
+            return True
+        _trace("cap %s kind=%s val=%s" % (
+            tag, type(obj).__name__,
+            json.dumps(obj, ensure_ascii=True, default=str)[:200]))
+        return True
+    except Exception as e:
+        _trace("cap %s shape fail: %s" % (tag, repr(e)[:120]))
+        return False
+
+
+def _cap_call(ContextInfo, api, shapes):
+    """Drive one API through a small ladder of argument shapes; log the first that answers.
+
+    A single-shape probe cannot tell "this API does not exist" apart from "we guessed the
+    signature wrong", and only one of those two is fixable -- the 11-02 reading on
+    get_market_data_ex came back n=0 and we still do not know which case it was. So: try,
+    on TypeError move to the next shape, on any other error record it and keep going, and
+    never let the exception leave this function.
+    """
+    fn = getattr(ContextInfo, api, None)
+    if fn is None:
+        _trace("cap api=%s ABSENT" % api)
+        return False
+    last = ""
+    for label, args, kwargs in shapes:
+        try:
+            res = fn(*args, **kwargs)
+        except TypeError as e:
+            last = "TypeError " + repr(e)[:110]
+            continue
+        except Exception as e:
+            last = repr(e)[:120]
+            _trace("cap api=%s shape=%s CALL_FAIL err=%s" % (api, label, last))
+            continue
+        _trace("cap api=%s shape=%s OK" % (api, label))
+        return _cap_shape(api + "/" + label, res)
+    _trace("cap api=%s PRESENT no_shape_worked last=%s" % (api, last))
+    return False
+
+
+def _cap_dump_names(ContextInfo):
+    """Print the full dir(ContextInfo) in chunks -- the inventory IS the deliverable."""
+    names = sorted([a for a in dir(ContextInfo) if not str(a).startswith("__")])
+    _trace("csurf total=%d" % len(names))
+    buf, part = "", 0
+    for nm in names:
+        if len(buf) + len(nm) + 1 > 900:
+            part += 1
+            _trace("csurf part%d=%s" % (part, buf))
+            buf = ""
+            if part >= 40:
+                # Truncation must announce itself: a quietly short print would be read as
+                # "the terminal has no such API", and this list exists precisely to tell
+                # "absent" apart from "never looked".
+                _trace("csurf TRUNCATED at 40 parts rest_unverified=1")
+                return names
+        buf += nm + ","
+    if buf:
+        _trace("csurf part%d=%s" % (part + 1, buf))
+    return names
+
+
+def probe_capability_surface(ContextInfo, force=False):
+    """Once per process: dump the callable surface, then read-only-probe the data plane we need.
+
+    What each group answers, in the order that matters for the migration decision:
+      1. universe/membership -- can the strategy enumerate the market and its sectors
+         (this is what breadth, limit-up pools and sector RPS would have to be recomputed from);
+      2. instrument detail -- does it hand back the day's limit prices (if yes, the limit-up
+         pool is computable in-sandbox; if no, regime loses one of its votes);
+      3. history bars with adjustment -- MA/MACD/volume families depend on it;
+      4. financials and dividends -- the valuation and adjustment-accurate back-data;
+      5. calendar -- whether trading-day logic survives without an external calendar.
+    """
+    global _CAP_DONE
+    if _CAP_DONE and not force:
+        return
+    _CAP_DONE = True
+    try:
+        names = _cap_dump_names(ContextInfo)
+    except Exception as e:
+        _trace("csurf dump fail: " + repr(e)[:150])
+        return
+    have = set(names)
+    for nm in _CAP_NAMECHECK:
+        if nm not in have:
+            _trace("cap name=%s ABSENT" % nm)
+    sec = _CAP_SECTORS[0] if _CAP_SECTORS else "A"
+    _cap_call(ContextInfo, "get_stock_list_in_sector", [
+        ("sector", (sec,), {}),
+        ("sector_type", (sec, "stock"), {}),
+    ])
+    _cap_call(ContextInfo, "get_sector_list", [("noarg", (), {})])
+    _cap_call(ContextInfo, "get_sector_type", [("noarg", (), {})])
+    _cap_call(ContextInfo, "get_index_weight", [("code", ("000300.SH",), {})])
+    # The decisive one for limit-up logic: field names are logged verbatim, and if
+    # UpStopPrice/DownStopPrice show up there, the whole limit-up pool / consecutive-board
+    # height / failed-board-rate set becomes
+    # recomputable from tick snapshots instead of needing the EastMoney pool.
+    _cap_call(ContextInfo, "get_instrument_detail", [("code", ("600588.SH",), {})])
+    _cap_call(ContextInfo, "get_trading_dates", [("range", ("20260101", "20261103"), {})])
+    _cap_call(ContextInfo, "get_financial_data", [
+        ("tbl", (["600588.SH"], "Balance", "20260101", "20261103"), {}),
+        ("list", (["600588.SH"], ["Balance"], "20260101", "20261103"), {}),
+    ])
+    _cap_call(ContextInfo, "get_divid_factors", [("code", ("600588.SH",), {})])
+    _cap_call(ContextInfo, "get_market_data_ex", [
+        ("empty_first", ([], _CAP_CODES, "1d", "", "", 10, "front"), {}),
+        ("kwargs", (_CAP_CODES,), {"period": "1d", "count": 10, "dividend": "front"}),
+        ("named", (), {"fieldList": [], "stockList": _CAP_CODES, "period": "1d", "count": 10}),
+    ])
+    _cap_call(ContextInfo, "get_market_data", [
+        ("named", (), {"stockList": _CAP_CODES, "period": "1d", "count": 10,
+                       "dividend_type": "front"}),
+        ("positional", ([], _CAP_CODES, "1d", "", "", 10), {}),
+    ])
+    _cap_call(ContextInfo, "get_full_tick", [("codes", (_CAP_CODES,), {})])
+
+
+def probe_capability_rerun(ContextInfo, now_hhmmss=None):
+    """Allow exactly one in-session rerun: existence is provable any time, but *shapes* --
+    non-zero volume, live limit prices, filled bars -- only exist while the market is open.
+    The 11-03 reading was taken at 08:54 (pre-open) and could not answer the unit question for
+    exactly this reason, so the rerun window is the whole point of this function.
+    """
+    global _CAP_RERUN_DONE
+    if _CAP_RERUN_DONE:
+        return False
+    try:
+        hhmmss = now_hhmmss or _now_cn_str("%H:%M:%S")
+    except Exception:
+        return False
+    if not (_CAP_WINDOW[0] <= hhmmss < _CAP_WINDOW[1]):
+        return False
+    _CAP_RERUN_DONE = True
+    _trace("csurf rerun at %s" % hhmmss)
+    try:
+        probe_capability_surface(ContextInfo, force=True)
+    except Exception as e:
+        _trace("csurf rerun fail: " + repr(e)[:150])
+    return True
+
+
 def init(ContextInfo):
     """QMT strategy init: inject ContextInfo into the probe and probe the session."""
     _trace("init called (handlebar-tick mode)")
@@ -2049,6 +2237,12 @@ def init(ContextInfo):
         probe_quote_capability(ContextInfo)
     except Exception as e:
         _trace("qcap error: " + repr(e)[:160])
+    # R3 step-2 (2026-11-03): dump the whole callable surface once -- the migration decision
+    # depends on APIs we have never even listed (sectors, instrument detail, financials).
+    try:
+        probe_capability_surface(ContextInfo)
+    except Exception as e:
+        _trace("csurf error: " + repr(e)[:160])
     # CLOSE-RECON (2026-10-28, retimed 2026-10-29): the 15:01 probe is fired from
     # _close_recon_due() inside handlebar, NOT from a QMT timer callback. The timed
     # registration is what the 10-29 outage was traced to (no handlebar dispatch at all
@@ -2081,5 +2275,12 @@ def handlebar(ContextInfo):
     # so _TICK["last_tick_day"] is already today when the probe checks the trading-day guard).
     try:
         _close_recon_due(ContextInfo)
+    except Exception:
+        pass
+    # Capability rerun sits LAST on the tick: a read-only data probe must never take time ahead
+    # of order/fill reporting in the same handlebar (the trading leg keeps priority, and the
+    # probe fires at most once per process inside a three-second window).
+    try:
+        probe_capability_rerun(ContextInfo)
     except Exception:
         pass
