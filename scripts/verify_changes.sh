@@ -20031,15 +20031,42 @@ for tc in '§FRIEND-LEG ① 读面契约：/api/qmt/state 带 friend_leg_state �
 	'§FRIEND-LEG ④c 仪表盘：值=3 给停腿清待发方向，且与熔断各说各的' \
 	'§FRIEND-LEG ⑤ equals-legacy：值=0（运营单机形态）那行字与今天逐字一致，整页无「远端腿」' \
 	'§FRIEND-LEG ⑥ 反证腿：未定义的档位不许有任何一句话（证明分支不是 >= 形状）' \
-	'§FRIEND-LEG ⑦ 契约不符只报不接单：读面三读数同现同缺，不许拿零值冒充已知'; do
+	'§FRIEND-LEG ⑦ 契约不符只报不接单：读面三读数同现同缺，不许拿零值冒充已知' \
+	'§FRIEND-LEG ⑧ quant_trade 单票成员：并集十三条进得来、特权面一律 403（只在本机 UAT 栈）'; do
 	grep -qF "$tc" "$E170" || fail170 "端到端契约用例缺一条：$tc"
 done
 # 等值数：加一条就要同批改这里——§165 那把尺子的同款（"存在即可"守不住覆盖退化）。
 N170E2E=$(grep -cE "^test\('" "$E170" 2>/dev/null || true)
-[ "${N170E2E:-0}" -eq 9 ] || fail170 "端到端用例实数 ${N170E2E}≠9（新增/删改必须同批改本段的标题清单与等值数）"
+[ "${N170E2E:-0}" -eq 10 ] || fail170 "端到端用例实数 ${N170E2E}≠10（新增/删改必须同批改本段的标题清单与等值数）"
+CNT170=$((CNT170 + 1))
+# overlay 落位自检（11-03 新增）：装不动 WG 这件事必须变成"值班的人一句话能看清"，
+# 而不是散在聊天记录里。这条锁判四件事：脚本在、缺省只读、有 -Preview、判据行是 ASCII 键名。
+P170=scripts/probe_wg_guangzhou.sh
+[ -s "$P170" ] || fail170 "overlay 只读探针不在册（${P170}）"
+for k in 'WG_EXE=' 'TUNNEL_SVC_N=' 'UDP_51820_LINES=' 'VERDICT='; do
+	grep -qF "$k" "$P170" || fail170 "探针缺判据行 ${k}（中文进判据＝码页打乱后的永久性假绿）"
+done
+grep -qF 'MODE="preview"' "$P170" || fail170 "探针没有 -Preview 腿（门禁要能离线跑它）"
+# 负锁：剥掉注释行后，写原语必须一次都不命中——"自检顺手把包装了"是本脚本最坏的失真方式。
+P170_CODE=$(grep -vE '^[[:space:]]*#' "$P170" || true)
+P170_WRITES=$(grep -cE 'msiexec|New-Item|Set-Content|Out-File|Add-Content|install-tunnel|genkey|Remove-Item|-OutFile' <<< "$P170_CODE" || true)
+[ "${P170_WRITES:-0}" -eq 0 ] || fail170 "探针里出现写原语 ${P170_WRITES} 处（它只许读；安装是 owner 单独授权的独立动作）"
+# 现网实测过的坑：OperatingSystem.TotalPhysicalMemory 在 PS5.1+CIM 上回过 0，
+# 拿 0 当预算分母等于判据自己撒谎 ⇒ 总量必须走 Win32_ComputerSystem。
+grep -qF 'Get-CimInstance Win32_ComputerSystem' "$P170" || fail170 "内存总量没走 ComputerSystem（OperatingSystem.TotalPhysicalMemory 实测回 0）"
+if grep_q '$os.TotalPhysicalMemory / 1KB' P170_CODE F; then
+	fail170 "探针还在用 OperatingSystem.TotalPhysicalMemory 算总量（现网第一跑实测读到 0）"
+fi
+[ -x "$P170" ] || fail170 "探针没有执行位（跑 e2e/值班卡靠复制粘贴命令不是办法）"
+bash -n "$P170" || fail170 "探针 bash -n 不过"
+grep -qE 'GATE_EXIT|GZ_IP' "$P170" || fail170 "探针没有主机入口变量（本仓运维脚本一律不猜主机地址）"
+# 同一姿势也要盯 e2e 那条注入变量提示：uat_bootstrap 起 mock 必带 -quote-source，
+# 提示行缺 E2E_QUOTE_SOURCE 会让 QS-2 走"未注入"支、从注入过的 mock 读到值（11-03 真红过一次）。
+grep -qF 'E2E_QUOTE_SOURCE=${QUOTE_SOURCE}' scripts/uat_bootstrap.sh \
+	|| fail170 "自举的「跑 e2e」提示行没带 E2E_QUOTE_SOURCE（照抄就假红，见 §13.6）"
 
 [ "$B170_FAILED" = "0" ] || exit 1
-echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1 + 端到端契约用例在册 1，累计判定点 ${CNT170}）"
+echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1 + 端到端契约用例在册 1 + overlay 只读探针与自举提示 1，累计判定点 ${CNT170}）"
 echo "==> 全部通过"
 
 

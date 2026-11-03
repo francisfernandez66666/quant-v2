@@ -162,7 +162,7 @@ test('§FRIEND-LEG ⑦ 契约不符只报不接单：读面三读数同现同缺
   const body = await resp.json()
   if (body.ok !== true) {
     // 未接入实盘/网关不可达：本批没给这条链新增任何字段，如实报"本轮无可断言对象"。
-    test.fixme(true, '网关探测未成功（ok=false），⑥ 无契约读数可判')
+    test.fixme(true, '网关探测未成功（ok=false），⑦ 无契约读数可判')
     return
   }
   // contract_ok 是指针三态：键缺席＝这版网关没发这个字段（老网关/别的部署），**不许**当成"契约没问题"
@@ -180,6 +180,92 @@ test('§FRIEND-LEG ⑦ 契约不符只报不接单：读面三读数同现同缺
     if (body.contract_ok === false) {
       expect(typeof body.broker, '契约不符不许把通道读数带空（只拒 /order 与 /cancel）').toBe('string')
       expect(typeof body.broker_connected, '契约不符不许把在线态带空').toBe('boolean')
+    }
+  }
+})
+
+// ⑧ quant_trade 单票成员的正面/负面清单（这条是本批中心承诺的唯一"跑起来"证据）。
+// 为什么必须端到端：单测证的是中间件认这位（quant_trade_perm_test.go）、路由表挂的是并集形态（§170 静态锁），
+// 而"发这一位之后朋友实际能干什么/干不了什么"是**这两件事的合取**——历史上正是这种合取漏人：
+// §MULTI-ADMIN 那批的「权限面边界（本批刻意未扩）」写在文档里、锁在路由里，页面入口却仍然能进。
+//
+// 安全边界（三条，一条都不能松）：
+//   1) **只在本机 UAT 栈跑**：这条要建号、授权、删号，是写面动作。E2E_BASE_URL 不是 localhost/127.0.0.1
+//      就 fixme 退出——现网永远不该被这条用例改账号表。
+//   2) 负面清单里**不许**放 `GET /api/qmt/broker`：它要不要并进并集还等 owner 裁（明细 §13.5 未验 1），
+//      把今天的 403 钉成断言＝把一个待裁决项焊死。
+//   3) 两条 POST 只做"进不进得来"的探测，**不带可执行载荷**：halt 送的是坏 JSON（必 400，永不落 halted），
+//      cancel 送的是一个不存在的委托号（必落到状态冲突分支，动不了真单）。
+test('§FRIEND-LEG ⑧ quant_trade 单票成员：并集十三条进得来、特权面一律 403（只在本机 UAT 栈）', async ({ request }) => {
+  if (!ADMIN.u || !ADMIN.p) {
+    test.fail(true, '§FRIEND-LEG ⑧ 需要 E2E_USER/E2E_PASS（建号与授权要 admin），缺失时不许伪通过')
+    return
+  }
+  const base = process.env.E2E_BASE_URL || 'http://localhost:5173'
+  const localStack = /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(API) && /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(base)
+  if (!localStack) {
+    test.fixme(true, '⑧ 会建号/授权/删号（写面），只允许打本机 UAT 栈；当前目标是远端 ⇒ 本轮无可断言对象')
+    return
+  }
+  const adminHdr = { Authorization: 'Bearer ' + (await loginToken(request, ADMIN.u, ADMIN.p)) }
+  const uname = 'qtleg' + Date.now().toString().slice(-7)
+  // 口令复用既有测试凭据（E2E_PASS2），不在仓里新增第三个明文口令——本仓的发版纪律是"不提交任何口令"，
+  // 而 UAT 栈的口令本来就是公开夹具；再引一个新字面量等于多一处要轮换的东西。
+  const upass = USER.p || 'Tester!2026'
+  let uid = ''
+  try {
+    const created = await request.post(API + '/api/admin/users', {
+      headers: adminHdr, data: { username: uname, password: upass, role: 'user' },
+    })
+    expect([200, 201], '建临时成员必须落 2xx（现网 201 Created）').toContain(created.status())
+    const list = await (await request.get(API + '/api/admin/users', { headers: adminHdr })).json()
+    uid = (list.users || []).find((x) => x.username === uname)?.id || ''
+    expect(uid, '建号后必须能在成员清单里找到 id（找不到＝这条用例后面全在空转）').not.toBe('')
+    // 只发「量化交易」这一位——这正是 owner 说的那枚"后台可配、不自动授予"的位。
+    const granted = await request.post(API + `/api/admin/users/${uid}/perms`, {
+      headers: adminHdr, data: { perms: ['quant_trade'] },
+    })
+    expect(granted.status(), 'POST perms 只挂 quant_trade 必须 200').toBe(200)
+    const tk = await loginToken(request, uname, upass)
+    const hdr = { Authorization: 'Bearer ' + tk }
+
+    // 并集腿：13 个调用点（11 条路由里 halt/cancel 用 POST 探测，其余走 GET）。
+    const admitted = [
+      ['GET', '/api/config/qmt'], ['GET', '/api/t-live/rounds'], ['GET', '/api/funds/today'],
+      ['GET', '/api/signals/decisions?day=2026-11-03'], ['GET', '/api/positions/real'],
+      ['GET', '/api/qmt/state'], ['GET', '/api/qmt/trades'], ['GET', '/api/qmt/orders'],
+      ['POST', '/api/qmt/halt'], ['POST', '/api/qmt/cancel/qtleg-bogus-order-id'],
+    ]
+    for (const [m, p] of admitted) {
+      const r = m === 'GET'
+        ? await request.get(API + p, { headers: hdr })
+        : await request.post(API + p, { headers: hdr, data: m.includes('halt') ? '{' : '{}' })
+      expect([401, 403], `quant_trade 打 ${m} ${p} 被挡在门外（并集没接上）：实得 ${r.status()}`).not.toContain(r.status())
+    }
+    // halt 的坏载荷必须落到 400 而不是 200——否则说明"没带 halted 也能翻转 kill-switch"。
+    const halt = await request.post(API + '/api/qmt/halt', { headers: hdr, data: '{' })
+    expect(halt.status(), '缺 halted 字段的急停必须 400（不许被当成"关闭急停"执行）').toBe(400)
+
+    // 状态读数顺带自证：这个成员没配 remote_leg ⇒ 恒 0（与①同一把尺子的第二个体位）。
+    const st = await (await request.get(API + '/api/qmt/state', { headers: hdr })).json()
+    expect(st.friend_leg_state, '未配 remote_leg 的账号必须读成 0（不适用）').toBe(0)
+
+    // 特权面：一位"量化交易"不许打开任何一条（这是 owner 敢把这枚位发出去的根据）。
+    const denied = [
+      ['GET', '/api/config/strategy'], ['GET', '/api/config/runtime'], ['GET', '/api/config/d1'],
+      ['GET', '/api/metrics/alerts'], ['GET', '/api/usage'], ['GET', '/api/admin/users'],
+      ['POST', '/api/qmt/broker'],
+    ]
+    for (const [m, p] of denied) {
+      const r = m === 'GET'
+        ? await request.get(API + p, { headers: hdr })
+        : await request.post(API + p, { headers: hdr, data: '{}' })
+      expect(r.status(), `quant_trade 竟能进特权面 ${m} ${p}（权限面被扩宽了，必须同批改这条清单）`).toBe(403)
+    }
+  } finally {
+    if (uid) {
+      const del = await request.delete(API + `/api/admin/users/${uid}`, { headers: adminHdr })
+      expect([200, 204], '临时成员必须删干净（残留＝下次跑撞重名）').toContain(del.status())
     }
   }
 })
