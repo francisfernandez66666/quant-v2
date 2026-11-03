@@ -552,8 +552,11 @@ log "UAT 栈已就绪（admin token 存于 $DATA_DIR/admin.token）："
 "$0" env
 echo
 log "跑 e2e：cd web && E2E_BASE_URL=http://localhost:${FRONT_PORT} E2E_API=${BACKEND} \\"
-log "        E2E_MOCK_URL=http://127.0.0.1:${MOCK_PORT} QMT_TOKEN=${QMT_TOKEN} \\"
+log "        E2E_MOCK_URL=http://127.0.0.1:${MOCK_PORT} QMT_TOKEN=${QMT_TOKEN} E2E_QUOTE_SOURCE=${QUOTE_SOURCE} \\"
 log "        E2E_USER=${E2E_USER} E2E_PASS='${E2E_PASS}' E2E_USER2=${E2E_USER2} E2E_PASS2='${E2E_PASS2}' npx playwright test"
+# E2E_QUOTE_SOURCE 必须出现在这条提示里：本脚本起 mock 时一律带 -quote-source，
+# 而 QS-2 用例按"有没有注入"分两支——照抄缺这一变量的命令会让用例走"未注入"支、
+# 却从真的被注入过的 mock 读到 quote_source，红成"mock 默认行为漂移"（11-03 实跑撞到）。
 log "停栈：  ./scripts/uat_bootstrap.sh stop"
 log "日志：  $DATA_DIR/{mock,engine,engine2,vite}.log"
 

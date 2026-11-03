@@ -20020,9 +20020,26 @@ grep_q 'Alias: ""' SEG170N F || fail170 "腿不可用没推给平台管理员（
 grep_q 'state == e.friendLegPushed' SEG170N F || fail170 "没做跳变判定（5s 一轮会刷屏，朋友手机被刷爆后就是全部静音）"
 [ -f internal/engine/friend_leg_gauge_test.go ] && grep -qF 'func TestPushFriendLegAlertOnlyOnTransition' internal/engine/friend_leg_gauge_test.go \
 	|| fail170 "跳变/恢复清零无回归锁"
+CNT170=$((CNT170 + 1))
+E170=web/e2e/friend_leg.spec.mjs
+[ -f "$E170" ] || fail170 "端到端契约用例文件不在册（${E170}）"
+for tc in '§FRIEND-LEG ① 读面契约：/api/qmt/state 带 friend_leg_state 且与 enabled 自洽' \
+	'§FRIEND-LEG ② 权限面：匿名 401、无位成员 403、admin 200（any-perms 中间件真拦得住）' \
+	'§FRIEND-LEG ③ 告警腿在册：第 24 条规则的五元组逐字对' \
+	'§FRIEND-LEG ④a 仪表盘：值=1 只给中性文案，不串到不可达' \
+	'§FRIEND-LEG ④b 仪表盘：值=2 给查链路方向，不串到撤销' \
+	'§FRIEND-LEG ④c 仪表盘：值=3 给停腿清待发方向，且与熔断各说各的' \
+	'§FRIEND-LEG ⑤ equals-legacy：值=0（运营单机形态）那行字与今天逐字一致，整页无「远端腿」' \
+	'§FRIEND-LEG ⑥ 反证腿：未定义的档位不许有任何一句话（证明分支不是 >= 形状）' \
+	'§FRIEND-LEG ⑦ 契约不符只报不接单：读面三读数同现同缺，不许拿零值冒充已知'; do
+	grep -qF "$tc" "$E170" || fail170 "端到端契约用例缺一条：$tc"
+done
+# 等值数：加一条就要同批改这里——§165 那把尺子的同款（"存在即可"守不住覆盖退化）。
+N170E2E=$(grep -cE "^test\('" "$E170" 2>/dev/null || true)
+[ "${N170E2E:-0}" -eq 9 ] || fail170 "端到端用例实数 ${N170E2E}≠9（新增/删改必须同批改本段的标题清单与等值数）"
 
 [ "$B170_FAILED" = "0" ] || exit 1
-echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1，累计判定点 ${CNT170}）"
+echo "ok - §170 §MULTI-ACCT-B-OPS 锁通过（权限位与无自动授予 3 + 并集接线等值 2 + 运营面独占 1 + 腿状态四态与会话门 3 + 观测不越界 1 + 告警规则与三处文案 2 + 用例在册 1 + 常驻反证 1 + 腿状态进快照与前端三态文案 2 + 双收件人推送与跳变锁 1 + 端到端契约用例在册 1，累计判定点 ${CNT170}）"
 echo "==> 全部通过"
 
 
