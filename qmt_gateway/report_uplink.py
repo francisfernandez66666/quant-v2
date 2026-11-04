@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -568,3 +569,86 @@ def _side_word(v):
     if "卖" in s or s.upper() in ("S", "SELL"):
         return "卖出"
     return ""
+
+
+# ---------------------------------------------------------------------------
+# 命令行入口（2026-11-04 补）
+#
+# 为什么必须补这一段：本模块写出来之后**没有人驱动它**——没有 CLI、没有任何调用点。
+# "回报由本地进程自己 POST"是 owner 2026-11-04 的第 1 条裁决，而一条只能被 import 的腿
+# 在今晚的家用机测试里等于没有：没法看它到底发出了几个事件、也没法证明
+# "导出文件缺失时一个都不发"这条纪律真在生效。
+#
+# 三条边界（与模块内四条硬规则同源，不新造口径）：
+#   1. **钥匙永不出口**：只打 report_url 的 host:port 与 token 的**有无/长度**，
+#      绝不打印 token 本体、绝不打印请求头；
+#   2. `--dry-run` 一个字节都不发、状态文件一个字都不写（只组事件、只数数）；
+#   3. 地址与导出根一律取自 config.xt.json（同一份真源），命令行不许传 IP/token。
+#
+# 用法
+#   python report_uplink.py --config C:\qmt\...\config.xt.json --once --dry-run
+#   python report_uplink.py --config ... --once            # 真上一轮（2xx 才推进基线）
+# ---------------------------------------------------------------------------
+
+def _host_of(url):
+    """只取 host:port 用于打印——路径与查询串里可能带东西，凭证更是绝对不出。"""
+    text = str(url or "")
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    return text.split("/", 1)[0]
+
+
+def main(argv=None):
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="report_uplink",
+                                 description="box-local readout uplink (POST /api/qmt/report)")
+    ap.add_argument("--config", required=True, help="path to config.xt.json (the same source the trade leg uses)")
+    ap.add_argument("--once", action="store_true", help="run exactly one round and exit")
+    ap.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="build and count events, send nothing, write no state")
+    args = ap.parse_args(argv)
+
+    try:
+        uplink = ReportUplink(args.config)
+    except Exception as exc:  # noqa: BLE001 -- config unreadable must be loud, and key-free
+        print("UPLINK_RESULT=ABORT reason=config_unreadable err=%s" % repr(exc)[:120])
+        return 2
+
+    print("UPLINK_CONFIG host=%s token_present=%d user_id_len=%d export_roots=%d "
+          "strategy_file=%s state=%s"
+          % (_host_of(uplink.base_url), 1 if uplink.token else 0, len(uplink.user_id or ""),
+             len(uplink.export_roots), "present" if uplink.strategy_file else "unset",
+             os.path.basename(uplink.state_path)))
+
+    if args.dry_run:
+        events = uplink.build_events()
+        kinds = {}
+        for ev in events:
+            kinds[str(ev.get("type"))] = kinds.get(str(ev.get("type")), 0) + 1
+        print("UPLINK_EVENTS n=%d kinds=%s"
+              % (len(events), ",".join("%s:%d" % kv for kv in sorted(kinds.items())) or "none"))
+        # 半文件/缺件的"为什么没发"必须同样可见，否则 0 事件分不清"确实没有"和"取不到"。
+        for skip in uplink.skips[-5:]:
+            print("UPLINK_SKIP kind=%s reason=%s" % (skip.get("kind"), skip.get("reason")))
+        print("UPLINK_RESULT=DRYRUN sent=0 dryrun=1")
+        return 0
+
+    if not args.once:
+        print("UPLINK_RESULT=ABORT reason=no_mode_given_use_once")
+        return 2
+    if not uplink.base_url or not uplink.token:
+        print("UPLINK_RESULT=ABORT reason=upstream_unconfigured host_present=%d token_present=%d"
+              % (1 if uplink.base_url else 0, 1 if uplink.token else 0))
+        return 2
+
+    report = uplink.run_once()
+    print("UPLINK_RESULT=OK sent=%d retry=%d dead=%d skipped_dupe=%d net_fail=%d drops=%d"
+          % (report.get("sent", 0), report.get("retry", 0), report.get("dead", 0),
+             report.get("skipped_dupe", 0), uplink.stats.get("net_fail", 0),
+             uplink.stats.get("dropped_queue_overflow", 0)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

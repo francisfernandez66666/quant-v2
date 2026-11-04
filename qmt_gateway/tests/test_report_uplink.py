@@ -17,6 +17,8 @@ TLS 校验那条由代码审读保证（urllib 默认工厂，全模块无 unver
 import contextlib
 import io
 import json
+import tempfile
+import shutil
 import logging
 import os
 import sys
@@ -394,6 +396,80 @@ class TestStubServerEndToEnd(unittest.TestCase):
         self.assertIn("positions", types)
         self.assertIn("account", types)
         self.assertIn("heartbeat", types)
+
+
+
+class CommandLine(unittest.TestCase):
+    """CLI 入口的用例（2026-11-04 补）。
+
+    这一条腿写出来之后**没有任何调用点**：没有 CLI、没有 cron、没有执行器接线。
+    一条只能被 import 的上行腿，在今晚的家用机测试里等于没有——所以入口和它的
+    三条边界必须一起有测试：不发一个字节、不写状态、不泄一把钥匙。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="uplink-cli-")
+        self.fx = _Fixture(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = up.main(argv)
+        return rc, buf.getvalue()
+
+    def test_dry_run_builds_events_and_sends_nothing(self):
+        rc, out = self._run(["--config", self.fx.config_path, "--once", "--dry-run"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("UPLINK_RESULT=DRYRUN sent=0 dryrun=1", out)
+        self.assertIn("UPLINK_EVENTS n=", out)
+        self.assertNotIn("kinds=none", out, "夹具里明明有持仓/委托/资产导出，事件数不该为零")
+
+    def test_dry_run_writes_no_state_file(self):
+        """不推进幂等基线：预览一轮之后，真跑那一轮仍然要把这批事件发出去。
+
+        这条要是反了，"先看一眼"就会把当天读数吃掉——晚上预览一次、早上上线就什么都不发。
+        """
+        self._run(["--config", self.fx.config_path, "--once", "--dry-run"])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "uplink_state.json")),
+                         "dry-run 写了状态文件：它会把自己看过的读数记成已上报")
+
+    def test_cli_never_prints_the_token(self):
+        rc, out = self._run(["--config", self.fx.config_path, "--once", "--dry-run"])
+        self.assertNotIn(FAKE_TOKEN, out)
+        self.assertNotIn(FAKE_TOKEN.replace("-", ""), out)
+        self.assertIn("token_present=1", out, "只许报'有没有'，不许报'是什么'")
+
+    def test_missing_exports_are_said_as_missing_not_as_empty(self):
+        """missing != empty 的可读版本：缺件那一类必须点名，不能折成 0 事件。"""
+        fx = _Fixture(tempfile.mkdtemp(prefix="uplink-cli-empty-"), with_positions=False)
+        try:
+            rc, out = self._run(["--config", fx.config_path, "--once", "--dry-run"])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("UPLINK_SKIP kind=positions reason=file_not_found", out)
+        finally:
+            shutil.rmtree(fx.tmp, ignore_errors=True)
+
+    def test_refuses_to_run_without_a_mode(self):
+        """没给 --once/--dry-run 就拒跑：默认动作必须是"什么都不做"，不是"默默上一轮"。"""
+        rc, out = self._run(["--config", self.fx.config_path])
+        self.assertEqual(rc, 2)
+        self.assertIn("reason=no_mode_given_use_once", out)
+
+    def test_unconfigured_upstream_aborts_before_any_send(self):
+        tmp = tempfile.mkdtemp(prefix="uplink-cli-nocfg-")
+        cfg = os.path.join(tmp, "config.xt.json")
+        with open(cfg, "w", encoding="utf-8") as fh:
+            json.dump({"token": FAKE_TOKEN}, fh)  # 没有 report_url
+        try:
+            rc, out = self._run(["--config", cfg, "--once"])
+            self.assertEqual(rc, 2, out)
+            self.assertIn("reason=upstream_unconfigured", out)
+            self.assertIn("host_present=0", out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
