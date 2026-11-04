@@ -20475,6 +20475,15 @@ grep_q "test_cli_never_prints_the_token" CLI_T F || fail173 "上行腿少了这�
 grep_q "test_refuses_to_run_without_a_mode" CLI_T F || fail173 "上行腿少了这条：不给模式的默认动作必须是什么都不做，不是默默上一轮"
 UNI_T=$(cat qmt_gateway/tests/test_derive_carrier_params.py || true)
 grep_q "test_preview_writes_nothing" UNI_T F || fail173 "观察宇宙少了这条：preview 写参数文件＝工具替 owner 做了决定"
+# 交易通道缺省必须**关着**：执行器的下单腿走 xtquant.xttrader＝券商 9 月已关的独立交易通道，
+# 而 10-29 的实录是"每次 connect 占一个客户端共享内存 writer 槽、槽满即崩"。
+# 所以这里既锁代码（main 不许无条件构造 XtBroker），也锁用例（拒绝必须被断言过）。
+grep_q "broker = build_broker(params, args.account)" LEXT F || fail173 "执行器 main 又无条件构造 XtBroker：缺省档就会去 connect 那条已关通道"
+grep_q 'if params.get("xt_channel_enable"):' LEXT F || fail173 "缺省安全档的开关判据不见了（键缺省＝关，显式 true 才交回 XtBroker）"
+[ -s "$LEX" ] && ! grep -nE '^[[:space:]]*broker = XtBroker\(' "$LEX" >/dev/null 2>&1 || \
+	fail173 "执行器里重新出现裸的 broker = XtBroker( —— 那道缺省拒绝被绕开了"
+CH_T=$(cat qmt_gateway/tests/test_local_executor.py || true)
+grep_q "test_once_round_refuses_without_ever_trying_to_connect" CH_T F || fail173 "缺省档的干净拒绝没被断言过（要断言的是从未 connect，不是连了没成）"
 [ -s web/src/utils/liveBrain.js ] || fail173 "前端档位文案表不在册（0/1 不渲染、2/3/4 三句不同处置方向）"
 [ -s web/src/components/ExternalBrainTag.jsx ] || fail173 "前端外脑档组件不在册（读面有数、屏上看不见＝等于没有）"
 

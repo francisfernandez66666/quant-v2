@@ -1015,6 +1015,69 @@ class BrokerUnavailable(Exception):
     """The broker channel cannot be used right now."""
 
 
+class DisabledBroker(object):
+    """The broker face used when the xt trading channel is NOT permitted -- which is the default.
+
+    Why the default refuses to trade (2026-11-04, before anyone runs this on a real account):
+      * this file's execution layer places orders through `xtquant.xttrader` -- that is the
+        INDEPENDENT TRADING channel (miniqmt). The broker closed it in September 2026 and
+        answered us in writing: "independent trading belongs to miniqmt, closed since September";
+      * 2026-10-29's postmortem is the physical reason to keep it off rather than "try once":
+        every `connect()` while the client is in queued state takes a writer slot in the
+        client's shared memory, slots filled up, and the QMT client crashed every 3-6 minutes
+        across 713 consecutive failures. A loop that "just checks whether it can connect"
+        is therefore not a read-only probe -- it is an attack on our own trading terminal;
+      * after 2026-11-05 the only legal automated order path we are allowed to build is the
+        QMT BUILT-IN strategy (this repo's qmt_internal_strategy.py, placing through
+        passorder inside the sandbox). The local process computes and delivers readings;
+        it does not place.
+
+    So every face of this object refuses, and it refuses with a reason that can be grepped.
+    Refusing is also what keeps `--once` safe to run on a box with a funded account: the
+    round fail-closes at "the broker order table is unreadable" and never reaches an order.
+    """
+
+    reason = "xt_channel_disabled"
+
+    def connect(self):
+        return False, self.reason
+
+    def is_connected(self):
+        return False
+
+    def status(self):
+        return "disabled"
+
+    def orders_today(self):
+        raise BrokerUnavailable(self.reason)
+
+    def positions_today(self):
+        raise BrokerUnavailable(self.reason)
+
+    def asset(self):
+        raise BrokerUnavailable(self.reason)
+
+    def place_order(self, signal, remark):
+        # Returns the refusal instead of raising: callers treat (ok=False, "", reason)
+        # as "nothing was sent", which is exactly what happened.
+        return False, "", self.reason
+
+    def cancel_order(self, order_id):
+        return False, self.reason
+
+
+def build_broker(params, account):
+    """Choose the broker face from the parameter table -- the closed channel is OFF by default.
+
+    `xt_channel_enable` is a pointer-style opt-in: the key being absent means the safe
+    behaviour (no trading channel at all). That is deliberate: a fresh box pulled out of the
+    friend package must not place orders just because nobody edited a file.
+    """
+    if params.get("xt_channel_enable"):
+        return XtBroker(account)
+    return DisabledBroker()
+
+
 def counter_status_vocab():
     """Counter status vocabulary + terminal set: IMPORTED, never copied here.
 
@@ -1697,7 +1760,14 @@ def main(argv=None):
         LOG.error("[executor] no broker account configured (--account / QMT_ACCOUNT)")
         return 2
     data = XtDataSource()
-    broker = XtBroker(args.account)
+    broker = build_broker(params, args.account)
+    if isinstance(broker, DisabledBroker):
+        # Say it once at start-up, in the same words the round will use later: without this
+        # line a quiet operator reads "placed=0" as "the strategy found nothing today".
+        LOG.warning("[executor] xt trading channel is DISABLED (params.xt_channel_enable is "
+                    "not set): this process computes and delivers readings only -- the legal "
+                    "order path after 2026-11-05 is the QMT built-in strategy (passorder inside "
+                    "the sandbox), not xtquant.xttrader")
     ok, reason = broker.connect()
     if not ok:
         LOG.error("[executor] broker not available: %s", reason)

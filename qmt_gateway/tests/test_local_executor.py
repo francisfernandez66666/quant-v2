@@ -50,6 +50,7 @@ import os
 import re
 import sys
 import tempfile
+import subprocess
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -204,6 +205,62 @@ class TestRuleLayerIsPure(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # (3) the risk caps are ANDed
 # ---------------------------------------------------------------------------
+
+class TestTradingChannelIsClosedByDefault(unittest.TestCase):
+    """11-04 定的一条：**本地执行器缺省不许碰交易通道**。
+
+    起因（这条不是防御性编程，是照着自己的事故记录改的）：
+      * `XtBroker` 走的是 `xtquant.xttrader`，也就是券商答复里"独立交易属于 miniqmt，
+        9 月份就关闭了"的那条通道；
+      * 10-29 的实录：queued 无心跳时每 60s 重试直连，每次 connect() 在客户端共享内存里
+        占一个 writer 槽，槽满即把 QMT 客户端拖崩（713 连败、3~6 分钟一崩）。
+        所以"试着连一下看看通不通"不是只读探测，是对着自己正在交易的终端打；
+      * 11-05 之后合法的自动下单只剩 QMT 内置策略（沙箱内 passorder）。
+        本地那一份的职责是**算 + 投递读数**，不是下单。
+    """
+
+    def test_default_params_give_the_refusing_face(self):
+        broker = lex.build_broker({}, "8-测试账号")
+        self.assertIsInstance(broker, lex.DisabledBroker)
+        self.assertEqual(broker.status(), "disabled")
+        ok, reason = broker.connect()
+        self.assertFalse(ok)
+        self.assertEqual(reason, "xt_channel_disabled")
+
+    def test_refusing_face_refuses_every_face(self):
+        broker = lex.DisabledBroker()
+        self.assertEqual(broker.place_order({"side": "buy", "symbol": "600000.SH",
+                                             "qty": 100, "price": 10.0}, "PBTEST"),
+                         (False, "", "xt_channel_disabled"))
+        self.assertEqual(broker.cancel_order("7701"), (False, "xt_channel_disabled"))
+        for getter in ("orders_today", "positions_today", "asset"):
+            with self.assertRaises(lex.BrokerUnavailable):
+                getattr(broker, getter)()
+
+    def test_opt_in_key_opens_the_real_face(self):
+        """键缺省＝关；显式写 true 才交回 XtBroker（开关方向必须是安全侧）。"""
+        broker = lex.build_broker({"xt_channel_enable": True}, "8-测试账号")
+        self.assertIsInstance(broker, lex.XtBroker)
+
+    def test_once_round_refuses_without_ever_trying_to_connect(self):
+        """端到端：缺省档跑 `--once` 必须是**干净拒绝**，且从未尝试打开交易会话。
+
+        区分的不是"成没成"而是"有没有去连"：真去 connect() 才会走 10-29 那条崩法
+        （每次 connect 占一个客户端共享内存 writer 槽）。所以这里断言的是
+        `broker connect failed`（XtBroker 试过之后才会打的那行）**不出现**。
+        """
+        proc = subprocess.run(
+            [sys.executable, os.path.join(GW_DIR, "local_executor.py"),
+             "--once", "--account", "8-CLI-TEST",
+             "--state-db", os.path.join(tempfile.gettempdir(), "exec_cli_test.db")],
+            cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        text = proc.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(proc.returncode, 0, text)
+        self.assertIn("broker not available: xt_channel_disabled", text)
+        self.assertNotIn("broker connect failed", text,
+                         "缺省档真的去 connect 了：那正是 10-29 拖崩 QMT 客户端的那条路")
+        self.assertIn("xt trading channel is DISABLED", text,
+                      "拒绝之前必须先把原因说出来：否则 placed=0 会被读成今天没有信号")
 
 class TestRiskCapsAreAnded(unittest.TestCase):
     """Cash AND per-order cap AND daily cap must all allow the order.
