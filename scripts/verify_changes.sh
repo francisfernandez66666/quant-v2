@@ -20463,9 +20463,18 @@ QUIET_T=$(cat internal/metrics/external_brain_quiet_test.go || true)
 for name in TestQuietRulesFirstPushStillGoesOut TestQuietRulesRepeatFoldsIntoDaily TestQuietRulesRecoveryAlwaysPasses TestQuietRulesDoNotMuteOthers TestQuietAlertRulesRoundTrip; do
 	grep_q "func $name" QUIET_T F || fail173 "静默域用例缺失：${name}"
 done
-for f in test_local_executor.py test_executor_cancel_leg.py test_windows_four_source.py test_broker_reads.py test_internal_strategy_sandbox.py test_update_qmt_strategy.py; do
+for f in test_local_executor.py test_executor_cancel_leg.py test_windows_four_source.py test_broker_reads.py test_internal_strategy_sandbox.py test_update_qmt_strategy.py test_report_uplink.py test_derive_carrier_params.py; do
 	[ -s "qmt_gateway/tests/$f" ] || fail173 "网关用例文件不在册：$f"
 done
+# 上行腿与单点导出各自有一条"只能跑起来才看得见"的腿，锚点在这里钉住：
+#   UPLINK —— 这一跳今天才补上命令行入口（此前只能被 import＝那台机器上等于没有）；
+#   DERIVE —— 观察宇宙的默认必须是**不落盘**（把自选池烘进 params 是 owner 的决定）。
+CLI_T=$(cat qmt_gateway/tests/test_report_uplink.py || true)
+grep_q "test_dry_run_writes_no_state_file" CLI_T F || fail173 "上行腿少了这条：预览一轮如果把状态写了，当天读数就被'看一眼'吃掉"
+grep_q "test_cli_never_prints_the_token" CLI_T F || fail173 "上行腿少了这把钥匙锁：CLI 只许报 token_present=1，不许报是什么"
+grep_q "test_refuses_to_run_without_a_mode" CLI_T F || fail173 "上行腿少了这条：不给模式的默认动作必须是什么都不做，不是默默上一轮"
+UNI_T=$(cat qmt_gateway/tests/test_derive_carrier_params.py || true)
+grep_q "test_preview_writes_nothing" UNI_T F || fail173 "观察宇宙少了这条：preview 写参数文件＝工具替 owner 做了决定"
 [ -s web/src/utils/liveBrain.js ] || fail173 "前端档位文案表不在册（0/1 不渲染、2/3/4 三句不同处置方向）"
 [ -s web/src/components/ExternalBrainTag.jsx ] || fail173 "前端外脑档组件不在册（读面有数、屏上看不见＝等于没有）"
 
