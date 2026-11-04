@@ -100,10 +100,19 @@ func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem 
 		items, err := a.marketAPI.GetTonghuashunNewsPage(page, 20)
 		if err != nil {
 			log.Printf("[newsagent] 同花顺 page %d err: %v", page, err)
+			// §B6 第一页就失败才算"这一源本轮没取到"；后续页失败只算追回不完整（已取到的部分照记）。
+			// English: §B6 — only a first-page failure means the source was unreachable this round;
+			// later pages just truncate the catch-up, and what we did get is still recorded.
+			if page == 1 {
+				a.RecordSourceResult(SourceTHS, 0, err)
+			}
 			break
 		}
 		if len(items) == 0 {
 			break
+		}
+		if page == 1 {
+			a.RecordSourceResult(SourceTHS, len(items), nil)
 		}
 
 		// 页内去重：跳过本轮已见、或（非force时）已处理(seen)或已排队(pending)的标题
@@ -142,8 +151,10 @@ func (a *Agent) fetchSinaOnce(seen map[string]bool, force bool) []data.NewsItem 
 	items, err := a.marketAPI.GetSinaNews(20)
 	if err != nil {
 		log.Printf("[newsagent] 新浪 err: %v", err)
+		a.RecordSourceResult(SourceSina, 0, err) // §B6 逐源读数：失败也要留痕，否则"三源全坏"读不出来
 		return nil
 	}
+	a.RecordSourceResult(SourceSina, len(items), nil)
 	var fresh []data.NewsItem
 	for _, item := range items {
 		key := truncateStr(item.Title, 60)
@@ -163,8 +174,10 @@ func (a *Agent) fetchCLSOnce(seen map[string]bool, force bool) []data.NewsItem {
 	items, err := a.marketAPI.GetCLSNews(20)
 	if err != nil {
 		log.Printf("[newsagent] 财联社 err: %v", err)
+		a.RecordSourceResult(SourceCLS, 0, err) // §B6 逐源读数（同上：失败也是读数）
 		return nil
 	}
+	a.RecordSourceResult(SourceCLS, len(items), nil)
 	var fresh []data.NewsItem
 	for _, item := range items {
 		key := truncateStr(item.Title, 60)

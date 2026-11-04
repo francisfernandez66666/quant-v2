@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -32,6 +33,13 @@ type QMTClient struct {
 	timeout    time.Duration // 请求超时
 	retries    int           // 失败重试次数（幂等场景安全）
 	httpClient *http.Client  // HTTP 客户端
+
+	// §EXT-BRAIN-1104 桥心跳读数缓存（外脑模式档 3 的数据源）。
+	// 指针三态：nil＝「这版网关没发这个字段 / 还没探过」，**不许**拿零值冒充"桥已断"
+	// （§M2 未知不装新鲜、§0925EVE-W3-E 同族口径）。只有 healthOnce 成功解码才推进。
+	// English: cached queued_connected with a real unknown state; only healthOnce writes it.
+	mu     sync.RWMutex
+	queued *bool
 }
 
 // NewQMTClient 创建网关客户端。
@@ -361,14 +369,42 @@ func (c *QMTClient) healthOnce() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	var out struct {
-		OK              bool   `json:"ok"`
-		BrokerConnected bool   `json:"broker_connected"`
+		OK              bool `json:"ok"`
+		BrokerConnected bool `json:"broker_connected"`
+		// §EXT-BRAIN-1104：queued_connected＝"QMT 客户端那根桥（内置策略心跳）还连着"。
+		// 11-05 券商断的是内置策略的文件读写 ⇒ 网关进程照常活、/health 仍 200、
+		// broker_connected 仍可能为真，**只有这个字段会掉假**，所以它是"桥还在不在"的唯一读数。
+		// 指针三态：老版网关不带这个键＝nil＝读数未知，绝不当成"桥已断"。
+		QueuedConnected *bool  `json:"queued_connected"`
 		TS              string `json:"ts"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/health", nil, &out); err != nil {
 		return false, err
 	}
+	// 只在真的解码成功时推进缓存；请求失败的分支保持上一份读数不动。
+	if out.QueuedConnected != nil {
+		v := *out.QueuedConnected
+		c.mu.Lock()
+		c.queued = &v
+		c.mu.Unlock()
+	}
 	return out.OK && out.BrokerConnected, nil
+}
+
+// QueuedConnected 返回最近一次 /health 探测里的桥心跳读数（值, 是否已知）。
+// §EXT-BRAIN-1104：这是给 trading.Controller 的可选能力（queuedConnReader）——
+// 它跟着 Health() 那一次探测顺带取，不额外发请求（额外请求在断链时会变成又一轮噪音）。
+// known=false 有三种来源：还没探过 / 这版网关不发这个字段 / 探测一直失败——
+// 三种都不许被读成"桥已断"。
+//
+// English: the last queued_connected reading, with an explicit unknown state.
+func (c *QMTClient) QueuedConnected() (value bool, known bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.queued == nil {
+		return false, false
+	}
+	return *c.queued, true
 }
 
 // GatewayBrokerStatus 网关双路径状态（§QMT-DUAL）：active 通道 + xt/queued 各自在线态。

@@ -205,6 +205,40 @@ func (n *Notifier) alertChannelDown(title, reason string) {
 	n.fanoutLocal(Message{Level: LevelHigh, Title: "【自监控】" + title, Content: reason})
 }
 
+// AnnounceChannelDown §B6（2026-11-05 通知增强）对外复用的"宕机播报"入口：
+// 必推通道（网关/ntfy）全部短路时，业务侧**不另造**一套告警，直接走这里——
+// 内部就是 §C9 那条"用还活着的站内通道（WS/Webhook）把通道坏了这件事本身报出来"的逻辑，
+// 同一进程内按 day-once 留痕，不会因每条消息都触发而成刷屏。
+// English: §B6 — the exported reuse point of §C9's channel-down announcement: when the
+// must-push lane is fully tripped, callers report it through the surviving in-process
+// channels instead of inventing a second mechanism.
+func (n *Notifier) AnnounceChannelDown(title, reason string) {
+	if n == nil {
+		return
+	}
+	n.alertChannelDown(title, reason)
+}
+
+// PushLaneAlive §B6 必推通道是否在位：网关/ntfy/Webhook/站内 WS 至少一条可用。
+// 全灭时出站方需要"把没送到这件事说出来"，而不是静默丢弃——
+// 与 J0 零回包同族：取不到不等于没有。
+// English: §B6 — whether any push channel (gateway/ntfy/webhook/WS) is present; the caller
+// announces the outage when none is, instead of dropping the message silently.
+func (n *Notifier) PushLaneAlive() bool {
+	if n == nil {
+		return false
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.gateway != nil || n.ntfy != nil {
+		return true
+	}
+	if len(n.webhookURLs) > 0 {
+		return true
+	}
+	return len(n.wsClients) > 0
+}
+
 // SetGatewayMinLevel §M8 设置 Push 网关扇出的最低告警级别（LevelLow=全部触达手机，
 // LevelHigh=只有关键提醒触达）。English: sets the minimum level for M8's folded gateway fan-out.
 func (n *Notifier) SetGatewayMinLevel(lvl AlertLevel) {

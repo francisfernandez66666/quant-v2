@@ -879,6 +879,16 @@ func (s *Server) registerRoutes() {
 	// （handler 全按 userIDFor(r) 过滤，跨账号视图仍只有运营侧的 trading_admin 拿得到）。
 	s.mux.HandleFunc("GET /api/qmt/state", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTState))
 	s.mux.HandleFunc("GET /api/qmt/trades", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTTrades))
+	// §2.12（2026-11-04 外脑化 B1'）手动维护账：桥 11-05 断后持仓/可用资金不再由柜台自动上报，
+	// owner 在量仔里手工维护，量仔据此继续出信号卡。
+	// **账号级 authMiddleware，刻意不落严格位**（§PLAN_EXTERNAL_BRAIN_IMPL §2.12 原文「不落严格位」）：
+	// 这是"成员维护自己的声称值"，不是实盘动作也不是实盘账本；挂 quant_trade/trading_admin 才能录，
+	// 等于把"桥断了以后先把手上的票记进量仔"这条止血通道一起锁进实盘权限面。
+	// 三条边界（按 requestUserID 归属／不进任何"必须新鲜"硬闸／请求体 user_id 一律不信）
+	// 与"为什么不给 real_positions 加 source 列"的论证都在 internal/server/manual_book.go 文件头，
+	// 行为锁见 manual_book_test.go。
+	// §115/契约台账牵连：路由 +1、台账 +1 行、前端调用 +1（web/src/api/index.js: saveManualBook）。
+	s.mux.HandleFunc("POST /api/qmt/manual-positions", s.authMiddleware(s.handleManualPositionsPost))
 	// §U-2 当日委托列表（撤单 UI 的 order_id 来源）
 	s.mux.HandleFunc("GET /api/qmt/orders", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTOrders))
 	// §R4-1 kill-switch 与手动撤单：资损级动作，但**作用域只有当前登录账号**

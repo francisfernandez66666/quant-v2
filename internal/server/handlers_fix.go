@@ -126,6 +126,15 @@ type fixSignal struct {
 	// DepthFactors 盘口因子（买卖压力/封单量，免费五档 / Level-2 十档），供前端与战法展示使用
 	// English: order-book factors (bid/ask pressure & seal volumes; 5 levels free / 10 with Level-2)
 	DepthFactors *data.OrderBookFactors `json:"depth_factors,omitempty"`
+
+	// §2.12（2026-11-04 外脑化 B1'）信号卡：两个键都是 **additive**（既有字段语义一个字没改）。
+	//   · SignalID＝三通道（Web 弹窗 / 桌面通知 / 手机推送）共用的去重键，取引擎的 Signal.ID；
+	//   · Card＝装配好的可执行卡（八字段 + 缺字段点名 + 可执行判定），
+	//     口径与"股数从哪里来"在 signal_card.go 文件头，行为锁见 signal_card_test.go。
+	// 为什么要在这里就判好"缺不缺"：设备侧各算一遍，就会有一端把"缺股数"折成 0 股显示，
+	// 而 0 股在卡面上与"真的建议 0 股"长得一模一样（§M12-A 真 0 与不可不得同族）。
+	SignalID string      `json:"signal_id,omitempty"`
+	Card     *SignalCard `json:"card,omitempty"`
 }
 
 // scoreToRemindLevel 将总分转换为前端提醒级别。
@@ -199,6 +208,10 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			D1Event:      s.D1Event,
 			DepthFactors: s.DepthFactors,
 			GeneratedAt:  signalGeneratedAtText(s.GeneratedAt),
+			// §2.12 去重键：引擎的信号 ID 此前在这条边界上被整段丢掉（与 §0929DIM
+			// "理由文本在战法→信号边界被丢弃"同族）。三通道去重必须有它，没有就只能自己造键，
+			// 而"设备侧自己造键"的表现是同一条信号在页面与手机上各弹一次。
+			SignalID: s.ID,
 		}
 		out = append(out, fs)
 	}
@@ -332,6 +345,10 @@ func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
 			out[i].QuoteAt = time.Now().Format("2006-01-02 15:04:05")
 		}
 	}
+	// §2.12（2026-11-04 外脑化 B1'）信号卡：逐条挂上"可执行卡片"（八字段 + 缺字段点名）。
+	// 在**这里**装配而不是让前端各算一遍，是因为"缺什么"必须是后端一处判定：
+	// 前端各端自己判会把"缺股数"折成 0 股，而 0 股在卡面上与"真建议 0 股"长得一模一样。
+	s.attachSignalCards(requestUserID(r), out)
 	writeJSON(w, 200, out)
 }
 
@@ -822,6 +839,21 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 	// 想拿全量必须**明写** page_size，不能再靠"不传参"默认拿到。
 	// English: default 50 (was 0 = no paging); callers that truly need everything must say page_size explicitly.
 	page, size := parsePageParams(r, 50, 5000)
+	// §B6（2026-11-05 通知增强）：消息中心「新闻」tab 走**同一个读接口**加 query 参数分流，
+	// 刻意不开新路由——契约台账与 §115 五组派生计数因此一个字都不动（施工图 §5A.4 的"零新路由"）。
+	// 缺省（不带 kind）＝既有行为减去新闻行：利多非持仓不进信号流，这正是它不去的地方。
+	// English: §B6 — the news tab rides a query parameter on the existing route (no new route, so the
+	// contract ledger and §115 counts stay untouched); the default view excludes news rows.
+	wantKind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	// keepKind 分流判据只有一处：?kind=news 只要新闻行、不带参只要非新闻行、
+	// 其它显式值只要该种类（不给"kind=all"这种能一次拿两类的口子——两类混排正是本次要消除的）。
+	// English: one predicate: news-only when kind=news, news-free by default, exact-kind otherwise.
+	keepKind := func(k string) bool {
+		if wantKind == "" {
+			return k != data.KindNews
+		}
+		return k == wantKind
+	}
 	writePaged := func(out []map[string]interface{}) {
 		total := len(out)
 		start, end, _ := pageBounds(total, page, size)
@@ -841,6 +873,9 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]map[string]interface{}, 0, len(msgs))
 		for _, m := range msgs {
+			if !keepKind(m.Kind) {
+				continue // §B6 新闻行与信号流分流，互不混排
+			}
 			name := m.Name
 			// 消息中心名称为空或等于代码时，用行情权威名回填（一次性迁移，持久化到存储）
 			if name == "" || name == m.Code {
@@ -866,6 +901,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 				"title":        m.Title,
 				"body":         m.Body,
 				"direction":    m.Direction,
+				"kind":         m.Kind, // §B6 种类（""=既有消息；"news"=当日新闻行）
 			})
 		}
 		// §FIX-0921 ctrl 路径同样按 generated_at 倒序（此前 ctrl 路径完全无排序，
@@ -879,6 +915,15 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 
 	dash := s.dashFor(requestUserID(r))
 	if dash == nil {
+		writeJSON(w, 200, []map[string]interface{}{})
+		return
+	}
+	// §B6 兜底这条腿（看板告警信号 + 持仓日志）产的全部是 kind="" 的既有消息：
+	// 显式带 kind（含 ?kind=news）时如实回空集，而不是把非新闻行冒充成新闻行。
+	// English: §B6 — the fallback leg only carries classic messages, so an explicit kind query
+	// returns an honest empty set instead of dressing up signal rows as news rows.
+	if wantKind != "" {
+		setPaginationHeaders(w, 0, page, size)
 		writeJSON(w, 200, []map[string]interface{}{})
 		return
 	}
@@ -903,6 +948,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 			"title":        fmt.Sprintf("%s %s", lvl, a.Code),
 			"body":         a.Reason,
 			"direction":    a.Direction,
+			"kind":         "", // §B6 兜底路径不产新闻行（新闻行只活在消息中心存储里）
 		}
 		out = append(out, item)
 	}

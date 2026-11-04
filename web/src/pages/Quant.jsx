@@ -34,6 +34,7 @@ import { fmtCNY2 } from '../utils'
 import { verdictDisplay, sizingDisplay } from './quantVerdicts.js'
 import FundsOverviewCard from '../components/FundsOverviewCard.jsx' // §FUNDS-TODAY 信号仓/T仓资金一帧
 import TRoundsCard from '../components/TRoundsCard.jsx' // §W-04 T 仓子页：T 回合明细（实盘账本）
+import ExternalBrainTag from '../components/ExternalBrainTag.jsx' // §EXT-BRAIN-1104 外脑档位（还有没有手）
 import { useSearchParams } from 'react-router-dom' // §W-04 子页签写进 URL，刷新不丢、可分享
 import { canStrict, canLiveTrading, LIVE_TRAADING_PERMS } from '../utils/perm.js'
 
@@ -1422,6 +1423,11 @@ export default function Quant() {
         {row('实盘链路', <>
           {state.enabled ? <Tag theme="success">已启用</Tag> : <Tag theme="default">未启用</Tag>}
           <span style={{ fontSize: 12, color: 'var(--app-text-2)', marginLeft: 8 }}>模式：{modeLabel}</span>
+          {/* §EXT-BRAIN-1104：外脑档位贴在实盘链路行（紧跟上面的启用态与下面的熔断行）。
+              它和熔断是两件事——熔断=钱的安全闸，外脑=引擎还有没有手——但值班要能一眼分开，
+              所以不复用 breaker 那句。档 0/1（没配网关 / 通道正常）时组件返回 null，
+              健康态一行字都不多，今天这条行的渲染形状不变。 */}
+          <span style={{ marginLeft: 8 }}><ExternalBrainTag code={state.external_brain} /></span>
         </>)}
         {/* 网关地址行：广州单机网关 URL */}
         {row('网关地址', state.gateway_url || '—')}

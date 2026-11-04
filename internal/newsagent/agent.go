@@ -43,6 +43,8 @@ type Agent struct {
 	// English: IPO-boot analysis cache: trading-day:code -> analyzed
 	bootCacheDay string // bootCache 对应的交易日 YYYYMMDD
 	// English: the trading day YYYYMMDD that bootCache corresponds to
+	sources *sourceLedger // §B6 逐源取数当日账（三源全失败必须出通道告警的读数源）
+	// English: §B6 the day's per-source fetch ledger — the reading behind the "all sources down" alert
 
 	// hotMu §R3-8 P1-K 可变字段锁：llmClient/minScore 由 HTTP 热更线程写（SetLLMClient/
 	// SetMinScore）、异步 Run goroutine 读；bootCache 由手动 ReanalyzeNews 与异步 Run 并发读写。
@@ -105,6 +107,8 @@ func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCl
 		historyPath: filepath.Join(dataDir, "news_event_history.jsonl"),
 		minScore:    0.25, // 默认最低落盘分 0.25（前端"显示全部"可降为 0）
 		// English: default minimum persist score 0.25 (the frontend "show all" toggle can lower it to 0)
+		sources: newSourceLedger(), // §B6 逐源读数账（内存态，跨交易日自动清）
+		// English: §B6 the per-source reading ledger (in-memory, cleared on the trading-day key)
 	}
 }
 

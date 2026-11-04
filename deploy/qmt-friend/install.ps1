@@ -301,12 +301,39 @@ if ($Apply) {
     Log "STEP9_VERIFY apply=0"
 }
 
+# —— STEP 9B：装本地执行器（§FRIEND-LOCAL 批 7）——
+# 券商 2026-11-05 起：QMT 内置策略禁本地文件 I/O 与外部网络（(A)），QMT 终端禁跑
+# 公有云/虚拟机（(B)）。⇒ 运算与执行必须跑在 QMT 之外的**独立普通 Python 进程**
+# （独立 venv，不受 (A) 约束）。这一段装的就是那条腿。
+#
+# 口径（复用，不另起炉灶）：
+#   * 账号/口令**不问这里**：STEP7 的 enroll.ps1 已经用 /api/auth/login 装填过，
+#     config.xt.json 的四元自洽也由 ensure_friend_gateway_config.ps1 落好了；
+#     本步只**读** config.xt.json 取账号（不新增任何服务端路由）。
+#   * 缺省只预览：install_local_executor.ps1 自己缺省也是预览，这里再传 -Apply。
+#   * 判据不在本文件里另造：版本指纹与哈希由产物自带，版本回读由
+#     scripts/update_local_executor.ps1 的三段自证负责。
+$localExecScript = Join-Path $here "install_local_executor.ps1"
+if (-not (Test-Path $localExecScript)) { Abort 9 "local_executor_installer_absent" }
+if ($Apply) {
+    $lout = (& $localExecScript -GatewayDir $gwDst -PythonExe $PythonExe -QmtRoot $QmtRoot -Apply 2>&1) | Out-String
+    Log ("STEP9B_LOCALEXEC begin`n" + $lout.TrimEnd() + "`nSTEP9B_LOCALEXEC end")
+    if ($lout -notmatch "LOCALEXEC_RESULT=OK") {
+        # 装不上执行器＝运算那条腿没有 ⇒ 这台机器现在只能收单不能算。
+        # 不留半装态：后面的"自检全绿"会骗人。
+        Abort 9 "local_executor_install_failed"
+    }
+} else {
+    Log "STEP9B_LOCALEXEC apply=0 would_run=install_local_executor.ps1"
+}
+
 # —— STEP 10：收尾（人话清单，别让人以为双击完就全好了）——
 Log ("STEP10_DONE commit=" + $manifest.build_commit + " contract_fp=" + $manifest.contract_fp)
 if ($Apply) {
     Log "MANUAL 1) QMT 客户端里新建/挂上模型策略（文件已放 python\新建策略文件.py），交易日 08:40 由任务拉起"
     Log "MANUAL 2) 收盘 15:30 的关闭门会自己判能不能关 QMT；判不过会留 CLOSE_GATE_HELD 原因，别手工硬关"
     Log "MANUAL 3) 换机/重装/卸载前先跑 export_ledger.bat 导出当日账本（§B-N9/N11）"
+    Log "MANUAL 4) 本地执行器已装在 C:\qmt\quant-trading-v2\local_executor（独立 venv）；它的账在自己的 executor_state.db 里，卸载时**保留**"
     Log ("LEG_INSTALL=PASS commit=" + $manifest.build_commit + " contract_fp=" + $manifest.contract_fp + " overlay=" + $wgState + " tunnel=" + $tunnel)
     exit 0
 }

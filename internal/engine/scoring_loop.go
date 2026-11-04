@@ -1404,14 +1404,35 @@ func (e *Engine) refreshStalenessGauges() {
 
 	uplinkAge := int64(0)
 	// QMTController/Snapshot 各自取锁，且本函数在 scoreCycle 顶部调用时 e.mu 已释放，无重入死锁。
+	// §EXT-BRAIN-1104：外脑档位与上行停摆**同一次快照**取，避免两处各取一次锁、各判一套。
+	externalBrain := int64(0)
 	if c := e.QMTController(); c != nil {
-		if snap := c.Snapshot(); snap.Enabled && !snap.LastReportAt.IsZero() {
-			if s := int64(time.Since(snap.LastReportAt).Seconds()); s > 0 {
-				uplinkAge = s
+		if snap := c.Snapshot(); snap.Enabled {
+			externalBrain = snap.ExternalBrain
+			if !snap.LastReportAt.IsZero() {
+				if s := int64(time.Since(snap.LastReportAt).Seconds()); s > 0 {
+					uplinkAge = s
+				}
 			}
 		}
 	}
 	metrics.SetGauge("uplink_staleness_sec", uplinkAge)
+	// 外脑档位只进读数（Prometheus 行 + /admin/status），**不进熔断判定、不动健康线**：
+	// 行情可用性/通道状态与"能不能下单"在本仓一直是硬隔离的两条线（§SUBSCRIPTION 同取向）。
+	// English: the tier is observability only — never an input to the breaker or the health line.
+	metrics.SetGauge("external_brain_state", externalBrain)
+	// §EXT-BRAIN-1104 降噪：档 3（通道断）/档 4（显式影子态）时把**纯通道派生**的两条规则
+	// 放进静默域（首推照发、重复转日汇总），否则断一整天＝每条最多 48 推，
+	// 一周后真告警被训练成噪音。
+	// signal_zero_in_session 刻意**不**静默：它的成因是扫描/行情/库断了，与券商通道无关，
+	// 桥断了它照样该响。档 2（读不到柜台）同样不静默：通道还通，只是读数旧。
+	// English: only channel-derived rules fold when the channel is provably down; the
+	// zero-signal rule keeps firing because its cause is unrelated to the broker link.
+	if externalBrain >= int64(trading.ExternalBrainChannelDown) {
+		metrics.QuietAlertRules([]string{"uplink_stale", "order_fail_rate"})
+	} else {
+		metrics.QuietAlertRules(nil)
+	}
 
 	// §DEADGAUGE（2026-09-23 傍晚批收尾）：LLM 密钥池冷却只数喂给规则 llm_cooldown（p2，阈值 >2）。
 	// 该规则 09-15 注册至今没有任何赋值点 = 永不触发（audit N-1 死规则同族第三例）。冷却态取客户端

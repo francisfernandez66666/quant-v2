@@ -971,9 +971,38 @@ export async function fetchHoldings() {
 
 /** 实盘（AUTO_TRADING_PLAN M1）：真实持仓（来自 QMT 网关回报的 real_positions） */
 /** Live trading (AUTO_TRADING_PLAN M1): real holdings fed by the QMT gateway reports */
-// 对应 GET /api/positions/real，返回 { positions:[...], enabled, tripped, mode }
+// 对应 GET /api/positions/real，返回 { positions:[...], enabled, tripped, mode, manual:{...} }
+// §2.12（2026-11-04）：多出一个 **additive** 的 `manual` 键（手动维护账，含
+// {present, source:'manual', positions, account, asof, note:"手动维护，更新于 …"}）。
+// positions / account 两个既有键的语义一个字没动——手动行**不**并进柜台行里，
+// 否则这张表上任何"positions 非空 ⇒ 有仓"的判据都会把手敲当成证据。
 export async function fetchRealPositions() {
   return request('/api/positions/real')
+}
+
+/** §2.12 手动维护账：桥断后由人手工录持仓与可用资金（账号级，非实盘下单通道） */
+/** §2.12 manual book: hand-maintained positions / available cash (account-level, NOT an order path) */
+// 对应 POST /api/qmt/manual-positions，body = {
+//   positions: [{ ts_code, qty, cost_price? }, …] | 省略表示"这次不动持仓",
+//   available_cash: number | 省略表示"这次不动资金",
+//   total_asset?: number（必须与 available_cash 同批）,
+//   asof?: "YYYY-MM-DD HH:MM:SS"（缺省由服务端取当前时刻）
+// }
+// 三条调用侧必须知道的边界（都在后端 internal/server/manual_book.go 文件头）：
+//   · **全量** upsert：positions 传空数组＝清仓，所以"只想改资金"时必须**整个键不带**；
+//     这是本封装层唯一能替调用方拦住"一次误清空持仓"的地方，故在下面显式判一次。
+//   · 归属只认登录态：body 里带 user_id 不会被采信。
+//   · 这份读数是"用户声称"，不进任何"必须新鲜"的硬闸（§M12-A / 风控闸 / VWAP 过滤照旧 fail-close）。
+export async function saveManualBook(body) {
+  const b = { ...(body || {}) }
+  if (b.positions !== undefined && b.positions !== null && !Array.isArray(b.positions)) {
+    throw new Error('positions 必须是数组（或整个不带）：§2.12 手动账是全量语义')
+  }
+  if (b.positions === undefined && b.available_cash === undefined) {
+    // 两个都不带＝一次什么都没改的提交；后端会 400，这里就地拦住不发出去
+    throw new Error('positions 与 available_cash 至少带一项（全量 upsert 不接受空提交）')
+  }
+  return request('/api/qmt/manual-positions', { method: 'POST', data: b })
 }
 
 /** 实盘：持仓处理建议（加仓/减仓/止盈/止损） */
@@ -1007,6 +1036,8 @@ export async function executeRealAction(data) {
 /** Live: connectivity snapshot (downlink probe latency / uplink report freshness / breaker) */
 // 对应 GET /api/qmt/state，返回 { enabled, mode, tripped, trip_reason, trip_at, gateway_url,
 //   last_probe_at, last_probe_ok, last_latency_ms, last_report_at, last_report_kind }
+// §EXT-BRAIN-1104 另带 external_brain（档位数字 0-4）与 external_brain_reason（给人看的一句话）：
+// 前端只按数字分形（判档与文案的唯一真源在 utils/liveBrain.js），不解析那句 reason。
 export async function fetchQMTState() {
   return request('/api/qmt/state')
 }

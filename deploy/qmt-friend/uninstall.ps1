@@ -7,9 +7,11 @@
 # 前置硬门槛（B-N11）：必须先 export_ledger.ps1 成功；导出失败（库坏/撕裂/重名）一律拒绝继续。
 param(
     [string]$GatewayDir  = "C:\qmt\quant-trading-v2\qmt_gateway",
+    [string]$ExecutorDir = "C:\qmt\quant-trading-v2\local_executor",
     [string]$PythonExe   = "C:\Python312\python.exe",
     [string]$Uid         = "",
     [string]$OutDir      = "$env:USERPROFILE\Desktop",
+    [string]$ExecTask    = "QMTF-Exec-Ensure",
     [switch]$PurgeLedger,
     [string]$Confirm     = "",
     [switch]$Apply
@@ -30,13 +32,41 @@ $today = (Get-Date -Format "yyyyMMdd")
 if ($LASTEXITCODE -ne 0) { Abort ("export_failed_exit_{0}" -f $LASTEXITCODE) }
 
 if (-not $Apply) {
-    Write-Host "UNINSTALL_RESULT=DRYRUN would=stop_leg,delete_tasks,delete_config,keep_ledger"
+    Write-Host "UNINSTALL_RESULT=DRYRUN would=stop_leg,delete_tasks,delete_config,delete_local_executor,keep_ledger"
     exit 0
 }
 
 # —— 2) 停腿（先停腿再拆任务，顺序不能反：腿还活着时删任务会被重建）——
 & (Join-Path $here "stop_leg.ps1") -GatewayDir $GatewayDir -PythonExe $PythonExe
 if ($LASTEXITCODE -ne 0) { Abort ("stop_leg_failed_exit_{0}" -f $LASTEXITCODE) }
+
+# —— 2b) 停本地执行器（§FRIEND-LOCAL 批 7）——
+# 顺序与腿那条一致：先禁任务、再停进程。只按本机命令行匹配 local_executor，
+# 绝不碰 QMT 客户端（B-N5：只动本机，且不误伤别人的腿）。
+schtasks /Change /TN $ExecTask /DISABLE 2>$null | Out-Null
+$execProcs = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+             Where-Object { $_.CommandLine -and $_.CommandLine -match "local_executor" }
+foreach ($p in $execProcs) {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    Write-Host ("UNINSTALL step=executor_killed pid={0}" -f $p.ProcessId)
+}
+schtasks /Delete /TN $ExecTask /F 2>$null | Out-Null
+Write-Host "UNINSTALL step=executor_task_removed task=$ExecTask"
+
+# —— 2c) 删执行器目录里的**程序**，但**保留它的账与日志** ——
+# executor_state.db 是那条腿"今天下过什么"的唯一凭据，和网关的 data.db 同一个性质：
+# 删掉＝销毁证据（§B-N9/N11）。所以只删 venv/脚本/配置，账本与日志一律不动。
+if (Test-Path $ExecutorDir) {
+    foreach ($t in @(".venv", "local_executor.py", "local_executor_params.json",
+                     "executor.env", "run_local_executor.ps1")) {
+        $p = Join-Path $ExecutorDir $t
+        if (Test-Path $p) {
+            Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host ("DELETED file={0}" -f $t)
+        }
+    }
+    Write-Host "UNINSTALL step=executor_kept_ledger executor_state.db,executor.log"
+}
 
 # —— 3) 删四个计划任务（走 install_tasks 的卸载分支，任务名不在这儿抄第二份）——
 & (Join-Path $here "install_tasks.ps1") -Uninstall -Apply -GatewayDir $GatewayDir
@@ -62,4 +92,4 @@ if ($PurgeLedger) {
     Write-Host "UNINSTALL_LEDGER_PURGED=1"
 }
 
-Write-Host "UNINSTALL_RESULT=OK ledger_kept=$(if ($PurgeLedger) { 0 } else { 1 }) export_dir=$OutDir"
+Write-Host "UNINSTALL_RESULT=OK ledger_kept=$(if ($PurgeLedger) { 0 } else { 1 }) export_dir=$OutDir executor_ledger_kept=1"

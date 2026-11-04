@@ -55,11 +55,25 @@ done
 # ── 白名单：点名的源文件必须存在，缺一个就 exit 1（宁可不发包，也不发一份少个文件的包）──
 GW_FILES="gateway.py store.py handler.py broker.py ids.py outbox_admin.py quote_feed.py \
 close_gate.py leg_ops.py trading_calendar.py qmt_bridge.py qmt_bridge_strategy.py \
-config.bridge.example.json"
+config.bridge.example.json local_executor.py local_executor_params.json \
+qmt_internal_strategy.py"
 FRIEND_FILES="ensure_friend_gateway_config.ps1 watchdog.ps1 install_tasks.ps1 enroll.ps1 \
 export_ledger.ps1 stop_leg.ps1 uninstall.ps1 config.xt.friend.template.json \
-install.ps1 uninstall_entry.bat export_ledger.bat install_entry.bat SETUP.txt"
+install.ps1 uninstall_entry.bat export_ledger.bat install_entry.bat SETUP.txt \
+install_local_executor.ps1"
+# §FRIEND-LOCAL 批 7：本地执行器那条腿的构建器与更新器（源在 scripts/，落进 payload/tools/）。
+#   * scripts/build_local_executor.py   烘参 + 五道静态闸（产物落仓库外）
+#   * scripts/update_local_executor.ps1 备份→写入(SHA 三值自证)→版本回读 三段自证
+# 11-04 载体定稿后多两件：内置策略的投递脚本（写策略文件+重启客户端+版本回读）。
+SCRIPTS_FILES="build_local_executor.py update_local_executor.ps1 update_qmt_strategy.ps1"
 # 门禁 §171 盯这两个变量的条目数与内容；改白名单必须同批改那里。
+#
+# §FRIEND-LOCAL 批 7 追加：本地执行器那条腿（QMT 之外的独立普通 Python 进程）
+#   * qmt_gateway/local_executor.py        执行器本体（纯 ASCII，规则层无裸数字）
+#   * qmt_gateway/local_executor_params.json 规则包参数（烘参唯一真源）
+#   * deploy/qmt-friend/install_local_executor.ps1  装这条腿（venv+依赖+计划任务+自检）
+#   * scripts/build_local_executor.py       构建器（烘参 + 五道静态闸）
+#   * scripts/update_local_executor.ps1     更新器（备份→写入→版本回读三段自证）
 
 # 黑名单：命中即拒绝构建（不是跳过）。真配置/账本/备份/凭据一律不许进包。
 deny_hit() { # $1=相对路径
@@ -72,6 +86,7 @@ deny_hit() { # $1=相对路径
 SRC_LIST=""
 for f in $GW_FILES; do SRC_LIST="$SRC_LIST qmt_gateway/$f"; done
 for f in $FRIEND_FILES; do SRC_LIST="$SRC_LIST deploy/qmt-friend/$f"; done
+for f in $SCRIPTS_FILES; do SRC_LIST="$SRC_LIST scripts/$f"; done
 # contract 目录整体进包（六件 golden）——契约指纹按目录内容算，所以这里必须是整目录而不是挑几件。
 for f in "$SRC_ROOT"/qmt_gateway/contract/*; do
 	[ -f "$f" ] && SRC_LIST="$SRC_LIST qmt_gateway/contract/$(basename "$f")"

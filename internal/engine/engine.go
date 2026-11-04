@@ -2095,6 +2095,22 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		})
 		return
 	}
+	// §EXT-BRAIN-1104 外脑模式买入闸（11-05 券商断 QMT 内置策略的文件/网络之后的安全垫）。
+	// 口径：档 2（读不到柜台）/档 3（通道断）/档 4（显式影子态）时**只停开新仓**，
+	// 卖出腿（止损/止盈/清仓）原样走既有熔断链——再叠一层只会挡住本来该出的货。
+	// 为什么放在这里而不是 dispatchLive：autoPlaceScaled 是实盘买入的唯一执行入口
+	// （主循环/5s 轮/测试都从这里走），判据单点；散在两处就会两套账。
+	// English: external-brain gate — tiers 2/3/4 stop new live buys only; exits keep their path.
+	if blocked, ebCode, ebReason := ctrl.ExternalBrainBlocksAutoBuy(); blocked {
+		ebTag := fmt.Sprintf("external-brain-%d", ebCode)
+		log.Printf("[qmt-gate] %s(%s) %s/%s 自动下单跳过: %s（%s）",
+			sig.Code, sig.Name, sig.StrategyID, sig.Strategy, ebTag, ebReason)
+		opslog.DayOnce("auto-gate:"+ebTag+":"+sig.Code, func() {
+			opslog.Logf("quant", "auto下单跳过 %s(%s) 策略=%s/%s 原因=%s 外脑模式=%s",
+				sig.Code, sig.Name, sig.StrategyID, sig.Strategy, ebTag, ebReason)
+		})
+		return
+	}
 	cfg := ctrl.Config()
 	// §DYN-SIZE-v3：动态预算模式——动态仓位是唯一预算决策者，旧的固定金额/战法金额/每日闸/
 	// ATR 风险预算/最低成交额闸全部让位。无配置入参（旧测试/autoPlace）保持 legacy 路径。

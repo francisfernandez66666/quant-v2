@@ -279,12 +279,23 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		acc.MarketValue = mv
 		acc.TotalAsset = mv
 	}
+	// §2.12 手动账读数装配。**装配失败不许把实盘持仓整张页面打死**：
+	// 手动账是旁路输入，它坏了只该让"手动维护"这块标注消失并留痕，不该让人看不见柜台持仓。
+	manualBlock, manualErr := s.manualBookReadout(userIDFor(r))
+	if manualErr != nil {
+		log.Printf("[server] §2.12 手动账读数装配失败（实盘持仓照常返回，manual 标 unavailable）user=%s: %v", userIDFor(r), manualErr)
+		manualBlock = map[string]interface{}{"present": false, "unavailable": true, "note": "手动维护账读取失败（不代表没有手动账）"}
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"positions": positions,                     // 持仓列表（已补名称/现价）
 		"account":   acc,                           // 账户资产快照（可能经市值兜底回填）
 		"enabled":   ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
 		"tripped":   ctrl != nil && ctrl.Tripped(), // 熔断是否触发
 		"mode":      ctrlMode(ctrl),                // 执行模式 manual/auto
+		// §2.12（2026-11-04 外脑化）手动维护账：桥 11-05 断后持仓/资金不再自动上报，owner 手工录的那本账
+		// **单独一个键**，刻意不并进 positions/account——并进去的那一行就再也说不清是柜台给的还是人敲的，
+		// 而这张页面上的数字是要被人拿去下单的。读侧唯一的"来源"标识就是这里（present/note/asof）。
+		"manual": manualBlock,
 	})
 }
 

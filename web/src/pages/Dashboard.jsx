@@ -14,6 +14,7 @@ import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
 import SentimentCard from '../components/SentimentCard.jsx'
 import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（live/trigger/cost/none）
+import ExternalBrainTag from '../components/ExternalBrainTag.jsx' // §EXT-BRAIN-1104 外脑档位（还有没有手）
 import { canLiveTrading } from '../utils/perm.js'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
@@ -568,6 +569,15 @@ export default function Dashboard() {
           <span>原始 {scanStats.raw_signals || 0} → 最终 {scanStats.final_signals || 0}</span>
           <span>流程引擎：新闻抓取{healthMark(engineHealth.news_agent)} 策略引擎{healthMark(engineHealth.strategy_engine)} 板块验证{healthMark(engineHealth.sector_agent)} 战法扫描{healthMark(engineHealth.combat_agent)} LLM{healthMark(engineHealth.llm)} 同花顺{healthMark(engineHealth.ths)} 聚合器{healthMark(engineHealth.aggregator)}</span>
           {qmtLine && <span>实盘链路：{qmtLine}</span>}
+          {/* §EXT-BRAIN-1104：外脑档位贴在实盘链路这一行（同 friend_leg_state 三态的宿主行）。
+              两个刻意的形状：
+              ① 不挂进 qmtLine 那个 useMemo——那段文本的第一句是 `if (!s || !s.enabled) return ''`，
+                 而档 4（显式影子态）恰恰是 enabled=false，挂进去等于影子态永远不显示；
+              ② 只在真的拿到过快照时才交给组件（qmtState 为 null 是"还没取到"，
+                 不是"读数未知"——把没取到渲染成未知会在全页首屏闪一块假告警，
+                 §0925EVE-W3-E「读不到不装已知」在这里的反面形态）。
+              档 0/1 由组件自己返回 null，健康的全局那一行字一个字都不多。 */}
+          {qmtState && <ExternalBrainTag code={qmtState.external_brain} />}
         </div>
       </Card>
 

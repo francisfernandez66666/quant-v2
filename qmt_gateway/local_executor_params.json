@@ -1,0 +1,68 @@
+{
+  "_comment": "Local executor baked parameters (P0 price-type signals). This file is the SINGLE source of truth for the thresholds: scripts/build_local_executor.py bakes it into qmt_gateway/local_executor.py (PARAMS block) and the builder refuses to build when the baked copy has drifted. Every threshold here must appear in the baked PARAMS table; the rule layer of local_executor.py may not contain a bare numeric literal at all.",
+  "_comment_windows": "Time windows are 'HH:MM' strings in Beijing time. no_cancel_windows = windows where cancelling is forbidden (e.g. right before the close, where a cancel that does not settle can leave a live order behind). no_new_order_windows = windows where placing a new order is forbidden (e.g. the call auction, where a limit order can be matched at a price nobody intended).",
+  "_comment_broker": "This executor is the LOCAL process: it runs outside QMT on the physical Windows box, so it may read local files and use the network. It never touches the QMT built-in strategy sandbox.",
+  "_comment_ids": "The signal short code is <signal_codes[kind]><symbol head> and travels in every order remark as <version>-<short code>; it is the idempotency key rebuilt from the broker's own same-day order table.",
+  "_comment_nontrading": "non_trading_weekdays uses Python weekday numbering (0=Monday .. 6=Sunday). closed_days is the fallback when no Go-produced trading_calendar.json is reachable; a real calendar file adds to it at runtime.",
+  "params": {
+    "breakdown_ratio": 0.96,
+    "buy_signals": [
+      "pullback_buy"
+    ],
+    "closed_days": [],
+    "daily_buy_cap": 100000.0,
+    "lot_size": 100,
+    "ma_period": "1d",
+    "ma_window": 5,
+    "max_ops_per_min": 6,
+    "min_cash_reserve": 1000.0,
+    "min_order_amount": 1000.0,
+    "min_price": 0.01,
+    "min_volume": 1.0,
+    "no_cancel_windows": [
+      [
+        "09:20",
+        "09:30"
+      ],
+      [
+        "14:57",
+        "15:00"
+      ]
+    ],
+    "no_new_order_windows": [
+      [
+        "09:20",
+        "09:30"
+      ],
+      [
+        "14:52",
+        "15:00"
+      ]
+    ],
+    "non_trading_weekdays": [
+      5,
+      6
+    ],
+    "ops_window_sec": 60,
+    "order_amount_cap": 20000.0,
+    "poll_interval_sec": 5,
+    "pullback_ratio": 0.98,
+    "signal_codes": {
+      "breakdown_sell": "BK",
+      "pullback_buy": "PB",
+      "stop_loss": "SL",
+      "take_profit": "TP"
+    },
+    "stale_order_sec": 900,
+    "stop_loss_ratio": 0.97,
+    "symbol_head_len": 6,
+    "symbols": [
+      "600000.SH",
+      "000001.SZ"
+    ],
+    "take_profit_ratio": 1.05,
+    "volume_ratio_min": 1.5,
+    "close_sweep_from": "14:52"
+  },
+  "strategy_version": "v01-20261103"
+}

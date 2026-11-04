@@ -1,5 +1,9 @@
 // Package data — 消息中心持久化存储。
 // 按稳定键（ID）去重合并消息，支持删除墓碑（当日不再自动出现）与跨交易日清理。
+//
+// §B6（2026-11-05 通知增强）新增「新闻」通道（Kind=news）：只留当日、跨交易日即清，
+// 日切判据**复用本存储既有的 day-key（TradingDayDate 那一处）**，不另起第二套日界线——
+// 本仓 cntime 与本地钟两套日界线反复出事，这里刻意只留一处判据。
 package data
 
 import (
@@ -10,6 +14,12 @@ import (
 	"sync"
 	"time"
 )
+
+// KindNews §B6：消息中心「新闻」tab 的消息种类（利多且未命中持仓/自选的事件进这里，
+// 不占必推通道、也不混进信号流）。
+// English: §B6 — the message-center "news" tab kind: bullish items that miss the
+// holdings/watchlist land here, taking neither the must-push lane nor the signal stream.
+const KindNews = "news"
 
 // MessageItem 消息中心单条消息（与前端 /api/alerts 结构一致）。
 // ID 为稳定去重键（如 600519@止盈 / hold@SIGxxx），供手工删除定位。
@@ -32,6 +42,10 @@ type MessageItem struct {
 	Direction   string    `json:"direction"`       // 方向（利好/利空）
 	GeneratedAt time.Time `json:"generated_at"`    // 生成时间
 	Scope       string    `json:"scope,omitempty"` // 可见范围（""=公共；uid=私有）
+	// Kind §B6 消息种类：空串=既有消息（信号流/持仓提示等，前端按 level 分类），
+	// "news"=「新闻」tab 的当日条目。读接口按 ?kind=news 分流，两类互不混排。
+	// English: §B6 message kind — empty keeps today's behaviour, "news" marks a news-tab row.
+	Kind string `json:"kind,omitempty"`
 }
 
 // messageFile 消息中心持久化文件结构。
@@ -62,8 +76,10 @@ func NewMessageStore(path string) *MessageStore {
 			s.file = messageFile{}
 		}
 	}
-	if s.file.TradingDay != TradingDayDate(time.Now()) {
-		s.file.DeletedKeys = nil
+	if s.file.TradingDay != "" {
+		// §B6：与 Sync/读面共用同一处日切判据（内存存储也要按日清新闻行）
+		// English: §B6 — load shares the single rollover judgement with Sync and the read paths.
+		s.rolloverLocked(time.Now())
 	}
 	return s
 }
@@ -84,13 +100,60 @@ func (s *MessageStore) persist() {
 	}
 }
 
+// rolloverLocked 交易日切换时的**唯一** day-key 判据（调用方须已持有 s.mu）：
+// 墓碑清零 + 「新闻」tab 行清零。两处必须同源——新闻只留当日是 §5A.3b 的硬要求，
+// 而另起一套"新闻日切"判据正是本仓两套日界线（cntime vs 本地钟）反复出事的形状。
+// 返回是否真的发生了切换（调用方据此决定要不要落盘）。
+// English: the single trading-day rollover judgement (caller must hold s.mu): tombstones and
+// news-tab rows both clear here, so the news tab never grows its own second day-line.
+func (s *MessageStore) rolloverLocked(now time.Time) bool {
+	td := TradingDayDate(now)
+	if s.file.TradingDay == td {
+		return false
+	}
+	// 先把日推进去再清理：path="" 的内存存储不走 persist，不自己推进的话会每次调用都判成"刚换日"，
+	// 把当日墓碑清干净（等价于删掉的新闻又复活）。
+	// English: advance the stored day here: in-memory stores never reach persist(), so without this
+	// every call would look like a fresh rollover and wipe the day's tombstones.
+	s.file.TradingDay = td
+	s.file.DeletedKeys = nil
+	// 新闻行跨日即清；非新闻行（信号流/持仓提示）保持既有行为不动
+	// English: news rows vanish on rollover; every other message keeps today's behaviour.
+	kept := make([]MessageItem, 0, len(s.file.Messages))
+	for _, m := range s.file.Messages {
+		if m.Kind == KindNews {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	s.file.Messages = kept
+	return true
+}
+
+// PublishNews §B6：写入「新闻」tab 的当日条目（Kind 由本方法统一置为 news，调用方不必记）。
+// 走与 Sync 相同的按 ID 去重合并 + 删除墓碑，因此"手工删掉的新闻当日不再复活"，
+// 跨交易日则随 rolloverLocked 一起清空（UI 不留历史 ≠ 证据不留：NewsEvent 事件表照旧落库）。
+// English: §B6 — publish today's news-tab rows through the same dedup/tombstone path as Sync;
+// they clear on the next trading day while the NewsEvent table stays persisted.
+func (s *MessageStore) PublishNews(items []MessageItem) {
+	if len(items) == 0 {
+		return
+	}
+	out := make([]MessageItem, 0, len(items))
+	for _, it := range items {
+		it.Kind = KindNews
+		out = append(out, it)
+	}
+	s.Sync(out)
+}
+
 // Sync 合并本轮消息：按 ID 去重（已存在则刷新内容），被删除的键不再出现。
 func (s *MessageStore) Sync(items []MessageItem) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.file.TradingDay != TradingDayDate(time.Now()) {
-		s.file.DeletedKeys = nil
-	}
+	// §B6：日切判据收敛到 rolloverLocked 一处（原先这里只清墓碑）
+	// English: §B6 — the rollover judgement now lives in one place (it used to clear tombstones only).
+	s.rolloverLocked(time.Now())
 	deleted := make(map[string]bool, len(s.file.DeletedKeys))
 	for _, k := range s.file.DeletedKeys {
 		deleted[k] = true
@@ -118,6 +181,13 @@ func (s *MessageStore) Sync(items []MessageItem) {
 			kept.Direction = it.Direction
 			kept.GeneratedAt = it.GeneratedAt
 			kept.Scope = it.Scope // §GAP2-W2 刷新时保留最新作用域归属
+			// §B6 只有显式带种类才覆盖：常规信号流的 Sync（Kind=""）不许把新闻行的种类抹掉，
+			// 否则同 ID 复用时新闻条目会掉回信号流（前端两处都会看不见或两处都看见）。
+			// English: §B6 — only an explicit kind overwrites; a plain Sync (Kind="") must not
+			// erase a news row's kind, which would drop it back into the signal stream.
+			if it.Kind != "" {
+				kept.Kind = it.Kind
+			}
 			s.file.Messages[idx] = kept
 			continue
 		}
@@ -135,6 +205,13 @@ func (s *MessageStore) Sync(items []MessageItem) {
 func (s *MessageStore) ListVisible(userID string) []MessageItem {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// §B6 读侧也判日切：引擎 5s 同步轮一旦停摆（重启窗口/非盘中），新闻行仍不许带着昨天的
+	// 内容进今天——切日即空的判据不能只挂在写侧。
+	// English: §B6 — the read path rolls the day too, so a stalled writer cannot let yesterday's
+	// news leak into today; "empty on a new trading day" must not depend on the write side alone.
+	if s.rolloverLocked(time.Now()) {
+		s.persist()
+	}
 	out := make([]MessageItem, 0, len(s.file.Messages))
 	for _, m := range s.file.Messages {
 		if m.Scope == "" || m.Scope == userID {
@@ -218,9 +295,14 @@ func (s *MessageStore) PurgeShortLevel() int {
 }
 
 // List 返回全部消息（按生成时间倒序）。
+// §B6 同 ListVisible：读侧也判日切，新闻行跨日不许留在内存里冒充当日。
+// English: §B6 — like ListVisible, the read path rolls the day so news rows never pretend to be today's.
 func (s *MessageStore) List() []MessageItem {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.rolloverLocked(time.Now()) {
+		s.persist()
+	}
 	out := make([]MessageItem, len(s.file.Messages))
 	copy(out, s.file.Messages)
 	sort.Slice(out, func(i, j int) bool {

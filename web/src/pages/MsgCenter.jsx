@@ -5,6 +5,9 @@ import React, { useState, useEffect, useMemo } from 'react'
 import { Card, Tag, Button, Select, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+// §B6（2026-11-05 通知增强）「新闻」tab：利多且未命中持仓/自选的新闻在这里落一行，
+// 不占必推通道、也不混进信号流；只留当日（日切由服务端消息中心的 day-key 判）。
+import NewsTab from '../components/NewsTab.jsx'
 import useSseRefresh from '../useSseRefresh.js'
 // §P2-I（2026-10-06 修复批 波 6）轮询「后到丢弃」统一入口：本页由 message/scan/score 三类 SSE 事件
 // 驱动重拉 + 60s 兜底轮询（§F5），事件密集时段两条腿同时在途是常态；旧一轮的消息列表后到，
@@ -45,6 +48,9 @@ export default function MsgCenter() {
   // 渲染可重试提示，不得与「暂无消息」空态共用分支。
   const [alertsError, setAlertsError] = useState('')
   const [activeFilter, setActiveFilter] = useState('all')
+  // §B6 页签：messages=既有消息流（默认，行为一字不变），news=当日「新闻」tab
+  const [tab, setTab] = useState('messages')
+  const [newsUnread, setNewsUnread] = useState(0)
   const [activeStrategy, setActiveStrategy] = useState('all')
   // §SHORT-4 做空显隐（决策⑤）：开关关闭时隐藏做空方向/做空战法消息
   const [shortEnabled, setShortEnabled] = useState(false)
@@ -311,6 +317,22 @@ export default function MsgCenter() {
         </div>
       </Card>
 
+      {/* §B6 页签：消息流 / 新闻（未读数只在拿到读数时才画，见 NewsTab 的空态纪律） */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+        <Button size="small" variant={tab === 'messages' ? 'base' : 'outline'}
+          theme={tab === 'messages' ? 'primary' : 'default'} onClick={() => setTab('messages')}>
+          消息流
+        </Button>
+        <Button size="small" variant={tab === 'news' ? 'base' : 'outline'}
+          theme={tab === 'news' ? 'primary' : 'default'} data-testid="news-tab-btn" onClick={() => setTab('news')}>
+          新闻{newsUnread > 0 ? `（${newsUnread}）` : ''}
+        </Button>
+      </div>
+
+      {tab === 'news' && <NewsTab active onUnreadChange={setNewsUnread} />}
+
+      {tab === 'messages' && (
+      <>
       {/* 消息等级筛选按钮组：全部/命中提醒/交易信号/策略信号/止盈止损/持仓提示 */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
         {filters.map((f) => (
@@ -365,6 +387,8 @@ export default function MsgCenter() {
           ⚠ 最近一次消息刷新失败（{alertsError}），当前为上次成功拉取的列表
           <Button size="small" variant="text" theme="warning" onClick={load}>重试</Button>
         </div>
+      )}
+      </>
       )}
 
       {/* §F3 全局个股详情抽屉：实时价 + 分时/盘口 + 同码相关消息 */}

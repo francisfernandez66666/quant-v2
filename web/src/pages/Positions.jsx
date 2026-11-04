@@ -113,6 +113,10 @@ export default function Positions() {
   const [realPositions, setRealPositions] = useState([])
   // 实盘账户资产（广州 QMT 上报的可用资金/冻结/总值/市值）
   const [realAccount, setRealAccount] = useState(null)
+  // §2.12（2026-11-04 外脑化 B1'）手动维护账：桥断后 owner 手工录的那本持仓/资金。
+  // **单独一个 state**，绝不与 realPositions/realAccount 合并——那两个是柜台回报的形状，
+  // 合并后页面上任何"非空 ⇒ 有仓"的判据都会把手敲当成证据（读面唯一的来源标识就是 manual.note）。
+  const [manualBook, setManualBook] = useState(null)
   // 实盘整体盈亏（/api/qmt/trades summary：realized/unrealized/total_pnl）——页头优先展示
   const [realTrades, setRealTrades] = useState(null)
   // 实盘持仓建议映射（ts_code -> 建议）

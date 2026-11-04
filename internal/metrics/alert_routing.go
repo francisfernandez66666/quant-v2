@@ -243,6 +243,42 @@ func SetAlertSink(s AlertSink) { alertOutput.setSink(s) }
 // English: reports whether an egress has been injected.
 func AlertSinkInjected() bool { return alertOutput.hasSink() }
 
+// §EXT-BRAIN-1104 —— 外脑模式降噪静默域（只影响**出站去向**，不影响规则表/条数/值）。
+//
+// QuietAlertRules 用给定的规则名**整份替换**当前静默域（每轮由引擎按外脑档位重算，
+// 传 nil/空 = 清空）。被静默的规则：首次触发照旧必推，之后的重复触发转日汇总；
+// 恢复销案一律照发（不成对就会被 §W7-E 的持久化状态判成"已报未销"挂死）。
+//
+// 为什么由引擎而不是路由器自己判：路由器看不到"桥心跳"这种通道事实，
+// 档位只在 trading.Controller 有一份（单点判据，不许两处各算一套）。
+//
+// English: replaces the quiet set; quieted rules push once then fold repeats into the daily
+// summary, and resolutions always pass through. The engine owns the tier, the router only folds.
+func QuietAlertRules(names []string) {
+	next := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n != "" {
+			next[n] = true
+		}
+	}
+	globalAlertRouter.mu.Lock()
+	globalAlertRouter.quiet = next
+	globalAlertRouter.mu.Unlock()
+}
+
+// QuietAlertRuleNames 返回当前静默域（排序后，供读数面/测试核对；只读）。
+// English: the current quiet set, sorted for readouts and tests; read-only.
+func QuietAlertRuleNames() []string {
+	globalAlertRouter.mu.Lock()
+	defer globalAlertRouter.mu.Unlock()
+	out := make([]string, 0, len(globalAlertRouter.quiet))
+	for n := range globalAlertRouter.quiet {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // dailyStat 一条规则当日的聚合统计（触发次数 / 峰值 / 首次 / 末次 / 当前是否仍在触发）。
 type dailyStat struct {
 	Level       string
@@ -267,8 +303,17 @@ type alertRouter struct {
 	announced  map[string]bool       // 规则名 → 已报未销（决定是否需要发 resolved）
 	pendingR   map[string]AlertEvent // 被恢复冷却窗挡下、待补发的 resolved
 	suppressed map[string]int        // 冷却窗内被抑制的重复触发计数（诊断风暴抑制量）
-	day        string                // 当前聚合的本地日历日
-	daily      map[string]*dailyStat
+	// §EXT-BRAIN-1104 降噪静默域：外脑模式档 3/4（通道确实断了/owner 显式影子态）时，
+	// 由引擎把"纯通道派生"的规则名放进来。语义＝**第一次仍必推，之后转日汇总**
+	// （判据是 announced：已报未销 ⇒ 不再刷第二条）。
+	// 为什么需要它：默认 FireCooldown 只有 30 分钟 ⇒ 断链一整天＝每条最多 48 推，
+	// 一周后没人再看，真告警被训练成噪音（本批第一靶）。
+	// 为什么按规则名逐条给、不搞"全局静默"：全局窗会吃掉无关规则的首推，
+	// 与本仓"冷却键分格"纪律同源。
+	// English: per-rule quiet set — first push still goes out, repeats fold into the daily summary.
+	quiet map[string]bool
+	day   string // 当前聚合的本地日历日
+	daily map[string]*dailyStat
 	// §W7-E（2026-10-06 修复批 波 7）跨重启持久化：上面四份状态（day/daily + pendingR +
 	// announced，另加 lastF/lastR 冷却锚与 suppressed 诊断计数）此前只活在内存里，
 	// 重启即丢 ⇒ 前一日汇总被吞、已报未销的规则永远补不出销案。落盘实现见 alert_router_state.go。
@@ -292,6 +337,7 @@ func newAlertRouter(now func() time.Time) *alertRouter {
 		announced:  map[string]bool{},
 		pendingR:   map[string]AlertEvent{},
 		suppressed: map[string]int{},
+		quiet:      map[string]bool{},
 		daily:      map[string]*dailyStat{},
 	}
 }
@@ -329,6 +375,12 @@ func (r *alertRouter) routeEventsLocked(events []AlertEvent) []AlertDelivery {
 		r.rememberRuleLocked(e)
 		switch r.routeOfLocked(e.Name) {
 		case RoutePush:
+			// §EXT-BRAIN-1104 静默域：已报未销的重复触发转日汇总（首推与销案一律照发，
+			// 否则会打断 alert/resolved 的成对语义，见上面 §W7-E 的注释）。
+			if e.Kind != "recover" && r.quiet[e.Name] && r.announced[e.Name] {
+				r.recordDailyLocked(e, now)
+				continue
+			}
 			if d := r.routePushLocked(e, now); d != nil {
 				out = append(out, *d)
 			}

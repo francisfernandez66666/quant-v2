@@ -15,12 +15,27 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
 
 // newEmotionDB 构造带情绪断点数据的研究库：两个候选 × 冰点相位 3+1 条事件 + 引擎日终标注。
+// emotionDayOff 给出"今天往前 n 天"的紧凑日期（YYYYMMDD，与生产 data.TradingDayDate 同格式）。
+// 为什么不能用写死的 20260907：端点按"今天起 57 个自然日"的窗口过滤（market_emotion.go 的
+// naturalSpan=days*7/5+15），夹具写死绝对日期 = 一枚定时炸弹——今天（11-04）就是它爆炸的日子
+// （窗口起点滑到 20260908，冰点那条掉出窗外，用例从"应有 2 条"变成"应有 1 条"）。
+// 判据本身没错，错在夹具跟着日历腐化。改成相对今天取数，用例在任何一天都判同一件事。
+func emotionDayOff(n int) string {
+	return time.Now().AddDate(0, 0, -n).Format("20060102")
+}
+
+// emotionDayDisplay 是同一个日期的前端展示形态（YYYY-MM-DD，ribbon 的 slice(5) 依赖它）。
+func emotionDayDisplay(n int) string {
+	return time.Now().AddDate(0, 0, -n).Format("2006-01-02")
+}
+
 func newEmotionDB(t *testing.T) *store.DB {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "trading.db"))
@@ -30,12 +45,12 @@ func newEmotionDB(t *testing.T) *store.DB {
 	t.Cleanup(func() { db.Close() })
 	// 引擎判定（market_risk_daily，YYYYMMDD 落库——与生产 data.TradingDayDate 同格式）
 	if err := db.UpsertMarketRiskDaily(store.MarketRiskDailyRow{
-		TradeDate: "20260907", Emotion: "冰点", LimitUpCount: 15, LadderHeight: 2, Reasons: "涨停少",
+		TradeDate: emotionDayOff(2), Emotion: "冰点", LimitUpCount: 15, LadderHeight: 2, Reasons: "涨停少",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.UpsertMarketRiskDaily(store.MarketRiskDailyRow{
-		TradeDate: "20260908", Emotion: "高潮", LimitUpCount: 120, LadderHeight: 6,
+		TradeDate: emotionDayOff(1), Emotion: "高潮", LimitUpCount: 120, LadderHeight: 6,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -55,12 +70,12 @@ func newEmotionDB(t *testing.T) *store.DB {
 	// 冰点 2 事件（hit_rate 为 0-1 比例口径——链式回测 er.HitRate = wins/n；
 	// 存储粒度 candidate×date×industry，两条须不同行业否则 upsert 互相覆盖）
 	for i, e := range []string{ev(15, 1.0, 0.5), ev(15, 2.0, 0.7)} {
-		if err := db.UpsertBacktestEventResult(cid, "20260907", "测试行业甲"+string(rune('1'+i)), "fp", research.AdjBaselineVersion, e); err != nil {
+		if err := db.UpsertBacktestEventResult(cid, emotionDayOff(2), "测试行业甲"+string(rune('1'+i)), "fp", research.AdjBaselineVersion, e); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// 高潮 1 事件（薄桶）
-	if err := db.UpsertBacktestEventResult(cid, "20260908", "测试行业", "fp-c", research.AdjBaselineVersion, ev(120, 3.0, 0.9)); err != nil {
+	if err := db.UpsertBacktestEventResult(cid, emotionDayOff(1), "测试行业", "fp-c", research.AdjBaselineVersion, ev(120, 3.0, 0.9)); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -88,8 +103,8 @@ func TestEmotionHistoryDateNormalize(t *testing.T) {
 		t.Fatalf("应有 2 条, got %d", len(resp.Series))
 	}
 	// 核心契约：YYYYMMDD → YYYY-MM-DD（前端 ribbon 的 slice(5) 展示依赖）
-	if got := resp.Series[0]["date"]; got != "2026-09-07" {
-		t.Fatalf("date 未归一化: %v", got)
+	if got := resp.Series[0]["date"]; got != emotionDayDisplay(2) {
+		t.Fatalf("date 未归一化: %v 期望 %s", got, emotionDayDisplay(2))
 	}
 	if _, ok := resp.Series[1]["reasons"]; ok {
 		t.Fatalf("空 reasons 字段应缺席而非空串")

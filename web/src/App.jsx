@@ -15,6 +15,10 @@ import RoleBar from './components/RoleBar'
 import CommandPalette from './components/CommandPalette'
 import StockDetailDrawer from './components/StockDetailDrawer'
 import Disclaimer from './components/Disclaimer'
+// §2.12（2026-11-04 外脑化 B1'）信号弹窗卡：全站一份，自己订阅 SSE 门铃并按三通道派发
+// （弹窗 / 桌面通知 / 手机原生桥）。挂在主布局里而不是各页，是因为一份去重账只能有一本——
+// 两页各挂一份就会同一条信号弹两次（判定与去重都在 utils/signalCard.js）。
+import SignalCardModal from './components/SignalCardModal'
 import IcpFooter from './components/IcpFooter'
 import ThemeToggle from './components/ThemeToggle'
 import { useTheme } from './theme.js'
@@ -795,6 +799,9 @@ export default function App() {
         {/* §F6 全局个股详情抽屉（命令面板/未来任意入口共用），仅此处一份实例避免多页重复 */}
         <StockDetailDrawer open={!!globalDetail} code={globalDetail?.code}
           onClose={() => setGlobalDetail(null)} />
+        {/* §2.12 信号弹窗卡（全站一份）：桥断后量仔只剩"给人看的卡"这条输出端，
+            弹窗/桌面/手机三通道的去重与开关都在 utils/signalCard.js，这里只负责挂载。 */}
+        <SignalCardModal />
         </>
       )}
       {/*

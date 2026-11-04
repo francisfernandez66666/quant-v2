@@ -66,6 +66,14 @@ type Controller struct {
 	lastHealthy  bool      // 最近一次健康探测是否成功
 	lastFailAt   time.Time // §CB-RUNSTART 本轮连续失联的起点时间（探测成功即清零；非"最近一次失败时间"）
 
+	// §EXT-BRAIN-1104 桥心跳读数（外脑模式档 3 的判据之一）。
+	// lastQueuedKnown=false 表示"这条读数没拿到"（执行器不提供该能力 / 还没探过），
+	// **不许**拿零值冒充"桥已断"（§M2 未知不装新鲜的同族口径）。
+	// lastQueuedConnected 只有在 known 为真时才有意义。
+	// English: bridge-heartbeat reading for the external-brain tier; unknown stays unknown.
+	lastQueuedKnown     bool // 是否已拿到桥心跳读数
+	lastQueuedConnected bool // 桥心跳是否新鲜（queued_connected）
+
 	// 互通健康展示数据（仪表盘-系统）：下行=首尔探测广州网关，上行=广州网关回报到首尔。
 	lastLatencyMs  int64     // 最近一次健康探测往返时延（毫秒）
 	lastReportAt   time.Time // 最近一次收到网关回报时间（上行通道新鲜度）
@@ -533,11 +541,25 @@ type StateSnapshot struct {
 	// switch change is queued but not yet consumed at a trading session (so the UI can show
 	// "configured, takes effect next session" instead of misreading deferred apply as "switch off").
 	PendingEnabled *bool `json:"pending_enabled"`
+
+	// §EXT-BRAIN-1104 外脑模式读数（纯观测，不参与熔断、不改 /health.ok）。
+	// ExternalBrain 是档位数字（0 不适用/1 正常/2 读不到柜台/3 通道断/4 显式影子态），
+	// ExternalBrainReason 是给人看的一句话。前端只按数字分形，不解析文案。
+	// 为什么要独立于 Tripped：熔断是"钱的安全闸"，外脑模式是"我还有没有手"的说明，
+	// 两者混在一起会让值班的人分不清是风控熔断还是通道断了。
+	// English: external-brain tier + reason; pure observability, never a data-plane input.
+	ExternalBrain       int64  `json:"external_brain"`
+	ExternalBrainReason string `json:"external_brain_reason"`
 }
 
 // Snapshot 返回当前互通健康快照（纯读，不加锁副作用）。
 // （Snapshot returns the current connectivity snapshot; read-only.）
 func (c *Controller) Snapshot() StateSnapshot {
+	// §EXT-BRAIN-1104：外脑模式读数在**取锁之前**算。
+	// 原因：externalBrainAt 自己要取读锁；在已持读锁的函数里再取一次读锁，
+	// 碰上并发写者（Go 的 RWMutex 不可重入）会死锁。这个坑必须写在这里，
+	// 下次有人"顺手"把这两行挪进锁里就炸。
+	ebCode, ebReason := c.externalBrainAt(time.Now())
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var pendingEnabled *bool
@@ -564,6 +586,8 @@ func (c *Controller) Snapshot() StateSnapshot {
 	return StateSnapshot{
 		Enabled:              c.cfg.Enabled,
 		FriendLegState:       friendLeg,
+		ExternalBrain:        ebCode,
+		ExternalBrainReason:  ebReason,
 		Mode:                 c.cfg.Mode,
 		Tripped:              c.tripped,
 		TripReason:           c.tripReason,
@@ -647,6 +671,11 @@ func (c *Controller) HealthCheck() {
 	// 配置与 miss 窗口都现场重取，保证热更新 MissHeartbeatSec 后本轮就生效。
 	started := time.Now()
 	ok, err := c.execRef().Health()
+	// §EXT-BRAIN-1104：采集桥心跳读数。
+	// 为什么放在探测之后：queued_connected 是网关 /health 里的一个字段，
+	// 跟着这一次探测顺带取，不额外发请求（额外请求会在断链时变成又一轮噪音）。
+	// 这是本仓唯一允许写 lastQueued* 的地方（判定函数保持只读）。
+	c.captureQueuedConnected()
 	c.mu.Lock()
 	c.lastLatencyMs = time.Since(started).Milliseconds()
 	c.mu.Unlock()
@@ -701,6 +730,34 @@ func (c *Controller) HealthCheck() {
 	if time.Since(runStart) >= miss {
 		c.setTripped(true, "网关心跳连续失联超过 "+miss.String())
 	}
+}
+
+// captureQueuedConnected 采集桥心跳读数并写入控制器（**唯一写入点**）。
+//
+// §EXT-BRAIN-1104：外脑模式档 3「通道断」的判据之一。11-05 断的是 QMT 内置策略（桥），
+// 网关进程本身还活着 ⇒ /health 仍 ok、broker_connected 仍可能为真，
+// 只有 queued_connected 会掉假。它是"桥还在不在"的唯一权威读数。
+//
+// 为什么用可选接口而不是给 Executor 加方法：加方法会破坏既有 Executor 实现
+// （mock / 降级实现 / 测试替身全都实现了 Executor）。拿不到能力就保持"读数未知"，
+// 绝不用零值冒充"桥已断"（§M2 未知不装新鲜的同族口径）。
+//
+// English: the single writer of the bridge-heartbeat reading; unknown stays unknown.
+func (c *Controller) captureQueuedConnected() {
+	qr, ok := c.execRef().(queuedConnReader)
+	if !ok {
+		// 执行器不提供该能力：保持 lastQueuedKnown=false（读数未知），不写 false 冒充断链。
+		return
+	}
+	v, known := qr.QueuedConnected()
+	if !known {
+		// 读数未知：不覆盖已知状态，也不把 known 降级——宁可少一个判据，不伪造一个。
+		return
+	}
+	c.mu.Lock()
+	c.lastQueuedConnected = v
+	c.lastQueuedKnown = true
+	c.mu.Unlock()
 }
 
 // fireOnAlert 触发上层告警回调（可空安全）。

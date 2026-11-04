@@ -39,7 +39,20 @@ let THRESHOLD = 15
 const LOOKBACK = 3
 
 // 强制纯 ASCII 的文件（中文注释会导致 GBK 沙箱乱码）：只要求「有注释」，不要求「有中文」。
-const ASCII_ONLY = new Set(['qmt_gateway/qmt_bridge_strategy.py'])
+//
+// §FRIEND-LOCAL 批 7 追加本地执行器那三件：它们要跑在 GBK 码页的物理 Windows 机上，
+// 正文必须纯 ASCII（中文注释会变 '?'），所以走同一条例外口径，而不是在文件里写中文。
+const ASCII_ONLY = new Set([
+  'qmt_gateway/qmt_bridge_strategy.py',
+  'qmt_gateway/local_executor.py',
+  'qmt_gateway/tests/test_local_executor.py',
+  'qmt_gateway/tests/test_local_executor_build_update.py',
+  // §SANDBOX-CARRIER（11-04）：这两件要进 GBK 码页的物理机/沙箱，正文必须纯 ASCII
+  // （中文注释会被撕成 '?'，11-02 那次假象就是同一成因）。它们仍必须"有注释"，
+  // 只是注释一律英文——豁免的是中文要求，不是注释要求。
+  'qmt_gateway/qmt_internal_strategy.py',
+  'qmt_gateway/tests/test_update_qmt_strategy.py',
+])
 
 // 控制流/数据操作特征：出现即认为该行是「逻辑」而非纯声明。
 const CTRL_RE = /\b(if|else|for|while|switch|case|catch|return|func |def |class |lambda|:=|await|yield)\b|[=!<>]=|\b(len|append|map|filter|forEach|reduce|push|concat|sort|split|join|slice|includes|parseInt|parseFloat|JSON\.|Object\.|Array\.|Math\.|Promise\.|String\.|Number\.|Boolean\.)\s*\(|\b(map|set|dict|list)\[|=>/
