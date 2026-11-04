@@ -216,6 +216,7 @@ DELETE	/api/positions/{id}	无 UI 待补	internal/server/server.go:789:DELETE /a
 PUT	/api/positions/{id}	无 UI 待补	internal/server/server.go:788:PUT /api/positions/{id}	运营账本改单能力已在（admin 门），持仓页只走 /api/holdings 系；保留尺寸等台账页，删除会断掉脚本旁路
 POST	/api/positions/{id}/exit	运维 curl	scripts/monitor_test.sh:377:"/api/positions/${pos_id}/exit"	上一条腿的平仓侧：do_curl 真拨 200 才算闭环（前端无入口，账本 exit 属运营操作）
 POST	/api/qmt/report	网关回调	qmt_gateway/handler.py:129:"/api/qmt/report"	Python 网关 outbox 后台线程推送成交/委托回报（§P2-A）；鉴权走 qmtReportMiddleware，非 UI 也非 curl
+POST	/api/qmt/order-receipt	无 UI 待补	internal/server/server.go:899:/api/qmt/order-receipt	§4.2 人工回执（11-05 桥断后券商手敲单的成交/撤单回填）：账号级 authMiddleware、按 requestUserID 归属、不动资金；当前由运维 curl/脚本回填，页面入口待 B 批后续补——能力在、入口未补是刻意排序不是遗漏
 GET	/api/tenant/usage	无 UI 待补	web/src/api/index.js:166:fetchTenantUsage	前端 wrapper 已按 §PERM-GATE 删除（用量改由 GET /api/tenants 行内返回），后端路由保留供配额核对
 POST	/auth/login	兼容端点	scripts/monitor_test.sh:210:"${BASE_URL}/auth/login"	旧路径别名：Android 壳旧版本与监控脚本仍在拨，与 POST /api/auth/login 同一处理器，删了即 404
 POST	/auth/register	兼容端点	internal/e2e/uat_live_probe_test.go:175:"/auth/register"	注册通道实际已关（处理器内回 403 提示文案），pattern 保留让旧壳拿到可读的 403 而不是 404

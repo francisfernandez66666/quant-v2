@@ -331,7 +331,10 @@ func (e *Engine) tSellVerdictActive(code string) bool {
 		return false
 	}
 	// 只认 5 分钟内的裁决：更旧的裁决要么已执行、要么已过期，不该长期锁死反 T。
-	return time.Since(at) < 5*time.Minute
+	// 为什么走 e.nowTime() 而不是 time.Since：本文件其余判据（腿龄、超时、时段窗）都以引擎
+	// 时钟为唯一基准，测试靠它注入固定钟；这里读真实墙钟会让"5 分钟"随运行时刻漂移
+	// ——同一条用例 10:30 前绿、10:35 后红（2026-11-04 实测），生产上则与裁决登记时刻不同源。
+	return e.nowTime().Sub(at) < 5*time.Minute
 }
 
 // tParamsFor 把账号级 TConfig 解析成纸面引擎的执行参数（§8.8 全部键走访问器＝带区间回落）。

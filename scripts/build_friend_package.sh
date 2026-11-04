@@ -56,7 +56,8 @@ done
 GW_FILES="gateway.py store.py handler.py broker.py ids.py outbox_admin.py quote_feed.py \
 close_gate.py leg_ops.py trading_calendar.py qmt_bridge.py qmt_bridge_strategy.py \
 config.bridge.example.json local_executor.py local_executor_params.json \
-qmt_internal_strategy.py"
+qmt_internal_strategy.py report_uplink.py broker_reads.py \
+rules_form.py rules_ladder.py rules_factor.py rules_t.py rules_sizing.py"
 FRIEND_FILES="ensure_friend_gateway_config.ps1 watchdog.ps1 install_tasks.ps1 enroll.ps1 \
 export_ledger.ps1 stop_leg.ps1 uninstall.ps1 config.xt.friend.template.json \
 install.ps1 uninstall_entry.bat export_ledger.bat install_entry.bat SETUP.txt \

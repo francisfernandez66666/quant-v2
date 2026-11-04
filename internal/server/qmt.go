@@ -689,6 +689,14 @@ type qmtReportEvent struct {
 	DataTS string `json:"data_ts"`
 	Broker string `json:"broker"` // §QMT-DUAL 通道切换事件：目标通道
 	From   string `json:"from"`   // §QMT-DUAL 通道切换事件：来源通道
+	// StrategyVersion §EXT-BRAIN-UP（2026-11-05 外脑上行腿）：本地普通 Python 进程
+	// （qmt_gateway/report_uplink.py）从**已安装的内置策略文件**读出的 STRATEGY_VERSION，
+	// 由 heartbeat（及其它读数事件）携带上行——回答"我装的构建是不是正在跑的那份"。
+	// omitempty：旧网关/旧桥不发该键时零影响；执行器自身版本与指纹走 reason（heartbeat
+	// 分支不消费 reason，不会误进任何账），信封契约照 §170 纪律只扩这一枚字段。
+	// English: §EXT-BRAIN-UP — version of the installed built-in strategy, reported by the
+	// box-local uplink process; answers "is the running build the installed build?".
+	StrategyVersion string `json:"strategy_version,omitempty"`
 }
 
 // qmtSnapshotMaxAge 桥侧快照的最大可信年龄：超过即视为“数据停滞”，不得据此刷新资金/持仓。
@@ -738,6 +746,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// SetLastReport 同时记录事件类型，/api/qmt/state 据此渲染上行新鲜度与最近事件。
 		ctrl.SetLastReport(ev.Type)
 	}
+	// §EXT-BRAIN-UP（2026-11-05 外脑上行腿）：本地普通进程携带的策略版本/执行器指纹落账号目录
+	// 观测文件（纯观测：空版本不覆盖已知、失败只打日志、不参与任何落账/熔断判定，见 leg_status.go）。
+	s.recordLegStatus(uid, ev, cntime.Now())
 
 	switch ev.Type {
 	case "positions":
@@ -1663,16 +1674,21 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 // English: returns the connectivity snapshot (downlink probe latency/state, uplink report
 // freshness, breaker details) for the dashboard system row and the quant page.
 func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
-	ctrl := s.qmtCtrlFor(userIDFor(r))
+	uid := userIDFor(r)
+	// §EXT-BRAIN-UP：leg_status 以**纯增量**并进本响应——两分支既有键值一字不动，
+	// 只多一枚 leg_status 键（无读数为 null）。superset 锁见 leg_status_test.go。
+	leg := s.readLegStatus(uid)
+	ctrl := s.qmtCtrlFor(uid)
 	if ctrl == nil {
 		// 未接入实盘：保留旧字段形状，前端据此隐藏实盘区块。
 		writeJSON(w, 200, map[string]interface{}{
 			"enabled": false, "mode": "manual", "tripped": false, "gateway_url": "",
+			"leg_status": leg,
 		})
 		return
 	}
-	// 已接入：直接透出控制器健康快照（下行探测/上行回报新鲜度/熔断详情/资金等）。
-	writeJSON(w, 200, ctrl.Snapshot())
+	// 已接入：直接透出控制器健康快照（下行探测/上行回报新鲜度/熔断详情/资金等），附腿状态。
+	writeJSON(w, 200, qmtStateWithLeg{StateSnapshot: ctrl.Snapshot(), LegStatus: leg})
 }
 
 // handleQMTOrders 处理 GET /api/qmt/orders（admin）：当日实盘委托列表。

@@ -889,6 +889,14 @@ func (s *Server) registerRoutes() {
 	// 行为锁见 manual_book_test.go。
 	// §115/契约台账牵连：路由 +1、台账 +1 行、前端调用 +1（web/src/api/index.js: saveManualBook）。
 	s.mux.HandleFunc("POST /api/qmt/manual-positions", s.authMiddleware(s.handleManualPositionsPost))
+	// §4.2（2026-11-04 外脑化 B1 第二腿）人工回执：11-05 桥断后券商 App 手敲单的
+	// 成交/撤单/未成交由成员本人回填，量仔据此推进 orders/fills 两本账。
+	// **账号级 authMiddleware，刻意不落严格位**（与上一行 manual-positions 同取向）：
+	// 这是"成员回填自己账号的回执"，挂任何严格位等于把桥断后唯一的收账通道锁进实盘权限面；
+	// 归属严格按 requestUserID，别人的 signal_id 403、查无 404、同键重放 409，
+	// 且**绝不写账户资产两列**（金额红线）。行为锁与函数体静态负锁见 handlers_qmt_receipt_test.go。
+	// §115/契约台账牵连：路由 +1、台账 +1 行（无 UI 待补），前端调用不增。
+	s.mux.HandleFunc("POST /api/qmt/order-receipt", s.authMiddleware(s.handleQMTOrderReceipt))
 	// §U-2 当日委托列表（撤单 UI 的 order_id 来源）
 	s.mux.HandleFunc("GET /api/qmt/orders", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTOrders))
 	// §R4-1 kill-switch 与手动撤单：资损级动作，但**作用域只有当前登录账号**

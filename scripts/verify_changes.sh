@@ -9632,6 +9632,7 @@ echo "ok - fixture s7"
 
 echo ""
 
+
 echo "==> 全部通过"
 P2LB_ONE
 ;;
@@ -12523,13 +12524,13 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 209 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209）'
+eqkey115 ROUTES_DERIVED 210 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210）'
 eqkey115 CALLPATH_DERIVED 168 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168）'
 eqkey115 CALLSITES_DERIVED 172 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 209 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209）'
+eqkey115 LEDGER_ROWS 210 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210）'
 eqkey115 COVERED_BY_WEB 168 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168）'
-eqkey115 UNCALLED 41 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41）'
+eqkey115 UNCALLED 42 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（无 UI 待补，前端未拨）→42）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
 eqkey115 NO_BASIS 0 '「无依据」档必须为空：说不清为什么还留着＝待决策，不许混进台账假装闭合'
@@ -12600,8 +12601,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 209 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209）'
-eqkey115 LEDGER_ROWS 209 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209）'
+eqkey115 ROUTES_DERIVED 210 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209；2026-11-04 §4.2 人工回执 +1 →210）'
+eqkey115 LEDGER_ROWS 210 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209；2026-11-04 §4.2 人工回执入账 →210）'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -20250,6 +20251,261 @@ fi
 
 [ "$B171_FAILED" = "0" ] || exit 1
 echo "ok - §171 §FRIEND-PKG 锁通过（入口与脚本在册 1 + bat 姿势 1 + 一把尺子与字节码 1 + deny 锚点 1 + install 锚点与零明文 1 + 用例在册等值 1 + 常驻反证 1 + pwsh 语法解析 1，累计判定点 ${CNT171}）"
+
+# ── §173 §QMT-INTERNAL-LOOP（11-04 外脑化批：判据只读／桥心跳接线不是死线／静默域只折重复／买入闸单点／四源窗口同源／构建闸三段自证／投递腿不直起客户端／移植规则内联不进 import）
+echo "==> 173 §QMT-INTERNAL-LOOP（外脑档契约与判定只读／桥心跳三态接线／静默域首推与销案不静默／买入执行点单点／四源时段窗逐字同源／构建闸漂移+装载+短码唯一／沙箱零文件零网络／撤单与投递腿 fail-closed／移植规则靠内联不靠 import／用例在册）..."
+B173_FAILED=0
+fail173() {
+	echo "--- FAIL: §173 $*"
+	FAIL=1
+	B173_FAILED=1
+}
+CNT173=0
+
+EB=internal/trading/external_brain.go
+QC=internal/trading/qmt_client.go
+CT=internal/trading/controller.go
+SL=internal/engine/scoring_loop.go
+EG=internal/engine/engine.go
+AR=internal/metrics/alert_routing.go
+SG=internal/trading/session_guard.go
+LEX=qmt_gateway/local_executor.py
+SANDBOX=qmt_gateway/qmt_internal_strategy.py
+BUILDR=scripts/build_local_executor.py
+PJ=qmt_gateway/local_executor_params.json
+UPS=scripts/update_qmt_strategy.ps1
+ULE=scripts/update_local_executor.ps1
+
+LEXT=$(cat "$LEX" || true)
+SANDBOXT=$(cat "$SANDBOX" || true)
+[ -n "$LEXT" ] || fail173 "读不到 ${LEX}（后面所有判据会一起变红，先红在这里而不是逐条误报）"
+[ -n "$SANDBOXT" ] || fail173 "读不到 ${SANDBOX}（内置策略载体文件不见了？）"
+
+# ① 外脑档：数字即对外契约 + 判定只读 + 显式影子态赢 + 不进降级链
+CNT173=$((CNT173 + 1))
+[ -s "$EB" ] || fail173 "外脑判据文件不在册（${EB}）"
+EBT=$(cat "$EB" || true)
+for k in "ExternalBrainNA int64 = 0" "ExternalBrainNormal int64 = 1" "ExternalBrainReadStale int64 = 2" "ExternalBrainChannelDown int64 = 3" "ExternalBrainShadow int64 = 4"; do
+	grep_q "$k" EBT F || fail173 "档位数字契约缺 [${k}]（前端按数字分形，改号必须同批改 web/src/utils/liveBrain.js）"
+done
+EBBODY=$(awk '/^func \(c \*Controller\) externalBrainAt/,/^}/' "$EB" || true)
+[ -n "$EBBODY" ] || fail173 "取不到 externalBrainAt 函数体（锚漂了＝这把锁今天没有牙）"
+if grep_q "c.mu.Lock()" EBBODY F; then
+	fail173 "判定函数里出现写锁：判据必须只读（§FIX-20261028-F02 同族——判定只读、推进点唯一）"
+fi
+grep_q "if !enabled" EBBODY F || fail173 "显式影子态不再赢过自动判定（owner 关掉的意图不许被自动判推翻）"
+EBCODE=$(printf "%s\n" "$EBT" | grep -vE "^[[:space:]]*(//|/\*)" || true)
+if grep_q "st.Degrade" EBCODE F; then
+	fail173 "外脑档写进行情降级链 st.Degrade（观测面带动数据面，§164/§170 同一靶子）"
+fi
+
+# ② 桥心跳接线：客户端真的有这个方法 + 三态 + 唯一写入点（本批开工时的真实缺陷是"接口没人实现"）
+CNT173=$((CNT173 + 1))
+QCT=$(cat "$QC" || true)
+grep_q "func (c *QMTClient) QueuedConnected() (value bool, known bool)" QCT F || fail173 "QMTClient 不再实现 QueuedConnected()——回到『可选接口恒不满足』的死线，11-05 断桥会判成正常"
+grep_q "queued *bool" QCT F || fail173 "桥心跳读数不再是指针三态（bool 零值会把『老网关不发这个键』读成『桥已断』）"
+grep_q "if c.queued == nil" QCT F || fail173 "未知态不再显式外传（§M2：未知既不装新鲜也不装断）"
+CTT=$(cat "$CT" || true)
+grep_q "func (c *Controller) captureQueuedConnected()" CTT F || fail173 "采集函数不见了（桥心跳读数的唯一写入点）"
+CTHL=$(awk '/^func \(c \*Controller\) HealthCheck\(\)/,/^}/' "$CT" || true)
+grep_q "c.captureQueuedConnected()" CTHL F || fail173 "HealthCheck 不再采集桥心跳＝档 3 的另一半判据断了"
+if ! grep_q "ebCode, ebReason := c.externalBrainAt" CTT F; then
+	fail173 "Snapshot 不再算外脑档（或把这两行挪进读锁里了：RWMutex 不可重入会死锁）"
+fi
+
+# ③ 静默域：只折"已报未销的重复触发"，首推与销案一律照发；且不含 signal_zero_in_session
+CNT173=$((CNT173 + 1))
+ART=$(cat "$AR" || true)
+grep_q "quiet[[:space:]]*map\[string\]bool" ART B || fail173 "静默域结构不见了（断链一天＝每条最多 48 推，会把真告警训练成噪音）"
+grep_q "func QuietAlertRules(names []string)" ART F || fail173 "静默域没有唯一入口（引擎每轮整份替换，不是累加）"
+grep_q 'e.Kind != "recover" && r.quiet[e.Name] && r.announced[e.Name]' ART F || fail173 "静默分支判据变了：首推或销案一旦被吞，成对语义就断了（§W7-E）"
+SLT=$(cat "$SL" || true)
+grep_q 'QuietAlertRules([]string{"uplink_stale", "order_fail_rate"})' SLT F || fail173 "档 3/4 的静默清单被改（这两条才是纯通道派生）"
+if grep_q 'QuietAlertRules(\[\]string{"uplink_stale", "order_fail_rate", "signal_zero_in_session"' SLT F; then
+	fail173 "signal_zero_in_session 被静默：它的成因是扫描/行情/库断了，与券商通道无关，桥断照样该响"
+fi
+grep_q 'metrics.SetGauge("external_brain_state", externalBrain)' SLT F || fail173 "外脑档量规不在册（读数没有，值班只能猜）"
+
+# ④ 买入闸单点：调用点恰一处，且在 autoPlaceScaled 内
+CNT173=$((CNT173 + 1))
+N_EB_GATE=$(grep -c "ExternalBrainBlocksAutoBuy" "$EG" || true)
+[ "${N_EB_GATE:-0}" = "1" ] || fail173 "实盘买入执行入口的外脑闸调用点应为恰 1 处，实得 ${N_EB_GATE}（散两处＝两套账）"
+AP=$(awk '/^func \(e \*Engine\) autoPlaceScaled/,/^\}/' "$EG" || true)
+grep_q "ExternalBrainBlocksAutoBuy" AP F || fail173 "外脑闸不在 autoPlaceScaled 内（那是实盘买入唯一执行入口）"
+SELLS=$(awk '/^func \(e \*Engine\) autoExecuteRealSellsRound/,/^}/' internal/engine/scoring_loop.go || true)
+[ -n "$SELLS" ] || fail173 "取不到 autoExecuteRealSellsRound 函数体（这条负锁会变摆设，先红在这里）"
+if grep_q "ExternalBrainBlocksAutoBuy" SELLS F; then
+	fail173 "外脑闸长到卖出腿上了：断链时挡住止损/止盈才是真危险"
+fi
+
+# ④b 人工回执三红线 + 回报腿（B1 兜底腿与「回报由本地进程自己 POST」的落点）
+CNT173=$((CNT173 + 1))
+RCV=internal/server/handlers_qmt_receipt.go
+[ -s "$RCV" ] || fail173 "人工回执 handler 文件不在册（${RCV}）"
+SRVT=$(cat internal/server/server.go || true)
+grep_q 'POST /api/qmt/order-receipt' SRVT F || fail173 "回执路由不在册（手工单/手工成交再也进不了账）"
+RCVL=$(grep 'POST /api/qmt/order-receipt' internal/server/server.go || true)
+if grep_q 'strict\|tradingMiddleware\|adminMiddleware' RCVL F; then
+	fail173 "回执路由被挂上严格/管理位：它是账号级写面（成员要能给自己回单），严格化会让朋友侧 403"
+fi
+RCVT=$(cat internal/server/handlers_qmt_receipt_test.go || true)
+for name in TestOrderReceiptIdempotentSameSignal TestOrderReceiptScopedToRequester TestOrderReceiptNeverMovesCash TestOrderReceiptHandlerHasNoAssetWrites TestOrderReceiptAudited TestOrderReceiptRowsAreMarkedManual TestOrderReceiptMemberLevelRoute; do
+	grep_q "func $name" RCVT F || fail173 "回执用例缺失：${name}"
+done
+RCVB=$(awk '/func \(s \*Server\) handleQMTOrderReceipt/,/^}/' "$RCV" || true)
+[ -n "$RCVB" ] || fail173 "取不到 handleQMTOrderReceipt 函数体（下面那枚资金负锁会是摆设）"
+if grep_q 'UpsertRealAccount\|UpdateRealAccount\|SetRealAccount\|AvailableCash =' RCVB B; then
+	fail173 "回执写面出现账户资金写操作（§8 R4 红线：手工回执一旦能改资金，账本就有了可伪造入口）"
+fi
+[ -s internal/server/leg_status.go ] || fail173 "leg_status 落地面不在册（回报腿的版本读数没有落点）"
+LGT=$(cat internal/server/leg_status_test.go || true)
+grep_q "func Test" LGT B || fail173 "leg_status 一条用例都没有（写了没人验＝下一版可以随便挪）"
+[ -s qmt_gateway/report_uplink.py ] || fail173 "回报腿模块不在册"
+UPL=$(cat qmt_gateway/report_uplink.py || true)
+grep_q "urllib" UPL F || fail173 "回报腿不再是 stdlib-only（依赖越少，朋友机越不容易起不来）"
+[ -s qmt_gateway/tests/test_broker_reads.py ] || fail173 "柜台导出解析用例不在册（missing≠empty 那条边界没有锁）"
+# ⑤ 四源时段窗逐字同源（Go / 网关 / 桥 / 执行器烘参）+ 左闭右开
+CNT173=$((CNT173 + 1))
+SGT=$(cat "$SG" || true)
+GO_CANCEL=$(printf '%s\n' "$SGT" | grep -oE 'DefaultNoCancelWindows = "[^"]+"' | head -1 || true)
+GO_NEW=$(printf '%s\n' "$SGT" | grep -oE 'DefaultNoNewOrderWindows = "[^"]+"' | head -1 || true)
+[ -n "$GO_CANCEL" ] || fail173 "读不到 Go 侧禁撤窗出厂值（锚漂了）"
+[ -n "$GO_NEW" ] || fail173 "读不到 Go 侧禁挂窗出厂值（锚漂了）"
+WINCHK=$(python3 - "$GO_CANCEL" "$GO_NEW" <<'PYWIN'
+import json,re,sys
+go_cancel=re.search(r'"([^"]+)"',sys.argv[1]).group(1)
+go_new=re.search(r'"([^"]+)"',sys.argv[2]).group(1)
+p=json.load(open('qmt_gateway/local_executor_params.json',encoding='utf-8'))['params']
+def render(ps): return ",".join("%s-%s"%(a,b) for a,b in ps)
+bad=[]
+if render(p['no_cancel_windows'])!=go_cancel: bad.append("executor_no_cancel=%s vs go=%s"%(render(p['no_cancel_windows']),go_cancel))
+if render(p['no_new_order_windows'])!=go_new: bad.append("executor_no_new=%s vs go=%s"%(render(p['no_new_order_windows']),go_new))
+gw=re.search(r'DEFAULT_NO_CANCEL_WINDOWS = "([^"]+)"',open('qmt_gateway/broker.py',encoding='utf-8').read())
+br=re.search(r'DEFAULT_NO_CANCEL_WINDOWS = "([^"]+)"',open('qmt_gateway/qmt_bridge_strategy.py',encoding='utf-8').read())
+if not gw: bad.append("broker.py 常量取不到")
+if not br: bad.append("bridge 常量取不到")
+for tag,m in (("broker",gw),("bridge",br)):
+    if m and m.group(1)!=go_cancel: bad.append("%s=%s vs go=%s"%(tag,m.group(1),go_cancel))
+print("WIN_OK" if not bad else "WIN_BAD "+" | ".join(bad))
+PYWIN
+)
+grep_q "WIN_OK" WINCHK F || fail173 "四处禁撤/禁挂窗不同源（断链后第四份会做出相反决定）：${WINCHK}"
+grep_q "if start <= hhmm < end" LEXT F || fail173 "执行器窗口判定不再是左闭右开（右闭会连 09:30 一起拦——那正是连续竞价开始那一刻）"
+grep_q "elif hhmm >= start or hhmm < end" LEXT F || fail173 "跨午夜窗口不再是右开（另一处会多拦一分钟）"
+
+# ⑥ 构建闸：漂移拒建 / 装载自证 / 短码唯一 / 沙箱零文件零网络
+CNT173=$((CNT173 + 1))
+BLT=$(cat "$BUILDR" || true)
+grep_q 'return fail("baked_copy_drifted"' BLT F || fail173 "漂移闸不见了：仓内烘参副本可以与参数 JSON 不一致而构建仍绿（11-04 实测过这个形态）"
+grep_q "def gate_ascii" BLT F || fail173 "ASCII 闸不见了"
+grep_q "def gate_sandbox_loads" BLT F || fail173 "g7 装载自证不见了（五道闸全绿而产物第一次 handlebar 就 NameError 的那次教训）"
+grep_q "def gate_sandbox_imports" BLT F || fail173 "g6 沙箱导入闸不见了"
+grep_q "def gate_pported_short_codes_unique" BLT F || fail173 "g8 短码唯一闸不见了（两条规则共用一个备注码＝第一条永久压住第二条）"
+grep_q 'SANDBOX_ALLOWED_IMPORTS = {"builtins", "datetime", "hashlib", "math", "time"}' BLT F || fail173 "沙箱允许导入面与登记值不一致（这里唯一可放宽的是纯算术 math；os/sys/sqlite3/网络一律不许进）"
+for banned in '"os"' '"sys"' '"sqlite3"' '"subprocess"' '"socket"'; do
+	if grep_q "SANDBOX_ALLOWED_IMPORTS = \{.*$banned" BLT E; then
+		fail173 "沙箱允许导入面出现 ${banned}：内置策略按券商公告不得碰文件、网络与子进程"
+	fi
+done
+for tok in '"rules_form"' '"rules_t"'; do
+	if grep_q "SANDBOX_ALLOWED_IMPORTS = {.*$tok" BLT E; then
+		fail173 "沙箱允许 import ${tok}：内置策略是单文件，规则只能内联"
+	fi
+done
+
+# ⑦ 撤单腿 fail-closed + 投递腿三段自证、且不直起客户端
+CNT173=$((CNT173 + 1))
+grep_q "def cancel_leg(self, day, broker_rows, moment, closed_days)" LEXT F || fail173 "执行器超时撤单/收盘清场腿不见了（桥断后没人帮你撤单）"
+grep_q "if terminal is not False:" LEXT F || fail173 "撤单腿不再区分未知态（词表取不到时会反复撤单）"
+grep_q "def mark_cancelled(self, day, order_id)" LEXT F || fail173 "同一委托号的重复撤单留痕不见了（频繁瞬时撤单是四类异常交易监测口径之一）"
+UPT=$(cat "$UPS" || true)
+for stage in "UPDATE_STAGE=BACKUP" "UPDATE_STAGE=WRITE" "UPDATE_STAGE=VERSION"; do
+	grep_q "$stage" UPT F || fail173 "投递腿三段缺一段（${stage}）：没有版本回读的自动更新就是伪装成功的静默失效"
+done
+grep_q "function Stop-AutoUpdate" UPT F || fail173 "回读失败不再立 STOP_AUTO_UPDATE 牌（下次会在不明状态上继续投）"
+grep_q "schtasks /Run" UPT F || fail173 "重启客户端不再走计划任务（会话内直起会随会话被杀，10-29 实录）"
+# 大小写折叠后交给 grep_q，而不是 printf|grep -qi：§129 那把尺子数的就是"整份测试原文
+# 直接管道给 grep -q"的形状——命中即退会打死写方、pipefail 会把判绿读成判红。
+UPTL=$(printf '%s' "$UPT" | tr 'A-Z' 'a-z')
+for banned in "start-process" "xtitclient.exe" "invoke-expression"; do
+	if grep_q "$banned" UPTL F; then
+		fail173 "投递腿里出现 ${banned}：禁止直接拉起交易客户端，也禁止任何 GUI 自动化"
+	fi
+done
+ULET=$(cat "$ULE" || true)
+grep_q "write_failed_restored" ULET F || fail173 "本地执行器投递腿的写失败不再还原备份（半份文件会被下一轮当已安装跑起来）"
+
+# ⑧ 移植规则：内联进两个载体，不靠 import；缺模块/缺短码一律拒建
+CNT173=$((CNT173 + 1))
+grep_q "# ==== PORTED RULES BEGIN ====" LEXT F || fail173 "执行器的 PORTED 区标记不见了（构建器无处注入）"
+grep_q "# ==== PORTED RULES BEGIN ====" SANDBOXT F || fail173 "沙箱模板的 PORTED 区标记不见了"
+grep_q "_PORTED_INLINE = {}" LEXT F || fail173 "内联表结构不见了：注册关系一旦改成运行时 import，发布件换个目录就静默少一批规则"
+for fn in register_ported_rule rule_arm_mode ported_load_status _ported_static_table; do
+	grep_q "\"$fn\"" BLT F || fail173 "共享注册表函数 ${fn} 不再被构建器带进沙箱（两个载体各写一份就会漂成不对称）"
+done
+grep_q "ported_modules_missing" BLT F || fail173 "点名了却没带文件不再拒建"
+grep_q "ported_kinds_without_short_code" BLT F || fail173 "注册种类没有短码不再拒建（幂等键缺失＝可能重复下单）"
+grep_q "def rule_arm_mode(params, kind)" LEXT F || fail173 "武装态判据不见了：P1 阈值移植后必须先在影子期与引擎对照 >=5 交易日"
+grep_q "return \"off\"" LEXT F || fail173 "移植规则的缺省不再是 off（新规则会在没人对照的那天直接花钱）"
+
+# ⑨ 用例在册（Go 13 + Python 4 份 + 前端 2 份），名字漂了就是锁没了
+CNT173=$((CNT173 + 1))
+EBTEST=$(cat internal/trading/external_brain_test.go || true)
+[ -n "$EBTEST" ] || fail173 "读不到 internal/trading/external_brain_test.go（外脑档判据没有用例＝锁不存在）"
+for name in TestExternalBrainShadowBeatsAutoJudgement TestExternalBrainProbeFailureIsThree TestExternalBrainBridgeHeartbeatDownIsThree TestExternalBrainReadStaleIsTwo TestExternalBrainUnparsableTimeIsNotStale TestExternalBrainJudgementIsReadOnly TestCaptureQueuedConnectedIsSingleWriterAndNoDowngrade TestExternalBrainTierNumbersAreExternalContract TestExternalBrainNoGatewayIsNotApplicable; do
+	grep_q "func $name" EBTEST F || fail173 "Go 用例缺失：${name}"
+done
+GATE_T=$(cat internal/engine/external_brain_gate_test.go || true)
+for name in TestExternalBrainBridgeDownPlacesNoBuy TestExternalBrainBridgeUpStillPlacesBuy TestExternalBrainLegacyGatewayUnknownIsNormal TestExternalBrainBridgeDownStillSells; do
+	grep_q "func $name" GATE_T F || fail173 "引擎行为腿缺失：${name}（静态锁抓不到『接线断了』，11-04 就是这么漏的）"
+done
+QUIET_T=$(cat internal/metrics/external_brain_quiet_test.go || true)
+for name in TestQuietRulesFirstPushStillGoesOut TestQuietRulesRepeatFoldsIntoDaily TestQuietRulesRecoveryAlwaysPasses TestQuietRulesDoNotMuteOthers TestQuietAlertRulesRoundTrip; do
+	grep_q "func $name" QUIET_T F || fail173 "静默域用例缺失：${name}"
+done
+for f in test_local_executor.py test_executor_cancel_leg.py test_windows_four_source.py test_broker_reads.py test_internal_strategy_sandbox.py test_update_qmt_strategy.py; do
+	[ -s "qmt_gateway/tests/$f" ] || fail173 "网关用例文件不在册：$f"
+done
+[ -s web/src/utils/liveBrain.js ] || fail173 "前端档位文案表不在册（0/1 不渲染、2/3/4 三句不同处置方向）"
+[ -s web/src/components/ExternalBrainTag.jsx ] || fail173 "前端外脑档组件不在册（读面有数、屏上看不见＝等于没有）"
+
+# ⑩ 常驻反证：摘掉判据必须红，且读 R173_MUTATED（恒 0 的锁不算锁）
+CNT173=$((CNT173 + 1))
+R173_MUTATED=0
+WORK173=$(mktemp -d /tmp/gate173-XXXXXX)
+cp "$PJ" "$WORK173/pj.json"
+python3 - "$WORK173/pj.json" <<'PYR1' || true
+import json,sys
+p=sys.argv[1]; d=json.load(open(p,encoding='utf-8'))
+d['params']['no_cancel_windows']=[["14:55","15:00"]]
+json.dump(d,open(p,'w',encoding='utf-8'))
+PYR1
+if ( cd /tmp && python3 - "$WORK173/pj.json" <<'PYR2' >/dev/null 2>&1
+import json,re,sys
+go_cancel="09:20-09:30,14:57-15:00"
+p=json.load(open(sys.argv[1],encoding='utf-8'))['params']
+render=lambda ps: ",".join("%s-%s"%(a,b) for a,b in ps)
+sys.exit(0 if render(p['no_cancel_windows'])!=go_cancel else 1)
+PYR2
+); then R173_MUTATED=$((R173_MUTATED + 1)); fi
+cp "$BUILDR" "$WORK173/b.py"
+python3 - "$WORK173/b.py" <<'PYR3' || true
+import sys
+p=sys.argv[1]; s=open(p,encoding='utf-8').read()
+s=s.replace('def gate_sandbox_loads(artifact):','def gate_sandbox_loads_disabled(artifact):',1)
+s=s.replace('"g7_sandbox_loads",','"g7_sandbox_loads_disabled",',1)
+open(p,'w',encoding='utf-8').write(s)
+PYR3
+if ! python3 "$WORK173/b.py" --target sandbox >/dev/null 2>&1; then :; fi
+if grep -q "g7_sandbox_loads_disabled" "$WORK173/b.py" && ! grep -q "^def gate_sandbox_loads(" "$WORK173/b.py"; then
+	R173_MUTATED=$((R173_MUTATED + 1))
+fi
+[ "$R173_MUTATED" -ge 2 ] || fail173 "§173 常驻反证未生效（R173_MUTATED=${R173_MUTATED}，应 >=2）：这两把锁今天没有牙"
+echo "   [§173 反证] R173_MUTATED=${R173_MUTATED}（摘四源窗口判据 / 摘 g7 装载自证，两处均按预期失效）"
+rm -rf "$WORK173"
+
+[ "$B173_FAILED" = "0" ] || exit 1
+echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 常驻反证 1，累计判定点 ${CNT173}）"
 
 echo "==> 全部通过"
 

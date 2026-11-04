@@ -213,6 +213,7 @@ ALLOWED_IMPORTS = {
     "sqlite3": "local state journal",
     "sys": "process exit",
     "time": "clock and pacing",
+    "math": "pure numeric helpers (percentile/clamp), no IO and no network",
     "xtquant": "the local QMT SDK",
 }
 
@@ -262,6 +263,13 @@ SAFE_METHODS = {
     "index": "sequence position", "rsplit": "string method", "split": "string method",
     "callable": "is the terminal-injected name a function",
     "ascii": "ASCII-safe log rendering (a GBK console eats CJK)",
+    "isnan": "NaN test on a bar value (Go's math.IsNaN equivalent)",
+    "isfinite": "finite test before a money comparison",
+    "floor": "lot rounding", "ceil": "rounding up", "sqrt": "volatility math",
+    "log": "logarithm (factor library)", "log1p": "logarithm (factor library)",
+    "exp": "exponential (factor library)", "pow": "power", "fsum": "stable sum",
+    "copysign": "sign transfer (alpha formulas)", "isclose": "float comparison",
+    "fabs": "absolute value of a float",
     "get": "dict read", "startswith": "prefix test", "title": "string method", "upper": "string method",
     "zfill": "string method",
     # file / stream / cursor methods
@@ -387,6 +395,234 @@ def bake(source, params, version):
     body += source[end:]
     return body
 
+
+
+# ---------------------------------------------------------------------------
+# PORTED RULE MODULES (owner 2026-11-04: all live factor/pattern/T/sizing rules
+# must end up inside the py carriers, not only in the Go engine).
+#
+# One source, two carriers: the rule bodies live in qmt_gateway/rules_*.py and
+# are INLINED into the published artifact between the PORTED RULES markers.
+# Neither carrier can keep a hand-copied second version:
+#   * the QMT built-in strategy is a single file and cannot import anything;
+#   * the local executor would otherwise drift the moment a threshold is edited.
+# Each module is gated on its own before it is inlined (ASCII / privileged calls
+# / bare numbers inside rule_* functions), and every kind it registers must own
+# a short code in params.signal_codes -- without a code the counter-remark
+# idempotency check cannot vouch for that rule, and two rules sharing one code
+# would let the first one's orders silence the second forever.
+# ---------------------------------------------------------------------------
+PORTED_MODULE_ORDER = ("rules_form", "rules_ladder", "rules_factor", "rules_t", "rules_sizing")
+PORTED_BEGIN = "# ==== PORTED RULES BEGIN ===="
+PORTED_END = "# ==== PORTED RULES END ===="
+
+
+def read_pported_module(name):
+    """Read one ported module, or None when it is not on this box yet."""
+    path = os.path.join(REPO_ROOT, "qmt_gateway", name + ".py")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def ported_rules_table(source, name):
+    """Return {kind: function_name} a module registers, by AST (never by exec).
+
+    The build host must not execute a trading module: it has no xtquant, and
+    running rules that can place orders just to read a table is its own risk.
+    """
+    import ast
+    tree = ast.parse(source)
+    out = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "RULES" not in targets or not isinstance(node.value, ast.Dict):
+            continue
+        for key, value in zip(node.value.keys, node.value.values):
+            if isinstance(key, ast.Constant) and isinstance(value, ast.Name):
+                out[str(key.value)] = value.id
+    if not out:
+        # 显式的空 RULES 是合法的：T 腿与仓位腿移植的是**判定**（能不能开回合、帽子多大），
+        # 不产出带短码的委托信号。允许它，但要求模块自己写明"我没有信号种类"——
+        # 判据是文件里有没有 `RULES = {}` 这一行；没有就是漏注册，照旧拒建。
+        if re.search(r"^RULES\s*=\s*\{\s*\}", source, re.M):
+            return {}
+        raise ValueError("ported_module_registers_nothing:%s" % name)
+    return out
+
+
+def ported_top_level_names(source):
+    """Every top-level name a module defines (for the collision check)."""
+    import ast
+    tree = ast.parse(source)
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+    return names
+
+
+def strip_pported_preamble(source):
+    """Drop import lines (the carriers own the import surface) and keep bodies.
+
+    An import of anything outside ALLOWED_IMPORTS is a hard failure: an inlined
+    module must reach exactly the shared helpers, or the artifact would carry a
+    dangling reference that only explodes on the first live tick.
+    """
+    import ast
+    lines = source.split("\n")
+    tree = ast.parse(source)
+    drop = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                root = (getattr(node, "module", None) or alias.name).split(".")[0]
+                if root not in ALLOWED_IMPORTS:
+                    raise ValueError("ported_module_import_not_allowed:%s" % root)
+            for ln in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                drop.add(ln - 1)
+    return "\n".join([l for i, l in enumerate(lines) if i not in drop])
+
+
+def ported_top_level_texts(source):
+    """Top-level name -> its exact source text (for the byte-identical dedup)."""
+    import ast
+    tree = ast.parse(source)
+    out = {}
+    for node in tree.body:
+        seg = ast.get_source_segment(source, node)
+        if not seg:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out[node.name] = seg
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    out[t.id] = seg
+    return out
+
+
+def drop_top_level_definition(source, name, definition):
+    """Remove one exact top-level definition (the duplicate we chose not to carry)."""
+    return source.replace(definition + "\n", "", 1)
+
+
+def assemble_pported(params):
+    """Inline every ported module params asks for, and merge their RULES tables.
+
+    Two failure modes are refused rather than tolerated:
+      * a named module that is not on disk (the box would run a smaller rule set
+        than the one that was tested -- invisible from the outside);
+      * a registered kind with no short code (the counter remark is the ONLY
+        idempotency key, so such a rule could double-send), and two modules
+        defining the same top-level name (the later definition would silently
+        erase the earlier one).
+    """
+    wanted = list(params.get("ported_modules") or [])
+    codes = params.get("signal_codes") or {}
+    missing, missing_codes, collisions = [], [], []
+    seen_names = {}
+    deduped = []
+    dropped = {}
+    blocks = []
+    for name in wanted:
+        source = read_pported_module(name)
+        if source is None:
+            missing.append(name)
+            continue
+        table = ported_rules_table(source, name)
+        for kind in sorted(table):
+            if not codes.get(kind):
+                missing_codes.append("%s.%s" % (name, kind))
+        for nm, definition in sorted(ported_top_level_texts(source).items()):
+            if nm in ("RULES",):
+                continue  # re-snapshotted per module below
+            if nm in seen_names:
+                if seen_names[nm][1] == definition:
+                    # 逐字相同的定义（例如共享的 make_signal）只带一份进产物：
+                    # 去重而不是报错，是为了让"模块单独可 import 自测"与"内联后不互相覆盖"
+                    # 同时成立。文本一旦漂了就不相同 ⇒ 照样报 collision。
+                    deduped.append("%s:%s" % (nm, name))
+                    dropped.setdefault(name, set()).add(nm)
+                    continue
+                collisions.append("%s:%s/%s" % (nm, seen_names[nm][0], name))
+            seen_names[nm] = (name, definition)
+        snapshot = "_RULES_SNAPSHOT_%s = dict(RULES)" % name.upper()
+        body = strip_pported_preamble(source)
+        for nm, definition in sorted(ported_top_level_texts(source).items()):
+            if nm in dropped.get(name, ()):
+                body = drop_top_level_definition(body, nm, definition)
+        blocks.append("# ---- inlined from qmt_gateway/%s.py ----\n%s\n%s"
+                      % (name, body, snapshot))
+    if missing:
+        raise ValueError("ported_modules_missing:%s" % ",".join(missing))
+    if missing_codes:
+        raise ValueError("ported_kinds_without_short_code:%s" % ",".join(missing_codes))
+    if collisions:
+        raise ValueError("ported_name_collision:%s" % ",".join(collisions[:6]))
+    if deduped:
+        sys.stdout.write("PORTED_DEDUP=%s\n" % ",".join(deduped))
+    if not blocks:
+        return "\n_PORTED_RULES = {}\n_PORTED_INLINE = {}\n"
+    merged = "\n".join(
+        ["    %r: _RULES_SNAPSHOT_%s," % (n, n.upper()) for n in wanted])
+    # 注入是**整段替换**标记区，所以注册表本体必须写在注入内容里：
+    # 少这一行，产物里就是 `register_ported_rule` 往不存在的 _PORTED_RULES 里写
+    # （g7 装载自证今天就是抓的这个）。
+    return ("\n_PORTED_RULES = {}\n" + "\n\n".join(blocks) +
+            "\n\n_PORTED_INLINE = {\n" + merged + "\n}\n" +
+            "\nfor _name, _table in _PORTED_INLINE.items():\n"
+            "    for _kind, _fn in (_table or {}).items():\n"
+            "        register_ported_rule(_kind, _fn, _name)\n"
+            "del _name, _kind, _fn\n"
+            "\n_PORTED_RULES = _PORTED_RULES\n")
+
+
+def inject_pported(artifact, params):
+    """Replace the PORTED RULES marker block in the artifact."""
+    begin = artifact.index(PORTED_BEGIN) + len(PORTED_BEGIN)
+    end = artifact.index(PORTED_END, begin)
+    return artifact[:begin] + assemble_pported(params) + "    " + artifact[end:]
+
+
+def gate_pported_short_codes_unique(artifact):
+    """Two registered kinds must not share one short code.
+
+    The remark is the ONLY idempotency key inside the sandbox, so a collision
+    means one rule's orders permanently suppress another's -- and it would look
+    like a quiet strategy that simply never fires.
+    """
+    import ast
+    tree = ast.parse(artifact)
+    seen = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "PARAMS" not in names or not isinstance(node.value, ast.Dict):
+            continue
+        for key, value in zip(node.value.keys, node.value.values):
+            if isinstance(key, ast.Constant) and key.value == "signal_codes" \
+                    and isinstance(value, ast.Dict):
+                for k, v in zip(value.keys, value.values):
+                    code = getattr(v, "value", None)
+                    kind = getattr(k, "value", None)
+                    if not isinstance(code, str):
+                        continue
+                    if code in seen and seen[code] != kind:
+                        return False, "short_code_collision:%s shared by %s/%s" % (
+                            code, seen[code], kind)
+                    seen[code] = kind
+    if not seen:
+        return False, "signal_codes_unreadable"
+    return True, "short_codes_unique n=%d" % len(seen)
 
 def gate_ascii(artifact):
     """G1: the artifact must contain no non-ASCII byte."""
@@ -808,9 +1044,16 @@ SHARED_FUNCTIONS = [
     "now_cn", "day_key", "hhmm_now", "symbol_head", "text_sha256",
     "build_remark", "short_code_from_remark", "normalize_tick",
     "normalize_order_status",
+    # §PORTED-RULES：注册表本身也共用一份。沙箱不能 import，所以"怎么登记一条规则、
+    # 怎么取它的武装态、缺模块怎么报"这三件事必须在两个载体里逐字相同——
+    # 各写一份就会漂成"执行器里 shadow、沙箱里 live"那种最贵的不对称。
+    "register_ported_rule", "rule_arm_mode", "_ported_static_table",
+    "load_ported_modules", "ported_load_status",
 ]
 
-SANDBOX_ALLOWED_IMPORTS = {"builtins", "datetime", "hashlib", "time"}
+# math is pure arithmetic -- the built-in strategy may use it, it still reaches
+# neither a file nor a socket (that is what g6's forbidden-token pass enforces).
+SANDBOX_ALLOWED_IMPORTS = {"builtins", "datetime", "hashlib", "math", "time"}
 
 def gate_sandbox_loads(artifact):
     """g7: the published artifact must LOAD, not merely parse.
@@ -1064,6 +1307,15 @@ def main(argv=None):
             return fail("baked_copy_drifted",
                         "repo copy %s differs from params JSON (version=%s); "
                         "re-run with --refresh-source" % (args.source, version))
+
+    # §PORTED-RULES：两个载体都要在发布前把移植进来的规则内联进去（缺模块/缺短码
+    # 一律拒建，而不是带着半套规则上线）。
+    try:
+        artifact = inject_pported(artifact, params)
+    except ValueError as exc:
+        return fail("ported_rules_inject_failed", str(exc))
+    gates = gates + [("g8_short_codes_unique", gate_pported_short_codes_unique,
+                     "two rules must not share one counter remark code")]
 
     ok, results = run_gates(artifact, gates)
     if not ok:

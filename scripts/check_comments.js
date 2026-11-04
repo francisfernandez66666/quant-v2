@@ -51,6 +51,13 @@ const ASCII_ONLY = new Set([
   // （中文注释会被撕成 '?'，11-02 那次假象就是同一成因）。它们仍必须"有注释"，
   // 只是注释一律英文——豁免的是中文要求，不是注释要求。
   'qmt_gateway/qmt_internal_strategy.py',
+  // 五个移植模块会被构建器逐字内联进上面那份内置策略产物里，所以它们与产物同一条铁律：
+  // 正文纯 ASCII（注释一律英文）。缺注释仍然判红，只是不要求中文。
+  'qmt_gateway/rules_form.py',
+  'qmt_gateway/rules_ladder.py',
+  'qmt_gateway/rules_factor.py',
+  'qmt_gateway/rules_t.py',
+  'qmt_gateway/rules_sizing.py',
   'qmt_gateway/tests/test_update_qmt_strategy.py',
 ])
 

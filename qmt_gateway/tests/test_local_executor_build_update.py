@@ -265,7 +265,7 @@ class TestBuilderLeavesNoHalfProduct(BuilderFixture):
         rc, out = self._run(builder.DEFAULT_PARAMS, self.out)
         self.assertEqual(rc, 0, out)
         self.assertIn("BUILD_RESULT=OK", out)
-        self.assertIn("BUILD_GATES gates=5 all_passed=1", out)
+        self.assertIn("BUILD_GATES gates=6 all_passed=1", out)
         names = os.listdir(self.out)
         self.assertEqual(len(names), 1)
         artifact = os.path.join(self.out, names[0])

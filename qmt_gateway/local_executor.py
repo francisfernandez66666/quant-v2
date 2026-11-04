@@ -66,9 +66,10 @@ import time
 LOG = logging.getLogger("qmt_gateway.local_executor")
 
 # ==== BAKED PARAMS BEGIN ====
-STRATEGY_VERSION = "v01-20261103"
+STRATEGY_VERSION = "v02-20261104"
 PARAMS = {
     'breakdown_ratio': 0.96,
+    'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell'],
     'buy_signals': ['pullback_buy'],
     'close_sweep_from': '14:52',
     'closed_days': [],
@@ -87,8 +88,10 @@ PARAMS = {
     'ops_window_sec': 60,
     'order_amount_cap': 20000.0,
     'poll_interval_sec': 5,
+    'ported_modules': ['rules_form', 'rules_ladder', 'rules_factor', 'rules_t', 'rules_sizing'],
     'pullback_ratio': 0.98,
-    'signal_codes': {'breakdown_sell': 'BK', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP'},
+    'rule_arm': {'break_down': 'shadow', 'double_bump': 'shadow', 'dragon': 'shadow', 'dragon_return': 'shadow', 'factor_composite': 'shadow', 'good_news_fade': 'shadow', 'high_churn': 'shadow', 'leader_decay': 'shadow', 'leader_decay_v2': 'shadow', 'pattern_template': 'shadow'},
+    'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP'},
     'stale_order_sec': 900,
     'stop_loss_ratio': 0.97,
     'symbol_head_len': 6,
@@ -587,6 +590,122 @@ def make_signal(params, ctx, kind, side, amount, price, qty=None):
     }
 # ==== RULE LAYER END ====
 
+# ==== PORTED RULES BEGIN ====
+# The ported rule modules (rules_form / rules_ladder / rules_factor / rules_t /
+# rules_sizing) are INLINED here by scripts/build_local_executor.py, in both
+# carriers. One mechanism on purpose:
+#   * the QMT built-in strategy is a single file and cannot import anything;
+#   * the published local-executor artifact is also a single file, and a runtime
+#     "import rules_t" would then depend on where the file happens to sit --
+#     a missing module would silently shrink the rule set while every gate stayed
+#     green. That is the "the knob says 5 strategies, the box runs 4" shape.
+# In the repository copy this block is empty (the modules are not written yet);
+# the builder fails the build when params names a module that is not on disk.
+_PORTED_RULES = {}
+_PORTED_INLINE = {}
+# ==== PORTED RULES END ====
+
+
+def _ported_static_table():
+    """kind -> (fn, module name) read from what the builder inlined.
+
+    A module named in params but contributing nothing is reported by
+    load_ported_modules as a failure, not as "no signals today".
+    """
+    out = {}
+    for name, table in _PORTED_INLINE.items():
+        for kind, fn in (table or {}).items():
+            out[kind] = (fn, name)
+    return out
+
+
+def register_ported_rule(kind, fn, source):
+    """Add one ported rule to the registry.
+
+    A duplicate kind is a build failure, not a last-write-wins: two rules with
+    the same short code would make the counter-remark idempotency check prove
+    the wrong intent (the first rule's orders would silence the second's).
+    """
+    if kind in _PORTED_RULES and _PORTED_RULES[kind][1] != source:
+        raise ValueError("ported_rule_kind_conflict:%s(%s,%s)"
+                         % (kind, _PORTED_RULES[kind][1], source))
+    _PORTED_RULES[kind] = (fn, source)
+
+
+def load_ported_modules(params):
+    """Import the ported rule modules and register what they expose.
+
+    Fail-loud-but-continue: a module that will not import is recorded in
+    params-visible state so the round reports it. A strategy module that is
+    silently missing is the "it looks like it runs but nothing was ever loaded"
+    shape this repo keeps getting bitten by (see the 2026-11-02 dead-gauge notes).
+    """
+    # Static list on purpose: the build gate must be able to see which symbols
+    # the artifact can reach, so there is no dynamic import here (and the sandbox
+    # artifact has no import at all -- the builder inlines the bodies instead).
+    table = {}
+    try:
+        table.update(_ported_static_table())
+    except Exception as exc:  # noqa: BLE001
+        return [], ["table_unavailable:%s" % repr(exc)[:80]]
+    wanted = params.get("ported_modules") or sorted(set(src for _k, (_f, src) in table.items()))
+    loaded, failed = [], []
+    for name in wanted:
+        kinds = [k for k, (_f, src) in table.items() if src == name]
+        if not kinds:
+            # The module was named but registers nothing: it did not come along
+            # (package missing a file, or the sandbox inline failed). Report it
+            # red -- folding "not loaded" into "no signal today" is the exact
+            # failure shape this repo keeps getting bitten by.
+            failed.append("%s:no_rules_registered" % name)
+            continue
+        for kind in kinds:
+            try:
+                register_ported_rule(kind, table[kind][0], name)
+            except ValueError as exc:
+                failed.append("%s:%s" % (name, repr(exc)[:80]))
+                continue
+        loaded.append(name)
+    return loaded, failed
+
+
+def rule_arm_mode(params, kind):
+    """shadow | live | off for one rule (default off for anything ported).
+
+    Why this exists instead of "port it and it trades": docs/IMPL_QMT_INTERNAL_LOOP
+    .md requires every P1 rule to run in shadow against the Go engine for at
+    least five trading days
+    before it may touch money, because a threshold that was re-calibrated wrong
+    changes the strategy's MEANING without changing any number anyone can see.
+    Shadow means the rule computes, is counted, and never places.
+    """
+    modes = params.get("rule_arm") or {}
+    if kind in modes:
+        return str(modes.get(kind) or "off")
+    if kind in (params.get("builtin_rules") or []):
+        return "live"
+    return "off"
+
+def ported_load_status(params):
+    """Which ported rule modules actually arrived, and which did not.
+
+    This exists because "the box is running 4 rules instead of the 20 that were
+    tested" is invisible from the outside: the round simply produces fewer
+    signals, which looks exactly like a quiet market. Anything that cannot be
+    loaded has to be said out loud (log, --selftest, round summary) -- the same
+    stance the news and quote legs take with "not fetched" vs "nothing there".
+    """
+    table = _ported_static_table()
+    loaded = sorted(set(src for _kind, (_fn, src) in table.items()))
+    wanted = list(params.get("ported_modules") or [])
+    missing = [name for name in wanted if name not in loaded]
+    kinds = sorted(table)
+    armed = {kind: rule_arm_mode(params, kind) for kind in kinds}
+    return {"wanted": wanted, "loaded": loaded, "missing": missing,
+            "kinds": kinds, "armed": armed}
+
+
+
 
 # ---------------------------------------------------------------------------
 # STATE LAYER: the local sqlite journal ("what did we already send today").
@@ -1012,10 +1131,16 @@ class Executor(object):
 
     def __init__(self, params, data, broker, state, clock=None):
         self.params = params
+        # Rule failures are counted, never folded into "no signal today".
+        self.errors = []
         self.data = data
         self.broker = broker
         self.state = state
         self.clock = clock or now_cn
+        # Register whatever the artifact inlined (or whatever the box can import)
+        # once, at construction, so a missing module is reported by the FIRST
+        # round instead of being discovered by a human comparing signal counts.
+        self.ported_loaded, self.ported_failures = load_ported_modules(params)
 
     def context_for(self, symbol, moment, broker_rows, positions, cash, closed_days):
         """Assemble the flat context the rule layer consumes."""
@@ -1123,27 +1248,59 @@ class Executor(object):
                     continue
         return max(broker_total, local_total)
 
-    def decide(self, ctx):
-        """All signals for one symbol, exits first.
+    def decide_with_modes(self, ctx):
+        """All signals for one symbol, exits first, each tagged with its arm mode.
 
-        An exit always wins over an entry on the same symbol: selling a
-        name that must be sold is more urgent than buying anything.
+        An exit always wins over an entry on the same symbol: selling a name that
+        must be sold is more urgent than buying anything.
+
+        The built-in four run in the order they were written. Rules ported from
+        rules_form / rules_ladder / rules_factor / rules_sizing / rules_t are
+        evaluated after them and carry their OWN mode (shadow / live / off), so a
+        freshly ported strategy can be computed and counted for days without ever
+        reaching the counter. Returns [(signal, mode), ...] and not a bare list,
+        because "the rule fired" and "the rule may place an order" are two
+        different facts -- conflating them is how a shadow rule starts spending.
         """
+        out = []
         for rule in (rule_take_profit, rule_stop_loss, rule_breakdown_sell):
             signal = rule(self.params, ctx)
             if signal:
-                return [signal]
+                out.append((signal, "live"))
+                return out
         signal = rule_pullback_buy(self.params, ctx)
         if signal:
-            return [signal]
-        return []
+            out.append((signal, "live"))
+            return out
+        for kind in sorted(_PORTED_RULES):
+            fn, _source = _PORTED_RULES[kind]
+            try:
+                signal = fn(self.params, ctx)
+            except Exception as exc:  # noqa: BLE001
+                # A rule that raises is a rule that is NOT working: count it and
+                # name it, never swallow it into "no signal today".
+                self.errors.append("%s:%s" % (kind, repr(exc)[:80]))
+                continue
+            if not signal:
+                continue
+            out.append((signal, rule_arm_mode(self.params, kind)))
+        return out
+
+    def decide(self, ctx):
+        """Just the signals, no arm mode (the shape the existing locks assert).
+
+        Kept as the public read of "what did the rule layer decide", so the
+        round's money gate can live in decide_with_modes without weakening the
+        determinism/purity tests that only care about the judgement itself.
+        """
+        return [signal for signal, _mode in self.decide_with_modes(ctx)]
 
     def run_round(self):
         """Run one round. Returns a summary dict (never raises on broker
         trouble -- a broken broker must not take the process down)."""
         moment = self.clock()
         day = day_key(moment)
-        summary = {"day": day, "placed": [], "skipped": [], "reason": ""}
+        summary = {"day": day, "placed": [], "skipped": [], "shadow": [], "reason": ""}
 
         try:
             broker_rows = self.broker.orders_today()
@@ -1171,7 +1328,18 @@ class Executor(object):
 
         for symbol in self.params.get("symbols", []):
             ctx = self.context_for(symbol, moment, broker_rows, positions, cash, closed_days)
-            for signal in self.decide(ctx):
+            for signal, mode in self.decide_with_modes(ctx):
+                if mode == "shadow":
+                    # Shadow leg: compute and record, never spend. The whole
+                    # point of the 5-day shadow window is that the judgement can
+                    # be compared against the engine while no money is involved.
+                    summary["shadow"].append({"short_code": signal["short_code"],
+                                              "kind": signal.get("kind"), "symbol": symbol})
+                    continue
+                if mode != "live":
+                    summary["skipped"].append({"short_code": signal["short_code"],
+                                               "reason": "rule_not_armed"})
+                    continue
                 outcome = self._maybe_send(ctx, signal, done, day)
                 if outcome.get("sent"):
                     summary["placed"].append(outcome)

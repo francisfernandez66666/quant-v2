@@ -143,12 +143,14 @@ class TestReportFieldsContractIntact(unittest.TestCase):
         # §SIDE-AUTH-2（2026-09-23 夜间批）系有意的契约新增：side_unverified（trade 专用，
         # 未命中派发行/派发行为空方向时的成交标记）——随契约变更同步更新本硬编码集，
         # 先例见 §M4 三条补腿。§DYN-SIZE-v3 再补 synced/data_ts（会话新鲜度）。
+        # §EXT-BRAIN-UP（2026-11-05 外脑上行腿批）再补 strategy_version：本地普通进程
+        # （report_uplink.py）heartbeat 携带的已安装内置策略版本——同为**有意**契约新增。
         self.assertEqual(
             sorted(c["report_event_fields"]),
             sorted(["amount", "asset", "at", "broker", "code", "created_at", "data_ts", "fee",
                     "from", "name", "order_id", "positions", "price", "qty", "reason", "side",
-                    "side_unverified", "signal_id", "stamp_tax", "status", "synced", "trade_id",
-                    "traded_at", "type", "user_id"]))
+                    "side_unverified", "signal_id", "stamp_tax", "status", "strategy_version",
+                    "synced", "trade_id", "traded_at", "type", "user_id"]))
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 
 

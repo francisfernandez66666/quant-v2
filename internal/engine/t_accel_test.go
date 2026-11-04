@@ -136,7 +136,8 @@ func TestAccelStopRespectsDisabled(t *testing.T) {
 		t.Fatalf("止血期间不许因为亏到线而主动卖底仓（那是新动作），实得 %q", got)
 	}
 	// 同一条腿：裁决出现 ⇒ 仍然触发（止血停的是新动作，不是收摊）
-	f.e.tSellVerdicts = map[string]time.Time{"600000": time.Now()}
+	// 时钟用夹具钟 f.now：判据已改成读引擎时钟，喂真实钟会让"5 分钟"随真实时刻漂移。
+	f.e.tSellVerdicts = map[string]time.Time{"600000": f.now}
 	if got := r.accelReason(rnd, 9.60); got != paper.TAccelVerdict {
 		t.Fatalf("止血期间裁决仍应触发配平（不是止损），实得 %q", got)
 	}
@@ -154,8 +155,11 @@ func TestAccelVerdictSellsEarly(t *testing.T) {
 
 func TestAccelVerdictExpiry(t *testing.T) {
 	f, r := accelFix(t, 10, 30)
-	// TTL 判据内部走 time.Since（真实钟），所以这里必须用 time.Now 而不是夹具钟。
-	f.e.tSellVerdicts = map[string]time.Time{"600000": time.Now().Add(-6 * time.Minute)}
+	// TTL 判据与腿龄/时段窗同一个基准（e.nowTime，测试里即夹具钟 f.now）。
+	// 改前这里必须喂 time.Now 才绿——那是"判据读真实墙钟"的痕迹：同一条用例在
+	// 10:35 前绿、10:35 后红（2026-11-04 实跑撞上的正是这一族），因为 5 分钟窗
+	// 被拿去和真实钟比。基准统一之后，用例在任何时刻跑都判同一件事。
+	f.e.tSellVerdicts = map[string]time.Time{"600000": f.now.Add(-6 * time.Minute)}
 	rnd := buyRoundAt(f.now, 3*time.Minute, 1000, 10.0)
 	if got := r.accelReason(rnd, 10.05); got != "" {
 		t.Fatalf("裁决超过 5 分钟 TTL 应失效（回到价差门），实得 %q", got)

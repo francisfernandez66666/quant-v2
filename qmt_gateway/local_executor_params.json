@@ -48,7 +48,17 @@
     "poll_interval_sec": 5,
     "pullback_ratio": 0.98,
     "signal_codes": {
+      "break_down": "BD",
       "breakdown_sell": "BK",
+      "double_bump": "DB",
+      "dragon": "D",
+      "dragon_return": "DR",
+      "factor_composite": "FC",
+      "good_news_fade": "GN",
+      "high_churn": "HC",
+      "leader_decay": "LD",
+      "leader_decay_v2": "LD1",
+      "pattern_template": "PT",
       "pullback_buy": "PB",
       "stop_loss": "SL",
       "take_profit": "TP"
@@ -62,7 +72,35 @@
     ],
     "take_profit_ratio": 1.05,
     "volume_ratio_min": 1.5,
-    "close_sweep_from": "14:52"
+    "close_sweep_from": "14:52",
+    "builtin_rules": [
+      "pullback_buy",
+      "take_profit",
+      "stop_loss",
+      "breakdown_sell"
+    ],
+    "ported_modules": [
+      "rules_form",
+      "rules_ladder",
+      "rules_factor",
+      "rules_t",
+      "rules_sizing"
+    ],
+    "rule_arm": {
+      "break_down": "shadow",
+      "double_bump": "shadow",
+      "dragon": "shadow",
+      "dragon_return": "shadow",
+      "factor_composite": "shadow",
+      "good_news_fade": "shadow",
+      "high_churn": "shadow",
+      "leader_decay": "shadow",
+      "leader_decay_v2": "shadow",
+      "pattern_template": "shadow"
+    }
   },
-  "strategy_version": "v01-20261103"
+  "strategy_version": "v02-20261104",
+  "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the four builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",
+  "_comment_ported_modules": "Names of the ported rule modules the builder must inline (rules_form/rules_ladder/rules_factor/rules_t/rules_sizing). Empty list = only the builtin four, i.e. today's behaviour. A name listed here whose file is missing, or whose registered kind has no short code in signal_codes, fails the build rather than publishing a smaller rule set.",
+  "_comment_signal_codes_added": "\u7531 tools \u4e00\u6b21\u6027\u6309\u6a21\u5757 RULES \u8868\u751f\u6210\uff08\u77ed\u7801\u552f\u4e00\u6027\u5f53\u573a\u5224\uff09\uff0crule_arm \u5bf9\u65b0\u79fb\u690d\u89c4\u5219\u7f3a\u7701 shadow\uff1aP1 \u9608\u503c\u5fc5\u987b\u5148\u4e0e\u5f15\u64ce\u5bf9\u7167 >=5 \u4ea4\u6613\u65e5\u3002"
 }

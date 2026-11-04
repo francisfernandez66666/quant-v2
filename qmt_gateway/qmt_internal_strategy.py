@@ -74,6 +74,17 @@ TERMINAL_STATUSES = ()
 # ==== SHARED CODE END ====
 
 
+# ==== PORTED RULES BEGIN ====
+# The ported rule modules are inlined here by scripts/build_local_executor.py.
+# A built-in strategy is one file with no import statement available, so the
+# bodies -- not an import -- are the only correct delivery, and the builder
+# refuses the build when a module named in params is missing on disk (a strategy
+# that silently runs with half its rules is worse than one that fails to load).
+_PORTED_RULES = {}
+_PORTED_INLINE = {}
+# ==== PORTED RULES END ====
+
+
 # ---------------------------------------------------------------------------
 # SANDBOX ADAPTER: counter access, the round loop, and the QMT entry points.
 # ---------------------------------------------------------------------------
@@ -559,13 +570,34 @@ def run_round(ContextInfo, moment):
         for rule in (rule_take_profit, rule_stop_loss, rule_breakdown_sell):
             hit = rule(PARAMS, ctx)
             if hit:
-                signals = [hit]
+                signals = [(hit, "live")]
                 break
         if not signals:
             hit = rule_pullback_buy(PARAMS, ctx)
             if hit:
-                signals = [hit]
-        for signal in signals:
+                signals = [(hit, "live")]
+        if not signals:
+            # Ported rules only get a turn when nothing live fired: the builtin
+            # four ARE today's behaviour, and a ported rule must not pre-empt
+            # them on the day it is armed.
+            for kind in sorted(_PORTED_RULES):
+                fn, _src = _PORTED_RULES[kind]
+                try:
+                    hit = fn(PARAMS, ctx)
+                except Exception as exc:  # noqa: BLE001
+                    # A rule that raises is not a rule that found nothing: name it.
+                    _warn_once("rule_raise:%s" % kind, "rule %s raised %s" % (kind, repr(exc)[:100]))
+                    continue
+                if hit:
+                    signals.append((hit, rule_arm_mode(PARAMS, kind)))
+        for signal, mode in signals:
+            if mode != "live":
+                # shadow/off: counted in the round summary, never sent. The
+                # >=5-day shadow window against the engine is the price of
+                # porting a re-calibrated threshold; spending during it is not.
+                summary["skipped"].append({"short": signal["short_code"],
+                                           "reason": "rule_" + mode})
+                continue
             short = signal["short_code"]
             if short in sent:
                 summary["skipped"].append({"short": short, "reason": "already_sent"})
