@@ -265,7 +265,14 @@ class TestBuilderLeavesNoHalfProduct(BuilderFixture):
         rc, out = self._run(builder.DEFAULT_PARAMS, self.out)
         self.assertEqual(rc, 0, out)
         self.assertIn("BUILD_RESULT=OK", out)
-        self.assertIn("BUILD_GATES gates=6 all_passed=1", out)
+        # 闸数从 6 到 7：新增的 g7e_executor_loads 是把产物**真的 import 一遍**。
+        # 它之所以必须存在：源文件解析正常、六道静态闸全绿，烘出来的产物却在装载时
+        # NameError（内联块里的注册循环排在它调用的函数定义之前）。一个装不起来的载体
+        # 不是"算错"，是"什么都不说"——那正是本仓说过的"声称已做"形状。
+        # 数量之外还按名字断言，摘掉任意一道闸都会红，而不是只红在计数上。
+        self.assertIn("BUILD_GATES gates=7 all_passed=1", out)
+        self.assertTrue(hasattr(builder, "gate_executor_loads"),
+                        "executor load gate removed: a non-importable artifact would pass again")
         names = os.listdir(self.out)
         self.assertEqual(len(names), 1)
         artifact = os.path.join(self.out, names[0])

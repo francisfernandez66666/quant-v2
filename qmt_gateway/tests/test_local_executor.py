@@ -229,11 +229,14 @@ class TestRiskCapsAreAnded(unittest.TestCase):
 
     def test_buy_amount_is_the_minimum_of_every_cap(self):
         p = params()
-        # cash allows 50k, per-order allows 20k, daily allows 5k left
-        c = ctx(available_cash=50000.0, daily_buy_total=95000.0)
+        # cash allows 50k, per-order allows 20k, daily allows 15k left.
+        # 15k (not 5k) because min_order_amount is the Go factory 10000: a 5k room is
+        # correctly refused outright ("not worth an order"), which tests the amount floor
+        # rather than the min-of-caps this case is about.
+        c = ctx(available_cash=50000.0, daily_buy_total=85000.0)
         amount = lex.rule_buy_amount(p, c)
         self.assertIsNotNone(amount)
-        self.assertLessEqual(amount, 5000.0)
+        self.assertLessEqual(amount, 15000.0)
         self.assertLessEqual(amount, 20000.0)
 
     def test_buy_amount_is_none_when_nothing_survives(self):

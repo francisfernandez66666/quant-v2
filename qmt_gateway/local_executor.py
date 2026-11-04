@@ -68,35 +68,158 @@ LOG = logging.getLogger("qmt_gateway.local_executor")
 # ==== BAKED PARAMS BEGIN ====
 STRATEGY_VERSION = "v02-20261104"
 PARAMS = {
+    'breadth_bands': {'low': 0.3, 'mid': 0.5},
+    'breadth_missing_default': 0.9,
+    'breadth_missing_scale': 0.9,
+    'breadth_scales': {'low': 0.7, 'mid': 0.85, 'high': 1.0},
     'breakdown_ratio': 0.96,
+    'budget_mode': 'dynamic',
     'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell'],
     'buy_signals': ['pullback_buy'],
     'close_sweep_from': '14:52',
     'closed_days': [],
+    'cluster_cap_pct': 40,
+    'cluster_rho': 0.7,
     'daily_buy_cap': 100000.0,
+    'emo_breadth_ice_down_ratio': 0.0,
+    'emo_breadth_retreat_down_ratio': 0.0,
+    'emo_climax_board_min': 7,
+    'emo_climax_limitup_min': 80,
+    'emo_diverge_board_drop': 2,
+    'emo_diverge_limitup_drop': 15,
+    'emo_ferment_board_max': 6,
+    'emo_ferment_limitup_max': 79,
+    'emo_ferment_limitup_min': 40,
+    'emo_ice_board_max': 2,
+    'emo_ice_limitup_max': 14,
+    'emo_retreat_board_max': 3,
+    'emo_retreat_limitup_max': 14,
+    'emo_start_board_max': 3,
+    'emo_start_limitup_max': 39,
+    'emo_start_limitup_min': 15,
+    'emotion_enabled': True,
+    'emotion_phase_labels': {'ice': '\u51b0\u70b9', 'start': '\u542f\u52a8', 'ferment': '\u53d1\u9175', 'climax': '\u9ad8\u6f6e', 'divergence': '\u80cc\u79bb', 'retreat': '\u9000\u6f6e'},
+    'emotion_scales': {'ferment': 1, 'start': 1, 'divergence': 0.6, 'retreat': 0.5, 'climax': 0.8},
+    'flow_5d_scales': {'mild_in': 1.05, 'mild_out': 0.85, 'neutral': 1, 'strong_in': 1.1, 'strong_out': 0.7},
+    'flow_bands': {'mild_in_pct': 1, 'mild_out_pct': -1, 'strong_in_pct': 3, 'strong_out_pct': -3},
+    'flow_factor_enabled': True,
+    'flow_today_scales': {'mild_in': 1.025, 'mild_out': 0.95, 'neutral': 1, 'strong_in': 1.05, 'strong_out': 0.9},
+    'group_floor_market': 0.45,
+    'group_floor_stock': 0.35,
+    'holiday_block_new': False,
+    'holiday_long_closed_run': 5,
+    'holiday_long_pre_max': 3,
+    'holiday_scales': {'long1': 0.4, 'long2': 0.6, 'long3': 0.75, 'small1': 0.7, 'small2': 0.85, 'weekend': 0.85},
+    'holiday_small_closed_run': 3,
+    'holiday_small_pre_max': 2,
+    'holiday_weekend_closed_run': 2,
+    'holiday_weekend_pre_max': 2,
+    'index_bands': {'shallow': -1.0, 'deep': -2.0},
+    'index_scales': {'shallow': 1, 'mid': 0.7, 'deep': 0.4},
+    'industry_cap_pct': 35.0,
+    'kelly_clamp': [0.6, 1.15],
+    'kelly_edge_gain': 1.1,
+    'kelly_lambda': 0.5,
+    'kelly_min_prob': 0.52,
+    'kelly_no_edge': 0.6,
+    'llm_bearish_scale': 0.5,
     'lot_size': 100,
     'ma_period': '1d',
     'ma_window': 5,
+    'macro_event_day_scale': 0.3,
+    'macro_lead_curve': [0.9, 0.85, 0.8, 0.7, 0.5],
+    'macro_lead_days': 5,
+    'macro_window_scales': {'high': 0.5, 'low': 1, 'medium': 0.8},
+    'market_state_enabled': False,
+    'max_drawdown_pct': 0.1,
     'max_ops_per_min': 6,
+    'max_total_position_pct': 1,
     'min_cash_reserve': 1000.0,
-    'min_order_amount': 1000.0,
+    'min_order_amount': 10000,
     'min_price': 0.01,
     'min_volume': 1.0,
+    'missing_key_target_cap': 0.5,
     'no_cancel_windows': [['09:20', '09:30'], ['14:57', '15:00']],
     'no_new_order_windows': [['09:20', '09:30'], ['14:52', '15:00']],
     'non_trading_weekdays': [5, 6],
     'ops_window_sec': 60,
     'order_amount_cap': 20000.0,
+    'per_trade_default_hi': 0.3,
+    'per_trade_default_lo': 0.1,
+    'per_trade_hard_max': 0.5,
+    'per_trade_position_max_pct': 0.3,
+    'per_trade_position_pct': 0.1,
     'poll_interval_sec': 5,
     'ported_modules': ['rules_form', 'rules_ladder', 'rules_factor', 'rules_t', 'rules_sizing'],
+    'power_p': 0.5,
     'pullback_ratio': 0.98,
+    'quality_weight_clamp': [0.9, 1.1],
+    'red_block_new_buy': False,
     'rule_arm': {'break_down': 'shadow', 'double_bump': 'shadow', 'dragon': 'shadow', 'dragon_return': 'shadow', 'factor_composite': 'shadow', 'good_news_fade': 'shadow', 'high_churn': 'shadow', 'leader_decay': 'shadow', 'leader_decay_v2': 'shadow', 'pattern_template': 'shadow'},
+    'scale_cap': 1.15,
+    'scale_floor': 0.15,
+    'sell_boost_level': 'L2',
     'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP'},
+    'single_stock_cap_pct': 35.0,
+    'sizing_enabled': True,
+    'sizing_mode': 'power_mean',
+    'sizing_shadow': False,
+    'sl_offset_risk_budget_keep': True,
     'stale_order_sec': 900,
+    'state_scales': {'bear': 0.4, 'bull': 1, 'range': 0.7},
     'stop_loss_ratio': 0.97,
+    'stoploss_guard_count': 4,
     'symbol_head_len': 6,
     'symbols': ['600000.SH', '000001.SZ'],
+    't_commission_rate': 0.00025,
+    't_day_loss_limit_pct': 0,
+    't_direction_mode': 'both',
+    't_enabled': True,
+    't_force_unwind_at': '1450',
+    't_ghost_grace_sec': 90,
+    't_intraday_cap_pct': 50,
+    't_intraday_sell_cap_total_pct': 20,
+    't_last_open_at': '1400',
+    't_limit_distance_pct': 1,
+    't_limit_pct_bse': 29.9,
+    't_limit_pct_main': 9.9,
+    't_limit_pct_st': 4.9,
+    't_limit_pct_star': 19.9,
+    't_limit_pct_wide': 19.9,
+    't_market_plunge_pct': -2,
+    't_max_rounds': 1,
+    't_min_amount_wan': 3000,
+    't_min_amplitude_pct': 2.5,
+    't_min_base_keep': 100,
+    't_min_base_keep_qty': 100,
+    't_min_commission': 5,
+    't_min_listed_days': 60,
+    't_min_market_scale': 0.4,
+    't_min_spread_pct': 2,
+    't_min_turnover_pct': 1.5,
+    't_mode': 'both',
+    't_near_extreme_pct': 0.3,
+    't_no_cancel_windows': [['09:20', '09:30'], ['14:57', '15:00']],
+    't_no_new_order_windows': [['09:20', '09:30'], ['14:52', '15:00']],
+    't_open_cooling_min': 15,
+    't_premise_grace_sec': 120,
+    't_regime_gate_enabled': True,
+    't_regime_min_votes': 4,
+    't_regime_stale_sec': 900,
+    't_round_stop_pct': 2,
+    't_sell_env_min_market_scale': 0.2,
+    't_shadow': False,
+    't_slippage_bps': 5,
+    't_stamp_tax_rate': 0.0005,
+    't_stop_guard_pct': 1.5,
+    't_vol_ratio_max': 1.8,
+    't_vwap_check_tol_pct': 0.1,
+    't_vwap_dev_pct': 0.8,
     'take_profit_ratio': 1.05,
+    'tier_red_default': 0.3,
+    'tier_scales': {'Red': 0.3, 'Yellow': 0.6},
+    'vol_clamp': [0.5, 1.5],
+    'vol_target_pct': 2,
     'volume_ratio_min': 1.5,
 }
 # ==== BAKED PARAMS END ====
@@ -590,20 +713,6 @@ def make_signal(params, ctx, kind, side, amount, price, qty=None):
     }
 # ==== RULE LAYER END ====
 
-# ==== PORTED RULES BEGIN ====
-# The ported rule modules (rules_form / rules_ladder / rules_factor / rules_t /
-# rules_sizing) are INLINED here by scripts/build_local_executor.py, in both
-# carriers. One mechanism on purpose:
-#   * the QMT built-in strategy is a single file and cannot import anything;
-#   * the published local-executor artifact is also a single file, and a runtime
-#     "import rules_t" would then depend on where the file happens to sit --
-#     a missing module would silently shrink the rule set while every gate stayed
-#     green. That is the "the knob says 5 strategies, the box runs 4" shape.
-# In the repository copy this block is empty (the modules are not written yet);
-# the builder fails the build when params names a module that is not on disk.
-_PORTED_RULES = {}
-_PORTED_INLINE = {}
-# ==== PORTED RULES END ====
 
 
 def _ported_static_table():
@@ -696,18 +805,49 @@ def ported_load_status(params):
     stance the news and quote legs take with "not fetched" vs "nothing there".
     """
     table = _ported_static_table()
-    loaded = sorted(set(src for _kind, (_fn, src) in table.items()))
     wanted = list(params.get("ported_modules") or [])
-    missing = [name for name in wanted if name not in loaded]
+    # "carried in the artifact" and "produces a signal kind" are two different
+    # facts and must be counted separately:
+    #   name present in _PORTED_INLINE -> the builder really shipped this module
+    #     (its RULES snapshot is baked in, even when that snapshot is empty --
+    #     rules_t and rules_sizing are judgement legs: they decide whether/how big,
+    #     they emit no signal kind of their own);
+    #   name absent -> the file was missing or the inline failed. That is a shortage.
+    # Counting "modules that have kinds" as loaded used to report both judgement
+    # legs as missing, which mixed "by design" into the same readout as "a file is
+    # gone". Split apart, EXEC_RULES_ALERT fires only for a real shortage.
+    present = sorted(_PORTED_INLINE)
     kinds = sorted(table)
+    kinds_by_module = {}
+    for _kind, (_fn, src) in table.items():
+        kinds_by_module[src] = kinds_by_module.get(src, 0) + 1
+    missing = [name for name in wanted if name not in present]
+    judgement = [name for name in wanted
+                 if name in present and kinds_by_module.get(name, 0) == 0]
     armed = {kind: rule_arm_mode(params, kind) for kind in kinds}
-    return {"wanted": wanted, "loaded": loaded, "missing": missing,
-            "kinds": kinds, "armed": armed}
+    return {"wanted": wanted, "loaded": present, "missing": missing,
+            "judgement": judgement, "kinds": kinds,
+            "kinds_by_module": kinds_by_module, "armed": armed}
 
 
 
 
 # ---------------------------------------------------------------------------
+# ==== PORTED RULES BEGIN ====
+# The ported rule modules (rules_form / rules_ladder / rules_factor / rules_t /
+# rules_sizing) are INLINED here by scripts/build_local_executor.py, in both
+# carriers. One mechanism on purpose:
+#   * the QMT built-in strategy is a single file and cannot import anything;
+#   * the published local-executor artifact is also a single file, and a runtime
+#     "import rules_t" would then depend on where the file happens to sit --
+#     a missing module would silently shrink the rule set while every gate stayed
+#     green. That is the "the knob says 5 strategies, the box runs 4" shape.
+# In the repository copy this block is empty (the modules are not written yet);
+# the builder fails the build when params names a module that is not on disk.
+_PORTED_RULES = {}
+_PORTED_INLINE = {}
+# ==== PORTED RULES END ====
+
 # STATE LAYER: the local sqlite journal ("what did we already send today").
 # ---------------------------------------------------------------------------
 
@@ -1520,6 +1660,27 @@ def print_selftest(params):
     print("EXEC_PARAMS symbols=%s daily_buy_cap=%s order_amount_cap=%s"
           % (",".join(params.get("symbols", [])), params.get("daily_buy_cap"),
              params.get("order_amount_cap")))
+    # ported_load_status's own docstring promises this leg is said out loud in
+    # --selftest and in the round summary. Until now it was said in neither: a box
+    # running 4 rules instead of the 14 that were tested looked exactly like a
+    # healthy box that simply had nothing to say. Counts are printed even when
+    # everything loaded (loaded=5 missing=none), because "absent" must not be
+    # readable as "not checked".
+    status = ported_load_status(params)
+    armed = status.get("armed") or {}
+    print("EXEC_RULES wanted=%s loaded=%s missing=%s judgement=%s kinds=%d live=%d shadow=%d off=%d"
+          % (",".join(status["wanted"]) or "none",
+             ",".join(status["loaded"]) or "none",
+             ",".join(status["missing"]) or "none",
+             ",".join(status.get("judgement") or []) or "none",
+             len(status["kinds"]),
+             sum(1 for v in armed.values() if v == "live"),
+             sum(1 for v in armed.values() if v == "shadow"),
+             sum(1 for v in armed.values() if v not in ("live", "shadow"))))
+    if status["missing"]:
+        # A named module that did not arrive is not "a quiet market": it is a
+        # missing file. Say it in its own line so a log grep finds it.
+        print("EXEC_RULES_ALERT missing_module=%s" % ",".join(status["missing"]))
     return 0
 
 
@@ -1548,8 +1709,15 @@ def main(argv=None):
         interval = float(params["poll_interval_sec"])
     if args.once:
         summary = executor.run_round()
-        print("EXEC_ROUND day=%s placed=%d skipped=%d reason=%s"
+        # shadow is its own field, not folded into skipped: a shadow hit is a
+        # *computation that agreed to run* and is the numerator of the 5-day
+        # comparison, while skipped is "armed off / gated". Folding them makes the
+        # shadow window unmeasurable, which is the whole reason the switch exists.
+        status = ported_load_status(params)
+        print("EXEC_ROUND day=%s placed=%d skipped=%d shadow=%d rules_missing=%s reason=%s"
               % (summary["day"], len(summary["placed"]), len(summary["skipped"]),
+                 len(summary.get("shadow") or []),
+                 ",".join(status["missing"]) or "none",
                  summary["reason"]))
         return 0
     while True:

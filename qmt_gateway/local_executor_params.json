@@ -16,7 +16,7 @@
     "ma_window": 5,
     "max_ops_per_min": 6,
     "min_cash_reserve": 1000.0,
-    "min_order_amount": 1000.0,
+    "min_order_amount": 10000,
     "min_price": 0.01,
     "min_volume": 1.0,
     "no_cancel_windows": [
@@ -97,10 +97,229 @@
       "leader_decay": "shadow",
       "leader_decay_v2": "shadow",
       "pattern_template": "shadow"
-    }
+    },
+    "breadth_missing_scale": 0.9,
+    "budget_mode": "dynamic",
+    "cluster_cap_pct": 40,
+    "cluster_rho": 0.7,
+    "emo_climax_board_min": 7,
+    "emo_climax_limitup_min": 80,
+    "emo_diverge_board_drop": 2,
+    "emo_diverge_limitup_drop": 15,
+    "emo_ferment_board_max": 6,
+    "emo_ferment_limitup_max": 79,
+    "emo_ferment_limitup_min": 40,
+    "emo_ice_board_max": 2,
+    "emo_ice_limitup_max": 14,
+    "emo_retreat_board_max": 3,
+    "emo_retreat_limitup_max": 14,
+    "emo_start_board_max": 3,
+    "emo_start_limitup_max": 39,
+    "emo_start_limitup_min": 15,
+    "emotion_scales": {
+      "ferment": 1,
+      "start": 1,
+      "divergence": 0.6,
+      "retreat": 0.5,
+      "climax": 0.8
+    },
+    "flow_5d_scales": {
+      "mild_in": 1.05,
+      "mild_out": 0.85,
+      "neutral": 1,
+      "strong_in": 1.1,
+      "strong_out": 0.7
+    },
+    "flow_bands": {
+      "mild_in_pct": 1,
+      "mild_out_pct": -1,
+      "strong_in_pct": 3,
+      "strong_out_pct": -3
+    },
+    "flow_factor_enabled": true,
+    "flow_today_scales": {
+      "mild_in": 1.025,
+      "mild_out": 0.95,
+      "neutral": 1,
+      "strong_in": 1.05,
+      "strong_out": 0.9
+    },
+    "group_floor_market": 0.45,
+    "group_floor_stock": 0.35,
+    "holiday_block_new": false,
+    "holiday_scales": {
+      "long1": 0.4,
+      "long2": 0.6,
+      "long3": 0.75,
+      "small1": 0.7,
+      "small2": 0.85,
+      "weekend": 0.85
+    },
+    "index_bands": {
+      "shallow": -1.0,
+      "deep": -2.0
+    },
+    "index_scales": {
+      "shallow": 1,
+      "mid": 0.7,
+      "deep": 0.4
+    },
+    "kelly_lambda": 0.5,
+    "kelly_min_prob": 0.52,
+    "llm_bearish_scale": 0.5,
+    "macro_event_day_scale": 0.3,
+    "macro_lead_curve": [
+      0.9,
+      0.85,
+      0.8,
+      0.7,
+      0.5
+    ],
+    "macro_lead_days": 5,
+    "macro_window_scales": {
+      "high": 0.5,
+      "low": 1,
+      "medium": 0.8
+    },
+    "max_drawdown_pct": 0.1,
+    "max_total_position_pct": 1,
+    "missing_key_target_cap": 0.5,
+    "per_trade_position_max_pct": 0.3,
+    "per_trade_position_pct": 0.1,
+    "power_p": 0.5,
+    "scale_cap": 1.15,
+    "scale_floor": 0.15,
+    "sell_boost_level": "L2",
+    "sizing_enabled": true,
+    "sizing_mode": "power_mean",
+    "sizing_shadow": false,
+    "sl_offset_risk_budget_keep": true,
+    "state_scales": {
+      "bear": 0.4,
+      "bull": 1,
+      "range": 0.7
+    },
+    "stoploss_guard_count": 4,
+    "t_commission_rate": 0.00025,
+    "t_enabled": true,
+    "t_force_unwind_at": "1450",
+    "t_intraday_cap_pct": 50,
+    "t_intraday_sell_cap_total_pct": 20,
+    "t_last_open_at": "1400",
+    "t_limit_distance_pct": 1,
+    "t_market_plunge_pct": -2,
+    "t_max_rounds": 1,
+    "t_min_amount_wan": 3000,
+    "t_min_amplitude_pct": 2.5,
+    "t_min_commission": 5,
+    "t_min_listed_days": 60,
+    "t_min_market_scale": 0.4,
+    "t_min_spread_pct": 2,
+    "t_min_turnover_pct": 1.5,
+    "t_mode": "both",
+    "t_near_extreme_pct": 0.3,
+    "t_open_cooling_min": 15,
+    "t_regime_gate_enabled": true,
+    "t_round_stop_pct": 2,
+    "t_sell_env_min_market_scale": 0.2,
+    "t_shadow": false,
+    "t_slippage_bps": 5,
+    "t_stamp_tax_rate": 0.0005,
+    "t_stop_guard_pct": 1.5,
+    "t_vol_ratio_max": 1.8,
+    "t_vwap_check_tol_pct": 0.1,
+    "t_vwap_dev_pct": 0.8,
+    "tier_red_default": 0.3,
+    "tier_scales": {
+      "Red": 0.3,
+      "Yellow": 0.6
+    },
+    "vol_clamp": [
+      0.5,
+      1.5
+    ],
+    "vol_target_pct": 2,
+    "breadth_bands": {
+      "low": 0.3,
+      "mid": 0.5
+    },
+    "breadth_missing_default": 0.9,
+    "breadth_scales": {
+      "low": 0.7,
+      "mid": 0.85,
+      "high": 1.0
+    },
+    "emo_breadth_ice_down_ratio": 0.0,
+    "emo_breadth_retreat_down_ratio": 0.0,
+    "emotion_enabled": true,
+    "emotion_phase_labels": {
+      "ice": "\u51b0\u70b9",
+      "start": "\u542f\u52a8",
+      "ferment": "\u53d1\u9175",
+      "climax": "\u9ad8\u6f6e",
+      "divergence": "\u80cc\u79bb",
+      "retreat": "\u9000\u6f6e"
+    },
+    "holiday_long_closed_run": 5,
+    "holiday_long_pre_max": 3,
+    "holiday_small_closed_run": 3,
+    "holiday_small_pre_max": 2,
+    "holiday_weekend_closed_run": 2,
+    "holiday_weekend_pre_max": 2,
+    "industry_cap_pct": 35.0,
+    "kelly_clamp": [
+      0.6,
+      1.15
+    ],
+    "kelly_edge_gain": 1.1,
+    "kelly_no_edge": 0.6,
+    "market_state_enabled": false,
+    "per_trade_default_hi": 0.3,
+    "per_trade_default_lo": 0.1,
+    "per_trade_hard_max": 0.5,
+    "quality_weight_clamp": [
+      0.9,
+      1.1
+    ],
+    "red_block_new_buy": false,
+    "single_stock_cap_pct": 35.0,
+    "t_direction_mode": "both",
+    "t_ghost_grace_sec": 90,
+    "t_limit_pct_bse": 29.9,
+    "t_limit_pct_main": 9.9,
+    "t_limit_pct_st": 4.9,
+    "t_limit_pct_star": 19.9,
+    "t_limit_pct_wide": 19.9,
+    "t_min_base_keep_qty": 100,
+    "t_no_cancel_windows": [
+      [
+        "09:20",
+        "09:30"
+      ],
+      [
+        "14:57",
+        "15:00"
+      ]
+    ],
+    "t_no_new_order_windows": [
+      [
+        "09:20",
+        "09:30"
+      ],
+      [
+        "14:52",
+        "15:00"
+      ]
+    ],
+    "t_premise_grace_sec": 120,
+    "t_regime_min_votes": 4,
+    "t_regime_stale_sec": 900,
+    "t_day_loss_limit_pct": 0,
+    "t_min_base_keep": 100
   },
   "strategy_version": "v02-20261104",
   "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the four builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",
   "_comment_ported_modules": "Names of the ported rule modules the builder must inline (rules_form/rules_ladder/rules_factor/rules_t/rules_sizing). Empty list = only the builtin four, i.e. today's behaviour. A name listed here whose file is missing, or whose registered kind has no short code in signal_codes, fails the build rather than publishing a smaller rule set.",
-  "_comment_signal_codes_added": "\u7531 tools \u4e00\u6b21\u6027\u6309\u6a21\u5757 RULES \u8868\u751f\u6210\uff08\u77ed\u7801\u552f\u4e00\u6027\u5f53\u573a\u5224\uff09\uff0crule_arm \u5bf9\u65b0\u79fb\u690d\u89c4\u5219\u7f3a\u7701 shadow\uff1aP1 \u9608\u503c\u5fc5\u987b\u5148\u4e0e\u5f15\u64ce\u5bf9\u7167 >=5 \u4ea4\u6613\u65e5\u3002"
+  "_comment_signal_codes_added": "\u7531 tools \u4e00\u6b21\u6027\u6309\u6a21\u5757 RULES \u8868\u751f\u6210\uff08\u77ed\u7801\u552f\u4e00\u6027\u5f53\u573a\u5224\uff09\uff0crule_arm \u5bf9\u65b0\u79fb\u690d\u89c4\u5219\u7f3a\u7701 shadow\uff1aP1 \u9608\u503c\u5fc5\u987b\u5148\u4e0e\u5f15\u64ce\u5bf9\u7167 >=5 \u4ea4\u6613\u65e5\u3002",
+  "_comment_derived": "Written by scripts/derive_carrier_params.py --write. Three sources, in priority order: (1) the Go factory defaults, printed by cmd/derive_carrier_params and listed by --emit-derived-keys -- never hand-edit those, change the Go default and re-run; (2) aliases (t_direction_mode, the T-side window copies, breadth_missing_default) which rename an existing key and must never carry their own number; (3) qmt_gateway/rules_sizing.py SIZING_DEFAULTS rows for knobs the Go side has not exported a readout for yet -- each is registered with a reason in the script, and --check compares every overlapping row against Go. A key in none of the three is reported as DERIVE_UNHOUSED rather than quietly defaulted."
 }

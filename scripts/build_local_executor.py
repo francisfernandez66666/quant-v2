@@ -365,7 +365,12 @@ def render_params(params):
     """
     lines = ["PARAMS = {"]
     for key in sorted(params):
-        lines.append("    %r: %r," % (key, params[key]))
+        # ascii() not %r: the derived table carries Chinese phase keys (emotion_scales is keyed
+        # by the Go side's phase names, and emotion_phase_labels maps them to their codes).
+        # %r emits those bytes verbatim, the GBK console on the box then turns each one into "?"
+        # and the artifact no longer parses as the file it claims to be. ascii() keeps the exact
+        # same Python value while writing only \uXXXX escapes -- so g1_ascii can stay a hard gate.
+        lines.append("    %s: %s," % (ascii(key), ascii(params[key])))
     lines.append("}")
     return "\n".join(lines)
 
@@ -1106,6 +1111,89 @@ def gate_sandbox_loads(artifact):
     return True, "sandbox_loads_clean"
 
 
+
+def gate_executor_loads(artifact):
+    """g7e: the published *executor* artifact must LOAD too, not merely parse.
+
+    This gate exists because of a failure the other seven could not see. The
+    inlined ported-rule block ends with a module-level registration loop that
+    calls register_ported_rule(); the marker block sat *above* that function's
+    definition, so the repository copy parsed fine, passed the ASCII / call /
+    f-string / bare-number gates, and the published artifact raised
+    NameError on import. A carrier that cannot be imported does not "trade
+    wrong" -- it says nothing at all, which is how 11-03's
+    "deployed and reporting nothing" shape returns.
+
+    ast.parse() cannot see a missing name; only executing the module body can.
+    Executing it is safe because the artifact's own gates already bound what it
+    may call, and nothing here reaches the network: this is import plus pure
+    helper calls, with no broker, no state file and no order path.
+    """
+    import ast
+    import sys as _sys
+    # counter_status_vocab() imports the gateway ledger modules at call time (that
+    # import *is* the single source -- copying the status table here is forbidden),
+    # so the gate has to give the artifact the same sys.path the delivered package
+    # has on the box. Without it the helper returns the "unknown" pair and the
+    # gate would report an empty vocabulary as a defect of the artifact.
+    _gateway_dir = os.path.join(REPO_ROOT, "qmt_gateway")
+    if _gateway_dir not in _sys.path:
+        _sys.path.insert(0, _gateway_dir)
+    try:
+        tree = ast.parse(artifact)
+        namespace = {"__name__": "local_executor_gate"}
+        exec(compile(tree, "<executor-artifact>", "exec"), namespace)
+    except SyntaxError as exc:
+        return False, "executor_syntax_error:%s" % exc
+    except Exception as exc:  # noqa: BLE001
+        return False, "executor_load_failed:%s" % repr(exc)[:200]
+    # The path stays inserted on purpose: the smoke calls below import the same
+    # ledger modules through counter_status_vocab(), and render_status_vocab()
+    # has always left this entry in place (one build process, one direction).
+
+    for needed in ("STRATEGY_VERSION", "PARAMS", "ported_load_status", "rule_arm_mode",
+                   "_ported_static_table", "normalize_order_status", "Executor",
+                   "counter_status_vocab", "rule_window_hit"):
+        if needed not in namespace:
+            return False, "executor_missing_symbol:%s" % needed
+
+    params = namespace["PARAMS"]
+    status = namespace["ported_load_status"](params)
+    # A module named in params but not carried in the artifact is a shortage, and
+    # a build must not publish a smaller rule set than the one that was tested.
+    if status["missing"]:
+        return False, "executor_ported_module_missing:%s" % ",".join(status["missing"])
+    if params.get("ported_modules") and not status["kinds"]:
+        return False, "executor_ported_registry_empty"
+    # Judgement legs (rules_t / rules_sizing) legitimately carry zero kinds.
+    # They must still be *present*, or "by design" and "file gone" read the same.
+    for name in (params.get("ported_modules") or []):
+        if name not in status["loaded"]:
+            return False, "executor_ported_module_absent:%s" % name
+
+    # Import is not enough -- a name used only inside one branch blows up on the
+    # first call that reaches it. So exercise the pure helpers every round depends on.
+    try:
+        vocab, terminals = namespace["counter_status_vocab"]()
+        if not vocab or not terminals:
+            return False, "executor_status_vocab_empty"
+        namespace["normalize_order_status"](50, vocab, terminals)
+        for kind in status["kinds"][:1]:
+            namespace["rule_arm_mode"](params, kind)
+        if not namespace["rule_window_hit"](params, [["09:30", "11:30"]], "10:00"):
+            return False, "executor_window_judgement_broken"
+        if namespace["rule_window_hit"](params, [["09:30", "11:30"]], "11:30"):
+            return False, "executor_window_end_is_closed_not_half_open"
+        table = namespace["_ported_static_table"]()
+        if len(table) != len(status["kinds"]):
+            return False, "executor_registry_table_mismatch:%d_vs_%d" % (len(table),
+                                                                        len(status["kinds"]))
+    except Exception as exc:  # noqa: BLE001
+        return False, "executor_smoke_call_failed:%s" % repr(exc)[:200]
+    return True, "executor_loads_clean kinds=%d judgement=%s" % (
+        len(status["kinds"]), ",".join(status.get("judgement") or []) or "none")
+
+
 def extract_shared(source_text):
     """Pull the named functions out of the executor source, verbatim.
 
@@ -1289,6 +1377,10 @@ def main(argv=None):
             artifact = bake(source, params, version)
         except ValueError as exc:
             return fail("bake_failed", str(exc))
+        gates = gates + [
+            ("g7e_executor_loads", gate_executor_loads,
+             "the published executor artifact must import and answer a call"),
+        ]
 
     # §DRIFT-GATE：仓内副本与"应当如此"的字节不一致 ⇒ 要么拒建，要么显式回写。
     # 判据用 bake 本身（幂等：已正确烘过的文件再过一次字节不变），

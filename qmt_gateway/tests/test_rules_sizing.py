@@ -912,12 +912,15 @@ def test_concentration_rooms_are_anded_when_baked():
     所以桶由上层算好后随 ctx 带来。
     """
     knobs = params()
+    # 已投 24000 而非 34000：行业帽 35% 打 10 万分位得到 11000 的空间，仍然过
+    # min_order_amount（Go 出厂 10000）；取 34000 时空间只剩 1000，会被金额闸判成
+    # "这一笔不值得下"（None），测的就是另一件事了。
     wide = rs.buy_size_amount(knobs, base_ctx())
     tight = rs.buy_size_amount(knobs, base_ctx(
-        industry_known=True, industry_value=34000.0, stock_value=34000.0))
+        industry_known=True, industry_value=24000.0, stock_value=24000.0))
     assert tight < wide
     assert tight == pytest.approx(
-        knobs["industry_cap_pct"] / 100 * 100000.0 - 34000.0)
+        knobs["industry_cap_pct"] / 100 * 100000.0 - 24000.0)
 
     # 行业未知 -> 那条帽不参与，单票那条仍然参与
     caps = rs.buy_size_caps(knobs, base_ctx(industry_value=99000.0,

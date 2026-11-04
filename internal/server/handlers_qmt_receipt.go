@@ -146,6 +146,9 @@ func (s *Server) handleQMTOrderReceipt(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, "advance receipt status failed: "+err.Error())
 			return
 		}
+		// 落痕 + 响应：重放必须**留下痕迹**（谁在何时重复回执了什么、状态有没有真的推进），
+		// 但响应只回事实不回动作——409 而不是 200，调用方据此知道"这一笔没有再落账"，
+		// 不会把同一条委托的回执数当成两笔（成交行/数量/留痕在重放下一个字都不写）。
 		opslog.Audit("qmt_order_receipt_replay", uid, sid,
 			fmt.Sprintf("dup status=%s cur=%s status_advanced=%v note=%s", target, own.Status, advanced, req.Note))
 		writeJSON(w, http.StatusConflict, map[string]interface{}{

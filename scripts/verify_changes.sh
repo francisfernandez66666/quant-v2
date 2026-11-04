@@ -20253,7 +20253,7 @@ fi
 echo "ok - §171 §FRIEND-PKG 锁通过（入口与脚本在册 1 + bat 姿势 1 + 一把尺子与字节码 1 + deny 锚点 1 + install 锚点与零明文 1 + 用例在册等值 1 + 常驻反证 1 + pwsh 语法解析 1，累计判定点 ${CNT171}）"
 
 # ── §173 §QMT-INTERNAL-LOOP（11-04 外脑化批：判据只读／桥心跳接线不是死线／静默域只折重复／买入闸单点／四源窗口同源／构建闸三段自证／投递腿不直起客户端／移植规则内联不进 import）
-echo "==> 173 §QMT-INTERNAL-LOOP（外脑档契约与判定只读／桥心跳三态接线／静默域首推与销案不静默／买入执行点单点／四源时段窗逐字同源／构建闸漂移+装载+短码唯一／沙箱零文件零网络／撤单与投递腿 fail-closed／移植规则靠内联不靠 import／用例在册）..."
+echo "==> 173 §QMT-INTERNAL-LOOP（外脑档契约与判定只读／桥心跳三态接线／静默域首推与销案不静默／买入执行点单点／四源时段窗逐字同源／构建闸漂移+装载+短码唯一／沙箱零文件零网络／撤单与投递腿 fail-closed／移植规则靠内联不靠 import／用例在册／Go 出厂值单点导出）..."
 B173_FAILED=0
 fail173() {
 	echo "--- FAIL: §173 $*"
@@ -20469,7 +20469,41 @@ done
 [ -s web/src/utils/liveBrain.js ] || fail173 "前端档位文案表不在册（0/1 不渲染、2/3/4 三句不同处置方向）"
 [ -s web/src/components/ExternalBrainTag.jsx ] || fail173 "前端外脑档组件不在册（读面有数、屏上看不见＝等于没有）"
 
-# ⑩ 常驻反证：摘掉判据必须红，且读 R173_MUTATED（恒 0 的锁不算锁）
+# ⑩ 单点导出：Go 出厂默认 → 载体 params（工具里不许住着一个数；无主阈值必须数得出来）
+CNT173=$((CNT173 + 1))
+DERIVE_TOOL=scripts/derive_carrier_params.py
+DERIVE_MAIN=cmd/derive_carrier_params/main.go
+[ -s "$DERIVE_TOOL" ] || fail173 "导出工具不在册（${DERIVE_TOOL}）：没有它，载体 params 里的数就还是人手抄的"
+[ -s "$DERIVE_MAIN" ] || fail173 "Go 出口不在册（${DERIVE_MAIN}）"
+# 四个新文件都必须"只转调、不定义"：带小数点的字面量出现在**非注释行**里就是第二本账。
+# 探针代码（600000.SH）不带小数点，所以这条尺子量的是阈值而不是代码。
+NUM_LITS=""
+for f in "$DERIVE_MAIN" internal/research/derive_carrier.go internal/data/derive_carrier.go internal/engine/derive_carrier.go; do
+	HITS=$(grep -vE '^\s*(//|/\*|\*)' "$f" 2>/dev/null | grep -nE '[0-9]+\.[0-9]+' || true)
+	NUM_LITS="${NUM_LITS}${HITS}"
+done
+[ -z "$NUM_LITS" ] || fail173 "导出侧出现数字字面量（阈值必须从 Go 真源读，不许写在工具里）"
+# 实跑 --check：孤儿=0 且整体绿；go 不在位就明说这一段没跑，不许静默放行
+if command -v go >/dev/null 2>&1; then
+	DERIVE_OUT=$(python3 "$DERIVE_TOOL" --check 2>&1 || true)
+	grep_q "DERIVE_RESULT=OK" DERIVE_OUT F || fail173 "单点导出 --check 未过：${DERIVE_OUT##*$'\n'}"
+	grep_q "orphan=0" DERIVE_OUT F || fail173 "载体规则要求、但既无 Go 读数又无登记理由的键存在（orphan≠0＝有主不明的数混在参数文件里）"
+	UNH="none"
+	grep_q "DERIVE_UNHOUSED" DERIVE_OUT F && UNH=$(printf '%s\n' "$DERIVE_OUT" | grep -oE 'DERIVE_UNHOUSED=[0-9]+' | head -1 || true)
+	echo "   [§173 ⑩] 单点导出实跑绿：${UNH:-?}（这些键在 Go 侧还没有导出读数，参数文件里也**没有**它们的默认值——补齐前先别接 T 腿）"
+	# 参数文件与 Go 必须逐键同源（这条就是"没有手抄"的可执行定义）
+	grep_q "DERIVE_CHANGED_TOTAL=0" DERIVE_OUT F || fail173 "参数文件与 Go 出厂值不一致（先跑 --write；别改 Go 去迁就一个抄错的数）"
+else
+	echo "   [§173 ⑩] INFO - 本机没有 go：这一段不含『--check 实跑』与『params 与 Go 逐键同源』两条判定，只判了文件在册与非注释行无数字字面量"
+fi
+CNT173=$((CNT173 + 1))
+[ -s qmt_gateway/tests/test_derive_carrier_params.py ] || fail173 "导出工具没有用例（形状转换一旦方向反了就是静默改档，必须有咬得住的测试）"
+DERIVE_T=$(cat qmt_gateway/tests/test_derive_carrier_params.py || true)
+for name in IndexBands EmotionRekey MappingIntegrity Coverage BuilderAscii AgainstGo; do
+	grep_q "class $name" DERIVE_T F || fail173 "导出工具用例缺组：$name"
+done
+
+# ⑪ 常驻反证：摘掉判据必须红，且读 R173_MUTATED（恒 0 的锁不算锁）
 CNT173=$((CNT173 + 1))
 R173_MUTATED=0
 WORK173=$(mktemp -d /tmp/gate173-XXXXXX)
@@ -20500,12 +20534,25 @@ if ! python3 "$WORK173/b.py" --target sandbox >/dev/null 2>&1; then :; fi
 if grep -q "g7_sandbox_loads_disabled" "$WORK173/b.py" && ! grep -q "^def gate_sandbox_loads(" "$WORK173/b.py"; then
 	R173_MUTATED=$((R173_MUTATED + 1))
 fi
-[ "$R173_MUTATED" -ge 2 ] || fail173 "§173 常驻反证未生效（R173_MUTATED=${R173_MUTATED}，应 >=2）：这两把锁今天没有牙"
-echo "   [§173 反证] R173_MUTATED=${R173_MUTATED}（摘四源窗口判据 / 摘 g7 装载自证，两处均按预期失效）"
+cp "$DERIVE_MAIN" "$WORK173/dm.go"
+python3 - "$WORK173/dm.go" <<'PYR4' || true
+import sys
+p = sys.argv[1]
+lines = open(p, encoding='utf-8').read().splitlines(True)
+for i, line in enumerate(lines):
+    if 'c.put("scale_floor"' in line:
+        lines[i] = line.replace('sc.Floor', '0.45')
+        break
+open(p, 'w', encoding='utf-8').write(''.join(lines))
+PYR4
+MINE4=$(grep -vE '^\s*(//|/\*|\*)' "$WORK173/dm.go" 2>/dev/null | grep -cE '[0-9]+\.[0-9]+' || true)
+if [ "${MINE4:-0}" -ge 1 ]; then R173_MUTATED=$((R173_MUTATED + 1)); fi
+[ "$R173_MUTATED" -ge 3 ] || fail173 "§173 常驻反证未生效（R173_MUTATED=${R173_MUTATED}，应 >=3）：这三把锁今天没有牙"
+echo "   [§173 反证] R173_MUTATED=${R173_MUTATED}（摘四源窗口判据 / 摘 g7 装载自证 / 往导出工具里注入一枚阈值，三处均按预期失效）"
 rm -rf "$WORK173"
 
 [ "$B173_FAILED" = "0" ] || exit 1
-echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 常驻反证 1，累计判定点 ${CNT173}）"
+echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 常驻反证 1，累计判定点 ${CNT173}）"
 
 echo "==> 全部通过"
 
