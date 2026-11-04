@@ -199,6 +199,45 @@ class DefaultsCatalog(unittest.TestCase):
         self.assertGreaterEqual(float(params["min_order_amount"]), 1000.0)
 
 
+class Universe(unittest.TestCase):
+    """观察宇宙：默认**只打印不落盘**，且代码→市场后缀那条规则不许在这里再写一遍。"""
+
+    def _write(self, doc):
+        path = os.path.join(self.tmp, "wl.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        return path
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="universe-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_bare_codes_get_the_single_source_suffix(self):
+        path = self._write(["600519", "000001", "300750", "830000"])
+        codes, dropped = dcp.build_universe([path])
+        self.assertEqual(codes, ["000001.SZ", "300750.SZ", "600519.SH", "830000.BJ"])
+        self.assertEqual(dropped, [])
+
+    def test_unusable_code_is_dropped_and_counted_not_guessed(self):
+        path = self._write(["600519", "ABC123", "", {"code": "000021"}])
+        codes, dropped = dcp.build_universe([path])
+        self.assertEqual(codes, ["000021.SZ", "600519.SH"])
+        self.assertEqual(len(dropped), 2, "认不出的码必须数得出来，不许折进'没有这一只'")
+
+    def test_preview_writes_nothing(self):
+        """把真实自选池烘进 params 是 owner 的决定：默认一条字节都不改。"""
+        path = self._write(["600519"])
+        before = open(dcp.PARAMS_PATH, "rb").read()
+        rc = dcp.emit_universe([path], write=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(open(dcp.PARAMS_PATH, "rb").read(), before,
+                         "preview 写了参数文件——那等于替 owner 做了决定")
+
+
 @unittest.skipUnless(GO_AVAILABLE, "go_absent: the end-to-end check needs the Go toolchain")
 class AgainstGo(unittest.TestCase):
     """端到端：参数文件的每一个派生键都必须等于 Go 此刻打出来的出厂值。"""

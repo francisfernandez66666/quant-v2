@@ -356,6 +356,63 @@ ALIAS = {
 }
 
 
+def build_universe(paths):
+    """把"自选 + 观察信号"的裸码烘成载体要的 symbols 列表。
+
+    为什么走 report_uplink.normalize_code 而不是在这里再写一份首位数字判断：
+    代码→市场后缀这条规则在仓库里已经是**一处定义**（SH/SZ/BJ 三段 + 裸码/前缀两种写法），
+    复制它就是第四本账——首位判错一位，载体观察的就是别人家的票。
+    认不出来的码一律丢掉并计数（不猜市场），丢掉多少必须可见。
+    """
+    sys.path.insert(0, QMT_GATEWAY)
+    import report_uplink  # noqa: E402  (single source of the code -> symbol rule)
+
+    codes, seen, dropped = [], set(), []
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        rows = doc if isinstance(doc, list) else (
+            doc.get("codes") or doc.get("symbols") or doc.get("watchlist") or [])
+        for raw in rows:
+            symbol = report_uplink.normalize_code(str(raw if not isinstance(raw, dict)
+                                                       else (raw.get("code") or raw.get("symbol") or "")))
+            if not symbol:
+                dropped.append(str(raw)[:16])
+                continue
+            if symbol not in seen:
+                seen.add(symbol)
+                codes.append(symbol)
+    return sorted(codes), dropped
+
+
+def emit_universe(paths, write):
+    codes, dropped = build_universe(paths)
+    if not codes:
+        print("UNIVERSE_RESULT=FAIL reason=no_usable_codes dropped=%d" % len(dropped))
+        return 1
+    doc, params = load_params_file()
+    print("UNIVERSE requested=%d symbols=%d dropped=%d write=%d"
+          % (len(codes) + len(dropped), len(codes), len(dropped), 1 if write else 0))
+    print("UNIVERSE_CODES=%s" % ",".join(codes))
+    if dropped:
+        print("UNIVERSE_DROPPED=%s" % ",".join(dropped[:10]))
+    if not write:
+        print("UNIVERSE_RESULT=PREVIEW reason=pass_--write_to_land_it"
+              "（把真实自选池烘进 params 是**你的**决定：这份文件在仓库里，"
+              "写进去就等于把你的观察清单交进 git 历史）")
+        return 0
+    params["symbols"] = codes
+    doc["_comment_universe"] = ("params.symbols is the carrier's observation universe. "
+                                "Landed by scripts/derive_carrier_params.py --universe-from --write "
+                                "from the operator's watchlist/signal files; the repo default is two "
+                                "placeholder codes. The downlink package channel that would refresh "
+                                "this daily is not built, so re-run this command after any watchlist "
+                                "change you want the box to see.")
+    emit_ascii(doc)
+    print("UNIVERSE_RESULT=OK symbols=%d" % len(codes))
+    return 0
+
+
 class DeriveError(Exception):
     pass
 
@@ -617,14 +674,22 @@ def emit_ascii(doc):
 
 def main():
     ap = argparse.ArgumentParser()
-    mode = ap.add_mutually_exclusive_group(required=True)
+    # 缺省是 --report（只读对账）。--universe-from 是另一条腿，它自己决定要不要落盘。
+    mode = ap.add_mutually_exclusive_group(required=False)
     mode.add_argument("--report", action="store_true", help="print the reconciliation, write nothing")
     mode.add_argument("--check", action="store_true", help="gate posture: exit 1 on drift or orphans")
     mode.add_argument("--write", action="store_true", help="merge derived values into the params file")
     mode.add_argument("--emit-json", action="store_true", help="print the raw Go-derived table")
     mode.add_argument("--emit-derived-keys", action="store_true",
                       help="print the carrier keys this tool owns (for the build gate)")
+    ap.add_argument("--universe-from", action="append", default=[], dest="universe_from",
+                    metavar="PATH", help="watchlist/signal JSON to bake into params.symbols "
+                                         "(repeatable; preview unless --write-universe is given)")
+    ap.add_argument("--write-universe", action="store_true", dest="write_universe",
+                    help="actually land params.symbols from --universe-from")
     ns = ap.parse_args()
+    if ns.universe_from:
+        return emit_universe(ns.universe_from, ns.write_universe)
     chosen = "report"
     for candidate in ("report", "check", "write", "emit_json", "emit_derived_keys"):
         if getattr(ns, candidate):
