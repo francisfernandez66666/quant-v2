@@ -38,7 +38,7 @@ func TestAdviseUnifiedOnSkipsFiveWayAndProjects(t *testing.T) {
 	}
 	// 切闸：五路跳过、无投影 → 卖出级卡片归零（只剩可能的加仓/格局持有级）
 	in.SellUnifiedOn = true
-	for _, a := range Advise(in) {
+	for _, a := range adviseOnly(in) {
 		if a.Action == "止盈" || a.Action == "止损" || a.Action == "减仓" {
 			t.Fatalf("切闸后旧五路不得再产出卖出卡，got %+v", a)
 		}
@@ -48,7 +48,7 @@ func TestAdviseUnifiedOnSkipsFiveWayAndProjects(t *testing.T) {
 		{TsCode: "600000.SH", Action: "止盈", Level: "高", Reason: "[统一裁决] 窗结算无做多信号", RefPrice: 10.5, Source: UnifiedSellSourceAction},
 		{TsCode: "000002.SZ", Action: "止损", Level: "高", Reason: "幽灵投影（已不在持仓）", RefPrice: 9, Source: UnifiedSellSourceAction},
 	}
-	out := Advise(in)
+	out := adviseOnly(in)
 	if len(out) != 1 {
 		t.Fatalf("应只剩 1 条投影卡（幽灵投影作废、不再叠加加仓/格局），got %+v", out)
 	}

@@ -76,3 +76,74 @@ if ($probeCfg) {
 
 "=== 6) watchdog/watchdog tasks ==="
 schtasks /query /fo csv 2>$null | Select-String -Pattern 'quant-all-wd|QMT-Ensure|QMT-Gateway|qmt-gateway' | ForEach-Object { $_.Line }
+
+"=== 7) QMT terminal version and upgrade trace (QMT-CLIENT-VERSION 2026-11-05) ==="
+# 2026-11-05 现网实测：券商公告的两条禁令（A 策略本地文件读写/网络、B 禁止公有云/虚拟机）对这台终端
+# **当天没有生效**——桥的上行文件 5 秒前还在写、queued_connected=True，而终端 exe 的 mtime 是
+# 2026-08-07、FileVersion 2.1.26.0，比 11-03 公告还早三个月。A+B 同时没生效，最可能的机制是
+# **限制随新版客户端下发**，而不是服务端按日历切（这是推断，不是结论）。
+#
+# 值钱的地方在这里：如果机制真是"随升级生效"，那断链的触发器就不是某个日期，而是**一次没人盯着的
+# 自动升级**。所以本节不猜哪一版会禁什么，只做一件事实性的事——把当前版本与安装时间钉成基线，
+# 任何一次变化都当场打一行 CHANGED。判据明细一律 ASCII：这台机器的码页是 936，
+# 非 ASCII 经 PS→SSH→bash 会被换成 '?'，中文的判据等于永久假绿（本仓反复踩过）。
+# English: pin the installed terminal version as a baseline and shout on any change, because an
+# unattended client upgrade -- not a calendar date -- is the plausible trigger of the ban.
+$QmtBaseline = 'C:\var\lib\quant-trading-v2\qmt_client_baseline.json'
+$exe = $null
+$cl = @(Get-CimInstance Win32_Process -Filter "name='XtItClient.exe'" -ErrorAction SilentlyContinue)
+if ($cl.Count -gt 0) {
+  $exe = $cl[0].ExecutablePath
+}
+if (-not $exe -or -not (Test-Path $exe)) {
+  # 进程没起也要能读数：按 ASCII 通配找安装位，绝不在脚本里写中文路径字面量（同一码页理由）
+  $guess = @(Get-ChildItem 'C:\Program Files (x86)' -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -like '*QMT*' } |
+      ForEach-Object { Join-Path $_.FullName 'bin.x64\XtItClient.exe' } |
+      Where-Object { Test-Path $_ })
+  if ($guess.Count -gt 0) { $exe = $guess[0] }
+}
+if (-not $exe) {
+  Write-Output 'QMT_CLIENT_STATE absent reason=no-process-and-no-install-glob'
+} else {
+  try {
+    $fi = (Get-Item $exe).VersionInfo
+    $item = Get-Item $exe
+    $ver = [string]$fi.FileVersion
+    $mt = $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss')
+    $safe = ($exe -replace '[^\x20-\x7E]', '?')
+    Write-Output ('QMT_CLIENT version=' + $ver + ' exe_mtime=' + $mt +
+        ' exe_bytes=' + $item.Length + ' age_days=' +
+        [int][Math]::Round(((Get-Date) - $item.LastWriteTime).TotalDays) + ' path_ascii=' + $safe)
+    $prev = $null
+    if (Test-Path $QmtBaseline) {
+      try { $prev = Get-Content $QmtBaseline -Raw | ConvertFrom-Json } catch { $prev = $null }
+    }
+    if (-not $prev) {
+      @{ version = $ver; exe_mtime = $mt; exe_bytes = $item.Length;
+         path_ascii = $safe; baselined_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss');
+         previous_version = '' } | ConvertTo-Json -Compress |
+        Set-Content -Path $QmtBaseline -Encoding ASCII
+      # 明细一律 ASCII：这行会被 ssh/grep 链读，中文在这条链上只会被换成 '?'（永久假绿）。
+      Write-Output ('QMT_CLIENT_STATE baseline_created file=' + $QmtBaseline +
+          ' note=any_future_version_or_mtime_change_prints_CHANGED')
+    } elseif ($prev.version -ne $ver -or $prev.exe_mtime -ne $mt) {
+      # 这一行就是"禁令可能随这次升级一起落地"的信号：出现它请先确认自动下单链路还在不在
+      Write-Output ('QMT_CLIENT_CHANGED from_version=' + [string]$prev.version +
+          ' to_version=' + $ver + ' from_mtime=' + [string]$prev.exe_mtime + ' to_mtime=' + $mt)
+      Write-Output ('WARN QMT_CLIENT_CHANGED -- on the day this appears, re-check the uplink' +
+          ' file is still growing (bridge_report.jsonl mtime) and /health queued_connected;' +
+          ' a client upgrade is the plausible carrier of the 11-05 file/network ban')
+      @{ version = $ver; exe_mtime = $mt; exe_bytes = $item.Length; path_ascii = $safe;
+         baselined_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss');
+         previous_version = [string]$prev.version;
+         previous_mtime = [string]$prev.exe_mtime } | ConvertTo-Json -Compress |
+        Set-Content -Path $QmtBaseline -Encoding ASCII
+    } else {
+      Write-Output ('QMT_CLIENT_STATE unchanged version=' + $ver +
+          ' since=' + [string]$prev.baselined_at)
+    }
+  } catch {
+    Write-Output ('QMT_CLIENT_STATE unreadable reason=' + $_.Exception.GetType().Name)
+  }
+}

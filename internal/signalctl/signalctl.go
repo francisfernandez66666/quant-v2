@@ -230,21 +230,18 @@ func (c *Controller) AttachAudit(dir string) error {
 	return nil
 }
 
-// StrategyKeyOf 解析信号的规范战法键（白名单/探针统一键空间）：
-// StrategyType 优先（runner 规范 ID 或库规则 ID），回退 StrategyID、再回退显示名归一。
-// English: canonical strategy key — StrategyType first (runner id / library rule id), then
-// StrategyID, then display-name normalization.
-func StrategyKeyOf(sig combat_agent.Signal) string {
-	// 优先取规范战法 ID（runner 规范 ID 或库规则 ID），与白名单/前端开关同键空间。
-	if sig.StrategyType != "" {
-		return sig.StrategyType
-	}
-	// 无规范 ID 时回退战法库规则 ID。
-	if sig.StrategyID != "" {
-		return sig.StrategyID
-	}
-	// 都没有时按显示名归一映射到内置键；无法映射则原样返回显示名。
-	switch combat_agent.NormalizeStrategyName(sig.Strategy) {
+// StrategyKeyByDisplay 显示名 / 规范键 → 规范战法键（StrategyKeyOf 的"只有战法名"那条腿）。
+// 为什么单独导出：展示侧（持仓建议、前端开关）手里只有一个战法字符串，没有 Signal 结构体，
+// 而它必须和准入判定用**同一张表**。以前这张表住在 StrategyKeyOf 的 switch 里，展示侧要么自己
+// 再抄一份（两份迟早漂开），要么只能按原始字符串比对（"龙头" 对 "dragon" 永远对不上——
+// 这正是 2026-11-05「建议不看战法开关」缺陷的另一半成因）。
+// 传入已经是规范键时同样归一（NormalizeStrategyName 认 dragon→龙头→回映射 dragon），
+// 因此调用方不必先分辨自己拿的是哪一种写法。无法映射的名字原样返回（与旧 StrategyKeyOf 同语义）。
+//
+// English: display-name/canonical-key → canonical strategy key. Exported so the presentation side,
+// which only holds a strategy string, shares ONE membership table with the admission predicate.
+func StrategyKeyByDisplay(name string) string {
+	switch combat_agent.NormalizeStrategyName(name) {
 	case "龙头":
 		return "dragon"
 	case "双响炮":
@@ -268,21 +265,33 @@ func StrategyKeyOf(sig combat_agent.Signal) string {
 	case "利好兑现砸盘":
 		return "good_news_fade"
 	}
-	return sig.Strategy
+	return name
 }
 
-// AdmitStrategy 战法白名单成员判定（纯函数，风控闸 risk.Gate 与控制器共用，杜绝双写漂移）：
-//   - 白名单非空 → 必须显式命中（键=规范键 ∪ 显示名 ∪ StrategyID 三键任一相等）；
-//   - 白名单为空（前端"全部开启"存量语义）→ 放行内置四形态与库规则（fac_/pat_ 前缀及聚合池
-//     factor/pattern），动量与其他未知键拒绝。
-//
-// English: whitelist membership shared by the controller and the risk gate. A non-empty list must
-// contain the key (canonical id / display name / rule id all match). The legacy EMPTY list means
-// "all known built-ins on": the four form strategies plus library rules — momentum and unknown
-// keys are rejected.
-func AdmitStrategy(pol Policy, sig combat_agent.Signal) (bool, string) {
-	// 解析规范键；无法识别来源战法直接拒绝。
-	key := StrategyKeyOf(sig)
+// StrategyKeyOf 解析信号的规范战法键（白名单/探针统一键空间）：
+// StrategyType 优先（runner 规范 ID 或库规则 ID），回退 StrategyID、再回退显示名归一。
+// English: canonical strategy key — StrategyType first (runner id / library rule id), then
+// StrategyID, then display-name normalization.
+func StrategyKeyOf(sig combat_agent.Signal) string {
+	// 优先取规范战法 ID（runner 规范 ID 或库规则 ID），与白名单/前端开关同键空间。
+	if sig.StrategyType != "" {
+		return sig.StrategyType
+	}
+	// 无规范 ID 时回退战法库规则 ID。
+	if sig.StrategyID != "" {
+		return sig.StrategyID
+	}
+	// 都没有时按显示名归一映射到内置键；无法映射则原样返回显示名（归一表与展示侧共用一处）。
+	return StrategyKeyByDisplay(sig.Strategy)
+}
+
+// admit 战法白名单成员判定的**唯一实现**（两把入口 AdmitStrategy / AdmitStrategyName 都走它）。
+// key=规范战法键（空=无法归属，直接拒）；aliases=同一条记录上其它可命中的写法
+// （Signal 侧传 显示名 + 规则 ID；只有名字串时传那个串本身，让"白名单里写显示名"也能命中）。
+// 两个分支的语义与旧 AdmitStrategy 逐字一致（含空串 alias 的边角行为），不是重写而是搬家。
+// English: the single membership implementation both entries call; branch semantics unchanged.
+func admit(pol Policy, key string, aliases ...string) (bool, string) {
+	// 无法识别来源战法：既不进默认全集，也不参与显式命中。
 	if key == "" {
 		return false, "无法识别信号来源战法"
 	}
@@ -301,11 +310,47 @@ func AdmitStrategy(pol Policy, sig combat_agent.Signal) (bool, string) {
 	}
 	// 分支二：白名单非空 → 必须"规范键 ∪ 显示名 ∪ 规则 ID"三键任一显式命中。
 	for _, s := range pol.Strategies {
-		if s == key || s == sig.Strategy || s == sig.StrategyID {
+		if s == key {
 			return true, ""
+		}
+		for _, alias := range aliases {
+			if s == alias {
+				return true, ""
+			}
 		}
 	}
 	return false, fmt.Sprintf("战法 %q 白名单外", key)
+}
+
+// AdmitStrategy 战法白名单成员判定（纯函数，风控闸 risk.Gate 与控制器共用，杜绝双写漂移）：
+//   - 白名单非空 → 必须显式命中（键=规范键 ∪ 显示名 ∪ StrategyID 三键任一相等）；
+//   - 白名单为空（前端"全部开启"存量语义）→ 放行内置四形态与库规则（fac_/pat_ 前缀及聚合池
+//     factor/pattern），动量与其他未知键拒绝。
+//
+// English: whitelist membership shared by the controller and the risk gate. A non-empty list must
+// contain the key (canonical id / display name / rule id all match). The legacy EMPTY list means
+// "all known built-ins on": the four form strategies plus library rules — momentum and unknown
+// keys are rejected.
+func AdmitStrategy(pol Policy, sig combat_agent.Signal) (bool, string) {
+	// 判定本体在 admit()（唯一实现）；本入口只负责把 Signal 的三个键空间摊给它。
+	return admit(pol, StrategyKeyOf(sig), sig.Strategy, sig.StrategyID)
+}
+
+// AdmitStrategyName 与 AdmitStrategy **同一条规则**的"只有一个战法串"入口——
+// 给拿不到 Signal 结构的调用方（持仓建议展示层 §ADVICE-TACTICS、前端开关回显）。
+// 入参可以是显示名（"龙头"）或规范键（"dragon"）：先经 StrategyKeyByDisplay 归一，
+// 再把原始串作为 alias 一起比对，所以白名单里存哪一种都能命中。
+// 为什么必须导出这个而不是让调用方自己比字符串：白名单语义（空=全集、动量严格 opt-in、
+// fac_/pat_ 前缀放行）一旦有两份实现就会漂开，而漂开的表现是"屏上建议与真实准入相反"。
+//
+// English: the one-predicate entry for callers holding only a strategy string (display name or
+// canonical key); identical semantics to AdmitStrategy by construction (both call admit).
+func AdmitStrategyName(pol Policy, nameOrKey string) (bool, string) {
+	// 别名把**两种写法都**交出去：原样串 + 归一后的显示名。
+	// 只带原样串会漏掉一半存量形状——持仓里存的是"龙头"而开关里存的是 "dragon"，
+	// 或反过来（量化页存的是战法 ID，券商对账建的行存的是名字）。
+	// 归一表在 StrategyKeyByDisplay 那一处，本函数不再自己判一次成员关系。
+	return admit(pol, StrategyKeyByDisplay(nameOrKey), nameOrKey, combat_agent.NormalizeStrategyName(nameOrKey))
 }
 
 // Admit 单信号裁定（推进确认窗状态机——探针推进本就是裁定语义的一部分）。

@@ -172,7 +172,7 @@ func n6FirstAdvice(t *testing.T, db *store.DB) PositionAdvice {
 		Scores:    map[string]combat_agent.StockScores{},
 		Cfg:       cfg,
 	}
-	adv := Advise(in)
+	adv := adviseOnly(in)
 	for _, a := range adv {
 		if a.TsCode == "600000.SH" {
 			return a

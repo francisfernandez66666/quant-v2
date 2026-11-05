@@ -176,6 +176,15 @@ type Engine struct {
 	// tLiveReg §DYN-T 实盘日内回转账本注册表（按账号懒建，文件落 <dataDir>/accounts/<uid>/t_rounds_live.json）。
 	// 目标仓位模型必须能问出"哪些敞口是 T 腿"，所以它比 T 编排本身更早接入执行链（批 2）。
 	tLiveReg *tLiveRegistry
+	// §TRADE-CARD（2026-11-05）自动交易链"这一轮真的做了什么"的进程内留痕（mu 保护，当日有效）。
+	// 交易提示卡的 加/减/走 三行、以及交易级提醒里那句【已自动买入/已触发自动卖出/本轮未下单：原因】
+	// 只读这里——旧实现判的是开关（Enabled&&mode=auto&&AutoSell），风控拒掉的单也会被说成"已触发"。
+	// 为什么不在提醒层自己按幂等键去查 orders：买入键里的战法键与持仓归属战法不同源、卖出键还带
+	// 减仓轮次后缀，猜键一次就把"其实下过单"报成"没下单"。详见 trade_action_ledger.go 文件头。
+	// English: what the auto-trading chain actually did today (placed / refused + why), written at the
+	// place an order is sent. The card and trade-level alerts read only this, never the switch state.
+	tradeActDay  string
+	tradeActions map[string]tradeAction
 	// tSignals §DYN-T 买入信号消费账本（候选 B 的新鲜度来源 + 一次性消费，§8.4.3）。
 	tSignals *tSignalLedger
 	// tMinuteCache 分时均线的分钟链校验腿缓存（60s TTL，按代码）。
@@ -347,7 +356,7 @@ type Engine struct {
 
 	// §SHORT-2 做空战法卖出标记：主循环命中持仓走弱的 sell 信号时记录（纯code → 标记），
 	// 近实时 pushRealAdvice 消费同交易日的标记生成实盘清仓级建议（Source=short_tactic），
-	// 复用 autoExecuteRealSells 的 mode=auto+auto_sell 门槛、幂等键与 syncLiveAdviceAlerts 强提醒。
+	// 复用 autoExecuteRealSells 的 mode=auto+auto_sell 门槛、幂等键与 syncTradeLevelAlerts 强提醒（§TRADE-CARD 11-05 改名）。
 	// English: bear-tactic sell marks — the main loop records weak-holding sells; the near-realtime
 	// advice pass converts same-trading-day marks into 止损-class advices (Source=short_tactic) so the
 	// existing live auto-sell gates/idempotency/strong-reminders are reused wholesale.
@@ -2380,7 +2389,7 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		if dec != nil {
 			dec.Qty = 0
 			dec.Notional = 0
-			dec.SkipReason = "禁挂时段（" + label + "）：集合竞价/尾盘窗口不接新委托，本轮未下单"
+			dec.SkipReason = "禁挂时段（" + label + "）：本系统不在该窗口挂新单，本轮未下单"
 		}
 		e.persistDynBuyDecision(sig, dec)
 		log.Printf("[qmt] %s(%s) §CANCEL-STATE 禁挂窗口(%s)生效：本轮不下单（读数已落决策快照）", sig.Code, sig.Name, label)
@@ -2609,7 +2618,18 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 	if ctrl == nil {
 		return
 	}
+	// §TRADE-CARD（2026-11-05）留痕：把"这一笔到底发出去了没"记在**发出动作的这一刻**。
+	// 交易提示卡的 加 一行、以及提醒里那句【已自动买入/本轮未下单：原因】只引用它——
+	// 旧形态引用的是开关状态（Enabled && mode=auto），被风控拒掉的单也会被报成"已触发"。
+	// 做 T 的腿按 req.IntradayT 分键（同一码同日既做 T 又战略加仓是合法形态，折一条就会互相贴错标签）。
+	rec := func(placed bool, qty int, orderID, reason string) {
+		e.recordTradeAction(tradeAction{
+			Kind: tradeActionBuy, Code: sig.Code, OrderID: orderID, Placed: placed,
+			Qty: qty, Price: req.Price, Reason: reason, At: time.Now(), IntradayT: req.IntradayT,
+		})
+	}
 	if !e.buyRejectAllow(req.Code) {
+		rec(false, 0, "", "同码近期连续被拒，退避窗口内本轮未再拨单")
 		return
 	}
 	// §P0-5 兜底：发送前用最新读数复核剩余空间（含他人预占）。超了就跳过并留痕，
@@ -2621,11 +2641,13 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 			opslog.Logf("quant", "§P0-5 发送前复核拦截 %s(%s) 金额=%.0f 剩余=%.0f（并发预占/仓位变化）",
 				sig.Code, sig.Name, req.Amount, limit)
 		})
+		rec(false, 0, "", "发送前复核未通过：本单金额超剩余空间，未发出")
 		return
 	}
 	res, err := ctrl.PlaceOrder(req)
 	if err != nil {
 		log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
+		rec(false, 0, "", "下单调用失败："+err.Error())
 		return
 	}
 	if res != nil && !res.OK {
@@ -2634,11 +2656,27 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 		// 判据与 controller.go 的 duplicate 返回文案同源（strings.HasPrefix，勿改前缀）。
 		if strings.HasPrefix(res.Err, "duplicate") {
 			log.Printf("[trading] auto order %s(%s) 幂等拦截（同键当日已有单），不记退避: %s", sig.Code, sig.Name, res.Err)
+			// 幂等命中＝这一笔当日**已经报过**，按"已发出"留痕（报成"没下单"是假读数）。
+			rec(true, req.Qty, res.OrderID, "同键当日已有委托（幂等命中，本轮未重复下单）")
 		} else {
 			e.buyRejectRecord(req.Code, res.Err)
+			reject := res.Err
+			if reject == "" {
+				reject = "网关未受理"
+			}
+			rec(false, 0, res.OrderID, reject)
 		}
 	} else {
 		e.buyRejectClear(req.Code)
+		placed := req.Qty
+		orderID := ""
+		if res != nil {
+			orderID = res.OrderID
+			if res.PlacedQty > 0 {
+				placed = res.PlacedQty // §T1-PARTIAL-W5：报出量可能是风控减量后的量，不许拿请求量冒充
+			}
+		}
+		rec(true, placed, orderID, "委托已受理（≠成交）")
 	}
 	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, req.Qty, req.Price, res)
 	// §DAILY_OPSLOG auto 实际下单结果（受理/业务拒单由 controller 侧另记，此处补策略上下文）
@@ -3883,7 +3921,12 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 		switch it.Level {
 		// 减仓=统一纪律"首触止损未深破→半平"，属保护性动作，同样需要强提醒
 		// English: 减仓/trim (first SL touch without deep breach → half out) is protective, alert too.
-		case "清仓", "止损", "止盈", "减仓", "交易信号":
+		// §TRADE-CARD（2026-11-05，owner 裁「撤+加+减+走 四类全推」）加的两档：
+		//   - 加仓：自动买入是真下真单的动作，属于交易级；旧词表只认卖出侧，加仓一条都不响。
+		//   - 撤单：系统撤了别人看得见、但只有翻当日委托才知道——它是四个动作里唯一"已经动了
+		//     却完全不响"的一档。做 T 的行落在这两档里（加仓/减仓）并靠正文/标题的【做T】标记区分。
+		// 持有/格局/观察预警（unified-watch）保持不响：不到交易级别不提醒（owner 令）。
+		case "清仓", "止损", "止盈", "减仓", "交易信号", "加仓", "撤单":
 		default:
 			continue
 		}
@@ -3910,102 +3953,6 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 		// 去重设计见 internal/notify/notify.go Push 注释。
 		nt.Push(msg)
 	}
-}
-
-// syncLiveAdviceAlerts 把实盘持仓分析建议（统一纪律裁决 Source=discipline + 常规卖出侧）中的
-// 止损/止盈/减仓 转入消息中心，并触发 P1 桌面/Webhook/外部推送网关强提醒——**与 auto_sell 开关无关**：
-// 用户关闭自动交易（mode≠auto 或 auto_sell=false）时，实时持仓触发止盈/止损/减仓判定仍能收到强提醒，
-// 及时手动处理；自动模式开启时也同步下发"已触发自动卖出"便于核对成交。
-// 去重：私有作用域（Scope=主账号）+ 交易日键（u<uid>|discipline@码@类@日）——纪律在观察窗结算后
-// 每轮重复输出断言（auto 关闭、持仓未动）,靠交易日键阻止 5s 循环重复轰炸；跨交易日仍未处理的持仓
-// 会在新交易日再次提醒（与退出动作同 home 消息，同键刷新正文）。与主循环纸面告警键（code@级别）
-// 不冲突。正文携带 现价/盈亏/回撤 + 自动卖出开关状态，行情缺失（RefPrice=0）时按 §P2#25 不伪造现价。
-// English: routes live-position advices whose action is 止损/止盈/减仓 — from the unified-discipline
-// engine (Source=discipline) and the regular sell-side — into the message center and fires P1 desktop /
-// Webhook / push-gateway alerts regardless of the auto_sell switch: with auto trading off, a live holding
-// tripping TP/SL/trim still gets a strong reminder to act manually; when auto is on it also announces
-// "已触发自动卖出" so fills can be double-checked. Dedup: private scope (Scope=primary account) plus a
-// trading-day key — the discipline re-asserts its decision every round once settled (holding untouched
-// with auto off), so the day key blocks 5s-loop spam while re-alerting on a fresh trading day when the
-// position is still unhandled. No key clash with main-loop paper alerts (code@level). The body carries
-// price / P&L / drawdown and the auto-sell state; missing quotes (RefPrice=0) never fake a price (§P2#25).
-func (e *Engine) syncLiveAdviceAlerts(sendTo string, advices []trading.PositionAdvice, autoActive bool) {
-	if e.msgStore == nil || len(advices) == 0 {
-		return
-	}
-	now := time.Now()
-	day := data.TradingDayDate(now)
-	idPrefix := "discipline@"
-	if sendTo != "" {
-		idPrefix = "u" + sendTo + "|discipline@"
-	}
-	items := make([]data.MessageItem, 0, len(advices))
-	for _, a := range advices {
-		switch a.Action {
-		case "止损", "止盈", "减仓":
-		default:
-			continue // 加仓/格局/持有 不提醒
-		}
-		name := a.Name
-		if name == "" {
-			name = a.Code
-		}
-		var b strings.Builder
-		b.WriteString("[")
-		if a.RefPrice > 0 {
-			fmt.Fprintf(&b, "现价:%.2f", a.RefPrice)
-			if math.Abs(a.ProfitPct) > 0.001 {
-				fmt.Fprintf(&b, " 盈亏:%+.2f%%", a.ProfitPct)
-			}
-			// §P4 缺陷4：只在真实回撤（现价低于阶段高点）时渲染——现价新高时
-			// DrawdownPct≥0 顶出「回撤:+0.64%」纯语义噪声，强化"这不是止盈止损点位"的困惑。
-			// English: P4 defect-4 — render drawdown only for a real pullback; a positive value at a new
-			// stage high was pure semantic noise.
-			if a.DrawdownPct < -0.001 {
-				fmt.Fprintf(&b, " 回撤:%+.2f%%", a.DrawdownPct)
-			}
-		} else {
-			b.WriteString("现价未知")
-		}
-		b.WriteString("]")
-		if a.Reason != "" {
-			b.WriteString(" ")
-			b.WriteString(a.Reason)
-		}
-		// 自动卖出开关状态提示：让用户立即知道系统是否已代执行/需手动处理
-		// English: surface auto-sell state so the user knows whether the system already acted.
-		if autoActive {
-			b.WriteString(" 【已触发自动卖出】")
-		} else {
-			b.WriteString(" 【自动卖出未开启，请手动处理】")
-		}
-		direction := "利空"
-		if a.Action == "止盈" {
-			direction = "利好"
-		}
-		items = append(items, data.MessageItem{
-			ID:          fmt.Sprintf("%s%s@%s@%s", idPrefix, a.Code, a.Action, day),
-			Scope:       sendTo,
-			Code:        a.Code,
-			Name:        name,
-			Level:       a.Action,
-			Action:      "卖出",
-			Strategy:    a.Strategy,
-			Time:        a.GeneratedAt.Format("15:04:05"),
-			Title:       fmt.Sprintf("%s %s", a.Action, a.Name),
-			Body:        b.String(),
-			Direction:   direction,
-			GeneratedAt: a.GeneratedAt,
-		})
-	}
-	if len(items) == 0 {
-		return
-	}
-	// 与 syncMessages 同序：先判新推送（P1 桌面/Webhook + SSE），后合并入库（下一轮同键即"已存在"静默）
-	// English: same order as syncMessages — push first (P1 + SSE), then persist; next round the key exists so it stays quiet.
-	e.pushCriticalAlerts(items)
-	e.pushSSEMessages(items)
-	e.msgStore.Sync(items)
 }
 
 // SetScanner 设置板块扫描器（线程安全，透传给策略引擎）。
@@ -7437,7 +7384,7 @@ func (e *Engine) shortSellMarkOf(code string) (shortSellMark, bool) {
 
 // shortTacticCloseAdvices §SHORT-2 把当日做空战法 sell 标记转换为实盘清仓级建议（止损类，
 // Source=short_tactic），供 autoExecuteRealSells 复用门槛（mode=auto+auto_sell）/幂等键/
-// 剩余量扣减，syncLiveAdviceAlerts 复用 P1 强提醒。跳过已有止损级建议的码（避免双触发）
+// 剩余量扣减，syncTradeLevelAlerts 复用 P1 强提醒。跳过已有止损级建议的码（避免双触发）
 // 与行情缺失的持仓（宁可不卖）。
 // English: §SHORT-2 — convert same-trading-day bear-tactic sell marks into 止损-class live advices
 // (Source=short_tactic) so the existing auto-sell gates/idempotency/remaining-qty logic and the P1

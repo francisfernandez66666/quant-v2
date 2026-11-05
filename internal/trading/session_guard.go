@@ -31,8 +31,18 @@ import (
 const (
 	// DefaultNoCancelWindows 禁撤窗口：开盘集合竞价后段 + 收盘集合竞价。
 	DefaultNoCancelWindows = "09:20-09:30,14:57-15:00"
-	// DefaultNoNewOrderWindows 禁挂窗口：开盘集合竞价 + 收盘清单之后。
-	DefaultNoNewOrderWindows = "09:20-09:30,14:52-15:00"
+	// DefaultNoNewOrderWindows 禁挂窗口：整段开盘集合竞价 + 收盘清单之后。
+	// 起点从 09:20 前移到 09:15（owner 2026-11-05 令，现场是德尔未来）：集合竞价的成交价要到
+	// 09:25 才定出来，09:15–09:20 挂出去的单等于**用开盘撮合价成交**——大幅低开时那笔单子
+	// 按没人愿意认的低价成交，低开那一刀就成了实际损失；而 09:20–09:25 挂出去的单在交易所
+	// 规则下又撤不掉（禁撤窗就是为它存在的）。两头一夹，"竞价的 15 分钟"里挂早了没有补救动作，
+	// 所以整段 09:15–09:30 都不许新挂：连续竞价从 09:30 起才有"看得见价格再决定"这件事。
+	// 终点保持 09:30（不缩到 09:25）：09:25–09:30 交易所不连续成交，那一段挂出去的单
+	// 就是按刚定的开盘价排队——正是本轮要避免的那个动作。
+	// English: no-new-order window now covers the whole opening call auction (09:15–09:30):
+	// an order sent before 09:25 gets matched at the auction price, and after 09:20 it can no
+	// longer be cancelled — so resting an order inside the auction has no corrective action left.
+	DefaultNoNewOrderWindows = "09:15-09:30,14:52-15:00"
 )
 
 // windowSpec 一个时段窗（北京时间，分钟为粒度）。
@@ -243,7 +253,11 @@ func ErrMarketClosed(action string) error {
 
 // ErrNoNewOrderWindow 禁挂窗口的拒绝文案。
 func ErrNoNewOrderWindow(label string) error {
-	return fmt.Errorf("当前处于不可挂单时段（%s）：集合竞价/尾盘窗口不再接受新委托，请稍后重试", label)
+	// 文案替自己说话：这是**本系统**不在这一段挂单，不是一句"交易所不接受"。
+	// 11-05 把禁挂窗起点前移到 09:15 之后，09:15–09:20 交易所其实照样接单，
+	// 照旧写"不再接受新委托"就成了一句当面的假话（与 10-31 那次"休市日撞窗口拿集合竞价
+	// 理由拒人"同一族）——操作者据此去怀疑交易所，就永远查不到是我们自己定的规矩。
+	return fmt.Errorf("当前处于不可挂单时段（%s）：本系统不在开盘集合竞价与尾盘窗口内挂新单，请稍后重试", label)
 }
 
 // isCancellableStatus 判断委托状态是否仍属"可（再）撤"的在途形态。

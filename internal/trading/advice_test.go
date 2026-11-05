@@ -66,7 +66,7 @@ func TestAdviseAddAndHold(t *testing.T) {
 		EmotionPhase: "高潮",
 		Cfg:          cfg,
 	}
-	advices := Advise(in)
+	advices := adviseOnly(in)
 	if len(advices) != 2 {
 		t.Fatalf("expected 2 advices, got %d: %+v", len(advices), advices)
 	}
@@ -99,7 +99,7 @@ func TestAdviseSkipAddWhenDrawdownExceeded(t *testing.T) {
 		Scores:    map[string]combat_agent.StockScores{"600000": {Code: "600000", SignalActive: true}},
 		Cfg:       cfg,
 	}
-	advices := Advise(in)
+	advices := adviseOnly(in)
 	// 盈利 (10.2-10)/10=2%>0 → 会走格局
 	if len(advices) != 1 || advices[0].Action != "格局" {
 		t.Fatalf("回撤超阈值应只格局，got %+v", advices)
@@ -328,7 +328,7 @@ func TestAdviseT1LockedSkipsSellSide(t *testing.T) {
 	}
 	// 注入 000001 全锁：其卖出建议必须消失，600000 保留
 	in.SellableQty = map[string]int{"600000.SH": 100, "000001.SZ": 0}
-	out := Advise(in)
+	out := adviseOnly(in)
 	var sellCodes []string
 	for _, a := range out {
 		switch a.Action {
@@ -355,11 +355,20 @@ func TestAdviseT1LockedSkipsSellSide(t *testing.T) {
 // baseOf 基线建议中的卖出级代码（辅助）。
 func baseOf(in AdviceInput) []string {
 	var codes []string
-	for _, a := range Advise(in) {
+	for _, a := range adviseOnly(in) {
 		switch a.Action {
 		case "止盈", "止损", "减仓":
 			codes = append(codes, a.Code)
 		}
 	}
 	return codes
+}
+
+// adviseOnly 测试辅助：只取建议列表本身。
+// Advise 的第二个返回值（AdviceFilter，§ADVICE-TACTICS 的"被战法开关滤掉几条"）在需要它的
+// 用例里单独断言；既有用例只关心列表内容，签名变化不让任何一条原断言放松。
+// English: test helper taking only the list; the filter stat is asserted where it matters.
+func adviseOnly(in AdviceInput) []PositionAdvice {
+	list, _ := Advise(in)
+	return list
 }

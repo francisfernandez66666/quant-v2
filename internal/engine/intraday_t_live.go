@@ -341,7 +341,7 @@ func (e *Engine) newTLiveRoundWith(uid string, ctrl *trading.Controller, quotes 
 	case !p.Enabled:
 		r.canOpen, r.openWhy = false, "t.enabled=false 一键止血：只推进在途腿，不开新腿"
 	case windowBlocked:
-		r.canOpen, r.openWhy = false, "禁挂时段（"+windowLabel+"）：交易所不接新委托，本轮不开新腿（避免两腿只成其一）"
+		r.canOpen, r.openWhy = false, "禁挂时段（"+windowLabel+"）：本系统不在该窗口挂新单，本轮不开新腿（避免两腿只成其一）"
 	case !p.BuyFirst && !p.SellFirst:
 		r.canOpen, r.openWhy = false, "t.mode 未放行任何方向"
 	case p.Shadow:

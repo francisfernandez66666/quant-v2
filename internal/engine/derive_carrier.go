@@ -17,7 +17,11 @@ package engine
 //   English: no literal here; every value delegates to the existing constant, and the
 //   seconds conversion uses Duration.Seconds() rather than a hand-written 60.
 
-import "time"
+import (
+	"time"
+
+	"quant-trading-v2/internal/config"
+)
 
 // TGhostGraceSeconds 幽灵 open 判定宽限（秒）。真源：tLGhostGrace。
 func TGhostGraceSeconds() float64 { return seconds(tLGhostGrace) }
@@ -36,6 +40,26 @@ func TMinBaseKeepQty() int { return tLMinBaseKeep }
 func TRegimeMinVotes() int { return tRegimeMinVotes }
 
 func seconds(d time.Duration) float64 { return d.Seconds() }
+
+// ── §CARRIER-PARITY-1105：三条钱路径行为的出厂值只读导出 ──────────────────────
+//
+// 载体（物理机本地执行器）要实现与现网同款的「信号消失撤单 / VWAP 改价 / 同轮预算预占」，
+// 阈值就必须在 Go 里只有一处真身。这里只做转调，不复制数值、不手敲默认值：
+// 前两枚直接取 DefaultQMTConfig 的字段，第三枚复现 buyRoomGuardOn 的 nil＝开语义，
+// 第四枚转调 buy_reprice_20261105.go 的具名常量（它本不是配置项，但仍是 Go 的真身）。
+// English: no literal here; delegate to the Go defaults so the carrier cannot drift.
+
+// BuyRoomGuardDefaultForCarrier 发送前预算复核闸的出厂态（nil＝开）。
+func BuyRoomGuardDefaultForCarrier() bool {
+	sc := config.DefaultSizingConfig()
+	if sc.BuyRoomGuard != nil {
+		return *sc.BuyRoomGuard
+	}
+	return true
+}
+
+// RepriceMaxPerDayForCarrier 一码当日因 VWAP 改价最多撤几次。真源：repriceMaxPerDay。
+func RepriceMaxPerDayForCarrier() int { return repriceMaxPerDay }
 
 // ── §DERIVE-CARRIER-1105 第二批：T 的**词表 / 比例 / 钟点**只读导出 ──────────────────
 //

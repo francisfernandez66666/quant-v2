@@ -825,7 +825,31 @@ type QMTConfig struct {
 	// CancelStaleSec §R4-1 未成交自动撤单阈值（秒）：已报超过该秒数仍未成交/未推进状态即自动撤单
 	//（0=默认 120；-1=关闭自动撤单，仅保留收盘清单）。
 	// English: §R4-1 stale-order auto-cancel threshold in seconds (0 = default 120; -1 disables).
-	CancelStaleSec int `json:"cancel_stale_sec"`
+	// SignalGoneCancelSec §SIGNAL-GONE（2026-11-05）：买入挂单的"信号消失即撤"宽限秒数。
+	// 0＝关（＝今天的行为，一单都不因消失而撤）；>0＝该单的信号在最后 N 秒内没有再被算出来
+	// （以当日动态仓位快照的 at 为活跃度真源，见 controller 的 sweepSignalGoneLocked 注释）
+	// 且打分链本轮确实在跑时，撤掉这笔挂单。
+	// 为什么用秒而不是"轮数"：轮长是 runtime.scoring_interval_sec 可调的，把轮数写进这里
+	// 等于把两个键捆成一个隐式乘积——改一个、动另一个，谁也说不清窗口实际多长。
+	// 为什么缺省是关：方向是**少下单**，看着安全，但误判一次就撤掉一笔本来会成交的合规挂单，
+	// 而"撤了没重挂"在当日幂等键下不会补回来（§ORDER-STATE-PULL 那条同一意图不重发的纪律）。
+	// English: 0 = off (today's behaviour); >0 = grace seconds after which a resting BUY order is
+	// cancelled because its signal stopped being recomputed -- seconds, not round counts, because
+	// the round length is itself a tunable knob.
+	SignalGoneCancelSec int `json:"signal_gone_cancel_sec"`
+	// VWAPRepricePct §BUY-REPRICE（2026-11-05，owner 令「根据 VWAP 动态更新买入价格，
+	// 信号消失后就撤下来」）：买入挂单的限价相对**市场 VWAP** 偏离超过该百分比时，撤掉这一笔，
+	// 让买入信号按新价重挂。0＝关（＝今天的行为，一笔都不因改价被撤）。
+	// 为什么走"撤单 + 同键重放"而不是改委托：QMT/柜台没有改价这条通道，已报出去的单只能撤；
+	// 而 §H1-MG 的"零成交已撤同键可重放"本来就在（controller.go 的 existed 分支），
+	// 撤掉之后下一轮的同一信号会按当时的价自己补上——不需要再造第二套挂单账。
+	// 为什么缺省是关：撤单吃柜台次数额度，且**部成单绝不能撤**（撤的只是未成交部分，
+	// 但本地幂等键会连带把已成交那部分的重挂机会一起关掉）；阈值要盘中真实读数才定得准。
+	// English: percent deviation of a resting BUY limit from market VWAP that triggers a cancel
+	// so the same signal re-places at the current price. 0 = off (today's behaviour); partial
+	// fills never reprice.
+	VWAPRepricePct float64 `json:"vwap_reprice_pct,omitempty"`
+	CancelStaleSec int     `json:"cancel_stale_sec"`
 	// CloseSweepAt §R4-1 收盘清单时刻（北京时 HHMM）：到达后对当日全部"已报"未成交委托撤单
 	//（0=默认 1452；-1=关闭收盘清单）。
 	// English: §R4-1 close-list time (Beijing HHMM) — cancels all unfilled 已报 orders of the day
@@ -1334,8 +1358,13 @@ func DefaultQMTConfig() QMTConfig {
 		// §CANCEL-STATE（owner 2026-10-28 拍板）：禁撤/禁挂时段出厂值。
 		// 出厂即开启是刻意的：默认安全 > 默认方便。这两个窗口堵住的是「请求受理即标已撤」
 		// 这类资损形态（2026-10-28 的 600362 尾盘单），关掉闸门等于把闸门撤了。
+		// §SESSION-WINDOW（owner 2026-11-05 令）：禁挂窗起点 09:20 → 09:15，整段开盘集合竞价
+		// 都不许新挂——09:25 才撮合出开盘价，挂早了等于**按没人愿意认的开盘价成交**
+		// （当天德尔未来大幅低开，挂早的那一笔把后面涨上去的筹码换掉了），而 09:20 之后
+		// 挂出去的又落进禁撤窗、撤无可撤。与 trading.DefaultNoNewOrderWindows 是同一条口径的两份
+		// 字面量（config 不能 import trading，会成环），门禁 §138 逐字钉住这两处必须同值。
 		NoCancelWindows:   "09:20-09:30,14:57-15:00",
-		NoNewOrderWindows: "09:20-09:30,14:52-15:00",
+		NoNewOrderWindows: "09:15-09:30,14:52-15:00",
 	}
 }
 
@@ -1922,6 +1951,14 @@ type PositionConfig struct {
 // reach real orders; any one missing leaves shadow-only reads. WithDefaults fills missing keys with
 // the new defaults, while an explicit legacy/false stays as the account-level escape hatch.
 type SizingConfig struct {
+	// BuyRoomGuard §BUY-ROOM-GUARD（2026-11-05）发送前预算复核的退路开关。
+	// nil（缺省）＝开：这笔买单在发出前必须过"目标剩余或可用资金 − 同轮他人预占"这道算术。
+	// 显式 false 才回到今天的形态——今天那行算术是 `限 = 剩余 + 他人预占`，
+	// 别人的额度把自己的上限抬高，同轮两笔各花全额把仓位控制打穿（owner 11-05 令补）。
+	// 这是缺陷修复的即时退路，不是新功能，所以缺省不守"缺省＝今天"的惯例。
+	// English: kill-switch for the pre-send budget backstop; nil = on. Default-on because the
+	// behaviour it replaces was an arithmetic inversion on the money path, not a feature.
+	BuyRoomGuard *bool `json:"buy_room_guard,omitempty"`
 	// Enabled 总开关。§DYN-GLOBAL 后默认开（nil=开，见 EnabledOn）。
 	// 改成指针的原因：旧 `bool` 让 WithDefaults 无法区分"这个键没写过"和"显式关了"——
 	// 而 `json:"enabled"` 无 omitempty，任何物化过的账号载荷里都躺着 `"enabled":false`。

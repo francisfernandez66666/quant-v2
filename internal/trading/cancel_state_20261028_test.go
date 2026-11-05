@@ -24,9 +24,12 @@ func bjAt(hh, mm int) time.Time {
 	return time.Date(2026, 10, 28, hh, mm, 0, 0, cntime.Loc)
 }
 
-// TestSessionWindowBoundaries §CANCEL-STATE：时段闸的边界判定（09:20/09:30/14:52/14:57/15:00）。
+// TestSessionWindowBoundaries §CANCEL-STATE：时段闸的边界判定（09:15/09:20/09:30/14:52/14:57/15:00）。
 // 锁的是"边界到底含不含"——差一分钟就是另一种行为（A 股 09:30:00 起接受撤单、
 // 15:00:00 起集合竞价结束），写成 <= 会把关闸时间多压一分钟。
+// 09:15 那一档是 §SESSION-WINDOW（owner 2026-11-05 令）把禁挂窗起点从 09:20 前移到整段集合竞价：
+// 开盘价要到 09:25 才撮合出来，09:15–09:20 挂出去的单等于按开盘价成交（当天那笔大幅低开的损失），
+// 而这一段挂出去之后 09:20 起就落进禁撤窗、撤无可撤。09:14 不许命中＝左闭区间的起点仍然可判。
 func TestSessionWindowBoundaries(t *testing.T) {
 	sw := DefaultSessionWindows()
 	cases := []struct {
@@ -35,8 +38,9 @@ func TestSessionWindowBoundaries(t *testing.T) {
 		wantNew  bool // 禁挂单窗口
 		wantCanc bool // 禁撤单窗口
 	}{
-		{"开盘前正常", 9, 15, false, false},
-		{"09:19 正常", 9, 19, false, false},
+		{"开盘前正常", 9, 14, false, false},
+		{"09:15 起整段集合竞价禁挂（11-05 前移，撤仍允许）", 9, 15, true, false},
+		{"09:19 禁挂（撤仍允许）", 9, 19, true, false},
 		{"09:20 禁挂禁撤", 9, 20, true, true},
 		{"09:29 禁挂禁撤", 9, 29, true, true},
 		{"09:30 恢复", 9, 30, false, false},

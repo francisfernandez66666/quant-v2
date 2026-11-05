@@ -277,16 +277,26 @@ if ($SkipRestart) {
         # Give the old process a moment to release its handles on the
         # state file before the new one opens it.
         Start-Sleep -Milliseconds 800
-        $python = "python"
-        $pyExe = Get-Command $python -ErrorAction SilentlyContinue
-        if ($pyExe) {
+        # GAP-1105 / CUTOVER-1105: never relaunch with a bare "python" from
+        # PATH. The installed runner uses the venv interpreter that actually
+        # has xtquant; a system-python relaunch computes but cannot trade,
+        # and that reads as "the update worked". If the venv is absent, say so
+        # and let the QMTF-Exec-Ensure scheduler relaunch -- do not invent a
+        # third runtime. The relaunch must ALSO carry the bridge/local
+        # interlock, or an update could silently create a second order leg.
+        $root = Split-Path $Target -Parent
+        $venvPy = Join-Path $root "local_executor\.venv\Scripts\python.exe"
+        $modeFile = Join-Path $root "local_executor\execution_mode.json"
+        if (Test-Path $venvPy) {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $pyExe.Source
-            $psi.Arguments = "`"$installed`""
+            $psi.FileName = $venvPy
+            $psi.Arguments = ('"{0}" --execution-mode-file "{1}"' -f $installed, $modeFile)
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
             [System.Diagnostics.Process]::Start($psi) | Out-Null
             $started = 1
+        } else {
+            Write-Host ("UPDATE_RESTART=warn reason=no_venv_python path={0} scheduler_will_relaunch" -f $venvPy)
         }
     } catch {
         Write-Host ("UPDATE_RESTART=warn reason={0}" -f ($_.Exception.Message -replace "`r", " " -replace "`n", " "))

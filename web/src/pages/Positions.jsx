@@ -3,6 +3,9 @@
 // 收益展示：纸面总盈亏（已实现+浮动，可一键清零） / 实盘总盈亏（QMT trades 汇总优先，
 // 汇总未回来时按持仓浮动兜底并挂「本地兜底」标记自报口径，§W7-G）；
 // 建议回看：实盘持仓「建议」列由 SSE real_advice 实时推送 + 挂载 REST 回填（§F-6）点亮。
+// §ADVICE-TACTICS（2026-11-05）：同一列再带「建议 N 股 ≈M 元（受限：x）」——数来自后端当日动态
+// 仓位快照（signal_decisions），本页不算任何仓位；算不出的一格显示「未计算」，不显示 0。
+// 战法开关做的是硬过滤，所以表下另起一行「另有 N 条因战法未启用被过滤」，载荷没带这个键时不渲染。
 // 纯 TDesign 组件（Tabs / TabPanel / Card / Table / Dialog / Form / Input / InputNumber / Button / Tag），无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin, DialogPlugin } from 'tdesign-react'
@@ -22,6 +25,8 @@ import LoadFailBanner from '../components/LoadFailBanner.jsx'
 // with an uncaught ReferenceError (no toast at all). Import added.
 import { showToast } from '../ui.jsx'
 import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（cost 不再冒充现价）
+// §ADVICE-TACTICS（2026-11-05）：建议行的股数文案与"被战法开关滤了几条"文案的唯一来源
+import { adviceSuggestText, adviceFilteredText, adviceRowLabel, tradeLevelSummaryText } from '../utils/adviceFormat.js'
 import { canStrict, canLiveTrading } from '../utils/perm.js'
 
 // 持仓与资金数据的 localStorage 缓存键
@@ -121,18 +126,37 @@ export default function Positions() {
   const [realTrades, setRealTrades] = useState(null)
   // 实盘持仓建议映射（ts_code -> 建议）
   const [realAdvices, setRealAdvices] = useState({})
+  // §ADVICE-TACTICS A（2026-11-05）：这一轮被战法开关滤掉的加仓条数（null=读数未知，
+  // 旧一轮载荷没带这个键时**不画 0**——"没滤"与"没报"是两件事）。
+  const [adviceFiltered, setAdviceFiltered] = useState(null)
+  // §TRADE-CARD（2026-11-05）本轮建议的**原始列表**（映射会按 ts_code 折叠，撤单行需要它）：
+  // 撤行定位的是委托而不是持仓，被撤的建仓单往往根本没有持仓行 ⇒ 表格里没有落脚处。
+  const [adviceRows, setAdviceRows] = useState([])
   // §F-6（20260917 缺陷修复批）建议映射统一入口：SSE 实时推送与挂载 REST 回填共用。
-  // 把建议数组按 ts_code（缺省回退 code）归一成 {code: {action,label,ref_price,reason,level}} 映射，
-  // 保证两个来源写入同一份 state，覆盖顺序为「REST 先回填、SSE 后覆盖」。
-  function applyAdviceMap(advices) {
+  // 把建议数组按 ts_code（缺省回退 code）归一成映射，保证两个来源写入同一份 state，
+  // 覆盖顺序为「REST 先回填、SSE 后覆盖」。
+  // §ADVICE-TACTICS B：映射**不再只留 5 个字段**——建议股数/金额/受限项/定权时刻都要带上，
+  // 否则后端算好的数在到达浏览器的那一刻又被前端丢了一次（owner 抱怨的正是"屏上没有一个数
+  // 是从我的持仓算出来的"）。缺席的字段保持缺席（不是补 0）。
+  function applyAdviceMap(advices, filteredBySwitch) {
     const m = {}
+    // §TRADE-CARD 新增四列：order_id（撤行定位到具体一笔委托）、trade_kind（做T 标注）、
+    // cancel_kind / cancel_source（撤单形态与理由）。全部原样透传，缺席就保持缺席——
+    // 补 0 或补默认话术都会让"后端没说"在屏上看上去像"后端说了没有"。
     for (const a of (advices || [])) {
       if (a && (a.ts_code || a.code)) {
         const key = a.ts_code || a.code
-        m[key] = { action: a.action, label: a.label || a.action, ref_price: a.ref_price, reason: a.reason, level: a.level }
+        m[key] = {
+          action: a.action, label: a.label || a.action, ref_price: a.ref_price, reason: a.reason, level: a.level,
+          suggest_qty: a.suggest_qty, suggest_amount: a.suggest_amount, capped_by: a.capped_by, sizing_at: a.sizing_at,
+          order_id: a.order_id, trade_kind: a.trade_kind, cancel_kind: a.cancel_kind, cancel_source: a.cancel_source,
+        }
       }
     }
     setRealAdvices(m)
+    setAdviceRows(advices || [])
+    // 载荷没带这个键 ⇒ 未知（null），不是 0。
+    setAdviceFiltered(typeof filteredBySwitch === 'number' ? filteredBySwitch : null)
   }
   // 实盘是否启用
   const realEnabled = !!qmtState.enabled
@@ -837,9 +861,9 @@ export default function Positions() {
     // §N-09：纸面轮询由 usePolling 管理，此处只做首轮加载与 SSE 订阅
     // 订阅 SSE 事件总线（App 单连接扇出）：处理实盘建议推送与 QMT/订单回报，触发对应刷新
     unsubSSE.current = on(['real_advice', 'qmt_report', 'real_order'], (msg) => {
-      // 实盘操作建议：按 ts_code 汇总成建议映射
+      // 实盘操作建议：按 ts_code 汇总成建议映射（§ADVICE-TACTICS：一并带上被战法开关滤掉的条数）
       if (msg.type === 'real_advice' && Array.isArray(msg.advices)) {
-        applyAdviceMap(msg.advices)
+        applyAdviceMap(msg.advices, msg.filtered_by_switch)
       } else if (msg.type === 'qmt_report' || msg.type === 'real_order') {
         // §M-13（2026-09-22 修复批）前端半：旧写法 `tripped: !!msg.tripped` 在后端
         // qmt_report 广播载荷缺 tripped 字段时被 !!undefined=false 命中，任意一发热报
@@ -859,7 +883,7 @@ export default function Positions() {
     // （既灌 opslog 又让人不知道发生了什么）。与 loadReal() 的 §PERM-GATE 同口径早退。
     if (canTrading) {
       api.fetchRealAdvice().then((r) => {
-        if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices)
+        if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices, r.filtered_by_switch)
       }).catch(() => {}) // §P2-J 可吞：建议列是增强信息，失败时保留上一轮映射（§F-6 口径）
     }
     // 卸载时清理：轮询由 usePolling 负责，这里只取消 SSE 订阅
@@ -933,7 +957,16 @@ export default function Positions() {
     // §F1 实盘持仓盈亏按 realPnlPct 派生值排序（成本价×数量的浮盈率），与展示口径一致
     { colKey: 'pnl', title: '持仓盈亏', width: 90, sorter: (a, b) => realPnlPct(a) - realPnlPct(b), cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
     { colKey: 'highest_price', title: '最高价', width: 90, sorter: (a, b) => (a.highest_price || 0) - (b.highest_price || 0), cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
-    { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: 'var(--app-border)' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
+    // 建议列：动作标签（做T 的行自动带「做T·」前缀）+ §ADVICE-TACTICS B 的"量"那一行
+    // （股数/金额/被哪道帽挡住，或「未计算」）。
+    // 为什么单独一行而不是并进 Tag：Tag 里塞两个事实就没法一眼判出"这条建议要买多少"；
+    // 为什么必须显式写「未计算」而不是留空：留空的格子会被读成"系统算过、算出来是 0"，
+    // 而真实情况是当日定权快照里根本没有这一票的行。
+    // 标签文案改走 adviceRowLabel 单点：此前直读后端给的 a.label，于是"做 T 要特殊标注"这条
+    // 口径只能在后端每个生产者各写一遍——漏一个生产者就漏一类卡。
+    // theme 表按**中文动作字面量**判：旧键是 add/reduce/tp 这套英文，而后端 Action 一直是中文，
+    // 所以那五行配色从来没有生效过（所有标签一律 default 色）。这是顺手补真，不改任何判定。
+    { colKey: 'advice', title: '建议', width: 170, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: 'var(--app-border)' }}>—</span>; const theme = { 加仓: 'danger', 减仓: 'warning', 止盈: 'success', 止损: 'success', 撤单: 'warning', 格局: 'default', 持有: 'default' }[a.action] || 'default'; const suggest = adviceSuggestText(a); return (<div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}><Tag data-testid="advice-tag" theme={theme} size="small">{adviceRowLabel(a)}</Tag>{suggest ? <span data-testid="advice-suggest" className="muted" style={{ fontSize: 12 }}>{suggest}</span> : null}</div>) } },
     //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用）
     //  §MULTI-ACCT-B 批5：这四个按钮打的是 POST /api/positions/execute（**本批刻意没对
     //  quant_trade 开放**——手动下真实单属运营动作），因此按 canTrading 隐藏，
@@ -1142,6 +1175,15 @@ export default function Positions() {
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
           </div>
 
+          {/* §TRADE-CARD（2026-11-05）撤单提示条：这条**必须挂在持仓表格之外**——
+              撤行定位的是委托，而被撤的建仓买单往往根本没有对应的持仓行（那只票还没买进来）。
+              只把撤单塞进表格"建议"列的结果就是：系统撤了一笔单，屏上一个字都不显示。
+              放在 ternary 之前 ⇒ 空持仓（一张建仓单都没成交）时这句话照样看得见。 */}
+          {(() => {
+            const txt = tradeLevelSummaryText(adviceRows)
+            return txt ? <Card><div data-testid="trade-cancel-strip" style={{ padding: '10px 14px', fontSize: 13 }}>{txt}</div></Card> : null
+          })()}
+
           {/* 实盘持仓表格或空态：有持仓渲染表格，无持仓显示启用状态 */}
           {!realPositions.length ? (
             <Card>
@@ -1153,6 +1195,13 @@ export default function Positions() {
           ) : (
             <Card>
               <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} empty="暂无实盘持仓" />
+              {/* §ADVICE-TACTICS A：战法开关做的是**硬过滤**（owner 裁决），所以"滤掉几条"必须自己上屏
+                  ——不然屏上少了几条加仓建议与"今天本来就没有几条信号"在用户眼里是同一张脸。
+                  读数未知（旧一轮载荷没带这个键）时整行不渲染，绝不显示「另有 0 条」。 */}
+              {(() => {
+                const txt = adviceFilteredText(adviceFiltered)
+                return txt ? <div data-testid="advice-filtered" className="muted" style={{ marginTop: 8, fontSize: 12 }}>{txt}</div> : null
+              })()}
             </Card>
           )}
           </>

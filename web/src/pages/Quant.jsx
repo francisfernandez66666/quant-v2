@@ -1493,11 +1493,17 @@ export default function Quant() {
   )
   // §CANCEL-STATE 撤单请求留痕：把"何时、谁（manual/sweep/halt）发的撤单请求"挂在状态标签上，
   // 操作者据此区分"我撤的、等确认"与"系统例行撤的、也在等确认"，不必翻日志。
+  // §TRADE-CARD（2026-11-05）补两档来源，并把旧的 sweep 文案收窄成它真正的含义：
+  //   - signal_gone  信号消失即撤（买入挂单跟着信号走，宽限秒数在 qmt.signal_gone_cancel_sec）
+  //   - close_sweep  收盘清单（每天到点清场，与"这单挂太久"是两件不同的事）
+  // 缺这两档时 unknown 分支会把英文原值直接顶到屏上——运维看到的是键名而不是人话。
   const cancelTraceText = (row) => {
     const at = String(row.cancel_requested_at || '').replace('T', ' ').slice(0, 19)
     const src = String(row.cancel_source || '')
     if (!at && !src) return ''
-    const who = { manual: '手动', sweep: '例行超时/收盘清场', halt: '紧急停止', gateway: '网关回报' }[src] || src
+    // §BUY-REPRICE（2026-11-05）加 vwap_reprice 一档：撤它是为了按新的市场参考价重挂，
+    // 不是"不想要这笔仓"。缺这档时新来源会以英文原值顶到屏上，运维得自己去猜。
+    const who = { manual: '手动', sweep: '例行超时撤单', halt: '紧急停止', gateway: '网关回报', signal_gone: '信号消失即撤', close_sweep: '收盘清单', vwap_reprice: 'VWAP 改价重挂' }[src] || src
     return `撤单请求：${at}${who ? '（来源：' + who + '）' : ''}${row.cancel_reason ? ' 原因：' + row.cancel_reason : ''}`
   }
 

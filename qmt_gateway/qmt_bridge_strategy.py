@@ -126,6 +126,71 @@ def _report(payload):
         return False
 
 
+# ---------------------------------------------------------------------------
+# BAN_IO (2026-11-05): does the strategy still get to touch the disk at all?
+#
+# Background: the broker announced that from 2026-11-05 a built-in Python strategy loses ALL local
+# file access. Measured on the production box that morning, it had NOT landed here -- the uplink
+# file was 5 seconds old and the terminal is still the 2026-08-07 build (FileVersion 2.1.26.0),
+# i.e. the restriction most plausibly ships with a NEW client rather than with the calendar. That
+# makes the moment of death an unattended client upgrade, not a date anyone is watching.
+#
+# So this probe buys exactly one thing: attribution at the moment it flips. The whole uplink is
+# file-based, therefore "the strategy cannot write" and "the strategy is not running" and "today
+# simply produced no events" all look identical from the outside -- a silent file. The gateway can
+# tell stall from liveness, but it cannot tell WHY it stalled, and the three answers have three
+# different repairs (upgrade the client / restart the terminal / nothing is wrong).
+#
+# Shape notes, all deliberate:
+#   * one attempt per process, at init and (if init somehow missed it) on the first handlebar --
+#     a per-tick probe would burn the 5 MB rotation budget on diagnostics;
+#   * report file and boot log are tried SEPARATELY, because "trace writable but report denied" is
+#     a different enforcement than "both denied" and we have never seen either;
+#   * the failure line is emitted through _trace() only. A failure here CANNOT produce an uplink
+#     event -- that is the very thing being measured -- so the observable is the boot log, which
+#     the gateway also tails;
+#   * it writes no state, places no order, touches no network, and never raises: a strategy that
+#     throws on load costs us the trading link (10-29 incident), and a diagnostic is never worth
+#     that. Pure ASCII on purpose -- the deployed copy must stay GBK-decodable.
+# English: one-shot self-check proving whether the sandbox can still write its own two files.
+IO_SELF_CHECK = {"done": False, "report_ok": None, "trace_ok": None, "reason": "", "at": ""}
+
+
+def probe_strategy_io():
+    """Write one marker line to each bridge file and remember which of the two worked."""
+    if IO_SELF_CHECK["done"]:
+        return dict(IO_SELF_CHECK)
+    stamp = _now_cn_str("%Y-%m-%d %H:%M:%S")
+    probe = {
+        "type": "io_selfcheck",
+        "day": _now_cn_str("%Y-%m-%d"),
+        "at": stamp,
+        "src": "qmt_bridge_strategy",
+    }
+    IO_SELF_CHECK["done"] = True
+    IO_SELF_CHECK["at"] = stamp
+    try:
+        IO_SELF_CHECK["report_ok"] = bool(_report(probe))
+    except Exception as e:
+        IO_SELF_CHECK["report_ok"] = False
+        IO_SELF_CHECK["reason"] = "report:" + e.__class__.__name__
+    try:
+        _trace("BAN_IO probe report_ok=%s" % (IO_SELF_CHECK["report_ok"],))
+        IO_SELF_CHECK["trace_ok"] = True
+    except Exception as e:
+        IO_SELF_CHECK["trace_ok"] = False
+        IO_SELF_CHECK["reason"] = (IO_SELF_CHECK["reason"] + " " if IO_SELF_CHECK["reason"] else "") \
+            + "trace:" + e.__class__.__name__
+    if not IO_SELF_CHECK["report_ok"]:
+        # The line that matters. Greppable on purpose: at the moment the ban lands, this is the
+        # only row in the whole system that says "the strategy lost the disk" instead of
+        # implying it by absence.
+        _trace("BAN_IO reason=%s report_ok=%s trace_ok=%s"
+               % (IO_SELF_CHECK["reason"] or "report_write_returned_false",
+                  IO_SELF_CHECK["report_ok"], IO_SELF_CHECK["trace_ok"]))
+    return dict(IO_SELF_CHECK)
+
+
 #  embedded xtquant adapter -- canonical XtQuantTrader instance API (mirrors
 #  qmt_gateway/broker.py::XtBroker, the production-verified call surface:
 #  XtQuantTrader(path, session) -> start/connect -> query_stock_* -> order_stock).
@@ -2243,6 +2308,11 @@ def init(ContextInfo):
         probe_capability_surface(ContextInfo)
     except Exception as e:
         _trace("csurf error: " + repr(e)[:160])
+    # BAN_IO: last of the init probes -- it writes our own two files and says which one refused.
+    try:
+        probe_strategy_io()
+    except Exception as e:
+        _trace("banio error: " + repr(e)[:160])
     # CLOSE-RECON (2026-10-28, retimed 2026-10-29): the 15:01 probe is fired from
     # _close_recon_due() inside handlebar, NOT from a QMT timer callback. The timed
     # registration is what the 10-29 outage was traced to (no handlebar dispatch at all
@@ -2256,6 +2326,14 @@ def handlebar(ContextInfo):
     try:
         _xt()._ctx = ContextInfo
         _mark_main_thread()
+    except Exception:
+        pass
+    # BAN_IO backstop: if init() never got to run the probe (a reload path that skips init on
+    # some builds), the first bar does it. Cheap and one-shot -- probe_strategy_io returns at once
+    # once IO_SELF_CHECK["done"] is set, so this costs nothing per tick afterwards.
+    try:
+        if not IO_SELF_CHECK["done"]:
+            probe_strategy_io()
     except Exception:
         pass
     try:

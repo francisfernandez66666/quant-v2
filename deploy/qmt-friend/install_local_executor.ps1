@@ -189,7 +189,10 @@ $runnerBody = @(
     'if (-not (Test-Path $py)) { Write-Host "LOCALEXEC_RUNNER=ABORT reason=venv_python_absent"; exit 2 }',
     'if (-not (Test-Path $app)) { Write-Host "LOCALEXEC_RUNNER=ABORT reason=executor_absent"; exit 2 }',
     'Write-Host "LOCALEXEC_RUNNER=start"',
-    '& $py $app',
+    '# CUTOVER-1105: the scheduled leg ALWAYS carries the bridge/local interlock.',
+    '# A missing interlock file means "bridge", i.e. this process must not trade.',
+    '$modeFile = Join-Path $ExecutorDir "execution_mode.json"',
+    '& $py $app --execution-mode-file $modeFile',
     'Write-Host ("LOCALEXEC_RUNNER=exit code=" + $LASTEXITCODE)'
 )
 [System.IO.File]::WriteAllText($runner, (($runnerBody -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))

@@ -1935,6 +1935,55 @@ T_PARAM_KEYS = [
     "signal_codes", "t_signal_codes", "t_remark_code_max_len",
 ]
 
+# Reason-string cap: a presentation bound, not a trading threshold (it changes no decision), and
+# declared at module level because this module is shape-locked against bare numbers in bodies.
+_REASON_MAX = 80
+
+
+
+# ---------------------------------------------------------------------------
+# JUDGEMENT LEG (SCARRIER-SHADOW / the T leg wiring, 2026-11-05)
+#
+# Why this only composes two existing gates and adds no step of its own:
+# `t_gate_open` is already the orchestrator of the whole open-leg chain (it names the Go step it
+# declined on) and `t_direction` is the single judgement of "which direction does this price
+# suggest" (ported from paper/t_rounds.go:942-953). A second ordering written here would be a
+# second book: when the carrier and the engine disagree about "may a T round open", nobody
+# could tell which of the two drifted.
+#
+# It produces NO threshold: every value comes from calling this module's own gate functions,
+# and parameters are still read out of the baked PARAMS (a missing key raises -- no fallback).
+# The return values are booleans plus short ASCII reason strings, journalled in the shadow
+# ledger so the brain side can ask "which step does the carrier differ on".
+# English: pure ASCII on purpose -- this file is inlined into a GBK-decoded artifact.
+def t_readout(params, ctx):
+    """One reading of the carrier's T judgement leg (open-gate chain + direction)."""
+    open_ok, open_reason = t_gate_open(params, ctx)
+    buy, sell, dir_reason = t_direction(params, ctx)
+    out = {
+        "t_open_allowed": bool(open_ok),
+        "t_dir_buy": bool(buy),
+        "t_dir_sell": bool(sell),
+    }
+    # ASCII only: the console/ssh chain on that box is code page 936, and a non-ASCII byte
+    # there is silently replaced by '?' -- which reads as a permanent false green.
+    for key, raw in (("t_block_reason", open_reason), ("t_dir_reason", dir_reason)):
+        # ASCII guard, not a transcode: this module is inlined into a GBK-decoded artifact, so a
+        # non-ASCII reason string means something un-sanitised crept in -- dropping it is honest,
+        # replacing bytes with '?' is the permanent false green this repo keeps hitting.
+        text = str(raw or "")[:_REASON_MAX]
+        if text and text.isascii():
+            out[key] = text
+    return out
+
+
+# Declared judgement legs: the builder binds each name explicitly into _PORTED_LEGS and the
+# load gate (g7e) refuses to publish while any declared leg is not callable in the artifact.
+# Same mechanism as rules_sizing -- inlined code with no reachable name is exactly the shape
+# that made "the T judgement is ported" green on screen and empty in the market.
+JUDGEMENT_LEGS = ["t_readout"]
+
+
 # This module ports judgement, not signal generation: the T leg decides whether a
 # round-trip may open / must be balanced / must be closed, and the sizing leg
 # produces the scale caps. Neither emits a broker remark short code, so it

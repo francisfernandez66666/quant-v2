@@ -634,6 +634,11 @@ class Gateway:
         # 网关只记"最近一次收盘快照的时刻/行数"——它回答"当天收盘那 3 分钟的成交有没有回传"，
         # 是 600362 事故（委托行说已撤、实际成交没回传）的唯一现网信号。
         self._close_snap = {"at": "", "day": "", "ts": 0.0, "n": 0, "positions": 0, "trades": 0}
+        # §BAN_IO 桥侧"策略还能不能写自己的文件"最近一次自证。
+        # 这枚读数只在**写得到**的时候才会更新——写不到就没有事件，所以读面必须把
+        # "从来没收到"（旧载体 / 真被禁）单独成态，绝不折成"正常"（missing≠empty 同一条线）。
+        self._io_selfcheck = {"at": "", "day": "", "ts": 0.0, "report_ok": None,
+                              "trace_ok": None, "reason": "", "n": 0}
         # §M-3/§MANUAL-SYNC 未确认单观察项：signal_id -> 首次判未确认的时刻。
         # 委托表快照里一旦出现它的 remark 就消项；宽限期内始终没出现 → 回写发送失败。
         self._order_unconfirmed = {}
@@ -1633,6 +1638,10 @@ class Gateway:
             if etype == "heartbeat":
                 self.store.bridge_heartbeat()
                 return 200, {"ok": True, "err": ""}
+            # §BAN_IO：策略启动时的文件写自证。它不结算任何派发、不碰账本，只落一枚观测位。
+            if etype == "io_selfcheck":
+                self._note_io_selfcheck(req)
+                return 200, {"ok": True, "err": ""}
             # §CLOSE-RECON：收盘快照事件打 close_snapshot=true，这里先记一笔观测位
             # （各事件类型随后走各自的处理分支）。
             if req.get("close_snapshot"):
@@ -2402,6 +2411,7 @@ class Gateway:
         # 只能靠对账单勘误；这是 600362 事故的现网判据。
         # 装配点与 /state 共用（§CLOSE-RECON-STATE），改键必须两面同批。
         payload["close_snapshot"] = self._close_snapshot_readout()
+        payload["strategy_io"] = self._io_selfcheck_readout()
         return 200, payload
 
     def _do_admin_order_confirm(self, body):
@@ -2729,6 +2739,48 @@ class Gateway:
             return 200, {"ok": True, "err": ""}
         return 409, {"ok": False, "err": err or "cancel failed"}
 
+    def _note_io_selfcheck(self, req):
+        """§BAN_IO 收下桥的一次文件写自证（只记最近一次 + 累计次数，不做任何判定）。"""
+        try:
+            self._io_selfcheck = {
+                "at": str(req.get("at", "") or ""),
+                "day": str(req.get("day", "") or ""),
+                "ts": time.time(),
+                # 这枚事件**只有写成功才可能存在**，所以"收到"本身就是 report_ok=True 的证据；
+                # 按 req 里的字段取值会把一个成功的自证读成 None（=denied），那是自己造出来的假阴性。
+                "report_ok": True if req.get("report_ok") is None else bool(req.get("report_ok")),
+                "trace_ok": req.get("trace_ok"),
+                "reason": str(req.get("reason", "") or "")[:120],
+                "n": int(self._io_selfcheck.get("n", 0) or 0) + 1,
+            }
+        except Exception:  # noqa: BLE001 — 观测位坏掉不许影响回报主链
+            log.exception("[gateway] io_selfcheck 记账失败")
+
+    def _io_selfcheck_readout(self):
+        """§BAN_IO 读数的**唯一装配点**（/state 与 /admin/status 共用，同收盘快照那条纪律）。
+
+        三个状态各有各的下一步，不许折：
+          * ok         —— 策略能写上行文件（禁令对这台终端还没生效的直接证据）；
+          * denied     —— 策略**还在跑**但写不出去：这才是禁令生效的形态，处置=换通道，不是重启；
+          * never_seen —— 从来没收到自证：旧载体（没这枚探针）或桥整条没起，两种修法不同，
+                         所以它同时带 `bridge_heartbeat_seen`，让读的人自己分辨是哪一种。
+        缺省不判红、不熔断：这条腿只做归因（§OBS-GUARD——观测腿不许有钱的动作）。
+        """
+        state = "never_seen"
+        if self._io_selfcheck.get("n", 0) > 0:
+            state = "ok" if self._io_selfcheck.get("report_ok") is True else "denied"
+        return {
+            "state": state,
+            "at": str(self._io_selfcheck.get("at", "") or ""),
+            "day": str(self._io_selfcheck.get("day", "") or ""),
+            "report_ok": self._io_selfcheck.get("report_ok"),
+            "trace_ok": self._io_selfcheck.get("trace_ok"),
+            "reason": str(self._io_selfcheck.get("reason", "") or ""),
+            "probes": int(self._io_selfcheck.get("n", 0) or 0),
+            "age_sec": (int(time.time() - float(self._io_selfcheck.get("ts", 0) or 0))
+                        if self._io_selfcheck.get("ts") else -1),
+        }
+
     def _close_snapshot_readout(self):
         """§CLOSE-RECON 收盘快照读数的**唯一装配点**（/state 与 /admin/status 共用）。
 
@@ -2776,6 +2828,7 @@ class Gateway:
         payload["positions_trusted"] = connected
         # 收盘快照读数（与 /admin/status 同一装配点，两个读面不许各写一份）
         payload["close_snapshot"] = self._close_snapshot_readout()
+        payload["strategy_io"] = self._io_selfcheck_readout()
         return 200, payload
 
     def _do_settlement(self, request_handler=None):

@@ -85,6 +85,13 @@ type Controller struct {
 	// §R4-1 撤单闭环节流状态（mu 保护）
 	lastSweepAt       time.Time // 最近一次 SweepOrders 执行时间（30s 节流）
 	lastCloseSweepDay string    // 最近一次执行收盘清单的交易日（每日一次）
+	// §TRADE-CARD（2026-11-05）撤单动作快照（mu 保护）：order_id → 当日 SweepOrders 对这一笔
+	// 委托做过的真实动作。交易提示卡上的"撤"只读这里，**不在展示层重判超时/信号消失**；
+	// 类型、当日失效与封顶的理由全写在 sweepActionLimit 的文件头注释里。
+	// English: per-order cancel actions taken by this process today — the ONLY face the advice
+	// card reads for the 撤 verb (the card never re-decides staleness itself).
+	lastSweepDay     string
+	sweepActionsByID map[string]SweepAction
 	// §C1b 跨日陈旧买单无条件清扫的独立节流戳（mu 保护）：不受 Enabled/Tripped 管辖，
 	// 故不能复用 lastSweepAt（后者在早退分支之前不被推进）。
 	lastStaleSweepAt time.Time
@@ -1305,6 +1312,18 @@ type SweepResult struct {
 	// English: cancels skipped because the row is an IPO-subscription registration (guard only;
 	// stays 0 while the switch is off, which doubles as proof of the switch state).
 	SubscriptionSkipped int // 申购登记行未发撤单的笔数
+	// SignalGoneCancelled §SIGNAL-GONE（2026-11-05）：本轮**只因**"信号消失"而发出的撤单笔数。
+	// 它并进上面的 Cancelled（撤的是同一条腿，不另开一条撤单路），单列只为让运维看得出撤单理由；
+	// 开关关着时恒 0，所以这个数字本身就是"这条腿开着且真撤到了"的证据（同 SubscriptionSkipped 取向）。
+	SignalGoneCancelled int
+	// SignalGoneUnknown §SIGNAL-GONE：买入挂单认不出自己信号键的笔数（键不是 buy: 幂等形状，
+	// 或当日决策表里没有这一行）。不并进 Skipped：Skipped 是"这单不需要撤"，这里是"这单说不清
+	// 信号还在不在"。它持续不为 0 就是键空间漂移的现场证据（§C6 那把尺子又分叉了）。
+	SignalGoneUnknown int
+	// SignalGoneIdle §SIGNAL-GONE：开关开着，但当日决策表给不出"打分链还在跑"的读数
+	// （今天零行／查库失败／全链停摆超过宽限）⇒ 一条都不撤。
+	// 这就是 missing ≠ empty：没读数和"信号都消失了"是两种完全不同的现象，后者才该撤单。
+	SignalGoneIdle bool
 }
 
 // ReconcileOrderStates §ORDER-STATE-PULL（2026-10-30）：用网关当日委托状态校正本地在途单。
@@ -1659,6 +1678,92 @@ func (c *Controller) reconcileMissingOrders(day string, states *GatewayOrderStat
 	}
 }
 
+// signalGoneLiveness §SIGNAL-GONE（2026-11-05）：把当日动态仓位快照折成"这条信号还在不在被算"的视图。
+//
+// 为什么用 signal_decisions 而不是另建一本"在途信号账"：这张表由打分链每一轮、每一条信号都写
+// （放行/被拦/跳过都落行，见 engine.persistDynBuyDecision），同键 last-write 只刷新 at，
+// 所以"at 还在一起变老"就是"这一轮又算出它了"的现成读数。再造一本账就是第二个真源，
+// 而本仓库最贵的错误恰恰是"两处各记一份、其中一份没人更新"。
+//
+// 三态不许折叠（missing ≠ empty ≠ stale）：
+//   - loaded=false：查库失败/没库 —— 什么都不做；
+//   - loaded=true 且 lastAt 空：今天一条决策都没有 —— 同样是"不知道"，不是"信号全消失"；
+//   - freshest 老过宽限：整条打分链停摆（崩了/熔断/休市），此时所有行的 at 一起变老，
+//     "信号消失"和"没人算了"根本分不开 —— 一律不撤（撤错的方向是少买，但当日幂等键下
+//     撤掉的单不会补挂，见 config.SignalGoneCancelSec 的缺省关理由）。
+type signalGoneLiveness struct {
+	// lastAt 是 "<code>|<strategyKey>" → 该信号当日最后一次被算出的时刻。
+	// 键形状与 store.UpsertSignalDecision 无 signal_id 时的兜底主键逐字一致（同一把尺子）。
+	lastAt map[string]time.Time
+	// freshest 当日所有行里最大的 at；零值＝这个账号今天一行决策都没有。
+	freshest time.Time
+	// loaded 读数是否真的拿到（与"拿到了但是空的"分开）。
+	loaded bool
+}
+
+// signalGoneLivenessFor 读当日快照并折叠成视图。只在开关打开时调用（关着＝零次查询＝今天的原样行为）。
+func (c *Controller) signalGoneLivenessFor(day string) signalGoneLiveness {
+	view := signalGoneLiveness{lastAt: map[string]time.Time{}}
+	if c.store == nil || day == "" {
+		return view
+	}
+	rows, err := c.store.SignalDecisionsForDay(c.userID, day)
+	if err != nil {
+		log.Printf("[trading] §SIGNAL-GONE 读当日决策快照失败（当作不知道，一条都不撤）day=%s: %v", day, err)
+		return view
+	}
+	view.loaded = true
+	for _, x := range rows {
+		// 只有 live 通道算数：纸面那条链自己也在每轮写快照，它新不新与实盘挂单无关。
+		// 这一条必须挡在 freshest 之前——否则"实盘链停了、纸面还在跑"会把 freshest 顶新，
+		// 于是拿着纸面的活跃度去撤实盘的挂单（方向是动钱，两本账的错法）。
+		if x.Channel != "" && x.Channel != "live" {
+			continue
+		}
+		at, perr := time.Parse(time.RFC3339, x.At)
+		if perr != nil {
+			continue
+		}
+		if at.After(view.freshest) {
+			view.freshest = at
+		}
+		key := x.Code + "|" + x.Strategy
+		if prev, ok := view.lastAt[key]; !ok || at.After(prev) {
+			view.lastAt[key] = at
+		}
+	}
+	return view
+}
+
+// signalGoneBuyKey 把买入委托的幂等键 buy:<code>:<strategy>:<day> 还原成决策表的键
+// "<code>|<strategy>"。
+//
+// 为什么只认这一种形状并且要求日键与本轮同日：这条腿撤的是"战略建仓买单"，它的键就是
+// engine.go 里那个 id（与准入探针同源，§C6）。T 腿（t0:…）、卖单（sell:…）、手动单（ext:…）
+// 压根不在这个键空间里，跨日僵尸行也不归这里管（§C1b 那条无条件清扫才是它们的去处）。
+// 认不出来一律 ok=false ⇒ 调用方记成"不知道"，绝不许拿别的键凑一个"消失"出来。
+func signalGoneBuyKey(signalID, day string) (string, bool) {
+	const buyPrefix = "buy:"
+	if !strings.HasPrefix(signalID, buyPrefix) {
+		return "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(signalID, buyPrefix), ":")
+	if len(parts) < 3 {
+		return "", false
+	}
+	if parts[len(parts)-1] != day {
+		return "", false
+	}
+	// 战法键理论上可能含冒号（内置战法显示名不会），按"首=代码、末=日、中间全归战法"还原，
+	// 这样即使键形变化也不会把一笔买单错认成另一条信号。
+	code := parts[0]
+	strategy := strings.Join(parts[1:len(parts)-1], ":")
+	if code == "" || strategy == "" {
+		return "", false
+	}
+	return code + "|" + strategy, true
+}
+
 // SweepOrders §R4-1 撤单闭环主入口（30s 节流，由引擎 5s 循环调用）：
 //  1. 未成交超时自动撤：orders 表 状态=已报 且滞留超过 cancel_stale_sec（默认 120s）→
 //     调网关撤单，成功即把本地行推进为"已撤"。撤单被拒（已成交/交易所号未回报）不重试强撤，
@@ -1742,8 +1847,12 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 			closeSweep = true
 		}
 	}
-	if staleSec < 0 && !closeSweep {
-		return nil // 自动撤单已关闭且未到收盘清单时刻
+	// §SIGNAL-GONE（2026-11-05）：`cancel_stale_sec=-1`（整条超时撤单关掉）不再连带关掉
+	// "信号消失即撤"——那是运维关掉超时撤单、但仍希望挂单跟着信号走时唯一能表达的形状。
+	// 开关关着时这里一个字节都不变（与今天的早退完全同条件）。
+	signalGoneOn := cfg.SignalGoneCancelSec > 0
+	if staleSec < 0 && !closeSweep && !signalGoneOn {
+		return nil // 自动撤单已关闭、未到收盘清单时刻，且没有"信号消失即撤"这条腿
 	}
 
 	orders, err := c.store.RealOrdersForUser(c.userID)
@@ -1752,6 +1861,23 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		return nil
 	}
 	res := &SweepResult{CloseSweep: closeSweep}
+	// §SIGNAL-GONE（2026-11-05）：把"今天这一轮打分链还在不在跑、每条信号最后一次算出是什么时候"
+	// 读一次（整轮只读一次，不按单反复查库）。开关关着时连查库都不发生 ⇒ 与今天逐字节同形。
+	live := signalGoneLiveness{}
+	grace := time.Duration(cfg.SignalGoneCancelSec) * time.Second
+	if signalGoneOn {
+		live = c.signalGoneLivenessFor(day)
+		if !live.loaded {
+			res.SignalGoneIdle = true // 查库失败：不知道，不撤
+		} else if live.freshest.IsZero() {
+			res.SignalGoneIdle = true // 今天零行：这是"没有读数"，不是"信号全消失"
+		} else if now.Sub(live.freshest) > grace {
+			res.SignalGoneIdle = true // 整链停摆超过宽限：撤单理由站不住，一条都不撤
+			log.Printf("[trading] §SIGNAL-GONE 未启用本轮：当日最新决策在 %s 前（宽限 %s），"+
+				"判为打分链停摆而非信号消失，本轮不因消失撤单", live.freshest.Format(time.RFC3339), grace)
+		}
+	}
+	signalGoneActive := signalGoneOn && !res.SignalGoneIdle
 	for _, o := range orders {
 		// §P1-7 超时撤单范围扩展到部成：已报/部成 均可能剩余未成交，需自动撤销。
 		// §CANCEL-STATE（2026-10-28）：「撤单中」不重复发撤单请求——它已经有一笔在途的撤单请求，
@@ -1798,36 +1924,73 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 			}
 			continue
 		}
-		if !((orderStale > 0 && age > orderStaleAfter) || closeSweep) {
+		// §SIGNAL-GONE（2026-11-05）第二个撤单理由：这笔买单的信号不再被算出来了。
+		// 只加"触发条件"，不加第二条撤单路——下面仍是同一次 Cancel()、同一处留痕、同一个状态迁移，
+		// 因为两条撤单路对同一笔单赛跑才是 10-30 那类"撤了又报、报了又撤"的成因。
+		// 每一处都判"不知道就不动"：认不出键（不是 buy: 幂等形／当日没有这一行）记 Unknown 而不是 Skipped。
+		signalGone := false
+		if signalGoneActive && o.Side == SideBuy {
+			key, known := signalGoneBuyKey(o.SignalID, day)
+			// 查表必须是"取到才判"：map 里缺这个键时 lastAt[key] 返回**零值时刻**，
+			// 拿它去比 now.Sub(...) > grace 恒真 ⇒ 一笔从没被算过的信号会被当成"消失了"撤掉。
+			// 这正是本仓反复的 missing≠empty 形状，缺键一律归 Unknown（不知道，不动钱）。
+			var lastAt time.Time
+			seen := false
+			if known {
+				lastAt, seen = live.lastAt[key]
+			}
+			switch {
+			case !known || !seen:
+				res.SignalGoneUnknown++
+			case now.Sub(lastAt) > grace:
+				signalGone = true
+			}
+		}
+		staleHit := orderStale > 0 && age > orderStaleAfter
+		if !(staleHit || closeSweep || signalGone) {
 			continue
 		}
-		// §CANCEL-STATE 禁撤窗口闸：集合竞价期间交易所不接受撤单，整轮不发撤单请求。
-		// 占位行降级（纯本地账）不受影响——它压根没到柜台。
-		if windowBlocked {
+		// §TRADE-CARD（2026-11-05）：撤单理由在这里一次算定，后面**留痕、动作快照、提醒文案**
+		// 三处都吃同一个变量——三个触发条件在次日的含义完全不同（"到期了"要查 cancel_stale_sec、
+		// "信号消失了"要查打分链、"收盘清场"每天都发生），折成一句就把三条排障线索抹成一条。
+		// 优先级 signal_gone > close_sweep > sweep：一笔单同时满足多条时，报"最早成立的那个理由"
+		// 没有意义，报"系统本轮据以下单的理由"才有意义——信号刚消失是最新事实。
+		traceSource, traceReason := SweepSourceSweep, "例行超时撤单：挂单超过 cancel_stale_sec 未成交，撤单请求已发出，等待交易所确认"
+		switch {
+		case signalGone && !staleHit && !closeSweep:
+			traceSource = SweepSourceSignalGone
+			traceReason = fmt.Sprintf("信号消失即撤：该买入信号超过 %d 秒未再被算出，撤单请求已发出，等待交易所确认",
+				cfg.SignalGoneCancelSec)
+		case closeSweep && !staleHit:
+			traceSource = SweepSourceClose
+			traceReason = "收盘清单撤单请求已发出，等待交易所确认"
+		}
+		// §TRADE-CARD / §BUY-REPRICE（2026-11-05）：撤单只有一条出口 RequestCancel——
+		// 窗口闸、撤单调用、orders.cancel_* 留痕、状态推进、动作快照五件事都在那一处做完。
+		// 本函数的三个触发条件（超时/信号消失/收盘清单）与 VWAP 改价那条腿共用它，
+		// 所以不会出现"某条腿撤了单但卡上没有留痕"这种形状。
+		switch c.RequestCancel(o, traceSource, traceReason, now, day) {
+		case CancelWindowBlocked:
 			res.WindowSkipped++
-			continue
-		}
-		if err := c.execRef().Cancel(o.OrderID); err != nil {
+		case CancelRefused, CancelStateNotAdvanced:
 			res.Errors++
-			// 典型失败：交易所委托号尚未回报（网关暂不可撤）/ 已成交（撤单被拒）——
-			// 不强试，交由回报线程推进真实状态，下轮再评估
-			log.Printf("[trading] 自动撤单被拒 %s(%s %s qty=%d, 滞留%s): %v",
-				o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), err)
-			continue
+			log.Printf("[trading] 自动撤单未成功 %s(%s %s qty=%d, 滞留%s)，下轮再评估",
+				o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second))
+		case CancelRequested:
+			res.Cancelled++
+			if traceSource == SweepSourceSignalGone {
+				res.SignalGoneCancelled++
+			}
+			metrics.OrdersCancelled() // §R4-9 撤单计数
+			log.Printf("[trading] 自动撤单请求已发出 %s %s %s qty=%d (滞留%s, 收盘清单=%v, 撤单来源=%s, 状态=撤单中)",
+				o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), closeSweep, traceSource)
 		}
-		// §CANCEL-STATE：撤单请求已发出 ≠ 已撤。置「撤单中」等交易所/快照确认。
-		// §FIX-20261028-F14：留痕先写（终态行也要留），再推进状态。
-		if _, err := c.store.SetCancelTrace(c.userID, o.OrderID, "sweep", "例行超时撤单/收盘清单撤单请求已发出，等待交易所确认"); err != nil {
-			log.Printf("[trading] sweep cancel trace %s: %v", o.OrderID, err)
-		}
-		if ok, err := c.store.MarkRealOrderCancelRequested(c.userID, o.OrderID, "sweep", "例行超时撤单/收盘清单撤单请求已发出，等待交易所确认"); err != nil || !ok {
-			res.Errors++
-			continue
-		}
-		res.Cancelled++
-		metrics.OrdersCancelled() // §R4-9 撤单计数
-		log.Printf("[trading] 自动撤单请求已发出 %s %s %s qty=%d (滞留%s, 收盘清单=%v, 状态=撤单中)",
-			o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), closeSweep)
+	}
+	if signalGoneOn {
+		// 三个读数一条不落全打：撤了几笔（SignalGoneCancelled）、几笔说不清（Unknown）、
+		// 整链是否停摆（Idle）。少了任何一项，"这条腿今天到底在不在工作"就只能靠猜。
+		log.Printf("[trading] §SIGNAL-GONE 本轮宽限=%s 因消失撤单=%d 键未知=%d 读数不可用=%v",
+			grace, res.SignalGoneCancelled, res.SignalGoneUnknown, res.SignalGoneIdle)
 	}
 	if windowBlocked {
 		// 窗口内不发撤单请求，但整轮节流/占位降级等仍照常；留痕让运维能看到"这段时间没撤单"。

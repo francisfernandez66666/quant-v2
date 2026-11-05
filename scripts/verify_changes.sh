@@ -16661,7 +16661,7 @@ echo "ok - §137 §FUNDS-TODAY + §DECISION-TODAY 锁通过（资金帧 6 + 接�
 # 事故本体（600362 江西铜业）：14:57:48 尾盘挂买单 → 15:00:03 想撤 → 撞上收盘集合竞价被交易所拒 →
 # 本地把「撤单请求被受理」记成「已撤」→ 实际成交既没有 fills 也没有持仓，委托行永远挂在已撤。
 # 两个洞必须一起堵，本段把它们钉死：
-#   ① 时段闸：禁挂 09:20-09:30/14:52-15:00、禁撤 09:20-09:30/14:57-15:00（北京时），
+#   ① 时段闸：禁挂 09:15-09:30（11-05 前移，整段开盘集合竞价）/14:52-15:00、禁撤 09:20-09:30/14:57-15:00（北京时），
 #      窗口内**不发起**（不是发起后被拒——那会拿到一次"受理成功"的假回执）；
 #   ② 状态闸：撤单请求发出 ⇒「撤单中」（非终态，冻结照算），只有交易所回报/快照才转终态；
 #      「撤单中」退回在途态只认一条显式事件（§CANCEL-REJECT），迟到快照不许回退。
@@ -16692,8 +16692,8 @@ QX138=web/src/pages/Quant.jsx
 # —— ① 时段闸：出厂窗口 + 判定器 + 配置项 + 两端接线 ——
 grep -qF 'DefaultNoCancelWindows = "09:20-09:30,14:57-15:00"' "$SG138" ||
 	fail138 "禁撤窗口默认值不是 09:20-09:30,14:57-15:00（owner 拍板口径漂了）"
-grep -qF 'DefaultNoNewOrderWindows = "09:20-09:30,14:52-15:00"' "$SG138" ||
-	fail138 "禁挂窗口默认值不是 09:20-09:30,14:52-15:00（owner 拍板口径漂了）"
+grep -qF 'DefaultNoNewOrderWindows = "09:15-09:30,14:52-15:00"' "$SG138" ||
+	fail138 "禁挂窗口默认值不是 09:15-09:30,14:52-15:00（owner 11-05 令：整段开盘集合竞价不挂单；口径漂回 09:20 就是重新允许挂早）"
 grep -qF 'func (sw *SessionWindows) CancelBlocked' "$SG138" ||
 	fail138 "缺 CancelBlocked（禁撤判定没有出口）"
 grep -qF 'func (sw *SessionWindows) NewOrderBlocked' "$SG138" ||
@@ -16708,8 +16708,8 @@ grep -qF 'NoNewOrderWindows string `json:"no_new_order_windows,omitempty"`' "$CF
 	fail138 "配置项 no_new_order_windows 不在"
 grep -qF 'NoCancelWindows:   "09:20-09:30,14:57-15:00"' "$CFG138" ||
 	fail138 "配置出厂默认没落禁撤窗口"
-grep -qF 'NoNewOrderWindows: "09:20-09:30,14:52-15:00"' "$CFG138" ||
-	fail138 "配置出厂默认没落禁挂窗口"
+grep -qF 'NoNewOrderWindows: "09:15-09:30,14:52-15:00"' "$CFG138" ||
+	fail138 "配置出厂默认没落禁挂窗口（或没跟上 11-05 的 09:15 前移——这两份字面量必须同值，derive 读的是这一份）"
 grep -qF 'return nil, ErrNoNewOrderWindow(label)' "$CT138" ||
 	fail138 "placeOrder 没挂禁挂闸（所有下单路径都从这里过，漏挂＝闸形同虚设）"
 grep -qF 'return ErrNoCancelWindow(label)' "$CT138" ||
@@ -20420,7 +20420,9 @@ done
 
 # ⑦ 撤单腿 fail-closed + 投递腿三段自证、且不直起客户端
 CNT173=$((CNT173 + 1))
-grep_q "def cancel_leg(self, day, broker_rows, moment, closed_days)" LEXT F || fail173 "执行器超时撤单/收盘清场腿不见了（桥断后没人帮你撤单）"
+# §CUTOVER-1105：撤单腿后来多了三个可选互锁参数，整串锚必须跟着换成"函数头前缀"，
+# 否则一次纯签名扩展就会被读成"撤单腿整个不见了"（gofmt 改注释那类锚静默失配）。
+grep_q "def cancel_leg(self, day, broker_rows, moment, closed_days," LEXT F || fail173 "执行器超时撤单/收盘清场腿不见了（桥断后没人帮你撤单）"
 grep_q "if terminal is not False:" LEXT F || fail173 "撤单腿不再区分未知态（词表取不到时会反复撤单）"
 grep_q "def mark_cancelled(self, day, order_id)" LEXT F || fail173 "同一委托号的重复撤单留痕不见了（频繁瞬时撤单是四类异常交易监测口径之一）"
 UPT=$(cat "$UPS" || true)
@@ -20689,8 +20691,409 @@ if [ "${MINE4:-0}" -ge 1 ]; then R173_MUTATED=$((R173_MUTATED + 1)); fi
 echo "   [§173 反证] R173_MUTATED=${R173_MUTATED}（摘四源窗口判据 / 摘 g7 装载自证 / 往导出工具里注入一枚阈值，三处均按预期失效）"
 rm -rf "$WORK173"
 
+# ⑰ §ADVICE-TACTICS（11-05 owner 两条裁决）：建议×战法开关 + 建议股数
+#   A. 「量化交易」页关掉的战法不再产**加仓**建议（硬过滤），但卖出方向一条都不许滤；
+#   B. 建议行带出当日定权算出的股数/金额/受限项，算不出就**字段缺席**（不是 0）。
+#   这两条各自都有"改回去也长得像对的"形状：过滤改成两侧都滤＝持仓敞口没人提醒；
+#   缺席折成 0＝屏上一个像测量值的 0。所以判据一律落在**可执行行**上，不靠注释。
+CNT173=$((CNT173 + 1))
+SC=internal/signalctl/signalctl.go
+ADV=internal/trading/advice.go
+ADVT=$(cat "$ADV" || true)
+SCT=$(cat "$SC" || true)
+[ -n "$ADVT" ] || fail173 "读不到 ${ADV}（下面所有建议侧判据会一起变红，先红在这里而不是逐条误报）"
+[ -n "$SCT" ] || fail173 "读不到 ${SC}"
+
+# ⑰-a 成员判定只有一处实现，两把入口都只是转调（漂开的表现＝屏上建议与真实准入相反）
+grep_q "func admit(pol Policy, key string, aliases ...string) (bool, string)" SCT F || fail173 "admit 不再是唯一成员判定实现（两把入口各自写一份迟早漂开）"
+grep_q "func AdmitStrategyName(pol Policy, nameOrKey string) (bool, string)" SCT F || fail173 "串入口 AdmitStrategyName 不见了（建议层只能自己再抄一份规则）"
+N_ADVICE_DEF=$(grep -c "^func AdmitStrategyName(" "$SC" || true)
+[ "${N_ADVICE_DEF:-0}" = "1" ] || fail173 "AdmitStrategyName 定义应恰 1 处，实得 ${N_ADVICE_DEF}（多出来那处就是第二本账）"
+ADMIT_OLD=$(awk '/^func AdmitStrategy\(/,/^}/' "$SC" || true)
+grep_q "return admit(pol, StrategyKeyOf(sig), sig.Strategy, sig.StrategyID)" ADMIT_OLD F || fail173 "AdmitStrategy 不再转调 admit（Signal 入口自己长回了成员判定）"
+ADMIT_NEW=$(awk '/^func AdmitStrategyName\(/,/^}/' "$SC" || true)
+grep_q "return admit(pol, StrategyKeyByDisplay(nameOrKey)" ADMIT_NEW F || fail173 "AdmitStrategyName 不再转调 admit（同上，两把入口分家）"
+grep_q "func StrategyKeyByDisplay(name string) string" SCT F || fail173 "显示名→规范键的归一表没有单一出口"
+KEYOF=$(awk '/^func StrategyKeyOf\(/,/^}/' "$SC" || true)
+grep_q "return StrategyKeyByDisplay(sig.Strategy)" KEYOF F || fail173 "StrategyKeyOf 又自己写了一遍归一 switch（归一表出现第二份）"
+N_DRAGON_CASE=$(grep -c 'case "龙头":' "$SC" || true)
+[ "${N_DRAGON_CASE:-0}" = "1" ] || fail173 "显示名归一的 case 龙头 应恰 1 处，实得 ${N_DRAGON_CASE}（两处＝两张表）"
+
+# ⑰-b 过滤只作用在买入方向：谓词应用次数**等值钉死**，卖出侧被一起滤的改法必然改动这两行
+grep_q "func filterEntryAdviceByTactics(list []PositionAdvice, pol signalctl.Policy) ([]PositionAdvice, int)" ADVT F || fail173 "过滤器本体不见了（开关与建议又各判一套）"
+grep_q "advices, flt.FilteredBySwitch = filterEntryAdviceByTactics(advices, signalctl.Policy{Strategies: in.Cfg.Strategies})" ADVT F || fail173 "Advise 不再按 Cfg.Strategies（量化页那组开关的真源）过滤买入建议"
+N_PRED=$(grep -c "signalctl.AdmitStrategyName(" "$ADV" || true)
+[ "${N_PRED:-0}" = "1" ] || fail173 "建议层的谓词应用点应恰 1 处，实得 ${N_PRED}（第 2 处几乎只能是「把卖出侧也滤了」）"
+N_GUARD=$(grep -c 'if a.Action != adviceActionAdd || strings.TrimSpace(a.Strategy) == "" {' "$ADV" || true)
+[ "${N_GUARD:-0}" = "1" ] || fail173 "「只滤加仓 + 归属不明不过滤」那行等值判定不在位（实得 ${N_GUARD}）——卖出方向重新进过滤器就是从这里改出来的"
+grep_q 'const adviceActionAdd = "加仓"' ADVT F || fail173 "买入动作字面量不再是单点常量（过滤器与 addAdvice 会漂成两个写法）"
+FILT=$(awk '/^func filterEntryAdviceByTactics/,/^}/' "$ADV" || true)
+[ -n "$FILT" ] || fail173 "取不到过滤器函数体（下面那枚卖出负锁会是摆设，先红在这里）"
+for sell in "止盈" "止损" "减仓" "清仓"; do
+	if grep_q "\"$sell\"" FILT F; then
+		fail173 "过滤器里出现卖出动作字面量 ${sell}：卖出方向永不过滤是刻意的边界（已买进来的持仓仍是敞口）"
+	fi
+done
+
+# ⑰-c 过滤不许静默：条数要能数出来、要上屏
+grep_q "func Advise(in AdviceInput) ([]PositionAdvice, AdviceFilter)" ADVT F || fail173 "Advise 又只返回列表（滤掉几条从此无处传）"
+grep_q 'FilteredBySwitch int `json:"filtered_by_switch"`' ADVT F || fail173 "AdviceFilter 的条数字段漂了（前端按这个键判「被滤」与「没有」）"
+grep_q "ADVICE_TACTICS_FILTER dropped=%d kept=%d strategies=%d" SLT F || fail173 "引擎那行 ASCII 读数锚不见了（值班只能猜今天为什么一条加仓都没有）"
+grep_q "if advFilter.FilteredBySwitch > 0 {" SLT F || fail173 "过滤日志不再只在 dropped>0 时打（0 也打＝每天 4 800 行噪音，真读数会被训练成没人看）"
+grep_q '"filtered_by_switch": advFilter.FilteredBySwitch' SLT F || fail173 "SSE 载荷不带过滤条数（屏上少了 N 条与本来就没 N 条同一张脸）"
+grep_q "if payload.FilteredBySwitch != nil" QGT F || fail173 "REST 回填不再判指针（旧一轮载荷没带这个键会被折成 0）"
+grep_q "FilteredBySwitch *int" QGT F || fail173 "REST 解包的过滤读数不再是指针（缺席与 0 又混成一件事）"
+
+# ⑰-d 建议股数只从当日定权快照抄：算式不许住进建议层，缺席不许变成 0
+for tag in 'json:"suggest_qty,omitempty"' 'json:"suggest_amount,omitempty"' 'json:"capped_by,omitempty"' 'json:"sizing_at,omitempty"'; do
+	grep_q "$tag" ADVT F || fail173 "建议行的量缺了 ${tag}（omitempty 是「缺席」的唯一机制，不是 -1/0 哨兵）"
+done
+grep_q "func attachSuggestedSizing(advices []PositionAdvice, decisions []store.SignalDecision)" ADVT F || fail173 "定权快照的附数腿不见了"
+grep_q "Decisions []store.SignalDecision" ADVT F || fail173 "AdviceInput 不再由引擎注入当日快照（建议层要么自己查库要么没有数）"
+ATTACH=$(awk '/^func attachSuggestedSizing/,/^}/' "$ADV" || true)
+[ -n "$ATTACH" ] || fail173 "取不到 attachSuggestedSizing 函数体"
+grep_q "if advices[i].Action != adviceActionAdd {" ATTACH F || fail173 "附数不再只挂买入方向的行（卖出卡会显示一个买入量）"
+grep_q "if d.Qty > 0 {" ATTACH F || fail173 "Qty=0 的行开始被当成「建议 0 股」（本仓纪律：没算出来不等于算出来是 0）"
+if grep_q "SignalDecisionsForDay(" ADVT F; then
+	fail173 "建议层自己去查库：Advise 必须是纯函数，快照只能由引擎注入（否则一轮 5s 循环里多一次库读）"
+fi
+# 引擎侧接线：day 尺子与写入侧同源，且每轮只读一次
+grep_q "dayKey := data.TradingDayDate(time.Now())" SLT F || fail173 "引擎取当日快照的 day 不再与写入侧同源（节假日两侧算出不同 day＝永远查不到行）"
+grep_q "realStore.SignalDecisionsForDay(sendTo, dayKey)" SLT F || fail173 "当日定权快照没接进建议链（建议行永远没有股数）"
+N_DEC_READ=$(grep -c "realStore.SignalDecisionsForDay(" "$SL" || true)
+[ "${N_DEC_READ:-0}" = "1" ] || fail173 "打分循环里读快照应恰 1 处，实得 ${N_DEC_READ}（多读一处＝一轮两本时刻）"
+grep_q "Decisions: decisions," SLT F || fail173 "Advise 入参没带快照"
+N_ENGINE_PRED=$(grep -c "AdmitStrategyName" "$SL" || true)
+[ "${N_ENGINE_PRED:-0}" = "0" ] || fail173 "引擎侧又出现谓词调用（${N_ENGINE_PRED} 处）：战法过滤只有一个落点，多出来的那份迟早连卖出一起滤"
+
+# ⑰-e 前端两格都在位，且"未计算"这句只有一个来源
+AFU=web/src/utils/adviceFormat.js
+POST=$(cat web/src/pages/Positions.jsx || true)
+AFUT=$(cat "$AFU" || true)
+[ -n "$AFUT" ] || fail173 "前端文案单点不在册（${AFU}）：未计算/受限项两句一旦写在各处就会各说一套"
+grep_q "from '../utils/adviceFormat.js'" POST F || fail173 "持仓页没走文案单点（具名清单会变，模块出处不会）"
+grep_q "suggest_qty: a.suggest_qty" POST F || fail173 "applyAdviceMap 又把后端算好的股数丢了（旧形态：到达浏览器那一刻再丢一次）"
+grep_q "applyAdviceMap(msg.advices, msg.filtered_by_switch)" POST F || fail173 "SSE 的过滤条数没进映射入口"
+grep_q "applyAdviceMap(r.advices, r.filtered_by_switch)" POST F || fail173 "REST 回填的过滤条数没进映射入口"
+grep_q "data-testid=\"advice-suggest\"" POST F || fail173 "建议行「量」那一格没有稳定判据位（用例只能靠数文字）"
+grep_q "data-testid=\"advice-filtered\"" POST F || fail173 "被滤条数那一行没有稳定判据位"
+grep_q "Number.isFinite(qty) && qty > 0" AFUT F || fail173 "文案层不再按「键在不在/是不是正数」判缺席（0 会开始冒充测量值）"
+grep_q "另有 " AFUT F || fail173 "过滤条数那句文案漂了（用例与页面判的是同一句）"
+if grep_q "建议 0 股" AFUT F; then
+	fail173 "前端会把缺席写成「建议 0 股」"
+fi
+
+# ⑰-f 用例在册（缺用例的腿等于没有锁）
+ADVT_T=$(cat internal/trading/advice_tactics_test.go || true)
+SCT_T=$(cat internal/signalctl/strategy_name_admit_test.go || true)
+[ -n "$ADVT_T" ] || fail173 "internal/trading/advice_tactics_test.go 不在册"
+[ -n "$SCT_T" ] || fail173 "internal/signalctl/strategy_name_admit_test.go 不在册"
+for name in TestAdviseTacticsSwitchDropsAddButNeverSell TestAdviseTacticsSwitchKeepsUnattributedRows TestAdviseTacticsSwitchLegacyAllOnSemantics TestAdviseTacticsSwitchKeyNameBothFormsMatch TestAdviseSuggestQtyPresentAndAbsent TestAdviseSuggestPicksLatestRowPerCode TestAdviseSuggestKeyShapesMeet TestAdviseSuggestNotAttachedToSellRows TestAdviseFilterStatIsZeroValueWhenNothingDropped; do
+	grep_q "func $name" ADVT_T F || fail173 "建议侧行为用例缺失：${name}"
+done
+for name in TestStrategyKeyByDisplayMatchesStrategyKeyOf TestAdmitStrategyNameAgreesWithAdmitStrategy TestAdmitStrategyNameLegacyAllOnSemantics; do
+	grep_q "func $name" SCT_T F || fail173 "谓词一致性用例缺失：${name}"
+done
+[ -s web/src/__tests__/advice_tactics_20261105.test.jsx ] || fail173 "前端建议行/过滤条数用例不在册"
+
+# ⑱ BAN_IO 禁令生效自证（11-05）：桥的写自证 + 网关三态读数。
+# 今天现网实测券商禁令**对这台旧客户端没生效**（桥文件 5 秒前还在长、exe 是 8 月 7 日那版），
+# 所以断链的触发器很可能是"一次没人盯着的自动升级"。真到切换那一刻，
+# "策略丢了磁盘 / 策略没在跑 / 今天没事件"三件事在文件层面完全同一副样子——这三态必须各有锁。
+CNT173=$((CNT173 + 1))
+BRI=$(cat qmt_gateway/qmt_bridge_strategy.py || true)
+grep_q "def probe_strategy_io():" BRI F || fail173 "桥的文件写自证不见了（禁令生效当天只剩静默）"
+grep_q 'if IO_SELF_CHECK["done"]:' BRI F || fail173 "探针不再是一次性：每轮都写会把 5MB 轮转预算花在诊断上"
+grep_q '_trace("BAN_IO reason=' BRI F || fail173 "写失败不再打 BAN_IO——这是全链唯一会说「策略丢了磁盘」的一行"
+PIO_N=$(printf '%s' "$BRI" | grep -cE "^[[:space:]]+probe_strategy_io\(\)$" || true)
+[ "${PIO_N:-0}" -ge 2 ] || fail173 "探针的接线点少于 2 处（init 与 handlebar 兜底各一处），实得 ${PIO_N}"
+GWI=$(cat qmt_gateway/gateway.py || true)
+grep_q 'if etype == "io_selfcheck":' GWI F || fail173 "网关不认 io_selfcheck（事件会被当未知类型 400 掉）"
+grep_q "def _io_selfcheck_readout(self):" GWI F || fail173 "网关少了 strategy_io 那枚三态读数"
+# 锚必须落在**赋值点**上：三态的名字同样出现在注释里（刚才塞雷就是这么骗过去的——
+# 改代码那行、留注释那行，锁照样绿），所以判 `state = "..."` 这三条实形，不判裸词。
+grep_q 'state = "never_seen"' GWI F || fail173 "读数少了 never_seen 这一态（从没收到过自证必须独立可判）"
+grep_q 'state = "ok" if' GWI F || fail173 "读数少了 ok 这一态（写得到要能被证明）"
+grep_q 'else "denied"' GWI F || fail173 "读数少了 denied 这一态（策略还在跑但写不出去必须与\"没跑\"分开）"
+SIO_N=$(printf '%s' "$GWI" | grep -c 'payload\["strategy_io"\]' || true)
+[ "${SIO_N:-0}" = "2" ] || fail173 "strategy_io 的装配点应为 2（/state 与 /admin/status 同源），实得 ${SIO_N}"
+# 观测腿不许有钱的动作：这枚读数不得进入健康线/熔断判定（§OBS-GUARD、J0 同取向）
+grep_q 'self._io_selfcheck_readout()' GWI B || fail173 "读数装配点不见了（上一条刚判过定义，这里判它真被调用）"
+BRI_BAD=$(python3 -c "print(sum(1 for b in open('qmt_gateway/qmt_bridge_strategy.py','rb').read() if b>127))" || true)
+[ "${BRI_BAD:-1}" = "0" ] || fail173 "桥策略文件含 ${BRI_BAD} 个非 ASCII 字节：客户端按 GBK 解源码，一个中文字节就能让加载失败"
+BIP_T=$(cat qmt_gateway/tests/test_ban_io_probe.py || true)
+for name in test_probe_writes_one_parseable_event test_probe_is_one_shot_per_process test_write_denied_still_leaves_a_trace_line test_unknown_type_is_still_refused; do
+	grep_q "def $name" BIP_T F || fail173 "BAN_IO 用例缺失：$name"
+done
+
+# ⑲ 终端版本巡检（QMT-CLIENT-VERSION，owner 令「不靠猜」）：钉基线 + 变化现形 + 不写中文路径字面量
+CNT173=$((CNT173 + 1))
+DOC=$(cat scripts/daily_ops_check.ps1 || true)
+grep_q "QMT_CLIENT_STATE baseline_created" DOC F || fail173 "日检不再钉版本基线（那等于回到靠人记\"哪一版会禁\"）"
+grep_q "Write-Output ('QMT_CLIENT_CHANGED from_version=" DOC F || fail173 "版本/安装时间变化不再现形——自动升级就是断链的嫌疑触发器（锚取发射点，WARN 那行也含同一个词，只判词会漏）"
+grep_q "qmt_client_baseline.json" DOC F || fail173 "基线文件路径不在了（没有基线就没有\"变化\"可言）"
+grep_q "'*QMT*' -like" DOC B || grep_q "\*QMT\*" DOC B || grep_q "*QMT*" DOC F || fail173 "找安装位不再用 ASCII 通配（那就必须写中文路径字面量，PS5.1 会吞掉后面的括号）"
+if grep -q "东莞证券" scripts/daily_ops_check.ps1; then
+	fail173 "日检脚本里出现中文路径字面量：无 BOM/码页错配时 UTF-8 字节会配对吞掉 ) 或 }（今天真抛过\"缺少右括号\"）"
+fi
+grep_q "name='XtItClient.exe'" DOC F || fail173 "不再从运行中的进程取 exe（那读的是\"装的是哪一版\"，不是\"正在跑哪一版\"）"
+
+# ⑳ 做 T 判断腿接线（11-05）：AGENTS 从 11-04 就挂着"rules_t / rules_sizing 的调用点没接进载体"——
+# 判断腿算得出数、但没人问它，于是"已移植"这句话在屏上是绿的、在盘上是空的。
+# 今天接的是三件事：模块自己声明、构建器显式绑名、g7e 逐条验 callable；少任何一件都还能骗人。
+CNT173=$((CNT173 + 1))
+RT=$(cat qmt_gateway/rules_t.py || true)
+grep_q "JUDGEMENT_LEGS = \[\"t_readout\"\]" RT B || fail173 "rules_t 不再自己声明判断腿（声明权漂回构建器＝第二本账）"
+grep_q "def t_readout(params, ctx):" RT F || fail173 "T 判断腿的读数函数不见了"
+grep_q "t_gate_open(params, ctx)" RT F || fail173 "读数不再转调真闸门链（那它就是一枚会说谎的桩）"
+grep_q "t_direction(params, ctx)" RT F || fail173 "方向不再来自 t_direction（另抄一份 VWAP 判据就是双写）"
+grep_q "def _judgement_view(ctx, positions, cash):" LEG F || fail173 "执行器少了账户视图：每票 ctx 直接喂判断腿，所有账户级闸门都弃权"
+grep_q "t_leg_judgement(self.params, view)" LEG F || fail173 "影子轮又不问 T 腿（接线回到\"代码在、没人调\"那个形状）"
+grep_q '"t_leg"' UP F || fail173 "上行说明列不带 t_leg：接了线也上不了行，广州还是没法对照"
+BUILDR_T=$(cat scripts/build_local_executor.py || true)
+grep_q '"RULES", "JUDGEMENT_LEGS"' BUILDR_T F || fail173 "构建器重新把判断腿声明当重名冲突（第二条腿一进册就 ported_name_collision）"
+LEG_T=$(cat qmt_gateway/tests/test_carrier_t_leg.py || true)
+for name in test_rules_t_declares_its_own_leg test_disabled_switch_reports_the_real_gate_reason \
+	     test_non_ascii_reason_is_dropped_not_transcoded test_market_dims_are_not_invented_into_the_view \
+	     test_disabled_leg_is_absent_not_zero test_shadow_row_journals_the_t_reading; do
+	grep_q "def $name" LEG_T F || fail173 "T 腿用例缺失：$name"
+done
+# 负锁：判断腿的调用点只能有一处（沙箱不跑 T 轮，那边没有调用点是射程外，不是缺口）
+SIZ_T=$(( $(grep -c "t_leg_judgement(" qmt_gateway/local_executor.py || true) ))
+[ "${SIZ_T:-0}" = "2" ] || fail173 "T 腿调用点数应为 2（定义 + 影子轮一处），实得 ${SIZ_T}"
+if grep -q "t_readout" qmt_gateway/qmt_internal_strategy.py; then
+	fail173 "沙箱里出现了 t_readout 调用：那台机器不跑 T 轮，接上去只会得到一个从不被验证的读数"
+fi
+
+# ㉑ §SIGNAL-GONE（11-05，owner 四条裁决的第 4 条「信号消失后就撤下来」）
+# 钉四件事：缺省必须是关（关着＝今天逐字节行为）、活跃度真源只有当日决策快照一处、
+# "不知道"三种形态各归各位（Idle/Unknown/缺席），以及展示层不许长出第二个判据。
+CNT173=$((CNT173 + 1))
+SGCFG=$(cat internal/config/config.go || true)
+grep_q 'SignalGoneCancelSec int `json:"signal_gone_cancel_sec"`' SGCFG F || fail173 "宽限秒数不再是不带 omitempty 的裸键（缺省 0＝关；键名一进 golden 契约就得多处同步）"
+SGC=$(cat internal/trading/controller.go || true)
+grep_q 'signalGoneOn := cfg.SignalGoneCancelSec > 0' SGC F || fail173 "开关的判据点不见了（>0 是唯一入口，改成 >=0 就把 0=关 变成 0=每轮都撤）"
+grep_q 'signalGoneActive := signalGoneOn && !res.SignalGoneIdle' SGC F || fail173 "读数不可用（Idle）时不再整条腿闭嘴——Idle 是这条腿最贵的护栏"
+grep_q 'lastAt, seen = live.lastAt[key]' SGC F || fail173 "决策表缺键改回直接取值：map 缺键返回零值时刻，\"从没被算过\"会被判成\"消失了\""
+grep_q 'case !known || !seen:' SGC F || fail173 "缺键不再归 Unknown（不知道与消失必须分开，前者不动钱）"
+grep_q 'x.Channel != "" && x.Channel != "live"' SGC F || fail173 "活跃度不再按 live 通道取：纸面那条链也在每轮写快照，拿它撤实盘的挂单是拿错读数动钱"
+grep_q 'const buyPrefix = "buy:"' SGC F || fail173 "信号键还原不再只认 buy: 幂等形（T 腿/卖单/手动单都在这把尺子外面）"
+grep_q 'func signalGoneBuyKey(signalID, day string) (string, bool)' SGC F || fail173 "键解析函数不见了"
+for k in SignalGoneCancelled SignalGoneUnknown; do
+	grep_q "${k} int" SGC F || fail173 "撤单摘要少了一个计数：${k}（撤/不知道 必须分开数）"
+done
+grep_q 'SignalGoneIdle bool' SGC F || fail173 "撤单摘要少了 Idle 读数"
+SGSRV=$(cat internal/server/qmt.go || true)
+grep_q 'SignalGoneCancelSec *int `json:"signal_gone_cancel_sec"`' SGSRV F || fail173 "写面退回非指针：那会让\"这次请求没带这个键\"被读成\"显式关掉\"，一次无关保存就把 owner 按下的开关摘了"
+grep_q 'signal_gone_cancel_sec 仅允许 0(关闭)/30-3600' SGSRV F || fail173 "写面不再校验宽限范围（负数会被当成关，秒级抖动会被当成消失）"
+if grep -q "SignalGoneCancelSec" internal/trading/advice.go; then
+	fail173 "展示层出现了 SignalGoneCancelSec：判据只能住在 SweepOrders 一处，卡再判一次就是两本账"
+fi
+SGT=$(cat internal/trading/signal_gone_20261105_test.go || true)
+for name in TestSignalGoneOffIsByteIdentical TestSignalGoneCancelsStaleSignal TestSignalGoneKeepsFreshSignal \
+	    TestSignalGoneIdleWhenPipelineDead TestSignalGoneNoDecisionsToday TestSignalGoneUnknownKey \
+	    TestSignalGoneNeverCancelsSells TestSignalGoneRespectsNoCancelWindow TestSignalGoneMissingRowIsUnknown \
+	    TestSignalGonePaperChannelIgnored; do
+	grep_q "func $name" SGT F || fail173 "§SIGNAL-GONE 用例缺失：$name"
+done
+
+# ㉒ §TRADE-CARD 撤单动作快照（11-05）：卡上的"撤"只可能来自真正撤单的那条腿
+CNT173=$((CNT173 + 1))
+TACT=$(cat internal/trading/trade_actions_20261105.go || true)
+grep_q 'func (c *Controller) recordSweepAction(a SweepAction)' TACT F || fail173 "撤单动作留痕的写入口不见了"
+grep_q 'func (c *Controller) SweepActions() []SweepAction' TACT F || fail173 "撤单动作快照的读出口不见了"
+grep_q 'func cancelAdvices(actions []SweepAction) []PositionAdvice' TACT F || fail173 "撤行投影函数不见了（卡要靠它，不能自己判）"
+# 常量块被 gofmt 列对齐（`Name   = "v"`），单空格字面锚永不命中——这里一律走 E 模式的 \s*
+for k in SweepActionRequested SweepActionWindow SweepActionRefused; do
+	grep_q "${k}[[:space:]]*=" TACT || fail173 "撤单动作少了一态：${k}"
+done
+for k in SweepSourceSweep SweepSourceSignalGone SweepSourceClose; do
+	grep_q "${k}[[:space:]]*=" TACT || fail173 "撤单理由少了一档：${k}（三档折两档就分不清到期与收盘清场）"
+done
+CALLS=$(( $(grep -c "act.Kind = SweepAction" internal/trading/trade_actions_20261105.go || true) ))
+[ "${CALLS:-0}" -ge 3 ] || fail173 "撤单出口里的动作留痕少于 3 态（requested/window/refused），实得 ${CALLS}——\
+留痕是从各触发点搬进唯一出口的（2026-11-05 RequestCancel），搬回去＝每条腿各记各的，必然分叉"
+REPCALLS=$(( $(grep -c "c.recordSweepAction(" internal/trading/controller.go || true) ))
+[ "${REPCALLS:-0}" = "0" ] || fail173 "SweepOrders 又自己记动作快照了（唯一出口之外记一份就是两本账），实得 ${REPCALLS}"
+grep_q 'traceSource, traceReason := SweepSourceSweep' SGC F || fail173 "撤单理由不再由触发条件一次算定（留痕与卡上文案会分叉）"
+grep_q 'OrderID:      a.OrderID' TACT F || fail173 "撤行丢了委托号：同日同码第二次撤单就会被折成一条（owner 裁的是按委托号一条）"
+ADVT=$(cat internal/trading/advice.go || true)
+grep_q 'cancelRows := cancelAdvices(in.CancelActions)' ADVT F || fail173 "Advise 不再从撤单动作投影（卡上自己判＝第二本账）"
+grep_q 'return cancelRows, flt' ADVT F || fail173 "空持仓时撤行被早退吞掉：建仓买单被撤时那只票往往还没有持仓行"
+# 负锁：战法过滤器只认"加仓"，撤行绝不进它的射程（滤掉一条撤单提示＝把那笔挂单留在市场上）
+FILTER_BODY=$(awk '/^func filterEntryAdviceByTactics/,/^}/' internal/trading/advice.go || true)
+if printf '%s\n' "$FILTER_BODY" | grep -qF 'adviceActionCancel'; then
+	fail173 "战法过滤器开始认识撤单行（只许滤买入方向，这是 owner 裁过的不对称边界）"
+fi
+SLP=$(cat internal/engine/scoring_loop.go || true)
+grep_q 'CancelActions: ctrl.SweepActions(),' SLP F || fail173 "引擎不再把撤单动作喂给建议层（卡上的撤就成了摆设）"
+
+# ㉓ §TRADE-CARD 交易级提醒（四类全推 + 非交易级静默 + 执行留痕取代开关 + 做T 标注）
+CNT173=$((CNT173 + 1))
+ENG=$(cat internal/engine/engine.go || true)
+TCA=$(cat internal/engine/trade_card_advice_20261105.go || true)
+grep_q 'var tradeLevelAlertActions = map\[string\]bool\{' TCA || fail173 "交易级词表不见了（白名单＝新增动作默认不推）"
+# 空白类一律 [[:space:]]：ERE 里的 \t 不是 POSIX，shim/toybox grep 会静默零命中，
+# 把"词表 5 档全在"读成"实得 0"（本仓 2026-09-18 起反复踩过的同族坑）。
+VL=$(( $(grep -cE '^[[:space:]]*"(撤单|加仓|减仓|止盈|止损)": true,' internal/engine/trade_card_advice_20261105.go || true) ))
+[ "${VL:-0}" = "5" ] || fail173 "交易级词表应为 5 档（撤/加/减/走两式），实得 ${VL}"
+grep_q 'func (e *Engine) syncTradeLevelAlerts(' TCA F || fail173 "交易级提醒入口不见了"
+grep_q 'if !tradeLevelAlertActions[a.Action] {' TCA F || fail173 "提醒不再按词表白名单过滤（不到交易级别也推＝把用户训练成忽略提醒）"
+grep_q 'return "【本进程未见证该动作，请核对当日委托】"' TCA F || fail173 "三态里的\"未见证\"不见了：没有留痕会被写成\"没下单\"，那是让人去手动补一笔已存在的委托"
+grep_q 'func (e *Engine) pushTradeLevelWithoutPositions(' TCA F || fail173 "空仓路径的投影腿不见了（撤单/做T 不需要持仓，空仓时也必须响）"
+grep_q 'e.pushTradeLevelWithoutPositions(sendTo, ctrl, sse)' SLP F || fail173 "pushRealAdvice 的空仓分支又不走交易级投影（建仓单被撤而屏上零字）"
+grep_q '已自动%s %d股@%.2f' TCA F || fail173 "已受理态的正文不再报动作与量价（只说\"已触发\"就还是开关那句话的翻版）"
+if grep -rqE 'autoActive|WriteString\(" 【已触发自动卖出】' internal/engine/*.go internal/server/*.go; then
+	fail173 "按开关状态报结果的旧形态回潮了（autoActive 那个参数/那句\"已触发自动卖出\"）：风控拒掉的单也会被报成已执行"
+fi
+if grep -rq "func (e \*Engine) syncLiveAdviceAlerts" internal/; then
+	fail173 "旧的开关版提醒函数又回来了（两本提醒账）"
+fi
+grep_q 'case "清仓", "止损", "止盈", "减仓", "交易信号", "加仓", "撤单":' ENG F || fail173 "P1 强推的词表没跟上（同步函数产出了撤/加，推送那关却被 default 挡掉——落库了却一声不响）"
+TAL=$(cat internal/engine/trade_action_ledger.go || true)
+grep_q 'func (e *Engine) recordTradeAction(a tradeAction)' TAL F || fail173 "执行留痕写入口不见了"
+grep_q 'func (e *Engine) tradeActionFor(' TAL F || fail173 "执行留痕读出口不见了（提醒层就只能猜幂等键了）"
+grep_q 't := "s" // strategic' TAL F || fail173 "做 T 与战略加减不再分键：同码同日的两条留痕会互相顶掉"
+RECS=$(( $(grep -c "e.recordTradeAction(tradeAction{" internal/engine/engine.go internal/engine/scoring_loop.go | awk -F: '{s+=$2} END {print s}' || true) ))
+[ "${RECS:-0}" = "3" ] || fail173 "执行留痕的写入点应为 3 处（买入 worker/卖出原语/缺价早退），实得 ${RECS}"
+grep_q 'rec(true, placed, orderID, "委托已受理（≠成交）")' ENG F || fail173 "买入成功分支不再留痕（那加仓那一行就只剩\"未见证\"）"
+grep_q 'recSell(true, placed, orderID, "卖单已受理（≠成交）")' SLP F || fail173 "卖出成功分支不再留痕"
+# 顺序锁：做 T 的行必须在**自动卖出执行之后**才并进列表（先并就会被执行腿当减仓指令）
+T_LINE=$(( $(grep -n "autoExecuteRealSellsRound(sendTo, ctrl, realStore, advices, sellMode)" internal/engine/scoring_loop.go | head -1 | cut -d: -f1 || true) ))
+C_LINE=$(( $(grep -n "cardRows := append(" internal/engine/scoring_loop.go | head -1 | cut -d: -f1 || true) ))
+[ -n "${T_LINE:-}" ] && [ -n "${C_LINE:-}" ] && [ "${C_LINE:-0}" -gt "${T_LINE:-0}" ] \
+	|| fail173 "做 T 的建议行被并到自动卖出执行之前了（展示行驱动执行腿＝重复卖）"
+grep_q 'TradeKind:   trading.AdviceTradeKindIntradayT' TCA F || fail173 "回转行不再标做 T（owner 令「特殊标注这是做 T」）"
+grep_q 'action, level, statusCN := "留", "低", "已收口"' TCA F || fail173 "已收口的回转不再落 留（落 加/减 就会被当待办再推一次）"
+FEA=$(cat web/src/utils/adviceFormat.js || true)
+grep_q 'export function adviceRowLabel(advice)' FEA F || fail173 "做T 前缀不再是文案单点（只能在后端每个生产者各写一遍）"
+grep_q 'export function tradeLevelSummaryText(advices)' FEA F || fail173 "撤单提示条的文案单点不见了"
+grep_q "window: '判定要撤，但禁撤窗口内未发请求（这单仍挂在柜台上）'" FEA F || fail173 "窗口内没撤成不再写明（撤单状态说反方向）"
+FEP=$(cat web/src/pages/Positions.jsx || true)
+grep_q "data-testid=\"trade-cancel-strip\"" FEP F || fail173 "撤单提示条不再挂在持仓表格之外（没有持仓行就没有落脚处，撤了等于没显示）"
+FEQ=$(cat web/src/pages/Quant.jsx || true)
+BRP=$(cat internal/engine/buy_reprice_20261105.go || true)
+FEC=$(cat web/src/__tests__/trade_card_20261105.test.jsx || true)
+TACT=$(cat internal/trading/trade_actions_20261105.go || true)
+for kv in 'signal_gone: ' 'close_sweep: '; do
+	grep_q "${kv}" FEQ F || fail173 "委托卡的撤单来源表缺 ${kv}（新值会以英文原顶到屏上）"
+done
+TCT=$(cat internal/engine/trade_card_20261105_test.go || true)
+for name in TestTRoundAdvicesVerbs TestPushTradeLevelWithoutPositions TestTradeActionSuffixUnknownNeverClaimsAbsence \
+	    TestTradeLevelVocabularyIsWhitelist TestTRoundAdvicesUnknownStatusIgnored; do
+	grep_q "func $name" TCT F || fail173 "§TRADE-CARD 引擎用例缺失：$name"
+done
+TA_T=$(cat internal/trading/trade_actions_20261105_test.go || true)
+for name in TestSweepActionOverwriteKeepsLatest TestSweepActionDayReset TestSweepActionCap \
+	    TestCancelAdvicesProjectOneRowPerTicket TestAdviseCancelRowsSurviveTacticsFilter; do
+	grep_q "func $name" TA_T F || fail173 "§TRADE-CARD 撤单动作用例缺失：$name"
+done
+FEC=$(cat web/src/__tests__/trade_card_20261105.test.jsx || true)
+for name in '被撤了建仓买单，提示条仍然上屏' '持仓行的建议标签带「做T·」前缀' '窗口内没撤成的那一笔要在提示条里算进' '非 T 的战略加仓行不许被误标成做T'; do
+	grep_q "${name}" FEC F || fail173 "§TRADE-CARD 前端用例缺失：${name}"
+done
+
+# ㉓b 沙箱载体用例不许再读真实钟（15:0x 实测假红：产物里那条"到 close_sweep_from 就撤在途单"
+# 的收摊腿会在下午两点五十二之后，把"一单都不该动"的断言判成失败——代码没变，钟变了）。
+CNT173=$((CNT173 + 1))
+SBX_T=$(cat qmt_gateway/tests/test_internal_strategy_sandbox.py || true)
+grep_q "_MID_SESSION = datetime(2026, 10, 28, 10, 30)" SBX_T F || fail173 "沙箱用例的固定时刻不见了（回到真实钟就是每天 14:52 之后必然假红）"
+if grep -qF "run_round(FakeContext({}), self.mod.now_cn())" qmt_gateway/tests/test_internal_strategy_sandbox.py; then
+	fail173 "沙箱用例又把 now_cn() 的真实钟喂给 run_round"
+fi
+
+# ㉕ §BUY-REPRICE（11-05，owner「能不能根据 vwap 动态更新买入价格」）改价腿与"撤单只有一条出口"
+# 钉三件事：改价撤单必须走 RequestCancel 那唯一出口（留痕/窗口/快照不会分叉）；
+# 可撤对象只有战略买入的已报单（部成/做T/手动/占位一律不碰）；缺省关＝今天。
+CNT173=$((CNT173 + 1))
+BRP=$(cat internal/engine/buy_reprice_20261105.go || true)
+grep_q 'func isStrategicBuyTicket(o store.RealOrder) bool' BRP F || fail173 "可撤对象的形状判据不见了（逐条 if 记住'哪些不能撤'必然漏）"
+grep_q 'o.Status != "已报"' BRP F || fail173 "部成单又开始被改价腿撤（撤的是未成交部分，同键重放却把已成交那部分的机会一起关掉）"
+grep_q 'strings.HasPrefix(o.SignalID, "buy:")' BRP F || fail173 "改价腿不再只认战略买入幂等键（t0:/ext:/manual: 会被卷进来）"
+grep_q 'ctrl.RequestCancel(o, trading.SweepSourceVWAPReprice' BRP F || fail173 "改价腿自己写撤单了（必须共用那条唯一出口）"
+grep_q 'repriced[code] >= repriceMaxPerDay' BRP F || fail173 "当日改价上限没了（限次管的是柜台撤单额度与重放机会）"
+grep_q 'o.CancelSource == trading.SweepSourceVWAPReprice' BRP F || fail173 "限次不再读 orders 留痕（内存计数会让重启后又能撤两次，那是假额度）"
+grep_q 'if !(cfg.VWAPRepricePct > 0) {' BRP F || fail173 "开关判据不见了（阈值 0 也必须一单都不动＝今天）"
+grep_q 'VWAPRepricePct float64 `json:"vwap_reprice_pct,omitempty"`' SGCFG F || fail173 "旋钮 vwap_reprice_pct 不在 qmt 配置里"
+# 唯一出口：撤单调用只许两处——RequestCancel（所有"改价/超时/消失/收盘"的撤单）与
+# HaltAll（紧急停止仍全撤，连手动单一并撤，是 §MANUAL-SYNC 定下的例外，不并入常规路径）。
+SWEEP_CANCEL_CALLS=$(( $(grep -c "c.execRef().Cancel(" internal/trading/controller.go || true) ))
+[ "${SWEEP_CANCEL_CALLS:-0}" = "2" ] || fail173 "控制器里的网关撤单调用应为 2 处（RequestCancel + HaltAll 的紧急全撤），实得 ${SWEEP_CANCEL_CALLS}；出现第三处就意味着某条腿自己写了一遍留痕/窗口/状态推进"
+grep_q 'func (c *Controller) RequestCancel(' TACT F || fail173 "撤单唯一出口不见了"
+grep_q 'c.RequestCancel(o, traceSource, traceReason, now, day)' SGC F || fail173 "SweepOrders 不走那条唯一出口了"
+# 调用点必须在打分轮、紧挨撤单闭环（放在下单分支只覆盖新单；放在展示层就是"看得见但不做"）
+grep_q 'e.repriceStaleBuys(ctrl, e.snapshotQuotes(), time.Now())' SLP F || fail173 "改价腿没接进打分轮（缺省关时它一次查询都不做，接进来是零成本的）"
+BRP_T=$(cat internal/engine/buy_reprice_20261105_test.go || true)
+for name in "TestRepriceDeviationMath" "TestRepriceStrategicTicketShape" "TestRepriceCancelsDriftedBuy" "TestRepriceOffIsToday" "TestRepriceNeedsReference" "TestRepriceDailyCap" "TestRepriceHonoursNoCancelWindow"; do
+	grep_q "func $name" BRP_T F || fail173 "§BUY-REPRICE 用例缺失：$name"
+done
+grep_q "vwap_reprice: 'VWAP 改价'" FEA F || fail173 "撤单理由表缺 VWAP 改价那一档（卡上会把英文原值顶给人看）"
+grep_q "vwap_reprice: 'VWAP 改价重挂'" FEQ F || fail173 "委托卡的撤单来源表缺改价那一档"
+
+# ㉔ §BUY-ROOM-GUARD（11-05，owner「买入信号要连续排队并占用预算，不然同时两笔买入会击穿仓位控制」）
+# 这条腿修的是一个**符号**：发送前复核原来写 `限 = 目标剩余 + 他人预占`，
+# 别人的额度把自己的上限抬高 ⇒ 同轮两笔各花全额，合计穿透目标（今天就在这上面丢过筹码）。
+# 因此这里既钉"减"的方向，也钉"拿不到目标空间时退到可用资金"这把第二尺——两者缺一个都还是穿透。
+CNT173=$((CNT173 + 1))
+BRL=$(cat internal/engine/buy_reserve.go || true)
+grep_q 'func sendRoomLimit(room float64, roomOK bool, others float64, cash float64, cashOK bool) (limit float64, ok bool)' BRL F \
+	|| fail173 "发送前的预算算术不再是一个纯函数（混在取数链里就没法单独锁住符号）"
+grep_q 'limit = room - others' BRL F || fail173 "他人预占又被加回上限了（这就是今天那颗雷的本体：同轮两笔各按全额放行）"
+grep_q 'limit = cash - others' BRL F || fail173 "定权缓存缺失时不再退到可用资金这把尺（legacy 支路等于完全没有这道闸）"
+grep_q 'others := e.reservedAmountExcept(uid, signalID)' BRL F || fail173 "取他人预占的那一处不见了（排除自己是语义的一部分）"
+if grep -qF 'limit := room + self' internal/engine/buy_reserve.go; then
+	fail173 "旧式 limit = room + self 回潮"
+fi
+grep_q 'func (e *Engine) availableCashFor(uid string)' BRL F || fail173 "可用资金这把尺的取数函数不见了"
+grep_q 'if !e.buyRoomGuardOn(uid) {' BRL F || fail173 "退路开关的读取点不见了（现网误伤时没有即时退路）"
+grep_q 'BuyRoomGuard *bool `json:"buy_room_guard,omitempty"`' SGCFG F \
+	|| fail173 "rules.sizing 里没有 buy_room_guard 这枚指针键（非指针会让"没带这个键"变成"显式关掉"）"
+# 这道闸必须挂在**所有**买单都要经过的那一处（placeOrderNow），挂在定量分支上就只覆盖一条路
+grep_q 'e.sendRoomGuard(uid, req.Amount, req.SignalID)' ENG F \
+	|| fail173 "发送前复核不在 placeOrderNow（那条路只覆盖一条定量支路，正是本轮的缺陷形状）"
+BRT=$(cat internal/engine/buy_room_guard_20261105_test.go || true)
+for name in TestSendRoomLimitSubtractsOthers TestSendRoomLimitCashFallback \
+	    TestSendRoomGuardUsesCashWhenNoSizingCtx TestSendRoomGuardSubtractsOthersFromTargetRoom \
+	    TestSendRoomGuardKillSwitchIsToday; do
+	grep_q "func $name" BRT F || fail173 "§BUY-ROOM-GUARD 用例缺失：$name"
+done
+
+# ㉕ §CARRIER-PARITY-1105 / §CUTOVER-1105（11-05 晚批，owner「载体也要实现同款撤单/改价/预算行为」
+# ＋「桥先保留，但切到物理机的兜底代码还是要写的」）。
+# 判据落在"真的接进钱路径"而不是"文件里有这个字符串"：旋钮必须有 Go 真源、三行为必须共用
+# 同一个撤单出口、执行器必须因互锁拒绝碰柜台，少一条就是把两套规则并行跑在同一笔单上。
+CNT173=$((CNT173 + 1))
+DCP=$(cat cmd/derive_carrier_params/main.go || true)
+PJT=$(cat "$PJ" || true)
+CPT=$(cat qmt_gateway/tests/test_carrier_parity_20261105.py || true)
+SWT=$(cat deploy/qmt-friend/switch_execution_mode.ps1 || true)
+ILET=$(cat deploy/qmt-friend/install_local_executor.ps1 || true)
+ULET=$(cat "$ULE" || true)
+BFPT=$(cat scripts/build_friend_package.sh || true)
+for k in "signal_gone_cancel_sec" "vwap_reprice_pct" "buy_room_guard" "reprice_max_per_day"; do
+	grep_q "c.put(\"$k\"" DCP F || fail173 "载体旋钮 $k 没有 Go 真源（在 Python 里造数＝第二本账）"
+	grep_q "\"$k\"" PJT F || fail173 "载体参数表缺 $k（没烘进包里，装到物理机上就是旧行为）"
+done
+grep_q 'return max(room - others, zero), True' LEXT F || fail173 "载体的预算算术又把他人预占加回上限了"
+grep_q 'cancel_why = "signal_gone"' LEXT F || fail173 "载体没有信号消失撤单（桥断了这笔单会一直挂着）"
+grep_q 'cancel_why = "vwap_reprice"' LEXT F || fail173 "载体没有 VWAP 改价撤单"
+grep_q 'record_reprice(day, reprice_code)' LEXT F || fail173 "改价限次没落 journal（重启会重新发两次额度）"
+grep_q 'reason": "buy_room_guard"' LEXT F || fail173 "同轮预算闸的拒单理由不见了"
+for name in TestRoomArithmetic TestSameRoundBudget TestCancelReasons TestCutoverInterlock; do
+	grep_q "class $name" CPT F || fail173 "载体三行为用例缺 $name"
+done
+grep_q 'def execution_mode_from(path)' LEXT F || fail173 "执行器没有桥/物理机互锁（桥还活着就能起第二条腿）"
+grep_q 'return 4' LEXT F || fail173 "互锁不再拒绝碰柜台（返回码 4 是 fail-closed 的唯一出口）"
+grep_q 'AckBridgeStopped' SWT F || fail173 "切到物理机不再要求确认桥已停（同一笔买入会被报两次）"
+grep_q 'SWITCH_RESULT=ABORT' SWT F || fail173 "切换入口没有 ABORT step/reason 契约"
+grep_q 'execution-mode-file' ILET F || fail173 "安装器 runner 没带互锁参数（装完的腿会绕过闸门）"
+grep_q 'execution-mode-file' ULET F || fail173 "更新器重启没带互锁参数"
+grep_q 'venv\Scripts\python.exe' ULET F || fail173 "更新器又用系统 python 重启（没有 xtquant 的进程＝看起来更新成功）"
+grep_q 'switch_execution_mode.ps1' BFPT F || fail173 "一键包白名单漏了切换脚本（包里没有兜底切换入口）"
+grep_q 'qmt_bridge_strategy.py' BFPT F || fail173 "桥文件被从一键包里剔掉了（owner 裁决：桥先保留）"
+
 [ "$B173_FAILED" = "0" ] || exit 1
-echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1，累计判定点 ${CNT173}）"
+echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1 + 建议×战法开关与建议股数 1 + BAN_IO 禁令自证 1 + 终端版本巡检 1 + 做 T 判断腿接线 1 + 信号消失即撤 1 + 撤单动作快照 1 + 交易级提醒与做T标注 1 + 沙箱固定时刻 1 + 发送前预算复核算术 1 + VWAP 改价腿与撤单唯一出口 1 + 载体同款三行为与桥/物理机切换互锁 1，累计判定点 ${CNT173}）"
 
 echo "==> 全部通过"
 

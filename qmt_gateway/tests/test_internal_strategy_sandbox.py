@@ -22,6 +22,7 @@
 import importlib.util
 import json
 import os
+from datetime import datetime
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(REPO, "qmt_gateway"))
 
 BUILDER = os.path.join(REPO, "scripts", "build_local_executor.py")
+
+# _MID_SESSION 是给 run_round 注入的固定时刻（连续竞价中段，2026-10-28 周三）。
+# 为什么不许再用 mod.now_cn() 的真实钟：产物里有一条"到 close_sweep_from（默认 14:52）
+# 就把在途单撤掉"的收摊腿，于是这批用例在 14:52 之后跑会看到一次**真实存在**的撤单调用——
+# 断言"一单都不该动"就变成随当日时刻漂移的假红（今天 15:0x 实测复现，代码未改）。
+# 注入固定时刻不是放松断言：判的还是同一件事（柜台已有同短码 ⇒ 不许再发第二次）。
+_MID_SESSION = datetime(2026, 10, 28, 10, 30)
 
 
 def build_sandbox(out_dir):
@@ -125,7 +133,7 @@ class SandboxArtifactTest(unittest.TestCase):
                                     "cancel_tried": [], "warned": {}, "last_round": 0.0})
             self.mod.run_round(FakeContext({symbol: {"last_price": 9.7, "prev_close": 10.0,
                                                      "volume": 100000, "ask1": 9.71,
-                                                     "bid1": 9.7}}), self.mod.now_cn())
+                                                     "bid1": 9.7}}), _MID_SESSION)
         finally:
             self.mod._log = original
         raised = [line for line in logs if "raised KeyError" in line]
@@ -141,7 +149,7 @@ class SandboxArtifactTest(unittest.TestCase):
                                     "last_round": 0.0})
             self.mod.run_round(FakeContext({symbol: {"last_price": 9.7, "prev_close": 10.0,
                                                      "volume": 100000, "ask1": 9.71,
-                                                     "bid1": 9.7}}), self.mod.now_cn())
+                                                     "bid1": 9.7}}), _MID_SESSION)
         finally:
             self.mod.PARAMS["rule_side"] = saved
             self.mod._log = original
@@ -159,7 +167,7 @@ class SandboxArtifactTest(unittest.TestCase):
                                       "get_account": lambda *a: "8001"})
         self.mod._STATE.update({"acct": "8001", "acct_type": "", "ops": [], "cancel_tried": [],
                                "warned": {}, "last_round": 0.0})
-        summary = self.mod.run_round(FakeContext({}), self.mod.now_cn())
+        summary = self.mod.run_round(FakeContext({}), _MID_SESSION)
         self.assertEqual(calls, [], "柜台表读不到却调了交易函数")
         self.assertEqual(summary["placed"], [])
         self.assertIn("unreadable", summary["reason"])
@@ -188,7 +196,7 @@ class SandboxArtifactTest(unittest.TestCase):
                                "warned": {}})
         self.mod.run_round(FakeContext({"600000.SH": {
             "last_price": 9.7, "prev_close": 10.0, "volume": 100000,
-            "ask1": 9.71, "bid1": 9.7}}), self.mod.now_cn())
+            "ask1": 9.71, "bid1": 9.7}}), _MID_SESSION)
         self.assertEqual(calls, [], "柜台里已有同一意图，仍然下单")
 
 

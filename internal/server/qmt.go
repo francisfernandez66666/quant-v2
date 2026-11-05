@@ -352,16 +352,25 @@ func (s *Server) handleRealAdvice(w http.ResponseWriter, r *http.Request) {
 		// 解包广播 payload 中真正给前端的 advices 数组；解包失败视为缓存损坏，继续尝试。
 		var payload struct {
 			Advices []trading.PositionAdvice `json:"advices"`
+			// §ADVICE-TACTICS A：这一轮被战法开关滤掉的加仓条数。用 **指针** 而不是 int：
+			// 旧载荷（升级前落的那一轮）根本没有这个键，折成 0 会让屏上显示"没有建议被过滤"，
+			// 而真实情况是"这轮还没带过滤读数"——两种"没有"必须分开（missing ≠ 0）。
+			FilteredBySwitch *int `json:"filtered_by_switch"`
 		}
 		if err := json.Unmarshal(raw, &payload); err != nil {
 			continue
 		}
 		// 命中：返回缓存建议 + 缓存时间（cached_at 供前端展示新鲜度）。
-		writeJSON(w, 200, map[string]interface{}{
+		resp := map[string]interface{}{
 			"advices":   payload.Advices,
 			"tripped":   ctrlTripped(s, uid),
 			"cached_at": at.Format(time.RFC3339),
-		})
+		}
+		// 载荷带过滤读数才回传（不带就**不写这个键**，让前端如实显示"读数未知"而不是 0）。
+		if payload.FilteredBySwitch != nil {
+			resp["filtered_by_switch"] = *payload.FilteredBySwitch
+		}
+		writeJSON(w, 200, resp)
 		return
 	}
 	// 从未广播过（引擎未跑/无建议轮次）：维持空表形状。
@@ -1099,6 +1108,14 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	// 取值真源是控制器里那份 SessionWindows（Describe 已把空串回落成出厂默认）；
 	// 未接实盘的账号回落到出厂默认，保证"没有控制器"也能看到规则本身。
 	if ctrl := s.qmtCtrlFor(userIDFor(r)); ctrl != nil {
+		// §SIGNAL-GONE / §BUY-REPRICE（2026-11-05）：两枚钱路径旋钮与窗口同口径，必须回显
+		// **生效值**——闸门实际读的是控制器里那份 cfg，不是配置文档里的愿望。这两条腿走
+		// "保存即生效"白名单（见 applySetQMTConfig），若这里只回显落库值，则在"已落库、
+		// 控制器尚未对齐"的窗口里，设置页会显示一个闸根本没读到的数。
+		// 未接实盘的账号没有控制器，落库值就是唯一读数，保持不覆盖。
+		applied := ctrl.Config()
+		view["signal_gone_cancel_sec"] = applied.SignalGoneCancelSec
+		view["vwap_reprice_pct"] = applied.VWAPRepricePct
 		for k, v := range ctrl.SessionWindowsSnapshot() {
 			view[k] = v
 		}
@@ -1168,6 +1185,13 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		// §R4-1 kill-switch 与撤单闭环参数
 		"halted":           cfg.Halted,
 		"cancel_stale_sec": cfg.CancelStaleSec,
+		// §SIGNAL-GONE（2026-11-05）买入挂单"信号消失即撤"的宽限秒数（0=关，缺省关）。
+		// 读面必须点名生效值：这条腿关掉与"今天没有任何信号消失"在屏上是同一种安静，
+		// 没有这个键就分不清是没开还是没发生。
+		"signal_gone_cancel_sec": cfg.SignalGoneCancelSec,
+		// §BUY-REPRICE（2026-11-05）买入挂单跟 VWAP 改价的偏离阈值（%，0＝关）。
+		// 读面必须点名生效值：这条腿关着与"今天所有挂单都贴得住参考价"在屏上是同一种安静。
+		"vwap_reprice_pct": cfg.VWAPRepricePct,
 		// §FIX-20261028-F05：生效窗口的默认值（handler 会用控制器快照覆盖为真实生效值）
 		"no_cancel_windows":    trading.DefaultNoCancelWindows,
 		"no_new_order_windows": trading.DefaultNoNewOrderWindows,
@@ -1198,7 +1222,14 @@ type setQMTConfigReq struct {
 	// §R4-1 kill-switch 与撤单闭环参数
 	Halted         *bool `json:"halted"`           // 全局熔断暂停
 	CancelStaleSec *int  `json:"cancel_stale_sec"` // 未成交撤单超时秒数
-	CloseSweepAt   *int  `json:"close_sweep_at"`   // 尾盘清仓时间（分钟）
+	// §SIGNAL-GONE：买入挂单"信号消失即撤"宽限秒数（nil=本次不改；0=关；30-3600=开）。
+	// 指针语义在这条键上格外要紧：非指针的 0 会让"没带这个字段"被读成"显式关掉"，
+	// 一次无关的保存就把 owner 按下过的开关悄悄摘掉。
+	SignalGoneCancelSec *int `json:"signal_gone_cancel_sec"`
+	// §BUY-REPRICE：买入挂单跟 VWAP 改价的偏离阈值（百分比）。同样必须是指针——
+	// 非指针的 0 会让"这次没带这个字段"被读成"显式关掉"，一次无关保存就把 owner 按下的阈值摘成 0。
+	VWAPRepricePct *float64 `json:"vwap_reprice_pct"`
+	CloseSweepAt   *int     `json:"close_sweep_at"` // 尾盘清仓时间（分钟）
 	// §AUDIT-PM 2026-09-15 单笔委托金额绝对帽（元；0=关）——安全封顶闸，保存即生效，
 	// 不随开关队列滞留到次日（与 §U-3 halted 即时语义同口径）。
 	MaxOrderAmount *float64 `json:"max_order_amount"`
@@ -1529,6 +1560,26 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		}
 		cfg.CancelStaleSec = v
 	}
+	if req.SignalGoneCancelSec != nil {
+		v := *req.SignalGoneCancelSec
+		// 范围与 cancel_stale_sec 同档：下限 30s 是"一轮打分 + 一次回报"的量级，
+		// 再短就是把打分抖动当信号消失；上限 3600s 之外这条腿已经不如超时撤单那条有用。
+		if v != 0 && (v < 30 || v > 3600) {
+			writeError(w, 400, "signal_gone_cancel_sec 仅允许 0(关闭)/30-3600")
+			return
+		}
+		cfg.SignalGoneCancelSec = v
+	}
+	if req.VWAPRepricePct != nil {
+		v := *req.VWAPRepricePct
+		// 下限 0.2%：比这更小的偏离天天都会发生，撤单次数会被行情噪声吃光；
+		// 上限 10%：超过这个量级这张单本来就该由超时撤单那条腿收掉，而不是靠改价。
+		if v != 0 && (v < 0.2 || v > 10) {
+			writeError(w, 400, "vwap_reprice_pct 仅允许 0(关闭)/0.2-10（百分比）")
+			return
+		}
+		cfg.VWAPRepricePct = v
+	}
 	if req.CloseSweepAt != nil {
 		v := *req.CloseSweepAt
 		if v != -1 && v != 0 && (v < 1300 || v > 1500) {
@@ -1654,7 +1705,13 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	// §AUDIT-PM 2026-09-15：单笔金额绝对帽同样"保存即生效"——安全封顶闸若滞留开关队列到
 	// 次日，等于收盘设置的上限在次日开盘前形同虚设。UpdateConfig 只换 c.cfg 不动 executor，
 	// 引擎热同步下一轮仍会以 QueueConfigUpdate 对齐（同值幂等，无竞争）。
-	if req.MaxOrderAmount != nil {
+	// §SIGNAL-GONE / §BUY-REPRICE（2026-11-05）：信号消失撤单与 VWAP 改价都是**在途买单的
+	// 钱路径闸门**，不是翻模式。滞留开关队列到次日＝owner 盘后按下的宽限/阈值当天不动，
+	// 而设置页还会显示"已按下"（GET 回显落库值）——那是"设置页自己会骗人"的形状。
+	// 因此与 halted / 金额帽同列即时生效；判据只看本次是否显式携带这两枚键，其余字段
+	// 照旧走 §QMT-PENDING 开关队列，不扩大即时生效面。UpdateConfig 只换 c.cfg 不动
+	// executor，引擎热同步下一轮仍会以 QueueConfigUpdate 对齐（同值幂等，无竞争）。
+	if req.MaxOrderAmount != nil || req.SignalGoneCancelSec != nil || req.VWAPRepricePct != nil {
 		if ctrl := s.qmtCtrlFor(target); ctrl != nil {
 			ctrl.UpdateConfig(cfg)
 		}

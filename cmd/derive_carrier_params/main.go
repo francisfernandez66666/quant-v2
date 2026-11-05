@@ -238,6 +238,13 @@ func collectQMT(c *collector) {
 	c.put("entry_pullback_pct", src, q.EntryPullbackPct)
 	c.put("entry_pullback_max_gap_pct", src, q.EntryPullbackMaxGapPct)
 	c.put("entry_timeout_sec", src, q.EntryTimeoutSec)
+	// §CARRIER-PARITY-1105：载体要与现网同款地撤单/改价/排队占预算，四枚值只从 Go 取。
+	// 前两枚出厂为关（0），照实搬 0 不是"把门拆了"——Go 的语义本来就是由 owner 按下。
+	c.put("signal_gone_cancel_sec", src, q.SignalGoneCancelSec)
+	c.put("vwap_reprice_pct", src, q.VWAPRepricePct)
+	c.put("buy_room_guard", "internal/engine/buy_reserve.go:buyRoomGuardOn", engine.BuyRoomGuardDefaultForCarrier())
+	c.put("reprice_max_per_day", "internal/engine/buy_reprice_20261105.go:repriceMaxPerDay",
+		engine.RepriceMaxPerDayForCarrier())
 }
 
 // collectEmotion 取情绪相位判定阈值的出厂值。

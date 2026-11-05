@@ -183,7 +183,8 @@ def _sqlite_readonly(path):
     return sqlite3.connect("file:%s?mode=ro" % escaped, uri=True)
 
 
-_SHADOW_NOTE_KEYS = ("hard_block", "t_allowed", "missing_key_dims", "emotion_phase")
+_SHADOW_NOTE_KEYS = ("hard_block", "t_allowed", "missing_key_dims", "emotion_phase",
+                    "t_leg")  # t_leg: T 判断腿的一串读数（open/dir/block_reason），见 local_executor
 
 
 def shadow_judgement_note(blob):

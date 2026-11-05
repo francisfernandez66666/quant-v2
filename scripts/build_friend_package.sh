@@ -172,7 +172,7 @@ rules_form.py rules_ladder.py rules_factor.py rules_t.py rules_sizing.py"
 FRIEND_FILES="ensure_friend_gateway_config.ps1 watchdog.ps1 install_tasks.ps1 enroll.ps1 \
 export_ledger.ps1 stop_leg.ps1 uninstall.ps1 config.xt.friend.template.json \
 install.ps1 uninstall_entry.bat export_ledger.bat install_entry.bat SETUP.txt \
-install_local_executor.ps1"
+install_local_executor.ps1 switch_execution_mode.ps1 switch_execution_mode.bat"
 # §FRIEND-LOCAL 批 7：本地执行器那条腿的构建器与更新器（源在 scripts/，落进 payload/tools/）。
 #   * scripts/build_local_executor.py   烘参 + 五道静态闸（产物落仓库外）
 #   * scripts/update_local_executor.ps1 备份→写入(SHA 三值自证)→版本回读 三段自证

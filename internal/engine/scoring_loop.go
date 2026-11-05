@@ -690,6 +690,10 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	if res := ctrl.SweepOrders(time.Now()); res != nil {
 		_ = res // 摘要日志已在 SweepOrders 内按需打印
 	}
+	// §BUY-REPRICE（2026-11-05，owner「根据 vwap 动态更新买入价格」）：紧挨着撤单闭环跑——
+	// 同一条撤单出口（Controller.RequestCancel）、同一个禁撤窗、同一份动作快照，
+	// 只是触发条件不同。缺省关（vwap_reprice_pct=0）时这个调用一次查询都不做。
+	e.repriceStaleBuys(ctrl, e.snapshotQuotes(), time.Now())
 	// §WS-B 券商交割单三方对账（默认关闭；启用后每日 settle_at 后对账一次，差异告警+可选补记）
 	if sc := ctrl.Config().Settle; sc.Enabled {
 		ctrl.MaybeSettleDay(data.TradingDayDate(time.Now()), sc.Mode, sc.At, true)
@@ -713,6 +717,11 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 			e.m8PeakTotal = 0
 			e.mu.Unlock()
 			e.saveM8Peak(0) // §R4-7 空仓归零同步落盘
+			// §TRADE-CARD（2026-11-05）空仓**不等于没发生交易级动作**：这条链上最常见的撤单
+			// 恰恰是建仓买单——那只票还没买进来，持仓表里根本没有它的行。旧实现在这里直接 return，
+			// 于是"系统撤了一笔单"这件事在屏上与提醒里一次都不出现（owner 要的 撤/留/加/减/走
+			// 五个动作里，撤 是唯一会整天不响的）。这里只走"不需要持仓"的那两条投影腿。
+			e.pushTradeLevelWithoutPositions(sendTo, ctrl, sse)
 		}
 		return
 	}
@@ -759,7 +768,21 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		sellProjection = e.unifiedSellViews(positions, sellVerdicts, sellableQty)
 	}
 
-	advices := trading.Advise(trading.AdviceInput{
+	// §ADVICE-TACTICS B（2026-11-05）：每轮读一次当日「动态仓位快照」，把建议行上的股数/金额
+	// 接上。读的是 engine 自己每轮写的那张表（§DECISION-TODAY），与 GET /api/signals/decisions
+	// 同一个 day-keyed 读面、同一把 day 尺子（写入侧用 data.TradingDayDate，这里必须同源，
+	// 否则节假日两侧算出的 day 不一样就永远查不到行、表现成"建议永远没有股数"）。
+	// 读取失败/无行 ⇒ 传 nil：建议照出，股数那一格缺席（前端显示「未计算」），
+	// 结构上一律不许把"没读到"折成"算出来是 0"。
+	// English: read the day's dynamic-sizing snapshot once per round so advice rows can carry the
+	// computed qty. Read failure passes nil — the field stays absent, never a fabricated 0.
+	dayKey := data.TradingDayDate(time.Now())
+	decisions, decisionsErr := realStore.SignalDecisionsForDay(sendTo, dayKey)
+	if decisionsErr != nil {
+		decisions = nil // 读不到＝今日读数未知：四列缺席，绝不当成"今天算出来是 0"
+		log.Printf("[qmt] §ADVICE-TACTICS 当日定权快照读取失败（建议股数按缺席出）day=%s 用户=%s：%v", dayKey, sendTo, decisionsErr)
+	}
+	advices, advFilter := trading.Advise(trading.AdviceInput{
 		Agent:        agent,
 		MarketAPI:    marketAPI,
 		Positions:    positions,
@@ -782,7 +805,21 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		// §REFACTOR_UNIFIED_SELL P2：切闸开关 + 裁决投影卡片（on 时卖出建议唯一来源）。
 		SellUnifiedOn:  sellMode == "on",
 		SellProjection: sellProjection,
+		// §ADVICE-TACTICS B：当日定权快照（可能为空=今日还没有定权读数）。
+		Decisions: decisions,
+		// §TRADE-CARD A（2026-11-05）：当日撤单闭环真做过的动作（进程内快照）。
+		// 卡上"撤"那一行只能来自这里——本层不判该不该撤，判据只住在 SweepOrders 一处。
+		CancelActions: ctrl.SweepActions(),
 	})
+
+	// §ADVICE-TACTICS A：过滤不许静默——战法开关挡掉的加仓条数打一行 ASCII 锚点读数。
+	// 0 条不打（与 EXEC_RULES_ALERT 同姿态：没发生的事不制造噪音），发生的每一轮都打，
+	// 值班据此能一眼分清"今天一条加仓建议都没有"是没信号还是开关把所有战法都关了。
+	// strategies=开关里存了几枚（0=空白名单=存量"全部开启"语义，那种形态下一律不该有 dropped）。
+	if advFilter.FilteredBySwitch > 0 {
+		log.Printf("ADVICE_TACTICS_FILTER dropped=%d kept=%d strategies=%d",
+			advFilter.FilteredBySwitch, len(advices), len(ctrl.Config().Strategies))
+	}
 
 	// §SHORT-2 做空战法卖出标记 → 实盘清仓级建议（Source=short_tactic，见 shortTacticCloseAdvices）。
 	advices = append(advices, e.shortTacticCloseAdvices(positions, advices, exitQuotes)...)
@@ -803,23 +840,34 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	// §SELLPOINT-UNIFY P1-b/P2：卖出统一裁决通道已上移至 trading.Advise 之前运行（见上方
 	// runSellUnifiedJudge），shadow 只留痕、on 走投影+来源闸执行，此处不再重复调用。
 
-	// §统一纪律补充（2026-09-08）：无论自动卖出开关，止损/止盈/减仓建议都进消息中心 + P1 强提醒。
-	// 用户关闭自动交易（mode≠auto / auto_sell=false）时，实时持仓触发止盈止损仍需强提醒手动处理；
-	// auto 开启时也提示"已触发自动卖出"，动作全程可核对。按 码@类@交易日 去重，5s 循环不重复轰炸。
-	// English: regardless of the auto-sell switch, 止损/止盈/减仓 advices also land in the message
-	// center with a P1 strong push — with auto trading off a live TP/SL/trim trip still demands manual
-	// handling; with auto on it confirms the sell fired. Deduped per code/class/trading-day.
-	e.syncLiveAdviceAlerts(sendTo, advices, ctrl.Enabled() && ctrl.Mode() == "auto" && ctrl.Config().AutoSell)
+	// §TRADE-CARD（2026-11-05，owner 口径「卡完全拿量化自动交易的数据来做：撤/留/加/减/走，
+	// 做 T 的也要提醒并特殊标注」）：在**自动卖出执行之后**才把做 T 的行并进列表。
+	// 顺序不是洁癖：做 T 的行也落 加/减 两个动词，如果先并进 advices 再跑
+	// autoExecuteRealSellsRound，一条"正 T 买腿在途"的展示行就可能被当成减仓指令再卖一笔
+	// ——回转腿的买卖时机由 §DYN-T 编排自己负责（在途腿配平/收摊），展示层永远不许驱动它。
+	// 撤单行同理（Advise 已把它排在列表末尾，见 advice.go 的 return）。
+	cardRows := append(append([]trading.PositionAdvice{}, advices...), e.tRoundAdvices(sendTo, time.Now())...)
 
-	if len(advices) == 0 || sse == nil || sendTo == "" {
+	// §TRADE-CARD：交易级提醒（撤/加/减/走四类；持有/格局/观察预警卡不推）。
+	// 旧实现在这里传的是 `Enabled && mode=auto && AutoSell` 这个**开关状态**，
+	// 于是风控拒掉的单照样被报成【已触发自动卖出】。现在读执行点的真实留痕（trade_action_ledger.go）。
+	// English: trade-level reminders (cancel/add/trim/exit only); the "did the system act?" suffix now
+	// comes from the executor's own record instead of the auto-sell switch state.
+	e.syncTradeLevelAlerts(sendTo, cardRows)
+
+	if len(cardRows) == 0 || sse == nil || sendTo == "" {
 		return
 	}
 	// §GAP2-W2 定向推送替代全员广播
 	sse.BroadcastTo(sendTo, map[string]interface{}{
 		"type":    "real_advice",
-		"advices": advices,
+		"advices": cardRows,
 		"tripped": ctrl.Tripped(),
-		"time":    time.Now().Format("15:04:05"),
+		// §ADVICE-TACTICS A：这一轮被战法开关滤掉的加仓条数（0=没有滤）。
+		// 为什么要单独一个字段而不是只让前端数列表：过滤之后"少了 N 条"在屏上与
+		// "本来就没有 N 条"长得一模一样，owner 要看得见自己关掉的是什么。
+		"filtered_by_switch": advFilter.FilteredBySwitch,
+		"time":               time.Now().Format("15:04:05"),
 	})
 }
 
@@ -897,6 +945,16 @@ func pureTsCode(tsCode string) string {
 func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string, intradayT ...bool) (int, error) {
 	cfg := ctrl.Config()
 	if qty <= 0 || price <= 0 {
+		// §TRADE-CARD：只有"本来要卖、但拿不到价"才留痕。qty<=0 是"本就没有量可卖"，
+		// 记成"本轮未下单：缺价"会在卡上凭空造一条本该静默的动作。
+		if qty > 0 {
+			e.recordTradeAction(tradeAction{
+				Kind: tradeActionSell, Code: p.TsCode, Class: class, Placed: false,
+				Reason:    "未发出：拿不到可用现价（宁可不卖也不以错价报单）",
+				At:        time.Now(),
+				IntradayT: len(intradayT) > 0 && intradayT[0],
+			})
+		}
 		return 0, nil
 	}
 	req := trading.OrderRequest{
@@ -928,8 +986,19 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		}
 	}
 	res, err := ctrl.PlaceOrder(req)
+	// §TRADE-CARD（2026-11-05）卖出方向的留痕与买入侧同一形状（见 trade_action_ledger.go 文件头）：
+	// 卡上的 减/走 与交易级提醒只引用"这一笔真发出去了没"，不再引用开关状态。
+	// 类别原样带上（止损/止盈/减仓/m8），因为同码同日多类各持独立幂等键，混成一条就分不清
+	// 今天到底是止损 fired 还是只是减了一刀。
+	recSell := func(placed bool, qty int, orderID, why string) {
+		e.recordTradeAction(tradeAction{
+			Kind: tradeActionSell, Code: p.TsCode, Class: class, OrderID: orderID, Placed: placed,
+			Qty: qty, Price: price, Reason: why, At: time.Now(), IntradayT: req.IntradayT,
+		})
+	}
 	if err != nil {
 		log.Printf("[qmt] 自动卖出 %s(%s) 失败: %v", p.TsCode, p.Name, err)
+		recSell(false, 0, "", "卖出调用失败："+err.Error())
 		return 0, err
 	}
 	if res != nil && !res.OK {
@@ -940,6 +1009,7 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 			// 因此幂等命中=目标已达成，静默返回是正确行为。
 			// §T1-PARTIAL-W5：幂等命中按"本次期望量已达成"回报，调用方照常烧槽（不能因为
 			// 没有新成交就把槽留着，否则同日会重复下同键单）。
+			recSell(true, qty, res.OrderID, "当日同类卖单已在（幂等命中，本轮未重复下单）")
 			return qty, nil
 		}
 		// §H4（2026-09-22 修复批）业务拒单不再假成功：网关 200+ok:false（券商拒单等）时
@@ -951,6 +1021,7 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 			reject = "网关未受理"
 		}
 		log.Printf("[qmt] 自动卖出 %s(%s) 被网关拒单: %s", p.TsCode, p.Name, reject)
+		recSell(false, 0, res.OrderID, reject)
 		return 0, fmt.Errorf("sell %s rejected: %s", p.TsCode, reject)
 	}
 	// §T1-PARTIAL-W5：回报**实际报出量**（风控减量档下会小于 qty），调用方据此判断有没有残量。
@@ -959,6 +1030,11 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 	if res != nil && res.PlacedQty > 0 {
 		placed = res.PlacedQty
 	}
+	orderID := ""
+	if res != nil {
+		orderID = res.OrderID
+	}
+	recSell(true, placed, orderID, "卖单已受理（≠成交）")
 	log.Printf("[qmt] 自动卖出 %s(%s) %d股 @%.2f 类别=%s 原因=%s → %+v",
 		p.TsCode, p.Name, placed, price, class, reason, res)
 	return placed, nil
@@ -1107,7 +1183,7 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 			// §P0-3（2026-09-15）：减仓量必须整手（主板 100 股/手）——旧实现 remaining/2 会把
 			// 1500 股减成卖 750（非整手非全平）→ 柜台废单，既没减成还烧一次委托；paper 侧同逻辑
 			// 早有 /2/100*100 取整（paper.go），实盘路径补齐同款。取整后为 0（持仓<200 股）降级为
-			// 通知（syncLiveAdviceAlerts 已统一推送），不强凑全平。
+			// 通知（syncTradeLevelAlerts 已统一推送），不强凑全平。
 			qty = remaining / 2 / 100 * 100
 			if qty <= 0 {
 				log.Printf("[qmt] %s(%s) 减仓半平取整后为 0（持仓 %d 股<2 手），降级为提醒", p.TsCode, p.Name, remaining)

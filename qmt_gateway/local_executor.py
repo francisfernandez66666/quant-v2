@@ -66,7 +66,7 @@ import time
 LOG = logging.getLogger("qmt_gateway.local_executor")
 
 # ==== BAKED PARAMS BEGIN ====
-STRATEGY_VERSION = "v02-20261104"
+STRATEGY_VERSION = "v03-20261105"
 PARAMS = {
     'bd_depth_full_pct': 3,
     'bd_depth_max_score': 30,
@@ -98,6 +98,7 @@ PARAMS = {
     'breakdown_ratio': 0.96,
     'budget_mode': 'dynamic',
     'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell'],
+    'buy_room_guard': True,
     'buy_signals': ['pullback_buy'],
     'close_sweep_from': '14:52',
     'closed_days': [],
@@ -362,7 +363,7 @@ PARAMS = {
     'min_volume': 1.0,
     'missing_key_target_cap': 0.5,
     'no_cancel_windows': [['09:20', '09:30'], ['14:57', '15:00']],
-    'no_new_order_windows': [['09:20', '09:30'], ['14:52', '15:00']],
+    'no_new_order_windows': [['09:15', '09:30'], ['14:52', '15:00']],
     'non_trading_weekdays': [5, 6],
     'ops_window_sec': 60,
     'order_amount_cap': 20000.0,
@@ -380,6 +381,7 @@ PARAMS = {
     'pullback_ratio': 0.98,
     'quality_weight_clamp': [0.9, 1.1],
     'red_block_new_buy': False,
+    'reprice_max_per_day': 2,
     'require_trading_day': True,
     'rule_arm': {'break_down': 'shadow', 'double_bump': 'shadow', 'dragon': 'shadow', 'dragon_return': 'shadow', 'factor_composite': 'shadow', 'good_news_fade': 'shadow', 'high_churn': 'shadow', 'leader_decay': 'shadow', 'leader_decay_v2': 'shadow', 'pattern_template': 'shadow'},
     'rule_side': 'sell',
@@ -389,6 +391,7 @@ PARAMS = {
     'score_domain': {'divisor': 2, 'floor': 0, 'full': 100, 'shift': 1},
     'sell_boost_level': 'L2',
     'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP'},
+    'signal_gone_cancel_sec': 0,
     'single_stock_cap_pct': 35.0,
     'sizing_enabled': True,
     'sizing_mode': 'power_mean',
@@ -436,7 +439,7 @@ PARAMS = {
     't_mode': 'both',
     't_near_extreme_pct': 0.3,
     't_no_cancel_windows': [['09:20', '09:30'], ['14:57', '15:00']],
-    't_no_new_order_windows': [['09:20', '09:30'], ['14:52', '15:00']],
+    't_no_new_order_windows': [['09:15', '09:30'], ['14:52', '15:00']],
     't_open_cooling_min': 15,
     't_premise_grace_sec': 120,
     't_regime_allow_states': ['range'],
@@ -469,6 +472,8 @@ PARAMS = {
     'vol_clamp': [0.5, 1.5],
     'vol_target_pct': 2,
     'volume_ratio_min': 1.5,
+    'vwap_reprice_pct': 0,
+    'zero_amount': 0.0,
 }
 # ==== BAKED PARAMS END ====
 
@@ -551,6 +556,33 @@ def load_closed_days(path):
         LOG.warning("[calendar] malformed calendar %s: no closed_days list", path)
         return set()
     return set(str(item) for item in days)
+
+
+def execution_mode_from(path):
+    """Read the box-level bridge/local interlock, defaulting to bridge.
+
+    CUTOVER-1105: the QMT file bridge is still alive on the owner's machine
+    (the announced 11-05 ban did not bite there), so BOTH legs could place
+    the same order if the local executor were started by hand. The executor
+    must therefore refuse to trade unless an explicit cutover says the bridge
+    leg is stopped.
+
+    Every unreadable / malformed / unknown state degrades to "bridge" --
+    the money-safe direction. A missing file is NOT permission to trade.
+    """
+    if not path:
+        return "local"  # no interlock configured: today's hand-run behaviour
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (IOError, OSError, ValueError) as exc:
+        LOG.warning("[cutover] unreadable execution mode %s: %s (staying on bridge)", path, exc)
+        return "bridge"
+    mode = doc.get("mode") if isinstance(doc, dict) else None
+    if mode not in ("bridge", "local"):
+        LOG.warning("[cutover] unknown execution mode %r (staying on bridge)", mode)
+        return "bridge"
+    return mode
 
 
 def build_remark(short_code):
@@ -959,6 +991,73 @@ def make_signal(params, ctx, kind, side, amount, price, qty=None):
         "amount": None if amount is None else float(amount),
         "short_code": short,
     }
+
+
+# --- CARRIER-PARITY-1105: pure predicates for the three money-path legs -----
+#
+# These mirror the Go side one for one (buy_reserve.go sendRoomLimit,
+# buy_reprice_20261105.go repriceDeviationPct / repriceWorthCancelling,
+# controller.go SweepOrders signal-gone). They live INSIDE the rule layer so
+# the sandbox artifact inlines the same arithmetic, and they stay pure: no
+# I/O, no clock, no randomness and NO numeric literal -- every threshold and
+# even the arithmetic identities come from PARAMS, so a knob change always
+# goes through a re-bake.
+
+def rule_leg_seconds(params, key):
+    """The enabled value of a money-path leg, or None when it is switched off.
+
+    Both legs ship off from Go (factory 0). Treating "off" as a real threshold
+    would make every resting order cancel in the first round.
+    """
+    value = params[key]
+    if not value:
+        return None
+    return float(value)
+
+
+def rule_room_guard_on(params):
+    """Is the pre-send budget backstop armed? Factory: on."""
+    return bool(params["buy_room_guard"])
+
+
+def rule_room_limit(params, room, room_ok, others, cash, cash_ok):
+    """Pure arithmetic of the pre-send backstop -> (limit, has_trustworthy_limit).
+
+    Others' reservations SUBTRACT from the room; the old Go bug added them,
+    which let two same-round buys each spend the full remaining budget. When
+    the target room is unreadable, fall back to available cash minus others;
+    only when BOTH rulers are missing do we report no limit (caller passes).
+    """
+    zero = params["zero_amount"]
+    if others is None or others < zero:
+        others = zero
+    if room_ok and room is not None:
+        return max(room - others, zero), True
+    if cash_ok and cash is not None:
+        return max(cash - others, zero), True
+    return zero, False
+
+
+def rule_reprice_deviation_pct(params, order_price, vwap):
+    """Deviation of a resting limit from VWAP in percent -> (dev, ref_ok)."""
+    floor = params["min_price"]
+    if order_price is None or vwap is None:
+        return None, False
+    if order_price < floor or vwap < floor:
+        return None, False
+    return (order_price - vwap) / vwap * params["pct_scale"], True
+
+
+def rule_reprice_worth_cancelling(params, dev, threshold):
+    """Both directions matter: too high overpays, too low never fills."""
+    if dev is None or not threshold:
+        return False
+    return abs(dev) >= threshold
+
+
+def rule_is_strategic_buy(params, kind):
+    """Only strategic buys are ours to cancel; T legs and manual orders are not."""
+    return kind in (params.get("buy_signals") or [])
 # ==== RULE LAYER END ====
 
 
@@ -1136,6 +1235,87 @@ _SHADOW_JUDGEMENT_TYPED = ("market_scale", "target")
 _SHADOW_JUDGEMENT_NOTE = ("hard_block", "t_allowed", "missing_key_dims", "emotion_phase")
 
 
+def _judgement_view(ctx, positions, cash):
+    """The account-level view the judgement legs need on top of the per-symbol ctx.
+
+    Why the carriers need this at all: the sizing/T chains were ported from Go code that runs
+    inside the engine, where the account book and the market state are one struct. A carrier
+    round only has a per-symbol context, so feeding it that context directly makes every
+    account-level gate abstain -- which is exactly how "the leg is wired" and "the leg always
+    says no" become indistinguishable on screen.
+
+    Deliberately ABSENT here (and the chains decline on them, naming the step):
+      * market dims (emotion phase, breadth, index change) -- this box has no market feed;
+        they are not invented, they are missing, and the sizing chain's blind-spot cap is the
+        designed consequence (same stance as the sandbox's _sizing_view);
+      * sector/cluster buckets -- no sector list on the box, so the concentration caps do not
+        participate rather than guessing a bucket.
+    The basis for a position's value is its cost price, except for the one symbol we hold a
+    live tick for. Understating room is allowed; overstating it is the defect the Go side
+    pinned. English: cost as the declared basis, live tick only where we actually have one.
+    """
+    out = dict(ctx or {})
+    live = []
+    holdings = 0.0
+    for symbol, row in (positions or {}).items():
+        qty = float((row or {}).get("qty") or 0.0)
+        price = (row or {}).get("cost")
+        if symbol == out.get("symbol"):
+            price = out.get("last_price") or price
+        price = float(price or 0.0)
+        holdings += qty * price
+        live.append({"qty": qty, "price": price})
+    out["positions_live"] = live
+    out["holdings_value"] = holdings
+    avail = cash if cash is not None else out.get("available_cash")
+    if avail is not None:
+        out["available_cash"] = float(avail)
+        out["total_asset"] = holdings + float(avail)
+        out["equity"] = out["total_asset"]
+    return out
+
+
+def _ascii_compact(text, limit=48):
+    """Keep one judgement field ASCII and short enough to ride inside sizing_note.
+
+    A non-ASCII value is DROPPED, not transcoded: the artifact is pinned pure ASCII by gate g1
+    (the client decodes source as GBK), so a non-ASCII string here can only come from a runtime
+    value nobody sanitised -- and turning it into '?' (the GBK behaviour this repo has been bitten
+    by) would put a plausible-looking corruption into the reconciliation ledger. Dropping it costs
+    the explanation only, never the measurement.
+    """
+    text = str(text or "")[:limit]
+    if not text.isascii():
+        return ""
+    return text.replace(" ", "_")
+
+
+def t_leg_judgement(params, view):
+    """Ask the ported T judgement leg what it would have said about this context.
+
+    One key out (`t_leg`, a compact ASCII string) rather than five: the shadow row carries the
+    explanation in a single 200-byte column, and the T answers are explanation, not measurement.
+    Absent leg => {} (the row is journalled without it); a raising leg => t_leg_error=..., so
+    "the leg is not wired here" and "the leg exists but is broken" stay two different readings.
+    """
+    fn = _PORTED_LEGS.get("t_readout")
+    if not callable(fn):
+        return {}
+    try:
+        raw = fn(params, view) or {}
+    except Exception as exc:  # noqa: BLE001 -- a broken judgement leg must not cost the round
+        return {"t_leg": "t_leg_error=%s" % _ascii_compact(exc.__class__.__name__, 24)}
+    parts = []
+    for key in ("t_open_allowed", "t_dir_buy", "t_dir_sell"):
+        if key in raw:
+            parts.append("%s=%s" % (key[2:], "1" if raw.get(key) else "0"))
+    for key in ("t_block_reason", "t_dir_reason"):
+        text = _ascii_compact(raw.get(key))
+        if text:
+            parts.append("%s=%s" % (key[2:], text))
+    return {"t_leg": " ".join(parts)} if parts else {}
+
+
 def sizing_judgement(params, ctx):
     """Ask the ported sizing leg what it would have said about this context.
 
@@ -1308,6 +1488,22 @@ class LocalState(object):
                 " mode TEXT NOT NULL DEFAULT 'shadow', judgement TEXT NOT NULL DEFAULT '',"
                 " first_ts REAL NOT NULL, last_ts REAL NOT NULL,"
                 " PRIMARY KEY (day, short_code))")
+            # CARRIER-PARITY-1105 SIGNAL-GONE: when was each signal last
+            # COMPUTED (not sent). The Go side reads this from today's decision
+            # table and refuses to cancel anything when the whole chain looks
+            # idle. A process restart must not reset the liveness evidence, so
+            # it is a table rather than an in-memory dict.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS signal_seen ("
+                "day TEXT NOT NULL, short_code TEXT NOT NULL, last_ts REAL NOT NULL,"
+                " PRIMARY KEY (day, short_code))")
+            # CARRIER-PARITY-1105 BUY-REPRICE: per-code daily cancel budget.
+            # The Go side counts these from the orders ledger so a restart
+            # cannot hand out a fresh pair of reprices; same reason here.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS reprice_counts ("
+                "day TEXT NOT NULL, code TEXT NOT NULL, n INTEGER NOT NULL,"
+                " PRIMARY KEY (day, code))")
             conn.commit()
         finally:
             conn.close()
@@ -1323,6 +1519,69 @@ class LocalState(object):
                 (day, signal["short_code"], signal["symbol"], signal["kind"],
                  signal["side"], int(signal["qty"]), float(signal["price"]),
                  remark, str(order_id), status, time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def record_signal_seen(self, day, short_code, ts):
+        """Mark that the decision chain still computes this signal today.
+
+        A signal that was merely COMPUTED counts as alive; whether it was
+        armed, sent or skipped is a different question. Mirrors the Go side's
+        decision-table liveness, where "no row today" means idle, not gone.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO signal_seen (day, short_code, last_ts)"
+                " VALUES (?,?,?)", (day, short_code, float(ts)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def signal_last_seen(self, day, short_code):
+        """Last computation timestamp for one code, or None when unknown."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT last_ts FROM signal_seen WHERE day = ? AND short_code = ?",
+                (day, short_code)).fetchall()
+        finally:
+            conn.close()
+        return float(rows[0][0]) if rows else None
+
+    def freshest_signal(self, day):
+        """Newest computation timestamp today (None when the chain never ran)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT MAX(last_ts) FROM signal_seen WHERE day = ?", (day,)).fetchone()
+        finally:
+            conn.close()
+        return float(row[0]) if row and row[0] is not None else None
+
+    def reprice_count(self, day, code):
+        """How many times this code was cancelled for a VWAP reprice today."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT n FROM reprice_counts WHERE day = ? AND code = ?",
+                (day, code)).fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row else 0
+
+    def record_reprice(self, day, code):
+        """Count one REAL reprice cancel (only called after the broker said ok)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT n FROM reprice_counts WHERE day = ? AND code = ?",
+                (day, code)).fetchone()
+            count = int(row[0]) if row else 0
+            conn.execute(
+                "INSERT OR REPLACE INTO reprice_counts (day, code, n) VALUES (?,?,?)",
+                (day, code, count + 1))
             conn.commit()
         finally:
             conn.close()
@@ -1865,6 +2124,11 @@ class Executor(object):
             }),
             "last_price": tick.get("last_price"),
             "prev_close": tick.get("prev_close"),
+            # CARRIER-PARITY-1105: the Go reprice leg reads a real VWAP from the
+            # quote snapshot. Here the only local source is the same tick's
+            # cumulative amount/volume; a missing or unusable pair stays None
+            # so "no reference price" can never be read as "price is fine".
+            "vwap": self._vwap_of(tick),
             "volume": tick.get("volume"),
             "ask1": tick.get("ask1"),
             "bid1": tick.get("bid1"),
@@ -1877,6 +2141,33 @@ class Executor(object):
             "ops_last_minute": self.state.ops_since(
                 time.time() - float(self.params["ops_window_sec"])),
         }
+
+    def _vwap_of(self, tick):
+        """Volume-weighted average price of the day, or None when unavailable.
+
+        xtdata reports cumulative volume in lots and cumulative amount in yuan,
+        so the per-share average needs the lot size. Units come from PARAMS,
+        never from a literal here. A tick with no volume or no amount yields
+        None: an absent reference must not become a zero reference.
+        """
+        volume = tick.get("volume")
+        amount = tick.get("amount")
+        if not volume or not amount or volume <= 0 or amount <= 0:
+            return None
+        try:
+            return float(amount) / (float(volume) * float(self.params["lot_size"]))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _vwap_for_symbol(self, symbol):
+        """Fresh VWAP for one resting order's symbol (None on data trouble)."""
+        if not symbol:
+            return None
+        try:
+            raw = self.data.get_full_tick([symbol])
+            return self._vwap_of(normalize_tick(symbol, raw.get(symbol) if isinstance(raw, dict) else None))
+        except (DataUnavailable, TypeError, ValueError):
+            return None
 
     def _volume_ratio(self, symbol, tick):
         """Today's volume against the recent average volume of the same name."""
@@ -2014,10 +2305,32 @@ class Executor(object):
         closed_days |= load_closed_days(self.params.get("calendar_file"))
         positions = self.broker.positions()
         cash = self.broker.available_cash()
+        # CARRIER-PARITY-1105 BUY-ROOM-GUARD: a context is built ONCE per
+        # symbol, BEFORE its signals are evaluated. Two buys from the same
+        # context therefore both read the same round-start spend -- the exact
+        # window that let a same-round pair each spend the full remaining room
+        # in Go. The ledger counts what THIS round has already committed.
+        # Resting counter orders are already inside daily_buy_total (the broker
+        # table feeds that number); counting them here again would double-charge
+        # the budget and silently turn the guard into a buy ban.
+        budget = {"reserved": 0.0}
+        # LIVENESS: "the chain still computes this signal today" is not the
+        # same fact as "an order was sent". Keep it day-keyed in the journal
+        # so a restart cannot turn a live signal into a vanished one.
+        live_shorts = set()
+        now_ts = time.time()
 
         for symbol in self.params.get("symbols", []):
             ctx = self.context_for(symbol, moment, broker_rows, positions, cash, closed_days)
+            # Snapshot of the ledger at the moment this context was built:
+            # only reservations made AFTER it are "others" for its signals.
+            ctx["round_reserved"] = budget["reserved"]
             for signal, mode in self.decide_with_modes(ctx):
+                # A computed signal is alive regardless of arm mode / whether
+                # it reaches the counter. Go reads the same liveness from the
+                # decision table, and treats "no rows today" as idle.
+                self.state.record_signal_seen(day, signal["short_code"], now_ts)
+                live_shorts.add(signal["short_code"])
                 if mode == "shadow":
                     # Shadow leg: compute and record, never spend. The whole
                     # point of the 5-day shadow window is that the judgement can
@@ -2028,7 +2341,9 @@ class Executor(object):
                     # window was unmeasurable and the arm button had no data behind it.
                     # The sizing leg is attached where it is computable, and simply absent
                     # where it is not (never 0): see sizing_judgement for why.
-                    judgement = sizing_judgement(self.params, ctx)
+                    view = _judgement_view(ctx, positions, cash)
+                    judgement = sizing_judgement(self.params, view)
+                    judgement.update(t_leg_judgement(self.params, view))
                     self.state.record_shadow(day, signal, judgement=judgement)
                     entry = {"short_code": signal["short_code"],
                              "kind": signal.get("kind"), "symbol": symbol,
@@ -2042,7 +2357,7 @@ class Executor(object):
                     summary["skipped"].append({"short_code": signal["short_code"],
                                                "reason": "rule_not_armed"})
                     continue
-                outcome = self._maybe_send(ctx, signal, done, day)
+                outcome = self._maybe_send(ctx, signal, done, day, budget)
                 if outcome.get("sent"):
                     summary["placed"].append(outcome)
                     done.add(signal["short_code"])
@@ -2054,11 +2369,19 @@ class Executor(object):
         # stale and pre-close live orders. Reversed, an order placed seconds
         # earlier is seen by the sweep in the same instant and the frequency
         # gate would spend its budget on cancels before any new intent.
-        summary["cancels"] = self.cancel_leg(day, broker_rows, moment, closed_days)
+        summary["cancels"] = self.cancel_leg(
+            day, broker_rows, moment, closed_days,
+            live_shorts=live_shorts, now_ts=now_ts,
+            freshest=self.state.freshest_signal(day))
         return summary
 
-    def _maybe_send(self, ctx, signal, done, day):
-        """Apply every gate, then place. Returns {sent, reason, order_id}."""
+    def _maybe_send(self, ctx, signal, done, day, budget=None):
+        """Apply every gate, then place. Returns {sent, reason, order_id}.
+
+        budget is the round's shared reservation ledger {"reserved": amount};
+        it is optional so callers outside run_round keep the old behaviour,
+        but every real round passes it (see CARRIER-PARITY-1105).
+        """
         short = signal["short_code"]
         if short in done:
             return {"sent": False, "reason": "already_sent"}
@@ -2077,6 +2400,25 @@ class Executor(object):
                 return {"sent": False, "reason": "order_amount_cap"}
             if not rule_daily_buy_cap_ok(self.params, ctx, signal["amount"]):
                 return {"sent": False, "reason": "daily_buy_cap"}
+            # CARRIER-PARITY-1105: the pre-send backstop. The three caps above
+            # all read the round-start snapshot; this one subtracts what the
+            # round has ALREADY committed, so two buys cannot each spend the
+            # full remaining room. Same arithmetic as Go sendRoomLimit.
+            if rule_room_guard_on(self.params):
+                room = rule_remaining_quota(self.params, ctx)
+                # Only the amount committed AFTER this context was built is
+                # still invisible to room. Everything older is already in
+                # daily_buy_total, so adding it again would charge twice.
+                others = (float((budget or {}).get("reserved", 0.0))
+                          - float(ctx.get("round_reserved", 0.0)))
+                cash_now = ctx.get("available_cash")
+                limit, has_limit = rule_room_limit(
+                    self.params, room, room is not None,
+                    others, cash_now, cash_now is not None)
+                if has_limit and signal["amount"] > limit:
+                    LOG.info("[executor] room guard refused %s amount=%.0f limit=%.0f",
+                             short, signal["amount"], limit)
+                    return {"sent": False, "reason": "buy_room_guard"}
         remark = build_remark(short)
         self.state.record_op("place")
         ok, order_id, why = self.broker.place_order(signal, remark)
@@ -2084,11 +2426,18 @@ class Executor(object):
             LOG.warning("[executor] place rejected %s: %s", short, why)
             return {"sent": False, "reason": "broker_rejected: %s" % (why,)}
         self.state.record_order(day, signal, remark, order_id)
+        # Reserve the amount BEFORE the next signal is evaluated. This is the
+        # whole point of the ledger: the broker table will not show this order
+        # until the next round, but the next signal in THIS round must see it.
+        if budget is not None and signal["side"] == "buy":
+            budget["reserved"] = (float(budget.get("reserved", 0.0))
+                                  + float(signal.get("amount") or 0.0))
         LOG.info("[executor] sent %s %s qty=%s remark=%s id=%s",
                  signal["side"], signal["symbol"], signal["qty"], remark, order_id)
         return {"sent": True, "reason": "sent", "order_id": order_id, "remark": remark}
 
-    def cancel_leg(self, day, broker_rows, moment, closed_days):
+    def cancel_leg(self, day, broker_rows, moment, closed_days,
+                   live_shorts=None, now_ts=None, freshest=None):
         """P0 execution leg number two: stale-order cancel + close sweep (11-04).
 
         Why it must exist here: while the bridge lived, CANCEL-STATE and
@@ -2127,7 +2476,20 @@ class Executor(object):
         stale_sec = float(self.params.get("stale_order_sec"))
         already = self.state.cancelled_ids(day)
         out = {"attempted": 0, "cancelled": [], "skipped_reason": ""}
-        now_ts = time.time()
+        now_ts = time.time() if now_ts is None else float(now_ts)
+        # CARRIER-PARITY-1105: the two new cancel reasons join THIS single exit.
+        # A second cancel path racing the first is how "cancelled then replaced"
+        # incidents happen, so they only add triggers -- never a second broker
+        # call, a second frequency debit or a second cancellation trail.
+        grace = rule_leg_seconds(self.params, "signal_gone_cancel_sec")
+        threshold = rule_leg_seconds(self.params, "vwap_reprice_pct")
+        live_shorts = live_shorts or set()
+        gone_idle = False
+        if grace is not None:
+            # "No decision at all today" or "the chain stopped longer ago than
+            # the grace" means the decision chain is idle, NOT that every
+            # resting signal vanished. Go refuses the whole leg in that case.
+            gone_idle = freshest is None or (now_ts - float(freshest)) > grace
         for row in broker_rows or []:
             short = short_code_from_remark(row.get("remark"))
             if not short:
@@ -2147,7 +2509,37 @@ class Executor(object):
                 age = None
             stale = age is not None and age >= stale_sec
             sweep = bool(sweep_from) and hhmm >= sweep_from
-            if not (stale or sweep):
+            # Only strategic BUYS are ours to cancel. Manual orders carry no
+            # short code and were already skipped; T legs have their own kind
+            # and must keep their own pacing.
+            strategic_buy = rule_is_strategic_buy(self.params, self._kind_of_short(short))
+            gone = False
+            reprice = False
+            reprice_code = str(row.get("symbol") or short)
+            if strategic_buy and grace is not None and not gone_idle:
+                if short not in live_shorts:
+                    last = self.state.signal_last_seen(day, short)
+                    # missing != zero: a code we have never seen computed is
+                    # UNKNOWN, never "gone". Only a seen code past its grace
+                    # can be cancelled for this reason.
+                    if last is not None and (now_ts - last) > grace:
+                        gone = True
+            # Partial fills are never repriced: cancelling the remainder would
+            # also close the same-key replay for the filled part, turning a
+            # price correction into a missing position. No VWAP reference is
+            # never "price looks fine".
+            if strategic_buy and threshold is not None and not row.get("traded"):
+                try:
+                    order_price = float(row.get("price") or 0)
+                except (TypeError, ValueError):
+                    order_price = None
+                dev, ref_ok = rule_reprice_deviation_pct(
+                    self.params, order_price, self._vwap_for_symbol(row.get("symbol")))
+                if (ref_ok and rule_reprice_worth_cancelling(self.params, dev, threshold)
+                        and self.state.reprice_count(day, reprice_code)
+                        < self.params["reprice_max_per_day"]):
+                    reprice = True
+            if not (gone or reprice or stale or sweep):
                 continue
             if not rule_ops_frequency_ok(self.params, base):
                 out["skipped_reason"] = "ops_frequency_exceeded"
@@ -2158,8 +2550,23 @@ class Executor(object):
             if ok:
                 self.state.mark_cancelled(day, order_id)
                 already.add(order_id)
+                # One reason per cancelled order, priority signal_gone >
+                # vwap_reprice > stale > close_sweep. The reason is what the
+                # next-day operator reads, so it must name the trigger that
+                # actually made us spend a counter cancellation.
+                if gone:
+                    cancel_why = "signal_gone"
+                elif reprice:
+                    # Count only REAL cancellations, from the journal, so a
+                    # restart cannot hand out a fresh pair of reprices.
+                    self.state.record_reprice(day, reprice_code)
+                    cancel_why = "vwap_reprice"
+                elif stale:
+                    cancel_why = "stale"
+                else:
+                    cancel_why = "close_sweep"
                 out["cancelled"].append({"order_id": order_id, "short_code": short,
-                                         "why": "stale" if stale else "close_sweep"})
+                                         "why": cancel_why})
             else:
                 LOG.warning("[executor] cancel failed id=%s: %s", order_id, why)
                 out["skipped_reason"] = "cancel_failed"
@@ -2198,6 +2605,12 @@ def build_parser():
                         help="print shadow-decision counts per kind/day and exit")
     parser.add_argument("--interval", type=float, default=None,
                         help="seconds between rounds (default: from PARAMS)")
+    # CUTOVER-1105: the box-level bridge/local interlock. Empty keeps today's
+    # behaviour for hand-run rounds; the installed scheduled runner always
+    # passes it, so a stray manual start cannot create a second order leg.
+    parser.add_argument("--execution-mode-file", default=os.environ.get(
+        "LOCAL_EXECUTOR_MODE_FILE", ""), dest="execution_mode_file",
+        help="box-level bridge/local cutover state (empty = no interlock)")
     return parser
 
 
@@ -2372,6 +2785,16 @@ def main(argv=None):
     if not args.account:
         LOG.error("[executor] no broker account configured (--account / QMT_ACCOUNT)")
         return 2
+    # CUTOVER-1105: fail closed before touching the broker. --selftest and
+    # --shadow-report already returned above, so health checks still work on
+    # a box that is deliberately still running the bridge leg.
+    mode = execution_mode_from(args.execution_mode_file)
+    if mode != "local":
+        LOG.warning("[cutover] execution_mode=%s: the QMT bridge is the live order leg; "
+                    "this process will NOT place orders (two legs would double-spend). "
+                    "Run switch_execution_mode.ps1 -Mode local -Apply -AckBridgeStopped "
+                    "to cut over, or pass no --execution-mode-file for a hand-run round.", mode)
+        return 4
     data = XtDataSource()
     broker = build_broker(params, args.account)
     if isinstance(broker, DisabledBroker):

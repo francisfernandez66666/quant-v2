@@ -659,8 +659,11 @@ def assemble_pported(params):
             if not codes.get(kind):
                 missing_codes.append("%s.%s" % (name, kind))
         for nm, definition in sorted(ported_top_level_texts(source).items()):
-            if nm in ("RULES",):
-                continue  # re-snapshotted per module below
+            if nm in ("RULES", "JUDGEMENT_LEGS"):
+                # 这两张表都是**每个模块自己的声明**（RULES=信号种类，JUDGEMENT_LEGS=判断腿名字），
+                # 不是可复用的定义：两个模块各写一份是设计，不是重名覆盖。
+                # 少这一条，第二条腿一进册就撞 ported_name_collision，等于"只准有一条判断腿"。
+                continue  # re-snapshotted / re-declared per module below
             if nm in seen_names:
                 if seen_names[nm][1] == definition:
                     # 逐字相同的定义（例如共享的 make_signal）只带一份进产物：
