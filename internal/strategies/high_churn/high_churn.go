@@ -44,6 +44,38 @@ func (s *Strategy) Name() string { return "high_churn" }
 // （Type returns the signal type.）
 func (s *Strategy) Type() strategy.SignalType { return strategy.SignalHighChurn }
 
+// 评分阈值单点（§DERIVE-CARRIER-1105）：高位滞涨三因子的分档边界与满分档。
+//
+// 为什么命名出来（与 break_down.go 同一取向，成因不重复第二遍）：这些数以前是函数体里的
+// 内联字面量，载体（QMT 内置策略 / 本地执行器）拿不到，只能人手抄进
+// qmt_gateway/local_executor_params.json——抄错一位没有任何东西会响，而它改的是策略的含义。
+// 现在真源只有这一处：下面的判定和 derive_carrier.go 的导出读数都指向它。
+// English: the single definition of every threshold this tactic scores with;
+// the carrier artifact reads it through DeriveCarrierThresholds instead of hand-copying.
+const (
+	hcMinBars          = 60   // 日K 硬闸：位置族要 60 根才成立，不足按数据缺口 0 分
+	hcPosStart         = 0.92 // 现价 ≥60日最高×0.92 起评
+	hcPosSpan          = 0.08 // 0.92 → 1.00 这 8 个百分点走完线性段
+	hcPosBaseScore     = 15.0 // 起评分
+	hcPosStepScore     = 15.0 // 线性段换来的分（合计满分）
+	hcPositionMaxScore = 30.0 // 位置高度满分（也是该因子的帽，含涨幅口径的帽）
+	hcGainStart        = 0.30 // 近 20 日涨幅 ≥30% 起评
+	hcGainSpan         = 0.20 // 30% → 50% 这 20 个百分点走完线性段
+	hcGainBaseScore    = 15.0 // 涨幅口径起评分
+	hcGainStepScore    = 15.0 // 涨幅口径线性段换来的分
+	hcDivHeavyRatio    = 1.5  // 5日均量/20日均量 ≥1.5 记"放量"
+	hcDivStallPct      = 2.0  // 近 3 日区间涨幅 <2% 记"滞涨"
+	hcDivFullScore     = 40.0 // 放量且滞涨＝派发，满分
+	hcDivHalfScore     = 20.0 // 只满足单边，减半
+	hcShadowRatio      = 0.4  // 上影占比 ≥40% 记走弱
+	hcShadowScore      = 12.0 // 长上影加分
+	hcBelowMA5Score    = 10.0 // 收盘跌破 5 日线加分
+	hcConsecDownDays   = 2    // 连续阴线达到这个天数
+	hcConsecDownScore  = 8.0  // 连续阴线加分
+	hcWeaknessMaxScore = 30.0 // K 线走弱满分（帽：三项相加可能超）
+	hcDefaultMinScore  = 60.0 // 通过门槛的出厂值（rules.strategy.short.high_churn_min 可覆盖）
+)
+
 // scoreThreshold 返回买入门槛（默认 60，账号级 rules.strategy.short.high_churn_min 可覆盖）。
 // （scoreThreshold resolves the pass gate with a 60 default.）
 func (s *Strategy) scoreThreshold() float64 {
@@ -53,7 +85,7 @@ func (s *Strategy) scoreThreshold() float64 {
 			return sc.Short.HighChurnMin
 		}
 	}
-	return 60
+	return hcDefaultMinScore
 }
 
 // Evaluate 执行高位滞涨三因子评分。
@@ -68,7 +100,7 @@ func (s *Strategy) scoreThreshold() float64 {
 // （Evaluate runs the three-factor scoring.）
 func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	sd, ok := data.(*shortbase.Data)
-	if !ok || sd == nil || len(sd.KLines) < 60 {
+	if !ok || sd == nil || len(sd.KLines) < hcMinBars {
 		// 数据不足：0 分安全降级（nodata 由上层 markDataGap 识别）
 		// English: insufficient bars → safe 0-score degrade.
 		return &strategy.Evaluation{Pass: false, TotalScore: 0, Level: "nodata",
@@ -94,7 +126,7 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 
 	// 置信度 = 总分/100；位置与背离同时满分时 +0.1（派发特征齐备），封顶 0.95。
 	conf := total / 100.0
-	if pos >= 30 && div >= 40 {
+	if pos >= hcPositionMaxScore && div >= hcDivFullScore {
 		conf += 0.1
 	}
 	if conf > 0.95 {
@@ -130,21 +162,21 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 func (s *Strategy) positionScore(sd *shortbase.Data) float64 {
 	var sc float64
 	// 现价 ≥60日最高×0.92 起评，线性到 1.0 满分
-	if sd.PosHigh >= 0.92 {
-		sc = 15 + (sd.PosHigh-0.92)/0.08*15
+	if sd.PosHigh >= hcPosStart {
+		sc = hcPosBaseScore + (sd.PosHigh-hcPosStart)/hcPosSpan*hcPosStepScore
 	}
 	// 近20日涨幅 ≥30% 起评，50% 满分
-	if sd.Gain20 >= 0.30 {
-		g := 15 + (sd.Gain20-0.30)/0.20*15
-		if g > 30 {
-			g = 30
+	if sd.Gain20 >= hcGainStart {
+		g := hcGainBaseScore + (sd.Gain20-hcGainStart)/hcGainSpan*hcGainStepScore
+		if g > hcPositionMaxScore {
+			g = hcPositionMaxScore
 		}
 		if g > sc {
 			sc = g
 		}
 	}
-	if sc > 30 {
-		sc = 30
+	if sc > hcPositionMaxScore {
+		sc = hcPositionMaxScore
 	}
 	return sc
 }
@@ -153,13 +185,13 @@ func (s *Strategy) positionScore(sd *shortbase.Data) float64 {
 // 只满足单边减半。
 // （divergenceScore scores heavy-volume-stalled-price, max 40.）
 func (s *Strategy) divergenceScore(sd *shortbase.Data) float64 {
-	heavy := sd.VolRatio5_20 >= 1.5
-	stall := sd.Last3RangePct < 2.0
+	heavy := sd.VolRatio5_20 >= hcDivHeavyRatio
+	stall := sd.Last3RangePct < hcDivStallPct
 	switch {
 	case heavy && stall:
-		return 40
+		return hcDivFullScore
 	case heavy || stall:
-		return 20
+		return hcDivHalfScore
 	}
 	return 0
 }
@@ -168,17 +200,17 @@ func (s *Strategy) divergenceScore(sd *shortbase.Data) float64 {
 // （weaknessScore scores candle weakness, max 30.）
 func (s *Strategy) weaknessScore(sd *shortbase.Data) float64 {
 	var sc float64
-	if sd.UpperShadowPct >= 0.4 {
-		sc += 12
+	if sd.UpperShadowPct >= hcShadowRatio {
+		sc += hcShadowScore
 	}
 	if sd.BelowMA5 {
-		sc += 10
+		sc += hcBelowMA5Score
 	}
-	if sd.ConsecDownDays >= 2 {
-		sc += 8
+	if sd.ConsecDownDays >= hcConsecDownDays {
+		sc += hcConsecDownScore
 	}
-	if sc > 30 {
-		sc = 30
+	if sc > hcWeaknessMaxScore {
+		sc = hcWeaknessMaxScore
 	}
 	return sc
 }

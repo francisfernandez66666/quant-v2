@@ -48,6 +48,32 @@ func (s *Strategy) Name() string { return "leader_decay" }
 // （Type returns the signal type.）
 func (s *Strategy) Type() strategy.SignalType { return strategy.SignalLeaderDecay }
 
+// 评分阈值单点（§DERIVE-CARRIER-1105）：龙头断板三因子的档位、加分项与帽。
+// 成因与 break_down.go 同源（载体只认名字不认人手的第二本账），这里不重复说明。
+// English: the tactic's own thresholds, named once, exported read-only by derive_carrier.go.
+const (
+	ldMinBars          = 10   // 日K 硬闸：不足 10 根按数据缺口安全降级
+	ldMinBoards        = 2    // 连板高度是存在前提：不足 2 板不适用本战法
+	ldBoardMaxScore    = 30.0 // 连板高度满分
+	ldBoardFullBoards  = 5    // 5 板及以上记满分
+	ldBoardBaseScore   = 12.0 // 2 板的起评分
+	ldBoardBaseBoards  = 2.0  // 起评的板数（线性段从这里往上数）
+	ldBoardSpanBoards  = 3.0  // 2 板到 5 板之间跨 3 个板
+	ldBoardSpanScore   = 18.0 // 这 3 个板换来 18 分
+	ldBigLossRatio     = 0.97 // 收盘 ≤ 昨收×0.97 记"大面"
+	ldBigLossScore     = 20.0 // 大面加分
+	ldTouchedScore     = 15.0 // 盘中触板后炸板回落加分
+	ldHugeVolumeRatio  = 2.0  // 当日量 ≥5日均量×2 记天量
+	ldHugeVolumeScore  = 10.0 // 天量加分
+	ldWeaknessMaxScore = 40.0 // 断板弱势的帽
+	ldSectorDropRatio  = 0.5  // 板块涨停家数较昨日降幅 ≥50%
+	ldSectorDropScore  = 20.0 // 板块退潮加分
+	ldPhaseRetreatMark = "退潮" // 市场相位名里的退潮标记（真源见 research 的相位表）
+	ldPhaseScore       = 10.0 // 市场相位仍在退潮的加分
+	ldRetreatMaxScore  = 30.0 // 情绪退潮的帽
+	ldDefaultMinScore  = 65.0 // 通过门槛出厂值：四战法最严（断板有反包风险）
+)
+
 // scoreThreshold 返回通过门槛（默认 65，rules.strategy.short.leader_decay_min 可覆盖）。
 // （scoreThreshold resolves the pass gate, default 65.）
 func (s *Strategy) scoreThreshold() float64 {
@@ -57,7 +83,7 @@ func (s *Strategy) scoreThreshold() float64 {
 			return sc.Short.LeaderDecayMin
 		}
 	}
-	return 65
+	return ldDefaultMinScore
 }
 
 // Evaluate 执行龙头断板三因子评分。
@@ -72,12 +98,12 @@ func (s *Strategy) scoreThreshold() float64 {
 // （Evaluate runs the scoring.）
 func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	sd, ok := data.(*shortbase.Data)
-	if !ok || sd == nil || len(sd.KLines) < 10 {
+	if !ok || sd == nil || len(sd.KLines) < ldMinBars {
 		return &strategy.Evaluation{Pass: false, TotalScore: 0, Level: "nodata",
 			Details: map[string]float64{}}, nil
 	}
 	// 非连板股不适用本战法（连板高度是存在前提）
-	if sd.ConsecBoards < 2 {
+	if sd.ConsecBoards < ldMinBoards {
 		return &strategy.Evaluation{Pass: false, TotalScore: 0, Level: "no_board",
 			Details: map[string]float64{"consec_boards": float64(sd.ConsecBoards)}}, nil
 	}
@@ -142,27 +168,27 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 // （boardScore scores consecutive limit-up height, max 30.）
 func (s *Strategy) boardScore(sd *shortbase.Data) float64 {
 	b := float64(sd.ConsecBoards)
-	if b >= 5 {
-		return 30
+	if b >= ldBoardFullBoards {
+		return ldBoardMaxScore
 	}
-	return 12 + (b-2)/3*18
+	return ldBoardBaseScore + (b-ldBoardBaseBoards)/ldBoardSpanBoards*ldBoardSpanScore
 }
 
 // weaknessScore 断板弱势（满分 40）：大面 20 + 炸板回落 15 + 天量 10，叠加封顶。
 // （weaknessScore scores the break-day weakness, max 40.）
 func (s *Strategy) weaknessScore(sd *shortbase.Data) float64 {
 	var sc float64
-	if sd.PrevClose > 0 && sd.Price <= sd.PrevClose*0.97 {
-		sc += 20 // 断板大面（≥-3%）
+	if sd.PrevClose > 0 && sd.Price <= sd.PrevClose*ldBigLossRatio {
+		sc += ldBigLossScore // 断板大面（≥-3%）
 	}
 	if sd.TouchedBoardToday {
-		sc += 15 // 盘中触板后炸板回落
+		sc += ldTouchedScore // 盘中触板后炸板回落
 	}
-	if sd.TodayVolVs5d >= 2.0 {
-		sc += 10 // 天量分歧
+	if sd.TodayVolVs5d >= ldHugeVolumeRatio {
+		sc += ldHugeVolumeScore // 天量分歧
 	}
-	if sc > 40 {
-		sc = 40
+	if sc > ldWeaknessMaxScore {
+		sc = ldWeaknessMaxScore
 	}
 	return sc
 }
@@ -171,15 +197,18 @@ func (s *Strategy) weaknessScore(sd *shortbase.Data) float64 {
 // （retreatScore scores sentiment retreat, max 30.）
 func (s *Strategy) retreatScore(sd *shortbase.Data) float64 {
 	var sc float64
-	if sd.SectorLimitUpDropPct >= 0.5 {
-		sc += 20
+	if sd.SectorLimitUpDropPct >= ldSectorDropRatio {
+		sc += ldSectorDropScore
 	}
+	// 相位名按"包含"判（Go 的相位串可能是"高潮转退潮"这种复合写法）；
+	// 这个词是从 params 走载体的——中文写死在移植后的 py 里会被 GBK 终端静默换成 ?。
+	// English: substring match on the retreat marker; the carrier gets it as a param list.
 	phase := sd.EmotionPhase
-	if strings.Contains(phase, "退潮") {
-		sc += 10
+	if strings.Contains(phase, ldPhaseRetreatMark) {
+		sc += ldPhaseScore
 	}
-	if sc > 30 {
-		sc = 30
+	if sc > ldRetreatMaxScore {
+		sc = ldRetreatMaxScore
 	}
 	return sc
 }

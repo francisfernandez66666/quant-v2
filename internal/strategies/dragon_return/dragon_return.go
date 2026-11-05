@@ -88,22 +88,105 @@ type Params struct {
 	MaxHoldDays         int     // 最长持仓天数（默认 8 天）（Max holding days, default 8）
 }
 
+// dr* 评分阈值单点（§DERIVE-CARRIER-1105B）。
+//
+// 为什么集中命名在这里：载体的 qmt_gateway/rules_ladder.py 是从本包逐行移植的，它按
+// LADDER_PARAM_KEYS 声明自己读哪些 params，构建闸 g9 因此要求每一枚都在烘进的参数文件里
+// 有主人。以前这些数是**函数体里的字面量**：外部进程拿不到，只能人手抄——抄对了也仍然留下
+// 两本账（本包改档，载体那一份不会跟着动，两边就在同一轮里用不同的阈值判同一笔信号）。
+// 现在生产判定读的就是下面这批常量，derive_carrier.go 只转调、一个数都不再定义。
+// English: the scoring code below reads exactly these constants; the carrier export
+// delegates to them instead of a second hand-written copy of the same numbers.
+const (
+	// 龙性识别（dragonIdentity）：硬性前置，任一不达标整笔评分归零。
+	drFirstRiseMin = 0.35 // 首轮涨幅下限（不足 35% 不算主升过的龙头）
+	drFirstRiseMax = 0.70 // 首轮涨幅上限（高于 70% 视为已透支）
+	drSectorRPSMin = 75.0 // 板块 RPS20 门槛（板块强度不达标不做二波）
+	drScoreDragon  = 25.0 // 龙性识别的满分值（也是 score() 里"不到 25 即否决"的那条线）
+	// 回调幅度档（pullbackHealth 子维度一）。
+	drPBBestLo       = 0.15 // 最优带下沿
+	drPBBestHi       = 0.20 // 最优带上沿／较优带下沿
+	drPBGoodsHi      = 0.25 // 较优带上沿／偏深带下沿
+	drPBShallowLo    = 0.10 // 偏浅带下沿
+	drPBDeepHi       = 0.35 // 偏深带上沿
+	drPBScoreBest    = 8.0  // 15%~20%：回调充分又不破位
+	drPBScoreGood    = 6.0  // 20%~25%：仍在可接受范围
+	drPBScoreShallow = 5.0  // 10%~15%：调整可能不到位
+	drPBScoreDeep    = 4.0  // 25%~35%：趋势可能走弱
+	drPBScoreOther   = 1.0  // 其余：不带"健康洗盘"的形状
+	// 回调天数档（子维度二）。
+	drDaysGoodLo     = 5  // 最优带下沿（天）
+	drDaysGoodHi     = 8  // 最优带上沿（天）
+	drDaysShortLo    = 3  // 偏短带下沿（天）
+	drDaysLongHi     = 12 // 偏长带上沿（天）
+	drDaysScoreGood  = 5  // 5~8 天：洗盘充分又不拖沓
+	drDaysScoreNear  = 3  // 3~4 天与 9~12 天：动能在磨底里流失
+	drDaysScoreOther = 1  // 其余只拿底分
+	// 缩量比档（子维度三）。
+	drVrGood       = 0.3 // 极度缩量线
+	drVrOk         = 0.4
+	drVrMid        = 0.5
+	drVrBad        = 0.6 // 超过这条就是放量回调（筹码松动）
+	drVrScoreGood  = 8.0
+	drVrScoreOk    = 7.0
+	drVrScoreMid   = 5.0
+	drVrScoreBad   = 3.0
+	drVrScoreOther = 1.0
+	// 鸭头形态（duckHead）。
+	drShrinkMax        = 0.5  // 鸭头顶要求缩量比 < 50%
+	drDuckTopFull      = 5.0  // 死叉且缩量
+	drDuckTopHalf      = 2.0  // 只死叉未缩量
+	drNeckSupportRatio = 0.98 // 鸭颈：现价 ≥ MA20×0.98 才算踩到支撑
+	drDuckNeckFull     = 8.0  // 均线仍在多头
+	drDuckNeckLow      = 5.0  // 已转到空头排列
+	drSlopePrevRatio   = 0.99 // MA10 斜率式的回看比例（Go 原式，见函数注释）
+	drSlopeDeltaRatio  = 0.01 // MA10 斜率式的步长（同上；该式恒等于 1，照搬含其退化形状）
+	drSlopeMin         = 0.5  // 斜率门槛
+	drDuckSlopeBonus   = 2.0  // 斜率达标加分
+	drMacdGreenNear    = 1.0  // 绿柱"接近零轴"的带宽（-1~0 视为将转红）
+	drBeakVrLo         = 0.5  // 鸭嘴量能子条件：温和放量下沿
+	drBeakVrHi         = 1.2  // 上沿（暴量不算确认）
+	drBeakScoreThree   = 7.0  // 三条全中
+	drBeakScoreTwo     = 4.0
+	drBeakScoreOne     = 2.0
+	drNostrilFull      = 5.0 // 鸭鼻孔：均线粘合待发散
+	drNostrilHalf      = 3.0 // 略破 MA20 但仍在支撑带
+	// 确认信号（confirmSignal）。
+	drConfirmVrLo    = 1.2  // 量能确认带下沿
+	drConfirmVrHi    = 1.5  // 量能确认带上沿
+	drConfirmVolFull = 7.0  // 温和放量（资金有序流入）
+	drConfirmVrMidLo = 0.8  // 平淡带下沿
+	drConfirmVolMid  = 3.0  // 尚未确认
+	drKHoldRatio     = 1.03 // 站稳短期线：现价 > MA5×1.03
+	drKScoreHold     = 5.0
+	drKScoreCross    = 2.0  // 同时上穿 MA10 的多头排列确认
+	drKNearLoRatio   = 0.98 // 企稳带下沿：MA5×0.98
+	drKScoreNear     = 2.0  // 企稳但未突破
+	// 总分档位（score/Evaluate/GenerateSignal 三处同一批线）。
+	drLevelFirst      = 60.0 // 首次（也是 Pass 闸）
+	drLevelMain       = 75.0 // 主升
+	drLevelAccelerate = 85.0 // 加速
+)
+
 // DefaultParams 返回龙回头策略默认参数。
 // 提供一组合理的默认值，用户可以通过配置文件覆盖这些参数。
 //
 // （DefaultParams returns the default Dragon Return parameters.）
 func DefaultParams() Params {
+	// 上面那批常量是**评分代码真正读的数**，这里的默认值必须与它们同源：
+	// 以前两边各写一遍字面量，改档时只改一边不会有任何东西响（载体侧抄的就是这一份）。
+	// 未列出的止损/止盈/持仓天数仍是本结构自己的参数，评分腿不读它们，故不在单点之列。
 	return Params{
-		FirstRiseMin:        0.35,
-		FirstRiseMax:        0.70,
-		PullbackOptimalLow:  0.15,
-		PullbackOptimalHigh: 0.25,
-		PullbackDaysMin:     5,
-		PullbackDaysMax:     8,
-		VolumeRatioGood:     0.3,
-		ScoreThreshold:      60,
-		MainPositionScore:   75,
-		AccelerateScore:     85,
+		FirstRiseMin:        drFirstRiseMin,
+		FirstRiseMax:        drFirstRiseMax,
+		PullbackOptimalLow:  drPBBestLo,
+		PullbackOptimalHigh: drPBGoodsHi,
+		PullbackDaysMin:     drDaysGoodLo,
+		PullbackDaysMax:     drDaysGoodHi,
+		VolumeRatioGood:     drVrGood,
+		ScoreThreshold:      drLevelFirst,
+		MainPositionScore:   drLevelMain,
+		AccelerateScore:     drLevelAccelerate,
 		StopLossPct:         0.05,
 		Target1Multiplier:   1.0,
 		Target2Multiplier:   1.25,
@@ -195,15 +278,15 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 
 	sr := d.score(sd)
 	// 通过判定：总分 ≥ 60（ScoreThreshold）（Pass: total ≥ 60 (ScoreThreshold)）
-	pass := sr.Total >= 60
+	pass := sr.Total >= drLevelFirst
 
 	// 信号级别分档：≥85 加速 / ≥75 主升 / ≥60 首次 / 其余不操作（Signal tiers: ≥85 accelerate / ≥75 main / ≥60 first / else none）
 	level := "none"
-	if sr.Total >= 85 {
+	if sr.Total >= drLevelAccelerate {
 		level = "accelerate"
-	} else if sr.Total >= 75 {
+	} else if sr.Total >= drLevelMain {
 		level = "main"
-	} else if sr.Total >= 60 {
+	} else if sr.Total >= drLevelFirst {
 		level = "first"
 	}
 	// 置信度 = 总分 / 100（满分 100 口径）（Confidence = total / 100 on a 100-point scale）
@@ -256,8 +339,9 @@ func (d *DragonReturnStrategy) score(sd *StockData) ScoreResult {
 	var sr ScoreResult
 
 	// 龙性识别是硬性前置条件：不达标直接返回（其余因子不再计算）（Dragon identity is a hard precondition: return early if unmet）
+	// 那条线就是龙性维度的满分值（全有或全无），所以它不另立一枚数——两枚数会漂成两档。
 	sr.DragonID = d.dragonIdentity(sd)
-	if sr.DragonID < 25 {
+	if sr.DragonID < drScoreDragon {
 		return sr
 	}
 
@@ -269,11 +353,11 @@ func (d *DragonReturnStrategy) score(sd *StockData) ScoreResult {
 
 	// 依据总分映射信号级别（Map signal level from the total score）
 	sr.Signal = "none"
-	if sr.Total >= 85 {
+	if sr.Total >= drLevelAccelerate {
 		sr.Signal = "accelerate"
-	} else if sr.Total >= 75 {
+	} else if sr.Total >= drLevelMain {
 		sr.Signal = "main"
-	} else if sr.Total >= 60 {
+	} else if sr.Total >= drLevelFirst {
 		sr.Signal = "first"
 	}
 
@@ -293,13 +377,13 @@ func (d *DragonReturnStrategy) dragonIdentity(sd *StockData) float64 {
 	if !sd.IsSectorTop2 {
 		return 0
 	}
-	if sd.FirstRisePct < 0.35 || sd.FirstRisePct > 0.70 {
+	if sd.FirstRisePct < drFirstRiseMin || sd.FirstRisePct > drFirstRiseMax {
 		return 0
 	}
-	if sd.SectorRPS20 < 75 {
+	if sd.SectorRPS20 < drSectorRPSMin {
 		return 0
 	}
-	return 25
+	return drScoreDragon
 }
 
 // pullbackHealth 回调健康度评分（权重 30%，满分 21~30）。
@@ -334,44 +418,44 @@ func (d *DragonReturnStrategy) dragonIdentity(sd *StockData) float64 {
 func (d *DragonReturnStrategy) pullbackHealth(sd *StockData) float64 {
 	score := 0.0
 	pct := sd.PullbackPct
-	if pct >= 0.15 && pct < 0.20 {
-		score += 8
-	} else if pct >= 0.20 && pct < 0.25 {
-		score += 6
-	} else if pct >= 0.10 && pct < 0.15 {
-		score += 5
-	} else if pct >= 0.25 && pct < 0.35 {
-		score += 4
+	if pct >= drPBBestLo && pct < drPBBestHi {
+		score += drPBScoreBest
+	} else if pct >= drPBBestHi && pct < drPBGoodsHi {
+		score += drPBScoreGood
+	} else if pct >= drPBShallowLo && pct < drPBBestLo {
+		score += drPBScoreShallow
+	} else if pct >= drPBGoodsHi && pct < drPBDeepHi {
+		score += drPBScoreDeep
 	} else {
-		score += 1
+		score += drPBScoreOther
 	}
 
 	// 回调时长维度：5~8 个交易日最理想（洗盘充分又不拖沓）给满分 5，
 	// 3~4 天嫌短、9~12 天动能已在磨底中流失，各给 3 分，其余时长只拿 1 分底分。
 	days := sd.PullbackDays
-	if days >= 5 && days <= 8 {
-		score += 5
-	} else if days >= 3 && days < 5 {
-		score += 3
-	} else if days > 8 && days <= 12 {
-		score += 3
+	if days >= drDaysGoodLo && days <= drDaysGoodHi {
+		score += drDaysScoreGood
+	} else if days >= drDaysShortLo && days < drDaysGoodLo {
+		score += drDaysScoreNear
+	} else if days > drDaysGoodHi && days <= drDaysLongHi {
+		score += drDaysScoreNear
 	} else {
-		score += 1
+		score += drDaysScoreOther
 	}
 
 	// 缩量维度：回调期量比越低说明抛压越轻（<0.3 拿满 8 分），
 	// 逐级递减到 ≥0.6 只给 1 分——放量回调意味着筹码松动，不是健康洗盘。
 	vr := sd.VolumeRatio
-	if vr < 0.3 {
-		score += 8
-	} else if vr < 0.4 {
-		score += 7
-	} else if vr < 0.5 {
-		score += 5
-	} else if vr < 0.6 {
-		score += 3
+	if vr < drVrGood {
+		score += drVrScoreGood
+	} else if vr < drVrOk {
+		score += drVrScoreOk
+	} else if vr < drVrMid {
+		score += drVrScoreMid
+	} else if vr < drVrBad {
+		score += drVrScoreBad
 	} else {
-		score += 1
+		score += drVrScoreOther
 	}
 
 	return score
@@ -406,23 +490,26 @@ func (d *DragonReturnStrategy) duckHead(sd *StockData) float64 {
 	score := 0.0
 
 	// 鸭头顶 (5分): MA5<MA10 且缩量（Duck head (5): MA5<MA10 with volume shrink）
-	if sd.MA5 < sd.MA10 && sd.VolumeRatio < 0.5 {
-		score += 5
+	if sd.MA5 < sd.MA10 && sd.VolumeRatio < drShrinkMax {
+		score += drDuckTopFull
 	} else if sd.MA5 < sd.MA10 {
-		score += 2
+		score += drDuckTopHalf
 	}
 
 	// 鸭颈部 (8分): 股价在 MA20 附近获得支撑（Duck neck (8): price supported near MA20）
-	if sd.MA20 > 0 && sd.MA5 < sd.MA20 && sd.CurrentPrice >= sd.MA20*0.98 {
-		ma10Slope := (sd.MA10 - sd.MA10*0.99) / (sd.MA10 * 0.01)
+	if sd.MA20 > 0 && sd.MA5 < sd.MA20 && sd.CurrentPrice >= sd.MA20*drNeckSupportRatio {
+		// 这条"斜率"式子在 Go 里恒等于 1（分子 MA10−MA10×0.99 = MA10×0.01，分母同为 MA10×0.01），
+		// 也就是说 0.5 的门槛永远过。载体是**照搬含这个退化形状**移植的（不是修好它）：
+		// 单边改成真斜率会让两边在同一轮里给出不同的分，而这条线现在是影子对照的基准。
+		ma10Slope := (sd.MA10 - sd.MA10*drSlopePrevRatio) / (sd.MA10 * drSlopeDeltaRatio)
 		if sd.MA10 > sd.MA5 {
-			score += 8
+			score += drDuckNeckFull
 		} else {
-			score += 5
+			score += drDuckNeckLow
 		}
 		// MA10 斜率加分：斜率 > 0.5 额外加 2 分（MA10 slope bonus: slope > 0.5 adds 2 points）
-		if ma10Slope > 0.5 {
-			score += 2
+		if ma10Slope > drSlopeMin {
+			score += drDuckSlopeBonus
 		}
 	}
 
@@ -431,28 +518,28 @@ func (d *DragonReturnStrategy) duckHead(sd *StockData) float64 {
 	if sd.MA5 > sd.MA10 {
 		duckBeakScore++
 	}
-	if sd.MACDGreen < 0 && sd.MACDGreen > -1 {
+	if sd.MACDGreen < 0 && sd.MACDGreen > -drMacdGreenNear {
 		duckBeakScore++
 	} else if sd.MACDGreen > 0 {
 		duckBeakScore++
 	}
-	if sd.VolumeRatio > 0.5 && sd.VolumeRatio < 1.2 {
+	if sd.VolumeRatio > drBeakVrLo && sd.VolumeRatio < drBeakVrHi {
 		duckBeakScore++
 	}
 	switch duckBeakScore {
 	case 3:
-		score += 7
+		score += drBeakScoreThree
 	case 2:
-		score += 4
+		score += drBeakScoreTwo
 	case 1:
-		score += 2
+		score += drBeakScoreOne
 	}
 
 	// 鸭鼻孔 (5分): 均线粘合区（Duck nostril (5): MA squeeze zone）
 	if sd.MA5 < sd.MA10 && sd.MA5 > sd.MA20 {
-		score += 5
-	} else if sd.MA5 <= sd.MA20 && sd.MA5 > sd.MA20*0.98 {
-		score += 3
+		score += drNostrilFull
+	} else if sd.MA5 <= sd.MA20 && sd.MA5 > sd.MA20*drNeckSupportRatio {
+		score += drNostrilHalf
 	}
 
 	return score
@@ -477,20 +564,20 @@ func (d *DragonReturnStrategy) confirmSignal(sd *StockData) float64 {
 	score := 0.0
 
 	// 量能确认 (7分)（Volume confirmation, 7 points）
-	if sd.VolumeRatio >= 1.2 && sd.VolumeRatio <= 1.5 {
-		score += 7
-	} else if sd.VolumeRatio > 0.8 && sd.VolumeRatio < 1.2 {
-		score += 3
+	if sd.VolumeRatio >= drConfirmVrLo && sd.VolumeRatio <= drConfirmVrHi {
+		score += drConfirmVolFull
+	} else if sd.VolumeRatio > drConfirmVrMidLo && sd.VolumeRatio < drConfirmVrLo {
+		score += drConfirmVolMid
 	}
 
 	// K线形态用当前价相对于均线的位置近似 (7分)（K-line confirm approximated by price vs. MA position, 7 points）
-	if sd.CurrentPrice > sd.MA5 && sd.CurrentPrice > sd.MA5*1.03 {
-		score += 5
+	if sd.CurrentPrice > sd.MA5 && sd.CurrentPrice > sd.MA5*drKHoldRatio {
+		score += drKScoreHold
 		if sd.CurrentPrice > sd.MA5 && sd.CurrentPrice > sd.MA10 {
-			score += 2
+			score += drKScoreCross
 		}
-	} else if sd.CurrentPrice >= sd.MA5*0.98 && sd.CurrentPrice <= sd.MA5 {
-		score += 2
+	} else if sd.CurrentPrice >= sd.MA5*drKNearLoRatio && sd.CurrentPrice <= sd.MA5 {
+		score += drKScoreNear
 	}
 
 	return score
@@ -519,13 +606,13 @@ func (d *DragonReturnStrategy) GenerateSignal(code string, eval *strategy.Evalua
 	// 总分分档同时决定动作与优先级：≥85 → P1、≥75 → P2、≥60 → P3_5，三档都转买入；
 	// 60 以下在上面的 Pass 闸已被拦掉，这里不会再产出弱信号抢占仓位额度。
 	total := eval.TotalScore
-	if total >= 85 {
+	if total >= drLevelAccelerate {
 		action = strategy.ActionBuy
 		priority = strategy.P1
-	} else if total >= 75 {
+	} else if total >= drLevelMain {
 		action = strategy.ActionBuy
 		priority = strategy.P2
-	} else if total >= 60 {
+	} else if total >= drLevelFirst {
 		action = strategy.ActionBuy
 		priority = strategy.P3_5
 	}

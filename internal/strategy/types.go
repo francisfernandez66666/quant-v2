@@ -34,6 +34,28 @@ const (
 	SignalMomentum     SignalType = "momentum"       // 动量（量价齐升观察/买入，§动量入模拟盘）
 )
 
+// ScoreScale 战法评分的**分值域刻度**（0~100）：权重×此值＝该维的分，总分也以此封顶，
+// 置信度＝总分/此值。载体侧对应的参数名是 `pct_scale`（rules_ladder 两条腿都读它）。
+//
+// 为什么放这里而不是各战法自己写 100：这个数不是某一维的阈值，而是**所有分的公共尺度**——
+// 各包以前各写一遍字面量，载体侧却要一个键（pct_scale），于是一枚数有两处主人；
+// 谁改自己那一处，另一处不会跟着动，两条腿就在同一轮里用不同的尺度归一同一批分。
+// 现在 dragon / double_bump 的评分腿都转调这一枚（其余战法沿用各自的内联尺度属既有形态，
+// 本批不动它们——动它们要一并重算其阈值用例，超出"把没主人的旋钮找到主人"的范围）。
+// English: the shared 0-100 score scale; the carrier reads it as pct_scale, so it must have
+// exactly one owner instead of one literal per tactic package.
+const ScoreScale = 100.0
+
+// ScoreMinBars 因子/形态两条发现类战法共同的**最少日K根数**门槛：不足这个数，
+// 均线族与分位数都算不出来，评分腿一律按 nodata 返回（factor.go / pattern.go 同一条线）。
+//
+// 为什么也放这里：载体侧只有一枚 `min_bars`（rules_factor 的两条规则共用），而 Go 是两处
+// 各写一个 30 的字面量——一处理解成"因子战法要 30 根"、另一处改成交 25，载体那枚键就同时
+// 是 25 和 30。收敛成一枚之后，两个包读的是同一个门槛，改一次两边一起动。
+// English: the minimum daily-bar count both the factor and pattern tactics require; the carrier
+// has a single min_bars knob, so the two packages must share one owner for it.
+const ScoreMinBars = 30
+
 // TradeAction 交易动作类型。（TradeAction is a trade action type.）
 type TradeAction string
 

@@ -210,6 +210,107 @@ class TestBuilderGatesBite(BuilderFixture):
 # (2) a failing build leaves no half-written artifact
 # ---------------------------------------------------------------------------
 
+class TestRuleKnobGate(BuilderFixture):
+    """g9 -- every knob a ported module DECLARES must be present in the baked PARAMS.
+
+    这道闸存在的全部理由是一个已经发生过的形态：11-04 把 rules_form.py 的规则代码内联进
+    两个载体，八道闸全绿、装载自证也绿（模块注册成功了），而它按 params["bd_min_bars"]
+    读的 102 枚阈值**在参数文件里一枚都不存在**——第一轮真的调用规则就 raise KeyError。
+    "模块到没到"与"它读的数有没有主人"是两件事，前者从来没人验过。
+
+    判据取模块自己声明的那张表（FORM_PARAM_KEYS 等），不是这里再列一份清单：
+    再列一份就是第二本账，而第二本账正是这条闸要消灭的东西。
+    """
+
+    def _injected(self, params=None):
+        params = self.params if params is None else params
+        return builder.inject_pported(builder.bake(self.source, params, self.version), params)
+
+    def _module_source(self, name):
+        with open(os.path.join(REPO, "qmt_gateway", name + ".py"), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_declared_knobs_are_read_from_the_module_itself(self):
+        """台账由模块自己报：rules_form 声明什么，构建器就读到什么（不多不少）。"""
+        import rules_form
+        keys = builder.ported_param_keys(self._module_source("rules_form"), "rules_form")
+        self.assertEqual(keys, sorted(set(rules_form.FORM_PARAM_KEYS)),
+                         "构建器读到的旋钮清单与模块声明的不一致（声明方式改了？）")
+        self.assertIn("bd_min_bars", keys)
+        # 兜底表那一形（SIZING_PARAM_KEYS = sorted(SIZING_DEFAULTS)）也必须认得，
+        # 否则那个模块会"没有声明"，闸门对它是瞎的。
+        sizing = builder.ported_param_keys(self._module_source("rules_sizing"), "rules_sizing")
+        self.assertTrue(sizing, "rules_sizing 的声明读不出来：那道模块的旋钮从此没人管")
+
+    def test_a_declaration_the_builder_cannot_read_is_not_skipped(self):
+        """读不出清单的模块必须炸，而不是"当它没有旋钮"混过去。"""
+        with self.assertRaises(ValueError):
+            builder.ported_param_keys('RULES = {}\nMY_PARAM_KEYS = compute(1)\n', "rules_ghost")
+
+    def test_rules_form_knobs_are_all_baked(self):
+        """rules_form 声明的每一枚都必须在烘好的 PARAMS 里（本批交付的那一半）。"""
+        _ok, detail = builder.gate_ported_rule_knobs(self._injected())
+        form_missing = [token for token in str(detail).split(",")
+                        if token.startswith("rules_form:")]
+        self.assertEqual(form_missing, [], "rules_form 有声明了却没主人的旋钮：%s" % form_missing[:10])
+
+    def test_a_missing_knob_fires_the_gate_and_names_it(self):
+        """反证：往台账里加一枚 PARAMS 没有的键，闸必须红并**点名**是哪一枚。"""
+        artifact = (self._injected() +
+                    '\n_PORTED_KNOBS = {"rules_form": ["knob_nobody_baked_it"]}\n')
+        ok, detail = builder.gate_ported_rule_knobs(artifact)
+        self.assertFalse(ok)
+        self.assertIn("knob_nobody_baked_it", detail)
+        self.assertIn("rules_form", detail)
+
+    def test_a_missing_ledger_is_itself_a_failure(self):
+        """没有台账＝没验过，不是"通过"。（g7 的装载自证同取向：不报"没跑"当"跑了没问题"。）"""
+        ok, detail = builder.gate_ported_rule_knobs(self.artifact)
+        self.assertFalse(ok)
+        self.assertIn("knob_table_absent", detail)
+
+    def test_the_build_aborts_under_its_own_reason(self):
+        """端到端：参数文件里少一枚阈值 ⇒ ABORT reason=rule_knobs_missing 且不留半份产物。
+
+        用 sandbox 目标跑真构建器（executor 目标会先撞上漂移闸——改了 params 副本
+        就与仓内烘好的副本不一致，那是另一道闸的正确行为，不该在这里混判）。
+        """
+        params = dict(self.params)
+        params.pop("bd_min_bars", None)
+        path = os.path.join(self.tmp.name, "knobs.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(__import__("json").dumps({"strategy_version": self.version,
+                                               "params": params}))
+        out_dir = os.path.join(self.tmp.name, "knob-out")
+        proc = subprocess.run([sys.executable, BUILDER, "--target", "sandbox",
+                               "--params", path, "--out-dir", out_dir],
+                              cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        text = proc.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(proc.returncode, 0, text[-600:])
+        self.assertIn("BUILD_RESULT=ABORT reason=rule_knobs_missing", text)
+        self.assertIn("rules_form:bd_min_bars", text)
+        self.assertFalse(os.path.isdir(out_dir) and os.listdir(out_dir),
+                         "拒建却把产物留在盘上：下一轮部署会把它当好文件捡起来")
+
+
+# ---------------------------------------------------------------------------
+# (2b) the knob gate is part of both carriers' published gate set
+# ---------------------------------------------------------------------------
+
+class TestKnobGateIsRegistered(unittest.TestCase):
+    """闸定义了但没接进任何一条构建路径＝没有闸（§173 反证同族：恒绿的锁不算锁）。"""
+
+    def test_both_targets_run_the_knob_gate(self):
+        source = open(BUILDER, "r", encoding="utf-8").read()
+        self.assertIn('("g9_rule_knobs_baked", gate_ported_rule_knobs', source)
+        self.assertEqual(source.count("g9_rule_knobs_baked"), 2,
+                         "g9 应当既在闸清单里、又在中止原因的分支里——少一处就是它不咬人")
+
+
+# ---------------------------------------------------------------------------
+# (2c) a failing build leaves no half-written artifact
+# ---------------------------------------------------------------------------
+
 class TestBuilderLeavesNoHalfProduct(BuilderFixture):
     """A stale artifact on disk is worse than no artifact: the next
     deploy picks it up happily."""
@@ -269,10 +370,15 @@ class TestBuilderLeavesNoHalfProduct(BuilderFixture):
         # 它之所以必须存在：源文件解析正常、六道静态闸全绿，烘出来的产物却在装载时
         # NameError（内联块里的注册循环排在它调用的函数定义之前）。一个装不起来的载体
         # 不是"算错"，是"什么都不说"——那正是本仓说过的"声称已做"形状。
+        # 闸数从 7 到 8：再加 g9_rule_knobs_baked（移植规则声明的每枚旋钮都必须烘进 PARAMS）。
+        # 11-04 的实际形态就是"模块到了、注册成功、七道闸全绿，而它读的 102 枚阈值一枚都没有"，
+        # 装载自证看不见这件事——只有第一轮真的调用规则才 raise KeyError。
         # 数量之外还按名字断言，摘掉任意一道闸都会红，而不是只红在计数上。
-        self.assertIn("BUILD_GATES gates=7 all_passed=1", out)
+        self.assertIn("BUILD_GATES gates=8 all_passed=1", out)
         self.assertTrue(hasattr(builder, "gate_executor_loads"),
                         "executor load gate removed: a non-importable artifact would pass again")
+        self.assertTrue(hasattr(builder, "gate_ported_rule_knobs"),
+                        "knob gate removed: a rule whose thresholds were never baked would pass again")
         names = os.listdir(self.out)
         self.assertEqual(len(names), 1)
         artifact = os.path.join(self.out, names[0])

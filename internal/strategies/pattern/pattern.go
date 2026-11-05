@@ -163,7 +163,7 @@ func (s *PatternStrategy) Evaluate(code string, data interface{}) (*strategy.Eva
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "nodata", Details: map[string]float64{}}, nil
 	}
 	md, ok := data.(*strategy_engine.StockMarketData)
-	if !ok || md == nil || len(md.KLines) < 30 {
+	if !ok || md == nil || len(md.KLines) < strategy.ScoreMinBars {
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "nodata",
 			Details: map[string]float64{}, Reasons: map[string]string{"pattern": "K线不足30根"}}, nil
 	}

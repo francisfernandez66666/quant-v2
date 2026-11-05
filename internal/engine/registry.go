@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -570,6 +571,96 @@ func (r *Registry) allPaperHeldCodes() []string {
 	return out
 }
 
+// newsHitCodes §NEWS-TIER：某账号"新闻分级命中集"的取数（持仓 = 实盘 ∪ 纸面多头 ∪ 融券空头；
+// 自选 = 该账号自选表）。三条口径写死在这里，防止日后被人"顺手放宽"成账目串味：
+//   - 实盘只认真实归属行（p.UserID==uid）；遗留全局行（user_id=<空串>）按既有口径只归
+//     运营账号（与 §P1 资金读取的 legacyCashGlobal 同源判定）——把它铺进朋友的命中集，
+//     表现为运营的持仓爆雷新闻打到朋友手机，是 uid 归属口径的倒置；
+//   - 纸面走 GetPaper(uid)（懒加载幂等，与该账号运行时用的是同一台引擎）；
+//   - 代码统一剥市场后缀（实盘账本存 "600519.SH"，分级器的命中索引只认 6 位裸码）。
+//
+// English: per-account news-hit provider — live book (strict ownership; legacy global rows
+// belong to the operator only, same rule as legacyCashGlobal), paper longs/shorts, watchlist;
+// ts-code suffixes stripped because the dispatcher indexes bare 6-digit codes.
+func (r *Registry) newsHitCodes(uid string) (holdings, watch []string) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return nil, nil
+	}
+	r.mu.Lock()
+	realDB := r.opts.RealStore
+	wl := r.opts.WlMgr
+	cfgMgr := r.opts.CfgMgr
+	r.mu.Unlock()
+	if realDB != nil {
+		operator := cfgMgr != nil && uid == cfgMgr.OperatorID()
+		if ps, err := realDB.RealPositionsForUser(uid); err == nil {
+			for _, p := range ps {
+				if p.UserID == uid {
+					holdings = append(holdings, p.TsCode)
+					continue
+				}
+				// 遗留全局行只进运营账号的命中集（上面注释的三条口径之一）
+				// English: legacy empty-owner rows count for the operator only.
+				if p.UserID == "" && operator {
+					holdings = append(holdings, p.TsCode)
+				}
+			}
+		} else {
+			// 读不到不等于没有持仓：如实打一行（分级器会按"未命中"走保守档，
+			// 但日志里必须留下"这一轮是按不完整的命中集算的"）。
+			// English: a failed read is logged, not silently treated as an empty book.
+			log.Printf("[registry] §NEWS-TIER 实盘持仓读取失败 uid=%s（本轮按不含实盘的命中集算）: %v", uid, err)
+		}
+	}
+	if pe := r.GetPaper(uid); pe != nil {
+		for _, p := range pe.Positions() {
+			holdings = append(holdings, p.Code)
+		}
+		for _, s := range pe.ShortPositions() {
+			holdings = append(holdings, s.Code)
+		}
+	}
+	if wl != nil {
+		watch = append(watch, wl.List(uid)...)
+	}
+	return holdings, watch
+}
+
+// NewsTierStatusMaps §NEWS-TIER（生产接线批）：全注册表的新闻分级读数聚合（只读观测面）。
+// 为什么走"通用 map"而不是 []engine.NewsTierReadout：依赖方向是 engine→server，
+// server 不能 import engine（否则成环），既有 EngineRegistry 接口同款取向（GetController
+// 返回的是 server 侧接口）。序列化用 json 往返而不是手抄字段：加字段时读面自动跟上，
+// 不会出现"结构体有、读面没有"的第二次孤儿腿。
+// 同一 uid 只会属于一台核（registerUser 单值映射），跨核直接拼接不查重；为空数组
+// 表示"引擎建了但还没跑过任何新闻轮"——与某账号 constructed=false+skip_reason 的
+// "跑过但被跳过"是两行不同读数（"没分级"永远不许被读成"没新闻"）。
+// English: process-wide news-tier readout aggregation for /api/usage, serialized as generic
+// maps because server cannot import engine (dependency direction engine→server).
+func (r *Registry) NewsTierStatusMaps() []map[string]interface{} {
+	out := make([]map[string]interface{}, 0)
+	for _, e := range r.All() {
+		if e == nil {
+			continue
+		}
+		for _, ro := range e.NewsTierStatus() {
+			b, err := json.Marshal(ro)
+			if err != nil {
+				// 序列化失败也要留痕：静默丢一条就是"读数少了但没人知道"的形状。
+				log.Printf("[registry] §NEWS-TIER 分级读数序列化失败 uid=%q: %v", ro.UID, err)
+				continue
+			}
+			var m map[string]interface{}
+			if err := json.Unmarshal(b, &m); err != nil {
+				log.Printf("[registry] §NEWS-TIER 分级读数转 map 失败 uid=%q: %v", ro.UID, err)
+				continue
+			}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // worstFriendLegState §FRIEND-LEG（2026-11-02）：全账号远端执行腿的**最坏档**（max）。
 // 为什么必须在注册表算而不是各引擎各喂一次：metrics.SetGauge 没有标签，`friend_leg_state`
 // 在整个进程里只有一个数；打分循环是每个引擎各跑一轮，各写各的就会后写盖先写——
@@ -1006,6 +1097,14 @@ func (r *Registry) build(userID string) *Engine {
 	e.SetScanner(opts.Scanner)
 	e.SetFetcher(opts.Fetcher)
 	e.SetNotifier(opts.Notifier)
+	// §NEWS-TIER（新闻分级出站生产接线）：注入"这一账号的持仓+自选"只读回调——
+	// 命中集必须按账号取（朋友的持仓命中利空打到朋友手机，运营的不打到朋友手机，
+	// 反之亦然），而注册表才是账本全集的持有者（纸面/实盘/自选都在这里），与
+	// allPaperHeldCodes 同一装配形状。身份口径只认注册表在册账号（memberIDs 来自
+	// registerUser），永不读请求体（§TOKEN-PERAACCT / §安全 T1 同族）。
+	// English: inject the per-account holdings/watchlist provider for the news tier dispatcher;
+	// attribution identity comes from the registry's booked accounts only (§TOKEN-PERAACCT).
+	e.SetNewsHitProvider(r.newsHitCodes)
 	e.SetEmotionConfig(&opts.CfgMgr.Get().Emotion) // §0925EVE-D1：字段裸读改加锁访问器
 	if opts.SectorTopN > 0 {
 		e.SetSectorConstituentTopN(opts.SectorTopN)

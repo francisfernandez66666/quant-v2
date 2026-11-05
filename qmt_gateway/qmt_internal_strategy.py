@@ -82,6 +82,11 @@ TERMINAL_STATUSES = ()
 # that silently runs with half its rules is worse than one that fails to load).
 _PORTED_RULES = {}
 _PORTED_INLINE = {}
+# Knob ledger (module -> params keys that module declares it reads), baked by the
+# builder from each module's own *_PARAM_KEYS list. The build refuses to publish
+# while a declared knob has no value in PARAMS: a rule that cannot read its
+# threshold is not "quiet today", it raises on the first call that reaches it.
+_PORTED_KNOBS = {}
 # ==== PORTED RULES END ====
 
 
@@ -439,6 +444,80 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     }
 
 
+def _account_total_asset():
+    """Total assets from the ACCOUNT table, or None when the counter will not say.
+
+    Only the balance field is trusted; cash comes from _cash(). None is propagated
+    on purpose: the sizing chain reads a missing total as "this cap does not
+    participate", and the blind-spot cap then tightens the target -- the opposite
+    of inventing an equity number and sizing a real order from it.
+    """
+    raw = _counter_rows("ACCOUNT")
+    if raw is None:
+        return None
+    for item in raw:
+        total = _pick(getattr(item, "m_dBalance", None), getattr(item, "total_asset", None),
+                      getattr(item, "m_dAssureAsset", None))
+        if total is not None:
+            return _to_float(total, 0.0)
+    return None
+
+
+def _sizing_view(ctx, positions):
+    """The account-level view the sizing chain needs on top of the per-symbol ctx.
+
+    Deliberately absent (and the chain abstains on them, which is the point):
+      * sector/cluster buckets -- this box has no sector list and no index weights
+        (G3 readout 11-04: get_sector_list / get_index_weight are not exposed), so
+        the 35%/35%/40% concentration caps do NOT participate rather than guessing;
+      * market dims (emotion phase, breadth, index change) -- not computable from a
+        two-code universe; they land the round in the blind spot, which caps the
+        target at missing_key_target_cap and stops T. That is the designed
+        consequence of "no external data inside the sandbox", not a bug to hide.
+    """
+    out = dict(ctx or {})
+    out["total_asset"] = _account_total_asset()
+    live = []
+    for symbol, row in (positions or {}).items():
+        entry = {"qty": (row or {}).get("qty")}
+        price = (row or {}).get("cost")
+        if symbol == out.get("symbol"):
+            # Only the symbol we actually have a tick for gets a market price;
+            # the rest keep cost as the declared basis, and the chain declines the
+            # target cap if even that is unreadable (understating room is allowed,
+            # overstating it is what the Go side pinned as a defect).
+            price = out.get("last_price") or price
+        entry["price"] = price
+        live.append(entry)
+    out["positions_live"] = live
+    return out
+
+
+def sizing_cap(ctx, positions):
+    """Cap one buy order with the dynamic-sizing chain. Returns (amount, reason, note).
+
+    amount None means "send nothing", never "no limit" -- that is buy_size_amount's
+    own contract and the reason this leg can be trusted to fail closed.
+    sizing_enabled=false is the legacy escape hatch (the Go side has the same
+    master switch; this box never invents its own default).
+    """
+    if not bool(PARAMS.get("sizing_enabled", False)):
+        return None, "sizing_disabled", ""
+    sized = _sizing_view(ctx, positions)
+    amount = buy_size_amount(PARAMS, sized)
+    if amount is None:
+        return None, "sizing_amount_unavailable", ""
+    caps = buy_size_caps(PARAMS, sized)
+    binding = sorted([k for k, v in caps.items() if v is not None],
+                     key=lambda k: caps[k])[:1]
+    note = ""
+    try:
+        note = "%s=%.0f" % (binding[0], float(caps[binding[0]])) if binding else ""
+    except Exception:  # noqa: BLE001 - the note is diagnostics, never a decision
+        note = ""
+    return amount, "", note
+
+
 def _place(ContextInfo, signal):
     """One passorder attempt ladder. Returns (ok, reason).
 
@@ -620,6 +699,30 @@ def run_round(ContextInfo, moment):
                 if blocked:
                     summary["skipped"].append({"short": short, "reason": "money_cap"})
                     continue
+                # DYN-SIZE-IN-SANDBOX (owner 11-04: the dynamic position model must run
+                # inside QMT today). The chain is ANDed with the caps above, never a
+                # replacement for them: the sizing cap can only make this order smaller.
+                sized_amount, why, note = sizing_cap(ctx, positions)
+                if sized_amount is None:
+                    summary["skipped"].append({"short": short, "reason": why})
+                    continue
+                if sized_amount < signal.get("amount", 0.0):
+                    price = signal.get("price") or ctx.get("last_price")
+                    lot = float(PARAMS.get("lot_size") or 0.0)
+                    if not price or lot <= 0.0:
+                        # Cannot re-cut the share count without a price and a lot size:
+                        # sending the ORIGINAL amount would silently trade around the cap.
+                        summary["skipped"].append({"short": short, "reason": "sizing_no_price"})
+                        continue
+                    qty = int(sized_amount / price / lot) * int(lot)
+                    if qty <= 0:
+                        summary["skipped"].append({"short": short, "reason": "sizing_below_lot"})
+                        continue
+                    signal = dict(signal)
+                    signal["qty"] = qty
+                    signal["amount"] = round(qty * price, 2)
+                    summary.setdefault("sized", []).append(
+                        {"short": short, "qty": qty, "amount": signal["amount"], "cap": note})
             ok, why = _place(ContextInfo, signal)
             if ok:
                 sent.add(short)

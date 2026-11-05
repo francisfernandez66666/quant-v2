@@ -243,6 +243,18 @@ type Engine struct {
 	hotRecords      []data.HotRecord // 当日热点板块轮次记录（固化到磁盘）
 	hotRecPath      string           // 热点板块记录持久化文件路径
 
+	// ── §NEWS-TIER（新闻分级出站生产接线，判据与理由全在 news_notify.go 文件头）──
+	// 每个账号一台 Dispatcher：**当日账（预算/冷却/去重/折叠计数）按 uid 独立**，
+	// 一个账号的预算绝不许把另一个账号的必推噤声（账目规则，不是体验优化）。
+	// 独立锁 newsDispMu：装配回调会进注册表/纸面引擎的锁，不把引擎主锁压在别人家锁下面。
+	// English: per-account news dispatchers with independent day ledgers; own mutex so the
+	// registry-backed hit provider never nests the engine lock inside other locks.
+	newsDisps       map[string]newsDispEntry                    // uid → 在册分级器（懒建，日切/命中集变化重建）
+	newsD1Snaps     map[string]newsD1Snap                       // uid → 上轮 D1 读数快照（跨档 diff 基准，按交易日 keyed）
+	newsTierReadout map[string]NewsTierReadout                  // uid → 最近一轮分级读数（含"跳过+原因"态）
+	newsHitProvider func(uid string) (holdings, watch []string) // registry 注入的按账号持仓/自选只读回调
+	newsDispMu      sync.Mutex                                  // 上面四本的锁（与 e.mu 分家）
+
 	sectorEventTimes map[string]time.Time         // 板块事件时间戳（重复事件衰减状态）
 	emotionCfg       *config.EmotionConfig        // 情绪周期阈值（SSE 广播情绪阶段）
 	sectorConstTopN  int                          // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
@@ -3324,6 +3336,11 @@ func (e *Engine) SetNewsShowAll(v bool) {
 	} else {
 		na.SetMinScore(0.25)
 	}
+	// §NEWS-TIER：这把尺子的热更必须同时落到出站侧（分级器阈值下探以 Agent.MinScore 为基准），
+	// 否则"显示全部"打开后读面全收、出站仍按旧档挡消息——同一参数漂出两把尺子。
+	// English: hot-reload the ruler onto the dispatchers too, so the read side and the send
+	// side can never drift apart (§NEWS-TIER in news_notify.go).
+	e.syncNewsTierMinScore(na.MinScore())
 	log.Printf("[engine] 资讯显示全部开关: %v (落盘最低分=%v)", v, na.MinScore())
 }
 
@@ -4152,6 +4169,11 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 
 	if len(out.rawNews) == 0 {
 		log.Printf("[engine] 无新新闻且无待归因新闻 (since=%s), 本轮仅执行打分", since.Format("01-02 15:04"))
+		// §NEWS-TIER：零进料的一轮同样是"新闻轮次"——三源全坏的通道告警（"今天没读到任何新闻"）
+		// 恰恰要在这里出站；跳过它等于把通道故障憋成"今天没有利空"（§5A.3 第 2 条）。
+		// English: a zero-intake round is still a news round — the all-sources-down channel
+		// announcement must fire here, not be swallowed as "no bad news today".
+		e.dispatchNewsTier(out)
 		return out
 	}
 
@@ -4286,6 +4308,11 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	// 用标题匹配把成功者移出 pending（MarkAttributedTitles），失败者由下一轮盘前/盘中重试，
 	// 避免"LLM 慢/失败一次 = 昨夜有价值的新闻永久丢失"。
 	e.markAttributedFromProduce(out, failedNews)
+	// §NEWS-TIER：本轮事件已定稿（含固化回填与 6d 再滤后的 out.valid）、未归因队列也已是本轮终态
+	// ——出站腿在这里跑，每轮恰好一次；它是观测腿，任何失败都不许把流水线带下去。
+	// English: events are final and the unattributed queue settled — the dispatch leg runs
+	// exactly once here; it is observation-only and cannot take the pipeline down.
+	e.dispatchNewsTier(out)
 	// 阶段2(深度分析 LLM)+事件构建总耗时（含聚簇/衰减/验真/传播）
 	out.timing.Stage2 = time.Since(_stepStage2)
 	out.timing.Events = out.timing.Stage2

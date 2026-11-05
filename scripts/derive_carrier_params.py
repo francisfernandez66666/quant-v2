@@ -259,6 +259,184 @@ MAPPING = [
 ]
 
 # ---------------------------------------------------------------------------
+# 做空四战法与派生窗口（§DERIVE-CARRIER-1105）——**同名直搬**的那一批
+#
+# 为什么单独成段而不逐条写进上面那张表：这一批 102 枚键是"Go 键名 == 载体键名"的
+# 恒等映射（rules_form.py 的 FORM_PARAM_KEYS 逐条写着真源在哪个 Go 文件的哪一行，
+# 值现在也真的从那里出来）。它们**只做改名（这里连改名都没有），绝不做算术**：
+# 形态转换的规矩和上面那条一致——工具不许产生任何一个新数字。
+#
+# 为什么必须有真源清单而不是"文件里有什么就搬什么"：这个表列出的每一枚都必须能在
+# Go 的导出读数里找到，找不到就整批判红（go_key_absent_in_output）——
+# 以前正是"没人知道哪些键该有主"让 102 枚阈值在参数文件里凭空消失，
+# 产物里每条移植规则一被调用就 raise KeyError。
+#
+# 真源（全部由 go run ./cmd/derive_carrier_params --provenance 点名）：
+#   internal/strategy/types.go            rule_side 与四枚 *_kind（已是命名常量，只转调）
+#   internal/combat_agent/adapter.go      派生窗口族（ma/vol/high60/low20/gain/last3/容忍/在窗天数）
+#   internal/strategies/break_down        bd_*
+#   internal/strategies/high_churn        hc_*
+#   internal/strategies/leader_decay      ld_*
+#   internal/strategies/good_news_fade    gf_*
+# ---------------------------------------------------------------------------
+BEAR_TACTIC_KEYS = (
+    # --- 方向与信号种类（载体的 RULES 注册表按这三枚对表） ---
+    "rule_side",
+    "break_down_kind", "high_churn_kind", "leader_decay_kind", "good_news_fade_kind",
+    # --- buildShortData 派生窗口（含今日 vs 不含今日，两处口径不同） ---
+    "ma5_window", "ma10_window", "ma20_window",
+    "vol5_window", "vol20_window",
+    "hc_high_window",                     # 60 日高：含今日
+    "bd_low_window", "hc_gain_window", "hc_last3_window",   # 这三族不含今日，导的是根数
+    "ld_seal_tolerance", "ld_touch_tolerance",
+    "gf_event_window_days",
+    # --- break_down ---
+    "bd_min_bars", "bd_depth_max_score", "bd_depth_single_cap", "bd_depth_full_pct",
+    "bd_volume_max_score", "bd_volume_full_ratio", "bd_volume_half_ratio",
+    "bd_volume_shrink_factor", "bd_intraday_max_score", "bd_intraday_severe_pct",
+    "bd_intraday_mid_pct", "bd_intraday_mid_base_score",
+    "bd_intraday_severe_span_pct", "bd_intraday_severe_span_score",
+    "bd_intraday_flat_span_pct", "bd_intraday_flat_span_score",
+    "bd_shadow_add_ratio", "bd_shadow_add_score",
+    "bd_shakeout_depth_pct", "bd_shakeout_discount", "bd_score_threshold",
+    # --- high_churn ---
+    "hc_min_bars", "hc_pos_start", "hc_pos_span", "hc_pos_base_score", "hc_pos_step_score",
+    "hc_position_max_score", "hc_gain_start", "hc_gain_span", "hc_gain_base_score",
+    "hc_gain_step_score", "hc_div_heavy_ratio", "hc_div_stall_pct", "hc_div_full_score",
+    "hc_div_half_score", "hc_shadow_ratio", "hc_shadow_score", "hc_below_ma5_score",
+    "hc_consec_down_days", "hc_consec_down_score", "hc_weakness_max_score",
+    "hc_score_threshold",
+    # --- leader_decay ---
+    "ld_min_bars", "ld_min_boards", "ld_board_max_score", "ld_board_full_boards",
+    "ld_board_base_score", "ld_board_base_boards", "ld_board_span_boards",
+    "ld_board_span_score", "ld_big_loss_ratio", "ld_big_loss_score", "ld_touched_score",
+    "ld_huge_volume_ratio", "ld_huge_volume_score", "ld_weakness_max_score",
+    "ld_sector_drop_ratio", "ld_sector_drop_score", "ld_phase_score",
+    "ld_retreat_phase_keys", "ld_retreat_max_score", "ld_score_threshold",
+    # --- good_news_fade ---
+    "gf_min_bars", "gf_event_fresh_age", "gf_event_stale_age", "gf_event_max_score",
+    "gf_event_min_score", "gf_event_age_span", "gf_event_age_drop",
+    "gf_gain_start", "gf_gain_full", "gf_gain_span", "gf_gain_max_score",
+    "gf_stall_pct", "gf_stall_score", "gf_heavy_ratio", "gf_heavy_score",
+    "gf_below_ma5_score", "gf_shadow_ratio", "gf_shadow_score", "gf_weakness_max_score",
+    "gf_surge_window", "gf_surge_step_pct", "gf_propagation_discount", "gf_score_threshold",
+)
+
+# 恒等映射：Go 键 == 载体键。单独 append 而不是复制粘贴 102 行，是为了让
+# "漏了一枚"这件事在 --check 里以 orphan 的形式点名，而不是靠人对着表数。
+MAPPING.extend([(key, (key,), None) for key in BEAR_TACTIC_KEYS])
+
+# ---------------------------------------------------------------------------
+# 做多四腿（rules_ladder）与因子/形态腿（rules_factor）的旋钮（§DERIVE-CARRIER-1106）
+#
+# rules_ladder 那 115 枚里有三种形状，分开处理：
+#   1. **同名直搬**（db_* / dragon_* / dr_* 的全部，加 pct_scale）：Go 键名 == 载体键名。
+#   2. **换名字**（ld_* 那一族 14 枚）：同一个 Go 常量在两条移植腿上叫不同名字——
+#      rules_form 按 `ld_board_max_score` 读，rules_ladder 按 `ld_board_score_full` 读
+#      （一个是断板因子分，一个是断板高度满分档，Go 里都是 ldBoardMaxScore 那一枚）。
+#      换名发生在**这张映射表**里，不在 py 模块里再写一份数，也不在 Go 侧加第二枚常量。
+#      一枚 Go 键供两个载体键时 transform 必须返回同值元组——两处供给同一枚数正是本工具
+#      判红的形状，所以这里给的是"同一个值的两个名字"，不是两个来源。
+#   3. **不属于战法常量**的两枚：`pct_scale` 是所有战法共用的分值域刻度（Go 侧新命名的
+#      strategy.ScoreScale，dragon/double_bump 的评分腿都转调它），
+#      `ladder_buy_amount` 则**没有 Go 主人**（Go 的单笔额由仓位引擎按目标仓位算，
+#      没有"每档固定金额"这个量）——它按别名接进载体已有的那枚单笔帽，见 ALIAS。
+#
+# rules_factor 那 14 枚：8 枚有 Go 主人（评分尺度与绝对区间，全部来自
+# internal/strategies/factor 的判据常量），6 枚是**移植侧自己的表**（因子库/规则模板/
+# 覆盖表），由模块自己声明的 PARAMS_TEMPLATE 供给，见 FACTOR_TABLE_KEYS。
+#
+# 真源（全部由 go run ./cmd/derive_carrier_params --provenance 点名）：
+#   internal/strategies/double_bump|dragon|dragon_return  的 derive_carrier.go（战法常量 + 出厂策略表）
+#   internal/strategy/types.go                            ScoreScale / ScoreMinBars / ActionBuy
+#   internal/strategies/factor/factor.go                  评分尺度、兜底档、财务绝对区间
+#   internal/data/{trade_time,limitup_pct}.go             时段边界、板块前缀与 ST 字样
+#   internal/engine/intraday_t_live.go                    行情门档位、被撤字样、底仓保留比、费用缓冲、开盘钟点
+#   internal/store/real_positions.go                      可开 T 的锚点来源清单
+#   internal/tcalib/tcalib.go                             成本安全倍数
+# ---------------------------------------------------------------------------
+LADDER_DIRECT_KEYS = (
+    "pct_scale", "ld_vol_window",
+    # --- double_bump（16） ---
+    "db_min_bars", "db_weak_day_pct", "db_min_change_pct", "db_lookback", "db_first_window",
+    "db_break_ratio", "db_first_vol_multiple", "db_second_vol_multiple", "db_volume_weight",
+    "db_adjust_max_pct", "db_position_weight", "db_ma_short", "db_ma_mid", "db_ma_weight",
+    "db_ma_align_ratio", "db_full_chain_min",
+    # --- dragon（19） ---
+    "dragon_min_bars", "dragon_seal_tolerance_pct", "dragon_f1_weight", "dragon_f1_base_ratio",
+    "dragon_f1_vol_ratio", "dragon_f2_weight", "dragon_f2_full_pct", "dragon_f2_half_pct",
+    "dragon_f2_half_ratio", "dragon_f3_weight", "dragon_f3_premium_pct", "dragon_f3_own_gain_pct",
+    "dragon_f3_half_ratio", "dragon_rs_window", "dragon_f4_weight", "dragon_f4_full_pct",
+    "dragon_f4_half_pct", "dragon_f4_half_ratio", "dragon_full_chain_min",
+    # --- dragon_return（64，含 adapter 派生窗口那五枚：Go 侧同名导出） ---
+    "dr_min_bars", "dr_ma_short", "dr_ma_mid", "dr_ma_long", "dr_rally_window",
+    "dr_first_rise_min", "dr_first_rise_max", "dr_sector_rps_min", "dr_score_dragon",
+    "dr_pb_best_lo", "dr_pb_best_hi", "dr_pb_good_hi", "dr_pb_shallow_lo", "dr_pb_deep_hi",
+    "dr_pb_score_best", "dr_pb_score_good", "dr_pb_score_shallow", "dr_pb_score_deep",
+    "dr_pb_score_other",
+    "dr_days_good_lo", "dr_days_good_hi", "dr_days_short_lo", "dr_days_long_hi",
+    "dr_days_score_good", "dr_days_score_near", "dr_days_score_other",
+    "dr_vr_good", "dr_vr_ok", "dr_vr_mid", "dr_vr_bad",
+    "dr_vr_score_good", "dr_vr_score_ok", "dr_vr_score_mid", "dr_vr_score_bad", "dr_vr_score_other",
+    "dr_shrink_max", "dr_duck_top_full", "dr_duck_top_half", "dr_neck_support_ratio",
+    "dr_duck_neck_full", "dr_duck_neck_low", "dr_slope_prev_ratio", "dr_slope_delta_ratio",
+    "dr_slope_min", "dr_duck_slope_bonus", "dr_macd_green_near",
+    "dr_beak_vr_lo", "dr_beak_vr_hi", "dr_beak_score_three", "dr_beak_score_two", "dr_beak_score_one",
+    "dr_nostril_full", "dr_nostril_half",
+    "dr_confirm_vr_lo", "dr_confirm_vr_hi", "dr_confirm_vol_full", "dr_confirm_vr_mid_lo",
+    "dr_confirm_vol_mid", "dr_k_hold_ratio", "dr_k_score_hold", "dr_k_score_cross",
+    "dr_k_near_lo_ratio", "dr_k_score_near", "dr_level_first",
+)
+
+# 因子/形态腿里**有 Go 主人**的那 8 枚（同名直搬；真源是战法包自己的判据常量）。
+FACTOR_SCORING_KEYS = (
+    "min_bars",
+    "entry_side",
+    "default_buy_threshold",
+    "default_weight",
+    "default_direction",
+    "percentile_min_samples",
+    "score_domain",
+    "financial_bands",
+)
+
+# 做 T 移植腿里**有 Go 主人**的那 11 枚（判据写法，不是配置项；见上面真源清单）。
+T_VOCAB_KEYS = (
+    "t_session_windows", "t_session_open_hhmm",
+    "t_wide_board_prefixes", "t_bse_board_prefixes", "t_st_markers",
+    "t_regime_allow_states", "t_regime_block_states", "t_cancelled_status_tokens",
+    "t_min_remaining_position_pct", "t_fee_buffer_pct", "t_cost_safety_multiplier",
+    "t_anchor_ok_sources",
+)
+
+MAPPING.extend([(key, (key,), None)
+                for key in LADDER_DIRECT_KEYS + FACTOR_SCORING_KEYS + T_VOCAB_KEYS])
+
+# ld_* 那一族的**换名**：同一枚 Go 常量在两条移植腿上叫不同名字。
+# 元组是 (Go 键, ladder 侧的名字)；Go 键自己那一份已经由上面两段供到（rules_form 读的就是它），
+# 这里**只加第二个名字**——一处值、两个键名，不是两处来源。
+# 为什么换名在这张表里而不是把 rules_ladder.py 改成 Go 的名字：那份 py 是已经过用例钉住的
+# 移植产物，它的键名就是它的契约；工具的存在意义正是"契约与真源之间只许有一张改名表"。
+LADDER_RENAMES = (
+    ("ld_board_max_score", "ld_board_score_full"),   # 断板高度满档分（leader_decay.go:146）
+    ("ld_board_base_score", "ld_board_score_base"),  # 起算分（:148）
+    ("ld_board_span_score", "ld_board_score_span"),  # 跨度加分（:148）
+    ("ld_big_loss_ratio", "ld_big_face_ratio"),      # 大面线（:155）
+    ("ld_big_loss_score", "ld_score_big_face"),      # 大面分（:156）
+    ("ld_touched_score", "ld_score_touched"),        # 摸板分（:159）
+    ("ld_huge_volume_score", "ld_score_huge_volume"),  # 天量分（:162）
+    ("ld_weakness_max_score", "ld_weakness_cap"),    # 弱势封顶（:164）
+    ("ld_sector_drop_score", "ld_score_sector_drop"),  # 板块退潮分（:175）
+    ("ld_phase_score", "ld_score_phase"),            # 相位分（:179）
+    ("ld_retreat_max_score", "ld_retreat_cap"),      # 退潮封顶（:182）
+    ("ld_retreat_phase_keys", "ld_retreat_tokens"),  # 退潮字样表（同一个列表，两处读）
+    ("ld_score_threshold", "ld_min_score"),          # 出单门槛（:60）
+)
+MAPPING.extend([(go_key, (ladder_key,), None) for go_key, ladder_key in LADDER_RENAMES])
+
+
+
+# ---------------------------------------------------------------------------
 # 载体自有键（Go 没有真源，登记理由；不登记＝孤儿，判红）
 #
 # 三类理由：
@@ -273,22 +451,17 @@ CARRIER_OWNED = {
     "symbol_head_len": "carrier-shape: 备注里代码前缀长度",
     "t_remark_code_max_len": "carrier-shape: 柜台备注长度上限的载体侧约束",
     "terminal_status_codes": "gateway-python: 真源 qmt_gateway/store.py TERMINAL_STATUSES",
-    "t_terminal_status_codes": "gateway-python: 同上，构建器 counter_status_vocab 烘入",
-    "t_cancelled_status_tokens": "gateway-python: 真源 qmt_gateway/handler.py XT_STATUS_CODES",
+    "t_terminal_status_codes": "gateway-python: 同上一条，T 腿那份按状态字回退比较时读它；"
+                               "值由 GATEWAY_VOCAB_READOUTS 从 store.py 现读现搬，脚本里没有抄过",
     "lot_size": "needs-go-naming: A 股一手=100 在 Go 是内联字面量，无导出读数",
-    "t_stale_order_sec": "needs-go-naming: 撤单未决时限在 Go 无同名导出",
-    "t_session_windows": "carrier-shape: 交易时段由 data.IsActiveSession 判定，无导出时段表",
-    "t_session_open_hhmm": "needs-go-naming: 早盘 09:30 在 Go 是内联分钟数",
+    # t_stale_order_sec 现在是**别名**（指向载体已有的那枚 stale_order_sec，只做改名、不给新数）。
+    "t_stale_order_sec": "carrier-shape: 与 stale_order_sec 同源，T 侧别名（见 ALIAS）",
     "t_no_new_order_windows": "carrier-shape: 与 no_new_order_windows 同源，T 侧别名",
     "t_no_cancel_windows": "carrier-shape: 与 no_cancel_windows 同源，T 侧别名",
-    "t_wide_board_prefixes": "carrier-shape: 板块前缀表只在载体侧使用",
-    "t_bse_board_prefixes": "carrier-shape: 同上",
-    "t_st_markers": "carrier-shape: ST 名称标记",
-    "t_anchor_ok_sources": "carrier-shape: 锚点来源白名单（载体侧记账）",
-    # t_min_base_keep_qty 的旧写法；两条都指向同一个 Go 常量（engine.tLMinBaseKeep）。
-    # 注意 Go 侧那份字段名带 "反 T" 的语义限定，载体侧两条键共用一个数是否成立由 owner 裁。
-    "t_cost_safety_multiplier": "needs-go-naming: 成本安全倍数在 Go 无导出读数",
-    "t_missing_key_input": "carrier-shape: 这是本轮读数不是配置，运行时由 ctx 提供",
+    # 11-06 这批里 t_session_open_hhmm / t_session_windows / 板块前缀 / ST 字样 / 锚点来源 /
+    # 行情门两档 / 被撤字样 / 底仓保留比 / 费用缓冲 / 成本安全倍数 **全部改由 Go 供给**
+    # （判据在 data / engine / store / tcalib 各自的常量上），所以这几枚从这里**删除**——
+    # 一条键既登记"载体自有"又被派生，就是两处供给同一枚数，--check 判红。
     "emotion_enabled": "needs-go-naming: 维度参与开关在 rules.runtime/enhance，非出厂常量",
     "market_state_enabled": "needs-go-naming: 同上",
     "emotion_phase_labels": "carrier-shape: 相位名与 Go 的 emotionPhases 由 --check 交叉验证",
@@ -331,11 +504,55 @@ CARRIER_OWNED = {
     "buy_signals": "carrier-shape: 载体侧参与买法的信号名清单",
     "closed_days": "carrier-shape: 日历兜底表（真源是 Go 产的 trading_calendar.json）",
     "non_trading_weekdays": "carrier-shape: 同上",
-    "t_fee_buffer_pct": "needs-go-naming: paper.t_rounds 的费用缓冲未导出",
-    "t_min_remaining_position_pct": "needs-go-naming: T 侧剩余底仓下限未导出",
-    "t_regime_allow_states": "carrier-shape: 放行档由载体决定",
-    "t_regime_block_states": "carrier-shape: 拦截档由载体决定",
 }
+
+# ---------------------------------------------------------------------------
+# 没有 Go 主人的三枚旋钮的**登记**（§DERIVE-CARRIER-1106 逐条定过主人，不是一笔带过）
+#
+# 为什么单列一段：CARRIER_OWNED 只说"这枚键不算孤儿"，它不产出任何一个值。
+# 而构建闸 g9 判的是"模块声明的每一枚都必须在烘出来的 PARAMS 里"——登记了却没落地，
+# 表现就是产物里那条规则第一次调用就 raise KeyError，正是 11-04 那个形状。
+# 所以"真的没有主人"这件事必须以**值**的形式承认，而且只能用两种值：
+#   ① 从别的模块读来的（下面 GATEWAY_VOCAB_READOUTS：柜台状态词表，真源在网关账本模块）；
+#   ② 让它**一律弃权**的中性形状（空表 / false / 零预算）——这不是"猜一个数"，
+#      而是"没有主人时这条腿不许动钱"，与 rules_t 自己的 fail-closed 取向同源。
+# 三枚的结论逐条写在这里，将来谁给它们找到主人，就把这条删掉、改走 MAPPING：
+#   t_signal_codes          —— 委托备注短码表。Go 侧根本没有这张表（T 腿的幂等键是
+#                              `t0:<码>:<向>:<日>:<序>` 那种长键，不是两字母短码），
+#                              短码是**载体的 idempotency 构造规则**，主人是 owner 的装填动作。
+#                              落空表＝T 腿在载体里不出单（make_signal 无码即 None），
+#                              比替 owner 编五个码诚实。
+#   t_remark_code_max_len   —— 柜台备注长度预算。这是**券商柜台的属性**，仓库里
+#                              Go/网关/文档都没有记过它（只有用例里随手写的 8，那不是读数）。
+#                              落 0＝任何码都超预算＝t_short_code_check 直接拒，
+#                              这条腿在 owner 填上柜台真值之前不许发单。
+#   t_missing_key_input     —— "本轮关键读数缺失"。它在 Go 里是**每轮的 ctx 读数**
+#                              （paper.TParams.MissingKeyInput），不是出厂配置；
+#                              落 false＝烘参那一刻没有缺失的证据，运行期由 ctx 覆盖。
+# ---------------------------------------------------------------------------
+CARRIER_UNOWNED = {
+    "t_signal_codes": ({}, "carrier-shape: 幂等短码表由 owner 装填；空表＝T 腿不出单（fail-closed）"),
+    "t_remark_code_max_len": (0, "counter-property: 柜台备注预算仓库里没记过；0＝任何码都判超长＝拒发"),
+    "t_missing_key_input": (False, "runtime-reading: 每轮读数不是配置；烘参刻按\"没有缺失\"落，运行期由 ctx 覆盖"),
+}
+
+# 柜台状态词表：真源在网关账本模块（构建器烘沙箱产物时读的也是这两个模块，见
+# scripts/build_local_executor.py 的 render_status_vocab —— 同一把尺子，不在这另造一份）。
+# rules_t 在 ctx 的委托行里没有 terminal 布尔时退回按状态字比较，所以它要的就是这份清单。
+GATEWAY_VOCAB_READOUTS = {
+    "t_terminal_status_codes": ("store", "TERMINAL_STATUSES",
+                                 "gateway-python: 真源 qmt_gateway/store.py TERMINAL_STATUSES"),
+}
+
+# 因子/形态腿里那 6 枚**移植侧自己的表**：Go 侧没有对应读数（因子库注册表带的是 Compute 闭包，
+# 没有可导出的窗口/方向元数据；规则模板是 owner 按账号配的样例；proxy 档位是 owner 的显式决定）。
+# 值由模块自己声明的 PARAMS_TEMPLATE 供给——与 rules_sizing 的 SIZING_DEFAULTS 同一条路：
+# 表是模块的一部分，工具只搬不改，绝不在这张表里写任何一个数。
+FACTOR_TABLE_KEYS = (
+    "factor_defs", "factor_rules", "pattern_rules", "factor_thresholds", "scalar_bands",
+    "require_trading_day",
+)
+
 
 # ---------------------------------------------------------------------------
 # 别名与"模块自带声明表"两类补数
@@ -353,6 +570,15 @@ ALIAS = {
     "t_no_new_order_windows": "no_new_order_windows",
     "t_no_cancel_windows": "no_cancel_windows",
     "breadth_missing_default": "breadth_missing_scale",
+    # T 腿的"在途单多久算陈旧"与执行器自己那枚同源（local_executor 的撤单轮用的就是它）。
+    "t_stale_order_sec": "stale_order_sec",
+    # rules_ladder 的每档买入额：**Go 没有这个量**（Go 的单笔额由仓位引擎按目标仓位现算，
+    # 不存在"每档固定金额"这枚出厂默认）。这里不新造一个数，而是把它接到载体已有的那枚
+    # 单笔帽上——两条腿从此共用同一枚帽，改帽只有一处要动。
+    # 为什么这样算诚实而不是敷衍：写一个新数（哪怕"看起来合理"的 20000）等于让工具替策略
+    # 做决定；接现有键则只声明"载体侧这条腿的最大单笔＝那张已有的帽"。owner 若要给它
+    # 单独一枚数，那是**一次显式配置**，届时把这条别名换成 params 里的显式值并登记主人。
+    "ladder_buy_amount": "order_amount_cap",
 }
 
 
@@ -527,6 +753,83 @@ def carrier_rule_keys():
     return sizing_keys, t_keys, rules_sizing.SIZING_DEFAULTS
 
 
+def form_rule_keys():
+    """rules_form 自己声明要读哪些键（与 carrier_rule_keys 同一姿势，单独成函数）。
+
+    为什么不并进 carrier_rule_keys 的返回值：那个三元组有测试按位置解包，
+    把它改成四元组会让"谁在扩模块清单"这件事变成一次跨批冲突。
+    键的**清单**必须由模块自己报——脚本里再列一份就成了第三本账。
+    """
+    sys.path.insert(0, QMT_GATEWAY)
+    import rules_form  # noqa: E402
+    return set(rules_form.FORM_PARAM_KEYS)
+
+
+def ported_module_inventory(params):
+    """逐模块取"它自己声明要读哪些 params"——**清单由构建闸那把尺子量**。
+
+    为什么现在改成这样（2026-11-06）：以前这里手写三份 import（sizing/t/form），
+    而构建闸 g9 判的是 `params["ported_modules"]` 里**每一个**模块自己声明的
+    `*_PARAM_KEYS`。两边各数一遍的结局就是这一批的起因——
+    rules_ladder 与 rules_factor 的 129 枚旋钮在构建闸上报 `rule_knobs_missing`，
+    而 `--check` 那边根本没这两行可看，还照样打 `DERIVE_RESULT=OK`。
+    尺子有两把，绿的那把说的不是同一件事。
+
+    现在：模块清单来自参数文件（与 g9 同一份），键清单来自构建闸同一个解析器
+    （build_local_executor.ported_param_keys，按 AST 读模块自己的声明）。
+    解析不了/模块不在册一律**抛**，不折成"这个模块没有键"。
+    """
+    sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+    import build_local_executor as builder  # noqa: E402  (one ruler for both sides)
+    names = list(params.get("ported_modules") or [])
+    if not names:
+        raise DeriveError("ported_modules_absent_from_params")
+    out = {}
+    for name in names:
+        source = builder.read_pported_module(name)
+        if source is None:
+            raise DeriveError("ported_module_not_on_disk:%s" % name)
+        out[name] = set(builder.ported_param_keys(source, name))
+    return out
+
+
+
+def knob_readout(modules, all_values, derived_keys, params):
+    """逐模块打"它声明的旋钮有多少真的有主"，并把两枚坏数返回给 --check。
+
+    这一行是本批存在的原因：移植规则的**代码**在 11-04 就进了载体，
+    而它读的 102 枚阈值既不在参数文件里、也不在任何兜底表里——产物里每条规则
+    第一次被调用就 raise KeyError，而构建闸只看"模块到没到"，不看"旋钮有没有主人"。
+    现在这件事每模块一行数得出来：declared / 派生 / 登记自有 / 仍在文件里缺。
+
+    返回值 {module: (missing_in_file, no_owner)} 是给 check 用的：**缺数就是红**。
+    为什么这条必须进判据而不只是打印——11-05 那批的实测形态就是
+    "DERIVE_KNOBS ... missing_in_file=17" 打了十七行、最后一行仍是 DERIVE_RESULT=OK，
+    绿的人从来不看上面那几行，而构建闸同一天报 146 枚缺数。两把尺子必须同时红。
+    """
+    gaps = {}
+    for name in sorted(modules):
+        keys = modules[name]
+        derived = sorted(k for k in keys if k in derived_keys)
+        owned = sorted(k for k in keys if k in CARRIER_OWNED and k not in derived)
+        absent = sorted(k for k in keys if k not in params)
+        # 两个数分开看，它们说的是两件不同的事：
+        #   missing_in_file —— 参数文件里还没有这一枚（--write 之后应当归 0）；
+        #   no_owner —— 连 Go 读数与登记都没有。那只能列出来，绝不许挑一个数补上
+        #               （补数＝工具替策略做决定，正是本工具要消灭的那种"没主人的数"）。
+        homeless = sorted(k for k in absent if k not in all_values)
+        print("DERIVE_KNOBS module=%s declared=%d derived=%d owned=%d missing_in_file=%d no_owner=%d"
+              % (name, len(keys), len(derived), len(owned), len(absent), len(homeless)))
+        if absent:
+            # 单条锚点：门禁与人都要能一眼看到"缺的是哪些"，而不是只看到一个数。
+            print("DERIVE_KNOBS_MISSING module=%s keys=%s" % (name, ",".join(absent)))
+        if homeless:
+            print("DERIVE_KNOBS_NO_OWNER module=%s keys=%s" % (name, ",".join(homeless)))
+        gaps[name] = (len(absent), len(homeless))
+    return gaps
+
+
+
 def check_phase_labels(derived, sizing_defaults):
     """相位标签表与 Go 的相位名单交叉验证（这是 emotion_phase_labels 登记理由里承诺的那一步）。
 
@@ -586,12 +889,15 @@ def defaults_table_drift(carrier_values, sizing_defaults):
     return sorted(drift)
 
 
-def resolve_extras(carrier_values, params, sizing_defaults):
+def resolve_extras(carrier_values, params, sizing_defaults, extras=None):
     """把别名与模块自带声明表并进待写表，返回新的值表。
 
     优先级是刻意的：Go 派生值 > 别名 > 模块声明表。三者冲突时取更靠前的那一个，
     并把冲突原样打出来——**不静默覆盖**，因为覆盖意味着"参数文件里的数和它的
     真源不一致"，而那正是这把尺子要消灭的东西。
+
+    `extras` 是第三条腿的三个来源（rules_factor 自己声明的表 / 网关账本的状态词表 /
+    刻意落中性形状的无主键），姿势与 SIZING_DEFAULTS 完全一致：**表长在别人身上，工具只搬**。
     """
     merged = dict(carrier_values)
     for key, src_key in sorted(ALIAS.items()):
@@ -609,20 +915,88 @@ def resolve_extras(carrier_values, params, sizing_defaults):
             continue
         merged[key] = (value, source)
 
-    for key, value in sorted(sizing_defaults.items()):
+    tables = dict((key, (value, "qmt_gateway/rules_sizing.py:SIZING_DEFAULTS"))
+                  for key, value in sizing_defaults.items())
+    for key, pair in (extras or {}).items():
+        if key in tables and _norm(tables[key][0]) != _norm(pair[0]):
+            # 两条来源腿供同一枚键且值不同＝工具内部的双账，当场停，不"取先到的那个"。
+            raise DeriveError("module_table_double_sourced:%s %s vs %s"
+                              % (key, tables[key][1], pair[1]))
+        tables.setdefault(key, pair)
+
+    for key, (value, source) in sorted(tables.items()):
         if key in merged:
             continue
         if key in params:
             if _norm(params[key]) == _norm(value):
+                # 文件里已经有、且与模块声明表**一致**：这条键仍然算"有主人"，必须记进表里。
+                # （以前这里是 continue，于是 --write 落完第二次再跑时，模块声明表供的那几枚
+                # 全部从值表里消失、被 coverage 判成孤儿——同一棵树第二次跑比第一次红，
+                # 而红的原因是"上一次把数写进去了"。这条现在按等值记账，两种姿势都判绿。）
+                merged[key] = (value, source)
                 continue
             # 参数文件里已有、且与模块声明表不一致：以已有值为准并出声（不悄悄改钱闸）。
             print("DERIVE_TABLE_CONFLICT key=%s file=%s table=%s kept=file"
                   % (key, json.dumps(params[key], ensure_ascii=True),
                      json.dumps(value, ensure_ascii=True)))
             continue
-        merged[key] = (value, "qmt_gateway/rules_sizing.py:SIZING_DEFAULTS")
+        merged[key] = (value, source)
 
     return merged
+
+
+def gateway_vocab_values():
+    """从网关账本模块**现读**状态词表（柜台状态这一族真源不在 Go，在网关那本账）。
+
+    为什么在这里 import 而不是把清单抄进脚本：构建器烘沙箱产物时读的就是这两个模块
+    （build_local_executor.render_status_vocab），脚本再抄一份就是第三本账——
+    网关加一个状态词，抄的那份不会跟着动，而载体按旧词表判"这单还活着"。
+    """
+    sys.path.insert(0, QMT_GATEWAY)
+    import store as gateway_store  # noqa: E402  (the ledger's own status vocabulary)
+    modules = {"store": gateway_store}
+    out = {}
+    for key, (module_name, attr, source) in GATEWAY_VOCAB_READOUTS.items():
+        module = modules.get(module_name)
+        if module is None:
+            raise DeriveError("gateway_vocab_module_unknown:%s" % module_name)
+        raw = getattr(module, attr, None)
+        if not raw:
+            raise DeriveError("gateway_vocab_empty:%s.%s" % (module_name, attr))
+        out[key] = (sorted(str(item) for item in raw), source)
+    return out
+
+
+def factor_table_values():
+    """rules_factor 自己声明的那 6 枚**移植侧的表**（因子库 / 规则模板 / 覆盖表）。
+
+    这些表在 Go 没有对应读数（internal/factor 的注册表带的是 Compute 闭包，没有可导出的
+    窗口/方向元数据；规则模板是 owner 按账号配的样例；proxy 档位刻意留空＝那条腿弃权）。
+    表本身是模块的一部分——与 rules_sizing.SIZING_DEFAULTS 同一条路：工具搬，不改，不猜。
+    少一枚就当场判红（不许"表里好像没有就当空表"，那会把一条规则静默变成永不命中）。
+    """
+    sys.path.insert(0, QMT_GATEWAY)
+    import rules_factor  # noqa: E402
+    template = getattr(rules_factor, "PARAMS_TEMPLATE", None)
+    if not isinstance(template, dict):
+        raise DeriveError("rules_factor_params_template_absent")
+    source = "qmt_gateway/rules_factor.py:PARAMS_TEMPLATE"
+    out = {}
+    for key in FACTOR_TABLE_KEYS:
+        if key not in template:
+            raise DeriveError("factor_table_key_absent_from_template:%s" % key)
+        out[key] = (template[key], "%s[%s]" % (source, key))
+    return out
+
+
+def unowned_sentinels():
+    """没有主人的三枚键的**中性形状**（值与理由都在 CARRIER_UNOWNED 里逐条登记）。
+
+    这一条是整个脚本唯一"值不由 Go 也不由模块表供给"的地方，所以它只许放**弃权形状**：
+    空表 / false / 零预算。任何看起来像阈值的数进到这里，就等于工具替策略做决定。
+    """
+    return dict((key, (value, reason)) for key, (value, reason) in CARRIER_UNOWNED.items())
+
 
 
 def apply_write(doc, params, carrier_values):
@@ -705,6 +1079,17 @@ def main():
     # 先读规则模块与参数文件：改名/重键用的对照表都在它们身上（唯一的一份）。
     doc, params = load_params_file()
     sizing_keys, t_keys, sizing_defaults = carrier_rule_keys()
+    form_keys = form_rule_keys()
+    # 模块清单与构建闸同源：params["ported_modules"] 里每一个模块、每个模块自己声明的键。
+    modules = ported_module_inventory(params)
+    required = set()
+    for keys in modules.values():
+        required |= keys
+    # 第三条腿：模块自带的表 / 网关账本的状态词表 / 无主键的中性形状。
+    extras = {}
+    extras.update(factor_table_values())
+    extras.update(gateway_vocab_values())
+    extras.update(unowned_sentinels())
     carrier_values = build_carrier_values(derived, provenance, params, sizing_defaults)
 
     if chosen == "emit-json":
@@ -716,9 +1101,10 @@ def main():
             print(key)
         return 0
 
-    all_values = resolve_extras(carrier_values, params, sizing_defaults)
-    required = sizing_keys | t_keys
+    all_values = resolve_extras(carrier_values, params, sizing_defaults, extras)
     cov = coverage(all_values, required, params)
+    # 每个移植模块自己报清单，这里逐模块数"旋钮有多少真的落了地"。
+    gaps = knob_readout(modules, all_values, set(carrier_values), params)
     drift = defaults_table_drift(carrier_values, sizing_defaults)
     label_problems = check_phase_labels(derived, sizing_defaults)
     for problem in label_problems:
@@ -770,7 +1156,12 @@ def main():
         print("DERIVE_UNHOUSED=%d %s" % (len(still), ",".join(still) if still else "none"))
 
     bad = bool(cov["orphan"]) or bool(drift) or bool(label_problems)
+    # 每一枚移植模块的"文件里还缺几枚 / 连主人都没有"都算红（与构建闸 g9 同一口径）。
+    short = sorted(name for name, (missing, homeless) in gaps.items() if missing or homeless)
+    if short:
+        print("DERIVE_KNOBS_SHORT modules=%s" % ",".join(short))
     if chosen == "check":
+        bad = bad or bool(short)
         print("DERIVE_RESULT=%s" % ("FAIL" if bad else "OK"))
         return 1 if bad else 0
     print("DERIVE_RESULT=%s" % ("DRIFT" if bad else "OK"))

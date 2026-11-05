@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 from collections import deque
@@ -75,6 +76,9 @@ DEFAULT_QUEUE_MAX = 500
 DEFAULT_SENT_KEEP = 2000
 # 跳过原因清单的保留条数（missing≠empty 的"记因为什么没发"就落在这里）。
 DEFAULT_SKIP_KEEP = 50
+# §CARRIER-SHADOW 单事件行数：必须**严格小于** Go 侧 carrierShadowMaxRows(500)——
+# 那一侧超上限是整条 400（毒丸进死信），宁可在这里多切一刀，也不要让一天的判定全丢。
+DEFAULT_SHADOW_BATCH_ROWS = 200
 
 # STRATEGY_VERSION 常量的读取姿势：按行正则，不 import 目标文件（构建产物可能在别人机器上，
 # 读它不等于运行它；而且 import 会执行顶层代码，那是沙箱外都不该有的动作）。
@@ -154,6 +158,77 @@ def file_fingerprint(path):
         return h.hexdigest()[:12]
     except OSError:
         return ""
+
+
+def _day_beijing(ts):
+    """epoch 秒 → YYYYMMDD（北京时间交易日紧凑形态，与执行器 day_key、Go cntime 同形）。
+
+    影子账本按 day 查，day 形态必须是 Go 侧 carrierShadowDayPat 认的那种 8 位数字：
+    拿 `2026-11-05` 去查会一行都查不到，而"查不到"在这条腿上的语义是"这台机器今天没报"，
+    不是"我格式写错了"——所以形态只能在这一处定义，别处一律复用本函数。
+    """
+    return datetime.fromtimestamp(ts, _BJ).strftime("%Y%m%d")
+
+
+def _sqlite_readonly(path):
+    """以**只读**方式打开执行器账本（uri mode=ro）。
+
+    为什么不是普通 connect：普通连接会以写模式打开库文件，SQLite 在打开时就可能创建
+    `-wal`/`-shm`；这条腿对执行器那本账只有读的权力——它一旦能写，影子行的幂等真源
+    就从执行器转移到了上行腿，同一件事就有了两本账（§MANUAL-SYNC 的对账纪律靠"只有一个写者"）。
+    路径里带 `?`/`#` 会被 URI 解析吃掉，所以先转成绝对路径再做百分号转义。
+    """
+    abs_path = os.path.abspath(path)
+    escaped = abs_path.replace("%", "%25").replace("?", "%3F").replace("#", "%23")
+    return sqlite3.connect("file:%s?mode=ro" % escaped, uri=True)
+
+
+_SHADOW_NOTE_KEYS = ("hard_block", "t_allowed", "missing_key_dims", "emotion_phase")
+
+
+def shadow_judgement_note(blob):
+    """把执行器账本里的 judgement 压缩串翻成上行侧的三枚 typed 字段。
+
+    执行器存的是 `{"market_scale":…, "target":…, "hard_block":…, …}`（ASCII JSON，
+    见 local_executor.sizing_judgement 的键清单），而 Go 的行是 typed 列
+    market_scale / target_scale / sizing_note。这里只做**改名 + 拼串**，不产生新数：
+
+      * 拿不到的键**整键缺席**，绝不写 0——Go 侧把 NULL 读成"这一版载体没接判断腿"，
+        把 0 读成"定权说了零仓位"，两者是完全不同的结论（missing≠empty 在行内的落形）；
+      * 说明类键（hard_block 等）拼成一枚 ASCII 键值串进 sizing_note，账本以后加键
+        不需要改 Go 的表结构；
+      * blob 坏了 / 不是 JSON ⇒ 返回空 dict：那是"这条判定没带判断腿读数"，
+        仍然要把判定行本身报上去（判定与解释是两件事，解释坏不了判定）。
+    """
+    if not blob:
+        return {}
+    try:
+        raw = json.loads(str(blob))
+    except Exception:  # noqa: BLE001 — 判断串坏掉只损失解释，不损失判定
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    scale = raw.get("market_scale")
+    if isinstance(scale, (int, float)) and not isinstance(scale, bool):
+        out["market_scale"] = float(scale)
+    target = raw.get("target")
+    if isinstance(target, (int, float)) and not isinstance(target, bool):
+        out["target_scale"] = float(target)
+    parts = []
+    for key in _SHADOW_NOTE_KEYS:
+        if key not in raw or raw.get(key) is None:
+            continue
+        parts.append("%s=%s" % (key, raw.get(key)))
+    if parts:
+        note = " ".join(parts)
+        if raw.get("judgement_error"):
+            # 判断腿自己抛了：把这行原样带上，运维看到的是"腿坏了"而不是"腿没说"。
+            note = "%s judgement_error=%s" % (note, raw.get("judgement_error"))
+        out["sizing_note"] = note[:200]  # Go 侧列宽 200 字节（carrierShadowMaxNote）
+    elif raw.get("judgement_error"):
+        out["sizing_note"] = ("judgement_error=%s" % raw.get("judgement_error"))[:200]
+    return out
 
 
 def load_xt_config(config_path):
@@ -240,6 +315,20 @@ class ReportUplink:
                                   os.path.join(os.path.dirname(self.config_path), "local_executor.py")).strip()
         state_dir = str(cfg.get("uplink_state_dir") or os.path.dirname(self.config_path))
         self.state_path = os.path.join(state_dir, "uplink_state.json")
+        # §CARRIER-SHADOW：执行器那本影子账的位置。三级兜底，全部指向**同一个**执行器写下的库：
+        #   1) 配置里显式登记（运维改了 --state-db 就必须在这里同步，改一处不够）；
+        #   2) 环境变量 LOCAL_EXECUTOR_DB（执行器自己的缺省来源，同一台机器上不必登记两次）；
+        #   3) 与配置同目录的 executor_state.db（装包默认布局：执行器与 config.xt.json 同级）。
+        # 三条都拿不到 ⇒ 属性为空串，_read_shadow_rows 记 journal_not_configured 后一个字节都不发：
+        # "影子窗口今天没数据"与"这台机器根本没接影子账本"是两种修复，不许混成一条空上报。
+        self.shadow_db = str(cfg.get("uplink_shadow_db")
+                             or os.environ.get("LOCAL_EXECUTOR_DB")
+                             or os.path.join(os.path.dirname(self.config_path),
+                                             "executor_state.db")).strip()
+        # 单批行数：Go 侧 carrierShadowMaxRows=500 整条拒收，所以上行必须先切好；
+        # 200 是给单事件留体积余量（一天几十条判定 × 每行十几个字段）。
+        self.shadow_max_rows = max(1, int(cfg.get("uplink_shadow_max_rows")
+                                          or DEFAULT_SHADOW_BATCH_ROWS))
         self.queue_max = int(cfg.get("uplink_queue_max") or DEFAULT_QUEUE_MAX)
         self.sent_keep = int(cfg.get("uplink_sent_keep") or DEFAULT_SENT_KEEP)
         self.skip_keep = int(cfg.get("uplink_skip_keep") or DEFAULT_SKIP_KEEP)
@@ -311,7 +400,7 @@ class ReportUplink:
         return led
 
     def build_events(self):
-        """按当前导出与已安装版本构造本轮事件清单（positions/account/order/heartbeat）。
+        """按当前导出与已安装版本构造本轮事件清单（positions/account/order/shadow/heartbeat）。
 
         每一类都独立走"缺→不发并记原因 / 半文件→不发 / 空→可发"三态，任何一类意外都不
         拖累其它类（单类读数坏掉是常态，全轮陪葬才是事故）。
@@ -320,6 +409,7 @@ class ReportUplink:
         events.extend(self._build_positions_event())
         events.extend(self._build_account_event())
         events.extend(self._build_order_events())
+        events.extend(self._build_shadow_events())
         hb = self._build_heartbeat()
         if hb is not None:
             events.append(hb)
@@ -445,6 +535,112 @@ class ReportUplink:
             created = str(row.get("time") or "").strip()
             out["created_at"] = created or stamp
             out["at"] = stamp
+            events.append(out)
+        return events
+
+    # ---------------- §CARRIER-SHADOW：载体影子判定（5 日对照窗口的分子） ----------------
+    def _read_shadow_rows(self):
+        """读执行器本地账本里**今天**的 shadow 决策；返回 rows（可能为空）或 None（这类不发）。
+
+        三态与 broker_reads 边界 2 同源，一个都不许折：
+          * 账本文件不存在 / 打不开 / 没有 shadow_decisions 表（11-05 之前建的旧账本）
+            ⇒ **一个事件都不发**并记原因——"这台机器的载体还不会记账"与"今天没有影子决策"
+            是两种完全不同的修复（前者换载体，后者等盘中）；
+          * 表在而今天零行 ⇒ 同样**一个都不发**并记 no_rows_today（硬规则 2：今天没有行就
+            不许把"空列表"发出去——Go 侧一旦收下空批次，那一天就会被对照表当成"报过的一天"，
+            5 日窗口能被一串静默日自己凑满）；
+          * 今天有行 ⇒ 原样返回。
+        只读连接（mode=ro）：这条腿对执行器账本**只有读**的权力，写一次就把幂等键的
+        真源从执行器挪到了上行腿，那是两本账。
+        """
+        if not self.shadow_db:
+            self._note_skip("shadow", "journal_not_configured")
+            return None
+        if not os.path.exists(self.shadow_db):
+            self._note_skip("shadow", "journal_missing")
+            return None
+        try:
+            conn = _sqlite_readonly(self.shadow_db)
+        except Exception as exc:  # noqa: BLE001 — 打不开＝这类不发，原因写清、绝不发空
+            self._note_skip("shadow", "journal_unreadable:%s" % type(exc).__name__)
+            return None
+        try:
+            day = _day_beijing(self._now_fn())
+            has = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shadow_decisions'"
+            ).fetchone()
+            if not has or int(has[0] or 0) == 0:
+                # 旧载体建的账本：它压根没这枚表。报"今天零条"是假话（今天到底有没有跑过
+                # 一轮判定，这张表回答不了），必须报"这台机器的载体还不会记影子账"。
+                self._note_skip("shadow", "journal_table_absent")
+                return None
+            rows = conn.execute(
+                "SELECT day, short_code, symbol, kind, side, qty, price, amount, judgement,"
+                " first_ts, last_ts FROM shadow_decisions WHERE day = ?"
+                " ORDER BY first_ts, short_code", (day,)).fetchall()
+            if not rows:
+                self._note_skip("shadow", "no_rows_today")
+                return None
+            return rows
+        except Exception as exc:  # noqa: BLE001 — 查询失败同样是一个都不发（不发≠空发）
+            self._note_skip("shadow", "journal_query_failed:%s" % type(exc).__name__)
+            return None
+        finally:
+            conn.close()
+
+    def _build_shadow_events(self):
+        """把今天的影子决策打成 carrier_shadow 事件（可分批），每批的 at 由内容推出。
+
+        为什么 `at` 不能取当前时钟：硬规则 4 的幂等基线是**内容哈希**，at 一进哈希就成了
+        墙钟，每轮都产生新哈希——同一份没变的账本会被反复重发（洪泛决策机），
+        而那正是"重启后不许重灌"要防的形状。取本批最新的 decided_at：账本不变⇒事件不变⇒
+        去重账挡下（与 _canonical_hash 那段注释同一判据）。
+
+        分批（shadow_max_rows）只为单个体积：行数封顶在 Go 侧的 carrierShadowMaxRows，
+        超上限它整条 400（毒丸可见、不静默截断），所以上行侧必须先切好。
+        """
+        rows = self._read_shadow_rows()
+        if rows is None:
+            return []
+        mapped = []
+        for r in rows:
+            code = normalize_code(r[2])
+            if not code:
+                # 认不出交易所的行整行丢弃（猜后缀会把票落到别的交易所账上，与 positions 同口径）
+                self._note_skip("shadow", "bad_code_row:%r" % (r[2],))
+                continue
+            row = {"day": str(r[0]), "ts_code": code, "kind": str(r[3] or ""),
+                   "side": str(r[4] or ""), "short_code": str(r[1] or ""),
+                   "qty": int(r[5] or 0), "price": float(r[6] or 0.0),
+                   "decided_at": _iso_beijing(float(r[10] or 0.0))}
+            if not row["kind"] or not row["short_code"]:
+                # Go 侧逐行拒收的就是这两枚（空种类进不了任何一格、空短码会互相覆盖），
+                # 与其发一条注定被摘掉的，不如本地记原因——与 order 缺 order_id 那条同处置。
+                self._note_skip("shadow", "row_without_kind_or_short_code")
+                continue
+            if r[7] is not None:
+                row["amount"] = float(r[7])  # 缺＝载体没给金额（卖出信号常如此），绝不写 0
+            note = shadow_judgement_note(r[8])
+            for key in ("market_scale", "target_scale"):
+                if note.get(key) is not None:
+                    row[key] = note[key]
+            if note.get("sizing_note"):
+                row["sizing_note"] = note["sizing_note"]
+            mapped.append(row)
+        if not mapped:
+            # 有行但全被摘掉：这一类**不发**（发了就是空批次，Go 侧按纪律 400）。
+            # 原因已经逐条记在 bad_code_row/row_without_kind 里，这里再补一条汇总，
+            # 让 dry-run 那一屏看得见"表里有 N 行但一条都没报"这种最难自查的形态。
+            self._note_skip("shadow", "all_rows_rejected")
+            return []
+        events = []
+        size = max(1, int(self.shadow_max_rows or 1))
+        for start in range(0, len(mapped), size):
+            chunk = mapped[start:start + size]
+            out = self._base_event("carrier_shadow")
+            # 批内 decided_at 字典序取最大＝内容派生的"这批最新的判定时刻"，重跑同一份账本必同值。
+            out["at"] = max(str(c.get("decided_at") or "") for c in chunk)
+            out["shadow"] = chunk
             events.append(out)
         return events
 

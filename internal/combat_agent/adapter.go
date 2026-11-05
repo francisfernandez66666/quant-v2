@@ -144,19 +144,19 @@ func dragonReturnDataFromMarketData(code string, md *strategy_engine.StockMarket
 	kl := md.KLines
 	// 历史K线不足30根时缺少均线/主升段数据，返回零值安全降级（0分）
 	// English: fewer than 30 K-lines → no MA/main-rally data, return zero struct as a safe 0-score degrade.
-	if len(kl) < 30 {
+	if len(kl) < drMinBars {
 		return sd
 	}
 
 	// 均线族：MA5/MA10/MA20
 	// English: MA series: MA5/MA10/MA20.
-	sd.MA5 = ma(kl, 5)
-	sd.MA10 = ma(kl, 10)
-	sd.MA20 = ma(kl, 20)
+	sd.MA5 = ma(kl, shortMA5Period)
+	sd.MA10 = ma(kl, shortMA10Period)
+	sd.MA20 = ma(kl, shortMA20Period)
 
 	// 近40根内最高收盘作为主升高点
 	// English: lowest index in the last 40 bars is the window start for the main rally peak.
-	start := len(kl) - 40
+	start := len(kl) - drRallyBars
 	if start < 0 {
 		start = 0
 	}
@@ -186,9 +186,9 @@ func dragonReturnDataFromMarketData(code string, md *strategy_engine.StockMarket
 
 	// 缩量比近似：近5日均量 / 20日均量（回调缩量 vs 主升量能）
 	// English: volume-shrink ratio ≈ 5-day avg volume / 20-day avg volume (pullback vs rally energy).
-	vol20 := avgVol(kl, 20)
+	vol20 := avgVol(kl, shortVol20Period)
 	if vol20 > 0 {
-		sd.VolumeRatio = avgVol(kl, 5) / vol20
+		sd.VolumeRatio = avgVol(kl, shortVol5Period) / vol20
 	}
 
 	// 板块龙性由已验证板块填充：RPS 排名前2视为板块龙头
@@ -285,6 +285,44 @@ func evalFor(runner StrategyRunner, code string, md *strategy_engine.StockMarket
 //   - 做空战法共享输入指针（KLines 为引用，战法只读）
 //
 // （buildShortData derives the shared bear-tactic input from market data in one pass.）
+//
+// shortXxx 这一族是**派生窗口的单点定义**（§DERIVE-CARRIER-1105）：QMT 内置策略与本地
+// 执行器把同一批指标从这份派生里移植过去（rules_form.py 的 ma5_window / bd_low_window /
+// ld_seal_tolerance 等键）。这些窗口以前是下面的内联数字，外部进程只能人手抄——抄错一位，
+// 或者把"含今日"与"不含今日"抄反，不会有任何东西响，而它改的是判据本身。
+// 现在窗口只在这里定义一次，导出读数见 derive_carrier.go。
+//
+// 命名口径：**"回溯根数"是不含今日的那几根**，因此起点是 n-(根数+1)（今日自己占一根）。
+// 以前这里写的是 n-21 / n-4 这种"起点偏移"，载体收的是"根数"20 / 3——偏移与根数之间差的
+// 那一根是今日，属于结构差而不是业务阈值，所以把 +1 明写在取起点的那一行，
+// 而不是把 21 当成一枚阈值交给载体。
+// English: lookback families are named once here; a "bars excluding today" window starts at
+// n-(bars+1) because today occupies one bar. The +1 is structure, not a threshold.
+const (
+	shortMA5Period      = 5     // MA5 窗口（含今日的最后一根）
+	shortMA10Period     = 10    // MA10 窗口
+	shortMA20Period     = 20    // MA20 窗口（破位判据的那条线）
+	shortVol5Period     = 5     // 5 日均量窗口
+	shortVol20Period    = 20    // 20 日均量窗口
+	shortHighBars       = 60    // 60 日最高收盘的回溯根数（含今日）
+	shortLowBars        = 20    // 20 日最低收盘的回溯根数（不含今日）
+	shortGainBars       = 20    // 近 20 日涨幅的基准根数（不含今日）
+	shortStallBars      = 3     // 近 3 日区间涨幅的基准根数（不含今日）
+	shortSealTolerance  = 0.995 // 封板容忍：收盘 ≥ 板价×0.995 才算封住（分钟回封同一条尺子）
+	shortTouchTolerance = 0.998 // 触板容忍：最高价 ≥ 板价×0.998 算盘中摸过板
+	shortEventWindowDay = 5     // 利好事件在窗天数：超过就不算"利好兑现"
+	// 龙回头（dragonReturnDataFromMarketData）那一族派生的两条长度。
+	// 均线窗口不另立：MA5/MA10/MA20 与上面同一批常量——两处各写一遍 5/10/20，
+	// 改一处会让同一天的两条腿用不同的均线判同一只票。
+	drMinBars   = 30 // 历史不足 30 根 ⇒ 返回零值结构（均线与主升段都算不出来）
+	drRallyBars = 40 // 主升高点的搜索窗口（近 40 根内的最高收盘）
+)
+
+// buildShortData 把一次扫描的全部输入（行情快照 / 板块核验 / 持仓标记 / 板块跌幅）装配成
+// 破位战法纯逻辑核（shortbase.Data）的入参：适配器只做取数与装配，不做任何判据——
+// 判据全部留在 shortbase 的纯函数里，方便逐规则单测与派生参数导出。
+// English: assembles one scan's inputs into the pure-rule core's payload; the adapter never
+// judges (all predicates live in shortbase), keeping derivation/export testable per rule.
 func buildShortData(code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, input *ScanInput, sectorName string, held bool, sectorDrop float64) *shortbase.Data {
 	sd := &shortbase.Data{
 		Code:         code,
@@ -308,12 +346,12 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 	if n >= 2 {
 		sd.PrevClose = kl[n-2].Close
 	}
-	sd.MA5 = ma(kl, 5)
-	sd.MA10 = ma(kl, 10)
-	sd.MA20 = ma(kl, 20)
+	sd.MA5 = ma(kl, shortMA5Period)
+	sd.MA10 = ma(kl, shortMA10Period)
+	sd.MA20 = ma(kl, shortMA20Period)
 
 	// 位置族：60日最高收盘 / 20日最低收盘（不含今日）/ 近20日涨幅 / 现价相对60日高
-	hiStart := n - 60
+	hiStart := n - shortHighBars
 	if hiStart < 0 {
 		hiStart = 0
 	}
@@ -322,7 +360,8 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 			sd.High60 = kl[i].Close
 		}
 	}
-	lowStart := n - 21
+	// "不含今日"的三族：起点要多让一根（今日占一根），所以是 n-(根数+1)。
+	lowStart := n - (shortLowBars + 1)
 	if lowStart < 0 {
 		lowStart = 0
 	}
@@ -335,7 +374,7 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 			sd.Low20 = kl[i].Close
 		}
 	}
-	if gStart := n - 21; gStart >= 0 && kl[gStart].Close > 0 {
+	if gStart := n - (shortGainBars + 1); gStart >= 0 && kl[gStart].Close > 0 {
 		sd.Gain20 = (last.Close - kl[gStart].Close) / kl[gStart].Close
 	}
 	if sd.High60 > 0 {
@@ -343,8 +382,8 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 	}
 
 	// 量能族
-	sd.Vol5 = avgVol(kl, 5)
-	sd.Vol20 = avgVol(kl, 20)
+	sd.Vol5 = avgVol(kl, shortVol5Period)
+	sd.Vol20 = avgVol(kl, shortVol20Period)
 	if sd.Vol20 > 0 {
 		sd.VolRatio5_20 = sd.Vol5 / sd.Vol20
 	}
@@ -353,8 +392,8 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 	}
 
 	// 滞涨与走弱族
-	if n >= 4 && kl[n-4].Close > 0 {
-		sd.Last3RangePct = (last.Close - kl[n-4].Close) / kl[n-4].Close * 100
+	if stallStart := n - (shortStallBars + 1); n >= shortStallBars+1 && kl[stallStart].Close > 0 {
+		sd.Last3RangePct = (last.Close - kl[stallStart].Close) / kl[stallStart].Close * 100
 	}
 	if rng := last.High - last.Low; rng > 0 {
 		sd.UpperShadowPct = (last.High - last.Close) / rng
@@ -384,8 +423,8 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 	sd.LimitUpPct = data.LimitUpPct(code, md.Name)
 	if sd.LimitUpPct > 0 && n >= 2 {
 		boardPx := sd.PrevClose * (1 + sd.LimitUpPct/100)
-		sd.TouchedBoardToday = last.High >= boardPx*0.998
-		sd.SealedToday = last.Close >= boardPx*0.995
+		sd.TouchedBoardToday = last.High >= boardPx*shortTouchTolerance
+		sd.SealedToday = last.Close >= boardPx*shortSealTolerance
 		// 今日之前：从倒数第二根往前数涨幅≥板幅（容忍0.2个百分点的四舍五入误差）
 		for i := n - 2; i >= 1; i-- {
 			prev := kl[i-1].Close
@@ -401,7 +440,7 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 		// 分钟K 14:30 后回封（断板反包保护）：任一 14:30 之后的 5 分钟 bar 收盘≥板价
 		for _, mb := range md.MinuteKLine {
 			t := mb.Date
-			if (t.Hour() > 14 || (t.Hour() == 14 && t.Minute() >= 30)) && mb.Close >= boardPx*0.995 {
+			if (t.Hour() > 14 || (t.Hour() == 14 && t.Minute() >= 30)) && mb.Close >= boardPx*shortSealTolerance {
 				sd.AfternoonReseal = true
 				break
 			}
@@ -436,7 +475,8 @@ func buildShortData(code string, md *strategy_engine.StockMarketData, sector *se
 			}
 			if idx >= 0 {
 				age := n - 1 - idx
-				if age <= 5 {
+				// 在窗判据用的是 short 族那枚 5（载体侧同名键 gf_event_window_days）
+				if age <= shortEventWindowDay {
 					sd.EventInWindow = true
 					sd.EventAgeDays = age
 					sd.EventScore = absF(best.Score)

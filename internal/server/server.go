@@ -875,6 +875,30 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/positions/advice", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRealAdvice))
 	s.mux.HandleFunc("POST /api/positions/execute", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleExecuteAction))
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
+	// §CARRIER-UPDATE（2026-11-05 载体更新，外脑化 B2）：QMT **内置策略**从 11-05 起不能读文件、
+	// 不能连网络，那个真正装着战法的载体文件结构上无法自更新——能替它做这件事的只有同一台
+	// 物理机上那个普通本地进程（qmt_gateway/carrier_updater.py，由另一个 agent 负责）。
+	// 这两条盒子侧路由因此**必须与 /api/qmt/report 同一条鉴权腿**：认的是那把账号级网关钥匙
+	// （qmtReportMiddleware），归属由钥匙反查得出，请求体/查询串里自报的 user_id 一律不信
+	// （§安全 T1 / §TOKEN-PERAACCT 同口径）。一把钥匙只服务一根腿（B-N1），所以"哪根腿在问"
+	// 与"该给它看哪份清单"是同一个答案。
+	// 三条刻意的设计，别当冗余删掉：
+	//   · GET 只读、幂等、零状态推进——盒子按 cron 一小时可能问好几次，一次点击只该被点击置位；
+	//   · 清单读不出/期望版没填齐 ⇒ ok=false + request_state=unknown（"不知道"不许折成"已一致"，
+	//     那是本仓反复出现的那类折叠：§STARVE-STALE 的 J0、§0925EVE-W3-E 的"读不到不装已知"）；
+	//   · 回执按 pending→acked/failed 单向推进，且版本必须对得上当前期望版（迟到回执不许吃格）。
+	// 产物字节这一半本批没做（清单只带 SHA256；将来加下载路由的三条硬边界写在
+	// internal/server/carrier.go 的 carrierArtifactsDirName 注释上）。
+	// §115/契约台账牵连：新增 3 条路由（本组 2 条 + 下面运营侧 1 条），台账同批补 3 行。
+	s.mux.HandleFunc("GET /api/qmt/carrier/manifest", s.qmtReportMiddleware(s.handleCarrierManifestGet))
+	s.mux.HandleFunc("POST /api/qmt/carrier/ack", s.qmtReportMiddleware(s.handleCarrierAckPost))
+	// 运营侧的人工触发：点一下「更新载体」= 把该账号的 request_state 置成 pending，
+	// 下一次盒子轮询时由那台机器自己的脚本停策略/写文件/重启（**广州不动任何机器**）。
+	// 这是**状态变更的控制动作**，所以只认 trading_admin（与通道切换 POST /api/qmt/broker 同档）；
+	// 跨账号代点另加 user_admin，判据与 /api/admin/users/{id}/config/qmt 同源（在 handler 内按
+	// 显式位再判一次，不在这里合并成"任一位放行"——那会把别人的机器变成谁能碰都行）。
+	// 读数面（期望版/请求态/最近回执）不在这条上，走 GET /api/qmt/state 的 carrier 键增量。
+	s.mux.HandleFunc("POST /api/qmt/carrier/update", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleCarrierUpdatePost))
 	// QMT 实盘状态/成交：§MULTI-ACCT-B 批5 起 quant_trade 也能读**自己账号**的这两本账
 	// （handler 全按 userIDFor(r) 过滤，跨账号视图仍只有运营侧的 trading_admin 拿得到）。
 	s.mux.HandleFunc("GET /api/qmt/state", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTState))

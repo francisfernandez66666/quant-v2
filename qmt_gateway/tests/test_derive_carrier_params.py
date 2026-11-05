@@ -238,6 +238,54 @@ class Universe(unittest.TestCase):
                          "preview 写了参数文件——那等于替 owner 做了决定")
 
 
+class BearTacticKnobs(unittest.TestCase):
+    """做空四战法的 102 枚旋钮：清单、真源、以及"参数文件里真的有这些数"。
+
+    这一组为什么必须存在：11-04 那批把 rules_form.py 的规则**代码**搬进了载体，
+    构建闸只验"模块到没到"，于是 105 枚声明的阈值里 102 枚在参数文件里不存在，
+    产物里每条移植规则第一次被调用就 raise KeyError('bd_min_bars')——装载成功、
+    注册成功、五道闸全绿，而一轮也算不出来。这三条用例把那个形状从三个方向钉住。
+    """
+
+    def test_declared_list_equals_form_keys_minus_carrier_owned(self):
+        """BEAR_TACTIC_KEYS 必须正好是 rules_form 自己声明的那批，去掉登记为载体自有的三枚。
+
+        多一枚＝搬一个没人读的数进产物；少一枚＝那枚阈值又没主人。两个方向都要红。
+        """
+        sys.path.insert(0, os.path.join(REPO_ROOT, "qmt_gateway"))
+        import rules_form
+        declared = set(dcp.BEAR_TACTIC_KEYS)
+        form = set(rules_form.FORM_PARAM_KEYS)
+        owned = set(dcp.CARRIER_OWNED)
+        self.assertEqual(declared, form - owned,
+                         "extra=%s missing=%s" % (sorted(declared - (form - owned)),
+                                                  sorted((form - owned) - declared)))
+        self.assertEqual(len(dcp.BEAR_TACTIC_KEYS), len(declared), "清单里有重复键")
+
+    def test_no_bear_key_is_doubly_sourced_with_the_main_table(self):
+        """同名直搬那一批与主表不能供同一个载体键（两处供给同一枚数＝本工具的头号靶子）。"""
+        seen = {}
+        for go_key, targets, _transform in dcp.MAPPING:
+            for target in targets:
+                self.assertNotIn(target, seen,
+                                 "carrier key %s supplied by both %s and %s"
+                                 % (target, seen.get(target), go_key))
+                seen[target] = go_key
+
+    @unittest.skipUnless(GO_AVAILABLE, "go_absent: needs the Go export readout")
+    def test_every_bear_knob_has_a_go_readout(self):
+        """每一枚都必须真的能从 Go 打出来，且参数文件里有值——缺一个就是一条 KeyError。"""
+        derived, _prov = dcp.run_go_tool()
+        params = _params()
+        missing_go = sorted(k for k in dcp.BEAR_TACTIC_KEYS if k not in derived)
+        self.assertEqual(missing_go, [], "Go 侧没有这些键的导出读数：%s" % missing_go[:10])
+        missing_file = sorted(k for k in dcp.BEAR_TACTIC_KEYS if k not in params)
+        self.assertEqual(missing_file, [], "参数文件里没有这些键：%s" % missing_file[:10])
+        drifted = sorted(k for k in dcp.BEAR_TACTIC_KEYS
+                         if k in params and dcp._norm(params[k]) != dcp._norm(derived[k]))
+        self.assertEqual(drifted, [], "这些键与 Go 出厂值不一致：%s" % drifted[:10])
+
+
 @unittest.skipUnless(GO_AVAILABLE, "go_absent: the end-to-end check needs the Go toolchain")
 class AgainstGo(unittest.TestCase):
     """端到端：参数文件的每一个派生键都必须等于 Go 此刻打出来的出厂值。"""

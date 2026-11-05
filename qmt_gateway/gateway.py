@@ -1424,6 +1424,15 @@ class Gateway:
             # §ORDER-STATE-PULL（2026-10-30）：当日委托状态的只读对账源。放在连接闸之前：
             # 断线/熔断时决策端最需要"最后已知状态"来纠正停滞行，不能因为通道断开就拒答。
             return self._do_orders(request_handler)
+        if path == "/state" and method == "GET":
+            # §CLOSE-RECON-STATE（2026-11-04）：收盘快照是 11-05 桥断后唯一的手工对账基线，
+            # 而它恰恰只在盘后 broker 已断开时才需要读。把 /state 放在连接闸之前，与
+            # /orders、/settlement、/quotes 同一姿势：**断线时回 200 且显式 connected=false +
+            # positions_trusted=false**，而不是一条 503 "broker not connected" 把观测面关掉。
+            # 只读端点前移不放行任何资本动作：/order 与 /cancel 仍在闸后被 503 拒（见下方）。
+            # English: /state is a read-only face and must stay answerable after the broker
+            # disconnects at close; capital actions remain gated below.
+            return self._do_state()
         # §LEG-CONTRACT-GATE：拒单点只挡这两条资本动作，且**排在连接闸之前**——
         # 版本旧时先回"通道没连"会把处置方向带跑（去查链路），而真正的答案是"升版后重启"。
         # 拒的是 /order 与 /cancel：/health、/state、/orders、/settlement、/quotes 一律照常应答。
@@ -1438,8 +1447,6 @@ class Gateway:
             return self._do_order(body, getattr(request_handler, "_caller_uid", ""))
         if path == "/cancel" and method == "POST":
             return self._do_cancel(body, getattr(request_handler, "_caller_uid", ""))
-        if path == "/state" and method == "GET":
-            return self._do_state()
         return 404, {"ok": False, "err": "not found"}
 
     def _do_quotes(self, request_handler=None):
@@ -2393,13 +2400,8 @@ class Gateway:
         # §CLOSE-RECON 观察位：最近一次收盘快照（桥 15:01 定时任务打的那一帧）。
         # day 为空＝桥从来没打过收盘快照 ⇒ 收盘那 3 分钟的成交不在账上，
         # 只能靠对账单勘误；这是 600362 事故的现网判据。
-        payload["close_snapshot"] = {
-            "day": str(self._close_snap.get("day", "") or ""),
-            "at": str(self._close_snap.get("at", "") or ""),
-            "orders_n": int(self._close_snap.get("n", 0) or 0),
-            "positions_n": int(self._close_snap.get("positions", 0) or 0),
-            "trades_n": int(self._close_snap.get("trades", 0) or 0),
-        }
+        # 装配点与 /state 共用（§CLOSE-RECON-STATE），改键必须两面同批。
+        payload["close_snapshot"] = self._close_snapshot_readout()
         return 200, payload
 
     def _do_admin_order_confirm(self, body):
@@ -2727,17 +2729,39 @@ class Gateway:
             return 200, {"ok": True, "err": ""}
         return 409, {"ok": False, "err": err or "cancel failed"}
 
+    def _close_snapshot_readout(self):
+        """§CLOSE-RECON 收盘快照读数的**唯一装配点**（/state 与 /admin/status 共用）。
+
+        为什么要收成一处：这份读数是桥断后手工对账的唯一基线，两个读面若各拼一次字典，
+        漏键/改名只会发生在其中一面，页面与探针会给出互相矛盾的"今天收盘快照来了没有"。
+        day 为空＝桥从来没打过快照（不是"今日无成交"）；三个计数都是"最近一次快照累计行数"。
+        English: one assembler for the close-of-day snapshot readout, shared by both read
+        faces so they cannot drift; an empty day means "never received", not "zero fills".
+        """
+        return {
+            "day": str(self._close_snap.get("day", "") or ""),
+            "at": str(self._close_snap.get("at", "") or ""),
+            "orders_n": int(self._close_snap.get("n", 0) or 0),
+            "positions_n": int(self._close_snap.get("positions", 0) or 0),
+            "trades_n": int(self._close_snap.get("trades", 0) or 0),
+        }
+
     def _do_state(self):
         """处理 GET /state 状态查询：返回通道连接态、账户与全部委托（含历史）。
 
         通道未连接时持仓返回空列表（调用方按不可信快照处理，不据此清账）。
+        §CLOSE-RECON-STATE（11-04）：断连时这个端点**仍应答 200**，并额外带两枚读数——
+        positions_trusted=false（空仓≠真的空仓）与 close_snapshot（收盘对账基线）。
         English: handles GET /state — returns connection state, account and all orders;
-        positions are empty when the broker is disconnected (treated as untrusted snapshot).
+        positions are empty when the broker is disconnected (treated as untrusted snapshot),
+        and the close-of-day readout is always present so the end-of-day baseline survives
+        a disconnected broker.
         """
-        positions = self.active_broker.query_positions() if self.active_broker.is_connected() else []
+        connected = bool(self.active_broker.is_connected())
+        positions = self.active_broker.query_positions() if connected else []
         orders = self.store.list_orders()
         payload = {
-            "connected": self.active_broker.is_connected(),
+            "connected": connected,
             "account": self.cfg.get("account", ""),
             "positions": positions,
             "orders": orders,
@@ -2747,6 +2771,11 @@ class Gateway:
         # §MANUAL-SYNC：透出委托表快照的规模与时刻，运维据此判断手动单是否已进来
         payload["orders_snapshot_at"] = str(self._orders_snap.get("data_ts", "") or "")
         payload["orders_snapshot_n"] = int(self._orders_snap.get("n", 0) or 0)
+        # 断连时的 positions=[] 是"没读到"而不是"没有持仓"：显式给一个可判的布尔，
+        # 免得下游把空数组折成清仓结论（§MANUAL-SYNC 空快照不做消失判定，同一族缺陷）。
+        payload["positions_trusted"] = connected
+        # 收盘快照读数（与 /admin/status 同一装配点，两个读面不许各写一份）
+        payload["close_snapshot"] = self._close_snapshot_readout()
         return 200, payload
 
     def _do_settlement(self, request_handler=None):

@@ -48,6 +48,30 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// db* 评分阈值单点（§DERIVE-CARRIER-1105B）。
+//
+// 为什么集中命名在这里：载体的 qmt_gateway/rules_ladder.py 是从本包逐行移植的，它按
+// LADDER_PARAM_KEYS 声明自己读哪些 params，构建闸 g9 因此要求每一枚都在烘进的参数文件里
+// 有主人。这些数以前是**评分函数里的字面量**，外部进程拿不到，只能人手抄——抄对了也仍然
+// 留下两本账（本包改档、载体那份不动，两条腿就在同一轮里用不同的线判同一个双响炮）。
+// 权重与放量倍数**不在这里**：那是账号级配置（rules.strategy.double_bump），出厂值在
+// config.defaultStrategyConfig，由本包的导出函数按"没配过的号会得到什么"取。
+// English: the band/width constants the scorer itself reads; weights stay in the per-account
+// config because they are knobs, not the tactic's shape.
+const (
+	dbMinBars           = 10   // 日K 根数硬闸：不足 10 根算不出基线，直接不评分
+	dbWeakDayPct        = -1.5 // 当日走弱线（≤ 此值按 watch，二次波确认作废）
+	dbLookbackBars      = 20   // 均量/均价基线的最大回看根数
+	dbFirstWaveWindow   = 5    // 第一波的搜索窗口（近 5 根内）
+	dbBreakRatio        = 1.05 // 收盘超过基线均价×此比例算"上破"
+	dbAdjustWidthFactor = 2    // 窄幅带的宽度倍数（带 = AdjustVolRatioMax × 本倍数）
+	dbMaShort           = 5    // 多头排列的短均线
+	dbMaMid             = 10   // 多头排列的长均线
+	dbMaAlignRatio      = 0.8  // 只排列未站稳 MA5 时给权重×80%
+	dbFullChainMin      = 60.0 // full_chain（唯一转成买入的那一档）
+	dbBriefMin          = 50.0 // brief（半确认，ActionWatch，不出单）
+)
+
 // DoubleBumpStrategy 双凸战法策略结构。
 // 通过量能/调整深度/均线三维度评分识别双凸突破机会。
 // 这是一个中线趋势延续策略，专注于捕捉主力资金两阶段建仓后的加速拉升。
@@ -139,13 +163,13 @@ func (d *DoubleBumpStrategy) Evaluate(code string, data interface{}) (*strategy.
 // （EvaluateReal runs the core Double Bump scoring.）
 func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []data.KLine) *strategy.Evaluation {
 	// 基础校验：无实时价或 K 线不足 10 根无法评分（Guard: require a live price and ≥10 bars to score）
-	if si == nil || si.Price <= 0 || len(kLines) < 10 {
+	if si == nil || si.Price <= 0 || len(kLines) < dbMinBars {
 		return nil
 	}
 	// 今日实时走弱（低开低走）时，双凸第二波确认被打破，不构成做多信号：
 	// 日K最后一根可能是昨日收盘，需用实时涨跌幅抑制当日下跌时的误报。（If today is already weak (≤-1.5%),
 	// the second wave confirm is broken — return watch to suppress false signals on falling days.）
-	if si.ChangePct <= -1.5 {
+	if si.ChangePct <= dbWeakDayPct {
 		return &strategy.Evaluation{
 			TotalScore: 0,
 			Pass:       false,
@@ -166,7 +190,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	avgClose := 0.0
 	n := len(kLines)
 	// 回看窗口最多 20 根且剔除最后一根（避免用当日数据污染基准）（Cap lookback at 20 and drop the last bar to avoid polluting the baseline）
-	lookback := int(math.Min(float64(n-1), 20))
+	lookback := int(math.Min(float64(n-1), dbLookbackBars))
 	for i := n - lookback - 1; i < n-1; i++ {
 		avgVol += kLines[i].Volume
 		avgClose += kLines[i].Close
@@ -178,11 +202,11 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	firstBreak := false
 	firstBreakIdx := -1
 	firstBreakVol := 0.0
-	for i := n - 5; i < n; i++ {
+	for i := n - dbFirstWaveWindow; i < n; i++ {
 		if i < 0 || i >= n {
 			continue
 		}
-		if kLines[i].Close > avgClose*1.05 && kLines[i].Volume > avgVol*dbc.FirstBreakVolumeMultiple {
+		if kLines[i].Close > avgClose*dbBreakRatio && kLines[i].Volume > avgVol*dbc.FirstBreakVolumeMultiple {
 			firstBreak = true
 			firstBreakIdx = i
 			firstBreakVol = kLines[i].Volume
@@ -209,7 +233,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 				break
 			}
 			if kLines[i].Volume > avgVol*dbc.SecondBreakVolumeMultiple {
-				volScore = dbc.VolumeWeight * 100
+				volScore = dbc.VolumeWeight * strategy.ScoreScale
 				secondBreak = true
 				break
 			}
@@ -231,36 +255,36 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	// amplitude (< AdjustVolRatioMax×2) means gentle consolidation, counted only on up sessions.）
 	high := kLines[n-1].High
 	low := kLines[n-1].Low
-	adjustDepth := (high - low) / avgClose * 100
+	adjustDepth := (high - low) / avgClose * strategy.ScoreScale
 	adjustScore := 0.0
-	if upSession && adjustDepth < dbc.AdjustVolRatioMax*2 {
-		adjustScore = dbc.PositionWeight * 100
+	if upSession && adjustDepth < dbc.AdjustVolRatioMax*dbAdjustWidthFactor {
+		adjustScore = dbc.PositionWeight * strategy.ScoreScale
 	}
 
 	// 均线趋势：MA5 > MA10 为多头排列
 	// 多头排列给 80%，收盘再站稳 MA5 才给满 100%（MA trend: bullish alignment MA5>MA10 gives 80%, +100% when close holds above MA5）
 	maScore := 0.0
-	ma5 := movingAvg(kLines, n, 5)
-	ma10 := movingAvg(kLines, n, 10)
+	ma5 := movingAvg(kLines, n, dbMaShort)
+	ma10 := movingAvg(kLines, n, dbMaMid)
 	if ma5 > ma10 {
-		maScore = dbc.MAWeight * 100 * 0.8
+		maScore = dbc.MAWeight * strategy.ScoreScale * dbMaAlignRatio
 		if kLines[n-1].Close > ma5 {
-			maScore = dbc.MAWeight * 100
+			maScore = dbc.MAWeight * strategy.ScoreScale
 		}
 	}
 
 	log.Printf("[double_bump] %s 今日价=%.2f chg=%.2f%% K线n=%d 最后一根日期=%v 量=%.0f 20日均量=%.0f 二突?volScore=%.0f adjustScore=%.0f maScore=%.0f total=%.0f upSession=%v",
-		code, si.Price, si.ChangePct, n, kLines[n-1].Date, kLines[n-1].Volume, avgVol, volScore, adjustScore, maScore, math.Min(volScore+adjustScore+maScore, 100), upSession)
+		code, si.Price, si.ChangePct, n, kLines[n-1].Date, kLines[n-1].Volume, avgVol, volScore, adjustScore, maScore, math.Min(volScore+adjustScore+maScore, strategy.ScoreScale), upSession)
 
 	// 总分封顶 100；≥60 → full_chain（买入，放宽层级统一到60），≥50 → brief（观察）
 	// （Cap total at 100; ≥60 full_chain (buy, relaxed to 60), ≥50 brief (watch)）
-	total := math.Min(volScore+adjustScore+maScore, 100)
-	pass := total >= 50
+	total := math.Min(volScore+adjustScore+maScore, strategy.ScoreScale)
+	pass := total >= dbBriefMin
 	level := "watch"
-	if total >= 60 {
+	if total >= dbFullChainMin {
 		level = "full_chain"
 		pass = true
-	} else if total >= 50 {
+	} else if total >= dbBriefMin {
 		level = "brief"
 	}
 
@@ -288,13 +312,13 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		},
 		Reasons: map[string]string{
 			"vol_score":    fmt.Sprintf("今量%.1f倍均量(需≥%.1f)", lastVolRatio, dbc.SecondBreakVolumeMultiple),
-			"adjust_score": fmt.Sprintf("振幅%.1f%%(<%.1f%%算窄幅)", adjustDepth, dbc.AdjustVolRatioMax*2),
+			"adjust_score": fmt.Sprintf("振幅%.1f%%(<%.1f%%算窄幅)", adjustDepth, dbc.AdjustVolRatioMax*dbAdjustWidthFactor),
 			"ma_score":     doubleBumpMaDesc(ma5, ma10, kLines[n-1].Close),
 			"adjust_depth": fmt.Sprintf("当日振幅%.1f%%", adjustDepth),
 		},
 		Pass:       pass,
 		Level:      level,
-		Confidence: total / 100.0,
+		Confidence: total / strategy.ScoreScale,
 	}
 }
 

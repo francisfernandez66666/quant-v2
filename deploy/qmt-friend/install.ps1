@@ -1,7 +1,8 @@
 ﻿# install.ps1 —— 朋友机器执行腿的一键安装编排（§FRIEND-PKG，2026-11-03 批 6）
 #
-# 职责：把"懂行才能串起来跑"的七件事固化成一次双击：清单校验 → 环境核 → 落码 → 桥落位 →
-#       overlay → 装填（钥匙两处登记）→ 计划任务 → 起一次并自证。判据一律**不在本文件里另造**：
+# 职责：把"懂行才能串起来跑"的七件事固化成一次双击：清单校验 → 环境核 → 落码 →
+#       **载体产物落位（§FRIEND-CARRIER）** → 桥落位 → overlay → 装填（钥匙两处登记）→
+#       计划任务 → 起一次并自证。判据一律**不在本文件里另造**：
 #       出厂档判定真源是 gateway.py 的 validate_friend_profile（--profile-check），
 #       装填与双向自证真源是 enroll.ps1（它会自己调 ensure_friend_gateway_config.ps1），
 #       关闭门真源是 close_gate.py。这里只做"编排 + 逐步判 rc + 失败即停"。
@@ -23,6 +24,7 @@
 #   STEP1_MANIFEST files=NN mismatches=0 contract_fp=XXXX
 #   STEP2_ENV      ps=5.x python=C:\...\python.exe pyver=3.12.x qmt_root=...
 #   STEP4_LAYOUT   copied=NN mirrored=NN identity_files_in_payload=0 backup=...
+#   STEP4B_ARTIFACTS placed=2 sha_match=1 executor=... sandbox=...
 #   STEP5_BRIDGE   placed=... manual=qmt_strategy_attach
 #   STEP6_OVERLAY  wg=absent|present|installed tunnel=missing|present|registered
 #   STEP7_ENROLL   ENROLL_RESULT=OK
@@ -102,7 +104,8 @@ if ($mismatch -gt 0) {
     # 表现是"只报不接单"——看着像在跑。宁可装不上。
     Abort 1 ("manifest_mismatch=" + $mismatch)
 }
-Log ("STEP1_MANIFEST files=" + $checked + " mismatches=0 contract_fp=" + $manifest.contract_fp + " commit=" + $manifest.build_commit)
+$artListed = @($manifest.files | Where-Object { $_.path -like "artifacts/*" })
+Log ("STEP1_MANIFEST files=" + $checked + " mismatches=0 contract_fp=" + $manifest.contract_fp + " commit=" + $manifest.build_commit + " artifacts=" + $artListed.Count)
 
 # —— STEP 2：环境核（Python 只做探测，不代装：CPython 不进包是体积与杀误报的取舍）——
 if ($PythonExe -eq "") {
@@ -174,20 +177,55 @@ if (-not $Apply) {
         Copy-Item $f.FullName $dst -Force
         $copied = $copied + 1
     }
-    Log ("STEP4_LAYOUT copied=" + $copied + " mirrored=" + $mirrored + " identity_files_in_payload=0 backup=" + $backup)
+	Log ("STEP4_LAYOUT copied=" + $copied + " mirrored=" + $mirrored + " identity_files_in_payload=0 backup=" + $backup)
+}
+
+# —— STEP 4B：把构建期烘好的两份载体产物落到稳定文件名（§FRIEND-CARRIER 11-04）——
+# payload/qmt_gateway/ 里的 local_executor.py / qmt_internal_strategy.py 是**模板/源**
+# （PARAMS 与规则块是空的，只用于包内复现构建）；真正含五个 rules_*.py 全量内联、
+# 烘好 v02 阈值的是 payload/artifacts/*_<version>.py。STEP4 只落模板会让这台机器装上
+# 一份"没有规则的空壳"，而 STEP1 清单逐文件校验照样全绿——这类歪了不会喊的形状必须堵死。
+# 产物覆盖到稳定名后，STEP9B（本地执行器）与 STEP5（QMT 沙箱内置策略）读的就是它们。
+# 预览只报不写；产物缺失/数量不对/写完 SHA 对不上都 ABORT，不留半态。
+$artDir = Join-Path $payload "artifacts"
+$artFiles = @(Get-ChildItem $artDir -Filter "*.py" -File -ErrorAction SilentlyContinue)
+$execArt = @($artFiles | Where-Object { $_.Name -like "local_executor_*.py" })
+$sandArt = @($artFiles | Where-Object { $_.Name -like "qmt_internal_strategy_*.py" })
+if ($execArt.Count -ne 1 -or $sandArt.Count -ne 1) {
+    Abort 4 ("payload_artifacts_shape_bad executor=" + $execArt.Count + " sandbox=" + $sandArt.Count)
+}
+if (-not $Apply) {
+    Log ("STEP4B_ARTIFACTS apply=0 would_write=local_executor.py,qmt_internal_strategy.py from=" + $execArt[0].Name + "," + $sandArt[0].Name)
+} else {
+    $execDst = Join-Path $gwDst "local_executor.py"
+    $sandDst = Join-Path $gwDst "qmt_internal_strategy.py"
+    Copy-Item $($execArt[0].FullName) $execDst -Force
+    Copy-Item $($sandArt[0].FullName) $sandDst -Force
+    # 落地后逐字节自证：写进去的 SHA 必须等于包内产物 SHA（清单第 1 步只证明包没被改，
+    # 这一步证明覆盖动作本身没写歪）。
+    $w1 = (Get-FileHash -Algorithm SHA256 -Path $execDst).Hash.ToLower()
+    $w2 = (Get-FileHash -Algorithm SHA256 -Path $sandDst).Hash.ToLower()
+    $s1 = (Get-FileHash -Algorithm SHA256 -Path $($execArt[0].FullName)).Hash.ToLower()
+    $s2 = (Get-FileHash -Algorithm SHA256 -Path $($sandArt[0].FullName)).Hash.ToLower()
+    if ($w1 -ne $s1 -or $w2 -ne $s2) { Abort 4 "artifact_copy_sha_mismatch" }
+    Log ("STEP4B_ARTIFACTS placed=2 sha_match=1 executor=" + $execArt[0].Name + " sandbox=" + $sandArt[0].Name)
 }
 
 # —— STEP 5：桥落位（QMT 模型沙箱里那份）——
 $bridgeSrc = Join-Path $gwDst "qmt_bridge.py"
 $stratSrc = Join-Path $gwDst "qmt_bridge_strategy.py"
+$internalSrc = Join-Path $gwDst "qmt_internal_strategy.py"
 # 判存在性要分两种脸：动手时找不到＝第 4 步没落成功，必须停；预览时本来就没落码，拿包内源文件判。
 if (-not $Apply) {
     # 预览时判的是**包内**那两份，路径要带 qmt_gateway 这一层（写漏就是预览必假红：
     # 11-03 用 pwsh 真跑预览才撞出来，静态读代码看不出来）。
     $bridgeSrc = Join-Path $payload "qmt_gateway\qmt_bridge.py"
     $stratSrc = Join-Path $payload "qmt_gateway\qmt_bridge_strategy.py"
+    # §FRIEND-CARRIER：预览时 STEP4B 没落码，内置策略要指包内**产物**，不是那份空模板。
+    $internalSrc = $($sandArt[0].FullName)
 }
 if (-not (Test-Path $bridgeSrc)) { Abort 5 "bridge_absent_after_layout" }
+if (-not (Test-Path $internalSrc)) { Abort 5 "internal_strategy_absent_after_layout" }
 $qmtPy = Join-Path $QmtRoot "python"
 $sitePy = Join-Path $QmtRoot "bin.x64\lib\site-packages"
 $placed = @()
@@ -198,6 +236,11 @@ if ($Apply) {
     # 策略文件名是 QMT 侧的约定（运营机同款），不是我们起的名字。
     Copy-Item $stratSrc (Join-Path $qmtPy "新建策略文件.py") -Force
     $placed += "strategy"
+    # §FRIEND-CARRIER：11-05 后唯一合法自动下单形态是 QMT 沙箱内置策略
+    # （builtins 的 passorder，零文件 I/O、零网络）。把构建期烘好全量规则的那份产物
+    # 落进 QMT 策略目录；新建/挂载策略仍是 QMT 里的人工一步（见 SETUP.txt）。
+    Copy-Item $internalSrc (Join-Path $qmtPy "qmt_internal_strategy.py") -Force
+    $placed += "internal_strategy"
 }
 Log ("STEP5_BRIDGE placed=" + ($(if ($placed.Count) { $placed -join "," } else { "apply0" })) + " manual=qmt_strategy_attach")
 

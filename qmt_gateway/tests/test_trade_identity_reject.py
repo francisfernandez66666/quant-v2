@@ -145,12 +145,15 @@ class TestReportFieldsContractIntact(unittest.TestCase):
         # 先例见 §M4 三条补腿。§DYN-SIZE-v3 再补 synced/data_ts（会话新鲜度）。
         # §EXT-BRAIN-UP（2026-11-05 外脑上行腿批）再补 strategy_version：本地普通进程
         # （report_uplink.py）heartbeat 携带的已安装内置策略版本——同为**有意**契约新增。
+        # §CARRIER-SHADOW（2026-11-05 影子对照批）再补 shadow：载体影子判定那一批行进信封的
+        # 一枚数组键（行内字段面另有 golden 的 shadow_row_fields / shadow_row_emitted_fields
+        # 两面盯着，见 tests/test_report_contract.py）——同样是有意新增，不是漂移。
         self.assertEqual(
             sorted(c["report_event_fields"]),
             sorted(["amount", "asset", "at", "broker", "code", "created_at", "data_ts", "fee",
-                    "from", "name", "order_id", "positions", "price", "qty", "reason", "side",
-                    "side_unverified", "signal_id", "stamp_tax", "status", "strategy_version",
-                    "synced", "trade_id", "traded_at", "type", "user_id"]))
+                    "from", "name", "order_id", "positions", "price", "qty", "reason", "shadow",
+                    "side", "side_unverified", "signal_id", "stamp_tax", "status",
+                    "strategy_version", "synced", "trade_id", "traded_at", "type", "user_id"]))
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 
 

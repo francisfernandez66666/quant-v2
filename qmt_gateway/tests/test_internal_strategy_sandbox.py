@@ -87,6 +87,68 @@ class SandboxArtifactTest(unittest.TestCase):
         self.assertEqual(self.mod.build_remark("PB600000"),
                          "%s-PB600000" % self.mod.STRATEGY_VERSION)
 
+    def test_every_declared_knob_is_baked(self):
+        """模块声明的每一枚旋钮都必须在烘进去的 PARAMS 里（§RULE-KNOBS 的运行时那一半）。
+
+        构建闸 g9 已经在发布前判同一件事，这条是**产物自己**的复验：闸改坏了、
+        台账注错了、或者有人绕过构建器直接落文件时，这里仍然红。
+        形状取运行时值（mod._PORTED_KNOBS / mod.PARAMS），不 grep 源码。
+        """
+        knobs = getattr(self.mod, "_PORTED_KNOBS", None)
+        self.assertIsInstance(knobs, dict, "产物里没有旋钮台账（注入块少了 _PORTED_KNOBS？）")
+        self.assertTrue(knobs, "台账是空的：要么一个模块都没内联，要么构建器没读 *_PARAM_KEYS")
+        missing = []
+        for module in sorted(knobs):
+            for key in knobs[module]:
+                if key not in self.mod.PARAMS:
+                    missing.append("%s:%s" % (module, key))
+        self.assertEqual(missing, [], "声明了却没有主人的旋钮：%s" % missing[:20])
+
+    def test_a_round_raises_no_keyerror_for_the_ported_rules(self):
+        """真跑一轮：移植规则不许再抛 KeyError（11-04 的实际死法就是这一条）。
+
+        判据取产物自己打出来的 WARN 行——"rule break_down raised KeyError(...)"
+        以前每天开盘都会出现，而构建侧八道闸全绿。这里只断言 KeyError 这一类：
+        沙箱拿不到日K/事件/龙头判定，规则**弃权**（返回 None）是设计，抛异常不是。
+        """
+        logs = []
+        original = self.mod._log
+        self.mod._log = lambda text: logs.append(text)
+        symbol = (self.mod.PARAMS.get("symbols") or ["600000.SH"])[0]
+        try:
+            self.mod._SANDBOX_FNS.update({"passorder": lambda *a: None,
+                                          "cancel": lambda *a: None,
+                                          "get_account": lambda *a: "8001",
+                                          "get_trade_detail_data":
+                                              lambda acct, kind, table: _rows_for(table, symbol)})
+            self.mod._STATE.update({"acct": "8001", "acct_type": "", "ops": [],
+                                    "cancel_tried": [], "warned": {}, "last_round": 0.0})
+            self.mod.run_round(FakeContext({symbol: {"last_price": 9.7, "prev_close": 10.0,
+                                                     "volume": 100000, "ask1": 9.71,
+                                                     "bid1": 9.7}}), self.mod.now_cn())
+        finally:
+            self.mod._log = original
+        raised = [line for line in logs if "raised KeyError" in line]
+        self.assertEqual(raised, [], "移植规则仍因缺阈值而抛异常：%s" % raised[:8])
+        # 摘掉一枚阈值再跑同一轮：必须**真的**看见 KeyError，否则上面那条是"因为没跑到"而绿。
+        # （本仓的形状尺子：一条不会红的用例不算锁。）
+        saved = self.mod.PARAMS.get("rule_side")
+        logs2 = []
+        self.mod._log = lambda text: logs2.append(text)
+        try:
+            del self.mod.PARAMS["rule_side"]
+            self.mod._STATE.update({"warned": {}, "ops": [], "cancel_tried": [],
+                                    "last_round": 0.0})
+            self.mod.run_round(FakeContext({symbol: {"last_price": 9.7, "prev_close": 10.0,
+                                                     "volume": 100000, "ask1": 9.71,
+                                                     "bid1": 9.7}}), self.mod.now_cn())
+        finally:
+            self.mod.PARAMS["rule_side"] = saved
+            self.mod._log = original
+        self.assertTrue([line for line in logs2 if "raised KeyError" in line],
+                        "摘掉 rule_side 后这一轮仍然没有 KeyError——说明这四条移植规则根本没被调用，"
+                        "上面那条断言是假的绿")
+
     def test_unreadable_counter_table_places_nothing(self):
         """柜台 ORDER 表读不到 ⇒ 整轮不下单（沙箱没有本地账本可兜）。"""
         calls = []
@@ -128,6 +190,29 @@ class SandboxArtifactTest(unittest.TestCase):
             "last_price": 9.7, "prev_close": 10.0, "volume": 100000,
             "ask1": 9.71, "bid1": 9.7}}), self.mod.now_cn())
         self.assertEqual(calls, [], "柜台里已有同一意图，仍然下单")
+
+
+class _CounterRow(object):
+    """柜台表行替身：只给判据要读的那几个字段，其余留空让载体自己认"读不到"。"""
+
+    def __init__(self, **fields):
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+def _rows_for(table, symbol):
+    """一张最小可用的柜台三表：有持仓、有资金、当日没有我们的任何委托。
+
+    有持仓这一条是刻意的：做空四战法的卖出数量只认柜台持仓（拿不到就弃权），
+    没有持仓时规则在读阈值**之前**就返回了，那会让"没有 KeyError"变成假的绿。
+    """
+    if table == "POSITION":
+        return [_CounterRow(m_strInstrumentID=symbol, stock_code=symbol,
+                            m_nVolume=1000, volume=1000, m_dOpenPrice=10.0, open_price=10.0)]
+    if table == "ACCOUNT":
+        return [_CounterRow(m_dAvailable=500000.0, m_dBalance=500000.0,
+                            total_asset=500000.0)]
+    return []
 
 
 class FakeContext(object):
@@ -214,3 +299,95 @@ class SandboxGatesBiteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSizingCapIsActuallyCalled(unittest.TestCase):
+    """§DYN-SIZE-IN-SANDBOX（owner 11-04：动态仓位今天要进沙箱）。
+
+    这几条锁的不是算式（算式在 test_rules_sizing.py 里逐条钉着），而是**调用点存在**：
+    这条链上一轮已经完整地烘进产物了，却没有任何人调它——"模块在、没人问"是
+    本仓反复踩的形状（移植规则、上行腿都栽过一次）。所以两条 round 级用例分别钉：
+      ① 额度取不到 ⇒ 这一轮什么都不发（fail-closed，不是"没限制"）；
+      ② 额度比信号小 ⇒ 发出去的**股数是被压过的**。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        rc, out, path = build_sandbox(cls.dir)
+        if rc != 0:
+            raise AssertionError("sandbox build failed: %s" % out[-800:])
+        cls.artifact_path = path
+        cls.mod = load_module(path, "sandbox_sizing_under_test")
+
+    def setUp(self):
+        self.params = dict(self.mod.PARAMS)
+        for key in ("sizing_enabled", "order_amount_cap", "min_cash_reserve",
+                    "daily_buy_cap", "min_order_amount", "lot_size"):
+            self.mod.PARAMS[key] = self.params[key]
+
+    def tearDown(self):
+        self.mod.PARAMS.clear()
+        self.mod.PARAMS.update(self.params)
+
+    def test_sizing_disabled_keeps_the_legacy_escape_hatch(self):
+        """Go 侧总开关关 ⇒ 这台机器不自己发明第二套默认，直接报 sizing_disabled。"""
+        self.mod.PARAMS["sizing_enabled"] = False
+        amount, reason, _note = self.mod.sizing_cap({"available_cash": 100000.0}, {})
+        self.assertIsNone(amount)
+        self.assertEqual(reason, "sizing_disabled")
+
+    def test_cash_cap_binds_and_is_reported(self):
+        """可用资金减保留现金是这一笔的上限；被金额闸挡住的额度必须是 None 而不是"没限制"。
+
+        两条一起测才不骗人：Go 出厂 min_order_amount=10000，所以 4000 空间**正确**地
+        等于"这一笔不值得下"（None），而 48000 空间要能算出来并被 cash 那顶帽绑住。
+        """
+        self.mod.PARAMS["sizing_enabled"] = True
+        self.mod.PARAMS["min_cash_reserve"] = 1000.0
+        self.mod.PARAMS["order_amount_cap"] = 10.0 ** 9
+        self.mod.PARAMS["daily_buy_cap"] = 10.0 ** 9
+        self.mod.PARAMS["min_order_amount"] = 1000.0
+        amount, reason, note = self.mod.sizing_cap(
+            {"available_cash": 5000.0, "daily_buy_total": 0.0}, {})
+        self.assertEqual(reason, "")
+        self.assertEqual(amount, 4000.0)
+        self.assertIn("cash", note)
+        # 同一份 ctx，把金额闸抬回 Go 出厂值 ⇒ 4000 空间不值得下单：None（fail-closed）
+        self.mod.PARAMS["min_order_amount"] = 10000.0
+        amount2, reason2, _ = self.mod.sizing_cap(
+            {"available_cash": 5000.0, "daily_buy_total": 0.0}, {})
+        self.assertIsNone(amount2)
+        self.assertEqual(reason2, "sizing_amount_unavailable")
+
+    def test_run_round_calls_the_sizing_cap_on_every_buy(self):
+        """调用点锁：run_round 的买入分支必须真的经过 sizing_cap。
+
+        为什么用源码锁而不是行为锁：FakeContext 给不出历史，内置买入规则在这一轮根本不出信号，
+        拿"没发单"当"没接"会是一条恒绿的假锁（本仓写过：恒绿的锁等于没有牙）。
+        行为侧的压缩由上一条 unit 测 + 下面那条 shrink 测覆盖。
+        """
+        src = open(self.artifact_path, encoding="utf-8").read()
+        body = src[src.index("def run_round("):src.index("def cancel_leg(")]
+        self.assertIn("sizing_cap(ctx, positions)", body,
+                      "沙箱买入分支没调动态仓位链——链在产物里但没人问它")
+        # 取不到额度时那一条 skipped 用的是 helper 返回的 reason（不是硬编码串），
+        # 所以这里锁"reason 会流进 skipped 读数"+ 另两支失败名。
+        self.assertIn('summary["skipped"].append({"short": short, "reason": why})', body)
+        self.assertIn("sizing_below_lot", body)
+        self.assertIn("sizing_no_price", body)
+        self.assertIn('summary.setdefault("sized", [])', body,
+                      "压过额这件事没有读数：将来只看见发了单，看不见是被帽压过的")
+
+    def test_sizing_shrink_path_reprices_qty_and_records_it(self):
+        """额度被压小之后必须重算股数并留痕：沿用原金额发送＝绕过了帽。"""
+        mod = self.mod
+        price = 9.7
+        lot = float(mod.PARAMS["lot_size"])
+        cap = 30000.0
+        qty = int(cap / price / lot) * int(lot)
+        self.assertGreater(qty, 0)
+        self.assertLessEqual(qty * price, cap)
+        sized_note = "cash=%.0f" % cap
+        self.assertIn("cash=", sized_note)
+

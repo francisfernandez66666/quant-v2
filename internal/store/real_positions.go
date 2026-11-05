@@ -255,11 +255,28 @@ func (d *DB) ensureAnchorPriceColumn() error {
 // anchor_source 为空＝这列上线前的存量行，宁可不开腿（保守方向，事后回查有理由）。
 // English: a cost-derived anchor is good enough to compute risk lines but never to justify an
 // intraday round-trip; only a first-buy provenance grants the ticket, empty counts as unknown.
+// anchorTicketSources 有"开日内回转腿"资格的锚点来源档位——AnchorTicket 判据的**唯一清单**。
+//
+// 为什么提成清单（§DERIVE-CARRIER-1105，2026-11-05）：载体那条移植腿判的是同一件事
+// （rules_t 的 t_anchor_ok_sources），而它没有 Go 的方法可调，只能收一张表。
+// 以前这张表只存在于 `return` 那一行的两个 `==` 里——载体侧要么抄、要么猜，
+// 抄对了也仍然是两本账：这里加一档、那边不知道，"摊薄成本冒充锚点"就从移植侧绕回来。
+// 清单与那两个常量同源（就是它们本身），所以枚举改动只有一处要动。
+// 空串（存量行没写来源）刻意不在清单里：判据是"来源必须是可证那一档"，缺证据＝没资格。
+// English: the single list of provenances that grant the intraday round-trip ticket; the
+// carrier reads the same list instead of re-typing the two comparisons.
+var anchorTicketSources = []string{AnchorSourceFirstBuyOrder, AnchorSourceFirstLot}
+
 func (p RealPosition) AnchorTicket() bool {
 	if p.AnchorPrice <= 0 {
 		return false
 	}
-	return p.AnchorSource == AnchorSourceFirstBuyOrder || p.AnchorSource == AnchorSourceFirstLot
+	for _, src := range anchorTicketSources {
+		if p.AnchorSource == src {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureAnchorSourceColumn §DYN-T：real_positions.anchor_source 的幂等补列（TEXT NOT NULL DEFAULT <空串>）。

@@ -5322,6 +5322,17 @@ func (c QMTConfig) EffectiveEntryTimeoutSec() int {
 	return 120
 }
 
+// DefaultStrategyConfig 打出四战法的**出厂**策略参数（只读）。
+//
+// 为什么加这一处（2026-11-05）：载体（QMT 内置策略 / 本地执行器）要烘的阈值里有一族是
+// 账号级策略配置（dragon 的 F1~F4 权重、double_bump 的放量倍数与三维权重），它们没有
+// "包内常量"这个主人——真源就是这里的出厂表。导出工具因此必须能**在没有 Manager、
+// 不读任何配置文件**的情况下拿到这张表，否则它只能人手抄一份，而抄的那份没有主人。
+// 本函数只转调既有的 defaultStrategyConfig，不定义任何一个数。
+// English: read-only accessor for the factory strategy table; the carrier exporter reads
+// factory defaults through it instead of copying numbers.
+func DefaultStrategyConfig() StrategyConfig { return defaultStrategyConfig() }
+
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。
 // Dragon 权重为 e2e 验证过的 F1~F4 组合；DoubleBump 权重用于总分构成（Volume/Position/MA）。
 // （defaultStrategyConfig returns the factory-default parameters for the four strategies, tunable

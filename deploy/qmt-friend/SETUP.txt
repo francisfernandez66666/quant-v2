@@ -24,9 +24,27 @@
 
 这个包做什么
 ------------
-它把"在你这台 Windows 上跑起属于你自己的那一根交易执行腿"需要做的七件事串成一次双击：
-校验包内文件 → 检查 Python 与 QMT 客户端 → 落网关代码 → 把桥文件放进 QMT → overlay（VPN）→
-装填（把你那把网关钥匙登记两处）→ 注册四个计划任务 → 起一次并自证。
+它把"在你这台 Windows 上跑起属于你自己的那一根交易执行腿"需要做的事串成一次双击：
+校验包内文件（MANIFEST 逐文件 SHA256）→ 检查 Python 与 QMT 客户端 → 落网关代码 →
+落两份载体产物 → 把桥文件与沙箱策略放进 QMT → overlay（VPN）→
+装填（把你那把网关钥匙登记两处）→ 注册五个计划任务 → 起一次并自证。
+（第五个是 11-05 新加的 QMTF-Carrier-Update：每天 15:40 让这台机器自己去问决策机
+ "我该跑哪一版规则"，拿到新版就校验哈希后更新并回报；缺 Python 或缺更新器时它拒绝注册，
+ 因为注册一个空跑的任务比不注册更坏。）
+
+本包**确实带有全量量化交易规则 + 沙箱策略 py + 一键解压/装载**（11-04 发版前补齐）：
+- 五个规则模块 rules_form.py / rules_ladder.py / rules_factor.py / rules_t.py / rules_sizing.py；
+- 参数真源 local_executor_params.json，以及它的单点导出器 derive_carrier_params.py；
+- 两份**构建期烘好的产物**（不是空模板）：payload\artifacts\local_executor_<版本>.py 与
+  payload\artifacts\qmt_internal_strategy_<版本>.py。后者就是 11-05 之后 QMT 沙箱内置策略
+  （唯一合法自动下单形态，builtins 的 passorder，零本地文件读写、零外部网络）——五个规则
+  模块与烘好的阈值都逐字内联在这两份产物里；仓里同名的两份只是模板，只供包内复现构建用；
+- 可复现构建器 build_local_executor.py（连同它读的模板、handler/store 状态词表真源一起在包内），
+  回报腿 report_uplink.py、载体更新轮询 carrier_updater.py、三段自证的更新脚本
+  update_qmt_strategy.ps1 / update_local_executor.ps1 / update_local_executor.bat、
+  看门狗 watchdog.ps1，以及本地执行器安装器 install_local_executor.ps1。
+出包时已从 zip 解压到临时目录、在**包内**重跑构建器，两份产物逐字节 + SHA256 复现一致；
+包内 MANIFEST.json 给每个文件记了 SHA256，装的时候第 1 步逐文件核对，对不上直接 ABORT。
 
 包里**没有**、也永远不会有的东西
 --------------------------------
@@ -42,19 +60,34 @@
 4) 网关钥匙（运营签发的一串，只有你这一把）。
 5) overlay 的隧道配置文件（运营发给你，放进 C:\ProgramData\WireGuard\Tunnels\ 这个目录）。
 
-怎么装
-------
-双击 install_entry.bat，跟着问句走。看到最后一行
+怎么装（一键解压 / 装载）
+------------------------
+1) 用资源管理器打开本 zip，点"全部提取"解压到任意目录（这一步就是"一键解压"；包体在
+   解压出的 payload\ 里，入口是 payload\tools\install_entry.bat）。
+2) 双击 install_entry.bat，跟着问句走。看到最后一行
     LEG_INSTALL=PASS commit=… contract_fp=… overlay=… tunnel=…
 就算装成。任何一步不过都会打
     LEG_INSTALL=ABORT step=N reason=…
 然后**停下不动**——不会出现"装了一半看起来也在跑"那种状态。
+
+纪律（写死在脚本里，不是愿望）：
+- 缺省只预览：命令行直调 install.ps1（不带 -Apply）只打印完整计划，不答问题、不写任何字节；
+  真正落码只由 install_entry.bat 传 -Apply 触发。
+- 动手前先逐文件核对 MANIFEST 的 SHA256；产物数量不对、产物覆盖后哈希对不上、任何一步
+  不过都 ABORT 并停下，已写的部分保留现场、不假装没动。
+- 想先验包、不装：在构建机上跑 build_friend_package.sh --check <本 zip>，只读、不落盘、
+  不改任何字节；绿了打 CHECK_OK files=… artifacts=2，篡改一个字节必转红。
+- 出包时的可复现自证：把 zip 解到临时目录、在包内重跑构建器，两份产物逐字节比对；
+  复现不上就删包不出包（ABORT 不留半态）。这些都在构建机跑，你不用做。
 
 装完还有一件事要你亲手做（软件做不到）
 --------------------------------------
 在 QMT 客户端里新建/挂载模型策略，文件已经放在
     <QMT 安装目录>\python\新建策略文件.py
 （这一步是 QMT 自己的交互流程，没有任何外部程序能替你点。）
+QMT 的 python 目录里另外放了本包新带的 qmt_internal_strategy.py ——就是那份含全量规则的
+沙箱策略产物，11-05 之后唯一合法的自动下单形态。**挂哪一份、怎么挂等运营通知**：通道形态
+正在重定，在运营明确通知之前本包仍按最上面三段 11-04 更正办：**不要发给朋友、不要装**。
 挂好以后，交易日 08:40 计划任务会自动把客户端与网关拉起来；15:30 起会自己判断"今天能不能关 QMT"，
 判不过会留原因，**不要手工硬关**。
 

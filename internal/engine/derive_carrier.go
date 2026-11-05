@@ -36,3 +36,44 @@ func TMinBaseKeepQty() int { return tLMinBaseKeep }
 func TRegimeMinVotes() int { return tRegimeMinVotes }
 
 func seconds(d time.Duration) float64 { return d.Seconds() }
+
+// ── §DERIVE-CARRIER-1105 第二批：T 的**词表 / 比例 / 钟点**只读导出 ──────────────────
+//
+// 为什么这批也要从 Go 出（而不是让载体自己写）：rules_t.py 是从本文件逐行移植的判定链，
+// 它按 params 读走"哪些市场状态放行、哪些拦截""卖腿必须留下多少底仓""什么字样算被撤"
+// "开盘冷静期从几点起算"。这四件事在 Go 都是**判据本身**（switch 的 case、quota 的除法、
+// Contains 的字样、tLDayStart 的钟点），不是配置项——判据在两处各写一遍，
+// 就是"引擎改了门、载体还在按旧门跑"，而两边都自检不出来。
+// 本文件仍然一个数字都没有：每一项都转调产品代码正在比较的那一枚常量。
+// English: the vocabulary / ratio / clock literals the live T gate itself compares against,
+// exported read-only so the ported carrier cannot grow a second copy of any of them.
+
+// TRegimeAllowStates 行情门**放行**的市场状态档（真源：regimeBlock 的 case 列表）。
+// 只有一档：盘整。空串不在这里——它在 Go 里是"弃权"（放行并出声），不是一档读数，
+// 把它并进放行表会让"从未产生读数"看起来像"读到了放行档"。
+func TRegimeAllowStates() []string { return []string{tLRegimeRange} }
+
+// TRegimeBlockStates 行情门**拦截**的市场状态档（真源同上：牛市 / 熊市）。
+// 未知状态在 Go 走 default 分支 fail-closed，因此它既不在放行表也不在拦截表——
+// 载体侧同样按"两张表都不在 ⇒ 不做 T"判，语义才对齐。
+func TRegimeBlockStates() []string { return []string{tLRegimeBull, tLRegimeBear} }
+
+// TSellKeepPositionPct 反 T 卖腿必须留下的原持仓比例（%）。真源：tLSellKeepPositionPct。
+func TSellKeepPositionPct() float64 { return float64(tLSellKeepPositionPct) }
+
+// TCancelStatusToken 委托状态里"算被撤"的字样。真源：tLStatusCancelToken（tLUnfilledReasonOf 比较的就是它）。
+// 载体必须收**字符串**而不是自己写中文：产物里的中文字面量会被 GBK 终端换成 ?。
+func TCancelStatusToken() string { return tLStatusCancelToken }
+
+// TFeeBufferPct 冻结款费用缓冲（%）。真源：tLFeeBufferPctDefault——
+// 本包在"配置层给不出该值"时用的就是它（不是 0：0 缓冲会让"差几毛钱买不回"变成一次半态）。
+func TFeeBufferPct() float64 { return tLFeeBufferPctDefault }
+
+// TDayStartClock 开盘冷静期的起算钟点（"HH:MM"，北京时）。
+// 真源是 tLDayStart 本身：这里不写 09:30、也不写 9 与 30，而是**调用那个函数**再把结果渲染成
+// 载体要的写法（time.Format 的布局串是格式说明，不是数值）。
+// 为什么载体需要它：移植腿没有 Go 的时钟，只有 ctx["hhmm"] 这一个读数，
+// 它必须自己判"现在离开盘够不够冷静期"——起算点必须与引擎同一枚。
+// English: renders tLDayStart (the very function the cooling gate uses) into the carrier's
+// "HH:MM" spelling; no clock literal is written here.
+func TDayStartClock() string { return tLDayStart(time.Time{}).Format("15:04") }

@@ -171,6 +171,12 @@ ALLOWED_CALLS = {
     "os.path.join": "build a path",
     "os.path.dirname": "build a path",
     "os.path.isdir": "check a path",
+    # os.path.exists: a pure stat, no capability -- the shadow-journal probe must be
+    # able to answer "there is no journal here" WITHOUT opening (and therefore
+    # creating) the file, because a probe that creates its subject turns "missing"
+    # into "empty" on the next read (missing != empty, the same reason the probe
+    # does not use LocalState()).
+    "os.path.exists": "check a path",
     "os.path.abspath": "build a path",
     # os.makedirs: create the state/log directory.
     "os.makedirs": "create the state directory",
@@ -519,6 +525,100 @@ def drop_top_level_definition(source, name, definition):
     return source.replace(definition + "\n", "", 1)
 
 
+def ported_judgement_legs(source, name):
+    """The judgement legs one ported module DECLARES (its own JUDGEMENT_LEGS list).
+
+    A judgement leg is a callable the carrier asks "how big / is this allowed at all";
+    it never produces a signal kind, so it is not in the module's RULES table and the
+    rule registry would never carry it. The 11-04 batch inlined rules_sizing and its
+    code came along while nothing could reach the readout -- AGENTS still lists
+    "the judgement legs have no call site in either carrier" as a NOT DONE item.
+
+    Read from the module (never a list here) for the same reason as *_PARAM_KEYS:
+    the module owns the contract, and a second copy in this script is two books.
+    Declaring a leg that the module does not actually define is a hard failure:
+    the carrier would look the name up forever and always get "not wired".
+    """
+    import ast
+    tree = ast.parse(source)
+    declared = []
+    defined = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if isinstance(node.value, ast.List):
+                for target in names:
+                    if target == "JUDGEMENT_LEGS":
+                        for item in node.value.elts:
+                            if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                                raise ValueError("ported_judgement_legs_not_a_string_list:%s" % name)
+                            if not item.value.isascii():
+                                raise ValueError("ported_judgement_legs_non_ascii:%s:%s"
+                                               % (name, item.value))
+                            declared.append(item.value)
+    missing = [d for d in declared if d not in defined]
+    if missing:
+        raise ValueError("ported_judgement_leg_not_defined:%s:%s" % (name, ",".join(missing)))
+    return sorted(set(declared))
+
+
+def ported_param_keys(source, name):
+    """Return the params keys one ported module DECLARES it reads, by AST.
+
+    Why this is read from the module and not from a list in this script: the
+    module owns the contract (its *_PARAM_KEYS list is what its rule bodies
+    actually index), and a second copy here is exactly the "two books, one
+    number" shape this repo keeps getting bitten by.
+
+    Two declaration shapes are accepted, and anything else is a hard failure
+    rather than a silent zero:
+      * `X_PARAM_KEYS = ["a", "b", ...]`            (rules_form/ladder/factor/t)
+      * `X_PARAM_KEYS = sorted(X_DEFAULTS)` where the defaults table is a dict
+        literal at top level                        (rules_sizing)
+    A non-ASCII key is refused here as well: it would be baked into a GBK
+    artifact and silently turn into '?'.
+    """
+    import ast
+    tree = ast.parse(source)
+    dict_tables = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    keys = [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+                    dict_tables[target.id] = keys
+    out = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        declared = [n for n in names if n.endswith("_PARAM_KEYS")]
+        if not declared:
+            continue
+        value = node.value
+        if isinstance(value, ast.List):
+            items = value.elts
+        elif (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id == "sorted" and len(value.args) == 1
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id in dict_tables):
+            # 别名指向那张 dict 字面量表：键名就是声明，不算第二次定义。
+            items = [ast.Constant(value=k) for k in dict_tables[value.args[0].id]]
+        else:
+            raise ValueError("ported_param_keys_unreadable:%s:%s" % (name, declared[0]))
+        for item in items:
+            if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                raise ValueError("ported_param_keys_not_a_string_list:%s" % name)
+            if not item.value.isascii():
+                raise ValueError("ported_param_keys_non_ascii:%s:%s" % (name, item.value))
+            out.append(item.value)
+    if not out:
+        raise ValueError("ported_module_declares_no_param_keys:%s" % name)
+    return sorted(set(out))
+
+
 def assemble_pported(params):
     """Inline every ported module params asks for, and merge their RULES tables.
 
@@ -537,12 +637,24 @@ def assemble_pported(params):
     deduped = []
     dropped = {}
     blocks = []
+    knobs = {}
+    legs = {}
     for name in wanted:
         source = read_pported_module(name)
         if source is None:
             missing.append(name)
             continue
         table = ported_rules_table(source, name)
+        # 这一腿以前没有：构建器只验"模块到没到"，从不验"模块声明要的旋钮在不在 PARAMS"。
+        # 11-04 的实际形态就是 rules_form 的代码进来了、它的 102 枚阈值一枚都没进来，
+        # 于是产物里每条移植规则第一次被调用就 raise KeyError——装载自证（g7）看到的是
+        # "模块注册成功"，不是"阈值读得到"，两者差整整一轮盘中。
+        knobs[name] = ported_param_keys(source, name)
+        # 判断腿台账（§JUDGEMENT-LEG）：模块自己声明它暴露哪些"该不该买/买多少"的读数函数。
+        # 内联只把代码搬进来不等于把接线做好——11-04 那批 rules_sizing 进来了、
+        # 产物里没有任何地方能调到 sizing_readout，于是"动态仓位已移植"这句话
+        # 在屏幕上是真的、在钱上是空的。这里把声明烘成显式绑定，g7e 再逐条验它可调。
+        legs[name] = ported_judgement_legs(source, name)
         for kind in sorted(table):
             if not codes.get(kind):
                 missing_codes.append("%s.%s" % (name, kind))
@@ -575,18 +687,39 @@ def assemble_pported(params):
     if deduped:
         sys.stdout.write("PORTED_DEDUP=%s\n" % ",".join(deduped))
     if not blocks:
-        return "\n_PORTED_RULES = {}\n_PORTED_INLINE = {}\n"
+        # 没有模块内联进来时也必须把两处注册表建出来：载体代码里
+        # _PORTED_LEGS.get(...) 与 _PORTED_KNOBS 是无条件读的，缺名字就是 NameError，
+        # 而那会把"这台机器一个移植模块都没带"这种可读的坏消息变成一条崩栈。
+        return ("\n_PORTED_RULES = {}\n_PORTED_INLINE = {}\n_PORTED_KNOBS = {}\n"
+                "_PORTED_LEGS = {}\n_PORTED_LEGS_DECLARED = {}\n")
     merged = "\n".join(
         ["    %r: _RULES_SNAPSHOT_%s," % (n, n.upper()) for n in wanted])
+    # 旋钮台账：每个内联进来的模块自己声明它读哪些 params，构建期一次性烘成数据。
+    # 为什么烘成表而不是让产物自己去解析源码：装载后的载体里没有"模块"这个概念了，
+    # 而运维在机器上必须能一眼看到"这条规则要的阈值到底缺哪几枚"（--selftest 那一行）。
+    # json.dumps 在这里就是 Python 字面量，且 ensure_ascii 保证 GBK 终端不会被中文字节咬。
+    knob_table = json.dumps({n: knobs[n] for n in sorted(knobs)},
+                            ensure_ascii=True, sort_keys=True)
+    # 判断腿绑定：模块声明的每条读数函数都在产物里**显式绑一次名**。
+    # 为什么显式赋值而不是让载体自己翻命名空间（globals()/vars()）：闸 g2 禁止载体做
+    # 命名空间自省——一个能查自己环境的载体就能长出没人审过的侧信道；而 import 在单文件
+    # 载体里取决于文件落在哪，这跟"内联而不是运行时 import"是同一条理由。
+    leg_table = json.dumps({n: legs[n] for n in sorted(legs) if legs[n]},
+                           ensure_ascii=True, sort_keys=True)
+    leg_lines = "".join('_PORTED_LEGS[%r] = %s\n' % (leg, leg)
+                        for n in sorted(legs) for leg in legs[n])
     # 注入是**整段替换**标记区，所以注册表本体必须写在注入内容里：
     # 少这一行，产物里就是 `register_ported_rule` 往不存在的 _PORTED_RULES 里写
     # （g7 装载自证今天就是抓的这个）。
-    return ("\n_PORTED_RULES = {}\n" + "\n\n".join(blocks) +
+    return ("\n_PORTED_RULES = {}\n_PORTED_KNOBS = " + knob_table +
+            "\n_PORTED_LEGS = {}\n_PORTED_LEGS_DECLARED = " + leg_table + "\n"
+            + "\n\n".join(blocks) +
             "\n\n_PORTED_INLINE = {\n" + merged + "\n}\n" +
             "\nfor _name, _table in _PORTED_INLINE.items():\n"
             "    for _kind, _fn in (_table or {}).items():\n"
             "        register_ported_rule(_kind, _fn, _name)\n"
             "del _name, _kind, _fn\n"
+            + leg_lines +
             "\n_PORTED_RULES = _PORTED_RULES\n")
 
 
@@ -628,6 +761,70 @@ def gate_pported_short_codes_unique(artifact):
     if not seen:
         return False, "signal_codes_unreadable"
     return True, "short_codes_unique n=%d" % len(seen)
+
+def gate_ported_rule_knobs(artifact):
+    """g9: every knob an inlined ported module declares must be in the baked PARAMS.
+
+    This gate exists because the eight gates before it can all be green while the
+    artifact cannot compute a single signal. The 11-04 batch is the proof: the
+    bear-tactic rules were ported into rules_form.py, the module was inlined, the
+    registry loaded, g7's smoke calls passed -- and the first handlebar raised
+    KeyError('bd_min_bars') for every one of them, because the VALUES those bodies
+    read had never been brought over (102 of the 105 declared keys existed nowhere).
+
+    A rule that cannot read its threshold must not be publishable. The module
+    declares the list itself (FORM_PARAM_KEYS etc.), so this stays true without
+    anyone maintaining a second inventory here.
+    """
+    import ast
+    tree = ast.parse(artifact)
+    baked = set()
+    knobs = None
+    wanted_modules = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "PARAMS" in names and isinstance(node.value, ast.Dict):
+            for key, value in zip(node.value.keys, node.value.values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    baked.add(key.value)
+                # What params says must be inlined: the ledger has to cover THESE,
+                # not just whatever rows happen to have been baked. Without this,
+                # an artifact whose knob table is an empty dict passes with
+                # "declared=0 modules=0" -- the gate would grade "never checked"
+                # as "checked and clean", which is the exact shape g9 was born to kill.
+                if key.value == "ported_modules" and isinstance(value, ast.List):
+                    wanted_modules = set(getattr(e, "value", None) for e in value.elts)
+                    wanted_modules.discard(None)
+        if "_PORTED_KNOBS" in names and isinstance(node.value, ast.Dict):
+            knobs = {}
+            for key, value in zip(node.value.keys, node.value.values):
+                module = getattr(key, "value", None)
+                if not isinstance(module, str) or not isinstance(value, ast.List):
+                    continue
+                knobs[module] = [getattr(e, "value", None) for e in value.elts]
+    if knobs is None:
+        return False, "knob_table_absent"
+    if not baked:
+        return False, "baked_params_unreadable"
+    missing = []
+    declared = 0
+    for module in sorted(knobs):
+        for key in knobs[module]:
+            declared += 1
+            if key not in baked:
+                missing.append("%s:%s" % (module, key))
+    if missing:
+        return False, "rule_knobs_missing n=%d keys=%s" % (len(missing), ",".join(missing))
+    # 缺件检查放在"哪一枚阈值没烘上"之后：两条都成立时，点名具体阈值的那句才是运维要看的第一句。
+    if wanted_modules and not knobs:
+        return False, "knob_table_absent:modules=%s" % ",".join(sorted(wanted_modules))
+    unledgered = sorted(m for m in wanted_modules if m not in knobs)
+    if unledgered:
+        return False, "knob_ledger_missing_module=%s" % ",".join(unledgered)
+    return True, "rule_knobs_baked declared=%d modules=%d" % (declared, len(knobs))
+
 
 def gate_ascii(artifact):
     """G1: the artifact must contain no non-ASCII byte."""
@@ -1173,6 +1370,15 @@ def gate_executor_loads(artifact):
 
     # Import is not enough -- a name used only inside one branch blows up on the
     # first call that reaches it. So exercise the pure helpers every round depends on.
+    # §JUDGEMENT-LEG: 模块自己声明的判断腿必须真的**可调**，不是"文件在内联区里出现过"。
+    # 11-04 的形态就是 rules_sizing 的代码进来了、没有任何名字能调到它，于是"动态仓位已移植"
+    # 这句话在装载自证里是绿的，在盘上是空的。声明表与绑定表两处都必须对得上，缺一即红。
+    declared_legs = namespace.get("_PORTED_LEGS_DECLARED") or {}
+    bound_legs = namespace.get("_PORTED_LEGS") or {}
+    for module_name, leg_names in sorted(declared_legs.items()):
+        for leg in leg_names:
+            if not callable(bound_legs.get(leg)):
+                return False, "executor_judgement_leg_unbound:%s.%s" % (module_name, leg)
     try:
         vocab, terminals = namespace["counter_status_vocab"]()
         if not vocab or not terminals:
@@ -1407,7 +1613,9 @@ def main(argv=None):
     except ValueError as exc:
         return fail("ported_rules_inject_failed", str(exc))
     gates = gates + [("g8_short_codes_unique", gate_pported_short_codes_unique,
-                     "two rules must not share one counter remark code")]
+                     "two rules must not share one counter remark code"),
+                    ("g9_rule_knobs_baked", gate_ported_rule_knobs,
+                     "every knob a ported module declares must be present in the baked PARAMS")]
 
     ok, results = run_gates(artifact, gates)
     if not ok:
@@ -1416,6 +1624,11 @@ def main(argv=None):
         for name, gate_ok, detail in results:
             if not gate_ok:
                 sys.stdout.write("GATE_FAIL gate=%s detail=%s\n" % (name, detail))
+        # 缺旋钮给**自己的**中止原因：这一个问题运维只关心"哪几枚阈值没有主人"，
+        # 把它混进 gate_failed 的闸名清单里，就得再去翻 detail 才知道是钱的事。
+        knob_detail = [d for n, o, d in results if not o and n == "g9_rule_knobs_baked"]
+        if knob_detail:
+            return fail("rule_knobs_missing", knob_detail[0])
         failed = [name for name, gate_ok, _d in results if not gate_ok]
         return fail("gate_failed", ",".join(failed))
 

@@ -33,6 +33,21 @@ var defaultTradeTime = TradeTimeConfig{
 	AfternoonStart: 1300, AfternoonEnd: 1330,
 }
 
+// 时段边界的两枚"写死"钟点（§DERIVE-CARRIER-1105 命名，2026-11-05）。
+//
+// 为什么要把它们从 switch 里提出来：载体（QMT 内置策略 / 本地执行器）移植做 T 的时段门时，
+// 需要的是"哪一段时间引擎会驱动判定链"这个**区间表**；这两个边界此前只活在
+// CurrentSession / IsContinuousTrade 的字面量里，载体侧要么抄一份（两本账）、要么自己猜。
+// 命名之后判据与只读导出读的是同一组常量。
+// 其余边界一律走 defaultTradeTime 的字段（可被 SetTradeTimeConfig 覆盖的那几个），
+// 这里只命名**覆盖不到**的那两个。
+// English: the two clock bounds no config field covers; the carrier's session gate reads
+// the same constants the session function compares against.
+const (
+	sessionPreMarketStart = 830  // 盘前观测段起点（早于它 CurrentSession 一律 SessionClosed）
+	sessionMorningEnd     = 1130 // 早盘收市＝午休起点（下午段另由 AfternoonStart 给）
+)
+
 // ApplyConfig 应用配置中的交易时段参数。
 func ApplyConfig(cfg TradeTimeConfig) {
 	SetTradeTimeConfig(cfg)
@@ -274,11 +289,11 @@ func CurrentSession(now time.Time) MarketSession {
 	// 按 HHMM 分钟数判断所在时段：盘前/早盘/午休/午盘/盘后。
 	m := now.Hour()*100 + now.Minute()
 	switch {
-	case m >= 830 && m < defaultTradeTime.FullOpen:
+	case m >= sessionPreMarketStart && m < defaultTradeTime.FullOpen:
 		return SessionPreMarket
-	case m >= defaultTradeTime.FullOpen && m < 1130:
+	case m >= defaultTradeTime.FullOpen && m < sessionMorningEnd:
 		return SessionMorningTrade
-	case m >= 1130 && m < defaultTradeTime.AfternoonStart:
+	case m >= sessionMorningEnd && m < defaultTradeTime.AfternoonStart:
 		return SessionPreAfternoon
 	case m >= defaultTradeTime.AfternoonStart && m < defaultTradeTime.TradeClose:
 		return SessionAfternoonTrade
@@ -317,7 +332,7 @@ func IsContinuousTrade(now time.Time) bool {
 		return false // §CAL-GATE 休市日没有连续竞价：桥心跳不可信，绝不在此判失联熔断（§CB 误熔方向）
 	}
 	m := now.Hour()*100 + now.Minute()
-	return (m >= 930 && m < 1130) || (m >= defaultTradeTime.AfternoonStart && m < 1457)
+	return (m >= 930 && m < sessionMorningEnd) || (m >= defaultTradeTime.AfternoonStart && m < 1457)
 }
 
 // NextTradeOpen 返回距离下一个交易时段开盘的等待时长。

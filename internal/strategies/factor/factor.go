@@ -39,6 +39,55 @@ import (
 	"quant-trading-v2/internal/strategy_engine"
 )
 
+// 因子评分的**公共尺度与兜底档**（§DERIVE-CARRIER-1105 命名，2026-11-05）。
+//
+// 为什么要把它们从函数里提出来：载体（QMT 内置策略 / 本地执行器）把 scoreRule 整段移植成了
+// rules_factor.py，它按 params 读走"缺省权重 / 缺省方向 / 缺省门槛 / 分值域 / 分位数最少几根样本"
+// 这五件事。这五件事在 Go 都是**判据本身**（`w := 1.0`、`threshold = 70`、`(x+1)/2*100`、
+// `len(vals) < 5`），不是配置项。散在函数里时载体侧只能抄——抄对了也仍是两本账：
+// 这里把门槛调到 65，那份 70 不会跟着动，两条腿就在同一轮里用不同的线判同一个分。
+// 现在判据与只读导出（derive_carrier.go）转调的是同一组常量。
+//
+// 最少 K 线根数**不在这里**：它与形态战法共用 strategy.ScoreMinBars（同一门槛、两个战法），
+// 载体侧也只有一个 min_bars 键——两处各写一遍会漂成"因子要 30 根、形态要 25 根"。
+// English: the factor scorer's own scale/fallback constants; the carrier reads the same names
+// through derive_carrier.go instead of re-typing them.
+const (
+	factorDefaultBuyThreshold = 70.0  // 规则没带门槛时用它（<=0 视为没带）
+	factorDefaultWeight       = 1.0   // 因子没配权重时按"等权"计入
+	factorDefaultDirection    = 1.0   // 因子没配方向时按"越大越强"
+	percentileMinSamples      = 5     // 时序分位最少样本数：不足则 NaN＝该因子不参与
+	scoreDomainFloor          = 0.0   // 复合分下沿
+	scoreDomainShift          = 1.0   // (x + shift)：把 0~1 的凸组合抬到 1~2 再折半
+	scoreDomainDivisor        = 2.0   // / divisor
+	scoreDomainFull           = 100.0 // 分值域上沿，也是置信度的分母
+	finaDefaultScale          = 1.0   // 未登记财务因子的归一分母（原 default 分支 clamp01(v)）
+)
+
+// finaBand 财务因子归一化的**绝对区间**一档：Scale＝满分对应的分母；
+// Offset 非零＝"越低越好"（先减后除，负债率那一档）。
+// 为什么从 switch 提成表（与上面同一理由）：载体移植的是同一张表，而 case 表达式带不走。
+// English: the absolute bands behind finaScore, as data, so the ported carrier reads the
+// same rows the scorer compares against.
+type finaBand struct {
+	Scale  float64
+	Offset float64
+}
+
+var finaBands = map[string]finaBand{
+	"ROE":          {Scale: 20},
+	"YoyNetProfit": {Scale: 30},
+	"SUE":          {Scale: 30},
+	"GrossMargin":  {Scale: 40},
+	"NetMargin":    {Scale: 20},
+	"DebtToAssets": {Scale: 100, Offset: 100}, // 负债率越低越好
+	"EP_ttm":       {Scale: 1},
+	"BP":           {Scale: 1},
+	"SP_ttm":       {Scale: 1},
+	"CFP_ttm":      {Scale: 1},
+	"DP":           {Scale: 5},
+}
+
 // Rule 因子战法的评分规则（由 applied 的 discover-factors 候选构造）。
 // 定义了一组因子的评分逻辑，包括因子列表、权重、方向和买入阈值。
 //
@@ -137,7 +186,7 @@ func (f *FactorStrategy) SetRules(rules []*ActiveRule) {
 			continue
 		}
 		if r.BuyThreshold <= 0 {
-			r.BuyThreshold = 70
+			r.BuyThreshold = factorDefaultBuyThreshold
 		}
 		if r.ID == "" {
 			r.ID = "fac_auto"
@@ -216,7 +265,7 @@ func (f *FactorStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "nodata", Details: map[string]float64{}}, nil
 	}
 	md, ok := data.(*strategy_engine.StockMarketData)
-	if !ok || md == nil || len(md.KLines) < 30 {
+	if !ok || md == nil || len(md.KLines) < strategy.ScoreMinBars {
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "nodata",
 			Details: map[string]float64{}, Reasons: map[string]string{"factor": "K线不足30根"}}, nil
 	}
@@ -279,11 +328,11 @@ func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries)
 		if math.IsNaN(pct) {
 			continue
 		}
-		dir := 1.0
+		dir := factorDefaultDirection
 		if d, ok := r.Directions[fid]; ok {
 			dir = float64(d)
 		}
-		w := 1.0
+		w := factorDefaultWeight
 		if wv, ok := r.Weights[fid]; ok {
 			w = wv
 		}
@@ -303,16 +352,16 @@ func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries)
 	// total/used∈[0,1]，(total/used+1)/2×100 恒 ≥50（现库权重均非负；若将来引入负权重此域会变宽）。
 	// 后果之一：扫参门槛网格 40/45 两档对因子规则恒不过滤（哑火档），
 	// 见 btreplay/sweep.go defaultPoolConfig 的 ScoreFrom 注释。
-	score := (total/used + 1) / 2 * 100
-	if score < 0 {
-		score = 0
+	score := (total/used + scoreDomainShift) / scoreDomainDivisor * scoreDomainFull
+	if score < scoreDomainFloor {
+		score = scoreDomainFloor
 	}
-	if score > 100 {
-		score = 100
+	if score > scoreDomainFull {
+		score = scoreDomainFull
 	}
 	threshold := r.BuyThreshold
 	if threshold <= 0 {
-		threshold = 70
+		threshold = factorDefaultBuyThreshold
 	}
 	pass := score >= threshold
 	level := "watch"
@@ -321,7 +370,7 @@ func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries)
 	}
 	return &strategy.Evaluation{
 		TotalScore: score, Pass: pass, Level: level,
-		Confidence: score / 100,
+		Confidence: score / scoreDomainFull,
 		Details:    details,
 		Reasons:    map[string]string{"factor": "因子复合分" + strconv.FormatFloat(score, 'f', 2, 64)},
 	}
@@ -510,7 +559,7 @@ func nanSlice(n int) []float64 {
 // English: returns the percentile rank (0~1) of the last value within the series; NaN when too short
 // or no valid values. Maps a factor's current value to its relative strength vs its own history.
 func percentile(vals []float64) float64 {
-	if len(vals) < 5 {
+	if len(vals) < percentileMinSamples {
 		return math.NaN()
 	}
 	last := vals[len(vals)-1]
@@ -562,24 +611,16 @@ func finaScore(fid string, v float64) float64 {
 	if math.IsNaN(v) {
 		return math.NaN()
 	}
-	switch fid {
-	case "ROE":
-		return clamp01(v / 20) // ROE≥20% 满分
-	case "YoyNetProfit", "SUE":
-		return clamp01(v / 30) // 净利同比≥30% 满分
-	case "GrossMargin":
-		return clamp01(v / 40)
-	case "NetMargin":
-		return clamp01(v / 20)
-	case "DebtToAssets":
-		return clamp01((100 - v) / 100) // 负债率越低越好
-	case "EP_ttm", "BP", "SP_ttm", "CFP_ttm":
-		return clamp01(v) // 估值倒数，越大越便宜（0 处截断）
-	case "DP":
-		return clamp01(v / 5) // 股息率
-	default:
-		return clamp01(v)
+	// 判据读的是包级表 finaBands（与只读导出同一份）；未登记的因子按原 default 分支
+	// 直接 clamp01(v)，也就是除以 finaDefaultScale。
+	band, ok := finaBands[fid]
+	if !ok {
+		band = finaBand{Scale: finaDefaultScale}
 	}
+	if band.Offset != 0 {
+		v = band.Offset - v // 越低越好那一档（负债率）
+	}
+	return clamp01(v / band.Scale)
 }
 
 // clamp01 把值截断到 [0,1]。

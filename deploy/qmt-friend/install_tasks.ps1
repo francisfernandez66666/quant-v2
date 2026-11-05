@@ -24,6 +24,7 @@ param(
     [string]$Watchdog    = "",
     [string]$QmtExe      = "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe",
     [string]$PsExe       = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe",
+    [string]$PythonExe   = "C:\Python312\python.exe",
     [switch]$Apply,
     [switch]$Uninstall
 )
@@ -40,6 +41,10 @@ $T1 = "QMTF-Client-Ensure"
 $T2 = "QMTF-Client-Start"
 $T3 = "QMTF-Gateway-Ensure"
 $T4 = "QMTF-Close"
+# 第五条（11-05 补，owner 11-04 原话"每天收盘后这些规则自动更新一次"）：
+# 内置策略自己不能更新自己（不落文件、不联网），所以更新动作必须由这台机器上的普通进程做。
+# 15:40 是刻意选的：收盘结算与三份快照已落（15:00/15:30 那条关闭腿之后），且离次日 08:35 拉起还够远。
+$T5 = "QMTF-Carrier-Update"
 
 function Tr($mode) {
     return ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Mode {2} -GatewayDir "{3}"' -f `
@@ -47,7 +52,7 @@ function Tr($mode) {
 }
 
 if ($Uninstall) {
-    foreach ($t in @($T1, $T2, $T3, $T4)) {
+    foreach ($t in @($T1, $T2, $T3, $T4, $T5)) {
         if (-not $Apply) {
             Write-Host ("WOULD_DELETE task={0}" -f $t)
             continue
@@ -59,18 +64,31 @@ if ($Uninstall) {
     exit 0
 }
 
-# 四条注册。schtasks 的 /TR 里嵌套引号只能按这种写法转义，PS 5.1 没有更干净的等价物。
+# 五条注册。schtasks 的 /TR 里嵌套引号只能按这种写法转义，PS 5.1 没有更干净的等价物。
 $jobs = @(
     @{ Name = $T1; Sc = "DAILY"; St = "08:35"; Tr = (Tr "ClientEnsure"); It = $true },
     @{ Name = $T2; Sc = "ONCE";  St = "23:59"; Tr = ('"{0}"' -f $QmtExe); It = $true },
     @{ Name = $T3; Sc = "MINUTE"; Mn = 5; Tr = (Tr "GatewayEnsure"); It = $false },
-    @{ Name = $T4; Sc = "MINUTE"; Mn = 5; Tr = (Tr "Close"); It = $false }
+    @{ Name = $T4; Sc = "MINUTE"; Mn = 5; Tr = (Tr "Close"); It = $false },
+    @{ Name = $T5; Sc = "DAILY"; St = "15:40"; It = $false;
+       Tr = ('"{0}" "{1}" --once --config "{2}"' -f `
+             $PythonExe, (Join-Path $GatewayDir "carrier_updater.py"), (Join-Path $GatewayDir "config.xt.json")) }
 )
 
 foreach ($j in $jobs) {
     if (-not $Apply) {
         Write-Host ("WOULD_CREATE task={0} sch={1} run={2}" -f $j.Name, $j.Sc, $j.Tr)
         continue
+    }
+    if ($j.Name -eq $T5) {
+        if (-not (Test-Path $PythonExe)) {
+            Write-Host "TASKS_RESULT=ABORT reason=no_python_for_carrier_update（注册了也是空跑：先装 Python 再重跑本脚本）"
+            exit 2
+        }
+        if (-not (Test-Path (Join-Path $GatewayDir "carrier_updater.py"))) {
+            Write-Host "TASKS_RESULT=ABORT reason=no_carrier_updater"
+            exit 2
+        }
     }
     if (-not (Test-Path $QmtExe) -and $j.Name -eq $T2) {
         Write-Host "TASKS_RESULT=ABORT reason=no_qmt_exe（QMT 客户端路径不对，注册了也是空跑；装填器应先修 -QmtExe）"
@@ -93,7 +111,7 @@ foreach ($j in $jobs) {
 # 注册后复读自证：四个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
 if ($Apply) {
     $missing = @()
-    foreach ($n in @($T1, $T2, $T3, $T4)) {
+    foreach ($n in @($T1, $T2, $T3, $T4, $T5)) {
         $found = schtasks /Query /TN $n 2>$null
         if (-not $found) { $missing += $n }
     }
@@ -101,7 +119,7 @@ if ($Apply) {
         Write-Host ("TASKS_RESULT=ABORT reason=reread_missing tasks={0}" -f ($missing -join ","))
         exit 2
     }
-    Write-Host "TASKS_REREAD_MATCH=1 tasks=4"
+    Write-Host "TASKS_REREAD_MATCH=1 tasks=5"
 }
 
 Write-Host ("TASKS_RESULT={0}" -f $(if ($Apply) { "INSTALLED" } else { "DRYRUN" }))

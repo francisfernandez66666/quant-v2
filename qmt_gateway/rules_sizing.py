@@ -280,6 +280,15 @@ SIZING_DEFAULTS = {
 
 SIZING_PARAM_KEYS = sorted(SIZING_DEFAULTS)
 
+# What this module exposes as a JUDGEMENT leg: a callable the carrier may ask
+# "how big / allowed at all", which never produces a signal kind of its own.
+# Declared here (not hardcoded in the builder) for the same reason the *_PARAM_KEYS
+# lists are: the carrier must be able to prove the leg arrived. The builder bakes
+# each name below into _PORTED_LEGS and gate g7e refuses to publish while any
+# declared leg is not actually callable in the artifact -- "inlined but nobody can
+# reach it" is exactly the shape AGENTS still lists as a NOT DONE item.
+JUDGEMENT_LEGS = ["sizing_readout"]
+
 # Every ctx key this chain reads. Declared rather than discovered: the carriers
 # (qmt_gateway/local_executor.py Executor.context_for and
 # qmt_gateway/qmt_internal_strategy.py build_context) assemble a PER-SYMBOL flat

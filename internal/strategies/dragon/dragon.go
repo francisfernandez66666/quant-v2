@@ -48,6 +48,34 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// dg* 评分阈值单点（§DERIVE-CARRIER-1105B）。
+//
+// 为什么集中命名在这里：载体的 qmt_gateway/rules_ladder.py 是从本包逐行移植的，它按
+// LADDER_PARAM_KEYS 声明自己读哪些 params，构建闸 g9 因此要求每一枚都在烘进的参数文件里
+// 有主人。这些数以前是**函数体里的字面量**，外部进程只能人手抄——抄对了也仍然留两本账
+// （本包改档而载体那份不动，两边就在同一轮里用不同的线判同一条龙头信号）。
+// 现在评分与理由文案（dragonSealDesc 等，本来就把同一条线复述一遍）读的是同一批常量。
+// F1~F4 的**权重**不在这里：那是账号级配置（rules.strategy.dragon），出厂值在
+// config.defaultStrategyConfig，由导出工具按"从没配过的号会得到什么"取。
+// English: the thresholds below are read by the scorer itself; the F1-F4 weights stay in config
+// because they are per-account knobs, and the exporter reads their factory defaults.
+const (
+	dgMinBars       = 5    // 日K 根数硬闸：不足 5 根连 RS 趋势都算不出来，直接不评分
+	dgSealTolerance = 0.5  // "贴近封板"的容忍（板块涨停幅 − 0.5 个百分点）
+	dgSealBaseRatio = 0.9  // F1 基础分＝权重×100×90%
+	dgSealVolRatio  = 0.1  // F1 量额比最多再补 10%
+	dgSectorFullPct = 3.0  // F2 板块最强涨幅满分线
+	dgSectorHalfPct = 1.0  // F2 半值线
+	dgWeightHalf    = 0.5  // F2/F3/F4 共用的"半值"比例
+	dgPremiumPct    = 2.0  // F3 超板块溢价满分线（百分点）
+	dgOwnGainPct    = 5.0  // F3 自身涨幅半值线
+	dgRsWindow      = 5    // F4 趋势窗口（近 5 根）
+	dgRsFullPct     = 10.0 // F4 满分线
+	dgRsHalfPct     = 5.0  // F4 半值线
+	dgFullChainMin  = 60.0 // full_chain（唯一会转成买入的那一档）
+	dgBriefMin      = 50.0 // brief（半确认，ActionWatch，不出单）
+)
+
 // DragonStrategy 破局龙战法策略结构。
 // 使用 F1~F4 四维评分判断龙头股封板质量和参与机会。
 // 这是一个超短线策略，专注于捕捉龙头股的二次介入机会。
@@ -139,7 +167,7 @@ func (d *DragonStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 // seal quality F1, sector resonance F2, premium F3 and 5-day RS strength F4.）
 func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []data.KLine, sectors []data.SectorInfo) *strategy.Evaluation {
 	// 基础数据校验：无实时价或 K 线不足 5 根无法评分（Guard: require a live price and ≥5 bars to score）
-	if si == nil || si.Price <= 0 || len(kLines) < 5 {
+	if si == nil || si.Price <= 0 || len(kLines) < dgMinBars {
 		return nil
 	}
 	dc := d.strategyCfg()
@@ -151,11 +179,11 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	// of the old main-board-only >9.5 — fixes BJ (30% board) where a 10% gain was falsely scored as sealed.
 	limitPct := data.LimitUpPct(code, si.Name)
 	f1 := 0.0
-	if si.ChangePct > limitPct-0.5 {
+	if si.ChangePct > limitPct-dgSealTolerance {
 		// 基础分 = 权重×90%；量额比（成交量/成交额）越高封板越坚决，最高补充 10%（Base=weight×90%; volume/turnover ratio adds up to 10%）
-		f1 = dc.F1SealWeight * 100 * 0.9
+		f1 = dc.F1SealWeight * strategy.ScoreScale * dgSealBaseRatio
 		if si.Amount > 0 {
-			f1 += (float64(si.Volume) / si.Amount) * 0.1 * dc.F1SealWeight * 100
+			f1 += (float64(si.Volume) / si.Amount) * dgSealVolRatio * dc.F1SealWeight * strategy.ScoreScale
 		}
 	}
 
@@ -168,19 +196,19 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 		}
 	}
 	// 板块涨幅 >3% → 满分；>1% → 半值；否则 0（Sector gain >3% → full marks, >1% → half, else 0）
-	if bestSector > 3 {
-		f2 = dc.F2ResonanceWeight * 100
-	} else if bestSector > 1 {
-		f2 = dc.F2ResonanceWeight * 100 * 0.5
+	if bestSector > dgSectorFullPct {
+		f2 = dc.F2ResonanceWeight * strategy.ScoreScale
+	} else if bestSector > dgSectorHalfPct {
+		f2 = dc.F2ResonanceWeight * strategy.ScoreScale * dgWeightHalf
 	}
 
 	// F3: 溢价率 — 个股涨幅偏离板块最强涨幅（F3: premium — stock gain vs. the strongest sector gain）
 	// 超出最强板块 2%+ → 满分（辨识度突出）；个股自身 >5% → 半值（+2% above the best sector → full marks (outstanding); own gain >5% → half）
 	f3 := 0.0
-	if bestSector > 0 && si.ChangePct > bestSector+2 {
-		f3 = dc.F3PremiumWeight * 100
-	} else if si.ChangePct > 5 {
-		f3 = dc.F3PremiumWeight * 100 * 0.5
+	if bestSector > 0 && si.ChangePct > bestSector+dgPremiumPct {
+		f3 = dc.F3PremiumWeight * strategy.ScoreScale
+	} else if si.ChangePct > dgOwnGainPct {
+		f3 = dc.F3PremiumWeight * strategy.ScoreScale * dgWeightHalf
 	}
 
 	// F4: RS强度 — 近5日趋势涨幅（F4: RS strength — 5-day trend gain）
@@ -188,26 +216,26 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	// 让前端 D4 列能显示"5日+X%"而不只是一个分数。
 	f4 := 0.0
 	trend5 := 0.0
-	if len(kLines) >= 5 {
-		trend5 = (kLines[len(kLines)-1].Close - kLines[len(kLines)-5].Close) / kLines[len(kLines)-5].Close * 100
+	if len(kLines) >= dgRsWindow {
+		trend5 = (kLines[len(kLines)-1].Close - kLines[len(kLines)-dgRsWindow].Close) / kLines[len(kLines)-dgRsWindow].Close * strategy.ScoreScale
 		// 5日涨幅 >10% → 满分；>5% → 半值（5-day gain >10% → full marks, >5% → half）
-		if trend5 > 10 {
-			f4 = dc.F4RsWeight * 100
-		} else if trend5 > 5 {
-			f4 = dc.F4RsWeight * 100 * 0.5
+		if trend5 > dgRsFullPct {
+			f4 = dc.F4RsWeight * strategy.ScoreScale
+		} else if trend5 > dgRsHalfPct {
+			f4 = dc.F4RsWeight * strategy.ScoreScale * dgWeightHalf
 		}
 	}
 
 	// 总分封顶 100；pass 至少需 ≥50（Cap total at 100; pass requires ≥50）
-	total := math.Min(f1+f2+f3+f4, 100)
-	pass := total >= 50
+	total := math.Min(f1+f2+f3+f4, strategy.ScoreScale)
+	pass := total >= dgBriefMin
 	level := "watch"
 	// 总分 ≥60 → full_chain（完整链，买入；放宽买入层级统一到60）；≥50 → brief（半确认，观察）
 	// English: total ≥60 → full_chain (buy; relaxed gate unified to 60); ≥50 → brief (watch)
-	if total >= 60 {
+	if total >= dgFullChainMin {
 		level = "full_chain"
 		pass = true
-	} else if total >= 50 {
+	} else if total >= dgBriefMin {
 		level = "brief"
 	}
 
@@ -234,7 +262,7 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 		},
 		Pass:       pass,
 		Level:      level,
-		Confidence: total / 100.0,
+		Confidence: total / strategy.ScoreScale,
 	}
 }
 
@@ -244,7 +272,7 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 // （dragonSealDesc words the F1 seal check using the same inputs as the score itself: today's gain
 // against the board's limit-up threshold, reporting both raw values when sealed.)
 func dragonSealDesc(changePct, limitPct float64) string {
-	if changePct > limitPct-0.5 {
+	if changePct > limitPct-dgSealTolerance {
 		return fmt.Sprintf("涨幅%.1f%%贴板(阈%.1f%%)", changePct, limitPct)
 	}
 	return fmt.Sprintf("涨幅%.1f%%未贴板(阈%.1f%%)", changePct, limitPct)
@@ -254,9 +282,9 @@ func dragonSealDesc(changePct, limitPct float64) string {
 // （dragonSectorDesc words the F2 resonance check from the strongest sector gain.)
 func dragonSectorDesc(bestSector float64) string {
 	switch {
-	case bestSector > 3:
+	case bestSector > dgSectorFullPct:
 		return fmt.Sprintf("板块共振%.1f%%", bestSector)
-	case bestSector > 1:
+	case bestSector > dgSectorHalfPct:
 		return fmt.Sprintf("板块偏弱%.1f%%", bestSector)
 	default:
 		return fmt.Sprintf("板块无共振%.1f%%", bestSector)
@@ -267,9 +295,9 @@ func dragonSectorDesc(bestSector float64) string {
 // （dragonPremiumDesc words the F3 premium check: stock gain relative to the strongest sector.)
 func dragonPremiumDesc(changePct, bestSector float64) string {
 	switch {
-	case bestSector > 0 && changePct > bestSector+2:
+	case bestSector > 0 && changePct > bestSector+dgPremiumPct:
 		return fmt.Sprintf("超板块%.1fpp辨识度高", changePct-bestSector)
-	case changePct > 5:
+	case changePct > dgOwnGainPct:
 		return fmt.Sprintf("自身涨%.1f%%未超板块", changePct)
 	default:
 		return fmt.Sprintf("自身涨%.1f%%无溢价", changePct)

@@ -697,6 +697,18 @@ type qmtReportEvent struct {
 	// English: §EXT-BRAIN-UP — version of the installed built-in strategy, reported by the
 	// box-local uplink process; answers "is the running build the installed build?".
 	StrategyVersion string `json:"strategy_version,omitempty"`
+	// Shadow §CARRIER-SHADOW（2026-11-05 载体影子对照批）：本地执行器（local_executor.py）在
+	// shadow 档算出的判定，由盒子普通进程（report_uplink.py）按"今天有行才报、没行一个都不发"
+	// 的口径上行（事件类型 carrier_shadow）。与 positions 同姿势——数组进信封一枚键，
+	// 行内字段面由 golden 的 shadow_row_fields / shadow_row_emitted_fields 两面钉
+	// （发出集 ⊆ 反射集，漏一侧即 §M4 那种"静默丢腿"）。
+	// 为什么是**数组进一枚键**而不是把每行摊平到信封：一天几十条判定会当场把信封字段面撑成
+	// 逐日漂移的自由文本域，golden 就失去了"两侧同一把尺子"的能力。
+	// 落库只进 carrier_shadow_decisions 一张观测表：不动持仓/委托/资金、不参与熔断与健康线
+	// （§OBS-GUARD：观测腿不许有钱的动作）。
+	// English: §CARRIER-SHADOW — the carrier's shadow-mode decisions, uploaded by the box-local
+	// uplink (event type carrier_shadow). Observation only: one table, no money, no breaker.
+	Shadow []store.CarrierShadowDecision `json:"shadow"`
 }
 
 // qmtSnapshotMaxAge 桥侧快照的最大可信年龄：超过即视为“数据停滞”，不得据此刷新资金/持仓。
@@ -1027,6 +1039,16 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// §QMT-DUAL 通道切换事件（xt↔queued）：仅观察用，不动账本。旧实现没有本 case
 		// 导致 outbox 里的切换回报反复 400 重推刷屏（2026-09-11 生产实录）。
 		log.Printf("[trading] 网关节点通道切换事件: %s -> %s at=%s", ev.From, ev.Broker, ev.At)
+	case "carrier_shadow":
+		// §CARRIER-SHADOW（2026-11-05 载体影子对照批）：载体 shadow 档的判定上行，只落观测表。
+		// 四条边界都写在 ingestCarrierShadow（同包 carrier_shadow_ingest.go），这里只挂接线：
+		// 归属 uid 由**那把钥匙**反查（§安全 T1，与 positions/account 同一口径，回报体自报的
+		// user_id 一律不信）；空批次整条拒收（上行侧本来就不该发——missing≠empty 的两侧锁）；
+		// **不碰 ctrl、不碰持仓/委托/资金、不推熔断**（§OBS-GUARD：观测腿不许有钱的动作）。
+		// English: §CARRIER-SHADOW ingest — key-derived attribution, empty batch refused,
+		// no controller / no book / no breaker touched (observation leg).
+		s.ingestCarrierShadow(w, db, uid, ev, cntime.Now())
+		return
 	default:
 		writeError(w, 400, "unknown report type")
 		return
@@ -1677,18 +1699,28 @@ func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
 	// §EXT-BRAIN-UP：leg_status 以**纯增量**并进本响应——两分支既有键值一字不动，
 	// 只多一枚 leg_status 键（无读数为 null）。superset 锁见 leg_status_test.go。
+	// §CARRIER-UPDATE：同姿势再并一枚 carrier（载体清单的期望版/请求态/最近回执），
+	// 读不到时期望段一律空串 + request_state="unknown"，**绝不折成"已是最新"**。
 	leg := s.readLegStatus(uid)
+	carrier := s.carrierStateReadout(uid)
+	// §CARRIER-SHADOW：第三枚纯增量读数（载体 shadow 判定 vs 引擎的按日对照，?shadow_days=N 控窗口）。
+	// 只读三张表、不参与任何判定；读不出时 Known=false + 原因，前端只能显示"读数未知"
+	// （绝不把"读不出"渲染成"今天没有影子决策"——那是 missing 折成 empty 的老形状）。
+	shadow := s.carrierShadowReadout(uid, parseCarrierShadowDays(r), cntime.Now())
 	ctrl := s.qmtCtrlFor(uid)
 	if ctrl == nil {
 		// 未接入实盘：保留旧字段形状，前端据此隐藏实盘区块。
 		writeJSON(w, 200, map[string]interface{}{
 			"enabled": false, "mode": "manual", "tripped": false, "gateway_url": "",
-			"leg_status": leg,
+			"leg_status":     leg,
+			"carrier":        carrier,
+			"carrier_shadow": shadow,
 		})
 		return
 	}
 	// 已接入：直接透出控制器健康快照（下行探测/上行回报新鲜度/熔断详情/资金等），附腿状态。
-	writeJSON(w, 200, qmtStateWithLeg{StateSnapshot: ctrl.Snapshot(), LegStatus: leg})
+	writeJSON(w, 200, qmtStateWithLeg{StateSnapshot: ctrl.Snapshot(), LegStatus: leg,
+		Carrier: carrier, CarrierShadow: shadow})
 }
 
 // handleQMTOrders 处理 GET /api/qmt/orders（admin）：当日实盘委托列表。

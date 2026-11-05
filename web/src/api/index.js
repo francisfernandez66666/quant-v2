@@ -1005,6 +1005,20 @@ export async function saveManualBook(body) {
   return request('/api/qmt/manual-positions', { method: 'POST', data: b })
 }
 
+/** §CARRIER-UPDATE 更新载体：把该账号的 request_state 置成 pending（运营人工触发） */
+/** §CARRIER-UPDATE: ask the box to re-check/re-apply its carrier on the next poll. */
+// 对应 POST /api/qmt/carrier/update（trading_admin 严格位，跨账号代点另判 user_admin）。
+// 三条调用侧必须知道的边界（都在 internal/server/carrier.go 文件头）：
+//   · 这是**控制动作**，不是"自己的账"：quant_trade 权限位进不来，别拿成员态去拨；
+//   · 点了不等于装好了——这一下只置 pending，写文件/停策略/重启由物理机自己的脚本做，
+//     所以页面绝不能把 200 渲染成"已更新成功"；
+//   · 期望段没填齐（desired_ready=false）时后端会判红，按钮在这一档就应当禁用，
+//     免得制造一个永远等不到答复的 pending 死格。
+// 路径写成字面量开头：契约台账 §115 的派生器只认 request() 里的字面量地址。
+export async function requestCarrierUpdate() {
+  return request('/api/qmt/carrier/update', { method: 'POST', data: {} })
+}
+
 /** 实盘：持仓处理建议（加仓/减仓/止盈/止损） */
 /** Live: position-handling advice (add/trim/take-profit/stop-loss) */
 // 对应 GET /api/positions/advice，返回 { advices:[...], tripped }（主要数据走 SSE real_advice 实时推送）

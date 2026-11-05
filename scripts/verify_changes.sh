@@ -12524,13 +12524,13 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 210 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210）'
-eqkey115 CALLPATH_DERIVED 168 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168）'
-eqkey115 CALLSITES_DERIVED 172 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172）'
+eqkey115 ROUTES_DERIVED 213 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210；2026-11-04 §CARRIER-UPDATE 载体更新链三条入账（GET /api/qmt/carrier/manifest + POST /api/qmt/carrier/ack 走网关钥匙、POST /api/qmt/carrier/update 走 trading_admin 且跨账号再加 user_admin）→213）'
+eqkey115 CALLPATH_DERIVED 169 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；2026-11-04 §CARRIER-UPDATE 前端覆盖 POST /api/qmt/carrier/update →169）'
+eqkey115 CALLSITES_DERIVED 173 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172；2026-11-04 §CARRIER-UPDATE 前端「更新载体」拨一次 →173）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 210 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210）'
-eqkey115 COVERED_BY_WEB 168 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168）'
-eqkey115 UNCALLED 42 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（无 UI 待补，前端未拨）→42）'
+eqkey115 LEDGER_ROWS 213 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213）'
+eqkey115 COVERED_BY_WEB 169 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168）'
+eqkey115 UNCALLED 44 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（无 UI 待补，前端未拨）→42；2026-11-04 §CARRIER-UPDATE 盒子侧两条（manifest/ack 由 qmt_gateway/carrier_updater.py 拨，不是前端）→44）'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
 eqkey115 NO_BASIS 0 '「无依据」档必须为空：说不清为什么还留着＝待决策，不许混进台账假装闭合'
@@ -12601,8 +12601,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 210 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209；2026-11-04 §4.2 人工回执 +1 →210）'
-eqkey115 LEDGER_ROWS 210 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209；2026-11-04 §4.2 人工回执入账 →210）'
+eqkey115 ROUTES_DERIVED 213 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209；2026-11-04 §4.2 人工回执 +1 →210；2026-11-04 §CARRIER-UPDATE +3 →213）'
+eqkey115 LEDGER_ROWS 213 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209；2026-11-04 §4.2 人工回执入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213）'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -17737,7 +17737,10 @@ N144=$(grep -cE 'strict(All)?Perm(s)?Middleware\(auth\.PermFundsAdmin|strictAnyP
 [ "$N144" -eq 19 ] || fail144 "funds_admin 严格路由应为 19，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cE 'strict(All)?Perm(s)?Middleware\(auth\.PermTradingAdmin|strictAnyPermsMiddleware\(auth\.PermTradingAdmin' internal/server/server.go || true)
-[ "$N144" -eq 27 ] || fail144 "trading_admin 严格路由应为 27，实得 $N144"
+# 27 -> 28（§CARRIER-UPDATE 2026-11-05）：POST /api/qmt/carrier/update 是**写面**——
+# 它能让别人家里的物理机换掉正在跑的策略文件并重启，所以按 trading_admin 而不是 quant_trade；
+# 同一批的 manifest/ack 两条走 qmtReportMiddleware（盒子那把钥匙），不在这条计数里。
+[ "$N144" -eq 28 ] || fail144 "trading_admin 严格路由应为 28，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server.go || true)
 [ "$N144" -eq 14 ] || fail144 "user_admin 严格路由应为 14，实得 $N144"
@@ -19522,9 +19525,11 @@ if grep -nE '^[^#]*print\("TRADING_DAY=[^"]*[^ -~]' "$TC167" >/dev/null 2>&1; th
 	fail167 "TRADING_DAY 锚点混入非 ASCII（PS 管道会换成 ? ⇒ 判读恒假）"
 fi
 
-# ⑦ 任务注册：四个名字齐、缺省 dry-run、注册后复读自证、卸载同四件
+# ⑦ 任务注册：五个名字齐、缺省 dry-run、注册后复读自证、卸载同五件
+# （11-05 加 QMTF-Carrier-Update：内置策略不能自我更新，"每天收盘后自动更新一次"必须有触发器；
+#   这条名字进清单不是为了好看——少注册一条，机器就会一直跑旧版规则而没人红。）
 CNT167=$((CNT167 + 1))
-for tok in 'QMTF-Client-Ensure' 'QMTF-Client-Start' 'QMTF-Gateway-Ensure' 'QMTF-Close'; do
+for tok in 'QMTF-Client-Ensure' 'QMTF-Client-Start' 'QMTF-Gateway-Ensure' 'QMTF-Close' 'QMTF-Carrier-Update'; do
 	grep -qF "$tok" "$IT167" || fail167 "缺任务定义 $tok"
 done
 CNT167=$((CNT167 + 1))
@@ -20253,7 +20258,7 @@ fi
 echo "ok - §171 §FRIEND-PKG 锁通过（入口与脚本在册 1 + bat 姿势 1 + 一把尺子与字节码 1 + deny 锚点 1 + install 锚点与零明文 1 + 用例在册等值 1 + 常驻反证 1 + pwsh 语法解析 1，累计判定点 ${CNT171}）"
 
 # ── §173 §QMT-INTERNAL-LOOP（11-04 外脑化批：判据只读／桥心跳接线不是死线／静默域只折重复／买入闸单点／四源窗口同源／构建闸三段自证／投递腿不直起客户端／移植规则内联不进 import）
-echo "==> 173 §QMT-INTERNAL-LOOP（外脑档契约与判定只读／桥心跳三态接线／静默域首推与销案不静默／买入执行点单点／四源时段窗逐字同源／构建闸漂移+装载+短码唯一／沙箱零文件零网络／撤单与投递腿 fail-closed／移植规则靠内联不靠 import／用例在册／Go 出厂值单点导出）..."
+echo "==> 173 §QMT-INTERNAL-LOOP（外脑档契约与判定只读／桥心跳三态接线／静默域首推与销案不静默／买入执行点单点／四源时段窗逐字同源／构建闸漂移+装载+短码唯一／沙箱零文件零网络／撤单与投递腿 fail-closed／移植规则靠内联不靠 import／用例在册／Go 出厂值单点导出／载体更新链与每日触发器与沙箱仓位与分级出站）..."
 B173_FAILED=0
 fail173() {
 	echo "--- FAIL: §173 $*"
@@ -20521,7 +20526,122 @@ for name in IndexBands EmotionRekey MappingIntegrity Coverage BuilderAscii Again
 	grep_q "class $name" DERIVE_T F || fail173 "导出工具用例缺组：$name"
 done
 
-# ⑪ 常驻反证：摘掉判据必须红，且读 R173_MUTATED（恒 0 的锁不算锁）
+# ⑩b 今天新长的四条腿：载体更新链 / 每日触发器 / 沙箱动态仓位 / 分级出站——每条都要有锁
+CNT173=$((CNT173 + 1))
+SVT=$(cat internal/server/server.go || true)
+for k in "GET /api/qmt/carrier/manifest" "POST /api/qmt/carrier/ack" "POST /api/qmt/carrier/update"; do
+	grep_q "$k" SVT F || fail173 "载体更新链少了路由 [$k]（清单拉不到＝盒子永远跑旧版）"
+done
+grep_q "qmtReportMiddleware(s.handleCarrierManifestGet)" SVT F || fail173 "manifest 没走钥匙鉴权（归属由钥匙决定，自报 user_id 一律不信）"
+grep_q "strictPermMiddleware(auth.PermTradingAdmin, s.handleCarrierUpdatePost)" SVT F || fail173 "人工触发更新没挂 trading_admin（它能让别人家里的机器重启策略）"
+CRT=$(cat qmt_gateway/carrier_updater.py || true)
+[ -n "$CRT" ] || fail173 "盒子侧更新器不在册"
+grep_q "STOP_AUTO_UPDATE" CRT F || fail173 "更新器不认停更标记（版本回读失败后本该拒绝继续自动更新）"
+grep_q "-ExpectedVersion" CRT F || fail173 "更新器没把期望版本交给三段自证（字节对了不等于版本对了）"
+if grep -qE "Start-Process|XtItClient[.]exe" qmt_gateway/carrier_updater.py; then
+	fail173 "更新器自己去起客户端（10-29：会话内直起会随会话被杀；只能走计划任务）"
+fi
+CNT173=$((CNT173 + 1))
+ITT=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
+grep_q "QMTF-Carrier-Update" ITT F || fail173 "每日收盘后的自动更新没有触发器"
+grep_q 'St = "15:40"' ITT F || fail173 "载体更新任务的时间锚漂了（15:40 选在收盘快照与关闭腿之后）"
+grep_q "TASKS_REREAD_MATCH=1 tasks=5" ITT F || fail173 "注册后复读仍写 tasks=4（少注册第五条也不会红＝恒绿锁）"
+grep_q "reason=no_carrier_updater" ITT F || fail173 "缺更新器时仍会注册一个空跑任务（空跑比不注册更坏）"
+CNT173=$((CNT173 + 1))
+SIZ=$(cat qmt_gateway/qmt_internal_strategy.py || true)
+grep_q "sizing_cap(ctx, positions)" SIZ F || fail173 "沙箱买入分支又不问动态仓位（链在产物里没人调＝等于没有，本批已犯一次）"
+grep_q "sizing_below_lot" SIZ F || fail173 "沙箱压额后不重算股数（沿用原金额＝绕过帽）"
+grep_q "sizing_amount_unavailable" SIZ F || fail173 "额度算不出时不再 fail-closed（把算不出过成一笔真单是最贵的形状）"
+CNT173=$((CNT173 + 1))
+EGT=$(cat internal/engine/engine.go || true)
+DISPATCH_N=$(printf '%s' "$EGT" | grep -c "e[.]dispatchNewsTier(out)" || true)
+[ "${DISPATCH_N:-0}" = "2" ] || fail173 "分级出站的生产调用点不是 2 处（零摄入那轮也必须发——通道告警只有那里能发）"
+REGT=$(cat internal/engine/registry.go || true)
+grep_q "SetNewsHitProvider" REGT F || fail173 "命中集没接（分级器拿不到自己的持仓/自选＝利空必推恒假）"
+NTR=$(cat internal/server/client_errors_api.go || true)
+for k in '"attached"' '"accounts"'; do
+	grep_q "$k" NTR F || fail173 "分级读面少了 ${k}（看不见与没跑必须可分）"
+done
+PANEL=$(cat web/src/components/CarrierUpdatePanel.jsx || true)
+grep_q "canStrict('trading_admin')" PANEL F || fail173 "前端更新按钮没按 trading_admin 关（后端有闸，前端也得一致）"
+grep_q 'tag="button"' PANEL F || fail173 "禁用态按钮不是真 button（disabled 退化成 div 就再也读不到状态）"
+
+# ⑫ 判断腿接线（11-05）：内联≠可调——"代码搬进来了"与"有名字能调到它"是两件事，
+RSZ=$(cat qmt_gateway/rules_sizing.py || true)
+CSI=$(cat internal/server/carrier_shadow_ingest.go || true)
+SHP=$(cat web/src/components/CarrierShadowPanel.jsx || true)
+CBH=$(cat scripts/backup_gz_cold_helper.py || true)
+RUB=$(cat docs/RUNBOOK_QMT_DAILY.md || true)
+UPT=$(cat qmt_gateway/tests/test_report_uplink.py || true)
+SJT=$(cat qmt_gateway/tests/test_local_executor_shadow_journal.py || true)
+CST=$(cat internal/server/carrier_shadow_test.go || true)
+# 11-04 那批就是前者成立、后者不存在，于是"动态仓位已移植"在屏上是绿的、在盘上是空的。
+CNT173=$((CNT173 + 1))
+grep_q "def ported_judgement_legs(source, name):" BLT F || fail173 "构建器不再读模块自己声明的判断腿：第二本账会漂回来"
+grep_q '_PORTED_LEGS[%r] = %s' BLT F || fail173 "判断腿没被显式绑进产物（内联了代码但没有名字可调）"
+grep_q "executor_judgement_leg_unbound" BLT F || fail173 "装载闸不验判断腿可调（g7e 退化成只验 import）"
+LEG=$(cat qmt_gateway/local_executor.py || true)
+grep_q '_PORTED_LEGS.get("sizing_readout")' LEG F || fail173 "载体又不通过注册表取判断腿"
+grep_q "def ported_leg_status():" LEG F || fail173 "--selftest 看不见判断腿 bound/unbound（缺这行就只能事后猜）"
+if grep -qE 'globals\(\)[.]get' qmt_gateway/local_executor.py; then
+	fail173 "载体里重新出现 globals().get（命名空间自省：g2 禁的就是这个，注册表才是正路）"
+fi
+grep_q "JUDGEMENT_LEGS" RSZ F || fail173 "模块不再自己声明判断腿（声明权漂回构建侧＝第二本账）"
+
+# ⑬ 影子对照这条测量腿（11-05 §CARRIER-SHADOW）：5 日窗口的分子必须四段都在，
+# 缺任何一段，那枚"武装"按钮背后就又变回零数据。
+CNT173=$((CNT173 + 1))
+grep_q "CREATE TABLE IF NOT EXISTS shadow_decisions" LEG F || fail173 "执行器不再记影子账（命中只剩一行日志＝窗口没有分子）"
+grep_q "def record_shadow(self, day" LEG F || fail173 "影子账写入腿不见了"
+grep_q "ON CONFLICT(day, short_code) DO UPDATE" LEG F || fail173 "同一意图改成整行替换（first_ts 每轮被推后＝天数越跑越少）"
+grep_q "def shadow_days(self):" LEG F || fail173 "少了「哪些天报过」那本账：静默日与零命中日就分不开"
+grep_q "def shadow_journal_probe(path):" LEG F || fail173 "影子账本探针不见了（它必须只读探，不许用 LocalState 顺手把缺账本问成空账本）"
+UP=$(cat qmt_gateway/report_uplink.py || true)
+grep_q "events.extend(self._build_shadow_events())" UP F || fail173 "上行腿不再构造 carrier_shadow 事件（Go 侧收到的是一个从不存在的类型）"
+for k in journal_missing journal_table_absent no_rows_today; do
+	grep_q "$k" UP F || fail173 "上行腿少了 $k 这一态（三种「没」折成一种＝把载体没跑读成今天没命中）"
+done
+grep_q "def _sqlite_readonly(path):" UP F || fail173 "上行腿用写模式打开执行器账本（幂等真源从此有两本账）"
+QGT=$(cat internal/server/qmt.go || true)
+grep_q 'case "carrier_shadow"' QGT F || fail173 "Go 侧不接 carrier_shadow 事件（上行发了也没人落）"
+grep_q "carrier_shadow 批次为空" CSI F || fail173 "空批次不再整条拒收（missing 被折成 empty，5 天会被静默日凑满）"
+CSG=$(cat internal/server/carrier_shadow.go || true)
+for k in carrierShadowStateNoReport carrierShadowStateNoHits carrierShadowStateDiverged; do
+	grep_q "$k" CSG F || fail173 "对照面少了 $k 这一态（三种零必须各自可判）"
+done
+SHU=$(cat web/src/utils/carrierShadow.js || true)
+for k in no_report no_hits diverged agreeing; do
+	grep_q "$k" SHU F || fail173 "前端状态清单少了 ${k}（改值必须两侧同批，否则读数与颜色互相冒充）"
+done
+grep_q "读数未知" SHP F || fail173 "前端把「读数未知」折成了天数（known=false 只能显示未知）"
+
+# ⑭ 冷备这条腿（11-05 §COLD-BACKUP）：重装系统前唯一的基线，判据写死在脚本里。
+CNT173=$((CNT173 + 1))
+CBK=$(cat scripts/backup_gz_cold.sh || true)
+for k in COLD_BACKUP_RESULT BASELINE_MANIFEST L1_RESULT L2_RESULT S3_SEALED; do
+	grep_q "$k" CBK F || fail173 "冷备脚本少了 $k 这条锚（跑完读不出结论＝等于没备）"
+done
+grep_q "--preflight" CBK F || fail173 "冷备没有只读预检档（第一次真跑之前就应当能判容量/通道/收盘态）"
+grep_q "--incremental" CBK F || fail173 "冷备没有增量档（新版本在补的东西只能靠整份重备，那次次都是全量）"
+grep_q "quant-trading-v2" CBK F || fail173 "冷备少了不可删路径的保护（备份前先别把资产清了）"
+grep_q "sqlite3.Error" CBH F || fail173 "撕裂库会崩探针而不是报 L2_FAIL（半份备份冒充基线）"
+[ -x scripts/backup_gz_cold.sh ] || fail173 "冷备脚本没有可执行位（运维照文档跑会 permission denied）"
+grep_q "test_backup_gz_cold" RUB F || fail173 "RUNBOOK 没写冷备自测（新工具没有运维卡＝第一跑在生产机上）"
+
+# ⑮ 今天这些新腿的用例在册（缺用例的腿等于没有锁）
+CNT173=$((CNT173 + 1))
+for f in qmt_gateway/tests/test_local_executor_shadow_journal.py \
+	 qmt_gateway/tests/test_report_uplink.py \
+	 internal/server/carrier_shadow_test.go \
+	 internal/store/carrier_shadow_test.go \
+	 web/src/__tests__/carrier_shadow_20261105.test.jsx; do
+	[ -f "$f" ] || fail173 "今天的影子/判断腿用例少了 $f"
+done
+grep_q "class TestCarrierShadowLeg" UPT F || fail173 "上行腿的影子用例组不见了"
+grep_q "class TestSizingJudgementLeg" SJT F || fail173 "判断腿「缺席 vs 坏了」的用例不见了"
+grep_q "func TestCarrierShadow" CST F || fail173 "对照面的 Go 用例不见了（三种零的判定没有行为锁）"
+
+# ⑯ 常驻反证：摘掉判据必须红，且读 R173_MUTATED（恒 0 的锁不算锁）
 CNT173=$((CNT173 + 1))
 R173_MUTATED=0
 WORK173=$(mktemp -d /tmp/gate173-XXXXXX)
@@ -20570,7 +20690,7 @@ echo "   [§173 反证] R173_MUTATED=${R173_MUTATED}（摘四源窗口判据 / �
 rm -rf "$WORK173"
 
 [ "$B173_FAILED" = "0" ] || exit 1
-echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 常驻反证 1，累计判定点 ${CNT173}）"
+echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1，累计判定点 ${CNT173}）"
 
 echo "==> 全部通过"
 

@@ -58,6 +58,33 @@ const (
 	tLDirBuy  = "buy_first"  // 正 T：先买机动仓，再卖等量底仓
 	tLDirSell = "sell_first" // 反 T：先卖底仓，再买回等量（或按新口径不回补）
 
+	// tLRegimeXxx 行情门比较的市场状态字面量（§DERIVE-CARRIER-1105 命名，2026-11-05）。
+	// 为什么命名：载体的移植腿要的是"哪几档放行 / 哪几档拦截"这张**表**，而这三枚串此前只在
+	// regimeBlock 的 switch 里各出现一次——载体侧要么抄、要么猜。判据与只读导出读同一组常量。
+	// 空串**不在**这两张表里：它在 Go 里是"弃权"（放行并出声），既不是放行档也不是拦截档，
+	// 折进任何一张都会把"没读数"读成"读到了一档"。
+	// English: the regime vocabulary the gate compares against; the carrier reads the same
+	// two lists instead of copying the switch. Empty string stays out (it means abstain).
+	tLRegimeRange = "range" // 唯一放行档
+	tLRegimeBull  = "bull"  // 拦截档
+	tLRegimeBear  = "bear"  // 拦截档
+
+	// tLSellKeepPositionPct 反 T 卖腿必须留下的原持仓比例（%）：卖后至少留一半底仓。
+	// 为什么从 `pos.Qty / 2` 改写成按百分数：载体侧那枚旋钮就叫"剩余底仓%"，
+	// 整数乘除与原来逐位等价（floor(Q*50/100)==floor(Q/2)），改写的全部收益是
+	// "判据与导出的读数同处一枚常量"——Go 调它、载体收到的那一份跟着动。
+	// English: the same half-position keep leg, spelled as the percentage the carrier reads;
+	// integer-equivalent to Qty/2, so this rewrite moves no behaviour.
+	tLSellKeepPositionPct = 50
+
+	// tLStatusCancelToken 委托状态里"算被撤"的字样（§DERIVE-CARRIER-1105 命名）。
+	// 已报待撤 / 部撤 / 已撤 / 撤单中 全部含它——与纸面同一套"按字样归类"的口径。
+	// 为什么必须走 params 而不是移植到 py 里写死：产物跑在 GBK 终端上，中文字面量会被
+	// 静默换成 ?（本仓锤过的形状），只有烘进 JSON 的那一份能活着到运行时。
+	// English: the counter-status substring Go classifies as "cancelled"; it travels as a
+	// param because a Chinese literal inside the artifact is mangled by the GBK console.
+	tLStatusCancelToken = "撤"
+
 	tLStatusOpen     = "open"
 	tLStatusDone     = "done"      // 唯一有"做 T 收益"的终态（§8.9a）
 	tLStatusUnwound  = "unwound"   // 半态收摊：仓位被动变更
@@ -1499,7 +1526,7 @@ func (r *tLiveRound) quota(code string, pos store.RealPosition, q *data.StockInf
 	if tqQty < maxSell {
 		maxSell = tqQty
 	}
-	if keep := tLLotFloor(pos.Qty / 2); keep < maxSell {
+	if keep := tLLotFloor(pos.Qty * tLSellKeepPositionPct / 100); keep < maxSell {
 		maxSell = keep
 	}
 	if halfKeep := pos.Qty - tLMinBaseKeep; halfKeep < maxSell {
@@ -1916,7 +1943,7 @@ func (r *tLiveRound) markUnfilled(rnd *TRoundLive) {
 func tLUnfilledReasonOf(f *tLiveLegFact) string {
 	for _, o := range f.orders {
 		switch {
-		case strings.Contains(o.Status, "撤"):
+		case strings.Contains(o.Status, tLStatusCancelToken):
 			return "canceled"
 		case strings.Contains(o.Status, "废") || strings.Contains(o.Status, "拒"):
 			return "rejected"
@@ -2159,7 +2186,7 @@ func (r *tLiveRound) regimeBlock() string {
 		return ""
 	}
 	switch st {
-	case "range":
+	case tLRegimeRange:
 		// 票数不足时状态机已把结论降级成 range（research/market_state.go 的安全阀）——放行结论不变，
 		// 但要留一行，否则复盘时分不清"真震荡"和"票太少"。这就是 owner 第 3 条裁决的全部落地。
 		// **零票单独一条**：votes==0 是兜底 range（状态机无任何有效输入），比 2/6 更不可信、
@@ -2173,7 +2200,7 @@ func (r *tLiveRound) regimeBlock() string {
 				r.p.MarketStateVotes, r.p.MarketStateVotesTotal, tRegimeMinVotes), "")
 		}
 		return ""
-	case "bull", "bear":
+	case tLRegimeBull, tLRegimeBear:
 		return fmt.Sprintf("行情门：市场状态=%s，非盘整行情不做 T", st)
 	case "":
 		r.st.noteBlock("step0", "行情门弃权：T 行情门已关（t.regime_gate_enabled=false）或读数从未产生，牛熊关闭 T 未生效", "")

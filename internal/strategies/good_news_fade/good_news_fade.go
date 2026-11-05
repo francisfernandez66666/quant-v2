@@ -45,6 +45,36 @@ func (s *Strategy) Name() string { return "good_news_fade" }
 // （Type returns the signal type.）
 func (s *Strategy) Type() strategy.SignalType { return strategy.SignalGoodNewsFade }
 
+// 评分阈值单点（§DERIVE-CARRIER-1105）：利好兑现砸盘的三因子档位、事件年龄衰减与帽。
+// 成因与 break_down.go 同源（载体只认名字，不认人手的第二本账），此处不重复说明。
+// English: the tactic's own thresholds, named once, exported read-only by derive_carrier.go.
+const (
+	gfMinBars             = 20   // 日K 硬闸：不足 20 根按数据缺口安全降级
+	gfEventFreshAge       = 1    // 事件 1 日内记满分
+	gfEventStaleAge       = 5    // 事件 5 日及以上记保底分
+	gfEventMaxScore       = 25.0 // 事件在窗满分
+	gfEventMinScore       = 5.0  // 事件年龄衰减后的保底分
+	gfEventAgeSpan        = 4.0  // 1 日到 5 日之间跨 4 个交易日
+	gfEventAgeDrop        = 20.0 // 这 4 个交易日掉 20 分
+	gfGainStart           = 0.10 // 事件日至现价涨到这一档才开始计兑现分
+	gfGainFull            = 0.25 // 涨过这一档记满分
+	gfGainSpan            = 0.15 // 10% → 25% 这 15 个百分点走完线性段
+	gfGainMaxScore        = 35.0 // 涨幅已兑现满分
+	gfStallPct            = 1.0  // 近 3 日区间涨幅 <1% 记滞涨
+	gfStallScore          = 15.0 // 滞涨加分
+	gfHeavyRatio          = 1.5  // 5日均量/20日均量 ≥1.5 记放量
+	gfHeavyScore          = 10.0 // 放量滞涨（派发）加分
+	gfBelowMA5Score       = 8.0  // 跌破 5 日线加分
+	gfShadowRatio         = 0.4  // 上影占比 ≥40%
+	gfShadowScore         = 7.0  // 长上影加分
+	gfWeaknessMaxScore    = 40.0 // 高位转弱的帽
+	gfSurgeWindow         = 3    // 防误杀看最近几根日K
+	gfSurgeStepPct        = 0.05 // 其中任一根涨幅达到这一档＝主升未止
+	gfSurgeMinBars        = 4    // 少于这个根数算不出"最近 3 根的相邻涨幅"
+	gfPropagationDiscount = 0.7  // 产业链上游传导类利好持续性更强：总分打 7 折
+	gfDefaultMinScore     = 60.0 // 通过门槛的出厂值（rules.strategy.short.good_news_fade_min 可覆盖）
+)
+
 // scoreThreshold 返回通过门槛（默认 60，rules.strategy.short.good_news_fade_min 可覆盖）。
 // （scoreThreshold resolves the pass gate.）
 func (s *Strategy) scoreThreshold() float64 {
@@ -54,7 +84,7 @@ func (s *Strategy) scoreThreshold() float64 {
 			return sc.Short.GoodNewsFadeMin
 		}
 	}
-	return 60
+	return gfDefaultMinScore
 }
 
 // Evaluate 执行利好兑现三因子评分。
@@ -69,7 +99,7 @@ func (s *Strategy) scoreThreshold() float64 {
 // （Evaluate runs the scoring.）
 func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	sd, ok := data.(*shortbase.Data)
-	if !ok || sd == nil || len(sd.KLines) < 20 {
+	if !ok || sd == nil || len(sd.KLines) < gfMinBars {
 		return &strategy.Evaluation{Pass: false, TotalScore: 0, Level: "nodata",
 			Details: map[string]float64{}}, nil
 	}
@@ -92,7 +122,7 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 	// 传导类利好持续性更强：总分 7 折
 	propagationDiscount := false
 	if sd.EventPropagation {
-		total *= 0.7
+		total *= gfPropagationDiscount
 		propagationDiscount = true
 	}
 
@@ -129,7 +159,7 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 			"weakness":    weak,
 			"event_age":   float64(sd.EventAgeDays),
 			"event_score": sd.EventScore,
-			"gain_since":  faded / 35 * 25, // 还原兑现幅度近似值供前端展示
+			"gain_since":  faded / gfGainMaxScore * gfEventMaxScore, // 还原兑现幅度近似值供前端展示
 			"propagation": boolFloat(sd.EventPropagation),
 			"prop_disc":   boolFloat(propagationDiscount),
 		},
@@ -154,13 +184,13 @@ func boolFloat(b bool) float64 {
 // （eventScore scores event freshness, max 25.）
 func (s *Strategy) eventScore(sd *shortbase.Data) float64 {
 	age := float64(sd.EventAgeDays)
-	if age <= 1 {
-		return 25
+	if age <= gfEventFreshAge {
+		return gfEventMaxScore
 	}
-	if age >= 5 {
-		return 5
+	if age >= gfEventStaleAge {
+		return gfEventMinScore
 	}
-	return 25 - (age-1)/4*20
+	return gfEventMaxScore - (age-gfEventFreshAge)/gfEventAgeSpan*gfEventAgeDrop
 }
 
 // gainSinceEvent 涨幅已兑现（满分 35）：事件日收盘至现价 ≥10% 起评，10~25% 线性，>25% 满分。
@@ -170,33 +200,33 @@ func (s *Strategy) gainSinceEvent(sd *shortbase.Data) float64 {
 		return 0
 	}
 	g := (sd.Price - sd.EventDayClose) / sd.EventDayClose
-	if g < 0.10 {
+	if g < gfGainStart {
 		return 0
 	}
-	if g >= 0.25 {
-		return 35
+	if g >= gfGainFull {
+		return gfGainMaxScore
 	}
-	return (g - 0.10) / 0.15 * 35
+	return (g - gfGainStart) / gfGainSpan * gfGainMaxScore
 }
 
 // weaknessScore 高位转弱（满分 40）：滞涨 15 + 放量滞涨 10 + 破5日线 8 + 长上影 7。
 // （weaknessScore scores stalling/softening near highs, max 40.）
 func (s *Strategy) weaknessScore(sd *shortbase.Data) float64 {
 	var sc float64
-	if sd.Last3RangePct < 1.0 {
-		sc += 15 // 滞涨
-		if sd.VolRatio5_20 >= 1.5 {
-			sc += 10 // 放量滞涨=派发
+	if sd.Last3RangePct < gfStallPct {
+		sc += gfStallScore // 滞涨
+		if sd.VolRatio5_20 >= gfHeavyRatio {
+			sc += gfHeavyScore // 放量滞涨=派发
 		}
 	}
 	if sd.BelowMA5 {
-		sc += 8
+		sc += gfBelowMA5Score
 	}
-	if sd.UpperShadowPct >= 0.4 {
-		sc += 7
+	if sd.UpperShadowPct >= gfShadowRatio {
+		sc += gfShadowScore
 	}
-	if sc > 40 {
-		sc = 40
+	if sc > gfWeaknessMaxScore {
+		sc = gfWeaknessMaxScore
 	}
 	return sc
 }
@@ -206,12 +236,13 @@ func (s *Strategy) weaknessScore(sd *shortbase.Data) float64 {
 func (s *Strategy) freshSurge(sd *shortbase.Data) bool {
 	kl := sd.KLines
 	n := len(kl)
-	if n < 4 {
+	// 相邻涨幅要"多看一根"（比 window 多 1 根）才数得出来，所以门槛是 gfSurgeMinBars。
+	if n < gfSurgeMinBars {
 		return false
 	}
-	for i := n - 3; i < n; i++ {
+	for i := n - gfSurgeWindow; i < n; i++ {
 		prev := kl[i-1].Close
-		if prev > 0 && kl[i].Close/prev-1 >= 0.05 {
+		if prev > 0 && kl[i].Close/prev-1 >= gfSurgeStepPct {
 			return true
 		}
 	}

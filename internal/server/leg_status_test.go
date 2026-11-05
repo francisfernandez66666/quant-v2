@@ -5,7 +5,9 @@
 //	① 携带 strategy_version 的回报要**落进账号目录**并能从读面拿回（装的是不是跑的是不是同一份）；
 //	② 空版本**绝不覆盖**已知版本，也不推进 seen_at（"这轮没带"≠"版本没了"≠"依然新鲜"）；
 //	③ GET /api/qmt/state 的输出必须是 trading.StateSnapshot 的**逐字段超集**
-//	   ——既有键一个不许改名/消失，只许多出 leg_status（§M12-A/§INDEX-BLIND 一贯的加锁姿势）；
+//	   ——既有键一个不许改名/消失，只许多出 leg_status、carrier、carrier_shadow 三枚纯观测键
+//	   （§M12-A/§INDEX-BLIND 一贯的加锁姿势；carrier 那枚见 carrier.go，
+//	    carrier_shadow 那枚见 carrier_shadow.go＝§CARRIER-SHADOW 影子对照 5 日窗口的读数）；
 //	④ golden 的 report_uplink_emitted_fields（本地普通进程上行发出集）⊆ qmtReportEvent 反射集
 //	   ——§M4 丢腿锁的上行侧镜像：这条腿以后加键不加 tag，这里先红。
 package server
@@ -172,11 +174,23 @@ func TestQMTStateSupersetOfStateSnapshot(t *testing.T) {
 			t.Errorf("字段 %q 的值被包装层改写了: %v vs %v", name, a, b)
 		}
 	}
-	// 超集判定二：多出来的键只许是 leg_status（不许顺手塞别的）。
+	// 超集判定二：多出来的键只许是这三枚已登记的观测键（不许顺手塞别的）。
+	// leg_status＝§EXT-BRAIN-UP 的上行腿读数；carrier＝§CARRIER-UPDATE 的载体清单读数；
+	// carrier_shadow＝§CARRIER-SHADOW 的载体影子对照读数（internal/server/carrier_shadow.go）。
+	// 三枚都是纯观测：加键要同批改这里，改这里要同批说清"谁消费它"。
+	allowedExtra := map[string]bool{"leg_status": true, "carrier": true, "carrier_shadow": true}
 	for k := range wrapMap {
-		if _, ok := snapMap[k]; !ok && k != "leg_status" {
-			t.Errorf("state 响应多出了未登记的键 %q（本批只承诺加 leg_status 一枚）", k)
+		if _, ok := snapMap[k]; !ok && !allowedExtra[k] {
+			t.Errorf("state 响应多出了未登记的键 %q（本批只承诺 leg_status、carrier、carrier_shadow 三枚）", k)
 		}
+	}
+	// §CARRIER-SHADOW：包装体没显式给 carrier_shadow 时必须序列化成 null，
+	// 而不是整个键消失——前端据此分"这版后端没这个读数"与"读数说我不知道"两种形态，
+	// 键缺席与 known=false 是两件事（missing≠empty 在呈现面的镜像）。
+	if v, ok := wrapMap["carrier_shadow"]; !ok {
+		t.Error("carrier_shadow 键消失了（应为 null）——前端无从区分旧版本与读不出")
+	} else if v != nil {
+		t.Errorf("未显式装配时 carrier_shadow 应为 null，got %v", v)
 	}
 	leg, ok := wrapMap["leg_status"].(map[string]any)
 	if !ok || leg["strategy_version"] != "v02-20261104" {

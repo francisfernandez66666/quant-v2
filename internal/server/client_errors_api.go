@@ -160,12 +160,51 @@ func (s *Server) clientErrorSnapshot() map[string]any {
 	}
 }
 
+// newsTierAggregator §NEWS-TIER（生产接线批）：注册表的可选只读接口——
+// 各账号最近一轮新闻分级出站的读数（必推/折叠/跳过原因……）。
+// 为什么做成"可选接口 + 类型断言"而不是加进 EngineRegistry 主接口：加主接口方法会打穿
+// 全部测试桩（它们都逐字实现 EngineRegistry），而这条腿是纯观测，缺席只应表现为
+// attached=false，不应让任何既有装配编译失败。真源实现是 engine.Registry.NewsTierStatusMaps。
+// English: optional read-only interface for the news-tier dispatch readout; asserted rather
+// than added to EngineRegistry so observation-leg absence degrades to attached=false.
+type newsTierAggregator interface {
+	NewsTierStatusMaps() []map[string]interface{}
+}
+
+// newsTierUsageReadout 装配 /api/usage 的 news_tier 段。
+// 三态必须互不折叠（本仓反复出现的形状——J0 零回包、空快照、指数盲区全是一族）：
+//   - attached=false ⇒ 读数腿没接上（注册表缺失/非真注册表），"看不见分级"不等于"分级没跑"；
+//   - attached=true 且 accounts 为空 ⇒ 引擎已建但今天还没跑过任何新闻轮；
+//   - accounts 里某条 constructed=false + skip_reason ⇒ 真跑了但分级被跳过（缺推送器/缺身份/缺持仓源）。
+//
+// English: assembles the news_tier block; the three states never collapse into one another.
+func (s *Server) newsTierUsageReadout() map[string]interface{} {
+	out := map[string]interface{}{"attached": false, "accounts": []map[string]interface{}{}}
+	if s.registry == nil {
+		return out
+	}
+	agg, ok := s.registry.(newsTierAggregator)
+	if !ok {
+		return out
+	}
+	maps := agg.NewsTierStatusMaps()
+	out["attached"] = true
+	if maps != nil {
+		out["accounts"] = maps
+	}
+	return out
+}
+
 // handleUsage GET /api/usage（admin）：LLM 当日用量 + 数据源健康 + 前端错误聚合。
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"uptime":        time.Since(s.startTime).Round(time.Second).String(),
 		"build_commit":  s.buildCommit,
 		"client_errors": s.clientErrorSnapshot(),
+		// §NEWS-TIER 新闻分级出站读数（JSON 路径 news_tier.attached / news_tier.accounts[]）。
+		// 只读观测：值不参与任何交易判定（§OBS-GUARD 同规），放在 ops_admin 这面而不放
+		// /api/qmt/state——那是单账号实盘快照，而分级账是按账号各记各的，运营要一次看全。
+		"news_tier": s.newsTierUsageReadout(),
 	}
 	if s.dc != nil {
 		out["data_sources"] = s.dc.HealthCheck()

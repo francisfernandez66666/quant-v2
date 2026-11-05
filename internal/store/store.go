@@ -668,6 +668,39 @@ func (d *DB) migrate() error {
 			UNIQUE(signal_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_shadow_day ON shadow_orders(created_at)`,
+		// §CARRIER-SHADOW（2026-11-05）载体影子决策：本地执行器（local_executor.py）在 shadow 档
+		// 算出来的判定，由盒子普通进程（report_uplink.py）经 POST /api/qmt/report 上行落这里。
+		// 与上面 shadow_orders 的区别（别混成一张表）：shadow_orders 是**我方 staging 引擎**的影子单
+		// （§WS-G，进程内产生），这张是**对方载体**上报的影子决策（外部输入、只能观测）。
+		// 三条形状：
+		//   · 主键 (user_id, day, short_code)＝载体自己的幂等键（同一天同一意图只一行）：
+		//     上行腿重启后把同一份未变的账本重发一遍，落库仍是同一行，5 日窗口的分子不会被灌水；
+		//   · day 用北京时间交易日 YYYYMMDD 且**进主键**：跨日天然隔离，昨天的行不会因为
+		//     "今天同码再来一次"被并进来（与 signal_decisions 同 day-keyed 口径）；
+		//   · amount/market_scale/target_scale 可空（NULL=载体没算出来／判断腿没接线），
+		//     绝不写 0——0 在对照表里会被读成"定权给的是零仓位"（§F18/missing≠empty 同取向）。
+		// English: carrier-side SHADOW decisions reported up by the box-local uplink (distinct from
+		// shadow_orders, which is OUR staging engine). PK is the carrier's own idempotency key,
+		// day-keyed on the Beijing trading day so yesterday never revives; the three nullable
+		// numerics stay NULL when the carrier could not compute them (NULL != 0).
+		`CREATE TABLE IF NOT EXISTS carrier_shadow_decisions (
+			user_id TEXT NOT NULL,
+			day TEXT NOT NULL,
+			short_code TEXT NOT NULL,
+			ts_code TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL DEFAULT '',
+			side TEXT NOT NULL DEFAULT '',
+			qty INTEGER DEFAULT 0,
+			price REAL DEFAULT 0,
+			amount REAL,
+			market_scale REAL,
+			target_scale REAL,
+			sizing_note TEXT DEFAULT '',
+			decided_at TEXT DEFAULT '',
+			seen_at TEXT DEFAULT '',
+			PRIMARY KEY (user_id, day, short_code)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_carrier_shadow_day ON carrier_shadow_decisions(user_id, day)`,
 		// 常用查询索引（主键外的补充加速）
 		`CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_db_date ON daily_basic(trade_date)`,

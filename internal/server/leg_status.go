@@ -177,8 +177,19 @@ func writeLegStatusFile(path string, st *legStatus) error {
 // qmtStateWithLeg §EXT-BRAIN-UP 的 /api/qmt/state 响应包装：**内嵌** trading.StateSnapshot，
 // 既有字段逐字节不变（encoding/json 对匿名字段做扁平合并），只追加 leg_status 一键。
 // leg_status 恒在位（无读数为 null），前端/探针不用在"字段缺失"与"没有读数"之间猜。
-// English: embedding keeps today's JSON byte-for-byte and appends exactly one key.
+//
+// §CARRIER-UPDATE（11-05 载体更新批）同姿势再加一键 carrier：载体清单的期望版/请求态/最近回执。
+// §CARRIER-SHADOW（11-05 影子对照批）再加一键 carrier_shadow：载体 shadow 判定与引擎的按日对照。
+// **为什么不新开一条 GET /api/qmt/carrier-shadow**：新路由必须同批改 scripts/contract_ledger.tsv
+// 与门禁 §115/§144 的派生计数，而那两处本批归另一个 agent——并进 /state 拿到同一份数据、
+// 不动别人的文件（窗口宽度用 ?shadow_days=N 表达，读面参数不是路由）。
+// 三枚都是**纯增量观测**——参与渲染，不参与任何判定；缺席即 null，前端按"读数未知"渲染。
+// "包装后只许多出这三枚键"的形状锁在 leg_status_test.go（超出即红，防止顺手往里塞业务字段）。
+// English: embedding keeps today's JSON byte-for-byte and appends exactly three keys
+// (leg_status, carrier, carrier_shadow) — all pure observability, never inputs to any decision.
 type qmtStateWithLeg struct {
 	trading.StateSnapshot
-	LegStatus *legStatus `json:"leg_status"`
+	LegStatus     *legStatus         `json:"leg_status"`
+	Carrier       *carrierReadout    `json:"carrier"`
+	CarrierShadow *carrierShadowView `json:"carrier_shadow"`
 }

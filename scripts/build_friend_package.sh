@@ -24,12 +24,27 @@
 # 朋友侧就不必去翻被墙的官网。**本脚本只嵌不验签**——Authenticode 只能在 Windows 上判，
 # 验签与拒装都在 install.ps1 第 9 步做（签名人必须是 WireGuard LLC，否则不装、只报）。
 #
+# §FRIEND-CARRIER 11-04 追加（owner 要求：发版前包里必须真有全量规则 + 沙箱策略 py）：
+#   ④ **产物与可复现构建器同带**：仓内 qmt_gateway/local_executor.py 与 qmt_internal_strategy.py
+#      只是**模板/源**（PARAMS/规则块是空的，77KB/30KB）；真正含五个 rules_*.py 全量内联、
+#      v02 烘参的载体是构建器输出到仓库外的 local_executor_<ver>.py / qmt_internal_strategy_<ver>.py
+#      （392KB/369KB）。只把模板打进包＝朋友装上一份没有规则的空壳，而包看起来完全正常。
+#      所以构建期在**包内布局**下跑 payload/tools/build_local_executor.py 两个 target，产物落进
+#      payload/artifacts/；模板原名保留在 payload/qmt_gateway/（构建器读的就是它们）。
+#   ⑤ **解压后重跑逐字节复现**：包压好后从 zip 解到临时目录，在解出来的 payload/tools 下
+#      再跑一次构建器，产物与包内 artifacts/ 逐字节 + SHA256 比对；不一致就删包、ABORT，
+#      不发一份"自证说不过去"的包（AGENTS 11-04 那条实测从此落成常驻腿，不靠人手记）。
+#   ⑥ **模板不许被产物覆盖**：qmt_internal_strategy.py 一旦被产物顶替，构建器拿产物当模板
+#      再烘一次字节会变（实测 cc968f51… → f787b57d…），复现腿当场红。所以是两套文件各归各位。
+#
 # 用法：
 #   scripts/build_friend_package.sh                       # 出一份不含 overlay 的包（会如实打 OVERLAY=none）
 #   scripts/build_friend_package.sh --wireguard ~/Downloads/wireguard-amd64.msi
-#   PKG_OUT=/tmp/x scripts/build_friend_package.sh -Preview   # 只打印将要打包的文件，不落盘不压缩
+#   PKG_OUT=/tmp/x scripts/build_friend_package.sh -Preview   # dry-run：只列白名单，不落盘不压缩
+#   scripts/build_friend_package.sh --check <pkg.zip|dir>     # 只读校验 MANIFEST 逐文件 SHA256，不写不改
 # 判读锚点（纯 ASCII）：BUILD_COMMIT= FILES= BYTES= CONTRACT_FP= WIREGUARD=embedded|none
-#                      DENIED_HIT=0 PKG= BUILD_EXIT=0
+#                      DENIED_HIT=0 ARTIFACTS=2 REPRO_OK=1 PKG= BUILD_EXIT=0
+#                      CHECK_OK files=NN artifacts=2（--check 专用）
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -41,22 +56,118 @@ PKG_OUT="${PKG_OUT:-${TMPDIR:-/tmp}/qmt-friend-pkg}"
 WG_MSI=""
 MODE="build"
 COMMIT=""
+CHECK_PATH=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--wireguard) WG_MSI="${2:-}"; shift 2 ;;
 		-Preview | --preview) MODE="preview"; shift ;;
+		--check) CHECK_PATH="${2:-}"; shift 2 ;;
 		--out) PKG_OUT="${2:-}"; shift 2 ;;
 		--commit) COMMIT="${2:-}"; shift 2 ;;
-		*) echo "X 不认识参数：$1（可用：--wireguard <msi> / --out <dir> / --commit <sha> / -Preview）" >&2; exit 2 ;;
+		*) echo "X 不认识参数：$1（可用：--wireguard <msi> / --check <pkg.zip|dir> / --out <dir> / --commit <sha> / -Preview）" >&2; exit 2 ;;
 	esac
 done
+
+# ── --check：只读校验一份已构建的包（zip 或已解压目录），不落盘、不改任何字节 ──
+# 与 -Preview 的分工：Preview 是"还没建，先看打算装什么"；--check 是"包已在那，逐文件核对
+# MANIFEST 的 SHA256 是否描述真实字节"。两者都是 dry-run，都缺省不动手。
+if [ -n "$CHECK_PATH" ]; then
+	CHECK_OUT=$(python3 - "$CHECK_PATH" <<'PY'
+import hashlib, json, os, sys, zipfile
+sys.dont_write_bytecode = True
+p = sys.argv[1]
+if not p:
+    print("CHECK_FAIL reason=check_path_empty")
+    sys.exit(1)
+z = None
+root = None
+prefix = ""
+if os.path.isfile(p) and p.lower().endswith(".zip"):
+    try:
+        z = zipfile.ZipFile(p)
+    except Exception as e:
+        print("CHECK_FAIL reason=zip_unreadable:%s" % e)
+        sys.exit(1)
+    names = z.namelist()
+    if "payload/MANIFEST.json" in names:
+        prefix = "payload/"
+    elif "MANIFEST.json" in names:
+        prefix = ""
+    else:
+        print("CHECK_FAIL reason=manifest_absent_in_zip")
+        sys.exit(1)
+else:
+    if os.path.isfile(os.path.join(p, "payload", "MANIFEST.json")):
+        root = os.path.abspath(os.path.join(p, "payload"))
+    elif os.path.isfile(os.path.join(p, "MANIFEST.json")):
+        root = os.path.abspath(p)
+    else:
+        print("CHECK_FAIL reason=manifest_absent_in_dir")
+        sys.exit(1)
+
+def read_bytes(rel):
+    if z is not None:
+        return z.read(prefix + rel)
+    with open(os.path.join(root, rel), "rb") as f:
+        return f.read()
+
+def list_paths():
+    if z is not None:
+        return [n[len(prefix):] for n in z.namelist()
+                if not n.endswith("/") and n.startswith(prefix) and n != prefix + "MANIFEST.json"]
+    out = []
+    for base, _, ns in os.walk(root):
+        for n in ns:
+            out.append(os.path.relpath(os.path.join(base, n), root).replace(os.sep, "/"))
+    return [x for x in out if x != "MANIFEST.json"]
+
+try:
+    manifest = json.loads(read_bytes("MANIFEST.json").decode("utf-8"))
+except Exception as e:
+    print("CHECK_FAIL reason=manifest_unreadable:%s" % e)
+    sys.exit(1)
+entries = dict((e["path"], e) for e in manifest.get("files", []))
+actual = list_paths()
+errs = []
+for path, e in entries.items():
+    try:
+        b = read_bytes(path)
+    except Exception:
+        errs.append("missing:" + path)
+        continue
+    if hashlib.sha256(b).hexdigest() != e["sha256"]:
+        errs.append("sha_mismatch:" + path)
+    if len(b) != e["bytes"]:
+        errs.append("size_mismatch:" + path)
+for path in actual:
+    if path not in entries:
+        errs.append("unlisted:" + path)
+    if "__pycache__" in path or path.endswith(".pyc"):
+        errs.append("junk:" + path)
+arts = [x for x in actual if x.startswith("artifacts/") and x.endswith(".py")]
+if len(arts) < 2:
+    errs.append("artifacts_missing:%d" % len(arts))
+if errs:
+    print("CHECK_FAIL reason=" + ",".join(errs[:8]))
+    sys.exit(1)
+print("CHECK_OK files=%d artifacts=%d contract_fp=%s commit=%s"
+      % (len(entries), len(arts), str(manifest.get("contract_fp", ""))[:12],
+         manifest.get("build_commit", "")))
+PY
+)
+	printf '%s\n' "$CHECK_OUT"
+	case "$CHECK_OUT" in
+		*CHECK_OK*) exit 0 ;;
+		*) exit 1 ;;
+	esac
+fi
 
 # ── 白名单：点名的源文件必须存在，缺一个就 exit 1（宁可不发包，也不发一份少个文件的包）──
 GW_FILES="gateway.py store.py handler.py broker.py ids.py outbox_admin.py quote_feed.py \
 close_gate.py leg_ops.py trading_calendar.py qmt_bridge.py qmt_bridge_strategy.py \
 config.bridge.example.json local_executor.py local_executor_params.json \
-qmt_internal_strategy.py report_uplink.py broker_reads.py \
+qmt_internal_strategy.py report_uplink.py broker_reads.py carrier_updater.py \
 rules_form.py rules_ladder.py rules_factor.py rules_t.py rules_sizing.py"
 FRIEND_FILES="ensure_friend_gateway_config.ps1 watchdog.ps1 install_tasks.ps1 enroll.ps1 \
 export_ledger.ps1 stop_leg.ps1 uninstall.ps1 config.xt.friend.template.json \
@@ -66,7 +177,12 @@ install_local_executor.ps1"
 #   * scripts/build_local_executor.py   烘参 + 五道静态闸（产物落仓库外）
 #   * scripts/update_local_executor.ps1 备份→写入(SHA 三值自证)→版本回读 三段自证
 # 11-04 载体定稿后多两件：内置策略的投递脚本（写策略文件+重启客户端+版本回读）。
-SCRIPTS_FILES="build_local_executor.py update_local_executor.ps1 update_qmt_strategy.ps1"
+# 11-04 §FRIEND-CARRIER 补齐（owner 清单，缺一件就不算"全量规则 + 沙箱策略 py"）：
+#   * scripts/derive_carrier_params.py  参数真源导出器（Go 出厂默认 → local_executor_params.json）
+#   * scripts/update_local_executor.bat 更新脚本的 .bat 入口（缺省 dry-run，-Apply 才写）
+# 看门狗 watchdog.ps1 与 install_local_executor.ps1 已在 FRIEND_FILES 里，不重复登记。
+SCRIPTS_FILES="build_local_executor.py derive_carrier_params.py \
+update_local_executor.ps1 update_qmt_strategy.ps1 update_local_executor.bat"
 # 门禁 §171 盯这两个变量的条目数与内容；改白名单必须同批改那里。
 #
 # §FRIEND-LOCAL 批 7 追加：本地执行器那条腿（QMT 之外的独立普通 Python 进程）
@@ -110,6 +226,8 @@ if [ "$MODE" = "preview" ]; then
 	echo "==> [-Preview] 只列出将要打包的文件，不落盘、不压缩"
 	printf '   %s\n' $SRC_LIST
 	echo "   （另加 MANIFEST.json / SETUP.txt / 三个 .bat，均在 deploy/qmt-friend/ 里）"
+	echo "ARTIFACTS_PLAN=2 built_at_build_time"
+	echo "REPRO_PLAN=1 verify_after_unzip"
 	echo "WIREGUARD=$([ -n "$WG_MSI" ] && echo requested || echo none)"
 	echo "BUILD_EXIT=0"
 	exit 0
@@ -147,6 +265,39 @@ if [ -n "$WG_MSI" ]; then
 		exit 1
 	fi
 fi
+
+# ── 载体产物（§FRIEND-CARRIER）：构建期在**包内布局**下烘出含全量规则的两份载体 ──
+# 构建器的 REPO_ROOT = 脚本父目录 = payload/，于是它读的就是 payload/qmt_gateway/ 里的模板、
+# 五个 rules_*.py、params 与 handler/store —— 与将来朋友解压后在包内重跑完全同一套输入。
+# out-dir 必须落在 payload **之外**：构建器 out_dir_for() 拒绝往 REPO_ROOT 里写（工作树漂移闸），
+# 所以先落在 $STAGE/artifact-build，再拷进 payload/artifacts/。
+ART_DIR="$STAGE/payload/artifacts"
+BUILD_OUT="$STAGE/artifact-build"
+mkdir -p "$ART_DIR" "$BUILD_OUT" || { echo "X 建产物目录失败" >&2; exit 1; }
+# 构建器 exec 产物 + import 账本模块：禁写字节码，否则清单里会混进 __pycache__/*.pyc。
+export PYTHONDONTWRITEBYTECODE=1
+for tgt in executor sandbox; do
+	BUILD_LOG="$STAGE/build-$tgt.log"
+	if ! python3 "$STAGE/payload/tools/build_local_executor.py" --out-dir "$BUILD_OUT" --target "$tgt" >"$BUILD_LOG" 2>&1; then
+		echo "X 载体构建失败 target=${tgt}（不出一份没有全量规则的包）" >&2
+		cat "$BUILD_LOG" >&2
+		exit 1
+	fi
+	if ! grep -q "BUILD_RESULT=OK" "$BUILD_LOG"; then
+		echo "X 载体构建没打 BUILD_RESULT=OK target=$tgt" >&2
+		cat "$BUILD_LOG" >&2
+		exit 1
+	fi
+done
+cp "$BUILD_OUT"/*.py "$ART_DIR/" || { echo "X 产物拷进包失败" >&2; exit 1; }
+ART_N=$(find "$ART_DIR" -maxdepth 1 -name '*.py' -type f | wc -l | tr -d ' ')
+[ "$ART_N" = "2" ] || { echo "BUILD_EXIT=1 reason=artifacts_expected_2_got_$ART_N" >&2; exit 1; }
+ART_VER=$(grep -ho 'version=v[A-Za-z0-9-]*' "$STAGE"/build-*.log | head -1 | cut -d= -f2)
+echo "ARTIFACTS=$ART_N version=$ART_VER"
+
+# 再清一次字节码：第一段 MANIFEST 见到 __pycache__ 会当场拒建（清单必须描述干净的包体）。
+find "$STAGE/payload" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+find "$STAGE/payload" -name '*.pyc' -type f -delete 2>/dev/null || true
 
 # MANIFEST：逐文件 SHA256 + 契约指纹（用网关自己的 contract_fingerprint，不另造尺子）。
 MANIFEST_ERR=$(cd "$STAGE/payload" && python3 - "$COMMIT" "$STAMP" <<'PY'
@@ -239,6 +390,71 @@ ZIP="${PKG_OUT}/leg-${COMMIT}-${STAMP}.zip"
 ( cd "$STAGE" && zip -q -r -X "$ZIP" payload ) || { echo "X 压缩失败" >&2; exit 1; }
 rm -rf "$STAGE" 2>/dev/null || true
 
+# ── 解压后在**包内**重跑构建器，逐字节复现 artifacts/（§FRIEND-CARRIER 常驻自证）──
+# 验的是 zip 里那一份，不是 STAGE 里的副本：只有真发出去的包自己能复现，自证才不作假。
+# 全程在 ${PKG_OUT} 下的临时目录里跑，不读也不写仓库源码；不过就删包 ABORT，不留半态。
+REPRO="${PKG_OUT}/repro-${COMMIT}-${STAMP}"
+rm -rf "$REPRO" 2>/dev/null || true
+mkdir -p "$REPRO/out" || { echo "X 建复现临时目录失败" >&2; rm -f "$ZIP" 2>/dev/null || true; exit 1; }
+if ! unzip -q "$ZIP" -d "$REPRO"; then
+	echo "BUILD_EXIT=1 reason=repro_unzip_failed" >&2
+	rm -f "$ZIP" 2>/dev/null || true
+	exit 1
+fi
+for tgt in executor sandbox; do
+	REPRO_LOG="$REPRO/repro-$tgt.log"
+	if ! python3 "$REPRO/payload/tools/build_local_executor.py" --out-dir "$REPRO/out" --target "$tgt" >"$REPRO_LOG" 2>&1; then
+		echo "BUILD_EXIT=1 reason=repro_build_failed_$tgt" >&2
+		cat "$REPRO_LOG" >&2
+		rm -f "$ZIP" 2>/dev/null || true
+		exit 1
+	fi
+	if ! grep -q "BUILD_RESULT=OK" "$REPRO_LOG"; then
+		echo "BUILD_EXIT=1 reason=repro_no_ok_$tgt" >&2
+		cat "$REPRO_LOG" >&2
+		rm -f "$ZIP" 2>/dev/null || true
+		exit 1
+	fi
+done
+REPRO_OUT=$(python3 - "$REPRO" <<'PY'
+import glob, hashlib, os, sys
+sys.dont_write_bytecode = True
+d = sys.argv[1]
+arts = sorted(glob.glob(os.path.join(d, "payload", "artifacts", "*.py")))
+outs = sorted(glob.glob(os.path.join(d, "out", "*.py")))
+if len(arts) != 2 or len(outs) != 2:
+    print("REPRO_FAIL reason=count artifacts=%d rebuilt=%d" % (len(arts), len(outs)))
+    sys.exit(1)
+by_name = dict((os.path.basename(p), p) for p in outs)
+for a in arts:
+    n = os.path.basename(a)
+    if n not in by_name:
+        print("REPRO_FAIL reason=missing_rebuilt:" + n)
+        sys.exit(1)
+    with open(a, "rb") as f:
+        ba = f.read()
+    with open(by_name[n], "rb") as f:
+        bo = f.read()
+    if ba != bo:
+        print("REPRO_FAIL reason=bytes_differ:" + n)
+        sys.exit(1)
+    print("REPRO_BYTE_SAME file=%s sha256=%s bytes=%d"
+          % (n, hashlib.sha256(ba).hexdigest()[:16], len(ba)))
+print("REPRO_OK files=2 bytesame=1")
+PY
+)
+printf '%s\n' "$REPRO_OUT"
+case "$REPRO_OUT" in
+	*REPRO_OK*) : ;;
+	*)
+		echo "BUILD_EXIT=1 reason=repro_mismatch（包已删，不留半态）" >&2
+		rm -f "$ZIP" 2>/dev/null || true
+		rm -rf "$REPRO" 2>/dev/null || true
+		exit 1
+		;;
+esac
+rm -rf "$REPRO" 2>/dev/null || true
+
 FILES_N=$(unzip -l "$ZIP" | awk 'END {print $2}')
 BYTES_Z=$(wc -c <"$ZIP" | tr -d ' ')
 FP=$(python3 -c "
@@ -254,4 +470,5 @@ echo "WIREGUARD=$OVERLAY"
 echo "OVERLAY=$([ "$OVERLAY" = "embedded" ] && echo bundled || echo not_bundled_first_leg_blocked)"
 echo "PKG=$ZIP"
 echo "PKG_SHA256=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)"
+echo "REPRO_OK=1"
 echo "BUILD_EXIT=0"

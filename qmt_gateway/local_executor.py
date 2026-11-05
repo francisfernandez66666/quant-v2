@@ -68,10 +68,33 @@ LOG = logging.getLogger("qmt_gateway.local_executor")
 # ==== BAKED PARAMS BEGIN ====
 STRATEGY_VERSION = "v02-20261104"
 PARAMS = {
+    'bd_depth_full_pct': 3,
+    'bd_depth_max_score': 30,
+    'bd_depth_single_cap': 25,
+    'bd_intraday_flat_span_pct': 2,
+    'bd_intraday_flat_span_score': 10,
+    'bd_intraday_max_score': 30,
+    'bd_intraday_mid_base_score': 20,
+    'bd_intraday_mid_pct': -2,
+    'bd_intraday_severe_pct': -5,
+    'bd_intraday_severe_span_pct': 3,
+    'bd_intraday_severe_span_score': 10,
+    'bd_low_window': 20,
+    'bd_min_bars': 25,
+    'bd_score_threshold': 60,
+    'bd_shadow_add_ratio': 0.5,
+    'bd_shadow_add_score': 5,
+    'bd_shakeout_depth_pct': 1,
+    'bd_shakeout_discount': 0.7,
+    'bd_volume_full_ratio': 1.5,
+    'bd_volume_half_ratio': 1,
+    'bd_volume_max_score': 40,
+    'bd_volume_shrink_factor': 0.5,
     'breadth_bands': {'low': 0.3, 'mid': 0.5},
     'breadth_missing_default': 0.9,
     'breadth_missing_scale': 0.9,
     'breadth_scales': {'low': 0.7, 'mid': 0.85, 'high': 1.0},
+    'break_down_kind': 'break_down',
     'breakdown_ratio': 0.96,
     'budget_mode': 'dynamic',
     'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell'],
@@ -81,6 +104,108 @@ PARAMS = {
     'cluster_cap_pct': 40,
     'cluster_rho': 0.7,
     'daily_buy_cap': 100000.0,
+    'db_adjust_max_pct': 6,
+    'db_break_ratio': 1.05,
+    'db_first_vol_multiple': 1.5,
+    'db_first_window': 5,
+    'db_full_chain_min': 60,
+    'db_lookback': 20,
+    'db_ma_align_ratio': 0.8,
+    'db_ma_mid': 10,
+    'db_ma_short': 5,
+    'db_ma_weight': 0.3,
+    'db_min_bars': 10,
+    'db_min_change_pct': 0,
+    'db_position_weight': 0.3,
+    'db_second_vol_multiple': 1.5,
+    'db_volume_weight': 0.4,
+    'db_weak_day_pct': -1.5,
+    'default_buy_threshold': 70,
+    'default_direction': 1,
+    'default_weight': 1,
+    'dr_beak_score_one': 2,
+    'dr_beak_score_three': 7,
+    'dr_beak_score_two': 4,
+    'dr_beak_vr_hi': 1.2,
+    'dr_beak_vr_lo': 0.5,
+    'dr_confirm_vol_full': 7,
+    'dr_confirm_vol_mid': 3,
+    'dr_confirm_vr_hi': 1.5,
+    'dr_confirm_vr_lo': 1.2,
+    'dr_confirm_vr_mid_lo': 0.8,
+    'dr_days_good_hi': 8,
+    'dr_days_good_lo': 5,
+    'dr_days_long_hi': 12,
+    'dr_days_score_good': 5,
+    'dr_days_score_near': 3,
+    'dr_days_score_other': 1,
+    'dr_days_short_lo': 3,
+    'dr_duck_neck_full': 8,
+    'dr_duck_neck_low': 5,
+    'dr_duck_slope_bonus': 2,
+    'dr_duck_top_full': 5,
+    'dr_duck_top_half': 2,
+    'dr_first_rise_max': 0.7,
+    'dr_first_rise_min': 0.35,
+    'dr_k_hold_ratio': 1.03,
+    'dr_k_near_lo_ratio': 0.98,
+    'dr_k_score_cross': 2,
+    'dr_k_score_hold': 5,
+    'dr_k_score_near': 2,
+    'dr_level_first': 60,
+    'dr_ma_long': 20,
+    'dr_ma_mid': 10,
+    'dr_ma_short': 5,
+    'dr_macd_green_near': 1,
+    'dr_min_bars': 30,
+    'dr_neck_support_ratio': 0.98,
+    'dr_nostril_full': 5,
+    'dr_nostril_half': 3,
+    'dr_pb_best_hi': 0.2,
+    'dr_pb_best_lo': 0.15,
+    'dr_pb_deep_hi': 0.35,
+    'dr_pb_good_hi': 0.25,
+    'dr_pb_score_best': 8,
+    'dr_pb_score_deep': 4,
+    'dr_pb_score_good': 6,
+    'dr_pb_score_other': 1,
+    'dr_pb_score_shallow': 5,
+    'dr_pb_shallow_lo': 0.1,
+    'dr_rally_window': 40,
+    'dr_score_dragon': 25,
+    'dr_sector_rps_min': 75,
+    'dr_shrink_max': 0.5,
+    'dr_slope_delta_ratio': 0.01,
+    'dr_slope_min': 0.5,
+    'dr_slope_prev_ratio': 0.99,
+    'dr_vr_bad': 0.6,
+    'dr_vr_good': 0.3,
+    'dr_vr_mid': 0.5,
+    'dr_vr_ok': 0.4,
+    'dr_vr_score_bad': 3,
+    'dr_vr_score_good': 8,
+    'dr_vr_score_mid': 5,
+    'dr_vr_score_ok': 7,
+    'dr_vr_score_other': 1,
+    'dragon_f1_base_ratio': 0.9,
+    'dragon_f1_vol_ratio': 0.1,
+    'dragon_f1_weight': 0.3,
+    'dragon_f2_full_pct': 3,
+    'dragon_f2_half_pct': 1,
+    'dragon_f2_half_ratio': 0.5,
+    'dragon_f2_weight': 0.25,
+    'dragon_f3_half_ratio': 0.5,
+    'dragon_f3_own_gain_pct': 5,
+    'dragon_f3_premium_pct': 2,
+    'dragon_f3_weight': 0.2,
+    'dragon_f4_full_pct': 10,
+    'dragon_f4_half_pct': 5,
+    'dragon_f4_half_ratio': 0.5,
+    'dragon_f4_weight': 0.25,
+    'dragon_full_chain_min': 60,
+    'dragon_min_bars': 5,
+    'dragon_rs_window': 5,
+    'dragon_seal_tolerance_pct': 0.5,
     'emo_breadth_ice_down_ratio': 0.0,
     'emo_breadth_retreat_down_ratio': 0.0,
     'emo_climax_board_min': 7,
@@ -100,12 +225,67 @@ PARAMS = {
     'emotion_enabled': True,
     'emotion_phase_labels': {'ice': '\u51b0\u70b9', 'start': '\u542f\u52a8', 'ferment': '\u53d1\u9175', 'climax': '\u9ad8\u6f6e', 'divergence': '\u80cc\u79bb', 'retreat': '\u9000\u6f6e'},
     'emotion_scales': {'ferment': 1, 'start': 1, 'divergence': 0.6, 'retreat': 0.5, 'climax': 0.8},
+    'entry_side': 'buy',
+    'factor_defs': {'Mom5': {'kind': 'momentum', 'windows': [5], 'input': 'bars'}, 'Mom10': {'kind': 'momentum', 'windows': [10], 'input': 'bars'}, 'Mom20': {'kind': 'momentum', 'windows': [20], 'input': 'bars'}, 'Mom60': {'kind': 'momentum', 'windows': [60], 'input': 'bars'}, 'Volatility20': {'kind': 'realized_vol', 'windows': [20], 'input': 'bars'}, 'RealizedVol5': {'kind': 'realized_vol', 'windows': [5], 'input': 'bars'}, 'RealizedVol10': {'kind': 'realized_vol', 'windows': [10], 'input': 'bars'}, 'Amplitude20': {'kind': 'amplitude', 'windows': [20], 'input': 'bars'}, 'AtrRatio14': {'kind': 'atr_ratio', 'windows': [14], 'input': 'bars'}, 'HighLow20': {'kind': 'high_low', 'windows': [20], 'input': 'bars'}, 'VolRatio5': {'kind': 'vol_break_ratio', 'windows': [5], 'input': 'bars'}, 'STOA': {'kind': 'log_amount', 'windows': [20], 'input': 'bars'}, 'Amihud20': {'kind': 'amihud', 'windows': [20], 'input': 'bars'}, 'VolSurge5': {'kind': 'vol_surge', 'windows': [20], 'input': 'bars'}, 'VolShrink': {'kind': 'vol_shrink', 'windows': [5, 20], 'input': 'bars'}, 'VMA5': {'kind': 'vol_ma_ratio', 'windows': [5, 20], 'input': 'bars'}, 'VMA10': {'kind': 'vol_ma_ratio', 'windows': [10, 20], 'input': 'bars'}, 'VSTD20': {'kind': 'vol_cv', 'windows': [20], 'input': 'bars'}, 'VMAX10': {'kind': 'vol_peak', 'windows': [10], 'input': 'bars'}, 'VMIN10': {'kind': 'vol_floor', 'windows': [10], 'input': 'bars'}, 'Brk20': {'kind': 'breakout', 'windows': [20], 'input': 'bars'}, 'Brk60': {'kind': 'breakout', 'windows': [60], 'input': 'bars'}, 'Drawdown20': {'kind': 'drawdown', 'windows': [20], 'input': 'bars'}, 'BullAlign': {'kind': 'bull_align', 'windows': [5, 10, 20], 'input': 'bars'}, 'RSI14': {'kind': 'rsi', 'windows': [14], 'input': 'bars'}, 'BBI': {'kind': 'bbi', 'windows': [3, 6, 12, 24], 'input': 'bars'}, 'EMA10_20': {'kind': 'ema_ratio', 'windows': [10, 20], 'input': 'bars'}, 'Alpha1': {'kind': 'alpha1', 'windows': [5, 20], 'input': 'bars'}, 'Alpha4': {'kind': 'alpha4', 'windows': [9], 'input': 'bars'}, 'Alpha12': {'kind': 'alpha12', 'windows': [1], 'input': 'bars'}, 'Alpha101': {'kind': 'alpha101', 'windows': [], 'input': 'bars'}, 'STO20': {'kind': 'turnover_mean', 'windows': [20], 'input': 'turnover_series', 'missing_input': 'per-day turnover rate series'}, 'TurnoverStd20': {'kind': 'turnover_std', 'windows': [20], 'input': 'turnover_series', 'missing_input': 'per-day turnover rate series'}, 'LnMktCap': {'kind': 'ln_mktcap', 'windows': [], 'input': 'total_share_series', 'missing_input': 'total share count series (share capital panel)'}, 'EP_ttm': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'pe_ttm', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'BP': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'pb', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'SP_ttm': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'ps_ttm', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'CFP_ttm': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'pcf_ttm', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'DP': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'dv_ttm', 'missing_input': 'per-day dividend yield panel'}, 'ROE': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'roe', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'GrossMargin': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'gross_margin', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'NetMargin': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'net_margin', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'DebtToAssets': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'debt_to_assets', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'YoyNetProfit': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'yoy_net_profit', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'SUE': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'single_quarter_ni_yoy', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'emo_limit_up': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_up_count', 'direct': True, 'missing_input': 'market limit-up history'}, 'emo_max_board': {'kind': 'scalar_proxy', 'windows': [], 'input': 'ladder_height', 'direct': True, 'missing_input': 'market ladder-height history'}, 'emo_blast_rate': {'kind': 'scalar_proxy', 'windows': [], 'input': 'broken_board_ratio', 'direct': True, 'missing_input': 'market blast-rate history'}, 'emo_blast_cnt': {'kind': 'scalar_proxy', 'windows': [], 'input': 'broken_board_count', 'direct': True, 'missing_input': 'market blast-count history'}, 'emo_chg5': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_up_count_history', 'direct': True, 'missing_input': 'market limit-up history'}, 'lu_board': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_board_count', 'direct': True, 'missing_input': 'per-stock limit-up board history (THS pool)'}, 'lu_board3': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_board_count', 'direct': True, 'missing_input': 'per-stock limit-up board history (THS pool)'}, 'lu_seal_strength': {'kind': 'scalar_proxy', 'windows': [], 'input': 'seal_amount_ratio', 'direct': True, 'missing_input': 'seal amount / free-float cap (THS pool)'}, 'lu_early_seal': {'kind': 'scalar_proxy', 'windows': [], 'input': 'first_seal_minute', 'direct': True, 'missing_input': 'first seal minute + break count (THS pool)'}, 'lu_reblast_low': {'kind': 'scalar_proxy', 'windows': [], 'input': 'broken_board_ratio_history', 'direct': True, 'missing_input': 'market blast-rate history (THS pool)'}, 'FlowToday': {'kind': 'scalar_proxy', 'windows': [], 'input': 'flow_today_pct', 'direct': True, 'missing_input': 'eastmoney main-force net inflow, today'}, 'Flow5d': {'kind': 'scalar_proxy', 'windows': [], 'input': 'flow_5d_pct', 'direct': True, 'missing_input': 'eastmoney main-force net inflow, 5 day'}, 'ConceptHeat': {'kind': 'scalar_proxy', 'windows': [], 'input': 'concept_heat', 'direct': True, 'missing_input': 'concept heat ranking (external feed)'}, 'NewsEvent': {'kind': 'scalar_proxy', 'windows': [], 'input': 'news_event', 'direct': True, 'missing_input': 'news agent / LLM event scoring (external)'}, 'IndexChange': {'kind': 'scalar_proxy', 'windows': [], 'input': 'index_change_pct', 'direct': True, 'missing_input': 'index weight / benchmark leg (external)'}, 'IsLeader': {'kind': 'scalar_proxy', 'windows': [], 'input': 'is_leader', 'direct': True, 'missing_input': 'sector leadership ranking (external)'}},
+    'factor_rules': [{'id': 'fac_1', 'name': 'factor_composite', 'factors': ['Mom20', 'VolShrink', 'BullAlign'], 'weights': {'Mom20': 0.4, 'VolShrink': 0.3, 'BullAlign': 0.3}, 'directions': {'Mom20': 1, 'VolShrink': -1, 'BullAlign': 1}, 'buy_threshold': 70.0}],
+    'factor_thresholds': {},
+    'financial_bands': {'BP': {'scale': 1}, 'CFP_ttm': {'scale': 1}, 'DP': {'scale': 5}, 'DebtToAssets': {'offset': 100, 'scale': 100}, 'EP_ttm': {'scale': 1}, 'GrossMargin': {'scale': 40}, 'NetMargin': {'scale': 20}, 'ROE': {'scale': 20}, 'SP_ttm': {'scale': 1}, 'SUE': {'scale': 30}, 'YoyNetProfit': {'scale': 30}},
     'flow_5d_scales': {'mild_in': 1.05, 'mild_out': 0.85, 'neutral': 1, 'strong_in': 1.1, 'strong_out': 0.7},
     'flow_bands': {'mild_in_pct': 1, 'mild_out_pct': -1, 'strong_in_pct': 3, 'strong_out_pct': -3},
     'flow_factor_enabled': True,
     'flow_today_scales': {'mild_in': 1.025, 'mild_out': 0.95, 'neutral': 1, 'strong_in': 1.05, 'strong_out': 0.9},
+    'gf_below_ma5_score': 8,
+    'gf_event_age_drop': 20,
+    'gf_event_age_span': 4,
+    'gf_event_fresh_age': 1,
+    'gf_event_max_score': 25,
+    'gf_event_min_score': 5,
+    'gf_event_stale_age': 5,
+    'gf_event_window_days': 5,
+    'gf_gain_full': 0.25,
+    'gf_gain_max_score': 35,
+    'gf_gain_span': 0.15,
+    'gf_gain_start': 0.1,
+    'gf_heavy_ratio': 1.5,
+    'gf_heavy_score': 10,
+    'gf_min_bars': 20,
+    'gf_propagation_discount': 0.7,
+    'gf_score_threshold': 60,
+    'gf_shadow_ratio': 0.4,
+    'gf_shadow_score': 7,
+    'gf_stall_pct': 1,
+    'gf_stall_score': 15,
+    'gf_surge_step_pct': 0.05,
+    'gf_surge_window': 3,
+    'gf_weakness_max_score': 40,
+    'good_news_fade_kind': 'good_news_fade',
     'group_floor_market': 0.45,
     'group_floor_stock': 0.35,
+    'hc_below_ma5_score': 10,
+    'hc_consec_down_days': 2,
+    'hc_consec_down_score': 8,
+    'hc_div_full_score': 40,
+    'hc_div_half_score': 20,
+    'hc_div_heavy_ratio': 1.5,
+    'hc_div_stall_pct': 2,
+    'hc_gain_base_score': 15,
+    'hc_gain_span': 0.2,
+    'hc_gain_start': 0.3,
+    'hc_gain_step_score': 15,
+    'hc_gain_window': 20,
+    'hc_high_window': 60,
+    'hc_last3_window': 3,
+    'hc_min_bars': 60,
+    'hc_pos_base_score': 15,
+    'hc_pos_span': 0.08,
+    'hc_pos_start': 0.92,
+    'hc_pos_step_score': 15,
+    'hc_position_max_score': 30,
+    'hc_score_threshold': 60,
+    'hc_shadow_ratio': 0.4,
+    'hc_shadow_score': 12,
+    'hc_weakness_max_score': 30,
+    'high_churn_kind': 'high_churn',
     'holiday_block_new': False,
     'holiday_long_closed_run': 5,
     'holiday_long_pre_max': 3,
@@ -122,8 +302,49 @@ PARAMS = {
     'kelly_lambda': 0.5,
     'kelly_min_prob': 0.52,
     'kelly_no_edge': 0.6,
+    'ladder_buy_amount': 20000.0,
+    'ld_big_face_ratio': 0.97,
+    'ld_big_loss_ratio': 0.97,
+    'ld_big_loss_score': 20,
+    'ld_board_base_boards': 2,
+    'ld_board_base_score': 12,
+    'ld_board_full_boards': 5,
+    'ld_board_max_score': 30,
+    'ld_board_score_base': 12,
+    'ld_board_score_full': 30,
+    'ld_board_score_span': 18,
+    'ld_board_span_boards': 3,
+    'ld_board_span_score': 18,
+    'ld_huge_volume_ratio': 2,
+    'ld_huge_volume_score': 10,
+    'ld_min_bars': 10,
+    'ld_min_boards': 2,
+    'ld_min_score': 65,
+    'ld_phase_score': 10,
+    'ld_retreat_cap': 30,
+    'ld_retreat_max_score': 30,
+    'ld_retreat_phase_keys': ['\u9000\u6f6e'],
+    'ld_retreat_tokens': ['\u9000\u6f6e'],
+    'ld_score_big_face': 20,
+    'ld_score_huge_volume': 10,
+    'ld_score_phase': 10,
+    'ld_score_sector_drop': 20,
+    'ld_score_threshold': 65,
+    'ld_score_touched': 15,
+    'ld_seal_tolerance': 0.995,
+    'ld_sector_drop_ratio': 0.5,
+    'ld_sector_drop_score': 20,
+    'ld_touch_tolerance': 0.998,
+    'ld_touched_score': 15,
+    'ld_vol_window': 5,
+    'ld_weakness_cap': 40,
+    'ld_weakness_max_score': 40,
+    'leader_decay_kind': 'leader_decay',
     'llm_bearish_scale': 0.5,
     'lot_size': 100,
+    'ma10_window': 10,
+    'ma20_window': 20,
+    'ma5_window': 5,
     'ma_period': '1d',
     'ma_window': 5,
     'macro_event_day_scale': 0.3,
@@ -134,6 +355,7 @@ PARAMS = {
     'max_drawdown_pct': 0.1,
     'max_ops_per_min': 6,
     'max_total_position_pct': 1,
+    'min_bars': 30,
     'min_cash_reserve': 1000.0,
     'min_order_amount': 10000,
     'min_price': 0.01,
@@ -144,20 +366,27 @@ PARAMS = {
     'non_trading_weekdays': [5, 6],
     'ops_window_sec': 60,
     'order_amount_cap': 20000.0,
+    'pattern_rules': [{'id': 'pat_1', 'name': 'pattern_template', 'conds': [{'factor': 'Drawdown20', 'min': 0.0, 'max': 0.3}, {'factor': 'VolShrink', 'min': 0.0, 'max': 1.0}, {'factor': 'BullAlign', 'min': 0.5, 'max': 2.0}]}],
+    'pct_scale': 100,
     'per_trade_default_hi': 0.3,
     'per_trade_default_lo': 0.1,
     'per_trade_hard_max': 0.5,
     'per_trade_position_max_pct': 0.3,
     'per_trade_position_pct': 0.1,
+    'percentile_min_samples': 5,
     'poll_interval_sec': 5,
     'ported_modules': ['rules_form', 'rules_ladder', 'rules_factor', 'rules_t', 'rules_sizing'],
     'power_p': 0.5,
     'pullback_ratio': 0.98,
     'quality_weight_clamp': [0.9, 1.1],
     'red_block_new_buy': False,
+    'require_trading_day': True,
     'rule_arm': {'break_down': 'shadow', 'double_bump': 'shadow', 'dragon': 'shadow', 'dragon_return': 'shadow', 'factor_composite': 'shadow', 'good_news_fade': 'shadow', 'high_churn': 'shadow', 'leader_decay': 'shadow', 'leader_decay_v2': 'shadow', 'pattern_template': 'shadow'},
+    'rule_side': 'sell',
+    'scalar_bands': {},
     'scale_cap': 1.15,
     'scale_floor': 0.15,
+    'score_domain': {'divisor': 2, 'floor': 0, 'full': 100, 'shift': 1},
     'sell_boost_level': 'L2',
     'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP'},
     'single_stock_cap_pct': 35.0,
@@ -171,10 +400,15 @@ PARAMS = {
     'stoploss_guard_count': 4,
     'symbol_head_len': 6,
     'symbols': ['600000.SH', '000001.SZ'],
+    't_anchor_ok_sources': ['first_buy_order', 'first_lot'],
+    't_bse_board_prefixes': ['4', '8', '92'],
+    't_cancelled_status_tokens': ['\u64a4'],
     't_commission_rate': 0.00025,
+    't_cost_safety_multiplier': 1.3,
     't_day_loss_limit_pct': 0,
     't_direction_mode': 'both',
     't_enabled': True,
+    't_fee_buffer_pct': 0.6,
     't_force_unwind_at': '1450',
     't_ghost_grace_sec': 90,
     't_intraday_cap_pct': 50,
@@ -195,29 +429,43 @@ PARAMS = {
     't_min_commission': 5,
     't_min_listed_days': 60,
     't_min_market_scale': 0.4,
+    't_min_remaining_position_pct': 50,
     't_min_spread_pct': 2,
     't_min_turnover_pct': 1.5,
+    't_missing_key_input': False,
     't_mode': 'both',
     't_near_extreme_pct': 0.3,
     't_no_cancel_windows': [['09:20', '09:30'], ['14:57', '15:00']],
     't_no_new_order_windows': [['09:20', '09:30'], ['14:52', '15:00']],
     't_open_cooling_min': 15,
     't_premise_grace_sec': 120,
+    't_regime_allow_states': ['range'],
+    't_regime_block_states': ['bull', 'bear'],
     't_regime_gate_enabled': True,
     't_regime_min_votes': 4,
     't_regime_stale_sec': 900,
+    't_remark_code_max_len': 0,
     't_round_stop_pct': 2,
     't_sell_env_min_market_scale': 0.2,
+    't_session_open_hhmm': '09:30',
+    't_session_windows': [['08:30', '15:00']],
     't_shadow': False,
+    't_signal_codes': {},
     't_slippage_bps': 5,
+    't_st_markers': ['ST'],
+    't_stale_order_sec': 900,
     't_stamp_tax_rate': 0.0005,
     't_stop_guard_pct': 1.5,
+    't_terminal_status_codes': ['\u5df2\u5e9f', '\u5df2\u6210', '\u5df2\u64a4', '\u5e9f\u5355', '\u90e8\u64a4'],
     't_vol_ratio_max': 1.8,
     't_vwap_check_tol_pct': 0.1,
     't_vwap_dev_pct': 0.8,
+    't_wide_board_prefixes': ['30', '68'],
     'take_profit_ratio': 1.05,
     'tier_red_default': 0.3,
     'tier_scales': {'Red': 0.3, 'Yellow': 0.6},
+    'vol20_window': 20,
+    'vol5_window': 5,
     'vol_clamp': [0.5, 1.5],
     'vol_target_pct': 2,
     'volume_ratio_min': 1.5,
@@ -778,6 +1026,51 @@ def load_ported_modules(params):
     return loaded, failed
 
 
+def ported_leg_status():
+    """Which judgement legs the artifact declares, and which of those it can CALL.
+
+    Two questions, deliberately asked separately: "the module was inlined" was always
+    answerable and was never enough -- the 11-04 build carried rules_sizing's code while
+    no name could reach its readout, so every shadow row was journalled without a sizing
+    number and no screen said so. declared-but-unbound is the shape this line exists to
+    make loud.
+
+    In the repository copy both lists are empty (nothing is inlined there), and that is
+    reported as "none", never as an error.
+    """
+    declared = []
+    for names in (_PORTED_LEGS_DECLARED or {}).values():
+        declared.extend(names or [])
+    declared = sorted(set(declared))
+    bound = sorted(k for k in declared if callable(_PORTED_LEGS.get(k)))
+    return {"declared": declared, "bound": bound,
+            "unbound": sorted(set(declared) - set(bound))}
+
+
+def ported_knob_status(params):
+    """Declared knobs of the inlined modules vs what PARAMS actually carries.
+
+    Why this exists next to ported_load_status: "the module arrived" and "the module
+    can read its thresholds" are two different facts, and only the first one was ever
+    checked. The 11-04 batch is the proof -- rules_form was inlined, registered four
+    kinds, passed every build gate, and raised KeyError('bd_min_bars') on its first
+    call because 102 of the knobs it declares existed nowhere in the parameter file.
+    The builder now refuses such an artifact; this leg is so an operator on a box can
+    see the same number without rebuilding anything.
+
+    declared=0 is NOT a pass: it means nothing was inlined (an unbaked source copy),
+    which is why the module count is printed alongside it.
+    """
+    ledger = _PORTED_KNOBS or {}
+    missing = []
+    declared = 0
+    for module in sorted(ledger):
+        for key in (ledger.get(module) or []):
+            declared += 1
+            if key not in params:
+                missing.append("%s:%s" % (module, key))
+    return {"declared": declared, "modules": sorted(ledger), "missing": sorted(missing)}
+
 def rule_arm_mode(params, kind):
     """shadow | live | off for one rule (default off for anything ported).
 
@@ -830,6 +1123,57 @@ def ported_load_status(params):
             "kinds_by_module": kinds_by_module, "armed": armed}
 
 
+# ---------------------------------------------------------------------------
+# JUDGEMENT ACCESSOR (SCARRIER-SHADOW, 2026-11-05)
+# ---------------------------------------------------------------------------
+
+# What we ask the sizing leg for, and the name it travels under in the journal.
+# Kept as a table so the wire contract and the journal can never drift apart by
+# somebody "just adding one more field" in one place only.
+#  * market_scale / target  -> typed columns on the brain side (nullable REAL)
+#  * hard_block / t_allowed / missing_key_dims -> sizing_note (free ASCII text)
+_SHADOW_JUDGEMENT_TYPED = ("market_scale", "target")
+_SHADOW_JUDGEMENT_NOTE = ("hard_block", "t_allowed", "missing_key_dims", "emotion_phase")
+
+
+def sizing_judgement(params, ctx):
+    """Ask the ported sizing leg what it would have said about this context.
+
+    Why the lookup goes through _PORTED_LEGS instead of an import or a namespace
+    probe: the shipped artifact does not have modules -- scripts/build_local_executor.py
+    INLINES the bodies and bakes the declared judgement legs into that one registry.
+    An `import rules_sizing` would depend on where the file happens to sit (the exact
+    shape this executor already rejected for the rule modules: "a runtime import would
+    silently shrink the rule set while every gate stayed green"), and globals()/vars()
+    is namespace introspection, which gate g2 forbids in a carrier.
+
+    What it must never do is invent a number: when the leg is not wired (the repo copy, or a
+    carrier built without rules_sizing inlined -- AGENTS lists "the judgement legs have no
+    call site in either carrier" as a NOT DONE item), it returns {} and the row is journaled
+    with NULL judgement columns. 0.0 there would be read as "sizing said zero position",
+    turning a gap into a measurement.
+
+    A judgement leg that raises is recorded as such (judgement_error) rather than swallowed:
+    "the leg exists but is broken" and "the leg is absent" lead to different repairs.
+    """
+    fn = _PORTED_LEGS.get("sizing_readout")
+    if not callable(fn):
+        return {}
+    try:
+        raw = fn(params, ctx) or {}
+    except Exception as exc:  # noqa: BLE001 -- a broken judgement leg must not cost the round
+        return {"judgement_error": repr(exc)[:80]}
+    out = {}
+    for key in _SHADOW_JUDGEMENT_TYPED + _SHADOW_JUDGEMENT_NOTE:
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if value is None:
+            continue  # absent stays absent; the journal column is NULL, never 0
+        out[key] = value
+    return out
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +1190,24 @@ def ported_load_status(params):
 # the builder fails the build when params names a module that is not on disk.
 _PORTED_RULES = {}
 _PORTED_INLINE = {}
+# Judgement legs: named callables a ported module exposes that are NOT signal
+# producers (they answer "how big / allowed at all", they never emit a kind).
+# Baked by the builder the same way _PORTED_INLINE is -- an explicit registry on
+# purpose: the alternative is the artifact poking at its own namespace
+# (globals()/vars()), which gate g2 forbids because a carrier that can introspect
+# its own environment can also grow a side channel nobody reviewed. In the
+# repository copy this dict is empty, so sizing_judgement answers "{}" -- the
+# honest "the leg is not wired here", never a invented number.
+_PORTED_LEGS = {}
+# Which legs each inlined module declared (module -> names). Baked by the builder from
+# each module's own JUDGEMENT_LEGS list; the load gate refuses to publish while any
+# declared leg is not bound to a callable in this very file.
+_PORTED_LEGS_DECLARED = {}
+# Knob ledger: module -> the params keys that module declares it reads.
+# Baked by the builder from each module's own *_PARAM_KEYS list; the load gate
+# refuses to publish while any declared knob is missing from PARAMS, and
+# --selftest prints the same count so a box can see it without rebuilding.
+_PORTED_KNOBS = {}
 # ==== PORTED RULES END ====
 
 # STATE LAYER: the local sqlite journal ("what did we already send today").
@@ -917,6 +1279,35 @@ class LocalState(object):
                 "CREATE TABLE IF NOT EXISTS cancelled_orders ("
                 "day TEXT NOT NULL, order_id TEXT NOT NULL, ts REAL NOT NULL,"
                 " PRIMARY KEY (day, order_id))")
+            # SHADOW-LEG (SCARRIER-SHADOW, 2026-11-05): the day-keyed journal of every
+            # shadow-mode decision, i.e. the NUMERATOR of the 5-trading-day comparison
+            # window that docs/IMPL_QMT_INTERNAL_LOOP_20261103.md demands before a ported
+            # rule may touch money.
+            #
+            # Why it has to be a table and not a log line: a log line is not uploadable,
+            # not queryable and not dedupable, so nothing on the brain side could ever
+            # answer "how close is this carrier's judgement to the engine's" -- the window
+            # was unmeasurable and the owner's arm button had no data behind it.
+            #
+            # Key shape, and why it is not (day, symbol):
+            #   (day, short_code) is the SAME key the money path uses for idempotency, so
+            #   one intent is one row per day here too. If it were (day, symbol) a second
+            #   rule firing on the same name would erase the first one's evidence, and the
+            #   per-kind day counts (what the window counts) would come out short.
+            #
+            # NULL vs 0: amount/judgement are nullable on purpose. "The carrier could not
+            # compute the sizing leg" (the judgement legs rules_sizing/rules_t are not
+            # wired into the carriers yet -- AGENTS "not done" item) must never be stored
+            # as 0.0, because 0 on the comparison table reads as "sizing said zero
+            # position", which is a measurement, not a gap.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS shadow_decisions ("
+                "day TEXT NOT NULL, short_code TEXT NOT NULL, symbol TEXT NOT NULL,"
+                " kind TEXT NOT NULL, side TEXT NOT NULL, qty INTEGER NOT NULL DEFAULT 0,"
+                " price REAL NOT NULL DEFAULT 0, amount REAL,"
+                " mode TEXT NOT NULL DEFAULT 'shadow', judgement TEXT NOT NULL DEFAULT '',"
+                " first_ts REAL NOT NULL, last_ts REAL NOT NULL,"
+                " PRIMARY KEY (day, short_code))")
             conn.commit()
         finally:
             conn.close()
@@ -1005,6 +1396,101 @@ class LocalState(object):
         finally:
             conn.close()
         return int(row[0]) if row else 0
+
+    # ---------------- SHADOW-LEG (the 5-day comparison numerator) ----------------
+
+    def record_shadow(self, day, signal, judgement=None, mode="shadow"):
+        """Journal one shadow-mode decision: computed, counted, never sent to the counter.
+
+        Why the conflict clause keeps first_ts and refreshes the rest:
+          * first_ts is when this intent FIRST fired that day -- the row's identity in the
+            window, so a later round must not move it (that would make "how many days did
+            this rule run" drift with every round);
+          * qty/price/amount/judgement/last_ts ARE refreshed: the same short code recomputed
+            at 14:30 carries a better judgement than the 09:31 one, and the comparison is
+            about the rule's verdict, not about how many times the round woke up.
+        A plain INSERT OR REPLACE would have reset first_ts on every round, which silently
+        shortens the day count; a plain INSERT OR IGNORE would freeze the FIRST judgement of
+        the day, which silently mis-states the comparison. Both were the wrong shape.
+
+        judgement: a dict of what the sizing/T legs would have said (see sizing_judgement
+        below). Stored as compact ASCII JSON -- the wire side maps a known subset into typed
+        columns, so the journal can gain fields without a schema evolution here.
+        """
+        blob = ""
+        if judgement:
+            try:
+                blob = json.dumps(judgement, sort_keys=True, ensure_ascii=True, default=str)
+            except (TypeError, ValueError):
+                # An unserialisable judgement must not cost us the DECISION row: keep the
+                # row, drop the explanation, and say so in the blob itself.
+                blob = '{"judgement_error":"unserialisable"}'
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO shadow_decisions"
+                " (day, short_code, symbol, kind, side, qty, price, amount, mode,"
+                "  judgement, first_ts, last_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(day, short_code) DO UPDATE SET"
+                "  symbol=excluded.symbol, kind=excluded.kind, side=excluded.side,"
+                "  qty=excluded.qty, price=excluded.price, amount=excluded.amount,"
+                "  mode=excluded.mode, judgement=excluded.judgement,"
+                "  last_ts=excluded.last_ts",
+                (day, signal["short_code"], signal["symbol"], signal["kind"], signal["side"],
+                 int(signal.get("qty") or 0), float(signal.get("price") or 0.0),
+                 None if signal.get("amount") is None else float(signal["amount"]),
+                 mode, blob, time.time(), time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def shadow_rows(self, day=None):
+        """Journaled shadow decisions (newest day first; day=None returns every day).
+
+        The uplink reads today's rows through here; --shadow-report reads all of them.
+        Returns [] for a day with no rows -- and the CALLER must not read that as "the box
+        was silent", which is why shadow_days() exists as the separate "which days reported
+        at all" ledger (missing != empty, one row of data, two questions).
+        """
+        conn = self._connect()
+        try:
+            if day:
+                rows = conn.execute(
+                    "SELECT day, short_code, symbol, kind, side, qty, price, amount, mode,"
+                    " judgement, first_ts, last_ts FROM shadow_decisions"
+                    " WHERE day = ? ORDER BY first_ts, short_code", (day,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT day, short_code, symbol, kind, side, qty, price, amount, mode,"
+                    " judgement, first_ts, last_ts FROM shadow_decisions"
+                    " ORDER BY day DESC, first_ts, short_code").fetchall()
+        finally:
+            conn.close()
+        out = []
+        for r in rows:
+            out.append({"day": r[0], "short_code": r[1], "symbol": r[2], "kind": r[3],
+                        "side": r[4], "qty": int(r[5] or 0), "price": float(r[6] or 0.0),
+                        "amount": None if r[7] is None else float(r[7]), "mode": r[8],
+                        "judgement": r[9], "first_ts": float(r[10] or 0.0),
+                        "last_ts": float(r[11] or 0.0)})
+        return out
+
+    def shadow_days(self):
+        """Days that produced at least one shadow decision, with the row count per day.
+
+        This is the ledger that separates "this rule fired zero times today" from "the box
+        never reported today": the first shows up here with the OTHER kinds' rows counted,
+        the second does not show up at all. Folding them is what makes a 5-day window
+        fill itself with silent days.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT day, COUNT(*) FROM shadow_decisions GROUP BY day ORDER BY day DESC"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [(str(r[0]), int(r[1])) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1536,8 +2022,21 @@ class Executor(object):
                     # Shadow leg: compute and record, never spend. The whole
                     # point of the 5-day shadow window is that the judgement can
                     # be compared against the engine while no money is involved.
-                    summary["shadow"].append({"short_code": signal["short_code"],
-                                              "kind": signal.get("kind"), "symbol": symbol})
+                    #
+                    # SCARRIER-SHADOW (2026-11-05): "record" now means the journal, not a
+                    # log line. A hit that only prints is a hit nobody can count -- the
+                    # window was unmeasurable and the arm button had no data behind it.
+                    # The sizing leg is attached where it is computable, and simply absent
+                    # where it is not (never 0): see sizing_judgement for why.
+                    judgement = sizing_judgement(self.params, ctx)
+                    self.state.record_shadow(day, signal, judgement=judgement)
+                    entry = {"short_code": signal["short_code"],
+                             "kind": signal.get("kind"), "symbol": symbol,
+                             "side": signal.get("side"), "qty": int(signal.get("qty") or 0),
+                             "price": float(signal.get("price") or 0.0)}
+                    if judgement:
+                        entry["judgement"] = judgement
+                    summary["shadow"].append(entry)
                     continue
                 if mode != "live":
                     summary["skipped"].append({"short_code": signal["short_code"],
@@ -1691,6 +2190,12 @@ def build_parser():
                         help="run a single round and exit")
     parser.add_argument("--selftest", action="store_true",
                         help="print a health/version readout and exit")
+    # SCARRIER-SHADOW (2026-11-05): read the shadow journal without running a round.
+    # Why a CLI and not just the log line: the numerator of the 5-day comparison window is
+    # the number the owner presses the arm button against, and until it could be counted
+    # per kind per day, "we have been running in shadow for five days" was a feeling.
+    parser.add_argument("--shadow-report", action="store_true", dest="shadow_report",
+                        help="print shadow-decision counts per kind/day and exit")
     parser.add_argument("--interval", type=float, default=None,
                         help="seconds between rounds (default: from PARAMS)")
     return parser
@@ -1731,7 +2236,17 @@ def print_selftest(params):
     # readable as "not checked".
     status = ported_load_status(params)
     armed = status.get("armed") or {}
+    # Knob coverage (RULE-KNOBS): a module arriving != its thresholds arriving.
+    # This line used to report only modules and kinds, so the 11-04 shape --
+    # rules_form listed, all four kinds registered, but 102 of the 105 knobs it
+    # declares existing nowhere in the parameter file -- was GREEN on --selftest
+    # and only raised KeyError on the first real rule call. The builder refuses
+    # such a publish now; this line is so a box can see the same number without
+    # rebuilding.
+    knobs = ported_knob_status(params)
+    legs = ported_leg_status()
     print("EXEC_RULES wanted=%s loaded=%s missing=%s judgement=%s kinds=%d live=%d shadow=%d off=%d"
+          " knobs_modules=%d knobs_declared=%d knobs_missing=%d legs_bound=%s legs_unbound=%s"
           % (",".join(status["wanted"]) or "none",
              ",".join(status["loaded"]) or "none",
              ",".join(status["missing"]) or "none",
@@ -1739,11 +2254,104 @@ def print_selftest(params):
              len(status["kinds"]),
              sum(1 for v in armed.values() if v == "live"),
              sum(1 for v in armed.values() if v == "shadow"),
-             sum(1 for v in armed.values() if v not in ("live", "shadow"))))
+             sum(1 for v in armed.values() if v not in ("live", "shadow")),
+             len(knobs["modules"]), knobs["declared"], len(knobs["missing"]),
+             ",".join(legs["bound"]) or "none", ",".join(legs["unbound"]) or "none"))
+    if legs["unbound"]:
+        # Its own line for the same reason missing_module has one: a judgement leg that
+        # arrived but cannot be reached makes every shadow row silently lossier.
+        print("EXEC_RULES_ALERT judgement_leg_unbound=%s" % ",".join(legs["unbound"]))
     if status["missing"]:
         # A named module that did not arrive is not "a quiet market": it is a
         # missing file. Say it in its own line so a log grep finds it.
         print("EXEC_RULES_ALERT missing_module=%s" % ",".join(status["missing"]))
+    if knobs["missing"]:
+        # Same posture for a threshold with no owner: its own line, its own names.
+        print("EXEC_RULES_ALERT missing_knob=%s" % ",".join(knobs["missing"]))
+    return 0
+
+
+def shadow_journal_probe(path):
+    """Is the shadow journal actually there, in which of the three senses of "there"?
+
+    Deliberately a raw read-only sqlite touch, NOT LocalState(path): LocalState creates the
+    schema on open, so building one to ask the question would ANSWER it (a "missing journal"
+    report would leave a fresh empty file behind and the next report would say "empty").
+
+    Three states, and they must not be folded into one line:
+      * missing        -- no file: this box never ran an executor round with a journal here;
+      * table_absent   -- a journal from BEFORE SCARRIER-SHADOW: the box is running, but the
+                          artifact it holds cannot journal shadow decisions (upgrade the carrier);
+      * empty          -- the table exists and holds zero rows: the shadow rules ran but never
+                          fired (or nothing ran today at all) -- a real measurement, not a gap.
+    """
+    if not path or not os.path.exists(path):
+        return {"state": "missing", "rows": 0}
+    conn = None
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        row = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shadow_decisions'"
+        ).fetchone()
+        if not row or int(row[0] or 0) == 0:
+            return {"state": "table_absent", "rows": 0}
+        n = conn.execute("SELECT COUNT(*) FROM shadow_decisions").fetchone()[0]
+        return {"state": "present", "rows": int(n or 0)}
+    except sqlite3.Error as exc:
+        # Unreadable is its own answer: never report it as "empty" (missing != empty).
+        return {"state": "unreadable", "rows": 0, "reason": exc.__class__.__name__}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def print_shadow_report(params, state_db):
+    """Print the shadow-decision counts per kind and per day (the 5-day window numerator).
+
+    The numbers printed are the ones the brain side counts: one row per (day, short_code),
+    grouped by kind, with the days ledger kept SEPARATE from the kinds ledger -- because
+    "this rule fired zero times today" and "the box never reported today" are different
+    repairs (one is a quiet strategy, the other is a dead uplink leg).
+
+    No required-days literal lives here: the window length is the plan's acceptance rule and
+    its single source is the brain side (internal/server/carrier_shadow.go). We print
+    params.shadow_required_days only if the box was baked with one -- absent says "unset".
+    """
+    probe = shadow_journal_probe(state_db)
+    # The FULL path, not a basename: two boxes can both hold "executor_state.db" and the
+    # operator comparing two logs needs to see which file each one actually opened.
+    # (It also keeps the artifact inside the pinned call allow-list -- os.path.basename
+    # is not on it, and widening that list for a print statement is not worth it.)
+    print("EXEC_SHADOW_DB path=%s state=%s rows=%d%s"
+          % (str(state_db or "unset"), probe["state"], probe["rows"],
+             (" reason=%s" % probe["reason"]) if probe.get("reason") else ""))
+    if probe["state"] != "present":
+        # One dedicated line so a log grep can tell "nothing fired" from "nothing journaled".
+        print("EXEC_SHADOW_NO_DATA state=%s next=check_carrier_artifact_or_uplink"
+              % probe["state"])
+        return 0
+    state = LocalState(state_db)
+    rows = state.shadow_rows()
+    days = state.shadow_days()
+    print("EXEC_SHADOW_DAYS %s" % (",".join("%s:%d" % (d, n) for d, n in days) or "none"))
+    per_kind = {}
+    for r in rows:
+        bucket = per_kind.setdefault(r["kind"], {"rows": 0, "days": set(), "codes": set()})
+        bucket["rows"] += 1
+        bucket["days"].add(r["day"])
+        bucket["codes"].add(r["symbol"])
+    for kind in sorted(per_kind):
+        b = per_kind[kind]
+        print("EXEC_SHADOW_KIND kind=%s rows=%d days=%d codes=%d"
+              % (kind, b["rows"], len(b["days"]), len(b["codes"])))
+        if not b["days"]:
+            print("EXEC_SHADOW_KIND_ALERT kind=%s never_fired" % kind)
+    for kind, day in sorted((k, d) for k in per_kind for d in per_kind[k]["days"]):
+        n = sum(1 for r in rows if r["kind"] == kind and r["day"] == day)
+        print("EXEC_SHADOW_CELL kind=%s day=%s rows=%d" % (kind, day, n))
+    print("EXEC_SHADOW_SUMMARY kinds=%d days_with_data=%d required=%s"
+          % (len(per_kind), max([len(b["days"]) for b in per_kind.values()] or [0]),
+             params.get("shadow_required_days", "unset")))
     return 0
 
 
@@ -1756,6 +2364,11 @@ def main(argv=None):
         params["calendar_file"] = args.calendar
     if args.selftest:
         return print_selftest(params)
+    if args.shadow_report:
+        # Read-only leg: no broker, no data source, no round, nothing sent. It must be
+        # runnable on a box whose QMT client is closed -- that is when somebody asks
+        # "how far into the shadow window are we".
+        return print_shadow_report(params, args.state_db)
     if not args.account:
         LOG.error("[executor] no broker account configured (--account / QMT_ACCOUNT)")
         return 2

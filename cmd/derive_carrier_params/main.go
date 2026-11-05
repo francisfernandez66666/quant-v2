@@ -33,12 +33,24 @@ import (
 	"os"
 	"sort"
 
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/signalctl"
+	"quant-trading-v2/internal/store"
+	"quant-trading-v2/internal/strategies/break_down"
+	"quant-trading-v2/internal/strategies/double_bump"
+	"quant-trading-v2/internal/strategies/dragon"
+	"quant-trading-v2/internal/strategies/dragon_return"
+	"quant-trading-v2/internal/strategies/factor"
+	"quant-trading-v2/internal/strategies/good_news_fade"
+	"quant-trading-v2/internal/strategies/high_churn"
+	"quant-trading-v2/internal/strategies/leader_decay"
+	"quant-trading-v2/internal/strategy"
+	"quant-trading-v2/internal/tcalib"
 )
 
 // collector 攒住"载体键 → 值 + 真源"。重复键直接判红：同一枚数由两处供给正是本仓反复锤过的双账形态。
@@ -82,6 +94,10 @@ func main() {
 	collectSignalctl(c)
 	collectBoards(c)
 	collectEngineTimings(c)
+	collectBearTactics(c)
+	collectScoreScale(c)
+	collectFactorScoring(c)
+	collectCarrierVocabulary(c)
 
 	keys := make([]string, 0, len(c.params))
 	for k := range c.params {
@@ -310,4 +326,141 @@ func collectEngineTimings(c *collector) {
 	c.put("t_regime_stale_sec", src, engine.TRegimeStaleSeconds())
 	c.put("t_min_base_keep_qty", src, engine.TMinBaseKeepQty())
 	c.put("t_regime_min_votes", src, engine.TRegimeMinVotes())
+}
+
+// collectBearTactics 取做空战法的评分阈值与派生窗口（§DERIVE-CARRIER-1105 / 1106 扩到七包）。
+//
+// 为什么必须补这一腿：qmt_gateway/rules_form.py 是从这四个 Go 战法移植的，它按
+// FORM_PARAM_KEYS 声明自己读哪些 params，而那 102 枚键在参数文件里**一个都不存在**——
+// 产物里每条移植规则第一次被调用就 raise KeyError('bd_min_bars')。规则代码搬完了，
+// 值没搬。现在值由各战法包**转调自己的常量**导出（各包 derive_carrier.go），
+// 本函数只是把这几张表并进派生结果，一个数都不在这里落地。
+//
+// 11-06 这批又并进来三个包（double_bump / dragon / dragon_return）：它们是
+// qmt_gateway/rules_ladder.py 那四条做多腿的真源，声明的 115 枚旋钮此前同样没有主人。
+// 加进**同一个批次列表**而不是另开一个函数：批次列表的形状（source + table，空表即判红）
+// 就是这批唯一要防的东西——"包在、旋钮空"必须当场停，而不是等装载闸去猜。
+//
+// rule_side 与四枚 kind 走的是"已有名字"那条路：strategy.ActionSell / Signal* 本来就是
+// 命名常量（战法出信号用的就是它们），所以这里只做 string 转换，不写 "sell" 这个字面量。
+// English: every tactic threshold comes from the tactic package's own constants;
+// the side and the kinds come from the already-named strategy identifiers.
+func collectBearTactics(c *collector) {
+	for _, batch := range []struct {
+		src   string
+		table map[string]interface{}
+	}{
+		{"internal/combat_agent/adapter.go:shortXxx window constants", combat_agent.DeriveCarrierWindows()},
+		{"internal/strategies/break_down/break_down.go:bdXxx constants", break_down.DeriveCarrierThresholds()},
+		{"internal/strategies/high_churn/high_churn.go:hcXxx constants", high_churn.DeriveCarrierThresholds()},
+		{"internal/strategies/leader_decay/leader_decay.go:ldXxx constants", leader_decay.DeriveCarrierThresholds()},
+		{"internal/strategies/good_news_fade/good_news_fade.go:gfXxx constants", good_news_fade.DeriveCarrierThresholds()},
+		{"internal/strategies/double_bump/double_bump.go:dbXxx constants + factory strategy cfg", double_bump.DeriveCarrierThresholds()},
+		{"internal/strategies/dragon/dragon.go:dgXxx constants + factory strategy cfg", dragon.DeriveCarrierThresholds()},
+		{"internal/strategies/dragon_return/dragon_return.go:drXxx constants", dragon_return.DeriveCarrierThresholds()},
+	} {
+		if len(batch.table) == 0 {
+			// 空表＝那一包里一个读数都没导出。这比"键缺失"更安静，必须当场判红。
+			fmt.Fprintf(os.Stderr, "DERIVE_EMPTY_TABLE source=%s\n", batch.src)
+			os.Exit(1)
+		}
+		for _, key := range sortedInterfaceKeys(batch.table) {
+			c.put(key, batch.src, batch.table[key])
+		}
+	}
+	// 四个战法的信号种类与方向：Go 出信号用的就是这两组命名常量（战法包内不重写）。
+	const sideSrc = "internal/strategy/types.go:ActionSell"
+	c.put("rule_side", sideSrc, string(strategy.ActionSell))
+	const kindSrc = "internal/strategy/types.go:Signal* type constants"
+	c.put("break_down_kind", kindSrc, string(strategy.SignalBreakDown))
+	c.put("high_churn_kind", kindSrc, string(strategy.SignalHighChurn))
+	c.put("leader_decay_kind", kindSrc, string(strategy.SignalLeaderDecay))
+	c.put("good_news_fade_kind", kindSrc, string(strategy.SignalGoodNewsFade))
+}
+
+// collectScoreScale 取两条做多腿共用的**分值域刻度**与两个战法共用的**最少根数**。
+//
+// 为什么单独成一个采集函数：载体侧 rules_ladder 的 `pct_scale` 与 rules_factor 的 `min_bars`
+// 都是**一枚数供两条腿**（dragon 与 double_bump 用同一个尺度归一各自的加权分；factor 与
+// pattern 用同一条"不足几根就不算"的线）。Go 侧此前是各包各写字面量，所以这两枚一旦
+// 由某个包自己导出，就会变成"两个战法两个主人、载体只有一个键"——collector.put 会判红，
+// 判得对。现在它们是 internal/strategy/types.go 的两枚公共常量，两处战法都转调它，
+// 这里也从那一处取。
+// English: the shared score scale and the shared minimum-bar guard, both taken from the
+// single strategy-package constants the tactics themselves now call.
+func collectScoreScale(c *collector) {
+	const src = "internal/strategy/types.go:ScoreScale"
+	c.put("pct_scale", src, strategy.ScoreScale)
+	const barsSrc = "internal/strategy/types.go:ScoreMinBars (factor.go + pattern.go both call it)"
+	c.put("min_bars", barsSrc, strategy.ScoreMinBars)
+}
+
+// collectFactorScoring 取因子战法那条移植腿（rules_factor.py）声明的评分旋钮。
+// 每一枚都是 internal/strategies/factor 自己判据用的常量（factor.go 顶部那组 +
+// finaScore 读的那张表），本函数只并表，不落地任何一个数。
+// entry_side 走的是"已有名字"那条路（战法出信号用的就是 strategy.ActionBuy）。
+// English: the factor rule library's own scale/fallback constants and its absolute bands.
+func collectFactorScoring(c *collector) {
+	const src = "internal/strategies/factor/factor.go:factorDefaultXxx / scoreDomainXxx constants"
+	scoring := factor.DeriveCarrierScoring()
+	if len(scoring) == 0 {
+		fmt.Fprintf(os.Stderr, "DERIVE_EMPTY_TABLE source=%s (scoring)\n", src)
+		os.Exit(1)
+	}
+	for _, key := range sortedInterfaceKeys(scoring) {
+		c.put(key, src, scoring[key])
+	}
+	c.put("score_domain", src, factor.DeriveCarrierScoreDomain())
+	c.put("financial_bands", "internal/strategies/factor/factor.go:finaBands table",
+		factor.DeriveCarrierFinancialBands())
+	c.put("entry_side", "internal/strategy/types.go:ActionBuy (via factor entry readout)",
+		factor.DeriveCarrierEntrySide())
+}
+
+// collectCarrierVocabulary 取做 T 移植腿（rules_t.py）声明的那批**判据写法**：
+// 时段边界、板块前缀与 ST 字样、行情门认的档位串、可开 T 的锚点来源、被撤的字样、
+// 卖腿必须留下的底仓比例、费用缓冲、成本安全倍数、开盘钟点。
+//
+// 为什么这些也要从 Go 出：它们在 Go 都不是"配置项"而是**判据本身**——
+// switch 的 case、Contains 的字样、quota 里的那次除法。移植腿在自己的机器上调不到
+// Go 的函数，只能收一张烘进 params 的表；表一旦由载体自己写，改 Go 的那一处不会有任何东西响。
+// 单位/形态换算一律用被测对象自己的方法（Duration.Seconds / time.Format），这里不写数字。
+// English: the gate vocabulary and ratios the live T chain itself compares against, exported
+// so the ported carrier never becomes the owner of a decision the engine makes.
+func collectCarrierVocabulary(c *collector) {
+	const dataSrc = "internal/data/trade_time.go + limitup_pct.go (gate tables)"
+	c.put("t_session_windows", dataSrc, data.ActiveSessionWindows())
+	boards := data.LimitUpBoardTables()
+	if len(boards) == 0 {
+		fmt.Fprintf(os.Stderr, "DERIVE_EMPTY_TABLE source=%s (board tables)\n", dataSrc)
+		os.Exit(1)
+	}
+	c.put("t_wide_board_prefixes", "internal/data/limitup_pct.go:limitUpWidePrefixes", boards["wide"])
+	c.put("t_bse_board_prefixes", "internal/data/limitup_pct.go:limitUpBsePrefixes", boards["bse"])
+	c.put("t_st_markers", "internal/data/limitup_pct.go:limitUpMarkerST", boards["st"])
+
+	const engineSrc = "internal/engine/intraday_t_live.go (regime gate / keep / token / clock)"
+	c.put("t_regime_allow_states", engineSrc, engine.TRegimeAllowStates())
+	c.put("t_regime_block_states", engineSrc, engine.TRegimeBlockStates())
+	c.put("t_cancelled_status_tokens", engineSrc, []string{engine.TCancelStatusToken()})
+	c.put("t_min_remaining_position_pct", engineSrc, engine.TSellKeepPositionPct())
+	c.put("t_fee_buffer_pct", engineSrc, engine.TFeeBufferPct())
+	c.put("t_session_open_hhmm", engineSrc, engine.TDayStartClock())
+
+	c.put("t_anchor_ok_sources", "internal/store/real_positions.go:anchorTicketSources",
+		store.TAnchorOkSources())
+	// 成本安全倍数：min_spread_pct 的安全边际，真源是标定包那枚出厂默认。
+	// 载体用它乘成本线，Go 用它乘成本线（tcalib.Params.MinSpreadPct），同一枚数两处用。
+	c.put("t_cost_safety_multiplier", "internal/tcalib/tcalib.go:DefaultSafetyMul", tcalib.DefaultSafetyMul)
+}
+
+// sortedInterfaceKeys 把 map 的键排序后返回：导出顺序必须稳定，
+// 否则同一棵树两次跑出来的 provenance 顺序不同，diff 就成了噪音。
+func sortedInterfaceKeys(table map[string]interface{}) []string {
+	keys := make([]string, 0, len(table))
+	for k := range table {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

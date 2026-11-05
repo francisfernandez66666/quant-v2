@@ -276,11 +276,47 @@ class TestEveryEmittedLegIsReceived(unittest.TestCase):
                              % (ev_type, sorted(orphan)))
 
     def test_consumed_subset_of_emitted(self):
-        """Go 声称消费的字段，网关必须真的发（否则消费的是恒零值假腿）。"""
+        """Go 声称消费的字段，**发出侧**必须真的发（否则消费的是恒零值假腿）。
+
+        §CARRIER-SHADOW（2026-11-05）把"发出侧"从一个变成两个：handler.py（xtquant 回调那代）
+        与 report_uplink.py（盒子本地普通进程那代）共用**同一份信封契约**，而 carrier_shadow
+        这一类只有后者会发。只看 gateway_emitted_fields 会把"上行腿真发的字段"判成假腿，
+        把契约里的 consumed 面逼成空集（那才是真的把断腿藏起来）。
+        因此判据改成 **两代发出集的并集**，并额外锁一条更强的：
+        某事件类型在 handler 那代**整类缺席**时，它的 consumed 必须落在 uplink 那代的发出集里
+        ——并集不许变成"两边各写一半也能过"的松口子。
+        """
+        uplink = self.golden.get("report_uplink_emitted_fields", {})
         for ev_type, keys in self.golden["consumed_by_event"].items():
-            emitted = set(self.golden["gateway_emitted_fields"].get(ev_type, []))
+            gw = set(self.golden["gateway_emitted_fields"].get(ev_type, []))
+            emitted = gw | set(uplink.get(ev_type, []))
             ghost = set(keys) - emitted
-            self.assertFalse(ghost, "事件 %s 消费了网关未发出的字段 %s" % (ev_type, sorted(ghost)))
+            self.assertFalse(ghost, "事件 %s 消费了两代发出侧都未发出的字段 %s" % (ev_type, sorted(ghost)))
+            if not gw:  # handler 那代整类没有这一类 ⇒ 只能由上行腿那代证实
+                self.assertTrue(set(keys) <= set(uplink.get(ev_type, [])),
+                                "事件 %s 的 consumed 没落在 report_uplink_emitted_fields 里：%s"
+                                % (ev_type, sorted(set(keys) - set(uplink.get(ev_type, [])))))
+
+    def test_carrier_shadow_consumed_legs_are_uplink_emitted(self):
+        """§CARRIER-SHADOW 新增事件类型的三点同步锁：emitter / golden / Go 消费面。
+
+        carrier_shadow 的信封只有一枚业务键 shadow；行内字段面另有两面
+        （shadow_row_fields＝Go 反射集、shadow_row_emitted_fields＝上行实际发出集），
+        发出集必须严格是反射集的子集——user_id/seen_at 属 Go 侧自有列（归属由钥匙决定、
+        到达时刻由 Go 盖），**结构上不该**出现在发出集里，这里就把它钉住。
+        """
+        g = self.golden
+        self.assertIn("carrier_shadow", g["report_uplink_emitted_fields"],
+                      "上行腿新增事件类型却没登记发出集（Go 侧消费面无从对照）")
+        self.assertEqual(set(g["report_uplink_emitted_fields"]["carrier_shadow"]) -
+                         set(g["report_event_fields"]), set(),
+                         "carrier_shadow 发出了信封外的键（会被 encoding/json 静默丢弃）")
+        self.assertEqual(g["consumed_by_event"]["carrier_shadow"], ["shadow"])
+        rows = set(g["shadow_row_fields"])
+        emitted = set(g["shadow_row_emitted_fields"])
+        self.assertTrue(emitted < rows, "影子行发出集必须是 Go 反射集的真子集")
+        self.assertEqual(rows - emitted, {"user_id", "seen_at"},
+                         "只有这两列属 Go 侧自有（归属来自钥匙、到达时刻来自本机时钟）")
 
 
 class TestBridgeTradePathKeepsLegs(unittest.TestCase):

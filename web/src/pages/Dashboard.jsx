@@ -15,6 +15,8 @@ import IcpFooter from '../components/IcpFooter'
 import SentimentCard from '../components/SentimentCard.jsx'
 import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（live/trigger/cost/none）
 import ExternalBrainTag from '../components/ExternalBrainTag.jsx' // §EXT-BRAIN-1104 外脑档位（还有没有手）
+import CarrierUpdatePanel from '../components/CarrierUpdatePanel.jsx' // §CARRIER-UPDATE 载体期望版/回执/人工触发
+import CarrierShadowPanel from '../components/CarrierShadowPanel.jsx' // §CARRIER-SHADOW 移植规则与引擎的按日对照（纯读数）
 import { canLiveTrading } from '../utils/perm.js'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
@@ -578,6 +580,15 @@ export default function Dashboard() {
                  §0925EVE-W3-E「读不到不装已知」在这里的反面形态）。
               档 0/1 由组件自己返回 null，健康的全局那一行字一个字都不多。 */}
           {qmtState && <ExternalBrainTag code={qmtState.external_brain} />}
+          {/* §CARRIER-UPDATE：载体读数与「更新载体」按钮跟外脑档位同一宿主行。
+              同样只在真的拿到过快照时才交给组件（qmtState=null 是"还没取到"，不是"未知"）；
+              组件自己按 carrier.known / desired_ready 分形，未知绝不折成"已是最新"。
+              这一行是纯读数＋人工触发，不参与任何熔断或资金判定。 */}
+          {qmtState && <CarrierUpdatePanel carrier={qmtState.carrier} />}
+          {/* §CARRIER-SHADOW：移植规则与引擎的按日对照贴在同一宿主行（同一份 /state 读数，
+              不新开路由）。这块屏是「武装」按钮前面唯一的证据，纯读数、无任何动作；
+              known=false 时组件自己显示「读数未知」，绝不显示 0 天。 */}
+          {qmtState && <CarrierShadowPanel shadow={qmtState.carrier_shadow} />}
         </div>
       </Card>
 

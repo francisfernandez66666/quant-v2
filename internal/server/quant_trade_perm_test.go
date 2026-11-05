@@ -60,6 +60,10 @@ var lockedRoutes = []openedRoute{
 	{http.MethodPost, "/api/qmt/order-confirm", `{}`},
 	{http.MethodGet, "/api/opslog", ""},
 	{http.MethodGet, "/api/risk/gates", ""},
+	// §CARRIER-UPDATE（11-05）：点「更新载体」会让朋友家那台物理机停策略、写文件、重启——
+	// 这是**控制动作**不是"自己的账"，所以 quant_trade 一律进不来（与上面通道切换同档）。
+	// 盒子侧那两条（manifest/ack）不在这张表里：它们走网关钥匙鉴权，与登录态两套体系。
+	{http.MethodPost, "/api/qmt/carrier/update", `{}`},
 }
 
 // newQuantTradePermServer 装配一台带实盘库与数据目录的测试服务，并建三个成员账号：
