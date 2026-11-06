@@ -5173,6 +5173,14 @@ gw_chk "A1 COALESCE(新,旧) 覆盖腿恰 2（两条 upsert 路径都要接柜�
 gw_chk "A1 柜台更小一律收紧（sellable=counter 必须落在 counter<localEst 分支体内）" "$(gw_awk_body internal/risk/gate.go 'if counter < localEst' 'sellable = counter')" "1"
 gw_min "A1 交叉偏差告警腿（warn + onGate 推送）" "$(grep -c 'T+1 可卖量交叉偏差' internal/risk/gate.go || true)" "1"
 gw_chk "A1 反射集 vs golden 持仓行字段锁在位" "$(grep -c 'vs golden.positions_row_fields' internal/server/report_contract_test.go || true)" "1"
+
+# ── ②-A1-FRESH（2026-11-06）柜台 can_use_qty 仅当前交易日快照可信 ──
+# 券商禁令/桥断开会把 real_positions.can_use_qty 冻结在较早交易日（T 日新仓全锁的 0），
+# §A1 取 min(柜台值,本地推算) 把它当今天权威可卖量会误杀隔夜仓。新增 positionSnapshotFresh 闸门：
+# updated_at 早于今日一律当读不到、回落本地推算；今日新鲜快照仍保留 §A1 收紧。
+gw_chk "A1-FRESH 陈旧快照回落本地推算（positionSnapshotFresh 闸门落地）" "$(gw_code_hits internal/risk/gate.go 'func positionSnapshotFresh')" "1"
+gw_chk "A1-FRESH 闸口对陈旧 can_use_qty 当读不到（positionSnapshotFresh 调用点）" "$(gw_code_hits internal/risk/gate.go 'positionSnapshotFresh\(p\.UpdatedAt, g\.today')" "1"
+gw_chk "A1-FRESH 测试锁两条边界（陈旧放行/新鲜拒）" "$(grep -c 'func TestGateT1SellableStaleSnapshotFallsBack' internal/risk/gate_test.go || true)" "1"
 gw_chk "A1 真行采样双测（样例==broker 真实产出、样例==golden 一致）" "$(grep -c 'def test_positions_sample_' qmt_gateway/tests/test_report_contract.py || true)" "2"
 gw_min "A1 采样夹具在位（可卖量断腿的输入源）" "$(test -f qmt_gateway/contract/positions_sample.json && echo 1 || echo 0)" "1"
 
