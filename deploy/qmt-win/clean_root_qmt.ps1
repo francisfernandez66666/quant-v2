@@ -34,7 +34,14 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
 
 # ---- 2. 解析失败绝不动文件（宁可留给人工，也不能把坏 JSON 再序列化一遍落盘）----
 try {
-    $parsed = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+    # §FIX-20261106：显式按 UTF-8 读全文，不再依赖 Get-Content 的默认编码。
+    # 现网 config.json 是 UTF-8（带或不带 BOM 都可能），而 Windows PowerShell 5.1 的
+    # Get-Content -Raw 在无 BOM 时按系统 ANSI/GBK 解码；配置里一旦有中文（战法备注、
+    # 账户名等），字节被拆成乱码后 ConvertFrom-Json 报 "无效的响应应为 ':' 或 '}' (9005)"，
+    # 部署链 [3a] 便以 PARSE_FAIL 回滚——文件其实完全合法，坏的是读取姿势。
+    # File.ReadAllText + UTF8Encoding 会自动识别并剥掉 BOM，两种形态一视同仁。
+    $rawText = [System.IO.File]::ReadAllText($ConfigPath, (New-Object System.Text.UTF8Encoding($false)))
+    $parsed = $rawText | ConvertFrom-Json
 } catch {
     Write-Host "ROOTQMT: PARSE_FAIL"
     Write-Host "  JSON 解析失败（文件未改动）: $($_.Exception.Message)"

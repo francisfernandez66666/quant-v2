@@ -20524,6 +20524,19 @@ if command -v go >/dev/null 2>&1; then
 	UNH="none"
 	grep_q "DERIVE_UNHOUSED" DERIVE_OUT F && UNH=$(printf '%s\n' "$DERIVE_OUT" | grep -oE 'DERIVE_UNHOUSED=[0-9]+' | head -1 || true)
 	echo "   [§173 ⑩] 单点导出实跑绿：${UNH:-?}（这些键在 Go 侧还没有导出读数，参数文件里也**没有**它们的默认值——补齐前先别接 T 腿）"
+	# ⑩c 现网账号级规则随包（11-06 晚批，owner「把现网规则/打开战法/动态仓位/做 T 规则全部送进 win 包」）：
+	# 快照 → sync_live_rules.py → params.live_rules → 构建器烘进 PARAMS → 一键包。
+	# 判据落在**派生链的四段**上：快照在册、派生器在册、params 带块、--check 绿；
+	# 少一段就是「包看起来正常、装上去还是 Go 出厂默认」那种没有运行时报错的假账。
+	CNT173=$((CNT173 + 1))
+	[ -s qmt_gateway/live_rules_snapshot.json ] || fail173 "现网账号级规则快照不在册（win 包没有现网生效值可烘）"
+	[ -s scripts/sync_live_rules.py ] || fail173 "现网规则派生器不在册（params.live_rules 会退回人手抄）"
+	LIVE_PJT=$(cat qmt_gateway/local_executor_params.json || true)
+	grep_q '"live_rules"' LIVE_PJT F || fail173 "载体 params 里没有 live_rules 块（现网规则没烘进去）"
+	LIVE_OUT=$(python3 scripts/sync_live_rules.py --check 2>&1 || true)
+	grep_q "LIVE_RULES_RESULT=OK" LIVE_OUT F || fail173 "现网规则派生对账未过：${LIVE_OUT##*$'\n'}"
+	grep_q "LIVE_RULES_STRATEGIES=16" LIVE_OUT F || fail173 "现网打开的战法没随包（16 枚白名单对不上）"
+	echo "   [§173 ⑩c] 现网规则随包：$(printf '%s\n' "$LIVE_OUT" | grep -E 'LIVE_RULES_SECTIONS|LIVE_RULES_FACTORS' | tr '\n' ' ')"
 	# 参数文件与 Go 必须逐键同源（这条就是"没有手抄"的可执行定义）
 	grep_q "DERIVE_CHANGED_TOTAL=0" DERIVE_OUT F || fail173 "参数文件与 Go 出厂值不一致（先跑 --write；别改 Go 去迁就一个抄错的数）"
 else
