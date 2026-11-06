@@ -110,6 +110,48 @@ func TestGateT1Sellable(t *testing.T) {
 	}
 }
 
+// TestGateT1SellableStaleSnapshotFallsBack §A1-FRESH（2026-11-06）：柜台 can_use_qty 只在该持仓
+// 快照属于当前交易日时可信任；券商禁令/桥断开冻结的较早交易日快照（can_use_qty 还停在"当日新仓全锁"的 0），
+// 必须当读不到、回落本地推算（持仓−当日买入−在途卖），放行隔夜仓合法退出，不再误杀。
+func TestGateT1SellableStaleSnapshotFallsBack(t *testing.T) {
+	db := gateDB(t)
+	g := NewGate(db, "u_stale", nil)
+	cfg := qmtCfg() // EnforceT1 默认开
+	today := cntime.In(time.Now()).Format("2006-01-02")
+	yesterday := cntime.In(time.Now()).AddDate(0, 0, -1).Format("2006-01-02")
+	zero := 0
+
+	// 场景一：陈旧快照——桥断开冻结在昨天，can_use_qty 仍为 0（昨天是 T 日新仓全锁），
+	// 但今天 T+1 已解锁，本地推算=500。应放行全量卖出，不再误杀隔夜仓。
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{
+		TsCode: "000426.SZ", Name: "兴业银锡", Qty: 500, CostPrice: 10, UserID: "u_stale",
+		CanUseQty: &zero, UpdatedAt: yesterday + " 15:00:00",
+	}}); err != nil {
+		t.Fatalf("seed stale position: %v", err)
+	}
+	o := liveOrder(SideSell)
+	o.Code = "000426.SZ"
+	o.Qty = 500
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("陈旧快照(updated_at=%s)应回落本地推算放行 500 股卖出, got %+v", yesterday, v)
+	}
+
+	// 场景二：同样 can_use_qty=0，但快照是今天（桥新鲜回报）——保留 §A1 收紧，仍拒（柜台账外冻结形态）。
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{
+		TsCode: "000426.SZ", Name: "兴业银锡", Qty: 500, CostPrice: 10, UserID: "u_stale",
+		CanUseQty: &zero, UpdatedAt: today + " 09:30:00",
+	}}); err != nil {
+		t.Fatalf("seed fresh position: %v", err)
+	}
+	v := g.CheckLiveOrder(cfg, o)
+	if v.Pass {
+		t.Fatalf("今日新鲜快照 can_use_qty=0 应保留 §A1 收紧拒单, got %+v", v)
+	}
+	if !strings.Contains(v.Reason, "T+1 不可卖") {
+		t.Fatalf("拒单原因应点名 T+1 不可卖, got %q", v.Reason)
+	}
+}
+
 // §UAT-D4（2026-09-16）：T+1 可卖量必须扣减当日在途卖单——并发双卖不得各自按全量放行。
 // 实录：两笔同秒卖单（合计超过 T+1 可卖量）先后通过旧守卫全部成交（校验输入相同、成交回报未回写）。
 // 本用例锁死：先到者占额度，后到者在网关侧被拦；在途单结算后额度自然回补/继续受持仓约束。

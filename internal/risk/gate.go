@@ -402,8 +402,18 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) 
 			sellable = 0
 		}
 		basis := "本地推算"
-		// §A1 柜台值优先（收紧方向）+ 交叉告警：nil / 负值都按"读不到"退回本地推算。
-		if p.CanUseQty != nil && *p.CanUseQty >= 0 {
+		// §A1-FRESH（2026-11-06）：can_use_qty 只在快照属于当前交易日时可信任。
+		// 券商禁令/桥断开会把持仓快照冻结在较早交易日，can_use_qty 仍是"当日新仓全锁"旧值，
+		// 而 T+1 隔夜已解锁——拿昨天的 0 当今天的权威可卖量会误杀合法隔夜仓退出。
+		// 陈旧快照一律当读不到，回落本地推算（持仓−当日买入−在途卖），不冒充柜台真值。
+		counterPresent := p.CanUseQty != nil && *p.CanUseQty >= 0
+		counterFresh := counterPresent && positionSnapshotFresh(p.UpdatedAt, g.today())
+		if counterPresent && !counterFresh {
+			log.Printf("[risk] §A1-FRESH %s %s 跳过陈旧柜台可卖量 can_use_qty=%d（快照 updated_at=%s 早于今日 %s，T+1 隔夜已解锁，回落本地推算）",
+				g.userID, o.Code, *p.CanUseQty, p.UpdatedAt, g.today())
+		}
+		// §A1 柜台值优先（收紧方向）+ 交叉告警：nil / 负值 / 陈旧快照都按"读不到"退回本地推算。
+		if counterFresh {
 			counter := *p.CanUseQty
 			localEst := sellable
 			if counter < localEst {
@@ -451,6 +461,29 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) 
 		}
 	}
 	return "", 0
+}
+
+// positionSnapshotFresh §A1-FRESH（2026-11-06）：持仓快照是否属于当前交易日。
+// 只有 updated_at 落在 today（或更晚）才认为柜台可卖量 can_use_qty 新鲜可信任；
+// 早于 today 的快照（桥断开/券商禁令冻结）还停在"当日新仓全锁"旧值，而 T+1 隔夜已解锁，
+// 不能拿来当今天的权威可卖量。updated_at 为空或无法解析时保守返回 true（维持改前行为，不扩大回归面）。
+func positionSnapshotFresh(updatedAt, today string) bool {
+	if updatedAt == "" {
+		return true
+	}
+	ds := updatedAt
+	if len(ds) > 10 {
+		ds = ds[:10]
+	}
+	if len(ds) != 10 {
+		return true
+	}
+	pt, err1 := time.Parse("2006-01-02", ds)
+	tt, err2 := time.Parse("2006-01-02", today)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return !pt.Before(tt)
 }
 
 // checkMaxOrderAmount 单笔委托金额绝对帽（默认关，阈值 0=放行一切）：本单金额（装配缺失时
