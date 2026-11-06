@@ -21,6 +21,8 @@
 // three-way comparison may book the day.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"os"
 	"path/filepath"
@@ -92,7 +94,7 @@ func TestMaybeSettleDayNotConnectedDoesNotBookTheDay(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	exec := &countingOfflineSettleExecutor{}
-	ctrl := NewController(exec, db, "u_st_p2e", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_st_p2e", cfg, nil)
 	at := settleAtNowBeijing(t)
 	day := "2026-09-08"
 
@@ -149,7 +151,7 @@ func TestMaybeSettleDayUnsupportedShortCircuitsOncePerDay(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	// guardStub 不实现 SettlementFetcher ⇒ SettleDay 走结构性不支持腿
-	ctrl := NewController(&guardStub{}, db, "u_st_p2e2", cfg, nil)
+	ctrl := newPinnedController(&guardStub{}, db, "u_st_p2e2", cfg, nil)
 	at := settleAtNowBeijing(t)
 	day := "2026-09-08"
 
@@ -191,7 +193,7 @@ func TestSettleSkipShortCircuitIsReasonAndDayScoped(t *testing.T) {
 	db := testDB(t)
 	cfg := configDefault()
 	cfg.Enabled = true
-	ctrl := NewController(&guardStub{}, db, "u_st_p2e3", cfg, nil)
+	ctrl := newPinnedController(&guardStub{}, db, "u_st_p2e3", cfg, nil)
 	day := "2026-09-08"
 
 	if ctrl.settleSkipShortCircuits(day) {
@@ -217,7 +219,7 @@ func TestSettleSkipShortCircuitIsReasonAndDayScoped(t *testing.T) {
 	// 第三条判据（**此刻**执行器是否仍不支持）必须真的参与判定：现网 executor 会在交易时段被
 	// ApplyPendingConfig 换装（§FIX#7），换成支持交割单的执行器之后，当日旧戳不得继续挡窗口——
 	// 只读派生戳的写法在这里会给出"今天已经不试了"的假象，而事实是今天已经能对了。
-	supported := NewController(&settleExecutor{src: &mockSettle{resp: &SettlementResponse{
+	supported := newPinnedController(&settleExecutor{src: &mockSettle{resp: &SettlementResponse{
 		Date: day, Connected: true,
 	}}}, db, "u_st_p2e3b", cfg, nil)
 	supported.recordSettleSkip(day, SettleOutcomeSkippedNoFetcher)
@@ -260,7 +262,7 @@ func TestMaybeSettleDayVerifiedBooksDayAndClearsSkipStamps(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	exec := &flakySettleExecutor{src: &mockSettle{}, failTimes: 0}
-	ctrl := NewController(exec, db, "u_st_p2e4", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_st_p2e4", cfg, nil)
 	at := settleAtNowBeijing(t)
 	day := "2026-09-08"
 

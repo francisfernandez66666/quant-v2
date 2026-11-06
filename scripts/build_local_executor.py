@@ -240,6 +240,10 @@ ALLOWED_XT_METHODS = {
     "order_stock": "place an order",
     "cancel_order_stock": "cancel an order",
     "query_stock_orders": "read today's orders",
+    # §PARTIAL-FILL-1106（方案 §5.2）：部成数量必须来自柜台成交表，委托表的
+    # traded_volume 只是柜台自己回填的副本。撤回一单的剩余量要按真实成交算，
+    # 用副本会把「已成交的那部分」也算进可撤余量。
+    "query_stock_trades": "read today's trades (partial-fill truth)",
     "query_stock_asset": "read the account asset",
     "query_stock_positions": "read the positions",
     "start": "open the trading session",

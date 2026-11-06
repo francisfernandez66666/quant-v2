@@ -17,6 +17,8 @@
 // SignalID inside the restored set), and the file is consumed (or cleared when empty).
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"encoding/json"
 	"os"
@@ -138,7 +140,9 @@ func TestBuyQueueShutdownDrainAndRestore(t *testing.T) {
 // 落盘集 [A,B,A] → 恢复入队 [A,B]（SignalID 首次出现者保留、顺序保持）。
 func TestBuyQueueRestoreDedupUnit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "buy_queue_pending.json")
-	e1 := &Engine{}
+	// §SESSION-WINDOW：本 harness 的引擎统一时钟也钉到当日北京时 10:15（见 testclock_test.go）。
+	// 不固定会在 09:15–09:30 与 14:52 后假红：同包 autoPlace 用例共用 newAsyncEngine 的时钟口径。
+	e1 := newPinnedEngine()
 	e1.buyQueuePath = path
 	task := func(sid, code string) buyTask {
 		bt := buyTask{}
@@ -155,7 +159,8 @@ func TestBuyQueueRestoreDedupUnit(t *testing.T) {
 		t.Fatalf("落盘失败: %v", err)
 	}
 
-	e2 := &Engine{}
+	// §SESSION-WINDOW：同上，引擎时钟钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+	e2 := newPinnedEngine()
 	e2.buyQueuePath = path
 	ch := make(chan buyTask, 64)
 	e2.restoreBuyQueue(ch)

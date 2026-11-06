@@ -12,6 +12,8 @@
 // days, unchanged window semantics on trading days, and the emergency-stop bypass stays intact.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"strings"
 	"testing"
@@ -38,7 +40,7 @@ func manualGateCtrl(t *testing.T, exec Executor, uid string) *Controller {
 	t.Helper()
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	return NewController(exec, testDB(t), uid, cfg, nil)
+	return newPinnedController(exec, testDB(t), uid, cfg, nil)
 }
 
 // TestManualOrderRefusalHonestOnNonTradingDay 休市日撞窗口时刻：新单与撤单都必须给"今日休市"，
@@ -91,7 +93,7 @@ func TestHaltAllStillCancelsOnNonTradingDay(t *testing.T) {
 	exec := &countingExec{}
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(exec, db, "u_mc_halt", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_mc_halt", cfg, nil)
 	ctrl.SetNow(func() time.Time { return nonTradingNow(9, 25) }) // 休市日 + 窗口内，最坏形状
 
 	if _, err := db.UpsertRealOrder(store.RealOrder{

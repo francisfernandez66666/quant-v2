@@ -1,5 +1,7 @@
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 // §MANUAL-SYNC（2026-10-28）：例行自动撤单/收盘清场不得碰手动委托。
 // 手动单在券商 App 里下的（signal_id=ext:<委托号>），超时被系统撤掉属于越权误杀；
 // 紧急停止（HaltAll）仍会连它们一起撤，这是两条不同的路径，必须分别守住。
@@ -19,7 +21,7 @@ func TestSweepOrdersSkipsManualOrders(t *testing.T) {
 	cfg.Enabled = true
 	cfg.CancelStaleSec = 120
 	cfg.CloseSweepAt = -1 // 隔离收盘清单，只验超时撤单
-	ctrl := NewController(guardServer(), db, "u_ms", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_ms", cfg, nil)
 
 	old := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
 	seed := []store.RealOrder{
@@ -67,7 +69,7 @@ func TestSnapshotExposesCashAt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
-	ctrl := NewController(guardServer(), db, "u_ms_at", config.DefaultQMTConfig(), nil)
+	ctrl := newPinnedController(guardServer(), db, "u_ms_at", config.DefaultQMTConfig(), nil)
 	snap := ctrl.Snapshot()
 	if snap.CashAt != updated {
 		t.Fatalf("cash_at 应透出最近快照时刻 %s, got %q", updated, snap.CashAt)

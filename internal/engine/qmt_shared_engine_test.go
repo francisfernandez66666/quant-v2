@@ -5,6 +5,8 @@
 // registry 装配同源）热同步 QMT 配置。
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"path/filepath"
 	"testing"
@@ -28,7 +30,7 @@ func TestSharedEngineQueuesQMTConfig(t *testing.T) {
 
 	// 共享引擎：.userID 为空；QMT 控制器在构建期由 registry 装配（归属首建成员 u_ops）。
 	e := &Engine{}
-	e.SetQMT(trading.NewController(trading.NoopExecutor{}, db, "", config.DefaultQMTConfig(), nil), db)
+	e.SetQMT(newPinnedController(trading.NoopExecutor{}, db, "", config.DefaultQMTConfig(), nil), db)
 	e.cfgMgr = cm
 	e.SetQMTCfgSource("u_ops")
 	// 模拟配置保存（管理员改网关地址后 5s 热同步轮询到达）。

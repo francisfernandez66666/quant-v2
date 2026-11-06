@@ -6,6 +6,8 @@
 //  3. 过滤不许碰撤单行——战法开关只管买入方向，把一条撤单提示滤掉等于把那笔挂单留在市场上。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 	"time"
@@ -31,7 +33,7 @@ func emptyCfg() config.QMTConfig {
 // 先 window（窗口内没发）后 requested（窗口一过就发出去）⇒ 卡上应当只剩 requested，
 // 因为那才是此刻的事实；追加会让同一委托号在映射里互相遮蔽成"随机显示一条"。
 func TestSweepActionOverwriteKeepsLatest(t *testing.T) {
-	c := NewController(guardServer(), nil, "u_ta", emptyCfg(), nil)
+	c := newPinnedController(guardServer(), nil, "u_ta", emptyCfg(), nil)
 	now := bjAt(9, 25)
 	recAction(c, "GW-1", "20261028", SweepActionWindow, SweepSourceSignalGone, now)
 	recAction(c, "GW-1", "20261028", SweepActionRequested, SweepSourceSignalGone, now.Add(5*time.Minute))
@@ -48,7 +50,7 @@ func TestSweepActionOverwriteKeepsLatest(t *testing.T) {
 // TestSweepActionDayReset 跨日不复活：昨天的动作在今天第一批写入时整本换掉。
 // 与 orders/t_rounds 的 day-keyed 口径一致——留痕跨日累积会让"今天撤了几笔"数不出去。
 func TestSweepActionDayReset(t *testing.T) {
-	c := NewController(guardServer(), nil, "u_ta", emptyCfg(), nil)
+	c := newPinnedController(guardServer(), nil, "u_ta", emptyCfg(), nil)
 	recAction(c, "GW-Y", "20261027", SweepActionRequested, SweepSourceSweep, bjAt(10, 0))
 	recAction(c, "GW-T", "20261028", SweepActionRequested, SweepSourceSweep, bjAt(10, 1))
 
@@ -61,7 +63,7 @@ func TestSweepActionDayReset(t *testing.T) {
 // TestSweepActionCap 封顶时按时刻丢最旧，且刚写入的这一笔必须在（整本清空会把它也抹掉，
 // 读数就反过来变成"什么都没发生"）。
 func TestSweepActionCap(t *testing.T) {
-	c := NewController(guardServer(), nil, "u_ta", emptyCfg(), nil)
+	c := newPinnedController(guardServer(), nil, "u_ta", emptyCfg(), nil)
 	base := bjAt(9, 30)
 	for i := 0; i < sweepActionLimit+20; i++ {
 		recAction(c, oidOf(i), "20261028", SweepActionRequested, SweepSourceSweep, base.Add(time.Duration(i)*time.Second))

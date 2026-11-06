@@ -15,6 +15,8 @@
 // assertion discriminates.
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"path/filepath"
 	"testing"
@@ -32,7 +34,7 @@ func n7Env(t *testing.T, db *store.DB) *Engine {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.SellUnifiedMode = "shadow" // 只裁决留痕，本用例不依赖任何下单
-	ctrl := trading.NewController(trading.NoopExecutor{}, db, "u_1", cfg, nil)
+	ctrl := newPinnedController(trading.NoopExecutor{}, db, "u_1", cfg, nil)
 	e := &Engine{}
 	e.SetQMT(ctrl, db)
 	return e

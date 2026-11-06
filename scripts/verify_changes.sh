@@ -21092,8 +21092,37 @@ grep_q 'venv\Scripts\python.exe' ULET F || fail173 "更新器又用系统 python
 grep_q 'switch_execution_mode.ps1' BFPT F || fail173 "一键包白名单漏了切换脚本（包里没有兜底切换入口）"
 grep_q 'qmt_bridge_strategy.py' BFPT F || fail173 "桥文件被从一键包里剔掉了（owner 裁决：桥先保留）"
 
+# ㉖ §STRATEGY-SWITCH-SYNC / §PARTIAL-FILL-1106（11-06，owner「今晚有我更新的批准战法，
+# 启用的战法口径以量化交易 tab 里的战法开关为准」）。
+# 判据落在「包里真的按 tab 跑」而不是「params 里有一串 ID」：派生链实跑、准入判据在规则层、
+# 白名单每条库规则都有可跑的规则表、部成读的是成交表而非委托表副本。
+CNT173=$((CNT173 + 1))
+SYNC_TOOL=scripts/sync_strategy_switches.py
+[ -s "$SYNC_TOOL" ] || fail173 "战法开关快照派生器不在册"
+SYNC_OUT=$(python3 "$SYNC_TOOL" --check 2>&1 || true)
+grep_q "SYNC_RESULT=OK" SYNC_OUT F || fail173 "快照 → params 实跑对账没过（包会带着旧 tab 开关上线）"
+SWTEST=$(cat qmt_gateway/tests/test_strategy_switch_sync_20261106.py || true)
+for name in TestStrategyAdmit TestSnapshotSyncGate TestPartialFillTruth; do
+	grep_q "class $name" SWTEST F || fail173 "战法开关/部成用例缺 $name"
+done
+grep_q 'def rule_strategy_admit(params, go_id)' LEXT F || fail173 "载体没有 tab 开关准入判据（Go signalctl.admit 的同款两支）"
+grep_q 'reason": "strategy_switch_off"' LEXT F || fail173 "开关拦下的信号被折进 rule_not_armed（明天分不清该看哪个开关）"
+for k in "enabled_strategies" "factor_rules" "unmapped_strategies" "strategy_kind_to_go"; do
+	grep_q "\"$k\"" PJT F || fail173 "params 缺 $k（tab 口径没烘进载体）"
+done
+grep_q '"v04-20261106"' PJT F || fail173 "规则表换了但版本没 bump（win 包无法与上一版区分）"
+BUILDRT=$(cat "$BUILDR" || true)
+grep_q '"query_stock_trades"' BUILDRT F || fail173 "成交表方法没进构建器白名单（g2 会拒或部成永远走副本）"
+grep_q 'query_stock_trades(self._acc)' LEXT F || fail173 "载体没读成交表（部成余量按副本算会多撤）"
+grep_q 'traded_source' LEXT F || fail173 "成交表降级回退没有点名来源（静默降级）"
+WEBAPI=$(cat web/src/api/index.js || true)
+WEBQ=$(cat web/src/pages/Quant.jsx || true)
+grep_q 'submitOrderReceipt' WEBAPI F || fail173 "B1 人工回执前端入口缺 API 封装"
+grep_q '人工回执' WEBQ F || fail173 "B1 人工回执没挂上量化交易页（台账自标『无 UI 待补』已结案）"
+grep_q 'STRATEGY_SWITCH_SYNC=OK' BFPT F || fail173 "打包脚本没在出包前实跑快照对账"
+
 [ "$B173_FAILED" = "0" ] || exit 1
-echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1 + 建议×战法开关与建议股数 1 + BAN_IO 禁令自证 1 + 终端版本巡检 1 + 做 T 判断腿接线 1 + 信号消失即撤 1 + 撤单动作快照 1 + 交易级提醒与做T标注 1 + 沙箱固定时刻 1 + 发送前预算复核算术 1 + VWAP 改价腿与撤单唯一出口 1 + 载体同款三行为与桥/物理机切换互锁 1，累计判定点 ${CNT173}）"
+echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1 + 建议×战法开关与建议股数 1 + BAN_IO 禁令自证 1 + 终端版本巡检 1 + 做 T 判断腿接线 1 + 信号消失即撤 1 + 撤单动作快照 1 + 交易级提醒与做T标注 1 + 沙箱固定时刻 1 + 发送前预算复核算术 1 + VWAP 改价腿与撤单唯一出口 1 + 载体同款三行为与桥/物理机切换互锁 1 + tab 战法开关同源与部成成交表 1，累计判定点 ${CNT173}）"
 
 echo "==> 全部通过"
 

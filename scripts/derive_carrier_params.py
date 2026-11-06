@@ -498,6 +498,11 @@ CARRIER_OWNED = {
     "industry_cap_pct": "needs-go-naming: 行业敞口帽在 Go 出厂为 0（＝关），不可当默认搬",
     "single_stock_cap_pct": "needs-go-naming: 同上（SingleStockValuePct 出厂 0）",
     "zero_amount": "math-constant: 规则层禁裸数字，预算算术的零元由这里给出；不是策略阈值，Go 无对应",
+    # §STRATEGY-SWITCH-SYNC（owner 11-06 裁决）：这三枚不是 Go 出厂默认，而是量化交易 tab
+    # 的现网开关快照，由 scripts/sync_strategy_switches.py 单点派生进 params；derive 不产出值。
+    "enabled_strategies": "snapshot-derived: 量化交易 tab 的战法白名单（auth.json#qmt.strategies），由 sync_strategy_switches.py 派生",
+    "factor_rules": "snapshot-derived: 白名单内已审批因子规则（applied_factors.json），由 sync_strategy_switches.py 派生；不再是模块模板",
+    "unmapped_strategies": "snapshot-derived: tab 已开但载体未移植的战法（如 n_shape），如实打 unmapped 读数，不许当成已启用",
     "max_ops_per_min": "carrier-shape: 执行器自身的节流，Go 无对应",
     "ops_window_sec": "carrier-shape: 同上",
     "poll_interval_sec": "carrier-shape: 本地进程轮询节拍",
@@ -555,7 +560,10 @@ GATEWAY_VOCAB_READOUTS = {
 # 值由模块自己声明的 PARAMS_TEMPLATE 供给——与 rules_sizing 的 SIZING_DEFAULTS 同一条路：
 # 表是模块的一部分，工具只搬不改，绝不在这张表里写任何一个数。
 FACTOR_TABLE_KEYS = (
-    "factor_defs", "factor_rules", "pattern_rules", "factor_thresholds", "scalar_bands",
+    # §STRATEGY-SWITCH-SYNC（11-06）：factor_rules 已改由现网 tab 开关快照派生
+    # （见 CARRIER_OWNED 的登记理由），不能再由模块模板在 --write 时覆盖回去，
+    # 否则「今晚批准的 14 条」会被一条 fac_1 模板悄悄顶掉。
+    "factor_defs", "pattern_rules", "factor_thresholds", "scalar_bands",
     "require_trading_day",
 )
 

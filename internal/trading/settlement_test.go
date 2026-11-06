@@ -4,6 +4,8 @@
 // diff detection, sync-fills backfill and alert gating.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"fmt"
 	"testing"
@@ -65,7 +67,7 @@ func TestSettleThreeWay(t *testing.T) {
 			{OrderID: "GW-2", TsCode: "000001.SZ", Side: "卖出", Price: 12, Qty: 200, Fee: 3, Serial: "SER-2", TradedAt: "10:00:00"},
 		},
 	}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
@@ -114,7 +116,7 @@ func TestSettleDayFormatNormalized(t *testing.T) {
 			{OrderID: "GW-H1", TsCode: "600000.SH", Side: "买入", Price: 10, Qty: 100, Fee: 2.5, Serial: "SER-H1", TradedAt: "09:35:00"},
 		},
 	}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	// 关键：入参为 data.TradingDayDate 的无杠格式
 	diff, _, err := ctrl.SettleDay("20260908", SettleModeReportOnly)
 	if err != nil {
@@ -143,7 +145,7 @@ func TestSettleSyncFills(t *testing.T) {
 			{OrderID: "GW-9", TsCode: "600519.SH", Side: "买入", Price: 100, Qty: 100, Fee: 5, Serial: "SER-9", TradedAt: "09:31:00"},
 		},
 	}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
@@ -171,7 +173,7 @@ func TestSettleUnsupported(t *testing.T) {
 	db := testDB(t)
 	cfg := configDefault()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), db, "u_st", cfg, nil) // guardStub 未实现 SettlementFetcher
+	ctrl := newPinnedController(guardServer(), db, "u_st", cfg, nil) // guardStub 未实现 SettlementFetcher
 	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil || diff != nil {
 		t.Fatalf("不支持交割单应 (nil,nil), got diff=%+v err=%v", diff, err)
@@ -184,7 +186,7 @@ func TestSettleDisconnected(t *testing.T) {
 	cfg := configDefault()
 	cfg.Enabled = true
 	src := &settleExecutor{src: &mockSettle{resp: &SettlementResponse{Date: "2026-09-08", Connected: false}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil || diff != nil {
 		t.Fatalf("未连接应 (nil,nil), got diff=%+v err=%v", diff, err)
@@ -224,7 +226,7 @@ func TestSettleFactKeyNoCollapse(t *testing.T) {
 			{TsCode: "000001.SZ", Side: "卖出", Price: 12, Qty: 200}, // 本地没有 → missing 1
 		},
 	}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
 	if err != nil {
 		t.Fatalf("settle: %v", err)
@@ -250,7 +252,7 @@ func TestSettleSyncFillsNoDoubleCount(t *testing.T) {
 			{OrderID: "GW-9", TsCode: "600519.SH", Side: "买入", Price: 100, Qty: 100, Fee: 5, Serial: "S-9", TradedAt: "09:31:00"},
 		},
 	}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	if _, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills); err != nil {
 		t.Fatalf("settle: %v", err)
 	}

@@ -9,6 +9,8 @@
 // English: behaviour legs for the 撤单中 state machine and the session-window guards.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"strings"
 	"testing"
@@ -87,7 +89,7 @@ func TestPlaceOrderBlockedInNoNewOrderWindow(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), db, "u_win", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_win", cfg, nil)
 	ctrl.SetNow(func() time.Time { return bjAt(14, 55) })
 
 	_, err := ctrl.PlaceOrder(buyReq("SIG-WIN-1", 10000))
@@ -108,7 +110,7 @@ func TestPlaceOrderAllowedOutsideWindow(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), db, "u_win2", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_win2", cfg, nil)
 	ctrl.SetNow(func() time.Time { return bjAt(10, 30) })
 
 	res, err := ctrl.PlaceOrder(buyReq("SIG-WIN-2", 10000))
@@ -127,7 +129,7 @@ func TestCancelOrderBlockedInNoCancelWindow(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_cw", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_cw", cfg, nil)
 	ctrl.SetNow(func() time.Time { return bjAt(14, 58) })
 
 	if _, err := db.UpsertRealOrder(store.RealOrder{
@@ -160,7 +162,7 @@ func TestCancelOrderSuccessMarksCancelPending(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), db, "u_cp", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_cp", cfg, nil)
 	ctrl.SetNow(func() time.Time { return bjAt(10, 30) })
 
 	if _, err := db.UpsertRealOrder(store.RealOrder{
@@ -195,7 +197,7 @@ func TestSweepOrdersSkippedInNoCancelWindow(t *testing.T) {
 	cfg.CancelStaleSec = 120
 	cfg.CloseSweepAt = 1452
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_sw", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sw", cfg, nil)
 	now := bjAt(14, 58)
 	ctrl.SetNow(func() time.Time { return now })
 
@@ -236,7 +238,7 @@ func TestHaltAllStillAttemptsInNoCancelWindow(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_hw", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_hw", cfg, nil)
 	ctrl.SetNow(func() time.Time { return bjAt(14, 58) })
 
 	if _, err := db.UpsertRealOrder(store.RealOrder{

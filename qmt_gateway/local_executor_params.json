@@ -969,24 +969,365 @@
     },
     "factor_rules": [
       {
-        "id": "fac_1",
-        "name": "factor_composite",
         "factors": [
-          "Mom20",
-          "VolShrink",
-          "BullAlign"
+          "AtrRatio14",
+          "Brk60",
+          "STOA",
+          "Mom20"
         ],
         "weights": {
-          "Mom20": 0.4,
-          "VolShrink": 0.3,
-          "BullAlign": 0.3
+          "AtrRatio14": 0.25,
+          "Brk60": 0.25,
+          "Mom20": 0.25,
+          "STOA": 0.25
         },
         "directions": {
+          "AtrRatio14": -1,
+          "Brk60": 1,
           "Mom20": 1,
-          "VolShrink": -1,
-          "BullAlign": 1
+          "STOA": 1
         },
-        "buy_threshold": 70.0
+        "buy_threshold": 95,
+        "id": "fac_1",
+        "name": "fac_1"
+      },
+      {
+        "factors": [
+          "VMIN10",
+          "VSTD20"
+        ],
+        "weights": {
+          "VMIN10": 0.09116249668631496,
+          "VSTD20": 0.9088375033136851
+        },
+        "directions": {
+          "VMIN10": -1,
+          "VSTD20": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_118",
+        "name": "fac_118"
+      },
+      {
+        "factors": [
+          "VSTD20"
+        ],
+        "weights": {
+          "VSTD20": 1
+        },
+        "directions": {
+          "VSTD20": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_117",
+        "name": "fac_117"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VolSurge5",
+          "Mom60",
+          "TurnoverStd20",
+          "VMA10",
+          "VMIN10",
+          "Mom5"
+        ],
+        "weights": {
+          "BBI": 0.25141725291988254,
+          "Mom5": 0.08537668192063383,
+          "Mom60": 0.08537668192063383,
+          "TurnoverStd20": 0.08537668192063383,
+          "VMA10": 0.08537668192063383,
+          "VMIN10": 0.08537668192063383,
+          "VSTD20": 0.23632265555631443,
+          "VolSurge5": 0.08537668192063383
+        },
+        "directions": {
+          "BBI": -1,
+          "Mom5": -1,
+          "Mom60": -1,
+          "TurnoverStd20": -1,
+          "VMA10": -1,
+          "VMIN10": -1,
+          "VSTD20": -1,
+          "VolSurge5": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_136",
+        "name": "fac_136"
+      },
+      {
+        "factors": [
+          "STOA",
+          "VSTD20",
+          "VolSurge5",
+          "Mom60",
+          "VMAX10",
+          "VMIN10"
+        ],
+        "weights": {
+          "Mom60": 0.12983567319796552,
+          "STOA": 0.11290058538953526,
+          "VMAX10": 0.15879467335038133,
+          "VMIN10": 0.03396614111444168,
+          "VSTD20": 0.2822514634738381,
+          "VolSurge5": 0.2822514634738381
+        },
+        "directions": {
+          "Mom60": -1,
+          "STOA": -1,
+          "VMAX10": -1,
+          "VMIN10": -1,
+          "VSTD20": -1,
+          "VolSurge5": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_131",
+        "name": "fac_131"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VolSurge5",
+          "Mom60",
+          "TurnoverStd20",
+          "VMA5",
+          "Brk60",
+          "VMIN10"
+        ],
+        "weights": {
+          "BBI": 0.389245479614369,
+          "Brk60": 0.07839915695191352,
+          "Mom60": 0.07839915695191352,
+          "TurnoverStd20": 0.07839915695191352,
+          "VMA5": 0.07839915695191352,
+          "VMIN10": 0.0025087730224612305,
+          "VSTD20": 0.2162499626036021,
+          "VolSurge5": 0.07839915695191352
+        },
+        "directions": {
+          "BBI": -1,
+          "Brk60": -1,
+          "Mom60": -1,
+          "TurnoverStd20": -1,
+          "VMA5": -1,
+          "VMIN10": -1,
+          "VSTD20": -1,
+          "VolSurge5": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_137",
+        "name": "fac_137"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "STOA",
+          "VolSurge5",
+          "DebtToAssets",
+          "VMIN10",
+          "VMAX10",
+          "Mom5",
+          "TurnoverStd20"
+        ],
+        "weights": {
+          "DebtToAssets": 0.4432234417196832,
+          "Mom5": 0.06414476477883833,
+          "STOA": 0.06414476477883833,
+          "TurnoverStd20": 0.06414476477883833,
+          "VMAX10": 0.06414476477883833,
+          "VMIN10": 0.06414476477883833,
+          "VSTD20": 0.11546057660190902,
+          "VolSurge5": 0.12059215778421609
+        },
+        "directions": {
+          "DebtToAssets": -1,
+          "Mom5": -1,
+          "STOA": -1,
+          "TurnoverStd20": -1,
+          "VMAX10": -1,
+          "VMIN10": -1,
+          "VSTD20": -1,
+          "VolSurge5": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_123",
+        "name": "fac_123"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "STOA",
+          "VolSurge5",
+          "Mom60",
+          "TurnoverStd20",
+          "VMIN10",
+          "GrossMargin",
+          "CFP_ttm"
+        ],
+        "weights": {
+          "CFP_ttm": 0.2991346082315521,
+          "GrossMargin": 0.2095294521008854,
+          "Mom60": 0.12124008470117403,
+          "STOA": 0.007775123003495552,
+          "TurnoverStd20": 0.06479269169579631,
+          "VMIN10": 0.06479269169579631,
+          "VSTD20": 0.11662684505243333,
+          "VolSurge5": 0.11610850351886697
+        },
+        "directions": {
+          "CFP_ttm": -1,
+          "GrossMargin": -1,
+          "Mom60": -1,
+          "STOA": -1,
+          "TurnoverStd20": -1,
+          "VMIN10": -1,
+          "VSTD20": -1,
+          "VolSurge5": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_150",
+        "name": "fac_150"
+      },
+      {
+        "factors": [
+          "VMIN10",
+          "VSTD20",
+          "VMAX10"
+        ],
+        "weights": {
+          "VMAX10": 0.21664456007890354,
+          "VMIN10": 0.4421317552630684,
+          "VSTD20": 0.34122368465802805
+        },
+        "directions": {
+          "VMAX10": -1,
+          "VMIN10": -1,
+          "VSTD20": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_153",
+        "name": "fac_153"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VMIN10",
+          "Brk60",
+          "DebtToAssets",
+          "lu_board3"
+        ],
+        "weights": {
+          "BBI": 0.20965691067779363,
+          "Brk60": 0.044552093519031125,
+          "DebtToAssets": 0,
+          "VMIN10": 0.13103556917362102,
+          "VSTD20": 0.13103556917362102,
+          "lu_board3": 0.4837198574559332
+        },
+        "directions": {
+          "BBI": -1,
+          "Brk60": -1,
+          "DebtToAssets": -1,
+          "VMIN10": -1,
+          "VSTD20": -1,
+          "lu_board3": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_154",
+        "name": "fac_154"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VMIN10",
+          "DebtToAssets"
+        ],
+        "weights": {
+          "BBI": 0.3535353535353535,
+          "DebtToAssets": 0.25252525252525254,
+          "VMIN10": 0.1414141414141414,
+          "VSTD20": 0.25252525252525254
+        },
+        "directions": {
+          "BBI": -1,
+          "DebtToAssets": -1,
+          "VMIN10": -1,
+          "VSTD20": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_155",
+        "name": "fac_155"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VMIN10"
+        ],
+        "weights": {
+          "BBI": 0.4888276706458524,
+          "VMIN10": 0.2050811141720232,
+          "VSTD20": 0.30609121518212423
+        },
+        "directions": {
+          "BBI": -1,
+          "VMIN10": -1,
+          "VSTD20": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_157",
+        "name": "fac_157"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VMIN10",
+          "lu_board3"
+        ],
+        "weights": {
+          "BBI": 0.31660088350205146,
+          "VMIN10": 0.09658776136475745,
+          "VSTD20": 0.17247814529420977,
+          "lu_board3": 0.41433320983898125
+        },
+        "directions": {
+          "BBI": -1,
+          "VMIN10": -1,
+          "VSTD20": -1,
+          "lu_board3": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_156",
+        "name": "fac_156"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "Brk60",
+          "lu_board3"
+        ],
+        "weights": {
+          "BBI": 0.1425439217307519,
+          "Brk60": 0.5729384104946673,
+          "VSTD20": 0.0855263530384511,
+          "lu_board3": 0.1989913147361296
+        },
+        "directions": {
+          "BBI": -1,
+          "Brk60": -1,
+          "VSTD20": -1,
+          "lu_board3": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_160",
+        "name": "fac_160"
       }
     ],
     "factor_thresholds": {},
@@ -1128,9 +1469,45 @@
     "reprice_max_per_day": 2,
     "signal_gone_cancel_sec": 0,
     "vwap_reprice_pct": 0,
-    "zero_amount": 0.0
+    "zero_amount": 0.0,
+    "enabled_strategies": [
+      "dragon",
+      "n_shape",
+      "fac_1",
+      "fac_118",
+      "fac_117",
+      "fac_136",
+      "fac_131",
+      "fac_137",
+      "fac_123",
+      "fac_150",
+      "fac_153",
+      "fac_154",
+      "fac_155",
+      "fac_157",
+      "fac_156",
+      "fac_160"
+    ],
+    "unmapped_strategies": [
+      "n_shape"
+    ],
+    "default_allowed_strategies": [
+      "dragon",
+      "double_bump",
+      "n_shape",
+      "dragon_return",
+      "factor",
+      "pattern"
+    ],
+    "factor_id_prefix": "fac_",
+    "pattern_id_prefix": "pat_",
+    "strategy_kind_to_go": {
+      "dragon": "dragon",
+      "double_bump": "double_bump",
+      "dragon_return": "dragon_return"
+    }
   },
-  "strategy_version": "v03-20261105",
+  "strategy_version": "v04-20261106",
   "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the four builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",
   "_comment_ported_modules": "Names of the ported rule modules the builder must inline (rules_form/rules_ladder/rules_factor/rules_t/rules_sizing). Empty list = only the builtin four, i.e. today's behaviour. A name listed here whose file is missing, or whose registered kind has no short code in signal_codes, fails the build rather than publishing a smaller rule set.",
   "_comment_signal_codes_added": "\u7531 tools \u4e00\u6b21\u6027\u6309\u6a21\u5757 RULES \u8868\u751f\u6210\uff08\u77ed\u7801\u552f\u4e00\u6027\u5f53\u573a\u5224\uff09\uff0crule_arm \u5bf9\u65b0\u79fb\u690d\u89c4\u5219\u7f3a\u7701 shadow\uff1aP1 \u9608\u503c\u5fc5\u987b\u5148\u4e0e\u5f15\u64ce\u5bf9\u7167 >=5 \u4ea4\u6613\u65e5\u3002",

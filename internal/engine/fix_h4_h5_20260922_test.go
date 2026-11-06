@@ -17,6 +17,8 @@
 // 5s-round-only global clock.
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"bytes"
 	"log"
@@ -87,7 +89,7 @@ func h4Env(t *testing.T, exec trading.Executor) (*Engine, *store.DB) {
 	cfg.Enabled = true
 	cfg.Mode = "auto"
 	cfg.AutoSell = true
-	ctrl := trading.NewController(exec, realDB, "u_1", cfg, nil)
+	ctrl := newPinnedController(exec, realDB, "u_1", cfg, nil)
 	e := &Engine{}
 	e.SetQMT(ctrl, realDB)
 	return e, realDB

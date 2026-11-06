@@ -222,6 +222,16 @@ done
 [ "$DENIED" = "0" ] || { echo "BUILD_EXIT=1 reason=deny_list_hit=$DENIED" >&2; exit 1; }
 echo "DENIED_HIT=0"
 
+# §STRATEGY-SWITCH-SYNC（owner 11-06）：win 包里的启用战法必须以量化交易 tab 的开关为准。
+# 包是「构建期烘参」产物，params 一旦被手改，装到物理机上就是另一套战法却没有任何报错。
+# 所以打包前实跑快照对账；漂移即拒发包，不留半份包。
+if ! python3 "$ROOT/scripts/sync_strategy_switches.py" --check >/dev/null 2>&1; then
+	echo "X 战法开关与快照漂移：先重抓 tab 开关快照并跑 sync_strategy_switches.py --write" >&2
+	echo "BUILD_EXIT=1 reason=strategy_switch_drift" >&2
+	exit 1
+fi
+echo "STRATEGY_SWITCH_SYNC=OK"
+
 if [ "$MODE" = "preview" ]; then
 	echo "==> [-Preview] 只列出将要打包的文件，不落盘、不压缩"
 	printf '   %s\n' $SRC_LIST

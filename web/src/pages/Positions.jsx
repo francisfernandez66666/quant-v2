@@ -13,6 +13,8 @@ import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import AnchorShadowCard from '../components/AnchorShadowCard.jsx' // §ANCHOR-FIRST W2 影子对照（只读）
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+// §2.12 手动维护账：桥回报可能断时，owner 手敲持仓/可用资金的那本账（与柜台读数严格分栏）。
+import ManualBookPanel from '../components/ManualBookPanel.jsx'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
@@ -687,6 +689,12 @@ export default function Positions() {
       if (realGuard.current.isStale(token)) return
       if (data && Array.isArray(data.positions)) setRealPositions(data.positions)
       if (data && data.account) setRealAccount(data.account)
+      // §2.12 手动维护账：GET /api/positions/real 的 additive manual 块单独收进 state，
+      // **绝不**并进 realPositions/realAccount（那两个是柜台回报的形状，合并后页面上任何
+      // "非空 ⇒ 有仓"的判据都会把手敲当成证据）。字段存在才写：旧一轮载荷没带 manual 键
+      // 时置 null，面板自己显示"尚未维护"，前端不硬依赖后端这个新字段。
+      if (data && data.manual) setManualBook(data.manual)
+      else setManualBook(null)
       ledger.clear('实盘持仓')
     } catch (e) {
       ledger.mark('实盘持仓', failMsg(e))
@@ -1173,6 +1181,18 @@ export default function Positions() {
               )
             })()}
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
+          </div>
+
+          {/* §2.12 手动维护账面板（券商禁令/桥断后续批）：桥回报可能断，owner 手敲的
+              持仓与可用资金走这本账，量化交易据它算动态仓位与推送买卖。
+              硬边界：单独一块带显眼来源身份条的 Card，绝不塞进上面的实盘持仓表格，
+              也绝不与 realPositions/realAccount 合并——手动数据一旦画成和桥回报一样的样式，
+              就会有人把"用户声称"当成"柜台证据"去下真单。
+              放在表格三元式之外 ⇒ 一张桥持仓都没有时照样能开/编辑/保存这本账。
+              manual 只传单独的 manualBook state（缺字段时面板自报"尚未维护"）；
+              onChanged 用 loadReal 重读：保存成功后连同实盘读数一起刷新，不留脏回显。 */}
+          <div style={{ marginBottom: 12 }}>
+            <ManualBookPanel manual={manualBook} onChanged={loadReal} />
           </div>
 
           {/* §TRADE-CARD（2026-11-05）撤单提示条：这条**必须挂在持仓表格之外**——

@@ -186,15 +186,24 @@ func (e *Engine) sendRoomGuard(uid string, amount float64, signalID string) (boo
 	if !e.buyRoomGuardOn(uid) {
 		return true, 0
 	}
+	// §MANUAL-BOOK-FALLBACK（11-06）：发送前复核与 dynamicBuyQty 必须读同一本账，
+	// 否则定量用手动实盘、复核用空掉的柜台表，会把「复核放行」变成第二份口径。
+	acctBook := e.accountBookFor(uid)
 	total := 0.0
-	if acc, err := e.cashAccount(uid); err == nil && acc.TotalAsset > 0 {
-		total = acc.TotalAsset
-	} else if v := e.totalAssetsFor(uid); v > 0 {
-		total = v
+	if acctBook.Account.TotalAsset > 0 {
+		total = acctBook.Account.TotalAsset
+	} else if !acctBook.Manual {
+		if v := e.totalAssetsFor(uid); v > 0 {
+			total = v
+		}
 	}
 	// 可用资金这把退路尺：与 total 同源取账号现金（拿不到就是没有这把尺，不许猜 0）。
 	cash, cashOK := e.availableCashFor(uid)
-	poses, err := st.RealPositionsForUser(uid)
+	if acctBook.Manual {
+		// 手动账是计算输入、不是柜台真值；这里同样不进任何「必须新鲜」硬闸。
+		cash, cashOK = acctBook.Account.AvailableCash, true
+	}
+	poses, err := acctBook.Positions, acctBook.PositionsErr
 	if err != nil {
 		return true, 0
 	}

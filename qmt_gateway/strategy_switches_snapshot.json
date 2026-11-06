@@ -1,0 +1,387 @@
+{
+  "_comment": "量化交易 tab 战法开关 + 已审批因子规则的现网快照。params 的 enabled_strategies/factor_rules 由本文件派生；改开关必须重跑 scripts/sync_strategy_switches.py，不要在 params 里手改。",
+  "captured_at": "2026-11-06T03:50+08:00",
+  "source": "C:/var/lib/quant-trading-v2/auth.json#quant_config_json_v1.qmt.strategies + C:/var/lib/quant-trading-v2/applied_factors.json",
+  "enabled_strategies": [
+    "dragon",
+    "n_shape",
+    "fac_1",
+    "fac_118",
+    "fac_117",
+    "fac_136",
+    "fac_131",
+    "fac_137",
+    "fac_123",
+    "fac_150",
+    "fac_153",
+    "fac_154",
+    "fac_155",
+    "fac_157",
+    "fac_156",
+    "fac_160"
+  ],
+  "factor_rules": [
+    {
+      "id": "fac_1",
+      "name": "波动突破战法",
+      "factors": [
+        "AtrRatio14",
+        "Brk60",
+        "STOA",
+        "Mom20"
+      ],
+      "weights": {
+        "AtrRatio14": 0.25,
+        "Brk60": 0.25,
+        "Mom20": 0.25,
+        "STOA": 0.25
+      },
+      "directions": {
+        "AtrRatio14": -1,
+        "Brk60": 1,
+        "Mom20": 1,
+        "STOA": 1
+      },
+      "buy_threshold": 95
+    },
+    {
+      "id": "fac_118",
+      "name": "因子战法#118",
+      "factors": [
+        "VMIN10",
+        "VSTD20"
+      ],
+      "weights": {
+        "VMIN10": 0.09116249668631496,
+        "VSTD20": 0.9088375033136851
+      },
+      "directions": {
+        "VMIN10": -1,
+        "VSTD20": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_117",
+      "name": "因子战法#117",
+      "factors": [
+        "VSTD20"
+      ],
+      "weights": {
+        "VSTD20": 1
+      },
+      "directions": {
+        "VSTD20": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_136",
+      "name": "因子战法#136",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VolSurge5",
+        "Mom60",
+        "TurnoverStd20",
+        "VMA10",
+        "VMIN10",
+        "Mom5"
+      ],
+      "weights": {
+        "BBI": 0.25141725291988254,
+        "Mom5": 0.08537668192063383,
+        "Mom60": 0.08537668192063383,
+        "TurnoverStd20": 0.08537668192063383,
+        "VMA10": 0.08537668192063383,
+        "VMIN10": 0.08537668192063383,
+        "VSTD20": 0.23632265555631443,
+        "VolSurge5": 0.08537668192063383
+      },
+      "directions": {
+        "BBI": -1,
+        "Mom5": -1,
+        "Mom60": -1,
+        "TurnoverStd20": -1,
+        "VMA10": -1,
+        "VMIN10": -1,
+        "VSTD20": -1,
+        "VolSurge5": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_131",
+      "name": "因子战法#131",
+      "factors": [
+        "STOA",
+        "VSTD20",
+        "VolSurge5",
+        "Mom60",
+        "VMAX10",
+        "VMIN10"
+      ],
+      "weights": {
+        "Mom60": 0.12983567319796552,
+        "STOA": 0.11290058538953526,
+        "VMAX10": 0.15879467335038133,
+        "VMIN10": 0.03396614111444168,
+        "VSTD20": 0.2822514634738381,
+        "VolSurge5": 0.2822514634738381
+      },
+      "directions": {
+        "Mom60": -1,
+        "STOA": -1,
+        "VMAX10": -1,
+        "VMIN10": -1,
+        "VSTD20": -1,
+        "VolSurge5": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_137",
+      "name": "因子战法#137",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VolSurge5",
+        "Mom60",
+        "TurnoverStd20",
+        "VMA5",
+        "Brk60",
+        "VMIN10"
+      ],
+      "weights": {
+        "BBI": 0.389245479614369,
+        "Brk60": 0.07839915695191352,
+        "Mom60": 0.07839915695191352,
+        "TurnoverStd20": 0.07839915695191352,
+        "VMA5": 0.07839915695191352,
+        "VMIN10": 0.0025087730224612305,
+        "VSTD20": 0.2162499626036021,
+        "VolSurge5": 0.07839915695191352
+      },
+      "directions": {
+        "BBI": -1,
+        "Brk60": -1,
+        "Mom60": -1,
+        "TurnoverStd20": -1,
+        "VMA5": -1,
+        "VMIN10": -1,
+        "VSTD20": -1,
+        "VolSurge5": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_123",
+      "name": "因子战法#123",
+      "factors": [
+        "VSTD20",
+        "STOA",
+        "VolSurge5",
+        "DebtToAssets",
+        "VMIN10",
+        "VMAX10",
+        "Mom5",
+        "TurnoverStd20"
+      ],
+      "weights": {
+        "DebtToAssets": 0.4432234417196832,
+        "Mom5": 0.06414476477883833,
+        "STOA": 0.06414476477883833,
+        "TurnoverStd20": 0.06414476477883833,
+        "VMAX10": 0.06414476477883833,
+        "VMIN10": 0.06414476477883833,
+        "VSTD20": 0.11546057660190902,
+        "VolSurge5": 0.12059215778421609
+      },
+      "directions": {
+        "DebtToAssets": -1,
+        "Mom5": -1,
+        "STOA": -1,
+        "TurnoverStd20": -1,
+        "VMAX10": -1,
+        "VMIN10": -1,
+        "VSTD20": -1,
+        "VolSurge5": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_150",
+      "name": "因子战法#150",
+      "factors": [
+        "VSTD20",
+        "STOA",
+        "VolSurge5",
+        "Mom60",
+        "TurnoverStd20",
+        "VMIN10",
+        "GrossMargin",
+        "CFP_ttm"
+      ],
+      "weights": {
+        "CFP_ttm": 0.2991346082315521,
+        "GrossMargin": 0.2095294521008854,
+        "Mom60": 0.12124008470117403,
+        "STOA": 0.007775123003495552,
+        "TurnoverStd20": 0.06479269169579631,
+        "VMIN10": 0.06479269169579631,
+        "VSTD20": 0.11662684505243333,
+        "VolSurge5": 0.11610850351886697
+      },
+      "directions": {
+        "CFP_ttm": -1,
+        "GrossMargin": -1,
+        "Mom60": -1,
+        "STOA": -1,
+        "TurnoverStd20": -1,
+        "VMIN10": -1,
+        "VSTD20": -1,
+        "VolSurge5": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_153",
+      "name": "因子战法#153",
+      "factors": [
+        "VMIN10",
+        "VSTD20",
+        "VMAX10"
+      ],
+      "weights": {
+        "VMAX10": 0.21664456007890354,
+        "VMIN10": 0.4421317552630684,
+        "VSTD20": 0.34122368465802805
+      },
+      "directions": {
+        "VMAX10": -1,
+        "VMIN10": -1,
+        "VSTD20": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_154",
+      "name": "因子战法#154",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VMIN10",
+        "Brk60",
+        "DebtToAssets",
+        "lu_board3"
+      ],
+      "weights": {
+        "BBI": 0.20965691067779363,
+        "Brk60": 0.044552093519031125,
+        "DebtToAssets": 0,
+        "VMIN10": 0.13103556917362102,
+        "VSTD20": 0.13103556917362102,
+        "lu_board3": 0.4837198574559332
+      },
+      "directions": {
+        "BBI": -1,
+        "Brk60": -1,
+        "DebtToAssets": -1,
+        "VMIN10": -1,
+        "VSTD20": -1,
+        "lu_board3": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_155",
+      "name": "因子战法#155",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VMIN10",
+        "DebtToAssets"
+      ],
+      "weights": {
+        "BBI": 0.3535353535353535,
+        "DebtToAssets": 0.25252525252525254,
+        "VMIN10": 0.1414141414141414,
+        "VSTD20": 0.25252525252525254
+      },
+      "directions": {
+        "BBI": -1,
+        "DebtToAssets": -1,
+        "VMIN10": -1,
+        "VSTD20": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_157",
+      "name": "因子战法#157",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VMIN10"
+      ],
+      "weights": {
+        "BBI": 0.4888276706458524,
+        "VMIN10": 0.2050811141720232,
+        "VSTD20": 0.30609121518212423
+      },
+      "directions": {
+        "BBI": -1,
+        "VMIN10": -1,
+        "VSTD20": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_156",
+      "name": "因子战法#156",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VMIN10",
+        "lu_board3"
+      ],
+      "weights": {
+        "BBI": 0.31660088350205146,
+        "VMIN10": 0.09658776136475745,
+        "VSTD20": 0.17247814529420977,
+        "lu_board3": 0.41433320983898125
+      },
+      "directions": {
+        "BBI": -1,
+        "VMIN10": -1,
+        "VSTD20": -1,
+        "lu_board3": -1
+      },
+      "buy_threshold": 70
+    },
+    {
+      "id": "fac_160",
+      "name": "因子战法#160",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "Brk60",
+        "lu_board3"
+      ],
+      "weights": {
+        "BBI": 0.1425439217307519,
+        "Brk60": 0.5729384104946673,
+        "VSTD20": 0.0855263530384511,
+        "lu_board3": 0.1989913147361296
+      },
+      "directions": {
+        "BBI": -1,
+        "Brk60": -1,
+        "VSTD20": -1,
+        "lu_board3": -1
+      },
+      "buy_threshold": 70
+    }
+  ],
+  "pattern_rules": []
+}

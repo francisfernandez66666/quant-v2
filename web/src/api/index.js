@@ -82,6 +82,7 @@
 //                           GET|POST /api/qmt/fill-amendments[/{id}/apply|/revoke]
 //                                                       §FILL-AMEND 成交逐笔人工改判（提交→批准→撤销）
 //   fetchFillConservation() GET  /api/qmt/fills/conservation   账本守恒自检（只读报数）
+//   submitOrderReceipt()    POST /api/qmt/order-receipt       §4.2 人工回执（桥断后券商 App 手敲单的成交/撤单回填，账号级）
 //
 // 【模拟盘】
 //   fetchPaperState() / fetchPaperPositions() / fetchPaperTrades() / fetchPaperOrders()
@@ -1003,6 +1004,30 @@ export async function saveManualBook(body) {
     throw new Error('positions 与 available_cash 至少带一项（全量 upsert 不接受空提交）')
   }
   return request('/api/qmt/manual-positions', { method: 'POST', data: b })
+}
+
+/** §4.2 人工回执：桥断后券商 App 手敲单的成交/撤单回填（账号级，按登录态归属、不动资金） */
+/** §4.2 manual order receipt: backfill fills/cancels typed in the broker app after the bridge broke. */
+// 对应 POST /api/qmt/order-receipt。请求体严格等同后端 orderReceiptReq 的五个字段：
+//   signal_id（必填，幂等/审计唯一锚点）/ status / qty(int) / price(float) / note。
+// 三条调用侧必须知道的边界（都在 internal/server/handlers_qmt_receipt.go 文件头与函数体）：
+//   · status 只认 filled/partial/rejected/cancelled/not_placed 五档，其余后端 400；
+//   · qty/price 不许为负；filled/partial 必须 qty>0 且 price>0（成交回执要落成交行）；
+//   · 后端另有 user_id 字段但「收下但永不采信」（归属只由 requestUserID 决定）——
+//     所以这里组装请求体时**不带 user_id**：传了等于诱导调用方自报身份，是伪造归属。
+// 成功响应（200）：{ status:'ok', signal_id, order_id, before_status, after_status, fill_written, source }；
+// 同键重放回 409、查无回 404、越权回 403，均由 request() 抛成带 status 的 Error（调用方不得吞错）。
+export async function submitOrderReceipt(body) {
+  const b = body || {}
+  // 只挑后端契约里的五个字段组装：不 spread 整个入参，杜绝调用方顺手塞进多余/拼错字段。
+  const data = {
+    signal_id: b.signal_id,
+    status: b.status,
+    qty: b.qty,
+    price: b.price,
+    note: b.note,
+  }
+  return request('/api/qmt/order-receipt', { method: 'POST', data })
 }
 
 /** §CARRIER-UPDATE 更新载体：把该账号的 request_state 置成 pending（运营人工触发） */

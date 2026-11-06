@@ -2,6 +2,8 @@
 // English: gateway active-broker status/switch tests (dual-path miniQMT/QMT).
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"encoding/json"
 	"net/http"
@@ -105,7 +107,7 @@ func TestControllerGatewayBrokerStatusUsesConfig(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.QMTConfig{Enabled: true, GatewayURL: srv.URL, Token: "tk"}
-	c := NewController(NoopExecutor{}, nil, "uA", cfg, nil)
+	c := newPinnedController(NoopExecutor{}, nil, "uA", cfg, nil)
 	st, err := c.GatewayBrokerStatus()
 	if err != nil {
 		t.Fatalf("GatewayBrokerStatus: %v", err)
@@ -117,7 +119,7 @@ func TestControllerGatewayBrokerStatusUsesConfig(t *testing.T) {
 
 // QMT 未启用时控制器返回明确的未启用态。
 func TestControllerGatewayBrokerStatusDisabled(t *testing.T) {
-	c := NewController(NoopExecutor{}, nil, "uA", config.QMTConfig{Enabled: false}, nil)
+	c := newPinnedController(NoopExecutor{}, nil, "uA", config.QMTConfig{Enabled: false}, nil)
 	if _, err := c.GatewayBrokerStatus(); err == nil {
 		t.Fatal("未启用实盘应返回错误")
 	}
@@ -130,7 +132,7 @@ func TestControllerSwitchGatewayBrokerValidates(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.QMTConfig{Enabled: true, GatewayURL: srv.URL, Token: "tk"}
-	c := NewController(NoopExecutor{}, nil, "uA", cfg, nil)
+	c := newPinnedController(NoopExecutor{}, nil, "uA", cfg, nil)
 	if err := c.SwitchGatewayBroker("bogus"); err == nil {
 		t.Fatal("非法通道应报错")
 	}

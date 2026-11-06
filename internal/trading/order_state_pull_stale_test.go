@@ -17,6 +17,8 @@
 
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"encoding/json"
 	"net/http"
@@ -95,7 +97,7 @@ func staleCtrl(t *testing.T, db *store.DB, uid string, srv *httptest.Server, on 
 		yes := true
 		cfg.OrderStatePullStale = &yes
 	}
-	return NewController(guardServer(), db, uid, cfg, nil)
+	return newPinnedController(guardServer(), db, uid, cfg, nil)
 }
 
 // pullStaleRounds 跑 n 轮，每轮间隔超过 stalePullEvery（10 分钟）节流。

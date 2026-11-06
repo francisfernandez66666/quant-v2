@@ -49,6 +49,18 @@ const KIND_LABELS = {
 // 战法类型展示顺序：按 内置→因子→自动发现 排列 tab
 const KIND_ORDER = ['form', 'factor', 'pattern']
 
+// §4.2 人工回执状态五档：value 是后端 orderReceiptStatusMap 认的原值（照抄，不另造词），
+// label 是给运维看的人话（括号里保留原值便于对照券商回单）。
+// 改这张表必须同步 internal/server/handlers_qmt_receipt.go 的 orderReceiptStatusMap，
+// 否则前端发出去的 status 会被后端 400 挡在门口。
+const RECEIPT_STATUS_OPTIONS = [
+  { value: 'filled', label: '已成 filled' },
+  { value: 'partial', label: '部成 partial' },
+  { value: 'rejected', label: '废单 rejected' },
+  { value: 'cancelled', label: '已撤 cancelled' },
+  { value: 'not_placed', label: '发送失败 not_placed' },
+]
+
 // 本地缓存键：切换 tab 时先显示上次成功加载的配置，避免开关/参数瞬间跳回默认值。
 // 键含当前账号名（多账号隔离），防止 A 账号的表单缓存串给 B 账号显示。
 const STORAGE_QMT_FORM_BASE = 'liangzai_qmt_form'
@@ -219,6 +231,10 @@ export default function Quant() {
   const [settleBusy, setSettleBusy] = useState(false)
   const [settle, setSettle] = useState(null)        // 最近一次对账结果/历史
   const [halted, setHalted] = useState(false)       // kill-switch 当前态（来自 config.halted）
+  // §4.2 人工回执表单：五个字段严格对齐后端 orderReceiptReq，账号级入口刻意不落权限严格位。
+  // status 默认 filled、qty/price 留空串（提交前才转数字），note 默认空——不带 user_id。
+  const [receiptForm, setReceiptForm] = useState({ signal_id: '', status: 'filled', qty: '', price: '', note: '' })
+  const [receiptBusy, setReceiptBusy] = useState(false) // 提交中：防连点把同一锚点重复回执
   // §N-09：admin 只读轮询总开关（进入/退出本页或权限止血时切换）
   const [pollingActive, setPollingActive] = useState(false)
 
@@ -724,6 +740,53 @@ export default function Quant() {
       await loadOrders()
     } catch (e) {
       MessagePlugin.error('撤单失败：' + (e && e.message ? e.message : e))
+    }
+  }
+
+  // §4.2 人工回执提交：桥断后券商 App 手敲单的成交/撤单回填。字段严格按后端契约，
+  // 前端就地校验只做「后端同样会拒」的那几条（不发注定 400 的请求），其余交给后端裁决。
+  // 成功/失败都要有可读反馈：成功回显后端落账事实，失败把后端中文 error 原样吐出，**绝不吞错**。
+  async function submitOrderReceipt() {
+    // 防连点：同 signal_id 第二次回执后端一律 409，前端先挡住重复点击更省一次往返。
+    if (receiptBusy) return
+    // 锚点必填且去空白：signal_id 是幂等与审计唯一锚点，空锚点发出去必然 400。
+    const sid = String(receiptForm.signal_id || '').trim()
+    if (!sid) {
+      MessagePlugin.warning('signal_id 必填（它是幂等与审计的唯一锚点，可从「当日委托」卡取）')
+      return
+    }
+    // status 只允许后端 orderReceiptStatusMap 认的五档，拼错/漏选就地挡下（后端会 400）。
+    const status = receiptForm.status
+    if (!RECEIPT_STATUS_OPTIONS.some((o) => o.value === status)) {
+      MessagePlugin.warning('回执状态不在后端允许的五档内')
+      return
+    }
+    // qty/price 转数字：空串按 0 处理，非数字或负数就地挡下（后端同样「不许为负」）。
+    const qty = Number(receiptForm.qty === '' ? 0 : receiptForm.qty)
+    const price = Number(receiptForm.price === '' ? 0 : receiptForm.price)
+    if (!Number.isFinite(qty) || !Number.isFinite(price) || qty < 0 || price < 0) {
+      MessagePlugin.warning('qty/price 必须是数字且不许为负')
+      return
+    }
+    // 成交类回执必须带量价：没有量价的「成交」后端会 400，前端先提示，省一次白跑。
+    if ((status === 'filled' || status === 'partial') && (qty <= 0 || price <= 0)) {
+      MessagePlugin.warning('成交回执（filled/partial）必须带 qty>0 与 price>0（否则无法落成交行）')
+      return
+    }
+    setReceiptBusy(true)
+    try {
+      // 只提交后端契约的五个字段；user_id 一律不传（归属只由登录态决定，见 api 层注释）。
+      const r = await api.submitOrderReceipt({ signal_id: sid, status, qty, price, note: receiptForm.note || '' })
+      // 成功反馈回显后端落账事实：锚点、after 状态、有没有真的落成交行（不谎称「已撤/已成交」）。
+      MessagePlugin.success(`人工回执已入账：${sid} → ${(r && r.after_status) || status}`
+        + `${r && r.fill_written ? '（已落成交行）' : '（未落成交行）'}`)
+    } catch (e) {
+      // 不吞错：request() 已把后端 {error:...} 的中文文案放进 e.message，原样回显。
+      // 409 重放 / 403 越权 / 404 查无 / 400 校验失败 / 5xx 全部走这一条，绝不静默当成功。
+      MessagePlugin.error('人工回执失败：' + (e && e.message ? e.message : e))
+    } finally {
+      // 无论成败都解锁按钮：卡在 busy 会让运维以为「还在提交」而不敢重试。
+      setReceiptBusy(false)
     }
   }
 
@@ -1602,6 +1665,49 @@ export default function Quant() {
     )
   }
 
+  /* §4.2 渲染「人工回执」卡：桥断后券商 App 手敲单的成交/撤单回填入口。
+     挂在「当日委托」卡之后——signal_id 从那张卡里取，回执推进的正是那些委托行。
+     五个输入严格对应后端 orderReceiptReq：signal_id / status / qty / price / note，
+     不带 user_id（账号级路由按登录态归属，自报身份后端永不采信）。
+     后端是账号级 authMiddleware、刻意不落严格位，所以本卡不加权限隐藏：
+     这是成员回填自己账号的回执，锁进实盘权限面反而把桥断后唯一收账通道关死。 */
+  function renderOrderReceiptCard() {
+    return (
+      <Card title="人工回执（桥断后手敲单回填）" style={{ marginBottom: 14 }}>
+        {/* 用途说明：把「不动资金、按账号归属、同键只收一次」三条边界摆到操作者眼前。 */}
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>
+          QMT 桥断后，券商 App 手工下的单、以及机器侧已发但无回报的单，用本表单把成交/部成/废单/已撤/未成交回填。
+          只推进本账号委托与成交两本账，不动账户资金；归属按登录账号，别人的 signal_id 不收；同 signal_id 第二次回执一律拒（409）。
+        </div>
+        {/* 表单行：五个字段一个不多一个不少，均带中文 placeholder 便于定位与核对。 */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' }}>
+          <Input style={{ width: 260 }} value={receiptForm.signal_id} placeholder="signal_id（必填，来自当日委托）"
+            onChange={(v) => setReceiptForm({ ...receiptForm, signal_id: v })} />
+          {/* status 用原生下拉把取值钉死在后端五档，杜绝手敲拼错键名被后端 400。 */}
+          <select data-testid="receipt-status" aria-label="回执状态" value={receiptForm.status}
+            onChange={(e) => setReceiptForm({ ...receiptForm, status: e.target.value })}
+            style={{ height: 32, padding: '0 8px', borderRadius: 3, border: '1px solid var(--app-border-2, #dcdcdc)' }}>
+            {RECEIPT_STATUS_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+          <Input style={{ width: 130 }} type="number" min={0} value={receiptForm.qty} placeholder="成交数量 qty"
+            onChange={(v) => setReceiptForm({ ...receiptForm, qty: v })} />
+          <Input style={{ width: 130 }} type="number" min={0} step={0.01} value={receiptForm.price} placeholder="成交价格 price"
+            onChange={(v) => setReceiptForm({ ...receiptForm, price: v })} />
+          <Input style={{ width: 220 }} value={receiptForm.note} placeholder="备注 note（可选）"
+            onChange={(v) => setReceiptForm({ ...receiptForm, note: v })} />
+          {/* 提交按钮：busy 时禁用防连点；成功/失败反馈统一走 MessagePlugin（与本页撤单/对账同款）。 */}
+          <Button theme="primary" loading={receiptBusy} disabled={receiptBusy} onClick={submitOrderReceipt}>提交人工回执</Button>
+        </div>
+        {/* 量价提示：只有成交类回执才要求 qty>0/price>0，非成交类带上量价后端忽略但不拒。 */}
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginTop: 8 }}>
+          filled/partial 必须带 qty&gt;0 与 price&gt;0（要落成交行）；rejected/cancelled/not_placed 可不带量价。qty/price 不许为负。
+        </div>
+      </Card>
+    )
+  }
+
   /* §0925EVE-W3-G（FIX_PLAN ⑫ C3）渲染"待核对委托"卡：网关第三态（已交通道、结算结果不明）
      的人工收敛面板。每行两个处置按钮（柜台无此单=released / 柜台有此单=settled），
      confirmDialog 二次确认后走 POST /api/qmt/order-confirm（后端落 opslog 审计）。
@@ -1743,6 +1849,9 @@ export default function Quant() {
 
       {/* §U-2 当日委托卡：撤单按钮的宿主（order_id 数据源） */}
       {renderOrdersCard()}
+
+      {/* §4.2 人工回执卡：紧跟当日委托，signal_id 从上方委托行取，回填的是同一批账本行 */}
+      {renderOrderReceiptCard()}
 
       {/* §0925EVE-W3-G 待核对委托卡：第三态人工改判入口（网关 /admin/* 的产品化出口）。
           §MULTI-ACCT-B 批5：人工改判不在 quant_trade 权限内（清单与 order-confirm 都锁在

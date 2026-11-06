@@ -8,6 +8,8 @@
 // 时长关系，用真实时间会随时区/跑测时刻漂移（本仓的日期漂移型 flaky 老题材）。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 	"time"
@@ -54,7 +56,7 @@ func sgFixture(t *testing.T, graceSec int) (*Controller, *store.DB, *countingExe
 	cfg.CloseSweepAt = -1
 	cfg.SignalGoneCancelSec = graceSec
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_sg", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sg", cfg, nil)
 	now := bjAt(10, 30)
 	ctrl.SetNow(func() time.Time { return now })
 	return ctrl, db, exec, now
@@ -195,7 +197,7 @@ func TestSignalGoneUnknownKey(t *testing.T) {
 	cfg.CloseSweepAt = -1
 	cfg.SignalGoneCancelSec = 300
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_sg2", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sg2", cfg, nil)
 	now := bjAt(10, 30)
 	ctrl.SetNow(func() time.Time { return now })
 	seedDecision(t, db, "u_sg2", "600000", "n_shape", now.Add(-3*time.Hour), 100)
@@ -241,7 +243,7 @@ func TestSignalGoneNeverCancelsSells(t *testing.T) {
 	cfg.CloseSweepAt = -1
 	cfg.SignalGoneCancelSec = 300
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_sg3", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sg3", cfg, nil)
 	now := bjAt(10, 30)
 	ctrl.SetNow(func() time.Time { return now })
 	seedDecision(t, db, "u_sg3", "600000", "n_shape", now.Add(-3*time.Hour), 100)
@@ -273,7 +275,7 @@ func TestSignalGoneRespectsNoCancelWindow(t *testing.T) {
 	cfg.CloseSweepAt = -1
 	cfg.SignalGoneCancelSec = 300
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_sg4", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sg4", cfg, nil)
 	now := bjAt(9, 25) // 集合竞价窗口：交易所不接受撤单
 	ctrl.SetNow(func() time.Time { return now })
 	seedDecision(t, db, "u_sg4", "600000", "n_shape", now.Add(-3*time.Hour), 100)

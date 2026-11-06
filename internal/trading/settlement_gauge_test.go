@@ -13,6 +13,8 @@
 // reading (3=unsupported, 2=not connected) that says the zero is not a verified result.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 
@@ -49,7 +51,7 @@ func TestSettleDayFeedsDiffGauge(t *testing.T) {
 			{OrderID: "GW-2", TsCode: "000001.SZ", Side: "卖出", Price: 12, Qty: 200, Fee: 3, Serial: "SER-2", TradedAt: "10:00:00"},
 		},
 	}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	if _, _, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly); err != nil {
 		t.Fatalf("settle: %v", err)
 	}
@@ -100,7 +102,7 @@ func TestSettleDaySkipBranchesZeroDiffButNotVerified(t *testing.T) {
 	metrics.SetGauge("settlement_diff_count", 7)
 
 	// 出口 A：执行器不支持交割单（结构性不适用）
-	noopCtrl := NewController(&guardStub{}, db, "u_st", cfg, nil)
+	noopCtrl := newPinnedController(&guardStub{}, db, "u_st", cfg, nil)
 	diff, outcome, err := noopCtrl.SettleDay("2026-09-09", SettleModeReportOnly)
 	if err != nil || diff != nil {
 		t.Fatalf("不支持交割单应返回空差异，got diff=%v err=%v", diff, err)
@@ -122,7 +124,7 @@ func TestSettleDaySkipBranchesZeroDiffButNotVerified(t *testing.T) {
 	// 重新播一次残值：出口 A 已经按本批口径把差异键归零，不重播就只能证到 A 一条腿——
 	// 反证 D10（删掉 B 腿的归零那行）会因此照样全绿，"三条出口都归零"退化成"一条出口有牙"。
 	metrics.SetGauge("settlement_diff_count", 7)
-	offCtrl := NewController(&settleExecutor{src: &mockSettle{resp: &SettlementResponse{
+	offCtrl := newPinnedController(&settleExecutor{src: &mockSettle{resp: &SettlementResponse{
 		Date: "2026-09-09", Connected: false,
 	}}}, db, "u_st", cfg, nil)
 	diff, outcome, err = offCtrl.SettleDay("2026-09-09", SettleModeReportOnly)
@@ -150,7 +152,7 @@ func TestSettleDaySkipBranchesZeroDiffButNotVerified(t *testing.T) {
 	src := &settleExecutor{src: &mockSettle{resp: &SettlementResponse{
 		Date: "2026-09-09", Connected: true, Trades: []SettlementTrade{},
 	}}}
-	okCtrl := NewController(src, db, "u_st", cfg, nil)
+	okCtrl := newPinnedController(src, db, "u_st", cfg, nil)
 	_, outcome, err = okCtrl.SettleDay("2026-09-09", SettleModeReportOnly)
 	if err != nil {
 		t.Fatalf("settle: %v", err)

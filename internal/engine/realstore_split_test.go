@@ -13,6 +13,8 @@
 // saw 0 — silently killing live SL/TP/auto-sell/M8. The e2e rig shared one DB so this rotted silently.
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"path/filepath"
 	"testing"
@@ -46,7 +48,7 @@ func TestSplitRealAndD1StoreWiring(t *testing.T) {
 	// 修复后装配（与 registry.go 同款）：realStore=实盘账本库、d1Store=研究库
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := trading.NewController(trading.NoopExecutor{}, realDB, "u_1", cfg, nil)
+	ctrl := newPinnedController(trading.NoopExecutor{}, realDB, "u_1", cfg, nil)
 	e := &Engine{}
 	e.SetQMT(ctrl, realDB)
 	e.SetD1Store(d1DB)

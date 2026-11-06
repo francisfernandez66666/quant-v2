@@ -7,6 +7,8 @@
 // fresh=true; stale keeps carrying the raw last value for the frontend banner.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 	"time"
@@ -19,12 +21,12 @@ import (
 func TestAvailableCashThreeStates(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	// ①未接账本库：口径不可得。
-	ctrlNil := NewController(guardServer(), nil, "u_3s", cfg, nil)
+	ctrlNil := newPinnedController(guardServer(), nil, "u_3s", cfg, nil)
 	if cash, fresh := ctrlNil.AvailableCash(); cash != 0 || fresh {
 		t.Fatalf("未接账本库应 (0,false)，got (%v,%v)", cash, fresh)
 	}
 	db := testDB(t)
-	ctrl := NewController(guardServer(), db, "u_3s", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_3s", cfg, nil)
 	// ②账本无行（GetRealAccount 返回零值行、UpdatedAt 为空→解析失败）：同为口径不可得（而非"真 0"）。
 	if cash, fresh := ctrl.AvailableCash(); cash != 0 || fresh {
 		t.Fatalf("账本无行应 (0,false)，got (%v,%v)", cash, fresh)
@@ -82,7 +84,7 @@ func TestAvailableCashBeijingParseOnUTCHost(t *testing.T) {
 
 	cfg := config.DefaultQMTConfig()
 	db := testDB(t)
-	ctrl := NewController(guardServer(), db, "u_tzpin", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_tzpin", cfg, nil)
 	seed := func(cash float64, age time.Duration) {
 		t.Helper()
 		// 北京时间视角的墙钟串（与网关写入侧 cntime 口径同源）

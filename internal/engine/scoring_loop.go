@@ -702,7 +702,11 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	// §GAP2-W2 实盘建议定向化（I-4）：只读主账号（=QMT 归属账号，实盘仅 admin 开启）的持仓，
 	// SSE 只推给该账号——admin 真实持仓代码/数量/买卖建议不再每 5s 广播给所有在线用户。
 	sendTo := e.primaryMember()
-	positions, err := realStore.RealPositionsForUser(sendTo)
+	// §MANUAL-BOOK-FALLBACK（11-06）：买卖建议/推送必须和动态仓位读同一本账。
+	// 桥断时若只把动态仓位切到手动实盘、推送仍读空掉的 real_positions，
+	// 屏上的「留/加/减/走」就会和真实计算输入相反——这正是方案 §2.12 的落点。
+	acctBook := e.accountBookFor(sendTo)
+	positions, err := acctBook.Positions, acctBook.PositionsErr
 	if err != nil || len(positions) == 0 {
 		// §GAP2-W1 平仓归零（资损级修复）：空仓时把 M8 组合回撤的进程内峰值基线清零。
 		// 旧实现提前 return 且从不重置 m8PeakTotal——注释宣称"平仓后基线归零"但代码没做，

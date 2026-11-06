@@ -14,6 +14,8 @@
 // numeric tier contract.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"errors"
 	"path/filepath"
@@ -69,7 +71,7 @@ func ebDB(t *testing.T) *store.DB {
 // ebCtrl 造一个"配了网关、开了实盘"的控制器，执行器与账本由用例给。
 func ebCtrl(t *testing.T, exec Executor, db *store.DB, uid string) *Controller {
 	t.Helper()
-	return NewController(exec, db, uid, config.QMTConfig{
+	return newPinnedController(exec, db, uid, config.QMTConfig{
 		Enabled: true, Mode: "auto", GatewayURL: "http://127.0.0.1:8789", MissHeartbeatSec: 5,
 	}, nil)
 }
@@ -106,7 +108,7 @@ func TestExternalBrainShadowBeatsAutoJudgement(t *testing.T) {
 // TestExternalBrainNoGatewayIsNotApplicable 没配网关的账号判 0，且**绝不挡买入**
 // （纯纸面/研究账号不能被这套判定顺手掐掉）。
 func TestExternalBrainNoGatewayIsNotApplicable(t *testing.T) {
-	c := NewController(&ebExec{healthOK: false, healthErr: errFakeDown}, nil, "u_eb0",
+	c := newPinnedController(&ebExec{healthOK: false, healthErr: errFakeDown}, nil, "u_eb0",
 		config.QMTConfig{Enabled: true, Mode: "auto"}, nil)
 	if code, reason := c.ExternalBrain(); code != ExternalBrainNA {
 		t.Fatalf("未配网关应判 0（不适用），实得 %d（%s）", code, reason)

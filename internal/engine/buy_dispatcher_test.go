@@ -4,6 +4,8 @@
 // enqueues on buyCh, a worker calls the gateway; the scoring loop is never blocked by gateway RTT.
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"encoding/json"
 	"fmt"
@@ -68,8 +70,10 @@ func newAsyncEngine(t *testing.T) (*Engine, *store.DB, *httptest.Server, *[]map[
 	cfg.GatewayURL = srv.URL
 	cfg.FixedAmount = 10000
 	exec := trading.NewQMTClient(srv.URL, "", 2*time.Second, 0)
-	ctrl := trading.NewController(exec, db, "u_1", cfg, nil)
-	e := &Engine{}
+	ctrl := newPinnedController(exec, db, "u_1", cfg, nil)
+	// §SESSION-WINDOW：引擎统一时钟钉到当日北京时 10:15（见 testclock_test.go 的 newPinnedEngine）。
+	// 不固定会在 09:15–09:30 与 14:52 后假红：autoPlace 的禁挂闸吃 e.nowTime()，窗口内整轮不下单。
+	e := newPinnedEngine()
 	e.SetQMT(ctrl, db)
 	return e, db, srv, &orders, &mu
 }

@@ -5,13 +5,14 @@
 // and every unknown/not-applicable state must land on 0 (which never trips a gt rule).
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/metrics"
-	"quant-trading-v2/internal/trading"
 )
 
 // TestRefreshStalenessGaugesUnknownIsZero 未接行情采集器、未接实盘控制器时两条量规都必须为 0：
@@ -30,7 +31,7 @@ func TestRefreshStalenessGaugesUnknownIsZero(t *testing.T) {
 // TestRefreshStalenessGaugesUplinkFreshAndNeverReported 实盘已开但从未收到回报 → 0（无基线不判陈旧）；
 // 刚收到回报 → 0（新鲜）。两者都不该让 uplink_stale 误触发。
 func TestRefreshStalenessGaugesUplinkFreshAndNeverReported(t *testing.T) {
-	c := trading.NewController(nil, nil, "u_1", config.QMTConfig{Enabled: true}, nil)
+	c := newPinnedController(nil, nil, "u_1", config.QMTConfig{Enabled: true}, nil)
 	e := &Engine{}
 	e.mu.Lock()
 	e.qmtCtrl = c

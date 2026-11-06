@@ -16,6 +16,8 @@
 // state survives rounds and is pruned when flat, and "off" stays completely silent.
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"path/filepath"
 	"testing"
@@ -39,7 +41,7 @@ func shadowTestEnv(t *testing.T, mode string) *Engine {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.SellUnifiedMode = mode
-	ctrl := trading.NewController(trading.NoopExecutor{}, realDB, "u_1", cfg, nil)
+	ctrl := newPinnedController(trading.NoopExecutor{}, realDB, "u_1", cfg, nil)
 	e := &Engine{}
 	e.SetQMT(ctrl, realDB)
 	return e

@@ -13,6 +13,8 @@
 //	③ 例行撤单跳过 ext: 手动单那条既有语义没被本批改动（见 controller.go 里两条判据并列）。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 	"time"
@@ -58,7 +60,7 @@ func TestHaltAllSkipsSubscriptionCancelsAllReal(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.SubscriptionCancelGuard = true
-	ctrl := NewController(exec, db, "u_sgh", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sgh", cfg, nil)
 	seedSubGuard(t, db, "u_sgh")
 
 	res := ctrl.HaltAll()
@@ -84,7 +86,7 @@ func TestHaltAllEqualsLegacyWhenGuardOff(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	// 显式不开护栏
-	ctrl := NewController(exec, db, "u_sgo", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sgo", cfg, nil)
 	seedSubGuard(t, db, "u_sgo")
 
 	res := ctrl.HaltAll()
@@ -104,7 +106,7 @@ func TestHaltAllCancelsUnknownSignalIdPrefix(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.SubscriptionCancelGuard = true
-	ctrl := NewController(exec, db, "u_sgk", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sgk", cfg, nil)
 	if _, err := db.UpsertRealOrder(store.RealOrder{
 		OrderID: "GW-UNK-1", SignalID: "zz:some-future-prefix", Code: "002961.SZ", Side: SideBuy,
 		Status: "已报", Price: 0, Qty: 0, CreatedAt: time.Now().Format(time.RFC3339), UserID: "u_sgk",
@@ -128,7 +130,7 @@ func TestSweepSubscriptionSkippedCounted(t *testing.T) {
 	cfg.CloseSweepAt = 1452
 	cfg.SubscriptionCancelGuard = true
 	exec := &countingExec{}
-	ctrl := NewController(exec, db, "u_sgs", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_sgs", cfg, nil)
 	now := bjAt(10, 30)
 	ctrl.SetNow(func() time.Time { return now })
 

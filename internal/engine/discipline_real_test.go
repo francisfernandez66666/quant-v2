@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
@@ -26,14 +27,17 @@ import (
 // 满窗放行并清探针；高置信走快车道（30s）。参数取 DefaultQMTConfig().Discipline（5min/30s）。
 // English: dispatchLive confirm window — first probe holds, persistence under the window holds,
 // at-window passes and clears; high-confidence takes the 30s fast lane.
-// liveTestNow 把 dispatchLive 用例的时钟钉到**当日 10:30**（§FIX-20261031，与 qmt_auto_test.go
-// 里 AutoExecuteRealSells* 的手法同源）。缺陷本体：传入的 now 还要再过一遍 §CANCEL-STATE 的禁挂闸
-// （09:20–09:30 / 14:52–15:00 直接拒绝新委托），原先这三条用例用真实 time.Now() ⇒ 每天那两段里
-// 跑全量 go test 必假红（实测 10-31 09:28 三条全红、09:32 全绿，代码一字未改）。
-// 只钉时分、保留当日日期：day-keyed 的幂等键与探针去重口径不受影响。
+// liveTestNow 把 dispatchLive 与 Controller 的时钟统一钉到**当日北京时 10:15**（连续竞价中段，
+// §FIX-20261031 / §五枚老用例固定时刻），是 qmt_auto_test.go 的 newQMTEngine 与三枚 live 用例共用的注入源。
+// 为什么必须固定：Controller.PlaceOrder 的禁挂时段闸吃 c.now()，默认 time.Now() 真实钟；出厂禁挂窗
+// 14:52–15:00（与「到 close_sweep_from 默认 14:52 就撤在途单」是同一条收摊腿）会让 14:52 之后跑的
+// 用例所有「首探针 hold / 满窗放行 / 列名后放行」期望下的单都被真实拒掉 ⇒ 假红，且红的是真在工作的腿、
+// 不是判据错。固定时刻不是放松断言，判的还是同一件事。
+// 只钉时分、保留当日日期（按北京时取）：day-keyed 的幂等键与探针去重口径不受影响。
+// English: pin the clock to 10:15 Beijing so the no-new-order window guard is deterministic.
 func liveTestNow() time.Time {
-	n := time.Now()
-	return time.Date(n.Year(), n.Month(), n.Day(), 10, 30, 0, 0, n.Location())
+	n := time.Now().In(cntime.Loc)
+	return time.Date(n.Year(), n.Month(), n.Day(), 10, 15, 0, 0, cntime.Loc)
 }
 
 func TestDispatchLiveBuyConfirmWindow(t *testing.T) {

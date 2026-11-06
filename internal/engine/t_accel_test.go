@@ -1,5 +1,7 @@
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"math"
 	"os"
@@ -372,7 +374,7 @@ func TestAccelFailureUnwinds(t *testing.T) {
 			if badGateway {
 				// 柜台不可达：连接被拒 ⇒ sellLeg 返回 error（与柜台拒单同一条失败分支）。
 				cfg := f.ctrl.Config()
-				f.ctrl = trading.NewController(
+				f.ctrl = newPinnedController(
 					trading.NewQMTClient("http://127.0.0.1:1", "", 200*time.Millisecond, 0), f.db, "u_1", cfg, nil)
 				f.e.SetQMT(f.ctrl, f.db)
 			}

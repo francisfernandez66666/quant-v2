@@ -4,6 +4,8 @@
 // precheck; sells are exempt from the buy discipline.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"fmt"
 	"strings"
@@ -58,9 +60,21 @@ func buyReq(id string, amount float64) OrderRequest {
 	}
 }
 
+// fixedSessionNow 给本包用例注入 Controller.SetNow 的固定时刻：当日北京时 10:15（连续竞价中段）。
+// 为什么必须固定：Controller.PlaceOrder 的禁挂时段闸吃 c.now()，默认 time.Now() 真实钟；出厂禁挂窗
+// 14:52–15:00（与「到 close_sweep_from 默认 14:52 就撤在途单」是同一条收摊腿）会让 14:52 之后跑的
+// 用例每一笔期望放行的新委托都被真实拒掉 ⇒ 断言全红，且红的是真在工作的腿、不是判据错。
+// 只固定时分、保留当日日期（按北京时取）：day-keyed 幂等键与当日结算口径一字不变；
+// 固定时刻不是放松断言，判的还是原来那件事。
+// English: pin the controller clock to 10:15 Beijing so the time-of-day no-new-order guard is deterministic.
+func fixedSessionNow() time.Time {
+	n := time.Now().In(cntime.Loc)
+	return time.Date(n.Year(), n.Month(), n.Day(), 10, 15, 0, 0, cntime.Loc)
+}
+
 // TestGuardSTRejected §GAP1.6：ST/退市风险股任何路径都拒绝下单。
 func TestGuardSTRejected(t *testing.T) {
-	ctrl := NewController(guardServer(), testDB(t), "u_g", func() config.QMTConfig {
+	ctrl := newPinnedController(guardServer(), testDB(t), "u_g", func() config.QMTConfig {
 		c := config.DefaultQMTConfig()
 		c.Enabled = true
 		return c
@@ -89,7 +103,12 @@ func TestGuardDailyBuysCap(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.DailyMaxBuys = 2
-	ctrl := NewController(guardServer(), db, "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_g", cfg, nil)
+	// §五枚老用例固定时刻：把控制器时钟钉到当日北京时 10:15（见 fixedSessionNow）。
+	// 不固定则 PlaceOrder 走真实钟，14:52 之后落进禁挂窗（收盘收摊腿生效），下面三笔
+	// 「今日 0 成交应放行」的报单会被整批真实拒掉 ⇒ 14:52 后必假红。断言一字未改：
+	// 仍验「报单不占额度、只有成交才占额度」。
+	ctrl.SetNow(fixedSessionNow)
 	// 连续报 3 笔（今日 0 成交）全部放行——旧口径会在第 3 笔拦下。
 	for i := 0; i < 3; i++ {
 		if _, err := ctrl.PlaceOrder(buyReq("SIG-B"+string(rune('A'+i)), 1000)); err != nil {
@@ -120,7 +139,7 @@ func TestGuardDailyBudget(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.DailyBudgetAmount = 1500
-	ctrl := NewController(guardServer(), testDB(t), "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), testDB(t), "u_g", cfg, nil)
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-B1", 1000)); err != nil {
 		t.Fatalf("首笔应放行: %v", err)
 	}
@@ -140,7 +159,7 @@ func TestGuardBudgetFreezeLedger(t *testing.T) {
 	cfg.Enabled = true
 	cfg.DailyBudgetAmount = 1500
 	db := testDB(t)
-	ctrl := NewController(guardServer(), db, "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_g", cfg, nil)
 	// B1 1000 报出 → 在途冻结 1000；B2 600：1000+600 > 1500 → 拒（在途确实占着额度）
 	if _, err := ctrl.PlaceOrder(buyReq("FL-B1", 1000)); err != nil {
 		t.Fatalf("首单应放行: %v", err)
@@ -192,7 +211,7 @@ func TestGuardCashDynamicSell(t *testing.T) {
 	cfg.InitialCapital = 10000
 	cfg.DailyBudgetAmount = 0 // 关预算闸，隔离闸3 行为
 	db := testDB(t)
-	ctrl := NewController(guardServer(), db, "u_cd", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_cd", cfg, nil)
 	now := time.Now().Format("2006-01-02 15:04:05")
 
 	// A1 6000 报出并全额成交 → 持仓成本 6000 落账（fills 与 real_positions 同事务更新）
@@ -232,7 +251,7 @@ func TestGuardCashPrecheck(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.InitialCapital = 10000
-	ctrl := NewController(guardServer(), testDB(t), "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), testDB(t), "u_g", cfg, nil)
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-B1", 9000)); err != nil {
 		t.Fatalf("首笔 9000 ≤ 本金应放行: %v", err)
 	}
@@ -251,7 +270,7 @@ func TestGuardBlacklist(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.Blacklist = []string{"600519.SH", "000001"}
-	ctrl := NewController(guardServer(), testDB(t), "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), testDB(t), "u_g", cfg, nil)
 	for _, code := range []string{"600519", "600519.SH", "000001.SZ"} {
 		_, err := ctrl.PlaceOrder(OrderRequest{SignalID: "BL-" + code, Code: code, Name: "普通名",
 			Side: SideBuy, Price: 10, Qty: 100, Amount: 1000, CreatedAt: time.Now().Format(time.RFC3339)})
@@ -295,7 +314,7 @@ func TestSendFailedRetryAndBudgetExclusion(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.DailyBudgetAmount = 3000 // 预算两笔：幽灵单若被计入（R1 失败 1000 + R2 成功 1000），R3 重试的 1000 会超限被拒
-	ctrl := NewController(stub, db, "u_sf", cfg, nil)
+	ctrl := newPinnedController(stub, db, "u_sf", cfg, nil)
 
 	mk := func(id string) OrderRequest {
 		return OrderRequest{SignalID: id, Code: "600000.SH", Name: "浦发", Strategy: "龙头",
@@ -383,7 +402,7 @@ func TestBusinessRejectDemotesPlaceholder(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.DailyBudgetAmount = 3000 // 三笔 1000：幽灵已报若计入预算（R1 已报+R2 成功），BR1 重试必被拒
-	ctrl := NewController(stub, db, "u_br", cfg, nil)
+	ctrl := newPinnedController(stub, db, "u_br", cfg, nil)
 
 	mk := func(id string) OrderRequest {
 		return OrderRequest{SignalID: id, Code: "600000.SH", Name: "浦发", Strategy: "龙头",
@@ -455,7 +474,7 @@ func TestPlaceOrderSerialized(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.DailyBudgetAmount = 100000
-	ctrl := NewController(stub, testDB(t), "u_ser", cfg, nil)
+	ctrl := newPinnedController(stub, testDB(t), "u_ser", cfg, nil)
 
 	mk := func(id string) OrderRequest {
 		return OrderRequest{SignalID: id, Code: "600000.SH", Name: "浦发", Strategy: "龙头",
@@ -487,7 +506,7 @@ func TestMaxPositionsFilteredByUser(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.MaxPositions = 1
-	ctrl := NewController(guardServer(), db, "u_me", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_me", cfg, nil)
 	// user_other 已持 1 只，但过滤后本账号 0 持仓 → 应放行
 	if _, err := ctrl.PlaceOrder(buyReq("MP-1", 1000)); err != nil {
 		t.Fatalf("他账号持仓不应占用本账号上限名额: %v", err)
@@ -512,7 +531,7 @@ func TestGuardSellExemptsSTAndBlacklist(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.Blacklist = []string{"000001"}
-	ctrl := NewController(g, db, "u_se", cfg, nil)
+	ctrl := newPinnedController(g, db, "u_se", cfg, nil)
 
 	sellReq := func(name, code string) OrderRequest {
 		return OrderRequest{SignalID: "SELL-" + code, Code: code, Name: name, Strategy: "龙头",
@@ -550,7 +569,7 @@ func TestGuardT1SellLocked(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), db, "u_t1", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_t1", cfg, nil)
 
 	// 今日建仓 100 股（fills 记录今日买入）。§CI 2026-09-11：必须按北京时间播种——
 	// 风控闸 g.today() 用 cntime.Loc 判定"当日"，CI 跑在 UTC 上若用 time.Now()
@@ -593,7 +612,7 @@ func TestGuardCashReserve(t *testing.T) {
 	cfg.Enabled = true
 	cfg.InitialCapital = 10000
 	cfg.Money = config.MoneyMgmtConfig{CashReserveRatio: 0.5} // 保留 50%
-	ctrl := NewController(guardServer(), db, "u_res", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_res", cfg, nil)
 
 	// 5000 正好 = 可用 10000 × (1−0.5) → 放行
 	if _, err := ctrl.PlaceOrder(buyReq("RES-B1", 5000)); err != nil {
@@ -619,7 +638,7 @@ func TestGuardLocalFrozen(t *testing.T) {
 	cfg.InitialCapital = 10000
 	f := false
 	cfg.Money = config.MoneyMgmtConfig{TrustBrokerFreeze: &f}
-	ctrl := NewController(guardServer(), db, "u_fr", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_fr", cfg, nil)
 
 	// 首单 6000 放行（占位行已报 6000 进入 orders 表 → 在途冻结 6000）
 	if _, err := ctrl.PlaceOrder(buyReq("FR-B1", 6000)); err != nil {

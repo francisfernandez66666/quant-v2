@@ -66,7 +66,7 @@ import time
 LOG = logging.getLogger("qmt_gateway.local_executor")
 
 # ==== BAKED PARAMS BEGIN ====
-STRATEGY_VERSION = "v03-20261105"
+STRATEGY_VERSION = "v04-20261106"
 PARAMS = {
     'bd_depth_full_pct': 3,
     'bd_depth_max_score': 30,
@@ -121,6 +121,7 @@ PARAMS = {
     'db_second_vol_multiple': 1.5,
     'db_volume_weight': 0.4,
     'db_weak_day_pct': -1.5,
+    'default_allowed_strategies': ['dragon', 'double_bump', 'n_shape', 'dragon_return', 'factor', 'pattern'],
     'default_buy_threshold': 70,
     'default_direction': 1,
     'default_weight': 1,
@@ -226,9 +227,11 @@ PARAMS = {
     'emotion_enabled': True,
     'emotion_phase_labels': {'ice': '\u51b0\u70b9', 'start': '\u542f\u52a8', 'ferment': '\u53d1\u9175', 'climax': '\u9ad8\u6f6e', 'divergence': '\u80cc\u79bb', 'retreat': '\u9000\u6f6e'},
     'emotion_scales': {'ferment': 1, 'start': 1, 'divergence': 0.6, 'retreat': 0.5, 'climax': 0.8},
+    'enabled_strategies': ['dragon', 'n_shape', 'fac_1', 'fac_118', 'fac_117', 'fac_136', 'fac_131', 'fac_137', 'fac_123', 'fac_150', 'fac_153', 'fac_154', 'fac_155', 'fac_157', 'fac_156', 'fac_160'],
     'entry_side': 'buy',
     'factor_defs': {'Mom5': {'kind': 'momentum', 'windows': [5], 'input': 'bars'}, 'Mom10': {'kind': 'momentum', 'windows': [10], 'input': 'bars'}, 'Mom20': {'kind': 'momentum', 'windows': [20], 'input': 'bars'}, 'Mom60': {'kind': 'momentum', 'windows': [60], 'input': 'bars'}, 'Volatility20': {'kind': 'realized_vol', 'windows': [20], 'input': 'bars'}, 'RealizedVol5': {'kind': 'realized_vol', 'windows': [5], 'input': 'bars'}, 'RealizedVol10': {'kind': 'realized_vol', 'windows': [10], 'input': 'bars'}, 'Amplitude20': {'kind': 'amplitude', 'windows': [20], 'input': 'bars'}, 'AtrRatio14': {'kind': 'atr_ratio', 'windows': [14], 'input': 'bars'}, 'HighLow20': {'kind': 'high_low', 'windows': [20], 'input': 'bars'}, 'VolRatio5': {'kind': 'vol_break_ratio', 'windows': [5], 'input': 'bars'}, 'STOA': {'kind': 'log_amount', 'windows': [20], 'input': 'bars'}, 'Amihud20': {'kind': 'amihud', 'windows': [20], 'input': 'bars'}, 'VolSurge5': {'kind': 'vol_surge', 'windows': [20], 'input': 'bars'}, 'VolShrink': {'kind': 'vol_shrink', 'windows': [5, 20], 'input': 'bars'}, 'VMA5': {'kind': 'vol_ma_ratio', 'windows': [5, 20], 'input': 'bars'}, 'VMA10': {'kind': 'vol_ma_ratio', 'windows': [10, 20], 'input': 'bars'}, 'VSTD20': {'kind': 'vol_cv', 'windows': [20], 'input': 'bars'}, 'VMAX10': {'kind': 'vol_peak', 'windows': [10], 'input': 'bars'}, 'VMIN10': {'kind': 'vol_floor', 'windows': [10], 'input': 'bars'}, 'Brk20': {'kind': 'breakout', 'windows': [20], 'input': 'bars'}, 'Brk60': {'kind': 'breakout', 'windows': [60], 'input': 'bars'}, 'Drawdown20': {'kind': 'drawdown', 'windows': [20], 'input': 'bars'}, 'BullAlign': {'kind': 'bull_align', 'windows': [5, 10, 20], 'input': 'bars'}, 'RSI14': {'kind': 'rsi', 'windows': [14], 'input': 'bars'}, 'BBI': {'kind': 'bbi', 'windows': [3, 6, 12, 24], 'input': 'bars'}, 'EMA10_20': {'kind': 'ema_ratio', 'windows': [10, 20], 'input': 'bars'}, 'Alpha1': {'kind': 'alpha1', 'windows': [5, 20], 'input': 'bars'}, 'Alpha4': {'kind': 'alpha4', 'windows': [9], 'input': 'bars'}, 'Alpha12': {'kind': 'alpha12', 'windows': [1], 'input': 'bars'}, 'Alpha101': {'kind': 'alpha101', 'windows': [], 'input': 'bars'}, 'STO20': {'kind': 'turnover_mean', 'windows': [20], 'input': 'turnover_series', 'missing_input': 'per-day turnover rate series'}, 'TurnoverStd20': {'kind': 'turnover_std', 'windows': [20], 'input': 'turnover_series', 'missing_input': 'per-day turnover rate series'}, 'LnMktCap': {'kind': 'ln_mktcap', 'windows': [], 'input': 'total_share_series', 'missing_input': 'total share count series (share capital panel)'}, 'EP_ttm': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'pe_ttm', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'BP': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'pb', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'SP_ttm': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'ps_ttm', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'CFP_ttm': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'pcf_ttm', 'missing_input': 'per-day PE/PB/PS/PCF/dividend panel'}, 'DP': {'kind': 'valuation', 'windows': [], 'input': 'valuation_series', 'field': 'dv_ttm', 'missing_input': 'per-day dividend yield panel'}, 'ROE': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'roe', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'GrossMargin': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'gross_margin', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'NetMargin': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'net_margin', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'DebtToAssets': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'debt_to_assets', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'YoyNetProfit': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'yoy_net_profit', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'SUE': {'kind': 'financial', 'windows': [], 'input': 'fin_pit', 'field': 'single_quarter_ni_yoy', 'direct': True, 'missing_input': 'point-in-time financial report (PIT)'}, 'emo_limit_up': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_up_count', 'direct': True, 'missing_input': 'market limit-up history'}, 'emo_max_board': {'kind': 'scalar_proxy', 'windows': [], 'input': 'ladder_height', 'direct': True, 'missing_input': 'market ladder-height history'}, 'emo_blast_rate': {'kind': 'scalar_proxy', 'windows': [], 'input': 'broken_board_ratio', 'direct': True, 'missing_input': 'market blast-rate history'}, 'emo_blast_cnt': {'kind': 'scalar_proxy', 'windows': [], 'input': 'broken_board_count', 'direct': True, 'missing_input': 'market blast-count history'}, 'emo_chg5': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_up_count_history', 'direct': True, 'missing_input': 'market limit-up history'}, 'lu_board': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_board_count', 'direct': True, 'missing_input': 'per-stock limit-up board history (THS pool)'}, 'lu_board3': {'kind': 'scalar_proxy', 'windows': [], 'input': 'limit_board_count', 'direct': True, 'missing_input': 'per-stock limit-up board history (THS pool)'}, 'lu_seal_strength': {'kind': 'scalar_proxy', 'windows': [], 'input': 'seal_amount_ratio', 'direct': True, 'missing_input': 'seal amount / free-float cap (THS pool)'}, 'lu_early_seal': {'kind': 'scalar_proxy', 'windows': [], 'input': 'first_seal_minute', 'direct': True, 'missing_input': 'first seal minute + break count (THS pool)'}, 'lu_reblast_low': {'kind': 'scalar_proxy', 'windows': [], 'input': 'broken_board_ratio_history', 'direct': True, 'missing_input': 'market blast-rate history (THS pool)'}, 'FlowToday': {'kind': 'scalar_proxy', 'windows': [], 'input': 'flow_today_pct', 'direct': True, 'missing_input': 'eastmoney main-force net inflow, today'}, 'Flow5d': {'kind': 'scalar_proxy', 'windows': [], 'input': 'flow_5d_pct', 'direct': True, 'missing_input': 'eastmoney main-force net inflow, 5 day'}, 'ConceptHeat': {'kind': 'scalar_proxy', 'windows': [], 'input': 'concept_heat', 'direct': True, 'missing_input': 'concept heat ranking (external feed)'}, 'NewsEvent': {'kind': 'scalar_proxy', 'windows': [], 'input': 'news_event', 'direct': True, 'missing_input': 'news agent / LLM event scoring (external)'}, 'IndexChange': {'kind': 'scalar_proxy', 'windows': [], 'input': 'index_change_pct', 'direct': True, 'missing_input': 'index weight / benchmark leg (external)'}, 'IsLeader': {'kind': 'scalar_proxy', 'windows': [], 'input': 'is_leader', 'direct': True, 'missing_input': 'sector leadership ranking (external)'}},
-    'factor_rules': [{'id': 'fac_1', 'name': 'factor_composite', 'factors': ['Mom20', 'VolShrink', 'BullAlign'], 'weights': {'Mom20': 0.4, 'VolShrink': 0.3, 'BullAlign': 0.3}, 'directions': {'Mom20': 1, 'VolShrink': -1, 'BullAlign': 1}, 'buy_threshold': 70.0}],
+    'factor_id_prefix': 'fac_',
+    'factor_rules': [{'factors': ['AtrRatio14', 'Brk60', 'STOA', 'Mom20'], 'weights': {'AtrRatio14': 0.25, 'Brk60': 0.25, 'Mom20': 0.25, 'STOA': 0.25}, 'directions': {'AtrRatio14': -1, 'Brk60': 1, 'Mom20': 1, 'STOA': 1}, 'buy_threshold': 95, 'id': 'fac_1', 'name': 'fac_1'}, {'factors': ['VMIN10', 'VSTD20'], 'weights': {'VMIN10': 0.09116249668631496, 'VSTD20': 0.9088375033136851}, 'directions': {'VMIN10': -1, 'VSTD20': -1}, 'buy_threshold': 70, 'id': 'fac_118', 'name': 'fac_118'}, {'factors': ['VSTD20'], 'weights': {'VSTD20': 1}, 'directions': {'VSTD20': -1}, 'buy_threshold': 70, 'id': 'fac_117', 'name': 'fac_117'}, {'factors': ['VSTD20', 'BBI', 'VolSurge5', 'Mom60', 'TurnoverStd20', 'VMA10', 'VMIN10', 'Mom5'], 'weights': {'BBI': 0.25141725291988254, 'Mom5': 0.08537668192063383, 'Mom60': 0.08537668192063383, 'TurnoverStd20': 0.08537668192063383, 'VMA10': 0.08537668192063383, 'VMIN10': 0.08537668192063383, 'VSTD20': 0.23632265555631443, 'VolSurge5': 0.08537668192063383}, 'directions': {'BBI': -1, 'Mom5': -1, 'Mom60': -1, 'TurnoverStd20': -1, 'VMA10': -1, 'VMIN10': -1, 'VSTD20': -1, 'VolSurge5': -1}, 'buy_threshold': 70, 'id': 'fac_136', 'name': 'fac_136'}, {'factors': ['STOA', 'VSTD20', 'VolSurge5', 'Mom60', 'VMAX10', 'VMIN10'], 'weights': {'Mom60': 0.12983567319796552, 'STOA': 0.11290058538953526, 'VMAX10': 0.15879467335038133, 'VMIN10': 0.03396614111444168, 'VSTD20': 0.2822514634738381, 'VolSurge5': 0.2822514634738381}, 'directions': {'Mom60': -1, 'STOA': -1, 'VMAX10': -1, 'VMIN10': -1, 'VSTD20': -1, 'VolSurge5': -1}, 'buy_threshold': 70, 'id': 'fac_131', 'name': 'fac_131'}, {'factors': ['VSTD20', 'BBI', 'VolSurge5', 'Mom60', 'TurnoverStd20', 'VMA5', 'Brk60', 'VMIN10'], 'weights': {'BBI': 0.389245479614369, 'Brk60': 0.07839915695191352, 'Mom60': 0.07839915695191352, 'TurnoverStd20': 0.07839915695191352, 'VMA5': 0.07839915695191352, 'VMIN10': 0.0025087730224612305, 'VSTD20': 0.2162499626036021, 'VolSurge5': 0.07839915695191352}, 'directions': {'BBI': -1, 'Brk60': -1, 'Mom60': -1, 'TurnoverStd20': -1, 'VMA5': -1, 'VMIN10': -1, 'VSTD20': -1, 'VolSurge5': -1}, 'buy_threshold': 70, 'id': 'fac_137', 'name': 'fac_137'}, {'factors': ['VSTD20', 'STOA', 'VolSurge5', 'DebtToAssets', 'VMIN10', 'VMAX10', 'Mom5', 'TurnoverStd20'], 'weights': {'DebtToAssets': 0.4432234417196832, 'Mom5': 0.06414476477883833, 'STOA': 0.06414476477883833, 'TurnoverStd20': 0.06414476477883833, 'VMAX10': 0.06414476477883833, 'VMIN10': 0.06414476477883833, 'VSTD20': 0.11546057660190902, 'VolSurge5': 0.12059215778421609}, 'directions': {'DebtToAssets': -1, 'Mom5': -1, 'STOA': -1, 'TurnoverStd20': -1, 'VMAX10': -1, 'VMIN10': -1, 'VSTD20': -1, 'VolSurge5': -1}, 'buy_threshold': 70, 'id': 'fac_123', 'name': 'fac_123'}, {'factors': ['VSTD20', 'STOA', 'VolSurge5', 'Mom60', 'TurnoverStd20', 'VMIN10', 'GrossMargin', 'CFP_ttm'], 'weights': {'CFP_ttm': 0.2991346082315521, 'GrossMargin': 0.2095294521008854, 'Mom60': 0.12124008470117403, 'STOA': 0.007775123003495552, 'TurnoverStd20': 0.06479269169579631, 'VMIN10': 0.06479269169579631, 'VSTD20': 0.11662684505243333, 'VolSurge5': 0.11610850351886697}, 'directions': {'CFP_ttm': -1, 'GrossMargin': -1, 'Mom60': -1, 'STOA': -1, 'TurnoverStd20': -1, 'VMIN10': -1, 'VSTD20': -1, 'VolSurge5': -1}, 'buy_threshold': 70, 'id': 'fac_150', 'name': 'fac_150'}, {'factors': ['VMIN10', 'VSTD20', 'VMAX10'], 'weights': {'VMAX10': 0.21664456007890354, 'VMIN10': 0.4421317552630684, 'VSTD20': 0.34122368465802805}, 'directions': {'VMAX10': -1, 'VMIN10': -1, 'VSTD20': -1}, 'buy_threshold': 70, 'id': 'fac_153', 'name': 'fac_153'}, {'factors': ['VSTD20', 'BBI', 'VMIN10', 'Brk60', 'DebtToAssets', 'lu_board3'], 'weights': {'BBI': 0.20965691067779363, 'Brk60': 0.044552093519031125, 'DebtToAssets': 0, 'VMIN10': 0.13103556917362102, 'VSTD20': 0.13103556917362102, 'lu_board3': 0.4837198574559332}, 'directions': {'BBI': -1, 'Brk60': -1, 'DebtToAssets': -1, 'VMIN10': -1, 'VSTD20': -1, 'lu_board3': -1}, 'buy_threshold': 70, 'id': 'fac_154', 'name': 'fac_154'}, {'factors': ['VSTD20', 'BBI', 'VMIN10', 'DebtToAssets'], 'weights': {'BBI': 0.3535353535353535, 'DebtToAssets': 0.25252525252525254, 'VMIN10': 0.1414141414141414, 'VSTD20': 0.25252525252525254}, 'directions': {'BBI': -1, 'DebtToAssets': -1, 'VMIN10': -1, 'VSTD20': -1}, 'buy_threshold': 70, 'id': 'fac_155', 'name': 'fac_155'}, {'factors': ['VSTD20', 'BBI', 'VMIN10'], 'weights': {'BBI': 0.4888276706458524, 'VMIN10': 0.2050811141720232, 'VSTD20': 0.30609121518212423}, 'directions': {'BBI': -1, 'VMIN10': -1, 'VSTD20': -1}, 'buy_threshold': 70, 'id': 'fac_157', 'name': 'fac_157'}, {'factors': ['VSTD20', 'BBI', 'VMIN10', 'lu_board3'], 'weights': {'BBI': 0.31660088350205146, 'VMIN10': 0.09658776136475745, 'VSTD20': 0.17247814529420977, 'lu_board3': 0.41433320983898125}, 'directions': {'BBI': -1, 'VMIN10': -1, 'VSTD20': -1, 'lu_board3': -1}, 'buy_threshold': 70, 'id': 'fac_156', 'name': 'fac_156'}, {'factors': ['VSTD20', 'BBI', 'Brk60', 'lu_board3'], 'weights': {'BBI': 0.1425439217307519, 'Brk60': 0.5729384104946673, 'VSTD20': 0.0855263530384511, 'lu_board3': 0.1989913147361296}, 'directions': {'BBI': -1, 'Brk60': -1, 'VSTD20': -1, 'lu_board3': -1}, 'buy_threshold': 70, 'id': 'fac_160', 'name': 'fac_160'}],
     'factor_thresholds': {},
     'financial_bands': {'BP': {'scale': 1}, 'CFP_ttm': {'scale': 1}, 'DP': {'scale': 5}, 'DebtToAssets': {'offset': 100, 'scale': 100}, 'EP_ttm': {'scale': 1}, 'GrossMargin': {'scale': 40}, 'NetMargin': {'scale': 20}, 'ROE': {'scale': 20}, 'SP_ttm': {'scale': 1}, 'SUE': {'scale': 30}, 'YoyNetProfit': {'scale': 30}},
     'flow_5d_scales': {'mild_in': 1.05, 'mild_out': 0.85, 'neutral': 1, 'strong_in': 1.1, 'strong_out': 0.7},
@@ -367,6 +370,7 @@ PARAMS = {
     'non_trading_weekdays': [5, 6],
     'ops_window_sec': 60,
     'order_amount_cap': 20000.0,
+    'pattern_id_prefix': 'pat_',
     'pattern_rules': [{'id': 'pat_1', 'name': 'pattern_template', 'conds': [{'factor': 'Drawdown20', 'min': 0.0, 'max': 0.3}, {'factor': 'VolShrink', 'min': 0.0, 'max': 1.0}, {'factor': 'BullAlign', 'min': 0.5, 'max': 2.0}]}],
     'pct_scale': 100,
     'per_trade_default_hi': 0.3,
@@ -401,6 +405,7 @@ PARAMS = {
     'state_scales': {'bear': 0.4, 'bull': 1, 'range': 0.7},
     'stop_loss_ratio': 0.97,
     'stoploss_guard_count': 4,
+    'strategy_kind_to_go': {'dragon': 'dragon', 'double_bump': 'double_bump', 'dragon_return': 'dragon_return'},
     'symbol_head_len': 6,
     'symbols': ['600000.SH', '000001.SZ'],
     't_anchor_ok_sources': ['first_buy_order', 'first_lot'],
@@ -467,6 +472,7 @@ PARAMS = {
     'take_profit_ratio': 1.05,
     'tier_red_default': 0.3,
     'tier_scales': {'Red': 0.3, 'Yellow': 0.6},
+    'unmapped_strategies': ['n_shape'],
     'vol20_window': 20,
     'vol5_window': 5,
     'vol_clamp': [0.5, 1.5],
@@ -1058,6 +1064,32 @@ def rule_reprice_worth_cancelling(params, dev, threshold):
 def rule_is_strategic_buy(params, kind):
     """Only strategic buys are ours to cancel; T legs and manual orders are not."""
     return kind in (params.get("buy_signals") or [])
+
+
+def rule_strategy_admit(params, go_id):
+    """The live-trading tab's strategy switch, mirrored from Go signalctl.admit.
+
+    STRATEGY-SWITCH-SYNC (2026-11-06, owner): the enabled-rule set is the tab's
+    whitelist, never a second list invented by the carrier. Two branches, both
+    word-for-word the Go semantics:
+      * empty whitelist = legacy "all known built-ins": form strategies plus
+        fac_/pat_ library rules; momentum and unknown keys must be named;
+      * non-empty whitelist = explicit membership only.
+    An unrecognisable source key is refused in BOTH branches -- a rule nobody
+    can attribute must never become a live order.
+    """
+    allow = params["enabled_strategies"]
+    if not go_id:
+        return False
+    if not allow:
+        if go_id in params["default_allowed_strategies"]:
+            return True
+        if go_id.startswith(params["factor_id_prefix"]):
+            return True
+        if go_id.startswith(params["pattern_id_prefix"]):
+            return True
+        return False
+    return go_id in allow
 # ==== RULE LAYER END ====
 
 
@@ -1974,6 +2006,37 @@ class XtBroker(object):
             return False, "cancel failed: %s" % (exc,)
         return True, "ok"
 
+    def trades_by_order(self):
+        """Today's fills grouped by order id, straight from the counter trade table.
+
+        PARTIAL-FILL-1106 (plan 5.2): the order table's traded_volume is only
+        a counter-maintained copy. The trade table is the truth for how much of
+        a resting order actually filled, which decides how much may be cancelled
+        and how much of the same-key replay is still available. An unreadable
+        table yields an EMPTY mapping (caller falls back to the copy and says so),
+        never a guessed number and never a raised exception that stops the round.
+        """
+        if not self.is_connected():
+            return {}
+        try:
+            raw = self._trader.query_stock_trades(self._acc)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("[broker] query_stock_trades unavailable, using order-table copy: %s", exc)
+            return {}
+        if raw is None:
+            return {}
+        out = {}
+        for item in raw:
+            oid = str(getattr(item, "order_id", "") or "")
+            if not oid:
+                continue
+            qty = getattr(item, "traded_volume", 0) or 0
+            try:
+                out[oid] = out.get(oid, 0.0) + float(qty)
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def orders_today(self):
         """The broker's own same-day order table.
 
@@ -1996,12 +2059,18 @@ class XtBroker(object):
             raise BrokerUnavailable("query_stock_orders returned None")
         rows = []
         codes, terminals = counter_status_vocab()
+        fills = self.trades_by_order()
         for item in raw:
             remark = getattr(item, "order_remark", "") or getattr(item, "remark", "") or ""
             status, terminal = normalize_order_status(
                 getattr(item, "order_status", None), codes, terminals)
+            order_id = str(getattr(item, "order_id", "") or "")
+            # PARTIAL-FILL-1106: prefer the counter TRADE table. A row with no
+            # fill records falls back to the order table's own copy, and the
+            # source is named on the row so a degraded readout is never silent.
+            from_trades = order_id in fills
             rows.append({
-                "order_id": str(getattr(item, "order_id", "") or ""),
+                "order_id": order_id,
                 "symbol": str(getattr(item, "stock_code", "") or ""),
                 "remark": remark,
                 "status": status,
@@ -2010,9 +2079,9 @@ class XtBroker(object):
                 "terminal": terminal,
                 "qty": getattr(item, "order_volume", 0) or 0,
                 "price": getattr(item, "price", 0) or 0,
-                # Filled quantity comes from the counter row (traded_volume),
-                # never an in-memory counter: a partial leg cancels its REMAINDER.
-                "traded": getattr(item, "traded_volume", 0) or 0,
+                # Filled quantity: a partial leg cancels its REMAINDER only.
+                "traded": fills.get(order_id, getattr(item, "traded_volume", 0) or 0),
+                "traded_source": "trade_table" if from_trades else "order_table_copy",
                 # Placement time (epoch seconds): the stale-cancel baseline.
                 "order_time": getattr(item, "order_time", None),
             })
@@ -2263,7 +2332,21 @@ class Executor(object):
                 continue
             if not signal:
                 continue
-            out.append((signal, rule_arm_mode(self.params, kind)))
+            mode = rule_arm_mode(self.params, kind)
+            # STRATEGY-SWITCH-SYNC: the live whitelist is the live-trading tab's switch
+            # list, derived from the captured snapshot. A library rule carries its
+            # own rule_id (fac_*), form rules map by kind. Without a tab-owned id
+            # a rule may keep observing in shadow but must never place an order:
+            # an unattributed live path is exactly how a switch gets bypassed.
+            go_id = signal.get("rule_id") or (
+                self.params.get("strategy_kind_to_go") or {}).get(
+                    signal.get("kind") or kind, "")
+            if go_id:
+                if not rule_strategy_admit(self.params, go_id):
+                    mode = "switch_off"
+            elif mode == "live":
+                mode = "switch_off"
+            out.append((signal, mode))
         return out
 
     def decide(self, ctx):
@@ -2352,6 +2435,13 @@ class Executor(object):
                     if judgement:
                         entry["judgement"] = judgement
                     summary["shadow"].append(entry)
+                    continue
+                if mode == "switch_off":
+                    # Named reason, not folded into rule_not_armed: tomorrow the
+                    # operator needs to know whether to look at rule_arm or at the
+                    # live-trading tab switch. Folding them hides a turned-off strategy.
+                    summary["skipped"].append({"short_code": signal["short_code"],
+                                               "reason": "strategy_switch_off"})
                     continue
                 if mode != "live":
                     summary["skipped"].append({"short_code": signal["short_code"],

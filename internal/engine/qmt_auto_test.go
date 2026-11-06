@@ -4,6 +4,8 @@
 // (qty from fixed_amount as whole lots, code exchange suffix, strategy whitelist / tripped / manual-skip).
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"bytes"
 	"encoding/json"
@@ -90,16 +92,18 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 		mutate(&cfg)
 	}
 	exec := trading.NewQMTClient(srv.URL, "", 2*time.Second, 0)
-	ctrl := trading.NewController(exec, db, "u_1", cfg, nil)
-	// §FIX-20261028-F15⑩（2026-10-29）：**把时钟钉到非窗口时刻（当日 10:30）**。
-	// 缺陷本体：这些自动卖出用例走真实 time.Now()，而 §CANCEL-STATE 的时段闸会在
-	// 09:20–09:30 / 14:52–15:00 直接拒绝新委托 ⇒ 每天这两个窗口内跑全量 go test 必假红
-	// （实测 09:28 四条 AutoExecuteRealSells* 全红、09:32 全绿，代码未改）。
-	// 只固定时分、保留当日日期：day-keyed 的幂等键与结算口径不受影响。
-	_now := time.Now()
-	_fixed := time.Date(_now.Year(), _now.Month(), _now.Day(), 10, 30, 0, 0, _now.Location())
-	ctrl.SetNow(func() time.Time { return _fixed })
-	e := &Engine{}
+	ctrl := newPinnedController(exec, db, "u_1", cfg, nil)
+	// §FIX-20261028-F15⑩ / §五枚老用例固定时刻：**把控制器时钟钉到当日北京时 10:15**（非窗口时刻）。
+	// 缺陷本体：PlaceOrder 的 §CANCEL-STATE 禁挂时段闸吃 c.now()，默认真实 time.Now()；禁挂窗
+	// 09:15–09:30 / 14:52–15:00（后者与「到 close_sweep_from 默认 14:52 就撤在途单」同一条收摊腿）
+	// 会直接拒绝新委托 ⇒ 14:52 之后跑这批用例，所有「应下单」断言必假红，红的是真在工作的腿、不是判据错。
+	// 统一走 liveTestNow（见 discipline_real_test.go）：只钉时分、保留当日日期，day-keyed 幂等键与
+	// 结算口径不受影响；固定时刻不是放松断言。
+	ctrl.SetNow(liveTestNow)
+	// §SESSION-WINDOW：引擎统一时钟也钉到当日北京时 10:15（见 testclock_test.go 的 newPinnedEngine）。
+	// 不固定会在 09:15–09:30 与 14:52 后假红：autoPlaceScaled 的禁挂闸吃 e.nowTime()，
+	// 与上面 ctrl.SetNow 钉的 c.now() 是两套时钟，缺一不可。
+	e := newPinnedEngine()
 	e.SetQMT(ctrl, db)
 	// §DYN-GLOBAL（2026-10-24 owner 裁决一）把出厂默认抬成 dynamic 之后，本 harness 必须显式
 	// 钉住**账号级 legacy 退路**：这里测的是固定金额/笔数/幂等/封板这些旧预算腿，而 dynamic 要求
@@ -232,7 +236,8 @@ func TestAutoPlaceIdempotencyKeyC6Unified(t *testing.T) {
 // 动量（momentum）即使在"全部开启"（空白名单）下也不放行，必须显式列名（09-17 事故回归）。
 // English: whitelist adjudication now lives in the controller; autoPlace stays pure execution.
 func TestDispatchLiveSkipsWhitelist(t *testing.T) {
-	// §FIX-20261031：本用例的 now 同样要过禁挂闸，钉到当日 10:30（见 discipline_real_test.go 的 liveTestNow）
+	// §FIX-20261031 / §五枚老用例固定时刻：now 走 liveTestNow 钉到当日北京时 10:15；不固定则
+	// 14:52 之后禁挂窗（收盘收摊腿）会把应放行的单真实拒掉 ⇒ 假红。断言一字未改。
 	now := liveTestNow()
 	live := map[string]*data.StockInfo{"000001": {Code: "000001", Price: 10}, "000002": {Code: "000002", Price: 10}}
 	dragon := combat_agent.Signal{ID: "S1", Code: "000001", Name: "平安", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}

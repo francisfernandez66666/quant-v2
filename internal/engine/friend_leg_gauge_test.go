@@ -11,6 +11,8 @@
 // 本批同时是一条 equals-legacy 锁：裸引擎（没有控制器 / 没有远端腿）喂出来的必须是 0。
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"os"
 	"strings"
@@ -20,7 +22,6 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
-	"quant-trading-v2/internal/trading"
 )
 
 // TestFriendLegGaugeRuleKeyAligned 规则读的键名必须与写端逐字相同（打错＝又一条死规则）。
@@ -52,7 +53,7 @@ func TestRefreshStalenessFeedsFriendLegGauge(t *testing.T) {
 	}
 
 	// ② 本机腿（没配 remote_leg 的实盘控制器）：即便探测没成功也仍是 0 —— equals-legacy 的读数面。
-	local := trading.NewController(nil, nil, "u_local", config.QMTConfig{Enabled: true, GatewayURL: "http://127.0.0.1:1"}, nil)
+	local := newPinnedController(nil, nil, "u_local", config.QMTConfig{Enabled: true, GatewayURL: "http://127.0.0.1:1"}, nil)
 	e.mu.Lock()
 	e.qmtCtrl = local
 	e.mu.Unlock()
@@ -62,7 +63,7 @@ func TestRefreshStalenessFeedsFriendLegGauge(t *testing.T) {
 	}
 
 	// ③ 远端腿且从未探到成功（现网"键按下但链路不通"的第一形态）：盘中读 2、非盘中读 0。
-	remote := trading.NewController(nil, nil, "u_remote",
+	remote := newPinnedController(nil, nil, "u_remote",
 		config.QMTConfig{Enabled: true, GatewayURL: "http://127.0.0.1:1", RemoteLeg: true}, nil)
 	e.mu.Lock()
 	e.qmtCtrl = remote
@@ -99,7 +100,7 @@ func TestWorstFriendLegStateIsMaxAcrossAccounts(t *testing.T) {
 	mk := func(uid string, cfg config.QMTConfig) *Engine {
 		e := &Engine{}
 		e.mu.Lock()
-		e.qmtCtrl = trading.NewController(nil, nil, uid, cfg, nil)
+		e.qmtCtrl = newPinnedController(nil, nil, uid, cfg, nil)
 		e.mu.Unlock()
 		return e
 	}

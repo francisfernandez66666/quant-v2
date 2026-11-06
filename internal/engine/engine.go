@@ -1668,6 +1668,10 @@ type dynBuyReadout struct {
 	// MissingKeyDims §INDEX-BLIND：这一笔定权时缺的到底是哪几维（进决策快照的 reason）。
 	MissingKeyDims []string
 	CashStale      bool
+	// §MANUAL-BOOK-FALLBACK（11-06）：本轮账户维度读数来自柜台还是 owner 手动维护的实盘。
+	// 只作展示/排障标注，不参与任何硬闸；空值＝今天的柜台口径，前端按"字段存在才显示"兼容。
+	Source string
+	AsOf   string
 	// PendingNote §P1-1（2026-10-30）在途买单占用的一句话摘要（空=无在途）。
 	// 事故当天「受限项=target」看不出是谁占的，这条把代码/数量/状态点出来。
 	PendingNote string
@@ -1688,12 +1692,21 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		out.SkipReason = "账本/账号/行情未就绪"
 		return 0, out
 	}
-	// 基数优先用券商 total_asset（与方案一致）；缺失才回落账本合计。
+	// §MANUAL-BOOK-FALLBACK：账户维度读数统一走单一 resolver。桥新鲜时它就是原来的
+	// cashAccount/RealPositionsForUser（今天行为逐字不变）；桥断了且 owner 维护了手动实盘，
+	// 才改用那份——只在内存里当计算输入，绝不写回 real_*。
+	acctBook := e.accountBookFor(uid)
+	out.Source = acctBook.Source
+	out.AsOf = acctBook.AsOf
+	// 基数优先用 total_asset；手动账没填总资产时不许拿柜台账本合计去补，
+	// 否则两本账会混成一份看似精确的基数。
 	total := 0.0
-	if acc, err := e.cashAccount(uid); err == nil && acc.TotalAsset > 0 {
-		total = acc.TotalAsset
-	} else if v := e.totalAssetsFor(uid); v > 0 {
-		total = v
+	if acctBook.Account.TotalAsset > 0 {
+		total = acctBook.Account.TotalAsset
+	} else if !acctBook.Manual {
+		if v := e.totalAssetsFor(uid); v > 0 {
+			total = v
+		}
 	}
 	out.Total = total
 	if total <= 0 {
@@ -1704,17 +1717,30 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		out.SkipReason = "总资产不可得"
 		return 0, out
 	}
-	cash, fresh := ctrl.AvailableCash()
-	out.Cash = cash
-	out.CashStale = !fresh
-	if !fresh {
-		log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：可用资金口径不可得", sig.Code)
-		opslog.DayOnce("dynbudget-cash:"+sig.Code, func() {
-			opslog.Logf("quant", "§DYN-SIZE-v3 可用资金不可得，跳过 %s(%s)", sig.Code, sig.Name)
-		})
+	// 手动账是 owner 声称、不是柜台证据：它绝不进 §M12-A「必须新鲜」硬闸。
+	// 所以这里走显式分支——用手动可用资金继续算，但把 CashStale 保持为真、
+	// 读数面带 source/asof，绝不假装券商刚回报过。
+	var cash float64
+	if acctBook.Manual {
+		cash = acctBook.Account.AvailableCash
+		out.Cash = cash
 		out.CashStale = true
-		out.SkipReason = "可用资金口径不可得"
-		return 0, out
+		log.Printf("[qmt] %s §MANUAL-BOOK 动态预算使用手动实盘资金 %.0f（source=manual asof=%s，非柜台读数）",
+			sig.Code, out.Cash, acctBook.AsOf)
+	} else {
+		var fresh bool
+		cash, fresh = ctrl.AvailableCash()
+		out.Cash = cash
+		out.CashStale = !fresh
+		if !fresh {
+			log.Printf("[qmt] %s §DYN-SIZE-v3 动态预算跳过：可用资金口径不可得（且未维护手动实盘）", sig.Code)
+			opslog.DayOnce("dynbudget-cash:"+sig.Code, func() {
+				opslog.Logf("quant", "§DYN-SIZE-v3 可用资金不可得，跳过 %s(%s)", sig.Code, sig.Name)
+			})
+			out.CashStale = true
+			out.SkipReason = "可用资金口径不可得"
+			return 0, out
+		}
 	}
 
 	// 行业/单票额度分母=总资产；上限默认 35%，账号配置为正数时以配置为准。
@@ -1748,11 +1774,13 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		}
 		return strings.TrimSpace(mkt.GetStockIndustry(pureTsCode(code)))
 	}
-	poses, err := st.RealPositionsForUser(uid)
-	if err != nil {
-		log.Printf("[qmt] %s §DYN-TARGET 跳过：持仓读取失败（fail-closed，不把读不到当成空仓）：%v", sig.Code, err)
+	// 持仓同样吃 resolver：桥断时用 owner 维护的手动实盘行，且只读、
+	// 不回填 real_positions。读不到这个事实必须保留（原 fail-closed 分支）。
+	poses := acctBook.Positions
+	if acctBook.PositionsErr != nil {
+		log.Printf("[qmt] %s §DYN-TARGET 跳过：持仓读取失败（fail-closed，不把读不到当成空仓）：%v", sig.Code, acctBook.PositionsErr)
 		opslog.DayOnce("dyntarget-posread:"+sig.Code, func() {
-			opslog.Logf("quant", "§DYN-TARGET 持仓读取失败跳过 %s 原因=%v", sig.Code, err)
+			opslog.Logf("quant", "§DYN-TARGET 持仓读取失败跳过 %s 原因=%v", sig.Code, acctBook.PositionsErr)
 		})
 		out.SkipReason = "持仓读取失败（fail-closed）"
 		return 0, out

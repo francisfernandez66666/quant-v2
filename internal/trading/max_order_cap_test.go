@@ -6,6 +6,8 @@
 // rejects both sides, falls back to qty×price when Amount is unset, and 0 disables.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"strings"
 	"testing"
@@ -19,7 +21,7 @@ func TestMaxOrderAmountCapImmediate(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.RiskGate.MaxOrderAmount = 500
-	ctrl := NewController(guardServer(), testDB(t), "u_cap", cfg, nil)
+	ctrl := newPinnedController(guardServer(), testDB(t), "u_cap", cfg, nil)
 
 	// 超限买单被拒（Amount=1000 > 帽 500）
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-CAP-BUY", 1000)); err == nil || !strings.Contains(err.Error(), "单笔金额超限") {

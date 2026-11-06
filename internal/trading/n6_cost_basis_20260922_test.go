@@ -17,6 +17,8 @@
 // snapshot qty; the drop is counted; downstream ProfitPct keeps its input.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"math"
 	"path/filepath"
@@ -80,7 +82,7 @@ func TestN6ReconcileKeepsFeeInclusiveCost(t *testing.T) {
 	exec := &n6Exec{snapshot: []store.RealPosition{
 		{TsCode: "600000.SH", Name: "浦发", Qty: 200, CostPrice: 10, Amount: 2000}, // 不含费 + 柜台加了 100 股
 	}}
-	ctrl := NewController(exec, db, "u_1", n6Cfg(), nil)
+	ctrl := newPinnedController(exec, db, "u_1", n6Cfg(), nil)
 	if err := ctrl.Reconcile(); err != nil {
 		t.Fatalf("reconcile#1: %v", err)
 	}
@@ -138,7 +140,7 @@ func TestN6ReconcileStillBackfillsMissingLocalCost(t *testing.T) {
 	exec := &n6Exec{snapshot: []store.RealPosition{
 		{TsCode: "301009.SZ", Name: "无本仓", Qty: 300, CostPrice: 12.5, Amount: 3750},
 	}}
-	ctrl := NewController(exec, db, "u_1", n6Cfg(), nil)
+	ctrl := newPinnedController(exec, db, "u_1", n6Cfg(), nil)
 	if err := ctrl.Reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

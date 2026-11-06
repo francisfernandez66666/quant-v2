@@ -24,6 +24,8 @@
 // sends nothing, and an unchanged remainder never re-fires.
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"fmt"
 	"path/filepath"
@@ -104,7 +106,7 @@ func newN3Book(t *testing.T, ticketSID string, ticketQty int) *n3Book {
 func h4EnvWithDB(t *testing.T, exec trading.Executor, realDB *store.DB) *Engine {
 	t.Helper()
 	cfg := n3Cfg()
-	ctrl := trading.NewController(exec, realDB, "u_1", cfg, nil)
+	ctrl := newPinnedController(exec, realDB, "u_1", cfg, nil)
 	e := &Engine{}
 	e.SetQMT(ctrl, realDB)
 	return e

@@ -18,6 +18,8 @@
 // predicate nor the no-sell short circuit can silently degrade.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"path/filepath"
 	"testing"
@@ -112,7 +114,7 @@ func TestRefreshRealizedPnlHeartbeatFeedsGaugePair(t *testing.T) {
 		UserID: "u_hb2g", Fee: 3, StampTax: 1.35}); err != nil {
 		t.Fatalf("seed orphan sell: %v", err)
 	}
-	cBad := NewController(nil, dbBad, "u_hb2g", config.QMTConfig{Enabled: true}, nil)
+	cBad := newPinnedController(nil, dbBad, "u_hb2g", config.QMTConfig{Enabled: true}, nil)
 	cBad.RefreshRealizedPnlHeartbeat(hbNow)
 	if v, ok := metrics.GetGauge("realized_pnl_zero_with_sells"); !ok || v != 1 {
 		t.Fatalf("有卖出且盈亏恒 0 时量规必须写 1，got %d ok=%v", v, ok)
@@ -131,7 +133,7 @@ func TestRefreshRealizedPnlHeartbeatFeedsGaugePair(t *testing.T) {
 		UserID: "u_hb2g", Fee: 4, StampTax: 2.75}); err != nil {
 		t.Fatalf("seed sell: %v", err)
 	}
-	cOK := NewController(nil, dbOK, "u_hb2g", config.QMTConfig{Enabled: true}, nil)
+	cOK := newPinnedController(nil, dbOK, "u_hb2g", config.QMTConfig{Enabled: true}, nil)
 	cOK.RefreshRealizedPnlHeartbeat(hbNow)
 	if v := mustHbGauge(t); v != 0 {
 		t.Fatalf("卖出且盈亏非 0 时必须等值 0（不是「变小」），got %d", v)
@@ -142,14 +144,14 @@ func TestRefreshRealizedPnlHeartbeatFeedsGaugePair(t *testing.T) {
 func TestRefreshRealizedPnlHeartbeatNonLiveDoesNotWrite(t *testing.T) {
 	metrics.SetGauge("realized_pnl_zero_with_sells", 1) // 哨兵：模拟实盘引擎刚报出的可疑读数
 	db := hbSeedDB(t)
-	c := NewController(nil, db, "u_hb2n", config.QMTConfig{Enabled: false}, nil)
+	c := newPinnedController(nil, db, "u_hb2n", config.QMTConfig{Enabled: false}, nil)
 	c.RefreshRealizedPnlHeartbeat(hbNow)
 	if v, _ := metrics.GetGauge("realized_pnl_zero_with_sells"); v != 1 {
 		t.Fatalf("非实盘控制器不得写 0（会掩掉实盘读数），got %d", v)
 	}
 	// 未接账本同样不落笔（观测面缺口不得伪造成"账本健康"或"账本断了"）。
 	metrics.SetGauge("realized_pnl_zero_with_sells", 1)
-	cNoStore := NewController(nil, nil, "u_hb2n", config.QMTConfig{Enabled: true}, nil)
+	cNoStore := newPinnedController(nil, nil, "u_hb2n", config.QMTConfig{Enabled: true}, nil)
 	cNoStore.RefreshRealizedPnlHeartbeat(hbNow)
 	if v, _ := metrics.GetGauge("realized_pnl_zero_with_sells"); v != 1 {
 		t.Fatalf("未接账本时不得改写量规，got %d", v)

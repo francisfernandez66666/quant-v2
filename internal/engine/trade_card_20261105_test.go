@@ -7,6 +7,8 @@
 //     推到消息中心——旧实现在 pushRealAdvice 的空仓分支直接 return，撤单一次都不响。
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"strings"
 	"testing"
@@ -127,7 +129,7 @@ func TestPushTradeLevelWithoutPositions(t *testing.T) {
 			Reason: "委托已受理（≠成交）", At: time.Now(), Day: fixedDay, IntradayT: true},
 	}
 	// ctrl 为非 nil 的空控制器（无持仓、无挂单）；sse 传 nil 只验消息中心那半条链。
-	ctrl := trading.NewController(nil, nil, "u_3", tradingEmptyCfg(), nil)
+	ctrl := newPinnedController(nil, nil, "u_3", tradingEmptyCfg(), nil)
 	e.pushTradeLevelWithoutPositions("u_3", ctrl, nil)
 
 	list := e.msgStore.ListVisible("u_3")
@@ -146,7 +148,7 @@ func TestPushTradeLevelWithoutPositions(t *testing.T) {
 // （撤单快照为空 + 没有回转轮次时不许凭空造消息）。
 func TestPushTradeLevelWithoutPositionsSilentWhenNothing(t *testing.T) {
 	e, _ := tCardFix(t)
-	ctrl := trading.NewController(nil, nil, "u_4", tradingEmptyCfg(), nil)
+	ctrl := newPinnedController(nil, nil, "u_4", tradingEmptyCfg(), nil)
 	e.pushTradeLevelWithoutPositions("u_4", ctrl, nil)
 	if n := len(e.msgStore.ListVisible("u_4")); n != 0 {
 		t.Fatalf("没发生过任何交易级动作就不该落库, got %d", n)

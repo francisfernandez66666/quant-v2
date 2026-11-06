@@ -1,6 +1,8 @@
 // 持仓处理分析层测试（AUTO_TRADING_PLAN M1）：加仓/格局判定、卖出侧映射、熔断、幂等下单。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"context"
 	"net/http"
@@ -132,7 +134,11 @@ func TestControllerTripAndIdempotent(t *testing.T) {
 	cfg.MissHeartbeatSec = 2
 
 	exec := NewQMTClient(srv.URL, "", 2*time.Second, 0)
-	ctrl := NewController(exec, db, "u_1", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_1", cfg, nil)
+	// §五枚老用例固定时刻：控制器时钟钉到当日北京时 10:15（fixedSessionNow 见 guards_test.go）。
+	// 不固定则 PlaceOrder 默认吃真实钟，14:52 之后撞禁挂窗（收盘收摊腿生效），首笔「正常下单」
+	// 就被真实拒掉 ⇒ 全例假红。断言一字未改：熔断与 signal_id 幂等照验，不是放松判据。
+	ctrl.SetNow(fixedSessionNow)
 
 	// 正常下单
 	res, err := ctrl.PlaceOrder(OrderRequest{

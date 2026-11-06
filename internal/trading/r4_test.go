@@ -3,6 +3,8 @@
 // 券商口径真实资金回灌买入纪律（R4-3）。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"strings"
 	"testing"
@@ -18,7 +20,7 @@ import (
 func TestKillSwitchRejectsAllOrders(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), testDB(t), "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), testDB(t), "u_g", cfg, nil)
 
 	// 未置位：正常放行
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-HALT-OFF", 1000)); err != nil {
@@ -93,7 +95,7 @@ func TestSweepOrdersStaleCancel(t *testing.T) {
 	cfg.Enabled = true
 	cfg.CancelStaleSec = 120
 	cfg.CloseSweepAt = -1 // 隔离收盘清单，单测只验超时撤
-	ctrl := NewController(guardServer(), db, "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_g", cfg, nil)
 
 	old := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
 	fresh := time.Now().Format(time.RFC3339)
@@ -142,7 +144,7 @@ func TestRealCashGate(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), db, "u_g", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_g", cfg, nil)
 
 	// 新鲜回报：可用 500 元。§CI 2026-09-11：账户新鲜度按 cntime.Loc（北京）判定，
 	// 播种须与之一致，否则 CI（UTC）上 8h 偏移被误判"陈旧"→保守折算50% 误拒（曾偶发 FAIL）。
@@ -173,7 +175,7 @@ func TestCancelPathMonotonic(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(guardServer(), db, "u_cancel", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_cancel", cfg, nil)
 
 	// seed 按给定状态往订单表塞一条本地订单（同代码同方向，只差 order_id/signal_id），
 	// 下面用"已成/已撤/已报"三条分别覆盖终态与非终态两种落库路径。
@@ -234,7 +236,7 @@ func TestSweepOrdersStaleBuyUnconditional(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = false // 主循环整体早退：本例恰好验证 C1b 本地清扫不受早退影响
-	ctrl := NewController(guardServer(), db, "u_c1b", cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, "u_c1b", cfg, nil)
 
 	// 播种按北京时区取日期前缀，与 beforeDay 的 cntime 口径一致——
 	// CI(UTC) 机器在 16:00~24:00 窗口自然日与北京日不同，用裸 time.Now 会误伤当日单。

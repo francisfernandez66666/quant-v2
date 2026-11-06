@@ -2,8 +2,9 @@
 // 桥 11-05 断后柜台不再上报持仓与资金（AGENTS「通道前提变更」），这张面板就是"手敲进去的那本账"。
 //
 // 三条渲染上的硬要求（都在这里，不在页面别处）：
-//   1. 每次读数都必须带「手动维护，更新于 <asof>」——这本账一旦长得像柜台回报，
-//      就会有人拿它当"刚核对过的持仓"去下真单；
+//   1. 每次读数都必须带「手动维护，更新于 <asof>」以及「非柜台实时读数」，且用醒目的
+//      warning 身份条与桥回报卡片分开——这本账一旦长得像柜台回报，就会有人拿它当证据去下真单；
+//      （文案取自 utils/manualSource.js，信号卡/推送共用，勿在本文件另抄一份）
 //   2. 提交是**全量**语义：清空某只票 = 删掉那一行，而不是把数量填 0；
 //      面板上把这句话写在按钮旁边，因为"填 0"是所有人的第一反应；
 //   3. 只改资金时**不带 positions 键**（带了就是全量替换，空数组＝清仓）——
@@ -11,6 +12,9 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Button, Card, Input, MessagePlugin, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
+// §2.12 来源标注文案（「手动维护，更新于 <asof>」「非柜台实时读数」）全站唯一源：
+// 面板与买卖信号卡/推送共用同一串，避免两处各抄一份、漂一个字后有一处长得像桥回报。
+import { manualSourceMain, MANUAL_SOURCE_NONREALTIME } from '../utils/manualSource.js'
 
 // emptyRow 新增一行的初值
 function emptyRow() { return { ts_code: '', name: '', qty: '', cost_price: '' } }
@@ -114,17 +118,32 @@ export default function ManualBookPanel({ manual, onChanged }) {
   }
 
   const note = (result && result.note) || (manual && manual.note) || ''
+  // §2.12 来源身份条的主句：优先用 manual.asof 现场拼「手动维护，更新于 <asof>」，
+  // 不靠后端 note 整句——note 是给用户读的说明，随时可能改写措辞，不能当结构字段依赖。
+  // asof 缺位时退回 note（旧后端只给了拼好的整句），再缺就只留「手动维护」半句，绝不伪造时刻。
+  const asofText = (manual && manual.asof) ? String(manual.asof) : ''
+  const sourceMain = asofText ? manualSourceMain(asofText) : (note || manualSourceMain(''))
   return (
     // data-testid 挂在**内层 div** 上：Arco 的 Card 不透传未知属性到 DOM，
     // 挂在 Card 上时测试与自动化都抓不到这块面板（11-04 实测：面板渲染出来了，
     // getByTestId 却报缺失——一个只会红在测试里的假缺失）。
     <Card title="手动维护账（桥断后的账户输入）" headerBordered>
       <div data-testid="manual-book-panel">
-      {/* 来源标注：这一行是本面板存在的第一理由——没有它，下面的数字就长得像柜台回报 */}
-      <div style={{ marginBottom: 10 }}>
-        {note
-          ? <Tag theme="warning" variant="light-outline" data-testid="manual-book-note">{note}</Tag>
-          : <Tag variant="light-outline" data-testid="manual-book-note">尚未维护手动账（当前读数仍来自柜台回报）</Tag>}
+      {/* 来源身份条（§2.12 硬边界，本面板存在的第一理由）：
+          ①「手动维护，更新于 <asof>」②「非柜台实时读数」两条必须常驻、原样上屏。
+          刻意用 warning 底色 + 独立边框 + 整块 testid，与实盘桥回报卡片（默认白底表格）
+          视觉上彻底分开——手敲的数一旦长得像柜台回报，就会有人拿它当证据去下真单。 */}
+      <div data-testid="manual-book-source" style={{
+        display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+        marginBottom: 10, padding: '8px 10px', borderRadius: 6,
+        background: '#fffbe6', border: '1px solid #ffe58f',
+      }}>
+        <Tag theme="warning" variant="light-outline" data-testid="manual-book-note">{sourceMain}</Tag>
+        <Tag theme="warning" variant="light-outline" data-testid="manual-book-nonrealtime">{MANUAL_SOURCE_NONREALTIME}</Tag>
+        {/* 还没维护时补一句口径，别让一张空表单看起来像"已经有账" */}
+        {!note && !asofText && (
+          <span style={{ fontSize: 12, color: '#ad6800' }}>尚未维护手动账（当前读数仍来自柜台回报）</span>
+        )}
       </div>
       <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>
         全量清单语义：清掉某只票请**删除那一行**；把数量填 0 会被拒（0 股不是持仓，也不是清仓指令）。

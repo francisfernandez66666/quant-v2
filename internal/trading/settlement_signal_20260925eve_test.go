@@ -10,6 +10,8 @@
 // passthrough and the distinguishable unattributed marker.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"net/http"
 	"net/http/httptest"
@@ -36,7 +38,7 @@ func TestSettleSyncFillsKeepsRealSignalID(t *testing.T) {
 				Serial: "SER-B", TradedAt: "14:00:00"},
 		},
 	}}}
-	ctrl := NewController(src, db, "u_st", cfg, nil)
+	ctrl := newPinnedController(src, db, "u_st", cfg, nil)
 	if _, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills); err != nil {
 		t.Fatalf("settle: %v", err)
 	}

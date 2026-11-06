@@ -14,6 +14,8 @@
 // anti-masking discipline), and equality locks on the registered rule.
 package engine
 
+// §SESSION-WINDOW：本文件测试夹具统一注入固定时钟（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 	"time"
@@ -23,7 +25,6 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
-	"quant-trading-v2/internal/trading"
 )
 
 // hbAnchor/hbLater 两个稳定时刻：2026-09-29（周二，交易日）盘中 10:00 建锚、10:31 再走一轮。
@@ -100,7 +101,7 @@ func hbEngineWithLive(t *testing.T, enabled bool, pinned int) *Engine {
 	t.Helper()
 	e := &Engine{}
 	e.mu.Lock()
-	e.qmtCtrl = trading.NewController(nil, nil, "u_hb", config.QMTConfig{Enabled: enabled}, nil)
+	e.qmtCtrl = newPinnedController(nil, nil, "u_hb", config.QMTConfig{Enabled: enabled}, nil)
 	if pinned > 0 {
 		byKey := map[string]combat_agent.Signal{}
 		for i := 0; i < pinned; i++ {

@@ -5,6 +5,8 @@
 // ② 探测周期恒为 miss/2，相邻失败间隔永远 < miss → 真断线反而永不熔断。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 	"time"
@@ -25,7 +27,7 @@ func TestBreakerFailRunStart(t *testing.T) {
 	cfg.GatewayURL = "http://127.0.0.1:1" // executor 全部桩替换，不会真发请求
 	cfg.MissHeartbeatSec = 2
 
-	newCtrl := func() *Controller { return NewController(healthyStub{}, db, "u_1", cfg, nil) }
+	newCtrl := func() *Controller { return newPinnedController(healthyStub{}, db, "u_1", cfg, nil) }
 	// probe 注入本轮探测：解锁节流（lastHealthAt 清零）→ 换 executor → 跑一次 HealthCheck。
 	probe := func(c *Controller, exec Executor) {
 		c.mu.Lock()

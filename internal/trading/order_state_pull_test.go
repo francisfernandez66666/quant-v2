@@ -6,6 +6,8 @@
 //  3. 终态拒单后置重发禁令：同 signal_id 再下单不再打网关。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"encoding/json"
 	"fmt"
@@ -77,7 +79,7 @@ func TestReconcileOrderStatesAppliesTerminalOnly(t *testing.T) {
 	cfg.Enabled = true
 	cfg.GatewayURL = srv.URL
 	cfg.Token = "tk"
-	ctrl := NewController(guardServer(), db, uid, cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, uid, cfg, nil)
 
 	ctrl.ReconcileOrderStates(time.Now())
 
@@ -115,7 +117,7 @@ func TestPlaceOrderTerminalRejectionRetiresSignal(t *testing.T) {
 	stub := &terminalStub{guardStub: guardServer()}
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
-	ctrl := NewController(stub, db, uid, cfg, nil)
+	ctrl := newPinnedController(stub, db, uid, cfg, nil)
 
 	sid := "buy:300502:fac_150:20261030"
 	res, err := ctrl.PlaceOrder(buyReq(sid, 1000))
@@ -191,7 +193,7 @@ func TestReconcileMissingOrdersPhase2(t *testing.T) {
 	cfg.Enabled = true
 	cfg.GatewayURL = srv.URL
 	cfg.Token = "tk"
-	ctrl := NewController(guardServer(), db, uid, cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, uid, cfg, nil)
 	if !cfg.OrderStatePullCloseMissingOn() {
 		t.Fatal("阶段二必须默认开（未配置=生效）")
 	}
@@ -216,7 +218,7 @@ func TestReconcileMissingOrdersPhase2Off(t *testing.T) {
 	cfg.GatewayURL = srv.URL
 	cfg.Token = "tk"
 	cfg.OrderStatePullCloseMissing = &off
-	ctrl := NewController(guardServer(), db, uid, cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, uid, cfg, nil)
 	pullSixRounds(ctrl)
 	if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {
 		t.Fatalf("显式关闭后不得动状态, got %q", st)
@@ -243,7 +245,7 @@ func TestReconcileMissingOrdersNeedsTrustedSnapshot(t *testing.T) {
 		cfg.Enabled = true
 		cfg.GatewayURL = srv.URL
 		cfg.Token = "tk"
-		ctrl := NewController(guardServer(), db, uid, cfg, nil)
+		ctrl := newPinnedController(guardServer(), db, uid, cfg, nil)
 		pullSixRounds(ctrl)
 		if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {
 			t.Fatalf("用例 %d（%s）快照不可信时不得判死, got %q", i, tc.name, st)
@@ -266,7 +268,7 @@ func TestReconcileMissingOrdersMassMissingSkips(t *testing.T) {
 	cfg.Enabled = true
 	cfg.GatewayURL = srv.URL
 	cfg.Token = "tk"
-	ctrl := NewController(guardServer(), db, uid, cfg, nil)
+	ctrl := newPinnedController(guardServer(), db, uid, cfg, nil)
 	pullSixRounds(ctrl)
 	for _, sid := range sids {
 		if st, _ := db.RealOrderStatusForUser(uid, sid); st != "撤单中" {

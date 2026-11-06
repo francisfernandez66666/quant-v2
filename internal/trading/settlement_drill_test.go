@@ -14,6 +14,8 @@
 // only, never deleted.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"encoding/json"
 	"net/http"
@@ -61,7 +63,7 @@ func TestSettleSyncFillsDrillRealGateway(t *testing.T) {
 	cfg.GatewayURL = srv.URL
 	cfg.Token = "drill-secret"
 	cli := NewQMTClient(srv.URL, "drill-secret", 5*time.Second, 0)
-	ctrl := NewController(cli, db, "u_drill", cfg, nil)
+	ctrl := newPinnedController(cli, db, "u_drill", cfg, nil)
 
 	// ② sync_fills 补记：缺两笔 → 补记后流水 2 条；卖出无对应持仓（本地空仓卖单）只入流水不动持仓
 	diff, _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills)
@@ -121,7 +123,7 @@ func TestSettleSyncFillsDrillPhantomOnlyFlagged(t *testing.T) {
 	cfg.Enabled = true
 	cfg.GatewayURL = srv.URL
 	cli := NewQMTClient(srv.URL, "drill-secret", 5*time.Second, 0)
-	ctrl := NewController(cli, db, "u_drill", cfg, nil)
+	ctrl := newPinnedController(cli, db, "u_drill", cfg, nil)
 	if err := db.ApplyRealFill(store.RealFill{OrderID: "GHOST-1", Code: "600999.SH", Side: "买入",
 		Price: 10, Qty: 100, Amount: 1000, TradedAt: "2026-09-08 09:40:00",
 		SignalID: "SIG-GHOST", UserID: "u_drill"}); err != nil {

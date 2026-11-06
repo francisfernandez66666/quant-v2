@@ -12,6 +12,8 @@
 //     miss/2 节流打架，并把"观测"变成"依赖"（观测挂了反过来影响下单路径）。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 	"time"
@@ -90,7 +92,7 @@ func TestFriendLegStateDefaultIsLegacyZero(t *testing.T) {
 	}
 
 	exec := &friendLegSpyExec{}
-	c := NewController(exec, db, "u_fl_legacy", friendLegCfg(false, false), nil)
+	c := newPinnedController(exec, db, "u_fl_legacy", friendLegCfg(false, false), nil)
 
 	// 未探测、探测成功、探测失败、已熔断四种内部状态下，非远端腿都必须读 0。
 	if got := c.FriendLegState(); got != 0 {
@@ -162,7 +164,7 @@ func TestFriendLegStateFourStates(t *testing.T) {
 			exec := &friendLegSpyExec{}
 			cfg := friendLegCfg(tc.remoteLeg, tc.halted)
 			cfg.Enabled = tc.enabled
-			c := NewController(exec, db, "u_fl_4s", cfg, nil)
+			c := newPinnedController(exec, db, "u_fl_4s", cfg, nil)
 			if tc.enabled {
 				probeLeg(t, c, exec, tc.reachable)
 			}
@@ -180,7 +182,7 @@ func TestFriendLegStateFourStates(t *testing.T) {
 func TestFriendLegStateTrippedCountsUnreachable(t *testing.T) {
 	db := testDB(t)
 	exec := &friendLegSpyExec{}
-	c := NewController(exec, db, "u_fl_trip", friendLegCfg(true, false), nil)
+	c := newPinnedController(exec, db, "u_fl_trip", friendLegCfg(true, false), nil)
 	probeLeg(t, c, exec, true)
 	if c.FriendLegState() != 1 {
 		t.Fatalf("前置条件：探测成功后应读 1，got %d", c.FriendLegState())
@@ -216,7 +218,7 @@ func TestFriendLegStateTrippedCountsUnreachable(t *testing.T) {
 func TestFriendLegStateIssuesNoHTTP(t *testing.T) {
 	db := testDB(t)
 	exec := &friendLegSpyExec{}
-	c := NewController(exec, db, "u_fl_nohttp", friendLegCfg(true, false), nil)
+	c := newPinnedController(exec, db, "u_fl_nohttp", friendLegCfg(true, false), nil)
 
 	// 先探一次建立状态（这一次是 HealthCheck 发的，不算在本断言里）。
 	probeLeg(t, c, exec, true)

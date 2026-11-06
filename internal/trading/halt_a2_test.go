@@ -9,6 +9,8 @@
 // success count), keep Failed a JSON-empty array on full success, and maintain the gauge.
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"encoding/json"
 	"errors"
@@ -66,7 +68,7 @@ func TestHaltAllReportsCancelFailures(t *testing.T) {
 	})
 	// GW-A2-2 点名失败：模拟网关拒撤（409 族）
 	exec := haltPickFailExec{failOrderID: "GW-A2-2", failErr: errors.New("gateway 409: 当前状态不可撤")}
-	ctrl := NewController(exec, db, "u_a2", cfg, nil)
+	ctrl := newPinnedController(exec, db, "u_a2", cfg, nil)
 
 	res := ctrl.HaltAll()
 
@@ -117,7 +119,7 @@ func TestHaltAllFullSuccessFailedIsEmptyArray(t *testing.T) {
 		{OrderID: "GW-OK-1", SignalID: "SIG-OK-1", Code: "600000.SH", Side: SideBuy, Status: "已报", Price: 10, Qty: 100, CreatedAt: now},
 		{OrderID: "GW-OK-2", SignalID: "SIG-OK-2", Code: "600000.SH", Side: SideBuy, Status: "部成", Price: 10, Qty: 100, CreatedAt: now},
 	})
-	ctrl := NewController(haltPickFailExec{}, db, "u_a2ok", cfg, nil) // 无点名失败=全部撤成
+	ctrl := newPinnedController(haltPickFailExec{}, db, "u_a2ok", cfg, nil) // 无点名失败=全部撤成
 
 	res := ctrl.HaltAll()
 	if res.Cancelled != 2 {

@@ -8,6 +8,8 @@
 //  4. 消费一次后队列清空 → 再次应用返回 false；停用配置入队后 executor 回退 Noop。
 package trading
 
+// §SESSION-WINDOW：本文件 Controller 构造统一走 newPinnedController（见 testclock_test.go），钉到当日北京时 10:15；不固定会在 09:15–09:30 与 14:52 后假红。
+
 import (
 	"testing"
 
@@ -33,7 +35,7 @@ func (c *Controller) execIsClient() bool {
 
 // 空队列时应用配置变更不产生副作用。
 func TestApplyPendingConfig_EmptyQueueNotApplied(t *testing.T) {
-	c := NewController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
+	c := newPinnedController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
 	if c.ApplyPendingConfig() {
 		t.Fatalf("空队列不应返回 true（会误导考核轮空转）")
 	}
@@ -44,7 +46,7 @@ func TestApplyPendingConfig_EmptyQueueNotApplied(t *testing.T) {
 
 // 待切换未启用时保持 no-op。
 func TestApplyPendingConfig_DisabledStaysNoop(t *testing.T) {
-	c := NewController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
+	c := newPinnedController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
 	c.QueueConfigUpdate(qmtCfg(false, "http://127.0.0.1:8789"))
 	if !c.ApplyPendingConfig() {
 		t.Fatalf("入队后应可应用")
@@ -63,7 +65,7 @@ func TestApplyPendingConfig_DisabledStaysNoop(t *testing.T) {
 // 启用待切换后执行器切到网关客户端。
 func TestApplyPendingConfig_EnableSwitchesToClient(t *testing.T) {
 	// 构建期 disabled + URL 为空 → 固化 Noop（历史"executor 固化 bug"的初始形态）。
-	c := NewController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
+	c := newPinnedController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
 	// 休市时段配置变更：只入队不立即生效。
 	c.QueueConfigUpdate(qmtCfg(true, "http://127.0.0.1:18789"))
 	if c.execIsClient() {
