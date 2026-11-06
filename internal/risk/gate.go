@@ -175,6 +175,181 @@ func (g *Gate) totalAssets() (float64, error) {
 	return g.st.TotalAssetsScoped(g.userID, g.legacyCashGlobal)
 }
 
+// gateBook §MANUAL-BOOK-UNIFY（2026-11-06，owner 裁决 1）：闸的账户维度读数，两维各自选源。
+//
+//	柜台资金回报新鲜（§M12-A 那把 30 分钟尺，真源 store.CashReportFresh）⇒ 逐字今天：
+//	  Cash/Total 都取柜台口径，source=counter，本批对行为零影响。
+//	柜台不新鲜 **且** owner 维护了当日手动账 ⇒ Cash/Total 取手动账，source=manual；
+//	  手动总资产优先取 owner 填的合计，没填则「手动现金 + Σ手动持仓×成本价」——
+//	  成本价口径必须在 reason 里点名（它会让集中度分母偏小或偏大，是已知的近似，不是精确市值）。
+//	两本账都拿不到 ⇒ 原样返回柜台值（可能是零值/陈旧值），调用方走改前的保守分支。
+//
+// 为什么不在这里判"10 分钟"（闸3/闸4 内联那把尺）：那两闸的 10 分钟是**对券商余额的保守折算**，
+// 语义是"这个数可能已经花掉一部分"；手动账没有这个问题（它本来就是人刚敲的），
+// 所以手动腿一律全额、不折算——把两件事折成一把尺会同时改坏两个方向。
+type gateBook struct {
+	Cash        float64
+	CashAt      string
+	CashSource  string // counter | manual | none（none=柜台读不到且没有当日手动账）
+	Total       float64
+	TotalSource string
+	ManualDay   string
+}
+
+// gateBook 把「这一本账现在是谁给的」收成一处（§MANUAL-BOOK-UNIFY 裁决 1）：
+// 柜台资金在 §M12-A 30 分钟窗内就吃柜台；否则仅当当日手动资金可用
+// （asof 属今日、未被柜台接管）才回落手动；读不到一律保持柜台原值、留 CashSource=none，
+// 由上层 fail-closed——静默换成空账会在桥断当天放行买入。
+// English: single source selection for the account book; fresh counter cash wins, a same-day
+// manual book is the fallback, and an unreadable book stays fail-closed instead of faking zero.
+func (g *Gate) gateBook() gateBook {
+	b := gateBook{CashSource: "none", TotalSource: "counter", ManualDay: g.today()}
+	if g.st == nil {
+		return b
+	}
+	acc, err := g.cashAccount()
+	if err == nil {
+		b.Cash = acc.AvailableCash
+		b.CashAt = acc.UpdatedAt
+		if store.CashReportFresh(acc.UpdatedAt, g.now()) {
+			b.CashSource = "counter"
+			if total, terr := g.totalAssets(); terr == nil {
+				b.Total = total
+			}
+			return b
+		}
+	}
+	v, verr := g.st.ManualBookViewFor(g.userID, b.ManualDay)
+	if verr != nil {
+		// 手动账可用性读失败＝旁路故障，不许改变主链读数：两维维持柜台原值（可能已陈旧），
+		// 由 §M12-A 的 fresh 判据自己 fail-close。这里若折成空账或 0 会当场解开买入。
+		// English: a broken manual-book read must not change the main-chain values; stay fail-closed.
+		log.Printf("[risk] §MANUAL-BOOK 手动账读取失败（按不可用处理，保持柜台原值）uid=%s: %v", g.userID, verr)
+		return b
+	}
+	if v.CashUsable {
+		b.Cash = v.Cash.Account.AvailableCash
+		b.CashAt = v.CashAsOf
+		b.CashSource = "manual"
+		total := v.Cash.Account.TotalAsset
+		if total <= 0 {
+			total = b.Cash
+			for _, p := range v.Positions {
+				price := p.CostPrice
+				total += price * float64(p.Qty)
+			}
+		}
+		b.Total = total
+		b.TotalSource = "manual"
+		return b
+	}
+	// 资金维度不可用，但持仓维度可能可用（两维独立）：总资产仍按柜台口径给，
+	// 免得"没录资金"把集中度分母凭空变成 0 而让闸整道弃权（弃权＝放行，方向是放钱）。
+	return b
+}
+
+// gatePositionForGates 该码在闸里的持仓读数（柜台快照属于当前交易日 ⇒ 柜台；否则手动今日行）。
+// 返回 ok=false 表示两本账都没有这一码（调用方按改前"查不到"分支走，不新造放行路径）。
+func (g *Gate) gatePositionForGates(code string) (qty int, cost, cur float64, source string, ok bool) {
+	if g.st == nil {
+		return 0, 0, 0, "none", false
+	}
+	p, err := g.st.RealPositionByCodeForUser(g.userID, code)
+	if err == nil && p.Qty > 0 {
+		if positionSnapshotFresh(p.UpdatedAt, g.today()) {
+			return p.Qty, p.CostPrice, p.CurPrice, "counter", true
+		}
+	}
+	v, verr := g.st.ManualBookViewFor(g.userID, g.today())
+	if verr != nil || !v.PositionsUsable {
+		// 手动账不可用 ⇒ 回落柜台原值（哪怕快照陈旧），与改前逐字一致。
+		if err == nil && p.Qty > 0 {
+			return p.Qty, p.CostPrice, p.CurPrice, "counter", true
+		}
+		return 0, 0, 0, "none", false
+	}
+	for _, mp := range v.Positions {
+		if mp.TsCode == code {
+			return mp.Qty, mp.CostPrice, 0, "manual", true
+		}
+	}
+	// 手动账可用但没有这一码：柜台有就用柜台，两边都没有才算查不到。
+	if err == nil && p.Qty > 0 {
+		return p.Qty, p.CostPrice, p.CurPrice, "counter", true
+	}
+	return 0, 0, 0, "none", false
+}
+
+// manualTodayBought 当日经改账买入的股数（§MANUAL-BOOK-UNIFY 裁决 1 的 T+1 补腿）。
+// 读失败按 0 处理并留痕——少扣一项会让可卖量偏松，所以这条必须能被日志数出来。
+func (g *Gate) manualTodayBought(code string) int {
+	if g.st == nil {
+		return 0
+	}
+	n, err := g.st.ManualTodayBoughtQty(g.userID, code, g.today())
+	if err != nil {
+		log.Printf("[risk] §MANUAL-BOOK 当日改账买入读取失败（按 0 扣减，可卖量偏松，请核对）uid=%s code=%s: %v",
+			g.userID, code, err)
+		return 0
+	}
+	return n
+}
+
+// totalAssetsForGates 集中度/日亏/板块/概念四道闸共用的总资产分母（§MANUAL-BOOK-UNIFY 裁决 1）。
+//
+// 柜台资金新鲜 ⇒ 逐字今天的柜台合计；柜台不可信且手动当日账可用 ⇒ 用手动账合计（source=manual，
+// reason 里必须点名，因为手动合计在没有填 total_asset 时是**成本价口径**的近似，不是实时市值）。
+// 两本账都拿不到 ⇒ 原样返回柜台值（可能是 0），调用方走改前的"分母不可得即跳过"分支——
+// 那条分支是 fail-open，但它 open 的依据是"没有任何可信分母"，不是"有一份被我说成不可信的读数"。
+func (g *Gate) totalAssetsForGates() (float64, string) {
+	total, err := g.totalAssets()
+	if err != nil {
+		total = 0
+	}
+	b := g.gateBook()
+	if b.CashSource == "manual" && b.Total > 0 {
+		return b.Total, "manual"
+	}
+	return total, "counter"
+}
+
+// manualTotalLabel 手动口径在拒单文案里的那半句（把"这是成本价近似"这件事写进用户看得见的那行）。
+func manualTotalLabel(source string) string {
+	if source != "manual" {
+		return ""
+	}
+	return "，分母=手动实盘（成本价口径，非实时市值）"
+}
+
+// gatePositionRows 敞口类与持仓数类判据共用的持仓行（§MANUAL-BOOK-UNIFY 2026-11-06 裁决 1）。
+//
+// 柜台至少有一行的 updated_at 属于当前交易日 ⇒ 柜台在报数 ⇒ 逐字今天的柜台行；
+// 否则手动账今日可用 ⇒ 把手动行转成同形状的行喂进去（CanUseQty 一律 nil：
+// 手动账没有柜台 T+1 可卖量，伪造一个 0 会把"不可卖"说成柜台结论，伪造正数更不行）。
+// 两本账都没有 ⇒ 原样返回柜台值与错误，调用方走改前分支（含"读失败视为命中"那条）。
+func (g *Gate) gatePositionRows() ([]store.RealPosition, error, string) {
+	if g.st == nil {
+		return nil, nil, "none"
+	}
+	pos, err := g.st.RealPositionsForUser(g.userID)
+	counterReporting := err == nil && store.CounterPositionsReporting(pos, g.today())
+	if err == nil && counterReporting {
+		return pos, nil, "counter"
+	}
+	v, verr := g.st.ManualBookViewFor(g.userID, g.today())
+	if verr == nil && v.PositionsUsable {
+		out := make([]store.RealPosition, 0, len(v.Positions))
+		for _, mp := range v.Positions {
+			out = append(out, store.RealPosition{
+				TsCode: mp.TsCode, Name: mp.Name, Qty: mp.Qty, CostPrice: mp.CostPrice,
+				UpdatedAt: mp.AsOf,
+			})
+		}
+		return out, nil, "manual"
+	}
+	return pos, err, "counter"
+}
+
 // SetCrossPriceSource §XCHECK 2026-09-22 C批：注入价格复核闸的独立复核源（可空=闸保持跳过，
 // 零行为变化）。setter 而非构造参数：复核源在引擎装配尾段（registry）才就绪，且旧调用方
 // 无需感知本闸存在。
@@ -392,12 +567,26 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) 
 	}
 	// 未知仓位 fail-open：本地查不到该持仓行时跳过校验，交由券商柜台终裁（不拦合法退出）。
 	if p, perr := g.st.RealPositionByCodeForUser(g.userID, o.Code); perr == nil && p.Qty > 0 {
-		// 可卖量 = 持仓 − 当日已买入（未结算不可卖） − 当日在途卖单的未成交余量（§N-3 净额口径：
+		// 可卖量 = 持仓 − 当日已买入（未结算不可卖） − 当日改账买入 − 当日在途卖单的未成交余量（§N-3 净额口径：
 		// 已报/部成/待撤等非终态行按 qty−已成交 占额度，成交腿已由 p.Qty 扣过，不在此重复）。
 		bought := g.st.TodayBoughtQty(g.userID, o.Code, g.today())
 		openSell := g.st.SumOpenSellQty(g.userID, o.Code, g.today())
-		sellable := p.Qty - bought - openSell
-		// 三项扣减后可能为负（数据时序误差），下限取 0 仅用于比较与提示。
+		// §MANUAL-BOOK-UNIFY（2026-11-06，owner 裁决 1）两条补腿，都只在柜台读数不可信时才改变结果：
+		//   ① 持仓基线：柜台快照不属于今日（桥断冻结）且手动账今日有这一码 ⇒ 基线换手动量；
+		//   ② 当日买入：人工在券商 App 下的买单不进 orders，改账流水是唯一有据可查的那一份。
+		// 两本账同时被写时 ② 会重复扣减，方向是**偏紧**（少卖），不是偏松——这是刻意选的错向，
+		// 也是方案 §9.1 如实登记的那条固有代价（没走改账入口的那笔买入仍然看不见，闸拦不住）。
+		baseQty := p.Qty
+		qtySource := "柜台"
+		manualBought := g.manualTodayBought(o.Code)
+		if !positionSnapshotFresh(p.UpdatedAt, g.today()) {
+			if mq, _, _, src, ok := g.gatePositionForGates(o.Code); ok && src == "manual" && mq > 0 {
+				baseQty = mq
+				qtySource = "手动实盘"
+			}
+		}
+		sellable := baseQty - bought - manualBought - openSell
+		// 四项扣减后可能为负（数据时序误差），下限取 0 仅用于比较与提示。
 		if sellable < 0 {
 			sellable = 0
 		}
@@ -431,8 +620,8 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) 
 				thr = 100
 			}
 			if dev > thr {
-				content := fmt.Sprintf("%s %s：柜台可卖口径 %d 与本地推算 %d 偏差 %d 股(阈值 %d)，持仓 %d 当日买入 %d 在途卖 %d —— 可卖量已按 min 收紧，偏差请核对本成交链与柜台账外操作",
-					g.userID, o.Code, counter, localEst, dev, thr, p.Qty, bought, openSell)
+				content := fmt.Sprintf("%s %s：柜台可卖口径 %d 与本地推算 %d 偏差 %d 股(阈值 %d)，持仓 %d 当日买入 %d 改账买入 %d 在途卖 %d —— 可卖量已按 min 收紧，偏差请核对本成交链与柜台账外操作",
+					g.userID, o.Code, counter, localEst, dev, thr, baseQty, bought, manualBought, openSell)
 				log.Printf("[risk] §A1 T+1 可卖量交叉偏差告警: %s", content)
 				if g.onGate != nil {
 					g.onGate("warn", "T+1 可卖量交叉偏差", content)
@@ -445,8 +634,8 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) 
 			if cfg.T1ClampEnabled() && sellable > 0 {
 				// 减量放行留痕：这是"闸门改了执行量"的一次真实资损向决定，必须能从日志与
 				// risk_gates 两处回看到"哪一单被砍到多少"，否则事后无法解释"为什么只卖了一半"。
-				reason := fmt.Sprintf("T+1 减量放行: 可卖 %d < 请求 %d，本单按 %d 股报出（%s；持仓 %d, 当日买入 %d, 在途卖 %d）",
-					sellable, o.Qty, sellable, basis, p.Qty, bought, openSell)
+				reason := fmt.Sprintf("T+1 减量放行: 可卖 %d < 请求 %d，本单按 %d 股报出（%s；持仓 %d(%s), 当日买入 %d, 改账买入 %d, 在途卖 %d）",
+					sellable, o.Qty, sellable, basis, baseQty, qtySource, bought, manualBought, openSell)
 				log.Printf("[risk] §T1-PARTIAL-W5 %s %s %s", g.userID, o.Code, reason)
 				if g.st != nil {
 					_ = g.st.RecordRiskGate(g.userID, g.today(), "t1_sellable_clamped", reason)
@@ -456,8 +645,8 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) 
 				}
 				return "", sellable
 			}
-			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %d < 请求 %d（%s；持仓 %d, 当日买入 %d, 在途卖 %d）",
-				sellable, o.Qty, basis, p.Qty, bought, openSell), 0
+			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %d < 请求 %d（%s；持仓 %d(%s), 当日买入 %d, 改账买入 %d, 在途卖 %d）",
+				sellable, o.Qty, basis, baseQty, qtySource, bought, manualBought, openSell), 0
 		}
 	}
 	return "", 0
@@ -467,23 +656,12 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) (string, int) 
 // 只有 updated_at 落在 today（或更晚）才认为柜台可卖量 can_use_qty 新鲜可信任；
 // 早于 today 的快照（桥断开/券商禁令冻结）还停在"当日新仓全锁"旧值，而 T+1 隔夜已解锁，
 // 不能拿来当今天的权威可卖量。updated_at 为空或无法解析时保守返回 true（维持改前行为，不扩大回归面）。
+//
+// §MANUAL-BOOK-UNIFY（2026-11-06 裁决 1）：判据本体已上收到 store.SnapshotBelongsToDay 单点
+// （闸、控制器、引擎 resolver 三处共吃一把尺），本函数**保留名字与调用点**并转调——
+// 门禁 ②-A1-FRESH 两处锚（函数声明 + 调用点形状）因此照旧命中，不是把锁挪空。
 func positionSnapshotFresh(updatedAt, today string) bool {
-	if updatedAt == "" {
-		return true
-	}
-	ds := updatedAt
-	if len(ds) > 10 {
-		ds = ds[:10]
-	}
-	if len(ds) != 10 {
-		return true
-	}
-	pt, err1 := time.Parse("2006-01-02", ds)
-	tt, err2 := time.Parse("2006-01-02", today)
-	if err1 != nil || err2 != nil {
-		return true
-	}
-	return !pt.Before(tt)
+	return store.SnapshotBelongsToDay(updatedAt, today)
 }
 
 // checkMaxOrderAmount 单笔委托金额绝对帽（默认关，阈值 0=放行一切）：本单金额（装配缺失时
@@ -622,8 +800,9 @@ func (g *Gate) checkDayLoss(cfg config.QMTConfig, o LiveOrder) string {
 		return ""
 	}
 	// 分母（总资产）优先取账本实时口径，不可得时回落初始本金；两者皆无则跳过（fail-open）。
+	// §MANUAL-BOOK-UNIFY 裁决 1：柜台不可信且手动当日账可用时分母取手动合计（成本价口径，reason 点名）。
 	base := 0.0
-	if total, terr := g.totalAssets(); terr == nil && total > 0 {
+	if total, _ := g.totalAssetsForGates(); total > 0 {
 		base = total
 	} else if cfg.InitialCapital > 0 {
 		base = cfg.InitialCapital
@@ -655,19 +834,22 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 		return ""
 	}
 	// 总资产不可得（账本缺失或 ≤0）时失败跳过 —— 以草率分母算出的比例不可信。
-	total, err := g.totalAssets()
-	if err != nil || total <= 0 {
+	// §MANUAL-BOOK-UNIFY 裁决 1：分母与分子都按同一本账取（柜台可信走柜台，否则走手动当日账），
+	// 混用两本账会让"分子是手动量、分母是柜台合计"算出一个谁也不认的百分比。
+	total, totalSource := g.totalAssetsForGates()
+	if total <= 0 {
 		return ""
 	}
 	// 现有持仓市值：优先现价，现价缺失回落成本价；两者皆无按 0 估算（只计本单金额）。
+	// 手动态没有实时市值可用（手动账只有成本价），reason 里点名这个近似。
 	posVal := 0.0
-	if p, perr := g.st.RealPositionByCodeForUser(g.userID, o.Code); perr == nil && p.Qty > 0 {
-		price := p.CurPrice
+	if qty, cost, cur, _, ok := g.gatePositionForGates(o.Code); ok && qty > 0 {
+		price := cur
 		if price <= 0 {
-			price = p.CostPrice
+			price = cost
 		}
 		if price > 0 {
-			posVal = price * float64(p.Qty)
+			posVal = price * float64(qty)
 		}
 	}
 	// §DYN-T 批 7：日内回转的**正 T 买腿**按净额增量计（当日会配等量底仓卖出，收盘持仓回到原量）。
@@ -687,8 +869,8 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 	// 买入后该票预计市值 = 现有持仓市值 + 本单净额，占总资产比例超上限即拒新买。
 	proj := posVal + netAmount
 	if proj/total*100 > cfg.RiskGate.SingleStockValuePct {
-		return fmt.Sprintf("单票集中度超限: 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%",
-			proj, total, proj/total*100, cfg.RiskGate.SingleStockValuePct)
+		return fmt.Sprintf("单票集中度超限: 预计市值 %.0f / 总资产 %.0f = %.1f%% > 上限 %.1f%%%s",
+			proj, total, proj/total*100, cfg.RiskGate.SingleStockValuePct, manualTotalLabel(totalSource))
 	}
 	return ""
 }
@@ -705,16 +887,18 @@ func (g *Gate) tPairingCovered(o LiveOrder) bool {
 	if g.st == nil {
 		return false
 	}
-	p, err := g.st.RealPositionByCodeForUser(g.userID, o.Code)
-	// RealPositionByCodeForUser 返回值类型（无持仓时 Qty=0），所以这里只看 err 与 Qty。
-	if err != nil || p.Qty <= 0 {
+	// §MANUAL-BOOK-UNIFY（2026-11-06，owner 裁决 1）：持仓基线与 T+1 闸**同源**——
+	// 柜台快照不属于今日且手动账今日有这一码时用手动量。不同源会出现"T+1 闸按手动量说可卖 800，
+	// 集中度复核按柜台旧量说配不平"，两条判据互相打脸，而屏上只显示后一条。
+	qty, _, _, _, ok := g.gatePositionForGates(o.Code)
+	if !ok || qty <= 0 {
 		return false
 	}
 	today := g.st.TodayBoughtQty(g.userID, o.Code, g.today())
 	if today < 0 {
 		return false
 	}
-	return p.Qty-today >= o.Qty
+	return qty-today-g.manualTodayBought(o.Code) >= o.Qty
 }
 
 // checkSectorExposure §C1 行业敞口：买入后目标行业预计市值 / 总资产 超过上限 → 拒新买。
@@ -734,8 +918,9 @@ func (g *Gate) checkSectorExposure(cfg config.QMTConfig, o LiveOrder) string {
 		return "" // 行业未知 → 弃权，不把“取不到”当 0 敞口
 	}
 	// 总资产不可得（账本缺失或 ≤0）→ 弃权：用不可信分母算出的比例没有意义。
-	total, err := g.totalAssets()
-	if err != nil || total <= 0 {
+	// §MANUAL-BOOK-UNIFY 裁决 1：柜台不可信时分母取手动当日账合计（板块敞口按成本价口径估算，已在文案点名）。
+	total, _ := g.totalAssetsForGates()
+	if total <= 0 {
 		return ""
 	}
 	// 本单金额：优先用委托金额，缺失时按 价×量 估算。
@@ -746,7 +931,8 @@ func (g *Gate) checkSectorExposure(cfg config.QMTConfig, o LiveOrder) string {
 	if amount <= 0 {
 		return ""
 	}
-	positions, err := g.st.RealPositionsForUser(g.userID)
+	// §MANUAL-BOOK-UNIFY 裁决 1：持仓行按同源规则选（柜台在报数走柜台，否则走手动当日行）。
+	positions, err, _ := g.gatePositionRows()
 	if err != nil {
 		return ""
 	}
@@ -814,8 +1000,9 @@ func (g *Gate) checkConceptExposure(cfg config.QMTConfig, o LiveOrder) string {
 		return "" // 概念未知 → 弃权
 	}
 	// 总资产不可得 → 弃权；概念敞口的分母必须是可信总资产。
-	assets, err := g.totalAssets()
-	if err != nil || assets <= 0 {
+	// §MANUAL-BOOK-UNIFY 裁决 1：柜台不可信且手动当日账可用时分母取手动合计。
+	assets, _ := g.totalAssetsForGates()
+	if assets <= 0 {
 		return ""
 	}
 	// 本单金额：委托金额优先，缺失按 价×量 估算。
@@ -826,7 +1013,8 @@ func (g *Gate) checkConceptExposure(cfg config.QMTConfig, o LiveOrder) string {
 	if amount <= 0 {
 		return ""
 	}
-	positions, err := g.st.RealPositionsForUser(g.userID)
+	// §MANUAL-BOOK-UNIFY 裁决 1：持仓行按同源规则选（柜台在报数走柜台，否则走手动当日行）。
+	positions, err, _ := g.gatePositionRows()
 	if err != nil {
 		return ""
 	}
@@ -907,7 +1095,9 @@ func (g *Gate) checkMaxPositions(cfg config.QMTConfig, o LiveOrder) string {
 		return ""
 	}
 	// 按账号读取本地持仓行；读取失败视为命中（错误原因即进入判定留痕）。
-	poses, err := g.st.RealPositionsForUser(g.userID)
+	// §MANUAL-BOOK-UNIFY 裁决 1：柜台不报数时持仓数按手动当日账数——否则"桥断 + 手上 5 只票"
+	// 会被数成 0 只，持仓数上限这道闸在最需要它的时候反而最先弃权。
+	poses, err, _ := g.gatePositionRows()
 	if err != nil {
 		return fmt.Sprintf("read real positions: %v", err)
 	}
@@ -1046,11 +1236,20 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 			}
 		}
 	} // §DYN-SIZE-v3: end of legacy daily/strategy-allocation gates
+	// book 闸3/闸4 共用的账户维度读数（§MANUAL-BOOK-UNIFY 2026-11-06 裁决 1）。
+	// 取一次而不是两闸各取一次：两闸必须对"这轮用的是哪本账"给同一个答案，
+	// 各取各的会出现"闸3 按手动跳过近似、闸4 按柜台 50% 折算"这种自相矛盾的拒单。
+	book := g.gateBook()
 	// 闸3：近似可用资金闸（依赖 InitialCapital 配置；无本金口径时跳过）。
 	if cfg.InitialCapital > 0 {
 		// 券商账户快照 10 分钟内视为新鲜；新鲜时直接用券商口径，跳过本地近似估算。
 		brokerFresh := false
-		if acc, aerr := g.cashAccount(); aerr == nil && acc.AvailableCash > 0 {
+		// §MANUAL-BOOK-UNIFY（2026-11-06，owner 裁决 1）：柜台资金不可信时，手动当日账就是可用资金读数。
+		// 手动腿一律**跳过**本金近似估算——近似口径的原料是"本金 − 柜台持仓成本 − 在途冻结 + 已实现盈亏"，
+		// 而桥断时那份柜台持仓成本本身就是昨天的，拿它去近似一个今天的人敲余额，只会把两本账糊成一个数。
+		if book.CashSource == "manual" && book.Cash > 0 {
+			brokerFresh = true
+		} else if acc, aerr := g.cashAccount(); aerr == nil && acc.AvailableCash > 0 {
 			if at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc); perr == nil &&
 				g.now().Sub(at) <= 10*time.Minute {
 				brokerFresh = true
@@ -1100,6 +1299,25 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 					amount)
 			}
 		}
+	}
+	// 闸4-A：手动实盘口径可用资金（§MANUAL-BOOK-UNIFY 2026-11-06，owner 裁决 1）。
+	// 只在柜台资金读数不可信且手动当日账可用时生效，且**全额**、不按 10 分钟折算——
+	// 折算的前提是"这个数可能已经花掉一部分"，而人刚敲的数没有这个问题（它的问题是"可能敲错"，
+	// 那由来源标注与 asof 上屏解决，不该由打折解决）。
+	if book.CashSource == "manual" && book.Cash > 0 {
+		cap := book.Cash
+		var frozenDed, reserveDed float64
+		if !cfg.Money.TrustBrokerFreezeEnabled() {
+			frozenDed = frozen
+			cap -= frozenDed
+		}
+		reserveDed = cfg.Money.EffectiveReserve(cap)
+		cap -= reserveDed
+		if amount > cap {
+			return fmt.Sprintf("可用资金不足(手动实盘口径 asof=%s): 上限 %.2f < 本次 %.2f（在途冻结%.0f, 保留现金%.0f；柜台回报不可信，本笔按手动账判定）",
+				book.CashAt, cap, amount, frozenDed, reserveDed)
+		}
+		return ""
 	}
 	// 闸4：券商口径可用资金双闸（§R4-3）——在近似口径之外，用券商上报的可用现金再校验一次。
 	if acc, err := g.cashAccount(); err == nil && acc.AvailableCash > 0 {

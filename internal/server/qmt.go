@@ -234,6 +234,55 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "read real positions: "+err.Error())
 		return
 	}
+	uid := userIDFor(r)
+	ctrl := s.qmtCtrlFor(uid)
+	// §可用资金：广州实盘账户资产（可用/冻结/总值/市值），随持仓接口一并返回供前端展示。
+	acc, accErr := s.realAccountFor(uid)
+	// §MANUAL-BOOK-UNIFY（2026-11-06，owner 裁决 1/2/5）：这一张表就是"一本账"——
+	// 柜台在报数的那一维用柜台，柜台不报数的那一维用 owner 当日改出来的账，两维各自判、各自标来源。
+	// 选源规则与引擎 resolver 共用 store.SelectBookSources（两处各写一份迟早一处严一处松，
+	// 而松的那一处会放行买入、严的那一处会让这张表凭空变成空表，两个方向都是事故）。
+	//
+	// 为什么合并在**读侧**而不是让前端各读一本：屏上这张表是要被人拿去下单的。
+	// 前端自己拼两本账＝同一只票可能在两张卡上各长一个数量，而这两个数谁也不报错。
+	manualView, manualViewErr := db.ManualBookViewFor(uid, cntime.DayOf(cntime.Now()))
+	bookSource := map[string]interface{}{
+		"cash": "counter", "positions": "counter",
+		"cash_asof": "", "positions_asof": "", "taken_over_at": manualView.TakenOverAt,
+	}
+	if manualViewErr != nil {
+		// 可用性读不到 ⇒ 两维一律按柜台原值报（读侧不许因为旁路坏掉而改变主链读数），但要把"没判成"这件事留在响应里。
+		log.Printf("[server] §MANUAL-BOOK 手动账可用性读取失败（实仓读数保持柜台口径）user=%s: %v", uid, manualViewErr)
+		bookSource["manual_unavailable"] = true
+	} else {
+		sel := store.SelectBookSources(acc, accErr, positions, nil, manualView,
+			cntime.DayOf(cntime.Now()), cntime.Now(), ctrl != nil)
+		bookSource["cash"] = sel.Cash
+		bookSource["positions"] = sel.Positions
+		bookSource["cash_asof"] = sel.CashAsOf
+		bookSource["positions_asof"] = sel.PositionsAsOf
+		if sel.Positions == "manual" {
+			converted := make([]store.RealPosition, 0, len(manualView.Positions))
+			for _, p := range manualView.Positions {
+				// UpdatedAt 取手动 asof：这张表右上角那句"持仓数据截至"必须跟着换成**人敲的时刻**，
+				// 继续显示柜台回报时刻会让"这份清单是我早上手敲的"看起来像"券商刚报的"。
+				// CanUseQty 留 nil：手动账没有柜台 T+1 可卖量（展示层也不许伪造）。
+				converted = append(converted, store.RealPosition{
+					TsCode: p.TsCode, Name: p.Name, Qty: p.Qty, CostPrice: p.CostPrice,
+					UpdatedAt: p.AsOf, UserID: uid,
+				})
+			}
+			positions = converted
+		}
+		if sel.Cash == "manual" {
+			acc = store.RealAccount{
+				UserID:        uid,
+				AvailableCash: manualView.Cash.Account.AvailableCash,
+				TotalAsset:    manualView.Cash.Account.TotalAsset,
+				UpdatedAt:     manualView.CashAsOf,
+			}
+		}
+	}
 	// §联调修复：装配实时现价（CurPrice）供前端实盘持仓"现价/浮动盈亏"列展示。
 	// 网关回报仅含 cost_price，实时价取自 fetcher 5s 快照（缺则按 TS 代码变换重试一次）。
 	// 不影响持久化（real_positions 仍按网关为准 upsert），仅响应层补充展示字段。
@@ -241,6 +290,7 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// Name 补全展示名，避免前端实盘持仓只显示代码不显示名称。
 	// English: §F2 name backfill — gateway reconciliation omits name; fill it from the quote
 	// snapshot so the real-positions table shows stock names, response-layer only (no persist).
+	// 手动行也走这同一段：现价/名称来自行情链，与账本来源无关，缺了它这张表连盈亏都算不出来。
 	for i := range positions {
 		// 名称兜底优先级：DB 已有名称 → stockName（基础信息表）→ quoteDisplay（行情快照）。
 		if positions[i].Name == "" {
@@ -255,9 +305,6 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 			positions[i].CurPrice = si.Price
 		}
 	}
-	ctrl := s.qmtCtrlFor(userIDFor(r))
-	// §可用资金：广州实盘账户资产（可用/冻结/总值/市值），随持仓接口一并返回供前端展示。
-	acc, _ := s.realAccountFor(userIDFor(r))
 	// §实盘账户兜底：网关未上报 account 事件（或上报异常）时 GetRealAccount 返回零值行，
 	// 前端"可用资金 ¥0.00/总值 ¥0.00"失真。此时用持仓市值（实时价优先、缺则成本价）补总值/
 	// 市值，可用资金未知则保持 0（无法凭空造现金，前端按 updated_at 区分展示）。
@@ -281,20 +328,24 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	}
 	// §2.12 手动账读数装配。**装配失败不许把实盘持仓整张页面打死**：
 	// 手动账是旁路输入，它坏了只该让"手动维护"这块标注消失并留痕，不该让人看不见柜台持仓。
-	manualBlock, manualErr := s.manualBookReadout(userIDFor(r))
+	manualBlock, manualErr := s.manualBookReadout(uid)
 	if manualErr != nil {
-		log.Printf("[server] §2.12 手动账读数装配失败（实盘持仓照常返回，manual 标 unavailable）user=%s: %v", userIDFor(r), manualErr)
+		log.Printf("[server] §2.12 手动账读数装配失败（实盘持仓照常返回，manual 标 unavailable）user=%s: %v", uid, manualErr)
 		manualBlock = map[string]interface{}{"present": false, "unavailable": true, "note": "手动维护账读取失败（不代表没有手动账）"}
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"positions": positions,                     // 持仓列表（已补名称/现价）
-		"account":   acc,                           // 账户资产快照（可能经市值兜底回填）
+		"positions": positions,                     // 持仓列表（已补名称/现价；来源见 book_source.positions）
+		"account":   acc,                           // 账户资产快照（来源见 book_source.cash）
 		"enabled":   ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
 		"tripped":   ctrl != nil && ctrl.Tripped(), // 熔断是否触发
 		"mode":      ctrlMode(ctrl),                // 执行模式 manual/auto
-		// §2.12（2026-11-04 外脑化）手动维护账：桥 11-05 断后持仓/资金不再自动上报，owner 手工录的那本账
-		// **单独一个键**，刻意不并进 positions/account——并进去的那一行就再也说不清是柜台给的还是人敲的，
-		// 而这张页面上的数字是要被人拿去下单的。读侧唯一的"来源"标识就是这里（present/note/asof）。
+		// §MANUAL-BOOK-UNIFY 读侧来源：这一张表里，资金与持仓两维各自是谁给的。
+		// 前端按它决定"操作"列点下去是下真单还是改账，也按它挂来源角标——
+		// 判据只在这里装配一次，前端不许再读一次新鲜度（两处判一个时间迟早不一致）。
+		"book_source": bookSource,
+		// §2.12（2026-11-04 外脑化）手动维护账明细：改账流水、可用性三态、接管时刻。
+		// 与 book_source 分开是因为职责不同：book_source 说"这张表当前用谁"，
+		// manual 说"人敲的那本账长什么样"——后者是审计与回看面，不许被并进表里冒充柜台行。
 		"manual": manualBlock,
 	})
 }
@@ -844,6 +895,10 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			return
 		} else {
 			log.Printf("[trading] 网关全量对账(用户=%s): %d 持仓", owner, n)
+			// §MANUAL-BOOK-UNIFY（2026-11-06 裁决 5）：柜台持仓真的落库了 ⇒ 给手动账打接管指针。
+			// 位置必须在成功分支里：回报失败也打标会让下次桥断时那本手动账"读不到"，
+			// 而它本来是唯一的兜底——这是把止血通道自己关掉。
+			markManualTakenOver(db, owner, "positions_report")
 			// §DAILY_OPSLOG 每日至首次对账记一行（对账每分钟跑，全记会淹没核心记录）。
 			// DayOnce 以 "reconcile:<uid>" 为当日去重键，同日重复对账只记首次。
 			opslog.DayOnce("reconcile:"+owner, func() {
@@ -1036,6 +1091,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[trading] 账户资产上报(用户=%s): 可用=%.2f 冻结=%.2f 总值=%.2f 市值=%.2f",
 			owner, ev.Asset["cash"], ev.Asset["frozen_cash"], ev.Asset["total_asset"], ev.Asset["market_value"])
+		// §MANUAL-BOOK-UNIFY（2026-11-06 裁决 5）：柜台资金真的落库了 ⇒ 手动账打接管指针。
+		// 资金维与持仓维各自独立报数，所以两条成功分支都要打（只打一条会出现"资金已接管、持仓还在用旧手动账"）。
+		markManualTakenOver(db, owner, "account_report")
 		// §DAILY_OPSLOG 每日至首次资产上报=开盘快照（每分钟全记会淹没核心记录）
 		opslog.DayOnce("asset:"+owner, func() {
 			opslog.Logf("quant", "开盘资产快照 用户=%s 可用=%.2f 冻结=%.2f 总值=%.2f 市值=%.2f",

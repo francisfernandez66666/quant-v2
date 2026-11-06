@@ -993,7 +993,7 @@ export async function fetchRealPositions() {
 //   · **全量** upsert：positions 传空数组＝清仓，所以"只想改资金"时必须**整个键不带**；
 //     这是本封装层唯一能替调用方拦住"一次误清空持仓"的地方，故在下面显式判一次。
 //   · 归属只认登录态：body 里带 user_id 不会被采信。
-//   · 这份读数是"用户声称"，不进任何"必须新鲜"的硬闸（§M12-A / 风控闸 / VWAP 过滤照旧 fail-close）。
+//   · 裁决 1 改判：经 resolver 显式选源参与买卖硬闸，但绝不写进 real_*（柜台账只由回报推进）。
 export async function saveManualBook(body) {
   const b = { ...(body || {}) }
   if (b.positions !== undefined && b.positions !== null && !Array.isArray(b.positions)) {
@@ -2671,4 +2671,29 @@ export async function qmtPendingReview() {
  *  本操作永不重发订单；网关拒绝（400/404/409）带原因抛错，前端如实回显。 */
 export async function qmtOrderConfirm(body) {
   return request('/api/qmt/order-confirm', { method: 'POST', data: body })
+}
+
+// ── §MANUAL-BOOK-UNIFY（2026-11-06 裁决 2/3/4）增量改账 ──
+// 位置刻意放在文件末尾：契约台账 scripts/contract_ledger.tsv 的 evidence 带**行号**，
+// 在文件中段插入函数会让它下面几百个调用点整体漂行号，一次插 20 行 ⇒ 75 行台账落点核不过。
+// 新增导出一律追加到本文件末尾（或同步重算台账），不改既有行的行号。
+/** §MANUAL-BOOK-UNIFY 增量改账：实仓 tab 桥断态的四个动作 + 改账新增 + 直接改资金（账号级，不下单） */
+/** §MANUAL-BOOK-UNIFY incremental book adjustment: account-level, NO broker order is placed. */
+// 与 saveManualBook 共用 POST /api/qmt/manual-positions，body = { adjust: [一条] }。
+// 后端把 adjust 与 positions/available_cash 判成**互斥**（两种语义同时提交必有一个被吞，400 更安全），
+// 且一次只收一条（批量逐笔提交，每笔都要能单独看见结果）。op ∈ add|reduce|tp|close|new|set_cash。
+// 这里替调用方拦住"没填"与"填 0"的混淆：持仓类动作缺 qty/price 必被后端 400，
+// 而 set_cash 的 0 是合法值（真的没有可用资金），缺键才是没填。
+export async function adjustManualBook(adjust) {
+  const a = { ...(adjust || {}) }
+  if (!a.op) throw new Error('改账必须带 op（add/reduce/tp/close/new/set_cash）')
+  if (a.op === 'set_cash') {
+    if (a.available_cash === undefined || a.available_cash === null) {
+      throw new Error('直接改资金缺 available_cash（填 0 表示真的没有可用资金，与"没填"不是一回事）')
+    }
+  } else {
+    if (a.qty === undefined || a.qty === null) throw new Error('改账缺数量（"没填"与"0 股"是两回事）')
+    if (a.price === undefined || a.price === null || !(Number(a.price) > 0)) throw new Error('改账缺有效成交价')
+  }
+  return request('/api/qmt/manual-positions', { method: 'POST', data: { adjust: [a] } })
 }

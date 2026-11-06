@@ -8,18 +8,24 @@
 //     与 30 分钟窗口判新鲜，过期即 fail-close 不自动买）、`internal/risk/gate.go`（T+1 可卖量、
 //     集中度、买入纪律的可用资金）、以及打分循环/收盘对账的持仓取数。
 //     手动行一旦落进这两张表，**不必改任何调用方就已经把钱放了**：updated_at 就是"刚写的"，
-//     三态判据立刻判成新鲜。这正是 §2.12「手动读数不得进任何'必须新鲜'硬闸」禁止的形态，
-//     而且它不会以报错的方式暴露，只会表现为"某天用一笔手敲进来的钱买了不该买的票"。
+//     三态判据立刻判成新鲜——而那个"新鲜"其实是一个人敲的数字，不是券商回报。
+//     这条与 owner 2026-11-06 裁决 1（手动账喂买卖硬闸）**不冲突**：进闸走 resolver 显式选源并带
+//     asof/接管两条可用性判据，靠的是"读数知道自己是谁给的"，不是靠伪造柜台回报时间戳。
 //   - 加列本身不被 schemaVersion 断言拦（本包先例：can_use_qty / anchor_price / anchor_source 都是
 //     惰性 ALTER，schemaVersion 恒 2，见 schema_version_bump_test.go 的 E3），
 //     但"带 source 列的柜台表"要求**每一个既有读者都会判这个列**——判漏一处就是假账。
-//   - 新表是**结构性**满足：硬闸的取数 SQL 一个字都不用改，也不可能读到手动行。
-//     代价是"同一账户两本账"，所以读数面必须把来源与时刻如实标出来（见 ManualSourceLabel / ManualAsOf）。
+//   - 新表是**结构性**满足：硬闸的取数 SQL 一个字都不改，也不可能**读到**手动行——
+//     手动值参与硬闸走的是 `ManualBookViewFor` + 上层 resolver 的**显式选源**（owner 2026-11-06 裁决 1），
+//     不是靠把行灌进柜台输入表。代价是"同一账户两本账"，所以读数面必须把来源与时刻如实标出来
+//     （见 ManualSourceLabel / ManualAsOf / ManualBookView）。
+//   - 为什么"经 resolver 进闸"仍然要求"永不写进 real_*"：柜台为准这条判据的前提是柜台账干净。
+//     手动行一旦混进去，`updated_at` 就同时可能是"刚回报"和"刚手敲"，两把尺（§M12-A 30 分钟、
+//     §A1-FRESH 当前交易日）都会把后者读成前者，于是"柜台恢复后自动让位"这件事失去依据。
 //
-// English: a *separate* manual book rather than a source column on real_positions/real_account, because
-// those two tables feed fail-closed hard gates (§M12-A cash freshness, T+1 sellable, concentration, buy
-// discipline) whose readers are outside this batch's edit boundary — a manual row there would itself
-// read as "just reported" and unlock the auto-buy leg with no code change at all.
+// English: a *separate* manual book rather than a source column on real_positions/real_account.
+// Hard gates may still consume manual values, but only through the explicit source-selection in
+// ManualBookViewFor and the engine resolver — never by writing rows into the counter tables,
+// which is what keeps "counter wins" decidable at all.
 package store
 
 import (
@@ -53,7 +59,11 @@ type ManualPosition struct {
 	Source    string  `json:"source"`     // 恒为 ManualSourceLabel：由本包写入，调用方无权改写
 	AsOf      string  `json:"asof"`       // 用户声称"这份账是几点的数据"
 	UpdatedAt string  `json:"updated_at"` // 服务端落库时刻（北京时间墙钟）
-	UserID    string  `json:"user_id,omitempty"`
+	// TakenOverAt §MANUAL-BOOK-UNIFY（2026-11-06 裁决 5）：柜台恢复回报的时刻。
+	// 非空且 asof ≤ 它 ⇒ 这本账已被柜台接管过，下次桥断**不许**自动复活（人敲的账停在接管那一刻，
+	// 而柜台已经证明自己能报数了）；行本身保留，作为"我改过哪些"的证据。
+	TakenOverAt string `json:"taken_over_at,omitempty"`
+	UserID      string `json:"user_id,omitempty"`
 }
 
 // ManualAccount 一行手动资金（账户级：可用资金可选填、总资产可选）。
@@ -64,6 +74,34 @@ type ManualAccount struct {
 	Source        string  `json:"source"`         // 恒为 ManualSourceLabel
 	AsOf          string  `json:"asof"`           // 用户声称的数据时刻
 	UpdatedAt     string  `json:"updated_at"`     // 服务端落库时刻
+	// TakenOverAt 同 ManualPosition：柜台恢复回报的时刻（§MANUAL-BOOK-UNIFY 裁决 5）。
+	TakenOverAt string `json:"taken_over_at,omitempty"`
+}
+
+// ManualFlow 一行改账流水（§MANUAL-BOOK-UNIFY 2026-11-06）。
+//
+// 为什么增量改账要另记流水，而不是只 UPDATE 当前值：
+//  1. T+1 本地推算要扣"当日买入"，而桥断期间人工在券商 App 下的单不进 orders 表——
+//     改账买入是这条链上唯一有据可查的当日增量，没有它，手动态的可卖量会算成"昨天全量"（偏松）；
+//  2. 资金联动（买扣卖加）必须能从"当前值"回看到"是怎么变成这个数的"，
+//     否则一次手滑改错资金只能靠猜，而两本账对不上时最需要的是过程；
+//  3. 柜台接管后人工核对"我改过哪些"靠它。
+//
+// 按北京时间交易日 day-keyed：新交易日不复活、不累计（与 signal_decisions / t_rounds 同纪律）。
+type ManualFlow struct {
+	ID          int64   `json:"id"`
+	UserID      string  `json:"user_id"`
+	Day         string  `json:"day"`          // 北京交易日 YYYY-MM-DD
+	TsCode      string  `json:"ts_code"`      // set_cash 时为空串
+	Op          string  `json:"op"`           // new|add|reduce|tp|close|set_cash
+	Side        string  `json:"side"`         // 买入|卖出|资金
+	Qty         int     `json:"qty"`          // 本笔数量（资金笔为 0）
+	Price       float64 `json:"price"`        // 本笔成交价（资金笔为 0）
+	AmountDelta float64 `json:"amount_delta"` // 对可用资金的影响（买为负、卖为正）
+	CashAfter   float64 `json:"cash_after"`   // 本笔之后的可用资金读数
+	SeededFrom  string  `json:"seeded_from"`  // counter|manual|none：本笔基线从哪本账来
+	AsOf        string  `json:"asof"`         // 用户声称时刻（缺省＝服务端当前时刻）
+	CreatedAt   string  `json:"created_at"`   // 服务端落库时刻
 }
 
 // ManualAccountState 手动资金读数（带"有没有这一行"的三态）。
@@ -89,6 +127,7 @@ func (d *DB) ensureManualBook() error {
 		asof        TEXT NOT NULL DEFAULT '',
 		updated_at  TEXT NOT NULL,
 		user_id     TEXT NOT NULL DEFAULT '',
+		taken_over_at TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (ts_code, user_id)
 	)`); err != nil {
 		return fmt.Errorf("store migrate manual_positions create: %w", err)
@@ -100,9 +139,46 @@ func (d *DB) ensureManualBook() error {
 		cash_filled    INTEGER NOT NULL DEFAULT 0,
 		source         TEXT NOT NULL DEFAULT 'manual',
 		asof           TEXT NOT NULL DEFAULT '',
-		updated_at     TEXT NOT NULL
+		updated_at     TEXT NOT NULL,
+		taken_over_at  TEXT NOT NULL DEFAULT ''
 	)`); err != nil {
 		return fmt.Errorf("store migrate manual_account create: %w", err)
+	}
+	// §MANUAL-BOOK-UNIFY（2026-11-06）接管指针列：存量库惰性补列（姿势与本包 can_use_qty 同族，
+	// 不进集中迁移清单、不动 schemaVersion——新增列不改变任何既有行的读法）。
+	for _, col := range []struct{ table, name string }{
+		{"manual_positions", "taken_over_at"},
+		{"manual_account", "taken_over_at"},
+	} {
+		has, err := d.hasColumn(col.table, col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.db.Exec(`ALTER TABLE ` + col.table + ` ADD COLUMN ` + col.name + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("store migrate %s add %s: %w", col.table, col.name, err)
+			}
+		}
+	}
+	if _, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS manual_flows (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id      TEXT NOT NULL,
+		day          TEXT NOT NULL,
+		ts_code      TEXT NOT NULL DEFAULT '',
+		op           TEXT NOT NULL,
+		side         TEXT NOT NULL DEFAULT '',
+		qty          INTEGER NOT NULL DEFAULT 0,
+		price        REAL NOT NULL DEFAULT 0,
+		amount_delta REAL NOT NULL DEFAULT 0,
+		cash_after   REAL NOT NULL DEFAULT 0,
+		seeded_from  TEXT NOT NULL DEFAULT '',
+		asof         TEXT NOT NULL DEFAULT '',
+		created_at   TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("store migrate manual_flows create: %w", err)
+	}
+	if _, err := d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_manual_flows_day ON manual_flows(user_id, day, ts_code)`); err != nil {
+		return fmt.Errorf("store migrate manual_flows index: %w", err)
 	}
 	return nil
 }
@@ -243,7 +319,7 @@ func (d *DB) ManualPositionsForUser(userID string) ([]ManualPosition, error) {
 	if err := d.ensureManualBook(); err != nil {
 		return nil, err
 	}
-	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, source, asof, updated_at, user_id
+	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, source, asof, updated_at, user_id, taken_over_at
 		FROM manual_positions WHERE user_id = ? ORDER BY ts_code`, userID)
 	if err != nil {
 		return nil, err
@@ -252,7 +328,7 @@ func (d *DB) ManualPositionsForUser(userID string) ([]ManualPosition, error) {
 	var out []ManualPosition
 	for rows.Next() {
 		var p ManualPosition
-		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Source, &p.AsOf, &p.UpdatedAt, &p.UserID); err != nil {
+		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Source, &p.AsOf, &p.UpdatedAt, &p.UserID, &p.TakenOverAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -267,10 +343,10 @@ func (d *DB) ManualAccountForUser(userID string) (ManualAccountState, error) {
 		return st, err
 	}
 	var cashFilled int
-	err := d.db.QueryRow(`SELECT available_cash, total_asset, cash_filled, source, asof, updated_at
+	err := d.db.QueryRow(`SELECT available_cash, total_asset, cash_filled, source, asof, updated_at, taken_over_at
 		FROM manual_account WHERE user_id = ?`, userID).
 		Scan(&st.Account.AvailableCash, &st.Account.TotalAsset, &cashFilled,
-			&st.Account.Source, &st.Account.AsOf, &st.Account.UpdatedAt)
+			&st.Account.Source, &st.Account.AsOf, &st.Account.UpdatedAt, &st.Account.TakenOverAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil // 没有手动行：Present=false（不等于"金额为 0"）
 	}
@@ -329,4 +405,162 @@ func NormalizeManualAsOf(s string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("%w: asof=%q 无法识别（期望 2006-01-02 15:04:05 或 RFC3339）", ErrInvalidManualPosition, s)
+}
+
+// SnapshotBelongsToDay §MANUAL-BOOK-UNIFY（2026-11-06）：**全仓唯一**的"快照是否属于当前交易日"判据。
+//
+// 为什么收在 store 而不是留在 risk 包：同一把尺现在有三处要吃——
+// risk.Gate 的 T+1 柜台可卖量信任、引擎 resolver 的持仓维度选源、trading 控制器的资金维度选源。
+// 三处各抄一份必然漂（§165 段序单点那条教训同形：按开关推算的那份会漏掉一段）。
+// 本包不 import risk，risk import store，所以真源只能落在这里。
+//
+// 语义与改前的 risk.positionSnapshotFresh 逐字一致：空串/短串/无法解析一律返回 true
+// （保守维持"可信"，不扩大回归面）；早于 day 返回 false。
+// English: the single canonical "does this snapshot belong to today" test, moved down to store
+// so the risk gate, the engine resolver and the controller all read one ruler instead of three copies.
+func SnapshotBelongsToDay(updatedAt, day string) bool {
+	if updatedAt == "" {
+		return true
+	}
+	ds := updatedAt
+	if len(ds) > 10 {
+		ds = ds[:10]
+	}
+	if len(ds) != 10 {
+		return true
+	}
+	pt, err1 := time.Parse("2006-01-02", ds)
+	tt, err2 := time.Parse("2006-01-02", day)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return !pt.Before(tt)
+}
+
+// manualAsofUsable 手动读数今天还能不能当输入用（owner 2026-11-06 裁决 1 的两条前置判据）。
+//
+// 三条都不满足即"读不到"，调用方照旧 fail-closed：
+//  1. asof 非空且**日期正好等于**当前交易日——几天前手敲的那本账不许在下次桥断时自动顶上
+//     （"以手工为准"的前提是这份手工读数本身就是按今天维护的）；
+//  2. 未来时刻同样拒（人敲错一个日期就解开资金闸，方向是放钱，必须响亮地拒）；
+//  3. 已被柜台接管（taken_over_at 非空）且 asof 不晚于接管时刻 ⇒ 这本账停在被接管那一刻，不许复活。
+//     接管之后 owner 又改了一笔（asof 更新）自然重新可用——判据只看时刻先后，不需要额外状态位。
+func manualAsofUsable(asof, takenOverAt, day string) bool {
+	if asof == "" || day == "" {
+		return false
+	}
+	if len(asof) < 10 || asof[:10] != day {
+		return false
+	}
+	if takenOverAt != "" && asof <= takenOverAt {
+		return false
+	}
+	return true
+}
+
+// ManualBookView 手动账在某个交易日的可用性读数（两维独立）。
+//
+// 为什么分两维而不是一个"手动模式"总开关：柜台可能资金回报新鲜而持仓快照停在昨天（或反过来），
+// 一个全局开关会把"哪个数是谁给的"重新糊掉——而这两个数一个决定买多少、一个决定能不能卖。
+type ManualBookView struct {
+	Day             string
+	Cash            ManualAccountState
+	CashUsable      bool
+	Positions       []ManualPosition // 只含"可用"的行（逐行判 asof）
+	PositionsUsable bool
+	PositionsAsOf   string // 可用行里最新的 asof
+	CashAsOf        string
+	TakenOverAt     string // 持仓行与资金行里最新的接管时刻（读数面显示"已被柜台接管"）
+}
+
+// ManualBookViewFor 装配该账号在 day 这一天的手动账可用性。
+// 读失败一律把错误原样带回（调用方 fail-closed）——把手动账读不到折成"没有手动账"，
+// 与折成"零仓位"是同一族错误：三个不同的事实（读不到 / 没录 / 录了但过期）在下游必须可分。
+func (d *DB) ManualBookViewFor(userID, day string) (ManualBookView, error) {
+	var v ManualBookView
+	v.Day = day
+	if err := d.ensureManualBook(); err != nil {
+		return v, err
+	}
+	rows, err := d.ManualPositionsForUser(userID)
+	if err != nil {
+		return v, err
+	}
+	acc, err := d.ManualAccountForUser(userID)
+	if err != nil {
+		return v, err
+	}
+	v.Cash = acc
+	v.CashAsOf = acc.Account.AsOf
+	v.CashUsable = acc.Present && acc.Filled && manualAsofUsable(acc.Account.AsOf, acc.Account.TakenOverAt, day)
+	if acc.Account.TakenOverAt != "" {
+		v.TakenOverAt = acc.Account.TakenOverAt
+	}
+	for _, p := range rows {
+		if !manualAsofUsable(p.AsOf, p.TakenOverAt, day) {
+			continue
+		}
+		v.Positions = append(v.Positions, p)
+		if p.AsOf > v.PositionsAsOf {
+			v.PositionsAsOf = p.AsOf
+		}
+		if p.TakenOverAt > v.TakenOverAt {
+			v.TakenOverAt = p.TakenOverAt
+		}
+	}
+	v.PositionsUsable = len(v.Positions) > 0
+	return v, nil
+}
+
+// MarkManualTakenOver 柜台恢复回报后给该账号的手动账打接管指针（owner 2026-11-06 裁决 5）。
+//
+// 三条边界：
+//  1. **只在柜台真的落库之后调用**（调用点在 server 的 positions/account 回报成功分支）——
+//     回报失败也打标记，等于把"没回来的账"说成"回来了"，手动账会当场变成读不到而没人报警；
+//  2. **不删任何行**：手动账与 manual_flows 都是"我改过哪些"的证据；
+//  3. 幂等：同一时刻重放结果逐字节相同；更晚的接管时刻覆盖更早的（语义＝最近一次柜台自证）。
+//
+// 返回被打标的行数（持仓行 + 资金行合计），调用方据此留痕。
+func (d *DB) MarkManualTakenOver(userID, at string) (int, error) {
+	if err := d.ensureManualBook(); err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(at) == "" {
+		return 0, errors.New("store: MarkManualTakenOver 需要非空接管时刻")
+	}
+	total := 0
+	res, err := d.db.Exec(`UPDATE manual_positions SET taken_over_at = ?
+		WHERE user_id = ? AND taken_over_at <> ?`, at, userID, at)
+	if err != nil {
+		return 0, fmt.Errorf("mark manual positions taken over: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	total += int(n)
+	res2, err := d.db.Exec(`UPDATE manual_account SET taken_over_at = ?
+		WHERE user_id = ? AND taken_over_at <> ?`, at, userID, at)
+	if err != nil {
+		return total, fmt.Errorf("mark manual account taken over: %w", err)
+	}
+	n2, _ := res2.RowsAffected()
+	total += int(n2)
+	return total, nil
+}
+
+// ManualTodayBoughtQty §MANUAL-BOOK-UNIFY：该码当日通过改账买入的股数（T+1 本地推算的第三项扣减）。
+//
+// 为什么必须有这条腿：桥断期间人工在券商 App 下的买单不进 orders 表，而 T+1 闸的"当日买入"
+// 原本只数 orders——看不见就会把"昨天 1000 股 + 今天刚买 300 股"算成可卖 1000 股（偏松方向）。
+// 改账是唯一有据可查的当日增量，所以手动态的可卖量扣减只能靠它；没走改账入口的那笔仍然看不见，
+// 这是裁决 1 的固有代价，已写进方案 §9.1，不在这里假装解决。
+func (d *DB) ManualTodayBoughtQty(userID, tsCode, day string) (int, error) {
+	if err := d.ensureManualBook(); err != nil {
+		return 0, err
+	}
+	var n int
+	err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM manual_flows
+		WHERE user_id = ? AND day = ? AND ts_code = ? AND side = '买入'`, userID, day, tsCode).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }

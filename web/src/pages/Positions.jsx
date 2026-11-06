@@ -13,8 +13,9 @@ import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import AnchorShadowCard from '../components/AnchorShadowCard.jsx' // §ANCHOR-FIRST W2 影子对照（只读）
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
-// §2.12 手动维护账：桥回报可能断时，owner 手敲持仓/可用资金的那本账（与柜台读数严格分栏）。
-import ManualBookPanel from '../components/ManualBookPanel.jsx'
+// §MANUAL-BOOK-UNIFY（2026-11-06 裁决 1/2/4）：独立的手动维护面板已删除（方案 §6.1），
+// 维护统一落进实仓 tab；「手动维护，更新于 <asof>」「非柜台实时读数」两串身份文案仍取自全站唯一源。
+import { manualSourceMain, MANUAL_SOURCE_NONREALTIME } from '../utils/manualSource.js'
 import { on } from '../sseBus.js'
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
@@ -120,10 +121,11 @@ export default function Positions() {
   const [realPositions, setRealPositions] = useState([])
   // 实盘账户资产（广州 QMT 上报的可用资金/冻结/总值/市值）
   const [realAccount, setRealAccount] = useState(null)
-  // §2.12（2026-11-04 外脑化 B1'）手动维护账：桥断后 owner 手工录的那本持仓/资金。
-  // **单独一个 state**，绝不与 realPositions/realAccount 合并——那两个是柜台回报的形状，
-  // 合并后页面上任何"非空 ⇒ 有仓"的判据都会把手敲当成证据（读面唯一的来源标识就是 manual.note）。
-  const [manualBook, setManualBook] = useState(null)
+  // §MANUAL-BOOK-UNIFY（2026-11-06 裁决 1/2）：book_source 是后端单点装配的"这一维用谁"
+  //（{cash, positions, cash_asof, positions_asof, taken_over_at, manual_unavailable?}）。
+  // 前端只透传、只按它分流（下单 vs 改账）与挂角标，**绝不**自己在页面上再判一次新鲜度——
+  // 两处判一个迟早一处漂，漂的方向不是放行买入就是把手敲账悄悄换成旧柜台账。
+  const [realBookSource, setRealBookSource] = useState(null)
   // 实盘整体盈亏（/api/qmt/trades summary：realized/unrealized/total_pnl）——页头优先展示
   const [realTrades, setRealTrades] = useState(null)
   // 实盘持仓建议映射（ts_code -> 建议）
@@ -164,6 +166,31 @@ export default function Positions() {
   const realEnabled = !!qmtState.enabled
   // 实盘网关是否熔断（熔断后禁止下单）
   const realTripped = !!qmtState.tripped
+  // ── §MANUAL-BOOK-UNIFY 两维来源翻译层 ──
+  // 三态：counter 可达 / manual 改账态 / unknown 读数未知。unknown 只在两种情况出现：
+  // 旧一轮载荷没带 book_source，或后端 manual_view 读取失败（manual_unavailable）。
+  // unknown **绝不**折成任何一个端（沿用 CarrierShadowPanel 那条纪律：读数未知不显示 0）——
+  // 页头显示"读数未知"，操作列保持今天的下真单行为，绝不自动变成改账。
+  function bookDimSource(dim) {
+    const bs = realBookSource
+    if (!bs || bs.manual_unavailable) return 'unknown'
+    const v = bs[dim]
+    if (v === 'counter' || v === 'manual') return v
+    return 'unknown'
+  }
+  const cashSrc = bookDimSource('cash')
+  const posSrc = bookDimSource('positions')
+  const cashManual = cashSrc === 'manual'
+  const posManual = posSrc === 'manual'
+  // 柜台可达＝两维都在报数——页头"柜台：可达"与操作列标题的唯一判据。
+  const counterReachable = cashSrc === 'counter' && posSrc === 'counter'
+  // 改账态＝**任一一维**确认为 manual（两维独立回落，资金新但持仓旧时也要能改账）。
+  // 第三态 bookUnknown 既不改账也不报可达：读数未知时操作列保持今天的下真单行为，
+  // 绝不把"点下单"静默变成"点记账"——那比按钮点不动更危险。
+  // English: three states — both dimensions counter (reachable), any dimension manual (adjust
+  // mode), or unknown (keep today's real-order behaviour; never silently switch to bookkeeping).
+  const manualMode = cashManual || posManual
+  const bookUnknown = !counterReachable && !manualMode
   // 当前实盘下单参数（持仓+方向）
   const [realAction, setRealAction] = useState(null)
   // 实盘下单价格/数量/策略
@@ -172,6 +199,20 @@ export default function Positions() {
   const [realFormStrategy, setRealFormStrategy] = useState('')
   // 实盘下单提交中标记（防重复提交）
   const [realSubmitting, setRealSubmitting] = useState(false)
+  // §MANUAL-BOOK-UNIFY 改账弹窗 state（柜台不可达·改账态专用）：四个动作（加仓/减仓/止盈/清仓）
+  // 与「改账」新增共用一个 Dialog，op 与按钮一一对应（op ∈ new|add|reduce|tp|close）。
+  // 弹窗 header 与确认按钮在改账态带「不下单」，与实盘下单弹窗刻意不同形——
+  // 同形＝最容易把"记一笔账"点成"下一笔真单"的形状。
+  const [manualAction, setManualAction] = useState(null) // {pos?, dir}
+  const [manualFormPrice, setManualFormPrice] = useState(0)
+  const [manualFormQty, setManualFormQty] = useState(0)
+  const [manualFormCode, setManualFormCode] = useState('')
+  const [manualFormName, setManualFormName] = useState('')
+  const [manualSubmitting, setManualSubmitting] = useState(false)
+  // 「直接改资金」小入口（裁决 3 的手续费/分红/出入金口子）：拆成独立的 state，
+  // 免得与改持仓的动作混在同一张弹窗里互相预填。
+  const [manualSetCashShow, setManualSetCashShow] = useState(false)
+  const [manualSetCashVal, setManualSetCashVal] = useState('')
   // 实盘轮询由 §N-09 的 usePolling 统一管理（进入实盘标签且为 admin 时启用）
   // §M-10（2026-09-22 PM 批清扫）轮询请求代号守卫：纸面 load 与实盘 loadReal 各自独立代号，
   // 60s 轮询/SSE 触发/手动刷新交错时，旧请求的迟到响应整包丢弃（防数据倒挂）。
@@ -689,12 +730,11 @@ export default function Positions() {
       if (realGuard.current.isStale(token)) return
       if (data && Array.isArray(data.positions)) setRealPositions(data.positions)
       if (data && data.account) setRealAccount(data.account)
-      // §2.12 手动维护账：GET /api/positions/real 的 additive manual 块单独收进 state，
-      // **绝不**并进 realPositions/realAccount（那两个是柜台回报的形状，合并后页面上任何
-      // "非空 ⇒ 有仓"的判据都会把手敲当成证据）。字段存在才写：旧一轮载荷没带 manual 键
-      // 时置 null，面板自己显示"尚未维护"，前端不硬依赖后端这个新字段。
-      if (data && data.manual) setManualBook(data.manual)
-      else setManualBook(null)
+      // §MANUAL-BOOK-UNIFY：book_source（后端单点装配的"这一维用谁"）透传进 state，
+      // 操作分流 / 页头状态 / 行角标 全部只认它。载荷没带该键 ⇒ null ＝ 读数未知
+      //（前端就这样如实显示），绝不本地重新判一次新鲜度去猜。
+      if (data && data.book_source) setRealBookSource(data.book_source)
+      else setRealBookSource(null)
       ledger.clear('实盘持仓')
     } catch (e) {
       ledger.mark('实盘持仓', failMsg(e))
@@ -819,6 +859,95 @@ export default function Positions() {
       if (msg.includes('__no_quote_cancel__')) MessagePlugin.info('已取消，未提交委托')
       else MessagePlugin.error('下单失败: ' + msg)
     } finally { setRealSubmitting(false) }
+  }
+
+  // ── §MANUAL-BOOK-UNIFY（2026-11-06 裁决 2/3/4）改账态操作 ──
+  // 柜台不可达时四个按钮不再发真单，改走 POST /api/qmt/manual-positions 的 adjust（一次一条）：
+  // 弹窗与确认按钮都带「不下单」，这是"记账"而不是"委托"——后端会在 op 词表上再拒一次，
+  // 但把形状分开是第一道闸：真单弹窗有战法/no-quote 确认流，改账弹窗没有，两个态不该共用一张脸。
+  // 打开改账弹窗（有持仓行的四个动作：加仓/减仓/止盈/清仓）
+  function openManualAdjust(p, dir) {
+    const p0 = p || {}
+    // 卖出侧沿用柜台纪律（§F16 同口径）：不足一手的整行减不了，引到「清仓」整行归零。
+    if (dir === 'reduce' && (p0.qty || 0) < 100) {
+      MessagePlugin.warning('手动账 ' + (p0.qty || 0) + ' 股不足一手，请用「清仓」整行归零')
+      return
+    }
+    setManualAction({ pos: p0, dir })
+    setManualFormPrice(curPrice(p0) || p0.cost_price || 0)
+    // 默认数量：加仓一手；减/止盈按当前持仓量与一手取小
+    setManualFormQty(dir === 'add' ? 100 : Math.min(100, p0.qty || 0))
+  }
+  // 打开「改账」新增（op=new）：柜台从来没回报过的一码，手工记进出口（只在改账态出现）
+  function openManualNew() {
+    setManualAction({ pos: null, dir: 'new' })
+    setManualFormCode('')
+    setManualFormName('')
+    setManualFormPrice(0)
+    setManualFormQty(100)
+  }
+  // 打开「直接改资金」（op=set_cash，裁决 3 的手续费/分红/出入金口子）：
+  // 用当前读到的可用资金预填——改的是**绝对值**，后端按"改后可用资金"整值落账并记流水。
+  function openManualSetCash() {
+    const cur = realAccount && realAccount.available_cash != null ? String(realAccount.available_cash) : ''
+    setManualSetCashVal(cur)
+    setManualSetCashShow(true)
+  }
+  async function confirmManualSetCash() {
+    const v = Number(String(manualSetCashVal).replace(/[, ]/g, ''))
+    if (!Number.isFinite(v) || v < 0) {
+      MessagePlugin.error('可用资金没填或不是数字（"没填"与"填 0"是两回事：填 0 表示真的没有可用资金）')
+      return
+    }
+    setManualSubmitting(true)
+    try {
+      await api.adjustManualBook({ op: 'set_cash', available_cash: v })
+      MessagePlugin.success('已记入改账（不下单）：可用资金 ¥' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }))
+      setManualSetCashShow(false)
+      loadReal()
+    } catch (e) {
+      MessagePlugin.error('改账失败（未产生任何委托）：' + (e && e.message ? e.message : '请求失败'))
+    } finally { setManualSubmitting(false) }
+  }
+  // 提交改账（op ∈ add|reduce|tp|close|new）：与真单语义互斥——本笔不触柜台、不产生委托。
+  async function confirmManualAdjust() {
+    const a = manualAction
+    if (!a) return
+    if (a.dir === 'new') {
+      const code = String(manualFormCode || '').trim()
+      if (!code) { MessagePlugin.warning('请输入代码：改账也必须挂在真实标的下，不留"不知道是谁的仓"'); return }
+      const q = Math.round(Number(manualFormQty) || 0)
+      const pr = Number(manualFormPrice) || 0
+      if (q <= 0 || pr <= 0) { MessagePlugin.warning('请输入有效的价格与数量'); return }
+      await submitManualAdjust({ op: 'new', ts_code: code, qty: q, price: pr })
+      return
+    }
+    const qty = a.dir === 'close' ? (a.pos.qty || 0) : Math.round(Number(manualFormQty) || 0)
+    const price = Number(manualFormPrice) || 0
+    if (qty <= 0 || price <= 0) { MessagePlugin.warning('请输入有效的价格与数量'); return }
+    const sell = a.dir === 'reduce' || a.dir === 'tp'
+    // 卖出侧沿用柜台两条纪律（§F16 同口径）：非清仓方向的卖出必须整手；
+    // 清仓走账上现量（后端 op=close 自取整行，qty 只是留痕）。
+    if (sell && (qty < 100 || qty % 100 !== 0)) {
+      MessagePlugin.warning('卖出必须整手（100 的倍数）；整行都不要请用「清仓」')
+      return
+    }
+    await submitManualAdjust({ op: a.dir, ts_code: a.pos.ts_code, qty, price })
+  }
+  // 改账提交唯一出口：成功后重读实盘读数（book_source/接管时刻在服务端已更新），
+  // 失败把"没产生委托"原样带上——那正是用户此刻最需要确认的事。
+  async function submitManualAdjust(adjust) {
+    setManualSubmitting(true)
+    try {
+      const res = await api.adjustManualBook(adjust)
+      const adj = (res && res.adjust) || {}
+      MessagePlugin.success('已改账（不下单）· ' + (adj.op || '') + ' ' + (adj.ts_code || '') +
+        (adj.qty != null ? ' 改后持仓 ' + adj.qty + ' 股' : ''))
+      setManualAction(null)
+      loadReal()
+    } catch (e) {
+      MessagePlugin.error('改账失败（未产生任何委托）：' + (e && e.message ? e.message : '请求失败'))
+    } finally { setManualSubmitting(false) }
   }
 
   // 展开/收起指定代码的分时图（维护已展开代码集合）
@@ -951,7 +1080,18 @@ export default function Positions() {
 
   // 实盘持仓表格列定义：代码、名称、数量、成本/现价、持仓盈亏、最高价、建议标签与操作按钮
   const realColumns = [
-    { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.ts_code}</span> },
+    // §MANUAL-BOOK-UNIFY 行级来源角标：持仓维确认为手动来源时，每一行都自带"人敲的"身份。
+    // 只挂在代码列（首屏必视列）；柜台来源与读数未知一律不挂——角标乱挂等于没有角标。
+    // English: rows sourced from the manual book carry an explicit badge; counter/unknown rows do not.
+    { colKey: 'ts_code', title: '代码', width: 120, cell: ({ row }) => (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+        <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.ts_code}</span>
+        {posSrc === 'manual' && (
+          <Tag data-testid="manual-row-badge" theme="warning" size="small"
+            title={manualSourceMain(realBookSource?.positions_asof) + ' · ' + MANUAL_SOURCE_NONREALTIME}>改账</Tag>
+        )}
+      </span>
+    ) },
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name}</span> },
     { colKey: 'qty', title: '数量', width: 70, sorter: (a, b) => (a.qty || 0) - (b.qty || 0), cell: ({ row }) => row.qty },
     { colKey: 'cost_price', title: '成本价', width: 90, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(3) : '-') },
@@ -975,16 +1115,19 @@ export default function Positions() {
     // theme 表按**中文动作字面量**判：旧键是 add/reduce/tp 这套英文，而后端 Action 一直是中文，
     // 所以那五行配色从来没有生效过（所有标签一律 default 色）。这是顺手补真，不改任何判定。
     { colKey: 'advice', title: '建议', width: 170, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: 'var(--app-border)' }}>—</span>; const theme = { 加仓: 'danger', 减仓: 'warning', 止盈: 'success', 止损: 'success', 撤单: 'warning', 格局: 'default', 持有: 'default' }[a.action] || 'default'; const suggest = adviceSuggestText(a); return (<div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}><Tag data-testid="advice-tag" theme={theme} size="small">{adviceRowLabel(a)}</Tag>{suggest ? <span data-testid="advice-suggest" className="muted" style={{ fontSize: 12 }}>{suggest}</span> : null}</div>) } },
-    //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用）
-    //  §MULTI-ACCT-B 批5：这四个按钮打的是 POST /api/positions/execute（**本批刻意没对
-    //  quant_trade 开放**——手动下真实单属运营动作），因此按 canTrading 隐藏，
-    //  只持 quant_trade 的成员看到的是同一张表、少了操作列，不会"能点却必 403"。
-    { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (!canTrading ? <span style={{ color: 'var(--app-border)' }}>—</span> : (
+    // 实盘操作列：加仓/减仓/止盈/清仓。§MANUAL-BOOK-UNIFY（2026-11-06 裁决 2）**一个按钮两种含义**，
+    // 判据只认后端单点装配的 book_source：改账态走 adjust（不下单），其余两态走 execute（今天行为）。
+    // disabled={realTripped} 只在真单态保留：桥断那天熔断必然已开，若改账态还照旧禁用，
+    // 四个按钮会一个都点不动——而那正是这本账唯一要被用上的时刻。
+    // §MULTI-ACCT-B 批5：execute 未对 quant_trade 开放，按 canTrading 隐藏的口径不变。
+    // English: same four buttons, two meanings — real orders while the counter is reachable,
+    // book adjustments (no order) when it is not; unknown keeps today's real-order behaviour.
+    { colKey: 'actions', title: manualMode ? '改账' : '操作', width: 200, cell: ({ row }) => (!canTrading ? <span style={{ color: 'var(--app-border)' }}>—</span> : (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
-        <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'add') }}>加仓</Button>
-        <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'reduce') }}>减仓</Button>
-        <Button size="small" variant="outline" theme="warning" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'tp') }}>止盈</Button>
-        <Button size="small" variant="outline" theme="danger" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'close') }}>清仓</Button>
+        <Button size="small" variant="outline" theme="primary" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'add') : openRealAction(row, 'add') }}>加仓</Button>
+        <Button size="small" variant="outline" theme="primary" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'reduce') : openRealAction(row, 'reduce') }}>减仓</Button>
+        <Button size="small" variant="outline" theme="warning" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'tp') : openRealAction(row, 'tp') }}>止盈</Button>
+        <Button size="small" variant="outline" theme="danger" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'close') : openRealAction(row, 'close') }}>清仓</Button>
       </div>
     )) },
   ]
@@ -1183,16 +1326,38 @@ export default function Positions() {
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
           </div>
 
-          {/* §2.12 手动维护账面板（券商禁令/桥断后续批）：桥回报可能断，owner 手敲的
-              持仓与可用资金走这本账，量化交易据它算动态仓位与推送买卖。
-              硬边界：单独一块带显眼来源身份条的 Card，绝不塞进上面的实盘持仓表格，
-              也绝不与 realPositions/realAccount 合并——手动数据一旦画成和桥回报一样的样式，
-              就会有人把"用户声称"当成"柜台证据"去下真单。
-              放在表格三元式之外 ⇒ 一张桥持仓都没有时照样能开/编辑/保存这本账。
-              manual 只传单独的 manualBook state（缺字段时面板自报"尚未维护"）；
-              onChanged 用 loadReal 重读：保存成功后连同实盘读数一起刷新，不留脏回显。 */}
-          <div style={{ marginBottom: 12 }}>
-            <ManualBookPanel manual={manualBook} onChanged={loadReal} />
+          {/* §MANUAL-BOOK-UNIFY（2026-11-06 裁决 2/4/5）可达性状态行 + 改账态两个入口。
+              旧形态是实仓表格之外再挂一块独立的「手动维护账」面板（第二个录入口，难用），
+              已按 owner 裁决删除：维护统一落在这张实仓表的四个动作上，冲突时柜台赢。
+              状态行放在表格三元式之外 ⇒ 一张持仓都没有时（桥断当天新买的票还没进账）
+              照样能看见"现在是改账态"，也照样点得到「改账·新增」。
+              unknown 态一律显示"读数未知"这四个字，绝不把没读到的来源画成 0 或空表，
+              也不许自动切改账（沿用 CarrierShadowPanel 那条纪律）。
+              English: one status strip for the whole tab; adjust-only entries appear solely in
+              adjust mode; an unknown source is labelled unknown, never rendered as zero. */}
+          <div data-testid="real-book-source" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: manualMode ? '#fff7e6' : 'transparent', border: manualMode ? '1px solid #ffd591' : '1px solid transparent' }}>
+            {counterReachable ? (
+              <>
+                <Tag data-testid="counter-reachable" theme="success" size="small">柜台：可达</Tag>
+                <span className="muted">持仓与可用资金以 QMT 柜台回报为准 · 回报于 {latestUpdatedAt() || '—'}</span>
+              </>
+            ) : manualMode ? (
+              <>
+                <Tag data-testid="counter-unreachable" theme="warning" size="small">柜台：不可达 · 改账态</Tag>
+                <span className="muted" data-testid="manual-book-note">
+                  {manualSourceMain(realBookSource?.positions_asof || realBookSource?.cash_asof)} · {MANUAL_SOURCE_NONREALTIME}
+                </span>
+                {realBookSource?.taken_over_at && <span className="muted">已被柜台接管于 {realBookSource.taken_over_at}</span>}
+                <span className="muted">四个动作只改账（不下单）</span>
+                <Button data-testid="manual-new-entry" size="small" variant="outline" theme="warning" onClick={openManualNew}>改账·新增</Button>
+                <Button data-testid="manual-set-cash-entry" size="small" variant="outline" theme="default" onClick={openManualSetCash}>直接改资金</Button>
+              </>
+            ) : bookUnknown ? (
+              <>
+                <Tag data-testid="book-unknown" theme="danger" size="small">柜台：读数未知</Tag>
+                <span className="muted">读数未知：未取得账本来源，操作列保持下真单；请刷新重试</span>
+              </>
+            ) : null}
           </div>
 
           {/* §TRADE-CARD（2026-11-05）撤单提示条：这条**必须挂在持仓表格之外**——
@@ -1397,6 +1562,62 @@ export default function Positions() {
           {realFormQty > 0 && realFormPrice > 0 && (
             <div className="muted">预估金额：¥{(realFormQty * realFormPrice).toFixed(2)}</div>
           )}
+        </Form>
+      </Dialog>
+
+      {/* §MANUAL-BOOK-UNIFY 改账弹窗（桥断态专用）：与上面真单弹窗**刻意不同形**。
+          header 与确认按钮都带「改账 · 不下单」；两个态的确认按钮文案不同
+          （真单＝「确认下单」，改账＝「确认改账 · 不下单」）——同形就是
+          "以为下了单其实只改了账"最容易发生的那一处。战法/归因字段改账态没有，也不该有。
+          English: the adjust dialog never shares its shape with the real-order dialog, precisely
+          so an operator cannot mistake bookkeeping for placing a broker order. */}
+      <Dialog
+        visible={!!manualAction}
+        header={'改账 · 不下单｜' + ({ add: '加仓', reduce: '减仓', tp: '止盈', close: '清仓', new: '改账新增' }[manualAction?.dir] || '改账')
+          + ' ' + (manualAction?.pos?.ts_code || manualFormCode || '')}
+        onClose={() => setManualAction(null)}
+        onConfirm={confirmManualAdjust}
+        confirmBtn={manualSubmitting ? '改账中…' : '确认改账 · 不下单'}
+        cancelBtn="取消"
+      >
+        <Form onSubmit={confirmManualAdjust}>
+          <div data-testid="manual-adjust-dialog" className="muted" style={{ marginBottom: 8 }}>
+            本笔只改量仔账本，不产生任何委托；柜台恢复后以柜台回报为准。
+          </div>
+          {manualAction?.dir === 'new' ? (
+            <Form.FormItem label="代码">
+              <Input value={manualFormCode} placeholder="输入代码（如 600000.SH）" onChange={(v) => setManualFormCode(v)} />
+            </Form.FormItem>
+          ) : (
+            <Form.FormItem label="当前持仓">
+              <span>{manualAction?.pos?.qty} 股 / 成本 ¥{manualAction?.pos?.cost_price?.toFixed(3)}</span>
+            </Form.FormItem>
+          )}
+          <Form.FormItem label="成交价">
+            <InputNumber value={manualFormPrice} min={0} step={0.001} placeholder="本笔成交价" onChange={(v) => setManualFormPrice(Number(v) || 0)} />
+          </Form.FormItem>
+          {manualAction?.dir !== 'close' && (
+            <Form.FormItem label="数量">
+              <InputNumber value={manualFormQty} min={100} step={100} placeholder="股数（一手=100）" onChange={(v) => setManualFormQty(parseInt(v) || 0)} />
+            </Form.FormItem>
+          )}
+          <div className="muted">资金联动：买扣卖加（数量×成交价）；手续费不建模，分红/出入金请用「直接改资金」。</div>
+        </Form>
+      </Dialog>
+
+      {/* 「直接改资金」（裁决 3 的手续费/分红/出入金口子）：改的是**改后可用资金**整值。
+          与改持仓拆成两张弹窗，免得预填值互相污染；真 0 是合法值，没填才是没填。 */}
+      <Dialog visible={manualSetCashShow} header="直接改可用资金 · 改账（不下单）"
+        onClose={() => setManualSetCashShow(false)} onConfirm={confirmManualSetCash}
+        confirmBtn={manualSubmitting ? '改账中…' : '确认改账 · 不下单'} cancelBtn="取消">
+        <Form onSubmit={confirmManualSetCash}>
+          <div data-testid="manual-set-cash-dialog" className="muted" style={{ marginBottom: 8 }}>
+            改的是改后可用资金的整值；手续费/分红/出入金不建模，用这个口子兜平。填 0 表示真的没有可用资金。
+          </div>
+          <Form.FormItem label="可用资金">
+            <InputNumber value={Number(manualSetCashVal) || 0} min={0} step={0.01} placeholder="改后可用资金"
+              onChange={(v) => setManualSetCashVal(String(v ?? ''))} />
+          </Form.FormItem>
         </Form>
       </Dialog>
 

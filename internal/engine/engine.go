@@ -1692,18 +1692,17 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		out.SkipReason = "账本/账号/行情未就绪"
 		return 0, out
 	}
-	// §MANUAL-BOOK-FALLBACK：账户维度读数统一走单一 resolver。桥新鲜时它就是原来的
-	// cashAccount/RealPositionsForUser（今天行为逐字不变）；桥断了且 owner 维护了手动实盘，
-	// 才改用那份——只在内存里当计算输入，绝不写回 real_*。
+	// §MANUAL-BOOK-UNIFY（11-06 裁决 1）：账户维度读数统一走这一个 resolver，两维各自选源。
+	// 柜台在报数 ⇒ 逐字今天的柜台口径；柜台不报数且 owner 维护了当日手动账 ⇒ 用那份（内存选择，绝不写回 real_*）。
 	acctBook := e.accountBookFor(uid)
 	out.Source = acctBook.Source
 	out.AsOf = acctBook.AsOf
-	// 基数优先用 total_asset；手动账没填总资产时不许拿柜台账本合计去补，
+	// 基数优先用 total_asset；资金维来自手动账时不许拿柜台账本合计去补，
 	// 否则两本账会混成一份看似精确的基数。
 	total := 0.0
 	if acctBook.Account.TotalAsset > 0 {
 		total = acctBook.Account.TotalAsset
-	} else if !acctBook.Manual {
+	} else if acctBook.CashSource != accountSourceManual {
 		if v := e.totalAssetsFor(uid); v > 0 {
 			total = v
 		}
@@ -1717,16 +1716,16 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 		out.SkipReason = "总资产不可得"
 		return 0, out
 	}
-	// 手动账是 owner 声称、不是柜台证据：它绝不进 §M12-A「必须新鲜」硬闸。
-	// 所以这里走显式分支——用手动可用资金继续算，但把 CashStale 保持为真、
-	// 读数面带 source/asof，绝不假装券商刚回报过。
+	// 手动资金维（owner 裁决 1）：它现在**就是**本轮的可用资金口径，参与买入判定不再是越界行为；
+	// 但 CashStale 仍保持 true、读数面仍带 source/asof——"用得上"不等于"和柜台读数一样可信"，
+	// 这两件事在屏上必须分开，否则下一次没人维护手动账时没人看得出来。
 	var cash float64
-	if acctBook.Manual {
+	if acctBook.CashSource == accountSourceManual {
 		cash = acctBook.Account.AvailableCash
 		out.Cash = cash
 		out.CashStale = true
 		log.Printf("[qmt] %s §MANUAL-BOOK 动态预算使用手动实盘资金 %.0f（source=manual asof=%s，非柜台读数）",
-			sig.Code, out.Cash, acctBook.AsOf)
+			sig.Code, out.Cash, acctBook.CashAsOf)
 	} else {
 		var fresh bool
 		cash, fresh = ctrl.AvailableCash()

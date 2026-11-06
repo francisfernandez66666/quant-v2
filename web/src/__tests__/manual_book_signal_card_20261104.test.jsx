@@ -5,8 +5,11 @@
 //  B 缺股数时**不许伪造**：不折成 0 股、不折成一手 100 股，只显示「数据缺失」；
 //  C 同一 signal_id 跨三通道只推一次（去重账是共用的，不是每通道各一本）；
 //  D 每条通道能单独关掉，关掉的那条一次都不发；
-//  E 手动账面板：回显「手动维护，更新于 …」，且"只改资金"的那次提交**不带** positions 键
-//    （带了就是全量替换＝把持仓清单清空）。
+//  E 手动账写面封装：空提交就地拦下 + 增量改账包装层形状。
+//    §MANUAL-BOOK-UNIFY（2026-11-06 裁决 2）删掉独立「手动维护账」面板后，原来挂在面板上的
+//    三条用例一并退役。其中"回显…并写明这本账不参与硬闸"那条是**旧口径的正锁**：
+//    owner 裁决 1 已把"绝不进任何必须新鲜硬闸"改判为"经 resolver 显式选源参与买卖硬闸"，
+//    留着就是给被推翻的口径继续背书（方案 §8 #6：改判而不是留）。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, within } from '@testing-library/react'
 
@@ -36,7 +39,6 @@ import {
   CARD_FIELDS, DEFAULT_CHANNELS, MISSING_LABEL, createSeenStore, dispatchCard,
   loadChannelPrefs, normalizeCard, saveChannelPrefs,
 } from '../utils/signalCard.js'
-import ManualBookPanel from '../components/ManualBookPanel.jsx'
 import SignalCardModal from '../components/SignalCardModal.jsx'
 
 // fullCard 后端装配好的一张"八字段齐全"的卡（与 Go 侧 SignalCard 的 JSON tag 同源）。
@@ -185,55 +187,8 @@ describe('D 通道单独开关', () => {
   })
 })
 
-describe('E 手动维护账面板', () => {
+describe('E 手动账写面封装（§MANUAL-BOOK-UNIFY）', () => {
   beforeEach(() => { api.saveManualBook.mockReset() })
-
-  const manual = {
-    present: true, source: 'manual', asof: '2026-11-04 09:30:00',
-    note: '手动维护，更新于 2026-11-04 09:30:00', cash_state: 'positive',
-    positions: [{ ts_code: '600000.SH', name: '浦发银行', qty: 1000, cost_price: 8.5 }],
-    account: { present: true, filled: true, account: { available_cash: 50000, total_asset: 58500 } },
-  }
-
-  it('回显「手动维护，更新于 …」，并写明这本账不参与硬闸', () => {
-    render(<ManualBookPanel manual={manual} />)
-    expect(screen.getByTestId('manual-book-note')).toHaveTextContent('手动维护，更新于 2026-11-04 09:30:00')
-    // 判据是"这本账不参与任何必须新鲜的硬闸"，屏上原文用的是"都不读它/照旧不动"，
-    // 断言按屏上实际措辞取串——取"不进"会红在文字上而不是红在缺陷上。
-    expect(screen.getByTestId('manual-book-panel')).toHaveTextContent('都不读它')
-    expect(screen.getByTestId('manual-book-panel')).toHaveTextContent('用户声称')
-  })
-
-  it('只改资金那次提交不带 positions 键（带了＝全量替换，会清空持仓清单）', async () => {
-    api.saveManualBook.mockResolvedValue({ ...manual, note: '手动维护，更新于 2026-11-04 10:00:00' })
-    const { container } = render(<ManualBookPanel manual={manual} />)
-    const cashInput = container.querySelector('input[placeholder="可用资金"]')
-    fireEvent.change(cashInput, { target: { value: '61000' } })
-    fireEvent.click(screen.getByText('只保存资金'))
-    await (async () => { await Promise.resolve() })()
-    expect(api.saveManualBook).toHaveBeenCalledTimes(1)
-    const body = api.saveManualBook.mock.calls[0][0]
-    expect(body.positions).toBeUndefined()
-    expect(body.available_cash).toBe(61000)
-  })
-
-  it('保存持仓那次把股数按数字发出；没填股数的一行直接拦在界面（不发请求）', async () => {
-    api.saveManualBook.mockResolvedValue({ ...manual })
-    const { container } = render(<ManualBookPanel manual={manual} />)
-    const qty = container.querySelector('input[placeholder="股数"]')
-    fireEvent.change(qty, { target: { value: '1200' } })
-    fireEvent.click(screen.getByText('保存持仓（全量）'))
-    await (async () => { await Promise.resolve() })()
-    expect(api.saveManualBook).toHaveBeenCalledTimes(1)
-    expect(api.saveManualBook.mock.calls[0][0].positions).toEqual([{ ts_code: '600000.SH', qty: 1200, name: '浦发银行', cost_price: 8.5 }])
-
-    // 把数量清空 ⇒ 必须拦下来，不发那次必被 400 的请求
-    api.saveManualBook.mockClear()
-    fireEvent.change(container.querySelector('input[placeholder="股数"]'), { target: { value: '' } })
-    fireEvent.click(screen.getByText('保存持仓（全量）'))
-    await (async () => { await Promise.resolve() })()
-    expect(api.saveManualBook).not.toHaveBeenCalled()
-  })
 
   it('api 层守住"两个键都不带"的空提交（全量语义下那是最坏的一次误写）', async () => {
     // 本文件把 ../api 整体 mock 掉了（组件用例要的只是它的调用记录），
@@ -241,6 +196,26 @@ describe('E 手动维护账面板', () => {
     // expect(...).rejects 会因为"不是 Promise"而报夹具错，而不是报产品错。
     const real = await vi.importActual('../api/index.js')
     await expect(real.saveManualBook({ asof: '2026-11-04 09:30:00' })).rejects.toThrow(/至少带一项/)
+  })
+
+  // 增量改账的包装层：这些校验都在**发请求之前**，就地拦下"没填"与"填 0"的混淆。
+  // set_cash 的 0 是合法值（真的没有可用资金），持仓类动作的 qty/price 缺键则必被后端 400。
+  it('adjustManualBook 缺 op / 缺数量 / 缺有效价 / set_cash 缺资金 一律不发请求', async () => {
+    const real = await vi.importActual('../api/index.js')
+    await expect(real.adjustManualBook({ qty: 100, price: 9 })).rejects.toThrow(/必须带 op/)
+    await expect(real.adjustManualBook({ op: 'add', price: 9 })).rejects.toThrow(/缺数量/)
+    await expect(real.adjustManualBook({ op: 'add', qty: 100 })).rejects.toThrow(/有效成交价/)
+    await expect(real.adjustManualBook({ op: 'set_cash' })).rejects.toThrow(/缺 available_cash/)
+  })
+
+  it('manualSource 两句身份文案仍是全站唯一源（删面板不许顺手删掉它）', async () => {
+    const src = await import('../utils/manualSource.js')
+    expect(src.manualSourceMain('2026-11-06 09:30:00')).toBe('手动维护，更新于 2026-11-06 09:30:00')
+    expect(src.manualSourceMain('')).toBe('手动维护') // 缺时刻只留半句，绝不伪造时刻
+    expect(src.MANUAL_SOURCE_NONREALTIME).toBe('非柜台实时读数')
+    expect(src.signalManualSource({ source: 'manual', asof: '2026-11-06 09:30:00' }).text)
+      .toContain(src.MANUAL_SOURCE_NONREALTIME)
+    expect(src.signalManualSource({ source: 'counter' })).toBeNull()
   })
 })
 

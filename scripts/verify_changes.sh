@@ -21129,8 +21129,51 @@ grep_q 'submitOrderReceipt' WEBAPI F || fail173 "B1 人工回执前端入口缺 
 grep_q '人工回执' WEBQ F || fail173 "B1 人工回执没挂上量化交易页（台账自标『无 UI 待补』已结案）"
 grep_q 'STRATEGY_SWITCH_SYNC=OK' BFPT F || fail173 "打包脚本没在出包前实跑快照对账"
 
+# ⑱ §MANUAL-BOOK-UNIFY（11-06 晚批，owner 裁决 2/4）：实仓单一出入口与两态分流。
+# 判据一律打在**赋值点/发射点**（导出函数、确认按钮文案、状态行文案），不打裸词——
+# 裸词锁会被一句注释骗过。五条对应方案 §7.2 的前端锁：
+#  ① 独立面板文件与挂载点双双不在册（负锁）；② 真单/改账确认按钮不同形；
+#  ③ 改账态才有「改账·新增」「直接改资金」；④ unknown 显示「读数未知」绝不显示 0；
+#  ⑤ manualSource.js 两句身份文案仍被实仓页引用（删面板不许顺手删文案源）。
+# 常驻反证：在 Positions.jsx 的**临时副本**里塞回一行挂载，判据必须变红；
+# 主仓文件全程不动，最后 cmp -s 逐字节自证（11-04 §173 同款形状）。
+CNT173=$((CNT173 + 1))
+MBU_POS=web/src/pages/Positions.jsx
+MBU_API=web/src/api/index.js
+MBU_PANEL=web/src/components/ManualBookPanel.jsx
+MBU_SRC=web/src/utils/manualSource.js
+mbu_locks_fail() {
+	local f="$1" a="$2" p="$3" s="$4" bad=0
+	[ -f "$p" ] && bad=$((bad + 1))
+	grep -q 'ManualBookPanel' "$f" && bad=$((bad + 1))
+	grep -q 'export async function adjustManualBook' "$a" || bad=$((bad + 1))
+	grep -q '确认改账 · 不下单' "$f" || bad=$((bad + 1))
+	grep -q '确认下单' "$f" || bad=$((bad + 1))
+	grep -q 'manual-new-entry' "$f" || bad=$((bad + 1))
+	grep -q 'manual-set-cash-entry' "$f" || bad=$((bad + 1))
+	grep -q '柜台：读数未知' "$f" || bad=$((bad + 1))
+	grep -q 'manualSourceMain' "$f" || bad=$((bad + 1))
+	grep -q 'MANUAL_SOURCE_NONREALTIME' "$s" || bad=$((bad + 1))
+	return "$bad"
+}
+if mbu_locks_fail "$MBU_POS" "$MBU_API" "$MBU_PANEL" "$MBU_SRC"; then
+	:
+else
+	fail173 "§MANUAL-BOOK-UNIFY 实仓单一出入口/两态分流锁在主仓没全绿（面板在册或入口/文案缺位）"
+fi
+MBU_WORK=$(mktemp -d)
+cp "$MBU_POS" "$MBU_WORK/orig.jsx"
+cp "$MBU_POS" "$MBU_WORK/mutated.jsx"
+python3 -c "import pathlib,sys; p=pathlib.Path(sys.argv[1]); s=p.read_text(encoding='utf-8'); p.write_text(s.replace('<Tabs value={bookTab}', '<ManualBookPanel manual={null} />\n      <Tabs value={bookTab}', 1), encoding='utf-8')" "$MBU_WORK/mutated.jsx"
+if mbu_locks_fail "$MBU_WORK/mutated.jsx" "$MBU_API" "$MBU_PANEL" "$MBU_SRC"; then
+	fail173 "§MANUAL-BOOK-UNIFY 塞雷后锁仍然绿（往页面塞回面板挂载都没判红＝这把锁今天没牙）"
+fi
+cmp -s "$MBU_WORK/orig.jsx" "$MBU_POS" || fail173 "§MANUAL-BOOK-UNIFY 反证过程改了主仓文件（cmp -s 不一致）"
+rm -rf "$MBU_WORK"
+echo "   [§173 ⑱] 实仓单一出入口反证：塞回面板挂载必红、主仓 cmp -s 逐字节一致"
+
 [ "$B173_FAILED" = "0" ] || exit 1
-echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1 + 建议×战法开关与建议股数 1 + BAN_IO 禁令自证 1 + 终端版本巡检 1 + 做 T 判断腿接线 1 + 信号消失即撤 1 + 撤单动作快照 1 + 交易级提醒与做T标注 1 + 沙箱固定时刻 1 + 发送前预算复核算术 1 + VWAP 改价腿与撤单唯一出口 1 + 载体同款三行为与桥/物理机切换互锁 1 + tab 战法开关同源与部成成交表 1，累计判定点 ${CNT173}）"
+echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1 + 建议×战法开关与建议股数 1 + BAN_IO 禁令自证 1 + 终端版本巡检 1 + 做 T 判断腿接线 1 + 信号消失即撤 1 + 撤单动作快照 1 + 交易级提醒与做T标注 1 + 沙箱固定时刻 1 + 发送前预算复核算术 1 + VWAP 改价腿与撤单唯一出口 1 + 载体同款三行为与桥/物理机切换互锁 1 + tab 战法开关同源与部成成交表 1 + 实仓单一出入口与两态分流 1，累计判定点 ${CNT173}）"
 
 echo "==> 全部通过"
 

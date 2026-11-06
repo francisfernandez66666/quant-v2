@@ -186,21 +186,23 @@ func (e *Engine) sendRoomGuard(uid string, amount float64, signalID string) (boo
 	if !e.buyRoomGuardOn(uid) {
 		return true, 0
 	}
-	// §MANUAL-BOOK-FALLBACK（11-06）：发送前复核与 dynamicBuyQty 必须读同一本账，
+	// §MANUAL-BOOK-UNIFY（11-06 裁决 1）：发送前复核与 dynamicBuyQty 必须读同一本账，
 	// 否则定量用手动实盘、复核用空掉的柜台表，会把「复核放行」变成第二份口径。
 	acctBook := e.accountBookFor(uid)
 	total := 0.0
 	if acctBook.Account.TotalAsset > 0 {
 		total = acctBook.Account.TotalAsset
-	} else if !acctBook.Manual {
+	} else if acctBook.CashSource != accountSourceManual {
 		if v := e.totalAssetsFor(uid); v > 0 {
 			total = v
 		}
 	}
 	// 可用资金这把退路尺：与 total 同源取账号现金（拿不到就是没有这把尺，不许猜 0）。
 	cash, cashOK := e.availableCashFor(uid)
-	if acctBook.Manual {
-		// 手动账是计算输入、不是柜台真值；这里同样不进任何「必须新鲜」硬闸。
+	if acctBook.CashSource == accountSourceManual {
+		// 资金维已由手动当日账供数（owner 裁决 1：柜台连不上就以手工为准）。
+		// 这里显式取 resolver 的值而不是依赖 availableCashFor 的回落腿：两把尺必须同源同一个 asof，
+		// 否则复核与定量会在"手动账刚被改过"的那一瞬间读到不同余额。
 		cash, cashOK = acctBook.Account.AvailableCash, true
 	}
 	poses, err := acctBook.Positions, acctBook.PositionsErr

@@ -361,34 +361,78 @@ func (c *Controller) Mode() string {
 // AvailableCash 返回最近一次网关上报的可用资金与其新鲜度（§M12-A 三态口径，2026-09-22 owner 定调）。
 // 资产由广州网关每分钟对账上报（real_account 表，§M1）；返回值语义：
 //   - (value, true)：账本可查且 30 分钟内有回报——value 是**真值**，0 就是真没钱；
-//   - (value/0, false)：未接账本库/查询失败/回报超过 30 分钟——**资金口径不可得**。
+//     或柜台回报不可信但 owner 维护了**当日**手动资金账（§MANUAL-BOOK-UNIFY 2026-11-06 裁决 1，
+//     详见 AvailableCashBook）——value 是用户声称值，读数面必须标"非柜台实时读数"；
+//   - (value/0, false)：未接账本库/两本账都查不到/柜台过期且没有当日手动账——**资金口径不可得**。
 //
 // 调用方（engine 自动买入腿）对 fresh=false 的处理是 **fail-close：不自动买**（保留手动通道），
 // 并经 /api/qmt/state 的 cash_stale 暴露给前端降级横幅。旧两态口径（未知/过期一律返回 0、
 // 调用方视为「不设限」放行）已废弃——H-4 事故证明冻结/断供的资金值与真零混在一起时，
 // 要么全拦要么全放，两个方向都是事故。
-// English: §M12-A three-state cash basis (owner verdict A, fail-close). fresh=false means the
-// ledger basis is unavailable (store nil / query error / report older than 30min) and the auto-buy
-// leg must NOT fire; manual orders stay available and the state endpoint exposes cash_stale for a
-// frontend banner. The old two-state contract (0 = "no cap") is retired.
+// English: §M12-A three-state cash basis (owner verdict A, fail-close), plus the §MANUAL-BOOK-UNIFY
+// fallback leg (counter stale AND owner maintained a same-day manual book → manual cash, fresh=true).
+// fresh=false still means "no basis at all" and the auto-buy leg must NOT fire.
 func (c *Controller) AvailableCash() (float64, bool) {
+	cash, fresh, _ := c.AvailableCashBook()
+	return cash, fresh
+}
+
+// AvailableCashBook §MANUAL-BOOK-UNIFY（2026-11-06，owner 裁决 1）：带来源的三态资金读数。
+//
+// 与 AvailableCash 的唯一新增是第三条返回值 source（"counter" / "manual" / "none"），
+// 以及**柜台不新鲜时多一条回落腿**：
+//   - 柜台回报新鲜 ⇒ 逐字今天的形态（(柜台值, true, "counter")）；
+//   - 柜台不新鲜，但 owner 维护了**当日**手动资金账（asof 属今日、未被柜台接管覆盖）
+//     ⇒ (手动值, true, "manual")——这就是裁决 1 要的"连不上就以手工为准"，
+//     §M12-A 的 fail-close 从此只在两本账都拿不到时才落；
+//   - 两本账都拿不到 ⇒ (柜台原值, false, "none")，调用方照旧不自动买。
+//
+// 为什么回落判据用 §M12-A 那把 30 分钟尺而不是新造一把：同一件事（柜台还在报数吗）
+// 有四个读者，多一把尺就多一处能漂的地方；真源已收在 store.CashReportFresh（freshness.go 头注写明成因）。
+//
+// 不取控制器锁：与 AvailableCash 同（纯读库），因此在 Snapshot 的 RLock 临界区内调用安全。
+func (c *Controller) AvailableCashBook() (float64, bool, string) {
 	if c.store == nil {
-		return 0, false // 未接账本库=资金口径不可得（§M12-A：调用方 fail-close，不自动买）
+		return 0, false, "none" // 未接账本库=两本账都读不到
 	}
 	acc, err := c.store.GetRealAccountScoped(c.userID, c.legacyCashGlobal)
 	if err != nil {
-		return 0, false // 查询失败同为口径不可得
+		// 柜台查询失败：仍允许回落手动账（柜台报不出数正是裁决 1 要兜的那一格）。
+		if cash, ok := c.manualCash(); ok {
+			return cash, true, "manual"
+		}
+		return 0, false, "none"
 	}
-	// 对账数据超过 30 分钟视为过期：带着原值返回 fresh=false，由调用方裁决。
-	// §0925EVE-W3-F（⑰/D2 时间口径收口）：UpdatedAt 是网关按北京时间写入的墙钟串
-	// （cntime 包声明的全系统唯一时区源），此处必须用 cntime.Loc 解析——此前误用
-	// time.Local，UTC 主机上北京墙钟串会被当作 UTC 时刻读成「未来 8 小时」，
-	// Since 为负恒判新鲜，40 分钟前的过期资金照旧放行 fresh=true（H-4 同族口径漂移）。
-	updated, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc)
-	if perr != nil || time.Since(updated) > 30*time.Minute {
-		return acc.AvailableCash, false
+	if store.CashReportFresh(acc.UpdatedAt, cntime.Now()) {
+		return acc.AvailableCash, true, "counter"
 	}
-	return acc.AvailableCash, true // 新鲜真值：0 即真无可用资金
+	if cash, ok := c.manualCash(); ok {
+		return cash, true, "manual"
+	}
+	// 带着原值返回 fresh=false，由调用方裁决（§M12-A 三态形态不变）。
+	return acc.AvailableCash, false, "none"
+}
+
+// manualCash 读该账号当日可用的手动资金。读失败一律按"不可用"处理并留痕——
+// 这里不许把"读不到"折成"手动账是 0"，那是 H-4 那族"真 0 与不可得混写"的原形。
+func (c *Controller) manualCash() (float64, bool) {
+	if c.store == nil {
+		return 0, false
+	}
+	day := cntime.DayOf(cntime.Now())
+	v, err := c.store.ManualBookViewFor(c.userID, day)
+	if err != nil {
+		log.Printf("[manual-book] 资金回落腿读取失败（按不可用处理，不冒充柜台）uid=%s: %v", c.userID, err)
+		return 0, false
+	}
+	if !v.CashUsable {
+		return 0, false
+	}
+	opslog.DayOnce("manualcash:"+c.userID, func() {
+		opslog.Logf("quant", "§MANUAL-BOOK 柜台资金回报不可信，可用资金改用手动实盘 %.0f（asof=%s，非柜台实时读数）",
+			v.Cash.Account.AvailableCash, v.CashAsOf)
+	})
+	return v.Cash.Account.AvailableCash, true
 }
 
 // Tripped 是否处于熔断状态（网关失联/心跳超时）。

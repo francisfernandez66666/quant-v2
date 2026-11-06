@@ -1258,6 +1258,14 @@ func (s *Server) handleFixSetBalance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "save balance failed: "+err.Error())
 		return
 	}
+	// §MANUAL-BOOK-UNIFY（2026-11-06 裁决 5）**刻意不在本函数打接管指针**。
+	// 方案 §5 曾把这一行误标为"对账写账户的第三处触发点"：本函数是纸面页
+	// POST /api/holdings/balance——人手工改可用资金，不是柜台回报。若在此调用
+	// markManualTakenOver，人改一次余额就把当日手动账判成"已被柜台接管"，下次桥断
+	// asof 早于接管时刻 ⇒ 手动账读不到，等于把唯一的止血通道自己关掉。
+	// 真源只有两条：qmt.go 的 positions 回报与 account 回报各自的**成功落库**分支。
+	// English: no take-over mark here — this is a human balance edit, not a counter report.
+	// Negative lock: TestManualTakenOverNotMarkedByManualBalanceEdit.
 	opslog.Audit("holdings_balance_set", uid, uid, fmt.Sprintf("available_balance=%.2f", r2(acc.AvailableCash)))
 	writeJSON(w, 200, map[string]interface{}{"status": "ok", "available_balance": r2(acc.AvailableCash)})
 }

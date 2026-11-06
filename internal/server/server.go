@@ -908,7 +908,7 @@ func (s *Server) registerRoutes() {
 	// **账号级 authMiddleware，刻意不落严格位**（§PLAN_EXTERNAL_BRAIN_IMPL §2.12 原文「不落严格位」）：
 	// 这是"成员维护自己的声称值"，不是实盘动作也不是实盘账本；挂 quant_trade/trading_admin 才能录，
 	// 等于把"桥断了以后先把手上的票记进量仔"这条止血通道一起锁进实盘权限面。
-	// 三条边界（按 requestUserID 归属／不进任何"必须新鲜"硬闸／请求体 user_id 一律不信）
+	// 三条边界（按 requestUserID 归属／绝不写进 real_* 柜台输入表、经 resolver 显式选源参与买卖硬闸／请求体 user_id 一律不信）
 	// 与"为什么不给 real_positions 加 source 列"的论证都在 internal/server/manual_book.go 文件头，
 	// 行为锁见 manual_book_test.go。
 	// §115/契约台账牵连：路由 +1、台账 +1 行、前端调用 +1（web/src/api/index.js: saveManualBook）。

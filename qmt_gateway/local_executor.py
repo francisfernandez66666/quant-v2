@@ -2021,6 +2021,8 @@ class XtBroker(object):
         try:
             raw = self._trader.query_stock_trades(self._acc)
         except Exception as exc:  # noqa: BLE001
+            # Fall back to the order-table copy when the trade table is unavailable;
+            # the caller must label this as a degraded source (never silent).
             LOG.warning("[broker] query_stock_trades unavailable, using order-table copy: %s", exc)
             return {}
         if raw is None:

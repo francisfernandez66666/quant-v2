@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 )
@@ -211,6 +212,18 @@ func (s *Server) handleQMTOrderReceipt(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fillWritten = true
+		// §MANUAL-BOOK-UNIFY §7.4 联动：回执落成交后，若该码存在**今日手动持仓行**，
+		// 打一行日志点名「两本账同时在动」，但**不自动改手动账**——自动改会让人敲的
+		// 与柜台报的在一次回执里互相覆盖，那是最难查的账。只读判定，不改任何账本。
+		// English: log the coexistence of both books; never auto-merge them inside a receipt.
+		if v, verr := db.ManualBookViewFor(uid, cntime.DayOf(cntime.Now())); verr == nil {
+			for _, p := range v.Positions {
+				if p.TsCode == own.Code {
+					log.Printf("[manual-book] 两本账同时在动：回执落成交 code=%s uid=%s 今日手动账仍在（未自动改写，请人工核对）", own.Code, uid)
+					break
+				}
+			}
+		}
 	}
 
 	// 人工回执标记：只补空、不覆盖（SetCancelTrace 的既有语义）——
