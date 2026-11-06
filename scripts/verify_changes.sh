@@ -21154,6 +21154,14 @@ mbu_locks_fail() {
 	grep -q '柜台：读数未知' "$f" || bad=$((bad + 1))
 	grep -q 'manualSourceMain' "$f" || bad=$((bad + 1))
 	grep -q 'MANUAL_SOURCE_NONREALTIME' "$s" || bad=$((bad + 1))
+	# 今天的开发内容必须在自动化测试程序里在册（不是只写在文档里）：
+	# Go 并发/跨日/接管三腿、改判后的柜台表负锁、前端三态行为用例，少一条就红。
+	grep -q 'func TestAdjustConcurrentAddsNoLostUpdate' internal/store/manual_adjust_test.go || bad=$((bad + 1))
+	grep -q 'func TestManualFlowsAcrossDaysDoNotRevive' internal/store/manual_adjust_test.go || bad=$((bad + 1))
+	grep -q 'func TestManualBookNeverReachesCounterTables' internal/store/manual_book_test.go || bad=$((bad + 1))
+	grep -q 'func TestManualTakenOverMarkedOnAccountReport' internal/server/manual_book_test.go || bad=$((bad + 1))
+	grep -q 'func TestManualTakenOverNotMarkedByManualBalanceEdit' internal/server/manual_book_test.go || bad=$((bad + 1))
+	grep -q '柜台不可达：状态行报' web/src/__tests__/manual_book_unify_20261106.test.jsx || bad=$((bad + 1))
 	return "$bad"
 }
 if mbu_locks_fail "$MBU_POS" "$MBU_API" "$MBU_PANEL" "$MBU_SRC"; then

@@ -174,14 +174,17 @@ func TestManualAccountThreeStates(t *testing.T) {
 	}
 }
 
-// TestManualBookNeverReachesHardGates ④（本批主题）：手动读数一张硬闸输入表都碰不到。
+// TestManualBookNeverReachesCounterTables ④：手动值**永不写进柜台输入表**（裁决 1 改判后仍成立）。
+// 别把这条读回旧口径：现在手动值会经 resolver 显式选源**参与**买卖硬闸，只是绝不落到 real_*
+// 两张表——柜台账只由回报与真实成交推进，是「柜台为准」能被机器判出来的前提。
+// 函数末尾另有正锁（ManualBookViewFor 必须把当日手动账判为可用），防「不写回」被做成「不参与」。
 //
 // 逐张数行数而不是"看代码没写那张表"：这张锁要在有人真去给 real_positions/real_account 加写入路径时
 // 当场变红。三张输入表分别是——
 //   - real_account：§M12-A 资金三态（Controller.AvailableCash）与 risk.Gate 的可用资金；
 //   - real_positions：T+1 可卖量 checkT1Sellable / 集中度 / BuyableQtyForUserSell；
 //   - orders：VWAP 硬过滤 fail-close 与收盘对账读的委托簿。
-func TestManualBookNeverReachesHardGates(t *testing.T) {
+func TestManualBookNeverReachesCounterTables(t *testing.T) {
 	db := manualTestDB(t)
 	uid := "u_gate"
 	code := "600111.SH"
@@ -196,7 +199,7 @@ func TestManualBookNeverReachesHardGates(t *testing.T) {
 	// 柜台账：三张输入表一行都不许多
 	var n int
 	if err := db.db.QueryRow(`SELECT COUNT(1) FROM real_positions WHERE user_id=? OR user_id=''`, uid).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("手动账写进了 real_positions（n=%d err=%v）——§M12-A/T+1 硬闸从此可被手敲解开", n, err)
+		t.Fatalf("手动账写进了 real_positions（n=%d err=%v）——柜台为准这条判据从此失去依据", n, err)
 	}
 	// real_account 是惰性建表（ensureRealAccountTable），这里按"该表要么不存在、要么没有本账号行"判：
 	// 用 store 自己的读口径而不是裸 SQL，否则新建库里那张表还没建出来，锁会红在无关的 DDL 上。
@@ -210,7 +213,7 @@ func TestManualBookNeverReachesHardGates(t *testing.T) {
 		t.Fatalf("手动账写进了 orders（n=%d err=%v）", n, err)
 	}
 
-	// 硬闸的三个实际取数口：读到的一定是"没有"
+	// 柜台输入表的三个实际取数口：读到的一定是"没有"（不写回 ≠ 不参与判定）
 	acc, err := db.GetRealAccountOwn(uid)
 	if err != nil || acc.AvailableCash != 0 || acc.UpdatedAt != "" {
 		t.Fatalf("GetRealAccountOwn 应仍是零值行（§M12-A 必须判成口径不可得）：%+v err=%v", acc, err)
@@ -221,12 +224,18 @@ func TestManualBookNeverReachesHardGates(t *testing.T) {
 	if q := db.BuyableQtyForUserSell(uid, code, cntime.DayOf(cntime.Now())); q != 0 {
 		t.Fatalf("手动持仓凭空造出可卖量：%d", q)
 	}
-	// 手动账自己那侧读得到（否则上面的"没进硬闸"只是"什么都没写"的假绿）
+	// 手动账自己那侧读得到（否则上面的"没写进柜台表"只是"什么都没写"的假绿）
 	if mp, err := db.ManualPositionsForUser(uid); err != nil || len(mp) != 1 || mp[0].Qty != 1000 {
 		t.Fatalf("手动账自身应读得到这一行：%+v err=%v", mp, err)
 	}
 	if st, _ := db.ManualAccountForUser(uid); !st.Filled || st.Account.AvailableCash != 999999 {
 		t.Fatalf("手动资金应读得到：%+v", st)
+	}
+
+	// 正锁（owner 2026-11-06 裁决 1）：不写回柜台表，但读侧选源必须把当日手动账判为可用，
+	// 否则「喂买卖硬闸」只是文档里的一句话。engine 侧 resolver 的端到端锁见 manual_book_source_test.go。
+	if v, verr := db.ManualBookViewFor(uid, cntime.DayOf(cntime.Now())); verr != nil || !v.CashUsable || !v.PositionsUsable {
+		t.Fatalf("当日手动账应经 resolver 选源参与硬闸（asof 今日 + 未被接管）：%+v err=%v", v, verr)
 	}
 }
 

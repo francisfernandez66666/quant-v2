@@ -15,6 +15,7 @@ package store
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -458,5 +459,106 @@ func TestAdjustNeverWritesCounterTables(t *testing.T) {
 	if afterAcc.AvailableCash != beforeAcc.AvailableCash || afterAcc.UpdatedAt != beforeAcc.UpdatedAt {
 		t.Fatalf("柜台资金行被改账污染（cash %.0f→%.0f，updated_at %q→%q）——手敲值一旦进这张表，§M12-A 会把人敲的数读成刚回报",
 			beforeAcc.AvailableCash, afterAcc.AvailableCash, beforeAcc.UpdatedAt, afterAcc.UpdatedAt)
+	}
+}
+
+// TestAdjustConcurrentAddsNoLostUpdate §7.1 第 9 条：同码两笔 add 并发，不丢量、不出半态。
+// 判据按**成功笔数**算而不是硬写死「两笔全成功」：SQLite WAL 下两个读改写事务可能有一笔
+// 撞 SQLITE_BUSY_SNAPSHOT，那一笔必须整笔回滚（持仓/资金/流水三处一起不动），
+// 不允许「钱扣了持仓没加」。把 AdjustManualBook 的事务拆掉，这里会红在 qty 或 cash 不一致上。
+// English: concurrent adjustments must never lose a successful write; a conflicting one rolls back whole.
+func TestAdjustConcurrentAddsNoLostUpdate(t *testing.T) {
+	db := manualTestDB(t)
+	uid := "u_concurrent"
+	day := manualToday()
+	if err := db.PutManualAccount(uid, 100000, true, 0, manualAsofOn(day)); err != nil {
+		t.Fatalf("资金基线: %v", err)
+	}
+	if _, err := db.AdjustManualBook(uid, ManualAdjustReq{Op: ManualOpNew, TsCode: "600000.SH", Qty: 1000, Price: 8.5, AsOf: day + " 09:30:00"}, day); err != nil {
+		t.Fatalf("建仓: %v", err)
+	}
+	const n = 2
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = db.AdjustManualBook(uid, ManualAdjustReq{
+				Op: ManualOpAdd, TsCode: "600000.SH", Qty: 100, Price: 9, AsOf: day + " 10:00:00",
+			}, day)
+		}(i)
+	}
+	wg.Wait()
+	ok := 0
+	for i, err := range errs {
+		if err == nil {
+			ok++
+			continue
+		}
+		// 只允许并发写冲突；别的错是产品缺陷，不是数据库并发语义。
+		if !strings.Contains(err.Error(), "locked") && !strings.Contains(err.Error(), "BUSY") {
+			t.Fatalf("第 %d 笔并发改账返回了非并发错误: %v", i, err)
+		}
+	}
+	if ok == 0 {
+		t.Fatal("两笔并发改账全失败，用例前提不成立（夹具/连接串问题，不是产品结论）")
+	}
+	rows, err := db.ManualPositionsForUser(uid)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("读手动持仓: rows=%d err=%v", len(rows), err)
+	}
+	if want := 1000 + ok*100; rows[0].Qty != want {
+		t.Fatalf("并发改账丢量：成功 %d 笔应 %d 股，got %d", ok, want, rows[0].Qty)
+	}
+	v, err := db.ManualBookViewFor(uid, day)
+	if err != nil {
+		t.Fatalf("读账本视图: %v", err)
+	}
+	if want := 100000 - 8500 - float64(ok)*900; v.Cash.Account.AvailableCash != want {
+		t.Fatalf("资金联动与持仓不同步（半态）：成功 %d 笔应 %.0f，got %.0f", ok, want, v.Cash.Account.AvailableCash)
+	}
+	flows, err := db.ManualFlowsForUser(uid, day)
+	if err != nil {
+		t.Fatalf("读流水: %v", err)
+	}
+	if want := 1 + ok; len(flows) != want {
+		t.Fatalf("流水与成功笔数不一致（成功 %d 笔应有 %d 行），got %d", ok, want, len(flows))
+	}
+}
+
+// TestManualFlowsAcrossDaysDoNotRevive §7.1 第 13 条补强：今日流水不因明日写入而累计，
+// 明日流水也不复活到今日——T+1 当日买入扣减的原料必须只认当日那一段。
+// English: day-keyed flows never accumulate across trading days.
+func TestManualFlowsAcrossDaysDoNotRevive(t *testing.T) {
+	db := manualTestDB(t)
+	uid := "u_flows_cross"
+	day := manualToday()
+	next := manualDayOffset(1)
+	if err := db.PutManualAccount(uid, 100000, true, 0, manualAsofOn(day)); err != nil {
+		t.Fatalf("资金基线: %v", err)
+	}
+	if _, _, err := db.PutManualPositions(uid, []ManualPosition{{TsCode: "600000.SH", Qty: 1000, CostPrice: 8.5}}, manualAsofOn(day)); err != nil {
+		t.Fatalf("播种持仓: %v", err)
+	}
+	if _, err := db.AdjustManualBook(uid, ManualAdjustReq{Op: ManualOpAdd, TsCode: "600000.SH", Qty: 100, Price: 9, AsOf: day + " 10:00:00"}, day); err != nil {
+		t.Fatalf("今日改账: %v", err)
+	}
+	if q, err := db.ManualTodayBoughtQty(uid, "600000.SH", day); err != nil || q != 100 {
+		t.Fatalf("今日买入量应 100，got %d err=%v", q, err)
+	}
+	if _, err := db.AdjustManualBook(uid, ManualAdjustReq{Op: ManualOpAdd, TsCode: "600000.SH", Qty: 200, Price: 9, AsOf: next + " 10:00:00"}, next); err != nil {
+		t.Fatalf("明日改账: %v", err)
+	}
+	if q, _ := db.ManualTodayBoughtQty(uid, "600000.SH", day); q != 100 {
+		t.Fatalf("今日流水被明日写入累计（会误杀隔夜仓的可卖量）：%d", q)
+	}
+	if q, _ := db.ManualTodayBoughtQty(uid, "600000.SH", next); q != 200 {
+		t.Fatalf("明日流水应独立记 200，got %d", q)
+	}
+	todayFlows, _ := db.ManualFlowsForUser(uid, day)
+	nextFlows, _ := db.ManualFlowsForUser(uid, next)
+	if len(todayFlows) != 1 || len(nextFlows) != 1 {
+		t.Fatalf("流水跨日串桶：今日 %d 行 / 明日 %d 行，应各 1 行", len(todayFlows), len(nextFlows))
 	}
 }

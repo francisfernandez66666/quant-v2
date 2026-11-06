@@ -187,7 +187,7 @@ func TestManualPositionsReadoutLabelsSource(t *testing.T) {
 
 // TestManualPositionsStaleAsofNeverUnlocksCashGate D：asof 停在旧日的手动账不许解开 §M12-A。
 //
-// 上午那批这条叫"手动读数绝不进硬闸"（本批主题）；owner 2026-11-06 裁决 1 把它改判成
+// 11-06 上午那批的旧主题是"手动读数绝不进硬闸"；owner 下午裁决 1 把它改判成
 // "柜台连不上就以手工为准"之后，它变成那条改判的**前置判据**——几天前手敲的余额不许在下次桥断时顶上。
 // 断言一个字没放松：判的还是 Controller.AvailableCash 的第二个返回值，也就是自动买入腿的 fail-close 开关。
 func TestManualPositionsStaleAsofNeverUnlocksCashGate(t *testing.T) {
