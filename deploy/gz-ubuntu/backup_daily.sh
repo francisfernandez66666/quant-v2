@@ -37,9 +37,13 @@ printf '{"ok":true,"ts":"%s","dbs":{"live.db":%s,"trading.db":%s},"integrity":"o
   "$(date -Iseconds)" "$LIVE_BYTES" "$TRADING_BYTES" "$ACCOUNTS" "$OUT" > "$WORK/SNAPSHOT_OK"
 
 ARCHIVE="$OUT/quant-$STAMP.tar.gz"
+# Write an explicit "in progress" marker BEFORE the long tar, so an interrupted
+# run can never leave an ok=true marker behind. Replaced with the real one only
+# after the archive has been written successfully.
+printf '{"ok":false,"reason":"backup_in_progress","ts":"%s"}\n' "$(date -Iseconds)" > "$OUT/SNAPSHOT_OK"
 if ! tar -czf "$ARCHIVE" \
   -C "$SRC" \
-    --exclude='trading.db' --exclude='live.db' \
+    --exclude='./trading.db' --exclude='./live.db' \
     --exclude='*.db-wal' --exclude='*.db-shm' \
     --exclude='qmt_gateway' --exclude='*bridge_report*.jsonl' \
     --exclude='bridge_cmd.json' --exclude='*.exe' --exclude='*.ps1' \
