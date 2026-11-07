@@ -142,8 +142,11 @@ JOURNAL_ERRORS=0"
 fi
 
 # ── 真机读数：一次 ssh 收齐，避免逐探针连接把失败伪装成超时 ──────────────────────
+# The pipe must live INSIDE the command substitution: putting `| tr` after `)"`
+# would assign READOUT only in a subshell and `set -u` would then abort on an
+# unbound variable. Heredoc stays attached to ssh (before the pipe), not to tr.
 READOUT="$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
-  "$TARGET" "EXPECT_COMMIT='$EXPECT_COMMIT' bash -s" <<'REMOTE'
+  "$TARGET" "EXPECT_COMMIT='$EXPECT_COMMIT' bash -s" 2>&1 <<'REMOTE' | tr -d '\r'
 set +e
 emit() { printf '%s=%s\n' "$1" "$2"; }
 for u in quant quant-research pydata caddy; do
@@ -165,7 +168,7 @@ emit SETUP_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https:
 emit ANON_API_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/api/status 2>/dev/null)"
 emit JOURNAL_ERRORS "$(journalctl -u quant --since '-10 min' --no-pager 2>/dev/null | grep -c 'ERROR' || true)"
 REMOTE
-)" 2>&1 | tr -d '\r'
+)"
 
 if [ -z "$READOUT" ]; then
   printf 'FAIL|remote_readout|empty target=%s\n' "$TARGET"

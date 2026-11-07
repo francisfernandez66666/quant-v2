@@ -1,4 +1,8 @@
 #!/bin/bash
+# ⚠️ 已退役（2026-11-07）：38 个探针全是 PS/NSSM/schtasks/注册表专属，
+# 广州云机重装为 Ubuntu 24.04 LTS 后不可用。改用
+# scripts/verify_deploy_guangzhou_linux.sh（bash+ssh，含 --selftest 变异反证）。
+# 保留本文件仅作历史与 Windows 镜像回滚参考。
 # verify_deploy_guangzhou.sh — 广州部署后自动化验证（§UAT 20260915 部署加固配套）。
 #
 # 定位：deploy_guangzhou.sh 只做"传上去+活着"，本脚本做"传对了吗+新代码生效了吗"的全量复核，

@@ -1,4 +1,8 @@
 #!/bin/bash
+# ⚠️ 已退役（2026-11-07）：广州云机已重装为 Ubuntu 24.04 LTS，本脚本的
+# NSSM / PowerShell / C:\opt\quant / *.exe 口径全部失效，不要再执行。
+# Linux 发版请改用 docs/DEPLOY_GZ_UBUNTU_20261107.md 与 deploy/gz-ubuntu/ 配置；
+# 保留本文件仅作历史与 Windows 镜像回滚参考。
 # 一键部署到广州腾讯云 Win Server 2022（单机全合一，docs/MIGRATION_GUANGZHOU_ALLINONE.md §2/§4）。
 #
 # 设计要点（防错）：
