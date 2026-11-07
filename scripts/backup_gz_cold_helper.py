@@ -792,9 +792,20 @@ def mode_l2(job):
                 counts.append("%s=%d" % (key, len(value) if isinstance(value, list) else 0))
             counts.append("schema_version=%s" % doc_auth.get("schema_version", "absent"))
             out("L2_AUTH|" + "|".join(counts))
+        # L2_APPLIED is plan 4.3's four-item assumption. On 2026-11-07 the real Guangzhou
+        # box only ever had applied_factors.json / applied_patterns.json; applied_rules.json
+        # and grayscale_rules.json were absent at the source (read-only verified, not lost
+        # in transfer). Keep the strict four-item check by default; a baseline may register
+        # an explicit allowance in its header, which must be echoed here so the exception
+        # is never silent. The allowance travels with THAT manifest only, so a future box
+        # that does produce these files still gets checked.
+        allowed = set(x for x in str(job.get("applied_absent_allow", "")).split(",") if x)
         for name in L2_APPLIED:
             if name not in got:
-                fails.append("applied_absent=%s" % name)
+                if name in allowed:
+                    out("L2_APPLIED_ABSENT_ALLOWED|name=%s" % name)
+                else:
+                    fails.append("applied_absent=%s" % name)
         accounts_n = len(accounts_seen)
         watch_global_n = len(watch_global_seen)
         watch_uid_n = len(watch_uid_seen)

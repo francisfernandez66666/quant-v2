@@ -1,0 +1,26 @@
+# 广州 Ubuntu 外脑 pydata sidecar unit（§6.6 工单 ③，2026-11-07）
+# 端口 U-10 现场裁定：首尔模板写 8788（因 8787 被翻译助手占），现网广州网关是 8789；
+# 本文件先用 8788，切换当天以现场 `ss -ltnp` 实读为准，冲突就改这里并重跑 daemon-reload。
+[Unit]
+Description=quant-trading-v2 baostock research data sidecar (Guangzhou)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+ExecStart=/opt/quant/venv/bin/python /opt/quant/pydata/server.py --host 127.0.0.1 --port 8788
+Restart=always
+RestartSec=5
+MemoryMax=512M
+LimitNOFILE=65535
+Environment=TZ=Asia/Shanghai
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

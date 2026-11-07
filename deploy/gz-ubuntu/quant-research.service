@@ -1,0 +1,41 @@
+# 广州 Ubuntu 外脑 quant-research unit（§6.6 工单 ③，2026-11-07）
+# 首尔模板的 500M/650M/GOMAXPROCS=4 是按 1.6G VPS 定的；广州 2 核 / 4GB 重定如下。
+# 研究侧单线程独占约 1 核（现网实测），GOMAXPROCS=1 与 CPUQuota=100% 对齐，
+# 低优先级 + I/O 让行，避免盘中与 quant 抢 CPU。
+[Unit]
+Description=quant-trading-v2 research scheduler (Guangzhou external brain)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/var/lib/quant-trading-v2
+ExecStart=/opt/quant/researchd
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+EnvironmentFile=-/etc/quant.env
+
+Nice=10
+CPUWeight=8
+CPUQuota=100%
+MemoryHigh=700M
+MemoryMax=1100M
+MemorySwapMax=512M
+IOSchedulingClass=idle
+
+Environment=TZ=Asia/Shanghai
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+Environment=PATH=/opt/quant:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=GOMAXPROCS=1
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quant-trading-v2
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

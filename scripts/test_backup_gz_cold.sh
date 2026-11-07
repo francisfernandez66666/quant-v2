@@ -152,9 +152,12 @@ else
 fi
 
 # ── 2. 预检三条该拦的必须拦住 ─────────────────────────────────────────────────────
+# 容量逼红因子原为 999999，是按规划时「本机只剩 11 Gi」标定的；owner 清理后余量
+# 涨到 52 Gi，小夹具包体 x 999999 已不超过余量 ⇒ 两条容量用例假红（闸没坏，是尺子
+# 跟着磁盘水位漂移）。改用 1e9：余量再涨一个数量级也仍然逼红，不再依赖现场盘况。
 stale="$(run_full --close-state-file="$T/close_stale.json" --frozen-confirmed 2>&1)"
 has "close_state_not_today_aborts" "$stale" "reason=close_state_not_today"
-tight="$(run_full --capacity-factor=999999 --frozen-confirmed 2>&1)"
+tight="$(run_full --capacity-factor=1000000000 --frozen-confirmed 2>&1)"
 has "capacity_shortfall_aborts" "$tight" "reason=capacity_shortfall"
 naked="$(run_full 2>&1)"
 has "freeze_must_be_confirmed" "$naked" "reason=freeze_unconfirmed"
@@ -165,6 +168,70 @@ for prot in "$HOME/backups/quant/probe" "$HOME/backups/quant/restic/probe" "$ROO
     "--close-state-file=$T/close_ok.json" --dry-run 2>&1)"
   has "protected_refused:$prot" "$guarded" "reason=baseline_target_protected"
 done
+
+# ── 2b. 收盘日显式口径（owner 11-07 裁决：最近交易日 11-06，不伪造 close-state 文件）──
+# 全部走 --preflight：S0 完整经过 close_guard，但零写入，不打扰第 3 组的 v1 基线。
+pf_day="$(run_full --preflight --close-state-file="$T/close_stale.json" \
+  --close-state-day=2020-01-01 2>&1)"
+has "explicit_close_day_accepts_named_day" "$pf_day" "S0_CLOSE_STATE OK day=2020-01-01"
+has "explicit_close_day_anchor" "$pf_day" "S0_CLOSE_DAY expected=2020-01-01 override=2020-01-01 ack=0"
+has "explicit_close_day_preflight_ok" "$pf_day" "COLD_BACKUP_RESULT=PREFLIGHT"
+# 反证：同一份「不是今日」的读数不给 override 仍须判红，expected 不能偷偷变成读数里的日期
+pf_today="$(run_full --preflight --close-state-file="$T/close_stale.json" 2>&1)"
+has "without_override_still_locks_today" "$pf_today" "expected=$TODAY"
+has "without_override_still_aborts" "$pf_today" "reason=close_state_not_today"
+has "bad_close_day_refused" "$(run_full --preflight --close-state-day=2020-1-1 2>&1)" \
+  "reason=bad_close_state_day"
+# ACK 不许单独点起来：那等于把 R14 悄悄关掉
+has "ack_requires_explicit_day" "$(run_full --preflight --close-state-unavailable-ack 2>&1)" \
+  "reason=close_day_required"
+NONE="$T/no_close_state_here.json"
+pf_ack="$(run_full --preflight --close-state-file="$NONE" \
+  --close-state-day=2026-11-06 --close-state-unavailable-ack 2>&1)"
+has "ack_unavailable_is_explicit" "$pf_ack" "S0_CLOSE_STATE ACK_UNAVAILABLE day=2026-11-06 src=owner_ack"
+has "ack_day_anchor" "$pf_ack" "S0_CLOSE_DAY expected=2026-11-06 override=2026-11-06 ack=1"
+hasnt "ack_never_fakes_a_readout" "$pf_ack" "S0_CLOSE_STATE OK"
+has "ack_preflight_ok" "$pf_ack" "COLD_BACKUP_RESULT=PREFLIGHT"
+has "unreadable_without_ack_still_aborts" \
+  "$(run_full --preflight --close-state-file="$NONE" 2>&1)" "reason=close_state_unreadable"
+
+# 静态反证（ssh 那条腿本地夹具跑不到，只能锁代码形态）：11-07 现网 --full 卡在 S1，
+# 根因是拿 Windows 路径在本机做 -e 检查；同批还发现管道末端 tr/grep 的 rc 被当成
+# 远端成败。这两条一旦回潮，本地 100 条全绿也照样在现网翻车。
+instrument_ok="$(python3 - "$BCK" <<'PY'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+a = s.index("\ndb_snapshot() {")
+b = s.index("\n}\n", a)
+body = s[a:b]
+h = s[s.index("\nhelper_run() {"):s.index("\nLAST_OUT=")]
+def code_of(t):
+    return "\n".join(ln for ln in t.splitlines() if not ln.lstrip().startswith("#"))
+code = code_of(body)
+hcode = code_of(h)
+skips = s.count('[ "$TRANSPORT" = "ssh" ] || [ -e "$ABS_ROOT/$db" ]')
+# 只禁「ssh 命令替换里套管道、再把 $? 当远端 rc」这个形态；拿到 rc 之后的
+# printf | tr 文本清理是合法的，不该被误伤。
+no_pipe_rc = ("2>&1 | tr -d" not in code and "rc=$?" in code
+              and "2>&1 | tr -d" not in hcode and "rc=$?" in hcode)
+# 远端 PowerShell 会话必须显式 exit 并带回 python 的 rc：否则 helper 写完卷也不关
+# 连接（11-07 build 空挂 1.5h / .backup 留孤儿占文件句柄，都是这一处）。
+exits = sum(1 for ln in s.splitlines()
+            if not ln.lstrip().startswith("#") and "exit $LASTEXITCODE" in ln)
+# 现网第二轮 S3 崩在「manifest 被发到远端」：ssh 形态必须按 mode 分流，
+# manifest/verify/l2 留本机跑，否则现网 --full 永远拿不到 v1 基线。
+split = ("manifest|verify|l2|hash|selfcheck|spec" in s
+         and s.count("local_only") >= 2 and "helper_mode" in s)
+# L2 的四件审批产物默认仍严查；显式豁免必须由基线 header 携带并被 L2 回显，
+# 不许改成「缺了就算了」的恒绿判据。
+h = open(sys.argv[1].replace("backup_gz_cold.sh", "backup_gz_cold_helper.py"),
+         encoding="utf-8").read()
+allow = ("applied_absent_allow" in s and "L2_APPLIED_ABSENT_ALLOWED" in h
+         and "fails.append(\"applied_absent=%s\" % name)" in h)
+print("yes" if (no_pipe_rc and skips == 2 and exits == 2 and split and allow) else "no")
+PY
+)"
+ck "ssh_instrument_rc_and_local_check" "$instrument_ok" "yes"
 
 # ── 3. 真跑 v1 ────────────────────────────────────────────────────────────────────
 cold_b="$(mktemp -d "${TMPDIR:-/tmp}/cold-b-pass-XXXXXX")"
@@ -518,7 +585,7 @@ hasnt "preflight_needs_no_freeze" "$pf" "reason=freeze_unconfirmed"
 ck "preflight_writes_nothing" "$(find "$T/out_pf" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
 # 预检不是"报个数就走"：盘不够它就是那道"不开拉"的闸（§1.3 的 11 Gi / R1 半份备份）
 pf_tight="$(bash "$BCK" "--local-source=$SRC" "${ARGS_BASE[@]}" "--out-dir=$T/out_pf" \
-            --preflight --capacity-factor=999999 2>&1)"
+            --preflight --capacity-factor=1000000000 2>&1)"
 has "preflight_refuses_tight_capacity" "$pf_tight" "reason=capacity_shortfall"
 ck "preflight_tight_writes_nothing" "$(find "$T/out_pf" -type f 2>/dev/null | wc -l | tr -d ' ')" "0"
 

@@ -63,6 +63,9 @@
 #   其它开关：--frozen-confirmed（写面已停的显式确认，S1/S3b 都要）--skip-secrets
 #             --out-dir --capacity-factor --volume-max-bytes --big-file-min-bytes
 #             --close-state-file --status-file --snapshot-ok-file --config-change-registered
+#             --close-state-day=<YYYY-MM-DD>  owner 显式认可的收盘日（休市日执行用最近交易日）
+#             --close-state-unavailable-ack  网关无读数时的显式 ACK，必须配上面那枚日期；
+#                                           只留痕不造假的 close-state 文件（R14）
 #   环境变量：GZ_USER ADMIN_TOKEN GZ_BASE_URL REMOTE_PY
 #             SRC_ROOT STAGE_ROOT WIRING_ROOT WIRING_DIRS WIRING_FILES APK_DIR DB_NAMES OUT_ROOT
 #             SECRET_QUANT_ENV SECRET_GATEWAY_CONFIG KEYCHAIN_ITEM COLD_B_PASS_CMD CAPACITY_FACTOR
@@ -96,12 +99,17 @@ REMOTE_PY="${REMOTE_PY:-python}"
 SNAPSHOT_MARK_REMOTE="${SNAPSHOT_MARK_REMOTE:-C:/var/lib/quant-snapshot/SNAPSHOT_OK}"
 
 MODE="full"
+# L2 的 applied_*.json 四件是规划假设；基线可在 header 显式登记「源端本来就没有」的
+# 缺席项，由 L2 回显放行。缺省空＝严格四件全查，绝不静默降级。
+APPLIED_ALLOW=""
 DRY_RUN=0
 LOCAL_SOURCE=""
 BASE_DIR=""
 BUILD_COMMIT_OVERRIDE=""
 WEB_COMMIT_OVERRIDE=""
 CLOSE_STATE_FILE=""
+CLOSE_DAY_OVERRIDE=""
+CLOSE_UNAVAILABLE_ACK=0
 STATUS_FILE=""
 SNAPSHOT_OK_FILE=""
 CONFIG_REGISTERED=""
@@ -146,6 +154,8 @@ for a in "$@"; do
     --build-commit=*) BUILD_COMMIT_OVERRIDE="${a#*=}" ;;
     --web-build-commit=*) WEB_COMMIT_OVERRIDE="${a#*=}" ;;
     --close-state-file=*) CLOSE_STATE_FILE="${a#*=}" ;;
+    --close-state-day=*) CLOSE_DAY_OVERRIDE="${a#*=}" ;;
+    --close-state-unavailable-ack) CLOSE_UNAVAILABLE_ACK=1 ;;
     --status-file=*) STATUS_FILE="${a#*=}" ;;
     --snapshot-ok-file=*) SNAPSHOT_OK_FILE="${a#*=}" ;;
     --config-change-registered=*) CONFIG_REGISTERED="${a#*=}" ;;
@@ -162,6 +172,18 @@ done
   { printf 'COLD_BACKUP_RESULT=ABORT step=0 reason=missing_option_value option=--%s\n' "$PENDING"; exit 1; }
 [ "$VERIFY_DIR" != "__pending__" ] || VERIFY_DIR=""
 [ "$HOST_ARG" != "__pending__" ] || HOST_ARG=""
+# --close-state-day 是 owner 的显式书面口径：只认 YYYY-MM-DD，不许把「网关没读数」
+# 的 ACK 单独点起来（那样等于把 R14 悄悄关掉）。两枚都会写进锚行与 manifest 头。
+if [ -n "$CLOSE_DAY_OVERRIDE" ]; then
+  printf '%s' "$CLOSE_DAY_OVERRIDE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || {
+    printf 'COLD_BACKUP_RESULT=ABORT step=0 reason=bad_close_state_day value=%s\n' "$CLOSE_DAY_OVERRIDE"
+    exit 1
+  }
+fi
+if [ "$CLOSE_UNAVAILABLE_ACK" = "1" ] && [ -z "$CLOSE_DAY_OVERRIDE" ]; then
+  printf 'COLD_BACKUP_RESULT=ABORT step=0 reason=close_day_required need=--close-state-day=<YYYY-MM-DD>\n'
+  exit 1
+fi
 
 [ -f "$HELPER" ] || { printf 'COLD_BACKUP_RESULT=ABORT step=0 reason=helper_absent\n'; exit 1; }
 [ -f "$SNAP_PY" ] || { printf 'COLD_BACKUP_RESULT=ABORT step=0 reason=snap_py_absent\n'; exit 1; }
@@ -266,8 +288,10 @@ elif [ -n "$HOST_ARG" ]; then
   TRANSPORT="ssh"
   SSH_HOST="$HOST_ARG"
   GZ_USER="${GZ_USER:-Administrator}"
-  SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes ${GZ_USER}@${SSH_HOST}"
-  SCP="scp -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
+  # ServerAlive 是长会话的双保险：远端 helper 打包 9.58GB 要半小时，中途没有任何输出，
+  # 中间设备会把静默连接当死连接收掉（11-07 首轮 build 空挂 1.5h 后 rc=255）。
+  SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=120 ${GZ_USER}@${SSH_HOST}"
+  SCP="scp -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=120"
   ABS_ROOT="$SRC_ROOT"
   STAGE="$STAGE_ROOT/$BACKUP_ID"
   WIRING_ABS_ROOT="$WIRING_ROOT"
@@ -298,7 +322,11 @@ fi
 remote_run() { # $1=远端命令（只读）；回传去 CR
   local out rc
   out="$($SSH "$1" 2>&1)"; rc=$?
-  printf '%s' "$out" | tr -d '\r'
+  # 本机 OpenSSH 的 post-quantum 提示写在 stderr，2>&1 后会粘在读数前面：
+  # 现网干跑实测 web_build_commit 成了 "**WARNING:...b6d8d46" 这种垃圾串，
+  # 版本锚脏了后面「与前端 BUILD_COMMIT 同源」就没法判。这里只剥告警行，
+  # ssh 自己的 rc 仍由 return 带回，不拿 grep 的返回码冒充远端成败。
+  printf '%s' "$out" | tr -d '\r' | { grep -vE '^\*\*' || true; }
   return $rc
 }
 LEAK_STEP="-"
@@ -312,11 +340,19 @@ leak_check() { # 回传文本里 40+ 位连续十六进制 = 疑似明文口令�
 helper_run() { # $1=spec $2=label -> stdout=读数；rc 0 成功 / 3 明文闸 / 4 spec 编译失败 / 其它=该步失败
   # rc=3 与"这一步自己失败"必须分开：混成一个非零值会把失败原因写反——
   # "疑似明文口令"会让人去查钥匙，"枚举失败"会让人去查路径（11-02 那两次假象同源）。
-  local spec="$1" label="$2" out rc job
+  local spec="$1" label="$2" out rc job raw helper_mode local_only=0
   # 判别只看"是不是 ssh 现网形态"，而不是"是不是 local"：
   # 本工具现在有 local（演练/本机数据根）、baseline（只读校验已封存基线）、ssh 三种形态，
   # 按 "!= local 就走远端" 写会把 baseline 当成现网去 scp（$SSH 那时根本就是空的）。
-  if [ "$TRANSPORT" != "ssh" ]; then
+  # ★ 第二道判据（11-07 现网第二轮实测）：ssh 形态下**不是所有 mode 都该发到远端**。
+  # enumerate/build/scan/merge 操作的是远端 stage，必须远端跑；但 manifest/verify/l2
+  # 的输入是本机 WORK 与本机已落地的卷，发到远端会拿 Windows 机去找 /var/folders/...
+  # 直接 helper_crashed FileNotFoundError。旧写法一律远端 ⇒ 现网 --full 永远过不了 S3。
+  helper_mode="$(sed -n 's/^mode=//p' "$spec" 2>/dev/null | head -1 | tr -d '\r')"
+  case "$helper_mode" in
+    manifest|verify|l2|hash|selfcheck|spec) local_only=1 ;;
+  esac
+  if [ "$TRANSPORT" != "ssh" ] || [ "$local_only" = "1" ]; then
     out="$(python3 "$HELPER" --spec="$spec" 2>&1)"; rc=$?
   else
     job="$(python3 "$HELPER" --mode=spec --spec="$spec" 2>/dev/null | { grep -E '^JOB_B64\|' || true; } | head -1 | cut -d'|' -f2)"
@@ -325,7 +361,13 @@ helper_run() { # $1=spec $2=label -> stdout=读数；rc 0 成功 / 3 明文闸 /
       return 4
     fi
     # 远端只跑一条只读的 python 取数/打包命令；脚本原文走 stdin，参数走一枚 base64（无 shell 元字符）
-    out="$($SSH "$REMOTE_PY - --job=$job" < "$HELPER" 2>&1 | tr -d '\r')"; rc=$?
+    # 同 db_snapshot：rc 必须是 ssh 自己的，不是管道末端 tr/grep 的；否则远端
+    # helper 挂了（返回非 0、还留了几行输出）会被记成 0，run_step 放它过关。
+    # 远端默认 shell 是 PowerShell：python 跑完后会话不会自己关，ssh 一直等 EOF，
+    # 表现就是「卷早写好了、本机却空挂到 rc=255」。显式 exit 并把 python 的退出码
+    # 带回来（$LASTEXITCODE 是 PowerShell 里上一个原生命令的 rc），既不吞失败也不留孤儿。
+    raw="$($SSH "$REMOTE_PY - --job=$job"'; exit $LASTEXITCODE' < "$HELPER" 2>&1)"; rc=$?
+    out="$(printf '%s' "$raw" | tr -d '\r' | { grep -vE '^\*\*' || true; })"
   fi
   printf '%s\n' "$out" > "$WORK/logs/$label.log"
   if leak_check "$out"; then
@@ -399,8 +441,8 @@ DATA_EXCLUDES=(
   "quant.env=secret_class_b"
   "config.xt.json=secret_class_b"
 )
-enum_spec() { # $1=tag $2=hash(0|1) $3=spec 路径 $4=manifest（可选，给 scan）$5=since（可选）
-  local tag="$1" hash="$2" path="$3" man="${4:-}" since="${5:-0}" db name
+enum_spec() { # $1=tag $2=hash(0|1) $3=spec 路径 $4=manifest（可选，给 scan）$5=since（可选）$6=estimate(0|1)
+  local tag="$1" hash="$2" path="$3" man="${4:-}" since="${5:-0}" estimate="${6:-0}" db name
   {
     if [ -n "$man" ]; then
       printf 'mode=scan\nwork=%s\nmanifest=%s\nsince=%s\n' "$STAGE" "$STAGE/$man" "$since"
@@ -416,12 +458,18 @@ enum_spec() { # $1=tag $2=hash(0|1) $3=spec 路径 $4=manifest（可选，给 sc
     # 少了它们，增量就会把"库变了"读成"什么都没变"——正是 §5 S3b 要防的那件事。
     # 快照进包时**前缀必须是空**：相对路径要跟原库同名（回传侧直接对位），
     # 把库名当前缀写出来会得到 trading.dbtrading.db 这种谁也对不上的路径。
-    for db in $DB_NAMES; do
-      # 第 5 段 content_only=1：快照的 mtime 是我们自己打的，不能当"冻结后有变化"的证据，
-      # 否则每次增量都会把两本账当新件重传一遍（§5 S3b 要的是只挑真变化的那几条）。
-      printf 'root=%s||snapshot|%s|1\n' "$STAGE" "$hash"
-      printf 'only=%s\n' "$db"
-    done
+    # S0 估算趟发生在冻结之前：远端 stage 目录此刻根本不存在，而 helper 对每个 root
+    # 都要求 isdir，硬写进去会让 --preflight / --dry-run / --full 一律在 S0 撞
+    # reason=root_absent（11-07 现网干跑实测，等于现网冷备开不了工）。两库体量本来
+    # 就由下面 DB_EXTRA_BYTES 从远端 Get-Item 单独加回，估算趟跳过快照根不丢读数。
+    if [ "$estimate" != "1" ]; then
+      for db in $DB_NAMES; do
+        # 第 5 段 content_only=1：快照的 mtime 是我们自己打的，不能当"冻结后有变化"的证据，
+        # 否则每次增量都会把两本账当新件重传一遍（§5 S3b 要的是只挑真变化的那几条）。
+        printf 'root=%s||snapshot|%s|1\n' "$STAGE" "$hash"
+        printf 'only=%s\n' "$db"
+      done
+    fi
     # 服务确实停过时 -wal/-shm 也一并带走（快照已含其内容，这份是现场证据，落在 wal-sidecar/ 前缀下）
     printf 'root=%s|wal-sidecar/|wal_sidecar|%s\n' "$ABS_ROOT" "$hash"
     for db in $DB_NAMES; do
@@ -506,12 +554,18 @@ PY
 # scan 把 live.db/trading.db 读成"冻结后被删除"，v2 的删除清单里凭空多出两本账（§5 S3b 最坏的形态：
 # 增量把"我们的快照腿没接上"上报成"源端把库删了"）。
 db_snapshot() { # $1=db 名
-  local db="$1" out rc
+  local db="$1" out rc raw
   if [ "$TRANSPORT" != "ssh" ]; then
     out="$(python3 "$SNAP_PY" "$ABS_ROOT/$db" "$STAGE/$db" 2>&1)"; rc=$?
   else
     # 脚本原文走 stdin、两个路径走参数：现网不要求这台机上有第二份副本，也不落任何临时脚本文件
-    out="$($SSH "$REMOTE_PY - $ABS_ROOT/$db $STAGE/$db" < "$SNAP_PY" 2>&1 | tr -d '\r')"; rc=$?
+    # 旧写法 `$SSH ... | tr -d '\r'` 让 $? 变成管道末端 tr 的 0 ⇒ 远端 backup_snap.py
+    # 返回 2（源库缺失）/3（integrity_check 不过）会被当成成功，正是 R2 最怕的形状。
+    # 先单独拿 ssh 的 rc，再做文本清理；PQ 告警行一并剥掉，别污染 S1_DB 锚。
+    # 同 helper_run：PowerShell 会话不主动退出会让 .backup 完成后仍挂着（还占着
+    # 快照文件句柄，删都删不掉）。显式 exit $LASTEXITCODE 关会话、同时保住 python 的 rc。
+    raw="$($SSH "$REMOTE_PY - $ABS_ROOT/$db $STAGE/$db"'; exit $LASTEXITCODE' < "$SNAP_PY" 2>&1)"; rc=$?
+    out="$(printf '%s' "$raw" | tr -d '\r' | { grep -vE '^\*\*' || true; })"
   fi
   printf '%s\n' "$out" > "$WORK/reports/db-$db.log"
   if [ $rc -ne 0 ]; then
@@ -576,11 +630,16 @@ print(json.load(open(sys.argv[1]))["header"].get("accounts_files", ""))
   [ "$vl1_rc" = "3" ] && abort 2 leak_guard_hit "label=verify-l1"
   printf '%s\n' "$vl1_out" | { grep -E '^L1_' || true; }
   [ $vl1_rc -eq 0 ] || abort 3 l1_failed "see=logs/verify-l1.log manifest=$CUR_NAME"
+  APPLIED_ALLOW="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["header"].get("applied_absent_allow", ""))
+' "$VER_MAN" 2>/dev/null || true)"
   SPEC_VL2="$WORK/spec/verify-l2.spec"
   {
     printf 'mode=l2\nmanifest=%s\nvolumes_dir=%s\n' "$VER_MAN" "$OUT_ABS/volumes"
     printf '%s' "$VPATH_LINES"
     [ -n "$MARKER_ARG" ] && printf 'snapshot_ok=%s\n' "$MARKER_ARG"
+    [ -n "$APPLIED_ALLOW" ] && printf 'applied_absent_allow=%s\n' "$APPLIED_ALLOW"
   } > "$SPEC_VL2"
   vl2_out="$(helper_run "$SPEC_VL2" verify-l2)"; vl2_rc=$?
   [ "$vl2_rc" = "3" ] && abort 2 leak_guard_hit "label=verify-l2"
@@ -602,18 +661,30 @@ fi
 TODAY_BJ="$(TZ=Asia/Shanghai date +%F)"
 CLOSE_STATE="not_evaluated"
 close_guard() {
-  local body="" day="" at="" src=""
+  local body="" day="" at="" src="" expected
+  # 缺省仍锁「今日」；只有 owner 显式给了 --close-state-day 才换成那个日期，
+  # 周末/休市日执行时是 11-06 这类「最近交易日」，绝不自动猜、绝不自动放宽。
+  expected="${CLOSE_DAY_OVERRIDE:-$TODAY_BJ}"
   if [ -n "$CLOSE_STATE_FILE" ] && [ -f "$CLOSE_STATE_FILE" ]; then
     body="$(cat "$CLOSE_STATE_FILE")"; src="file"
   elif [ -n "${ADMIN_TOKEN:-}" ]; then
     body="$(curl -fsS --max-time 20 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
       "${GZ_BASE_URL}/api/qmt/close-snapshot" 2>/dev/null || true)"; src="http"
   fi
-  [ -n "$body" ] || { CLOSE_STATE="unreadable"; return 1; }
+  if [ -z "$body" ]; then
+    # 网关停摆 / ADMIN_TOKEN 不迁移时 owner 显式 ACK：绝不手造一份假的 close-state
+    # 文件，而是把「读数不可得 + 认可哪一天」原样写进锚行与 manifest 头（R14 留痕，
+    # 不静默降级）。真实账本仍由 S3 的两库 integrity_check + 关键表行数兜底。
+    if [ "$CLOSE_UNAVAILABLE_ACK" = "1" ]; then
+      CLOSE_STATE="ACK_UNAVAILABLE day=$expected src=owner_ack"
+      return 0
+    fi
+    CLOSE_STATE="unreadable"; return 1
+  fi
   day="$(json_field "$body" close_snapshot.day)"; [ -n "$day" ] || day="$(json_field "$body" day)"
   at="$(json_field "$body" close_snapshot.at)"; [ -n "$at" ] || at="$(json_field "$body" at)"
-  if [ "$day" != "$TODAY_BJ" ] || [ -z "$at" ]; then
-    CLOSE_STATE="fail day=${day:-empty} expected=$TODAY_BJ at=${at:-empty} src=$src"
+  if [ "$day" != "$expected" ] || [ -z "$at" ]; then
+    CLOSE_STATE="fail day=${day:-empty} expected=$expected at=${at:-empty} src=$src"
     return 1
   fi
   CLOSE_STATE="OK day=$day at=$at src=$src"
@@ -624,12 +695,14 @@ if ! close_guard; then
     say "INFO - 收盘态读数：${CLOSE_STATE}（干跑不拦；真跑这一步就是 ABORT，R14）"
   else
     case "$CLOSE_STATE" in
-      unreadable*) abort 0 close_state_unreadable "need=--close-state-file_or_ADMIN_TOKEN" ;;
+      unreadable*) abort 0 close_state_unreadable "need=--close-state-file_or_ADMIN_TOKEN_or_--close-state-unavailable-ack" ;;
       *) abort 0 close_state_not_today "$CLOSE_STATE" ;;
     esac
   fi
 fi
 printf 'S0_CLOSE_STATE %s\n' "$CLOSE_STATE"
+printf 'S0_CLOSE_DAY expected=%s override=%s ack=%s\n' \
+  "${CLOSE_DAY_OVERRIDE:-$TODAY_BJ}" "${CLOSE_DAY_OVERRIDE:-none}" "$CLOSE_UNAVAILABLE_ACK"
 
 FROZEN_AT="$(TZ=Asia/Shanghai date '+%Y-%m-%dT%H:%M:%S%z')"
 FROZEN_EPOCH="$(date +%s)"
@@ -675,7 +748,7 @@ else
 fi
 
 # 枚举是包体的输入（§5 S0 第 3 条）。hash=0 这一趟只为算体量与文件全集。
-enum_spec "estimate" 0 "$WORK/spec/enum-estimate.spec"
+enum_spec "estimate" 0 "$WORK/spec/enum-estimate.spec" "" 0 1
 run_step "$WORK/spec/enum-estimate.spec" enum-estimate 0 enumeration_failed
 est_out="$LAST_OUT"
 printf '%s\n' "$est_out" | { grep -E '^ENUM_SUMMARY\||^ENUM_NOTE' || true; }
@@ -980,6 +1053,7 @@ man2_out="$LAST_OUT"
     printf 'mode=l2\nmanifest=%s\nvolumes_dir=%s\n' "$WORK/$NEW_NAME" "$OUT_ABS/volumes"
     printf '%s' "$VPATH_LINES"
     [ -n "$MARKER_ARG" ] && printf 'snapshot_ok=%s\n' "$MARKER_ARG"
+    [ -n "$APPLIED_ALLOW" ] && printf 'applied_absent_allow=%s\n' "$APPLIED_ALLOW"
   } > "$SPEC_L22"
   l2b_out="$(helper_run "$SPEC_L22" "l2-v${NEW_VER}")"; l2b_rc=$?
   [ "$l2b_rc" = "3" ] && abort 2 leak_guard_hit "label=l2-v${NEW_VER}"
@@ -1035,7 +1109,10 @@ mkdir -p "$OUT_ABS" "$OUT_ABS/volumes" "$OUT_ABS/reports" "$OUT_ABS/meta" "$OUT_
 say "==> [S1] 冻结已确认；基线目录 $OUT_ABS"
 
 for db in $DB_NAMES; do
-  [ -e "$ABS_ROOT/$db" ] || { [ "$TRANSPORT" = "ssh" ] && abort 1 db_snapshot_failed "db_absent=$db"; }
+  # ssh 形态下 ABS_ROOT 是 Windows 路径（C:/...），在本机 -e 必然为假；源库是否
+  # 存在由远端 backup_snap.py 判（它返回 2 且不会静默跳过）。S3b 分支早就这么写，
+  # 这里旧写法反而在 ssh 时直接 abort db_absent —— 现网 --full 卡在 S1 的根因。
+  [ "$TRANSPORT" = "ssh" ] || [ -e "$ABS_ROOT/$db" ] || abort 1 db_snapshot_failed "db_absent=$db"
   db_snapshot "$db"
 done
 
@@ -1180,10 +1257,15 @@ printf '%s\n' "$l1_out" > "$OUT_ABS/reports/L1_v1.txt"
 printf '%s\n' "$l1_out" | { grep -E '^L1_' || true; }
 [ $l1_rc -eq 0 ] || abort 3 l1_failed "see=reports/L1_v1.txt"
 
+APPLIED_ALLOW="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["header"].get("applied_absent_allow", ""))
+' "$OUT_ABS/BACKUP_MANIFEST.json" 2>/dev/null || true)"
 L2_SPEC="$WORK/spec/l2.spec"
 {
   printf 'mode=l2\nmanifest=%s\nvolumes_dir=%s\n' "$OUT_ABS/BACKUP_MANIFEST.json" "$OUT_ABS/volumes"
   [ -n "$MARKER_ARG" ] && printf 'snapshot_ok=%s\n' "$MARKER_ARG"
+    [ -n "$APPLIED_ALLOW" ] && printf 'applied_absent_allow=%s\n' "$APPLIED_ALLOW"
 } > "$L2_SPEC"
 l2_out="$(helper_run "$L2_SPEC" l2-v1)"; l2_rc=$?
 [ "$l2_rc" = "3" ] && abort 2 leak_guard_hit "label=l2-v1"

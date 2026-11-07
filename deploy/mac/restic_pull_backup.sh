@@ -12,7 +12,20 @@
 set -uo pipefail
 
 SSH_HOST="${SSH_HOST:-gz}"
-REPO_REMOTE="sftp:${SSH_HOST}:C:/var/lib/quant-restic-repo"   # 广州中转仓库（restic copy 源）
+# §GZ-UBUNTU（2026-11-07，§6.6 工单 ④）：广州重装 Ubuntu 后这个 C:/ 路径不存在，
+# Mac 每日拉取链会**静默断掉**（失败只靠 ntfy，主题没配就只剩日志）。改显式两档，
+# 缺省 windows = 今天行为，绝不打断切换前的现网链：
+#   RESTIC_REPO_MODE=windows（缺省） -> sftp:gz:C:/var/lib/quant-restic-repo
+#   RESTIC_REPO_MODE=linux           -> sftp:gz:/var/lib/quant-restic-repo
+# REPO_REMOTE 仍可直接覆盖，便于演练/自建仓库。切换当天必须跑一次 restic check +
+# restore_drill.sh，并确认 launchd 07:00/10:30 两档稳定副本同步了本文件（见文件头第 10 行）。
+RESTIC_REPO_MODE="${RESTIC_REPO_MODE:-windows}"
+case "$RESTIC_REPO_MODE" in
+	windows) RESTIC_REPO_DEFAULT="sftp:${SSH_HOST}:C:/var/lib/quant-restic-repo" ;;
+	linux)   RESTIC_REPO_DEFAULT="sftp:${SSH_HOST}:/var/lib/quant-restic-repo" ;;
+	*) echo "FATAL: RESTIC_REPO_MODE must be windows or linux (got $RESTIC_REPO_MODE)" >&2; exit 1 ;;
+esac
+REPO_REMOTE="${REPO_REMOTE:-$RESTIC_REPO_DEFAULT}"   # 广州中转仓库（restic copy 源）
 REPO_LOCAL="$HOME/backups/quant/restic"                        # Mac 异地仓库（restic copy 目标）
 KEYCHAIN_ITEM="quant-restic-repo-pass"
 NTFY_URL="${NTFY_URL:-https://ntfy.sh}"

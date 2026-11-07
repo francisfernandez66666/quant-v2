@@ -1,0 +1,39 @@
+# 广州 Ubuntu 外脑 quant 引擎 unit（§6.6 工单 ③，2026-11-07）
+# 为什么不改 deploy/quant.service：那份是首尔 1.6G VPS 模板（8080 / 900M / GOMAXPROCS=4），
+# 广州是 2 核 / 4GB，照抄会全站 502 且内存上限互相挤压（R7）。本文件只在广州外脑机使用。
+# 端口以现网实测 8081 为准；pydata 的 8787/8788 冲突由现场裁一个（U-10）。
+[Unit]
+Description=quant-trading-v2 quant engine + API (Guangzhou external brain)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/opt/quant
+ExecStart=/opt/quant/quant
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+# 2 核 / 4GB 重定：quant 常态 200-400M，软限先回收，硬限留足余量给 research + caddy + 系统。
+MemoryHigh=900M
+MemoryMax=1400M
+CPUQuota=150%
+Environment=GOMAXPROCS=2
+
+Environment=TZ=Asia/Shanghai
+Environment=QUANT_ADDR=127.0.0.1:8081
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+# 密钥只进 0600 的 /etc/quant.env，不写进 unit；缺失不报错由代码按缺省处理。
+EnvironmentFile=-/etc/quant.env
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quant-trading-v2
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+# 广州 Ubuntu 外脑专用 Caddyfile（§6.6 工单 ③，2026-11-07）
+# 与 deploy/Caddyfile（首尔 1.6G 模板）分开维护，不动现网 Windows / 首尔部署：
+#   - 反代端口以现网实测 8081 为准；首尔模板写 8080，照抄会全站 502（R7）。
+#   - 静态根 C:\opt\quant\web -> /opt/quant/web；APK -> /opt/quant/apk；日志 -> /var/log/caddy。
+#   - 不 import translator.conf：广州外脑机没部署翻译助手，import 不存在的文件会让 Caddy 起不来；
+#     也不带 on_demand_tls 全局块（首尔那套是给通配符子域按需求签发用的）。
+#   - /assets/* 带内容 hash，长缓存 immutable；index.html 与 /api/* 一律 no-store。
+# 部署前用 `caddy validate --config /etc/caddy/Caddyfile` 静态自证。
+
+quant-trading.top {
+	encode gzip
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	# handle_path 会自动剥掉 /apk 前缀，避免映射到 /opt/quant/apk/apk/<name>
+	handle_path /apk/* {
+		root * /opt/quant/apk
+		file_server
+	}
+
+	handle {
+		root * /opt/quant/web
+		file_server
+		@html path /
+		header @html Cache-Control "no-store"
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	request_body {
+		max_size 10MB
+	}
+
+	log {
+		output file /var/log/caddy/quant.access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
