@@ -1657,8 +1657,30 @@ grep -q 'price_cross_check' internal/risk/gate.go || { echo "--- FAIL: 价格复
 grep -q 'checkPriceCross' internal/risk/gate.go || { echo "--- FAIL: 复核闸判定函数丢失（§XCHECK）"; exit 1; }
 grep -q 'SetCrossPriceSource' internal/engine/registry.go || { echo "--- FAIL: registry 装配注入丢失（§XCHECK 接线断裂，复核源永不生效）"; exit 1; }
 grep -q 'cross_check_pct' internal/config/config.go || { echo "--- FAIL: 复核闸配置键丢失（§XCHECK）"; exit 1; }
-if ! grep -rn 'CrossCheckPrice' internal cmd --include='*.go' 2>/dev/null | grep -v _test.go | grep -v 'internal/data/source.go' | grep -q .; then
-	echo "--- FAIL: CrossCheckPrice 又成死代码（§XCHECK 消费链断裂，§LOW(a) 死代码形态复活）"; exit 1; fi
+# §GZ-UBUNTU 11-08：bash grep 在本机 shim 下会静默零命中（带 --include 时尤甚），
+# 旧判据把明明在 registry.go 的 CrossCheckPrice 消费链误判成死代码（collect 假红）。
+# 否定结论一律用 Python 逐文件读，不再信 shell grep 的「0 命中」。
+XCHECK_CONSUMERS="$(python3 - <<'PY'
+import os
+hits = []
+for base in ("internal", "cmd"):
+    for root, dirs, files in os.walk(base):
+        for name in files:
+            if not name.endswith(".go") or name.endswith("_test.go"):
+                continue
+            p = os.path.join(root, name)
+            if p.replace(os.sep, "/") == "internal/data/source.go":
+                continue
+            try:
+                if "CrossCheckPrice" in open(p, encoding="utf-8").read():
+                    hits.append(p)
+            except OSError:
+                pass
+print(",".join(hits[:3]))
+PY
+)"
+[ -n "$XCHECK_CONSUMERS" ] || { echo "--- FAIL: CrossCheckPrice 又成死代码（§XCHECK 消费链断裂）"; exit 1; }
+echo "ok - §XCHECK 消费链消费者=$XCHECK_CONSUMERS"
 echo "ok - §XCHECK 专项守卫通过（行为锁 1 组 6 态 + 静态锁 5 道）"
 
 echo "==> 46 §NATIVEAUTH 登录 token 迁原生加密存储（2026-09-22 C批，代理A2/A3）..."
@@ -21195,6 +21217,12 @@ echo "   [§173 ⑱] 实仓单一出入口反证：塞回面板挂载必红、�
 
 [ "$B173_FAILED" = "0" ] || exit 1
 echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1 + 建议×战法开关与建议股数 1 + BAN_IO 禁令自证 1 + 终端版本巡检 1 + 做 T 判断腿接线 1 + 信号消失即撤 1 + 撤单动作快照 1 + 交易级提醒与做T标注 1 + 沙箱固定时刻 1 + 发送前预算复核算术 1 + VWAP 改价腿与撤单唯一出口 1 + 载体同款三行为与桥/物理机切换互锁 1 + tab 战法开关同源与部成成交表 1 + 实仓单一出入口与两态分流 1，累计判定点 ${CNT173}）"
+
+# §GZ-UBUNTU 11-08：Linux 部署件口径总闸。不新增段号——collect 段清单由装配器
+# 动态派生，这行属尾体最终总闸；GATE_SELF_ABS 是主脚本绝对路径，段体被搬进
+# 临时脚本执行时也指得回仓内 scripts/。独立跑：bash scripts/verify_gz_ubuntu_assets.sh
+bash "$(dirname "$GATE_SELF_ABS")/verify_gz_ubuntu_assets.sh" || exit 1
+echo "ok - §GZ-UBUNTU 部署件总闸通过"
 
 echo "==> 全部通过"
 
