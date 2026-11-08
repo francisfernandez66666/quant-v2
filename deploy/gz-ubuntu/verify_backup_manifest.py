@@ -34,6 +34,7 @@ def main(archive):
         doc = json.load(open(man_path, encoding="utf-8"))
         files = doc.get("files", [])
         diffs = []
+        mode_drift = []
         for e in files:
             path = os.path.join(tmp, e["rel_path"])
             if not os.path.isfile(path):
@@ -47,8 +48,11 @@ def main(archive):
             if digest(path) != e["sha256"]:
                 diffs.append("CONTENT_DIFF|" + e["rel_path"])
                 continue
+            # mode 只登记不判红：manifest 记的是源目录权限（多为 0666），
+            # tar 解压按 umask 重建，两者本就不等。按方案 §7.3 显式列入允许
+            # 差异白名单并留计数，内容与字节差异仍严格判红。
             if e.get("mode") and oct(stat.S_IMODE(st.st_mode)) != e["mode"]:
-                diffs.append("MODE_DIFF|" + e["rel_path"])
+                mode_drift.append(e["rel_path"])
         # 归档成员集合 vs 清单（tar 把数据根写成 ./xxx，清单里是 xxx）
         with tarfile.open(archive, "r:gz") as tf:
             members = {m.name.lstrip("./") for m in tf.getmembers() if m.isfile()}
@@ -57,6 +61,7 @@ def main(archive):
         declared.add("SNAPSHOT_OK")
         extra = sorted(members - declared)
         absent = sorted(declared - members)
+        print("MANIFEST_MODE_DRIFT=%d reason=tar_extract_umask_allowed" % len(mode_drift))
         print("MANIFEST_VERIFY files=%d excluded=%d diffs=%d extra=%d absent=%d" % (
             len(files), len(doc.get("excluded", [])), len(diffs), len(extra), len(absent)))
         for line in diffs[:10]:
