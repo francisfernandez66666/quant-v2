@@ -14,6 +14,12 @@ quant-trading.top {
 		reverse_proxy 127.0.0.1:8081
 	}
 
+	# /livez 是方案 §6.6 ③ 的健康判据（server.go 的 GET /livez）。
+	# 只反代 /api/* 会让它落进下面的 file_server 被当成静态文件 → 404，判据永远红。
+	handle /livez {
+		reverse_proxy 127.0.0.1:8081
+	}
+
 	# handle_path 会自动剥掉 /apk 前缀，避免映射到 /opt/quant/apk/apk/<name>
 	handle_path /apk/* {
 		root * /opt/quant/apk
