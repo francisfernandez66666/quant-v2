@@ -170,9 +170,9 @@ config.bridge.example.json local_executor.py local_executor_params.json \
 qmt_internal_strategy.py report_uplink.py broker_reads.py carrier_updater.py \
 rules_form.py rules_ladder.py rules_factor.py rules_t.py rules_sizing.py"
 FRIEND_FILES="ensure_friend_gateway_config.ps1 watchdog.ps1 install_tasks.ps1 enroll.ps1 \
-export_ledger.ps1 stop_leg.ps1 uninstall.ps1 config.xt.friend.template.json \
+start_gateway.ps1 export_ledger.ps1 stop_leg.ps1 uninstall.ps1 config.xt.friend.template.json \
 install.ps1 uninstall_entry.bat export_ledger.bat install_entry.bat SETUP.txt \
-install_local_executor.ps1 switch_execution_mode.ps1 switch_execution_mode.bat"
+install_local_executor.ps1 switch_execution_mode.ps1 switch_execution_mode.bat update_leg.ps1"
 # §FRIEND-LOCAL 批 7：本地执行器那条腿的构建器与更新器（源在 scripts/，落进 payload/tools/）。
 #   * scripts/build_local_executor.py   烘参 + 五道静态闸（产物落仓库外）
 #   * scripts/update_local_executor.ps1 备份→写入(SHA 三值自证)→版本回读 三段自证
@@ -264,6 +264,27 @@ for rel in $SRC_LIST; do
 	# （11-08 实测），包会静默少一个 gateway.py。
 	/bin/cp "$src" "$dst" || { echo "X 复制失败：$rel" >&2; exit 1; }
 done
+
+# .ps1 加 UTF-8 BOM：PowerShell 5.1 默认按系统码页（中文 Windows = GBK）读无 BOM 的 UTF-8，
+# 中文注释会被误读并破坏 param() 块解析（11-08 朋友端实测 install 直接红）。加 BOM 后 PS 正确识别。
+# 仅 .ps1 加（Python 文件绝不能带 BOM，否则 json.load 与 import 报错）。MANIFEST 在加 BOM 之后生成，
+# 故哈希自动对齐，朋友侧 STEP1 不必再手改清单。
+STAGE_DIR="$STAGE" python3 - <<'PY'
+import glob, os
+base = os.path.join(os.environ["STAGE_DIR"], "payload", "tools")
+bom = b"\xef\xbb\xbf"
+n = 0
+for f in glob.glob(os.path.join(base, "*.ps1")):
+    with open(f, "rb") as fh:
+        data = fh.read()
+    if not data.startswith(bom):
+        with open(f, "wb") as fh:
+            fh.write(bom + data)
+        n += 1
+        print("BOM_ADDED file=%s" % os.path.basename(f))
+if n:
+    print("BOM_DONE added=%d" % n)
+PY
 
 OVERLAY="none"
 if [ -n "$WG_MSI" ]; then

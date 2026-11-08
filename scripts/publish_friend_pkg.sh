@@ -4,13 +4,13 @@
 #
 # 职责：跑 build_friend_package.sh 出包 → 把 payload 目录（含 MANIFEST.json）
 #       推到广州机 /opt/quant/friend-pkg/（Caddy /leg/* 静态直出）。
-#       朋友机器 update_leg.ps1 从 https://quant-trading.top/leg/manifest.json
+#       朋友机器 update_leg.ps1 从 https://quant-trading.top/leg/MANIFEST.json
 #       拉清单、逐文件验 SHA256、备份换文件（缺省 dry-run，-Apply 才动手）。
 #
 # 用法：
 #   scripts/publish_friend_pkg.sh                # 构建 + 发布
 #   scripts/publish_friend_pkg.sh --skip-build   # 跳过构建，直接发现有 payload
-# 判读锚点（纯 ASCII）：PUBLISH_OK files=NN url=https://quant-trading.top/leg/manifest.json
+# 判读锚点（纯 ASCII）：PUBLISH_OK files=NN url=https://quant-trading.top/leg/MANIFEST.json
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,6 +44,6 @@ scp -q -r "$PAYLOAD/." "$GZ_HOST:$GZ_DIR/" || { echo "X scp failed" >&2; exit 1;
 ssh "$GZ_HOST" "sudo chmod -R a+rX $GZ_DIR" || { echo "X chmod failed" >&2; exit 1; }
 
 FILES=$(python3 -c "import json,sys;print(len(json.load(open('$PAYLOAD/MANIFEST.json'))['files']))")
-echo "PUBLISH_OK files=$FILES url=https://quant-trading.top/leg/manifest.json"
+echo "PUBLISH_OK files=$FILES url=https://quant-trading.top/leg/MANIFEST.json"
 echo "== verify =="
-curl -sS -o /dev/null -w "manifest_http=%{http_code}\n" https://quant-trading.top/leg/manifest.json
+curl -sS -o /dev/null -w "manifest_http=%{http_code}\n" https://quant-trading.top/leg/MANIFEST.json
