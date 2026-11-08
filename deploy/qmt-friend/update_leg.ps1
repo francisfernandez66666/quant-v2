@@ -32,7 +32,7 @@ if (-not (Test-Path $payload)) { Write-Host "UPDATE_RESULT=ABORT reason=payload_
 function Abort($reason) { Write-Host ("UPDATE_RESULT=ABORT reason=" + $reason); exit 2 }
 
 # 1) remote manifest
-$mfUrl = $BaseUrl + "/leg/manifest.json"
+$mfUrl = $BaseUrl + "/leg/MANIFEST.json"
 try {
     $mf = Invoke-RestMethod -Uri $mfUrl -TimeoutSec 30
 } catch {
