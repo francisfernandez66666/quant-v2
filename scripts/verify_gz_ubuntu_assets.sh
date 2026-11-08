@@ -119,6 +119,73 @@ else
   ck "daily_backup_manifest" 1 "manifest_discipline_missing"
 fi
 
+# 9) §FRIEND-UPDATE 通道静态锁（2026-11-09：装机 11 连 bug + PS5.1 四雷的防回潮闸）。
+E=deploy/qmt-friend/enroll.ps1
+U=deploy/qmt-friend/update_leg.ps1
+P=scripts/publish_friend_pkg.sh
+K=deploy/gz-ubuntu/Caddyfile
+IT=deploy/qmt-friend/install_tasks.ps1
+IP=deploy/qmt-friend/install.ps1
+SG=deploy/qmt-friend/start_gateway.ps1
+WD=deploy/qmt-friend/watchdog.ps1
+EN=deploy/qmt-friend/ensure_friend_gateway_config.ps1
+# 9a 白名单与拉取器本体
+if has_text 'scripts/build_friend_package.sh' 'update_leg.ps1' && has_text "$U" 'UPDATE_RESULT=DRYRUN' \
+   && has_text "$U" 'Get-FileHash' && has_text "$U" 'param(' && has_text "$U" '-Apply'; then
+  ck "update_channel_updater" 0 "whitelist+dryrun_default+sha_verify"
+else
+  ck "update_channel_updater" 1 "updater_discipline_missing"
+fi
+# 9b 发布脚本：sudo 清建（/opt/quant root 属主）+ 大写 MANIFEST.json（ubuntu 区分大小写）
+if has_text "$P" 'sudo rm -rf' && has_text "$P" 'MANIFEST.json' \
+   && ! has_text "$P" '/leg/manifest.json'; then
+  ck "update_channel_publish" 0 "sudo_prepare+case_exact"
+else
+  ck "update_channel_publish" 1 "publish_discipline_missing"
+fi
+# 9c Caddy /leg 路由指向 friend-pkg
+if has_text "$K" 'handle_path /leg/*' && has_text "$K" '/opt/quant/friend-pkg'; then
+  ck "update_channel_caddy" 0 "route+root"
+else
+  ck "update_channel_caddy" 1 "caddy_route_missing"
+fi
+# 9d PYTHON_EXE 走 friend.env（/TR 261 上限）；install_tasks 的 /TR 不得内联 -PythonExe
+if has_text "$EN" '"PYTHON_EXE=$PythonExe"' && has_text "$SG" '^PYTHON_EXE=' \
+   && has_text "$WD" '^PYTHON_EXE=' && has_text "$IT" 'carrier_run.ps1' \
+   && ! has_text "$IT" 'Tr = .*(-PythonExe)'; then
+  ck "friend_env_python_exe" 0 "ensure_writes+gw_wd_parse+carrier_run_wrapper"
+else
+  ck "friend_env_python_exe" 1 "python_exe_chain_regressed"
+fi
+# 9e enroll：无裸 "< file" 重定向；任务调用必须哈希表展开（数组展开传不了命名参数）
+if has_text "$E" 'cmd /c $cmd' && has_text "$E" '@{ Apply = $true' \
+   && ! has_text "$E" '-Apply < $tmpTok' && ! has_text "$E" '@("-Apply"'; then
+  ck "enroll_ps51_discipline" 0 "cmd_c_wrapper+hashtable_splat"
+else
+  ck "enroll_ps51_discipline" 1 "enroll_regressed"
+fi
+# 9f install.ps1 捕获必须 *>&1（Write-Host 锚点走信息流 6），且恰好 5 处
+N_CAP="$(count_text "$IP" '*>&1) | Out-String')"
+if ! has_text "$IP" '2>&1) | Out-String' && [ "$N_CAP" -eq 5 ]; then
+  ck "install_capture_all_streams" 0 "star_gt1_x5"
+else
+  ck "install_capture_all_streams" 1 "capture_regressed count=$N_CAP"
+fi
+# 9g 八份朋友侧 ps1 无 "$var:" 作用域冒号形态（cfgPathACL 同族解析雷；env: 例外）
+VAR_COLON=0
+for f in "$E" "$EN" "$SG" "$WD" "$IT" "$IP" deploy/qmt-friend/install_local_executor.ps1 deploy/qmt-friend/update_leg.ps1; do
+  C=$(python3 -c "
+import io,re,sys
+t=io.open('$f',encoding='utf-8').read()
+print(len([m.group(0) for m in re.finditer(r'\\\$([A-Za-z_]\\\\w*):', t) if m.group(1)!='env']))" 2>/dev/null || echo 1)
+  VAR_COLON=$((VAR_COLON + C))
+done
+if [ "$VAR_COLON" -eq 0 ]; then
+  ck "ps_var_colon_scan" 0 "zero_var_colon_x8"
+else
+  ck "ps_var_colon_scan" 1 "var_colon_hits=$VAR_COLON"
+fi
+
 printf 'INFO|summary|pass=%s fail=%s failed=%s\n' "$PASS" "$FAIL" "${FAILED:-none}"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "ok - §GZ-UBUNTU 部署件口径门禁通过（$PASS 道静态锁 + 探针变异反证）"
