@@ -104,7 +104,7 @@ $out = & $py $cu --once --config $cfg 2>&1
 $ErrorActionPreference = $eap
 $out | ForEach-Object { Write-Host $_ }
 exit $LASTEXITCODE
-'
+'@
 [System.IO.File]::WriteAllText($carrierRun, $carrierRunSrc, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "WROTE carrier_run.ps1"
 

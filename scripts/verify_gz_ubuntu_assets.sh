@@ -186,6 +186,24 @@ else
   ck "ps_var_colon_scan" 1 "var_colon_hits=$VAR_COLON"
 fi
 
+# 9h 八份朋友侧 ps1 here-string 配对：每个行尾 @' 必须有行首 '@ 收（2026-11-09 实录：
+# Python 回灌脚本把闭合行写成 ' 丢了 @，坏包发上通道、朋友机更新后 install_tasks 解析炸）。
+HS_BAD=0
+for f in "$E" "$EN" "$SG" "$WD" "$IT" "$IP" deploy/qmt-friend/install_local_executor.ps1 deploy/qmt-friend/update_leg.ps1; do
+  C=$(python3 -c "
+import io
+ls=io.open('$f',encoding='utf-8').read().split('\n')
+o=sum(1 for l in ls if l.rstrip('\r').endswith(\"@'\") and not l.strip().startswith(\"'@\"))
+c=sum(1 for l in ls if l.startswith(\"'@\"))
+print(0 if o==c else 1)" 2>/dev/null || echo 1)
+  HS_BAD=$((HS_BAD + C))
+done
+if [ "$HS_BAD" -eq 0 ]; then
+  ck "ps_herestring_balance" 0 "paired_x8"
+else
+  ck "ps_herestring_balance" 1 "unbalanced_files=$HS_BAD"
+fi
+
 printf 'INFO|summary|pass=%s fail=%s failed=%s\n' "$PASS" "$FAIL" "${FAILED:-none}"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "ok - §GZ-UBUNTU 部署件口径门禁通过（$PASS 道静态锁 + 探针变异反证）"
