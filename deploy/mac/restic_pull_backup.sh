@@ -19,7 +19,9 @@ SSH_HOST="${SSH_HOST:-gz}"
 #   RESTIC_REPO_MODE=linux           -> sftp:gz:/var/lib/quant-restic-repo
 # REPO_REMOTE 仍可直接覆盖，便于演练/自建仓库。切换当天必须跑一次 restic check +
 # restore_drill.sh，并确认 launchd 07:00/10:30 两档稳定副本同步了本文件（见文件头第 10 行）。
-RESTIC_REPO_MODE="${RESTIC_REPO_MODE:-windows}"
+# 2026-11-08 起广州云机已是 Ubuntu，C:/ 中转仓不存在；默认改 linux，
+# 需要回查 Windows 历史仓时显式设 RESTIC_REPO_MODE=windows 即可。
+RESTIC_REPO_MODE="${RESTIC_REPO_MODE:-linux}"
 case "$RESTIC_REPO_MODE" in
 	windows) RESTIC_REPO_DEFAULT="sftp:${SSH_HOST}:C:/var/lib/quant-restic-repo" ;;
 	linux)   RESTIC_REPO_DEFAULT="sftp:${SSH_HOST}:/var/lib/quant-restic-repo" ;;
