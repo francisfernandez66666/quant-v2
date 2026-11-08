@@ -12,6 +12,16 @@ import tarfile
 import tempfile
 
 
+# 服务运行中会持续写的文件：manifest 在 tar 之前生成，归档里的内容可能已变。
+# 按方案 §7.3「允许差异白名单」逐条登记路径 + 原因 + 原文读数，不笼统忽略。
+def live_write_reason(rel):
+    if rel == "scheduler_status.json":
+        return "engine_scheduler_tick"
+    if rel.startswith("task_logs/"):
+        return "research_task_log_append"
+    return ""
+
+
 def digest(path):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -35,18 +45,24 @@ def main(archive):
         files = doc.get("files", [])
         diffs = []
         mode_drift = []
+        live_writes = []
         for e in files:
             path = os.path.join(tmp, e["rel_path"])
             if not os.path.isfile(path):
                 diffs.append("MISSING|" + e["rel_path"])
                 continue
             st = os.stat(path)
+            live = live_write_reason(e["rel_path"])
             if st.st_size != int(e["bytes"]):
-                diffs.append("SIZE_DIFF|%s|want=%s|got=%s" % (
-                    e["rel_path"], e["bytes"], st.st_size))
+                line = "SIZE_DIFF|%s|want=%s|got=%s" % (
+                    e["rel_path"], e["bytes"], st.st_size)
+                (live_writes if live else diffs).append(
+                    line + ("|" + live if live else ""))
                 continue
             if digest(path) != e["sha256"]:
-                diffs.append("CONTENT_DIFF|" + e["rel_path"])
+                line = "CONTENT_DIFF|" + e["rel_path"]
+                (live_writes if live else diffs).append(
+                    line + ("|" + live if live else ""))
                 continue
             # mode 只登记不判红：manifest 记的是源目录权限（多为 0666），
             # tar 解压按 umask 重建，两者本就不等。按方案 §7.3 显式列入允许
@@ -62,6 +78,9 @@ def main(archive):
         extra = sorted(members - declared)
         absent = sorted(declared - members)
         print("MANIFEST_MODE_DRIFT=%d reason=tar_extract_umask_allowed" % len(mode_drift))
+        print("MANIFEST_LIVE_WRITES_ALLOWED=%d reason=services_running_paths_registered" % len(live_writes))
+        for line in live_writes[:10]:
+            print("MANIFEST_LIVE_WRITE|" + line)
         print("MANIFEST_VERIFY files=%d excluded=%d diffs=%d extra=%d absent=%d" % (
             len(files), len(doc.get("excluded", [])), len(diffs), len(extra), len(absent)))
         for line in diffs[:10]:
