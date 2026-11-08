@@ -103,6 +103,16 @@ run_probes() { # $1=读数文本；依赖全局 EXPECT_COMMIT
   v="$(get ANON_API_CODE)"
   if [ "$v" = "401" ]; then probe "anon_api_401" 0 "code=$v"; else probe "anon_api_401" 1 "code=${v:-missing}"; fi
 
+  # U-3（owner 11-08 裁决 A）：引擎装配 Controller 用的是账号级
+  # GetQMTConfigFor(userID)（internal/engine/registry.go:1177），不是全局 rules.qmt。
+  # 只有账号级 qmt.enabled=false 才是档 4「显式影子态」；改回 true 会放行自动买入判据。
+  v="$(get U3_QMT_ENABLED)"
+  if [ "$v" = "false" ]; then
+    probe "u3_account_shadow" 0 "account_qmt_enabled=$v external_brain=4"
+  else
+    probe "u3_account_shadow" 1 "account_qmt_enabled=${v:-missing} want=false"
+  fi
+
   v="$(get JOURNAL_ERRORS)"
   if [ "${v:-1}" -eq 0 ] 2>/dev/null; then probe "journald_clean" 0 "errors=$v"; else probe "journald_clean" 1 "errors=${v:-missing}"; fi
 }
@@ -126,6 +136,7 @@ WEB_HAS_COMMIT=yes
 HTTPS_HOME_CODE=200
 SETUP_CODE=404
 ANON_API_CODE=401
+U3_QMT_ENABLED=false
 JOURNAL_ERRORS=0"
   run_probes "$GREEN"
   GREEN_OK="$FAIL"
@@ -166,6 +177,21 @@ fi
 emit HTTPS_HOME_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/ 2>/dev/null)"
 emit SETUP_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/setup 2>/dev/null)"
 emit ANON_API_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/api/status 2>/dev/null)"
+# Only the boolean is emitted; never echo any credential value from auth.json.
+emit U3_QMT_ENABLED "$(python3 - <<'PY' 2>/dev/null || echo unknown
+import json
+d = json.load(open('/var/lib/quant-trading-v2/auth.json', encoding='utf-8-sig'))
+for c in d.get('configs', []):
+    if not isinstance(c, dict) or not str(c.get('key', '')).startswith('quant_config_json_v1'):
+        continue
+    v = c.get('value')
+    if isinstance(v, str):
+        v = json.loads(v)
+    if isinstance(v, dict) and isinstance(v.get('qmt'), dict):
+        print('true' if v['qmt'].get('enabled') else 'false')
+        break
+PY
+)"
 emit JOURNAL_ERRORS "$(journalctl -u quant --since '-10 min' --no-pager 2>/dev/null | grep -c 'ERROR' || true)"
 REMOTE
 )"
