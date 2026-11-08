@@ -197,11 +197,17 @@ $runnerBody = @(
 )
 [System.IO.File]::WriteAllText($runner, (($runnerBody -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 
-$taskArgs = "/Create /TN `"$TaskName`" /TR `"`"$psExe`" -NoProfile -ExecutionPolicy Bypass -File `"$runner`" -ExecutorDir `"$ExecutorDir`" /SC MINUTE /MO 5 /F"
+$eapX = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$q = [string][char]34
+$trVal = $q + $psExe + $q + " -NoProfile -ExecutionPolicy Bypass -File " + $q + $runner + $q + " -ExecutorDir " + $q + $ExecutorDir + $q
+$taskArgs = @("/Create", "/TN", $TaskName, "/TR", $trVal, "/SC", "MINUTE", "/MO", "5", "/F")
 schtasks @taskArgs | Out-Null
-if ($LASTEXITCODE -ne 0) { Abort 4 ("task_create_failed_exit=" + $LASTEXITCODE) }
+$rcX = $LASTEXITCODE
 # 注册后复读自证：写了不注册＝没有（§164 那批"写了没跑"的同形教训）
 $found = schtasks /Query /TN $TaskName 2>$null
+$ErrorActionPreference = $eapX
+if ($rcX -ne 0) { Abort 4 ("task_create_failed_exit=" + $rcX) }
 if (-not $found) { Abort 4 "task_reread_missing" }
 Info "已注册任务 $TaskName（每 5 分钟；只管执行器，不碰 QMT 客户端任务）"
 
@@ -212,7 +218,10 @@ schtasks /Run /TN $TaskName | Out-Null
 Start-Sleep -Seconds 4
 
 # 5a 执行器自检：--selftest 打印版本 + 指纹 + 参数摘要（纯 ASCII 锚点）
+$eapY = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 $selftest = & $venvPy $execDst --selftest 2>&1 | Out-String
+$ErrorActionPreference = $eapY
 $stMatch = [regex]::Match($selftest, "EXEC_SELFTEST version=(\S+) fingerprint=(\S+)")
 if (-not $stMatch.Success) {
     Write-Host $selftest

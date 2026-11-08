@@ -5,17 +5,19 @@
 #   2) 10-29 实证——在 ssh/远程会话里直接 Start-Process 拉客户端，进程随会话被杀；
 #   3) 看门狗自己死了也要有人再把它叫起来（任务计划就是那个"守门人的守门人"）。
 #
-# 四个任务（名字固定，卸载按这三个 + QMTF-Client-Start 逐个删）：
+# 六个任务（名字固定，卸载按全部逐个删）：
 #   QMTF-Client-Ensure   工作日 08:35  → watchdog -Mode ClientEnsure   （判交易日、必要时拉起客户端）
 #   QMTF-Client-Start    按需被调用    → 直接起 XtItClient.exe（/IT 交互式，客户端唯一合法拉起通道）
-#   QMTF-Gateway-Ensure  每 5 分钟     → watchdog -Mode GatewayEnsure  （未监听才起，起前跑 profile-check）
+#   QMTF-Gateway-Start   按需被调用    → 直接拉起 gateway.py（读 friend.env 注入 QUANT_GATEWAY_BIND/ALLOWED_IPS；
+#                                     无交易日闸门，纯拉起，装填器自证与看门狗兜底都走它）
+#   QMTF-Gateway-Ensure  每 5 分钟     → watchdog -Mode GatewayEnsure  （未监听才调 Gateway-Start，起前跑 profile-check）
 #   QMTF-Close           每 5 分钟     → watchdog -Mode Close          （脚本内部 15:30 前直接 retry，任务不必做时段判断）
 #
 # 边界：本脚本只在**本机**注册/删除任务（B-N5：对广州零权限；不出现远程计算机名/PSRemoting）。
 # 缺省 **只打印不注册**（dry-run），必须显式 -Apply——与 ensure_friend_gateway_config.ps1 同纪律。
 #
 # 用法：
-#   .\install_tasks.ps1                 # 只打印将要注册的四条
+#   .\install_tasks.ps1                 # 只打印将要注册的六条
 #   .\install_tasks.ps1 -Apply          # 真注册
 #   .\install_tasks.ps1 -Uninstall -Apply
 
@@ -45,6 +47,9 @@ $T4 = "QMTF-Close"
 # 内置策略自己不能更新自己（不落文件、不联网），所以更新动作必须由这台机器上的普通进程做。
 # 15:40 是刻意选的：收盘结算与三份快照已落（15:00/15:30 那条关闭腿之后），且离次日 08:35 拉起还够远。
 $T5 = "QMTF-Carrier-Update"
+# 第六条：网关纯拉起任务（与 QMTF-Client-Start 同形——只负责把进程拉起来，不随会话亡）。
+#   看门狗 GatewayEnsure 与装填器 enroll 都经它拉起网关；自身无交易日闸门。
+$T6 = "QMTF-Gateway-Start"
 
 function Tr($mode) {
     return ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Mode {2} -GatewayDir "{3}"' -f `
@@ -52,7 +57,7 @@ function Tr($mode) {
 }
 
 if ($Uninstall) {
-    foreach ($t in @($T1, $T2, $T3, $T4, $T5)) {
+    foreach ($t in @($T1, $T2, $T3, $T4, $T5, $T6)) {
         if (-not $Apply) {
             Write-Host ("WOULD_DELETE task={0}" -f $t)
             continue
@@ -64,16 +69,44 @@ if ($Uninstall) {
     exit 0
 }
 
-# 五条注册。schtasks 的 /TR 里嵌套引号只能按这种写法转义，PS 5.1 没有更干净的等价物。
+# 六条注册。schtasks 的 /TR 里嵌套引号只能按这种写法转义，PS 5.1 没有更干净的等价物。
 $jobs = @(
     @{ Name = $T1; Sc = "DAILY"; St = "08:35"; Tr = (Tr "ClientEnsure"); It = $true },
     @{ Name = $T2; Sc = "ONCE";  St = "23:59"; Tr = ('"{0}"' -f $QmtExe); It = $true },
     @{ Name = $T3; Sc = "MINUTE"; Mn = 5; Tr = (Tr "GatewayEnsure"); It = $false },
     @{ Name = $T4; Sc = "MINUTE"; Mn = 5; Tr = (Tr "Close"); It = $false },
+    @{ Name = $T6; Sc = "ONCE";  St = "23:59"; It = $false;
+       Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -GatewayDir "{2}"' -f `
+             $PsExe, (Join-Path $PSScriptRoot "start_gateway.ps1"), $GatewayDir) },
     @{ Name = $T5; Sc = "DAILY"; St = "15:40"; It = $false;
-       Tr = ('"{0}" "{1}" --once --config "{2}"' -f `
-             $PythonExe, (Join-Path $GatewayDir "carrier_updater.py"), (Join-Path $GatewayDir "config.xt.json")) }
+       Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f `
+             $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) }
 )
+
+# carrier_run.ps1: short /TR wrapper for T5; python comes from friend.env (261-char /TR limit)
+$carrierRun = Join-Path $GatewayDir "carrier_run.ps1"
+$carrierRunSrc = @'
+# carrier_run.ps1 - run carrier_updater once; python path comes from friend.env
+# (schtasks /TR is capped at 261 chars, so the python path must NOT be inline)
+param([string]$GatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway")
+$envFile = Join-Path $GatewayDir "friend.env"
+$py = "python"
+if (Test-Path $envFile) {
+    foreach ($ln in (Get-Content $envFile)) {
+        if ($ln -match "^PYTHON_EXE=(.+)$") { $py = $Matches[1].Trim() }
+    }
+}
+$cu = Join-Path $GatewayDir "carrier_updater.py"
+$cfg = Join-Path $GatewayDir "config.xt.json"
+$eap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$out = & $py $cu --once --config $cfg 2>&1
+$ErrorActionPreference = $eap
+$out | ForEach-Object { Write-Host $_ }
+exit $LASTEXITCODE
+'
+[System.IO.File]::WriteAllText($carrierRun, $carrierRunSrc, (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "WROTE carrier_run.ps1"
 
 foreach ($j in $jobs) {
     if (-not $Apply) {
@@ -108,10 +141,10 @@ foreach ($j in $jobs) {
     Write-Host ("CREATED task={0}" -f $j.Name)
 }
 
-# 注册后复读自证：四个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
+# 注册后复读自证：六个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
 if ($Apply) {
     $missing = @()
-    foreach ($n in @($T1, $T2, $T3, $T4, $T5)) {
+    foreach ($n in @($T1, $T2, $T3, $T4, $T5, $T6)) {
         $found = schtasks /Query /TN $n 2>$null
         if (-not $found) { $missing += $n }
     }
@@ -119,7 +152,7 @@ if ($Apply) {
         Write-Host ("TASKS_RESULT=ABORT reason=reread_missing tasks={0}" -f ($missing -join ","))
         exit 2
     }
-    Write-Host "TASKS_REREAD_MATCH=1 tasks=5"
+    Write-Host "TASKS_REREAD_MATCH=1 tasks=6"
 }
 
 Write-Host ("TASKS_RESULT={0}" -f $(if ($Apply) { "INSTALLED" } else { "DRYRUN" }))

@@ -26,6 +26,15 @@ quant-trading.top {
 		file_server
 	}
 
+	# §FRIEND-UPDATE（2026-11-09）：朋友执行腿自动更新通道。
+	# /leg/manifest.json = 包清单（build_friend_package.sh 产物，逐文件 SHA256），
+	# /leg/<相对路径> = 包内文件。朋友侧 update_leg.ps1 拉取、逐文件验哈希后才换盘，
+	# 缺省 dry-run、显式 -Apply 才动手；通道本身是静态只读，写权限只在构建机的发布脚本。
+	handle_path /leg/* {
+		root * /opt/quant/friend-pkg
+		file_server
+	}
+
 	handle {
 		root * /opt/quant/web
 		file_server

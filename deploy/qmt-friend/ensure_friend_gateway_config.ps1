@@ -69,7 +69,7 @@ if ($OverlayIP -eq $DecisionIP) { Fail "OverlayIP == DecisionIP (同机不需要
 if ($OverlayIP -eq "127.0.0.1" -or $OverlayIP.StartsWith("0.")) { Fail "OverlayIP is loopback/unset: $OverlayIP" "OVERLAY_LOOPBACK" }
 
 # —— 3) 读模板、填占位（用对象赋值而不是字符串替换：JSON 里的反斜杠/引号踩坑史太多）——
-$cfg = Get-Content -Raw -Path $TemplatePath | ConvertFrom-Json
+$cfg = Get-Content -Raw -Encoding UTF8 -Path $TemplatePath | ConvertFrom-Json
 $cfg.account      = $Account
 $cfg.user_id      = $UserId
 $cfg.owner_user_id = $UserId
@@ -104,13 +104,21 @@ $json = $cfg | ConvertTo-Json -Depth 6
 # 无 BOM UTF-8：网关 json.load 不容 BOM（带了就是"配置存在但读不出"那种静默死法）
 [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 # ACL 收敛：这份文件里是**别人账户的实盘钥匙**，同机其他账号不许能读到
-icacls $cfgPath /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls $cfgPath /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" /grant "*${sid}:(F)" | Out-Null
 Info "已写入 $cfgPath（ACL: Administrators+SYSTEM）"
 
 # —— 5) friend.env：看门狗拉起网关时必须带这两个值（缺一就等于"只上报不收单"）——
+#     ALLOWED_IPS 必须含两址：
+#       * 决策机 $DecisionIP —— 真正下单方，来源白名单的本来目的；
+#       * 本机 overlay $OverlayIP —— 让本机装填器的 /health 自探不被 IP 白名单判 403。
+#         /health 只对回环与白名单开放，而网关绑定在 overlay 地址（validate_friend_profile 禁止
+#         0.0.0.0），回环并未监听，故本机自探只能走 overlay 地址，必须把它自己放进白名单。
+#         只加本机自己，不放开任何第三方；/order 等仍需 Bearer token，放 IP 不等于放开鉴权。
 Set-Content -Path $envPath -Value @(
     "QUANT_GATEWAY_BIND=$($cfg.listen)",
-    "ALLOWED_IPS=$DecisionIP"
+    "ALLOWED_IPS=$DecisionIP,$OverlayIP",
+    "PYTHON_EXE=$PythonExe"
 ) -Encoding ASCII
 Info "已写 $envPath（供看门狗/计划任务注入）"
 
@@ -123,7 +131,12 @@ $oldAllow = $env:ALLOWED_IPS
 try {
     $env:QUANT_GATEWAY_BIND = $cfg.listen
     $env:ALLOWED_IPS = $DecisionIP
-    & $PythonExe $gwPy -c $cfgPath --profile-check
+    # PS5.1: stderr lines become ErrorRecords under EAP=Stop -> wrap the native call.
+    $eapP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $pyOut = & $PythonExe $gwPy -c $cfgPath --profile-check 2>&1
+    $pyOut | ForEach-Object { Write-Host $_ }
+    $ErrorActionPreference = $eapP
     $rc = $LASTEXITCODE
 } finally {
     if ($null -eq $oldBind) { Remove-Item Env:\QUANT_GATEWAY_BIND -ErrorAction SilentlyContinue } else { $env:QUANT_GATEWAY_BIND = $oldBind }
@@ -144,7 +157,7 @@ if ($rc -ne 0) {
 }
 
 # —— 7) 写后复读自证：把落盘文件读回来逐字段比（防 ConvertTo-Json 把 false 写成字符串之类）——
-$back = Get-Content -Raw -Path $cfgPath | ConvertFrom-Json
+$back = Get-Content -Raw -Encoding UTF8 -Path $cfgPath | ConvertFrom-Json
 $checks = @(
     ($back.deploy_profile -eq "friend"),
     ($back.broker -eq "queued"),

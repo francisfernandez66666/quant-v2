@@ -30,7 +30,7 @@ param(
     [string]$PythonExe    = "C:\Python312\python.exe",
     [string]$QmtExe       = "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe",
     [string]$ClientTask   = "QMTF-Client-Start",
-    [string]$GatewayTask  = "QMTF-Gateway-Ensure",
+    [string]$GatewayTask  = "QMTF-Gateway-Start",
     [int]$GatewayPort     = 8789,
     [int]$HoldLimitSec    = 3600
 )
@@ -50,7 +50,10 @@ function Test-TradingDay {
     # 日历文件不可得时该模块自己退化成"只看周末"并打一条日志——那是可见的降级，不是静默。
     $tc = Join-Path $GatewayDir "trading_calendar.py"
     if (-not (Test-Path $tc)) { return $false }
+    $eapT = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $PythonExe $tc 2>$null | Out-Null
+    $ErrorActionPreference = $eapT
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -67,6 +70,14 @@ function Invoke-Guarded([scriptblock]$body, [string]$tag) {
 function Test-PortListening([int]$port) {
     $conns = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
     return [bool]($conns)
+}
+
+# PYTHON_EXE from friend.env (schtasks /TR is capped at 261 chars)
+$envFileWd = Join-Path $GatewayDir "friend.env"
+if (Test-Path $envFileWd) {
+    foreach ($lnWd in (Get-Content $envFileWd)) {
+        if ($lnWd -match "^PYTHON_EXE=(.+)$") { $PythonExe = $Matches[1].Trim() }
+    }
 }
 
 switch ($Mode) {
@@ -97,7 +108,11 @@ switch ($Mode) {
                     if ($ln -match "^ALLOWED_IPS=(.+)$") { $env:ALLOWED_IPS = $Matches[1].Trim() }
                 }
             }
-            & $PythonExe $gw -c $cfg --profile-check | Out-Null
+            $eapG = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $pyOut = & $PythonExe $gw -c $cfg --profile-check 2>&1
+            $pyOut | ForEach-Object { Write-Host $_ }
+            $ErrorActionPreference = $eapG
             if ($LASTEXITCODE -ne 0) { Anchor "abort" "profile_check_failed_exit_$LASTEXITCODE"; exit 2 }
 
             # 拉起走计划任务（与客户端同一条纪律：不随某个会话的存活而亡）
@@ -125,7 +140,10 @@ switch ($Mode) {
             $payload = @{ admin_status = $st; orders = $rows; day = $day; elapsed_sec = $elapsed; hold_limit_sec = $HoldLimitSec } | ConvertTo-Json -Depth 8
 
             $cg = Join-Path $GatewayDir "close_gate.py"
-            $out = ($payload | & $PythonExe $cg)
+            $eapC = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $out = ($payload | & $PythonExe $cg 2>&1)
+            $ErrorActionPreference = $eapC
             $rc = $LASTEXITCODE
             Write-Host ($out | Out-String).Trim()
             if ($rc -eq 0) {

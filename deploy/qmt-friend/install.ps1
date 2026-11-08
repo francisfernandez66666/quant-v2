@@ -118,7 +118,7 @@ if ($PythonExe -eq "") {
     if ($cmd) { $PythonExe = $cmd.Source }
 }
 if ($PythonExe -eq "" -or -not (Test-Path $PythonExe)) { Abort 2 "python_absent" }
-$pyver = (& $PythonExe -V 2>&1) | Out-String
+$pyver = (& $PythonExe -V *>&1) | Out-String
 $pyver = $pyver.Trim()
 if ($pyver -notmatch '3\.(1[0-9]|9)') { Abort 2 ("python_too_old:" + $pyver) }
 if ($QmtRoot -eq "") {
@@ -306,7 +306,7 @@ if ($Apply) {
     # enroll 自己会提示输两次秘密（平台口令 + 网关钥匙，都走 SecureString），这里只把身份参数递过去；
     # 输出先收后打是为了能判 ENROLL_RESULT=OK —— Read-Host 读控制台，不受这段缓冲影响。
     $out = (& $enroll -BaseUrl $BaseUrl -Username $Username -Account $Account -OverlayIP $OverlayIP `
-            -DecisionIP $DecisionIP -GatewayDir $gwDst -PythonExe $PythonExe -QmtExe $QmtExePath -Apply 2>&1) | Out-String
+            -DecisionIP $DecisionIP -GatewayDir $gwDst -PythonExe $PythonExe -QmtExe $QmtExePath -Apply *>&1) | Out-String
     Log ("STEP7_ENROLL begin`n" + $out.TrimEnd() + "`nSTEP7_ENROLL end")
     if ($out -notmatch "ENROLL_RESULT=OK") { Abort 7 "enroll_not_ok" }
 } else {
@@ -317,7 +317,7 @@ if ($Apply) {
 $tasks = Join-Path $here "install_tasks.ps1"
 if (-not (Test-Path $tasks)) { Abort 8 "install_tasks_absent" }
 if ($Apply) {
-    $tout = (& $tasks -GatewayDir $gwDst -QmtExe $QmtExePath -Apply 2>&1) | Out-String
+    $tout = (& $tasks -GatewayDir $gwDst -QmtExe $QmtExePath -PythonExe $PythonExe -Apply *>&1) | Out-String
     # 锚点是 install_tasks.ps1 真发的那两行：TASKS_RESULT=INSTALLED + TASKS_REREAD_MATCH=1 tasks=4
     # （按记忆写成 TASKS_APPLIED=4 的话，这一步永远假红——脚本本身是对的。）
     if ($tout -notmatch "TASKS_REREAD_MATCH=1") {
@@ -330,7 +330,10 @@ if ($Apply) {
 
 # —— STEP 9：起一次 + 自证（/health 与 --profile-check 都归网关自己判）——
 if ($Apply) {
-    $pc = (& $PythonExe (Join-Path $gwDst "gateway.py") --profile-check 2>&1) | Out-String
+    $eap9 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $pc = (& $PythonExe (Join-Path $gwDst "gateway.py") --profile-check *>&1) | Out-String
+    $ErrorActionPreference = $eap9
     if ($pc -notmatch "PROFILE_CHECK=PASS") { Abort 9 "profile_check_not_pass" }
     Log ("STEP9_VERIFY profile_check=PASS")
     try {
@@ -359,7 +362,7 @@ if ($Apply) {
 $localExecScript = Join-Path $here "install_local_executor.ps1"
 if (-not (Test-Path $localExecScript)) { Abort 9 "local_executor_installer_absent" }
 if ($Apply) {
-    $lout = (& $localExecScript -GatewayDir $gwDst -PythonExe $PythonExe -QmtRoot $QmtRoot -Apply 2>&1) | Out-String
+    $lout = (& $localExecScript -GatewayDir $gwDst -PythonExe $PythonExe -QmtRoot $QmtRoot -Apply *>&1) | Out-String
     Log ("STEP9B_LOCALEXEC begin`n" + $lout.TrimEnd() + "`nSTEP9B_LOCALEXEC end")
     if ($lout -notmatch "LOCALEXEC_RESULT=OK") {
         # 装不上执行器＝运算那条腿没有 ⇒ 这台机器现在只能收单不能算。

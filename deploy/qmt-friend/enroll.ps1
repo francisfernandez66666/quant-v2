@@ -87,28 +87,43 @@ if (-not $Apply) {
 }
 
 # —— 4) 落配置（写前备份 + 出厂档自证，判据在 gateway.py）——
-$token | & $cfgScript -Account $Account -UserId $UserId -OverlayIP $OverlayIP `
-    -DecisionIP $DecisionIP -GatewayDir $GatewayDir -PythonExe $PythonExe -Apply
+# 钥匙必须走 stdin：ensure_friend_gateway_config.ps1 从 [Console]::In 读。
+# 不能用管道（$token | & ...），管道对象不会进子脚本的 stdin，会触发参数绑定失败。
+$tmpTok = Join-Path $env:TEMP ("qmt-friend-tok-" + $UserId + ".txt")
+[System.IO.File]::WriteAllText($tmpTok, $token)
+# PS5.1 has no "< file" input redirection; drive ensure via cmd /c and merge stderr.
+$cmd = ("powershell -NoProfile -ExecutionPolicy Bypass -File `"{0}`" -Account {1} -UserId {2} -OverlayIP {3} -DecisionIP {4} -GatewayDir `"{5}`" -PythonExe `"{6}`" -Apply < `"{7}`" 2>&1" -f `
+    $cfgScript, $Account, $UserId, $OverlayIP, $DecisionIP, $GatewayDir, $PythonExe, $tmpTok)
+$out = cmd /c $cmd 2>&1
+$out | ForEach-Object { Write-Host $_ }
+Remove-Item $tmpTok -Force -ErrorAction SilentlyContinue
 if ($LASTEXITCODE -ne 0) { Abort ("config_failed_exit_{0}" -f $LASTEXITCODE) }
 
 # —— 5) 装计划任务 ——
-$taskArgs = @("-Apply", "-GatewayDir", $GatewayDir)
-if ($QmtExe) { $taskArgs += @("-QmtExe", $QmtExe) }
+$taskArgs = @{ Apply = $true; GatewayDir = $GatewayDir }
+if ($QmtExe) { $taskArgs["QmtExe"] = $QmtExe }
+if ($PythonExe) { $taskArgs["PythonExe"] = $PythonExe }
 & $tasksScript @taskArgs
 if ($LASTEXITCODE -ne 0) { Abort ("tasks_failed_exit_{0}" -f $LASTEXITCODE) }
 
 # —— 6) 双向连通自证 ——
 # 6a 本机网关活着且身份自证
-schtasks /Run /TN "QMTF-Gateway-Ensure" | Out-Null
-Start-Sleep -Seconds 8
-try {
-    $h = Invoke-RestMethod -Uri "http://$OverlayIP`:8789/health" -TimeoutSec 10 `
-        -Headers @{ Authorization = "Bearer $token" }
-} catch {
-    Abort "local_health_unreachable"
+#     先经"纯拉起"任务（QMTF-Gateway-Start：无交易日闸门、不递归）把网关进程真正拉起来；
+#     再探本机 overlay 地址的 /health。该地址已在 ALLOWED_IPS 里（本机自探），故返回 200。
+#     网关绑定在 overlay 地址、回环并未监听，故不能用 127.0.0.1 探；/health 免鉴权，无需 token 头。
+schtasks /Run /TN "QMTF-Gateway-Start" | Out-Null
+# Store-python cold start can exceed 8s; retry instead of a single shot.
+$h = $null
+foreach ($tryi in 1..5) {
+    Start-Sleep -Seconds 6
+    try {
+        $h = Invoke-RestMethod -Uri "http://$OverlayIP`:8789/health" -TimeoutSec 8
+        break
+    } catch { }
 }
+if (-not $h) { Abort "local_health_unreachable" }
 if (-not $h.ok) { Abort "local_health_not_ok" }
-if ($h.broker_kind -and $h.broker_kind -ne "queued") { Abort "broker_kind_unexpected" }
+if ($h.broker -and $h.broker -ne "queued") { Abort "broker_kind_unexpected" }
 
 # 6b 广州侧那把钥匙归属对不对：拿该账号的实盘状态，比 account 尾号。
 #     尾号一致才算"两处登记同指一把"；403 说明授权没到位（结构性不能下单，正是要的效果）。
