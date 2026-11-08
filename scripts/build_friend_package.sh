@@ -259,14 +259,17 @@ for rel in $SRC_LIST; do
 		*) dst="$STAGE/payload/tools/$(basename "$rel")" ;;
 	esac
 	mkdir -p "$(dirname "$dst")"
-	cp "$src" "$dst" || { echo "X 复制失败：$rel" >&2; exit 1; }
+	# 用绝对路径的 /bin/cp：WorkBuddy 会在子进程 PATH 里注入 brokered-bin shim，
+	# 裸 `cp` 可能被文件策略拦成 "Brokered host copy source refused by file policy"
+	# （11-08 实测），包会静默少一个 gateway.py。
+	/bin/cp "$src" "$dst" || { echo "X 复制失败：$rel" >&2; exit 1; }
 done
 
 OVERLAY="none"
 if [ -n "$WG_MSI" ]; then
 	if [ -f "$WG_MSI" ]; then
 		mkdir -p "$STAGE/payload/overlay"
-		cp "$WG_MSI" "$STAGE/payload/overlay/wireguard-amd64.msi" || { echo "X 复制 msi 失败" >&2; exit 1; }
+		/bin/cp "$WG_MSI" "$STAGE/payload/overlay/wireguard-amd64.msi" || { echo "X 复制 msi 失败" >&2; exit 1; }
 		OVERLAY="embedded"
 	else
 		# 点了 --wireguard 但文件不在：这不是"那就跳过"，而是当场叫出来——
@@ -299,7 +302,7 @@ for tgt in executor sandbox; do
 		exit 1
 	fi
 done
-cp "$BUILD_OUT"/*.py "$ART_DIR/" || { echo "X 产物拷进包失败" >&2; exit 1; }
+/bin/cp "$BUILD_OUT"/*.py "$ART_DIR/" || { echo "X 产物拷进包失败" >&2; exit 1; }
 ART_N=$(find "$ART_DIR" -maxdepth 1 -name '*.py' -type f | wc -l | tr -d ' ')
 [ "$ART_N" = "2" ] || { echo "BUILD_EXIT=1 reason=artifacts_expected_2_got_$ART_N" >&2; exit 1; }
 ART_VER=$(grep -ho 'version=v[A-Za-z0-9-]*' "$STAGE"/build-*.log | head -1 | cut -d= -f2)
