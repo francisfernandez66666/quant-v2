@@ -42,24 +42,30 @@ func CashReportFresh(updatedAt string, now time.Time) bool {
 	return now.Sub(updated) <= CashReportWindow
 }
 
-// CounterPositionsReporting 柜台是否还在报持仓：持仓行里**至少一行**的 updated_at 非空且属于当前交易日。
+// CounterPositionsReporting 柜台是否还在报持仓：**全部非空 updated_at 的行都属于当前交易日**。
 //
-// 为什么看"至少一行"而不是"最大 updated_at"：桥断的表现是整表停在最后一次回报那一刻，
-// 所有行的时间戳一起冻住；而柜台恢复回报时逐行刷新，只要有一行是今天的就说明回报链活着。
-// 用 max(updated_at) 需要再排一次序，且遇到空串行的处理会和 SnapshotBelongsToDay 的保守语义打架。
+// 为什么从"至少一行"收紧成"全部"（2026-11-09 实锤）：旧判据的假设是"桥断＝整表一起冻住、
+// 恢复＝逐行刷新"——但 11-09 实测一笔后台任务把整表冻结（账本停在 11-05）里的**一行**摸成了
+// 当日时间戳，"至少一行属今日"立即误判"柜台在报数"，两行 11-05 的旧仓被当作真柜台展示
+// （owner 已清仓、余额 9 万 1，屏上却是 3 只旧仓 49k）。帧式写入下健康回报本来就把全表
+// 一起戳新，"全部属今日"与健康形态不冲突，却能抓住任何单行漂移。
 //
 // 三处共用（risk.Gate 的敞口/持仓数与 T+1 基线、engine 的 resolver、server 的 book_source 装配）：
 // 判据只许在这里定义一次，抄第三份就是抄出一份会漂的尺。
+// 空表（零行）返回 false——"柜台说空仓"的真值由资金帧的新鲜度与 empty-frame 事件承载，
+// 本判据只回答"这张持仓表是不是今天 freshly 写出来的"。
 func CounterPositionsReporting(rows []RealPosition, day string) bool {
+	seen := false
 	for i := range rows {
 		if rows[i].UpdatedAt == "" {
 			continue
 		}
-		if SnapshotBelongsToDay(rows[i].UpdatedAt, day) {
-			return true
+		seen = true
+		if !SnapshotBelongsToDay(rows[i].UpdatedAt, day) {
+			return false
 		}
 	}
-	return false
+	return seen
 }
 
 // BookSources 一本账在两维上各自该信谁。

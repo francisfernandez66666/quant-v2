@@ -333,12 +333,19 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[server] §2.12 手动账读数装配失败（实盘持仓照常返回，manual 标 unavailable）user=%s: %v", uid, manualErr)
 		manualBlock = map[string]interface{}{"present": false, "unavailable": true, "note": "手动维护账读取失败（不代表没有手动账）"}
 	}
+	// §LEDGER-FROZEN-BANNER（2026-11-09 实锤后的诚实化）：柜台帧的最新读数时刻与「冻结」判定
+	// 随响应下发——11-09 的形态是整本柜台账冻结在 11-05，却被一行被后台任务摸新的行顶出
+	// "回报于 14:15"的假新鲜。前端据此在页头挂「数据冻结，以券商 App 为准」的横幅，
+	// 不再把冻结账当可信柜台展示。
+	frameAt, frameFrozen := counterFrameReadout(acc, positions, cntime.DayOf(cntime.Now()))
 	writeJSON(w, 200, map[string]interface{}{
-		"positions": positions,                     // 持仓列表（已补名称/现价；来源见 book_source.positions）
-		"account":   acc,                           // 账户资产快照（来源见 book_source.cash）
-		"enabled":   ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
-		"tripped":   ctrl != nil && ctrl.Tripped(), // 熔断是否触发
-		"mode":      ctrlMode(ctrl),                // 执行模式 manual/auto
+		"positions":        positions,                     // 持仓列表（已补名称/现价；来源见 book_source.positions）
+		"account":          acc,                           // 账户资产快照（来源见 book_source.cash）
+		"counter_frame_at": frameAt,                       // 柜台读数的最新时刻（两维里较新的那个；空=柜台从未报过）
+		"counter_frozen":   frameFrozen,                   // true=最新柜台读数不属于当前交易日（冻结账）
+		"enabled":          ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
+		"tripped":          ctrl != nil && ctrl.Tripped(), // 熔断是否触发
+		"mode":             ctrlMode(ctrl),                // 执行模式 manual/auto
 		// §MANUAL-BOOK-UNIFY 读侧来源：这一张表里，资金与持仓两维各自是谁给的。
 		// 前端按它决定"操作"列点下去是下真单还是改账，也按它挂来源角标——
 		// 判据只在这里装配一次，前端不许再读一次新鲜度（两处判一个时间迟早不一致）。
@@ -348,6 +355,30 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		// manual 说"人敲的那本账长什么样"——后者是审计与回看面，不许被并进表里冒充柜台行。
 		"manual": manualBlock,
 	})
+}
+
+// counterFrameReadout 柜台帧读数（§LEDGER-FROZEN-BANNER）：返回两维里**最新**的非空读数时刻
+// 与「是否冻结」（最新读数不属于当前交易日＝true）。
+// 时刻串有两种历史形态（live.db 旧行 "2006-01-02T15:04:05+08:00" 与新行 "2006-01-02 15:04:05"），
+// 取 [:10] 的日期前缀比较即可（SnapshotBelongsToDay 同款口径）；全空 ⇒ 帧不存在（"" , false）。
+// English: newest counter reading timestamp + a "frozen" flag (not belonging to today).
+func counterFrameReadout(acc store.RealAccount, positions []store.RealPosition, day string) (string, bool) {
+	best := ""
+	for _, ts := range []string{acc.UpdatedAt} {
+		if ts != "" && (best == "" || ts[:10] > best[:10]) {
+			best = ts
+		}
+	}
+	for i := range positions {
+		ts := positions[i].UpdatedAt
+		if ts != "" && (best == "" || ts[:10] > best[:10]) {
+			best = ts
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, !store.SnapshotBelongsToDay(best, day)
 }
 
 // ctrlMode 返回控制器执行模式（manual/auto，nil → manual）。

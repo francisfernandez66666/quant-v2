@@ -1336,7 +1336,18 @@ export default function Positions() {
               English: one status strip for the whole tab; adjust-only entries appear solely in
               adjust mode; an unknown source is labelled unknown, never rendered as zero. */}
           <div data-testid="real-book-source" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: manualMode ? '#fff7e6' : 'transparent', border: manualMode ? '1px solid #ffd591' : '1px solid transparent' }}>
-            {counterReachable ? (
+            {/* §LEDGER-FROZEN-BANNER（2026-11-09 实锤后的诚实化）：柜台帧不属于今日 ⇒ 整表是冻结账，
+                页头必须挂「以券商 App 为准」——冻结账长得跟真柜台一模一样，是最危险的静默降级。
+                counter_frozen/counter_frame_at 由后端随响应下发（qmt.go counterFrameReadout）。 */}
+            {realBookSource?.counter_frozen && (
+              <>
+                <Tag data-testid="counter-frozen" theme="danger" size="small">柜台数据冻结</Tag>
+                <span className="muted" data-testid="counter-frozen-note">
+                  最新柜台读数 {realBookSource?.counter_frame_at || '—'} · 回报通路重建中 · 持仓与资金以券商 App 为准
+                </span>
+              </>
+            )}
+            {!realBookSource?.counter_frozen && counterReachable ? (
               <>
                 <Tag data-testid="counter-reachable" theme="success" size="small">柜台：可达</Tag>
                 <span className="muted">持仓与可用资金以 QMT 柜台回报为准 · 回报于 {latestUpdatedAt() || '—'}</span>
