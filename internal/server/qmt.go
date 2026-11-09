@@ -357,28 +357,49 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// counterFrameReadout 柜台帧读数（§LEDGER-FROZEN-BANNER）：返回两维里**最新**的非空读数时刻
-// 与「是否冻结」（最新读数不属于当前交易日＝true）。
-// 时刻串有两种历史形态（live.db 旧行 "2006-01-02T15:04:05+08:00" 与新行 "2006-01-02 15:04:05"），
-// 取 [:10] 的日期前缀比较即可（SnapshotBelongsToDay 同款口径）；全空 ⇒ 帧不存在（"" , false）。
-// English: newest counter reading timestamp + a "frozen" flag (not belonging to today).
+// counterFrameTime 解析柜台读数的两种历史时刻形态（live.db 旧行 ISO 带时区、新行北京墙钟）。
+// 两种并存是实库现状，解析失败的串按"没有这个读数"处理（不猜）。
+func counterFrameTime(ts string) (time.Time, bool) {
+	for _, layout := range []string{"2006-01-02T15:04:05Z07:00", "2006-01-02 15:04:05"} {
+		if t, err := time.ParseInLocation(layout, ts, cntime.Loc); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// counterFrameReadout 柜台帧读数（§LEDGER-FROZEN-BANNER）：返回最新非空读数时刻与「冻结」判定。
+// 冻结判据与 W2 同源同口径（绝不再造第二把尺）：资金帧属今日 **或** 持仓全行属今日
+// （CounterPositionsReporting）任一成立 ⇒ 柜台活着；两者皆否且确有旧读数 ⇒ 冻结。
+// 若只看"最新时间戳属不属今日"，会复刻 11-09 的单行摸新漏洞——一行被摸新就又把冻结账洗白。
+// English: frozen iff neither the account frame nor the positions table belongs to today,
+// reusing the same predicates selected by book_source (never a second ruler).
 func counterFrameReadout(acc store.RealAccount, positions []store.RealPosition, day string) (string, bool) {
-	best := ""
-	for _, ts := range []string{acc.UpdatedAt} {
-		if ts != "" && (best == "" || ts[:10] > best[:10]) {
-			best = ts
+	best, bestT, seen := "", time.Time{}, false
+	for _, ts := range append([]string{acc.UpdatedAt}, func() []string {
+		out := make([]string, 0, len(positions))
+		for i := range positions {
+			out = append(out, positions[i].UpdatedAt)
+		}
+		return out
+	}()...) {
+		if ts == "" {
+			continue
+		}
+		t, ok := counterFrameTime(ts)
+		if !ok {
+			continue
+		}
+		if !seen || t.After(bestT) {
+			best, bestT, seen = ts, t, true
 		}
 	}
-	for i := range positions {
-		ts := positions[i].UpdatedAt
-		if ts != "" && (best == "" || ts[:10] > best[:10]) {
-			best = ts
-		}
-	}
-	if best == "" {
+	if !seen {
 		return "", false
 	}
-	return best, !store.SnapshotBelongsToDay(best, day)
+	accToday := acc.UpdatedAt != "" && store.SnapshotBelongsToDay(acc.UpdatedAt, day)
+	posReporting := store.CounterPositionsReporting(positions, day)
+	return best, !accToday && !posReporting
 }
 
 // ctrlMode 返回控制器执行模式（manual/auto，nil → manual）。
