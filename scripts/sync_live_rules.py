@@ -84,6 +84,19 @@ def derive(snapshot):
     return block
 
 
+def daily_cap_pair(params_doc, block):
+    """§CAP-OVERRIDE-ASCII（2026-11-09）：顶层 daily_buy_cap 与快照内
+    daily_budget_amount 的两本账读数（§CAP-OVERRIDE 对账用，只读不写）。
+
+    carrier 顶层 daily_buy_cap 于 owner 2026-11-09 15:15 裁决起对齐账号
+    daily_budget_amount（提交 fa6939b）：这枚帽决定"当日还能买多少"，载体被
+    静态闸禁止联网，值只能烘参，而它的真源就是这份快照。失配＝载体与现网
+    分家，必须让人听见，不许哪本账悄悄赢。
+    """
+    return ((params_doc.get("params") or {}).get("daily_buy_cap"),
+            (block.get("qmt") or {}).get("daily_budget_amount"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     mode = ap.add_mutually_exclusive_group(required=True)
@@ -101,19 +114,48 @@ def main():
 
     current = (params_doc.get("params") or {}).get("live_rules")
     same = current == block
+    cap_params, cap_snapshot = daily_cap_pair(params_doc, block)
+    cap_ok = cap_params == cap_snapshot
     if args.check:
         print("LIVE_RULES_CHANGED_TOTAL=%d" % (0 if same else 1))
         print("LIVE_RULES_SECTIONS=%d" % len([k for k in block if k in SECTIONS]))
         print("LIVE_RULES_STRATEGIES=%d" % len(block["enabled_strategies"]))
         print("LIVE_RULES_FACTORS=%d" % len(block["applied_factor_ids"]))
-        print("LIVE_RULES_RESULT=%s" % ("OK" if same else "DRIFT"))
-        return 0 if same else 1
+        if not cap_ok:
+            # §CAP-OVERRIDE-ASCII（2026-11-09）：params.daily_buy_cap 必须**恒等于**
+            # 快照里账号的 daily_budget_amount——失配就是两本账，事后没人翻旧账
+            # 会发现载体帽与现网配置已经分家。帽漂移的 reason 单列，别被块漂移盖掉。
+            print("LIVE_RULES_CAP_MISMATCH key=daily_buy_cap params=%s snapshot=%s"
+                  % (json.dumps(cap_params, ensure_ascii=True),
+                     json.dumps(cap_snapshot, ensure_ascii=True)))
+        result = "OK" if (same and cap_ok) else "DRIFT"
+        if result == "DRIFT" and not cap_ok:
+            result = "DRIFT reason=daily_buy_cap_mismatch"
+        print("LIVE_RULES_RESULT=%s" % result)
+        print("LIVE_RULES_RESULT_CODE=%d" % (0 if result == "OK" else 1))
+        return 0 if result == "OK" else 1
 
     if same:
+        if not cap_ok:
+            print("LIVE_RULES_RESULT=ABORT reason=daily_buy_cap_mismatch params=%s snapshot=%s"
+                  % (json.dumps(cap_params, ensure_ascii=True),
+                     json.dumps(cap_snapshot, ensure_ascii=True)))
+            return 1
         print("LIVE_RULES_RESULT=OK unchanged=1")
         return 0
+    if not cap_ok:
+        # 刻意不写：把 daily_budget_amount 抄进顶层帽等于「数从数据文件进了代码路径」；
+        # 对账不落数，写侧也只在两侧对上时才落盘，失配当场停让人去看，而不是猜一个。
+        print("LIVE_RULES_RESULT=ABORT reason=daily_buy_cap_mismatch params=%s snapshot=%s"
+              % (json.dumps(cap_params, ensure_ascii=True),
+                 json.dumps(cap_snapshot, ensure_ascii=True)))
+        return 1
     params_doc["params"]["live_rules"] = block
-    payload = json.dumps(params_doc, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    # §CAP-OVERRIDE-ASCII（2026-11-09）：ensure_ascii=True 在这文件上是铁律——
+    # 这里曾经写 False，把 derive 写好的 \uXXXX 转义整体反转义成 UTF-8 中文
+    # （实测 213 处非 ASCII 入库）。产物转义有两道闸（builder g1 / 测试 ascii 门），
+    # 但这是仓里唯一一处会把已经合规的文件重新写坏的姿势，2026-11-09 起禁绝。
+    payload = json.dumps(params_doc, ensure_ascii=True, indent=2, sort_keys=False) + "\n"
     with open(PARAMS, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(payload)
     # 逐字节复读：写盘被拦/半截文件不许报成成功。

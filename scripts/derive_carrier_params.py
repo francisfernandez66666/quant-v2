@@ -185,7 +185,13 @@ MAPPING = [
     ("cluster_rho", ("cluster_rho",), None),
     ("sell_boost_level", ("sell_boost_level",), None),
     ("missing_key_target_cap", ("missing_key_target_cap",), None),
-    ("daily_buy_cap", ("daily_buy_cap",), None),
+    # daily_buy_cap 不进 MAPPING（§CAP-OVERRIDE-ASCII 2026-11-09）：它的真源是
+    # live_rules 快照的账号级 daily_budget_amount（owner 2026-11-09 15:15 裁决把
+    # 载体帽对齐现网账号值，提交 fa6939b；语义是日买入累计额度的资金流水闸）。
+    # 若留在这里，--write 会把文件里已对齐的现网值重写成 Go 出厂 100000——
+    # 等于工具替 owner 反悔。对账由 scripts/sync_live_rules.py --check/--write
+    # 硬判（reason=daily_buy_cap_mismatch），本脚本不再与 Go 出厂比这枚键。
+    # Go 导出读数刻意保留（cmd/derive_carrier_params collectQMT 未动），只是不进映射。
     ("min_order_amount", ("min_order_amount",), None),
     # §CARRIER-PARITY-1105：载体三行为的出厂值，同名直搬（Go 侧真身见 main.go collectQMT）。
     ("signal_gone_cancel_sec", ("signal_gone_cancel_sec",), None),
@@ -550,6 +556,20 @@ CARRIER_UNOWNED = {
     "t_signal_codes": ({}, "carrier-shape: 幂等短码表由 owner 装填；空表＝T 腿不出单（fail-closed）"),
     "t_remark_code_max_len": (0, "counter-property: 柜台备注预算仓库里没记过；0＝任何码都判超长＝拒发"),
     "t_missing_key_input": (False, "runtime-reading: 每轮读数不是配置；烘参刻按\"没有缺失\"落，运行期由 ctx 覆盖"),
+}
+
+# §CAP-OVERRIDE-ASCII（2026-11-09 批）：账号级覆盖登记——这些载体键的真源不是
+# Go 出厂，而是 qmt_gateway/live_rules_snapshot.json（运营主账号的现网配置导出，
+# 由 sync_live_rules.py 派生进 params.live_rules）。这里只登记「去快照的哪个键取值」，
+# **一个数字都不写**——数由快照与参数文件持有。
+# 对账执行点：scripts/sync_live_rules.py --check/--write 硬判
+# （reason=daily_buy_cap_mismatch，失配即红、--write 失配不落盘），它是快照的
+# 唯一读者，避免第二处快照解析。新增第二枚豁免键必须同时：
+#   (a) 改 pytest 等值锁 test_go_factory_exclusions_are_pinned 并给出理由；
+#   (b) 在 sync_live_rules 的对账里补一枚键的账目行；
+#   (c) 在 SIZING_DEFAULTS（若它在那张表里）改注释指明新真源。
+SNAPSHOT_OVERRIDES = {
+    "daily_buy_cap": ("qmt", "daily_budget_amount"),
 }
 
 # 柜台状态词表：真源在网关账本模块（构建器烘沙箱产物时读的也是这两个模块，见

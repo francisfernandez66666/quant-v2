@@ -20288,7 +20288,7 @@ fi
 echo "ok - §171 §FRIEND-PKG 锁通过（入口与脚本在册 1 + bat 姿势 1 + 一把尺子与字节码 1 + deny 锚点 1 + install 锚点与零明文 1 + 用例在册等值 1 + 常驻反证 1 + pwsh 语法解析 1，累计判定点 ${CNT171}）"
 
 # ── §173 §QMT-INTERNAL-LOOP（11-04 外脑化批：判据只读／桥心跳接线不是死线／静默域只折重复／买入闸单点／四源窗口同源／构建闸三段自证／投递腿不直起客户端／移植规则内联不进 import）
-echo "==> 173 §QMT-INTERNAL-LOOP（外脑档契约与判定只读／桥心跳三态接线／静默域首推与销案不静默／买入执行点单点／四源时段窗逐字同源／构建闸漂移+装载+短码唯一／沙箱零文件零网络／撤单与投递腿 fail-closed／移植规则靠内联不靠 import／用例在册／Go 出厂值单点导出／载体更新链与每日触发器与沙箱仓位与分级出站）..."
+echo "==> 173 §QMT-INTERNAL-LOOP（外脑档契约与判定只读／桥心跳三态接线／静默域首推与销案不静默／买入执行点单点／四源时段窗逐字同源／构建闸漂移+装载+短码唯一／沙箱零文件零网络／撤单与投递腿 fail-closed／移植规则靠内联不靠 import／用例在册／Go 出厂值单点导出／载体更新链与每日触发器与沙箱仓位与分级出站／账号级钱帽覆盖登记（⑩d））..."
 B173_FAILED=0
 fail173() {
 	echo "--- FAIL: §173 $*"
@@ -20570,6 +20570,45 @@ DERIVE_T=$(cat qmt_gateway/tests/test_derive_carrier_params.py || true)
 for name in IndexBands EmotionRekey MappingIntegrity Coverage BuilderAscii AgainstGo; do
 	grep_q "class $name" DERIVE_T F || fail173 "导出工具用例缺组：$name"
 done
+# ⑩d §CAP-OVERRIDE-ASCII（2026-11-09）：账号级钱帽覆盖登记。
+# daily_buy_cap 的真源是 live_rules 快照的账号 daily_budget_amount（owner 11-09 15:15
+# 裁决对齐现网账号值，fa6939b），从 Go 出厂对账旁路登记——存在性压在四条一组上：
+# 登记表在册 / 写盘姿势不回潮 / params 字节纯 ASCII / 手改帽必被对账喊红；
+# 少一条就是「两个尺子一红一绿、没人知道信哪把」的 2026-11-09 现场重演。
+CNT173=$((CNT173 + 1))
+DERIVE_SRC=$(cat scripts/derive_carrier_params.py || true)
+SYNC_SRC=$(cat scripts/sync_live_rules.py || true)
+grep_q "SNAPSHOT_OVERRIDES" DERIVE_SRC F || fail173 "账号级覆盖登记表不在册（从此势必要不对快照也不对出厂，谁也不知道信哪本账）"
+if grep -q "ensure_ascii=False" scripts/sync_live_rules.py; then
+	fail173 "sync_live_rules.py 用 ensure_ascii=False 整文件重排（把 derive 写好的 \\uXXXX 反转义——2026-11-09 实际入库过 213 处非 ASCII 字节）"
+fi
+PARAMS_NONASCII=$(python3 -c "d=open('qmt_gateway/local_executor_params.json','rb').read(); print(sum(1 for b in d if b>127))" || true)
+[ "$PARAMS_NONASCII" = "0" ] || fail173 "参数文件里出现非 ASCII 字节（n=${PARAMS_NONASCII:-?}），按字节点账，别让测试夹具用崩溃来代喊"
+echo "   [§173 ⑩d] 登记表在册 / sync 写盘姿势 / params 字节纯 ASCII"
+# 常驻反证 R1_MUTATED：复制树里把 daily_buy 帽改到与快照不同 → --check 必须以
+# daily_buy_cap_mismatch 喊红退出非 0；恒 0＝这把锁今天没有牙（教训：写完必须读 MUTATED）。
+CNT173=$((CNT173 + 1))
+R1_MUTATED=0
+WORK173B=$(mktemp -d /tmp/gate173-cap-XXXXXX)
+mkdir -p "$WORK173B/scripts" "$WORK173B/qmt_gateway"
+cp scripts/sync_live_rules.py "$WORK173B/scripts/" || true
+cp qmt_gateway/live_rules_snapshot.json qmt_gateway/strategy_switches_snapshot.json \
+   qmt_gateway/local_executor_params.json "$WORK173B/qmt_gateway/" || true
+python3 - "$WORK173B/qmt_gateway/local_executor_params.json" <<'PYC' || true
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding='utf-8'))
+d['params']['daily_buy_cap'] = float(d['params']['daily_buy_cap']) + 1000.0
+json.dump(d, open(p, 'w', encoding='utf-8'))
+PYC
+MU_OUT=$( (cd "$WORK173B" && python3 scripts/sync_live_rules.py --check 2>&1) || true )
+if grep_q "daily_buy_cap_mismatch" MU_OUT F; then R1_MUTATED=$((R1_MUTATED + 1)); fi
+rm -rf "$WORK173B"
+if [ "$R1_MUTATED" -ge 1 ]; then
+	echo "   [§173 ⑩d] R1_MUTATED=${R1_MUTATED}（手改帽被 --check 当场喊红，锁有牙）"
+else
+	fail173 "帽对账锁是恒绿摆设（把 params.daily_buy_cap 改出快照后 --check 没打 daily_buy_cap_mismatch）"
+fi
 
 # ⑩b 今天新长的四条腿：载体更新链 / 每日触发器 / 沙箱动态仓位 / 分级出站——每条都要有锁
 CNT173=$((CNT173 + 1))
@@ -20590,7 +20629,7 @@ CNT173=$((CNT173 + 1))
 ITT=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
 grep_q "QMTF-Carrier-Update" ITT F || fail173 "每日收盘后的自动更新没有触发器"
 grep_q 'St = "15:40"' ITT F || fail173 "载体更新任务的时间锚漂了（15:40 选在收盘快照与关闭腿之后）"
-grep_q "TASKS_REREAD_MATCH=1 tasks=5" ITT F || fail173 "注册后复读仍写 tasks=4（少注册第五条也不会红＝恒绿锁）"
+grep_q "TASKS_REREAD_MATCH=1 tasks=6" ITT F || fail173 "注册后复读仍少写 tasks=6（第六条 QMTF-Gateway-Start 起就锁 6；少注册一条也不会红＝恒绿锁）"
 grep_q "reason=no_carrier_updater" ITT F || fail173 "缺更新器时仍会注册一个空跑任务（空跑比不注册更坏）"
 CNT173=$((CNT173 + 1))
 SIZ=$(cat qmt_gateway/qmt_internal_strategy.py || true)
@@ -21153,7 +21192,10 @@ grep_q 'reason": "strategy_switch_off"' LEXT F || fail173 "开关拦下的信号
 for k in "enabled_strategies" "factor_rules" "unmapped_strategies" "strategy_kind_to_go"; do
 	grep_q "\"$k\"" PJT F || fail173 "params 缺 ${k}（tab 口径没烘进载体）"
 done
-grep_q '"v04-20261106"' PJT F || fail173 "规则表换了但版本没 bump（win 包无法与上一版区分）"
+# strategy_version 锚随真实版本走：11-09 15:15 批（fa6939b）把规则全部送进包时
+# 已 bump 到 v05-20261109（朋友真机已按 v05 实弹）。锚停在 v04 会让"换规则表
+# 忘 bump 版本"这条真缺陷永远测不出来——它判不了陈旧版本，只判我也看不见的假绿。
+grep_q '"v05-20261109"' PJT F || fail173 "规则表换了但版本没 bump（win 包无法与上一版区分；params strategy_version 应与最近一次实弹配菜批一致）"
 BUILDRT=$(cat "$BUILDR" || true)
 grep_q '"query_stock_trades"' BUILDRT F || fail173 "成交表方法没进构建器白名单（g2 会拒或部成永远走副本）"
 grep_q 'query_stock_trades(self._acc)' LEXT F || fail173 "载体没读成交表（部成余量按副本算会多撤）"

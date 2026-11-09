@@ -280,21 +280,34 @@ class TestRiskCapsAreAnded(unittest.TestCase):
 
     def test_daily_cap_accounts_for_what_was_already_spent(self):
         p = params()
+        # The daily cap's value is owner-aligned to the account's live
+        # daily_budget_amount (§CAP-OVERRIDE-ASCII 2026-11-09), so this case
+        # pins the SEMANTICS, not the number: spent near the cap must refuse,
+        # spent with room must allow.
         c = ctx(daily_buy_total=95000.0)
-        self.assertFalse(lex.rule_daily_buy_cap_ok(p, c, 10000.0))
-        self.assertTrue(lex.rule_daily_buy_cap_ok(p, c, 1000.0))
+        remainder = p["daily_buy_cap"] - 95000.0
+        self.assertFalse(lex.rule_daily_buy_cap_ok(p, c, remainder + 1000.0))
+        self.assertTrue(
+            lex.rule_daily_buy_cap_ok(p, c, max(remainder - 1000.0, 1.0)))
 
     def test_buy_amount_is_the_minimum_of_every_cap(self):
         p = params()
-        # cash allows 50k, per-order allows 20k, daily allows 15k left.
-        # 15k (not 5k) because min_order_amount is the Go factory 10000: a 5k room is
-        # correctly refused outright ("not worth an order"), which tests the amount floor
-        # rather than the min-of-caps this case is about.
+        # No literal cap values here: the cap numbers live in params
+        # (owner-aligned), and this case pins the invariant -- the sendable
+        # amount is the MIN of every live cap, never the max or the last.
         c = ctx(available_cash=50000.0, daily_buy_total=85000.0)
         amount = lex.rule_buy_amount(p, c)
-        self.assertIsNotNone(amount)
-        self.assertLessEqual(amount, 15000.0)
-        self.assertLessEqual(amount, 20000.0)
+        expected = min(
+            c["available_cash"] - p["min_cash_reserve"],
+            p["order_amount_cap"],
+            p["daily_buy_cap"] - c["daily_buy_total"])
+        if expected < p["min_order_amount"]:
+            # Below the floor nothing is worth sending: None, not a
+            # shrunk-to-the-floor order.
+            self.assertIsNone(amount)
+        else:
+            self.assertIsNotNone(amount)
+            self.assertEqual(amount, expected)
 
     def test_buy_amount_is_none_when_nothing_survives(self):
         p = params()

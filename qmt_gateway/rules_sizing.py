@@ -242,11 +242,22 @@ SIZING_DEFAULTS = {
     # -- money caps ANDed with the sizing caps (local_executor rule layer) --
     "min_cash_reserve": 1000.0,
     "order_amount_cap": 20000.0,
-    "daily_buy_cap": 100000.0,
+    # daily_buy_cap: true source = live_rules_snapshot#configs.qmt.daily_budget_amount
+    # (owner ruling 2026-11-09 15:15, commit fa6939b: align the carrier cap with
+    # the live account value). Semantics: a day-cumulative-buy MONEY gate, not a
+    # position cap. The Go factory (100000) remains the default tier for accounts
+    # without an override (internal/risk/gate.go reads the account-level cfg).
+    # Runtime always reads the baked PARAMS value (_sz_p raises on a missing
+    # key); this table is only a declared catalog. The Go-factory comparison
+    # covers MAPPED rows only; this key is reconciled hard against the snapshot
+    # by scripts/sync_live_rules.py (reason=daily_buy_cap_mismatch).
+    "daily_buy_cap": 150000.0,
     # Go: config.QMTConfig.EffectiveMinOrderAmount (factory 10000). This table is a DECLARED
     # catalog, never a runtime fallback (_sz_p raises on a missing key) -- and scripts/
-    # derive_carrier_params.py --check compares every row here against the Go factory value,
-    # so a stale number in this catalog goes red instead of silently becoming the behaviour.
+    # derive_carrier_params.py --check compares its Go-mapped rows against the Go factory
+    # value, so a stale number in this catalog goes red instead of silently becoming the
+    # behaviour. daily_buy_cap is the registered exemption: its reconciliation anchor is
+    # the live_rules snapshot, not the Go factory (see above).
     "min_order_amount": 10000.0,
     "industry_cap_pct": 35.0,
     "single_stock_cap_pct": 35.0,

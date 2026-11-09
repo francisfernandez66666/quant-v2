@@ -287,6 +287,42 @@ class BearTacticKnobs(unittest.TestCase):
 
 
 @unittest.skipUnless(GO_AVAILABLE, "go_absent: the end-to-end check needs the Go toolchain")
+class SnapshotOverride(unittest.TestCase):
+    """§CAP-OVERRIDE-ASCII（2026-11-09）：账号级钱帽覆盖登记。
+
+    daily_buy_cap 的真源是 live_rules 快照里的账号 daily_budget_amount
+    （owner 2026-11-09 15:15 裁决对齐现网账号值，fa6939b），不是 Go 出厂。
+    这一组锁三件事：登记在册、登记表不滚雪球、参数文件保持纯 ASCII。
+    """
+
+    def test_override_value_comes_from_the_live_rules_snapshot(self):
+        sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+        import sync_live_rules
+
+        block = sync_live_rules.derive(sync_live_rules._read(
+            sync_live_rules.SNAPSHOT))
+        params = _params()
+        self.assertEqual(float(params["daily_buy_cap"]),
+                         float(block["qmt"]["daily_budget_amount"]))
+
+    def test_go_factory_exclusions_are_pinned(self):
+        """等值锁：任何想给第二枚键办"免于 Go 出厂对账"的人必须改这里并给理由。"""
+        self.assertEqual(set(dcp.SNAPSHOT_OVERRIDES), {"daily_buy_cap"})
+
+    def test_params_file_is_pure_ascii(self):
+        """参数文件必须纯 ASCII：builder 转义有两道闸，这把字节尺料事在写入层。
+
+        曾经 sync_live_rules --write 用 ensure_ascii=False 把整个 doc 重排，
+        derive 写好的 \\uXXXX 被整体反转义（213 处中文入库）。字节数比"读进来
+        是否抛 UnicodeDecodeError"可读：红了能报出第一个偏移。
+        """
+        raw = open(PARAMS_PATH, "rb").read()
+        bad = [i for i, b in enumerate(raw) if b > 127]
+        self.assertEqual(bad, [],
+                         "params file carries non-ASCII bytes, first at offset %d"
+                         % (bad[0] if bad else -1))
+
+
 class AgainstGo(unittest.TestCase):
     """端到端：参数文件的每一个派生键都必须等于 Go 此刻打出来的出厂值。"""
 

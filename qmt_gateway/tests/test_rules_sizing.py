@@ -570,9 +570,13 @@ def test_cash_and_daily_quota_shrink_the_amount():
     # 当日额度已用满 -> 同样拒
     assert rs.buy_size_amount(
         knobs, base_ctx(daily_buy_total=knobs["daily_buy_cap"])) is None
-    # 额度还剩一点时，那个余额就是上限
+    # 额度还剩一点时，那个余额就是上限。期望值不写死数字：帽的真值在 params
+    # （§CAP-OVERRIDE-ASCII 2026-11-09 起 owner 对齐现网账号值），本用例钉的是
+    # 「daily 剩余与单笔帽取最小」这条不变量，不是某个金额。
+    leftover = max(
+        knobs["daily_buy_cap"] - 85000.0, knobs["min_order_amount"])
     assert rs.buy_size_amount(knobs, base_ctx(daily_buy_total=85000.0)) == pytest.approx(
-        15000.0)
+        min(leftover, knobs["order_amount_cap"]))
 
 
 def test_missing_cash_reading_does_not_become_an_unlimited_order():
