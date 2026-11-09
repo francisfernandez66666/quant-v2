@@ -1524,6 +1524,8 @@ func (r *Registry) LLMClient() *llm.Client {
 	return r.opts.LLMClient
 }
 
+// SetLLMClient 热替换注册表持有的 LLM 客户端：后续 GetOrBuild 新建引擎直接带新客户端，
+// 新闻代理与全部在册核心在锁外逐个换装——锁内只摘引用，避免与引擎内部锁嵌套。
 func (r *Registry) SetLLMClient(c *llm.Client) {
 	r.mu.Lock()
 	r.opts.LLMClient = c // 模板更新：后续 GetOrBuild 新建引擎直接带新客户端

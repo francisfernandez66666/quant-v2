@@ -40,6 +40,9 @@ const (
 	AnchorSourceNone = "none"
 )
 
+// RealPosition 柜台持仓行（实盘账本的最小单元）：ts_code/qty/cost_price 是柜台口径，
+// anchor_price 是首买锚点（只升不降，见 AnchorTicket）；写入侧字段级校验与成本基准
+// 守卫都在 UpsertRealPositions，读侧不得绕过。
 type RealPosition struct {
 	TsCode    string  `json:"ts_code"`    // TS代码
 	Name      string  `json:"name"`       // 名称
@@ -267,6 +270,8 @@ func (d *DB) ensureAnchorPriceColumn() error {
 // carrier reads the same list instead of re-typing the two comparisons.
 var anchorTicketSources = []string{AnchorSourceFirstBuyOrder, AnchorSourceFirstLot}
 
+// AnchorTicket 判定该持仓是否带有效首买锚点（AnchorPrice>0）：锚点缺失时 T 腿/纪律
+// 判定按弃权处理——拿不到真锚点绝不造数。
 func (p RealPosition) AnchorTicket() bool {
 	if p.AnchorPrice <= 0 {
 		return false
@@ -1671,6 +1676,8 @@ const realOrderSelectColumns = `order_id, signal_id, code, side, status, price, 
 	COALESCE(signal_vwap_premium_pct,0), COALESCE(intraday_t,0),
 	COALESCE(cancel_requested_at,''), COALESCE(cancel_source,''), COALESCE(cancel_reason,'')`
 
+// RealOrdersForUser 返回该账号的实盘委托列表（含 §C2-VWAP-READ 的四列 VWAP 读数），
+// 供对账页与成交质量分析；只读不改状态。
 func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
 	// §C2-VWAP-READ（2026-10-26）：写入侧一直有 market_vwap/vwap_source/vwap_as_of/
 	// signal_vwap_premium_pct 四列，但本查询此前没 SELECT，导致订单 API 永远回空——

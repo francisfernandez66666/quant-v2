@@ -630,6 +630,7 @@ type ErrShortHistory struct {
 	Got  int
 }
 
+// Error 返回样本日不足的可读文案：标定+验证所需的交易日数与实得数，供标定入口直接回给人。
 func (e ErrShortHistory) Error() string {
 	return fmt.Sprintf("样本日不足：需要 %d 个交易日（标定+验证），实得 %d 个", e.Need, e.Got)
 }

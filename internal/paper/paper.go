@@ -43,6 +43,8 @@ func vwapPremiumPct(fill, vwap float64) float64 {
 	return (fill - vwap) / vwap * 100
 }
 
+// LimitUpPct 是 data.LimitUpPct 的薄委托（§R6 P1-4：全系统唯一口径）：paper 包内的
+// 调用点保持局部可读，实现绝不在此复制第二份。
 func LimitUpPct(code, name string) float64 {
 	// §R6 P1-4 收敛到 data.LimitUpPct（全系统唯一口径，含北交所 30% 板）。
 	// English: delegated to data.LimitUpPct — single authoritative board-aware threshold.

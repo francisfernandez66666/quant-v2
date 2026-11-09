@@ -150,6 +150,8 @@ func (d *DB) DeleteSignalDecisionsForUser(userID string) (int64, error) {
 	return res.RowsAffected()
 }
 
+// PruneSignalDecisions 删除 beforeDay（compact 交易日）之前的当日定权快照，返回删除行数；
+// 空串直接拒绝——参数缺失时宁可不清扫，绝不误删整表。
 func (d *DB) PruneSignalDecisions(beforeDay string) (int64, error) {
 	if strings.TrimSpace(beforeDay) == "" {
 		return 0, nil

@@ -171,6 +171,7 @@ type MinuteStats struct {
 	AvgBars float64 `json:"avg_bars_per_code_day"` // 平均每(票,日)根数：远低于 48 说明上游窗口被截
 }
 
+// String 返回单行日志摘要：行数/代码数/时间跨度/日均根数，供分钟线回填任务的收尾读数。
 func (s MinuteStats) String() string {
 	return fmt.Sprintf("rows=%d codes=%d span=%s..%s avg_bars/code_day=%.1f",
 		s.Rows, s.Codes, s.FirstTs, s.LastTs, s.AvgBars)

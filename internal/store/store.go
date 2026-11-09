@@ -1952,12 +1952,15 @@ func (d *DB) UpsertStockListings(rows []StockListing) (int64, error) {
 // 时点股票池判定"防线有没有粮"用——覆盖为 0 时回放必须把降级抬成可见读数而不是静默空池。
 // English: §B4-PIT coverage probe (total / list_date filled / delist_date filled) so the replay
 // can tell "PIT has data" from "PIT would silently return an empty pool".
+// StockMetaStats 基础信息表（stocks）的健康度读数：调用方靠它区分「PIT 有数据」与
+// 「PIT 会静默回空池」——后者是最危险的静默降级形态。
 type StockMetaStats struct {
 	Total      int // stocks 表行数
 	WithList   int // list_date 非空
 	WithDelist int // delist_date 非空（已退市样本，幸存者偏差的补集）
 }
 
+// StockMetaStats 读取基础信息表的统计读数（字段含义见 StockMetaStats），错误原样上抛。
 func (d *DB) StockMetaStats() (StockMetaStats, error) {
 	var s StockMetaStats
 	err := d.db.QueryRow(`SELECT COUNT(*),

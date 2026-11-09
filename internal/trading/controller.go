@@ -1196,6 +1196,9 @@ func (c *Controller) MaybeReconcile(interval time.Duration) {
 // English: the controller clock, exposed so the manual-entry gate is test-pinnable.
 func (c *Controller) Now() time.Time { return c.now() }
 
+// ManualOrderRefusal 手动入口闸：非交易日/非下单窗口时返回可直接回 409 的原因文案，
+// 空串=放行；forCancel 切换撤单口径（撤单窗口与下单窗口是两张表）。时钟由调用方注入，
+// 测试才能钉出「周六 09:25」与「周三 09:25」两种形状。
 func (c *Controller) ManualOrderRefusal(now time.Time, forCancel bool) string {
 	if !data.IsTradingDay(now) {
 		action := "挂单"
@@ -1216,6 +1219,8 @@ func (c *Controller) ManualOrderRefusal(now time.Time, forCancel bool) string {
 	return ""
 }
 
+// CancelOrder 手动撤单入口：禁撤窗口内直接拒绝（绝不发了让交易所拒——那会拿到一次
+// 「受理成功」的假回执）；发出后先补留痕三列再推进状态（§FIX-20261028-F14 顺序红线）。
 func (c *Controller) CancelOrder(orderID string) error {
 	c.mu.RLock()
 	enabled := c.cfg.Enabled

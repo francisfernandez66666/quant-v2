@@ -40,6 +40,8 @@ func hasAnyPrefix(head string, prefixes []string) bool {
 	return false
 }
 
+// LimitUpPct 返回该代码对应的涨停幅度（%）：主板 10%、创业板/科创板 20%、北交所 30%，
+// ST 按 5%——全系统涨跌停判定的唯一口径，判定依据是代码前缀与名称里的 ST 字样。
 func LimitUpPct(code, name string) float64 {
 	if strings.Contains(strings.ToUpper(name), limitUpMarkerST) {
 		return 4.9

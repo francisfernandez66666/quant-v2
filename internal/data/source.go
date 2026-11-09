@@ -314,6 +314,8 @@ func (dc *DataCoordinator) BreakerDetail() map[string]map[string]any {
 	return em.BreakerDetail()
 }
 
+// HealthCheck 返回各行情源的可用性表（键=eastmoney/sina/tencent/ths，值=是否可用），
+// 供状态页与探针判断哪条链活着；协调器未装配东财客户端时全键 false（不编造可用）。
 func (dc *DataCoordinator) HealthCheck() map[string]bool {
 	if dc.eastMoney == nil {
 		return map[string]bool{"eastmoney": false, "sina": false, "tencent": false, "ths": false}
