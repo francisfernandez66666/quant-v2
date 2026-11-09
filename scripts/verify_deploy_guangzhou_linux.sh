@@ -181,18 +181,26 @@ emit SETUP_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https:
 emit ANON_API_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/api/status 2>/dev/null)"
 # Only the boolean is emitted; never echo any credential value from auth.json.
 # auth.json 是 0600 凭据文件（quant 属主）：探针只经 sudo 读布尔位，绝不放宽文件权限。
+# §TOKEN-PERAACCT 口径升级（2026-11-09）：多账号各有快照后，「第一行快照」不再有语义。
+# 现在判的是**除 OWNER（u_1785377969825355000）外任何账号的 qmt.enabled 都必须 false**——
+# 成员账号的实盘腿未接入自己的盒子前绝不允许继承/持有 enabled 的凭证（10-30 双份账事故的形状）。
+# OWNER 自身 enabled=true 是它的真实在跑腿，不参与本判定。
 emit U3_QMT_ENABLED "$(sudo python3 - <<'PY' 2>/dev/null || echo unknown
 import json
 d = json.load(open('/var/lib/quant-trading-v2/auth.json', encoding='utf-8-sig'))
+owner = 'u_1785377969825355000'
+bad = []
 for c in d.get('configs', []):
     if not isinstance(c, dict) or not str(c.get('key', '')).startswith('quant_config_json_v1'):
+        continue
+    if c.get('user_id') == owner:
         continue
     v = c.get('value')
     if isinstance(v, str):
         v = json.loads(v)
-    if isinstance(v, dict) and isinstance(v.get('qmt'), dict):
-        print('true' if v['qmt'].get('enabled') else 'false')
-        break
+    if isinstance(v, dict) and isinstance(v.get('qmt'), dict) and v['qmt'].get('enabled'):
+        bad.append(str(c.get('user_id') or 'unknown_uid'))
+print('true' if bad else 'false')
 PY
 )"
 emit JOURNAL_ERRORS "$(journalctl -u quant --since '-10 min' --no-pager 2>/dev/null | grep -c 'ERROR' || true)"
