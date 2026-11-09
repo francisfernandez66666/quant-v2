@@ -136,8 +136,13 @@ MARK_ERR="none"
 MARK_MAX_TRIES="${MARK_MAX_TRIES:-3}"
 for mk_try in $(seq 1 "$MARK_MAX_TRIES"); do
   # stdout 与 stderr 同管道取回：一次拨号既要产物也要失败原因（成功时整串就是标记，直接用）。
+  # §GZ-UBUNTU（2026-11-09 修）：广州已切 Ubuntu，标记读取从 Windows `type C:\...` 改为
+  #   `cat /var/backups/quant/SNAPSHOT_OK`——旧写法在新机上必然 `type: not found`（11-09 两轮
+  #   拉取实录全红），拉取在第一步中止，restic 根本没跑，异地副本断供一整天。
+  # English: GZ is Ubuntu now — read the marker with cat + the Linux path (the Windows-era
+  #   `type C:\...` failed on every run, so the offsite copy silently stopped).
   mk_out="$(ssh -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
-    -o LogLevel=ERROR "$SSH_HOST" 'type C:\var\lib\quant-snapshot\SNAPSHOT_OK' 2>&1)" && mk_rc=0 || mk_rc=$?
+    -o LogLevel=ERROR "$SSH_HOST" 'cat /var/backups/quant/SNAPSHOT_OK' 2>&1)" && mk_rc=0 || mk_rc=$?
   if [ "$mk_rc" -eq 0 ]; then MARK="$mk_out"; break; fi
   # 成因回显：只留非 "** " 行、压成一行、截 200 字符（行长是这条链的隐形约束，超了会劈行）。
   MARK_ERR="$(printf '%s\n' "$mk_out" | grep -v '^\*\* ' | tr '\n' ' ' | cut -c1-200)"
