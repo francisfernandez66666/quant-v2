@@ -107,10 +107,11 @@ run_probes() { # $1=读数文本；依赖全局 EXPECT_COMMIT
   # GetQMTConfigFor(userID)（internal/engine/registry.go:1177），不是全局 rules.qmt。
   # 只有账号级 qmt.enabled=false 才是档 4「显式影子态」；改回 true 会放行自动买入判据。
   v="$(get U3_QMT_ENABLED)"
-  if [ "$v" = "false" ]; then
-    probe "u3_account_shadow" 0 "account_qmt_enabled=$v external_brain=4"
+  WANT_U3="${EXPECT_QMT_ENABLED:-false}"
+  if [ "$v" = "$WANT_U3" ]; then
+    probe "u3_account_shadow" 0 "account_qmt_enabled=$v want=$WANT_U3"
   else
-    probe "u3_account_shadow" 1 "account_qmt_enabled=${v:-missing} want=false"
+    probe "u3_account_shadow" 1 "account_qmt_enabled=${v:-missing} want=$WANT_U3"
   fi
 
   v="$(get JOURNAL_ERRORS)"
@@ -178,7 +179,8 @@ emit HTTPS_HOME_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 h
 emit SETUP_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/setup 2>/dev/null)"
 emit ANON_API_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/api/status 2>/dev/null)"
 # Only the boolean is emitted; never echo any credential value from auth.json.
-emit U3_QMT_ENABLED "$(python3 - <<'PY' 2>/dev/null || echo unknown
+# auth.json 是 0600 凭据文件（quant 属主）：探针只经 sudo 读布尔位，绝不放宽文件权限。
+emit U3_QMT_ENABLED "$(sudo python3 - <<'PY' 2>/dev/null || echo unknown
 import json
 d = json.load(open('/var/lib/quant-trading-v2/auth.json', encoding='utf-8-sig'))
 for c in d.get('configs', []):
