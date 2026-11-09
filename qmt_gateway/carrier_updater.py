@@ -186,6 +186,11 @@ class CarrierUpdater:
         if not self.qmt_python_dir and self.strategy_file:
             self.qmt_python_dir = os.path.dirname(os.path.abspath(self.strategy_file))
 
+        # 客户端保活任务名：投递脚本的缺省值是广州机的 "QMT-Ensure-Running"，
+        # 朋友机上是 "QMTF-Client-Ensure"。不显式传就会在有序重启里 disable/run 一个
+        # 不存在的任务：网关与客户端被杀掉却没人拉起（2026-11-09 切换实测发现）。
+        self.ensure_task = str(self.cfg.get("carrier_ensure_task") or "").strip()
+
         # 投递脚本（唯一合法的写盘路径）与它的 PowerShell。
         self.ps_exe = str(self.cfg.get("carrier_ps_exe") or _default_ps_exe()).strip()
         self.updater_script = str(self.cfg.get("carrier_updater_script") or "").strip()
@@ -388,13 +393,16 @@ class CarrierUpdater:
         -StrategyFile 显式带上**已安装那份的名字**：否则更新脚本按它自己的缺省名写，
         于是"我们比过哈希的文件"和"它写下去的文件"可以是两个文件。
         """
-        return [self.ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass",
+        argv = [self.ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass",
                 "-File", self.updater_script,
                 "-Source", source_path,
                 "-QmtPythonDir", self.qmt_python_dir,
                 "-StrategyFile", os.path.basename(self.strategy_file),
                 "-Apply",
                 "-ExpectedVersion", str(manifest.get("strategy_version") or "")]
+        if self.ensure_task:
+            argv += ["-EnsureTaskName", self.ensure_task]
+        return argv
 
     def run_updater(self, argv):
         """跑更新脚本并判它的锚。返回 (ok, reason, output_text)。

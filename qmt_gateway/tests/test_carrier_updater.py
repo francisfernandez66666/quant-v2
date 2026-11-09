@@ -499,6 +499,34 @@ class TestDownloadThenApply(unittest.TestCase):
         self.assertIn("updater_rc_0", rep["reason"])
 
 
+class TestEnsureTaskNamePassthrough(unittest.TestCase):
+    """2026-11-09 切换实录：投递脚本缺省任务名是广州机的 QMT-Ensure-Running，
+    朋友机上是 QMTF-Client-Ensure。不显式传就会在有序重启里 disable/run 一个不存在的
+    任务，网关与客户端被杀掉却没人拉起。这一支锁住「配置里写什么就传什么」。
+    """
+
+    def _argv_with(self, extra_cfg):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            fx = _Fixture(tmp.name, extra_cfg=extra_cfg)
+            u = fx.updater(transport=_Transport(manifest=fx.manifest()),
+                           runner=_Runner())
+            return u.updater_argv(os.path.join(tmp.name, "candidate.py"),
+                                 {"strategy_version": "v02-20261105"})
+        finally:
+            tmp.cleanup()
+
+    def test_configured_task_name_is_passed_verbatim(self):
+        argv = self._argv_with({"carrier_ensure_task": "QMTF-Client-Ensure"})
+        self.assertIn("-EnsureTaskName", argv)
+        self.assertEqual(argv[argv.index("-EnsureTaskName") + 1], "QMTF-Client-Ensure")
+
+    def test_no_guangzhou_task_name_leaks_into_friend_box(self):
+        argv = self._argv_with({})
+        self.assertNotIn("QMT-Ensure-Running", argv)
+        self.assertNotIn("-EnsureTaskName", argv)
+
+
 class TestStopMarker(unittest.TestCase):
     """规则 5：目标目录里有 STOP_AUTO_UPDATE 牌 ⇒ 提前拒（那块牌只有人工能清），拒也要回话。"""
 
