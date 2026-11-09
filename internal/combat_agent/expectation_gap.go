@@ -87,6 +87,15 @@ func CheckExpectationGap(newsText string, positive bool, changePct, turnover, vo
 		case changePct >= 3 && changePct < 9.5:
 			// 高位放量滞涨：涨幅 3-9.5% 且换手异常放大
 			// High-placement sluggish rise: 3-9.5% gain with abnormally inflated turnover.
+			// §GAP-DATA-GUARD（2026-11-09 owner 报的"没数据也会提醒"）：量比未知（调用方
+			// 传 0 表示"没有这个读数"）时，量价两类判定都无从做起——把 0 当成"缩量"就会
+			// 让这一涨幅带里的每条利好新闻都必然触发提醒（0 < 0.7 恒真）。缺数据 = 弃权。
+			// English: volRatio 0 means UNKNOWN; treating it as "shrunk volume" made every
+			// bullish-news item in this band fire. Missing data abstains.
+			if volRatio <= 0 {
+				res.Score = 0
+				return res
+			}
 			if turnover > 20 && volRatio > 2 {
 				// 高换手 + 高量比但涨幅一般 → 滞涨
 				// High turnover + high volume ratio but a modest gain -> sluggish.

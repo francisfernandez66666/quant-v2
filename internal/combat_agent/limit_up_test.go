@@ -58,6 +58,25 @@ func TestCheckExpectationGap(t *testing.T) {
 	}
 }
 
+// §GAP-DATA-GUARD（2026-11-09）：量比未知（0）时，3-9.5% 涨幅带里的量价判定必须弃权——
+// 旧实现把 0 当成"缩量"，`volRatio < 0.7` 恒真，该带里的每条利好新闻都必然触发提醒
+// （owner 实报"没数据也会提醒并推荐交易"）。缺数据 = 不触发，绝不缺数据反而加分。
+func TestCheckExpectationGapUnknownVolRatioAbstains(t *testing.T) {
+	// 3-9.5% 涨幅 + 利好 + 量比未知 ⇒ 不得触发（旧实现必触发"缩量上涨"）
+	if g := CheckExpectationGap("公司中标大单", true, 5.0, 25, 0); g.Trigger {
+		t.Errorf("量比未知必须弃权: got %+v", g)
+	}
+	// 量比已知且萎缩 ⇒ 照常触发（守卫不许把真信号也掐了）
+	g := CheckExpectationGap("公司中标大单", true, 5.0, 25, 0.5)
+	if !g.Trigger || g.GapType != GapShrinkRise {
+		t.Errorf("量比 0.5 已知缩量应触发缩量上涨: got %+v", g)
+	}
+	// 量比已知且正常 ⇒ 量价配合，不触发
+	if g := CheckExpectationGap("公司中标大单", true, 5.0, 5, 1.2); g.Trigger {
+		t.Errorf("量价配合不应触发: got %+v", g)
+	}
+}
+
 // TestScoreLeaderWeights 验证龙头评分：强票（高连板/早封板/高封单/低换手）
 // 评分应在 (0,100] 区间，且明显高于弱票（首板/午后封板/低封单/高换手）。
 func TestScoreLeaderWeights(t *testing.T) {
