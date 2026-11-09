@@ -268,6 +268,45 @@ func TestCarrierManifestKnownShape(t *testing.T) {
 	if _, ok := body["requested_at"]; !ok {
 		t.Error("requested_at 必须恒在位（没点过时为 null）")
 	}
+	// §ARTIFACT-URL-PASSTHROUGH（2026-11-09 实机钉死）：清单给了地址就必须原样下发，
+	// 否则盒子拿不到 URL 会走"本机重烘"兜底腿、用旧参数烘出旧字节，SHA 闸判红——
+	// 形态是"发布了但永远更新不上"（当天实机日志：CARRIER_DOWNLOAD match=0）。
+	if body["has_artifact_url"] != false {
+		t.Error("清单没写 artifact_url 时 has_artifact_url 必须 false（缺省形态＝本批不供字节）")
+	}
+	if _, ok := body["artifact_url"]; ok {
+		t.Error("清单没给地址时不得下发 artifact_url 键（缺省形态保持干净）")
+	}
+}
+
+func TestCarrierManifestArtifactUrlPassthrough(t *testing.T) {
+	s := newCarrierServer(t)
+	leg := newCarrierLeg(t, s, "carrier-url", "KEY-URL")
+	writeCarrierFile(t, s, leg.ID, &carrierManifest{
+		StrategyVersion: "v91-20261109", StrategySha256: carrierShaSample,
+		UpdatedAt:    "2026-11-09T13:46:49+08:00",
+		RequestState: carrierStatePending,
+		ArtifactURL:  "https://quant-trading.top/leg/carrier/qmt_internal_strategy_v91-20261109.py",
+	})
+	body := decodeCarrierResp(t, carrierGetWithKey(s, "KEY-URL"))
+	if body["has_artifact_url"] != true {
+		t.Fatalf("清单给了地址 ⇒ has_artifact_url 必须 true，实得 %v", body["has_artifact_url"])
+	}
+	want := "https://quant-trading.top/leg/carrier/qmt_internal_strategy_v91-20261109.py"
+	if got, _ := body["artifact_url"].(string); got != want {
+		t.Fatalf("artifact_url 必须逐字透传：want %q got %q", want, got)
+	}
+	// 非法形状（非 http/https）不得下发——盒子侧还会再挡一次，两层同口径。
+	writeCarrierFile(t, s, leg.ID, &carrierManifest{
+		StrategyVersion: "v91-20261109", StrategySha256: carrierShaSample,
+		UpdatedAt:    "2026-11-09T13:46:49+08:00",
+		RequestState: carrierStatePending,
+		ArtifactURL:  "file:///etc/passwd",
+	})
+	body2 := decodeCarrierResp(t, carrierGetWithKey(s, "KEY-URL"))
+	if body2["has_artifact_url"] != false {
+		t.Fatalf("非 http(s) 地址不得下发，实得 %v", body2["has_artifact_url"])
+	}
 }
 
 // ───────────── ① 归属由钥匙决定：body 里自报的 user_id 一律不信 ─────────────

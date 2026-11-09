@@ -130,6 +130,11 @@ type carrierManifest struct {
 	// StrategySha256 期望载体文件的完整 SHA256——盒子只把**验过哈希**的字节交给投递脚本，
 	// 所以这一枚缺失/形状不对就等于"这一轮谁也不许动盘"。
 	StrategySha256 string `json:"strategy_sha256"`
+	// ArtifactURL 期望字节的下载地址（publish_carrier.sh 写入）。缺省为空＝本批不供字节，
+	// 盒子据此走"本机重烘"兜底腿（carrier_updater.stage_artifact 的分支依据）。
+	// 2026-11-09 实机教训：payload 曾把这一枚吞掉（硬编码 has_artifact_url=false），
+	// 盒子拿不到地址就用旧参数重烘出旧版本字节，SHA 闸如实判红——"发布了但永远更新不上"。
+	ArtifactURL string `json:"artifact_url"`
 	// ExecutorVersion/ExecutorSha256 期望的本地执行器版本与哈希。
 	// 执行器在本批是**只报不投**（carrier_updater._note_executor_diff 只点名差别，
 	// 换执行器是 update_local_executor.ps1 那条独立腿）：所以这两枚缺失不阻塞策略更新。
@@ -279,7 +284,7 @@ func carrierManifestPayload(doc *carrierManifest, unknownReason string) map[stri
 		"requested_at":     nil,
 		"last_ack":         nil,
 		"request_state":    carrierStateUnknown,
-		"has_artifact_url": false, // 本批不供字节；盒子据此走本机重烘那条兜底腿
+		"has_artifact_url": false, // 缺省不供字节；盒子据此走本机重烘那条兜底腿
 		"brain_ack_schema": "carrier-ack-v1",
 	}
 	if doc == nil {
@@ -287,6 +292,12 @@ func carrierManifestPayload(doc *carrierManifest, unknownReason string) map[stri
 	}
 	out["strategy_version"] = doc.StrategyVersion
 	out["strategy_sha256"] = doc.StrategySha256
+	// artifact_url 只在清单真给了地址时下发：空串不发（保持"本批不供字节"的缺省形态），
+	// 非HTTP(S)形状也不发——盒子那侧 _url_or_none 还会再挡一次，两层同口径。
+	if u := strings.TrimSpace(doc.ArtifactURL); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		out["artifact_url"] = u
+		out["has_artifact_url"] = true
+	}
 	out["executor_version"] = doc.ExecutorVersion
 	out["executor_sha256"] = doc.ExecutorSha256
 	out["updated_at"] = doc.UpdatedAt
