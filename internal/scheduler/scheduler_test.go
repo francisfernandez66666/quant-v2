@@ -93,6 +93,34 @@ func TestNightlyEligible(t *testing.T) {
 	}
 }
 
+// TestNightlyEligibleAllDay §ALL-DAY-RESEARCH（2026-11-09 owner 裁决）：all_day_research=true
+// 时交易窗口/盘前门**全部放行**——云端全天跑自动研究，quant↔research 互相自动退避关闭。
+// 缺省 false 保持既有口径（上面那组用例锁的就是它），开关只加不改。
+func TestNightlyEligibleAllDay(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	cfg := cfgSamples("fake", "/tmp/x.db")
+	cfg.AllDayResearch = true
+	// 交易窗口内的时点：旧口径全禁，all-day 全放
+	for _, tc := range []struct {
+		t    time.Time
+		note string
+	}{
+		{time.Date(2026, 8, 18, 10, 0, 0, 0, loc), "上午盘"},
+		{time.Date(2026, 8, 18, 9, 0, 0, 0, loc), "盘前冲刺段"},
+		{time.Date(2026, 8, 18, 12, 0, 0, 0, loc), "午休"},
+		{time.Date(2026, 8, 18, 14, 59, 0, 0, loc), "收盘前"},
+	} {
+		if !NightlyEligible(tc.t, cfg) {
+			t.Errorf("%s: all_day_research=true 应放行", tc.note)
+		}
+	}
+	// 缺省 false 时同一点位仍禁止（开关只加不改：上面既有用例组是回归锚）
+	cfgOff := cfgSamples("fake", "/tmp/x.db")
+	if NightlyEligible(time.Date(2026, 8, 18, 10, 0, 0, 0, loc), cfgOff) {
+		t.Error("all_day_research 缺省 false 时交易窗口必须仍禁止")
+	}
+}
+
 // TestTradingDataloadDue TradingDataloadDue。
 // 交易日盘后数据补载触发条件。
 func TestTradingDataloadDue(t *testing.T) {

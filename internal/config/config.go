@@ -1406,6 +1406,14 @@ func (d DataConfig) RiskHithinkPrimary() bool {
 type SchedulerConfig struct {
 	// 总开关（默认 true）
 	Enabled bool `json:"enabled"`
+	// AllDayResearch §ALL-DAY-RESEARCH（2026-11-09 owner 裁决）：云端全天跑自动研究——
+	// 交易窗口不再禁止出队、不再抢占在跑任务（旧的 quant↔research 互相自动退避关闭）。
+	// 缺省 false＝既有口径（盘后/休市才研究）。退避的历史成因（QMT 下单与研究在同一台
+	// Windows 机抢 CPU/IO）已随下单链外迁（内置策略载体在物理机）不复存在；2 核 4G 的
+	// 容量代价由 owner 显式承担（内存闸门 MinFreeMemMB 仍然生效，内存不足照样留队）。
+	// English: when true, research runs all day — the trading-window gate and the
+	// trading-window preemption are both bypassed. Default false (legacy backoff).
+	AllDayResearch bool `json:"all_day_research"`
 	// research 二进制路径
 	ResearchBin string `json:"research_bin"`
 	// dataload 二进制路径
