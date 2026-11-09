@@ -3658,6 +3658,21 @@ func nowTimeString() string {
 // message store, deduplicated by stable keys.)）
 // bearSectors/bearStocks 为本轮利空板块与利空个股，用于扫出"命中利空板块的持仓"并提醒卖出。
 // quotes 为调用方可复用的实时行情（5s fetcher 快照），trade 信号优先取用，缺失走 新浪批量→单查 回退。
+// confidenceTier 提醒卡的置信档位词（§GAP-CARD-TIER，2026-11-09 owner 裁决）：
+// 0-1 置信映射成 高/中/低，替代百分比——百分比在 watch 类卡上会被读成"强推荐"，
+// 档位词只表达"该多看一眼"。
+// English: confidence 0-1 → 高/中/低 tier word for alert cards.
+func confidenceTier(c float64) string {
+	switch {
+	case c >= 0.8:
+		return "高"
+	case c >= 0.5:
+		return "中"
+	default:
+		return "低"
+	}
+}
+
 func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult, quotes map[string]*data.StockInfo) {
 	if e.msgStore == nil {
 		return
@@ -3755,14 +3770,33 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 			changePct = si.ChangePct
 			hasQuote = true
 		}
-		body := fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f %s", action, sig.Strategy, sig.Confidence*100, price, sig.Reason)
+		// §GAP-CARD-TIER（2026-11-09 owner 裁决）：提醒卡的置信度改档位词——
+		// "置信度:100%" 的观感是强推荐，而这类卡是观察提醒不是交易指令；档位词不装精确。
+		// English: tier word instead of a percentage — watch cards must not read like strong
+		// trade recommendations.
+		tier := confidenceTier(sig.Confidence)
+		body := fmt.Sprintf("%s 战法:%s 置信:%s 现价:%.2f %s", action, sig.Strategy, tier, price, sig.Reason)
 		if hasQuote {
 			// 有实时行情时在现价后补涨跌幅（%+.2f 自带 +/- 符号）
 			// English: when a live quote exists, append the change% after the price (%+.2f adds the +/- sign).
-			body = fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f 涨跌幅:%+.2f%% %s",
-				action, sig.Strategy, sig.Confidence*100, price, changePct, sig.Reason)
+			body = fmt.Sprintf("%s 战法:%s 置信:%s 现价:%.2f 涨跌幅:%+.2f%% %s",
+				action, sig.Strategy, tier, price, changePct, sig.Reason)
 		}
 		body += gateNote
+		// §STRATEGY-SWITCH-GATE（2026-11-09 owner 裁决）：量化页**没打开开关**的战法不进
+		// 消息提醒——白名单是用户对"哪些战法有资格提醒我交易"的显式授权，非卖出方向的
+		// 卡（做多/watch 提醒）一律过同一把准入（AdmitStrategyName 与下单准入同一条规则）。
+		// 卖出方向（做空/卖出）与 alertSignals 的持仓风控提醒不在此列——风控与离场提醒
+		// 永远放行，这里只管"推荐交易"那一半。
+		// English: strategies not switched on in the live-trading page must not push trade
+		// reminders; sell-side and position-risk alerts always pass.
+		if direction != "做空" {
+			if _, why := signalctl.AdmitStrategyName(e.liveSignalPolicy(), sig.Strategy); why != "" {
+				log.Printf("[engine] §STRATEGY-SWITCH-GATE 提醒拦截 %s %s 战法=%s 原因=%s",
+					sig.Code, sig.Name, sig.Strategy, why)
+				continue
+			}
+		}
 		// 交易信号入消息中心：ID 含 code+战法保证去重，方向/行动供前端状态色展示。
 		items = append(items, data.MessageItem{
 			ID:          sig.Code + "@交易信号@" + sig.Strategy,
