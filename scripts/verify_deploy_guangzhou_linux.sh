@@ -32,6 +32,7 @@ for a in "$@"; do
   case "$a" in
     --target=*) TARGET="${a#*=}" ;;
     --expect-commit=*) EXPECT_COMMIT="${a#*=}" ;;
+    --expect-qmt-enabled=*) EXPECT_QMT_ENABLED="${a#*=}" ;;
     --selftest) SELFTEST=1 ;;
     --mutation=*) MUTATE="${a#*=}" ;;
     -h|--help) sed -n '1,32p' "$0"; exit 0 ;;
