@@ -17,11 +17,11 @@ import (
 func TestCounterFrameReadout(t *testing.T) {
 	day := "2026-11-09"
 	cases := []struct {
-		note        string
-		acc         store.RealAccount
-		positions   []store.RealPosition
-		wantAt      string
-		wantFrozen  bool
+		note       string
+		acc        store.RealAccount
+		positions  []store.RealPosition
+		wantAt     string
+		wantFrozen bool
 	}{
 		{"两维全空 ⇒ 帧不存在", store.RealAccount{}, nil, "", false},
 		{"冻结账：资金帧停在过去", store.RealAccount{UpdatedAt: "2026-11-05 15:00:06"}, nil,
