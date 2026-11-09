@@ -100,7 +100,24 @@ if ($hadOriginal) {
     Info "已备份原配置 -> $backup"
 }
 
+# §CUTOVER 2026-11-09：合并写，不整体覆盖。
+# 本脚本从模板重建四元（account/user_id/token/listen），但机器上可能还有别的腿加的键
+# （upkink_*/carrier_* 共 9 个，由 cutover_prep.ps1 写入，负责上行腿与每日自动更新）。
+# 整盘覆盖会让 install.ps1 重跑一次就把那条链冲掉，而表面上看不出任何异常。
+# 规则：模板 + 本次参数优先；只把「既有配置里有、新对象里没有」的键保留回来。
+if (Test-Path $cfgPath) {
+    try {
+        $existing = Get-Content -Raw -Encoding UTF8 $cfgPath | ConvertFrom-Json
+        foreach ($p in $existing.PSObject.Properties) {
+            if (-not ($cfg.PSObject.Properties.Name -contains $p.Name)) {
+                $cfg | Add-Member -Force -NotePropertyName $p.Name -NotePropertyValue $p.Value
+            }
+        }
+    } catch { }
+}
 $json = $cfg | ConvertTo-Json -Depth 6
+# PS5.1 把空数组序列化成 ""/null，report_uplink 见字符串会当成一个假导出根路径。
+$json = $json -replace '(?s)"uplink_export_roots"\s*:\s*(null|"")', '"uplink_export_roots": []'
 # 无 BOM UTF-8：网关 json.load 不容 BOM（带了就是"配置存在但读不出"那种静默死法）
 [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 # ACL 收敛：这份文件里是**别人账户的实盘钥匙**，同机其他账号不许能读到

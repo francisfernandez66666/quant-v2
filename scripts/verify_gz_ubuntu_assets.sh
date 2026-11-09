@@ -219,6 +219,15 @@ else
   ck "carrier_daily_update_chain" 1 "carrier_publish_chain_regressed"
 fi
 
+# 9j §CUTOVER：ensure 从模板重建 config 时必须合并保留 uplink_*/carrier_* 键，
+# 否则朋友机每跑一次 install.ps1 -Apply 就会把上行腿与每日更新链静默冲掉（11-09 实录）。
+E=deploy/qmt-friend/ensure_friend_gateway_config.ps1
+if has_text "$E" 'existing.PSObject.Properties' && has_text "$EN" 'uplink_export_roots": []'; then
+  ck "cutover_config_merge" 0 "merge_preserves_uplink_and_carrier_keys"
+else
+  ck "cutover_config_merge" 1 "config_rebuild_would_wipe_cutover_keys"
+fi
+
 printf 'INFO|summary|pass=%s fail=%s failed=%s\n' "$PASS" "$FAIL" "${FAILED:-none}"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "ok - §GZ-UBUNTU 部署件口径门禁通过（$PASS 道静态锁 + 探针变异反证）"

@@ -102,4 +102,4 @@ foreach ($f in $change) {
 # 5) refresh the local manifest copy so the next diff is clean
 try { $dl.DownloadFile($mfUrl, $localMfPath) } catch { }
 Write-Host ("UPDATE_RESULT=OK changed=" + $okN + " backup=" + $backupDir)
-Write-Host "NEXT re-run install.ps1 -Apply to mirror into the runtime directory"
+Write-Host "NEXT re-run install.ps1 -Apply to mirror into the runtime directory (CUTOVER: ensure_friend_gateway_config.ps1 now MERGES config keys, so uplink_*/carrier_* survive)"
