@@ -68,6 +68,7 @@ LOG = logging.getLogger("qmt_gateway.local_executor")
 # ==== BAKED PARAMS BEGIN ====
 STRATEGY_VERSION = "v04-20261106"
 PARAMS = {
+    'account': '2069008957',
     'bd_depth_full_pct': 3,
     'bd_depth_max_score': 30,
     'bd_depth_single_cap': 25,

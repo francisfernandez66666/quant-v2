@@ -99,6 +99,7 @@ _PORTED_KNOBS = {}
 # loses the cache (the counter is what proves what was already sent).
 _STATE = {
     "acct": "",
+    "acct_ok": False,
     "acct_type": "",
     "last_round": 0.0,
     "ops": [],          # [epoch, ...] of place/cancel attempts this session
@@ -164,30 +165,87 @@ def _fn(key):
     return found if callable(found) else None
 
 
-def _account():
-    """Resolve the funding account id (resolve once, then cache).
+# The sandbox has no file and no socket, so the funding account id can only
+# arrive from the client itself (get_account) or be baked into PARAMS by the
+# brain-side build (2026-11-09: this QMT build exposes NO get_account, and the
+# retired bridge took its id from a config file the sandbox is forbidden to
+# read -- so the baked PARAMS entry is the only reliable path).
+#
+# A candidate is not guessed, it is PROVEN: the pair (account, type) is accepted
+# only when the ACCOUNT table returns a real asset row for it -- the bridge's
+# own proof on this box (2026-09-11: rows=1). An empty table proves NOTHING: a
+# wrong account id reads empty exactly like a right one, and an empty ORDER
+# table of a wrong account is indistinguishable from "nothing sent today",
+# which is the double-order hazard this resolution exists to close. So a
+# candidate that cannot be proven is REJECTED, not defaulted.
+_ACCT_TYPES = ("STOCK", "stock", "8", "10")
 
-    Fallback: the baked PARAMS account, which the builder fills from the
-    decision side. Nothing here reads a config file.
-    """
-    if _STATE["acct"]:
-        return _STATE["acct"]
+
+def _account_candidates():
+    """Ordered candidate funding account ids, best guess first."""
+    cands = []
+
+    def _add(value):
+        value = str(value or "").strip()
+        # "__ACCOUNT__" is the unfilled placeholder: it is a literal that would
+        # only ever make the counter calls fail, so it is not a candidate.
+        if value and not value.startswith("__") and value not in cands:
+            cands.append(value)
+
+    # 1) what the client itself reports for this session (absent on this build)
     getter = _fn("get_account")
-    for kind in ("stock", "STOCK"):
-        try:
-            got = getter(kind)
-        except Exception:
-            continue
-        if isinstance(got, (list, tuple)) and got:
-            _STATE["acct"] = str(got[0])
-            break
-        if isinstance(got, str) and got:
-            _STATE["acct"] = got
-            break
-    if not _STATE["acct"]:
-        _STATE["acct"] = str(PARAMS.get("account", "") or "")
-    _log("account=%s" % (ascii(_STATE["acct"]),))
-    return _STATE["acct"]
+    if getter:
+        for kind in ("stock", "STOCK"):
+            try:
+                got = getter(kind)
+            except Exception:
+                continue
+            if isinstance(got, (list, tuple)) and got:
+                _add(got[0])
+            elif isinstance(got, str):
+                _add(got)
+    # 2) the account baked into PARAMS by the brain-side build
+    _add(PARAMS.get("account", ""))
+    return cands
+
+
+def _probe_account(cand, atype):
+    """True when this (account, type) pair reads a REAL asset row."""
+    gtdd = _fn("get_trade_detail_data")
+    if not gtdd:
+        return False
+    try:
+        rows = gtdd(cand, atype, "ACCOUNT")
+    except Exception:
+        return False
+    return bool(rows)
+
+
+def _account():
+    """Resolve the funding account id AND its account type; cache on SUCCESS only.
+
+    A failed resolution is not cached: the ACCOUNT table can be momentarily
+    empty while the session is still syncing (the bridge saw exactly that), and
+    caching a failure would fail-close the whole day for a 5-second gap. The
+    probe is a cheap counter read, so retrying each round is safe.
+    """
+    if _STATE["acct_ok"]:
+        return _STATE["acct"]
+    for cand in _account_candidates():
+        for atype in _ACCT_TYPES:
+            if not _probe_account(cand, atype):
+                continue
+            _STATE["acct"] = cand
+            _STATE["acct_type"] = atype
+            _STATE["acct_ok"] = True
+            # Only the tail is logged: the full account id is the box's
+            # business and does not belong in a log pane.
+            _log("account=resolved tail=%s type=%s" % (cand[-4:], atype))
+            return cand
+    _warn_once("no_acct_proof", "no candidate account reads a real asset row "
+               "(candidates=%d); counter tables stay unreadable" %
+               len(_account_candidates()))
+    return ""
 
 
 def _counter_rows(table):
@@ -204,7 +262,9 @@ def _counter_rows(table):
         return None
     acct = _account()
     if not acct:
-        _warn_once("no_acct", "account id unknown: counter tables unavailable")
+        # The diagnosis itself (why no candidate was provable) is what
+        # _account() already warned once; repeating it here would only
+        # duplicate the line every round.
         return None
     kinds = [_STATE["acct_type"]] if _STATE["acct_type"] else ["stock", "STOCK", "8", "10"]
     for kind in kinds:
@@ -543,6 +603,11 @@ def _place(ContextInfo, signal):
     op = op_buy if signal["side"] == "buy" else op_sell
     pr_limit = int(PARAMS.get("price_type_limit", 11))
     acct = _account()
+    if not acct:
+        # passorder with an empty account id is not a recoverable error: the
+        # counter would reject it (or worse, route it nowhere). An unproven
+        # account must never reach the order API.
+        return False, "account unproven: refusing to passorder"
     remark = build_remark(signal["short_code"])
     args = (op, int(PARAMS.get("order_type", 1101)), acct, code, pr_limit,
             float(signal["price"]), int(signal["qty"]))
@@ -601,6 +666,8 @@ def _cancel(order_id):
     if not oid:
         return False, "cancel needs an order id"
     acct = _account()
+    if not acct:
+        return False, "account unproven: refusing to cancel"
     attempts = [("4s", (oid, acct, "STOCK")), ("4l", (oid, acct, "stock")),
                 ("3", (oid, acct, "STOCK")), ("2s", (oid, acct))]
     errs = []

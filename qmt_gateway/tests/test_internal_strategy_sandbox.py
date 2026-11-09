@@ -305,6 +305,88 @@ class SandboxGatesBiteTest(unittest.TestCase):
         self.assertIn("sandbox_smoke_call_failed", out)
 
 
+class SandboxAccountResolutionTest(unittest.TestCase):
+    """§ACCOUNT-RESOLUTION（2026-11-09 实机钉死的缺口）。
+
+    实机日志：`account='' -> counter_order_table_unreadable` 每轮重复。根因链：
+    这个 QMT 构建的沙箱面**没有 get_account**（09-11 实测面只有
+    passorder/get_trade_detail_data/cancel/...）；退役的文件桥拿账号靠 config
+    文件，而沙箱禁读文件；PARAMS 又没烘账号 ⇒ 两条来路都空。
+    修复口径：账号烘进 PARAMS（脑侧唯一真源，CARRIER_OWNED 登记），候选×账号
+    类型用 **ACCOUNT 表非空行**做强证明（桥 09-11 实测 rows=1），证明失败
+    fail-closed 且**不缓存失败**（ACCOUNT 表开盘瞬间可能还没同步完，缓存失败
+    会把 5 秒的间隙放大成全天拒读）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        rc, out, path = build_sandbox(cls.dir)
+        if rc != 0:
+            raise AssertionError("sandbox build failed: %s" % out[-800:])
+        cls.artifact_path = path
+        cls.mod = load_module(path, "sandbox_account_under_test")
+
+    def setUp(self):
+        self.mod._STATE.update({"acct": "", "acct_ok": False, "acct_type": "",
+                                "warned": {}, "ops": [], "cancel_tried": [],
+                                "last_round": 0.0})
+        self.mod._SANDBOX_FNS.update({"get_account": None})
+
+    def _install(self, gtdd):
+        self.mod._SANDBOX_FNS.update({
+            "passorder": lambda *a: None, "cancel": lambda *a: None,
+            "get_trade_detail_data": gtdd})
+
+    def test_baked_account_is_proven_via_account_table_and_type_pinned(self):
+        """烘入账号 + ACCOUNT 表有真实资产行 ⇒ 解析成功且账号类型被钉死。"""
+        self._install(lambda acct, kind, table:
+                      [_CounterRow(m_dAvailable=100000.0)]
+                      if (acct, kind, table) == ("2069008957", "STOCK", "ACCOUNT") else [])
+        self.assertEqual(self.mod._account(), "2069008957")
+        self.assertEqual(self.mod._STATE["acct_type"], "STOCK")
+        self.assertTrue(self.mod._STATE["acct_ok"])
+        # 空的 ORDER 表是**可读**（[]），不是读不到（None）——两者语义不同。
+        rows = self.mod._counter_rows("ORDER")
+        self.assertEqual(rows, [])
+        orders, ok = self.mod._live_orders()
+        self.assertTrue(ok)
+        self.assertEqual(orders, [])
+
+    def test_unprovable_account_fail_closed_and_refuses_to_passorder(self):
+        """证明不了的账号 ⇒ 空串 + 下单/撤单双护栏拒绝（错账号读空表＝重复下单隐患）。"""
+        self.mod.PARAMS["account"] = "9999999999"
+        self._install(lambda acct, kind, table: [] if kind in ("STOCK", "stock") else None)
+        self.assertEqual(self.mod._account(), "")
+        ok, why = self.mod._place(None, {"side": "buy", "symbol": "600000.SH",
+                                         "price": 10.0, "qty": 100, "short_code": "t1"})
+        self.assertFalse(ok)
+        self.assertIn("unproven", why)
+        ok2, why2 = self.mod._cancel("12345")
+        self.assertFalse(ok2)
+        self.assertIn("unproven", why2)
+
+    def test_failed_resolution_is_not_cached(self):
+        """ACCOUNT 表开盘瞬间为空 ⇒ 本轮不证明、下一轮再试、证明后缓存。"""
+        flip = {"n": 0}
+
+        def gtdd(acct, kind, table):
+            if (acct, kind, table) == ("2069008957", "STOCK", "ACCOUNT"):
+                flip["n"] += 1
+                return [_CounterRow()] if flip["n"] >= 2 else []
+            return []
+
+        self._install(gtdd)
+        self.assertEqual(self.mod._account(), "")
+        self.assertEqual(self.mod._account(), "2069008957")
+        self.assertEqual(self.mod._account(), "2069008957")  # 缓存生效
+        self.assertEqual(flip["n"], 2, "证明成功后还在反复探测＝缓存没生效")
+
+    def test_probe_exception_never_breaks_the_round(self):
+        self._install(lambda *a: (_ for _ in ()).throw(RuntimeError("gbk")))
+        self.assertEqual(self.mod._account(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
 

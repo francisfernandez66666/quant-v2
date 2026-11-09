@@ -451,6 +451,11 @@ MAPPING.extend([(go_key, (ladder_key,), None) for go_key, ladder_key in LADDER_R
 #                     得先在 Go 把它命名成常量——那是产品代码改动，等 owner 点头。
 # ---------------------------------------------------------------------------
 CARRIER_OWNED = {
+    # 2026-11-09 内置策略实机日志（account='' -> counter_order_table_unreadable）钉死的缺口：
+    # 沙箱禁读文件、本构建无 get_account，柜台资金账号唯一来路是烘进 PARAMS。
+    # 值与盒子 config.xt.json 同源（config.bridge.example.json 里公开同一值）；
+    # 本地执行腿不受它影响（其下单账号走 CLI/env，且 DisabledBroker 缺省拒绝）。
+    "account": "carrier-shape: 柜台资金账号 id，沙箱唯一来路是烘进 PARAMS（值同盒子 config.xt.json）",
     "signal_codes": "carrier-shape: 委托备注短码表只属于载体（幂等键的构造规则）",
     "t_signal_codes": "carrier-shape: 同上，T 腿各自的短码",
     "symbol_head_len": "carrier-shape: 备注里代码前缀长度",
