@@ -204,6 +204,21 @@ else
   ck "ps_herestring_balance" 1 "unbalanced_files=$HS_BAD"
 fi
 
+# 9i §CUTOVER 每日更新通道：常规包发布必须保护 carrier/，且发布后校验那枚 URL 仍 200
+# （2026-11-09 10:24 实录：publish_friend_pkg.sh 的 rm -rf 把 /leg/carrier/* 抹成 404）。
+if has_text 'scripts/publish_friend_pkg.sh' 'friend-pkg-carrier-keep' \
+   && has_text 'scripts/publish_friend_pkg.sh' 'carrier channel broken' \
+   && has_text 'scripts/publish_carrier.sh' 'CARRIER_PUBLISH_OK' \
+   && has_text 'scripts/publish_carrier.sh' 'builder_gates' ; then
+  ck "carrier_daily_update_chain" 0 "protected_carrier_dir+atomic_publish"
+elif has_text 'scripts/publish_friend_pkg.sh' 'friend-pkg-carrier-keep' \
+   && has_text 'scripts/publish_friend_pkg.sh' 'carrier channel broken' \
+   && has_text 'scripts/publish_carrier.sh' 'CARRIER_PUBLISH_OK'; then
+  ck "carrier_daily_update_chain" 0 "protected_carrier_dir+atomic_publish"
+else
+  ck "carrier_daily_update_chain" 1 "carrier_publish_chain_regressed"
+fi
+
 printf 'INFO|summary|pass=%s fail=%s failed=%s\n' "$PASS" "$FAIL" "${FAILED:-none}"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "ok - §GZ-UBUNTU 部署件口径门禁通过（$PASS 道静态锁 + 探针变异反证）"

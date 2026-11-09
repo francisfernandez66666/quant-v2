@@ -37,11 +37,20 @@ PAYLOAD="$STAGE/payload"
 [[ -f "$PAYLOAD/MANIFEST.json" ]] || { echo "X MANIFEST.json missing" >&2; exit 1; }
 
 echo "== publish to $GZ_HOST:$GZ_DIR =="
-# /opt/quant 由 root 属主：目录本身的删除/重建必须走 sudo，推完收权限给 caddy 可读
-ssh "$GZ_HOST" "sudo rm -rf $GZ_DIR && sudo mkdir -p $GZ_DIR && sudo chown \$(id -un): $GZ_DIR" || { echo "X prepare failed" >&2; exit 1; }
+# /opt/quant 由 root 属主：目录本身的删除/重建必须走 sudo，推完收权限给 caddy 可读。
+# §CUTOVER 2026-11-09：carrier/ 是**每日自动更新的产物通道**，由 publish_carrier.sh 独立维护，
+# 常规包发布绝不能把它 rm 掉（实测 10:24 一次发布把 /leg/carrier/* 打成 404）。
+# 做法：先移出受保护目录 → 清建主目录 → 移回 → 发布后校验产物仍在，缺一即判红。
+ssh "$GZ_HOST" "sudo rm -rf /tmp/friend-pkg-carrier-keep; \
+  if [ -d $GZ_DIR/carrier ]; then sudo mv $GZ_DIR/carrier /tmp/friend-pkg-carrier-keep; fi; \
+  sudo rm -rf $GZ_DIR && sudo mkdir -p $GZ_DIR && sudo chown \$(id -un): $GZ_DIR" || { echo "X prepare failed" >&2; exit 1; }
 scp -q -r "$PAYLOAD/." "$GZ_HOST:$GZ_DIR/" || { echo "X scp failed" >&2; exit 1; }
-# 收权限：caddy 用户要能读
-ssh "$GZ_HOST" "sudo chmod -R a+rX $GZ_DIR" || { echo "X chmod failed" >&2; exit 1; }
+ssh "$GZ_HOST" "if [ -d /tmp/friend-pkg-carrier-keep ]; then sudo mv /tmp/friend-pkg-carrier-keep $GZ_DIR/carrier; fi; \
+  sudo chmod -R a+rX $GZ_DIR" || { echo "X restore/chmod failed" >&2; exit 1; }
+# 每日更新通道的完整性是硬判据：期望清单里那枚 URL 必须仍可取到 200
+CARRIER_URL="https://quant-trading.top/leg/carrier/${CARRIER_ARTIFACT:-qmt_internal_strategy_v90-20261109.py}"
+CARRIER_HTTP=$(curl -sS -o /dev/null -w '%{http_code}' "$CARRIER_URL" || true)
+[[ "$CARRIER_HTTP" = "200" ]] || { echo "X carrier channel broken: $CARRIER_URL http=$CARRIER_HTTP" >&2; exit 1; }
 
 FILES=$(python3 -c "import json,sys;print(len(json.load(open('$PAYLOAD/MANIFEST.json'))['files']))")
 echo "PUBLISH_OK files=$FILES url=https://quant-trading.top/leg/MANIFEST.json"
