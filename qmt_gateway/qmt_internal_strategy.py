@@ -404,39 +404,64 @@ def _tick_of(ContextInfo, symbol):
     return normalize_tick(symbol, entry)
 
 
+def _hist_bars(ContextInfo, symbol):
+    """History bars via every signature this client family has shown, or None.
+
+    Signatures differ per QMT build AND the 2026-11-03 real-machine probe proved
+    this build has no usable history at all (`get_market_data_ex` returned an
+    empty dict, `get_market_data` NoneType; only `get_full_tick` works). So the
+    bridge-proven KEYWORD shape goes first (it was the one probe that returned
+    a dict rather than an ArgumentError), the old positional shape second, and
+    the caller must survive both failing.
+    """
+    getter = getattr(ContextInfo, "get_market_data_ex", None)
+    if not callable(getter):
+        return None
+    fields = ["close", "volume"]
+    period = PARAMS.get("ma_period", "1d")
+    try:
+        return getter(fields, [symbol], period=period, count=3)
+    except Exception:
+        pass
+    try:
+        return getter(fields, [symbol], period, "", "", 3, True, True)
+    except Exception:
+        return None
+
+
 def _ref_and_volume(ContextInfo, symbol, tick):
     """Reference price (MA of the baked window) and the volume ratio.
 
     History comes from ContextInfo.get_market_data_ex when the build exposes
-    it. When it does not, or returns nothing, both come back as None: the pullback
-    rule then declines instead of inventing a level. No download call happens
-    here -- a blocking download inside handlebar is what killed the trading leg
-    for a whole day on 2026-10-29.
+    it. When it does not -- the 2026-11-09 live log showed this build rejecting
+    every signature -- the reference falls back to the tick's own prev_close
+    and the volume ratio to None: the pullback rule then judges against
+    yesterday's close instead of inventing a level, and the ratio-only gates
+    abstain. No download call happens here -- a blocking download inside
+    handlebar is what killed the trading leg for a whole day on 2026-10-29.
     """
-    getter = getattr(ContextInfo, "get_market_data_ex", None)
-    if not callable(getter):
-        return None, None
-    try:
-        bars = getter(["close", "volume"], [symbol], PARAMS.get("ma_period", "1d"),
-                      "", "", 3, True, True)
-    except Exception as exc:
-        _warn_once("hist:%s" % symbol, "get_market_data_ex failed: %s" % repr(exc)[:120])
-        return None, None
+    bars = _hist_bars(ContextInfo, symbol)
     series = _series(bars, "close", symbol)
     volumes = _series(bars, "volume", symbol)
-    if len(series) < 2:
-        return None, None
-    history = series[:-1] if len(series) > int(PARAMS.get("ma_window", 1)) else series
-    ref = (sum(history[-int(PARAMS.get("ma_window", 1)):]) /
-           float(len(history[-int(PARAMS.get("ma_window", 1)):]))) if history else None
-    volume = tick.get("volume")
-    ratio = None
-    past = volumes[:-1] if len(volumes) > 1 else []
-    if volume and past:
-        average = sum(past) / float(len(past))
-        if average:
-            ratio = volume / average
-    return ref, ratio
+    if len(series) >= 2:
+        history = series[:-1] if len(series) > int(PARAMS.get("ma_window", 1)) else series
+        ref = (sum(history[-int(PARAMS.get("ma_window", 1)):]) /
+               float(len(history[-int(PARAMS.get("ma_window", 1)):]))) if history else None
+        volume = tick.get("volume")
+        ratio = None
+        past = volumes[:-1] if len(volumes) > 1 else []
+        if volume and past:
+            average = sum(past) / float(len(past))
+            if average:
+                ratio = volume / average
+        return ref, ratio
+    # History unavailable on this build: prev_close is the honest reference
+    # (it IS a real counter price, not an invented level), and the volume
+    # ratio simply abstains. Warn once per PROCESS, not per symbol per round:
+    # a 97-symbol universe would otherwise drown the log pane.
+    _warn_once("hist_unavailable",
+               "no history series from this build: ref=prev_close fallback, volume ratio abstains")
+    return tick.get("prev_close"), None
 
 
 def _series(payload, field, symbol):

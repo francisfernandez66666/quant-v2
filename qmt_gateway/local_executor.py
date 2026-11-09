@@ -66,7 +66,7 @@ import time
 LOG = logging.getLogger("qmt_gateway.local_executor")
 
 # ==== BAKED PARAMS BEGIN ====
-STRATEGY_VERSION = "v04-20261106"
+STRATEGY_VERSION = "v05-20261109"
 PARAMS = {
     'account': '2069008957',
     'bd_depth_full_pct': 3,
@@ -105,7 +105,7 @@ PARAMS = {
     'closed_days': [],
     'cluster_cap_pct': 40,
     'cluster_rho': 0.7,
-    'daily_buy_cap': 100000.0,
+    'daily_buy_cap': 150000.0,
     'db_adjust_max_pct': 6,
     'db_break_ratio': 1.05,
     'db_first_vol_multiple': 1.5,
@@ -389,7 +389,7 @@ PARAMS = {
     'red_block_new_buy': False,
     'reprice_max_per_day': 2,
     'require_trading_day': True,
-    'rule_arm': {'break_down': 'shadow', 'double_bump': 'shadow', 'dragon': 'shadow', 'dragon_return': 'shadow', 'factor_composite': 'shadow', 'good_news_fade': 'shadow', 'high_churn': 'shadow', 'leader_decay': 'shadow', 'leader_decay_v2': 'shadow', 'pattern_template': 'shadow'},
+    'rule_arm': {'break_down': 'shadow', 'double_bump': 'shadow', 'dragon': 'live', 'dragon_return': 'shadow', 'factor_composite': 'live', 'good_news_fade': 'shadow', 'high_churn': 'shadow', 'leader_decay': 'shadow', 'leader_decay_v2': 'shadow', 'pattern_template': 'shadow'},
     'rule_side': 'sell',
     'scalar_bands': {},
     'scale_cap': 1.15,
@@ -409,7 +409,7 @@ PARAMS = {
     'stoploss_guard_count': 4,
     'strategy_kind_to_go': {'dragon': 'dragon', 'double_bump': 'double_bump', 'dragon_return': 'dragon_return'},
     'symbol_head_len': 6,
-    'symbols': ['600000.SH', '000001.SZ'],
+    'symbols': ['000417.SZ', '000520.SZ', '000530.SZ', '000533.SZ', '000625.SZ', '000652.SZ', '000753.SZ', '000823.SZ', '000831.SZ', '000905.SZ', '000927.SZ', '000980.SZ', '001316.SZ', '001331.SZ', '001379.SZ', '002093.SZ', '002115.SZ', '002124.SZ', '002141.SZ', '002149.SZ', '002214.SZ', '002310.SZ', '002316.SZ', '002347.SZ', '002367.SZ', '002385.SZ', '002415.SZ', '002420.SZ', '002477.SZ', '002488.SZ', '002548.SZ', '002578.SZ', '002594.SZ', '002708.SZ', '002811.SZ', '002889.SZ', '002913.SZ', '003004.SZ', '003006.SZ', '300023.SZ', '300033.SZ', '300104.SZ', '300118.SZ', '300169.SZ', '300292.SZ', '300308.SZ', '300310.SZ', '300367.SZ', '300407.SZ', '300479.SZ', '300489.SZ', '300498.SZ', '301226.SZ', '301361.SZ', '301366.SZ', '301592.SZ', '301630.SZ', '600018.SH', '600089.SH', '600408.SH', '600458.SH', '600609.SH', '600620.SH', '600715.SH', '600717.SH', '600770.SH', '600776.SH', '600805.SH', '600839.SH', '600844.SH', '600881.SH', '600928.SH', '601000.SH', '601009.SH', '601011.SH', '601018.SH', '601022.SH', '601188.SH', '601288.SH', '601328.SH', '601398.SH', '601866.SH', '601939.SH', '601988.SH', '603019.SH', '603121.SH', '603220.SH', '603286.SH', '603323.SH', '603366.SH', '603660.SH', '603706.SH', '603881.SH', '603920.SH', '688130.SH', '920062.SH'],
     't_anchor_ok_sources': ['first_buy_order', 'first_lot'],
     't_bse_board_prefixes': ['4', '8', '92'],
     't_cancelled_status_tokens': ['\u64a4'],
