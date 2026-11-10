@@ -24,7 +24,7 @@ cd "$ROOT"
 
 GZ_HOST="${GZ_HOST:-gz}"
 GZ_SCRIPTS_DIR="${GZ_SCRIPTS_DIR:-/opt/quant/friend-pkg/carrier}"
-OWNER_UID="${OWNER_UID:-u_1792728708736589500}"
+OWNER_UID="${OWNER_UID:-u_1785377969825355000}"   # OWNER=admin（物理机账号）；u_1792728708736589500 是孤儿配置，勿用
 STATE="/tmp/carrier_hotreload_whitelist.sha"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1

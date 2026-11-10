@@ -104,15 +104,20 @@ run_probes() { # $1=读数文本；依赖全局 EXPECT_COMMIT
   v="$(get ANON_API_CODE)"
   if [ "$v" = "401" ]; then probe "anon_api_401" 0 "code=$v"; else probe "anon_api_401" 1 "code=${v:-missing}"; fi
 
-  # U-3（owner 11-08 裁决 A）：引擎装配 Controller 用的是账号级
-  # GetQMTConfigFor(userID)（internal/engine/registry.go:1177），不是全局 rules.qmt。
-  # 只有账号级 qmt.enabled=false 才是档 4「显式影子态」；改回 true 会放行自动买入判据。
+  # U-3（owner 11-08 裁决 A；**2026-11-10 16:50 owner 新裁决改判**）：
+  # 「没物理机的账号，可以改执行腿，只是没物理机不下发」——无网关连接时 passorder
+  # 通道天然不可达，enabled=true 只是开关状态，不再是误下发判据。本探针降级为
+  # **只读留痕**（不再判 PASS/FAIL），硬拦改为部署后人工核对面（下发面 = 盒子
+  # carrier_updater ack + 柜台回报，与账号开关解耦）。
+  # English: owner re-ruling 2026-11-10 — member accounts MAY toggle qmt.enabled;
+  # without a physical box the order channel is unreachable, so this probe is now
+  # informational only (never PASS/FAIL).
   v="$(get U3_QMT_ENABLED)"
   WANT_U3="${EXPECT_QMT_ENABLED:-false}"
   if [ "$v" = "$WANT_U3" ]; then
     probe "u3_account_shadow" 0 "account_qmt_enabled=$v want=$WANT_U3"
   else
-    probe "u3_account_shadow" 1 "account_qmt_enabled=${v:-missing} want=$WANT_U3"
+    probe "u3_account_shadow" 0 "account_qmt_enabled=${v:-missing} want=$WANT_U3 (informational; owner 2026-11-10 re-ruling)"
   fi
 
   v="$(get JOURNAL_ERRORS)"
