@@ -18811,7 +18811,7 @@ grep -qF 'logRuntimeSwitches(cfgMgr)' cmd/quant/main.go || fail162 "启动清单
 # 清单条数与"本批开关数"等值：新增一个开关却不进清单 ⇒ 这条当场红
 CNT162=$((CNT162 + 1))
 SWITCH_LINES=$(grep -c '§SWITCH 状态' cmd/quant/runtime_switches.go || true)
-[ "$SWITCH_LINES" = "14" ] || fail162 "启动清单应逐键 14 条（新增开关必须同批进清单并整表重编号），现测 $SWITCH_LINES"
+[ "$SWITCH_LINES" = "15" ] || fail162 "启动清单应逐键 15 条（新增开关必须同批进清单并整表重编号），现测 $SWITCH_LINES"
 # 关着也统计：网关 would_label 与 Go 读面 would-label 两条腿都必须在
 CNT162=$((CNT162 + 1))
 grep -qF 'self._orders_sub_would_label_seen.add(oid)' qmt_gateway/gateway.py || fail162 "网关关态的 would_label 计数丢了"
@@ -21274,6 +21274,147 @@ echo "   [§173 ⑱] 实仓单一出入口反证：塞回面板挂载必红、�
 
 [ "$B173_FAILED" = "0" ] || exit 1
 echo "ok - §173 §QMT-INTERNAL-LOOP 锁通过（外脑档契约与只读 1 + 桥心跳接线 1 + 静默域 1 + 买入闸单点 1 + 回执与回报腿 1 + 四源窗口 1 + 构建闸 1 + 撤单与投递腿 1 + 移植内联 1 + 用例在册 1 + 单点导出 2 + 更新载体等四组 4 + 判断腿接线 1 + 影子对照腿 1 + 冷备腿 1 + 今日用例在册 1 + 常驻反证 1 + 建议×战法开关与建议股数 1 + BAN_IO 禁令自证 1 + 终端版本巡检 1 + 做 T 判断腿接线 1 + 信号消失即撤 1 + 撤单动作快照 1 + 交易级提醒与做T标注 1 + 沙箱固定时刻 1 + 发送前预算复核算术 1 + VWAP 改价腿与撤单唯一出口 1 + 载体同款三行为与桥/物理机切换互锁 1 + tab 战法开关同源与部成成交表 1 + 实仓单一出入口与两态分流 1，累计判定点 ${CNT173}）"
+
+echo "==> 174 §CONSULT-DATARICH（审计放宽双向锁 / 数据块新字段与量比单尺 / A 轮 fail-open 与预算留位 / 开关接线与卡面代价同屏）..."
+B174_FAILED=0
+fail174() {
+	echo "--- FAIL: §174 $*"
+	FAIL=1
+	B174_FAILED=1
+}
+CNT174=0
+
+C174=internal/engine/consult.go
+DR174=internal/engine/consult_data_round.go
+L174=internal/llm/llm.go
+CF174=internal/config/config.go
+HR174=internal/server/handlers_runtime_config.go
+CD174=web/src/pages/ConsultDataRoundCard.jsx
+ST174=web/src/pages/Settings.jsx
+T174=internal/engine/consult_datarich_test.go
+FT174=web/src/__tests__/consult_data_round_card_20261110.test.jsx
+IR174=internal/combat_agent/intraday_ratio.go
+
+# ① 万手/亿手必须同时活在正则与单位表两处，且正则里排在裸"万/亿"之前——
+# 只改表不改正则＝token 被裸"万"截断，表里那条后缀永远走不到（空操作）。
+CNT174=$((CNT174 + 1))
+grep -qF '万股|亿股|万手|亿手|万|亿|手|笔' "$C174" || fail174 "auditedNumberRe 缺万手/亿手或顺序在裸万/亿之后（组合后缀会被截断）"
+CNT174=$((CNT174 + 1))
+grep -qF '{"万手", catLots, 1e4}, {"亿手", catLots, 1e8}' "$C174" || fail174 "numUnitTable 缺万手/亿手→catLots（基础量是手，乘数不得混入手→股的100）"
+CNT174=$((CNT174 + 1))
+grep -qF '{"手", catLots, 1}, {"笔", catCount, 1}' "$C174" || fail174 "手必须与笔分类（合在一类时手↔股换算会顺手放行 笔↔股 跨量纲冒充）"
+
+# ② 舍入容差按"写出的那一位"取，不是固定百分比：精度函数必须真接进审计判定。
+CNT174=$((CNT174 + 1))
+grep -qF 'func auditedTokenGranularity(tok string) float64 {' "$C174" || fail174 "缺 auditedTokenGranularity（容差尺子）"
+CNT174=$((CNT174 + 1))
+grep -qF 'trusted.allows(cat, val, reply[:m[0]], auditedTokenGranularity(tok))' "$C174" || fail174 "auditNumbers 没把写出精度传进 allows（容差档会按另一把尺子取）"
+CNT174=$((CNT174 + 1))
+grep -qF 'if tol <= 0 || val == 0 {' "$C174" || fail174 "roundHit 缺零值/零容差边界（0 与任何数都'接近'是假放行）"
+CNT174=$((CNT174 + 1))
+grep -qF '(v > 0) != (val > 0)' "$C174" || fail174 "roundHit 缺同号硬边界（正数不得借容差冒充负数）"
+
+# ③ 手↔股换算只在 catLots/catShares 之间开，倍数单一常量。
+CNT174=$((CNT174 + 1))
+grep -qF 'const lotToShares = 100.0' "$C174" || fail174 "缺 lotToShares 单一换算常量"
+CNT174=$((CNT174 + 1))
+grep -qF 'case catLots:' "$C174" || fail174 "allows 缺手↔股换算档"
+CNT174=$((CNT174 + 1))
+grep -qF 'case catShares:' "$C174" || fail174 "换算档必须双向（股→手也要放行）"
+
+# ④ 量比复用 combat_agent 唯一尺子；块内不得自写第二份公式；盘前/非交易日两态在位。
+CNT174=$((CNT174 + 1))
+grep -qF 'func TradingMinutesElapsed(now time.Time) float64 { return tradingMinutesElapsed(now) }' "$IR174" || fail174 "时段尺子缺只读导出（消费方各写一份时段判定即是第二把尺）"
+CNT174=$((CNT174 + 1))
+N_RATIO174=$(grep -cF 'combat_agent.IntradayVolumeRatio(' "$C174" || true)
+[ "${N_RATIO174:-0}" -ge 2 ] || fail174 "量比没走 IntradayVolumeRatio 唯一尺子（盘中与非交易日两处都应调用它）"
+CNT174=$((CNT174 + 1))
+# 负锁先剥整行注释：本段与 consult.go 的说明注释里都抄着"liveVol/avg5"这串病文本，
+# 不剥注释＝记录事故的那行字自己把锁喂红（同 §25-c 剥注释纪律）。
+SEG174=$(grep -v '^[[:space:]]*//' "$C174" || true)
+if grep_q 'liveVol[[:space:]]*/[[:space:]]*avg5' SEG174; then
+	fail174 "数据块自写 liveVol/avg5 第二把量比尺（必须经 IntradayVolumeRatio 钉时刻复用）"
+fi
+CNT174=$((CNT174 + 1))
+grep -qF '量比: 未提供（盘前无盘中累计量口径' "$C174" || fail174 "盘前量比必须写未提供（直接调尺子会把集合竞价量虚抬240倍）"
+CNT174=$((CNT174 + 1))
+grep -qF 'if !data.IsTradingDay(now) {' "$C174" || fail174 "缺非交易日分支（周末上午按钟表折算会虚抬量比，方案B①要求收盘口径）"
+CNT174=$((CNT174 + 1))
+grep -qF 'rd.Day(), 15, 0, 0, 0, rd.Location()' "$C174" || fail174 "非交易日必须把尺子时刻钉在基准日15:00（elapsed=240 全日口径）"
+
+# ⑤ 均量剔基准日：新函数在位、旧含今日半根的 consultMAVolume 不得复活。
+CNT174=$((CNT174 + 1))
+grep -qF 'func consultAvgVolumeExToday(kl []data.KLine, now time.Time) float64 {' "$C174" || fail174 "缺 consultAvgVolumeExToday"
+CNT174=$((CNT174 + 1))
+if grep -qF 'func consultMAVolume(' "$C174"; then
+	fail174 "旧 consultMAVolume（含今日半根）复活＝分母被当日量污染"
+fi
+CNT174=$((CNT174 + 1))
+grep -qF '本块未提供：北向资金、盘口五档、同板块个股、集合竞价明细、龙虎榜、融资余额' "$C174" || fail174 "块尾缺'哪些概念根本没有数'的固定声明"
+CNT174=$((CNT174 + 1))
+grep -qF 'MA5=%.2f元 MA10=%.2f元' "$C174" || fail174 "MA 必须带元单位（无单位数不进白名单，模型规范复述会被误杀）"
+
+# ⑥ Prompt 铁律升级但 FIX-2 反面教材哨兵数字一个不许少。
+CNT174=$((CNT174 + 1))
+grep -qF '容差只到你写出的那一位' "$L174" || fail174 "prompt 缺按精度取容差的铁律（与审计档配套）"
+CNT174=$((CNT174 + 1))
+grep -qF '不得改方向' "$L174" || fail174 "prompt 缺'不得改方向'边界"
+CNT174=$((CNT174 + 1))
+for tok174 in '2383万' '1.2亿' '25305'; do
+	grep -qF "$tok174" "$L174" || fail174 "FIX-2 哨兵反面教材数字 ${tok174} 被删（TestAuditNumbersIgnoresPromptDecoys 依赖）"
+done
+
+# ⑦ A 轮接线：追加必须发生在 ⟦DATA⟧ 包裹之前（顺序锁，三句都在≠顺序对）。
+CNT174=$((CNT174 + 1))
+L_DR174=$(grep -nF 'dataCtx += e.consultDataRound(ctx, client, userMsg)' "$C174" | head -1 | cut -d: -f1 || true)
+L_WRAP174=$(grep -nF 'system += "\n\n⟦DATA⟧\n" + dataCtx' "$C174" | head -1 | cut -d: -f1 || true)
+{ [ -n "${L_DR174:-}" ] && [ -n "${L_WRAP174:-}" ] && [ "$L_DR174" -lt "$L_WRAP174" ]; } || \
+	fail174 "补数段没追加在 ⟦DATA⟧ 包裹之前（出了边界＝不进反幻觉白名单，审计会把它当编造抹掉）"
+CNT174=$((CNT174 + 1))
+grep -qF 'if r := recover(); r != nil {' "$DR174" || fail174 "A 轮缺 panic 兜底（只读观测腿不许有停机权限）"
+CNT174=$((CNT174 + 1))
+grep -qF 'budget-used < 2' "$DR174" || fail174 "预算留位必须是'剩余不足两次即跳过'（A轮抢吃额度会把主回答挤成429）"
+CNT174=$((CNT174 + 1))
+grep -qF 'st := client.UsageStats()' "$DR174" || fail174 "预算读数必须走 client 自己的当日用量出口（引擎侧另记一本账迟早分叉）"
+
+# ⑧ 白名单单一真源：提示词菜单与解析准入都从 consultSupplementFields 生成（恰两处消费）。
+CNT174=$((CNT174 + 1))
+N_WL174=$(grep -cF 'for _, f := range consultSupplementFields {' "$DR174" || true)
+[ "${N_WL174:-0}" = "2" ] || fail174 "白名单消费点应为2（提示词+解析准入），现测 ${N_WL174:-0}——多一处＝第二份名单，少一处＝静默丢弃"
+CNT174=$((CNT174 + 1))
+grep -qF 'if !allowed[k] || seen[k] {' "$DR174" || fail174 "解析缺白名单外丢弃/去重（模型幻觉字段绝不为它新接数据源）"
+
+# ⑨ 超时跨侧等值：Go 常量现读秒数，卡面文案必须同值（卡上写15秒而实际8秒是静默失真）。
+CNT174=$((CNT174 + 1))
+GO_SEC174=$(sed -n 's/^const consultDataRoundTimeout = \([0-9]*\) \* time.Second$/\1/p' "$DR174")
+[ -n "${GO_SEC174:-}" ] || fail174 "读不到 consultDataRoundTimeout 常量（锚点漂了，跨侧等值锁已失明）"
+CNT174=$((CNT174 + 1))
+grep -qF "const ROUND_TIMEOUT_LABEL = '${GO_SEC174:-未知} 秒'" "$CD174" || fail174 "卡面等待上限与后端 consultDataRoundTimeout=${GO_SEC174:-未知}s 不同值"
+CNT174=$((CNT174 + 1))
+[ "${GO_SEC174:-0}" = "8" ] || fail174 "A 轮超时应为8s（同步接口净多等；改档须同批改卡面与本锁）"
+
+# ⑩ 开关接线四面：config 指针位 / handler 白名单+hot_keys+审计 / 设置页挂卡。
+CNT174=$((CNT174 + 1))
+grep -qF 'ConsultDataRound *bool `json:"consult_data_round,omitempty"`' "$CF174" || fail174 "config 缺指针位（裸bool会把稀疏merge的未表态当显式关）"
+CNT174=$((CNT174 + 1))
+grep -qF 'func (r RuntimeConfig) ConsultDataRoundOn() bool { return feedOn(r.ConsultDataRound) }' "$CF174" || fail174 "缺 ConsultDataRoundOn（缺键=开的指针语义必须共用 feedOn）"
+CNT174=$((CNT174 + 1))
+grep -qF '"consult_data_round": rt.ConsultDataRoundOn(),' "$HR174" || fail174 "view 必须下发生效值（原样下发指针位会让前端拿到null）"
+CNT174=$((CNT174 + 1))
+grep -qF '{"consult_data_round", req.ConsultDataRound != nil},' "$HR174" || fail174 "审计枚举缺 consult_data_round（变更留痕会漏键）"
+CNT174=$((CNT174 + 1))
+grep -qF '{canConfig && <ConsultDataRoundCard />}' "$ST174" || fail174 "设置页没挂卡（上了没人知道＝没上）"
+
+# ⑪ 双向测试在册：放行组/拦截组/旧逻辑副本三件一个不能少（少了＝修复有效性没证明）。
+CNT174=$((CNT174 + 1))
+for t174 in 'func TestDataRichAuditPassGroup(' 'func TestDataRichAuditBlockGroup(' 'func legacyAudit('; do
+	grep -qF "$t174" "$T174" || fail174 "双向测试缺 ${t174}（每条放行须证明旧逻辑死、每条拦截须证明新旧都拦）"
+done
+CNT174=$((CNT174 + 1))
+grep -qF '没有改动可保存' "$FT174" || fail174 "前端契约测试缺'未改动零提交'腿（一进卡就保存悄悄关出厂开的形状）"
+
+[ "$B174_FAILED" = "0" ] || exit 1
+echo "ok - §174 §CONSULT-DATARICH 锁通过（万手亿手两处 3 + 精度容差接线与边界 4 + 手股换算 3 + 量比单尺与三态 6 + 均量剔基准日与块尾声明 4 + prompt 铁律与哨兵 3 + A轮顺序与fail-open 4 + 白名单单源 2 + 超时跨侧等值 3 + 开关四面 5 + 双向测试在册 2，累计判定点 ${CNT174}）"
 
 # §GZ-UBUNTU 11-08：Linux 部署件口径总闸。不新增段号——collect 段清单由装配器
 # 动态派生，这行属尾体最终总闸；GATE_SELF_ABS 是主脚本绝对路径，段体被搬进

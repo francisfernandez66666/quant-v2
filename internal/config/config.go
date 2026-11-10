@@ -326,6 +326,17 @@ type RuntimeConfig struct {
 	// English: snapshot-first for consult and watchlist price filling; factory-on (absent key = on).
 	// Explicit false keeps today's per-question upstream fetch as the rollback position.
 	QuoteHubConsult *bool `json:"quote_hub_consult,omitempty"`
+	// ConsultDataRound §CONSULT-DATARICH(2026-11-10) A 期：咨询「补数轮」开关。
+	// 主数据块拼好后，先用一次短调用问模型"还缺哪些字段"（只能从白名单里选），Go 侧按需补取
+	// 近5日逐日主力净流入 / MA20·MA60 中期均线，追加进同一个 ⟦DATA⟧ 边界再正式作答。
+	// 指针位：缺键=开；显式 false=关（回到今天"一轮一次调用"的形态，作为回滚位）。
+	// 为什么要有这一枚：A 轮把咨询的调用数与 token 消耗翻倍、并在同步接口上串行增加最多
+	// consultDataRoundTimeout 的等待。现场若觉得贵/慢，设置页拨回关闭即可，不必回退发版。
+	// 任何失败（超时/解析不出/预算只够一次/取数失败）都静默跳过，主回答不受影响。
+	// English: optional pre-answer "supplement round" for stock consult; factory-on pointer switch.
+	// It doubles consult call/token spend and adds serial latency, so it must be flip-able without
+	// a redeploy; every failure path silently falls back to the main answer.
+	ConsultDataRound *bool `json:"consult_data_round,omitempty"`
 	// IndexFallbackSources §INDEX-BLIND（2026-11-02 owner 裁决「出厂即开」）：大盘指数实时不再只吃东财一族，
 	// 主链失败后依次试新浪、腾讯的**指数专用**腿（指数字段位次与个股逐位相同，但市场前缀必须独立判定）。
 	// 成因是现网读数，不是设想：11-02 东财 push2/push2delay 对这台机器间歇 TLS 重置（EOF），
@@ -413,6 +424,13 @@ func (r RuntimeConfig) QuotePerCodeSourceOn() bool { return feedOn(r.QuotePerCod
 
 // QuoteHubConsultOn 咨询与自选价是否走快照优先（缺省开）。
 func (r RuntimeConfig) QuoteHubConsultOn() bool { return feedOn(r.QuoteHubConsult) }
+
+// ConsultDataRoundOn 咨询是否跑「补数轮」（缺省开，§CONSULT-DATARICH A 期）。
+// 与行情七枚共用 feedOn 的指针语义（缺键=开、显式 false=关），但它管的是 LLM 调用次数与
+// 咨询延迟，不参与任何行情装配/价格改写——关掉只影响"要不要多问模型一次"。
+// English: whether the consult supplement round runs; same pointer semantics as the feed
+// switches (absent = on), but it only governs an extra LLM call, never quote assembly.
+func (r RuntimeConfig) ConsultDataRoundOn() bool { return feedOn(r.ConsultDataRound) }
 
 // IndexFallbackSourcesOn 指数实时是否允许多源兜底（缺省开，§INDEX-BLIND）。
 func (r RuntimeConfig) IndexFallbackSourcesOn() bool { return feedOn(r.IndexFallbackSources) }

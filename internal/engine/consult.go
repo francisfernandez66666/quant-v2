@@ -19,6 +19,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/llm"
 )
@@ -60,6 +62,12 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 	// 被模型原样复现即放行，守卫自击穿）。
 	system := llm.ConsultSystemPrompt()
 	dataCtx := e.buildConsultContext(userMsg)
+	// §CONSULT-DATARICH(2026-11-10) A 期：补数轮追加在**边界包裹之前**，因此补充段与主块
+	// 同在 ⟦DATA⟧ 内、同被 collectTrustedNumbers 采集（审计零改动）。返回空串＝今天的行为：
+	// 开关关、预算只够一次、超时、JSON 解不出、取数失败，任何一条都静默跳过。
+	if dataCtx != "" {
+		dataCtx += e.consultDataRound(ctx, client, userMsg)
+	}
 	if dataCtx != "" {
 		system += "\n\n⟦DATA⟧\n" + dataCtx + "\n⟦/DATA⟧"
 	} else {
@@ -114,28 +122,44 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 // 及百分比与倍数（% / 倍）——这些同样是模型幻觉的高发区。
 // 支持"万/亿"紧邻 笔/手/股 的组合（如 2.3万笔、1.2亿股）。
 // §FIX-5(20260919 批三)：数字与单位之间允许空白（模型常写"净流出 2.22 亿元"），否则漏审。
+// §CONSULT-DATARICH(2026-11-10)：补"万手/亿手"两个组合后缀，且**必须排在裸"万/亿"之前**——
+// 正则交替是最左优先，"3.2万手"会先被"万"截成"3.2万"（catAmbiguous），
+// 只往 numUnitTable 加后缀而不动本正则＝那条后缀永远走不到（空操作）。
 // 刻意不匹配：时间、股票代码、时长、日期，以及"点/个"等无单位口径字段——避免误伤，
 // 数据块里的无单位复述（如"12个点"）天然不进白名单也不被审，后人勿再加宽单位表。
 // English: matches unit-bearing finance numbers (space between digits and unit allowed);
+// the 万手/亿手 compounds must precede bare 万/亿 or the alternation truncates them;
 // deliberately skips times/codes/dates and unit-less phrasings.
-var auditedNumberRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?\s*(?:万元|亿元|元|万股|亿股|万|亿|手|笔|[%％]|倍)`)
+var auditedNumberRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?\s*(?:万元|亿元|元|万股|亿股|万手|亿手|万|亿|手|笔|[%％]|倍)`)
 
 // numCat §FIX-5：带单位数字的量纲类别。金额/股数/笔数/百分比/倍数互不等价，
 // 只在同类内做单位换算归一（万元↔亿元）；catAmbiguous 专治裸"万/亿"（"2.3万笔"
 // 会被正则截成 "2.3万"，量纲未知），允许命中任意类别的基础量。
+// §CONSULT-DATARICH(2026-11-10)：catLots（手）从 catCount 里分出来——手与股是同一物理量的
+// 两种口径（1手=100股，允许换算），而"笔"是成交笔数、与股数毫无关系。
+// 混在一类时放开手↔股换算等于顺手放行"2.3万笔 ↔ 230万股"这种跨量纲冒充。
+// English: lot counts split from transaction counts so the lot↔share conversion
+// (1 lot = 100 shares) can never legitimise a cross-dimension "笔 ↔ 股" match.
 type numCat int
 
 const (
 	catAmbiguous numCat = iota // 裸"万/亿"，量纲未知
 	catMoney                   // 元/万元/亿元
-	catShares                  // 万股/亿股
-	catCount                   // 手/笔
+	catShares                  // 万股/亿股（基础量＝股）
+	catCount                   // 笔（成交笔数，不可与股/手换算）
 	catPct                     // % / ％
 	catMult                    // 倍
+	catLots                    // 手/万手/亿手（基础量＝手，可与 catShares 按 ×100 换算）
 )
+
+// lotToShares 手→股的换算倍数（A股 1手=100股）。只用于 catLots↔catShares 的跨类比对，
+// 不参与同类归一——同类的基础量本来就是手/股本身。
+const lotToShares = 100.0
 
 // numUnitTable token 后缀 →（量纲类别, 归一到基础量的乘数）。长后缀必须排在前，
 // 保证 "万元" 先于 "万" 命中（HasSuffix 顺序扫描）。
+// §CONSULT-DATARICH：万手/亿手的基础量是**手**，故乘数为 1e4/1e8（与万股/亿股同形），
+// 不是 100/1e6——把"手→股"的 100 混进前缀乘数会让 3.2万手 归一成 320 手，差 100 倍。
 var numUnitTable = []struct {
 	suffix string
 	cat    numCat
@@ -143,21 +167,28 @@ var numUnitTable = []struct {
 }{
 	{"万元", catMoney, 1e4}, {"亿元", catMoney, 1e8},
 	{"万股", catShares, 1e4}, {"亿股", catShares, 1e8},
+	{"万手", catLots, 1e4}, {"亿手", catLots, 1e8},
 	{"元", catMoney, 1}, {"万", catAmbiguous, 1e4}, {"亿", catAmbiguous, 1e8},
-	{"手", catCount, 1}, {"笔", catCount, 1},
+	{"手", catLots, 1}, {"笔", catCount, 1},
 	{"%", catPct, 1}, {"％", catPct, 1}, {"倍", catMult, 1},
+}
+
+// splitAuditedToken 把 token 拆成「数字部分」与「单位后缀」（数字与单位间的空白已剥）。
+// 解析与"写到哪一位"的精度判定共用这一处切法：两处各切一遍，精度就会按另一种口径算。
+// English: single split shared by value parsing and written-precision detection.
+func splitAuditedToken(tok string) (numPart, suffix string) {
+	numPart = strings.TrimRight(tok[:strings.LastIndexAny(tok, "0123456789.")+1], " ")
+	return numPart, strings.TrimSpace(tok[len(numPart):])
 }
 
 // parseAuditedNumberToken 把 "-22200.00 万元" 这类 token 拆成（量纲类别, 基础量纲数值）。
 // 换算归一是 FIX-5 的核心："-22200万元" 与 "2.22亿元" 落到同一个基础值 -2.22e8，
 // 模型换口径复述不再被当成编造。
 func parseAuditedNumberToken(tok string) (numCat, float64, bool) {
-	// 数字与单位间的空白先剥掉（正则允许 \s*）。
-	trimmed := strings.TrimRight(tok[:strings.LastIndexAny(tok, "0123456789.")+1], " ")
-	suffix := strings.TrimSpace(tok[len(trimmed):])
+	numPart, suffix := splitAuditedToken(tok)
 	for _, u := range numUnitTable {
 		if suffix == u.suffix {
-			f, err := strconv.ParseFloat(trimmed, 64)
+			f, err := strconv.ParseFloat(numPart, 64)
 			if err != nil {
 				return 0, 0, false
 			}
@@ -165,6 +196,30 @@ func parseAuditedNumberToken(tok string) (numCat, float64, bool) {
 		}
 	}
 	return 0, 0, false
+}
+
+// auditedTokenGranularity 回复里这个数字**写到了哪一位**（该位的一个单位，换算到基础量纲）。
+// "36.1元"→0.1元、"2.2亿"→0.1亿=1e7元、"45800手"→1手。
+// §CONSULT-DATARICH(2026-11-10)：舍入容差按它的一半取，而不是按一个固定的相对百分比。
+// 为什么不用"±5% 相对容差"：现价 22.09元 的 5% 是 ±1.10元，模型写"23.00元"也会被当成
+// 四舍五入放行——那不是舍入而是报错价。按写出的精度取容差，"23.00元"只允许 ±0.005元，
+// 而"2.2亿"允许 ±5e6（2.22亿 舍入到 2.2亿 正是合法复述），大额与价格自动各得其所。
+// English: tolerance derives from the precision actually written, not a flat percentage —
+// a flat 5% would let a wrong price (22.09 → 23.00) pass as "rounding".
+func auditedTokenGranularity(tok string) float64 {
+	numPart, suffix := splitAuditedToken(tok)
+	mult := 1.0
+	for _, u := range numUnitTable {
+		if suffix == u.suffix {
+			mult = u.mult
+			break
+		}
+	}
+	decimals := 0
+	if i := strings.Index(numPart, "."); i >= 0 {
+		decimals = len(numPart) - i - 1
+	}
+	return math.Pow(10, -float64(decimals)) * mult
 }
 
 // trustedNumbers §FIX-5：可信数字集合——按量纲分组的"有出处"基础量 + 推算涨跌幅容差清单。
@@ -256,8 +311,31 @@ func setHit(set map[float64]bool, val float64) bool {
 	return false
 }
 
-// allows 判定回复中一个数字 token（类别+基础量）是否有可信出处；prefix 为该数字之前的回复文本。
-func (t *trustedNumbers) allows(cat numCat, val float64, prefix string) bool {
+// roundHit 集合内是否有「与 val 同号、且差不超过 tol」的成员（tol＝回复写出的半个精度）。
+// §CONSULT-DATARICH：同号是硬边界——正数不许冒充负数，反向复述仍只走 reverseWordAnchors
+// 那条保守规则（它额外要求近邻措辞锚）。零值不参与容差比对（0 与任何数都"接近"是假放行）。
+// English: same-sign rounding match; zero never participates, and sign flips still require
+// the conservative reverse-word anchor rule.
+func roundHit(set map[float64]bool, val, tol float64) bool {
+	if tol <= 0 || val == 0 {
+		return false
+	}
+	for v := range set {
+		if v == 0 || (v > 0) != (val > 0) {
+			continue
+		}
+		if math.Abs(v-val) <= tol {
+			return true
+		}
+	}
+	return false
+}
+
+// allows 判定回复中一个数字 token（类别+基础量）是否有可信出处；prefix 为该数字之前的回复文本，
+// gran 为该 token 写出的精度（auditedTokenGranularity），舍入档按它的一半取容差。
+// English: decides whether a replied number has a trusted origin; gran is the precision
+// actually written and drives the rounding tolerance (half a unit of that precision).
+func (t *trustedNumbers) allows(cat numCat, val float64, prefix string, gran float64) bool {
 	// 1) 同量纲精确命中（含单位换算归一后的相等）。
 	if setHit(t.vals[cat], val) {
 		return true
@@ -282,6 +360,35 @@ func (t *trustedNumbers) allows(cat numCat, val float64, prefix string) bool {
 			}
 		}
 	}
+	// 5) §CONSULT-DATARICH(2026-11-10) 舍入档：同量纲、同号、差 ≤ 半个写出精度。
+	// 覆盖"36.10→36.1""22200万→2.2亿"这类合法复述；按精度而非固定百分比取容差，
+	// 因此"22.09元→23.00元"这种报错价仍被拦（它的写出精度是 0.01元）。
+	tol := gran / 2
+	if roundHit(t.vals[cat], val, tol) {
+		return true
+	}
+	if cat == catAmbiguous {
+		for _, set := range t.vals {
+			if roundHit(set, val, tol) {
+				return true
+			}
+		}
+	}
+	// 6) §CONSULT-DATARICH 手↔股换算档：数据块给"4580万股"、模型复述"45.8万手"不再被判编造。
+	// 只在 catLots 与 catShares 之间开（catCount＝笔不参与，见 numCat 注释）；精度同步换算，
+	// 否则换算后的容差会按另一把尺子取。
+	switch cat {
+	case catLots:
+		shares, shTol := val*lotToShares, tol*lotToShares
+		if setHit(t.vals[catShares], shares) || roundHit(t.vals[catShares], shares, shTol) {
+			return true
+		}
+	case catShares:
+		lots, lotTol := val/lotToShares, tol/lotToShares
+		if setHit(t.vals[catLots], lots) || roundHit(t.vals[catLots], lots, lotTol) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -303,7 +410,7 @@ func auditNumbers(reply string, trusted *trustedNumbers) string {
 	for _, m := range idx {
 		tok := reply[m[0]:m[1]]
 		cat, val, ok := parseAuditedNumberToken(tok)
-		if ok && trusted.allows(cat, val, reply[:m[0]]) {
+		if ok && trusted.allows(cat, val, reply[:m[0]], auditedTokenGranularity(tok)) {
 			sb.WriteString(reply[last:m[1]])
 		} else {
 			sb.WriteString(reply[last:m[0]])
@@ -332,35 +439,35 @@ const consultNoStockPrompt = `当前消息中未识别到明确的股票名称�
 // + 数百 KB 文本进付费 prompt。超出部分只处理前 5 只并在数据块尾部如实注明。
 const consultMaxStocks = 5
 
-// buildConsultContext 从用户消息解析提到的股票，拉取真实实时行情组装为上下文文本。
-// 返回空串表示未解析出任何股票（调用方应提示用户指明股票）。
-// 数据来源：东财 push2 实时价（含主力净流入 F162）+ 东财资金流明细 + 新浪日K/分钟K + 引擎战法信号。
-func (e *Engine) buildConsultContext(userMsg string) string {
+// consultCodesInMessage 从用户消息解析本轮要处理的股票（出现顺序、去重、截断至 consultMaxStocks）。
+// §CONSULT-DATARICH(2026-11-10)：从 buildConsultContext 里原样抽出（行为零改动），
+// 因为 A 补数轮也要按同一份名单补数——两处各解析一遍就会出现"主块答了5只、补数轮补了另一批"。
+// dropped 是因超限被丢弃的只数，调用方必须如实告知用户（§FIX-6：截断要可见）。
+// English: verbatim extraction of the per-message code resolution so the supplement round
+// addresses exactly the same universe as the main data block.
+func (e *Engine) consultCodesInMessage(userMsg string) (order []string, names map[string]string, dropped int) {
 	// §FIX-6：按**出现顺序**收集代码并截断至前 consultMaxStocks 只（map 无序，旧实现
 	// 逐 code 全量外呼是行情配额与 prompt 体积的放大器）。
-	var order []string           // 出现顺序（截断后 ≤consultMaxStocks）
-	codes := map[string]string{} // code → name（仅用于去重与名称回查）
-	dropped := 0                 // 因超限被丢弃的代码数
+	names = map[string]string{} // code → name（仅用于去重与名称回查）
 	addCode := func(code, name string) {
 		if code == "" {
 			return
 		}
-		if _, dup := codes[code]; dup {
+		if _, dup := names[code]; dup {
 			return
 		}
 		if len(order) >= consultMaxStocks {
 			dropped++
 			return
 		}
-		codes[code] = name
+		names[code] = name
 		order = append(order, code)
 	}
 
 	// 1. 名称 → 代码：解析文本中出现的股票名称，再清洗为代码
-	var names []string
 	if e.newsAgent != nil {
-		names = e.newsAgent.FindStocksInText(userMsg)
-		for _, c := range e.newsAgent.CleanStocks(names) {
+		found := e.newsAgent.FindStocksInText(userMsg)
+		for _, c := range e.newsAgent.CleanStocks(found) {
 			parts := strings.SplitN(c, "|", 2)
 			if len(parts) != 2 || parts[0] == "" {
 				continue
@@ -372,7 +479,14 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 	for _, m := range consultCodeRe.FindAllString(userMsg, -1) {
 		addCode(m, "")
 	}
+	return order, names, dropped
+}
 
+// buildConsultContext 从用户消息解析提到的股票，拉取真实实时行情组装为上下文文本。
+// 返回空串表示未解析出任何股票（调用方应提示用户指明股票）。
+// 数据来源：东财 push2 实时价（含主力净流入 F162）+ 东财资金流明细 + 新浪日K/分钟K + 引擎战法信号。
+func (e *Engine) buildConsultContext(userMsg string) string {
+	order, codes, dropped := e.consultCodesInMessage(userMsg)
 	if len(order) == 0 {
 		return ""
 	}
@@ -545,6 +659,12 @@ func (e *Engine) evictConsultBlocksLocked() {
 func (e *Engine) buildStockBlockUncached(code, name string) string {
 	var b strings.Builder
 	hubMerged := false // 只用于下面那一行"现价来自哪个源、几秒前"的诚实标注
+	// §CONSULT-DATARICH(2026-11-10) B①：本块的统一时钟与"实时参考价/累计量"。
+	// 时钟走引擎可注入钟（与 buildConsultContext 同源），量比的时段折算因此可被测试钉住；
+	// 参考价与累计量只在实时报价**成功**那一支里赋值——err!=nil 时 si 可能仍非 nil，
+	// 直接读它等于把失败源的残值当实测喂给模型。
+	now := e.nowTime()
+	refPrice, liveVol := 0.0, 0.0
 	b.WriteString(fmt.Sprintf("\n—— 股票 %s", code))
 	if name != "" {
 		b.WriteString(" " + name)
@@ -572,6 +692,7 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		}
 	}
 	if err == nil && si != nil && si.Price > 0 {
+		refPrice, liveVol = si.Price, si.Volume
 		if si.Name != "" {
 			name = si.Name
 		}
@@ -595,6 +716,19 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		// 任选其一原样照抄即可过关（与 llm.go 的"数字引用铁律"提示词配套）。
 		b.WriteString(fmt.Sprintf("成交量 %.0f股（约%.0f手） 成交额%.0f元 换手率 %.2f%%\n",
 			si.Volume, si.Volume/100, si.Amount, si.Turnover))
+		// §CONSULT-DATARICH(2026-11-10) B①：位置类推算值本地算好进块——模型自己算的数不在
+		// 白名单，算了也会被 auditNumbers 抹成 [数据缺失]（11-09 实录"现价距最高点7.7%"即此类）。
+		// 分母显式写进文案：同一句"距最高7.7%"以现价还是最高价作分母差一档，不写明就是两把尺。
+		// 双形态（叙述锚 + 带符号）与上面涨跌幅那行同一取向，防模型改写措辞后撞不上白名单。
+		// High<Price / Low>Price 只在混源时点错位时出现，此时不写推算值（原始最高/最低已在块内）。
+		if si.High > 0 && si.High >= si.Price {
+			drop := (si.High - si.Price) / si.Price * 100
+			b.WriteString(fmt.Sprintf("从当日最高回落 %.2f%%（即%+.2f%%，分母=现价）\n", drop, -drop))
+		}
+		if si.Low > 0 && si.Price >= si.Low {
+			above := (si.Price - si.Low) / si.Price * 100
+			b.WriteString(fmt.Sprintf("高于当日最低 %.2f%%（即%+.2f%%，分母=现价）\n", above, above))
+		}
 		// §FIX-9e(20260919)：判"缺数"必须看 HasFlow——东财真返回 0（买卖完全对冲）是合法
 		// 实测值，旧口径 NetInflow==0 一律说"数据源未返回"，诱导模型答"没有数据"。
 		if si.HasFlow {
@@ -622,23 +756,84 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 			cf.SuperLargeNet/1e4, cf.LargeNet/1e4, cf.MediumNet/1e4, cf.SmallNet/1e4))
 	}
 
-	// 日K：当日振幅、MA5/MA10、近5日量能
+	// 日K：当日振幅、MA5/MA10、前5个交易日量能、量比
 	if kl, err := e.marketAPI.GetSinaKLine(code, 30); err == nil && len(kl) > 0 {
 		last := kl[len(kl)-1]
 		amp := 0.0
 		if last.Close > 0 {
 			amp = (last.High - last.Low) / last.Close * 100
 		}
-		b.WriteString(fmt.Sprintf("日K(最新一根 %s): 振幅%.2f%% 收%.2f 高%.2f 低%.2f\n",
+		// §CONSULT-DATARICH B①：收/高/低补"元"。无单位的数不进白名单也不被审，
+		// 模型规范复述成"收盘22.09元"时那个"元"会让它撞不上任何锚点而被抹（与 MA 同族误杀）。
+		b.WriteString(fmt.Sprintf("日K(最新一根 %s): 振幅%.2f%% 收%.2f元 高%.2f元 低%.2f元\n",
 			last.Date.Format("2006-01-02"), amp, last.Close, last.High, last.Low))
 		if len(kl) >= 10 {
-			b.WriteString(fmt.Sprintf("MA5=%.2f MA10=%.2f %s\n",
-				consultMA(kl[len(kl)-5:]), consultMA(kl[len(kl)-10:]), consultMATrend(kl)))
+			ma5, ma10 := consultMA(kl[len(kl)-5:]), consultMA(kl[len(kl)-10:])
+			b.WriteString(fmt.Sprintf("MA5=%.2f元 MA10=%.2f元 %s\n", ma5, ma10, consultMATrend(kl)))
+			// 偏离度：分母＝均线值本身（不是现价），参考价优先用实时价、取不到才退日K收盘。
+			// 这两个数是模型最爱自己算的（"离均线还有几个点"），算出来必被抹，故本地算好进块。
+			ref := refPrice
+			if ref <= 0 {
+				ref = last.Close
+			}
+			if ref > 0 && ma5 > 0 && ma10 > 0 {
+				d5, d10 := (ref-ma5)/ma5*100, (ref-ma10)/ma10*100
+				w5, w10 := "高于", "高于"
+				if d5 < 0 {
+					w5 = "低于"
+				}
+				if d10 < 0 {
+					w10 = "低于"
+				}
+				b.WriteString(fmt.Sprintf("均线偏离: MA5 %+.2f%%（即现价%sMA5 %.2f%%） MA10 %+.2f%%（即现价%sMA10 %.2f%%），分母=均线值、参考价%.2f元\n",
+					d5, w5, math.Abs(d5), d10, w10, math.Abs(d10), ref))
+			}
 		}
-		// 近5日量能
-		avg5 := consultMAVolume(kl)
-		// §CONSULT-UX(20260921)：近5日量能同样给双口径，与上一条成交量口径一致，避免模型复述时单位改写触发"[数据缺失]"。
-		b.WriteString(fmt.Sprintf("近5日平均成交量 %.0f股（约%.0f手），最新一根量 %.0f股（约%.0f手）\n", avg5, avg5/100, last.Volume, last.Volume/100))
+		// §CONSULT-DATARICH B①：均量改为**剔除基准日那根**的前5个交易日均量，与量比分母同源。
+		// 旧口径把今日半根算进分母：今天放量会把分母抬高，反而测不出放量（与 t_vol_ratio.go
+		// 剔今日K 同一条纪律）；且块内若同时存在"含今日的5日均量"与"不含今日的量比分母"，
+		// 就是两个都叫"5日均量"的数互相打架。取不到就写未提供，绝不输出 0股 冒充实测。
+		// 基准日：交易日＝今日；非交易日（周末/节假日）报价是最近收盘口径，基准日改取
+		// 最后一根日K 的日期——否则周六上午 TradingMinutesElapsed 只看时钟会凭空折出
+		// "已流逝60分钟"，把最近交易日量比虚抬 4 倍（方案 B①"非交易时段标注收盘口径"）。
+		refDay := now
+		exNote := "不含今日"
+		if !data.IsTradingDay(now) {
+			refDay = last.Date
+			exNote = "不含最近交易日"
+		}
+		avg5 := consultAvgVolumeExToday(kl, refDay)
+		if avg5 > 0 {
+			b.WriteString(fmt.Sprintf("前5个交易日平均成交量 %.0f股（约%.0f手，%s），最新一根量 %.0f股（约%.0f手）\n",
+				avg5, avg5/100, exNote, last.Volume, last.Volume/100))
+		} else {
+			b.WriteString("前5个交易日平均成交量: 未提供（剔除基准日后日K不足，请勿编造），最新一根量 " +
+				fmt.Sprintf("%.0f股（约%.0f手）\n", last.Volume, last.Volume/100))
+		}
+		// 量比：复用 combat_agent 那把唯一尺子（按已流逝交易分钟折算全天），本处不新写公式。
+		// 盘前 elapsed=0 ⇒ 未提供：IntradayVolumeRatio 内部把 elapsed<=0 兜成 1 分钟以免除零，
+		// 直接调它会把集合竞价量放大 240 倍报成"巨量比"。收盘后 elapsed=240 ⇒ 全日口径。
+		// 非交易日：把尺子的时刻钉在基准日 15:00（elapsed=240）⇒ 同一份实现算出收盘全日口径，
+		// 不另写 liveVol/avg5 第二把尺。
+		if !data.IsTradingDay(now) {
+			if liveVol > 0 && avg5 > 0 {
+				rd := cntime.In(last.Date)
+				closedRef := time.Date(rd.Year(), rd.Month(), rd.Day(), 15, 0, 0, 0, rd.Location())
+				b.WriteString(fmt.Sprintf("量比 %.2f倍（非交易日，按最近交易日 %s 收盘全日口径；该日量÷其前5个交易日均量）\n",
+					combat_agent.IntradayVolumeRatio(closedRef, liveVol, avg5), last.Date.Format("2006-01-02")))
+			} else {
+				b.WriteString("量比: 未提供（日K/量能取数不足；请勿编造）\n")
+			}
+		} else if elapsed := combat_agent.TradingMinutesElapsed(now); liveVol > 0 && avg5 > 0 && elapsed > 0 {
+			scope := "盘中按已流逝交易分钟折算全天"
+			if elapsed >= 240 {
+				scope = "收盘全日口径"
+			}
+			b.WriteString(fmt.Sprintf("量比 %.2f倍（%s；今日累计量÷前5个交易日均量，已流逝%.0f/240交易分钟）\n",
+				combat_agent.IntradayVolumeRatio(now, liveVol, avg5), scope, elapsed))
+		} else {
+			b.WriteString("量比: 未提供（盘前无盘中累计量口径，或日K/量能取数不足；请勿编造）\n")
+		}
 	}
 
 	// 分钟K（5分钟）MACD 状态
@@ -682,6 +877,12 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		}
 	}
 
+	// §CONSULT-DATARICH(2026-11-10) B①：块尾固定声明"哪些概念根本没有数"。
+	// 审计只查数字不查名词，模型给"北向资金/龙虎榜"配一个看似合理的数时，若那个数恰好
+	// 撞上块内别的锚点就会被放行；把"这些字段一律无数"写在数据块里（因而在白名单采集范围内、
+	// 也是模型唯一被允许引用的来源），让"严禁配数字"有明确指向而不是泛泛一句。
+	b.WriteString("本块未提供：北向资金、盘口五档、同板块个股、集合竞价明细、龙虎榜、融资余额——引用这些概念时严禁配任何具体数字。\n")
+
 	return b.String()
 }
 
@@ -697,8 +898,19 @@ func consultMA(kl []data.KLine) float64 {
 	return sum / float64(len(kl))
 }
 
-// consultMAVolume 计算最近5根日K的平均成交量（不足则取全部）。
-func consultMAVolume(kl []data.KLine) float64 {
+// consultAvgVolumeExToday 基准日前5个交易日的平均成交量（**剔除与基准日同日的那根**，不足5根则取全部）。
+// §CONSULT-DATARICH(2026-11-10)：取代旧 consultMAVolume（含今日半根）。第二参是"基准日"：
+// 交易日传 now（剔今日未收盘那根）；非交易日传最后一根日K的日期（报价即该日收盘口径，
+// 分子是该日量，分母就必须剔掉它，否则放量被自己的分母稀释）。判据与 t_vol_ratio.go /
+// nshape_input.go 同一口径——按北京交易日比对日期，不靠"最后一根一定是今天"的假设。
+// 返回 0 ＝ 无可信均量（剔完为空/量全为零），调用方必须写"未提供"，绝不把 0 当实测注入。
+// English: mean volume of the five trading days before the reference day, excluding the bar whose
+// Beijing day-key equals it (callers pass now on trading days, the last bar's date otherwise);
+// 0 means unavailable, never a measured zero.
+func consultAvgVolumeExToday(kl []data.KLine, now time.Time) float64 {
+	if len(kl) > 0 && cntime.DayOf(kl[len(kl)-1].Date) == cntime.DayOf(now) {
+		kl = kl[:len(kl)-1]
+	}
 	if len(kl) == 0 {
 		return 0
 	}

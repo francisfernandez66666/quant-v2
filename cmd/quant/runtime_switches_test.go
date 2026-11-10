@@ -115,6 +115,9 @@ func TestSwitchInventoryCoversEveryKey(t *testing.T) {
 		"runtime.index_fallback_sources",
 		"runtime.index_breaker_scope",
 		"runtime.quote_feed_index_enabled",
+		// §CONSULT-DATARICH（2026-11-10）：补数轮是唯一把咨询调用数翻倍的开关，
+		// 不进清单＝现场看到额度掉得快时无从判读（与 §关态留痕 同一条纪律）。
+		"runtime.consult_data_round",
 	}
 	for _, k := range want {
 		if !strings.Contains(out, k) {
@@ -134,6 +137,9 @@ func TestSwitchInventoryCoversEveryKey(t *testing.T) {
 		"runtime.index_fallback_sources=enabled",
 		"runtime.index_breaker_scope=enabled",
 		"runtime.quote_feed_index_enabled=enabled",
+		// §CONSULT-DATARICH：补数轮出厂开（指针位缺键=开）。改成裸 bool 会让清单打 disabled，
+		// 这条用例先红——与上面三枚指数键同一条护栏。
+		"runtime.consult_data_round=enabled",
 	} {
 		if !strings.Contains(out, k) {
 			t.Fatalf("行情四键出厂态必须是 enabled（缺键=开，指针位语义）: 缺 %q:\n%s", k, out)

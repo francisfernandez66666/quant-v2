@@ -14,6 +14,7 @@ import { canStrict } from '../utils/perm.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
 import QuoteFeedConfigCard from './QuoteFeedConfigCard.jsx'
+import ConsultDataRoundCard from './ConsultDataRoundCard.jsx' // §CONSULT-DATARICH 咨询补数轮开关（A 期）
 
 // 五大战法参数分组定义：每个 group 含标题与字段列表（k=后端字段名, label=展示名, step=步进, type=控件类型, hint=悬浮说明）
 const strategyGroups = [
@@ -873,6 +874,9 @@ export default function Settings() {
           这批键管的是"行情从哪来、多旧能用"，与资金动作无关；单独成卡也避免把整页配置
           的 dirty 判定搅在一起（各管各的保存，失败互不牵连）。 */}
       {canConfig && <QuoteFeedConfigCard />}
+      {/* §CONSULT-DATARICH（2026-11-10）咨询补数轮：同样只挂 config_admin、同样各自保存。
+          单独成卡的理由见组件头注——它管 LLM 调用次数与咨询延迟，不属于行情面。 */}
+      {canConfig && <ConsultDataRoundCard />}
       <Card title="系统" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>版本</span>

@@ -80,39 +80,44 @@ func logRuntimeSwitches(cfgMgr *config.Manager) {
 	if qm != nil {
 		rec, guard = qm.SubscriptionRecognize, qm.SubscriptionCancelGuard
 	}
-	log.Printf("[main] §SWITCH 状态 1/14 runtime.qmt_feed_enabled=%s（出厂开：配置无此键即轮询，显式 false 才停）", yesNo(rt.QMTFeedOn()))
-	log.Printf("[main] §SWITCH 状态 2/14 runtime.qmt_feed_primary=%s（出厂开；关＝观察模式：只统计不改写价格；开＝券商价为当前价）", yesNo(rt.QMTFeedPrimaryOn()))
-	log.Printf("[main] §SWITCH 状态 3/14 runtime.qmt_feed_coverage_min_pct=%d（出厂 80；-1＝关闭阈值判断＝旧行为）",
+	log.Printf("[main] §SWITCH 状态 1/15 runtime.qmt_feed_enabled=%s（出厂开：配置无此键即轮询，显式 false 才停）", yesNo(rt.QMTFeedOn()))
+	log.Printf("[main] §SWITCH 状态 2/15 runtime.qmt_feed_primary=%s（出厂开；关＝观察模式：只统计不改写价格；开＝券商价为当前价）", yesNo(rt.QMTFeedPrimaryOn()))
+	log.Printf("[main] §SWITCH 状态 3/15 runtime.qmt_feed_coverage_min_pct=%d（出厂 80；-1＝关闭阈值判断＝旧行为）",
 		rt.EffectiveFeedCoverageMinPct())
-	log.Printf("[main] §SWITCH 状态 4/14 runtime.qmt_feed_volume_to_shares=%.0f（必须由盘中探针判读固化；错 100 倍即 VWAP 错 100 倍）",
+	log.Printf("[main] §SWITCH 状态 4/15 runtime.qmt_feed_volume_to_shares=%.0f（必须由盘中探针判读固化；错 100 倍即 VWAP 错 100 倍）",
 		rt.EffectiveFeedVolumeToShares())
-	log.Printf("[main] §SWITCH 状态 5/14 runtime.monitor_pool_hot_max=%d（券商主源档；降级档仍是常数 60）",
+	log.Printf("[main] §SWITCH 状态 5/15 runtime.monitor_pool_hot_max=%d（券商主源档；降级档仍是常数 60）",
 		rt.EffectiveMonitorPoolHotMax())
-	log.Printf("[main] §SWITCH 状态 6/14 rules.qmt.subscription_recognize=%s（关＝申购行仍不可见、unknown 计数仍被注水）", yesNo(rec))
-	log.Printf("[main] §SWITCH 状态 7/14 rules.qmt.subscription_cancel_guard=%s（关＝紧急停止与今天一致，全发撤单）", yesNo(guard))
-	log.Printf("[main] §SWITCH 状态 8/14 runtime.quote_per_code_source=%s（出厂开；关＝快照里不带每票来源与时刻，混源时整份 Source 仍是唯一读数）", yesNo(rt.QuotePerCodeSourceOn()))
-	log.Printf("[main] §SWITCH 状态 9/14 runtime.quote_hub_consult=%s（出厂开；关＝咨询与自选补价仍每次现拉外部源）", yesNo(rt.QuoteHubConsultOn()))
-	log.Printf("[main] §SWITCH 状态 10/14 网关侧 subscription_recognize 由 qmt_gateway/config.xt.json 自持，" +
+	log.Printf("[main] §SWITCH 状态 6/15 rules.qmt.subscription_recognize=%s（关＝申购行仍不可见、unknown 计数仍被注水）", yesNo(rec))
+	log.Printf("[main] §SWITCH 状态 7/15 rules.qmt.subscription_cancel_guard=%s（关＝紧急停止与今天一致，全发撤单）", yesNo(guard))
+	log.Printf("[main] §SWITCH 状态 8/15 runtime.quote_per_code_source=%s（出厂开；关＝快照里不带每票来源与时刻，混源时整份 Source 仍是唯一读数）", yesNo(rt.QuotePerCodeSourceOn()))
+	log.Printf("[main] §SWITCH 状态 9/15 runtime.quote_hub_consult=%s（出厂开；关＝咨询与自选补价仍每次现拉外部源）", yesNo(rt.QuoteHubConsultOn()))
+	log.Printf("[main] §SWITCH 状态 10/15 网关侧 subscription_recognize 由 qmt_gateway/config.xt.json 自持，" +
 		"现值看网关 /admin/status 的 orders_sync.subscription_recognize（两个键都要开才见效；只开一边最坏是少标注）")
 	// §ORDER-STATE-PULL-STALE（2026-11-02）：跨交易日在途行的拉取收敛。缺省**关**是刻意的——
 	// 这条腿的方向是"放额度"，误判就是多买一笔，必须 owner 在场按下；
 	// 但它同时是"两笔 10-30 的「撤单中」为什么挂到今天"的成因位，所以清单必须点名这一态，
 	// 否则"关着"和"没这个功能"在启动日志里又长成同一个样子（§关态留痕 同一条纪律）。
 	staleOn := qm != nil && qm.OrderStatePullStaleOn()
-	log.Printf("[main] §SWITCH 状态 11/14 rules.qmt.order_state_pull_stale=%s（关＝只收当日在途行，跨日非终态永远不收敛；开＝按网关该日账补终态/判废，三条安全边界同阶段二）",
+	log.Printf("[main] §SWITCH 状态 11/15 rules.qmt.order_state_pull_stale=%s（关＝只收当日在途行，跨日非终态永远不收敛；开＝按网关该日账补终态/判废，三条安全边界同阶段二）",
 		yesNo(staleOn))
 	// §INDEX-BLIND（2026-11-02 owner 裁决「出厂即开」）：大盘指数不再只吃东财一族。
 	// 11-02 现网整天封顶半仓的成因就是这一条腿单点 + 10 分钟 LKG 过窗，
 	// 而当时任何一行日志都不会说"缺的是大盘指数"——清单点名这两枚，是为了让"上了但没开"当场可见。
-	log.Printf("[main] §SWITCH 状态 12/14 runtime.index_fallback_sources=%s（出厂开；关＝指数只试东财主域+镜像，10 分钟 LKG 过窗即判盲区、目标封顶半仓且当天不做 T）",
+	log.Printf("[main] §SWITCH 状态 12/15 runtime.index_fallback_sources=%s（出厂开；关＝指数只试东财主域+镜像，10 分钟 LKG 过窗即判盲区、目标封顶半仓且当天不做 T）",
 		yesNo(rt.IndexFallbackSourcesOn()))
-	log.Printf("[main] §SWITCH 状态 13/14 runtime.index_breaker_scope=%s（出厂开；关＝指数与个股共享 push2…/api/qt/stock/get 那一格熔断名额，个股连败会把指数这条腿一起 fast-fail）",
+	log.Printf("[main] §SWITCH 状态 13/15 runtime.index_breaker_scope=%s（出厂开；关＝指数与个股共享 push2…/api/qt/stock/get 那一格熔断名额，个股连败会把指数这条腿一起 fast-fail）",
 		yesNo(rt.IndexBreakerScopeOn()))
 	// §A7-3（owner 裁决 4）：券商侧指数白名单先到位。现网这条通道此刻不通（xtdata 无服务可连），
 	// 所以这一行今天必然打 enabled 而点位仍来自外部源——这不是矛盾，是"装配到位≠有 tick"的既有判据
 	// （上一基线就为这句话踩过坑），判读要看 /api/status.quote_feed 的 rounds/hits，不看这一行。
-	log.Printf("[main] §SWITCH 状态 14/14 runtime.quote_feed_index_enabled=%s（出厂开；券商按独立指数后缀白名单取点位，不进监控池也不进覆盖率分母）",
+	log.Printf("[main] §SWITCH 状态 14/15 runtime.quote_feed_index_enabled=%s（出厂开；券商按独立指数后缀白名单取点位，不进监控池也不进覆盖率分母）",
 		yesNo(rt.QuoteFeedIndexOn()))
+	// §CONSULT-DATARICH（2026-11-10）A 期补数轮：这一枚不改行情、只改"咨询要不要多问模型一次"，
+	// 但它是唯一会把咨询调用数与 token 消耗翻倍的开关，必须在启动清单里点名生效值——
+	// 否则现场看到咨询变慢/额度掉得快时，又要靠人记住"这批上了个补数轮"。
+	log.Printf("[main] §SWITCH 状态 15/15 runtime.consult_data_round=%s（出厂开；开＝咨询主数据块后多一次短调用按需补数，调用数与 token 约翻倍、串行多等最多 8s；关＝回到一轮一次调用。任何失败静默跳过，预算只够一次时自动不跑）",
+		yesNo(rt.ConsultDataRoundOn()))
 }
 
 // yesNo 把布尔开关打成可读文本（清单里用 enabled/disabled，不用 true/false：

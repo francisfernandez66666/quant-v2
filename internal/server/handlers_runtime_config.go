@@ -48,6 +48,9 @@ type runtimeConfigPatch struct {
 	IndexFallbackSources  *bool `json:"index_fallback_sources"`
 	IndexBreakerScope     *bool `json:"index_breaker_scope"`
 	QuoteFeedIndexEnabled *bool `json:"quote_feed_index_enabled"`
+	// §CONSULT-DATARICH（2026-11-10）咨询补数轮：同为"缺键=开"的指针位，理由同上——
+	// 裸 bool 的 false 会被稀疏 merge 当成"用户显式关了"，一进卡点保存就把出厂开悄悄改掉。
+	ConsultDataRound *bool `json:"consult_data_round"`
 }
 
 // runtimeConfigView 下发"原始值 + 生效值"两栏。
@@ -76,6 +79,9 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 		"index_fallback_sources":   rt.IndexFallbackSourcesOn(),
 		"index_breaker_scope":      rt.IndexBreakerScopeOn(),
 		"quote_feed_index_enabled": rt.QuoteFeedIndexOn(),
+		// §CONSULT-DATARICH：下发**生效值**（指针位原样下发会让"没配过"在前端变成 null）。
+		// 这一枚管的是 LLM 调用次数与咨询延迟，不参与行情装配，故与上面三枚分开注释。
+		"consult_data_round": rt.ConsultDataRoundOn(),
 		// 实际会依次试谁（真源 data.IndexLegOrderFor，卡面不许自己列一份）：
 		// 现场要能一眼回答"东财断了现在谁给点位"，而不是让人推算开关系没开。
 		"index_legs":        data.IndexLegNames(),
@@ -88,7 +94,9 @@ func (s *Server) runtimeConfigView() map[string]interface{} {
 			"index_fallback_sources", "index_breaker_scope",
 			// 券商侧指数白名单走 feed 的策略装配（SetFeedPolicy 即热更），同样不需重启；
 			// 现网这条通道此刻不通，按下也不产生价格影响——但键必须可回显，否则"上了没人知道"。
-			"quote_feed_index_enabled"},
+			"quote_feed_index_enabled",
+			// §CONSULT-DATARICH：补数轮每次咨询现读 cfgMgr.Get().Runtime，保存即生效、无需重启。
+			"consult_data_round"},
 		"restart_required": restart,
 	}
 	// 行情通道现状一并回显：设置页要能回答"现在到底连着没有、覆盖率多少"，
@@ -221,6 +229,11 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 	if req.QuoteFeedIndexEnabled != nil {
 		rt.QuoteFeedIndexEnabled = req.QuoteFeedIndexEnabled
 	}
+	// §CONSULT-DATARICH：只在请求里出现过时才写（稀疏 merge），且不需要额外热更调用——
+	// 引擎每次咨询现读配置快照，落盘发布即生效。
+	if req.ConsultDataRound != nil {
+		rt.ConsultDataRound = req.ConsultDataRound
+	}
 	if err := s.cfg.SetRuntimeConfig(&rt); err != nil {
 		// 未落盘就不审计"已变更"（否则审计变成假账），并如实回 500
 		writeError(w, 500, "runtime 配置保存失败（未落盘）: "+err.Error())
@@ -230,7 +243,7 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 
 	// 审计要回答的是"这次到底动了哪几个键"，所以逐键判"指针是否非 nil"（=请求里出现没出现），
 	// 而不是把整段配置打进去：后者会把没改的键也写成"变更"，审计立刻退化成噪声。
-	changed := make([]string, 0, 11)
+	changed := make([]string, 0, 12)
 	for _, kv := range []struct {
 		name string
 		set  bool
@@ -246,6 +259,7 @@ func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) 
 		{"index_fallback_sources", req.IndexFallbackSources != nil},
 		{"index_breaker_scope", req.IndexBreakerScope != nil},
 		{"quote_feed_index_enabled", req.QuoteFeedIndexEnabled != nil},
+		{"consult_data_round", req.ConsultDataRound != nil},
 	} {
 		if kv.set {
 			changed = append(changed, kv.name)

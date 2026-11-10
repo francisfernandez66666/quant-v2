@@ -45,6 +45,14 @@ func tradingMinutesElapsed(now time.Time) float64 {
 	}
 }
 
+// TradingMinutesElapsed 已流逝交易分钟数的只读导出（转调 tradingMinutesElapsed，零新逻辑）。
+// §CONSULT-DATARICH(2026-11-10)：咨询数据块要报量比，而量比在盘前无意义（累计量为零/集合竞价量，
+// IntradayVolumeRatio 内部把 elapsed<=0 兜成 1 分钟以免除零，那会让盘前量比虚高 240 倍）。
+// 消费方需要自己判"现在有没有盘中口径"，就必须问同一把尺子——各写一份时段判定即是第二把尺。
+// English: read-only export of the elapsed-trading-minutes ruler so callers can decide whether
+// an intraday ratio is meaningful at all, instead of re-implementing session boundaries.
+func TradingMinutesElapsed(now time.Time) float64 { return tradingMinutesElapsed(now) }
+
 // IntradayVolumeRatio 盘中时间窗归一的量比：今日实时累计量折算全天等值后 ÷ 前 N 日均量。
 // elapsed<=0（盘前）或 now 非交易日/停牌缺口按 1 处理（保守：不放大）。
 //
