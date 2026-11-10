@@ -1035,7 +1035,19 @@ def run_round(ContextInfo, moment):
     if positions is not None:
         held_symbols = len([1 for row in positions.values() if (row or {}).get("qty", 0.0) > 0.0])
     now_ts = _now_ts()
-    for symbol in PARAMS.get("symbols") or []:
+    # 2026-11-10 owner ruling: bake the brain-side BULLISH pool (d1 / n-shape
+    # / factor scores) as an OPPORTUNITY pool. Merging it into the scan list
+    # only widens what the rules may LOOK at -- every entry still passes the
+    # full 12-gate chain, so a hot name buys nothing by itself.
+    # English: merge the baked hot_pool (score-sorted, capped) into the scan
+    # symbols, dedup, bounded by hot_pool_max_codes.
+    symbols = list(PARAMS.get("symbols") or [])
+    hot = (PARAMS.get("hot_pool") or {}).get("bullish") or {}
+    if hot:
+        cap = int(PARAMS.get("hot_pool_max_codes", 20))
+        extra = [c for c in hot if c not in symbols][:max(0, cap)]
+        symbols = symbols + extra
+    for symbol in symbols:
         ctx = build_context(ContextInfo, symbol, moment, orders, positions, cash)
         signals = []
         for rule in (rule_take_profit, rule_stop_loss, rule_breakdown_sell):

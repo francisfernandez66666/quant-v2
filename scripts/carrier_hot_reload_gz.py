@@ -42,6 +42,10 @@ SIGNALS_TODAY = os.path.join(DATA_DIR, "signals_today.json")
 
 SHORT_STRATEGY_TYPES = ("high_churn", "break_down", "leader_decay", "leader_decay_v2",
                         "good_news_fade")
+# 利好池参数（owner 2026-11-10 18:42：利好/d1/n 形打分也烘进载体做机会池；
+# 进池只拓宽规则"可看"的票，买入仍要过全部 12 闸，不发明新下单语义）。
+BULLISH_MIN_SCORE = float(os.environ.get("BULLISH_MIN_SCORE", "60"))
+HOT_POOL_MAX = int(os.environ.get("HOT_POOL_MAX", "30"))
 
 
 def die(reason):
@@ -70,6 +74,37 @@ def load_live():
         af = json.load(fh)
     rules = af if isinstance(af, list) else af.get("rules", [])
     return qc, rules
+
+
+def extract_bullish():
+    """signals_today.json 的做多高分信号 → 机会池 {code:{score,source}}（去重取最高分）。"""
+    pool = {}
+    try:
+        with open(SIGNALS_TODAY, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = None
+    rows = data if isinstance(data, list) else (data or {}).get("signals") or []
+    for s in rows:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("direction") or "") in ("做空", "利空"):
+            continue
+        conf = s.get("confidence")
+        try:
+            score = round(float(conf) * 100.0)
+        except (TypeError, ValueError):
+            continue
+        if score < BULLISH_MIN_SCORE:
+            continue
+        c = norm(s.get("code"))
+        if not (len(c) == 6 and c.isdigit()):
+            continue
+        src = str(s.get("strategy_type") or s.get("strategyType")
+                  or s.get("strategy") or "scan")
+        if c not in pool or score > pool[c]["score"]:
+            pool[c] = {"score": score, "source": src[:24]}
+    return pool
 
 
 def extract_bearish():
@@ -157,14 +192,16 @@ def main():
     # sha 载荷必须包含当日利空归因（owner 17:35 每半小时一烘的配套）：否则
     # 「归因变了但白名单没变」会被 sha 闸拦成 NOTHING_TO_DO，利空清单永远烘不进载体。
     bearish = extract_bearish()
+    bullish = extract_bullish()
     payload = json.dumps({"wl": wl, "rules": [r.get("id") for r in rules],
-                          "bearish": bearish}, ensure_ascii=True)
+                          "bearish": bearish, "bullish": bullish}, ensure_ascii=True)
     sha = hashlib.sha256(payload.encode()).hexdigest()
 
     if not args.force and os.path.exists(STATE) and open(STATE).read().strip() == sha:
         print("HOTRELOAD_GZ_NOTHING_TO_DO sha=%s" % sha)
         return 0
-    print("HOTRELOAD_GZ payload sha=%s wl=%d bearish=%d" % (sha, len(wl), len(bearish)))
+    print("HOTRELOAD_GZ payload sha=%s wl=%d bearish=%d bullish=%d" % (
+        sha, len(wl), len(bearish), len(bullish)))
 
     # 1) 快照重建 + 双派生（漂移各自 ABORT，绝不带病烘参）
     try:
@@ -183,6 +220,16 @@ def main():
     r = run(["python3", "scripts/gen_carrier_risk_list.py"])
     if r.returncode != 0:
         die("risklist_failed")
+
+    # 2b) 利好机会池烘参：top-N 高分票进 hot_pool（ASCII 键值，进产物前过 scrub 同规）。
+    top = sorted(bullish.items(), key=lambda kv: -kv[1]["score"])[:HOT_POOL_MAX]
+    doc2 = json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8"))
+    doc2["params"]["hot_pool"] = {
+        "bullish": dict(top),
+        "updated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
+              ensure_ascii=True, indent=2)
 
     # 3) 版本号 +1 自动 bump（vNN-YYYYMMDD）
     params_path = "qmt_gateway/local_executor_params.json"
@@ -225,8 +272,8 @@ def main():
 
     with open(STATE, "w") as fh:
         fh.write(sha)
-    print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d" % (
-        ver, sha_art, len(wl), len(bearish)))
+    print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d bullish=%d" % (
+        ver, sha_art, len(wl), len(bearish), len(top)))
     return 0
 
 

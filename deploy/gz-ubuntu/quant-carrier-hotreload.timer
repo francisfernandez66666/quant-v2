@@ -1,13 +1,12 @@
-# quant-carrier-hotreload.timer — owner 17:37 裁决：只在交易日 08:45–15:30 每半小时烘
-# （夜间/周末不跑；白名单 sha 无变化时幂等 NOTHING_TO_DO，不涨版本不发布）。
-# 08:45 首烘含盘前 LLM 归因合入。
+# quant-carrier-hotreload.timer — owner 18:42 裁决：时效优先，交易日 08:45–15:30
+# 每 5 分钟一烘（sha=白名单+利空归因+利好池，无变化幂等 NOTHING_TO_DO，不涨版本）。
 [Unit]
-Description=Quant carrier hot-reload schedule (Mon-Fri 08:45-15:30 every 30min)
+Description=Quant carrier hot-reload schedule (Mon-Fri 08:45-15:30 every 5min)
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 08:45:00
-OnCalendar=Mon..Fri *-*-* 09..14:00,30:00
-OnCalendar=Mon..Fri *-*-* 15:00:00,15:30:00
+OnCalendar=Mon..Fri *-*-* 08:45,50,55:00
+OnCalendar=Mon..Fri *-*-* 09..14:0/5:00
+OnCalendar=Mon..Fri *-*-* 15:00,05,10,15,20,25,30:00
 Persistent=true
 Unit=quant-carrier-hotreload.service
 
