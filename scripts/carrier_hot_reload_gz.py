@@ -154,13 +154,17 @@ def main():
     wl = (qc.get("qmt", {}) or {}).get("strategies") or []
     if not wl:
         die("whitelist_empty")
-    payload = json.dumps({"wl": wl, "rules": [r.get("id") for r in rules]}, ensure_ascii=True)
+    # sha 载荷必须包含当日利空归因（owner 17:35 每半小时一烘的配套）：否则
+    # 「归因变了但白名单没变」会被 sha 闸拦成 NOTHING_TO_DO，利空清单永远烘不进载体。
+    bearish = extract_bearish()
+    payload = json.dumps({"wl": wl, "rules": [r.get("id") for r in rules],
+                          "bearish": bearish}, ensure_ascii=True)
     sha = hashlib.sha256(payload.encode()).hexdigest()
 
     if not args.force and os.path.exists(STATE) and open(STATE).read().strip() == sha:
         print("HOTRELOAD_GZ_NOTHING_TO_DO sha=%s" % sha)
         return 0
-    print("HOTRELOAD_GZ whitelist sha=%s wl=%d" % (sha, len(wl)))
+    print("HOTRELOAD_GZ payload sha=%s wl=%d bearish=%d" % (sha, len(wl), len(bearish)))
 
     # 1) 快照重建 + 双派生（漂移各自 ABORT，绝不带病烘参）
     try:
@@ -173,8 +177,7 @@ def main():
         if r.returncode != 0:
             die("sync_failed:" + cmd[1])
 
-    # 2) Q3 利空归因：盘前做空/利空候选合入（空=保留上一版）
-    bearish = extract_bearish()
+    # 2) Q3 利空归因：候选已在 sha 前提取，这里落盘合并（空=保留上一版）
     with open("qmt_gateway/risk_list_llm.json", "w", encoding="utf-8") as fh:
         json.dump(bearish, fh, ensure_ascii=True)
     r = run(["python3", "scripts/gen_carrier_risk_list.py"])

@@ -1,10 +1,10 @@
-# quant-carrier-hotreload.timer — 08:30 盘前归因+发版 / 15:10 收盘复核（Persistent 补跑）
+# quant-carrier-hotreload.timer — owner 17:35 裁决：每半小时一烘（白名单 sha 无变化时
+# 幂等 NOTHING_TO_DO，不涨版本不发布）。08:30 盘前那次顺带做 LLM 归因合入。
 [Unit]
-Description=Quant carrier hot-reload schedule (08:30 pre-market, 15:10 post-close)
+Description=Quant carrier hot-reload schedule (every 30min, idempotent)
 
 [Timer]
-OnCalendar=*-*-* 08:30:00
-OnCalendar=*-*-* 15:10:00
+OnCalendar=*:0/30
 Persistent=true
 Unit=quant-carrier-hotreload.service
 
