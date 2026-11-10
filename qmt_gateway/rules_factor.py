@@ -320,8 +320,15 @@ PARAMS_TEMPLATE = {
     "symbol_head_len": 6,
     "min_cash_reserve": 1000.0,
     "order_amount_cap": 20000.0,
-    "daily_buy_cap": 100000.0,
-    "min_order_amount": 1000.0,
+    # 2026-11-10 FIX (PLAN_CARRIER_RISK_REBUILD section 1.3 item 13): these two
+    # module-local fallbacks used to disagree with the baked account truth
+    # (min_order_amount 1000 vs Go factory 10000, daily_buy_cap 100000 vs the
+    # account's 150000) -- the exact ambiguity that let sub-10k shreds slip
+    # through the local chain. They must mirror the baked top-level values;
+    # the baked keys are the single source, these only keep the module
+    # importable standalone.
+    "daily_buy_cap": 150000.0,
+    "min_order_amount": 10000.0,
 }
 
 

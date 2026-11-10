@@ -54,6 +54,9 @@ export default function ExecutionRiskPanel() {
   const [saving, setSaving] = useState(false)
   const [form, setForm] = useState(null)
   const [baseline, setBaseline] = useState('')
+  // 2026-11-10 Q8b：记录 qmt.enabled 原值，用于「半自动模式」来源标注（enabled=false =
+  // 只停自动执行，参数照常可读可保存，实仓读数走手动账口径）。
+  const [liveEnabled, setLiveEnabled] = useState(null)
   const [concept, setConcept] = useState(null)
   const [conceptErr, setConceptErr] = useState('')
 
@@ -67,8 +70,17 @@ export default function ExecutionRiskPanel() {
     try {
       const fetchCfg = getApiFn('fetchQMTConfig')
       if (!fetchCfg) throw new Error('实盘配置接口不可用')
-      const cfg = await fetchCfg()
+      // 2026-11-10 Q10：显式 20s 超时 + 耗时读数。根因背景：服务端 GET /api/config/qmt
+      // 即时返回（qmt.go diag 实证），「请求超时」大概率出在传输/排队层而非 handler；
+      // 10s 默认值在排队场景下会把面板打成「读取失败，禁止保存」。console 里与
+      // [q10-timing] 前缀的网络层读数两侧对比即可定位具体接口。
+      const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+      const cfg = await fetchCfg({ timeout: 20000 })
+      if (typeof console !== 'undefined') {
+        console.info('[q10-timing] 执行层风控面板 GET /api/config/qmt →', Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - t0) + 'ms')
+      }
       if (!cfg || typeof cfg !== 'object') throw new Error('返回载荷为空/非对象')
+      setLiveEnabled(cfg.enabled === true)
       const rg = cfg.risk_gate || {}
       const next = {
         mode: String(cfg.mode || 'manual'),
@@ -200,6 +212,14 @@ export default function ExecutionRiskPanel() {
         <div role="alert" style={{ margin: '0 0 10px', padding: '8px 10px', borderRadius: 4, fontSize: 12, background: 'var(--app-danger-bg, #fdecee)', border: '1px solid var(--app-border, #e0e0e0)' }}>
           <div style={{ fontWeight: 600 }}>⛔ 读取失败，禁止保存</div>
           <div style={{ marginTop: 4 }}>{error || '实盘配置读取失败（原因未知），已禁止保存以免覆盖配置。'}</div>
+        </div>
+      )}
+      {/* 2026-11-10 Q8b：数据来源标注——qmt.enabled=false（半自动模式）时面板照常显示，
+          并明确本面数据来自账号落库配置（非柜台读数），实仓读数走手动账口径。 */}
+      {liveEnabled === false && state === 'loaded' && (
+        <div style={{ margin: '0 0 10px', padding: '8px 10px', borderRadius: 4, fontSize: 12, background: 'var(--app-warn-bg, #fff7e6)', border: '1px solid var(--app-border, #e0e0e0)' }}>
+          <b>半自动模式</b>（qmt.enabled=false＝只停自动执行）：下方参数照常可读可保存（不含 token 的字段不变）。
+          数据来源：账号落库配置；实仓持仓/资金读数按手动账口径更新，买卖指令在消息/建议面供人工执行。
         </div>
       )}
       <div style={{ ...rowStyle, gap: 8 }}>

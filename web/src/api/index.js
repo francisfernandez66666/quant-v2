@@ -638,11 +638,21 @@ export async function request(path, opts = {}) {
 
 // requestInner 单轮请求实现：每次尝试独立 AbortController（超时/外部取消），
 // GET 允许一次重试（网络错误或 502/503/504），其余方法一律只发一次。
+// 2026-11-10 Q10（设置读取超时 debug）：对设置页配置类 GET 打一次性耗时读数
+// （console.info，[q10-timing] 前缀）。根因排查的背景：GET /api/config/qmt 服务端
+// 即时返回（qmt.go diag 实证）而前端报「请求超时」——耗时读数把「handler 慢」与
+// 「传输/排队慢」分开，云端排查时浏览器 console 与服务端日志两侧对比即可定位。
+const Q10_TIMING_PREFIX = '[q10-timing]'
+const Q10_TIMING_MATCH = /^\/api\/(config\/|qmt\/state|alerts)/
+function q10Now() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+}
 async function requestInner(path, opts = {}) {
   // 拼接完整请求地址：服务器基础地址 + 相对路径
   const base = baseUrl()
   const method = String(opts.method || 'GET').toUpperCase()
   const timeoutMs = opts.timeout || REQUEST_TIMEOUT
+  const q10T0 = Q10_TIMING_MATCH.test(path) ? q10Now() : 0
   let retried = false
 
   // 单次请求执行：base 为基础地址（可为自定义服务器或同源空串）
@@ -690,6 +700,10 @@ async function requestInner(path, opts = {}) {
   try {
     res = await doFetch(base)
   } catch (e) {
+    // 2026-11-10 Q10：超时/网络失败同样出耗时读数（定位「服务端即时返回但前端超时」的关键侧写）
+    if (q10T0 && typeof console !== 'undefined') {
+      console.info(Q10_TIMING_PREFIX, method, path, '失败', Math.round(q10Now() - q10T0) + 'ms', 'timeout=' + timeoutMs, (e && e.name) || '')
+    }
     // 外部取消（页面卸载）：原样抛出 AbortError，调用方不弹错误提示
     if (e && e.name === 'AbortError') {
       if (opts.signal && opts.signal.aborted) throw e
@@ -716,6 +730,11 @@ async function requestInner(path, opts = {}) {
   // §N-10：GET 的 5xx 瞬时故障重试一次；POST/PUT/DELETE 永不重发（计费/写路径）
   if (!retried && method === 'GET' && RETRYABLE_STATUS.has(res.status)) {
     res = await retryOnce(() => doFetch(base))
+  }
+
+  // 2026-11-10 Q10：成功拿到响应头即出耗时读数（含状态码与是否重试）
+  if (q10T0 && typeof console !== 'undefined') {
+    console.info(Q10_TIMING_PREFIX, method, path, 'HTTP ' + res.status, Math.round(q10Now() - q10T0) + 'ms', retried ? '(重试轮次)' : '')
   }
 
   // 401 表示令牌过期，清除本地登录态
@@ -1100,8 +1119,11 @@ export async function switchQMTBroker(broker) {
 // 对应 GET /api/config/qmt，返回 { enabled, mode, gateway_url, token_masked, price_type,
 //   fixed_amount, max_positions, initial_capital, strategies, daily_max_buys,
 //   daily_budget_amount, auto_sell, miss_heartbeat_sec, known_strategies, halted }
-export async function fetchQMTConfig() {
-  return request('/api/config/qmt')
+export async function fetchQMTConfig(opts = {}) {
+  // 2026-11-10 Q10：允许调用点显式放宽超时（设置页执行层风控面板传 20s）——
+  // 服务端 GET 本身即时返回（qmt.go diag 实证），超时大概率出在传输/排队层，
+  // 10s 默认值在这种场景下会把面板打成「读取失败，禁止保存」。
+  return request('/api/config/qmt', opts)
 }
 
 /** 实盘配置保存：局部更新（仅传需要修改的字段，后端校验后进入待生效队列，交易时段自动生效；

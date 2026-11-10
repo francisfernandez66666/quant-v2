@@ -475,7 +475,12 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     //    判据随之从 canStrict('trading_admin') 换成 canLiveTrading()——**早退本身不许消失**，
     //    零权限位成员仍然一条请求都不发（§0929GATE-403 的立意不变）。
     expect(read('pages/Dashboard.jsx')).toMatch(/async function loadQMT\(\) \{\s*(?:\/\/[^\n]*\n\s*)*if \(!canLiveTrading\(\)\) return/)
-    expect(read('pages/MsgCenter.jsx')).toMatch(/async function load\(\) \{\s*if \(!admin\) \{/)
+    // 2026-11-10 Q9（owner 裁决）：消息读面对登录用户放行——MsgCenter load() 不再按角色早退；
+    // 静态锁反转为「读面无角色门 + admin 判据只留在写路径按钮上」。
+    const msgcenter = read('pages/MsgCenter.jsx')
+    expect(msgcenter).toMatch(/async function load\(\) \{\s*(?:\/\/[^\n]*\n\s*)*const token = loadGuard\.begin\(\)/)
+    expect(msgcenter.match(/if \(!admin\) \{/g) || [], 'Q9：读面不得再有 !admin 早退').toHaveLength(0)
+    expect(msgcenter, 'Q9：写路径 admin 门必须保留（删除/清空/模拟卖出）').toMatch(/admin && <Button/)
     expect(read('pages/Consult.jsx')).toMatch(/if \(!admin\) \{\s*setLlmGated\(true\)/)
     // §PAGING-DEFAULT（2026-11-01）：角标改走 fetchAlertTotal()（只取 1 条 + X-Total-Count），
     // 判据的意图不变——**仍是「admin 才轮询、且必须早退」**，只是取数函数换了。

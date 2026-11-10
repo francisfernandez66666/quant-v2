@@ -675,28 +675,45 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		return
 	}
 
-	// 熔断健康探测（节流：miss_heartbeat_sec/2）
-	// §CB-TICKWINDOW（2026-09-21 误熔实录）：只在连续竞价窗口探测/计失联。QMT 内嵌桥的心跳由
-	// handlebar-tick 驱动，盘前/开盘竞价（9:15-9:30）与收盘竞价（14:57-15:00）行情不推进，
-	// 桥必然静默——按失联口径会计时误熔（当日 09:10:27 误熔、09:25-09:30 断流）。真断线仍有
-	// 双保险：网关 disconnect 回报即时 SetTripped 熔断 + 9:30/13:00 后探测 2 分钟内熔断。
-	if data.IsContinuousTrade(time.Now()) {
-		ctrl.HealthCheck()
+	// 2026-11-10 Q8（§1.3 第 14 项④，owner 裁决）：qmt.enabled=false = 半自动模式 =
+	// 只停自动执行，建议链照常输出（买卖指令推到消息/建议面供人工执行），绝不当作
+	// "量化系统停摆"。旧实现在这里 !ctrl.Enabled() 直接整链早退，断链/关闭时建议面
+	// 一次都不响。放开后执行侧仍有三层既有安全网兜底：
+	//   ① autoExecuteRealSellsRound 的 Enabled 闸（disabled 时只打节流告警不下单）；
+	//   ② controller.placeOrder 底层 "qmt disabled" 硬拒（controller.go，一切单都不可能出去）；
+	//   ③ autoPlaceScaled 的自动下单闸（engine.go，买入入口原样保留）。
+	// 取数语义不动：acctBook = accountBookFor（manual_book_source.go 两维独立选源，原样复用）。
+	if !data.IsActiveSession(time.Now()) {
+		return
 	}
-	// §W6-a 周期对账（默认 5min 节流）：首尔侧主动拉网关持仓落库，终结"双向对账均不存在"的盲区
-	ctrl.MaybeReconcile(5 * time.Minute)
-	// §R4-1 撤单闭环（30s 节流 + 每日收盘清单）：未成交超时自动撤 / 占位行降级 / 收盘清单，
-	// 根除"已报委托悬置整天虚耗买入纪律预算"的悬置态（内部自节流，5s 循环调用无额外开销）
-	if res := ctrl.SweepOrders(time.Now()); res != nil {
-		_ = res // 摘要日志已在 SweepOrders 内按需打印
-	}
-	// §BUY-REPRICE（2026-11-05，owner「根据 vwap 动态更新买入价格」）：紧挨着撤单闭环跑——
-	// 同一条撤单出口（Controller.RequestCancel）、同一个禁撤窗、同一份动作快照，
-	// 只是触发条件不同。缺省关（vwap_reprice_pct=0）时这个调用一次查询都不做。
-	e.repriceStaleBuys(ctrl, e.snapshotQuotes(), time.Now())
-	// §WS-B 券商交割单三方对账（默认关闭；启用后每日 settle_at 后对账一次，差异告警+可选补记）
-	if sc := ctrl.Config().Settle; sc.Enabled {
-		ctrl.MaybeSettleDay(data.TradingDayDate(time.Now()), sc.Mode, sc.At, true)
+	liveExec := ctrl.Enabled()
+
+	// 网关相关的执行辅助（健康探测/对账/撤单闭环/改价/交割对账）只在 Enabled 时跑——
+	// 与旧行为逐字一致：disabled（断链/半自动）时这些调用一次都不发生。
+	if liveExec {
+		// 熔断健康探测（节流：miss_heartbeat_sec/2）
+		// §CB-TICKWINDOW（2026-09-21 误熔实录）：只在连续竞价窗口探测/计失联。QMT 内嵌桥的心跳由
+		// handlebar-tick 驱动，盘前/开盘竞价（9:15-9:30）与收盘竞价（14:57-15:00）行情不推进，
+		// 桥必然静默——按失联口径会计时误熔（当日 09:10:27 误熔、09:25-09:30 断流）。真断线仍有
+		// 双保险：网关 disconnect 回报即时 SetTripped 熔断 + 9:30/13:00 后探测 2 分钟内熔断。
+		if data.IsContinuousTrade(time.Now()) {
+			ctrl.HealthCheck()
+		}
+		// §W6-a 周期对账（默认 5min 节流）：首尔侧主动拉网关持仓落库，终结"双向对账均不存在"的盲区
+		ctrl.MaybeReconcile(5 * time.Minute)
+		// §R4-1 撤单闭环（30s 节流 + 每日收盘清单）：未成交超时自动撤 / 占位行降级 / 收盘清单，
+		// 根除"已报委托悬置整天虚耗买入纪律预算"的悬置态（内部自节流，5s 循环调用无额外开销）
+		if res := ctrl.SweepOrders(time.Now()); res != nil {
+			_ = res // 摘要日志已在 SweepOrders 内按需打印
+		}
+		// §BUY-REPRICE（2026-11-05，owner「根据 vwap 动态更新买入价格」）：紧挨着撤单闭环跑——
+		// 同一条撤单出口（Controller.RequestCancel）、同一个禁撤窗、同一份动作快照，
+		// 只是触发条件不同。缺省关（vwap_reprice_pct=0）时这个调用一次查询都不做。
+		e.repriceStaleBuys(ctrl, e.snapshotQuotes(), time.Now())
+		// §WS-B 券商交割单三方对账（默认关闭；启用后每日 settle_at 后对账一次，差异告警+可选补记）
+		if sc := ctrl.Config().Settle; sc.Enabled {
+			ctrl.MaybeSettleDay(data.TradingDayDate(time.Now()), sc.Mode, sc.At, true)
+		}
 	}
 
 	// §GAP2-W2 实盘建议定向化（I-4）：只读主账号（=QMT 归属账号，实盘仅 admin 开启）的持仓，
@@ -1315,6 +1332,14 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 	}
 	log.Printf("[qmt] M8 兜底触发: 组合市值 %.0f 自峰值 %.0f %s —— 全部自动卖出",
 		total, peak, verdict.Reason)
+	// 2026-11-10 Q8（半自动模式）：qmt.enabled=false 时 M8 不自动下单（placeOrder 底层
+	// 也会硬拒），但峰值维护照常、触发事件照常留痕——半自动下由 owner 在券商 App 人工处置。
+	if !ctrl.Enabled() {
+		opslog.DayOnce("m8-gate:qmt-disabled", func() {
+			opslog.Logf("quant", "M8 兜底触发但 qmt.enabled=false（半自动）：不自动下单，请人工处置 组合市值=%.0f 峰值=%.0f", total, peak)
+		})
+		return
+	}
 	for _, p := range positions {
 		price := p.CostPrice
 		if q := quotes[pureTsCode(p.TsCode)]; q != nil && q.Price > 0 {

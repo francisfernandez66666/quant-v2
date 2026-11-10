@@ -1209,6 +1209,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 // token 只回脱敏形态（§GAP2-W2 同口径），提交脱敏哨兵或空串时后端保持原值。
 // English: GET /api/config/qmt returns the account's live-trading config with the token masked.
 func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
 	cfg := s.cfg.GetQMTConfigFor(userIDFor(r))
 	// 诊断日志：排查「开关刷新后变回关闭」——记录每次读取的真实账号与 enabled 值。
 	log.Printf("[diag-qmt] GET /api/config/qmt user=%s operator=%s enabled=%v", userIDFor(r), s.operatorID(), cfg.Enabled)
@@ -1234,6 +1235,8 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 			view[k] = v
 		}
 	}
+	// 2026-11-10 Q10：服务端耗时读数（与前端 [q10-timing] 两侧对比定位「前端超时但服务端即时返回」）。
+	log.Printf("[diag-qmt] GET /api/config/qmt user=%s 耗时=%dms（handler 内）", userIDFor(r), time.Since(t0).Milliseconds())
 	writeJSON(w, 200, view)
 }
 

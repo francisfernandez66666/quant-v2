@@ -34,23 +34,20 @@ describe('§PERM-GATE MsgCenter 写入口按角色显隐', () => {
   beforeEach(() => { localStorage.clear(); vi.clearAllMocks() })
   afterEach(() => { localStorage.clear() })
 
-  it('普通用户：提醒一条都不拨，写入口不渲染', async () => {
-    // §0929GATE-403：本页的提醒列表来自 GET /api/metrics/alerts（server.go:617 adminMiddleware，
-    // 成员态后端实测 403——见 internal/server/r7_endpoints_test.go:221 的方向锁）。
-    // 旧形态是"成员进来吃一发 403，再由 SSE 刷新与 60s 兜底反复吃"；现在按角色在 load() 里
-    // 早退，所以成员态**根本不会有提醒卡**，原用例那句"提醒卡能渲染"在新语义下不成立。
-    // 这里把它换成更强的三条锁：零请求 + 「未拉取」独立态 + 写入口缺席，
-    // 写入口的正常渲染由下面 admin 用例反证（同一批控件，管理员必须出现）。
-    // English: member sessions now never dial the admin-only alerts endpoint; assert
-    // zero requests + the dedicated "not fetched" state + absent write entries.
+  it('普通用户：消息列表照常拉取（Q9 读面放行），写入口不渲染', async () => {
+    // 2026-11-10 Q9（owner 裁决）：消息读面（GET /api/alerts = authMiddleware）对登录用户
+    // 全员放行——成员也走 fetchAlerts 拉列表；admin 判据只保留在写路径
+    // （清空全部/删除/模拟卖出按钮）。旧「成员未拉取」语义随 load() 的角色早退一并摘除。
+    // English: 2026-11-10 Q9 — the alerts read path is open to every logged-in user; the admin
+    // gate now lives only on the write affordances (clear/delete/paper-sell buttons).
     setRole('user')
     render(<MsgCenter />)
-    await waitFor(() => expect(screen.getByText(/系统提醒未拉取/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/止盈提醒·600580/)).toBeInTheDocument())
     const api = await import('../api/index.js')
-    expect(api.fetchAlerts).toHaveBeenCalledTimes(0)
-    expect(screen.queryByText(/止盈提醒·600580/)).not.toBeInTheDocument()
+    expect(api.fetchAlerts).toHaveBeenCalledTimes(1)
     expect(screen.queryByText('清空全部')).not.toBeInTheDocument()
     expect(screen.queryByText('模拟卖出')).not.toBeInTheDocument()
+    expect(screen.queryByText('✕')).not.toBeInTheDocument()
     // 只读入口保留：立即复盘对成员可见（POST /api/review/positions 为 auth 守卫）
     expect(screen.getByText('立即复盘')).toBeInTheDocument()
   })

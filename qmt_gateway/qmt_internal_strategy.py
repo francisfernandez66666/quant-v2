@@ -105,6 +105,15 @@ _STATE = {
     "ops": [],          # [epoch, ...] of place/cancel attempts this session
     "cancel_tried": [],  # order ids already cancelled this session (see below)
     "warned": {},
+    # 2026-11-10 rebuild (PLAN_CARRIER_RISK_REBUILD section 1.3): the counter
+    # ORDER table alone is a SECONDS-late idempotency source, which is how the
+    # same intent was re-sent in the open window. Every successful place now
+    # registers HERE immediately, and buys are deduped per (day, symbol) too:
+    # one buy intent per symbol per day, regardless of short code.
+    "sent": set(),       # {(day, symbol, short_code), ...} placed this session
+    "buy_intents": set(),  # {(day, symbol), ...} buy intents sent this session
+    "buy_amounts": {},   # {(day, symbol): amount} session buy total per symbol
+    "buy_seen": {},      # {symbol: [epoch, ...]} Q1 confirm-window rounds
 }
 
 
@@ -336,7 +345,14 @@ def _to_float(value, default):
 
 
 def _positions():
-    """{symbol: {qty, cost}} from the counter, or None when unreadable."""
+    """{symbol: {qty, cost, can_use, market_value}} or None when unreadable.
+
+    2026-11-10 rebuild: can_use (m_nCanUseVolume, the T+1 sellable qty) and
+    market_value (m_dMarketValue) used to be left unread, which blinded both
+    the sell chain (no T+1 check) and the concentration buckets (no mark-to-
+    market value). Missing optional fields stay None -- callers fail closed
+    on None, they never fold it into zero.
+    """
     raw = _counter_rows("POSITION")
     if raw is None:
         return None
@@ -348,8 +364,242 @@ def _positions():
         out[symbol] = {
             "qty": _to_float(_pick(getattr(item, "m_nVolume", None), getattr(item, "volume", None)), 0.0),
             "cost": _to_float(_pick(getattr(item, "m_dOpenPrice", None), getattr(item, "open_price", None)), 0.0),
+            "can_use": _to_float(_pick(getattr(item, "m_nCanUseVolume", None),
+                                       getattr(item, "can_use_volume", None)), 0.0),
+            "market_value": _to_float(_pick(getattr(item, "m_dMarketValue", None),
+                                            getattr(item, "market_value", None)), 0.0),
         }
     return out
+
+
+def _deals():
+    """Today's fills from the DEAL table, or None when unreadable.
+
+    The day-loss fuse (account truth day_loss_limit_pct=3.5) needs REALIZED
+    pnl, and realized pnl only exists in fills -- the ORDER table never carries
+    it. Field families are probed one by one exactly like the bridge did
+    (qmt_bridge_strategy.py embed_trades_rows); direction is resolved by the
+    op codes baked in PARAMS, never by one ambiguous enum field.
+    """
+    raw = _counter_rows("DEAL")
+    if raw is None:
+        return None
+    op_buy = int(PARAMS.get("op_type_buy", 23))
+    op_sell = int(PARAMS.get("op_type_sell", 24))
+    out = []
+    for item in raw:
+        symbol = str(_pick(getattr(item, "m_strInstrumentID", None),
+                           getattr(item, "stock_code", None),
+                           getattr(item, "m_strCode", None)) or "")
+        price = _to_float(_pick(getattr(item, "m_dPrice", None),
+                                getattr(item, "traded_price", None)), 0.0)
+        qty = _to_float(_pick(getattr(item, "m_nVolume", None),
+                              getattr(item, "traded_volume", None)), 0.0)
+        amount = _to_float(_pick(getattr(item, "m_dTradeAmount", None),
+                                 getattr(item, "amount", None)), 0.0)
+        if amount <= 0.0:
+            amount = price * qty
+        otype = _to_float(_pick(getattr(item, "m_nOrderType", None),
+                                getattr(item, "order_type", None)), 0.0)
+        if int(otype) == op_sell:
+            side = "sell"
+        elif int(otype) == op_buy:
+            side = "buy"
+        else:
+            side = ""
+        out.append({"symbol": symbol, "side": side, "price": price,
+                    "qty": qty, "amount": amount})
+    return out
+
+
+def _vwap_of(tick):
+    """Session VWAP approximated from the tick's cumulative amount/volume.
+
+    Owner ruling (Q6): this approximation is accepted; volume<=0 or a reading
+    that blatantly disagrees with the last price is VWAP MISSING, and a missing
+    VWAP skips the buy (the same fail-closed posture as the Go side's
+    autoPlaceScaled). Returns (vwap_or_None, reason).
+    """
+    volume = tick.get("volume")
+    amount = tick.get("amount")
+    last = tick.get("last_price")
+    if not volume or volume <= 0.0 or not amount or amount <= 0.0:
+        return None, "vwap_missing"
+    vwap = amount / volume
+    if not last or last <= 0.0:
+        return None, "vwap_missing"
+    if vwap < last * float(PARAMS.get("vwap_sanity_lo", 0.5)) or \
+            vwap > last * float(PARAMS.get("vwap_sanity_hi", 2.0)):
+        return None, "vwap_suspect"
+    return vwap, ""
+
+
+def _risk_reason(symbol):
+    """Reject reason when the symbol carries a baked risk tag, else "".
+
+    Q3 final: the static floor (000520 + whatever else the owner bakes) never
+    expires, the daily LLM list is baked fresh every morning and is same-day
+    valid. A hit is a HARD exclude -- no down-weighting, reason=llm_bearish
+    for dynamic rows so the log pane says why.
+    """
+    head = symbol.split(".")[0]
+    for entry in (PARAMS.get("risk_list_static") or []):
+        if str(entry).split(".")[0] == head:
+            return "static_risk_list"
+    for entry in (PARAMS.get("risk_list_dynamic") or []):
+        if str(entry).split(".")[0] == head:
+            return "llm_bearish"
+    return ""
+
+
+def _buy_confirmed(symbol, now_ts):
+    """Q1 confirm window: a buy needs N observed rounds spaced >= gap seconds.
+
+    Session memory only -- after a restart the count starts over (better to
+    miss an entry than to front-run it). Returns (ok, reason).
+    """
+    rounds = int(PARAMS.get("buy_confirm_rounds", 2))
+    gap = float(PARAMS.get("buy_confirm_min_gap_sec", 60))
+    seen = _STATE["buy_seen"].setdefault(symbol, [])
+    seen.append(now_ts)
+    del seen[:-rounds]
+    if len(seen) < rounds:
+        return False, "confirm_rounds_%d_of_%d" % (len(seen), rounds)
+    if seen[-1] - seen[-2] < gap:
+        return False, "confirm_gap_pending"
+    return True, ""
+
+
+def _go_admitted(kind):
+    """rule_strategy_admit, actually called (the 0-call-site defect, closed).
+
+    Maps a ported rule kind to the Go strategy id the whitelist is keyed by:
+    the baked strategy_kind_to_go table first, then the factor/pattern id
+    prefixes pass through verbatim. An unmappable kind is REFUSED -- a rule
+    nobody can attribute must never become a live order.
+    """
+    go_id = (PARAMS.get("strategy_kind_to_go") or {}).get(kind)
+    if not go_id:
+        if str(kind).startswith(str(PARAMS.get("factor_id_prefix", "fac_"))):
+            go_id = kind
+        elif str(kind).startswith(str(PARAMS.get("pattern_id_prefix", "pat_"))):
+            go_id = kind
+    if not go_id:
+        return False
+    try:
+        return bool(rule_strategy_admit(PARAMS, go_id))
+    except Exception:  # noqa: BLE001 - an unreadable whitelist refuses, never admits
+        return False
+
+
+def _intent_of(signal, held_qty):
+    """Explicit intent tag (owner 11:05 ruling -- never inferred from size).
+
+    position_qty>0 => add, ==0 => new; sell => reduce; a t-prefixed short code
+    => t_leg. The min-order-amount gate reads ONLY this tag.
+    """
+    short = str(signal.get("short_code") or "")
+    if short.startswith("t0:") or short.startswith("t:"):
+        return "t_leg"
+    if signal.get("side") == "sell":
+        return "reduce"
+    if (held_qty or 0.0) > 0.0:
+        return "add"
+    return "new"
+
+
+def _day_loss_pct(deals, positions):
+    """Realized day pnl as a fraction of nothing yet -- returns (pnl, ok).
+
+    Sell fills booked against the position's open price; a sell whose cost is
+    unreadable makes the whole reading UNPROVABLE (ok=False) and the caller
+    stops buying for the day rather than guessing the account is fine.
+    """
+    if deals is None:
+        return None, False
+    pnl = 0.0
+    for row in deals:
+        if row.get("side") != "sell":
+            continue
+        held = (positions or {}).get(row.get("symbol") or "") or {}
+        cost = held.get("cost")
+        if not cost or cost <= 0.0:
+            return None, False
+        pnl += (row.get("price", 0.0) - cost) * row.get("qty", 0.0)
+    return pnl, True
+
+
+def _asset_guard_ok(total, cash, positions):
+    """Dimension guard on the total-asset reading (the 11-06 pollution).
+
+    From 11-06 the exported target jumped from ~70k to 4-7M because a polluted
+    total inflated room to infinity. The counter itself provides the sanity
+    check: total must cover both the cash and the held value, and must stay
+    within asset_guard_factor of them. An implausible total refuses every buy.
+    """
+    if not total or total <= 0.0:
+        return False
+    mv = 0.0
+    for _sym, row in (positions or {}).items():
+        value = (row or {}).get("market_value") or 0.0
+        if value <= 0.0:
+            value = ((row or {}).get("qty") or 0.0) * ((row or {}).get("cost") or 0.0)
+        mv += value
+    floor = max(cash or 0.0, mv)
+    if total < floor:
+        return False
+    factor = float(PARAMS.get("asset_guard_factor", 10.0))
+    return total <= floor * factor + (cash or 0.0) + mv
+
+
+def _bucket_view(symbol, positions, tick, session_buy_amount):
+    """Fill the concentration buckets the sizing chain used to abstain on.
+
+    stock_value is ALWAYS computed (held marked price + this session's buys);
+    industry/cluster are known only when the baked ownership maps carry the
+    symbol -- an unknown bucket refuses the BUY at the gate (fail closed),
+    so here the unknown simply reports known=False.
+    """
+    price = tick.get("last_price")
+    stock_value = session_buy_amount or 0.0
+    for sym, row in (positions or {}).items():
+        qty = (row or {}).get("qty") or 0.0
+        if qty <= 0.0:
+            continue
+        mark = price if sym == symbol else ((row or {}).get("market_value") or 0.0) / qty
+        if not mark or mark <= 0.0:
+            mark = (row or {}).get("cost") or 0.0
+        stock_value += qty * mark
+    industry = (PARAMS.get("industry_map") or {}).get(symbol)
+    concept = (PARAMS.get("concept_map") or {}).get(symbol)
+    industry_value = 0.0
+    industry_known = isinstance(industry, str) and bool(industry)
+    concept_value = 0.0
+    cluster_set = isinstance(concept, str) and bool(concept)
+    if industry_known or cluster_set:
+        for sym, row in (positions or {}).items():
+            qty = (row or {}).get("qty") or 0.0
+            if qty <= 0.0:
+                continue
+            mark = ((row or {}).get("market_value") or 0.0) / qty
+            if not mark or mark <= 0.0:
+                mark = (row or {}).get("cost") or 0.0
+            value = qty * mark
+            if industry_known and (PARAMS.get("industry_map") or {}).get(sym) == industry:
+                industry_value += value
+            if cluster_set and (PARAMS.get("concept_map") or {}).get(sym) == concept:
+                concept_value += value
+        if industry_known:
+            industry_value += session_buy_amount or 0.0
+        if cluster_set:
+            concept_value += session_buy_amount or 0.0
+    return {
+        "stock_value": stock_value,
+        "industry_known": industry_known,
+        "industry_value": industry_value,
+        "cluster_set": cluster_set,
+        "cluster_value": concept_value,
+    }
 
 
 def _cash():
@@ -505,6 +755,10 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         if not any(short.startswith(prefix) for prefix in buy_prefixes):
             continue
         spent += row.get("traded", 0.0) * row.get("price", 0.0)
+    # 2026-11-10: the counter ORDER table is seconds late -- the session's own
+    # placed-but-not-yet-reported buys must count too (counter fills UNION
+    # session sends; neither alone is the day total).
+    spent += float(_STATE["buy_amounts"].get((day, symbol), 0.0) or 0.0)
     return {
         "symbol": symbol,
         "day": day,
@@ -517,12 +771,14 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "last_price": tick.get("last_price"),
         "prev_close": tick.get("prev_close"),
         "volume": tick.get("volume"),
+        "amount": tick.get("amount"),
         "ask1": tick.get("ask1"),
         "bid1": tick.get("bid1"),
         "ref_price": ref if ref is not None else tick.get("prev_close"),
         "volume_ratio": ratio,
         "position_qty": held.get("qty"),
         "position_cost": held.get("cost"),
+        "can_use_qty": held.get("can_use"),
         "available_cash": cash,
         "daily_buy_total": spent,
         "ops_last_minute": _ops_budget_used(),
@@ -551,14 +807,14 @@ def _account_total_asset():
 def _sizing_view(ctx, positions):
     """The account-level view the sizing chain needs on top of the per-symbol ctx.
 
-    Deliberately absent (and the chain abstains on them, which is the point):
-      * sector/cluster buckets -- this box has no sector list and no index weights
-        (G3 readout 11-04: get_sector_list / get_index_weight are not exposed), so
-        the 35%/35%/40% concentration caps do NOT participate rather than guessing;
-      * market dims (emotion phase, breadth, index change) -- not computable from a
-        two-code universe; they land the round in the blind spot, which caps the
-        target at missing_key_target_cap and stops T. That is the designed
-        consequence of "no external data inside the sandbox", not a bug to hide.
+    2026-11-10 rebuild: the buckets this view used to leave empty
+    (stock_value / pending_buys / industry_known / cluster_set / the T legs)
+    are exactly why every concentration cap abstained while the account went
+    to 98.9% one name. They are computed per round now (see _bucket_view);
+    market dims (emotion phase, breadth, index change) remain ABSENT on
+    purpose -- not computable from a tick-only sandbox, they land the round in
+    the blind spot, which caps the target at missing_key_target_cap. That is
+    the designed consequence of "no external data inside the sandbox".
     """
     out = dict(ctx or {})
     out["total_asset"] = _account_total_asset()
@@ -575,6 +831,17 @@ def _sizing_view(ctx, positions):
         entry["price"] = price
         live.append(entry)
     out["positions_live"] = live
+    # T legs: this carrier does not place T legs itself (t orchestration is a
+    # separate batch), so both are honestly zero -- never absent, which the
+    # target layer would read as an unprovable account.
+    out.setdefault("t_buy_leg_value", 0.0)
+    out.setdefault("t_sell_leg_value", 0.0)
+    bucket = out.get("bucket_view") or {}
+    for key in ("stock_value", "industry_known", "industry_value",
+                "cluster_set", "cluster_value"):
+        if key in bucket:
+            out[key] = bucket[key]
+    out.setdefault("pending_buys", [])
     return out
 
 
@@ -716,9 +983,13 @@ def _cancel(order_id):
 def run_round(ContextInfo, moment):
     """One round: rebuild from the counter, decide, then act. Returns a summary.
 
-    Never raises. A round that cannot see the counter places nothing -- the
-    same fail-closed posture as the local executor, and for the same reason:
-    "we cannot prove we have not already sent this" is not a licence to send.
+    2026-11-10 rebuild -- the gate order below IS the plan's section 2 order
+    (engine.autoPlace -> signalctl.Admit -> ordbudget -> risk.Gate 12 gates ->
+    execution quality -> place). Every missing reading REFUSES THE BUY
+    (fail-closed); "abstain = allow" is the defect that filled the account
+    with one name at 98.9% and it is reversed here line by line.
+
+    Never raises. A round that cannot see the counter places nothing.
     """
     summary = {"placed": [], "skipped": [], "cancelled": [], "reason": ""}
     orders, ok = _live_orders()
@@ -726,15 +997,33 @@ def run_round(ContextInfo, moment):
         summary["reason"] = "counter_order_table_unreadable"
         _warn_once("order_table", summary["reason"])
         return summary
-    sent = set(row["short_code"] for row in orders)
+    counter_codes = set(row["short_code"] for row in orders)
     positions = _positions()
     cash = _cash()
+    total = _account_total_asset()
+    deals = _deals()
     if positions is None:
-        # Fail-closed on the SELL side only: without the position table the exit
-        # rules have no qty, so they decline (they never size from memory). Buys
-        # stay possible because their caps are cash + the counter order table.
+        # Fail-closed on BOTH sides now: without the position table the exits
+        # have no qty AND the buys have no concentration proof (single-stock /
+        # max-positions buckets are unprovable), so neither may fire.
         summary["reason"] = "counter_position_table_unreadable"
-        _warn_once("position_table", "POSITION table unreadable: exits decline this round")
+        _warn_once("position_table", "POSITION table unreadable: buys and exits decline this round")
+    if deals is None:
+        # Day-loss fuse input: without fills the realized loss is UNPROVABLE,
+        # and an unprovable fuse means no buys this round (never "assume fine").
+        _warn_once("deal_table", "DEAL table unreadable: buys decline this round")
+    day = day_key(moment)
+    day_loss, loss_ok = _day_loss_pct(deals, positions)
+    day_loss_limit = None
+    if loss_ok and total and total > 0.0:
+        day_loss_limit = total * float(PARAMS.get("day_loss_limit_pct", 0.0)) / 100.0
+    emergency = bool(PARAMS.get("emergency_stop", False))
+    if emergency:
+        _warn_once("emergency_stop", "emergency_stop=true: every buy refused, sells unaffected")
+    held_symbols = 0
+    if positions is not None:
+        held_symbols = len([1 for row in positions.values() if (row or {}).get("qty", 0.0) > 0.0])
+    now_ts = _now_ts()
     for symbol in PARAMS.get("symbols") or []:
         ctx = build_context(ContextInfo, symbol, moment, orders, positions, cash)
         signals = []
@@ -770,7 +1059,7 @@ def run_round(ContextInfo, moment):
                                            "reason": "rule_" + mode})
                 continue
             short = signal["short_code"]
-            if short in sent:
+            if short in counter_codes or (day, symbol, short) in _STATE["sent"]:
                 summary["skipped"].append({"short": short, "reason": "already_sent"})
                 continue
             allowed, why = rule_no_new_order_window(PARAMS, ctx)
@@ -784,40 +1073,137 @@ def run_round(ContextInfo, moment):
             if not fillable:
                 summary["skipped"].append({"short": short, "reason": why})
                 continue
+            intent = _intent_of(signal, ctx.get("position_qty"))
             if signal["side"] == "buy":
-                blocked = (not rule_cash_ok(PARAMS, ctx, signal["amount"]) or
-                           not rule_amount_cap_ok(PARAMS, signal["amount"]) or
-                           not rule_daily_buy_cap_ok(PARAMS, ctx, signal["amount"]))
-                if blocked:
-                    summary["skipped"].append({"short": short, "reason": "money_cap"})
+                if (day, symbol) in _STATE["buy_intents"] and intent != "t_leg":
+                    # One buy intent per symbol per day (plan 1.3 item 1): a
+                    # second live signal on the same name must not stack.
+                    summary["skipped"].append({"short": short, "reason": "same_symbol_day"})
                     continue
-                # DYN-SIZE-IN-SANDBOX (owner 11-04: the dynamic position model must run
-                # inside QMT today). The chain is ANDed with the caps above, never a
-                # replacement for them: the sizing cap can only make this order smaller.
-                sized_amount, why, note = sizing_cap(ctx, positions)
-                if sized_amount is None:
-                    summary["skipped"].append({"short": short, "reason": why})
+            if signal["side"] == "sell":
+                # Sell chain (tomorrow's 000520 disposal runs through here): the
+                # T+1 sellable qty is a HARD bound. An unreadable can_use refuses
+                # the exit (fail-closed); a qty above can_use is clipped down to
+                # whole lots rather than sent into a reject.
+                can_use = ctx.get("can_use_qty")
+                if can_use is None:
+                    summary["skipped"].append({"short": short, "reason": "can_use_unknown"})
                     continue
-                if sized_amount < signal.get("amount", 0.0):
-                    price = signal.get("price") or ctx.get("last_price")
-                    lot = float(PARAMS.get("lot_size") or 0.0)
-                    if not price or lot <= 0.0:
-                        # Cannot re-cut the share count without a price and a lot size:
-                        # sending the ORIGINAL amount would silently trade around the cap.
-                        summary["skipped"].append({"short": short, "reason": "sizing_no_price"})
-                        continue
-                    qty = int(sized_amount / price / lot) * int(lot)
-                    if qty <= 0:
-                        summary["skipped"].append({"short": short, "reason": "sizing_below_lot"})
+                lot = float(PARAMS.get("lot_size") or 0.0)
+                if signal.get("qty", 0.0) > can_use and lot > 0.0:
+                    clipped = int(can_use / lot) * int(lot)
+                    if clipped <= 0:
+                        summary["skipped"].append({"short": short, "reason": "can_use_zero"})
                         continue
                     signal = dict(signal)
-                    signal["qty"] = qty
-                    signal["amount"] = round(qty * price, 2)
-                    summary.setdefault("sized", []).append(
-                        {"short": short, "qty": qty, "amount": signal["amount"], "cap": note})
+                    signal["qty"] = clipped
+                    signal["amount"] = round(clipped * (signal.get("price") or 0.0), 2)
+                ok, why = _place(ContextInfo, signal)
+                if ok:
+                    _STATE["sent"].add((day, symbol, short))
+                    summary["placed"].append(short)
+                else:
+                    summary["skipped"].append({"short": short, "reason": why})
+                continue
+            # ---- BUY side: stage 1 filters, then the 12-gate chain ----
+            if emergency:
+                summary["skipped"].append({"short": short, "reason": "emergency_stop"})
+                continue
+            if positions is None:
+                summary["skipped"].append({"short": short, "reason": "position_table_unreadable"})
+                continue
+            if deals is None or not loss_ok or day_loss is None:
+                summary["skipped"].append({"short": short, "reason": "day_loss_unprovable"})
+                continue
+            if day_loss_limit is not None and (-day_loss) >= day_loss_limit:
+                summary["skipped"].append({"short": short, "reason": "day_loss_limit"})
+                continue
+            if not _asset_guard_ok(total, cash, positions):
+                summary["skipped"].append({"short": short, "reason": "asset_guard_failed"})
+                continue
+            risk = _risk_reason(symbol)
+            if risk:
+                summary["skipped"].append({"short": short, "reason": risk})
+                continue
+            vwap, vwhy = _vwap_of(ctx)
+            if vwap is None:
+                # Q6: VWAP missing (or insane vs last) SKIPS the buy -- the same
+                # fail-closed contract as the Go side's autoPlaceScaled.
+                summary["skipped"].append({"short": short, "reason": vwhy})
+                continue
+            price = signal.get("price") or ctx.get("last_price")
+            if price and vwap > 0.0:
+                premium_pct = (price - vwap) / vwap * 100.0
+                if premium_pct > float(PARAMS.get("max_signal_vwap_premium_pct", 0.0)):
+                    summary["skipped"].append({"short": short,
+                                               "reason": "vwap_premium_%.1f" % premium_pct})
+                    continue
+            if intent in ("new", "add"):
+                confirmed, cwhy = _buy_confirmed(symbol, now_ts)
+                if not confirmed:
+                    summary["skipped"].append({"short": short, "reason": cwhy})
+                    continue
+            if intent == "new" and held_symbols >= int(PARAMS.get("max_positions", 0)):
+                summary["skipped"].append({"short": short, "reason": "max_positions"})
+                continue
+            session_amount = float(_STATE["buy_amounts"].get((day, symbol), 0.0) or 0.0)
+            buckets = _bucket_view(symbol, positions, {"last_price": ctx.get("last_price")},
+                                   session_amount)
+            if not buckets["industry_known"] or not buckets["cluster_set"]:
+                # Baked ownership maps are a MUST-BAKE item (plan section 1.2):
+                # a symbol with no sector/concept bucket refuses the buy instead
+                # of letting the 35% caps abstain.
+                summary["skipped"].append({"short": short, "reason": "sector_bucket_unknown"})
+                continue
+            ctx["bucket_view"] = buckets
+            blocked = (not rule_cash_ok(PARAMS, ctx, signal["amount"]) or
+                       not rule_amount_cap_ok(PARAMS, signal["amount"]))
+            if blocked:
+                summary["skipped"].append({"short": short, "reason": "money_cap"})
+                continue
+            # NOTE (Q4, owner 10:45): the flat daily_buy_cap no longer gates the
+            # buy -- the day budget IS the dynamic-position room below; the flat
+            # cap stays baked as corroborating evidence only.
+            # DYN-SIZE-IN-SANDBOX: the sizing chain is ANDed with the caps above,
+            # never a replacement for them: it can only make this order smaller.
+            sized_amount, why, note = sizing_cap(ctx, positions)
+            if sized_amount is None:
+                summary["skipped"].append({"short": short, "reason": why})
+                continue
+            if sized_amount < signal.get("amount", 0.0):
+                lot = float(PARAMS.get("lot_size") or 0.0)
+                if not price or lot <= 0.0:
+                    # Cannot re-cut the share count without a price and a lot size:
+                    # sending the ORIGINAL amount would silently trade around the cap.
+                    summary["skipped"].append({"short": short, "reason": "sizing_no_price"})
+                    continue
+                qty = int(sized_amount / price / lot) * int(lot)
+                if qty <= 0:
+                    summary["skipped"].append({"short": short, "reason": "sizing_below_lot"})
+                    continue
+                signal = dict(signal)
+                signal["qty"] = qty
+                signal["amount"] = round(qty * price, 2)
+                summary.setdefault("sized", []).append(
+                    {"short": short, "qty": qty, "amount": signal["amount"], "cap": note})
+            # Final min-order-amount gate (owner 11:05): NEW-position auto buys
+            # only -- add / reduce / t_leg are exempt, but every gate above and
+            # below still binds them. Judged on the FINAL share count, after the
+            # cash downgrade and the lot rounding, right before _place; a miss
+            # abandons the WHOLE order (no top-up, no shred).
+            if intent == "new":
+                final_amount = float(signal.get("amount", 0.0))
+                if final_amount < float(PARAMS.get("min_order_amount", 0.0)):
+                    summary["skipped"].append({"short": short, "reason": "min_order_amount"})
+                    continue
             ok, why = _place(ContextInfo, signal)
             if ok:
-                sent.add(short)
+                _STATE["sent"].add((day, symbol, short))
+                if intent != "t_leg":
+                    # One buy intent per symbol per day (plan 1.3 item 1): the
+                    # session registry, not the seconds-late ORDER table.
+                    _STATE["buy_intents"].add((day, symbol))
+                    _STATE["buy_amounts"][(day, symbol)] = session_amount + float(signal.get("amount", 0.0))
                 summary["placed"].append(short)
             else:
                 summary["skipped"].append({"short": short, "reason": why})

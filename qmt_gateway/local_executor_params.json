@@ -297,7 +297,7 @@
     "t_commission_rate": 0.00025,
     "t_enabled": true,
     "t_force_unwind_at": "1450",
-    "t_intraday_cap_pct": 50,
+    "t_intraday_cap_pct": 30,
     "t_intraday_sell_cap_total_pct": 20,
     "t_last_open_at": "1400",
     "t_limit_distance_pct": 1,
@@ -1535,7 +1535,7 @@
       "bull",
       "bear"
     ],
-    "t_remark_code_max_len": 0,
+    "t_remark_code_max_len": 16,
     "t_session_open_hhmm": "09:30",
     "t_session_windows": [
       [
@@ -1953,7 +1953,22 @@
         "black_list": null
       }
     },
-    "account": "2069008957"
+    "account": "2069008957",
+    "emergency_stop": true,
+    "max_signal_vwap_premium_pct": 5.0,
+    "max_positions": 6,
+    "day_loss_limit_pct": 3.5,
+    "buy_confirm_rounds": 2,
+    "buy_confirm_min_gap_sec": 60,
+    "risk_list_static": [
+      "000520.SZ"
+    ],
+    "risk_list_dynamic": [],
+    "industry_map": {},
+    "concept_map": {},
+    "asset_guard_factor": 10.0,
+    "vwap_sanity_lo": 0.5,
+    "vwap_sanity_hi": 2.0
   },
   "strategy_version": "v05-20261109",
   "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the four builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",

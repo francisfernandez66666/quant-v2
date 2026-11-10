@@ -176,6 +176,34 @@ def heredoc_mask(lines):
     return mask
 
 
+def heredoc_openers(lines, mask):
+    """opener_of[i]：若第 i 行是 heredoc **正文**（即 mask[i] 为 True），记它所属 opener 的行号；否则 -1。
+
+    与 heredoc_mask 同一次 O(n) 扫描顺手算出，供 _heredoc_complete 把「回退到 opener」从
+    O(body_start) 降到 O(1)：每段的单元装配不再从文件头重扫到段头（173 段累计 O(n²) 正是
+    selftest / parallel_units 单段装配卡死的元凶）。
+    """
+    opener_of = [-1] * len(lines)
+    delim = None
+    allow_tabs = False
+    start = -1
+    for i, line in enumerate(lines):
+        if delim is not None:
+            body = line.lstrip("\t") if allow_tabs else line
+            if body == delim:
+                delim = None
+                start = -1
+                continue
+            if start != -1:
+                opener_of[i] = start
+            continue
+        opener = heredoc_opener(line)
+        if opener is not None:
+            delim, allow_tabs = opener
+            start = i
+    return opener_of
+
+
 def section_of(sections, idx):
     for sid, start, end, _title in sections:
         if start <= idx < end:
@@ -248,8 +276,19 @@ def word_re(name):
     return re.compile(r'(?<![\w])' + re.escape(name) + r'(?![\w])')
 
 
+_CSH_CACHE = {}
+
+
 def cross_section_helpers(sections, funcs, lines, mask):
-    """定义在某段、被更晚的段**调用**（注释与 heredoc 正文里的提及不算调用）的顶格函数。"""
+    """定义在某段、被更晚的段**调用**（注释与 heredoc 正文里的提及不算调用）的顶格函数。
+
+    纯函数（只依赖传入的 lines/mask/sections/funcs），故按 id(lines) 记忆化：_assemble 在
+    selftest / parallel_units 里对 173 段各调一次，若不缓存就是 173 × O(funcs×sections×lines)
+    的 O(n³) 量级——实测单段装配卡死的真凶。缓存后整轮只算一次。
+    """
+    key = id(lines)
+    if key in _CSH_CACHE:
+        return _CSH_CACHE[key]
     first_by_name = {}
     for name, start, end, sid in funcs:
         if name not in first_by_name:
@@ -279,6 +318,7 @@ def cross_section_helpers(sections, funcs, lines, mask):
                 consumers.append(cs)
         if consumers:
             out.append((name, producer, consumers, len(own_sections) > 1))
+    _CSH_CACHE[key] = out
     return out
 
 
@@ -301,11 +341,55 @@ def cmd_helpers(gate):
     print("HELPDERIVED\t%d" % len(deps))
 
 
-def build_inner(gate, start_id, root):
-    """内层脚本文本：前言（set/cd + 顶格函数定义）+ 跨段 helper 搬运 + 带标记的尾体。"""
+def build_inner(gate, start_id, end_id, root):
+    """内层脚本文本：前言（set/cd + 顶格函数定义）+ 跨段 helper 搬运 + 带标记的尾体。
+
+    `end_id=None` 表示跑到文件尾（旧 `emit` 尾体语义）；`end_id=<某段号>` 表示只跑到该段
+    **之前**（即「单段单元」或任意区间）。并行收集模式用后者把每一段装配成自包含独立脚本，
+    跨段变量/helper 依赖靠「把更早段定义的 helper 一并搬进前言」消除——消费段自带所需 helper，
+    不需要运行时串行。
+    """
     lines = read_lines(gate)
     mask = heredoc_mask(lines)
     sections, _pe, funcs = parse(lines)
+    return _assemble(lines, mask, sections, funcs, gate, start_id, end_id, root)
+
+
+def _heredoc_complete(lines, mask, opener_of, body_start, body_end):
+    """把区间 [body_start, body_end) 调整到最近的 heredoc 边界，保证单元内 heredoc 全部闭合。
+
+    为什么必须：emit-one 取 [某段头, 下一段头) 时，若该段尾有个 heredoc 开在下段才闭合（或上段
+    开的 heredoc在本段头仍未闭），直接切会得到"未闭合 heredoc"——bash 解析卡 stdin 等终止符，
+    bash -n 都挂。延伸到 opener / terminator 即可。延伸到 terminator 可能把下一段头也带进来
+    （那一段头在 heredoc 体内＝数据、不会被执行，无害）；延伸到 opener 可能把上一段尾带进来
+    （同理是 heredoc 数据）。两种情况都不影响被装配段的判据，只保证语法完整不自锁。
+
+    opener_of[i] 是 heredoc_openers() 预计算的「逐行 opener 行号」（-1 表示不在 heredoc 体内），
+    把原实现「从文件头重扫到 body_start」的 O(body_start)（173 段累计 O(n²)）降到 O(1)；
+    向前延伸到闭合则直接读 mask（已编码整份文件的 heredoc 结构），O(段长)。
+    """
+    n = len(lines)
+    # body_start 落在未闭合 heredoc 体内 ⇒ 回退到该 heredoc 的 opener（O(1)）。
+    if body_start < n and opener_of[body_start] != -1:
+        body_start = opener_of[body_start]
+    # body_end 若落在 heredoc 体内 ⇒ 向前延伸到闭合行（mask 已含整份结构，O(段长)）。
+    while body_end < n and mask[body_end]:
+        body_end += 1
+    return body_start, body_end
+
+
+def _assemble(lines, mask, sections, funcs, gate, start_id, end_id, root, deps=None, opener_of=None,
+              exports=None, producer_vars=None, work=None):
+    """build_inner 的无重解析内核：接收已解析的 lines/mask/sections，产出内层脚本文本。
+
+    emit-one / selftest / parallel_units 各自只解析一次门禁文件，再对 173 段反复调用本函数，
+    避免每段重跑 heredoc_mask 的逐字符扫描（21k 行 × 173 段会拖垮自检与调度）。
+
+    `deps` / `opener_of` 是预计算的跨段 helper 依赖与 heredoc opener 数组；173 段循环调用时由
+    调用方算一次传入，避免每段重算（cross_section_helpers 是 O(funcs×sections×lines) 的纯函数，
+    已按 id(lines) 记忆化兜底；opener_of 同理用 heredoc_openers 一次 O(n) 算出）。两个参数都缺省
+    None ⇒ 函数内惰性补全，保持 build_inner / cmd_emit_one 旧调用形态不破。
+    """
     ids = [s[0] for s in sections]
     if start_id not in ids:
         raise SystemExit("gate-emit: 段号 %s 不在派生段清单里（共 %d 段）" % (start_id, len(ids)))
@@ -314,6 +398,18 @@ def build_inner(gate, start_id, root):
     #   带后缀的编号排在纯数字编号后面（§GATE-SELFACC）。order 就是派生段清单的下标。
     order = {sid: k for k, sid in enumerate(ids)}
     start_pos = order[start_id]
+    if end_id is None:
+        body_end = len(lines)
+    else:
+        if end_id not in order:
+            raise SystemExit("gate-emit: 结束段号 %s 不在派生段清单里" % end_id)
+        body_end = [s for s in sections if s[0] == end_id][0][1]
+    # 不允许在 heredoc 体内截断：emit-one 的区间 [start, next) 可能把"开头在本段、结束在下段"的
+    # heredoc 腰斩 ⇒ 单元里出现未闭合 heredoc ⇒ bash 解析时卡 stdin 等终止符（bash -n 也会挂）。
+    # 把区间两端都延伸到最近的 heredoc 边界，保证单元里的 heredoc 全部完整闭合。
+    if opener_of is None:
+        opener_of = heredoc_openers(lines, mask)
+    body_start, body_end = _heredoc_complete(lines, mask, opener_of, body_start, body_end)
 
     prelude = []
     prelude_names = []
@@ -323,7 +419,8 @@ def build_inner(gate, start_id, root):
         prelude.append("\n".join(lines[s:e]))
         prelude_names.append(name)
 
-    deps = cross_section_helpers(sections, funcs, lines, mask)
+    if deps is None:
+        deps = cross_section_helpers(sections, funcs, lines, mask)
     for name, producer, consumers, _dup in deps:
         if not any(order[c] >= start_pos for c in consumers if c in order):
             continue
@@ -337,16 +434,34 @@ def build_inner(gate, start_id, root):
                 break
 
     tail = []
-    for i in range(body_start, len(lines)):
+    for i in range(body_start, body_end):
         if not mask[i]:
             m = HEADER_RE.match(lines[i])
             if m:
                 tail.append('echo "GATE-SECTION-START %s"' % m.group(1))
         tail.append(lines[i])
 
+    # 并行跨进程变量桥接（gate_need 语义保真）：消费段在段体之前 source 各生产者段导出的环境变量文件。
+    # 串行尾体模式下，生产者段与消费段跑在同一个 bash 作用域，IP_HITS 这类"前段派生的读数"天然可见；
+    # 孤立单元里消费段的进程读不到，gate_need 会把消费段永远判成 SKIP（假信号）。用文件桥接复刻串行语义：
+    # 生产者成功退出时把流动变量 declare -p 落盘，消费段启动即 source；生产者失败（文件不写）⇒ 消费段
+    # 读不到 ⇒ 也 SKIP，与串行 collect「前段红⇒本遍尾体死在那段、下一遍从其后起重跑、消费段同样读不到 SKIP」同形。
+    if exports and start_id in exports and work:
+        for _p in exports[start_id]:
+            tail.insert(0, 'source "%s/gate_exports_%s.sh" 2>/dev/null || true' % (work, _p))
+
+    # 生产者侧：成功退出时把流动变量落盘（见上面 source 注释）。仅 exit 0 才写，失败不写。
+    extra = []
+    if producer_vars and start_id in producer_vars and work:
+        evars = " ".join(sorted(set(producer_vars[start_id])))
+        extra.append('GATE_EXPORTS_FILE="%s/gate_exports_%s.sh"' % (work, start_id))
+        extra.append(
+            "trap 'if [ \"$?\" = \"0\" ]; then declare -p %s > \"$GATE_EXPORTS_FILE\" 2>/dev/null; fi' EXIT" % evars)
+
     parts = [
         "#!/usr/bin/env bash",
-        "# §P2-L collect 内层脚本：由 scripts/gate_sections.py 从 %s 装配，只跑段 %s 起到文件尾。" % (gate, start_id),
+        "# §P2-L collect 内层脚本：由 scripts/gate_sections.py 装配，只跑段 %s%s。" % (
+            start_id, " 起到文件尾" if end_id is None else " 单段（含全部更早 helper）"),
         "# 仓库里的段体一字未改；变的只有 cd 目标（相对 $0 会指向 /tmp）与前置 helper 搬运。",
         "set -euo pipefail",
         'cd "%s"' % root,
@@ -355,6 +470,7 @@ def build_inner(gate, start_id, root):
         # GATE_SELF_ABS 等值定义补进内层前言。11-07→11-10 三个批次里任何一段 single-emit 都以
         # 「GATE_SELF_ABS: unbound variable」收尾＝不是判据红、是装配器漏写定义（§173 的假红即此）。
         "GATE_SELF_ABS=\"%s\"" % os.path.abspath(gate),
+        "\n".join(extra),
         "\n".join(prelude),
         "\n".join(tail).rstrip("\n"),
     ]
@@ -364,12 +480,295 @@ def build_inner(gate, start_id, root):
 
 def cmd_emit(gate, start_id, out_path, root):
     # start_id 原样传（字符串编号，可能是 `34b`）；旧口径的 int() 会把带后缀的编号当场炸掉。
-    text, prelude_names = build_inner(gate, start_id, root)
+    # end_id=None ⇒ 跑到文件尾（旧尾体语义，串行 -collect 仍用这条）。
+    text, prelude_names = build_inner(gate, start_id, None, root)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(text)
     os.chmod(out_path, 0o755)
     sys.stderr.write("gate-emit: %s start=§%s lines=%d prelude=%s\n" % (
         out_path, start_id, text.count("\n"), ",".join(prelude_names) or "-"))
+
+
+def next_section_id(sections, sid):
+    """返回 sid 在派生段清单里的下一编号；sid 是最后一段时返回 None。"""
+    ids = [s[0] for s in sections]
+    k = ids.index(sid)
+    return ids[k + 1] if k + 1 < len(ids) else None
+
+
+def cmd_emit_one(gate, sid, out_path, root):
+    """把**单段**装配成自包含独立脚本（带 GATE-SECTION-START 标记，含全部更早 helper）。
+
+    区间取 [sid, 下一编号)：最后一段则 [sid, 文件尾)（含 §GZ-UBUNTU 终端总闸，与串行尾体一致）。
+    """
+    lines = read_lines(gate)
+    mask = heredoc_mask(lines)
+    sections, _pe, funcs = parse(lines)
+    ids = [s[0] for s in sections]
+    if sid not in ids:
+        raise SystemExit("gate-emit-one: 段号 %s 不在派生段清单里（共 %d 段）" % (sid, len(ids)))
+    nxt = next_section_id(sections, sid)
+    text, prelude_names = _assemble(lines, mask, sections, funcs, gate, sid, nxt, root)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(out_path, 0o755)
+    sys.stderr.write("gate-emit-one: %s end=%s out=%s prelude=%s\n" % (
+        sid, nxt or "EOF", out_path, ",".join(prelude_names) or "-"))
+
+
+def derive_edges(gate):
+    """派生跨段产物依赖边（producer → consumer），供并行调度保序。来源：
+
+    ① `gate_need <段号> "$VAR"` 声明里被校验的 `$VAR` 在更早单一段赋值 ⇒ 边。这是门禁作者声明
+       跨段依赖的正式通道；未来新增的「直接变量」依赖会自动被抓到。
+    ② KNOWN_SEMANTIC_EDGES：gate_need 用**本地代理变量**间接表达、自动检测看不见的依赖。
+       目前只有一条：§107 → §110——§110 读 §107 派生扫描的 IP_HITS / IP_SCAN_N 读数
+       （注释明写「§110 不再自己写第二遍扫描」），但 gate_need 校验的是段内据 IP_HITS 算出的
+       本地 IP110_HAS，自动检测只能看到 IP110_HAS 在 §110 自己段里赋值，看不到真正的跨段链路
+       ——故显式点名。
+
+    为什么不扫「跨段变量读」做通用推断：串行尾体模式下所有段跑在同一个 bash 作用域，单字母/短变量
+    （$g/$b/$_/$V/$bad/$fn…）会"顺带"从更早段泄漏到更晚段，但并不是真依赖；并行模式下每段是独立
+    进程，这些泄漏本就不存在。把这种泄漏误判成依赖会过度串行化，且无助于正确性。真·跨段依赖请走
+    gate_need（或直接加进 KNOWN_SEMANTIC_EDGES）。
+    """
+    lines = read_lines(gate)
+    mask = heredoc_mask(lines)
+    sections, _pe, funcs = parse(lines)
+    ids = [s[0] for s in sections]
+    order = {sid: k for k, sid in enumerate(ids)}
+    sec_of_line = {}
+    for sid, start, end, _t in sections:
+        for i in range(start, end):
+            sec_of_line[i] = sid
+    # 不只认行首赋值：`then VAR=`、`; VAR=`、缩进后的 `VAR=$( )` 都要抓到。左侧锚「非单词字符
+    # 且非 =」、右侧排除 `==`，避免误吞比较表达式。
+    assign_re = re.compile(r'(?<![\w=])([A-Za-z_][A-Za-z0-9_]*)=(?!=)')
+    var_assigners = {}      # var -> 赋值它的段集合
+    for i, line in enumerate(lines):
+        if mask[i] or i not in sec_of_line:
+            continue
+        for m in assign_re.finditer(line):
+            var_assigners.setdefault(m.group(1), set()).add(sec_of_line[i])
+    edges = []
+    seen = set()
+
+    def add_edge(p, c):
+        if p not in order or c not in order or order[p] >= order[c]:
+            return
+        e = (p, c)
+        if e not in seen:
+            seen.add(e)
+            edges.append(e)
+
+    # ① gate_need 声明边
+    need_re = re.compile(r'^\s*gate_need\s+(\d+[a-z]?)\s+"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?')
+    for i, line in enumerate(lines):
+        if mask[i] or i not in sec_of_line:
+            continue
+        m = need_re.match(line)
+        if not m:
+            continue
+        consumer = sec_of_line[i]
+        producers = [a for a in var_assigners.get(m.group(2), set()) if order[a] < order[consumer]]
+        if len(producers) == 1:
+            add_edge(producers[0], consumer)
+    # ② 显式已知语义边（gate_need 用代理变量表达、自动检测看不见的跨段链路）
+    KNOWN_SEMANTIC_EDGES = [("107", "110")]
+    for p, c in KNOWN_SEMANTIC_EDGES:
+        add_edge(p, c)
+    return edges, ids, order
+
+
+def cmd_deps(gate):
+    edges, ids, _order = derive_edges(gate)
+    for p, c in edges:
+        print("%s>%s" % (p, c))
+    print("DEPS_EDGES\t%d" % len(edges))
+
+
+def cmd_parallel_units(gate, root, jobs, work, inner_args):
+    """预发射全部单段单元 + 按依赖边有界并发执行 + 逐段 classify，产出 cls_*.txt 供汇总。
+
+    * 每段一个独立 bash 进程（只读仓库树，各写各自 log_/cls_ 文件，互不踩）。
+    * 依赖边（§107→§110）用有界 DAG 调度：消费者段等生产者段完成后才起。
+    * 调度器返回 0 只表示"全部单元已执行并分类"，段自身的 PASS/FAIL/SKIP/SILENT 由 cls 汇总判定；
+      发射失败的段不写 cls ⇒ 汇总记 MISSING（不当绿）。
+    """
+    import concurrent.futures as _cf
+    import subprocess as _sp
+    lines = read_lines(gate)
+    mask = heredoc_mask(lines)
+    sections, _pe, funcs = parse(lines)
+    ids = [s[0] for s in sections]
+    edges, _ids, _order = derive_edges(gate)
+    deps = {sid: [] for sid in ids}
+    for p, c in edges:
+        if c in deps:
+            deps[c].append(p)
+    py = sys.executable
+    os.makedirs(work, exist_ok=True)
+    # 跨进程变量桥接：每条 gate_need 边（producer→consumer）需要把生产者"流动变量"喂给消费段。
+    # 流动变量 = 生产者段顶层赋值 ∩ 消费段顶层读取（且消费段自己不赋值、不 for-绑定）。单字符／下划线
+    # 前缀／rc（$? 约定）一律排除——它们是循环或瞬时量，跨进程传递只会制造噪声，真实跨段读数（如
+    # IP_HITS／IP_SCAN_N）都是多字符语义变量，照常导出。
+    assign_re = re.compile(r'(?<![\w=])([A-Za-z_][A-Za-z0-9_]*)=(?!=)')
+    read_re = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)\b')
+    for_re = re.compile(r'\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b')
+    func_lines = set()
+    for _n, s, e, _sid in funcs:
+        for i in range(s, e):
+            func_lines.add(i)
+    sec_of_line = {}
+    for sid, start, end, _t in sections:
+        for i in range(start, end):
+            sec_of_line[i] = sid
+    assigned_top = {}
+    loopbind = {}
+    for i, line in enumerate(lines):
+        if mask[i] or i in func_lines or i not in sec_of_line or i < _pe:
+            continue
+        for m in assign_re.finditer(line):
+            assigned_top.setdefault(sec_of_line[i], set()).add(m.group(1))
+        for m in for_re.finditer(line):
+            loopbind.setdefault(sec_of_line[i], set()).add(m.group(1))
+    read_top = {}
+    for i, line in enumerate(lines):
+        if mask[i] or i in func_lines or i not in sec_of_line or i < _pe:
+            continue
+        for m in read_re.finditer(line):
+            v = m.group(1) or m.group(2)
+            read_top.setdefault(sec_of_line[i], set()).add(v)
+    exports = {}        # consumer -> [producer]
+    producer_vars = {}  # producer -> [流动变量]
+    for (p, c) in edges:
+        exports.setdefault(c, []).append(p)
+        flow = (assigned_top.get(p, set()) & read_top.get(c, set())) \
+            - assigned_top.get(c, set()) - loopbind.get(c, set())
+        for v in flow:
+            if len(v) <= 1 or v.startswith("_") or v == "rc":
+                continue
+            producer_vars.setdefault(p, []).append(v)
+    # 173 段装配共享一份跨段 helper 依赖与 heredoc opener 数组，避免每段重算（见 _assemble docstring）。
+    csh = cross_section_helpers(sections, funcs, lines, mask)
+    opener_of = heredoc_openers(lines, mask)
+    unit_paths = {}
+    emit_fail = []
+    for sid in ids:
+        nxt = next_section_id(sections, sid)
+        out = os.path.join(work, "unit_%s.sh" % sid)
+        try:
+            text, _ = _assemble(lines, mask, sections, funcs, gate, sid, nxt, root,
+                               deps=csh, opener_of=opener_of,
+                               exports=exports, producer_vars=producer_vars, work=work)
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.chmod(out, 0o755)
+            unit_paths[sid] = out
+        except SystemExit as e:
+            emit_fail.append((sid, str(e)))
+            sys.stderr.write("gate-parallel: 发射 §%s 失败：%s\n" % (sid, e))
+    if emit_fail:
+        print("PARALLEL_EMIT_FAIL\t%d" % len(emit_fail))
+
+    def run_unit(sid):
+        out = unit_paths.get(sid)
+        if out is None:
+            return (sid, 127, "emit-failed")
+        log = os.path.join(work, "log_%s.txt" % sid)
+        cls = os.path.join(work, "cls_%s.txt" % sid)
+        with open(log, "w", encoding="utf-8") as lf:
+            rc = _sp.run(["bash", out] + list(inner_args),
+                         stdout=lf, stderr=_sp.STDOUT).returncode
+        with open(cls, "w", encoding="utf-8") as cf2:
+            _sp.run([py, gate, "classify", gate, log, str(rc)], stdout=cf2)
+        return (sid, rc, "ok")
+
+    jobs = max(1, int(jobs))
+    done = set()
+    running = {}
+    pending = list(ids)
+    with _cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        while pending or running:
+            ready = [s for s in pending if all(d in done for d in deps[s])]
+            for s in ready:
+                if len(running) >= jobs:
+                    break
+                pending.remove(s)
+                running[ex.submit(run_unit, s)] = s
+            if not running:
+                break
+            done_futs, _ = _cf.wait(list(running.keys()), return_when=_cf.FIRST_COMPLETED)
+            for f in done_futs:
+                s = running.pop(f)
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001 - 调度异常必须现形，不能静默少一段
+                    sys.stderr.write("gate-parallel: §%s 调度异常：%s\n" % (s, e))
+                done.add(s)
+    print("PARALLEL_DONE\t%d\tEMIT_FAIL\t%d" % (len(done), len(emit_fail)))
+    return 0
+
+
+def cmd_selftest(gate):
+    """装配器自检：emit-one 产出的全部单段单元必须 bash -n 通过，且跨段 helper 正确捆绑。
+
+    这是 `-collect-parallel` 的可回归前提：一旦 build_inner 把某段装配成语法坏脚本或漏搬 helper，
+    读数归属就不可信。bash -n 覆盖「语法坏」；helper 捆绑抽查覆盖「漏搬跨段定义」（§108 消费
+    §100 的 gw_code_hits、§111 消费 §110 的 legnote110）。两者都不过＝装配器坏，整轮并行直接判红。
+    """
+    import subprocess as _sp
+    import tempfile as _tf
+    lines = read_lines(gate)
+    mask = heredoc_mask(lines)
+    sections, _pe, funcs = parse(lines)
+    ids = [s[0] for s in sections]
+    # 173 段装配共享一份跨段 helper 依赖与 heredoc opener 数组，避免每段重算（见 _assemble docstring）。
+    csh = cross_section_helpers(sections, funcs, lines, mask)
+    opener_of = heredoc_openers(lines, mask)
+    root = os.path.dirname(os.path.abspath(gate)) + "/.."
+    bad = []          # bash -n 不过（含未闭合 heredoc）的单元
+    nomark = []       # 单元里找不到自己段号的 GATE-SECTION-START 标记（heredoc 跨越段头致标记被吞）
+    for sid in ids:
+        nxt = next_section_id(sections, sid)
+        text, _ = _assemble(lines, mask, sections, funcs, gate, sid, nxt, root,
+                           deps=csh, opener_of=opener_of)
+        fd, path = _tf.mkstemp(suffix=".sh")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            # stdin 重定向 /dev/null：万一仍有未闭合 heredoc，bash -n 会立刻遇 EOF 报错而非卡 stdin 挂死。
+            if _sp.run(["bash", "-n", path], stdin=_sp.DEVNULL).returncode != 0:
+                bad.append(sid)
+        finally:
+            os.unlink(path)
+        # 标记完整性：单元里必须出现本段自己的 GATE-SECTION-START 标记（说明段头没被 heredoc 当成数据吞掉）。
+        if ('GATE-SECTION-START %s' % sid) not in text:
+            nomark.append(sid)
+    if bad:
+        print("SELFTEST\tFAIL bash -n 不过的单元：%s" % ",".join(bad))
+        return 1
+    if nomark:
+        print("SELFTEST\tFAIL 缺本段标记的单元（heredoc 跨越段头致段头被当数据）：%s" % ",".join(nomark))
+        return 1
+    expect = {
+        "108": "gw_code_hits",   # §100 定义、§108 消费
+        "111": "legnote110",     # §110 定义、§111 消费
+    }
+    miss = []
+    for sid, helper in expect.items():
+        if sid not in ids:
+            continue
+        nxt = next_section_id(sections, sid)
+        text, _ = _assemble(lines, mask, sections, funcs, gate, sid, nxt, root,
+                           deps=csh, opener_of=opener_of)
+        if ("%s()" % helper) not in text:
+            miss.append("%s:%s" % (sid, helper))
+    if miss:
+        print("SELFTEST\tFAIL 跨段 helper 未捆绑：%s" % ",".join(miss))
+        return 1
+    print("SELFTEST\tOK sections=%d bash_n_ok=1 helper_bundle_ok=1" % len(ids))
+    return 0
 
 
 def cmd_classify(gate, log_path, rc):
@@ -565,6 +964,14 @@ def main(argv):
         cmd_helpers(argv[2])
     elif cmd == "emit":
         cmd_emit(argv[2], argv[3], argv[4], argv[5])
+    elif cmd == "emit-one":
+        cmd_emit_one(argv[2], argv[3], argv[4], argv[5])
+    elif cmd == "deps":
+        cmd_deps(argv[2])
+    elif cmd == "parallel_units":
+        cmd_parallel_units(argv[2], argv[3], argv[4], argv[5], argv[6:])
+    elif cmd == "selftest":
+        return cmd_selftest(argv[2])
     elif cmd == "classify":
         cmd_classify(argv[2], argv[3], argv[4])
     elif cmd == "summary":

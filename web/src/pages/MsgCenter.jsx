@@ -64,6 +64,8 @@ export default function MsgCenter() {
   const [reviewing, setReviewing] = useState(false)
   // §PERM-GATE 20260918：删除/清空/模拟卖出的后端守卫均为 admin（server.go:599/625/626），
   // 成员显示按钮必 403；与 Quant/Paper 姿势对齐，非管理员隐藏这三个操作入口。
+  // 2026-11-10 Q9（owner 裁决）：消息列表读面（GET /api/alerts 为 authMiddleware）对
+  // 普通用户放行——admin 判据只保留在写路径（删除/清空/模拟卖出按钮），读面不再按角色早退。
   const admin = api.isAdmin()
   const PAGE_SIZE = 50
 
@@ -160,16 +162,9 @@ export default function MsgCenter() {
   // §M-9（2026-09-22 修复批）三态分离：fetchAlerts 失败置 alertsError（可重试提示），
   // 不再被 catch 吞掉后落到「暂无消息」空分支——错误伪装空态会让用户漏掉真实提醒。
   // English: §M-9 — load failures render a retryable error, never the "no messages" empty state.
-  // §0929GATE-403（第四态）：GET /api/metrics/alerts 在 adminMiddleware 下（server.go:617），
-  // 成员会话进本页必吃 403，旧形态是"错误态显示一行 403 文案 + SSE/兜底轮询每 60s 再吃一次"。
-  // 现在按角色早退并清干净两态，渲染侧改出「未拉取」独立分支：既不是失败也不是没有消息。
-  // 判据只写在 load() 这一处（挂载/SSE 刷新/60s 兜底/删除后重拉四条路都走它）。
+  // 2026-11-10 Q9：读面对登录用户全员放行（GET /api/alerts = authMiddleware），成员也走同一
+  // 取数链；旧「admin 才拉、成员未拉取」的早退已按 owner 裁决摘除，写路径权限不变。
   async function load() {
-    if (!admin) {
-      setAlerts([])
-      setAlertsError('')
-      return
-    }
     // §P2-I：本轮代号在发起请求前盖章，回写前两处判据各自到位
     const token = loadGuard.begin()
     try {
@@ -366,14 +361,10 @@ export default function MsgCenter() {
 
       {/* §M-9（2026-09-22 修复批）空列表 ≠ 加载失败：error 态独立渲染（含原因与重试按钮）；
           有旧数据但最近一次刷新失败时另给顶部警示条，不清空列表误导为「无消息」。
-          §0929GATE-403 追加第四态：普通用户＝未拉取（一条请求都没发），排在 error 之前判定。 */}
+          2026-11-10 Q9：旧「普通用户＝未拉取」第四态随 load() 的角色早退一并摘除——
+          读面对登录用户全员放行后，成员与 admin 共用 error/empty 两态。 */}
       {filteredAlerts.length === 0 && (
-        !admin ? (
-          <div style={{ textAlign: 'center', padding: 40, color: 'var(--app-text-2)', fontSize: 13 }}>
-            🔒 系统提醒未拉取：提醒列表来自仅管理员可查的接口，当前账号为普通用户。
-            <div style={{ marginTop: 6, fontSize: 12 }}>这里是「未拉取」而不是「暂无消息」或「加载失败」——权限判定仍以后端为准。</div>
-          </div>
-        ) : alertsError ? (
+        alertsError ? (
           <div style={{ textAlign: 'center', padding: 40, color: 'var(--td-warning-color)', fontSize: 13 }}>
             ⚠ 消息加载失败：{alertsError}
             <div><Button size="small" variant="outline" theme="warning" style={{ marginTop: 10 }} onClick={load}>重试</Button></div>

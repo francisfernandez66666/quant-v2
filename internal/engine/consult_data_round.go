@@ -117,6 +117,7 @@ func (e *Engine) consultDataRound(ctx context.Context, client *llm.Client, userM
 		return ""
 	}
 
+	// 按补数轮要到的字段逐票拼补充数据段：只拼取到数的行（line 为空＝该票该维暂缺，跳过不写空行）。
 	var sb strings.Builder
 	for _, code := range codes {
 		for _, key := range keys {
