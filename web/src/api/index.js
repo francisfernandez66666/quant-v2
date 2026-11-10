@@ -2167,6 +2167,22 @@ export async function toggleNewsShowAll(enabled) {
   return request('/api/news/showall', { method: 'POST', data: { enabled } })
 }
 
+// ── 板块过滤三开关（科创/创业/北交所）──
+// ── Board filter toggles (STAR / ChiNext / BSE) ──
+// 2026-11-10 owner 需求：账号级板块过滤。star/chinext/bse 三布尔，true=显示该板块。
+// 对应 GET /api/board-filter/status，返回 { star_enabled, chinext_enabled, bse_enabled }
+// Maps to GET /api/board-filter/status; returns the three board switches.
+export async function fetchBoardFilterStatus() {
+  return request('/api/board-filter/status')
+}
+
+// 对应 POST /api/board-filter/toggle，请求体 { board: 'star'|'chinext'|'bse', enabled }，
+// 返回更新后的三布尔全量状态（前端一次拿到一致快照）
+// Maps to POST /api/board-filter/toggle; body { board, enabled }; returns the full updated state.
+export async function toggleBoardFilter(board, enabled) {
+  return request('/api/board-filter/toggle', { method: 'POST', data: { board, enabled } })
+}
+
 // ── 数据源健康状况 ──
 // ── Data source health ──
 // 对应 GET /api/data_source_health，返回各数据源健康探测结果

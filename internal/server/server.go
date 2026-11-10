@@ -833,6 +833,12 @@ func (s *Server) registerRoutes() {
 	// now require admin: they mutate the operator account's in-process engine regardless of caller.
 	s.mux.HandleFunc("POST /api/news/showall", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleNewsShowAllToggle))
 	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
+	// 2026-11-10 owner 需求：板块过滤三开关（科创/创业/北交所）。读面账号级 authMiddleware
+	// （与 /api/short/status 同姿势）；写面 config_admin（与做多/做空 toggle 同档——
+	// 这组开关直接决定哪些板块的信号进交易推荐与提醒，属配置面）。开关落独立 KV 键
+	// perUserBoardFilterKey（auth.json 的 per-user 配置存储内新增小节，不动 quant_config_json_v1）。
+	s.mux.HandleFunc("POST /api/board-filter/toggle", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleBoardFilterToggle))
+	s.mux.HandleFunc("GET /api/board-filter/status", s.authMiddleware(s.handleBoardFilterStatus))
 	s.mux.HandleFunc("POST /api/news/reanalyze", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleNewsReanalyze))
 	// §M-14（2026-09-22 PM 批清扫）：test-attribution 是运营引擎 Stage2 的手动试跑口，
 	// 每次调用消耗老板 LLM key 配额且前端零调用——旧路由只挂 authMiddleware，普通成员
@@ -871,7 +877,15 @@ func (s *Server) registerRoutes() {
 	// 运营账号（持 trading_admin）的可达面与此前逐字节一致，区别只在于成员号凭 quant_trade
 	// 也能进自己那一本账。勘误/通道切换/人工改判/结算/风险闸/advice/execute/跨账号
 	// 仍锁在 trading_admin（或 user_admin+trading_admin），见下方未改的那几条。
-	s.mux.HandleFunc("GET /api/positions/real", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleRealPositions))
+	// 2026-11-10 owner 需求（需求2 全用户手动持仓维护）：实盘账读端点从 strictAnyPerms
+	// （trading_admin/quant_trade）放宽为账号级 authMiddleware——facai2026 等无物理机账号
+	// 也要能读到自己那本账并手动增删改实盘持仓。归属严格按 requestUserID（handleRealPositions
+	// 逐行按 uid 过滤），A 永远读不到 B 的账；敏感写路径（advice/execute/通道切换/改判）的
+	// admin 守卫原样保留。
+	// English: the real-book read endpoint is account-scoped auth now (owner 2026-11-10: users
+	// without a physical machine must be able to maintain their own live book); every privileged
+	// write path keeps its strict guard.
+	s.mux.HandleFunc("GET /api/positions/real", s.authMiddleware(s.handleRealPositions))
 	s.mux.HandleFunc("GET /api/positions/advice", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleRealAdvice))
 	s.mux.HandleFunc("POST /api/positions/execute", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleExecuteAction))
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
@@ -2174,6 +2188,81 @@ func (s *Server) handleEngineInitStatus(w http.ResponseWriter, r *http.Request) 
 // handleNewsShowAllStatus 处理 GET /api/news/showall：返回"资讯显示全部"开关状态。
 func (s *Server) handleNewsShowAllStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn(requestUserID(r))})
+}
+
+// boardFilterOnFor 返回指定账号的板块过滤三开关（cfg 未装配时回出厂默认：三板块全开）。
+func (s *Server) boardFilterOnFor(userID string) config.BoardFilterConfig {
+	if s.cfg == nil {
+		return config.DefaultBoardFilterConfig()
+	}
+	return s.cfg.GetBoardFilterConfigFor(userID)
+}
+
+// handleBoardFilterStatus 处理 GET /api/board-filter/status（2026-11-10 owner 需求）：
+// 返回板块过滤三开关状态（前端 Signals 页兜底过滤与设置页回显共用这一个读数）。
+func (s *Server) handleBoardFilterStatus(w http.ResponseWriter, r *http.Request) {
+	c := s.boardFilterOnFor(requestUserID(r))
+	writeJSON(w, 200, map[string]bool{
+		"star_enabled":    c.StarEnabled,
+		"chinext_enabled": c.ChiNextEnabled,
+		"bse_enabled":     c.BseEnabled,
+	})
+}
+
+// boardFilterToggleReq 板块过滤开关请求体：board ∈ star|chinext|bse，enabled=目标状态。
+type boardFilterToggleReq struct {
+	Board   string `json:"board"`
+	Enabled bool   `json:"enabled"`
+}
+
+// handleBoardFilterToggle 处理 POST /api/board-filter/toggle（2026-11-10 owner 需求）：
+// 切换一个板块开关并按账号持久化，返回三开关全量状态。
+// 与做多/做空开关同姿势：写前快照 + 写后字段级审计（config_write 面 boardfilter），
+// 落库失败即 500 且不翻运行时值（防"内存已开、磁盘没落"半态）。
+func (s *Server) handleBoardFilterToggle(w http.ResponseWriter, r *http.Request) {
+	var req boardFilterToggleReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	userID := requestUserID(r)
+	if s.cfg != nil {
+		var field string
+		switch req.Board {
+		case "star":
+			field = "StarEnabled"
+		case "chinext":
+			field = "ChiNextEnabled"
+		case "bse":
+			field = "BseEnabled"
+		default:
+			writeError(w, 400, "board 必须是 star|chinext|bse 之一")
+			return
+		}
+		trace := s.snapshotConfigWrite(userIDFor(r), userID, "boardfilter")
+		cur := s.cfg.GetBoardFilterConfigFor(userID)
+		switch req.Board {
+		case "star":
+			cur.StarEnabled = req.Enabled
+		case "chinext":
+			cur.ChiNextEnabled = req.Enabled
+		case "bse":
+			cur.BseEnabled = req.Enabled
+		}
+		if err := s.cfg.SetBoardFilterConfigFor(userID, cur); err != nil {
+			log.Printf("[server] 账号 %s 板块过滤开关保存失败: %v", userID, err)
+			writeError(w, 500, "开关未保存（未落盘，本次不生效）: "+err.Error())
+			return
+		}
+		trace.audit(s)
+		log.Printf("[server] 账号 %s 板块过滤开关 %s: %v", userID, field, req.Enabled)
+	}
+	c := s.boardFilterOnFor(userID)
+	writeJSON(w, 200, map[string]bool{
+		"star_enabled":    c.StarEnabled,
+		"chinext_enabled": c.ChiNextEnabled,
+		"bse_enabled":     c.BseEnabled,
+	})
 }
 
 // handleNewsReanalyze 处理 POST /api/news/reanalyze：手动 LLM 补推。

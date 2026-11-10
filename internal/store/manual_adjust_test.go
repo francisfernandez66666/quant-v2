@@ -305,9 +305,14 @@ func TestAdjustNewAndSeed(t *testing.T) {
 	if res3.Qty != 200 || res3.CostPrice != 200 || res3.SeededFrom != ManualSeedNone {
 		t.Fatalf("新增应建一行且基线来源=none，got %+v", res3)
 	}
-	// ④ 再点一次新增 ⇒ 拒（该走加仓），清单不长重复行。
-	if _, err := db.AdjustManualBook(uid, ManualAdjustReq{Op: ManualOpNew, TsCode: "300750.SZ", Qty: 100, Price: 210, AsOf: today + " 15:03:00"}, today); err == nil {
-		t.Fatal("同一码第二次「新增」必须拒")
+	// ④ 再点一次新增 ⇒ 同票覆盖（2026-11-10 owner 需求）：清空上一次该票记录后录入本次，
+	// 不合并、不叠加；清单仍不长重复行。（旧断言"第二次新增必须拒"已被 owner 需求取代。）
+	res4, err := db.AdjustManualBook(uid, ManualAdjustReq{Op: ManualOpNew, TsCode: "300750.SZ", Qty: 100, Price: 210, AsOf: today + " 15:03:00"}, today)
+	if err != nil {
+		t.Fatalf("同票第二次新增应覆盖: %v", err)
+	}
+	if !res4.Replaced || res4.Qty != 100 || res4.CostPrice != 210 {
+		t.Fatalf("第二次新增应覆盖为 100@210 且 Replaced=true，got %+v", res4)
 	}
 	rows, _ := db.ManualPositionsForUser(uid)
 	if len(rows) != 2 {
@@ -561,4 +566,57 @@ func TestManualFlowsAcrossDaysDoNotRevive(t *testing.T) {
 	if len(todayFlows) != 1 || len(nextFlows) != 1 {
 		t.Fatalf("流水跨日串桶：今日 %d 行 / 明日 %d 行，应各 1 行", len(todayFlows), len(nextFlows))
 	}
+}
+
+// TestAdjustNewReplacesSameCode 2026-11-10 owner 需求（同票覆盖）：手动新增（op=new）遇到
+// 同一股票已有手动记录时，清空上一次该票记录（清零）后录入本次——不合并、不叠加。
+// 资金联动：上一次录入占用的现金按 行量×成本 返还，再按本次录入扣减。
+// 柜台行不适用同票覆盖（覆盖柜台证据是写面红线），op=new 撞柜台行仍拒并引到「加仓」。
+func TestAdjustNewReplacesSameCode(t *testing.T) {
+	db := manualTestDB(t)
+	uid := "u_new_replace"
+	day := manualToday()
+	// 基线：手动资金 100000 + 手动持仓 600000.SH 1000 股 @8.5
+	if err := db.PutManualAccount(uid, 100000, true, 0, manualAsofOn(day)); err != nil {
+		t.Fatalf("资金基线: %v", err)
+	}
+	if _, _, err := db.PutManualPositions(uid, []ManualPosition{{TsCode: "600000.SH", Name: "浦发银行", Qty: 1000, CostPrice: 8.5}}, manualAsofOn(day)); err != nil {
+		t.Fatalf("播种持仓: %v", err)
+	}
+	res, err := db.AdjustManualBook(uid, ManualAdjustReq{Op: ManualOpNew, TsCode: "600000.SH", Qty: 500, Price: 10, AsOf: day + " 11:00:00"}, day)
+	if err != nil {
+		t.Fatalf("同票新增应覆盖而不是拒: %v", err)
+	}
+	if !res.Replaced {
+		t.Fatal("命中同票时 res.Replaced 必须为 true（覆盖不许静默发生）")
+	}
+	if res.Qty != 500 || res.CostPrice != 10 {
+		t.Fatalf("覆盖后持仓应为 500@10（不合并不叠加），got %d@%.2f", res.Qty, res.CostPrice)
+	}
+	// 资金净效果 = 100000 + 1000×8.5（旧录入返还） − 500×10（本次录入） = 103500
+	if res.CashAfter != 103500 {
+		t.Fatalf("清零旧记录应返还其现金占用：CashAfter 期望 103500，got %.2f", res.CashAfter)
+	}
+	rows, err := db.ManualPositionsForUser(uid)
+	if err != nil {
+		t.Fatalf("读回持仓: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("同票覆盖后该票只应有一行，got %d 行", len(rows))
+	}
+	if rows[0].Qty != 500 || rows[0].CostPrice != 10 || rows[0].Name != "浦发银行" {
+		t.Fatalf("覆盖后的行应 500@10 且名字沿用，got %+v", rows[0])
+	}
+	// 柜台行同票：仍然拒（引到「加仓」），覆盖柜台证据是红线
+	if _, err := db.UpsertRealPositions([]RealPosition{storeRealPositionForTest(uid, "000001.SZ", 800, 12)}); err != nil {
+		t.Fatalf("种柜台行: %v", err)
+	}
+	if _, err := db.AdjustManualBook(uid, ManualAdjustReq{Op: ManualOpNew, TsCode: "000001.SZ", Qty: 100, Price: 12, AsOf: day + " 11:30:00"}, day); err == nil {
+		t.Fatal("op=new 撞柜台行必须仍拒（柜台行不是「上一次该票记录」，不适用同票覆盖）")
+	}
+}
+
+// storeRealPositionForTest 造一条柜台持仓行（测试夹具，同票覆盖反例用）。
+func storeRealPositionForTest(uid, code string, qty int, cost float64) RealPosition {
+	return RealPosition{TsCode: code, Name: "平安银行", Qty: qty, CostPrice: cost, UserID: uid, UpdatedAt: manualAsofOn(manualToday())}
 }

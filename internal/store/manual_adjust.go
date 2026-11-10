@@ -69,6 +69,10 @@ type ManualAdjustResult struct {
 	CashSeeded   string  `json:"cash_seeded"`   // 资金基线来源
 	AmountDelta  float64 `json:"amount_delta"`  // 本笔对资金的影响
 	PositionRows int     `json:"position_rows"` // 该账号手动持仓总行数（改后）
+	// Replaced 2026-11-10 owner 需求（同票覆盖）：op=new 命中同票时为 true——
+	// 上一次该票记录已清零、本次记录已替换录入。响应带上它，前端/调用方能区分
+	// "全新建仓"与"覆盖了旧记录"（后者屏上应有一句提示，不让覆盖静默发生）。
+	Replaced bool `json:"replaced,omitempty"`
 }
 
 // manualBaseline 一次改账读到的基线（持仓行 + 资金）。
@@ -172,13 +176,26 @@ func (d *DB) AdjustManualBook(userID string, req ManualAdjustReq, day string) (M
 
 	switch req.Op {
 	case ManualOpNew:
-		if base.posFound && base.posSeeded == ManualSeedManual {
-			return res, fmt.Errorf("%w: %s 已在手动持仓里，加仓请用「加仓」而不是「新增」", ErrInvalidManualAdjust, code)
-		}
-		if base.posFound {
+		if base.posFound && base.posSeeded == ManualSeedCounter {
 			// 柜台账里有这一码 ⇒ "新增"其实是在给已有仓位记一笔，走 add 才是加权语义。
+			// （柜台行不是"上一次该票记录"，不适用同票覆盖：覆盖柜台证据是写面红线，见文件头边界 1。）
 			return res, fmt.Errorf("%w: %s 柜台账里已有持仓（%d 股），请用「加仓」改账（新增只用于柜台从未回报过的票）",
 				ErrInvalidManualAdjust, code, base.pos.Qty)
+		}
+		// 2026-11-10 owner 需求（同票覆盖）：手动新增遇到同一股票（手动账已有行）时，
+		// 清空上一次该票记录（清零）后录入本次——不合并、不叠加。
+		// 「清零」含资金联动：上一次录入占用的现金按 行量×成本 返还，再按本次录入扣减，
+		// 账上只体现"最新这一次录入"的净效果（流水仍逐笔留痕，可回溯被清掉的那笔）。
+		// 成本直接取本次价（不与旧成本加权），名字沿用旧行（COALESCE 语义不变）。
+		// English: op=new on a code already in the manual book REPLACES the previous record —
+		// the old entry's cash effect (qty×cost) is refunded and the new entry charged; no merge.
+		if base.posFound {
+			res.Replaced = true
+			side = "买入"
+			newQty = req.Qty
+			newCost = req.Price
+			delta = float64(base.pos.Qty)*base.pos.CostPrice - float64(req.Qty)*req.Price
+			break
 		}
 		side = "买入"
 		newQty = req.Qty

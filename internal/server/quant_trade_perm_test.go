@@ -217,13 +217,31 @@ func TestTradingAdminStillHoldsPrivilegedRoutes(t *testing.T) {
 	}
 }
 
-// Q6：零权限位成员对 11 条"自己的实盘"路由全部 403——放行按位、不按角色。
+// Q6：零权限位成员对「自己的实盘」路由全部 403——放行按位、不按角色。
+// 例外：GET /api/positions/real 已于 2026-11-10 按 owner 需求（全用户手动持仓维护）放宽为
+// 账号级 authMiddleware——零权限位成员也能读到自己账号的实盘/手动账并手动维护；
+// 该路由的归属仍严格按 requestUserID，放行不等于跨账号可见。其余敏感写路径照旧 403。
 func TestBitlessMemberBlockedOnOpenedRoutes(t *testing.T) {
 	s, _, _, plain := newQuantTradePermServer(t)
 	for _, rt := range openedRoutes {
+		// 2026-11-10 owner 需求：实盘账读端点对所有登录用户开放（账号级归属），
+		// 不再要求 quant_trade/trading_admin 位；单独用例锁新语义，见下。
+		if rt.path == "/api/positions/real" {
+			continue
+		}
 		rr := adminDo(s, adminReq(s, plain, rt.method, rt.path, rt.body))
 		if rr.Code != http.StatusForbidden {
 			t.Fatalf("%s %s：零权限位应 403，实得 %d body=%s", rt.method, rt.path, rr.Code, rr.Body.String())
 		}
+	}
+}
+
+// Q7：2026-11-10 owner 需求（全用户手动持仓维护）——零权限位成员对 GET /api/positions/real
+// 可进（账号级 authMiddleware），读到的只是自己账号的账（handleRealPositions 按 uid 过滤）。
+func TestBitlessMemberCanReadOwnRealBook(t *testing.T) {
+	s, _, _, plain := newQuantTradePermServer(t)
+	rr := adminDo(s, adminReq(s, plain, http.MethodGet, "/api/positions/real", ""))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("零权限位成员应能读自己账号的实盘/手动账（200），实得 %d body=%s", rr.Code, rr.Body.String())
 	}
 }

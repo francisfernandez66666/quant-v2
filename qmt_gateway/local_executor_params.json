@@ -181,15 +181,15 @@
       "rules_sizing"
     ],
     "rule_arm": {
-      "break_down": "shadow",
+      "break_down": "live",
       "double_bump": "shadow",
       "dragon": "live",
       "dragon_return": "shadow",
       "factor_composite": "live",
-      "good_news_fade": "shadow",
-      "high_churn": "shadow",
-      "leader_decay": "shadow",
-      "leader_decay_v2": "shadow",
+      "good_news_fade": "live",
+      "high_churn": "live",
+      "leader_decay": "live",
+      "leader_decay_v2": "live",
       "pattern_template": "shadow"
     },
     "breadth_missing_scale": 0.9,

@@ -213,6 +213,16 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			// 而"设备侧自己造键"的表现是同一条信号在页面与手机上各弹一次。
 			SignalID: s.ID,
 		}
+		// 2026-11-10 owner 需求：做空战法正式归入做空——四个做空战法（高位滞涨/放量破位/
+		// 龙头断板/利好兑现砸盘）的信号在下发层统一归一 Direction="做空"，不受做空开关影响
+		// （开关只管显隐与 sell 动作，不管分类）；「卖点评估」保持现有 direction 语义不动
+		// （做空模式下它的徽标本身就是方向词"做空"，见 combat_agent/sell_side.go）。
+		// 这是从前端的兜底 `(s.direction || '做多')` 收敛到后端单一出口的一步。
+		if s.Strategy != "卖点评估" && combat_agent.IsShortTactic(s.StrategyType) {
+			fs.Direction = "做空"
+		} else {
+			fs.Direction = s.Direction // 空=做多历史兼容（omitempty，前端按缺省做多处理）
+		}
 		out = append(out, fs)
 	}
 	return out
@@ -335,6 +345,18 @@ func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
 	if pruned > 0 {
 		log.Printf("[server] /api/signals 撤下 %d 条失效信号(仅展示层,不影响日志/存储)", pruned)
 	}
+	// 2026-11-10 owner 需求（需求6 板块过滤）：/api/signals 是交易推荐卡（随信号下发的可执行卡）
+	// 与信号列表的唯一数据源，在这里按账号级板块过滤三开关（科创/创业/北交所）拦截已关闭板块的
+	// 个股；判定用统一工具函数 config.StockBoardOf（与前端 utils/boardFilter.js 同一份口径）。
+	// 注意：过滤只作用于下发展示面，不影响引擎内部打分与固化库。
+	bf := s.boardFilterOnFor(requestUserID(r))
+	kept := live[:0]
+	for _, sig := range live {
+		if bf.Allows(sig.Code) {
+			kept = append(kept, sig)
+		}
+	}
+	live = kept
 	out := toFixSignals(live)
 	// 逐票补充实时现价与涨跌幅（§N-12d：只有 >0 的真报价才允许覆盖触发价并改标 live）
 	for i := range out {

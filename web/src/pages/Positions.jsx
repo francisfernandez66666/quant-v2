@@ -30,7 +30,7 @@ import { showToast } from '../ui.jsx'
 import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行情来源契约（cost 不再冒充现价）
 // §ADVICE-TACTICS（2026-11-05）：建议行的股数文案与"被战法开关滤了几条"文案的唯一来源
 import { adviceSuggestText, adviceFilteredText, adviceRowLabel, tradeLevelSummaryText } from '../utils/adviceFormat.js'
-import { canStrict, canLiveTrading } from '../utils/perm.js'
+import { canStrict } from '../utils/perm.js'
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -182,8 +182,16 @@ export default function Positions() {
   const posSrc = bookDimSource('positions')
   const cashManual = cashSrc === 'manual'
   const posManual = posSrc === 'manual'
-  // 柜台可达＝两维都在报数——页头"柜台：可达"与操作列标题的唯一判据。
-  const counterReachable = cashSrc === 'counter' && posSrc === 'counter'
+  // 柜台可达＝两维都标 counter 且**确有柜台读数证据**（asof 或持仓行时刻）——页头"柜台：可达"
+  // 与操作列标题的唯一判据。
+  // 2026-11-10 owner 需求（全用户手动持仓维护）：book_source 对柜台从未回报过的账号也缺省标
+  // counter（SelectBookSources 的"手动不可用⇒保持柜台默认"语义，不改两维语义本身），但那不等于
+  // "可达"——无物理机账号（facai2026 等）没有任何柜台读数，若照字面判可达，它们会永远停在
+  // "柜台可达+无持仓"的死路上，进不了手动维护入口。可达必须有证据；没证据落 unknown 态。
+  // English: "counter" labels without any asof/timestamp evidence are not reachability — a
+  // machine-less account falls into the unknown state, which is where manual maintenance starts.
+  const counterReachable = cashSrc === 'counter' && posSrc === 'counter' &&
+    !!(realBookSource && (realBookSource.cash_asof || realBookSource.positions_asof || realBookSource.counter_frame_at))
   // 改账态＝**任一一维**确认为 manual（两维独立回落，资金新但持仓旧时也要能改账）。
   // 第三态 bookUnknown 既不改账也不报可达：读数未知时操作列保持今天的下真单行为，
   // 绝不把"点下单"静默变成"点记账"——那比按钮点不动更危险。
@@ -220,6 +228,9 @@ export default function Positions() {
   if (!paperGuard.current) paperGuard.current = createStaleGuard()
   const realGuard = useRef(null)
   if (!realGuard.current) realGuard.current = createStaleGuard()
+  // 2026-11-10 owner 需求：state/trades 两腿的权限位探测结果（null=未探测；false=已吃 403，
+  // 后续轮询直接跳过，避免每 60s 重复打一条必 403 的请求；true=有权限，照常拉）。
+  const realPermsRef = useRef(null)
 
   // 编辑中的持仓下标（-1 表示新增）
   const [editingIdx, setEditingIdx] = useState(-1)
@@ -272,21 +283,21 @@ export default function Positions() {
   const [sheetHolding, setSheetHolding] = useState(null)
 
   // §PERM-GATE 20260918：纸面持仓写操作（updateHoldings/addHoldingLot/setHoldingCost/
-  // closeHolding/sellHoldingLot/holdings/balance）与实盘读（/api/positions/real 系）后端均为
-  // admin 守卫（server.go:629-634/660-662）；成员点击必 403。前端按 admin 收敛写入口、
-  // 实盘 tab 显示无权限面板（此前 403 被 loadReal 的 catch 静默吞成"空表"，误导为无持仓）。
+  // closeHolding/sellHoldingLot/holdings/balance）后端为 admin 守卫；成员点击必 403，
+  // 前端按 admin 收敛写入口。
+  // 2026-11-10 owner 需求（全用户手动持仓维护）：实盘账读端点已放宽为账号级 authMiddleware，
+  // 实盘 tab 对所有登录用户渲染——手动增删改实盘持仓（manual_* 写面）不再要求任何权限位；
+  // canTrading 继续只管运营专属腿（建议回填 advice、execute 下真单）。
   const canFundsWrite = canStrict('funds_admin')
   const canTrading = canStrict('trading_admin')
-  // §MULTI-ACCT-B 批5：实盘**读**三腿（/api/qmt/state、/api/positions/real、/api/qmt/trades）
-  // 本批对 quant_trade 开放；canTrading 继续只管运营专属腿（建议回填 advice、execute 下单）。
-  const canLive = canLiveTrading()
   // §FIX-20261028-F09：实盘三段拉取的失败台账（失败请名到腿、成功即销案、不清旧读数）
   const ledger = useLoadLedger()
 
   // §N-09：纸面/实盘两条轮询统一走 usePolling——后台暂停、恢复补一次、卸载清理。
-  // 实盘只在 admin 且当前标签为「实盘」时轮询（与旧 switchBook 的启停语义一致）。
+  // 实盘只在当前标签为「实盘」时轮询（2026-11-10 owner 需求：所有登录用户都能维护实盘持仓，
+  // 轮询判据从 canLive 收敛为标签本身；无权限的 state/trades 腿在 loadReal 内按 403 静默处理）。
   usePolling(load, 60000, bookTab === 'paper')
-  usePolling(loadReal, 60000, canLive && bookTab === 'real')
+  usePolling(loadReal, 60000, bookTab === 'real')
 
   // 纸面持仓轮询定时器（30s）
   // 纸面/实盘轮询均交给 §N-09 的 usePolling，不再使用页面级定时器 ref
@@ -713,17 +724,28 @@ export default function Positions() {
   // 现在接仓里统一的"按腿记账"设施（useLoadLedger）：失败只点名那一腿、不清旧数据，
   // 成功即销案；页头用共享的 LoadFailBanner 渲染（testid=load-ledger 全站唯一）。
   async function loadReal() {
-    // §MULTI-ACCT-B 批5：这一腿是实盘**读**（state / positions/real / trades 三条，本批都按
-    // 请求者取账），判据从 canTrading 换成 canLive（trading_admin 或 quant_trade）。
-    // 运营专属腿（advice 建议回填、execute 下单）仍是 canTrading，见下方同族早退与操作列。
-    if (!canLive) return // §PERM-GATE：无实盘读权限不发起必 403 的请求
+    // 2026-11-10 owner 需求（全用户手动持仓维护）：实盘账读三腿改为**所有登录用户**发起
+    // （后端 GET /api/positions/real 已放宽为账号级 authMiddleware，按请求者取账）。
+    // /api/qmt/state 与 /api/qmt/trades 仍是 trading_admin/quant_trade 守卫：无权限位成员
+    // 对这两腿吃 403 时按"无实盘权限"静默处理（保持默认 qmtState，不进失败台账刷红条），
+    // 不影响持仓/手动账主腿。运营专属腿（advice 建议回填、execute 下单）仍是 canTrading。
+    // English: the real-book leg loads for every logged-in user (account-scoped backend); the
+    // state/trades legs stay privileged and their 403s are treated as "no live perms", not failures.
     const token = realGuard.current.begin() // §M-10 本轮代号（三段拉取共用一次判定）
     const failMsg = (e) => (e && e.message ? String(e.message) : '请求失败')
-    try {
-      const st = await api.fetchQMTState()
-      if (st && !realGuard.current.isStale(token)) { setQmtState(st); ledger.clear('实盘状态') }
-    } catch (e) {
-      ledger.mark('实盘状态', failMsg(e))
+    // state/trades 两腿是 trading_admin/quant_trade 守卫：已探测到无权限（realPermsRef=false）
+    // 就不再发必 403 的请求；首次仍发一次以探测（有权限的账号照常拿到读数）。
+    if (realPermsRef.current !== false) {
+      try {
+        const st = await api.fetchQMTState()
+        if (st && !realGuard.current.isStale(token)) { setQmtState(st); ledger.clear('实盘状态') }
+        realPermsRef.current = true
+      } catch (e) {
+        // 403＝该账号没有实盘状态读权限（无 quant_trade/trading_admin 位），不是故障：
+        // 静默保持默认态（enabled=false ⇒ 熔断徽标不闪红条），只记一次已探测。
+        if (api.isForbidden(e)) { realPermsRef.current = false }
+        else ledger.mark('实盘状态', failMsg(e))
+      }
     }
     try {
       const data = await api.fetchRealPositions()
@@ -733,20 +755,29 @@ export default function Positions() {
       // §MANUAL-BOOK-UNIFY：book_source（后端单点装配的"这一维用谁"）透传进 state，
       // 操作分流 / 页头状态 / 行角标 全部只认它。载荷没带该键 ⇒ null ＝ 读数未知
       //（前端就这样如实显示），绝不本地重新判一次新鲜度去猜。
-      if (data && data.book_source) setRealBookSource(data.book_source)
-      else setRealBookSource(null)
+      // 顺带把后端随响应下发的柜台帧读数（counter_frame_at/counter_frozen，§LEDGER-FROZEN-BANNER）
+      // 并进同一份 state——它们是响应顶层键，不并进来页头的冻结横幅判不到。
+      if (data && data.book_source) {
+        setRealBookSource({
+          ...data.book_source,
+          counter_frame_at: data.counter_frame_at || '',
+          counter_frozen: !!data.counter_frozen,
+        })
+      } else setRealBookSource(null)
       ledger.clear('实盘持仓')
     } catch (e) {
       ledger.mark('实盘持仓', failMsg(e))
     }
     // §F1 实盘整体盈亏（已实现+浮动）：页头优先展示，无实盘才回落纸面
-    try {
-      const t = await api.fetchQMTTrades()
-      if (realGuard.current.isStale(token)) return
-      if (t && t.summary) setRealTrades(t.summary)
-      ledger.clear('实盘成交')
-    } catch (e) {
-      ledger.mark('实盘成交', failMsg(e))
+    if (realPermsRef.current !== false) {
+      try {
+        const t = await api.fetchQMTTrades()
+        if (realGuard.current.isStale(token)) return
+        if (t && t.summary) setRealTrades(t.summary)
+        ledger.clear('实盘成交')
+      } catch (e) {
+        if (!api.isForbidden(e)) ledger.mark('实盘成交', failMsg(e))
+      }
     }
   }
   // 取实盘持仓的有效现价（无效价返回 0，避免展示脏数据）
@@ -1122,14 +1153,30 @@ export default function Positions() {
     // §MULTI-ACCT-B 批5：execute 未对 quant_trade 开放，按 canTrading 隐藏的口径不变。
     // English: same four buttons, two meanings — real orders while the counter is reachable,
     // book adjustments (no order) when it is not; unknown keeps today's real-order behaviour.
-    { colKey: 'actions', title: manualMode ? '改账' : '操作', width: 200, cell: ({ row }) => (!canTrading ? <span style={{ color: 'var(--app-border)' }}>—</span> : (
-      <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
-        <Button size="small" variant="outline" theme="primary" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'add') : openRealAction(row, 'add') }}>加仓</Button>
-        <Button size="small" variant="outline" theme="primary" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'reduce') : openRealAction(row, 'reduce') }}>减仓</Button>
-        <Button size="small" variant="outline" theme="warning" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'tp') : openRealAction(row, 'tp') }}>止盈</Button>
-        <Button size="small" variant="outline" theme="danger" disabled={manualMode ? false : realTripped} onClick={(e) => { e.stopPropagation(); manualMode ? openManualAdjust(row, 'close') : openRealAction(row, 'close') }}>清仓</Button>
-      </div>
-    )) },
+    // 2026-11-10 owner 需求（全用户手动持仓维护）：改账态（manualMode）对所有登录用户开放——
+    // 这写的是"自己声称的账"（manual_*，账号级归属）；真单（柜台可达走 execute）仍是
+    // trading_admin 专属，非管理员的柜台态保持 '—'（与既有 §MULTI-ACCT-B 口径一致）。
+    { colKey: 'actions', title: manualMode ? '改账' : '操作', width: 200, cell: ({ row }) => {
+      if (manualMode) {
+        return (
+          <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
+            <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openManualAdjust(row, 'add') }}>加仓</Button>
+            <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openManualAdjust(row, 'reduce') }}>减仓</Button>
+            <Button size="small" variant="outline" theme="warning" onClick={(e) => { e.stopPropagation(); openManualAdjust(row, 'tp') }}>止盈</Button>
+            <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); openManualAdjust(row, 'close') }}>清仓</Button>
+          </div>
+        )
+      }
+      if (!canTrading) return <span style={{ color: 'var(--app-border)' }}>—</span>
+      return (
+        <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
+          <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'add') }}>加仓</Button>
+          <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'reduce') }}>减仓</Button>
+          <Button size="small" variant="outline" theme="warning" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'tp') }}>止盈</Button>
+          <Button size="small" variant="outline" theme="danger" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'close') }}>清仓</Button>
+        </div>
+      )
+    } },
   ]
 
   return (
@@ -1283,17 +1330,11 @@ export default function Positions() {
 
         <Tabs.TabPanel value="real" label={realTripped ? '实盘持仓 !' : '实盘持仓'}>
           {/* §PERM-GATE 20260918：实盘读端点原为 admin 守卫，成员 403 曾被 loadReal 的 catch
-              静默吞成"空表"——改为显式无权限面板，与 Quant 页姿势一致。
-              §MULTI-ACCT-B 批5：判据换成 canLive（trading_admin 或 quant_trade）——
-              持有量化交易位的成员读的是**自己账号**的实盘账，不再是无权限面板；
-              零权限位的成员仍走这一面板（e2e uat_full 的"成员实盘 Tab 显示无权限"腿据此仍成立）。 */}
-          {!canLive ? (
-            <Card>
-              <div style={{ padding: 18, borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
-                🔒 无权限访问实盘持仓：当前登录「{api.getAccount() || '未知'}」为普通用户，实盘账本仅管理员账号可见。
-              </div>
-            </Card>
-          ) : (
+              静默吞成"空表"——后经 §MULTI-ACCT-B 批5 放开到 canLive（trading_admin 或 quant_trade）。
+              2026-11-10 owner 需求（全用户手动持仓维护）：读端点已放宽为账号级 authMiddleware
+              （后端归属严格按 requestUserID，A 读不到 B 的账），实仓 tab 对**所有登录用户**渲染；
+              无权限位的成员没有 state/trades 徽标读数（loadReal 内按 403 静默跳过），
+              但可以读到自己账号的实盘/手动账并增删改。敏感写路径（execute 下真单等）仍 admin。 */}
           <>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
             <span style={{ color: qmtState.enabled ? 'var(--app-down)' : 'var(--app-muted)' }}>{qmtState.enabled ? '已启用' : '未启用'}</span>
@@ -1367,6 +1408,10 @@ export default function Positions() {
               <>
                 <Tag data-testid="book-unknown" theme="danger" size="small">柜台：读数未知</Tag>
                 <span className="muted">读数未知：未取得账本来源，操作列保持下真单；请刷新重试</span>
+                {/* 2026-11-10 owner 需求（全用户手动持仓维护）：无物理机账号（柜台从未回报、
+                    手动账也还没录）从这里开始手动维护——先录一笔，book_source 立即翻成改账态。 */}
+                <Button data-testid="manual-new-entry" size="small" variant="outline" theme="warning" onClick={openManualNew}>改账·新增</Button>
+                <Button data-testid="manual-set-cash-entry" size="small" variant="outline" theme="default" onClick={openManualSetCash}>直接改资金</Button>
               </>
             ) : null}
           </div>
@@ -1401,7 +1446,6 @@ export default function Positions() {
             </Card>
           )}
           </>
-          )}
         </Tabs.TabPanel>
       </Tabs>
 

@@ -68,7 +68,7 @@ async function openRealBook() {
 }
 
 // 三种后端单点装配的来源读数：两维都 counter / 两维都 manual / 载荷不带键（unknown）。
-const COUNTER = { cash: 'counter', positions: 'counter', cash_asof: '', positions_asof: '', taken_over_at: '' }
+const COUNTER = { cash: 'counter', positions: 'counter', cash_asof: '2026-11-06 09:30:00', positions_asof: '2026-11-06 09:30:00', taken_over_at: '' }
 const MANUAL = {
   cash: 'manual', positions: 'manual',
   cash_asof: '2026-11-06 09:30:00', positions_asof: '2026-11-06 09:30:00', taken_over_at: '',
@@ -117,7 +117,9 @@ describe('§MANUAL-BOOK-UNIFY 实仓三态：可达下真单／不可达改账�
     expect(screen.getByTestId('book-unknown')).toBeInTheDocument()
     // 「没读到」与「读到 0」是两件事：状态行不许出现任何数字金额。
     expect(strip.textContent).not.toMatch(/[¥￥]\s*0|0\.00/)
-    expect(screen.queryByTestId('manual-new-entry')).not.toBeInTheDocument()
+    // 2026-11-10 owner 需求：unknown 态必须给出两个手动维护入口（无物理机账号从这里开始建账）。
+    expect(screen.getByTestId('manual-new-entry')).toBeInTheDocument()
+    expect(screen.getByTestId('manual-set-cash-entry')).toBeInTheDocument()
     expect(screen.queryByTestId('counter-reachable')).not.toBeInTheDocument()
   })
 
@@ -132,14 +134,20 @@ describe('§MANUAL-BOOK-UNIFY 实仓三态：可达下真单／不可达改账�
     const raw = fs.readFileSync(path.join(HERE, '..', 'pages', 'Positions.jsx'), 'utf-8')
     const src = raw.replace(/^[ \t]*\/\/.*$/gm, '').replace(/\{?\/\*[\s\S]*?\*\/\}?/g, '')
     expect(src.length, '夹具自检：源码要读到位').toBeGreaterThan(1000)
-    // ① 列标题与按钮分流都挂在 manualMode 上（改回一律真单会让这条红）。
+    // ① 列标题随态分流（改回一律真单会让这条红）。
     expect((src.match(/title: manualMode \? '改账' : '操作'/g) || []).length).toBe(1)
-    expect((src.match(/manualMode \? openManualAdjust\(row, 'add'\) : openRealAction\(row, 'add'\)/g) || []).length).toBe(1)
+    // 2026-11-10 owner 需求（全用户手动持仓维护）：操作列改为显式分流——改账态（manualMode）
+    // 对所有登录用户开放（4 个 openManualAdjust），真单分支（4 个 openRealAction，带
+    // disabled={realTripped}）只属于 trading_admin；静态锁按新结构逐个钉死。
+    expect((src.match(/openManualAdjust\(row, '(add|reduce|tp|close)'\)/g) || []).length,
+      '改账态四个动作必须齐全').toBe(4)
+    expect((src.match(/openRealAction\(row, '(add|reduce|tp|close)'\)/g) || []).length,
+      '真单态四个动作必须齐全').toBe(4)
     // ② 真单＝「确认下单」，改账＝「确认改账 · 不下单」，两串必须同时在位且不等。
     expect(src).toContain('确认下单')
     expect(src).toContain('确认改账 · 不下单')
-    expect((src.match(/disabled=\{manualMode \? false : realTripped\}/g) || []).length,
-      '桥断熔断时四个改账按钮必须仍可点（这才是不达态唯一能用上的时刻）').toBe(4)
+    expect((src.match(/disabled=\{realTripped\}/g) || []).length,
+      '熔断只禁真单按钮（改账态按钮必须恒可点）').toBe(4)
     // ③ 行级来源角标只在持仓维确认为 manual 时挂。
     expect((src.match(/posSrc === 'manual'/g) || []).length).toBeGreaterThanOrEqual(1)
     expect((src.match(/data-testid="manual-row-badge"/g) || []).length).toBe(1)

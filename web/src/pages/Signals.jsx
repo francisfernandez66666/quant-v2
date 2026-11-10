@@ -17,6 +17,8 @@ import { on } from '../sseBus.js'
 import { Loading, confirmDialog } from '../ui.jsx'
 import SignalDecisionsCard from '../components/SignalDecisionsCard.jsx' // §DECISION-TODAY 今日动态仓位计算过程
 import { useSearchParams } from 'react-router-dom' // §W-04 子页签写进 URL，刷新不丢、可分享
+// 2026-11-10 owner 需求：板块过滤（科创/创业/北交所）前端兜底——与后端 StockBoardOf 同一份判定口径
+import { filterByBoardFilter } from '../utils/boardFilter.js'
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
 const FILTERS = [
@@ -25,6 +27,21 @@ const FILTERS = [
   { key: 'observe', label: '观察' },
   { key: 'mute', label: '静默' },
 ]
+
+// 2026-11-10 owner 需求（方向归类）：四个做空战法（中文名=列表 strategy 展示名，
+// 英文名=strategy_type 下发值）。direction 缺失时按战法类型判断方向——后端已归一
+// direction 下发，这里是旧载荷/缓存的兜底，与 internal/combat_agent.IsShortTactic 同口径。
+const SHORT_STRATEGIES = [
+  '高位滞涨', '放量破位', '龙头断板', '利好兑现砸盘',
+  'high_churn', 'break_down', 'leader_decay', 'good_news_fade',
+]
+
+// 判断一条信号是否做空战法信号：优先看 direction，缺失再按战法名/类型兜底
+function isShortSignal(s) {
+  if (!s) return false
+  if (s.direction) return s.direction === '做空'
+  return SHORT_STRATEGIES.includes(s.strategy) || SHORT_STRATEGIES.includes(s.strategy_type)
+}
 
 // 取长描述的前缀或前 6 个字符，用于 D-pill 展示
 function shortDesc(s) {
@@ -135,6 +152,8 @@ export default function Signals() {
   const admin = api.isAdmin()
   // §SHORT-4 做空开关（决策⑤）：关闭时列表整体隐藏做空信号；开启后追加方向筛选与红徽标
   const [shortEnabled, setShortEnabled] = useState(false)
+  // 2026-11-10 owner 需求：板块过滤三开关读数（科创/创业/北交所，null=未取到→不过滤，与历史行为一致）
+  const [boardFilterCfg, setBoardFilterCfg] = useState(null)
   // 当前方向筛选（all/做多/做空，仅做空开关开启时生效）
   const [activeDir, setActiveDir] = useState('all')
   // 待确认交易的信号对象
@@ -154,30 +173,59 @@ export default function Signals() {
   // 页面可见性变化处理函数
   const visHandler = useRef(null)
   // §修复 P2#23：受控排序——所有列可点击表头排序（此前表格完全没有 sorter，点表头无反应），
-  // 受控状态保证 5s 轮询整体替换信号列表时用户选择的排序不被重置。
-  // English: P2#23 — controlled sort so every column is header-sortable (previously the table had no
-  // sorters at all) and the user's chosen sort survives the 5s signal-list poll.
+  // 受控状态保证轮询整体替换信号列表时用户选择的排序不被重置。
+  // 2026-11-10 owner 需求（排序修复）：受控 data 下 TDesign 内部排序被父组件数据覆盖、点表头
+  // 无反应——sort 状态现在只管图标与方向，数据排序在渲染层自行应用（见 filteredSignals 之后）。
+  // English: P2#23 — controlled sort; since 2026-11-10 the sort state drives an explicit
+  // render-layer sort of the data (TDesign's internal sort is clobbered by controlled `data`).
   const [sort, setSort] = useState(null)
 
   // 从信号列表中提取全部战法名称作为筛选下拉选项（去重）
   const strategyOptions = Array.from(new Set(signals.map((s) => s.strategy).filter(Boolean)))
 
-  // §SHORT-4 做空显隐（决策⑤）：开关关闭时做空战法信号不进列表；开启后按方向筛选
-  // English: short signals are hidden entirely while the switch is off; direction filter when on.
+  // §SHORT-4 做空显隐（决策⑤）：开关关闭时做空战法信号不进列表；开启后按方向筛选。
+  // 2026-11-10 owner 需求：方向判定不再用 `(s.direction || '做多')` 盲兜底（做空战法信号
+  // direction 缺失时会漏进做多筛选）——缺失时按战法类型判断（isShortSignal）。
+  // English: direction fallback now consults the bear-tactic list instead of assuming 做多.
   const dirScoped = shortEnabled
-    ? signals.filter((s) => activeDir === 'all' || (s.direction || '做多') === activeDir)
-    : signals.filter((s) => s.direction !== '做空')
+    ? signals.filter((s) => activeDir === 'all' || (s.direction || (isShortSignal(s) ? '做空' : '做多')) === activeDir)
+    : signals.filter((s) => !isShortSignal(s))
   // 按等级筛选、战法筛选，并过滤掉「预期差」非标准评级信号
   let filteredSignals = dirScoped
     .filter((s) => (activeFilter !== 'all' ? s.remind_level === activeFilter : true))
     .filter((s) => (activeStrategy !== 'all' ? s.strategy === activeStrategy : true))
     // 过滤掉「预期差」战法（非标准评级信号，不在列表展示）
     .filter((s) => s.strategy !== '预期差')
+  // 2026-11-10 owner 需求：板块过滤前端兜底（后端已在 /api/signals 下发层过滤；
+  // 这里挡旧一轮轮询载荷与缓存残留，口径与后端 StockBoardOf 一致）
+  if (boardFilterCfg) {
+    filteredSignals = filterByBoardFilter(filteredSignals, boardFilterCfg)
+  }
   // §F1 搜索框生效：代码或名称模糊匹配（空串时不过滤）
   if (q.trim()) {
     const kw = q.trim().toLowerCase()
     filteredSignals = filteredSignals.filter((s) =>
       (s.code || '').toLowerCase().includes(kw) || (s.name || '').toLowerCase().includes(kw))
+  }
+
+  // 2026-11-10 owner 需求（排序修复）：受控 data 下 TDesign 的内部排序会被父组件下一轮渲染
+  // 重新下发的未排序 data 覆盖（useSorter 的 tData 受控同步回弹），点表头"看起来没反应"。
+  // 改为渲染层自行应用排序：sort 状态仍由表头 onSortChange 维护，数据在这里排好再交给
+  // Table——20s 轮询整体替换 signals 后排序保持（状态在，每次渲染都按当前 sort 重排）。
+  // English: TDesign's internal sort is clobbered by the controlled `data` prop on re-render;
+  // apply the sort ourselves so header clicks take effect and survive the polling replace.
+  const sorters = {
+    code: sorterStr('code'),
+    name: sorterStr('name'),
+    price: sorterNum('price'),
+    strategy: sorterStr('strategy'),
+    generated_at: sorterStr('generated_at'),
+    total_score: sorterNum('total_score'),
+  }
+  let sortedSignals = filteredSignals
+  if (sort && sort.sortBy && sorters[sort.sortBy]) {
+    const cmp = sorters[sort.sortBy]
+    sortedSignals = [...filteredSignals].sort(sort.descending ? (a, b) => cmp(b, a) : cmp)
   }
 
   // 根据操作结果弹出成功/失败提示
@@ -315,6 +363,11 @@ export default function Signals() {
     try { setShortEnabled(!!(await api.fetchShortStatus()).short_enabled) } catch (_) {}
   }
 
+  // 2026-11-10 owner 需求：探测板块过滤三开关（关闭的板块在列表兜底过滤；取不到=不过滤）
+  async function probeBoardFilter() {
+    try { setBoardFilterCfg(await api.fetchBoardFilterStatus()) } catch (_) { setBoardFilterCfg(null) }
+  }
+
   // §F5 SSE 新信号/扫描到达时刷新列表（改走 App 单连接扇出的事件总线，不再各页自建 SSE 连接）
   const unsubBus = useRef(null)
   // 事件总线回调：收到「新信号」或「完成一轮扫描」事件时重新拉取信号列表
@@ -327,6 +380,7 @@ export default function Signals() {
     load()
     probePaper()
     probeShort()
+    probeBoardFilter()
     // §F5 兜底轮询由 5s 降为 20s（信号看板需较实时）；新信号主要靠 SSE `scan` 即时刷新
     timer.current = setInterval(load, 20000)
     visHandler.current = () => {
@@ -567,14 +621,16 @@ export default function Signals() {
       )}
 
 
-      {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板 */}
+      {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板。
+          2026-11-10 owner 需求：data 改传渲染层已排序的 sortedSignals（受控 data 下 TDesign
+          内部排序会被父组件数据覆盖，见上方排序修复注释）；sort/onSortChange 继续管图标态。 */}
       <Card>
         <Table
           rowKey="code"
-          data={filteredSignals}
+          data={sortedSignals}
           columns={columns}
           sort={sort}
-          onSortChange={(val) => setSort(val)}
+          onSortChange={(val) => setSort(val || null)}
           size="small"
           expandedRow={({ row }) => (
             <MinuteView code={row.code} name={row.name} />

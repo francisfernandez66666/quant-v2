@@ -153,6 +153,10 @@ export default function Settings() {
 
   const [newsShowAll, setNewsShowAll] = useState(false)
 
+  // 2026-11-10 owner 需求：板块过滤三开关（科创/创业/北交所）。true=显示该板块；
+  // 默认全开（与后端出厂态一致，读不到时也按全开回显——与历史行为兼容）。
+  const [boardFilter, setBoardFilter] = useState({ star_enabled: true, chinext_enabled: true, bse_enabled: true })
+
   // §D-3（GAP_VERIFY_20260917_PM）配置历史/回滚卡：接上早已就绪但零消费的两组端点
   // （GET /api/config/history[?diff=TS] + POST /api/config/rollback 规则快照；
   //   GET /api/research/strategies/snapshots + POST /api/research/strategies/rollback 战法参数）。
@@ -500,6 +504,11 @@ export default function Settings() {
           const ns = await api.fetchNewsShowAllStatus()
           if (ns && typeof ns.news_show_all === 'boolean') setNewsShowAll(ns.news_show_all)
         } catch (_) {}
+        // 5) 2026-11-10 owner 需求：读取板块过滤三开关状态（读不到时保持默认全开回显）
+        try {
+          const bf = await api.fetchBoardFilterStatus()
+          if (bf) setBoardFilter((prev) => ({ ...prev, ...bf }))
+        } catch (_) {}
       }
     })()
   }, [canConfig])
@@ -812,6 +821,36 @@ export default function Settings() {
         <div style={rowStyle}>
           <span style={labelStyle}>说明</span>
           <span className="muted" style={{ fontSize: 12 }}>该开关即时生效，不影响引擎打分（引擎始终按 |score|≥0.5 过滤）</span>
+        </div>
+      </Card>
+
+      {/* 2026-11-10 owner 需求：板块过滤三开关（科创/创业/北交所）。关闭的板块在
+          「交易推荐卡」（/api/signals 及其信号卡）与「交易提醒」（消息中心）两个 surfaces
+          被过滤；后端出 signals/recommendations 时已过滤，这里只是把开关落库 + 回显。 */}
+      <Card title="板块过滤" style={{ marginBottom: 16 }}>
+        {[
+          { key: 'star_enabled', label: '科创板（688/689 开头）' },
+          { key: 'chinext_enabled', label: '创业板（300/301 开头）' },
+          { key: 'bse_enabled', label: '北交所（43/83/87/88/92 等开头）' },
+        ].map((b) => (
+          <div key={b.key} style={rowStyle}>
+            <span style={{ ...labelStyle, width: 240 }}>{b.label}</span>
+            <ToggleSw
+              checked={!!boardFilter[b.key]}
+              onChange={(v) => {
+                setBoardFilter((prev) => ({ ...prev, [b.key]: v }))
+                // 即时落库（与"显示全部资讯"开关同姿势）：成功后用后端回传的全量状态校准，
+                // 失败回滚本地态——不许出现"界面已关、后端没存"的假象。
+                api.toggleBoardFilter(b.key.replace('_enabled', ''), v)
+                  .then((res) => { if (res) setBoardFilter((prev) => ({ ...prev, ...res })) })
+                  .catch(() => setBoardFilter((prev) => ({ ...prev, [b.key]: !v })))
+              }}
+            />
+          </div>
+        ))}
+        <div style={rowStyle}>
+          <span style={labelStyle}>说明</span>
+          <span className="muted" style={{ fontSize: 12 }}>关闭后该板块个股从交易推荐卡与交易提醒中过滤（按账号持久化，即时生效）</span>
         </div>
       </Card>
 

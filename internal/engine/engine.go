@@ -3673,9 +3673,35 @@ func confidenceTier(c float64) string {
 	}
 }
 
+// filterSignalsByBoard 2026-11-10 owner 需求（需求6）：按板块过滤三开关拦信号的轻量助手
+// （统一判定在 config.StockBoardOf / BoardFilterConfig.Allows，这里只做过滤循环）。
+// English: drops signals whose stock board is disabled by the account's board filter.
+func filterSignalsByBoard(signals []combat_agent.Signal, bf config.BoardFilterConfig) []combat_agent.Signal {
+	if len(signals) == 0 {
+		return signals
+	}
+	out := signals[:0]
+	for _, s := range signals {
+		if bf.Allows(s.Code) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult, quotes map[string]*data.StockInfo) {
 	if e.msgStore == nil {
 		return
+	}
+	// 2026-11-10 owner 需求（需求6 板块过滤）：消息中心/SSE 是「交易提醒」surface——
+	// 按账号级板块过滤三开关（科创/创业/北交所）拦截已关闭板块的个股；判定用统一工具函数
+	// config.StockBoardOf（与前端 utils/boardFilter.js 同一份口径）。cfgMgr 缺席（最小装配/测试）
+	// 时回默认三板块全开，行为与从前一致。
+	if e.cfgMgr != nil {
+		bf := e.cfgMgr.GetBoardFilterConfigFor(e.userID)
+		bull = filterSignalsByBoard(bull, bf)
+		bear = filterSignalsByBoard(bear, bf)
+		alertSignals = filterSignalsByBoard(alertSignals, bf)
 	}
 	items := make([]data.MessageItem, 0, len(bull)+len(bear)+len(alertSignals)+2)
 	// 交易信号：做多/做空，消息中心级别为"交易信号"，Action 按其方向定为 买入/卖出

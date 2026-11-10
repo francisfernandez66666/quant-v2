@@ -4090,6 +4090,117 @@ func (m *Manager) SetLongShortConfigFor(userID string, c LongShortConfig) error 
 	return nil
 }
 
+// perUserBoardFilterKey 每账号板块过滤三开关在 KVStore 中的键（2026-11-10 owner 需求）。
+// 独立小节落 auth.json 的 per-user 配置存储（与 quant_config_longshort_v1 同一册账、各占一键），
+// 不写进 quant_config_json_v1 那份 Rules 快照——避免破坏既有键的解析与快照/回滚语义。
+// English: per-account board-filter toggles live in their own KV key inside the same per-user
+// config document; the existing quant_config_json_v1 Rules snapshot is untouched.
+const perUserBoardFilterKey = "quant_config_boardfilter_v1"
+
+// BoardFilterConfig 每账号板块过滤三开关（2026-11-10 owner 需求）。
+// 语义：true＝该板块照常显示/参与交易推荐与提醒；false＝在交易推荐卡（/api/signals 及其
+// 信号卡）与交易提醒（消息中心）两个 surfaces 过滤该板块的个股。
+// （BoardFilterConfig holds the per-account STAR/ChiNext/BSE filter switches.）
+type BoardFilterConfig struct {
+	// 科创板（688/689 开头）
+	StarEnabled bool `json:"star_enabled"`
+	// 创业板（300/301 开头）
+	ChiNextEnabled bool `json:"chinext_enabled"`
+	// 北交所（43/83/87/88/92 及以 4/8 开头）
+	BseEnabled bool `json:"bse_enabled"`
+}
+
+// DefaultBoardFilterConfig 出厂态：三个板块全开（未配置过开关的账号行为与从前一致）。
+func DefaultBoardFilterConfig() BoardFilterConfig {
+	return BoardFilterConfig{StarEnabled: true, ChiNextEnabled: true, BseEnabled: true}
+}
+
+// StockBoardOf 板块判定的**统一工具函数**（2026-11-10 owner 需求：前后端共用一份判定口径，
+// 前端镜像实现见 web/src/utils/boardFilter.js，两处必须同判——漂了就会出现"后端滤了前端又放回
+// 来"或反向漏网）。
+// 参数 code 兼容 "688001.SH"（带市场后缀）与 "688001"（裸六位）两种形态。
+// 返回 "star"（科创板：688/689 开头）/ "chinext"（创业板：300/301 开头）/
+// "bse"（北交所：43/83/87/88/92 明确列出，另按 owner 口径以 4/8 开头整体归入）/ ""（主板/未知）。
+func StockBoardOf(code string) string {
+	// 去掉 .SH/.SZ/.BJ 等市场后缀，取连续数字前缀
+	s := code
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		s = s[:i]
+	}
+	n := 0
+	for n < len(s) && s[n] >= '0' && s[n] <= '9' {
+		n++
+	}
+	p := s[:n]
+	if p == "" {
+		return ""
+	}
+	if strings.HasPrefix(p, "688") || strings.HasPrefix(p, "689") {
+		return "star"
+	}
+	if strings.HasPrefix(p, "300") || strings.HasPrefix(p, "301") {
+		return "chinext"
+	}
+	if p[0] == '4' || p[0] == '8' || strings.HasPrefix(p, "92") {
+		return "bse"
+	}
+	return ""
+}
+
+// Allows 该代码是否通过板块过滤（板内开关关闭即拦；主板/未知代码不受开关影响恒放行）。
+func (c BoardFilterConfig) Allows(code string) bool {
+	switch StockBoardOf(code) {
+	case "star":
+		return c.StarEnabled
+	case "chinext":
+		return c.ChiNextEnabled
+	case "bse":
+		return c.BseEnabled
+	}
+	return true
+}
+
+// GetBoardFilterConfigFor 返回运营数据归属账号的板块过滤三开关（运营配置系统级共享，
+// 与做多/做空开关同一归属口径；未配置时三板块全开）。
+func (m *Manager) GetBoardFilterConfigFor(userID string) BoardFilterConfig {
+	def := DefaultBoardFilterConfig()
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return def
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(oid, perUserBoardFilterKey)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return def
+	}
+	var c BoardFilterConfig
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		log.Printf("[config] 账号 %s 板块过滤配置反序列化失败, 回退默认(全开): %v", oid, err)
+		return def
+	}
+	return c
+}
+
+// SetBoardFilterConfigFor 更新运营数据归属账号的板块过滤三开关并持久化（写后复读自证，
+// 与做多/做空开关同姿势）。
+func (m *Manager) SetBoardFilterConfigFor(userID string, c BoardFilterConfig) error {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return nil
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("账号 %s 板块过滤配置序列化失败: %w", oid, err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.setConfigVerifiedLocked(oid, perUserBoardFilterKey, data); err != nil {
+		return fmt.Errorf("账号 %s 板块过滤配置%w", oid, err)
+	}
+	return nil
+}
+
 // GetStrategyConfig 返回全局策略参数配置（无账号隔离时使用）。
 // §N-4/§CFGSMASH-concurrency（2026-09-22 傍晚批）：本 getter 起返回**快照拷贝的指针**，
 // 不再别名内部活体 —— 旧实现 `return &m.Rules.Strategy` 让跨 goroutine 的持有者

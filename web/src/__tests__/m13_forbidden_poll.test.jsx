@@ -485,14 +485,17 @@ describe('§0929GATE-403 成员首屏预过滤（本地角色缓存只决定发�
     // §PAGING-DEFAULT（2026-11-01）：角标改走 fetchAlertTotal()（只取 1 条 + X-Total-Count），
     // 判据的意图不变——**仍是「admin 才轮询、且必须早退」**，只是取数函数换了。
     expect(read('App.jsx')).toMatch(/if \(api\.isAdmin\(\)\) \{\s*try \{\s*(?:\/\/[^\n]*\n\s*)*setAlertCount\(await api\.fetchAlertTotal\(\)\)/)
-    // ⑤ Positions：§MULTI-ACCT-B 批5 把「实盘读」与「运营动作」拆成两档判据——
-    //    loadReal（state / positions/real / trades 三条本批已放行给 quant_trade）走 canLive；
-    //    建议回填 advice 与 execute 下单**继续**走 canTrading（本批刻意没放）。
+    // ⑤ Positions：§MULTI-ACCT-B 批5 把「实盘读」与「运营动作」拆成两档判据。
+    //    2026-11-10 owner 需求（全用户手动持仓维护）再度改判：实盘账主腿
+    //    （GET /api/positions/real，账号级归属）对**所有登录用户**放行——loadReal 不再按
+    //    canLive 早退；state/trades 两腿仍是 trading_admin/quant_trade 守卫，403 在 loadReal
+    //    内按"无实盘权限"静默跳过（realPermsRef 单次探测，不反复打必 403 的请求）。
+    //    敏感写路径不变：建议回填 advice 与 execute 下单**继续**走 canTrading。
     const pos = read('pages/Positions.jsx')
-    expect(pos).toMatch(/if \(!canLive\) return \/\/ §PERM-GATE/)
+    expect(pos, 'loadReal 不得再有 canLive 早退（实盘账主腿全员可读，2026-11-10 owner 需求）')
+      .not.toMatch(/if \(!canLive\) return/)
+    expect(pos, 'state/trades 无权限腿必须静默跳过（403 不进失败台账）').toMatch(/realPermsRef/)
     expect(pos).toMatch(/if \(canTrading\) \{\s*api\.fetchRealAdvice\(\)/)
-    expect(pos.match(/if \(!canLive\) return/g) || [], '实盘读早退必须存在（判据单点=canLive）')
-      .toHaveLength(1)
-    expect(pos, '实盘操作列（execute）必须仍按 canTrading 判').toMatch(/colKey: 'actions'[\s\S]{0,80}\(!canTrading \?/)
+    expect(pos, '实盘操作列（execute）必须仍按 canTrading 判').toMatch(/colKey: 'actions', title: manualMode \? '改账' : '操作'[\s\S]{0,1200}if \(!canTrading\) return/)
   })
 })
