@@ -1,0 +1,12 @@
+# quant-carrier-hotreload.service — 战法白名单热更新链（方案 A，owner 2026-11-10 17:27）
+# 与 .timer 配对：08:30 盘前归因 + 15:10 收盘复核。oneshot，幂等（无变化 NOTHING_TO_DO）。
+[Unit]
+Description=Quant carrier whitelist hot-reload (bake+publish from gz)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/quant/carrier_build/scripts/carrier_hot_reload_gz.py
+Environment=CARRIER_BUILD_DIR=/opt/quant/carrier_build
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+Environment=OWNER_UID=u_1785377969825355000

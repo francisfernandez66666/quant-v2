@@ -1,0 +1,12 @@
+# quant-carrier-hotreload.timer — 08:30 盘前归因+发版 / 15:10 收盘复核（Persistent 补跑）
+[Unit]
+Description=Quant carrier hot-reload schedule (08:30 pre-market, 15:10 post-close)
+
+[Timer]
+OnCalendar=*-*-* 08:30:00
+OnCalendar=*-*-* 15:10:00
+Persistent=true
+Unit=quant-carrier-hotreload.service
+
+[Install]
+WantedBy=timers.target
