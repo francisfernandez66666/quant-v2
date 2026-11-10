@@ -23,6 +23,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 GZ_HOST="${GZ_HOST:-gz}"
+GZ_SCRIPTS_DIR="${GZ_SCRIPTS_DIR:-/opt/quant/friend-pkg/carrier}"
 OWNER_UID="${OWNER_UID:-u_1792728708736589500}"
 STATE="/tmp/carrier_hotreload_whitelist.sha"
 FORCE=0
@@ -48,6 +49,16 @@ if [[ "$FORCE" -eq 0 && -f "$STATE" && "$(cat "$STATE")" == "$SHA" ]]; then
 fi
 
 echo "HOTRELOAD whitelist changed (sha=$SHA): $WL_JSON"
+
+# 0) Q3 利空清单：08:30 盘前从 gz signals_today.json 提取 LLM 归因做空标的
+#    （空结果/文件缺失 = 保留上一版清单，绝不静默清空），再合进烘参
+REMOTE_BEARISH=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$GZ_HOST" \
+    "sudo -n python3 $GZ_SCRIPTS_DIR/pregen_risk_list_gz.py 2>/dev/null" || echo "")
+if [[ -n "$REMOTE_BEARISH" ]]; then
+    printf '%s' "$REMOTE_BEARISH" | python3 -c "import json,sys;d=json.load(sys.stdin);open('qmt_gateway/risk_list_llm.json','w').write(json.dumps(d.get('codes') or [],ensure_ascii=True))"
+    echo "HOTRELOAD risk_list_llm codes=$(python3 -c "import json;print(len(json.load(open('qmt_gateway/risk_list_llm.json'))))")"
+fi
+python3 scripts/gen_carrier_risk_list.py || { echo "HOTRELOAD_ABORT reason=risklist_failed" >&2; exit 1; }
 
 # 1) 重建快照（fresh pull 是唯一写入口，杜绝手工拼）
 python3 - "$REMOTE_JSON" <<'PYEOF'

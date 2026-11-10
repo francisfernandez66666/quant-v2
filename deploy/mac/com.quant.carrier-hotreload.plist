@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- com.quant.carrier-hotreload.plist — 战法白名单热更新链（owner 2026-11-10 15:09 需求 3）
-     语义：每日 08:25（盘前，LLM 利空清单同窗口）与 15:10（收盘后发版窗口）各跑一次
-     carrier_hot_reload.sh——从 gz 只读拉现网白名单/审批因子，与本地烘参比对，变了就
-     自动重建快照→派生→烘载体→publish_carrier（版本号自动 +1）；盒子 carrier_updater
-     按 sha 拉取。无变化幂等退出（HOTRELOAD_NOTHING_TO_DO）。
+<!-- com.quant.carrier-hotreload.plist — 战法白名单热更新链（owner 2026-11-10 15:09 需求 3；
+     16:38 口径：盘前 LLM 归因定在 08:30 一次并随链发到 QMT 物理机）
+     语义：每日 08:30（盘前：gz signals_today.json 提取 LLM 归因做空标的→合利空清单→烘参发布）
+     与 15:10（收盘后发版窗口复核）各跑一次 carrier_hot_reload.sh——与 gz 现网白名单/审批因子
+     比对，变了就自动重建快照→派生→烘载体→publish_carrier（版本号自动 +1）；盒子
+     carrier_updater 按 sha 拉取。无变化幂等退出（HOTRELOAD_NOTHING_TO_DO）。
      ⚠️ TCC 教训（com.quant.backup.plist 2026-09-25 实录）：launchd 读不到 Desktop 仓库，
      脚本稳定副本必须放非保护目录 ~/backups/quant/bin/，仓库版只是源。
      安装：./install_mac_carrier_hotreload.sh -Apply（拷贝+装 plist+重载，-Kick 立即补跑一次）。
@@ -20,7 +21,7 @@
 	</array>
 	<key>StartCalendarInterval</key>
 	<array>
-		<dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>25</integer></dict>
+		<dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
 		<dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>10</integer></dict>
 	</array>
 	<key>StandardOutPath</key>
