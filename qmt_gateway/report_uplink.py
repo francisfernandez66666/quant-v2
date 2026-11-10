@@ -310,6 +310,11 @@ class ReportUplink:
         if isinstance(roots, str):
             roots = [roots]
         self.export_roots = tuple(str(r) for r in roots)
+        # 2026-11-10（PLAN 1.3 第 12 项）：D:\qmt 下 HGT/SGT 是港股通空壳账户的导出目录，
+        # 与 A 股主账户同名前缀文件并存，按 mtime 抢占时空壳（只有表头）会顶掉真数据。
+        # 配置了 uplink_fund_account 后，行里「资金账号」列不匹配的整行丢弃——三个目录
+        # 里只认主账户自己的那份。缺省为空＝不过滤（单目录部署不需要）。
+        self.fund_account = str(cfg.get("uplink_fund_account") or "").strip()
         # 已安装内置策略文件（心跳版本的读取源）与执行器文件（自身指纹源）。
         self.strategy_file = str(cfg.get("uplink_strategy_file") or "").strip()
         self.executor_file = str(cfg.get("uplink_executor_file") or
@@ -384,12 +389,17 @@ class ReportUplink:
         return {"type": etype, "user_id": self.user_id}
 
     def _latest_export(self, kind):
-        """在登记的导出根里按文件名形态找该类**最新**一份；找不到返回 None（不猜、不兜底扫描）。"""
+        """在登记的导出根里按文件名形态找该类**最新**一份；找不到返回 None（不猜、不兜底）。
+
+        2026-11-10（PLAN 1.3 第 12 项）：旧姿势 `[root + "/*"]` 只扫一层——
+        QMT 把导出落在 D:\\qmt 的 HGT/SGT/Stock **子目录**里，于是所有类别
+        file_not_found、脑侧全天 0 事件。改走递归发现（四道准入闸全部复用
+        broker_reads，不另起第二套）。
+        """
         if not self.export_roots:
             return None
-        hits = [e for e in broker_reads.discover_exports(
-            [os.path.join(r, "*") for r in self.export_roots], self.export_roots)
-            if e.kind == kind]
+        hits = [e for e in broker_reads.discover_exports_recursive(
+            self.export_roots, self.export_roots) if e.kind == kind]
         return hits[0] if hits else None
 
     def _ledger_for(self, kind):
@@ -437,7 +447,32 @@ class ReportUplink:
                             broker_reads.STATE_UNSUPPORTED):
             self._note_skip(kind, "%s:%s" % (result.state, result.reason))
             return None, result
-        return result.rows, result
+        rows = self._filter_fund_account(kind, result.rows)
+        if rows is None:
+            return None, result
+        return rows, result
+
+    def _filter_fund_account(self, kind, rows):
+        """按「资金账号」列过滤出主账户自己的行（2026-11-10，PLAN 1.3 第 12 项）。
+
+        HGT/SGT 是港股通空壳账户的导出，与 A 股主账户同名前缀文件并存：
+        只按 mtime 挑"最新一份"会让空壳顶掉主账户数据。未配置
+        uplink_fund_account（单目录部署）或行里没有该列时不做任何过滤——
+        过滤只在两边都能对得上号时才说话。全部行都不匹配 ⇒ 视同 missing
+        （"这份文件不是我们账户的"），一个事件都不发并记原因。
+        """
+        if not self.fund_account:
+            return rows
+        if not rows:
+            return rows
+        if not any(str(r.get("fund_account") or "").strip() for r in rows):
+            return rows  # 这类导出没有资金账号列：无从过滤，不猜
+        mine = [r for r in rows
+                if str(r.get("fund_account") or "").strip() == self.fund_account]
+        if not mine:
+            self._note_skip(kind, "fund_account_mismatch:expected=%s" % len(rows))
+            return None
+        return mine
 
     def _stamp_of(self, result):
         """导出文件 mtime → RFC3339 北京串（进 data_ts/at 让 Go 按新鲜度裁决，不自造时钟）。"""

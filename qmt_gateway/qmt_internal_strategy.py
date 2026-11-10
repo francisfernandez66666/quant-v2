@@ -845,17 +845,28 @@ def _sizing_view(ctx, positions):
     return out
 
 
-def sizing_cap(ctx, positions):
+def sizing_cap(ctx, positions, intent="new"):
     """Cap one buy order with the dynamic-sizing chain. Returns (amount, reason, note).
 
     amount None means "send nothing", never "no limit" -- that is buy_size_amount's
     own contract and the reason this leg can be trusted to fail closed.
     sizing_enabled=false is the legacy escape hatch (the Go side has the same
     master switch; this box never invents its own default).
+
+    2026-11-10 Q7 ruling: add / t_leg intents are EXEMPT from the min-order-
+    amount floor (new-position shreds are what the floor exists to stop). For
+    those intents the amount is min(buy_size_caps) WITHOUT the floor refusal;
+    every other cap in the chain still binds.
     """
     if not bool(PARAMS.get("sizing_enabled", False)):
         return None, "sizing_disabled", ""
     sized = _sizing_view(ctx, positions)
+    if intent in ("add", "t_leg"):
+        caps = buy_size_caps(PARAMS, sized)
+        values = [v for v in caps.values() if v is not None]
+        if not values:
+            return None, "sizing_amount_unavailable", ""
+        return min(values), "", ""
     amount = buy_size_amount(PARAMS, sized)
     if amount is None:
         return None, "sizing_amount_unavailable", ""
@@ -1166,7 +1177,7 @@ def run_round(ContextInfo, moment):
             # cap stays baked as corroborating evidence only.
             # DYN-SIZE-IN-SANDBOX: the sizing chain is ANDed with the caps above,
             # never a replacement for them: it can only make this order smaller.
-            sized_amount, why, note = sizing_cap(ctx, positions)
+            sized_amount, why, note = sizing_cap(ctx, positions, intent)
             if sized_amount is None:
                 summary["skipped"].append({"short": short, "reason": why})
                 continue

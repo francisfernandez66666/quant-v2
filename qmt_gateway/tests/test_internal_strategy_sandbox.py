@@ -459,7 +459,7 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         """
         src = open(self.artifact_path, encoding="utf-8").read()
         body = src[src.index("def run_round("):src.index("def cancel_leg(")]
-        self.assertIn("sizing_cap(ctx, positions)", body,
+        self.assertIn("sizing_cap(ctx, positions, intent)", body,
                       "沙箱买入分支没调动态仓位链——链在产物里但没人问它")
         # 取不到额度时那一条 skipped 用的是 helper 返回的 reason（不是硬编码串），
         # 所以这里锁"reason 会流进 skipped 读数"+ 另两支失败名。

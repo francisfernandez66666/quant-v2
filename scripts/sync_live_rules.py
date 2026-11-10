@@ -40,6 +40,75 @@ SECTIONS = (
     "enhance", "signal_ctl", "emotion_cycle", "concept", "main_sector", "theme",
 )
 
+# ---------------------------------------------------------------------------
+# 账号真源投影层（2026-11-10，PLAN_CARRIER_RISK_REBUILD §1.1）。
+# 11-10 事故的根因不是"没导出"，是 live_rules 被烘成嵌套挂件、规则层只读
+# 顶层散键（散键=Go 出厂默认）。本表显式声明「账号路径 → 载体顶层键」投影：
+#   * path     账号配置 JSON 里的取值路径（"." 分段）；
+#   * key      载体顶层 PARAMS 键；
+#   * expect   对账基线值（docs/EXPORT_ACCOUNT_RULES_20261110.json 脱敏导出）；
+#   * override owner 裁决覆盖（见 PLAN §3.0），diff 必须登记在案，不许静默。
+# live_rules 挂件保留作审计，但不再是唯一落点——本表就是断言本身。
+# ---------------------------------------------------------------------------
+PROJECTIONS = (
+    {"path": "qmt.max_signal_vwap_premium_pct", "key": "max_signal_vwap_premium_pct", "expect": 5},
+    {"path": "qmt.max_positions", "key": "max_positions", "expect": 6},
+    {"path": "qmt.risk_gate.day_loss_limit_pct", "key": "day_loss_limit_pct", "expect": 3.5},
+    {"path": "qmt.min_order_amount", "key": "min_order_amount", "expect": 10000},
+    # Q4（owner 10:45）：单票 35% 覆盖账号 25%，差异登记在案。
+    {"path": "qmt.risk_gate.single_stock_value_pct", "key": "single_stock_cap_pct",
+     "expect": 25, "override": 35},
+    {"path": "qmt.risk_gate.sector_value_pct", "key": "industry_cap_pct", "expect": 35},
+    {"path": "qmt.risk_gate.concept_value_pct", "key": "cluster_cap_pct", "expect": 35},
+    # Q4：日额随动态仓位 room，daily_budget_amount 仅作绝对上限旁证留痕。
+    {"path": "qmt.daily_budget_amount", "key": "daily_buy_cap", "expect": 150000},
+    # Q2′（owner 10:45）：恢复 Go 出厂全套动态仓位公式（账号 sizing.enabled=false
+    # 是账号里未配置全 0 的表现，不是"要关"的裁决；最终裁决以 §3.0 为准）。
+    {"path": "sizing.enabled", "key": "sizing_enabled", "expect": False, "override": True},
+)
+
+# owner 覆盖的登记账（随 params 烘入载体，审计可见，不许静默改）。
+PROJECTION_OVERRIDES = {
+    "single_stock_cap_pct": {
+        "account_value": 25, "value": 35,
+        "source": "owner 2026-11-10 10:45 Q4 (PLAN 3.0)"},
+    "sizing_enabled": {
+        "account_value": False, "value": True,
+        "source": "owner 2026-11-10 10:45 Q2' (PLAN 3.0)"},
+}
+
+
+def _dig(rules, path):
+    """按 "." 路径取账号配置值；缺路径返回 None（投影侧缺席=断言失败，不猜）。"""
+    node = rules
+    for part in str(path).split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def projection_report(params_doc, block):
+    """逐键对账：返回 [(key, expected, actual, ok, override), ...]。
+
+    expected 取投影表：owner override 优先，否则账号快照值；账号快照缺该键时
+    退回表内 expect（对账基线），两者都缺 ⇒ 该键记 (missing, FAIL)。
+    """
+    rules = block  # live_rules 块本身就是账号段的镜像
+    out = []
+    for proj in PROJECTIONS:
+        key = proj["key"]
+        want = proj.get("override", _dig(rules, proj["path"]))
+        if want is None:
+            want = proj.get("expect")
+        got = (params_doc.get("params") or {}).get(key)
+        try:
+            ok = (float(got) == float(want)) if want is not None and got is not None else (got == want)
+        except (TypeError, ValueError):
+            ok = got == want
+        out.append((key, want, got, ok, "override" in proj))
+    return out
+
 
 def _read(path):
     with open(path, "r", encoding="utf-8") as handle:
@@ -116,11 +185,20 @@ def main():
     same = current == block
     cap_params, cap_snapshot = daily_cap_pair(params_doc, block)
     cap_ok = cap_params == cap_snapshot
+    # 投影层逐键对账（2026-11-10）：顶层散键必须与账号真源（含 owner 覆盖）一致。
+    proj = projection_report(params_doc, block)
+    proj_bad = [r for r in proj if not r[3]]
     if args.check:
         print("LIVE_RULES_CHANGED_TOTAL=%d" % (0 if same else 1))
         print("LIVE_RULES_SECTIONS=%d" % len([k for k in block if k in SECTIONS]))
         print("LIVE_RULES_STRATEGIES=%d" % len(block["enabled_strategies"]))
         print("LIVE_RULES_FACTORS=%d" % len(block["applied_factor_ids"]))
+        for key, want, got, ok, is_override in proj:
+            tag = "OVERRIDE" if is_override else "PROJ"
+            print("PROJECTION %s key=%s want=%s got=%s ok=%d"
+                  % (tag, key, json.dumps(want, ensure_ascii=True),
+                     json.dumps(got, ensure_ascii=True), 1 if ok else 0))
+        print("PROJECTION_BAD_TOTAL=%d" % len(proj_bad))
         if not cap_ok:
             # §CAP-OVERRIDE-ASCII（2026-11-09）：params.daily_buy_cap 必须**恒等于**
             # 快照里账号的 daily_budget_amount——失配就是两本账，事后没人翻旧账
@@ -128,9 +206,11 @@ def main():
             print("LIVE_RULES_CAP_MISMATCH key=daily_buy_cap params=%s snapshot=%s"
                   % (json.dumps(cap_params, ensure_ascii=True),
                      json.dumps(cap_snapshot, ensure_ascii=True)))
-        result = "OK" if (same and cap_ok) else "DRIFT"
+        result = "OK" if (same and cap_ok and not proj_bad) else "DRIFT"
         if result == "DRIFT" and not cap_ok:
             result = "DRIFT reason=daily_buy_cap_mismatch"
+        if result == "DRIFT" and proj_bad:
+            result = "DRIFT reason=projection_%s" % ",".join(r[0] for r in proj_bad)
         print("LIVE_RULES_RESULT=%s" % result)
         print("LIVE_RULES_RESULT_CODE=%d" % (0 if result == "OK" else 1))
         return 0 if result == "OK" else 1
@@ -141,8 +221,15 @@ def main():
                   % (json.dumps(cap_params, ensure_ascii=True),
                      json.dumps(cap_snapshot, ensure_ascii=True)))
             return 1
+        if proj_bad:
+            print("LIVE_RULES_RESULT=ABORT reason=projection_%s" % ",".join(r[0] for r in proj_bad))
+            return 1
         print("LIVE_RULES_RESULT=OK unchanged=1")
         return 0
+    if proj_bad:
+        # 投影漂移时连审计块也不写：先让顶层键与账号真源对上，再谈携带快照。
+        print("LIVE_RULES_RESULT=ABORT reason=projection_%s" % ",".join(r[0] for r in proj_bad))
+        return 1
     if not cap_ok:
         # 刻意不写：把 daily_budget_amount 抄进顶层帽等于「数从数据文件进了代码路径」；
         # 对账不落数，写侧也只在两侧对上时才落盘，失配当场停让人去看，而不是猜一个。

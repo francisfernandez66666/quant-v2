@@ -572,6 +572,26 @@ SNAPSHOT_OVERRIDES = {
     "daily_buy_cap": ("qmt", "daily_budget_amount"),
 }
 
+# §3.0 终裁（2026-11-10 10:45 owner 六卡拍板，覆盖 §1.1 早期任何相反表述）的**故意背离
+# Go 出厂值**登记表。这些载体键的有意取值与 Go 默认不同，差异登记在案，不许静默：
+#   * single_stock_cap_pct 35  —— Q4：覆盖账号 single_stock_value_pct=25（单票 35%）。
+#   * cluster_cap_pct      35  —— Q4：对齐账号 concept_value_pct=35（概念/集群帽）。
+#   * sizing_enabled       True —— Q2′：账号 sizing.enabled=false（全套 0）视为"未配置"而非
+#                            "要关"，恢复 Go 出厂动态仓位（power_mean + 10%~30% 单笔 + T 仓
+#                            净额剔除 + 总资产量纲护栏）。
+#   * t_intraday_cap_pct   30  —— Q2：T 机动仓 30%（§3.0 "T 仓...机动仓 30%"）。
+#   * daily_buy_cap     150000 —— §CAP-OVERRIDE-ASCII / Q4：账号 daily_budget_amount，日额随
+#                            动态仓位 room，此值仅作绝对上限旁证（亦在 SNAPSHOT_OVERRIDES）。
+# 用途：① --write 模式跳过这些键，保留参数文件里的 override 值，绝不被 Go 出厂值覆盖；
+#       ② 测试端到对账时只核 override 值、不核 Go，避免把已裁决背离误报成漂移。
+REGISTERED_OVERRIDES = {
+    "single_stock_cap_pct": 35,
+    "cluster_cap_pct": 35,
+    "sizing_enabled": True,
+    "t_intraday_cap_pct": 30,
+    "daily_buy_cap": 150000,
+}
+
 # 柜台状态词表：真源在网关账本模块（构建器烘沙箱产物时读的也是这两个模块，见
 # scripts/build_local_executor.py 的 render_status_vocab —— 同一把尺子，不在这另造一份）。
 # rules_t 在 ctx 的委托行里没有 terminal 布尔时退回按状态字比较，所以它要的就是这份清单。
@@ -1041,6 +1061,11 @@ def unowned_sentinels():
 def apply_write(doc, params, carrier_values):
     added, changed, unchanged = [], [], []
     for key, (value, _src) in sorted(carrier_values.items()):
+        if key in REGISTERED_OVERRIDES:
+            # §3.0 / Q4 已裁决的**故意背离** Go 出厂值：保留参数文件里的 override 值，
+            # 绝不被 Go 默认覆盖（owner 10:45 终裁，差异登记在案）。--write 只更新其余键。
+            unchanged.append(key)
+            continue
         if key not in params:
             params[key] = value
             added.append(key)

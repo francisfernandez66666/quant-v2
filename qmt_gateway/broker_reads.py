@@ -76,18 +76,41 @@ KIND_STEMS = {
 HEADER_ALIASES = {
     "symbol": ("代码", "证券代码", "股票代码", "标的代码", "证券标识", "symbol", "code", "instrument"),
     "name": ("名称", "证券名称", "股票名称", "标的名称", "name"),
-    "qty": ("数量", "持仓数量", "股票数量", "委托数量", "成交数量", "累计成交数量", "qty", "volume", "amount"),
-    "usable_qty": ("可用数量", "可用余额", "平仓数量", "usable_qty", "available"),
+    # 2026-11-10: the QMT client's own PositionStatics export calls the held
+    # qty "当前拥股" -- without this alias every positions file failed
+    # header_missing:qty (PLAN_CARRIER_RISK_REBUILD 1.3 item 12).
+    "qty": ("数量", "持仓数量", "股票数量", "当前拥股", "拥股数量", "拥股",
+            "委托数量", "成交数量", "累计成交数量", "qty", "volume", "amount"),
+    "usable_qty": ("可用数量", "可用余额", "可用拥股", "平仓数量", "usable_qty", "available"),
     "price": ("价格", "委托价格", "成交价", "成交均价", "最新价", "price"),
     "order_id": ("委托号", "委托编号", "合同编号", "订单编号", "order_id", "orderid", "order"),
     "fill_id": ("成交编号", "成交序号", "fill_id", "trade_id", "deal_id"),
     "status": ("委托状态", "状态", "订单状态", "status", "state"),
     "side": ("买卖标志", "操作", "业务名称", "交易方向", "委托方向", "买卖", "side", "direction"),
     "time": ("时间", "委托时间", "成交时间", "发生时间", "datetime", "time"),
-    "total_assets": ("总资产", "资产总值", "账户总资产", "total_assets", "totalasset"),
-    "usable_cash": ("可用资金", "可用金额", "资金可用", "可用余额", "usable_cash", "available_cash"),
-    "market_value": ("证券市值", "持仓市值", "市值", "market_value"),
+    # 2026-11-10: the funding-account column is how the A-share main account is
+    # told apart from the HGT/SGT (HK Connect) shell accounts that sit beside it
+    # in D:\qmt and would otherwise win the mtime race with header-only rows.
+    "fund_account": ("资金账号", "账号", "account_no", "fund_account"),
+    "total_assets": ("总资产", "资产总值", "账户总资产", "总资产（人民币）", "净资产",
+                     "total_assets", "totalasset"),
+    "usable_cash": ("可用资金", "可用金额", "资金可用", "可取金额", "可用余额", "usable_cash", "available_cash"),
+    # 2026-11-10 FIX: _norm_header used to strip the parenthetical currency, so
+    # 总市值（港币） and 总市值（人民币） both collapsed to 总市值 and the
+    # second-pass contains-match on 市值 grabbed the FIRST one -- the HKD column
+    # (value 0) -- and frozen_cash = total − cash − mv booked the whole
+    # portfolio as frozen. Currencies are no longer stripped as units; the CNY
+    # spellings are listed here so the RMB column wins the exact-match pass and
+    # the HKD column stays unmapped (its rows are dropped by the fund-account
+    # filter anyway).
+    "market_value": ("证券市值", "持仓市值", "市值", "总市值（人民币）", "股票总市值",
+                     "market_value"),
 }
+
+# Units that DO get stripped by _norm_header (quantity/count units). Currency
+# suffixes are deliberately NOT in this set: they distinguish columns that
+# would otherwise share one canonical name (the HKD/CNY market-value bug).
+HEADER_UNITS = ("股", "元", "份", "手", "张", "%", "笔")
 
 # 每种读数**必须**齐备的规范列：缺任意一列即判表头缺失（半文件/不是这类文件的常见形态）。
 REQUIRED_COLUMNS = {
@@ -110,11 +133,19 @@ DEFAULT_STALE_SEC = 3600  # 与 §3.1 的 READ_STALE_SEC 建议值同源（外�
 
 
 def _norm_header(cell):
-    """表头单元格规范化：去空白（含全角）＋转小写＋剥掉括号单位。"""
+    """表头单元格规范化：去空白（含全角）＋转小写＋剥掉**数量单位**后缀。
+
+    2026-11-10 FIX（PLAN_CARRIER_RISK_REBUILD 1.3 第 12 项）：这里曾经无差别剥掉
+    任何括号后缀，`总市值（港币）` 与 `总市值（人民币）` 归一化后都变成 `总市值`，
+    第二趟包含匹配让港币列（值 0）抢走 market_value，下游
+    frozen_cash = 总资产 − 可用 − 市值 把全部市值算成冻结资金。货币后缀是
+    **列名的一部分**，不在 HEADER_UNITS 里，不再剥掉。
+    """
     s = str(cell or "").strip().replace("\u3000", "").replace(" ", "")
     s = s.lower()
-    # 「成交数量(股)」「持仓数量（元）」这类带单位的表头，单位对本模块无意义 ⇒ 剥掉
-    s = re.sub(r"[（(].*?[)）]$", "", s)
+    # 「成交数量(股)」「持仓数量（手）」这类数量单位对本模块无意义 ⇒ 剥掉；
+    # 货币后缀（人民币/港币/美元）保留——它们区分的是不同的列。
+    s = re.sub(r"[（(](%s)?[)）]$" % "|".join(HEADER_UNITS), "", s)
     return s
 
 
@@ -304,6 +335,30 @@ def discover_exports(dir_glob, allowed_roots=None):
         found.append(ExportFile(full, kind, size=st.st_size, mtime=st.st_mtime))
     found.sort(key=lambda e: e.mtime, reverse=True)
     return found
+
+
+def discover_exports_recursive(roots, allowed_roots=None):
+    """白名单根目录下的**递归**发现（2026-11-10，PLAN 1.3 第 12 项）。
+
+    11-10 实锤：QMT 客户端把导出落在 `D:\\qmt` 的**子目录**里（HGT / SGT /
+    Stock，其中 Stock 才是 A 股主账户），而旧的发现姿势只扫 `root/*` 一层，
+    于是所有类别都 `file_not_found`、脑侧全天 0 事件。本函数 os.walk 每个根，
+    把**文件**路径直接喂给 discover_exports（白名单/形态/扩展名/锁文件四道闸
+    全部复用，不另起第二套准入），结果同样按 mtime 倒序。
+    同名前缀在多个子目录并存（HGT/SGT/Stock 都有 Account-*.csv）时**不做**
+    目录取舍——那由调用方按「资金账号」列过滤（report_uplink 侧），发现层
+    只负责"把真实存在的文件都交出来"。
+    """
+    paths = []
+    for root in tuple(roots or []):
+        root = str(root)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                paths.append(os.path.join(dirpath, name))
+    return discover_exports(paths, allowed_roots)
 
 
 def _require_text_format(path):

@@ -194,7 +194,7 @@
     },
     "breadth_missing_scale": 0.9,
     "budget_mode": "dynamic",
-    "cluster_cap_pct": 40,
+    "cluster_cap_pct": 35,
     "cluster_rho": 0.7,
     "emo_climax_board_min": 7,
     "emo_climax_limitup_min": 80,
@@ -1580,7 +1580,9 @@
       "fac_155",
       "fac_157",
       "fac_156",
-      "fac_160"
+      "fac_160",
+      "fac_163",
+      "fac_162"
     ],
     "unmapped_strategies": [
       "n_shape"
@@ -1968,7 +1970,19 @@
     "concept_map": {},
     "asset_guard_factor": 10.0,
     "vwap_sanity_lo": 0.5,
-    "vwap_sanity_hi": 2.0
+    "vwap_sanity_hi": 2.0,
+    "projection_overrides": {
+      "single_stock_cap_pct": {
+        "account_value": 25,
+        "value": 35,
+        "source": "owner 2026-11-10 10:45 Q4 (PLAN 3.0)"
+      },
+      "sizing_enabled": {
+        "account_value": false,
+        "value": true,
+        "source": "owner 2026-11-10 10:45 Q2' (PLAN 3.0)"
+      }
+    }
   },
   "strategy_version": "v05-20261109",
   "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the four builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",

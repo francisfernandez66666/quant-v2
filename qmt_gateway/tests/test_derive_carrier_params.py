@@ -336,11 +336,24 @@ class AgainstGo(unittest.TestCase):
         values = dcp.build_carrier_values(self.derived, self.provenance, params, sizing_defaults)
         bad = []
         for key, (value, _src) in values.items():
+            if key in dcp.REGISTERED_OVERRIDES:
+                # §3.0 / Q4 已裁决的故意背离 Go 出厂值：只核 override 值，不核 Go。
+                if dcp._norm(params.get(key)) != dcp._norm(dcp.REGISTERED_OVERRIDES[key]):
+                    bad.append("%s override=%r file=%r" % (key, dcp.REGISTERED_OVERRIDES[key], params.get(key)))
+                continue
             if key not in params:
                 bad.append("%s=absent" % key)
             elif dcp._norm(params[key]) != dcp._norm(value):
                 bad.append("%s file=%r go=%r" % (key, params[key], value))
         self.assertEqual(bad, [], "params drifted from Go: %s" % bad[:12])
+
+    def test_registered_overrides_are_applied(self):
+        """§3.0 / Q4 已裁决的 override 必须真的落在参数文件里且值正确——否则等于没登记。"""
+        params = _params()
+        for key, want in dcp.REGISTERED_OVERRIDES.items():
+            self.assertIn(key, params, "override key %s missing from params" % key)
+            self.assertEqual(dcp._norm(params[key]), dcp._norm(want),
+                             "override key %s file=%r want=%r" % (key, params[key], want))
 
     def test_check_mode_is_green_on_the_current_tree(self):
         proc = subprocess.run([sys.executable, SCRIPT, "--check"],
