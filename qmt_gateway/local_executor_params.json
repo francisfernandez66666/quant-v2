@@ -1064,29 +1064,6 @@
     "factor_rules": [
       {
         "factors": [
-          "AtrRatio14",
-          "Brk60",
-          "STOA",
-          "Mom20"
-        ],
-        "weights": {
-          "AtrRatio14": 0.25,
-          "Brk60": 0.25,
-          "Mom20": 0.25,
-          "STOA": 0.25
-        },
-        "directions": {
-          "AtrRatio14": -1,
-          "Brk60": 1,
-          "Mom20": 1,
-          "STOA": 1
-        },
-        "buy_threshold": 95,
-        "id": "fac_1",
-        "name": "fac_1"
-      },
-      {
-        "factors": [
           "VMIN10",
           "VSTD20"
         ],
@@ -1422,6 +1399,49 @@
         "buy_threshold": 70,
         "id": "fac_160",
         "name": "fac_160"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VolSurge5"
+        ],
+        "weights": {
+          "BBI": 0.5123975931918757,
+          "VSTD20": 0.35442837219914053,
+          "VolSurge5": 0.1331740346089838
+        },
+        "directions": {
+          "BBI": -1,
+          "VSTD20": -1,
+          "VolSurge5": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_163",
+        "name": "fac_163"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "BBI",
+          "VolSurge5",
+          "lu_board3"
+        ],
+        "weights": {
+          "BBI": 0.24869508438980883,
+          "VSTD20": 0.1814195367482296,
+          "VolSurge5": 0.06686605783006178,
+          "lu_board3": 0.5030193210318997
+        },
+        "directions": {
+          "BBI": -1,
+          "VSTD20": -1,
+          "VolSurge5": -1,
+          "lu_board3": -1
+        },
+        "buy_threshold": 70,
+        "id": "fac_162",
+        "name": "fac_162"
       }
     ],
     "factor_thresholds": {},
@@ -1567,7 +1587,6 @@
     "enabled_strategies": [
       "dragon",
       "n_shape",
-      "fac_1",
       "fac_118",
       "fac_117",
       "fac_136",
@@ -1603,14 +1622,13 @@
       "dragon_return": "dragon_return"
     },
     "live_rules": {
-      "captured_at": "2026-11-06T23:28:48+08:00",
-      "source": "C:/var/lib/quant-trading-v2/auth.json#configs[].value + applied_factors.json",
+      "captured_at": "2026-11-10T15:05:00+08:00",
+      "source": "gz:/var/lib/quant-trading-v2/auth.json (fresh pull 15:05)",
       "account_key": "quant_config_json_v1",
       "account_user_id": "u_1785377969825355000",
       "enabled_strategies": [
         "dragon",
         "n_shape",
-        "fac_1",
         "fac_118",
         "fac_117",
         "fac_136",
@@ -1623,7 +1641,9 @@
         "fac_155",
         "fac_157",
         "fac_156",
-        "fac_160"
+        "fac_160",
+        "fac_163",
+        "fac_162"
       ],
       "applied_factor_ids": [
         "fac_1",
@@ -1646,7 +1666,9 @@
         "fac_155",
         "fac_157",
         "fac_156",
-        "fac_160"
+        "fac_160",
+        "fac_163",
+        "fac_162"
       ],
       "qmt": {
         "enabled": true,
@@ -1659,7 +1681,6 @@
         "strategies": [
           "dragon",
           "n_shape",
-          "fac_1",
           "fac_118",
           "fac_117",
           "fac_136",
@@ -1672,7 +1693,9 @@
           "fac_155",
           "fac_157",
           "fac_156",
-          "fac_160"
+          "fac_160",
+          "fac_163",
+          "fac_162"
         ],
         "timeout_sec": 10,
         "subscription_recognize": false,

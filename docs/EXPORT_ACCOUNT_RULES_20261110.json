@@ -10,7 +10,6 @@
     "strategies": [
       "dragon",
       "n_shape",
-      "fac_1",
       "fac_118",
       "fac_117",
       "fac_136",
@@ -316,6 +315,6 @@
     "exported_at": "2026-11-10T09:55:00+08:00",
     "source": "gz:/var/lib/quant-trading-v2/auth.json configs[user_id=u_1785377969825355000,key=quant_config_json_v1]",
     "scrubbed": true,
-    "note": "所有 token/password/secret/api_key 键已剔除；仅用于烘参对照，禁止入库"
+    "note": "\u6240\u6709 token/password/secret/api_key \u952e\u5df2\u5254\u9664\uff1b\u4ec5\u7528\u4e8e\u70d8\u53c2\u5bf9\u7167\uff0c\u7981\u6b62\u5165\u5e93"
   }
 }

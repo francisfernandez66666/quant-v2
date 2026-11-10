@@ -1,35 +1,252 @@
 {
-  "_comment": "现网账号级量化规则快照（只读导出，凭据整键剔除）。win 一键包由 sync_live_rules.py 派生，勿手改 params。",
-  "captured_at": "2026-11-06T23:28:48+08:00",
-  "source": "C:/var/lib/quant-trading-v2/auth.json#configs[].value + applied_factors.json",
-  "applied_factor_ids": [
-    "fac_1",
-    "fac_118",
-    "fac_117",
-    "fac_136",
-    "fac_135",
-    "fac_134",
-    "fac_133",
-    "fac_130",
-    "fac_131",
-    "fac_129",
-    "fac_138",
-    "fac_137",
-    "fac_123",
-    "fac_145",
-    "fac_150",
-    "fac_153",
-    "fac_154",
-    "fac_155",
-    "fac_157",
-    "fac_156",
-    "fac_160"
-  ],
+  "captured_at": "2026-11-10T15:05:00+08:00",
+  "source": "gz:/var/lib/quant-trading-v2/auth.json (fresh pull 15:05)",
   "configs": [
     {
-      "key": "quant_config_json_v1",
       "user_id": "u_1785377969825355000",
+      "key": "quant_config_json_v1",
+      "has_qmt_strategies": true,
       "rules": {
+        "emotion_cycle": {
+          "emo_ice_board_max": 0,
+          "emo_ice_limitup_max": 0,
+          "emo_ice_blast_min": 0,
+          "emo_start_board_max": 0,
+          "emo_start_limitup_min": 0,
+          "emo_start_limitup_max": 0,
+          "emo_start_blast_min": 0,
+          "emo_start_blast_max": 0,
+          "emo_ferment_board_max": 0,
+          "emo_ferment_limitup_min": 0,
+          "emo_ferment_limitup_max": 0,
+          "emo_ferment_blast_max": 0,
+          "emo_climax_board_min": 0,
+          "emo_climax_limitup_min": 0,
+          "emo_climax_blast_max": 0,
+          "emo_diverge_board_drop": 0,
+          "emo_diverge_limitup_drop": 0,
+          "emo_diverge_blast_rise": 0,
+          "emo_retreat_board_max": 0,
+          "emo_retreat_limitup_max": 0,
+          "emo_retreat_blast_min": 0,
+          "emo_breadth_ice_down_ratio": 0,
+          "emo_breadth_retreat_down_ratio": 0
+        },
+        "strategy": {
+          "dragon": {
+            "f1_seal_weight": 0.3,
+            "f2_resonance_weight": 0.25,
+            "f3_premium_weight": 0.2,
+            "f4_rs_weight": 0.25,
+            "pullback_max_pct": 0.05,
+            "breaker_sell_half_pct": 0.08,
+            "breaker_sell_all_pct": 0.12,
+            "buy_pullback_sell_half_pct": 0.05,
+            "buy_pullback_sell_all_pct": 0.08,
+            "buy_day_close_below": 0.03,
+            "next_open_if_below": 0.05,
+            "take_profit_pct": 0
+          },
+          "double_bump": {
+            "first_break_volume_multiple": 1.5,
+            "second_break_volume_multiple": 1.5,
+            "adjust_vol_ratio_max": 3,
+            "adjust_days_overflow": 6,
+            "min_change_pct": 0,
+            "position_weight": 0.3,
+            "ma_weight": 0.3,
+            "volume_weight": 0.4,
+            "double_bump_take_profit_pct": 0.15
+          },
+          "n_shape": {
+            "n_pattern_score_threshold": 60,
+            "hard_stop_loss": 0.08
+          },
+          "dragon_return": {
+            "stop_loss_pct": 0.05,
+            "take_profit_pct": 0.25,
+            "max_hold_days": 8,
+            "target1_multiplier": 1,
+            "target2_multiplier": 1.25,
+            "trailing_drawback": 0.08
+          },
+          "momentum": {
+            "volume_price_weight": 40,
+            "macd_weight": 30,
+            "trend_weight": 30,
+            "signal_threshold": 0,
+            "buy_signal_threshold": 0,
+            "momentum_gate_enabled": false,
+            "momentum_delta_tol": 0
+          },
+          "macro_gate": {
+            "enabled": false,
+            "levels": null,
+            "min_confidence": 0,
+            "block_n_shape": false,
+            "block_momentum": false
+          },
+          "short": {
+            "enabled": null,
+            "high_churn_min": 0,
+            "break_down_min": 0,
+            "leader_decay_min": 0,
+            "good_news_fade_min": 0,
+            "margin_rate": 0,
+            "annual_fee_rate": 0
+          }
+        },
+        "laodeng": {
+          "enabled": false,
+          "market_cap_min": 0,
+          "pe_max": 0,
+          "turnover_min": 0,
+          "tech_penalty": 0,
+          "weight_score": 0
+        },
+        "main_sector": {
+          "sector_constituent_top_n": 0
+        },
+        "llm": {
+          "api_url": "https://api.siliconflow.cn/v1/chat/completions",
+          "model": "THUDM/GLM-Z1-9B-0414",
+          "timeout_sec": 240,
+          "stream": true,
+          "max_retry_times": 0,
+          "batch_concurrency": 8,
+          "classifier_model": "",
+          "daily_call_budget": 0,
+          "stream_idle_timeout_sec": 0,
+          "consult_daily_calls": 0
+        },
+        "theme": {
+          "black_list": null
+        },
+        "risk_ctrl": {
+          "compliance": {
+            "compliance_mode": false
+          },
+          "m8_enabled": false,
+          "m8_portfolio_drawdown_pct": 0,
+          "per_stock_max": 0
+        },
+        "position": {
+          "max_total_position_pct": 0,
+          "auto_track_signals": false,
+          "atr_enabled": false,
+          "atr_stop_mult": 0,
+          "daily_drop_alert_pct": 5
+        },
+        "notify": {
+          "push": {
+            "enabled": false,
+            "provider": ""
+          }
+        },
+        "scheduler": {
+          "enabled": false,
+          "all_day_research": false,
+          "research_bin": "",
+          "dataload_bin": "",
+          "db": "",
+          "pyurl": "",
+          "nightly": {
+            "start_hhmm": 0,
+            "weekend_start_hhmm": 0,
+            "steps": null,
+            "abort_on_error": false,
+            "backtest_enabled": false,
+            "evo_enabled": false,
+            "backtest_events": 0,
+            "research_rounds": 0,
+            "discover": {
+              "horizons": null,
+              "start_windows": null,
+              "metrics": null,
+              "factor_pools": null,
+              "top_n": 0,
+              "min_stocks": 0,
+              "max_factors": 0,
+              "split": 0,
+              "min_ir": 0,
+              "min_days": 0,
+              "min_gen_t": 0,
+              "min_trigger": 0,
+              "min_excess": 0,
+              "min_limit_ups": 0,
+              "top_k": 0,
+              "max_per_day": 0,
+              "guard_strong": 0,
+              "guard_weak": 0,
+              "min_yr_sign": 0,
+              "min_bt_events": 0,
+              "dedup_jaccard": 0,
+              "change_gate": false,
+              "staleness_days": 0,
+              "hysteresis": 0
+            },
+            "lifecycle": {
+              "consec_days": 0,
+              "min_ir": 0,
+              "min_win_rate": 0,
+              "min_daily_trades": 0,
+              "dry_run": false,
+              "zero_obs_days": 0,
+              "pending_expire_days": 0
+            }
+          },
+          "dataload_during_trading": {
+            "enabled": false,
+            "interval_minutes": 0
+          },
+          "step_timeout_min": 0,
+          "trim_interval_min": 0,
+          "min_free_mem_mb": 0,
+          "per_task_night_max_min": 0,
+          "replay_throttle_ms": 0,
+          "primary_source": "",
+          "ths_factors_ready": false,
+          "optimize_enabled": false
+        },
+        "paper": {
+          "enabled": true,
+          "fixed_amount": 0,
+          "max_positions": 0,
+          "initial_capital": 0,
+          "auto_sell": true,
+          "discipline": {
+            "stop_loss_pct": 0,
+            "take_profit_pct": 0,
+            "max_pullback_pct": 0,
+            "deep_stop_mult": 0,
+            "buy_confirm_min": 0,
+            "buy_confirm_high_sec": 0,
+            "exit_confirm_min": 0,
+            "trail_confirm_min": 0,
+            "probe_sec": 0,
+            "high_conf_threshold": 0,
+            "sell_signal_max_age_sec": 0,
+            "max_extends": 0
+          },
+          "strategies": [
+            "dragon",
+            "double_bump",
+            "n_shape",
+            "dragon_return",
+            "momentum",
+            "fac_1",
+            "fac_118",
+            "fac_117",
+            "fac_131",
+            "fac_145",
+            "fac_150"
+          ],
+          "short_capital": 0,
+          "short_margin_rate": 0,
+          "short_fee_annual": 0,
+          "short_fixed_amount": 0,
+          "short_stop_loss_pct": 0
+        },
         "qmt": {
           "enabled": true,
           "mode": "auto",
@@ -41,7 +258,6 @@
           "strategies": [
             "dragon",
             "n_shape",
-            "fac_1",
             "fac_118",
             "fac_117",
             "fac_136",
@@ -54,7 +270,9 @@
             "fac_155",
             "fac_157",
             "fac_156",
-            "fac_160"
+            "fac_160",
+            "fac_163",
+            "fac_162"
           ],
           "timeout_sec": 10,
           "subscription_recognize": false,
@@ -121,6 +339,51 @@
           },
           "auto_risk_caution": true
         },
+        "app_release": {
+          "min_version_code": 0,
+          "latest_version_code": 0,
+          "apk_url": "",
+          "note": ""
+        },
+        "runtime": {
+          "trim_after_hours": false,
+          "trim_interval_min": 0,
+          "feed_interval_sec": 0,
+          "qmt_feed_enabled": false,
+          "qmt_feed_interval_sec": 0,
+          "qmt_feed_coverage_min_pct": 0,
+          "qmt_feed_volume_to_shares": 0,
+          "monitor_pool_hot_max": 0,
+          "scoring_interval_sec": 0,
+          "review_max_stocks": 0
+        },
+        "data": {
+          "primary_source": "",
+          "ths_factors_ready": false,
+          "optimize_enabled": false
+        },
+        "calendar": {
+          "enabled": false,
+          "events": null
+        },
+        "enhance": {
+          "news_decay_enabled": false,
+          "news_decay_half_life_min": 0,
+          "auction_signal_enabled": false,
+          "factor_dedup_enabled": false,
+          "news_impact_enabled": false,
+          "sector_linkage_enabled": false,
+          "market_state_enabled": false,
+          "orderflow_enabled": false,
+          "dynweight_enabled": false,
+          "t0_enabled": false,
+          "tech_filter": {
+            "kdj_j_max": 0,
+            "ma_filter": ""
+          }
+        },
+        "signal_ctl": {},
+        "research": {},
         "sizing": {
           "enabled": false,
           "floor": 0,
@@ -152,193 +415,38 @@
           "flow_factor": {},
           "evo": {}
         },
-        "strategy": {
-          "dragon": {
-            "f1_seal_weight": 0.3,
-            "f2_resonance_weight": 0.25,
-            "f3_premium_weight": 0.2,
-            "f4_rs_weight": 0.25,
-            "pullback_max_pct": 0.05,
-            "breaker_sell_half_pct": 0.08,
-            "breaker_sell_all_pct": 0.12,
-            "buy_pullback_sell_half_pct": 0.05,
-            "buy_pullback_sell_all_pct": 0.08,
-            "buy_day_close_below": 0.03,
-            "next_open_if_below": 0.05,
-            "take_profit_pct": 0
-          },
-          "double_bump": {
-            "first_break_volume_multiple": 1.5,
-            "second_break_volume_multiple": 1.5,
-            "adjust_vol_ratio_max": 3,
-            "adjust_days_overflow": 6,
-            "min_change_pct": 0,
-            "position_weight": 0.3,
-            "ma_weight": 0.3,
-            "volume_weight": 0.4,
-            "double_bump_take_profit_pct": 0.15
-          },
-          "n_shape": {
-            "n_pattern_score_threshold": 60,
-            "hard_stop_loss": 0.08
-          },
-          "dragon_return": {
-            "stop_loss_pct": 0.05,
-            "take_profit_pct": 0.25,
-            "max_hold_days": 8,
-            "target1_multiplier": 1,
-            "target2_multiplier": 1.25,
-            "trailing_drawback": 0.08
-          },
-          "momentum": {
-            "volume_price_weight": 40,
-            "macd_weight": 30,
-            "trend_weight": 30,
-            "signal_threshold": 0,
-            "buy_signal_threshold": 0,
-            "momentum_gate_enabled": false,
-            "momentum_delta_tol": 0
-          },
-          "macro_gate": {
-            "enabled": false,
-            "levels": null,
-            "min_confidence": 0,
-            "block_n_shape": false,
-            "block_momentum": false
-          },
-          "short": {
-            "enabled": null,
-            "high_churn_min": 0,
-            "break_down_min": 0,
-            "leader_decay_min": 0,
-            "good_news_fade_min": 0,
-            "margin_rate": 0,
-            "annual_fee_rate": 0
-          }
-        },
-        "paper": {
-          "enabled": true,
-          "fixed_amount": 0,
-          "max_positions": 0,
-          "initial_capital": 0,
-          "auto_sell": true,
-          "discipline": {
-            "stop_loss_pct": 0,
-            "take_profit_pct": 0,
-            "max_pullback_pct": 0,
-            "deep_stop_mult": 0,
-            "buy_confirm_min": 0,
-            "buy_confirm_high_sec": 0,
-            "exit_confirm_min": 0,
-            "trail_confirm_min": 0,
-            "probe_sec": 0,
-            "high_conf_threshold": 0,
-            "sell_signal_max_age_sec": 0,
-            "max_extends": 0
-          },
-          "strategies": [
-            "dragon",
-            "double_bump",
-            "n_shape",
-            "dragon_return",
-            "momentum",
-            "fac_1",
-            "fac_118",
-            "fac_117",
-            "fac_131",
-            "fac_145",
-            "fac_150"
-          ],
-          "short_capital": 0,
-          "short_margin_rate": 0,
-          "short_fee_annual": 0,
-          "short_fixed_amount": 0,
-          "short_stop_loss_pct": 0
-        },
-        "risk_ctrl": {
-          "compliance": {
-            "compliance_mode": false
-          },
-          "m8_enabled": false,
-          "m8_portfolio_drawdown_pct": 0,
-          "per_stock_max": 0
-        },
-        "runtime": {
-          "trim_after_hours": false,
-          "trim_interval_min": 0,
-          "feed_interval_sec": 0,
-          "qmt_feed_enabled": false,
-          "qmt_feed_interval_sec": 0,
-          "qmt_feed_coverage_min_pct": 0,
-          "qmt_feed_volume_to_shares": 0,
-          "monitor_pool_hot_max": 0,
-          "scoring_interval_sec": 0,
-          "review_max_stocks": 0
-        },
-        "position": {
-          "max_total_position_pct": 0,
-          "auto_track_signals": false,
-          "atr_enabled": false,
-          "atr_stop_mult": 0,
-          "daily_drop_alert_pct": 5
-        },
-        "enhance": {
-          "news_decay_enabled": false,
-          "news_decay_half_life_min": 0,
-          "auction_signal_enabled": false,
-          "factor_dedup_enabled": false,
-          "news_impact_enabled": false,
-          "sector_linkage_enabled": false,
-          "market_state_enabled": false,
-          "orderflow_enabled": false,
-          "dynweight_enabled": false,
-          "t0_enabled": false,
-          "tech_filter": {
-            "kdj_j_max": 0,
-            "ma_filter": ""
-          }
-        },
-        "signal_ctl": {},
-        "emotion_cycle": {
-          "emo_ice_board_max": 0,
-          "emo_ice_limitup_max": 0,
-          "emo_ice_blast_min": 0,
-          "emo_start_board_max": 0,
-          "emo_start_limitup_min": 0,
-          "emo_start_limitup_max": 0,
-          "emo_start_blast_min": 0,
-          "emo_start_blast_max": 0,
-          "emo_ferment_board_max": 0,
-          "emo_ferment_limitup_min": 0,
-          "emo_ferment_limitup_max": 0,
-          "emo_ferment_blast_max": 0,
-          "emo_climax_board_min": 0,
-          "emo_climax_limitup_min": 0,
-          "emo_climax_blast_max": 0,
-          "emo_diverge_board_drop": 0,
-          "emo_diverge_limitup_drop": 0,
-          "emo_diverge_blast_rise": 0,
-          "emo_retreat_board_max": 0,
-          "emo_retreat_limitup_max": 0,
-          "emo_retreat_blast_min": 0,
-          "emo_breadth_ice_down_ratio": 0,
-          "emo_breadth_retreat_down_ratio": 0
-        },
         "concept": {
           "enabled": false,
           "shadow": false,
           "min_coverage_pct": 0,
           "max_staleness_hours": 0
-        },
-        "main_sector": {
-          "sector_constituent_top_n": 0
-        },
-        "theme": {
-          "black_list": null
         }
-      },
-      "qmt_enabled": true,
-      "has_qmt_strategies": true
+      }
     }
+  ],
+  "applied_factor_ids": [
+    "fac_1",
+    "fac_118",
+    "fac_117",
+    "fac_136",
+    "fac_135",
+    "fac_134",
+    "fac_133",
+    "fac_130",
+    "fac_131",
+    "fac_129",
+    "fac_138",
+    "fac_137",
+    "fac_123",
+    "fac_145",
+    "fac_150",
+    "fac_153",
+    "fac_154",
+    "fac_155",
+    "fac_157",
+    "fac_156",
+    "fac_160",
+    "fac_163",
+    "fac_162"
   ]
 }

@@ -1,11 +1,10 @@
 {
-  "_comment": "量化交易 tab 战法开关 + 已审批因子规则的现网快照。params 的 enabled_strategies/factor_rules 由本文件派生；改开关必须重跑 scripts/sync_strategy_switches.py，不要在 params 里手改。",
-  "captured_at": "2026-11-06T03:50+08:00",
-  "source": "C:/var/lib/quant-trading-v2/auth.json#quant_config_json_v1.qmt.strategies + C:/var/lib/quant-trading-v2/applied_factors.json",
+  "_comment": "\u91cf\u5316\u4ea4\u6613 tab \u6218\u6cd5\u5f00\u5173 + \u5df2\u5ba1\u6279\u56e0\u5b50\u89c4\u5219\u7684\u73b0\u7f51\u5feb\u7167\u3002params \u7684 enabled_strategies/factor_rules \u7531\u672c\u6587\u4ef6\u6d3e\u751f\uff1b\u6539\u5f00\u5173\u5fc5\u987b\u91cd\u8dd1 scripts/sync_strategy_switches.py\uff0c\u4e0d\u8981\u5728 params \u91cc\u624b\u6539\u3002",
+  "captured_at": "2026-11-10T15:05:00+08:00",
+  "source": "gz:/var/lib/quant-trading-v2/auth.json + applied_factors.json (fresh pull 15:05)",
   "enabled_strategies": [
     "dragon",
     "n_shape",
-    "fac_1",
     "fac_118",
     "fac_117",
     "fac_136",
@@ -18,35 +17,17 @@
     "fac_155",
     "fac_157",
     "fac_156",
-    "fac_160"
+    "fac_160",
+    "fac_163",
+    "fac_162"
   ],
   "factor_rules": [
     {
-      "id": "fac_1",
-      "name": "波动突破战法",
-      "factors": [
-        "AtrRatio14",
-        "Brk60",
-        "STOA",
-        "Mom20"
-      ],
-      "weights": {
-        "AtrRatio14": 0.25,
-        "Brk60": 0.25,
-        "Mom20": 0.25,
-        "STOA": 0.25
-      },
-      "directions": {
-        "AtrRatio14": -1,
-        "Brk60": 1,
-        "Mom20": 1,
-        "STOA": 1
-      },
-      "buy_threshold": 95
-    },
-    {
       "id": "fac_118",
-      "name": "因子战法#118",
+      "name": "\u56e0\u5b50\u6218\u6cd5#118",
+      "enabled": true,
+      "candidate_id": 118,
+      "applied_at": "2026-09-22 14:27:02",
       "factors": [
         "VMIN10",
         "VSTD20"
@@ -59,11 +40,21 @@
         "VMIN10": -1,
         "VSTD20": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 10,
+      "ir": 1.35320342492775,
+      "excess": 0.0014130140513282624,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0
     },
     {
       "id": "fac_117",
-      "name": "因子战法#117",
+      "name": "\u56e0\u5b50\u6218\u6cd5#117",
+      "enabled": true,
+      "candidate_id": 117,
+      "applied_at": "2026-09-22 14:27:06",
       "factors": [
         "VSTD20"
       ],
@@ -73,11 +64,21 @@
       "directions": {
         "VSTD20": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 10,
+      "ir": 1.342697965127352,
+      "excess": 0.006453593046222632,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0
     },
     {
       "id": "fac_136",
-      "name": "因子战法#136",
+      "name": "\u56e0\u5b50\u6218\u6cd5#136",
+      "enabled": true,
+      "candidate_id": 136,
+      "applied_at": "2026-09-28 09:33:22",
       "factors": [
         "VSTD20",
         "BBI",
@@ -108,11 +109,22 @@
         "VSTD20": -1,
         "VolSurge5": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.9883016762331999,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_131",
-      "name": "因子战法#131",
+      "name": "\u56e0\u5b50\u6218\u6cd5#131",
+      "enabled": true,
+      "candidate_id": 131,
+      "applied_at": "2026-09-28 09:34:17",
       "factors": [
         "STOA",
         "VSTD20",
@@ -137,11 +149,22 @@
         "VSTD20": -1,
         "VolSurge5": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 10,
+      "ir": 0.9937341097234296,
+      "excess": 0.0011728339269175402,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_137",
-      "name": "因子战法#137",
+      "name": "\u56e0\u5b50\u6218\u6cd5#137",
+      "enabled": true,
+      "candidate_id": 137,
+      "applied_at": "2026-09-30 09:59:05",
       "factors": [
         "VSTD20",
         "BBI",
@@ -172,11 +195,22 @@
         "VSTD20": -1,
         "VolSurge5": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.9894890315198249,
+      "excess": 0.0007514196798304429,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_123",
-      "name": "因子战法#123",
+      "name": "\u56e0\u5b50\u6218\u6cd5#123",
+      "enabled": true,
+      "candidate_id": 123,
+      "applied_at": "2026-10-01 22:25:55",
       "factors": [
         "VSTD20",
         "STOA",
@@ -207,11 +241,22 @@
         "VSTD20": -1,
         "VolSurge5": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.9758609700234222,
+      "excess": 0.005926915018044505,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_150",
-      "name": "因子战法#150",
+      "name": "\u56e0\u5b50\u6218\u6cd5#150",
+      "enabled": true,
+      "candidate_id": 150,
+      "applied_at": "2026-10-22 09:35:52",
       "factors": [
         "VSTD20",
         "STOA",
@@ -242,11 +287,22 @@
         "VSTD20": -1,
         "VolSurge5": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 1.017681212982167,
+      "excess": 0.0011694998049495958,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_153",
-      "name": "因子战法#153",
+      "name": "\u56e0\u5b50\u6218\u6cd5#153",
+      "enabled": true,
+      "candidate_id": 153,
+      "applied_at": "2026-10-23 09:45:25",
       "factors": [
         "VMIN10",
         "VSTD20",
@@ -262,11 +318,22 @@
         "VMIN10": -1,
         "VSTD20": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 10,
+      "ir": 1.3470116712681393,
+      "excess": 0.0005703475750753782,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_154",
-      "name": "因子战法#154",
+      "name": "\u56e0\u5b50\u6218\u6cd5#154",
+      "enabled": true,
+      "candidate_id": 154,
+      "applied_at": "2026-10-25 19:13:20",
       "factors": [
         "VSTD20",
         "BBI",
@@ -291,11 +358,22 @@
         "VSTD20": -1,
         "lu_board3": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.8650337803051504,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_155",
-      "name": "因子战法#155",
+      "name": "\u56e0\u5b50\u6218\u6cd5#155",
+      "enabled": true,
+      "candidate_id": 155,
+      "applied_at": "2026-10-28 10:06:07",
       "factors": [
         "VSTD20",
         "BBI",
@@ -314,11 +392,22 @@
         "VMIN10": -1,
         "VSTD20": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.8570858151519516,
+      "excess": 0.004742718945952542,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_157",
-      "name": "因子战法#157",
+      "name": "\u56e0\u5b50\u6218\u6cd5#157",
+      "enabled": true,
+      "candidate_id": 157,
+      "applied_at": "2026-11-02 20:53:09",
       "factors": [
         "VSTD20",
         "BBI",
@@ -334,11 +423,22 @@
         "VMIN10": -1,
         "VSTD20": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.8507520381105635,
+      "excess": 0.0008608553608783275,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_156",
-      "name": "因子战法#156",
+      "name": "\u56e0\u5b50\u6218\u6cd5#156",
+      "enabled": true,
+      "candidate_id": 156,
+      "applied_at": "2026-11-02 20:53:12",
       "factors": [
         "VSTD20",
         "BBI",
@@ -357,11 +457,22 @@
         "VSTD20": -1,
         "lu_board3": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.8505974470376946,
+      "excess": -0.002275100175415022,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     },
     {
       "id": "fac_160",
-      "name": "因子战法#160",
+      "name": "\u56e0\u5b50\u6218\u6cd5#160",
+      "enabled": true,
+      "candidate_id": 160,
+      "applied_at": "2026-11-06 03:50:29",
       "factors": [
         "VSTD20",
         "BBI",
@@ -380,7 +491,80 @@
         "VSTD20": -1,
         "lu_board3": -1
       },
-      "buy_threshold": 70
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.8543626909798725,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_163",
+      "name": "\u56e0\u5b50\u6218\u6cd5#163",
+      "enabled": true,
+      "candidate_id": 163,
+      "applied_at": "2026-11-07 02:01:44",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VolSurge5"
+      ],
+      "weights": {
+        "BBI": 0.5123975931918757,
+        "VSTD20": 0.35442837219914053,
+        "VolSurge5": 0.1331740346089838
+      },
+      "directions": {
+        "BBI": -1,
+        "VSTD20": -1,
+        "VolSurge5": -1
+      },
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.9098863035482037,
+      "excess": 0.0006682830078871995,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_162",
+      "name": "\u56e0\u5b50\u6218\u6cd5#162",
+      "enabled": true,
+      "candidate_id": 162,
+      "applied_at": "2026-11-07 02:01:46",
+      "factors": [
+        "VSTD20",
+        "BBI",
+        "VolSurge5",
+        "lu_board3"
+      ],
+      "weights": {
+        "BBI": 0.24869508438980883,
+        "VSTD20": 0.1814195367482296,
+        "VolSurge5": 0.06686605783006178,
+        "lu_board3": 0.5030193210318997
+      },
+      "directions": {
+        "BBI": -1,
+        "VSTD20": -1,
+        "VolSurge5": -1,
+        "lu_board3": -1
+      },
+      "buy_threshold": 70,
+      "horizon": 5,
+      "ir": 0.9100204411026779,
+      "excess": -0.004069037296940686,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     }
   ],
   "pattern_rules": []
