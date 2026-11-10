@@ -350,6 +350,11 @@ def build_inner(gate, start_id, root):
         "# 仓库里的段体一字未改；变的只有 cd 目标（相对 $0 会指向 /tmp）与前置 helper 搬运。",
         "set -euo pipefail",
         'cd "%s"' % root,
+        # §GZ-UBUNTU（11-07 批起）文件尾总闸被 emit 带进段尾（emit 本就「跑到文件尾」）；它的
+        # 注释自述「段体被搬进临时脚本执行时也指得回仓内 scripts/」——所以这里必须把主脚本的
+        # GATE_SELF_ABS 等值定义补进内层前言。11-07→11-10 三个批次里任何一段 single-emit 都以
+        # 「GATE_SELF_ABS: unbound variable」收尾＝不是判据红、是装配器漏写定义（§173 的假红即此）。
+        "GATE_SELF_ABS=\"%s\"" % os.path.abspath(gate),
         "\n".join(prelude),
         "\n".join(tail).rstrip("\n"),
     ]

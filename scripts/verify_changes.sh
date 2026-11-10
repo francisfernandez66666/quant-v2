@@ -5201,7 +5201,11 @@ gw_chk "A1 反射集 vs golden 持仓行字段锁在位" "$(grep -c 'vs golden.p
 # §A1 取 min(柜台值,本地推算) 把它当今天权威可卖量会误杀隔夜仓。新增 positionSnapshotFresh 闸门：
 # updated_at 早于今日一律当读不到、回落本地推算；今日新鲜快照仍保留 §A1 收紧。
 gw_chk "A1-FRESH 陈旧快照回落本地推算（positionSnapshotFresh 闸门落地）" "$(gw_code_hits internal/risk/gate.go 'func positionSnapshotFresh')" "1"
-gw_chk "A1-FRESH 闸口对陈旧 can_use_qty 当读不到（positionSnapshotFresh 调用点）" "$(gw_code_hits internal/risk/gate.go 'positionSnapshotFresh\(p\.UpdatedAt, g\.today')" "1"
+# §MANUAL-BOOK-UNIFY（11-06 批 60b4392）在卖出闸（259 行）之外，把同一判据复用到读侧
+# 双维选源（book_source 的 !fresh 分支 582 行与 counterFresh 合取 599 行）——判据函数还是
+# 那一个，调用点从 1 处变成 3 处。11-05→11-10 唯一一次整轮 -collect 抓出这条陈账：
+# 等值取“当前真值 3”而不是“≥1”＝两边都防回归（少一处判据被拆掉也会红）。
+gw_chk "A1-FRESH 闸口对陈旧 can_use_qty 当读不到（positionSnapshotFresh 调用点，卖出闸+读侧双维共 3）" "$(gw_code_hits internal/risk/gate.go 'positionSnapshotFresh\(p\.UpdatedAt, g\.today')" "3"
 gw_chk "A1-FRESH 测试锁两条边界（陈旧放行/新鲜拒）" "$(grep -c 'func TestGateT1SellableStaleSnapshotFallsBack' internal/risk/gate_test.go || true)" "1"
 gw_chk "A1 真行采样双测（样例==broker 真实产出、样例==golden 一致）" "$(grep -c 'def test_positions_sample_' qmt_gateway/tests/test_report_contract.py || true)" "2"
 gw_min "A1 采样夹具在位（可卖量断腿的输入源）" "$(test -f qmt_gateway/contract/positions_sample.json && echo 1 || echo 0)" "1"
@@ -7328,12 +7332,19 @@ qmt, sig, ada = read(Q), read(S), read(A)
 
 # K：配置写入侧允许的键 = 内置白名单里 Kind:"form" 的 ID
 K = set(re.findall(r'\{ID:\s*"([a-z0-9_]+)",\s*Name:\s*"[^"]*",\s*Kind:\s*"form"\}', qmt))
-# P：生产可产生的规范键 = StrategyKeyOf 函数体内所有字面 return
-m = re.search(r'^func StrategyKeyOf\(sig combat_agent\.Signal\) string \{\n(.*?)^\}\n', sig, re.M | re.S)
-if not m:
-    die("锚点失效：%s 里没解析到 StrategyKeyOf 函数体（签名或收尾大括号形态变了 ⇒ P 会退化成空集合，"
-        "而空集合 ⊆ 任何集合恒绿，本腿就白跑了）" % S)
-P = set(re.findall(r'\breturn\s+"([a-z0-9_]+)"', m.group(1)))
+# P：生产可产生的规范键 = StrategyKeyOf 与 StrategyKeyByDisplay 两函数体并集的字面 return。
+# §07ca013（11-05 批）把映射字面量整批搬进 StrategyKeyByDisplay（StrategyKeyOf 只剩
+# StrategyType/StrategyID 两腿透传）——只取 StrategyKeyOf 的旧尺子从那批起 P 退成空集：
+# 空集 ⊆ 任何集合恒绿，这条腿等于白跑。键空间的事实真源现在是两函数链，P 必须两体并取。
+KEYSPACE_DIE = ("锚点失效：%s 的 StrategyKeyOf/StrategyKeyByDisplay 函数体没解析到（签名或收尾大括号"
+                "形态变了 ⇒ P 会退化成空集合，而空集合 ⊆ 任何集合恒绿，本腿就白跑了）")
+keyspace_P = set()
+for _fn in ("StrategyKeyOf", "StrategyKeyByDisplay"):
+    _m = re.search(r'^func %s\((?:sig combat_agent\.Signal|name string)\) string \{\n(.*?)^\}\n' % _fn, sig, re.M | re.S)
+    if not _m:
+        die(KEYSPACE_DIE % S)
+    keyspace_P |= set(re.findall(r'\breturn\s+"([a-z0-9_]+)"', _m.group(1)))
+P = keyspace_P
 # S：做空族分组点 = 同一 case 行并了多个 *X.Strategy、下一行注释点名做空（分组只应有一处）
 lines = ada.split("\n")
 groups = [ln for i, ln in enumerate(lines)
@@ -17201,9 +17212,12 @@ CNT140=$((CNT140 + 1))
 grep -qF "cancel_requested_at = CASE WHEN cancel_requested_at = ''" internal/store/real_positions.go ||
 	fail140 "SetCancelTrace 未用 CASE WHEN 处理空串（COALESCE 对空串无效）"
 CNT140=$((CNT140 + 1))
-TRACE140=$(grep -cF 'SetCancelTrace(' internal/trading/controller.go || true)
+# §CANCEL 唯一出口（2026-11-05 07ca013）：sweep 触发腿的留痕从 controller.go 搬进了
+# RequestCancel（trade_actions_20261105.go）——controller 只剩 manual/halt 两份直写点，
+# 这正是 11-05 落码的设计结果；判据跟着真源走并取两文件，而不是把“唯一出口”拆回去。
+TRACE140=$(( $(grep -cF 'SetCancelTrace(' internal/trading/controller.go || true) + $(grep -cF 'SetCancelTrace(' internal/trading/trade_actions_20261105.go || true) ))
 [ "${TRACE140:-0}" -ge 3 ] ||
-	fail140 "controller 里 SetCancelTrace 调用点少于 3（manual/halt/sweep 都要先写留痕）"
+	fail140 "controller 与唯一出口 RequestCancel 里 SetCancelTrace 留痕写点合计少于 3（manual/halt/sweep 都要先写留痕；sweep 现居 RequestCancel）"
 
 # —— ⑨ 分页形状 ——
 CNT140=$((CNT140 + 1))
@@ -21003,8 +21017,9 @@ ADVT=$(cat internal/trading/advice.go || true)
 grep_q 'cancelRows := cancelAdvices(in.CancelActions)' ADVT F || fail173 "Advise 不再从撤单动作投影（卡上自己判＝第二本账）"
 grep_q 'return cancelRows, flt' ADVT F || fail173 "空持仓时撤行被早退吞掉：建仓买单被撤时那只票往往还没有持仓行"
 # 负锁：战法过滤器只认"加仓"，撤行绝不进它的射程（滤掉一条撤单提示＝把那笔挂单留在市场上）
+# §GATE-PIPEFAIL（§129 尺子全文件量）：判读一律走 grep_q，不许把 awk 管给 grep -q。
 FILTER_BODY=$(awk '/^func filterEntryAdviceByTactics/,/^}/' internal/trading/advice.go || true)
-if printf '%s\n' "$FILTER_BODY" | grep -qF 'adviceActionCancel'; then
+if grep_q 'adviceActionCancel' FILTER_BODY F; then
 	fail173 "战法过滤器开始认识撤单行（只许滤买入方向，这是 owner 裁过的不对称边界）"
 fi
 SLP=$(cat internal/engine/scoring_loop.go || true)
