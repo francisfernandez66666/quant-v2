@@ -21429,3 +21429,21 @@ echo "==> 全部通过"
 
 
 
+
+# ── §PRECALC-V2/QMT直取（2026-11-11 收口批 d383400/e35aaf1）：价量 QMT 直取、非价量 gz 烘、B 机制 ──
+gw_chk "PRECALC 模板 init 拉起 QMT 日线下载（价量类直取的入口）" "$(grep -c '_download_day_bars(ContextInfo)' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+gw_chk "PRECALC 官方下载 API 调用在模板内" "$(grep -c 'download_history_data2' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+gw_chk "PRECALC bars_count 出厂 ≥60（覆盖 Mom60 因子窗口）" "$(grep -cE 'PARAMS\.get\("bars_count", (6[0-9]|7[0-9]|8[0-9]|9[0-9]|1[0-9][0-9])\)' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+gw_chk "PRECALC build_context 接线 ctx bars（形态/龙头/因子战法的序列输入）" "$(grep -c '"bars": bars' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+gw_chk "PRECALC build_context 透传估值/换手/财务/资金流/D1/热度（QMT 拿不到的才烘）" "$(grep -c 'valuation_series": pre.get("valuation_series")' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+gw_chk "PRECALC data_health 覆盖率日志（下载失败绝不静默）" "$(grep -c 'data_health bars_coverage' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+gw_chk "PRECALC v2 烘焙函数在 pregen（估值/换手/财务/资金流/D1/热度）" "$(grep -c 'def bake_bakeables' scripts/pregen_carrier_factors_gz.py || true)" "1"
+gw_chk "B机制 hot reload 自动补推（限频每小时）" "$(grep -c 'HOTRELOAD_DATARETRY' scripts/carrier_hot_reload_gz.py || true)" "1"
+gw_chk "B机制 pregen ntfy 手机通知（连续失败/恢复）" "$(grep -c 'def _notify' scripts/pregen_carrier_factors_gz.py || true)" "1"
+gw_chk "B机制 precalc 状态文件（consec_fail/coverage 判定依据）" "$(grep -c 'def _write_status' scripts/pregen_carrier_factors_gz.py || true)" "1"
+gw_chk "隔离 report 过滤视图（成员手动账提醒不再泄进运营流）" "$(grep -c 'func (r \*Report) ViewExcludingForeign' internal/report/report.go || true)" "1"
+gw_chk "隔离 视图接线（引擎提醒生产者用过滤视图）" "$(grep -c 'viewRpt := e.rpt.ViewExcludingForeign' internal/engine/engine.go || true)" "1"
+gw_chk "交易列表 只认 live placed（纸面碎单不混入）" "$(grep -c 'EqualFold(strings.TrimSpace(it.Channel), "live")' internal/server/signal_trades_api.go || true)" "1"
+gw_chk "hithink key 前台配置端点（研究库主源凭据）" "$(grep -c 'handleAdminSetHithinkKey' internal/server/admin.go || true)" "1"
+gw_chk "调度器 hithink_sync 步（ths_daily 停更根因修复）" "$(grep -c 'case "hithink_sync"' internal/scheduler/worker.go || true)" "1"
+gw_chk "回归测试锁在位（precalc v2 五用例）" "$(grep -c 'def test_bake_bakeables_shapes_align_consumers' qmt_gateway/tests/test_precalc_v2_20261111.py || true)" "1"
