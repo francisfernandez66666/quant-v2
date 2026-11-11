@@ -102,13 +102,31 @@ function chgColor(v) {
 // "YYYY-MM-DD HH:MM:SS" timestamp string sorts correctly in lexicographic order); sorterNum compares a
 // numeric field (price/total score). Both plug straight into the TDesign column sorter config.
 export function sorterStr(key) {
-  return (a, b) => (a[key] || '').localeCompare(b[key] || '')
+  return (a, b) => String(a[key] == null ? '' : a[key]).localeCompare(String(b[key] == null ? '' : b[key]), 'zh-CN')
 }
 
-// English: numeric-field sorter factory (ascending; missing values treated as 0).
-// sorterNum 数值列排序比较器（antd 风格 sorter 工厂，缺值沉底）。
+// 2026-11-11 owner 需求：数值列点击后不是按数字大小排而是乱序。根因是旧比较器直接相减，
+// 只要有一格是格式化串（"¥22.68" / "89.5%" / "—"）或 null，NaN 比较结果会被 JS sort 当成 0，
+// 于是整表保持引擎下发顺序（看似乱序）。这里统一做数值解析 + 缺值沉底 + 稳定兜底。
+// English: numeric-aware comparator; unparsable/missing values sink to the bottom so one
+// formatted cell can never poison the ordering of the whole column.
+export function numVal(v) {
+  if (v == null || v === '') return null
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null
+  const cleaned = String(v).replace(/[^0-9.+\-]/g, '')
+  if (!cleaned) return null   // 纯占位符（—/-/空）清洗后为空串，不能当 0
+  const n = Number(cleaned)
+  return Number.isFinite(n) ? n : null
+}
 export function sorterNum(key) {
-  return (a, b) => (a[key] || 0) - (b[key] || 0)
+  return (a, b) => {
+    const x = numVal(a[key]); const y = numVal(b[key])
+    if (x == null && y == null) return String(a.code || '').localeCompare(String(b.code || ''))
+    if (x == null) return 1      // 缺值永远沉底，升/降序都在底部
+    if (y == null) return -1
+    if (x === y) return String(a.code || '').localeCompare(String(b.code || ''))
+    return x - y
+  }
 }
 
 /**
@@ -218,14 +236,26 @@ export default function Signals() {
     code: sorterStr('code'),
     name: sorterStr('name'),
     price: sorterNum('price'),
+    change_pct: sorterNum('change_pct'),
     strategy: sorterStr('strategy'),
+    strategy_type: sorterStr('strategy_type'),
+    direction: sorterStr('direction'),
+    level: sorterStr('level'),
+    remind_level: sorterStr('remind_level'),
+    action: sorterStr('action'),
     generated_at: sorterStr('generated_at'),
     total_score: sorterNum('total_score'),
+    d1: sorterNum('d1'), d2: sorterNum('d2'), d3: sorterNum('d3'), d4: sorterNum('d4'),
+    confidence: sorterNum('confidence'),
   }
+  // TDesign 的 sort 可能是数组（multipleSort）或对象；只看第一项，避免 sortBy 取不到时
+  // 整表回落成引擎原始顺序（owner 看到的"点了没排/乱序"）。
+  const active = Array.isArray(sort) ? sort[0] : sort
+  const sortBy = active && (active.sortBy || active.colKey)
   let sortedSignals = filteredSignals
-  if (sort && sort.sortBy && sorters[sort.sortBy]) {
-    const cmp = sorters[sort.sortBy]
-    sortedSignals = [...filteredSignals].sort(sort.descending ? (a, b) => cmp(b, a) : cmp)
+  if (sortBy && sorters[sortBy]) {
+    const cmp = sorters[sortBy]
+    sortedSignals = [...filteredSignals].sort(active.descending ? (a, b) => cmp(b, a) : cmp)
   }
 
   // 根据操作结果弹出成功/失败提示

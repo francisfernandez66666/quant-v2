@@ -17,6 +17,14 @@ import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 // 维护统一落进实仓 tab；「手动维护，更新于 <asof>」「非柜台实时读数」两串身份文案仍取自全站唯一源。
 import { manualSourceMain, MANUAL_SOURCE_NONREALTIME } from '../utils/manualSource.js'
 import { on } from '../sseBus.js'
+// 2026-11-11 owner 需求：手动/自动维护改为前端显式开关，不再硬等系统判冻结/熔断。
+// 自动＝跟随 book_source（柜台帧冻结时仍自动放开改账，避免按钮全灰）；手动＝强制改账态。
+// English: explicit bookkeeping mode; "manual" always forces the adjust path, "auto"
+// follows the server book source (with the frozen-frame safety fallback).
+export const BOOK_MODE_KEY = 'positions_book_mode'
+export function resolveBookMode(bookMode, cashManual, posManual, counterFrozen) {
+  return bookMode === 'manual' || !!(cashManual || posManual || counterFrozen)
+}
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
 // §FIX-20261028-F09：读取失败按腿记账（共享 hook + 共享红条，testid 全站唯一）
@@ -126,6 +134,14 @@ export default function Positions() {
   // 前端只透传、只按它分流（下单 vs 改账）与挂角标，**绝不**自己在页面上再判一次新鲜度——
   // 两处判一个迟早一处漂，漂的方向不是放行买入就是把手敲账悄悄换成旧柜台账。
   const [realBookSource, setRealBookSource] = useState(null)
+  // 维护模式显式开关（localStorage 记住选择；SSR/隐私模式下 localStorage 不可用也不炸）
+  const [bookMode, setBookModeState] = useState(() => {
+    try { return localStorage.getItem(BOOK_MODE_KEY) === 'manual' ? 'manual' : 'auto' } catch { return 'auto' }
+  })
+  function setBookMode(v) {
+    setBookModeState(v)
+    try { localStorage.setItem(BOOK_MODE_KEY, v) } catch { /* no-op */ }
+  }
   // 实盘整体盈亏（/api/qmt/trades summary：realized/unrealized/total_pnl）——页头优先展示
   const [realTrades, setRealTrades] = useState(null)
   // 实盘持仓建议映射（ts_code -> 建议）
@@ -197,7 +213,14 @@ export default function Positions() {
   // 绝不把"点下单"静默变成"点记账"——那比按钮点不动更危险。
   // English: three states — both dimensions counter (reachable), any dimension manual (adjust
   // mode), or unknown (keep today's real-order behaviour; never silently switch to bookkeeping).
-  const manualMode = cashManual || posManual
+  // 2026-11-11 owner 需求：柜台帧已冻结（counter_frozen=true，页头挂"以券商 App 为准"）时，
+  // 旧逻辑仍把两维标成 counter ⇒ 落进真单态，而网关熔断又把四个按钮全禁用，用户既不能
+  // 下单也不能改账。冻结账本就不是可信柜台读数，此时一律进改账态（列标题变「改账」、
+  // 四个动作只写 manual_* 不下单），这才是"回报通路重建中"唯一该开的口。
+  // English: a frozen counter frame must open the bookkeeping path; otherwise the tripped
+  // real-order buttons leave every manual maintenance action greyed out.
+  const counterFrozen = !!realBookSource?.counter_frozen
+  const manualMode = resolveBookMode(bookMode, cashManual, posManual, counterFrozen)
   const bookUnknown = !counterReachable && !manualMode
   // 当前实盘下单参数（持仓+方向）
   const [realAction, setRealAction] = useState(null)
@@ -1364,7 +1387,11 @@ export default function Positions() {
                 </span>
               )
             })()}
-            <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
+            {/* 2026-11-11 owner 需求：维护模式显式开关（手动=强制改账，不下单；自动=跟随读数）。 */}
+            <span className="muted" style={{ marginLeft: 'auto' }}>维护模式</span>
+            <Button size="small" data-testid="book-mode-auto" variant={bookMode === 'auto' ? 'base' : 'outline'} theme={bookMode === 'auto' ? 'primary' : 'default'} onClick={() => setBookMode('auto')}>自动</Button>
+            <Button size="small" data-testid="book-mode-manual" variant={bookMode === 'manual' ? 'base' : 'outline'} theme={bookMode === 'manual' ? 'warning' : 'default'} onClick={() => setBookMode('manual')}>手动维护</Button>
+            <Button size="small" variant="outline" theme="primary" onClick={loadReal}>刷新</Button>
           </div>
 
           {/* §MANUAL-BOOK-UNIFY（2026-11-06 裁决 2/4/5）可达性状态行 + 改账态两个入口。
@@ -1377,6 +1404,12 @@ export default function Positions() {
               English: one status strip for the whole tab; adjust-only entries appear solely in
               adjust mode; an unknown source is labelled unknown, never rendered as zero. */}
           <div data-testid="real-book-source" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: manualMode ? '#fff7e6' : 'transparent', border: manualMode ? '1px solid #ffd591' : '1px solid transparent' }}>
+            {bookMode === 'manual' && (
+              <>
+                <Tag data-testid="book-mode-forced" theme="warning" size="small">维护模式：手动（强制改账）</Tag>
+                <span className="muted">四个动作只写手动账，不下单；切回「自动」恢复跟随柜台读数</span>
+              </>
+            )}
             {/* §LEDGER-FROZEN-BANNER（2026-11-09 实锤后的诚实化）：柜台帧不属于今日 ⇒ 整表是冻结账，
                 页头必须挂「以券商 App 为准」——冻结账长得跟真柜台一模一样，是最危险的静默降级。
                 counter_frozen/counter_frame_at 由后端随响应下发（qmt.go counterFrameReadout）。 */}

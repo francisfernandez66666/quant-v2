@@ -13,6 +13,32 @@ import React, { useEffect, useState } from 'react'
 import { Card, Table, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
 
+// 2026-11-11 owner 需求：决策子表表头点击也必须能按数字大小排序。此前该表一列 sorter
+// 都没有，点击表头无反应，30s 轮询又整体替换列表，看起来就是"乱序"。与 Signals.jsx 同一套
+// 数值解析口径：格式化串/缺值不产生 NaN（NaN 会让 JS sort 把整表当相等，保持引擎原序）。
+// English: numeric-aware comparators for the decisions table; unparsable values sink.
+function decisionNum(v) {
+  if (v == null || v === '') return null
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null
+  const cleaned = String(v).replace(/[^0-9.+\-]/g, '')
+  if (!cleaned) return null   // 纯占位符（—/-/空）清洗后为空串，不能当 0
+  const n = Number(cleaned)
+  return Number.isFinite(n) ? n : null
+}
+function decisionNumSorter(key) {
+  return (a, b) => {
+    const x = decisionNum(a[key]); const y = decisionNum(b[key])
+    if (x == null && y == null) return String(a.code || '').localeCompare(String(b.code || ''))
+    if (x == null) return 1
+    if (y == null) return -1
+    if (x === y) return String(a.code || '').localeCompare(String(b.code || ''))
+    return x - y
+  }
+}
+function decisionStrSorter(key) {
+  return (a, b) => String(a[key] == null ? '' : a[key]).localeCompare(String(b[key] == null ? '' : b[key]), 'zh-CN')
+}
+
 /** 金额：千分位两位小数；非数字显示“—”。 */
 function money(v) {
   const n = Number(v)
@@ -36,6 +62,8 @@ function stageTag(stage) {
 }
 
 export default function SignalDecisionsCard() {
+  // 受控排序：渲染层自行排序（TDesign 受控 data 下内部排序会被覆盖）。
+  const [sort, setSort] = useState(null)
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
@@ -68,20 +96,34 @@ export default function SignalDecisionsCard() {
   if (forbidden) return null
 
   const items = (data && Array.isArray(data.items)) ? data.items : []
+  const dcSorters = {
+    at: decisionStrSorter('at'), channel: decisionStrSorter('channel'),
+    code: decisionStrSorter('code'), strategy_key: decisionStrSorter('strategy_key'),
+    stage: decisionStrSorter('stage'), scale: decisionNumSorter('market_scale'),
+    target: decisionNumSorter('target'), rooms: decisionNumSorter('industry_room'),
+    qty: decisionNumSorter('qty'), reason: decisionStrSorter('reason'),
+  }
+  const dActive = Array.isArray(sort) ? sort[0] : sort
+  const dBy = dActive && (dActive.sortBy || dActive.colKey)
+  let displayItems = items
+  if (dBy && dcSorters[dBy]) {
+    const cmp = dcSorters[dBy]
+    displayItems = [...items].sort(dActive.descending ? (a, b) => cmp(b, a) : cmp)
+  }
   const columns = [
-    { colKey: 'at', title: '计算时刻', width: 110, cell: ({ row }) => <span style={{ fontSize: 12 }}>{String(row.at || '').replace('T', ' ').slice(11, 19) || '—'}</span> },
+    { sorter: decisionStrSorter('at'), colKey: 'at', title: '计算时刻', width: 110, cell: ({ row }) => <span style={{ fontSize: 12 }}>{String(row.at || '').replace('T', ' ').slice(11, 19) || '—'}</span> },
     // §FIX-20261028-F19a：通道列（实盘自动 / 手动直发 / 纸面）。此前三个通道在屏上无法区分，
     // 客户看到一行无法判断"这是引擎算的还是我手点的"。manual 行的定权列显示「—」（不伪造 MS/SS）。
-    { colKey: 'channel', title: '通道', width: 80, cell: ({ row }) => {
+    { sorter: decisionStrSorter('channel'), colKey: 'channel', title: '通道', width: 80, cell: ({ row }) => {
       const map = { live: ['实盘', 'primary'], manual: ['手动', 'warning'], paper: ['纸面', 'default'] }
       const [label, theme] = map[row.channel] || ['实盘', 'primary']
       return <Tag size="small" theme={theme} variant="light">{label}</Tag>
     } },
-    { colKey: 'code', title: '代码', width: 95 },
-    { colKey: 'strategy_key', title: '战法', width: 90, ellipsis: true, cell: ({ row }) => <span style={{ fontSize: 12 }}>{row.strategy_key || '—'}</span> },
-    { colKey: 'stage', title: '阶段', width: 90, cell: ({ row }) => stageTag(row.stage) },
+    { sorter: decisionStrSorter('code'), colKey: 'code', title: '代码', width: 95 },
+    { sorter: decisionStrSorter('strategy_key'), colKey: 'strategy_key', title: '战法', width: 90, ellipsis: true, cell: ({ row }) => <span style={{ fontSize: 12 }}>{row.strategy_key || '—'}</span> },
+    { sorter: decisionStrSorter('stage'), colKey: 'stage', title: '阶段', width: 90, cell: ({ row }) => stageTag(row.stage) },
     {
-      colKey: 'scale', title: '定权 MS / SS / 单笔', width: 150,
+      colKey: 'scale', title: '定权 MS / SS / 单笔', width: 150, sorter: decisionNumSorter('market_scale'),
       cell: ({ row }) => (
         <span style={{ fontSize: 12 }}>
           {/* §FIX-20261028-F19a：手动直发不经动态预算 ⇒ 这三列对它没有意义，显示「—」
@@ -95,19 +137,19 @@ export default function SignalDecisionsCard() {
       ),
     },
     {
-      colKey: 'target', title: '目标 / 当前 / 剩余', width: 170,
+      colKey: 'target', title: '目标 / 当前 / 剩余', width: 170, sorter: decisionNumSorter('target'),
       cell: ({ row }) => <span style={{ fontSize: 12 }}>{`${money(row.target)} / ${money(row.cur_strat)} / ${money(row.room)}`}</span>,
     },
     {
-      colKey: 'rooms', title: '额度余量 行业/单票/簇', width: 160,
+      colKey: 'rooms', title: '额度余量 行业/单票/簇', width: 160, sorter: decisionNumSorter('industry_room'),
       cell: ({ row }) => <span style={{ fontSize: 12 }}>{`${money(row.industry_room)} / ${money(row.stock_room)} / ${money(row.cluster_room)}`}</span>,
     },
     {
-      colKey: 'qty', title: '数量 / 金额', width: 120,
+      colKey: 'qty', title: '数量 / 金额', width: 120, sorter: decisionNumSorter('qty'),
       cell: ({ row }) => <span style={{ fontSize: 12 }}>{`${Number(row.qty) || 0} 股 / ${money(row.notional)}`}</span>,
     },
     {
-      colKey: 'reason', title: '受限项 / 原因', ellipsis: true,
+      colKey: 'reason', title: '受限项 / 原因', ellipsis: true, sorter: decisionStrSorter('reason'),
       cell: ({ row }) => {
         // §P1-3（2026-10-30）：在途买单占用单独点名。事故当天这里只有 target，
         // 看不出 3.6 万是被两笔卡在「撤单中」的买单占着的。
@@ -141,8 +183,10 @@ export default function SignalDecisionsCard() {
       {error ? <div style={{ color: 'var(--td-warning-color)', fontSize: 12, marginBottom: 8 }}>⚠ {error}</div> : null}
       <Table
         rowKey={(row) => `${row.code}|${row.strategy_key}|${row.signal_id || ''}`}
-        data={items}
+        data={displayItems}
         columns={columns}
+        sort={sort}
+        onSortChange={(val) => setSort(val || null)}
         size="small"
         bordered
         empty="今日尚无决策快照（自动买入评估未触发；手动直发单会以「手动」通道出现）"
