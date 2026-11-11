@@ -430,6 +430,20 @@ def _vwap_of(tick):
         return None, "vwap_missing"
     if vwap < last * float(PARAMS.get("vwap_sanity_lo", 0.5)) or \
             vwap > last * float(PARAMS.get("vwap_sanity_hi", 2.0)):
+        # 2026-11-11 owner: consecutive vwap_suspect in round_skips. QMT builds
+        # disagree on amount/volume units (volume in lots vs shares, amount in
+        # yuan vs wan). Data-driven unit auto-correction: divide by each baked
+        # candidate and accept ONLY the value that lands inside the same sanity
+        # band (the existing gate arbitrates; nothing is invented). If none
+        # lands, keep suspect (fail-closed). Candidates come from PARAMS.
+        for mult in PARAMS.get("vwap_unit_candidates") or []:
+            try:
+                corrected = vwap / float(mult)
+            except (TypeError, ZeroDivisionError):
+                continue
+            if last * float(PARAMS.get("vwap_sanity_lo", 0.5)) <= corrected <= \
+                    last * float(PARAMS.get("vwap_sanity_hi", 2.0)):
+                return corrected, ""
         return None, "vwap_suspect"
     return vwap, ""
 

@@ -701,12 +701,20 @@ export default function Signals() {
         {/* §TRADE-LIST（2026-11-11 owner 需求）：交易列表 = 全套脑侧规则（动态仓位/额度帽/
             关键读数拦截…）跑完后 stage=placed 的**下单信号**。有就显示这个 tab，一条都没有
             就不渲染（"没有就不显示"）；弹窗提醒同样只推这份清单（SignalCardModal 同源）。 */}
-        {tradeCount > 0 && (
+        {/* 2026-11-11 owner：admin 找不到这个 tab——改为**常显**，空态说明「今日暂无实盘
+            下单信号」，避免「有数据才渲染」让 tab 蒸发。 */}
         <Tabs.TabPanel value="trades" label={`交易列表 ${tradeCount}`}>
           <div data-testid="trade-list-note" className="muted" style={{ marginBottom: 8 }}>
             以下每条都已通过全套脑侧规则（信号准入 → 动态仓位 → 三道额度帽 → 关键读数），
             是**下单信号**而非原始提醒；盒内 12 闸（确认窗/VWAP/集中度等）仍是下单前最后一道。
           </div>
+          {tradeCount === 0 ? (
+            <Card>
+              <div data-testid="trade-list-empty" className="muted" style={{ padding: '18px 0', textAlign: 'center' }}>
+                今日暂无实盘下单信号（全套规则 placed 为空）· 纸面/被拦的决策请看「动态仓位」tab
+              </div>
+            </Card>
+          ) : (
           <Card>
             <Table rowKey={(r) => `${r.signal_id}|${r.code}`} data={tradeItems} size="small" bordered
               columns={[
@@ -715,6 +723,8 @@ export default function Signals() {
                 { colKey: 'name', title: '名称', width: 100, cell: ({ row }) => String(row.card?.stock_name || '—') },
                 { colKey: 'channel', title: '通道', width: 80, cell: ({ row }) => <Tag size="small" variant="light" theme={row.channel === 'manual' ? 'warning' : 'primary'}>{row.channel === 'manual' ? '手动' : row.channel === 'paper' ? '纸面' : '实盘'}</Tag> },
                 { colKey: 'strategy_key', title: '战法', width: 120, ellipsis: true },
+                // §TRADE-LIST（2026-11-11 owner）：必须写清楚买入还是卖出——方向取信号卡 side（买入/卖出）
+                { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => { const side = String(row.card?.side || ''); const isBuy = side.indexOf('买') >= 0; return <Tag size="small" variant="light" theme={isBuy ? 'danger' : 'success'}>{side || '—'}</Tag> } },
                 { colKey: 'qty', title: '股数', width: 80, cell: ({ row }) => `${Number(row.qty) || 0} 股` },
                 { colKey: 'price', title: '参考价', width: 90, cell: ({ row }) => row.price_kind === 'live' ? `¥${Number(row.price).toFixed(2)}` : '—' },
                 { colKey: 'money', title: '金额', width: 110, cell: ({ row }) => `¥${(Number(row.notional) || 0).toLocaleString('zh-CN', { maximumFractionDigits: 0 })}` },
@@ -723,8 +733,8 @@ export default function Signals() {
               ]}
             />
           </Card>
+          )}
         </Tabs.TabPanel>
-        )}
         <Tabs.TabPanel value="decisions" label="动态仓位" destroyOnHide>
           {/* §DECISION-TODAY：今日动态仓位计算过程（因子→目标→额度帽→结果/拒因；含被拦信号）。
               原在信号列表上方，宽表把列表挤到首屏之外；owner 2026-10-29 要求单独开一个子页。 */}

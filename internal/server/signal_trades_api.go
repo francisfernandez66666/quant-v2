@@ -44,7 +44,12 @@ func (s *Server) handleSignalTrades(w http.ResponseWriter, r *http.Request) {
 	codes := make([]string, 0)
 	seen := map[string]bool{}
 	for _, it := range items {
-		if !strings.EqualFold(strings.TrimSpace(it.Stage), "placed") {
+		// 2026-11-11 owner 实锤：纸面通道的决策（纸面账资金只有几千块）混进交易列表，
+		// 推出 ¥287 的碎单——与实盘动态仓位（10 万成本）完全不挂钩。交易列表/弹窗只认
+		// **live（实盘）通道 + stage=placed**；纸面决策留在「动态仓位」tab 里看。
+		// English: live-channel placed decisions only; paper stays in the decisions tab.
+		if !strings.EqualFold(strings.TrimSpace(it.Stage), "placed") ||
+			!strings.EqualFold(strings.TrimSpace(it.Channel), "live") {
 			continue
 		}
 		placed = append(placed, it)
