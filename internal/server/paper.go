@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -69,14 +70,35 @@ func (s *Server) paperEngineFor(userID string) *paper.Engine {
 // English: returns the paper master state (enabled) plus performance/signal-quality stats, with the
 // account role flag (the admin account's paper additionally supports backtest + auto-trade linkage),
 // plus the strategy pool snapshot (allocation balances).
+// paperStateCache §SLOW-TAB（2026-11-11）：/api/paper/state p90 12s——Stats/StrategyPools/
+// ShortBook 每次全量重算（纸面账 1MB 级）。加 10s 每账号 TTL 缓存：前端各 tab 轮询共享一帧，
+// 重算频率从「每次请求」降到「每 10s 最多一次」。English: 10s per-uid cache; stats staleness
+// within 10s is acceptable for these panels (they poll at 30-60s anyway).
+type paperStateCacheEntry struct {
+	payload map[string]interface{}
+	at      time.Time
+}
+
+var paperStateCache = struct {
+	sync.Mutex
+	m map[string]paperStateCacheEntry
+}{m: map[string]paperStateCacheEntry{}}
+
 func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
+	paperStateCache.Lock()
+	if ent, ok := paperStateCache.m[uid]; ok && time.Since(ent.at) < 10*time.Second {
+		paperStateCache.Unlock()
+		writeJSON(w, 200, ent.payload)
+		return
+	}
+	paperStateCache.Unlock()
 	pe := s.paperEngineFor(uid)
 	if pe == nil {
 		writeJSON(w, 200, map[string]interface{}{"enabled": false}) // 未接入模拟盘引擎
 		return
 	}
-	writeJSON(w, 200, map[string]interface{}{
+	payload := map[string]interface{}{
 		"enabled":         pe.Enabled(),            // 模拟盘总开关
 		"is_admin":        s.auth.IsAdmin(uid),     // 账号角色（admin 额外支持回测/自动交易联动）
 		"stats":           pe.Stats(),              // 绩效/信号质量汇总（现金/净值/胜率等）
@@ -86,7 +108,11 @@ func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 		// §SHORT-3/决策⑤ 融券做空卡（负持仓/担保/利息/做空权益），enabled=false 时前端整卡隐藏。
 		// English: §SHORT-3 margin-short card payload; the frontend hides it entirely when disabled.
 		"short_book": pe.ShortBook(),
-	})
+	}
+	paperStateCache.Lock()
+	paperStateCache.m[uid] = paperStateCacheEntry{payload: payload, at: time.Now()}
+	paperStateCache.Unlock()
+	writeJSON(w, 200, payload)
 }
 
 // handlePaperPositions 返回模拟盘当前持仓（含实时估值价/浮盈/滑点参照）。

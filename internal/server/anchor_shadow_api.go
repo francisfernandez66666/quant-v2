@@ -16,7 +16,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// anchorShadowCache §SLOW-TAB：60s 每账号 TTL（见 handleAnchorShadow 注释）。
+type anchorShadowCacheEntry struct {
+	payload interface{}
+	at      time.Time
+}
+
+var anchorShadowCache = struct {
+	sync.Mutex
+	m map[string]anchorShadowCacheEntry
+}{m: map[string]anchorShadowCacheEntry{}}
 
 const (
 	anchorShadowDefaultDays = 20
@@ -64,6 +77,17 @@ func (s *Server) handleAnchorShadow(w http.ResponseWriter, r *http.Request) {
 	if days > anchorShadowMaxDays {
 		days = anchorShadowMaxDays
 	}
+	// §SLOW-TAB（2026-11-11）：/api/anchor-shadow avg 5.4s（全量聚合 1.5MB 账本）。
+	// 60s 每(账号,days) TTL 缓存：影子对照是分钟级面板，60s 内复用同一帧完全够用。
+	// 缓存键含 days（不同窗口不是同一帧），且放在 days 归一之后。
+	ck := uid + "|" + strconv.Itoa(days)
+	anchorShadowCache.Lock()
+	if ent, ok := anchorShadowCache.m[ck]; ok && time.Since(ent.at) < 60*time.Second {
+		anchorShadowCache.Unlock()
+		writeJSON(w, 200, ent.payload)
+		return
+	}
+	anchorShadowCache.Unlock()
 
 	path := filepath.Join(s.cacheDir, "accounts", uid, "anchor_shadow.json")
 	raw, err := os.ReadFile(path)
@@ -104,6 +128,9 @@ func (s *Server) handleAnchorShadow(w http.ResponseWriter, r *http.Request) {
 	if view.Days == nil {
 		view.Days = []anchorShadowDayView{}
 	}
+	anchorShadowCache.Lock()
+	anchorShadowCache.m[ck] = anchorShadowCacheEntry{payload: view, at: time.Now()}
+	anchorShadowCache.Unlock()
 	view.State = "ok"
 	view.Reason = ""
 	writeJSON(w, http.StatusOK, view)
