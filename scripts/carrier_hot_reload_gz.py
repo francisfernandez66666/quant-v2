@@ -46,6 +46,7 @@ SHORT_STRATEGY_TYPES = ("high_churn", "break_down", "leader_decay", "leader_deca
 # 进池只拓宽规则"可看"的票，买入仍要过全部 12 闸，不发明新下单语义）。
 BULLISH_MIN_SCORE = float(os.environ.get("BULLISH_MIN_SCORE", "60"))
 HOT_POOL_MAX = int(os.environ.get("HOT_POOL_MAX", "30"))
+SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "600"))  # owner：监视池上限 600
 
 
 def die(reason):
@@ -105,6 +106,27 @@ def extract_bullish():
         if c not in pool or score > pool[c]["score"]:
             pool[c] = {"score": score, "source": src[:24]}
     return pool
+
+
+def extract_signal_codes():
+    """signals_today.json 里**全部**信号代码（不限方向）→ 信号监视池来源。
+    owner 2026-11-13:36 需求：个股监视（信号监视）池上限扩到 600，随信号自动扩池，
+    不再烘死在自选清单里。English: all signal codes feed the carrier scan universe.
+    """
+    codes = []
+    try:
+        with open(SIGNALS_TODAY, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = None
+    rows = data if isinstance(data, list) else (data or {}).get("signals") or []
+    for s in rows:
+        if not isinstance(s, dict):
+            continue
+        c = norm(s.get("code"))
+        if len(c) == 6 and c.isdigit():
+            codes.append(c)
+    return sorted(set(codes))
 
 
 def extract_bearish():
@@ -193,8 +215,10 @@ def main():
     # 「归因变了但白名单没变」会被 sha 闸拦成 NOTHING_TO_DO，利空清单永远烘不进载体。
     bearish = extract_bearish()
     bullish = extract_bullish()
+    signal_pool = extract_signal_codes()
     payload = json.dumps({"wl": wl, "rules": [r.get("id") for r in rules],
-                          "bearish": bearish, "bullish": bullish}, ensure_ascii=True)
+                          "bearish": bearish, "bullish": bullish,
+                          "signal_pool": signal_pool}, ensure_ascii=True)
     sha = hashlib.sha256(payload.encode()).hexdigest()
 
     if not args.force and os.path.exists(STATE) and open(STATE).read().strip() == sha:
@@ -228,6 +252,11 @@ def main():
         "bullish": dict(top),
         "updated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
+    # 2026-11-11 owner 需求：个股监视（信号监视）池上限扩到 600——扫描池 = 原自选 ∪
+    # 当日全部信号 ∪ 利好池，去重排序后截断到 SIGNAL_POOL_MAX。只拓"可看"的票，
+    # 买入仍过全部 12 闸。QMT 用 get_full_tick 逐票拉取（非订阅），无订阅上限风险。
+    pool = set(doc2["params"].get("symbols") or []) | set(signal_pool) | set(bullish)
+    doc2["params"]["symbols"] = sorted(pool)[:SIGNAL_POOL_MAX]
     json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 
@@ -272,8 +301,8 @@ def main():
 
     with open(STATE, "w") as fh:
         fh.write(sha)
-    print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d bullish=%d" % (
-        ver, sha_art, len(wl), len(bearish), len(top)))
+    print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d bullish=%d pool=%d" % (
+        ver, sha_art, len(wl), len(bearish), len(top), len(doc2["params"].get("symbols") or [])))
     return 0
 
 

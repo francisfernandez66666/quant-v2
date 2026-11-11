@@ -799,6 +799,8 @@ func (s *Server) registerRoutes() {
 	// §DECISION-TODAY（2026-10-28）今日动态仓位计算过程（只读；被拦/未下单也返回）。
 	// §MULTI-ACCT-B 批5：handler 按 userIDFor(r) 取**自己账号**的决策快照，故 quant_trade 可放行。
 	s.mux.HandleFunc("GET /api/signals/decisions", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleSignalDecisions))
+	// §TRADE-LIST（2026-11-11）：交易列表 = 全套脑侧规则跑完后的下单信号（stage=placed）。
+	s.mux.HandleFunc("GET /api/signals/trades", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleSignalTrades))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
 	s.mux.HandleFunc("GET /api/engine_health", s.authMiddleware(s.handleFixEngineHealth))
 	// 消息中心：列表对所有登录用户可读（运营数据系统级共享）；清空/删除为写操作，仅管理员可操作。

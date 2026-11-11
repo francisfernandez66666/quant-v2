@@ -1304,7 +1304,10 @@ export default function Positions() {
                 {dirtyCodes.size} 项未落库
               </Tag>
             )}
-            {canFundsWrite && <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>}
+            {/* 2026-11-11 owner 实锤：这个按钮是**纸面账**的录入口，曾挂在两 tab 共用的页头，
+                在实盘 tab 点它会把持仓写到纸面账里。只在纸面 tab 显示；实盘 tab 的录入口
+                是状态条里的「改账·新增」（写 manual_*）。 */}
+            {bookTab === 'paper' && canFundsWrite && <Button theme="primary" onClick={openAddNew}>+ 新增持仓（纸面）</Button>}
           </div>
         </div>
       </Card>

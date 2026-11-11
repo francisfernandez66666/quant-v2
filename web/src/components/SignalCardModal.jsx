@@ -52,10 +52,18 @@ export default function SignalCardModal() {
     if (fetchingRef.current) return // 并发门铃（连着来两条消息）只跑一趟，避免同一批卡派发两次
     fetchingRef.current = true
     try {
-      const list = await api.fetchSignals()
+      // 2026-11-11 owner 需求：卡只推**全套规则跑完后的下单信号**（/api/signals/trades，
+      // stage=placed），原始信号不再推卡（"而不是乱推送"）；403/为空 ⇒ 不推也不清堆叠。
+      const list = await api.fetchTradeSignals()
       if (!Array.isArray(list)) return
+      const rows = Array.isArray(list.trades) ? list.trades : []
+      // ② 信号消失 ⇒ 卡消失：每轮把卡堆叠按当轮仍存活的 signal_id 裁剪（含手动拉一次的卡）。
+      const liveIds = rows.map((s) => String(s.signal_id || (s.card && s.card.signal_id) || ''))
+      setCards((prev) => pruneCardsByLive(prev, liveIds))
+      // ① 非交易时段不提醒：不加新卡（已挂着的卡随上一条裁剪规则自然消退）。
+      if (!isTradingSessionNow(new Date())) return
       const fresh = []
-      list.forEach((sig) => {
+      rows.forEach((sig) => {
         if (!sig || !sig.card) return
         const c = normalizeCard(sig.card)
         if (!c.signalId) return
@@ -127,7 +135,7 @@ export function SignalCard({ card, onDone }) {
         <strong>{c.side === MISSING_LABEL ? '交易信号' : '交易信号 · ' + c.side}</strong>
         {c.executable
           ? <Tag theme="success" variant="light-outline">可执行</Tag>
-          : <Tag theme="warning" variant="light-outline">不可执行</Tag>}
+          : <Tag theme="warning" variant="light-outline">弱提醒 · 缺读数</Tag>}
       </div>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
         <tbody>

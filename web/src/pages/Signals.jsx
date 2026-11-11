@@ -137,10 +137,13 @@ export function sorterNum(key) {
 export default function Signals() {
   // §W-04：与量化页同款——子页签写进 URL，刷新后仍停在「动态仓位」。
   const [sp, setSp] = useSearchParams()
-  const tab = sp.get('tab') === 'decisions' ? 'decisions' : 'signals'
-  const setTab = (v) => setSp(v === 'decisions' ? { tab: 'decisions' } : {}, { replace: true })
+  const tab = (sp.get('tab') === 'decisions' || sp.get('tab') === 'trades') ? sp.get('tab') : 'signals'
+  const setTab = (v) => setSp(v === 'decisions' || v === 'trades' ? { tab: v } : {}, { replace: true })
   // 策略信号列表
   const [signals, setSignals] = useState([])
+  // §TRADE-LIST（2026-11-11）：交易列表（placed 决策）单独拉取；无权限/为空 ⇒ tab 不渲染
+  const [tradeItems, setTradeItems] = useState([])
+  const tradeCount = tradeItems.length
   // 已展开分时图的信号代码集合
   const [klineOpen, setKlineOpen] = useState(new Set())
   // 当前等级筛选（all/strong/observe/mute）
@@ -374,6 +377,15 @@ export default function Signals() {
       if (loadGuard.current.isStale(token)) return
       setSignals(list)
       setLoadErr('')
+      // §TRADE-LIST：403（无权限）静默 ⇒ 交易列表 tab 不渲染；有权限则每轮跟随刷新
+      try {
+        const t = await api.fetchTradeSignals()
+        if (loadGuard.current.isStale(token)) return
+        setTradeItems(Array.isArray(t.trades) ? t.trades : [])
+      } catch (_) {
+        if (loadGuard.current.isStale(token)) return
+        setTradeItems([])
+      }
     } catch (e) {
       if (loadGuard.current.isStale(token)) return
       setLoadErr(e && e.message ? String(e.message) : '信号列表加载失败（网络/服务异常）')
@@ -686,6 +698,33 @@ export default function Signals() {
       </Card>
         </Tabs.TabPanel>
 
+        {/* §TRADE-LIST（2026-11-11 owner 需求）：交易列表 = 全套脑侧规则（动态仓位/额度帽/
+            关键读数拦截…）跑完后 stage=placed 的**下单信号**。有就显示这个 tab，一条都没有
+            就不渲染（"没有就不显示"）；弹窗提醒同样只推这份清单（SignalCardModal 同源）。 */}
+        {tradeCount > 0 && (
+        <Tabs.TabPanel value="trades" label={`交易列表 ${tradeCount}`}>
+          <div data-testid="trade-list-note" className="muted" style={{ marginBottom: 8 }}>
+            以下每条都已通过全套脑侧规则（信号准入 → 动态仓位 → 三道额度帽 → 关键读数），
+            是**下单信号**而非原始提醒；盒内 12 闸（确认窗/VWAP/集中度等）仍是下单前最后一道。
+          </div>
+          <Card>
+            <Table rowKey={(r) => `${r.signal_id}|${r.code}`} data={tradeItems} size="small" bordered
+              columns={[
+                { colKey: 'at', title: '计算时刻', width: 110, cell: ({ row }) => <span style={{ fontSize: 12 }}>{String(row.at || '').replace('T', ' ').slice(11, 19) || '—'}</span> },
+                { colKey: 'code', title: '代码', width: 95, cell: ({ row }) => <b>{row.code}</b> },
+                { colKey: 'name', title: '名称', width: 100, cell: ({ row }) => String(row.card?.stock_name || '—') },
+                { colKey: 'channel', title: '通道', width: 80, cell: ({ row }) => <Tag size="small" variant="light" theme={row.channel === 'manual' ? 'warning' : 'primary'}>{row.channel === 'manual' ? '手动' : row.channel === 'paper' ? '纸面' : '实盘'}</Tag> },
+                { colKey: 'strategy_key', title: '战法', width: 120, ellipsis: true },
+                { colKey: 'qty', title: '股数', width: 80, cell: ({ row }) => `${Number(row.qty) || 0} 股` },
+                { colKey: 'price', title: '参考价', width: 90, cell: ({ row }) => row.price_kind === 'live' ? `¥${Number(row.price).toFixed(2)}` : '—' },
+                { colKey: 'money', title: '金额', width: 110, cell: ({ row }) => `¥${(Number(row.notional) || 0).toLocaleString('zh-CN', { maximumFractionDigits: 0 })}` },
+                { colKey: 'target', title: '目标 / 当前 / 剩余', width: 170, cell: ({ row }) => <span style={{ fontSize: 12 }}>{`${Number(row.target || 0).toLocaleString('zh-CN', { maximumFractionDigits: 0 })} / ${Number(row.cur_strat || 0).toLocaleString('zh-CN', { maximumFractionDigits: 0 })} / ${Number(row.room || 0).toLocaleString('zh-CN', { maximumFractionDigits: 0 })}`}</span> },
+                { colKey: 'weak', title: '读数', width: 110, cell: ({ row }) => row.missing_key_input || row.cash_stale ? <Tag size="small" theme="warning" variant="light">弱提醒 · 缺读数</Tag> : <Tag size="small" theme="success" variant="light">完整</Tag> },
+              ]}
+            />
+          </Card>
+        </Tabs.TabPanel>
+        )}
         <Tabs.TabPanel value="decisions" label="动态仓位" destroyOnHide>
           {/* §DECISION-TODAY：今日动态仓位计算过程（因子→目标→额度帽→结果/拒因；含被拦信号）。
               原在信号列表上方，宽表把列表挤到首屏之外；owner 2026-10-29 要求单独开一个子页。 */}

@@ -859,6 +859,13 @@ export async function fetchSignals() {
   return request('/api/signals', { timeout: 20000 })
 }
 
+// §TRADE-LIST（2026-11-11）：交易列表 = 全套脑侧规则跑完后的下单信号（stage=placed）。
+// 弹窗提醒与「交易列表」tab 都只吃这一份——原始信号不再直接推卡（owner："而不是乱推送"）。
+// 权限与 /api/signals/decisions 同面（trading_admin / quant_trade）；无权限 403 由调用方静默。
+export async function fetchTradeSignals() {
+  return request('/api/signals/trades', { timeout: 20000 })
+}
+
 /** 获取个股分时数据（分时价格 + 成交量 + MACD） */
 /** Fetch a stock's intraday (分时) data: price line + volume + MACD */
 // 对应 GET /api/minute；code 必填，scale 分钟数（默认 1），count 点数（默认 241）；

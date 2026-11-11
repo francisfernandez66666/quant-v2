@@ -15,6 +15,22 @@
 // 不按通道记——分通道记就会退化成"每条通道各一次"。
 import { notifyThrottled } from '../notify.js'
 
+// 2026-11-11 owner 需求三条的判定层（纯函数，vitest 可钉）：
+//   ① 非交易时段不提醒（周一至周五 09:30–11:30 / 13:00–15:00，北京时间）；
+//   ② 信号消失 ⇒ 提醒卡消失（调用方用 pruneCardsByLive 按当轮信号 id 裁剪卡堆叠）。
+// English: trading-session gate + live-signal pruning, both injectable for tests.
+export function isTradingSessionNow(now = new Date()) {
+  const bj = new Date(now.getTime() + 8 * 3600 * 1000)
+  const day = bj.getUTCDay()
+  if (day === 0 || day === 6) return false
+  const mins = bj.getUTCHours() * 60 + bj.getUTCMinutes()
+  return (mins >= 570 && mins <= 690) || (mins >= 780 && mins <= 900)
+}
+export function pruneCardsByLive(cards, liveIds) {
+  const live = new Set(liveIds)
+  return (cards || []).filter((c) => live.has(c.signalId))
+}
+
 // 卡片八字段（与后端 internal/server/signal_card.go 的 CardField* 常量逐字对齐）。
 // 后端那份是判据源，这份是渲染源；两边漂一个字，"缺什么"就会显示成"什么都不缺"。
 // 由 signal_card_20261104.test.jsx 用同一份清单对撞（后端常量已在 Go 用例里锁住）。
