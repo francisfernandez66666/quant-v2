@@ -400,7 +400,21 @@ class ReportUplink:
             return None
         hits = [e for e in broker_reads.discover_exports_recursive(
             self.export_roots, self.export_roots) if e.kind == kind]
-        return hits[0] if hits else None
+        if not hits:
+            return None
+        # 2026-11-11 实锤（SGT 空壳顶掉 Stock 真账户）：HGT/SGT 港股通壳账户的
+        # 同名导出**只有表头、每分钟刷新**，mtime 永远最新；资金账号过滤救不了它
+        # （过滤只对有数据行的文件说话）。改为**按内容择优**：从新到旧读，第一份
+        # 解析出 ≥1 行数据的即用；全空才退回最新一份（合法空语义不丢）。
+        # English: prefer the newest export that actually parses rows; header-only
+        # shells refresh constantly and must not shadow the real account file.
+        for exp in hits:
+            try:
+                if broker_reads.ReadLedger(kind, source="probe").refresh(exp.path).row_count > 0:
+                    return exp
+            except Exception:  # noqa: BLE001 - 读坏的候选跳过，继续找下一份
+                continue
+        return hits[0]
 
     def _ledger_for(self, kind):
         """每类读数一本跨轮账本：半文件骤降判定需要"上一份可信行数"当参照物。"""
