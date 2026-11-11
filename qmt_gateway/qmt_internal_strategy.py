@@ -705,13 +705,26 @@ def _ref_and_volume(ContextInfo, symbol, tick):
             if average:
                 ratio = volume / average
         return ref, ratio
-    # History unavailable on this build: prev_close is the honest reference
-    # (it IS a real counter price, not an invented level), and the volume
-    # ratio simply abstains. Warn once per PROCESS, not per symbol per round:
-    # a 97-symbol universe would otherwise drown the log pane.
+    # History unavailable on this build. PRECALC (2026-11-11 owner decision): when
+    # the pre-open baked factor table (params.precalc, gz-side pregen from public
+    # daily bars) covers this symbol, use it instead of abstaining -- ma_ref /
+    # vol_ma5 are yesterday-anchored counter-side values, so the pullback rule and
+    # the volume-ratio gates become computable with tick data alone. A symbol NOT
+    # covered by precalc keeps the old honest fallback (ref=prev_close, ratio
+    # abstains): we never invent a number. Warn once per PROCESS either way.
+    precalc = (PARAMS.get("precalc") or {}).get(symbol) or {}
+    prev_close = tick.get("prev_close")
+    if precalc:
+        ref = precalc.get("ma_ref") or prev_close
+        volume = tick.get("volume")
+        base = precalc.get("vol_ma5")
+        ratio = (volume / base) if (volume and base) else None
+        _warn_once("hist_precalc",
+                   "no history series from this build: using params.precalc factors")
+        return ref, ratio
     _warn_once("hist_unavailable",
-               "no history series from this build: ref=prev_close fallback, volume ratio abstains")
-    return tick.get("prev_close"), None
+               "no history series from this build: no precalc for this symbol, ref=prev_close fallback, volume ratio abstains")
+    return prev_close, None
 
 
 def _series(payload, field, symbol):

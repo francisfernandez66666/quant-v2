@@ -129,6 +129,21 @@ def extract_signal_codes():
     return sorted(set(codes))
 
 
+def load_precalc():
+    """读当日预计算因子文件（§PRECALC）。返回 (meta, precalc_dict)：非当日/缺失 ⇒ (空meta, None)。
+    过期因子绝不留宿：宁可盒内弃权，也不拿昨天的量比当今天的。"""
+    try:
+        with open("qmt_gateway/local_executor_precalc.json", "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {"day": "", "count": 0}, None
+    today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
+    if doc.get("day") != today:
+        return {"day": str(doc.get("day") or ""), "count": 0}, None
+    precalc = doc.get("precalc") or {}
+    return {"day": doc.get("day"), "count": len(precalc)}, precalc
+
+
 def extract_bearish():
     """signals_today.json 的做空/利空归因 → 当日利空候选（空=保留上一版）。"""
     codes = []
@@ -216,9 +231,10 @@ def main():
     bearish = extract_bearish()
     bullish = extract_bullish()
     signal_pool = extract_signal_codes()
+    precalc_meta, _precalc = load_precalc()
     payload = json.dumps({"wl": wl, "rules": [r.get("id") for r in rules],
                           "bearish": bearish, "bullish": bullish,
-                          "signal_pool": signal_pool}, ensure_ascii=True)
+                          "signal_pool": signal_pool, "precalc": precalc_meta}, ensure_ascii=True)
     sha = hashlib.sha256(payload.encode()).hexdigest()
 
     if not args.force and os.path.exists(STATE) and open(STATE).read().strip() == sha:
@@ -257,6 +273,14 @@ def main():
     # 买入仍过全部 12 闸。QMT 用 get_full_tick 逐票拉取（非订阅），无订阅上限风险。
     pool = set(doc2["params"].get("symbols") or []) | set(signal_pool) | set(bullish)
     doc2["params"]["symbols"] = sorted(pool)[:SIGNAL_POOL_MAX]
+    # §PRECALC（2026-11-11 owner 拍板）：盘前预计算因子并入 params——载体在缺历史序列的
+    # 构建上用 precalc 替代 get_market_data_ex（均线参考/量比基线/近高近低），只有当日新鲜
+    # 的文件才并入；并入与否都计入 sha（因子日变即重烘）。
+    precalc_meta, precalc = load_precalc()
+    if precalc:
+        doc2["params"]["precalc"] = precalc
+    else:
+        doc2["params"].pop("precalc", None)  # 过期因子绝不留宿：宁可弃权也不拿昨天的量比当今天的
     json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 

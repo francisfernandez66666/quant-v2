@@ -10,6 +10,7 @@ FILES=(
   scripts/sync_live_rules.py
   scripts/gen_carrier_risk_list.py
   scripts/carrier_hot_reload_gz.py
+  scripts/pregen_carrier_factors_gz.py
   qmt_gateway/local_executor.py
   qmt_gateway/qmt_internal_strategy.py
   qmt_gateway/handler.py
