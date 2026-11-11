@@ -45,13 +45,14 @@ var ErrInvalidManualAdjust = errors.New("改账参数校验失败")
 
 // ManualAdjustReq 一次增量改账（server 层已完成 asof 归一与归属判定）。
 type ManualAdjustReq struct {
-	Op     string   // ManualOp* 之一
-	TsCode string   // 持仓类动作必填（set_cash 忽略）
-	Qty    int      // 本笔股数
-	Price  float64  // 本笔成交价（持仓类动作必填）
-	Cash   *float64 // 仅 set_cash：nil＝本次不改资金
-	AsOf   string   // 已归一的"这份账是几点"
-	User   string   // 操作者（审计留痕用，与 user_id 同值时才有意义）
+	Op         string   // ManualOp* 之一
+	TsCode     string   // 持仓类动作必填（set_cash 忽略）
+	Qty        int      // 本笔股数
+	Price      float64  // 本笔成交价（持仓类动作必填）
+	Cash       *float64 // 仅 set_cash：nil＝本次不改资金
+	TotalAsset *float64 // 仅 set_cash 且显式给出：人填的总资产；nil＝不猜、不改写
+	AsOf       string   // 已归一的"这份账是几点"
+	User       string   // 操作者（审计留痕用，与 user_id 同值时才有意义）
 }
 
 // ManualAdjustResult 改账后的读数回显（响应层直接透传，让录入人当场看见服务端认下来的值）。
@@ -146,7 +147,7 @@ func (d *DB) AdjustManualBook(userID string, req ManualAdjustReq, day string) (M
 		res.Cash = base.cash
 		res.CashAfter = *req.Cash
 		res.AmountDelta = *req.Cash - base.cash
-		if err := d.writeManualCash(tx, userID, *req.Cash, base, req.AsOf); err != nil {
+		if err := d.writeManualCash(tx, userID, *req.Cash, base, req.AsOf, req.TotalAsset); err != nil {
 			return res, err
 		}
 		if err := insertManualFlow(tx, userID, day, "", req.Op, "资金", 0, 0, res.AmountDelta, res.CashAfter,
@@ -260,7 +261,7 @@ func (d *DB) AdjustManualBook(userID string, req ManualAdjustReq, day string) (M
 	if err := d.writeManualPosition(tx, userID, code, base, newQty, newCost, deleted, req.AsOf); err != nil {
 		return res, err
 	}
-	if err := d.writeManualCash(tx, userID, res.CashAfter, base, req.AsOf); err != nil {
+	if err := d.writeManualCash(tx, userID, res.CashAfter, base, req.AsOf, nil); err != nil {
 		return res, err
 	}
 	if err := insertManualFlow(tx, userID, day, code, req.Op, side, req.Qty, req.Price, delta, res.CashAfter,
@@ -377,16 +378,32 @@ func (d *DB) writeManualPosition(tx *sql.Tx, userID, code string, base manualBas
 // total_asset 刻意**不**在这里推算：它是"现金+市值"的合计，改账只动了现金与若干持仓行，
 // 拿不到实时价就算不出市值，凭空写一个合计会让下游展示读到一个自相矛盾的数
 // （与 manual_book.go 里"只带总资产会被拒"同取向：宁可不动，不许猜）。
-func (d *DB) writeManualCash(tx *sql.Tx, userID string, cash float64, base manualBaseline, asof string) error {
-	_, err := tx.Exec(`INSERT INTO manual_account
+func (d *DB) writeManualCash(tx *sql.Tx, userID string, cash float64, base manualBaseline, asof string, totalAsset *float64) error {
+	// 2026-11-11 owner 需求：资金也要能完整维护（可用资金 + 总资产）。总资产只能由人显式
+	// 填；不填时插入 0、更新时保留旧值，绝不按"现金+成本"推算一个假的市值合计。
+	// English: total_asset is written only when explicitly supplied by the user.
+	ta := 0.0
+	query := `INSERT INTO manual_account
 		(user_id, available_cash, total_asset, cash_filled, source, asof, updated_at)
-		VALUES (?, ?, 0, 1, ?, ?, ?)
+		VALUES (?, ?, ?, 1, ?, ?, ?)
 		ON CONFLICT(user_id) DO UPDATE SET
 			available_cash=excluded.available_cash,
 			cash_filled=1,
 			asof=excluded.asof,
-			updated_at=excluded.updated_at`,
-		userID, cash, ManualSourceLabel, asof, ManualNow())
+			updated_at=excluded.updated_at`
+	if totalAsset != nil {
+		ta = *totalAsset
+		query = `INSERT INTO manual_account
+		(user_id, available_cash, total_asset, cash_filled, source, asof, updated_at)
+		VALUES (?, ?, ?, 1, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET
+			available_cash=excluded.available_cash,
+			total_asset=excluded.total_asset,
+			cash_filled=1,
+			asof=excluded.asof,
+			updated_at=excluded.updated_at`
+	}
+	_, err := tx.Exec(query, userID, cash, ta, ManualSourceLabel, asof, ManualNow())
 	if err != nil {
 		return fmt.Errorf("upsert manual cash: %w", err)
 	}

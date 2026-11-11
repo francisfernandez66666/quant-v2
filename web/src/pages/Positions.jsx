@@ -134,6 +134,8 @@ export default function Positions() {
   // 前端只透传、只按它分流（下单 vs 改账）与挂角标，**绝不**自己在页面上再判一次新鲜度——
   // 两处判一个迟早一处漂，漂的方向不是放行买入就是把手敲账悄悄换成旧柜台账。
   const [realBookSource, setRealBookSource] = useState(null)
+  // 2026-11-11：资金维护补齐「总资产」显式输入（不填就不改，服务端绝不推算）
+  const [manualSetTotalVal, setManualSetTotalVal] = useState('')
   // 维护模式显式开关（localStorage 记住选择；SSR/隐私模式下 localStorage 不可用也不炸）
   const [bookMode, setBookModeState] = useState(() => {
     try { return localStorage.getItem(BOOK_MODE_KEY) === 'manual' ? 'manual' : 'auto' } catch { return 'auto' }
@@ -945,6 +947,9 @@ export default function Positions() {
   function openManualSetCash() {
     const cur = realAccount && realAccount.available_cash != null ? String(realAccount.available_cash) : ''
     setManualSetCashVal(cur)
+    const curTotal = realAccount && realAccount.total_asset != null && Number(realAccount.total_asset) > 0
+      ? String(realAccount.total_asset) : ''
+    setManualSetTotalVal(curTotal)
     setManualSetCashShow(true)
   }
   async function confirmManualSetCash() {
@@ -955,7 +960,15 @@ export default function Positions() {
     }
     setManualSubmitting(true)
     try {
-      await api.adjustManualBook({ op: 'set_cash', available_cash: v })
+      const payload = { op: 'set_cash', available_cash: v }
+      // 留空＝本次不改总值（服务端保留旧值）；填了才按人填的绝对值落库。
+      const tv = String(manualSetTotalVal || '').trim()
+      if (tv !== '') {
+        const t = Number(tv.replace(/[, ]/g, ''))
+        if (!Number.isFinite(t) || t < 0) { MessagePlugin.error('总资产不是有效数字（留空表示不改）'); return }
+        payload.total_asset = t
+      }
+      await api.adjustManualBook(payload)
       MessagePlugin.success('已记入改账（不下单）：可用资金 ¥' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }))
       setManualSetCashShow(false)
       loadReal()
@@ -1705,6 +1718,10 @@ export default function Positions() {
           <Form.FormItem label="可用资金">
             <InputNumber value={Number(manualSetCashVal) || 0} min={0} step={0.01} placeholder="改后可用资金"
               onChange={(v) => setManualSetCashVal(String(v ?? ''))} />
+          </Form.FormItem>
+          <Form.FormItem label="总资产（选填）">
+            <InputNumber value={manualSetTotalVal === '' ? undefined : Number(manualSetTotalVal)} min={0} step={0.01}
+              placeholder="留空＝不改；按券商 App 的总资产填" onChange={(v) => setManualSetTotalVal(v == null ? '' : String(v))} />
           </Form.FormItem>
         </Form>
       </Dialog>

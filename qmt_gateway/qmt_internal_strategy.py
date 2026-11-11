@@ -1326,6 +1326,19 @@ def handlebar(ContextInfo):
     if summary.get("placed") or summary.get("cancelled") or summary.get("reason"):
         _log("round placed=%s cancelled=%s reason=%s" % (
             summary.get("placed"), summary.get("cancelled"), summary.get("reason")))
+    # 2026-11-11 owner: signals exist but no buys were placed, and refusals were
+    # invisible: they only went into summary. Print a bounded ASCII histogram so
+    # the QMT client log names the gate that refused (vwap / confirm / caps /
+    # min-amount / whitelist). English: observable gate refusals, ASCII only.
+    skips = summary.get("skipped") or []
+    if skips:
+        counts = {}
+        for row in skips:
+            why = str((row or {}).get("reason") or "unknown")
+            counts[why] = counts.get(why, 0) + 1
+        parts = sorted(counts.items())[:12]
+        _log("round_skips total=%d %s" % (
+            len(skips), " ".join("%s=%d" % (k, v) for k, v in parts)))
 
 
 if __name__ == "__main__":

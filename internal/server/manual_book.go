@@ -52,12 +52,13 @@ type manualPositionItem struct {
 // manualAdjustItem 一次增量改账（§MANUAL-BOOK-UNIFY 2026-11-06，owner 裁决 2/3/4）。
 // 形状与实仓 tab 那四个按钮一一对应：op ∈ new|add|reduce|tp|close|set_cash。
 type manualAdjustItem struct {
-	Op     string   `json:"op"`
-	TsCode string   `json:"ts_code"`
-	Qty    *int     `json:"qty"`   // 指针：缺键与 0 不是一回事（持仓类动作缺数量＝拒，不许猜）
-	Price  float64  `json:"price"` // 本笔成交价（持仓类动作必填）
-	Cash   *float64 `json:"available_cash"`
-	UserID string   `json:"user_id,omitempty"` // 收下但永不采信（§安全 T1）
+	Op         string   `json:"op"`
+	TsCode     string   `json:"ts_code"`
+	Qty        *int     `json:"qty"`   // 指针：缺键与 0 不是一回事（持仓类动作缺数量＝拒，不许猜）
+	Price      float64  `json:"price"` // 本笔成交价（持仓类动作必填）
+	Cash       *float64 `json:"available_cash"`
+	TotalAsset *float64 `json:"total_asset,omitempty"` // 2026-11-11：set_cash 可显式填总资产
+	UserID     string   `json:"user_id,omitempty"`     // 收下但永不采信（§安全 T1）
 }
 
 // manualBookReq POST /api/qmt/manual-positions 的请求体。
@@ -142,6 +143,7 @@ func (s *Server) handleManualPositionsPost(w http.ResponseWriter, r *http.Reques
 			adj.Qty = *item.Qty
 		}
 		adj.Cash = item.Cash
+		adj.TotalAsset = item.TotalAsset
 		res, err := db.AdjustManualBook(uid, adj, cntime.DayOf(cntime.Now()))
 		if err != nil {
 			if errors.Is(err, store.ErrInvalidManualAdjust) {

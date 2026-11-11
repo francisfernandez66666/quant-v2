@@ -248,9 +248,9 @@ export default function Signals() {
     d1: sorterNum('d1'), d2: sorterNum('d2'), d3: sorterNum('d3'), d4: sorterNum('d4'),
     confidence: sorterNum('confidence'),
   }
-  // TDesign 的 sort 可能是数组（multipleSort）或对象；只看第一项，避免 sortBy 取不到时
+  // TDesign 的 sort 可能是数组（multipleSort）或对象；取最新一项，避免 sortBy 取不到时
   // 整表回落成引擎原始顺序（owner 看到的"点了没排/乱序"）。
-  const active = Array.isArray(sort) ? sort[0] : sort
+  const active = Array.isArray(sort) ? sort[sort.length - 1] : sort
   const sortBy = active && (active.sortBy || active.colKey)
   let sortedSignals = filteredSignals
   if (sortBy && sorters[sortBy]) {
@@ -660,7 +660,11 @@ export default function Signals() {
           data={sortedSignals}
           columns={columns}
           sort={sort}
-          onSortChange={(val) => setSort(val || null)}
+          // 2026-11-11 owner 实锤：TDesign 的 sort 可能是数组（多列排序），旧代码只取
+          // sort[0] ⇒ 再点其它列时排序键被第一列「锁住」，列表不动。显式关掉多列排序，
+          // 并把回调归一成单对象（取最新一次点击），保证每次点击都换列生效。
+          multipleSort={false}
+          onSortChange={(val) => setSort(Array.isArray(val) ? (val[val.length - 1] || null) : (val || null))}
           size="small"
           expandedRow={({ row }) => (
             <MinuteView code={row.code} name={row.name} />

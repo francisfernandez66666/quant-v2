@@ -509,7 +509,34 @@ func (d *DB) ManualBookViewFor(userID, day string) (ManualBookView, error) {
 		}
 	}
 	v.PositionsUsable = len(v.Positions) > 0
+	// 2026-11-11 owner 实锤：把最后一只持仓「清仓」后 manual_positions 变空表，旧判据
+	// len>0 ⇒ PositionsUsable=false ⇒ 读面回落旧柜台行，屏上「原持仓股数不动」。
+	// 当日有改账流水就说明这本账被人显式维护过，空仓是一个**事实**而不是「没数据」。
+	// English: an explicitly maintained EMPTY book is usable; otherwise closing the
+	// last position silently falls back to stale counter rows.
+	if !v.PositionsUsable {
+		if asof, ferr := d.ManualLatestFlowAsof(userID, day); ferr == nil && asof != "" {
+			v.PositionsUsable = true
+			v.PositionsAsOf = asof
+		}
+	}
 	return v, nil
+}
+
+// ManualLatestFlowAsof 返回当日最近一条改账流水的 asof（没有流水返回空串）。
+// 只用于「空仓也算子维护过」的证据判据，不参与任何资金/持仓数值计算。
+// English: latest adjustment timestamp today; empty when the book was never touched.
+func (d *DB) ManualLatestFlowAsof(userID, day string) (string, error) {
+	if err := d.ensureManualBook(); err != nil {
+		return "", err
+	}
+	var asof string
+	err := d.db.QueryRow(`SELECT COALESCE(MAX(asof),'') FROM manual_flows
+		WHERE user_id = ? AND day = ?`, userID, day).Scan(&asof)
+	if err != nil {
+		return "", fmt.Errorf("manual flow today lookup: %w", err)
+	}
+	return asof, nil
 }
 
 // MarkManualTakenOver 柜台恢复回报后给该账号的手动账打接管指针（owner 2026-11-06 裁决 5）。

@@ -186,7 +186,8 @@ export default function SignalDecisionsCard() {
         data={displayItems}
         columns={columns}
         sort={sort}
-        onSortChange={(val) => setSort(val || null)}
+        multipleSort={false}
+        onSortChange={(val) => setSort(Array.isArray(val) ? (val[val.length - 1] || null) : (val || null))}
         size="small"
         bordered
         empty="今日尚无决策快照（自动买入评估未触发；手动直发单会以「手动」通道出现）"
