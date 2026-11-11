@@ -879,3 +879,26 @@ func (r *Report) BackfillAnchors() int {
 	}
 	return filled
 }
+
+// ViewExcludingForeign §多账号隔离（2026-11-11 owner 需求「个人数据强相关的都要带 userid」）：
+// 返回一个**过滤视图**——排除「归属他人」的行（user_id 非空且 ≠ 本账号）。运营单例引擎把
+// 全账本喂给提醒生产者（风险档减仓/止盈止损/情绪退潮/利空归因），成员账号的手动账/report
+// 行会泄进运营共享流（11-11 实锤：admin 看到 facai 卧龙减仓提醒）。本视图是止血过滤器：
+// 归属他人的行不产提醒；归属自己的行（user_id=自己或空=系统/全局）照常。
+// 浅拷贝语义：logs 切片独立，mu 为零值新锁——调用方只能把它当**只读快照**喂给提醒生产者，
+// 不能对它写账（写账必须走原 Report 实例）。
+// English: a read-only filtered view excluding rows owned by other accounts; feed it to alert
+// producers so per-user ledger rows never leak into the shared operator stream. Writes must go
+// through the original Report instance.
+func (r *Report) ViewExcludingForeign(ownerUID string) *Report {
+	r.mu.RLock()
+	logs := make([]ExecLog, 0, len(r.logs))
+	for _, l := range r.logs {
+		if l.UserID != "" && l.UserID != ownerUID {
+			continue // 归属他人的行：不产提醒（泄漏源，11-11 admin 看到 facai 卧龙提醒）
+		}
+		logs = append(logs, l)
+	}
+	r.mu.RUnlock()
+	return &Report{logs: logs} // mu 零值、path 空=只读内存视图
+}

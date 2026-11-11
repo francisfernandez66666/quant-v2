@@ -5047,7 +5047,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.recordDailyEquitySnapshot()
 	alertRegime := e.regimeForAccount(e.primaryMember())
 	e.combatAgent.SetMarketStopContext(alertRegime.SizeCfg, alertRegime.IndexChangePct, alertRegime.IndexTrendBroken)
-	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, e.snapshotQuotes(), stockScores, bearHitCodes(sr))
+	// §多账号隔离（2026-11-11 owner「个人数据强相关的都要带 userid」）：提醒生产者只喂
+	// **归属自己**的账本视图——成员账号（如 facai）手动账/report 行的减仓/止盈止损提醒
+	// 不再泄进运营共享流。五个生产者（持仓提示/退出/情绪退潮/利空归因/风险档）统一换视图。
+	viewRpt := e.rpt.ViewExcludingForeign(e.userID)
+	alertSignals := e.combatAgent.CheckPositionAlerts(viewRpt, e.marketAPI, e.snapshotQuotes(), stockScores, bearHitCodes(sr))
 	_alertsT := time.Since(_stepAlerts)
 
 	// 13b. 战法退出引擎实时评估（移动止盈/分批止盈/尾盘强平/破位/超期 等卖点提醒，仅提醒不自动执行）。
@@ -5067,18 +5071,18 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			exitDayK[code] = md.KLines
 		}
 	}
-	alertSignals = append(alertSignals, e.combatAgent.CheckPositionsExits(e.rpt, exitQuotes, exitDayK, time.Now())...)
+	alertSignals = append(alertSignals, e.combatAgent.CheckPositionsExits(viewRpt, exitQuotes, exitDayK, time.Now())...)
 
 	// 13c. 情绪退潮/背离 → 对做多持仓整体减仓建议（仅提醒）。
 	// English: when the emotion cycle turns to retreat/divergence, advise trimming all long positions.
-	alertSignals = append(alertSignals, e.combatAgent.EmotionRetreatAlerts(e.rpt, exitQuotes, emotionPhase, time.Now())...)
+	alertSignals = append(alertSignals, e.combatAgent.EmotionRetreatAlerts(viewRpt, exitQuotes, emotionPhase, time.Now())...)
 
 	// 13c'. 利空归因持仓抛售提醒（E4）：做多持仓命中利空板块/利空个股 → 独立于价格止损提醒尽快抛售。
 	// 使用 bearHitReasons 提供归因说明（板块名/上榜原因/关联新闻），让用户理解为何抛售。
 	// English: E4 bearish-attribution sell alerts — long holdings hit by bearish sectors/stocks get an
 	// independent "sell soon" reminder decoupled from price stops, with an attribution reason (sector
 	// name / listing reason / linked news) explaining why.
-	alertSignals = append(alertSignals, e.combatAgent.BearishAttributionAlerts(e.rpt, exitQuotes, bearHitReasons(sr), time.Now())...)
+	alertSignals = append(alertSignals, e.combatAgent.BearishAttributionAlerts(viewRpt, exitQuotes, bearHitReasons(sr), time.Now())...)
 
 	// 13c''. §MARKET_RISK_GATE P5 系统性风险持仓提醒：由合成风险档（情绪+市场状态+宏观三源）驱动，对做多持仓
 	// 产出「建议减仓」提醒（AlertType=系统性风险，SellAction 不命中 → 绝不自动卖出，仅进消息中心/展示）。
@@ -5086,7 +5090,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// English: P5 composite-tier held-position trim reminder — reminder only (never auto-sold), complementing
 	// the emotion-only 13c by firing on delivery-day/CPI/bear-market risk even before the phase turns cold.
 	_, _, _, riskTier, riskReasons := e.MarketEnvSnapshot()
-	alertSignals = append(alertSignals, e.combatAgent.MarketRiskAlerts(e.rpt, exitQuotes, riskTier, riskReasons, time.Now())...)
+	alertSignals = append(alertSignals, e.combatAgent.MarketRiskAlerts(viewRpt, exitQuotes, riskTier, riskReasons, time.Now())...)
 
 	// 13d. 逐股卖点评估：对打分池全量个股（含未持仓的自选/跟踪股）评估利空D1/破位/派发/动量衰竭，
 	// 命中即产出"卖点"提醒（仅提醒不自动执行）；消息中心按 code@卖点评估 稳定键去重，5s 循环同键刷新。
