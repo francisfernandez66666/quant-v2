@@ -1525,7 +1525,16 @@
     "pct_scale": 100,
     "percentile_min_samples": 5,
     "require_trading_day": true,
-    "scalar_bands": {},
+    "scalar_bands": {
+      "NewsEvent": {
+        "min": 30,
+        "max": 101
+      },
+      "ConceptHeat": {
+        "min": 0.6,
+        "max": 1.01
+      }
+    },
     "score_domain": {
       "divisor": 2,
       "floor": 0,

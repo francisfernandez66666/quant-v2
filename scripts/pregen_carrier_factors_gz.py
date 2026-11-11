@@ -49,6 +49,8 @@ VOL_UNIT_MULT = float(os.environ.get("PREGEN_VOL_UNIT_MULT", "1"))  # hithink �
 #   data_day 让消费方可见 staleness，绝不冒充最新。
 LOCAL_DB = os.environ.get("PREGEN_LOCAL_DB", "/var/lib/quant-trading-v2/trading.db")
 LOCAL_VOL_MULT = float(os.environ.get("PREGEN_LOCAL_VOL_MULT", "100"))
+FLOW_DIR = os.environ.get("PREGEN_FLOW_DIR", "/var/lib/quant-trading-v2/moneyflow_history")
+BAKE_SERIES_N = int(os.environ.get("PREGEN_SERIES_N", "20"))
 SLEEP_MS = int(os.environ.get("PREGEN_SLEEP_MS", "80"))
 MAX_CODES = int(os.environ.get("SIGNAL_POOL_MAX", "600"))
 
@@ -131,6 +133,124 @@ def compute(bars):
     }
 
 
+def _q(sql, args):
+    import sqlite3
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % LOCAL_DB, uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        return conn.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _ts_code(symbol):
+    return symbol if "." in symbol else symbol
+
+
+def bake_bakeables(symbol, params_doc):
+    """§PRECALC v2（2026-11-11 owner 定案）：QMT 直取价量（bars），**QMT 拿不到的才烘**——
+    估值序列/换手序列（daily_basic，当日新鲜）、财务分位（fina_indicator 最新档）、
+    资金流（moneyflow_history MainNet/circ_mv）、新闻事件=D1 分数（scalar_proxy 带值）、
+    概念热度=当日利好池强度分（同为 scalar_proxy）。形态逐一对齐 rules_factor 的消费端：
+    valuation_series={"pe_ttm":[..],..}（_field_series 面板）、fin_pit={"eps":..}（_pit_value）、
+    flow/heat 标量（_scalar_score + params.scalar_bands）。缺源的字段如实缺省（绝不编造）。"""
+    ts = _ts_code(symbol)
+    out = {}
+    n = BAKE_SERIES_N
+    rows = _q("SELECT trade_date,pe_ttm,pb,ps_ttm,turnover_rate FROM daily_basic "
+              "WHERE ts_code=? AND pe_ttm IS NOT NULL ORDER BY trade_date DESC LIMIT ?", (ts, n)) \
+        or _q("SELECT trade_date,pe_ttm,pb,ps_ttm,turnover_rate FROM daily_basic "
+              "WHERE ts_code=? ORDER BY trade_date DESC LIMIT ?", (ts, n))
+    if rows:
+        val = {"pe_ttm": [r[1] for r in rows if r[1] is not None],
+               "pb": [r[2] for r in rows if r[2] is not None],
+               "ps_ttm": [r[3] for r in rows if r[3] is not None]}
+        val = {k: v for k, v in val.items() if v}
+        if val:
+            out["valuation_series"] = val
+        tos = [r[4] for r in rows if r[4] is not None]
+        if tos:
+            out["turnover_series"] = tos
+    fin = _q("SELECT eps,roe,roe_waa,roa,grossprofit_margin,netprofit_margin,"
+             "debt_to_assets,yoy_or FROM fina_indicator WHERE ts_code=? "
+             "ORDER BY end_date DESC LIMIT 1", (ts,))
+    if fin and fin[0]:
+        cols = ["eps", "roe", "roe_waa", "roa", "grossprofit_margin",
+                "netprofit_margin", "debt_to_assets", "yoy_or"]
+        pit = {c: v for c, v in zip(cols, fin[0]) if v is not None}
+        if pit:
+            out["fin_pit"] = pit
+    code6 = symbol.split(".")[0]
+    flow_path = os.path.join(FLOW_DIR, code6 + ".json")
+    circ = _q("SELECT circ_mv FROM daily_basic WHERE ts_code=? AND circ_mv IS NOT NULL "
+              "ORDER BY trade_date DESC LIMIT 1", (ts,))
+    try:
+        flow_doc = json.load(open(flow_path, encoding="utf-8")) if os.path.exists(flow_path) else None
+    except (OSError, ValueError):
+        flow_doc = None
+    if flow_doc and isinstance(flow_doc.get("days"), list) and flow_doc["days"]:
+        days = flow_doc["days"][-5:]
+        mains = [float(d.get("MainNet") or 0) for d in days]
+        if circ and circ[0] and circ[0][0]:
+            cap = float(circ[0][0]) * 10000.0  # circ_mv 万元 -> 元
+            if cap > 0:
+                out["flow_today_pct"] = round(mains[-1] / cap * 100.0, 4)
+                if len(mains) >= 2:
+                    out["flow_5d_pct"] = round(sum(mains) / cap * 100.0, 4)
+    d1 = _q("SELECT score,blocked FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
+            (code6,))
+    if d1 and d1[0]:
+        score, blocked = d1[0]
+        out["news_event"] = 0.0 if blocked else float(score or 0.0)
+    hp = (params_doc.get("hot_pool") or {}).get("bullish") or {}
+    hit = hp.get(symbol) or hp.get(code6)
+    if isinstance(hit, dict) and hit.get("score") is not None:
+        out["concept_heat"] = float(hit["score"])
+    return out
+
+
+def _notify(title, body):
+    """§B 机制（2026-11-11 owner 要求）：手机推送走系统现成的 ntfy 运维告警通道
+    （config.json notify.ntfy_url/topic，与 APK 推送网关并行的独立冗余通道）。
+    best-effort：推送失败只记日志，绝不影响 pregen 本身的退出码。
+    English: best-effort phone push over the existing ntfy ops channel.
+    """
+    try:
+        cfg = json.load(open("/var/lib/quant-trading-v2/config.json", encoding="utf-8"))
+        notify = cfg.get("notify") or {}
+        url = (notify.get("ntfy_url") or "https://ntfy.sh").rstrip("/")
+        topic = notify.get("ntfy_topic") or ""
+        if not topic:
+            print("PREGEN_NOTIFY_FAIL reason=no_topic")
+            return
+        req = urllib.request.Request(
+            url + "/" + topic, data=body.encode("utf-8"),
+            headers={"Title": title, "Priority": "high", "Tags": "warning"})
+        urllib.request.urlopen(req, timeout=8)
+        print("PREGEN_NOTIFY_OK")
+    except Exception as exc:  # noqa: BLE001 - 通知是尽力而为，不拖垮主流程
+        print("PREGEN_NOTIFY_FAIL %s" % type(exc).__name__)
+
+
+def _write_status(day, symbols_n, ok, fail_n, consec_fail, recovered):
+    """状态文件（BUILD_DIR 内）：consec_fail/coverage 给 hot reload 的自动补推限频与判定。"""
+    status_path = os.path.join(BUILD_DIR, "qmt_gateway", "precalc_status.json")
+    coverage = ok * 100 // max(1, symbols_n)
+    status = {"day": day, "codes": symbols_n, "ok": ok, "fail": fail_n,
+              "coverage": coverage, "consec_fail": consec_fail,
+              "recovered": recovered,
+              "last_attempt": datetime.now().astimezone().isoformat(timespec="seconds")}
+    tmp = status_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(status, fh, ensure_ascii=True, indent=1)
+    os.replace(tmp, status_path)
+    return status, coverage
+
+
 def main():
     started = time.time()
     with open(PARAMS_PATH, "r", encoding="utf-8") as fh:
@@ -155,11 +275,20 @@ def main():
                 if fact:
                     fact["data_day"] = data_day
                     fact["src"] = src
+            bakeables = bake_bakeables(symbol, params) if fact else {}
             if fact:
+                fact.update(bakeables)
                 precalc[symbol] = fact
                 ok += 1
             else:
-                failed.append(symbol)
+                # 价量缺失也可能只是 hithink 单票失败：bakeables 仍值得烘（估值/财务/D1）
+                bakeables = bake_bakeables(symbol, params)
+                if bakeables:
+                    bakeables["src"] = "bake_only"
+                    precalc[symbol] = bakeables
+                    ok += 1
+                else:
+                    failed.append(symbol)
         except Exception as exc:  # noqa: BLE001 - 单票失败不拖全局，计数可见
             failed.append(symbol)
             print("PREGEN_FAIL %s %s" % (symbol, type(exc).__name__))
@@ -178,6 +307,26 @@ def main():
           % (day, len(symbols), ok, len(failed), elapsed))
     print("PREGEN_WRITE path=%s bytes=%d" % (OUT_PATH, len(raw)))
     print("PREGEN_FAILED=%s" % ",".join(failed[:12]) if failed else "PREGEN_FAILED=none")
+    # §B 机制：失败判定（全败 或 覆盖率<50%）计入连续失败；连续≥2 次推手机通知；
+    # 此前连续失败≥2 且本次恢复 → 推「已恢复」。状态落 BUILD_DIR 供 hot reload 限频补推。
+    prev = {}
+    try:
+        prev = json.load(open(os.path.join(BUILD_DIR, "qmt_gateway", "precalc_status.json"),
+                              encoding="utf-8"))
+    except (OSError, ValueError):
+        prev = {}
+    prev_consec = int(prev.get("consec_fail") or 0)
+    failed_run = (ok == 0) or (ok * 100 < 50 * max(1, len(symbols)))
+    consec_fail = prev_consec + 1 if failed_run else 0
+    recovered = (not failed_run) and prev_consec >= 2
+    status, coverage = _write_status(day, len(symbols), ok, len(failed), consec_fail, recovered)
+    if consec_fail >= 2:
+        _notify("Quant预计算连续失败x%d" % consec_fail,
+                "day=%s ok=%d fail=%d coverage=%d%% 上游恢复前盒内相关战法维持保守弃权"
+                % (day, ok, len(failed), coverage))
+    elif recovered:
+        _notify("Quant预计算已恢复", "day=%s ok=%d coverage=%d%%（此前连续失败%d次）"
+                % (day, ok, coverage, prev_consec))
     return 0 if ok >= 1 else 3
 
 

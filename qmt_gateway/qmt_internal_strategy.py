@@ -668,6 +668,119 @@ def _tick_of(ContextInfo, symbol):
     return normalize_tick(symbol, entry)
 
 
+def _download_day_bars(ContextInfo):
+    """2026-11-11 owner direction: pull the day bars FROM QMT itself.
+
+    The 11-03 probe saw an empty get_market_data_ex because the client had no
+    local daily history -- the official fix is download_history_data2 (the
+    client's own downloader; no files, no out-of-process network). Kicked once
+    in init for the whole pool; after the callback fires, _hist_bars starts
+    returning real bars and every bars-consuming tactic goes live. precalc
+    stays as the fallback for symbols the download never covers.
+    """
+    dl = getattr(ContextInfo, "download_history_data2", None)
+    if not callable(dl):
+        _log("WARN download_history_data2 unavailable: precalc is the only history source")
+        return
+    symbols = list(PARAMS.get("symbols") or [])
+    if not symbols:
+        return
+    def _cb(data):
+        try:
+            done = 0
+            if isinstance(data, dict):
+                fin = data.get("finished") or data.get("finish") or []
+                done = len(fin) if isinstance(fin, (list, tuple)) else 1
+            _log("day_bars_download callback finished=%s" % str(done))
+        except Exception:
+            _log("day_bars_download callback fired")
+    try:
+        dl(symbols, "1d", "", "", _cb)
+        _log("day_bars_download kicked symbols=%d period=1d" % len(symbols))
+    except Exception as exc:
+        _log("WARN download_history_data2 failed: %s" % repr(exc)[:120])
+
+
+def _bars_of(payload, symbol):
+    """get_market_data_ex payload -> bar dicts for the rules library.
+
+    Field lists are extracted with the same attribute-or-dict reader as
+    _series, then zipped position-wise into {open,high,low,close,volume,amount}
+    dicts (the shape columns_from_bars / _f_day_data expect). Short/ragged
+    fields are padded with None -- the rules treat missing fields as NaN.
+    """
+    entry = None
+    if isinstance(payload, dict):
+        entry = payload.get(symbol, payload)
+    if entry is None:
+        return []
+    # g2 demands a LITERAL attribute name on every getattr -- six explicit reads.
+    def _col_open():
+        v = getattr(entry, "open", None)
+        if v is None and isinstance(entry, dict):
+            v = entry.get("open")
+        return v
+    def _col_high():
+        v = getattr(entry, "high", None)
+        if v is None and isinstance(entry, dict):
+            v = entry.get("high")
+        return v
+    def _col_low():
+        v = getattr(entry, "low", None)
+        if v is None and isinstance(entry, dict):
+            v = entry.get("low")
+        return v
+    def _col_close():
+        v = getattr(entry, "close", None)
+        if v is None and isinstance(entry, dict):
+            v = entry.get("close")
+        return v
+    def _col_volume():
+        v = getattr(entry, "volume", None)
+        if v is None and isinstance(entry, dict):
+            v = entry.get("volume")
+        return v
+    def _col_amount():
+        v = getattr(entry, "amount", None)
+        if v is None and isinstance(entry, dict):
+            v = entry.get("amount")
+        return v
+    def _as_list(value):
+        if value is None:
+            return []
+        try:
+            return list(value)
+        except TypeError:
+            return []
+    cols = {
+        "open": _as_list(_col_open()),
+        "high": _as_list(_col_high()),
+        "low": _as_list(_col_low()),
+        "close": _as_list(_col_close()),
+        "volume": _as_list(_col_volume()),
+        "amount": _as_list(_col_amount()),
+    }
+    n = max((len(v) for v in cols.values()), default=0)
+    bars = []
+    for i in range(n):
+        bar = {}
+        for f, col in cols.items():
+            raw = col[i] if i < len(col) else None
+            try:
+                bar[f] = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                bar[f] = None
+        bars.append(bar)
+    return bars
+
+
+def _mean_tail(values, n):
+    vals = [v for v in values if v]
+    if len(vals) < n:
+        return None
+    return sum(vals[-n:]) / float(n)
+
+
 def _hist_bars(ContextInfo, symbol):
     """History bars via every signature this client family has shown, or None.
 
@@ -681,14 +794,15 @@ def _hist_bars(ContextInfo, symbol):
     getter = getattr(ContextInfo, "get_market_data_ex", None)
     if not callable(getter):
         return None
-    fields = ["close", "volume"]
+    fields = ["close", "volume", "high", "low", "open", "amount"]
     period = PARAMS.get("ma_period", "1d")
+    count = int(PARAMS.get("bars_count", 80))
     try:
-        return getter(fields, [symbol], period=period, count=3)
+        return getter(fields, [symbol], period=period, count=count)
     except Exception:
         pass
     try:
-        return getter(fields, [symbol], period, "", "", 3, True, True)
+        return getter(fields, [symbol], period, "", "", count, True, True)
     except Exception:
         return None
 
@@ -786,6 +900,21 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     # placed-but-not-yet-reported buys must count too (counter fills UNION
     # session sends; neither alone is the day total).
     spent += float(_STATE["buy_amounts"].get((day, symbol), 0.0) or 0.0)
+    # 2026-11-11 owner: bars come FROM QMT (download_history_data2 + get_market_data_ex)
+    # so the ported form/ladder/factor tactics finally have their day-series inputs.
+    # Derived features mirror the Go adapters (ma/vol windows over the last bars,
+    # today's tick volume vs the 5-day average). precalc passthrough covers ONLY
+    # what QMT cannot provide (valuation/turnover/fin/flow/news=D1/concept heat).
+    bars = _bars_of(_hist_bars(ContextInfo, symbol), symbol)
+    closes = [b["close"] for b in bars if b.get("close")]
+    vols = [b["volume"] for b in bars if b.get("volume")]
+    ma5 = _mean_tail(closes, 5)
+    ma20 = _mean_tail(closes, 20)
+    vol5 = _mean_tail(vols, 5)
+    tick_volume = tick.get("volume")
+    today_vol_vs_5d = (tick_volume / vol5) if (tick_volume and vol5) else None
+    _STATE.setdefault("bars_cov", {})[symbol] = 1 if bars else 0
+    pre = (PARAMS.get("precalc") or {}).get(symbol) or {}
     return {
         "symbol": symbol,
         "day": day,
@@ -809,6 +938,17 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "available_cash": cash,
         "daily_buy_total": spent,
         "ops_last_minute": _ops_budget_used(),
+        "bars": bars,
+        "ma5": ma5,
+        "ma20": ma20,
+        "today_vol_vs_5d": today_vol_vs_5d,
+        "valuation_series": pre.get("valuation_series"),
+        "turnover_series": pre.get("turnover_series"),
+        "fin_pit": pre.get("fin_pit"),
+        "flow_today_pct": pre.get("flow_today_pct"),
+        "flow_5d_pct": pre.get("flow_5d_pct"),
+        "news_event": pre.get("news_event"),
+        "concept_heat": pre.get("concept_heat"),
     }
 
 
@@ -1074,6 +1214,15 @@ def run_round(ContextInfo, moment):
         cap = int(PARAMS.get("hot_pool_max_codes", 20))
         extra = [c for c in hot if c not in symbols][:max(0, cap)]
         symbols = symbols + extra
+    # DATA-HEALTH: hourly one-line coverage log so a silent download failure is
+    # visible in the log pane (2026-11-11 review finding -- never fail silently).
+    cov_key = "%s_%d" % (day, moment.hour)
+    if _STATE.get("cov_log_key") != cov_key:
+        _STATE["cov_log_key"] = cov_key
+        cov = _STATE.get("bars_cov") or {}
+        covered = sum(1 for sym in symbols if cov.get(sym))
+        _log("data_health bars_coverage=%d/%d precalc=%d" % (
+            covered, len(symbols), len(PARAMS.get("precalc") or {})))
     for symbol in symbols:
         ctx = build_context(ContextInfo, symbol, moment, orders, positions, cash)
         signals = []
@@ -1327,6 +1476,7 @@ def init(ContextInfo):
         bool(counter_api), bool(_fn("passorder")), bool(_fn("cancel"))))
     if not counter_api or not _fn("passorder"):
         _log("WARN trade surface unavailable: this build will place nothing")
+    _download_day_bars(ContextInfo)
 
 
 def handlebar(ContextInfo):

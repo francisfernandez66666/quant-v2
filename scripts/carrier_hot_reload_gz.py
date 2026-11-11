@@ -222,6 +222,33 @@ def main():
         die("build_dir_missing:" + BUILD_DIR)
     os.chdir(BUILD_DIR)
 
+    # §B 自动补推（2026-11-11 owner 要求）：precalc 缺当日 / 覆盖率<80% ⇒ 自动补跑一次
+    # pregen（限频：每小时最多一次，重试时间戳落 precalc_retry_ts），失败不阻断热更
+    # （pregen 自带 ntfy 通知与连续失败计数）。
+    try:
+        st_path = "qmt_gateway/precalc_status.json"
+        st = {}
+        if os.path.exists(st_path):
+            with open(st_path, "r", encoding="utf-8") as fh:
+                st = json.load(fh)
+        today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
+        stale = st.get("day") != today or int(st.get("coverage") or 0) < 80
+        retry_ts_path = "qmt_gateway/precalc_retry_ts"
+        last_retry = 0.0
+        if os.path.exists(retry_ts_path):
+            with open(retry_ts_path, "r", encoding="utf-8") as fh:
+                last_retry = float(fh.read().strip() or 0)
+        now_ts = datetime.datetime.now().astimezone().timestamp()
+        if stale and now_ts - last_retry > 3600:
+            r = subprocess.run(["python3", "scripts/pregen_carrier_factors_gz.py"],
+                               cwd=BUILD_DIR, capture_output=True, text=True, timeout=900)
+            with open(retry_ts_path, "w", encoding="utf-8") as fh:
+                fh.write(str(now_ts))
+            tail = (r.stdout + r.stderr).strip().splitlines()
+            print("HOTRELOAD_DATARETRY rc=%d %s" % (r.returncode, tail[0] if tail else ""))
+    except Exception as exc:  # noqa: BLE001 - 补推失败不阻断热更
+        print("HOTRELOAD_DATARETRY_FAIL %s" % repr(exc)[:100])
+
     qc, rules = load_live()
     wl = (qc.get("qmt", {}) or {}).get("strategies") or []
     if not wl:
