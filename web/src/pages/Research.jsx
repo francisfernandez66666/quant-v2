@@ -188,6 +188,25 @@ export default function Research() {
   const [editingName, setEditingName] = useState({})
   const [nameDraft, setNameDraft] = useState({})
   const [backtestEnabled, setBacktestEnabled] = useState(false)
+  // §PRECALC：同花顺 key 前台配置（admin/config_admin）
+  const [hithinkKeyInput, setHithinkKeyInput] = useState('')
+  const [hithinkKeyState, setHithinkKeyState] = useState('未配置')
+  useEffect(() => {
+    if (!api.hasPerm('config_admin')) return
+    api.fetchHithinkKey().then((r) => {
+      setHithinkKeyState(r && r.present ? `已配置（尾4位 ${r.tail}）` : '未配置')
+    }).catch(() => {})
+  }, [])
+  async function saveHithinkKey() {
+    try {
+      await api.setHithinkKey(hithinkKeyInput.trim())
+      const r = await api.fetchHithinkKey()
+      setHithinkKeyState(r && r.present ? `已配置（尾4位 ${r.tail}）` : '未配置')
+      setHithinkKeyInput('')
+      showToast('同花顺 key 已保存，30s 内热生效')
+    } catch (e) { showToast((e && e.message) || '保存失败') }
+  }
+
 
   // ── 参数寻优中心状态：子标签 / 优化目标 / 任务列表 / 当前选中战法 / 抽屉 ──
   const [candSubTab, setCandSubTab] = useState('patterns')
@@ -2256,7 +2275,24 @@ export default function Research() {
                 <ToggleSw checked={backtestEnabled} onChange={(v) => { setBacktestEnabled(v); saveBacktestToggle(v) }} />
                 <Tag theme={backtestEnabled ? 'success' : 'default'}>{backtestEnabled ? '已开启' : '已关闭'}</Tag>
               </div>
-            </Card>
+            
+            {/* §PRECALC（2026-11-11 owner 需求）：同花顺 API key 前台配置——研究库主源
+                （ths_daily）与预计算兜底的取数凭据。只回显是否已配置+尾4位；保存后
+                researchd 30s 内热生效（夜间链 hithink_sync 步自动注入）。 */}
+            <Card title="研究数据源（同花顺）" style={{ marginTop: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <div style={{ flex: 1, minWidth: 260 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>HITHINK_FINANCE_API_KEY</div>
+                  <div style={{ fontSize: 12, color: 'var(--app-muted)', marginTop: 4, lineHeight: 1.5 }}>
+                    同花顺（新）API key：夜间 hithink_sync 步（ths_daily 主源日线）与数据源路由取数凭据。
+                    保存后 30s 内热生效；留空保存=清除。当前：{hithinkKeyState}
+                  </div>
+                </div>
+                <Input style={{ width: 320 }} value={hithinkKeyInput} placeholder="粘贴同花顺 API key"
+                  onChange={(v) => setHithinkKeyInput(String(v ?? ''))} />
+                <Button theme="primary" onClick={saveHithinkKey}>保存</Button>
+              </div>
+            </Card></Card>
 
             {/* §回测自动增强 D：回测可信度增强配置（滑点校准/流动性门控/Pareto 前沿） */}
             <BacktestConfigPanel />

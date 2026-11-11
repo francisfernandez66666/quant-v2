@@ -1440,6 +1440,10 @@ type SchedulerConfig struct {
 	DB string `json:"db"`
 	// baostock sidecar 地址（默认 http://127.0.0.1:8787）
 	PyURL string `json:"pyurl"`
+	// HithinkKey §PRECALC/研究库主源（2026-11-11 owner）：同花顺（新）API key——
+	// 前台（admin 设置）可配，调度器拉起 dataload/hithink-sync 子进程时注入
+	// HITHINK_FINANCE_API_KEY 环境变量。空=注入跳过（子进程按原语义报未认证）。
+	HithinkKey string `json:"hithink_api_key"`
 	// 盘后/周末夜间作业
 	Nightly NightlyConfig `json:"nightly"`
 	// 交易时段增量下载
@@ -3850,6 +3854,23 @@ func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) error
 	return m.saveUserRules(oid, r)
 }
 
+// SetSchedulerHithinkKey §PRECALC（2026-11-11 owner）：把同花顺 API key 落进运营归属
+// 账号的全局调度配置（rules.scheduler.hithink_api_key），前台 admin 可见可改；
+// researchd 30s tick 重读 config.json 热生效，调度器拉起 hithink-sync 时注入子进程环境。
+// English: operator-scoped persistence of the hithink API key; hot-effective via the
+// researchd config re-read tick.
+func (m *Manager) SetSchedulerHithinkKey(userID, key string) error {
+	oid := m.ownerOf(userID)
+	r := m.userRules(oid)
+	r.Scheduler.HithinkKey = key
+	return m.saveUserRules(oid, r)
+}
+
+// GetSchedulerHithinkKey 返回运营归属账号配置的同花顺 key（空串=未配置）。
+func (m *Manager) GetSchedulerHithinkKey(userID string) string {
+	return m.userRules(m.ownerOf(userID)).Scheduler.HithinkKey
+}
+
 // GetLLMConfigFor 返回运营数据归属账号（管理员）的 LLM 配置（运营配置系统级共享）。
 //
 // §警告 返回的是**内部结构的指针**，不是拷贝：调用方必须**立即取值拷贝**再使用，
@@ -5120,6 +5141,9 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 	}
 	if v, ok := cfgStr(m, "pyurl"); ok && v != "" {
 		out.PyURL = v
+	}
+	if v, ok := cfgStr(m, "hithink_api_key"); ok {
+		out.HithinkKey = v
 	}
 	if sub, ok := cfgObject(m, "nightly"); ok {
 		if v, ok := cfgInt(sub, "start_hhmm"); ok {

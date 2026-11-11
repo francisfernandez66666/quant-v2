@@ -752,3 +752,49 @@ func (s *Server) purgeAccountDir(uid string) (string, error) {
 	log.Printf("[admin] 删号私有目录已移入备份区 user=%s dst=%s", uid, dst)
 	return "moved", nil
 }
+
+// handleAdminGetHithinkKey 处理 GET /api/admin/research/hithink-key：回显 key 是否已配置
+// （只回尾 4 位脱敏），config_admin 权限。§PRECALC/研究库主源（2026-11-11 owner 需求）。
+func (s *Server) handleAdminGetHithinkKey(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	key := s.cfg.GetSchedulerHithinkKey(userIDFor(r))
+	tail := ""
+	if len(key) >= 4 {
+		tail = key[len(key)-4:]
+	}
+	writeJSON(w, 200, map[string]interface{}{"present": key != "", "tail": tail})
+}
+
+// handleAdminSetHithinkKey 处理 POST /api/admin/research/hithink-key：保存 key（写前快照
+// + 审计留痕，与其它管理端配置同形态）。空串=清除。researchd 30s tick 重读 config.json 热生效。
+func (s *Server) handleAdminSetHithinkKey(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	var body struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	trace := s.snapshotConfigWrite(userIDFor(r), s.operatorID(), "hithink_key")
+	if err := s.cfg.SetSchedulerHithinkKey(userIDFor(r), strings.TrimSpace(body.Key)); err != nil {
+		log.Printf("[admin] hithink key 保存失败: %v", err)
+		writeError(w, 500, "配置保存失败: "+err.Error())
+		return
+	}
+	trace.audit(s)
+	log.Printf("[admin] hithink key 已保存（tail=%s）", func() string {
+		k := strings.TrimSpace(body.Key)
+		if len(k) >= 4 {
+			return k[len(k)-4:]
+		}
+		return k
+	}())
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}

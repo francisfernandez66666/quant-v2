@@ -988,6 +988,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
 	s.mux.HandleFunc("GET /api/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
+	// §PRECALC（2026-11-11）：同花顺 key 前台配置（admin/config_admin），研究库主源 key。
+	s.mux.HandleFunc("GET /api/admin/research/hithink-key", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetHithinkKey))
+	s.mux.HandleFunc("POST /api/admin/research/hithink-key", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetHithinkKey))
 	s.mux.HandleFunc("GET /api/research/task/{id}/log", s.authMiddleware(s.handleResearchTaskLog))
 	s.mux.HandleFunc("GET /api/research/event-factor", s.authMiddleware(s.handleResearchEventFactor))
 	s.mux.HandleFunc("GET /api/research/progress", s.permMiddleware(auth.PermResearchApprove, s.handleResearchProgress))

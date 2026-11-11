@@ -882,11 +882,14 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 	// 将调度步骤映射为 research 任务类型+参数载荷；未知步骤返回 ok=false。
 	switch step {
 	case "dataload":
-		pyurl := cfg.PyURL
-		if pyurl == "" {
-			pyurl = "http://127.0.0.1:8787"
-		}
-		return store.TaskDataload, mustJSON(map[string]any{"pyurl": pyurl}), true
+		return store.TaskDataload, mustJSON(map[string]any{"pyurl": pyurlOf(cfg)}), true
+	case "hithink_sync":
+		// §PRECALC/研究库主源（2026-11-11 owner）：ths_daily 日线增量的独立调度步——
+		// 此前夜间链根本没有这一步，ths_daily 停在 20261106（迁移遗留）。复用 dataload
+		// 二进制：payload 打 hithink_sync 标记，taskCommand 据此换成 hithink-sync 子命令；
+		// key 走 cmd.Env 环境注入，未配置时子进程按原语义报未认证、任务判红可见。
+		return store.TaskDataload, mustJSON(map[string]any{
+			"pyurl": pyurlOf(cfg), "hithink_sync": true}), true
 	case "minute_sync":
 		// §MINUTE-K 分钟 K 收盘后日增：只补**库里已有**的票（incremental=true，清单自维护），
 		// 每票拉最近 count 根。count 缺省 60 足够覆盖当日 48 根 5 分钟 + 集合竞价尾量；
@@ -1204,9 +1207,15 @@ func (s *Scheduler) taskCommand(cfg config.SchedulerConfig, tk *store.ResearchTa
 		}
 		var p map[string]any
 		_ = json.Unmarshal([]byte(tk.Payload), &p)
-		pyurl := "http://127.0.0.1:8787"
+		pyurl := "http://127.0.0.1:8788"
 		if v, ok := p["pyurl"].(string); ok && v != "" {
 			pyurl = v
+		}
+		// §PRECALC：hithink_sync 标记 ⇒ 换成同花顺日线增量子命令（ths_daily 主源）。
+		if flag, _ := p["hithink_sync"].(bool); flag {
+			since := time.Now().AddDate(0, 0, -10).Format("20060102")
+			return bin, []string{"--db", dbPath, "--pyurl", pyurl, "hithink-sync",
+				"--kind", "daily-k-10d", "--since", since, "--tmp", "/tmp/hithink_dump"}, nil
 		}
 		return bin, []string{"--db", dbPath, "--pyurl", pyurl, "daily"}, nil
 	}
@@ -1340,6 +1349,11 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, bin, args...)
 	cmd.Dir = dirOfDB(cfg)
+	// §PRECALC（2026-11-11 owner）：前台配置的同花顺 key 注入子进程环境——
+	// hithink-sync / dataload 等子命令按既有语义读取该变量；空=不注入。
+	if cfg.HithinkKey != "" {
+		cmd.Env = append(os.Environ(), "HITHINK_FINANCE_API_KEY="+cfg.HithinkKey)
+	}
 	// §S1 孤儿防护：独立进程组 + Linux Pdeathsig（父死内核杀子），抢占/超时整组击杀
 	configureSysProcAttr(cmd)
 
@@ -2013,4 +2027,13 @@ func (s *Scheduler) execDataload(ctx context.Context, cfg config.SchedulerConfig
 	}
 	logger.flush()
 	return nil
+}
+
+// pyurlOf 调度配置的 sidecar 地址（缺省 8788——本仓部署口径；8787 是旧缺省）。
+// English: sidecar address from scheduler config, defaulting to this deployment's 8788.
+func pyurlOf(cfg config.SchedulerConfig) string {
+	if cfg.PyURL != "" {
+		return cfg.PyURL
+	}
+	return "http://127.0.0.1:8788"
 }

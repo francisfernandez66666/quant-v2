@@ -862,6 +862,15 @@ export async function fetchSignals() {
 // §TRADE-LIST（2026-11-11）：交易列表 = 全套脑侧规则跑完后的下单信号（stage=placed）。
 // 弹窗提醒与「交易列表」tab 都只吃这一份——原始信号不再直接推卡（owner："而不是乱推送"）。
 // 权限与 /api/signals/decisions 同面（trading_admin / quant_trade）；无权限 403 由调用方静默。
+// §PRECALC（2026-11-11 owner）：同花顺 key 前台配置（admin/config_admin）。
+// GET 只回 present+尾4位脱敏；POST 空 key=清除。researchd 30s tick 热生效。
+export async function fetchHithinkKey() {
+  return request('/api/admin/research/hithink-key')
+}
+export async function setHithinkKey(key) {
+  return request('/api/admin/research/hithink-key', { method: 'POST', data: { key } })
+}
+
 export async function fetchTradeSignals() {
   return request('/api/signals/trades', { timeout: 20000 })
 }
