@@ -43,6 +43,12 @@ VOL_WINDOW = 5     # vol_ma5：昨收起往前 5 日均量（量比基线）
 HIGH_LOW_N = 10    # high10/low10：近 10 日（不含当日）
 REQ_TIMEOUT = 8
 VOL_UNIT_MULT = float(os.environ.get("PREGEN_VOL_UNIT_MULT", "1"))  # hithink 日线量=股，与 QMT tick 同量纲
+# 云端自动研究库（trading.db.daily，5546 只全市场 tushare 口径）：hithink 失败的票兜底。
+# 注意两点：① vol 单位是**手** ⇒ ×100 换算成股；② 库新鲜度由 dataload 管道决定
+#   （2026-11-11 实测停在 20261106——迁移后 dataload 服务/定时器缺失），兜底行会带
+#   data_day 让消费方可见 staleness，绝不冒充最新。
+LOCAL_DB = os.environ.get("PREGEN_LOCAL_DB", "/var/lib/quant-trading-v2/trading.db")
+LOCAL_VOL_MULT = float(os.environ.get("PREGEN_LOCAL_VOL_MULT", "100"))
 SLEEP_MS = int(os.environ.get("PREGEN_SLEEP_MS", "80"))
 MAX_CODES = int(os.environ.get("SIGNAL_POOL_MAX", "600"))
 
@@ -82,6 +88,29 @@ def fetch_klines(symbol):
     return bars or None
 
 
+def fetch_local_daily(symbol, db_path=LOCAL_DB):
+    """云端自动研究库兜底（owner 14:2x 提示）：trading.db.daily（tushare 口径，全市场）。
+    只读；vol 手→股。新鲜度以库为准（可能落后数日），返回 (bars, data_day) 或 (None, None)。"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
+    except sqlite3.Error:
+        return None, None
+    try:
+        rows = conn.execute(
+            "SELECT trade_date, close, high, low, vol FROM daily WHERE ts_code=? "
+            "ORDER BY trade_date DESC LIMIT ?", (symbol, MA_WINDOW + HIGH_LOW_N + 2)).fetchall()
+    except sqlite3.Error:
+        return None, None
+    finally:
+        conn.close()
+    if not rows:
+        return None, None
+    bars = [{"close": r[1], "high": r[2], "low": r[3],
+             "volume": float(r[4] or 0) * LOCAL_VOL_MULT} for r in reversed(rows)]
+    return bars, rows[0][0]
+
+
 def compute(bars):
     """盘前语义：所有窗口都止于上一交易日（盘前运行时当日K线不存在）。"""
     closes = [b["close"] for b in bars]
@@ -116,6 +145,16 @@ def main():
         try:
             bars = fetch_klines(symbol)
             fact = compute(bars) if bars else None
+            src = "hithink"
+            if not fact:
+                # owner 2026-11-11 14:2x：云端自动研究库（5546 只）兜底——hithink 无覆盖/
+                # 拉取失败的票，用本地 trading.db.daily；data_day 让 staleness 可见。
+                bars2, data_day = fetch_local_daily(symbol)
+                fact = compute(bars2) if bars2 else None
+                src = "local_daily"
+                if fact:
+                    fact["data_day"] = data_day
+                    fact["src"] = src
             if fact:
                 precalc[symbol] = fact
                 ok += 1
