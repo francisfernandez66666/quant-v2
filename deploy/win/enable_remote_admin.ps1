@@ -23,9 +23,25 @@ $PubKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIErtnyaHCh/bq4fezo6fLrzCeEa8/pnmV
 $WgSubnet = '10.77.0.0/24'
 
 # 1) 管理员校验：改 sshd/防火墙/授权文件都需要提权，静默失败比报错更危险。
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Output 'REMOTE_ADMIN_ABORT reason=administrator_required'
+# 2026-11-11 owner 实锤：[WindowsIdentity]::GetCurrent() 在个别宿主下返回 $null，
+# 直接 New-Object 会得到 $null principal，IsInRole 抛 "对 Null 值表达式调用方法"。
+# 改为防御式判定 + whoami /groups 兜底（Administrators SID = S-1-5-32-544）。
+function Test-IsAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -eq $id) { return $false }
+        $pr = New-Object Security.Principal.WindowsPrincipal($id)
+        if ($null -eq $pr) { return $false }
+        if ($pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { return $true }
+    } catch { }
+    try {
+        $g = whoami /groups 2>$null | Select-String 'S-1-5-32-544'
+        if ($g -match 'Enabled') { return $true }
+    } catch { }
+    return $false
+}
+if (-not (Test-IsAdmin)) {
+    Write-Output 'REMOTE_ADMIN_ABORT reason=administrator_required (请右键"以管理员身份运行" PowerShell 后重试)'
     exit 2
 }
 

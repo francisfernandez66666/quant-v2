@@ -2,7 +2,7 @@
 // English: numeric sort regression locks (formatted strings, nulls, mixed shapes).
 import { describe, it, expect } from 'vitest'
 import { sorterNum, sorterStr, numVal } from '../pages/Signals.jsx'
-import { resolveBookMode } from '../pages/Positions.jsx'
+import { resolveBookMode, normalizeManualCode } from '../pages/Positions.jsx'
 
 describe('signal numeric sorting', () => {
   it('sorts by numeric value, not lexicographic', () => {
@@ -32,6 +32,15 @@ describe('signal numeric sorting', () => {
   it('string sorter tolerates null fields', () => {
     const rows = [{ name: null }, { name: '甲' }, { name: '乙' }]
     expect(() => [...rows].sort(sorterStr('name'))).not.toThrow()
+  })
+  it('normalizes bare 6-digit codes to exchange suffixes', () => {
+    expect(normalizeManualCode('601958')).toBe('601958.SH')
+    expect(normalizeManualCode('002631')).toBe('002631.SZ')
+    expect(normalizeManualCode('300750')).toBe('300750.SZ')
+    expect(normalizeManualCode('430047')).toBe('430047.BJ')
+    expect(normalizeManualCode('600000.SH')).toBe('600000.SH')
+    expect(normalizeManualCode(' 601958 ')).toBe('601958.SH')
+    expect(normalizeManualCode('12ab')).toBe('12AB')  // 非法形态原样透传给后端拒
   })
 })
 

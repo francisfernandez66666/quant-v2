@@ -22,6 +22,20 @@ import { on } from '../sseBus.js'
 // English: explicit bookkeeping mode; "manual" always forces the adjust path, "auto"
 // follows the server book source (with the frozen-frame safety fallback).
 export const BOOK_MODE_KEY = 'positions_book_mode'
+// 2026-11-11 owner 实锤：改账新增在手机上「明明填了代码却报请输入代码」——受控 Input 在
+// 移动端 IME/自动填充下 onChange 可能不触发，confirm 读到空串。修复两件：确认时优先读
+// ref（不受闭包/渲染时序影响），并接受 6 位纯数字码按板块自动补后缀（60→SH，00/30→SZ，4/8→BJ）。
+// English: ref-backed read + suffix normalization for bare 6-digit codes.
+export function normalizeManualCode(raw) {
+  const c = String(raw || '').trim().toUpperCase()
+  if (/^\d{6}\.(SH|SZ|BJ)$/.test(c)) return c
+  if (/^\d{6}$/.test(c)) {
+    if (c.startsWith('6')) return c + '.SH'
+    if (c.startsWith('0') || c.startsWith('3')) return c + '.SZ'
+    if (c.startsWith('4') || c.startsWith('8')) return c + '.BJ'
+  }
+  return c
+}
 export function resolveBookMode(bookMode, cashManual, posManual, counterFrozen) {
   return bookMode === 'manual' || !!(cashManual || posManual || counterFrozen)
 }
@@ -240,6 +254,7 @@ export default function Positions() {
   const [manualFormPrice, setManualFormPrice] = useState(0)
   const [manualFormQty, setManualFormQty] = useState(0)
   const [manualFormCode, setManualFormCode] = useState('')
+  const manualFormCodeRef = useRef('')
   const [manualFormName, setManualFormName] = useState('')
   const [manualSubmitting, setManualSubmitting] = useState(false)
   // 「直接改资金」小入口（裁决 3 的手续费/分红/出入金口子）：拆成独立的 state，
@@ -938,6 +953,7 @@ export default function Positions() {
   function openManualNew() {
     setManualAction({ pos: null, dir: 'new' })
     setManualFormCode('')
+    manualFormCodeRef.current = ''
     setManualFormName('')
     setManualFormPrice(0)
     setManualFormQty(100)
@@ -981,7 +997,8 @@ export default function Positions() {
     const a = manualAction
     if (!a) return
     if (a.dir === 'new') {
-      const code = String(manualFormCode || '').trim()
+      // ref 优先：移动端受控 Input 可能不触发 onChange，state 会是空串（owner 11:42 实锤）
+      const code = normalizeManualCode(manualFormCodeRef.current || manualFormCode)
       if (!code) { MessagePlugin.warning('请输入代码：改账也必须挂在真实标的下，不留"不知道是谁的仓"'); return }
       const q = Math.round(Number(manualFormQty) || 0)
       const pr = Number(manualFormPrice) || 0
@@ -1687,7 +1704,9 @@ export default function Positions() {
           </div>
           {manualAction?.dir === 'new' ? (
             <Form.FormItem label="代码">
-              <Input value={manualFormCode} placeholder="输入代码（如 600000.SH）" onChange={(v) => setManualFormCode(v)} />
+              <Input value={manualFormCode} placeholder="输入代码（如 601958 或 600000.SH）"
+                onChange={(v) => { manualFormCodeRef.current = String(v ?? ''); setManualFormCode(String(v ?? '')) }}
+                onBlur={(v) => { if (v != null) { manualFormCodeRef.current = String(v ?? '') ; setManualFormCode(String(v ?? '')) } }} />
             </Form.FormItem>
           ) : (
             <Form.FormItem label="当前持仓">
