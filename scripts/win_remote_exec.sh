@@ -13,7 +13,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BOX_USER="${BOX_USER:-57516}"
 BOX_HOST="${BOX_HOST:-10.77.0.2}"
-KEY="${KEY:-/opt/quant/keys/win_admin}"
+KEY="${KEY:-/home/ubuntu/.ssh/win_admin}"  # 必须是 gz 上 ubuntu 可读的私钥（root 600 会 Load key denied）
 MODE="${1:-}"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -i $KEY"
 
