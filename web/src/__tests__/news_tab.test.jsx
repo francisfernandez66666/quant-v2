@@ -16,8 +16,17 @@ vi.mock('../api/index.js', async () => {
 import NewsTab, { dayKeyOf, readLastSeen, LAST_SEEN_PREFIX } from '../components/NewsTab.jsx'
 import * as api from '../api/index.js'
 
+// 2026-11-11 修日期腐化：夹具原先写死 2026-11-05/06，跨日后「换日」断言必红。
+// D1=昨天（旧 day-key），D2=明天（行内时刻一定晚于当刻写入的已读标记）。
+// English: derive day keys from the clock so the day-rollover test never rots.
+function bjDay(offset) {
+  return new Date(Date.now() + 8 * 3600 * 1000 + offset * 86400000).toISOString().slice(0, 10)
+}
+const D1 = bjDay(-1)
+const D2 = bjDay(1)
+
 // mkRows 造 n 条当日新闻行（generated_at 全部落在同一个 dayKey 下，分页/未读都按它算）
-function mkRows(n, day = '2026-11-05', titlePrefix = '行业利好') {
+function mkRows(n, day = D1, titlePrefix = '行业利好') {
   return Array.from({ length: n }, (_, i) => ({
     id: `news|${i}`,
     code: '300750',
@@ -90,9 +99,9 @@ describe('NewsTab §B6 新闻 tab', () => {
   // ②b 「今日已折叠 N 条」这一行必须原样可见（静默折叠＝通知变黑箱）
   it('折叠行原样可见，不被汇总或省略', async () => {
     const rows = [...mkRows(1), {
-      id: 'news|folded|20261105', code: '', name: '', level: '新闻', kind: 'news',
+      id: 'news|folded|day1', code: '', name: '', level: '新闻', kind: 'news',
       title: '今日已折叠 3 条', body: '超出每票/全局必推预算的新闻已转日汇总',
-      generated_at: '2026-11-05T10:20:00',
+      generated_at: `${D1}T10:20:00`,
     }]
     api.request.mockResolvedValue(okRes(rows, rows.length))
     render(<NewsTab />)
@@ -102,11 +111,11 @@ describe('NewsTab §B6 新闻 tab', () => {
 
   // ③ 切交易日清零：未读标记按日一把键，换日＝新键＝旧标记不再复用
   it('切交易日清零：未读与折叠行随当日数据一起归零', async () => {
-    api.request.mockResolvedValue(okRes(mkRows(3, '2026-11-05'), 3))
+    api.request.mockResolvedValue(okRes(mkRows(3, D1), 3))
     const { rerender } = render(<NewsTab pageSize={10} />)
     await waitFor(() => expect(screen.getByText(/当日 3 条/)).toBeInTheDocument())
-    const key1105 = dayKeyOf('2026-11-05T09:00:00')
-    expect(key1105).toBe('2026-11-05')
+    const key1105 = dayKeyOf(`${D1}T09:00:00`)
+    expect(key1105).toBe(D1)
     // 打开过当日 ⇒ 写入这一天的"已读到"标记
     await waitFor(() => expect(readLastSeen(key1105)).toBeGreaterThan(0))
 
@@ -118,16 +127,16 @@ describe('NewsTab §B6 新闻 tab', () => {
     expect(screen.queryByText(/今日已折叠/)).toBeNull()
     expect(screen.getByText(/未读 0/)).toBeInTheDocument()
 
-    // 而新一天真的来了一条 ⇒ 未读必须是 1（11-05 那把"已读到"键不许管 11-06）
-    api.request.mockResolvedValue(okRes(mkRows(1, '2026-11-06'), 1))
+    // 而新一天真的来了一条 ⇒ 未读必须是 1（旧 day-key 不许管新一天）
+    api.request.mockResolvedValue(okRes(mkRows(1, D2), 1))
     cleanup()
     render(<NewsTab pageSize={10} />)
     await waitFor(() => expect(screen.getByText(/当日 1 条/)).toBeInTheDocument())
-    // 11-05 的标记与 11-06 的标记是两把键：新键此刻还没写过＝按"全部未读"起算
-    expect(window.localStorage.getItem(`${LAST_SEEN_PREFIX}.2026-11-05`)).not.toBeNull()
-    const rows1106 = mkRows(1, '2026-11-06')
+    // 两天的标记是两把键：新键此刻还没写过＝按"全部未读"起算
+    expect(window.localStorage.getItem(`${LAST_SEEN_PREFIX}.${D1}`)).not.toBeNull()
+    const rows1106 = mkRows(1, D2)
     // 该行的时间戳晚于 11-05 的标记 ⇒ 无论标记是否已写，都判未读
-    expect(new Date(rows1106[0].generated_at).getTime()).toBeGreaterThan(readLastSeen('2026-11-05'))
+    expect(new Date(rows1106[0].generated_at).getTime()).toBeGreaterThan(readLastSeen(D1))
   })
 
   // dayKeyOf 的取值纪律：行内日期取不到时返回空串（不许拿"今天"冒充数据日期）
