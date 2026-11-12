@@ -1424,14 +1424,16 @@ func (d DataConfig) RiskHithinkPrimary() bool {
 type SchedulerConfig struct {
 	// 总开关（默认 true）
 	Enabled bool `json:"enabled"`
-	// AllDayResearch §ALL-DAY-RESEARCH（2026-11-09 owner 裁决）：云端全天跑自动研究——
-	// 交易窗口不再禁止出队、不再抢占在跑任务（旧的 quant↔research 互相自动退避关闭）。
-	// 缺省 false＝既有口径（盘后/休市才研究）。退避的历史成因（QMT 下单与研究在同一台
-	// Windows 机抢 CPU/IO）已随下单链外迁（内置策略载体在物理机）不复存在；2 核 4G 的
-	// 容量代价由 owner 显式承担（内存闸门 MinFreeMemMB 仍然生效，内存不足照样留队）。
-	// English: when true, research runs all day — the trading-window gate and the
-	// trading-window preemption are both bypassed. Default false (legacy backoff).
+	// AllDayResearch §DEPRECATED（2026-11-12 owner 更正）：11-09 的「全天研究」开关已废弃，
+	// 代码不再读取它来绕过交易窗口门控。11-12 现网实证白天研究抢占 2 核 4G 小机资源、
+	// 队列积压 63 条 queued 且云端前端加载变慢，故恢复 quant↔research 按交易时段互相退避。
+	// 字段保留仅为兼容存量 config.json / 账号级规则投影（解析不报错），写 true 也不再生效。
+	// English: deprecated — the all-day bypass is retired; kept only for config compatibility.
 	AllDayResearch bool `json:"all_day_research"`
+	// MaxQueuedTasks §QUEUE-CAP-20261112：自动夜间链入队前的队列深度上限（0=用默认 20）。
+	// 超过上限就不排当晚新链并留痕，防止任务无限堆积拖慢前端与 researchd 启动扫描。
+	// English: cap on queued research tasks before a new nightly chain is enqueued.
+	MaxQueuedTasks int `json:"max_queued_tasks"`
 	// research 二进制路径
 	ResearchBin string `json:"research_bin"`
 	// dataload 二进制路径

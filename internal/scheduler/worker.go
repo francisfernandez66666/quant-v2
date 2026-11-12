@@ -434,7 +434,11 @@ func (s *Scheduler) preemptCurrent(reason string) {
 // swap 死锁（2026-08-23 实录：discover_factors 峰值 + quant 并发 → SSH/HTTPS 全僵死，
 // OOM 重启 → 排水重跑 → 再 OOM 的 crash loop）。English: global memory gate — when system
 // MemAvailable drops below the threshold, no task is dequeued (everything stays queued).
-const memGateDefaultMB = 400
+// §RESOURCE-CAP-20261112（owner：把研究侧资源限制加回来，不按交易时段判定）：
+// 缺省可用内存门槛由 400MB 抬到 800MB —— 2 核 4G 小机上 quant 常驻约 800MB RSS，
+// 400MB 门槛太松，research 仍会在 quant 吃紧时挤进同一波内存回收，前端跟着变慢。
+// 读不到 /proc/meminfo 时仍按 fail-open 放行（既有纪律）。
+const memGateDefaultMB = 800
 
 // readMemAvailableMB 系统可用内存（MB）；读取失败返回 -1（闸门放行，不因读数失败卡死队列）。
 // 平台实现见 memgate_unix.go（/proc/meminfo）/ memgate_windows.go（GlobalMemoryStatusEx）。
@@ -642,6 +646,20 @@ func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
 // every later tick backfills only the missing positions, with issued/total recorded in state.
 func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfig, now time.Time) {
 	today := cntime.DayCompactOf(now) // §TZ1 北京日历定链日
+	// §QUEUE-CAP-20261112（owner：把自动研究的队列/次数限制加回来）：
+	// 待执行任务达上限就不排当晚新链并留痕，防止任务无限堆积拖慢前端与 researchd
+	// 出队扫描（11-12 现网积压 63 条 queued）。上限 0=默认 20；只拦新链，
+	// 不动已在队列里的任务，也不拦手动 high 优先级任务。
+	capN := cfg.MaxQueuedTasks
+	if capN <= 0 {
+		capN = 20
+	}
+	if n, err := db.QueuedTaskCount(); err != nil {
+		log.Printf("[scheduler] §QUEUE-CAP 队列深度读取失败（不阻断入队）: %v", err)
+	} else if n >= capN {
+		log.Printf("[scheduler] §QUEUE-CAP 待执行任务 %d >= 上限 %d，本轮不排新夜间链（chain_day=%s）", n, capN, today)
+		return
+	}
 	steps := cfg.Nightly.Steps
 	if len(steps) == 0 {
 		steps = config.DefaultSchedulerConfig().Nightly.Steps

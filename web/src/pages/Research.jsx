@@ -276,6 +276,10 @@ export default function Research() {
   const libPollTimer = useRef(null)
   // 常量 libPollTimer：局部定义
   const pollTimer = useRef(null)
+  // §RESEARCH-POLL-CAP-20261112（owner：前端加载/轮询限流加回来）：
+  // 进度接口冷缓存重算可能超过一次请求窗口，60s 轮询与手动刷新叠加会并发打后端；
+  // 用 in-flight 标记做单飞去重，慢请求没回来就不再发第二个。
+  const progressInFlight = useRef(false)
   // 常量 pollTimer：局部定义
   // §P2-I：四条轮询腿的代号守卫。固定腿各一枚（progress/backtests/log），
   // 按候选 id 动态起的那条把实例存进 ref 映射（同一 id 复用同一枚，代号序列才连续；
@@ -473,6 +477,10 @@ export default function Research() {
   // ===== 进度 / 候选 =====
   // 拉取研究处理进度（数据准备度、日线/财务行数、候选计数），更新进度卡片
   async function loadProgress() {
+    // §RESEARCH-POLL-CAP-20261112：单飞去重——上一轮还没回来就别再发一轮，
+    // 避免慢接口叠加成并发风暴（前端加载变慢的直接成因之一）。
+    if (progressInFlight.current) return
+    progressInFlight.current = true
     // §P2-I：本轮代号先盖章；后到的旧进度整包丢弃（否则进度条会从「90%」倒回「40%」）
     const token = progressGuard.begin()
     try {
@@ -495,6 +503,8 @@ export default function Research() {
       if (progressGuard.isStale(token)) return
       setProgressError(String((e && e.message) || e || '研究进度读取失败'))
       console.error('Research 进度加载失败', e)
+    } finally {
+      progressInFlight.current = false
     }
   }
   // 按当前状态筛选拉取研究候选列表；研究库未接入时进入 noDB 空状态
@@ -1401,15 +1411,22 @@ export default function Research() {
   // （cmd/researchd），API 进程内无该生命周期事件可广播（复核证实：全仓 SSE 广播 type 词表
   // 仅 scan/message/score/qmt_*/real_*/trigger/settlement_diff/positions_clear_guard，
   // 无 backtest/research 事件），跨进程感知只有轮询一条路——旧「接 useSseRefresh」方案不成立，
-  // 改为对齐 §F5 页面统一的 60s 兜底档；任务态自查轮询（libPollTimer/backtestPollers）
-  // 仅在忙时存在且自停，维持原设计。
-  // English: §A6 — researchd is a separate process with no SSE channel into the API server,
-  // so page-level polling stays, converged from 30s to the app-wide 60s fallback cadence.
+// §RESEARCH-POLL-CAP-20261112 起进一步收敛到 90s（历史：30s → 60s → 90s），
+// 且隐藏页整轮跳过；任务态自查轮询（libPollTimer/backtestPollers）仅在忙时存在且自停。
+// English: §A6 — researchd is a separate process with no SSE channel into the API server,
+// so page-level polling stays; cadence converged 30s → 60s → 90s with hidden-tab skip.
   function startPolling() {
     if (pollTimer.current) return
     // 每 60 秒同时刷新「研究进度」与「回测任务列表」：回测任务列表此前未纳入轮询，
     // 导致任务排队 → 运行 → 完成的状态变化在前端不刷新（长时间停在「排队中」）。
-    pollTimer.current = setInterval(() => { loadProgress(); loadBacktests() }, 60000)
+    // §RESEARCH-POLL-CAP-20261112（owner：前端轮询限流加回来）：60s → 90s；
+    // 页面隐藏（切走标签/最小化）时整轮跳过，不做无意义的后台请求。
+    // 不按交易时段判定——限流常驻，时段退避由 scheduler.NightlyEligible 负责。
+    pollTimer.current = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      loadProgress()
+      loadBacktests()
+    }, 90000)
   }
   function stopPolling() {
   // 停止全部研究轮询定时器（组件卸载时清理）

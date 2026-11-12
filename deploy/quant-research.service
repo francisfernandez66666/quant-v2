@@ -35,7 +35,11 @@ LimitNOFILE=65535
 # so the old 1500M headroom is unnecessary and stacked against quant's 900M on a 1.6G box.
 Nice=10
 CPUWeight=8
-CPUQuota=100%
+# §RESOURCE-CAP-20261112（owner：恢复研究侧资源让路）：2 核机上 quant 主程序需要
+# 近实时 5s 打分，research 侧硬上限收到 60%（原 100% 等于允许吃满一整核），
+# 与 MemoryHigh/MemoryMax/SwapMax、Idle I/O 一起构成「盘中把机器让给 quant」的配额组。
+# 不按交易时段切换配额——配额常驻，时段退避由 scheduler.NightlyEligible 负责。
+CPUQuota=60%
 # §2026-08-23 内存总闸配套：硬限之和必须 < 物理 1.6G（此前 research 1G + quant 900M = 1.9G，
 # 双侧冲高吸干 swap → 整机僵死 → OOM 重启 → 排水重跑的 crash loop，实录见 PROGRESS）。
 # MemorySwapMax 限制研究侧 swap 配额：宁可本任务 OOM 重跑（有断点），绝不拖垮 SSH/caddy/quant。
@@ -49,8 +53,9 @@ IOSchedulingClass=idle
 Environment=TZ=Asia/Shanghai
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
 Environment=PATH=/opt/quant:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# 单核执行：研究作业本就慢可接受，限制单核避免挤占 quant 主程序与 sshd
-Environment=GOMAXPROCS=4
+# 单核执行：研究作业本就慢可接受，限制并发数避免挤占 quant 主程序与 sshd
+# §RESOURCE-CAP-20261112：原注释写「单核」却配 4，与 CPUQuota=60% 矛盾，收敛为 2。
+Environment=GOMAXPROCS=2
 
 # 加固：子进程（research/dataload）同样以 quant 用户运行
 NoNewPrivileges=true

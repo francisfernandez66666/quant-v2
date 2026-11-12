@@ -224,16 +224,13 @@ func (s *Scheduler) tickInner() {
 		return
 	}
 	if data.IsTradingWindow(now) {
-		// §ALL-DAY-RESEARCH（2026-11-09 owner 裁决）：全天研究模式下交易窗口不再抢占/停摆，
-		// 直接走正常出队（盘中 dataload 增量下载保留——数据新鲜度对全天研究同样重要）。
-		// English: all-day research mode keeps dequeuing through the trading window; only the
-		// intraday incremental dataload stays on this branch.
-		if cfg.AllDayResearch {
-			s.maybeTradingDataload(cfg, now)
-			s.workerTick(cfg, now)
-			s.writeStatus(cfg, now)
-			return
-		}
+		// §MUTUAL-BACKOFF-20261112（owner 更正 11-09「全天研究」裁决）：quant 与 research
+		// 恢复按交易时段互相退避——盘中 research 一律停摆并抢占在跑任务，把 CPU/IO 让给
+		// quant 的新闻归因流水线与近实时打分；盘后/休市 quant 打分循环休眠，research 才出队。
+		// all_day_research 不再作为绕过退避的开关（11-12 现网：白天研究抢占资源、
+		// research_tasks 积压 63 条 queued、云端前端加载变慢）。
+		// English: restore mutual session backoff — during trading windows research stands down
+		// (preempt the running child); after-hours quant hibernates and research dequeues.
 		// 交易日交易窗口：终止遗留任务（标 preempted 次日自动续跑）+ 内存治理 + 增量下载（只下载不研究）
 		s.preemptCurrent("交易时段开始")
 		s.trimInSession(cfg, now)
@@ -280,9 +277,9 @@ func (s *Scheduler) writeStatus(cfg config.SchedulerConfig, now time.Time) {
 		Enabled:         cfg.Enabled,
 		BeijingNow:      cntime.In(now).Format("2006-01-02 15:04:05"),
 		InTradingWindow: data.IsTradingWindow(now),
-		// §ALL-DAY-RESEARCH：全天模式下研究窗口恒开（快照如实反映，前端不再显示
-		// "当前为交易时段"的停摆理由）。
-		NightlyEligible: cfg.AllDayResearch || !data.IsTradingWindow(now),
+		// §MUTUAL-BACKOFF-20261112：快照如实反映退避状态——盘中恒为 false，
+		// 前端要能显示「当前为交易时段，研究让路给 quant」。
+		NightlyEligible: !data.IsTradingWindow(now),
 		MemAvailMB:      mem,
 		MemGateOpen:     memGateOpen(cfg),
 		Busy:            busy,
@@ -292,8 +289,8 @@ func (s *Scheduler) writeStatus(cfg config.SchedulerConfig, now time.Time) {
 	switch {
 	case !cfg.Enabled:
 		st.Reason = "调度器已禁用(enabled=false)：请检查 config.json 的 rules.scheduler.enabled"
-	case data.IsTradingWindow(now) && !cfg.AllDayResearch:
-		st.Reason = "当前为交易时段(9:15-15:00)，按设计盘后/休市才执行"
+	case data.IsTradingWindow(now):
+		st.Reason = "当前为交易时段(9:15-15:00)，研究按 §MUTUAL-BACKOFF 让路给 quant"
 	case busy:
 		st.Reason = "正在执行任务 " + busyTask + "（唯一槽位占用中）"
 	case !st.MemGateOpen:
@@ -521,20 +518,24 @@ func dirOfDB(cfg config.SchedulerConfig) string {
 //   - 盘前/上午盘/午前/下午盘 → 禁止（这段时间归 quant：新闻归因流水线 + 近实时打分）
 //   - 盘后(15:00 收盘后)/休市(周末·节假日·凌晨) → 允许
 //
-// §ALL-DAY-RESEARCH（2026-11-09 owner 裁决）：cfg.AllDayResearch=true 时**全天放行**——
-// 下单链已外迁（内置策略载体在物理机），旧的 quant↔research 互相自动退避随之关闭；
-// 内存闸门（MinFreeMemMB）不在本函数，全天模式下内存不足仍会留队，不会挤爆机器。
+// §MUTUAL-BACKOFF-20261112（owner 更正）：11-09 曾以「下单链外迁」为由加
+// cfg.AllDayResearch 全天放行、关掉 quant↔research 互相退避；11-12 现网实证白天
+// 研究抢占 2 核 4G 小机资源（research_tasks 积压 63 条 queued、云端前端加载变慢），
+// 故撤销该短路，恢复双向退避：
+//   盘中 → research 停摆（本函数 false + tick 抢占在跑任务），quant 保持 5s 近实时；
+//   盘后/休市 → quant 打分循环休眠，research 出队跑完整夜间链。
+// 内存闸门（MinFreeMemMB）不在此函数，内存不足仍留队，不会挤爆机器。
 //
 // 与 quant 自身的时段判断共用同一谓词集合，两边永远一致，不会出现"日历说休市、
 // 时钟却拦着"的错位。cfg 参数保留以兼容调用方与测试（门控不再消费钟点配置，
-// Nightly.StartHHMM / WeekendStartHHMM 已废弃）。
+// Nightly.StartHHMM / WeekendStartHHMM 与 AllDayResearch 均已废弃）。
 // English: gate driven purely by the session model — blocked during premarket/trading windows
-// (quant owns those), allowed after close and on closed days. AllDayResearch bypasses the gate
-// entirely (the mutual backoff is retired along with the on-box order path).
+// (quant owns those), allowed after close and on closed days. The 11-09 all-day bypass is
+// retired; quant hibernates off-hours so research gets the box.
 func NightlyEligible(now time.Time, cfg config.SchedulerConfig) bool {
-	if cfg.AllDayResearch {
-		return true
-	}
+	// §MUTUAL-BACKOFF-20261112：11-09 加的 `cfg.AllDayResearch → return true` 短路已撤销。
+	// owner 更正：要的就是 quant↔research 按交易时段互相退避，不允许配置把它整条关掉。
+	// cfg 参数保留以兼容调用方与既有测试（门控不消费钟点/开关配置）。
 	// §统一口径（用户约定）：交易日交易窗口（9:15~收盘）禁止，其余全放行。
 	// §W4-a 盘前门（GAP-20260826）：补拦 8:30~9:15 盘前段——该时段是 quant 新闻归因
 	// LLM 流水线"跑完即排"的冲刺期，恰是资源最紧张时刻；此前文档声称 8:30 自动终止

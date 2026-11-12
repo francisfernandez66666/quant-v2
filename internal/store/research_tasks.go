@@ -255,6 +255,16 @@ func (d *DB) HasActiveTaskByRef(taskType string, refID int64) (bool, error) {
 	return n > 0, err
 }
 
+// QueuedTaskCount §QUEUE-CAP-20261112：当前待执行任务数（queued + preempted，
+// 与 DequeueHighestTask 的候选集合同口径），供自动夜间链入队前做队列深度上限判定。
+// English: number of pending tasks (queued + preempted) for the queue-depth cap.
+func (d *DB) QueuedTaskCount() (int, error) {
+	var n int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM research_tasks WHERE status IN (?, ?)`,
+		TaskQueued, TaskPreempted).Scan(&n)
+	return n, err
+}
+
 // UpdateTaskRunState 回写任务运行态（progress/result/error；终态补 finished_at）。
 // English: writes back run state (progress/result/error; finished_at filled on terminal states).
 func (d *DB) UpdateTaskRunState(id int64, status, progress string, resultNum float64, resultText, errMsg string) error {
