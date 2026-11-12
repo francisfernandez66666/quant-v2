@@ -184,7 +184,7 @@ func TestScorePoolN1BreakoutEmit(t *testing.T) {
 
 	pool := map[string]*strategy_engine.StockMarketData{"600899": mkWaveMD(11.2, 2_000_000)}
 	// D1 满分（0~40 制）→ 配合波形 D 分使总分≥60，满足一突门槛
-	d1Scores := map[string]D1Score{"600899": {Code: "600899", Score: 40, Blocked: false}}
+	d1Scores := map[string]D1Score{"600899": {Code: "600899", Score: 40}}
 
 	_, sigs := a.ScorePool([]string{"600899"}, pool, d1Scores, "")
 
@@ -211,7 +211,7 @@ func TestScorePoolN1LowTotalSuppressed(t *testing.T) {
 
 	pool := map[string]*strategy_engine.StockMarketData{"600899": mkWaveMD(11.2, 2_000_000)}
 	// D1 低（0~40 制，0.5）→ 总分达不到 60 → 不发一突/buy
-	d1Scores := map[string]D1Score{"600899": {Code: "600899", Score: 0.5, Blocked: false}}
+	d1Scores := map[string]D1Score{"600899": {Code: "600899", Score: 0.5}}
 
 	_, sigs := a.ScorePool([]string{"600899"}, pool, d1Scores, "")
 
@@ -276,7 +276,7 @@ func scorePoolFullChain(t *testing.T, md *strategy_engine.StockMarketData) []Sig
 	a := New(cfg.GetStrategyConfig())
 	a.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: fakeFullChainStrategy{}}})
 	pool := map[string]*strategy_engine.StockMarketData{"600899": md}
-	_, sigs := a.ScorePool([]string{"600899"}, pool, map[string]D1Score{"600899": {Code: "600899", Score: 0.8, Blocked: false}}, "")
+	_, sigs := a.ScorePool([]string{"600899"}, pool, map[string]D1Score{"600899": {Code: "600899", Score: 0.8}}, "")
 	return sigs
 }
 

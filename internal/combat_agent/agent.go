@@ -421,7 +421,7 @@ func (a *Agent) SetLaodengConfig(cfg *config.LaodengConfig) {
 
 // SetD1Config 注入 D1 软加成配置（C1）：负面硬 veto + 高分软加成（线程安全）。
 // 当 D1 分达到加成门槛时，对非 N 战法总分进行软加成，让强事件股越过买入门槛。
-// 负面 D1（Blocked）会硬 veto 该股票。
+// §NEWS-GATE 2026-11-12：负面 D1（Score<0，明确利空）会硬 veto 该股票（原 Blocked 布尔改为负分语义）。
 // 参数：
 //   - cfg: D1 配置，包含 BoostWeight、BoostThreshold 等参数
 func (a *Agent) SetD1Config(cfg *config.D1Config) {
@@ -938,14 +938,12 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	if ds, ok := input.D1Scores[code]; ok {
 		d1 = &ds
 	}
-	// §W5-v3 LLM 解耦（owner 口径）：负面过滤不再硬拦截任何战法的信号产生——
-	// LLM 打分对非 N 战法只做参考标注；Blocked 个股的信号照常产出，
-	// 在 evalAll 收尾统一追加 "⚠️LLM利空提示" 到 Reason，由执行层利空冷却守卫把关真金下单。
+	// §W5-v3 LLM 解耦（owner 口径）+ §NEWS-GATE 2026-11-12 带符号化：D1<0（明确利空）的
+	// 个股信号照常产出（只做参考标注），拦截职责移交买入侧 news gate（engine 层一票否决）。
 	// N 形自身的 D1 硬闸不受影响（scorer 内部实现）。此处仅保留打分占位与日志。
-	// English: §W5-v3 LLM decoupling — the negative filter no longer vetoes signal generation for
-	// non-N strategies; blocked stocks still produce signals annotated with an LLM-caution suffix,
-	// while real-money protection moves to the execution-layer fresh-bearish guard.
-	llmBlocked := d1 != nil && d1.Blocked
+	// English: §W5-v3 LLM decoupling + §NEWS-GATE signed scale — stocks with D1<0 still produce
+	// signals (annotated only); vetoing moved to the engine-level buy-side news gate.
+	llmBlocked := d1 != nil && d1.Score < 0
 	if llmBlocked {
 		if input.Scores == nil {
 			input.Scores = make(map[string]StockScores)
@@ -1054,7 +1052,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		// English: C1 D1 soft boost — for non-N strategies, a D1 score above the boost threshold
 		// multiplies the total by (1+BoostWeight×D1/40), capped at 100, then re-derives pass/level so a
 		// strong-event stock clears its buy gate. N-shape already has its own D1 hard gate and is skipped.
-		if runner.Type != strategy.SignalNShape && d1 != nil && !d1.Blocked {
+		if runner.Type != strategy.SignalNShape && d1 != nil && d1.Score >= 0 {
 			a.applyD1Boost(runner.Type, eval, d1)
 		}
 		// N 形候选：推进一突/二突日内状态机，并尊重 D 硬闸 + 总分门槛。
@@ -1344,10 +1342,11 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	}
 	log.Printf("[combat_agent] 评分 %s(%s) 龙=%.0f 双=%.0f N=%.0f 回=%.0f 动量=%.0f 命中=%v%s",
 		code, md.Name, sc.DragonScore, sc.DoubleBumpScore, sc.NScore, sc.DragonReturnScore, sc.MomentumScore, sc.SignalActive, unSigNote)
-	// §W5-v3 LLM 参考标注收口：非 N 战法信号统一携带 d1_ref 参考分（Meta，浮点）；
-	// Blocked 个股在 Reason 尾部追加"⚠️LLM利空提示"——信息不丢，但不改写级别、不拦截信号。
-	// English: §W5-v3 — non-N signals carry a d1_ref reference score; blocked stocks get an
-	// LLM-caution suffix on Reason without any level rewrite or veto.
+	// §W5-v3 LLM 参考标注收口：非 N 战法信号统一携带 d1_ref 参考分（Meta，浮点，带符号）；
+	// D1<0（明确利空）个股在 Reason 尾部追加"⚠️LLM利空提示"——信息不丢，但不改写级别、
+	// 不在生成层拦截（拦截在买入侧 news gate，engine 层）。
+	// English: §W5-v3 — non-N signals carry a signed d1_ref reference score; D1<0 stocks get an
+	// LLM-caution suffix on Reason without any level rewrite (veto lives in the engine news gate).
 	if len(sigs) > 0 {
 		for i := range sigs {
 			if sigs[i].StrategyType == string(strategy.SignalNShape) {
@@ -1534,7 +1533,7 @@ func (a *Agent) applyD1Boost(t strategy.SignalType, eval *strategy.Evaluation, d
 	a.mu.RLock()
 	cfg := a.d1Boost
 	a.mu.RUnlock()
-	if d1 == nil || d1.Blocked {
+	if d1 == nil || d1.Score < 0 { // §NEWS-GATE：负分（明确利空）不做加成，只留参考
 		return
 	}
 	if eval.Details == nil {

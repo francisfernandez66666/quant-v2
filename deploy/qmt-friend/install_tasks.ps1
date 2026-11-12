@@ -53,6 +53,10 @@ $T5 = "QMTF-Carrier-Update"
 # 第六条：网关纯拉起任务（与 QMTF-Client-Start 同形——只负责把进程拉起来，不随会话亡）。
 #   看门狗 GatewayEnsure 与装填器 enroll 都经它拉起网关；自身无交易日闸门。
 $T6 = "QMTF-Gateway-Start"
+# 第七条（§NEWS-GATE 2026-11-12 owner 裁决：盘中拉取走计划任务）：09:30–15:00 每 10 分钟
+# 跑 carrier_run.ps1 -Intraday —— carrier_updater --intraday 只投递带 intraday_priority 的
+# 反转清单（普通版本推进留给 15:40 班次），投递即有序重启客户端（owner 已勾「重启自动运行」）。
+$T7 = "QMTF-Carrier-Update-Intraday"
 
 function Tr($mode) {
     return ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Mode {2} -GatewayDir "{3}"' -f `
@@ -60,7 +64,7 @@ function Tr($mode) {
 }
 
 if ($Uninstall) {
-    foreach ($t in @($T1, $T2, $T3, $T4, $T5, $T6)) {
+    foreach ($t in @($T1, $T2, $T3, $T4, $T5, $T6, $T7)) {
         if (-not $Apply) {
             Write-Host ("WOULD_DELETE task={0}" -f $t)
             continue
@@ -83,6 +87,9 @@ $jobs = @(
              $PsExe, (Join-Path $PSScriptRoot "start_gateway.ps1"), $GatewayDir) },
     @{ Name = $T5; Sc = "DAILY"; St = "15:40"; It = $false;
        Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f `
+             $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) },
+    @{ Name = $T7; Sc = "MINUTE"; Mn = 10; St = "09:30"; Et = "15:00"; It = $false;
+       Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Intraday' -f `
              $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) }
 )
 
@@ -91,7 +98,10 @@ $carrierRun = Join-Path $GatewayDir "carrier_run.ps1"
 $carrierRunSrc = @'
 # carrier_run.ps1 - run carrier_updater once; python path comes from friend.env
 # (schtasks /TR is capped at 261 chars, so the python path must NOT be inline)
-param([string]$GatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway")
+# §NEWS-GATE 2026-11-12: -Intraday -> carrier_updater --intraday (only applies manifests
+# flagged intraday_priority, i.e. reversal-triggered mid-day re-bakes; normal promotion
+# stays with the 15:40 shift).
+param([string]$GatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway", [switch]$Intraday)
 $envFile = Join-Path $GatewayDir "friend.env"
 $py = "python"
 if (Test-Path $envFile) {
@@ -101,9 +111,11 @@ if (Test-Path $envFile) {
 }
 $cu = Join-Path $GatewayDir "carrier_updater.py"
 $cfg = Join-Path $GatewayDir "config.xt.json"
+$extra = @()
+if ($Intraday) { $extra += "--intraday" }
 $eap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-$out = & $py $cu --once --config $cfg 2>&1
+$out = & $py $cu --once $extra --config $cfg 2>&1
 $ErrorActionPreference = $eap
 $out | ForEach-Object { Write-Host $_ }
 exit $LASTEXITCODE
@@ -136,6 +148,7 @@ foreach ($j in $jobs) {
     if ($j.Sc -eq "MINUTE") {
         $args1 += @("/MO", $j.Mn)
         if ($j.St) { $args1 += @("/ST", $j.St) }   # 保活腿：08:25 起跑，之后每 10 分钟一轮
+        if ($j.Et) { $args1 += @("/ET", $j.Et) }   # §NEWS-GATE T7：09:30–15:00 盘中窗口
     }
     if ($j.It) { $args1 += "/IT" }   # 交互式：客户端必须有桌面会话
     $args1 += "/F"
@@ -147,10 +160,10 @@ foreach ($j in $jobs) {
     Write-Host ("CREATED task={0}" -f $j.Name)
 }
 
-# 注册后复读自证：六个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
+# 注册后复读自证：七个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
 if ($Apply) {
     $missing = @()
-    foreach ($n in @($T1, $T2, $T3, $T4, $T5, $T6)) {
+    foreach ($n in @($T1, $T2, $T3, $T4, $T5, $T6, $T7)) {
         $found = schtasks /Query /TN $n 2>$null
         if (-not $found) { $missing += $n }
     }
@@ -158,7 +171,7 @@ if ($Apply) {
         Write-Host ("TASKS_RESULT=ABORT reason=reread_missing tasks={0}" -f ($missing -join ","))
         exit 2
     }
-    Write-Host "TASKS_REREAD_MATCH=1 tasks=6"
+    Write-Host "TASKS_REREAD_MATCH=1 tasks=7"
 }
 
 Write-Host ("TASKS_RESULT={0}" -f $(if ($Apply) { "INSTALLED" } else { "DRYRUN" }))

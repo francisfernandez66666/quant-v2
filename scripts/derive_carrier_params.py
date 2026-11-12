@@ -526,6 +526,10 @@ CARRIER_OWNED = {
     "buy_signals": "carrier-shape: 载体侧参与买法的信号名清单",
     "closed_days": "carrier-shape: 日历兜底表（真源是 Go 产的 trading_calendar.json）",
     "non_trading_weekdays": "carrier-shape: 同上",
+    # §NEWS-GATE（2026-11-12 owner 裁决 R5/R10/R12）：三枚 gz 烘焙链运行态键（不派生值）。
+    "news_weight_boost": "carrier-shape: 资讯因子加权系数（rules_factor NEWS_WEIGHT_FACTORS 消费），gz 烘焙链写入",
+    "force_sell_boost": "snapshot-derived: 负分 D1 且当日持仓 → 卖出加速桶（carrier_hot_reload_gz 每次重算覆盖）",
+    "news_gate": "snapshot-derived: 负分个股名单（分值闸双保险的名单面，carrier_hot_reload_gz 写入）",
 }
 
 # ---------------------------------------------------------------------------

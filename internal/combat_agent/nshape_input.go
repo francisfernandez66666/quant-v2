@@ -149,10 +149,11 @@ func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 func buildCtx(md *strategy_engine.StockMarketData, emotionPhase string, d1 *D1Score, eventDesc string, pe float64) *n_shape.Ctx {
 	ctx := &n_shape.Ctx{EmotionPhase: emotionPhase, EventDesc: eventDesc, StockPE: pe}
 	if d1 != nil {
-		// LLM 评分 0~40 直接作为 D1（calcD1 不再乘 MaxD1）；负面阻断标记透传
-		// The LLM 0~40 score is used directly as D1 (calcD1 no longer multiplies by MaxD1); the negative-block flag passes through.
+		// §NEWS-GATE 2026-11-12：带符号 D1（−40~+40）原样透传——负分=明确利空，
+		// 由 N 形 D1>0 硬闸与买入侧 news gate 消费（原 Blocked 布尔标记已废除）。
+		// English: signed D1 (−40~+40) passes through as-is — negative = explicit bearish,
+		// consumed by the N-shape D1>0 gate and the buy-side news gate (old Blocked flag removed).
 		ctx.LLMD1Score = d1.Score
-		ctx.LLMBlocked = d1.Blocked
 	}
 	if md != nil && len(md.KLines) >= 2 {
 		// 与 buildIntradayB 同口径：剔除今日未收盘K线。

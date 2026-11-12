@@ -43,20 +43,22 @@ const (
 )
 
 // assessSellFactor 判定单只个股的四项卖点因素并返回命中集合（未命中则空）。
-// 数据全部取自分池快照：事件面用 d1Scores（Blocked=负面过滤拦截），
+// 数据全部取自分池快照：事件面用 d1Scores（§NEWS-GATE 2026-11-12：Score<0 = 明确利空，
+// 原 Blocked 标记已废除，负分即清仓级事件卖点），
 // 行情面用 md 的日K/实时量价（破位/派发），动量用分钟 MACD 与动量分（衰竭）。
 // now 显式传入：派发判据依赖时段阈值折算，测试需要确定时刻（P4 缺陷2）。
 // English: judges the four sell factors for one stock and returns the tripped set (empty when none).
-// Event face uses d1Scores (Blocked = negative-filter interception); price face uses md's daily bars
+// Event face uses d1Scores (§NEWS-GATE 2026-11-12: Score<0 = explicit bearish; the old Blocked flag is
+// gone — a negative score IS the close-out-level event sell point); price face uses md's daily bars
 // and live quote (breakdown/distribution); momentum uses the minute MACD and the momentum score.
 // now is explicit: the distribution gate is time-of-day dependent, so tests pin the clock.
 func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Score, mScore float64, mThreshold float64, now time.Time) []sellSideFactor {
 	var factors []sellSideFactor
 
-	// 1. 利空D1：负面过滤拦截（立案/减持/质押/解禁等），属于事件面强卖点 → 清仓级
-	// English: bearish D1 — the negative filter blocked this stock (investigation/share-reduction/
-	// pledge/restricted-unlock…), a strong event-based sell point → close-out level.
-	if d1.Blocked {
+	// 1. 利空D1：D1<0（立案/减持/质押/解禁等明确利空，§NEWS-GATE 带符号制），属于事件面强卖点 → 清仓级
+	// English: bearish D1 — Score<0 under the signed scale (investigation/share-reduction/pledge/
+	// restricted-unlock…), a strong event-based sell point → close-out level.
+	if d1.Score < 0 {
 		factors = append(factors, sellSideFactor{
 			kind:   kindEvent,
 			level:  "清仓",

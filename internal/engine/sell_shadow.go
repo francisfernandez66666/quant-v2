@@ -244,7 +244,7 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account, book string, 
 			}
 			in.Evidence = append(in.Evidence, "利空归因:"+br)
 		}
-		if d1, ok := feed.D1Scores[code]; ok && d1.Blocked {
+		if d1, ok := feed.D1Scores[code]; ok && d1.Score < 0 { // §NEWS-GATE：负分=明确利空
 			bearHit = true
 			if !in.Bear.Hit {
 				in.Bear = signalctl.BearConfirm{Hit: true, Verified: verified}

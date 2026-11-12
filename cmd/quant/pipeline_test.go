@@ -507,8 +507,7 @@ func TestNShapeScorer(t *testing.T) {
 	}
 	ctx := &n_shape.Ctx{
 		LLMD1Score:  20, // D1 满分 0~40 制，直接采用 LLM 分
-		LLMBlocked:  false,
-		StockPE:     12, // < 15 → D3=20
+				StockPE:     12, // < 15 → D3=20
 		AvgDailyVol: 100000,
 	}
 

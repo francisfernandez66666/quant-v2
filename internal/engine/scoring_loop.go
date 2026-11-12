@@ -309,6 +309,19 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		sigs = nil
 	}
 
+	// §NEWS-GATE（2026-11-12）信号层一票否决+通用系数（R9/R5）：与主循环同口径——D1<0 或
+	// 板块强利空命中的买入信号在此统一拦截（改发利空拦截提醒），存留买入信号乘资讯系数。
+	// 位置在时段压制之后：emit 翻转/确认窗喂入/Upsert 固化三条消费链全部吃过滤结果。
+	// English: §NEWS-GATE — same unified buy veto + coefficient as the main loop, after the
+	// time-window suppression so flips/confirm-window feeds/pinning all consume the filtered set.
+	{
+		var gateAlerts []combat_agent.Signal
+		sigs, gateAlerts = e.applyNewsGate(sigs, d1Scores)
+		if len(gateAlerts) > 0 {
+			e.syncMessages(nil, nil, gateAlerts, nil, quotes)
+		}
+	}
+
 	// N 形候选诊断：收口本轮 N 候选的 D1/总分/级别/拦截原因，一眼定位"为何无 N 信号"
 	if nd := e.combatAgent.DrainNDiag(); len(nd) > 0 {
 		e.logNShapeDiag(emotionPhase, nd)
@@ -585,7 +598,7 @@ func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMar
 		// holds. But a RetryPending entry (Score=0 is a placeholder, not a real zero) must NOT tombstone:
 		// wait for the retry queue to re-score it via LLM next round.
 		if sig.Strategy == string(strategy.SignalNShape) {
-			if d, ok := d1Scores[sig.Code]; ok && d.Blocked == false && d.Score <= 0 && !d.RetryPending {
+			if d, ok := d1Scores[sig.Code]; ok && d.Score <= 0 && !d.RetryPending {
 				e.signalStore.Invalidate(sig.Code, sig.Strategy)
 				e.msgStore.Delete(sig.Code + "@交易信号@" + sig.Strategy)
 				log.Printf("[engine] 失效墓碑: %s(%s) n_shape 当前D1=0(无实质事件), 已移除信号", sig.Code, sig.Name)

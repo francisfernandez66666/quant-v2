@@ -21,6 +21,7 @@
 """
 
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -46,6 +47,10 @@ APPLIED = os.path.join(DATA_DIR, "applied_factors.json")
 SIGNALS_TODAY = os.path.join(DATA_DIR, "accounts", OWNER_UID, "signals_today.json")
 if not os.path.exists(SIGNALS_TODAY):
     SIGNALS_TODAY = os.path.join(DATA_DIR, "signals_today.json")
+# §NEWS-GATE 2026-11-12（R10/R11/R12）：脑侧资讯闸快照——烘焙唯一真源（取代旧
+# extract_bearish/bullish 的 signals 筛选）。文件由引擎每轮主循环刷新（day-keyed 原子写）。
+NEWS_GATE_TODAY = os.path.join(DATA_DIR, "accounts", OWNER_UID, "news_gate_today.json")
+HOTRELOAD_DB = os.environ.get("HOTRELOAD_DB", "/var/lib/quant-trading-v2/trading.db")
 
 SHORT_STRATEGY_TYPES = ("high_churn", "break_down", "leader_decay", "leader_decay_v2",
                         "good_news_fade")
@@ -177,7 +182,12 @@ def load_precalc():
 
 
 def extract_bearish():
-    """signals_today.json 的做空/利空归因 → 当日利空候选（空=保留上一版）。"""
+    """signals_today.json 的做空/利空归因 → 当日利空候选（空=保留上一版）。
+
+    §NEWS-GATE 2026-11-12（R12）：本函数降级为**回退源**——news_gate_today.json 当日新鲜时
+    烘焙一律走资讯闸快照（负分个股+板块负分，比信号筛选更细、归因更快）；快照缺失/过期
+    （引擎未跑/刚迁移）才回退本函数，绝不静默空清单。
+    """
     codes = []
     try:
         with open(SIGNALS_TODAY, "r", encoding="utf-8") as fh:
@@ -195,6 +205,102 @@ def extract_bearish():
             if len(c) == 6 and c.isdigit():
                 codes.append(c)
     return sorted(set(codes))
+
+
+def extract_held_codes():
+    """OWNER 当日持仓代码（trading.db real_positions 只读，qty>0）→ force_sell_boost 判定用。
+
+    表/列缺失或库不可读 → 空表（fail-open：退化为"负分全量加大卖出观察"，不下猛药）。
+    """
+    try:
+        import sqlite3
+        conn = sqlite3.connect("file:%s?mode=ro" % HOTRELOAD_DB, uri=True, timeout=5)
+        try:
+            cur = conn.execute(
+                "SELECT DISTINCT code FROM real_positions "
+                "WHERE user_id=? AND COALESCE(qty,0) > 0", (OWNER_UID,))
+            out = set()
+            for row in cur:
+                c = norm(row[0])
+                if len(c) == 6 and c.isdigit():
+                    out.add(c)
+            return out
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — 库缺表/锁繁忙都不阻断烘焙
+        print("HOTRELOAD_HELD_FALLBACK %s" % repr(exc)[:80])
+        return set()
+
+
+def extract_news_gate():
+    """§NEWS-GATE（R10/R11/R12）：读当日资讯闸快照，返回 None=不可用作真源（回退旧规则）。
+
+    返回 dict：
+      negative        个股负分代码（D1<0，明确利空）
+      sector_negative 板块级强利空映射代码（R4）
+      positive        {code:{score(0~100),source:"d1"}} 正分个股（≥16，利好池烘焙源）
+      force_sell      负分且当日持仓 → 烘 params.force_sell_boost（载体卖出加速）
+      reversal_events 盘中反转事件（R11；触发盒内拉取/重启编排与 SSH 兜底）
+    当日性：snap.day ≠ 今天 → None（昨日快照绝不留宿，与 load_precalc 同纪律）。
+    """
+    try:
+        with open(NEWS_GATE_TODAY, "r", encoding="utf-8") as fh:
+            snap = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(snap, dict):
+        return None
+    today = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
+    if str(snap.get("day") or "") != today:
+        return None
+    neg = sorted({norm(c) for c in (snap.get("negative_codes") or {})
+                  if isinstance(c, str) and len(norm(c)) == 6 and norm(c).isdigit()})
+    sec_neg = sorted({norm(c) for c in (snap.get("sector_negative_codes") or {})
+                      if isinstance(c, str) and len(norm(c)) == 6 and norm(c).isdigit()})
+    positive = {}
+    for c, score in (snap.get("positive_codes") or {}).items():
+        cc = norm(c)
+        try:
+            s = float(score)
+        except (TypeError, ValueError):
+            continue
+        if len(cc) == 6 and cc.isdigit() and s > 0:
+            # 归一到 0~100（与旧 extract_bullish 的 conf×100 同尺度，hot_pool/concept_heat 消费端不变）
+            positive[cc] = {"score": int(round(s / 40 * 100)), "source": "d1"}
+    held = extract_held_codes()
+    neg_all = set(neg) | set(sec_neg)
+    force_sell = sorted(neg_all & held)
+    rev = snap.get("reversal_events") or []
+    return {"negative": neg, "sector_negative": sec_neg, "positive": positive,
+            "force_sell": force_sell, "reversal_events": rev if isinstance(rev, list) else []}
+
+
+def ssh_intraday_trigger(ver):
+    """§NEWS-GATE（R11）SSH 兜底腿：盘中反转发布后不等盒子的 10 分钟盘中班次，
+    直接经 WG 直连盒子触发一次 carrier_run.ps1 -Intraday（owner 裁决：计划任务主通道、
+    计划任务失败走 SSH——本函数与盘中班次互为冗余，updater 的 intraday 闸与幂等哈希
+    保证重复触发不会重复重启：已同版本时 up_to_date 直接返回）。
+    失败仅日志不阻断（下一班计划任务仍会接住）。"""
+    key = os.environ.get("BOX_SSH_KEY", "/home/ubuntu/.ssh/win_admin")
+    user = os.environ.get("BOX_SSH_USER", "57516")
+    host = os.environ.get("BOX_SSH_HOST", "10.77.0.2")
+    ps1 = os.environ.get("BOX_CARRIER_RUN",
+                         "C:\\qmt\\quant-trading-v2\\qmt_gateway\\carrier_run.ps1")
+    if not os.path.exists(key):
+        print("HOTRELOAD_SSH_SKIP reason=no_key path=%s" % key)
+        return
+    ps = ('powershell -NoProfile -ExecutionPolicy Bypass -File "%s" -Intraday' % ps1)
+    b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+           "-o", "StrictHostKeyChecking=accept-new", "-i", key,
+           "%s@%s" % (user, host), "powershell", "-NoProfile", "-EncodedCommand", b64]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        tail = (r.stdout + r.stderr).strip().splitlines()
+        print("HOTRELOAD_SSH_TRIGGER version=%s rc=%d %s" % (
+            ver, r.returncode, tail[-1][:160] if tail else ""))
+    except Exception as exc:  # noqa: BLE001 — 兜底腿失败不影响已发布产物
+        print("HOTRELOAD_SSH_TRIGGER_FAIL version=%s %s" % (ver, repr(exc)[:120]))
 
 
 def scrub(o):
@@ -293,8 +399,23 @@ def main():
         die("whitelist_empty")
     # sha 载荷必须包含当日利空归因（owner 17:35 每半小时一烘的配套）：否则
     # 「归因变了但白名单没变」会被 sha 闸拦成 NOTHING_TO_DO，利空清单永远烘不进载体。
-    bearish = extract_bearish()
-    bullish = extract_bullish()
+    # §NEWS-GATE 2026-11-12（R12）：真源换为资讯闸快照（负分个股+板块负分+正分 D1 +
+    # force_sell + 反转事件）；快照缺失/过期才回退旧 signals 筛选（绝不静默空清单）。
+    ng = extract_news_gate()
+    if ng is not None:
+        bearish = sorted(set(ng["negative"]) | set(ng["sector_negative"]))
+        bullish = ng["positive"]
+        force_sell = ng["force_sell"]
+        reversal_events = ng["reversal_events"]
+        print("HOTRELOAD_NEWS_GATE neg=%d sector_neg=%d pos=%d force_sell=%d reversal=%d" % (
+            len(ng["negative"]), len(ng["sector_negative"]), len(bullish),
+            len(force_sell), len(reversal_events)))
+    else:
+        bearish = extract_bearish()
+        bullish = extract_bullish()
+        force_sell = []
+        reversal_events = []
+        print("HOTRELOAD_NEWS_GATE_FALLBACK signals_filter neg=%d bullish=%d" % (len(bearish), len(bullish)))
     signal_pool = extract_signal_codes()
     precalc_meta, _precalc = load_precalc()
     # §BUCKETS-SHA-20261112：行业/概念桶内容纳入 sha——桶由 pregen 的回填腿维护，
@@ -309,6 +430,10 @@ def main():
         _bp = {}
     payload = json.dumps({"wl": wl, "rules": [r.get("id") for r in rules],
                           "bearish": bearish, "bullish": bullish,
+                          "force_sell": force_sell,
+                          "reversal": hashlib.sha256(json.dumps(
+                              reversal_events, ensure_ascii=True,
+                              sort_keys=True).encode()).hexdigest()[:16],
                           "signal_pool": signal_pool, "precalc": precalc_meta,
                           "buckets": {"industry": len(_bp.get("industry_map") or {}),
                                       "concept": len(_bp.get("concept_map") or {}),
@@ -354,6 +479,19 @@ def main():
     # 买入仍过全部 12 闸。QMT 用 get_full_tick 逐票拉取（非订阅），无订阅上限风险。
     pool = set(doc2["params"].get("symbols") or []) | set(signal_pool) | set(bullish) | set(extract_score_pool())
     doc2["params"]["symbols"] = sorted(pool)[:SIGNAL_POOL_MAX]
+    # §NEWS-GATE（R10）：负分且当日持仓 → params.force_sell_boost（ASCII 键值；每次烘焙
+    # **重算覆盖**——该桶语义是"当前持仓的利空票"，清空是正确状态而非数据丢失，与 risk_list
+    # 的"空=保旧"并集纪律刻意不同）。ng is None（快照缺失）时不改动该键（保旧）。
+    if ng is not None:
+        doc2["params"]["force_sell_boost"] = {
+            c: {"level": "boost"} for c in force_sell
+        }
+        doc2["params"]["news_gate"] = {
+            "negative": bearish, "updated_at": datetime.datetime.now().astimezone()
+            .isoformat(timespec="seconds"),
+        }
+    # §NEWS-GATE（R5）：资讯因子加权系数（rules_factor 的 NewsEvent 贡献乘子），旋钮经环境变量。
+    doc2["params"]["news_weight_boost"] = float(os.environ.get("NEWS_WEIGHT_BOOST", "2.0"))
     # §PRECALC（2026-11-11 owner 拍板）：盘前预计算因子并入 params——载体在缺历史序列的
     # 构建上用 precalc 替代 get_market_data_ex（均线参考/量比基线/近高近低），只有当日新鲜
     # 的文件才并入；并入与否都计入 sha（因子日变即重烘）。
@@ -412,9 +550,16 @@ def main():
         "updated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "request_state": "pending",
         "mode": "live",
+        # §NEWS-GATE（R11）：盘中反转事件存在 ⇒ 盒子盘中拉取班次（QMTF-Carrier-Update-Intraday）
+        # 允许在盘中投递+重启（否则盘中班次只记账不动客户端，重启窗口留给反转/收盘后班次）。
+        "intraday_priority": bool(reversal_events),
     }
     json.dump(manifest, open(os.path.join(manifest_dir, "carrier_manifest.json"), "w",
                              encoding="utf-8"), ensure_ascii=True, indent=2)
+
+    # §NEWS-GATE（R11）：盘中反转发布 → SSH 兜底立即触发盒子盘中拉取（不等 10 分钟班次）。
+    if reversal_events:
+        ssh_intraday_trigger(ver)
 
     with open(STATE, "w") as fh:
         fh.write(sha)

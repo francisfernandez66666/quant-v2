@@ -14,8 +14,8 @@ import (
 // onto signals, direction matching picks the corresponding bullish/bearish event title; signals without a D1 score stay unchanged.
 func TestEnrichSignalsWithD1(t *testing.T) {
 	d1s := map[string]combat_agent.D1Score{
-		"000001": {Code: "000001", Score: 0.8, Blocked: false, Reason: "中标海外储能大单"},
-		"000002": {Code: "000002", Score: 0.0, Blocked: true, Reason: "股东减持"},
+		"000001": {Code: "000001", Score: 0.8, Reason: "中标海外储能大单"},
+		"000002": {Code: "000002", Score: -40, Reason: "股东减持"},
 	}
 	briefs := map[string][]combat_agent.NewsBrief{
 		"000001": {{Title: "中标海外储能大单", Positive: true}},
@@ -37,8 +37,8 @@ func TestEnrichSignalsWithD1(t *testing.T) {
 	if sigs[0].D1Event != "中标海外储能大单" {
 		t.Fatalf("000001 应匹配利好事件标题, got %q", sigs[0].D1Event)
 	}
-	if sigs[1].D1Score != 0 || !sigs[1].D1Blocked || sigs[1].D1Reason != "股东减持" {
-		t.Fatalf("000002 D1 负面拦截未正确回填: %+v", sigs[1])
+	if sigs[1].D1Score != -40 || !sigs[1].D1Blocked || sigs[1].D1Reason != "股东减持" {
+		t.Fatalf("000002 D1 负分（明确利空）未正确回填: %+v", sigs[1])
 	}
 	if sigs[1].D1Event != "股东减持风险" {
 		t.Fatalf("000002 应匹配利空事件标题, got %q", sigs[1].D1Event)

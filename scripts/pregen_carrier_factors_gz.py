@@ -201,11 +201,17 @@ def bake_bakeables(symbol, params_doc):
                 out["flow_today_pct"] = round(mains[-1] / cap * 100.0, 4)
                 if len(mains) >= 2:
                     out["flow_5d_pct"] = round(sum(mains) / cap * 100.0, 4)
-    d1 = _q("SELECT score,blocked FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
+    d1 = _q("SELECT score FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
             (code6,))
-    if d1 and d1[0]:
-        score, blocked = d1[0]
-        out["news_event"] = 0.0 if blocked else float(score or 0.0)
+    # §NEWS-GATE 2026-11-12（R8/R12）：D1 改带符号分 [−40,+40] 原样烘入——负分=明确利空
+    # 直接下传（载体负分拒买闸与 NewsEvent 负带消费），不再 blocked→0 抹平（旧 Blocked 标记废除，
+    # d1_scores.blocked 列已由引擎按 score<0 派生，无需在此读）。0/缺行=无事件（中性，不烘键）。
+    if d1 and d1[0] and d1[0][0] is not None:
+        score = float(d1[0][0])
+        if score != 0:
+            out["news_event"] = score
+        if score < 0:
+            out["news_negative"] = True
     hp = (params_doc.get("hot_pool") or {}).get("bullish") or {}
     hit = hp.get(symbol) or hp.get(code6)
     if isinstance(hit, dict) and hit.get("score") is not None:

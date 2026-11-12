@@ -118,7 +118,12 @@ describe('§P2-H 全局 D1 面板：读回显 / 写载荷 / 读失败禁保存 /
     const api = await import('../api/index.js')
     expect(api.setD1Config.mock.calls.length).toBe(1)
     const payload = api.setD1Config.mock.calls[0][0]
-    expect(Object.keys(payload).sort()).toEqual(['boost_threshold', 'boost_weight', 'rules'])
+    // §NEWS-GATE 2026-11-12：面板扩资讯闸五键（disable/boost_good/negative_cap/sector_block/sector_score_min），
+    // 后端 D1Config 同批扩字段，键集契约同步升级为 8 键。
+    expect(Object.keys(payload).sort()).toEqual([
+      'boost_threshold', 'boost_weight', 'news_gate_boost_good', 'news_gate_disable',
+      'news_gate_negative_cap', 'news_gate_sector_block', 'news_gate_sector_score_min', 'rules',
+    ])
     expect(payload.boost_weight).toBe(0.15)
     expect(payload.boost_threshold).toBe(8)
     expect(payload.rules.map((r) => Object.keys(r).sort())).toEqual([['blocked', 'direction', 'score'], ['blocked', 'direction', 'score']])

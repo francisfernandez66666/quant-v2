@@ -269,7 +269,8 @@ func (f *FactorStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "nodata",
 			Details: map[string]float64{}, Reasons: map[string]string{"factor": "K线不足30根"}}, nil
 	}
-	series := seriesFromKLines(md.KLines, md.Fina)
+	// §NEWS-GATE（R7）：md.D1（带符号 −40~+40，evalFor 统一注入）随序列装配为 D1Event 因子输入。
+	series := seriesFromKLines(md.KLines, md.Fina, md.D1)
 
 	// 逐条启用规则各自独立打分，只保留原始分最高的一条作为本次结果（没有规则达标时也返回
 	// 最高分，由上层门槛决定放不放行）；最高分连同其规则存进 pending，
@@ -316,7 +317,16 @@ func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries)
 		// value normalized to an absolute range (no live cross-section available); price-volume factors use
 		// their time-series percentile.
 		var pct float64
-		if isFinancialFactor(df) {
+		if fid == "D1Event" {
+			// §NEWS-GATE 2026-11-12（R7）：D1 事件带符号分特例——绝对带打分（事件分本身
+			// 就是绝对量级，非时序分位）；负分/无事件**弃权**（利空的处置在信号层 news gate
+			// 一票否决，因子层绝不把负值混入凸组合）。
+			last := vals[len(vals)-1]
+			if math.IsNaN(last) || last <= 0 {
+				continue
+			}
+			pct = clamp01(last / 40)
+		} else if isFinancialFactor(df) {
 			last := vals[len(vals)-1]
 			if math.IsNaN(last) {
 				continue
@@ -489,7 +499,7 @@ func (f *FactorStrategy) ResetStats() {
 // English: builds a factorlib.StockSeries from daily bars + financials. Price/volume fields come from
 // daily bars; financial fields (ROE/YoyNetProfit/margins/debt/EPS) come from md.Fina (latest report, 0
 // when missing), so financial factors (ROE quality / YoyNetProfit growth / SUE etc.) score live too.
-func seriesFromKLines(kl []data.KLine, fina *strategy_engine.FinancialData) *factorlib.StockSeries {
+func seriesFromKLines(kl []data.KLine, fina *strategy_engine.FinancialData, d1 float64) *factorlib.StockSeries {
 	n := len(kl)
 	s := &factorlib.StockSeries{Dates: make([]string, n)}
 	s.Open, s.High, s.Low, s.CloseHfq = make([]float64, n), make([]float64, n), make([]float64, n), make([]float64, n)
@@ -521,6 +531,13 @@ func seriesFromKLines(kl []data.KLine, fina *strategy_engine.FinancialData) *fac
 	s.NetMargin = np
 	s.DebtToAssets = debt
 	s.Eps = eps
+	// §NEWS-GATE（R7）：D1 事件带符号分单日常量列；0（无事件/未评）一律 NaN（弃权语义，
+	// 与「无事件≠0 分有效输入」的 D1 口径一致，负分拦截职责在信号层 news gate）。
+	if d1 != 0 {
+		s.D1 = constant(n, d1)
+	} else {
+		s.D1 = nanSlice(n)
+	}
 	for i, k := range kl {
 		s.Dates[i] = k.Date.Format("20060102")
 		s.Open[i], s.High[i], s.Low[i], s.CloseHfq[i] = k.Open, k.High, k.Low, k.Close

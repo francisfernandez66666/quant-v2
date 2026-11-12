@@ -157,7 +157,7 @@ func main() {
 	} else {
 		fmt.Println("  未配置 LLM_API_KEY → D1 利好种子分(仅测行情+评分链路耗时)")
 		for _, c := range codes {
-			d1s[c] = combat_agent.D1Score{Code: c, Score: 0.8, Blocked: false, Reason: "模拟:利好消息"}
+			d1s[c] = combat_agent.D1Score{Code: c, Score: 0.8, Reason: "模拟:利好消息"}
 		}
 	}
 

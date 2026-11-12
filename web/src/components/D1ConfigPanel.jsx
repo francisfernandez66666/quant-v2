@@ -62,6 +62,12 @@ export default function D1ConfigPanel() {
   const [rows, setRows] = useState([])
   const [boostWeight, setBoostWeight] = useState(null)
   const [boostThreshold, setBoostThreshold] = useState(null)
+  // §NEWS-GATE 2026-11-12 资讯闸旋钮（owner §6 裁决定稿；数字缺失≠0，同上面纪律）
+  const [newsGateDisable, setNewsGateDisable] = useState(false)
+  const [newsGateBoostGood, setNewsGateBoostGood] = useState(null)
+  const [newsGateNegativeCap, setNewsGateNegativeCap] = useState(null)
+  const [newsGateSectorBlock, setNewsGateSectorBlock] = useState(true)
+  const [newsGateSectorScoreMin, setNewsGateSectorScoreMin] = useState(null)
   // 加载三态：loading / loaded / error（error 禁保存，同 §N-4 战法参数口径）
   const [loadState, setLoadState] = useState('loading')
   const [loadError, setLoadError] = useState('')
@@ -74,7 +80,10 @@ export default function D1ConfigPanel() {
   // 当前编辑态的序列化形式（与后端提交体同形，dirty 比对只用这一份）
   const snapshot = useCallback(() => JSON.stringify({
     rules: toRules(rows), boost_weight: boostWeight, boost_threshold: boostThreshold,
-  }), [rows, boostWeight, boostThreshold])
+    news_gate_disable: newsGateDisable, news_gate_boost_good: newsGateBoostGood,
+    news_gate_negative_cap: newsGateNegativeCap, news_gate_sector_block: newsGateSectorBlock,
+    news_gate_sector_score_min: newsGateSectorScoreMin,
+  }), [rows, boostWeight, boostThreshold, newsGateDisable, newsGateBoostGood, newsGateNegativeCap, newsGateSectorBlock, newsGateSectorScoreMin])
 
   // 读取全局 D1 配置（初始化与「重载」共用同一口径，避免两处各写一遍而分叉）
   async function load() {
@@ -89,11 +98,22 @@ export default function D1ConfigPanel() {
       const nextRows = toRows(cfg.rules)
       const nextWeight = Number.isFinite(Number(cfg.boost_weight)) ? Number(cfg.boost_weight) : null
       const nextThreshold = Number.isFinite(Number(cfg.boost_threshold)) ? Number(cfg.boost_threshold) : null
+      const nextBoostGood = Number.isFinite(Number(cfg.news_gate_boost_good)) ? Number(cfg.news_gate_boost_good) : null
+      const nextNegCap = Number.isFinite(Number(cfg.news_gate_negative_cap)) ? Number(cfg.news_gate_negative_cap) : null
+      const nextSectorMin = Number.isFinite(Number(cfg.news_gate_sector_score_min)) ? Number(cfg.news_gate_sector_score_min) : null
       setRows(nextRows)
       setBoostWeight(nextWeight)
       setBoostThreshold(nextThreshold)
+      setNewsGateDisable(!!cfg.news_gate_disable)
+      setNewsGateBoostGood(nextBoostGood)
+      setNewsGateNegativeCap(nextNegCap)
+      setNewsGateSectorBlock(cfg.news_gate_sector_block !== false) // 缺省=true（后端默认板块级也拒买）
+      setNewsGateSectorScoreMin(nextSectorMin)
       setBaseline(JSON.stringify({
         rules: toRules(nextRows), boost_weight: nextWeight, boost_threshold: nextThreshold,
+        news_gate_disable: !!cfg.news_gate_disable, news_gate_boost_good: nextBoostGood,
+        news_gate_negative_cap: nextNegCap, news_gate_sector_block: cfg.news_gate_sector_block !== false,
+        news_gate_sector_score_min: nextSectorMin,
       }))
       setEffectiveSource(typeof cfg.effective_source === 'string' ? cfg.effective_source : '')
       setLoadState('loaded')
@@ -122,13 +142,22 @@ export default function D1ConfigPanel() {
       if (!String(r.direction || '').trim()) missing.push(`规则 #${i + 1} 方向`)
       if (!Number.isFinite(Number(r.score))) missing.push(`规则 #${i + 1} 得分`)
     })
+    // §NEWS-GATE 资讯闸数字旋钮同样「缺失≠0」：未读回/未填不给默认值提交
+    if (!Number.isFinite(Number(newsGateBoostGood))) missing.push('资讯系数上限')
+    if (!Number.isFinite(Number(newsGateNegativeCap))) missing.push('强制负分上限')
+    if (!Number.isFinite(Number(newsGateSectorScoreMin))) missing.push('板块利空阈值')
     if (missing.length) {
       showToast(`以下 D1 字段缺失，禁止保存（缺失≠0，请补齐或点「重载」）：${missing.slice(0, 4).join('、')}${missing.length > 4 ? ` 等 ${missing.length} 项` : ''}`, 'error')
       return
     }
     setSaving(true)
     try {
-      const res = await api.setD1Config({ rules: toRules(rows), boost_weight: Number(boostWeight), boost_threshold: Number(boostThreshold) })
+      const res = await api.setD1Config({
+        rules: toRules(rows), boost_weight: Number(boostWeight), boost_threshold: Number(boostThreshold),
+        news_gate_disable: newsGateDisable, news_gate_boost_good: Number(newsGateBoostGood),
+        news_gate_negative_cap: Number(newsGateNegativeCap), news_gate_sector_block: newsGateSectorBlock,
+        news_gate_sector_score_min: Number(newsGateSectorScoreMin),
+      })
       const ignored = Array.isArray(res && res.ignored_keys) ? res.ignored_keys : []
       if (ignored.length) {
         // 稀疏 merge 会把未知键如实回报而不是静默吞掉：出现即说明前端契约漂了，必须当场可见
@@ -206,6 +235,33 @@ export default function D1ConfigPanel() {
       <div style={rowStyle}>
         <span style={labelStyle} title="D1 分（0~40）低于该值不做加成">加成门槛</span>
         <InputNumber value={boostThreshold} onChange={setBoostThreshold} step={1} theme="column" placeholder="如 8" disabled={loadState !== 'loaded'} />
+      </div>
+
+      {/* §NEWS-GATE 2026-11-12 资讯闸旋钮（D1 带符号 −40~+40；owner 裁决 R4/R5/R6/R8/R9） */}
+      <div style={{ fontWeight: 600, margin: '10px 0 4px' }}>资讯闸（D1 带符号分：正=利好强度，负=明确利空）</div>
+      <div style={rowStyle}>
+        <span style={labelStyle} title="关闭后负分不再拦截买入、正分不再加权">资讯闸总开关</span>
+        <ToggleSw checked={!newsGateDisable} onChange={(v) => setNewsGateDisable(!v)} disabled={loadState !== 'loaded'} />
+        <span style={{ fontSize: 12, color: 'var(--app-muted-2)' }}>{newsGateDisable ? '已关闭' : '开启中'}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle} title="存留买入信号置信度 ×(1+系数×D1/40)，D1=40 时达到上限">资讯系数上限</span>
+        <InputNumber value={newsGateBoostGood} onChange={setNewsGateBoostGood} step={0.05} theme="column" placeholder="如 0.25" disabled={loadState !== 'loaded'} />
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle} title="负面过滤强制负分的绝对值上限（与正向档位对称）">强制负分上限</span>
+        <InputNumber value={newsGateNegativeCap} onChange={setNewsGateNegativeCap} step={5} theme="column" placeholder="如 40" disabled={loadState !== 'loaded'} />
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle} title="板块级强利空（事件分≤阈值）映射成分股同样拒买">板块级也拒买</span>
+        <ToggleSw checked={newsGateSectorBlock} onChange={setNewsGateSectorBlock} disabled={loadState !== 'loaded'} />
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle} title="newsagent 利空事件 Score ≤ 本值才算板块级强利空（默认 -0.5）">板块利空阈值</span>
+        <InputNumber value={newsGateSectorScoreMin} onChange={setNewsGateSectorScoreMin} step={0.25} theme="column" placeholder="如 -0.5" disabled={loadState !== 'loaded'} />
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--app-muted-2)', margin: '2px 0 6px' }}>
+        D1&lt;0（明确利空）的个股买入信号会被一票否决并改发「利空拦截」提醒（持仓票升格清仓级）；盘中持仓票跨阈值反转将触发重烘+QMT 重启（防抖 3 轮 / 每日 8 次 / 冷却 30 分钟，不可调）。
       </div>
 
       {/* 规则表：direction=事件方向/关键词标签，score=匹配得分，blocked=负面阻断标记 */}

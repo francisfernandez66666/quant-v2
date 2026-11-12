@@ -21505,6 +21505,190 @@ grep -qF 'fetchHithinkKey' web/src/pages/Research.jsx \
 [ "$B175_FAILED" = "0" ] || exit 1
 echo "ok - §175 §20261112-CLOSEOUT 锁通过（交易信号判据/0行过滤/账户隔离/外脑按日/队列治理/保活/退避/行业桶/math+gap/监视池600/发布链/hithink入口 + 4 用例在册，累计判定点 ${CNT175}）"
 
+# §176 §NEWS-GATE-D1-SIGNED（2026-11-12 收口批：D1 带符号化 + 资讯闸 + 盘中反转链，
+# docs/PLAN_D1_SIGNED_NEWS_GATE_20261112.md，owner 六轮裁决 R1-R12）。
+echo "==> 176 §NEWS-GATE-D1-SIGNED（D1带符号/负分拦截/板块否决/通用系数/D1Event因子/烘焙换源/force_sell/盘中反转链/盘中班次/对账登记/设置页）..."
+B176_FAILED=0
+CNT176=0
+fail176() {
+	echo "--- FAIL: §176 $*"
+	FAIL=1
+	B176_FAILED=1
+}
+# —— ① D1 带符号化（R8）：钳位 [−40,+40] / 对称提示词 / Blocked 字段废除 ——
+CNT176=$((CNT176 + 1))
+grep -qF 'if r.Score < -40 {' internal/combat_agent/d1_scorer.go \
+	|| fail176 "D1 钳位未带符号（缺 -40 下界）"
+CNT176=$((CNT176 + 1))
+grep -qF '"score":-40~40' internal/combat_agent/d1_scorer.go \
+	|| fail176 "D1 提示词未改带符号对称制"
+CNT176=$((CNT176 + 1))
+grep -qF 'json:"blocked"' internal/combat_agent/d1_scorer.go \
+	&& fail176 "D1Score.Blocked 字段未删除（owner R8：拦截标记废除）"
+CNT176=$((CNT176 + 1))
+grep -qF 'Score: 0, Blocked' internal/combat_agent/d1_scorer.go \
+	&& fail176 "d1_scorer 仍残留 Blocked 结构字面量"
+# —— ② 拦截语义改负分判据（R9）——
+CNT176=$((CNT176 + 1))
+grep -qF 'if d1.Score < 0 {' internal/combat_agent/sell_side.go \
+	|| fail176 "卖点评估利空清仓未改 Score<0 判据"
+CNT176=$((CNT176 + 1))
+grep -qF 'llmBlocked := d1 != nil && d1.Score < 0' internal/combat_agent/agent.go \
+	|| fail176 "combat_agent 利空参考标注未改负分判据"
+CNT176=$((CNT176 + 1))
+grep -qF 'if d1 == nil || d1.Score < 0 { // §NEWS-GATE：负分（明确利空）不做加成，只留参考' internal/combat_agent/agent.go \
+	|| fail176 "applyD1Boost 未按负分弃权"
+CNT176=$((CNT176 + 1))
+grep -qF 'd.Score <= 0 && !d.RetryPending' internal/engine/scoring_loop.go \
+	|| fail176 "invalidateBrokenSignals 未把负分纳入作废判据"
+CNT176=$((CNT176 + 1))
+grep -qF 'd1.Score < 0 { // §NEWS-GATE：负分=明确利空' internal/engine/sell_shadow.go \
+	|| fail176 "卖出影子未按负分判定利空"
+CNT176=$((CNT176 + 1))
+grep -qF 'Blocked: d.Score < 0, Reason: d.Reason' internal/engine/engine.go \
+	|| fail176 "d1_scores 落库未按 Score<0 派生 blocked 列（历史兼容语义）"
+CNT176=$((CNT176 + 1))
+grep -qF 's.D1Blocked = d1.Score < 0' internal/engine/engine.go \
+	|| fail176 "信号 D1Blocked 回填未改 Score<0 派生"
+# —— ③ N 形（R8）：YAML 负面过滤→强制负分顶格；ctx 带符号透传 ——
+CNT176=$((CNT176 + 1))
+grep -qF 'return -40, []string{mr.BlockReason}, false' internal/strategies/n_shape/scorer.go \
+	|| fail176 "N 形 YAML 负面过滤未改强制负分 -40"
+CNT176=$((CNT176 + 1))
+grep -qF 'if ctx.LLMD1Score < 0 {' internal/strategies/n_shape/scorer.go \
+	|| fail176 "N 形 calcD1 未按带符号负分传导"
+CNT176=$((CNT176 + 1))
+grep -qF 'ctx.LLMBlocked' internal/combat_agent/nshape_input.go \
+	&& fail176 "buildCtx 仍在写 LLMBlocked（字段已废除）"
+# —— ④ 资讯闸旋钮（R6）：D1Config 扩展 + 归一化访问器 ——
+CNT176=$((CNT176 + 1))
+grep -qF 'news_gate_disable,omitempty' internal/config/config.go \
+	|| fail176 "NewsGateDisable 旋钮未登记"
+CNT176=$((CNT176 + 1))
+grep -qF 'news_gate_boost_good,omitempty' internal/config/config.go \
+	|| fail176 "NewsGateBoostGood 旋钮未登记"
+CNT176=$((CNT176 + 1))
+grep -qF 'func (d *D1Config) Normalized() *D1Config {' internal/config/config.go \
+	|| fail176 "D1Config.Normalized 访问器缺失（读侧默认值填充）"
+# —— ⑤ engine news gate（R9/R5/R10/R11）——
+CNT176=$((CNT176 + 1))
+grep -qF 'func (e *Engine) applyNewsGate' internal/engine/news_gate.go \
+	|| fail176 "资讯闸一票否决+通用系数函数缺失"
+CNT176=$((CNT176 + 1))
+grep -qF 'newsGateRestartCap      = 8' internal/engine/news_gate.go \
+	|| fail176 "盘中重启上限未钉 8 次/日（owner §6 裁决）"
+CNT176=$((CNT176 + 1))
+grep -qF 'newsGateCooldown        = 30 * time.Minute' internal/engine/news_gate.go \
+	|| fail176 "冷却期未钉 30 分钟（owner §6 裁决）"
+CNT176=$((CNT176 + 1))
+grep -qF 'newsGateDebounceStrikes = 3' internal/engine/news_gate.go \
+	|| fail176 "反转防抖未钉 3 轮（owner §6 裁决）"
+CNT176=$((CNT176 + 1))
+grep -qF 'news_gate_today.json' internal/engine/engine.go \
+	|| fail176 "资讯闸快照落盘路径未装配"
+CNT176=$((CNT176 + 1))
+grep -qF 'e.refreshNewsGate(d1Scores, verifiedBear, events)' internal/engine/engine.go \
+	|| fail176 "主循环未接线资讯闸快照刷新"
+CNT176=$((CNT176 + 1))
+grep -qF 'sigs, gateAlerts = e.applyNewsGate(sigs, d1Scores)' internal/engine/scoring_loop.go \
+	|| fail176 "近实时循环未过资讯闸"
+CNT176=$((CNT176 + 1))
+grep -qF 'bullSignals, gateAlerts = e.applyNewsGate(bullSignals, d1Scores)' internal/engine/engine.go \
+	|| fail176 "主循环信号流未过资讯闸"
+CNT176=$((CNT176 + 1))
+grep -qF 'func TestNewsGateVetoAndBoost' internal/engine/news_gate_test.go \
+	|| fail176 "资讯闸否决/系数用例缺失"
+CNT176=$((CNT176 + 1))
+grep -qF 'func TestNewsGateReversalDebounce' internal/engine/news_gate_test.go \
+	|| fail176 "盘中反转防抖用例缺失"
+# —— ⑥ D1Event 因子（R7）：注册 / 绝对带打分 / 注入链 ——
+CNT176=$((CNT176 + 1))
+grep -qF 'ID:   "D1Event"' internal/factor/d1_event.go \
+	|| fail176 "D1Event 因子未注册（D1 彻底因子化）"
+CNT176=$((CNT176 + 1))
+grep -qF 'pct = clamp01(last / 40)' internal/strategies/factor/factor.go \
+	|| fail176 "因子战法未按绝对带打 D1 分"
+CNT176=$((CNT176 + 1))
+grep -qF 'series := seriesFromKLines(md.KLines, md.Fina, md.D1)' internal/strategies/factor/factor.go \
+	|| fail176 "因子战法序列未装配 D1 列"
+CNT176=$((CNT176 + 1))
+grep -qF 'md.D1 = d1.Score' internal/combat_agent/adapter.go \
+	|| fail176 "evalFor 未把带符号 D1 注入行情快照"
+CNT176=$((CNT176 + 1))
+grep -qF 'D1 []float64 // 当日 D1 事件分（带符号；缺失 NaN）' internal/factor/factor.go \
+	|| fail176 "StockSeries 缺 D1 列"
+# —— ⑦ 烘焙链换源（R12）：快照真源 / force_sell / 反转事件 / 回退源 ——
+CNT176=$((CNT176 + 1))
+grep -qF 'def extract_news_gate():' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "烘焙链未接资讯闸快照真源（R12 取代旧规则）"
+CNT176=$((CNT176 + 1))
+grep -qF 'HOTRELOAD_NEWS_GATE_FALLBACK signals_filter' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "快照缺失回退源日志缺失（绝不静默空清单）"
+CNT176=$((CNT176 + 1))
+grep -qF 'doc2["params"]["force_sell_boost"] = {' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "force_sell_boost 卖出加速桶未烘焙（R10）"
+CNT176=$((CNT176 + 1))
+grep -qF '"intraday_priority": bool(reversal_events)' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "manifest 未带 intraday_priority（盘中班次闸的开关面）"
+CNT176=$((CNT176 + 1))
+grep -qF 'if reversal_events:' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "反转发布后未触发 SSH 兜底（R11 计划任务失败走 SSH）"
+CNT176=$((CNT176 + 1))
+grep -qF 'def ssh_intraday_trigger' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "SSH 兜底触发函数缺失"
+CNT176=$((CNT176 + 1))
+grep -qF 'doc2["params"]["news_weight_boost"] = float(os.environ.get("NEWS_WEIGHT_BOOST", "2.0"))' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "资讯因子加权系数未烘入 params"
+CNT176=$((CNT176 + 1))
+grep -qF 'out["news_negative"] = True' scripts/pregen_carrier_factors_gz.py \
+	|| fail176 "pregen 未烘带符号 D1 负分标记"
+CNT176=$((CNT176 + 1))
+grep -qF 'SELECT score FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1' scripts/pregen_carrier_factors_gz.py \
+	|| fail176 "pregen 仍读 blocked 列（带符号化后只取 score）"
+# —— ⑧ 载体（R3/R9/R10）：分值闸 / 卖出加速 / 加权 ——
+CNT176=$((CNT176 + 1))
+grep -qF '"reason": "d1_negative"' qmt_gateway/qmt_internal_strategy.py \
+	|| fail176 "载体买入链缺负分拒买闸"
+CNT176=$((CNT176 + 1))
+grep -qF '_boosted_sell' qmt_gateway/qmt_internal_strategy.py \
+	|| fail176 "载体卖出加速（force_sell_boost 豁免当日去重）缺失"
+CNT176=$((CNT176 + 1))
+grep -qF 'NEWS_WEIGHT_FACTORS = frozenset({"NewsEvent"})' qmt_gateway/rules_factor.py \
+	|| fail176 "资讯因子加权清单缺失"
+CNT176=$((CNT176 + 1))
+grep -qF 'contrib *= float(params.get("news_weight_boost", 2.0) or 2.0)' qmt_gateway/rules_factor.py \
+	|| fail176 "NewsEvent 贡献未乘加权系数"
+# —— ⑨ 盒子盘中班次（R11）：updater 闸 / 第七条计划任务 ——
+CNT176=$((CNT176 + 1))
+grep -qF 'self.intraday and manifest.get("intraday_priority") is not True' qmt_gateway/carrier_updater.py \
+	|| fail176 "updater 盘中班次闸缺失（普通版本不许盘中重启）"
+CNT176=$((CNT176 + 1))
+grep -qF 'CARRIER_INTRADAY_SKIP' qmt_gateway/carrier_updater.py \
+	|| fail176 "盘中跳过判读锚缺失"
+CNT176=$((CNT176 + 1))
+grep -qF 'QMTF-Carrier-Update-Intraday' deploy/qmt-friend/install_tasks.ps1 \
+	|| fail176 "第七条盘中拉取计划任务缺失"
+CNT176=$((CNT176 + 1))
+grep -qF 'tasks=7' deploy/qmt-friend/install_tasks.ps1 \
+	|| fail176 "计划任务复读自证未升级为 7 条"
+CNT176=$((CNT176 + 1))
+grep -qF '"{1}" -Intraday' deploy/qmt-friend/install_tasks.ps1 \
+	|| fail176 "carrier_run.ps1 未透传盘中旗标"
+# —— ⑩ PARAMS 对账登记（derive 孤儿闸）——
+CNT176=$((CNT176 + 1))
+grep -qF '"news_weight_boost": "carrier-shape' scripts/derive_carrier_params.py \
+	|| fail176 "news_weight_boost 未登记 CARRIER_OWNED（derive --check 会判孤儿）"
+CNT176=$((CNT176 + 1))
+grep -qF '"force_sell_boost": "snapshot-derived' scripts/derive_carrier_params.py \
+	|| fail176 "force_sell_boost 未登记 CARRIER_OWNED"
+# —— ⑪ 设置页旋钮（R6）——
+CNT176=$((CNT176 + 1))
+grep -qF 'news_gate_boost_good' web/src/components/D1ConfigPanel.jsx \
+	|| fail176 "设置页 D1 面板缺资讯闸旋钮"
+
+[ "$B176_FAILED" = "0" ] || exit 1
+echo "ok - §176 §NEWS-GATE-D1-SIGNED 锁通过（带符号化/负分拦截/板块否决/通用系数/D1Event因子/烘焙换源/force_sell/盘中反转链/盘中班次/对账登记/设置页，累计判定点 ${CNT176}）"
+
 # §GZ-UBUNTU 11-08：Linux 部署件口径总闸。不新增段号——collect 段清单由装配器
 # 动态派生，这行属尾体最终总闸；GATE_SELF_ABS 是主脚本绝对路径，段体被搬进
 # 临时脚本执行时也指得回仓内 scripts/。独立跑：bash scripts/verify_gz_ubuntu_assets.sh

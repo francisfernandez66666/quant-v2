@@ -53,8 +53,8 @@ func TestFindEventForCodeByName(t *testing.T) {
 // 时，过去 cleanJSON 只剥首尾导致 json.Unmarshal 整批失败、全部归 0；现在应全局剔除可正常解析。
 func TestCleanJSONInteriorBOM(t *testing.T) {
 	// 模拟 LLM 输出：数组第二个对象内 "reason" 值前、以及元素分隔处混入 BOM
-	raw := "\ufeff```json\n[\n  {\"code\":\"600519\",\"score\":0.7,\"blocked\":false,\"reason\":\"板块利好\"},\n" +
-		"  {\"code\":" + "\ufeff" + "\"000001\",\"score\":\ufeff0.5,\"blocked\"\ufeff:true,\"reason\":\ufeff\"利空\"}\n]```\ufeff"
+	raw := "\ufeff```json\n[\n  {\"code\":\"600519\",\"score\":0.7,\"reason\":\"板块利好\"},\n" +
+		"  {\"code\":" + "\ufeff" + "\"000001\",\"score\":\ufeff-0.5,\"reason\":\ufeff\"利空\"}\n]```\ufeff"
 
 	got := cleanJSON(raw)
 	var arr []D1Score
@@ -64,10 +64,10 @@ func TestCleanJSONInteriorBOM(t *testing.T) {
 	if len(arr) != 2 {
 		t.Fatalf("应解析出2只个股, got %d: %+v", len(arr), arr)
 	}
-	if arr[0].Code != "600519" || arr[0].Score != 0.7 || arr[0].Blocked {
+	if arr[0].Code != "600519" || arr[0].Score != 0.7 {
 		t.Fatalf("600519 解析异常: %+v", arr[0])
 	}
-	if arr[1].Code != "000001" || arr[1].Score != 0.5 || !arr[1].Blocked {
+	if arr[1].Code != "000001" || arr[1].Score != -0.5 {
 		t.Fatalf("000001 解析异常: %+v", arr[1])
 	}
 }
@@ -77,7 +77,7 @@ func TestCleanJSONInteriorBOM(t *testing.T) {
 // json.Unmarshal 整批失败、10 只全部标记待重试。现在应把字符串内字面换行转成 \n 并可正常解析。
 func TestCleanJSONReasonLiteralNewline(t *testing.T) {
 	// 模拟线上失败样本：reason 值内嵌真实换行（反引号内的 \n 是字面换行）
-	raw := "```json\n[\n  {\"code\":\"688432\",\"score\":18,\"blocked\":false,\"reason\":\"半导体材料供应商\n受益于上海张江能智终端产业链政策\"},\n  {\"code\":\"600460\",\"score\":18,\"blocked\":false,\"reason\":\"半导体分立器件企业，伴随AI终端规划受益\"}\n]```"
+	raw := "```json\n[\n  {\"code\":\"688432\",\"score\":18,\"reason\":\"半导体材料供应商\n受益于上海张江能智终端产业链政策\"},\n  {\"code\":\"600460\",\"score\":18,\"reason\":\"半导体分立器件企业，伴随AI终端规划受益\"}\n]```"
 
 	got := cleanJSON(raw)
 	var arr []D1Score
@@ -87,7 +87,7 @@ func TestCleanJSONReasonLiteralNewline(t *testing.T) {
 	if len(arr) != 2 {
 		t.Fatalf("应解析出2只个股, got %d: %+v", len(arr), arr)
 	}
-	if arr[0].Code != "688432" || arr[0].Score != 18 || arr[0].Blocked {
+	if arr[0].Code != "688432" || arr[0].Score != 18 {
 		t.Fatalf("688432 解析异常: %+v", arr[0])
 	}
 	if arr[0].Reason != "半导体材料供应商\n受益于上海张江能智终端产业链政策" {
@@ -102,11 +102,11 @@ func TestMarkRetryPending(t *testing.T) {
 	ds := &D1Scorer{}
 	// 即使"上一轮有分"，LLM 本轮失败也不得回退复用：必须标记待重试。
 	result := map[string]D1Score{
-		"600519": {Code: "600519", Score: 0.7, Blocked: false, Reason: "上一轮评分"},
+		"600519": {Code: "600519", Score: 0.7, Reason: "上一轮评分"},
 	}
 	ds.markRetryPending(result, []string{"600519"}, "LLM失败")
 	got := result["600519"]
-	if got.Score != 0 || got.RetryPending != true || got.Blocked {
+	if got.Score != 0 || got.RetryPending != true {
 		t.Fatalf("应标记 RetryPending 待重试(Score=0), got %+v", got)
 	}
 	if !strings.Contains(got.Reason, "待重试") {

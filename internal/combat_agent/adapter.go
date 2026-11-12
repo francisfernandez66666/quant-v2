@@ -233,6 +233,13 @@ func evalFor(runner StrategyRunner, code string, md *strategy_engine.StockMarket
 	if md == nil {
 		return runner.Strategy.Evaluate(code, md)
 	}
+	// §NEWS-GATE（R7）：带符号 D1 统一注入行情快照——因子战法（D1Event 因子）与其它潜在
+	// 消费方从这里读；同一轮同股重复 stamp 同值幂等。负分的买入拦截在 engine news gate。
+	// English: §NEWS-GATE — stamp the signed D1 onto the market-data snapshot once per eval so the
+	// factor strategy's D1Event factor (and other consumers) see it; idempotent per round.
+	if d1 != nil {
+		md.D1 = d1.Score
+	}
 	// 按策略具体类型分发到真实评分逻辑
 	// English: dispatch by the concrete strategy type.
 	switch st := runner.Strategy.(type) {

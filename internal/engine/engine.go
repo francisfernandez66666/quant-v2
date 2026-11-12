@@ -273,15 +273,27 @@ type Engine struct {
 	marketTracker    *research.StateTracker       // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
 	signalQuality    *research.SignalQualityTable // §P2.5 信号质量分桶表（Enhance.DynWeight 开启时懒建，nil=关闭）
 
-	fetcher          *data.Fetcher                   // 5s 实时行情采集器（近实时打分快照来源）
-	scoreStore       *scoreStore                     // 8a/8b 主循环打分持久化（scores.json）
-	fastScoreStore   *scoreStore                     // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
-	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
-	prevBullBuy      map[string]map[string]bool      // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
-	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
-	d1ScoredSig      map[string]string               // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
-	d1RetryQueue     map[string]bool                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
-	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
+	fetcher        *data.Fetcher                   // 5s 实时行情采集器（近实时打分快照来源）
+	scoreStore     *scoreStore                     // 8a/8b 主循环打分持久化（scores.json）
+	fastScoreStore *scoreStore                     // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
+	prevPass       map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
+	prevBullBuy    map[string]map[string]bool      // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
+	lastD1Scores   map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
+	d1ScoredSig    map[string]string               // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
+	d1RetryQueue   map[string]bool                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
+	// ── §NEWS-GATE（2026-11-12，news_gate.go）：D1 带符号资讯闸状态 ──
+	newsGatePath          string                  // news_gate_today.json 落盘路径（dataDir 空=纯内存禁用）
+	newsGateMu            sync.RWMutex            // 快照/反转状态锁（主循环写、5s 循环与烘焙读取）
+	newsGate              *NewsGateSnapshot       // 最近一轮快照（闸的板块 veto 输入 + 烘焙真源）
+	newsGatePrevD1        map[string]float64      // 上一轮 D1 全量分（反转监测的跨阈值对比基线）
+	newsGatePrevSectorNeg map[string]string       // 上一轮板块负分映射（「新进板块利空」判定）
+	newsGateStrikes       map[string]int          // 反转防抖：code→连续同向确认轮数（3 轮确认）
+	newsGateStrikeDir     map[string]string       // 反转防抖：code→当前计击方向（bearish/bullish）
+	newsGateRestarts      int                     // 当日已确认触发次数（上限 8，owner §6）
+	newsGateLastRestart   time.Time               // 冷却期锚点（30 分钟）
+	newsGateDay           string                  // 反转状态所属交易日（换日重置）
+	newsGateEvents        []NewsGateReversalEvent // 已确认反转事件（幂等留痕，随快照落盘）
+	lastEmotionPhase      string                  // 主循环最近一轮情绪阶段（近实时循环复用）
 	// §MARKET_RISK_GATE P2/F2：最近一轮市场状态机结果 + 仓位档，供 SSE 市场环境条展示与风险档合成消费。
 	// English: last market-state-machine result + position cap, surfaced via the SSE status bar (F2) and
 	// consumed by the risk-tier synthesizer (B3).
@@ -728,6 +740,7 @@ func New(
 	// 均落在账号数据目录下（per-acctDir 装配天然按账号隔离；dataDir 空=纯内存禁用）。
 	paperAnchorPath := ""
 	buyQueuePath := ""
+	newsGatePath := ""     // §NEWS-GATE news_gate_today.json 落盘路径（dataDir 空=纯内存禁用）
 	anchorShadowPath := "" // §ANCHOR-FIRST 影子对照表落盘路径（dataDir 空=禁用文件、只打日志）
 	evoStoreDir := ""      // §SIZING-EVO 影子库目录（dataDir 空=纯内存禁用）
 	if dataDir != "" {
@@ -740,6 +753,7 @@ func New(
 		buyQueuePath = filepath.Join(dataDir, "buy_queue_pending.json")
 		anchorShadowPath = filepath.Join(dataDir, "anchor_shadow.json") // §ANCHOR-FIRST W2 影子对照表
 		evoStoreDir = filepath.Join(dataDir, "sizing_evo")              // §SIZING-EVO 影子库
+		newsGatePath = filepath.Join(dataDir, "news_gate_today.json")   // §NEWS-GATE 2026-11-12 烘焙真源
 	}
 	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
 	e := &Engine{
@@ -794,6 +808,10 @@ func New(
 		buyQueuePath:      buyQueuePath,     // §M11 停机买单队列落盘路径（空=禁用）
 		anchorShadowPath:  anchorShadowPath, // §ANCHOR-FIRST W2 影子对照表（空=不落盘，日志照打）
 		evoStoreDir:       evoStoreDir,      // §SIZING-EVO 影子库目录（空=纯内存禁用）
+		newsGatePath:      newsGatePath,     // §NEWS-GATE 烘焙真源落盘路径（空=纯内存禁用）
+		newsGatePrevD1:    make(map[string]float64),
+		newsGateStrikes:   make(map[string]int),
+		newsGateStrikeDir: make(map[string]string),
 	}
 	// §D-2（GAP_VERIFY_20260917_PM）裁定留痕落盘：JSONL 按日轮转 + 启动回灌当日环，
 	// quant 重启不再丢"为何没成交"的拦截原因。dataDir 空（纯内存测试路径）自动跳过；
@@ -4806,11 +4824,23 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			if d.RetryPending {
 				continue
 			}
-			rows = append(rows, store.D1ScoreRow{Code: code, Score: d.Score, Blocked: d.Blocked, Reason: d.Reason})
+			rows = append(rows, store.D1ScoreRow{Code: code, Score: d.Score, Blocked: d.Score < 0, Reason: d.Reason})
 		}
 		if err := e.d1Store.UpsertD1Scores(time.Now().Format("2006-01-02"), rows); err != nil {
 			log.Printf("[engine] D1 评分落库失败(不影响主流程): %v", err)
 		}
+	}
+
+	// §NEWS-GATE（2026-11-12）：刷新当日资讯闸快照（负分个股/板块负分/正分个股）+ 盘中反转监测
+	// + news_gate_today.json 落盘（烘焙链唯一真源，R10/R12；反转事件随快照携带，R11）。
+	// English: refresh the daily news-gate snapshot (negative/sector-negative/positive codes), run the
+	// intraday reversal monitor, and persist news_gate_today.json — the single bake source.
+	{
+		var events []newsagent.NewsEvent
+		if e.newsAgent != nil {
+			events = e.newsAgent.AllEvents()
+		}
+		e.refreshNewsGate(d1Scores, verifiedBear, events)
 	}
 	_d1T := time.Since(_stepD1)
 
@@ -5015,6 +5045,19 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	if data.BeforeOpenTrade(e.nowTime()) {
 		bullSignals = nil
 		bearSignals = nil
+	}
+
+	// §NEWS-GATE（2026-11-12）信号层一票否决+通用系数（R9/R5）：D1<0 或板块强利空命中的
+	// 个股买入信号在此**所有战法统一**拦截（改发利空拦截提醒），存留买入信号乘资讯系数。
+	// 位置刻意在时段压制之后、分发/固化之前——两条消费链（dispatch/paper 与 Upsert）都吃过滤结果。
+	// English: §NEWS-GATE unified buy veto + universal coefficient applied after the time-window
+	// suppression, before dispatch and pinning, so every consumer sees the filtered set.
+	{
+		var gateAlerts []combat_agent.Signal
+		bullSignals, gateAlerts = e.applyNewsGate(bullSignals, d1Scores)
+		if len(gateAlerts) > 0 {
+			e.syncMessages(nil, nil, gateAlerts, nil, e.snapshotQuotes())
+		}
 	}
 
 	// §M9 轮首快照：本轮所有 sell_unified_mode 消费方（paperSignals 证据闸 / judgePaperLedgers /
@@ -6187,9 +6230,9 @@ func enrichSignalsWithD1(sigs []combat_agent.Signal, d1Scores map[string]combat_
 		if !ok {
 			continue
 		}
-		// 回填 D1 评分缓存：分数/是否被板块 D1 规则阻断/理由，前端据此展示 D1 独立评分。
+		// 回填 D1 评分缓存：带符号分数/是否明确利空（Score<0 派生，§NEWS-GATE 2026-11-12）/理由，前端据此展示 D1 独立评分。
 		s.D1Score = d1.Score
-		s.D1Blocked = d1.Blocked
+		s.D1Blocked = d1.Score < 0
 		s.D1Reason = d1.Reason
 	}
 }

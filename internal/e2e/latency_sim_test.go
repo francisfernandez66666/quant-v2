@@ -234,7 +234,7 @@ func TestRealSpeedRehearsal(t *testing.T) {
 			continue
 		}
 		carried++
-		if after.Score != before.Score || after.Blocked != before.Blocked {
+		if after.Score != before.Score {
 			t.Errorf("空窗轮 %s 评分应沿用消费轮 %+v, got %+v", code, before, after)
 		}
 	}

@@ -44,7 +44,7 @@ func TestD1BoostAnnotationOnly(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 63, Pass: false, Level: "brief", Confidence: 0.6, Details: map[string]float64{}}
-	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 30, Blocked: false})
+	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 30})
 	if eval.Pass || eval.Level != "brief" || eval.TotalScore != 63 {
 		t.Fatalf("§W5-v3 级别不得被 D1 改写, got level=%s pass=%v total=%.2f", eval.Level, eval.Pass, eval.TotalScore)
 	}
@@ -59,7 +59,7 @@ func TestD1BoostNoLevelRewriteAnyTier(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 56, Pass: false, Level: "none", Confidence: 0.5, Details: map[string]float64{}}
-	a.applyD1Boost(strategy.SignalDragonReturn, eval, &D1Score{Score: 20, Blocked: false})
+	a.applyD1Boost(strategy.SignalDragonReturn, eval, &D1Score{Score: 20})
 	if eval.Pass || eval.Level != "none" || eval.TotalScore != 56 {
 		t.Fatalf("§W5-v3 龙回头级别不应被改写, got level=%s pass=%v total=%.2f", eval.Level, eval.Pass, eval.TotalScore)
 	}
@@ -71,7 +71,7 @@ func TestD1BoostNeverMutatesScoreEvenHighD1(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 90, Pass: true, Level: "full_chain", Confidence: 0.9, Details: map[string]float64{}}
-	a.applyD1Boost(strategy.SignalDoubleBump, eval, &D1Score{Score: 40, Blocked: false})
+	a.applyD1Boost(strategy.SignalDoubleBump, eval, &D1Score{Score: 40})
 	if eval.TotalScore != 90 || !eval.Pass || eval.Level != "full_chain" {
 		t.Fatalf("总分应保持 90 不变, got %.2f/%v/%s", eval.TotalScore, eval.Pass, eval.Level)
 	}
@@ -83,7 +83,7 @@ func TestD1BoostBelowThresholdNoOp(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 63, Pass: false, Level: "brief", Confidence: 0.6, Details: map[string]float64{}}
-	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 5, Blocked: false})
+	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 5})
 	if eval.TotalScore != 63 || eval.Pass || eval.Level != "brief" {
 		t.Fatalf("D1=5 低于门槛不应加成, got total=%.2f pass=%v level=%s", eval.TotalScore, eval.Pass, eval.Level)
 	}
@@ -95,7 +95,7 @@ func TestD1BoostBlockedNoOp(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 63, Pass: false, Level: "brief", Confidence: 0.6, Details: map[string]float64{}}
-	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 30, Blocked: true})
+	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: -40})
 	if eval.TotalScore != 63 || eval.Pass {
 		t.Fatalf("blocked 时不应加成, got total=%.2f pass=%v", eval.TotalScore, eval.Pass)
 	}
@@ -107,7 +107,7 @@ func TestD1BoostDisabledNoOp(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 63, Pass: false, Level: "brief", Confidence: 0.6, Details: map[string]float64{}}
-	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 30, Blocked: false})
+	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 30})
 	if eval.TotalScore != 63 || eval.Pass {
 		t.Fatalf("BoostWeight=0 时不应加成, got total=%.2f pass=%v", eval.TotalScore, eval.Pass)
 	}
@@ -137,7 +137,7 @@ func TestD1BoostDragonEndToEnd(t *testing.T) {
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: dragon.New(cfg)}})
-	_, sigsBoost := a2.ScorePool([]string{"000001"}, pool, map[string]D1Score{"000001": {Code: "000001", Score: 40, Blocked: false}}, "")
+	_, sigsBoost := a2.ScorePool([]string{"000001"}, pool, map[string]D1Score{"000001": {Code: "000001", Score: 40}}, "")
 	if !hasDragonAction(sigsBoost, "000001", "buy") {
 		t.Fatalf("D1=40 软加成后应升级为 dragon buy, got %+v", sigsBoost)
 	}
@@ -176,7 +176,7 @@ func TestD1BlockedAnnotatesButNotVetoes(t *testing.T) {
 	pool := map[string]*strategy_engine.StockMarketData{"000001": d1BoostDragonMD()}
 
 	_, sigs := a.ScorePool([]string{"000001"}, pool,
-		map[string]D1Score{"000001": {Code: "000001", Score: 30, Blocked: true, Reason: "立案调查"}}, "")
+		map[string]D1Score{"000001": {Code: "000001", Score: -40, Reason: "立案调查"}}, "")
 	found := 0
 	for _, sg := range sigs {
 		if sg.Code == "000001" && strings.Contains(sg.Reason, "LLM利空提示") {
@@ -192,7 +192,7 @@ func TestD1BlockedAnnotatesButNotVetoes(t *testing.T) {
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: &fakeAlwaysPass{}}})
 	_, sigs2 := a2.ScorePool([]string{"000001"}, pool,
-		map[string]D1Score{"000001": {Code: "000001", Score: 30, Blocked: false}}, "")
+		map[string]D1Score{"000001": {Code: "000001", Score: 30}}, "")
 	if !hasDragonAction(sigs2, "000001", "buy") {
 		t.Fatalf("对照组应正常产出 dragon buy, got %+v", sigs2)
 	}

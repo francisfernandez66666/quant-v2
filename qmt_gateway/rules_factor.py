@@ -233,6 +233,15 @@ FACTOR_LIBRARY = {
                  "direct": True, "missing_input": "sector leadership ranking (external)"},
 }
 
+# NEWS-GATE (owner ruling 2026-11-12, R1/R5): news-family factors are weighted
+# heavier -- their contribution is multiplied by params.news_weight_boost
+# (default NEWS_WEIGHT_BOOST_DEFAULT). The buy-side negative-D1 veto lives in
+# qmt_internal_strategy (the d1_negative gate); this module only amplifies the
+# positive contribution. ConceptHeat is an opportunity-pool heat proxy, not a
+# news factor, so it is NOT amplified.
+NEWS_WEIGHT_BOOST_DEFAULT = 2.0
+NEWS_WEIGHT_FACTORS = frozenset({"NewsEvent"})
+
 # The families that decline by design, kept as data so a test and the report
 # can enumerate them without re-deriving it from comments.
 DECLINE_BY_DESIGN = dict(
@@ -329,6 +338,10 @@ PARAMS_TEMPLATE = {
     # importable standalone.
     "daily_buy_cap": 150000.0,
     "min_order_amount": 10000.0,
+    # NEWS-GATE (owner ruling 2026-11-12, R1/R5): news-factor weight boost; the
+    # baked value from carrier_hot_reload_gz (NEWS_WEIGHT_BOOST env) is the
+    # single source, this keeps the module importable standalone.
+    "news_weight_boost": NEWS_WEIGHT_BOOST_DEFAULT,
 }
 
 
@@ -1286,11 +1299,19 @@ def score_factor_rule(params, rule, ctx, cols=None):
                 continue  # Go: NaN percentile -> the factor drops out of the composite
         weight = weights.get(fid, default_weight)
         direction = directions.get(fid, default_direction)
+        contrib = float(weight)
+        # NEWS-GATE (owner ruling 2026-11-12, R1/R5): news factors weigh heavier.
+        # Negative inputs fall outside the scalar band and decline (never
+        # invented); the buy-side negative-D1 veto is the d1_negative gate in
+        # qmt_internal_strategy. Only the positive contribution is amplified.
+        if fid in NEWS_WEIGHT_FACTORS:
+            contrib *= float(params.get("news_weight_boost", NEWS_WEIGHT_BOOST_DEFAULT)) \
+                or NEWS_WEIGHT_BOOST_DEFAULT
         if direction < ZERO:
-            total += float(weight) * (UNIT - pct)
+            total += contrib * (UNIT - pct)
         else:
-            total += float(weight) * float(direction) * pct
-        used += float(weight)
+            total += contrib * float(direction) * pct
+        used += contrib
         details[fid] = pct
 
     if used <= ZERO:
@@ -1534,6 +1555,7 @@ FACTOR_PARAM_KEYS = [
     "min_bars",
     "min_cash_reserve",
     "min_order_amount",
+    "news_weight_boost",
     "order_amount_cap",
     "pattern_rules",
     "percentile_min_samples",

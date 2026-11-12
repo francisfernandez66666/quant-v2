@@ -46,7 +46,7 @@ func upKLines(n int) []data.KLine {
 // English: TestSellFactorBearishD1 bearish D1 (negative filter veto) → liquidation tier.
 func TestSellFactorBearishD1(t *testing.T) {
 	md := sellTestMD(120, 2, upKLines(30), data.MACD{DIF: 0.5, DEA: 0.4, Bar: 0.1})
-	fs := assessSellFactor("600001", md, D1Score{Score: 0, Blocked: true, Reason: "控股股东减持"}, 80, 60, sellTestPM())
+	fs := assessSellFactor("600001", md, D1Score{Score: -40, Reason: "控股股东减持"}, 80, 60, sellTestPM())
 	if len(fs) != 1 || fs[0].level != "清仓" || fs[0].action != "卖出" {
 		t.Fatalf("利空D1 应清仓/卖出, got %+v", fs)
 	}
@@ -112,7 +112,7 @@ func TestSellFactorSeverityOrdering(t *testing.T) {
 	// 利空D1 + 破位 + 动量衰竭同时命中 → 最终应为清仓（最高级）
 	kl := upKLines(30)
 	md := sellTestMD(110, -3, kl, data.MACD{DIF: -0.2, DEA: 0.1, Bar: -0.3})
-	d1 := D1Score{Score: 0, Blocked: true, Reason: "立案调查"}
+	d1 := D1Score{Score: -40, Reason: "立案调查"}
 	fs := assessSellFactor("600001", md, d1, 25, 60, sellTestPM())
 	if len(fs) < 2 {
 		t.Fatalf("应至少命中2项因素, got %+v", fs)
@@ -140,7 +140,7 @@ func TestAssessSellSide(t *testing.T) {
 	bad := sellTestMD(110, -3, upKLines(30), data.MACD{DIF: -0.2, DEA: 0.1, Bar: -0.3})
 	bad.Quote.Volume = 2000
 	md := map[string]*strategy_engine.StockMarketData{"600001": good, "600002": bad}
-	d1 := map[string]D1Score{"600001": {Code: "600001"}, "600002": {Code: "600002", Blocked: true, Reason: "减持"}}
+	d1 := map[string]D1Score{"600001": {Code: "600001"}, "600002": {Code: "600002", Score: -40, Reason: "减持"}}
 	scores := map[string]StockScores{"600001": {MomentumScore: 80, MomentumValid: true}, "600002": {MomentumScore: 25, MomentumValid: true}}
 
 	sigs := a.AssessSellSide([]string{"600001", "600002"}, md, d1, scores, false)
@@ -164,7 +164,7 @@ func TestAssessSellSideShortEnabled(t *testing.T) {
 	bad := sellTestMD(110, -3, upKLines(30), data.MACD{DIF: -0.2, DEA: 0.1, Bar: -0.3})
 	bad.Quote.Volume = 2000
 	md := map[string]*strategy_engine.StockMarketData{"600002": bad}
-	d1 := map[string]D1Score{"600002": {Code: "600002", Blocked: true, Reason: "减持"}}
+	d1 := map[string]D1Score{"600002": {Code: "600002", Score: -40, Reason: "减持"}}
 	scores := map[string]StockScores{"600002": {MomentumScore: 25, MomentumValid: true}}
 
 	sigs := a.AssessSellSide([]string{"600002"}, md, d1, scores, true)

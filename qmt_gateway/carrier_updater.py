@@ -220,6 +220,10 @@ class CarrierUpdater:
 
         self.history = []
         self.manifest_error = ""
+        # §NEWS-GATE 2026-11-12（R11）：盘中班次模式（--intraday）。True 时只投递带
+        # `intraday_priority`（盘中反转触发）的清单；普通版本推进留给收盘 15:40 班次，
+        # 避免"任何一次 sha 变化都盘中重启交易客户端"。缺省 False（收盘班次行为不变）。
+        self.intraday = False
         self._load_state()
 
     # ---------------- 状态文件（结构与凭证无关：只写哈希/版本/ASCII 原因） ----------------
@@ -473,6 +477,16 @@ class CarrierUpdater:
                      _ascii_text(manifest.get("updated_at") or "unknown"),
                      request_state, _ascii_text(manifest.get("requested_at") or "none")))
 
+        # §NEWS-GATE（R11）盘中班次闸：--intraday 轮只处理带 intraday_priority 的反转投递。
+        # 普通版本不投、不重启、**不回执**（pending 留给收盘班次接住；回了执 = 15:40 那班
+        # 会把这份 pending 当"已答话"跳过，版本推进就丢了）。
+        if self.intraday and manifest.get("intraday_priority") is not True:
+            self._log("CARRIER_INTRADAY_SKIP request_state=%s (no intraday_priority)"
+                      % request_state)
+            rep.update(reason="intraday_skip_no_priority", status="OK")
+            self._finish(rep, dry_run, acked=False)
+            return rep
+
         have_sha = self.installed_sha256()
         have_ver = self.installed_version()
         # 两个哈希都要打出来：只打"该装的那份"会让值班的人无从比对（J0 那批的同一条纪律）。
@@ -671,6 +685,9 @@ def _run_cli(argv, transport=None, runner=None):
     ap.add_argument("--once", action="store_true", help="run exactly one round and exit")
     ap.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="compare and print only: no download, no apply, no ack")
+    ap.add_argument("--intraday", action="store_true", dest="intraday",
+                    help="intraday shift: apply only manifests flagged intraday_priority "
+                         "(reversal-triggered); normal promotion is left to the 15:40 shift")
     args = ap.parse_args(argv)
 
     try:
@@ -680,6 +697,7 @@ def _run_cli(argv, transport=None, runner=None):
               "reason=config_unreadable:%s" % exc.__class__.__name__)
         return 2
 
+    updater.intraday = bool(args.intraday)  # §NEWS-GATE R11 盘中班次旗标
     print("CARRIER_CONFIG base_host=%s token_present=%d strategy_file=%s updater_script=%s "
           "qmt_python_dir=%s temp_dir=%s state=%s mode=%s"
           % (_host_of(updater.base_url), 1 if updater.token else 0,

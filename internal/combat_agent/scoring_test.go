@@ -148,31 +148,32 @@ func TestEvalForNShape(t *testing.T) {
 	_ = eval.TotalScore
 }
 
-// TestBuildCtxD1Propagation 验证 D1 评分透传：buildCtx 收到非零 D1Score 时
-// 应写入 ctx.LLMD1Score/LLMBlocked，calcD1 据此产出 d1>0（断链修复的核心断言）。
-// English: TestBuildCtxD1Propagation verifies D1 score propagation: when buildCtx receives a non-zero D1Score it must write ctx.LLMD1Score/LLMBlocked, from which calcD1 yields d1>0 (the core assertion of the broken-chain fix).
+// TestBuildCtxD1Propagation 验证 D1 带符号评分透传：buildCtx 收到非零 D1Score 时
+// 应写入 ctx.LLMD1Score（§NEWS-GATE 2026-11-12 带符号制 −40~+40，Blocked 标记已废除）。
+// English: TestBuildCtxD1Propagation verifies signed D1 score propagation: buildCtx must write
+// ctx.LLMD1Score (signed −40~+40 per §NEWS-GATE 2026-11-12; the Blocked flag is gone).
 func TestBuildCtxD1Propagation(t *testing.T) {
 	md := mkBullMarketData()
 	// 1) 无 D1 → LLMD1Score 保持 0（缺省路径）
 	// English: 1) No D1 → LLMD1Score stays 0 (default path).
 	ctx := buildCtx(md, "", nil, "", 0)
-	if ctx.LLMD1Score != 0 || ctx.LLMBlocked {
-		t.Fatalf("无D1时 LLMD1Score/Blocked 应为零, got %.2f/%v", ctx.LLMD1Score, ctx.LLMBlocked)
+	if ctx.LLMD1Score != 0 {
+		t.Fatalf("无D1时 LLMD1Score 应为零, got %.2f", ctx.LLMD1Score)
 	}
-	// 2) 有正向 D1 → LLMD1Score 透传（0~40 制）
-	// English: 2) Positive D1 → LLMD1Score is passed through (0~40 scale).
-	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: 20, Blocked: false}, "利好事件", 0)
-	if ctx.LLMD1Score != 20 || ctx.LLMBlocked {
-		t.Fatalf("D1=20 应透传, got %.2f/%v", ctx.LLMD1Score, ctx.LLMBlocked)
+	// 2) 有正向 D1 → LLMD1Score 透传（带符号制正值）
+	// English: 2) Positive D1 → LLMD1Score is passed through (signed positive).
+	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: 20}, "利好事件", 0)
+	if ctx.LLMD1Score != 20 {
+		t.Fatalf("D1=20 应透传, got %.2f", ctx.LLMD1Score)
 	}
 	if ctx.EventDesc != "利好事件" {
 		t.Fatalf("EventDesc 未透传: %q", ctx.EventDesc)
 	}
-	// 3) 负面阻断 D1 → LLMBlocked 透传
-	// English: 3) Negative blocking D1 → LLMBlocked is passed through.
-	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: 0, Blocked: true}, "", 0)
-	if !ctx.LLMBlocked {
-		t.Fatal("Blocked 应透传")
+	// 3) 负分 D1（明确利空）→ 负值透传（买入硬闸据此拦截）
+	// English: 3) Negative D1 (explicit bearish) → negative passes through for the buy-side gate.
+	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: -40}, "", 0)
+	if ctx.LLMD1Score != -40 {
+		t.Fatalf("D1=-40 应透传, got %.2f", ctx.LLMD1Score)
 	}
 	// 4) PE 透传（D3 超跌评分用）
 	// English: 4) PE is passed through (used by D3 oversold scoring).

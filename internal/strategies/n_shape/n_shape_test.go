@@ -75,13 +75,16 @@ func TestEmotionGate(t *testing.T) {
 	}
 }
 
-// TestLLMBlocked LLM 利空判定直接否决。
-func TestLLMBlocked(t *testing.T) {
+// TestLLMNegativeBlocked §NEWS-GATE 2026-11-12：LLM 带符号负分（明确利空）→ D1>0 硬闸不过。
+func TestLLMNegativeBlocked(t *testing.T) {
 	ctx := fullCtx()
-	ctx.LLMBlocked = true
+	ctx.LLMD1Score = -40
 	ev, _ := newNS().EvaluateWave(fullWA(), fullIB(), ctx)
 	if ev.Pass {
-		t.Error("LLM 利空不应通过")
+		t.Error("LLM 利空负分不应通过")
+	}
+	if ev.TotalScore > 0 && ev.Level != "nodata" {
+		t.Errorf("利空负分评分应为空/零分, got score=%v level=%s", ev.TotalScore, ev.Level)
 	}
 }
 

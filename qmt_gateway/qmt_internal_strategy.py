@@ -1311,9 +1311,18 @@ def run_round(ContextInfo, moment):
                                            "reason": "rule_" + mode})
                 continue
             short = signal["short_code"]
-            if short in counter_codes or (day, symbol, short) in _STATE["sent"]:
+            # NEWS-GATE (owner ruling R10) sell acceleration: force_sell_boost
+            # (negative-D1 holdings) SELLS are exempt from the same-day
+            # already_sent dedup so a close-out level bearish case can keep
+            # working its exit legs (staged sells). Oversell is bounded by the
+            # T+1 can_use hard cap, not by dedup. Buys are NOT exempt.
+            _boosted_sell = (signal["side"] == "sell"
+                             and short in (PARAMS.get("force_sell_boost") or {}))
+            if short in counter_codes or (not _boosted_sell and (day, symbol, short) in _STATE["sent"]):
                 summary["skipped"].append({"short": short, "reason": "already_sent"})
                 continue
+            if _boosted_sell:
+                print("[local_strategy] force_sell_boost sell %s (negative-D1 holding)" % short)
             allowed, why = rule_no_new_order_window(PARAMS, ctx)
             if not allowed:
                 summary["skipped"].append({"short": short, "reason": why})
@@ -1376,6 +1385,23 @@ def run_round(ContextInfo, moment):
             risk = _risk_reason(symbol)
             if risk:
                 summary["skipped"].append({"short": short, "reason": risk})
+                continue
+            # NEWS-GATE 2026-11-12 (owner ruling R9, same semantics as the brain
+            # news gate): precalc.news_event carries the SIGNED D1 score -- a
+            # negative value (explicit bearish) or the news_negative marker
+            # refuses the buy (reason=d1_negative). Belt-and-suspenders with the
+            # name-based risk_list_dynamic gate: this one is score-based (pregen
+            # re-bakes precalc every round) and catches a stock the list missed.
+            # Missing precalc = abstain, never a veto (missing data is never
+            # invented). The sell chain exits earlier (line ~1335 continue).
+            _pc = (PARAMS.get("precalc") or {}).get(symbol) or {}
+            _nev = _pc.get("news_event")
+            try:
+                _nev = float(_nev) if _nev is not None else None
+            except (TypeError, ValueError):
+                _nev = None
+            if (_nev is not None and _nev < 0.0) or _pc.get("news_negative"):
+                summary["skipped"].append({"short": short, "reason": "d1_negative"})
                 continue
             vwap, vwhy = _vwap_of(ctx)
             if vwap is None:

@@ -3494,6 +3494,32 @@ type D1Config struct {
 	// （BoostThreshold is the minimum D1 score (0~40) to trigger the soft boost.）
 	// D1 软加成门槛
 	BoostThreshold float64 `json:"boost_threshold,omitempty"`
+
+	// ── §NEWS-GATE 2026-11-12（owner 裁决 R5/R6/R8/R9，docs/PLAN_D1_SIGNED_NEWS_GATE_20261112.md）──
+	// D1 带符号化后的资讯闸旋钮，全部设置页可调（/api/config/d1 稀疏 merge，热生效）。
+
+	// NewsGateDisable 资讯闸总开关（nil/false=开启；owner 2026-11-12 裁决默认开启）。
+	// English: master switch for the news gate (nil/false = enabled).
+	NewsGateDisable *bool `json:"news_gate_disable,omitempty"`
+	// NewsGateBoostGood 正分通用系数上限：买入信号 Confidence ×(1+boost×D1/40)（默认 0.25，
+	// D1=40 → ×1.25；≤0 回落默认）。资讯加权更重落在所有战法的买入决策上（R1/R5）。
+	// English: cap of the positive-D1 universal coefficient applied to every strategy's buy confidence.
+	NewsGateBoostGood float64 `json:"news_gate_boost_good,omitempty"`
+	// NewsGateNegativeCap 强制负分上限（绝对值，默认 40；≤0 回落默认）。负面过滤命中的
+	// 负分量级天花板——与正向档位对称（R8：打分与正分对称，上限 −40）。
+	// English: magnitude cap of forced negative D1 scores (symmetric with the positive scale).
+	NewsGateNegativeCap float64 `json:"news_gate_negative_cap,omitempty"`
+	// NewsGateBlockBelow 拒买阈值：D1 < 本值 → 一票否决买入（指针；nil/0 = 任何负分都拦截，
+	// owner 裁决 R9「负分直接拦截」）。
+	// English: buy-veto threshold — D1 below this vetoes the buy (nil/0 = any negative blocks).
+	NewsGateBlockBelow *float64 `json:"news_gate_block_below,omitempty"`
+	// NewsGateSectorBlock 板块级强利空也拒买（默认 true，owner 裁决 R4「板块级也拒买」）。
+	// English: sector-level severe bearish also vetoes buys (default true per owner).
+	NewsGateSectorBlock *bool `json:"news_gate_sector_block,omitempty"`
+	// NewsGateSectorScoreMin 板块利空事件分阈值：newsagent 事件 Direction=利空 且
+	// Score ≤ 本值 → 映射行业成分股全部拒买（默认 −0.5）。
+	// English: sector bearish event score threshold for the sector-level veto.
+	NewsGateSectorScoreMin float64 `json:"news_gate_sector_score_min,omitempty"`
 }
 
 // normalizeD1 填充 D1Config 缺失的默认值（零值视为未配置）。
@@ -3505,6 +3531,32 @@ func normalizeD1(d *D1Config) {
 	if d.BoostThreshold <= 0 {
 		d.BoostThreshold = 8
 	}
+	// §NEWS-GATE 2026-11-12：资讯闸旋钮默认值（owner §6 裁决定稿）。
+	if d.NewsGateBoostGood <= 0 {
+		d.NewsGateBoostGood = 0.25
+	}
+	if d.NewsGateNegativeCap <= 0 {
+		d.NewsGateNegativeCap = 40
+	}
+	if d.NewsGateBlockBelow == nil {
+		zero := 0.0
+		d.NewsGateBlockBelow = &zero // 默认任何负分都拦截（R9「负分直接拦截」）
+	}
+	if d.NewsGateSectorBlock == nil {
+		tr := true
+		d.NewsGateSectorBlock = &tr // 默认板块级也拒买（R4）
+	}
+	if d.NewsGateSectorScoreMin == 0 {
+		d.NewsGateSectorScoreMin = -0.5
+	}
+}
+
+// Normalized 返回填充默认值后的副本（不改原指针，读侧安全——§NEWS-GATE 引擎读旋钮用）。
+// English: returns a defaults-filled copy without mutating the receiver (read-side safe).
+func (d *D1Config) Normalized() *D1Config {
+	c := *d
+	normalizeD1(&c)
+	return &c
 }
 
 // KVStore 配置持久化抽象：按 userID 读写任意 key-value。

@@ -97,6 +97,11 @@ type StockSeries struct {
 	SingleQuarterNIYoy []float64 // 单季净利同比（SUE 降级版）
 	Eps                []float64 // 每股收益
 
+	// §NEWS-GATE 2026-11-12（R7）：D1 事件带符号分（−40~+40），单日常量列——实盘由
+	// StockMarketData.D1 经 seriesFromKLines 装载；研究侧缺数据整列 NaN（因子层过滤）。
+	// 负分=明确利空：因子层弃权（不参与复合分），拦截职责在信号层 news gate。
+	D1 []float64 // 当日 D1 事件分（带符号；缺失 NaN）
+
 	// 市场情绪（单日全体一致，由 Store.EmotionStatsRange 预装载；缺失为 NaN）。
 	// §Phase2 情绪因子入池：同截面所有股票当日情绪值相同，属于"市场状态因子"，
 	// 用于 B3 分层/IC 时须与其他风格因子配合，或作情绪相位分组回测输入。

@@ -187,12 +187,11 @@ type IntradayB struct {
 
 // Ctx 策略运行上下文，包含板块、情绪、LLM 等多种数据。（Ctx carries sector, emotion and LLM context for scoring.）
 type Ctx struct {
-	// LLM D1 评分字段
-	// LLMD1Score > 0 时优先使用 LLM 评分（替换 YAML EventMatcher 的得分）。
-	// LLMBlocked 为 true 时直接否决（LLM 判定为利空）。
-	// （LLM D1 fields: LLMD1Score>0 takes precedence over the YAML matcher; LLMBlocked vetoes outright.）
-	LLMD1Score float64 // LLM 给出的个股 D1 评分（0~40），0 表示无 LLM 结果或有利空阻断（LLM D1 score 0~40; 0 means no LLM result / bearish block）
-	LLMBlocked bool    // LLM 判定利空时阻塞（calcD1 直接返回 blocked）（LLM bearish → calcD1 returns blocked）
+	// LLM D1 评分字段（§NEWS-GATE 2026-11-12：带符号制）
+	// LLMD1Score > 0 时优先使用 LLM 正向评分（替换 YAML EventMatcher 的得分）；
+	// LLMD1Score < 0 = LLM 判定明确利空（负分原样传导，买入硬闸天然不过，原 LLMBlocked 布尔标记已废除）。
+	// （Signed LLM D1 fields: >0 takes precedence over the YAML matcher; <0 = explicit bearish, passed through.）
+	LLMD1Score float64 // LLM 给出的个股 D1 带符号评分（−40~+40），0 表示无 LLM 结果（signed LLM D1 score −40~+40; 0 = no LLM result）
 
 	EmotionPhase       string  // 情绪周期阶段（"冰点"/"启动"/"高潮"/"退潮"/"衰退"）（Emotion phase: 冰点/启动/高潮/退潮/衰退）
 	EventDesc          string  // 事件描述文本（用于 D1 YAML 兜底匹配）（Event description for D1 YAML fallback matching）
@@ -239,11 +238,9 @@ func NewLeftSideScorer(matcher *data.EventMatcher) *LeftSideScorer {
 //
 // 评分流程：
 //  1. 情绪硬闸检查（"衰退"阶段直接返回）
-//  2. D1 事件评分 → 三段式：YAML 负面阻断 → LLM 评分 → YAML 正面兜底
-//     若 LLM 判定利空（LLMBlocked=true）直接 blocked；
-//     若 LLM 有正向评分（LLMD1Score>0）则以其为准（×MaxD1）；
-//     若 LLM 无结果则走 YAML EventMatcher 兜底。
-//     信号硬闸从 D1=40 放宽到 D1>0。
+//  2. D1 事件评分 → 两段式：YAML 负面过滤 → LLM 带符号评分（§NEWS-GATE 2026-11-12：
+//     负面命中=强制负分/LLM 负分原样传导，D1>0 硬闸天然不过；LLM 正向评分以其为准；
+//     LLM 无结果走 YAML EventMatcher 兜底。信号硬闸从 D1=40 放宽到 D1>0）。
 //  3. 板块冷热检查：板块成交 < 20日均量×2 → sector_cold
 //  4. 事件预支检查：5日涨幅 > 40% → pre_overdrawn
 //  5. D2 相对强度评分（集合竞价+量比+超额收益）
@@ -264,11 +261,23 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 		return res
 	}
 
-	// D1: 事件硬闸 — 三段式计算（YAML 负面阻断 → LLM 评分 → YAML 正面兜底）（D1 event gate: YAML negative block → LLM → YAML backstop）
+	// D1: 事件硬闸 — 两段式计算（YAML 负面过滤 → LLM 带符号评分）（D1 event gate: YAML negative filter → signed LLM）
 	d1, tags, blocked := s.calcD1(ctx)
 	res.Matched = tags
+	if d1 < 0 {
+		// §NEWS-GATE 明确利空（负分）：D1Event 记负值并提前返回——D1>0 硬闸天然不过，
+		// 诊断面保留负分与命中规则（Record the negative D1 + first hit rule as the failure reason）
+		res.D1Event = d1
+		res.Reason = "d1_neg:" + (func() string {
+			if len(tags) > 0 {
+				return tags[0]
+			}
+			return ""
+		})()
+		return res
+	}
 	if blocked {
-		// 负面阻断：记录命中的第一条负面规则作为失败原因（Record the first negative rule hit as the failure reason）
+		// 兼容兜底：calcD1 当前恒返回 false（防御性保留）（defensive; calcD1 no longer returns true）
 		res.Reason = "d1_neg:" + (func() string {
 			if len(tags) > 0 {
 				return tags[0]
@@ -375,28 +384,30 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 
 // calcD1 计算 D1 事件评分。两段式计算：（calcD1 computes the D1 event score in two stages.）
 //
-//	Stage 1: YAML 负面阻断（始终执行，硬闸）
-//	  EventMatcher 只做 negative_filter，命中即 blocked。
+//	Stage 1: YAML 负面过滤（始终执行）
+//	  EventMatcher 只做 negative_filter，命中即**强制负分 −40**（规则级命中=明确利空顶格；
+//	  §NEWS-GATE 2026-11-12 owner 裁决：拦截标记废除，负分本身即拦截语义）。
 //
-//	Stage 2: LLM 评分（优先于 YAML）
-//	  若 LLM 判定利空（LLMBlocked=true），直接返回 blocked。
-//	  否则以 LLMD1Score 直接作为 D1 得分（LLM 现已按 0~40 满分制打分，不再 ×MaxD1）。
+//	Stage 2: LLM 带符号评分（优先于 YAML）
+//	  LLMD1Score<0（LLM 判定利空，量级与正向对称）→ 原样返回负分；
+//	  LLMD1Score>0 → 直接作为 D1 得分（不再 ×MaxD1）。
 //
+// blocked 返回值保留仅为兼容签名，当前恒为 false（负分经 d1<0 传导，不再有布尔拦截）。
 // D1 评分收拢到 combat_agent/d1_scorer，此方法仅在 LLM 结果已传入时调用。
-// （Stage 1 YAML negative block (hard gate); Stage 2 LLM score takes priority — blocked on LLMBlocked,
-// else LLMD1Score directly (the LLM now grades on the 0~40 scale, no ×MaxD1).）
+// （Stage 1 YAML negative filter → forced negative −40; Stage 2 signed LLM score takes priority —
+// negative passes through as-is, positive used directly. The bool stays for signature compat, always false.）
 func (s *LeftSideScorer) calcD1(ctx *Ctx) (float64, []string, bool) {
-	// Stage 1: YAML 负面阻断（Stage 1: YAML negative block）
+	// Stage 1: YAML 负面过滤 → 强制负分顶格（Stage 1: YAML negative filter → forced negative at cap）
 	if ctx.EventDesc != "" && ctx.EventDesc != "null" && s.matcher != nil {
 		mr := s.matcher.MatchD1(ctx.EventDesc)
 		if mr.Blocked {
-			return 0, []string{mr.BlockReason}, true
+			return -40, []string{mr.BlockReason}, false
 		}
 	}
 
-	// Stage 2: LLM 评分（Stage 2: LLM scoring）
-	if ctx.LLMBlocked {
-		return 0, []string{"llm_blocked"}, true
+	// Stage 2: LLM 带符号评分（Stage 2: signed LLM scoring）
+	if ctx.LLMD1Score < 0 {
+		return ctx.LLMD1Score, []string{"llm_negative"}, false
 	}
 	if ctx.LLMD1Score > 0 {
 		return ctx.LLMD1Score, []string{"llm_d1"}, false

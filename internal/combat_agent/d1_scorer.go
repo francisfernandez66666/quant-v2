@@ -1,15 +1,16 @@
 // Package combat_agent 提供操盘战斗 Agent 的核心评分逻辑。
 // D1Scorer 负责对个股进行 D1 级别的事件驱动评分，依赖 LLM 分析新闻事件与行情数据。
-// 评分维度（含优先级）：负面过滤(blocked) > 顶级影响 > 间接影响 > 中等影响 > 低影响，
-// 输出 0~40 满分制分数（对应 N 形 D1 事件维度）并附 LLM 分析理由。
+// §NEWS-GATE 2026-11-12（owner 裁决 R8）：D1 为**带符号分 [−40, +40]**，利好利空对称——
+// 正分衡量事件驱动强度（负面过滤优先级最高已废除，改为负分档），0=无实质事件，
+// 负分=明确利空（立案/减持/质押/解禁/被调查），量级与正向档位镜像，买入侧直接拦截。
 // D1 分独立于"板块利好/利空事件分"（HotTopic.Score / SectorHot.Score，0~1，仅作评分上下文），
-// 由 LLM 按 40 分制独立核定，避免两者混用。
+// 由 LLM 按带符号对称制独立核定，避免两者混用。
 //
 // 评分机制：
 //   - 批量评分：按 llmBatchSize 分批并发调用 LLM
 //   - 失败重试：支持轮询重试（§S5 默认 2 次含首次=1 次重试），指数抖动并封顶
-//   - 无事件归零：无实质事件的个股 D1 强制归 0
-//   - 负面过滤：命中负面事件的个股标记 Blocked，D1=0
+//   - 无事件归零：无实质事件的个股 D1 强制归 0（中性，不是利空）
+//   - 负面过滤：命中负面事件的个股给**对称负分**（明确利空，买入侧直接拦截）
 package combat_agent
 
 import (
@@ -28,19 +29,21 @@ import (
 )
 
 // D1Score 表示单只个股的 D1 事件评分结果。
-// Score 范围 0~40（对应 N 形 D1 维度满分 40），Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
-// RetryPending 表示本轮 LLM 失败（未拿到有效评分），分数 0 且待重试队列下轮重新调 LLM。
+// §NEWS-GATE 2026-11-12（owner 裁决 R8/R9）：D1 改为**带符号分 [−40, +40]**——
+// 正分=事件驱动强度（档位不变），0=无实质事件（中性），**负分=明确利空**（立案/减持/质押/
+// 解禁/被调查等负面过滤命中，强制负值，量级与正向档位对称，上限绝对值 40）。
+// 原 Blocked 拦截标记已废除：负分本身即拦截语义（买入侧一票否决，见 engine news_gate）。
+// RetryPending 表示本轮 LLM 失败（未拿到有效评分），分数 0 且待重试队列下轮重新调 LLM——
+// 失败≠利空，绝不当作负分拦截。
 //
 // 字段说明：
 //   - Code: 股票代码
-//   - Score: 评分值，0~40，越高越值得关注
-//   - Blocked: 是否被负面过滤拦截（利空事件命中）
+//   - Score: 带符号评分值，−40~+40，正越高事件驱动越强、负越深利空越重
 //   - Reason: LLM 给出的评分分析理由
 //   - RetryPending: LLM 失败待重试（分数 0，入重试队列，下轮重新调 LLM）
 type D1Score struct {
 	Code         string  `json:"code"`          // 股票代码
-	Score        float64 `json:"score"`         // 评分值，0~40，越高越值得关注
-	Blocked      bool    `json:"blocked"`       // 是否被负面过滤拦截（利空事件命中）
+	Score        float64 `json:"score"`         // 带符号评分值，−40~+40（负分=明确利空，直接拦截买入）
 	Reason       string  `json:"reason"`        // LLM 给出的评分分析理由
 	RetryPending bool    `json:"retry_pending"` // LLM 失败待重试（分数 0，入重试队列，下轮重新调 LLM）
 }
@@ -140,21 +143,19 @@ func (ds *D1Scorer) SetMaxTokens(n int) int {
 
 // d1SystemPrompt 是 D1 评分的系统级提示词，定义评分优先级规则和输出格式。
 // LLM 根据该提示词对个股关联事件进行分级打分（负面过滤/顶级影响/间接影响/中等影响/低影响）。
-// 打分采用 0~40 满分制（对应 N 形 D1 维度：事件驱动硬闸，满分 40，信号需 D1>0）。
-//
-// 评分优先级：
-//  1. 负面过滤(negative_filter): score=0, blocked=true
-//  2. 顶级影响(top_impact): score=16~40
-//  3. 间接影响(indirect): score=12~24
-//  4. 中等影响(medium_impact): score=8~20
-//  5. 低影响(low_impact): score=0~8
+// §NEWS-GATE 2026-11-12（owner 裁决 R8）：打分**与正分对称**的带符号制——正分 0~40 衡量利好
+// 事件驱动强度，负分 −0~−40 衡量利空冲击深度（量级镜像），负分个股买入侧直接拦截。
 var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个股基于关联事件进行D1评分。
 
-评分采用 0~40 满分制，对应 N 形策略的 D1 事件驱动维度（满分 40，信号需 D1>0 且 总分≥60）。
-分数越高代表该股的事件驱动越强、越值得关注；请给出明确的正向分值，避免一律给极低分。
+评分采用带符号的 −40~+40 分制（利好利空对称），对应 N 形策略的 D1 事件驱动维度
+（信号需 D1>0 且 总分≥60；负分个股买入会被直接拦截）。
+正分越高代表该股的事件驱动越强、越值得关注；负分越深代表利空冲击越重、越需要回避。
+请给出明确的分值，避免一律给极低分或一律给 0。
 
 按优先级：
-1. 负面过滤(negative_filter): score=0, blocked=true — 立案/减持/质押/解禁/被调查等
+1. 负面过滤(negative_filter): score=负值 — 立案/减持/质押/解禁/被调查等明确利空，
+   量级与正向档位对称：严重利空（实控人被立案/大额减持/被调查）给 −16~−40，
+   中等利空（业绩预亏/质押/解禁压力）给 −8~−20，轻微利空给 −0~−8（绝对值上限 40）
 2. 顶级影响(top_impact): score=16~40 — 政策/技术突破/并购重组/龙头大额回购等
 3. 间接影响(indirect): score=12~24 — 板块情绪传导/上游下游联动等
 4. 中等影响(medium_impact): score=8~20 — 业绩/回购/涨价/订单等
@@ -163,14 +164,15 @@ var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个�
 注意：
 - 若给到的"关联事件"是热点板块级别事件（光模块/算力/AI/半导体等产业链利好），
   应按该板块事件的利好强度给该股一个与其绑定的合理分值，而非 0 或极低的 0~4 分。
-- 仅当确实无任何利好事件、且无板块关联时才给低分。
-- 只有命中负面过滤（立案/减持/质押/解禁等明确利空）时才 blocked=true 并给 0 分。
+- 板块级利空事件同样对称传导负分（按该股与板块的绑定深度给合理负值）。
+- 仅当确实无任何利好事件、且无板块关联时才给低正分。
+- 只有命中负面过滤（立案/减持/质押/解禁等明确利空）时才给负分。
 
 详细规则见下方参考。
 
 输出JSON数组：
 [
-  {"code":"600519","score":0~40,"blocked":true/false,"reason":"评分理由"}
+  {"code":"600519","score":-40~40,"reason":"评分理由"}
 ]
 只输出JSON数组，不要多余文字。`
 
@@ -226,7 +228,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	// English: no LLM client or no codes → default everything to 0.
 	if ds.llmClient == nil || len(codes) == 0 {
 		for _, code := range codes {
-			result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: "LLM未配置，默认0分"}
+			result[code] = D1Score{Code: code, Score: 0, Reason: "LLM未配置，默认0分"}
 		}
 		log.Printf("[D1Scorer] LLM未配置，%d只个股默认0分", len(codes))
 		return result
@@ -403,15 +405,15 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 
 	for _, r := range raw {
 		if r.Code != "" {
-			// 分数越界防护：裁剪到 0~40
+			// 分数越界防护：带符号分裁剪到 −40~+40（§NEWS-GATE：负分=明确利空，保留符号）
 			if r.Score > 40 {
 				r.Score = 40
 			}
-			if r.Score < 0 {
-				r.Score = 0
+			if r.Score < -40 {
+				r.Score = -40
 			}
 			result[r.Code] = r
-			log.Printf("[D1Scorer] %s → score=%.2f blocked=%v reason=%s", r.Code, r.Score, r.Blocked, r.Reason)
+			log.Printf("[D1Scorer] %s → score=%.2f reason=%s", r.Code, r.Score, r.Reason)
 		}
 	}
 
@@ -436,11 +438,10 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 	// as a valid D1. This closes the "无特定事件 → LLM 给 0.1 → 触发左侧买入并固化" leak.
 	for code := range noEvent {
 		if r, ok := result[code]; ok {
-			if r.Score > 0 {
+			if r.Score != 0 {
 				log.Printf("[D1Scorer] %s 无实质事件 → D1强制归0 (原score=%.2f reason=%s)", code, r.Score, r.Reason)
 			}
 			r.Score = 0
-			r.Blocked = false
 			r.Reason = "无特定事件，D1归0"
 			result[code] = r
 		}
@@ -457,7 +458,7 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 //   - reason: 失败原因说明
 func (ds *D1Scorer) markRetryPending(result map[string]D1Score, codes []string, reason string) {
 	for _, code := range codes {
-		result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: reason + "待重试", RetryPending: true}
+		result[code] = D1Score{Code: code, Score: 0, Reason: reason + "待重试", RetryPending: true}
 		log.Printf("[D1Scorer] %s %s, 标记待重试(Score=0)", code, reason)
 	}
 }

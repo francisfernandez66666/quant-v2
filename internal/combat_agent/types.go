@@ -128,7 +128,7 @@ type StockScores struct {
 //   - StrategyID: 战法库规则 ID，用于效果监测
 //   - StrategyType: 战法来源类型，用于模拟盘战法分仓
 //   - D1Score: D1 事件评分（0~40）
-//   - D1Blocked: D1 负面过滤拦截标记
+//   - D1Blocked: D1 明确利空标记（§NEWS-GATE 2026-11-12：由 D1Score<0 派生，原 Blocked 布尔已废除）
 //   - D1Reason: D1 事件分析理由（LLM）
 //   - D1Event: D1 关联事件名称
 //   - Meta: 策略评分明细，供前端展示真实维度分
