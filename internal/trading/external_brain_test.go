@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
 )
@@ -162,21 +163,31 @@ func TestExternalBrainBridgeHeartbeatDownIsThree(t *testing.T) {
 	}
 }
 
-// TestExternalBrainReadStaleIsTwo 通道在、资金行过窗（>1 小时）⇒ 档 2，
+// TestExternalBrainReadStaleIsTwo 通道在、资金帧属于**前一交易日** ⇒ 档 2，
 // 且文案指向"柜台读数过期"而不是"通道断"（两者处置方向不同：查导出 vs 查进程）。
+// §READ-STALE-20261112：判据由「固定 1 小时窗」改为「北京自然日」——同日 08:54
+// 的开盘资金帧到下午仍须判 1，不再在 09:54 被误判成读不到柜台而拦住全天买入。
 // 对照：新鲜读数 ⇒ 1；没有账户行（还没开实盘）⇒ 1 而不是 2。
 func TestExternalBrainReadStaleIsTwo(t *testing.T) {
 	db := ebDB(t)
-	old := time.Now().Add(-2 * time.Hour).Format("2006-01-02 15:04:05")
-	fresh := time.Now().Format("2006-01-02 15:04:05")
-	ebSeedCash(t, db, "u_eb2old", old)
+	nowBJ := cntime.Now()
+	yesterday := cntime.DayOf(nowBJ.AddDate(0, 0, -1)) + " 15:00:00"
+	sameDayEarly := cntime.DayOf(nowBJ) + " 08:54:21"
+	fresh := nowBJ.Format("2006-01-02 15:04:05")
+	ebSeedCash(t, db, "u_eb2old", yesterday)
 	cOld := ebCtrl(t, &ebExec{healthOK: true}, db, "u_eb2old")
 	code, reason := cOld.ExternalBrain()
 	if code != ExternalBrainReadStale {
-		t.Fatalf("读数过窗应判 2，实得 %d（%s）", code, reason)
+		t.Fatalf("跨日资金帧应判 2，实得 %d（%s）", code, reason)
 	}
 	if reason == "" || containsCN(reason, "通道") {
 		t.Fatalf("档 2 文案必须指向读数过期，不得说成通道断：%s", reason)
+	}
+	// 同日早盘帧：修复前按 1 小时窗会误判 2，现必须仍是 1。
+	ebSeedCash(t, db, "u_eb2early", sameDayEarly)
+	cEarly := ebCtrl(t, &ebExec{healthOK: true}, db, "u_eb2early")
+	if code, _ := cEarly.ExternalBrain(); code != ExternalBrainNormal {
+		t.Fatalf("同日 08:54 开盘资金帧应判 1，实得 %d", code)
 	}
 	ebSeedCash(t, db, "u_eb2new", fresh)
 	cFresh := ebCtrl(t, &ebExec{healthOK: true}, db, "u_eb2new")

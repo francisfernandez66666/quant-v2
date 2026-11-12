@@ -27,6 +27,8 @@ package trading
 
 import (
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // 外脑模式档位常量。数值即对外契约（前端按数字分形），改动需同批改前端映射。
@@ -44,10 +46,16 @@ const (
 	ExternalBrainShadow int64 = 4
 )
 
-// externalBrainReadStaleSec 柜台读数过窗阈值（秒）。默认 1 小时。
-// 为什么是 1 小时：资金/持仓在桥断后由 owner 手动维护（§MANUAL-MAINT-1104），
-// 手填的口径本就不该追求秒级新鲜；过窗只用于"别拿一份太旧的数字开新仓"。
-// English: how long a counter reading may age before the tier becomes "read stale".
+// §READ-STALE-20261112：原「固定 1 小时窗」已废弃。柜台资金帧是稀疏上报
+// （今日 08:52 / 08:54 / 08:57 三帧后一整天无变化是 by design——导出内容没变，
+// uplink 按内容哈希去重，不会重复 POST），按秒数判新鲜会把 08:54 的开盘帧在
+// 09:54 后误判「柜台读数过期」→ 档 2 拦住全天买入。
+// 现改为「资金帧是否属于当前北京自然日」：同日帧全天可用，跨日帧才判过期。
+// 与持仓维度的 SnapshotBelongsToDay 同族口径，不再引入第三把尺。
+// English: freshness is day-keyed, not second-based — a counter cash frame stays
+// valid for the whole trading day; only a previous-day frame is stale.
+//
+// 保留常量名以兼容既有测试与文档引用，但它不再参与档 2 判定。
 const externalBrainReadStaleSec = 3600
 
 // queuedConnReader 网关可选能力：暴露桥心跳读数（queued_connected）。
@@ -107,10 +115,12 @@ func (c *Controller) externalBrainAt(now time.Time) (int64, string) {
 		return ExternalBrainChannelDown, "桥心跳已断（queued_connected=false）"
 	}
 	// 档 2：柜台读数过期。只有真的存在账户行才判（没有行 = 还没开实盘，不算过期）。
+	// §READ-STALE-20261112：改按北京自然日判 —— 同日开盘帧全天可用，跨日帧才过期。
+	// 08:54 的资金帧不再在 09:54 被误判成「读不到柜台」而拦住全天买入。
 	if asof := c.cashAsOf(); asof != "" {
 		if t, ok := parseSnapshotTime(asof); ok {
-			if now.Sub(t) > externalBrainReadStaleSec*time.Second {
-				return ExternalBrainReadStale, "柜台读数过期（资金帧超过 1 小时未更新）"
+			if cntime.DayOf(t) != cntime.DayOf(now) {
+				return ExternalBrainReadStale, "柜台读数过期（资金帧不属于当前交易日）"
 			}
 		}
 	}

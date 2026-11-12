@@ -646,6 +646,13 @@ func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
 // every later tick backfills only the missing positions, with issued/total recorded in state.
 func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfig, now time.Time) {
 	today := cntime.DayCompactOf(now) // §TZ1 北京日历定链日
+	// §QUEUE-DRAIN-20261112：先清掉跨日遗留的 queued 链再判上限 —— 否则历史积压
+	// 会一直顶着上限，当天新链永远排不进来（11-12 现网 63 条、最早 11-02）。
+	if n, err := db.CancelStaleQueuedTasks(today); err != nil {
+		log.Printf("[scheduler] §QUEUE-DRAIN 历史链清理失败（不阻断入队）: %v", err)
+	} else if n > 0 {
+		log.Printf("[scheduler] §QUEUE-DRAIN 清理 %d 条跨日遗留排队任务（chain_day<%s）", n, today)
+	}
 	// §QUEUE-CAP-20261112（owner：把自动研究的队列/次数限制加回来）：
 	// 待执行任务达上限就不排当晚新链并留痕，防止任务无限堆积拖慢前端与 researchd
 	// 出队扫描（11-12 现网积压 63 条 queued）。上限 0=默认 20；只拦新链，

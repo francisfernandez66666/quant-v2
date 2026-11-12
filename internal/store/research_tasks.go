@@ -255,6 +255,22 @@ func (d *DB) HasActiveTaskByRef(taskType string, refID int64) (bool, error) {
 	return n > 0, err
 }
 
+// CancelStaleQueuedTasks §QUEUE-DRAIN-20261112：把 chain_day 早于 day 的排队任务标 cancelled。
+// 每天 00:00 会排一整条夜间链，某天没跑完就会永久堆积（11-12 现网 63 条 queued、最早
+// 可追到 11-02），拖慢前端列表与 researchd 出队扫描。只动 queued、只动有 chain_day 的
+// 自动链任务，绝不碰 running/preempted/done 与手动任务；当日链一律保留。
+// English: cancel stale queued nightly chains from earlier days, keep today's chain.
+func (d *DB) CancelStaleQueuedTasks(day string) (int64, error) {
+	now := nowStr()
+	res, err := d.db.Exec(`UPDATE research_tasks SET status=?, error=?, finished_at=?, updated_at=?
+		WHERE status=? AND chain_day<>'' AND chain_day<?`,
+		TaskCancelled, "§QUEUE-DRAIN 历史夜间链过期清理（保留当日链）", now, now, TaskQueued, day)
+	if err != nil {
+		return 0, fmt.Errorf("cancel stale queued tasks: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 // QueuedTaskCount §QUEUE-CAP-20261112：当前待执行任务数（queued + preempted，
 // 与 DequeueHighestTask 的候选集合同口径），供自动夜间链入队前做队列深度上限判定。
 // English: number of pending tasks (queued + preempted) for the queue-depth cap.
