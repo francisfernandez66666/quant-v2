@@ -560,7 +560,14 @@ func (d *DB) BackfillRealPositionAnchors() (filled, remaining int64, err error) 
 // English: R3-8 P1-G — user-scoped full reconciliation write: stamps ownership on every row,
 // deletes only this account's rows plus legacy global rows; never touches other accounts' rows.
 // An empty pos means "gateway flat" — the caller must have verified the channel is connected.
-func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, error) {
+// strict 可选（§OWNER-SCOPE-20261112）：仅柜台回报通道传 true —— 严格只操作
+// `user_id = ?` 的行，**不抢占、也不删除 `user_id=''` 的遗留全局行**。
+// 事故背景：11-12 08:52 admin 的一帧持仓快照（只有 000520.SZ qty=0）经默认口径
+// 把全库 `user_id=''` 的行 claim/DELETE 掉，facai 账号的实盘持仓随之清零。
+// 柜台数据只属于持有物理机的 owner 账号，绝不允许顺手清理「共享全局桶」。
+// 不传 strict 的既有调用方保持原兼容语义（含单测），行为一字不变。
+func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition, strict ...bool) (int, error) {
+	isStrict := len(strict) > 0 && strict[0]
 	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 非法即整批拒收不落库，
 	// 上层据 ErrInvalidPositionReport 回 400（网关 outbox 按 4xx 永久拒绝进死信，不无限重推）。
 	if err := validateRealPositions(pos); err != nil {
@@ -595,7 +602,9 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 		}
 		// §P0-1 多租户主键：同一股票先声明遗留全局行，避免复合主键冲突产生重复行。
 		// English: claim any legacy global row for this account before upserting.
-		if userID != "" {
+		// §OWNER-SCOPE：严格模式（柜台回报）不 claim —— 全局行可能属于别的账号，
+		// 抢占等于把别人的持仓改写成 owner 名下；宁可留孤儿行，也不串号。
+		if userID != "" && !isStrict {
 			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, userID, p.TsCode); err != nil {
 				return 0, fmt.Errorf("claim legacy position %s: %w", p.TsCode, err)
 			}
@@ -702,13 +711,23 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 		// re-surfacing as phantom positions after a full reconcile. Real multi-tenant scoped rows are
 		// untouched; a genuine legacy row gets converted to scoped earlier in this transaction via the
 		// claim UPDATE, so what this deletes is only ownerless stale rows.
-		if _, err := tx.Exec(`DELETE FROM real_positions WHERE (user_id = ? OR user_id = '') AND ts_code NOT IN (`+placeholders+`)`,
-			append([]any{userID}, codes...)...); err != nil {
+		// §OWNER-SCOPE-20261112：柜台回报走严格模式，删除范围只含本账号自己的行；
+		// 默认模式保留 P2#17 的 `OR user_id=''` 遗留全局行清理，供非柜台调用方使用。
+		delSQL := `DELETE FROM real_positions WHERE (user_id = ? OR user_id = '') AND ts_code NOT IN (` + placeholders + `)`
+		delArgs := append([]any{userID}, codes...)
+		if isStrict {
+			delSQL = `DELETE FROM real_positions WHERE user_id = ? AND ts_code NOT IN (` + placeholders + `)`
+		}
+		if _, err := tx.Exec(delSQL, delArgs...); err != nil {
 			return 0, err
 		}
 	}
 	var n int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM real_positions WHERE user_id = '' OR user_id = ?`, userID).Scan(&n); err != nil {
+	countSQL := `SELECT COUNT(*) FROM real_positions WHERE user_id = '' OR user_id = ?`
+	if isStrict {
+		countSQL = `SELECT COUNT(*) FROM real_positions WHERE user_id = ?`
+	}
+	if err := tx.QueryRow(countSQL, userID).Scan(&n); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -1501,7 +1501,9 @@ export default function Positions() {
             </Card>
           ) : (
             <Card>
-              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} empty="暂无实盘持仓" />
+              {/* §FIX-20261112：tdesign 未传 total 时页脚错显「共 0 条数据」且翻页按钮不可用
+                  （与 §FIX-20260902 的 Research/Signals/Hotspot/LLMDebug 同形），必须显式给 total。 */}
+              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100], total: realPositions.length }} empty="暂无实盘持仓" />
               {/* §ADVICE-TACTICS A：战法开关做的是**硬过滤**（owner 裁决），所以"滤掉几条"必须自己上屏
                   ——不然屏上少了几条加仓建议与"今天本来就没有几条信号"在用户眼里是同一张脸。
                   读数未知（旧一轮载荷没带这个键）时整行不渲染，绝不显示「另有 0 条」。 */}

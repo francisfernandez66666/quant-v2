@@ -2149,15 +2149,17 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 	// 为什么放在这里而不是 dispatchLive：autoPlaceScaled 是实盘买入的唯一执行入口
 	// （主循环/5s 轮/测试都从这里走），判据单点；散在两处就会两套账。
 	// English: external-brain gate — tiers 2/3/4 stop new live buys only; exits keep their path.
-	if blocked, ebCode, ebReason := ctrl.ExternalBrainBlocksAutoBuy(); blocked {
-		ebTag := fmt.Sprintf("external-brain-%d", ebCode)
-		log.Printf("[qmt-gate] %s(%s) %s/%s 自动下单跳过: %s（%s）",
-			sig.Code, sig.Name, sig.StrategyID, sig.Strategy, ebTag, ebReason)
-		opslog.DayOnce("auto-gate:"+ebTag+":"+sig.Code, func() {
-			opslog.Logf("quant", "auto下单跳过 %s(%s) 策略=%s/%s 原因=%s 外脑模式=%s",
-				sig.Code, sig.Name, sig.StrategyID, sig.Strategy, ebTag, ebReason)
-		})
-		return
+	// §TRADE-LIST-20261112（owner：交易信号 tab 应取「持仓余额 + 量化计算结果」给推荐）：
+	// 拦截点由「算预算之前」下移到「动态预算算完 + 决策快照落库之后」。原实现在这里直接
+	// return，通道一断就既不跑 dynamicBuyQty、也不写 signal_decisions，于是
+	// /api/signals/trades 整天恒空（11-12 现网日志刷满 external-brain-3）。
+	// 现在：预算照算、live 决策行照落（stage=evaluated、qty>0、reason 点名未发单），
+	// 但**绝不发单**——档 2/3/4 停开新仓的安全语义一字未改。
+	var ebBlocked bool
+	var ebCode int64
+	var ebReason string
+	if blocked, code, reason := ctrl.ExternalBrainBlocksAutoBuy(); blocked {
+		ebBlocked, ebCode, ebReason = true, code, reason
 	}
 	cfg := ctrl.Config()
 	// §DYN-SIZE-v3：动态预算模式——动态仓位是唯一预算决策者，旧的固定金额/战法金额/每日闸/
@@ -2426,6 +2428,27 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		return
 	}
 	// §DECISION-TODAY：无论放行还是被拦都落一行快照（"没买"也必须有解释）。
+	// §TRADE-LIST-20261112：外脑闸（档 2/3/4）在这里才真正拦截——预算读数已按
+	// 持仓余额 + 动态仓位算出并落库（交易信号 tab 因此不再恒空），但绝不发单。
+	if ebBlocked {
+		if dec != nil {
+			note := fmt.Sprintf("外脑档%d（%s）：仅出建议、未发单", ebCode, ebReason)
+			if strings.TrimSpace(dec.SkipReason) != "" {
+				dec.SkipReason += "；" + note
+			} else {
+				dec.SkipReason = note
+			}
+		}
+		e.persistDynBuyDecision(sig, dec)
+		ebTag := fmt.Sprintf("external-brain-%d", ebCode)
+		log.Printf("[qmt-gate] %s(%s) %s/%s 自动下单跳过: %s（%s）；预算建议已落决策快照",
+			sig.Code, sig.Name, sig.StrategyID, sig.Strategy, ebTag, ebReason)
+		opslog.DayOnce("auto-gate:"+ebTag+":"+sig.Code, func() {
+			opslog.Logf("quant", "auto下单跳过 %s(%s) 策略=%s/%s 原因=%s 外脑模式=%s（预算建议已落库）",
+				sig.Code, sig.Name, sig.StrategyID, sig.Strategy, ebReason, ebTag)
+		})
+		return
+	}
 	e.persistDynBuyDecision(sig, dec)
 	if dynamicBudget && qty <= 0 {
 		// 具体原因在 dynamicBuyQty 内已按 DayOnce 留痕；这里只结束本单。

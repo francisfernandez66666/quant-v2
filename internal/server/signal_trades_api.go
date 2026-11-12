@@ -24,7 +24,13 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// handleSignalTrades 装配「交易信号」tab 的可执行建议列表：只读当前账号当日的
+// signal_decisions，挑出 live 通道、且动态仓位算出正股数的决策行，再复用
+// /api/signals 的卡片装配与 5s 快照现价一并下发。
+// §TRADE-LIST-20261112：判据由「仅 stage=placed」放宽为「placed 或 evaluated」——
+// 实盘通道从不写 placed（见 engine.persistDynBuyDecision），原判据对实盘恒空。
 func (s *Server) handleSignalTrades(w http.ResponseWriter, r *http.Request) {
+	// 真库与当日键：库不可用时显式 503，不伪装成「今天没有信号」的空列表。
 	db := s.realDB()
 	if db == nil {
 		writeError(w, http.StatusServiceUnavailable, "real book not available")
@@ -46,10 +52,18 @@ func (s *Server) handleSignalTrades(w http.ResponseWriter, r *http.Request) {
 	for _, it := range items {
 		// 2026-11-11 owner 实锤：纸面通道的决策（纸面账资金只有几千块）混进交易列表，
 		// 推出 ¥287 的碎单——与实盘动态仓位（10 万成本）完全不挂钩。交易列表/弹窗只认
-		// **live（实盘）通道 + stage=placed**；纸面决策留在「动态仓位」tab 里看。
-		// English: live-channel placed decisions only; paper stays in the decisions tab.
-		if !strings.EqualFold(strings.TrimSpace(it.Stage), "placed") ||
-			!strings.EqualFold(strings.TrimSpace(it.Channel), "live") {
+		// **live（实盘）通道**；纸面决策留在「动态仓位」tab 里看。
+		//
+		// §TRADE-LIST-20261112 修正「实盘恒空」：原判据要求 stage=placed，但实盘通道的
+		// persistDynBuyDecision 只写 evaluated/skipped（placed 是 paper.DecisionRecord
+		// 专用 stage），所以这个组合在生产永远凑不齐 —— 11-12 现网 live.db 里今天
+		// 只有 paper 的 18 条 placed，live 一条都没有。owner 口径：交易信号 = 取
+		// 持仓余额 + 量化计算结果给出的可执行建议，因此 live + evaluated + qty>0
+		// 就是一条合法建议；真正发单成功仍以 placed 为准，两者用 order_state 区分。
+		// 通道断链（外脑档 2/3/4）时引擎仍会落 evaluated 行并在 reason 点名未发单。
+		stage := strings.ToLower(strings.TrimSpace(it.Stage))
+		if !strings.EqualFold(strings.TrimSpace(it.Channel), "live") ||
+			(stage != "placed" && stage != "evaluated") || it.Qty <= 0 {
 			continue
 		}
 		placed = append(placed, it)
@@ -81,8 +95,15 @@ func (s *Server) handleSignalTrades(w http.ResponseWriter, r *http.Request) {
 			price = info.Price
 			priceKind = "live"
 		}
+		orderState := "建议未发单"
+		if strings.EqualFold(strings.TrimSpace(it.Stage), "placed") {
+			orderState = "已发单"
+		}
+		// 决策字段原样透传，另带 stage / order_state 让调用方区分「已发单」与
+		// 「仅出建议、未发单」：通道断链时引擎仍会落 evaluated 行，reason 里点名原因。
 		row := map[string]interface{}{
 			"at": it.At, "channel": it.Channel, "code": it.Code,
+			"stage": it.Stage, "order_state": orderState,
 			"strategy_key": it.Strategy, "signal_id": it.SignalID,
 			"qty": it.Qty, "notional": it.Notional,
 			"market_scale": it.MarketScale, "stock_scale": it.StockScale,

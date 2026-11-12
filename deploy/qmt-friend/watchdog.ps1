@@ -49,7 +49,19 @@ function Test-TradingDay {
     # 或交易日整天不动（远端"没下单"最容易被误读成网络问题，11-02 的 J0 同族教训）。
     # 日历文件不可得时该模块自己退化成"只看周末"并打一条日志——那是可见的降级，不是静默。
     $tc = Join-Path $GatewayDir "trading_calendar.py"
-    if (-not (Test-Path $tc)) { return $false }
+    # §KEEPALIVE-20261112：日历模块/解释器缺失时**不许静默返回 false**。原实现会让
+    # ClientEnsure 每轮都打 not_trading_day 然后整天不拉起客户端，而日志看起来「一切正常」。
+    # 降级为「本地非周末即按交易日处理」：宁可休市日多开一次会话，也不能让交易日整天漏拉。
+    if (-not (Test-Path $tc)) {
+        Write-Host "WD mode=$Mode action=warn reason=no_trading_calendar"
+        $dow = (Get-Date).DayOfWeek
+        return ($dow -ne "Saturday" -and $dow -ne "Sunday")
+    }
+    if (-not (Test-Path $PythonExe)) {
+        Write-Host "WD mode=$Mode action=warn reason=python_exe_missing path=$PythonExe"
+        $dow = (Get-Date).DayOfWeek
+        return ($dow -ne "Saturday" -and $dow -ne "Sunday")
+    }
     $eapT = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     & $PythonExe $tc 2>$null | Out-Null
@@ -83,6 +95,15 @@ if (Test-Path $envFileWd) {
 switch ($Mode) {
     "ClientEnsure" {
         Invoke-Guarded {
+            # §KEEPALIVE-20261112：本腿每 10 分钟一轮，必须自带时段闸。
+            # 15:30 的关闭门会把客户端收掉，若这里不设上界，15:40 又会被重新拉起来过夜；
+            # 夜里/周末也不该空跑。窗口 08:25-15:25，收盘前 5 分钟停止补拉。
+            $now = Get-Date
+            $winStart = $now.Date.AddHours(8).AddMinutes(25)
+            $winEnd   = $now.Date.AddHours(15).AddMinutes(25)
+            if ($now -lt $winStart -or $now -gt $winEnd) {
+                Anchor "abort" "outside_ensure_window"; exit 0
+            }
             if (-not (Test-TradingDay)) { Anchor "abort" "not_trading_day"; exit 0 }
             $running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq "XtItClient" }
             if ($running) { Anchor "already" "client_running"; exit 0 }

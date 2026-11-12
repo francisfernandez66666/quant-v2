@@ -191,12 +191,18 @@ def rebuild_snapshots(qc, rules, wl):
     d2["factor_rules"] = sel
     d2["captured_at"] = now
     d2["source"] = "gz auth.json+applied_factors.json (carrier_hot_reload_gz)"
+    # §OWNER-SCOPE-20261112：下发载荷显式带归属账号，盒子回传时按同一 uid 对齐，
+    # 杜绝「一批白名单/参数被别的账号的物理机领走并回报到别人账上」。
+    d2["owner_user_id"] = OWNER_UID
+    d2["user_id"] = OWNER_UID
     json.dump(d2, open(os.path.join(qg, "strategy_switches_snapshot.json"), "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 
     snap = {
         "captured_at": now,
         "source": "gz:/var/lib/quant-trading-v2/auth.json (carrier_hot_reload_gz)",
+        "owner_user_id": OWNER_UID,   # §OWNER-SCOPE-20261112 交易权限分发的归属账号
+        "user_id": OWNER_UID,
         "configs": [{"user_id": OWNER_UID, "key": "quant_config_json_v1",
                      "has_qmt_strategies": True, "rules": scrub(qc)}],
         "applied_factor_ids": [r.get("id") for r in rules],
@@ -342,6 +348,10 @@ def main():
     manifest = {
         "strategy_version": ver,
         "strategy_sha256": sha_art,
+        # §OWNER-SCOPE-20261112：manifest 直接落到 accounts/<OWNER_UID>/ 且带 uid，
+        # 盒子拉取后校验「这批载体参数属于哪个账号」，只允许该账号的柜台回报回写。
+        "owner_user_id": OWNER_UID,
+        "user_id": OWNER_UID,
         "artifact_url": "%s/leg/carrier/qmt_internal_strategy_%s.py" % (BASE_URL, ver),
         "updated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "request_state": "pending",

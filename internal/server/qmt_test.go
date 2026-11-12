@@ -41,6 +41,76 @@ func TestQMTEndpointsUnavailableWithoutDB(t *testing.T) {
 	}
 }
 
+// TestHandleRealPositionsFiltersZeroQty §ZERO-QTY-FILTER（2026-11-12 owner 需求）：
+// 券商清仓当日仍导出「数量 0 / 成本 0」的持仓行，uplink 原样上报后会在实盘持仓页
+// 挂成僵尸行（截图：000520.SZ 凤凰航运 数量 0，页脚却写「共 0 条数据」）。
+// 读侧响应层必须把 qty<=0 的行统一滤掉，counter / manual 两条来源都不例外。
+func TestHandleRealPositionsFiltersZeroQty(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1200},
+		{TsCode: "000520.SZ", Name: "凤凰航运", Qty: 0, CostPrice: 0},
+	}); err != nil {
+		t.Fatalf("seed positions: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	s.handleRealPositions(rr, httptest.NewRequest(http.MethodGet, "/api/positions/real", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Positions []store.RealPosition `json:"positions"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode positions: %v", err)
+	}
+	if len(out.Positions) != 1 || out.Positions[0].TsCode != "600519.SH" {
+		t.Fatalf("已清仓的 qty=0 行必须被过滤，实际=%+v", out.Positions)
+	}
+}
+
+// TestCounterReportStrictScopeKeepsOtherAccounts §OWNER-SCOPE-20261112 事故回归：
+// 11-12 08:52 admin 的一帧持仓快照把全库 user_id='' 的遗留全局行 claim/DELETE 掉，
+// facai 账号的实盘持仓随之清零。柜台回报走 strict 模式后，只准增删 owner 自己
+// scoped 的行，其它账号行与遗留全局行一律不许碰。
+func TestCounterReportStrictScopeKeepsOtherAccounts(t *testing.T) {
+	_, db, _ := newTestResearchServer(t)
+	const owner, other = "u_admin", "u_facai"
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10, UserID: owner},
+		{TsCode: "000001.SZ", Name: "平安", Qty: 200, CostPrice: 50, UserID: other},
+		{TsCode: "000520.SZ", Name: "凤凰航运", Qty: 300, CostPrice: 2, UserID: ""},
+	}); err != nil {
+		t.Fatalf("seed multi-account positions: %v", err)
+	}
+	// owner 柜台快照：只剩一只新票，其余（含遗留全局桶里的 000520）都不在本帧里。
+	if _, err := db.ReconcilePositionsForUser(owner, []store.RealPosition{
+		{TsCode: "600519.SH", Name: "贵州茅台", Qty: 50, CostPrice: 1200},
+	}, true); err != nil {
+		t.Fatalf("strict reconcile: %v", err)
+	}
+	all, err := db.RealPositions()
+	if err != nil {
+		t.Fatalf("read all positions: %v", err)
+	}
+	byCode := map[string]string{}
+	for _, p := range all {
+		byCode[p.TsCode] = p.UserID
+	}
+	if uid, ok := byCode["000001.SZ"]; !ok || uid != other {
+		t.Fatalf("别的账号持仓被柜台回报误删/改写: %+v", byCode)
+	}
+	if uid, ok := byCode["000520.SZ"]; !ok || uid != "" {
+		t.Fatalf("遗留全局行被柜台回报误删/抢占: %+v", byCode)
+	}
+	if _, ok := byCode["600000.SH"]; ok {
+		t.Fatalf("owner 自己已不在快照中的旧持仓未被清理: %+v", byCode)
+	}
+	if uid, ok := byCode["600519.SH"]; !ok || uid != owner {
+		t.Fatalf("owner 新快照未落到自己名下: %+v", byCode)
+	}
+}
+
 // TestHandleQMTReportTrade 成交回报 → ApplyRealFill 落库 → handleRealPositions 可读回。
 // English: a trade report persists via ApplyRealFill and is readable back through handleRealPositions.
 func TestHandleQMTReportTrade(t *testing.T) {

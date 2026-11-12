@@ -283,6 +283,22 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// §ZERO-QTY-FILTER（2026-11-12 owner 需求）：已清仓（qty<=0）的行不属于「持仓清单」，
+	// 柜台导出在清仓当日仍会保留该票一行（数量 0 / 成本 0），uplink 原样上报后
+	// ReconcilePositionsForUser 又把它 upsert 回来 → 实盘持仓页挂着「数量 0」的僵尸行。
+	// 在这里统一过滤响应，counter 与 manual 两条来源都汇入同一个 positions 变量，
+	// 一处覆盖 web / mobile / e2e 全部消费端；不改 real_positions 表的证据链，
+	// 也不影响空快照守卫、风控 T+1 判定等其它读口。
+	// §OWNER-SCOPE-20261112：遗留全局行（user_id=''）只对运营账号本人可见，
+	// 其它账号一律只认自己 user_id 的行 —— 柜台持仓/金额只属于持有物理机的 admin。
+	allowLegacy := uid == s.operatorID()
+	filtered := make([]store.RealPosition, 0, len(positions))
+	for _, p := range positions {
+		if p.Qty > 0 && (p.UserID == uid || (allowLegacy && p.UserID == "")) {
+			filtered = append(filtered, p)
+		}
+	}
+	positions = filtered
 	// §联调修复：装配实时现价（CurPrice）供前端实盘持仓"现价/浮动盈亏"列展示。
 	// 网关回报仅含 cost_price，实时价取自 fetcher 5s 快照（缺则按 TS 代码变换重试一次）。
 	// 不影响持久化（real_positions 仍按网关为准 upsert），仅响应层补充展示字段。
@@ -864,6 +880,19 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid report body")
 		return
 	}
+	// §OWNER-SCOPE-20261112：回报体必须带 user_id（盒子回传侧的归属声明）。
+	// 归属判据仍然只信网关 token（§安全 T1，防越权写面）；声明不一致不改归属，
+	// 但必须留痕告警——这说明盒子贴了别的账号的配置/钥匙，是串号事故的前兆。
+	if ev.UserID == "" {
+		opslog.DayOnce("report-no-uid:"+uid, func() {
+			opslog.Logf("quant", "柜台回报未带 user_id（token=%s）：归属按 token 判定，请检查盒子 config.xt.json 的 user_id/owner_user_id", uid)
+		})
+	} else if ev.UserID != uid {
+		opslog.DayOnce("report-uid-mismatch:"+uid+":"+ev.UserID, func() {
+			opslog.Logf("quant", "柜台回报 user_id 与网关 token 归属不一致：token=%s body=%s（归属以 token 为准）", uid, ev.UserID)
+		})
+		log.Printf("[trading] ⚠ 柜台回报归属声明不一致 token=%s body=%s（以 token 为准）", uid, ev.UserID)
+	}
 	ctrl := s.qmtCtrlFor(uid)
 	if ctrl != nil {
 		// 上行通道新鲜度：任何回报到达都刷新 last_report_at（互通健康展示用）。
@@ -879,8 +908,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 全量对账（按用户 reconcile）：以本次快照为准写入该账号持仓，并移除该账号范围内已不在
 		// 快照中的旧持仓。使用 ReconcilePositionsForUser 而非 UpsertRealPositions —— 后者是
 		// 全表覆盖（空快照会 DELETE FROM real_positions 清全表），多账号下会误删他人持仓、造成
-		// 跨账号持仓泄漏甚至误卖。按用户 reconcile 后，空快照只清空本账号（含遗留全局行），
-		// 绝不波及任何其它账号的数据。
+		// 跨账号持仓泄漏甚至误卖。按用户 reconcile 后，空快照只清空本账号；
+		// §OWNER-SCOPE-20261112 起走严格模式（strict=true），连 user_id='' 的遗留全局行
+		// 也不再 claim/删除 —— 那一桶可能属于别的账号，绝不波及任何其它账号的数据。
 		// §安全 T1（2026-08-29）：归属账号一律以网关 token 解析出的 uid 为准，
 		// 忽略 body 携带的 user_id——防止持有 A 账号网关 token 者借 ev.UserID 越权写入/清空任意账号持仓。
 		// 此前"网关 user_id > token uid"的优先级是越权写面。
@@ -934,7 +964,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 		// 守卫通过（空快照且本地确实无持仓，或非空快照）：按用户范围全量对账落库。
 		// ReconcilePositionsForUser 以本账号为界做 upsert+删除，绝不触碰其它账号数据。
-		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions); err != nil {
+		// §OWNER-SCOPE-20261112：柜台回报严格按 token 归属，只增删 owner 自己 scoped 的行，
+		// 绝不碰 user_id='' 的遗留全局桶（否则一帧 admin 快照会清掉其它账号的持仓）。
+		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions, true); err != nil {
 			// §F2（2026-09-22 修复批）：store 入口的字段级校验失败（任一行 ts_code 空/非法格式）
 			// → 整批拒收 400（留痕已在 store 侧 opslog 完成）。4xx 会被网关 outbox 按永久拒绝
 			// 移入死信表，不会无限重推刷屏；其余落库错误仍回 500 触发重推。

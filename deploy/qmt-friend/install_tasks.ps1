@@ -6,7 +6,10 @@
 #   3) 看门狗自己死了也要有人再把它叫起来（任务计划就是那个"守门人的守门人"）。
 #
 # 六个任务（名字固定，卸载按全部逐个删）：
-#   QMTF-Client-Ensure   工作日 08:35  → watchdog -Mode ClientEnsure   （判交易日、必要时拉起客户端）
+#   QMTF-Client-Ensure   盘中每 10 分钟 → watchdog -Mode ClientEnsure  （交易日/时段闸内判客户端在不在，掉了就补拉）
+#                         §KEEPALIVE-20261112：原为 DAILY 08:35 单次，那一次若判交易日失败或客户端
+#                         晚于 08:35 才登录/崩掉，整天不再补拉 —— 11-12 现网即因此整天无 QMT、
+#                         网关 8789 closed、云端 external-brain-3 拒发所有买入单。
 #   QMTF-Client-Start    按需被调用    → 直接起 XtItClient.exe（/IT 交互式，客户端唯一合法拉起通道）
 #   QMTF-Gateway-Start   按需被调用    → 直接拉起 gateway.py（读 friend.env 注入 QUANT_GATEWAY_BIND/ALLOWED_IPS；
 #                                     无交易日闸门，纯拉起，装填器自证与看门狗兜底都走它）
@@ -71,7 +74,7 @@ if ($Uninstall) {
 
 # 六条注册。schtasks 的 /TR 里嵌套引号只能按这种写法转义，PS 5.1 没有更干净的等价物。
 $jobs = @(
-    @{ Name = $T1; Sc = "DAILY"; St = "08:35"; Tr = (Tr "ClientEnsure"); It = $true },
+    @{ Name = $T1; Sc = "MINUTE"; Mn = 10; St = "08:25"; Tr = (Tr "ClientEnsure"); It = $true },
     @{ Name = $T2; Sc = "ONCE";  St = "23:59"; Tr = ('"{0}"' -f $QmtExe); It = $true },
     @{ Name = $T3; Sc = "MINUTE"; Mn = 5; Tr = (Tr "GatewayEnsure"); It = $false },
     @{ Name = $T4; Sc = "MINUTE"; Mn = 5; Tr = (Tr "Close"); It = $false },
@@ -130,7 +133,10 @@ foreach ($j in $jobs) {
     $args1 = @("/Create", "/TN", $j.Name, "/TR", $j.Tr, "/SC", $j.Sc)
     if ($j.Sc -eq "DAILY") { $args1 += @("/ST", $j.St) }
     if ($j.Sc -eq "ONCE") { $args1 += @("/ST", $j.St, "/SD", (Get-Date -Format "yyyy/MM/dd")) }
-    if ($j.Sc -eq "MINUTE") { $args1 += @("/MO", $j.Mn) }
+    if ($j.Sc -eq "MINUTE") {
+        $args1 += @("/MO", $j.Mn)
+        if ($j.St) { $args1 += @("/ST", $j.St) }   # 保活腿：08:25 起跑，之后每 10 分钟一轮
+    }
     if ($j.It) { $args1 += "/IT" }   # 交互式：客户端必须有桌面会话
     $args1 += "/F"
     & schtasks @args1 | Out-Null
