@@ -482,6 +482,14 @@ def _buy_confirmed(symbol, now_ts):
     rounds = int(PARAMS.get("buy_confirm_rounds", 2))
     gap = float(PARAMS.get("buy_confirm_min_gap_sec", 60))
     seen = _STATE["buy_seen"].setdefault(symbol, [])
+    # CONFIRM-FIX-20261112: the old code appended EVERY round's timestamp, so
+    # with the ~6s round cadence the last two observations were always ~6s
+    # apart and gap=60 could never pass -- 67 live intents sat in
+    # confirm_gap_pending forever (14:17 box log). Fixed: only record an
+    # observation once the gap since the LAST RECORDED one has elapsed; each
+    # recorded observation then advances the count.
+    if seen and now_ts - seen[-1] < gap:
+        return False, "confirm_gap_pending"
     seen.append(now_ts)
     del seen[:-rounds]
     if len(seen) < rounds:
