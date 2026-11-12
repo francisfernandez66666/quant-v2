@@ -100,6 +100,7 @@ func (e *Engine) buildNewsGateSnapshot(d1Scores map[string]combat_agent.D1Score,
 		sectorHit := map[string]bool{}
 		for _, ev := range events {
 			if !strings.Contains(ev.Direction, "利空") || ev.Score > cfg.NewsGateSectorScoreMin {
+				// 非明确利空或强度未达阈值的事件不参与板块否决，直接跳过。
 				continue
 			}
 			for _, sec := range ev.Sectors {

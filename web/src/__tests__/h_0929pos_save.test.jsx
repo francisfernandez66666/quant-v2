@@ -125,7 +125,7 @@ function addDialogOpen() {
 
 // 走"新增持仓"这条真实交互链：点页头按钮 → 填代码/成本/数量 → 点确定（=confirmAdd）
 async function addHolding(code, cost, qty) {
-  fireEvent.click(await screen.findByText('+ 新增持仓'))
+  fireEvent.click(await screen.findByText(/\+ 新增持仓/))
   await fill('输入代码', code)
   await fill('成本价', cost)
   await fill('持股数量', qty)

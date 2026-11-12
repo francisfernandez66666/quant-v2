@@ -17,10 +17,10 @@ package factor
 
 // d1Array 安全取 D1 列，空序列返回 nil（用例层过滤）。
 func d1Array(s *StockSeries) []float64 {
-	if s == nil || len(s.Dates) == 0 {
+	if s == nil {
 		return nil
 	}
-	return s.D1
+	return fieldOrNaN(s.D1, s.Len())
 }
 
 // init 注册 D1 事件因子（§NEWS-GATE R7：D1 彻底作为因子，引入信号生成）。

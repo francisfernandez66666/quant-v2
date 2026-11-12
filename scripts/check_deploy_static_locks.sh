@@ -123,12 +123,11 @@ check("L3.register_web_service 引用 ${ProbeCaddyPort}（§H8 同源）", "$Pro
 check("L3.register validate stderr 撕裂+适配器已修（M7b-1）",
       '$eapPrev' in webps and '--adapter caddyfile --config $CaddyConfSrc' in webps
       and '2>&1 | ForEach-Object { Write-Host "  $_" }' not in webps)
-conf = rd("deploy/caddy/guangzhou.conf")
+conf = rd("deploy/gz-ubuntu/Caddyfile")
 cm = re.search(r"\$ProbeCaddyPort\s*=\s*(\d+)", probe)
 qm = re.search(r"\$ProbeQuantPort\s*=\s*(\d+)", probe)
-check("L3.guangzhou.conf 静态口 = $ProbeCaddyPort",
-      bool(cm) and bool(re.search(r":" + cm.group(1) + r"\s*\{", conf)), "未找到监听块 :" + (cm.group(1) if cm else "?"))
-check("L3.guangzhou.conf 反代目标 = 127.0.0.1:$ProbeQuantPort",
+check("L3.gz-ubuntu/Caddyfile 站点块在位", "quant-trading.top {" in conf)
+check("L3.gz-ubuntu/Caddyfile 反代目标 = 127.0.0.1:$ProbeQuantPort",
       bool(qm) and ("reverse_proxy 127.0.0.1:" + qm.group(1)) in conf)
 check("L3.register_engine_services 仍 dot-source 探针单源（§H8 不得破）",
       'Join-Path $PSScriptRoot "service_probe_config.ps1"' in rd("deploy/qmt-win/register_engine_services.ps1"))

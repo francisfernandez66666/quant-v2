@@ -6,9 +6,23 @@
 #     也不带 on_demand_tls 全局块（首尔那套是给通配符子域按需求签发用的）。
 #   - /assets/* 带内容 hash，长缓存 immutable；index.html 与 /api/* 一律 no-store。
 # 部署前用 `caddy validate --config /etc/caddy/Caddyfile` 静态自证。
+#
+# 2026-11-13 UAT 修复批（docs/UAT_FIX_PLAN_20261112.md F1/F2/F3）：
+#   站点级四安全头 + -Server、/assets 404 不再 immutable、SPA 深链回落、/setup 显式 404、/dl 分发。
+#   模板来源为退役 Windows 配置 deploy/caddy/guangzhou.conf，root 已换 Linux 路径。
 
 quant-trading.top {
 	encode gzip
+
+	# §F-08 站点级安全头：所有响应统一带；HSTS 首版不带 includeSubDomains
+	# （DNS 侧其他子域尚未取证，先不把它们钉进强制 HTTPS）
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		X-Frame-Options "DENY"
+		-Server
+	}
 
 	handle /api/* {
 		reverse_proxy 127.0.0.1:8081
@@ -18,6 +32,37 @@ quant-trading.top {
 	# 只反代 /api/* 会让它落进下面的 file_server 被当成静态文件 → 404，判据永远红。
 	handle /livez {
 		reverse_proxy 127.0.0.1:8081
+	}
+
+	# 初始化入口不公开；显式 404，避免被 SPA 兜底成 200 HTML
+	handle /setup {
+		respond 404
+	}
+
+	# /dl 无尾斜杠显式 301：SPA try_files 会吞掉隐式 308，故必须显式处理
+	handle /dl {
+		redir * /dl/ 301
+	}
+
+	# /dl/*：落地页优先，其余按 APK 文件分发（云端 /opt/quant/apk/quant-latest.apk 已在位）
+	# 不上 immutable，保留 Range 断点续传
+	handle /dl/* {
+		@landing path /dl/ /dl/index.html
+		handle @landing {
+			root * /opt/quant/web
+			rewrite * /dl/index.html
+			file_server
+		}
+		handle {
+			uri strip_prefix /dl
+			root * /opt/quant/apk
+			header {
+				Content-Type "application/vnd.android.package-archive"
+				Content-Disposition "attachment; filename=\"quant-latest.apk\""
+				Cache-Control "no-cache"
+			}
+			file_server
+		}
 	}
 
 	# handle_path 会自动剥掉 /apk 前缀，避免映射到 /opt/quant/apk/apk/<name>
@@ -35,13 +80,31 @@ quant-trading.top {
 		file_server
 	}
 
+	# §F-01/§F-05：/assets/* 单独一条，严禁 try_files——否则缺失的哈希名会被回落成
+	# index.html 200，把「404 不缓存」的判据直接废掉。
+	# 默认 no-store 兜住 404；磁盘上真实存在的文件再覆盖成长缓存。
+	# route 保留字面顺序：后一条 @asset 覆盖必须在默认 no-store 之后执行。
+	handle /assets/* {
+		root * /opt/quant/web
+		route {
+			header Cache-Control "no-store"
+			@asset file {http.request.uri.path}
+			header @asset Cache-Control "public, max-age=31536000, immutable"
+			file_server
+		}
+	}
+
+	# §F-01：SPA 深链回落（刷新/书签/微信点链接不再 0 字节白页）
+	# 必须用 route 保留字面顺序：Caddy 默认指令序里 header 早于 try_files，
+	# 平铺时 @html 看到的是原始请求路径，回落后的 index.html 就永远拿不到 no-store。
 	handle {
 		root * /opt/quant/web
-		file_server
-		@html path /
-		header @html Cache-Control "no-store"
-		@assets path /assets/*
-		header @assets Cache-Control "public, max-age=31536000, immutable"
+		route {
+			try_files {path} /index.html
+			@html path / /index.html
+			header @html Cache-Control "no-store"
+			file_server
+		}
 	}
 
 	request_body {

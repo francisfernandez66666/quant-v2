@@ -1707,8 +1707,8 @@ grep -q 'GET /api/app/version' internal/server/server.go || { echo "--- FAIL: �
 # 负锁：该端点注册行若被 authMiddleware 包裹=登录前更新检查死锁（v1 登不进即永远收不到更新单）。
 if grep -n 'GET /api/app/version' internal/server/server.go | grep -q 'authMiddleware'; then
 	echo "--- FAIL: /api/app/version 被套鉴权（§APPVER 登录前检查死锁复活）"; exit 1; fi
-grep -q 'handle /dl/\*' deploy/caddy/guangzhou.conf || { echo "--- FAIL: Caddy APK 分发块丢失（§APPVER 下载 404）"; exit 1; }
-grep -q 'quant-latest.apk' scripts/deploy_guangzhou.sh || { echo "--- FAIL: APK 分发同步步丢失（§APPVER [3c]）"; exit 1; }
+grep -qE '^[[:space:]]*handle /dl/\*' deploy/gz-ubuntu/Caddyfile || { echo "--- FAIL: Caddy APK 分发块丢失（现网 gz-ubuntu）"; exit 1; }
+grep -q 'quant-latest.apk' deploy/gz-ubuntu/Caddyfile || { echo "--- FAIL: APK 分发文件名丢失（现网 gz-ubuntu）"; exit 1; }
 grep -q 'UpdateGate' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "--- FAIL: 原生强制更新闸未接线（§APPVER）"; exit 1; }
 grep -qE 'versionCode = ([2-9]|[1-9][0-9])' mobile/app/build.gradle.kts || { echo "--- FAIL: APK 版本仍停在无更新通道的 1（§APPVER 跃迁回退）"; exit 1; }
 echo "ok - §ROOTQMT/§APPVER 专项守卫通过（行为锁 1 组 + 静态锁 7 道 + 鉴权负锁）"
@@ -14343,14 +14343,14 @@ fail2026() {
   exit 1
 }
 # W1 Caddy：两站点块同构的深链/资产/APK/安全头/初始化入口
-[ "$(grep -c 'try_files {path} /index.html' deploy/caddy/guangzhou.conf)" -ge 2 ] || fail2026 "Caddy SPA 深链回落缺失（两份站点块都要有）"
-[ "$(grep -c 'handle /assets/\*' deploy/caddy/guangzhou.conf)" -ge 2 ] || fail2026 "Caddy /assets 独立 handle 缺失"
-grep -q '@asset file {http.request.uri.path}' deploy/caddy/guangzhou.conf || fail2026 "Caddy /assets 存在性匹配器缺失"
-grep -q 'Cache-Control "no-store"' deploy/caddy/guangzhou.conf || fail2026 "Caddy /assets 404 no-store 缺失"
-grep -q 'application/vnd.android.package-archive' deploy/caddy/guangzhou.conf || fail2026 "APK Content-Type 缺失"
-grep -q 'Content-Disposition "attachment' deploy/caddy/guangzhou.conf || fail2026 "APK Content-Disposition 缺失"
-grep -q 'Strict-Transport-Security "max-age=31536000"' deploy/caddy/guangzhou.conf || fail2026 "安全头 HSTS 缺失"
-grep -q 'handle /setup' deploy/caddy/guangzhou.conf || fail2026 "D11 /setup 默认 404 缺失"
+[ "$(grep -c 'try_files {path} /index.html' deploy/gz-ubuntu/Caddyfile)" -ge 1 ] || fail2026 "Caddy SPA 深链回落缺失（现网单站点块）"
+[ "$(grep -c 'handle /assets/\*' deploy/gz-ubuntu/Caddyfile)" -ge 1 ] || fail2026 "Caddy /assets 独立 handle 缺失"
+grep -q '@asset file {http.request.uri.path}' deploy/gz-ubuntu/Caddyfile || fail2026 "Caddy /assets 存在性匹配器缺失"
+grep -q 'Cache-Control "no-store"' deploy/gz-ubuntu/Caddyfile || fail2026 "Caddy /assets 404 no-store 缺失"
+grep -q 'application/vnd.android.package-archive' deploy/gz-ubuntu/Caddyfile || fail2026 "APK Content-Type 缺失"
+grep -q 'Content-Disposition "attachment' deploy/gz-ubuntu/Caddyfile || fail2026 "APK Content-Disposition 缺失"
+grep -q 'Strict-Transport-Security "max-age=31536000"' deploy/gz-ubuntu/Caddyfile || fail2026 "安全头 HSTS 缺失"
+grep -q 'handle /setup' deploy/gz-ubuntu/Caddyfile || fail2026 "D11 /setup 默认 404 缺失"
 grep -q '!web/public/\*\*/\*.png' .gitignore || fail2026 "web/public 图标入库否定规则缺失（*.png 会继续挡）"
 
 # F-21/N-11d 自选：缓存信封、强制回源、刷新入口、未取真值不写回

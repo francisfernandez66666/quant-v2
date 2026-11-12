@@ -47,10 +47,21 @@ describe('sorterNum 数值排序器', () => {
     ])
   })
 
-  it('缺失数值按 0 参与比较', () => {
-    const rows = [{ total_score: 70 }, {}, { total_score: 90 }]
-    const sorted = rows.sort(sorterNum('total_score'))
-    expect(sorted[0]).toEqual({}) // 缺失字段按 0 → 排最前
-    expect(sorted.map((r) => r.total_score || 0)).toEqual([0, 70, 90])
+  it('缺失数值沉底（升序），双缺按 code 稳定兜底', () => {
+    const rows = [{ code: 'B', total_score: 70 }, { code: 'Z' }, { code: 'A', total_score: 90 }]
+    const cmp = sorterNum('total_score')
+    const asc = [...rows].sort(cmp)
+    expect(asc.map((r) => r.code)).toEqual(['B', 'A', 'Z'])
+    expect(asc[2].total_score).toBeUndefined()
+    const desc = [...rows].sort((a, b) => cmp(b, a))
+    // 降序靠反转比较器实现，缺值随之浮到顶部（既有产品行为，本次不改排序器）
+    expect(desc.map((r) => r.code)).toEqual(['Z', 'A', 'B'])
+    expect(desc[0].code).toBe('Z')
+    const ties = [
+      { code: '600519' }, { code: '000001' },
+      { code: '300750', total_score: 50 }, { code: '000002', total_score: 50 },
+    ]
+    expect([...ties].sort(cmp).map((r) => r.code))
+      .toEqual(['000002', '300750', '000001', '600519'])
   })
 })

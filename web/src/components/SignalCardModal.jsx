@@ -13,7 +13,8 @@ import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import {
   CARD_FIELDS, CHANNELS, MISSING_LABEL, createSeenStore, dispatchCard,
-  loadChannelPrefs, normalizeCard, saveChannelPrefs,
+  isTradingSessionNow, loadChannelPrefs, normalizeCard,
+  pruneCardsByLive, saveChannelPrefs,
 } from '../utils/signalCard.js'
 
 // MAX_CARDS 页内最多堆叠几张卡：超过即丢最旧的。
@@ -55,8 +56,8 @@ export default function SignalCardModal() {
       // 2026-11-11 owner 需求：卡只推**全套规则跑完后的下单信号**（/api/signals/trades，
       // stage=placed），原始信号不再推卡（"而不是乱推送"）；403/为空 ⇒ 不推也不清堆叠。
       const list = await api.fetchTradeSignals()
-      if (!Array.isArray(list)) return
-      const rows = Array.isArray(list.trades) ? list.trades : []
+      if (!list || !Array.isArray(list.trades)) return
+      const rows = list.trades
       // ② 信号消失 ⇒ 卡消失：每轮把卡堆叠按当轮仍存活的 signal_id 裁剪（含手动拉一次的卡）。
       const liveIds = rows.map((s) => String(s.signal_id || (s.card && s.card.signal_id) || ''))
       setCards((prev) => pruneCardsByLive(prev, liveIds))

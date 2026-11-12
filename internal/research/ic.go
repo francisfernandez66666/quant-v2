@@ -156,7 +156,11 @@ func ICByDate(panels []*Panel, factorID string, h, minStocks int) []ICRow {
 			if !ok {
 				continue
 			}
-			f := p.Factors[factorID][i]
+			col, ok := p.Factors[factorID]
+			if !ok || i >= len(col) {
+				continue
+			}
+			f := col[i]
 			if isNaN(f) {
 				continue
 			}

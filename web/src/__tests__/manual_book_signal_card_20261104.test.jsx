@@ -25,7 +25,7 @@ vi.mock('../notify.js', () => ({
 
 vi.mock('../api/index.js', async () => {
   const actual = await vi.importActual('../api/index.js')
-  return { ...actual, saveManualBook: vi.fn(), fetchSignals: vi.fn() }
+  return { ...actual, saveManualBook: vi.fn(), fetchSignals: vi.fn(), fetchTradeSignals: vi.fn() }
 })
 
 vi.mock('../sseBus.js', () => ({
@@ -227,10 +227,18 @@ describe('信号弹窗层端到端（SSE 门铃 → 拉卡 → 弹窗）', () =>
     // 表现是"卡没出现"这种看着像产品缺陷的红。每次用例开头把订阅账清干净。
     bus.on.mockClear()
     api.fetchSignals.mockReset()
+    api.fetchTradeSignals.mockReset()
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-11T02:00:00Z'))
   })
 
+  afterEach(() => vi.useRealTimers())
+
   it('交易信号门铃到达后拉一次 /api/signals 并把可执行卡挂上屏', async () => {
-    api.fetchSignals.mockResolvedValue([{ card: fullCard() }])
+    api.fetchTradeSignals.mockResolvedValue({
+      day: '20261104', count: 1,
+      trades: [{ signal_id: 'buy:600000:dragon:20261104', card: fullCard() }],
+    })
     render(<SignalCardModal />)
     // 触发组件注册的 message 订阅（sseBus 已被 mock，on 记录了回调）
     const on = (await import('../sseBus.js')).on

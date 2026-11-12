@@ -266,8 +266,8 @@ jobs:
           # §APPVER 强制更新通道：公开端点（不得套鉴权）+ /dl 分发 + 原生闸 + 版本跃迁
           grep -q 'GET /api/app/version' internal/server/server.go || { echo "APPVER 版本端点丢失"; exit 1; }
           if grep -n 'GET /api/app/version' internal/server/server.go | grep -q 'authMiddleware'; then echo "APPVER 端点被套鉴权（登录前检查死锁复活）"; exit 1; fi
-          grep -q 'handle /dl/\*' deploy/caddy/guangzhou.conf || { echo "APPVER Caddy 分发块丢失"; exit 1; }
-          grep -q 'quant-latest.apk' scripts/deploy_guangzhou.sh || { echo "APPVER APK 同步步丢失"; exit 1; }
+          grep -qE '^[[:space:]]*handle /dl/\*' deploy/gz-ubuntu/Caddyfile || { echo "APPVER Caddy 分发块丢失（现网 gz-ubuntu）"; exit 1; }
+          grep -q 'quant-latest.apk' deploy/gz-ubuntu/Caddyfile || { echo "APPVER APK 分发文件名丢失（现网 gz-ubuntu）"; exit 1; }
           grep -q 'UpdateGate' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "APPVER 原生更新闸未接线"; exit 1; }
           grep -qE 'versionCode = ([2-9]|[1-9][0-9])' mobile/app/build.gradle.kts || { echo "APPVER 版本停在没有更新通道的 1"; exit 1; }
           echo "ok - §20260922-C 批静态锁全过"
