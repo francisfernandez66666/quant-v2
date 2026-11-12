@@ -1,7 +1,9 @@
 # 广州 Ubuntu 外脑 quant-research unit（§6.6 工单 ③，2026-11-07）
-# 首尔模板的 500M/650M/GOMAXPROCS=4 是按 1.6G VPS 定的；广州 2 核 / 4GB 重定如下。
-# 研究侧单线程独占约 1 核（现网实测），GOMAXPROCS=1 与 CPUQuota=100% 对齐，
-# 低优先级 + I/O 让行，避免盘中与 quant 抢 CPU。
+# §RESOURCE-CAP-20261112（owner：恢复研究侧资源让路）：2 核机上 quant 主程序需要
+# 5s 近实时打分，研究侧硬上限收到 60%（原 100% 等于允许吃满一整核）、内存软硬限
+# 回到 500M/650M（现网旧值 700M/1100M 与 quant 的 900M 相加贴着物理内存）。
+# 配额常驻、不按交易时段切换；时段退避由 scheduler.NightlyEligible 负责。
+# 与仓库根 deploy/quant-research.service 同口径，发版时以本模板为准。
 [Unit]
 Description=quant-trading-v2 research scheduler (Guangzhou external brain)
 After=network-online.target
@@ -20,16 +22,16 @@ EnvironmentFile=-/etc/quant.env
 
 Nice=10
 CPUWeight=8
-CPUQuota=100%
-MemoryHigh=700M
-MemoryMax=1100M
+CPUQuota=60%
+MemoryHigh=500M
+MemoryMax=650M
 MemorySwapMax=512M
 IOSchedulingClass=idle
 
 Environment=TZ=Asia/Shanghai
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
 Environment=PATH=/opt/quant:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=GOMAXPROCS=1
+Environment=GOMAXPROCS=2
 
 NoNewPrivileges=true
 ProtectSystem=strict

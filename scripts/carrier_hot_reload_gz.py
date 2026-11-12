@@ -38,7 +38,14 @@ BASE_URL = os.environ.get("BASE_URL", "https://quant-trading.top")
 
 AUTH = os.path.join(DATA_DIR, "auth.json")
 APPLIED = os.path.join(DATA_DIR, "applied_factors.json")
-SIGNALS_TODAY = os.path.join(DATA_DIR, "signals_today.json")
+# §UNIVERSE-20261112：引擎自 §W-03 起按账号隔离落盘（accounts/<uid>/signals_today.json，
+# registry.go「每账号独立持久化目录」），根目录那份是 2026-08-14 的老全局文件——
+# 热更新链一直读旧全局文件，监视池因此永远只有 ~123 只（11-12 盒子实锤 universe=123）。
+# 修复：读 OWNER（admin，物理机账号）账号目录的当日文件；缺失时回退根目录旧文件
+# （总比空池好，且 extract_* 对旧日代码同样只做「扩池不买入」）。
+SIGNALS_TODAY = os.path.join(DATA_DIR, "accounts", OWNER_UID, "signals_today.json")
+if not os.path.exists(SIGNALS_TODAY):
+    SIGNALS_TODAY = os.path.join(DATA_DIR, "signals_today.json")
 
 SHORT_STRATEGY_TYPES = ("high_churn", "break_down", "leader_decay", "leader_decay_v2",
                         "good_news_fade")
@@ -127,6 +134,31 @@ def extract_signal_codes():
         if len(c) == 6 and c.isdigit():
             codes.append(c)
     return sorted(set(codes))
+
+
+def extract_score_pool():
+    """当日评分榜全量代码（accounts/<OWNER>/scores_fast.json 的 scores keys）→ 监视池来源。
+
+    owner 2026-11-12：监视池要 600 只——当日信号只有 ~100 只，池子凑不满。
+    scores_fast 是引擎当日实算的全市场活跃池（~593 只、trading_day 必须当日才采信），
+    并入后监视池直达 SIGNAL_POOL_MAX=600。扩池只加「看得见」：每一票仍过 QMT 载体
+    12 闸（确认窗/VWAP/集中度/1万闸/熔断…），评分榜高分本身不构成任何买入理由。
+    English: merge today's scored universe into the carrier scan pool, capped at 600.
+    """
+    try:
+        path = os.path.join(DATA_DIR, "accounts", OWNER_UID, "scores_fast.json")
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
+    if str(doc.get("trading_day") or "") != today:
+        return []  # 非当日评分榜绝不留宿（与 load_precalc 同一纪律）
+    out = []
+    for c in (doc.get("scores") or {}):
+        if isinstance(c, str) and len(c) == 6 and c.isdigit():
+            out.append(c)
+    return sorted(set(out))
 
 
 def load_precalc():
@@ -304,7 +336,7 @@ def main():
     # 2026-11-11 owner 需求：个股监视（信号监视）池上限扩到 600——扫描池 = 原自选 ∪
     # 当日全部信号 ∪ 利好池，去重排序后截断到 SIGNAL_POOL_MAX。只拓"可看"的票，
     # 买入仍过全部 12 闸。QMT 用 get_full_tick 逐票拉取（非订阅），无订阅上限风险。
-    pool = set(doc2["params"].get("symbols") or []) | set(signal_pool) | set(bullish)
+    pool = set(doc2["params"].get("symbols") or []) | set(signal_pool) | set(bullish) | set(extract_score_pool())
     doc2["params"]["symbols"] = sorted(pool)[:SIGNAL_POOL_MAX]
     # §PRECALC（2026-11-11 owner 拍板）：盘前预计算因子并入 params——载体在缺历史序列的
     # 构建上用 precalc 替代 get_market_data_ex（均线参考/量比基线/近高近低），只有当日新鲜
@@ -317,12 +349,20 @@ def main():
     json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 
-    # 3) 版本号 +1 自动 bump（vNN-YYYYMMDD）
+    # 3) 版本号 +1 自动 bump（vNN-YYYYMMDD）。§VER-COLLISION-20261112：out_dir 里
+    # 历史产物会按字典序被 sorted()[-1] 错拿（v18>v17 ⇒ 11-12 实锤 pool=600 新产物
+    # 被丢、发布的还是旧 v18 文件——AGENTS「11-11 v14/v15/v17 混名事故」的代码位置）。
+    # 修复：烘焙前把版本 bump 到「out_dir 里还不存在」的唯一值；发布只取本次版本名。
     params_path = "qmt_gateway/local_executor_params.json"
+    out_dir = "/var/lib/quant-trading-v2/carrier_build_out"
     doc = json.load(open(params_path, encoding="utf-8"))
     cur = doc.get("strategy_version") or "v00-19700101"
-    nn = int(str(cur).split("-")[0][1:]) + 1
-    ver = "v%02d-%s" % (nn, datetime.date.today().strftime("%Y%m%d"))
+    nn = int(str(cur).split("-")[0][1:])
+    day = datetime.date.today().strftime("%Y%m%d")
+    ver = "v%02d-%s" % (nn + 1, day)
+    while os.path.exists(os.path.join(out_dir, "qmt_internal_strategy_%s.py" % ver)):
+        nn += 1
+        ver = "v%02d-%s" % (nn + 1, day)
     doc["strategy_version"] = ver
     json.dump(doc, open(params_path, "w", encoding="utf-8"), ensure_ascii=True, indent=2)
 

@@ -2292,10 +2292,14 @@ export default function Research() {
                 <ToggleSw checked={backtestEnabled} onChange={(v) => { setBacktestEnabled(v); saveBacktestToggle(v) }} />
                 <Tag theme={backtestEnabled ? 'success' : 'default'}>{backtestEnabled ? '已开启' : '已关闭'}</Tag>
               </div>
-            
+            </Card>
+
             {/* §PRECALC（2026-11-11 owner 需求）：同花顺 API key 前台配置——研究库主源
                 （ths_daily）与预计算兜底的取数凭据。只回显是否已配置+尾4位；保存后
-                researchd 30s 内热生效（夜间链 hithink_sync 步自动注入）。 */}
+                researchd 30s 内热生效（夜间链 hithink_sync 步自动注入）。
+                §HITHINK-UI-20261112：原实现把这张卡嵌套在「研究调度设置」Card 内部
+                （</Card></Card> 双层闭合），嵌套卡渲染被吞 → owner 前端找不到设置入口。
+                拆为同级卡片，入口恒可见。 */}
             <Card title="研究数据源（同花顺）" style={{ marginTop: 12 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
                 <div style={{ flex: 1, minWidth: 260 }}>
@@ -2309,7 +2313,7 @@ export default function Research() {
                   onChange={(v) => setHithinkKeyInput(String(v ?? ''))} />
                 <Button theme="primary" onClick={saveHithinkKey}>保存</Button>
               </div>
-            </Card></Card>
+            </Card>
 
             {/* §回测自动增强 D：回测可信度增强配置（滑点校准/流动性门控/Pareto 前沿） */}
             <BacktestConfigPanel />

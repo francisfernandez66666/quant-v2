@@ -21447,3 +21447,43 @@ gw_chk "交易列表 只认 live placed（纸面碎单不混入）" "$(grep -c '
 gw_chk "hithink key 前台配置端点（研究库主源凭据）" "$(grep -c 'handleAdminSetHithinkKey' internal/server/admin.go || true)" "1"
 gw_chk "调度器 hithink_sync 步（ths_daily 停更根因修复）" "$(grep -c 'case "hithink_sync"' internal/scheduler/worker.go || true)" "1"
 gw_chk "回归测试锁在位（precalc v2 五用例）" "$(grep -c 'def test_bake_bakeables_shapes_align_consumers' qmt_gateway/tests/test_precalc_v2_20261111.py || true)" "1"
+
+# ── §20261112 收尾批（fd2da83 / 543c91f / 9b74ba0）：0 持仓过滤 / 账户隔离 strict /
+#    交易信号判据 / 外脑资金帧按日 / quant↔research 双向退避 / 队列治理 / 保活 / 下发 uid ──
+# 固定串一律 grep -F：括号、方括号、引号在 ERE 下会误判；计数用 || true 防 set -e 假死（§89）。
+gw_chk "0 持仓响应层过滤（counter+manual 两源汇合处）" "$(grep -cF 'if p.Qty > 0 && (p.UserID == uid' internal/server/qmt.go || true)" "1"
+gw_chk "0 持仓归属隔离（遗留全局行只对运营账号可见）" "$(grep -cF 'allowLegacy := uid == s.operatorID()' internal/server/qmt.go || true)" "1"
+gw_chk "实盘持仓页 tdesign 分页显式 total" "$(grep -cF 'total: realPositions.length' web/src/pages/Positions.jsx || true)" "1"
+gw_chk "柜台回报严格归属（strict=true 只动 owner 自己的行）" "$(grep -cF 'ReconcilePositionsForUser(owner, ev.Positions, true)' internal/server/qmt.go || true)" "1"
+gw_chk "严格对账变参入口（既有调用方行为不变）" "$(grep -cF 'func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition, strict ...bool)' internal/store/real_positions.go || true)" "1"
+gw_chk "严格模式不删遗留全局桶" "$(grep -cF 'WHERE user_id = ? AND ts_code NOT IN (' internal/store/real_positions.go || true)" "1"
+gw_chk "回报体 user_id 与 token 不一致留痕告警" "$(grep -cF 'report-uid-mismatch' internal/server/qmt.go || true)" "1"
+gw_chk "交易信号判据放行 evaluated（实盘恒空修复）" "$(grep -cF 'stage != "placed" && stage != "evaluated"' internal/server/signal_trades_api.go || true)" "1"
+gw_chk "外脑闸拦截点后移到预算落库之后" "$(grep -cF 'if ebBlocked {' internal/engine/engine.go || true)" "1"
+gw_chk "外脑资金帧按北京自然日判新鲜（不再按 1 小时窗）" "$(grep -cF 'cntime.DayOf(t) != cntime.DayOf(now)' internal/trading/external_brain.go || true)" "1"
+gw_absent "AllDayResearch 全天放行短路必须已撤销" "$(grep -cF 'if cfg.AllDayResearch {' internal/scheduler/scheduler.go || true)"
+gw_chk "盘中 research 让路给 quant（快照可读原因）" "$(grep -cF '研究按 §MUTUAL-BACKOFF 让路给 quant' internal/scheduler/scheduler.go || true)" "1"
+gw_chk "队列深度上限接线" "$(grep -cF 'capN := cfg.MaxQueuedTasks' internal/scheduler/worker.go || true)" "1"
+gw_chk "跨日队列自动清理接线" "$(grep -cF 'CancelStaleQueuedTasks(today)' internal/scheduler/worker.go || true)" "1"
+gw_chk "跨日队列清理实现在 store" "$(grep -cF 'func (d *DB) CancelStaleQueuedTasks' internal/store/research_tasks.go || true)" "1"
+gw_chk "内存闸缺省抬到 800MB" "$(grep -cF 'const memGateDefaultMB = 800' internal/scheduler/worker.go || true)" "1"
+gw_chk "研究侧 CPU 配额收紧到 60%" "$(grep -cF 'CPUQuota=60%' deploy/quant-research.service || true)" "1"
+gw_chk "前端轮询隐藏页跳过" "$(grep -cF "document.visibilityState !== 'visible'" web/src/pages/Research.jsx || true)" "1"
+gw_min "前端进度单飞去重（判空/置位/复位三处）" "$(grep -cF 'progressInFlight.current' web/src/pages/Research.jsx || true)" "3"
+gw_chk "保活改每 10 分钟（08:25 起）" "$(grep -cF 'Sc = "MINUTE"; Mn = 10' deploy/qmt-friend/install_tasks.ps1 || true)" "1"
+gw_chk "保活自带 08:25-15:25 时段闸" "$(grep -cF 'outside_ensure_window' deploy/qmt-friend/watchdog.ps1 || true)" "1"
+gw_chk "下发载荷显式带 owner uid（snapshot+manifest）" "$(grep -cF '"owner_user_id": OWNER_UID' scripts/carrier_hot_reload_gz.py || true)" "2"
+gw_chk "回归用例：0 持仓过滤" "$(grep -cF 'func TestHandleRealPositionsFiltersZeroQty' internal/server/qmt_test.go || true)" "1"
+gw_chk "回归用例：跨账号严格隔离" "$(grep -cF 'func TestCounterReportStrictScopeKeepsOtherAccounts' internal/server/qmt_test.go || true)" "1"
+gw_chk "回归用例：退避不可被配置关闭" "$(grep -cF 'func TestNightlyEligibleAllDayRetired' internal/scheduler/scheduler_test.go || true)" "1"
+gw_chk "回归用例：同日 08:54 资金帧仍判 1" "$(grep -cF '同日 08:54 开盘资金帧应判 1' internal/trading/external_brain_test.go || true)" "1"
+gw_chk "前后端全量中文注释基线 go=0 fe=0" "$(python3 tools/check_doc_comments.py --list 2>/dev/null | grep -cF 'GAP_SUMMARY go_files=0 fe_files=0' || true)" "1"
+
+# §20261112 门禁自修：11-11 追加的 §PRECALC-V2 组只往 GW_ERRS 累积，末尾没有判红
+# （GW_ERRS 唯一检查在 5280 行的 §0926-W2 段），16 条静态锁形同虚设。这里补尾体总闸，
+# 让此前 16 条与本批 26 条都真正能让整轮 exit 1。
+if [ -n "$GW_ERRS" ]; then
+	echo "--- FAIL: 尾体静态锁断言不符:${GW_ERRS}"
+	exit 1
+fi
+echo "ok - 尾体静态锁总闸通过（§PRECALC-V2 16 条 + §20261112 本批 26 条）"

@@ -116,6 +116,11 @@ web/.auth/
 # 独立字节级 UAT 探针的证据目录（每次运行落一份 json/日志，供报告引用；本地留档不入库）
 tools/indep_cloud_evidence_*/
 
+# §20261112 本地一次性字节级 UAT 探针与用例生成器（11-11 遗留；正式自动化门禁是
+# scripts/verify_changes.sh，这两件只作本地留档，不入库、不进发版包）
+/scripts/cloud_byte_uat.mjs
+/scripts/gen_uat_cases.mjs
+
 # 本地 QMT 网关 mock（UAT 用二进制，不入库）
 /qmt-mock
 # §AUDIT-PM 2026-09-15 仓库卫生：根目录大二进制产物（同 /quant /qmt-mock 口径），勿再裸提交

@@ -50,13 +50,20 @@ any gate fails:
                       import them, but it must not hand-copy them either).
 """
 
-# The only imports this carrier may have: a clock and a digest. Both are pure
-# computation -- no file, no socket, no process. They used to be MISSING, which
-# made the published artifact raise NameError on the first handlebar while all
-# six build gates stayed green: g7 (load smoke) now exists precisely because of
-# that shape, and these lines are what it guards.
+# The only imports this carrier may have: a clock, a digest and math. All are
+# pure computation -- no file, no socket, no process. They used to be MISSING,
+# which made the published artifact raise NameError on the first handlebar
+# while all six build gates stayed green: g7 (load smoke) now exists precisely
+# because of that shape, and these lines are what it guards.
+# RULE-MATH-20261112: `math` was missing AGAIN in a different shape -- the
+# ported rule bodies inlined by the builder (rules_factor.py lineage) call
+# math.log/math.sqrt, but the inline delivers bodies, not imports, so every
+# factor_composite / pattern_template call raised NameError and the whole
+# ported-rule layer went silent on the box (live 2026-11-12). One import here
+# covers every inlined body; the sandbox cannot import modules itself.
 from datetime import datetime, timedelta, timezone
 import hashlib
+import math
 import time
 
 # ==== BAKED PARAMS BEGIN ====
@@ -680,7 +687,16 @@ def _download_day_bars(ContextInfo):
     """
     dl = getattr(ContextInfo, "download_history_data2", None)
     if not callable(dl):
-        _log("WARN download_history_data2 unavailable: precalc is the only history source")
+        # DL-FALLBACK-20261112: this broker build does not expose the batch
+        # downloader as a callable ContextInfo attr (live log "unavailable").
+        # Fall back to the legacy single-symbol download_history_data, pulled
+        # from the round loop in small batches so init never blocks.
+        dl1 = getattr(ContextInfo, "download_history_data", None)
+        if callable(dl1):
+            _STATE["dl1_pending"] = list(PARAMS.get("symbols") or [])
+            _log("day_bars_download legacy mode queued=%d (batched per round)" % len(_STATE["dl1_pending"]))
+        else:
+            _log("WARN no downloader API in this build: precalc is the only history source")
         return
     symbols = list(PARAMS.get("symbols") or [])
     if not symbols:
@@ -699,6 +715,33 @@ def _download_day_bars(ContextInfo):
         _log("day_bars_download kicked symbols=%d period=1d" % len(symbols))
     except Exception as exc:
         _log("WARN download_history_data2 failed: %s" % repr(exc)[:120])
+
+
+def _pump_legacy_downloads(ContextInfo):
+    """Drain the legacy downloader queue, N symbols per round.
+
+    The legacy download_history_data(stock, period, start, end) is synchronous
+    per symbol; draining the whole pool inside init would freeze the first
+    handlebar for minutes. Batching keeps the round cadence while the local
+    day-bar store fills up, after which get_market_data_ex starts returning
+    real series and the bars-consuming tactics go live on their own.
+    """
+    pending = _STATE.get("dl1_pending") or []
+    if not pending:
+        return
+    dl1 = getattr(ContextInfo, "download_history_data", None)
+    if not callable(dl1):
+        _STATE["dl1_pending"] = []
+        return
+    batch, _STATE["dl1_pending"] = pending[:20], pending[20:]
+    ok = 0
+    for sym in batch:
+        try:
+            dl1(sym, "1d", "", "")
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            _warn_once("dl1_fail", "legacy day-bar download failed: %s" % repr(exc)[:100])
+    _log("day_bars_download legacy batch done=%d remain=%d" % (ok, len(_STATE["dl1_pending"])))
 
 
 def _bars_of(payload, symbol):
@@ -1202,6 +1245,8 @@ def run_round(ContextInfo, moment):
     if positions is not None:
         held_symbols = len([1 for row in positions.values() if (row or {}).get("qty", 0.0) > 0.0])
     now_ts = _now_ts()
+    # DL-FALLBACK: keep draining the legacy downloader queue (batch per round).
+    _pump_legacy_downloads(ContextInfo)
     # 2026-11-10 owner ruling: bake the brain-side BULLISH pool (d1 / n-shape
     # / factor scores) as an OPPORTUNITY pool. Merging it into the scan list
     # only widens what the rules may LOOK at -- every entry still passes the
