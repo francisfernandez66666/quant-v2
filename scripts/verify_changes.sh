@@ -21416,6 +21416,95 @@ grep -qF '没有改动可保存' "$FT174" || fail174 "前端契约测试缺'未�
 [ "$B174_FAILED" = "0" ] || exit 1
 echo "ok - §174 §CONSULT-DATARICH 锁通过（万手亿手两处 3 + 精度容差接线与边界 4 + 手股换算 3 + 量比单尺与三态 6 + 均量剔基准日与块尾声明 4 + prompt 铁律与哨兵 3 + A轮顺序与fail-open 4 + 白名单单源 2 + 超时跨侧等值 3 + 开关四面 5 + 双向测试在册 2，累计判定点 ${CNT174}）"
 
+# ════════════════════════════════════════════════════════════════════════════
+# §175 §20261112-CLOSEOUT（2026-11-12 收尾批：六处修复 + 队列治理 + 保活 + 退避 + 行业桶 + 入口能见度 静态锁）
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 175 §20261112-CLOSEOUT（交易信号判据/实盘0行过滤/账户隔离/外脑按日/队列治理/保活/退避/行业桶/math+gap/监视池600/发布链/hithink入口/用例在册）..."
+B175_FAILED=0
+fail175() {
+	echo "--- FAIL: §175 $*"
+	FAIL=1
+	B175_FAILED=1
+}
+CNT175=0
+
+# —— ① 交易信号 tab 判据：live + (placed|evaluated) + qty>0（实盘通道恒空根因）——
+CNT175=$((CNT175 + 1))
+grep -qF '§TRADE-LIST-20261112' internal/server/signal_trades_api.go \
+	|| fail175 "交易信号判据缺 §TRADE-LIST-20261112 标记"
+grep -qF '(stage != "placed" && stage != "evaluated") || it.Qty <= 0' internal/server/signal_trades_api.go \
+	|| fail175 "交易信号判据没放宽到 placed|evaluated + qty>0（实盘通道恒空根因）"
+grep -qF 'func TestHandleSignalTradesCriterion' internal/server/qmt_test.go \
+	|| fail175 "交易信号判据缺回归用例 TestHandleSignalTradesCriterion"
+
+# —— ② 实盘持仓 0 行过滤 + 柜台回报 strict 账户隔离 ——
+CNT175=$((CNT175 + 1))
+grep -qF '§ZERO-QTY-FILTER（2026-11-12 owner 需求）' internal/server/qmt.go \
+	|| fail175 "实盘持仓缺 0 行过滤 §ZERO-QTY-FILTER"
+grep -qF '§OWNER-SCOPE-20261112' internal/server/qmt.go \
+	|| fail175 "实盘持仓读侧缺账户隔离 §OWNER-SCOPE-20261112"
+grep -qF '§OWNER-SCOPE-20261112' internal/store/real_positions.go \
+	|| fail175 "ReconcilePositionsForUser 缺 strict 账户隔离 §OWNER-SCOPE-20261112"
+
+# —— ③ 外脑资金帧按北京自然日判新鲜（同日帧全天可用、跨日帧才过期）——
+CNT175=$((CNT175 + 1))
+grep -qF '§READ-STALE-20261112' internal/trading/external_brain.go \
+	|| fail175 "外脑资金帧缺按日判新鲜 §READ-STALE-20261112"
+grep -qF '资金帧是否属于当前北京自然日' internal/trading/external_brain.go \
+	|| fail175 "外脑资金帧判据没改成北京自然日（同日开盘帧被误判过期＝全天买入被拦）"
+
+# —— ④ 研究队列治理：跨日 queued 清理 + 计数口径 ——
+CNT175=$((CNT175 + 1))
+grep -qF '§QUEUE-DRAIN-20261112' internal/store/research_tasks.go \
+	|| fail175 "研究队列跨日清理缺 §QUEUE-DRAIN-20261112"
+grep -qF '§QUEUE-CAP-20261112' internal/store/research_tasks.go \
+	|| fail175 "研究队列计数口径缺 §QUEUE-CAP-20261112"
+grep -qF 'func TestCancelStaleQueuedTasksAndQueueCap' internal/store/research_tasks_test.go \
+	|| fail175 "研究队列治理缺回归用例 TestCancelStaleQueuedTasksAndQueueCap"
+grep -qF 'func TestQueueCapBlocksNewNightlyChain' internal/store/research_tasks_test.go \
+	|| fail175 "研究队列上限缺回归用例 TestQueueCapBlocksNewNightlyChain"
+
+# —— ⑤ QMT 客户端保活（盘中每 10 分钟 Ensure，08:25 起跑）——
+CNT175=$((CNT175 + 1))
+grep -qF 'QMTF-Client-Ensure' deploy/qmt-friend/install_tasks.ps1 \
+	|| fail175 "QMT 客户端保活任务 QMTF-Client-Ensure 缺失（客户端重启后须置于运行中，否则全天零委托）"
+
+# —— ⑥ quant↔research 交易时段互相退避（撤销 11-09 AllDayResearch 短路）——
+CNT175=$((CNT175 + 1))
+grep -qF '§MUTUAL-BACKOFF-20261112' internal/scheduler/scheduler.go \
+	|| fail175 "quant↔research 退避恢复缺 §MUTUAL-BACKOFF-20261112"
+grep -qF 'AllDayResearch §DEPRECATED（2026-11-12 owner 更正）' internal/config/config.go \
+	|| fail175 "AllDayResearch 未标 DEPRECATED（11-09 全天研究开关须废弃，退避不可被配置关掉）"
+
+# —— ⑦ 集中度行业桶从装机起恒空修复（生成链补齐 + 运行态 params 保护）——
+CNT175=$((CNT175 + 1))
+grep -qF '§BUCKETS-20261112' scripts/gen_industry_buckets_gz.py \
+	|| fail175 "集中度行业桶回填缺 §BUCKETS-20261112"
+
+# —— ⑧ 载体 math NameError 根治 + 买入确认窗 gap 语义修复 ——
+CNT175=$((CNT175 + 1))
+grep -qF 'RULE-MATH-20261112' qmt_gateway/qmt_internal_strategy.py \
+	|| fail175 "载体 math NameError 根治缺 RULE-MATH-20261112"
+grep -qF 'import math' qmt_gateway/qmt_internal_strategy.py \
+	|| fail175 "载体仍缺 import math（NameError 根因）"
+grep -qF 'CONFIRM-FIX-20261112' qmt_gateway/qmt_internal_strategy.py \
+	|| fail175 "买入确认窗 gap 修复缺 CONFIRM-FIX-20261112（67 个意图永久卡死的根因）"
+
+# —— ⑨ 监视池扩到 600 + 发布链混名事故修复（按 strategy_version 精确取版本）——
+CNT175=$((CNT175 + 1))
+grep -qF 'SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "600"))' scripts/carrier_hot_reload_gz.py \
+	|| fail175 "监视池上限未扩到 600（SIGNAL_POOL_MAX 默认 600）"
+grep -qF 'doc.get("strategy_version")' scripts/carrier_hot_reload_gz.py \
+	|| fail175 "发布链未按 strategy_version 精确取版本（v14/v15/v17 混名事故根因）"
+
+# —— ⑩ hithink key 前端入口可见（缺 key 时明确引导 owner 粘贴）——
+CNT175=$((CNT175 + 1))
+grep -qF 'fetchHithinkKey' web/src/pages/Research.jsx \
+	|| fail175 "hithink key 前端入口不可见（缺 fetchHithinkKey；ths_* 数据回补的前置）"
+
+[ "$B175_FAILED" = "0" ] || exit 1
+echo "ok - §175 §20261112-CLOSEOUT 锁通过（交易信号判据/0行过滤/账户隔离/外脑按日/队列治理/保活/退避/行业桶/math+gap/监视池600/发布链/hithink入口 + 4 用例在册，累计判定点 ${CNT175}）"
+
 # §GZ-UBUNTU 11-08：Linux 部署件口径总闸。不新增段号——collect 段清单由装配器
 # 动态派生，这行属尾体最终总闸；GATE_SELF_ABS 是主脚本绝对路径，段体被搬进
 # 临时脚本执行时也指得回仓内 scripts/。独立跑：bash scripts/verify_gz_ubuntu_assets.sh
