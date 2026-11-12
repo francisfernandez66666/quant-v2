@@ -10,6 +10,7 @@ FILES=(
   scripts/sync_live_rules.py
   scripts/gen_carrier_risk_list.py
   scripts/carrier_hot_reload_gz.py
+  scripts/gen_industry_buckets_gz.py
   scripts/pregen_carrier_factors_gz.py
   qmt_gateway/local_executor.py
   qmt_gateway/qmt_internal_strategy.py
@@ -20,7 +21,10 @@ FILES=(
   qmt_gateway/rules_factor.py
   qmt_gateway/rules_t.py
   qmt_gateway/rules_sizing.py
-  qmt_gateway/local_executor_params.json
+  # qmt_gateway/local_executor_params.json 已移出清单（§PARAMS-RUNTIME-20261112）：
+  # 它是 gz 运行态文件（hot reload 写监视池/pool、pregen 回填行业桶），rsync 每次用
+  # 仓库旧副本覆盖会冲掉运行态（11-12 实录：600 池与 508 行业桶被一次 rsync 清空）。
+  # 云侧真源 = gz BUILD_DIR 上这份；仓库副本仅作本地构建默认值，不再下发。
   qmt_gateway/live_rules_snapshot.json
   qmt_gateway/strategy_switches_snapshot.json
 )

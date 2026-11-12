@@ -253,6 +253,20 @@ def _write_status(day, symbols_n, ok, fail_n, consec_fail, recovered):
 
 def main():
     started = time.time()
+    # §BUCKETS-20261112：集中度桶回填（行业/概念映射自装机以来恒空，载体桶闸
+    # fail-closed 拒全部买入）。独立 venv 脚本多源补齐（baostock/东财/雪球）；
+    # 失败绝不阻断 precalc 主链——桶缺时买入照样被闸拒，这里只负责把桶填上。
+    venv_py = os.environ.get("QUANT_VENV_PY", "/opt/quant/venv/bin/python3")
+    buckets_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "gen_industry_buckets_gz.py")
+    try:
+        import subprocess
+        r = subprocess.run([venv_py, buckets_script, "--build-dir", BUILD_DIR],
+                           capture_output=True, text=True, timeout=900)
+        tail = (r.stdout or "").strip().splitlines()[-1:] or [""]
+        print("BUCKETS_STEP rc=%s %s" % (r.returncode, tail[0][:200]))
+    except Exception as exc:  # noqa: BLE001
+        print("BUCKETS_STEP rc=exc %r" % (exc,))
     with open(PARAMS_PATH, "r", encoding="utf-8") as fh:
         params = json.load(fh).get("params") or {}
     symbols = list(params.get("symbols") or [])[:MAX_CODES]

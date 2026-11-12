@@ -297,9 +297,25 @@ def main():
     bullish = extract_bullish()
     signal_pool = extract_signal_codes()
     precalc_meta, _precalc = load_precalc()
+    # §BUCKETS-SHA-20261112：行业/概念桶内容纳入 sha——桶由 pregen 的回填腿维护，
+    # 桶变化必须触发重烘投递（否则 params 变了产物不变，盒子上永远拿不到桶）。
+    # 注意：本脚本没有 PARAMS_PATH 常量（那是 pregen 的），params 走 BUILD_DIR 相对
+    # CWD 的路径（与 331 行 doc2 的读法同一份）。
+    try:
+        _bp = json.load(open(os.path.join(BUILD_DIR, "qmt_gateway",
+                                           "local_executor_params.json"),
+                              encoding="utf-8")).get("params") or {}
+    except (OSError, ValueError):
+        _bp = {}
     payload = json.dumps({"wl": wl, "rules": [r.get("id") for r in rules],
                           "bearish": bearish, "bullish": bullish,
-                          "signal_pool": signal_pool, "precalc": precalc_meta}, ensure_ascii=True)
+                          "signal_pool": signal_pool, "precalc": precalc_meta,
+                          "buckets": {"industry": len(_bp.get("industry_map") or {}),
+                                      "concept": len(_bp.get("concept_map") or {}),
+                                      "digest": hashlib.sha256(json.dumps(
+                                          {"i": sorted((_bp.get("industry_map") or {}).items())[:4000],
+                                           "c": sorted((_bp.get("concept_map") or {}).items())[:4000]},
+                                          ensure_ascii=True).encode()).hexdigest()[:16]}}, ensure_ascii=True)
     sha = hashlib.sha256(payload.encode()).hexdigest()
 
     if not args.force and os.path.exists(STATE) and open(STATE).read().strip() == sha:
