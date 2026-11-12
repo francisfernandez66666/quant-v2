@@ -5,6 +5,8 @@ package store
 import (
 	"strings"
 	"testing"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // TestTaskDequeueOrdering 验证出队排序：high 先于 low；同级内 preempted 置顶；
@@ -100,6 +102,98 @@ func TestTaskControlAndStates(t *testing.T) {
 	tk2, _ := db.GetResearchTask(id2)
 	if tk2.Status != TaskPreempted {
 		t.Fatalf("状态=%s，期望 preempted", tk2.Status)
+	}
+}
+
+// TestCancelStaleQueuedTasksAndQueueCap §QUEUE-DRAIN/CAP-20261112 回归：
+// 跨日遗留 queued 链必须被清理，但「当日链 / 非 queued 态（running/preempted）/
+// 无 chain_day 的手动任务」一律不动；QueuedTaskCount 统计 queued+preempted 口径一致。
+// 背景：11-12 现网 research_tasks 积压 63 条 queued、最早 11-02，拖慢前端与 researchd 出队。
+func TestCancelStaleQueuedTasksAndQueueCap(t *testing.T) {
+	db := testDB(t)
+	today := cntime.DayCompactOf(cntime.Now())
+	staleDay := "20260101" // 远早于今日，必被判定跨日
+
+	// 跨日 queued（应被清理）
+	idStaleQueued, err := db.EnqueueResearchTask(&ResearchTask{
+		Type: TaskDiscoverFactors, Priority: "low", Status: TaskQueued, ChainDay: staleDay, ChainSeq: 1, Payload: "{}"})
+	if err != nil {
+		t.Fatalf("enqueue stale queued: %v", err)
+	}
+	// 跨日 running（只清 queued，不动）
+	if _, err := db.EnqueueResearchTask(&ResearchTask{
+		Type: TaskDiscoverFactors, Priority: "low", Status: TaskRunning, ChainDay: staleDay, ChainSeq: 2, Payload: "{}"}); err != nil {
+		t.Fatalf("enqueue stale running: %v", err)
+	}
+	// 跨日 preempted（只清 queued，不动）
+	if _, err := db.EnqueueResearchTask(&ResearchTask{
+		Type: TaskDiscoverFactors, Priority: "low", Status: TaskPreempted, ChainDay: staleDay, ChainSeq: 3, Payload: "{}"}); err != nil {
+		t.Fatalf("enqueue stale preempted: %v", err)
+	}
+	// 当日 queued（保留）
+	if _, err := db.EnqueueResearchTask(&ResearchTask{
+		Type: TaskDiscoverFactors, Priority: "low", Status: TaskQueued, ChainDay: today, ChainSeq: 1, Payload: "{}"}); err != nil {
+		t.Fatalf("enqueue today queued: %v", err)
+	}
+	// 无 chain_day 的手动 queued（保留：chain_day<>'' 条件排除它）
+	if _, err := db.EnqueueResearchTask(&ResearchTask{
+		Type: TaskBacktestCandidate, Priority: "high", Status: TaskQueued, Payload: "{}"}); err != nil {
+		t.Fatalf("enqueue manual queued: %v", err)
+	}
+
+	n, err := db.CancelStaleQueuedTasks(today)
+	if err != nil {
+		t.Fatalf("CancelStaleQueuedTasks: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("应只清理 1 条跨日 queued，实得 %d", n)
+	}
+	stale, err := db.GetResearchTask(idStaleQueued)
+	if err != nil {
+		t.Fatalf("get stale: %v", err)
+	}
+	if stale.Status != TaskCancelled {
+		t.Fatalf("跨日 queued 未被标 cancelled，状态=%s", stale.Status)
+	}
+
+	// 队列深度：queued(当日1 + 手动1) + preempted(跨日1) = 3；running/cancelled 不计入
+	count, err := db.QueuedTaskCount()
+	if err != nil {
+		t.Fatalf("QueuedTaskCount: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("QueuedTaskCount 应为 3（queued×2 + preempted×1），实得 %d", count)
+	}
+}
+
+// TestQueueCapBlocksNewNightlyChain §QUEUE-CAP-20261112 边界：ensureNightlyEnqueue 的
+// 上限判定由 QueuedTaskCount 驱动。这里只验证「已达上限」的计数语义——达到 cap 时
+// 调用方据此 return 不排新链。MaxQueuedTasks 默认 20，此处用 3 验证阈值判定一致。
+func TestQueueCapBlocksNewNightlyChain(t *testing.T) {
+	db := testDB(t)
+	const capN = 3
+	// 先塞 3 条 queued，逼近上限
+	for i := 0; i < capN; i++ {
+		if _, err := db.EnqueueResearchTask(&ResearchTask{
+			Type: TaskDiscoverFactors, Priority: "low", Status: TaskQueued, Payload: "{}"}); err != nil {
+			t.Fatalf("seed queued %d: %v", i, err)
+		}
+	}
+	count, err := db.QueuedTaskCount()
+	if err != nil {
+		t.Fatalf("QueuedTaskCount: %v", err)
+	}
+	// 达到上限 → 调用方应据 `count >= capN` 跳过当晚新链
+	if count < capN {
+		t.Fatalf("期望至少 %d 条排队，实得 %d", capN, count)
+	}
+	// 再加 1 条 preempted 也计入候选集（与 DequeueHighestTask 同口径）
+	if _, err := db.EnqueueResearchTask(&ResearchTask{
+		Type: TaskDiscoverFactors, Priority: "low", Status: TaskPreempted, Payload: "{}"}); err != nil {
+		t.Fatalf("seed preempted: %v", err)
+	}
+	if c2, _ := db.QueuedTaskCount(); c2 != capN+1 {
+		t.Fatalf("preempted 应计入队列深度，期望 %d 实得 %d", capN+1, c2)
 	}
 }
 

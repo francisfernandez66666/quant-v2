@@ -4,11 +4,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/store"
 )
 
@@ -756,5 +758,78 @@ func assertJSONError(t *testing.T, rr *httptest.ResponseRecorder, what string) {
 	}
 	if body["error"] == "" {
 		t.Fatalf("%s 响应体应含非空 error 字段: %s", what, rr.Body.String())
+	}
+}
+
+// TestHandleSignalTradesCriterion §TRADE-LIST-20261112（owner 需求）：交易信号 tab 判据
+// = live 通道 + (placed|evaluated) + qty>0。旧判据要求 stage=placed，但实盘通道的
+// persistDynBuyDecision 只写 evaluated/skipped（placed 是 paper 专用 stage），导致
+// 实盘恒空。这里逐情形验证过滤与 order_state 区分。
+func TestHandleSignalTradesCriterion(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	const day = "20261112"
+	const uid = "u_test_signal_trades"
+	seed := []store.SignalDecision{
+		{UserID: uid, Day: day, Channel: "live", Code: "600519.SH", Strategy: "dragon", Stage: "evaluated", Qty: 100, Notional: 120000},
+		{UserID: uid, Day: day, Channel: "live", Code: "000001.SZ", Strategy: "factor_composite", Stage: "placed", Qty: 200, Notional: 10000},
+		{UserID: uid, Day: day, Channel: "paper", Code: "600000.SH", Strategy: "dragon", Stage: "placed", Qty: 300, Notional: 287}, // 纸面误混入
+		{UserID: uid, Day: day, Channel: "live", Code: "000520.SZ", Strategy: "dragon", Stage: "evaluated", Qty: 0, Notional: 0},   // qty=0 僵尸
+		{UserID: uid, Day: day, Channel: "live", Code: "300750.SZ", Strategy: "dragon", Stage: "skipped", Qty: 50, Notional: 0},     // 非 placed/evaluated
+		{UserID: uid, Day: day, Channel: "live", Code: "688981.SH", Strategy: "factor_composite", Stage: "evaluated", Qty: 150, Notional: 90000},
+	}
+	for _, d := range seed {
+		if err := db.UpsertSignalDecision(d); err != nil {
+			t.Fatalf("seed decision %s: %v", d.Code, err)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/signals/trades?day="+day, nil)
+	// 注入登录用户上下文（userIDFor 从 context 取 uid，与 seed 的 user_id 对齐）
+	req = req.WithContext(context.WithValue(req.Context(), ctxUserKey{}, &auth.User{ID: uid}))
+	s.handleSignalTrades(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Day    string `json:"day"`
+		Count  int    `json:"count"`
+		Trades []struct {
+			Code       string `json:"code"`
+			Stage      string `json:"stage"`
+			OrderState string `json:"order_state"`
+			Qty        int    `json:"qty"`
+		} `json:"trades"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode trades: %v", err)
+	}
+	if out.Day != day {
+		t.Fatalf("回显 day=%s 期望 %s", out.Day, day)
+	}
+	// 只应留下 3 条合法：live+evaluated/qty>0（600519.SH、688981.SH）+ live+placed（000001.SZ）
+	if out.Count != 3 {
+		t.Fatalf("合法建议数=%d 期望 3（live+placed/evaluated+qty>0），实际=%+v", out.Count, out.Trades)
+	}
+	byCode := map[string]string{}
+	for _, tr := range out.Trades {
+		byCode[tr.Code] = tr.OrderState
+	}
+	for _, want := range []string{"600519.SH", "000001.SZ", "688981.SH"} {
+		if _, ok := byCode[want]; !ok {
+			t.Fatalf("合法建议 %s 被错误过滤，实际=%v", want, byCode)
+		}
+	}
+	for _, exclude := range []string{"600000.SH", "000520.SZ", "300750.SZ"} {
+		if _, ok := byCode[exclude]; ok {
+			t.Fatalf("非法行 %s 未被过滤，实际=%v", exclude, byCode)
+		}
+	}
+	// order_state 区分：placed=已发单；evaluated=建议未发单
+	if byCode["000001.SZ"] != "已发单" {
+		t.Fatalf("placed 行的 order_state 应为「已发单」，实得 %q", byCode["000001.SZ"])
+	}
+	if byCode["600519.SH"] != "建议未发单" {
+		t.Fatalf("evaluated 行的 order_state 应为「建议未发单」，实得 %q", byCode["600519.SH"])
 	}
 }

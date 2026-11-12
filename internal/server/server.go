@@ -351,7 +351,8 @@ func (s *Server) dashFor(userID string) *display.DashboardData {
 		if c := s.registry.GetController(s.operatorID()); c != nil {
 			d = c.DashboardData()
 		}
-	} else {
+	} else if s.agg != nil {
+		// 实时聚合器未初始化（部分初始化 / 测试）时回落缓存快照，不空指针 panic。
 		d = s.agg.Current()
 	}
 	if d == nil {
