@@ -66,6 +66,9 @@ __pycache__/
 # 同上口径（go test 用 TMPDIR=$PWD/.tmp）：本机安全策略禁止删除 /tmp 下文件时，测试夹具的
 # 临时目录只能落在项目内。纯运行期产物，不入库。
 .tmp/
+# qmt_gateway 运行/测试期产物（broker 导出 CSV 夹具、临时部署脚本、friend 推送源等），
+# 纯运行时生成，不入库；与 .workbuddy-ai（项目记忆，禁止删）区分开。
+.workbuddy/
 
 # 本地回测工具（不入库）
 bt_jq/
