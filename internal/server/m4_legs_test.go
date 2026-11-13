@@ -31,7 +31,7 @@ func TestReportTradeNameLegPersists(t *testing.T) {
 	body := `{"type":"trade","order_id":"O-M4A","trade_id":"T-M4A","name":"贵州茅台","code":"600519.SH",` +
 		`"side":"买入","price":10,"qty":100,"amount":1000,"traded_at":"2026-09-22T10:00:00+08:00","signal_id":"M4A"}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
 	}
@@ -44,7 +44,7 @@ func TestReportTradeNameLegPersists(t *testing.T) {
 	}
 
 	// 同一持仓随后到达的券商对账快照不带名称 → 旧名必须保留（不得被空串洗掉）。
-	if _, err := db.ReconcilePositionsForUser("", []store.RealPosition{
+	if _, err := db.ReconcilePositionsForUser(reportTestUser, []store.RealPosition{
 		{TsCode: "600519.SH", Name: "", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 10},
 	}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -54,7 +54,7 @@ func TestReportTradeNameLegPersists(t *testing.T) {
 		t.Fatalf("① 空名对账快照把持仓名称抹空了：got %q", pos.Name)
 	}
 	// 快照带非空名称时仍以快照为准（券商改名要能生效）。
-	if _, err := db.ReconcilePositionsForUser("", []store.RealPosition{
+	if _, err := db.ReconcilePositionsForUser(reportTestUser, []store.RealPosition{
 		{TsCode: "600519.SH", Name: "贵州茅台A", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 10},
 	}); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
@@ -74,7 +74,7 @@ func TestReportTradeIDAnchorsPartialFills(t *testing.T) {
 		body := `{"type":"trade","order_id":"O-M4B","trade_id":"` + tradeID + `","name":"平安银行","code":"000001.SZ",` +
 			`"side":"买入","price":10,"qty":100,"amount":1000,"traded_at":"2026-09-22T10:05:00+08:00","signal_id":"M4B"}`
 		rr := httptest.NewRecorder()
-		s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+		s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 		return rr.Code
 	}
 	if c := post("T-M4B-1"); c != http.StatusOK {
@@ -88,7 +88,7 @@ func TestReportTradeIDAnchorsPartialFills(t *testing.T) {
 		t.Fatalf("② 第二笔真实部成（同秒同价同量、不同成交编号）被误判重放：HTTP %d", c)
 	}
 
-	pos, err := db.RealPositionByCodeForUser("", "000001.SZ")
+	pos, err := db.RealPositionByCodeForUser(reportTestUser, "000001.SZ")
 	if err != nil {
 		t.Fatalf("read position: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestReportOrderCreatedAtLeg(t *testing.T) {
 	body := `{"type":"order","order_id":"O-M4C","signal_id":"M4C","code":"600519.SH","side":"买入",` +
 		`"status":"已报","price":10,"qty":100,"created_at":"2026-09-22T09:31:02+08:00","at":"2026-09-22T09:31:09+08:00"}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("order report HTTP %d: %s", rr.Code, rr.Body.String())
 	}

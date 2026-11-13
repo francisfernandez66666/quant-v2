@@ -109,6 +109,17 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// §L2 F2-①（2026-11-13 owner 裁决「要全部做完」）：遗留全局桶归档迁移——
+	// 把 real_positions 里 user_id='' 的历史串号温床整批搬进留档表（**不是删库**：
+	// 行一字不改地留档，可随时人工回查），主表此后不再有全局行。
+	// 放在所有 ensure*Column 之后：SELECT * 的列面此时才完整。幂等：无全局行即 no-op。
+	// 写入侧同步封口（scopedWrite 403 / strict reconcile 不 claim 全局行 / ApplyRealFill
+	// 归属必带账号），主表不会再长出新的 user_id='' 行；CHECK 约束需整表重建，
+	// 本批不做（live.db 上周五盘日重建风险 > 收益），写入侧强制已达成同一目标。
+	if err := d.archiveLegacyGlobalRealPositions(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store migrate archive legacy global positions: %w", err)
+	}
 	// §D-5（GAP_VERIFY_20260917_PM）库文件权限 0600：trading.db/live.db 含 LLM 密钥池与 QMT token
 	// 的 KV 快照，默认 0644 在共享主机/备份外泄面过大。auth.json 0600 先例（§A3）同口径收口。
 	// -wal/-shm 旁文件同样处理（WAL 下常驻）。个别平台 chmod 不支持时静默跳过。

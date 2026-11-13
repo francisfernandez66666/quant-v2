@@ -1922,7 +1922,9 @@ if grep -n 'YYYY-MM-DD，如 2026-06-30' internal/strategy_engine/types.go | gre
 # M-8/N-6 CLI：两同步函数必须返回 error 且分发点转成非零退出（log.Fatalf）。
 grep -q 'func cmdHithinkSyncValuations(client \*data.HithinkClient, db \*store.DB) error {' cmd/dataload/hithink_sync.go || { echo "--- FAIL: 估值同步又无返回值（批次失败无法非零退出，§M-8 复活）"; exit 1; }
 grep -q 'func cmdHithinkSyncFinIndicators(client \*data.HithinkClient, db \*store.DB, args \[\]string) error {' cmd/dataload/hithink_sync.go || { echo "--- FAIL: 财务指标同步又无返回值（§M-8/N-6 复活）"; exit 1; }
-H_ERR=$(grep -c 'if err := cmdHithinkSync\(Valuations\|FinIndicators\)' cmd/dataload/hithink_sync.go || true)
+H_ERR=$(grep -cE 'if err := cmdHithinkSync(Valuations|FinIndicators)' cmd/dataload/hithink_sync.go || true)
+# 2026-11-13：原 BRE '\(...\|...\)' 写法在 macOS/BSD grep 上对含中文的文件会静默返回 0
+# （本机实测：BRE=0 / -E=2），Linux/GNU grep 正常——本机跑门禁必然假红。改 -E 语义不变。
 [ "$H_ERR" -ge 2 ] || { echo "--- FAIL: 分发点吃 err 的非零退出腿 $H_ERR < 2（§M-8 降级错误又被吞）"; exit 1; }
 # M-8/N-6 research：五处逐窗装配失败计数 + 统一降级行；ckpt save 双吞（_ =）必须绝迹。
 R_FAIL=$(grep -c 'failed++' internal/research/windowed.go || true)
@@ -21419,7 +21421,7 @@ echo "ok - §174 §CONSULT-DATARICH 锁通过（万手亿手两处 3 + 精度容
 # ════════════════════════════════════════════════════════════════════════════
 # §175 §20261112-CLOSEOUT（2026-11-12 收尾批：六处修复 + 队列治理 + 保活 + 退避 + 行业桶 + 入口能见度 静态锁）
 # ════════════════════════════════════════════════════════════════════════════
-echo "==> 175 §20261112-CLOSEOUT（交易信号判据/实盘0行过滤/账户隔离/外脑按日/队列治理/保活/退避/行业桶/math+gap/监视池600/发布链/hithink入口/用例在册）..."
+echo "==> 175 §20261112-CLOSEOUT（交易信号判据/实盘0行过滤/账户隔离/外脑按日/队列治理/保活/退避/行业桶/math+gap/监视池1000/发布链/hithink入口/用例在册）..."
 B175_FAILED=0
 fail175() {
 	echo "--- FAIL: §175 $*"
@@ -21492,8 +21494,8 @@ grep -qF 'CONFIRM-FIX-20261112' qmt_gateway/qmt_internal_strategy.py \
 
 # —— ⑨ 监视池扩到 600 + 发布链混名事故修复（按 strategy_version 精确取版本）——
 CNT175=$((CNT175 + 1))
-grep -qF 'SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "600"))' scripts/carrier_hot_reload_gz.py \
-	|| fail175 "监视池上限未扩到 600（SIGNAL_POOL_MAX 默认 600）"
+grep -qF 'SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "1000"))' scripts/carrier_hot_reload_gz.py \
+	|| fail175 "监视池上限未扩到 1000（SIGNAL_POOL_MAX 默认 1000，2026-11-13 owner 裁决 10）"
 grep -qF 'doc.get("strategy_version")' scripts/carrier_hot_reload_gz.py \
 	|| fail175 "发布链未按 strategy_version 精确取版本（v14/v15/v17 混名事故根因）"
 
@@ -21503,7 +21505,7 @@ grep -qF 'fetchHithinkKey' web/src/pages/Research.jsx \
 	|| fail175 "hithink key 前端入口不可见（缺 fetchHithinkKey；ths_* 数据回补的前置）"
 
 [ "$B175_FAILED" = "0" ] || exit 1
-echo "ok - §175 §20261112-CLOSEOUT 锁通过（交易信号判据/0行过滤/账户隔离/外脑按日/队列治理/保活/退避/行业桶/math+gap/监视池600/发布链/hithink入口 + 4 用例在册，累计判定点 ${CNT175}）"
+echo "ok - §175 §20261112-CLOSEOUT 锁通过（交易信号判据/0行过滤/账户隔离/外脑按日/队列治理/保活/退避/行业桶/math+gap/监视池1000/发布链/hithink入口 + 4 用例在册，累计判定点 ${CNT175}）"
 
 # §176 §NEWS-GATE-D1-SIGNED（2026-11-12 收口批：D1 带符号化 + 资讯闸 + 盘中反转链，
 # docs/PLAN_D1_SIGNED_NEWS_GATE_20261112.md，owner 六轮裁决 R1-R12）。
@@ -21656,7 +21658,10 @@ CNT176=$((CNT176 + 1))
 grep -qF 'NEWS_WEIGHT_FACTORS = frozenset({"NewsEvent"})' qmt_gateway/rules_factor.py \
 	|| fail176 "资讯因子加权清单缺失"
 CNT176=$((CNT176 + 1))
-grep -qF 'contrib *= float(params.get("news_weight_boost", 2.0) or 2.0)' qmt_gateway/rules_factor.py \
+# 2026-11-13 校正：88b6c94 把缺省值抽成 NEWS_WEIGHT_BOOST_DEFAULT 常量，旧字面锁
+# 'news_weight_boost", 2.0) or 2.0' 在 HEAD 上已经打不开任何东西（锁自己红了）。
+# 收紧到消费前缀：无论缺省是字面 2.0 还是常量，contrib 必须乘 news_weight_boost。
+grep -qF 'contrib *= float(params.get("news_weight_boost"' qmt_gateway/rules_factor.py \
 	|| fail176 "NewsEvent 贡献未乘加权系数"
 # —— ⑨ 盒子盘中班次（R11）：updater 闸 / 第七条计划任务 ——
 CNT176=$((CNT176 + 1))
@@ -21760,3 +21765,137 @@ if [ -n "$GW_ERRS" ]; then
 	exit 1
 fi
 echo "ok - 尾体静态锁总闸通过（§PRECALC-V2 16 条 + §20261112 本批 26 条）"
+
+# ════════════════════════════════════════════════════════════════════════════
+# §177 §20261113-DEFECTS（2026-11-13 实盘六问题批：时段闸 + 预算接线 + VWAP 回踩 +
+# 自然日新鲜度 + 回报字段链 + 锚点仅缺失回填 + C2/C3 + L1 快照展示 + L2 scopedWrite/归档 静态锁）
+# docs/PLAN_SIX_DEFECTS_20261113.md，owner 11:32 十项裁决 + 13:05 三条补充裁决。
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 177 §20261113-DEFECTS（时段白名单闸/pending_buys接线/VWAP回踩/自然日新鲜度/回报字段/锚点回填/C2 SSE/C3诊断/L1快照/L2鉴权+归档/用例在册）..."
+B177_FAILED=0
+fail177() {
+	echo "--- FAIL: §177 $*"
+	FAIL=1
+	B177_FAILED=1
+}
+CNT177=0
+
+# —— ① #2 交易时段白名单闸（隔夜单根因：旧 no_*_windows 是黑名单，00:00 直通）——
+CNT177=$((CNT177 + 1))
+grep -qF 'def _trade_session_ok' qmt_gateway/qmt_internal_strategy.py \
+	|| fail177 "载体缺 _trade_session_ok 白名单闸（隔夜单根因）"
+grep -qF 'outside_trading_session' qmt_gateway/qmt_internal_strategy.py \
+	|| fail177 "载体缺 outside_trading_session 拒单原因"
+grep -qF 'session_gate_enabled' qmt_gateway/local_executor.py \
+	|| fail177 "载体 params 缺 session_gate_enabled"
+grep -qF "'close_sweep_from': '14:50'" qmt_gateway/local_executor.py \
+	|| fail177 "收摊撤单未提前到 14:50（14:52 关闸后 sweep 永远跑不到，裁决 D1）"
+grep -qF 'test_session_and_pricing_20261113.py' qmt_gateway/tests/test_session_and_pricing_20261113.py \
+	|| fail177 "时段闸回归用例文件缺失"
+
+# —— ② #3 预算接线（pending_buys 恒空 = 同轮把整个预算打满的根因）——
+CNT177=$((CNT177 + 1))
+grep -qF 'def _pending_buy_rows' qmt_gateway/qmt_internal_strategy.py \
+	|| fail177 "载体缺 _pending_buy_rows（在途买单真实化）"
+grep -qF 'min_cash_after_reserve_pct' qmt_gateway/local_executor.py \
+	|| fail177 "载体缺剩余现金下限参数 min_cash_after_reserve_pct（裁决 4：不恢复 daily_buy_cap）"
+grep -qF 'sizing_cap(ctx, positions, intent, pending_rows)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail177 "sizing 链未接真实 pending_rows（rules_sizing.py:94-99 的 journal 纪律）"
+
+# —— ③ #4 VWAP 回踩 0.7% 买入定价（含现价保护）——
+CNT177=$((CNT177 + 1))
+grep -qF 'def _pullback_limit_price' qmt_gateway/qmt_internal_strategy.py \
+	|| fail177 "载体缺 _pullback_limit_price（VWAP 回踩定价）"
+grep -qF 'min(target, last_price)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail177 "回踩价缺 min(...,last) 现价保护（VWAP 高于现价时会抬轿）"
+grep -qF "'vwap_pullback_pct': 0.7" qmt_gateway/local_executor.py \
+	|| fail177 "载体缺 vwap_pullback_pct=0.7"
+grep -qF "'entry_price_mode': 'vwap_pullback'" qmt_gateway/local_executor.py \
+	|| fail177 "载体缺 entry_price_mode 旋钮"
+
+# —— ④ #5 C1 柜台帧按北京自然日判新鲜（10 分钟滚动窗误杀早盘帧）——
+CNT177=$((CNT177 + 1))
+grep -qF 'cntime.DayOf(ts) != cntime.DayOf(now)' internal/server/qmt.go \
+	|| fail177 "柜台帧新鲜度未改成北京自然日判档（owner 裁决 A7）"
+grep -qF 'ts.After(now)' internal/server/qmt.go \
+	|| fail177 "柜台帧缺未来帧拒收"
+grep -qF '同日 20 分钟前的早盘帧仍可用' internal/server/qmt_freshness_test.go \
+	|| fail177 "自然日判档缺回归用例（T5.1）"
+grep -qF '跨日帧判过期' internal/server/qmt_freshness_test.go \
+	|| fail177 "跨日帧判档缺回归用例（T5.2）"
+
+# —— ⑤ #5 D1/D3 回报字段链：成本/最高价/首买锚点从导出一路到落库 ——
+CNT177=$((CNT177 + 1))
+grep -qF '"cost_price": ("成本价"' qmt_gateway/broker_reads.py \
+	|| fail177 "broker_reads 未映射成本价列（cost_price=0 的根因）"
+grep -qF '"anchor_price"' qmt_gateway/broker_reads.py \
+	|| fail177 "broker_reads 未映射首买锚点列"
+grep -qF '"cost_price": cost,' qmt_gateway/report_uplink.py \
+	|| fail177 "uplink 未携带 cost_price"
+grep -qF '"highest_price": _fnum(row.get("highest_price"))}' qmt_gateway/report_uplink.py \
+	|| fail177 "uplink 未携带 highest_price"
+grep -qF 'anchor_price=CASE WHEN real_positions.anchor_price IS NULL OR real_positions.anchor_price <= 0' internal/store/real_positions.go \
+	|| fail177 "锚点回填缺「仅 NULL/0 时」守卫（不得回拉已有非零风险线）"
+grep -qF '"counter_snapshot"' internal/store/real_positions.go \
+	|| fail177 "回填锚点缺 counter_snapshot 溯源打标"
+grep -qF 'func TestAnchorBackfilledFromCounterSnapshotOnlyWhenMissing' internal/store/real_positions_anchor_test.go \
+	|| fail177 "锚点仅缺失回填缺正向回归用例（T5.6）"
+
+# —— ⑥ #5 C2 跳过对账必须定向前端广播 ——
+CNT177=$((CNT177 + 1))
+grep -qF '"skipped": "market_value_conflict"' internal/server/qmt.go \
+	|| fail177 "空快照+市值冲突 skip 缺 market_value_conflict 分支"
+grep -qF '"event": "positions", "skipped": "unsynced"' internal/server/qmt.go \
+	|| fail177 "C2 SSE 广播缺失（跳过对账必须定向前端广播，不得静默空白）"
+
+# —— ⑦ #5 C3 上行诊断事件（读数缺失不再云端静默）——
+CNT177=$((CNT177 + 1))
+grep -qF '"type": "diagnostic"' qmt_gateway/report_uplink.py \
+	|| fail177 "uplink 缺 diagnostic 观测事件（#5 四候选根因定案的前置）"
+grep -qF 'case "diagnostic":' internal/server/qmt.go \
+	|| fail177 "Go 侧缺 diagnostic case（无 case 会进 default 400 → outbox 死信，诊断链自断）"
+grep -qF 'diagnostic' qmt_gateway/contract/report_fields.json \
+	|| fail177 "golden 契约未登记 diagnostic"
+
+# —— ⑧ #5 E2 实盘页兜底轮询 60s → 15s（SSE 为主，REST 只做安全网）——
+CNT177=$((CNT177 + 1))
+grep -qF 'usePolling(loadReal, 15000' web/src/pages/Positions.jsx \
+	|| fail177 "实盘页兜底轮询未收紧到 15s（E2）"
+
+# —— ⑨ #6 L1 最近手动账快照只读展示（无物理机账号每个交易日复发的根治面）——
+CNT177=$((CNT177 + 1))
+grep -qF 'func (d *DB) LatestManualSnapshot' internal/store/manual_book.go \
+	|| fail177 "store 缺 LatestManualSnapshot（L1 快照读口）"
+grep -qF 'last_manual_snapshot' internal/server/qmt.go \
+	|| fail177 "响应未下发 last_manual_snapshot（T6.9）"
+grep -qF 'last-manual-snapshot' web/src/pages/Positions.jsx \
+	|| fail177 "前端空态缺快照只读展示（T6.10）"
+grep -qF 'func TestManualSnapshotCaptureRestoreLatest' internal/store/manual_snapshot_test.go \
+	|| fail177 "快照/回灌缺回归用例（T6.5）"
+
+# —— ⑩ #6 L2 scopedWrite 统一入口 + 每日快照表 + 遗留全局桶归档 ——
+CNT177=$((CNT177 + 1))
+grep -qF 'func scopedWriteOK' internal/server/qmt.go \
+	|| fail177 "server 缺统一 scopedWriteOK 写面鉴权入口（F2-②）"
+grep -qF 'func TestQMTReportScopedWriteRefusesAnonymous' internal/server/qmt_test.go \
+	|| fail177 "scopedWrite 403 缺回归用例（T6.4）"
+grep -qF 'CREATE TABLE IF NOT EXISTS manual_position_snapshot' internal/store/manual_book.go \
+	|| fail177 "缺 manual_position_snapshot 每日快照表（T6.5）"
+grep -qF 'func (d *DB) ArchiveLegacyGlobalPositions' internal/store/real_positions.go \
+	|| fail177 "缺遗留全局桶归档迁移（F2-①）"
+grep -qF 'func TestArchiveLegacyGlobalPositions' internal/store/real_positions_global_archive_test.go \
+	|| fail177 "归档迁移缺测试库演练用例（D4 纪律）"
+
+# —— ⑪ #7 监视池 1000 + 字典序截断修复（裁决 10 ④「不能只把 600 改成 1000」）——
+CNT177=$((CNT177 + 1))
+grep -qF 'SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "1000"))' scripts/carrier_hot_reload_gz.py \
+	|| fail177 "载体扫描池上限未到 1000（裁决 10）"
+grep -qF 'def assemble_scan_pool' scripts/carrier_hot_reload_gz.py \
+	|| fail177 "缺三级优先级截断纯函数 assemble_scan_pool（当日信号 > 评分 > 自选）"
+grep -qF 'assemble_scan_pool(' scripts/carrier_hot_reload_gz.py \
+	|| fail177 "池装配点未接入三级优先级截断（仍字典序截断）"
+grep -qF 'def test_low_prefix_old_codes_no_longer_pinned' qmt_gateway/tests/test_scan_pool_priority_20261113.py \
+	|| fail177 "「000 系老代码钉死」直锤回归用例缺失"
+
+[ "$B177_FAILED" = "0" ] || exit 1
+echo "ok - §177 §20261113-DEFECTS 锁通过（时段闸/预算接线/VWAP回踩/自然日新鲜度/回报字段/锚点回填/C2/C3/L1快照/L2鉴权+归档 + 用例在册，累计判定点 ${CNT177}）"

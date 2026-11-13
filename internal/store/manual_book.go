@@ -180,6 +180,27 @@ func (d *DB) ensureManualBook() error {
 	if _, err := d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_manual_flows_day ON manual_flows(user_id, day, ts_code)`); err != nil {
 		return fmt.Errorf("store migrate manual_flows index: %w", err)
 	}
+	// §L2 2026-11-13 owner: per-account DAILY snapshot so a "positions vanished"
+	// incident is a one-command restore instead of a manual asof patch. An
+	// independent table needs no schemaVersion bump (no existing row changes).
+	if _, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS manual_position_snapshot (
+		user_id     TEXT NOT NULL,
+		day         TEXT NOT NULL,
+		ts_code     TEXT NOT NULL,
+		name        TEXT NOT NULL DEFAULT '',
+		qty         INTEGER NOT NULL,
+		cost_price  REAL NOT NULL DEFAULT 0,
+		cash        REAL NOT NULL DEFAULT 0,
+		total_asset REAL NOT NULL DEFAULT 0,
+		asof        TEXT NOT NULL DEFAULT '',
+		captured_at TEXT NOT NULL,
+		PRIMARY KEY (user_id, day, ts_code)
+	)`); err != nil {
+		return fmt.Errorf("store migrate manual_position_snapshot create: %w", err)
+	}
+	if _, err := d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_manual_snapshot_day ON manual_position_snapshot(user_id, day)`); err != nil {
+		return fmt.Errorf("store migrate manual_position_snapshot index: %w", err)
+	}
 	return nil
 }
 
@@ -520,6 +541,9 @@ func (d *DB) ManualBookViewFor(userID, day string) (ManualBookView, error) {
 			v.PositionsAsOf = asof
 		}
 	}
+	// §L2 2026-11-13: self-driven daily snapshot (once per Beijing day, per
+	// account). Read-side only -- a failure is logged, never changes the view.
+	d.captureManualSnapshotOnce(userID, day)
 	return v, nil
 }
 
@@ -590,4 +614,195 @@ func (d *DB) ManualTodayBoughtQty(userID, tsCode, day string) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// SnapshotManualPositions §L2（2026-11-13 owner）：按北京交易日把某账号的手动账整本
+// 落一份快照（幂等覆盖当日）。账户行用 ts_code=” 表示。只写快照表，不动 manual_*/real_*。
+// 空 user_id 一律拒绝——账户级鉴权不许有"全局桶"写入口。
+func (d *DB) SnapshotManualPositions(userID, day string) (int, error) {
+	if userID == "" || day == "" {
+		return 0, fmt.Errorf("scopedWrite: empty user_id/day refused")
+	}
+	if err := d.ensureManualBook(); err != nil {
+		return 0, err
+	}
+	rows, err := d.ManualPositionsForUser(userID)
+	if err != nil {
+		return 0, err
+	}
+	acc, err := d.ManualAccountForUser(userID)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM manual_position_snapshot WHERE user_id = ? AND day = ?`, userID, day); err != nil {
+		return 0, err
+	}
+	const ins = `INSERT INTO manual_position_snapshot
+		(user_id, day, ts_code, name, qty, cost_price, cash, total_asset, asof, captured_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	for _, p := range rows {
+		if _, err := tx.Exec(ins, userID, day, p.TsCode, p.Name, p.Qty, p.CostPrice,
+			0.0, 0.0, p.AsOf, now); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.Exec(ins, userID, day, "", "", 0, 0.0,
+		acc.Account.AvailableCash, acc.Account.TotalAsset, acc.Account.AsOf, now); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(rows), nil
+}
+
+// RestoreManualPositionsFromSnapshot §L2：从指定日快照恢复某账号手动账（只写 manual_*）。
+// asof 传当日时刻，避免恢复出来的账立刻又因跨日判据不可用。
+func (d *DB) RestoreManualPositionsFromSnapshot(userID, day, asof string) (int, error) {
+	if userID == "" || day == "" {
+		return 0, fmt.Errorf("scopedWrite: empty user_id/day refused")
+	}
+	if err := d.ensureManualBook(); err != nil {
+		return 0, err
+	}
+	type snapRow struct {
+		tsCode, name, asof string
+		qty                int
+		cost, cash, total  float64
+	}
+	rs, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, cash, total_asset, asof
+		FROM manual_position_snapshot WHERE user_id = ? AND day = ?`, userID, day)
+	if err != nil {
+		return 0, err
+	}
+	var rows []snapRow
+	for rs.Next() {
+		var r snapRow
+		if err := rs.Scan(&r.tsCode, &r.name, &r.qty, &r.cost, &r.cash, &r.total, &r.asof); err != nil {
+			rs.Close()
+			return 0, err
+		}
+		rows = append(rows, r)
+	}
+	rs.Close()
+	if len(rows) == 0 {
+		return 0, fmt.Errorf("no snapshot for user=%s day=%s", userID, day)
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM manual_positions WHERE user_id = ?`, userID); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range rows {
+		if r.tsCode == "" {
+			if _, err := tx.Exec(`INSERT INTO manual_account
+				(user_id, available_cash, total_asset, cash_filled, source, asof, updated_at, taken_over_at)
+				VALUES (?, ?, ?, 1, 'manual', ?, ?, '')
+				ON CONFLICT(user_id) DO UPDATE SET
+					available_cash=excluded.available_cash, total_asset=excluded.total_asset,
+					cash_filled=1, asof=excluded.asof, updated_at=excluded.updated_at, taken_over_at=''`,
+				userID, r.cash, r.total, asof, now); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO manual_positions
+			(ts_code, name, qty, cost_price, source, asof, updated_at, user_id, taken_over_at)
+			VALUES (?, ?, ?, ?, 'manual', ?, ?, ?, '')
+			ON CONFLICT(ts_code, user_id) DO UPDATE SET
+				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
+				asof=excluded.asof, updated_at=excluded.updated_at, taken_over_at=''`,
+			r.tsCode, r.name, r.qty, r.cost, asof, now, userID); err != nil {
+			return 0, err
+		}
+		n++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// captureManualSnapshotOnce 读侧自驱动：当日快照缺失才写一次，失败只留痕不改读数。
+func (d *DB) captureManualSnapshotOnce(userID, day string) {
+	if userID == "" || day == "" {
+		return
+	}
+	var n int
+	if err := d.db.QueryRow(`SELECT count(*) FROM manual_position_snapshot WHERE user_id = ? AND day = ?`,
+		userID, day).Scan(&n); err == nil && n > 0 {
+		return
+	}
+	if _, err := d.SnapshotManualPositions(userID, day); err != nil {
+		log.Printf("[store] §L2 手动账每日快照写入失败（不影响读数）user=%s day=%s: %v", userID, day, err)
+	}
+}
+
+// ManualSnapshotRow §L1（2026-11-13）：快照持仓行的只读展示形态（不含资金，资金单独回）。
+type ManualSnapshotRow struct {
+	TsCode    string  `json:"ts_code"`
+	Name      string  `json:"name"`
+	Qty       int     `json:"qty"`
+	CostPrice float64 `json:"cost_price"`
+	AsOf      string  `json:"asof"`
+}
+
+// ManualSnapshotView §L1：某账号最近一天的手动账快照（展示层专用——
+// 决策链 resolver / 风控两闸绝不消费本视图，仍走当日 manualAsofUsable 口径）。
+type ManualSnapshotView struct {
+	Day        string              `json:"day"`
+	AsOf       string              `json:"asof"`
+	Cash       float64             `json:"cash"`
+	TotalAsset float64             `json:"total_asset"`
+	Positions  []ManualSnapshotRow `json:"positions"`
+}
+
+// LatestManualSnapshot 取某账号最近一天（有持仓行或账户行）的手动账快照。
+// 账户行（ts_code=”）拆成 Cash/TotalAsset，不混进 Positions。没有快照返回 ok=false。
+// English: latest per-day manual snapshot for display-only use; the account row
+// (ts_code=”) becomes cash/total rather than a position row.
+func (d *DB) LatestManualSnapshot(userID string) (ManualSnapshotView, bool, error) {
+	v := ManualSnapshotView{Positions: []ManualSnapshotRow{}}
+	if userID == "" {
+		return v, false, fmt.Errorf("scopedRead: empty user_id refused")
+	}
+	var day string
+	if err := d.db.QueryRow(`SELECT MAX(day) FROM manual_position_snapshot WHERE user_id = ?`,
+		userID).Scan(&day); err != nil || day == "" {
+		return v, false, err
+	}
+	v.Day = day
+	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, cash, total_asset, asof
+		FROM manual_position_snapshot WHERE user_id = ? AND day = ? ORDER BY ts_code`, userID, day)
+	if err != nil {
+		return v, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r ManualSnapshotRow
+		var cash, total float64
+		if err := rows.Scan(&r.TsCode, &r.Name, &r.Qty, &r.CostPrice, &cash, &total, &r.AsOf); err != nil {
+			return v, false, err
+		}
+		if r.TsCode == "" {
+			v.Cash, v.TotalAsset, v.AsOf = cash, total, r.AsOf
+			continue
+		}
+		v.Positions = append(v.Positions, r)
+	}
+	if err := rows.Err(); err != nil {
+		return v, false, err
+	}
+	return v, true, nil
 }

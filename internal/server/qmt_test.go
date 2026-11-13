@@ -14,6 +14,19 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// reportTestUser 是回报类测试的统一账号。scopedWrite（§L2 2026-11-13）之后，柜台回报
+// 必须带 token 解析出的账号才受理——测试里没有任何 token/密钥：这里是把一个内存里的
+// auth.User 直接塞进请求 context（与 carrier_shadow_test.go / leg_status_test.go 既有惯例
+// 完全一致），生产路径 userIDFor → userFromContext 一字未改，不存在任何可暴露的凭据。
+const reportTestUser = "u_test"
+
+// withReportUser 把测试用户注入请求 context，使 handleQMTReport 的 scopedWrite 鉴权
+// 走到「有账号」分支。English: injects an in-memory test user into the request context so the
+// scoped-write authorization sees a non-empty account; no token or secret is involved.
+func withReportUser(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, &auth.User{ID: reportTestUser}))
+}
+
 // TestQMTEndpointsUnavailableWithoutDB §白板修复回归：researchDB 未接入时，
 // 实盘族端点必须返回 503（前端 request() 据此走失败分支），绝不允许 200+{"error":…}——
 // 那会把错误体当成功数据渲染，Quant 页 trades.summary 为 undefined 直接 TypeError 白屏。
@@ -72,7 +85,7 @@ func TestHandleRealPositionsFiltersZeroQty(t *testing.T) {
 }
 
 // TestCounterReportStrictScopeKeepsOtherAccounts §OWNER-SCOPE-20261112 事故回归：
-// 11-12 08:52 admin 的一帧持仓快照把全库 user_id='' 的遗留全局行 claim/DELETE 掉，
+// 11-12 08:52 admin 的一帧持仓快照把全库 user_id=” 的遗留全局行 claim/DELETE 掉，
 // facai 账号的实盘持仓随之清零。柜台回报走 strict 模式后，只准增删 owner 自己
 // scoped 的行，其它账号行与遗留全局行一律不许碰。
 func TestCounterReportStrictScopeKeepsOtherAccounts(t *testing.T) {
@@ -121,7 +134,7 @@ func TestHandleQMTReportTrade(t *testing.T) {
 	// 建仓：买 100 股 @ 10.00
 	reqBody := `{"type":"trade","order_id":"O1","code":"600519.SH","side":"买入","price":10,"qty":100,"amount":1000,"traded_at":"2026-08-20T10:00:00+08:00","signal_id":"S1"}`
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))
+	r := withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
 	s.handleQMTReport(rr, r)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
@@ -138,7 +151,7 @@ func TestHandleQMTReportTrade(t *testing.T) {
 	// 加仓：再买 100 股 @ 12.00 → 加权成本 11，最高价 12
 	reqBody = `{"type":"trade","order_id":"O2","code":"600519.SH","side":"买入","price":12,"qty":100,"amount":1200,"traded_at":"2026-08-20T10:01:00+08:00","signal_id":"S2"}`
 	rr = httptest.NewRecorder()
-	r = httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))
+	r = withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
 	s.handleQMTReport(rr, r)
 	pos, _ = db.RealPositionByCode("600519.SH")
 	if pos.Qty != 200 || pos.CostPrice != 11 || pos.HighestPrice != 12 {
@@ -148,16 +161,16 @@ func TestHandleQMTReportTrade(t *testing.T) {
 	// 减仓：卖 50 股 @ 13.00 → 剩 150，成本不变
 	reqBody = `{"type":"trade","order_id":"O3","code":"600519.SH","side":"卖出","price":13,"qty":50,"amount":650,"traded_at":"2026-08-20T10:02:00+08:00","signal_id":"S3"}`
 	rr = httptest.NewRecorder()
-	r = httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))
+	r = withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
 	s.handleQMTReport(rr, r)
 	pos, _ = db.RealPositionByCode("600519.SH")
 	if pos.Qty != 150 || pos.CostPrice != 11 {
 		t.Fatalf("unexpected position after sell: %+v", pos)
 	}
 
-	// handleRealPositions 读回
+	// handleRealPositions 读回（同一账号 scope）
 	rr = httptest.NewRecorder()
-	r = httptest.NewRequest(http.MethodGet, "/api/positions/real", nil)
+	r = withReportUser(httptest.NewRequest(http.MethodGet, "/api/positions/real", nil))
 	s.handleRealPositions(rr, r)
 	var out struct {
 		Positions []store.RealPosition `json:"positions"`
@@ -181,7 +194,7 @@ func TestHandleQMTReportTradeFeeLeg(t *testing.T) {
 	body := `{"type":"trade","order_id":"OF1","code":"600519.SH","side":"买入","price":10,"qty":100,"amount":1000,` +
 		`"traded_at":"2026-09-18T10:00:00+08:00","signal_id":"SF1","trade_id":"TF1","fee":32.5,"stamp_tax":65}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
 	}
@@ -189,10 +202,10 @@ func TestHandleQMTReportTradeFeeLeg(t *testing.T) {
 	// 无费用字段的旧格式成交 → fee/stamp_tax 落 0（与历史口径字节兼容）
 	body2 := `{"type":"trade","order_id":"OF2","code":"600519.SH","side":"买入","price":10,"qty":100,"amount":1000,` +
 		`"traded_at":"2026-09-18T10:01:00+08:00","signal_id":"SF2"}`
-	s.handleQMTReport(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2)))
+	s.handleQMTReport(httptest.NewRecorder(), withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2))))
 
 	// 读回落库成交逐信号核对费用腿：SF1 必须透传 32.5/65，SF2（旧格式）落 0 而非 NULL。
-	fills, err := db.ListFillsByDay("", "2026-09-18")
+	fills, err := db.ListFillsByDay(reportTestUser, "2026-09-18")
 	if err != nil {
 		t.Fatalf("list fills: %v", err)
 	}
@@ -212,15 +225,15 @@ func TestHandleQMTReportTradeFeeLeg(t *testing.T) {
 // English: full reconciliation upserts and drops positions absent from the push.
 func TestHandleQMTReportPositions(t *testing.T) {
 	s, db, _ := newTestResearchServer(t)
-	// 预置一笔旧持仓
-	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "000001.SZ", Name: "平安银行", Qty: 100, CostPrice: 10}}); err != nil {
+	// 预置一笔旧持仓（scopedWrite 后柜台回报按账号 reconcile，种子行必须同账号才会被替换）
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "000001.SZ", Name: "平安银行", Qty: 100, CostPrice: 10, UserID: reportTestUser}}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	// 网关推送仅含 600519 → 000001 应被移除
 	body := `{"type":"positions","positions":[{"ts_code":"600519.SH","name":"贵州茅台","qty":200,"cost_price":1500,"amount":300000,"highest_price":1500}]}`
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))
+	r := withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
 	s.handleQMTReport(rr, r)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
@@ -241,7 +254,7 @@ func TestHandleQMTReportOrder(t *testing.T) {
 	body := `{"type":"order","order_id":"ORD1","signal_id":"S1","code":"600519.SH","side":"买入","status":"已报","price":1500,"qty":100,"at":"2026-08-20T10:00:00+08:00"}`
 	for i := 0; i < 2; i++ {
 		rr := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))
+		r := withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
 		s.handleQMTReport(rr, r)
 	}
 	orders, err := db.RealOrders()
@@ -250,6 +263,25 @@ func TestHandleQMTReportOrder(t *testing.T) {
 	}
 	if len(orders) != 1 || orders[0].OrderID != "ORD1" {
 		t.Fatalf("orders: %+v", orders)
+	}
+}
+
+// TestQMTReportScopedWriteRefusesAnonymous §L2（2026-11-13）T6.4 锁：无账号归属的柜台回报
+// 必须 403 + opslog 留痕，绝不落进 user_id=” 遗留全局桶（11-12 跨账号清仓事故的写面封口）。
+// English: §L2 T6.4 lock — an unscoped report is refused 403 with an audit trace, never
+// landing in the legacy global bucket.
+func TestQMTReportScopedWriteRefusesAnonymous(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	body := `{"type":"positions","positions":[{"ts_code":"600519.SH","name":"贵州茅台","qty":100,"cost_price":1500}]}`
+	rr := httptest.NewRecorder()
+	// 刻意不带任何用户 context（生产上等价于 token 解析失败）
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("无账号归属的回报应 403, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// 全桶零写入：legacy 全局行不得被创建
+	if all, _ := db.RealPositions(); len(all) != 0 {
+		t.Fatalf("403 后不得有任何落库（含全局桶）, got %+v", all)
 	}
 }
 
@@ -314,17 +346,17 @@ func TestQMTReportAuthzGatewayTokenOnly(t *testing.T) {
 func TestHandleQMTReportOrderAdvancesStatus(t *testing.T) {
 	s, db, _ := newTestResearchServer(t)
 
-	// 种一单本地"已报"
+	// 种一单本地"已报"（同账号：scopedWrite 后回报按账号定位推进）
 	if _, err := db.UpsertRealOrder(store.RealOrder{OrderID: "pend:S-ADV", SignalID: "S-ADV",
 		Code: "600519.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100,
-		CreatedAt: "2026-08-20T09:31:00+08:00", UserID: ""}); err != nil {
+		CreatedAt: "2026-08-20T09:31:00+08:00", UserID: reportTestUser}); err != nil {
 		t.Fatalf("seed order: %v", err)
 	}
 
 	// 回报 部成 → 本地行应推进
 	reqBody := `{"type":"order","order_id":"O-ADV","signal_id":"S-ADV","code":"600519.SH","side":"买入","status":"部成","price":10,"qty":100,"at":"2026-08-20T09:32:00+08:00"}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
 	}
@@ -346,13 +378,13 @@ func TestHandleQMTReportOrderAdvancesStatus(t *testing.T) {
 	// 回报 已成 → 推进
 	reqBody = `{"type":"order","order_id":"O-ADV","signal_id":"S-ADV","code":"600519.SH","side":"买入","status":"已成","price":10,"qty":100,"at":"2026-08-20T09:33:00+08:00"}`
 	rr = httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))))
 	assertOrderStatus("已成")
 
 	// 重放 已报 → 绝不回退
 	reqBody = `{"type":"order","order_id":"O-ADV","signal_id":"S-ADV","code":"600519.SH","side":"买入","status":"已报","price":10,"qty":100,"at":"2026-08-20T09:34:00+08:00"}`
 	rr = httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))))
 	assertOrderStatus("已成")
 }
 
@@ -363,7 +395,7 @@ func TestHandleQMTReportBrokerEventAccepted(t *testing.T) {
 	s, db, _ := newTestResearchServer(t)
 	body := `{"type":"broker","broker":"queued","from":"xt","at":"2026-09-11T14:48:00+08:00"}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("broker 切换事件应 200 接受, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -381,7 +413,7 @@ func TestHandleQMTReportOrderUnknownSideNotRejected(t *testing.T) {
 
 	reqBody := `{"type":"order","order_id":"O-DRY","signal_id":"TEST-DRY-20260911-1","code":"600000.SH","side":"???","status":"已报","price":9.3,"qty":100,"at":"2026-09-11T11:19:00+08:00"}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("未知方向 order 回报不应拒收: HTTP %d: %s", rr.Code, rr.Body.String())
 	}
@@ -402,7 +434,7 @@ func TestHandleQMTReportOrderUnknownSideNotRejected(t *testing.T) {
 	// trade 事件：未知方向仍必须 400 拒收（§安全 T3 防误走卖分支清仓）
 	tradeBody := `{"type":"trade","order_id":"O-DRY-T","code":"600000.SH","side":"???","price":9.3,"qty":100,"amount":930,"traded_at":"2026-09-11T11:19:05+08:00","signal_id":"TEST-DRY-20260911-2"}`
 	rr2 := httptest.NewRecorder()
-	s.handleQMTReport(rr2, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(tradeBody)))
+	s.handleQMTReport(rr2, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(tradeBody))))
 	if rr2.Code != http.StatusBadRequest {
 		t.Fatalf("未知方向 trade 必须拒收, got HTTP %d", rr2.Code)
 	}
@@ -574,12 +606,12 @@ func TestQMTTradesFeeInclusiveReplay(t *testing.T) {
 // non-empty push reconciles normally; empty push on an empty book passes (legit flat).
 func TestHandleQMTReportPositionsClearGuard(t *testing.T) {
 	s, db, _ := newTestResearchServer(t)
-	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1280}}); err != nil {
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1280, UserID: reportTestUser}}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	// ① 有仓 + 空快照 → 拒收，账本不动
 	rr := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[]}`))
+	r := withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[]}`)))
 	s.handleQMTReport(rr, r)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("空快照+有仓应 409, got %d: %s", rr.Code, rr.Body.String())
@@ -589,17 +621,17 @@ func TestHandleQMTReportPositionsClearGuard(t *testing.T) {
 	}
 	// ② 非空快照正常对账（覆盖为本账号快照口径）
 	rr = httptest.NewRecorder()
-	r = httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[{"ts_code":"000001.SZ","name":"平安银行","qty":200,"cost_price":12}]}`))
+	r = withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[{"ts_code":"000001.SZ","name":"平安银行","qty":200,"cost_price":12}]}`)))
 	s.handleQMTReport(rr, r)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("非空快照应 200, got %d: %s", rr.Code, rr.Body.String())
 	}
-	// ③ 本地已无仓（清到空后）→ 空快照放行
-	if _, err := db.ReconcilePositionsForUser("", nil); err != nil {
+	// ③ 本地已无仓（清到空后）→ 空快照放行（同账号范围内 flatten）
+	if _, err := db.ReconcilePositionsForUser(reportTestUser, nil); err != nil {
 		t.Fatalf("flatten: %v", err)
 	}
 	rr = httptest.NewRecorder()
-	r = httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[]}`))
+	r = withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[]}`)))
 	s.handleQMTReport(rr, r)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("空账本收空快照应放行（合法全平）, got %d: %s", rr.Code, rr.Body.String())
@@ -618,7 +650,7 @@ func TestHandleQMTReportPositionsInvalidTsCode400(t *testing.T) {
 	}
 	body := `{"type":"positions","positions":[{"ts_code":"600519.SH","name":"贵州茅台","qty":100,"cost_price":1500},{"ts_code":"","name":"垃圾行","qty":100}]}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("含空 ts_code 的快照应整批 400, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -629,7 +661,7 @@ func TestHandleQMTReportPositionsInvalidTsCode400(t *testing.T) {
 	// 非法后缀格式同样拒
 	body2 := `{"type":"positions","positions":[{"ts_code":"600519","name":"缺后缀","qty":100}]}`
 	rr = httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2))))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("缺交易所后缀应 400, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -648,7 +680,7 @@ func TestHandleQMTReportOrderStoreError500(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	if rr.Code >= 200 && rr.Code < 300 {
 		t.Fatalf("落库失败必须非 2xx（让 outbox 重推）, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -671,7 +703,7 @@ func TestHandleQMTReportOrderMissingKeys(t *testing.T) {
 	// ① 缺 signal_id：已报 → 落最小行
 	body := `{"type":"order","order_id":"MANUAL-77","code":"600000.SH","side":"买入","status":"已报","price":10,"qty":100,"at":"2026-09-22T10:00:00+08:00"}`
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("缺 signal_id 的 order 回报应落最小行并 200, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -691,7 +723,7 @@ func TestHandleQMTReportOrderMissingKeys(t *testing.T) {
 	// 同单号后续 已成 → 单调推进（占位键幂等）
 	body2 := `{"type":"order","order_id":"MANUAL-77","code":"600000.SH","side":"买入","status":"已成","price":10,"qty":100,"at":"2026-09-22T10:05:00+08:00"}`
 	rr = httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2))))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("推进回报应 200, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -702,10 +734,10 @@ func TestHandleQMTReportOrderMissingKeys(t *testing.T) {
 		}
 	}
 
-	// ② 缺 order_id：显式拒收 400，不落库
+	// ② 缺 order_id：显式拒收 400，不落库（本腿考察缺主键语义，鉴权腿已在①②覆盖）
 	body3 := `{"type":"order","signal_id":"S-NOORD","code":"600000.SH","side":"买入","status":"已成","price":10,"qty":100,"at":"2026-09-22T10:06:00+08:00"}`
 	rr = httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body3)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body3))))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("缺 order_id 应显式拒收 400, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -774,7 +806,7 @@ func TestHandleSignalTradesCriterion(t *testing.T) {
 		{UserID: uid, Day: day, Channel: "live", Code: "000001.SZ", Strategy: "factor_composite", Stage: "placed", Qty: 200, Notional: 10000},
 		{UserID: uid, Day: day, Channel: "paper", Code: "600000.SH", Strategy: "dragon", Stage: "placed", Qty: 300, Notional: 287}, // 纸面误混入
 		{UserID: uid, Day: day, Channel: "live", Code: "000520.SZ", Strategy: "dragon", Stage: "evaluated", Qty: 0, Notional: 0},   // qty=0 僵尸
-		{UserID: uid, Day: day, Channel: "live", Code: "300750.SZ", Strategy: "dragon", Stage: "skipped", Qty: 50, Notional: 0},     // 非 placed/evaluated
+		{UserID: uid, Day: day, Channel: "live", Code: "300750.SZ", Strategy: "dragon", Stage: "skipped", Qty: 50, Notional: 0},    // 非 placed/evaluated
 		{UserID: uid, Day: day, Channel: "live", Code: "688981.SH", Strategy: "factor_composite", Stage: "evaluated", Qty: 150, Notional: 90000},
 	}
 	for _, d := range seed {

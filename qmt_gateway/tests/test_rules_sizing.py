@@ -22,8 +22,15 @@ oracle_* 那几枚函数是把 Go 的合成口径独立重写一遍（不是 imp
 """
 
 import math
+import os
+import sys
 
 import pytest
+
+# unittest discover runs with qmt_gateway/ as cwd, where the repo root is not
+# on sys.path and `from qmt_gateway import ...` fails. Pytest (the intended
+# runner) has the root on the path already; make both runners work.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from qmt_gateway import rules_sizing as rs
 

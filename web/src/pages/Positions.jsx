@@ -337,7 +337,10 @@ export default function Positions() {
   // 实盘只在当前标签为「实盘」时轮询（2026-11-10 owner 需求：所有登录用户都能维护实盘持仓，
   // 轮询判据从 canLive 收敛为标签本身；无权限的 state/trades 腿在 loadReal 内按 403 静默处理）。
   usePolling(load, 60000, bookTab === 'paper')
-  usePolling(loadReal, 60000, bookTab === 'real')
+  // 2026-11-13: SSE qmt_report already triggers loadReal() on every counter
+  // report (server qmt.go:1235). The 60s REST poll was only a fallback and made
+  // a missed push look like a frozen page; tighten it to 15s as the safety net.
+  usePolling(loadReal, 15000, bookTab === 'real')
 
   // 纸面持仓轮询定时器（30s）
   // 纸面/实盘轮询均交给 §N-09 的 usePolling，不再使用页面级定时器 ref
@@ -1496,7 +1499,46 @@ export default function Positions() {
             <Card>
               <div style={{ padding: 24, textAlign: 'center' }}>
                 <p className="muted">{realEnabled ? '暂无实盘持仓' : '实盘未启用（config.toml 中 qmt.enabled=true 并配置网关）'}</p>
-                {realEnabled && <p className="muted">等待 QMT 网关回报 /api/qmt/report 推送持仓对账</p>}
+                {/* 2026-11-13: an account with no physical box will NEVER get a
+                    counter report. Telling it to "wait for /api/qmt/report" is a
+                    dead end (facai2026 incident). In bookUnknown state say what
+                    is actually unknown and point at the manual-maintenance path. */}
+                {realEnabled && (
+                  <p className="muted">
+                    {bookUnknown
+                      ? '读数未知：柜台未报数，手动账也没有当日数据。请在「手动维护」补录，或检查柜台回报通路；屏上仓位可能不是今天的'
+                      : '等待 QMT 网关回报 /api/qmt/report 推送持仓对账'}
+                    {realBookSource?.last_manual_asof
+                      ? ` · 最近手动账数据截至 ${realBookSource.last_manual_asof}`
+                      : ''}
+                  </p>
+                )}
+                {/* §L1 2026-11-13（T6.10）：最近一次手动账快照的只读展示——柜台无源 + 手动账跨日
+                    失效时，空 tab 不再只是文案而是能看到最近一天的持仓行（灰色非当目标）。
+                    展示层专用：这些行绝不可当作今日读数下单参考，操作请走「手动维护」。 */}
+                {realEnabled && bookUnknown && realBookSource?.last_manual_snapshot?.positions?.length > 0 && (() => {
+                  const snap = realBookSource.last_manual_snapshot
+                  return (
+                    <div style={{ marginTop: 16, textAlign: 'left' }} data-testid="last-manual-snapshot">
+                      <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+                        最近一次手动账快照（{snap.day} {snap.asof ? `截至 ${snap.asof}` : ''}，仅供参考，非今日读数）
+                        {typeof snap.cash === 'number' && snap.cash > 0 ? ` · 现金 ¥${snap.cash.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}` : ''}
+                      </div>
+                      <Table
+                        data={snap.positions}
+                        rowKey="ts_code"
+                        size="small"
+                        columns={[
+                          { colKey: 'ts_code', title: '代码', width: 110 },
+                          { colKey: 'name', title: '名称', width: 120 },
+                          { colKey: 'qty', title: '数量', width: 80, align: 'right' },
+                          { colKey: 'cost_price', title: '成本价', width: 90, align: 'right', cell: ({ row }) => `¥${Number(row.cost_price || 0).toFixed(2)}` },
+                        ]}
+                        pagination={false}
+                      />
+                    </div>
+                  )
+                })()}
               </div>
             </Card>
           ) : (

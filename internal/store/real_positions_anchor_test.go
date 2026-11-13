@@ -1,14 +1,19 @@
 // §ANCHOR-FIRST（2026-10-24 裁决二「止盈止损点和动态加减仓按首次买入价做锚点」）实盘账锚点列测试。
+// 2026-11-13 owner 裁决 3 改口径：柜台快照**可回填缺失锚点**（NULL/0，带 counter_snapshot 溯源），
+// 但**绝不回拉**已存在的非零风险线；"唯一写入点"从 ApplyRealFill 放宽为「ApplyRealFill 建行 +
+// 对账快照仅缺失回填」两个受控写入点。
 //
 // 钉死的语义（W2 影子层的写入冻结面）：
-//   - anchor_price 的**唯一**生产写入点是 ApplyRealFill 的建仓建行（含费每股成本，与 cost_price 同源同值）；
+//   - anchor_price 的生产写入点是 ApplyRealFill 的建仓建行（含费每股成本，与 cost_price 同源同值）；
 //   - 加仓摊薄 cost_price，**绝不**摊薄 anchor_price；
-//   - 柜台对账快照（两个 upsert 口）**不得**回拉、也不得凭空写入锚点（列有意缺席 SET 列表）；
+//   - 柜台对账快照（两个 upsert 口）仅在本地锚点 NULL/0 时回填，且回填必带 anchor_source=
+//     'counter_snapshot'（可证来源纪律）；本地已有非零锚点时快照任何取值都碰不到它；
 //   - 存量行 NULL 读回 0＝「锚点未知」，不是「锚点等于 0」也不是「锚点等于成本」。
 //
-// English: the live-book anchor column. Only the first fill creates it; add-ons dilute cost but
-// never the anchor; broker snapshots can neither pull it back nor invent it; NULL reads as 0 =
-// "unknown", which is not the same statement as "equal to cost".
+// English: the live-book anchor column. The first fill creates it; add-ons dilute cost but
+// never the anchor; a broker snapshot may FILL a missing anchor (with counter_snapshot
+// provenance) but can never pull back an existing non-zero one; NULL reads as 0 = "unknown",
+// which is not the same statement as "equal to cost".
 package store
 
 import (
@@ -52,17 +57,18 @@ func TestAnchorFrozenAcrossAddAndReduce(t *testing.T) {
 	}
 }
 
-// TestAnchorSurvivesBrokerReconcile 柜台对账不得回拉/伪造锚点。
-// 锤实形态：柜台快照里 anchor_price 为 0（网关根本不认识这个字段）与为 99（有人塞了脏值）两种写法，
-// 落账后本地锚点都必须还是建仓那笔的 10.05——列缺席 SET 列表 ⇒ 快照侧任何取值都碰不到它。
-// English: a broker snapshot carrying either 0 or a dirty value leaves the local anchor untouched.
+// TestAnchorSurvivesBrokerReconcile 柜台对账不得回拉本地已有锚点（2026-11-13 改口径后仍钉死的一半）。
+// 锤实形态：本地锚点已是建仓那笔的 10.05 时，快照里 anchor_price 为 0（网关不认识字段）、
+// 99（脏值）、7（更低值）都碰不到它，anchor_source 也保持首买来源不被洗成 counter_snapshot。
+// English: once the anchor exists, a broker snapshot carrying 0, a dirty value, or a lower
+// price cannot touch it, and the provenance stays first-buy.
 func TestAnchorSurvivesBrokerReconcile(t *testing.T) {
 	db := testDB(t)
 	if err := db.ApplyRealFill(RealFill{OrderID: "R-1", Code: "600000.SH", Side: "买入",
 		Price: 10, Qty: 100, Amount: 1000, Fee: 5, TradedAt: "2026-10-24 09:31:00", UserID: "u1"}); err != nil {
 		t.Fatalf("建仓: %v", err)
 	}
-	for i, snap := range []float64{0, 99} {
+	for i, snap := range []float64{0, 99, 7} {
 		if _, err := db.UpsertRealPositions([]RealPosition{
 			{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 12, Amount: 1200, HighestPrice: 13, AnchorPrice: snap, UserID: "u1"},
 		}); err != nil {
@@ -74,6 +80,9 @@ func TestAnchorSurvivesBrokerReconcile(t *testing.T) {
 		}
 		if p.AnchorPrice != 10.05 {
 			t.Fatalf("§ANCHOR-FIRST 对账快照(anchor=%v)不得改写本地锚点, got %v", snap, p.AnchorPrice)
+		}
+		if p.AnchorSource != AnchorSourceFirstBuyOrder {
+			t.Fatalf("§ANCHOR-FIRST 快照不得洗掉首买溯源, got %q", p.AnchorSource)
 		}
 	}
 	// 定向口径（生产主路径）同锁：ReconcilePositionsForUser 也必须碰不到锚点
@@ -135,5 +144,69 @@ func TestAnchorUnknownOnLegacyRow(t *testing.T) {
 	}
 	if p, _ := db.RealPositionByCode("300750.SZ"); p.AnchorPrice != 25.05 {
 		t.Fatalf("重新入场锚点须从零起算=新首买价 25.05, got %v", p.AnchorPrice)
+	}
+}
+
+// TestAnchorBackfilledFromCounterSnapshotOnlyWhenMissing 2026-11-13 owner 裁决 3 的正向锁：
+// 本地锚点缺失（NULL/0）时，柜台快照**必须**回填首买锚点与最高价，且回填带
+// anchor_source='counter_snapshot' 溯源（防"无标签锚点"混进风险线）；
+// 回填后快照再送更低的值不得回拉（与 TestAnchorSurvivesBrokerReconcile 闭环）。
+// 根因背景：旧链路 uplink 根本不发 cost/anchor，云端落库 cost=0、锚点恒「—」，
+// 现字段链已补齐（broker_reads 列别名 + uplink 四字段），这里锁住云侧消费端。
+// English: when the local anchor is missing, a counter snapshot MUST back-fill it with
+// counter_snapshot provenance; afterwards lower/dirty snapshot values cannot pull it back.
+func TestAnchorBackfilledFromCounterSnapshotOnlyWhenMissing(t *testing.T) {
+	db := testDB(t)
+	// 造一行锚点缺失的存量持仓（改造前形态：锚点 NULL）
+	if _, err := db.db.Exec(`INSERT INTO real_positions
+		(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+		VALUES ('002584.SZ','苏大维格',1000,9.60,9600,9.80,'recon','SIG-BS','2026-11-13 09:15:00','u1')`); err != nil {
+		t.Fatalf("造存量行: %v", err)
+	}
+	// 柜台快照带锚点 8.32 + 期间最高 9.80 → 必须回填并打 counter_snapshot 溯源
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "002584.SZ", Name: "苏大维格", Qty: 1000, CostPrice: 9.60, Amount: 9600,
+			HighestPrice: 9.80, AnchorPrice: 8.32, UserID: "u1"},
+	}); err != nil {
+		t.Fatalf("对账回填: %v", err)
+	}
+	p, err := db.RealPositionByCodeForUser("u1", "002584.SZ")
+	if err != nil {
+		t.Fatalf("读回: %v", err)
+	}
+	if p.AnchorPrice != 8.32 {
+		t.Fatalf("缺失锚点应被柜台快照回填为 8.32, got %v", p.AnchorPrice)
+	}
+	if p.AnchorSource != "counter_snapshot" {
+		t.Fatalf("回填锚点必须带 counter_snapshot 溯源, got %q", p.AnchorSource)
+	}
+	if p.HighestPrice != 9.80 {
+		t.Fatalf("期间最高价应随快照落值, got %v", p.HighestPrice)
+	}
+	// 回填后：快照送更低价/0/脏值都不得回拉，溯源不得被洗
+	for i, snap := range []float64{7, 0, 99} {
+		if _, err := db.UpsertRealPositions([]RealPosition{
+			{TsCode: "002584.SZ", Name: "苏大维格", Qty: 1000, CostPrice: 9.60, Amount: 9600,
+				HighestPrice: 9.80, AnchorPrice: snap, UserID: "u1"},
+		}); err != nil {
+			t.Fatalf("回拉对账 #%d: %v", i+1, err)
+		}
+		if p, _ = db.RealPositionByCodeForUser("u1", "002584.SZ"); p.AnchorPrice != 8.32 || p.AnchorSource != "counter_snapshot" {
+			t.Fatalf("回填后快照(anchor=%v)不得回拉/洗溯源: anchor=%v source=%q", snap, p.AnchorPrice, p.AnchorSource)
+		}
+	}
+	// 定向口径（生产主路径 ReconcilePositionsForUser）同锁：本地无行时新建行也带锚点+溯源
+	if _, err := db.ReconcilePositionsForUser("u2", []RealPosition{
+		{TsCode: "002738.SZ", Name: "中矿资源", Qty: 200, CostPrice: 60.00, Amount: 12000,
+			HighestPrice: 61.00, AnchorPrice: 58.50},
+	}, true); err != nil {
+		t.Fatalf("定向对账: %v", err)
+	}
+	p2, err := db.RealPositionByCodeForUser("u2", "002738.SZ")
+	if err != nil {
+		t.Fatalf("定向读回: %v", err)
+	}
+	if p2.AnchorPrice != 58.50 || p2.AnchorSource != "counter_snapshot" {
+		t.Fatalf("定向对账新建行应回填锚点 58.50 + counter_snapshot, got %v/%q", p2.AnchorPrice, p2.AnchorSource)
 	}
 }

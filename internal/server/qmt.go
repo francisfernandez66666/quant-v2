@@ -204,6 +204,21 @@ func userIDFor(r *http.Request) string {
 	return ""
 }
 
+// scopedWriteOK §L2 F2-②（2026-11-13）：持仓/资金**写面**的统一账号级鉴权入口。
+// F2-①（11-12 事故）之后写面鉴权散落在各 handler、各写各的判据——本 helper 收敛成
+// 一处：空账号一律 403 + opslog 留痕，绝不允许写进 user_id=” 遗留全局桶。
+// 读面（列表/展示）不走这里——展示层允许跨日快照只读展示（§L1），那是另一个口径。
+// English: §L2 F2-② — the single authorization gate for every scoped WRITE surface:
+// an empty account is refused 403 with an opslog trace, never landing in the global bucket.
+func scopedWriteOK(w http.ResponseWriter, uid, what string) bool {
+	if uid != "" {
+		return true
+	}
+	opslog.Logf("quant", "scopedWrite 拒收 %s：请求未携带账号归属（token 解析为空），写面封死", what)
+	writeError(w, 403, "scopedWrite: "+what+" has no account scope")
+	return false
+}
+
 // qmtCtrlFor 返回指定账号的 QMT 执行控制器（可空=未接入实盘）。
 // §2026-09-07 多账号实盘：走 liveCtrlFor 按调用方账号自身路由——每个账号读到自己引擎
 // 的控制器（其 gateway/token 由该账号 QMT 配置决定），运营账号行为与旧路径一致。
@@ -282,6 +297,28 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 				UpdatedAt:     manualView.CashAsOf,
 			}
 		}
+	}
+	// §L1 2026-11-13: when BOTH dimensions silently kept the default "counter"
+	// label with no live gateway behind them, say so explicitly instead of
+	// showing a blank table labelled "counter reachable". Display-only: the
+	// decision path (SelectBookSources / manualAsofUsable) still fails closed.
+	if ctrl == nil && manualViewErr == nil &&
+		bookSource["cash"] == "counter" && bookSource["positions"] == "counter" &&
+		manualView.CashAsOf != "" {
+		bookSource["unavailable"] = true
+		bookSource["last_manual_asof"] = manualView.CashAsOf
+	}
+	// §L1 2026-11-13（T6.9/T6.10）：额外下发「最近一次 manual 快照」作只读展示数据——
+	// 柜台无源 + 手动账跨日失效时（无物理机账号的每个交易日），空 tab 不再只是文案，
+	// 而是能显示快照里的持仓行 + 「数据截至」时刻。展示层专用：引擎 resolver / 风控
+	// 两闸不消费本字段，决策口径仍由 manualAsofUsable fail-closed，一字未动。
+	if snap, ok, err := db.LatestManualSnapshot(uid); err == nil && ok {
+		bookSource["last_manual_snapshot"] = snap
+		if bookSource["last_manual_asof"] == nil || bookSource["last_manual_asof"] == "" {
+			bookSource["last_manual_asof"] = snap.AsOf
+		}
+	} else if err != nil {
+		log.Printf("[server] §L1 最近手动账快照读取失败（展示层旁路，不影响主读数）user=%s: %v", uid, err)
 	}
 	// §ZERO-QTY-FILTER（2026-11-12 owner 需求）：已清仓（qty<=0）的行不属于「持仓清单」，
 	// 柜台导出在清仓当日仍会保留该票一行（数量 0 / 成本 0），uplink 原样上报后
@@ -837,10 +874,18 @@ type qmtReportEvent struct {
 	// English: §CARRIER-SHADOW — the carrier's shadow-mode decisions, uploaded by the box-local
 	// uplink (event type carrier_shadow). Observation only: one table, no money, no breaker.
 	Shadow []store.CarrierShadowDecision `json:"shadow"`
+	// Skips §C3（2026-11-13）：上行观测诊断事件（type=diagnostic）携带的「本轮跳过清单」——
+	// uplink 每类读数 missing/parse_fail/file_not_found 时旧实现只在盒子本地记一笔，
+	// 云端完全静默（#5 四候选根因迟迟无法定案的直接原因）。现随报上行，Go 只留痕
+	// （opslog + 日志），不落账、不触发任何账面动作（观测腿不许有钱的动作）。
+	// English: §C3 — the uplink's per-round skip list (type=diagnostic); logged only, never booked.
+	Skips []map[string]interface{} `json:"skips,omitempty"`
 }
 
-// qmtSnapshotMaxAge 桥侧快照的最大可信年龄：超过即视为“数据停滞”，不得据此刷新资金/持仓。
-// English: max trusted age of a bridge snapshot; older snapshots must not refresh cash/positions.
+// qmtSnapshotMaxAge 已于 2026-11-13 停用（owner 裁决 A7）：柜台帧是稀疏上报，
+// 08:54 的开盘帧不该在 09:54 被误判过期而拦住全天买入/对账。现按北京自然日判档，
+// 仅跨日帧判 stale。常量保留仅为兼容既有引用，不再参与判定。
+// English: retired fixed age window; freshness is now decided by Beijing calendar day.
 const qmtSnapshotMaxAge = 10 * time.Minute
 
 // qmtReportFreshness 判定快照是否可信：显式 synced=false → 不可信；data_ts 可解析且过旧 → 不可信。
@@ -857,7 +902,16 @@ func qmtReportFreshness(ev qmtReportEvent, now time.Time) (bool, time.Time) {
 	if ev.Synced != nil && !*ev.Synced {
 		return false, ts
 	}
-	if now.Sub(ts) > qmtSnapshotMaxAge {
+	// 2026-11-13 owner ruling A7: counter frames are SPARSE uploads, not a
+	// heartbeat. A frame stamped 08:54 must stay usable at 14:00 on the same
+	// Beijing calendar day; the old 10-minute rolling window silently rejected
+	// every later frame of the morning and left the positions page empty.
+	// Only a CROSS-DAY (or future-dated) frame is stale. synced=false above
+	// remains an unconditional veto.
+	if ts.After(now) {
+		return false, ts
+	}
+	if cntime.DayOf(ts) != cntime.DayOf(now) {
 		return false, ts
 	}
 	return true, ts
@@ -870,6 +924,12 @@ func qmtReportFreshness(ev qmtReportEvent, now time.Time) (bool, time.Time) {
 // positions/disconnect. Persists → SSE to frontend; disconnect trips the breaker and alerts.
 func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
+	// §L2 2026-11-13: every report write must carry a real token-derived
+	// account scope. Refuse an empty one instead of writing into the legacy
+	// user_id='' global bucket (the 11-12 cross-account wipe). 统一走 scopedWriteOK（F2-②）。
+	if !scopedWriteOK(w, uid, "qmt report") {
+		return
+	}
 	db := s.realDB()
 	if db == nil {
 		writeError(w, 500, "real book not available")
@@ -926,6 +986,14 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 				opslog.Logf("quant", "持仓快照未同步/停滞 用户=%s synced=%v data_ts=%s，本次跳过对账",
 					owner, ev.Synced, ev.DataTS)
 			})
+			// §C2（2026-11-13）：跳过也要让前端知道——SSE 定向通知触发实盘页重读，
+			// 让「暂无持仓」显示成「柜台快照未同步」而不是死寂的空白。
+			if s.sse != nil {
+				s.sse.BroadcastTo(owner, map[string]interface{}{
+					"type": "qmt_report", "event": "positions", "skipped": "unsynced",
+					"time": time.Now().Format("15:04:05"),
+				})
+			}
 			writeJSON(w, 200, map[string]interface{}{"ok": true, "skipped": "unsynced"})
 			return
 		}
@@ -936,6 +1004,13 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 				opslog.DayOnce("positions-empty-mv:"+owner, func() {
 					opslog.Logf("quant", "持仓空快照但账户市值 %.0f>0 用户=%s，推断会话未同步，跳过对账", acc.MarketValue, owner)
 				})
+				// §C2（2026-11-13）：同上——跳过对账必须定向前端广播，不得静默。
+				if s.sse != nil {
+					s.sse.BroadcastTo(owner, map[string]interface{}{
+						"type": "qmt_report", "event": "positions", "skipped": "market_value_conflict",
+						"time": time.Now().Format("15:04:05"),
+					})
+				}
 				writeJSON(w, 200, map[string]interface{}{"ok": true, "skipped": "market_value_conflict"})
 				return
 			}
@@ -1200,6 +1275,18 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// no controller / no book / no breaker touched (observation leg).
 		s.ingestCarrierShadow(w, db, uid, ev, cntime.Now())
 		return
+	case "diagnostic":
+		// §C3（2026-11-13）：上行观测诊断——uplink 本轮哪些读数类为什么一个事件都没发
+		// （file_not_found / parse_fail / fund_account_mismatch…）。只留痕（日志 + opslog），
+		// 不落库、不动账本、不推熔断。没有本 case 时该事件会进 default 400 → outbox 死信，
+		// 诊断链自己先断（与 broker 事件 2026-09-11 的教训同形）。
+		for _, sk := range ev.Skips {
+			log.Printf("[trading] 上行诊断(用户=%s): kind=%v reason=%v at=%v",
+				uid, sk["kind"], sk["reason"], sk["at"])
+		}
+		opslog.DayOnce("diagnostic:"+uid, func() {
+			opslog.Logf("quant", "上行诊断事件 用户=%s 跳过类别数=%d（明细见应用日志）", uid, len(ev.Skips))
+		})
 	default:
 		writeError(w, 400, "unknown report type")
 		return

@@ -58,7 +58,7 @@ SHORT_STRATEGY_TYPES = ("high_churn", "break_down", "leader_decay", "leader_deca
 # 进池只拓宽规则"可看"的票，买入仍要过全部 12 闸，不发明新下单语义）。
 BULLISH_MIN_SCORE = float(os.environ.get("BULLISH_MIN_SCORE", "60"))
 HOT_POOL_MAX = int(os.environ.get("HOT_POOL_MAX", "30"))
-SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "600"))  # owner：监视池上限 600
+SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "1000"))  # owner 2026-11-13：监视池上限 1000（裁决 10）
 
 
 def die(reason):
@@ -141,29 +141,68 @@ def extract_signal_codes():
     return sorted(set(codes))
 
 
-def extract_score_pool():
-    """当日评分榜全量代码（accounts/<OWNER>/scores_fast.json 的 scores keys）→ 监视池来源。
+def assemble_scan_pool(prev_symbols, signal_pool, bullish, score_rank, pool_max):
+    """监视池三级优先级截断（2026-11-13 owner 裁决「当日信号 > 评分 > 自选」）。
+
+    旧实现 `sorted(pool)[:MAX]` 是**字典序截断**——池只增不减，一旦超上限，000/001/002
+    开头的老代码被永久钉住，新信号 / 600xxx / 688xxx 永远进不来（#7 裁决 10 ④ 必带修复；
+    把 600 扩到 1000 只会把缺陷推迟、放大）。
+    三级语义（纯函数，无 IO，可单测）：
+      tier1 当日信号——有票必进（同层按码序稳定，保证幂等）；
+      tier2 评分——利好池分数 ∪ scores_fast 评分榜，分数高者在前（并列按码序）；
+      tier3 上一轮自选——超上限的老代码自然滚动淘汰（不再字典序钉死）。
+    输入均为 6 位码（norm 后形态）；bullish 值形如 {"score": 88.5, ...}。
+    English: priority-based scan-pool truncation — signals beat scores beat stale watchlist;
+    lexicographic pinning of old low-prefix codes is retired.
+    """
+    prev = set(prev_symbols or [])
+    tier2 = dict(score_rank or {})
+    for c, info in (bullish or {}).items():
+        s = 0.0
+        if isinstance(info, dict):
+            try:
+                s = float(info.get("score") or 0.0)
+            except (TypeError, ValueError):
+                s = 0.0
+        tier2[c] = max(tier2[c], s) if c in tier2 else s
+    sig = set(signal_pool or [])
+    ordered = []
+    ordered.extend(sorted(sig))
+    ordered.extend(c for c, _s in sorted(tier2.items(), key=lambda kv: (-kv[1], kv[0]))
+                   if c not in sig)
+    ordered.extend(sorted(prev - sig - set(tier2)))
+    return ordered[: max(0, int(pool_max))]
+
+
+def extract_score_rank():
+    """当日评分榜代码→分数映射（accounts/<OWNER>/scores_fast.json 的 scores keys）。
 
     owner 2026-11-12：监视池要 600 只——当日信号只有 ~100 只，池子凑不满。
     scores_fast 是引擎当日实算的全市场活跃池（~593 只、trading_day 必须当日才采信），
-    并入后监视池直达 SIGNAL_POOL_MAX=600。扩池只加「看得见」：每一票仍过 QMT 载体
+    并入后监视池直达 SIGNAL_POOL_MAX。扩池只加「看得见」：每一票仍过 QMT 载体
     12 闸（确认窗/VWAP/集中度/1万闸/熔断…），评分榜高分本身不构成任何买入理由。
-    English: merge today's scored universe into the carrier scan pool, capped at 600.
+    2026-11-13（#7 裁决 10 ④）：返回**代码→分数**映射而非纯代码清单——
+    三级优先级截断需要在 tier2 内按分数排序，纯清单做不到（字典序截断缺陷的根因之一）。
+    English: today's scored universe as {code: score}; the priority truncation ranks
+    tier-2 entries by score, which a bare code list cannot express.
     """
     try:
         path = os.path.join(DATA_DIR, "accounts", OWNER_UID, "scores_fast.json")
         with open(path, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
     except (OSError, ValueError):
-        return []
+        return {}
     today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
     if str(doc.get("trading_day") or "") != today:
-        return []  # 非当日评分榜绝不留宿（与 load_precalc 同一纪律）
-    out = []
-    for c in (doc.get("scores") or {}):
+        return {}  # 非当日评分榜绝不留宿（与 load_precalc 同一纪律）
+    out = {}
+    for c, s in (doc.get("scores") or {}).items():
         if isinstance(c, str) and len(c) == 6 and c.isdigit():
-            out.append(c)
-    return sorted(set(out))
+            try:
+                out[c] = float(s)
+            except (TypeError, ValueError):
+                out[c] = 0.0
+    return out
 
 
 def load_precalc():
@@ -474,11 +513,17 @@ def main():
         "bullish": dict(top),
         "updated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
-    # 2026-11-11 owner 需求：个股监视（信号监视）池上限扩到 600——扫描池 = 原自选 ∪
-    # 当日全部信号 ∪ 利好池，去重排序后截断到 SIGNAL_POOL_MAX。只拓"可看"的票，
-    # 买入仍过全部 12 闸。QMT 用 get_full_tick 逐票拉取（非订阅），无订阅上限风险。
-    pool = set(doc2["params"].get("symbols") or []) | set(signal_pool) | set(bullish) | set(extract_score_pool())
-    doc2["params"]["symbols"] = sorted(pool)[:SIGNAL_POOL_MAX]
+    # 2026-11-11 owner 需求：个股监视（信号监视）池扩容——扫描池 = 原自选 ∪ 当日全部信号
+    # ∪ 利好池 ∪ scores_fast 评分榜，去重后截断到 SIGNAL_POOL_MAX（2026-11-13 起默认 1000）。
+    # 只拓"可看"的票，买入仍过全部 12 闸。QMT 用 get_full_tick 逐票拉取（非订阅），无订阅上限风险。
+    #
+    # 2026-11-13 owner 裁决（#7 裁决 10 ④ 必带修复）：旧实现 `sorted(pool)[:MAX]` 是
+    # **字典序截断**——池只增不减，一旦超上限，000/001/002 开头的老代码被永久钉住，
+    # 新信号 / 600xxx / 688xxx 永远进不来。三级优先级截断（「当日信号 > 评分 > 自选」）
+    # 的纯函数实现见 assemble_scan_pool（含行为单测），此处只做装配调用。
+    doc2["params"]["symbols"] = assemble_scan_pool(
+        doc2["params"].get("symbols") or [], signal_pool, bullish,
+        extract_score_rank(), SIGNAL_POOL_MAX)
     # §NEWS-GATE（R10）：负分且当日持仓 → params.force_sell_boost（ASCII 键值；每次烘焙
     # **重算覆盖**——该桶语义是"当前持仓的利空票"，清空是正确状态而非数据丢失，与 risk_list
     # 的"空=保旧"并集纪律刻意不同）。ng is None（快照缺失）时不改动该键（保旧）。

@@ -664,6 +664,88 @@ def _now_ts():
     return time.time()
 
 
+def _trade_session_ok(moment=None):
+    """Whitelist gate: trade only inside a trading day's two cash sessions.
+
+    2026-11-13 owner ruling: no order and no cancel outside 09:30-11:30 /
+    13:00-14:52 (lunch break included). The legacy no_*_windows lists are
+    BLACKLISTS and let 00:00 straight through -- that is how the overnight
+    orders landed. This gate is fail-closed: missing or empty session_windows
+    refuses everything. run_round passes its own moment (one clock for the
+    whole round); the _place/_cancel backstop passes none and therefore reads
+    the real clock, so it can never be bypassed with a forged ctx.
+    """
+    if moment is None:
+        # Inside a round, _place/_cancel inherit the round's clock so a test
+        # or a replay that pins the moment stays deterministic. Outside any
+        # round the real clock is used -- never a caller-supplied ctx.
+        moment = _STATE.get("round_moment")
+    if moment is None:
+        try:
+            moment = now_cn()
+        except Exception:  # noqa: BLE001 - a broken clock must refuse, not trade
+            return False, "clock_unavailable"
+    hhmm = hhmm_now(moment)
+    day = day_key(moment)
+    trading = rule_is_trading_day(PARAMS, {
+        "weekday": moment.weekday(), "day": day,
+        "closed_days": set(PARAMS.get("closed_days") or [])})
+    if not trading:
+        return False, "not_trading_day"
+    windows = PARAMS.get("session_windows")
+    if not isinstance(windows, (list, tuple)) or not windows:
+        return False, "session_windows_missing"
+    if not rule_window_hit(PARAMS, windows, hhmm):
+        return False, "outside_trading_session"
+    return True, "ok"
+
+
+def _pending_buy_rows(orders):
+    """Open BUY orders that still reserve cash, in rules_sizing row shape.
+
+    Mirrors build_context's buy-prefix rule (baked signal_codes x buy_signals)
+    so only our own buy intents are counted. Terminal rows and fully traded
+    rows reserve nothing. Rules_sizing consumes qty/remain + price; see
+    rules_sizing.py:1099-1108 and :94-99 (the journal must be fed first).
+    """
+    codes = PARAMS.get("signal_codes") or {}
+    prefixes = set()
+    for name in (PARAMS.get("buy_signals") or []):
+        code = codes.get(name)
+        if code:
+            prefixes.add(str(code))
+    out = []
+    for row in orders or []:
+        short = str((row or {}).get("short_code") or "")
+        if not any(short.startswith(prefix) for prefix in prefixes):
+            continue
+        if (row or {}).get("terminal") is not False:
+            continue
+        qty = float((row or {}).get("qty") or 0.0) - float((row or {}).get("traded") or 0.0)
+        price = float((row or {}).get("price") or 0.0)
+        if qty <= 0.0 or price <= 0.0:
+            continue
+        out.append({"qty": qty, "remain": qty, "price": price})
+    return out
+
+
+def _pullback_limit_price(vwap, last_price):
+    """VWAP minus the baked pullback pct, never above the last price.
+
+    2026-11-13 owner ruling: "VWAP price minus 0.7%". The min() cap matters:
+    VWAP is a session average and can sit ABOVE the last price; without the
+    cap a "pullback" limit would rest above the market and lift the ask.
+    Returns None when either reading is unusable (caller keeps the old price).
+    """
+    pct = float(PARAMS.get("vwap_pullback_pct", 0.0))
+    if not vwap or vwap <= 0.0 or not last_price or last_price <= 0.0:
+        return None
+    target = vwap * (1.0 - pct / 100.0)
+    if target <= 0.0:
+        return None
+    return round(min(target, last_price), 2)
+
+
 def _tick_of(ContextInfo, symbol):
     """One snapshot -> the flat dict the rule layer reads, or {} when absent."""
     getter = getattr(ContextInfo, "get_full_tick", None)
@@ -1022,7 +1104,7 @@ def _account_total_asset():
     return None
 
 
-def _sizing_view(ctx, positions):
+def _sizing_view(ctx, positions, pending_buys=None):
     """The account-level view the sizing chain needs on top of the per-symbol ctx.
 
     2026-11-10 rebuild: the buckets this view used to leave empty
@@ -1059,11 +1141,15 @@ def _sizing_view(ctx, positions):
                 "cluster_set", "cluster_value"):
         if key in bucket:
             out[key] = bucket[key]
-    out.setdefault("pending_buys", [])
+    # 2026-11-13: feed the existing dynamic-sizing chain with REAL open buy
+    # orders. rules_sizing.py:94-99 states this journal must be filled before
+    # the next order is sized, otherwise the same-round room is stale and the
+    # account gets filled in one round. It was an empty list unconditionally.
+    out["pending_buys"] = list(pending_buys or [])
     return out
 
 
-def sizing_cap(ctx, positions, intent="new"):
+def sizing_cap(ctx, positions, intent="new", pending_buys=None):
     """Cap one buy order with the dynamic-sizing chain. Returns (amount, reason, note).
 
     amount None means "send nothing", never "no limit" -- that is buy_size_amount's
@@ -1078,7 +1164,7 @@ def sizing_cap(ctx, positions, intent="new"):
     """
     if not bool(PARAMS.get("sizing_enabled", False)):
         return None, "sizing_disabled", ""
-    sized = _sizing_view(ctx, positions)
+    sized = _sizing_view(ctx, positions, pending_buys)
     if intent in ("add", "t_leg"):
         caps = buy_size_caps(PARAMS, sized)
         values = [v for v in caps.values() if v is not None]
@@ -1108,6 +1194,10 @@ def _place(ContextInfo, signal):
     and TypeError means "this build's signature differs, try the next shape"
     while any other exception means "the request may have partially landed,
     stop and report" -- retrying that would double-send.
+
+    2026-11-13 hard stop: this is the single convergence point of EVERY order,
+    so the trading-session gate lives here too (not only in run_round) and
+    cannot be bypassed by a new caller.
     """
     po = _fn("passorder")
     if not po:
@@ -1129,6 +1219,11 @@ def _place(ContextInfo, signal):
         # counter would reject it (or worse, route it nowhere). An unproven
         # account must never reach the order API.
         return False, "account unproven: refusing to passorder"
+    # Session gate runs AFTER account proof so the long-standing "unproven
+    # account" refusal keeps its reason, but BEFORE the only passorder call.
+    allowed, why = _trade_session_ok()
+    if not allowed:
+        return False, why
     remark = build_remark(signal["short_code"])
     args = (op, int(PARAMS.get("order_type", 1101)), acct, code, pr_limit,
             float(signal["price"]), int(signal["qty"]))
@@ -1179,6 +1274,9 @@ def _cancel(order_id):
     ContextInfo); the numeric two-arg shape is attempted only when the id is
     genuinely numeric -- building int(oid) up front once raised ValueError
     before any documented form ran, and a live order stayed live (10-29).
+
+    2026-11-13 hard stop: cancelling outside the two cash sessions is refused
+    just like placing, per owner ruling (both close at 14:52).
     """
     ca = _fn("cancel")
     if not ca:
@@ -1189,6 +1287,10 @@ def _cancel(order_id):
     acct = _account()
     if not acct:
         return False, "account unproven: refusing to cancel"
+    # Same session gate, same position: after account proof, before any cancel.
+    allowed, why = _trade_session_ok()
+    if not allowed:
+        return False, why
     attempts = [("4s", (oid, acct, "STOCK")), ("4l", (oid, acct, "stock")),
                 ("3", (oid, acct, "STOCK")), ("2s", (oid, acct))]
     errs = []
@@ -1221,6 +1323,16 @@ def run_round(ContextInfo, moment):
     Never raises. A round that cannot see the counter places nothing.
     """
     summary = {"placed": [], "skipped": [], "cancelled": [], "reason": ""}
+    _STATE["round_moment"] = moment
+    # 2026-11-13 P0: refuse the WHOLE round outside the two cash sessions.
+    # The downloader leg is intentionally kept alive so bars coverage does
+    # not collapse overnight; everything else (counter reads included) stops.
+    allowed, why = _trade_session_ok(moment)
+    if not allowed:
+        _pump_legacy_downloads(ContextInfo)
+        summary["reason"] = why
+        summary["skipped"].append({"short": "-", "reason": why})
+        return summary
     orders, ok = _live_orders()
     if not ok:
         summary["reason"] = "counter_order_table_unreadable"
@@ -1228,8 +1340,24 @@ def run_round(ContextInfo, moment):
         return summary
     counter_codes = set(row["short_code"] for row in orders)
     positions = _positions()
-    cash = _cash()
+    cash_raw = _cash()
     total = _account_total_asset()
+    # 2026-11-13: open BUY orders reserve cash BEFORE the next order is sized
+    # (rules_sizing.py:94-99: a stale room is the same-round double-buy).
+    # Plus the owner's remaining-cash floor: keep total_asset x
+    # min_cash_after_reserve_pct untouched by auto buys (no daily_buy_cap).
+    pending_rows = _pending_buy_rows(orders)
+    pending_amount = 0.0
+    for row in pending_rows:
+        pending_amount += float(row["qty"]) * float(row["price"])
+    reserve_floor = 0.0
+    if total and total > 0.0:
+        reserve_floor = total * float(PARAMS.get("min_cash_after_reserve_pct", 0.0))
+    cash = None
+    if cash_raw is not None:
+        cash = cash_raw - pending_amount - reserve_floor
+        if cash < 0.0:
+            cash = 0.0
     deals = _deals()
     if positions is None:
         # Fail-closed on BOTH sides now: without the position table the exits
@@ -1410,6 +1538,26 @@ def run_round(ContextInfo, moment):
                 summary["skipped"].append({"short": short, "reason": vwhy})
                 continue
             price = signal.get("price") or ctx.get("last_price")
+            # 2026-11-13 owner ruling: buy limit = VWAP price minus 0.7%.
+            # min(..., last_price) is mandatory: VWAP is a session average and
+            # may sit ABOVE the last price; without the cap the "pullback"
+            # order would rest above the market and lift the ask immediately.
+            new_price = None
+            if str(PARAMS.get("entry_price_mode") or "") == "vwap_pullback":
+                new_price = _pullback_limit_price(vwap, price)
+            if new_price and new_price < price:
+                lot = float(PARAMS.get("lot_size") or 0.0)
+                amount = float(signal.get("amount", 0.0))
+                if lot > 0.0 and amount > 0.0:
+                    qty = int(amount / new_price / lot) * int(lot)
+                    if qty > 0:
+                        signal = dict(signal)
+                        signal["price"] = new_price
+                        signal["qty"] = qty
+                        signal["amount"] = round(qty * new_price, 2)
+                        price = new_price
+                        summary.setdefault("priced", []).append(
+                            {"short": short, "price": new_price, "qty": qty})
             if price and vwap > 0.0:
                 premium_pct = (price - vwap) / vwap * 100.0
                 if premium_pct > float(PARAMS.get("max_signal_vwap_premium_pct", 0.0)):
@@ -1444,7 +1592,7 @@ def run_round(ContextInfo, moment):
             # cap stays baked as corroborating evidence only.
             # DYN-SIZE-IN-SANDBOX: the sizing chain is ANDed with the caps above,
             # never a replacement for them: it can only make this order smaller.
-            sized_amount, why, note = sizing_cap(ctx, positions, intent)
+            sized_amount, why, note = sizing_cap(ctx, positions, intent, pending_rows)
             if sized_amount is None:
                 summary["skipped"].append({"short": short, "reason": why})
                 continue
@@ -1482,6 +1630,16 @@ def run_round(ContextInfo, moment):
                     # session registry, not the seconds-late ORDER table.
                     _STATE["buy_intents"].add((day, symbol))
                     _STATE["buy_amounts"][(day, symbol)] = session_amount + float(signal.get("amount", 0.0))
+                # 2026-11-13: reserve this send IMMEDIATELY for the next symbol
+                # in the same round (the counter ORDER table is seconds late).
+                placed_amount = float(signal.get("amount", 0.0))
+                pending_rows.append({"qty": float(signal.get("qty") or 0.0),
+                                     "remain": float(signal.get("qty") or 0.0),
+                                     "price": float(signal.get("price") or 0.0)})
+                if cash is not None:
+                    cash -= placed_amount
+                    if cash < 0.0:
+                        cash = 0.0
                 summary["placed"].append(short)
             else:
                 summary["skipped"].append({"short": short, "reason": why})
@@ -1499,6 +1657,10 @@ def cancel_leg(orders, moment):
     counter is what proves it -- a cancelled row leaves the live set, so the
     rule does not depend on the cache.
     """
+    # 2026-11-13: cancelling obeys the SAME session whitelist as placing.
+    allowed, reason = _trade_session_ok(moment)
+    if not allowed:
+        return []
     hhmm = hhmm_now(moment)
     ctx = {"trading_day": rule_is_trading_day(PARAMS, {
         "weekday": moment.weekday(), "day": day_key(moment),

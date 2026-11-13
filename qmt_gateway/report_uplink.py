@@ -429,7 +429,12 @@ class ReportUplink:
 
         每一类都独立走"缺→不发并记原因 / 半文件→不发 / 空→可发"三态，任何一类意外都不
         拖累其它类（单类读数坏掉是常态，全轮陪葬才是事故）。
+        2026-11-13 §C3：本轮若发生过任何 skip（file_not_found / parse_fail / 资金账号
+        不匹配…），追加一条 diagnostic 观测事件——旧实现这些原因只躺在盒子本地状态里，
+        云端完全静默，#5 的四候选根因因此迟迟无法定案。diagnostic 只观测不落账（Go 侧
+        case diagnostic 只留痕），没有 skip 时整条不发（常态零噪音）。
         """
+        skips_before = len(self.skips)
         events = []
         events.extend(self._build_positions_event())
         events.extend(self._build_account_event())
@@ -438,6 +443,13 @@ class ReportUplink:
         hb = self._build_heartbeat()
         if hb is not None:
             events.append(hb)
+        new_skips = self.skips[skips_before:]
+        if new_skips:
+            events.append({
+                "type": "diagnostic",
+                "user_id": self.user_id,
+                "skips": new_skips,
+            })
         return events
 
     def _read_kind(self, kind):
@@ -507,8 +519,26 @@ class ReportUplink:
             if not code:
                 self._note_skip("positions", "bad_code_row:%r" % (row.get("symbol"),))
                 continue  # 认不出市场的行整行丢弃——猜后缀会把票落到别的交易所账上
+            qty = int(row.get("qty") or 0)
+
+            def _fnum(value):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            cost = _fnum(row.get("cost_price"))
             r = {"ts_code": code, "name": str(row.get("name") or ""),
-                 "qty": int(row.get("qty") or 0), "user_id": self.user_id}
+                 "qty": qty, "user_id": self.user_id,
+                 # 2026-11-13: cost/amount/highest/anchor were missing entirely,
+                 # so every reconciled row landed with cost_price=0. The Go side
+                 # only back-fills a zero local cost, so it could never recover.
+                 "cost_price": cost,
+                 "amount": round(qty * cost, 2),
+                 "highest_price": _fnum(row.get("highest_price"))}
+            anchor = row.get("anchor_price")
+            if anchor not in (None, ""):
+                r["anchor_price"] = _fnum(anchor)
             # can_use_qty：导出有"可用数量"才带（*int 语义，缺键=nil=未知，绝不拿 0 冒充"不可卖"）
             if row.get("usable_qty") not in (None, ""):
                 try:

@@ -405,21 +405,68 @@ class TestEnvelopeShape(unittest.TestCase):
     def test_uplink_emit_sets_match_golden_section(self):
         # golden 的 report_uplink_emitted_fields 是这条腿自己的发出集（与 handler.py 的
         # gateway_emitted_fields 并列、互不冒充）——本模块加/删键不同批改 golden 即红。
+        # diagnostic（§C3 2026-11-13）只在发生 skip 的轮次才发，主夹具四类齐全无 skip，
+        # 由 test_diagnostic_event_on_missing_exports 单独钉住。
         want = self.golden["report_uplink_emitted_fields"]
         seen_types = set()
         for t, keys in want.items():
+            if t == "diagnostic":
+                continue
             for e in self._by_type(t):
                 seen_types.add(t)
                 self.assertEqual(set(e.keys()), set(keys),
                                  "事件 %s 发出键集与 golden.report_uplink_emitted_fields 不一致" % t)
-        self.assertEqual(seen_types, set(want.keys()), "夹具应逐类各至少发出一条，四类都要被钉到")
+        self.assertEqual(seen_types, set(want.keys()) - {"diagnostic"},
+                         "夹具应逐类各至少发出一条（diagnostic 除外），都要被钉到")
+
+    def test_diagnostic_event_on_missing_exports(self):
+        """§C3（2026-11-13）：读数缺失的轮次必须发出一条 diagnostic 观测事件。
+
+        旧实现 skip 原因只躺在盒子本地状态里、云端完全静默——#5 的四候选根因因此
+        迟迟无法定案。锁三件事：①有 skip 才发（常态零噪音）；②键集与 golden 一致；
+        ③skips 里每条都带 kind/reason/at 且 kind 覆盖了缺文件的类别。
+        """
+        import tempfile
+        tmp2 = tempfile.TemporaryDirectory()
+        try:
+            # 导出根为空目录 ⇒ positions/account/order 全部 file_not_found
+            fx2 = _Fixture(tmp2.name, with_positions=False)
+            opener2 = _OkOpener()
+            u2 = fx2.uplink(opener2)
+            u2.run_once()
+            events2 = [c[2] for c in opener2.calls]
+            diags = [e for e in events2 if e.get("type") == "diagnostic"]
+            self.assertEqual(len(diags), 1, "有 skip 的轮次应恰好发出一条 diagnostic")
+            golden_keys = set(self.golden["report_uplink_emitted_fields"]["diagnostic"])
+            self.assertEqual(set(diags[0].keys()), golden_keys,
+                             "diagnostic 发出键集必须与 golden 逐字一致")
+            skips = diags[0]["skips"]
+            self.assertTrue(skips, "diagnostic 不许发空清单（那等于没有信息量）")
+            for s in skips:
+                self.assertTrue({"kind", "reason", "at"} <= set(s.keys()),
+                                "skip 条目缺可取证字段: %r" % (s,))
+            self.assertTrue(any(s["kind"] == "positions" for s in skips),
+                             "持仓类缺失必须出现在诊断里")
+        finally:
+            tmp2.cleanup()
+
+        # 对照组：四类齐全的轮次（主夹具）绝不多发 diagnostic（常态零噪音）
+        self.assertEqual(self._by_type("diagnostic"), [],
+                         "无 skip 的轮次不得发 diagnostic（观测腿不许刷屏）")
 
     def test_positions_row_uplink_keys_within_golden(self):
-        allowed = {"ts_code", "name", "qty", "user_id", "can_use_qty", "updated_at"}
+        # 2026-11-13: broker_reads.py now maps the export's cost / period-high /
+        # first-buy columns, so the uplink actually carries them. Every one is
+        # already in golden.positions_row_fields (Go RealPosition reflection set).
+        allowed = {"ts_code", "name", "qty", "user_id", "can_use_qty", "updated_at",
+                   "cost_price", "amount", "highest_price", "anchor_price"}
         pos = self._by_type("positions")[0]
         for row in pos["positions"]:
             self.assertTrue(set(row.keys()) <= allowed,
                             "上行对账行发出了未登记的键: %s" % sorted(set(row.keys()) - allowed))
+            # 正向锁：登记了就必须真发（防「字段进了 golden 但停发」的假腿）。
+            self.assertIn("cost_price", row, "成本价字段必须随持仓行上报")
+            self.assertIn("amount", row, "成本×数量必须与成本价同源上报")
 
     def test_heartbeat_carries_strategy_versions(self):
         hb = self._by_type("heartbeat")

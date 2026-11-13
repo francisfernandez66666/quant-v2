@@ -47,6 +47,20 @@
     "order_amount_cap": 20000.0,
     "poll_interval_sec": 5,
     "pullback_ratio": 0.98,
+    "session_windows": [
+      [
+        "09:30",
+        "11:30"
+      ],
+      [
+        "13:00",
+        "14:52"
+      ]
+    ],
+    "session_gate_enabled": true,
+    "vwap_pullback_pct": 0.7,
+    "entry_price_mode": "vwap_pullback",
+    "min_cash_after_reserve_pct": 0.2,
     "signal_codes": {
       "break_down": "BD",
       "breakdown_sell": "BK",
@@ -166,7 +180,7 @@
     ],
     "take_profit_ratio": 1.05,
     "volume_ratio_min": 1.5,
-    "close_sweep_from": "14:52",
+    "close_sweep_from": "14:50",
     "builtin_rules": [
       "pullback_buy",
       "take_profit",

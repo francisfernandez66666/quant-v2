@@ -45,7 +45,11 @@ _ZIP = None
 _BUILD_OUT = ""
 
 RULE_MODULES = ("rules_form", "rules_ladder", "rules_factor", "rules_t", "rules_sizing")
-SANDBOX_IMPORT_ALLOW = {"datetime", "hashlib", "time"}
+# 2026-11-12 (RULE-MATH) added `import math` to the carrier template because
+# inlined ported rules call math.log/math.sqrt. math is pure computation with
+# no file/socket capability, so it belongs on the allow-list; leaving it out
+# made this gate red on every build after that fix.
+SANDBOX_IMPORT_ALLOW = {"datetime", "hashlib", "math", "time"}
 
 
 def _env(extra=None):

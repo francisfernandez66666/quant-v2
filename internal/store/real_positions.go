@@ -372,6 +372,13 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 		if p.UpdatedAt == "" {
 			p.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 		}
+		// 2026-11-13 owner ruling (mirror of ReconcilePositionsForUser): a counter
+		// snapshot MAY back-fill a missing first-buy anchor, but only with a
+		// provable provenance. The uplink sends anchor_price (never anchor_source),
+		// so stamp it here rather than letting an unlabelled anchor into the risk line.
+		if p.AnchorPrice > 0 && p.AnchorSource == "" {
+			p.AnchorSource = "counter_snapshot"
+		}
 		// §P0-1 多租户：带归属账号的对账先声明遗留全局行，避免复合主键冲突产生重复行。
 		if p.UserID != "" {
 			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, p.UserID, p.TsCode); err != nil {
@@ -433,7 +440,15 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				-- snapshot may never pull back or invent the immutable first-buy risk anchor (unlike signal_id,
 				-- which only keeps its old value when this round carries none).
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
-					THEN excluded.highest_price ELSE real_positions.highest_price END`,
+					THEN excluded.highest_price ELSE real_positions.highest_price END,
+				-- 2026-11-13 owner ruling (overrides the old "never touch the anchor"
+				-- discipline): a counter snapshot may FILL a missing anchor, but must
+				-- never pull back an existing non-zero risk line. Provenance is
+				-- stamped by the caller (counter_snapshot) and never rewritten once set.
+				anchor_price=CASE WHEN real_positions.anchor_price IS NULL OR real_positions.anchor_price <= 0
+					THEN excluded.anchor_price ELSE real_positions.anchor_price END,
+				anchor_source=CASE WHEN real_positions.anchor_source IS NULL OR real_positions.anchor_source = ''
+					THEN excluded.anchor_source ELSE real_positions.anchor_source END`,
 			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty, p.AnchorPrice, p.AnchorSource)
 		if err != nil {
 			return 0, fmt.Errorf("upsert real position %s: %w", p.TsCode, err)
@@ -561,13 +576,84 @@ func (d *DB) BackfillRealPositionAnchors() (filled, remaining int64, err error) 
 // deletes only this account's rows plus legacy global rows; never touches other accounts' rows.
 // An empty pos means "gateway flat" — the caller must have verified the channel is connected.
 // strict 可选（§OWNER-SCOPE-20261112）：仅柜台回报通道传 true —— 严格只操作
-// `user_id = ?` 的行，**不抢占、也不删除 `user_id=''` 的遗留全局行**。
+// `user_id = ?` 的行，**不抢占、也不删除 `user_id=”` 的遗留全局行**。
 // 事故背景：11-12 08:52 admin 的一帧持仓快照（只有 000520.SZ qty=0）经默认口径
-// 把全库 `user_id=''` 的行 claim/DELETE 掉，facai 账号的实盘持仓随之清零。
+// 把全库 `user_id=”` 的行 claim/DELETE 掉，facai 账号的实盘持仓随之清零。
 // 柜台数据只属于持有物理机的 owner 账号，绝不允许顺手清理「共享全局桶」。
+// ArchiveLegacyGlobalPositions §L2 F2-①（2026-11-13 owner 裁决「要全部做完」）：
+// 把 real_positions 里 user_id=” 的遗留全局行**整批留档**后从主表移除。
+// 为什么要做：这一桶是历史串号温床——11-12 08:52 admin 一帧快照曾把它 claim/清掉，
+// 间接清光 facai 的持仓；任何"对全局桶写一行"的路径都可能复刻同族事故。
+// 留档纪律（**不是删库**）：行一字不改搬进 real_positions_global_archive（含
+// archived_at 戳），随时可人工回查或回灌；审计可证，绝不静默消失。
+// 幂等：无全局行时零写入（连建表都不做）。写入口同步封口——scopedWrite 403 /
+// strict reconcile 不 claim 全局桶 / ApplyRealFill 归属必带账号——主表不会再长出
+// 新的 user_id=” 行；CHECK 约束需整表重建，live.db 上做风险大于收益，本批不做。
+// English: §L2 F2-① — archive-and-remove the legacy global bucket (preserved verbatim
+// in real_positions_global_archive, never silently deleted); idempotent, zero writes
+// when the bucket is already empty.
+func (d *DB) ArchiveLegacyGlobalPositions() (int, error) {
+	// 列面补齐后再 SELECT *：老库可能还没长出 anchor/can_use 列，此时搬运会缺列。
+	if err := d.ensureCanUseQtyColumn(); err != nil {
+		return 0, err
+	}
+	if err := d.ensureAnchorPriceColumn(); err != nil {
+		return 0, err
+	}
+	if err := d.ensureAnchorSourceColumn(); err != nil {
+		return 0, err
+	}
+	var n int
+	if err := d.db.QueryRow(`SELECT count(*) FROM real_positions WHERE user_id=''`).Scan(&n); err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if _, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS real_positions_global_archive AS
+		SELECT *, '' AS archived_at FROM real_positions WHERE 0`); err != nil {
+		return 0, fmt.Errorf("create global archive table: %w", err)
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	stamp := time.Now().Format("2006-01-02 15:04:05")
+	if _, err := tx.Exec(`INSERT INTO real_positions_global_archive
+		SELECT *, ? FROM real_positions WHERE user_id=''`, stamp); err != nil {
+		return 0, fmt.Errorf("archive legacy global rows: %w", err)
+	}
+	res, err := tx.Exec(`DELETE FROM real_positions WHERE user_id=''`)
+	if err != nil {
+		return 0, fmt.Errorf("remove archived rows from main table: %w", err)
+	}
+	if rm, _ := res.RowsAffected(); int(rm) != n {
+		return 0, fmt.Errorf("archive/remove count mismatch: counted=%d removed=%d", n, rm)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	log.Printf("[store] §L2 F2-① 遗留全局桶归档完成：%d 行已留档至 real_positions_global_archive（archived_at=%s）", n, stamp)
+	opslog.Logf("quant", "遗留全局持仓桶归档迁移(§L2 F2-①)：留档 %d 行，主表全局行清零", n)
+	return n, nil
+}
+
+// archiveLegacyGlobalRealPositions Open 挂载点：失败即拒开库（迁移失败不能带病运行）。
+func (d *DB) archiveLegacyGlobalRealPositions() error {
+	_, err := d.ArchiveLegacyGlobalPositions()
+	return err
+}
+
 // 不传 strict 的既有调用方保持原兼容语义（含单测），行为一字不变。
 func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition, strict ...bool) (int, error) {
 	isStrict := len(strict) > 0 && strict[0]
+	// §L2 2026-11-13: account-level authorization. A counter report must be
+	// scoped to a real account; an empty owner would land in the legacy global
+	// bucket and could wipe another account's rows (11-12 incident).
+	if isStrict && userID == "" {
+		return 0, fmt.Errorf("scopedWrite: empty owner on strict counter reconcile refused")
+	}
 	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 非法即整批拒收不落库，
 	// 上层据 ErrInvalidPositionReport 回 400（网关 outbox 按 4xx 永久拒绝进死信，不无限重推）。
 	if err := validateRealPositions(pos); err != nil {
@@ -599,6 +685,13 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition, strict
 		}
 		if userID != "" {
 			p.UserID = userID
+		}
+		// 2026-11-13 owner ruling: a counter snapshot MAY back-fill a missing
+		// first-buy anchor, but only with a provable provenance. The uplink
+		// sends anchor_price (never anchor_source), so stamp it here rather
+		// than letting an unlabelled anchor into the risk line.
+		if p.AnchorPrice > 0 && p.AnchorSource == "" {
+			p.AnchorSource = "counter_snapshot"
 		}
 		// §P0-1 多租户主键：同一股票先声明遗留全局行，避免复合主键冲突产生重复行。
 		// English: claim any legacy global row for this account before upserting.
@@ -678,7 +771,15 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition, strict
 				-- snapshot may never pull back or invent the immutable first-buy risk anchor (unlike signal_id,
 				-- which only keeps its old value when this round carries none).
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
-					THEN excluded.highest_price ELSE real_positions.highest_price END`,
+					THEN excluded.highest_price ELSE real_positions.highest_price END,
+				-- 2026-11-13 owner ruling (overrides the old "never touch the anchor"
+				-- discipline): a counter snapshot may FILL a missing anchor, but must
+				-- never pull back an existing non-zero risk line. Provenance is
+				-- stamped by the caller (counter_snapshot) and never rewritten once set.
+				anchor_price=CASE WHEN real_positions.anchor_price IS NULL OR real_positions.anchor_price <= 0
+					THEN excluded.anchor_price ELSE real_positions.anchor_price END,
+				anchor_source=CASE WHEN real_positions.anchor_source IS NULL OR real_positions.anchor_source = ''
+					THEN excluded.anchor_source ELSE real_positions.anchor_source END`,
 			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID, p.CanUseQty, p.AnchorPrice, p.AnchorSource)
 		if err != nil {
 			return 0, fmt.Errorf("reconcile real position %s: %w", p.TsCode, err)

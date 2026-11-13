@@ -36,10 +36,11 @@ import (
 )
 
 // postReport 直接向 handleQMTReport 投递一条回报信封，返回状态码与响应体。
+// scopedWrite（§L2 2026-11-13）后回报必须带账号：注入内存测试用户（同 qmt_test.go 惯例，无 token）。
 func postReport(t *testing.T, s *Server, body string) (int, string) {
 	t.Helper()
 	rr := httptest.NewRecorder()
-	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
 	return rr.Code, rr.Body.String()
 }
 

@@ -12,8 +12,12 @@ import (
 
 func TestQMTReportFreshness(t *testing.T) {
 	now := time.Now()
+	// 2026-11-13 owner ruling A7: a same-day frame stays usable all day
+	// (counter uploads are sparse); only cross-day / future frames are stale.
 	old := now.Add(-20 * time.Minute).Format(time.RFC3339)
 	recent := now.Add(-time.Minute).Format(time.RFC3339)
+	yesterday := now.AddDate(0, 0, -1).Format(time.RFC3339)
+	future := now.Add(time.Hour).Format(time.RFC3339)
 	unsynced := false
 	synced := true
 
@@ -25,9 +29,12 @@ func TestQMTReportFreshness(t *testing.T) {
 		{"旧桥无字段按旧口径放行", qmtReportEvent{}, true},
 		{"显式未同步", qmtReportEvent{Synced: &unsynced}, false},
 		{"显式同步", qmtReportEvent{Synced: &synced}, true},
-		{"数据停滞 20 分钟", qmtReportEvent{DataTS: old}, false},
+		{"同日 20 分钟前的早盘帧仍可用", qmtReportEvent{DataTS: old}, true},
 		{"数据 1 分钟前", qmtReportEvent{DataTS: recent}, true},
-		{"同步但数据停滞", qmtReportEvent{Synced: &synced, DataTS: old}, false},
+		{"同步但同日早盘帧仍可用", qmtReportEvent{Synced: &synced, DataTS: old}, true},
+		{"跨日帧判过期", qmtReportEvent{DataTS: yesterday}, false},
+		{"未来帧一律拒收", qmtReportEvent{DataTS: future}, false},
+		{"未同步压过同日帧", qmtReportEvent{Synced: &unsynced, DataTS: recent}, false},
 		{"data_ts 不可解析按旧口径", qmtReportEvent{DataTS: "not-a-time"}, true},
 	}
 	for _, c := range cases {

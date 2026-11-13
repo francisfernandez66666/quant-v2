@@ -83,6 +83,16 @@ HEADER_ALIASES = {
             "委托数量", "成交数量", "累计成交数量", "qty", "volume", "amount"),
     "usable_qty": ("可用数量", "可用余额", "可用拥股", "平仓数量", "usable_qty", "available"),
     "price": ("价格", "委托价格", "成交价", "成交均价", "最新价", "price"),
+    # 2026-11-13: the QMT position export carries cost / period-high / first-buy
+    # columns, but none of them were mapped here, so the parser dropped them and
+    # the uplink could only ever send qty. The cloud then stored cost_price=0
+    # and showed an empty first-buy anchor (owner report 11-13).
+    # These are OPTIONAL columns: REQUIRED_COLUMNS stays (symbol, qty) so older
+    # export files without them are still parsed instead of rejected.
+    "cost_price": ("成本价", "持仓成本", "成本价格", "买入成本", "开仓价",
+                   "cost_price", "cost", "open_price"),
+    "highest_price": ("最高价", "期间最高价", "持仓最高价", "highest_price"),
+    "anchor_price": ("首买价", "首买锚点", "锚点价", "anchor_price"),
     "order_id": ("委托号", "委托编号", "合同编号", "订单编号", "order_id", "orderid", "order"),
     "fill_id": ("成交编号", "成交序号", "fill_id", "trade_id", "deal_id"),
     "status": ("委托状态", "状态", "订单状态", "status", "state"),
