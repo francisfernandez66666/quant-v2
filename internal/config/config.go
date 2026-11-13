@@ -3908,16 +3908,30 @@ func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) error
 	return m.saveUserRules(oid, r)
 }
 
-// SetSchedulerHithinkKey §PRECALC（2026-11-11 owner）：把同花顺 API key 落进运营归属
-// 账号的全局调度配置（rules.scheduler.hithink_api_key），前台 admin 可见可改；
-// researchd 30s tick 重读 config.json 热生效，调度器拉起 hithink-sync 时注入子进程环境。
-// English: operator-scoped persistence of the hithink API key; hot-effective via the
-// researchd config re-read tick.
+// SetSchedulerHithinkKey §PRECALC（2026-11-11 owner）／§HITHINK-WIRING（2026-11-13 owner 修复）：
+// 把同花顺 API key 落进运营归属账号的 per-user 调度配置（前台 admin 可见可改，回显走这里），
+// **同时**同步进全局调度配置（config.json 顶层 rules.scheduler.hithink_api_key）并落盘。
+// 为什么必须双写：worker 拉起 hithink-sync 子进程注入凭据走的是**全局**字段
+// （worker.go:1379 的 cfg.HithinkKey 来自全局 rules.scheduler），旧实现只写 per-user 会令
+// ① THS 扒取实际拿不到 key（ths_* 数据回补失效）；② per-user 值未落盘到全局 config.json，
+// 进程重启即丢、需重存。运营归属账号（owner）的 key 即平台级 key，双写语义一致。
+// researchd 30s tick 重读 config.json 热生效。English: dual-write (per-user + global) so the
+// scheduler's hithink-sync injection source is actually populated.
 func (m *Manager) SetSchedulerHithinkKey(userID, key string) error {
 	oid := m.ownerOf(userID)
 	r := m.userRules(oid)
 	r.Scheduler.HithinkKey = key
-	return m.saveUserRules(oid, r)
+	if err := m.saveUserRules(oid, r); err != nil {
+		return err
+	}
+	// 同步进全局调度配置（hithink_sync 注入凭据的唯一来源），并原子落盘 config.json。
+	m.mu.Lock()
+	m.rules.Scheduler.HithinkKey = key
+	m.mu.Unlock()
+	if err := m.Save(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // GetSchedulerHithinkKey 返回运营归属账号配置的同花顺 key（空串=未配置）。
