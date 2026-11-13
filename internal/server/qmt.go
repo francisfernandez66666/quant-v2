@@ -365,6 +365,14 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// §5(c) 兜底：逐票 AsOfMs 全缺（quote_per_code_source 显式关闭）时用 5s 快照的批次
+	// 时刻——quoteDisplay 读的就是 fetcher.Snapshot()（无额外 TTL 缓存层，快照每 5s 重建），
+	// Snapshot.Time 即这批价的生成时刻，语义正确且不冒充请求时刻。
+	if curPriceAsofMs == 0 && s.fetcher != nil {
+		if snap := s.fetcher.Snapshot(); snap != nil && !snap.Time.IsZero() {
+			curPriceAsofMs = snap.Time.UnixMilli()
+		}
+	}
 	// §实盘账户兜底：网关未上报 account 事件（或上报异常）时 GetRealAccount 返回零值行，
 	// 前端"可用资金 ¥0.00/总值 ¥0.00"失真。此时用持仓市值（实时价优先、缺则成本价）补总值/
 	// 市值，可用资金未知则保持 0（无法凭空造现金，前端按 updated_at 区分展示）。
@@ -2499,36 +2507,14 @@ func (s *Server) handleTradeResults(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "read trade results: "+err.Error())
 		return
 	}
-	// summary：按战法聚合（买入额/已平盈亏/行数）——数据源与台账同表，与
-	// /api/qmt/trades 的 by_strategy 在共同时间窗内一致（T10，两处读同一 fills 链）。
-	type agg struct {
-		Buys     float64 `json:"buys"`
-		Realized float64 `json:"realized_pnl"`
-		Count    int     `json:"trade_count"`
-	}
-	byStrat := map[string]*agg{}
-	for _, r := range rows {
-		a := byStrat[r.Strategy]
-		if a == nil {
-			a = &agg{}
-			byStrat[r.Strategy] = a
-		}
-		a.Buys += r.Amount
-		a.Realized += r.RealizedPnl
-		a.Count++
-	}
-	names := make([]string, 0, len(byStrat))
-	for k := range byStrat {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	summary := make([]map[string]interface{}, 0, len(names))
-	for _, k := range names {
-		a := byStrat[k]
-		summary = append(summary, map[string]interface{}{
-			"strategy": k, "buys": math.Round(a.Buys*100) / 100,
-			"realized_pnl": math.Round(a.Realized*100) / 100, "trade_count": a.Count,
-		})
+	// summary：按战法聚合**全过滤窗口**（SQL GROUP BY，不是当前页）——T10 的数据源，
+	// 与 /api/qmt/trades 的 by_strategy 在共同时间窗内一致（同一 fills 链，T3 已锁单笔数学）。
+	summary, err := db.TradeResultsSummary(uid,
+		strings.TrimSpace(q.Get("strategy")), strings.TrimSpace(q.Get("status")),
+		strings.TrimSpace(q.Get("day")))
+	if err != nil {
+		writeError(w, 500, "read trade results summary: "+err.Error())
+		return
 	}
 	totalPages := 0
 	if pageSize > 0 {

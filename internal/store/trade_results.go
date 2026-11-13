@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 )
@@ -294,6 +295,51 @@ func (d *DB) RebuildTradeResultsForCode(userID, code string) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// TradeResultsSummary 按战法聚合**全过滤窗口**（不是当前页）——T10 的数据源：
+// /api/qmt/trade-results 的 summary 与 /api/qmt/trades 的 by_strategy 必须在同一
+// fills 集上可对账（T3 已锁单笔数学等价，此处保证聚合口径不因分页截断）。
+// English: per-strategy aggregates over the FULL filtered window, not the current page.
+func (d *DB) TradeResultsSummary(userID, strategy, status, day string) ([]map[string]interface{}, error) {
+	if err := d.ensureTradeResults(); err != nil {
+		return nil, err
+	}
+	where := " WHERE user_id=?"
+	args := []any{userID}
+	if strategy != "" {
+		where += " AND strategy=?"
+		args = append(args, strategy)
+	}
+	if status != "" {
+		where += " AND status=?"
+		args = append(args, status)
+	}
+	if day != "" {
+		where += " AND day=?"
+		args = append(args, day)
+	}
+	rows, err := d.db.Query(`SELECT strategy, COUNT(*), COALESCE(SUM(amount),0), COALESCE(SUM(realized_pnl),0)
+		FROM trade_results`+where+` GROUP BY strategy ORDER BY strategy`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]map[string]interface{}, 0, 8)
+	for rows.Next() {
+		var k string
+		var count int
+		var buys, pnl float64
+		if err := rows.Scan(&k, &count, &buys, &pnl); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]interface{}{
+			"strategy": k, "trade_count": count,
+			"buys":        math.Round(buys*100) / 100,
+			"realized_pnl": math.Round(pnl*100) / 100,
+		})
+	}
+	return out, rows.Err()
 }
 
 // TradeResultsForUser 分页读某账号的台账（新→旧）；strategy/status/day 可选过滤。

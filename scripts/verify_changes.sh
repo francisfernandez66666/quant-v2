@@ -21983,5 +21983,20 @@ grep -qF 'fetchN < 100' internal/data/sector_scanner.go \
 grep -qF 'MainSector.SectorConstituentTopN' cmd/quant/main.go \
 	|| fail179 "配置源缺失（main_sector.sector_constituent_top_n）"
 
+# —— ⑥ 板块成分抓取能力：THS 扒 + 东财兜底补足 + 行情回填（owner 17:14 裁决）——
+CNT179=$((CNT179 + 1))
+grep -qF 'func mergeConstituents' internal/data/sector_scanner.go \
+	|| fail179 "缺 mergeConstituents 纯合并（THS 名单在前 + 东财补足）"
+grep -qF 'GetSinaQuotes(need)' internal/data/sector_scanner.go \
+	|| fail179 "THS-only 代码缺行情回填（打分五因子会恒低分）"
+grep -qF 'GetBoardStocks(sectorCode, topN)' internal/data/sector_scanner.go \
+	|| fail179 "THS 扒取未接线"
+grep -qF 'GetSectorStocks(sectorCode, emN)' internal/data/sector_scanner.go \
+	|| fail179 "东财兜底未接线"
+grep -qF 'func TestMergeConstituentsTHSFirstEmTopUp' internal/data/sector_constituents_merge_test.go \
+	|| fail179 "合并语义回归用例缺失（T11）"
+grep -qF 'func TestMergeConstituentsCapAndEdge' internal/data/sector_constituents_merge_test.go \
+	|| fail179 "兜底韧性回归用例缺失（T12）"
+
 [ "$B179_FAILED" = "0" ] || exit 1
 echo "ok - §179 §20261113-LEDGER-TOPN 锁通过（台账四用例/remark全链/端点/TopN三处接线，累计判定点 ${CNT179}）"

@@ -54,20 +54,98 @@ func (ss *SectorScanner) SetSectorSource(ths *THSClient) {
 	ss.ths = ths
 }
 
-// sectorStocks 获取板块成分股：同花顺优先（仅代码/名称），失败或为空回退东财（含行情字段）。
-// THS 板块代码（881xxx/308xxx）直接可用；东财兜底供多因子打分使用完整行情。
-// （sectorStocks returns a sector's constituents: THS first (code/name only), falling back
-// to EastMoney (full quotes) for the multi-factor scoring path.）
+// mergeConstituents 纯合并：THS 名单在前（板块语义权威），东财行在后补足——
+// 同代码去重，THS 行缺行情字段（Price<=0）时用东财行的完整行情覆盖；封顶 topN。
+// 纯函数（无 IO），供单测直接钉合并语义。
+// English: pure merge — THS membership first, EastMoney rows top up; dedupe by code,
+// THS rows lacking quote fields are replaced by the richer EastMoney row; capped at topN.
+func mergeConstituents(thsList, emList []StockInfo, topN int) []StockInfo {
+	merged := make([]StockInfo, 0, topN)
+	index := make(map[string]int, topN)
+	add := func(list []StockInfo) {
+		for _, s := range list {
+			if s.Code == "" {
+				continue
+			}
+			if i, ok := index[s.Code]; ok {
+				if merged[i].Price <= 0 && s.Price > 0 {
+					merged[i] = s
+				}
+				continue
+			}
+			if len(merged) >= topN {
+				return
+			}
+			index[s.Code] = len(merged)
+			merged = append(merged, s)
+		}
+	}
+	add(thsList)
+	if len(merged) < topN {
+		add(emList)
+	}
+	return merged
+}
+
+// sectorStocks 获取板块成分股：**同花顺扒取 + 东财兜底补足**（owner 2026-11-13 17:14 裁决）。
+//
+// 实测约束（2026-11-13 当日实测，写死在这里免得下次重测）：
+//   - THS 网页成分页（q.10jqka.com.cn）单页 10 只；**深分页被 hexin-v 反爬拦死**
+//     （page/2/ 起无 cookie 返回空，带 UA 亦空）⇒ THS 实际每板块只出 ~10 只，
+//     且只回代码/名称、**没有行情字段**；
+//   - 东财 clist 单页 pz 上限 100（实测 pz=200 只回 100），带完整行情（涨跌幅/换手/
+//     成交额/量能），是打分链的行情来源。
+//
+// 因此正确姿势是**合并**而不是二选一：THS 出名单（板块语义权威），不足 topN 时用东财
+// 补足并顺带取行情；THS 命中的代码若缺行情字段，再用新浪批量行情回填——
+// 旧实现「THS 成功即 return」会让每板块只拿到 10 只（TopN=100 形同虚设，
+// scores_fast 凑不满 1000 的直接原因之一）。
+// English: THS scraping + EastMoney top-up (owner ruling 2026-11-13). THS is capped at
+// ~10/page by anti-scraping and carries no quotes, so we merge instead of short-circuit:
+// THS provides the authoritative membership, EastMoney fills up to topN and supplies quotes,
+// and Sina batch quotes backfill any THS-only codes that still lack quote fields.
 func (ss *SectorScanner) sectorStocks(sectorCode string, topN int) ([]StockInfo, error) {
 	ss.mu.RLock()
 	ths := ss.ths
 	ss.mu.RUnlock()
+	var thsList []StockInfo
 	if ths != nil {
-		if list, err := ths.GetBoardStocks(sectorCode, topN); err == nil && len(list) > 0 {
-			return list, nil
+		if list, err := ths.GetBoardStocks(sectorCode, topN); err == nil {
+			thsList = list
 		}
 	}
-	return ss.api.GetSectorStocks(sectorCode, topN)
+	var emList []StockInfo
+	if len(thsList) < topN && ss.api != nil {
+		// 东财兜底：单页 pz 实测上限 100，取 min(topN,100)；失败不影响 THS 已得部分。
+		emN := topN
+		if emN > 100 {
+			emN = 100
+		}
+		if list, err := ss.api.GetSectorStocks(sectorCode, emN); err == nil {
+			emList = list
+		}
+	}
+	merged := mergeConstituents(thsList, emList, topN)
+	if len(merged) == 0 {
+		return nil, fmt.Errorf("no stocks for sector %s (ths+em both empty)", sectorCode)
+	}
+	// 行情回填：THS 只给代码/名称——缺价字段的代码走新浪批量行情补（打分链必需）。
+	var need []string
+	for _, s := range merged {
+		if s.Price <= 0 {
+			need = append(need, s.Code)
+		}
+	}
+	if len(need) > 0 && ss.api != nil {
+		if quotes := ss.api.GetSinaQuotes(need); len(quotes) > 0 {
+			for i := range merged {
+				if q := quotes[merged[i].Code]; q != nil && q.Price > 0 {
+					merged[i] = *q
+				}
+			}
+		}
+	}
+	return merged, nil
 }
 
 // NewSectorScanner 创建板块扫描器。
