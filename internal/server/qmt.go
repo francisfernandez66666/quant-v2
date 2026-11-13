@@ -880,6 +880,11 @@ type qmtReportEvent struct {
 	// （opslog + 日志），不落账、不触发任何账面动作（观测腿不许有钱的动作）。
 	// English: §C3 — the uplink's per-round skip list (type=diagnostic); logged only, never booked.
 	Skips []map[string]interface{} `json:"skips,omitempty"`
+	// Remark §TRADE-LEDGER（2026-11-13）：柜台委托备注（`<载体版本>-<信号短码>`，
+	// 如 v24-FC600519）。载体自闭环的成交/委托导出没有 signal_id，备注是唯一战法归因源
+	// （AGENTS.md：「委托来源/投资备注是单据归属第一证据」）。Go 在成交落库前反解短码
+	// 补 signal_id（见 carrierRemarkStrategy），不改导出原文。
+	Remark string `json:"remark,omitempty"`
 }
 
 // qmtSnapshotMaxAge 已于 2026-11-13 停用（owner 裁决 A7）：柜台帧是稀疏上报，
@@ -1187,9 +1192,20 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 		// ApplyRealFill 事务内完成：成交流水插入（signal_id 幂等，重复回报整体回滚）
 		// + 持仓更新（买入加权成本 / 卖出按加权成本实现盈亏 / 清仓删行）。
+		// §TRADE-LEDGER（2026-11-13）战法归因补链：载体自闭环的成交导出没有 signal_id，
+		// 委托备注（remark = <载体版本>-<信号短码>）是唯一归因源。signal_id 缺失且带备注时，
+		// 反解短码补 `buy:<码>:<战法>:<日>`（仅买入腿；卖出的退出归因按持仓入场战法，
+		// 与 qmtStrategyOf 注释同一语义）。导出原文不改，只在落库前补归因。
+		fillSignalID := ev.SignalID
+		if fillSignalID == "" && strings.TrimSpace(ev.Remark) != "" {
+			if strat := carrierRemarkStrategy(ev.Remark); strat != "" && tradeSide == "买入" {
+				fillSignalID = fmt.Sprintf("buy:%s:%s:%s", ev.Code, strat,
+					tradeDayOfTradedAt(ev.TradedAt))
+			}
+		}
 		if err := db.ApplyRealFill(store.RealFill{
 			OrderID: ev.OrderID, Code: ev.Code, Side: tradeSide, Price: ev.Price,
-			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: ev.SignalID,
+			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: fillSignalID,
 			// §M4（2026-09-22 PM 批）两条腿接进账本：name 回填建仓持仓（R8 回填路径一直在等它，
 			// 但信封没 tag 所以恒空），trade_id 成交判重精确锚（同委托同秒同价同量的两笔真实
 			// 部成不再被复合键误判为重放）。
@@ -2392,20 +2408,122 @@ func (s *Server) handleQMTBrokerSwitch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"ok": "1", "broker": req.Broker})
 }
 
-// qmtStrategyOf 从 signal_id 解析战法归属：buy:<码>:<战法>:<日> → 战法名；其余（sell:/manual@）→ manual。
-// 卖出盈亏按持仓当前的入场战法归因（重放状态维护），卖出自身 signal_id 里的类目是退出原因而非来源战法。
-// English: derives the strategy tag from a buy signal_id; sells are attributed to the position's
-// entry strategy tracked during replay (the sell key encodes exit class, not origin strategy).
-func qmtStrategyOf(signalID string) string {
-	// 买入信号键形如 buy:600519.SH:龙抬头:2026-09-17，第 3 段即战法名。
-	if strings.HasPrefix(signalID, "buy:") {
-		parts := strings.Split(signalID, ":")
-		if len(parts) >= 3 && parts[2] != "" { // 战法段缺失/为空 → 回退 manual
-			return parts[2]
+// carrierSignalCodes 载体信号短码 → 战法名（真源 = local_executor_params.json 的
+// signal_codes 烘参；§179 静态锁逐键核对两侧一致，改烘参必须同批改这里）。
+// English: carrier short-code → strategy mapping, gate-locked against the baked params.
+var carrierSignalCodes = map[string]string{
+	"BD": "break_down", "BK": "breakdown_sell", "DB": "double_bump",
+	"D": "dragon", "DR": "dragon_return", "GN": "good_news_fade",
+	"HC": "high_churn", "LD": "leader_decay", "LD1": "leader_decay_v2",
+	"PT": "pattern_template", "PB": "pullback_buy", "SL": "stop_loss",
+	"TP": "take_profit",
+	// factor_composite 家族（fac_*）共用 FC；n_shape 无短码（unapped，载体侧登记）。
+	"FC": "factor_composite",
+}
+
+// carrierRemarkStrategy 从委托备注反解战法名：`v24-FC600519` → factor_composite。
+// 规则 = 剥掉载体版本前缀（v\d+-）后，对余串做**最长前缀匹配**（LD1 三字符须压过 LD）；
+// 匹配不到返回空串（未知不冒充，台账落 manual）。
+// English: reverse-resolve the strategy from a carrier order remark; longest-prefix match
+// after stripping the version prefix, empty when unknown.
+func carrierRemarkStrategy(remark string) string {
+	text := strings.TrimSpace(remark)
+	if i := strings.Index(text, "-"); i > 0 && strings.HasPrefix(text, "v") {
+		text = text[i+1:]
+	}
+	best := ""
+	for code := range carrierSignalCodes {
+		if strings.HasPrefix(text, code) && len(code) > len(best) {
+			best = code
 		}
 	}
-	// sell:*/manual@… 等非买入键统一归 manual（卖出按持仓入场战法归因，见调用方）。
-	return "manual"
+	if best == "" {
+		return ""
+	}
+	return carrierSignalCodes[best]
+}
+
+// tradeDayOfTradedAt 从成交时间串提取买入交易日（前 10 位，北京日）。
+func tradeDayOfTradedAt(tradedAt string) string {
+	if len(tradedAt) >= 10 {
+		return tradedAt[:10]
+	}
+	return tradedAt
+}
+
+// qmtStrategyOf 从 signal_id 解析战法归属：buy:<码>:<战法>:<日> → 战法名；其余（sell:/manual@）→ manual。
+// 卖出盈亏按持仓当前的入场战法归因（重放状态维护），卖出自身 signal_id 里的类目是退出原因而非来源战法。
+// §TRADE-LEDGER：实现下沉到 store.StrategyOfSignalID（台账写入侧同一把尺子），此处委托。
+// English: derives the strategy tag from a buy signal_id; the parse lives in store so the
+// ledger writer and this reader share one implementation.
+func qmtStrategyOf(signalID string) string {
+	return store.StrategyOfSignalID(signalID)
+}
+
+// handleTradeResults GET /api/qmt/trade-results：§TRADE-LEDGER 交易台账（一行 = 一笔买入
+// 成交 + 闭环进度：战法/成交价/挂单价/笔数语义=行粒度/卖出腿/已分摊盈亏）。
+// 过滤：day(yyyymmdd)/strategy/status；分页同 §F9 姿势。归属按 uid（§OWNER-SCOPE 同口径）。
+func (s *Server) handleTradeResults(w http.ResponseWriter, r *http.Request) {
+	db := s.realDB()
+	if db == nil {
+		writeError(w, http.StatusServiceUnavailable, "real book not available")
+		return
+	}
+	uid := userIDFor(r)
+	if uid == "" {
+		// 台账是账面读数，无账号归属时宁可空回也不泄漏他人流水（与 fills 归属过滤同取向）。
+		writeJSON(w, 200, map[string]interface{}{"total": 0, "rows": []any{}})
+		return
+	}
+	q := r.URL.Query()
+	page, pageSize := parsePageParams(r, 100, 500)
+	rows, total, err := db.TradeResultsForUser(uid,
+		strings.TrimSpace(q.Get("strategy")), strings.TrimSpace(q.Get("status")),
+		strings.TrimSpace(q.Get("day")), pageSize, (page-1)*pageSize)
+	if err != nil {
+		writeError(w, 500, "read trade results: "+err.Error())
+		return
+	}
+	// summary：按战法聚合（买入额/已平盈亏/行数）——数据源与台账同表，与
+	// /api/qmt/trades 的 by_strategy 在共同时间窗内一致（T10，两处读同一 fills 链）。
+	type agg struct {
+		Buys     float64 `json:"buys"`
+		Realized float64 `json:"realized_pnl"`
+		Count    int     `json:"trade_count"`
+	}
+	byStrat := map[string]*agg{}
+	for _, r := range rows {
+		a := byStrat[r.Strategy]
+		if a == nil {
+			a = &agg{}
+			byStrat[r.Strategy] = a
+		}
+		a.Buys += r.Amount
+		a.Realized += r.RealizedPnl
+		a.Count++
+	}
+	names := make([]string, 0, len(byStrat))
+	for k := range byStrat {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	summary := make([]map[string]interface{}, 0, len(names))
+	for _, k := range names {
+		a := byStrat[k]
+		summary = append(summary, map[string]interface{}{
+			"strategy": k, "buys": math.Round(a.Buys*100) / 100,
+			"realized_pnl": math.Round(a.Realized*100) / 100, "trade_count": a.Count,
+		})
+	}
+	totalPages := 0
+	if pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	setPaginationHeaders(w, total, page, pageSize)
+	writeJSON(w, 200, map[string]interface{}{
+		"rows": rows, "total": total, "page": page, "page_size": pageSize,
+		"total_pages": totalPages, "summary": summary,
+	})
 }
 
 // handleQMTTrades 处理 GET /api/qmt/trades：交易流水 + 整体盈亏 + 按战法归因统计。

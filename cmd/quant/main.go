@@ -589,6 +589,11 @@ func run() int {
 	if sectorTopN <= 0 {
 		sectorTopN = 20
 	}
+	// §SCORES-FAST-1000（2026-11-13）：把 sectorTopN 同步接进板块验证代理——
+	// 旧缺陷：engine.SetSectorConstituentTopN 只管 propagateSectorToStocks（新闻→个股传播），
+	// sectorAgent.Verify（热点池成分来源）用的是它自己的出厂 20，配置调了也不生效。
+	// 现在两处同一把尺子：热点池供给 = 8 板块 × topN，scores_fast 由此凑满 1000。
+	sAgent.SetConstituentTopN(sectorTopN)
 	sAgent.SetConstituentTopN(sectorTopN)
 
 	// 多账号独立引擎注册表：数据源全局共享一份，每个账号登录时懒加载自己的引擎实例。

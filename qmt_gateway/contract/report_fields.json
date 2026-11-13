@@ -44,19 +44,20 @@
       "data_ts"
     ],
     "trade": [
-      "order_id",
-      "trade_id",
-      "name",
+      "amount",
       "code",
-      "side",
+      "fee",
+      "name",
+      "order_id",
       "price",
       "qty",
-      "amount",
-      "traded_at",
+      "remark",
+      "side",
+      "side_unverified",
       "signal_id",
-      "fee",
       "stamp_tax",
-      "side_unverified"
+      "trade_id",
+      "traded_at"
     ]
   },
   "gateway_emitted_fields": {
@@ -169,6 +170,7 @@
     "price",
     "qty",
     "reason",
+    "remark",
     "shadow",
     "side",
     "side_unverified",
@@ -227,6 +229,21 @@
       "data_ts",
       "positions",
       "synced",
+      "type",
+      "user_id"
+    ],
+    "trade": [
+      "amount",
+      "at",
+      "code",
+      "order_id",
+      "price",
+      "qty",
+      "remark",
+      "signal_id",
+      "side",
+      "trade_id",
+      "traded_at",
       "type",
       "user_id"
     ]

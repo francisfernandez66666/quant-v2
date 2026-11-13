@@ -920,6 +920,8 @@ func (s *Server) registerRoutes() {
 	// （handler 全按 userIDFor(r) 过滤，跨账号视图仍只有运营侧的 trading_admin 拿得到）。
 	s.mux.HandleFunc("GET /api/qmt/state", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTState))
 	s.mux.HandleFunc("GET /api/qmt/trades", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTTrades))
+	// §TRADE-LEDGER（2026-11-13）：交易台账（一行=一笔买入成交+闭环进度），权限面与 trades 同族。
+	s.mux.HandleFunc("GET /api/qmt/trade-results", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleTradeResults))
 	// §2.12（2026-11-04 外脑化 B1'）手动维护账：桥 11-05 断后持仓/可用资金不再由柜台自动上报，
 	// owner 在量仔里手工维护，量仔据此继续出信号卡。
 	// **账号级 authMiddleware，刻意不落严格位**（§PLAN_EXTERNAL_BRAIN_IMPL §2.12 原文「不落严格位」）：

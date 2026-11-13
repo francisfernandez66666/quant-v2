@@ -1159,6 +1159,12 @@ export async function fetchQMTTrades(page = 1, pageSize = 100) {
   return request(`/api/qmt/trades?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`)
 }
 
+/** §TRADE-LEDGER（2026-11-13）：交易台账（一行=一笔买入成交+闭环进度）。
+ *  对应 GET /api/qmt/trade-results，返回 { rows, summary, total, page, page_size, total_pages }。 */
+export async function fetchTradeResults(page = 1, pageSize = 100) {
+  return request(`/api/qmt/trade-results?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`)
+}
+
 /** 实盘：当日委托列表（§U-2 撤单 UI 数据源；仅当日，含 order_id 供撤单） */
 /** Live: today's order tickets (data source for the cancel UI) */
 // 对应 GET /api/qmt/orders，返回 [{ order_id, signal_id, code, side, status, price, qty, created_at }]

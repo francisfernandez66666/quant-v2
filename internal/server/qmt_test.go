@@ -285,6 +285,92 @@ func TestQMTReportScopedWriteRefusesAnonymous(t *testing.T) {
 	}
 }
 
+// TestQMTReportRemarkAttribution §TRADE-LEDGER（2026-11-13）T7 锁：载体自闭环的成交
+// 信封没有 signal_id，委托备注（v24-FC600519）是唯一归因源——Go 反解短码补
+// `buy:<码>:<战法>:<日>` 后落 fills 与台账，台账行战法=factor_composite（不再 manual）。
+func TestQMTReportRemarkAttribution(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	body := `{"type":"trade","order_id":"O-RM","code":"600519.SH","side":"买入","price":10,"qty":100,` +
+		`"amount":1000,"traded_at":"2026-11-13 09:31:05","trade_id":"T-RM","remark":"v24-FC600519"}`
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, withReportUser(httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	pos, err := db.RealPositionByCode("600519.SH")
+	if err != nil || pos.Qty != 100 {
+		t.Fatalf("成交应落库: %+v err=%v", pos, err)
+	}
+	if pos.SignalID != "buy:600519.SH:factor_composite:2026-11-13" {
+		t.Fatalf("T7: signal_id 应由 remark 反解补全, got %q", pos.SignalID)
+	}
+	rows, _, err := db.TradeResultsForUser(reportTestUser, "", "", "", 10, 0)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("台账应有 1 行, n=%d err=%v", len(rows), err)
+	}
+	if rows[0].Strategy != "factor_composite" {
+		t.Fatalf("T7: 台账战法应=factor_composite, got %q", rows[0].Strategy)
+	}
+	if rows[0].Price != 10 || rows[0].Qty != 100 || rows[0].Status != "open" {
+		t.Fatalf("台账行读数不符: %+v", rows[0])
+	}
+	// 反解纯函数：版本前缀剥离 + 最长前缀（LD1 压过 LD）+ 未知返回空
+	if got := carrierRemarkStrategy("v24-LD100519"); got != "leader_decay_v2" {
+		t.Fatalf("最长前缀匹配应选 LD1, got %q", got)
+	}
+	if got := carrierRemarkStrategy("v24-ZZ999999"); got != "" {
+		t.Fatalf("未知短码应返回空串, got %q", got)
+	}
+}
+
+// TestHandleTradeResultsEndpoint §TRADE-LEDGER 端点锁：台账读数按账号过滤、summary 按战法聚合。
+func TestHandleTradeResultsEndpoint(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "O-TR", Code: "600519.SH", Side: "买入",
+		Price: 10, Qty: 100, Amount: 1000, Fee: 5, TradedAt: "2026-11-13 09:31:00",
+		SignalID: "buy:600519.SH:龙抬头:2026-11-13", UserID: reportTestUser}); err != nil {
+		t.Fatalf("seed fill: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	r := withReportUser(httptest.NewRequest(http.MethodGet, "/api/qmt/trade-results", nil))
+	s.handleTradeResults(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Rows []struct {
+			Code     string  `json:"code"`
+			Strategy string  `json:"strategy"`
+			Status   string  `json:"status"`
+			Price    float64 `json:"price"`
+		} `json:"rows"`
+		Summary []struct {
+			Strategy string `json:"strategy"`
+		} `json:"summary"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Total != 1 || len(out.Rows) != 1 || out.Rows[0].Strategy != "龙抬头" || out.Rows[0].Status != "open" {
+		t.Fatalf("台账读数不符: total=%d rows=%+v", out.Total, out.Rows)
+	}
+	if len(out.Summary) != 1 || out.Summary[0].Strategy != "龙抬头" {
+		t.Fatalf("summary 应按战法聚合: %+v", out.Summary)
+	}
+	// 越权：别的账号看不到
+	rr2 := httptest.NewRecorder()
+	r2 := r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, &auth.User{ID: "u_other"}))
+	s.handleTradeResults(rr2, r2)
+	var out2 struct {
+		Total int `json:"total"`
+	}
+	_ = json.Unmarshal(rr2.Body.Bytes(), &out2)
+	if out2.Total != 0 {
+		t.Fatalf("跨账号台账必须不可见, got total=%d", out2.Total)
+	}
+}
+
 // TestNormalizeTsCode 代码补后缀。
 // English: exchange-suffix completion for bare codes.
 func TestNormalizeTsCode(t *testing.T) {

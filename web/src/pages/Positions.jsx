@@ -148,6 +148,8 @@ export default function Positions() {
   // 前端只透传、只按它分流（下单 vs 改账）与挂角标，**绝不**自己在页面上再判一次新鲜度——
   // 两处判一个迟早一处漂，漂的方向不是放行买入就是把手敲账悄悄换成旧柜台账。
   const [realBookSource, setRealBookSource] = useState(null)
+  // §TRADE-LEDGER（2026-11-13）：交易台账（rows/summary/total），随 loadReal 同轮刷新
+  const [realLedger, setRealLedger] = useState({ rows: [], summary: [], total: 0 })
   // 2026-11-11：资金维护补齐「总资产」显式输入（不填就不改，服务端绝不推算）
   const [manualSetTotalVal, setManualSetTotalVal] = useState('')
   // 维护模式显式开关（localStorage 记住选择；SSR/隐私模式下 localStorage 不可用也不炸）
@@ -820,6 +822,15 @@ export default function Positions() {
         ledger.clear('实盘成交')
       } catch (e) {
         if (!api.isForbidden(e)) ledger.mark('实盘成交', failMsg(e))
+      }
+      // §TRADE-LEDGER（2026-11-13）：交易台账随 loadReal 同轮刷新（SSE→loadReal 链路
+      // 自动带动台账；勘误重算后下一次刷新即见）。
+      try {
+        const lr = await api.fetchTradeResults()
+        if (realGuard.current.isStale(token)) return
+        setRealLedger({ rows: lr?.rows || [], summary: lr?.summary || [], total: lr?.total || 0 })
+      } catch (e) {
+        if (!api.isForbidden(e)) ledger.mark('交易台账', failMsg(e))
       }
     }
   }
@@ -1555,6 +1566,40 @@ export default function Positions() {
               })()}
             </Card>
           )}
+          {/* §TRADE-LEDGER（2026-11-13）：交易台账——一行=一笔买入成交+闭环进度
+              （战法/成交价/挂单价/卖出腿/已分摊盈亏）。数据源 /api/qmt/trade-results，
+              与成交簿同链（勘误后台账自动重算）。 */}
+          <Card>
+            <div style={{ padding: '10px 14px 0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <b>交易台账</b>
+              <span className="muted" style={{ fontSize: 12 }}>
+                {realLedger.summary?.map(s => `${s.strategy} ¥${s.buys.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}/盈亏 ${s.realized_pnl}`).join(' · ')}
+              </span>
+            </div>
+            <Table
+              data={realLedger.rows}
+              rowKey={(r) => `${r.fill_id}`}
+              size="small"
+              columns={[
+                { colKey: 'day', title: '交易日', width: 100 },
+                { colKey: 'code', title: '代码', width: 100 },
+                { colKey: 'name', title: '名称', width: 110 },
+                { colKey: 'strategy', title: '战法', width: 110 },
+                { colKey: 'price', title: '成交价', width: 90, align: 'right', cell: ({ row }) => `¥${Number(row.price || 0).toFixed(2)}` },
+                { colKey: 'limit_price', title: '挂单价', width: 90, align: 'right', cell: ({ row }) => row.limit_price > 0 ? `¥${Number(row.limit_price).toFixed(2)}` : '—' },
+                { colKey: 'qty', title: '数量', width: 80, align: 'right' },
+                { colKey: 'sell_qty', title: '已卖', width: 80, align: 'right' },
+                { colKey: 'sell_avg_price', title: '卖出均价', width: 95, align: 'right', cell: ({ row }) => row.sell_avg_price > 0 ? `¥${Number(row.sell_avg_price).toFixed(2)}` : '—' },
+                { colKey: 'realized_pnl', title: '已实现盈亏', width: 110, align: 'right', cell: ({ row }) => {
+                    const v = Number(row.realized_pnl || 0)
+                    return <span style={{ color: v > 0 ? '#d54941' : v < 0 ? '#2a8674' : undefined }}>{v === 0 ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(2)}`}</span>
+                  } },
+                { colKey: 'status', title: '状态', width: 80, cell: ({ row }) => row.status === 'closed' ? '已平' : row.status === 'partial' ? '部分平' : '在持' },
+              ]}
+              pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50], total: realLedger.total || realLedger.rows.length }}
+              empty="暂无台账记录（发版时刻起记）"
+            />
+          </Card>
           </>
         </Tabs.TabPanel>
       </Tabs>

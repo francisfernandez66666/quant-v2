@@ -25,6 +25,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -219,6 +220,19 @@ func (s *Server) transitionFillAmendment(w http.ResponseWriter, r *http.Request,
 			"revoke": "勘误已撤销：所有账目数字回到原始方向",
 		}[action],
 	})
+	// §TRADE-LEDGER（2026-11-13 T11）：勘误改账后台账整本重算该 (user, code)——
+	// 台账按生效方向重放（fills_effective），保证「勘误后台账与流水不打架」。
+	// 失败只留痕不回滚勘误本身（账目已生效，台账可在下一次勘误/重启重放修复，
+	// 绝不让展示层的失败污染钱路径的审计语义）。
+	owner := after.UserID
+	if owner == "" {
+		owner = before.UserID
+	}
+	if n, err := db.RebuildTradeResultsForCode(owner, after.Code); err != nil {
+		log.Printf("[server] §TRADE-LEDGER 勘误后台账重算失败（留痕不阻断）user=%s code=%s: %v", owner, after.Code, err)
+	} else {
+		log.Printf("[server] §TRADE-LEDGER 勘误后台账已重算 user=%s code=%s rows=%d", owner, after.Code, n)
+	}
 }
 
 // amendmentOperator 审计用的操作者标识：优先用户名（人类可读），回落 uid，再回落 "unknown"。

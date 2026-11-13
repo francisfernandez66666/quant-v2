@@ -951,6 +951,16 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	if err := d.ensureAnchorSourceColumn(); err != nil {
 		return err
 	}
+	// §TRADE-LEDGER（2026-11-13）：台账表惰性建表——与 fills 同事务写，失败整体回滚
+	// （绝无「有台账无成交」半态，T12）。
+	if err := d.ensureTradeResults(); err != nil {
+		return err
+	}
+	// §TRADE-LEDGER 卖出盈亏上下文：在持仓更新**前**捕获加权成本基准与钳制量，
+	// 与 handleQMTTrades 重放同式（超卖钳到重放量、超出卖出的无基准余量不摊分）。
+	var sellCost float64
+	var sellClamped int
+	var sellApplicable bool
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -1033,6 +1043,16 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			if newQty < 0 {
 				newQty = 0
 			}
+			// §TRADE-LEDGER：卖出盈亏基准捕获——钳制量与减仓前加权成本（与重放同式）。
+			if c := p.Qty; f.Qty < c {
+				sellClamped = f.Qty
+			} else {
+				sellClamped = p.Qty
+			}
+			if sellClamped > 0 {
+				sellCost = p.CostPrice
+				sellApplicable = true
+			}
 			// §实盘账户隔离：减仓时同样回写 user_id（减仓不改变归属，但保持写路径一致，
 			// 防止历史上 user_id 为空的持仓在减仓后仍以全局行形态存在）。
 			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=? WHERE ts_code=? AND (user_id='' OR user_id=?)`,
@@ -1100,12 +1120,29 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	if f.MarketVWAP > 0 {
 		f.FillVWAPPremiumPct = (f.Price - f.MarketVWAP) / f.MarketVWAP * 100
 	}
-	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id,
+	res, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id,
 		 market_vwap, fill_vwap_premium_pct, vwap_source, vwap_as_of)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial, f.TradeID,
-		f.MarketVWAP, f.FillVWAPPremiumPct, f.VWAPSource, f.VWAPAsOf); err != nil {
+		f.MarketVWAP, f.FillVWAPPremiumPct, f.VWAPSource, f.VWAPAsOf)
+	if err != nil {
 		return err
+	}
+	// §TRADE-LEDGER：成交行落库成功后，同事务写台账——买入插行；卖出 FIFO 匹配摊分。
+	// 台账失败与 fills 同回滚（同一事务），绝无半态。
+	if fillID, idErr := res.LastInsertId(); idErr == nil {
+		nowTs := time.Now().Format("2006-01-02 15:04:05")
+		if f.Side == "买入" {
+			if err := writeTradeResultBuyTx(tx, f, fillID, nowTs); err != nil {
+				return err
+			}
+		} else if sellApplicable {
+			if err := matchSellTradeResultsTx(tx, f, sellCost, sellClamped, nowTs); err != nil {
+				return err
+			}
+		}
+	} else {
+		log.Printf("[store] 台账跳过（fills LastInsertId 不可得）order=%s: %v", f.OrderID, idErr)
 	}
 	return tx.Commit()
 }

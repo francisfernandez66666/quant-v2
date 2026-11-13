@@ -21899,3 +21899,89 @@ grep -qF 'def test_low_prefix_old_codes_no_longer_pinned' qmt_gateway/tests/test
 
 [ "$B177_FAILED" = "0" ] || exit 1
 echo "ok - §177 §20261113-DEFECTS 锁通过（时段闸/预算接线/VWAP回踩/自然日新鲜度/回报字段/锚点回填/C2/C3/L1快照/L2鉴权+归档 + 用例在册，累计判定点 ${CNT177}）"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §179 §20261113-LEDGER-TOPN（交易结果台账 + scores_fast 1000/板块成分 TopN 扩容 静态锁）
+# docs/PLAN_TRADE_RESULT_LEDGER_20261113.md + docs/PLAN_SCORES_FAST_1000_20261113.md
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 179 §20261113-LEDGER-TOPN（台账一行一成交/FIFO摊分/勘误重算/remark归因链/成交上行腿/TopN接线）..."
+B179_FAILED=0
+fail179() {
+	echo "--- FAIL: §179 $*"
+	FAIL=1
+	B179_FAILED=1
+}
+CNT179=0
+
+# —— ① 台账表与写入点（一笔成交一行，ApplyRealFill 同事务）——
+CNT179=$((CNT179 + 1))
+grep -qF 'CREATE TABLE IF NOT EXISTS trade_results' internal/store/trade_results.go \
+	|| fail179 "缺 trade_results 台账表"
+grep -qF 'func writeTradeResultBuyTx' internal/store/trade_results.go \
+	|| fail179 "缺买入插行写入点"
+grep -qF 'func matchSellTradeResultsTx' internal/store/trade_results.go \
+	|| fail179 "缺卖出 FIFO 匹配摊分"
+grep -qF 'func (d *DB) RebuildTradeResultsForCode' internal/store/trade_results.go \
+	|| fail179 "缺勘误后台账整本重算（T11）"
+grep -qF 'ensureTradeResults' internal/store/real_positions.go \
+	|| fail179 "ApplyRealFill 未接台账建表"
+grep -qF 'writeTradeResultBuyTx(tx, f, fillID, nowTs)' internal/store/real_positions.go \
+	|| fail179 "ApplyRealFill 买入腿未写台账"
+grep -qF 'matchSellTradeResultsTx(tx, f, sellCost, sellClamped, nowTs)' internal/store/real_positions.go \
+	|| fail179 "ApplyRealFill 卖出腿未摊分台账"
+
+# —— ② 台账断言用例在册（T1-T6/T11/T12）——
+CNT179=$((CNT179 + 1))
+grep -qF 'func TestTradeResultsPerFillGranularity' internal/store/trade_results_test.go \
+	|| fail179 "台账粒度用例缺失（T1/T2/T4）"
+grep -qF 'func TestTradeResultsSellMatchingAndPnl' internal/store/trade_results_test.go \
+	|| fail179 "卖出匹配/盈亏同尺用例缺失（T3/T5/T6）"
+grep -qF 'func TestTradeResultsIdempotentReplay' internal/store/trade_results_test.go \
+	|| fail179 "幂等重放用例缺失（T12）"
+grep -qF 'func TestTradeResultsRebuildFollowsAmendment' internal/store/trade_results_test.go \
+	|| fail179 "勘误重算用例缺失（T11）"
+
+# —— ③ remark 归因链（短码反解 + fills.signal_id 补链 + 成交上行腿）——
+CNT179=$((CNT179 + 1))
+grep -qF 'func carrierRemarkStrategy' internal/server/qmt.go \
+	|| fail179 "缺 remark 短码反解"
+grep -qF '"LD1": "leader_decay_v2"' internal/server/qmt.go \
+	|| fail179 "短码映射缺 LD1（最长前缀语义）"
+grep -qF 'carrierRemarkStrategy(ev.Remark)' internal/server/qmt.go \
+	|| fail179 "trade 分支未接 remark 归因"
+grep -qF 'Remark string `json:"remark,omitempty"`' internal/server/qmt.go \
+	|| fail179 "信封缺 remark 字段"
+grep -qF '"remark": ("投资备注", "委托备注", "备注", "remark", "comment")' qmt_gateway/broker_reads.py \
+	|| fail179 "broker_reads 未映射投资备注列"
+grep -qF 'def _build_fill_events' qmt_gateway/report_uplink.py \
+	|| fail179 "uplink 缺成交上行腿（D-B：fills 导出有解析器无人消费）"
+grep -qF '"remark"' qmt_gateway/contract/report_fields.json \
+	|| fail179 "golden 契约未登记 remark"
+grep -qF 'func TestQMTReportRemarkAttribution' internal/server/qmt_test.go \
+	|| fail179 "remark 归因回归用例缺失（T7）"
+
+# —— ④ 台账读侧端点 ——
+CNT179=$((CNT179 + 1))
+grep -qF 'func (s *Server) handleTradeResults' internal/server/qmt.go \
+	|| fail179 "缺 /api/qmt/trade-results 端点"
+grep -qF 'GET /api/qmt/trade-results' internal/server/server.go \
+	|| fail179 "路由未注册"
+grep -qF 'fetchTradeResults' web/src/api/index.js \
+	|| fail179 "前端 API 缺台账封装"
+grep -qF 'func StrategyOfSignalID' internal/store/trade_results.go \
+	|| fail179 "战法解析未下沉 store（两把尺子）"
+
+# —— ⑤ scores_fast 1000：板块成分 TopN 接线（三处同一把尺子）——
+CNT179=$((CNT179 + 1))
+grep -qF 'sAgent.SetConstituentTopN(sectorTopN)' cmd/quant/main.go \
+	|| fail179 "板块验证代理未接配置 TopN（Verify 恒用出厂 20，scores_fast 凑不满的根因）"
+grep -qF 'fetchN := maxStocks' internal/data/sector_scanner.go \
+	|| fail179 "成分拉取量未跟随 TopN（恒拉 100 留 20 的旧截断）"
+grep -qF 'fetchN < 100' internal/data/sector_scanner.go \
+	|| fail179 "拉取下限 100 保底缺失（TopN<100 时行为不变）"
+grep -qF 'MainSector.SectorConstituentTopN' cmd/quant/main.go \
+	|| fail179 "配置源缺失（main_sector.sector_constituent_top_n）"
+
+[ "$B179_FAILED" = "0" ] || exit 1
+echo "ok - §179 §20261113-LEDGER-TOPN 锁通过（台账四用例/remark全链/端点/TopN三处接线，累计判定点 ${CNT179}）"

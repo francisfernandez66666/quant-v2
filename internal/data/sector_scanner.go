@@ -313,7 +313,15 @@ func (ss *SectorScanner) BuildEventMapFromNews(news []NewsItem, base map[string]
 // 因子：涨跌幅(0-35) + 换手率(0-25) + 成交额(0-20) + 量能(0-20) + 龙头加成(0-15)
 // 返回按总分降序排列的 ScoredStock 切片。
 func (ss *SectorScanner) ScoreSectorStocks(sectorCode string, maxStocks int) ([]ScoredStock, error) {
-	allStocks, err := ss.sectorStocks(sectorCode, 100)
+	// §SCORES-FAST-1000（2026-11-13）：成分拉取量跟随 maxStocks（下限 100 保底）——
+	// 旧实现恒拉 100、只留 TopN 20，热点池供给被钉死在 8 板块×20≈160（scores_fast
+	// 凑不满 1000 的根因）。拉取量与留存量同源后，main_sector.sector_constituent_top_n
+	// 调到 100 即为每板块 100 只成分入池（上游接口本就支持整板名单，成本不变）。
+	fetchN := maxStocks
+	if fetchN < 100 {
+		fetchN = 100
+	}
+	allStocks, err := ss.sectorStocks(sectorCode, fetchN)
 	if err != nil || len(allStocks) == 0 {
 		return nil, fmt.Errorf("no stocks for sector %s", sectorCode)
 	}

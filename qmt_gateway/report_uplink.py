@@ -439,6 +439,7 @@ class ReportUplink:
         events.extend(self._build_positions_event())
         events.extend(self._build_account_event())
         events.extend(self._build_order_events())
+        events.extend(self._build_fill_events())
         events.extend(self._build_shadow_events())
         hb = self._build_heartbeat()
         if hb is not None:
@@ -615,6 +616,49 @@ class ReportUplink:
             created = str(row.get("time") or "").strip()
             out["created_at"] = created or stamp
             out["at"] = stamp
+            events.append(out)
+        return events
+
+    def _build_fill_events(self):
+        """§TRADE-LEDGER（2026-11-13）：成交导出 → type=trade 事件（D-B 缺口的补腿）。
+
+        背景：载体自闭环（QMT 内置策略）的成交此前**根本不上云**——handler.py 网关腿
+        跑在 QMT 进程内（11-05 起禁网已死），fills 导出有解析器（broker_reads "fills"）
+        却没有 builder。实测 2026-11-13：gz fills 表当日 0 行。台账（交易结果记录）以
+        成交腿为地基，本 builder 补上这条腿。
+
+        行字段：成交价/成交数量/成交金额/成交时间/成交编号/委托号/投资备注（备注经
+        broker_reads 新映射，供 Go 反解战法归因）。柜台导出无费用列 → 不发（Go 按 0
+        落，与旧格式兼容）；signal_id 恒空串（导出无信号归因，Go 按 remark 反解）。
+        幂等锚 = 成交编号（Go ApplyRealFill §M4 trade_id 判重先行，重放不双记）。
+        English: build type=trade events from the fills export — the missing uplink leg
+        that feeds the per-fill trade ledger; remark rides along for strategy attribution.
+        """
+        rows, result = self._read_kind("fills")
+        if rows is None:
+            return []
+        events = []
+        stamp = self._stamp_of(result)
+        for row in rows:
+            code = normalize_code(row.get("symbol"))
+            if not code:
+                self._note_skip("fills", "bad_code_row:%r" % (row.get("symbol"),))
+                continue
+            out = self._base_event("trade")
+            out["order_id"] = str(row.get("order_id") or "").strip()
+            out["code"] = code
+            out["side"] = _side_word(row.get("side"))
+            out["price"] = _to_float(row.get("price")) or 0.0
+            out["qty"] = int(_to_float(row.get("qty")) or 0)
+            out["amount"] = _to_float(row.get("amount")) or 0.0
+            out["traded_at"] = str(row.get("time") or "").strip() or stamp
+            out["trade_id"] = str(row.get("fill_id") or "").strip()
+            out["remark"] = str(row.get("remark") or "").strip()
+            out["signal_id"] = ""  # 导出无信号归因；Go 按 remark 反解（§TRADE-LEDGER）
+            out["at"] = stamp
+            if out["qty"] <= 0 or out["price"] <= 0:
+                self._note_skip("fills", "zero_price_or_qty_row")
+                continue
             events.append(out)
         return events
 

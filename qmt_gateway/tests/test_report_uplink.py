@@ -73,6 +73,10 @@ class _Fixture:
         self._write("委托.csv", "代码,委托号,委托状态,买卖标志,价格,数量,时间\n"
                                 "600519,7701,已报,买入,10.0,100,2026-11-05 09:31:00\n"
                                 "000001,7702,已成,卖出,8.5,200,2026-11-05 10:02:00\n")
+        # §TRADE-LEDGER（2026-11-13）：成交导出——台账的地基腿。备注列经 broker_reads
+        # 新映射随行上行，Go 反解战法归因；费用列柜台不导出 → 不发（Go 按 0 落）。
+        self._write("成交.csv", "代码,委托号,买卖标志,成交均价,成交数量,成交金额,成交时间,成交编号,投资备注\n"
+                                "600519,7701,买入,10.05,100,1005.0,2026-11-13 09:31:05,T9001,v24-FC600519\n")
         self._write("资产.csv", "总资产,可用资金,证券市值\n100000.0,40000.0,60000.0\n")
         # 影子账本：与执行器 --state-db 同一张表名与列名（列名漂移＝上行一条都读不出，
         # 而读不出的表现是"今天没报"，所以这里必须复刻真表的形状，不能自编简化版）。
@@ -401,6 +405,21 @@ class TestEnvelopeShape(unittest.TestCase):
         self.assertEqual(orders[0]["order_id"], "7701")
         self.assertEqual(orders[1]["code"], "000001.SZ")  # 裸 6 位码归一：0 开头=深市（平安银行形态）
         self.assertEqual(orders[0]["side"], "买入")
+
+        # §TRADE-LEDGER（2026-11-13）：成交上行腿（台账地基）形状锁
+        trades = self._by_type("trade")
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(set(trades[0].keys()),
+                         set(self.golden["report_uplink_emitted_fields"]["trade"]),
+                         "trade 事件发出键集必须与 golden 逐字一致")
+        self.assertEqual(trades[0]["code"], "600519.SH")
+        self.assertEqual(trades[0]["side"], "买入")
+        self.assertEqual(trades[0]["price"], 10.05)
+        self.assertEqual(trades[0]["qty"], 100)
+        self.assertEqual(trades[0]["trade_id"], "T9001")
+        self.assertEqual(trades[0]["remark"], "v24-FC600519",
+                         "投资备注必须随成交行上行（Go 反解战法归因的唯一来源）")
+        self.assertEqual(trades[0]["signal_id"], "")
 
     def test_uplink_emit_sets_match_golden_section(self):
         # golden 的 report_uplink_emitted_fields 是这条腿自己的发出集（与 handler.py 的

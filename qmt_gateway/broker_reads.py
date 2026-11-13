@@ -95,6 +95,12 @@ HEADER_ALIASES = {
     "anchor_price": ("首买价", "首买锚点", "锚点价", "anchor_price"),
     "order_id": ("委托号", "委托编号", "合同编号", "订单编号", "order_id", "orderid", "order"),
     "fill_id": ("成交编号", "成交序号", "fill_id", "trade_id", "deal_id"),
+    # §TRADE-LEDGER（2026-11-13）：委托备注是载体成交的唯一战法归因源（<版本>-<信号短码>）。
+    # 可选列：旧导出没有该列时照常解析（REQUIRED_COLUMNS 不变）。
+    "remark": ("投资备注", "委托备注", "备注", "remark", "comment"),
+    # 成交金额列（qty 的英文别名表里已占用 "amount"，这里只登记中文列名，
+    # 避免英文导出 "amount" 表头在 qty/amount 两个键间产生二义）。
+    "amount": ("成交金额", "发生金额", "成交额"),
     "status": ("委托状态", "状态", "订单状态", "status", "state"),
     "side": ("买卖标志", "操作", "业务名称", "交易方向", "委托方向", "买卖", "side", "direction"),
     "time": ("时间", "委托时间", "成交时间", "发生时间", "datetime", "time"),

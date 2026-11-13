@@ -150,12 +150,15 @@ class TestReportFieldsContractIntact(unittest.TestCase):
         # 两面盯着，见 tests/test_report_contract.py）——同样是有意新增，不是漂移。
         # §C3（2026-11-13 实盘六问题批）再补 skips：上行观测诊断事件（type=diagnostic）
         # 携带的「本轮跳过清单」——读数缺失不再云端静默，Go 只留痕不落账。有意新增。
+        # §TRADE-LEDGER（2026-11-13）再补 remark：委托备注随成交/委托行上行——载体自闭环
+        # 的唯一战法归因源（Go 反解短码补 signal_id）。有意新增。
         self.assertEqual(
             sorted(c["report_event_fields"]),
             sorted(["amount", "asset", "at", "broker", "code", "created_at", "data_ts", "fee",
-                    "from", "name", "order_id", "positions", "price", "qty", "reason", "shadow",
-                    "side", "side_unverified", "signal_id", "skips", "stamp_tax", "status",
-                    "strategy_version", "synced", "trade_id", "traded_at", "type", "user_id"]))
+                    "from", "name", "order_id", "positions", "price", "qty", "reason", "remark",
+                    "shadow", "side", "side_unverified", "signal_id", "skips", "stamp_tax",
+                    "status", "strategy_version", "synced", "trade_id", "traded_at", "type",
+                    "user_id"]))
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 
 
