@@ -219,6 +219,7 @@
       "price",
       "qty",
       "reason",
+      "remark",
       "side",
       "signal_id",
       "status",

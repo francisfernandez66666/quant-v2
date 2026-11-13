@@ -613,6 +613,9 @@ class ReportUplink:
             out["qty"] = int(_to_float(row.get("qty")) or 0)
             out["signal_id"] = ""  # 柜台导出不含信号归因；Go 走 ext:<order_id> 占位键（§F5）
             out["reason"] = ""
+            # §TRADE-LEDGER（2026-11-13）：委托备注随行上行（唯一战法归因源，审计与
+            # 在途单归因可查；成交腿同字段，Go 反解同一条 carrierRemarkStrategy 链）。
+            out["remark"] = str(row.get("remark") or "").strip()
             created = str(row.get("time") or "").strip()
             out["created_at"] = created or stamp
             out["at"] = stamp

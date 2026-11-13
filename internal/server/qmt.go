@@ -344,6 +344,10 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// English: §F2 name backfill — gateway reconciliation omits name; fill it from the quote
 	// snapshot so the real-positions table shows stock names, response-layer only (no persist).
 	// 手动行也走这同一段：现价/名称来自行情链，与账本来源无关，缺了它这张表连盈亏都算不出来。
+	// §5(c)（2026-11-13）：现价快照不同步的诚实化——收集本批现价的最大 AsOfMs（逐票价
+	// 时刻，§SUBSCRIPTION-A），响应顶层带 cur_price_asof，前端标「行情截至」；
+	// 偏差 >1% 标 stale 的比对由前端按既有 latestUpdatedAt 姿势处理，这里只供读数。
+	var curPriceAsofMs int64
 	for i := range positions {
 		// 名称兜底优先级：DB 已有名称 → stockName（基础信息表）→ quoteDisplay（行情快照）。
 		if positions[i].Name == "" {
@@ -356,6 +360,9 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		// 现价兜底：行情快照有价才覆盖（快照缺失时保留 DB 侧 CurPrice，前端至少不显示 0）。
 		if si := s.quoteDisplay(positions[i].TsCode); si != nil && si.Price > 0 {
 			positions[i].CurPrice = si.Price
+			if si.AsOfMs > curPriceAsofMs {
+				curPriceAsofMs = si.AsOfMs
+			}
 		}
 	}
 	// §实盘账户兜底：网关未上报 account 事件（或上报异常）时 GetRealAccount 返回零值行，
@@ -396,6 +403,14 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		"account":          acc,                           // 账户资产快照（来源见 book_source.cash）
 		"counter_frame_at": frameAt,                       // 柜台读数的最新时刻（两维里较新的那个；空=柜台从未报过）
 		"counter_frozen":   frameFrozen,                   // true=最新柜台读数不属于当前交易日（冻结账）
+		// §5(c)（2026-11-13）：现价批次的行情截至时刻（逐票 AsOfMs 的最大值，HH:MM:SS；
+		// 空=本批没有一行拿到带时刻的行情）——不让 5s 快照的价冒充实时。
+		"cur_price_asof": func() string {
+			if curPriceAsofMs <= 0 {
+				return ""
+			}
+			return time.UnixMilli(curPriceAsofMs).In(cntime.Loc).Format("15:04:05")
+		}(),
 		"enabled":          ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
 		"tripped":          ctrl != nil && ctrl.Tripped(), // 熔断是否触发
 		"mode":             ctrlMode(ctrl),                // 执行模式 manual/auto

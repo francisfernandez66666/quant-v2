@@ -70,9 +70,9 @@ class _Fixture:
                 for i in range(positions_rows):
                     body += "600519,贵州茅台,%d,%d\n" % (100 + i, 100 + i)
             self._write("持仓.csv", body)
-        self._write("委托.csv", "代码,委托号,委托状态,买卖标志,价格,数量,时间\n"
-                                "600519,7701,已报,买入,10.0,100,2026-11-05 09:31:00\n"
-                                "000001,7702,已成,卖出,8.5,200,2026-11-05 10:02:00\n")
+        self._write("委托.csv", "代码,委托号,委托状态,买卖标志,价格,数量,时间,投资备注\n"
+                                "600519,7701,已报,买入,10.0,100,2026-11-05 09:31:00,v24-FC600519\n"
+                                "000001,7702,已成,卖出,8.5,200,2026-11-05 10:02:00,\n")
         # §TRADE-LEDGER（2026-11-13）：成交导出——台账的地基腿。备注列经 broker_reads
         # 新映射随行上行，Go 反解战法归因；费用列柜台不导出 → 不发（Go 按 0 落）。
         self._write("成交.csv", "代码,委托号,买卖标志,成交均价,成交数量,成交金额,成交时间,成交编号,投资备注\n"
@@ -399,7 +399,10 @@ class TestEnvelopeShape(unittest.TestCase):
                                            "market_value": 60000.0, "frozen_cash": 0.0})
         orders = self._by_type("order")
         self.assertEqual(len(orders), 2)
-        want = set(self.golden["gateway_emitted_fields"]["order"])
+        # §TRADE-LEDGER（2026-11-13）：order 事件字段名对照**本腿自己的** golden 发出集——
+        # 旧对照对象是 gateway_emitted_fields（handler.py 时代），但两条腿已合法分化：
+        # uplink 的 order 带 remark（投资备注=唯一战法归因源），gateway 腿（盒上已死）不带。
+        want = set(self.golden["report_uplink_emitted_fields"]["order"])
         for o in orders:
             self.assertEqual(set(o.keys()), want, "order 事件字段名必须逐字镜像既有契约")
         self.assertEqual(orders[0]["order_id"], "7701")

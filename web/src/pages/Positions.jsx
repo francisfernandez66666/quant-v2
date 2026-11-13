@@ -807,6 +807,8 @@ export default function Positions() {
           ...data.book_source,
           counter_frame_at: data.counter_frame_at || '',
           counter_frozen: !!data.counter_frozen,
+          // §5(c)（2026-11-13）：现价批次的行情截至时刻（逐票 AsOfMs 最大值），页头标「行情截至」
+          cur_price_asof: data.cur_price_asof || '',
         })
       } else setRealBookSource(null)
       ledger.clear('实盘持仓')
@@ -1472,6 +1474,10 @@ export default function Positions() {
               <>
                 <Tag data-testid="counter-reachable" theme="success" size="small">柜台：可达</Tag>
                 <span className="muted">持仓与可用资金以 QMT 柜台回报为准 · 回报于 {latestUpdatedAt() || '—'}</span>
+                {/* §5(c)（2026-11-13）：现价批次的行情截至——5s 快照价不再冒充实时 */}
+                {realBookSource?.cur_price_asof && (
+                  <span className="muted" data-testid="cur-price-asof">行情截至 {realBookSource.cur_price_asof}</span>
+                )}
               </>
             ) : manualMode ? (
               <>

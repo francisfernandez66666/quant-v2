@@ -589,6 +589,10 @@ func run() int {
 	if sectorTopN <= 0 {
 		sectorTopN = 20
 	}
+	// §SCORES-FAST-1000 护栏：TopN 上限 200（防单板块成分全量灌池；方案 §3.1）。
+	if sectorTopN > 200 {
+		sectorTopN = 200
+	}
 	// §SCORES-FAST-1000（2026-11-13）：把 sectorTopN 同步接进板块验证代理——
 	// 旧缺陷：engine.SetSectorConstituentTopN 只管 propagateSectorToStocks（新闻→个股传播），
 	// sectorAgent.Verify（热点池成分来源）用的是它自己的出厂 20，配置调了也不生效。
