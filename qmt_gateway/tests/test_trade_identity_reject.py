@@ -148,11 +148,13 @@ class TestReportFieldsContractIntact(unittest.TestCase):
         # §CARRIER-SHADOW（2026-11-05 影子对照批）再补 shadow：载体影子判定那一批行进信封的
         # 一枚数组键（行内字段面另有 golden 的 shadow_row_fields / shadow_row_emitted_fields
         # 两面盯着，见 tests/test_report_contract.py）——同样是有意新增，不是漂移。
+        # §C3（2026-11-13 实盘六问题批）再补 skips：上行观测诊断事件（type=diagnostic）
+        # 携带的「本轮跳过清单」——读数缺失不再云端静默，Go 只留痕不落账。有意新增。
         self.assertEqual(
             sorted(c["report_event_fields"]),
             sorted(["amount", "asset", "at", "broker", "code", "created_at", "data_ts", "fee",
                     "from", "name", "order_id", "positions", "price", "qty", "reason", "shadow",
-                    "side", "side_unverified", "signal_id", "stamp_tax", "status",
+                    "side", "side_unverified", "signal_id", "skips", "stamp_tax", "status",
                     "strategy_version", "synced", "trade_id", "traded_at", "type", "user_id"]))
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 
