@@ -84,10 +84,18 @@ func TestClearConsultHistoryHonest503(t *testing.T) {
 	// 故意不 SetEngineController：registry 为 nil 时 ctrlFor 返回 nil 接口 → 503 分支。
 	am := newConsultServer(t, &fix6Ctrl{}).auth
 	s := &Server{auth: am}
-	r := httptest.NewRequest(http.MethodDelete, "/api/consult/history", nil)
+	r := httptest.NewRequest(http.MethodDelete, "/api/consult/history?confirm=CLEAR_CONSULT_HISTORY", nil)
 	r = r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, &auth.User{ID: "u_g"}))
 	rec := httptest.NewRecorder()
 	s.handleClearConsultHistory(rec, r)
+	// §F2-20261114（owner 裁决路 a）：缺 confirm 先于一切动作回 400（破坏性写面显式确认）。
+	rnc := httptest.NewRequest(http.MethodDelete, "/api/consult/history", nil)
+	rnc = rnc.WithContext(context.WithValue(rnc.Context(), ctxUserKey{}, &auth.User{ID: "u_g"}))
+	recNC := httptest.NewRecorder()
+	s.handleClearConsultHistory(recNC, rnc)
+	if recNC.Code != http.StatusBadRequest {
+		t.Fatalf("缺 confirm 应 400, got %d body=%s", recNC.Code, recNC.Body.String())
+	}
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("无引擎应 503, got %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -97,7 +105,7 @@ func TestClearConsultHistoryHonest503(t *testing.T) {
 	}
 	// 反向护栏：有引擎时仍是 200 ok（本次改动不能把正常清空一并拦掉）。
 	s2 := newConsultServer(t, &fix6Ctrl{})
-	r2 := httptest.NewRequest(http.MethodDelete, "/api/consult/history", nil)
+	r2 := httptest.NewRequest(http.MethodDelete, "/api/consult/history?confirm=CLEAR_CONSULT_HISTORY", nil)
 	r2 = r2.WithContext(context.WithValue(r2.Context(), ctxUserKey{}, &auth.User{ID: "u_g"}))
 	rec2 := httptest.NewRecorder()
 	s2.handleClearConsultHistory(rec2, r2)

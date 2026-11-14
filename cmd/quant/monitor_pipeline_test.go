@@ -382,7 +382,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 		}
 		ctx := &n_shape.Ctx{
 			LLMD1Score: 30, // D1 带符号 −40~+40 制（§NEWS-GATE 2026-11-12）
-			StockPE: 12, AvgDailyVol: 100000,
+			StockPE:    12, AvgDailyVol: 100000,
 		}
 		scorer := n_shape.NewLeftSideScorer(nil)
 		sr := scorer.Evaluate(wa, ib, ctx)

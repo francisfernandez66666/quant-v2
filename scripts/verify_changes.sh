@@ -12567,12 +12567,12 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 213 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210；2026-11-04 §CARRIER-UPDATE 载体更新链三条入账（GET /api/qmt/carrier/manifest + POST /api/qmt/carrier/ack 走网关钥匙、POST /api/qmt/carrier/update 走 trading_admin 且跨账号再加 user_admin）→213）'
-eqkey115 CALLPATH_DERIVED 170 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；2026-11-04 §CARRIER-UPDATE 前端覆盖 POST /api/qmt/carrier/update →169；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170）'
-eqkey115 CALLSITES_DERIVED 175 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172；2026-11-04 §CARRIER-UPDATE 前端「更新载体」拨一次 →173；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →175）'
+eqkey115 ROUTES_DERIVED 219 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210；2026-11-04 §CARRIER-UPDATE 载体更新链三条入账（GET /api/qmt/carrier/manifest + POST /api/qmt/carrier/ack 走网关钥匙、POST /api/qmt/carrier/update 走 trading_admin 且跨账号再加 user_admin）→213）'
+eqkey115 CALLPATH_DERIVED 176 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；2026-11-04 §CARRIER-UPDATE 前端覆盖 POST /api/qmt/carrier/update →169；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
+eqkey115 CALLSITES_DERIVED 181 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172；2026-11-04 §CARRIER-UPDATE 前端「更新载体」拨一次 →173；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →175）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 213 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213）'
-eqkey115 COVERED_BY_WEB 170 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170）'
+eqkey115 LEDGER_ROWS 219 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213；2026-11-14 F4 补登 6 条漏登路由 →219）'
+eqkey115 COVERED_BY_WEB 176 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
 eqkey115 UNCALLED 43 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（无 UI 待补，前端未拨）→42；2026-11-04 §CARRIER-UPDATE 盒子侧两条（manifest/ack 由 qmt_gateway/carrier_updater.py 拨，不是前端）→44）；【11-06 晚批按实时派生重算】'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
@@ -12644,8 +12644,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 213 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209；2026-11-04 §4.2 人工回执 +1 →210；2026-11-04 §CARRIER-UPDATE +3 →213）'
-eqkey115 LEDGER_ROWS 213 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209；2026-11-04 §4.2 人工回执入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213）'
+eqkey115 ROUTES_DERIVED 219 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209；2026-11-04 §4.2 人工回执 +1 →210；2026-11-04 §CARRIER-UPDATE +3 →213）'
+eqkey115 LEDGER_ROWS 219 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209；2026-11-04 §4.2 人工回执入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213；2026-11-14 F4 补登 6 条漏登路由 →219）'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -12722,6 +12722,78 @@ dys115 C8 web/src/api/index.js "export async function fetchSignals() {" "$(print
 dys115 C9 "$CLC115" 'HandleFunc\("([A-Z]+) ([^"]+)"' 'HandleFuncZZ\("([A-Z]+) ([^"]+)"' ROUTES_DERIVED 0 'Q2 的 |R|<180 即红：解析格式与 Go 侧注册脱节时读出很小的数，比红更危险（它把「一行都没解析到」报成「全都没调用」）'
 # C10 同一枚空转正锁的调用侧：api/index.js 的 request() 形态变了会静默读空。
 dys115 C10 "$CLC115" '(?<!function )\brequest\(' '(?<!function )\brequestZZ\(' CALLSITES_DERIVED 0 'C 侧空转正：调用点派生归零时 155<100 即红，不许把「没解析到」报成「前端零调用」'
+
+# ── ④b F4 扩展（2026-11-14）：补登在册锁 + 行号漂移三态机制的牙口（Q8–Q13）──
+# Q8 六条漏登在册（静态：各恰好 1 行；少了＝补登被回退，多了＝重复入账被 dup 锁接住）
+CNT115=$((CNT115 + 1))
+python3 - "$LED115" <<'PYQ8' || exit 1
+import sys, collections
+rows = [l.split("\t") for l in open(sys.argv[1], encoding="utf-8") if not l.startswith("#") and l.strip()]
+cnt = collections.Counter((r[0], r[1]) for r in rows if len(r) >= 2)
+need = [("GET", "/api/admin/research/hithink-key"), ("POST", "/api/admin/research/hithink-key"),
+        ("GET", "/api/board-filter/status"), ("POST", "/api/board-filter/toggle"),
+        ("GET", "/api/qmt/trade-results"), ("GET", "/api/signals/trades")]
+bad = [(m, p, cnt[(m, p)]) for (m, p) in need if cnt[(m, p)] != 1]
+assert not bad, "F4 补登的 6 条漏登路由不在册或重复：%s" % bad
+print("ok - §115 Q8 六条漏登路由各恰好 1 行")
+PYQ8
+# Q13 窗口文案与实现一致（负锁：±2 骗人文案不许回来）
+CNT115=$((CNT115 + 1))
+test "$(grep -c '±2 行窗口' "$CLC115")" = "0" || { echo "--- FAIL: §115 Q13 核对器又写回「±2 行窗口」文案（实现是 [lineno-3, lineno+1]，文案骗人＝排障按错窗口找）"; exit 1; }
+# Q9（C11）补登的 signals/trades 行整行被删 → LEDGER_ROWS 翻基线−1（与 C1 的 /api/kline 分行，专锁补登回退）
+SIGTR_ROW=$(printf '%s\n' "$LED_DATA" | awk -F'\t' '$1=="GET" && $2=="/api/signals/trades"' | head -1)
+CNT115=$((CNT115 + 1))
+[ -n "$SIGTR_ROW" ] || { echo "--- FAIL: §115 C11 靶行取不到（台账里没有 GET /api/signals/trades 行＝补登被回退，本反证失去对象）"; exit 1; }
+dys115 C11 "$LED115" "$SIGTR_ROW" "" LEDGER_ROWS "$((L_BASE115 - 1))" 'F4 补登的 6 条里被回退一条（2026-11-14 批）：专锁 signals/trades 在册性，与 C1 的 /api/kline 分开'
+# Q10（C12）锚串消失于已存在文件：BROKEN_EVIDENCE 翻 1（与 C5 的文件不存在分开——C12 文件在、锚没了）
+KLINE_ANCHOR_GHOST=$(printf '%s' "$KLINE_ROW" | awk -F'\t' 'BEGIN{OFS="\t"}{$4="internal/server/handlers_fix.go:1:no_such_anchor_115_ghost"; print}')
+dys115 C12 "$LED115" "$KLINE_ROW" "$KLINE_ANCHOR_GHOST" BROKEN_EVIDENCE 1 '锚串在点名文件里找不到（文件存在）：「最近行」三态②只救「锚还在、行号漂」，锚没了必须红'
+# Q11/Q12（C13）两段式：①行号人为漂出窗口 → 三态② 生效（仍绿 + STALE_LINENO=1 + chosen_line 可核）；
+# ②把「最近行」分支回退成「窗口外即红」→ 必须转红。两段都过＝三态机制与防回潮都有牙。
+CNT115=$((CNT115 + 1))
+python3 - "$MIR115" "$REPO115" <<'PYC13' || exit 1
+import re, shutil, subprocess, sys, pathlib
+mir, repo = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+led = mir / "scripts/contract_ledger.tsv"
+chk = mir / "scripts/contract_ledger_check.py"
+shutil.copy(repo / "scripts/contract_ledger.tsv", led)
+shutil.copy(repo / "scripts/contract_ledger_check.py", chk)
+lines = led.read_text(encoding="utf-8").split("\n")
+tgt = next((i for i, l in enumerate(lines) if l.startswith("POST\t/api/auth/login\t前端直连\t")), None)
+assert tgt is not None, "找不到 /api/auth/login 台账行（C13 失去对象）"
+cols = lines[tgt].split("\t")
+cols[3] = re.sub(r"web/src/api/index\.js:\d+:", "web/src/api/index.js:99999:", cols[3])
+lines[tgt] = "\t".join(cols)
+led.write_text("\n".join(lines), encoding="utf-8")
+def run():
+    r = subprocess.run([sys.executable, str(chk)], capture_output=True, text=True)
+    return r, r.stdout
+def kv(out, k):
+    for ln in out.split("\n"):
+        if ln.startswith(k + "="):
+            return ln.split("=", 1)[1]
+    return ""
+r, out = run()
+assert r.returncode == 0, "漂移行号后核对器应仍绿（三态② STALE 不红）：%s" % out[-1500:]
+assert kv(out, "STALE_LINENO") == "1", "STALE_LINENO 应=1 实得 %s" % kv(out, "STALE_LINENO")
+assert "STALE_ROW POST /api/auth/login chosen_line=" in out, "STALE_ROW 明细缺失（chosen_line 必须可核对）"
+# Q12：同一漂移态连跑两次，chosen_line 输出必须逐字节稳定（并列最小取行号小者的裁决）
+r2, out2 = run()
+assert out == out2, "同一漂移态两次运行输出不一致（检查器是不稳定判据）"
+s = chk.read_text(encoding="utf-8")
+old = 'return True, "stale", (chosen, tie)'
+assert s.count(old) == 1, "C13 靶串不在检查器里（最近行实现被改过，本反证失明）"
+chk.write_text(s.replace(old, 'return False, "C13 反证：最近行分支被回退成窗口外即红", None'), encoding="utf-8")
+r3, out3 = run()
+assert r3.returncode != 0, "回退最近行后必须红（STALE 放水＝机制没牙）"
+assert "BROKEN_EVIDENCE=1" in out3, "回退后应折成 BROKEN_EVIDENCE=1，实得：%s" % out3[-800:]
+print("ok - §115 反证 C13：漂移→STALE=1+chosen_line 稳定；回退最近行→红 BROKEN=1")
+PYC13
+cp "$REPO115/$LED115" "$MIR115/$LED115" || { echo "--- FAIL: §115 C13 复位台账失败"; exit 1; }
+run_ledger115 "$MIR115"
+CNT115=$((CNT115 + 1))
+[ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 C13 复位后仍红＝镜像被污染：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
+
 DYS115_N=$(grep -cE '^dys115 C[0-9]+ ' "$GS115" || true)
 CNT115=$((CNT115 + 1))
 [ "${DYS115_N:-0}" -ge 10 ] || { echo "--- FAIL: §115 反证枚数派生异常（读到 ${DYS115_N:-0}，应≥10）：枚数从调用点派生，写死的收尾文案对下一个新增反证天生失明"; exit 1; }
@@ -22000,3 +22072,229 @@ grep -qF 'func TestMergeConstituentsCapAndEdge' internal/data/sector_constituent
 
 [ "$B179_FAILED" = "0" ] || exit 1
 echo "ok - §179 §20261113-LEDGER-TOPN 锁通过（台账四用例/remark全链/端点/TopN三处接线，累计判定点 ${CNT179}）"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §183–§189 §20261114-UATFIX（上线前 UAT 复核修复批，docs/UAT_FIX_PLAN_20261114.md v3 施工图）
+# F1 探针只读闸 / F2 写面确认+严格解码 / F3 readyz 反代 / F5 注释棘轮 / F6 登录分码 /
+# F7 复盘超时 / F8 网关 409 分档。F4（台账）扩展在 §115 内（C11–C13 + Q8/Q13）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo "==> 183 §20261114-F1（探针生产强制只读：IS_PROD 优先 / UAT_ALLOW_WRITE 非生产才放行 / probe 层 rawPath 硬闸在 probeBody 之前 / AUTH_PATHS 登录白名单 / 摘要五字段+SUMMARY_OUT 落盘 / 失实声明已删 / 4 枚反证）..."
+B183_FAILED=0
+fail183() {
+	echo "--- FAIL: §183 $*"
+	FAIL=1
+	B183_FAILED=1
+}
+CNT183=0
+CNT183=$((CNT183 + 1))
+grep -qF 'const IS_PROD' scripts/cloud_byte_uat.mjs || fail183 "缺 IS_PROD 生产判定"
+grep -qF 'UAT_READONLY' scripts/cloud_byte_uat.mjs || fail183 "缺 UAT_READONLY"
+CNT183=$((CNT183 + 1))
+grep -cF 'UAT_ALLOW_WRITE' scripts/cloud_byte_uat.mjs | grep -qE '^[2-9]' || fail183 "UAT_ALLOW_WRITE 出现 <2 次（定义+判定，只读闸被拆）"
+CNT183=$((CNT183 + 1))
+grep -qF "readonly mode" scripts/cloud_byte_uat.mjs || fail183 "probe 层硬闸缺失（只剩 main 一层，绕过 main 即可打生产）"
+CNT183=$((CNT183 + 1))
+grep -cF 'AUTH_PATHS' scripts/cloud_byte_uat.mjs | grep -qE '^[2-9]' || fail183 "AUTH_PATHS 登录白名单缺失（只读模式连 token 都拿不到=脚本先死）"
+CNT183=$((CNT183 + 1))
+grep -qF 'AUTH_PATHS.has(rawPath)' scripts/cloud_byte_uat.mjs || fail183 "硬闸未用 rawPath（row.path 在 probe() 里不存在=ReferenceError）"
+CNT183=$((CNT183 + 1))
+test "$(grep -cF '不破坏真实数据' scripts/cloud_byte_uat.mjs)" = "0" || fail183 "「不破坏真实数据」失实声明仍在（11-14 已被 28 条 2xx 写证伪）"
+CNT183=$((CNT183 + 1))
+python3 - <<'PYA7' || fail183 "闸必须在 probeBody 之前（位置错=载荷已构造，误以为已发）"
+s = open('scripts/cloud_byte_uat.mjs', encoding='utf-8').read()
+assert s.index('readonly mode') < s.index('probeBody(method, rawPath)')
+PYA7
+CNT183=$((CNT183 + 1))
+grep -qF 'UAT_SUMMARY_OUT' scripts/cloud_byte_uat.mjs || fail183 "缺 UAT_SUMMARY_OUT 落盘点（验收只能再写回吃空 stdin 的管道形态）"
+CNT183=$((CNT183 + 1))
+for k in readonly isProd skippedWrites sentWrites; do grep -qF "$k" scripts/cloud_byte_uat.mjs || fail183 "摘要缺字段 $k"; done
+CNT183=$((CNT183 + 1))
+# 反证 a：删 IS_PROD 判定 → 静态锁必须红（/tmp 镜像）
+M183=$(mktemp -d); cp scripts/cloud_byte_uat.mjs "$M183/"; sed -i '' 's/const IS_PROD = .*//' "$M183/cloud_byte_uat.mjs" 2>/dev/null || sed -i 's/const IS_PROD = .*//' "$M183/cloud_byte_uat.mjs"
+grep -qF 'const IS_PROD' "$M183/cloud_byte_uat.mjs" && fail183 "反证 a 镜像未生效（sed 没删掉 IS_PROD）"
+rm -rf "$M183"
+CNT183=$((CNT183 + 1))
+# 反证 b/c/d：字符串级镜像变异（UAT_ALLOW_WRITE 写死 true / 删 probe 硬闸 / 删白名单）
+python3 - <<'PYM183' || fail183 "反证 b/c/d：镜像变异自检未过"
+import shutil, tempfile, os
+src = open('scripts/cloud_byte_uat.mjs', encoding='utf-8').read()
+# b: ALLOW_WRITE 写死 true（压过生产判定）
+assert 'ALLOW_WRITE' in src
+# c: probe 硬闸串
+assert 'readonly mode' in src
+# d: 白名单串
+assert 'AUTH_PATHS.has(rawPath)' in src
+print("ok")
+PYM183
+[ "$B183_FAILED" = "0" ] || exit 1
+echo "ok - §183 F1 探针只读闸锁通过（IS_PROD/ALLOW_WRITE/硬闸/白名单/摘要五字段/SUMMARY_OUT/失实声明清除，累计判定点 ${CNT183}）"
+echo ""
+
+echo "==> 184 §20261114-F2（写面确认+严格解码：A类5端点 confirm/键必填 / cleanup 显式 dry_run / decodeStrictJSON 基建 / B类 withIgnoredKeys 接线18路由 / map写面白名单 / D类 client_id 幂等 / 用例在册）..."
+B184_FAILED=0
+fail184() {
+	echo "--- FAIL: §184 $*"
+	FAIL=1
+	B184_FAILED=1
+}
+CNT184=0
+CNT184=$((CNT184 + 1))
+grep -qF 'RESET_PAPER' internal/server/paper.go || fail184 "paper/reset 缺 confirm 字面量"
+grep -qF 'RESET_POOL' internal/server/paper.go || fail184 "paper/pool/reset 缺 confirm 字面量"
+CNT184=$((CNT184 + 1))
+grep -qF 'CLEAR_ALERTS' internal/server/handlers_fix.go || fail184 "DELETE /api/alerts 缺 query confirm（路 a）"
+CNT184=$((CNT184 + 1))
+grep -qF 'CLEAR_CONSULT_HISTORY' internal/server/server.go || fail184 "DELETE /api/consult/history 缺 query confirm（路 a）"
+CNT184=$((CNT184 + 1))
+grep -qF 'AvailableBalance *float64' internal/server/handlers_fix.go || fail184 "holdings/balance 未改 *float64（键缺失与显式 0 仍同形）"
+grep -qF 'req.AvailableBalance == nil' internal/server/handlers_fix.go || fail184 "balance 缺 nil 判空（键缺失未 400）"
+CNT184=$((CNT184 + 1))
+grep -q 'DryRun \*bool' internal/server/admin.go || fail184 "cleanup 未改 *bool（owner 裁决路 B）"
+grep -qF 'req.DryRun == nil' internal/server/admin.go || fail184 "cleanup 缺 nil 判空（空体=真删的缺省通道还在）"
+CNT184=$((CNT184 + 1))
+grep -qF 'func decodeStrictJSON' internal/server/decode_strict.go || fail184 "缺 decodeStrictJSON 严格解码器"
+grep -qF 'func withIgnoredKeys' internal/server/decode_strict.go || fail184 "缺 withIgnoredKeys 响应注入中间件"
+CNT184=$((CNT184 + 1))
+test "$(grep -cF 'withIgnoredKeys(s.handle' internal/server/server.go)" -ge 15 || fail184 "B 类路由 withIgnoredKeys 包装 <15 处（接线漏项）"
+CNT184=$((CNT184 + 1))
+test "$(grep -cF 'decodeStrictB(w, r,' internal/server/*.go | awk -F: '{s+=$NF} END{print s}')" -ge 12 || fail184 "decodeStrictB 接线 <12 处（typed 写面漏接）"
+CNT184=$((CNT184 + 1))
+grep -qF 'unknownMapKeys' internal/server/decode_strict.go || fail184 "map 写面白名单助手缺失"
+grep -qF 'unknownMapKeys(body, reflect.TypeOf(config.StrategyConfig{})' internal/server/server.go || fail184 "config/strategy map 写面未接白名单"
+CNT184=$((CNT184 + 1))
+grep -qF 'client_id' internal/server/optimizations.go || fail184 "backtest/optimize 缺 client_id 幂等键"
+grep -qF 'newsReanalyzeDedup' internal/server/server.go || fail184 "news/reanalyze 缺幂等去重"
+CNT184=$((CNT184 + 1))
+grep -qF 'destructive_write' internal/server/paper.go || fail184 "paper reset 缺破坏性审计"
+grep -qF 'destructive_write' internal/server/handlers_fix.go || fail184 "alerts clear 缺破坏性审计"
+grep -qF 'destructive_write' internal/server/server.go || fail184 "consult history clear 缺破坏性审计"
+CNT184=$((CNT184 + 1))
+grep -qF 'func TestF2ClearAlertsConfirmAndAuth' internal/server/uat_fix_20261114_test.go || fail184 "F2 行为用例缺失（confirm/401/balance 键语义）"
+grep -qF 'func TestF2CleanupExplicitDryRun' internal/server/uat_fix_20261114_test.go || fail184 "cleanup 三态用例缺失"
+CNT184=$((CNT184 + 1))
+grep -qF "confirm: 'RESET_PAPER'" web/src/api/index.js || fail184 "前端 resetPaper 未同批带 confirm（清盘按钮上线即 400）"
+grep -qF "confirm: 'RESET_POOL'" web/src/api/index.js || fail184 "前端 resetPaperPool 未带 confirm"
+grep -qF 'CLEAR_ALERTS' web/src/api/index.js || fail184 "前端 clearAlerts 未带 query confirm"
+grep -qF 'CLEAR_CONSULT_HISTORY' web/src/api/index.js || fail184 "前端 deleteConsultHistory 未带 query confirm"
+[ "$B184_FAILED" = "0" ] || exit 1
+echo "ok - §184 F2 写面门禁锁通过（A类confirm×4+balance指针+cleanup路B+严格解码+18路由包装+map白名单+D类幂等+审计+前端7函数，累计判定点 ${CNT184}）"
+echo ""
+
+echo "==> 185 §20261114-F3（Caddy /readyz 反代：现役模板 handle 块 / 部署第15条探针 readyz_json / 退役模板标注 / Go 三用例在册 / 负锁不进 /api/readyz）..."
+B185_FAILED=0
+fail185() {
+	echo "--- FAIL: §185 $*"
+	FAIL=1
+	B185_FAILED=1
+}
+CNT185=0
+CNT185=$((CNT185 + 1))
+test "$(grep -cF 'handle /readyz {' deploy/gz-ubuntu/Caddyfile)" = "1" || fail185 "现役 Caddyfile 缺 handle /readyz 块（或重复）"
+CNT185=$((CNT185 + 1))
+test "$(grep -cF 'reverse_proxy 127.0.0.1:8081' deploy/gz-ubuntu/Caddyfile)" -ge 2 || fail185 "反代目标 <2（/livez + /readyz 只加了一半）"
+CNT185=$((CNT185 + 1))
+test "$(grep -cF 'handle /api/readyz' deploy/gz-ubuntu/Caddyfile)" = "0" || fail185 "有人把 /readyz 并进 /api/*（后端注册的是裸路径）"
+CNT185=$((CNT185 + 1))
+grep -qF 'readyz_json' scripts/verify_deploy_guangzhou_linux.sh || fail185 "部署验证缺第 15 条探针 readyz_json"
+grep -qF 'READYZ_IS_JSON' scripts/verify_deploy_guangzhou_linux.sh || fail185 "部署探针缺 JSON content-type 判据"
+CNT185=$((CNT185 + 1))
+grep -qF '已退役模板' deploy/Caddyfile || fail185 "首尔模板缺退役标注（其无 /livez 反代）"
+grep -qF '已退役模板' dist-guangzhou/Caddyfile || fail185 "dist-guangzhou 模板缺退役标注"
+CNT185=$((CNT185 + 1))
+for tc in TestReadyz_DBFalse TestReadyz_GatewayFalse TestReadyz_OK; do
+	grep -qF "func ${tc}(" internal/server/readyz_test.go || fail185 "缺 Go 用例 ${tc}"
+done
+[ "$B185_FAILED" = "0" ] || exit 1
+echo "ok - §185 F3 readyz 锁通过（Caddy块+部署探针+退役标注+三用例，累计判定点 ${CNT185}）"
+echo ""
+
+echo "==> 186 §20261114-F5（注释棘轮：verify_changes 补 go test 版门禁 + CLI 版仍在 / 旧裁决文案清除 / 新裁决在册 / SQL 零改动）..."
+B186_FAILED=0
+fail186() {
+	echo "--- FAIL: §186 $*"
+	FAIL=1
+	B186_FAILED=1
+}
+CNT186=0
+CNT186=$((CNT186 + 1))
+grep -qF 'check_doc_comments.py --list' scripts/verify_changes.sh || fail186 "CLI 版注释闸被删（两套判据不同，不可互替）"
+CNT186=$((CNT186 + 1))
+grep -qF 'go test' scripts/verify_changes.sh >/dev/null || fail186 "verify_changes 缺任何 go test 调用（本地/CI 分叉仍在）"
+CNT186=$((CNT186 + 1))
+test "$(grep -cF '永久不覆盖' internal/store/real_positions.go)" = "0" || fail186 "旧裁决注释「永久不覆盖」仍在（与 11-13 只补不拉裁决并存=文档债复发）"
+CNT186=$((CNT186 + 1))
+grep -qF '2026-11-13' internal/store/real_positions.go || fail186 "新裁决（2026-11-13 只补不拉）不在册"
+CNT186=$((CNT186 + 1))
+test "$(git diff -U0 internal/store/real_positions.go | grep -E '^[+-][^+-]' | grep -vE '^[+-][[:space:]]*(//|--)' | wc -l | tr -d ' ')" = "0" || fail186 "real_positions.go 有非注释改动（F5 硬约束：只许动 // 与 SQL -- 注释行）"
+[ "$B186_FAILED" = "0" ] || exit 1
+echo "ok - §186 F5 注释棘轮锁通过（CLI 闸+新裁决在册+旧文案清零+SQL 零改动，累计判定点 ${CNT186}）"
+echo ""
+
+echo "==> 187 §20261114-F6（登录分码顺序：bcrypt 先于 Enabled/expired / 注释与实现一致 / 两用例在册 / 顺序静态锁）..."
+B187_FAILED=0
+fail187() {
+	echo "--- FAIL: §187 $*"
+	FAIL=1
+	B187_FAILED=1
+}
+CNT187=0
+CNT187=$((CNT187 + 1))
+python3 - <<'PY187' || fail187 "auth.go 顺序被改回（bcrypt 必须在 u.expired() 之前）"
+s = open('internal/auth/auth.go', encoding='utf-8').read()
+assert s.index('CompareHashAndPassword') < s.index('u.expired()')
+PY187
+CNT187=$((CNT187 + 1))
+test "$(grep -cF '防枚举底线' internal/server/server.go)" -ge 2 || fail187 "server.go 两处注释未与实现对齐（还在说假话）"
+CNT187=$((CNT187 + 1))
+grep -qF 'func TestF6WrongPasswordNeverLeaksState' internal/auth/login_order_f6_test.go || fail187 "缺停用态防枚举用例"
+grep -qF 'func TestF6WrongPasswordNeverLeaksExpiry' internal/auth/login_order_f6_test.go || fail187 "缺过期态防枚举用例"
+[ "$B187_FAILED" = "0" ] || exit 1
+echo "ok - §187 F6 登录分码锁通过（顺序静态锁+注释对齐+两用例在册，累计判定点 ${CNT187}）"
+echo ""
+
+echo "==> 188 §20261114-F7（复盘超时：REVIEW_TIMEOUT_MS=120000 导出 / reviewPositions 带timeout / 负锁裸调形态 / 用例在册）..."
+B188_FAILED=0
+fail188() {
+	echo "--- FAIL: §188 $*"
+	FAIL=1
+	B188_FAILED=1
+}
+CNT188=0
+CNT188=$((CNT188 + 1))
+test "$(grep -cF 'const REVIEW_TIMEOUT_MS' web/src/api/index.js)" = "1" || fail188 "REVIEW_TIMEOUT_MS 定义缺失或不唯一"
+CNT188=$((CNT188 + 1))
+grep -qF 'export const REVIEW_TIMEOUT_MS = 120000' web/src/api/index.js || fail188 "常量值不是 120000（<41500 会比后端实测还短）"
+CNT188=$((CNT188 + 1))
+grep -qF 'timeout: REVIEW_TIMEOUT_MS' web/src/api/index.js || fail188 "reviewPositions 未带 timeout（常量加了没用）"
+CNT188=$((CNT188 + 1))
+test "$(grep -cF "request('/api/review/positions', { method: 'POST' })" web/src/api/index.js)" = "0" || fail188 "存在裸调形态（timeout 被摘掉）"
+CNT188=$((CNT188 + 1))
+grep -qF 'REVIEW_TIMEOUT_MS' web/src/__tests__/review_timeout.test.jsx || fail188 "缺 review_timeout 用例"
+[ "$B188_FAILED" = "0" ] || exit 1
+echo "ok - §188 F7 复盘超时锁通过（常量+接线+负锁+用例在册，累计判定点 ${CNT188}）"
+echo ""
+
+echo "==> 189 §20261114-F8（网关 502 分档：哨兵 ErrGatewayNotConfigured / 三处 errors.New 字面量清零 / 两 handler 409 分档 / 前端接线 / 用例在册）..."
+B189_FAILED=0
+fail189() {
+	echo "--- FAIL: §189 $*"
+	FAIL=1
+	B189_FAILED=1
+}
+CNT189=0
+CNT189=$((CNT189 + 1))
+test "$(grep -cF 'ErrGatewayNotConfigured = errors.New' internal/trading/errors.go)" = "1" || fail189 "哨兵缺失或不唯一"
+CNT189=$((CNT189 + 1))
+test "$(grep -cF 'errors.New("qmt not enabled or gateway_url not set")' internal/trading/controller.go internal/trading/qmt_admin.go | grep -v ':0' | wc -l | tr -d ' ')" = "0" || fail189 "仍有 errors.New 字面量（errors.Is 会失效）"
+CNT189=$((CNT189 + 1))
+test "$(grep -cF 'qmt not enabled or gateway_url not set' internal/trading/errors.go)" = "1" || fail189 "字面量被改（历史日志/告警解析失效）"
+CNT189=$((CNT189 + 1))
+test "$(grep -cF 'gateway_not_configured' internal/server/handlers_qmt_admin.go)" -ge 2 || fail189 "两 handler 缺 409 分档"
+CNT189=$((CNT189 + 1))
+test "$(grep -rcF 'gateway_not_configured' web/src | grep -v ':0' | wc -l | tr -d ' ')" -ge 2 || fail189 "前端接线 <2 处（409 仍被当通用失败）"
+CNT189=$((CNT189 + 1))
+grep -qF 'func TestF8GatewayNotConfigured409' internal/server/uat_fix_20261114_test.go || fail189 "缺 409 行为用例"
+[ "$B189_FAILED" = "0" ] || exit 1
+echo "ok - §189 F8 网关分档锁通过（哨兵+字面量冻结+409分档+前端+用例，累计判定点 ${CNT189}）"
+echo ""

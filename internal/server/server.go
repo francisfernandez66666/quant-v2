@@ -55,6 +55,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -140,18 +141,21 @@ type EngineController interface {
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
 type Server struct {
-	auth      *auth.Manager          // 认证管理器：注册/登录/临时账号/token 校验
-	agg       *display.Aggregator    // 看板数据聚合器（读取实时看板快照）
-	cfg       *config.Manager        // 配置管理器（策略/D1/LLM 参数）
-	rpt       *report.Report         // 交易持仓报告（开仓/平仓/统计）
-	mux       *http.ServeMux         // 路由注册表
-	market    *data.MarketAPI        // 行情数据 API（实时报价/板块/IPO 等）
-	ths       *data.THSClient        // 同花顺客户端（板块行情表）
-	fetcher   *data.Fetcher          // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
-	dc        *data.DataCoordinator  // 行情统一数据源（新浪→同花顺→东财 三级降级链）
-	paper     *paper.Engine          // 模拟盘引擎（独立纸面交易，nil=未启用）
-	watchlist *data.WatchlistManager // 自选股管理器
-	sse       *SSEBroker             // SSE 事件广播器（向前端实时推送）
+	auth    *auth.Manager         // 认证管理器：注册/登录/临时账号/token 校验
+	agg     *display.Aggregator   // 看板数据聚合器（读取实时看板快照）
+	cfg     *config.Manager       // 配置管理器（策略/D1/LLM 参数）
+	rpt     *report.Report        // 交易持仓报告（开仓/平仓/统计）
+	mux     *http.ServeMux        // 路由注册表
+	market  *data.MarketAPI       // 行情数据 API（实时报价/板块/IPO 等）
+	ths     *data.THSClient       // 同花顺客户端（板块行情表）
+	fetcher *data.Fetcher         // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
+	dc      *data.DataCoordinator // 行情统一数据源（新浪→同花顺→东财 三级降级链）
+	// §F2-20261114 D 类幂等账（news/reanalyze client_id 防重，进程内即可）：
+	reanalyzeMu   sync.Mutex
+	reanalyzeSeen map[string]time.Time
+	paper         *paper.Engine          // 模拟盘引擎（独立纸面交易，nil=未启用）
+	watchlist     *data.WatchlistManager // 自选股管理器
+	sse           *SSEBroker             // SSE 事件广播器（向前端实时推送）
 	// §SUBSCRIPTION（2026-11-01）上市状态问询腿的进程内单例（懒构造，见 subscription_listing.go）。
 	// 用 Once + 指针而不是在 New 里构造：DataCoordinator 是启动后期由 SetCoordinator 注入的，
 	// 构造期抓指针会永远是 nil。
@@ -630,7 +634,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/admin/users/{id}/expiry", s.strictPermMiddleware(auth.PermUserAdmin, s.handleSetUserExpiry))
 	s.mux.HandleFunc("DELETE /api/admin/users/{id}", s.strictPermMiddleware(auth.PermUserAdmin, s.handleDeleteUser))
 	// §U-5 脏账号批量清理（temp_/过期）。static 段 "cleanup" 优先于 {id}，二者路径段数不同不冲突。
-	s.mux.HandleFunc("POST /api/admin/users/cleanup", s.strictPermMiddleware(auth.PermUserAdmin, s.handleCleanupUsers))
+	s.mux.HandleFunc("POST /api/admin/users/cleanup", s.strictPermMiddleware(auth.PermUserAdmin, withIgnoredKeys(s.handleCleanupUsers)))
 	// §MT 多租户：租户管理（平台运营者）+ 本租户用量 + 跨租户迁移
 	s.mux.HandleFunc("GET /api/tenants", s.strictPermMiddleware(auth.PermUserAdmin, s.handleListTenants))
 	s.mux.HandleFunc("POST /api/tenants", s.strictPermMiddleware(auth.PermUserAdmin, s.handleCreateTenant))
@@ -639,7 +643,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/admin/users/{id}/tenant", s.strictPermMiddleware(auth.PermUserAdmin, s.handleMoveUserTenant))
 	// 管理员代配他人账号配置（strategy / d1 / longshort / llm）
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/strategy", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetStrategyConfig))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/config/strategy", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetStrategyConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/strategy", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(withIgnoredKeys(s.handleAdminSetStrategyConfig)))
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/d1", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetD1Config))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/d1", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetD1Config))
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/longshort", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminGetLongShortConfig))
@@ -648,7 +652,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/llm", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermConfigAdmin)(s.handleAdminSetLLMConfig))
 	// §2026-09-07 多账号实盘：管理员逐账号配置 QMT 实盘（每账号独立 gateway/token/资金）。
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/qmt", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermTradingAdmin)(s.handleAdminGetQMTConfig))
-	s.mux.HandleFunc("POST /api/admin/users/{id}/config/qmt", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermTradingAdmin)(s.handleAdminSetQMTConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/qmt", s.strictAllPermsMiddleware(auth.PermUserAdmin, auth.PermTradingAdmin)(withIgnoredKeys(s.handleAdminSetQMTConfig)))
 
 	// §E-1（20260917 全量对账）运维/机器端点无 UI 消费方属**有意设计**（curl/监控脚本/网关回调），
 	// 不算前端断链；新增前端调用前先确认页面归属。
@@ -693,17 +697,17 @@ func (s *Server) registerRoutes() {
 	// （Long/short toggles are operator config: only admin may toggle; status is readable by all.）
 	s.mux.HandleFunc("POST /api/long/toggle", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleLongToggle))
 	s.mux.HandleFunc("GET /api/long/status", s.authMiddleware(s.handleLongStatus))
-	s.mux.HandleFunc("POST /api/short/toggle", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleShortToggle))
+	s.mux.HandleFunc("POST /api/short/toggle", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleShortToggle)))
 	s.mux.HandleFunc("GET /api/short/status", s.authMiddleware(s.handleShortStatus))
 	// ── 策略/D1/LLM 配置：运营配置系统级共享、仅管理员可读写（写会热替换全部账号引擎/新闻管线客户端）。──
 	// （Strategy/D1/LLM configs are operator-owned: admin-only read+write.）
 	s.mux.HandleFunc("GET /api/config/strategy", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetStrategyConfig))
 	// §GAP2-W2 权限收口：全局战法参数影响所有账号的实盘/模拟决策，写权限收敛到 admin
 	// （此前任意 14 天临时账号可改全局止盈止损）。English: §GAP2-W2 — global strategy writes are admin-only.
-	s.mux.HandleFunc("POST /api/config/strategy", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetStrategyConfig))
+	s.mux.HandleFunc("POST /api/config/strategy", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleSetStrategyConfig)))
 	s.mux.HandleFunc("GET /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetD1Config))
 	// §GAP2-W2 权限收口：D1 规则同为全局决策面，写权限收敛到 admin。
-	s.mux.HandleFunc("POST /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetD1Config))
+	s.mux.HandleFunc("POST /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleSetD1Config)))
 	s.mux.HandleFunc("GET /api/config/llm", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetLLMConfig))
 	// §GAP2-W2 权限收口（P1-3）：普通用户保存自己的 LLM 配置会经 llmRecreate 热替换【全部账号】
 	// 引擎与新闻管线的客户端（归因上下文外送/计费劫持），故写权限收敛到 admin；普通用户 GET 只读。
@@ -726,14 +730,14 @@ func (s *Server) registerRoutes() {
 	// §C1-V2 概念库状态（覆盖率/最后同步/失败概念）；admin 只读。
 	s.mux.HandleFunc("GET /api/config/concept/status", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleConceptStatus))
 	s.mux.HandleFunc("GET /api/config/regime", s.authMiddleware(s.handleGetRegimeConfig))
-	s.mux.HandleFunc("POST /api/config/regime", s.authMiddleware(s.handleSetRegimeConfig))
+	s.mux.HandleFunc("POST /api/config/regime", s.authMiddleware(withIgnoredKeys(s.handleSetRegimeConfig)))
 	s.mux.HandleFunc("GET /api/config/qmt", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleGetQMTConfig))
-	s.mux.HandleFunc("POST /api/config/qmt", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleSetQMTConfig))
+	s.mux.HandleFunc("POST /api/config/qmt", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(withIgnoredKeys(s.handleSetQMTConfig)))
 	// §SUBSCRIPTION-A（2026-11-01 裁决 4/12）runtime 段行情开关的读写面：覆盖率阈值、量纲系数、
 	// 热点池上限、主源档都要能在后台改（改完热更，不必改文件重启）。权限走 config_admin——
 	// 这批键管的是"行情从哪来、多旧能用"，不管资金动作；放 trading_admin 会让运维面越扩越宽。
 	s.mux.HandleFunc("GET /api/config/runtime", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetRuntimeConfig))
-	s.mux.HandleFunc("POST /api/config/runtime", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetRuntimeConfig))
+	s.mux.HandleFunc("POST /api/config/runtime", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleSetRuntimeConfig)))
 
 	// 模拟盘（纸面交易）：运营数据统一归属管理员（系统级共享），仅管理员可读写；
 	// 子账号不操作模拟盘，后端鉴权，前端只负责展示与交互。
@@ -764,12 +768,12 @@ func (s *Server) registerRoutes() {
 	// 读对已登录账号开放，写限管理员（模拟盘为运营数据）。
 	// English: paper strategy whitelist endpoints (read for authed users, write admin-only).
 	s.mux.HandleFunc("GET /api/paper/strategies", s.authMiddleware(s.handleGetPaperStrategies))
-	s.mux.HandleFunc("POST /api/paper/strategies", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetPaperStrategies))
+	s.mux.HandleFunc("POST /api/paper/strategies", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleSetPaperStrategies)))
 	// §F-4（20260917 缺陷修复批）模拟盘撮合配置读写：总开关/自动卖出/单笔资金/初始资金/做空预算
 	// 改后即热同步（main.go 与 Registry.SetPaperConfig 共用 paper.ConfigFromRules，重启不再是
 	// 唯一生效路径）。GET 登录可见，POST 限管理员。
 	s.mux.HandleFunc("GET /api/paper/config", s.authMiddleware(s.handleGetPaperConfig))
-	s.mux.HandleFunc("POST /api/paper/config", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetPaperConfig))
+	s.mux.HandleFunc("POST /api/paper/config", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleSetPaperConfig)))
 	// 信号控制器裁定留痕审计（"提醒了为何没成交"一屏定位）。
 	// English: signal-controller verdict audit endpoint.
 	s.mux.HandleFunc("GET /api/signalctl/verdicts", s.authMiddleware(s.handleSignalVerdicts))
@@ -782,7 +786,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/paper/short_cover", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperShortCover))
 	s.mux.HandleFunc("POST /api/paper/reset", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperReset))
 	s.mux.HandleFunc("POST /api/paper/pool/reset", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperPoolReset))
-	s.mux.HandleFunc("POST /api/paper/pool/config", s.strictPermMiddleware(auth.PermFundsAdmin, s.handlePaperPoolConfig))
+	s.mux.HandleFunc("POST /api/paper/pool/config", s.strictPermMiddleware(auth.PermFundsAdmin, withIgnoredKeys(s.handlePaperPoolConfig)))
 	// 持仓（运营账本）：读对所有登录用户开放（系统级共享的大盘持仓）；写仅管理员可操作。
 	// （Positions: readable by all; writes are admin-only.）
 	// §E-1 对账：/api/positions 台账 CRUD/exit 系运营账本 API（前端持仓页实际走 /api/holdings 系），
@@ -810,9 +814,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleDeleteAlert))
 	// 自选股/持仓：读对所有登录用户开放（系统级共享的大盘自选）；写仅管理员可操作。
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
-	s.mux.HandleFunc("POST /api/holdings", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetHoldings))
-	s.mux.HandleFunc("POST /api/holdings/balance", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetBalance))   // §P1-11 窄口径改资金
-	s.mux.HandleFunc("POST /api/holdings/pnl-offset", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixPnlOffset)) // §E1 盈亏校准入库留痕（清零按钮的正规后端）
+	s.mux.HandleFunc("POST /api/holdings", s.strictPermMiddleware(auth.PermFundsAdmin, withIgnoredKeys(s.handleFixSetHoldings)))
+	s.mux.HandleFunc("POST /api/holdings/balance", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetBalance))                    // §P1-11 窄口径改资金
+	s.mux.HandleFunc("POST /api/holdings/pnl-offset", s.strictPermMiddleware(auth.PermFundsAdmin, withIgnoredKeys(s.handleFixPnlOffset))) // §E1 盈亏校准入库留痕（清零按钮的正规后端）
 	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixAddHoldingLot))
 	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSetCost))
 	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.strictPermMiddleware(auth.PermFundsAdmin, s.handleFixSellHolding))
@@ -834,7 +838,7 @@ func (s *Server) registerRoutes() {
 	// 补推（成本/状态污染）。与 /api/action 一起升 adminMiddleware（GET showall 只读不动）。
 	// English: §H3 — global-state write endpoints (news showall toggle, reanalyze, manual action)
 	// now require admin: they mutate the operator account's in-process engine regardless of caller.
-	s.mux.HandleFunc("POST /api/news/showall", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleNewsShowAllToggle))
+	s.mux.HandleFunc("POST /api/news/showall", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleNewsShowAllToggle)))
 	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
 	// 2026-11-10 owner 需求：板块过滤三开关（科创/创业/北交所）。读面账号级 authMiddleware
 	// （与 /api/short/status 同姿势）；写面 config_admin（与做多/做空 toggle 同档——
@@ -984,7 +988,7 @@ func (s *Server) registerRoutes() {
 	// §DAILY_REVIEW 手动触发当前账号的盘后持仓 LLM 复盘（同步执行，返回复盘股票数；正常每日自动跑亦存在）。
 	s.mux.HandleFunc("POST /api/review/positions", s.authMiddleware(s.handleTriggerPositionReview))
 	s.mux.HandleFunc("GET /api/consult/pro-mode", s.authMiddleware(s.handleGetConsultProMode))
-	s.mux.HandleFunc("PUT /api/consult/pro-mode", s.authMiddleware(s.handleSetConsultProMode))
+	s.mux.HandleFunc("PUT /api/consult/pro-mode", s.authMiddleware(withIgnoredKeys(s.handleSetConsultProMode)))
 	// §WS-E 敏感管线隔离：stage-records 暴露运营账号全链路 stage 记录，仅管理员可见（子账号 403）。
 	s.mux.HandleFunc("GET /api/stage-records", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleStageRecords))
 	// signal-logs 是各账号自己的信号批次读面（handler 按请求者取引擎），不属运营特权面。
@@ -1038,9 +1042,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/research/library/{id}/enable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("enable")))
 	s.mux.HandleFunc("POST /api/research/library/{id}/disable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("disable")))
 	s.mux.HandleFunc("POST /api/research/library/{id}/delete", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryDelete))
-	s.mux.HandleFunc("POST /api/research/library/{id}/rename", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryRename))
+	s.mux.HandleFunc("POST /api/research/library/{id}/rename", s.permMiddleware(auth.PermResearchApprove, withIgnoredKeys(s.handleResearchLibraryRename)))
 	s.mux.HandleFunc("GET /api/research/backtest-toggle", s.authMiddleware(s.handleResearchBacktestToggle))
-	s.mux.HandleFunc("POST /api/research/backtest-toggle", s.permMiddleware(auth.PermResearchApprove, s.handleResearchBacktestToggle))
+	s.mux.HandleFunc("POST /api/research/backtest-toggle", s.permMiddleware(auth.PermResearchApprove, withIgnoredKeys(s.handleResearchBacktestToggle)))
 	// §WS-H C2 参数版本化：历史快照列表（auth 可见）+ 回滚（admin 专属，原子恢复+审计）
 	// §E-1 对账：配置快照/回滚 API 面已就绪但 UI 未接（docs/DEFECT_FIX_PLAN_20260917 E-1 台账），按需接。
 	s.mux.HandleFunc("GET /api/research/strategies/snapshots", s.authMiddleware(s.handleStrategySnapshots))
@@ -1343,7 +1347,8 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 // §FIX-20261028-F04（2026-10-29）：到期/停用与口令错同形是 UAT 里真实踩到的锁死形态
 // （账号到期 → 屏上只显示"账号或密码不正确" → 用户与管理員都不知道该续期）。
 // 返回空 code 表示"必须保持 401 invalid credentials"（用户名不存在/口令错/临时号），
-// 防枚举底线不变：只有用户名存在且口令正确才会走到这里的分码分支。
+// 防枚举底线（§F6-20261114 口径，与 auth.go Login 顺序一致）：**分码仅在口令校验通过后产生**
+// ——错口令一律 401 invalid credentials（与不存在用户同形），不再能探出账号是否被停用/过期。
 // 抽成纯函数是为了让分码规则可被单测直接钉住（不必为测试去改 auth 的建号 API）。
 func loginFailureCode(err error) (code, message string) {
 	if err == nil {
@@ -1443,8 +1448,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// wrong password，见 auth.go:873-883）整体丢掉，统一写 401 invalid credentials ⇒
 		// 账号到期时用户看到的是"账号或密码不正确"，没有任何续期引导（本轮 UAT 就因此把自己
 		// 锁在门外 15 分钟）。
-		// 防枚举底线不变：**只有"用户名存在且口令正确"才会出现 403 分码**，
-		// 用户名不存在/口令错一律 401 invalid credentials（保持同形）。
+		// 防枚举底线（§F6-20261114）：**只有"用户名存在且口令正确"才会出现 403 分码**
+		// （auth.go 的 bcrypt 校验在 Enabled/expired 判定之前），错口令一律 401 同形。
 		if code, text := loginFailureCode(err); code != "" {
 			opslog.Audit("login", clientIP(r), req.Username, "fail:"+code)
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": code, "message": text})
@@ -2109,8 +2114,7 @@ type shortToggleReq struct {
 // handleShortToggle 处理 POST /api/short/toggle：切换做空开关（按账号持久化）并返回最新状态。
 func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 	var req shortToggleReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	userID := s.operatorID()
@@ -2155,8 +2159,7 @@ func (s *Server) newsShowAllOn(userID string) bool {
 // handleNewsShowAllToggle 处理 POST /api/news/showall：切换"资讯显示全部"开关。
 func (s *Server) handleNewsShowAllToggle(w http.ResponseWriter, r *http.Request) {
 	var req newsShowAllReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	userID := requestUserID(r)
@@ -2286,8 +2289,17 @@ func (s *Server) handleNewsReanalyze(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "engine not ready")
 		return
 	}
+	// §F2-20261114 D 类幂等：带 client_id 的重复点击在窗口内只触发一次补推
+	// （每次补推 = 全市场拉取 + LLM 批量调用，真金白银的成本面）。不带 client_id
+	// 走旧路径（rate limit 兜底），不破坏既有契约。
+	if cid := r.URL.Query().Get("client_id"); cid != "" {
+		if s.newsReanalyzeDedup(requestUserID(r), cid) {
+			writeJSON(w, 202, map[string]interface{}{"accepted": true, "dedup": true})
+			return
+		}
+	}
 	log.Printf("[server] 触发手动LLM补推")
-	writeJSON(w, 202, map[string]bool{"accepted": true})
+	writeJSON(w, 202, map[string]interface{}{"accepted": true})
 	go func() {
 		stat, err := c.ReanalyzeNews()
 		if err != nil {
@@ -2552,6 +2564,10 @@ func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	// §F2-20261114：map 解码写面（无 json tag 可比）→ 显式键白名单，白名单外键如实回报
+	// ignored_keys（配置面按设计接受任意键，不能拒绝，但绝不静默吞——09-29 事故同族）。
+	// 白名单 = config.StrategyConfig 的 json tag 全集 + updated_at（客户端基线版本键）。
+	stashIgnoredKeys(r, unknownMapKeys(body, reflect.TypeOf(config.StrategyConfig{}), "updated_at"))
 	// §中-6：取出客户端基线版本（允许缺省=不比对），非法类型宽容忽略而非 400——
 	// 版本只是比对输入，不值得为它拒绝一次合法参数写入。
 	baseVersion := ""
@@ -2707,8 +2723,7 @@ func (s *Server) handleSetRegimeConfig(w http.ResponseWriter, r *http.Request) {
 		MacroGate map[string]json.RawMessage `json:"macro_gate"`
 		Concept   map[string]json.RawMessage `json:"concept"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &body); !ok {
 		return
 	}
 	// 系统级段只有 admin 可写：普通账号即使把这两段塞进 body 也明确 403，不静默忽略后回 200。
@@ -3405,8 +3420,7 @@ func (s *Server) handleSetConsultProMode(w http.ResponseWriter, r *http.Request)
 		userID = user.ID
 	}
 	var req proModeReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	v := "0"
@@ -3439,10 +3453,22 @@ func (s *Server) handleConsultHistory(w http.ResponseWriter, r *http.Request) {
 // handleClearConsultHistory 处理 DELETE /api/consult/history：清空当日咨询对话。
 // §FIX-9g(20260919)：引擎缺失时不再回"ok"假成功——前端 await 后清屏会造成
 // "界面已清空、服务端历史仍在、刷新复现"的分裂态，如实 503 让调用方保留原界面。
+// §F2-20261114（owner 裁决路 a）：必须带 ?confirm=CLEAR_CONSULT_HISTORY，且只清调用者
+// 自己账号的历史（ClearConsultHistoryFor(uid) 本就按账号隔离），confirm 不是免鉴权钥匙
+// ——uid 为空（匿名/无 token）一律 401，带 confirm 也不放行。
 func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("confirm") != "CLEAR_CONSULT_HISTORY" {
+		writeError(w, 400, "missing or invalid confirm (expected CLEAR_CONSULT_HISTORY)")
+		return
+	}
 	uid := requestUserID(r)
+	if uid == "" {
+		writeError(w, http.StatusUnauthorized, "无法确定账号")
+		return
+	}
 	if c := s.ctrlFor(uid); c != nil {
 		c.ClearConsultHistoryFor(uid) // §GAP2-W2 只清本人账号的历史
+		opslog.Audit("destructive_write", auditActorID(r), "consult/history/clear", "uid="+uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 		return
 	}

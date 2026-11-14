@@ -561,6 +561,8 @@ export function setStoredServer(url) {
 // Note: if no response within this window, the request is aborted via AbortController and "请求超时" (request timeout) is thrown
 const REQUEST_TIMEOUT = 10000
 
+// §F7-20261114：复盘端点专用超时（后端实测 41.5s + 余量；导出供单测锁定 ≥41500 且 > REQUEST_TIMEOUT）。
+export const REVIEW_TIMEOUT_MS = 120000
 /**
  * LLM 配置类接口（测试连接 / 保存 / 回滚）的请求超时。
  * Request timeout for LLM-config endpoints (probe / save / rollback), in ms.
@@ -974,7 +976,8 @@ export async function fetchAlertTotal() {
 // 对应 DELETE /api/alerts，一次性删除所有提醒
 // Maps to DELETE /api/alerts; deletes every alert at once
 export async function clearAlerts() {
-  return request('/api/alerts', { method: 'DELETE' })
+  // §F2-20261114（owner 裁决路 a）：破坏性清空必须带 query confirm；后端按账号隔离+鉴权
+  return request('/api/alerts?confirm=CLEAR_ALERTS', { method: 'DELETE' })
 }
 
 /** 手工删除单条消息 */
@@ -991,7 +994,8 @@ export async function deleteAlert(id) {
 /** §DAILY_REVIEW force-run the after-hours LLM position review for this account; returns {reviewed}. */
 // 对应 POST /api/review/positions（同步执行，耗时数秒~数十秒；失败 502 抛错）。
 export async function reviewPositions() {
-  return request('/api/review/positions', { method: 'POST' })
+  // §F7-20261114：后端实测 41.5s，通用 10s 必掐——本端点单独放宽到 120s（余量）
+  return request('/api/review/positions', { method: 'POST', timeout: REVIEW_TIMEOUT_MS })
 }
 
 // ── 持仓管理 ──
@@ -1188,7 +1192,13 @@ export async function fetchQMTOrders() {
  * English: close-reconciliation readout passthrough (available:false is NOT "zero trades").
  */
 export async function fetchCloseSnapshot() {
-  return request('/api/qmt/close-snapshot')
+  // §F8-20261114：同 pending-review，409 配置态透传 gateway_not_configured
+  try {
+    return await request('/api/qmt/close-snapshot')
+  } catch (e) {
+    if (e && e.status === 409) e.code = e.code || 'gateway_not_configured'
+    throw e
+  }
 }
 
 /** 实盘 kill-switch：置位/解除人工紧急停止（§R4-1/§U-2；资损级，仅 admin） */
@@ -1456,7 +1466,8 @@ export async function shortCoverPaper(code, price) {
  *  other pools and the global equity/fill log are untouched) */
 // 对应 POST /api/paper/pool/reset，data: { pool }
 export async function resetPaperPool(pool) {
-  return request('/api/paper/pool/reset', { method: 'POST', data: { pool: pool || '' } })
+  // §F2-20261114（owner 裁决）：破坏性写面必须带 confirm 字面量
+  return request('/api/paper/pool/reset', { method: 'POST', data: { pool: pool || '', confirm: 'RESET_POOL' } })
 }
 
 /** 模拟盘：分仓池级配置（全局持仓上限 + 每池持仓上限/资金分配，与全局资金/上限解耦可自定义）。
@@ -1487,7 +1498,7 @@ export async function configPaperPools(maxPositions, poolCaps, poolAllocs, poolR
  *  0 = unlimited) */
 // 对应 POST /api/paper/reset
 export async function resetPaper(initialCapital, maxPositions) {
-  const data = {}
+  const data = { confirm: 'RESET_PAPER' } // §F2-20261114：清盘/注入两分支都必带 confirm
   if (initialCapital > 0) data.initial_capital = initialCapital
   if (maxPositions > 0) data.max_positions = maxPositions
   return request('/api/paper/reset', { method: 'POST', data })
@@ -1706,7 +1717,9 @@ export async function fetchNews(all) {
  */
 // 手动触发一次新闻重新归因
 export async function reanalyzeNews() {
-  return request('/api/news/reanalyze', { method: 'POST' })
+  // §F2-20261114 D 类幂等：带 client_id，重复点击在服务端 5 分钟窗口内只触发一次补推
+  const cid = 'reanalyze-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+  return request('/api/news/reanalyze?client_id=' + encodeURIComponent(cid), { method: 'POST' })
 }
 
 // ── 自选股 ──
@@ -2336,7 +2349,8 @@ export async function fetchConsultHistory() {
 // 对应 DELETE /api/consult/history，清空当日咨询对话
 // Maps to DELETE /api/consult/history; clears today's consultation messages
 export async function clearConsultHistory() {
-  return request('/api/consult/history', { method: 'DELETE' })
+  // §F2-20261114（owner 裁决路 a）：同 alerts，query confirm
+  return request('/api/consult/history?confirm=CLEAR_CONSULT_HISTORY', { method: 'DELETE' })
 }
 
 /** 获取专业模式开关状态 */
@@ -2649,7 +2663,10 @@ export async function setAdminStrategyConfig(id, cfg) {
  *  params 可选 {objective, start, end, top_n}；同 ref 幂等（已有排队/运行中返回现任务）。
  *  对应后端 POST /api/backtest/optimize。 */
 export async function enqueueOptimize(params) {
-  return request('/api/backtest/optimize', { method: 'POST', data: params || {} })
+  // §F2-20261114 D 类幂等：client_id 进 payload（后端留痕；同 objective 分槽本身幂等）
+  const p = { ...(params || {}) }
+  if (!p.client_id) p.client_id = 'optimize-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+  return request('/api/backtest/optimize', { method: 'POST', data: p })
 }
 
 /** §DAILY_OPSLOG 每日系统运行日志（管理员）：列出已有日志的日期与大小（倒序）。
@@ -2714,7 +2731,8 @@ export async function rejectOptimization(id) {
 /** §v2 清盘：支持显式指定重置后初始资金（reset_to）与持仓上限
  *  对应后端 POST /api/paper/reset（body 原样透传后端，与 resetPaper() 共用同一路由） */
 export async function paperResetV2(body) {
-  return request('/api/paper/reset', { method: 'POST', data: body })
+  // §F2-20261114：同批恒带 confirm（body 原样透传 + 强制合并确认位）
+  return request('/api/paper/reset', { method: 'POST', data: { ...(body || {}), confirm: 'RESET_PAPER' } })
 }
 
 /** §0925EVE-W3-G（FIX_PLAN ⑫ C3）第三态「待核对」清单（GET /api/qmt/pending-review，仅 admin）：
@@ -2722,7 +2740,13 @@ export async function paperResetV2(body) {
  *  dispatch_in_flight}], unresolved_count, truncated, active, gateway_ts, failover_enable}。
  *  失败（网关不可达/未接入）后端如实 502/503 抛错——调用方必须区分「查询失败」与「确实没有」。 */
 export async function qmtPendingReview() {
-  return request('/api/qmt/pending-review')
+  // §F8-20261114：409 = 配置态「未接入柜台」，不再是网关故障 502——错误码透传给调用方分形。
+  try {
+    return await request('/api/qmt/pending-review')
+  } catch (e) {
+    if (e && e.status === 409) e.code = e.code || 'gateway_not_configured'
+    throw e
+  }
 }
 
 /** §0925EVE-W3-G 第三态人工确认（POST /api/qmt/order-confirm，仅 admin，后端每次尝试落 opslog 审计）：

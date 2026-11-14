@@ -129,7 +129,9 @@ func TestCleanupUsersDryRunAndDelete(t *testing.T) {
 		t.Fatalf("dry_run 不得删除任何账号, got %d", len(mgr.ListUsers()))
 	}
 	// 2) 真删：只剩 admin/alice/live temp
-	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/cleanup", `{}`))
+	// §F2-20261114（owner 裁决路 B）：dry_run 必须显式携带（空体/缺键 400）——
+	// 旧契约"{} = dry_run 缺省 false = 真删"作废，真删须显式 {"dry_run":false}。
+	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/cleanup", `{"dry_run":false}`))
 	if err := json.Unmarshal(rr.Body.Bytes(), &preview); err != nil {
 		t.Fatalf("解析 cleanup: %v", err)
 	}

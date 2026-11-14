@@ -20,7 +20,6 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -180,8 +179,7 @@ func validateRuntimePatch(req runtimeConfigPatch) []string {
 // handleSetRuntimeConfig POST /api/config/runtime（config_admin）：稀疏 merge 后落盘 + 热更。
 func (s *Server) handleSetRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 	var req runtimeConfigPatch
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	if errs := validateRuntimePatch(req); len(errs) > 0 {

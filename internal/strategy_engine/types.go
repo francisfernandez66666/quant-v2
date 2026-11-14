@@ -99,8 +99,8 @@ type StockMarketData struct {
 	// D1 §NEWS-GATE 2026-11-12（R7）：该股最近一轮带符号 D1 事件分（−40~+40；0=无事件/未评）。
 	// 由 combat_agent/adapter.go evalFor 统一注入（每轮覆盖写），因子战法经 seriesFromKLines
 	// 装配为 D1Event 因子输入；信号层 news gate 直接消费负分做一票否决。
-	D1    float64           `json:"d1,omitempty"`           // 带符号 D1 事件分（−40~+40；0=无事件）
-	Fina  *FinancialData    `json:"fina,omitempty"`         // 最新财务指标（财务因子评分用）（Latest financials for financial-factor scoring）
+	D1   float64        `json:"d1,omitempty"`   // 带符号 D1 事件分（−40~+40；0=无事件）
+	Fina *FinancialData `json:"fina,omitempty"` // 最新财务指标（财务因子评分用）（Latest financials for financial-factor scoring）
 }
 
 // StrategyResult 策略引擎评估结果，包含板块、个股、行情数据和 L1 过滤信息。

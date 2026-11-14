@@ -936,21 +936,24 @@ func (m *Manager) Login(username, password string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// 按用户名定位用户：临时账号/禁用/过期直接拒绝，命中后校验密码哈希。
+	// 按用户名定位用户：密码正确**之后**才判状态（§F6-20261114 防"错口令探出账号状态"
+	// 的枚举面——此前 temp/禁用/过期判在 bcrypt 之前，错口令也能得到 403 分码）。
+	// 分码（disabled/expired）仅在口令校验通过后产生，兼顾续期引导与防枚举；
+	// 「口令正确+过期」仍走 403 account_expired（产品需求：到期用户要看到续期引导）。
 	for i := range m.db.Users {
 		u := &m.db.Users[i]
 		if u.Username == username {
 			if u.PasswordHash == "" {
 				return nil, fmt.Errorf("cannot login with temp account")
 			}
+			if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+				return nil, fmt.Errorf("wrong password")
+			}
 			if !u.Enabled {
 				return nil, fmt.Errorf("account disabled")
 			}
 			if u.expired() {
 				return nil, fmt.Errorf("account expired")
-			}
-			if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
-				return nil, fmt.Errorf("wrong password")
 			}
 			// §多会话：登录签发新会话而非轮换覆盖——手机/电脑可同时在线，
 			// 旧令牌继续有效至其自然过期（此前"登录即踢旧端"导致另一端 401，

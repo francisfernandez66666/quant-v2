@@ -11,7 +11,6 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -86,8 +85,7 @@ func (s *Server) handleSetPaperConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req setPaperConfigReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "无效请求体")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	// 落库前的四项数值参数校验：负值一律 400 拒绝（fixed_amount/初始资金为金额、

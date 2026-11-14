@@ -8,7 +8,6 @@
 package server
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
 	"sort"
@@ -95,8 +94,7 @@ func (s *Server) handleSetPaperStrategies(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req setPaperStrategiesReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "无效请求体")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	rules := s.cfg.GetRulesFor(uid)

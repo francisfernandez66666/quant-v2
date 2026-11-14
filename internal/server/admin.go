@@ -84,17 +84,28 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 // expiry is judged by HasActiveSession (all sessions lapsed ⇒ unusable), never by creation time.
 // Targets: expired non-admin accounts, plus temp_ accounts with no live session or disabled.
 // dry_run previews without deleting. Admin and in-use accounts are never touched.
+// §F2-20261114（owner 裁决路 B）：dry_run 必须显式携带（*bool，空体 400）——堵"不带参数
+// 触发真删"的缺省通道，字段本义不变。
+// English: §F2-20261114 — dry_run must be explicitly provided (*bool; empty body ⇒ 400).
 func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		DryRun bool `json:"dry_run"`
+		// §F2-20261114（owner 裁决路 B）：`*bool` + nil 判空——空体（dry_run 缺省）从
+		// "真删"改成 400。字段本义不变：false 仍然=真删、true 仍然=预览，不改语义只堵缺省。
+		// 前端 cleanupUsers(dryRun) 恒发 {dry_run:!!dryRun} ⇒ 零影响；外部脚本若依赖
+		// "不带 body 就真删"会从删变成 400（响亮失败，不是静默不删）。
+		DryRun *bool `json:"dry_run"`
 	}
 	// §0926E2E-W1D：旧写法 `_ = Decode(&req)` 把畸形 JSON 解析成零值继续**删号**——
 	// 想带 dry_run:true 预览的调用只要请求体坏一个括号，就静默变成真实批量删除。
-	// 现口径：空体=合法缺省（dry_run=false）；非法 JSON→400 中止。
-	if err := decodeOptJSON(r, &req); err != nil {
-		writeError(w, 400, "invalid request body: "+err.Error())
+	// §F2-20261114：空体不再合法（旧口径"空体=真删"作废）；非法 JSON→400 中止。
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
+	if req.DryRun == nil {
+		writeError(w, 400, "missing dry_run (must be explicitly true=preview or false=delete)")
+		return
+	}
+	dryRun := *req.DryRun
 	now := time.Now().Unix()
 	type cleaned struct {
 		ID       string `json:"id"`
@@ -120,7 +131,7 @@ func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
 		if reason == "" {
 			continue
 		}
-		if !req.DryRun {
+		if !dryRun {
 			if err := s.auth.DeleteUser(u.ID); err != nil {
 				log.Printf("[admin] cleanup 删除 %s(%s) 失败: %v", u.Username, u.ID, err)
 				continue // 单个失败不阻断整批
@@ -128,8 +139,8 @@ func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, cleaned{ID: u.ID, Username: u.Username, Reason: reason})
 	}
-	opslog.Audit("user_cleanup", auditActorID(r), "users", fmt.Sprintf("dry_run=%v count=%d", req.DryRun, len(out))) // §0926E2E-W1D：nil-safe 取主体
-	writeJSON(w, 200, map[string]interface{}{"deleted": out, "count": len(out), "dry_run": req.DryRun})
+	opslog.Audit("user_cleanup", auditActorID(r), "users", fmt.Sprintf("dry_run=%v count=%d", dryRun, len(out))) // §0926E2E-W1D：nil-safe 取主体
+	writeJSON(w, 200, map[string]interface{}{"deleted": out, "count": len(out), "dry_run": dryRun})
 }
 
 // createUserReq 管理员开户请求体。
@@ -440,8 +451,7 @@ func (s *Server) handleAdminSetStrategyConfig(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var cfg config.StrategyConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &cfg); !ok {
 		return
 	}
 	// §0929CFG-HIST：管理员代配战法参数落的是**该账号归属运营者的配置文档**，此前既无写前快照
@@ -704,8 +714,7 @@ func (s *Server) handleAdminSetQMTConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req setQMTConfigReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	s.applySetQMTConfig(w, userIDFor(r), id, req)

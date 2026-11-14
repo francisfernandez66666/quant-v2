@@ -18,6 +18,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,6 +42,16 @@ func (s *Server) handleQMTPendingReview(w http.ResponseWriter, r *http.Request) 
 	}
 	pv, err := ctrl.GatewayPendingReview()
 	if err != nil {
+		// §F8-20261114：配置态（未启用/未填 gateway_url，哨兵 ErrGatewayNotConfigured）
+		// 回 409 让前端渲染「未接入柜台」；网关真故障仍 502（honest errors 纪律不变）。
+		// 注意 ctrl == nil 的 503 分支在上面已经处理，409 不要写进那条分支。
+		if errors.Is(err, trading.ErrGatewayNotConfigured) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":   "gateway_not_configured",
+				"message": "该账号未接入柜台网关",
+			})
+			return
+		}
 		writeError(w, 502, "网关待核对清单查询失败: "+err.Error())
 		return
 	}
@@ -72,6 +83,14 @@ func (s *Server) handleQMTCloseSnapshot(w http.ResponseWriter, r *http.Request) 
 	}
 	res, err := ctrl.GatewayCloseSnapshot()
 	if err != nil {
+		// §F8-20261114：配置态 409（同 pending-review 分档口径）。
+		if errors.Is(err, trading.ErrGatewayNotConfigured) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":   "gateway_not_configured",
+				"message": "该账号未接入柜台网关",
+			})
+			return
+		}
 		writeError(w, 502, "网关收盘对账查询失败: "+err.Error())
 		return
 	}

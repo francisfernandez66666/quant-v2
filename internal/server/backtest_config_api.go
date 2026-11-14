@@ -48,8 +48,7 @@ func (s *Server) handleBacktestConfigPut(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var cfg config.BacktestConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-		writeError(w, 400, "请求体非法: "+err.Error())
+	if _, ok := decodeStrictB(w, r, &cfg); !ok {
 		return
 	}
 	// 保存入口统一校验（Enabled=false 也校验，防半坏配置后续启用踩坑）

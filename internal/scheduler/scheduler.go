@@ -522,8 +522,10 @@ func dirOfDB(cfg config.SchedulerConfig) string {
 // cfg.AllDayResearch 全天放行、关掉 quant↔research 互相退避；11-12 现网实证白天
 // 研究抢占 2 核 4G 小机资源（research_tasks 积压 63 条 queued、云端前端加载变慢），
 // 故撤销该短路，恢复双向退避：
-//   盘中 → research 停摆（本函数 false + tick 抢占在跑任务），quant 保持 5s 近实时；
-//   盘后/休市 → quant 打分循环休眠，research 出队跑完整夜间链。
+//
+//	盘中 → research 停摆（本函数 false + tick 抢占在跑任务），quant 保持 5s 近实时；
+//	盘后/休市 → quant 打分循环休眠，research 出队跑完整夜间链。
+//
 // 内存闸门（MinFreeMemMB）不在此函数，内存不足仍留队，不会挤爆机器。
 //
 // 与 quant 自身的时段判断共用同一谓词集合，两边永远一致，不会出现"日历说休市、

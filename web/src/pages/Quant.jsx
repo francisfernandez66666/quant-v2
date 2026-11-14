@@ -814,7 +814,13 @@ export default function Quant() {
       setPendingReviewError('') // 成功即清错误态
     } catch (e) {
       if (!noteForbidden(e)) {
-        setPendingReviewError(e && e.message ? String(e.message) : '待核对清单查询失败（网络/服务异常）')
+        // §F8-20261114：409 gateway_not_configured 是「未接入柜台」的配置态，不是查询失败——
+        // 独立文案，避免把"没接实盘"渲染成"网关坏了"。
+        if (e && (e.code === 'gateway_not_configured' || e.status === 409)) {
+          setPendingReviewError('该账号未接入柜台网关（未启用实盘或未填 gateway_url）')
+        } else {
+          setPendingReviewError(e && e.message ? String(e.message) : '待核对清单查询失败（网络/服务异常）')
+        }
       }
     }
   }

@@ -239,8 +239,8 @@ func (d *DB) RebuildTradeResultsForCode(userID, code string) (int, error) {
 		return 0, err
 	}
 	type fillRow struct {
-		id      int64
-		f       RealFill
+		id int64
+		f  RealFill
 	}
 	var stream []fillRow
 	for rows.Next() {
@@ -286,7 +286,7 @@ func (d *DB) RebuildTradeResultsForCode(userID, code string) (int, error) {
 		}
 		cost := posAmount / float64(posQty)
 		posQty -= clamped
-		posAmount -= cost*float64(clamped)
+		posAmount -= cost * float64(clamped)
 		if err := matchSellTradeResultsTx(tx, f, cost, clamped, now); err != nil {
 			return 0, err
 		}
@@ -335,7 +335,7 @@ func (d *DB) TradeResultsSummary(userID, strategy, status, day string) ([]map[st
 		}
 		out = append(out, map[string]interface{}{
 			"strategy": k, "trade_count": count,
-			"buys":        math.Round(buys*100) / 100,
+			"buys":         math.Round(buys*100) / 100,
 			"realized_pnl": math.Round(pnl*100) / 100,
 		})
 	}

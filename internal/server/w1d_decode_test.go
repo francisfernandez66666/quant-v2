@@ -32,9 +32,10 @@ func TestW1dCleanupMalformedBodyRejected(t *testing.T) {
 	if len(s.auth.ListUsers()) != before {
 		t.Fatal("dry_run 预览不得真删")
 	}
-	// 空体维持旧语义（=不携带 dry_run，正常执行清理流程）：本盘无僵尸号 → 200 count=0
-	if rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/cleanup", ``)); rr.Code != 200 {
-		t.Fatalf("空体应维持旧缺省语义 200, got %d body=%s", rr.Code, rr.Body.String())
+	// §F2-20261114（owner 裁决路 B）：空体从"旧缺省=真删"改为 400——dry_run 必须显式携带，
+	// 堵"不带参数触发真删"的缺省通道（外部脚本依赖旧行为会响亮失败，不是静默不删）。
+	if rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/cleanup", ``)); rr.Code != 400 {
+		t.Fatalf("空体（dry_run 缺省）应 400, got %d body=%s", rr.Code, rr.Body.String())
 	}
 	// 类型错（dry_run 传字符串）同属"带坏了"，必须 400
 	if rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/cleanup", `{"dry_run":"yes"}`)); rr.Code != 400 {

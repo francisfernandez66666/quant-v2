@@ -39,6 +39,11 @@ func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
 		Start     string `json:"start"`
 		End       string `json:"end"`
 		TopN      int    `json:"top_n"`
+		// §F2-20261114 D 类幂等：客户端幂等键（防"重复点击排两个任务"）。同 ref 槽
+		// （objective 分槽）本来就有 HasActiveTaskByRef 幂等——同 objective 双击返回同一
+		// task_id、不重复入队；client_id 是给前端将来跨 objective 重发时防重的可选键，
+		// 进 payload 留痕，不参与分槽（改分槽会动 W6 的语义）。
+		ClientID string `json:"client_id"`
 	}
 	if r.Body != nil {
 		// §0926E2E-W1D：空体合法（全缺省参数）；畸形 JSON 400 中止，不再静默按零值排队寻优任务。
@@ -59,6 +64,9 @@ func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.TopN > 0 {
 		payload["top_n"] = body.TopN
+	}
+	if body.ClientID != "" {
+		payload["client_id"] = body.ClientID
 	}
 	// §W6 修复：objective 分槽——不同优化目标使用不同 ref_id 槽位，
 	// 避免旧行为"任意时刻只允许 1 个扫参任务、后续 objective 请求被 HasActiveTaskByRef 静默吞掉"

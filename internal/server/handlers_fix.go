@@ -1040,13 +1040,25 @@ func alertGeneratedAtKey(v interface{}) string {
 }
 
 // handleClearAlerts 处理 DELETE /api/alerts 请求：清空消息中心全部消息（按账号）。
+// §F2-20261114（owner 裁决路 a）：必须带 `?confirm=CLEAR_ALERTS`，且只清调用者自己账号的消息
+// （归属来自登录态 requestUserID，不来自请求体/query，confirm 不是免鉴权钥匙）。
 func (s *Server) handleClearAlerts(w http.ResponseWriter, r *http.Request) {
-	ctrl := s.ctrlFor(requestUserID(r))
+	if r.URL.Query().Get("confirm") != "CLEAR_ALERTS" {
+		writeError(w, 400, "missing or invalid confirm (expected CLEAR_ALERTS)")
+		return
+	}
+	uid := requestUserID(r)
+	if uid == "" {
+		writeError(w, http.StatusUnauthorized, "无法确定账号")
+		return
+	}
+	ctrl := s.ctrlFor(uid)
 	if ctrl == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
 	ctrl.ClearMessages()
+	opslog.Audit("destructive_write", auditActorID(r), "alerts/clear", "ok")
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -1208,8 +1220,7 @@ type fixPnlOffsetReq struct {
 // 旧版这一步只写 localStorage：换浏览器即丢、全程无痕，"手工校准"因而无法审计。
 func (s *Server) handleFixPnlOffset(w http.ResponseWriter, r *http.Request) {
 	var req fixPnlOffsetReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	// §MULTI-ADMIN：账户级写面按请求者归属，不再落到运营账号 operatorID。
@@ -1247,7 +1258,10 @@ func (s *Server) handleFixPnlOffset(w http.ResponseWriter, r *http.Request) {
 
 // fixSetBalanceReq 可用资金更新请求体（§P1-11）。
 type fixSetBalanceReq struct {
-	AvailableBalance float64 `json:"available_balance"` // 新的可用资金
+	// §F2-20261114（owner 裁决）：指针位区分「键缺失」与「显式传 0」。
+	// 旧写法 float64 的零值让两者解码后同形——探针发 {"_probe":true} 就会把可用资金写成 0。
+	// 现在：键缺失 → 400；显式 0 → 合法（清零是正当业务动作）。
+	AvailableBalance *float64 `json:"available_balance"` // 新的可用资金（必填）
 }
 
 // handleFixSetBalance 处理 POST /api/holdings/balance 请求（§P1-11，2026-09-15）：
@@ -1262,7 +1276,14 @@ func (s *Server) handleFixSetBalance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if req.AvailableBalance < 0 {
+	// §F2-20261114：`*float64` + nil 判空——键缺失（含 {"_probe":true} 这类无效载荷）一律 400；
+	// 显式传 0 合法（用户把可用资金清零是正当业务动作，"必填且 >0" 的旧稿会禁掉它）。
+	// 值本身不再做 >=0 校验：负数语义维持旧口径（资金不为负），仅在解引用后判。
+	if req.AvailableBalance == nil {
+		writeError(w, 400, "missing or invalid available_balance (key must be present)")
+		return
+	}
+	if *req.AvailableBalance < 0 {
 		writeError(w, 400, "available_balance must be >= 0")
 		return
 	}
@@ -1275,7 +1296,7 @@ func (s *Server) handleFixSetBalance(w http.ResponseWriter, r *http.Request) {
 	acc, _ := s.realAccountFor(uid)
 	// 只改可用资金，保留冻结/总资产/市值（下一次网关 account 回报会整体覆盖，网关优先）
 	acc.UserID = uid
-	acc.AvailableCash = req.AvailableBalance
+	acc.AvailableCash = *req.AvailableBalance
 	if err := s.realDB().UpsertRealAccount(acc); err != nil {
 		writeError(w, 500, "save balance failed: "+err.Error())
 		return

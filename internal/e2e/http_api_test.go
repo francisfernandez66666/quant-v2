@@ -499,7 +499,8 @@ func TestHTTPConsultHistory(t *testing.T) {
 	}
 
 	// 清空
-	code, body = apiReq(t, hr, hr.token, http.MethodDelete, "/api/consult/history", nil)
+	// §F2-20261114：破坏性清空需带 query confirm（owner 裁决路 a）
+	code, body = apiReq(t, hr, hr.token, http.MethodDelete, "/api/consult/history?confirm=CLEAR_CONSULT_HISTORY", nil)
 	if code != 200 {
 		t.Fatalf("DELETE history status=%d", code)
 	}

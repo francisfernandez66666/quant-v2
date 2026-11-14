@@ -263,8 +263,7 @@ func (s *Server) handleResearchLibraryRename(w http.ResponseWriter, r *http.Requ
 	var body struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, 400, "无效请求体")
+	if _, ok := decodeStrictB(w, r, &body); !ok {
 		return
 	}
 	var err error

@@ -407,10 +407,10 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// 不再把冻结账当可信柜台展示。
 	frameAt, frameFrozen := counterFrameReadout(acc, positions, cntime.DayOf(cntime.Now()))
 	writeJSON(w, 200, map[string]interface{}{
-		"positions":        positions,                     // 持仓列表（已补名称/现价；来源见 book_source.positions）
-		"account":          acc,                           // 账户资产快照（来源见 book_source.cash）
-		"counter_frame_at": frameAt,                       // 柜台读数的最新时刻（两维里较新的那个；空=柜台从未报过）
-		"counter_frozen":   frameFrozen,                   // true=最新柜台读数不属于当前交易日（冻结账）
+		"positions":        positions,   // 持仓列表（已补名称/现价；来源见 book_source.positions）
+		"account":          acc,         // 账户资产快照（来源见 book_source.cash）
+		"counter_frame_at": frameAt,     // 柜台读数的最新时刻（两维里较新的那个；空=柜台从未报过）
+		"counter_frozen":   frameFrozen, // true=最新柜台读数不属于当前交易日（冻结账）
 		// §5(c)（2026-11-13）：现价批次的行情截至时刻（逐票 AsOfMs 的最大值，HH:MM:SS；
 		// 空=本批没有一行拿到带时刻的行情）——不让 5s 快照的价冒充实时。
 		"cur_price_asof": func() string {
@@ -419,9 +419,9 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 			}
 			return time.UnixMilli(curPriceAsofMs).In(cntime.Loc).Format("15:04:05")
 		}(),
-		"enabled":          ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
-		"tripped":          ctrl != nil && ctrl.Tripped(), // 熔断是否触发
-		"mode":             ctrlMode(ctrl),                // 执行模式 manual/auto
+		"enabled": ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
+		"tripped": ctrl != nil && ctrl.Tripped(), // 熔断是否触发
+		"mode":    ctrlMode(ctrl),                // 执行模式 manual/auto
 		// §MANUAL-BOOK-UNIFY 读侧来源：这一张表里，资金与持仓两维各自是谁给的。
 		// 前端按它决定"操作"列点下去是下真单还是改账，也按它挂来源角标——
 		// 判据只在这里装配一次，前端不许再读一次新鲜度（两处判一个时间迟早不一致）。
@@ -1553,8 +1553,7 @@ type riskGatePatch struct {
 // （空数组=全部允许，与引擎语义一致）；数值参数做范围钳制。token 提交脱敏哨兵/空串则不变。
 func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	var req setQMTConfigReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
+	if _, ok := decodeStrictB(w, r, &req); !ok {
 		return
 	}
 	s.applySetQMTConfig(w, userIDFor(r), userIDFor(r), req)

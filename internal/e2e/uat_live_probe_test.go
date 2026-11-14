@@ -346,11 +346,11 @@ func TestUATLiveProbeTrading(t *testing.T) {
 	if code != 200 {
 		t.Errorf("paper/pool/config → %d (body=%s)", code, body)
 	}
-	code, _, _ = ur.doReq(t, http.MethodPost, "/api/paper/pool/reset", token, `{"pool":"dragon"}`)
+	code, _, _ = ur.doReq(t, http.MethodPost, "/api/paper/pool/reset", token, `{"pool":"dragon","confirm":"RESET_POOL"}`) // §F2-20261114 确认位
 	if code != 200 {
 		t.Errorf("paper/pool/reset → %d", code)
 	}
-	code, _, _ = ur.doReq(t, http.MethodPost, "/api/paper/reset", token, `{"initial_capital":1000000,"max_positions":20}`)
+	code, _, _ = ur.doReq(t, http.MethodPost, "/api/paper/reset", token, `{"initial_capital":1000000,"max_positions":20,"confirm":"RESET_PAPER"}`) // §F2-20261114 确认位
 	if code != 200 {
 		t.Errorf("paper/reset → %d", code)
 	}

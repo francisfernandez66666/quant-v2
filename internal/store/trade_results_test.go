@@ -1,12 +1,14 @@
 // trade_results_test.go — §TRADE-LEDGER（2026-11-13）台账回归。
 //
 // 锁六件事（断言编号对应 PLAN_TRADE_RESULT_LEDGER_20261113.md §6）：
-//  T1 粒度：一行 = 一笔买入成交；3 笔部成 → 3 行，各带自己的成交价/量；
-//  T3 盈亏同尺：Σ 行 realized_pnl == handleQMTTrades 式重放 realized（同一序列两实现对比）；
-//  T4 含费口径：买入摊费（价=含费单价读数）、卖出扣 fee+stamp_tax；
-//  T5 超卖钳制：卖出量 > 持仓量时按剩余钳制，无基准余量不摊分；
-//  T6 状态机：部分平=partial、全平=closed；同码二次建仓=新行（生命周期与持仓一致）；
-//  T12 幂等：同一回报重放 → 台账行不变（fills 判重先行，无半态）。
+//
+//	T1 粒度：一行 = 一笔买入成交；3 笔部成 → 3 行，各带自己的成交价/量；
+//	T3 盈亏同尺：Σ 行 realized_pnl == handleQMTTrades 式重放 realized（同一序列两实现对比）；
+//	T4 含费口径：买入摊费（价=含费单价读数）、卖出扣 fee+stamp_tax；
+//	T5 超卖钳制：卖出量 > 持仓量时按剩余钳制，无基准余量不摊分；
+//	T6 状态机：部分平=partial、全平=closed；同码二次建仓=新行（生命周期与持仓一致）；
+//	T12 幂等：同一回报重放 → 台账行不变（fills 判重先行，无半态）。
+//
 // T2（挂单价）与 T11（勘误重算）分见各自用例。
 package store
 
@@ -219,7 +221,7 @@ func TestTradeResultsRebuildFollowsAmendment(t *testing.T) {
 	if len(rows) != 1 || rows[0].Status != "closed" {
 		t.Fatalf("T11: 重放后应仍是 1 行 closed, got %+v", rows)
 	}
-	if diff := rows[0].RealizedPnl - ((9 - 10.05) * 100 - 7.5); diff > 1e-6 || diff < -1e-6 {
+	if diff := rows[0].RealizedPnl - ((9-10.05)*100 - 7.5); diff > 1e-6 || diff < -1e-6 {
 		t.Fatalf("T11: 重放 pnl 应一致 (含费成本 10.05), got %v", rows[0].RealizedPnl)
 	}
 	// scope 守卫

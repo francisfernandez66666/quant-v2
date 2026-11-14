@@ -216,7 +216,7 @@ func (c *QMTClient) ConfirmOrder(ctx context.Context, req OrderConfirmRequest) (
 func (c *Controller) gatewayAdminClient() (*QMTClient, error) {
 	gc := c.gatewayClient()
 	if gc == nil {
-		return nil, errors.New("qmt not enabled or gateway_url not set")
+		return nil, ErrGatewayNotConfigured
 	}
 	return gc, nil
 }

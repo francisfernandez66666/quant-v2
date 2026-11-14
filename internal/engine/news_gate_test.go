@@ -30,10 +30,10 @@ func TestNewsGateVetoAndBoost(t *testing.T) {
 	e := mkNewsGateEngine(t)
 	at := time.Now()
 	sigs := []combat_agent.Signal{
-		mkBuySig("600001", "dragon", at),    // D1=-40 → 拦截
-		mkBuySig("600002", "dragon", at),    // D1=40  → 置信度 ×1.25
-		mkBuySig("600003", "dragon", at),    // D1=0   → 原样
-		mkBuySig("600004", "dragon", at),    // RetryPending → 原样（失败≠利空）
+		mkBuySig("600001", "dragon", at), // D1=-40 → 拦截
+		mkBuySig("600002", "dragon", at), // D1=40  → 置信度 ×1.25
+		mkBuySig("600003", "dragon", at), // D1=0   → 原样
+		mkBuySig("600004", "dragon", at), // RetryPending → 原样（失败≠利空）
 		{ID: "w1", Code: "600005", Strategy: "dragon", Direction: "做多", Action: "watch"}, // watch 不拦
 	}
 	d1 := map[string]combat_agent.D1Score{

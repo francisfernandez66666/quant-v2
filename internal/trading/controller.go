@@ -8,7 +8,6 @@ package trading
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -2127,7 +2126,7 @@ func (c *Controller) gatewayClient() *QMTClient {
 func (c *Controller) GatewayBrokerStatus() (*GatewayBrokerStatus, error) {
 	gc := c.gatewayClient()
 	if gc == nil {
-		return nil, errors.New("qmt not enabled or gateway_url not set")
+		return nil, ErrGatewayNotConfigured
 	}
 	return gc.BrokerStatus()
 }
@@ -2140,7 +2139,7 @@ func (c *Controller) SwitchGatewayBroker(broker string) error {
 	}
 	gc := c.gatewayClient()
 	if gc == nil {
-		return errors.New("qmt not enabled or gateway_url not set")
+		return ErrGatewayNotConfigured
 	}
 	if err := gc.SwitchBroker(broker); err != nil {
 		return err

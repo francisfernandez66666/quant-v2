@@ -696,12 +696,21 @@ func (s *Server) handlePaperPoolReset(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Pool string `json:"pool"` // 池 key（n_shape 等）；空串=清"其他池"
+		// §F2-20261114（owner 裁决）：破坏性写面必须带确认字面量。
+		Confirm string `json:"confirm"` // 必填 "RESET_POOL"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "无效请求体")
 		return
 	}
+	// §F2-20261114：confirm 缺失一律 400，先于任何池级清空动作。
+	if req.Confirm != "RESET_POOL" {
+		writeError(w, 400, "missing or invalid confirm (expected RESET_POOL)")
+		return
+	}
 	pe.ResetPool(req.Pool) // 引擎侧只清该池：平仓回池现金、清池级持久化，其余池不动
+	// §F2-20261114：破坏性动作落审计（按账号归属，审计目标带池名）。
+	opslog.Audit("destructive_write", auditActorID(r), "paper/pool/reset", "pool="+req.Pool)
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "pool": req.Pool})
 }
 
@@ -731,6 +740,8 @@ func (s *Server) handlePaperPoolConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "无效请求体")
 		return
 	}
+	// §F2-20261114：map 解码写面 → 键白名单回报（四个消费键之外的键如实上报，不静默吞）。
+	stashIgnoredKeys(r, unknownMapKeys(raw, nil, "max_positions", "pool_caps", "pool_rules", "pool_allocs"))
 	if v, ok := raw["max_positions"]; ok {
 		var mp int
 		if json.Unmarshal(v, &mp) == nil && mp >= 0 {
@@ -804,11 +815,18 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 		InitialCapital float64 `json:"initial_capital"` // >0 = 注入资金模式
 		MaxPositions   int     `json:"max_positions"`   // 可选持仓上限（注入模式 >=0 生效；清盘模式 >0 生效）
 		ResetTo        float64 `json:"reset_to"`        // §反馈修复：清盘时显式指定重置后的初始资金
+		// §F2-20261114（owner 裁决）：破坏性写面必须带确认字面量，缺失一律 400（先于任何引擎动作）。
+		Confirm string `json:"confirm"` // 必填 "RESET_PAPER"
 	}
 	// §0926E2E-W1D：清盘/注入是破坏性动作——畸形 JSON 不再吞成零值走默认清盘分支，400 中止。
-	// 空体仍合法（三种语义见下方分支：缺省/注入/清盘）。
-	if err := decodeOptJSON(r, &req); err != nil {
-		writeError(w, 400, "invalid request body: "+err.Error())
+	// §F2-20261114：改走严格解码（E5 锁：A 类 handler 内 decodeOptJSON 出现 0 次）；空体=400。
+	if _, ok := decodeStrictB(w, r, &req); !ok {
+		return
+	}
+	// §F2-20261114：confirm 两个分支都要（注入与清盘同属写面，避免"先注入再清盘"绕过）。
+	// 空体不再合法：旧口径"空体=清盘"已按 owner 裁决作废（前端 resetPaper 同批恒带 confirm）。
+	if req.Confirm != "RESET_PAPER" {
+		writeError(w, 400, "missing or invalid confirm (expected RESET_PAPER)")
 		return
 	}
 	if req.InitialCapital > 0 {
@@ -833,6 +851,9 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 			pe.SetMaxPositions(req.MaxPositions)
 		}
 	}
+	// §F2-20261114：破坏性动作落审计（谁在什么时候清了/注入了哪个账号的模拟盘）。
+	opslog.Audit("destructive_write", auditActorID(r), "paper/reset",
+		fmt.Sprintf("deposit=%.2f reset_to=%.2f max_positions=%d", req.InitialCapital, req.ResetTo, req.MaxPositions))
 	// 回显落库后的最终配置，前端据此刷新资金/上限显示。
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":              true,
