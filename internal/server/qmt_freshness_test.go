@@ -11,7 +11,12 @@ import (
 )
 
 func TestQMTReportFreshness(t *testing.T) {
-	now := time.Now()
+	// §20261115-CLOSEOUT：只钉时分、保留当日日期（与 engine 夹具 liveTestNow 同款）。
+	// 旧写法用真实 time.Now()：凌晨 00:0x 跑时 now-1min / now-20min 会落到前一天，
+	// 而 2026-11-13 owner 裁决 A7 的判据是「按北京自然日判新鲜」，跨日帧一律过期 ⇒
+	// 两条「同日帧仍可用」用例假红。这不是代码回归，是测试时钟与被测判据口径不一致。
+	n := time.Now().In(cntime.Loc)
+	now := time.Date(n.Year(), n.Month(), n.Day(), 10, 30, 0, 0, cntime.Loc)
 	// 2026-11-13 owner ruling A7: a same-day frame stays usable all day
 	// (counter uploads are sparse); only cross-day / future frames are stale.
 	old := now.Add(-20 * time.Minute).Format(time.RFC3339)

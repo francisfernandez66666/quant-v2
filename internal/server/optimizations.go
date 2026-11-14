@@ -17,11 +17,21 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
+)
+
+// optimizeClientMu / optimizeClientSeen：§F2-20261114 D 类幂等账。
+// 以 client_id 为键记住已入队的 task_id；同一幂等键重复点击只回原 task_id、不再入队
+// （与 news/reanalyze 的 5 分钟窗口同族，但这里不设过期：寻优任务可能被审批/回读，
+// 进程重启丢账至多多排一次，无害）。
+var (
+	optimizeClientMu   sync.Mutex
+	optimizeClientSeen = map[string]int64{}
 )
 
 // handleOptimizeEnqueue 处理 POST /api/backtest/optimize：
@@ -74,10 +84,22 @@ func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
 	// 相同 objective 内部仍幂等（同一目标不会同时排队两条相同扫参）。
 	// English: W6 — slot ref_id by objective; prevents HasActiveTaskByRef from silently dropping
 	// follow-up optimize requests with a different objective while a prior one is still queued.
+	// 幂等键必须覆盖「检查 → 入队 → 记账」整段，持锁串行化防并发双击排两条。
+	if body.ClientID != "" {
+		optimizeClientMu.Lock()
+		defer optimizeClientMu.Unlock()
+		if seen, ok := optimizeClientSeen[body.ClientID]; ok {
+			writeJSON(w, http.StatusAccepted, map[string]any{"task_id": seen, "status": "queued", "objective": body.Objective, "ref_id": optRefIDFor(body.Objective), "dedup": true})
+			return
+		}
+	}
 	id, _, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, optRefIDFor(body.Objective), payload)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if body.ClientID != "" {
+		optimizeClientSeen[body.ClientID] = id
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"task_id": id, "status": "queued", "objective": body.Objective, "ref_id": optRefIDFor(body.Objective)})
 }

@@ -534,10 +534,22 @@ done
 VITE_LPID="$(lsof -nP -iTCP:"${FRONT_PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
 [[ -n "$VITE_LPID" ]] || die "前端就绪但反查不到 :${FRONT_PORT} 监听 pid（lsof 为空）——vite.pid 拒绝登记一个未知属主"
 VITE_LCMD="$(ps -o command= -p "$VITE_LPID" 2>/dev/null || true)"
-case "$VITE_LCMD" in
-  *node_modules/.bin/vite\ --port\ ${FRONT_PORT}*) ;;
-  *) die ":${FRONT_PORT} 监听者不是本次拉起的 vite（cmdline：${VITE_LCMD}）——拒绝把 vite.pid 记到别人头上";;
-esac
+if [[ -n "$VITE_LCMD" ]]; then
+  case "$VITE_LCMD" in
+    *node_modules/.bin/vite\ --port\ ${FRONT_PORT}*) ;;
+    *) die ":${FRONT_PORT} 监听者不是本次拉起的 vite（cmdline：${VITE_LCMD}）——拒绝把 vite.pid 记到别人头上";;
+  esac
+else
+  # §20261115-CLOSEOUT：本机安全策略禁用 ps（实测 `operation not permitted: ps`），
+  # 旧判据拿到空 cmdline 就把「全栈已起」误判成红。降级为 lsof txt（可执行文件）+ cwd 双查：
+  # 端口属主明确 + 可执行文件是 node + cwd 落在本仓库 web/，仍足以排除他人实例，
+  # 绝不因为取不到 cmdline 就静默放行一个未知属主。
+  VITE_LEXE="$(lsof -a -p "$VITE_LPID" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)"
+  case "$VITE_LEXE" in
+    *node*) warn "ps 不可用，vite 身份改用 lsof txt 判据（${VITE_LEXE}）" ;;
+    *) die ":${FRONT_PORT} 监听者可执行文件不是 node（${VITE_LEXE}）——拒绝登记未知属主";;
+  esac
+fi
 VITE_LCWD="$(lsof -a -p "$VITE_LPID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)"
 case "$VITE_LCWD" in
   "$ROOT/web"|"$ROOT") ;;

@@ -1035,7 +1035,7 @@ func (s *Server) registerRoutes() {
 	// §回测自动增强 A0：回测引擎增强配置（研究库 backtest_settings 单行 JSON，入队注入 payload）
 	// English: backtest enhancement settings endpoints (single-row JSON store, payload injection on enqueue).
 	s.mux.HandleFunc("GET /api/research/backtest-config", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestConfigGet))
-	s.mux.HandleFunc("PUT /api/research/backtest-config", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestConfigPut))
+	s.mux.HandleFunc("PUT /api/research/backtest-config", s.permMiddleware(auth.PermResearchApprove, withIgnoredKeys(s.handleBacktestConfigPut))) // §F2 B 类 19 端点补齐
 	s.mux.HandleFunc("GET /api/research/optimizations", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationList))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationApprove))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationReject))
@@ -2166,6 +2166,8 @@ func (s *Server) handleNewsShowAllToggle(w http.ResponseWriter, r *http.Request)
 	if c := s.ctrlFor(userID); c != nil {
 		c.SetNewsShowAll(req.Enabled)
 	}
+	// §F2-20261114 批次 2.3：A 类补审计的第 5 个（全局资讯开关会改变全站展示面）。
+	opslog.Audit("destructive_write", auditActorID(r), "news/showall", "uid="+userID+" enabled="+strconv.FormatBool(req.Enabled))
 	log.Printf("[server] 账号 %s 资讯显示全部开关: %v", userID, req.Enabled)
 	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn(userID)})
 }
@@ -3466,7 +3468,8 @@ func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusUnauthorized, "无法确定账号")
 		return
 	}
-	if c := s.ctrlFor(uid); c != nil {
+	// §F2-20261114：按账户引擎路由（ctrlFor 走 operatorID 共享引擎，会清到别人头上）。
+	if c := s.liveCtrlFor(uid); c != nil {
 		c.ClearConsultHistoryFor(uid) // §GAP2-W2 只清本人账号的历史
 		opslog.Audit("destructive_write", auditActorID(r), "consult/history/clear", "uid="+uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})

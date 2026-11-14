@@ -1052,7 +1052,9 @@ func (s *Server) handleClearAlerts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "无法确定账号")
 		return
 	}
-	ctrl := s.ctrlFor(uid)
+	// §F2-20261114 路 a 附加硬要求 ①：按账户清空。ctrlFor 内部按 operatorID 取共享引擎
+	// （看板数据系统级共享），会清掉别人的消息；实盘/账号级读写一律走 liveCtrlFor(uid)。
+	ctrl := s.liveCtrlFor(uid)
 	if ctrl == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
@@ -1473,6 +1475,12 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 	if _, has := body["available_balance"]; has {
 		ignoredFields = append(ignoredFields, "available_balance")
 	}
+	// §F2-20261114 B3：map 写面白名单（消费键只有 holdings；available_balance 是刻意忽略的旧字段）。
+	// 其余未知键也一并如实回报，绝不静默吞；经 withIgnoredKeys 注入响应的 ignored_keys。
+	for _, k := range unknownMapKeys(body, nil, "holdings", "available_balance") {
+		ignoredFields = append(ignoredFields, k)
+	}
+	stashIgnoredKeys(r, ignoredFields)
 	for _, h := range req.Holdings {
 		// 定位持仓：优先手动 _fix；无 _fix 时回退到同代码的现有持仓（兼容信号创建的持仓，避免重复建档）
 		id := h.Code + fixSuffix

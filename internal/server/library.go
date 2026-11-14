@@ -301,11 +301,20 @@ func (s *Server) handleResearchBacktestToggle(w http.ResponseWriter, r *http.Req
 		return
 	}
 	// POST
+	// §F2-20261114 B 类补缺（2026-11-15 本地栈写探针锤出）：旧写法用 json.NewDecoder 裸解码，
+	// 未知键被静默吞，且 Enabled 的零值 false 会真的落盘——探针只发 {"_probe":true} 就把
+	// 夜间回测开关关掉了，正是方案 §F2 B1 禁止的「200 且无 ignored_keys 且状态变了」。
+	// 现改：① decodeStrictB 严格解码，未知键经 withIgnoredKeys 回报给调用端；
+	// ② Enabled 改 *bool，键缺失响亮 400，绝不把"没传"当成显式 false 写盘。
+	// English: strict decoding + required pointer flag; never apply a zero-value toggle.
 	var body struct {
-		Enabled bool `json:"enabled"`
+		Enabled *bool `json:"enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, 400, "无效请求体")
+	if _, ok := decodeStrictB(w, r, &body); !ok {
+		return
+	}
+	if body.Enabled == nil {
+		writeError(w, 400, "missing enabled (must be explicitly true or false)")
 		return
 	}
 	// §0929CFG-HIST：调度配置属全局文件这本账，纳入统一的写前快照/写后 diff 审计入口。
@@ -315,16 +324,16 @@ func (s *Server) handleResearchBacktestToggle(w http.ResponseWriter, r *http.Req
 	trace := s.snapshotConfigWrite(userIDFor(r), userIDFor(r), "scheduler")
 	cur := s.cfg.Get()
 	next := cur.Scheduler // 值拷贝：只改这一个开关，其余调度字段原样带过去
-	next.Nightly.BacktestEnabled = body.Enabled
+	next.Nightly.BacktestEnabled = *body.Enabled
 	if err := s.cfg.SetSchedulerConfig(&next); err != nil {
 		// 未落盘如实回 500（旧写法吞掉 Save 错误、照样回 200，属"降级报成功"家族）。
 		writeError(w, 500, "调度配置保存失败（本次开关不会在重启后保留）: "+err.Error())
 		return
 	}
 	opslog.Audit("config_scheduler_write", userIDFor(r), "scheduler("+trace.ledger+")",
-		fmt.Sprintf("backtest_enabled=%v %s", body.Enabled, trace.detail()))
+		fmt.Sprintf("backtest_enabled=%v %s", *body.Enabled, trace.detail()))
 	trace.audit(s)
-	writeJSON(w, 200, map[string]any{"enabled": body.Enabled})
+	writeJSON(w, 200, map[string]any{"enabled": *body.Enabled})
 }
 
 // reloadLibraries 对注册表内全部引擎热重载因子+形态战法库（启用/禁用/删除/重命名后立即生效），

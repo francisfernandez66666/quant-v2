@@ -15,8 +15,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/config"
@@ -131,5 +133,82 @@ func TestF8GatewayNotConfigured409(t *testing.T) {
 	var body map[string]string
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil || body["error"] != "gateway_not_configured" {
 		t.Fatalf("409 应带 error=gateway_not_configured, got %s", rr.Body.String())
+	}
+}
+
+// TestF2OptimizeClientIDIdempotent §184 D1：同一 client_id 连发两次只排一个任务、
+// 两次 task_id 相同，且重发回执显式 dedup=true（重复点击不会双花扫参配额）。
+func TestF2OptimizeClientIDIdempotent(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "opt.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	s := &Server{researchDB: db}
+	cid := "cid-f2-idem-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	call := func() (int, map[string]interface{}) {
+		t.Helper()
+		body := `{"objective":"profitfactor","client_id":"` + cid + `"}`
+		rr := httptest.NewRecorder()
+		r := f2WithUser(httptest.NewRequest(http.MethodPost, "/api/backtest/optimize", strings.NewReader(body)), "u_f2opt")
+		s.handleOptimizeEnqueue(rr, r)
+		var out map[string]interface{}
+		if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+			t.Fatalf("响应非 JSON: %v body=%s", err, rr.Body.String())
+		}
+		return rr.Code, out
+	}
+	code1, out1 := call()
+	code2, out2 := call()
+	if code1 != http.StatusAccepted || code2 != http.StatusAccepted {
+		t.Fatalf("两次都应 202, got %d/%d (%v / %v)", code1, code2, out1, out2)
+	}
+	if out1["task_id"] == nil || out1["task_id"] != out2["task_id"] {
+		t.Fatalf("同 client_id 的 task_id 必须相同: %v vs %v", out1["task_id"], out2["task_id"])
+	}
+	if out2["dedup"] != true {
+		t.Fatalf("重发应带 dedup=true（证明第二次没有再入队）: %v", out2)
+	}
+}
+
+// TestF8GatewayFailureStill502 §189 B2：网关真故障（HTTP 500）必须仍为 502，
+// honest-errors 纪律不得被 409 分档改没。
+func TestF8GatewayFailureStill502(t *testing.T) {
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusInternalServerError, "gateway exploded")
+	}))
+	defer gw.Close()
+	ctrl := trading.NewController(trading.NoopExecutor{}, nil, "u_f8b2",
+		config.QMTConfig{Enabled: true, GatewayURL: gw.URL, Token: "t"}, nil)
+	s := &Server{registry: &readyzStubRegistry{ctrl: ctrl}}
+	rr := httptest.NewRecorder()
+	s.handleQMTPendingReview(rr, httptest.NewRequest(http.MethodGet, "/api/qmt/pending-review", nil))
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("网关 500 应映射 502, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestF8GatewaySuccess200 §189 B3：网关 200 正常路径返回 200 + unresolved_count
+// （handler 实际键名，不是原方案误写的 unresolved_orders）。
+func TestF8GatewaySuccess200(t *testing.T) {
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"ts":"2026-11-14T15:00:00+08:00","active":"qmt","failover_enable":false,"unresolved_count":0,"unresolved_orders":[]}`))
+	}))
+	defer gw.Close()
+	ctrl := trading.NewController(trading.NoopExecutor{}, nil, "u_f8b3",
+		config.QMTConfig{Enabled: true, GatewayURL: gw.URL, Token: "t"}, nil)
+	s := &Server{registry: &readyzStubRegistry{ctrl: ctrl}}
+	rr := httptest.NewRecorder()
+	s.handleQMTPendingReview(rr, httptest.NewRequest(http.MethodGet, "/api/qmt/pending-review", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("网关 200 应映射 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("响应非 JSON: %v", err)
+	}
+	if _, ok := out["unresolved_count"]; !ok {
+		t.Fatalf("成功响应缺 unresolved_count: %s", rr.Body.String())
 	}
 }

@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
@@ -36,12 +35,15 @@ func m12Live(code string) map[string]*data.StockInfo {
 }
 
 // m12SeedCash 播种网关对账回报（real_account）；updated 距 now 的 age 决定新鲜/过期。
-// 时刻口径须与 cntime.Loc 一致（§CI 教训：UTC 机器上 8h 偏移会把新鲜值误判成过期）。
+// §20261115-CLOSEOUT：时刻必须与被测方同一把钟。newQMTEngine 把控制器/引擎时钟钉在
+// liveTestNow()（当日北京 10:15），旧写法却用真实 time.Now() 播种——凌晨 00:0x 跑时
+// 「1 分钟前」落在前一天 23:59，对 10:15 的判定基准差 10 小时，被 30 分钟窗判成过期，
+// fresh_value_downgrades / recovery_after_fresh 假红。改用夹具钟后任何真实时刻都稳定。
 func m12SeedCash(t *testing.T, db *store.DB, cash float64, age time.Duration) {
 	t.Helper()
 	if err := db.UpsertRealAccount(store.RealAccount{
 		UserID: "u_1", AvailableCash: cash,
-		UpdatedAt: time.Now().In(cntime.Loc).Add(-age).Format("2006-01-02 15:04:05"),
+		UpdatedAt: liveTestNow().Add(-age).Format("2006-01-02 15:04:05"),
 	}); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}

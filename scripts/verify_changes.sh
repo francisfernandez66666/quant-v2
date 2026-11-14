@@ -1348,7 +1348,7 @@ echo "==> 31 §H3 全局写端点收权 admin（/api/action + news showall/reana
 go test -count=1 ./internal/server/ -run 'TestH3ActionAdminOnly|TestH3NewsShowAllAndReanalyzeAdminOnly' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 grep -q 'POST /api/action", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleFixAction)' internal/server/server.go || { echo "--- FAIL: /api/action 路由回退 authMiddleware/adminMiddleware（§H3 越权复活）"; exit 1; }
 grep -q 'POST /api/news/reanalyze", s.strictPermMiddleware(auth.PermOpsAdmin, s.handleNewsReanalyze)' internal/server/server.go || { echo "--- FAIL: reanalyze 路由回退 authMiddleware/adminMiddleware（§H3）"; exit 1; }
-grep -q 'POST /api/news/showall", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleNewsShowAllToggle)' internal/server/server.go || { echo "--- FAIL: showall 路由回退 authMiddleware/adminMiddleware（§H3）"; exit 1; }
+grep -qF 'POST /api/news/showall", s.strictPermMiddleware(auth.PermConfigAdmin,' internal/server/server.go || { echo "--- FAIL: showall 路由回退 authMiddleware/adminMiddleware（§H3）"; exit 1; }
 grep -q 'admin && row.can_open' web/src/pages/Signals.jsx || { echo "--- FAIL: 信号页买入/忽略按钮管理员门控丢失（§H3 前端面）"; exit 1; }
 grep -q 'api.isAdmin() &&' web/src/pages/Hotspot.jsx || { echo "--- FAIL: 资讯页手动补推按钮管理员门控丢失（§H3 前端面）"; exit 1; }
 echo "ok - §H3 专项守卫通过（行为回归 1 组 + 静态锁 5 道）"
@@ -15693,9 +15693,17 @@ OLDF129
 printf '%s\n' "$BIG129" > "$W129/big.txt"
 rc129=0
 BIG129_TXT="$W129/big.txt" bash "$W129/old_form.sh" > "$W129/old.out" 2>&1 || rc129=$?
+OLD129="$(cat "$W129/old.out" 2>/dev/null || true)"
 CNT129=$((CNT129 + 1))
-[ "$rc129" = "141" ] \
-	|| fail129 "旧写法在同一份超限文本上退出码=${rc129}（期望 141＝写方被 SIGPIPE 打死）：要么本机管道缓冲不是 64KB、要么 pipefail 没生效——两种情况下 ①/② 面锁的都是一个不存在的成因，本段判红而不是放绿"
+# macOS bash 3.2 内建 printf 遇 EPIPE 不进程性死亡，只打印 "write error: Broken pipe" 并退 1；
+# GNU 环境里写方被 SIGPIPE 打死是 141。两者是同一成因（超限文本 + grep -q 提前关管），
+# 而 rc=0（旧写法干净判中）才说明体积根本没进判据路径——那一档仍必红，不许放绿。
+# English: builtin printf reports EPIPE as rc=1 + "Broken pipe" instead of dying by SIGPIPE (141);
+# both prove the same cause, while a clean rc=0 still fails this lock.
+if [ "$rc129" != "141" ]; then
+	{ [ "$rc129" = "1" ] && grep_q 'Broken pipe' OLD129; } \
+		|| fail129 "旧写法在同一份超限文本上退出码=${rc129}（期望 141＝写方被 SIGPIPE 打死，或 1 且夹具输出含 Broken pipe＝bash 内建 printf 的 EPIPE 形态）：要么本机管道缓冲不是 64KB、要么 pipefail 没生效——两种情况下 ①/② 面锁的都是一个不存在的成因，本段判红而不是放绿"
+fi
 
 # —— ③ 装配面：grep_q 的临时文件必须懒建在函数内部 ——
 # -collect 的内层脚本只搬「前言里的函数定义」，不搬前言里的普通语句（§111 的 CHECK 腿专门管这个名字）。
@@ -21794,20 +21802,24 @@ echo "==> 全部通过"
 
 
 # ── §PRECALC-V2/QMT直取（2026-11-11 收口批 d383400/e35aaf1）：价量 QMT 直取、非价量 gz 烘、B 机制 ──
-gw_chk "PRECALC 模板 init 拉起 QMT 日线下载（价量类直取的入口）" "$(grep -c '_download_day_bars(ContextInfo)' qmt_gateway/qmt_internal_strategy.py || true)" "1"
-gw_chk "PRECALC 官方下载 API 调用在模板内" "$(grep -c 'download_history_data2' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+# 2026-11-15 完整 -collect 首跑锤出：下面 4 条的期望值仍是 1，而模板/脚本演化后实读为
+# 2/4/2/2（定义+调用、注释+getattr+日志、常量+消费、路由+handler）。这些锁此前从未被整轮跑到过
+# （旧口径用分段门禁替代），所以陈旧值一直没现形。按仓内同款做法把等值锁同步到实读，不降成 ≥1。
+# English: exact-count locks refreshed to real readings; uniqueness was never the invariant.
+gw_chk "PRECALC 模板 init 拉起 QMT 日线下载（价量类直取的入口）" "$(grep -c '_download_day_bars(ContextInfo)' qmt_gateway/qmt_internal_strategy.py || true)" "2"
+gw_chk "PRECALC 官方下载 API 调用在模板内" "$(grep -c 'download_history_data2' qmt_gateway/qmt_internal_strategy.py || true)" "4"
 gw_chk "PRECALC bars_count 出厂 ≥60（覆盖 Mom60 因子窗口）" "$(grep -cE 'PARAMS\.get\("bars_count", (6[0-9]|7[0-9]|8[0-9]|9[0-9]|1[0-9][0-9])\)' qmt_gateway/qmt_internal_strategy.py || true)" "1"
 gw_chk "PRECALC build_context 接线 ctx bars（形态/龙头/因子战法的序列输入）" "$(grep -c '"bars": bars' qmt_gateway/qmt_internal_strategy.py || true)" "1"
 gw_chk "PRECALC build_context 透传估值/换手/财务/资金流/D1/热度（QMT 拿不到的才烘）" "$(grep -c 'valuation_series": pre.get("valuation_series")' qmt_gateway/qmt_internal_strategy.py || true)" "1"
 gw_chk "PRECALC data_health 覆盖率日志（下载失败绝不静默）" "$(grep -c 'data_health bars_coverage' qmt_gateway/qmt_internal_strategy.py || true)" "1"
 gw_chk "PRECALC v2 烘焙函数在 pregen（估值/换手/财务/资金流/D1/热度）" "$(grep -c 'def bake_bakeables' scripts/pregen_carrier_factors_gz.py || true)" "1"
-gw_chk "B机制 hot reload 自动补推（限频每小时）" "$(grep -c 'HOTRELOAD_DATARETRY' scripts/carrier_hot_reload_gz.py || true)" "1"
+gw_chk "B机制 hot reload 自动补推（限频每小时）" "$(grep -c 'HOTRELOAD_DATARETRY' scripts/carrier_hot_reload_gz.py || true)" "2"
 gw_chk "B机制 pregen ntfy 手机通知（连续失败/恢复）" "$(grep -c 'def _notify' scripts/pregen_carrier_factors_gz.py || true)" "1"
 gw_chk "B机制 precalc 状态文件（consec_fail/coverage 判定依据）" "$(grep -c 'def _write_status' scripts/pregen_carrier_factors_gz.py || true)" "1"
 gw_chk "隔离 report 过滤视图（成员手动账提醒不再泄进运营流）" "$(grep -c 'func (r \*Report) ViewExcludingForeign' internal/report/report.go || true)" "1"
 gw_chk "隔离 视图接线（引擎提醒生产者用过滤视图）" "$(grep -c 'viewRpt := e.rpt.ViewExcludingForeign' internal/engine/engine.go || true)" "1"
 gw_chk "交易列表 只认 live placed（纸面碎单不混入）" "$(grep -c 'EqualFold(strings.TrimSpace(it.Channel), "live")' internal/server/signal_trades_api.go || true)" "1"
-gw_chk "hithink key 前台配置端点（研究库主源凭据）" "$(grep -c 'handleAdminSetHithinkKey' internal/server/admin.go || true)" "1"
+gw_chk "hithink key 前台配置端点（研究库主源凭据）" "$(grep -c 'handleAdminSetHithinkKey' internal/server/admin.go || true)" "2"
 gw_chk "调度器 hithink_sync 步（ths_daily 停更根因修复）" "$(grep -c 'case "hithink_sync"' internal/scheduler/worker.go || true)" "1"
 gw_chk "回归测试锁在位（precalc v2 五用例）" "$(grep -c 'def test_bake_bakeables_shapes_align_consumers' qmt_gateway/tests/test_precalc_v2_20261111.py || true)" "1"
 
@@ -22125,23 +22137,14 @@ grep -qF 'UAT_SUMMARY_OUT' scripts/cloud_byte_uat.mjs || fail183 "缺 UAT_SUMMAR
 CNT183=$((CNT183 + 1))
 for k in readonly isProd skippedWrites sentWrites; do grep -qF "$k" scripts/cloud_byte_uat.mjs || fail183 "摘要缺字段 $k"; done
 CNT183=$((CNT183 + 1))
-# 反证 a：删 IS_PROD 判定 → 静态锁必须红（/tmp 镜像）
-M183=$(mktemp -d); cp scripts/cloud_byte_uat.mjs "$M183/"; sed -i '' 's/const IS_PROD = .*//' "$M183/cloud_byte_uat.mjs" 2>/dev/null || sed -i 's/const IS_PROD = .*//' "$M183/cloud_byte_uat.mjs"
-grep -qF 'const IS_PROD' "$M183/cloud_byte_uat.mjs" && fail183 "反证 a 镜像未生效（sed 没删掉 IS_PROD）"
-rm -rf "$M183"
+# §183 B1/B2/C1–C4：真实行为锁（本地 mock 服务，零生产发包）与 4 枚镜像变异反证。
+# 用例登记：F1_readonly_probe → scripts/cloud_byte_uat_readonly_test.mjs
 CNT183=$((CNT183 + 1))
-# 反证 b/c/d：字符串级镜像变异（UAT_ALLOW_WRITE 写死 true / 删 probe 硬闸 / 删白名单）
-python3 - <<'PYM183' || fail183 "反证 b/c/d：镜像变异自检未过"
-import shutil, tempfile, os
-src = open('scripts/cloud_byte_uat.mjs', encoding='utf-8').read()
-# b: ALLOW_WRITE 写死 true（压过生产判定）
-assert 'ALLOW_WRITE' in src
-# c: probe 硬闸串
-assert 'readonly mode' in src
-# d: 白名单串
-assert 'AUTH_PATHS.has(rawPath)' in src
-print("ok")
-PYM183
+[ -s scripts/cloud_byte_uat_readonly_test.mjs ] || fail183 "F1_readonly_probe 用例文件缺失"
+F1OUT183=$(node scripts/cloud_byte_uat_readonly_test.mjs 2>&1 || true)
+grep_q 'F1_READONLY_OK' F1OUT183 F || fail183 "F1_readonly_probe 行为锁未过：${F1OUT183##*$'\n'}"
+grep_q 'mutations=4/4 red' F1OUT183 F || fail183 "F1 C1–C4 变异反证不全红"
+echo "ok - §183 F1_readonly_probe：$(printf '%s\n' "$F1OUT183" | tail -1)"
 [ "$B183_FAILED" = "0" ] || exit 1
 echo "ok - §183 F1 探针只读闸锁通过（IS_PROD/ALLOW_WRITE/硬闸/白名单/摘要五字段/SUMMARY_OUT/失实声明清除，累计判定点 ${CNT183}）"
 echo ""
@@ -22202,8 +22205,52 @@ grep -qF "confirm: 'RESET_PAPER'" web/src/api/index.js || fail184 "前端 resetP
 grep -qF "confirm: 'RESET_POOL'" web/src/api/index.js || fail184 "前端 resetPaperPool 未带 confirm"
 grep -qF 'CLEAR_ALERTS' web/src/api/index.js || fail184 "前端 clearAlerts 未带 query confirm"
 grep -qF 'CLEAR_CONSULT_HISTORY' web/src/api/index.js || fail184 "前端 deleteConsultHistory 未带 query confirm"
+# §184 补项：E5（A 类 handler 不再用可选解码）/ B3（map 写面白名单在册）/
+# E6（DELETE 按账户路由）/ F1 六枚变异反证 / D1 幂等行为用例在册。
+CNT184=$((CNT184 + 1))
+test "$(grep -c 'if err := decodeOptJSON' internal/server/paper.go internal/server/handlers_fix.go | awk -F: '{s+=$NF} END{print s}')" = "0" || fail184 "A 类 handler 仍在用 decodeOptJSON 可选解码（E5）"
+# B3 六个 map 写面（非测试文件）逐条登记：前四条自带 ignored_keys/ignored_fields 回报，
+# 后两条经 unknownMapKeys 显式白名单；新增 map 写面必须同批补这里。
+for m184 in \
+  'handleSetStrategyConfig' 'handleSetD1Config' 'handlePaperPoolConfig' \
+  'handleAdminSetD1Config' 'handleFixSetHoldings' 'handleBacktestConfigPut'; do
+  grep -qF "$m184" internal/server/server.go internal/server/paper.go internal/server/admin.go internal/server/handlers_fix.go internal/server/backtest_config_api.go 2>/dev/null || fail184 "map/typed 写面 ${m184} 不在册（B3）"
+done
+grep -qF 'unknownMapKeys(body, reflect.TypeOf(config.StrategyConfig{})' internal/server/server.go || fail184 "config/strategy map 白名单缺失（B3）"
+grep -qF 'unknownMapKeys(raw, nil, "max_positions"' internal/server/paper.go || fail184 "paper/pool/config map 白名单缺失（B3）"
+grep -qF 'unknownMapKeys(body, nil, "holdings"' internal/server/handlers_fix.go || fail184 "holdings map 白名单缺失（B3）"
+CNT184=$((CNT184 + 1))
+grep -qF 'ctrl := s.liveCtrlFor(uid)' internal/server/handlers_fix.go || fail184 "DELETE /api/alerts 未按账户路由（E6：会清掉别人的消息）"
+grep -qF 's.liveCtrlFor(uid)' internal/server/server.go || fail184 "DELETE /api/consult/history 未按账户路由（E6）"
+grep -qF 'destructive_write' internal/server/server.go || fail184 "news/showall 破坏性审计缺失（E2 第 5 个）"
+# §20261115 补缺（本地栈写探针锤出）：backtest-toggle 旧裸解码会把 {"_probe":true}
+# 的零值 false 真的写进调度配置，且未知键无 ignored_keys 回报。两处形态 + 行为用例同时锁。
+CNT184=$((CNT184 + 1))
+grep -qF 'decodeStrictB(w, r, &body)' internal/server/library.go || fail184 "backtest-toggle 未接严格解码（B1 未知键静默生效）"
+grep -qF 'Enabled *bool' internal/server/library.go || fail184 "backtest-toggle 的 enabled 未改指针判空（零值 false 会落盘）"
+grep -qF 'func TestF2BacktestToggleUnknownKeyNeverFlips' internal/server/backtest_toggle_strict_test.go || fail184 "backtest-toggle 行为用例缺失"
+# B1 静态登记：19 个 B 类写端点中，18 个有 body 的必须逐条包 withIgnoredKeys；
+# 唯一无 body 的 DELETE /api/alerts/{id} 显式登记豁免（它不读 r.Body，无未知键可吞）。
+CNT184=$((CNT184 + 1))
+for r184 in \
+  'POST /api/config/strategy' 'POST /api/config/qmt' 'POST /api/config/regime' 'POST /api/config/runtime' \
+  'POST /api/config/d1' 'POST /api/short/toggle' 'POST /api/news/showall' 'PUT /api/consult/pro-mode' \
+  'POST /api/paper/config' 'POST /api/paper/strategies' 'POST /api/paper/pool/config' \
+  'PUT /api/research/backtest-config' 'POST /api/research/backtest-toggle' 'POST /api/research/library/{id}/rename' \
+  'POST /api/holdings"' 'POST /api/holdings/pnl-offset' 'POST /api/admin/users/{id}/config/strategy' \
+  'POST /api/admin/users/cleanup'; do
+  L184=$(grep -F "HandleFunc(\"$r184" internal/server/server.go | head -1 || true)
+  [ -n "$L184" ] || fail184 "B 类路由 $r184 不在册"
+  printf '%s' "$L184" | grep -qF 'withIgnoredKeys' || fail184 "B 类路由 $r184 未接 ignored_keys 回报"
+done
+grep -qF 'HandleFunc("DELETE /api/alerts/{id}"' internal/server/server.go || fail184 "单条 DELETE 豁免登记对象缺失"
+
+grep -qF 'TestF2OptimizeClientIDIdempotent' internal/server/uat_fix_20261114_test.go || fail184 "D1 client_id 幂等行为用例缺失"
+MUTOUT184=$(python3 scripts/uat_fix_20261114_mutations.py 184 2>&1 || true)
+grep_q 'MUT_184_COUNT=8' MUTOUT184 F || fail184 "§184 八枚变异反证未全红：${MUTOUT184##*$'\n'}"
+echo "ok - §184 八枚变异反证全红 + B3/E5/E6/D1/backtest-toggle 补项"
 [ "$B184_FAILED" = "0" ] || exit 1
-echo "ok - §184 F2 写面门禁锁通过（A类confirm×4+balance指针+cleanup路B+严格解码+18路由包装+map白名单+D类幂等+审计+前端7函数，累计判定点 ${CNT184}）"
+echo "ok - §184 F2 写面门禁锁通过（A类confirm×4+balance指针+cleanup路B+严格解码+19端点登记+map白名单+D类幂等+backtest-toggle补缺+审计+前端7函数，累计判定点 ${CNT184}）"
 echo ""
 
 echo "==> 185 §20261114-F3（Caddy /readyz 反代：现役模板 handle 块 / 部署第15条探针 readyz_json / 退役模板标注 / Go 三用例在册 / 负锁不进 /api/readyz）..."
@@ -22230,6 +22277,8 @@ CNT185=$((CNT185 + 1))
 for tc in TestReadyz_DBFalse TestReadyz_GatewayFalse TestReadyz_OK; do
 	grep -qF "func ${tc}(" internal/server/readyz_test.go || fail185 "缺 Go 用例 ${tc}"
 done
+MUTOUT185=$(python3 scripts/uat_fix_20261114_mutations.py 185 2>&1 || true)
+grep_q 'MUT_185_COUNT=1' MUTOUT185 F || fail185 "§185 C2 变异反证未红：${MUTOUT185##*$'\n'}"
 [ "$B185_FAILED" = "0" ] || exit 1
 echo "ok - §185 F3 readyz 锁通过（Caddy块+部署探针+退役标注+三用例，累计判定点 ${CNT185}）"
 echo ""
@@ -22252,6 +22301,14 @@ CNT186=$((CNT186 + 1))
 grep -qF '2026-11-13' internal/store/real_positions.go || fail186 "新裁决（2026-11-13 只补不拉）不在册"
 CNT186=$((CNT186 + 1))
 test "$(git diff -U0 internal/store/real_positions.go | grep -E '^[+-][^+-]' | grep -vE '^[+-][[:space:]]*(//|--)' | wc -l | tr -d ' ')" = "0" || fail186 "real_positions.go 有非注释改动（F5 硬约束：只许动 // 与 SQL -- 注释行）"
+# §186 A1/A2：本地门禁必须真跑 go test 版（CLI 与 go test 两套判据不同），退出码被收住。
+# 注意：本行是仓内该命令的**唯一**出现处，A1 的 grep -c 才等于 1（不要在别处抄这串）。
+CNT186=$((CNT186 + 1))
+RC186=0
+go test -count=1 ./internal/commentcheck/ >/dev/null 2>&1 || RC186=$?
+[ "${RC186}" = "0" ] || fail186 "go test 版注释棘轮未过（RC186=${RC186}，本地绿/CI 红分叉）"
+MUTOUT186=$(python3 scripts/uat_fix_20261114_mutations.py 186 2>&1 || true)
+grep_q 'MUT_186_COUNT=2' MUTOUT186 F || fail186 "§186 C1/C2 变异反证未全红：${MUTOUT186##*$'\n'}"
 [ "$B186_FAILED" = "0" ] || exit 1
 echo "ok - §186 F5 注释棘轮锁通过（CLI 闸+新裁决在册+旧文案清零+SQL 零改动，累计判定点 ${CNT186}）"
 echo ""
@@ -22274,6 +22331,9 @@ test "$(grep -cF '防枚举底线' internal/server/server.go)" -ge 2 || fail187 
 CNT187=$((CNT187 + 1))
 grep -qF 'func TestF6WrongPasswordNeverLeaksState' internal/auth/login_order_f6_test.go || fail187 "缺停用态防枚举用例"
 grep -qF 'func TestF6WrongPasswordNeverLeaksExpiry' internal/auth/login_order_f6_test.go || fail187 "缺过期态防枚举用例"
+grep -qF 'func TestF6LoginFailureBodiesByteIdentical' internal/server/login_shape_f6_test.go || fail187 "U1/U2/U5/U6 HTTP 字节全等用例缺失"
+MUTOUT187=$(python3 scripts/uat_fix_20261114_mutations.py 187 2>&1 || true)
+grep_q 'MUT_187_COUNT=2' MUTOUT187 F || fail187 "§187 M1/M2 变异反证未全红：${MUTOUT187##*$'\n'}"
 [ "$B187_FAILED" = "0" ] || exit 1
 echo "ok - §187 F6 登录分码锁通过（顺序静态锁+注释对齐+两用例在册，累计判定点 ${CNT187}）"
 echo ""
@@ -22296,6 +22356,8 @@ CNT188=$((CNT188 + 1))
 test "$(grep -cF "request('/api/review/positions', { method: 'POST' })" web/src/api/index.js)" = "0" || fail188 "存在裸调形态（timeout 被摘掉）"
 CNT188=$((CNT188 + 1))
 grep -qF 'REVIEW_TIMEOUT_MS' web/src/__tests__/review_timeout.test.jsx || fail188 "缺 review_timeout 用例"
+MUTOUT188=$(python3 scripts/uat_fix_20261114_mutations.py 188 2>&1 || true)
+grep_q 'MUT_188_COUNT=1' MUTOUT188 F || fail188 "§188 C1 变异反证未红：${MUTOUT188##*$'\n'}"
 [ "$B188_FAILED" = "0" ] || exit 1
 echo "ok - §188 F7 复盘超时锁通过（常量+接线+负锁+用例在册，累计判定点 ${CNT188}）"
 echo ""
@@ -22320,6 +22382,10 @@ CNT189=$((CNT189 + 1))
 test "$(grep -rcF 'gateway_not_configured' web/src | grep -v ':0' | wc -l | tr -d ' ')" -ge 2 || fail189 "前端接线 <2 处（409 仍被当通用失败）"
 CNT189=$((CNT189 + 1))
 grep -qF 'func TestF8GatewayNotConfigured409' internal/server/uat_fix_20261114_test.go || fail189 "缺 409 行为用例"
+grep -qF 'func TestF8GatewayFailureStill502' internal/server/uat_fix_20261114_test.go || fail189 "B2 真故障仍 502 用例缺失"
+grep -qF 'func TestF8GatewaySuccess200' internal/server/uat_fix_20261114_test.go || fail189 "B3 成功 200 用例缺失"
+MUTOUT189=$(python3 scripts/uat_fix_20261114_mutations.py 189 2>&1 || true)
+grep_q 'MUT_189_COUNT=1' MUTOUT189 F || fail189 "§189 C1 变异反证未红：${MUTOUT189##*$'\n'}"
 [ "$B189_FAILED" = "0" ] || exit 1
 echo "ok - §189 F8 网关分档锁通过（哨兵+字面量冻结+409分档+前端+用例，累计判定点 ${CNT189}）"
 echo ""
