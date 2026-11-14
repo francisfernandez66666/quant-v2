@@ -1,3 +1,4 @@
+# 【已退役模板，勿套用】（2026-11-14 F3 标注）：本模板连 /livez 都没有反代——健康探针会落 SPA 兜底成 200 HTML（判据永远绿的假探针）。现役模板是 deploy/gz-ubuntu/Caddyfile（含 /livez + /readyz 反代）。
 # quant-trading-v2 HTTPS 反向代理 + 前端静态托管（Caddy）
 # 部署：见 scripts/deploy_seoul.sh。Caddy 自动申请/续期 Let's Encrypt 证书，无需手动管证书。
 #

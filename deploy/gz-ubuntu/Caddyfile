@@ -34,6 +34,13 @@ quant-trading.top {
 		reverse_proxy 127.0.0.1:8081
 	}
 
+	# §F3-20261114：就绪探针必须与 /livez 同等反代，否则落 SPA 兜底＝判据永远绿
+	# （11-14 实测公网 /readyz 返回 200 text/html index.html——后端的 503 分支形同虚设）。
+	# 注意：后端注册的是裸路径 GET /readyz，不是 /api/readyz，不能合进 handle /api/*。
+	handle /readyz {
+		reverse_proxy 127.0.0.1:8081
+	}
+
 	# 初始化入口不公开；显式 404，避免被 SPA 兜底成 200 HTML
 	handle /setup {
 		respond 404

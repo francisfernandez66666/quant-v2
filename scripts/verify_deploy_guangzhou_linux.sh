@@ -122,6 +122,22 @@ run_probes() { # $1=读数文本；依赖全局 EXPECT_COMMIT
 
   v="$(get JOURNAL_ERRORS)"
   if [ "${v:-1}" -eq 0 ] 2>/dev/null; then probe "journald_clean" 0 "errors=$v"; else probe "journald_clean" 1 "errors=${v:-missing}"; fi
+
+  # §F3-20261114 第 15 条探针（全套第一条健康探针——修复前 14 条里既无 /livez 也无 /readyz）：
+  # /readyz 必须走 Caddy 反代到后端（content-type=application/json，body 是 5 键 JSON，
+  # 不是落 SPA 兜底的 200 text/html）。判据按 §185 口径：状态码 ∈ {200,503} 且与 body 的
+  # ok 一致——生产 qmt.enabled=false 时 gateway=false ⇒ ok=false ⇒ 503 是「诚实」，不是故障；
+  # 所以本探针认「结构 + 一致性」，不认「必须 200」（见 §185 B3/上线说明）。
+  v="$(get READYZ_CODE)"
+  local rd_json rd_ok rd_ct
+  rd_json="$(get READYZ_IS_JSON)"
+  rd_ok="$(get READYZ_OK)"
+  if { [ "$v" = "200" ] || [ "$v" = "503" ]; } && [ "$rd_json" = "yes" ] \
+     && { { [ "$v" = "200" ] && [ "$rd_ok" = "true" ]; } || { [ "$v" = "503" ] && [ "$rd_ok" = "false" ]; } }; then
+    probe "readyz_json" 0 "code=$v ok=$rd_ok json=$rd_json"
+  else
+    probe "readyz_json" 1 "code=${v:-missing} ok=${rd_ok:-missing} json=${rd_json:-missing} (SPA fallback or key mismatch)"
+  fi
 }
 
 summary() {
@@ -144,7 +160,10 @@ HTTPS_HOME_CODE=200
 SETUP_CODE=404
 ANON_API_CODE=401
 U3_QMT_ENABLED=false
-JOURNAL_ERRORS=0"
+JOURNAL_ERRORS=0
+READYZ_CODE=503
+READYZ_IS_JSON=yes
+READYZ_OK=false"
   run_probes "$GREEN"
   GREEN_OK="$FAIL"
   PASS=0; FAIL=0; FAILED_IDS=""
@@ -182,6 +201,17 @@ else
   emit WEB_HAS_COMMIT no
 fi
 emit HTTPS_HOME_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/ 2>/dev/null)"
+# §F3-20261114 /readyz 读数：状态码 + content-type 是否 JSON + body 的 ok 布尔。
+# 判据只消费布尔位与状态码，不回显 body（响应只含 5 个布尔 + build，无敏感字段）。
+READYZ_CODE="$(curl -ksS -o /tmp/readyz_deploy_probe.json -w '%{http_code}' --max-time 15 https://quant-trading.top/readyz 2>/dev/null)"
+emit READYZ_CODE "$READYZ_CODE"
+if head -c 1 /tmp/readyz_deploy_probe.json 2>/dev/null | grep -q '{' && curl -ksS -o /dev/null -w '%{content_type}' --max-time 15 https://quant-trading.top/readyz 2>/dev/null | grep -q 'application/json'; then
+  emit READYZ_IS_JSON yes
+else
+  emit READYZ_IS_JSON no
+fi
+emit READYZ_OK "$(python3 -c "import json;print(str(json.load(open('/tmp/readyz_deploy_probe.json')).get('ok')).lower())" 2>/dev/null || echo unknown)"
+rm -f /tmp/readyz_deploy_probe.json
 emit SETUP_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/setup 2>/dev/null)"
 emit ANON_API_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/api/status 2>/dev/null)"
 # Only the boolean is emitted; never echo any credential value from auth.json.
