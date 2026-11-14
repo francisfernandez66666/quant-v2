@@ -174,8 +174,10 @@ type ignoredInjector struct {
 	code int
 }
 
+// WriteHeader 记录下游 handler 写入的状态码并透传给真实 ResponseWriter（注入只改 body，不改状态码）。
 func (w *ignoredInjector) WriteHeader(code int) { w.code = code; w.ResponseWriter.WriteHeader(code) }
 
+// Write 缓冲下游 handler 的响应体，flush 前不向真实连接写任何字节（防"原体+注入体"重复输出）。
 func (w *ignoredInjector) Write(b []byte) (int, error) { return w.buf.Write(b) }
 
 // withIgnoredKeys 包装 handler：未知键在册时把 ignored_keys 并入 JSON 响应对象；

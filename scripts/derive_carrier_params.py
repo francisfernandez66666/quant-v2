@@ -999,9 +999,13 @@ def resolve_extras(carrier_values, params, sizing_defaults, extras=None):
                 merged[key] = (value, source)
                 continue
             # 参数文件里已有、且与模块声明表不一致：以已有值为准并出声（不悄悄改钱闸）。
+            # §20261114 修复：kept=file 分支必须把键**记进值表**（merged[key]=(现值, file-kept)）——
+            # 此前 continue 直接跳过，键从值表里消失，被 coverage 误判成孤儿
+            # （scalar_bands 现网已烘焙出真值、模板是空 {}，两者必然"不一致"，于是恒红）。
             print("DERIVE_TABLE_CONFLICT key=%s file=%s table=%s kept=file"
                   % (key, json.dumps(params[key], ensure_ascii=True),
                      json.dumps(value, ensure_ascii=True)))
+            merged[key] = (params[key], "file-kept:%s" % source)
             continue
         merged[key] = (value, source)
 
@@ -1207,6 +1211,11 @@ def main():
         missing = []
         diff = []
         for key in sorted(all_values):
+            if key in REGISTERED_OVERRIDES:
+                # §20261114 尺子归一：--write 对 REGISTERED_OVERRIDES 是"跳过不改"（owner
+                # 已裁决的故意背离 Go 出厂值），--check 也必须同尺跳过——否则 write 说
+                # unchanged=0、check 却报 DERIVE_CHANGED，两把尺子打架，门禁永远红。
+                continue
             if key not in params:
                 missing.append(key)
             elif _norm(params[key]) != _norm(all_values[key][0]):

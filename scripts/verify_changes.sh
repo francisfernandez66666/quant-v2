@@ -9581,7 +9581,7 @@ eq111 "$GPY111" 'def read_lines(path, errors=None):' 1 '读文本的默认口径
 neg111 "$GPY111" 'def read_lines(path):' '旧签名（没有 errors 形参＝日志与源码一个口径，正是打挂整轮那份）不许复活'
 eq111 "$GPY111" 'with open(path, encoding="utf-8", errors=errors) as fh:' 1 'errors 真的透传进了 open（只在 docstring 里讲道理＝零判据；这一串只出现在唯一的读文件处）'
 eq111 "$GPY111" 'log = read_lines(log_path, errors="replace")' 1 '只有**段日志**这一入口容错：日志是别人写的字节（go test/pytest/ssh 回来的 PS 读数），一个坏字节不该把整遍结论抹掉'
-eq111 "$GPY111" 'lines = read_lines(gate)' 6 '其余六个入口（sections/helpers/emit/classify/summary/check）读**门禁源码**一律严格：源文件里有非法字节＝解析器读的不是人们以为在看的那份脚本，派生读数全部作废比假装能读更安全'
+eq111 "$GPY111" 'lines = read_lines(gate)' 10 '十个入口（sections/helpers/emit/classify/summary/check＋2026-11-10 批新增的装配/镜像入口；2026-11-14 复核实读）读**门禁源码**一律严格；其余六个入口（sections/helpers/emit/classify/summary/check）读**门禁源码**一律严格：源文件里有非法字节＝解析器读的不是人们以为在看的那份脚本，派生读数全部作废比假装能读更安全'
 
 # ── ②c §P2-M：门禁自己的日志面不许按字节截断 ──
 # 三把尺子都是「代码行」锚（`^[[:space:]]*[^#]`）而不是全文计数：本段上面那份说明注释里
@@ -9977,8 +9977,12 @@ prelude111 "$IN111" 104 > "$PRE104"
 N_PYTEST=$(grep -cF 'py_tests() {' "$PRE104" 2>/dev/null || true)
 N_NEED=$(grep -cF 'gate_need() {' "$PRE104" 2>/dev/null || true)
 N_GW=$(grep -cF 'gw_code_hits() {' "$PRE104" 2>/dev/null || true)
-if [ "${N_PYTEST:-0}" != "1" ] || [ "${N_NEED:-0}" != "1" ] || [ "${N_GW:-0}" != "1" ]; then
-	echo "--- FAIL: §111 装配搬运腿 ${CNT111}（§104 内层脚本的**前置搬运区**里 py_tests=${N_PYTEST} gate_need=${N_NEED} gw_code_hits=${N_GW}，应各 1）"
+# §20261114 锁形订正：875e1a6 的并行装配改造后，前置搬运会把**相邻定义**一起带进
+# prelude（gw_* 那几枚单行走内 `}` 的函数体在 parse() 里共用一块），所以计数不再是恰好 1。
+# 判据要守的是"少搬一个函数＝collect 里 command not found"，故改为每枚 ≥1（缺失仍红），
+# "重复"本身无害（后定义覆盖前定义，函数体逐字同源）。
+if [ "${N_PYTEST:-0}" -lt 1 ] || [ "${N_NEED:-0}" -lt 1 ] || [ "${N_GW:-0}" -lt 1 ]; then
+	echo "--- FAIL: §111 装配搬运腿 ${CNT111}（§104 内层脚本的**前置搬运区**里 py_tests=${N_PYTEST} gate_need=${N_NEED} gw_code_hits=${N_GW}，应各 ≥1）"
 	echo "    少搬一个函数＝那段在收集模式里报 command not found，读数写着「§N 缺陷」，而真正坏的是装配器"
 	exit 1
 fi
@@ -14091,7 +14095,7 @@ neg_code120 "$PY120" 'heads.append((int(m.group(1))' '解析侧的旧 int() 不�
 eq_code120 "$PY120" 'sid = m.group(1)' 1 'classify 取标记里的编号同样按字符串'
 neg_code120 "$PY120" 'sid = int(m.group(1))' 'classify 的旧 int() 不许复活'
 eq_code120 "$PY120" 'skipped[sm.group(1)] = sm.group(2)' 1 'SKIP 桶的键按编号字符串存'
-eq_code120 "$PY120" 'text, prelude_names = build_inner(gate, start_id, root)' 1 'emit 不再 int(start_id)（带后缀起点必须能被装配出来）'
+eq_code120 "$PY120" 'text, prelude_names = build_inner(gate, start_id, None, root)' 1 'emit 不再 int(start_id)（带后缀起点必须能被装配出来；2026-11-10 批起 build_inner 带 prelude 显式入参，锁串随签名同步）'
 neg_code120 "$PY120" 'build_inner(gate, int(start_id), root)' 'emit 的旧 int() 不许复活'
 # 汇总认桶：尺子从"是不是数字"换成"在不在派生段清单里"，清单外单列一档
 eq_code120 "$PY120" 'if t in id_set:' 1 'PASS/FAIL/SILENT 三桶按清单认（isdigit 会把带后缀编号安静丢掉＝四桶少一段，还查不出是谁丢的）'
@@ -14101,7 +14105,7 @@ eq_code120 "$PY120" 'balance = "BOGUS_ID:"' 1 '清单外编号单列一档（既
 # 段的先后按文件位置比，不按编号比大小（编号是字符串时字典序会说谎）
 eq_code120 "$PY120" 'if cstart <= pstart or cs in own_sections:' 1 '跨段 helper 的"更晚的段"按行序判'
 neg_code120 "$PY120" 'if cs <= producer or cs in own_sections:' '旧的按编号比大小不许复活（实测不报 TypeError，而是安静少搬 helper，见反证 N5）'
-eq_code120 "$PY120" 'order = {sid: k for k, sid in enumerate(ids)}' 2 '位置表两处各一枚（emit 的前置搬运／summary 的点名列序）'
+eq_code120 "$PY120" 'order = {sid: k for k, sid in enumerate(ids)}' 3 '位置表三处各一枚（emit 前置搬运／summary 点名列序＋2026-11-10 批 classify 侧新增第三处；锁值随实现同步）'
 eq_code120 "$PY120" 'if not any(order[c] >= start_pos for c in consumers if c in order):' 1 '搬运判据走位置表'
 eq_code120 "$PY120" 'order.get(sid2, -1) < start_pos' 1 '取"更早段里的同名定义"也走位置表'
 # 重复编号当场炸（判据一枚＋文案点名一枚）
@@ -14372,12 +14376,12 @@ SECC120=$(cnt120)
 # ── E. 反证：五处口径各退回旧写法一次，对应的腿必须在同一个件上转红 ──
 # N1 段头只捕数字＋摘掉撞号守卫＝当年"116 vs 114 且原地打转"的完整复现：镜像必须打遍数上限
 #   （不摘守卫的话解析期先炸，"打转"这一形态就复现不出来——两处都得退旧写法才凑成当年的形状）。
-mk_mut120 'py_n1.py' '\d+[a-z]?' '\d+' 'if len(rows) > 1:' 'if False:'
+mk_mut120 'py_n1.py' '(\d+[a-z]?)([^"]*)' '(\d+)([^"]*)' 'if len(rows) > 1:' 'if False:'
 p2l120_make "$W120/mut/py_n1.py" "$W120/mirror_n1"
 red120 "N1 段头只捕数字（无守卫）" "整轮红且点名「遍数超过上限」" red_collect120 "$W120/mirror_n1" "遍数超过上限"
 
 # N2 emit 的 int(start_id) 复活：带后缀起点装不出来 → 装配腿红。
-mk_mut120 'py_n2.py' 'text, prelude_names = build_inner(gate, start_id, root)' 'text, prelude_names = build_inner(gate, int(start_id), root)'
+mk_mut120 'py_n2.py' 'text, prelude_names = build_inner(gate, start_id, None, root)' 'text, prelude_names = build_inner(gate, int(start_id), None, root)'
 red120 "N2 emit 退回 int()" "非零退出" leg_emit120 "$MUT120" "$W120/seq_gate.sh" "2b" 'echo "==> 2b ' ''
 
 # N3 MARK_RE 退回只认数字：带后缀的段标记在分类器里不存在 → STARTED 认不出 2b。
@@ -17858,14 +17862,16 @@ N144=$(grep -cE 'strict(All)?Perm(s)?Middleware\(auth\.PermTradingAdmin|strictAn
 # 27 -> 28（§CARRIER-UPDATE 2026-11-05）：POST /api/qmt/carrier/update 是**写面**——
 # 它能让别人家里的物理机换掉正在跑的策略文件并重启，所以按 trading_admin 而不是 quant_trade；
 # 同一批的 manifest/ack 两条走 qmtReportMiddleware（盒子那把钥匙），不在这条计数里。
-[ "$N144" -eq 28 ] || fail144 "trading_admin 严格路由应为 28，实得 $N144"
+# 28 -> 29（§20261113-LEDGER-TOPN：GET /api/qmt/trade-results 台账读面入账；2026-11-14 复核实读）
+[ "$N144" -eq 29 ] || fail144 "trading_admin 严格路由应为 29，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server.go || true)
 [ "$N144" -eq 14 ] || fail144 "user_admin 严格路由应为 14，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermConfigAdmin' internal/server/server.go || true)
 # 21→23：§SUBSCRIPTION-A 裁决 4/12 开了 GET/POST /api/config/runtime（runtime 段行情开关写面）
-[ "$N144" -eq 23 ] || fail144 "config_admin 严格路由应为 23，实得 $N144"
+# 23 -> 24（2026-11-13 board-filter 批：POST /api/board-filter/toggle 入账；2026-11-14 复核实读）
+[ "$N144" -eq 24 ] || fail144 "config_admin 严格路由应为 24，实得 $N144"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermOpsAdmin' internal/server/server.go || true)
 [ "$N144" -eq 14 ] || fail144 "ops_admin 严格路由应为 14，实得 $N144"
@@ -19613,9 +19619,13 @@ if grep -vE '^[[:space:]]*#' "$WD167" | grep -qE '已成|已撤|部撤|废单|�
 	fail167 "watchdog 里出现委托状态中文串（终态口径的第二份）"
 fi
 CNT167=$((CNT167 + 1))
-if grep -nE 'DayOfWeek|Saturday|Sunday' "$WD167" >/dev/null 2>&1; then
-	fail167 "watchdog 自己判周末＝第三份交易日历（真源在 trading_calendar）"
-fi
+# §KEEPALIVE-20261112 裁决：日历模块/解释器缺失时的降级=「非周末即交易日」+显式日志
+# （宁可休市日多开一次会话，也不能交易日整天漏拉）。负锁随之改形：DayOfWeek 只许出现
+# 在这条**显式降级**路径里（恰好 2 处）且降级必须打日志，其余任何"自己判日历"仍禁。
+_dow167=$(grep -cE 'DayOfWeek|Saturday|Sunday' "$WD167" || true)
+[ "${_dow167:-0}" -eq 4 ] || fail167 "watchdog DayOfWeek/Saturday/Sunday 出现 ${_dow167:-0} 行（只许 §KEEPALIVE-20261112 降级路径的 4 行＝第三份日历又长出来了）"
+grep -qF 'no_trading_calendar' "$WD167" || fail167 "watchdog 降级路径缺显式日志 no_trading_calendar（静默降级＝原缺陷形态）"
+grep -qF 'trading_calendar.py' "$WD167" || fail167 "watchdog 丢失 trading_calendar 真源调用（降级取代了主路径）"
 CNT167=$((CNT167 + 1))
 if grep -nE '^[^#]*Start-Process[^\r\n]*XtItClient' "$WD167" >/dev/null 2>&1; then
 	fail167 "watchdog 在会话里直起 QMT 客户端（进程随会话被杀＝10-29 实录）"
@@ -20032,7 +20042,8 @@ CNT170=$((CNT170 + 1))
 grep -qF 'func (s *Server) strictAnyPermsMiddleware(perms ...string)' "$SV170" || fail170 "缺 strictAnyPermsMiddleware"
 CNT170=$((CNT170 + 1))
 N170R=$(grep -c 'strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)\|strictAnyPermsMiddleware(auth.PermFundsAdmin, auth.PermQuantTrade)' "$SV170" || true)
-[ "${N170R:-0}" -eq 12 ] || fail170 "开放给 quant_trade 的路由数是 ${N170R}（应为 12：config/qmt GET+POST、t-live/rounds、funds/today、signals/decisions、positions/real、qmt/state|trades|orders、qmt/halt、qmt/cancel、GET qmt/broker）"
+# 12 -> 13（§20261113-LEDGER-TOPN：GET /api/signals/trades 与 GET /api/qmt/trade-results 两个台账读面并进 quant_trade；2026-11-14 复核实读）
+[ "${N170R:-0}" -eq 13 ] || fail170 "开放给 quant_trade 的路由数是 ${N170R}（应为 13：config/qmt GET+POST、t-live/rounds、funds/today、signals/decisions|trades、positions/real、qmt/state|trades|trade-results|orders、qmt/halt、qmt/cancel、GET qmt/broker）"
 
 # ③ 负锁：运营面仍被 trading_admin 独占（**按方法分条判**——同一路径 GET/POST 一边开放一边锁死
 #    才是这条的正确形状；整条路径进负锁会把"朋友看不见自己腿的契约读数"那半也一起焊死）
@@ -20645,7 +20656,7 @@ if command -v go >/dev/null 2>&1; then
 	grep_q '"live_rules"' LIVE_PJT F || fail173 "载体 params 里没有 live_rules 块（现网规则没烘进去）"
 	LIVE_OUT=$(python3 scripts/sync_live_rules.py --check 2>&1 || true)
 	grep_q "LIVE_RULES_RESULT=OK" LIVE_OUT F || fail173 "现网规则派生对账未过：${LIVE_OUT##*$'\n'}"
-	grep_q "LIVE_RULES_STRATEGIES=16" LIVE_OUT F || fail173 "现网打开的战法没随包（16 枚白名单对不上）"
+	grep_q "LIVE_RULES_STRATEGIES=17" LIVE_OUT F || fail173 "现网打开的战法没随包（17 枚白名单对不上；2026-11-10 v06 白名单 17 项实弹，2026-11-14 复核实读）"
 	echo "   [§173 ⑩c] 现网规则随包：$(printf '%s\n' "$LIVE_OUT" | grep -E 'LIVE_RULES_SECTIONS|LIVE_RULES_FACTORS' | tr '\n' ' ')"
 	# 参数文件与 Go 必须逐键同源（这条就是"没有手抄"的可执行定义）
 	grep_q "DERIVE_CHANGED_TOTAL=0" DERIVE_OUT F || fail173 "参数文件与 Go 出厂值不一致（先跑 --write；别改 Go 去迁就一个抄错的数）"
@@ -20717,11 +20728,11 @@ CNT173=$((CNT173 + 1))
 ITT=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
 grep_q "QMTF-Carrier-Update" ITT F || fail173 "每日收盘后的自动更新没有触发器"
 grep_q 'St = "15:40"' ITT F || fail173 "载体更新任务的时间锚漂了（15:40 选在收盘快照与关闭腿之后）"
-grep_q "TASKS_REREAD_MATCH=1 tasks=6" ITT F || fail173 "注册后复读仍少写 tasks=6（第六条 QMTF-Gateway-Start 起就锁 6；少注册一条也不会红＝恒绿锁）"
+grep_q "TASKS_REREAD_MATCH=1 tasks=7" ITT F || fail173 "注册后复读仍少写 tasks=6（第六条 QMTF-Gateway-Start 起就锁 6；少注册一条也不会红＝恒绿锁）"
 grep_q "reason=no_carrier_updater" ITT F || fail173 "缺更新器时仍会注册一个空跑任务（空跑比不注册更坏）"
 CNT173=$((CNT173 + 1))
 SIZ=$(cat qmt_gateway/qmt_internal_strategy.py || true)
-grep_q "sizing_cap(ctx, positions)" SIZ F || fail173 "沙箱买入分支又不问动态仓位（链在产物里没人调＝等于没有，本批已犯一次）"
+grep_q "sizing_cap(ctx, positions, intent, pending_rows)" SIZ F || fail173 "沙箱买入分支又不问动态仓位（链在产物里没人调＝等于没有，本批已犯一次）"
 grep_q "sizing_below_lot" SIZ F || fail173 "沙箱压额后不重算股数（沿用原金额＝绕过帽）"
 grep_q "sizing_amount_unavailable" SIZ F || fail173 "额度算不出时不再 fail-closed（把算不出过成一笔真单是最贵的形状）"
 CNT173=$((CNT173 + 1))
@@ -21281,10 +21292,10 @@ grep_q 'reason": "strategy_switch_off"' LEXT F || fail173 "开关拦下的信号
 for k in "enabled_strategies" "factor_rules" "unmapped_strategies" "strategy_kind_to_go"; do
 	grep_q "\"$k\"" PJT F || fail173 "params 缺 ${k}（tab 口径没烘进载体）"
 done
-# strategy_version 锚随真实版本走：11-09 15:15 批（fa6939b）把规则全部送进包时
-# 已 bump 到 v05-20261109（朋友真机已按 v05 实弹）。锚停在 v04 会让"换规则表
-# 忘 bump 版本"这条真缺陷永远测不出来——它判不了陈旧版本，只判我也看不见的假绿。
-grep_q '"v05-20261109"' PJT F || fail173 "规则表换了但版本没 bump（win 包无法与上一版区分；params strategy_version 应与最近一次实弹配菜批一致）"
+# strategy_version 锚随真实版本走：本地烘焙输入 params 现在是 v16-20261111
+# （gz 热更新链再按当日三入载荷派生 v26+ 版本，见 AGENTS §热更新链）。锚停在 v05 是
+# 11-09 批后遗留的陈旧锁，2026-11-14 复核实读后同步：换规则表忘 bump 仍当场红。
+grep_q '"v16-20261111"' PJT F || fail173 "规则表换了但版本没 bump（win 包无法与上一版区分；params strategy_version 应与最近一次实弹配菜批一致）"
 BUILDRT=$(cat "$BUILDR" || true)
 grep_q '"query_stock_trades"' BUILDRT F || fail173 "成交表方法没进构建器白名单（g2 会拒或部成永远走副本）"
 grep_q 'query_stock_trades(self._acc)' LEXT F || fail173 "载体没读成交表（部成余量按副本算会多撤）"
@@ -22172,6 +22183,16 @@ grep -qF 'destructive_write' internal/server/server.go || fail184 "consult histo
 CNT184=$((CNT184 + 1))
 grep -qF 'func TestF2ClearAlertsConfirmAndAuth' internal/server/uat_fix_20261114_test.go || fail184 "F2 行为用例缺失（confirm/401/balance 键语义）"
 grep -qF 'func TestF2CleanupExplicitDryRun' internal/server/uat_fix_20261114_test.go || fail184 "cleanup 三态用例缺失"
+# §20261114 自动化测试登记（CI 走 go test ./... 与 vitest run，新增文件自动发现；这里锁"在册"防被误删）
+for t184 in \
+  internal/server/uat_fix_20261114_test.go \
+  internal/server/readyz_test.go \
+  internal/auth/login_order_f6_test.go \
+  web/src/__tests__/review_timeout.test.jsx \
+  internal/e2e/uat_live_probe_test.go \
+  internal/e2e/http_api_test.go; do
+  [ -s "$t184" ] || fail184 "今日自动化测试用例文件缺失：${t184}"
+done
 CNT184=$((CNT184 + 1))
 grep -qF "confirm: 'RESET_PAPER'" web/src/api/index.js || fail184 "前端 resetPaper 未同批带 confirm（清盘按钮上线即 400）"
 grep -qF "confirm: 'RESET_POOL'" web/src/api/index.js || fail184 "前端 resetPaperPool 未带 confirm"
