@@ -97,7 +97,7 @@ type RealPosition struct {
 	// 只存 anchor_price 而不存来源，回填过的成本档与建仓即冻结的首买价档在库里**长得一模一样**，
 	// 于是"用摊薄成本冒充锚点"这条被裁决二终结的路径会从实盘 T 侧绕回来。
 	// 写入点只有两处：买入首成交建行（first_buy_order）与存量回填（cost_fallback）；
-	// 对账快照一律不覆盖，与 anchor_price 同一条"永久不覆盖"纪律。
+	// 对账快照只在来源为空时补齐、绝不改写已有非空来源（2026-11-13 裁决：与 anchor_price 同一条"只补不拉"纪律）。
 	// English: §DYN-T — where the anchor came from; the live T gate needs it because a cost-derived
 	// anchor is fine for risk lines but must never justify an intraday round-trip.
 	AnchorSource string `json:"anchor_source,omitempty"`
@@ -432,19 +432,19 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				can_use_qty=COALESCE(excluded.can_use_qty, real_positions.can_use_qty),
 				-- signal_id 有意不出现在 SET 列表：本入口无归因来源时保持旧值（与
 				-- ReconcilePositionsForUser 的 COALESCE 非空才覆盖等效，见 §N-6 同族裸写盘点）。
-				-- §ANCHOR-FIRST（2026-10-24 裁决二）anchor_price **有意整条缺席 SET 列表**：锚点是建仓即
-				-- 冻结的风险线基准，券商对账快照既不认识该键、也绝不允许把已有锚点回拉或补写——
-				-- 与上面 signal_id「无来源时保持旧值」同姿势，但这里是**永久**不覆盖（不只是本轮没带）。
+				-- §ANCHOR-FIRST（2026-10-24 裁决二，**已被 2026-11-13 裁决推翻**）：原口径是
+				-- anchor_price 整条缺席 SET 列表——锚点为建仓即冻结的风险线基准，券商快照不得回拉或补写。
+				-- 2026-11-13 owner 裁决改为"只补不拉"：仅当现有锚点为 NULL 或 <=0 时用柜台值补齐，
+				-- 已有非零风险线绝不回拉；anchor_source 由调用方一次性写入，落定后不再改写。
 				-- 新建行走 INSERT 列：本地知道就落值，不知道就 NULL=未知（读侧 COALESCE 归 0，不冒充首买价）。
-				-- English: §ANCHOR-FIRST — anchor_price is deliberately absent from the SET list: a broker
-				-- snapshot may never pull back or invent the immutable first-buy risk anchor (unlike signal_id,
-				-- which only keeps its old value when this round carries none).
+				-- English: §ANCHOR-FIRST (2026-10-24) originally kept anchor_price out of the SET list
+				-- entirely; the 2026-11-13 owner ruling supersedes it with "fill only, never pull back".
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END,
-				-- 2026-11-13 owner ruling (overrides the old "never touch the anchor"
-				-- discipline): a counter snapshot may FILL a missing anchor, but must
-				-- never pull back an existing non-zero risk line. Provenance is
-				-- stamped by the caller (counter_snapshot) and never rewritten once set.
+				-- 2026-11-13 owner ruling（推翻旧的"永不触碰锚点"口径）：柜台快照可以**补**缺失的锚点，
+				-- 但绝不回拉已有非零风险线；来源标记由调用方（counter_snapshot）一次性写入，落定后不再改写。
+				-- English: a counter snapshot may fill a missing anchor but never pull back an existing
+				-- non-zero risk line; provenance is stamped by the caller and never rewritten once set.
 				anchor_price=CASE WHEN real_positions.anchor_price IS NULL OR real_positions.anchor_price <= 0
 					THEN excluded.anchor_price ELSE real_positions.anchor_price END,
 				anchor_source=CASE WHEN real_positions.anchor_source IS NULL OR real_positions.anchor_source = ''
@@ -763,19 +763,19 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition, strict
 				-- §M5 只增锚 → §N-7 起本地锚点会由 RaiseRealPositionHigh 持续抬高：这里
 				-- max(本地, 快照) 的只增语义保证快照 open_price（券商口径=开仓价）绝不会把
 				-- 已回写的期间最高价拉回，两条写路径（对账 upsert / 锚点 UPDATE）因此互不覆盖。
-				-- §ANCHOR-FIRST（2026-10-24 裁决二）anchor_price **有意整条缺席 SET 列表**：锚点是建仓即
-				-- 冻结的风险线基准，券商对账快照既不认识该键、也绝不允许把已有锚点回拉或补写——
-				-- 与上面 signal_id「无来源时保持旧值」同姿势，但这里是**永久**不覆盖（不只是本轮没带）。
+				-- §ANCHOR-FIRST（2026-10-24 裁决二，**已被 2026-11-13 裁决推翻**）：原口径是
+				-- anchor_price 整条缺席 SET 列表——锚点为建仓即冻结的风险线基准，券商快照不得回拉或补写。
+				-- 2026-11-13 owner 裁决改为"只补不拉"：仅当现有锚点为 NULL 或 <=0 时用柜台值补齐，
+				-- 已有非零风险线绝不回拉；anchor_source 由调用方一次性写入，落定后不再改写。
 				-- 新建行走 INSERT 列：本地知道就落值，不知道就 NULL=未知（读侧 COALESCE 归 0，不冒充首买价）。
-				-- English: §ANCHOR-FIRST — anchor_price is deliberately absent from the SET list: a broker
-				-- snapshot may never pull back or invent the immutable first-buy risk anchor (unlike signal_id,
-				-- which only keeps its old value when this round carries none).
+				-- English: §ANCHOR-FIRST (2026-10-24) originally kept anchor_price out of the SET list
+				-- entirely; the 2026-11-13 owner ruling supersedes it with "fill only, never pull back".
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END,
-				-- 2026-11-13 owner ruling (overrides the old "never touch the anchor"
-				-- discipline): a counter snapshot may FILL a missing anchor, but must
-				-- never pull back an existing non-zero risk line. Provenance is
-				-- stamped by the caller (counter_snapshot) and never rewritten once set.
+				-- 2026-11-13 owner ruling（推翻旧的"永不触碰锚点"口径）：柜台快照可以**补**缺失的锚点，
+				-- 但绝不回拉已有非零风险线；来源标记由调用方（counter_snapshot）一次性写入，落定后不再改写。
+				-- English: a counter snapshot may fill a missing anchor but never pull back an existing
+				-- non-zero risk line; provenance is stamped by the caller and never rewritten once set.
 				anchor_price=CASE WHEN real_positions.anchor_price IS NULL OR real_positions.anchor_price <= 0
 					THEN excluded.anchor_price ELSE real_positions.anchor_price END,
 				anchor_source=CASE WHEN real_positions.anchor_source IS NULL OR real_positions.anchor_source = ''

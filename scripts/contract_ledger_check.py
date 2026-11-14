@@ -280,39 +280,61 @@ def evidence_ok(evidence):
 
     只验「文件存在」不够——「运维 curl」写个不存在的行号也算过，那和没写一样；
     只验「锚串在全文件某处」也不够——调用点被删掉后注释里往往还留着同样的路径，台账会假勾。
-    行号容差 ±2 行：给编辑留出手抖的空间，超出就说明点名的那一腿已经不是这件事了。
+    行号窗口是 **[lineno-3, lineno+1] 共 5 行**（切片 `lines[lineno-3:lineno+2]` 右开）——
+    注意这不是对称 ±2（历史文案写"±2"与实现不符，2026-11-14 v3 实测订正，文案已同步改）。
+
+    三态判定（F4，2026-11-14；防"行号漂移 15–60 行"这种最常见形态把门禁打成永久红）：
+      ① 锚串不存在于文件                          → (False, 原因, None)（证据作废，语义不变）
+      ② 锚串存在但不在窗口内 → 取所有命中行里 |line-lineno| 最小者
+         （并列最小取行号较小者并标 tie，保证同一文件两次运行挑同一处）
+                                                  → (True, "stale", chosen_line)——计数进 STALE_LINENO
+      ③ 窗口内命中                                → (True, "", None)
+    为什么用"最近行"而不是"唯一命中"：78 条漂移行里 73 条的锚串在文件里出现多次
+    （实测分布 2×35 / 3×17 / 4×9 / 5×2 / 6×4 / 7×2 / 11×4，最多 11 次），"唯一"分支几乎永不触发。
+    取最近行保住「调用点被删必须红」（①），又不会因同名路径多处出现而误判；STALE_LINENO 由门禁锁 0。
     """
     parts = evidence.split(":", 2)
     if len(parts) < 2:
-        return False, "evidence 不是 file:… 形态"
+        return False, "evidence 不是 file:… 形态", None
     rel = parts[0]
     # 畸形三段格（`file::symbol`）以前会静默退化成"没给行号"，于是整条行号校验被跳过——
     # 等于 evidence 可以随便填，而 §115 的锁看起来仍然全绿。行号要么给对，要么判红。
     if len(parts) == 3 and not parts[1].isdigit():
-        return False, "evidence 三段式但行号非数字（file::symbol 会让行号校验整条失效）"
+        return False, "evidence 三段式但行号非数字（file::symbol 会让行号校验整条失效）", None
     needle = parts[2] if len(parts) == 3 else ""
     lineno = parts[1] if len(parts) == 3 and parts[1].isdigit() else ""
     if len(parts) == 3 and not needle:
-        return False, "evidence 三段式但锚串为空（只剩 file:行号，等于没证据）"
+        return False, "evidence 三段式但锚串为空（只剩 file:行号，等于没证据）", None
     path = ROOT / rel
     if not path.exists():
-        return False, "文件不存在"
+        return False, "文件不存在", None
     text = path.read_text(encoding="utf-8", errors="replace")
     if lineno:
         lines = text.split("\n")
-        lo = max(0, int(lineno) - 3)
-        hi = min(len(lines), int(lineno) + 2)
+        target = int(lineno)
+        lo = max(0, target - 3)
+        hi = min(len(lines), target + 2)
         window = "\n".join(lines[lo:hi])
         if needle and needle not in window:
-            return False, "锚串不在点名的第 %s 行附近（±2 行窗口内找不到）" % lineno
+            # 三态 ②：锚串还在文件里、只是行号漂出窗口 → 找最近命中行记 STALE（不再直接红）。
+            if not needle:
+                return False, "给了行号却没给锚串（行号会随文件漂移，锚串才是判据）", None
+            hits = [i + 1 for i, l in enumerate(lines) if needle in l]
+            if not hits:
+                return False, "锚串不在点名的第 %s 行附近，且全文件找不到锚串（证据作废）" % lineno, None
+            # 并列最小取行号较小者：distance 相同时 min() 天然选先出现的（行号小的）那一处，
+            # 显式写成 (dist, line) 元组最小值，保证检查器是稳定判据（两次运行挑同一行）。
+            chosen = min(hits, key=lambda ln: (abs(ln - target), ln))
+            tie = sum(1 for ln in hits if abs(ln - target) == abs(chosen - target)) > 1
+            return True, "stale", (chosen, tie)
         if not needle:
-            return False, "给了行号却没给锚串（行号会随文件漂移，锚串才是判据）"
-        return True, ""
+            return False, "给了行号却没给锚串（行号会随文件漂移，锚串才是判据）", None
+        return True, "", None
     if not needle:
-        return False, "evidence 既没有行号也没有锚串"
+        return False, "evidence 既没有行号也没有锚串", None
     if needle not in text:
-        return False, "锚串在该文件里找不到"
-    return True, ""
+        return False, "锚串在该文件里找不到", None
+    return True, "", None
 
 
 # 两段式 evidence（`file:symbol`，没有行号）的**存量上限**——棘轮，不是许可：
@@ -375,14 +397,21 @@ def check():
     thin = sorted("%s %s" % (m, p) for m, p, c, _, n in ledger if c in ("无 UI 待补", "兼容端点") and len(n) < 12)
     lock(not thin, "有 %d 行保留类标签的说明太短（少于 12 字＝等于没写理由）：%s" % (len(thin), "; ".join(thin[:5])))
 
-    # evidence 可核
+    # evidence 可核（三态： broken=证据作废；stale=锚串在、行号漂出窗口）
     broken = []
+    stale_rows = []
     for m, p, c, e, _ in ledger:
         if c in EVIDENCE_REQUIRED:
-            ok, why = evidence_ok(e)
+            ok, why, chosen = evidence_ok(e)
             if not ok:
                 broken.append("%s %s（%s）" % (m, p, why))
+            elif why == "stale":
+                stale_rows.append((m, p, chosen))
     lock(not broken, "有 %d 行的 evidence 落点核不过：%s" % (len(broken), "; ".join(broken[:5])))
+    if stale_rows:
+        for m, p, (chosen, tie) in stale_rows:
+            print("# STALE_ROW %s %s chosen_line=%d tie=%s（锚串在文件里、行号漂出窗口；"
+                  "跑 --emit-web --write 一键回填）" % (m, p, chosen, "true" if tie else "false"))
 
     # 前端调用行必须被实时派生证实（台账撒谎检测）
     web_rows = {(m, norm(p)) for m, p, c, _, _ in ledger if c in ("前端调用", "前端直连")}
@@ -423,6 +452,7 @@ def check():
     print("UNTAGGED=%d" % untagged)
     print("NO_BASIS=%d" % no_basis)
     print("BROKEN_EVIDENCE=%d" % len(broken))
+    print("STALE_LINENO=%d" % len(stale_rows))
     print("LEDGER_LIES=%d" % len(lied))
     for c in sorted(counts):
         print("CLASS_%s=%d" % (c, counts[c]))
@@ -443,6 +473,7 @@ def main():
                 print("%s\t%s" % (method, path))
         return 0
     if "--emit-web" in sys.argv:
+        write_back = "--write" in sys.argv
         routes = derive_routes()
         raw_by_key = {}
         for method, path in routes:
@@ -454,14 +485,32 @@ def main():
                 best[key] = (ln, fn)
         # 台账里写的必须是**注册原文**（带 {id}），否则 Q1 的双向相等对不上；锚串取路径里第一个
         # 变量段之前的字面量：它一定真实出现在调用行上（'/api/x/' 或整串）。
+        emitted = []
         for (method, path), (ln, fn) in sorted(best.items(), key=lambda x: (x[0][1], x[0][0])):
             raw = raw_by_key.get((method, path))
             if raw is None:
                 print("# GHOST %s %s（服务端无此注册，不进台账）" % (method, path), file=sys.stderr)
                 continue
             anchor = path.split("*")[0] or path
-            print("%s\t%s\t前端调用\tweb/src/api/index.js:%d:%s\t调用点 %s()（本行由核对器派生，勿手改）"
-                  % (method, raw, ln, anchor, fn))
+            emitted.append("%s\t%s\t前端调用\tweb/src/api/index.js:%d:%s\t调用点 %s()（本行由核对器派生，勿手改）"
+                           % (method, raw, ln, anchor, fn))
+        if write_back:
+            # --write（F4，2026-11-14）：把派生行**整块写回**台账（缺省仍是 dry-run 打到 stdout）。
+            # STALE_CEILING=0 要成立，必须有"一条命令修完 78 行漂移"的入口，否则只是把诊断拆开。
+            # 只替换「前端调用」类：前端直连/运维 curl 等行有人工写的原因列，机器不能替人重写。
+            kept = []
+            for raw_line in read(LEDGER).split("\n"):
+                cols = raw_line.split("\t")
+                if raw_line.startswith("#") or not raw_line.strip():
+                    kept.append(raw_line)
+                elif len(cols) >= 3 and cols[2] != "前端调用":
+                    kept.append(raw_line)
+            LEDGER.write_text("\n".join(kept + emitted) + "\n", encoding="utf-8")
+            print("# 已写回 %d 行前端调用（其余 %d 行原样保留）" % (len(emitted), len(kept) - sum(1 for k in kept if k.startswith("#") or not k.strip())),
+                  file=sys.stderr)
+            return 0
+        for row in emitted:
+            print(row)
         return 0
     return check()
 
