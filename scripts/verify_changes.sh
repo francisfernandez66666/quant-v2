@@ -11397,7 +11397,8 @@ SNAP113 2
 
 # ── ③ §P2-H M1/M2：后端两条路由与面板接线（前端调用点的两端都得在位）──
 eq113 "$SRV113" 's.mux.HandleFunc("GET /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleGetD1Config))' 1 'M1：GET 路由带 config_admin 严格门（面板挂载门槛与它同口径）'
-eq113 "$SRV113" 's.mux.HandleFunc("POST /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, s.handleSetD1Config))' 1 'M1：POST 路由带 config_admin 严格门'
+# §F2-20261114：B 类写面加 withIgnoredKeys 响应注入中间件，路由串随之改形；严格门不变。
+eq113 "$SRV113" 's.mux.HandleFunc("POST /api/config/d1", s.strictPermMiddleware(auth.PermConfigAdmin, withIgnoredKeys(s.handleSetD1Config)))' 1 'M1：POST 路由带 config_admin 严格门（2026-11-14 起外层包 withIgnoredKeys）'
 eqj113 "$API113" 'export async function fetchD1Config()' 1 'M2：GET 出口声明恰好一处'
 eqj113 "$API113" "return request('/api/config/d1')" 1 'M2：GET 请求串（斜杠开头＝绝对路径，不是拼出来的相对串）'
 eqj113 "$API113" 'export async function setD1Config(cfg)' 1 'M2：POST 出口声明恰好一处'
@@ -14446,7 +14447,8 @@ grep -q 'dash-two-col' web/src/styles.css web/src/pages/Dashboard.jsx || fail202
 
 # F-14 失败台账 + F-19 价格单实现
 for f in web/src/pages/Dashboard.jsx web/src/pages/Watchlist.jsx web/src/pages/EmotionReview.jsx; do
-  grep -q 'useLoadLedger\|setEquityErr\|LoadFailBanner' "$f" || fail2026 "$f 失败态未接台账"
+  # §20261114：BRE 的 \| 交替在 toybox grep 下静默零命中（本机实测多次），一律 ERE。
+  grep -qE 'useLoadLedger|setEquityErr|LoadFailBanner' "$f" || fail2026 "$f 失败态未接台账"
 done
 grep -q 'PriceCell' web/src/components/StockDetailDrawer.jsx || fail2026 "抽屉未复用 PriceCell"
 [ "$(grep -c 'export function PriceCell' web/src/pages/Watchlist.jsx)" -eq 1 ] || fail2026 "Watchlist PriceCell 导出唯一性破坏"
@@ -21828,10 +21830,12 @@ gw_chk "队列深度上限接线" "$(grep -cF 'capN := cfg.MaxQueuedTasks' inter
 gw_chk "跨日队列自动清理接线" "$(grep -cF 'CancelStaleQueuedTasks(today)' internal/scheduler/worker.go || true)" "1"
 gw_chk "跨日队列清理实现在 store" "$(grep -cF 'func (d *DB) CancelStaleQueuedTasks' internal/store/research_tasks.go || true)" "1"
 gw_chk "内存闸缺省抬到 800MB" "$(grep -cF 'const memGateDefaultMB = 800' internal/scheduler/worker.go || true)" "1"
-gw_chk "研究侧 CPU 配额收紧到 60%" "$(grep -cF 'CPUQuota=60%' deploy/quant-research.service || true)" "1"
+# 2026-11-14 复核实读：researchd 模板现两处 CPUQuota=60%（主模板 + 备份/重装脚注），各 1 会假红。
+gw_chk "研究侧 CPU 配额收紧到 60%" "$(grep -cF 'CPUQuota=60%' deploy/quant-research.service || true)" "2"
 gw_chk "前端轮询隐藏页跳过" "$(grep -cF "document.visibilityState !== 'visible'" web/src/pages/Research.jsx || true)" "1"
 gw_min "前端进度单飞去重（判空/置位/复位三处）" "$(grep -cF 'progressInFlight.current' web/src/pages/Research.jsx || true)" "3"
-gw_chk "保活改每 10 分钟（08:25 起）" "$(grep -cF 'Sc = "MINUTE"; Mn = 10' deploy/qmt-friend/install_tasks.ps1 || true)" "1"
+# 2026-11-12 保活补第七条任务后两处 MINUTE/10（ClientEnsure + Gateway-Start），锁值随实读同步。
+gw_chk "保活改每 10 分钟（08:25 起）" "$(grep -cF 'Sc = "MINUTE"; Mn = 10' deploy/qmt-friend/install_tasks.ps1 || true)" "2"
 gw_chk "保活自带 08:25-15:25 时段闸" "$(grep -cF 'outside_ensure_window' deploy/qmt-friend/watchdog.ps1 || true)" "1"
 gw_chk "下发载荷显式带 owner uid（snapshot+manifest）" "$(grep -cF '"owner_user_id": OWNER_UID' scripts/carrier_hot_reload_gz.py || true)" "2"
 gw_chk "回归用例：0 持仓过滤" "$(grep -cF 'func TestHandleRealPositionsFiltersZeroQty' internal/server/qmt_test.go || true)" "1"
