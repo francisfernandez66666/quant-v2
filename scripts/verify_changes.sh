@@ -22205,6 +22205,12 @@ grep -qF "confirm: 'RESET_PAPER'" web/src/api/index.js || fail184 "前端 resetP
 grep -qF "confirm: 'RESET_POOL'" web/src/api/index.js || fail184 "前端 resetPaperPool 未带 confirm"
 grep -qF 'CLEAR_ALERTS' web/src/api/index.js || fail184 "前端 clearAlerts 未带 query confirm"
 grep -qF 'CLEAR_CONSULT_HISTORY' web/src/api/index.js || fail184 "前端 deleteConsultHistory 未带 query confirm"
+# §2 验收：破坏性 confirm 的「运行时」契约用例在册（与上面的静态锁互补——静态锁防接线被删，
+# 本用例防令牌被静默清空或错填）。缺失即视为 §2 第三点未完成。
+CNT184=$((CNT184 + 1))
+test -f web/src/__tests__/destructive_confirm.test.jsx || fail184 "§2 验收用例 destructive_confirm.test.jsx 缺失（破坏性 confirm 运行时契约未锁定）"
+grep -qF 'clearConsultHistory' web/src/__tests__/destructive_confirm.test.jsx || fail184 "destructive_confirm 未覆盖 clearConsultHistory"
+grep -qF "confirm=CLEAR_ALERTS" web/src/__tests__/destructive_confirm.test.jsx || fail184 "destructive_confirm 未断言 clearAlerts 的 CLEAR_ALERTS"
 # §184 补项：E5（A 类 handler 不再用可选解码）/ B3（map 写面白名单在册）/
 # E6（DELETE 按账户路由）/ F1 六枚变异反证 / D1 幂等行为用例在册。
 CNT184=$((CNT184 + 1))
