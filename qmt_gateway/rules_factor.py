@@ -1476,6 +1476,21 @@ def _emit(params, ctx, kind, rule, scored):
         return None
     amount = entry_amount(params, ctx)
     if amount is None:
+        # BUDGET-GATE (2026-11-16 owner): a passing composite with no affordable
+        # size is filtered silently by design (no budget -> no signal -> no log
+        # line), but during a full position the operator must still SEE the
+        # factor engine working. Mark the ctx; the sandbox handlebar aggregates
+        # per round and logs it at most once per hour (BUDGET_GATE anchor).
+        if scored.get("pass"):
+            try:
+                ctx["_passed_but_no_budget"] = float(
+                    ctx.get("_passed_but_no_budget") or ZERO) + UNIT
+                sc = float(scored.get("score") or ZERO)
+                if sc > float(ctx.get("_passed_but_no_budget_best") or ZERO):
+                    ctx["_passed_but_no_budget_best"] = sc
+                    ctx["_passed_but_no_budget_code"] = str(ctx.get("symbol") or "")
+            except Exception:  # noqa: BLE001 - observability must never throw
+                pass
         return None
     signal = make_signal(params, ctx, kind, params["entry_side"], amount, float(price))
     if signal is None:

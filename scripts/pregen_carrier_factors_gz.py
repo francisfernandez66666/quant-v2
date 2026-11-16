@@ -187,10 +187,28 @@ def _q(sql, args):
 
 
 def _ts_code(symbol):
-    return symbol if "." in symbol else symbol
+    """6 位纯码按交易所推断 tushare 后缀——§TS-CODE-FIX 20261116：daily_basic/
+    fina_indicator 的键是 600xxx.SH / 000xxx.SZ / 300xxx.SZ / 8xxxxx.BJ 全市场
+    5546 只（实测新鲜 20261113），而 6 位码原样查询永远打空——300576 有 1663 行
+    daily_basic 却被查成 0，估值/换手/财务/资金流四类 bakeables 因此集体缺烘
+    （载体侧 TurnoverStd20/DebtToAssets/valuation 系列因子集体 declined 的根因）。
+    English: infer the tushare suffix from the 6-digit code; passthrough when
+    the code already carries one."""
+    s = str(symbol or "").strip().upper()
+    if "." in s:
+        return s
+    if len(s) == 6 and s.isdigit():
+        head = s[0]
+        if head == "6":
+            return s + ".SH"
+        if head in ("0", "3"):
+            return s + ".SZ"
+        if head in ("4", "8", "9"):
+            return s + ".BJ"
+    return s
 
 
-def bake_bakeables(symbol, params_doc):
+def bake_bakeables(symbol, params_doc, lu_boards=None):
     """§PRECALC v2（2026-11-11 owner 定案）：QMT 直取价量（bars），**QMT 拿不到的才烘**——
     估值序列/换手序列（daily_basic，当日新鲜）、财务分位（fina_indicator 最新档）、
     资金流（moneyflow_history MainNet/circ_mv）、新闻事件=D1 分数（scalar_proxy 带值）、
@@ -255,7 +273,44 @@ def bake_bakeables(symbol, params_doc):
     hit = hp.get(symbol) or hp.get(code6)
     if isinstance(hit, dict) and hit.get("score") is not None:
         out["concept_heat"] = float(hit["score"])
+    # §LIMIT-BOARD 20261116：连板数按 input_key=limit_board_count 键名烘入
+    # （scalar_proxy 的 ctx 取值即同名键）。池外票不烘键=absent=declined——
+    # 与外脑"无涨停史"口径一致，0 与 absent 语义在 percentile 排名里不同。
+    if lu_boards:
+        lbc = lu_boards.get(code6)
+        if lbc is not None:
+            out["limit_board_count"] = float(lbc)
     return out
+
+
+def fetch_lu_boards(day):
+    """§LIMIT-BOARD 20261116（owner 拍板接入 lu_board3）：东财涨停池直拉
+    （akshare stock_zt_pool_em 同源底层，无需 venv 依赖）→ {6位码: 连板数}。
+    连板数是**当日实时事件数据**（首板=1、2 连板=2…；池外票=未涨停，消费侧
+    缺省弃权——外脑同口径）。失败返回 None：涨停池缺源时 limit_board_count
+    因子如实 declined，绝不编造（同 fetch 的单票纪律）。hithink 不提供涨停池，
+    东财仅作此一项事件数据源（日线主源仍是 owner 指定的 hithink）。
+    English: EM limit-up pool -> {code: consecutive-limit count}; None on failure."""
+    url = ("https://push2ex.eastmoney.com/getTopicZTPool"
+           "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt"
+           "&Pageindex=0&pagesize=10000&sort=fbt%%3Aasc&date=%s" % day)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (quant-pregen)",
+        "Referer": "https://quote.eastmoney.com/",
+    })
+    with urllib.request.urlopen(req, timeout=REQ_TIMEOUT) as resp:
+        doc = json.loads(resp.read().decode("utf-8", errors="replace"))
+    pool = ((doc or {}).get("data") or {}).get("pool") or []
+    boards = {}
+    for item in pool:
+        code = str(item.get("c") or "").strip()
+        lbc = item.get("lbc")
+        if len(code) == 6 and code.isdigit() and lbc is not None:
+            try:
+                boards[code] = float(lbc)
+            except (TypeError, ValueError):
+                continue
+    return boards or None
 
 
 def _notify(title, body):
@@ -324,6 +379,14 @@ def main():
         print("PREGEN_RESULT day= codes=0 ok=0 fail=0 elapsed_s=0 (no symbols)")
         return 2
     day = datetime.now().astimezone().strftime("%Y%m%d")
+    # §LIMIT-BOARD 20261116：一次请求全市场涨停池（失败不阻断主链，limit_board_count
+    # 因子如实 declined——与价量单票失败同一纪律）。
+    try:
+        lu_boards = fetch_lu_boards(day)
+        print("PREGEN_ZT_POOL day=%s codes=%s" % (day, len(lu_boards or {})))
+    except Exception as exc:  # noqa: BLE001 - 涨停池缺源不拖全局
+        lu_boards = None
+        print("PREGEN_ZT_POOL_FAIL %s" % type(exc).__name__)
     precalc, ok, failed = {}, 0, []
     for symbol in symbols:
         try:
@@ -343,14 +406,14 @@ def main():
                 if fact:
                     fact["data_day"] = data_day
                     fact["src"] = src
-            bakeables = bake_bakeables(symbol, params) if fact else {}
+            bakeables = bake_bakeables(symbol, params, lu_boards) if fact else {}
             if fact:
                 fact.update(bakeables)
                 precalc[symbol] = fact
                 ok += 1
             else:
                 # 价量缺失也可能只是 hithink 单票失败：bakeables 仍值得烘（估值/财务/D1）
-                bakeables = bake_bakeables(symbol, params)
+                bakeables = bake_bakeables(symbol, params, lu_boards)
                 if bakeables:
                     bakeables["src"] = "bake_only"
                     precalc[symbol] = bakeables

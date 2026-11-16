@@ -1140,6 +1140,10 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "flow_5d_pct": pre.get("flow_5d_pct"),
         "news_event": pre.get("news_event"),
         "concept_heat": pre.get("concept_heat"),
+        # LIMIT-BOARD (2026-11-16 owner): lu_board3/lu_board scalar proxies read
+        # ctx["limit_board_count"] by input_key -- baked by pregen from the EM
+        # limit-up pool. Absent = declined (honest), same as the engine side.
+        "limit_board_count": pre.get("limit_board_count"),
     }
 
 
@@ -1462,6 +1466,19 @@ def run_round(ContextInfo, moment):
         covered = sum(1 for sym in symbols if cov.get(sym))
         _log("data_health bars_coverage=%d/%d precalc=%d" % (
             covered, len(symbols), len(PARAMS.get("precalc") or {})))
+    # BUDGET-GATE: hourly one-line, beside data_health -- shows that factor
+    # composites DID pass on a full-position day (owner request 13:40 2026-11-16).
+    bg = _STATE.get("budget_gate") or {}
+    if bg.get("n") and bg.get("logged_key") != cov_key:
+        _STATE["budget_gate"]["logged_key"] = cov_key
+        try:
+            reserve = float(total or 0.0) * float(
+                PARAMS.get("min_cash_after_reserve_pct") or 0.0)
+        except (TypeError, ValueError):
+            reserve = 0.0
+        _log("budget_gate rules_passed_but_no_budget=%d best_score=%.1f code=%s cash=%.0f reserve_floor=%.0f" % (
+            int(bg.get("n", 0)), float(bg.get("best") or 0.0),
+            str(bg.get("code") or "-"), float(cash_raw or 0.0), reserve))
     for symbol in symbols:
         ctx = build_context(ContextInfo, symbol, moment, orders, positions, cash)
         signals = []
@@ -1488,6 +1505,18 @@ def run_round(ContextInfo, moment):
                     continue
                 if hit:
                     signals.append((hit, rule_arm_mode(PARAMS, kind)))
+        # BUDGET-GATE (2026-11-16 owner): the rules layer marks ctx when a factor
+        # composite PASSED but entry_amount was None (full position + reserve
+        # floor) -- aggregate per round here; the hourly log beside data_health
+        # prints it so a full-position day still shows the engine working.
+        nb = ctx.pop("_passed_but_no_budget", 0)
+        if nb:
+            agg = _STATE.setdefault("budget_gate", {})
+            agg["n"] = int(agg.get("n", 0)) + int(nb)
+            best = float(ctx.get("_passed_but_no_budget_best") or 0.0)
+            if best > float(agg.get("best") or 0.0):
+                agg["best"] = best
+                agg["code"] = ctx.get("_passed_but_no_budget_code") or ""
         for signal, mode in signals:
             if mode != "live":
                 # shadow/off: counted in the round summary, never sent. The
