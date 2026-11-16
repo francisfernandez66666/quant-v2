@@ -274,12 +274,13 @@ def bake_bakeables(symbol, params_doc, lu_boards=None):
     if isinstance(hit, dict) and hit.get("score") is not None:
         out["concept_heat"] = float(hit["score"])
     # §LIMIT-BOARD 20261116：连板数按 input_key=limit_board_count 键名烘入
-    # （scalar_proxy 的 ctx 取值即同名键）。池外票不烘键=absent=declined——
-    # 与外脑"无涨停史"口径一致，0 与 absent 语义在 percentile 排名里不同。
-    if lu_boards:
-        lbc = lu_boards.get(code6)
-        if lbc is not None:
-            out["limit_board_count"] = float(lbc)
+    # （scalar_proxy 的 ctx 取值即同名键）。**池外票烘 0**：外脑对"今日未涨停"
+    # 的票有值 0 照算（lu_board3 在 fac_160 权重仅 0.199，主体是价量因子），
+    # 若烘 absent 则整条规则 declined、永远与外脑分叉——0 与 absent 语义在
+    # percentile 排名里不同，这里必须取 0 对齐。池数据整体缺失（拉取失败）时
+    # 仍走 absent（真实缺源绝不编造）。
+    if lu_boards is not None:
+        out["limit_board_count"] = float(lu_boards.get(code6) or 0.0)
     return out
 
 
