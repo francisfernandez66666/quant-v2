@@ -92,6 +92,10 @@ func startScoreLoopWatchdog(ctx context.Context) {
 	})
 }
 
+// scoreLoopWatchdog 打分循环的看门狗：每 30 秒查一次「打分主循环距今是否超过
+// 2 分钟没跑」——只在**活跃交易时段**内告警（休市静默不算停摆），且用 CAS 保证
+// 同一次停摆只推一次告警（恢复后自动复位重新武装），防止每 30 秒重复轰炸提醒通道。
+// 它只观测告警、绝不代替主循环拉起——主循环的保活与重启属 engine 生命周期管辖。
 func scoreLoopWatchdog(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
