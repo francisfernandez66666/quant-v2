@@ -765,6 +765,45 @@ def _tick_of(ContextInfo, symbol):
     return normalize_tick(symbol, entry)
 
 
+def _subscribe_market(ContextInfo):
+    """SUBSCRIBE-FIX (2026-11-16 P0): get_full_tick returns empty for symbols
+    that were never subscribed, and NOTHING in init ever subscribed -- held
+    symbols outside the lucky tick window had their stop-loss legs blind all
+    day (002115 case). whole-market push covers every pool member regardless
+    of which re-bake it joined in; per-symbol subscribe is the fallback for
+    builds where whole_quote is unavailable. Outcome is logged, not swallowed."""
+    tried = []
+    whole = _fn("subscribe_whole_quote")
+    if callable(whole):
+        for market in ("SH", "SZ"):
+            try:
+                sub_id = whole(market)
+                tried.append("%s=%s" % (market, _short_id(sub_id)))
+            except Exception as exc:  # noqa: BLE001
+                tried.append("%s=err:%s" % (market, repr(exc)[:60]))
+    per_symbol = _fn("subscribe_quote")
+    n = 0
+    if callable(per_symbol):
+        for symbol in (PARAMS.get("symbols") or []):
+            try:
+                sub_id = per_symbol(symbol, "1m", "follow")
+                if _short_id(sub_id):
+                    n += 1
+            except Exception:  # noqa: BLE001
+                continue
+    _log("subscribe_market tried=[%s] per_symbol_ok=%d/%d" % (
+        ",".join(tried), n, len(PARAMS.get("symbols") or [])))
+
+
+def _short_id(sub_id):
+    """Normalize a subscribe return into a short readable token (0/None -> '-')."""
+    try:
+        value = int(sub_id)
+        return str(value)
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _download_day_bars(ContextInfo):
     """2026-11-11 owner direction: pull the day bars FROM QMT itself.
 
@@ -1804,6 +1843,17 @@ def init(ContextInfo):
         bool(counter_api), bool(_fn("passorder")), bool(_fn("cancel"))))
     if not counter_api or not _fn("passorder"):
         _log("WARN trade surface unavailable: this build will place nothing")
+    # SUBSCRIBE-FIX (2026-11-16, P0): the sell legs (stop_loss/take_profit/
+    # breakdown_sell) read ctx.last_price from get_full_tick, and get_full_tick
+    # returns an EMPTY dict for symbols that were never subscribed on this
+    # client -- live evidence: round_skips no_price=2 EVERY round, and held
+    # symbol 002115 sat at -5.46% (stop line -3%) with the sell leg blind until
+    # the operator sold by hand at 14:09:46. The init comment always SAID
+    # "subscribe the baked universe" but no subscribe call existed. Subscribe
+    # whole-market (one call, covers the whole pool regardless of re-bakes)
+    # with a per-symbol fallback; log the outcome so a silent empty return
+    # cannot hide again.
+    _subscribe_market(ContextInfo)
     _download_day_bars(ContextInfo)
 
 
