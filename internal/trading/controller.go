@@ -168,6 +168,10 @@ func NewController(exec Executor, db *store.DB, userID string, cfg config.QMTCon
 }
 
 // SetNow §CANCEL-STATE：注入时钟（测试专用）。传 nil 恢复系统时间。
+// ⚠️ 只钉时段闸（NewOrderBlockedByWindow/CancelBlocked）这一把——资金新鲜度
+// （AvailableCashBook → CashReportFresh）刻意保持真实挂钟，manual_cash_book_test.go
+// 头注写明"夹具不许顺手把这里也钉"（§0925EVE-W3-F 同族事故：一钉就把
+// "40 分钟前"种成"未来 4 小时"，fresh 恒真）。
 func (c *Controller) SetNow(fn func() time.Time) {
 	c.mu.Lock()
 	if fn == nil {
@@ -402,6 +406,11 @@ func (c *Controller) AvailableCashBook() (float64, bool, string) {
 		}
 		return 0, false, "none"
 	}
+	// §M12-FIXTURE-20261116：新鲜判定的钟与播种侧必须同一把——这里用真实挂钟
+	// （cntime.Now()），manual_cash_book_test.go 头注明文"夹具不许钉这把钟"；
+	// 2026-11-15 的 43e631a 把 m12 测试播种侧钉到夹具钟 10:15、读取侧仍是真实钟，
+	// 两钟只在 09:45–10:45 跑测试才碰巧对齐，其余时刻差 2h+ 被误判过期 → 假红。
+	// 正解是播种侧回真实钟（见 m12_cash_gate_test.go m12SeedCash 注释）。
 	if store.CashReportFresh(acc.UpdatedAt, cntime.Now()) {
 		return acc.AvailableCash, true, "counter"
 	}

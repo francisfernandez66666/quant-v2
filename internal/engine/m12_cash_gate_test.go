@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
@@ -35,15 +36,18 @@ func m12Live(code string) map[string]*data.StockInfo {
 }
 
 // m12SeedCash 播种网关对账回报（real_account）；updated 距 now 的 age 决定新鲜/过期。
-// §20261115-CLOSEOUT：时刻必须与被测方同一把钟。newQMTEngine 把控制器/引擎时钟钉在
-// liveTestNow()（当日北京 10:15），旧写法却用真实 time.Now() 播种——凌晨 00:0x 跑时
-// 「1 分钟前」落在前一天 23:59，对 10:15 的判定基准差 10 小时，被 30 分钟窗判成过期，
-// fresh_value_downgrades / recovery_after_fresh 假红。改用夹具钟后任何真实时刻都稳定。
+// §M12-FIXTURE-20261116（43e631a 的回调）：播种必须用**真实挂钟**。新鲜判定读取侧
+// （AvailableCashBook → CashReportFresh）吃 cntime.Now() 真实钟，且 trading 侧
+// manual_cash_book_test.go 头注明文"夹具不许钉这把钟"——43e631a 曾把本函数改成
+// liveTestNow()（当日北京 10:15）播种，两钟只在 09:45–10:45 跑测试才碰巧对齐，
+// 其余时刻差 2h+ 被误判过期，fresh_value_downgrades/recovery_after_fresh 全天假红
+// （2026-11-16 实录，当天在 ac7fdcb/a3cbec9 上 12:45 跑必红）。真实钟对真实钟，
+// 任何时刻运行都稳定；"凌晨假红"的正确修法不是钉播种侧，而是统一真实钟口径。
 func m12SeedCash(t *testing.T, db *store.DB, cash float64, age time.Duration) {
 	t.Helper()
 	if err := db.UpsertRealAccount(store.RealAccount{
 		UserID: "u_1", AvailableCash: cash,
-		UpdatedAt: liveTestNow().Add(-age).Format("2006-01-02 15:04:05"),
+		UpdatedAt: time.Now().In(cntime.Loc).Add(-age).Format("2006-01-02 15:04:05"),
 	}); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
