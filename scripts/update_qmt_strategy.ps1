@@ -1,4 +1,4 @@
-# update_qmt_strategy.ps1 -- deliver the baked BUILT-IN strategy onto the physical box.
+﻿# update_qmt_strategy.ps1 -- deliver the baked BUILT-IN strategy onto the physical box.
 #
 # WHY THIS EXISTS (carrier decision, owner 2026-11-04)
 #   From 2026-11-05 the broker's QMT built-in strategy is the only automated
@@ -72,6 +72,10 @@ param(
     [switch]$Apply,
     [switch]$SkipRestart
 )
+# ENTER ANCHOR: first statement after param proves the script was actually
+# parsed and run (2026-11-16: updater_rc_0 with ZERO output twice --
+# parse-level silent death suspected; separates "never ran" from "died mid-way").
+Write-Output "STRATEGY_UPDATE_ENTERED param_ok=1"
 
 $ErrorActionPreference = "Stop"
 
