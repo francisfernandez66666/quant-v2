@@ -211,37 +211,46 @@ Say ("STRATEGY_UPDATE_STAGE=VERSION ok=1 version={0}" -f $installedVersion)
 # ---- RESTART: the documented order, and the order is the safety ----
 # 1 stop the gateway: its retry loop would otherwise grab writer slots in the
 #   client's shared memory while the client is coming back (10-29 slot storm).
-# 2 stop the ensure task so it does not fight us while the client is down.
-# 3 kill the client.
-# 4 start it THROUGH THE SCHEDULED TASK (never a direct launch: a child started
+#   §RESTART-FIX 20261116: match by COMMAND LINE (gateway.py), never by process
+#   name "python" -- Stop-Process -Name python killed EVERY python.exe including
+#   the carrier_updater process that was running THIS script, which is why the
+#   updater output always died mid-flight (v39/v44/v46 all showed it) and the
+#   client restart leg never ran. Exact-PID kill only.
+# 2 kill the client.
+# 3 start it THROUGH THE SCHEDULED TASK (never a direct launch: a child started
 #   inside an SSH/agent session dies with the session).
-# 5 start the gateway again.
+#   §RESTART-FIX 20261116: the old DISABLE -> /Run -> ENABLE order guaranteed
+#   failure -- schtasks /Run REFUSES a disabled task, so the client was never
+#   relaunched while STRATEGY_UPDATE_RESULT=OK still reported success (three
+#   live incidents 2026-11-16). ENABLE is now ensured BEFORE the /Run.
+# 4 start the gateway again (same command-line match as step 1; the ensure
+#   watchdog's GatewayEnsure leg brings it back within 5 minutes regardless).
 if ($SkipRestart) {
     Say "STRATEGY_UPDATE_RESTART=skipped reason=flag"
 } else {
     $log = @()
     try {
-        Stop-Process -Name $GatewayProcessName -ErrorAction SilentlyContinue `
-            -Force | Out-Null
-        $log += "gateway_stop=attempted"
+        $gwPids = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+            Where-Object { $_.CommandLine -match "gateway\.py" } |
+            Select-Object -ExpandProperty ProcessId)
+        foreach ($gwPid in $gwPids) {
+            Stop-Process -Id $gwPid -Force -ErrorAction SilentlyContinue
+        }
+        $log += ("gateway_stop=attempted pids=" + ($gwPids -join "+"))
     } catch { $log += ("gateway_stop=warn:" + $_.Exception.Message) }
     try {
-        schtasks /Change /TN $EnsureTaskName /DISABLED | Out-Null
-        $log += "ensure_stop=disabled"
-    } catch { $log += ("ensure_stop=warn:" + $_.Exception.Message) }
+        schtasks /Change /TN $EnsureTaskName /ENABLE | Out-Null
+        $log += "ensure_enabled=pre_run"
+    } catch { $log += ("ensure_enabled=warn:" + $_.Exception.Message) }
     try {
         Stop-Process -Name "XtItClient" -ErrorAction SilentlyContinue -Force | Out-Null
         $log += "client_kill=attempted"
     } catch { $log += ("client_kill=warn:" + $_.Exception.Message) }
     Start-Sleep -Milliseconds 800
     try {
-        schtasks /Run /TN $EnsureTaskName | Out-Null
-        $log += ("task_run=" + $(if ($LASTEXITCODE -eq 0) { "ok" } else { "rc$LASTEXITCODE" }))
+        $runOut = schtasks /Run /TN $EnsureTaskName 2>&1
+        $log += ("task_run=" + $(if ($LASTEXITCODE -eq 0) { "ok" } else { "rc$LASTEXITCODE:" + ($runOut | Select-Object -First 1) }))
     } catch { $log += ("task_run=warn:" + $_.Exception.Message) }
-    try {
-        schtasks /Change /TN $EnsureTaskName /ENABLE | Out-Null
-        $log += "ensure_reenabled"
-    } catch { $log += ("ensure_reenabled=warn:" + $_.Exception.Message) }
     Say ("STRATEGY_UPDATE_RESTART=" + ($log -join ","))
     Say "STRATEGY_UPDATE_RESTART_NOTE=gateway_start_is_the_ensure_tasks_job_or_the_operator"
 }

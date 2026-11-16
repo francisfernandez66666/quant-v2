@@ -20574,6 +20574,12 @@ for stage in "UPDATE_STAGE=BACKUP" "UPDATE_STAGE=WRITE" "UPDATE_STAGE=VERSION"; 
 done
 grep_q "function Stop-AutoUpdate" UPT F || fail173 "回读失败不再立 STOP_AUTO_UPDATE 牌（下次会在不明状态上继续投）"
 grep_q "schtasks /Run" UPT F || fail173 "重启客户端不再走计划任务（会话内直起会随会话被杀，10-29 实录）"
+# §RESTART-FIX 20261116：①停网关必须按命令行匹配 gateway.py——按进程名 python 会把
+# 正在跑投递链的 carrier_updater 本体一起杀掉（v39/v44/v46 三次投递输出断在中间的根因）；
+# ②ENABLE 必须先于 schtasks /Run——DISABLED 状态下 /Run 必被 Windows 拒绝，客户端无人拉起，
+# 而 RESULT=OK 照报，重启静默失败三次实盘实录。
+grep_q 'CommandLine -match "gateway\\.py"' UPT F || fail173 "停网关改回按进程名杀 python（会误杀投递链本体，§RESTART-FIX 20261116）"
+grep_q '/ENABLE | Out-Null' UPT F && grep -qF 'ensure_enabled=pre_run' scripts/update_qmt_strategy.ps1 || fail173 "重启时序退回 DISABLE→/Run（禁用任务 /Run 必被拒，客户端无人拉起，§RESTART-FIX 20261116）"
 # 大小写折叠后交给 grep_q，而不是 printf|grep -qi：§129 那把尺子数的就是"整份测试原文
 # 直接管道给 grep -q"的形状——命中即退会打死写方、pipefail 会把判绿读成判红。
 UPTL=$(printf '%s' "$UPT" | tr 'A-Z' 'a-z')
