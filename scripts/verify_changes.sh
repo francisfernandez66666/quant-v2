@@ -22480,3 +22480,136 @@ grep_q 'MUT_189_COUNT=1' MUTOUT189 F || fail189 "§189 C1 变异反证未红：$
 [ "$B189_FAILED" = "0" ] || exit 1
 echo "ok - §189 F8 网关分档锁通过（哨兵+字面量冻结+409分档+前端+用例，累计判定点 ${CNT189}）"
 echo ""
+
+# §191 §20261116-LATE-CLOSEOUT（2026-11-16 12:54–15:01 后期十提交收口：载体投递重启腿/
+# 数据面二期/涨停池/FIN-ALIAS/预算闸观测/盘中透传/订阅修复/成本口径/页面加载慢）。
+# 这十笔功能代码已入库（见 docs/PLAN_CARRIER_FACTOR_DATAFACE_20261116.md 与当日 commit），
+# 但当时只跑测试未补门禁；本段把每笔修复的**防回潮静态锁**与**新增测试在册**补齐，
+# 并附一条 Go 行为腿（intraday 透传）+ 一条 Python 行为腿（成本口径），让门禁真跑而非只看文件在不在。
+echo "==> 191 §20261116-LATE-CLOSEOUT（投递重启腿/数据面二期/涨停池/FIN别名/预算闸/盘中透传/订阅/成本/HTTP3，静态锁+用例在册+行为腿）..."
+B191_FAILED=0
+fail191() {
+	echo "--- FAIL: §191 $*"
+	FAIL=1
+	B191_FAILED=1
+}
+CNT191=0
+
+# —— ① §RESTART-FIX 投递重启腿（4616918）：按 CommandLine 精确杀网关 + ENABLE 先于 /Run ——
+CNT191=$((CNT191 + 1))
+grep -qF 'Get-CimInstance' scripts/update_qmt_strategy.ps1 \
+	|| fail191 "§RESTART-FIX 停网关未用 Get-CimInstance 按 CommandLine 匹配（按进程名 python 会连 carrier_updater 本体一起杀）"
+CNT191=$((CNT191 + 1))
+grep -qF 'schtasks /Change /TN $EnsureTaskName /ENABLE' scripts/update_qmt_strategy.ps1 \
+	|| fail191 "§RESTART-FIX 缺 /Change /ENABLE 前置（DISABLE→/Run→ENABLE 时序必败，Windows 拒绝跑已禁用任务）"
+CNT191=$((CNT191 + 1))
+grep -qF 'ensure_enabled=pre_run' scripts/update_qmt_strategy.ps1 \
+	|| fail191 "§RESTART-FIX 缺 ensure_enabled=pre_run 锚（ENABLE 必须先于 /Run）"
+
+# —— ② §SUBSCRIBE-FIX P0（000444e）：init 真订阅全市场 + 逐票 fallback + 结果打锚 ——
+CNT191=$((CNT191 + 1))
+grep -qF '_fn("subscribe_whole_quote")' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "载体 init 缺 subscribe_whole_quote（get_full_tick 对未订阅票返回空 dict，卖出腿盲区）"
+CNT191=$((CNT191 + 1))
+grep -qF '_subscribe_market(ContextInfo)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "载体 init 未调用订阅函数（注释声称订阅、实际从不订阅的 P0 回潮）"
+CNT191=$((CNT191 + 1))
+grep -qF 'subscribe_market tried=' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "订阅结果未打锚（静默空返回会再次藏住盲区）"
+
+# —— ③ 数据面二期 _ts_code 后缀推断（cc6c67b）：6 位码 → .SH/.SZ/.BJ ——
+CNT191=$((CNT191 + 1))
+grep -qF 'return s + ".SH"' scripts/pregen_carrier_factors_gz.py \
+	|| fail191 "pregen 缺 6 位码 .SH 后缀推断（daily_basic 全市场 5546 只查空的根因）"
+CNT191=$((CNT191 + 1))
+grep -qF 'return s + ".BJ"' scripts/pregen_carrier_factors_gz.py \
+	|| fail191 "pregen 缺 6 位码 .BJ 后缀推断（北交所票查询恒空回潮）"
+
+# —— ④ §FIN-ALIAS（3c66c0b）：tushare 列名对齐 factor_defs 的 fin_pit 键 ——
+CNT191=$((CNT191 + 1))
+grep -qF 'pit["gross_margin"] = pit["grossprofit_margin"]' scripts/pregen_carrier_factors_gz.py \
+	|| fail191 "缺 grossprofit_margin→gross_margin 别名（GrossMargin 因子 declined 回潮）"
+CNT191=$((CNT191 + 1))
+grep -qF 'pit["net_margin"] = pit["netprofit_margin"]' scripts/pregen_carrier_factors_gz.py \
+	|| fail191 "缺 netprofit_margin→net_margin 别名（NetMargin 因子 declined 回潮）"
+
+# —— ⑤ §LIMIT-BOARD（4f0b70b/cc6c67b）：涨停池直拉 + 池外烘 0 + 载体 ctx 透传 ——
+CNT191=$((CNT191 + 1))
+grep -qF 'def fetch_lu_boards' scripts/pregen_carrier_factors_gz.py \
+	|| fail191 "pregen 缺东财涨停池直拉函数（lu_board3 系列因子无源）"
+CNT191=$((CNT191 + 1))
+grep -qF 'out["limit_board_count"] = float(lu_boards.get(code6) or 0.0)' scripts/pregen_carrier_factors_gz.py \
+	|| fail191 "缺池外票 limit_board_count 烘 0（烘 absent 会让整条规则 declined、与外脑永久分叉）"
+CNT191=$((CNT191 + 1))
+grep -qF '"limit_board_count": pre.get("limit_board_count")' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "载体 build_context 未透传 limit_board_count（pregen 烘了但引擎读不到）"
+
+# —— ⑥ 预算闸观测（cc6c67b/3c66c0b）：pass 无预算写 ctx 标记 + 载体聚合 + 小时级日志 ——
+CNT191=$((CNT191 + 1))
+grep -qF 'ctx["_passed_but_no_budget"]' qmt_gateway/rules_factor.py \
+	|| fail191 "rules_factor._emit 缺 pass-but-no-budget 的 ctx 标记（满仓期引擎在跑却无声）"
+CNT191=$((CNT191 + 1))
+grep -qF 'budget_gate rules_passed_but_no_budget=' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "载体缺 budget_gate 小时级观测日志（owner 要求满仓期可见引擎在工作）"
+
+# —— ⑦ §INTRADAY-BUYSIG（419685d）：manifest 透传 intraday_priority（struct + payload）——
+CNT191=$((CNT191 + 1))
+grep -qF 'IntradayPriority bool `json:"intraday_priority"`' internal/server/carrier.go \
+	|| fail191 "carrierManifest 缺 IntradayPriority 字段（盒子 GET 恒缺键、盘中闸恒 SKIP）"
+CNT191=$((CNT191 + 1))
+grep -qF 'out["intraday_priority"] = doc.IntradayPriority' internal/server/carrier.go \
+	|| fail191 "carrierManifestPayload 未透传 intraday_priority（字段在文件、断在透传的回潮）"
+
+# —— ⑧ 成本口径（88774c6）：cost_price 每股 / cost_amount 合计 / 只有合计按 qty 反推 ——
+CNT191=$((CNT191 + 1))
+grep -qF 'def _derive_position_cost' qmt_gateway/broker_reads.py \
+	|| fail191 "缺 _derive_position_cost（只有合计列时无法按 qty 反推每股成本）"
+CNT191=$((CNT191 + 1))
+grep -qF '"cost_amount": (' qmt_gateway/broker_reads.py \
+	|| fail191 "缺 cost_amount 独立别名（持仓成本合计又抢占 cost_price，9.52 显示 9527 回潮）"
+
+# —— ⑨ 投递锚 ASCII 纪律（0f2eae2/eb4c77a）：只记 rc 不回显本地化输出 + ENTER 锚 ——
+CNT191=$((CNT191 + 1))
+grep -qF 'STRATEGY_UPDATE_ENTERED' scripts/update_qmt_strategy.ps1 \
+	|| fail191 "投递脚本缺 STRATEGY_UPDATE_ENTERED 进入锚（无法区分脚本未跑 vs 中途死）"
+
+# —— ⑩ 页面加载慢（88774c6）：Caddy 只开 h1/h2 + UDP 缓冲配置在册 ——
+CNT191=$((CNT191 + 1))
+grep -qF 'protocols h1 h2' deploy/gz-ubuntu/Caddyfile \
+	|| fail191 "Caddy 未显式关闭 HTTP/3（h3 吞吐塌陷 7.2KB/s 拖慢页面回潮）"
+CNT191=$((CNT191 + 1))
+grep -qF 'net.core.rmem_max = 16777216' deploy/gz-ubuntu/99-quic-buffers.conf \
+	|| fail191 "缺 QUIC UDP 缓冲配置在册（配套 h3 关闭文档不完整）"
+
+# —— ⑪ 新增测试在册（后期十提交新增/修改的 4 个测试文件/用例）——
+CNT191=$((CNT191 + 1))
+[ -s qmt_gateway/tests/test_broker_reads_cost_20261116.py ] \
+	|| fail191 "成本口径回归用例不在册（5 例：两列都在每股优先/合计不覆盖/反推/qty=0 不造数/合计=0 不造数）"
+grep -qF 'func TestCarrierIntradayPriorityPassthrough' internal/server/carrier_test.go \
+	|| fail191 "intraday_priority 透传双向断言用例不在册（true→true / 未写→false）"
+grep -qF 'BUILD_GATES gates=9 all_passed=1' qmt_gateway/tests/test_local_executor_build_update.py \
+	|| fail191 "构建闸数断言未随 g10 刷新为 9（ac7fdcb 补 g10 漏改，闸被摘都测不出）"
+grep -qF 'gate_fail_closed_params' qmt_gateway/tests/test_local_executor_build_update.py \
+	|| fail191 "fail-closed params 闸存在性断言缺失（缺 session_windows 的烘参又会被放行）"
+grep -qF 'cntime.Loc' internal/engine/m12_cash_gate_test.go \
+	|| fail191 "M12 资金三态夹具钟回调不在册（钉夹具钟致资金新鲜全天假红回潮）"
+
+# —— ⑫ 行为腿：Go intraday 透传 + Python 成本口径（真跑，不只查文件在不在）——
+GO191=$(go test -count=1 ./internal/server/ -run 'TestCarrierIntradayPriorityPassthrough|TestCarrierManifestArtifactUrlPassthrough' 2>&1 || true)
+if grep_q '^(--- FAIL|FAIL)' GO191; then
+	echo "--- FAIL: §191 Go intraday 透传行为腿："
+	printf '%s\n' "$GO191" | tail -20
+	B191_FAILED=1
+fi
+grep_q '^ok' GO191 || { echo "--- FAIL: §191 Go 行为腿未跑出 ok（编译/导入坏？）"; B191_FAILED=1; }
+PY191=$(py_tests qmt_gateway/tests/test_broker_reads_cost_20261116.py 2>&1 || true)
+if grep_q 'FAILED|ERROR|ModuleNotFound|No such file' PY191; then
+	echo "--- FAIL: §191 Python 成本口径行为腿："
+	printf '%s\n' "$PY191" | tail -20
+	B191_FAILED=1
+fi
+grep_q '5 passed|Ran 5 test' PY191 || { echo "--- FAIL: §191 Python 行为腿未跑满 5 例：$(printf '%s\n' "$PY191" | tail -3)"; B191_FAILED=1; }
+
+[ "$B191_FAILED" = "0" ] || exit 1
+echo "ok - §191 §20261116-LATE-CLOSEOUT 锁通过（投递重启腿/订阅P0/ts后缀/FIN别名/涨停池/预算闸/盘中透传/成本/ENTER锚/HTTP3 静态锁 + 4 用例在册 + Go/Python 双行为腿，累计判定点 ${CNT191}）"
+echo ""
