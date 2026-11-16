@@ -45,6 +45,8 @@ APPLIED = os.path.join(DATA_DIR, "applied_factors.json")
 # 修复：读 OWNER（admin，物理机账号）账号目录的当日文件；缺失时回退根目录旧文件
 # （总比空池好，且 extract_* 对旧日代码同样只做「扩池不买入」）。
 SIGNALS_TODAY = os.path.join(DATA_DIR, "accounts", OWNER_UID, "signals_today.json")
+# §INTRADAY-BUYSIG：上次**发布**时的 buy 信号集合（差分基准；发布腿写回）。
+BUY_STATE_PATH = os.path.join(BUILD_DIR, "qmt_gateway", "buy_signals_state.json")
 if not os.path.exists(SIGNALS_TODAY):
     SIGNALS_TODAY = os.path.join(DATA_DIR, "signals_today.json")
 # §NEWS-GATE 2026-11-12（R10/R11/R12）：脑侧资讯闸快照——烘焙唯一真源（取代旧
@@ -118,6 +120,35 @@ def extract_bullish():
         if c not in pool or score > pool[c]["score"]:
             pool[c] = {"score": score, "source": src[:24]}
     return pool
+
+
+def extract_buy_codes():
+    """§INTRADAY-BUYSIG（2026-11-16 owner 拍板）：今日全部 buy 信号代码集合——
+    与上次**发布**时的集合做差分，新增非空即置 manifest.intraday_priority=true，
+    让盘中班次（≤10 分钟）把含新信号的载体投下去并有序重启客户端；否则普通
+    版本推进只能等 15:40 收盘班次（今天 4 个 93~99 分 buy 信号因此全天没下盒）。
+    行的字段以 signals_today.json 实测为准：action/kind=="buy"（watch/N形观察
+    不是买入意图），direction 在 ("做空","利空") 的行剔除。English: today's buy
+    signal codes; a non-empty diff vs the last PUBLISH flips intraday_priority."""
+    buys = set()
+    try:
+        with open(SIGNALS_TODAY, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return buys
+    rows = data if isinstance(data, list) else (data or {}).get("signals") or []
+    for s in rows:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("direction") or "") in ("做空", "利空"):
+            continue
+        kind = str(s.get("action") or s.get("kind") or "").lower()
+        if kind != "buy":
+            continue
+        c = norm(s.get("code"))
+        if len(c) == 6 and c.isdigit():
+            buys.add(c)
+    return buys
 
 
 def extract_signal_codes():
@@ -474,6 +505,7 @@ def main():
                               reversal_events, ensure_ascii=True,
                               sort_keys=True).encode()).hexdigest()[:16],
                           "signal_pool": signal_pool, "precalc": precalc_meta,
+                          "buy_codes": sorted(extract_buy_codes()),
                           "buckets": {"industry": len(_bp.get("industry_map") or {}),
                                       "concept": len(_bp.get("concept_map") or {}),
                                       "digest": hashlib.sha256(json.dumps(
@@ -548,6 +580,16 @@ def main():
     json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 
+    # §INTRADAY-BUYSIG：本次 buy 集合 vs 上次发布基准的差分 → intraday_priority。
+    buys_now = extract_buy_codes()
+    try:
+        buys_prev = set(json.load(open(BUY_STATE_PATH, encoding="utf-8")))
+    except (OSError, ValueError):
+        buys_prev = set()
+    new_buys = sorted(buys_now - buys_prev)
+    print("HOTRELOAD_BUY_DIFF now=%d prev=%d new=%d %s" % (
+        len(buys_now), len(buys_prev), len(new_buys), ",".join(new_buys[:12])))
+
     # 3) 版本号 +1 自动 bump（vNN-YYYYMMDD）。§VER-COLLISION-20261112：out_dir 里
     # 历史产物会按字典序被 sorted()[-1] 错拿（v18>v17 ⇒ 11-12 实锤 pool=600 新产物
     # 被丢、发布的还是旧 v18 文件——AGENTS「11-11 v14/v15/v17 混名事故」的代码位置）。
@@ -597,10 +639,19 @@ def main():
         "mode": "live",
         # §NEWS-GATE（R11）：盘中反转事件存在 ⇒ 盒子盘中拉取班次（QMTF-Carrier-Update-Intraday）
         # 允许在盘中投递+重启（否则盘中班次只记账不动客户端，重启窗口留给反转/收盘后班次）。
-        "intraday_priority": bool(reversal_events),
+        # §INTRADAY-BUYSIG（2026-11-16 owner 拍板）：盘中新 buy 信号同样走 intraday——
+        # 差分基准是**上次发布**（buy_signals_state.json 只在发布腿写回，NOTHING_TO_DO
+        # 轮不写，否则一次空轮就会把新信号吃掉）；每次投递重启 1~2 分钟，同集合天然防抖。
+        "intraday_priority": bool(reversal_events) or bool(new_buys),
     }
     json.dump(manifest, open(os.path.join(manifest_dir, "carrier_manifest.json"), "w",
                              encoding="utf-8"), ensure_ascii=True, indent=2)
+    # §INTRADAY-BUYSIG：发布腿才推进 buy 信号基准（NOTHING_TO_DO 轮绝不写，
+    # 否则新信号被一次空轮消费、永远到不了盘中班次）。
+    try:
+        json.dump(sorted(buys_now), open(BUY_STATE_PATH, "w", encoding="utf-8"))
+    except OSError as exc:
+        print("HOTRELOAD_BUY_STATE_FAIL %s" % type(exc).__name__)
 
     # §NEWS-GATE（R11）：盘中反转发布 → SSH 兜底立即触发盒子盘中拉取（不等 10 分钟班次）。
     if reversal_events:

@@ -52,7 +52,16 @@ LOCAL_VOL_MULT = float(os.environ.get("PREGEN_LOCAL_VOL_MULT", "100"))
 FLOW_DIR = os.environ.get("PREGEN_FLOW_DIR", "/var/lib/quant-trading-v2/moneyflow_history")
 BAKE_SERIES_N = int(os.environ.get("PREGEN_SERIES_N", "20"))
 SLEEP_MS = int(os.environ.get("PREGEN_SLEEP_MS", "80"))
-MAX_CODES = int(os.environ.get("SIGNAL_POOL_MAX", "600"))
+# §PRECALC-SERIES（2026-11-16 owner 拍板，PLAN_CARRIER_FACTOR_DATAFACE_20261116）：
+# 池子 11-13 已扩到 1000 而 pregen 写死 600 —— 403 只连基线都没有。改为缺省覆盖
+# params.symbols 全量；PREGEN_MAX_CODES>0 时显式截断（200 只试点实测 QMT 加载体积用）。
+MAX_CODES = int(os.environ.get("PREGEN_MAX_CODES", "0"))
+# 序列烘焙：61 因子全部 input="bars"（factor_defs 实测 max_window=60），载体
+# _precalc_bars 无本地历史时整段消费。N=80 与载体 bars_count(80) 对齐；价格×1000
+# int 化压体积（1000 票×80 根≈2.6MB，断言 A5：QMT 对 3MB 产物的加载需 200 只试点先行）。
+SERIES_BARS_N = int(os.environ.get("PREGEN_SERIES_BARS", "80"))
+SERIES_PRICE_SCALE = 1000
+MIN_SEQ_BARS = 5   # 少于 5 根的序列没有因子价值，不烘（如实缺）
 
 
 def fetch_klines(symbol):
@@ -84,10 +93,40 @@ def fetch_klines(symbol):
         try:
             bars.append({"close": float(fields[4]), "high": float(fields[2]),
                          "low": float(fields[3]),
-                         "volume": float(fields[5]) * VOL_UNIT_MULT})
+                         "volume": float(fields[5]) * VOL_UNIT_MULT,
+                         "date": fields[0],
+                         "amount": float(fields[6]) if len(fields) > 6 and fields[6] else 0.0})
         except (ValueError, IndexError):
             continue
     return bars or None
+
+
+def bars_seq(bars):
+    """§PRECALC-SERIES（2026-11-16 owner 拍板）：最近 SERIES_BARS_N 根日线 →
+    紧凑序列 [high,low,close,volume,amount]（价格×1000 int），喂给载体
+    _precalc_bars（61 因子全部 input="bars"，bars_coverage 实测仅 52/961——
+    序列是唯一能激活因子引擎的腿）。只接受 hithink 源（口径统一前复权，
+    与本地 bars 绝不拼接——两源口径不同，接缝假跳变会污染动量类因子）。
+    盘前语义：止于上一交易日，当日 bar 由载体用 tick 合成。
+    English: last N daily bars, compact int rows; hithink source only."""
+    tail = bars[-SERIES_BARS_N:]
+    if len(tail) < MIN_SEQ_BARS:
+        return None
+    rows = []
+    for b in tail:
+        try:
+            rows.append([int(round(b["high"] * SERIES_PRICE_SCALE)),
+                         int(round(b["low"] * SERIES_PRICE_SCALE)),
+                         int(round(b["close"] * SERIES_PRICE_SCALE)),
+                         int(round(b["volume"])),
+                         int(round(b.get("amount") or 0.0)),
+                         int(str(b.get("date") or "0")[:8] or 0)])
+        except (KeyError, ValueError, TypeError):
+            continue
+    if len(rows) < MIN_SEQ_BARS:
+        return None
+    return {"n": len(rows), "d0": int(str(tail[0].get("date") or "0")[:8] or 0),
+            "scale": SERIES_PRICE_SCALE, "rows": rows}
 
 
 def fetch_local_daily(symbol, db_path=LOCAL_DB):
@@ -275,7 +314,9 @@ def main():
         print("BUCKETS_STEP rc=exc %r" % (exc,))
     with open(PARAMS_PATH, "r", encoding="utf-8") as fh:
         params = json.load(fh).get("params") or {}
-    symbols = list(params.get("symbols") or [])[:MAX_CODES]
+    symbols = list(params.get("symbols") or [])
+    if MAX_CODES > 0:
+        symbols = symbols[:MAX_CODES]
     if not symbols:
         print("PREGEN_RESULT day= codes=0 ok=0 fail=0 elapsed_s=0 (no symbols)")
         return 2
@@ -286,6 +327,10 @@ def main():
             bars = fetch_klines(symbol)
             fact = compute(bars) if bars else None
             src = "hithink"
+            if fact:
+                seq = bars_seq(bars)
+                if seq:
+                    fact["bars_seq"] = seq
             if not fact:
                 # owner 2026-11-11 14:2x：云端自动研究库（5546 只）兜底——hithink 无覆盖/
                 # 拉取失败的票，用本地 trading.db.daily；data_day 让 staleness 可见。

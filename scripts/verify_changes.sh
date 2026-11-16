@@ -21727,8 +21727,17 @@ CNT176=$((CNT176 + 1))
 grep -qF 'doc2["params"]["force_sell_boost"] = {' scripts/carrier_hot_reload_gz.py \
 	|| fail176 "force_sell_boost 卖出加速桶未烘焙（R10）"
 CNT176=$((CNT176 + 1))
-grep -qF '"intraday_priority": bool(reversal_events)' scripts/carrier_hot_reload_gz.py \
-	|| fail176 "manifest 未带 intraday_priority（盘中班次闸的开关面）"
+grep -qF '"intraday_priority": bool(reversal_events) or bool(new_buys)' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "manifest 未带 intraday_priority（盘中班次闸的开关面；§INTRADAY-BUYSIG 20261116 后=反转事件 OR 新 buy 信号差分）"
+CNT176=$((CNT176 + 1))
+grep -qF 'def extract_buy_codes' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "buy 信号提取函数不在册（盘中新信号差分的来源腿）"
+grep -qF 'BUY_STATE_PATH' scripts/carrier_hot_reload_gz.py \
+	|| fail176 "buy 信号差分基准状态文件不在册（NOTHING_TO_DO 轮绝不写回，否则新信号被空轮吃掉）"
+grep -qF 'bars_seq' scripts/pregen_carrier_factors_gz.py \
+	|| fail176 "pregen 序列烘焙不在册（§PRECALC-SERIES 20261116：61 因子全吃 bars，无序列=因子引擎全弃权）"
+grep -qF '_precalc_bars' qmt_gateway/qmt_internal_strategy.py \
+	|| fail176 "载体 precalc 序列消费腿不在册（整段替换不拼接：两源复权口径不同）"
 CNT176=$((CNT176 + 1))
 grep -qF 'if reversal_events:' scripts/carrier_hot_reload_gz.py \
 	|| fail176 "反转发布后未触发 SSH 兜底（R11 计划任务失败走 SSH）"

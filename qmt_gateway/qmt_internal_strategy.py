@@ -834,6 +834,57 @@ def _pump_legacy_downloads(ContextInfo):
     _log("day_bars_download legacy batch done=%d remain=%d" % (ok, len(_STATE["dl1_pending"])))
 
 
+def _precalc_bars(symbol, tick):
+    """PRECALC-SERIES (2026-11-16 owner): decode the pregen bars_seq into bar
+    dicts and append one synthetic in-progress bar from the live tick.
+
+    All 61 factor_defs consume input="bars" (daily series), and this build has
+    no downloader API -- bars_coverage was 52/961, so the factor engine
+    abstained on 96% of the pool and never even reached the max_positions
+    refusal. The pregen sequence (hithink daily bars, forward-adjusted, ending
+    on the previous session) is the only data leg that can feed them.
+
+    Two hard rules here:
+      * WHOLE-SEQUENCE REPLACEMENT ONLY: local bars (get_market_data_ex) and
+        the pregen series use different adjustment bases; splicing them at a
+        seam would fabricate a one-day jump that poisons momentum/breakout.
+        The caller decides which source wins; this function never merges.
+      * NEVER INVENT: a symbol without bars_seq keeps the honest abstain.
+
+    The synthetic today-bar carries real close/volume/amount from the tick;
+    open/high/low stay None because get_full_tick has no such fields, so
+    HighLow/Atr family factors decline on today's bar only while the
+    close/volume/amount family (Mom/Brk/VMA/Alpha/RSI/VolSurge ...) stays
+    live. Rows are ints scaled by 1000 on the pregen side (see bars_seq).
+    """
+    seq = ((PARAMS.get("precalc") or {}).get(symbol) or {}).get("bars_seq")
+    if not isinstance(seq, dict):
+        return []
+    scale = seq.get("scale") or 1000
+    rows = seq.get("rows") or []
+    bars = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 4:
+            continue
+        try:
+            bars.append({"open": None,
+                         "high": row[0] / float(scale),
+                         "low": row[1] / float(scale),
+                         "close": row[2] / float(scale),
+                         "volume": float(row[3]),
+                         "amount": float(row[4]) if len(row) > 4 else None})
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not bars:
+        return []
+    if tick and tick.get("last_price"):
+        bars.append({"open": None, "high": None, "low": None,
+                     "close": tick.get("last_price"),
+                     "volume": tick.get("volume"),
+                     "amount": tick.get("amount")})
+    return bars
+
+
 def _bars_of(payload, symbol):
     """get_market_data_ex payload -> bar dicts for the rules library.
 
@@ -1038,7 +1089,14 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     # Derived features mirror the Go adapters (ma/vol windows over the last bars,
     # today's tick volume vs the 5-day average). precalc passthrough covers ONLY
     # what QMT cannot provide (valuation/turnover/fin/flow/news=D1/concept heat).
+    # PRECALC-SERIES (2026-11-16 owner): when the client's own history is short
+    # of the factor windows, the pregen sequence replaces it WHOLE (never
+    # spliced -- different adjustment bases must not meet at a seam) and one
+    # synthetic today-bar from the live tick is appended. A symbol with NEITHER
+    # source keeps the honest abstain.
     bars = _bars_of(_hist_bars(ContextInfo, symbol), symbol)
+    if len(bars) < 20:
+        bars = _precalc_bars(symbol, tick)
     closes = [b["close"] for b in bars if b.get("close")]
     vols = [b["volume"] for b in bars if b.get("volume")]
     ma5 = _mean_tail(closes, 5)
