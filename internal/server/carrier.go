@@ -146,6 +146,12 @@ type carrierManifest struct {
 	RequestedAt *string `json:"requested_at"`
 	// RequestState idle / pending / acked / failed（读侧可能报 unknown，那个值不会落盘）。
 	RequestState string `json:"request_state"`
+	// IntradayPriority §NEWS-GATE R11 + §INTRADAY-BUYSIG 20261116：true ⇒ 盒子盘中班次
+	// （--intraday 轮）允许投递本版并有序重启客户端；false ⇒ 盘中 SKIP、等 15:40 收盘班次。
+	// 2026-11-16 实证缺陷：本字段 11-12 起就写在 manifest 文件里，但 struct 与 payload 都没
+	// 透传——盒子读到的恒缺省 false，盘中班次闸恒 SKIP（反转/新信号全靠 SSH 兜底腿），
+	// 与 carrier_updater.py:483 的闸判定（is not True）两头语义齐全、中间这一跳断了。
+	IntradayPriority bool `json:"intraday_priority"`
 	// LastAck 最近一次**被接受**的回执；从没收到过是 null。
 	LastAck *carrierAck `json:"last_ack"`
 }
@@ -286,10 +292,15 @@ func carrierManifestPayload(doc *carrierManifest, unknownReason string) map[stri
 		"request_state":    carrierStateUnknown,
 		"has_artifact_url": false, // 缺省不供字节；盒子据此走本机重烘那条兜底腿
 		"brain_ack_schema": "carrier-ack-v1",
+		// IntradayPriority 恒在位（bool 零值=false=盘中 SKIP）：盒子闸判定是
+		// `manifest.get("intraday_priority") is not True`，键缺席与 false 同判——
+		// 但恒在位让「文件写了 true、API 却没透传」这类断层在盒侧日志里可判读。
+		"intraday_priority": false,
 	}
 	if doc == nil {
 		return out
 	}
+	out["intraday_priority"] = doc.IntradayPriority
 	out["strategy_version"] = doc.StrategyVersion
 	out["strategy_sha256"] = doc.StrategySha256
 	// artifact_url 只在清单真给了地址时下发：空串不发（保持"本批不供字节"的缺省形态），

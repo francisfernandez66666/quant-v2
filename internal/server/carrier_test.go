@@ -292,10 +292,17 @@ func TestCarrierManifestArtifactUrlPassthrough(t *testing.T) {
 	if body["has_artifact_url"] != true {
 		t.Fatalf("清单给了地址 ⇒ has_artifact_url 必须 true，实得 %v", body["has_artifact_url"])
 	}
+	// §INTRADAY-BUYSIG 20261116：intraday_priority 必须从 manifest 文件透传到 API——
+	// 11-12 起该字段只写文件不进 payload，盒子盘中班次闸恒 SKIP（反转/新信号全废），
+	// 与 artifact_url 被吞是同族断层（键在文件、断在透传），用同一把锁钉住。
+	if body["intraday_priority"] != false {
+		t.Fatalf("未写 intraday_priority 的清单 ⇒ API 必须 false 恒在位，实得 %v", body["intraday_priority"])
+	}
 	want := "https://quant-trading.top/leg/carrier/qmt_internal_strategy_v91-20261109.py"
 	if got, _ := body["artifact_url"].(string); got != want {
 		t.Fatalf("artifact_url 必须逐字透传：want %q got %q", want, got)
 	}
+
 	// 非法形状（非 http/https）不得下发——盒子侧还会再挡一次，两层同口径。
 	writeCarrierFile(t, s, leg.ID, &carrierManifest{
 		StrategyVersion: "v91-20261109", StrategySha256: carrierShaSample,
@@ -876,5 +883,28 @@ func TestCarrierUnknownStateReadsBadPersistedState(t *testing.T) {
 	// 对照：空串＝从没点过＝idle（合法空态，与"读不懂"是两格，不许合并）。
 	if normalizeCarrierState("") != carrierStateIdle {
 		t.Fatal("空状态应归 idle（从没点过），别和读不懂混成一格")
+	}
+}
+
+// TestCarrierIntradayPriorityPassthrough §INTRADAY-BUYSIG 20261116：manifest 文件里的
+// intraday_priority 必须透传到 GET 响应（true→true；未写→false 恒在位）。11-12 起该字段
+// 只落文件不进 payload，盒子盘中班次闸恒 SKIP——键在文件、断在透传，与 artifact_url 被吞同族。
+func TestCarrierIntradayPriorityPassthrough(t *testing.T) {
+	s := newCarrierServer(t)
+	leg := newCarrierLeg(t, s, "carrier-intraday", "KEY-INTRADAY")
+	writeCarrierFile(t, s, leg.ID, &carrierManifest{
+		StrategyVersion: "v44-20261116", StrategySha256: carrierShaSample,
+		IntradayPriority: true,
+	})
+	body := decodeCarrierResp(t, carrierGetWithKey(s, "KEY-INTRADAY"))
+	if body["intraday_priority"] != true {
+		t.Fatalf("清单写 true ⇒ API 必须 true（盘中班次闸靠它放行），实得 %v", body["intraday_priority"])
+	}
+	writeCarrierFile(t, s, leg.ID, &carrierManifest{
+		StrategyVersion: "v45-20261116", StrategySha256: carrierShaSample,
+	})
+	body = decodeCarrierResp(t, carrierGetWithKey(s, "KEY-INTRADAY"))
+	if body["intraday_priority"] != false {
+		t.Fatalf("未写字段 ⇒ API 必须 false 恒在位，实得 %v", body["intraday_priority"])
 	}
 }
