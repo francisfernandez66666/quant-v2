@@ -21853,6 +21853,9 @@ CNT190=$((CNT190 + 1))
 grep -qF 'gap > 2*time.Minute' internal/engine/scoring_loop.go || fail190 "看门狗缺 2min 停摆阈值"
 CNT190=$((CNT190 + 1))
 grep -qF 'opslog.Logf("quant", "打分循环停摆告警' internal/engine/scoring_loop.go || fail190 "停摆告警缺 opslog 留痕"
+# 判定 18：持仓页纸面 tab 全局隐藏（2026-11-16 owner 加单需求；恢复=改回 true）
+CNT190=$((CNT190 + 1))
+grep -qF 'const SHOW_PAPER_TAB = false' web/src/pages/Positions.jsx || fail190 "纸面持仓 tab 未全局隐藏"
 [ "$B190_FAILED" = "0" ] || exit 1
 echo "ok - §190 §20261116-DEADLOCK 锁通过（锁内禁嵌套5判定/解锁后求值/超时兜底/心跳看门狗，累计判定点 ${CNT190}）"
 echo ""

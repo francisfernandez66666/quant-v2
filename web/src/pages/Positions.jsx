@@ -136,7 +136,11 @@ export default function Positions() {
   // 前端只消费 total_pnl/pnl_offset 两个读数（原 [totalRealizedPnl, setTotalRealizedPnl] 删除）。
 
   // 当前账本标签：paper=纸面持仓，real=实盘持仓
-  const [bookTab, setBookTab] = useState('paper')
+  // §HIDE-PAPER-TAB（2026-11-16 owner 需求）：持仓页全局隐藏纸面持仓 tab——默认落在实盘，
+  // 纸面面板由 SHOW_PAPER_TAB=false 整体摘除（数据/接口都还在，只藏 UI；要恢复改回 true
+  // 并把初始 bookTab 改回 'paper' 即可）。
+  const SHOW_PAPER_TAB = false
+  const [bookTab, setBookTab] = useState(SHOW_PAPER_TAB ? 'paper' : 'real')
   // QMT 网关状态（启用/模式/熔断/网关地址）
   const [qmtState, setQmtState] = useState({ enabled: false, mode: 'manual', tripped: false, gateway_url: '' })
   // 实盘持仓列表
@@ -1329,6 +1333,10 @@ export default function Positions() {
       </Card>
 
       <Tabs value={bookTab} onChange={(v) => switchBook(v)}>
+        {/* §HIDE-PAPER-TAB（2026-11-16）：纸面持仓面板全局隐藏（SHOW_PAPER_TAB=false）。
+            恢复方式：把上面的 SHOW_PAPER_TAB 改回 true。纸面数据链路（load/轮询/写接口）
+            原样保留，只是不在界面上露出。 */}
+        {SHOW_PAPER_TAB && (
         <Tabs.TabPanel value="paper" label="纸面持仓">
           {/* §E1 可达性补腿（2026-09-26）：实盘数据在位时页头被 §F1 回落让位给实盘盈亏，
               纸面「总盈亏+清零」若无此处则整页不可达——真实接了 QMT 的用户将永远点不到清零。
@@ -1399,6 +1407,7 @@ export default function Positions() {
             <span>N≥60可买 龙≥60买 量≥50关注</span>
           </div>
         </Tabs.TabPanel>
+        )}
 
         <Tabs.TabPanel value="real" label={realTripped ? '实盘持仓 !' : '实盘持仓'}>
           {/* §PERM-GATE 20260918：实盘读端点原为 admin 守卫，成员 403 曾被 loadReal 的 catch
