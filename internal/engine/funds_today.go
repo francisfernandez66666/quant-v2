@@ -420,7 +420,7 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 		f.CurStrat = cur
 		f.Room = room
 		f.MarketScale = ctx.MS
-		f.IndexPct = ctx.IndexPct  // §LIVE-T-20261116：大盘涨跌同帧烘给物理机 T 方向门
+		f.IndexPct = ctx.IndexPct // §LIVE-T-20261116：大盘涨跌同帧烘给物理机 T 方向门
 		f.MissingKey = ctx.Missing
 		// §INDEX-BLIND：维度与来源同帧写出去（读改写同一个 f，字段互不覆盖的分工不变）。
 		f.MissingKeyDims = append([]string(nil), ctx.MissingDims...)
