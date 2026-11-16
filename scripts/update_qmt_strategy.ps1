@@ -248,8 +248,11 @@ if ($SkipRestart) {
     } catch { $log += ("client_kill=warn:" + $_.Exception.Message) }
     Start-Sleep -Milliseconds 800
     try {
-        $runOut = schtasks /Run /TN $EnsureTaskName 2>&1
-        $log += ("task_run=" + $(if ($LASTEXITCODE -eq 0) { "ok" } else { "rc$LASTEXITCODE:" + ($runOut | Select-Object -First 1) }))
+        schtasks /Run /TN $EnsureTaskName 2>&1 | Out-Null
+        # ASCII-only anchor: NEVER echo localized schtasks output into the log --
+        # the updater decodes this stream as UTF-8 and a GBK byte (0xCB) crashes
+        # its reader thread (UnicodeDecodeError -> updater rc=1, 2026-11-16 live).
+        $log += ("task_run=" + $(if ($LASTEXITCODE -eq 0) { "ok" } else { "rc$LASTEXITCODE" }))
     } catch { $log += ("task_run=warn:" + $_.Exception.Message) }
     Say ("STRATEGY_UPDATE_RESTART=" + ($log -join ","))
     Say "STRATEGY_UPDATE_RESTART_NOTE=gateway_start_is_the_ensure_tasks_job_or_the_operator"
