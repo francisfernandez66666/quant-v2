@@ -64,11 +64,15 @@ SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "1000"))  # owner 2026-1
 
 
 def die(reason):
+    """带 ASCII 锚的硬退出：HOTRELOAD_GZ_ABORT reason=...——任何烘焙前置失败
+    （快照漂移/同步失败/闸门红）都必须走这里点名成因，绝不带病继续发布。"""
     print("HOTRELOAD_GZ_ABORT reason=%s" % reason)
     sys.exit(1)
 
 
 def norm(code):
+    """信号代码归一化成 6 位纯数字：剥 .SZ/.SH/.BJ 后缀并大写——signals_today
+    与利空/利好池里的代码形态不一（600519.SH/600519），监视池与差分都以此为唯一口径。"""
     c = str(code or "").strip().upper()
     for suf in (".SZ", ".SH", ".BJ"):
         if c.endswith(suf):
@@ -421,6 +425,8 @@ def rebuild_snapshots(qc, rules, wl):
 
 
 def run(cmd, cwd=None):
+    """跑子流程并回显最后一行日志（rc/输出尾行可见——烘焙链每步的失败都要留痕，
+    不静默吞）；返回 CompletedProcess，调用方按 returncode 决定 die 还是继续。"""
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     tail = (r.stdout + r.stderr).strip().splitlines()
     print("  RUN %s rc=%d %s" % (" ".join(cmd[-2:]), r.returncode, tail[-1] if tail else ""))
@@ -428,6 +434,9 @@ def run(cmd, cwd=None):
 
 
 def main():
+    """烘焙发布主流程：快照重建 → 双派生（漂移 ABORT）→ 利空归因/利好池/D1 资讯闸
+    烘参 → 版本 bump → 10 闸构建 → 发布产物+manifest → SSH 兜底触发。sha 无变化
+    时 NOTHING_TO_DO 幂等空轮；--force 跳过 sha 比对（事故恢复/试点实测用）。"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true", help="skip sha compare")
     args = ap.parse_args()
@@ -659,8 +668,9 @@ def main():
 
     with open(STATE, "w") as fh:
         fh.write(sha)
-    print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d bullish=%d pool=%d" % (
-        ver, sha_art, len(wl), len(bearish), len(top), len(doc2["params"].get("symbols") or [])))
+    print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d bullish=%d pool=%d new_buys=%d" % (
+        ver, sha_art, len(wl), len(bearish), len(top), len(doc2["params"].get("symbols") or []),
+        len(new_buys)))
     return 0
 
 

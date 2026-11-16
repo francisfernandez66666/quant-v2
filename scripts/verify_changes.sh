@@ -21739,6 +21739,9 @@ grep -qF 'bars_seq' scripts/pregen_carrier_factors_gz.py \
 grep -qF '_precalc_bars' qmt_gateway/qmt_internal_strategy.py \
 	|| fail176 "载体 precalc 序列消费腿不在册（整段替换不拼接：两源复权口径不同）"
 CNT176=$((CNT176 + 1))
+[ -s qmt_gateway/tests/test_precalc_series.py ] || fail176 "PRECALC-SERIES 回归用例不在册（P1-P6：roundtrip/诚实截断/解码+合成今日 bar/缺失不编造/整段替换/因子可算）"
+[ -s qmt_gateway/tests/test_hotreload_buy_codes.py ] || fail176 "盘中 buy 信号差分用例不在册（B1 过滤/B2 状态契约）"
+CNT176=$((CNT176 + 1))
 grep -qF 'if reversal_events:' scripts/carrier_hot_reload_gz.py \
 	|| fail176 "反转发布后未触发 SSH 兜底（R11 计划任务失败走 SSH）"
 CNT176=$((CNT176 + 1))

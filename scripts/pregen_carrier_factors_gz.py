@@ -297,6 +297,9 @@ def _write_status(day, symbols_n, ok, fail_n, consec_fail, recovered):
 
 
 def main():
+    """盘前预计算主流程：桶回填 → 全量拉日线（基线 6 字段 + bars_seq 序列）→
+    原子写产物 → 状态落盘/通知。单票失败计数可见绝不拖全局；退出码
+    0=成功（ok≥1）/2=无码可跑/3=全部失败（§B 机制按 coverage 判连续失败推手机）。"""
     started = time.time()
     # §BUCKETS-20261112：集中度桶回填（行业/概念映射自装机以来恒空，载体桶闸
     # fail-closed 拒全部买入）。独立 venv 脚本多源补齐（baostock/东财/雪球）；
