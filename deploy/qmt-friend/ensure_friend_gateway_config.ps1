@@ -1,4 +1,4 @@
-# ensure_friend_gateway_config.ps1 —— 朋友机器网关配置的生成与自证（§FRIEND-PROFILE，2026-11-02 批 1）
+﻿# ensure_friend_gateway_config.ps1 —— 朋友机器网关配置的生成与自证（§FRIEND-PROFILE，2026-11-02 批 1）
 #
 # 职责：把 config.xt.friend.template.json 的占位符换成这台机器自己的四元
 #       （资金账号 / 归属账号 / 一把钥匙 / overlay 地址），落盘前备份、落盘后**让网关自己判一次**。

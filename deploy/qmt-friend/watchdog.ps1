@@ -1,4 +1,4 @@
-# watchdog.ps1 —— 朋友机器的每日节拍与"收盘关闭门"（§FRIEND-PROFILE 批 2，2026-11-02）
+﻿# watchdog.ps1 —— 朋友机器的每日节拍与"收盘关闭门"（§FRIEND-PROFILE 批 2，2026-11-02）
 #
 # 职责：一台朋友机器上的三个定时动作，全部由这一个脚本承载（-Mode 分流），
 #       这样"每日节拍"的真相只有一个文件，改判据只改一处：
@@ -127,6 +127,9 @@ switch ($Mode) {
                 foreach ($ln in (Get-Content $envFile)) {
                     if ($ln -match "^QUANT_GATEWAY_BIND=(.+)$") { $env:QUANT_GATEWAY_BIND = $Matches[1].Trim() }
                     if ($ln -match "^ALLOWED_IPS=(.+)$") { $env:ALLOWED_IPS = $Matches[1].Trim() }
+                    # 2026-11-16 实证：出厂默认 C:\Python312 在现网盒子不存在（真身是
+                    # friend.env 的 PYTHON_EXE），不读它则 profile-check 必失败、拉起链断。
+                    if ($ln -match "^PYTHON_EXE=(.+)$") { $PythonExe = $Matches[1].Trim() }
                 }
             }
             $eapG = $ErrorActionPreference

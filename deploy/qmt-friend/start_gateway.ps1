@@ -1,4 +1,4 @@
-# start_gateway.ps1 —— 朋友机器网关纯拉起器（§FRIEND-PROFILE 批 2 补，2026-11-08）
+﻿# start_gateway.ps1 —— 朋友机器网关纯拉起器（§FRIEND-PROFILE 批 2 补，2026-11-08）
 #
 # 为什么单独一个文件（而不是看门狗 /Run 自己）：watchdog GatewayEnsure 只负责"判端口 + 跑自证 +
 # 触发拉起"，真正的拉起必须是一个**独立**的计划任务（QMTF-Gateway-Start），与 QMTF-Client-Start

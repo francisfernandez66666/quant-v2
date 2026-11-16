@@ -1,4 +1,4 @@
-# install_tasks.ps1 —— 朋友机器上四个计划任务的注册/注销（§FRIEND-PROFILE 批 2，2026-11-02）
+﻿# install_tasks.ps1 —— 朋友机器上四个计划任务的注册/注销（§FRIEND-PROFILE 批 2，2026-11-02）
 #
 # 为什么必须是计划任务而不是脚本自己常驻：
 #   1) QMT 客户端要求交互式桌面会话，服务账号起不来（现网同形：QMT-Ensure-Running 走计划任务）；
