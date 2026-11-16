@@ -68,6 +68,8 @@ class SessionAndPricingTest(unittest.TestCase):
     # ---- T2: trading-session whitelist -----------------------------------
     def test_session_matrix(self):
         """14 clock points + weekend: only the two cash sessions are open."""
+        # 十四个钟点加周末：只有两段现金交易时段放行，其余一律拒单。
+        # 这张矩阵锁住开盘/午休/收盘边界，防止某分钟误放行造成裸单。
         cases = [
             ((2026, 11, 13, 0, 0), False, "overnight 00:00 (the incident)"),
             ((2026, 11, 13, 8, 55), False, "pre-open"),
@@ -140,6 +142,7 @@ class SessionAndPricingTest(unittest.TestCase):
         self.assertEqual(summary["reason"], "outside_trading_session")
 
     # ---- T3: pending buys feed the EXISTING sizing chain -----------------
+    # 在途买单只能算"自己的"：柜台里别人的单或已撤单若被计入，会错误压低本轮可用额度。
     def test_pending_buy_rows_only_count_our_open_buys(self):
         orders = [
             {"short_code": "PB600000", "terminal": False,

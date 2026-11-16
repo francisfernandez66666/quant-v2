@@ -5,6 +5,8 @@ package config
 
 import "testing"
 
+// TestStockBoardOf 校验板块归类：按代码前缀把个股归入主板/创业板/科创板/北交所，
+// 涨跌停幅度与做 T 的限价带都据此取值，前缀判错会让限价单打在错误的档位上。
 func TestStockBoardOf(t *testing.T) {
 	cases := []struct {
 		code string

@@ -189,6 +189,11 @@ type tLiveFunds struct {
 	DoneRounds   int     `json:"done_rounds"`    // 当日已完成轮数
 	PnlNet       float64 `json:"pnl_net"`        // 当日 T 已实现净额（仅 done 轮）
 	PnlGross     float64 `json:"pnl_gross"`      // 当日 T 已实现毛额
+
+	// §LIVE-T-20261116 IndexPct 大盘指数涨跌（%）：T 方向门的"大盘急跌停正 T"判据。
+	// 与 MarketScale 同帧写入，由外脑烘进物理机载体——沙箱零外部输入拿不到指数。
+	// 0 是合法读数（指数平盘）；缺失用 IndexSource 空判断，不能把 0 当"没读到"。
+	IndexPct float64 `json:"index_change_pct"`
 }
 
 // tLiveCostDaily 当日成本分解（与 paper.TCostDaily 同名字段同语义，前端一套渲染）。

@@ -477,7 +477,7 @@ PARAMS = {
     't_session_open_hhmm': '09:30',
     't_session_windows': [['08:30', '15:00']],
     't_shadow': False,
-    't_signal_codes': {},
+    't_signal_codes': {'t_buy_first': 'TB', 't_buy_first_pair': 'TS', 't_sell_first': 'XB', 't_sell_pair': 'XS', 't_close_out': 'TC'},
     't_slippage_bps': 5,
     't_st_markers': ['ST'],
     't_stale_order_sec': 900,

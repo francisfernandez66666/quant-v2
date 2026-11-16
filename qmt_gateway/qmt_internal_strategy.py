@@ -1412,6 +1412,189 @@ def _cancel(order_id):
     return False, "cancel failed: %s" % (" | ".join(errs[-2:]),)
 
 
+def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summary):
+    """LIVE-T-20261116: drive the intraday round-trip (zuo T) layer from the counter.
+
+    The T state machine (t_round_state / TRoundBook / t_gate_open ...) is inlined
+    into this artifact from rules_t.py by the builder; the template source does
+    not name them, so we resolve them defensively and no-op if a build lacks them.
+
+    Data the T gates need arrives BAKED (this carrier has zero external I/O):
+      * params.t_anchor_book  -- first-buy anchors, baked by the Go outer brain
+                                 from live.db (signed backfill). The counter's
+                                 POSITION row has NO anchor columns, so this is
+                                 the only provable source for the step0 anchor gate.
+      * params.t_macro        -- market_scale / index_change_pct / market_state,
+                                 baked from the engine's t_rounds_live.json.
+      * params.t_signal_codes -- T leg remark short codes (owner-loaded).
+
+    Every gate is fail-closed: a missing reading makes the T layer do nothing,
+    never invent a value and place an order. Actions go through the SAME _place /
+    _cancel convergence points as the strategic legs (one session gate, one
+    idempotency source: the counter ORDER table via short code in remark).
+    """
+    # --- double gate: t_enabled AND owner-loaded short codes must both be on ---
+    if not (PARAMS.get("t_enabled") and PARAMS.get("t_signal_codes")):
+        return
+    # The T state machine symbols are inlined by the builder; the build gate
+    # refuses to publish when a module named in params is missing, so they are
+    # guaranteed present here. The caller wraps this whole function in try/except.
+
+    anchor_book = PARAMS.get("t_anchor_book") or {}
+    macro = PARAMS.get("t_macro") or {}
+    # macro freshness: the outer brain bakes asof_age_sec (it can parse ISO;
+    # this sandbox cannot call datetime.fromisoformat -- g2 forbids it). A stale
+    # number, or a missing age when a staleness window exists, disables T.
+    stale_sec = float(PARAMS.get("t_regime_stale_sec", 900) or 0)
+    if stale_sec > 0:
+        age = macro.get("asof_age_sec")
+        if age is None:
+            _warn_once("t_macro_age", "baked T macro has no age: fail closed")
+            macro = {}
+        elif float(age) > stale_sec:
+            _warn_once("t_macro_stale", "baked T macro is stale")
+            macro = {}  # fail closed: no T on stale market reading
+
+    # positions with a provable baked anchor; counter qty/cost/can_use are truth,
+    # anchor_price/anchor_source come ONLY from the outer brain's baked book.
+    pos_view = {}
+    for symbol, row in (positions or {}).items():
+        head = str(symbol or "").split(".")[0]
+        bake = anchor_book.get(head) or anchor_book.get(symbol) or {}
+        if not bake:
+            continue
+        entry = dict(row or {})
+        entry["anchor_price"] = bake.get("anchor_price")
+        entry["anchor_source"] = bake.get("anchor_source")
+        entry["symbol"] = symbol
+        pos_view[symbol] = entry
+    if not pos_view:
+        return  # no provable anchor on any holding -> nothing may open a T leg
+
+    now_ts = _now_ts()
+    hhmm = hhmm_now(moment)
+    holdings_value = 0.0
+    for symbol, row in pos_view.items():
+        px = (row or {}).get("price") or (row or {}).get("cost") or 0.0
+        holdings_value += float(px) * float((row or {}).get("qty") or 0.0)
+
+    book = TRoundBook(PARAMS)
+    try:
+        rebuilt, unknown = book.rebuild_from(orders, deals, day)
+    except Exception as exc:  # noqa: BLE001 -- rebuild must not take the round down
+        _warn_once("t_rebuild", "T rebuild failed: " + repr(exc)[:100])
+        return
+
+    t_actions = {"open": 0, "balance": 0, "cancel": 0, "close": 0, "hold": 0}
+    t_skips = {}
+
+    def base_ctx(symbol):
+        row = pos_view.get(symbol) or {}
+        tick = _tick_of(ContextInfo, symbol)
+        px = (tick or {}).get("last_price")
+        c = {
+            "symbol": symbol, "day": day, "hhmm": hhmm, "now_ts": now_ts,
+            "trading_day": True,  # run_round already passed _trade_session_ok
+            "last_price": px, "position_qty": (row or {}).get("qty"),
+            "available_cash": cash, "total_asset": total,
+            "holdings_value": holdings_value,
+            "positions_live": pos_view,
+            "market_scale": macro.get("market_scale"),
+            "index_change_pct": macro.get("index_change_pct"),
+            "market_state": macro.get("market_state"),
+            "market_state_age_sec": macro.get("market_state_age_sec"),
+            "initial_capital": float(PARAMS.get("initial_capital", 0) or 0),
+            "t_has_open_leg": bool(book.open_for(symbol, day)),
+        }
+        return c
+
+    # (a) in-flight rounds first: reconcile / pair / close (never stack a new leg)
+    for rnd in list(book.rounds.values()):
+        if str(rnd.get("status")) != T_STATE_OPEN:
+            continue
+        symbol = rnd.get("symbol") or ""
+        if symbol not in pos_view:
+            continue  # no provable anchor baked -> hands off
+        ctx = base_ctx(symbol)
+        ctx["positions_live"] = book.context_for(ctx, symbol)
+        try:
+            act = t_round_state(PARAMS, ctx, rnd)
+        except Exception as exc:  # noqa: BLE001
+            _warn_once("t_round_state", "round decision failed: " + repr(exc)[:100])
+            continue
+        _apply_t_action(ContextInfo, act, rnd, symbol, day, summary, t_actions, t_skips)
+
+    # (b) then new legs on holdings with no round in flight
+    for symbol, row in pos_view.items():
+        if book.open_for(symbol, day):
+            continue
+        ctx = base_ctx(symbol)
+        try:
+            act = t_round_state(PARAMS, ctx, None)
+        except Exception as exc:  # noqa: BLE001
+            _warn_once("t_round_state_open", "open decision failed: " + repr(exc)[:100])
+            continue
+        if act.get("action") == "hold":
+            t_actions["hold"] += 1
+            why = str(act.get("reason") or "hold")
+            t_skips[why] = t_skips.get(why, 0) + 1
+            continue
+        _apply_t_action(ContextInfo, act, None, symbol, day, summary, t_actions, t_skips)
+
+    # one bounded log line per round, ASCII only (GBK console safety)
+    _log("t_round actions=%s skips=%s rebuilt=%d unknown=%d" % (
+        ",".join("%s=%d" % (k, v) for k, v in sorted(t_actions.items())),
+        ",".join("%s=%d" % (k, v) for k, v in sorted(t_skips.items())[:6]),
+        len(rebuilt), len(unknown)))
+
+
+def _apply_t_action(ContextInfo, act, rnd, symbol, day, summary, t_actions, t_skips):
+    """Translate one t_round_state decision into the shared place/cancel exit."""
+    action = act.get("action")
+    if action in ("hold", None):
+        t_actions["hold"] += 1
+        why = str(act.get("reason") or "hold")
+        t_skips[why] = t_skips.get(why, 0) + 1
+        return
+    if action == "cancel":
+        detail = act.get("detail") or {}
+        oid = detail.get("order_id") or (detail.get("orders") or [{}])[0].get("order_id")
+        if oid:
+            ok, why = _cancel(oid)
+            if ok:
+                t_actions["cancel"] += 1
+                summary["cancelled"].append(str(oid))
+            else:
+                t_skips[why] = t_skips.get(why, 0) + 1
+        return
+    if action in ("open", "balance", "close"):
+        side = act.get("side")
+        qty = int(act.get("qty") or 0)
+        short = act.get("short_code") or ""
+        if not side or qty <= 0 or not short:
+            t_skips["incomplete_action"] = t_skips.get("incomplete_action", 0) + 1
+            return
+        if (day, symbol, short) in _STATE["sent"]:
+            t_skips["already_sent"] = t_skips.get("already_sent", 0) + 1
+            return
+        tick = _tick_of(ContextInfo, symbol)
+        px = (tick or {}).get("last_price")
+        if px is None or px <= 0:
+            t_skips["no_price"] = t_skips.get("no_price", 0) + 1
+            return
+        sig = {"symbol": symbol, "side": side, "qty": qty,
+               "price": float(px), "amount": float(px) * qty, "short_code": short}
+        ok, why = _place(ContextInfo, sig)
+        if ok:
+            t_actions[{"open": "open", "balance": "balance", "close": "close"}[action]] += 1
+            _STATE["sent"].add((day, symbol, short))
+            summary["placed"].append(short)
+        else:
+            t_skips[why] = t_skips.get(why, 0) + 1
+        return
+    t_skips["unknown_action"] = t_skips.get("unknown_action", 0) + 1
+
+
 def run_round(ContextInfo, moment):
     """One round: rebuild from the counter, decide, then act. Returns a summary.
 
@@ -1769,6 +1952,17 @@ def run_round(ContextInfo, moment):
                 summary["placed"].append(short)
             else:
                 summary["skipped"].append({"short": short, "reason": why})
+    # LIVE-T-20261116: drive the intraday round-trip layer AFTER the strategic
+    # buy/sell chain (signal execution outranks T) and BEFORE the stale-cancel
+    # sweep. The T layer is double-gated (t_enabled + owner-loaded short codes)
+    # and consumes only baked anchor/macro readings; every missing input makes
+    # it no-op, never place an order (fail closed). It reuses _place/_cancel,
+    # so session gate + counter idempotency are the same as every other leg.
+    if PARAMS.get("t_enabled") and PARAMS.get("t_signal_codes"):
+        try:
+            _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summary)
+        except Exception as exc:  # noqa: BLE001 -- T must never break the main round
+            _warn_once("t_layer", "T layer raised: " + repr(exc)[:120])
     cancelled = cancel_leg(orders, moment)
     summary["cancelled"] = cancelled
     return summary

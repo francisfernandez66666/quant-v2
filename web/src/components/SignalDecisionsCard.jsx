@@ -95,6 +95,7 @@ export default function SignalDecisionsCard() {
 
   if (forbidden) return null
 
+  // 信号决策列表：数据未到或结构异常时退为空数组，避免直接渲染 undefined 把整页打挂。
   const items = (data && Array.isArray(data.items)) ? data.items : []
   const dcSorters = {
     at: decisionStrSorter('at'), channel: decisionStrSorter('channel'),

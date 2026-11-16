@@ -181,6 +181,8 @@ func (d *DB) ensureManualBook() error {
 		return fmt.Errorf("store migrate manual_flows index: %w", err)
 	}
 	// §L2 2026-11-13 owner: per-account DAILY snapshot so a "positions vanished"
+	// 独立快照表：事故时一条命令即可恢复，不用手工补 asof。
+	// 新建独立表不改任何已有行，故无需提升 schemaVersion。
 	// incident is a one-command restore instead of a manual asof patch. An
 	// independent table needs no schemaVersion bump (no existing row changes).
 	if _, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS manual_position_snapshot (

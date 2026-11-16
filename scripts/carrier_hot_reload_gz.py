@@ -53,6 +53,21 @@ if not os.path.exists(SIGNALS_TODAY):
 # extract_bearish/bullish 的 signals 筛选）。文件由引擎每轮主循环刷新（day-keyed 原子写）。
 NEWS_GATE_TODAY = os.path.join(DATA_DIR, "accounts", OWNER_UID, "news_gate_today.json")
 HOTRELOAD_DB = os.environ.get("HOTRELOAD_DB", "/var/lib/quant-trading-v2/trading.db")
+# §LIVE-T-20261116：做 T 的锚点与宏观读数只存在于实盘库和引擎账本。
+# LIVE_DB 是首买锚点（real_positions.anchor_price/anchor_source，签字回填工具写入）的唯一真源；
+# 与 HOTRELOAD_DB（trading.db 研究库）刻意分开——锚点在 trading.db 里恒为空（实测）。
+LIVE_DB = os.environ.get("LIVE_DB", "/var/lib/quant-trading-v2/live.db")
+T_ROUNDS_LIVE = os.path.join(DATA_DIR, "accounts", OWNER_UID, "t_rounds_live.json")
+# T 腿短码锚点可开 T 的来源档位（与 Go real_positions.go anchorTicketSources 同字面量）。
+T_ANCHOR_OK_SOURCES = ("first_buy_order", "first_lot")
+# §LIVE-T-20261116：T 腿幂等短码表（owner 装填动作，离线确认过：
+# 五个码互不为前缀、且不与现有 signal_codes 的 BD/BK/D/DB/DR/FC/GN/HC/LD/LD1/PB/PT/SL/TP 冲突；
+# 'X' 前缀战略腿未使用）。空表即 T 腿 fail-closed 不出单——这里装填即解锁。
+# 经环境变量可覆盖，改码前必须重跑 rules_t.t_short_code_check 与 g8 唯一闸。
+T_SIGNAL_CODES = json.loads(os.environ.get(
+    "T_SIGNAL_CODES_JSON",
+    '{"t_buy_first":"TB","t_buy_first_pair":"TS","t_sell_first":"XB",'
+    '"t_sell_pair":"XS","t_close_out":"TC"}'))
 
 SHORT_STRATEGY_TYPES = ("high_churn", "break_down", "leader_decay", "leader_decay_v2",
                         "good_news_fade")
@@ -306,6 +321,84 @@ def extract_held_codes():
         return set()
 
 
+def bake_t_anchor_book():
+    """§LIVE-T-20261116：把「可开 T 的持仓首买锚点」从 live.db 烘进载体参数。
+
+    QMT 沙箱零外部输入、从柜台持仓对象读不到 anchor_price/anchor_source（柜台
+    get_trade_detail_data 根本没有这两列），所以做 T 的 step0 锚点门只能靠外脑
+    把锚点烘进 params.t_anchor_book，沙箱在 _run_t 里注入 ctx.positions_live。
+
+    只读 live.db（mode=ro），只取 qty>0 且 anchor_source ∈ 白名单且 anchor_price>0 的行。
+    库不可读/表缺失 → 空表并打锚（fail-closed：沙箱 step0 会因此拒绝开 T，不会瞎下）。
+    """
+    out = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect("file:%s?mode=ro" % LIVE_DB, uri=True, timeout=5)
+        try:
+            ph = ",".join("?" for _ in T_ANCHOR_OK_SOURCES)
+            cur = conn.execute(
+                "SELECT ts_code, anchor_price, anchor_source FROM real_positions "
+                "WHERE user_id=? AND COALESCE(qty,0)>0 AND anchor_price>0 "
+                "AND anchor_source IN (%s)" % ph, (OWNER_UID,) + T_ANCHOR_OK_SOURCES)
+            for code, price, source in cur:
+                code = norm(code)
+                if len(code) != 6 or not code.isdigit():
+                    continue
+                out[code] = {"anchor_price": round(float(price), 6),
+                             "anchor_source": str(source)}
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — 库缺表/锁繁忙 → 空表，沙箱 fail-closed
+        print("HOTRELOAD_T_ANCHOR_FALLBACK %s" % repr(exc)[:80])
+        return {}
+    print("HOTRELOAD_T_ANCHOR n=%d" % len(out))
+    return out
+
+
+def bake_t_macro():
+    """§LIVE-T-20261116：把 T 方向门必需的宏观读数烘进载体参数。
+
+    market_scale 来自引擎 T 账本 funds（每轮刷新，已带 timestamp）；
+    market_state/index_change_pct 若账本没有则留空——沙箱 t_gate_open 对
+    market_state 缺失是 abstain（放行）、对 market_scale/index 缺失是 fail-closed，
+    所以两者都缺时 T 会自己停开，符合「缺证据不瞎做」纪律。
+
+    带 asof 供沙箱判新鲜度（t_regime_stale_sec）；取不到 → {} → 沙箱停开 T。
+    """
+    out = {}
+    try:
+        doc = json.load(open(T_ROUNDS_LIVE, encoding="utf-8"))
+        funds = doc.get("funds") or {}
+        ms = funds.get("market_scale")
+        if ms is not None and float(ms) > 0:
+            out["market_scale"] = round(float(ms), 6)
+        out["index_source"] = funds.get("index_source") or ""
+        out["asof"] = funds.get("t_at") or funds.get("at") or ""
+        # 沙箱不能用 datetime.fromisoformat（g2 闸禁），这里在云端算好"读数年龄秒"，
+        # 载体只比数字。取不到/格式错 → 不写该键 → 沙箱按新鲜度未知 fail-closed。
+        try:
+            _asof_dt = datetime.datetime.fromisoformat(str(out["asof"]))
+            out["asof_age_sec"] = max(0.0, (datetime.datetime.now(_asof_dt.tzinfo) - _asof_dt).total_seconds())
+        except (ValueError, TypeError):
+            pass
+        # index_change_pct 由 §LIVE-T-20261116 写入 T 账本 funds（Go 外脑同帧烘出）。
+        # 0 是合法的平盘读数，不是缺失——缺失用 index_source 空来判断。
+        if funds.get("index_change_pct") is not None:
+            out["index_change_pct"] = float(funds["index_change_pct"])
+        # market_state 账本暂无；缺失时沙箱 market_state gate 走 abstain（放行），
+        # 这是设计语义：不把"没读到位"伪装成"读到牛市/熊市"。
+        if funds.get("market_state") is not None:
+            out["market_state"] = funds["market_state"]
+            if funds.get("market_state_at") is not None:
+                out["market_state_age_sec"] = funds["market_state_at"]
+    except Exception as exc:  # noqa: BLE001 — 账本缺失 → 空表，沙箱停开 T
+        print("HOTRELOAD_T_MACRO_FALLBACK %s" % repr(exc)[:80])
+        return {}
+    print("HOTRELOAD_T_MACRO keys=%s asof=%s" % (sorted(out.keys()), out.get("asof")))
+    return out
+
+
 def extract_news_gate():
     """§NEWS-GATE（R10/R11/R12）：读当日资讯闸快照，返回 None=不可用作真源（回退旧规则）。
 
@@ -497,6 +590,13 @@ def main():
         print("HOTRELOAD_NEWS_GATE_FALLBACK signals_filter neg=%d bullish=%d" % (len(bearish), len(bullish)))
     signal_pool = extract_signal_codes()
     precalc_meta, _precalc = load_precalc()
+    # §LIVE-T-20261116：做 T 的首买锚点与宏观读数（外脑烘参，只读，不碰下单）。
+    # 在 sha 之前算，确保任一变化都会触发重烘投递——否则盒子上永远拿不到新锚点/新宏观。
+    t_anchor_book = bake_t_anchor_book()
+    t_macro = bake_t_macro()
+    t_bake_digest = hashlib.sha256(json.dumps(
+        {"a": t_anchor_book, "m": t_macro, "c": T_SIGNAL_CODES}, ensure_ascii=True,
+        sort_keys=True).encode()).hexdigest()[:16]
     # §BUCKETS-SHA-20261112：行业/概念桶内容纳入 sha——桶由 pregen 的回填腿维护，
     # 桶变化必须触发重烘投递（否则 params 变了产物不变，盒子上永远拿不到桶）。
     # 注意：本脚本没有 PARAMS_PATH 常量（那是 pregen 的），params 走 BUILD_DIR 相对
@@ -515,6 +615,7 @@ def main():
                               sort_keys=True).encode()).hexdigest()[:16],
                           "signal_pool": signal_pool, "precalc": precalc_meta,
                           "buy_codes": sorted(extract_buy_codes()),
+                          "t_bake": t_bake_digest,
                           "buckets": {"industry": len(_bp.get("industry_map") or {}),
                                       "concept": len(_bp.get("concept_map") or {}),
                                       "digest": hashlib.sha256(json.dumps(
@@ -586,6 +687,12 @@ def main():
         doc2["params"]["precalc"] = precalc
     else:
         doc2["params"].pop("precalc", None)  # 过期因子绝不留宿：宁可弃权也不拿昨天的量比当今天的
+    # §LIVE-T-20261116：外脑烘参——做 T 的锚点表 + 宏观读数。沙箱零外部输入，
+    # 从柜台读不到 anchor，也没法自算 market_scale，只能靠这里烘进去。
+    # 空表/空宏观是安全的：沙箱 t_gate_open 会 fail-closed 停开 T（不会瞎下）。
+    doc2["params"]["t_anchor_book"] = t_anchor_book
+    doc2["params"]["t_macro"] = t_macro
+    doc2["params"]["t_signal_codes"] = dict(T_SIGNAL_CODES)
     json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 

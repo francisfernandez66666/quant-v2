@@ -24,6 +24,8 @@ class _Row(object):
             setattr(self, k, v)
 
 
+# 载体公共函数的一致性锁：沙箱与本地执行器必须逐字共用同一批工具函数，
+# 任何一侧私自改实现都会让同一条规则在两台机器上判出相反结果。
 class HelperLockTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

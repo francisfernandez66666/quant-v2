@@ -563,6 +563,8 @@ type dataRoundLLM struct {
 	supplement500 bool   // A 轮上游故障形态
 }
 
+// handler 造一个假的数据面 HTTP 端点，供回合测试注入可控的研究读数；
+// 用桩而非真实上游，保证用例对外部数据源的可用性不敏感。
 func (m *dataRoundLLM) handler(t *testing.T) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {

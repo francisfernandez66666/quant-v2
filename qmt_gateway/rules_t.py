@@ -357,7 +357,7 @@ def _limit_pct(params, symbol, name):
     return _param(params, "t_limit_pct_main")
 
 
-def _vwap_of(ctx):
+def _t_vwap_of(ctx):
     """Intraday average price = cumulative amount / cumulative volume (data/types.go:68-77).
 
     Unavailable stays unavailable: it is never replaced by the price or by the cost basis
@@ -515,7 +515,7 @@ def t_direction(params, ctx):
     Both false is the normal "no round-trip opportunity on this name right now", not a defect.
     """
     price = _t__num(ctx.get("last_price"))
-    vwap = _vwap_of(ctx)
+    vwap = _t_vwap_of(ctx)
     if price is None or vwap is None:
         return False, False, "no_price_or_vwap"
     dev = _pct(price - vwap, vwap)
@@ -638,7 +638,7 @@ def t_gate_open(params, ctx):
     price = _t__num(ctx.get("last_price"))
     if price is None or price <= _ZERO_F:
         return False, "step0 no_realtime_price (fail closed)"
-    vwap = _vwap_of(ctx)
+    vwap = _t_vwap_of(ctx)
     if vwap is None:
         return False, "step0 vwap_untrustworthy: no T and no fallback to the cost basis"
     buy, sell, why = t_direction(params, ctx)

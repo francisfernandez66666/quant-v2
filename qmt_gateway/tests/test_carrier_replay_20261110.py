@@ -126,6 +126,7 @@ class ReplayTest(unittest.TestCase):
                                         "rule_stop_loss", "rule_breakdown_sell")}
         cls._orig_cap = cls.mod.PARAMS.get("order_amount_cap")
 
+    # 每个用例前把柜台桩、行情与账户映射复位到同一基线，避免用例间相互污染。
     def _reset(self, counter, symbol="600000.SH", tick=None, maps=True):
         mod = self.mod
         mod._SANDBOX_FNS.update({
