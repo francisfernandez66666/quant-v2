@@ -833,6 +833,45 @@ def gate_ported_rule_knobs(artifact):
     return True, "rule_knobs_baked declared=%d modules=%d" % (declared, len(knobs))
 
 
+# §SESSION-WINDOWS-FAIL-CLOSED-20261116：沙箱适配器（不是移植模块）直接读、缺了就让
+# _trade_session_ok / _buy_confirmed fail-closed 拒掉一切下单的顶层键。g9 只管移植模块
+# 自己声明的 *_PARAM_KEYS，这些键没有声明腿——2026-11-16 实盘就是因此带着缺 session_windows
+# 的 v38 上线、开盘后每轮 session_windows_missing 零成交（仓库改了 params，但 11-12 起
+# params.json 已移出 rsync 清单，gz 运行态那份没人补）。构建器必须自己挡住这种产物。
+FAIL_CLOSED_PARAMS = ("session_windows", "buy_confirm_rounds", "buy_confirm_min_gap_sec")
+
+
+def gate_fail_closed_params(artifact):
+    """g10: keys whose absence makes the carrier refuse every order must be baked.
+
+    Presence alone is not enough: an empty session_windows is the same fail-closed
+    refusal as a missing one (see _trade_session_ok), so the gate checks non-empty
+    for the window list as well. Keeping this in the builder -- not in a downstream
+    script -- means a params file that never reached the build source cannot ship.
+    """
+    import ast
+    tree = ast.parse(artifact)
+    baked = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "PARAMS" in names and isinstance(node.value, ast.Dict):
+            for key, value in zip(node.value.keys, node.value.values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    baked[key.value] = value
+            break
+    if not baked:
+        return False, "baked_params_unreadable"
+    missing = [k for k in FAIL_CLOSED_PARAMS if k not in baked]
+    if missing:
+        return False, "fail_closed_params_missing=%s" % ",".join(missing)
+    windows = baked["session_windows"]
+    if isinstance(windows, (ast.List, ast.Tuple)) and not windows.elts:
+        return False, "fail_closed_params_empty=session_windows"
+    return True, "fail_closed_params_baked n=%d" % len(FAIL_CLOSED_PARAMS)
+
+
 def gate_ascii(artifact):
     """G1: the artifact must contain no non-ASCII byte."""
     bad = [i for i, byte in enumerate(artifact.encode("utf-8")) if byte > 127]
@@ -1622,7 +1661,9 @@ def main(argv=None):
     gates = gates + [("g8_short_codes_unique", gate_pported_short_codes_unique,
                      "two rules must not share one counter remark code"),
                     ("g9_rule_knobs_baked", gate_ported_rule_knobs,
-                     "every knob a ported module declares must be present in the baked PARAMS")]
+                     "every knob a ported module declares must be present in the baked PARAMS"),
+                    ("g10_fail_closed_params", gate_fail_closed_params,
+                     "params that make the carrier refuse all orders must be baked and non-empty")]
 
     ok, results = run_gates(artifact, gates)
     if not ok:

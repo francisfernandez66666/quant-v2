@@ -20545,6 +20545,10 @@ grep_q "def gate_ascii" BLT F || fail173 "ASCII 闸不见了"
 grep_q "def gate_sandbox_loads" BLT F || fail173 "g7 装载自证不见了（五道闸全绿而产物第一次 handlebar 就 NameError 的那次教训）"
 grep_q "def gate_sandbox_imports" BLT F || fail173 "g6 沙箱导入闸不见了"
 grep_q "def gate_pported_short_codes_unique" BLT F || fail173 "g8 短码唯一闸不见了（两条规则共用一个备注码＝第一条永久压住第二条）"
+grep_q "def gate_fail_closed_params" BLT F || fail173 "g10 fail-closed 参数闸不见了：11-16 实盘就是带着缺 session_windows 的 v38 开盘零成交（g9 只管移植模块声明的旋钮，这些顶层键没有声明腿）"
+grep_q 'FAIL_CLOSED_PARAMS = ("session_windows", "buy_confirm_rounds", "buy_confirm_min_gap_sec")' BLT F || fail173 "g10 的 fail-closed 键表变了：载体直接读且缺了就拒单的键必须逐枚在册"
+grep_q 'fail_closed_params_empty=session_windows' BLT F || fail173 "g10 只查键存在不查空列表：session_windows=[] 与缺键同样是 fail-closed 全拒"
+grep_q '("g10_fail_closed_params", gate_fail_closed_params' BLT F || fail173 "g10 闸没注册进闸表（函数写了但没跑＝摆设）"
 grep_q 'SANDBOX_ALLOWED_IMPORTS = {"builtins", "datetime", "hashlib", "math", "time"}' BLT F || fail173 "沙箱允许导入面与登记值不一致（这里唯一可放宽的是纯算术 math；os/sys/sqlite3/网络一律不许进）"
 for banned in '"os"' '"sys"' '"sqlite3"' '"subprocess"' '"socket"'; do
 	if grep_q "SANDBOX_ALLOWED_IMPORTS = \{.*$banned" BLT E; then
