@@ -6640,7 +6640,17 @@ func (e *Engine) currentRegime() signalctl.Regime {
 // reading stays zero/NaN (abstain) rather than a fabricated neutral.
 func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 	// 1. 引擎缓存的状态机读数（主循环每轮刷新）。
+	// §DEADLOCK-20261116：本临界区内**禁止**调用会再次拿 e.mu 的方法（emotionConfigured/
+	// enhanceFlag 内部各自 RLock）。Go RWMutex 语义下，递归读者一旦撞上 writer-pending
+	//（打分循环每 5s 的 SignalCtl 写锁就是常驻写者）即全引擎死锁：写者等外层读者、
+	// 外层读者卡在嵌套 RLock 上放不掉、后续所有读者排队。2026-11-16 09:27 现网实录，
+	// SIGQUIT 堆栈锤实（读者停在本函数锁内 e.enhanceFlag，写者等 e.mu 写锁 53 分钟）。
+	// 故三个开关读数改为解锁后求值；combat 指针锁内快照、锁外解引用。
+	// English: NEVER call e.mu-reacquiring helpers inside this critical section — a recursive
+	// reader hitting writer-pending deadlocks the whole engine (verified in production on
+	// 2026-11-16 via SIGQUIT dump). Evaluate the three toggles after RUnlock.
 	e.mu.RLock()
+	combat := e.combatAgent
 	r := signalctl.Regime{
 		AsOf:           now,
 		EmotionPhase:   e.lastEmotionPhase,
@@ -6652,15 +6662,15 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 		// 分开告诉 signalctl——只有后者才把目标仓位封顶半仓，否则关掉状态机就等于永久半仓。
 		// English: distinguishes a deliberately disabled dimension from a blind spot; only the latter
 		// caps the target position at 0.50.
-		EmotionEnabled:     e.emotionConfigured(),
-		MarketStateEnabled: e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState }),
-		// §N6-RISK：Red 硬拦只由应急开关触发；默认走 tier_scales.Red 权重收束。
-		RedBlockNewBuy: e.combatAgent != nil && e.combatAgent.RedBlockNewBuyOn(),
 	}
 	if len(e.lastRiskReasons) > 0 {
 		r.RiskReasons = append([]string(nil), e.lastRiskReasons...)
 	}
 	e.mu.RUnlock()
+	r.EmotionEnabled = e.emotionConfigured()
+	r.MarketStateEnabled = e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState })
+	// §N6-RISK：Red 硬拦只由应急开关触发；默认走 tier_scales.Red 权重收束。
+	r.RedBlockNewBuy = combat != nil && combat.RedBlockNewBuyOn()
 
 	// 2~4. 指数 / 宏观 / 节前（各带缓存）——这三类读数与账号无关，全局缓存即可。
 	// 账号级的定权配置与账本读数由 regimeForAccount 叠加（paper 通道是逐账号的）。

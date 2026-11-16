@@ -21796,6 +21796,66 @@ echo "ok - §176 §NEWS-GATE-D1-SIGNED 锁通过（带符号化/负分拦截/板
 # 临时脚本执行时也指得回仓内 scripts/。独立跑：bash scripts/verify_gz_ubuntu_assets.sh
 bash "$(dirname "$GATE_SELF_ABS")/verify_gz_ubuntu_assets.sh" || exit 1
 echo "ok - §GZ-UBUNTU 部署件总闸通过"
+echo ""
+
+# ════════════════════════════════════════════════════════════════════════════
+# §190 §20261116-DEADLOCK（2026-11-16 引擎递归读锁自死锁修复批：assembleRegime 锁内
+# 禁嵌套 e.mu 调用 / 解锁后求值 / qmt_client 单请求超时兜底 / 打分循环心跳+看门狗）
+# ════════════════════════════════════════════════════════════════════════════
+echo "==> 190 §20261116-DEADLOCK（assembleRegime锁内禁嵌套/解锁后求值/qmt超时兜底/打分心跳看门狗）..."
+B190_FAILED=0
+fail190() {
+	echo "--- FAIL: §190 $*"
+	FAIL=1
+	B190_FAILED=1
+}
+CNT190=0
+# 判定 1：assembleRegime 函数体可提取（函数本体不许被改名/移走）
+CNT190=$((CNT190 + 1))
+ASM190_BODY=$(awk '/^func \(e \*Engine\) assembleRegime\(/{f=1} f{print} f&&/^}/{exit}' internal/engine/engine.go)
+test -n "$ASM190_BODY" || fail190 "assembleRegime 函数体提取失败（被改名/移走？）"
+# 判定 2~6：RLock↔RUnlock 临界区内禁止任何会再拿 e.mu 的嵌套调用（2026-11-16 09:27
+# 现网死锁实录：锁内 e.enhanceFlag 撞 writer-pending 全引擎停车 53 分钟，见 gz:/tmp/qdump2.txt）
+ASM190_LOCKSEG=$(printf '%s\n' "$ASM190_BODY" | awk '/e\.mu\.RLock\(\)/{f=1} f{print} /e\.mu\.RUnlock\(\)/{f=0}')
+CNT190=$((CNT190 + 1))
+test -n "$ASM190_LOCKSEG" || fail190 "assembleRegime 临界区段提取失败（RLock/RUnlock 缺失？）"
+for PAT190 in 'e.emotionConfigured(' 'e.enhanceFlag(' 'e.SignalCtl(' 'e.QMTController(' 'e.primaryMember('; do
+	CNT190=$((CNT190 + 1))
+	test "$(printf '%s\n' "$ASM190_LOCKSEG" | grep -cF "$PAT190")" = "0" || fail190 "assembleRegime 临界区内出现嵌套 e.mu 调用：$PAT190（递归读者撞 writer-pending 会再死锁）"
+done
+# 判定 7：三个开关读数必须在 RUnlock 之后求值（解锁后求值行不许被搬回锁内）
+CNT190=$((CNT190 + 1))
+grep -qF 'r.EmotionEnabled = e.emotionConfigured()' internal/engine/engine.go || fail190 "缺解锁后 EmotionEnabled 求值行"
+CNT190=$((CNT190 + 1))
+grep -qF 'r.MarketStateEnabled = e.enhanceFlag(' internal/engine/engine.go || fail190 "缺解锁后 MarketStateEnabled 求值行"
+CNT190=$((CNT190 + 1))
+grep -qF 'r.RedBlockNewBuy = combat != nil && combat.RedBlockNewBuyOn()' internal/engine/engine.go || fail190 "缺 combat 指针快照后解锁求值行（RedBlockNewBuy 不许在锁内解引用）"
+# 判定 8：§DEADLOCK-20261116 注释锁在位（警示后人别把嵌套调用加回去）
+CNT190=$((CNT190 + 1))
+grep -qF '§DEADLOCK-20261116' internal/engine/engine.go || fail190 "assembleRegime 缺 §DEADLOCK-20261116 注释锁"
+# 判定 9~11：qmt_client.do 单请求超时兜底（凡入参 ctx 无 deadline 以 c.timeout 兜底）
+CNT190=$((CNT190 + 1))
+grep -qF 'if _, ok := ctx.Deadline(); !ok {' internal/trading/qmt_client.go || fail190 "qmt_client.do 缺无-deadline 检测兜底"
+CNT190=$((CNT190 + 1))
+grep -qF 'ctx, cancel = context.WithTimeout(ctx, c.timeout)' internal/trading/qmt_client.go || fail190 "qmt_client.do 缺 WithTimeout(ctx, c.timeout) 兜底限时"
+CNT190=$((CNT190 + 1))
+grep -qF '§DEADLOCK-20261116 单请求超时兜底' internal/trading/qmt_client.go || fail190 "qmt_client.do 缺 2026-11-16 实录根因注释"
+# 判定 12~17：打分循环心跳量规 + 看门狗（循环冻死必须有名告警，不再是静默停车）
+CNT190=$((CNT190 + 1))
+grep -qF 'scoreLoopLastRun.Store(now.UnixNano())' internal/engine/scoring_loop.go || fail190 "scoreCycle 缺心跳打点（必须在轮次开始而非出口）"
+CNT190=$((CNT190 + 1))
+grep -qF 'metrics.SetGauge("engine_score_loop_last_run_unix"' internal/engine/scoring_loop.go || fail190 "缺 engine_score_loop_last_run_unix 量规"
+CNT190=$((CNT190 + 1))
+test "$(grep -cF 'startScoreLoopWatchdog(ctx)' internal/engine/scoring_loop.go)" -ge 2 || fail190 "看门狗接线 <2 处（RunScoringLoop 与 RunScoringLoopOnce 都要起）"
+CNT190=$((CNT190 + 1))
+grep -qF 'data.IsActiveSession(now)' internal/engine/scoring_loop.go || fail190 "看门狗缺盘中交易时段闸（盘后不许空告）"
+CNT190=$((CNT190 + 1))
+grep -qF 'gap > 2*time.Minute' internal/engine/scoring_loop.go || fail190 "看门狗缺 2min 停摆阈值"
+CNT190=$((CNT190 + 1))
+grep -qF 'opslog.Logf("quant", "打分循环停摆告警' internal/engine/scoring_loop.go || fail190 "停摆告警缺 opslog 留痕"
+[ "$B190_FAILED" = "0" ] || exit 1
+echo "ok - §190 §20261116-DEADLOCK 锁通过（锁内禁嵌套5判定/解锁后求值/超时兜底/心跳看门狗，累计判定点 ${CNT190}）"
+echo ""
 
 echo "==> 全部通过"
 

@@ -89,6 +89,21 @@ func (c *QMTClient) do(ctx context.Context, method, path string, body any, out a
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	// §DEADLOCK-20261116 单请求超时兜底：2026-11-16 09:27 现网实录，引擎死锁取证时
+	// goroutine 卡在本函数 httpClient.Do → Transport getConn 的 select 上（对
+	// 10.77.0.2:8789 死网关）。client.Timeout/拨号超时自 2026-08-26（§ROBUST）就有，
+	// 但那是「构造参数正确才生效」的保证——若调用方 ctx 不带 deadline 且构造侧超时
+	// 被配成超大/被改，挂起就重新成为可能。此处补最后一层：凡入参 ctx 无 deadline
+	// 一律以 c.timeout 兜底限时，超时保证与构造配置、调用方习惯解耦（三保险的最后一道）。
+	// 探测/行情类调用方想更快失败可自带更紧的 ctx；下单类保持 c.timeout 量级即可
+	// （上层已有 signal_id 幂等 + retries=1 的 2 attempts 重试，超时重试不会双花）。
+	// English: per-request deadline floor — if the caller's ctx carries no deadline, bound it
+	// with c.timeout so the no-hang guarantee no longer depends on constructor config.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err

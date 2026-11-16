@@ -61,6 +61,7 @@ POST	/setup	运维 curl	scripts/monitor_test.sh:231:"POST" "/setup" 200	首次�
 POST	/api/paper/adjust	运维 curl	internal/server/paper.go:404:handlePaperAdjust	000683 一次性纸面修复（补历史错账要留 paper_adjust 审计痕迹，普通买入不留）：owner 带 admin token 用 curl 调用，confirm=RESTORE-000683
 
 
+
 POST	/api/action	前端调用	web/src/api/index.js:1762:/api/action	调用点 actionSignal()（本行由核对器派生，勿手改）
 GET	/api/admin/research/hithink-key	前端调用	web/src/api/index.js:870:/api/admin/research/hithink-key	调用点 fetchHithinkKey()（本行由核对器派生，勿手改）
 POST	/api/admin/research/hithink-key	前端调用	web/src/api/index.js:873:/api/admin/research/hithink-key	调用点 setHithinkKey()（本行由核对器派生，勿手改）

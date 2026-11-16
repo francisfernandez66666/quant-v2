@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -39,6 +41,7 @@ func (e *Engine) RunScoringLoop(ctx context.Context) {
 		return
 	}
 	log.Printf("[engine] 近实时 8a/8b 打分循环启动: 5s 节奏")
+	startScoreLoopWatchdog(ctx) // §HEARTBEAT-20261116：循环停摆看门狗（幂等）
 	// §FUNDS-TODAY（2026-10-30）：资金帧独立心跳，不再依赖本循环的轮次时长。
 	e.StartFundsLoop(ctx)
 	ticker := time.NewTicker(5 * time.Second) // 固定 5s 心跳：与快照源刷新节奏对齐
@@ -58,13 +61,80 @@ func (e *Engine) RunScoringLoop(ctx context.Context) {
 // English: runs one near-realtime scoring cycle (called by the multi-account registry's shared
 // 5s scheduler).
 func (e *Engine) RunScoringLoopOnce(ctx context.Context) {
-	e.StartBuyDispatcher(4) // §A+B 异步下单分发器（幂等启动）
-	e.StartFundsLoop(ctx)   // §FUNDS-TODAY 资金帧独立心跳（幂等启动）
+	startScoreLoopWatchdog(ctx) // §HEARTBEAT-20261116：多账号注册表统一 5s 调度也要看门狗（幂等）
+	e.StartBuyDispatcher(4)     // §A+B 异步下单分发器（幂等启动）
+	e.StartFundsLoop(ctx)       // §FUNDS-TODAY 资金帧独立心跳（幂等启动）
 	e.scoreCycle(ctx)
+}
+
+// §HEARTBEAT-20261116 打分循环心跳：本轮开始时刻（纳秒，进程级）。为什么必须要有——
+// 2026-11-16 09:27 现网实录：引擎全局 e.mu 被递归读者占死后，5s 循环连同决策落库/自动
+// 下单/柜台回报全链静默停摆 53 分钟，进程活着、日志只剩行情噪音，没有任何"死了"的信号。
+// 看门狗（下方 scoreLoopWatchdog）把"循环冻死"从无声变成有名告警。
+// English: process-level heartbeat of the last scoring cycle start; the watchdog converts a
+// silently frozen loop (2026-11-16 production incident) into a named alarm.
+var (
+	scoreLoopLastRun   atomic.Int64    // 最近一轮 scoreCycle 开始时刻（UnixNano；0=从未运行）
+	scoreLoopAlerted   atomic.Bool     // 停摆告警已发标记（恢复即复位，允许下次再挂再响）
+	scoreLoopWatchOnce sync.Once       // 看门狗进程级只起一次（多账号注册表会多处调用）
+	scoreLoopWatchRef  context.Context // 首次启动者的 ctx；后续调用方 ctx 不同也只认第一次
+)
+
+// startScoreLoopWatchdog 幂等启动看门狗。30s 一跳：盘中交易时段内若距上一轮 >2 分钟
+// （正常节奏 5s，单轮打满也就 2m32s 级别——阈值取 2min 已留出慢轮余量），log + opslog
+// 双路留痕。恢复自动复位 alerted，允许下次再挂再响。
+// English: idempotent watchdog start; alerts when the scoring loop has not ticked for >2min
+// during an active trading session, and re-arms automatically on recovery.
+func startScoreLoopWatchdog(ctx context.Context) {
+	scoreLoopWatchOnce.Do(func() {
+		scoreLoopWatchRef = ctx
+		go scoreLoopWatchdog(scoreLoopWatchRef)
+	})
+}
+
+func scoreLoopWatchdog(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			now := time.Now()
+			lastNano := scoreLoopLastRun.Load()
+			var gap time.Duration
+			never := lastNano == 0
+			if !never {
+				gap = now.Sub(time.Unix(0, lastNano))
+			}
+			stale := never || gap > 2*time.Minute
+			if stale && data.IsActiveSession(now) {
+				if scoreLoopAlerted.CompareAndSwap(false, true) {
+					gapText := "从未运行"
+					if !never {
+						gapText = gap.Round(time.Second).String()
+					}
+					log.Printf("[engine] §HEARTBEAT 打分循环停摆告警：距上一轮 %s（>2min 阈值），盘中交易时段引擎疑似死锁/挂起——查 goroutine 堆栈与 e.mu 持有者，别只看本进程是否活着", gapText)
+					opslog.Logf("quant", "打分循环停摆告警 距上一轮=%s（盘中 2min 阈值，§HEARTBEAT-20261116）", gapText)
+				}
+			} else if !stale {
+				scoreLoopAlerted.Store(false)
+			}
+		}
+	}
 }
 
 // scoreCycle 执行一轮近实时打分：收拢持仓+自选 → 构建行情 → 8a/8b 打分+信号 → 状态翻转去重 → 更新看板/落盘。
 func (e *Engine) scoreCycle(ctx context.Context) {
+	// §HEARTBEAT-20261116：心跳打点必须放在 panic recover 之后的第一件事——就算本轮中途
+	// 挂死，"上一轮开始时刻"也必须是真实值，看门狗的 2min 阈值才有效。放循环入口而不是
+	// 出口：出口打点会把"卡在轮内"误读成"循环还活着"。
+	// English: stamp the heartbeat at cycle start (not exit) so a hang inside the cycle still
+	// reads as stale to the watchdog.
+	now := time.Now()
+	scoreLoopLastRun.Store(now.UnixNano())
+	metrics.SetGauge("engine_score_loop_last_run_unix", now.Unix())
+
 	// 防御：单轮 panic 不拖垮整个循环，记录日志后继续下一轮
 	defer func() {
 		if r := recover(); r != nil {
@@ -93,7 +163,6 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// §WS-L 维5 阈值告警评估：每 30s 节流跑一轮（量规值越界持续满 For 才 fire，去重+恢复）。
 	// English: WS-L 维5 — throttled alert evaluation every 30s (sustained-for state machine, dedup,
 	// recovery).
-	now := time.Now()
 	if e.lastAlertEval.IsZero() || now.Sub(e.lastAlertEval) >= 30*time.Second {
 		e.refreshStalenessGauges() // §UPDLINK：先把新鲜度量规喂满，再评估
 		metrics.RunAlertEvaluation()
