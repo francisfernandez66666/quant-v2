@@ -22613,3 +22613,143 @@ grep_q '5 passed|Ran 5 test' PY191 || { echo "--- FAIL: §191 Python 行为腿�
 [ "$B191_FAILED" = "0" ] || exit 1
 echo "ok - §191 §20261116-LATE-CLOSEOUT 锁通过（投递重启腿/订阅P0/ts后缀/FIN别名/涨停池/预算闸/盘中透传/成本/ENTER锚/HTTP3 静态锁 + 4 用例在册 + Go/Python 双行为腿，累计判定点 ${CNT191}）"
 echo ""
+
+# §192 §20261116-LIVE-T（2026-11-16 生产 QMT 物理机做 T 落地批 9ffe34c/5578a71 收口）。
+# 这批把做 T 从"代码在、腿不走"变成真接线：签字锚点回填 + 外脑烘参 + 沙箱 T 编排 +
+# 指数同帧 + vwap 命名冲突消除。当时只入库+独立测试，未登记进门禁；本段补防回潮静态锁、
+# 新增用例在册，并附 Go（store 锚点回填）+ Python（T 接线行为）双行为腿真跑。
+echo "==> 192 §20261116-LIVE-T（签字锚点/外脑烘参/T编排接线/指数同帧/vwap消歧，静态锁+用例在册+双行为腿）..."
+B192_FAILED=0
+fail192() {
+	echo "--- FAIL: §192 $*"
+	FAIL=1
+	B192_FAILED=1
+}
+CNT192=0
+
+# —— ① 签字锚点回填工具（cmd/anchor-backfill-live）：硬确认短语 + 三段式 + 逐票白名单 ——
+CNT192=$((CNT192 + 1))
+[ -s cmd/anchor-backfill-live/main.go ] \
+	|| fail192 "签字回填 CLI 不在册（cmd/anchor-backfill-live/main.go）"
+CNT192=$((CNT192 + 1))
+grep -qF 'const confirmPhrase = "I-CONFIRM-NO-ADD-REDUCE"' cmd/anchor-backfill-live/main.go \
+	|| fail192 "apply 缺显式无加减仓确认短语（无硬签字就能整批改锚点，真金白银风险）"
+CNT192=$((CNT192 + 1))
+grep -qF 'flag.Bool("plan"' cmd/anchor-backfill-live/main.go \
+	&& grep -qF 'flag.Bool("apply"' cmd/anchor-backfill-live/main.go \
+	|| fail192 "签字工具缺 plan/apply 两段式（先规划后落库的边界消失）"
+
+# —— ② store 层锚点 API：规划/回填/审计 + 只补不覆盖 + first_buy_order 档 ——
+CNT192=$((CNT192 + 1))
+grep -qF 'func (d *DB) AnchorSignoffPlanBackfill' internal/store/anchor_signoff.go \
+	|| fail192 "缺 AnchorSignoffPlanBackfill（只读规划视图回潮）"
+CNT192=$((CNT192 + 1))
+grep -qF 'func (d *DB) AnchorSignoffApply' internal/store/anchor_signoff.go \
+	|| fail192 "缺 AnchorSignoffApply（签字回填主写入口回潮）"
+CNT192=$((CNT192 + 1))
+grep -qF 'func (d *DB) AnchorSignoffLog' internal/store/anchor_signoff.go \
+	|| fail192 "缺 AnchorSignoffLog（审计读回/回滚依据回潮）"
+CNT192=$((CNT192 + 1))
+grep -qF 'anchor_signoff_log' internal/store/anchor_signoff.go \
+	|| fail192 "缺 anchor_signoff_log 审计表（签字人/依据/旧新值无留痕）"
+CNT192=$((CNT192 + 1))
+grep -qF 'anchorTicketEligible' internal/store/anchor_signoff.go \
+	|| fail192 "缺 anchorTicketEligible 白名单档判定（非 first_buy_order/first_lot 的锚点会被误当可开 T）"
+
+# —— ③ 沙箱 T 编排接线：run_round 真调 _run_t（不是死代码）+ 双闸 + 收敛点 ——
+CNT192=$((CNT192 + 1))
+grep -qF 'def _run_t(ContextInfo, moment, orders, positions' qmt_gateway/qmt_internal_strategy.py \
+	|| fail192 "载体缺 _run_t 定义（T 状态机编排层回潮为死代码）"
+CNT192=$((CNT192 + 1))
+grep -qF '_run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summary)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail192 "载体缺 _run_t 调用（代码在、腿又走不到）"
+CNT192=$((CNT192 + 1))
+grep -qF 'if not (PARAMS.get("t_enabled") and PARAMS.get("t_signal_codes")):' qmt_gateway/qmt_internal_strategy.py \
+	|| fail192 "T 层双闸缺失（t_enabled 与短码任一关闭都必须 no-op）"
+# 接线顺序：_run_t 必须在 cancel_leg 之前（signal 腿优先、T 次之、清单最后）
+CNT192=$((CNT192 + 1))
+awk '
+	/_run_t\(ContextInfo, moment, orders/ {t=NR}
+	/cancelled = cancel_leg\(orders, moment\)/ {c=NR}
+	END{ if (t>0 && c>0 && t<c) exit 0; exit 1 }
+' qmt_gateway/qmt_internal_strategy.py \
+	|| fail192 "_run_t 未排在 cancel_leg 之前（清单腿抢在 T 决策前会漏掉轮回配对）"
+CNT192=$((CNT192 + 1))
+grep -qF 'book.rebuild_from(orders, deals, day)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail192 "_run_t 未从柜台订单/成交重建 TRoundBook（幂等源不是唯一柜台 ORDER 表）"
+
+# —— ④ 外脑烘参：锚点/宏观/短码三键进 params，缺任一 T 就 fail-closed ——
+CNT192=$((CNT192 + 1))
+grep -qF 'def bake_t_anchor_book()' scripts/carrier_hot_reload_gz.py \
+	|| fail192 "缺 bake_t_anchor_book（柜台持仓没有 anchor 列，只能外脑烘）"
+CNT192=$((CNT192 + 1))
+grep -qF 'def bake_t_macro()' scripts/carrier_hot_reload_gz.py \
+	|| fail192 "缺 bake_t_macro（T 方向门宏观读数无源）"
+CNT192=$((CNT192 + 1))
+grep -qF 'doc2["params"]["t_anchor_book"] = t_anchor_book' scripts/carrier_hot_reload_gz.py \
+	|| fail192 "烘参未写 t_anchor_book（烘了没写进 params）"
+CNT192=$((CNT192 + 1))
+grep -qF 'doc2["params"]["t_macro"] = t_macro' scripts/carrier_hot_reload_gz.py \
+	|| fail192 "烘参未写 t_macro"
+CNT192=$((CNT192 + 1))
+grep -qF 'doc2["params"]["t_signal_codes"] = dict(T_SIGNAL_CODES)' scripts/carrier_hot_reload_gz.py \
+	|| fail192 "烘参未写 t_signal_codes（短码没下发，T 双闸恒关）"
+CNT192=$((CNT192 + 1))
+grep -qF 'asof_age_sec' scripts/carrier_hot_reload_gz.py \
+	|| fail192 "宏观读数未烘 asof_age_sec（沙箱 g2 禁 fromisoformat，无年龄秒无法判新鲜）"
+
+# —— ⑤ 指数同帧：Go 外脑 IndexPct → T 账本 index_change_pct → 烘参 ——
+CNT192=$((CNT192 + 1))
+grep -qF 'IndexPct float64 `json:"index_change_pct"`' internal/engine/tlive_state.go \
+	|| fail192 "T 账本 funds 缺 IndexPct 字段（大盘急跌方向门读不到指数涨跌）"
+CNT192=$((CNT192 + 1))
+grep -qF 'f.IndexPct = ctx.IndexPct' internal/engine/funds_today.go \
+	|| fail192 "funds_today 未把 IndexPct 同帧烘出（字段在、值为 0 回潮）"
+CNT192=$((CNT192 + 1))
+grep -qF 'funds.get("index_change_pct")' scripts/carrier_hot_reload_gz.py \
+	|| fail192 "烘参未读 T 账本 index_change_pct（Go 烘了载体不取）"
+
+# —— ⑥ vwap 命名冲突消除：T 标量版 _t_vwap_of 与战略 tuple 版 _vwap_of 分离 ——
+CNT192=$((CNT192 + 1))
+grep -qF 'def _t_vwap_of(ctx):' qmt_gateway/rules_t.py \
+	|| fail192 "rules_t 缺标量版 _t_vwap_of（T 用 tuple 版会算错 VWAP）"
+CNT192=$((CNT192 + 1))
+grep -qF 'def _vwap_of(tick):' qmt_gateway/qmt_internal_strategy.py \
+	|| fail192 "模板 tuple 版 _vwap_of 丢失（战略腿 VWAP 无源）"
+
+# —— ⑦ 新增用例在册：Python 7 例 T 接线 + Go 5 例锚点回填 ——
+CNT192=$((CNT192 + 1))
+[ -s qmt_gateway/tests/test_live_t_enable_20261116.py ] \
+	|| fail192 "T 接线行为用例不在册（test_live_t_enable_20261116.py）"
+CNT192=$((CNT192 + 1))
+grep -qF 'def test_01_run_round_calls_run_t' qmt_gateway/tests/test_live_t_enable_20261116.py \
+	|| fail192 "接线在位用例缺失（AST 验 run_round 真调 _run_t）"
+CNT192=$((CNT192 + 1))
+grep -qF 'def test_03_vwap_name_collision_removed' qmt_gateway/tests/test_live_t_enable_20261116.py \
+	|| fail192 "vwap 冲突消除用例缺失"
+CNT192=$((CNT192 + 1))
+grep -qF 'func TestAnchorSignoffApplyOnlyTAndIdempotent' internal/store/anchor_signoff_test.go \
+	|| fail192 "锚点只补不覆盖/幂等用例缺失（又允许整批改价回潮）"
+CNT192=$((CNT192 + 1))
+grep -qF 'func TestAnchorSignoffRejectsMissingSignerOrBasis' internal/store/anchor_signoff_test.go \
+	|| fail192 "签字硬校验用例缺失（缺 signer/basis 仍能回填回潮）"
+
+# —— ⑧ 行为腿：Go 锚点回填 5 例 + Python T 接线 7 例（真跑，不只查文件在不在）——
+GO192=$(go test -count=1 ./internal/store/ -run 'TestAnchorSignoff' 2>&1 || true)
+if grep_q '^(--- FAIL|FAIL)' GO192; then
+	echo "--- FAIL: §192 Go 锚点回填行为腿："
+	printf '%s\n' "$GO192" | tail -20
+	B192_FAILED=1
+fi
+grep_q '^ok' GO192 || { echo "--- FAIL: §192 Go 行为腿未跑出 ok（编译/导入坏？）"; B192_FAILED=1; }
+PY192=$(py_tests qmt_gateway/tests/test_live_t_enable_20261116.py 2>&1 || true)
+if grep_q 'FAILED|ERROR|ModuleNotFound|No such file' PY192; then
+	echo "--- FAIL: §192 Python T 接线行为腿："
+	printf '%s\n' "$PY192" | tail -20
+	B192_FAILED=1
+fi
+grep_q '7 passed|Ran 7 test' PY192 || { echo "--- FAIL: §192 Python 行为腿未跑满 7 例：$(printf '%s\n' "$PY192" | tail -3)"; B192_FAILED=1; }
+
+[ "$B192_FAILED" = "0" ] || exit 1
+echo "ok - §192 §20261116-LIVE-T 锁通过（签字锚点/外脑烘参/T编排接线/指数同帧/vwap消歧 静态锁 + 用例在册 + Go/Python 双行为腿，累计判定点 ${CNT192}）"
+echo ""
