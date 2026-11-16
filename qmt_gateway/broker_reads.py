@@ -89,8 +89,16 @@ HEADER_ALIASES = {
     # and showed an empty first-buy anchor (owner report 11-13).
     # These are OPTIONAL columns: REQUIRED_COLUMNS stays (symbol, qty) so older
     # export files without them are still parsed instead of rejected.
-    "cost_price": ("成本价", "持仓成本", "成本价格", "买入成本", "开仓价",
+    # 2026-11-16 FIX（owner 现场：云端持仓成本显示 9527 而不是 9.52）：QMT 的
+    # PositionStatics 导出里 `持仓成本` 是**该票的持仓成本合计（元）**，`成本价` 才是
+    # 每股成本。旧别名表把两者挂在同一个规范名下，而 _canon_columns 的精确趟按**列序**
+    # 命中——`持仓成本` 排在 `成本价` 前面，于是 cost_price 恒等于整票成本合计，上游
+    # report_uplink 再按 qty×cost 算 amount，账面成本直接错到"千元/股"量级。
+    # 现在：cost_price 只认每股口径；合计另立 cost_amount，仅在缺每股列时按 qty 反推
+    # （见 _derive_position_cost）。
+    "cost_price": ("成本价", "成本价格", "买入成本", "开仓价",
                    "cost_price", "cost", "open_price"),
+    "cost_amount": ("持仓成本", "持仓成本金额", "成本金额", "cost_amount", "total_cost"),
     "highest_price": ("最高价", "期间最高价", "持仓最高价", "highest_price"),
     "anchor_price": ("首买价", "首买锚点", "锚点价", "anchor_price"),
     "order_id": ("委托号", "委托编号", "合同编号", "订单编号", "order_id", "orderid", "order"),
@@ -392,6 +400,39 @@ def _require_text_format(path):
     return head
 
 
+def _derive_position_cost(rec):
+    """持仓行：只带合计列时按 qty 反推每股成本（2026-11-16）。
+
+    `持仓成本` 是整票成本合计（元），`成本价` 才是每股口径。旧别名表把两者挂在同一个
+    规范名下，列序让合计抢走了 cost_price，云端于是出现"9.52 元的票成本 9527 元"。
+    这里的取舍：
+      * 有每股列（cost_price>0）一律以它为准，**不平均、不覆盖**——合计与每股不同源时
+        （含费/不含费）平均出来的数是两边都不认的第三种口径；
+      * 只有合计列时按 qty 反推；qty<=0（清仓残行）或合计缺失/<=0 时不造数，宁可留空，
+        让下游按"未知"走各自的兜底，而不是拿 0 混进成本基准。
+    """
+    cur = rec.get("cost_price")
+    if cur not in (None, ""):
+        try:
+            if float(cur) > 0:
+                return rec
+        except (TypeError, ValueError):
+            pass
+    total = rec.get("cost_amount")
+    qty = rec.get("qty")
+    if total in (None, "") or qty in (None, ""):
+        return rec
+    try:
+        total = float(total)
+        qty = int(qty)
+    except (TypeError, ValueError):
+        return rec
+    if total <= 0 or qty <= 0:
+        return rec
+    rec["cost_price"] = round(total / qty, 6)
+    return rec
+
+
 def _parse(path, kind, prev_row_count=None):
     """唯一的解析实现：状态机在文档字符串里，四个分支互不折叠。"""
     file_name = os.path.basename(str(path))
@@ -444,6 +485,10 @@ def _parse(path, kind, prev_row_count=None):
             rec[key] = _coerce(cell)
         if not any(str(v).strip() for v in rec.values()):
             continue  # 全空行（导出常见的分隔行/收尾空行）
+        if kind == "positions":
+            # 2026-11-16 FIX：只有「持仓成本（合计）」列时按 qty 反推每股成本，
+            # 避免把整票成本合计当成每股价一路报到云端（见 _derive_position_cost）。
+            rec = _derive_position_cost(rec)
         rows.append(rec)
 
     if not rows:

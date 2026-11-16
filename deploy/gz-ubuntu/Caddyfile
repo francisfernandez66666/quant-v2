@@ -10,6 +10,17 @@
 # 2026-11-13 UAT 修复批（docs/UAT_FIX_PLAN_20261112.md F1/F2/F3）：
 #   站点级四安全头 + -Server、/assets 404 不再 immutable、SPA 深链回落、/setup 显式 404、/dl 分发。
 #   模板来源为退役 Windows 配置 deploy/caddy/guangzhou.conf，root 已换 Linux 路径。
+#
+# 2026-11-16 页面加载慢（HTTP/3 吞吐塌陷）：
+#   同机同客户端 IP 实测 h3 中位 7.2 KB/s vs h2 2640 KB/s，chunk 下载被拖到 30–70s。
+#   这里显式只开 h1/h2，浏览器不再协商 QUIC；配套内核 UDP 上限见 deploy/gz-ubuntu/99-quic-buffers.conf。
+#   若要恢复 h3，删掉下面这个全局块并重启 caddy 即可（alt-svc 头会重新出现）。
+
+{
+	servers {
+		protocols h1 h2
+	}
+}
 
 quant-trading.top {
 	encode gzip

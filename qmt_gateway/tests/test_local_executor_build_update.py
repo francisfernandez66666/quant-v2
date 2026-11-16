@@ -373,8 +373,14 @@ class TestBuilderLeavesNoHalfProduct(BuilderFixture):
         # 闸数从 7 到 8：再加 g9_rule_knobs_baked（移植规则声明的每枚旋钮都必须烘进 PARAMS）。
         # 11-04 的实际形态就是"模块到了、注册成功、七道闸全绿，而它读的 102 枚阈值一枚都没有"，
         # 装载自证看不见这件事——只有第一轮真的调用规则才 raise KeyError。
+        # 闸数从 8 到 9（executor 支）：2026-11-16 载体 v38 带着缺 session_windows 的烘参开盘
+        # 全拒，构建器补了 g10_fail_closed_params（沙箱适配器直读的 fail-closed 键必须烘进去）。
+        # executor 这一支 = 5 基础 + g7e + g8 + g9 + g10 = 9；sandbox 那一支多 g6/g7 共 10。
+        # 数字本身是"少了一道闸就红"的判据，改闸时同批改这里。
         # 数量之外还按名字断言，摘掉任意一道闸都会红，而不是只红在计数上。
-        self.assertIn("BUILD_GATES gates=8 all_passed=1", out)
+        self.assertIn("BUILD_GATES gates=9 all_passed=1", out)
+        self.assertTrue(hasattr(builder, "gate_fail_closed_params"),
+                        "fail-closed params gate removed: an artifact missing session_windows would pass again")
         self.assertTrue(hasattr(builder, "gate_executor_loads"),
                         "executor load gate removed: a non-importable artifact would pass again")
         self.assertTrue(hasattr(builder, "gate_ported_rule_knobs"),
