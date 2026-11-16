@@ -239,6 +239,14 @@ def bake_bakeables(symbol, params_doc, lu_boards=None):
         cols = ["eps", "roe", "roe_waa", "roa", "grossprofit_margin",
                 "netprofit_margin", "debt_to_assets", "yoy_or"]
         pit = {c: v for c, v in zip(cols, fin[0]) if v is not None}
+        # §FIN-ALIAS 20261116：factor_defs 的 financial 家族读 fin_pit["gross_margin"]
+        # /["net_margin"]（factor_defs GrossMargin.field=gross_margin），而 tushare
+        # 列名是 grossprofit_margin/netprofit_margin——键名错位让 GrossMargin/NetMargin
+        # 因子 declined（fac_150 实证）。别名对齐，原键保留不破坏旧消费。
+        if "grossprofit_margin" in pit:
+            pit["gross_margin"] = pit["grossprofit_margin"]
+        if "netprofit_margin" in pit:
+            pit["net_margin"] = pit["netprofit_margin"]
         if pit:
             out["fin_pit"] = pit
     code6 = symbol.split(".")[0]
