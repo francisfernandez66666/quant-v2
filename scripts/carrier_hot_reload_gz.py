@@ -373,6 +373,15 @@ def bake_t_macro():
         ms = funds.get("market_scale")
         if ms is not None and float(ms) > 0:
             out["market_scale"] = round(float(ms), 6)
+        # T-EQUITY-FALLBACK 2026-11-17: the box counter's ACCOUNT table does not
+        # fill m_dBalance on this broker, so _account_total_asset() returns None
+        # and t_cap_base has no denominator -> T stays dead all day. Bake the
+        # engine's own total_asset (already refreshed every round in funds) as a
+        # fallback. The carrier uses it ONLY when the counter gives no reading,
+        # and only while this asof is fresh (asof_age_sec below); stale -> no T.
+        ta = funds.get("total_asset")
+        if ta is not None and float(ta) > 0:
+            out["total_asset"] = round(float(ta), 2)
         out["index_source"] = funds.get("index_source") or ""
         out["asof"] = funds.get("t_at") or funds.get("at") or ""
         # 沙箱不能用 datetime.fromisoformat（g2 闸禁），这里在云端算好"读数年龄秒"，

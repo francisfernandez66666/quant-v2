@@ -401,6 +401,45 @@ def _to_float(value, default):
         return default
 
 
+def _t_equity_basis(total, macro, stale_sec):
+    """T cap-base equity: the counter reading, else a FRESH baked fallback.
+
+    T-EQUITY-FALLBACK 2026-11-17: this broker's ACCOUNT table does not fill
+    m_dBalance intraday, so `total` (from _account_total_asset) is None and
+    t_cap_base has no denominator -> T dies all day (no quota denominator).
+    Fall back to the outer-brain-baked total_asset in t_macro. Rules:
+
+      * counter reading ALWAYS wins (never override a real number with a bake);
+      * the baked value must be positive and carry a non-stale asof_age_sec,
+        else return None (fail closed -- never size a T leg off old equity);
+      * freshness window is the shared t_regime_stale_sec; a missing age or a
+        non-positive window refuses the fallback.
+
+    Pure and independently testable; this is used ONLY for the T ctx, so the
+    strategic buy sizing / cash-reserve paths are byte-for-byte untouched.
+    """
+    if total is not None:
+        t = _to_float(total, None)
+        return t if t is not None and t > 0.0 else None
+    _macro = macro if isinstance(macro, dict) else {}
+    baked = _to_float(_macro.get("total_asset"), None)
+    if baked is None or baked <= 0.0:
+        _warn_once("t_equity_no_denominator",
+                   "no counter equity and no baked total_asset: T stays closed")
+        return None
+    window = _to_float(stale_sec, 0.0)
+    if window is None or window <= 0.0:
+        return None  # no defined freshness window -> do not trust a baked number
+    age = _to_float(_macro.get("asof_age_sec"), None)
+    if age is None:
+        _warn_once("t_equity_baked_age", "baked total_asset has no age: fail closed")
+        return None
+    if age > window:
+        _warn_once("t_equity_baked_stale", "baked total_asset is stale: fail closed")
+        return None
+    return baked
+
+
 def _positions():
     """{symbol: {qty, cost, can_use, market_value}} or None when unreadable.
 
@@ -1616,6 +1655,9 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
                                  the only provable source for the step0 anchor gate.
       * params.t_macro        -- market_scale / index_change_pct / market_state,
                                  baked from the engine's t_rounds_live.json.
+                                 total_asset here is a freshness-gated fallback
+                                 for the T cap base when the counter ACCOUNT
+                                 table gives no equity (T-EQUITY-FALLBACK).
       * params.t_signal_codes -- T leg remark short codes (owner-loaded).
 
     Every gate is fail-closed: a missing reading makes the T layer do nothing,
@@ -1698,6 +1740,11 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
     t_actions = {"open": 0, "balance": 0, "cancel": 0, "close": 0, "hold": 0}
     t_skips = {}
 
+    # T-EQUITY-FALLBACK 2026-11-17: counter equity first, else a fresh baked
+    # total_asset (see _t_equity_basis). Only feeds the T ctx -- the strategic
+    # buy sizing / cash-reserve paths are untouched.
+    t_total = _t_equity_basis(total, macro, stale_sec)
+
     def base_ctx(symbol):
         row = pos_view.get(symbol) or {}
         tick = _tick_of(ContextInfo, symbol)
@@ -1706,7 +1753,7 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
             "symbol": symbol, "day": day, "hhmm": hhmm, "now_ts": now_ts,
             "trading_day": True,  # run_round already passed _trade_session_ok
             "last_price": px, "position_qty": (row or {}).get("qty"),
-            "available_cash": cash, "total_asset": total,
+            "available_cash": cash, "total_asset": t_total,
             "holdings_value": holdings_value,
             "positions_live": pos_view,
             "market_scale": macro.get("market_scale"),

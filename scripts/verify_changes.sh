@@ -23030,3 +23030,84 @@ grep_q 'passed' G196 || { echo "--- FAIL: §196 行为腿未过：$(printf '%s\n
 [ "$B196_FAILED" = "0" ] || exit 1
 echo "ok - §196 §20261117-STALE-CANCEL-FIX 锁通过（账龄走 _order_submit_epoch + 旧裸字段负锁 + 沙箱纯算术 + 撤后可重发两锁 + 超时 600 + 行为腿，累计判定点 ${CNT196}）"
 echo ""
+
+# §197 §20261117-T-EQUITY-FALLBACK（做T分母拿不到：柜台 ACCOUNT 表 m_dBalance 不填 →
+# t_cap_base 无分母 → 全天零做T）。修法：云端 bake_t_macro 加烘 total_asset（ funds 现成），
+# 机内纯函数 _t_equity_basis 在柜台读不到时回退烘参，带 t_regime_stale_sec/asof_age_sec 新鲜度闸；
+# 只喂 T ctx，主买入腿 sizing/cash-reserve 一字节不动（柜台有真数时行为完全不变）。
+echo "==> 197 §20261117-T-EQUITY-FALLBACK（柜台权益优先 + 新鲜烘参回退 + 陈旧负锁 + 主腿隔离 + 行为腿）..."
+B197_FAILED=0
+fail197() {
+	echo "--- FAIL: §197 $*"
+	FAIL=1
+	B197_FAILED=1
+}
+CNT197=0
+ST197=qmt_gateway/qmt_internal_strategy.py
+HR197=scripts/carrier_hot_reload_gz.py
+
+# ① 正锁：机内有纯函数 _t_equity_basis，柜台优先 + 烘参回退两条线都在册。
+CNT197=$((CNT197 + 1))
+grep -qE 'def _t_equity_basis\(total, macro, stale_sec\)' "$ST197" || fail197 "缺 _t_equity_basis（T 分母回退纯函数）"
+CNT197=$((CNT197 + 1))
+grep -qF '"total_asset": t_total' "$ST197" || fail197 "base_ctx total_asset 未走回退值 t_total"
+CNT197=$((CNT197 + 1))
+grep -qF 't_total = _t_equity_basis(total, macro, stale_sec)' "$ST197" || fail197 "_run_t 未接 _t_equity_basis"
+
+# ② 柜台优先负锁：total 非 None 分支必须先返回，不能被烘参覆盖。
+# Python 按缩进精确切函数体（无 C 风格 }）。
+PB197="$(/usr/local/bin/python3 -c "
+lines=open('$ST197',encoding='utf-8').read().splitlines()
+out=[];inside=False
+for ln in lines:
+    if ln.startswith('def _t_equity_basis('):
+        inside=True;out.append(ln);continue
+    if inside:
+        if ln and not ln[0].isspace():
+            break
+        out.append(ln)
+print('\n'.join(out))
+")"
+CNT197=$((CNT197 + 1))
+printf '%s\n' "$PB197" | grep -qE 'if total is not None:' || fail197 "_t_equity_basis 缺柜台优先分支（柜台有真数会被烘参覆盖）"
+
+# ③ 陈旧负锁：asof_age_sec 超窗必须 fail-closed（返回 None），不得拿旧权益下单。
+CNT197=$((CNT197 + 1))
+printf '%s\n' "$PB197" | grep -qE 'if age > window:' || fail197 "缺 stale 判定（旧烘参权益会被拿去下单）"
+CNT197=$((CNT197 + 1))
+printf '%s\n' "$PB197" | grep -q 'return None' || fail197 "陈旧路径未 fail-closed"
+
+# ④ 云端烘参锁：bake_t_macro 加烘 total_asset 且纳入 t_bake sha。
+CNT197=$((CNT197 + 1))
+grep -qF 'out["total_asset"] = round(float(ta), 2)' "$HR197" || fail197 "云端 bake_t_macro 未烘 total_asset"
+CNT197=$((CNT197 + 1))
+grep -qE 'ta = funds.get\("total_asset"\)' "$HR197" || fail197 "烘参 total_asset 来源不是 funds（账本现成字段）"
+
+# ⑤ 主腿隔离锁：_account_total_asset 函数体不得含烘参回退（回退只能在 T ctx 内）。
+# 用 Python 按缩进精确切函数体（Python 无 C 风格 }，awk 会吞掉后续所有函数）。
+CNT197=$((CNT197 + 1))
+AB197="$(/usr/local/bin/python3 -c "
+import sys
+lines=open('$ST197',encoding='utf-8').read().splitlines()
+out=[];inside=False
+for ln in lines:
+    if ln.startswith('def _account_total_asset('):
+        inside=True;out.append(ln);continue
+    if inside:
+        if ln and not ln[0].isspace():
+            break
+        out.append(ln)
+print('\n'.join(out))
+")"
+if printf '%s\n' "$AB197" | grep -qE 'PARAMS\.get|_t_equity_basis|asof_age_sec'; then
+	fail197 "_account_total_asset 混入烘参回退（会放大主买入腿下单金额）"
+fi
+
+# ⑥ 行为腿真跑：TEquityFallback20261117（柜台优先/新鲜回退/陈旧拒绝/缺龄拒绝/隔离）。
+G197=$( cd qmt_gateway && timeout 120 /usr/local/bin/python3 -m pytest tests/test_wiring_selfcontained_20261117.py -k TEquityFallback20261117 2>&1 || true )
+CNT197=$((CNT197 + 1))
+grep_q 'passed' G197 || { echo "--- FAIL: §197 行为腿未过：$(printf '%s\n' "$G197" | tail -6)"; B197_FAILED=1; }
+
+[ "$B197_FAILED" = "0" ] || exit 1
+echo "ok - §197 §20261117-T-EQUITY-FALLBACK 锁通过（柜台优先 + 新鲜烘参回退 + 陈旧/缺龄负锁 + 主腿隔离 + 云端烘参 + 行为腿，累计判定点 ${CNT197}）"
+echo ""

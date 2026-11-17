@@ -204,5 +204,51 @@ class StaleCancelFix20261117(unittest.TestCase):
                       "_live_orders must parse order time, not float a missing field")
 
 
+class TEquityFallback20261117(unittest.TestCase):
+    """T cap-base equity: counter first, else a FRESH baked total_asset.
+
+    This broker's ACCOUNT table does not fill m_dBalance intraday -> the old
+    t_cap_base had no denominator and T was dead all day. The fix adds a
+    freshness-gated fallback to the outer-brain-baked total_asset, scoped to
+    the T ctx only (strategic buy sizing untouched).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _build_and_load()
+
+    def test_counter_reading_always_wins(self):
+        # a real counter number must never be replaced by a baked one
+        self.assertEqual(
+            self.mod._t_equity_basis(123456.78, {"total_asset": 999.0, "asof_age_sec": 1}, 900),
+            123456.78)
+
+    def test_missing_counter_uses_fresh_baked_total_asset(self):
+        self.assertEqual(
+            self.mod._t_equity_basis(None, {"total_asset": 100403.53, "asof_age_sec": 30}, 900),
+            100403.53)
+
+    def test_stale_baked_equity_is_refused(self):
+        # old equity must never size a live T leg -> fail closed
+        self.assertIsNone(
+            self.mod._t_equity_basis(None, {"total_asset": 100403.53, "asof_age_sec": 1200}, 900))
+
+    def test_missing_age_is_refused(self):
+        self.assertIsNone(
+            self.mod._t_equity_basis(None, {"total_asset": 100403.53}, 900))
+
+    def test_no_freshness_window_refuses_baked(self):
+        # stale_sec<=0 means "no trust window" -> do not size off a baked number
+        self.assertIsNone(
+            self.mod._t_equity_basis(None, {"total_asset": 100403.53, "asof_age_sec": 5}, 0))
+
+    def test_baked_artifact_carries_the_fallback_wire(self):
+        # the baked sandbox artifact must actually contain the fallback wire,
+        # not just the template source (builder inlines/port rules)
+        text = open(self.mod.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("_t_equity_basis", text)
+        self.assertIn('"total_asset": t_total', text)
+
+
 if __name__ == "__main__":
     unittest.main()
