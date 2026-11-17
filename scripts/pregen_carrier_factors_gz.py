@@ -343,6 +343,16 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
             (ts,))
     if up and up[0] and up[0][0] is not None:
         out["up_stop"] = float(up[0][0])
+    # §SECTOR-DROP 2026-11-17（owner：sector_limit_up_drop_pct 走云端烘）：该股所属
+    # 板块的涨停家数较昨日降幅。industry_map/sector_drop_map 由 main() 一次查好放
+    # market（避免每票查库）。本票查不到行业或该板块降幅无定义 ⇒ 不烘 ⇒ 消费侧
+    # 安全降级为 0（Go adapter "empty = 0"，绝不为缺失编一个降幅）。
+    _ind_map = market.get("industry_map")
+    _drop_map = market.get("sector_drop_map")
+    if isinstance(_ind_map, dict) and isinstance(_drop_map, dict):
+        _industry = _ind_map.get(ts)
+        if _industry is not None and _industry in _drop_map:
+            out["sector_limit_up_drop_pct"] = _drop_map[_industry]
     # §WIRING-B 2026-11-17 lu_seal_strength/lu_early_seal：与 Go research/assemble.go
     # 逐字同口径（scaler_bands 照这套峰值口径标定，绝不能用东财池"当前 fund"替代——
     # 那是另一分布＝漂移＝钱路径分叉，正是本仓反复防的形状）。
@@ -462,6 +472,55 @@ def fetch_market_history(day, lookback=20):
     }
 
 
+def fetch_sector_drop_map(day):
+    """§SECTOR-DROP 2026-11-17（owner 路线：sector_limit_up_drop_pct 走云端烘）：
+    板块涨停家数较昨日下降比例 = (昨 limitup_cnt - 今) / 昨，按 industry 聚合。
+
+    真源 = sector_history(trade_date, industry, limitup_cnt)（权威落库表，
+    13.8 万行、盘前 fresh 到上一交易日），Go shortbase.go:32 的同名字段口径。
+    "今日" = 表内 MAX(trade_date)，"昨日" = 其前一交易日（表内次大日期），
+    不硬编码自然日（跳过周末/停市）。昨日为 0 的板块降幅无定义 ⇒ 不烘该板块
+    （消费侧缺读数安全降级为 0，与 Go "empty = 0" 同口径，绝不编造降幅）。
+
+    返回 {industry: drop(0..1+)} 或 None（缺表/缺两日数据）。降幅可 >1 吗？
+    不会：今 >= 0、昨 > 0 ⇒ drop <= 1。今 > 昨时 drop < 0（涨停增加），照烘
+    （负降幅让 leader_decay 的 >=0.5 判据自然不触发，语义正确）。
+    """
+    dates = _q("SELECT DISTINCT trade_date FROM sector_history "
+               "WHERE trade_date<=? ORDER BY trade_date DESC LIMIT 2", (day,))
+    if not dates or len(dates) < 2:
+        return None
+    today, yday = str(dates[0][0]), str(dates[1][0])
+    cur = _q("SELECT industry, COALESCE(limitup_cnt,0) FROM sector_history "
+             "WHERE trade_date=?", (today,)) or []
+    prev = _q("SELECT industry, COALESCE(limitup_cnt,0) FROM sector_history "
+              "WHERE trade_date=?", (yday,)) or []
+    prev_map = {}
+    for industry, cnt in prev:
+        prev_map[str(industry)] = int(cnt or 0)
+    out = {}
+    for industry, cnt in cur:
+        p = prev_map.get(str(industry))
+        if p is None or p <= 0:            # 昨日无该板块或 0 家 ⇒ 降幅无定义 ⇒ 不烘
+            continue
+        out[str(industry)] = (p - int(cnt or 0)) / float(p)
+    return out or None
+
+
+def fetch_industry_map():
+    """个股 ts_code -> industry（stock_basic 真源），供 bake 按票查所属板块降幅。
+
+    缺表/空表返回 None ⇒ bake 不烘 sector_limit_up_drop_pct，消费侧安全降级。
+    """
+    rows = _q("SELECT ts_code, industry FROM stock_basic "
+              "WHERE industry IS NOT NULL AND industry!=''", ()) or []
+    out = {}
+    for code, industry in rows:
+        if code and industry:
+            out[str(code)] = str(industry)
+    return out or None
+
+
 def _notify(title, body):
     """§B 机制（2026-11-11 owner 要求）：手机推送走系统现成的 ntfy 运维告警通道
     （config.json notify.ntfy_url/topic，与 APK 推送网关并行的独立冗余通道）。
@@ -559,6 +618,19 @@ def main():
         print("PREGEN_LEADER_SET n=%s" % len(leader_set))
     except Exception as exc:  # noqa: BLE001
         print("PREGEN_LEADER_FAIL %s" % type(exc).__name__)
+    # §SECTOR-DROP 2026-11-17（owner：sector_limit_up_drop_pct 走云端烘）：一次算出
+    # 板块涨停家数降幅 + 个股行业映射，放 market 供每票 O(1) 查（缺源不阻断主链）。
+    try:
+        drop_map = fetch_sector_drop_map(day)
+        ind_map = fetch_industry_map()
+        if drop_map:
+            market["sector_drop_map"] = drop_map
+        if ind_map:
+            market["industry_map"] = ind_map
+        print("PREGEN_SECTOR_DROP industries=%s stocks=%s" % (
+            len(drop_map or {}), len(ind_map or {})))
+    except Exception as exc:  # noqa: BLE001
+        print("PREGEN_SECTOR_DROP_FAIL %s" % type(exc).__name__)
     # §WIRING-B+ 2026-11-17：全市场情绪历史从权威落库表逐日聚合（涨停/炸板/炸板率多日序列），
     # 喂 rules_factor 的历史型 scalar_proxy（emo_chg5 / lu_reblast_low）。缺表/盘前未同步⇒None，
     # 消费侧诚实弃权。缺源不阻断主链（与涨停池同一纪律）。

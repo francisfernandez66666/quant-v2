@@ -1168,6 +1168,172 @@ def _bars_of(payload, symbol):
     return bars
 
 
+# ---- AFTERNOON-RESEAL 2026-11-17 (owner: sell-side protective leg, in-client) ----
+# leader_decay / leader_decay_v2 are LIVE sell tactics that were structurally dead:
+# ctx["afternoon_reseal"] was only ever read from baked precalc, which never
+# carried it, so the rule declined forever (None) and never sold. The 17:46
+# read/value probe on this exact box proved the client CAN return 1-minute bars
+# (get_market_data_ex positional shape) and the exact limit price (UpStopPrice
+# from get_instrument_detail). So compute the protective reading in-client.
+# SAFETY (owner ruling 2026-11-17): this is a PROTECTIVE gate -- True/None both
+# skip the sell. On ANY missing reading (no minute bars, no timestamps, no
+# limit price) return None => no sell (fail-closed, never assume "not resealed"
+# from absent data). Mirrors Go shortbase.go:71 / adapter.go:447-454, but uses
+# the EXACT UpStopPrice instead of Go's name-based limit-pct inference.
+def _minute_bars_payload(ContextInfo, symbol, count):
+    """Fetch today's 1-minute bars with the shape the 17:46 probe proved.
+
+    The probe: get_market_data_ex([], [code], "1m", "", "", 20, "front")
+    returned {code: DataFrame(close,high,low,open,amount,stime,...)}. Keyword
+    shapes (field=/fieldList=) all raised TypeError on this build, so use the
+    positional shape only. Absent/exception -> None (caller stays fail-closed).
+    """
+    getter = getattr(ContextInfo, "get_market_data_ex", None)
+    if not callable(getter):
+        return None
+    try:
+        payload = getter([], [symbol], "1m", "", "", int(count), "front")
+    except Exception:  # noqa: BLE001 - no minute data is a valid outcome
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _instrument_up_stop(ContextInfo, symbol):
+    """Exact limit-up price from the instrument detail (probe: UpStopPrice).
+
+    Literal getattr only (g2). None when the API is absent, raises, or carries
+    no usable price -> caller stays fail-closed.
+    """
+    getter = getattr(ContextInfo, "get_instrument_detail", None)
+    if not callable(getter):
+        return None
+    try:
+        detail = getter(symbol)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(detail, dict):
+        return None
+    value = detail.get("UpStopPrice")
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def _bar_times(entry, n):
+    """Timestamps of a market-data entry as strings, len n, or None.
+
+    The QMT DataFrame exposes its time axis as `stime` (probe column listing)
+    and/or as the DataFrame index. Both are read by LITERAL attribute/key, so
+    the sandbox g2 rule (no variable-name getattr) is satisfied. A payload
+    without any readable time axis yields None -> the caller cannot prove a
+    14:30 reseal and stays fail-closed.
+    """
+    times = None
+    try:
+        column = getattr(entry, "stime", None)
+        if column is None and isinstance(entry, dict):
+            column = entry.get("stime")
+        if column is not None:
+            times = list(column)
+    except (TypeError, ValueError):  # noqa: BLE001
+        times = None
+    if not times:
+        try:
+            index = getattr(entry, "index", None)
+            if index is not None:
+                times = list(index)
+        except (TypeError, ValueError):  # noqa: BLE001
+            times = None
+    if not times or len(times) < n:
+        return None
+    return times
+
+
+def _is_after_1430(stamp):
+    """True iff a bar timestamp is 14:30 or later (Beijing wall clock).
+
+    Accepts "202611171430" (YYYYMMDDHHMM), "20261117143000" (+SS),
+    "2026-11-17 14:30:00" and "14:30". Pure string work: no date parser, no
+    clock, no locale. A stamp carrying letters or too few digits is rejected
+    (False) so junk can never manufacture a protective True.
+    """
+    text = str(stamp)
+    # Only digits and common datetime separators are plausible; anything else
+    # (letters, stray words) is unparseable and must not be read as a time.
+    for ch in text:
+        if not (ch.isdigit() or ch in "-: ."):
+            return False
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 12:
+        hhmm = digits[8:12]        # YYYYMMDDHHMM(SS): positions 8-11 are HHMM
+    elif len(digits) == 6:
+        hhmm = digits[0:4]         # HHMMSS
+    elif len(digits) == 4:
+        hhmm = digits              # HHMM
+    else:
+        return False
+    try:
+        hour, minute = int(hhmm[:2]), int(hhmm[2:])
+    except ValueError:
+        return False
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return False
+    return hour > 14 or (hour == 14 and minute >= 30)
+
+
+def _afternoon_reseal_from(payload, symbol, up_stop, tol):
+    """PURE: minute bars + exact limit price -> reseal bool, or None.
+
+    None = cannot prove (no bars / no timestamps / no limit price) => the
+    caller skips the sell. True = a bar at/after 14:30 closed at/above the
+    limit (within tol) => protective skip. False = bars exist, none resealed.
+    tol is the sealed-board tolerance fraction read from params.
+    """
+    if not up_stop or up_stop <= 0:
+        return None
+    entry = payload.get(symbol, payload) if isinstance(payload, dict) else None
+    if entry is None:
+        return None
+    close_entry = getattr(entry, "close", None)
+    if close_entry is None and isinstance(entry, dict):
+        close_entry = entry.get("close")
+    if close_entry is None:
+        return None
+    try:
+        closes = [float(v) if v is not None else None for v in list(close_entry)]
+    except (TypeError, ValueError):
+        return None
+    n = len(closes)
+    if n == 0:
+        return None
+    times = _bar_times(entry, n)
+    if times is None:                      # cannot prove timing -> fail closed
+        return None
+    threshold = up_stop * (1.0 - float(tol))
+    for index in range(n):
+        close = closes[index]
+        if close is None:
+            continue
+        if _is_after_1430(times[index]) and close >= threshold:
+            return True
+    return False
+
+
+def _afternoon_reseal(ContextInfo, symbol, tol, count):
+    """Adapter: pull minute bars + UpStopPrice, then the pure judgment.
+
+    Only called for held symbols by build_context, so the extra reads stay
+    bounded (a handful of positions, not the whole 1000-name pool).
+    """
+    up_stop = _instrument_up_stop(ContextInfo, symbol)
+    if up_stop is None:
+        return None
+    payload = _minute_bars_payload(ContextInfo, symbol, count)
+    return _afternoon_reseal_from(payload, symbol, up_stop, tol)
+
+
 def _mean_tail(values, n):
     vals = [v for v in values if v]
     if len(vals) < n:
@@ -1316,6 +1482,15 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     today_vol_vs_5d = (tick_volume / vol5) if (tick_volume and vol5) else None
     _STATE.setdefault("bars_cov", {})[symbol] = 1 if bars else 0
     pre = (PARAMS.get("precalc") or {}).get(symbol) or {}
+    # AFTERNOON-RESEAL (2026-11-17): compute the protective reading in-client
+    # for HELD names only (leader_decay fires on positions). Failed reads stay
+    # None -> the sell is skipped (owner ruling: never infer "not resealed"
+    # from missing minute data). Non-held names keep the baked passthrough.
+    reseal = pre.get("afternoon_reseal")
+    if held.get("qty") and reseal is None:
+        reseal = _afternoon_reseal(ContextInfo, symbol,
+                                   PARAMS.get("ld_seal_tolerance", 0.995),
+                                   PARAMS.get("bars_count", 80))
     return {
         "symbol": symbol,
         "day": day,
@@ -1371,7 +1546,7 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         # "abstain=allow" defect that filled the account at 98.9%.
         "is_leader": pre.get("is_leader"),
         "ladder_height": pre.get("ladder_height"),
-        "afternoon_reseal": pre.get("afternoon_reseal"),
+        "afternoon_reseal": reseal,
         "up_stop": pre.get("up_stop"),
         "index_change_pct": pre.get("index_change_pct"),
         "limit_up_count": pre.get("limit_up_count"),

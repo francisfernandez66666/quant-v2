@@ -23278,3 +23278,57 @@ grep_q '4 passed' PY200 || { echo "--- FAIL: §200 series 行为腿未跑满 4 �
 [ "$B200_FAILED" = "0" ] || exit 1
 echo "ok - §200 §20261117-PERCENTILE-SERIES 锁通过（源码+烘参6项series + handler + pregen history + 反scalar_proxy回潮 + 4例行为腿，累计判定点 ${CNT200}）"
 echo ""
+
+# §201 §20261117-RESEAL-SECTORDROP（owner 裁决：afternoon_reseal 机内自算 + sector_drop 云端烘）。
+# leader_decay/v2 是 live 卖出战法，此前因 afternoon_reseal 恒 None 结构性死亡。17:46 真机
+# 探针证明本机可取分钟K(get_market_data_ex 位置姿势)+精确涨停价(get_instrument_detail 的
+# UpStopPrice)，故保护腿改机内自算；owner 口径：缺读数一律 None(保护腿不卖，fail-closed)。
+# sector_limit_up_drop_pct 的"昨日家数"无源(_STATE 重启丢/机内无文件网络)，走云端 pregen
+# 从 sector_history.limitup_cnt 烘，缺源安全降级为 0(Go empty=0)。
+echo "==> 201 §20261117-RESEAL-SECTORDROP（机内自算+云端烘+行为腿）..."
+B201_FAILED=0
+fail201() {
+	echo "--- FAIL: §201 $*"
+	FAIL=1
+	B201_FAILED=1
+}
+CNT201=0
+
+# ① afternoon_reseal 机内自算函数族 + build_context 接入。
+for _fn201 in _minute_bars_payload _instrument_up_stop _bar_times _is_after_1430 _afternoon_reseal_from _afternoon_reseal; do
+	CNT201=$((CNT201 + 1))
+	grep -qF "def $_fn201(" qmt_gateway/qmt_internal_strategy.py || fail201 "缺 $_fn201（afternoon_reseal 自算链断）"
+done
+CNT201=$((CNT201 + 1))
+grep -qF '"afternoon_reseal": reseal' qmt_gateway/qmt_internal_strategy.py || fail201 "build_context 未用机内自算值（仍读旧 precalc）"
+CNT201=$((CNT201 + 1))
+grep -qF 'getter([], [symbol], "1m", "", "", int(count), "front")' qmt_gateway/qmt_internal_strategy.py || fail201 "分钟K姿势非探针证实的位置参数形状"
+CNT201=$((CNT201 + 1))
+grep -qF 'UpStopPrice' qmt_gateway/qmt_internal_strategy.py || fail201 "未用精确 UpStopPrice 作板价"
+# 负锁：自算值不得被无条件覆盖回 pre.get（那会让机内自算形同虚设）。
+CNT201=$((CNT201 + 1))
+if grep -qF '"afternoon_reseal": pre.get("afternoon_reseal")' qmt_gateway/qmt_internal_strategy.py; then
+	fail201 "afternoon_reseal 又读回 precalc（机内自算被旁路）"
+fi
+
+# ② sector_drop 云端烘：pregen 两函数 + 烘值键 + main 接入。
+CNT201=$((CNT201 + 1))
+grep -qF 'def fetch_sector_drop_map(' scripts/pregen_carrier_factors_gz.py || fail201 "pregen 缺 fetch_sector_drop_map"
+CNT201=$((CNT201 + 1))
+grep -qF 'def fetch_industry_map(' scripts/pregen_carrier_factors_gz.py || fail201 "pregen 缺 fetch_industry_map"
+CNT201=$((CNT201 + 1))
+grep -qF 'out["sector_limit_up_drop_pct"] = _drop_map[_industry]' scripts/pregen_carrier_factors_gz.py || fail201 "pregen 未按个股行业烘 sector_limit_up_drop_pct"
+CNT201=$((CNT201 + 1))
+grep -qF 'market["sector_drop_map"] = drop_map' scripts/pregen_carrier_factors_gz.py || fail201 "main 未把 sector_drop_map 传入 market"
+
+# ③ 行为腿真跑：机内自算 13 例 + 云端烘 8 例。
+PY201A=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_afternoon_reseal_20261117.py -q 2>&1 || true )
+CNT201=$((CNT201 + 1))
+grep_q '13 passed' PY201A || { echo "--- FAIL: §201 机内自算行为腿未跑满13例：$(printf '%s\n' "$PY201A" | tail -6)"; B201_FAILED=1; }
+PY201B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_sector_drop_20261117.py -q 2>&1 || true )
+CNT201=$((CNT201 + 1))
+grep_q '8 passed' PY201B || { echo "--- FAIL: §201 云端烘行为腿未跑满8例：$(printf '%s\n' "$PY201B" | tail -6)"; B201_FAILED=1; }
+
+[ "$B201_FAILED" = "0" ] || exit 1
+echo "ok - §201 §20261117-RESEAL-SECTORDROP 锁通过（机内自算6函数+build_context接入+负锁 + pregen云端烘 + 13+8例行为腿，累计判定点 ${CNT201}）"
+echo ""
