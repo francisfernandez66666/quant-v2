@@ -814,13 +814,20 @@ class ReportUplink:
             return "dead"  # 永久拒绝（毒丸）：记死信，不再重发（§P1-8 同口径）
         return "retry"
 
-    def run_once(self):
+    def run_once(self, force=False):
         """完整一轮：先排空重试队列（保持原序，老事实先到），再构造并发本轮新事件。
 
         返回统计 dict（供 cron 日志与测试断言）。发送成功才把内容哈希推进"已发"账——
         这条就是 §FIX-20261028-F02 在本腿的落形：基线只随真实成功的写推进。
+
+        force=True（2026-11-17 云端强制刷新）：本轮对 positions/account/order 事件
+        **旁路"同哈希已发过"去重**，把当前最新导出再发一次——这是补"手动 App 卖出不
+        触发盒端交易回报"那一手：账变了哈希自然新（本来就会发），但当导出 mtime 没动 /
+        值与上次相同时，普通轮次会静默、强刷仍要发一次覆盖云端。**仍走同一个 _post/
+        同一条归属链**（负锁：force 不得另开第二条上报函数）；force 只放宽"要不要发"，
+        不放宽"发到哪/归谁"。成功仍按原样推进哈希账。
         """
-        report = {"sent": 0, "retry": 0, "dead": 0, "skipped_dupe": 0}
+        report = {"sent": 0, "retry": 0, "dead": 0, "skipped_dupe": 0, "forced": 0}
         pending = []
         while self._retry:
             pending.append(self._retry.popleft())
@@ -828,9 +835,12 @@ class ReportUplink:
             pending.append(event)
         for event in pending:
             h = _canonical_hash(event)
-            if h in self.sent_hashes or h in self.dead_hashes:
+            dedupable = event.get("type") in ("positions", "account", "order")
+            if not (force and dedupable) and (h in self.sent_hashes or h in self.dead_hashes):
                 report["skipped_dupe"] += 1
                 continue  # 同内容已定论（成功或死信），不重复占网络
+            if force and dedupable and (h in self.sent_hashes or h in self.dead_hashes):
+                report["forced"] += 1
             outcome = self._post(event)
             if outcome == "sent":
                 self.sent_hashes.append(h)
@@ -930,6 +940,9 @@ def main(argv=None):
     ap.add_argument("--once", action="store_true", help="run exactly one round and exit")
     ap.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="build and count events, send nothing, write no state")
+    ap.add_argument("--force", action="store_true",
+                    help="cloud manual refresh: re-post current positions/account/order this "
+                         "round even if unchanged (same POST/attribution path, dedup bypassed only)")
     args = ap.parse_args(argv)
 
     try:
@@ -965,10 +978,11 @@ def main(argv=None):
               % (1 if uplink.base_url else 0, 1 if uplink.token else 0))
         return 2
 
-    report = uplink.run_once()
-    print("UPLINK_RESULT=OK sent=%d retry=%d dead=%d skipped_dupe=%d net_fail=%d drops=%d"
+    report = uplink.run_once(force=args.force)
+    print("UPLINK_RESULT=OK sent=%d retry=%d dead=%d skipped_dupe=%d forced=%d net_fail=%d drops=%d"
           % (report.get("sent", 0), report.get("retry", 0), report.get("dead", 0),
-             report.get("skipped_dupe", 0), uplink.stats.get("net_fail", 0),
+             report.get("skipped_dupe", 0), report.get("forced", 0),
+             uplink.stats.get("net_fail", 0),
              uplink.stats.get("dropped_queue_overflow", 0)))
     return 0
 

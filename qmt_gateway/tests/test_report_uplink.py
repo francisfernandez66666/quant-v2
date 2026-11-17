@@ -309,6 +309,30 @@ class TestCarrierShadowLeg(unittest.TestCase):
         self.assertEqual(len(again), 1, "同一份账本被重发：事件的 at 里混进了墙钟")
         self.assertGreaterEqual(report["skipped_dupe"], 1)
 
+    def test_force_reposts_positions_even_when_unchanged(self):
+        """§WIRING-C 2026-11-17：云端手动强刷——旁路去重再发一次，但仍走同一上报链。
+
+        手动 App 卖出不触发盒端交易回报；账变没变导出 mtime 都可能不动，普通轮次会静默。
+        force=True 必须把当前持仓/资产再发一次覆盖云端（补那一手），而**不许**因此开第二条
+        POST/归属函数（这里只数 positions 事件被多发了 1 次，没有新增 kind）。非 force 第二轮
+        仍必须静默——证明"变了才发"没被破坏。
+        """
+        fx = self._fx(shadow_rows=0)
+        u = fx.uplink(self.opener)
+        u.run_once()
+        pos_first = [c for c in self.opener.calls if c[2].get("type") == "positions"]
+        self.assertEqual(len(pos_first), 1)
+        u.run_once()  # 内容未变 -> 去重静默
+        pos_second = [c for c in self.opener.calls if c[2].get("type") == "positions"]
+        self.assertEqual(len(pos_second), 1, "非 force 同内容必须静默（不破坏变了才发）")
+        rep3 = u.run_once(force=True)
+        pos_third = [c for c in self.opener.calls if c[2].get("type") == "positions"]
+        self.assertEqual(len(pos_third), 2, "force 必须把持仓再发一次覆盖云端")
+        self.assertGreaterEqual(rep3.get("forced", 0), 1)
+        # 仍只走同一条上报链：positions/account/order 这些 type 集合不新增第三条上报 kind。
+        self.assertTrue({e.get("type") for _, _, e in self.opener.calls} <= {
+            "positions", "account", "order", "trade", "heartbeat", "carrier_shadow", "diagnostic"})
+
     def test_batches_respect_the_row_cap(self):
         """超单批上限必须**切批**而不是截断：Go 侧超 carrierShadowMaxRows 是整条 400。
 
