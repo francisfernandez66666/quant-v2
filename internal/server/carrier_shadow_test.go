@@ -456,12 +456,32 @@ func TestCarrierShadowReadoutIgnoresYesterday(t *testing.T) {
 func TestQMTStateCarriesCarrierShadow(t *testing.T) {
 	s, db := newCarrierShadowServer(t)
 	uid := "u_state"
-	day := cntime.DayCompactOf(carrierShadowNow)
-	mustIngest(t, s, db, uid, day, []store.CarrierShadowDecision{
+	// DATE-DRIFT-FIX（2026-11-17）：这是唯一走 HTTP 路径的影子用例——handleQMTState
+	// 内部用真实时钟定交易日窗，灌固定日期（2026-11-05）的行会随日历漂出窗口
+	// （11-16 跑绿、11-17 跑红，正是跨日出窗的形状）。改为灌「当前最近一个交易日」
+	// 的行：readout 的窗口右端（to=最新交易日）恒含它，任何日期跑都成立。
+	tradingDays := carrierShadowTradingDays(cntime.Now(), 7)
+	if len(tradingDays) == 0 {
+		t.Fatalf("交易日历定不出最近窗口，探针行无从落日")
+	}
+	day := tradingDays[0]
+	dayT, err := time.ParseInLocation("20060102", day, cntime.Loc)
+	if err != nil {
+		t.Fatalf("最近交易日 %s 解析失败: %v", day, err)
+	}
+	probeNow := time.Date(dayT.Year(), dayT.Month(), dayT.Day(), 15, 30, 0, 0, cntime.Loc)
+	rows := []store.CarrierShadowDecision{
 		carrierShadowRow(day, "600000.SH", "dragon", func(r *store.CarrierShadowDecision) {
 			r.ShortCode = "DR600000"
 		}),
-	})
+	}
+	written, _, err := db.UpsertCarrierShadowRows(uid, probeNow.Format(time.RFC3339), rows)
+	if err != nil {
+		t.Fatalf("upsert shadow: %v", err)
+	}
+	if written != len(rows) {
+		t.Fatalf("探针行应全量写入：written=%d want=%d", written, len(rows))
+	}
 	r := httptest.NewRequest(http.MethodGet, "/api/qmt/state?shadow_days=7", nil)
 	r = r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, &auth.User{ID: uid}))
 	rec := httptest.NewRecorder()
