@@ -1293,6 +1293,10 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "first_seal_minute": pre.get("first_seal_minute"),
         "sector_limit_up_drop_pct": pre.get("sector_limit_up_drop_pct"),
         "emotion_phase": pre.get("emotion_phase"),
+        # as-of stamp of the authoritative emotion snapshot (the ths pool session it
+        # was aggregated from); carried so a reader can see the emotion scalar is a
+        # prior-session baseline, not a live intraday count.
+        "emotion_day": pre.get("emotion_day"),
     }
 
 

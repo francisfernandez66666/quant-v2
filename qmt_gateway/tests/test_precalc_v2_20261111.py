@@ -28,9 +28,11 @@ def research_db(tmp_path, monkeypatch):
     dbp = str(tmp_path / "trading.db")
     conn = sqlite3.connect(dbp)
     conn.execute("CREATE TABLE daily_basic (ts_code TEXT, trade_date TEXT, pe_ttm REAL,"
-                 " pb REAL, ps_ttm REAL, turnover_rate REAL, circ_mv REAL)")
+                 " pb REAL, ps_ttm REAL, pcf_ttm REAL, dv_ttm REAL, turnover_rate REAL,"
+                 " total_share REAL, circ_mv REAL)")
     for i in range(20):
-        conn.execute("INSERT INTO daily_basic VALUES (:c, :d, 51.8, 3.5, 2.7, 8.4, 210000)",
+        conn.execute("INSERT INTO daily_basic VALUES (:c, :d, 51.8, 3.5, 2.7, 12.4, 2.6, 8.4,"
+                     " 91000.0, 210000)",
                      {"c": "600580.SH", "d": "2026%02d01" % (i + 1)})
     conn.execute("CREATE TABLE fina_indicator (ts_code TEXT, end_date TEXT, ann_date TEXT,"
                  " eps REAL, roe REAL, roe_waa REAL, roa REAL, grossprofit_margin REAL,"
@@ -57,9 +59,14 @@ def research_db(tmp_path, monkeypatch):
 def test_bake_bakeables_shapes_align_consumers(research_db):
     """烘出键=QMT 拿不到的集合，形态对齐 rules_factor 消费端（_field_series/_pit_value/_scalar_score）。"""
     out = P.bake_bakeables("600580.SH", {"hot_pool": {"bullish": {"600580.SH": {"score": 0.94}}}})
-    # 估值面板：{"pe_ttm":[...],...} —— _field_series 直接 get(field) 取序列
-    assert set(out["valuation_series"]) == {"pe_ttm", "pb", "ps_ttm"}
+    # 估值面板：{"pe_ttm":[...],...} —— _field_series 直接 get(field) 取序列。
+    # §WIRING-B 20261117 起 pcf_ttm/dv_ttm 一并烘（补 CFP_ttm/DP 两条恒 declined 因子），
+    # total_share 单独成 total_share_series（LnMktCap）。
+    assert set(out["valuation_series"]) == {"pe_ttm", "pb", "ps_ttm", "pcf_ttm", "dv_ttm"}
     assert len(out["valuation_series"]["pe_ttm"]) == 20
+    assert out["valuation_series"]["pcf_ttm"][0] == pytest.approx(12.4)
+    assert out["valuation_series"]["dv_ttm"][0] == pytest.approx(2.6)
+    assert len(out["total_share_series"]) == 20
     # 换手序列：纯数值列表（_plain_series）
     assert len(out["turnover_series"]) == 20
     # 财务分位：_pit_value 按字段取最新档

@@ -49,6 +49,9 @@ class PregenWiringB(unittest.TestCase):
                 return [(35.0, "2026-11-16")]  # score, date
             if "FROM stk_limit" in s:
                 return [(11.0,)]
+            if "FROM ths_limit_up_daily" in s:
+                # (continue_cnt, first_seal_time, max_seal_money) —— 涨停事件日
+                return [(2, "09:41", 3e7)]
             return None
         return q
 
@@ -76,6 +79,30 @@ class PregenWiringB(unittest.TestCase):
         self.assertEqual(out.get("ladder_height"), 5.0)
         self.assertTrue(out.get("is_leader"), "600206 in leader_set -> True")
         self.assertEqual(out.get("limit_board_count"), 3.0)  # existing per-code boards
+        # seal/first_seal 与 assemble.go 同口径：峰值封单/流通市值(万元×1e4)、首封 HH:MM→分钟。
+        # max_seal=3e7, circ_mv=5000万=5e7元 -> ratio=0.6; "09:41" -> 581 分钟。
+        self.assertAlmostEqual(out.get("seal_amount_ratio"), 0.6, places=6,
+                               msg="seal_amount_ratio 必须用峰值 max_seal_money/circ_mv，非东财当前 fund")
+        self.assertEqual(out.get("first_seal_minute"), 581.0)
+
+    def test_no_ths_event_row_does_not_fabricate_seal(self):
+        # 池里没有该票涨停事件行（非涨停日 / ths 停摆缺行）时绝不烘 ratio=0——
+        # 0 与 absent 在 lu_* 分档里语义不同，烘 0 会把"没数据"冒充"封单为零"。
+        m = self.mod
+        orig_q = m._q
+
+        def q_none(sql, args):
+            s = " ".join(sql.split())
+            if "FROM ths_limit_up_daily" in s:
+                return []  # 无涨停事件行
+            return self._fake_q()(sql, args)
+        m._q = q_none
+        try:
+            out = m.bake_bakeables("600206", {"hot_pool": {"bullish": {}}}, lu_boards={}, market={})
+        finally:
+            m._q = orig_q
+        self.assertNotIn("seal_amount_ratio", out)
+        self.assertNotIn("first_seal_minute", out)
 
     def test_is_leader_is_explicit_bool_not_none(self):
         m = self.mod
@@ -101,6 +128,65 @@ class PregenWiringB(unittest.TestCase):
             m._q = orig_q
         self.assertNotIn("news_propagation", out,
                          "propagation must stay absent (no Level source) -> good_news_fade declines honestly")
+
+    # §WIRING-B+ fetch_market_history：从权威落库表逐日聚合涨停/炸板/炸板率多日序列。
+    def test_fetch_market_history_orders_old_to_new_and_ratio_math(self):
+        m = self.mod
+        orig_q = m._q
+        # 故意返回 DESC（新→旧），函数须翻成旧→新；炸板表只有两天有行，另一天缺→该天炸板按 0 计。
+        def q(sql, args):
+            s = " ".join(sql.split())
+            if "FROM ths_limit_up_daily" in s and "GROUP BY trade_date" in s:
+                return [("20261116", 30), ("20261115", 20), ("20261114", 10)]
+            if "FROM ths_break_pool_daily" in s and "GROUP BY trade_date" in s:
+                return [("20261116", 10), ("20261114", 2)]  # 20261115 缺行 -> break 0
+            return None
+        m._q = q
+        try:
+            h = m.fetch_market_history("20261116", lookback=20)
+        finally:
+            m._q = orig_q
+        self.assertIsNotNone(h)
+        self.assertEqual(h["limit_up_count_history"], [10.0, 20.0, 30.0])  # old->new
+        # 20261116: 10/(30+10)=0.25; 20261115: 0/(20+0)=0; 20261114: 2/(10+2)=0.1667
+        self.assertAlmostEqual(h["broken_board_ratio_history"][2], 0.25, places=6)
+        self.assertEqual(h["broken_board_ratio_history"][1], 0.0)
+        self.assertAlmostEqual(h["broken_board_ratio_history"][0], 2.0 / 12.0, places=6)
+        # latest-session scalars + as-of day
+        self.assertEqual(h["broken_board_count"], 10.0)
+        self.assertAlmostEqual(h["broken_board_ratio"], 0.25, places=6)
+        self.assertEqual(h["emotion_day"], "20261116")
+
+    def test_fetch_market_history_returns_none_when_pool_table_empty(self):
+        # 盘前池未同步 / 表不存在：_q 返回 None/空 ⇒ 整个历史 None，绝不烘一个 0 序列。
+        m = self.mod
+        orig_q = m._q
+        m._q = lambda sql, args: None
+        try:
+            self.assertIsNone(m.fetch_market_history("20261116"))
+        finally:
+            m._q = orig_q
+
+    def test_market_history_flows_into_bake_out(self):
+        # market 聚合一次，须按账户级标量逐票写进 out（消费端 rules_factor 从 ctx 读这些键）。
+        m = self.mod
+        orig_q = m._q
+        m._q = self._fake_q()
+        try:
+            out = m.bake_bakeables(
+                "600206", {"hot_pool": {"bullish": {}}}, lu_boards={},
+                market={"limit_up_count_history": [10.0, 20.0],
+                        "broken_board_ratio_history": [0.1, 0.2],
+                        "broken_board_count": 4.0, "broken_board_ratio": 0.2,
+                        "emotion_day": "20261116"})
+        finally:
+            m._q = orig_q
+        self.assertEqual(out.get("limit_up_count_history"), [10.0, 20.0])
+        self.assertEqual(out.get("broken_board_ratio_history"), [0.1, 0.2])
+        self.assertEqual(out.get("broken_board_ratio"), 0.2)
+        self.assertEqual(out.get("emotion_day"), "20261116")
+        # absent market keys must NOT be materialised as 0/None into out.
+        self.assertNotIn("afternoon_reseal", out)
 
 
 if __name__ == "__main__":

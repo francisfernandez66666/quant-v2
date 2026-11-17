@@ -315,11 +315,42 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
     # 板块龙头（leader_decay 要 is_leader）：sector_history.top_stocks membership，bool 显式。
     if "leader_set" in market:
         out["is_leader"] = bool(code6 in market["leader_set"])
+    # §WIRING-B+ 2026-11-17：全市场情绪历史是账户级标量（每票同值），market 已在 main() 聚合一次。
+    # 历史列表进 ctx 供 owner 后续把 emo_chg5/lu_reblast_low 从 scalar_proxy 改接序列消费端；
+    # 现阶段无 scalar_bands ⇒ rules_factor 仍弃权（列表喂 _as_number=None，与缺席同形、不假打分）。
+    # broken_board_ratio/count 给最近一交易日的标量（含 emotion_day 让 as-of 可见），单位见
+    # fetch_market_history 注释（0..1 比值）——owner 标定 band 时须对齐。
+    for _mk in ("limit_up_count_history", "broken_board_ratio_history",
+                "broken_board_count", "broken_board_ratio", "emotion_day"):
+        if _mk in market:
+            out[_mk] = market[_mk]
     # 涨停价（leader_decay 的 up_stop = 今日板价）：stk_limit 最新一行的 up_limit。
     up = _q("SELECT up_limit FROM stk_limit WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1",
             (ts,))
     if up and up[0] and up[0][0] is not None:
         out["up_stop"] = float(up[0][0])
+    # §WIRING-B 2026-11-17 lu_seal_strength/lu_early_seal：与 Go research/assemble.go
+    # 逐字同口径（scaler_bands 照这套峰值口径标定，绝不能用东财池"当前 fund"替代——
+    # 那是另一分布＝漂移＝钱路径分叉，正是本仓反复防的形状）。
+    #   seal_amount_ratio = max_seal_money / (circ_mv 万元 ×1e4)  （峰值封单/流通市值）
+    #   first_seal_minute = HH*60+MM（first_seal_time "HH:MM"，如 09:41→581；早封阈值 600=10:00）
+    # 只在该票有涨停事件行(continue_cnt>=1)时烘；ths_limit_up_daily 缺该行就不烘（诚实弃权，
+    # 绝不拿非事件日/缺失值编一个 ratio=0——0 与 absent 在分档里语义不同）。
+    # English: matches engine assemble.go exactly; peak seal (max_seal_money), not EM current fund.
+    seal = _q("SELECT continue_cnt, first_seal_time, max_seal_money FROM ths_limit_up_daily "
+              "WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1", (ts,))
+    if seal and seal[0] and seal[0][0] is not None and int(seal[0][0]) >= 1:
+        fst, max_seal = seal[0][1], seal[0][2]
+        if circ and circ[0] and circ[0][0] and max_seal and float(max_seal) > 0:
+            cap_yuan = float(circ[0][0]) * 10000.0
+            if cap_yuan > 0:
+                out["seal_amount_ratio"] = round(float(max_seal) / cap_yuan, 6)
+        if fst and len(str(fst)) >= 4 and ":" in str(fst):
+            try:
+                hh, mm = str(fst).split(":")[0], str(fst).split(":")[1]
+                out["first_seal_minute"] = float(int(hh) * 60 + int(mm))
+            except (ValueError, IndexError):
+                pass
     return out
 
 
@@ -351,6 +382,62 @@ def fetch_lu_boards(day):
             except (TypeError, ValueError):
                 continue
     return boards or None
+
+
+def fetch_market_history(day, lookback=20):
+    """§WIRING-B+ 2026-11-17（owner：把能算的都算出来并持久化）：全市场情绪历史——
+    涨停家数 / 炸板家数 / 炸板率——按交易日从**权威落库表** ths_limit_up_daily +
+    ths_break_pool_daily 聚合。这两张表正是引擎 internal/data/risk_pools.go 与
+    emotion.go 的取数源（连板=ContinueDayCnt、炸板=OpenTimes），pregen 只读它们做
+    逐日 COUNT，**不另起东财多日抓取**，所以与引擎口径天然一致、零漂移（本仓反复防的
+    "换源即钱路径分叉"形状，这里从源头规避）。
+
+    产出（喂 rules_factor 的历史型 scalar_proxy：emo_chg5 ← limit_up_count_history，
+    lu_reblast_low ← broken_board_ratio_history）：
+      limit_up_count_history     = [各交易日涨停家数]（旧→新）
+      broken_board_count         = 最近一交易日炸板家数（int 标量）
+      broken_board_ratio         = 最近一交易日 炸板/(涨停+炸板)（0..1 比值；引擎 emotion.go
+                                   :44-47 同式但 ×100 出百分数——此处按字段名 ratio 给 0..1，
+                                   owner 标定 scalar_bands 时单位须对齐这里，注释已点明）
+      broken_board_ratio_history = [各交易日炸板率 0..1]（旧→新）
+      emotion_day                = 最近一交易日 YYYYMMDD（as-of，让陈旧可见）
+
+    缺表 / 无行 / 盘前池未同步 ⇒ 返回 None：消费侧 rules_factor 见 None 即 scalar_proxy
+    弃权（绝不补 0 冒充"今天没人炸板"——0 与缺读在分档里语义不同，同 seal 纪律）。
+    English: per-session market emotion series read from the engine's own authoritative
+    pool tables; None on any gap so consumers decline honestly rather than score a 0.
+    """
+    lu_rows = _q("SELECT trade_date, COUNT(*) FROM ths_limit_up_daily "
+                 "WHERE trade_date<=? GROUP BY trade_date "
+                 "ORDER BY trade_date DESC LIMIT ?", (day, lookback))
+    if not lu_rows:
+        return None
+    br_rows = _q("SELECT trade_date, COUNT(*) FROM ths_break_pool_daily "
+                 "WHERE trade_date<=? GROUP BY trade_date "
+                 "ORDER BY trade_date DESC LIMIT ?", (day, lookback)) or []
+    br_by_day = {str(r[0]): int(r[1]) for r in br_rows if r and r[0] is not None}
+    sessions = []  # (trade_date, limit_cnt, break_cnt) 旧→新
+    for r in reversed(list(lu_rows)):
+        d = str(r[0])
+        lc = int(r[1]) if r[1] is not None else 0
+        bc = br_by_day.get(d, 0)
+        sessions.append((d, lc, bc))
+    if not sessions:
+        return None
+    lu_hist = [float(s[1]) for s in sessions]
+    ratio_hist = []
+    for (_d, lc, bc) in sessions:
+        denom = lc + bc
+        ratio_hist.append(round(bc / float(denom), 6) if denom > 0 else 0.0)
+    last_d, last_lc, last_bc = sessions[-1]
+    denom = last_lc + last_bc
+    return {
+        "limit_up_count_history": lu_hist,
+        "broken_board_ratio_history": ratio_hist,
+        "broken_board_count": float(last_bc),
+        "broken_board_ratio": round(last_bc / float(denom), 6) if denom > 0 else 0.0,
+        "emotion_day": last_d,
+    }
 
 
 def _notify(title, body):
@@ -450,6 +537,20 @@ def main():
         print("PREGEN_LEADER_SET n=%s" % len(leader_set))
     except Exception as exc:  # noqa: BLE001
         print("PREGEN_LEADER_FAIL %s" % type(exc).__name__)
+    # §WIRING-B+ 2026-11-17：全市场情绪历史从权威落库表逐日聚合（涨停/炸板/炸板率多日序列），
+    # 喂 rules_factor 的历史型 scalar_proxy（emo_chg5 / lu_reblast_low）。缺表/盘前未同步⇒None，
+    # 消费侧诚实弃权。缺源不阻断主链（与涨停池同一纪律）。
+    try:
+        hist = fetch_market_history(day)
+        if hist:
+            market.update(hist)
+            print("PREGEN_EMOTION_HIST day=%s sessions=%s break_ratio=%s"
+                  % (hist.get("emotion_day"), len(hist.get("limit_up_count_history") or []),
+                     hist.get("broken_board_ratio")))
+        else:
+            print("PREGEN_EMOTION_HIST none")
+    except Exception as exc:  # noqa: BLE001
+        print("PREGEN_EMOTION_HIST_FAIL %s" % type(exc).__name__)
     precalc, ok, failed = {}, 0, []
     for symbol in symbols:
         try:
