@@ -514,12 +514,41 @@ def fetch_sector_drop_map(day):
     return out or None
 
 
+def parse_leader_set(rows):
+    """sector_history.top_stocks -> 6-digit leader-code set (§LEADER-JSON-FIX).
+
+    top_stocks is a JSON array in the live DB ('["600805.SH","600834.SH"]') --
+    the old comma-split kept the quotes, isdigit failed on EVERY part and the
+    leader set came back empty, so is_leader was never baked and leader_decay(v1)
+    stayed dead on its first protective reading. Unit-test mocks did not use the
+    JSON shape, so only the real-data pilot exposed it (2026-11-17). JSON first,
+    legacy delimiter shapes as the fallback.
+    """
+    leader_set = set()
+    for r0 in (rows or []):
+        raw = str(r0[0] or "")
+        codes = []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                codes = [str(x) for x in parsed]
+        except (ValueError, TypeError):
+            codes = [p for p in raw.replace("|", ",").split(",")]
+        for part in codes:
+            p = part.strip().strip('"[]').split(".")[0]
+            if p.isdigit():
+                leader_set.add(p)
+    return leader_set
+
+
 def fetch_industry_map():
-    """个股 ts_code -> industry（stock_basic 真源），供 bake 按票查所属板块降幅。
+    """个股 ts_code -> industry（stocks 真源，5546 行/5208 有行业），供 bake 按票
+    查所属板块降幅。表名是 stocks 不是 stock_basic——后者在 trading.db 不存在，
+    _q 静默返 None，只有真跑才暴露（2026-11-17 试点实锤）。
 
     缺表/空表返回 None ⇒ bake 不烘 sector_limit_up_drop_pct，消费侧安全降级。
     """
-    rows = _q("SELECT ts_code, industry FROM stock_basic "
+    rows = _q("SELECT ts_code, industry FROM stocks "
               "WHERE industry IS NOT NULL AND industry!=''", ()) or []
     out = {}
     for code, industry in rows:
@@ -661,12 +690,7 @@ def main():
         leader_rows = _q("SELECT top_stocks FROM sector_history WHERE trade_date=("
                          "SELECT MAX(trade_date) FROM sector_history) "
                          "AND top_stocks IS NOT NULL AND top_stocks!=''", ())
-        leader_set = set()
-        for r0 in (leader_rows or []):
-            for part in str(r0[0]).replace("|", ",").split(","):
-                p = part.strip().split(".")[0]
-                if p.isdigit():
-                    leader_set.add(p)
+        leader_set = parse_leader_set(leader_rows)
         if leader_set:
             market["leader_set"] = leader_set
         print("PREGEN_LEADER_SET n=%s" % len(leader_set))

@@ -93,6 +93,41 @@ class TestSectorDropMap(unittest.TestCase):
         self.mod._q = lambda sql, args: []
         self.assertIsNone(self.mod.fetch_industry_map())
 
+    def test_industry_map_reads_stocks_table_not_stock_basic(self):
+        """真跑实锤（2026-11-17 试点）：trading.db 没有 stock_basic 表，行业真源
+        是 stocks（5546 行）。表名错 ⇒ _q 静默 None ⇒ sector_drop 烘不进个股。"""
+        captured = {}
+
+        def fake_q(sql, args):
+            captured["sql"] = sql
+            return [("600001.SH", "银行")]
+
+        self.mod._q = fake_q
+        self.mod.fetch_industry_map()
+        self.assertIn("FROM stocks ", captured["sql"])
+        self.assertNotIn("stock_basic", captured["sql"])
+
+
+class TestLeaderSetParse(unittest.TestCase):
+    """§LEADER-JSON-FIX：top_stocks 真库是 JSON 数组，旧逗号解析恒空 ⇒ is_leader
+    全缺 ⇒ leader_decay(v1) 死。单测必须用真库形状（JSON），不再是 mock 纯码列表。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_pregen()
+
+    def test_json_array_shape_yields_leaders(self):
+        rows = [('[\"600805.SH\",\"600834.SH\",\"000532.SZ\"]',)]
+        self.assertEqual(self.mod.parse_leader_set(rows),
+                         {"600805", "600834", "000532"})
+
+    def test_legacy_delimiter_shape_still_parses(self):
+        rows = [('600805.SH|600834.SH',), ('000532.SZ,600158.SH',)]
+        self.assertEqual(self.mod.parse_leader_set(rows), {"600805", "600834", "000532", "600158"})
+
+    def test_empty_and_null_cells_contribute_nothing(self):
+        self.assertEqual(self.mod.parse_leader_set([("",), (None,), ('[]',)]), set())
+
 
 class TestSectorDropBake(unittest.TestCase):
     """bake_bakeables 按 market 里两 map 给个股烘 sector_limit_up_drop_pct。"""

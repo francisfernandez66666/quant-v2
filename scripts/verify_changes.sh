@@ -23381,13 +23381,27 @@ grep -qF 'the IN-CLIENT strategy is the live' qmt_gateway/local_executor.py || f
 CNT202=$((CNT202 + 1))
 grep -qF '_CUTOVER_WARN_HOUR' qmt_gateway/local_executor.py || fail202 "P1-2 降噪变量缺失"
 
-# ④ 行为腿：consec_boards 6 例 + micro bands 9 例。
+# ③b 真跑实锤修复锁（2026-11-17 pregen 试点抓出两处单测盲区）：
+#    行业真源表名=stocks（trading.db 无 stock_basic，错表名 _q 静默 None）；
+#    top_stocks 是 JSON 数组（旧逗号解析恒空 ⇒ is_leader 全缺 ⇒ leader_decay 死）。
+CNT202=$((CNT202 + 1))
+grep -qF 'FROM stocks ' scripts/pregen_carrier_factors_gz.py || fail202 "fetch_industry_map 未查 stocks 真源表"
+CNT202=$((CNT202 + 1))
+if grep -qF 'FROM stock_basic' scripts/pregen_carrier_factors_gz.py; then
+	fail202 "pregen 仍引用不存在的 stock_basic 表（真跑 stocks=0 的根因）"
+fi
+CNT202=$((CNT202 + 1))
+grep -qF 'def parse_leader_set(' scripts/pregen_carrier_factors_gz.py || fail202 "缺 parse_leader_set（JSON 形状解析）"
+CNT202=$((CNT202 + 1))
+grep -qF 'json.loads(raw)' scripts/pregen_carrier_factors_gz.py || fail202 "leader 解析未按 JSON 数组形状（is_leader 会全缺）"
+
+# ④ 行为腿：consec_boards 6 例 + micro bands 9 例 + sector_drop/leader 18 例。
 PY202A=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_consec_boards_20261117.py -q 2>&1 || true )
 CNT202=$((CNT202 + 1))
 grep_q '6 passed' PY202A || { echo "--- FAIL: §202 consec_boards 行为腿未跑满6例：$(printf '%s\n' "$PY202A" | tail -6)"; B202_FAILED=1; }
-PY202B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_micro_bands_20261117.py -q 2>&1 || true )
+PY202B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_micro_bands_20261117.py tests/test_sector_drop_20261117.py tests/test_consec_boards_20261117.py -q 2>&1 || true )
 CNT202=$((CNT202 + 1))
-grep_q '9 passed' PY202B || { echo "--- FAIL: §202 micro bands 行为腿未跑满9例：$(printf '%s\n' "$PY202B" | tail -6)"; B202_FAILED=1; }
+grep_q '27 passed' PY202B || { echo "--- FAIL: §202 micro bands/consec 行为腿未跑满27例：$(printf '%s\n' "$PY202B" | tail -6)"; B202_FAILED=1; }
 
 [ "$B202_FAILED" = "0" ] || exit 1
 echo "ok - §202 §20261117-REVIEW-CLOSEOUT 锁通过（consec_boards烘/透传/契约+负锁 + 3band+反seal_strength + P1-2 + 6+9例行为腿，累计判定点 ${CNT202}）"
