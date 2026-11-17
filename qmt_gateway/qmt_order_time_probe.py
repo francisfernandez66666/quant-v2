@@ -23,7 +23,7 @@
 #      once, then sleeps.
 #   3. Paste ALL ORD_* lines back, then STOP this probe strategy.
 
-PROBE_BUILD = "2026-11-17-order-time-v4-fixedpath"
+PROBE_BUILD = "2026-11-17-order-time-v5-constacct"
 _done = False
 
 # Candidate time fields, verbatim from the stale-cancel fix and its alternatives.
@@ -112,6 +112,13 @@ def handlebar(ContextInfo):
             print("ORD_ACCT_CFG file=%s acct=%s" % (s(cand), acct))
         except Exception as exc:  # noqa: BLE001 - fallback failure is a result
             print("ORD_ACCT_CFG_ERR %s" % repr(exc)[:140])
+        # QMT strategy sandbox FORBIDS all file IO (owner 21:56 paste-back:
+        # PermissionError 'Foribdden FileIO') -- final fallback: the production
+        # account id as a constant. Not a new disclosure: the same id already
+        # sits in repo fixtures (tests/test_broker_reads_rebuild_20261110.py).
+        if not acct:
+            acct = "002069008957"
+            print("ORD_ACCT_CONST used")
     if not acct:
         print("ORD_NOACCT get_account ladder empty -- cannot form 3-arg call")
         print("ORD_DONE paste_all_ORD_lines_back")
