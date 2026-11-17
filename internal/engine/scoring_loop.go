@@ -757,9 +757,6 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	if ctrl == nil || realStore == nil || agent == nil {
 		return
 	}
-	if !data.IsActiveSession(time.Now()) || !ctrl.Enabled() {
-		return
-	}
 
 	// 2026-11-10 Q8（§1.3 第 14 项④，owner 裁决）：qmt.enabled=false = 半自动模式 =
 	// 只停自动执行，建议链照常输出（买卖指令推到消息/建议面供人工执行），绝不当作
@@ -769,6 +766,12 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	//   ② controller.placeOrder 底层 "qmt disabled" 硬拒（controller.go，一切单都不可能出去）；
 	//   ③ autoPlaceScaled 的自动下单闸（engine.go，买入入口原样保留）。
 	// 取数语义不动：acctBook = accountBookFor（manual_book_source.go 两维独立选源，原样复用）。
+	// §WIRING-D-20261117（owner：及时上报持仓/资金 + 复用云端止盈止损计算与通知）：上面这条
+	// Q8 裁决当时漏改了一半——本函数仍留着一句 `!ctrl.Enabled() 整链早退`，与注释自相矛盾，
+	// 于是外脑/半自动（现网运营账号 qmt.enabled=false，执行在盒子自闭环）时，云端对**上报来的
+	// 实盘持仓**一份止盈止损/清仓建议都不算、syncMessages/pushCriticalAlerts 通知也不发，
+	// "为什么没提醒"和"为什么没自动卖"在 disabled 态双双静默。删掉那句早退：建议生成+通知照跑，
+	// 下单仍由上面三层安全网挡住（NoopExecutor + placeOrder 硬拒 + autoExecuteRealSellsRound 闸）。
 	if !data.IsActiveSession(time.Now()) {
 		return
 	}

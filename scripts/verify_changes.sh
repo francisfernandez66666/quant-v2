@@ -22931,3 +22931,46 @@ grep -qF 'if force_consumed:' qmt_gateway/carrier_updater.py \
 [ "$B194_FAILED" = "0" ] || exit 1
 echo "ok - §194 §20261117-WIRING-C 锁通过（force-report 路由/字段/透传/ack清除 + 盒子消费复用同一上报腿 + report --force 旁路去重 + 前端按钮 + 4 键契约不破 + go/py 双行为腿，累计判定点 ${CNT194}）"
 echo ""
+
+# §195 §20261117-WIRING-D（外脑/半自动模式：及时上报持仓资金 + 复用云端止盈止损计算与通知）。
+# 2026-11-10 Q8 裁决"enabled=false 只停执行、建议链照常输出"，但 pushRealAdvice 顶部漏改一句
+# `!ctrl.Enabled() → 整链早退`，使外脑态云端对上报来的实盘持仓一份止盈止损都不算、通知也不发。
+# §WIRING-D 删该早退；执行侧仍由三层安全网挡死（本段把"代码里不许再出现这句早退"钉成负锁，
+# 并把"disabled→0 单 / enabled→下单"的行为锁真跑一遍）。
+echo "==> 195 §20261117-WIRING-D（外脑建议链照常输出：删 pushRealAdvice 残留 enabled 早退 + 执行三层闸行为锁）..."
+B195_FAILED=0
+fail195() {
+	echo "--- FAIL: §195 $*"
+	FAIL=1
+	B195_FAILED=1
+}
+CNT195=0
+
+# ① 负锁（注释感知）：pushRealAdvice 函数体内**代码**不得再出现 !ctrl.Enabled()（只挡早退那一句，
+#    本段上方的解释注释里同名串必须被排除——否则锁会被自己的说明文字撑红，§173 同族教训）。
+CNT195=$((CNT195 + 1))
+N195_GATE="$(awk '/^func \(e \*Engine\) pushRealAdvice\(/{f=1} f && /!ctrl\.Enabled\(\)/ && !/^[[:space:]]*\/\// {c++} f && /^}$/{exit} END{print c+0}' internal/engine/scoring_loop.go || true)"
+[ "${N195_GATE:-0}" = "0" ] || fail195 "pushRealAdvice 体内重现 !ctrl.Enabled() 代码早退（外脑态建议链又被整链挡掉，N=${N195_GATE}）"
+
+# ② 正锁：执行侧第一层安全网仍在 autoExecuteRealSellsRound（gated := !ctrl.Enabled() || ...），
+#    删的是建议链早退、不是执行闸——这句一旦被削弱，disabled 就会抢盒子下单权（重复下单资损级）。
+CNT195=$((CNT195 + 1))
+grep -qF 'gated := !ctrl.Enabled() || ctrl.Mode() != "auto" || !cfg.AutoSell' internal/engine/scoring_loop.go \
+	|| fail195 "autoExecuteRealSellsRound 的 disabled 执行闸（安全网①）缺失/被改——外脑不许下单的兜底没了"
+
+# ③ 行为锁在册：disabled→0 单 / enabled→下单 两枚用例名必须在测试文件里。
+CNT195=$((CNT195 + 1))
+grep -qF 'func TestDisabledBrainAdviceRunsButPlacesNoOrders' internal/engine/wiring_d_20261117_test.go \
+	|| fail195 "缺 disabled→0 单行为锁"
+CNT195=$((CNT195 + 1))
+grep -qF 'func TestEnabledBrainAdvicePlacesOrders' internal/engine/wiring_d_20261117_test.go \
+	|| fail195 "缺 enabled→下单 反证锁（恒绿用例防线）"
+
+# ④ 行为腿真跑：disabled 下拿到止损/止盈一笔不发；enabled 下确实发（两枚都绿才算这条接线成立）。
+G195=$(timeout 120 go test ./internal/engine/ -run 'TestDisabledBrainAdviceRunsButPlacesNoOrders|TestEnabledBrainAdvicePlacesOrders' -count=1 2>&1 || true)
+CNT195=$((CNT195 + 1))
+grep_q 'ok  	quant-trading-v2/internal/engine' G195 || { echo "--- FAIL: §195 WIRING-D 行为腿未过：$(printf '%s\n' "$G195" | tail -6)"; B195_FAILED=1; }
+
+[ "$B195_FAILED" = "0" ] || exit 1
+echo "ok - §195 §20261117-WIRING-D 锁通过（外脑建议链删残留早退 + 执行三层闸负/正锁 + disabled/enabled 双行为锁真跑，累计判定点 ${CNT195}）"
+echo ""
