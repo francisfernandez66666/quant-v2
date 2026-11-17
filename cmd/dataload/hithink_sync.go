@@ -143,6 +143,43 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	// §W7-D：导入成功后抽一次 ths_daily 的成交额量纲读数（只报不改判，理由见函数头与
 	// checkThsAmountScale）。放在这里而不是每个 kind 分支：只有日 K 这条腿写 amount。
 	checkThsAmountScale(db)
+
+	// §WIRING-12 2026-11-17：夜间增量（daily-k-10d）跑完后，顺带把**事件类 ths 主源表**
+	// 也刷新落库——三池（涨停/跌停/炸板，含连板/峰值封单/首封时间）、复权因子、个股异动。
+	// 根因：默认夜间 steps 只有 dataload(hithink-sync daily-k-10d)，从不跑 pools，
+	// 导致 ths_limit_up_daily 自 11-06 停摆——载体侧 lu_seal_strength/lu_early_seal/
+	// leader_decay(is_leader/ladder) 这些"会动钱却哑"的规则全因这张表没新值而诚实弃权。
+	// 单种类手动跑（pools/anomaly/...）不受影响（那些分支已 return），只在这一条夜增量后追加。
+	// best-effort：任一事件表失败只记日志、不改本次 daily 的退出码（daily 已落库是真进度，
+	// 事件表缺则下夜再补——绝不让 pools 抖动把整夜 dataload 判死）。
+	if *kind == string(data.HithinkDumpDailyK10d) {
+		log.Printf("[hithink] 夜增量后续刷事件表：pools/adjustment-factors/anomaly")
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[hithink] pools 同步异常(不影响 daily 结论): %v", r)
+				}
+			}()
+			cmdHithinkSyncPools(client, db, *dateF, poolSyncOpts{allowShadow: *allowShadow, stampEnforce: *enforceStamp})
+		}()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[hithink] adjustment-factors 同步异常: %v", r)
+				}
+			}()
+			cmdHithinkSyncAdjFactors(client, db, *tmpPath, *since, *batchSize)
+		}()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[hithink] anomaly 同步异常: %v", r)
+				}
+			}()
+			cmdHithinkSyncAnomaly(client, db, *since)
+		}()
+		log.Printf("[hithink] 事件表刷新收尾完成")
+	}
 }
 
 // cmdHithinkSyncAdjFactors 复权因子同步：全量事件 dump → 窗口内事件换算累计 hfq 因子

@@ -15,6 +15,10 @@
 #                                     无交易日闸门，纯拉起，装填器自证与看门狗兜底都走它）
 #   QMTF-Gateway-Ensure  每 5 分钟     → watchdog -Mode GatewayEnsure  （未监听才调 Gateway-Start，起前跑 profile-check）
 #   QMTF-Close           每 5 分钟     → watchdog -Mode Close          （脚本内部 15:30 前直接 retry，任务不必做时段判断）
+#   QMTF-Uplink          每 1 分钟     → report_run.ps1（report_uplink --once）（§WIRING-12 2026-11-17：
+#                         08:50–15:40 盘中把持仓/可用余额/委托/成交「变了才发」上行覆盖——
+#                         这是让手动 App 卖出在 1 分钟内回传云端的腿；运营机早有 QMTF-Uplink，
+#                         friend 包历史上缺这条，一对多回传缺一半。force 覆盖随 T5/T7 载体班次。）
 #
 # 边界：本脚本只在**本机**注册/删除任务（B-N5：对广州零权限；不出现远程计算机名/PSRemoting）。
 # 缺省 **只打印不注册**（dry-run），必须显式 -Apply——与 ensure_friend_gateway_config.ps1 同纪律。
@@ -57,6 +61,10 @@ $T6 = "QMTF-Gateway-Start"
 # 跑 carrier_run.ps1 -Intraday —— carrier_updater --intraday 只投递带 intraday_priority 的
 # 反转清单（普通版本推进留给 15:40 班次），投递即有序重启客户端（owner 已勾「重启自动运行」）。
 $T7 = "QMTF-Carrier-Update-Intraday"
+# §WIRING-12 2026-11-17：回报腿调度。运营机早有 QMTF-Uplink、friend 包历史上没有 ⇒
+# 朋友那 M 根腿只烘数据不下报（一对多回传缺一半）。这条每 1 分钟跑 report_uplink --once
+# （交易时段内、时段闸在 report_uplink/导出节奏里），把持仓/可用余额/委托/成交上行覆盖。
+$T8 = "QMTF-Uplink"
 
 function Tr($mode) {
     return ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Mode {2} -GatewayDir "{3}"' -f `
@@ -64,7 +72,7 @@ function Tr($mode) {
 }
 
 if ($Uninstall) {
-    foreach ($t in @($T1, $T2, $T3, $T4, $T5, $T6, $T7)) {
+    foreach ($t in @($T1, $T2, $T3, $T4, $T5, $T6, $T7, $T8)) {
         if (-not $Apply) {
             Write-Host ("WOULD_DELETE task={0}" -f $t)
             continue
@@ -90,7 +98,10 @@ $jobs = @(
              $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) },
     @{ Name = $T7; Sc = "MINUTE"; Mn = 10; St = "09:30"; Et = "15:00"; It = $false;
        Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Intraday' -f `
-             $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) }
+             $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) },
+    @{ Name = $T8; Sc = "MINUTE"; Mn = 1; St = "08:50"; Et = "15:40"; It = $false;
+       Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f `
+             $PsExe, (Join-Path $GatewayDir "report_run.ps1")) }
 )
 
 # carrier_run.ps1: short /TR wrapper for T5; python comes from friend.env (261-char /TR limit)
@@ -123,6 +134,34 @@ exit $LASTEXITCODE
 [System.IO.File]::WriteAllText($carrierRun, $carrierRunSrc, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "WROTE carrier_run.ps1"
 
+# report_run.ps1: /TR wrapper for T8 QMTF-Uplink. Runs report_uplink --once every minute
+# (trading session). This is what makes a MANUAL App sell show up in the cloud within ~1 min:
+# the QMT client re-exports 持仓/资产 every ~10s, report_uplink re-reads and posts the changed
+# hash. force-consume rides the carrier shifts (T5/T7), which run report_uplink --force.
+$reportRun = Join-Path $GatewayDir "report_run.ps1"
+$reportRunSrc = @'
+# report_run.ps1 - run report_uplink once; python path comes from friend.env (261-char /TR limit)
+param([string]$GatewayDir = "C:\qmt\quant-trading-v2\qmt_gateway")
+$envFile = Join-Path $GatewayDir "friend.env"
+$py = "python"
+if (Test-Path $envFile) {
+    foreach ($ln in (Get-Content $envFile)) {
+        if ($ln -match "^PYTHON_EXE=(.+)$") { $py = $Matches[1].Trim() }
+    }
+}
+$ru = Join-Path $GatewayDir "report_uplink.py"
+$cfg = Join-Path $GatewayDir "config.xt.json"
+if (-not (Test-Path $ru)) { Write-Host "REPORT_UPLINK result=missing_script"; exit 2 }
+$eap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$out = & $py $ru --config $cfg --once 2>&1
+$ErrorActionPreference = $eap
+$out | ForEach-Object { Write-Host $_ }
+exit $LASTEXITCODE
+'@
+[System.IO.File]::WriteAllText($reportRun, $reportRunSrc, (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "WROTE report_run.ps1"
+
 foreach ($j in $jobs) {
     if (-not $Apply) {
         Write-Host ("WOULD_CREATE task={0} sch={1} run={2}" -f $j.Name, $j.Sc, $j.Tr)
@@ -135,6 +174,12 @@ foreach ($j in $jobs) {
         }
         if (-not (Test-Path (Join-Path $GatewayDir "carrier_updater.py"))) {
             Write-Host "TASKS_RESULT=ABORT reason=no_carrier_updater"
+            exit 2
+        }
+    }
+    if ($j.Name -eq $T8) {
+        if (-not (Test-Path (Join-Path $GatewayDir "report_uplink.py"))) {
+            Write-Host "TASKS_RESULT=ABORT reason=no_report_uplink（回传腿缺脚本：注册了也是空跑）"
             exit 2
         }
     }
@@ -160,10 +205,10 @@ foreach ($j in $jobs) {
     Write-Host ("CREATED task={0}" -f $j.Name)
 }
 
-# 注册后复读自证：七个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
+# 注册后复读自证：八个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
 if ($Apply) {
     $missing = @()
-    foreach ($n in @($T1, $T2, $T3, $T4, $T5, $T6, $T7)) {
+    foreach ($n in @($T1, $T2, $T3, $T4, $T5, $T6, $T7, $T8)) {
         $found = schtasks /Query /TN $n 2>$null
         if (-not $found) { $missing += $n }
     }
@@ -171,7 +216,7 @@ if ($Apply) {
         Write-Host ("TASKS_RESULT=ABORT reason=reread_missing tasks={0}" -f ($missing -join ","))
         exit 2
     }
-    Write-Host "TASKS_REREAD_MATCH=1 tasks=7"
+    Write-Host "TASKS_REREAD_MATCH=1 tasks=8"
 }
 
 Write-Host ("TASKS_RESULT={0}" -f $(if ($Apply) { "INSTALLED" } else { "DRYRUN" }))
