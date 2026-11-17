@@ -23,7 +23,7 @@
 #      once, then sleeps.
 #   3. Paste ALL ORD_* lines back, then STOP this probe strategy.
 
-PROBE_BUILD = "2026-11-17-order-time-v3-cfgacct"
+PROBE_BUILD = "2026-11-17-order-time-v4-fixedpath"
 _done = False
 
 # Candidate time fields, verbatim from the stale-cancel fix and its alternatives.
@@ -94,14 +94,18 @@ def handlebar(ContextInfo):
         try:
             import json
             import os
-            cand = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "config.bridge.json")
-            probe_dir = "C:\\qmt"
-            if not os.path.isfile(cand):
-                cand = os.path.join(probe_dir, "config.bridge.json")
-            if not os.path.isfile(cand):
-                cand = os.path.join(probe_dir, "quant-trading-v2", "qmt_gateway",
-                                    "config.bridge.json")
+            # QMT strategy sandbox does NOT define __file__ (owner 21:51
+            # paste-back) -- use fixed candidate paths instead.
+            cands = (
+                os.path.join("C:\\", "qmt", "quant-trading-v2", "qmt_gateway",
+                             "config.bridge.json"),
+                os.path.join("C:\\", "qmt", "config.bridge.json"),
+            )
+            cand = None
+            for c in cands:
+                if os.path.isfile(c):
+                    cand = c
+                    break
             with open(cand, "rb") as fh:
                 cfg = json.loads(fh.read().decode("utf-8-sig", "replace"))
             acct = str(cfg.get("account", "") or "")
