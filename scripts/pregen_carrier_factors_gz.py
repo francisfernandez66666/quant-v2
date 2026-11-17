@@ -208,7 +208,7 @@ def _ts_code(symbol):
     return s
 
 
-def bake_bakeables(symbol, params_doc, lu_boards=None):
+def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
     """§PRECALC v2（2026-11-11 owner 定案）：QMT 直取价量（bars），**QMT 拿不到的才烘**——
     估值序列/换手序列（daily_basic，当日新鲜）、财务分位（fina_indicator 最新档）、
     资金流（moneyflow_history MainNet/circ_mv）、新闻事件=D1 分数（scalar_proxy 带值）、
@@ -218,20 +218,29 @@ def bake_bakeables(symbol, params_doc, lu_boards=None):
     ts = _ts_code(symbol)
     out = {}
     n = BAKE_SERIES_N
-    rows = _q("SELECT trade_date,pe_ttm,pb,ps_ttm,turnover_rate FROM daily_basic "
-              "WHERE ts_code=? AND pe_ttm IS NOT NULL ORDER BY trade_date DESC LIMIT ?", (ts, n)) \
-        or _q("SELECT trade_date,pe_ttm,pb,ps_ttm,turnover_rate FROM daily_basic "
-              "WHERE ts_code=? ORDER BY trade_date DESC LIMIT ?", (ts, n))
+    # §WIRING-B 2026-11-17：valuation 面板补齐 pcf_ttm/dv_ttm（旧只 SELECT pe/pb/ps ⇒
+    # CFP_ttm 权重 0.299 与 DP 的 fac_ 规则恒 declined），并带 total_share 喂 LnMktCap。
+    # daily_basic 列都已建且 fresh 11-16，纯加列、不改源。
+    rows = _q("SELECT trade_date,pe_ttm,pb,ps_ttm,pcf_ttm,dv_ttm,turnover_rate,total_share "
+              "FROM daily_basic WHERE ts_code=? AND pe_ttm IS NOT NULL "
+              "ORDER BY trade_date DESC LIMIT ?", (ts, n)) \
+        or _q("SELECT trade_date,pe_ttm,pb,ps_ttm,pcf_ttm,dv_ttm,turnover_rate,total_share "
+              "FROM daily_basic WHERE ts_code=? ORDER BY trade_date DESC LIMIT ?", (ts, n))
     if rows:
         val = {"pe_ttm": [r[1] for r in rows if r[1] is not None],
                "pb": [r[2] for r in rows if r[2] is not None],
-               "ps_ttm": [r[3] for r in rows if r[3] is not None]}
+               "ps_ttm": [r[3] for r in rows if r[3] is not None],
+               "pcf_ttm": [r[4] for r in rows if r[4] is not None],
+               "dv_ttm": [r[5] for r in rows if r[5] is not None]}
         val = {k: v for k, v in val.items() if v}
         if val:
             out["valuation_series"] = val
-        tos = [r[4] for r in rows if r[4] is not None]
+        tos = [r[6] for r in rows if r[6] is not None]
         if tos:
             out["turnover_series"] = tos
+        tsh = [r[7] for r in rows if r[7] is not None]
+        if tsh:
+            out["total_share_series"] = tsh
     fin = _q("SELECT eps,roe,roe_waa,roa,grossprofit_margin,netprofit_margin,"
              "debt_to_assets,yoy_or FROM fina_indicator WHERE ts_code=? "
              "ORDER BY end_date DESC LIMIT 1", (ts,))
@@ -266,7 +275,7 @@ def bake_bakeables(symbol, params_doc, lu_boards=None):
                 out["flow_today_pct"] = round(mains[-1] / cap * 100.0, 4)
                 if len(mains) >= 2:
                     out["flow_5d_pct"] = round(sum(mains) / cap * 100.0, 4)
-    d1 = _q("SELECT score FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
+    d1 = _q("SELECT score, date FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
             (code6,))
     # §NEWS-GATE 2026-11-12（R8/R12）：D1 改带符号分 [−40,+40] 原样烘入——负分=明确利空
     # 直接下传（载体负分拒买闸与 NewsEvent 负带消费），不再 blocked→0 抹平（旧 Blocked 标记废除，
@@ -277,6 +286,12 @@ def bake_bakeables(symbol, params_doc, lu_boards=None):
             out["news_event"] = score
         if score < 0:
             out["news_negative"] = True
+        # §WIRING-B 2026-11-17：good_news_fade 还要 event.day 定位事件那根 bar。
+        # d1_scores.date 即评估交易日（带横线），烘成 yyyymmdd 喂 _news_event_obj。
+        if d1[0][1]:
+            out["news_day"] = str(d1[0][1]).replace("-", "")[:8]
+        # news_propagation 不烘：d1_scores 无 Level 列（个股 vs 板块/宏观），
+        # 不靠 reason 文本猜——缺 propagation 时 good_news_fade 诚实弃权（见施工图 §15.2/§16）。
     hp = (params_doc.get("hot_pool") or {}).get("bullish") or {}
     hit = hp.get(symbol) or hp.get(code6)
     if isinstance(hit, dict) and hit.get("score") is not None:
@@ -289,6 +304,22 @@ def bake_bakeables(symbol, params_doc, lu_boards=None):
     # 仍走 absent（真实缺源绝不编造）。
     if lu_boards is not None:
         out["limit_board_count"] = float(lu_boards.get(code6) or 0.0)
+    # §WIRING-B 2026-11-17：把"做了一半"的情绪/涨停池类读数补齐（全部从已拉/新鲜数据派生，
+    # 不另开多日扫描，避免烘错值污染买入判定）。market 由 main() 算一次传入。
+    market = market or {}
+    # 全市场涨停家数 + 当日最高连板（lu_boards 已含每票连板数，max/len 直取，无需回看历史）。
+    if "limit_up_count" in market:
+        out["limit_up_count"] = market["limit_up_count"]
+    if "ladder_height" in market:
+        out["ladder_height"] = market["ladder_height"]
+    # 板块龙头（leader_decay 要 is_leader）：sector_history.top_stocks membership，bool 显式。
+    if "leader_set" in market:
+        out["is_leader"] = bool(code6 in market["leader_set"])
+    # 涨停价（leader_decay 的 up_stop = 今日板价）：stk_limit 最新一行的 up_limit。
+    up = _q("SELECT up_limit FROM stk_limit WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1",
+            (ts,))
+    if up and up[0] and up[0][0] is not None:
+        out["up_stop"] = float(up[0][0])
     return out
 
 
@@ -396,6 +427,29 @@ def main():
     except Exception as exc:  # noqa: BLE001 - 涨停池缺源不拖全局
         lu_boards = None
         print("PREGEN_ZT_POOL_FAIL %s" % type(exc).__name__)
+    # §WIRING-B 2026-11-17：全市场情绪/龙头标量算一次传入每票（从已拉的 lu_boards +
+    # sector_history 派生，绝不另起多日扫描）。缺源时键不放进 market，消费侧 None 诚实弃权。
+    market = {}
+    if lu_boards:
+        market["limit_up_count"] = float(len(lu_boards))
+        boards_vals = [v for v in lu_boards.values() if isinstance(v, (int, float))]
+        if boards_vals:
+            market["ladder_height"] = float(max(boards_vals))
+    try:
+        leader_rows = _q("SELECT top_stocks FROM sector_history WHERE trade_date=("
+                         "SELECT MAX(trade_date) FROM sector_history) "
+                         "AND top_stocks IS NOT NULL AND top_stocks!=''", ())
+        leader_set = set()
+        for r0 in (leader_rows or []):
+            for part in str(r0[0]).replace("|", ",").split(","):
+                p = part.strip().split(".")[0]
+                if p.isdigit():
+                    leader_set.add(p)
+        if leader_set:
+            market["leader_set"] = leader_set
+        print("PREGEN_LEADER_SET n=%s" % len(leader_set))
+    except Exception as exc:  # noqa: BLE001
+        print("PREGEN_LEADER_FAIL %s" % type(exc).__name__)
     precalc, ok, failed = {}, 0, []
     for symbol in symbols:
         try:
@@ -415,14 +469,14 @@ def main():
                 if fact:
                     fact["data_day"] = data_day
                     fact["src"] = src
-            bakeables = bake_bakeables(symbol, params, lu_boards) if fact else {}
+            bakeables = bake_bakeables(symbol, params, lu_boards, market) if fact else {}
             if fact:
                 fact.update(bakeables)
                 precalc[symbol] = fact
                 ok += 1
             else:
                 # 价量缺失也可能只是 hithink 单票失败：bakeables 仍值得烘（估值/财务/D1）
-                bakeables = bake_bakeables(symbol, params, lu_boards)
+                bakeables = bake_bakeables(symbol, params, lu_boards, market)
                 if bakeables:
                     bakeables["src"] = "bake_only"
                     precalc[symbol] = bakeables
