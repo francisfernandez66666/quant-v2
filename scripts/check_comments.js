@@ -45,6 +45,10 @@ const LOOKBACK = 3
 const ASCII_ONLY = new Set([
   'qmt_gateway/qmt_bridge_strategy.py',
   'qmt_gateway/local_executor.py',
+  // 只读诊断探针会被整份贴进 QMT 策略沙箱跑（GBK 码页），与载体同一条 ASCII 铁律：
+  // 注释一律英文、缺注释仍判红。2026-11-17 五步收口时登记（value/order-time 两枚）。
+  'qmt_gateway/qmt_api_value_probe.py',
+  'qmt_gateway/qmt_order_time_probe.py',
   'qmt_gateway/tests/test_local_executor.py',
   'qmt_gateway/tests/test_local_executor_build_update.py',
   // §SANDBOX-CARRIER（11-04）：这两件要进 GBK 码页的物理机/沙箱，正文必须纯 ASCII

@@ -63,7 +63,7 @@ def _safe_tick(label, fn, codes):
     """Print tick field->value samples (v1 printed only the outer code keys)."""
     try:
         v = fn(codes)
-    except Exception as exc:  # noqa: BLE001 - exception IS a probe result
+    except Exception as exc:  # noqa: BLE001 - exception IS a probe result, keep it for the paste-back
         print("PROBEV2_%s CALL_ERR %s" % (label, _short(exc, 160)))
         return
     print("PROBEV2_%s TYPE=%s" % (label, type(v).__name__))
@@ -76,6 +76,7 @@ def _safe_tick(label, fn, codes):
                 for f in ("lastPrice", "lastClose", "high", "open", "volume", "stockStatus"):
                     if f in row:
                         bits.append("%s=%s" % (f, _short(row[f], 40)))
+                # key fields only: v1 printed outer keys so lastPrice was invisible
                 print("PROBEV2_%s ROW %s N=%d %s" % (label, k, len(row), " ".join(bits)))
             else:
                 print("PROBEV2_%s ROW %s TYPE=%s VAL=%s" % (label, k, type(row).__name__, _short(row)))
@@ -90,6 +91,7 @@ def _safe_read(label, fn, *args, **kwargs):
     try:
         v = fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001
+        # a raised signature error IS the probe answer: log it and try the next shape
         print("PROBEV2_%s CALL_ERR %s" % (label, _short(exc, 200)))
         return
     print("PROBEV2_%s TYPE=%s" % (label, type(v).__name__))
