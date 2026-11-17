@@ -52,6 +52,8 @@ const ASCII_ONLY = new Set([
   // 2026-11-17 无头轮次三枚（headless value probe 1-3）：经 win_remote_exec
   // 在盒子内置 py3.6.8 直跑的只读探针，同样贴 GBK 码页环境，正文英文注释。
   'qmt_gateway/qmt_headless_value_probe.py',
+  // 2026-11-17 21:3x 二轮：撤单探针 v2(3参阶梯) + 精简值探针 v3c，同 GBK 沙箱规。
+  'qmt_gateway/qmt_value_probe_c.py',
   'qmt_gateway/qmt_headless_value_probe2.py',
   'qmt_gateway/qmt_headless_value_probe3.py',
   'qmt_gateway/tests/test_local_executor.py',
