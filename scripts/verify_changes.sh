@@ -22506,16 +22506,31 @@ CNT191=$((CNT191 + 1))
 grep -qF 'ensure_enabled=pre_run' scripts/update_qmt_strategy.ps1 \
 	|| fail191 "§RESTART-FIX 缺 ensure_enabled=pre_run 锚（ENABLE 必须先于 /Run）"
 
-# —— ② §SUBSCRIBE-FIX P0（000444e）：init 真订阅全市场 + 逐票 fallback + 结果打锚 ——
+# —— ② §SUBSCRIBE-FIX P0-A（2026-11-17）：订阅必须真接在 ContextInfo 上 ——
+# 000444e 那版把订阅塞进 _fn(...)（白名单只 4 个交易函数）⇒ 恒 None ⇒ 整天不订阅、
+# 卖出/T 腿 last_price=None 静默失明；当时这条锁的就是 `_fn("subscribe_whole_quote")`
+# 这串文本——缺陷本身就是被锁对象，所以门禁全绿。改：负锁（空接线不许回潮）+
+# 字面 getattr 正锁 + api= 三态回执 + 行为腿（真跑 stop_loss 用例）。
 CNT191=$((CNT191 + 1))
-grep -qF '_fn("subscribe_whole_quote")' qmt_gateway/qmt_internal_strategy.py \
-	|| fail191 "载体 init 缺 subscribe_whole_quote（get_full_tick 对未订阅票返回空 dict，卖出腿盲区）"
+if grep -qF '_fn("subscribe' qmt_gateway/qmt_internal_strategy.py; then
+	fail191 "§P0-A 订阅又走 _fn(...) 空接线（白名单只 4 个交易函数，恒 None = 整天不订阅）"
+fi
+CNT191=$((CNT191 + 1))
+grep -qF 'getattr(ContextInfo, "subscribe_whole_quote"' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "§P0-A 全市场订阅未走字面 getattr(ContextInfo,...)（11-17 修法回潮）"
+CNT191=$((CNT191 + 1))
+grep -qF 'getattr(ContextInfo, "subscribe_quote"' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "§P0-A 逐票订阅未走字面 getattr(ContextInfo,...)"
 CNT191=$((CNT191 + 1))
 grep -qF '_subscribe_market(ContextInfo)' qmt_gateway/qmt_internal_strategy.py \
 	|| fail191 "载体 init 未调用订阅函数（注释声称订阅、实际从不订阅的 P0 回潮）"
 CNT191=$((CNT191 + 1))
-grep -qF 'subscribe_market tried=' qmt_gateway/qmt_internal_strategy.py \
-	|| fail191 "订阅结果未打锚（静默空返回会再次藏住盲区）"
+grep -qF 'api=' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "订阅结果未打 api= 三态锚（tried=[] 分不清没跑/没成的盲区会再藏起来）"
+# 行为腿：订到价才出 stop_loss 信号（同时证伪阈值有问题与订阅没问题两说）
+SUB191=$( cd qmt_gateway && python3 -m pytest tests/test_wiring_selfcontained_20261117.py -k "stop_loss or subscribe_fns_present" 2>&1 || true )
+CNT191=$((CNT191 + 1))
+grep_q '2 passed' SUB191 || { echo "--- FAIL: §191 ② 订阅行为腿未跑满 2 例：$(printf '%s\n' "$SUB191" | tail -5)"; FAIL=1; B191_FAILED=1; }
 
 # —— ③ 数据面二期 _ts_code 后缀推断（cc6c67b）：6 位码 → .SH/.SZ/.BJ ——
 CNT191=$((CNT191 + 1))

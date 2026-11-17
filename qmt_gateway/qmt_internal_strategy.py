@@ -765,43 +765,124 @@ def _tick_of(ContextInfo, symbol):
     return normalize_tick(symbol, entry)
 
 
+def _subscribe_fns(ContextInfo):
+    """P0-A (2026-11-17): resolve the subscribe callables BY LITERAL NAME.
+
+    The 11-16 "fix" resolved the subscribe names through `_fn(...)`, but `_fn` only
+    knows the four whitelisted trade fns (passorder/cancel/get_trade_detail_data/
+    get_account), so the lookup for the subscribe names was ALWAYS None and the init
+    subscribed -- every sell leg and the T legs read last_price=None all day and
+    returned silently. This build exposes get_full_tick but the SUBSCRIBE calls
+    were never made, so the tick came back empty for unsubscribed symbols.
+
+    Resolution goes through getattr(ContextInfo, "<literal name>", None) -- the
+    same shape as _tick_of / _download_day_bars. g2 forbids getattr with a
+    VARIABLE name; here both names are literals, so it is allowed.
+
+    Returns (whole_fn, per_symbol_fn, api_state) where api_state is
+    present | absent | error so the init receipt can name WHY nothing subscribed.
+    """
+    whole = getattr(ContextInfo, "subscribe_whole_quote", None)
+    per_symbol = getattr(ContextInfo, "subscribe_quote", None)
+    if not callable(whole) and not callable(per_symbol):
+        return (whole if callable(whole) else None,
+                per_symbol if callable(per_symbol) else None, "absent")
+    return (whole if callable(whole) else None,
+            per_symbol if callable(per_symbol) else None, "present")
+
+
 def _subscribe_market(ContextInfo):
-    """SUBSCRIBE-FIX (2026-11-16 P0): get_full_tick returns empty for symbols
-    that were never subscribed, and NOTHING in init ever subscribed -- held
-    symbols outside the lucky tick window had their stop-loss legs blind all
-    day (002115 case). whole-market push covers every pool member regardless
-    of which re-bake it joined in; per-symbol subscribe is the fallback for
-    builds where whole_quote is unavailable. Outcome is logged, not swallowed."""
+    """SUBSCRIBE-FIX P0-A (2026-11-17): whole-market subscribe via getattr.
+
+    get_full_tick returns EMPTY for symbols that were never subscribed; the 11-16
+    version routed subscribe through _fn (whitelist of 4 trade fns) so it was
+    always None and NOTHING subscribed -- logs showed `tried=[] per_symbol_ok=0`
+    while the sell legs sat blind all day. This is the real fix: call the
+    literal subscribe fns, with a signature ladder because the whole-market call
+    shape differs across builds (list of markets vs one market), and record the
+    api state so a silent no-op can never pass as "ran but failed" again.
+    """
+    whole, _per, api = _subscribe_fns(ContextInfo)
     tried = []
-    whole = _fn("subscribe_whole_quote")
+    if api == "absent":
+        _log("subscribe_market tried=[] api=absent per_symbol=0/0")
+        return
     if callable(whole):
-        for market in ("SH", "SZ"):
-            try:
-                sub_id = whole(market)
-                tried.append("%s=%s" % (market, _short_id(sub_id)))
-            except Exception as exc:  # noqa: BLE001
-                tried.append("%s=err:%s" % (market, repr(exc)[:60]))
-    per_symbol = _fn("subscribe_quote")
+        # W1: pass both markets at once (the common 2.x shape).
+        try:
+            sub_id = whole(["SH", "SZ"])
+            tried.append("W1=%s" % _short_id(sub_id))
+        except Exception as exc:  # noqa: BLE001
+            tried.append("W1=err:%s" % repr(exc)[:60])
+            # W2: one market per call (fallback build).
+            for market in ("SH", "SZ"):
+                try:
+                    sub_id = whole(market)
+                    tried.append("%s=%s" % (market, _short_id(sub_id)))
+                except Exception as exc2:  # noqa: BLE001
+                    tried.append("%s=err:%s" % (market, repr(exc2)[:40]))
+    # api= present means the fn existed and we at least attempted a call;
+    # error means every attempted shape raised (subscribe genuinely unavailable).
+    api_state = "error" if any("err:" in t for t in tried) and not _any_ok(tried) else api
+    _log("subscribe_market tried=[%s] api=%s" % (",".join(tried), api_state))
+
+
+def _any_ok(tried):
+    """True when at least one ladder entry returned a usable subscription id."""
+    for t in tried:
+        if "err:" not in t and not t.endswith("=bad") and not t.endswith("=none"):
+            if "=" in t and t.rsplit("=", 1)[-1] not in ("bad", "none", "-"):
+                return True
+    return False
+
+
+def _subscribe_held(ContextInfo, positions):
+    """P0-A per-symbol fallback: subscribe only the HELD symbols, once per day.
+
+    init cannot afford 1000 per-symbol subscribe calls (it would block the first
+    bar). Whole-market covers the pool; this closes the gap for builds where
+    whole-market is unavailable but per-symbol works, by subscribing the handful
+    of positions we must price for the sell legs. Idempotent per day via _STATE.
+    """
+    _whole, per, api = _subscribe_fns(ContextInfo)
+    if not callable(per):
+        return
+    if not positions:
+        return
+    day = day_key(now_cn())
+    done = _STATE.setdefault("subbed_today", {})
+    if done.get("day") != day:
+        done.clear()
+        done["day"] = day
     n = 0
-    if callable(per_symbol):
-        for symbol in (PARAMS.get("symbols") or []):
-            try:
-                sub_id = per_symbol(symbol, "1m", "follow")
-                if _short_id(sub_id):
-                    n += 1
-            except Exception:  # noqa: BLE001
-                continue
-    _log("subscribe_market tried=[%s] per_symbol_ok=%d/%d" % (
-        ",".join(tried), n, len(PARAMS.get("symbols") or [])))
+    for symbol, row in positions.items():
+        if not row or float(row.get("qty", 0.0) or 0.0) <= 0.0:
+            continue
+        if symbol in done:
+            continue
+        try:
+            sub_id = per(symbol, "1m", "follow")
+            done[symbol] = _short_id(sub_id)
+            n += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if n:
+        _log("subscribe_held new=%d held_total=%d" % (n, len(done) - 1))
 
 
 def _short_id(sub_id):
-    """Normalize a subscribe return into a short readable token (0/None -> '-')."""
+    """Normalize a subscribe return into a short readable token.
+
+    -1 is a FAILURE sentinel on this client and reads like a real subscription id
+    when printed as "-1", so it is mapped to `bad`; None/empty maps to `none`.
+    """
     try:
         value = int(sub_id)
-        return str(value)
     except (TypeError, ValueError):
-        return "-"
+        return "none"
+    if value < 0:
+        return "bad"
+    return str(value)
 
 
 def _download_day_bars(ContextInfo):
@@ -1174,15 +1255,70 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "today_vol_vs_5d": today_vol_vs_5d,
         "valuation_series": pre.get("valuation_series"),
         "turnover_series": pre.get("turnover_series"),
+        "total_share_series": pre.get("total_share_series"),
         "fin_pit": pre.get("fin_pit"),
         "flow_today_pct": pre.get("flow_today_pct"),
         "flow_5d_pct": pre.get("flow_5d_pct"),
-        "news_event": pre.get("news_event"),
+        # C1 (2026-11-17): good_news_fade reads ctx["news_event"] as a DICT
+        # {score, positive, propagation, day}; the R9 bearish gate at ~:1958 reads
+        # the PRECALC news_event float directly (pre.get("news_event")), so the two
+        # consumers must not collide. We keep precalc.news_event a signed float and
+        # build the dict here from it + the baked news_day/news_propagation. Absent
+        # extras -> the dict still has score, and the rule declines on missing
+        # propagation/day (honest), never on a fabricated value.
+        "news_event": _news_event_obj(pre),
         "concept_heat": pre.get("concept_heat"),
         # LIMIT-BOARD (2026-11-16 owner): lu_board3/lu_board scalar proxies read
         # ctx["limit_board_count"] by input_key -- baked by pregen from the EM
         # limit-up pool. Absent = declined (honest), same as the engine side.
         "limit_board_count": pre.get("limit_board_count"),
+        # C1-LEADER 2026-11-17: leader_decay/leader_decay_v2 and the emotion/limit-up
+        # scalar proxies consumed ctx keys that build_context NEVER wrote, so those
+        # LIVE rules were structurally dead on the box. Each name mirrors the factor's
+        # input_key; pregen bakes it from fresh daily tables (limit-up count, ladder,
+        # broken board, sector top stocks, index change, seal microstructure). Absent
+        # = None = honest decline -- never coerce to 0/False, that reopens the
+        # "abstain=allow" defect that filled the account at 98.9%.
+        "is_leader": pre.get("is_leader"),
+        "ladder_height": pre.get("ladder_height"),
+        "afternoon_reseal": pre.get("afternoon_reseal"),
+        "up_stop": pre.get("up_stop"),
+        "index_change_pct": pre.get("index_change_pct"),
+        "limit_up_count": pre.get("limit_up_count"),
+        "limit_up_count_history": pre.get("limit_up_count_history"),
+        "broken_board_ratio": pre.get("broken_board_ratio"),
+        "broken_board_count": pre.get("broken_board_count"),
+        "broken_board_ratio_history": pre.get("broken_board_ratio_history"),
+        "seal_amount_ratio": pre.get("seal_amount_ratio"),
+        "first_seal_minute": pre.get("first_seal_minute"),
+        "sector_limit_up_drop_pct": pre.get("sector_limit_up_drop_pct"),
+        "emotion_phase": pre.get("emotion_phase"),
+    }
+
+
+def _news_event_obj(pre):
+    """Build the good_news_fade dict shape from a flat precalc entry.
+
+    score comes from the signed float precalc.news_event (the engine's authoritative
+    D1); positive derives from its sign; propagation/day come from baked extras.
+    Returns None when there is no readable score so good_news_fade declines rather
+    than treating "no news" as "news with score 0".
+    """
+    score = pre.get("news_event")
+    if score is None or not isinstance(score, (int, float)):
+        return None
+    day = pre.get("news_day")
+    propagation = pre.get("news_propagation")
+    if day is None and propagation is None:
+        # score present but event metadata baked nowhere: good_news_fade needs
+        # propagation+day, so abstain rather than fabricate (the rule itself also
+        # declines on None, this just keeps one source of truth for the shape).
+        return None
+    return {
+        "score": float(score),
+        "positive": float(score) > 0.0,
+        "propagation": propagation,
+        "day": str(day)[:8] if day else None,
     }
 
 
@@ -1464,6 +1600,16 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
         if not bake:
             continue
         entry = dict(row or {})
+        # T1-A 2026-11-17: the counter position row keys the sellable field as
+        # `can_use` (hardcoded by _positions), but the ported rules_t._sellable_qty
+        # only probes can_use_qty/available_qty/sellable_qty/can_use_volume -- so
+        # `can_use` is never found, sellable stays None, and the open/balance/close
+        # legs all fail closed (zuo T structurally dead on the box). build_context
+        # already renames can_use->can_use_qty on the buy side (:1167); the T side
+        # missed it. Fix at the assembly point (one place, ported rules untouched);
+        # pos_view is exactly the table rules_t._position_of reads first.
+        if entry.get("can_use_qty") is None and entry.get("can_use") is not None:
+            entry["can_use_qty"] = entry.get("can_use")
         entry["anchor_price"] = bake.get("anchor_price")
         entry["anchor_source"] = bake.get("anchor_source")
         entry["symbol"] = symbol
@@ -1473,10 +1619,20 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
 
     now_ts = _now_ts()
     hhmm = hhmm_now(moment)
+    # T1-B 2026-11-17: holdings_value uses the counter's `market_value` (taken from
+    # m_dMarketValue in _positions). The old `price or cost` found neither key on the
+    # pos_view row -> silently fell back to COST, so the T position cap was computed
+    # on cost basis. Prefer real market value; only fall back to qty*cost when the
+    # counter gave no market_value for that row.
+    # use the counter's market_value, fall back to qty*cost only when absent.
     holdings_value = 0.0
     for symbol, row in pos_view.items():
-        px = (row or {}).get("price") or (row or {}).get("cost") or 0.0
-        holdings_value += float(px) * float((row or {}).get("qty") or 0.0)
+        mv = (row or {}).get("market_value")
+        if mv is not None and float(mv) > 0.0:
+            holdings_value += float(mv)
+        else:
+            px = (row or {}).get("cost") or 0.0
+            holdings_value += float(px) * float((row or {}).get("qty") or 0.0)
 
     book = TRoundBook(PARAMS)
     try:
@@ -1624,6 +1780,11 @@ def run_round(ContextInfo, moment):
         return summary
     counter_codes = set(row["short_code"] for row in orders)
     positions = _positions()
+    # P0-A (2026-11-17): whole-market subscribe ran in init; for builds where only
+    # per-symbol works, subscribe the held names here (once/day) so the sell legs
+    # and T legs actually get last_price. A no-op when whole-market already covers it.
+    if positions:
+        _subscribe_held(ContextInfo, positions)
     cash_raw = _cash()
     total = _account_total_asset()
     # 2026-11-13: open BUY orders reserve cash BEFORE the next order is sized
@@ -1664,6 +1825,24 @@ def run_round(ContextInfo, moment):
     held_symbols = 0
     if positions is not None:
         held_symbols = len([1 for row in positions.values() if (row or {}).get("qty", 0.0) > 0.0])
+    # P0-B sell_blind (2026-11-17): a held position with NO last_price makes the
+    # stop_loss/take_profit/breakdown legs return None silently -- "no trigger"
+    # and "cannot see price" looked identical, so a whole day of blindness was
+    # invisible. Name it, hourly-deduped so it never becomes round_skips noise
+    # (4 rows / 5s would train the operator to ignore real alerts). This is the
+    # leg's own receipt that subscription either worked or did not.
+    if positions:
+        blind = 0
+        for symbol, row in positions.items():
+            if not row or float(row.get("qty", 0.0) or 0.0) <= 0.0:
+                continue
+            tick = _tick_of(ContextInfo, symbol)
+            if not tick.get("last_price"):
+                blind += 1
+        blind_key = "blind_%s" % day
+        if blind > 0 and _STATE.get("blind_log_key") != blind_key:
+            _STATE["blind_log_key"] = blind_key
+            _log("sell_blind held_without_price=%d total_held=%d" % (blind, held_symbols))
     now_ts = _now_ts()
     # DL-FALLBACK: keep draining the legacy downloader queue (batch per round).
     _pump_legacy_downloads(ContextInfo)

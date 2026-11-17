@@ -872,6 +872,34 @@ def gate_fail_closed_params(artifact):
     return True, "fail_closed_params_baked n=%d" % len(FAIL_CLOSED_PARAMS)
 
 
+def gate_subscribe_wired(artifact):
+    """g11 (sandbox only, 2026-11-17): the subscribe leg must be REAL wiring.
+
+    The 11-16 P0 "fix" resolved subscribe through `_fn(...)`, whose whitelist only
+    knows the four trade fns -- so `_fn("subscribe_whole_quote")` was always None,
+    init never subscribed, and the sell legs / T legs read last_price=None all day
+    (003006 sat -6% past its -3% stop line, machine never sold). The §191 lock then
+    grepped for that exact defect string, so the gate stayed green on a broken leg.
+    This gate locks the FIX and forbids the regression: literal getattr subscribe
+    calls + the api= receipt + init actually calling _subscribe_market, and a
+    negative lock that no `_fn("subscribe` empty-wiring helper may reappear.
+    """
+    problems = []
+    if '_fn("subscribe' in artifact:
+        problems.append("empty_wiring_helper_reappeared")
+    if 'getattr(ContextInfo, "subscribe_whole_quote"' not in artifact:
+        problems.append("whole_quote_not_resolved_by_getattr")
+    if 'getattr(ContextInfo, "subscribe_quote"' not in artifact:
+        problems.append("per_symbol_quote_not_resolved_by_getattr")
+    if "_subscribe_market(" not in artifact:
+        problems.append("init_never_calls_subscribe_market")
+    if "api=" not in artifact:
+        problems.append("no_api_tri_state_receipt")
+    if problems:
+        return False, "subscribe_wiring:" + ",".join(problems)
+    return True, "subscribe_wired=g11"
+
+
 def gate_ascii(artifact):
     """G1: the artifact must contain no non-ASCII byte."""
     bad = [i for i, byte in enumerate(artifact.encode("utf-8")) if byte > 127]
@@ -1622,6 +1650,8 @@ def main(argv=None):
              "built-in strategy must reach neither files nor network"),
             ("g7_sandbox_loads", gate_sandbox_loads,
              "the published artifact must load, not merely parse"),
+            ("g11_subscribe_wired", gate_subscribe_wired,
+             "subscribe resolved by literal getattr + api= receipt; no _fn(subscribe) empty wiring"),
         ]
         prefix = SANDBOX_PREFIX
     else:
