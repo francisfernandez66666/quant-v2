@@ -49,6 +49,11 @@ const ASCII_ONLY = new Set([
   // 注释一律英文、缺注释仍判红。2026-11-17 五步收口时登记（value/order-time 两枚）。
   'qmt_gateway/qmt_api_value_probe.py',
   'qmt_gateway/qmt_order_time_probe.py',
+  // 2026-11-17 无头轮次三枚（headless value probe 1-3）：经 win_remote_exec
+  // 在盒子内置 py3.6.8 直跑的只读探针，同样贴 GBK 码页环境，正文英文注释。
+  'qmt_gateway/qmt_headless_value_probe.py',
+  'qmt_gateway/qmt_headless_value_probe2.py',
+  'qmt_gateway/qmt_headless_value_probe3.py',
   'qmt_gateway/tests/test_local_executor.py',
   'qmt_gateway/tests/test_local_executor_build_update.py',
   // §SANDBOX-CARRIER（11-04）：这两件要进 GBK 码页的物理机/沙箱，正文必须纯 ASCII

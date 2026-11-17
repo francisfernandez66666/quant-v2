@@ -45,7 +45,7 @@
 
 import sys
 
-PROBE_BUILD = "2026-11-17-value-v2sector"
+PROBE_BUILD = "2026-11-17-value-v3sector-snake"
 _done = False
 CODE = "000001.SZ"
 
@@ -165,6 +165,13 @@ def handlebar(ContextInfo):
         _safe_read("M1_KW", gmd, fieldList=[], stockList=[CODE], period="1m", count=20)
         _safe_read("M1_KWF", gmd, fieldList=["close", "high", "low", "open", "volume"],
                    stockList=[CODE], period="1m", count=20)
+        # Headless probe round 2 (2026-11-17) proved the LOCAL xtquant lib on
+        # this broker build uses snake_case (field_list=...); ContextInfo may
+        # forward to it unchanged. Cover both spellings so one run settles it.
+        _safe_read("M1_KW_SN", gmd, field_list=[], stock_list=[CODE],
+                   period="1m", count=20)
+        _safe_read("M1_KWF_SN", gmd, field_list=["close", "high", "low", "open", "volume"],
+                   stock_list=[CODE], period="1m", count=20)
         _safe_read("M1_DAY", gmd, [], [CODE], "1d", "", "", 20, "front")
     else:
         print("PROBEV2_M1 ABSENT")
