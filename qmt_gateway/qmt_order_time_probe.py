@@ -1,45 +1,51 @@
 # qmt_order_time_probe.py -- READ-ONLY probe: which counter field carries the
 # order submission time, and in what format?
 #
-# Owner request 2026-11-17 (PLAN_BOX_STALE_ORDER_AUTOCANCEL section 7-A): the stale-
-# cancel fix (a381cb1) reads m_strInsertDate + m_strInsertTime -- the bridge-era
-# proven shape (qmt_bridge_strategy.py:679/716) -- but that assumption was never
-# confirmed ON THIS BOX by an actual read of a live order object. This probe
-# settles it: it prints every candidate time field of the first few ORDER-table
-# rows, verbatim, so the fix can be confirmed or corrected before the next bake.
+# Owner request 2026-11-17 (PLAN_BOX_STALE_ORDER_AUTOCANCEL section 7-A): the
+# stale-cancel fix (a381cb1) reads m_strInsertDate + m_strInsertTime -- the
+# bridge-era proven shape (qmt_bridge_strategy.py:679/716) -- but that assumption
+# was never confirmed ON THIS BOX by an actual read of a live order object.
+#
+# VERSION HISTORY (all owner paste-backs, same day):
+#   v1 get_trade_detail_data("ORDER") 1-arg -> ArgumentError: this build wants
+#      the 3-arg C++ shape (acct, accounttype, TABLE).
+#   v2 get_account ladder empty in the model-research environment -> no acct.
+#   v3 cfg fallback -> NameError: the QMT strategy sandbox has NO __file__.
+#   v4 fixed paths -> PermissionError 'Foribdden FileIO': the sandbox forbids
+#      ALL file IO. Sandbox env-info channels are ONLY builtins + baked params.
+#   v5 const acct -> chain FULLY OK: shape (acct,"stock","ORDER") returns, but
+#      the ORDER table was empty (after close, no in-flight orders).
+#   v6 WATCH MODE: query every bar, print ONLY on change, so the owner runs it
+#      once before the next session and pastes back whenever orders flow.
 #
 # HARD SAFETY RULES:
-#   1. NO socket/http, NO database. The ONLY file read allowed is the
-#      production config.bridge.json (same read-only config the live strategy
-#      loads every round) -- v3 account fallback. No file writes.
-#   2. NO trading calls: never passorder / cancel. READ ONLY.
-#   3. get_trade_detail_data("ORDER") is the same read the live strategy makes
-#      every round (_counter_rows) -- one call, wrapped, then silent forever.
-#   4. Pure ASCII (QMT GBK sandbox); stdlib only.
+#   1. NO socket/http, NO database, NO file IO at all (sandbox forbids it; the
+#      v3/v4 cfg-read attempts are kept only as inert logging on non-sandbox
+#      runs). NO trading calls: never passorder / cancel. READ ONLY.
+#   2. Account fallback is a constant (002069008957) -- same id already in repo
+#      fixtures (tests/test_broker_reads_rebuild_20261110.py), no new disclosure.
+#   3. Pure ASCII (QMT GBK sandbox); stdlib only.
 #
-# HOW TO RUN (owner, on the physical Win box, QMT model-research / new strategy):
+# HOW TO RUN (owner, QMT model-research / new strategy):
 #   1. Paste WHOLE file as a NEW strategy (NEVER touch the live strategy file).
-#   2. Run once (simulation is fine -- it orders nothing). It prints ORD_* lines
-#      once, then sleeps.
-#   3. Paste ALL ORD_* lines back, then STOP this probe strategy.
+#   2. Run in simulation. It prints ORD_* once at boot, then stays quiet until
+#      the ORDER table changes (new order / status change), re-printing fields
+#      then. Leave it running through the session; paste ALL ORD_* lines back
+#      afterwards, then STOP this probe strategy.
 
-PROBE_BUILD = "2026-11-17-order-time-v5-constacct"
-_done = False
+PROBE_BUILD = "2026-11-17-order-time-v6-watch"
+CONST_ACCT = "002069008957"
 
 # Candidate time fields, verbatim from the stale-cancel fix and its alternatives.
 TIME_FIELDS = ("m_strInsertDate", "m_strInsertTime", "m_nOrderTime",
                "m_strOrderTime", "order_time", "m_strInsertTimeLocal")
 
-# v2 (2026-11-17 21:28 owner paste-back): get_trade_detail_data("ORDER") raised
-# ArgumentError -- THIS build wants the 3-arg shape acct/accttype/TABLE, exactly
-# what the bridge production code documents. v2 resolves the account the same
-# way the bridge does (get_account over type ladder), then drives a bounded
-# (acct, accttype, TABLE-casing) ladder. Still one-shot, still read-only.
-# v3 (21:45 paste-back): get_account ladder empty on this build -> fallback to
-# the SAME cfg file the live strategy reads (config.bridge.json "account").
-# (v2 note above). Identity fields so the owner can see WHICH order each row is.
+# Identity fields so the owner can see WHICH order each row is (no account data).
 ID_FIELDS = ("m_strOrderSysID", "m_strInstrumentID", "m_strOrderRemark",
              "m_nOrderStatus", "order_id", "stock_code", "order_status")
+
+# Watch state: resolved once, then reused every bar.
+_state = {"acct": None, "shape": None, "getter": None, "sig": None, "dead": False}
 
 
 def _desc(value):
@@ -53,22 +59,39 @@ def _desc(value):
     return text[:60]
 
 
-def init(ContextInfo):
-    print("ORD_START build=%s" % PROBE_BUILD)
+def _short(v, n=160):
+    return repr(v)[:n]
 
 
-def handlebar(ContextInfo):
-    global _done
-    if _done:
-        return
-    _done = True
+def _dump_rows(rows, tag):
+    """Print identity + every candidate time field for up to 5 order rows."""
+    shown = 0
+    for item in rows:
+        if item is None:
+            continue
+        if shown >= 5:
+            break
+        shown += 1
+        ids = " ".join("%s=%s" % (f, _desc(getattr(item, f, "<absent>")))
+                       for f in ID_FIELDS if getattr(item, f, None) is not None)
+        print("ORD_%s %d %s" % (tag, shown, ids[:220]))
+        # Every candidate time field of this row, verbatim -- THE answer.
+        for f in TIME_FIELDS:
+            print("ORD_%sTIME %s = %s" % (tag, f, _desc(getattr(item, f, "<absent>"))))
+    return shown
+
+
+def _resolve(ContextInfo):
+    """One-time account + shape resolution; sets _state, returns True when ready."""
     getter = getattr(ContextInfo, "get_trade_detail_data", None)
     if not callable(getter):
         getter = globals().get("get_trade_detail_data")
     if not callable(getter):
         print("ORD_ABSENT get_trade_detail_data not on ContextInfo nor globals")
-        return
-    # Resolve the account the same way the bridge production code does.
+        _state["dead"] = True
+        return False
+    _state["getter"] = getter
+    # Account ladder mirrors the bridge production fallback chain.
     acct = None
     ga = getattr(ContextInfo, "get_account", None)
     if not callable(ga):
@@ -88,14 +111,11 @@ def handlebar(ContextInfo):
                 break
     print("ORD_ACCT resolved=%s" % _desc(acct))
     if not acct:
-        # v3 fallback (owner 21:45 paste-back: get_account ladder empty on this
-        # build): same source the live strategy uses -- config.bridge.json
-        # "account" (bridge _read_cfg). Read-only JSON, production parity.
+        # v3/v4 cfg fallback (kept for non-sandbox runs only -- the strategy
+        # sandbox forbids file IO and has no __file__; see version history).
         try:
             import json
             import os
-            # QMT strategy sandbox does NOT define __file__ (owner 21:51
-            # paste-back) -- use fixed candidate paths instead.
             cands = (
                 os.path.join("C:\\", "qmt", "quant-trading-v2", "qmt_gateway",
                              "config.bridge.json"),
@@ -109,67 +129,74 @@ def handlebar(ContextInfo):
             with open(cand, "rb") as fh:
                 cfg = json.loads(fh.read().decode("utf-8-sig", "replace"))
             acct = str(cfg.get("account", "") or "")
-            print("ORD_ACCT_CFG file=%s acct=%s" % (s(cand), acct))
-        except Exception as exc:  # noqa: BLE001 - fallback failure is a result
+            print("ORD_ACCT_CFG file=%s acct=%s" % (_short(cand), acct))
+        except Exception as exc:  # noqa: BLE001 - sandbox forbids FileIO
             print("ORD_ACCT_CFG_ERR %s" % repr(exc)[:140])
-        # QMT strategy sandbox FORBIDS all file IO (owner 21:56 paste-back:
-        # PermissionError 'Foribdden FileIO') -- final fallback: the production
-        # account id as a constant. Not a new disclosure: the same id already
-        # sits in repo fixtures (tests/test_broker_reads_rebuild_20261110.py).
         if not acct:
-            acct = "002069008957"
+            acct = CONST_ACCT
             print("ORD_ACCT_CONST used")
-    if not acct:
-        print("ORD_NOACCT get_account ladder empty -- cannot form 3-arg call")
-        print("ORD_DONE paste_all_ORD_lines_back")
-        return
     # Bounded shape ladder: this build's C++ signature is
     # get_trade_detail_data(acct, accounttype, TABLE) (owner 21:28 paste-back).
-    # First shape that returns wins; every rejected shape is logged verbatim so
-    # the paste-back alone documents this build's accepted signature.
-    raw = None
-    last_err = None
     for at in ("stock", "STOCK"):
         # Table-name casing ladder: docs show both ORDER and order spellings.
         for tab in ("ORDER", "order"):
             try:
-                raw = getter(acct, at, tab)
-                print("ORD_SHAPE_OK accttype=%s table=%s" % (at, tab))
-                break
+                getter(acct, at, tab)
+                _state["acct"] = acct
+                _state["shape"] = (at, tab)
+                print("ORD_SHAPE_OK accttype=%s table=%s acct=%s" % (at, tab, acct))
+                return True
             except Exception as exc:  # noqa: BLE001 - shape errors ARE results
-                # remember only the last rejection; earlier shapes stay in the log
-                last_err = exc
+                # every rejected shape stays in the log verbatim
                 print("ORD_SHAPE_ERR accttype=%s table=%s %s" % (
                     at, tab, repr(exc)[:120]))
-        if raw is not None:
-            break
-    if raw is None:
-        print("ORD_CALL_ERR all_shapes_failed last=%s" % repr(last_err)[:140])
+    print("ORD_CALL_ERR all_shapes_failed")
+    _state["dead"] = True
+    return False
+
+
+def init(ContextInfo):
+    print("ORD_START build=%s" % PROBE_BUILD)
+
+
+def handlebar(ContextInfo):
+    if _state["dead"]:
         return
-    if raw is None:
-        print("ORD_EMPTY NoneType (no rows or wrong arg shape)")
-        return
+    # First bar: resolve account + accepted shape once, then wait for orders.
+    if _state["getter"] is None:
+        if not _resolve(ContextInfo):
+            return
+    # Watch loop: one counter read per bar; print ONLY when the ORDER table
+    # changes (row count or leading order ids), so a whole session is quiet
+    # until real orders flow.
     try:
-        rows = list(raw)
+        raw = _state["getter"](_state["acct"], _state["shape"][0], _state["shape"][1])
+        rows = list(raw) if raw is not None else []
     except TypeError:
-        rows = [raw]
-    print("ORD_ROWS n=%d" % len(rows))
-    shown = 0
-    # Dump at most three order rows: identity line + every candidate time field.
-    for item in rows:
+        rows = [raw] if raw is not None else []
+    except Exception as exc:  # noqa: BLE001 - mid-session read error is notable
+        print("ORD_WATCH_ERR %s" % repr(exc)[:140])
+        return
+    # Change signature: count + leading identity heads (order ids when present).
+    heads = []
+    for item in rows[:5]:
         if item is None:
             continue
-        if shown >= 3:
-            break
-        shown += 1
-        ids = " ".join("%s=%s" % (f, _desc(getattr(item, f, "<absent>")))
-                       for f in ID_FIELDS if getattr(item, f, None) is not None)
-        print("ORD_ROW %d %s" % (shown, ids[:200]))
-        for f in TIME_FIELDS:
-            print("ORD_TIME %s = %s" % (f, _desc(getattr(item, f, "<absent>"))))
-    if shown == 0:
-        print("ORD_NO_ROWS (counter ORDER table empty -- run once while an order exists)")
-    print("ORD_DONE paste_all_ORD_lines_back")
+        heads.append(_desc(getattr(item, "m_strOrderSysID",
+                                   getattr(item, "order_id", "?")))[:40])
+    sig = (len(rows), tuple(heads))
+    if sig == _state["sig"]:
+        return
+    _state["sig"] = sig
+    print("ORD_WATCH rows=%d heads=%s" % (len(rows), ",".join(heads) or "none"))
+    if not rows:
+        print("ORD_WATCH_EMPTY (counter ORDER table empty -- prints again on the first order)")
+        return
+    shown = _dump_rows(rows, "ROW")
+    if shown:
+        # Full field dump complete for this change; no further prints until the
+        # next change. Paste every ORD_* line back once the session is done.
+        print("ORD_DONE paste_all_ORD_lines_back_then_stop_probe")
 
 
 def stop(ContextInfo):
