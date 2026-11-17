@@ -549,7 +549,10 @@ test.describe('权限与登录分支', () => {
     await page.getByText('实盘持仓', { exact: true }).first().click(); await page.waitForTimeout(500)
     await expect(page.locator('.app-main'), '成员实盘 Tab 显示无权限').toContainText('无权限访问实盘持仓', { timeout: 8000 })
     // 纸面持仓写入口对成员隐藏（读/明细保留）
-    await page.getByText('纸面持仓', { exact: true }).first().click(); await page.waitForTimeout(500)
+    // §HIDE-PAPER-TAB（2026-11-16 owner 需求）：纸面持仓 tab 已整体摘除，页面默认落在实盘。
+    // 旧形态是"点进纸面 tab 再断言没有新增按钮"——现在那个 tab 本身就不在，判据改成
+    // 两个入口（tab 与按钮）都不得出现在 DOM 里，这才是"纸面入口对成员隐藏"的当前形态。
+    await expect(page.getByText('纸面持仓'), '纸面持仓 tab 应整体隐藏').toHaveCount(0)
     await expect(page.getByText('+ 新增持仓'), '成员无新增持仓入口').toHaveCount(0)
     await page.goto('/#/quant'); await page.waitForTimeout(2500)
     // §UAT-FIXTURE（2026-11-01）：旧断言等的是「页内无权限面板」的文案，而现行设计是
@@ -2058,6 +2061,12 @@ test.describe('修复回归 · §0929POS-SAVE 持仓整表写浏览器腿 (2026-
   }
 
   // 打开「新增持仓」弹窗并填一行（代码/成本价/持股数）；返回该弹窗定位器
+  //
+  // §HIDE-PAPER-TAB（2026-11-16 owner 需求，POS-1/2/3 随之挂起）：这是**纸面账**的录入口，
+  // 随纸面持仓 tab 一起从界面摘除（SHOW_PAPER_TAB=false）。同一套不变量（载荷带新行 /
+  // 失败可见 / 重试去重）仍由 vitest `h_0929pos_save.test.jsx` 用 `showPaperTab` 显式打开
+  // 面板来覆盖——那边测的是组件行为，不依赖用户能点到按钮。要让这三条 e2e 复活，
+  // 前提是 owner 把纸面 tab 改回可见（SHOW_PAPER_TAB=true），届时本函数与三条用例都不用改。
   async function fillAddDialog(page, qty) {
     await page.getByRole('button', { name: /新增持仓/ }).click()
     const dlg = page.locator('.t-dialog')
@@ -2071,7 +2080,8 @@ test.describe('修复回归 · §0929POS-SAVE 持仓整表写浏览器腿 (2026-
   // POS-1 载荷腿：新增行必须出现在整表载荷里，且数量＝界面填的那份。
   // 反证方向：把 saveHoldings 的调用序退回「setHoldings 后不传参读闭包」，
   // 这条必红（载荷里没有 900099，或数量是旧值）——旧缺陷正是这么丢的。
-  test('POS-1：新增持仓行的代码与股数真的进了整表载荷（旧闭包读旧表＝改动丢失）', async ({ page }) => {
+  // §HIDE-PAPER-TAB（2026-11-16）：纸面录入口已从界面摘除 ⇒ 这三条 e2e 无路可走，显式挂起（不是静默跳过）。
+  test.skip('POS-1：新增持仓行的代码与股数真的进了整表载荷（旧闭包读旧表＝改动丢失）', async ({ page }) => {
     await page.goto('/#/positions')
     await page.waitForTimeout(2000)
     const errs = watch(page)
@@ -2094,7 +2104,7 @@ test.describe('修复回归 · §0929POS-SAVE 持仓整表写浏览器腿 (2026-
 
   // POS-2 失败可见腿：后端 500 ⇒ 红 toast + 弹窗保持打开 + 行标脏（旧空 catch 三样全静默）。
   // toast 断言按 §FIX-8 纪律锁主题类与文案，不看"有没有 toast 飘出来"。
-  test('POS-2：保存失败必须可见（红 toast+弹窗不关+未落库标记），旧空 catch 静默即红', async ({ page }) => {
+  test.skip('POS-2：保存失败必须可见（红 toast+弹窗不关+未落库标记），旧空 catch 静默即红', async ({ page }) => {
     await page.goto('/#/positions')
     await page.waitForTimeout(2000)
     const errs = watch(page)
@@ -2116,7 +2126,7 @@ test.describe('修复回归 · §0929POS-SAVE 持仓整表写浏览器腿 (2026-
   // POS-3 重试去重腿：失败后弹窗留着、界面已有一条乐观行；用户再点一次「确定」
   // ⇒ 表格与载荷都**只允许一条**该代码（旧写法 [ ...holdings, item] 会追加成两条，
   //   full-replace 语义下等于让后端"两次更新同一条记录"）。
-  test('POS-3：保存失败后原地重试不得重复同一代码行', async ({ page }) => {
+  test.skip('POS-3：保存失败后原地重试不得重复同一代码行', async ({ page }) => {
     await page.goto('/#/positions')
     await page.waitForTimeout(2000)
     const payloads = await interceptHoldingsWrite(page, 'fail')

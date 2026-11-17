@@ -61,9 +61,12 @@ vi.mock('../api/index.js', async () => {
 
 import Positions from '../pages/Positions.jsx'
 
-// openRealBook 与 §W7-G 同姿势：点击「实盘持仓」标签触发 loadReal（轮询与 SSE 都从这一下开始）。
+// openRealBook 与 §W7-G 同姿势：等实盘面板出现（纸面 tab 隐藏后默认就落在实盘，详情见下）。
 async function openRealBook() {
-  fireEvent.click(await screen.findByText(/实盘持仓/))
+  // §HIDE-PAPER-TAB（2026-11-16）：纸面 tab 隐藏后持仓页默认落在实盘，不再需要"点进实盘"；
+  // 且空态文案「暂无实盘持仓」与导航标签同文，旧的 findByText(/实盘持仓/) 会命中多个节点。
+  // 只等实盘面板自己的锚点（面板内必渲染的那一行）。
+  await screen.findByText('持仓数据截至', { exact: false })
   await waitFor(() => expect(screen.getByTestId('real-book-source')).toBeInTheDocument())
 }
 

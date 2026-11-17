@@ -47,9 +47,11 @@ import {
   adviceRowLabel, cancelKindText, cancelSourceText, tradeLevelSummaryText,
 } from '../utils/adviceFormat.js'
 
-// openRealTab 点进「实盘持仓」标签；不假定表格里有没有行（C1 那支的持仓集是空的）。
+// openRealTab 等实盘面板出现；不假定表格里有没有行（C1 那支的持仓集是空的）。
+// §HIDE-PAPER-TAB（2026-11-16）：纸面 tab 隐藏后默认落在实盘，不再需要点标签；且空态文案
+// 「暂无实盘持仓」与导航标签同文，旧的 findByText(/实盘持仓/) 会命中多个节点。
 async function openRealTab() {
-  fireEvent.click(await screen.findByText(/实盘持仓/))
+  await screen.findByText('持仓数据截至', { exact: false })
 }
 
 describe('§TRADE-CARD 文案单点 adviceFormat', () => {

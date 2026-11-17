@@ -50,9 +50,11 @@ vi.mock('../api/index.js', async () => {
 import Positions from '../pages/Positions.jsx'
 import { adviceSuggestText, adviceFilteredText } from '../utils/adviceFormat.js'
 
-// openRealBook 点进「实盘持仓」标签：建议列在实盘表格里，必须等表格真渲染出来。
+// openRealBook 等实盘面板渲染：纸面 tab 隐藏后默认落在实盘（见 §HIDE-PAPER-TAB）。
 async function openRealBook() {
-  fireEvent.click(await screen.findByText(/实盘持仓/))
+  // 空态文案「暂无实盘持仓」与导航标签同文，findByText(/实盘持仓/) 会命中多个节点；
+  // 这里改等实盘面板内的锚点，语义仍是"这一页已进入实盘态"。
+  await screen.findByText('持仓数据截至', { exact: false })
   await screen.findByText('600000.SH')
 }
 

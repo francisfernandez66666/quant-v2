@@ -68,9 +68,11 @@ function headerPnlText() {
   return el.textContent || ''
 }
 
-// openRealBook 走真实交互路径触发 loadReal（点击「实盘持仓」标签）。
+// openRealBook 等实盘面板出现并拿到首轮读数。
+// §HIDE-PAPER-TAB（2026-11-16）：纸面 tab 隐藏后默认落在实盘，挂载即拉 loadReal，不再需要
+// 点标签；且空态文案「暂无实盘持仓」与导航标签同文，旧 findByText(/实盘持仓/) 会命中多个节点。
 async function openRealBook() {
-  fireEvent.click(await screen.findByText(/实盘持仓/))
+  await screen.findByText('持仓数据截至', { exact: false })
   await waitFor(() => expect(state.positions.length === 0 || screen.queryAllByTestId('real-pnl-value').length > 0))
 }
 

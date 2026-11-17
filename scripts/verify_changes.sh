@@ -22753,3 +22753,89 @@ grep_q '7 passed|Ran 7 test' PY192 || { echo "--- FAIL: §192 Python 行为腿�
 [ "$B192_FAILED" = "0" ] || exit 1
 echo "ok - §192 §20261116-LIVE-T 锁通过（签字锚点/外脑烘参/T编排接线/指数同帧/vwap消歧 静态锁 + 用例在册 + Go/Python 双行为腿，累计判定点 ${CNT192}）"
 echo ""
+
+# §193 §20261117-POS-REAL-NEW（2026-11-17 owner 需求：持仓页「新增实盘持仓」入口加回来，
+# 纸面持仓入口仍隐藏）。凌晨落地：一个按钮两种含义（改账 / 真单），判据与行内四动作同源；
+# 真单提交收敛成唯一出口 placeRealOrder（行内四动作与建仓共用无现价二次确认与幂等键）；
+# 顺带修 §HIDE-PAPER-TAB 留下的"默认落实盘但挂载不拉读数"（usePolling 只装定时器不立刻 tick）。
+echo "==> 193 §20261117-POS-REAL-NEW（实盘新增入口/真单唯一出口/纸面仍隐藏/挂载首轮拉实盘）..."
+B193_FAILED=0
+fail193() {
+	echo "--- FAIL: §193 $*"
+	FAIL=1
+	B193_FAILED=1
+}
+CNT193=0
+POSJS193=web/src/pages/Positions.jsx
+
+# ① 入口在位，且判据与行内四动作同源（不另立第三套判断）
+CNT193=$((CNT193 + 1))
+grep -qF 'data-testid="real-new-entry"' "$POSJS193" || fail193 "实盘新增持仓入口缺 testid（owner 2026-11-17 需求）"
+CNT193=$((CNT193 + 1))
+grep -qF "bookTab === 'real' && (manualMode || canTrading)" "$POSJS193" \
+	|| fail193 "入口判据未与行内四动作同源（manualMode || canTrading）"
+CNT193=$((CNT193 + 1))
+grep -qF 'onClick={manualMode ? openManualNew : openRealNew}' "$POSJS193" \
+	|| fail193 "一个按钮两种含义丢失（改账 openManualNew vs 真单 openRealNew）"
+
+# ② 真单提交唯一出口：行内四动作与建仓共用同一条「幂等键 + 无现价二次确认」链。
+# 两处 submit 各抄一份的形态在真钱路径上会分叉（一处补了 confirm_no_quote、另一处没补）。
+CNT193=$((CNT193 + 1))
+grep -qF 'async function placeRealOrder(' "$POSJS193" || fail193 "缺真单唯一出口 placeRealOrder"
+CNT193=$((CNT193 + 1))
+test "$(grep -cF 'confirm_no_quote: true' "$POSJS193")" = "1" \
+	|| fail193 "confirm_no_quote 重发点必须恰 1 处（>1＝两条提交链分叉）"
+CNT193=$((CNT193 + 1))
+test "$(grep -cF 'await placeRealOrder({' "$POSJS193")" -ge 2 \
+	|| fail193 "行内确认与建仓确认未同时走唯一出口（<2 处调用）"
+
+# ③ 建仓语义：代码可编辑 + 6 位补后缀 + reason=manual:new（建仓与加仓必须分键）
+CNT193=$((CNT193 + 1))
+grep -qF 'async function confirmRealNew()' "$POSJS193" || fail193 "缺 confirmRealNew（建仓提交）"
+CNT193=$((CNT193 + 1))
+grep -qF 'normalizeManualCode(realFormCodeRef.current || realFormCode)' "$POSJS193" \
+	|| fail193 "建仓代码未走 normalizeManualCode（6 位纯数字补交易所后缀）"
+CNT193=$((CNT193 + 1))
+grep -qF "reason: 'manual:new'" "$POSJS193" || fail193 "建仓与加仓未分键（reason 必须 manual:new）"
+
+# ④ 纸面入口仍隐藏（owner 2026-11-17 再确认：纸面按钮还是隐藏）
+CNT193=$((CNT193 + 1))
+grep -qF 'const SHOW_PAPER_TAB = false' "$POSJS193" || fail193 "纸面 tab 常量被改（owner 要求仍隐藏）"
+CNT193=$((CNT193 + 1))
+grep -qF "bookTab === 'paper' && canFundsWrite" "$POSJS193" \
+	|| fail193 "纸面新增按钮未继续限定在纸面 tab"
+CNT193=$((CNT193 + 1))
+grep -qF '{showPaperTab && (' "$POSJS193" || fail193 "纸面面板未按 showPaperTab 开关渲染（测试可达性）"
+
+# ⑤ 默认落实盘的挂载首轮加载（usePolling 只装定时器、不会立刻 tick）
+CNT193=$((CNT193 + 1))
+grep -qF "if (bookTab === 'real') loadReal()" "$POSJS193" \
+	|| fail193 "默认实盘缺挂载首轮 loadReal（打开持仓页要空等满 15s 的回归）"
+
+# ⑥ 纸面 e2e 三条必须显式挂起而不是被删（藏 UI ≠ 可以删证据）
+CNT193=$((CNT193 + 1))
+test "$(grep -cF "test.skip('POS-" web/e2e/uat_full.spec.mjs)" = "3" \
+	|| fail193 "纸面持仓 e2e 三条未显式挂起（不许静默删除）"
+
+# ⑦ 用例在册 + 行为腿真跑
+for T193 in \
+	"N1 真单态：按钮在位，点开是可编辑代码的真单弹窗，提交走 execute 且理由=manual:new" \
+	"N2 改账态：同一枚按钮打开改账弹窗（不下单），execute 一次都不许被调用" \
+	"N3 无 trading 权限且非改账态：入口不渲染（不给点了必 403 的按钮）" \
+	"N4 纸面入口仍然隐藏：纸面 tab 与「+ 新增持仓（纸面）」都不在 DOM"; do
+	CNT193=$((CNT193 + 1))
+	grep -qF "$T193" web/src/__tests__/pos_real_new_entry_20261117.test.jsx \
+		|| fail193 "用例不在册：$T193"
+done
+VT193=$( cd web && npx vitest run src/__tests__/pos_real_new_entry_20261117.test.jsx 2>&1 || true )
+if grep_q 'Failed Tests|FAIL ' VT193; then
+	echo "--- FAIL: §193 前端行为腿："
+	printf '%s\n' "$VT193" | tail -20
+	B193_FAILED=1
+fi
+CNT193=$((CNT193 + 1))
+grep_q '4 passed' VT193 || { echo "--- FAIL: §193 行为腿未跑满 4 例：$(printf '%s\n' "$VT193" | tail -3)"; B193_FAILED=1; }
+
+[ "$B193_FAILED" = "0" ] || exit 1
+echo "ok - §193 §20261117-POS-REAL-NEW 锁通过（实盘新增入口/真单唯一出口/建仓分键/纸面仍隐藏/挂载首轮拉实盘 + 4 用例在册并真跑，累计判定点 ${CNT193}）"
+echo ""

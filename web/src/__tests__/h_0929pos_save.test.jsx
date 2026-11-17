@@ -102,6 +102,12 @@ vi.mock('../api/index.js', async () => {
 
 import Positions from '../pages/Positions.jsx'
 
+// §HIDE-PAPER-TAB（2026-11-16 owner 需求）：持仓页纸面 tab 默认隐藏（生产形态），
+// 本文件的五条用例测的是**纸面整表写**链路——那条链路仍然在产品里（数据/接口都在，
+// 只是 UI 不露出）。所以这里显式传 showPaperTab 打开面板，而不是把用例 skip 掉：
+// 藏 UI 不等于可以不再验证它的写面（失败不撒谎/脏行不被轮询抹掉这些不变量与 UI 无关）。
+const PAPER = <Positions showPaperTab />
+
 // 弹窗内按 placeholder 定位输入框并赋值（TDesign InputNumber 的 input 同选择器可用）
 async function fill(placeholder, value) {
   const el = await waitFor(() => {
@@ -167,7 +173,7 @@ describe('§0929POS-SAVE Positions 整表持仓写（载荷等值 + 失败不撒
   // 反向锁：同一次载荷不得再夹带 available_balance——§P1-11 起资金只走窄口径，
   // 整表端点显式丢弃该字段（带它就是"字段存在但无效"的假契约）。
   it('T1 新增持仓：载荷真带上新行，且不再夹带 available_balance', async () => {
-    render(<Positions />)
+    render(PAPER)
     await screen.findByText(/可用资金: ¥100\.00/)
     await addHolding('600998', 10, 200)
 
@@ -188,7 +194,7 @@ describe('§0929POS-SAVE Positions 整表持仓写（载荷等值 + 失败不撒
   // 摘掉 holdingsPendingRef 守卫或把 catch 改回空实现，本条必红。
   it('T2 整表写失败：toast + 行标脏 + 缓存不写脏 + 弹窗保持打开', async () => {
     state.saveErr = Object.assign(new Error('服务端 500：持仓保存失败'), { status: 500 })
-    render(<Positions />)
+    render(PAPER)
     await screen.findByText(/可用资金: ¥100\.00/)
     await addHolding('600997', 10, 300)
 
@@ -215,7 +221,7 @@ describe('§0929POS-SAVE Positions 整表持仓写（载荷等值 + 失败不撒
   // 旧写法（load 无条件整表覆盖）会把失败行直接抹掉。
   it('T3 失败后轮询：服务端缺这一行时脏行仍在列表里', async () => {
     state.saveErr = new Error('500')
-    render(<Positions />)
+    render(PAPER)
     await screen.findByText(/可用资金: ¥100\.00/)
     await addHolding('600996', 10, 400)
     await screen.findByText('未落库', {}, { timeout: 5000 })
@@ -233,7 +239,7 @@ describe('§0929POS-SAVE Positions 整表持仓写（载荷等值 + 失败不撒
   it('T4 编辑失败后重载：脏行保留用户编辑值，不被服务端旧值覆盖', async () => {
     state.holdings = [{ code: '600999', name: '旧值票', quantity: 100, cost_price: 10, cur_price: 11 }]
     state.saveErr = new Error('500')
-    render(<Positions />)
+    render(PAPER)
     await screen.findByText('600999', {}, { timeout: 5000 })
     await editHoldingQty('600999', 500)
     await screen.findByText('未落库', {}, { timeout: 5000 })
@@ -252,7 +258,7 @@ describe('§0929POS-SAVE Positions 整表持仓写（载荷等值 + 失败不撒
   //    后端按 code 归一只存一条，界面却显示两行——full-replace 载荷里带重复代码也是模糊语义）。
   it('T5 原地重试成功：脏标记消失、缓存落新行，且同代码不出两行', async () => {
     state.saveErr = new Error('500')
-    render(<Positions />)
+    render(PAPER)
     await screen.findByText(/可用资金: ¥100\.00/)
     await addHolding('600995', 10, 600)
     await screen.findByText('未落库', {}, { timeout: 5000 })

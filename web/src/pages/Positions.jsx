@@ -22,6 +22,10 @@ import { on } from '../sseBus.js'
 // English: explicit bookkeeping mode; "manual" always forces the adjust path, "auto"
 // follows the server book source (with the frozen-frame safety fallback).
 export const BOOK_MODE_KEY = 'positions_book_mode'
+// §HIDE-PAPER-TAB（2026-11-16 owner 需求）：持仓页全局隐藏纸面持仓 tab——默认落在实盘，
+// 纸面面板整体摘除（数据/接口都还在，只藏 UI）。要恢复给用户看：把这个常量改回 true。
+// English: paper tab is hidden by default; flip this constant to bring it back.
+const SHOW_PAPER_TAB = false
 // 2026-11-11 owner 实锤：改账新增在手机上「明明填了代码却报请输入代码」——受控 Input 在
 // 移动端 IME/自动填充下 onChange 可能不触发，confirm 读到空串。修复两件：确认时优先读
 // ref（不受闭包/渲染时序影响），并接受 6 位纯数字码按板块自动补后缀（60→SH，00/30→SZ，4/8→BJ）。
@@ -78,9 +82,13 @@ function loadCache() {
 /**
  * 持仓管理页面组件
  * 管理纸面持仓（增删改/加减仓/改成本/清仓）与实盘 QMT 持仓对账/下单。
+ * @param {{showPaperTab?: boolean}} props
+ *   §HIDE-PAPER-TAB（2026-11-16 owner 需求）：纸面持仓 tab 默认全局隐藏（下面的
+ *   SHOW_PAPER_TAB=false 是生产形态）。showPaperTab 是显式开关，**只给测试/将来恢复用**——
+ *   生产调用点一律不传；要给用户重新看到纸面账，改回 SHOW_PAPER_TAB 常量。
  * @returns {JSX.Element}
  */
-export default function Positions() {
+export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
   // 初始化时读取本地缓存的持仓与资金作为初始值（断线/刷新后仍可见）
   const cache = loadCache()
   // 纸面持仓列表
@@ -136,11 +144,9 @@ export default function Positions() {
   // 前端只消费 total_pnl/pnl_offset 两个读数（原 [totalRealizedPnl, setTotalRealizedPnl] 删除）。
 
   // 当前账本标签：paper=纸面持仓，real=实盘持仓
-  // §HIDE-PAPER-TAB（2026-11-16 owner 需求）：持仓页全局隐藏纸面持仓 tab——默认落在实盘，
-  // 纸面面板由 SHOW_PAPER_TAB=false 整体摘除（数据/接口都还在，只藏 UI；要恢复改回 true
-  // 并把初始 bookTab 改回 'paper' 即可）。
-  const SHOW_PAPER_TAB = false
-  const [bookTab, setBookTab] = useState(SHOW_PAPER_TAB ? 'paper' : 'real')
+  // §HIDE-PAPER-TAB（2026-11-16 owner 需求）：持仓页全局隐藏纸面持仓 tab——默认落在实盘。
+  // 常量提到模块级（组件默认参数 showPaperTab 要用它）；生产形态仍是下面这个 false。
+  const [bookTab, setBookTab] = useState(showPaperTab ? 'paper' : 'real')
   // QMT 网关状态（启用/模式/熔断/网关地址）
   const [qmtState, setQmtState] = useState({ enabled: false, mode: 'manual', tripped: false, gateway_url: '' })
   // 实盘持仓列表
@@ -250,6 +256,10 @@ export default function Positions() {
   const [realFormPrice, setRealFormPrice] = useState(0)
   const [realFormQty, setRealFormQty] = useState(0)
   const [realFormStrategy, setRealFormStrategy] = useState('')
+  // 2026-11-17 owner 需求：实盘「新增持仓」入口（真单建仓）需要可编辑代码——行内四动作
+  // 的标的是既有持仓行，这个入口的标的还没在账上。与改账新增同姿势用 ref 兜底：
+  // 移动端受控 Input 在 IME/自动填充下可能不触发 onChange，确认时读到空串（11-11 实锤）。
+  const [realFormCode, setRealFormCode] = useState('')
   // 实盘下单提交中标记（防重复提交）
   const [realSubmitting, setRealSubmitting] = useState(false)
   // §MANUAL-BOOK-UNIFY 改账弹窗 state（柜台不可达·改账态专用）：四个动作（加仓/减仓/止盈/清仓）
@@ -261,6 +271,8 @@ export default function Positions() {
   const [manualFormQty, setManualFormQty] = useState(0)
   const [manualFormCode, setManualFormCode] = useState('')
   const manualFormCodeRef = useRef('')
+  // 实盘新增持仓的代码 ref（同上：确认时优先读 ref，不受渲染/IME 时序影响）。
+  const realFormCodeRef = useRef('')
   const [manualFormName, setManualFormName] = useState('')
   const [manualSubmitting, setManualSubmitting] = useState(false)
   // 「直接改资金」小入口（裁决 3 的手续费/分红/出入金口子）：拆成独立的 state，
@@ -882,40 +894,32 @@ export default function Positions() {
     setRealFormQty(dir === 'add' ? 100 : Math.min(100, p.qty || 0))
     setRealFormStrategy('')
   }
-  // 提交实盘买入/卖出/止盈/清仓委托
+  // 2026-11-17 owner 需求：实盘 tab 的「新增实盘持仓」入口（真单建仓，买入方向）。
+  // 与行内四动作同判据：只有能发真单的账号（canTrading）才走这条；标的还没在账上，代码可编辑。
+  function openRealNew() {
+    if (realTripped) { MessagePlugin.warning('网关已熔断，暂停实盘下单'); return }
+    setRealAction({ pos: null, dir: 'new' })
+    setRealFormCode('')
+    realFormCodeRef.current = ''
+    setRealFormPrice(0)
+    setRealFormQty(100)
+    setRealFormStrategy('')
+  }
+  // 实盘真单提交唯一出口（2026-11-17 抽出）：行内四动作与「新增实盘持仓」共用同一条
+  // 幂等键 / 无现价二次确认 / 错误分型链。旧形态把这段长在 confirmRealAction 里，第二个
+  // 入口若各抄一份，就会出现"一处补了 confirm_no_quote、另一处忘补"的分叉——真钱路径上
+  // 这种分叉的代价是"行情故障时静默放行"或"该确认的没法确认"。
   // §0926E2E-W1C（后端同步改造）：现价不可得时后端不再静默放行价格校验，而是 400 要求
-  // 显式确认（confirm_no_quote）。这里承接该形态：报"无法获取实时现价"→ 弹二次确认，
-  // 用户点「仍要下单」后带确认位**复用同一 client_id** 重发（幂等双保险：即便首请求
-  // 已到达柜台，重试也只会命中幂等键返回 duplicate，不会重复下单）。
-  async function confirmRealAction() {
-    const a = realAction
-    if (!a) return
-    const qty = a.dir === 'close' ? (a.pos.qty || 0) : Math.round(Number(realFormQty) || 0)
-    const price = Number(realFormPrice) || 0
-    if (qty <= 0 || price <= 0) { MessagePlugin.warning('请输入有效的价格与数量'); return }
-    // §F16 前端兜底：减仓/止盈方向必须 ≥100 且为整手，与后端 400 拒单同口径
-    const sell = a.dir === 'reduce' || a.dir === 'tp' || a.dir === 'close'
-    if (sell && a.dir !== 'close' && (qty < 100 || qty % 100 !== 0)) {
-      MessagePlugin.warning('卖出必须整手（100 的倍数）；如需清仓请用清仓动作')
-      return
-    }
-    setRealSubmitting(true)
+  // 显式确认（confirm_no_quote）；用户点「仍要下单」后带确认位**复用同一 client_id** 重发
+  // （幂等双保险：即便首请求已到达柜台，重试也只会命中幂等键返回 duplicate，不会重复下单）。
+  async function placeRealOrder({ code, side, action, qty, price, strategy, reason }) {
     // 一次确认生成一次幂等键（§P2-15），行情确认重试复用同一键
     const clientID = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : undefined
-    const base = {
-      code: a.pos.ts_code,
-      side: sell ? '卖出' : '买入',
-      action: realActionLabel(a.dir),
-      qty,
-      price,
-      strategy: realFormStrategy,
-      reason: 'manual:' + a.dir,
-      client_id: clientID,
-    }
+    const base = { code, side, action, qty, price, strategy: strategy || '', reason, client_id: clientID }
     // 真正提交并处理成功收尾（成功提示+关弹窗+延迟刷新等回报）
     async function submit(payload) {
       const res = await api.executeRealAction(payload)
-      MessagePlugin.success((sell ? '卖出' : '买入') + '委托已提交 ' + a.pos.ts_code + ' ' + qty + ' 股' + (res.order_id ? '（单号 ' + res.order_id + '）' : ''))
+      MessagePlugin.success((side === '卖出' ? '卖出' : '买入') + '委托已提交 ' + code + ' ' + qty + ' 股' + (res.order_id ? '（单号 ' + res.order_id + '）' : ''))
       setRealAction(null)
       // 委托提交后 2s 刷新实盘持仓，等待网关回报
       setTimeout(loadReal, 2000)
@@ -939,8 +943,8 @@ export default function Positions() {
       } catch (e) {
         const msg = String((e && e.message) || '')
         // §P2-J 可吞（非吞错）：这里不是"吃掉错误"——非"无现价"类错误原样 throw 给调用方；
-      // 只有"取不到实时现价"会走 confirmNoQuote() 弹二次确认，由用户决定是否仍要下单。
-      if (!msg.includes('无法获取实时现价')) throw e
+        // 只有"取不到实时现价"会走 confirmNoQuote() 弹二次确认，由用户决定是否仍要下单。
+        if (!msg.includes('无法获取实时现价')) throw e
         await confirmNoQuote()
         await submit({ ...base, confirm_no_quote: true })
       }
@@ -950,6 +954,49 @@ export default function Positions() {
       if (msg.includes('__no_quote_cancel__')) MessagePlugin.info('已取消，未提交委托')
       else MessagePlugin.error('下单失败: ' + msg)
     } finally { setRealSubmitting(false) }
+  }
+  // 提交实盘买入/卖出/止盈/清仓委托（行内四动作）
+  async function confirmRealAction() {
+    const a = realAction
+    if (!a) return
+    const qty = a.dir === 'close' ? (a.pos.qty || 0) : Math.round(Number(realFormQty) || 0)
+    const price = Number(realFormPrice) || 0
+    if (qty <= 0 || price <= 0) { MessagePlugin.warning('请输入有效的价格与数量'); return }
+    // §F16 前端兜底：减仓/止盈方向必须 ≥100 且为整手，与后端 400 拒单同口径
+    const sell = a.dir === 'reduce' || a.dir === 'tp' || a.dir === 'close'
+    if (sell && a.dir !== 'close' && (qty < 100 || qty % 100 !== 0)) {
+      MessagePlugin.warning('卖出必须整手（100 的倍数）；如需清仓请用清仓动作')
+      return
+    }
+    setRealSubmitting(true)
+    await placeRealOrder({
+      code: a.pos.ts_code,
+      side: sell ? '卖出' : '买入',
+      action: realActionLabel(a.dir),
+      qty,
+      price,
+      strategy: realFormStrategy,
+      reason: 'manual:' + a.dir,
+    })
+  }
+  // 提交「新增实盘持仓」的真单建仓（买入）：标的未在账上，代码按 6 位纯数字自动补交易所后缀
+  // （与改账新增共用 normalizeManualCode）。买入侧仍守一手纪律：后端会把 qty<100 抬到 100，
+  // 前端先拦是为了让用户看清"自己要下的是多少股"，而不是替谁悄悄改数。
+  async function confirmRealNew() {
+    const code = normalizeManualCode(realFormCodeRef.current || realFormCode)
+    if (!code) { MessagePlugin.warning('请输入代码：实盘建仓必须指定真实标的'); return }
+    const qty = Math.round(Number(realFormQty) || 0)
+    const price = Number(realFormPrice) || 0
+    if (qty <= 0 || price <= 0) { MessagePlugin.warning('请输入有效的价格与数量'); return }
+    if (qty < 100 || qty % 100 !== 0) {
+      MessagePlugin.warning('买入必须整手（100 的倍数）')
+      return
+    }
+    setRealSubmitting(true)
+    await placeRealOrder({
+      code, side: '买入', action: '加仓', qty, price,
+      strategy: realFormStrategy, reason: 'manual:new',
+    })
   }
 
   // ── §MANUAL-BOOK-UNIFY（2026-11-06 裁决 2/3/4）改账态操作 ──
@@ -1099,6 +1146,9 @@ export default function Positions() {
   // 挂载时加载持仓、启动轮询并订阅 SSE 实盘建议；卸载时清理
   useEffect(() => {
     load()
+    // §HIDE-PAPER-TAB（2026-11-16）：默认落在实盘，首轮必须自己拉一次——usePolling 只装
+    // 定时器、不会立刻 tick，否则打开持仓页要先盯着空表等满 15s 才出现读数。
+    if (bookTab === 'real') loadReal()
     // §N-09：纸面轮询由 usePolling 管理，此处只做首轮加载与 SSE 订阅
     // 订阅 SSE 事件总线（App 单连接扇出）：处理实盘建议推送与 QMT/订单回报，触发对应刷新
     unsubSSE.current = on(['real_advice', 'qmt_report', 'real_order'], (msg) => {
@@ -1328,6 +1378,17 @@ export default function Positions() {
                 在实盘 tab 点它会把持仓写到纸面账里。只在纸面 tab 显示；实盘 tab 的录入口
                 是状态条里的「改账·新增」（写 manual_*）。 */}
             {bookTab === 'paper' && canFundsWrite && <Button theme="primary" onClick={openAddNew}>+ 新增持仓（纸面）</Button>}
+            {/* 2026-11-17 owner 需求：实盘 tab 的「新增实盘持仓」入口加回来。
+                一个按钮两种含义，判据与行内四动作**同源**（不另立第三套判断）：
+                  · manualMode（柜台不可达/手动维护）⇒ 走「改账·新增」（写 manual_*，不下单）；
+                  · 否则 canTrading（能发真单）⇒ 新建真单弹窗（代码可编辑，走 execute）；
+                  · 两者都不是 ⇒ 不渲染（与行内操作列显示 '—' 同一口径）。
+                纸面按钮仍由 SHOW_PAPER_TAB=false 隐藏，两者不会同屏。 */}
+            {bookTab === 'real' && (manualMode || canTrading) && (
+              <Button data-testid="real-new-entry" theme="primary" onClick={manualMode ? openManualNew : openRealNew}>
+                + 新增实盘持仓
+              </Button>
+            )}
           </div>
         </div>
       </Card>
@@ -1336,7 +1397,7 @@ export default function Positions() {
         {/* §HIDE-PAPER-TAB（2026-11-16）：纸面持仓面板全局隐藏（SHOW_PAPER_TAB=false）。
             恢复方式：把上面的 SHOW_PAPER_TAB 改回 true。纸面数据链路（load/轮询/写接口）
             原样保留，只是不在界面上露出。 */}
-        {SHOW_PAPER_TAB && (
+        {showPaperTab && (
         <Tabs.TabPanel value="paper" label="纸面持仓">
           {/* §E1 可达性补腿（2026-09-26）：实盘数据在位时页头被 §F1 回落让位给实盘盈亏，
               纸面「总盈亏+清零」若无此处则整页不可达——真实接了 QMT 的用户将永远点不到清零。
@@ -1754,26 +1815,38 @@ export default function Positions() {
         </div>
       </Dialog>
 
-      {/* 实盘下单确认弹窗：参考价/数量/战法/预估金额，网关熔断时禁用 */}
-      <Dialog visible={!!realAction} header={`实盘${realAction ? realActionLabel(realAction.dir) : ''} ${realAction?.pos.ts_code} ${realAction?.pos.name}`} onClose={() => setRealAction(null)} onConfirm={confirmRealAction} confirmBtn={realSubmitting ? '下单中…' : '确认下单'} cancelBtn="取消">
-        <Form onSubmit={confirmRealAction}>
-          {/* 实盘持仓信息：数量/成本价 */}
-          <Form.FormItem label="当前持仓">
-            <span>{realAction?.pos.qty} 股 / 成本 ¥{realAction?.pos.cost_price?.toFixed(3)}</span>
-          </Form.FormItem>
+      {/* 实盘下单确认弹窗：参考价/数量/战法/预估金额，网关熔断时禁用。
+          2026-11-17：「新增实盘持仓」复用同一张弹窗（dir='new'）——真单建仓只是标的还没在账上，
+          其余校验链（整手/战法白名单/无现价二次确认/幂等键）与行内四动作完全同源；
+          两套弹窗就会两套校验，而真钱路径上"少一道"从来不会报错。 */}
+      <Dialog visible={!!realAction} header={`实盘${realAction ? (realAction.dir === 'new' ? '新增持仓' : realActionLabel(realAction.dir)) : ''} ${realAction?.dir === 'new' ? (normalizeManualCode(realFormCode || realFormCodeRef.current) || '（待填代码）') : (realAction?.pos?.ts_code || '')} ${realAction?.pos?.name || ''}`} onClose={() => setRealAction(null)} onConfirm={realAction?.dir === 'new' ? confirmRealNew : confirmRealAction} confirmBtn={realSubmitting ? '下单中…' : '确认下单'} cancelBtn="取消">
+        <Form onSubmit={realAction?.dir === 'new' ? confirmRealNew : confirmRealAction}>
+          {/* 新增建仓：代码可编辑（标的还没在账上）；行内四动作：显示当前持仓 */}
+          {realAction?.dir === 'new' ? (
+            <Form.FormItem label="代码">
+              <Input value={realFormCode} placeholder="输入代码（如 601958 或 600000.SH）"
+                onChange={(v) => { realFormCodeRef.current = String(v ?? ''); setRealFormCode(String(v ?? '')) }}
+                onBlur={(v) => { if (v != null) { realFormCodeRef.current = String(v ?? ''); setRealFormCode(String(v ?? '')) } }} />
+            </Form.FormItem>
+          ) : (
+            <Form.FormItem label="当前持仓">
+              <span>{realAction?.pos.qty} 股 / 成本 ¥{realAction?.pos.cost_price?.toFixed(3)}</span>
+            </Form.FormItem>
+          )}
           {/* 参考价/数量/战法输入 */}
           <Form.FormItem label="参考价">
             <InputNumber value={realFormPrice} min={0} step={0.001} placeholder="成交参考价" onChange={(v) => setRealFormPrice(Number(v) || 0)} />
           </Form.FormItem>
            {/* §F16 卖出不支持零股：非清仓方向的卖出/减仓数量 min=100 强制一手起，
-               与后端 qmt.go:317-327 校验同口径；清仓走 pos.qty 全量，输入框隐藏数量语义。 */}
-           <Form.FormItem label={realAction?.dir === 'add' ? '加仓数量' : realAction?.dir === 'close' ? '清仓数量' : '减仓数量'}>
+               与后端 qmt.go:317-327 校验同口径；清仓走 pos.qty 全量，输入框隐藏数量语义。
+               新增建仓是买入侧，同样整手——A 股最小申购单位就是一手。 */}
+           <Form.FormItem label={realAction?.dir === 'new' ? '买入数量' : realAction?.dir === 'add' ? '加仓数量' : realAction?.dir === 'close' ? '清仓数量' : '减仓数量'}>
              <InputNumber
                value={realFormQty}
                min={realAction?.dir === 'close' ? 0 : 100}
                step={100}
                disabled={realAction?.dir === 'close'}
-               placeholder={realAction?.dir === 'add' ? '股数（一手=100）' : realAction?.dir === 'close' ? '全部持仓 ' + (realAction?.pos?.qty || 0) + ' 股' : '股数（最少一手=100）'}
+               placeholder={realAction?.dir === 'new' || realAction?.dir === 'add' ? '股数（一手=100）' : realAction?.dir === 'close' ? '全部持仓 ' + (realAction?.pos?.qty || 0) + ' 股' : '股数（最少一手=100）'}
                onChange={(v) => setRealFormQty(parseInt(v) || 0)}
              />
            </Form.FormItem>
