@@ -46,6 +46,7 @@ type D1Score struct {
 	Score        float64 `json:"score"`         // 带符号评分值，−40~+40（负分=明确利空，直接拦截买入）
 	Reason       string  `json:"reason"`        // LLM 给出的评分分析理由
 	RetryPending bool    `json:"retry_pending"` // LLM 失败待重试（分数 0，入重试队列，下轮重新调 LLM）
+	Level        string  `json:"level"`         // §D1-LEVEL：关联新闻级别（个股/板块/宏观/空），供 pregen 烘 news_propagation
 }
 
 // D1Scorer 批量个股 D1 评分器。
@@ -314,6 +315,9 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 	// English: stocks with no substantive event (no individual news match and no bullish sector event)
 	// are forced to D1=0 so a placeholder low score can't act as a valid D1 that fires/gets pinned.
 	noEvent := make(map[string]bool, len(codes))
+	// §D1-LEVEL 2026-11-17：记录每只股关联事件的级别（个股/板块/宏观），LLM 输出不含此字段，
+	// 组装结果时用本地记录补上——propagation 的语义源（Level 非空且非"个股"）在这里定。
+	eventLevel := make(map[string]string, len(codes))
 	for i, code := range codes {
 		sb.WriteString(fmt.Sprintf("%d. 代码: %s\n", i+1, code))
 		md := marketData[code]
@@ -336,7 +340,16 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 		// no event link at all are flagged noEvent and forced to 0 afterwards.
 		eventDesc := findEventForCode(code, md, events)
 		if eventDesc == "" {
+			// 无个股级事件命中、但所属热点板块有正向事件 = 板块传导，级别记"板块"。
+			if ds.sectorEvents[code] != "" {
+				eventLevel[code] = "板块"
+			}
 			eventDesc = ds.sectorEvents[code]
+		} else {
+			// 个股级事件命中：取该事件的原始 Level（个股/板块/宏观）。
+			if lv := findEventLevelForCode(code, md, events); lv != "" {
+				eventLevel[code] = lv
+			}
 		}
 		if eventDesc != "" {
 			sb.WriteString(fmt.Sprintf("   关联事件: %s\n", eventDesc))
@@ -412,6 +425,8 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 			if r.Score < -40 {
 				r.Score = -40
 			}
+			// §D1-LEVEL：Level 来自本地关联事件，不是 LLM 输出——覆盖 LLM 可能臆造的同名字段。
+			r.Level = eventLevel[r.Code]
 			result[r.Code] = r
 			log.Printf("[D1Scorer] %s → score=%.2f reason=%s", r.Code, r.Score, r.Reason)
 		}
@@ -483,6 +498,25 @@ func findEventForCode(code string, md *strategy_engine.StockMarketData, events [
 		for _, s := range ev.CleanedStocks {
 			if stockMatch(s, code, md) {
 				return ev.Title
+			}
+		}
+	}
+	return ""
+}
+
+// findEventLevelForCode 返回与该股关联的第一条新闻的 Level（个股/板块/宏观）。
+// §D1-LEVEL 2026-11-17：与 findEventForCode 同一匹配口径（RelatedStocks + CleanedStocks），
+// 只取级别不取标题——pregen 据此烘 news_propagation（Level 非空且不含"个股" = 会传导）。
+func findEventLevelForCode(code string, md *strategy_engine.StockMarketData, events []newsagent.NewsEvent) string {
+	for _, ev := range events {
+		for _, s := range ev.RelatedStocks {
+			if stockMatch(s, code, md) {
+				return ev.Level
+			}
+		}
+		for _, s := range ev.CleanedStocks {
+			if stockMatch(s, code, md) {
+				return ev.Level
 			}
 		}
 	}

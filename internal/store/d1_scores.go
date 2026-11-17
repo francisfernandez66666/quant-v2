@@ -16,6 +16,7 @@ type D1ScoreRow struct {
 	Score   float64 // 评分
 	Blocked bool    // 是否阻断
 	Reason  string  // 原因
+	Level   string  // 新闻级别（个股/板块/宏观/空）；§D1-LEVEL 供 pregen 烘 news_propagation
 }
 
 // UpsertD1Scores 批量幂等写入某日期的 D1 评分（同 date+code 覆盖，保留最新一轮）。
@@ -28,11 +29,12 @@ func (d *DB) UpsertD1Scores(date string, rows []D1ScoreRow) error {
 		return fmt.Errorf("d1 begin: %w", err)
 	}
 	now := time.Now().Format("2006-01-02 15:04:05")
-	stmt, err := tx.Prepare(`INSERT INTO d1_scores (date, code, score, blocked, reason, created_at)
-		VALUES (?,?,?,?,?,?)
+	stmt, err := tx.Prepare(`INSERT INTO d1_scores (date, code, score, blocked, reason, created_at, level)
+		VALUES (?,?,?,?,?,?,?)
 		ON CONFLICT(date, code) DO UPDATE SET
 		  score=excluded.score, blocked=excluded.blocked,
-		  reason=excluded.reason, created_at=excluded.created_at`)
+		  reason=excluded.reason, created_at=excluded.created_at,
+		  level=excluded.level`)
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("d1 prepare: %w", err)
@@ -43,7 +45,7 @@ func (d *DB) UpsertD1Scores(date string, rows []D1ScoreRow) error {
 		if r.Blocked {
 			bl = 1
 		}
-		if _, err := stmt.Exec(date, r.Code, r.Score, bl, r.Reason, now); err != nil {
+		if _, err := stmt.Exec(date, r.Code, r.Score, bl, r.Reason, now, r.Level); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("d1 exec %s: %w", r.Code, err)
 		}

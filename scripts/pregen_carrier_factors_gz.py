@@ -275,8 +275,15 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
                 out["flow_today_pct"] = round(mains[-1] / cap * 100.0, 4)
                 if len(mains) >= 2:
                     out["flow_5d_pct"] = round(sum(mains) / cap * 100.0, 4)
-    d1 = _q("SELECT score, date FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
+    # §D1-LEVEL 2026-11-17：带出当日新闻级别，烘 news_propagation（good_news_fade 的
+    # dict 四元组缺的就是这枚）。D1 日更只记当天，旧行 level 空串=未知→不烘（诚实弃权）。
+    d1 = _q("SELECT score, date, level FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
             (code6,))
+    if d1 is None:
+        # 回退：schema 迁移尚未跑到本库（旧库无 level 列）——保住原有 news_event 烘值，
+        # 只是没有 propagation（诚实弃权），绝不因缺列把 D1 分一起丢掉。
+        d1 = _q("SELECT score, date FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
+                (code6,))
     # §NEWS-GATE 2026-11-12（R8/R12）：D1 改带符号分 [−40,+40] 原样烘入——负分=明确利空
     # 直接下传（载体负分拒买闸与 NewsEvent 负带消费），不再 blocked→0 抹平（旧 Blocked 标记废除，
     # d1_scores.blocked 列已由引擎按 score<0 派生，无需在此读）。0/缺行=无事件（中性，不烘键）。
@@ -290,8 +297,14 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
         # d1_scores.date 即评估交易日（带横线），烘成 yyyymmdd 喂 _news_event_obj。
         if d1[0][1]:
             out["news_day"] = str(d1[0][1]).replace("-", "")[:8]
-        # news_propagation 不烘：d1_scores 无 Level 列（个股 vs 板块/宏观），
-        # 不靠 reason 文本猜——缺 propagation 时 good_news_fade 诚实弃权（见施工图 §15.2/§16）。
+        # §D1-LEVEL 2026-11-17：Level 非空且不含"个股" = 会传导（与 Go adapter.go 同口径：
+        # 板块/宏观级事件会传导、个股级不会）。缺/空 Level 不烘，good_news_fade 诚实弃权。
+        # 只取当日 D1 行的 Level——D1 日更、过期不存，不回溯历史（owner 口径）。
+        if len(d1[0]) > 2 and d1[0][2]:
+            # 明确有 Level：显式烘 True/False（个股级不传导=False，板块/宏观=会传导=True）。
+            # 空 Level（本列落地前的旧行/未知）不烘→propagation None→诚实弃权，不回溯。
+            _lv = str(d1[0][2])
+            out["news_propagation"] = "个股" not in _lv
     hp = (params_doc.get("hot_pool") or {}).get("bullish") or {}
     hit = hp.get(symbol) or hp.get(code6)
     if isinstance(hit, dict) and hit.get("score") is not None:

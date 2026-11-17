@@ -409,3 +409,32 @@ func TestBatchScoreParseFailureBothDirtyGoesQueue(t *testing.T) {
 		}
 	}
 }
+
+// §D1-LEVEL 2026-11-17：关联新闻的 Level 必须能从事件里取到（个股 vs 板块/宏观），
+// 这是 pregen 烘 news_propagation 的唯一数据源——取不到则 good_news_fade 永久弃权。
+func TestFindEventLevelForCode(t *testing.T) {
+	events := []newsagent.NewsEvent{
+		{Title: "个股公告", Level: "个股", CleanedStocks: []string{"招金黄金|600547"}},
+		{Title: "板块利好", Level: "板块", RelatedStocks: []string{"中金黄金"}},
+		{Title: "宏观政策", Level: "宏观", RelatedStocks: []string{"000001"}},
+	}
+	cases := []struct {
+		name string
+		md   *strategy_engine.StockMarketData
+		want string
+	}{
+		{"个股级按代码命中", &strategy_engine.StockMarketData{Name: "招金黄金"}, "个股"},
+		{"板块级按名称命中", &strategy_engine.StockMarketData{Name: "中金黄金"}, "板块"},
+		{"宏观级命中", &strategy_engine.StockMarketData{Name: "x"}, "宏观"},
+		{"无关个股空", &strategy_engine.StockMarketData{Name: "茅台"}, ""},
+	}
+	// 每个用例的 code 互不冲突：个股级按 code=600547 命中；板块级用 600999
+	// （不在任何事件里）只靠 md.Name 命中，避免误撞个股事件的 scode。
+	codes := []string{"600547", "600999", "000001", "600519"}
+	for i, c := range cases {
+		got := findEventLevelForCode(codes[i], c.md, events)
+		if got != c.want {
+			t.Errorf("%s: findEventLevelForCode = %q, want %q", c.name, got, c.want)
+		}
+	}
+}

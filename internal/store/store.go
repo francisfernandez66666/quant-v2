@@ -406,6 +406,7 @@ func (d *DB) migrate() error {
 			blocked INTEGER NOT NULL DEFAULT 0,
 			reason TEXT DEFAULT '',
 			created_at TEXT NOT NULL,
+			level TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (date, code)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_d1_date ON d1_scores(date)`,
@@ -904,6 +905,10 @@ func (d *DB) migrate() error {
 		{"fills", "fill_vwap_premium_pct", "ALTER TABLE fills ADD COLUMN fill_vwap_premium_pct REAL DEFAULT 0"},
 		{"fills", "vwap_source", "ALTER TABLE fills ADD COLUMN vwap_source TEXT DEFAULT ''"},
 		{"fills", "vwap_as_of", "ALTER TABLE fills ADD COLUMN vwap_as_of TEXT DEFAULT ''"},
+		// §D1-LEVEL 2026-11-17（owner：D1 日更只记当天、不回填历史）：新闻级别
+		// （个股/板块/宏观）随当日 D1 分落库，供 pregen 烘 news_propagation。
+		// 旧行空串＝本列落地前的历史，不回填（D1 是日更新闻，过期即无意义）。
+		{"d1_scores", "level", "ALTER TABLE d1_scores ADD COLUMN level TEXT NOT NULL DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

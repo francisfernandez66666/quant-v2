@@ -23157,3 +23157,62 @@ grep_q '2 passed' G198 || { echo "--- FAIL: §198 完备性行为腿未过：$(p
 [ "$B198_FAILED" = "0" ] || exit 1
 echo "ok - §198 §20261117-WIRING-COMPLETENESS 锁通过（契约白名单在册 + 反摆设 + 差集判定 + build_context 覆盖行为腿，累计判定点 ${CNT198}）"
 echo ""
+
+# §199 §20261117-D1-LEVEL（owner 裁决：D1 日更只记当天、不回填历史，加 Level 列 + pregen 烘）。
+# good_news_fade 要 news_event 是 dict{score,positive,propagation,day}；propagation 的语义源是
+# 新闻 Level（个股级=不传导=False，板块/宏观=会传导=True）。此前 D1 打分链/落库表都没有 Level，
+# 导致 propagation 永久缺、战法诚实弃权。本段锁整条数据血缘：打分带出→落库→pregen 烘。
+echo "==> 199 §20261117-D1-LEVEL（Level列 + 打分带出 + 落库 + pregen烘propagation + 行为腿）..."
+B199_FAILED=0
+fail199() {
+	echo "--- FAIL: §199 $*"
+	FAIL=1
+	B199_FAILED=1
+}
+CNT199=0
+
+# ① schema：建表带 level 列 + 幂等迁移补列。
+CNT199=$((CNT199 + 1))
+grep -qE 'level TEXT NOT NULL DEFAULT' internal/store/store.go || fail199 "d1_scores 建表缺 level 列"
+CNT199=$((CNT199 + 1))
+grep -qF '{"d1_scores", "level"' internal/store/store.go || fail199 "旧库缺增量补 level 列（迁移清单）"
+
+# ② 打分带出：D1Score 结构有 Level + findEventLevelForCode + 组装覆盖。
+CNT199=$((CNT199 + 1))
+grep -qE 'Level +string .*json:"level"' internal/combat_agent/d1_scorer.go || fail199 "D1Score 结构缺 Level 字段"
+CNT199=$((CNT199 + 1))
+grep -qF 'func findEventLevelForCode(' internal/combat_agent/d1_scorer.go || fail199 "缺 findEventLevelForCode（Level 源头）"
+CNT199=$((CNT199 + 1))
+grep -qF 'r.Level = eventLevel[r.Code]' internal/combat_agent/d1_scorer.go || fail199 "组装结果未补 Level（LLM 不输出 Level，必须本地补）"
+
+# ③ 落库：D1ScoreRow 带 Level + Upsert 写 level 列 + engine 写入点带出。
+CNT199=$((CNT199 + 1))
+grep -qE 'Level +string.*新闻级别' internal/store/d1_scores.go || fail199 "D1ScoreRow 缺 Level 字段"
+CNT199=$((CNT199 + 1))
+grep -qF 'created_at, level)' internal/store/d1_scores.go || fail199 "Upsert 未写 level 列"
+CNT199=$((CNT199 + 1))
+grep -qF 'Reason: d.Reason, Level: d.Level' internal/engine/engine.go || fail199 "engine 落库写入点未带出 Level"
+
+# ④ pregen 烘值：SELECT 带 level + propagation 三态口径（个股 not in → False）。
+CNT199=$((CNT199 + 1))
+grep -qF 'SELECT score, date, level FROM d1_scores' scripts/pregen_carrier_factors_gz.py || fail199 "pregen 未读 level 列"
+CNT199=$((CNT199 + 1))
+grep -qF 'out["news_propagation"] = "个股" not in _lv' scripts/pregen_carrier_factors_gz.py || fail199 "propagation 烘值口径错（应个股=False、板块/宏观=True）"
+
+# ⑤ 负锁：不许靠 reason 文本猜 propagation（这是被明确废弃的做法）。
+CNT199=$((CNT199 + 1))
+if grep -qE 'propagation.*reason|reason.*propagation' scripts/pregen_carrier_factors_gz.py; then
+	fail199 "不许从 reason 文本猜 propagation（必须从 Level 列）"
+fi
+
+# ⑥ 行为腿真跑：store 落库 + combat_agent Level 提取 + pregen 三态烘值。
+G199=$(timeout 150 go test ./internal/store/ ./internal/combat_agent/ -run 'TestD1ScoresLevelPersist|TestFindEventLevelForCode' -count=1 2>&1 || true)
+CNT199=$((CNT199 + 1))
+grep_q 'ok  ' G199 || { echo "--- FAIL: §199 Go 行为腿未过：$(printf '%s\n' "$G199" | tail -8)"; B199_FAILED=1; }
+PY199=$( cd qmt_gateway && timeout 120 /usr/local/bin/python3 -m pytest tests/test_pregen_wiring_b_20261117.py -k news_propagation -q 2>&1 || true )
+CNT199=$((CNT199 + 1))
+grep_q 'passed' PY199 || { echo "--- FAIL: §199 pregen 烘值行为腿未过：$(printf '%s\n' "$PY199" | tail -6)"; B199_FAILED=1; }
+
+[ "$B199_FAILED" = "0" ] || exit 1
+echo "ok - §199 §20261117-D1-LEVEL 锁通过（schema列+迁移 + 打分带出 + 落库 + pregen三态烘值 + 反文本猜负锁 + Go/py行为腿，累计判定点 ${CNT199}）"
+echo ""

@@ -279,6 +279,41 @@ func TestD1ScoresUpsertAndQuery(t *testing.T) {
 	}
 }
 
+// §D1-LEVEL 2026-11-17：新闻级别随当日 D1 落库，pregen 据此烘 news_propagation。
+func TestD1ScoresLevelPersist(t *testing.T) {
+	db := testDB(t)
+	if err := db.UpsertD1Scores("2026-11-17", []D1ScoreRow{
+		{Code: "600547", Score: 30, Level: "个股"},
+		{Code: "600999", Score: 20, Level: "板块"},
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	q := func(code string) string {
+		var lv string
+		if err := db.db.QueryRow(`SELECT level FROM d1_scores WHERE date='2026-11-17' AND code=?`, code).Scan(&lv); err != nil {
+			t.Fatalf("query level %s: %v", code, err)
+		}
+		return lv
+	}
+	if q("600547") != "个股" || q("600999") != "板块" {
+		t.Fatalf("level 落库错误: 600547=%q 600999=%q", q("600547"), q("600999"))
+	}
+	// 同键覆盖：level 随新一轮更新（D1 日更，只记当天最新帧）。
+	if err := db.UpsertD1Scores("2026-11-17", []D1ScoreRow{{Code: "600547", Score: 31, Level: "宏观"}}); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if q("600547") != "宏观" {
+		t.Fatalf("覆盖后 level 未更新: %q", q("600547"))
+	}
+	// 缺省 level：显式空串入库（不伪造"个股"，让下游诚实弃权）。
+	if err := db.UpsertD1Scores("2026-11-17", []D1ScoreRow{{Code: "000001", Score: 5}}); err != nil {
+		t.Fatalf("upsert default: %v", err)
+	}
+	if q("000001") != "" {
+		t.Fatalf("缺省 level 应空串, got %q", q("000001"))
+	}
+}
+
 // TestTaskSameCauseBreaker §M14（2026-09-22）同因连败熔断（取代 §P1-11 异因混计上限）：
 //  1. 同一失败指纹连败达阈值 → failed_needs_attention 挂起终态，不再出队；
 //  2. 异因失败不误判同因——指纹每次不同则连败恒为 1，但 §QUEUE-REQUEUE（2026-10-12）

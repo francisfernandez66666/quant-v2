@@ -46,7 +46,8 @@ class PregenWiringB(unittest.TestCase):
             if "FROM fina_indicator" in s:
                 return [(0.5, 12.0, 12.0, 6.0, 30.0, 8.0, 40.0, 5.0)]
             if "FROM d1_scores" in s:
-                return [(35.0, "2026-11-16")]  # score, date
+                # §D1-LEVEL：带 level（个股级），测 news_propagation=False 烘值。
+                return [(35.0, "2026-11-16", "个股")]  # score, date, level
             if "FROM stk_limit" in s:
                 return [(11.0,)]
             if "FROM ths_limit_up_daily" in s:
@@ -117,17 +118,35 @@ class PregenWiringB(unittest.TestCase):
         # cannot tell "not a leader" from "no data".
         self.assertIs(out.get("is_leader"), False)
 
-    def test_news_propagation_stays_absent_not_fabricated(self):
-        # d1_scores has no Level column: we must NOT invent propagation from text.
+    def test_news_propagation_from_level_three_states(self):
+        # §D1-LEVEL 2026-11-17：propagation 由当日 D1 的 Level 烘出（Go adapter 同口径：
+        # 个股级=False、板块/宏观=True、Level 空=不烘→诚实弃权）。不靠 reason 文本猜。
         m = self.mod
         orig_q = m._q
-        m._q = self._fake_q()
-        try:
-            out = m.bake_bakeables("600206", {"hot_pool": {"bullish": {}}}, lu_boards={}, market={})
-        finally:
-            m._q = orig_q
-        self.assertNotIn("news_propagation", out,
-                         "propagation must stay absent (no Level source) -> good_news_fade declines honestly")
+        for level, expected, present in [
+            ("个股", False, True),
+            ("板块", True, True),
+            ("宏观", True, True),
+            ("", None, False),   # 旧行/未知 Level：不烘
+        ]:
+            def q(sql, args, _lv=level):
+                s = " ".join(sql.split())
+                if "FROM d1_scores" in s:
+                    return [(35.0, "2026-11-16", _lv)] if "level" in s else [(35.0, "2026-11-16")]
+                return self._fake_q()(sql, args)
+            m._q = q
+            try:
+                out = m.bake_bakeables("600206", {"hot_pool": {"bullish": {}}}, lu_boards={}, market={})
+            finally:
+                pass
+            if present:
+                self.assertIn("news_propagation", out, "Level=%r 应烘 propagation" % level)
+                self.assertIs(out["news_propagation"], expected,
+                              "Level=%r propagation 应为 %r" % (level, expected))
+            else:
+                self.assertNotIn("news_propagation", out,
+                                 "Level 空应不烘 propagation（诚实弃权，不猜）")
+        m._q = orig_q
 
     # §WIRING-B+ fetch_market_history：从权威落库表逐日聚合涨停/炸板/炸板率多日序列。
     def test_fetch_market_history_orders_old_to_new_and_ratio_math(self):

@@ -4824,7 +4824,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			if d.RetryPending {
 				continue
 			}
-			rows = append(rows, store.D1ScoreRow{Code: code, Score: d.Score, Blocked: d.Score < 0, Reason: d.Reason})
+			// §D1-LEVEL 2026-11-17：带出关联新闻级别，供 pregen 烘 news_propagation。
+			rows = append(rows, store.D1ScoreRow{Code: code, Score: d.Score, Blocked: d.Score < 0, Reason: d.Reason, Level: d.Level})
 		}
 		if err := e.d1Store.UpsertD1Scores(time.Now().Format("2006-01-02"), rows); err != nil {
 			log.Printf("[engine] D1 评分落库失败(不影响主流程): %v", err)
