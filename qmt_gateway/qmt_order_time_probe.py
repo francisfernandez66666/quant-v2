@@ -9,7 +9,9 @@
 # rows, verbatim, so the fix can be confirmed or corrected before the next bake.
 #
 # HARD SAFETY RULES:
-#   1. NO file IO, NO socket/http, NO database.
+#   1. NO socket/http, NO database. The ONLY file read allowed is the
+#      production config.bridge.json (same read-only config the live strategy
+#      loads every round) -- v3 account fallback. No file writes.
 #   2. NO trading calls: never passorder / cancel. READ ONLY.
 #   3. get_trade_detail_data("ORDER") is the same read the live strategy makes
 #      every round (_counter_rows) -- one call, wrapped, then silent forever.
@@ -21,7 +23,7 @@
 #      once, then sleeps.
 #   3. Paste ALL ORD_* lines back, then STOP this probe strategy.
 
-PROBE_BUILD = "2026-11-17-order-time-v2-3arg"
+PROBE_BUILD = "2026-11-17-order-time-v3-cfgacct"
 _done = False
 
 # Candidate time fields, verbatim from the stale-cancel fix and its alternatives.
@@ -33,6 +35,8 @@ TIME_FIELDS = ("m_strInsertDate", "m_strInsertTime", "m_nOrderTime",
 # what the bridge production code documents. v2 resolves the account the same
 # way the bridge does (get_account over type ladder), then drives a bounded
 # (acct, accttype, TABLE-casing) ladder. Still one-shot, still read-only.
+# v3 (21:45 paste-back): get_account ladder empty on this build -> fallback to
+# the SAME cfg file the live strategy reads (config.bridge.json "account").
 # (v2 note above). Identity fields so the owner can see WHICH order each row is.
 ID_FIELDS = ("m_strOrderSysID", "m_strInstrumentID", "m_strOrderRemark",
              "m_nOrderStatus", "order_id", "stock_code", "order_status")
@@ -83,6 +87,27 @@ def handlebar(ContextInfo):
                 acct = a
                 break
     print("ORD_ACCT resolved=%s" % _desc(acct))
+    if not acct:
+        # v3 fallback (owner 21:45 paste-back: get_account ladder empty on this
+        # build): same source the live strategy uses -- config.bridge.json
+        # "account" (bridge _read_cfg). Read-only JSON, production parity.
+        try:
+            import json
+            import os
+            cand = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "config.bridge.json")
+            probe_dir = "C:\\qmt"
+            if not os.path.isfile(cand):
+                cand = os.path.join(probe_dir, "config.bridge.json")
+            if not os.path.isfile(cand):
+                cand = os.path.join(probe_dir, "quant-trading-v2", "qmt_gateway",
+                                    "config.bridge.json")
+            with open(cand, "rb") as fh:
+                cfg = json.loads(fh.read().decode("utf-8-sig", "replace"))
+            acct = str(cfg.get("account", "") or "")
+            print("ORD_ACCT_CFG file=%s acct=%s" % (s(cand), acct))
+        except Exception as exc:  # noqa: BLE001 - fallback failure is a result
+            print("ORD_ACCT_CFG_ERR %s" % repr(exc)[:140])
     if not acct:
         print("ORD_NOACCT get_account ladder empty -- cannot form 3-arg call")
         print("ORD_DONE paste_all_ORD_lines_back")
