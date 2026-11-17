@@ -22974,3 +22974,59 @@ grep_q 'ok  	quant-trading-v2/internal/engine' G195 || { echo "--- FAIL: §195 W
 [ "$B195_FAILED" = "0" ] || exit 1
 echo "ok - §195 §20261117-WIRING-D 锁通过（外脑建议链删残留早退 + 执行三层闸负/正锁 + disabled/enabled 双行为锁真跑，累计判定点 ${CNT195}）"
 echo ""
+
+# §196 §20261117-STALE-CANCEL-FIX（盒子长期不成交单不自动撤：order_time 读错柜台字段）。
+# owner 报（2026-11-17 实盘）：下午挂的未成交单盘中不自动撤、卡资金。根因：内置策略 cancel_leg 算账龄读
+# m_nOrderTime（本柜台不填）→ order_time None → stale 永不成立 → 只有 14:50 清扫会撤。修法：_order_submit_epoch
+# 把柜台 m_strInsertTime 字符串用纯算术折成 epoch（沙箱禁 datetime 构造/fromisoformat）；撤单后可重发
+# （counter_codes 摘掉 cancel_like 行 + 撤成功清 _STATE["sent"]）；超时 900→600s；买卖都撤（cancel_leg 不分向）。
+echo "==> 196 §20261117-STALE-CANCEL-FIX（撤单账龄可算 + 撤后可重发 + 超时 600 + 行为腿）..."
+B196_FAILED=0
+fail196() {
+	echo "--- FAIL: §196 $*"
+	FAIL=1
+	B196_FAILED=1
+}
+CNT196=0
+ST196=qmt_gateway/qmt_internal_strategy.py
+
+# ① 正锁：撤单账龄来源必须走 _order_submit_epoch（不再是裸 m_nOrderTime 直接当 order_time）。
+CNT196=$((CNT196 + 1))
+grep -qE 'def _order_submit_epoch\(item\)' "$ST196" || fail196 "缺 _order_submit_epoch（账龄来源函数）"
+CNT196=$((CNT196 + 1))
+grep -qF '"order_time": _order_submit_epoch(item)' "$ST196" || fail196 "_live_orders order_time 未接 _order_submit_epoch"
+
+# ② 负锁：旧的"把 m_nOrderTime 直接当 order_time"那行不许回潮（这正是永远读不到、stale 永不成立的形状）。
+CNT196=$((CNT196 + 1))
+if grep -qF '"order_time": _pick(getattr(item, "m_nOrderTime"' "$ST196"; then
+	fail196 "order_time 退回裸 m_nOrderTime 赋值（本柜台不填→盘中不自动撤，owner 报的根因）"
+fi
+
+# ③ 沙箱纪律：不得用 fromisoformat/strptime/datetime 构造取 epoch（g2 只许 datetime.now）——用纯算术。
+CNT196=$((CNT196 + 1))
+PB196="$(awk '/^def _order_submit_epoch\(/{f=1} f{print} f&&/^}$/{exit}' "$ST196")"
+if grep_q 'fromisoformat(' PB196 F || grep_q 'strptime(' PB196 F || grep_q 'datetime(' PB196 F; then
+	fail196 "_order_submit_epoch 用了沙箱禁用法（fromisoformat/strptime/datetime 构造）"
+fi
+
+# ④ 撤后可重发（owner 裁决）：counter_codes 只摘 cancel_like 行；撤成功清 _STATE["sent"]。
+CNT196=$((CNT196 + 1))
+grep -qF 'if not row.get("cancel_like"))' "$ST196" || fail196 "counter_codes 未对 cancel_like 放行撤后重发"
+CNT196=$((CNT196 + 1))
+grep -qF '_STATE["sent"].discard((day, row.get("symbol"), row.get("short_code")))' "$ST196" || fail196 "撤成功未清当日 sent 留痕（撤后仍不能重发）"
+
+# ⑤ 超时参数 owner 令 900→600（params 单点 + 载体兜底同源一致）。
+CNT196=$((CNT196 + 1))
+VAL196="$(/usr/local/bin/python3 -c "import json;print(json.load(open('qmt_gateway/local_executor_params.json'))['params'].get('stale_order_sec'))" 2>/dev/null || true)"
+[ "${VAL196:-}" = "600" ] || fail196 "baked stale_order_sec 应为 600，实为 ${VAL196:-none}"
+CNT196=$((CNT196 + 1))
+grep -qE "'stale_order_sec': 600" qmt_gateway/local_executor.py || fail196 "载体兜底 stale_order_sec 未同步 600（漂成两值）"
+
+# ⑥ 行为腿真跑：StaleCancelFix20261117（string→epoch / epoch passthrough / 缺值 None 不误撤）。
+G196=$( cd qmt_gateway && timeout 120 /usr/local/bin/python3 -m pytest tests/test_wiring_selfcontained_20261117.py -k StaleCancelFix20261117 2>&1 || true )
+CNT196=$((CNT196 + 1))
+grep_q 'passed' G196 || { echo "--- FAIL: §196 行为腿未过：$(printf '%s\n' "$G196" | tail -6)"; B196_FAILED=1; }
+
+[ "$B196_FAILED" = "0" ] || exit 1
+echo "ok - §196 §20261117-STALE-CANCEL-FIX 锁通过（账龄走 _order_submit_epoch + 旧裸字段负锁 + 沙箱纯算术 + 撤后可重发两锁 + 超时 600 + 行为腿，累计判定点 ${CNT196}）"
+echo ""

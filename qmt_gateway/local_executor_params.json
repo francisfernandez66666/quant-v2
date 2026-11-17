@@ -77,7 +77,7 @@
       "stop_loss": "SL",
       "take_profit": "TP"
     },
-    "stale_order_sec": 900,
+    "stale_order_sec": 600,
     "stop_loss_ratio": 0.97,
     "symbol_head_len": 6,
     "symbols": [
@@ -1596,7 +1596,7 @@
     "t_st_markers": [
       "ST"
     ],
-    "t_stale_order_sec": 900,
+    "t_stale_order_sec": 600,
     "t_terminal_status_codes": [
       "\u5df2\u5e9f",
       "\u5df2\u6210",

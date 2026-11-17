@@ -309,6 +309,55 @@ def _pick(*values):
     return None
 
 
+def _digits(value):
+    """Keep only ASCII digits of a string (no regex, sandbox-allowed)."""
+    return "".join(ch for ch in str(value) if ch.isdigit())
+
+
+def _order_submit_epoch(item):
+    """Submit time of one order as epoch SECONDS, or None (unknown => never stale).
+
+    STALE-CANCEL-FIX (owner report 2026-11-17). The counter exposes the submit
+    stamp as m_strInsertDate + m_strInsertTime STRINGS (the bridge reads exactly
+    this pair -- see qmt_bridge_strategy.embed_orders). The old sandbox code read
+    `m_nOrderTime`/`order_time` and float()'d it; this counter never fills that,
+    so order_time stayed None -> age stayed None -> the stale test never fired ->
+    unfilled buy/sell orders were only ever cleared by the 14:50 close sweep,
+    pinning capital all afternoon (the log shows cancelled=[] on EVERY round).
+
+    The sandbox cannot construct a datetime from parts (g2 allows only
+    datetime.now), so we build the epoch with pure arithmetic against this
+    round's clock: today's Beijing-midnight epoch = now - seconds_of_day(now),
+    then add the order's own seconds-of-day. Orders are intraday by the session
+    gate, so they share today's date with now -- the result is a correct epoch
+    that both cancel_leg and rules_t (now_ts - order_time) consume unchanged. If
+    the build hands an epoch-like m_nOrderTime (>1e9) we use it directly.
+    Unparseable -> None: unknown age is never guessed "old enough" (fail-safe --
+    we may under-cancel but never wrongly cancel a live order).
+    """
+    n = _pick(getattr(item, "m_nOrderTime", None), getattr(item, "order_time", None))
+    try:
+        nf = float(n) if n is not None else 0.0
+    except (TypeError, ValueError):
+        nf = 0.0
+    if nf > 1000000000.0:  # already epoch seconds on this counter build
+        return nf
+    t = _digits(_pick(getattr(item, "m_strInsertTime", None), "") or "")
+    if len(t) < 4:
+        return None  # no usable submit clock -> unknown age -> never stale
+    try:
+        hh = int(t[0:2])
+        mi = int(t[2:4])
+        ss = int(t[4:6]) if len(t) >= 6 else 0
+    except (ValueError, TypeError):
+        return None
+    order_sod = hh * 3600 + mi * 60 + ss  # seconds of day (Beijing wall clock)
+    now = _now_ts()
+    now_sod = (now + 28800.0) % 86400.0
+    midnight = now - now_sod
+    return midnight + float(order_sod)
+
+
 def _live_orders():
     """Today's OWN live orders, normalised -> (rows, ok).
 
@@ -339,7 +388,8 @@ def _live_orders():
             "qty": _to_float(_pick(getattr(item, "m_nOrderVolume", None), getattr(item, "order_volume", None)), 0.0),
             "traded": _to_float(_pick(getattr(item, "m_nTradedVolume", None), getattr(item, "traded_volume", None)), 0.0),
             "price": _to_float(_pick(getattr(item, "m_dLimitPrice", None), getattr(item, "price", None)), 0.0),
-            "order_time": _pick(getattr(item, "m_nOrderTime", None), getattr(item, "order_time", None)),
+            "order_time": _order_submit_epoch(item),
+            "cancel_like": bool(terminal and _to_float(_pick(getattr(item, "m_nTradedVolume", None), getattr(item, "traded_volume", None)), 0.0) <= 0.0),
         })
     return out, True
 
@@ -1782,7 +1832,12 @@ def run_round(ContextInfo, moment):
         summary["reason"] = "counter_order_table_unreadable"
         _warn_once("order_table", summary["reason"])
         return summary
-    counter_codes = set(row["short_code"] for row in orders)
+    # owner ruling (2026-11-17) "re-place allowed after a cancel": drop only the
+    # rows that were cancelled WITHOUT filling (cancel_like) from the same-day
+    # block set. A code with an OPEN (non-terminal/unknown) row or any FILLED row
+    # stays blocked exactly as before -- re-place is opened only for a cancelled,
+    # unfilled order, never to re-buy a position that actually traded today.
+    counter_codes = set(row["short_code"] for row in orders if not row.get("cancel_like"))
     positions = _positions()
     # P0-A (2026-11-17): whole-market subscribe ran in init; for builds where only
     # per-symbol works, subscribe the held names here (once/day) so the sell legs
@@ -2176,6 +2231,7 @@ def cancel_leg(orders, moment):
     stale_sec = float(PARAMS.get("stale_order_sec"))
     done = []
     now = _now_ts()
+    day = day_key(moment)
     for row in orders:
         oid = row.get("order_id") or ""
         if not oid or oid in _STATE["cancel_tried"]:
@@ -2200,6 +2256,13 @@ def cancel_leg(orders, moment):
         if ok:
             _STATE["cancel_tried"].append(oid)
             done.append(oid)
+            # owner ruling (2026-11-17) "re-place allowed after a cancel": drop
+            # this order's same-day "sent" journal entry so the next round's
+            # signal for the same code may re-place. The cancel leg only touches
+            # non-terminal rows, so a row that actually traded is never cancelled
+            # and its journal stays -- this frees only a placed-then-cancelled,
+            # unfilled intent.
+            _STATE["sent"].discard((day, row.get("symbol"), row.get("short_code")))
         else:
             _log("cancel failed id=%s: %s" % (ascii(oid), why))
     return done

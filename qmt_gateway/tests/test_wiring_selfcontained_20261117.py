@@ -141,5 +141,68 @@ class WiringLocks20261117(unittest.TestCase):
         self.assertIn('getattr(ContextInfo, "subscribe_whole_quote"', text)
 
 
+class StaleCancelFix20261117(unittest.TestCase):
+    """STALE-CANCEL-FIX: the box could never compute order age, so unfilled orders
+    were only ever cleared by the 14:50 close sweep (owner report; log showed
+    cancelled=[] every round). The fix lives in _order_submit_epoch turning the
+    counter's m_strInsertTime into a usable epoch. Each input shape is pinned."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _build_and_load()
+
+    class _Item:
+        pass
+
+    def _epoch_at(self, insert_time, now_ts):
+        m = self.mod
+        item = StaleCancelFix20261117._Item()
+        item.m_strInsertTime = insert_time
+        orig = m._now_ts
+        m._now_ts = lambda: now_ts
+        try:
+            return m._order_submit_epoch(item)
+        finally:
+            m._now_ts = orig
+
+    def test_string_insert_time_yields_computable_age(self):
+        # an order stamped 13:05:00, round clock at 13:20:00 (Beijing) -> age 900s.
+        # now_ts = today Beijing 13:20:00 epoch; build it as midnight + 13h20m.
+        sod = lambda h, mi, s: h * 3600 + mi * 60 + s
+        midnight = 1763000000 - ((1763000000 + 28800) % 86400)  # today's BJ midnight epoch
+        now = midnight + sod(13, 20, 0)
+        epoch = self._epoch_at("13:05:00", now)
+        self.assertIsNotNone(epoch, "string time must yield an epoch, not None")
+        self.assertAlmostEqual(now - epoch, 900.0, places=2)
+        self.assertGreaterEqual(now - epoch, 600.0, "old enough => stale fires (>=stale_order_sec)")
+
+    def test_epoch_like_mnordertime_used_directly(self):
+        m = self.mod
+        item = StaleCancelFix20261117._Item()
+        item.m_nOrderTime = 1763000000
+        item.m_strInsertTime = ""
+        orig = m._now_ts
+        m._now_ts = lambda: 1763006000
+        try:
+            self.assertEqual(m._order_submit_epoch(item), 1763000000)
+        finally:
+            m._now_ts = orig
+
+    def test_unparseable_time_is_none_never_wrongly_old(self):
+        # fail-safe: no clock => None => age unknown => stale must NOT fire (never
+        # wrongly cancel). This is the direction that protects live orders.
+        self.assertIsNone(self._epoch_at("", 1763000000))
+        self.assertIsNone(self._epoch_at("xx:yy", 1763000000))
+
+    def test_counter_codes_treats_cancelled_unfilled_as_replayable(self):
+        # the sandbox build must filter cancel_like rows out of the same-day block
+        # set (owner "re-place after cancel") while keeping open/filled blocked.
+        text = open(self.mod.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn('if not row.get("cancel_like"))', text,
+                      "counter_codes must drop only cancel-and-unfilled rows")
+        self.assertIn('order_time": _order_submit_epoch', text,
+                      "_live_orders must parse order time, not float a missing field")
+
+
 if __name__ == "__main__":
     unittest.main()
