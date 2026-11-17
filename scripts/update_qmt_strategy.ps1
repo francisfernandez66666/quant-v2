@@ -79,7 +79,11 @@ Write-Output "STRATEGY_UPDATE_ENTERED param_ok=1"
 
 $ErrorActionPreference = "Stop"
 
-function Say($line) { Write-Host $line }
+# P1-1 (2026-11-17): a host-console write is invisible to
+# subprocess(capture_output=True), so carrier_updater saw rc=0 with no RESULT anchor
+# and reported a false "updater_rc_0" failure even though the file had landed.
+# Write-Output puts every STRATEGY_UPDATE_* anchor on stdout where the updater reads it.
+function Say($line) { Write-Output $line }
 function Abort($step, $reason) {
     Say ("STRATEGY_UPDATE_RESULT=ABORT step={0} reason={1}" -f $step, $reason)
     exit 2

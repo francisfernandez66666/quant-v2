@@ -22527,6 +22527,14 @@ grep -qF '_subscribe_market(ContextInfo)' qmt_gateway/qmt_internal_strategy.py \
 CNT191=$((CNT191 + 1))
 grep -qF 'api=' qmt_gateway/qmt_internal_strategy.py \
 	|| fail191 "订阅结果未打 api= 三态锚（tried=[] 分不清没跑/没成的盲区会再藏起来）"
+# P0-B2 (2026-11-17): init 交付回执订阅_api= 必须在册——远程读首屏日志即可判
+# 这一版订没订上，不靠 subscribe_market 行间接推断。
+CNT191=$((CNT191 + 1))
+grep -qF 'subscribe_api=%s' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "init 缺 subscribe_api= 交付回执（P0-B2：远程无法直判这版订没订上）"
+CNT191=$((CNT191 + 1))
+grep -qF 'sub_api = _subscribe_market(ContextInfo)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail191 "init 未接住 _subscribe_market 返回值（回执会恒占位、不反映真实 api 态）"
 # 行为腿：订到价才出 stop_loss 信号（同时证伪阈值有问题与订阅没问题两说）
 SUB191=$( cd qmt_gateway && python3 -m pytest tests/test_wiring_selfcontained_20261117.py -k "stop_loss or subscribe_fns_present" 2>&1 || true )
 CNT191=$((CNT191 + 1))
@@ -22965,14 +22973,18 @@ grep -qF 'func TestDisabledBrainAdviceRunsButPlacesNoOrders' internal/engine/wir
 CNT195=$((CNT195 + 1))
 grep -qF 'func TestEnabledBrainAdvicePlacesOrders' internal/engine/wiring_d_20261117_test.go \
 	|| fail195 "缺 enabled→下单 反证锁（恒绿用例防线）"
+# 通路完整性（owner 口径「直接引用外脑侧报警」）：通知腿在 disabled 下也必须推 P1。
+CNT195=$((CNT195 + 1))
+grep -qF 'func TestDisabledBrainStopLossAdviceStillPushesP1' internal/engine/wiring_d_20261117_test.go \
+	|| fail195 "缺 外脑止损建议→P1推送 通路锁（原两枚只锁执行腿、没锁通知腿）"
 
-# ④ 行为腿真跑：disabled 下拿到止损/止盈一笔不发；enabled 下确实发（两枚都绿才算这条接线成立）。
-G195=$(timeout 120 go test ./internal/engine/ -run 'TestDisabledBrainAdviceRunsButPlacesNoOrders|TestEnabledBrainAdvicePlacesOrders' -count=1 2>&1 || true)
+# ④ 行为腿真跑：disabled 下拿到止损/止盈一笔不发但照样推 P1；enabled 下确实发（三枚都绿）。
+G195=$(timeout 120 go test ./internal/engine/ -run 'TestDisabledBrainAdviceRunsButPlacesNoOrders|TestEnabledBrainAdvicePlacesOrders|TestDisabledBrainStopLossAdviceStillPushesP1' -count=1 2>&1 || true)
 CNT195=$((CNT195 + 1))
 grep_q 'ok  	quant-trading-v2/internal/engine' G195 || { echo "--- FAIL: §195 WIRING-D 行为腿未过：$(printf '%s\n' "$G195" | tail -6)"; B195_FAILED=1; }
 
 [ "$B195_FAILED" = "0" ] || exit 1
-echo "ok - §195 §20261117-WIRING-D 锁通过（外脑建议链删残留早退 + 执行三层闸负/正锁 + disabled/enabled 双行为锁真跑，累计判定点 ${CNT195}）"
+echo "ok - §195 §20261117-WIRING-D 锁通过（外脑建议链删残留早退 + 执行三层闸负/正锁 + disabled/enabled 双行为锁 + disabled→P1推送通路锁真跑，累计判定点 ${CNT195}）"
 echo ""
 
 # §196 §20261117-STALE-CANCEL-FIX（盒子长期不成交单不自动撤：order_time 读错柜台字段）。
@@ -23110,4 +23122,38 @@ grep_q 'passed' G197 || { echo "--- FAIL: §197 行为腿未过：$(printf '%s\n
 
 [ "$B197_FAILED" = "0" ] || exit 1
 echo "ok - §197 §20261117-T-EQUITY-FALLBACK 锁通过（柜台优先 + 新鲜烘参回退 + 陈旧/缺龄负锁 + 主腿隔离 + 云端烘参 + 行为腿，累计判定点 ${CNT197}）"
+echo ""
+
+# §198 §20261117-WIRING-COMPLETENESS（施工图 §11.4：build_context 必须装配全部
+# live 战法/因子 input）。§195 已被 WIRING-D 占用，故完备性锁另起 §198。
+# 契约 = 经核对的 live 战法 input 白名单（非"所有规则读的键"——后者含运行时注入键会误报）。
+echo "==> 198 §20261117-WIRING-COMPLETENESS（build_context ⊇ live 战法 input 契约 + 反摆设 + 行为腿）..."
+B198_FAILED=0
+fail198() {
+	echo "--- FAIL: §198 $*"
+	FAIL=1
+	B198_FAILED=1
+}
+CNT198=0
+WC198=qmt_gateway/tests/test_wiring_completeness_20261117.py
+
+# ① 契约文件在册 + 契约白名单非空（防清空白名单让锁恒绿）。
+CNT198=$((CNT198 + 1))
+[ -f "$WC198" ] || fail198 "缺接线完备性契约用例文件"
+CNT198=$((CNT198 + 1))
+grep -qE 'LIVE_TACTIC_CTX_INPUTS = \{' "$WC198" || fail198 "契约白名单常量缺失"
+CNT198=$((CNT198 + 1))
+grep -qE 'assertGreaterEqual\(len\(LIVE_TACTIC_CTX_INPUTS\), 30' "$WC198" \
+	|| fail198 "缺反摆设锁（契约可被清空让完备性检查恒绿）"
+CNT198=$((CNT198 + 1))
+grep -qF 'LIVE_TACTIC_CTX_INPUTS - self.bc_keys' "$WC198" \
+	|| fail198 "完备性差集判定缺失（不检查 build_context 是否覆盖契约）"
+
+# ② 行为腿真跑：两枚契约用例（覆盖 + 反摆设）。
+G198=$( cd qmt_gateway && timeout 120 /usr/local/bin/python3 -m pytest tests/test_wiring_completeness_20261117.py -q 2>&1 || true )
+CNT198=$((CNT198 + 1))
+grep_q '2 passed' G198 || { echo "--- FAIL: §198 完备性行为腿未过：$(printf '%s\n' "$G198" | tail -6)"; B198_FAILED=1; }
+
+[ "$B198_FAILED" = "0" ] || exit 1
+echo "ok - §198 §20261117-WIRING-COMPLETENESS 锁通过（契约白名单在册 + 反摆设 + 差集判定 + build_context 覆盖行为腿，累计判定点 ${CNT198}）"
 echo ""

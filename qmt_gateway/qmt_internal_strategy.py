@@ -895,7 +895,7 @@ def _subscribe_market(ContextInfo):
     tried = []
     if api == "absent":
         _log("subscribe_market tried=[] api=absent per_symbol=0/0")
-        return
+        return "absent"
     if callable(whole):
         # W1: pass both markets at once (the common 2.x shape).
         try:
@@ -914,6 +914,7 @@ def _subscribe_market(ContextInfo):
     # error means every attempted shape raised (subscribe genuinely unavailable).
     api_state = "error" if any("err:" in t for t in tried) and not _any_ok(tried) else api
     _log("subscribe_market tried=[%s] api=%s" % (",".join(tried), api_state))
+    return api_state
 
 
 def _any_ok(tried):
@@ -2340,7 +2341,14 @@ def init(ContextInfo):
     # whole-market (one call, covers the whole pool regardless of re-bakes)
     # with a per-symbol fallback; log the outcome so a silent empty return
     # cannot hide again.
-    _subscribe_market(ContextInfo)
+    # P0-B2 (2026-11-17): init delivery receipt. The subscribe_market line above
+    # names the api state, but a single grep of the init block must tell us
+    # whether THIS shipped build can subscribe at all -- put it beside the
+    # counter_api line so a remote read of the first log lines is conclusive.
+    sub_api = _subscribe_market(ContextInfo)
+    _per_callable = callable(_subscribe_fns(ContextInfo)[1])
+    _log("subscribe_api=%s per_symbol=%s" % (
+        sub_api, "present" if _per_callable else "absent"))
     _download_day_bars(ContextInfo)
 
 

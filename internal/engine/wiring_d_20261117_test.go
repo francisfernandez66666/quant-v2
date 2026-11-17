@@ -18,8 +18,11 @@ package engine
 
 import (
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
@@ -49,6 +52,30 @@ func TestDisabledBrainAdviceRunsButPlacesNoOrders(t *testing.T) {
 	})
 	if len(*orders) != 0 {
 		t.Fatalf("外脑(enabled=false)绝不可替盒子下单, got %d 笔: %+v", len(*orders), *orders)
+	}
+}
+
+// §WIRING-D 通路完整性（owner 口径「直接引用外脑侧报警」）：外脑态不新增告警，
+// 而是复用云端既有的 P1 强提醒。pushRealAdvice 里通知腿 syncTradeLevelAlerts 位于
+// autoExecuteRealSellsRound 的执行闸之后且**不受 enabled 控制**——所以 disabled 时
+// 只要 Advise 出了止损/止盈建议，就必须能从 notifier 推出 LevelHigh。
+// 本用例钉死这段出口"建议→消息中心+P1推送"是通的（D 组原两枚只锁了执行腿，没锁通知腿）。
+func TestDisabledBrainStopLossAdviceStillPushesP1(t *testing.T) {
+	e := &Engine{msgStore: data.NewMessageStore(""), notifier: notify.New()}
+	ch := e.notifier.RegisterWS("wiring_d")
+	defer e.notifier.UnregisterWS("wiring_d")
+	advices := []trading.PositionAdvice{
+		{Code: "600000", TsCode: "600000.SH", Action: "止损", Level: "高", RefPrice: 8.8,
+			Reason: "统一纪律止损", GeneratedAt: time.Now()},
+	}
+	e.syncTradeLevelAlerts("", advices) // 与 pushRealAdvice disabled 分支同一出口
+	select {
+	case m := <-ch:
+		if m.Level != notify.LevelHigh {
+			t.Fatalf("外脑止损建议应推 P1(LevelHigh), got %+v", m)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("外脑止损建议未推 P1：syncTradeLevelAlerts→pushCriticalAlerts 通路断了")
 	}
 }
 

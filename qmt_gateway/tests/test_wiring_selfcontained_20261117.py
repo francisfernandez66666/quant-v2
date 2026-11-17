@@ -94,6 +94,19 @@ class WiringLocks20261117(unittest.TestCase):
         # the list-market ladder must have actually been invoked
         self.assertTrue(ci.whole_calls, "whole_quote never called -> the empty-wiring bug is back")
 
+    # ---- P0-B2 (2026-11-17): init delivery receipt tells us if a build subscribed ----
+    def test_subscribe_market_returns_api_state_for_init_receipt(self):
+        present = self.mod._subscribe_market(_FakeContextInfo(with_subscribe=True, whole_mode="list"))
+        absent = self.mod._subscribe_market(_FakeContextInfo(with_subscribe=False))
+        self.assertIn(present, ("present", "error"), "present build must report a real api state")
+        self.assertEqual(absent, "absent", "absent build must report absent, not silent None")
+
+    def test_init_carries_subscribe_api_receipt(self):
+        text = open(self.mod.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("subscribe_api=%s", text, "init must print a subscribe_api receipt")
+        self.assertIn("sub_api = _subscribe_market(ContextInfo)", text,
+                      "init must consume the api state returned by _subscribe_market")
+
     # ---- C1: news_event composed into the dict good_news_fade needs ----
     def test_news_event_obj_builds_dict_from_score_plus_extras(self):
         obj = self.mod._news_event_obj

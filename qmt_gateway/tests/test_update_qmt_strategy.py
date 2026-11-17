@@ -158,5 +158,23 @@ class UpdateQmtStrategyTest(unittest.TestCase):
         self.assertIn("stop-process", lowered, "客户端没有先停就投新策略＝旧代码还在跑")
 
 
+class DeliveryAnchorStaticTest(unittest.TestCase):
+    """P1-1 (2026-11-17): delivery anchors must reach stdout, not the host console.
+
+    Static so it runs even without pwsh (the pwsh behaviour class above skips
+    on this box). Write-Host writes the host console -- invisible to
+    subprocess(capture_output=True) -- so carrier_updater saw rc=0 with no
+    STRATEGY_UPDATE_RESULT and reported a false updater_rc_0 failure even when
+    the file had landed.
+    """
+
+    def test_result_anchors_go_to_stdout_not_the_host(self):
+        body = open(SCRIPT, encoding="utf-8").read()
+        self.assertIn("function Say($line) { Write-Output $line }", body,
+                      "Say 必须用 Write-Output，否则投递结果锚进不了 stdout")
+        self.assertNotIn("Write-Host", body,
+                         "脚本里任何 Write-Host 都会把投递锚从 stdout 吞掉（P1-1 假红根因）")
+
+
 if __name__ == "__main__":
     unittest.main()
