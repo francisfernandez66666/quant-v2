@@ -65,6 +65,10 @@ import time
 
 LOG = logging.getLogger("qmt_gateway.local_executor")
 
+# P1-2 (2026-11-17): last wall-clock hour in which the bridge/opt-out cutover
+# notice was printed, so a 5-minute restart cadence cannot flood the log.
+_CUTOVER_WARN_HOUR = -1
+
 # ==== BAKED PARAMS BEGIN ====
 STRATEGY_VERSION = "v16-20261111"
 PARAMS = {
@@ -406,7 +410,7 @@ PARAMS = {
     'risk_list_static': ['000520.SZ'],
     'rule_arm': {'break_down': 'live', 'double_bump': 'shadow', 'dragon': 'live', 'dragon_return': 'shadow', 'factor_composite': 'live', 'good_news_fade': 'live', 'high_churn': 'live', 'leader_decay': 'live', 'leader_decay_v2': 'live', 'pattern_template': 'shadow'},
     'rule_side': 'sell',
-    'scalar_bands': {'NewsEvent': {'min': 30, 'max': 101}, 'ConceptHeat': {'min': 0.6, 'max': 1.01}},
+    'scalar_bands': {'NewsEvent': {'min': 30, 'max': 101}, 'ConceptHeat': {'min': 0.6, 'max': 1.01}, 'lu_board': {'min': 2, 'max': 100}, 'lu_board3': {'min': 3, 'max': 100}, 'lu_early_seal': {'min': 0, 'max': 600}},
     'scale_cap': 1.15,
     'scale_floor': 0.15,
     'score_domain': {'divisor': 2, 'floor': 0, 'full': 100, 'shift': 1},
@@ -2905,10 +2909,21 @@ def main(argv=None):
     # a box that is deliberately still running the bridge leg.
     mode = execution_mode_from(args.execution_mode_file)
     if mode != "local":
-        LOG.warning("[cutover] execution_mode=%s: the QMT bridge is the live order leg; "
-                    "this process will NOT place orders (two legs would double-spend). "
-                    "Run switch_execution_mode.ps1 -Mode local -Apply -AckBridgeStopped "
-                    "to cut over, or pass no --execution-mode-file for a hand-run round.", mode)
+        # P1-2 (2026-11-17): the old wording called "bridge" the live leg, but the
+        # file bridge was retired on 11-05 -- an operator could read it as a live
+        # second leg and waste an incident chasing a ghost. The IN-CLIENT strategy
+        # is the only live order leg; say so, and point at the two log anchors that
+        # prove health. Rate-limit to one line per wall-clock hour: a fresh process
+        # every 5 minutes must not train a real alert into noise.
+        global _CUTOVER_WARN_HOUR
+        hour_bucket = int(time.time() // 3600)
+        if hour_bucket != _CUTOVER_WARN_HOUR:
+            _CUTOVER_WARN_HOUR = hour_bucket
+            LOG.warning("[cutover] execution_mode=%s: the IN-CLIENT strategy is the live "
+                        "order leg (old file bridge is retired); this process will NOT place "
+                        "orders. Check the QMT log for 'subscribe_market'/'sell_blind' before "
+                        "assuming that leg is healthy. Cut over with switch_execution_mode.ps1 "
+                        "only after the in-client leg is proven stopped.", mode)
         return 4
     data = XtDataSource()
     broker = build_broker(params, args.account)

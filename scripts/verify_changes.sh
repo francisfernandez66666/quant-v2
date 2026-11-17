@@ -17873,7 +17873,7 @@ N144=$(grep -cE 'strict(All)?Perm(s)?Middleware\(auth\.PermTradingAdmin|strictAn
 # 它能让别人家里的物理机换掉正在跑的策略文件并重启，所以按 trading_admin 而不是 quant_trade；
 # 同一批的 manifest/ack 两条走 qmtReportMiddleware（盒子那把钥匙），不在这条计数里。
 # 28 -> 29（§20261113-LEDGER-TOPN：GET /api/qmt/trade-results 台账读面入账；2026-11-14 复核实读）
-[ "$N144" -eq 30 ] || fail144 "trading_admin 严格路由应为 30，实得 $N144（2026-11-17 §WIRING-C 强制刷新实盘账 POST /api/qmt/carrier/force-report 入账 29→30）"
+[ "$N144" -eq 30 ] || fail144 "trading_admin 严格路由应为 30，实得 ${N144}（2026-11-17 §WIRING-C 强制刷新实盘账 POST /api/qmt/carrier/force-report 入账 29→30）"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server.go || true)
 [ "$N144" -eq 14 ] || fail144 "user_admin 严格路由应为 14，实得 $N144"
@@ -21839,7 +21839,7 @@ CNT190=$((CNT190 + 1))
 test -n "$ASM190_LOCKSEG" || fail190 "assembleRegime 临界区段提取失败（RLock/RUnlock 缺失？）"
 for PAT190 in 'e.emotionConfigured(' 'e.enhanceFlag(' 'e.SignalCtl(' 'e.QMTController(' 'e.primaryMember('; do
 	CNT190=$((CNT190 + 1))
-	test "$(printf '%s\n' "$ASM190_LOCKSEG" | grep -cF "$PAT190")" = "0" || fail190 "assembleRegime 临界区内出现嵌套 e.mu 调用：$PAT190（递归读者撞 writer-pending 会再死锁）"
+	test "$(printf '%s\n' "$ASM190_LOCKSEG" | grep -cF "$PAT190")" = "0" || fail190 "assembleRegime 临界区内出现嵌套 e.mu 调用：${PAT190}（递归读者撞 writer-pending 会再死锁）"
 done
 # 判定 7：三个开关读数必须在 RUnlock 之后求值（解锁后求值行不许被搬回锁内）
 CNT190=$((CNT190 + 1))
@@ -23297,7 +23297,7 @@ CNT201=0
 # ① afternoon_reseal 机内自算函数族 + build_context 接入。
 for _fn201 in _minute_bars_payload _instrument_up_stop _bar_times _is_after_1430 _afternoon_reseal_from _afternoon_reseal; do
 	CNT201=$((CNT201 + 1))
-	grep -qF "def $_fn201(" qmt_gateway/qmt_internal_strategy.py || fail201 "缺 $_fn201（afternoon_reseal 自算链断）"
+	grep -qF "def $_fn201(" qmt_gateway/qmt_internal_strategy.py || fail201 "缺 ${_fn201}（afternoon_reseal 自算链断）"
 done
 CNT201=$((CNT201 + 1))
 grep -qF '"afternoon_reseal": reseal' qmt_gateway/qmt_internal_strategy.py || fail201 "build_context 未用机内自算值（仍读旧 precalc）"
@@ -23331,4 +23331,64 @@ grep_q '8 passed' PY201B || { echo "--- FAIL: §201 云端烘行为腿未跑满8
 
 [ "$B201_FAILED" = "0" ] || exit 1
 echo "ok - §201 §20261117-RESEAL-SECTORDROP 锁通过（机内自算6函数+build_context接入+负锁 + pregen云端烘 + 13+8例行为腿，累计判定点 ${CNT201}）"
+echo ""
+
+# §202 §20261117-REVIEW-CLOSEOUT（方案文档复核收口批）：复核发现三处未完成项补齐——
+# ① leader_decay_v2 的第二否决项 consec_boards 无源(不能用 pool ladder_height 顶替)：
+#    pregen 从 daily+stk_limit 逐日算个股连板、build_context 透传、§198 契约登记；
+# ② 个股微结构因子 lu_board/lu_board3/lu_early_seal 走 A 数值 band(方案§9.3)：
+#    scalar_bands 烘值；lu_seal_strength 数据不可得保持弃权；
+# ③ local_executor 措辞 P1-2(IN-CLIENT live leg + 每小时降噪) + 变量名后跟中文误报修复。
+echo "==> 202 §20261117-REVIEW-CLOSEOUT（consec_boards + 微结构band + 措辞 + 误报）..."
+B202_FAILED=0
+fail202() {
+	echo "--- FAIL: §202 $*"
+	FAIL=1
+	B202_FAILED=1
+}
+CNT202=0
+
+# ① consec_boards：pregen compute + 烘值 + build_context + 契约登记。
+CNT202=$((CNT202 + 1))
+grep -qF 'def compute_consec_boards(' scripts/pregen_carrier_factors_gz.py || fail202 "pregen 缺 compute_consec_boards"
+CNT202=$((CNT202 + 1))
+grep -qF 'out["consec_boards"] = float(consec)' scripts/pregen_carrier_factors_gz.py || fail202 "pregen 未烘 consec_boards"
+CNT202=$((CNT202 + 1))
+grep -qF 'close) >= up * tol' scripts/pregen_carrier_factors_gz.py || fail202 "consec_boards 未用权威板价 up_limit 判涨停（按名字猜板幅会漂移）"
+CNT202=$((CNT202 + 1))
+grep -qF '"consec_boards": pre.get("consec_boards")' qmt_gateway/qmt_internal_strategy.py || fail202 "build_context 未透传 consec_boards"
+# 负锁：不能用 ladder_height 冒充 consec_boards 喂给 v2。
+CNT202=$((CNT202 + 1))
+if grep -qF '"consec_boards": pre.get("ladder_height")' qmt_gateway/qmt_internal_strategy.py; then
+	fail202 "consec_boards 被 ladder_height(池max)顶替（方案§11.2 明令禁止）"
+fi
+CNT202=$((CNT202 + 1))
+grep -qF '"consec_boards"' qmt_gateway/tests/test_wiring_completeness_20261117.py || fail202 "§198 契约未登记 consec_boards"
+
+# ② micro bands：3 枚 band 值在烘参 + lu_seal_strength 不标。
+for _b202 in 'lu_board' 'lu_board3' 'lu_early_seal'; do
+	CNT202=$((CNT202 + 1))
+	grep -qF "\"$_b202\":" qmt_gateway/local_executor_params.json || fail202 "烘参缺 $_b202 band"
+done
+CNT202=$((CNT202 + 1))
+if python3 -c "import json,sys; sys.exit(0 if 'lu_seal_strength' in json.load(open('qmt_gateway/local_executor_params.json'))['params']['scalar_bands'] else 1)"; then
+	fail202 "lu_seal_strength 不该标 band（circ_mv 全空，方案§3 明定暂不启用）"
+fi
+
+# ③ P1-2 措辞 + 降噪。
+CNT202=$((CNT202 + 1))
+grep -qF 'the IN-CLIENT strategy is the live' qmt_gateway/local_executor.py || fail202 "P1-2 措辞未改（仍称 bridge 为 live leg）"
+CNT202=$((CNT202 + 1))
+grep -qF '_CUTOVER_WARN_HOUR' qmt_gateway/local_executor.py || fail202 "P1-2 降噪变量缺失"
+
+# ④ 行为腿：consec_boards 6 例 + micro bands 9 例。
+PY202A=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_consec_boards_20261117.py -q 2>&1 || true )
+CNT202=$((CNT202 + 1))
+grep_q '6 passed' PY202A || { echo "--- FAIL: §202 consec_boards 行为腿未跑满6例：$(printf '%s\n' "$PY202A" | tail -6)"; B202_FAILED=1; }
+PY202B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_micro_bands_20261117.py -q 2>&1 || true )
+CNT202=$((CNT202 + 1))
+grep_q '9 passed' PY202B || { echo "--- FAIL: §202 micro bands 行为腿未跑满9例：$(printf '%s\n' "$PY202B" | tail -6)"; B202_FAILED=1; }
+
+[ "$B202_FAILED" = "0" ] || exit 1
+echo "ok - §202 §20261117-REVIEW-CLOSEOUT 锁通过（consec_boards烘/透传/契约+负锁 + 3band+反seal_strength + P1-2 + 6+9例行为腿，累计判定点 ${CNT202}）"
 echo ""

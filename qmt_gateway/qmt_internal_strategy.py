@@ -1546,6 +1546,10 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         # "abstain=allow" defect that filled the account at 98.9%.
         "is_leader": pre.get("is_leader"),
         "ladder_height": pre.get("ladder_height"),
+        # CONSEC-BOARDS 2026-11-17: leader_decay_v2's OTHER protective reading --
+        # per-stock consecutive limit-ups before today, baked from daily+stk_limit
+        # (pool ladder_height is NOT a substitute). Absent = honest decline.
+        "consec_boards": pre.get("consec_boards"),
         "afternoon_reseal": reseal,
         "up_stop": pre.get("up_stop"),
         "index_change_pct": pre.get("index_change_pct"),

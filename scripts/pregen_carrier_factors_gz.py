@@ -343,6 +343,13 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
             (ts,))
     if up and up[0] and up[0][0] is not None:
         out["up_stop"] = float(up[0][0])
+    # §CONSEC-BOARDS 2026-11-17（leader_decay_v2 的否决项）：今日之前的连续涨停
+    # 天数，从 daily+stk_limit 逐日算（不能用 pool 的 ladder_height 代替）。
+    # 盘前跑 ⇒ 最新日K即昨日 ⇒ 正好等于盘中规则要的"今日之前连板数"。
+    # 无历史 ⇒ 不烘 ⇒ v2 诚实弃权（绝不编一个连板数）。
+    consec = compute_consec_boards(ts)
+    if consec is not None:
+        out["consec_boards"] = float(consec)
     # §SECTOR-DROP 2026-11-17（owner：sector_limit_up_drop_pct 走云端烘）：该股所属
     # 板块的涨停家数较昨日降幅。industry_map/sector_drop_map 由 main() 一次查好放
     # market（避免每票查库）。本票查不到行业或该板块降幅无定义 ⇒ 不烘 ⇒ 消费侧
@@ -519,6 +526,53 @@ def fetch_industry_map():
         if code and industry:
             out[str(code)] = str(industry)
     return out or None
+
+
+# ConsecBoards tolerance: same ruler as Go shortbase shortSealTolerance (0.995)
+# and params.ld_seal_tolerance. A day counts as a limit-up when its close is at
+# or above the authoritative stk_limit.up_limit times this factor.
+CONSEC_SEAL_TOL = 0.995
+CONSEC_LOOKBACK = 12
+
+
+def compute_consec_boards(ts, tol=CONSEC_SEAL_TOL, lookback=CONSEC_LOOKBACK):
+    """§CONSEC-BOARDS 2026-11-17：个股"今日之前"的连续涨停天数（leader_decay_v2）。
+
+    Go shortbase.go:69 ConsecBoards / adapter.go:435-446 counts consecutive
+    limit-ups going BACKWARD from the second-to-last bar (i.e. excluding today).
+    pregen runs before the open, so the newest daily bar IS yesterday: count
+    backward from the newest bar. That bakes exactly the value the in-client
+    rule needs during today's session -- "boards before today" -- with no need
+    for a per-stock limit history inside the sandbox.
+
+    Board price comes from stk_limit.up_limit (authoritative, same source as the
+    baked up_stop), NOT from a name-based 10/20/30% guess -- a fidelity gain over
+    Go. A day is a limit-up when close >= up_limit*tol. Days without an up_limit
+    row break the streak (honest: cannot prove a board, do not invent one).
+
+    Returns int >= 0, or None when there is no usable daily history (bake skips
+    the key => the rule declines rather than scoring a fabricated board count).
+    """
+    rows = _q("SELECT trade_date, close FROM daily WHERE ts_code=? "
+              "AND close IS NOT NULL ORDER BY trade_date DESC LIMIT ?", (ts, lookback)) or []
+    if not rows:
+        return None
+    limits = _q("SELECT trade_date, up_limit FROM stk_limit WHERE ts_code=? "
+                "AND up_limit IS NOT NULL ORDER BY trade_date DESC LIMIT ?",
+                (ts, lookback)) or []
+    up_by_day = {}
+    for trade_date, up_limit in limits:
+        up_by_day[str(trade_date)] = float(up_limit)
+    count = 0
+    for trade_date, close in rows:          # newest (yesterday) first
+        up = up_by_day.get(str(trade_date))
+        if up is None or up <= 0 or close is None:
+            break
+        if float(close) >= up * tol:
+            count += 1
+        else:
+            break
+    return count
 
 
 def _notify(title, body):

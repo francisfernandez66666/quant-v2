@@ -1547,6 +1547,18 @@
       "ConceptHeat": {
         "min": 0.6,
         "max": 1.01
+      },
+      "lu_board": {
+        "min": 2,
+        "max": 100
+      },
+      "lu_board3": {
+        "min": 3,
+        "max": 100
+      },
+      "lu_early_seal": {
+        "min": 0,
+        "max": 600
       }
     },
     "score_domain": {

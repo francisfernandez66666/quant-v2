@@ -35,7 +35,7 @@ LIVE_TACTIC_CTX_INPUTS = {
     # factor_composite / 移植战法的烘值 input（A 组透传 + B 组 pregen 烘）
     "valuation_series", "turnover_series", "total_share_series", "fin_pit",
     "flow_today_pct", "flow_5d_pct", "news_event", "concept_heat",
-    "limit_board_count", "is_leader", "ladder_height", "afternoon_reseal",
+    "limit_board_count", "is_leader", "ladder_height", "consec_boards", "afternoon_reseal",
     "up_stop", "index_change_pct", "limit_up_count", "limit_up_count_history",
     "broken_board_ratio", "broken_board_count", "broken_board_ratio_history",
     "seal_amount_ratio", "first_seal_minute", "sector_limit_up_drop_pct",
