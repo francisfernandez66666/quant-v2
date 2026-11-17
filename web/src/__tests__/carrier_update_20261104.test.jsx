@@ -13,8 +13,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import CarrierUpdatePanel, { carrierStateText } from '../components/CarrierUpdatePanel.jsx'
 
-vi.mock('../api/index.js', () => ({ requestCarrierUpdate: vi.fn() }))
-import { requestCarrierUpdate } from '../api/index.js'
+vi.mock('../api/index.js', () => ({ requestCarrierUpdate: vi.fn(), requestCarrierForceReport: vi.fn() }))
+import { requestCarrierUpdate, requestCarrierForceReport } from '../api/index.js'
 
 const READY = {
   known: true,
@@ -29,6 +29,7 @@ const READY = {
 beforeEach(() => {
   vi.clearAllMocks()
   requestCarrierUpdate.mockResolvedValue({ ok: true })
+  requestCarrierForceReport.mockResolvedValue({ ok: true, force_report: true })
 })
 afterEach(() => cleanup())
 
@@ -52,13 +53,13 @@ describe('CarrierUpdatePanel 渲染与触发', () => {
     render(<CarrierUpdatePanel carrier={null} />)
     expect(screen.getByTestId('carrier-panel').textContent).toContain('读数未知')
     expect(screen.getByTestId('carrier-panel').textContent).not.toContain('已是最新')
-    expect(screen.getByRole('button').disabled).toBe(true)
+    expect(screen.getByRole('button', { name: '更新载体' }).disabled).toBe(true)
     expect(requestCarrierUpdate).not.toHaveBeenCalled()
   })
 
   it('读数齐备：点击只发一次请求，文案是「已置为待更新」而不是「已更新成功」', async () => {
     render(<CarrierUpdatePanel carrier={READY} />)
-    fireEvent.click(screen.getByRole('button'))
+    fireEvent.click(screen.getByRole('button', { name: '更新载体' }))
     await waitFor(() => expect(requestCarrierUpdate).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.getByTestId('carrier-msg').textContent).toContain('已置为待更新'))
     expect(screen.getByTestId('carrier-msg').textContent).not.toContain('已更新成功')
@@ -70,19 +71,39 @@ describe('CarrierUpdatePanel 渲染与触发', () => {
     expect(screen.getByTestId('carrier-mismatch').textContent).toContain('装的不等于跑的')
   })
 
+  it('§WIRING-C 强制刷新实盘账：点一次只登记一次意图，文案是「已登记…再报一次」不是「已刷新」', async () => {
+    render(<CarrierUpdatePanel carrier={READY} />)
+    const btn = screen.getByTestId('carrier-force-report')
+    fireEvent.click(btn)
+    await waitFor(() => expect(requestCarrierForceReport).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByTestId('carrier-force-msg').textContent).toContain('已登记强制刷新'))
+    // 不是即时成功：此刻只是登记意图，真发在物理机下次轮询。
+    expect(screen.getByTestId('carrier-force-msg').textContent).not.toContain('已刷新成功')
+    // 与更新载体互不串台：force 按钮的 msg 不写进 carrier-msg。
+    expect(screen.queryByTestId('carrier-msg')).toBeNull()
+  })
+
+  it('§WIRING-C 强刷失败显式档，不落在成功档', async () => {
+    requestCarrierForceReport.mockRejectedValueOnce(new Error('403 无权限'))
+    render(<CarrierUpdatePanel carrier={READY} />)
+    fireEvent.click(screen.getByTestId('carrier-force-report'))
+    await waitFor(() => expect(screen.getByTestId('carrier-force-msg').textContent).toContain('强刷登记失败'))
+    expect(screen.getByTestId('carrier-force-msg').textContent).not.toContain('已登记强制刷新')
+  })
+
   it('期望段没填齐 / 已 pending：按钮禁用，不制造死格也不重复点击', () => {
     const { unmount } = render(<CarrierUpdatePanel carrier={{ ...READY, desired_ready: false }} />)
-    expect(screen.getByRole('button').disabled).toBe(true)
+    expect(screen.getByRole('button', { name: '更新载体' }).disabled).toBe(true)
     unmount()
     render(<CarrierUpdatePanel carrier={{ ...READY, request_state: 'pending' }} />)
-    expect(screen.getByRole('button').disabled).toBe(true)
+    expect(screen.getByRole('button', { name: '更新载体' }).disabled).toBe(true)
     expect(requestCarrierUpdate).not.toHaveBeenCalled()
   })
 
   it('请求失败：显式失败文案，绝不落在成功那一档', async () => {
     requestCarrierUpdate.mockRejectedValueOnce(new Error('403 无权限'))
     render(<CarrierUpdatePanel carrier={READY} />)
-    fireEvent.click(screen.getByRole('button'))
+    fireEvent.click(screen.getByRole('button', { name: '更新载体' }))
     await waitFor(() => expect(screen.getByTestId('carrier-msg').textContent).toContain('触发失败'))
     expect(screen.getByTestId('carrier-msg').textContent).not.toContain('已置为待更新')
   })

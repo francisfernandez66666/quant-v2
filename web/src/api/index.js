@@ -2781,3 +2781,11 @@ export async function adjustManualBook(adjust) {
   }
   return request('/api/qmt/manual-positions', { method: 'POST', data: { adjust: [a] } })
 }
+
+// §WIRING-C 2026-11-17：云端「强制刷新实盘账」——逼物理机把当前持仓/可用余额再报一次覆盖。
+// 对应 POST /api/qmt/carrier/force-report（trading_admin 严格位，跨账号代点另判 user_admin）。
+// 它只登记一次"请盒子下次轮询强发"的意图，此刻不直接改任何账（响应里 message 已说明）。
+export async function requestCarrierForceReport(userId) {
+  const data = userId ? { user_id: userId } : {}
+  return request('/api/qmt/carrier/force-report', { method: 'POST', data })
+}

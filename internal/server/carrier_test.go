@@ -908,3 +908,63 @@ func TestCarrierIntradayPriorityPassthrough(t *testing.T) {
 		t.Fatalf("未写字段 ⇒ API 必须 false 恒在位，实得 %v", body["intraday_priority"])
 	}
 }
+
+// carrierForce 用某用户打一次 POST /api/qmt/carrier/force-report（与 carrierUpdate 同姿势）。
+func carrierForce(s *Server, u *auth.User, body string) *httptest.ResponseRecorder {
+	return adminDo(s, adminReq(s, u, http.MethodPost, "/api/qmt/carrier/force-report", body))
+}
+
+// TestCarrierForceReportSetReadClear §WIRING-C：置位→GET 透传 force_report→ack force_consumed 清除。
+func TestCarrierForceReportSetReadClear(t *testing.T) {
+	s := newCarrierServer(t)
+	leg := newCarrierLeg(t, s, "carrier-fr", "KEY-FR")
+
+	rr := carrierForce(s, leg, `{}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("trading_admin 给自己点强刷应 200，实得 %d body=%s", rr.Code, rr.Body.String())
+	}
+	doc, _ := readCarrierManifest(s.carrierManifestPath(leg.ID))
+	if doc == nil || !doc.ForceReport || doc.ForceReportAt == nil || *doc.ForceReportAt == "" {
+		t.Fatalf("点强刷应置 ForceReport+时刻，实得 %+v", doc)
+	}
+	// GET 透传：force_report 键恒在位且此刻为 true。
+	body := decodeCarrierResp(t, carrierGetWithKey(s, "KEY-FR"))
+	if body["force_report"] != true {
+		t.Fatalf("GET 应透传 force_report=true，实得 %v", body["force_report"])
+	}
+	// 带 force_consumed 的 ack 清旗标。
+	ack := carrierAckWithKey(s, "KEY-FR", `{"strategy_version":"v02-20261104","ok":true,`+
+		`"reason":"force_report_consumed","force_consumed":true}`)
+	if ack.Code != http.StatusOK {
+		t.Fatalf("force ack 应 200，实得 %d body=%s", ack.Code, ack.Body.String())
+	}
+	doc, _ = readCarrierManifest(s.carrierManifestPath(leg.ID))
+	if doc.ForceReport {
+		t.Fatal("force_consumed ack 后旗标应被清，仍为 true")
+	}
+	body = decodeCarrierResp(t, carrierGetWithKey(s, "KEY-FR"))
+	if body["force_report"] != false {
+		t.Fatalf("清除后 GET force_report 应 false，实得 %v", body["force_report"])
+	}
+}
+
+// TestCarrierForceReportNeedsTradingAdminAndCrossAdmin 鉴权与跨账号：缺 trading_admin 403；
+// 只持 trading_admin 点别人 403 且别人旗标不动；user_admin+trading_admin 代点 200。
+func TestCarrierForceReportNeedsTradingAdminAndCrossAdmin(t *testing.T) {
+	s := newCarrierServer(t)
+	trader := createCarrierUser(t, s, "fr-trader", []string{auth.PermTradingAdmin})
+	plain := createCarrierUser(t, s, "fr-plain", []string{auth.PermQuantTrade})
+	other := createCarrierUser(t, s, "fr-other", []string{auth.PermTradingAdmin})
+	carrierDesiredFile(t, s, trader.ID)
+	carrierDesiredFile(t, s, other.ID)
+
+	if code := carrierForce(s, plain, `{}`).Code; code != http.StatusForbidden {
+		t.Fatalf("quant_trade 不该触发强刷，实得 %d", code)
+	}
+	if code := carrierForce(s, trader, `{"user_id":"`+other.ID+`"}`).Code; code != http.StatusForbidden {
+		t.Fatalf("跨账号缺 user_admin 应 403，实得 %d", code)
+	}
+	if doc, _ := readCarrierManifest(s.carrierManifestPath(other.ID)); doc.ForceReport {
+		t.Fatal("被拒的跨账号强刷改了别人的旗标")
+	}
+}

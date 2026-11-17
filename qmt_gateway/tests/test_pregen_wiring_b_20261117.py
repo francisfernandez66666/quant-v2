@@ -52,6 +52,8 @@ class PregenWiringB(unittest.TestCase):
             return None
         return q
 
+    # B 组派生键全验一遍：valuation 加 pcf/dv、total_share、up_stop、news_day、
+    # 以及 market 传入的 limit_up_count/ladder_height/is_leader——任一漏烘即对应因子弃权。
     def test_bake_bakeables_emits_the_recompute_keys(self):
         m = self.mod
         orig_q = m._q

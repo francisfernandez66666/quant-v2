@@ -12572,12 +12572,12 @@ run_ledger115 "$REPO115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
-eqkey115 ROUTES_DERIVED 219 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210；2026-11-04 §CARRIER-UPDATE 载体更新链三条入账（GET /api/qmt/carrier/manifest + POST /api/qmt/carrier/ack 走网关钥匙、POST /api/qmt/carrier/update 走 trading_admin 且跨账号再加 user_admin）→213）'
-eqkey115 CALLPATH_DERIVED 176 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；2026-11-04 §CARRIER-UPDATE 前端覆盖 POST /api/qmt/carrier/update →169；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
-eqkey115 CALLSITES_DERIVED 181 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172；2026-11-04 §CARRIER-UPDATE 前端「更新载体」拨一次 →173；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →175）'
+eqkey115 ROUTES_DERIVED 220 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210；2026-11-04 §CARRIER-UPDATE 载体更新链三条入账（GET /api/qmt/carrier/manifest + POST /api/qmt/carrier/ack 走网关钥匙、POST /api/qmt/carrier/update 走 trading_admin 且跨账号再加 user_admin）→213；2026-11-17 §WIRING-C 强制刷新实盘账 POST /api/qmt/carrier/force-report（trading_admin）→220）'
+eqkey115 CALLPATH_DERIVED 177 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；2026-11-04 §CARRIER-UPDATE 前端覆盖 POST /api/qmt/carrier/update →169；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
+eqkey115 CALLSITES_DERIVED 182 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172；2026-11-04 §CARRIER-UPDATE 前端「更新载体」拨一次 →173；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →175）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
-eqkey115 LEDGER_ROWS 219 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213；2026-11-14 F4 补登 6 条漏登路由 →219）'
-eqkey115 COVERED_BY_WEB 176 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
+eqkey115 LEDGER_ROWS 220 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213；2026-11-14 F4 补登 6 条漏登路由 →219）'
+eqkey115 COVERED_BY_WEB 177 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
 eqkey115 UNCALLED 43 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（无 UI 待补，前端未拨）→42；2026-11-04 §CARRIER-UPDATE 盒子侧两条（manifest/ack 由 qmt_gateway/carrier_updater.py 拨，不是前端）→44）；【11-06 晚批按实时派生重算】'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
@@ -12649,8 +12649,8 @@ fi
 run_ledger115 "$MIR115"
 CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 镜像基线不绿（rc=${LEDGER_RC115}）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -3)"; exit 1; }
-eqkey115 ROUTES_DERIVED 219 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209；2026-11-04 §4.2 人工回执 +1 →210；2026-11-04 §CARRIER-UPDATE +3 →213）'
-eqkey115 LEDGER_ROWS 219 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209；2026-11-04 §4.2 人工回执入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213；2026-11-14 F4 补登 6 条漏登路由 →219）'
+eqkey115 ROUTES_DERIVED 220 '镜像基线：R 与主仓同值（2026-11-01 §SUBSCRIPTION-A 行情开关写面两条路由入账 206→208；2026-11-04 §MANUAL-BOOK 手动台账写面 +1 →209；2026-11-04 §4.2 人工回执 +1 →210；2026-11-04 §CARRIER-UPDATE +3 →213）'
+eqkey115 LEDGER_ROWS 220 '镜像基线：台账行数与主仓同值（206→208 同批；2026-11-04 §MANUAL-BOOK 入账 →209；2026-11-04 §4.2 人工回执入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213；2026-11-14 F4 补登 6 条漏登路由 →219）'
 eqkey115 BROKEN_EVIDENCE 0 '镜像基线：证据落点在镜像里全部拨得动（少文件就是这里红，别处绿的镜像不可信）'
 eqkey115 LEDGER_CHECK GREEN '镜像基线整体闭合'
 SNAP115 3
@@ -17873,7 +17873,7 @@ N144=$(grep -cE 'strict(All)?Perm(s)?Middleware\(auth\.PermTradingAdmin|strictAn
 # 它能让别人家里的物理机换掉正在跑的策略文件并重启，所以按 trading_admin 而不是 quant_trade；
 # 同一批的 manifest/ack 两条走 qmtReportMiddleware（盒子那把钥匙），不在这条计数里。
 # 28 -> 29（§20261113-LEDGER-TOPN：GET /api/qmt/trade-results 台账读面入账；2026-11-14 复核实读）
-[ "$N144" -eq 29 ] || fail144 "trading_admin 严格路由应为 29，实得 $N144"
+[ "$N144" -eq 30 ] || fail144 "trading_admin 严格路由应为 30，实得 $N144（2026-11-17 §WIRING-C 强制刷新实盘账 POST /api/qmt/carrier/force-report 入账 29→30）"
 CNT144=$((CNT144 + 1))
 N144=$(grep -cF 'strictPermMiddleware(auth.PermUserAdmin' internal/server/server.go || true)
 [ "$N144" -eq 14 ] || fail144 "user_admin 严格路由应为 14，实得 $N144"

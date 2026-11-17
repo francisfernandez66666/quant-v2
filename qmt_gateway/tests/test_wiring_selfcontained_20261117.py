@@ -25,6 +25,7 @@ BUILDER = os.path.join(REPO, "scripts", "build_local_executor.py")
 STRATEGY_SRC = os.path.join(GATEWAY, "qmt_internal_strategy.py")
 
 
+# 跑真构建器产沙箱产物再 load 成模块：A 组接线全是机内 py 里的函数，只能对"真产物"取证。
 def _build_and_load():
     out_dir = tempfile.mkdtemp()
     proc = subprocess.run(

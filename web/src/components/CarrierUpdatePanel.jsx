@@ -23,7 +23,7 @@
 // gated on the explicit trading_admin permission bit (read stays open, the control does not).
 import React, { useState } from 'react'
 import { Button, Tag } from 'tdesign-react'
-import { requestCarrierUpdate } from '../api/index.js'
+import { requestCarrierUpdate, requestCarrierForceReport } from '../api/index.js'
 import { canStrict } from '../utils/perm.js'
 
 // stateText 把五种请求态各指向一句不同的话（折成同一句就等于让人猜下一步做什么）。
@@ -44,6 +44,11 @@ export default function CarrierUpdatePanel({ carrier }) {
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
   const [failed, setFailed] = useState(false)
+  // §WIRING-C 强制刷新实盘账的独立态：它不依赖载体版本 ready（强刷与换版互不相干），
+  // 也不许复用更新载体的 busy/msg（否则一次点击的结论会被另一次覆盖）。
+  const [forceBusy, setForceBusy] = useState(false)
+  const [forceMsg, setForceMsg] = useState('')
+  const [forceFailed, setForceFailed] = useState(false)
 
   const known = !!(carrier && carrier.known)
   const state = carrier && carrier.request_state ? carrier.request_state : 'unknown'
@@ -76,6 +81,26 @@ export default function CarrierUpdatePanel({ carrier }) {
     }
   }
 
+  // 强制刷新实盘账：与"更新载体"不同，它不需要清单 desired_ready（强发当前账与装哪版无关），
+  // 只要求登录者持 trading_admin（与后端 strictPermMiddleware 同源）。点一次登记一次意图，
+  // 盒子下次轮询读到即跑 report_uplink --force 把当前持仓/可用余额再报一次。
+  const canForce = canTrade && !forceBusy
+  async function onForce() {
+    if (!canForce) return
+    setForceBusy(true)
+    setForceMsg('')
+    setForceFailed(false)
+    try {
+      await requestCarrierForceReport()
+      setForceMsg('已登记强制刷新，等物理机下一次轮询把当前账再报一次（不是此刻已刷新）')
+    } catch (err) {
+      setForceFailed(true)
+      setForceMsg('强刷登记失败：' + (err && err.message ? err.message : '请求未成功'))
+    } finally {
+      setForceBusy(false)
+    }
+  }
+
   return (
     <div data-testid="carrier-panel" style={{ marginTop: 8 }}>
       <span>载体更新：</span>
@@ -100,6 +125,15 @@ export default function CarrierUpdatePanel({ carrier }) {
       <Button tag="button" size="small" disabled={!canClick} loading={busy} onClick={onClick} style={{ marginLeft: 8 }}>
         更新载体
       </Button>
+      {/* §WIRING-C 强制刷新实盘账：手动 App 卖出后盒端不触发回报，点它逼物理机把当前
+          持仓/可用余额再发一次覆盖云端。禁用态同样要真实可发现的 disabled <button>。 */}
+      <Button tag="button" size="small" variant="outline" data-testid="carrier-force-report"
+        disabled={!canForce} loading={forceBusy} onClick={onForce} style={{ marginLeft: 8 }}>
+        强制刷新实盘账
+      </Button>
+      {!!forceMsg && (
+        <div data-testid="carrier-force-msg" style={{ marginTop: 4, color: forceFailed ? '#d54941' : undefined }}>{forceMsg}</div>
+      )}
       {!!msg && (
         <div data-testid="carrier-msg" style={{ marginTop: 4, color: failed ? '#d54941' : undefined }}>{msg}</div>
       )}

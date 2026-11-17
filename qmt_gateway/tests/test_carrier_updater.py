@@ -817,5 +817,62 @@ class TestExecutorLegIsReportOnly(unittest.TestCase):
         self.assertIn("CARRIER_EXECUTOR reason=manifest_has_no_executor_sha", out)
 
 
+class TestForceReportConsume(unittest.TestCase):
+    """§WIRING-C 2026-11-17：运营点「刷新」→ 盒子消费 force_report → 跑强制上报 + 清旗标。
+
+    钉三件事：force_report=true 才跑上报腿并 ack force_consumed；没有旗标绝不跑、且普通 ack
+    维持 4 键契约；dry-run 既不上报也不回执清（dry-run 一个字节都不写，与整轮纪律一致）。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.fx = _Fixture(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _ack_bodies(self, transport):
+        return [json.loads(c[3].decode("utf-8"))
+                for c in transport.calls if cu.ACK_PATH in c[1]]
+
+    def test_force_report_runs_uplink_and_acks_consumed(self):
+        transport = _Transport(manifest=self.fx.manifest(force_report=True))
+        u = self.fx.updater(transport=transport)
+        calls = {"n": 0}
+
+        def fake_force():
+            calls["n"] += 1
+            return True, 1
+        u._run_force_uplink = fake_force
+        _run(u)
+        self.assertEqual(calls["n"], 1, "force_report=true 必须跑一次强制上报")
+        self.assertTrue(any(b.get("force_consumed") is True for b in self._ack_bodies(transport)),
+                        "消费成功必须 ack force_consumed=true 让云端清旗标")
+
+    def test_no_force_report_never_runs_uplink_normal_ack_stays_four_keys(self):
+        transport = _Transport(manifest=self.fx.manifest())  # 无 force_report
+        u = self.fx.updater(transport=transport)
+
+        def boom():
+            raise AssertionError("没有 force_report 旗标却跑了上报腿")
+        u._run_force_uplink = boom
+        _run(u)
+        for b in self._ack_bodies(transport):
+            self.assertNotIn("force_consumed", b,
+                             "普通 ack 不能多出 force_consumed 键（破坏 4 键契约）")
+
+    def test_dry_run_does_not_send_or_clear(self):
+        transport = _Transport(manifest=self.fx.manifest(force_report=True))
+        u = self.fx.updater(transport=transport)
+        calls = {"n": 0}
+
+        def fake_force():
+            calls["n"] += 1
+            return True, 1
+        u._run_force_uplink = fake_force
+        _run(u, dry_run=True)
+        self.assertEqual(calls["n"], 0, "dry-run 不许真跑强制上报")
+
+
 if __name__ == "__main__":
     unittest.main()

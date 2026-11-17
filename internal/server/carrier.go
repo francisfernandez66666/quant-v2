@@ -152,6 +152,14 @@ type carrierManifest struct {
 	// 透传——盒子读到的恒缺省 false，盘中班次闸恒 SKIP（反转/新信号全靠 SSH 兜底腿），
 	// 与 carrier_updater.py:483 的闸判定（is not True）两头语义齐全、中间这一跳断了。
 	IntradayPriority bool `json:"intraday_priority"`
+	// ForceReport §WIRING-C 2026-11-17：运营点「刷新」要强制盒子把当前持仓/可用余额再报一次
+	// （补"手动 App 卖出不触发盒端交易回报"那一手）。true＝有一次待消费的强刷意图；盒子下一次
+	// 轮询读到时跑 report_uplink --force（旁路哈希去重、仍同一条 POST/归属链），成功回执后由
+	// handleCarrierAckPost 清除。这是**一次性旗标**，不常驻、不等于心跳回报。
+	// 读不到清单（ok=false）时它一律报 false——"不知道有没有待刷"绝不冒充"没有待刷"。
+	ForceReport bool `json:"force_report"`
+	// ForceReportAt 运营点强刷的时刻；从没点过是 null（不是零值串，与 RequestedAt 同纪律）。
+	ForceReportAt *string `json:"force_report_requested_at"`
 	// LastAck 最近一次**被接受**的回执；从没收到过是 null。
 	LastAck *carrierAck `json:"last_ack"`
 }
@@ -296,11 +304,16 @@ func carrierManifestPayload(doc *carrierManifest, unknownReason string) map[stri
 		// `manifest.get("intraday_priority") is not True`，键缺席与 false 同判——
 		// 但恒在位让「文件写了 true、API 却没透传」这类断层在盒侧日志里可判读。
 		"intraday_priority": false,
+		// §WIRING-C force_report 恒在位（读不到清单=false＝"没有待消费的强刷"），
+		// 但 ok=false 时这条是"不知道"的诚实缺省，绝不冒充"已确认没有待刷"。
+		"force_report": false,
 	}
 	if doc == nil {
 		return out
 	}
 	out["intraday_priority"] = doc.IntradayPriority
+	out["force_report"] = doc.ForceReport
+	out["force_report_requested_at"] = doc.ForceReportAt
 	out["strategy_version"] = doc.StrategyVersion
 	out["strategy_sha256"] = doc.StrategySha256
 	// artifact_url 只在清单真给了地址时下发：空串不发（保持"本批不供字节"的缺省形态），
@@ -344,6 +357,10 @@ type carrierAckReq struct {
 	ExecutorVersion *string `json:"executor_version"`
 	OK              *bool   `json:"ok"`
 	Reason          *string `json:"reason"`
+	// ForceConsumed §WIRING-C：盒子跑完 report_uplink --force 后在 ack 里带 true，
+	// 云端据此清掉 force_report 一次性旗标（意图已满足）。缺省/不带＝不碰 force_report
+	// （兼容只更新载体版本的旧回执）。
+	ForceConsumed *bool `json:"force_consumed,omitempty"`
 	// UserID 是**收下但永不采信**的字段（§安全 T1）：归属只由钥匙决定。
 	// 保留它（而不是报错）是为了兼容旧脚本；不一致时打一行日志，让"有人以为能指名"这件事留痕。
 	UserID string `json:"user_id,omitempty"`
@@ -452,6 +469,16 @@ func (s *Server) handleCarrierAckPost(w http.ResponseWriter, r *http.Request) {
 		stateChanged = true
 	}
 	doc.RequestState = newState
+	// §WIRING-C 消费 force_report：盒子带 force_consumed=true（它已跑完 report_uplink --force）
+	// 才清旗标；这是一次性意图，清掉后下一次普通轮询不再强发。与版本推进腿互不干涉。
+	forceCleared := false
+	if req.ForceConsumed != nil && *req.ForceConsumed && doc.ForceReport {
+		doc.ForceReport = false
+		forceCleared = true
+	}
+	if forceCleared {
+		log.Printf("[carrier] force_report 已消费(用户=%s)：盒子跑完 report_uplink --force 并回执", uid)
+	}
 	if err := writeCarrierManifest(path, doc); err != nil {
 		// 落盘失败必须响亮：回执是"这台机器答了话"的唯一凭据，丢了就等于那次点击没有下文。
 		log.Printf("[carrier] 回执落盘失败(用户=%s): %v", uid, err)
@@ -599,6 +626,75 @@ func (s *Server) handleCarrierUpdatePost(w http.ResponseWriter, r *http.Request)
 		"when":               "该账号那台物理机上的本地进程下一次轮询时接住（收盘后的计划任务，或手工 --once）",
 		"message": "已记下这次请求（request_state=pending）。此刻**还没有任何东西被更新**：广州只登记了一次意图，" +
 			"停策略、写文件、重启三件事都由那台机器自己的脚本在轮询到时完成，做完才回执。",
+	})
+}
+
+// carrierForceReportReq POST /api/qmt/carrier/force-report 的请求体。UserID 仅在跨账号代点时有效，
+// 且必须另持 user_admin（与 carrier/update 同判据源）；缺省只作用于请求者自己那根腿。
+type carrierForceReportReq struct {
+	UserID string `json:"user_id,omitempty"`
+}
+
+// handleCarrierForceReportPost 处理 POST /api/qmt/carrier/force-report（trading_admin；跨账号加 user_admin）。
+// §WIRING-C 2026-11-17：owner 点「刷新」置一次 force_report 意图，盒子下一次轮询读到即跑
+// report_uplink --force（把当前持仓/可用余额再发一次，补手动 App 卖出那条）。
+// 它**只登记一次意图**，不在此刻发任何账、不更新任何载体字节；期望段没填齐也照样接受（强刷不依赖
+// 载体版本），但数据目录不可用要如实 503。
+func (s *Server) handleCarrierForceReportPost(w http.ResponseWriter, r *http.Request) {
+	actor := requestUserID(r)
+	if actor == "" {
+		writeError(w, http.StatusForbidden, "无法确定账号")
+		return
+	}
+	var req carrierForceReportReq
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	target := strings.TrimSpace(req.UserID)
+	if target == "" {
+		target = actor
+	}
+	if target != actor {
+		u := userFromContext(r)
+		if u == nil || !u.HasExplicitPerm(auth.PermUserAdmin) {
+			opslog.Audit("carrier_force_report_denied", actor, target, "cross_account_requires_user_admin+trading_admin")
+			writeError(w, http.StatusForbidden, "跨账号强制刷新需要 user_admin + trading_admin 两位")
+			return
+		}
+	}
+	if s.auth.UserByID(target) == nil {
+		writeError(w, http.StatusNotFound, "目标账号不存在: "+target)
+		return
+	}
+	path := s.carrierManifestPath(target)
+	if !carrierDirUsable(path) {
+		writeError(w, http.StatusServiceUnavailable, "carrier manifest unavailable（数据目录未装配）")
+		return
+	}
+	carrierMu.Lock()
+	defer carrierMu.Unlock()
+	doc, _ := readCarrierManifest(path)
+	if doc == nil {
+		doc = &carrierManifest{RequestState: carrierStateIdle}
+	}
+	stamp := carrierStamp(cntime.Now())
+	doc.ForceReport = true
+	doc.ForceReportAt = &stamp
+	if err := writeCarrierManifest(path, doc); err != nil {
+		writeError(w, 500, "persist force_report request failed: "+err.Error())
+		return
+	}
+	opslog.Audit("carrier_force_report_request", actor, target, "force_report_requested_at="+stamp)
+	writeJSON(w, 200, map[string]interface{}{
+		"ok":                        true,
+		"force_report":              true,
+		"force_report_requested_at": stamp,
+		"target_user_id":            target,
+		"message": "已记下一次强制刷新意图。此刻还没发任何账：盒子下一次轮询读到 force_report=true，" +
+			"会跑 report_uplink --force（旁路哈希去重、走同一条 POST /api/qmt/report 与同一归属链）" +
+			"把当前持仓/可用余额再报一次，回执后清掉本次意图。",
 	})
 }
 

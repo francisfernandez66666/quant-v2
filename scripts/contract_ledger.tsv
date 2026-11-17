@@ -62,6 +62,7 @@ POST	/api/paper/adjust	运维 curl	internal/server/paper.go:404:handlePaperAdjus
 
 
 
+
 POST	/api/action	前端调用	web/src/api/index.js:1762:/api/action	调用点 actionSignal()（本行由核对器派生，勿手改）
 GET	/api/admin/research/hithink-key	前端调用	web/src/api/index.js:870:/api/admin/research/hithink-key	调用点 fetchHithinkKey()（本行由核对器派生，勿手改）
 POST	/api/admin/research/hithink-key	前端调用	web/src/api/index.js:873:/api/admin/research/hithink-key	调用点 setHithinkKey()（本行由核对器派生，勿手改）
@@ -159,6 +160,7 @@ GET	/api/positions/real	前端调用	web/src/api/index.js:1020:/api/positions/re
 GET	/api/qmt/broker	前端调用	web/src/api/index.js:1127:/api/qmt/broker	调用点 fetchQMTBroker()（本行由核对器派生，勿手改）
 POST	/api/qmt/broker	前端调用	web/src/api/index.js:1134:/api/qmt/broker	调用点 switchQMTBroker()（本行由核对器派生，勿手改）
 POST	/api/qmt/cancel/{order_id}	前端调用	web/src/api/index.js:1221:/api/qmt/cancel/	调用点 qmtCancel()（本行由核对器派生，勿手改）
+POST	/api/qmt/carrier/force-report	前端调用	web/src/api/index.js:2790:/api/qmt/carrier/force-report	调用点 requestCarrierForceReport()（本行由核对器派生，勿手改）
 POST	/api/qmt/carrier/update	前端调用	web/src/api/index.js:1083:/api/qmt/carrier/update	调用点 requestCarrierUpdate()（本行由核对器派生，勿手改）
 GET	/api/qmt/close-snapshot	前端调用	web/src/api/index.js:1197:/api/qmt/close-snapshot	调用点 fetchCloseSnapshot()（本行由核对器派生，勿手改）
 GET	/api/qmt/fill-amendments	前端调用	web/src/api/index.js:1248:/api/qmt/fill-amendments	调用点 fetchFillAmendments()（本行由核对器派生，勿手改）

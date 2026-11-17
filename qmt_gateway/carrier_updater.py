@@ -425,14 +425,23 @@ class CarrierUpdater:
         return False, "updater_rc_%d" % rc, text
 
     # ---------------- 回执 ----------------
-    def post_ack(self, strategy_version, executor_version, ok, reason):
-        """POST 回执：字段名与 brain 侧一字不差（四键），任何异常只让回执失败，不改本轮结论。"""
-        body = json.dumps({
+    def post_ack(self, strategy_version, executor_version, ok, reason, force_consumed=False):
+        """POST 回执：字段名与 brain 侧一字不差，任何异常只让回执失败，不改本轮结论。
+
+        force_consumed=True（§WIRING-C 2026-11-17）：本轮已跑完 report_uplink --force，
+        带上该键让云端清掉 force_report 一次性旗标。缺省 False＝普通回执、不碰该旗标。
+        """
+        payload = {
             "strategy_version": _ascii_text(strategy_version),
             "executor_version": _ascii_text(executor_version),
             "ok": bool(ok),
             "reason": _ascii_text(reason)[:200],
-        }, ensure_ascii=True).encode("utf-8")
+        }
+        # 普通 ack 维持"恰好四键"的契约形状；force_consumed 仅在 True 时多带一键（False/缺省
+        # 不发，避免把既有 4 键金标准撑成 5 键——§CARRIER-SHADOW 的字段名契约测试盯着它）。
+        if force_consumed:
+            payload["force_consumed"] = True
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         status, _ = self._request("POST", self.base_url.rstrip("/") + ACK_PATH, body)
         self._log("CARRIER_ACK_POST status=%d ok=%d" % (status, 1 if ok else 0))
         return status
@@ -476,6 +485,13 @@ class CarrierUpdater:
                      _ascii_text(manifest.get("executor_version") or "unknown"),
                      _ascii_text(manifest.get("updated_at") or "unknown"),
                      request_state, _ascii_text(manifest.get("requested_at") or "none")))
+
+        # §WIRING-C force_report 消费：运营点了「刷新」就把当前持仓/可用余额再发一次。
+        # 这一腿**独立于版本推进与 intraday 班次闸**（强刷不更新任何载体字节、不重启客户端），
+        # 所以放在闸之前、每轮都判。跑 report_uplink --force 成功后发一条 force_consumed ack
+        # 让云端清旗标；跑不成就不清（下次轮询再来，宁重复一次强发，不可"说清了其实没发")。
+        if manifest.get("force_report") is True:
+            self._consume_force_report(manifest, want_version, dry_run)
 
         # §NEWS-GATE（R11）盘中班次闸：--intraday 轮只处理带 intraday_priority 的反转投递。
         # 普通版本不投、不重启、**不回执**（pending 留给收盘班次接住；回了执 = 15:40 那班
@@ -611,6 +627,36 @@ class CarrierUpdater:
             if ver:
                 return ver
         return "unknown"
+
+    def _run_force_uplink(self):
+        """强制刷新这一腿：同进程复用 report_uplink（同一 config/同一钥匙/同一条 POST 链），
+        跑一轮 force=True。返回 (ok, sent)。可被测试注入替换（不打真网络）。
+        """
+        try:
+            up = report_uplink.ReportUplink(self.config_path)
+            rep = up.run_once(force=True)
+        except Exception as exc:  # noqa: BLE001 -- 上报腿异常是结论，不是崩；且不泄露 token
+            self._log("FORCE_UPLINK ok=0 err=%s" % exc.__class__.__name__)
+            return False, 0
+        sent = int(rep.get("sent", 0)) + int(rep.get("forced", 0))
+        return True, sent
+
+    def _consume_force_report(self, manifest, want_version, dry_run):
+        """消费一次 force_report 意图：跑强制上报，成功才回执清旗标。
+
+        dry-run：只点名"有一张待消费的强刷旗标"，绝不真上报、绝不回执清（与整轮 dry-run 零写一致）。
+        """
+        if dry_run:
+            self._log("FORCE_UPLINK dryrun=1 pending=1（dry-run 不上报、不清旗标）")
+            return
+        ok, sent = self._run_force_uplink()
+        if not ok or sent <= 0:
+            self._log("FORCE_UPLINK ok=%d sent=%d result=not_cleared" % (1 if ok else 0, sent))
+            return  # 没真发出去就不回执清——下次轮询再消费，宁重复强发不可谎报已刷
+        status = self.post_ack(want_version or "unknown",
+                               self._executor_ack_version(manifest), True,
+                               "force_report_consumed", force_consumed=True)
+        self._log("FORCE_UPLINK ok=1 sent=%d ack_status=%d" % (sent, status))
 
     def _note_executor_diff(self, manifest):
         """执行器只报不投：清单说要的那份与本机装的不一样时点名，绝不折进"已一致"。"""

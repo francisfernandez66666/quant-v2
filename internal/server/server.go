@@ -920,6 +920,7 @@ func (s *Server) registerRoutes() {
 	// 显式位再判一次，不在这里合并成"任一位放行"——那会把别人的机器变成谁能碰都行）。
 	// 读数面（期望版/请求态/最近回执）不在这条上，走 GET /api/qmt/state 的 carrier 键增量。
 	s.mux.HandleFunc("POST /api/qmt/carrier/update", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleCarrierUpdatePost))
+	s.mux.HandleFunc("POST /api/qmt/carrier/force-report", s.strictPermMiddleware(auth.PermTradingAdmin, s.handleCarrierForceReportPost))
 	// QMT 实盘状态/成交：§MULTI-ACCT-B 批5 起 quant_trade 也能读**自己账号**的这两本账
 	// （handler 全按 userIDFor(r) 过滤，跨账号视图仍只有运营侧的 trading_admin 拿得到）。
 	s.mux.HandleFunc("GET /api/qmt/state", s.strictAnyPermsMiddleware(auth.PermTradingAdmin, auth.PermQuantTrade)(s.handleQMTState))
