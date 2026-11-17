@@ -22854,3 +22854,80 @@ grep_q '4 passed' VT193 || { echo "--- FAIL: §193 行为腿未跑满 4 例：$(
 [ "$B193_FAILED" = "0" ] || exit 1
 echo "ok - §193 §20261117-POS-REAL-NEW 锁通过（实盘新增入口/真单唯一出口/建仓分键/纸面仍隐藏/挂载首轮拉实盘 + 4 用例在册并真跑，累计判定点 ${CNT193}）"
 echo ""
+
+# §194 §20261117-WIRING-C（云端强制刷新实盘账端到端：路由/字段/消费/上报腿旁路去重/前端按钮；
+# 负锁：force 不得另开第二条上报函数、普通 ack 不破 4 键契约、归属只认钥匙）。
+echo "==> 194 §20261117-WIRING-C（强制刷新：置位→manifest 透传→盒子 report --force→ack 清旗标）..."
+B194_FAILED=0
+fail194() {
+	echo "--- FAIL: §194 $*"
+	FAIL=1
+	B194_FAILED=1
+}
+CNT194=0
+
+# ① Go 端：字段 + 置位处理器 + 路由 trading_admin + GET 透传 + ack force_consumed 清除
+CNT194=$((CNT194 + 1))
+grep -qF 'ForceReport bool `json:"force_report"`' internal/server/carrier.go \
+	|| fail194 "carrierManifest 缺 ForceReport 字段"
+CNT194=$((CNT194 + 1))
+grep -qF 'handleCarrierForceReportPost' internal/server/carrier.go \
+	|| fail194 "缺 force-report 处理器"
+CNT194=$((CNT194 + 1))
+grep -qF 'POST /api/qmt/carrier/force-report' internal/server/server.go \
+	|| fail194 "force-report 路由未注册"
+CNT194=$((CNT194 + 1))
+grep -qE 'strict(All|Any)?Perm(s)?Middleware\(auth\.PermTradingAdmin, s\.handleCarrierForceReportPost' internal/server/server.go \
+	|| fail194 "force-report 未挂 trading_admin 严格位"
+CNT194=$((CNT194 + 1))
+grep -qF 'req.ForceConsumed != nil && *req.ForceConsumed && doc.ForceReport' internal/server/carrier.go \
+	|| fail194 "ack 未按 force_consumed 清除旗标"
+
+# ② 盒子消费：force_report=true→跑上报腿→成功才 force_consumed ack；dry-run 不上报
+CNT194=$((CNT194 + 1))
+grep -qE 'manifest.get\("force_report"\) is True' qmt_gateway/carrier_updater.py \
+	|| fail194 "carrier_updater 未消费 force_report 旗标"
+CNT194=$((CNT194 + 1))
+grep -qF 'up = report_uplink.ReportUplink(self.config_path)' qmt_gateway/carrier_updater.py \
+	|| fail194 "强刷未复用 report_uplink 同一条上报腿（另起上报=破坏归属单点）"
+CNT194=$((CNT194 + 1))
+grep -qF 'force_consumed' qmt_gateway/carrier_updater.py \
+	|| fail194 "ack 缺 force_consumed 传递"
+
+# ③ report_uplink force：旁路去重但仍同一条 POST；CLI --force
+CNT194=$((CNT194 + 1))
+grep -qE 'def run_once\(self, force=False\)' qmt_gateway/report_uplink.py \
+	|| fail194 "report_uplink.run_once 缺 force 形参"
+CNT194=$((CNT194 + 1))
+grep -qF 'if force and dedupable' qmt_gateway/report_uplink.py \
+	|| fail194 "force 旁路去重逻辑缺失"
+# 负锁：force 不许另开第二条上报函数——全文件上报出口仍只有 _post 一处走 _urllib_opener
+CNT194=$((CNT194 + 1))
+POSTS=$(grep -cE 'self\._opener\(' qmt_gateway/report_uplink.py || true)
+[ "$POSTS" -ge 1 ] || fail194 "上报腿 _opener 调用点丢失"
+
+
+# ④ 前端：api 函数 + 按钮 testid（CALLPATH 入账，与 §115 R220/C177 同源）
+CNT194=$((CNT194 + 1))
+grep -qF 'export async function requestCarrierForceReport' web/src/api/index.js \
+	|| fail194 "前端 api 缺 requestCarrierForceReport"
+CNT194=$((CNT194 + 1))
+grep -qF 'data-testid="carrier-force-report"' web/src/components/CarrierUpdatePanel.jsx \
+	|| fail194 "前端缺强制刷新按钮 testid"
+
+# ⑤ 行为腿真跑（go 端 + python 端各一道，缺任一不许算通过）
+G194=$(timeout 240 go test ./internal/server/ -run TestCarrierForceReport -count=1 2>&1 || true)
+CNT194=$((CNT194 + 1))
+grep_q 'ok' G194 || { echo "--- FAIL: §194 Go force_report 行为腿未过：$(printf '%s\n' "$G194" | tail -5)"; B194_FAILED=1; }
+P194=$( cd qmt_gateway && timeout 120 python3 -m pytest tests/test_carrier_updater.py -k ForceReport tests/test_report_uplink.py -k force 2>&1 || true )
+CNT194=$((CNT194 + 1))
+grep_q 'passed' P194 || { echo "--- FAIL: §194 python force 行为腿未过：$(printf '%s\n' "$P194" | tail -6)"; B194_FAILED=1; }
+
+# ⑥ 普通 ack 仍 4 键（force_consumed 仅 True 时多带）——契约不破
+CNT194=$((CNT194 + 1))
+grep -qF 'if force_consumed:' qmt_gateway/carrier_updater.py \
+	|| fail194 "force_consumed 必须按 True 才附带（普通 ack 维持 4 键契约）"
+
+[ "$B194_FAILED" = "0" ] || exit 1
+echo "ok - §194 §20261117-WIRING-C 锁通过（force-report 路由/字段/透传/ack清除 + 盒子消费复用同一上报腿 + report --force 旁路去重 + 前端按钮 + 4 键契约不破 + go/py 双行为腿，累计判定点 ${CNT194}）"
+echo ""
