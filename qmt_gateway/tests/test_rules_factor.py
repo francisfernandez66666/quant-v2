@@ -443,6 +443,58 @@ class TestPercentileSemantics(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# (3b) PERCENTILE-SERIES 2026-11-17（owner 路线B）：全市场情绪/涨停池因子不再是
+# "今天一个数" 的二值 proxy，而是把 pregen 烘出的 N 日历史序列喂给原生 percentile，
+# 取末值在自身历史中的连续分位（0~1）。这里钉住"序列真的走到 percentile"这件事——
+# 否则改回 scalar_proxy 会让整条路线静默失效（band 缺失→弃权），而测试全绿。
+# ---------------------------------------------------------------------------
+
+class TestPercentileSeriesFactors(unittest.TestCase):
+    """情绪/涨停池因子的 series 路径：history list -> percentile -> 连续分。"""
+
+    SERIES_FACTORS = ("emo_limit_up", "emo_max_board", "emo_blast_rate",
+                      "emo_blast_cnt", "emo_chg5", "lu_reblast_low")
+
+    def _rule(self, fid, threshold=70.0):
+        return {"id": "fac_series_%s" % fid, "name": "factor_composite",
+                "factors": [fid], "weights": {fid: 1.0},
+                "directions": {fid: 1}, "buy_threshold": threshold}
+
+    def test_six_factors_are_series_kind(self):
+        """塞雷锁：任一因子退回 scalar_proxy/list 即红——路线B 静默失效的形状。"""
+        lib = rf.FACTOR_LIBRARY
+        for fid in self.SERIES_FACTORS:
+            spec = lib[fid]
+            self.assertEqual(spec["kind"], "series", "%s kind must be series" % fid)
+            self.assertTrue(str(spec["input"]).endswith("_history"),
+                            "%s input must be a *_history series" % fid)
+
+    def test_series_factor_ranks_own_history(self):
+        """末值在历史里排最高 → 分位 1 → 复合分满格、规则过线。"""
+        rule = self._rule("emo_limit_up")
+        scene = ctx(limit_up_count_history=[20.0, 30.0, 40.0, 50.0, 90.0])
+        scored = rf.score_factor_rule(params(factor_rules=[rule]), rule, scene)
+        self.assertFalse(scored["declined"])
+        self.assertAlmostEqual(scored["details"]["emo_limit_up"], 1.0)
+        self.assertTrue(scored["pass"])
+
+    def test_mid_history_scores_mid_percentile(self):
+        """末值居中 → 连续分（非二值 0/1）：这正是路线B 优于 band 的证据。"""
+        rule = self._rule("emo_max_board")
+        scene = ctx(ladder_height_history=[2.0, 4.0, 6.0, 8.0, 5.0])
+        scored = rf.score_factor_rule(params(factor_rules=[rule]), rule, scene)
+        self.assertFalse(scored["declined"])
+        self.assertAlmostEqual(scored["details"]["emo_max_board"], 0.5)
+
+    def test_absent_history_declines_not_zero(self):
+        """没有 history 就诚实弃权，绝不把缺失当 0 分（缺读数一律弃权纪律）。"""
+        rule = self._rule("emo_blast_cnt")
+        scored = rf.score_factor_rule(params(factor_rules=[rule]), rule, ctx())
+        self.assertTrue(scored["declined"])
+        self.assertIn("input_absent", scored["reason"])
+
+
+# ---------------------------------------------------------------------------
 # (4) 形态战法：AND + 右开区间（Go pattern.go:198）
 # ---------------------------------------------------------------------------
 

@@ -963,35 +963,35 @@
         "missing_input": "point-in-time financial report (PIT)"
       },
       "emo_limit_up": {
-        "kind": "scalar_proxy",
+        "kind": "series",
         "windows": [],
-        "input": "limit_up_count",
+        "input": "limit_up_count_history",
         "direct": true,
         "missing_input": "market limit-up history"
       },
       "emo_max_board": {
-        "kind": "scalar_proxy",
+        "kind": "series",
         "windows": [],
-        "input": "ladder_height",
+        "input": "ladder_height_history",
         "direct": true,
         "missing_input": "market ladder-height history"
       },
       "emo_blast_rate": {
-        "kind": "scalar_proxy",
+        "kind": "series",
         "windows": [],
-        "input": "broken_board_ratio",
+        "input": "broken_board_ratio_history",
         "direct": true,
         "missing_input": "market blast-rate history"
       },
       "emo_blast_cnt": {
-        "kind": "scalar_proxy",
+        "kind": "series",
         "windows": [],
-        "input": "broken_board_count",
+        "input": "broken_board_count_history",
         "direct": true,
         "missing_input": "market blast-count history"
       },
       "emo_chg5": {
-        "kind": "scalar_proxy",
+        "kind": "series",
         "windows": [],
         "input": "limit_up_count_history",
         "direct": true,
@@ -1026,7 +1026,7 @@
         "missing_input": "first seal minute + break count (THS pool)"
       },
       "lu_reblast_low": {
-        "kind": "scalar_proxy",
+        "kind": "series",
         "windows": [],
         "input": "broken_board_ratio_history",
         "direct": true,

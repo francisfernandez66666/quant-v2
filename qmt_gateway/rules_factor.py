@@ -189,15 +189,21 @@ FACTOR_LIBRARY = {
             "missing_input": "point-in-time financial report (PIT)"},
     # market emotion family (Go emotion.go): only TODAY's market scalar exists
     # in the sandbox, never the history a percentile needs.
-    "emo_limit_up": {"kind": "scalar_proxy", "windows": [], "input": "limit_up_count",
+    # PERCENTILE-SERIES 2026-11-17 (owner route B): market emotion factors now
+    # consume baked per-session history series and use the native
+    # time_series_percentile (rank of today's value in its own history, 0~1),
+    # replacing the binary scalar_proxy band. pregen #13 bakes 20-point series;
+    # emo_chg5 previously abstained forever (list input -> _as_number=None).
+    # kind="series" passes the baked series through via _f_raw_series.
+    "emo_limit_up": {"kind": "series", "windows": [], "input": "limit_up_count_history",
                      "direct": True, "missing_input": "market limit-up history"},
-    "emo_max_board": {"kind": "scalar_proxy", "windows": [], "input": "ladder_height",
+    "emo_max_board": {"kind": "series", "windows": [], "input": "ladder_height_history",
                       "direct": True, "missing_input": "market ladder-height history"},
-    "emo_blast_rate": {"kind": "scalar_proxy", "windows": [], "input": "broken_board_ratio",
+    "emo_blast_rate": {"kind": "series", "windows": [], "input": "broken_board_ratio_history",
                        "direct": True, "missing_input": "market blast-rate history"},
-    "emo_blast_cnt": {"kind": "scalar_proxy", "windows": [], "input": "broken_board_count",
-                     "direct": True, "missing_input": "market blast-count history"},
-    "emo_chg5": {"kind": "scalar_proxy", "windows": [], "input": "limit_up_count_history",
+    "emo_blast_cnt": {"kind": "series", "windows": [], "input": "broken_board_count_history",
+                      "direct": True, "missing_input": "market blast-count history"},
+    "emo_chg5": {"kind": "series", "windows": [], "input": "limit_up_count_history",
                  "direct": True, "missing_input": "market limit-up history"},
     # limit-up microstructure family (Go limitup_micro.go): the THS pools are
     # research-DB tables; the sandbox has no per-stock board / seal / first-lock
@@ -210,7 +216,7 @@ FACTOR_LIBRARY = {
                          "direct": True, "missing_input": "seal amount / free-float cap (THS pool)"},
     "lu_early_seal": {"kind": "scalar_proxy", "windows": [], "input": "first_seal_minute",
                       "direct": True, "missing_input": "first seal minute + break count (THS pool)"},
-    "lu_reblast_low": {"kind": "scalar_proxy", "windows": [], "input": "broken_board_ratio_history",
+    "lu_reblast_low": {"kind": "series", "windows": [], "input": "broken_board_ratio_history",
                        "direct": True, "missing_input": "market blast-rate history (THS pool)"},
     # capital flow -- the eastmoney main-force net inflow leg (Go reads it through
     # internal/engine/flow_factor_track.go and the GetRealtimeQuoteWithFlow chain).
@@ -976,6 +982,16 @@ def _f_ln_mktcap(cols, windows, series):
     return out
 
 
+def _f_raw_series(cols, windows, series):
+    """PERCENTILE-SERIES 2026-11-17: pass a baked per-session series through
+    unchanged so evaluate_factor_rules ranks its newest value with the standard
+    time_series_percentile. cols/windows are unused (market scalars have no
+    per-stock bar axis); keeping the signature identical to other _SERIES_KINDS
+    handlers means factor_input needs no special case for these factors.
+    """
+    return list(series)
+
+
 def _f_valuation(cols, windows, series, reciprocal):
     out = _nan_list(len(cols["close"]))
     for index in range(len(out)):
@@ -1021,6 +1037,7 @@ _SERIES_KINDS = {
     "turnover_mean": _f_turnover_mean,
     "turnover_std": _f_turnover_std,
     "ln_mktcap": _f_ln_mktcap,
+    "series": _f_raw_series,  # PERCENTILE-SERIES: baked market history -> percentile
 }
 
 

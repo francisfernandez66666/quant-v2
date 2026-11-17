@@ -23216,3 +23216,65 @@ grep_q 'passed' PY199 || { echo "--- FAIL: §199 pregen 烘值行为腿未过：
 [ "$B199_FAILED" = "0" ] || exit 1
 echo "ok - §199 §20261117-D1-LEVEL 锁通过（schema列+迁移 + 打分带出 + 落库 + pregen三态烘值 + 反文本猜负锁 + Go/py行为腿，累计判定点 ${CNT199}）"
 echo ""
+
+# §200 §20261117-PERCENTILE-SERIES（owner 路线B：全市场情绪/涨停池因子从二值 band 改为
+# 原生时序百分位连续打分）。pregen 烘 N 日 history 序列 → 因子 kind=series 透传 →
+# time_series_percentile 取末值分位（0~1）。命门：factor_defs 是 carrier-owned 表，
+# 必须同时改源码 FACTOR_LIBRARY 与烘参 local_executor_params.json 的 6 项定义，
+# 否则 derive kept=file、运行时读旧定义 → 路线B 静默失效（11-16 session_windows 同型）。
+echo "==> 200 §20261117-PERCENTILE-SERIES（源码+烘参6项series + _f_raw_series + pregen history + 塞雷 + 行为腿）..."
+B200_FAILED=0
+fail200() {
+	echo "--- FAIL: §200 $*"
+	FAIL=1
+	B200_FAILED=1
+}
+CNT200=0
+
+# ① 源码 FACTOR_LIBRARY：6 因子 kind=series + input 为 *_history。
+for _f200 in emo_limit_up emo_max_board emo_blast_rate emo_blast_cnt emo_chg5 lu_reblast_low; do
+	CNT200=$((CNT200 + 1))
+	grep -qE "\"$_f200\": \{\"kind\": \"series\"" qmt_gateway/rules_factor.py \
+		|| fail200 "源码因子 $_f200 非 series（路线B 源码被回退）"
+done
+
+# ② handler：_f_raw_series 存在 + 注册 kind "series" + 透传 list 不改写成标量。
+CNT200=$((CNT200 + 1))
+grep -qF 'def _f_raw_series(cols, windows, series)' qmt_gateway/rules_factor.py || fail200 "缺 _f_raw_series（series 处理器）"
+CNT200=$((CNT200 + 1))
+grep -qF '"series": _f_raw_series' qmt_gateway/rules_factor.py || fail200 "_SERIES_KINDS 未注册 series"
+CNT200=$((CNT200 + 1))
+grep -qF 'return list(series)' qmt_gateway/rules_factor.py || fail200 "_f_raw_series 未透传整段序列（percentile 需要 history 而非末值）"
+
+# ③ 烘参（命门）：local_executor_params.json 的 6 项也必须是 series，否则运行时读旧定义。
+for _f200 in emo_limit_up emo_max_board emo_blast_rate emo_blast_cnt emo_chg5 lu_reblast_low; do
+	CNT200=$((CNT200 + 1))
+	if ! grep -A3 "\"$_f200\":" qmt_gateway/local_executor_params.json | grep -q '"kind": "series"'; then
+		fail200 "烘参因子 $_f200 非 series（源码改了但烘参没同步＝运行时仍走旧定义）"
+	fi
+done
+
+# ④ pregen：MAX(continue_cnt) 得连板高度 + 烘 ladder_height_history / broken_board_count_history。
+CNT200=$((CNT200 + 1))
+grep -qF 'MAX(continue_cnt)' scripts/pregen_carrier_factors_gz.py || fail200 "pregen 未取 MAX(continue_cnt)（连板高度历史无源）"
+CNT200=$((CNT200 + 1))
+grep -qF '"ladder_height_history": board_hist' scripts/pregen_carrier_factors_gz.py || fail200 "pregen 未烘 ladder_height_history"
+CNT200=$((CNT200 + 1))
+grep -qF '"broken_board_count_history": blast_cnt_hist' scripts/pregen_carrier_factors_gz.py || fail200 "pregen 未烘 broken_board_count_history"
+CNT200=$((CNT200 + 1))
+grep -qF '"ladder_height": float(last_mb)' scripts/pregen_carrier_factors_gz.py || fail200 "pregen 未烘当日 ladder_height 标量"
+
+# ⑤ 负锁：这 6 因子不许回到 scalar_proxy + 当日标量 input（防止路线A 回潮把 series 覆盖）。
+CNT200=$((CNT200 + 1))
+if grep -E '"(emo_limit_up|emo_max_board|emo_blast_rate|emo_blast_cnt)": \{"kind": "scalar_proxy", "windows": \[\], "input": "(limit_up_count|ladder_height|broken_board_ratio|broken_board_count)"' qmt_gateway/rules_factor.py; then
+	fail200 "情绪因子回退到 scalar_proxy 当日标量（路线A 回潮，塞雷必须拦）"
+fi
+
+# ⑥ 行为腿真跑：6 因子 series + 连续分位 + 缺 history 弃权。
+PY200=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_rules_factor.py -k PercentileSeriesFactors -q 2>&1 || true )
+CNT200=$((CNT200 + 1))
+grep_q '4 passed' PY200 || { echo "--- FAIL: §200 series 行为腿未跑满 4 例：$(printf '%s\n' "$PY200" | tail -6)"; B200_FAILED=1; }
+
+[ "$B200_FAILED" = "0" ] || exit 1
+echo "ok - §200 §20261117-PERCENTILE-SERIES 锁通过（源码+烘参6项series + handler + pregen history + 反scalar_proxy回潮 + 4例行为腿，累计判定点 ${CNT200}）"
+echo ""

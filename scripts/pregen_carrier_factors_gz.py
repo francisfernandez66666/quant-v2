@@ -334,7 +334,8 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
     # broken_board_ratio/count 给最近一交易日的标量（含 emotion_day 让 as-of 可见），单位见
     # fetch_market_history 注释（0..1 比值）——owner 标定 band 时须对齐。
     for _mk in ("limit_up_count_history", "broken_board_ratio_history",
-                "broken_board_count", "broken_board_ratio", "emotion_day"):
+                "broken_board_count", "broken_board_ratio", "emotion_day",
+                "ladder_height_history", "broken_board_count_history"):
         if _mk in market:
             out[_mk] = market[_mk]
     # 涨停价（leader_decay 的 up_stop = 今日板价）：stk_limit 最新一行的 up_limit。
@@ -420,7 +421,9 @@ def fetch_market_history(day, lookback=20):
     English: per-session market emotion series read from the engine's own authoritative
     pool tables; None on any gap so consumers decline honestly rather than score a 0.
     """
-    lu_rows = _q("SELECT trade_date, COUNT(*) FROM ths_limit_up_daily "
+    # §PERCENTILE-SERIES 2026-11-17（owner 路线B）：补 MAX(continue_cnt) 得每日最高连板，
+    # 连同炸板家数都烘成 history 序列，供 emo_max_board/emo_blast_cnt 走原生 percentile。
+    lu_rows = _q("SELECT trade_date, COUNT(*), MAX(continue_cnt) FROM ths_limit_up_daily "
                  "WHERE trade_date<=? GROUP BY trade_date "
                  "ORDER BY trade_date DESC LIMIT ?", (day, lookback))
     if not lu_rows:
@@ -429,26 +432,32 @@ def fetch_market_history(day, lookback=20):
                  "WHERE trade_date<=? GROUP BY trade_date "
                  "ORDER BY trade_date DESC LIMIT ?", (day, lookback)) or []
     br_by_day = {str(r[0]): int(r[1]) for r in br_rows if r and r[0] is not None}
-    sessions = []  # (trade_date, limit_cnt, break_cnt) 旧→新
+    sessions = []  # (trade_date, limit_cnt, max_board, break_cnt) 旧→新
     for r in reversed(list(lu_rows)):
         d = str(r[0])
         lc = int(r[1]) if r[1] is not None else 0
+        mb = int(r[2]) if len(r) > 2 and r[2] is not None else 0
         bc = br_by_day.get(d, 0)
-        sessions.append((d, lc, bc))
+        sessions.append((d, lc, mb, bc))
     if not sessions:
         return None
     lu_hist = [float(s[1]) for s in sessions]
+    board_hist = [float(s[2]) for s in sessions]
+    blast_cnt_hist = [float(s[3]) for s in sessions]
     ratio_hist = []
-    for (_d, lc, bc) in sessions:
+    for (_d, lc, _mb, bc) in sessions:
         denom = lc + bc
         ratio_hist.append(round(bc / float(denom), 6) if denom > 0 else 0.0)
-    last_d, last_lc, last_bc = sessions[-1]
+    last_d, last_lc, last_mb, last_bc = sessions[-1]
     denom = last_lc + last_bc
     return {
         "limit_up_count_history": lu_hist,
+        "ladder_height_history": board_hist,
+        "broken_board_count_history": blast_cnt_hist,
         "broken_board_ratio_history": ratio_hist,
         "broken_board_count": float(last_bc),
         "broken_board_ratio": round(last_bc / float(denom), 6) if denom > 0 else 0.0,
+        "ladder_height": float(last_mb),
         "emotion_day": last_d,
     }
 

@@ -156,7 +156,8 @@ class PregenWiringB(unittest.TestCase):
         def q(sql, args):
             s = " ".join(sql.split())
             if "FROM ths_limit_up_daily" in s and "GROUP BY trade_date" in s:
-                return [("20261116", 30), ("20261115", 20), ("20261114", 10)]
+                # (trade_date, count, max_continue_cnt) —— 路线B 要烘连板高度历史
+                return [("20261116", 30, 5), ("20261115", 20, 3), ("20261114", 10, 2)]
             if "FROM ths_break_pool_daily" in s and "GROUP BY trade_date" in s:
                 return [("20261116", 10), ("20261114", 2)]  # 20261115 缺行 -> break 0
             return None
@@ -175,6 +176,10 @@ class PregenWiringB(unittest.TestCase):
         self.assertEqual(h["broken_board_count"], 10.0)
         self.assertAlmostEqual(h["broken_board_ratio"], 0.25, places=6)
         self.assertEqual(h["emotion_day"], "20261116")
+        # 路线B：连板高度历史 + 炸板家数历史也须烘出（old->new）
+        self.assertEqual(h["ladder_height_history"], [2.0, 3.0, 5.0])
+        self.assertEqual(h["broken_board_count_history"], [2.0, 0.0, 10.0])
+        self.assertEqual(h["ladder_height"], 5.0)
 
     def test_fetch_market_history_returns_none_when_pool_table_empty(self):
         # 盘前池未同步 / 表不存在：_q 返回 None/空 ⇒ 整个历史 None，绝不烘一个 0 序列。
