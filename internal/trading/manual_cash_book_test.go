@@ -3,9 +3,10 @@
 // 这一条锁的是"柜台连不上就以手工维护的可用资金为准"到底成不成立，以及它在什么情况下**必须不成立**：
 //
 //	① 柜台新鲜 ⇒ source=counter，值与改前逐字相同（本批不许动正常链路，一个字节都不动）；
-//	② 柜台陈旧 + 手动账当日可用 ⇒ source=manual、fresh=true（裁决 1 的正腿；没有它整个功能等于没接）；
-//	③ 柜台陈旧 + 手动账 asof 停在昨天 ⇒ fresh=false，保持 §M12-A fail-close
-//	   （"几天前手敲的余额"不许在下次桥断时顶上——方向是放钱，必须响亮地不可得）；
+//	② 柜台陈旧 + 手动账当日或**跨日携带期内**（owner 2026-11-18：跨日不失效）⇒ source=manual、fresh=true
+//	   （裁决 1 的正腿；没有它整个功能等于没接）；
+//	③ 柜台陈旧 + 手动账**超出跨日携带上限** ⇒ fresh=false，保持 §M12-A fail-close
+//	   （这本账没人再碰过，不许在下次桥断时顶上——方向是放钱，必须响亮地不可得）；
 //	④ 柜台陈旧 + 手动账已被柜台接管且 asof 早于接管 ⇒ 同 ③（裁决 5 的防复活腿）；
 //	⑤ 手动真 0 ⇒ fresh=true 且值就是 0（真 0 与不可得不得混写，§M12-A 那条纪律对手动维同样成立）。
 //
@@ -78,19 +79,38 @@ func TestAvailableCashBookFallsBackToManual(t *testing.T) {
 	}
 }
 
-func TestAvailableCashBookStaleManualDoesNotUnlock(t *testing.T) {
+// TestAvailableCashBookExpiredManualDoesNotUnlock 锁③：手动账**超出跨日携带上限** ⇒ 保持 §M12-A fail-close。
+// owner 2026-11-18 撤掉的是"过零点就失效"，不是"旧账永远算数"。
+func TestAvailableCashBookExpiredManualDoesNotUnlock(t *testing.T) {
 	uid := "u_book3"
+	ctrl, db := manualCashCtrl(t, uid)
+	seedCounterCash(t, db, uid, 5000, 40*time.Minute)
+	expired := cntime.DayOf(cntime.Now().AddDate(-1, 0, 0)) + " 09:35:00"
+	if err := db.PutManualAccount(uid, 32000, true, 0, expired); err != nil {
+		t.Fatalf("写过期的手动资金: %v", err)
+	}
+	cash, fresh, source := ctrl.AvailableCashBook()
+	if fresh || source != "none" {
+		t.Fatalf("超出跨日上限的手动账不许解开 §M12-A fail-close，got (%.0f,%v,%q)", cash, fresh, source)
+	}
+	if cash != 5000 {
+		t.Fatalf("回落失败时必须仍带柜台原值供前端横幅展示（cash_stale 语义），got %.0f", cash)
+	}
+}
+
+// TestAvailableCashBookCarriedManualUnlocks 锁②的另一半（owner 2026-11-18 改判的正腿）：
+// 昨天手敲的余额今天仍然参与（跨日携带），且 source 点名 manual。
+// 把"必须当日"加回 manualAsofUsable ⇒ 本格必红。
+func TestAvailableCashBookCarriedManualUnlocks(t *testing.T) {
+	uid := "u_book3c"
 	ctrl, db := manualCashCtrl(t, uid)
 	seedCounterCash(t, db, uid, 5000, 40*time.Minute)
 	if err := db.PutManualAccount(uid, 32000, true, 0, manualYesterdayAsof()); err != nil {
 		t.Fatalf("写昨天的手动资金: %v", err)
 	}
 	cash, fresh, source := ctrl.AvailableCashBook()
-	if fresh || source != "none" {
-		t.Fatalf("asof 停在昨天的手动账不许解开 §M12-A fail-close，got (%.0f,%v,%q)", cash, fresh, source)
-	}
-	if cash != 5000 {
-		t.Fatalf("回落失败时必须仍带柜台原值供前端横幅展示（cash_stale 语义），got %.0f", cash)
+	if cash != 32000 || !fresh || source != "manual" {
+		t.Fatalf("跨日携带的手动账必须参与资金判定，got (%.0f,%v,%q)", cash, fresh, source)
 	}
 }
 

@@ -4,8 +4,9 @@
 // 改判不等于放开——所以四条锁里有两条是"必须仍然不成立"的：
 //
 //	① 柜台新鲜时，手动账哪怕写着 99 万也不许参与（裁决 1 前半句"以柜台为准"，方向是放钱，最容易被改坏）；
-//	② 陈旧柜台 + 手动 asof 停在昨天 ⇒ 两本账都不作数，闸保持改前的保守分支；
-//	③ 陈旧柜台 + 手动当日账 ⇒ 可用资金帽与集中度分母真的换成手动数，且拒单文案点名"手动实盘口径"；
+//	② 陈旧柜台 + 手动账**超出跨日携带上限**（owner 2026-11-18：跨日可用，但不是无限期）
+//	   ⇒ 两本账都不作数，闸保持改前的保守分支；
+//	③ 陈旧柜台 + 手动账（当日**或携带期内**）⇒ 可用资金帽与集中度分母真的换成手动数，且拒单文案点名"手动实盘口径"；
 //	④ T+1 可卖量：持仓基线换手动量，并额外扣掉当日**改账**买入（桥断时人工买的票不进 orders，
 //	   这一项是唯一有据可查的当日增量；漏了它会把昨天全量说成今天可卖）。
 package risk
@@ -97,24 +98,59 @@ func TestGateManualCashCap(t *testing.T) {
 	}
 }
 
-// TestGateManualStaleAsofKeepsLegacyBranch 锁②：手动 asof 停在昨天 ⇒ 闸回到改前的保守分支。
-func TestGateManualStaleAsofKeepsLegacyBranch(t *testing.T) {
+// TestGateManualExpiredAsofKeepsLegacyBranch 锁②：手动账超出**跨日携带上限** ⇒ 闸回到改前的保守分支。
+// owner 2026-11-18 撤掉的是"过零点就失效"，不是"旧账永远算数"：一本没人再碰过的账不许
+// 在下次桥断时顶上（这类账号也没有接管指针能把它顶掉）。所以这里用一个远超上限的日期。
+func TestGateManualExpiredAsofKeepsLegacyBranch(t *testing.T) {
 	db := gateDB(t)
 	uid := "u_mb_stale"
 	g := NewGate(db, uid, nil)
 	cfg := qmtCfg()
 	seedStaleCounter(t, db, uid, "600000.SH", 4000, 5000)
-	if err := db.PutManualAccount(uid, 100000, true, 0, riskYesterday()+" 09:35:00"); err != nil {
-		t.Fatalf("seed stale manual cash: %v", err)
+	expired := cntime.Now().AddDate(-1, 0, 0).Format("2006-01-02") + " 09:35:00"
+	if err := db.PutManualAccount(uid, 100000, true, 0, expired); err != nil {
+		t.Fatalf("seed expired manual cash: %v", err)
 	}
 	o := liveOrder(SideBuy)
 	o.Amount = 6000
 	v := g.CheckLiveOrder(cfg, o)
 	if v.Pass {
-		t.Fatalf("asof 停在昨天的手动账不许解开可用资金帽, got %+v", v)
+		t.Fatalf("超出跨日上限的手动账不许解开可用资金帽, got %+v", v)
 	}
 	if strings.Contains(v.Reason, "手动实盘") {
 		t.Fatalf("本轮不该用手动账，文案却点名了手动口径：%q", v.Reason)
+	}
+}
+
+// TestGateManualCarriedUnlocksCashCap 锁②的另一半（owner 2026-11-18 改判的正腿）：
+// 陈旧柜台 + 手动账 asof 停在**昨天** ⇒ 仍然必须参与，且拒单文案点名手动口径。
+// 这一格是方向锁：把 manualAsofUsable 里"必须当日"那条加回去 ⇒ 必红
+// （11-18 早上的现场就是它：前夜手敲的 11 只票一过零点全被判过期）。
+func TestGateManualCarriedUnlocksCashCap(t *testing.T) {
+	db := gateDB(t)
+	uid := "u_mb_carried"
+	g := NewGate(db, uid, nil)
+	cfg := qmtCfg()
+	cfg.DailyBudgetAmount = 0
+	seedStaleCounter(t, db, uid, "600000.SH", 4000, 5000)
+	if err := db.PutManualAccount(uid, 100000, true, 0, riskYesterday()+" 20:45:00"); err != nil {
+		t.Fatalf("seed carried manual cash: %v", err)
+	}
+	// 改前形态：柜台 5000 陈旧 ⇒ 保守 2500，6000 必拒。跨日携带后：手动 10 万 ⇒ 放行。
+	o := liveOrder(SideBuy)
+	o.Amount = 6000
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("跨日携带的手动账 10 万应放行 6000 买单, got %+v", v)
+	}
+	// 超上限时文案必须点名手动口径与 asof，让人看出这是自己敲的余额在拦。
+	o2 := liveOrder(SideBuy)
+	o2.Amount = 300000
+	v2 := g.CheckLiveOrder(cfg, o2)
+	if v2.Pass {
+		t.Fatalf("30 万买单必须被跨日手动账 10 万拦下, got %+v", v2)
+	}
+	if !strings.Contains(v2.Reason, "手动实盘口径") {
+		t.Fatalf("拒单文案必须点名手动实盘口径, got %q", v2.Reason)
 	}
 }
 

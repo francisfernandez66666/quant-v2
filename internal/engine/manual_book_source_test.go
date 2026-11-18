@@ -6,9 +6,9 @@
 // 本批把上午那批的"手动账只做计算输入、绝不进必须新鲜硬闸"**改判**成"喂买卖硬闸"
 // （owner 2026-11-06 裁决 1），所以这里锁的四件事也跟着换向：
 //
-//	① 桥不新鲜且维护了**当日**手动账 ⇒ 计算输入真的换成那几行；
-//	② 没维护手动账、或 asof 停在昨天、或已被柜台接管 ⇒ 保持 fail-closed，
-//	   绝不把空账当成"零仓位/零资金"放行（这是裁决 1 的两条前置，不是放松）；
+//	① 桥不新鲜且维护了手动账（当日或跨日携带）⇒ 计算输入真的换成那几行；
+//	② 没维护手动账、手动账该维不可用（无时刻/未来时刻/已被柜台接管）⇒ 保持 fail-closed，
+//	   绝不把空账当成"零仓位/零资金"放行（这是裁决 1 的前置，不是放松）；
 //	③ 手动数据只活在内存里：不写回 real_*，不伪造 UpdatedAt / CanUseQty。
 //	   伪造它们等于用"刚回报过"的形态去解开新鲜度闸——本批要的是**显式选源**，不是假时间戳；
 //	④ 两维独立：柜台可能资金还在报而持仓快照停在昨天（或反过来），不许折成一个全局开关。
@@ -97,45 +97,55 @@ func liveBridgeEngine(t *testing.T) (*Engine, *store.DB) {
 	return e, db
 }
 
-// TestManualBookDimensionsIndependent 两维独立：柜台资金新鲜、柜台持仓快照停在昨天 ⇒
-// 资金维吃柜台、持仓维吃手动。折成一个开关会把"哪个数是谁给的"重新糊掉。
+// TestManualBookDimensionsIndependent 两维独立（owner 2026-11-18 改判后的优先序）：
+// 手动持仓可用 ⇒ 持仓维吃手动，即便柜台持仓今天也在报数；资金维没录手动 ⇒ 仍吃柜台。
+// 折成一个开关会把"哪个数是谁给的"重新糊掉，而这两个数一个决定买多少、一个决定能不能卖。
 func TestManualBookDimensionsIndependent(t *testing.T) {
 	e, db := liveBridgeEngine(t)
-	// 把柜台资金行刷成"刚刚回报"（夹具种的就是当前时刻，这里显式再写一次以表达意图）。
+	// 柜台两维都新鲜：资金刚回报，持仓快照属今日（"柜台还在报数"的形态）。
 	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_1", AvailableCash: 7_777,
 		UpdatedAt: cntime.Now().Format("2006-01-02 15:04:05")}); err != nil {
 		t.Fatalf("刷新柜台资金: %v", err)
 	}
-	// 柜台持仓行故意种成昨天（桥断当天冻结的样子）。
-	yesterday := cntime.DayOf(cntime.Now().AddDate(0, 0, -1)) + " 14:55:00"
+	today := cntime.DayOf(cntime.Now()) + " 09:45:00"
 	if _, err := db.ReconcilePositionsForUser("u_1", []store.RealPosition{
-		{TsCode: "600000.SH", Qty: 4000, CostPrice: 8.0, UpdatedAt: yesterday},
+		{TsCode: "600999.SH", Qty: 4000, CostPrice: 8.0, UpdatedAt: today},
 	}); err != nil {
-		t.Fatalf("种昨天持仓: %v", err)
+		t.Fatalf("种柜台持仓: %v", err)
 	}
-	putManualBook(t, db)
+	// 只录手动**持仓**（不填手动资金）：这一维应当按"手动优先"判，另一维仍回到柜台。
+	asof := manualBookAsof()
+	rows := []store.ManualPosition{
+		{TsCode: "600000.SH", Name: "浦发银行", Qty: 1000, CostPrice: 9.8},
+		{TsCode: "000001.SZ", Name: "平安银行", Qty: 500, CostPrice: 11.2},
+	}
+	if _, _, err := db.PutManualPositions("u_1", rows, asof); err != nil {
+		t.Fatalf("写手动持仓: %v", err)
+	}
 	book := e.accountBookFor("u_1")
 	if book.CashSource != accountSourceCounter {
-		t.Fatalf("柜台资金新鲜时资金维必须吃柜台，got %q", book.CashSource)
+		t.Fatalf("没录手动资金的维度必须回到柜台，got %q", book.CashSource)
 	}
 	if book.Account.AvailableCash != 7_777 {
 		t.Fatalf("资金维数值应为柜台 7777，got %.0f", book.Account.AvailableCash)
 	}
 	if book.PositionsSource != accountSourceManual {
-		t.Fatalf("柜台持仓快照不属于今日，持仓维必须吃手动，got %q", book.PositionsSource)
+		t.Fatalf("手动持仓可用时持仓维必须吃手动（手动高于柜台），got %q", book.PositionsSource)
 	}
 	if len(book.Positions) != 2 {
 		t.Fatalf("持仓维应换成手动 2 行，got %+v", book.Positions)
 	}
-	// 合成展示值仍是 manual（任一维手动即标注"非柜台实时读数"），但 asof 取持仓维那一路。
-	if book.Source != accountSourceManual || book.PositionsAsOf != manualBookAsof() {
+	// 合成展示值仍是 manual（任一维手动即标注"非柜台实时读数"），asof 取手动那一路。
+	if book.Source != accountSourceManual || book.PositionsAsOf != asof {
 		t.Fatalf("展示值与持仓维时刻都要点名，got source=%q posAsOf=%q", book.Source, book.PositionsAsOf)
 	}
 }
 
-// TestManualBookStaleAsofDoesNotSwitch asof 停在昨天 ⇒ 两维都不许切（裁决 1 的前置判据）。
-// 这一条锁的方向是"不许放开"：几天前手敲的那本账在下次桥断时顶上，等于用旧余额放行新买入。
-func TestManualBookStaleAsofDoesNotSwitch(t *testing.T) {
+// TestManualBookCarriedAsofStaysUsable 跨日携带（owner 2026-11-18 裁决）：
+// 「手动账跨日直接失效不合理」——昨天手敲的账在桥断当天仍然必须参与计算，
+// 且读数面带得回那个**昨天的** asof（屏上据此写「非今日」）。
+// 这一格是本次改判的方向锁：把"asof 属今日"这条前置加回来 ⇒ 必红。
+func TestManualBookCarriedAsofStaysUsable(t *testing.T) {
 	e, db := bridgeDownEngine(t)
 	old := manualBookAsofYesterday()
 	if err := db.PutManualAccount("u_1", 50_000, true, 200_000, old); err != nil {
@@ -145,9 +155,16 @@ func TestManualBookStaleAsofDoesNotSwitch(t *testing.T) {
 		t.Fatalf("写昨日手动持仓: %v", err)
 	}
 	book := e.accountBookFor("u_1")
-	if book.Manual || book.CashSource != accountSourceCounter || book.PositionsSource != accountSourceCounter {
-		t.Fatalf("asof 停在昨天的手动账两维都不许参与: manual=%v cash=%q pos=%q",
+	if !book.Manual || book.CashSource != accountSourceManual || book.PositionsSource != accountSourceManual {
+		t.Fatalf("跨日的手动账必须继续参与: manual=%v cash=%q pos=%q",
 			book.Manual, book.CashSource, book.PositionsSource)
+	}
+	if book.Account.AvailableCash != 50_000 || len(book.Positions) != 1 {
+		t.Fatalf("跨日账的数值必须原样带上: %+v / %+v", book.Account, book.Positions)
+	}
+	// asof 必须是那个**昨天的**时刻：读数面靠它写「非今日」，不许洗成今天。
+	if book.CashAsOf != old || book.PositionsAsOf != old {
+		t.Fatalf("跨日账的时刻不许被洗成今天，got cash=%q pos=%q", book.CashAsOf, book.PositionsAsOf)
 	}
 }
 

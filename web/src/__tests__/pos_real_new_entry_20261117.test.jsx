@@ -133,15 +133,16 @@ describe('2026-11-17 持仓页「新增实盘持仓」入口', () => {
     expect(payload.client_id, '§P2-15 幂等键必须在').toBeTruthy()
   })
 
-  it('N2 改账态：同一枚按钮打开改账弹窗（不下单），execute 一次都不许被调用', async () => {
+  it('N2 改账态：同一枚按钮打开改账入口（不下单），execute 一次都不许被调用', async () => {
     state.bookSource = MANUAL
     render(<Positions />)
     fireEvent.click(await screen.findByTestId('real-new-entry'))
 
-    // 改账弹窗自己的标识（与真单弹窗刻意不同形）
-    await screen.findByTestId('manual-adjust-dialog')
+    // 2026-11-18 owner 需求：改账态这枚按钮改开**批量录入**弹窗（一次 1..N 只票）；
+    // 单行改账仍在状态行的「改账·新增」上。两条腿都写同一个端点、都不下单。
+    // 判据保留原来的两条：弹窗自己的标识 + 确认按钮必须说清"不下单"。
+    await screen.findByTestId('manual-batch-dialog')
     expect(api.executeRealAction).not.toHaveBeenCalled()
-    // 确认按钮文案必须说清"不下单"，不能与真单共用一张脸
     const ctxs = [...document.querySelectorAll('.t-dialog__ctx')]
       .filter((n) => getComputedStyle(n).display !== 'none')
     expect(ctxs[0].textContent).toContain('不下单')

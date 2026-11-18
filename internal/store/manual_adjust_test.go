@@ -56,14 +56,57 @@ func TestSnapshotBelongsToDay(t *testing.T) {
 	}
 }
 
-// TestManualBookViewUsability 裁决 1 的两条前置判据逐格：
-// 今日可用 / 昨天不可用 / 未来不可用 / 被接管且 asof 早于接管不可用 / 接管后又改过重新可用。
+// TestManualAsofCarryHorizon 跨日携带的上限（owner 2026-11-18 裁决的边界）：
+// 13 天前仍可用（覆盖 8–9 天长假还有余量）、恰好 14 天仍可用（`>` 而非 `>=`）、
+// 15 天起判不可用（一本没人再碰过的账不许无限期当买入依据）。
+// 这一格锁的是"放开跨日"与"别把上个月的账当今天"之间的那条线：
+// 把上限删掉 ⇒ 第 15 天那格必红；把上限收紧成 0（回到"必须当日"）⇒ 第 13 天那格必红。
+func TestManualAsofCarryHorizon(t *testing.T) {
+	today := manualToday()
+	cases := []struct {
+		name string
+		days int
+		want bool
+	}{
+		{"今天", 0, true},
+		{"昨天", -1, true},
+		{"长假后第 9 天", -9, true},
+		{"第 13 天", -13, true},
+		{"恰好 14 天", -14, true},
+		{"第 15 天", -15, false},
+		{"第 30 天", -30, false},
+		{"未来", 1, false},
+	}
+	for _, c := range cases {
+		if got := manualAsofUsable(manualAsofOn(manualDayOffset(c.days)), "", today); got != c.want {
+			t.Fatalf("%s（%d 天）：可用性应=%v，实得 %v", c.name, c.days, c.want, got)
+		}
+	}
+	// 空/不可解析的 asof 一律不可用（没有时刻的账不许参与决策）。
+	for _, bad := range []string{"", "   ", "2026-11", "not-a-date"} {
+		if manualAsofUsable(bad, "", today) {
+			t.Fatalf("asof=%q 应判不可用", bad)
+		}
+	}
+	// 上限不放松接管判据：被接管之后即便在携带期内也要让位。
+	if manualAsofUsable(manualAsofOn(manualDayOffset(-1)), today+" 08:00:00", today) {
+		t.Fatal("被柜台接管 + asof 更早的手动账必须让位")
+	}
+	// 接管后又改过（asof 晚于接管）⇒ 重新可用。
+	if !manualAsofUsable(today+" 09:30:00", today+" 08:00:00", today) {
+		t.Fatal("接管后重新维护的账必须重新可用")
+	}
+}
+
+// TestManualBookViewUsability 可用性判据逐格（owner 2026-11-18 改判后）：
+// 今日可用 / **昨天也可用（跨日携带，Carried=true）** / 未来不可用 /
+// 被接管且 asof 早于接管不可用 / 接管后又改过重新可用。
 func TestManualBookViewUsability(t *testing.T) {
 	db := manualTestDB(t)
 	uid := "u_unify"
 	today := manualToday()
 
-	// ① 今日 asof ⇒ 两维都可用。
+	// ① 今日 asof ⇒ 两维都可用，且都不是"携带"。
 	if _, _, err := db.PutManualPositions(uid, []ManualPosition{{TsCode: "600000.SH", Name: "浦发银行", Qty: 1000, CostPrice: 8.5}}, manualAsofOn(today)); err != nil {
 		t.Fatalf("写手动持仓: %v", err)
 	}
@@ -77,8 +120,13 @@ func TestManualBookViewUsability(t *testing.T) {
 	if !v.CashUsable || !v.PositionsUsable || len(v.Positions) != 1 {
 		t.Fatalf("今日维护的手动账两维都必须可用，got cash=%v pos=%v rows=%d", v.CashUsable, v.PositionsUsable, len(v.Positions))
 	}
+	if v.CashCarried || v.PositionsCarried {
+		t.Fatalf("今日的账不该标「跨日携带」，got cash=%v pos=%v", v.CashCarried, v.PositionsCarried)
+	}
 
-	// ② asof 停在昨天 ⇒ 两维都当读不到（不许拿旧账顶上今天）。
+	// ② asof 停在昨天 ⇒ **仍然可用**，但必须标成跨日携带（owner 2026-11-18：
+	//    「手动账跨日直接失效不合理」）。这一格是本次改判的行为锁：
+	//    把 day 判据加回去（asof[:10] != day ⇒ false）⇒ 本格必红。
 	if _, _, err := db.PutManualPositions(uid, []ManualPosition{{TsCode: "600000.SH", Name: "浦发银行", Qty: 1000, CostPrice: 8.5}}, manualAsofOn(manualDayOffset(-1))); err != nil {
 		t.Fatalf("改写 asof 到昨天: %v", err)
 	}
@@ -86,8 +134,11 @@ func TestManualBookViewUsability(t *testing.T) {
 		t.Fatalf("改写资金 asof 到昨天: %v", err)
 	}
 	v, _ = db.ManualBookViewFor(uid, today)
-	if v.CashUsable || v.PositionsUsable {
-		t.Fatalf("昨天的手动账不许在今天当输入用（cash=%v pos=%v）", v.CashUsable, v.PositionsUsable)
+	if !v.CashUsable || !v.PositionsUsable || len(v.Positions) != 1 {
+		t.Fatalf("跨日的手动账不许失效（cash=%v pos=%v rows=%d）", v.CashUsable, v.PositionsUsable, len(v.Positions))
+	}
+	if !v.CashCarried || !v.PositionsCarried {
+		t.Fatalf("跨日可用的账必须自报「非今日」，got cash=%v pos=%v", v.CashCarried, v.PositionsCarried)
 	}
 
 	// ③ asof 敲成未来 ⇒ 同样不可用（人敲错一个日期就解开资金闸，方向是放钱）。
@@ -119,9 +170,53 @@ func TestManualBookViewUsability(t *testing.T) {
 	if !v.PositionsUsable || len(v.Positions) != 1 || v.Positions[0].Qty != 1200 {
 		t.Fatalf("接管后重新维护的行必须重新可用，got %+v", v.Positions)
 	}
-	// 资金行没再动（asof 仍是昨天）⇒ 两维独立：持仓可用不代表资金可用。
+	if v.PositionsCarried {
+		t.Fatal("今天的改动不该被标成跨日携带")
+	}
+	// 资金行没再动 ⇒ 两维独立：持仓刚被重新维护，资金仍停在**接管指针的阴影里**
+	//（asof 昨天 ≤ 接管时刻今天 15:00）——挡住它的是接管，不是"不是今天的账"。
+	// 跨日携带本身可用这一点由 ② 单独锁住（那里没有接管指针）。
 	if v.CashUsable {
-		t.Fatal("资金维度必须独立判定：持仓可用不代表资金可用")
+		t.Fatalf("资金维必须独立判定：藏接管指针之后资金不许复活，got usable=%v", v.CashUsable)
+	}
+	if !v.CashCarried {
+		t.Fatal("资金读数仍是昨日 asof，必须标「非今日」")
+	}
+}
+
+// TestManualEmptyBookCarriedAcrossDays 昨天把最后一只票清仓（manual_positions 空表 + 昨日流水）
+// ⇒ 今天零点之后这本**显式维护过的空仓**仍然成立，不许回落旧柜台行（11-11 事故的跨日版本）。
+func TestManualEmptyBookCarriedAcrossDays(t *testing.T) {
+	db := manualTestDB(t)
+	uid := "u_empty_carried"
+	today := manualToday()
+	yesterday := manualDayOffset(-1)
+	// 昨日清仓：先有一只，再走改账入口清掉（只有改账会留下 manual_flows 证据，
+	// 而"这本账被显式维护过"的证据正是空仓仍然成立的依据）。
+	if _, _, err := db.PutManualPositions(uid, []ManualPosition{{TsCode: "600000.SH", Qty: 1000}}, manualAsofOn(yesterday)); err != nil {
+		t.Fatalf("写昨日持仓: %v", err)
+	}
+	if err := db.PutManualAccount(uid, 30000, true, 0, manualAsofOn(yesterday)); err != nil {
+		t.Fatalf("写昨日资金: %v", err)
+	}
+	if _, err := db.AdjustManualBook(uid, ManualAdjustReq{
+		Op: ManualOpClose, TsCode: "600000.SH", Qty: 1000, Price: 9.5,
+		AsOf: manualAsofOn(yesterday), User: uid,
+	}, yesterday); err != nil {
+		t.Fatalf("昨日清仓改账: %v", err)
+	}
+	v, err := db.ManualBookViewFor(uid, today)
+	if err != nil {
+		t.Fatalf("ManualBookViewFor: %v", err)
+	}
+	if !v.PositionsUsable || len(v.Positions) != 0 {
+		t.Fatalf("昨日显式清仓的空仓今天仍应可用且为空，got usable=%v rows=%d", v.PositionsUsable, len(v.Positions))
+	}
+	if !v.PositionsCarried {
+		t.Fatal("跨日带来的空仓必须标「非今日」")
+	}
+	if v.PositionsAsOf == "" {
+		t.Fatal("空仓也要带 asof（读数面据它显示数据截至）")
 	}
 }
 

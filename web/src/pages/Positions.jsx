@@ -8,14 +8,14 @@
 // 战法开关做的是硬过滤，所以表下另起一行「另有 N 条因战法未启用被过滤」，载荷没带这个键时不渲染。
 // 纯 TDesign 组件（Tabs / TabPanel / Card / Table / Dialog / Form / Input / InputNumber / Button / Tag），无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
-import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin, DialogPlugin } from 'tdesign-react'
+import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin, DialogPlugin, Textarea } from 'tdesign-react'
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import AnchorShadowCard from '../components/AnchorShadowCard.jsx' // §ANCHOR-FIRST W2 影子对照（只读）
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 // §MANUAL-BOOK-UNIFY（2026-11-06 裁决 1/2/4）：独立的手动维护面板已删除（方案 §6.1），
 // 维护统一落进实仓 tab；「手动维护，更新于 <asof>」「非柜台实时读数」两串身份文案仍取自全站唯一源。
-import { manualSourceMain, MANUAL_SOURCE_NONREALTIME } from '../utils/manualSource.js'
+import { manualSourceMain, manualCarriedNote, MANUAL_SOURCE_NONREALTIME } from '../utils/manualSource.js'
 import { on } from '../sseBus.js'
 // 2026-11-11 owner 需求：手动/自动维护改为前端显式开关，不再硬等系统判冻结/熔断。
 // 自动＝跟随 book_source（柜台帧冻结时仍自动放开改账，避免按钮全灰）；手动＝强制改账态。
@@ -42,6 +42,53 @@ export function normalizeManualCode(raw) {
 }
 export function resolveBookMode(bookMode, cashManual, posManual, counterFrozen) {
   return bookMode === 'manual' || !!(cashManual || posManual || counterFrozen)
+}
+
+// §MANUAL-BATCH-20261118：批量录入文本 → 逐笔 op=new 请求（纯函数，行为锁直测这一支）。
+//
+// 为什么是"每行一只票"的文本而不是一张可编辑表格：一次要录十来只票时，点十次「加一行」
+// 再填三个框，比直接粘贴快一个数量级；而粘贴的代价是错行——所以下面每条非法行都
+// **带行号点名原因**，且整批不提交（一行错就整批退回，不猜调用方想不想跳过）。
+//
+// 接受的形状（三列，顺序固定 代码 数量 成交价）：空白/逗号/制表符分隔都行；
+// 代码可写 600000、600000.SH、sz000001；`#` 开头与空行忽略（方便从别处粘表格带表头）。
+// 返回 { rows:[{ts_code,qty,price,line,raw}], errors:[{line,raw,reason}] }。
+export function parseManualBatch(text) {
+  const rows = []
+  const errors = []
+  const lines = String(text || '').split(/\r?\n/)
+  const seen = new Map() // 同一批里重复的代码：重复即为错（后一条会静默覆盖前一条＝账上少一只）
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i].trim()
+    if (!raw || raw.startsWith('#')) continue
+    const cols = raw.split(/[,，\t ]+/).filter(Boolean)
+    if (cols.length !== 3) {
+      errors.push({ line: i + 1, raw, reason: `应有 3 列（代码 数量 成交价），实际 ${cols.length} 列` })
+      continue
+    }
+    const code = normalizeManualCode(cols[0].replace(/^(SH|SZ|BJ)/i, ''))
+    if (!/^\d{6}\.(SH|SZ|BJ)$/.test(code)) {
+      errors.push({ line: i + 1, raw, reason: `代码「${cols[0]}」认不出来（要 6 位数字或带 .SH/.SZ/.BJ 后缀）` })
+      continue
+    }
+    const qty = Number(cols[1])
+    if (!Number.isInteger(qty) || qty <= 0) {
+      errors.push({ line: i + 1, raw, reason: `数量「${cols[1]}」必须是正整数股数` })
+      continue
+    }
+    const price = Number(cols[2])
+    if (!Number.isFinite(price) || price <= 0) {
+      errors.push({ line: i + 1, raw, reason: `成交价「${cols[2]}」必须是大于 0 的数字` })
+      continue
+    }
+    if (seen.has(code)) {
+      errors.push({ line: i + 1, raw, reason: `与第 ${seen.get(code)} 行重复（同一只票一批只许出现一次，否则前一条会被覆盖）` })
+      continue
+    }
+    seen.set(code, i + 1)
+    rows.push({ ts_code: code, qty, price, line: i + 1, raw })
+  }
+  return { rows, errors }
 }
 import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import { usePolling } from '../utils/usePolling.js' // §N-09 统一可见性轮询生命周期
@@ -250,6 +297,16 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
   const counterFrozen = !!realBookSource?.counter_frozen
   const manualMode = resolveBookMode(bookMode, cashManual, posManual, counterFrozen)
   const bookUnknown = !counterReachable && !manualMode
+  // §MANUAL-CARRIED（2026-11-18 owner 裁决）：手动账跨日可用，但屏上必须说出"这不是今天的账"。
+  // 两维各自携带 ⇒ 取**最早**那一维的 asof：让人看到最旧的那个数，而不是较新的那个
+  // （较新的那个会让人以为整本账都刚核对过）。
+  const manualCarriedAsOf = (() => {
+    const carried = []
+    if (realBookSource?.positions_carried && realBookSource?.positions_asof) carried.push(realBookSource.positions_asof)
+    if (realBookSource?.cash_carried && realBookSource?.cash_asof) carried.push(realBookSource.cash_asof)
+    if (!carried.length) return ''
+    return carried.sort()[0]
+  })()
   // 当前实盘下单参数（持仓+方向）
   const [realAction, setRealAction] = useState(null)
   // 实盘下单价格/数量/策略
@@ -279,6 +336,14 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
   // 免得与改持仓的动作混在同一张弹窗里互相预填。
   const [manualSetCashShow, setManualSetCashShow] = useState(false)
   const [manualSetCashVal, setManualSetCashVal] = useState('')
+  // §MANUAL-BATCH-20261118（owner 需求：一次性录入多个股票）：批量录入弹窗。
+  // 一次手敲整本账（facai2026 11-18 实录：11 只票逐只点了 6 分钟）本来就不该是一只一只点的。
+  // 提交形态刻意是**逐笔 op=new**（服务端 adjust 一次只接一条，且每笔各自留流水与资金联动）——
+  // 前端只是把这一步自动化，不引入"批次事务"这种新的钱路径语义：部分成功必须逐行可见。
+  const [manualBatchShow, setManualBatchShow] = useState(false)
+  const [manualBatchText, setManualBatchText] = useState('')
+  const [manualBatchResult, setManualBatchResult] = useState(null) // {ok:[], failed:[{line,ts_code,reason}]}
+  const [manualBatchBusy, setManualBatchBusy] = useState(false)
   // 实盘轮询由 §N-09 的 usePolling 统一管理（进入实盘标签且为 admin 时启用）
   // §M-10（2026-09-22 PM 批清扫）轮询请求代号守卫：纸面 load 与实盘 loadReal 各自独立代号，
   // 60s 轮询/SSE 触发/手动刷新交错时，旧请求的迟到响应整包丢弃（防数据倒挂）。
@@ -1059,6 +1124,71 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
       MessagePlugin.error('改账失败（未产生任何委托）：' + (e && e.message ? e.message : '请求失败'))
     } finally { setManualSubmitting(false) }
   }
+  // §MANUAL-BATCH-20261118 批量录入：打开弹窗（不清空上一批文本——重开时继续编辑比重新粘贴好）
+  function openManualBatch() {
+    setManualBatchResult(null)
+    setManualBatchShow(true)
+  }
+  // 把「最近一次手动账快照」里的行带进文本框：这就是跨日失效后最省事的复核形态
+  // （快照是昨日账的只读副本，带进来只是省掉重敲，提交仍逐笔按今日 op=new 记账）。
+  function fillBatchFromSnapshot() {
+    const snap = realBookSource?.last_manual_snapshot
+    const pos = (snap && snap.positions) || []
+    if (!pos.length) {
+      MessagePlugin.warning('没有可带入的手动账快照（今天已经录过，或快照还没生成）')
+      return
+    }
+    const txt = pos
+      .filter((p) => p && p.ts_code && Number(p.qty) > 0)
+      .map((p) => `${p.ts_code} ${Math.round(Number(p.qty))} ${Number(p.cost_price) || 0}`)
+      .join('\n')
+    setManualBatchText(txt)
+    setManualBatchResult(null)
+    MessagePlugin.info(`已带入 ${snap.day || ''} 的手动账快照 ${pos.length} 行，请逐行核对数量与成本后再提交`)
+  }
+  // 批量提交：逐笔 op=new（服务端 adjust 一次只接一条），逐行收结论。
+  // 任何一行失败都不静默丢弃：失败的留在弹窗里点名（代码 + 原因），成功的那几笔已经落账
+  // 且各自有流水——所以文案说的是"成功 N 笔、失败 M 笔"，不是"录入失败"。
+  async function confirmManualBatch() {
+    const parsed = parseManualBatch(manualBatchText)
+    if (parsed.errors.length) {
+      MessagePlugin.error(`有 ${parsed.errors.length} 行认不出来，整批未提交：第 ${parsed.errors[0].line} 行 ${parsed.errors[0].reason}`)
+      return
+    }
+    if (!parsed.rows.length) {
+      MessagePlugin.warning('没有可提交的行（每行三列：代码 数量 成交价）')
+      return
+    }
+    setManualBatchBusy(true)
+    const ok = []
+    const failed = []
+    try {
+      for (const row of parsed.rows) {
+        try {
+          // 逐笔串行：服务端每笔都要读基线再写（含资金联动），并发提交会互相抢同一份基线。
+          await api.adjustManualBook({ op: 'new', ts_code: row.ts_code, qty: row.qty, price: row.price })
+          ok.push(row)
+        } catch (e) {
+          failed.push({ line: row.line, ts_code: row.ts_code, reason: (e && e.message) || '请求失败' })
+        }
+      }
+      setManualBatchResult({ ok, failed })
+      if (!failed.length) {
+        MessagePlugin.success(`已录入 ${ok.length} 只（不下单）；本批成交额合计 ¥${ok.reduce((s, r) => s + r.qty * r.price, 0).toFixed(2)}`)
+        setManualBatchShow(false)
+        setManualBatchText('')
+      } else {
+        MessagePlugin.error(`成功 ${ok.length} 笔、失败 ${failed.length} 笔：失败行已列在弹窗里，修正后可只提交剩下的`)
+        // 只把失败行留在文本框里重试（成功的那几笔再提交一次会走同票覆盖，虽然幂等但没意义）
+        setManualBatchText(failed.map((f) => {
+          const r = parsed.rows.find((x) => x.line === f.line)
+          return r ? `${r.ts_code} ${r.qty} ${r.price}` : ''
+        }).filter(Boolean).join('\n'))
+      }
+      loadReal()
+    } finally { setManualBatchBusy(false) }
+  }
+
   // 提交改账（op ∈ add|reduce|tp|close|new）：与真单语义互斥——本笔不触柜台、不产生委托。
   async function confirmManualAdjust() {
     const a = manualAction
@@ -1242,7 +1372,8 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
         <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.ts_code}</span>
         {posSrc === 'manual' && (
           <Tag data-testid="manual-row-badge" theme="warning" size="small"
-            title={manualSourceMain(realBookSource?.positions_asof) + ' · ' + MANUAL_SOURCE_NONREALTIME}>改账</Tag>
+            title={manualSourceMain(realBookSource?.positions_asof) + ' · ' + MANUAL_SOURCE_NONREALTIME
+              + (realBookSource?.positions_carried ? ' · ' + manualCarriedNote(realBookSource?.positions_asof) : '')}>改账</Tag>
         )}
       </span>
     ) },
@@ -1380,12 +1511,14 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
             {bookTab === 'paper' && canFundsWrite && <Button theme="primary" onClick={openAddNew}>+ 新增持仓（纸面）</Button>}
             {/* 2026-11-17 owner 需求：实盘 tab 的「新增实盘持仓」入口加回来。
                 一个按钮两种含义，判据与行内四动作**同源**（不另立第三套判断）：
-                  · manualMode（柜台不可达/手动维护）⇒ 走「改账·新增」（写 manual_*，不下单）；
+                  · manualMode（柜台不可达/手动维护）⇒ 走「改账」（写 manual_*，不下单）；
+                    2026-11-18 owner 需求：这里打开的是**批量录入**弹窗（1..N 行，一次录完整本账）；
+                    单行改账仍可由状态行里的「改账·新增」进入，两者写同一个端点；
                   · 否则 canTrading（能发真单）⇒ 新建真单弹窗（代码可编辑，走 execute）；
                   · 两者都不是 ⇒ 不渲染（与行内操作列显示 '—' 同一口径）。
                 纸面按钮仍由 SHOW_PAPER_TAB=false 隐藏，两者不会同屏。 */}
             {bookTab === 'real' && (manualMode || canTrading) && (
-              <Button data-testid="real-new-entry" theme="primary" onClick={manualMode ? openManualNew : openRealNew}>
+              <Button data-testid="real-new-entry" theme="primary" onClick={manualMode ? openManualBatch : openRealNew}>
                 + 新增实盘持仓
               </Button>
             )}
@@ -1555,9 +1688,16 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
                 <span className="muted" data-testid="manual-book-note">
                   {manualSourceMain(realBookSource?.positions_asof || realBookSource?.cash_asof)} · {MANUAL_SOURCE_NONREALTIME}
                 </span>
+                {/* §MANUAL-CARRIED（owner 2026-11-18）：跨日可用的账必须自报"不是今天的"。
+                    这一枚刻意与上面那句身份句并列而不是折进它：身份句说"谁给的、什么时候录的"，
+                    这一句说"这个数不是今天的"——两件事的处置动作不同（前者只是出处，后者是先去核对）。 */}
+                {manualCarriedAsOf && (
+                  <Tag data-testid="manual-carried" theme="warning" size="small">{manualCarriedNote(manualCarriedAsOf)}</Tag>
+                )}
                 {realBookSource?.taken_over_at && <span className="muted">已被柜台接管于 {realBookSource.taken_over_at}</span>}
                 <span className="muted">四个动作只改账（不下单）</span>
                 <Button data-testid="manual-new-entry" size="small" variant="outline" theme="warning" onClick={openManualNew}>改账·新增</Button>
+                <Button data-testid="manual-batch-entry" size="small" variant="outline" theme="warning" onClick={openManualBatch}>批量录入</Button>
                 <Button data-testid="manual-set-cash-entry" size="small" variant="outline" theme="default" onClick={openManualSetCash}>直接改资金</Button>
               </>
             ) : bookUnknown ? (
@@ -1567,6 +1707,7 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
                 {/* 2026-11-10 owner 需求（全用户手动持仓维护）：无物理机账号（柜台从未回报、
                     手动账也还没录）从这里开始手动维护——先录一笔，book_source 立即翻成改账态。 */}
                 <Button data-testid="manual-new-entry" size="small" variant="outline" theme="warning" onClick={openManualNew}>改账·新增</Button>
+                <Button data-testid="manual-batch-entry" size="small" variant="outline" theme="warning" onClick={openManualBatch}>批量录入</Button>
                 <Button data-testid="manual-set-cash-entry" size="small" variant="outline" theme="default" onClick={openManualSetCash}>直接改资金</Button>
               </>
             ) : null}
@@ -1593,8 +1734,10 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
                 {realEnabled && (
                   <p className="muted">
                     {bookUnknown
-                      ? '读数未知：柜台未报数，手动账也没有当日数据。请在「手动维护」补录，或检查柜台回报通路；屏上仓位可能不是今天的'
-                      : '等待 QMT 网关回报 /api/qmt/report 推送持仓对账'}
+                      ? '读数未知：柜台未报数，也没有可用的手动账（未录 / 已超 14 天未更新）。请在「手动维护」补录，或检查柜台回报通路；屏上仓位不是今天的'
+                      : manualMode && realBookSource?.positions_carried
+                        ? `手动账当前为空仓（${manualCarriedNote(realBookSource?.positions_asof)}）：这是显式维护过的空仓，不是没读到`
+                        : '等待 QMT 网关回报 /api/qmt/report 推送持仓对账'}
                     {realBookSource?.last_manual_asof
                       ? ` · 最近手动账数据截至 ${realBookSource.last_manual_asof}`
                       : ''}
@@ -1861,6 +2004,95 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
             <div className="muted">预估金额：¥{(realFormQty * realFormPrice).toFixed(2)}</div>
           )}
         </Form>
+      </Dialog>
+
+      {/* §MANUAL-BATCH-20261118 批量录入弹窗（改账态专用，一次 1..N 只票）。
+          三个刻意的形状：
+           ① 确认按钮同样带「不下单」，与真单弹窗不同形；
+           ② 提交前把每一行回显成一张预览表（代码/数量/价格/金额 + 是否已存在将覆盖），
+              粘贴错一行的代价是"按错了价记了账"，预览是唯一能当场发现它的地方；
+           ③ 有任一行认不出来时**整批不提交**（一行错就退回，不替调用方决定跳过哪行）。 */}
+      <Dialog
+        visible={manualBatchShow}
+        header="改账 · 批量录入（不下单）"
+        width={720}
+        onClose={() => setManualBatchShow(false)}
+        onConfirm={confirmManualBatch}
+        confirmBtn={manualBatchBusy ? '录入中…' : '确认录入 · 不下单'}
+        cancelBtn="取消"
+      >
+        <div data-testid="manual-batch-dialog">
+          <div className="muted" style={{ marginBottom: 8 }}>
+            每行一只票，三列：<b>代码 数量 成交价</b>（空格 / 逗号 / Tab 分隔；<code>600000</code> 或
+            <code>600000.SH</code> 都认）。只改量仔账本，不产生任何委托；同一只票重复提交＝按本次覆盖上一次。
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+            <Button data-testid="manual-batch-from-snapshot" size="small" variant="outline" theme="default"
+              onClick={fillBatchFromSnapshot}>带入最近一次手动账</Button>
+            <Button data-testid="manual-batch-clear" size="small" variant="outline" theme="default"
+              onClick={() => { setManualBatchText(''); setManualBatchResult(null) }}>清空</Button>
+          </div>
+          <Textarea
+            data-testid="manual-batch-text"
+            value={manualBatchText}
+            autosize={{ minRows: 6, maxRows: 16 }}
+            placeholder={'600000 1000 8.50\n000001.SZ 500 11.20\n# 井号开头与空行会被忽略'}
+            onChange={(v) => { setManualBatchText(String(v ?? '')); setManualBatchResult(null) }}
+          />
+          {(() => {
+            const parsed = parseManualBatch(manualBatchText)
+            const existing = new Set((realPositions || []).map((p) => p && p.ts_code).filter(Boolean))
+            if (parsed.errors.length) {
+              return (
+                <div data-testid="manual-batch-errors" style={{ marginTop: 8, color: 'var(--td-error-color)', fontSize: 13 }}>
+                  {parsed.errors.length} 行认不出来（整批不会提交）：
+                  <ul style={{ margin: '4px 0 0 18px' }}>
+                    {parsed.errors.map((e) => (
+                      <li key={e.line}>第 {e.line} 行「{e.raw}」：{e.reason}</li>
+                    ))}
+                  </ul>
+                </div>
+              )
+            }
+            if (!parsed.rows.length) return null
+            return (
+              <div data-testid="manual-batch-preview" style={{ marginTop: 8, fontSize: 13 }}>
+                <div className="muted" style={{ marginBottom: 4 }}>
+                  将录入 {parsed.rows.length} 只，成交额合计 ¥
+                  {parsed.rows.reduce((s, r) => s + r.qty * r.price, 0).toFixed(2)}
+                </div>
+                <Table
+                  data={parsed.rows.map((r) => ({ ...r, rowKey: r.ts_code }))}
+                  rowKey="rowKey"
+                  size="small"
+                  columns={[
+                    { colKey: 'ts_code', title: '代码', width: 120 },
+                    { colKey: 'qty', title: '数量', width: 100 },
+                    { colKey: 'price', title: '成交价', width: 110, cell: ({ row }) => `¥${Number(row.price).toFixed(3)}` },
+                    { colKey: 'amt', title: '金额', width: 120, cell: ({ row }) => `¥${(row.qty * row.price).toFixed(2)}` },
+                    {
+                      colKey: 'state', title: '状态', cell: ({ row }) => (
+                        existing.has(row.ts_code)
+                          ? <Tag theme="warning" size="small" variant="light">账上已有 · 本次覆盖</Tag>
+                          : <Tag theme="success" size="small" variant="light">新建</Tag>
+                      ),
+                    },
+                  ]}
+                />
+              </div>
+            )
+          })()}
+          {manualBatchResult && manualBatchResult.failed?.length > 0 && (
+            <div data-testid="manual-batch-failed" style={{ marginTop: 8, fontSize: 13 }}>
+              <div>已成功 {manualBatchResult.ok.length} 笔；下面 {manualBatchResult.failed.length} 笔没写进去（已留在输入框里，修正后可再提交）：</div>
+              <ul style={{ margin: '4px 0 0 18px', color: 'var(--td-error-color)' }}>
+                {manualBatchResult.failed.map((f) => (
+                  <li key={f.line}>{f.ts_code}：{f.reason}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
       </Dialog>
 
       {/* §MANUAL-BOOK-UNIFY 改账弹窗（桥断态专用）：与上面真单弹窗**刻意不同形**。

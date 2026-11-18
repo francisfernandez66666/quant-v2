@@ -460,25 +460,70 @@ func SnapshotBelongsToDay(updatedAt, day string) bool {
 	return !pt.Before(tt)
 }
 
-// manualAsofUsable 手动读数今天还能不能当输入用（owner 2026-11-06 裁决 1 的两条前置判据）。
+// manualAsofMaxCarryDays 手动账跨日携带的最大自然日数（含边界日之外即判过期）。
 //
-// 三条都不满足即"读不到"，调用方照旧 fail-closed：
-//  1. asof 非空且**日期正好等于**当前交易日——几天前手敲的那本账不许在下次桥断时自动顶上
-//     （"以手工为准"的前提是这份手工读数本身就是按今天维护的）；
-//  2. 未来时刻同样拒（人敲错一个日期就解开资金闸，方向是放钱，必须响亮地拒）；
-//  3. 已被柜台接管（taken_over_at 非空）且 asof 不晚于接管时刻 ⇒ 这本账停在被接管那一刻，不许复活。
-//     接管之后 owner 又改了一笔（asof 更新）自然重新可用——判据只看时刻先后，不需要额外状态位。
+// 为什么不是"当日"也不是"永远"：owner 2026-11-18 裁决撤掉的是"过零点就失效"那条——
+// 前夜手敲的账第二天开盘就该能用，否则没物理机的账号每个交易日都要重新录一遍。
+// 但一本**没人再碰过**的账不能无限期当买入依据：这类账号（没有柜台回报）也没有接管指针
+// 来把它顶掉。14 天覆盖最长的连续休市（春节/国庆 8–9 个自然日）还有余量，
+// 又能在"上个月的手工账"这种形态上停住。
+// 过期时不是静默失效：ManualBookView 仍把它算出来，读数面据此写「非今日 / 已 N 天未更新」，
+// 前端在过期时明确提示需要重新核对（见 Positions.jsx 的 carried/stale 文案）。
+const manualAsofMaxCarryDays = 14
+
+// manualAsofUsable 手动读数今天还能不能当输入用。
+//
+// owner 2026-11-18 裁决（覆盖 11-06 那版"asof 必须正好等于今天"）：**手动账跨日不失效，
+// 且优先级高于柜台账**。原判据在 11-18 早上真实伤人：facai2026 前夜 20:45–20:50 手敲的
+// 11 只票，一过零点全被判"过期"，而该账号没有物理机、柜台也从不回报 ⇒ 两维都回落到
+// 那张 11-16 冻住的旧柜台行，屏上只剩 5 只、国脉/合百看起来"被删了"（其实一行没删）。
+//
+// 五条判据（少一条都会往"放钱"的方向错）：
+//  1. asof 非空且可读——空串/短串一律不可用（没有时刻的账不许参与决策）；
+//  2. **未来时刻拒**：把日期敲成明天就解锁资金闸，方向是放钱，必须响亮地拒；
+//  3. **超过 manualAsofMaxCarryDays 拒**：没人再碰过的旧账不许无限期当买入依据；
+//  4. 已被柜台接管（taken_over_at 非空）且 asof 不晚于接管时刻 ⇒ 停在被接管那一刻，不许复活。
+//     接管之后 owner 又改了一笔（asof 更新）自然重新可用——判据只看时刻先后；
+//  5. 其余一律可用（含昨天、上周、上个交易周）。
+//
+// 「这本账是哪天的」不再是"是不是今天"的判据，但仍是一个**必须上屏**的事实——
+// 见 manualAsofCarried + ManualBookView 的两个 Carried 位：跨日可用的代价是"数字可能是
+// 昨收前的"，所以屏上要写明「非今日」，绝不靠静默失效来"保守"。
 func manualAsofUsable(asof, takenOverAt, day string) bool {
 	if asof == "" || day == "" {
 		return false
 	}
-	if len(asof) < 10 || asof[:10] != day {
+	if len(asof) < 10 || len(day) < 10 {
+		return false
+	}
+	asOfDate, err1 := time.Parse("2006-01-02", asof[:10])
+	dayDate, err2 := time.Parse("2006-01-02", day[:10])
+	if err1 != nil || err2 != nil {
+		// 日期读不懂 ⇒ 判不可用（宁可让人重新核一遍，也不拿一串乱七八糟的字符放行买入）。
+		return false
+	}
+	// 未来一律拒（只拒未来、不拒过去）。
+	if asOfDate.After(dayDate) {
+		return false
+	}
+	if dayDate.Sub(asOfDate) > manualAsofMaxCarryDays*24*time.Hour {
 		return false
 	}
 	if takenOverAt != "" && asof <= takenOverAt {
 		return false
 	}
 	return true
+}
+
+// manualAsofCarried 该读数是"今天记的"还是"从前一天带过来的"。
+//
+// 只用于读数面文案（「手动维护，更新于 X（非今日）」）：可用性判据不按日，但呈现必须
+// 分得清——否则一本 11-17 的账会看起来像今早刚核对过的，而那正是这笔账唯一还能伤到人的地方。
+func manualAsofCarried(asof, day string) bool {
+	if len(asof) < 10 || len(day) < 10 {
+		return false
+	}
+	return asof[:10] < day[:10]
 }
 
 // ManualBookView 手动账在某个交易日的可用性读数（两维独立）。
@@ -494,6 +539,10 @@ type ManualBookView struct {
 	PositionsAsOf   string // 可用行里最新的 asof
 	CashAsOf        string
 	TakenOverAt     string // 持仓行与资金行里最新的接管时刻（读数面显示"已被柜台接管"）
+	// 跨日携带标记：可用但记的不是今天的账。owner 2026-11-18 裁决撤销了"必须当日"这条可用性判据，
+	// 代价是数字可能是昨收前的——所以必须在读数面如实说出来（「非今日」），不许靠静默失效装保守。
+	CashCarried      bool
+	PositionsCarried bool
 }
 
 // ManualBookViewFor 装配该账号在 day 这一天的手动账可用性。
@@ -516,6 +565,7 @@ func (d *DB) ManualBookViewFor(userID, day string) (ManualBookView, error) {
 	v.Cash = acc
 	v.CashAsOf = acc.Account.AsOf
 	v.CashUsable = acc.Present && acc.Filled && manualAsofUsable(acc.Account.AsOf, acc.Account.TakenOverAt, day)
+	v.CashCarried = manualAsofCarried(acc.Account.AsOf, day)
 	if acc.Account.TakenOverAt != "" {
 		v.TakenOverAt = acc.Account.TakenOverAt
 	}
@@ -532,15 +582,19 @@ func (d *DB) ManualBookViewFor(userID, day string) (ManualBookView, error) {
 		}
 	}
 	v.PositionsUsable = len(v.Positions) > 0
+	v.PositionsCarried = len(v.Positions) > 0 && manualAsofCarried(v.PositionsAsOf, day)
 	// 2026-11-11 owner 实锤：把最后一只持仓「清仓」后 manual_positions 变空表，旧判据
 	// len>0 ⇒ PositionsUsable=false ⇒ 读面回落旧柜台行，屏上「原持仓股数不动」。
 	// 当日有改账流水就说明这本账被人显式维护过，空仓是一个**事实**而不是「没数据」。
+	// 2026-11-18 改判：这条同样要跨日——owner 昨天清的仓，今天零点不该复活旧柜台行。
 	// English: an explicitly maintained EMPTY book is usable; otherwise closing the
-	// last position silently falls back to stale counter rows.
+	// last position silently falls back to stale counter rows. "Maintained" is not
+	// day-scoped either: carried-over emptiness is still a fact about the book.
 	if !v.PositionsUsable {
 		if asof, ferr := d.ManualLatestFlowAsof(userID, day); ferr == nil && asof != "" {
 			v.PositionsUsable = true
 			v.PositionsAsOf = asof
+			v.PositionsCarried = manualAsofCarried(asof, day)
 		}
 	}
 	// §L2 2026-11-13: self-driven daily snapshot (once per Beijing day, per
@@ -549,18 +603,27 @@ func (d *DB) ManualBookViewFor(userID, day string) (ManualBookView, error) {
 	return v, nil
 }
 
-// ManualLatestFlowAsof 返回当日最近一条改账流水的 asof（没有流水返回空串）。
-// 只用于「空仓也算子维护过」的证据判据，不参与任何资金/持仓数值计算。
-// English: latest adjustment timestamp today; empty when the book was never touched.
+// ManualLatestFlowAsof 返回**截止 day（含更早交易日）**最近一条改账流水的 asof（没有流水返回空串）。
+//
+// 只用于「空仓也算被维护过」的证据判据，不参与任何资金/持仓数值计算。
+// 2026-11-18 改判：判据从"当日流水"放宽成"截止当日的流水"——owner 昨天把最后一只票清掉，
+// 今天零点后 manual_positions 仍是空表，若只认当日流水，这本**显式维护过的空仓**
+// 会重新变成"没数据"，读面立刻回落旧柜台行（正是 11-11 那次事故的跨日版本）。
+// English: latest adjustment timestamp up to and including the given day; empty when the
+// book was never touched. Day-scoping here would resurrect stale counter rows after a
+// carried-over "closed everything" edit.
 func (d *DB) ManualLatestFlowAsof(userID, day string) (string, error) {
 	if err := d.ensureManualBook(); err != nil {
 		return "", err
 	}
+	if day == "" {
+		return "", nil
+	}
 	var asof string
 	err := d.db.QueryRow(`SELECT COALESCE(MAX(asof),'') FROM manual_flows
-		WHERE user_id = ? AND day = ?`, userID, day).Scan(&asof)
+		WHERE user_id = ? AND asof <= ?`, userID, day+" 23:59:59").Scan(&asof)
 	if err != nil {
-		return "", fmt.Errorf("manual flow today lookup: %w", err)
+		return "", fmt.Errorf("manual flow lookup: %w", err)
 	}
 	return asof, nil
 }

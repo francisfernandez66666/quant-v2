@@ -3,8 +3,11 @@
 // 沿革（两段口径相反，必须都留着，否则下一个人会把"为什么不进硬闸"当成没被改过）：
 //   - 11-06 上午 §MANUAL-BOOK-FALLBACK：桥断后手动账只当**计算输入**，硬边界写着"绝不进任何必须新鲜硬闸"。
 //   - 11-06 下午 owner 裁决 1：**手动账喂买卖硬闸**——柜台连不上就以手工维护的持仓与可用资金为准。
-//     本文件因此从一个全局开关升级成**两维各自选源**，可用性的两条前置（asof 属当前交易日、
-//     未被柜台接管覆盖）收在 store.ManualBookViewFor 一处判。
+//     本文件因此从一个全局开关升级成**两维各自选源**，可用性的前置判据
+//     （有时刻 / 非未来 / 未被柜台接管覆盖）收在 store.ManualBookViewFor 一处判。
+//   - 11-18 owner 改判：**手动账高于柜台账**，且不再要求 asof 属今日（跨日携带照样可用）。
+//     顺序变成 手动(该维可用) → 柜台(该维在报数) → unknown；柜台恢复回报会打接管指针，
+//     此后 asof 更早的手动账自动让位，所以"手动优先"不会把柜台永久顶掉。
 //
 // 仍然成立的三条边界（改的是作用维度，不是方向）：
 //  1. 只做**读数选择**：手动值绝不写回 real_*——"柜台为准"这条规则的前提是柜台账只由回报与真实成交推进；
@@ -77,8 +80,8 @@ func (e *Engine) counterAccount(uid string) (store.RealAccount, error) {
 //   - 资金维：§M12-A 的 30 分钟窗（store.CashReportFresh）；
 //   - 持仓维：§A1-FRESH 的"快照属于当前交易日"（store.CounterPositionsReporting）。
 //
-// 手动维是否可用由 store.ManualBookViewFor 判（asof 属今日 + 未被接管覆盖），本函数不重复判一次——
-// 同一个 freshness 在两处判，迟早一处严一处松，而松的那一处会放行买入。
+// 手动维是否可用由 store.ManualBookViewFor 判（有时刻 + 非未来 + 未被接管覆盖；跨日照样可用），
+// 本函数不重复判一次——同一个 freshness 在两处判，迟早一处严一处松，而松的那一处会放行买入。
 func (e *Engine) accountBookFor(uid string) accountBook {
 	book := accountBook{Source: accountSourceCounter, CashSource: accountSourceCounter, PositionsSource: accountSourceCounter}
 	e.mu.RLock()

@@ -9,8 +9,9 @@
 // 11-06 晚批改了两件事（owner 裁决逐条对应）：
 //   - 裁决 2/3/4：写面新增**增量改账**形态（`adjust`），四个动作（加仓/减仓/止盈/清仓）+ 改账新增 +
 //     直接改资金都在这一条端点上落；与既有**全量清单**形态（`positions`）互斥，全量语义原样保留给脚本面。
-//   - 裁决 1：手动读数**改为喂买卖硬闸**。旧边界"绝不进任何必须新鲜硬闸"已作废，换成两条可用性前置
-//     （asof 属当前交易日 + 未被柜台接管覆盖），判据本体在 store.ManualBookViewFor / store.SelectBookSources。
+//   - 裁决 1：手动读数**改为喂买卖硬闸**。旧边界"绝不进任何必须新鲜硬闸"已作废，换成可用性前置
+//     （有时刻 + 未被柜台接管覆盖；owner 2026-11-18 又撤销了"必须当日"那一半，改为跨日携带可用），
+//     判据本体在 store.ManualBookViewFor / store.SelectBookSources。
 //
 // 三条不许被"顺手优化"掉的边界：
 //  1. **账号级 authMiddleware，刻意不落严格位**（§2.12 原文）。这是一张成员自己维护自己声称值的表，
@@ -288,12 +289,17 @@ func (s *Server) manualBookReadout(uid string) (map[string]interface{}, error) {
 		"positions_n": len(positions),
 		"cash_state":  manualCashState(acc),
 		// §MANUAL-BOOK-UNIFY（2026-11-06 裁决 1/5）可用性三态上屏：
-		// usable_today＝asof 属当前交易日；taken_over_at＝最近一次被柜台接管；
 		// cash_usable / positions_usable 是**两维独立**的最终结论（读侧真正会不会用它）。
-		"usable_today":     view.CashUsable || view.PositionsUsable,
-		"cash_usable":      view.CashUsable,
-		"positions_usable": view.PositionsUsable,
-		"taken_over_at":    view.TakenOverAt,
+		// 2026-11-18 owner 改判后「可用」不再要求 asof 属今日：跨日携带的账照样可用，
+		// 但必须自报 *_carried —— 屏上要把「非今日」写出来，不能让它长得像今早刚核对过的。
+		// usable_today 保留为旧键（值含跨日携带），新读者请用 usable + *_carried。
+		"usable":            view.CashUsable || view.PositionsUsable,
+		"usable_today":      view.CashUsable || view.PositionsUsable,
+		"cash_usable":       view.CashUsable,
+		"positions_usable":  view.PositionsUsable,
+		"cash_carried":      view.CashCarried,
+		"positions_carried": view.PositionsCarried,
+		"taken_over_at":     view.TakenOverAt,
 		// note 是**给人看的那句**：读数面一律标"手动维护"，绝不让它长得像柜台回报
 		// （手动数据不是柜台证据，哪怕它现在会参与判定）。
 		"note": manualNote(asof),
@@ -308,9 +314,9 @@ func (s *Server) manualBookReadout(uid string) (map[string]interface{}, error) {
 			"持仓页实仓表与可用资金读数",
 		},
 		"unavailable_when": []string{
-			"柜台该维仍在报数（资金 30 分钟窗内 / 持仓快照属当前交易日）——以柜台为准",
-			"asof 不属于当前交易日",
-			"已被柜台接管且 asof 不晚于接管时刻",
+			"该维手动账不可用（无 asof / asof 落在未来 / 已被柜台接管且 asof 不晚于接管时刻）",
+			"两者皆不可用 ⇒ 该维来源标 unknown，不拿旧柜台行顶上去",
+			"手动账不是柜台证据：任何需要「券商确认过」的结论仍按柜台口径",
 		},
 		// not_used_by 只留**真正不读手动账**的那一条：VWAP 硬过滤吃的是行情成交额/量，与账本无关。
 		// 保留这个键是为了旧调用方形状不炸（有测试按它存在性判），但内容必须诚实。

@@ -11,7 +11,9 @@ import (
 	"testing"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
+	"quant-trading-v2/internal/trading"
 )
 
 // reportTestUser 是回报类测试的统一账号。scopedWrite（§L2 2026-11-13）之后，柜台回报
@@ -60,8 +62,13 @@ func TestQMTEndpointsUnavailableWithoutDB(t *testing.T) {
 // 券商清仓当日仍导出「数量 0 / 成本 0」的持仓行，uplink 原样上报后会在实盘持仓页
 // 挂成僵尸行（截图：000520.SZ 凤凰航运 数量 0，页脚却写「共 0 条数据」）。
 // 读侧响应层必须把 qty<=0 的行统一滤掉，counter / manual 两条来源都不例外。
+//
+// 2026-11-18 改判后必须显式装配控制器：柜台维只有在"实盘链路在场且持仓快照属今日"时才算
+// 在报数，否则两维都落 unknown、整表按设计清空（那会把本条测成"过滤掉了所有行"的假绿）。
 func TestHandleRealPositionsFiltersZeroQty(t *testing.T) {
 	s, db, _ := newTestResearchServer(t)
+	ctrl := trading.NewController(nil, db, reportTestUser, config.DefaultQMTConfig(), nil)
+	s.SetEngineController(fakeCtrl{qmt: ctrl})
 	if _, err := db.UpsertRealPositions([]store.RealPosition{
 		{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1200},
 		{TsCode: "000520.SZ", Name: "凤凰航运", Qty: 0, CostPrice: 0},
@@ -130,6 +137,10 @@ func TestCounterReportStrictScopeKeepsOtherAccounts(t *testing.T) {
 // English: a trade report persists via ApplyRealFill and is readable back through handleRealPositions.
 func TestHandleQMTReportTrade(t *testing.T) {
 	s, db, _ := newTestResearchServer(t)
+	// 2026-11-18：读回腿要显式装配控制器——柜台维只有在"实盘链路在场"时才算在报数，
+	// 否则会落 unknown 并按设计清空（本测试要测的是成交落库后的读回，不是 unknown 态）。
+	ctrl := trading.NewController(nil, db, reportTestUser, config.DefaultQMTConfig(), nil)
+	s.SetEngineController(fakeCtrl{qmt: ctrl})
 
 	// 建仓：买 100 股 @ 10.00
 	reqBody := `{"type":"trade","order_id":"O1","code":"600519.SH","side":"买入","price":10,"qty":100,"amount":1000,"traded_at":"2026-08-20T10:00:00+08:00","signal_id":"S1"}`

@@ -36,3 +36,37 @@ export function signalManualSource(card) {
     text: main + ' · ' + MANUAL_SOURCE_NONREALTIME,
   }
 }
+
+// ── 跨日携带（owner 2026-11-18 裁决）：手动账跨日不再失效，但**必须自报是哪天的账** ──
+// 为什么这两句要单独成一档而不并进 MANUAL_SOURCE_PREFIX：那串的语义是"我什么时候录的"
+// （身份句），这一档的语义是"这个数**不是**今天的"（新鲜度警告）。两者的处置动作不同：
+// 前者告诉你这本账的出处，后者告诉你要不要先核对一遍再去下单。
+// 说成"过期"也不对——它是**可用**的（判据在 store.manualAsofUsable，跨日携带 + 14 天上限），
+// 说成过期会让人以为决策没用它；说成"今天刚核对"则会让人按旧数字下手。
+export const MANUAL_CARRIED_PREFIX = '非今日'
+
+// manualCarriedDays 计算 asof 距 now 的自然日数。
+// 不可解析/越界一律返回 null —— **绝不返回 0**：0 在屏上等于"今天"，那是伪造新鲜度。
+export function manualCarriedDays(asof, now = new Date()) {
+  const t = asof == null ? '' : String(asof).trim()
+  if (t.length < 10) return null
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(t)
+  if (!m) return null
+  const at = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  if (Number.isNaN(at)) return null
+  const ref = now instanceof Date ? now : new Date(now)
+  if (Number.isNaN(ref.getTime())) return null
+  const today = Date.UTC(ref.getFullYear(), ref.getMonth(), ref.getDate())
+  const days = Math.round((today - at) / 86400000)
+  if (!Number.isFinite(days)) return null
+  return days
+}
+
+// manualCarriedNote 拼「非今日 · 已 N 天未更新」；天数不可得时只留「非今日」半句
+// （沿用 manualSourceMain 那条纪律：没时刻就说没时刻，不编一个数字）。
+// days <= 0 时也只留前半句：同一自然日内录的账不是"跨日"，后端也不会给 carried。
+export function manualCarriedNote(asof, now = new Date()) {
+  const n = manualCarriedDays(asof, now)
+  if (n == null || n <= 0) return MANUAL_CARRIED_PREFIX
+  return MANUAL_CARRIED_PREFIX + ' · 已 ' + n + ' 天未更新'
+}

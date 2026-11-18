@@ -253,8 +253,9 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.qmtCtrlFor(uid)
 	// §可用资金：广州实盘账户资产（可用/冻结/总值/市值），随持仓接口一并返回供前端展示。
 	acc, accErr := s.realAccountFor(uid)
-	// §MANUAL-BOOK-UNIFY（2026-11-06，owner 裁决 1/2/5）：这一张表就是"一本账"——
-	// 柜台在报数的那一维用柜台，柜台不报数的那一维用 owner 当日改出来的账，两维各自判、各自标来源。
+	// §MANUAL-BOOK-UNIFY（2026-11-06 裁决 1/2/5，2026-11-18 改判选源优先级）：这一张表就是"一本账"。
+	// 手动账该维可用就用手动（跨日也可用），否则柜台该维在报数就用柜台，两者皆否标 unknown 且不下发旧行。
+	// 两维各自判、各自标来源。
 	// 选源规则与引擎 resolver 共用 store.SelectBookSources（两处各写一份迟早一处严一处松，
 	// 而松的那一处会放行买入、严的那一处会让这张表凭空变成空表，两个方向都是事故）。
 	//
@@ -262,52 +263,66 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// 前端自己拼两本账＝同一只票可能在两张卡上各长一个数量，而这两个数谁也不报错。
 	manualView, manualViewErr := db.ManualBookViewFor(uid, cntime.DayOf(cntime.Now()))
 	bookSource := map[string]interface{}{
-		"cash": "counter", "positions": "counter",
+		"cash": store.BookSourceUnknown, "positions": store.BookSourceUnknown,
 		"cash_asof": "", "positions_asof": "", "taken_over_at": manualView.TakenOverAt,
 	}
 	if manualViewErr != nil {
-		// 可用性读不到 ⇒ 两维一律按柜台原值报（读侧不许因为旁路坏掉而改变主链读数），但要把"没判成"这件事留在响应里。
-		log.Printf("[server] §MANUAL-BOOK 手动账可用性读取失败（实仓读数保持柜台口径）user=%s: %v", uid, manualViewErr)
+		// 可用性读不到 ⇒ 按"手动这一维不参与"选源（读侧不许因为旁路坏掉而改变主链读数），
+		// 但要把"没判成"这件事留在响应里。空的 manualView 让 SelectBookSources 自然落到
+		// 柜台/unknown 两支，而不是在这里另写一套默认值。
+		log.Printf("[server] §MANUAL-BOOK 手动账可用性读取失败（实仓读数按柜台/未知口径）user=%s: %v", uid, manualViewErr)
 		bookSource["manual_unavailable"] = true
-	} else {
-		sel := store.SelectBookSources(acc, accErr, positions, nil, manualView,
-			cntime.DayOf(cntime.Now()), cntime.Now(), ctrl != nil)
-		bookSource["cash"] = sel.Cash
-		bookSource["positions"] = sel.Positions
-		bookSource["cash_asof"] = sel.CashAsOf
-		bookSource["positions_asof"] = sel.PositionsAsOf
-		if sel.Positions == "manual" {
-			converted := make([]store.RealPosition, 0, len(manualView.Positions))
-			for _, p := range manualView.Positions {
-				// UpdatedAt 取手动 asof：这张表右上角那句"持仓数据截至"必须跟着换成**人敲的时刻**，
-				// 继续显示柜台回报时刻会让"这份清单是我早上手敲的"看起来像"券商刚报的"。
-				// CanUseQty 留 nil：手动账没有柜台 T+1 可卖量（展示层也不许伪造）。
-				converted = append(converted, store.RealPosition{
-					TsCode: p.TsCode, Name: p.Name, Qty: p.Qty, CostPrice: p.CostPrice,
-					UpdatedAt: p.AsOf, UserID: uid,
-				})
-			}
-			positions = converted
-		}
-		if sel.Cash == "manual" {
-			acc = store.RealAccount{
-				UserID:        uid,
-				AvailableCash: manualView.Cash.Account.AvailableCash,
-				TotalAsset:    manualView.Cash.Account.TotalAsset,
-				UpdatedAt:     manualView.CashAsOf,
-			}
-		}
+		manualView = store.ManualBookView{Day: cntime.DayOf(cntime.Now())}
 	}
-	// §L1 2026-11-13: when BOTH dimensions silently kept the default "counter"
-	// label with no live gateway behind them, say so explicitly instead of
-	// showing a blank table labelled "counter reachable". Display-only: the
-	// decision path (SelectBookSources / manualAsofUsable) still fails closed.
-	if ctrl == nil && manualViewErr == nil &&
-		bookSource["cash"] == "counter" && bookSource["positions"] == "counter" &&
-		manualView.CashAsOf != "" {
+	sel := store.SelectBookSources(acc, accErr, positions, nil, manualView,
+		cntime.DayOf(cntime.Now()), cntime.Now(), ctrl != nil)
+	bookSource["cash"] = sel.Cash
+	bookSource["positions"] = sel.Positions
+	bookSource["cash_asof"] = sel.CashAsOf
+	bookSource["positions_asof"] = sel.PositionsAsOf
+	// 跨日携带：可用但不是今天的账 ⇒ 前端必须写「非今日」，不许看起来像今早核对过的。
+	bookSource["cash_carried"] = sel.CashCarried
+	bookSource["positions_carried"] = sel.PositionsCarried
+	// §未知不冒充（2026-11-18 owner 裁决 2）：来源 unknown 的维度**不下发任何旧行/旧余额**。
+	// 11-18 的现场是屏上写「柜台：可达」却挂着 11-16 冻住的旧行，被当成今天的持仓去改账。
+	// 空表 + unavailable 比"看起来像真账的旧账"安全；最近一次手动账快照另走 last_manual_snapshot。
+	if sel.Positions == store.BookSourceManual {
+		converted := make([]store.RealPosition, 0, len(manualView.Positions))
+		for _, p := range manualView.Positions {
+			// UpdatedAt 取手动 asof：这张表右上角那句"持仓数据截至"必须跟着换成**人敲的时刻**，
+			// 继续显示柜台回报时刻会让"这份清单是我早上手敲的"看起来像"券商刚报的"。
+			// CanUseQty 留 nil：手动账没有柜台 T+1 可卖量（展示层也不许伪造）。
+			converted = append(converted, store.RealPosition{
+				TsCode: p.TsCode, Name: p.Name, Qty: p.Qty, CostPrice: p.CostPrice,
+				UpdatedAt: p.AsOf, UserID: uid,
+			})
+		}
+		positions = converted
+	} else if sel.Positions == store.BookSourceUnknown {
+		positions = []store.RealPosition{}
+	}
+	if sel.Cash == store.BookSourceManual {
+		acc = store.RealAccount{
+			UserID:        uid,
+			AvailableCash: manualView.Cash.Account.AvailableCash,
+			TotalAsset:    manualView.Cash.Account.TotalAsset,
+			UpdatedAt:     manualView.CashAsOf,
+		}
+	} else if sel.Cash == store.BookSourceUnknown {
+		// 零值 + 空 UpdatedAt：前端据"网关未上报"渲染破折号，绝不用旧余额冒充今天的可用资金。
+		acc = store.RealAccount{UserID: uid}
+	}
+	// §UNKNOWN-HONEST：任一维读不到 ⇒ 显式标记，并把"最近手动账数据截至"随响应下发。
+	// 前端因此显示「读数未知」+ 空表 + 最近快照，而不是把旧柜台行当真账。
+	if sel.Cash == store.BookSourceUnknown || sel.Positions == store.BookSourceUnknown {
 		bookSource["unavailable"] = true
-		bookSource["last_manual_asof"] = manualView.CashAsOf
 	}
+	if asof := manualView.CashAsOf; asof != "" {
+		bookSource["last_manual_asof"] = asof
+	} else if asof := manualView.PositionsAsOf; asof != "" {
+		bookSource["last_manual_asof"] = asof
+	}
+	cashUnknown := sel.Cash == store.BookSourceUnknown
 	// §L1 2026-11-13（T6.9/T6.10）：额外下发「最近一次 manual 快照」作只读展示数据——
 	// 柜台无源 + 手动账跨日失效时（无物理机账号的每个交易日），空 tab 不再只是文案，
 	// 而是能显示快照里的持仓行 + 「数据截至」时刻。展示层专用：引擎 resolver / 风控
@@ -380,7 +395,7 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// returns a zero row and the frontend shows ¥0.00. We backfill total_asset/market_value from the
 	// positions (live price first, cost price as fallback); available cash stays 0 (unknowable here —
 	// the frontend distinguishes by updated_at).
-	if acc.UpdatedAt == "" && len(positions) > 0 {
+	if !cashUnknown && acc.UpdatedAt == "" && len(positions) > 0 {
 		// 兜底估值循环：逐只累加"现价×数量"（现价缺失回退成本价），得到近似市值/总值。
 		// 可用资金无法推算（本地无从知道冻结现金），保持 0 由前端按 updated_at 区分展示。
 		var mv float64

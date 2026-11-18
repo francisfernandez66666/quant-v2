@@ -68,21 +68,43 @@ func CounterPositionsReporting(rows []RealPosition, day string) bool {
 	return seen
 }
 
+// 选源结果的三种取值（引擎 resolver、持仓页读面、前端分流共用同一组字面量）。
+//
+// 为什么要有 third 值 unknown，而不是继续把"两本账都不可用"标成 counter：
+// 标 counter 等于替柜台担保一个它并没有给的读数——11-18 的现场就是屏上写「柜台：可达」
+// 却挂着 11-16 冻住的旧行，被当成今天的持仓去改账/下单。unknown 让"我读不到"
+// 成为一个能被看见了的事实（前端按它显示「读数未知」并交出空表，绝不画成 0 或旧行）。
+const (
+	BookSourceCounter = "counter"
+	BookSourceManual  = "manual"
+	BookSourceUnknown = "unknown"
+)
+
 // BookSources 一本账在两维上各自该信谁。
 type BookSources struct {
-	Cash          string // counter | manual
-	Positions     string // counter | manual
+	Cash          string // counter | manual | unknown
+	Positions     string // counter | manual | unknown
 	CashAsOf      string
 	PositionsAsOf string
 	TakenOverAt   string
 	AnyManual     bool
+	// Carried 手动读数虽可用，但记的不是今天的账（跨日带过来的）。
+	// 只喂读数面文案（「手动维护，更新于 X（非今日）」）：可用性不按日，呈现必须分得清。
+	CashCarried      bool
+	PositionsCarried bool
 }
 
 // SelectBookSources 选源规则的唯一真源（§MANUAL-BOOK-UNIFY 2026-11-06 裁决 1/5）。
 //
-// 引擎 resolver 与持仓页读面都调它。规则本身只有两条：
-//   - 该维柜台在报数 ⇒ 信柜台（手动账一个字不参与）；
-//   - 否则手动账该维可用（asof 属今日且未被接管覆盖，判据在 manualAsofUsable）⇒ 信手动。
+// 引擎 resolver 与持仓页读面都调它。规则（owner 2026-11-18 改判后的顺序）：
+//  1. 该维手动账可用（判据在 manualAsofUsable：有时刻、非未来、未被接管覆盖；**不看是哪天**）
+//     ⇒ 信手动——手动账高于柜台账，owner 明说前夜维护的那本不许过零点就作废；
+//  2. 否则该维柜台在报数 ⇒ 信柜台；
+//  3. 两者皆否 ⇒ unknown（调用方据此把这一维当"读不到"，绝不拿旧柜台行顶上去）。
+//
+// 柜台"能证明自己还活着"这件事仍有两个出口，所以第 1 条不会把柜台永久顶掉：
+//   - 柜台回报成功落库时 server 会打 taken_over_at，此后 asof 早于接管的手动账自动让位；
+//   - owner 重新手敲一笔时 asof 更新，手动账重新赢（判据只看时刻先后）。
 //
 // 为什么不各写一份：这是钱路径上"哪个数是谁给的"的唯一判据。抄第二份的地方迟早会严一档或松一档，
 // 而松的那一处会放行买入、严的那一处会让 owner 看见一张空仓表——两个方向都出过事故。
@@ -91,19 +113,30 @@ type BookSources struct {
 // real_account 是回报直接写库的，qmt 未启用时库里照样可能留着一行时间戳很新的旧数据。
 func SelectBookSources(counterAcc RealAccount, counterAccErr error, counterPos []RealPosition,
 	counterPosErr error, view ManualBookView, day string, now time.Time, linkLive bool) BookSources {
-	bs := BookSources{Cash: "counter", Positions: "counter"}
+	bs := BookSources{
+		Cash:        BookSourceUnknown,
+		Positions:   BookSourceUnknown,
+		TakenOverAt: view.TakenOverAt,
+	}
 	cashFromCounter := linkLive && counterAccErr == nil && CashReportFresh(counterAcc.UpdatedAt, now)
 	posFromCounter := linkLive && counterPosErr == nil && CounterPositionsReporting(counterPos, day)
-	if !cashFromCounter && view.CashUsable {
-		bs.Cash = "manual"
+	if view.CashUsable {
+		bs.Cash = BookSourceManual
 		bs.CashAsOf = view.CashAsOf
+		bs.CashCarried = view.CashCarried
 		bs.AnyManual = true
+	} else if cashFromCounter {
+		bs.Cash = BookSourceCounter
+		// 柜台读数时刻照样下发：前端据此判定"确有柜台读数证据"，不必再自己猜一遍。
+		bs.CashAsOf = counterAcc.UpdatedAt
 	}
-	if !posFromCounter && view.PositionsUsable {
-		bs.Positions = "manual"
+	if view.PositionsUsable {
+		bs.Positions = BookSourceManual
 		bs.PositionsAsOf = view.PositionsAsOf
+		bs.PositionsCarried = view.PositionsCarried
 		bs.AnyManual = true
+	} else if posFromCounter {
+		bs.Positions = BookSourceCounter
 	}
-	bs.TakenOverAt = view.TakenOverAt
 	return bs
 }

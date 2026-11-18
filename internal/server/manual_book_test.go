@@ -176,7 +176,7 @@ func TestManualPositionsReadoutLabelsSource(t *testing.T) {
 		t.Fatalf("读面必须点名这条读数参与哪些判据（至少四条），got %#v", out["used_by"])
 	}
 	if v, ok := out["unavailable_when"].([]interface{}); !ok || len(v) != 3 {
-		t.Fatalf("读面必须点名三条「不参与」情形（柜台在报数 / asof 非今日 / 已被接管），got %#v", out["unavailable_when"])
+		t.Fatalf("读面必须点名三条「不参与」情形（该维不可用 / 两者皆不可用标 unknown / 手动账不是柜台证据），got %#v", out["unavailable_when"])
 	}
 	// VWAP 硬过滤吃的是行情成交额/量，与账本无关——这条必须仍然留在 not_used_by 里（改判不等于全改）。
 	if v, ok := out["not_used_by"].([]interface{}); !ok || len(v) != 1 ||
@@ -185,27 +185,30 @@ func TestManualPositionsReadoutLabelsSource(t *testing.T) {
 	}
 }
 
-// TestManualPositionsStaleAsofNeverUnlocksCashGate D：asof 停在旧日的手动账不许解开 §M12-A。
+// TestManualPositionsStaleAsofNeverUnlocksCashGate D：**超出跨日携带上限**的手动账不许解开 §M12-A。
 //
 // 11-06 上午那批的旧主题是"手动读数绝不进硬闸"；owner 下午裁决 1 把它改判成
-// "柜台连不上就以手工为准"之后，它变成那条改判的**前置判据**——几天前手敲的余额不许在下次桥断时顶上。
+// "柜台连不上就以手工为准"之后，它变成那条改判的**前置判据**——一本没人再碰过的账不许在下次桥断时顶上。
+// 2026-11-18 owner 又撤掉了"必须当日"那半（跨日携带可用），但**上限仍在**：
+// 所以这里刻意用一个远超 manualAsofMaxCarryDays 的日期（去年），判据张力不变。
 // 断言一个字没放松：判的还是 Controller.AvailableCash 的第二个返回值，也就是自动买入腿的 fail-close 开关。
 func TestManualPositionsStaleAsofNeverUnlocksCashGate(t *testing.T) {
 	s, member, db := newManualTestServer(t)
-	rr := manualPost(s, member, `{"positions":[{"ts_code":"600000.SH","qty":1000}],"available_cash":999999,"total_asset":999999,"asof":"2026-11-04 09:30:00"}`)
+	ancient := cntime.Now().AddDate(-1, 0, 0).Format("2006-01-02") + " 09:30:00"
+	rr := manualPost(s, member, `{"positions":[{"ts_code":"600000.SH","qty":1000}],"available_cash":999999,"total_asset":999999,"asof":"`+ancient+`"}`)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("应 200，got %d body=%s", rr.Code, rr.Body.String())
 	}
 	ctrl := trading.NewController(nil, db, member.ID, config.DefaultQMTConfig(), nil)
 	cash, fresh := ctrl.AvailableCash()
 	if fresh {
-		t.Fatalf("asof 停在 11-04 的手动账解开了 §M12-A 资金新鲜度（cash=%.2f fresh=%v）——自动买入腿从此可被一笔旧账放行", cash, fresh)
+		t.Fatalf("asof 停在 %s 的手动账解开了 §M12-A 资金新鲜度（cash=%.2f fresh=%v）——自动买入腿从此可被一笔旧账放行", ancient, cash, fresh)
 	}
 	if cash != 0 {
 		t.Fatalf("AvailableCash 读到了过期手动值：%.2f", cash)
 	}
 	// T+1 可卖量：过期手动那 1000 股不许变成"可卖"。
-	if q := db.BuyableQtyForUserSell(member.ID, "600000.SH", "2026-11-04"); q != 0 {
+	if q := db.BuyableQtyForUserSell(member.ID, "600000.SH", cntime.DayOf(cntime.Now())); q != 0 {
 		t.Fatalf("手动持仓造出了可卖量：%d 股", q)
 	}
 }
@@ -232,8 +235,11 @@ func TestManualPositionsTodayAsofDoesFeedCashGate(t *testing.T) {
 	}
 }
 
-// TestManualPositionsRealBookReadAdditive C 的另一半：GET /api/positions/real 新增 manual 键，
-// 而 positions/account 两个既有键一个字节都没变（手动行绝不混进柜台行里）。
+// TestManualPositionsRealBookReadAdditive C 的另一半：GET /api/positions/real 新增 manual 键；
+// 当手动账**不可用**（超出跨日携带上限）时，positions/account 两个既有键一个字节都没变
+// ——手动行绝不混进柜台行里。
+// 2026-11-18 改判后「手动可用 ⇒ positions 换成手动」由 TestManualRealBookMergesBySource 场景一锁，
+// 本格锁的是另一半：不可用的手动账**不能**借 additive 的名义污染柜台键。
 func TestManualPositionsRealBookReadAdditive(t *testing.T) {
 	s, member, db := newManualTestServer(t)
 	// 柜台账先来一笔真实持仓（网关回报路径的等价写法）
@@ -242,8 +248,19 @@ func TestManualPositionsRealBookReadAdditive(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed broker position: %v", err)
 	}
-	if rr := manualPost(s, member, `{"positions":[{"ts_code":"600111.SH","qty":1000}],"available_cash":50000,"asof":"2026-11-04 09:30:00"}`); rr.Code != http.StatusOK {
+	ancient := cntime.Now().AddDate(-1, 0, 0).Format("2006-01-02") + " 09:30:00"
+	if rr := manualPost(s, member, `{"positions":[{"ts_code":"600111.SH","qty":1000}],"available_cash":50000,"asof":"`+ancient+`"}`); rr.Code != http.StatusOK {
 		t.Fatalf("manual post 应 200，got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 没有控制器 ⇒ 柜台也不算"在报数"，两维都会落到 unknown、positions 被清空。
+	// 但本格要判的是"手动行不许混进柜台键"，所以显式装配控制器让持仓维按柜台报数。
+	ctrl := trading.NewController(nil, db, member.ID, config.DefaultQMTConfig(), nil)
+	s.SetEngineController(fakeCtrl{qmt: ctrl})
+	today := cntime.DayOf(cntime.Now())
+	if _, err := db.ReconcilePositionsForUser(member.ID, []store.RealPosition{
+		{TsCode: "600000.SH", Name: "柜台山", Qty: 300, CostPrice: 7.7, UpdatedAt: today + " 09:45:00"},
+	}); err != nil {
+		t.Fatalf("refresh broker position: %v", err)
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/positions/real", nil)
 	ctx := context.WithValue(req.Context(), ctxUserKey{}, s.auth.UserByID(member.ID))
@@ -316,6 +333,18 @@ func qmtReportTokenFor(t *testing.T, s *Server, uid string) string {
 		t.Fatalf("钥匙应反查到 %s，实得 %q", uid, got)
 	}
 	return key
+}
+
+// manualReport 走真实的网关回报通道提交一条事件（归属只认钥匙）。
+// 用它而不是直写 store：打不打接管指针、哪些形状算"成功落库"都发生在 handler 里，
+// 直写 store 会把这条判据测成永远绿。
+func manualReport(t *testing.T, s *Server, uid, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/qmt/report", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+qmtReportTokenFor(t, s, uid))
+	rr := httptest.NewRecorder()
+	s.qmtReportMiddleware(s.handleQMTReport)(rr, req)
+	return rr
 }
 
 // TestManualAdjustEndpoints E：增量改账的三条入口约束——
@@ -421,20 +450,21 @@ func TestManualRealBookMergesBySource(t *testing.T) {
 		t.Fatalf("manual 明细键缺失：%#v", out["manual"])
 	}
 
-	// 场景二：柜台恢复报数 ⇒ 表逐字回到柜台，book_source 标 counter（手动账一个字都不参与）。
-	if _, err := db.ReconcilePositionsForUser(member.ID, []store.RealPosition{
-		{TsCode: "600999.SH", Name: "柜台新", Qty: 500, CostPrice: 7.7, UpdatedAt: today + " 10:00:00"},
-	}); err != nil {
-		t.Fatalf("seed fresh counter: %v", err)
+	// 场景二：柜台恢复报数 ⇒ 打接管指针（成功落库后），此后 asof 更早的手动账让位，
+	// 表逐字回到柜台、book_source 标 counter。
+	// 2026-11-18 改判后「手动优先」不是永久的：柜台能证明自己回来了就赢回来，
+	// 而这条腿必须走**真实回报通道**（直写 ReconcilePositionsForUser 不会打接管指针，
+	// 那是测试夹具的捷径，用它验证"柜台恢复"会给出一个生产上不存在的绿）。
+	if rr := manualReport(t, s, member.ID, `{"type":"positions","positions":[{"ts_code":"600999.SH","name":"柜台新","qty":500,"cost_price":7.7}]}`); rr.Code != http.StatusOK {
+		t.Fatalf("柜台持仓回报应 200，got %d body=%s", rr.Code, rr.Body.String())
 	}
-	if err := db.UpsertRealAccount(store.RealAccount{UserID: member.ID, AvailableCash: 4321,
-		UpdatedAt: cntime.Now().Format("2006-01-02 15:04:05")}); err != nil {
-		t.Fatalf("seed fresh account: %v", err)
+	if rr := manualReport(t, s, member.ID, `{"type":"account","asset":{"cash":4321,"frozen_cash":0,"total_asset":4321,"market_value":0}}`); rr.Code != http.StatusOK {
+		t.Fatalf("柜台资金回报应 200，got %d body=%s", rr.Code, rr.Body.String())
 	}
 	out = manualGetReal(t, s, member)
 	src, _ = out["book_source"].(map[string]interface{})
 	if src["positions"] != "counter" || src["cash"] != "counter" {
-		t.Fatalf("柜台在报数时两维都必须信柜台，got %#v", src)
+		t.Fatalf("柜台回报落库后两维都必须让位给柜台，got %#v", src)
 	}
 	poses, _ = out["positions"].([]interface{})
 	if len(poses) != 1 || poses[0].(map[string]interface{})["ts_code"] != "600999.SH" {
