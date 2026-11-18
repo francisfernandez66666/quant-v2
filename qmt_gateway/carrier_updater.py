@@ -702,9 +702,19 @@ class CarrierUpdater:
 
 
 def _subprocess_runner(argv):
-    """真实执行腿：更新脚本与本地构建都走这一条。异常收敛成 rc=1（并把文本压成 ASCII）。"""
+    """真实执行腿：更新脚本与本地构建都走这一条。异常收敛成 rc=1（并把文本压成 ASCII）。
+
+    §DECODE-20261118：**绝不许按严格 UTF-8 解子进程输出**。Windows PowerShell 5.1 在中文
+    码页下仍会把本地化文本（schtasks / Stop-Process 的错误行）写成 GBK 字节，2026-11-18
+    实测 0xb6 一枚就让 subprocess 的 _readerthread 抛 UnicodeDecodeError：更新脚本其实已
+    写好文件、也已重启启动客户端，整轮却被记成 FAILED 并回执 ok=false（11-17 起的 v54/v66/
+    v72/v73 每一轮都是这个形状，云端因此一直显示"回执失败"）。
+    本模块判读用的锚串全是 ASCII，解码坏字节换成替换字符不影响任何结论；
+    结论只由 rc 与那些锚决定，所以这里显式声明编码并放宽错误策略。
+    """
     try:
-        proc = subprocess.run(list(argv), capture_output=True, text=True)
+        proc = subprocess.run(list(argv), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
         return int(proc.returncode), (proc.stdout or "") + (proc.stderr or "")
     except Exception as exc:  # noqa: BLE001 -- 起不来也是结论，不是崩
         return 1, "runner_exception:%s" % exc.__class__.__name__

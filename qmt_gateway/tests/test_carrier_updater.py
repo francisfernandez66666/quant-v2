@@ -874,5 +874,30 @@ class TestForceReportConsume(unittest.TestCase):
         self.assertEqual(calls["n"], 0, "dry-run 不许真跑强制上报")
 
 
+class TestRunnerDecodeIsLenient(unittest.TestCase):
+    """§DECODE-20261118：子进程吐 GBK 字节不许把成功的一轮读成失败。
+
+    缺陷现场（2026-11-18 真机）：update_qmt_strategy.ps1 已写完文件、已按顺序重启完
+    网关与 QMT 客户端，但它的 stdout 里漏出一枚 0xb6（中文码页下的本地化错误行），旧实现
+    `text=True` 严格 UTF-8 解码在 subprocess 的 reader 线程抛 UnicodeDecodeError ⇒
+    整轮 rc=1、状态记 FAILED、回执 ok=false，云端从此显示"回执失败"。
+    判读锚（STRATEGY_UPDATE_RESULT=…）全是 ASCII，替换字符不影响结论。
+    """
+
+    def test_gbk_byte_in_child_output_does_not_fail_the_round(self):
+        child = (
+            "import sys;"
+            "sys.stdout.buffer.write(b'STRATEGY_UPDATE_RESULT=OK version=v74-20261118\\n');"
+            "sys.stdout.buffer.write(b'localized: \\xb6\\xd5\\n');"
+            "sys.stdout.buffer.flush()"
+        )
+        rc, out = cu._subprocess_runner([sys.executable, "-c", child])
+        self.assertEqual(rc, 0, "坏字节只是读歪，不是子进程失败")
+        self.assertIn("STRATEGY_UPDATE_RESULT=OK version=v74-20261118", out,
+                      "ASCII 锚必须完整存活——判读全靠它")
+        self.assertIn("localized:", out,
+                      "整段被吞掉就是另一种失真：坏字节要替换，不是丢行")
+
+
 if __name__ == "__main__":
     unittest.main()
