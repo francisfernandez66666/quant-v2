@@ -1012,6 +1012,55 @@ def _subscribe_held(ContextInfo, positions):
         _log("subscribe_held new=%d held_total=%d" % (n, len(done) - 1))
 
 
+def _subscribe_1m_held(ContextInfo, positions):
+    """A-ROUTE 2026-11-18 production wiring: subscribe the MINUTE period for
+    held names so the client bar engine aggregates 1m bars the minute legs read.
+
+    Why a SEPARATE function and not a shape in _subscribe_held: that loop tries
+    ("tick") first and BREAKS on success -- tick always wins here, so its "1m"
+    fallback was unreachable and the 1m store stayed empty. The 11-18 probe
+    (_probe_subscribe_1m) proved the suffixed "1m" subscribe DOES make the client
+    aggregate bars (mde_1m=5 > 0 after sub1m=243). This promotes that proven
+    shape to production, alongside tick (both periods are valid at once on this
+    build -- the probe subscribed tick and 1m on the same code without conflict).
+
+    Only HELD names are subscribed: the two minute-leg consumers (afternoon
+    reseal protection, the T leg) both operate on positions, never on the pool.
+    Idempotent per Beijing day via a dedicated ledger keyed by BARE symbol (the
+    join keys stay bare -- see rule 204). Read-only: a subscribe call places no order
+    and touches no budget; failure is swallowed so a broken subscribe API does
+    not take down the round (the minute legs stay fail-closed on missing bars).
+    """
+    _whole, per, _api = _subscribe_fns(ContextInfo)
+    if not callable(per) or not positions:
+        return
+    day = day_key(now_cn())
+    done = _STATE.setdefault("subbed_1m_today", {})
+    if done.get("day") != day:
+        done.clear()
+        done["day"] = day
+    n = 0
+    for symbol, row in positions.items():
+        if not row or float(row.get("qty", 0.0) or 0.0) <= 0.0:
+            continue
+        if symbol in done:
+            continue
+        code = _qmt_code(symbol)
+        sub_id = None
+        for shape in ((code, "1m", "follow"), (code, "1m")):
+            try:
+                sub_id = per(*shape)
+            except Exception:  # noqa: BLE001 - signature ladder
+                continue
+            break
+        if sub_id is None:
+            continue
+        done[symbol] = _short_id(sub_id)
+        n += 1
+    if n:
+        _log("subscribe_1m_held new=%d held_total=%d" % (n, len(done) - 1))
+
+
 def _short_id(sub_id):
     """Normalize a subscribe return into a short readable token.
 
@@ -2446,6 +2495,11 @@ def run_round(ContextInfo, moment):
     # and T legs actually get last_price. A no-op when whole-market already covers it.
     if positions:
         _subscribe_held(ContextInfo, positions)
+        # A-ROUTE 2026-11-18: subscribe 1m for held names so the client bar
+        # engine aggregates the 1m bars the minute legs (_minute_bars_payload)
+        # read. Separate from the tick subscribe above (which breaks on tick
+        # success and never reaches its 1m fallback). Idempotent per day.
+        _subscribe_1m_held(ContextInfo, positions)
     # PRICE-PROBE 2026-11-18: read-only receipt for "why did nothing trade".
     # Runs after the position read (held rows first) and before any sizing, so
     # the line lands even on a round that goes on to refuse every signal.

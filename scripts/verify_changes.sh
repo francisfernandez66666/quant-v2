@@ -23842,3 +23842,67 @@ fi
 [ "$B206_FAILED" = "0" ] || exit 1
 echo "ok - §206 §20261118-SPLIT-FUNDS-READ 锁通过（按日缓存/锁外预热/拆接口/纸面按需四组静态 + Go2/前端1 行为腿，累计判定点 ${CNT206}）"
 echo ""
+
+# §207 §20261118-A-ROUTE-1M（A 路：带后缀 1m 订阅扶正到生产，客户端 bar 引擎聚合分钟腿）。
+# 证据：11-18 探针 _probe_subscribe_1m 实证 sub1m=243 后 mde_1m=5>0 —— 带后缀 1m
+#   订阅能让客户端聚合 1m bar；本地 1m 仓空 + 此 build 无下载器，A 路是分钟腿唯一来源。
+# 现状缺陷：_subscribe_held 的 shape 循环 (tick,tick,1m) 成功即 break，tick 恒赢，
+#   1m 兜底永不可达；§204 锁死那一行（价格盲锚点）故不碰它，改为独立生产订阅。
+echo "==> 207 §20261118-A-ROUTE-1M（持仓票 1m 订阅生产接线 + 幂等 + 只读）..."
+B207_FAILED=0
+fail207() {
+	echo "--- FAIL: §207 $*"
+	FAIL=1
+	B207_FAILED=1
+}
+CNT207=0
+
+# ① 生产函数定义 + 独立账本（与 tick 的 _subscribe_held 分家）。
+CNT207=$((CNT207 + 1))
+grep -qF 'def _subscribe_1m_held(ContextInfo, positions):' qmt_gateway/qmt_internal_strategy.py || fail207 "缺 _subscribe_1m_held 生产订阅函数"
+CNT207=$((CNT207 + 1))
+grep -qF '_STATE.setdefault("subbed_1m_today", {})' qmt_gateway/qmt_internal_strategy.py || fail207 "1m 订阅无独立按日账本（会退成每轮订阅风暴）"
+CNT207=$((CNT207 + 1))
+grep -qF 'done[symbol] = _short_id(sub_id)' qmt_gateway/qmt_internal_strategy.py || fail207 "1m 订阅账本未按裸码键记账"
+
+# ② 订阅姿势：带后缀 + 1m 周期（探针实证唯一能聚 bar 的形态）。
+CNT207=$((CNT207 + 1))
+grep -qF 'for shape in ((code, "1m", "follow"), (code, "1m")):' qmt_gateway/qmt_internal_strategy.py || fail207 "1m 订阅未用带后缀 code + 1m 周期阶梯"
+CNT207=$((CNT207 + 1))
+grep -qF 'code = _qmt_code(symbol)' qmt_gateway/qmt_internal_strategy.py || fail207 "1m 订阅未复用 _qmt_code 后缀归一（裸码又全盲）"
+
+# ③ run_round 真接线（不是死函数）。
+CNT207=$((CNT207 + 1))
+grep -qF '_subscribe_1m_held(ContextInfo, positions)' qmt_gateway/qmt_internal_strategy.py || fail207 "1m 订阅没有调用点"
+
+# ④ 负锁：订阅函数体不许出现下单动作（只读承诺）。
+CNT207=$((CNT207 + 1))
+if grep -qE 'passorder|_place\(|order_share|cancel_leg' qmt_gateway/qmt_internal_strategy.py; then
+	# 下单动作在全文件本就存在，负锁必须限定在函数体内——用 python 精确抽取。
+	SUBFN=$(python3 - <<'PY'
+import ast, io
+src = io.open('qmt_gateway/qmt_internal_strategy.py', encoding='ascii').read()
+tree = ast.parse(src)
+fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_subscribe_1m_held'), None)
+print('OK' if fn else 'MISSING')
+if fn:
+    seg = ast.get_source_segment(src, fn) or ''
+    bad = [t for t in ('passorder', '_place(', 'order_share', 'cancel_leg', 'm_dAvailable') if t in seg]
+    if bad:
+        print('TRADE_CALL:' + ','.join(bad))
+PY
+)
+	echo "$SUBFN" | grep -q '^OK$' || fail207 "无法解析 _subscribe_1m_held 函数体"
+	if echo "$SUBFN" | grep -q 'TRADE_CALL:'; then
+		fail207 "1m 订阅函数体内混入下单动作：$(echo "$SUBFN" | grep TRADE_CALL)"
+	fi
+fi
+
+# ⑤ 行为腿：8 例（后缀/零量/幂等/空输入/异常吞掉/裸键/只读负锁/接线）。
+PY207=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_subscribe_1m_production_20261118.py -q 2>&1 || true )
+CNT207=$((CNT207 + 1))
+grep_q '8 passed' PY207 || { echo "--- FAIL: §207 A路1m生产订阅行为腿未跑满8例：$(printf '%s\n' "$PY207" | tail -8)"; B207_FAILED=1; }
+
+[ "$B207_FAILED" = "0" ] || exit 1
+echo "ok - §207 §20261118-A-ROUTE-1M 锁通过（独立订阅+按日幂等+裸键+后缀1m+接线+只读负锁+8例行为腿，累计判定点 ${CNT207}）"
+echo ""
