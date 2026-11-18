@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // testResp 构造一个 mock HTTP 响应（本地 helper，避免跨包依赖）。
@@ -224,8 +226,11 @@ func TestEmMirrorFailoverKeepsServing(t *testing.T) {
 	m.SetTransport(rt)
 
 	// 调用次数 > 阈值(5)，确保覆盖"主域名熔断打开之后"的调用。
+	// §INDUSTRY-DAY-CACHE：这里直接测回源腿 fetchStockIndustry——本例验证的是
+	// 镜像熔断切换（网络行为），不是缓存命中；走 GetStockIndustry 会被当日缓存短路，
+	// 网络不再被调用，熔断断言就失去意义。缓存行为由 TestIndustryDayCache 单独覆盖。
 	for i := 0; i < 8; i++ {
-		if got := m.GetStockIndustry("300489"); got != "光学光电子" {
+		if got := m.fetchStockIndustry("300489"); got != "光学光电子" {
 			t.Fatalf("第 %d 次取行业: got %q, want 光学光电子（主域名熔断后镜像仍应可用）", i+1, got)
 		}
 	}
@@ -256,9 +261,99 @@ func TestGetStockIndustryPrefersF127(t *testing.T) {
 		rt := &hostBodyTransport{body: map[string]string{emPrimaryPush2Host: c.body}}
 		m := NewMarketAPI()
 		m.SetTransport(rt)
-		if got := m.GetStockIndustry("300489"); got != c.want {
+		// §INDUSTRY-DAY-CACHE：直接测回源腿的字段优先级（f127/f128），不经过缓存。
+		if got := m.fetchStockIndustry("300489"); got != c.want {
 			t.Errorf("%s: got %q want %q", c.name, got, c.want)
 		}
+	}
+}
+
+// TestIndustryDayCache §INDUSTRY-DAY-CACHE：当日命中不再打网络（锁内零 I/O 的核心判据），
+// 跨自然日自动失效重拉（＝盘后刷新），失败结果不固化（下一轮可重试，fail-open）。
+// English: same-day hits never hit the network; a new day forces a refetch; failures are not cached.
+func TestIndustryDayCache(t *testing.T) {
+	defer func() { DisableAll = false }()
+	DisableAll = true
+
+	today := cntime.Now().Format("2006-01-02")
+	rt := &hostBodyTransport{body: map[string]string{
+		emPrimaryPush2Host: `{"data":{"f127":"光学光电子","f128":"浙江板块"}}`,
+	}}
+	m := NewMarketAPI()
+	m.SetTransport(rt)
+
+	// 首次 miss → 回源写缓存。
+	if got := m.GetStockIndustry("300489"); got != "光学光电子" {
+		t.Fatalf("首次取行业 got %q want 光学光电子", got)
+	}
+	if n := rt.calls[emPrimaryPush2Host]; n != 1 {
+		t.Fatalf("首次应回源 1 次, got %d", n)
+	}
+
+	// 当日第二次 → 命中缓存, 网络不再被调用（paper 写锁内就是走这条）。
+	if got := m.GetStockIndustry("300489"); got != "光学光电子" {
+		t.Fatalf("缓存命中 got %q", got)
+	}
+	if n := rt.calls[emPrimaryPush2Host]; n != 1 {
+		t.Fatalf("当日命中不得再打网络, 期望仍为 1 次, got %d", n)
+	}
+
+	// 人为改成昨天 → 视为跨日, 必须重新回源（盘后刷新语义）。
+	m.industryCacheMu.Lock()
+	m.industryCache["300489"] = industryCacheEntry{name: "光学光电子", day: "2000-01-01"}
+	m.industryCacheMu.Unlock()
+	if got := m.GetStockIndustry("300489"); got != "光学光电子" {
+		t.Fatalf("跨日重取 got %q", got)
+	}
+	if n := rt.calls[emPrimaryPush2Host]; n != 2 {
+		t.Fatalf("跨日应再回源 1 次, 期望累计 2 次, got %d", n)
+	}
+	// 跨日重拉后条目归属日应刷新为今天（否则每轮都重拉＝缓存失效）。
+	m.industryCacheMu.RLock()
+	entry := m.industryCache["300489"]
+	m.industryCacheMu.RUnlock()
+	if entry.day != today {
+		t.Fatalf("跨日重拉后条目日=%q want %q", entry.day, today)
+	}
+
+	// 失败（无 body）不入缓存：php 空响应 → 返回空串, 且不能留下条目把失败固化一天。
+	rtFail := &hostBodyTransport{body: map[string]string{}}
+	m2 := NewMarketAPI()
+	m2.SetTransport(rtFail)
+	if got := m2.GetStockIndustry("000001"); got != "" {
+		t.Fatalf("失败应返回空串（fail-open）, got %q", got)
+	}
+	m2.industryCacheMu.RLock()
+	_, cached := m2.industryCache["000001"]
+	m2.industryCacheMu.RUnlock()
+	if cached {
+		t.Fatal("失败结果不得写入缓存, 否则一整天的行业闸都按'查不到'跳过")
+	}
+}
+
+// TestWarmIndustryCache §INDUSTRY-DAY-CACHE：预热把候选池行业名在锁外填进缓存,
+// 后续 GetStockIndustry 全部命中、零回源——这是"paper 锁内零 I/O"成立的前提。
+func TestWarmIndustryCache(t *testing.T) {
+	defer func() { DisableAll = false }()
+	DisableAll = true
+
+	rt := &hostBodyTransport{body: map[string]string{
+		emPrimaryPush2Host: `{"data":{"f127":"半导体","f128":"广东板块"}}`,
+	}}
+	m := NewMarketAPI()
+	m.SetTransport(rt)
+	m.WarmIndustryCache([]string{"300001", "300002", "", "300003"})
+	if n := rt.calls[emPrimaryPush2Host]; n != 3 {
+		t.Fatalf("预热应回源 3 次(空码跳过), got %d", n)
+	}
+	// 预热后三次读取都应命中缓存, 不再增加网络调用。
+	for _, code := range []string{"300001", "300002", "300003"} {
+		if got := m.GetStockIndustry(code); got != "半导体" {
+			t.Fatalf("预热后 %s got %q", code, got)
+		}
+	}
+	if n := rt.calls[emPrimaryPush2Host]; n != 3 {
+		t.Fatalf("预热命中后不得再回源, 期望仍为 3 次, got %d", n)
 	}
 }
 

@@ -2014,9 +2014,10 @@ export default function Quant() {
         </Tabs.TabPanel>
 
         <Tabs.TabPanel value="t" label="T 仓" destroyOnHide>
-          {/* §FUNDS-TODAY：当日信号仓 / T 仓资金（实盘取引擎 funds 帧，纸面取 TargetReadout）。
-              整卡迁过来而不是拆列：它是一帧数据（一次请求取回三列），拆列要么两次请求、
-              要么把 props 传穿两层。主页面仍有「链路状态」里的可用资金读数，不会失去资金感知。 */}
+          {/* §FUNDS-TODAY + §SPLIT-FUNDS-READ（2026-11-18）：当日信号仓 / T 仓资金。
+              实盘（funds/today，10s 轮询）与纸面（paper/target，按需单次）已拆成两条独立请求——
+              纸面要过 paper 写锁，不再让它把实盘 MS 拖成"数据日 —"。整卡保留在 T 仓 tab
+              （destroyOnHide）：切走卸载、再开重挂载即触发纸面按需重取。 */}
           <FundsOverviewCard />
           <TRoundsCard defaultTab="live" />
         </Tabs.TabPanel>

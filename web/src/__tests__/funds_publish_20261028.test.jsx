@@ -19,9 +19,11 @@ import { settle } from './settle.js'
 
 const mocks = vi.hoisted(() => ({
   fetchFundsToday: vi.fn(),
+  fetchPaperTarget: vi.fn(async () => ({ available: false, reason: '模拟盘引擎未接入' })),
 }))
 vi.mock('../api/index.js', () => ({
   fetchFundsToday: mocks.fetchFundsToday,
+  fetchPaperTarget: mocks.fetchPaperTarget,
   isForbidden: (e) => !!(e && e.status === 403),
   hasStrictPerm: () => true, // §MULTI-ADMIN：本用例锁定资金帧展示，权限由 strict_perm_api 单测覆盖
 }))
@@ -54,6 +56,28 @@ function frame({ tAt, marketScale = 0.765 } = {}) {
 describe('FundsOverviewCard §FUNDS-TODAY 信号仓侧发布点前移', () => {
   beforeEach(() => {
     mocks.fetchFundsToday.mockReset()
+    mocks.fetchPaperTarget.mockReset()
+  })
+
+  // §SPLIT-FUNDS-READ（2026-11-18）：实盘 10s 轮询、纸面**只挂载时取一次**。
+  // 纸面要过 paper 写锁，绝不能跟着实盘心跳每 10s 打一次；这条锁住"按需单次"的消费形状。
+  it('纸面按需单次：跨多个实盘轮询周期仍只取一次 paper/target', async () => {
+    vi.useFakeTimers()
+    try {
+      mocks.fetchFundsToday.mockResolvedValue(frame({ tAt: '' }))
+      mocks.fetchPaperTarget.mockResolvedValue({ available: false, reason: '模拟盘引擎未接入' })
+      render(<FundsOverviewCard />)
+      await settle()
+      expect(mocks.fetchFundsToday).toHaveBeenCalledTimes(1)
+      expect(mocks.fetchPaperTarget).toHaveBeenCalledTimes(1)
+      // 推进 35s ⇒ 实盘轮询至少再跑 3 次，纸面不得再取。
+      vi.advanceTimersByTime(35000)
+      await settle()
+      expect(mocks.fetchFundsToday.mock.calls.length).toBeGreaterThan(1)
+      expect(mocks.fetchPaperTarget).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('信号仓侧有帧时显示 MS/目标/剩余（T 没跑也不算"尚未定权"）', async () => {

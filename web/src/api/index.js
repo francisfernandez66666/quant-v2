@@ -2285,9 +2285,18 @@ export async function fetchSignalDecisions(day) {
   return request(`/api/signals/decisions?${q.toString()}`)
 }
 
-/** 获取当日「信号仓 / T 仓」资金一帧（只读；实盘取引擎 funds 帧，纸面取 TargetReadout）。 */
+/** 获取当日实盘「信号仓 / T 仓」资金一帧（只读）。§SPLIT-FUNDS-READ：只回实盘，纸面另取。 */
 export async function fetchFundsToday() {
   return request('/api/funds/today')
+}
+
+/**
+ * §SPLIT-FUNDS-READ（2026-11-18）纸面目标仓位读数（与实盘资金帧拆开）。
+ * 纸面不涉真实资金，不做轮询——由 FundsOverviewCard 在打开纸面内容时单次按需取。
+ * 响应：{ available, readout? , reason? }，readout 结构与旧 funds/today 的 paper.readout 逐字一致。
+ */
+export async function fetchPaperTarget() {
+  return request('/api/paper/target')
 }
 
 // §DYN-SIZE v4 / §ANCHOR-FIRST 签字面（六轮 T4-8/B8：dry-run 未签字不写盘）。

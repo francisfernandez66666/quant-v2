@@ -16,9 +16,11 @@ import FundsOverviewCard from '../components/FundsOverviewCard.jsx'
 
 const mocks = vi.hoisted(() => ({
   fetchFundsToday: vi.fn(),
+  fetchPaperTarget: vi.fn(async () => ({ available: false, reason: '模拟盘引擎未接入' })),
 }))
 vi.mock('../api/index.js', () => ({
   fetchFundsToday: mocks.fetchFundsToday,
+  fetchPaperTarget: mocks.fetchPaperTarget,
   isForbidden: (e) => !!(e && e.status === 403),
 }))
 

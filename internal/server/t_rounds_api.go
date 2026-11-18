@@ -387,7 +387,12 @@ func statsSellNotional(st *paper.TRoundDayStats) float64 {
 // English: the single read-only frame of the v4 target model, computed by the engine itself;
 // market_scale=0 means "no sizing this round" and must never be rendered as a neutral 1.00.
 func (s *Server) handlePaperTargetReadout(w http.ResponseWriter, r *http.Request) {
-	pe := s.paperEngineFor(s.operatorID())
+	// §INDUSTRY-DAY-CACHE 拆接口（2026-11-18）：这是纸面读数的**唯一出口**后，
+	// 必须按请求者取账（requestUserID），不能回落到 s.operatorID()——后者恒取运营账号，
+	// 成员会看到 owner 的纸面目标仓位（旧 funds/today 用 uid 取账，TestFundsTodayPaperIsolation
+	// 一直盯着这条；拆接口后这层保护必须跟着搬过来，否则就是静默回归）。
+	uid := requestUserID(r)
+	pe := s.paperEngineFor(uid)
 	if pe == nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"available": false,
 			"reason": "模拟盘引擎未接入：目标仓位读数不可得（不是 0，也不是满额）"})
@@ -407,12 +412,17 @@ func dayOfQueryOrToday(raw string) string {
 	return time.Now().Format("2006-01-02")
 }
 
-// handleFundsToday 处理 GET /api/funds/today（admin）：当日「信号仓 / T 仓」资金一帧。
+// handleFundsToday 处理 GET /api/funds/today：当日实盘「信号仓 / T 仓」资金一帧。
 //
-// 数据来源刻意分成两条，server 只做搬运：
-//   - 实盘：读 `<dataDir>/accounts/<uid>/t_rounds_live.json` 的 funds 帧（引擎每轮写下的
-//     "本轮实际使用的读数"；本接口不重算，避免第二套公式）；
-//   - 纸面：`paper.Engine.TargetReadout()`（与 /api/paper/target 同一个出口）。
+// §SPLIT-FUNDS-READ（2026-11-18）：本接口**只回实盘**，不再夹带纸面读数。
+// 原因：两半 SLA 天差地别——实盘半读文件（毫秒级），纸面半要过 paper.e.mu 写锁，
+// 被结算腿逐票问行业（锁内 HTTP）拖到 6~10s。合并在一份 JSON 里，纸面腿一卡，
+// 连已经算好的实盘 MS 都送不到前端，面板显示"数据日 —"。拆分后纸面走独立接口
+// GET /api/paper/target，由前端在打开纸面内容时单独按需取（不跟随实盘 10s 轮询），
+// 实盘卡的可用性从此与 paper 锁完全解耦。
+//
+// 数据来源：读 `<dataDir>/accounts/<uid>/t_rounds_live.json` 的 funds 帧（引擎每轮写下的
+// "本轮实际使用的读数"；本接口不重算，避免第二套公式）。
 //
 // 每日清零与诚实性：
 //   - 帧自带 Day，只有与当日一致才返回（引擎跨日已清，文件里不会带昨日数）；
@@ -420,9 +430,9 @@ func dayOfQueryOrToday(raw string) string {
 //   - 实盘 T 循环未跑（非交易时段/未启用）时仍给 `live.account`（券商资金快照）兜底，
 //     并同时给 `cash_at`，让前端能区分"金额没变"与"快照没更新"。
 //
-// English: one read-only frame of "signal book vs T book" funds for today. Live comes from the
-// engine-published funds frame in the T ledger file (never recomputed here); paper comes from the
-// paper engine's TargetReadout. A new trading day reports pending until the first frame exists.
+// English: one read-only frame of live "signal book vs T book" funds for today, read from the
+// engine-published funds frame (never recomputed). The paper readout moved to /api/paper/target so
+// a busy ledger lock can never drag the live funds frame down with it (§SPLIT-FUNDS-READ).
 func (s *Server) handleFundsToday(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
 	if uid == "" || filepath.Base(uid) != uid || strings.ContainsAny(uid, `/\`) {
@@ -470,12 +480,10 @@ func (s *Server) handleFundsToday(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	paperView := map[string]interface{}{"available": false, "reason": "模拟盘引擎未接入：目标仓位读数不可得（不是 0，也不是满额）"}
-	if pe := s.paperEngineFor(uid); pe != nil {
-		paperView = map[string]interface{}{"available": true, "readout": pe.TargetReadout()}
-	}
+	// §SPLIT-FUNDS-READ：这里不再取 paper.TargetReadout（那条腿要过 paper 写锁，会把本接口
+	// 从毫秒级拖成 6~10s）。响应只有实盘；纸面由前端按需单独 GET /api/paper/target。
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"day": day, "at": cntime.Now().Format(time.RFC3339),
-		"live": live, "paper": paperView,
+		"live": live,
 	})
 }

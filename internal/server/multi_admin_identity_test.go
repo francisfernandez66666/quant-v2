@@ -203,8 +203,10 @@ func (r *multiAdminPaperRegistry) PaperForUser(uid string) *paper.Engine {
 	return nil
 }
 
-// TestFundsTodayPaperIsolation /api/funds/today 的 paper 读数必须取请求者自己的引擎，
-// 不能回落到运营账号（旧实现恒取 operatorID，成员会看到 owner 的纸面目标仓位）。
+// TestFundsTodayPaperIsolation §SPLIT-FUNDS-READ（2026-11-18）：纸面读数搬到
+// /api/paper/target 后，该接口的 paper 读数必须取请求者自己的引擎，不能回落到运营账号
+// （旧实现恒取 operatorID，成员会看到 owner 的纸面目标仓位）。拆接口时这层归属保护
+// 必须跟着搬过来，否则就是静默回归。
 func TestFundsTodayPaperIsolation(t *testing.T) {
 	s, owner, second, _ := newMultiAdminTestServer(t)
 	if err := s.auth.GrantPerm(second.ID, auth.PermFundsAdmin); err != nil {
@@ -220,31 +222,44 @@ func TestFundsTodayPaperIsolation(t *testing.T) {
 	peOwner, peSecond := newPaper(100000, "owner"), newPaper(200000, "second")
 	s.SetEngineRegistry(&multiAdminPaperRegistry{ownerID: owner.ID, secondID: second.ID, owner: peOwner, second: peSecond})
 
-	// readPaperCash 用指定账号请求 funds/today，取 paper.readout.cash 断言拿到的是谁的账。
+	// readPaperCash 用指定账号请求 /api/paper/target（拆接口后纸面读数的唯一出口），
+	// 取 readout.cash 断言拿到的是谁的账。注意响应顶层就是 {available, readout}，不再套 paper 一层。
 	readPaperCash := func(u *auth.User) float64 {
-		rr := adminDo(s, adminReq(s, u, http.MethodGet, "/api/funds/today", ""))
+		rr := adminDo(s, adminReq(s, u, http.MethodGet, "/api/paper/target", ""))
 		if rr.Code != 200 {
-			t.Fatalf("GET funds/today who=%s got %d body=%s", u.Username, rr.Code, rr.Body.String())
+			t.Fatalf("GET paper/target who=%s got %d body=%s", u.Username, rr.Code, rr.Body.String())
 		}
 		var body struct {
-			Paper struct {
-				Available bool `json:"available"`
-				Readout   struct {
-					Cash float64 `json:"cash"`
-				} `json:"readout"`
-			} `json:"paper"`
+			Available bool `json:"available"`
+			Readout   struct {
+				Cash float64 `json:"cash"`
+			} `json:"readout"`
 		}
 		_ = json.Unmarshal(rr.Body.Bytes(), &body)
-		if !body.Paper.Available {
+		if !body.Available {
 			t.Fatalf("%s 的 paper 读数应可用", u.Username)
 		}
-		return body.Paper.Readout.Cash
+		return body.Readout.Cash
 	}
 	if got, want := readPaperCash(second), peSecond.Stats().Cash; math.Abs(got-want) > 0.005 {
 		t.Fatalf("test01 应读自己的纸面账 %.2f, got %.2f", want, got)
 	}
 	if got, want := readPaperCash(owner), peOwner.Stats().Cash; math.Abs(got-want) > 0.005 {
 		t.Fatalf("owner 应读自己的纸面账 %.2f, got %.2f", want, got)
+	}
+
+	// §SPLIT-FUNDS-READ：funds/today 拆完后不得再夹带 paper 字段——否则两半又合回一份 JSON，
+	// 纸面锁一卡还是会把实盘帧拖死（这次拆分要防的就是这个回归）。
+	rr := adminDo(s, adminReq(s, owner, http.MethodGet, "/api/funds/today", ""))
+	if rr.Code != 200 {
+		t.Fatalf("GET funds/today got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &top); err != nil {
+		t.Fatalf("解析 funds/today 失败: %v", err)
+	}
+	if _, has := top["paper"]; has {
+		t.Fatalf("funds/today 不应再含 paper 字段（拆接口后纸面走 /api/paper/target）: %s", rr.Body.String())
 	}
 }
 

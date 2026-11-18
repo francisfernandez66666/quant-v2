@@ -1,9 +1,16 @@
 // FundsOverviewCard.jsx — 当日「信号仓 / T 仓」资金一帧上屏（§FUNDS-TODAY，2026-10-28）。
 //
-// 页面职责：把 /api/funds/today 返回的两本钱一次摆清楚——
+// §SPLIT-FUNDS-READ（2026-11-18）两半数据彻底分流：
+//   · 实盘（信号仓 + T 仓）：/api/funds/today，10s 轮询——纯文件读、毫秒级；
+//   · 纸面（对照）：/api/paper/target，按需单次——本卡在「T 仓」tab 且 destroyOnHide，
+//     挂载即"用户打开纸面内容"，此时取一次；不随实盘心跳轮询，纸面锁再忙也拖不到实盘。
+// 拆因：纸面 TargetReadout 要过 paper.e.mu 写锁，被结算腿逐票问行业拖到 6~10s；
+// 合在一份 JSON 里会把已算好的实盘 MS 一起拖成"数据日 —"。
+//
+// 页面职责：把两本钱一次摆清楚——
 //   · 信号仓：券商可用/冻结/总资产/市值 + 目标/当前/剩余（MS 未注入时显示“尚未定权”）；
 //   · T 仓：T 额度、可用 T 现金、反 T 冻结、在途正/反 T 腿市值、当日 T 已实现净额；
-//   · 纸面：同一结构（来自 TargetReadout），与实盘并列但互不混算。
+//   · 纸面：同一结构（来自 TargetReadout），与实盘并列但互不混算、互不拖累。
 //
 // 口径纪律（写在组件里是为了防止后人“顺手补一个 0”）：
 //   1) 每日清零：接口只回当日；state=pending 表示新交易日首帧还没写下，显示“今日尚未定权”，
@@ -15,7 +22,7 @@
 //      “未更新”，绝不把 0 画成“T 仓真的是空的”（§FUNDS-TODAY 方案 §7.1）；
 //   5) 非 admin 访问 403 时整卡不渲染（该接口是 admin 观测面，不在普通成员页制造噪音）。
 import React, { useEffect, useState } from 'react'
-import { Card, Tag } from 'tdesign-react'
+import { Button, Card, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { canStrictAny } from '../utils/perm.js'
 
@@ -89,18 +96,21 @@ function Column({ title, tags, children }) {
 }
 
 export default function FundsOverviewCard() {
-  const [data, setData] = useState(null)
+  const [data, setData] = useState(null)          // 实盘资金帧（§SPLIT-FUNDS-READ：只含 live）
+  const [paper, setPaper] = useState(null)        // 纸面读数：独立取、非轮询
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
 
-  // 10s 轮询：与 T 循环同频；页面切走后清理定时器（不留下幽灵请求）。
+  // 权限判据与后端 funds/today 的 strictAnyPerms 严格对齐（§MULTI-ACCT-B 批5）：
+  // 只持量化交易位的成员也放行，否则页面判据比后端严＝把新位做成哑权限。
+  const allowed = canStrictAny(FUNDS_READ_PERMS)
+
+  // §SPLIT-FUNDS-READ（2026-11-18）实盘半：10s 轮询，与 T 循环同频；切走后清理定时器。
+  // 这一半只走 /api/funds/today（纯文件读、毫秒级），不再夹带纸面——纸面锁再忙也拖不到这里。
   useEffect(() => {
+    if (!allowed) { setForbidden(true); return }
     let alive = true
     const load = async () => {
-      // §MULTI-ACCT-B 批5：GET /api/funds/today 后端本批改判为「funds_admin 或 quant_trade」，
-      // 前端这一档必须同步——否则只持量化交易位的成员会被本地判据挡在"无权限"卡片外，
-      // 而接口其实回 200（页面判据比后端严＝把新位做成哑权限）。
-      if (!canStrictAny(FUNDS_READ_PERMS)) { setForbidden(true); return }
       try {
         const res = await api.fetchFundsToday()
         if (!alive) return
@@ -121,14 +131,26 @@ export default function FundsOverviewCard() {
       alive = false
       clearInterval(timer)
     }
-  }, [])
+  }, [allowed])
+
+  // §SPLIT-FUNDS-READ 纸面半：不涉真实资金，不做轮询。本卡片位于「T 仓」tab 且 destroyOnHide，
+  // 组件挂载＝用户打开纸面内容，此时单次按需取一次 /api/paper/target 即可；切走卸载、再开再取。
+  // 这样纸面读数的刷新完全由用户打开动作驱动，与实盘的 10s 心跳彻底解耦。
+  const loadPaper = async () => {
+    if (!allowed) return
+    try {
+      setPaper(await api.fetchPaperTarget())
+    } catch (e) {
+      setPaper({ available: false, reason: e && e.message ? e.message : '纸面读数读取失败' })
+    }
+  }
+  useEffect(() => { loadPaper() }, [allowed])
 
   if (forbidden) return null
 
   const live = (data && data.live) || {}
   const funds = live.funds || null
   const account = live.account || null
-  const paper = (data && data.paper) || null
   const paperR = (paper && paper.readout) || null
   const pending = live.state === 'pending' || (!funds && live.state !== 'ok')
   const corrupt = live.state === 'corrupt'
@@ -223,7 +245,13 @@ export default function FundsOverviewCard() {
           <Row label="当日 T 净额" hint="仅 done 轮，独立口径">{funds ? money(funds.pnl_net) : '—'}</Row>
           <Row label="T 侧取数时刻">{funds && funds.t_at ? hhmmss(funds.t_at) : '—'}</Row>
         </Column>
-        <Column title="纸面（对照）" tags={paper && paper.available ? null : <Tag size="small" theme="default">未接入</Tag>}>
+        <Column title="纸面（对照）" tags={
+          <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+            {paper && paper.available ? null : <Tag size="small" theme="default">未接入</Tag>}
+            {/* §SPLIT-FUNDS-READ 纸面按需刷新：不轮询，用户点一次取一次。 */}
+            <Button size="small" variant="text" onClick={loadPaper}>刷新</Button>
+          </span>
+        }>
           {paper && paper.available && paperR ? (
             <>
               <Row label="现金">{money(paperR.cash)}</Row>

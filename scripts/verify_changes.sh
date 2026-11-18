@@ -12573,12 +12573,12 @@ CNT115=$((CNT115 + 1))
 [ "$LEDGER_RC115" = "0" ] || { echo "--- FAIL: §115 契约台账核对器在主仓退出码=${LEDGER_RC115}（应 0）：$(printf '%s\n' "$LEDGER_OUT115" | grep -E '^--- FAIL' | head -4)"; exit 1; }
 eqkey115 LEDGER_CHECK GREEN '台账闭合（Q1 双向相等 + Q2 无标签=0 + Q3 幽灵=0 + 撒谎=0 全齐）'
 eqkey115 ROUTES_DERIVED 220 'Q1 的 R：HandleFunc 派生读数须等值打印（2026-10-22 概念状态路由 191→195；2026-10-27 §DYN-T/§DYN-SIZE v4 签字面＋做 T 只读面 7 条 →202；2026-10-28 §FUNDS/§DECISION 两条只读面 →204；§FIX-20261028-F06 收盘对账只读面 GET /api/qmt/close-snapshot →205；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →206；§SUBSCRIPTION-A runtime 行情开关写面 GET/POST /api/config/runtime →208；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（账号级 authMiddleware，不落严格位）入账 →210；2026-11-04 §CARRIER-UPDATE 载体更新链三条入账（GET /api/qmt/carrier/manifest + POST /api/qmt/carrier/ack 走网关钥匙、POST /api/qmt/carrier/update 走 trading_admin 且跨账号再加 user_admin）→213；2026-11-17 §WIRING-C 强制刷新实盘账 POST /api/qmt/carrier/force-report（trading_admin）→220）'
-eqkey115 CALLPATH_DERIVED 177 '前端真拨得出去的地址条数（2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；2026-11-04 §CARRIER-UPDATE 前端覆盖 POST /api/qmt/carrier/update →169；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
-eqkey115 CALLSITES_DERIVED 182 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172；2026-11-04 §CARRIER-UPDATE 前端「更新载体」拨一次 →173；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →175）'
+eqkey115 CALLPATH_DERIVED 178 '前端真拨得出去的地址条数（2026-11-18 §SPLIT-FUNDS-READ fetchPaperTarget 拨 /api/paper/target →178；2026-10-22 153→156；2026-10-27 做 T 两张账本＋签字面 6 条 →162；2026-10-28 资金卡/决策卡 2 条 →164；§FIX-20261028-F13 把 fetchPaperOrders 的路径从变量改回字面量开头，GET /api/paper/orders 重新回到派生射程 →165；§SUBSCRIPTION-A 裁决 4/12 的行情开关写面 fetchRuntimeConfig/updateRuntimeConfig 两条 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；2026-11-04 §CARRIER-UPDATE 前端覆盖 POST /api/qmt/carrier/update →169；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
+eqkey115 CALLSITES_DERIVED 183 '调用点条数（一条路径可被多处拨；这两个数不等不是矛盾，是分账。2026-11-18 §SPLIT-FUNDS-READ 新增 fetchPaperTarget 调用点 →183；2026-10-22 156→159；2026-10-27 同批 →165；2026-10-28 →167；§FIX-20261028-F13 新增 fetchPaperOrdersPage 直连读 X-Total-Count →168；2026-11-01 §UAT-REVERIFY 新增 fetchAlertTotal + fetchSignalLogs 翻页参数，api/index.js 调用点 →169；§SUBSCRIPTION-A 行情开关写面两个调用点 →171；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →172；2026-11-04 §CARRIER-UPDATE 前端「更新载体」拨一次 →173；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →175）'
 eqkey115 OUT_OF_RANGE 0 '射程账：request() 里展开不出路径的调用必须为 0——静默跳过＝Q1/Q3 对它一起失明'
 eqkey115 LEDGER_ROWS 220 '台账行数须等于 R（多一行＝幽灵账，少一行＝新注册没归类；§FIX-20261028-F06 收盘对账只读面入账 →205；§SUBSCRIPTION-A runtime 写面入账 →208；2026-11-04 §MANUAL-BOOK 手动台账写面入账 →209；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt 入账 →210；2026-11-04 §CARRIER-UPDATE 三条入账 →213；2026-11-14 F4 补登 6 条漏登路由 →219）'
-eqkey115 COVERED_BY_WEB 177 '被前端覆盖的路由条数（2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
-eqkey115 UNCALLED 43 'R−C：每条都必须有分类标签＋可核落点（/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（无 UI 待补，前端未拨）→42；2026-11-04 §CARRIER-UPDATE 盒子侧两条（manifest/ack 由 qmt_gateway/carrier_updater.py 拨，不是前端）→44）；【11-06 晚批按实时派生重算】'
+eqkey115 COVERED_BY_WEB 178 '被前端覆盖的路由条数（2026-11-18 §SPLIT-FUNDS-READ /api/paper/target 从"无 UI 待补"转为前端覆盖 →178；2026-10-22 153→156；2026-10-27 同批 →162；2026-10-28 →164；§FIX-20261028-F13 纸面委托分页读取回到射程；§SUBSCRIPTION-A 设置页调用 runtime 两个端点 →167；2026-11-04 §MANUAL-BOOK 手动台账写面 POST /api/qmt/manual-positions（账号级 authMiddleware，不落严格位）入账 →168；；2026-11-06 晚批：增量改账新调用点 +1、order-receipt 分类归位 +1 →170；2026-11-14 F4 --emit-web 整块重生成（含 6 条漏登）→176）'
+eqkey115 UNCALLED 42 'R−C：每条都必须有分类标签＋可核落点（2026-11-18 §SPLIT-FUNDS-READ /api/paper/target 挂上 UI，从"无 UI 待补"转前端调用 →42；/livez /readyz 后 36→39；2026-10-27 新增只读取证面 /api/paper/target →40；§MULTI-ADMIN 000683 修复端点 POST /api/paper/adjust →41；2026-11-04 §4.2 人工回执 POST /api/qmt/order-receipt（无 UI 待补，前端未拨）→42；2026-11-04 §CARRIER-UPDATE 盒子侧两条（manifest/ack 由 qmt_gateway/carrier_updater.py 拨，不是前端）→44）；【11-06 晚批按实时派生重算】'
 eqkey115 GHOST_CALLS 0 'Q3：前端拨了服务端没注册的地址＝运行期 404，比缺 UI 严重'
 eqkey115 UNTAGGED 0 'Q2：分类/依据/说明三者缺一的条数'
 eqkey115 NO_BASIS 0 '「无依据」档必须为空：说不清为什么还留着＝待决策，不许混进台账假装闭合'
@@ -23731,4 +23731,114 @@ grep_q '2 passed' P205 || { echo "--- FAIL: §205 rules_t 锚点两例未跑满�
 
 [ "$B205_FAILED" = "0" ] || exit 1
 echo "ok - §205 §20261118-T-ANCHOR-COSTFALLBACK 锁通过（Go/纸面/烘参/热更新四处同源 + none/空来源负锁 + Go3/Py2 行为腿，累计判定点 ${CNT205}）"
+echo ""
+
+# §206 §20261118-SPLIT-FUNDS-READ（行业按日缓存根治 paper 锁内 I/O + 实盘/纸面资金拆接口）。
+# 背景：paper.e.mu 写锁内 dynamicPaperQtyLocked 逐票问行业（industryOf → 东财 HTTP +
+# EastMoneyLimiter≈300ms），121 信号 × N 票 ⇒ 锁被占 6~10s；funds/today 把纸面读数与实盘
+# 合在一份 JSON，纸面腿一卡，连已经算好的实盘 MS 都送不到前端（"数据日 —"）。
+# 本段锁四件事：
+#   ① 行业名按日缓存：命中即内存返回；跨日失效重拉；失败不入缓存（fail-open 不固化）；
+#   ② 锁外预热接线：撮合前 WarmIndustryCache 填当日候选池，使锁内行业查询零回源；
+#   ③ 拆接口：funds/today 响应无 paper 字段；paper/target 按请求者取账（不回落 operatorID）；
+#   ④ 前端纸面按需：fetchPaperTarget 存在、不在 10s 轮询里、组件在 destroyOnHide tab。
+#   ⑤ 行为腿真跑（Go data 缓存 / Go server 归属与拆分 / 前端纸面单次）。
+echo "==> 206 §20261118-SPLIT-FUNDS-READ（行业按日缓存 + 锁外预热 + 资金拆接口 + 纸面按需）..."
+B206_FAILED=0
+fail206() {
+	echo "--- FAIL: §206 $*"
+	FAIL=1
+	B206_FAILED=1
+}
+CNT206=0
+
+# ① 行业名按日缓存（data 层）。
+CNT206=$((CNT206 + 1))
+grep -qF 'func (m *MarketAPI) GetStockIndustry(code string) string {' internal/data/market.go \
+	|| fail206 "GetStockIndustry 入口丢失"
+CNT206=$((CNT206 + 1))
+grep -qF 'if ok && entry.day == today && entry.name != "" {' internal/data/market.go \
+	|| fail206 "当日缓存命中分支丢失（锁内会重新触网）"
+CNT206=$((CNT206 + 1))
+grep -qF 'name := m.fetchStockIndustry(code)' internal/data/market.go \
+	|| fail206 "回源腿未从 GetStockIndustry 拆出"
+CNT206=$((CNT206 + 1))
+if grep -qF 'm.industryCache[code] = industryCacheEntry{name: name, day: today}' internal/data/market.go; then :; else
+	fail206 "缓存写入未带当日 day（跨日不会失效）"
+fi
+CNT206=$((CNT206 + 1))
+grep -qF 'day 用 cntime 北京自然日' internal/data/market.go \
+	|| fail206 "缓存按北京自然日判定丢失（时区漂移会把跨日算成同日）"
+# 负锁：失败结果不得入缓存（否则一次网络抖动固化一整天 fail-open）。
+CNT206=$((CNT206 + 1))
+CACHE206=$(sed -n '/func (m \*MarketAPI) GetStockIndustry/,/^}/p' internal/data/market.go)
+if printf '%s' "$CACHE206" | grep -qF 'if name != "" {'; then :; else
+	fail206 "回源失败（空串）仍写入缓存——会把查不到固化一整天"
+fi
+
+# ② 锁外预热接线（engine 侧）。
+CNT206=$((CNT206 + 1))
+grep -qF 'func (m *MarketAPI) WarmIndustryCache(codes []string) {' internal/data/market.go \
+	|| fail206 "锁外预热方法 WarmIndustryCache 丢失"
+CNT206=$((CNT206 + 1))
+grep -qF 'e.warmPaperIndustries(emit, exit, pe)' internal/engine/engine.go \
+	|| fail206 "撮合前预热未接线（首轮冷缓存仍会在锁内回源）"
+CNT206=$((CNT206 + 1))
+WARM206=$(sed -n '/func (e \*Engine) warmPaperIndustries/,/^}/p' internal/engine/engine.go)
+if printf '%s' "$WARM206" | grep -qF 'pe.Positions()'; then :; else
+	fail206 "预热集合未含持仓票（dynamicPaperQtyLocked 遍历持仓问行业，冷票仍触网）"
+fi
+CNT206=$((CNT206 + 1))
+if printf '%s' "$WARM206" | grep -qF 'e.industryWarmDay == today'; then :; else
+	fail206 "预热未按日去重（每 5s 轮都预热＝限流打满）"
+fi
+
+# ③ 拆接口（server 侧）。
+CNT206=$((CNT206 + 1))
+FUNDS206=$(sed -n '/func (s \*Server) handleFundsToday/,/^}/p' internal/server/t_rounds_api.go)
+if printf '%s' "$FUNDS206" | grep -qF '"paper"'; then
+	fail206 "funds/today 响应仍夹带 paper 字段（纸面锁会再次拖垮实盘帧）"
+fi
+CNT206=$((CNT206 + 1))
+TARGET206=$(sed -n '/func (s \*Server) handlePaperTargetReadout/,/^}/p' internal/server/t_rounds_api.go)
+if printf '%s' "$TARGET206" | grep -qF 's.paperEngineFor(uid)'; then :; else
+	fail206 "paper/target 未按请求者取账（拆接口后成员会看到 owner 纸面账）"
+fi
+if printf '%s' "$TARGET206" | grep -qF 's.paperEngineFor(s.operatorID())'; then
+	fail206 "paper/target 回落到 operatorID（归属回归）"
+fi
+
+# ④ 前端纸面按需（不轮询、destroyOnHide）。
+CNT206=$((CNT206 + 1))
+grep -qF 'export async function fetchPaperTarget()' web/src/api/index.js \
+	|| fail206 "前端缺 fetchPaperTarget（纸面列无独立取数口）"
+CNT206=$((CNT206 + 1))
+if grep -qF 'fetchPaperTarget' web/src/components/FundsOverviewCard.jsx; then :; else
+	fail206 "FundsOverviewCard 未改用 paper/target"
+fi
+CNT206=$((CNT206 + 1))
+# 负锁：paper 取数不得出现在 setInterval 的轮询函数体内——用整段轮询块做文本判定。
+POLL206=$(sed -n '/10s 轮询，与 T 循环同频/,/}, \[allowed\])/p' web/src/components/FundsOverviewCard.jsx)
+if printf '%s' "$POLL206" | grep -qF 'fetchPaperTarget'; then
+	fail206 "纸面取数被塞回 10s 轮询器（纸面锁会再次拖累实盘卡）"
+fi
+CNT206=$((CNT206 + 1))
+grep -qF 'destroyOnHide' web/src/pages/Quant.jsx \
+	|| fail206 "T 仓 tab 丢了 destroyOnHide（切走不卸载＝纸面按需语义失效）"
+
+# ⑤ 行为腿：Go data 缓存 / Go server 归属与拆分 / 前端纸面单次。
+CNT206=$((CNT206 + 1))
+G206A=$(go test -count=1 ./internal/data/ -run 'TestIndustryDayCache|TestWarmIndustryCache' 2>&1 || true)
+grep_q '^ok' G206A || { echo "--- FAIL: §206 行业缓存行为腿：$(printf '%s\n' "$G206A" | tail -5)"; B206_FAILED=1; }
+CNT206=$((CNT206 + 1))
+G206B=$(go test -count=1 ./internal/server/ -run 'TestFundsTodayPaperIsolation' 2>&1 || true)
+grep_q '^ok' G206B || { echo "--- FAIL: §206 拆接口归属行为腿：$(printf '%s\n' "$G206B" | tail -5)"; B206_FAILED=1; }
+CNT206=$((CNT206 + 1))
+cd web && W206=$(env -u NODE_OPTIONS npx vitest run src/__tests__/funds_publish_20261028.test.jsx -t '纸面按需单次' 2>&1 || true); cd ..
+if printf '%s' "$W206" | grep -q '1 passed'; then :; else
+	echo "--- FAIL: §206 纸面按需单次前端行为腿：$(printf '%s\n' "$W206" | tail -8)"; B206_FAILED=1
+fi
+
+[ "$B206_FAILED" = "0" ] || exit 1
+echo "ok - §206 §20261118-SPLIT-FUNDS-READ 锁通过（按日缓存/锁外预热/拆接口/纸面按需四组静态 + Go2/前端1 行为腿，累计判定点 ${CNT206}）"
 echo ""

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/cluster"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
@@ -142,6 +143,12 @@ type Engine struct {
 	// equitySnapDay §DYN-SIZE P6 权益日快照去重（YYYY-MM-DD，写成功才置位）。
 	// English: §DYN-SIZE P6 daily dedup for the equity snapshot (set only after a successful write).
 	equitySnapDay string
+	// industryWarmDay §INDUSTRY-DAY-CACHE（2026-11-18）行业名按日预热的去重日（YYYY-MM-DD）。
+	// 首轮撮合前于锁外预热"本轮信号 + 持仓"的行业名，让 paper 写锁内的 industryOf 全命中
+	// data.MarketAPI 的当日缓存（零 I/O）。跨日重新预热一次——这就是"每日盘后刷新"的落点。
+	// English: day-keyed one-shot pre-warm of industry names, run OUTSIDE the ledger lock before
+	// the first paper fill, so every in-lock industryOf hits the day cache instead of hitting HTTP.
+	industryWarmDay string
 	// accountProbeFn §DYN-SIZE 账户级读数探针（registry/main 注入：回看窗止损次数 / 权益回撤 /
 	// 总仓位占比）。nil=未注入 → AccountState 保持零值（各上限因子弃权），不影响任何裁定。
 	// English: §DYN-SIZE account-level reading probe (injected by registry/main); nil = abstain.
@@ -1307,11 +1314,63 @@ func (e *Engine) QMTController() *trading.Controller {
 // short-book signals pass through. The judge itself runs every round via judgePaperLedgers, not here.
 // §M9：sellMode 为轮首快照（调用方在轮首读一次配置后逐层透传），本函数内不再现读配置，
 // 避免轮中 shadow→on 翻转导致同一轮前半用旧口径、后半用新口径的「保护空窗」。
+// warmPaperIndustries §INDUSTRY-DAY-CACHE（2026-11-18）：在 paper 撮合持锁之前，
+// 于锁外把当日会问到的行业名预热进共享缓存。集合 = 本轮买入/卖出信号票 + paper 当前持仓票：
+// dynamicPaperQtyLocked 只对本票与遍历持仓调 industryOf，覆盖这两类即可让锁内零回源。
+// 按北京自然日去重（industryWarmDay），一天只预热一次；跨日首轮重新预热＝盘后刷新语义。
+// 预热是纯读副作用（只填缓存、不碰账本），失败票不入缓存留给后续重试，不改变任何交易判定。
+// English: once-per-day, outside the ledger lock, pre-warm industry names for this round's signal
+// codes and current paper holdings. Pure side effect on the data cache; no trading decision reads it.
+func (e *Engine) warmPaperIndustries(emit, exit []combat_agent.Signal, pe *paper.Engine) {
+	today := cntime.Now().Format("2006-01-02")
+	// 按日去重：在锁内判定并置位，确保当天只有一轮真正执行预热（避免在锁外重复打网络）。
+	e.mu.Lock()
+	if e.industryWarmDay == today {
+		e.mu.Unlock()
+		return
+	}
+	e.industryWarmDay = today
+	e.mu.Unlock()
+
+	if e.marketAPI == nil {
+		return // 无行情源：缓存不可用，GetStockIndustry 回退为空串，行业闸照旧 fail-open
+	}
+	seen := make(map[string]bool)
+	codes := make([]string, 0, len(emit)+len(exit)+16)
+	add := func(code string) {
+		code = pureTsCode(code)
+		if code != "" && !seen[code] {
+			seen[code] = true
+			codes = append(codes, code)
+		}
+	}
+	for _, s := range emit {
+		add(s.Code)
+	}
+	for _, s := range exit {
+		add(s.Code)
+	}
+	if pe != nil {
+		for _, p := range pe.Positions() {
+			add(p.Code)
+		}
+	}
+	e.marketAPI.WarmIndustryCache(codes)
+}
+
 func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo, sellMode string) {
 	e.mu.RLock()
 	dispatch := e.paperOnSignals
 	pe := e.paper
 	e.mu.RUnlock()
+
+	// §INDUSTRY-DAY-CACHE（2026-11-18）：撮合前在**锁外**预热当日行业名。
+	// paper.OnSignals 持写锁逐票问行业（本票 + 遍历持仓），首轮冷缓存会在锁内打东财
+	// （≈300ms/票）把锁占住。这里按日一次把"本轮信号 + 当前持仓"的行业名填进共享缓存，
+	// 使锁内每行 industryOf 命中内存。预热失败（返回空）不入缓存、下轮自然重试，fail-open 不变。
+	// English: pre-warm industry names outside the ledger lock, once per day, for this round's
+	// signal codes plus current holdings — so the in-lock industry lookups are pure memory hits.
+	e.warmPaperIndustries(emit, exit, pe)
 	unifiedOn := sellMode == "on"
 	if unifiedOn {
 		emit = unifiedSellGateSigs(emit)

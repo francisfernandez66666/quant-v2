@@ -164,6 +164,27 @@ type MarketAPI struct {
 	// 东财是唯一源；盘中失败时回退同日最近一次成功快照（跨重启仍可用），
 	// 供 5 日净流入因子与研究/回测离线消费。
 	flowHistCacheDir string
+
+	// §INDUSTRY-DAY-CACHE（2026-11-18）个股行业名的**按日**内存缓存。
+	// 为什么必须有：行业名是慢变量（一只股票的申万/东财行业一天变不了几次），
+	// 而 GetStockIndustry 每次都打东财 push2 + EastMoneyLimiter.Wait()≈300ms。
+	// 纸面撮合在 paper.e.mu 写锁内逐票问行业（本票 + 遍历全部持仓），
+	// 121 条信号 × N 票 × 0.3s ⇒ 锁被占 6~10s，把读接口和整个撮合轮一起拖死。
+	// 命中当日缓存即纯内存返回 ⇒ 锁内零 I/O；跨自然日自动失效＝"每日盘后刷新一次"。
+	// 失败（返回空串）**不入缓存**，下一轮可重试——保持既有 fail-open 语义
+	// （查不到行业 ⇒ 敞口闸跳过），不把一次网络抖动固化成一整天。
+	// English: per-day in-memory cache for industry names — a slow-moving field hit synchronously
+	// under the paper ledger lock. Day-keyed so it refreshes once daily; failures are NOT cached
+	// so a transient miss never freezes into a full trading day of skipped sector checks.
+	industryCacheMu sync.RWMutex
+	industryCache   map[string]industryCacheEntry
+}
+
+// industryCacheEntry 一条按日行业缓存：行业名 + 写入时的北京自然日（YYYY-MM-DD）。
+// day 决定命中与否——跨日即视为 miss，重新回源，等价于"盘后刷新"。
+type industryCacheEntry struct {
+	name string
+	day  string
 }
 
 // ── §M3 新闻源健康记录 ──
@@ -339,11 +360,12 @@ const emNewsReferer = "https://np-anotice-stock.eastmoney.com/"
 // and pre-initialized quote/PE caches.
 func NewMarketAPI() *MarketAPI {
 	return &MarketAPI{
-		client:     &http.Client{Timeout: 10 * time.Second},
-		quoteCache: make(map[string]cachedQuote),
-		peMap:      make(map[string]peCacheEntry),
-		peTTL:      10 * time.Minute,
-		emBreakers: make(map[string]*emBreaker),
+		client:        &http.Client{Timeout: 10 * time.Second},
+		quoteCache:    make(map[string]cachedQuote),
+		peMap:         make(map[string]peCacheEntry),
+		peTTL:         10 * time.Minute,
+		emBreakers:    make(map[string]*emBreaker),
+		industryCache: make(map[string]industryCacheEntry),
 	}
 }
 
@@ -2825,6 +2847,65 @@ func maxSectorChange(sectors []SectorInfo) float64 {
 // region board ("浙江板块"). The old implementation returned f128 as if it were the industry —
 // a wrong-field bug. Now f127 wins, with f128 kept only as a fallback for sources that omit f127.
 func (m *MarketAPI) GetStockIndustry(code string) string {
+	// §INDUSTRY-DAY-CACHE：先查当日缓存。命中即纯内存返回，绝不在调用方（尤其 paper
+	// 写锁内）触网。day 用 cntime 北京自然日，跨日自动失效＝盘后刷新语义。
+	today := cntime.Now().Format("2006-01-02")
+	m.industryCacheMu.RLock()
+	entry, ok := m.industryCache[code]
+	m.industryCacheMu.RUnlock()
+	if ok && entry.day == today && entry.name != "" {
+		return entry.name
+	}
+	// miss（或跨日）：回源。多并发同时 miss 同一只票会各自打一次，但预热（WarmIndustryCache）
+	// 已在锁外提前填好当日候选池，锁内命中的是缓存，不存在这里；此处只兜预热遗漏的冷票。
+	name := m.fetchStockIndustry(code)
+	if name != "" {
+		m.industryCacheMu.Lock()
+		if m.industryCache == nil {
+			m.industryCache = make(map[string]industryCacheEntry)
+		}
+		m.industryCache[code] = industryCacheEntry{name: name, day: today}
+		m.industryCacheMu.Unlock()
+	}
+	return name
+}
+
+// WarmIndustryCache 预热一组代码的当日行业名（**锁外调用**）。
+//
+// 为什么单独提供：GetStockIndustry 的回源带 EastMoneyLimiter≈300ms 等待，若在 paper.e.mu
+// 写锁内首次回源，仍会短暂占锁。打分循环在拿快照后、调 paper 撮合前于锁外批量预热候选池，
+// 使锁内每一行 industryOf 都命中当日缓存——这是"锁内零 I/O"根治成立的前提。
+// 预热只填成功结果；失败的票不写缓存，留给后续轮次自然重试（fail-open 语义不变）。
+// English: pre-warm the day-cache for a set of codes OUTSIDE the ledger lock, so the fill path
+// never runs while the paper lock is held. Failed lookups stay uncached for later retry.
+func (m *MarketAPI) WarmIndustryCache(codes []string) {
+	today := cntime.Now().Format("2006-01-02")
+	for _, code := range codes {
+		if code == "" {
+			continue
+		}
+		m.industryCacheMu.RLock()
+		entry, ok := m.industryCache[code]
+		m.industryCacheMu.RUnlock()
+		if ok && entry.day == today && entry.name != "" {
+			continue
+		}
+		name := m.fetchStockIndustry(code)
+		if name == "" {
+			continue
+		}
+		m.industryCacheMu.Lock()
+		if m.industryCache == nil {
+			m.industryCache = make(map[string]industryCacheEntry)
+		}
+		m.industryCache[code] = industryCacheEntry{name: name, day: today}
+		m.industryCacheMu.Unlock()
+	}
+}
+
+// fetchStockIndustry 真正打东财 push2 取行业名（不含缓存）。缓存未命中时才调用。
+// 返回空串表示查不到（含网络失败 / 字段缺失），调用方据此保持 fail-open。
+func (m *MarketAPI) fetchStockIndustry(code string) string {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f57,f58,f127,f128", sid)
 	EastMoneyLimiter.Wait()

@@ -38,8 +38,8 @@ vi.mock('../api/index.js', () => ({
   fetchFundsToday: vi.fn(async () => ({
     at: '2026-10-30 10:30:00',
     live: { state: 'ok', funds: { cash: 50000, frozen_cash: 0, total_asset: 200000, market_value: 150000, cash_at: '2026-10-30 10:30:00' }, account: null },
-    paper: { available: false },
   })),
+  fetchPaperTarget: vi.fn(async () => ({ available: false, reason: '模拟盘引擎未接入' })),
   fetchPaperTRounds: vi.fn(async () => ({ book: 'paper', enabled: true, rounds: [], pnl: { net: 0, gross: 0, done_rounds: 0, fee_est_share: 0 } })),
   fetchLiveTRounds: vi.fn(async () => ({ book: 'live', state: 'missing', rounds: [], pnl: { net: 0, gross: 0, done_rounds: 0, fee_est_share: 0 } })),
 }))
