@@ -1241,11 +1241,13 @@ func (r *tLiveRound) openPlan(code string) (string, int, string) {
 	}
 	// 锚点前置（§8.4.5）：没有锚点时止盈/止损基准会回落到摊薄成本，T 腿一成交就拖走风控参数线。
 	// 实盘侧只有 anchor_price 一列、没有 anchor_source 列，故成本回落档无法在此辨识（已在交付说明里上报）。
-	// 锚点前置（§8.4.5）：光有 anchor_price>0 不够，来源必须是**首买价可证**那一档。
-	// cost_fallback/none/空值一律不开腿——否则"用摊薄成本冒充锚点"就从实盘侧绕回来了
+	// 锚点前置（§8.4.5）：光有 anchor_price>0 不够，来源必须是**可证**那一档。
+	// none/空值一律不开腿——否则"用一个不存在的基准"就从实盘侧绕回来了
 	// （纸面侧同判据是 paper.Position.AnchorTicket，两边各一份、门禁 §127 锁字面量一致）。
+	// cost_fallback 自 2026-11-18 owner 裁决起放行：物理机上没有首买成交可证的持仓，
+	// 坚持只认 first_buy_order 会让 T 腿永远开不了（代价＝锚点可能随加仓漂移，已接受）。
 	if pos.AnchorPrice <= 0 || !pos.AnchorTicket() {
-		return "", 0, fmt.Sprintf("step0 锚点不可证(anchor_price=%.4f source=%q)：非首买价来源不得开 T（T 腿不许改动卖出裁决基准）",
+		return "", 0, fmt.Sprintf("step0 锚点不可证(anchor_price=%.4f source=%q)：无基准来源不得开 T（T 腿不许改动卖出裁决基准）",
 			pos.AnchorPrice, orDashSource(pos.AnchorSource))
 	}
 	q := r.quotes[code]

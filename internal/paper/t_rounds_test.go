@@ -522,7 +522,7 @@ func TestTRoundStrategicGateBlocksConversion(t *testing.T) {
 }
 
 // TestTRoundAnchorInvariants 锚点三条：开腿不改锚点、摊薄成本不影响判线（判线读锚点）、
-// 无锚点或来源是 cost_fallback ⇒ 一律不开 T 腿。
+// 无锚点或来源是 none ⇒ 一律不开 T 腿；cost_fallback 自 2026-11-18 裁决起放行。
 func TestTRoundAnchorInvariants(t *testing.T) {
 	minuteVNow = 0
 	e := seedBase(t, "300001", 1000)
@@ -553,14 +553,24 @@ func TestTRoundAnchorInvariants(t *testing.T) {
 		t.Fatalf("无锚点持仓开了 T 腿＝用摊薄成本冒充风控基准，got %+v", e2.tRounds[0])
 	}
 
-	// cost_fallback 档
+	// cost_fallback 档（2026-11-18 owner 裁决：以摊薄成本为锚点也允许开 T）
 	e3 := seedBase(t, "300001", 1000)
 	e3.mu.Lock()
 	e3.positions["300001"].AnchorSource = anchorSourceCostFallback
 	e3.mu.Unlock()
 	e3.RunIntradayT(tQuote("300001", 9.4, 10), tParams())
-	if len(e3.tRounds) != 0 {
-		t.Fatalf("成本回落档不得开 T（可能被历史加仓/T 腿摊薄过），got %+v", e3.tRounds[0])
+	if len(e3.tRounds) != 1 {
+		t.Fatalf("成本回落档自 2026-11-18 裁决起应可开 T，got %+v", e3.tRounds)
+	}
+
+	// none 档仍然不开腿：那不是"用一个可疑的基准"，而是根本没有任何基准
+	e4 := seedBase(t, "300001", 1000)
+	e4.mu.Lock()
+	e4.positions["300001"].AnchorSource = anchorSourceNone
+	e4.mu.Unlock()
+	e4.RunIntradayT(tQuote("300001", 9.4, 10), tParams())
+	if len(e4.tRounds) != 0 {
+		t.Fatalf("none 档不得开 T 腿（无基准），got %+v", e4.tRounds[0])
 	}
 }
 

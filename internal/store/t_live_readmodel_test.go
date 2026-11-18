@@ -4,7 +4,7 @@
 //  1. EarliestBuyFillPrice：首买价必须来自 `fills_effective`（人工勘误已生效的视图）并且**忽略被勘误成卖出的行**。
 //     反证方向：如果实现改读原始 fills，一笔被勘误的"记成买入的卖出"就会被写成锚点——
 //     那是把一个根本没发生过的成交价当作风控基准，且事后从库里查不出来源（§FILL-AMEND 同族事故）。
-//  2. AnchorTicket：来源不可证（cost_fallback/none/空）一律不给 T 资格。
+//  2. AnchorTicket：来源不可证（none/空）一律不给 T 资格；cost_fallback 自 2026-11-18 起放行。
 //     反证方向：只判 `AnchorPrice>0` 的实现会让 W3 回填过的存量票全体获得开日内腿的许可。
 //  3. TLegOrderLedger：委托笔数按**每一笔报出的委托**计（含撤后重报），不去重。
 //     反证方向：去重后的数字好看但没有解释力——券商异常交易观察看的就是报单量。
@@ -79,7 +79,9 @@ func TestRealPositionAnchorTicket(t *testing.T) {
 	}{
 		{"首成交建行可开 T", 10, AnchorSourceFirstBuyOrder, true},
 		{"层账首买价可开 T", 10, AnchorSourceFirstLot, true},
-		{"成本回落档不可开 T", 10, AnchorSourceCostFallback, false},
+		// §T-ANCHOR-COSTFALLBACK（owner 2026-11-18 裁决）：成本回落档也放行——物理机上
+		// 没有首买成交可证的持仓，否则 T 腿永远停在锚点门。
+		{"成本回落档可开 T（2026-11-18 裁决）", 10, AnchorSourceCostFallback, true},
 		{"明确无源不可开 T", 10, AnchorSourceNone, false},
 		{"来源列上线前的存量行不可开 T", 10, "", false},
 		{"来源可证但锚点为零仍不可开 T", 0, AnchorSourceFirstBuyOrder, false},

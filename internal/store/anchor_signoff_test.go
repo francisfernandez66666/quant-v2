@@ -40,7 +40,7 @@ func TestAnchorSignoffPlanClassifies(t *testing.T) {
 	db := newSignoffTestDB(t)
 	seedPositions(t, db, []RealPosition{
 		{TsCode: "000001.SZ", UserID: "u1", Qty: 100, CostPrice: 10, AnchorSource: "", AnchorPrice: 0},                         // 可回填
-		{TsCode: "000002.SZ", UserID: "u1", Qty: 100, CostPrice: 20, AnchorSource: AnchorSourceCostFallback, AnchorPrice: 20},  // 可回填
+		{TsCode: "000002.SZ", UserID: "u1", Qty: 100, CostPrice: 20, AnchorSource: AnchorSourceCostFallback, AnchorPrice: 20},  // 2026-11-18 起已可开T
 		{TsCode: "000003.SZ", UserID: "u1", Qty: 100, CostPrice: 30, AnchorSource: AnchorSourceFirstBuyOrder, AnchorPrice: 29}, // 已可开T
 		{TsCode: "000004.SZ", UserID: "u1", Qty: 0, CostPrice: 40, AnchorSource: ""},                                           // 清仓，不计
 		{TsCode: "000005.SZ", UserID: "u1", Qty: 100, CostPrice: 0, AnchorSource: ""},                                          // 无价，跳过
@@ -52,11 +52,11 @@ func TestAnchorSignoffPlanClassifies(t *testing.T) {
 	if p.Total != 4 { // qty>0 的四行
 		t.Fatalf("total=%d want=4", p.Total)
 	}
-	if p.Eligible != 2 {
-		t.Fatalf("eligible=%d want=2", p.Eligible)
+	if p.Eligible != 1 {
+		t.Fatalf("eligible=%d want=1（cost_fallback 自 2026-11-18 起已可开 T）", p.Eligible)
 	}
-	if p.AlreadyOK != 1 || p.Skipped != 1 {
-		t.Fatalf("already_ok=%d skipped=%d want=1/1", p.AlreadyOK, p.Skipped)
+	if p.AlreadyOK != 2 || p.Skipped != 1 {
+		t.Fatalf("already_ok=%d skipped=%d want=2/1", p.AlreadyOK, p.Skipped)
 	}
 }
 
@@ -124,8 +124,9 @@ func TestAnchorSignoffCodesWhitelist(t *testing.T) {
 
 func TestAnchorSignoffAuditTrail(t *testing.T) {
 	db := newSignoffTestDB(t)
+	// 存量行（来源列上线前）：无锚点、无来源 —— 2026-11-18 后仍不可开 T，才是签字面要补的行。
 	seedPositions(t, db, []RealPosition{
-		{TsCode: "000001.SZ", UserID: "u1", Qty: 100, CostPrice: 10, AnchorSource: AnchorSourceCostFallback, AnchorPrice: 10},
+		{TsCode: "000001.SZ", UserID: "u1", Qty: 100, CostPrice: 10, AnchorSource: "", AnchorPrice: 0},
 	})
 	if _, _, err := db.AnchorSignoffApply("owner-zhang", "依据原文ABC", nil); err != nil {
 		t.Fatal(err)
@@ -139,7 +140,7 @@ func TestAnchorSignoffAuditTrail(t *testing.T) {
 	}
 	row := logs[0]
 	if row["new_anchor_source"] != AnchorSourceFirstBuyOrder ||
-		row["old_anchor_source"] != AnchorSourceCostFallback ||
+		row["old_anchor_source"] != "" ||
 		row["signer"] != "owner-zhang" || row["basis"] != "依据原文ABC" {
 		t.Fatalf("audit row wrong: %+v", row)
 	}

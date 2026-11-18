@@ -58,8 +58,12 @@ HOTRELOAD_DB = os.environ.get("HOTRELOAD_DB", "/var/lib/quant-trading-v2/trading
 # 与 HOTRELOAD_DB（trading.db 研究库）刻意分开——锚点在 trading.db 里恒为空（实测）。
 LIVE_DB = os.environ.get("LIVE_DB", "/var/lib/quant-trading-v2/live.db")
 T_ROUNDS_LIVE = os.path.join(DATA_DIR, "accounts", OWNER_UID, "t_rounds_live.json")
-# T 腿短码锚点可开 T 的来源档位（与 Go real_positions.go anchorTicketSources 同字面量）。
-T_ANCHOR_OK_SOURCES = ("first_buy_order", "first_lot")
+# T 腿短码锚点可开 T 的来源档位（兜底表；真源是烘参 t_anchor_ok_sources）。
+# §T-ANCHOR-COSTFALLBACK（owner 2026-11-18 裁决）：cost_fallback 也放行——物理机上没有
+# 首买成交可证的持仓，坚持只认 first_buy_order/first_lot 会让 T 腿永远停在锚点门。
+# 优先读 local_executor_params.json（Go anchorTicketSources 经 derive 写入），两份清单
+# 因此不会各说各话；读不到时才用这张兜底表。
+T_ANCHOR_OK_SOURCES = ("first_buy_order", "first_lot", "cost_fallback")
 # §LIVE-T-20261116：T 腿幂等短码表（owner 装填动作，离线确认过：
 # 五个码互不为前缀、且不与现有 signal_codes 的 BD/BK/D/DB/DR/FC/GN/HC/LD/LD1/PB/PT/SL/TP 冲突；
 # 'X' 前缀战略腿未使用）。空表即 T 腿 fail-closed 不出单——这里装填即解锁。
@@ -321,6 +325,25 @@ def extract_held_codes():
         return set()
 
 
+def _t_anchor_ok_sources():
+    """可开 T 的锚点来源清单：优先读烘参，读不到才退回模块常量。
+
+    真源是 Go 的 anchorTicketSources（经 derive_carrier_params.py 写进
+    local_executor_params.json）。载体在盒子上判的是同一份烘参，所以这里必须跟它一致——
+    两份手抄清单一旦漂移，锚点簿会按一份过滤、rules_t 又按另一份判，T 腿会静默不出。
+    """
+    try:
+        with open(os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_params.json"),
+                  encoding="utf-8") as fh:
+            vals = (json.load(fh).get("params") or {}).get("t_anchor_ok_sources") or []
+        vals = [str(v) for v in vals if str(v)]
+        if vals:
+            return tuple(vals)
+    except (OSError, ValueError):
+        pass
+    return T_ANCHOR_OK_SOURCES
+
+
 def bake_t_anchor_book():
     """§LIVE-T-20261116：把「可开 T 的持仓首买锚点」从 live.db 烘进载体参数。
 
@@ -332,15 +355,16 @@ def bake_t_anchor_book():
     库不可读/表缺失 → 空表并打锚（fail-closed：沙箱 step0 会因此拒绝开 T，不会瞎下）。
     """
     out = {}
+    ok_sources = _t_anchor_ok_sources()
     try:
         import sqlite3
         conn = sqlite3.connect("file:%s?mode=ro" % LIVE_DB, uri=True, timeout=5)
         try:
-            ph = ",".join("?" for _ in T_ANCHOR_OK_SOURCES)
+            ph = ",".join("?" for _ in ok_sources)
             cur = conn.execute(
                 "SELECT ts_code, anchor_price, anchor_source FROM real_positions "
                 "WHERE user_id=? AND COALESCE(qty,0)>0 AND anchor_price>0 "
-                "AND anchor_source IN (%s)" % ph, (OWNER_UID,) + T_ANCHOR_OK_SOURCES)
+                "AND anchor_source IN (%s)" % ph, (OWNER_UID,) + ok_sources)
             for code, price, source in cur:
                 code = norm(code)
                 if len(code) != 6 or not code.isdigit():

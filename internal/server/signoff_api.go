@@ -102,7 +102,8 @@ func (s *Server) handleAnchorBackfillPlan(w http.ResponseWriter, r *http.Request
 		"plan":               pe.AnchorBackfillPlan(lookup, true),
 		"authorize_key":      v4SignoffToken,
 		"load_time_behavior": "账本加载时只自动补层账首买价（first_lot）；成本档（cost_fallback）与买入历史档必须走本接口签字",
-		"note": "回填后 source=cost_fallback / none 的持仓不得开做 T 腿（AnchorTicket 已按此收口）；" +
+		"note": "回填后 source=none 的持仓不得开做 T 腿（AnchorTicket 已按此收口）；" +
+			"cost_fallback 自 2026-11-18 owner 裁决起可开 T（已知代价：锚点可能随加仓漂移）。" +
 			"签字落盘请调用 POST /api/paper/anchor-backfill（body 带 authorize）。",
 	})
 }
@@ -142,7 +143,7 @@ func (s *Server) handleAnchorBackfillApply(w http.ResponseWriter, r *http.Reques
 		"coverage":   pe.AnchorCoverage(lookup),
 		"remaining":  pe.AnchorBackfillPlan(lookup, true), // 回填后仍缺锚点的行（正常应为空数组）
 		"t_eligible": pe.TAnchorEligibleCount(),
-		"note":       "cost_fallback/none 来源的持仓不计入 t_eligible（可判线但不开 T 腿）",
+		"note":       "none/空来源的持仓不计入 t_eligible；cost_fallback 自 2026-11-18 owner 裁决起计入（可开 T 腿）",
 	})
 }
 

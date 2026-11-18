@@ -3,7 +3,7 @@ package store
 // anchor_signoff.go —— 实盘持仓「首买锚点」签字回填（§ANCHOR-SIGNOFF 2026-11-16）。
 //
 // 为什么需要它
-//   做 T 的 step0 开腿门要求 anchor_source ∈ {first_buy_order, first_lot}（AnchorTicket）。
+//   做 T 的 step0 开腿门要求 anchor_source ∈ 白名单（AnchorTicket；2026-11-18 起含 cost_fallback）。
 //   现网存量持仓大量是券商快照建行（anchor 为空）或 W3 回填的 cost_fallback 档，
 //   两者都不能开 T。要么用真实成交重建首买价，要么——当 owner 能证明该持仓自买入
 //   从未加减仓、成本价即首买价时——由 owner 签字把成本价确认为首买锚点。
@@ -12,7 +12,8 @@ package store
 //
 // 硬边界（不越过就不算「用摊薄成本冒充首买价」）
 //   1. 只处理 qty>0 且当前不能开 T 的行；已有白名单档锚点一律跳过、绝不覆盖。
-//   2. anchor_source 写 AnchorSourceFirstBuyOrder（唯一能开 T 的实盘档），
+//   2. anchor_source 写 AnchorSourceFirstBuyOrder（**证据最强**的实盘档，不是唯一可开 T 的档——
+//      cost_fallback 自 2026-11-18 owner 裁决起也放行，见 real_positions.go 的 anchorTicketSources），
 //      anchor_price 取 cost_price —— 但**仅当**调用方携带 owner 签字口令，
 //      并逐票声明「买入后无加减仓」事实。
 //   3. 每一笔写入同步落 anchor_signoff_log：谁、何时、哪只票、旧值/新值、依据原文。

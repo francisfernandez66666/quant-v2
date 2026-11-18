@@ -9,11 +9,15 @@
 // 回填口径与降级顺序（每票取第一个拿得到的读数，并把来源写进 AnchorSource）：
 //  1. `first_lot`       层账里最早那一批的含费每股成本＝真正的首买价（最可信，与新建仓同源）；
 //  2. `first_buy_order` 调用方（engine）从买入历史（实盘 orders/fills）取到的最早一笔成交价；
-//  3. `cost_fallback`   只有摊薄成本可读——**只给裁决内核一个能算的基准，不作为开 T 的资格**；
+//  3. `cost_fallback`   只有摊薄成本可读——给裁决内核一个能算的基准；2026-11-18 owner 裁决后
+//     也授予开 T 资格（见下方 AnchorTicket 与实盘侧 anchorTicketSources 的说明）；
 //  4. `none`            什么价都没有：`AnchorPrice` 保持 0，既不判线也不开 T。
 //
-// 为什么第 3 档不能开 T：摊薄成本可能被历史加仓、也可能被正 T 买腿本身改写过，
+// 为什么第 3 档原本不能开 T：摊薄成本可能被历史加仓、也可能被正 T 买腿本身改写过，
 // 把它写成"最初那笔"就是让 T 腿继续移动风控线，只是换了个入口（§0 第 10 条）。
+// 2026-11-18 owner 裁决放宽了这一档：物理机上的既有持仓没有首买成交可证，若坚持只认
+// first_lot/first_buy_order，做 T 腿会永远停在锚点门。代价（锚点随加仓漂移）已被接受，
+// 但证据等级仍然区分：cost_fallback 的行在读数面必须能看出它只是成本回落档。
 //
 // 幂等：只处理 `AnchorPrice<=0` 的行；已回填的第二次调用一律不动（含来源字段）。
 // dry-run：`AnchorBackfillPlan` 只算不写，供 owner 逐票看"前后触发价差多少"再签字落盘——
@@ -35,7 +39,7 @@ import (
 const (
 	anchorSourceFirstLot     = "first_lot"       // 层账最早批次的含费买入价（＝首买价，可开 T）
 	anchorSourceFirstBuy     = "first_buy_order" // 买入历史里最早一笔成交价（可开 T）
-	anchorSourceCostFallback = "cost_fallback"   // 只有摊薄成本（有基准但**不开 T**）
+	anchorSourceCostFallback = "cost_fallback"   // 摊薄成本回落档（2026-11-18 起同样可开 T）
 	anchorSourceNone         = "none"            // 无从回填（不判线、不开 T）
 )
 
@@ -61,7 +65,7 @@ type AnchorBackfillCoverage struct {
 	WithAnchor   int     `json:"with_anchor"`   // AnchorPrice>0
 	Missing      int     `json:"missing"`       // AnchorPrice=0（待回填）
 	Backfillable int     `json:"backfillable"`  // 待回填里能拿到首买价或历史的行数
-	CostOnly     int     `json:"cost_only"`     // 只能按成本回落（回填后也不得开 T）
+	CostOnly     int     `json:"cost_only"`     // 只能按成本回落（回填后来源＝cost_fallback，2026-11-18 起也可开 T）
 	Unfillable   int     `json:"unfillable"`    // 完全无价可回填
 	MissingValue float64 `json:"missing_value"` // 待回填行的市值合计
 	TotalValue   float64 `json:"total_value"`   // 全部持仓市值
@@ -89,15 +93,17 @@ func (p *Position) firstBuyPrice() float64 {
 }
 
 // AnchorTicket 该持仓有没有"开 T 腿"的资格（§8.4.5 锚点前置）。
-// 只有锚点非零**且**来源可证（首买价/买入历史）才放行；cost_fallback 与 none 一律拒绝，
-// 哪怕后者已经把 AnchorPrice 填成了一个能算的数。
-// English: T eligibility needs a non-zero anchor **and** a provable provenance; a cost-derived anchor
-// is only good enough to compute risk lines, never to justify intraday trading.
+// 锚点非零且来源可证（首买价/买入历史/成本回落）才放行；none 与来源为空一律拒绝。
+// 成本回落档为什么 2026-11-18 起也放行：见文件头第 3 档的说明——物理机上没有首买成交可证的
+// 持仓，否则 T 腿永远开不了；该裁决接受"锚点可能随加仓漂移"的已知代价。
+// English: T eligibility needs a non-zero anchor with a known provenance; `none` and empty
+// stay closed, while the cost-derived provenance is admitted by the 2026-11-18 owner ruling.
 func (p *Position) AnchorTicket() bool {
 	if p == nil || p.AnchorPrice <= 0 {
 		return false
 	}
 	return p.AnchorSource == anchorSourceFirstLot || p.AnchorSource == anchorSourceFirstBuy ||
+		p.AnchorSource == anchorSourceCostFallback ||
 		// 新建仓路径在建仓时就写好了锚点（fillLocked），当时还没有来源字段——按 first_lot 同性质处理，
 		// 层账与锚点同源，可信度等同 first_lot。
 		(len(p.AnchorSource) == 0 && len(p.Lots) > 0)
@@ -249,7 +255,7 @@ func (e *Engine) TAnchorBlockReason(p *Position) string {
 		return "锚点缺失(AnchorPrice=0)，未回填不得开T"
 	}
 	if !p.AnchorTicket() {
-		return fmt.Sprintf("锚点来源不可信(anchor_source=%q)，成本回落档不得开T", p.AnchorSource)
+		return fmt.Sprintf("锚点来源不可证(anchor_source=%q)，无首买/成本回落基准不得开T", p.AnchorSource)
 	}
 	return ""
 }
@@ -286,8 +292,8 @@ func (e *Engine) BackfillAnchorsOnLoad() (filled, skipped int) {
 
 // TAnchorEligibleCount 当前有多少持仓具备"开做 T 腿"的锚点资格（AnchorTicket 为真的行数）。
 // 签字接口用它给一个总数：回填完成后 owner 要看的不是"补了几条"，而是"能开 T 的仓有多少"——
-// cost_fallback/none 两档即便有锚点也不计入，这正是 §8.4.5 那道口径的读数面。
-// English: how many positions may open a T leg at all — cost-derived anchors deliberately excluded.
+// none 档与来源为空的行即便有锚点也不计入（2026-11-18 起 cost_fallback 计入，见 AnchorTicket）。
+// English: how many positions may open a T leg at all — unknown provenance stays excluded.
 func (e *Engine) TAnchorEligibleCount() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()

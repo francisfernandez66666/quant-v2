@@ -7,8 +7,9 @@
 //     否则就是"写了一半但接口回 ok"；再点一次必须判无待迁（幂等）；
 //  4. 非管理员一律 403（这四个端点改的是判线基准与合成口径，不是展示层配置）。
 //
-// 锚点回填那一组还要多锁一条：回填完的 t_eligible 只数**首买价可证**的行——
-// cost_fallback 档有锚点也没资格开 T 腿，把两者混进一个数就是 §8.4.5 那道门被读数面绕过。
+// 锚点回填那一组还要多锁一条：回填完的 t_eligible 只数**来源可证**的行——
+// none 与空来源不计入；cost_fallback 自 2026-11-18 owner 裁决起计入（物理机上没有
+// 首买成交可证的持仓，否则 T 腿永远开不了）。
 //
 // English: locks for the sign-off endpoints. GET never writes; a missing or wrong authorize token
 // writes nothing and says so; a signed apply leaves zero residual and is idempotent; non-admins 403.
@@ -255,7 +256,7 @@ func TestAnchorBackfillSignoffAPI(t *testing.T) {
 		t.Fatalf("未签字不得回填锚点，got %v", snap[0].AnchorPrice)
 	}
 
-	// 签字：回填 1 条，但 t_eligible 必须是 0（成本档没有开 T 资格）。
+	// 签字：回填 1 条；2026-11-18 裁决后 cost_fallback 计入 t_eligible（1）。
 	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/paper/anchor-backfill",
 		`{"authorize":"`+v4SignoffToken+`"}`))
 	if rr.Code != http.StatusOK {
@@ -268,8 +269,8 @@ func TestAnchorBackfillSignoffAPI(t *testing.T) {
 	if filled, _ := out["filled"].(float64); filled != 1 {
 		t.Fatalf("应回填 1 条，got %v", out["filled"])
 	}
-	if elig, _ := out["t_eligible"].(float64); elig != 0 {
-		t.Fatalf("cost_fallback 档不得有开 T 资格，got t_eligible=%v", out["t_eligible"])
+	if elig, _ := out["t_eligible"].(float64); elig != 1 {
+		t.Fatalf("cost_fallback 档自 2026-11-18 裁决起应计入 t_eligible，got t_eligible=%v", out["t_eligible"])
 	}
 	if snap := pe.Positions(); len(snap) != 1 || snap[0].AnchorPrice != 12.5 {
 		t.Fatalf("回填后锚点应为成本 12.5，got %+v", snap)

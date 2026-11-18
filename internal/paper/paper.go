@@ -197,10 +197,11 @@ type Position struct {
 	//   first_buy_order   买入历史（实盘 orders/fills）里最早一笔成交单价
 	//   cost_fallback     只有摊薄成本可读（存量无层账、又查不到买入历史）
 	//   none              什么价都拿不到，AnchorPrice 保持 0
-	// 为什么必须留来源而不只留价格：**`cost_fallback` 的票不许开 T 腿**——那个数可能被历史加仓
-	// 甚至被 T 腿摊薄过，把它当"最初那笔"会让回填悄悄把摊薄成本请回风控基准（正是本批要修的缺陷）。
-	// English: provenance of the anchor; cost_fallback/none rows are barred from opening T legs because a
-	// diluted cost must never be passed off as the first buy price.
+	// 为什么必须留来源而不只留价格：来源决定这道锚点**有没有资格开 T 腿**（none 与空来源不许开；
+	// cost_fallback 自 2026-11-18 owner 裁决起允许，已知代价是锚点可能被加仓摊薄、随成本漂移）。
+	// 不留来源就没法把"首买成交可证"与"只有摊薄成本"分开，两种基准会在读数面与判据上混成一团。
+	// English: provenance decides T eligibility — unknown provenance stays closed, while a
+	// cost-derived anchor is admitted by the 2026-11-18 owner ruling at the cost of drift.
 	AnchorSource string `json:"anchor_source,omitempty"`
 	// Lots §T1-PARTIAL（2026-10-24 裁决三）批次层账：同一交易日买到的股数合成一批。
 	// 它只回答"这批哪天买的 ⇒ 今天可卖多少"，不改任何价格口径（结算仍按 CostPrice 摊薄、

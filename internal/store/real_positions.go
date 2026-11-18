@@ -34,7 +34,8 @@ const (
 	AnchorSourceFirstLot = "first_lot"
 	// AnchorSourceFirstBuyOrder 买入首成交建行时冻结的锚点（实盘账本口径）。
 	AnchorSourceFirstBuyOrder = "first_buy_order"
-	// AnchorSourceCostFallback 摊薄成本回落档：可以判风险线，**不可以**开日内回转腿。
+	// AnchorSourceCostFallback 摊薄成本回落档：判风险线用；2026-11-18 owner 裁决后也允许开 T
+	// （见 anchorTicketSources 的说明：物理机上没有首买成交可证的持仓，否则 T 永远开不了）。
 	AnchorSourceCostFallback = "cost_fallback"
 	// AnchorSourceNone 任何一档都取不到价（不判线、不开 T）。
 	AnchorSourceNone = "none"
@@ -251,24 +252,30 @@ func (d *DB) ensureAnchorPriceColumn() error {
 // AnchorTicket 这笔实盘持仓有没有"开日内回转腿"的资格（§8.4.5 锚点前置，与 paper 侧
 // `Position.AnchorTicket()` 同一判据的实盘形态）。
 //
-// 为什么有 anchor_price 还不够：`cost_fallback` 与 `none` 两档的锚点是**算得出风险线**用的
-// （摊薄成本能支撑止盈止损判定），但摊薄成本会被加仓与日内腿改动，把它当天花板/地板的依据
-// 等于让一笔日内低吸悄悄改写自己的退出基准——那正是裁决二终结过的缺陷从实盘侧绕回来。
-// 所以只有"首成交建行"那一档（first_buy_order，与本仓层账 first_lot 同性质）才给 T 资格；
-// anchor_source 为空＝这列上线前的存量行，宁可不开腿（保守方向，事后回查有理由）。
-// English: a cost-derived anchor is good enough to compute risk lines but never to justify an
-// intraday round-trip; only a first-buy provenance grants the ticket, empty counts as unknown.
+// 为什么有 anchor_price 还不够：`none` 档与来源为空的行**根本没有可证基准**，拿它们开 T
+// 等于让卖出裁决在一条虚构的线上工作；`cost_fallback` 的锚点至少是一个真实成交成本，
+// 只是可能被加仓或正 T 买腿摊薄过——这个已知代价由 owner 2026-11-18 裁决接受（见下）。
+// English: a T ticket needs a non-zero anchor with a known provenance; `none` and empty
+// stay closed, while a cost-derived anchor is admitted by the 2026-11-18 owner ruling below.
 // anchorTicketSources 有"开日内回转腿"资格的锚点来源档位——AnchorTicket 判据的**唯一清单**。
 //
 // 为什么提成清单（§DERIVE-CARRIER-1105，2026-11-05）：载体那条移植腿判的是同一件事
 // （rules_t 的 t_anchor_ok_sources），而它没有 Go 的方法可调，只能收一张表。
 // 以前这张表只存在于 `return` 那一行的两个 `==` 里——载体侧要么抄、要么猜，
-// 抄对了也仍然是两本账：这里加一档、那边不知道，"摊薄成本冒充锚点"就从移植侧绕回来。
+// 抄对了也仍然是两本账：这里加一档、那边不知道，判据就从移植侧漂走。
 // 清单与那两个常量同源（就是它们本身），所以枚举改动只有一处要动。
 // 空串（存量行没写来源）刻意不在清单里：判据是"来源必须是可证那一档"，缺证据＝没资格。
+//
+// §T-ANCHOR-COSTFALLBACK（owner 2026-11-18 裁决）：把 cost_fallback 也收进清单。
+// 原口径（§8.4.5）把它挡在门外，理由是摊薄成本会被历史加仓/正 T 买腿改写，等于让一笔
+// 日内低吸移动自己的退出基准。但这条门在物理机上是**永久关死**的：那台柜台的既有持仓都是
+// 券商快照建行，没有首买成交可证，启动回填只能写 cost_fallback ⇒ T 腿从上线起一天都没开过。
+// owner 因此裁决"以摊薄成本为锚点也允许开 T"，接受"锚点随加仓漂移"这个已知代价；
+// `none` 与空串仍然不开腿——那不是"用一个可疑的基准"，而是根本没有任何基准。
 // English: the single list of provenances that grant the intraday round-trip ticket; the
-// carrier reads the same list instead of re-typing the two comparisons.
-var anchorTicketSources = []string{AnchorSourceFirstBuyOrder, AnchorSourceFirstLot}
+// carrier reads the same list instead of re-typing the comparisons. A cost-derived anchor is
+// admitted by explicit owner ruling (2026-11-18); unknown provenance stays closed.
+var anchorTicketSources = []string{AnchorSourceFirstBuyOrder, AnchorSourceFirstLot, AnchorSourceCostFallback}
 
 // AnchorTicket 判定该持仓是否带有效首买锚点（AnchorPrice>0）：锚点缺失时 T 腿/纪律
 // 判定按弃权处理——拿不到真锚点绝不造数。
@@ -544,7 +551,8 @@ func (d *DB) BackfillRealPositionAnchors() (filled, remaining int64, err error) 
 	if err := d.ensureAnchorPriceColumn(); err != nil {
 		return 0, 0, err
 	}
-	// 回填同时写来源：成本档**只能用于判线，不能用于开 T 腿**（§8.4.5）。
+	// 回填同时写来源：成本档有了来源，2026-11-18 owner 裁决后才允许据此开 T 腿（§8.4.5 原口径
+	// 只判线；该裁决的代价与边界写在 anchorTicketSources 上方，改这里前先读那段）。
 	// 来源与锚点必须同一条 UPDATE 落库——分两条语句就会出现"锚点已写、来源还是空"的半态，
 	// 而那个半态在门判上等价于 none，等于把刚回填好的基准又判回未知。
 	if err := d.ensureAnchorSourceColumn(); err != nil {

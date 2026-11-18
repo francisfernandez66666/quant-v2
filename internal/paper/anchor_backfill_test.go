@@ -9,7 +9,7 @@
 //  4. 完全无价 ⇒ AnchorPrice 保持 0、来源 none，计入跳过；
 //  5. 已有锚点**永不被覆盖**（哪怕与成本不等）：覆盖一次就等于抹掉真首买价；
 //  6. 幂等：第二次调用回填 0 条；
-//  7. **开 T 资格**：first_lot / first_buy_order 可开；cost_fallback 与 none 不可开。
+//  7. **开 T 资格**：first_lot / first_buy_order / cost_fallback 可开；none 与空来源不可开。
 //
 // English: locks the v4 first-buy backfill — lot/history provenance, cost fallback only through the
 // signed path (never at load), existing anchors untouched, idempotent, and T eligibility keyed off the
@@ -108,7 +108,7 @@ func TestBackfillCostFallbackOnlyThroughSignedPath(t *testing.T) {
 	}
 	e.mu.Unlock()
 
-	// ② owner 签字后的显式回填：允许 cost_fallback，但**不给开 T 资格**
+	// ② owner 签字后的显式回填：允许 cost_fallback；2026-11-18 裁决后它同样有开 T 资格
 	filled, skipped := e.BackfillAnchors(func(string) (float64, bool) { return 0, false })
 	if filled != 1 || skipped != 1 {
 		t.Fatalf("签字回填应写 1 条（成本档）、跳过 1 条（无任何价），got filled=%d skipped=%d", filled, skipped)
@@ -120,8 +120,8 @@ func TestBackfillCostFallbackOnlyThroughSignedPath(t *testing.T) {
 	if costOnly.AnchorPrice != 6.0 || costOnly.AnchorSource != anchorSourceCostFallback {
 		t.Fatalf("成本档应记 6.0/cost_fallback，got %v/%q", costOnly.AnchorPrice, costOnly.AnchorSource)
 	}
-	if costOnly.AnchorTicket() {
-		t.Fatal("cost_fallback 档**不得**有开 T 资格（可能被历史加仓或 T 腿摊薄过）")
+	if !costOnly.AnchorTicket() {
+		t.Fatal("cost_fallback 档自 2026-11-18 裁决起应有开 T 资格（否则物理机 T 腿永远停在锚点门）")
 	}
 	// 完全无价的行：锚点保持 0（写 0 等于没写），来源也留空——计划报告里它才是 none，
 	// 账本上不落一个"看起来像结论"的 none，免得前端把它读成"已处理"。
@@ -198,8 +198,10 @@ func TestTAnchorBlockReason(t *testing.T) {
 	}{
 		{"无持仓", nil, "无持仓"},
 		{"锚点为 0", &Position{Code: "A", Qty: 100, CostPrice: 10, AnchorPrice: 0, FilledAt: d}, "锚点缺失"},
-		{"成本回落档", &Position{Code: "B", Qty: 100, AnchorPrice: 10, AnchorSource: anchorSourceCostFallback}, "来源不可信"},
-		{"无来源也无层账", &Position{Code: "C", Qty: 100, AnchorPrice: 10}, "来源不可信"},
+		// 2026-11-18 owner 裁决：成本回落档也允许开 T（物理机上没有首买成交可证的持仓）。
+		{"成本回落档（2026-11-18 起可开 T）", &Position{Code: "B", Qty: 100, AnchorPrice: 10, AnchorSource: anchorSourceCostFallback}, ""},
+		{"无来源也无层账", &Position{Code: "C", Qty: 100, AnchorPrice: 10}, "来源不可证"},
+		{"明确无来源", &Position{Code: "F", Qty: 100, AnchorPrice: 10, AnchorSource: anchorSourceNone}, "来源不可证"},
 		{"首买价档", &Position{Code: "D", Qty: 100, AnchorPrice: 10, AnchorSource: anchorSourceFirstLot}, ""},
 		{"买入历史档", &Position{Code: "E", Qty: 100, AnchorPrice: 10, AnchorSource: anchorSourceFirstBuy}, ""},
 	}

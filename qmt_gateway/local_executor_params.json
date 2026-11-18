@@ -1569,7 +1569,8 @@
     },
     "t_anchor_ok_sources": [
       "first_buy_order",
-      "first_lot"
+      "first_lot",
+      "cost_fallback"
     ],
     "t_bse_board_prefixes": [
       "4",

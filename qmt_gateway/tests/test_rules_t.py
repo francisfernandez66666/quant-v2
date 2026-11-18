@@ -89,7 +89,7 @@ BASE_PARAMS = {
     # 否决门 / 锚点
     "t_stop_guard_pct": 1.5,
     "t_round_stop_pct": 2.0,
-    "t_anchor_ok_sources": ["first_buy"],
+    "t_anchor_ok_sources": ["first_buy_order", "first_lot", "cost_fallback"],
     # 流动性前置
     "t_min_amount_wan": 3000.0,
     "t_min_turnover_pct": 1.5,
@@ -135,7 +135,7 @@ def params(**overrides):
 
 def position(**overrides):
     row = {"qty": 10000, "can_use_qty": 10000, "anchor_price": 10.0,
-           "anchor_source": "first_buy"}
+           "anchor_source": "first_buy_order"}
     row.update(overrides)
     return row
 
@@ -313,9 +313,19 @@ class GateOrderTests(unittest.TestCase):
 
     def test_anchor_must_be_provable(self):
         allowed, reason = rt.t_gate_open(
-            params(), ctx(positions_live={"600000.SH": position(anchor_source="cost_fallback")}))
+            params(), ctx(positions_live={"600000.SH": position(anchor_source="none")}))
         self.assertFalse(allowed)
         self.assertIn("anchor_not_provable", reason)
+        allowed, reason = rt.t_gate_open(
+            params(), ctx(positions_live={"600000.SH": position(anchor_source="")}))
+        self.assertFalse(allowed)
+        self.assertIn("anchor_not_provable", reason)
+
+    def test_cost_fallback_anchor_is_provable(self):
+        # §T-ANCHOR-COSTFALLBACK（owner 2026-11-18 裁决）：摊薄成本回落档也允许开 T。
+        allowed, reason = rt.t_gate_open(
+            params(), ctx(positions_live={"600000.SH": position(anchor_source="cost_fallback")}))
+        self.assertTrue(allowed, reason)
 
     def test_missing_price_or_vwap_declines_without_falling_back_to_cost(self):
         allowed, reason = rt.t_gate_open(params(), ctx(last_price=None))

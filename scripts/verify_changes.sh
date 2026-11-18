@@ -23642,3 +23642,93 @@ grep_q '9 passed' PY204B || { echo "--- FAIL: §204 探针行为腿未跑满9例
 [ "$B204_FAILED" = "0" ] || exit 1
 echo "ok - §204 §20261118-PRICE-SUFFIX 锁通过（归一函数复用 _expect_suffix + 五处边界 + 裸键负锁 + 后缀7例/探针9例，累计判定点 ${CNT204}）"
 echo ""
+
+# §205 §20261118-T-ANCHOR-COSTFALLBACK（owner 2026-11-18 裁决：cost_fallback 锚点也允许开 T）。
+# 背景：物理机上没有首买成交可证的持仓（柜台快照建行，启动回填只能写 cost_fallback），
+# 原 §8.4.5 白名单把这一档挡在门外 ⇒ T 腿从上线起一天都没开过。owner 裁决放宽，
+# 已知代价＝锚点可能随加仓摊薄漂移；none 与空来源仍然不开腿。
+# 本段锁四件事：
+#   ① Go 清单（AnchorTicket 真源）含 cost_fallback；纸面判据同步；
+#   ② 载体烘参 / 本地执行器兜底表 / 热更新烘锚白名单三处同步（且热更新优先读烘参，不再手抄）；
+#   ③ none 与空来源仍是负锁（放宽不能把"没有基准"也放进来）；
+#   ④ 四个行为腿真跑（Go 三包 + Python 锚点两例）。
+echo "==> 205 §20261118-T-ANCHOR-COSTFALLBACK（cost_fallback 可开 T：清单/烘参/热更新/负锁/行为腿）..."
+B205_FAILED=0
+fail205() {
+	echo "--- FAIL: §205 $*"
+	FAIL=1
+	B205_FAILED=1
+}
+CNT205=0
+
+# ① Go 真源与纸面判据。
+CNT205=$((CNT205 + 1))
+grep -qF 'var anchorTicketSources = []string{AnchorSourceFirstBuyOrder, AnchorSourceFirstLot, AnchorSourceCostFallback}' internal/store/real_positions.go \
+	|| fail205 "store 锚点白名单未收 cost_fallback（AnchorTicket 仍会把物理机持仓挡在门外）"
+CNT205=$((CNT205 + 1))
+grep -qF 'p.AnchorSource == anchorSourceCostFallback ||' internal/paper/anchor_backfill.go \
+	|| fail205 "paper AnchorTicket 未同步 cost_fallback（两本账判据分家）"
+CNT205=$((CNT205 + 1))
+if grep -qF 'AnchorSourceCostFallback, false}' internal/store/t_live_readmodel_test.go; then
+	fail205 "行为锁仍断言 cost_fallback 不可开 T（锁与裁决反向）"
+fi
+
+# ② 三个载体副本必须与 Go 清单一致。
+CNT205=$((CNT205 + 1))
+PARAM205=$(/usr/local/bin/python3 - <<'PY'
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8")).get("params") or {}
+vals = [str(v) for v in (p.get("t_anchor_ok_sources") or [])]
+want = ["first_buy_order", "first_lot", "cost_fallback"]
+print("OK" if vals == want else "BAD:" + ",".join(vals))
+PY
+)
+[ "${PARAM205:-}" = "OK" ] || fail205 "载体烘参 t_anchor_ok_sources 与 Go 清单不一致：${PARAM205:-<空>}"
+CNT205=$((CNT205 + 1))
+grep -qF "'t_anchor_ok_sources': ['first_buy_order', 'first_lot', 'cost_fallback']," qmt_gateway/local_executor.py \
+	|| fail205 "local_executor 兜底表未收 cost_fallback（参数文件缺失时 T 会静默不开）"
+CNT205=$((CNT205 + 1))
+grep -qF 'T_ANCHOR_OK_SOURCES = ("first_buy_order", "first_lot", "cost_fallback")' scripts/carrier_hot_reload_gz.py \
+	|| fail205 "热更新兜底白名单未收 cost_fallback（锚点簿会漏掉那台机器上唯一的持仓）"
+CNT205=$((CNT205 + 1))
+grep -qF 'def _t_anchor_ok_sources():' scripts/carrier_hot_reload_gz.py \
+	|| fail205 "缺 _t_anchor_ok_sources：锚点簿与 rules_t 仍各读一份手抄清单"
+CNT205=$((CNT205 + 1))
+grep -qF 'ok_sources = _t_anchor_ok_sources()' scripts/carrier_hot_reload_gz.py \
+	|| fail205 "bake_t_anchor_book 未走烘参白名单（两份清单会漂移）"
+CNT205=$((CNT205 + 1))
+if grep -qF 'AND anchor_source IN (%s)" % ph, (OWNER_UID,) + T_ANCHOR_OK_SOURCES)' scripts/carrier_hot_reload_gz.py; then
+	fail205 "bake_t_anchor_book 又回到手抄常量（与 rules_t 的烘参可能各说各话）"
+fi
+
+# ③ 负锁：放宽只针对 cost_fallback，none/空来源不得混进来。
+CNT205=$((CNT205 + 1))
+NONE205=$(/usr/local/bin/python3 - <<'PY'
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8")).get("params") or {}
+vals = [str(v) for v in (p.get("t_anchor_ok_sources") or [])]
+print("OK" if "none" not in vals and "" not in vals else "BAD:" + ",".join(vals))
+PY
+)
+[ "${NONE205:-}" = "OK" ] || fail205 "none/空来源混进可开 T 白名单（没有基准的票也会开腿）"
+CNT205=$((CNT205 + 1))
+grep -qF 'anchor is None or anchor <= _ZERO_F or source not in allowed_sources' qmt_gateway/rules_t.py \
+	|| fail205 "rules_t 锚点门判据丢失（载体侧不再看来源白名单）"
+
+# ④ 行为腿：Go 三包 + Python 锚点两例。
+CNT205=$((CNT205 + 1))
+G205A=$(go test -count=1 ./internal/store/ -run 'TestRealPositionAnchorTicket' 2>&1 || true)
+grep_q '^ok' G205A || { echo "--- FAIL: §205 store 锚点档行为腿：$(printf '%s\n' "$G205A" | tail -5)"; B205_FAILED=1; }
+CNT205=$((CNT205 + 1))
+G205B=$(go test -count=1 ./internal/paper/ -run 'TestTAnchorBlockReason|TestTRoundAnchorInvariants' 2>&1 || true)
+grep_q '^ok' G205B || { echo "--- FAIL: §205 纸面 T 锚点行为腿：$(printf '%s\n' "$G205B" | tail -5)"; B205_FAILED=1; }
+CNT205=$((CNT205 + 1))
+G205C=$(go test -count=1 ./internal/engine/ -run 'TestTLiveAnchorProvenanceGatesTicket' 2>&1 || true)
+grep_q '^ok' G205C || { echo "--- FAIL: §205 实盘 T 锚点行为腿：$(printf '%s\n' "$G205C" | tail -5)"; B205_FAILED=1; }
+CNT205=$((CNT205 + 1))
+P205=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_rules_t.py -q -k anchor 2>&1 || true )
+grep_q '2 passed' P205 || { echo "--- FAIL: §205 rules_t 锚点两例未跑满：$(printf '%s\n' "$P205" | tail -6)"; B205_FAILED=1; }
+
+[ "$B205_FAILED" = "0" ] || exit 1
+echo "ok - §205 §20261118-T-ANCHOR-COSTFALLBACK 锁通过（Go/纸面/烘参/热更新四处同源 + none/空来源负锁 + Go3/Py2 行为腿，累计判定点 ${CNT205}）"
+echo ""

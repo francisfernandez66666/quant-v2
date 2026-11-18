@@ -1101,14 +1101,17 @@ func TestTLiveTQuotaZeroBlocksBothDirections(t *testing.T) {
 	}
 }
 
-// TestTLiveAnchorProvenanceGatesTicket §8.4.5 的实盘形态：只有首买价来源的锚点才允许开 T 腿。
+// TestTLiveAnchorProvenanceGatesTicket §8.4.5 的实盘形态：锚点必须"有基准、来源可证"才允许开 T 腿。
 //
 // 这条锁的存在理由是"回填让实盘账看起来有锚点"这件事太容易发生：W3 的存量回填会把
-// cost_price 写进 anchor_price（那是为了让卖出裁决有基准，方案 §1.6a 明写它**不构成 T 资格**）。
-// 闸门若只看 AnchorPrice>0，一次回填就给全账户开了日内回转的许可——而摊薄成本会被加仓
-// 与 T 腿自身改动，等于让一笔日内低吸去改写自己的退出基准，正是裁决二终结过的缺陷从实盘侧绕回来。
+// cost_price 写进 anchor_price。闸门若只看 AnchorPrice>0，来源列为空或 none 的行也会被放行，
+// 而它们根本没有可证的基准。
+// 2026-11-18 owner 裁决把 cost_fallback 也纳入可开 T 的档位：物理机上的既有持仓都是券商快照
+// 建行、没有首买成交可证，若坚持只认 first_buy_order，T 腿会永远停在锚点门。已知代价是
+// 摊薄成本锚点会随加仓漂移；none 与空来源仍然不开腿（那不是可疑基准，而是没有基准）。
 //
-// English: provenance, not mere presence, grants the live T ticket; a cost-derived anchor never does.
+// English: a non-zero anchor plus a known provenance grants the live T ticket; `none` and
+// empty stay closed, while a cost-derived anchor is admitted by the 2026-11-18 owner ruling.
 func TestTLiveAnchorProvenanceGatesTicket(t *testing.T) {
 	// ① 判据本身逐档扫（含"来源列为空的存量行"——那必须与 none 同判，不能当可证）。
 	cases := []struct {
@@ -1118,7 +1121,7 @@ func TestTLiveAnchorProvenanceGatesTicket(t *testing.T) {
 	}{
 		{"首成交建行的锚点可开 T", store.AnchorSourceFirstBuyOrder, true},
 		{"层账首买价来源可开 T", store.AnchorSourceFirstLot, true},
-		{"成本回落档不可开 T", store.AnchorSourceCostFallback, false},
+		{"成本回落档可开 T（2026-11-18 裁决）", store.AnchorSourceCostFallback, true},
 		{"明确无从回填不可开 T", store.AnchorSourceNone, false},
 		{"来源列上线前的存量行不可开 T", "", false},
 	}
@@ -1142,7 +1145,7 @@ func TestTLiveAnchorProvenanceGatesTicket(t *testing.T) {
 		wantOpen bool
 	}{
 		{"首买价来源照常开腿", store.AnchorSourceFirstBuyOrder, true},
-		{"成本来源不得开腿", store.AnchorSourceCostFallback, false},
+		{"成本来源自 2026-11-18 起可开腿", store.AnchorSourceCostFallback, true},
 		{"来源未知的存量行不得开腿", "", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
