@@ -588,15 +588,27 @@ def _buy_confirmed(symbol, now_ts):
     return True, ""
 
 
-def _go_admitted(kind):
-    """rule_strategy_admit, actually called (the 0-call-site defect, closed).
+def _go_admitted(kind, rule_id=""):
+    """Runtime whitelist check, wired from run_round (GO-ADMIT-WIRING 2026-11-18).
 
-    Maps a ported rule kind to the Go strategy id the whitelist is keyed by:
-    the baked strategy_kind_to_go table first, then the factor/pattern id
-    prefixes pass through verbatim. An unmappable kind is REFUSED -- a rule
-    nobody can attribute must never become a live order.
+    The 2026-11-10 build shipped this helper with ZERO call sites while its
+    docstring already claimed the defect closed -- the audit on 11-18 proved it
+    with an AST LOAD-count of []. This is now the REAL single entry: run_round's
+    ported-rule loop calls it for every live BUY, and the semantics match
+    local_executor.decide_with_modes word for word:
+      * rule_id first (factor library signals carry their own fac_* id),
+      * kind fallback via the baked strategy_kind_to_go table,
+      * factor/pattern prefixed kinds pass through verbatim,
+      * an unmappable/unattributable rule is REFUSED -- a rule nobody can
+        attribute must never become a live order.
+    SELL signals never reach this check (the caller exempts them): the Go
+    whitelist gates only the BUY dispatch (scoring_loop.go dispatchLive takes
+    buys; exits run the sell-judge/fuse chain), so gating sells here would
+    blind every live exit leg.
     """
-    go_id = (PARAMS.get("strategy_kind_to_go") or {}).get(kind)
+    go_id = str(rule_id or "")
+    if not go_id:
+        go_id = (PARAMS.get("strategy_kind_to_go") or {}).get(kind)
     if not go_id:
         if str(kind).startswith(str(PARAMS.get("factor_id_prefix", "fac_"))):
             go_id = kind
@@ -2714,7 +2726,21 @@ def run_round(ContextInfo, moment):
                     _warn_once("rule_raise:%s" % kind, "rule %s raised %s" % (kind, repr(exc)[:100]))
                     continue
                 if hit:
-                    signals.append((hit, rule_arm_mode(PARAMS, kind)))
+                    # GO-ADMIT-WIRING 2026-11-18 (owner approved plan A): the
+                    # runtime whitelist check via _go_admitted (see its
+                    # docstring). Only LIVE BUYS are gated: a BUY that cannot
+                    # prove its tab-owned id is demoted to "switch_off" --
+                    # computed, counted, observable as skipped reason
+                    # rule_switch_off, never placed. SELL signals are exempt:
+                    # the Go whitelist only gates the BUY dispatch
+                    # (scoring_loop.go dispatchLive takes buys only; exits run
+                    # the sell-judge/fuse chain), so gating sells here would
+                    # blind every live exit leg.
+                    _mode = rule_arm_mode(PARAMS, kind)
+                    if _mode == "live" and str(hit.get("side") or "") == "buy":
+                        if not _go_admitted(kind, rule_id=hit.get("rule_id")):
+                            _mode = "switch_off"
+                    signals.append((hit, _mode))
         # BUDGET-GATE (2026-11-16 owner): the rules layer marks ctx when a factor
         # composite PASSED but entry_amount was None (full position + reserve
         # floor) -- aggregate per round here; the hourly log beside data_health

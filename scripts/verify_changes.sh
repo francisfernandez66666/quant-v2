@@ -23980,3 +23980,50 @@ grep_q '9 passed' PY208 || { echo "--- FAIL: §208 整池批取行为腿未跑�
 [ "$B208_FAILED" = "0" ] || exit 1
 echo "ok - §208 §20261118-BATCH-TICKS 锁通过（整池批取+裸码rekey+round作用域+逐票兜底+只读负锁+9例行为腿，累计判定点 ${CNT208}）"
 echo ""
+
+# §209 §20261118-GO-ADMIT-WIRING（_go_admitted 运行时白名单接线，方案 A）。
+# 史料：_go_admitted 自 875e1a6 引入起 0 调用点（11-18 AST LOAD 计数=[]实锤），
+#   docstring 却声称"defect closed"——注释说修了实际没修的实锤。本批真接线：
+#   rule_id 优先 + strategy_kind_to_go 兜底 + live 买入无归属降档 switch_off
+#   （算但不花，skipped reason=rule_switch_off 可观测）+ 卖出豁免（Go 白名单只管
+#   买入 dispatch，scoring_loop.go dispatchLive 只收 buys；卖出走 sell-judge/熔断链）。
+# 当前烘参影响面=零（因子表烘焙时已按白名单过滤、dragon∈白名单、做空是 sell）；
+#   防线价值在"rule_arm=live 但白名单没开"的烘参漂移场景。
+echo "==> 209 §20261118-GO-ADMIT-WIRING（运行时白名单真接线 + 卖出豁免 + switch_off 降档）..."
+B209_FAILED=0
+fail209() {
+	echo "--- FAIL: §209 $*"
+	FAIL=1
+	B209_FAILED=1
+}
+CNT209=0
+
+# ① helper 真实签名（rule_id 参数）+ run_round 真调用（死代码不许回潮）。
+CNT209=$((CNT209 + 1))
+grep -qF 'def _go_admitted(kind, rule_id=""):' qmt_gateway/qmt_internal_strategy.py || fail209 "_go_admitted 缺 rule_id 参数（接线姿势回退）"
+CNT209=$((CNT209 + 1))
+grep -qF '_go_admitted(kind, rule_id=hit.get("rule_id"))' qmt_gateway/qmt_internal_strategy.py || fail209 "run_round 未调用 _go_admitted（0-call-site 缺陷回潮）"
+
+# ② 只对 live BUY 生效：卖出豁免锚 + 降档写法。
+CNT209=$((CNT209 + 1))
+grep -qF 'if _mode == "live" and str(hit.get("side") or "") == "buy":' qmt_gateway/qmt_internal_strategy.py || fail209 "白名单检查未限定 live BUY（卖出腿会被误拦/买入未拦）"
+CNT209=$((CNT209 + 1))
+grep -qF '_mode = "switch_off"' qmt_gateway/qmt_internal_strategy.py || fail209 "缺 switch_off 降档（拒绝必须可观测，不许静默丢弃）"
+
+# ③ helper 内 fail-closed：无归属拒、白名单异常拒（既有语义不许弱化）。
+CNT209=$((CNT209 + 1))
+grep -qF '    if not go_id:' qmt_gateway/qmt_internal_strategy.py || fail209 "helper 缺无归属拒绝分支"
+
+# ④ 行为腿：8 例（白名单内放行/白名单外拒/kind 映射/无归属拒/卖出豁免锚/塞雷摘dragon/接线/单参兼容）。
+PY209=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_go_admit_wiring_20261118.py -q 2>&1 || true )
+CNT209=$((CNT209 + 1))
+grep_q '8 passed' PY209 || { echo "--- FAIL: §209 GO-ADMIT 接线行为腿未跑满8例：$(printf '%s\n' "$PY209" | tail -8)"; B209_FAILED=1; }
+
+# ⑤ 旧 helper 行为测试仍兼容（单参调用 4 例）。
+PY209B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_carrier_gates_20261110.py -q 2>&1 || true )
+CNT209=$((CNT209 + 1))
+grep_q 'passed' PY209B || { echo "--- FAIL: §209 旧 _go_admitted 兼容腿红：$(printf '%s\n' "$PY209B" | tail -6)"; B209_FAILED=1; }
+
+[ "$B209_FAILED" = "0" ] || exit 1
+echo "ok - §209 §20261118-GO-ADMIT-WIRING 锁通过（真接线+卖出豁免+switch_off降档+8例接线腿+旧兼容腿，累计判定点 ${CNT209}）"
+echo ""
