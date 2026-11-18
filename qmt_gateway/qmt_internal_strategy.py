@@ -1073,7 +1073,7 @@ def _probe_mde_rows(getter, symbol, period, fields, count):
         payload = getter(fields, [symbol], period=period, count=count)
     except Exception:  # noqa: BLE001 -- a signature this build rejects IS the answer
         return -1
-    return len(_bars_of(payload, symbol))
+    return len(_bar_dicts_of(payload, symbol))
 
 
 def _probe_priced_one(ContextInfo, getter, symbol):
@@ -1245,10 +1245,13 @@ def _probe_price_channels(ContextInfo, positions):
             mde_1m_after = -1
         if one or one_sfx or sub_tick or sfx_tick or mde_tick > 0 or mde_day > 0:
             priced += 1
-        _log("tick_probe sym=%s one=%d one_sfx=%d sub=%s sfx=%s sub_tick=%d sfx_tick=%d "
-             "mde_tick=%d mde_1d=%d mde_1d_sfx=%d mde_1m=%d sub1m=%s mde_1m_after=%d" % (
-                 symbol, one, one_sfx, sub, sfx_sub, sub_tick, sfx_tick,
-                 mde_tick, mde_day, mde_day_sfx, mde_1m, sub_1m, mde_1m_after))
+        # TWO lines on purpose: the client truncates one printed line at ~150
+        # chars (13:00 receipt: `... mde_tick=0 mde_1d` and then cut), so the
+        # bar readings were the first thing to fall off the end.
+        _log("tick_probe sym=%s one=%d one_sfx=%d sub=%s sfx=%s sub_tick=%d sfx_tick=%d" % (
+            symbol, one, one_sfx, sub, sfx_sub, sub_tick, sfx_tick))
+        _log("tick_probe M sym=%s mde_tick=%d mde_1d=%d d1d_sfx=%d mde_1m=%d sub1m=%s mde_1m_after=%d" % (
+            symbol, mde_tick, mde_day, mde_day_sfx, mde_1m, sub_1m, mde_1m_after))
     _log("tick_probe summary asked=%d priced=%d universe=%d" % (
         len(asked), priced, len(universe)))
 
@@ -1373,7 +1376,7 @@ def _precalc_bars(symbol, tick):
     return bars
 
 
-def _bars_of(payload, symbol):
+def _bar_dicts_of(payload, symbol):
     """get_market_data_ex payload -> bar dicts for the rules library.
 
     Field lists are extracted with the same attribute-or-dict reader as
@@ -1772,7 +1775,7 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     # spliced -- different adjustment bases must not meet at a seam) and one
     # synthetic today-bar from the live tick is appended. A symbol with NEITHER
     # source keeps the honest abstain.
-    bars = _bars_of(_hist_bars(ContextInfo, symbol), symbol)
+    bars = _bar_dicts_of(_hist_bars(ContextInfo, symbol), symbol)
     if len(bars) < 20:
         bars = _precalc_bars(symbol, tick)
     closes = [b["close"] for b in bars if b.get("close")]
@@ -2123,6 +2126,45 @@ def _cancel(order_id):
     return False, "cancel failed: %s" % (" | ".join(errs[-2:]),)
 
 
+def _holdings_value(positions, price_of):
+    """Mark-to-market of the held rows, in the order the fields can be trusted.
+
+    LIVE READING 2026-11-18 13:1x: with prices finally working, the T leg moved
+    past `step0 no_realtime_price` and stopped at `step0
+    equity_or_holdings_value_unavailable: no quota denominator`. The counter
+    equity side is already covered (`_t_equity_basis`), so the denominator that
+    collapsed was holdings_value: this broker's POSITION rows carry neither
+    `m_dMarketValue` nor `m_dOpenPrice`, and both default to 0.0 in `_positions`
+    -- so the sum stayed exactly 0.0 and every T gate closed on arithmetic, not
+    on judgement.
+
+    Order of trust (never invents a number, only uses a reading that exists):
+      1. the counter's market value (what the position is worth right now);
+      2. qty x cost (cost basis, the 2026-11-17 floor);
+      3. qty x last price from the price channel (the same tick the sell legs use).
+    A row that yields none of the three contributes 0.0, and an all-zero sum
+    still fails closed at `t_cap_base` -- a missing price is never a zero.
+    """
+    total = 0.0
+    for symbol, row in (positions or {}).items():
+        item = row or {}
+        qty = _to_float(item.get("qty"), 0.0) or 0.0
+        if qty <= 0.0:
+            continue
+        mv = _to_float(item.get("market_value"), 0.0) or 0.0
+        if mv > 0.0:
+            total += mv
+            continue
+        cost = _to_float(item.get("cost"), 0.0) or 0.0
+        if cost > 0.0:
+            total += cost * qty
+            continue
+        last = _to_float(price_of(symbol), 0.0) or 0.0
+        if last > 0.0:
+            total += last * qty
+    return total
+
+
 def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summary):
     """LIVE-T-20261116: drive the intraday round-trip (zuo T) layer from the counter.
 
@@ -2202,15 +2244,11 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
     # pos_view row -> silently fell back to COST, so the T position cap was computed
     # on cost basis. Prefer real market value; only fall back to qty*cost when the
     # counter gave no market_value for that row.
-    # use the counter's market_value, fall back to qty*cost only when absent.
-    holdings_value = 0.0
-    for symbol, row in pos_view.items():
-        mv = (row or {}).get("market_value")
-        if mv is not None and float(mv) > 0.0:
-            holdings_value += float(mv)
-        else:
-            px = (row or {}).get("cost") or 0.0
-            holdings_value += float(px) * float((row or {}).get("qty") or 0.0)
+    # 2026-11-18 13:1x: on THIS broker neither market_value nor cost is present (both
+    # default 0.0), so the sum was 0 and the T leg died on its quota denominator.
+    # _holdings_value adds the last-price leg as the final fallback, per symbol.
+    holdings_value = _holdings_value(
+        positions, lambda sym: (_tick_of(ContextInfo, sym) or {}).get("last_price"))
 
     book = TRoundBook(PARAMS)
     try:
@@ -2226,6 +2264,11 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
     # total_asset (see _t_equity_basis). Only feeds the T ctx -- the strategic
     # buy sizing / cash-reserve paths are untouched.
     t_total = _t_equity_basis(total, macro, stale_sec)
+    # 2026-11-18: the denominator pair is what decides whether ANY T leg can be
+    # sized (`t_cap_base` = min of the two). Printing them once per round turns
+    # "step0 equity_or_holdings_value_unavailable" from a dead end into a number.
+    _log("t_denom equity=%s holdings=%.0f" % (
+        "none" if t_total is None else "%.0f" % t_total, holdings_value))
 
     def base_ctx(symbol):
         row = pos_view.get(symbol) or {}
@@ -2379,6 +2422,23 @@ def run_round(ContextInfo, moment):
     _probe_price_channels(ContextInfo, positions)
     cash_raw = _cash()
     total = _account_total_asset()
+    # COUNTER-VIEW 2026-11-18 13:2x: the round stopped printing subscribe/probe
+    # lines and the T leg stopped running, which can only mean `positions` read as
+    # empty (or unreadable). Without a readout those two states are indistinguishable
+    # from the log -- and "no positions" versus "table refused" lead to opposite
+    # conclusions. One short line per round names both tables and both money rows.
+    _log("views pos=%s ord=%d cash=%s eq=%s" % (
+        "na" if positions is None else len(positions), len(orders),
+        "na" if cash_raw is None else "%.0f" % cash_raw,
+        "na" if total is None else "%.0f" % total))
+    # The count alone cannot answer "did the 13:0x orders actually fill?" -- a
+    # position row with qty>0 for a code we just sold says the sell never reached
+    # the counter, and that is a different world from "it filled and the row is
+    # gone". Name the rows (bounded to six: this account will never hold more).
+    if positions:
+        _log("held %s" % ",".join(
+            "%sx%d" % (sym, int(_to_float(row.get("qty"), 0.0) or 0.0))
+            for sym, row in list(positions.items())[:6]))
     # 2026-11-13: open BUY orders reserve cash BEFORE the next order is sized
     # (rules_sizing.py:94-99: a stale room is the same-round double-buy).
     # Plus the owner's remaining-cash floor: keep total_asset x

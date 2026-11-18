@@ -375,16 +375,22 @@ class TestBuilderLeavesNoHalfProduct(BuilderFixture):
         # 装载自证看不见这件事——只有第一轮真的调用规则才 raise KeyError。
         # 闸数从 8 到 9（executor 支）：2026-11-16 载体 v38 带着缺 session_windows 的烘参开盘
         # 全拒，构建器补了 g10_fail_closed_params（沙箱适配器直读的 fail-closed 键必须烘进去）。
-        # executor 这一支 = 5 基础 + g7e + g8 + g9 + g10 = 9；sandbox 那一支多 g6/g7 共 10。
+        # 闸数从 9 到 10（两载体共用）：g11_no_duplicate_toplevel。2026-11-18 13:01 实录：
+        # 载体的 `_bars_of(payload, symbol)` 与移植 rules_t 的 `_bars_of(ctx)` 内联进同一
+        # 命名空间，后定义者静默胜出，输的那方调用点抛 TypeError。等 arity 的重名更坏：
+        # 两套行为静默交换、零痕迹。这条闸在构建期就把同形事故拦下。
+        # executor 这一支 = 5 基础 + g7e + g8 + g9 + g10 + g11 = 10；sandbox 那一支多两道共 12。
         # 数字本身是"少了一道闸就红"的判据，改闸时同批改这里。
         # 数量之外还按名字断言，摘掉任意一道闸都会红，而不是只红在计数上。
-        self.assertIn("BUILD_GATES gates=9 all_passed=1", out)
+        self.assertIn("BUILD_GATES gates=10 all_passed=1", out)
         self.assertTrue(hasattr(builder, "gate_fail_closed_params"),
                         "fail-closed params gate removed: an artifact missing session_windows would pass again")
         self.assertTrue(hasattr(builder, "gate_executor_loads"),
                         "executor load gate removed: a non-importable artifact would pass again")
         self.assertTrue(hasattr(builder, "gate_ported_rule_knobs"),
                         "knob gate removed: a rule whose thresholds were never baked would pass again")
+        self.assertTrue(hasattr(builder, "gate_no_duplicate_toplevel"),
+                        "duplicate-name gate removed: one definition could silently overwrite another")
         names = os.listdir(self.out)
         self.assertEqual(len(names), 1)
         artifact = os.path.join(self.out, names[0])

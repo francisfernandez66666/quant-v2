@@ -127,7 +127,7 @@ class TestBuildContextWholeSeqReplacement(unittest.TestCase):
             def get_market_data_ex(self, *a, **k):
                 return {}
 
-        bars = self.mod._bars_of(_Ctx().get_market_data_ex(), "300576")
+        bars = self.mod._bar_dicts_of(_Ctx().get_market_data_ex(), "300576")
         self.assertEqual(len(bars), 0)
         merged = self.mod._precalc_bars("300576", tick)
         self.assertEqual(len(merged), pg.SERIES_BARS_N + 1)

@@ -263,5 +263,62 @@ class TEquityFallback20261117(unittest.TestCase):
         self.assertIn('"total_asset": t_total', text)
 
 
+class THoldingsValue20261118(unittest.TestCase):
+    """The OTHER half of the T quota denominator.
+
+    LIVE READING 2026-11-18 13:1x: with the price fix live, the T leg moved past
+    `step0 no_realtime_price` and stopped at `step0
+    equity_or_holdings_value_unavailable`. The counter equity side already falls
+    back (`_t_equity_basis`), so what collapsed was holdings_value: this broker's
+    POSITION rows carry neither m_dMarketValue nor m_dOpenPrice, both default to
+    0.0, and the sum stayed exactly zero -- every T gate closed on arithmetic.
+
+    The helper keeps the trust order (market value -> cost -> last price) and
+    never turns a missing reading into a number.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _build_and_load()
+
+    def test_market_value_wins_over_cost_and_price(self):
+        rows = {"600000": {"qty": 1000, "cost": 9.0, "market_value": 9950.0}}
+        self.assertEqual(self.mod._holdings_value(rows, lambda s: 10.0), 9950.0)
+
+    def test_cost_is_the_second_choice(self):
+        rows = {"600000": {"qty": 1000, "cost": 9.0, "market_value": 0.0}}
+        self.assertEqual(self.mod._holdings_value(rows, lambda s: 10.0), 9000.0)
+
+    def test_last_price_saves_the_zero_row_shape_the_box_reported(self):
+        # exactly the 13:1x shape: both counter fields 0.0, qty real
+        rows = {"600000": {"qty": 1000, "cost": 0.0, "market_value": 0.0}}
+        self.assertEqual(self.mod._holdings_value(rows, lambda s: 10.0), 10000.0)
+
+    def test_price_of_is_asked_per_symbol_not_reused(self):
+        rows = {"600000": {"qty": 1000, "cost": 0.0, "market_value": 0.0},
+                "600519": {"qty": 100, "cost": 0.0, "market_value": 0.0}}
+        seen = []
+
+        def price_of(sym):
+            seen.append(sym)
+            return {"600000": 10.0, "600519": 1500.0}[sym]
+
+        self.assertEqual(self.mod._holdings_value(rows, price_of), 1000 * 10.0 + 100 * 1500.0)
+        self.assertEqual(sorted(seen), ["600000", "600519"])
+
+    def test_no_reading_stays_zero_and_never_invents(self):
+        rows = {"600000": {"qty": 1000, "cost": 0.0, "market_value": 0.0}}
+        self.assertEqual(self.mod._holdings_value(rows, lambda s: None), 0.0)
+        self.assertEqual(self.mod._holdings_value({}, lambda s: 10.0), 0.0)
+        # qty 0 / negative rows must not contribute even if a price exists
+        self.assertEqual(self.mod._holdings_value({"600000": {"qty": 0}}, lambda s: 10.0), 0.0)
+
+    def test_baked_artifact_wires_the_helper_into_the_t_round(self):
+        text = open(self.mod.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("def _holdings_value(positions, price_of):", text)
+        self.assertIn("holdings_value = _holdings_value(", text)
+        self.assertIn('_log("t_denom equity=%s holdings=%.0f"', text)
+
+
 if __name__ == "__main__":
     unittest.main()

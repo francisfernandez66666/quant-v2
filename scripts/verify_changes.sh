@@ -22627,8 +22627,10 @@ CNT191=$((CNT191 + 1))
 	|| fail191 "成本口径回归用例不在册（5 例：两列都在每股优先/合计不覆盖/反推/qty=0 不造数/合计=0 不造数）"
 grep -qF 'func TestCarrierIntradayPriorityPassthrough' internal/server/carrier_test.go \
 	|| fail191 "intraday_priority 透传双向断言用例不在册（true→true / 未写→false）"
-grep -qF 'BUILD_GATES gates=9 all_passed=1' qmt_gateway/tests/test_local_executor_build_update.py \
-	|| fail191 "构建闸数断言未随 g10 刷新为 9（ac7fdcb 补 g10 漏改，闸被摘都测不出）"
+grep -qF 'BUILD_GATES gates=10 all_passed=1' qmt_gateway/tests/test_local_executor_build_update.py \
+	|| fail191 "构建闸数断言未随 g11 刷新为 10（闸被摘都测不出）"
+grep -qF 'gate_no_duplicate_toplevel' qmt_gateway/tests/test_local_executor_build_update.py \
+	|| fail191 "重名闸存在性断言缺失（同名定义静默覆盖会再次无声）"
 grep -qF 'gate_fail_closed_params' qmt_gateway/tests/test_local_executor_build_update.py \
 	|| fail191 "fail-closed params 闸存在性断言缺失（缺 session_windows 的烘参又会被放行）"
 grep -qF 'cntime.Loc' internal/engine/m12_cash_gate_test.go \
@@ -23132,13 +23134,39 @@ if printf '%s\n' "$AB197" | grep -qE 'PARAMS\.get|_t_equity_basis|asof_age_sec';
 	fail197 "_account_total_asset 混入烘参回退（会放大主买入腿下单金额）"
 fi
 
+# ⑤b 分母的另一半（2026-11-18 13:1x 实录）：持仓市值。价格修好后 T 腿越过
+#   `step0 no_realtime_price`，停在 `step0 equity_or_holdings_value_unavailable`——
+#   这家柜台的 POSITION 行 **market_value 与 cost 都是 0**（_positions 两列都缺省 0.0），
+#   于是 min(权益, 持仓市值) 恒为 0，每道 T 闸都是被算术关上的，不是被判断关上的。
+#   优先级 market_value → cost → 现价（同一枚 tick 给卖出腿用的那枚）；三条都没有仍为 0，
+#   在 t_cap_base 处照旧 fail-closed（缺价永远不许读成 0 之外的数）。
+CNT197=$((CNT197 + 1))
+grep -qF 'def _holdings_value(positions, price_of):' qmt_gateway/qmt_internal_strategy.py \
+	|| fail197 "缺 _holdings_value（持仓市值退化为 0，T 腿全天无分母）"
+CNT197=$((CNT197 + 1))
+grep -qF 'holdings_value = _holdings_value(' qmt_gateway/qmt_internal_strategy.py \
+	|| fail197 "_holdings_value 写了没人调（恒空读数）"
+CNT197=$((CNT197 + 1))
+if grep -qF '    holdings_value = 0.0' qmt_gateway/qmt_internal_strategy.py; then
+	fail197 "持仓市值回到恒 0.0 起点（那台盒子上 T 腿会再次死在同一道闸）"
+fi
+CNT197=$((CNT197 + 1))
+grep -qF '_log("t_denom equity=%s holdings=%.0f"' qmt_gateway/qmt_internal_strategy.py \
+	|| fail197 "没有 t_denom 读数（分母到底哪一半是 0，下次又只能猜）"
+CNT197=$((CNT197 + 1))
+grep -qF 'self.mod._holdings_value' qmt_gateway/tests/test_wiring_selfcontained_20261117.py \
+	|| fail197 "缺持仓市值行为腿（三档优先级 + 缺价不造数）"
+
 # ⑥ 行为腿真跑：TEquityFallback20261117（柜台优先/新鲜回退/陈旧拒绝/缺龄拒绝/隔离）。
 G197=$( cd qmt_gateway && timeout 120 /usr/local/bin/python3 -m pytest tests/test_wiring_selfcontained_20261117.py -k TEquityFallback20261117 2>&1 || true )
 CNT197=$((CNT197 + 1))
 grep_q 'passed' G197 || { echo "--- FAIL: §197 行为腿未过：$(printf '%s\n' "$G197" | tail -6)"; B197_FAILED=1; }
+CNT197=$((CNT197 + 1))
+G197B=$( cd qmt_gateway && timeout 120 /usr/local/bin/python3 -m pytest tests/test_wiring_selfcontained_20261117.py -k THoldingsValue20261118 2>&1 || true )
+grep_q '6 passed' G197B || { echo "--- FAIL: §197 持仓市值行为腿未跑满6例：$(printf '%s\n' "$G197B" | tail -6)"; B197_FAILED=1; }
 
 [ "$B197_FAILED" = "0" ] || exit 1
-echo "ok - §197 §20261117-T-EQUITY-FALLBACK 锁通过（柜台优先 + 新鲜烘参回退 + 陈旧/缺龄负锁 + 主腿隔离 + 云端烘参 + 行为腿，累计判定点 ${CNT197}）"
+echo "ok - §197 §20261117-T-EQUITY-FALLBACK 锁通过（柜台优先 + 新鲜烘参回退 + 陈旧/缺龄负锁 + 主腿隔离 + 云端烘参 + 持仓市值三档回退 + 行为腿，累计判定点 ${CNT197}）"
 echo ""
 
 # §198 §20261117-WIRING-COMPLETENESS（施工图 §11.4：build_context 必须装配全部
@@ -23319,7 +23347,9 @@ done
 CNT201=$((CNT201 + 1))
 grep -qF '"afternoon_reseal": reseal' qmt_gateway/qmt_internal_strategy.py || fail201 "build_context 未用机内自算值（仍读旧 precalc）"
 CNT201=$((CNT201 + 1))
-grep -qF 'getter([], [symbol], "1m", "", "", int(count), "front")' qmt_gateway/qmt_internal_strategy.py || fail201 "分钟K姿势非探针证实的位置参数形状"
+# 2026-11-18 后缀修复后这里传的是归一过的码（`_qmt_code(symbol)`）：裸码客户端
+# 直接回空——位置姿势与"带后缀"这两件事都要判，缺任一半都是同一个价格盲。
+grep -qF 'getter([], [_qmt_code(symbol)], "1m", "", "", int(count), "front")' qmt_gateway/qmt_internal_strategy.py || fail201 "分钟K姿势非探针证实的位置参数形状（且必须带市场后缀）"
 CNT201=$((CNT201 + 1))
 grep -qF 'UpStopPrice' qmt_gateway/qmt_internal_strategy.py || fail201 "未用精确 UpStopPrice 作板价"
 # 负锁：自算值不得被无条件覆盖回 pre.get（那会让机内自算形同虚设）。
@@ -23344,10 +23374,10 @@ CNT201=$((CNT201 + 1))
 grep_q '13 passed' PY201A || { echo "--- FAIL: §201 机内自算行为腿未跑满13例：$(printf '%s\n' "$PY201A" | tail -6)"; B201_FAILED=1; }
 PY201B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_sector_drop_20261117.py -q 2>&1 || true )
 CNT201=$((CNT201 + 1))
-grep_q '8 passed' PY201B || { echo "--- FAIL: §201 云端烘行为腿未跑满8例：$(printf '%s\n' "$PY201B" | tail -6)"; B201_FAILED=1; }
+grep_q '12 passed' PY201B || { echo "--- FAIL: §201 云端烘行为腿未跑满12例：$(printf '%s\n' "$PY201B" | tail -6)"; B201_FAILED=1; }
 
 [ "$B201_FAILED" = "0" ] || exit 1
-echo "ok - §201 §20261117-RESEAL-SECTORDROP 锁通过（机内自算6函数+build_context接入+负锁 + pregen云端烘 + 13+8例行为腿，累计判定点 ${CNT201}）"
+echo "ok - §201 §20261117-RESEAL-SECTORDROP 锁通过（机内自算6函数+build_context接入+负锁 + pregen云端烘 + 13+12例行为腿，累计判定点 ${CNT201}）"
 echo ""
 
 # §202 §20261117-REVIEW-CLOSEOUT（方案文档复核收口批）：复核发现三处未完成项补齐——
@@ -23495,7 +23525,19 @@ grep -qE '^        sub_1m = _probe_subscribe_1m\(ContextInfo, sfx\)$' qmt_gatewa
 CNT203=$((CNT203 + 1))
 grep -qF 'mde_1m=%d sub1m=%s mde_1m_after=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针行没打 1m 读数（订阅前后各一次才有对照）"
 CNT203=$((CNT203 + 1))
-grep -qF 'mde_1d_sfx=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针没按后缀读日线（本地仓到底答不答，缺这条就没结论）"
+grep -qF 'd1d_sfx=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针没按后缀读日线（本地仓到底答不答，缺这条就没结论）"
+# ⑥b 柜台视图读数（2026-11-18 13:2x）：某轮起订阅/探针/T 腿全都不打印了，唯一的解释是
+#   `positions` 读成空（或读不了）——而"没有持仓"与"表被拒"在日志上是同一个形状，
+#   结论却相反。一行读数把两张表与两行钱同时点名。
+CNT203=$((CNT203 + 1))
+grep -qF '_log("views pos=%s ord=%d cash=%s eq=%s"' qmt_gateway/qmt_internal_strategy.py \
+	|| fail203 "缺柜台视图读数（空表与读不了分不出来）"
+CNT203=$((CNT203 + 1))
+grep -qF '"na" if positions is None else len(positions)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail203 "视图读数把 None 折成 0（读不了会被读成没有持仓）"
+CNT203=$((CNT203 + 1))
+grep -qF '_log("held %s" % ",".join(' qmt_gateway/qmt_internal_strategy.py \
+	|| fail203 "缺 held 行读数（\"卖了但没成交\"与\"成交了行就没了\"在计数上同形）"
 
 # ⑦ 行为腿：9 例（批次行+sample/单票行/后缀变体/1m订阅/上限4只/每5轮/tick订阅/破客户端不炸/静态负锁）。
 PY203=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_price_probe_20261118.py -q 2>&1 || true )
@@ -23574,7 +23616,22 @@ grep -qF 'return normalize_tick(symbol, entry)' qmt_gateway/qmt_internal_strateg
 CNT204=$((CNT204 + 1))
 grep -qF 'def _rekey_payload(payload, symbol):' qmt_gateway/qmt_internal_strategy.py || fail204 "缺 _rekey_payload（历史 payload 键回不到裸码＝读成空）"
 
-# ④ 行为腿：后缀 7 例 + 探针 8 例（两条腿一起跑，改坏任一侧都红）。
+# ③b 顶层重名（2026-11-18 13:01 实录）：载体的 `_bars_of(payload, symbol)` 与移植
+#   rules_t 的 `_bars_of(ctx)` 内联进同一命名空间，后定义者静默胜出，输的那方调用点抛
+#   `TypeError: missing 1 required positional argument`。等 arity 的重名更坏——它会静默
+#   交换两套行为、一点痕迹都没有。所以：载体侧改名 + 构建闸拒重名，两把都要在。
+CNT204=$((CNT204 + 1))
+grep -qF 'def _bar_dicts_of(payload, symbol):' qmt_gateway/qmt_internal_strategy.py || fail204 "载体侧未改名 _bar_dicts_of（与 rules_t._bars_of 撞名）"
+CNT204=$((CNT204 + 1))
+if grep -qF 'def _bars_of(payload, symbol):' qmt_gateway/qmt_internal_strategy.py; then
+	fail204 "载体侧又定义 _bars_of(payload, symbol)（与移植规则同名，静默覆盖）"
+fi
+CNT204=$((CNT204 + 1))
+grep -qF 'def gate_no_duplicate_toplevel(artifact):' scripts/build_local_executor.py || fail204 "缺 g11 重名闸（同形事故会再次静默）"
+CNT204=$((CNT204 + 1))
+grep -qF '"g11_no_duplicate_toplevel"' scripts/build_local_executor.py || fail204 "g11 未挂进构建闸列表"
+
+# ④ 行为腿：后缀 7 例 + 探针 9 例（两条腿一起跑，改坏任一侧都红）。
 PY204=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_price_code_suffix_20261118.py -q 2>&1 || true )
 CNT204=$((CNT204 + 1))
 grep_q '7 passed' PY204 || { echo "--- FAIL: §204 后缀行为腿未跑满7例：$(printf '%s\n' "$PY204" | tail -6)"; B204_FAILED=1; }

@@ -141,10 +141,13 @@ class PriceProbe20261118(unittest.TestCase):
     def test_per_symbol_line_names_every_shape_it_tried(self):
         ctx = _ProbeCtx(ticks={_HELD: _tick()}, batch_ticks={})
         lines = self._probe(ctx)
-        row = [ln for ln in lines if " sym=%s " % _HELD in ln]
-        self.assertEqual(len(row), 1, "each asked symbol gets one line")
+        # The client truncates a printed line at ~150 chars, so the shapes are
+        # split over exactly two lines; join them before checking every key.
+        rows = [ln for ln in lines if " sym=%s " % _HELD in ln]
+        self.assertEqual(len(rows), 2, "two lines per symbol: price shapes, then bar shapes")
+        row = [" ".join(rows)]
         for piece in ("one=1", "one_sfx=", "sub=", "sfx=", "sub_tick=", "sfx_tick=",
-                      "mde_tick=", "mde_1d=", "mde_1d_sfx=", "mde_1m=", "sub1m=",
+                      "mde_tick=", "mde_1d=", "d1d_sfx=", "mde_1m=", "sub1m=",
                       "mde_1m_after="):
             self.assertIn(piece, row[0])
         # the tick subscription is what the evidence pointed at: period must be tick
@@ -165,7 +168,7 @@ class PriceProbe20261118(unittest.TestCase):
         """
         ctx = _ProbeCtx(ticks={_HELD + ".SZ": _tick()}, batch_ticks={})
         lines = self._probe(ctx)
-        row = [ln for ln in lines if " sym=%s " % _HELD in ln][0]
+        row = " ".join([ln for ln in lines if " sym=%s " % _HELD in ln])
         self.assertIn((_HELD + ".SZ", "1m"), ctx.quote_calls,
                       "the probe must subscribe the suffixed 1m period")
         self.assertIn("sub1m=", row)
@@ -181,7 +184,7 @@ class PriceProbe20261118(unittest.TestCase):
         """
         ctx = _ProbeCtx(ticks={_HELD + ".SZ": _tick()}, batch_ticks={})
         lines = self._probe(ctx)
-        row = [ln for ln in lines if " sym=%s " % _HELD in ln][0]
+        row = " ".join([ln for ln in lines if " sym=%s " % _HELD in ln])
         self.assertIn("one=0", row)
         self.assertIn("one_sfx=1", row)
         self.assertIn("priced=1", [ln for ln in lines if "summary" in ln][0])
@@ -214,10 +217,10 @@ class PriceProbe20261118(unittest.TestCase):
         lines = self._probe(ctx)
         self.assertTrue(any("batch raised=" in ln for ln in lines),
                         "a raising batch read must be named, not swallowed")
-        row = [ln for ln in lines if " sym=%s " % _HELD in ln]
+        row = " ".join([ln for ln in lines if " sym=%s " % _HELD in ln])
         self.assertTrue(row)
-        self.assertIn("mde_tick=-1", row[0], "a rejected signature is the answer: print -1")
-        self.assertIn("sub=api_absent", row[0], "no subscribe fn must read as api_absent")
+        self.assertIn("mde_tick=-1", row, "a rejected signature is the answer: print -1")
+        self.assertIn("sub=api_absent", row, "no subscribe fn must read as api_absent")
 
     # ---- 6. static negative lock: the probe can never trade ------------------
     def test_probe_source_contains_no_trade_call(self):

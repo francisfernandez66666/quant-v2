@@ -1217,6 +1217,45 @@ def gate_no_bare_numbers(artifact):
     return True, ""
 
 
+def gate_no_duplicate_toplevel(artifact):
+    """No top-level function/class may be DEFINED TWICE in one artifact.
+
+    LIVE INCIDENT 2026-11-18 13:01: the carrier's `_bars_of(payload, symbol)` and
+    the ported rules_t's `_bars_of(ctx)` were both inlined into one namespace, so
+    whichever definition came last silently won. The loser's callers then raised
+    `TypeError: _bars_of() missing 1 required positional argument` -- and because
+    the T/open leg only reaches that line once prices work, the defect stayed
+    hidden for as long as the carrier was price-blind. The arity mismatch made it
+    loud; a same-arity clash would have swapped two behaviours with NO trace at
+    all, which is worse. Cheap to check, so check it at build time.
+    """
+    try:
+        tree = ast.parse(artifact)
+    except SyntaxError as exc:
+        return False, "artifact_not_parsable:%s" % (exc,)
+    seen = {}
+    dups = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        else:
+            continue
+        body = ast.get_source_segment(artifact, node) or ""
+        if name in seen:
+            prev_line, prev_body = seen[name]
+            # Byte-identical duplicates are the intended dedup shape (the same
+            # helper ported into two modules) and are harmless: both copies do
+            # the same thing. Different text under one name is the silent-swap
+            # bug this gate exists for.
+            if prev_body.strip() != body.strip():
+                dups.append("%s@%d/%d" % (name, prev_line, node.lineno))
+        else:
+            seen[name] = (node.lineno, body)
+    if dups:
+        return False, "duplicate_toplevel=%s" % ",".join(dups[:6])
+    return True, ""
+
+
 GATES = [
     ("g1_ascii", gate_ascii, "artifact contains a non-ASCII byte"),
     ("g2_privileged_calls", gate_no_privileged_calls,
@@ -1688,6 +1727,8 @@ def main(argv=None):
         artifact = inject_pported(artifact, params)
     except ValueError as exc:
         return fail("ported_rules_inject_failed", str(exc))
+    gates = gates + [("g11_no_duplicate_toplevel", gate_no_duplicate_toplevel,
+                      "a top-level name is defined twice (one definition silently wins)")]
     gates = gates + [("g8_short_codes_unique", gate_pported_short_codes_unique,
                      "two rules must not share one counter remark code"),
                     ("g9_rule_knobs_baked", gate_ported_rule_knobs,
