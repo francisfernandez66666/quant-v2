@@ -23459,6 +23459,10 @@ echo ""
 # ⇒ 载体一只票都取不到价，买入死在 rule_fillable、三条卖出腿全盲。本批只加"哪条取价通道
 #   还活着"的只读取证线（批取价/单票/ tick 订阅/ tick bar/ 日线 bar 五形态 + 每 5 轮一次），
 #   改价路径必须等这条线的读数。负锁：探针体里永远不许长出下单/撤单/预算动作。
+# 判读提示（owner 2026-11-18）：data_health bars_coverage 每小时一行、计数器仅在
+#   _STATE 内存中，策略/客户端一重启就清零 ⇒ 重启后首行 0/1000 是伪影（bar 还没重数），
+#   不是下载失败证据；要看重启一小时后稳定态的行，别拿首帧下结论。载体同款提示在
+#   qmt_internal_strategy.py 的 data_health 日志行注释里（ASCII）。
 echo "==> 203 §20261118-PRICE-PROBE（价格盲取证线只读 + 有界）..."
 B203_FAILED=0
 fail203() {
@@ -23905,4 +23909,74 @@ grep_q '8 passed' PY207 || { echo "--- FAIL: §207 A路1m生产订阅行为腿�
 
 [ "$B207_FAILED" = "0" ] || exit 1
 echo "ok - §207 §20261118-A-ROUTE-1M 锁通过（独立订阅+按日幂等+裸键+后缀1m+接线+只读负锁+8例行为腿，累计判定点 ${CNT207}）"
+echo ""
+
+# §208 §20261118-BATCH-TICKS（整池批取价：一次 get_full_tick 取代 ~1000 逐票读）。
+# 证据：11-18 探针 getter(universe 裸码) asked=1000 got=48（只回带点的），单票带后缀
+#   能取价 ⇒ 批取必须喂全后缀码、再 rekey 回裸码。fail-closed：批取失败/空时快照为空，
+#   _tick_of 回退逐票（§204 锁死那行），价格链绝不比批取前更差。
+echo "==> 208 §20261118-BATCH-TICKS（整池批取 + 裸码 rekey + round 作用域 + 逐票兜底）..."
+B208_FAILED=0
+fail208() {
+	echo "--- FAIL: §208 $*"
+	FAIL=1
+	B208_FAILED=1
+}
+CNT208=0
+
+# ① 批取函数 + round 作用域快照 + 入口清旧快照（fail-closed 核心）。
+CNT208=$((CNT208 + 1))
+grep -qF 'def _batch_ticks(ContextInfo, symbols, positions):' qmt_gateway/qmt_internal_strategy.py || fail208 "缺 _batch_ticks 整池批取函数"
+CNT208=$((CNT208 + 1))
+grep -qF '_STATE.pop("tick_snapshot", None)' qmt_gateway/qmt_internal_strategy.py || fail208 "批取入口未清旧快照（失败轮会留隔夜脏数据）"
+CNT208=$((CNT208 + 1))
+grep -qF '_STATE["tick_snapshot_round"] = _STATE.get("round_moment")' qmt_gateway/qmt_internal_strategy.py || fail208 "快照未按 round 打标（跨轮会服务旧价）"
+CNT208=$((CNT208 + 1))
+grep -qF 'codes = [_qmt_code(s) for s in bare]' qmt_gateway/qmt_internal_strategy.py || fail208 "批取未喂全后缀码（裸码只回 48/1000）"
+
+# ② 裸码 rekey（键带后缀会打断所有 join）。
+CNT208=$((CNT208 + 1))
+grep -qF 'snap[s] = normalize_tick(s, entry)' qmt_gateway/qmt_internal_strategy.py || fail208 "批取快照未按裸码键 rekey"
+
+# ③ _tick_of 优先查快照但保留逐票兜底（§204 锚点必须还在）。
+CNT208=$((CNT208 + 1))
+grep -qF 'snap = _STATE.get("tick_snapshot")' qmt_gateway/qmt_internal_strategy.py || fail208 "_tick_of 未查批取快照"
+CNT208=$((CNT208 + 1))
+grep -qF 'raw = getter([code])' qmt_gateway/qmt_internal_strategy.py || fail208 "逐票兜底被删（批取失败=全盲，违反 fail-closed）"
+
+# ④ run_round 真接线。
+CNT208=$((CNT208 + 1))
+grep -qF '_batch_ticks(ContextInfo, symbols, positions)' qmt_gateway/qmt_internal_strategy.py || fail208 "整池批取没在 run_round 调用"
+
+# ⑤ 只读负锁：批取函数体不许有下单动作。
+CNT208=$((CNT208 + 1))
+BFN=$(python3 - <<'PY'
+import ast, io
+src = io.open('qmt_gateway/qmt_internal_strategy.py', encoding='ascii').read()
+tree = ast.parse(src)
+fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_batch_ticks'), None)
+print('OK' if fn else 'MISSING')
+if fn:
+    seg = ast.get_source_segment(src, fn) or ''
+    bad = [t for t in ('passorder', '_place(', 'order_share', 'cancel_leg', 'sizing_cap') if t in seg]
+    if bad:
+        print('TRADE_CALL:' + ','.join(bad))
+PY
+)
+	echo "$BFN" | grep -q '^OK$' || fail208 "无法解析 _batch_ticks 函数体"
+	if echo "$BFN" | grep -q 'TRADE_CALL:'; then
+		fail208 "批取函数体内混入下单/预算动作：$(echo "$BFN" | grep TRADE_CALL)"
+	fi
+
+# ⑥ data_health 判读提示（owner 2026-11-18）：重启后首行 0/1000 是伪影的警示注释。
+CNT208=$((CNT208 + 1))
+grep -qF 'after a restart showing 0/1000 is an ARTEFACT' qmt_gateway/qmt_internal_strategy.py || fail208 "缺 data_health 重启首帧伪影判读提示（会被误当下载失败）"
+
+# ⑦ 行为腿：9 例（后缀 rekey/快照命中/失败兜底/空负载/部分命中/跨轮失效/空输入/只读/接线）。
+PY208=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_batch_ticks_20261118.py -q 2>&1 || true )
+CNT208=$((CNT208 + 1))
+grep_q '9 passed' PY208 || { echo "--- FAIL: §208 整池批取行为腿未跑满9例：$(printf '%s\n' "$PY208" | tail -8)"; B208_FAILED=1; }
+
+[ "$B208_FAILED" = "0" ] || exit 1
+echo "ok - §208 §20261118-BATCH-TICKS 锁通过（整池批取+裸码rekey+round作用域+逐票兜底+只读负锁+9例行为腿，累计判定点 ${CNT208}）"
 echo ""

@@ -871,7 +871,16 @@ def _qmt_code(symbol):
 
 
 def _tick_of(ContextInfo, symbol):
-    """One snapshot -> the flat dict the rule layer reads, or {} when absent."""
+    """One snapshot -> the flat dict the rule layer reads, or {} when absent.
+
+    Round-scoped batch is consulted first (A-ROUTE 2026-11-18); a miss or a
+    stale snapshot falls through to the original per-symbol read below, keeping
+    the price chain fail-closed if the batch never answers on a given build.
+    """
+    snap = _STATE.get("tick_snapshot")
+    if (isinstance(snap, dict) and symbol in snap
+            and _STATE.get("tick_snapshot_round") == _STATE.get("round_moment")):
+        return snap[symbol]
     getter = getattr(ContextInfo, "get_full_tick", None)
     if not callable(getter):
         _warn_once("no_tick", "ContextInfo.get_full_tick unavailable")
@@ -893,6 +902,60 @@ def _tick_of(ContextInfo, symbol):
         return {}
     # Keep the BARE symbol on the normalised tick: ctx identity stays bare.
     return normalize_tick(symbol, entry)
+
+
+def _batch_ticks(ContextInfo, symbols, positions):
+    """A-ROUTE companion 2026-11-18: ONE batched get_full_tick for the whole
+    scan universe per round, rekeyed to BARE symbols into a round-scoped snapshot.
+
+    Why: the per-symbol path above costs ~1000 serial reads (~45s/round on this
+    client) and is the reason decisions lag the market. The 11-18 probe proved
+    the client DOES answer batched reads -- but ONLY for SUFFIXED codes (bare
+    universe asked=1000 got=48). So feed every code through _qmt_code and rekey
+    the answered keys back to bare before caching.
+
+    FAIL-CLOSED by construction: a missing API, an exception, or an empty/odd
+    payload leaves the snapshot empty, and _tick_of then falls back to its
+    original per-symbol read for EVERY name -- never worse than before this
+    function existed. The snapshot is keyed by the round moment so a stale
+    batch from a prior round can never be served. Only names that actually
+    answered are cached; misses fall through to the per-symbol path. No order,
+    no budget, no state beyond the round snapshot is touched.
+    """
+    # Clear LAST round's snapshot up front: a batch that fails/returns empty
+    # must never leave a stale cache behind, even if the round key were reused.
+    _STATE.pop("tick_snapshot", None)
+    _STATE.pop("tick_snapshot_round", None)
+    getter = getattr(ContextInfo, "get_full_tick", None)
+    if not callable(getter):
+        return
+    bare = []
+    seen = set()
+    for s in list(symbols or []) + list((positions or {}).keys()):
+        key = str(s)
+        if key and key not in seen:
+            seen.add(key)
+            bare.append(key)
+    if not bare:
+        return
+    codes = [_qmt_code(s) for s in bare]
+    try:
+        raw = getter(codes)
+    except Exception:  # noqa: BLE001 - batch is an optimisation, never a gate
+        return
+    if not isinstance(raw, dict) or not raw:
+        return
+    snap = {}
+    for s, code in zip(bare, codes):
+        entry = raw.get(code)
+        if not isinstance(entry, dict):
+            entry = raw.get(s)
+        if isinstance(entry, dict):
+            snap[s] = normalize_tick(s, entry)
+    _STATE["tick_snapshot"] = snap
+    _STATE["tick_snapshot_round"] = _STATE.get("round_moment")
+    if snap:
+        _log("batch_ticks got=%d asked=%d" % (len(snap), len(bare)))
 
 
 def _subscribe_fns(ContextInfo):
@@ -2594,8 +2657,18 @@ def run_round(ContextInfo, moment):
         cap = int(PARAMS.get("hot_pool_max_codes", 20))
         extra = [c for c in hot if c not in symbols][:max(0, cap)]
         symbols = symbols + extra
+    # A-ROUTE 2026-11-18: one batched price read for the whole scan universe,
+    # cached round-scoped so every _tick_of below hits memory (~1s vs ~45s).
+    # Fail-closed: if the client ignores the suffixed batch, the snapshot stays
+    # empty and each _tick_of falls back to its per-symbol read.
+    _batch_ticks(ContextInfo, symbols, positions)
     # DATA-HEALTH: hourly one-line coverage log so a silent download failure is
     # visible in the log pane (2026-11-11 review finding -- never fail silently).
+    # READING GUIDE (owner 2026-11-18): one line per hour AND the counters live
+    # only in _STATE -- a client/strategy restart clears them, so the FIRST line
+    # after a restart showing 0/1000 is an ARTEFACT (bars not re-counted yet),
+    # NOT proof that downloads failed. Judge coverage from the steady-state
+    # lines after the first hour, never from that first post-restart frame.
     cov_key = "%s_%d" % (day, moment.hour)
     if _STATE.get("cov_log_key") != cov_key:
         _STATE["cov_log_key"] = cov_key
