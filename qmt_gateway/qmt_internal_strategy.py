@@ -1964,6 +1964,35 @@ def _sizing_view(ctx, positions, pending_buys=None):
     return out
 
 
+def _probe_cash_due():
+    """CASH-PROBE gate: true once every _PROBE_ROUND_EVERY rounds, for the first
+    new candidate only. Bounded so the line can never slow a round or flood the
+    log; pure read of a session counter, no trading state touched."""
+    seq = int(_STATE.get("cash_probe_seq") or 0) + 1
+    _STATE["cash_probe_seq"] = seq
+    return (seq - 1) % _PROBE_ROUND_EVERY == 0 and not _STATE.get("cash_probe_done")
+
+
+def _probe_cash_line(short, amount, why, note, ctx, params):
+    """CASH-PROBE readout (read-only): name the exact sizing verdict and the
+    money caps it was built from, so 'sizing_amount_unavailable' stops being an
+    opaque reason. Marks done for this round via the caller's flag."""
+    _STATE["cash_probe_done"] = True
+    cap = ""
+    try:
+        sized_view = _sizing_view(ctx, _STATE.get("cash_probe_positions") or {}, None)
+        names = buy_size_caps(params, sized_view)
+        cap = ",".join("%s=%s" % (k, "na" if v is None else "%.0f" % float(v))
+                       for k, v in sorted(names.items()))
+    except Exception as exc:  # noqa: BLE001 - readout only, never a decision
+        cap = "err:%s" % repr(exc)[:60]
+    _log("cash_probe sym=%s amt=%s why=%s note=%s cash=%s eq=%s caps=%s" % (
+        short, "na" if amount is None else "%.0f" % amount, why or "", note or "",
+        "na" if (ctx or {}).get("available_cash") is None else "%.0f" % float(ctx.get("available_cash") or 0.0),
+        "na" if (ctx or {}).get("total_asset") is None else "%.0f" % float(ctx.get("total_asset") or 0.0),
+        cap))
+
+
 def sizing_cap(ctx, positions, intent="new", pending_buys=None):
     """Cap one buy order with the dynamic-sizing chain. Returns (amount, reason, note).
 
@@ -2389,6 +2418,7 @@ def run_round(ContextInfo, moment):
     Never raises. A round that cannot see the counter places nothing.
     """
     summary = {"placed": [], "skipped": [], "cancelled": [], "reason": ""}
+    _STATE["cash_probe_done"] = False  # CASH-PROBE: allow one new candidate this round
     _STATE["round_moment"] = moment
     # 2026-11-13 P0: refuse the WHOLE round outside the two cash sessions.
     # The downloader leg is intentionally kept alive so bars coverage does
@@ -2733,6 +2763,15 @@ def run_round(ContextInfo, moment):
             # DYN-SIZE-IN-SANDBOX: the sizing chain is ANDed with the caps above,
             # never a replacement for them: it can only make this order smaller.
             sized_amount, why, note = sizing_cap(ctx, positions, intent, pending_rows)
+            # CASH-PROBE 2026-11-18 (read-only, bounded): why every NEW buy is
+            # sizing_amount_unavailable while cash/equity readouts look healthy.
+            # Prints ONE new candidate per _PROBE_ROUND_EVERY rounds with the
+            # exact sizing_cap verdict and the caps it was built from. No state
+            # is changed and no decision reads this line -- it only names the
+            # cap that refuses the order. Remove once the root cause is closed.
+            if intent == "new" and _probe_cash_due():
+                _STATE["cash_probe_positions"] = positions
+                _probe_cash_line(short, sized_amount, why, note, ctx, params)
             if sized_amount is None:
                 summary["skipped"].append({"short": short, "reason": why})
                 continue
