@@ -60,6 +60,16 @@ $T6 = "QMTF-Gateway-Start"
 # 第七条（§NEWS-GATE 2026-11-12 owner 裁决：盘中拉取走计划任务）：09:30–15:00 每 10 分钟
 # 跑 carrier_run.ps1 -Intraday —— carrier_updater --intraday 只投递带 intraday_priority 的
 # 反转清单（普通版本推进留给 15:40 班次），投递即有序重启客户端（owner 已勾「重启自动运行」）。
+#
+# §INTRADAY-TRIGGER-FIX（2026-11-18，现网实锤）：这条任务此前用 /SC MINUTE /ST 09:30
+# **外加 /ET 15:00** 注册。schtasks 的 /ET 是「结束边界」而不是「每天到点的窗口终点」——
+# 它把 EndBoundary 钉成**注册当天** 15:00（盒子上的实测读数：StartBoundary=2026-11-16T09:30、
+# EndBoundary=2026-11-16T15:00），于是这条任务只在装机那天跑过，之后永远不再触发：
+# 11-18 云端 10:00 发布 v75（intraday_priority=true）躺在清单里一小时无人拉取，
+# 盘中载体一直停在 09:34 装上的 v74。
+# 现在改用 **DAILY + /RI 10 + /DU 05:30**：每天 09:30 起、每 10 分钟一轮、连跑 5 小时 30 分
+# 到 15:00 收工，且**没有 EndBoundary**（次日照旧）。盒子实测该形态
+# START=…T09:30 / END=空 / REP_INTERVAL=PT10M / REP_DURATION=PT5H30M。
 $T7 = "QMTF-Carrier-Update-Intraday"
 # §WIRING-12 2026-11-17：回报腿调度。运营机早有 QMTF-Uplink、friend 包历史上没有 ⇒
 # 朋友那 M 根腿只烘数据不下报（一对多回传缺一半）。这条每 1 分钟跑 report_uplink --once
@@ -96,7 +106,7 @@ $jobs = @(
     @{ Name = $T5; Sc = "DAILY"; St = "15:40"; It = $false;
        Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f `
              $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) },
-    @{ Name = $T7; Sc = "MINUTE"; Mn = 10; St = "09:30"; Et = "15:00"; It = $false;
+    @{ Name = $T7; Sc = "DAILY"; St = "09:30"; Ri = 10; Du = "05:30"; It = $false;
        Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Intraday' -f `
              $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) },
     @{ Name = $T8; Sc = "MINUTE"; Mn = 1; St = "08:50"; Et = "15:40"; It = $false;
@@ -193,8 +203,11 @@ foreach ($j in $jobs) {
     if ($j.Sc -eq "MINUTE") {
         $args1 += @("/MO", $j.Mn)
         if ($j.St) { $args1 += @("/ST", $j.St) }   # 保活腿：08:25 起跑，之后每 10 分钟一轮
-        if ($j.Et) { $args1 += @("/ET", $j.Et) }   # §NEWS-GATE T7：09:30–15:00 盘中窗口
     }
+    # §INTRADAY-TRIGGER-FIX（2026-11-18）：盘中窗口改成「DAILY + 重复窗口」而不是 MINUTE + /ET。
+    # /ET 会把结束边界钉在注册当天，任务次日即不再触发（现网 11-16 装机后从未再跑）。
+    if ($j.Ri) { $args1 += @("/RI", $j.Ri) }
+    if ($j.Du) { $args1 += @("/DU", $j.Du) }
     if ($j.It) { $args1 += "/IT" }   # 交互式：客户端必须有桌面会话
     $args1 += "/F"
     & schtasks @args1 | Out-Null

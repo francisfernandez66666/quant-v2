@@ -21760,8 +21760,14 @@ CNT176=$((CNT176 + 1))
 grep -qF 'out["news_negative"] = True' scripts/pregen_carrier_factors_gz.py \
 	|| fail176 "pregen 未烘带符号 D1 负分标记"
 CNT176=$((CNT176 + 1))
-grep -qF 'SELECT score FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1' scripts/pregen_carrier_factors_gz.py \
-	|| fail176 "pregen 仍读 blocked 列（带符号化后只取 score）"
+grep -qF 'SELECT score, date, level FROM d1_scores WHERE code=?' scripts/pregen_carrier_factors_gz.py \
+	|| fail176 "pregen 的 D1 查询形状变了（§D1-LEVEL 后应带 level；核对是否回退到读 blocked 列）"
+# 负锁：任何 SELECT 行里都不许再出现 blocked 列（旧 Blocked 标记已由 score<0 派生）。
+# 只看 SELECT 行——注释里那句"d1_scores.blocked 列已由引擎派生"是说明，不是读取。
+CNT176=$((CNT176 + 1))
+if grep -n "SELECT" scripts/pregen_carrier_factors_gz.py | grep -q "blocked"; then
+	fail176 "pregen 又在 SELECT 里读 blocked 列（带符号化后该列只由引擎派生）"
+fi
 # —— ⑧ 载体（R3/R9/R10）：分值闸 / 卖出加速 / 加权 ——
 CNT176=$((CNT176 + 1))
 grep -qF '"reason": "d1_negative"' qmt_gateway/qmt_internal_strategy.py \
@@ -21789,11 +21795,22 @@ CNT176=$((CNT176 + 1))
 grep -qF 'QMTF-Carrier-Update-Intraday' deploy/qmt-friend/install_tasks.ps1 \
 	|| fail176 "第七条盘中拉取计划任务缺失"
 CNT176=$((CNT176 + 1))
-grep -qF 'tasks=7' deploy/qmt-friend/install_tasks.ps1 \
-	|| fail176 "计划任务复读自证未升级为 7 条"
+grep -qF 'tasks=8' deploy/qmt-friend/install_tasks.ps1 \
+	|| fail176 "计划任务复读自证未升级为 8 条（T8 回报腿在 11-17 已入册）"
 CNT176=$((CNT176 + 1))
 grep -qF '"{1}" -Intraday' deploy/qmt-friend/install_tasks.ps1 \
 	|| fail176 "carrier_run.ps1 未透传盘中旗标"
+# §INTRADAY-TRIGGER-FIX（2026-11-18 现网实锤）：盘中班次曾用 /SC MINUTE 加"结束时刻"参数注册，
+# 而 schtasks 的那个参数是**结束边界**——会被钉成注册当天 15:00（盒子实测 EndBoundary=2026-11-16T15:00），
+# 次日永不触发，11-18 的 v75 因此躺了一小时没人拉。两条锁：不许回潮结束边界参数；必须走 DAILY+RI+DU。
+CNT176=$((CNT176 + 1))
+if grep -qF '"/ET"' deploy/qmt-friend/install_tasks.ps1; then
+	fail176 "计划任务注册又用结束边界参数（会把窗口钉在注册当天，盘中班次次日即不再触发）"
+fi
+CNT176=$((CNT176 + 1))
+grep -qF '"/RI", $j.Ri' deploy/qmt-friend/install_tasks.ps1 \
+	&& grep -qF '"/DU", $j.Du' deploy/qmt-friend/install_tasks.ps1 \
+	|| fail176 "盘中班次未用 /RI+/DU 表达每日重复窗口（README 的 09:30–15:00 会退化成一次性）"
 # —— ⑩ PARAMS 对账登记（derive 孤儿闸）——
 CNT176=$((CNT176 + 1))
 grep -qF '"news_weight_boost": "carrier-shape' scripts/derive_carrier_params.py \
