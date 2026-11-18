@@ -23475,23 +23475,35 @@ fi
 
 # ⑤ 后缀变体：池里是裸 6 位码，客户端只认 CODE.SH/.SZ/.BJ —— 这是 2026-11-18 的根因假设
 #   （池 1000 只里 52 只带点，批取价正好回 48 只）。变体必须问、且必须打 one_sfx 读数，
-#   否则"裸码取不到价"这件事下次又只能靠猜。
+#   否则"裸码取不到价"这件事下次又只能靠猜。归一函数的细节锁在 §204（这里只判探针在用
+#   **生产同一把尺子**——探针另写一份映射就会量出两种世界）。
 CNT203=$((CNT203 + 1))
-grep -qF 'def _probe_suffixed(symbol):' qmt_gateway/qmt_internal_strategy.py || fail203 "缺 _probe_suffixed（裸码后缀变体）"
-CNT203=$((CNT203 + 1))
-grep -qF 'return text + ".SZ"' qmt_gateway/qmt_internal_strategy.py || fail203 "后缀映射缺 .SZ（0/3 开头走深市）"
+grep -qF 'sfx = _qmt_code(symbol)' qmt_gateway/qmt_internal_strategy.py || fail203 "探针的后缀变体没复用生产 _qmt_code（两把尺子会量出两个世界）"
 CNT203=$((CNT203 + 1))
 grep -qF 'one_sfx=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针行没打 one_sfx（后缀假设没有读数就没有结论）"
 CNT203=$((CNT203 + 1))
 grep -qF 'sfx_tick=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针行没打 sfx_tick（订阅后仍要按后缀再读一次）"
 
-# ⑥ 行为腿：8 例（批次行+sample/单票行/后缀变体/上限4只/每5轮/tick订阅/破客户端不炸/静态负锁）。
+# ⑥ 分钟腿（2026-11-18 12:2x）：本地 1m 仓是空的、这个 build 又没有下载器，但 1m 从来不需要
+#   下载器——客户端自己的 bar 引擎会把已经推过来的 tick 聚合成 1m。带后缀的 "1m" 订阅**从未
+#   跑过**（11-18 把 "tick" 提为主路、"1m" 退成不可达兜底；更早的裸码 "1m" 返回 id 0 是静默
+#   空操作）。没有这几条锁，"下午封板保护 / 做 T 分时腿能不能喂上"这个结论下次又要靠猜。
+CNT203=$((CNT203 + 1))
+grep -qF 'def _probe_subscribe_1m(ContextInfo, symbol):' qmt_gateway/qmt_internal_strategy.py || fail203 "缺 1m 订阅探针（分钟腿的唯一内部来源没有读数）"
+CNT203=$((CNT203 + 1))
+grep -qE '^        sub_1m = _probe_subscribe_1m\(ContextInfo, sfx\)$' qmt_gateway/qmt_internal_strategy.py || fail203 "1m 订阅探针写了没人调（恒空读数）"
+CNT203=$((CNT203 + 1))
+grep -qF 'mde_1m=%d sub1m=%s mde_1m_after=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针行没打 1m 读数（订阅前后各一次才有对照）"
+CNT203=$((CNT203 + 1))
+grep -qF 'mde_1d_sfx=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针没按后缀读日线（本地仓到底答不答，缺这条就没结论）"
+
+# ⑦ 行为腿：9 例（批次行+sample/单票行/后缀变体/1m订阅/上限4只/每5轮/tick订阅/破客户端不炸/静态负锁）。
 PY203=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_price_probe_20261118.py -q 2>&1 || true )
 CNT203=$((CNT203 + 1))
-grep_q '8 passed' PY203 || { echo "--- FAIL: §203 价格探针行为腿未跑满8例：$(printf '%s\n' "$PY203" | tail -6)"; B203_FAILED=1; }
+grep_q '9 passed' PY203 || { echo "--- FAIL: §203 价格探针行为腿未跑满9例：$(printf '%s\n' "$PY203" | tail -6)"; B203_FAILED=1; }
 
 [ "$B203_FAILED" = "0" ] || exit 1
-echo "ok - §203 §20261118-PRICE-PROBE 锁通过（五形态+后缀变体取证线只读 + 每5轮节拍 + run_round 接线 + 资本动作负锁 + 8例行为腿，累计判定点 ${CNT203}）"
+echo "ok - §203 §20261118-PRICE-PROBE 锁通过（五形态+后缀变体+1m订阅取证线只读 + 每5轮节拍 + run_round 接线 + 资本动作负锁 + 9例行为腿，累计判定点 ${CNT203}）"
 echo ""
 
 # §204 §20261118-PRICE-SUFFIX（价格盲真因修复：裸 6 位码 → CODE.SH/.SZ/.BJ）
@@ -23548,9 +23560,10 @@ grep -qF 'dl1(_qmt_code(sym), "1d", "", "")' qmt_gateway/qmt_internal_strategy.p
 # ③ 键必须仍是裸码（负锁：joins 一旦带后缀，pos_view/去重账本/池全对不上）。
 CNT204=$((CNT204 + 1))
 # 同一行在探针的 _probe_subscribe_tick 里也有一份，所以用"恰好两处 + 禁止 done[code]"判。
+# 下界判据（不是等值）：订阅腿会随探针增加，但**每一处**都必须按裸码记账。
 DONE_BARE_COUNT=$(grep -cF 'done[symbol] = _short_id(sub_id)' qmt_gateway/qmt_internal_strategy.py || true)
-if [ "$DONE_BARE_COUNT" != "2" ]; then
-	fail204 "订阅日账本键少/多了一处裸码写法（实际 ${DONE_BARE_COUNT} 处，期望 2）"
+if [ "${DONE_BARE_COUNT:-0}" -lt 2 ]; then
+	fail204 "订阅日账本键的裸码写法少于 2 处（实际 ${DONE_BARE_COUNT} 处：生产腿 + 探针腿各一）"
 fi
 CNT204=$((CNT204 + 1))
 if grep -qF 'done[code] = _short_id' qmt_gateway/qmt_internal_strategy.py; then
@@ -23567,8 +23580,8 @@ CNT204=$((CNT204 + 1))
 grep_q '7 passed' PY204 || { echo "--- FAIL: §204 后缀行为腿未跑满7例：$(printf '%s\n' "$PY204" | tail -6)"; B204_FAILED=1; }
 PY204B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_price_probe_20261118.py -q 2>&1 || true )
 CNT204=$((CNT204 + 1))
-grep_q '8 passed' PY204B || { echo "--- FAIL: §204 探针行为腿未跑满8例：$(printf '%s\n' "$PY204B" | tail -6)"; B204_FAILED=1; }
+grep_q '9 passed' PY204B || { echo "--- FAIL: §204 探针行为腿未跑满9例：$(printf '%s\n' "$PY204B" | tail -6)"; B204_FAILED=1; }
 
 [ "$B204_FAILED" = "0" ] || exit 1
-echo "ok - §204 §20261118-PRICE-SUFFIX 锁通过（归一函数复用 _expect_suffix + 五处边界 + 裸键负锁 + 后缀7例/探针8例，累计判定点 ${CNT204}）"
+echo "ok - §204 §20261118-PRICE-SUFFIX 锁通过（归一函数复用 _expect_suffix + 五处边界 + 裸键负锁 + 后缀7例/探针9例，累计判定点 ${CNT204}）"
 echo ""

@@ -1114,6 +1114,40 @@ def _probe_subscribe_tick(ContextInfo, symbol):
     return str(done[symbol])
 
 
+def _probe_subscribe_1m(ContextInfo, symbol):
+    """Shape 6: subscribe the MINUTE period and let the CLIENT aggregate.
+
+    Live question 2026-11-18 12:2x: the minute legs (afternoon reseal, T intraday)
+    read `get_market_data_ex(..., "1m", ...)`, and the local minute store is
+    empty (the SZ/60 minute shard holds one file). A downloader is absent from
+    this build, but 1m bars do not need one -- the client bar engine aggregates
+    the ticks it already pushes. The suffixed "1m" subscribe has never been
+    exercised (the 11-18 rebuild made "tick" primary and "1m" an unreachable
+    fallback; the pre-11-18 bare-code "1m" call returned id 0, a silent no-op).
+    Returns the short id, or a reason tag. Idempotent per day per symbol.
+    """
+    _whole, per, _api = _subscribe_fns(ContextInfo)
+    if not callable(per):
+        return "api_absent"
+    day = day_key(now_cn())
+    done = _STATE.setdefault("probe_1m", {})
+    if done.get("day") != day:
+        done.clear()
+        done["day"] = day
+    if symbol in done:
+        return str(done[symbol])
+    try:
+        sub_id = per(symbol, "1m", "follow")
+    except Exception:  # noqa: BLE001
+        try:
+            sub_id = per(symbol, "1m")
+        except Exception:  # noqa: BLE001
+            done[symbol] = "err"
+            return "err"
+    done[symbol] = _short_id(sub_id)
+    return str(done[symbol])
+
+
 def _probe_price_channels(ContextInfo, positions):
     """Read-only receipt: which price channel still answers on this client.
 
@@ -1188,10 +1222,33 @@ def _probe_price_channels(ContextInfo, positions):
         else:
             mde_tick = _probe_mde_rows(mde, symbol, "tick", ["close"], 1)
             mde_day = _probe_mde_rows(mde, symbol, "1d", ["close", "volume"], 2)
+        # Shapes 6..7 (2026-11-18 12:2x, MINUTE LEG): can the client aggregate the
+        # 1m bars itself, with no downloader at all? The suffixed "1m" subscribe
+        # has never actually run -- the 11-18 rebuild switched _subscribe_held to
+        # "tick" and left "1m" as an unreachable fallback, while the old bare+1m
+        # call returned id 0 (a silent no-op). Read BEFORE subscribing (so round N
+        # shows the pre-subscription state), subscribe, read again: if a later
+        # round reports mde_1m > 0 the afternoon-reseal and T minute legs can be
+        # fed from inside QMT. mde_1d_sfx is the same question for day bars --
+        # the production read now uses the suffixed code, this proves whether the
+        # local store actually answers it.
+        if callable(mde):
+            mde_day_sfx = _probe_mde_rows(mde, sfx, "1d", ["close", "volume"], 2)
+            mde_1m = _probe_mde_rows(mde, sfx, "1m", ["close"], 5)
+        else:
+            mde_day_sfx = -1
+            mde_1m = -1
+        sub_1m = _probe_subscribe_1m(ContextInfo, sfx)
+        if callable(mde):
+            mde_1m_after = _probe_mde_rows(mde, sfx, "1m", ["close"], 5)
+        else:
+            mde_1m_after = -1
         if one or one_sfx or sub_tick or sfx_tick or mde_tick > 0 or mde_day > 0:
             priced += 1
-        _log("tick_probe sym=%s one=%d one_sfx=%d sub=%s sfx=%s sub_tick=%d sfx_tick=%d mde_tick=%d mde_1d=%d" % (
-            symbol, one, one_sfx, sub, sfx_sub, sub_tick, sfx_tick, mde_tick, mde_day))
+        _log("tick_probe sym=%s one=%d one_sfx=%d sub=%s sfx=%s sub_tick=%d sfx_tick=%d "
+             "mde_tick=%d mde_1d=%d mde_1d_sfx=%d mde_1m=%d sub1m=%s mde_1m_after=%d" % (
+                 symbol, one, one_sfx, sub, sfx_sub, sub_tick, sfx_tick,
+                 mde_tick, mde_day, mde_day_sfx, mde_1m, sub_1m, mde_1m_after))
     _log("tick_probe summary asked=%d priced=%d universe=%d" % (
         len(asked), priced, len(universe)))
 

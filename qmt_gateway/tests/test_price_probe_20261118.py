@@ -103,6 +103,10 @@ class PriceProbe20261118(unittest.TestCase):
         self.mod.PARAMS["symbols"] = list(_UNIVERSE)
         self.mod._STATE["probe_seq"] = 0
         self.mod._STATE.pop("probe_subbed", None)
+        # the 1m ledger is per-day/idempotent: a sibling test that already
+        # subscribed turns the next call into a cache hit, so the assertion
+        # would fail on a correct implementation.
+        self.mod._STATE.pop("probe_1m", None)
 
     # ---- helper: run the probe and capture the lines it printed --------------
     def _probe(self, ctx, positions=None):
@@ -140,7 +144,8 @@ class PriceProbe20261118(unittest.TestCase):
         row = [ln for ln in lines if " sym=%s " % _HELD in ln]
         self.assertEqual(len(row), 1, "each asked symbol gets one line")
         for piece in ("one=1", "one_sfx=", "sub=", "sfx=", "sub_tick=", "sfx_tick=",
-                      "mde_tick=", "mde_1d="):
+                      "mde_tick=", "mde_1d=", "mde_1d_sfx=", "mde_1m=", "sub1m=",
+                      "mde_1m_after="):
             self.assertIn(piece, row[0])
         # the tick subscription is what the evidence pointed at: period must be tick
         self.assertIn((_HELD, "tick"), ctx.quote_calls,
@@ -148,6 +153,23 @@ class PriceProbe20261118(unittest.TestCase):
         # ...and it must ask for the SUFFIXED code too: the pool is bare 6-digit.
         self.assertIn((_HELD + ".SZ", "tick"), ctx.quote_calls,
                       "the probe must also subscribe the CODE.SZ form -- the pool carries bare codes")
+
+    # ---- 2a-bis. the MINUTE leg: subscribe 1m, let the client aggregate -------
+    def test_minute_period_is_subscribed_so_the_client_can_aggregate(self):
+        """2026-11-18: the local 1m store is empty and this build has no
+        downloader, but 1m bars never needed one -- the client aggregates the
+        ticks it pushes. The suffixed "1m" subscribe has never been exercised
+        (11-18 made "tick" primary; the old bare-code "1m" returned id 0). This
+        lock exists so the reading cannot be dropped before the minute legs
+        (afternoon reseal / T) are settled either way.
+        """
+        ctx = _ProbeCtx(ticks={_HELD + ".SZ": _tick()}, batch_ticks={})
+        lines = self._probe(ctx)
+        row = [ln for ln in lines if " sym=%s " % _HELD in ln][0]
+        self.assertIn((_HELD + ".SZ", "1m"), ctx.quote_calls,
+                      "the probe must subscribe the suffixed 1m period")
+        self.assertIn("sub1m=", row)
+        self.assertIn("mde_1m=", row)
 
     # ---- 2b. THE SUSPECT: only the dotted form answers ------------------------
     def test_suffixed_variant_is_the_one_that_answers(self):
