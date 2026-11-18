@@ -835,22 +835,63 @@ def _pullback_limit_price(vwap, last_price):
     return round(min(target, last_price), 2)
 
 
+def _qmt_code(symbol):
+    """Bare 6-digit code -> 'CODE.SH/.SZ/.BJ' for every ContextInfo call.
+
+    LIVE ROOT CAUSE 2026-11-18 (v79 probe receipt on the box): the baked pool is
+    1000 codes and only 52 of them carry a market dot; the batched read returned
+    exactly 48 -- the dotted subset. Measured per symbol:
+        get_full_tick(['000417'])            -> {}      (0 ticks)
+        get_full_tick(['000417.SZ'])         -> 1 tick
+        subscribe_quote('000417', 'tick')    -> 0       (0 is not a real id)
+        subscribe_quote('000417.SZ','tick')  -> 186
+    So 948 of 1000 names were structurally unreachable, the two held positions
+    included: `no_price=770` refused every buy at rule_fillable and
+    `sell_blind held_without_price=2 total_held=2` left all exit legs blind --
+    the whole of "today traded nothing".
+
+    ONLY the string handed to the client is normalised. Every key we join on
+    (pos_view, PARAMS symbols, precalc, dedup sets) stays BARE, so this cannot
+    ripple into the booking logic. `_place` already builds its own suffixed code
+    via _expect_suffix, so the order path is unchanged.
+    """
+    text = str(symbol or "")
+    if not text or "." in text:
+        return text
+    suffix = _expect_suffix(text)
+    if suffix:
+        return "%s.%s" % (text, suffix)
+    # _expect_suffix declines BJ-style heads; a read still needs a code, so map
+    # the two remaining exchange families explicitly rather than silently ask
+    # for a bare code that this client never resolves.
+    head = text[:1]
+    if head in ("4", "8"):
+        return text + ".BJ"
+    return text
+
+
 def _tick_of(ContextInfo, symbol):
     """One snapshot -> the flat dict the rule layer reads, or {} when absent."""
     getter = getattr(ContextInfo, "get_full_tick", None)
     if not callable(getter):
         _warn_once("no_tick", "ContextInfo.get_full_tick unavailable")
         return {}
+    code = _qmt_code(symbol)
     try:
-        raw = getter([symbol])
+        raw = getter([code])
     except Exception as exc:
         _warn_once("tick_fail:%s" % symbol, "get_full_tick failed: %s" % repr(exc)[:120])
         return {}
     if not isinstance(raw, dict):
         return {}
-    entry = raw.get(symbol)
+    # The client echoes the key it was given; accept both shapes so a build that
+    # normalises codes back to bare keys does not silently read as "no price".
+    entry = raw.get(code)
+    if not isinstance(entry, dict):
+        entry = raw.get(symbol)
     if not isinstance(entry, dict):
         return {}
+    # Keep the BARE symbol on the normalised tick: ctx identity stays bare.
     return normalize_tick(symbol, entry)
 
 
@@ -950,12 +991,23 @@ def _subscribe_held(ContextInfo, positions):
             continue
         if symbol in done:
             continue
-        try:
-            sub_id = per(symbol, "1m", "follow")
-            done[symbol] = _short_id(sub_id)
-            n += 1
-        except Exception:  # noqa: BLE001
+        # 2026-11-18: subscribe with the SUFFIXED code and the TICK period --
+        # the probe measured ('000417','tick') -> id 0 (silent no-op) and
+        # ('000417.SZ','tick') -> 186. Bare+1m was the shape that kept every
+        # exit leg blind; the ladder keeps the old shape as a fallback for a
+        # build that rejects "tick".
+        code = _qmt_code(symbol)
+        sub_id = None
+        for shape in ((code, "tick", "follow"), (code, "tick"), (code, "1m", "follow")):
+            try:
+                sub_id = per(*shape)
+            except Exception:  # noqa: BLE001
+                continue
+            break
+        if sub_id is None:
             continue
+        done[symbol] = _short_id(sub_id)
+        n += 1
     if n:
         _log("subscribe_held new=%d held_total=%d" % (n, len(done) - 1))
 
@@ -973,6 +1025,175 @@ def _short_id(sub_id):
     if value < 0:
         return "bad"
     return str(value)
+
+
+# ---- PRICE-PROBE 2026-11-18 (owner: "why did nothing trade today") ----------
+# Live evidence that forced this probe: `round_skips total=859 no_price=770` AND
+# `sell_blind held_without_price=2 total_held=2` -- the carrier could not price a
+# single symbol, not even the two positions it is supposed to exit. The buy lane
+# therefore died at rule_fillable and all three sell legs stood blind, which is
+# the whole of "today placed nothing".
+#
+# Before the price path is touched we need a receipt naming WHICH read shape
+# still answers on this client. Five shapes, all read-only:
+#   1) one BATCHED get_full_tick over the whole pool (the proposed fix)
+#   2) the per-symbol get_full_tick (today's only read)
+#   3) subscribe_quote(symbol, "tick") followed by 2) -- is the subscription
+#      period ("1m" today) the reason nothing arrives?
+#   4) get_market_data_ex(period="tick") -- tick bars instead of snapshots
+#   5) get_market_data_ex(period="1d")  -- is the history leg dead too?
+#
+# A round with the probe on trades exactly what it traded before: the only
+# output is a log line. It never touches _STATE["sent"], the budget, or any
+# trade helper -- and the probe body must never grow a place/cancel call.
+#
+# Every 5th round only: rounds already sit ~45s apart because ~1000 serial
+# per-symbol reads cost ~45ms each; probing every round would add log volume
+# and no information.
+_PROBE_ROUND_EVERY = 5
+
+
+def _probe_hits(raw, symbol):
+    """How many tick entries a snapshot read returned (0 for any odd shape)."""
+    if not isinstance(raw, dict):
+        return 0
+    if symbol:
+        entry = raw.get(symbol)
+        return 1 if isinstance(entry, dict) and bool(entry) else 0
+    hits = 0
+    for key in raw.keys():
+        if isinstance(raw.get(key), dict):
+            hits += 1
+    return hits
+
+
+def _probe_mde_rows(getter, symbol, period, fields, count):
+    """Rows one get_market_data_ex read returned; -1 means the call raised."""
+    try:
+        payload = getter(fields, [symbol], period=period, count=count)
+    except Exception:  # noqa: BLE001 -- a signature this build rejects IS the answer
+        return -1
+    return len(_bars_of(payload, symbol))
+
+
+def _probe_priced_one(ContextInfo, getter, symbol):
+    """Shape 2: the per-symbol snapshot read the round loop uses today."""
+    if not callable(getter):
+        return 0
+    try:
+        return _probe_hits(getter([symbol]), symbol)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _probe_subscribe_tick(ContextInfo, symbol):
+    """Shape 3: subscribe for TICKS (today's held-subscribe asks for "1m").
+
+    Returns the short subscription id, or a reason tag. Idempotent per day per
+    symbol so a probe round never turns into a subscription storm.
+    """
+    _whole, per, _api = _subscribe_fns(ContextInfo)
+    if not callable(per):
+        return "api_absent"
+    day = day_key(now_cn())
+    done = _STATE.setdefault("probe_subbed", {})
+    if done.get("day") != day:
+        done.clear()
+        done["day"] = day
+    if symbol in done:
+        return str(done[symbol])
+    try:
+        sub_id = per(symbol, "tick")
+    except Exception:  # noqa: BLE001
+        try:
+            sub_id = per(symbol, "tick", "follow")
+        except Exception:  # noqa: BLE001
+            done[symbol] = "err"
+            return "err"
+    done[symbol] = _short_id(sub_id)
+    return str(done[symbol])
+
+
+def _probe_price_channels(ContextInfo, positions):
+    """Read-only receipt: which price channel still answers on this client.
+
+    Called once every _PROBE_ROUND_EVERY rounds from run_round. Symbols probed:
+    the held rows first (those are the ones the sell legs must see), then the
+    first pool names, capped at four so the probe can never become the reason a
+    round is slow.
+    """
+    seq = int(_STATE.get("probe_seq") or 0) + 1
+    _STATE["probe_seq"] = seq
+    if (seq - 1) % _PROBE_ROUND_EVERY != 0:
+        return
+    asked = []
+    for symbol in (positions or {}):
+        row = (positions or {}).get(symbol) or {}
+        try:
+            qty = float(row.get("qty", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty > 0.0:
+            asked.append(str(symbol))
+    for symbol in (PARAMS.get("symbols") or []):
+        if len(asked) >= 4:
+            break
+        if str(symbol) not in asked:
+            asked.append(str(symbol))
+    asked = asked[:4]
+    if not asked:
+        _log("tick_probe skipped=no_symbols")
+        return
+    getter = getattr(ContextInfo, "get_full_tick", None)
+    mde = getattr(ContextInfo, "get_market_data_ex", None)
+    universe = [str(s) for s in (PARAMS.get("symbols") or [])]
+    if callable(getter):
+        # Shape 1: ONE batched call over the whole baked pool. The SAMPLE of the
+        # keys that came back is the format receipt: if the hits are exactly the
+        # dotted codes, the pool's bare codes are the bug.
+        try:
+            raw_batch = getter(universe)
+            batch_hits = _probe_hits(raw_batch, None)
+            sample = ""
+            if isinstance(raw_batch, dict):
+                keys = [str(k) for k in raw_batch.keys()]
+                keys.sort()
+                sample = "|".join(keys[:4])
+            _log("tick_probe batch asked=%d got=%d sample=%s" % (
+                len(universe), batch_hits, sample))
+        except Exception as exc:  # noqa: BLE001
+            _log("tick_probe batch raised=%s" % repr(exc)[:80])
+    else:
+        _log("tick_probe batch api=absent")
+    # Shapes 2..5, one line per symbol: read before subscribing, subscribe for
+    # TICKS, read again (does the subscription change the answer?), then the two
+    # bar reads. "-1" means the call shape was rejected, "0" means accepted but
+    # empty -- those are different diagnoses and must not be folded together.
+    priced = 0
+    for symbol in asked:
+        sfx = _qmt_code(symbol)
+        one = _probe_priced_one(ContextInfo, getter, symbol)
+        one_sfx = one if sfx == symbol else _probe_priced_one(ContextInfo, getter, sfx)
+        sub = _probe_subscribe_tick(ContextInfo, symbol)
+        sub_tick = _probe_priced_one(ContextInfo, getter, symbol)
+        if sfx == symbol:
+            sfx_sub = sub
+            sfx_tick = sub_tick
+        else:
+            sfx_sub = _probe_subscribe_tick(ContextInfo, sfx)
+            sfx_tick = _probe_priced_one(ContextInfo, getter, sfx)
+        if not callable(mde):
+            mde_tick = -1
+            mde_day = -1
+        else:
+            mde_tick = _probe_mde_rows(mde, symbol, "tick", ["close"], 1)
+            mde_day = _probe_mde_rows(mde, symbol, "1d", ["close", "volume"], 2)
+        if one or one_sfx or sub_tick or sfx_tick or mde_tick > 0 or mde_day > 0:
+            priced += 1
+        _log("tick_probe sym=%s one=%d one_sfx=%d sub=%s sfx=%s sub_tick=%d sfx_tick=%d mde_tick=%d mde_1d=%d" % (
+            symbol, one, one_sfx, sub, sfx_sub, sub_tick, sfx_tick, mde_tick, mde_day))
+    _log("tick_probe summary asked=%d priced=%d universe=%d" % (
+        len(asked), priced, len(universe)))
 
 
 def _download_day_bars(ContextInfo):
@@ -1011,7 +1232,7 @@ def _download_day_bars(ContextInfo):
         except Exception:
             _log("day_bars_download callback fired")
     try:
-        dl(symbols, "1d", "", "", _cb)
+        dl([_qmt_code(s) for s in symbols], "1d", "", "", _cb)
         _log("day_bars_download kicked symbols=%d period=1d" % len(symbols))
     except Exception as exc:
         _log("WARN download_history_data2 failed: %s" % repr(exc)[:120])
@@ -1037,7 +1258,7 @@ def _pump_legacy_downloads(ContextInfo):
     ok = 0
     for sym in batch:
         try:
-            dl1(sym, "1d", "", "")
+            dl1(_qmt_code(sym), "1d", "", "")
             ok += 1
         except Exception as exc:  # noqa: BLE001
             _warn_once("dl1_fail", "legacy day-bar download failed: %s" % repr(exc)[:100])
@@ -1192,10 +1413,10 @@ def _minute_bars_payload(ContextInfo, symbol, count):
     if not callable(getter):
         return None
     try:
-        payload = getter([], [symbol], "1m", "", "", int(count), "front")
+        payload = getter([], [_qmt_code(symbol)], "1m", "", "", int(count), "front")
     except Exception:  # noqa: BLE001 - no minute data is a valid outcome
         return None
-    return payload if isinstance(payload, dict) else None
+    return _rekey_payload(payload, symbol) if isinstance(payload, dict) else None
 
 
 def _instrument_up_stop(ContextInfo, symbol):
@@ -1208,7 +1429,7 @@ def _instrument_up_stop(ContextInfo, symbol):
     if not callable(getter):
         return None
     try:
-        detail = getter(symbol)
+        detail = getter(_qmt_code(symbol))
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(detail, dict):
@@ -1357,12 +1578,13 @@ def _hist_bars(ContextInfo, symbol):
     fields = ["close", "volume", "high", "low", "open", "amount"]
     period = PARAMS.get("ma_period", "1d")
     count = int(PARAMS.get("bars_count", 80))
+    code = _qmt_code(symbol)
     try:
-        return getter(fields, [symbol], period=period, count=count)
+        return _rekey_payload(getter(fields, [code], period=period, count=count), symbol)
     except Exception:
         pass
     try:
-        return getter(fields, [symbol], period, "", "", count, True, True)
+        return _rekey_payload(getter(fields, [code], period, "", "", count, True, True), symbol)
     except Exception:
         return None
 
@@ -1413,6 +1635,29 @@ def _ref_and_volume(ContextInfo, symbol, tick):
     _warn_once("hist_unavailable",
                "no history series from this build: no precalc for this symbol, ref=prev_close fallback, volume ratio abstains")
     return prev_close, None
+
+
+def _rekey_payload(payload, symbol):
+    """Re-key a one-symbol market-data payload back to the BARE symbol.
+
+    Reads now ask the client with 'CODE.SZ' (the only shape it resolves, see
+    _qmt_code), but every downstream reader looks the payload up by the bare
+    code we join on. Without this re-key the series reader falls back to the
+    outer dict, finds no columns, and reports "no history" -- the same blindness
+    relocated. Returns the payload untouched when the key is already bare.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    code = _qmt_code(symbol)
+    if code == symbol or code not in payload:
+        return payload
+    moved = {}
+    for key in payload.keys():
+        if key == code:
+            moved[symbol] = payload.get(key)
+        else:
+            moved[key] = payload.get(key)
+    return moved
 
 
 def _series(payload, field, symbol):
@@ -2071,6 +2316,10 @@ def run_round(ContextInfo, moment):
     # and T legs actually get last_price. A no-op when whole-market already covers it.
     if positions:
         _subscribe_held(ContextInfo, positions)
+    # PRICE-PROBE 2026-11-18: read-only receipt for "why did nothing trade".
+    # Runs after the position read (held rows first) and before any sizing, so
+    # the line lands even on a round that goes on to refuse every signal.
+    _probe_price_channels(ContextInfo, positions)
     cash_raw = _cash()
     total = _account_total_asset()
     # 2026-11-13: open BUY orders reserve cash BEFORE the next order is sized

@@ -23423,3 +23423,152 @@ grep_q '27 passed' PY202B || { echo "--- FAIL: §202 micro bands/consec 行为�
 [ "$B202_FAILED" = "0" ] || exit 1
 echo "ok - §202 §20261117-REVIEW-CLOSEOUT 锁通过（consec_boards烘/透传/契约+负锁 + 3band+反seal_strength + P1-2 + 6+9例行为腿，累计判定点 ${CNT202}）"
 echo ""
+
+# §203 §20261118-PRICE-PROBE（价格盲取证线，owner 2026-11-18「顺便查一下为什么没有买卖」）
+# 史料：round_skips total=859 no_price=770 + sell_blind held_without_price=2 total_held=2
+# ⇒ 载体一只票都取不到价，买入死在 rule_fillable、三条卖出腿全盲。本批只加"哪条取价通道
+#   还活着"的只读取证线（批取价/单票/ tick 订阅/ tick bar/ 日线 bar 五形态 + 每 5 轮一次），
+#   改价路径必须等这条线的读数。负锁：探针体里永远不许长出下单/撤单/预算动作。
+echo "==> 203 §20261118-PRICE-PROBE（价格盲取证线只读 + 有界）..."
+B203_FAILED=0
+fail203() {
+	echo "--- FAIL: §203 $*"
+	FAIL=1
+	B203_FAILED=1
+}
+CNT203=0
+
+# ① 只读探针在位：限量常量 + 每 5 轮的节拍判据。
+CNT203=$((CNT203 + 1))
+grep -qF '_PROBE_ROUND_EVERY = 5' qmt_gateway/qmt_internal_strategy.py || fail203 "缺探针节拍常量（每轮探会把日志埋掉）"
+CNT203=$((CNT203 + 1))
+grep -qF 'if (seq - 1) % _PROBE_ROUND_EVERY != 0:' qmt_gateway/qmt_internal_strategy.py || fail203 "探针未按 _PROBE_ROUND_EVERY 节拍（改回每轮=噪音）"
+
+# ② 五形态都在：批取价 / 单票 / tick 订阅 / tick bar / 日线 bar。
+CNT203=$((CNT203 + 1))
+grep -qF 'raw_batch = getter(universe)' qmt_gateway/qmt_internal_strategy.py || fail203 "缺整池批取价（本轮唯一可能真正修好价格盲的形态）"
+CNT203=$((CNT203 + 1))
+grep -qF 'per(symbol, "tick")' qmt_gateway/qmt_internal_strategy.py || fail203 "订阅探针未按 tick 周期（_subscribe_held 用的是 1m，正是要验证的疑点）"
+CNT203=$((CNT203 + 1))
+grep -qF '_probe_mde_rows(mde, symbol, "tick", ["close"], 1)' qmt_gateway/qmt_internal_strategy.py || fail203 "缺 tick bar 形态（订阅无效时的唯一替代取价路）"
+CNT203=$((CNT203 + 1))
+grep -qF '_probe_mde_rows(mde, symbol, "1d", ["close", "volume"], 2)' qmt_gateway/qmt_internal_strategy.py || fail203 "缺日线形态（bars_coverage=0 是否同一病根）"
+
+# ③ 接线：run_round 必须在持仓读之后、算钱之前调它（读数为 0 也要留痕）。
+CNT203=$((CNT203 + 1))
+# 锚必须落在"调用点"上：`def _probe_price_channels(ContextInfo, positions):` 也带同一串，
+# 按裸串判会让"删掉调用、只留定义"照样绿（2026-11-18 塞雷实测过这一刀）。
+grep -qE '^    _probe_price_channels\(ContextInfo, positions\)$' qmt_gateway/qmt_internal_strategy.py || fail203 "探针未接进 run_round（写了没人调＝恒空读数）"
+
+# ④ 负锁：探针体里不许出现下单/撤单/预算动作（只读取证线不许有资本动作）。
+CNT203=$((CNT203 + 1))
+PROBE_BODY=$(awk '/^_PROBE_ROUND_EVERY = /{f=1} /^def _download_day_bars\(/{f=0} f' qmt_gateway/qmt_internal_strategy.py || true)
+if [ -z "$PROBE_BODY" ]; then
+	fail203 "探针区段取不到（锚串漂了，这条锁今天没有牙）"
+else
+	for _banned203 in 'passorder' '_place(' 'cancel(' '_STATE["sent"]' 'buy_intents' 'buy_amounts'; do
+		if printf '%s\n' "$PROBE_BODY" | grep -qF "$_banned203"; then
+			fail203 "探针体长出资本动作：${_banned203}（只读取证线不许下单/撤单/占预算）"
+		fi
+	done
+fi
+
+# ⑤ 后缀变体：池里是裸 6 位码，客户端只认 CODE.SH/.SZ/.BJ —— 这是 2026-11-18 的根因假设
+#   （池 1000 只里 52 只带点，批取价正好回 48 只）。变体必须问、且必须打 one_sfx 读数，
+#   否则"裸码取不到价"这件事下次又只能靠猜。
+CNT203=$((CNT203 + 1))
+grep -qF 'def _probe_suffixed(symbol):' qmt_gateway/qmt_internal_strategy.py || fail203 "缺 _probe_suffixed（裸码后缀变体）"
+CNT203=$((CNT203 + 1))
+grep -qF 'return text + ".SZ"' qmt_gateway/qmt_internal_strategy.py || fail203 "后缀映射缺 .SZ（0/3 开头走深市）"
+CNT203=$((CNT203 + 1))
+grep -qF 'one_sfx=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针行没打 one_sfx（后缀假设没有读数就没有结论）"
+CNT203=$((CNT203 + 1))
+grep -qF 'sfx_tick=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针行没打 sfx_tick（订阅后仍要按后缀再读一次）"
+
+# ⑥ 行为腿：8 例（批次行+sample/单票行/后缀变体/上限4只/每5轮/tick订阅/破客户端不炸/静态负锁）。
+PY203=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_price_probe_20261118.py -q 2>&1 || true )
+CNT203=$((CNT203 + 1))
+grep_q '8 passed' PY203 || { echo "--- FAIL: §203 价格探针行为腿未跑满8例：$(printf '%s\n' "$PY203" | tail -6)"; B203_FAILED=1; }
+
+[ "$B203_FAILED" = "0" ] || exit 1
+echo "ok - §203 §20261118-PRICE-PROBE 锁通过（五形态+后缀变体取证线只读 + 每5轮节拍 + run_round 接线 + 资本动作负锁 + 8例行为腿，累计判定点 ${CNT203}）"
+echo ""
+
+# §204 §20261118-PRICE-SUFFIX（价格盲真因修复：裸 6 位码 → CODE.SH/.SZ/.BJ）
+# 证据（v79 探针在盒子上的逐字读数）：
+#   tick_probe batch asked=1000 got=48 sample=000417.SZ|000520.SZ|...
+#   tick_probe sym=000417 one=0 one_sfx=1 sub=0 sfx=186 sub_tick=0 sfx_tick=1
+#   tick_probe summary asked=4 priced=4
+# ⇒ 池 1000 只里 948 只是裸码（带点的 52 只），客户端只认带后缀的；两只持仓也是裸码
+#   ⇒ 卖出三条腿全盲（held_without_price=2）、买入 770 条死在 rule_fillable。
+# 修法边界：只归一"喂给客户端的字符串"，所有 join 键（pos_view/PARAMS/去重账本）保持裸码；
+#   passorder 的代码本来就由 _expect_suffix 自己拼，钱路径不变。
+echo "==> 204 §20261118-PRICE-SUFFIX（裸码→带后缀：取价/订阅/历史/下载五处边界归一）..."
+B204_FAILED=0
+fail204() {
+	echo "--- FAIL: §204 $*"
+	FAIL=1
+	B204_FAILED=1
+}
+CNT204=0
+
+# ① 归一函数在位，且复用 _expect_suffix 的沪/深判据（不许第二套市场规则）。
+CNT204=$((CNT204 + 1))
+grep -qF 'def _qmt_code(symbol):' qmt_gateway/qmt_internal_strategy.py || fail204 "缺 _qmt_code（裸码后缀归一）"
+CNT204=$((CNT204 + 1))
+grep -qF 'suffix = _expect_suffix(text)' qmt_gateway/qmt_internal_strategy.py || fail204 "_qmt_code 未复用 _expect_suffix（第二套市场规则会漂移）"
+CNT204=$((CNT204 + 1))
+grep -qF 'return text + ".BJ"' qmt_gateway/qmt_internal_strategy.py || fail204 "_qmt_code 缺北交所映射"
+
+# ② 五个边界都归一：取价 / 订阅 / 日线 / 1m / 合约详情。
+CNT204=$((CNT204 + 1))
+grep -qF 'raw = getter([code])' qmt_gateway/qmt_internal_strategy.py || fail204 "_tick_of 未按后缀取价（本轮的核心修复）"
+CNT204=$((CNT204 + 1))
+# 负锁：取价不许退回裸码（2026-11-18 之前的形态，必须永远回不去）。
+if grep -qF 'raw = getter([symbol])' qmt_gateway/qmt_internal_strategy.py; then
+	fail204 "_tick_of 退回裸码取价（948/1000 只又全盲）"
+fi
+CNT204=$((CNT204 + 1))
+# 锚必须唯一：`code = _qmt_code(symbol)` 在 _tick_of/_rekey_payload 里也有，按裸串判
+# 会让"订阅退回裸码"照样绿（2026-11-18 塞雷第二次踩到同一形状）。
+grep -qF 'for shape in ((code, "tick", "follow"), (code, "tick"), (code, "1m", "follow")):' qmt_gateway/qmt_internal_strategy.py || fail204 "_subscribe_held 未按后缀订阅"
+CNT204=$((CNT204 + 1))
+grep -qF '(code, "tick", "follow")' qmt_gateway/qmt_internal_strategy.py || fail204 "订阅未按 tick 周期（探针实测 sfx=186 才拿得到价）"
+CNT204=$((CNT204 + 1))
+grep -qF 'getter(fields, [code], period=period, count=count)' qmt_gateway/qmt_internal_strategy.py || fail204 "_hist_bars 未按后缀读日线"
+CNT204=$((CNT204 + 1))
+grep -qF 'getter([], [_qmt_code(symbol)], "1m", "", "", int(count), "front")' qmt_gateway/qmt_internal_strategy.py || fail204 "_minute_bars_payload 未按后缀读 1m"
+CNT204=$((CNT204 + 1))
+grep -qF 'detail = getter(_qmt_code(symbol))' qmt_gateway/qmt_internal_strategy.py || fail204 "_instrument_up_stop 未按后缀读合约详情"
+CNT204=$((CNT204 + 1))
+grep -qF 'dl([_qmt_code(s) for s in symbols], "1d", "", "", _cb)' qmt_gateway/qmt_internal_strategy.py || fail204 "批量日线下载未按后缀（bars_coverage=0 同族）"
+CNT204=$((CNT204 + 1))
+grep -qF 'dl1(_qmt_code(sym), "1d", "", "")' qmt_gateway/qmt_internal_strategy.py || fail204 "逐票日线下载未按后缀"
+
+# ③ 键必须仍是裸码（负锁：joins 一旦带后缀，pos_view/去重账本/池全对不上）。
+CNT204=$((CNT204 + 1))
+# 同一行在探针的 _probe_subscribe_tick 里也有一份，所以用"恰好两处 + 禁止 done[code]"判。
+DONE_BARE_COUNT=$(grep -cF 'done[symbol] = _short_id(sub_id)' qmt_gateway/qmt_internal_strategy.py || true)
+if [ "$DONE_BARE_COUNT" != "2" ]; then
+	fail204 "订阅日账本键少/多了一处裸码写法（实际 ${DONE_BARE_COUNT} 处，期望 2）"
+fi
+CNT204=$((CNT204 + 1))
+if grep -qF 'done[code] = _short_id' qmt_gateway/qmt_internal_strategy.py; then
+	fail204 "订阅日账本键被改成带后缀（pos_view/去重全对不上）"
+fi
+CNT204=$((CNT204 + 1))
+grep -qF 'return normalize_tick(symbol, entry)' qmt_gateway/qmt_internal_strategy.py || fail204 "tick 身份键必须仍是裸码"
+CNT204=$((CNT204 + 1))
+grep -qF 'def _rekey_payload(payload, symbol):' qmt_gateway/qmt_internal_strategy.py || fail204 "缺 _rekey_payload（历史 payload 键回不到裸码＝读成空）"
+
+# ④ 行为腿：后缀 7 例 + 探针 8 例（两条腿一起跑，改坏任一侧都红）。
+PY204=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_price_code_suffix_20261118.py -q 2>&1 || true )
+CNT204=$((CNT204 + 1))
+grep_q '7 passed' PY204 || { echo "--- FAIL: §204 后缀行为腿未跑满7例：$(printf '%s\n' "$PY204" | tail -6)"; B204_FAILED=1; }
+PY204B=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_price_probe_20261118.py -q 2>&1 || true )
+CNT204=$((CNT204 + 1))
+grep_q '8 passed' PY204B || { echo "--- FAIL: §204 探针行为腿未跑满8例：$(printf '%s\n' "$PY204B" | tail -6)"; B204_FAILED=1; }
+
+[ "$B204_FAILED" = "0" ] || exit 1
+echo "ok - §204 §20261118-PRICE-SUFFIX 锁通过（归一函数复用 _expect_suffix + 五处边界 + 裸键负锁 + 后缀7例/探针8例，累计判定点 ${CNT204}）"
+echo ""
