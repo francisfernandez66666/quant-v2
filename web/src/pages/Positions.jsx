@@ -1169,6 +1169,7 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
           await api.adjustManualBook({ op: 'new', ts_code: row.ts_code, qty: row.qty, price: row.price })
           ok.push(row)
         } catch (e) {
+          // §P2-J 可吞：逐笔失败收进 failed[]，循环后由 setManualBatchResult 统一渲染到结果面板（非静默吞错）
           failed.push({ line: row.line, ts_code: row.ts_code, reason: (e && e.message) || '请求失败' })
         }
       }
