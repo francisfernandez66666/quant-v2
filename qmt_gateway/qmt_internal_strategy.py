@@ -2448,7 +2448,15 @@ def sizing_cap(ctx, positions, intent="new", pending_buys=None):
         hard = [v for k, v in caps.items() if k != "per_trade" and v is not None]
         allow = min(hard) if hard else amount
         if allow < floor:
-            return None, "sizing_amount_unavailable", ""
+            # 2026-11-19 DIAG (owner asked "why is v114 still placing nothing"):
+            # the old label here was "sizing_amount_unavailable", which ALSO covers
+            # "every cap unreadable" -- an operator reading the skip histogram
+            # concluded "the amount could not be computed" while in fact every cap
+            # was readable and the binding one was target_room (live box 13:2x:
+            # target_room=138..330 vs floor=10000, 662/670 buys refused per round,
+            # because holdings sat at the 50% blind cap and the room left was ~200).
+            # Name the real gate; keep fail-closed semantics byte-for-byte identical.
+            return None, "hard_cap_below_floor", "min_hard=%.0f<floor=%.0f" % (allow, floor)
         return floor, "", "floor_topup:%.2f" % allow
     binding = sorted([k for k, v in caps.items() if v is not None],
                      key=lambda k: caps[k])[:1]

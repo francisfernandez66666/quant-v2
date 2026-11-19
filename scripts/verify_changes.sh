@@ -24280,6 +24280,16 @@ grep -qF 'return floor, "", "floor_topup:%.2f" % allow' qmt_gateway/qmt_internal
 # ④ 整手截断不许把补足后的额度又打回 1 万以下（10000/6.81 整手=9534）。
 CNT213=$((CNT213 + 1))
 grep -qF 'def _floor_topup_qty(floor, price, lot, ceiling):' qmt_gateway/qmt_internal_strategy.py || fail213 "整手补足助手缺失（补足后仍会按整手截断回 9534）"
+# ④b 诊断分流（2026-11-19 owner 问「v114 为啥还没委托」逼出来的）：两个 reason 不许再折回一句。
+# 现网 13:2x 实况：target_room=138..330（持仓已顶到 50% 盲区帽）、662/670 笔被拒，
+# 而日志写的是 sizing_amount_unavailable —— 读的人会去查"额度算不出"，方向全错。
+CNT213=$((CNT213 + 1))
+grep -qF 'return None, "hard_cap_below_floor", "min_hard=%.0f<floor=%.0f"' qmt_gateway/qmt_internal_strategy.py \
+	|| fail213 "「硬帽低于 1 万底线」没有独立 reason（又和「额度算不出」折回一句）"
+grep -qF 'return None, "sizing_amount_unavailable", ""' qmt_gateway/qmt_internal_strategy.py \
+	|| fail213 "「一顶帽子都读不到」的 reason 丢了（那个分支才是真的算不出）"
+grep -qF 'test_no_readable_cap_still_reports_amount_unavailable' qmt_gateway/tests/test_internal_strategy_sandbox.py \
+	|| fail213 "缺负锁用例（两个 reason 分开后必须有一条断言「算不出」还是老标签）"
 # ⑤ 在途买单占用预算：侧别从柜台行读，读不到时按"我方短码"兜底，卖出永不占预算。
 CNT213=$((CNT213 + 1))
 grep -qF 'def _order_side(item, op_buy=23, op_sell=24):' qmt_gateway/qmt_internal_strategy.py || fail213 "在途单侧别判据缺失（卖出单会被当成买单占预算）"
@@ -24318,7 +24328,7 @@ if grep_q 'failed' PY213; then
 fi
 
 [ "$B213_FAILED" = "0" ] || exit 1
-echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 在途占预算 + m_strRemark 首读 + 前缀负锁 + 字段族（m_nVolumeTraded/m_dOrderPrice），累计判定点 ${CNT213}）"
+echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 拒绝原因分流（hard_cap_below_floor / sizing_amount_unavailable）+ 在途占预算 + m_strRemark 首读 + 前缀负锁 + 字段族（m_nVolumeTraded/m_dOrderPrice），累计判定点 ${CNT213}）"
 echo ""
 
 # ---------------------------------------------------------------------------

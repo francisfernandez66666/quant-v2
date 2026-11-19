@@ -448,7 +448,10 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         amount2, reason2, _ = self.mod.sizing_cap(
             {"available_cash": 5000.0, "daily_buy_total": 0.0}, {})
         self.assertIsNone(amount2)
-        self.assertEqual(reason2, "sizing_amount_unavailable")
+        # 2026-11-19：这条分支的标签从 sizing_amount_unavailable 改成
+        # hard_cap_below_floor —— 后者才说清"读得到帽、但最紧那顶低于 1 万底线"。
+        # 现网 13:2x 实况：target_room=138..330、662/670 笔被拒，日志却写着"额度算不出"。
+        self.assertEqual(reason2, "hard_cap_below_floor")
 
     def test_run_round_calls_the_sizing_cap_on_every_buy(self):
         """调用点锁：run_round 的买入分支必须真的经过 sizing_cap。
@@ -523,6 +526,28 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
                                "per_trade_position_max_pct": 0.05,
                                "max_total_position_pct": 1.0})
             amount, reason, _note = mod.sizing_cap(self._sizing_ctx(cash=4000.0), {})
+            self.assertIsNone(amount)
+            # 现金 4000 < 1 万底线：这是"最紧的硬帽低于底线"，不是"额度算不出"。
+            self.assertEqual(reason, "hard_cap_below_floor")
+            self.assertIn("floor", _note)
+        finally:
+            mod._account_total_asset = saved
+
+    def test_no_readable_cap_still_reports_amount_unavailable(self):
+        """负锁：一顶帽子都读不到时，reason 必须仍是 sizing_amount_unavailable。
+
+        两个 reason 现在分开了，这条用例是防止有人把"算不出"和"低于底线"又折回一句：
+        折回去的代价是排障时按错方向查（现网 13:2x 就是这么被误导的）。
+        """
+        mod = self.mod
+        saved = mod._account_total_asset
+        mod._account_total_asset = lambda: None
+        try:
+            mod.PARAMS.update({"sizing_enabled": True, "min_order_amount": 10000.0})
+            # 显式置 None 而不是删键：载体对"键缺失"是 fail-closed 的 KeyError
+            # （sizing_param_missing），删键测到的是参数闸，不是"帽子读不到"这条分支。
+            mod.PARAMS["order_amount_cap"] = None
+            amount, reason, _note = mod.sizing_cap({}, {})
             self.assertIsNone(amount)
             self.assertEqual(reason, "sizing_amount_unavailable")
         finally:
