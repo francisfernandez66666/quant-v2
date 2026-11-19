@@ -341,7 +341,12 @@ FORBIDDEN_BUILTINS = {
 FSTRING_RE = re.compile(r"""\bf["']""")
 
 # G4 -- the version constant and the remark builder that must carry it.
-VERSION_RE = re.compile(r"^v\d{2}-\d{8}$")
+# 2026-11-19: 位数放宽到 2–3 位。`carrier_hot_reload_gz.py` 每次烘焙把版本 +1，
+# 从 v99 越过三位后这里原来只认 `\d{2}` ⇒ 烘焙一律 `params_invalid:
+# strategy_version_missing_or_bad`，而热更新链**先写版本再烘焙**，于是每轮又 +1、
+# 又失败（今天 09:0x 起连续失败并涨到 v103），盒子再也收不到新载体。
+# 版本号在载体里是自证用的不透明字符串（备注只放 short code），没有两位数的契约。
+VERSION_RE = re.compile(r"^v\d{2,3}-\d{8}$")
 VERSION_CONST = "STRATEGY_VERSION"
 REMARK_BUILDER = "build_remark"
 

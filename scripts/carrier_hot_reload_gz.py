@@ -766,7 +766,15 @@ def main():
     arts = [f for f in os.listdir(out_dir) if f.startswith("qmt_internal_strategy_")]
     if not arts:
         die("artifact_missing")
-    art_path = os.path.join(out_dir, sorted(arts)[-1])
+    # §PUBLISH-EXACT-20261119：必须按**本次版本名**取产物，绝不按字典序兜底。
+    # 现场：v99 之后版本涨到 v104，`sorted(arts)[-1]` 因为 '9' > '1' 又拿回 v99，
+    # 于是 "PUBLISHED version=v104" 落下的字节其实是旧的 buggy v99（sha 与 v99 逐字节相同），
+    # 盒子就算拉到也还是坏的那份——11-12 只修了「版本名不撞车」，取文件这一半没修。
+    # English: pick THIS round's version by exact filename; lexical sort silently republishes
+    # the older buggy artifact once the counter crosses v99 -> v100.
+    art_path = os.path.join(out_dir, "qmt_internal_strategy_%s.py" % ver)
+    if not os.path.exists(art_path):
+        die("artifact_version_not_baked version=%s" % ver)
     sha_art = hashlib.sha256(open(art_path, "rb").read()).hexdigest()
 
     # 5) 本地发布：产物 + manifest（与 publish_carrier.sh 的三值同源语义一致）

@@ -504,7 +504,8 @@ class TestArtifactShape(BuilderFixture):
         self.assertIn("params", doc)
         self.assertTrue(doc["params"])
         self.assertIn("strategy_version", doc)
-        self.assertTrue(re.match(r"^v\d{2}-\d{8}$", doc["strategy_version"]))
+        # 2–3 位：热更新链的版本自增会越过 v99（见 build_local_executor.VERSION_RE 头注）。
+        self.assertTrue(re.match(r"^v\d{2,3}-\d{8}$", doc["strategy_version"]))
         self.assertEqual(doc["params"], self.params)
         self.assertEqual(doc["strategy_version"], self.version)
 

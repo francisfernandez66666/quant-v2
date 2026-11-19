@@ -24100,3 +24100,33 @@ grep_q '^ok' GT211 || { echo "--- FAIL: §211 接管判据行为腿红：$(print
 [ "$B211_FAILED" = "0" ] || exit 1
 echo "ok - §211 §MANUAL-TAKEOVER 锁通过（接管判据 + 裸兜底负锁 + 两个读面单点 + 行为腿，累计判定点 ${CNT211}）"
 echo ""
+
+# ---------------------------------------------------------------------------
+# §212 §PUBLISH-EXACT（2026-11-19）：载体发布必须按「本次版本名」取产物。
+# 事故：v99 之后版本涨到 v104，发布腿仍用 `sorted(arts)[-1]`（字典序 '9' > '1'），
+# 落下的文件字节其实是旧的 buggy v99 —— 日志却打 `PUBLISHED version=v104`，
+# 且 manifest 的 sha 与 v99 逐字节相同（这正是能一眼看穿的地方）。
+# 11-12 只修了「版本名不撞车」，**取文件**这一半没修。
+echo "==> 212 §20261119-PUBLISH-EXACT（载体发布按本次版本名取产物：v99 之后不再错发旧件）..."
+B212_FAILED=0
+fail212() {
+	echo "--- FAIL: §212 $*"
+	FAIL=1
+	B212_FAILED=1
+}
+CNT212=0
+
+# ① 正锁：按本次版本名精确取产物，缺失就 die。
+CNT212=$((CNT212 + 1))
+grep -qF 'art_path = os.path.join(out_dir, "qmt_internal_strategy_%s.py" % ver)' scripts/carrier_hot_reload_gz.py || fail212 "发布腿未按本次版本名取产物"
+CNT212=$((CNT212 + 1))
+grep -qF 'die("artifact_version_not_baked version=%s" % ver)' scripts/carrier_hot_reload_gz.py || fail212 "缺「本次版本产物不存在」的响亮失败（会退回静默发布旧件）"
+# ② 负锁：字典序兜底不许回潮（按**代码行**判：注释里提到这个形状不算回潮）。
+CNT212=$((CNT212 + 1))
+if grep -qE '^[[:space:]]*art_path = .*sorted\(arts\)' scripts/carrier_hot_reload_gz.py; then
+	fail212 "sorted(arts)[-1] 回潮（v99 之后会再发布旧产物）"
+fi
+
+[ "$B212_FAILED" = "0" ] || exit 1
+echo "ok - §212 §PUBLISH-EXACT 锁通过（按版本名取件 + 缺失响亮失败 + 字典序负锁，累计判定点 ${CNT212}）"
+echo ""
