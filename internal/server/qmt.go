@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1138,8 +1139,14 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		orderSignalID := ev.SignalID
+		// §REPORT-STAMP（2026-11-19）：占位键必须带当日，因为**柜台委托号按会话递增、跨日会复用**
+		// （现网：11-04 那天的 ext:1703…3673 与 11-19 的 ext:1253/1285 同一号段）。orders 的
+		// UNIQUE(user_id, signal_id) 让"昨天那笔 ext:1253"吃掉"今天这笔 ext:1253"——状态秩守卫
+		// 只推进旧行，今天的委托连一行都不存在（漏账方向）。日期进键后同号不同日各成一行，
+		// 而所有消费方判的都是 `HasPrefix("ext:")`，前缀语义不变。
+		orderCreated := reportStampFromParts(ev.CreatedAt, ev.At)
 		if orderSignalID == "" {
-			orderSignalID = "ext:" + ev.OrderID // §F5 手工单占位信号键
+			orderSignalID = "ext:" + reportDayKey(orderCreated) + ":" + ev.OrderID // §F5 手工单占位信号键
 			log.Printf("[trading] §F5 order 回报缺 signal_id，以占位键 %s 落最小状态行(code=%s status=%s)",
 				orderSignalID, ev.Code, ev.Status)
 		}
@@ -1152,12 +1159,22 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			// 补插"是两步独立写，崩溃/并发插队会整体丢掉这条回报；现合并为单事务
 			// ApplyOrderReportTx（推进/补插/幂等 no-op 三选一，判定共享同一事务快照）。
 			// English: §A4 — advance-then-insert-if-absent folded into one atomic transaction call.
-			created := ev.CreatedAt // §M4 优先网关的委托创建时间
-			if created == "" {
-				created = ev.At // 缺省退回回报时刻（旧口径）
+			// §REPORT-STAMP（2026-11-19）：柜台导出只有时分秒，orderCreated 已补成完整北京时间戳；
+			// 否则 day-keyed 读面（当日委托/日报花费/收盘对账）整天读不到这一行。
+			created := orderCreated
+			// §REPORT-STAMP（2026-11-19）：委托号跨日复用 + orders 主键是 order_id + 插入是
+			// INSERT OR IGNORE ⇒ 同号的"今天这笔"会被昨天那行静默吃掉。命中冲突时给新一天的
+			// 行换 `<号>@<yyyymmdd>`（仍可读、仍带原始委托号），并留一条日志供人工对账。
+			orderKey := ev.OrderID
+			orderDay := orderCreated[:10] // orderCreated 恒为 "YYYY-MM-DD HH:MM:SS"
+			if prevDay, ok, qerr := db.OrderDayByID(ev.OrderID); qerr == nil && ok &&
+				prevDay != "" && prevDay != orderDay {
+				orderKey = ev.OrderID + "@" + reportDayKey(orderCreated)
+				log.Printf("[trading] §REPORT-STAMP 委托号跨日复用：%s 已属 %s，今日行改用键 %s(code=%s status=%s)",
+					ev.OrderID, prevDay, orderKey, ev.Code, ev.Status)
 			}
 			action, err := db.ApplyOrderReportTx(store.RealOrder{
-				OrderID: ev.OrderID, SignalID: orderSignalID, Code: ev.Code,
+				OrderID: orderKey, SignalID: orderSignalID, Code: ev.Code,
 				Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
 				CreatedAt: created,
 				UserID:    uid, // §W2-10 委托行打归属账号
@@ -1235,15 +1252,19 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 反解短码补 `buy:<码>:<战法>:<日>`（仅买入腿；卖出的退出归因按持仓入场战法，
 		// 与 qmtStrategyOf 注释同一语义）。导出原文不改，只在落库前补归因。
 		fillSignalID := ev.SignalID
+		// §REPORT-STAMP（2026-11-19）：成交导出的 traded_at 同样只有时分秒（现网 fills 表 45 行
+		// 形如 `10:01:51`）。它不只是显示问题：日报盈亏、当日成交读面、`tradeDayOfTradedAt`
+		// 反解战法归因的日期全部吃这个前缀 ⇒ 当日成交整天读不到。先归一，再落库与归因。
+		tradedAt := reportStampFromParts(ev.TradedAt, ev.At)
 		if fillSignalID == "" && strings.TrimSpace(ev.Remark) != "" {
 			if strat := carrierRemarkStrategy(ev.Remark); strat != "" && tradeSide == "买入" {
 				fillSignalID = fmt.Sprintf("buy:%s:%s:%s", ev.Code, strat,
-					tradeDayOfTradedAt(ev.TradedAt))
+					tradeDayOfTradedAt(tradedAt))
 			}
 		}
 		if err := db.ApplyRealFill(store.RealFill{
 			OrderID: ev.OrderID, Code: ev.Code, Side: tradeSide, Price: ev.Price,
-			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: fillSignalID,
+			Qty: ev.Qty, Amount: ev.Amount, TradedAt: tradedAt, SignalID: fillSignalID,
 			// §M4（2026-09-22 PM 批）两条腿接进账本：name 回填建仓持仓（R8 回填路径一直在等它，
 			// 但信封没 tag 所以恒空），trade_id 成交判重精确锚（同委托同秒同价同量的两笔真实
 			// 部成不再被复合键误判为重放）。
@@ -2465,19 +2486,26 @@ var carrierSignalCodes = map[string]string{
 // after stripping the version prefix, empty when unknown.
 func carrierRemarkStrategy(remark string) string {
 	text := strings.TrimSpace(remark)
-	if i := strings.Index(text, "-"); i > 0 && strings.HasPrefix(text, "v") {
-		text = text[i+1:]
-	}
-	best := ""
-	for code := range carrierSignalCodes {
-		if strings.HasPrefix(text, code) && len(code) > len(best) {
-			best = code
+	// §REPORT-STAMP（2026-11-19）：备注形如 `v109-20261119-FC000034`——版本号自身带一个日期段，
+	// 所以**不能只剥第一个连字符**（旧实现剥完剩 `20261119-FC000034`，永远匹配不到信号短码，
+	// 于是载体成交的 signal_id 恒空、交易台账按战法归因全空）。这里按连字符逐段右剥，
+	// 取第一个能匹配到已知短码的尾巴。
+	for i := 0; i < len(text); i++ {
+		if i > 0 && text[i-1] != '-' {
+			continue
+		}
+		tail := text[i:]
+		cand := ""
+		for code := range carrierSignalCodes {
+			if strings.HasPrefix(tail, code) && len(code) > len(cand) {
+				cand = code
+			}
+		}
+		if cand != "" {
+			return carrierSignalCodes[cand]
 		}
 	}
-	if best == "" {
-		return ""
-	}
-	return carrierSignalCodes[best]
+	return ""
 }
 
 // tradeDayOfTradedAt 从成交时间串提取买入交易日（前 10 位，北京日）。
@@ -2486,6 +2514,70 @@ func tradeDayOfTradedAt(tradedAt string) string {
 		return tradedAt[:10]
 	}
 	return tradedAt
+}
+
+// reportStampFromParts 把「只有时分秒」的柜台时间补成完整北京时间戳（日期取自回报时刻）。
+//
+// §REPORT-STAMP（2026-11-19 实盘取证）：载体自闭环这条腿的委托/成交导出只有 `HH:MM:SS`
+// （`report_uplink._build_order_events` 的 `created_at = row["time"]`），而 Go 侧此前原样落库。
+// 于是 orders.created_at 变成 `10:01:51` 这种形态，代价不是"显示难看"而是**整天不可见**：
+//
+//	· `/api/orders` 与所有 day-keyed 读面按 `strings.HasPrefix(created_at, "2026-11-19")` 过滤
+//	  ⇒ 当日真实委托/成交一条都读不到（现网 11-19 实测：云端 orders today=0、fills today=0，
+//	  而柜台上真下了 9 笔单）；
+//	· 日报花费、当日预算、`SweepOrders(day)`、收盘对账同样按日前缀取值 ⇒ 全部漏账（漏账方向
+//	  是"少算已花"，会放任重复买入）。
+//
+// 归一规则只在**确实缺日期**时介入：带 `YYYY-MM-DD` 前缀的原样返回（旧网关口径逐字节不变）。
+// 兜底顺序 = raw 自身 → at（回报时刻，RFC3339 或已是本地格式）→ 服务器当前北京时间。
+// English: §REPORT-STAMP — the carrier export only carries HH:MM:SS; combining it with the report
+// time keeps every day-keyed read (orders list, day budget, sweep, close reconciliation) honest.
+func reportStampFromParts(raw, at string) string {
+	t := strings.TrimSpace(raw)
+	if len(t) >= 10 && t[4] == '-' && t[7] == '-' {
+		return t
+	}
+	base := cntime.Now()
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05"} {
+		if parsed, err := time.Parse(layout, strings.TrimSpace(at)); err == nil {
+			base = parsed.In(base.Location())
+			break
+		}
+	}
+	clock := normalizeClock(t)
+	if clock == "" {
+		return base.Format("2006-01-02 15:04:05")
+	}
+	return base.Format("2006-01-02") + " " + clock
+}
+
+// normalizeClock 把 `H:MM:SS` / `HH:MM:SS` 补成两位时区无关的时刻串；不是时刻形态返回空串。
+func normalizeClock(t string) string {
+	if t == "" || !strings.Contains(t, ":") {
+		return ""
+	}
+	parts := strings.Split(t, ":")
+	if len(parts) != 3 {
+		return ""
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	sec, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return ""
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 || sec < 0 || sec > 60 {
+		return ""
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, sec)
+}
+
+// reportDayKey 从完整时间戳取 yyyymmdd（用于按日唯一的占位信号键）。
+func reportDayKey(stamp string) string {
+	if len(stamp) >= 10 && stamp[4] == '-' && stamp[7] == '-' {
+		return stamp[0:4] + stamp[5:7] + stamp[8:10]
+	}
+	return cntime.Now().Format("20060102")
 }
 
 // qmtStrategyOf 从 signal_id 解析战法归属：buy:<码>:<战法>:<日> → 战法名；其余（sell:/manual@）→ manual。

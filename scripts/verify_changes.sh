@@ -1460,7 +1460,12 @@ py_tests qmt_gateway/tests/test_channel_position_fields.py
 grep -q 'ErrInvalidPositionReport' internal/store/real_positions.go || { echo "--- FAIL: 持仓快照字段校验哨兵丢失（§F2 回归）"; exit 1; }
 grep -q 'errors.Is(err, store.ErrInvalidPositionReport)' internal/server/qmt.go || { echo "--- FAIL: 400 映射丢失，校验失败回退 500 无限重推（§F2 回归）"; exit 1; }
 if grep -q 'if ev.OrderID != "" && ev.SignalID != "" {' internal/server/qmt.go; then echo "--- FAIL: 双键齐全才进块复活，缺键回报静默丢弃（§F5 回归）"; exit 1; fi
-grep -q '"ext:" + ev.OrderID' internal/server/qmt.go || { echo "--- FAIL: 占位信号键丢失（§F5 回归）"; exit 1; }
+# 2026-11-19 §REPORT-STAMP：占位键从 `ext:<号>` 改成按日唯一的 `ext:<yyyymmdd>:<号>`——
+# 柜台委托号**按会话递增、跨日会复用**（现网 11-04 的 ext:1703… 与 11-19 的 ext:1253 同号段），
+# 旧的 UNIQUE(user_id, signal_id) 下"昨天那笔"会吃掉"今天这笔"。锁的还是§F5 那件事
+# （缺 signal_id 必须有占位键落最小状态行），形状随修同步，不是放松。
+grep -q 'orderSignalID = "ext:" + reportDayKey(orderCreated) + ":" + ev.OrderID' internal/server/qmt.go \
+	|| { echo "--- FAIL: 占位信号键丢失或未带日键（§F5/§REPORT-STAMP 回归）"; exit 1; }
 grep -q 'COALESCE(NULLIF(excluded.strategy' internal/store/real_positions.go || { echo "--- FAIL: 对账洗空保护丢失（§M5 回归）"; exit 1; }
 grep -q 'muxWithJSONErrors' internal/server/server.go || { echo "--- FAIL: 404/405 JSON 信封出口丢失（§F3 回归）"; exit 1; }
 grep -q 'can_use_qty' qmt_gateway/broker.py || { echo "--- FAIL: xt 直连通道 T+1 可卖量字段丢失（§M5 通道字段对齐回归）"; exit 1; }
@@ -5164,11 +5169,17 @@ fi
 echo "==> 100 §0926-W2 第二波裁决+A1/A5/B2/B3/B4/B7+E1 盈亏单轨+C7 服务单源+元闸（2026-09-26 owner 裁决批）..."
 GW_ERRS=""
 GW_OBS=""
-gw_chk() { if [ "$2" != "$3" ]; then GW_ERRS="${GW_ERRS}
+# 2026-11-19 门禁自修：三个 helper 用 `${GW_ERRS:-}` 追加。`-collect` 按段分批装配，
+# §PRECALC-V2 那一大片 gw_chk 与它的判红尾巴都在 §190/§191 之间的浮块里，而
+# `GW_ERRS=""` 是在 §100 段头初始化的——§100 不在这一批里时，第一次 gw_chk 就撞
+# `set -u` 的 unbound variable，整批（§177–§190）连读数都吐不出来（本次实测：
+# 27 段记 MISSING，看上去像"这些段不存在"，实际是累加器没初始化把 shell 打死）。
+# 改成带缺省展开：累加器缺席＝从空串起步，判红尾巴照常读得到。
+gw_chk() { if [ "$2" != "$3" ]; then GW_ERRS="${GW_ERRS:-}
   · ${1}（读到 ${2}，应为 ${3}）"; fi; }
-gw_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then GW_ERRS="${GW_ERRS}
+gw_min() { if [ "${2:-0}" -lt "${3:-1}" ]; then GW_ERRS="${GW_ERRS:-}
   · ${1}（读到 ${2}，应 ≥ ${3}）"; fi; }
-gw_absent() { if [ "${2:-0}" -ne "0" ]; then GW_ERRS="${GW_ERRS}
+gw_absent() { if [ "${2:-0}" -ne "0" ]; then GW_ERRS="${GW_ERRS:-}
   · ${1}（应彻底没有，实得 ${2} 处）"; fi; }
 # 非注释命中（§89/静态负锁同族坑：说明注释≠旧写法复活；set -e 下管道 grep 必带 || true）
 gw_code_hits() { # $1=文件 $2=扩展正则 → 非注释命中行数
@@ -6131,9 +6142,14 @@ has106 "$RD" 'DRILL_RECORD' '⑪-5 演练读数留档腿（失败也留一行，
 # 为什么单独钉这一组：本轮全量门禁两次判红（§88 INFO 观测行数、§99 admin 审计行数）根因是同一族
 # ——「新增一条腿，计数锁没跟着同步」。而**测试腿**静默消失比观测腿更常见：改个名、注释掉、
 # 被 -run 正则吃不到，用例数都会变少而没人红。所以这里钉的是"腿的数量与形状"，不是"腿绿不绿"。
-# 三条 Playwright 浏览器腿按 test('POS- 前缀等值锁 3；共用拦截 helper 恰 4 行（定义 1 + 三条腿各调 1），
+# 三条 Playwright 浏览器腿按 `test.skip('POS-` 前缀等值锁 3（2026-11-16 §HIDE-PAPER-TAB 之后
+# 纸面录入口随 tab 一起从界面摘除，三条腿只能显式挂起），共用拦截 helper 恰 4 行（定义 1 + 三条腿各调 1），
 # 谁把某条腿改成真写现网库（去掉拦截），计数立刻掉到 3 当场判红——零写入纪律由此变成可机检的约束。
-eq106 web/e2e/uat_full.spec.mjs "test('POS-" 3 '④ 持仓整表写浏览器腿三条在位（载荷腿/失败可见腿/重试去重腿）'
+# 另配两条反向锁：`test('POS-` 必须为 0（不许有人悄悄解挂把"纸面入口已隐藏"读成仍然可用）、
+# 挂起理由锚 `§HIDE-PAPER-TAB` 必须还在（不然读者只会看到三条被跳过的用例，不知道是被设计挂起还是坏了）。
+eq106 web/e2e/uat_full.spec.mjs "test.skip('POS-" 3 '④ 持仓整表写浏览器腿三条在位但显式挂起（纸面 tab 已摘除，§HIDE-PAPER-TAB）'
+eq106 web/e2e/uat_full.spec.mjs "test('POS-" 0 '④ 三条 POS 腿不得被静默解挂（解挂＝纸面录入口复活，本锁要跟着改）'
+has106 web/e2e/uat_full.spec.mjs '§HIDE-PAPER-TAB' '④ 挂起理由锚在位（读者要能分清"设计挂起"与"腿坏了"）'
 eq106 web/e2e/uat_full.spec.mjs 'interceptHoldingsWrite(' 4 '④ 三条腿共用零写入拦截 helper（定义 1 + 调用 3）'
 # ① D1 写通道的两行审计**动作名**逐名钉住：§99 那条只数总行数（8→10），动作名被改掉＝留痕语义丢了
 # 而计数照旧，事后查"谁改了配置"就查不到那本账；故按带引号的字面量各钉一枚。
@@ -14539,7 +14555,14 @@ grep -qE 'BreadthMissingScale:[[:space:]]+0\.90' internal/config/config.go || fa
 grep -q 'math.IsNaN(up)' internal/signalctl/sizing.go || failrisk "广度 NaN 未走缺失降权"
 # ⑤ Regime 透传应急阀 + 引擎装配。
 grep -q 'RedBlockNewBuy bool `json:"red_block_new_buy,omitempty"`' internal/signalctl/regime.go || failrisk "Regime 未携带 red_block_new_buy"
-grep -q 'RedBlockNewBuy: e.combatAgent != nil && e.combatAgent.RedBlockNewBuyOn()' internal/engine/engine.go || failrisk "引擎未装配 Red 禁新开仓开关"
+# 2026-11-19：装配点从「结构体字面量里内联三元」重构成"先取 agent 指针、再赋 Regime 字段"
+# （engine.go 同一处还有 combat/agent 两种取名）。锁锚跟着改成**语义判据**：赋值右侧必须是
+# 「非 nil 指针 && 该指针的 RedBlockNewBuyOn()」，这样既不会因为改名假红，也仍然拦得住
+# 退回"无探空地解引用"（那正是 11-16 锁内死锁那族事故的形状）。
+grep -qE 'RedBlockNewBuy = [A-Za-z_][A-Za-z0-9_]* != nil && [A-Za-z_][A-Za-z0-9_]*\.RedBlockNewBuyOn\(\)' internal/engine/engine.go || failrisk "引擎未装配 Red 禁新开仓开关"
+if grep -qE 'RedBlockNewBuy = e\.combatAgent\.RedBlockNewBuyOn\(\)' internal/engine/engine.go; then
+	failrisk "引擎装配 Red 开关时不再做 nil 探空（combatAgent 可能为 nil）"
+fi
 # ⑥ 配置端点 + 前端面板。
 grep -q 'GET /api/config/regime' internal/server/server.go || failrisk "GET /api/config/regime 路由缺失"
 grep -q 'POST /api/config/regime' internal/server/server.go || failrisk "POST /api/config/regime 路由缺失"
@@ -14871,15 +14894,64 @@ for F124 in "$RP124" "$PAP124" "$RPT124"; do
 done
 CNT124=$((CNT124 + 3))
 
-# —— ③ 写入冻结：anchor_price 只出现在建行 INSERT 列清单，绝不出现在任何 UPDATE SET ——
+# —— ③ 写入冻结：anchor_price 不得被任何 UPDATE 写成**绑定值**（快照同步会洗掉首买价）——
 # 判据打在 **SQL 占位符形态**（anchor_price=?）上，不是打在「anchor_price=」这串字面量上：
 # 2026-10-27 实盘 T 的 step0 观测文案里有一句 `anchor_price=%.4f`（日志文本，不是写库），
 # 旧写法把它也数成「写进了 UPDATE SET」——一条判红文案能同时被日志、注释、格式化串踩到，
 # 这种锁下一次没人敢信。收窄成占位符形态后：写库必带 `?`（本仓 SQL 一律参数化），日志/文案踩不到；
 # 下面两枚自证分别钉住「真写库形态必须命中」与「日志形态必须不命中」，防止收窄变成新的失明。
-SETA124=$(grep -rnE --include='*.go' 'anchor_price[[:space:]]*=[[:space:]]*\?' internal/ 2>/dev/null | grep -v '_test\.go' | wc -l | tr -d ' ' || true)
-[ "${SETA124:-0}" = "0" ] ||
-	fail124 "anchor_price 被写进了 UPDATE SET（非测试代码 ${SETA124} 处）——券商对账快照没有锚点这个键，一次全量同步就会把首买价洗成摊薄成本/0"
+#
+# 2026-11-19 起有两处**有门**的例外，判据按"函数归属 + 门在不在"钉住（不是按文件打白名单）：
+#   ① `ApplyRealFill` 的「这一行还没有锚点（anchor_price<=0）」回填（§ANCHOR-T1）——写的是
+#      锚点簿给出的当天首买价，不是快照摊薄成本；少了它，"快照建行 → 当天买入"这一档的
+#      风险线会退回摊薄成本（owner 报的漂移）。
+#   ② `AnchorSignoffApply` 的签字回填（§ANCHOR-SIGNOFF，11-16 起就有）——只在
+#      `anchorTicketEligible` 判"不可开 T"时写，价取 cost_price、来源 first_buy_order，
+#      并同事务落 anchor_signoff_log 审计。**这处此前一直是陈旧锁下的红**（锁写着 0 处）。
+# 对账/upsert 两条路径仍必须 0 处（那才是"一次全量同步洗掉首买价"的形状）。
+SET124_ROWS=$(grep -rnE --include='*.go' 'anchor_price[[:space:]]*=[[:space:]]*\?' internal/ 2>/dev/null | grep -v '_test\.go' || true)
+SETA124=$(printf '%s\n' "$SET124_ROWS" | sed '/^$/d' | wc -l | tr -d ' ' || true)
+[ "${SETA124:-0}" = "2" ] ||
+	fail124 "anchor_price 的绑定值写入口数漂移（非测试代码 ${SETA124:-0} 处，期望恰好 2＝空锚点回填 + 签字回填）——多了＝对账快照可能洗掉首买价，少了＝当天清仓回买的风险线退回摊薄成本"
+python3 - <<'PY124A' || fail124 "anchor_price 的写入口不在登记过的两处有门路径里（或对账/快照 upsert 又开始写锚点）"
+import re
+import sys
+
+ALLOWED = {
+    ('internal/store/real_positions.go', 'ApplyRealFill'): 'if anchorPrice <= 0 {',
+    ('internal/store/anchor_signoff.go', 'AnchorSignoffApply'): 'anchorTicketEligible(p.AnchorSource, p.AnchorPrice)',
+}
+pat = re.compile(r'anchor_price\s*=\s*\?')
+found = {}
+for path in ('internal/store/real_positions.go', 'internal/store/anchor_signoff.go'):
+    lines = open(path, encoding='utf-8').read().splitlines()
+    for i, line in enumerate(lines):
+        if not pat.search(line):
+            continue
+        fn = ''
+        for j in range(i, -1, -1):
+            m = re.match(r'func (?:\([^)]*\) )?([A-Za-z0-9_]+)\(', lines[j])
+            if m:
+                fn = m.group(1)
+                break
+        found[(path, fn)] = (i, lines)
+if sorted(found) != sorted(ALLOWED):
+    print('sites=%s' % sorted(found))
+    sys.exit(1)
+for key, guard in ALLOWED.items():
+    i, lines = found[key]
+    window = lines[max(0, i - 20):i + 1]
+    if not any(guard in l for l in window):
+        print('no-guard %s:%d -> %s' % (key[0], i + 1, guard))
+        sys.exit(1)
+src = open('internal/store/real_positions.go', encoding='utf-8').read()
+for name in ('func (d *DB) UpsertRealPositions(', 'func (d *DB) ReconcilePositionsForUser('):
+    b = src.index(name)
+    if pat.search(src[b:b + 6000]):
+        print('write-in-%s' % name)
+        sys.exit(1)
+PY124A
+CNT124=$((CNT124 + 1))
 # 射程自证两枚（同一把尺子，两个方向都要有读数）：
 SET124_W=$(printf 'SET sellable_qty = ?, anchor_price = ? WHERE code = ?\n' | grep -cE 'anchor_price[[:space:]]*=[[:space:]]*\?' || true)
 [ "${SET124_W:-0}" = "1" ] ||
@@ -14988,7 +15060,7 @@ fi
 rm -rf "$W124M"
 CNT124=$((CNT124 + 3))
 
-echo "ok - §124 §ANCHOR-FIRST W2/W3 锁通过（默认基准未换锚 5 道：basis 默认 EntryPrice／换锚唯一门／算式走单一 basis／in.AnchorPrice 门数等值／射程自证 + 三本账字段 3 道 + 写入冻结 8 道（SQL 占位符形态判红 + 同尺两向自证：写库形态必中／日志形态必不中 + 建行 INSERT 价源成对 3 口 + 残留旧尾巴 0 口 + 读侧成对 4 口） + 影子装配 7 道（三口账本标识逐个等值）+ 日志镜像 1 道 + 前端 4 道 + 行为腿 5 包共 ${LEG124_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT124}；W2 只影子、W3 切硬开关默认关，等 Q10 签认）"
+echo "ok - §124 §ANCHOR-FIRST W2/W3 锁通过（默认基准未换锚 5 道：basis 默认 EntryPrice／换锚唯一门／算式走单一 basis／in.AnchorPrice 门数等值／射程自证 + 三本账字段 3 道 + 写入冻结 9 道（SQL 占位符形态判红 + 同尺两向自证：写库形态必中／日志形态必不中 + 两处有门写入口的函数归属与门在不在 + 建行 INSERT 价源成对 3 口 + 残留旧尾巴 0 口 + 读侧成对 4 口） + 影子装配 7 道（三口账本标识逐个等值）+ 日志镜像 1 道 + 前端 4 道 + 行为腿 5 包共 ${LEG124_TOTAL} 条用例 + 反证 3 枚，累计判定点 ${CNT124}；W2 只影子、W3 切硬开关默认关，等 Q10 签认）"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # §125 §T1-PARTIAL（2026-10-24 owner 裁决三）模拟盘层账 / 减量成交 / 残量意图 / 真实减仓
@@ -17834,13 +17906,28 @@ grep -qF 'GetRealAccountOwn' internal/store/real_account.go || fail144 "store �
 CNT144=$((CNT144 + 1))
 grep -qF 'GetRealAccountScoped' internal/store/real_account.go || fail144 "store 缺 GetRealAccountScoped"
 CNT144=$((CNT144 + 1))
-# 只锁 handleFundsToday 函数体：同文件 handlePaperTargetReadout 是运营账号专用的目标仓位只读面，
-# 全文件负锁会把那条合法用法当成回潮（2026-11-01 §144 首跑就是这么假红的）。
+# 只锁 handleFundsToday 函数体：§SPLIT-FUNDS-READ 之后纸面读数在 handlePaperTargetReadout
+# 里单独出口，全文件负锁会把那条合法取数当成回潮（2026-11-01 §144 首跑就是这么假红的）。
 BODY144F=$(awk '/func \(s \*Server\) handleFundsToday\(/,/^}/' internal/server/t_rounds_api.go)
-grep_q 'paperEngineFor\(uid\)' BODY144F || fail144 "funds/today 的 paperView 未按请求者 uid"
+# §SPLIT-FUNDS-READ（2026-11-18）：纸面读数从 funds/today 拆到 GET /api/paper/target 之后，
+# "按请求者取账"这条判据必须**跟着搬到新出口**——旧锚 `paperEngineFor(uid)` 在 handleFundsToday
+# 里已经合法消失，继续钉旧形状就会把「正确拆分」读成「越权回归」。判据改成三面：
+#   ① 实盘帧里不许再有纸面取数（纸面写锁会把毫秒级的实盘帧拖成 6~10s，这正是拆分的原因）；
+#   ② 新出口必须先 requestUserID(r) 再 paperEngineFor(uid)（成员只能看自己的目标仓位）；
+#   ③ 新出口里不许出现 operatorID()（那是"成员看到 owner 纸面仓"的老形态）。
+if grep_q 'paperEngineFor\(' BODY144F; then
+	fail144 "funds/today 又把纸面读数合回来了（§SPLIT-FUNDS-READ：纸面写锁会把实盘帧拖成秒级）"
+fi
 CNT144=$((CNT144 + 1))
-if grep_q 'paperEngineFor\(s\.operatorID\(\)\)' BODY144F; then
-	fail144 "funds/today 仍用运营账号取纸面读数"
+BODY144P=$(awk '/func \(s \*Server\) handlePaperTargetReadout\(/,/^}/' internal/server/t_rounds_api.go)
+grep_q 'requestUserID\(r\)' BODY144P || fail144 "paper/target 未按请求者取账号（成员会看到 owner 的纸面仓）"
+grep_q 'paperEngineFor\(uid\)' BODY144P || fail144 "paper/target 的 paperView 未按请求者 uid"
+CNT144=$((CNT144 + 1))
+# 负锁只判代码行：这个函数的注释里正好写着"不能回落到 s.operatorID()"（解释为什么这样取账），
+# 裸判整段会把说明文字读成缺陷（本仓 §106/§164 都吃过这一口）。
+CODE144P=$(printf '%s\n' "$BODY144P" | sed 's://.*$::')
+if grep_q 'operatorID\(\)' CODE144P; then
+	fail144 "paper/target 仍用运营账号取纸面读数"
 fi
 CNT144=$((CNT144 + 1))
 grep -qF 'req.Enabled != nil && *req.Enabled && target != s.operatorID()' internal/server/qmt.go || fail144 "非运营账号显式启用实盘缺自有 token 护栏"
@@ -20578,7 +20665,7 @@ grep_q "schtasks /Run" UPT F || fail173 "重启客户端不再走计划任务（
 # 正在跑投递链的 carrier_updater 本体一起杀掉（v39/v44/v46 三次投递输出断在中间的根因）；
 # ②ENABLE 必须先于 schtasks /Run——DISABLED 状态下 /Run 必被 Windows 拒绝，客户端无人拉起，
 # 而 RESULT=OK 照报，重启静默失败三次实盘实录。
-grep_q 'CommandLine -match "gateway\\.py"' UPT F || fail173 "停网关改回按进程名杀 python（会误杀投递链本体，§RESTART-FIX 20261116）"
+grep_q 'CommandLine -match "gateway\.py"' UPT F || fail173 "停网关改回按进程名杀 python（会误杀投递链本体，§RESTART-FIX 20261116）"
 grep_q '/ENABLE | Out-Null' UPT F && grep -qF 'ensure_enabled=pre_run' scripts/update_qmt_strategy.ps1 || fail173 "重启时序退回 DISABLE→/Run（禁用任务 /Run 必被拒，客户端无人拉起，§RESTART-FIX 20261116）"
 # 大小写折叠后交给 grep_q，而不是 printf|grep -qi：§129 那把尺子数的就是"整份测试原文
 # 直接管道给 grep -q"的形状——命中即退会打死写方、pipefail 会把判绿读成判红。
@@ -20748,7 +20835,7 @@ CNT173=$((CNT173 + 1))
 ITT=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
 grep_q "QMTF-Carrier-Update" ITT F || fail173 "每日收盘后的自动更新没有触发器"
 grep_q 'St = "15:40"' ITT F || fail173 "载体更新任务的时间锚漂了（15:40 选在收盘快照与关闭腿之后）"
-grep_q "TASKS_REREAD_MATCH=1 tasks=7" ITT F || fail173 "注册后复读仍少写 tasks=6（第六条 QMTF-Gateway-Start 起就锁 6；少注册一条也不会红＝恒绿锁）"
+grep_q "TASKS_REREAD_MATCH=1 tasks=8" ITT F || fail173 "注册后复读仍少写 tasks（8＝T1..T8：Ensure/Start/Gateway-Ensure/Close/Carrier-Update/Gateway-Start/Carrier-Update-Intraday/Uplink；少注册一条也不会红＝恒绿锁）"
 grep_q "reason=no_carrier_updater" ITT F || fail173 "缺更新器时仍会注册一个空跑任务（空跑比不注册更坏）"
 CNT173=$((CNT173 + 1))
 SIZ=$(cat qmt_gateway/qmt_internal_strategy.py || true)
@@ -21910,7 +21997,9 @@ echo "==> 全部通过"
 # English: exact-count locks refreshed to real readings; uniqueness was never the invariant.
 gw_chk "PRECALC 模板 init 拉起 QMT 日线下载（价量类直取的入口）" "$(grep -c '_download_day_bars(ContextInfo)' qmt_gateway/qmt_internal_strategy.py || true)" "2"
 gw_chk "PRECALC 官方下载 API 调用在模板内" "$(grep -c 'download_history_data2' qmt_gateway/qmt_internal_strategy.py || true)" "4"
-gw_chk "PRECALC bars_count 出厂 ≥60（覆盖 Mom60 因子窗口）" "$(grep -cE 'PARAMS\.get\("bars_count", (6[0-9]|7[0-9]|8[0-9]|9[0-9]|1[0-9][0-9])\)' qmt_gateway/qmt_internal_strategy.py || true)" "1"
+# 2026-11-19 复核实读：bars_count 现在两处都是 80（下载根数 + ctx 窗口各一处），
+# 11-11 建这条锁时只有一处；判据是"出厂 ≥60 覆盖 Mom60 窗口"，不是"只许出现一次"。
+gw_chk "PRECALC bars_count 出厂 ≥60（覆盖 Mom60 因子窗口，下载与 ctx 两处）" "$(grep -cE 'PARAMS\.get\("bars_count", (6[0-9]|7[0-9]|8[0-9]|9[0-9]|1[0-9][0-9])\)' qmt_gateway/qmt_internal_strategy.py || true)" "2"
 gw_chk "PRECALC build_context 接线 ctx bars（形态/龙头/因子战法的序列输入）" "$(grep -c '"bars": bars' qmt_gateway/qmt_internal_strategy.py || true)" "1"
 gw_chk "PRECALC build_context 透传估值/换手/财务/资金流/D1/热度（QMT 拿不到的才烘）" "$(grep -c 'valuation_series": pre.get("valuation_series")' qmt_gateway/qmt_internal_strategy.py || true)" "1"
 gw_chk "PRECALC data_health 覆盖率日志（下载失败绝不静默）" "$(grep -c 'data_health bars_coverage' qmt_gateway/qmt_internal_strategy.py || true)" "1"
@@ -21949,7 +22038,13 @@ gw_chk "研究侧 CPU 配额收紧到 60%" "$(grep -cF 'CPUQuota=60%' deploy/qua
 gw_chk "前端轮询隐藏页跳过" "$(grep -cF "document.visibilityState !== 'visible'" web/src/pages/Research.jsx || true)" "1"
 gw_min "前端进度单飞去重（判空/置位/复位三处）" "$(grep -cF 'progressInFlight.current' web/src/pages/Research.jsx || true)" "3"
 # 2026-11-12 保活补第七条任务后两处 MINUTE/10（ClientEnsure + Gateway-Start），锁值随实读同步。
-gw_chk "保活改每 10 分钟（08:25 起）" "$(grep -cF 'Sc = "MINUTE"; Mn = 10' deploy/qmt-friend/install_tasks.ps1 || true)" "2"
+# 2026-11-19 复核实读：保活腿只有 QMTF-Client-Ensure 一条是 MINUTE/10（08:25 起）；
+# QMTF-Gateway-Start 自 11-09 f6bd3db 起就是 **ONCE 23:59 的按需任务**（看门狗/装填器用
+# `schtasks /Run` 拉起，本身不挂调度）。旧锁写"2"是 11-12 按错记的两处同步下来的陈旧值，
+# 与实读 1 不符——判据改成两条：保活那条必须在位，按需那条不许偷偷变回定时腿
+# （变回去＝网关拉起器会与看门狗抢着起进程，正是 §RESTART-FIX 家族的形状）。
+gw_chk "保活改每 10 分钟（08:25 起）" "$(grep -cF 'Sc = "MINUTE"; Mn = 10; St = "08:25"' deploy/qmt-friend/install_tasks.ps1 || true)" "1"
+gw_chk "Gateway-Start 仍为按需任务（不自挂调度）" "$(grep -cE 'Name = \$T6; Sc = "ONCE"' deploy/qmt-friend/install_tasks.ps1 || true)" "1"
 gw_chk "保活自带 08:25-15:25 时段闸" "$(grep -cF 'outside_ensure_window' deploy/qmt-friend/watchdog.ps1 || true)" "1"
 gw_chk "下发载荷显式带 owner uid（snapshot+manifest）" "$(grep -cF '"owner_user_id": OWNER_UID' scripts/carrier_hot_reload_gz.py || true)" "2"
 gw_chk "回归用例：0 持仓过滤" "$(grep -cF 'func TestHandleRealPositionsFiltersZeroQty' internal/server/qmt_test.go || true)" "1"
@@ -21961,7 +22056,7 @@ gw_chk "前后端全量中文注释基线 go=0 fe=0" "$(python3 tools/check_doc_
 # §20261112 门禁自修：11-11 追加的 §PRECALC-V2 组只往 GW_ERRS 累积，末尾没有判红
 # （GW_ERRS 唯一检查在 5280 行的 §0926-W2 段），16 条静态锁形同虚设。这里补尾体总闸，
 # 让此前 16 条与本批 26 条都真正能让整轮 exit 1。
-if [ -n "$GW_ERRS" ]; then
+if [ -n "${GW_ERRS:-}" ]; then
 	echo "--- FAIL: 尾体静态锁断言不符:${GW_ERRS}"
 	exit 1
 fi
@@ -22407,8 +22502,16 @@ CNT186=$((CNT186 + 1))
 test "$(grep -cF '永久不覆盖' internal/store/real_positions.go)" = "0" || fail186 "旧裁决注释「永久不覆盖」仍在（与 11-13 只补不拉裁决并存=文档债复发）"
 CNT186=$((CNT186 + 1))
 grep -qF '2026-11-13' internal/store/real_positions.go || fail186 "新裁决（2026-11-13 只补不拉）不在册"
+# 2026-11-19：这条原来是**批次级**约束（§20261114-F5 那一批只许动注释），判据是 `git diff`——
+# 它天生只在"工作树干净"时成立；本批 §ANCHOR-T1 合法改了 ApplyRealFill 的 SQL（把锚点两列读进来），
+# 于是它把正常施工读成"SQL 语义被偷改"。批次约束不该长成常驻锁（§123/§129 同族教训），
+# 改成该批次真正要守的**资金路径不变量**：① 锚点列读侧一律 COALESCE 归一到 0
+# （缺列/缺值只能读成"锚点未知"，绝不许读成满额）；② `anchor_source` 的"只补不拉"裁决文案仍在册
+# （读者要能分清回填成本档与建仓即冻结的首买档——这两档在库里长得一模一样）。
 CNT186=$((CNT186 + 1))
-test "$(git diff -U0 internal/store/real_positions.go | grep -E '^[+-][^+-]' | grep -vE '^[+-][[:space:]]*(//|--)' | wc -l | tr -d ' ')" = "0" || fail186 "real_positions.go 有非注释改动（F5 硬约束：只许动 // 与 SQL -- 注释行）"
+test "$(grep -cE 'COALESCE\(anchor_price, ?0\)' internal/store/real_positions.go)" -ge 2 || fail186 "锚点读侧 COALESCE 归一不足 2 处（缺列时会读出满额锚点）"
+CNT186=$((CNT186 + 1))
+grep -qF '只补不拉' internal/store/real_positions.go || fail186 "anchor_source 的「只补不拉」裁决文案被删（回填档与首买档又会长得一模一样）"
 # §186 A1/A2：本地门禁必须真跑 go test 版（CLI 与 go test 两套判据不同），退出码被收住。
 # 注意：本行是仓内该命令的**唯一**出现处，A1 的 grep -c 才等于 1（不要在别处抄这串）。
 CNT186=$((CNT186 + 1))
@@ -22816,9 +22919,12 @@ grep -qF 'data-testid="real-new-entry"' "$POSJS193" || fail193 "实盘新增持�
 CNT193=$((CNT193 + 1))
 grep -qF "bookTab === 'real' && (manualMode || canTrading)" "$POSJS193" \
 	|| fail193 "入口判据未与行内四动作同源（manualMode || canTrading）"
+# 2026-11-19 复核实读：改账态这枚按钮在 11-18 改开**批量录入**弹窗（一次录 1..N 只，
+# 单行改账仍在状态行的「改账·新增」）。「一个按钮两种含义」不变——变的是改账那半的落地弹窗，
+# 仍必须走手动账端点、绝不调 execute。锁锚跟着换，同时保留"两条腿不许合并成一条"的判据。
 CNT193=$((CNT193 + 1))
-grep -qF 'onClick={manualMode ? openManualNew : openRealNew}' "$POSJS193" \
-	|| fail193 "一个按钮两种含义丢失（改账 openManualNew vs 真单 openRealNew）"
+grep -qF 'onClick={manualMode ? openManualBatch : openRealNew}' "$POSJS193" \
+	|| fail193 "一个按钮两种含义丢失（改账 openManualBatch vs 真单 openRealNew）"
 
 # ② 真单提交唯一出口：行内四动作与建仓共用同一条「幂等键 + 无现价二次确认」链。
 # 两处 submit 各抄一份的形态在真钱路径上会分叉（一处补了 confirm_no_quote、另一处没补）。
@@ -22830,6 +22936,13 @@ test "$(grep -cF 'confirm_no_quote: true' "$POSJS193")" = "1" \
 CNT193=$((CNT193 + 1))
 test "$(grep -cF 'await placeRealOrder({' "$POSJS193")" -ge 2 \
 	|| fail193 "行内确认与建仓确认未同时走唯一出口（<2 处调用）"
+# 改账那半的负锁：批量录入只写手动账端点，函数体里一旦出现真单出口就等于"改账按钮能下单"。
+CNT193=$((CNT193 + 1))
+BATCH193=$(awk '/function openManualBatch\(/{f=1} f{print} f&&/^  }/{exit}' "$POSJS193")
+grep -qF 'setManualBatchShow(true)' <<<"$BATCH193" || fail193 "openManualBatch 未打开批量录入弹窗（改账态按钮点下去会没反应）"
+if grep_q 'executeRealAction' BATCH193; then
+	fail193 "openManualBatch 长出真单出口（改账态按钮会下单）"
+fi
 
 # ③ 建仓语义：代码可编辑 + 6 位补后缀 + reason=manual:new（建仓与加仓必须分键）
 CNT193=$((CNT193 + 1))
@@ -22862,7 +22975,7 @@ test "$(grep -cF "test.skip('POS-" web/e2e/uat_full.spec.mjs)" = "3" \
 # ⑦ 用例在册 + 行为腿真跑
 for T193 in \
 	"N1 真单态：按钮在位，点开是可编辑代码的真单弹窗，提交走 execute 且理由=manual:new" \
-	"N2 改账态：同一枚按钮打开改账弹窗（不下单），execute 一次都不许被调用" \
+	"N2 改账态：同一枚按钮打开改账入口（不下单），execute 一次都不许被调用" \
 	"N3 无 trading 权限且非改账态：入口不渲染（不给点了必 403 的按钮）" \
 	"N4 纸面入口仍然隐藏：纸面 tab 与「+ 新增持仓（纸面）」都不在 DOM"; do
 	CNT193=$((CNT193 + 1))
@@ -23100,13 +23213,13 @@ for ln in lines:
 print('\n'.join(out))
 ")"
 CNT197=$((CNT197 + 1))
-printf '%s\n' "$PB197" | grep -qE 'if total is not None:' || fail197 "_t_equity_basis 缺柜台优先分支（柜台有真数会被烘参覆盖）"
+grep_q 'if total is not None:' PB197 || fail197 "_t_equity_basis 缺柜台优先分支（柜台有真数会被烘参覆盖）"
 
 # ③ 陈旧负锁：asof_age_sec 超窗必须 fail-closed（返回 None），不得拿旧权益下单。
 CNT197=$((CNT197 + 1))
-printf '%s\n' "$PB197" | grep -qE 'if age > window:' || fail197 "缺 stale 判定（旧烘参权益会被拿去下单）"
+grep_q 'if age > window:' PB197 || fail197 "缺 stale 判定（旧烘参权益会被拿去下单）"
 CNT197=$((CNT197 + 1))
-printf '%s\n' "$PB197" | grep -q 'return None' || fail197 "陈旧路径未 fail-closed"
+grep_q 'return None' PB197 || fail197 "陈旧路径未 fail-closed"
 
 # ④ 云端烘参锁：bake_t_macro 加烘 total_asset 且纳入 t_bake sha。
 CNT197=$((CNT197 + 1))
@@ -23130,7 +23243,7 @@ for ln in lines:
         out.append(ln)
 print('\n'.join(out))
 ")"
-if printf '%s\n' "$AB197" | grep -qE 'PARAMS\.get|_t_equity_basis|asof_age_sec'; then
+if grep_q 'PARAMS\.get|_t_equity_basis|asof_age_sec' AB197; then
 	fail197 "_account_total_asset 混入烘参回退（会放大主买入腿下单金额）"
 fi
 
@@ -23501,7 +23614,7 @@ if [ -z "$PROBE_BODY" ]; then
 	fail203 "探针区段取不到（锚串漂了，这条锁今天没有牙）"
 else
 	for _banned203 in 'passorder' '_place(' 'cancel(' '_STATE["sent"]' 'buy_intents' 'buy_amounts'; do
-		if printf '%s\n' "$PROBE_BODY" | grep -qF "$_banned203"; then
+		if grep_q "$_banned203" PROBE_BODY F; then
 			fail203 "探针体长出资本动作：${_banned203}（只读取证线不许下单/撤单/占预算）"
 		fi
 	done
@@ -23534,7 +23647,9 @@ grep -qF 'd1d_sfx=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针没
 #   `positions` 读成空（或读不了）——而"没有持仓"与"表被拒"在日志上是同一个形状，
 #   结论却相反。一行读数把两张表与两行钱同时点名。
 CNT203=$((CNT203 + 1))
-grep -qF '_log("views pos=%s ord=%d cash=%s eq=%s"' qmt_gateway/qmt_internal_strategy.py \
+# 2026-11-19：这行读数在 §213 批补了 raw/kept 两栏（ORDER 表"读不到"与"读到 0 行"原本同形），
+# 锁随形同步——判据还是那件事（一行同时点名两张表与两行钱），不是放松。
+grep -qF '_log("views pos=%s ord=%d raw=%s kept=%s cash=%s eq=%s"' qmt_gateway/qmt_internal_strategy.py \
 	|| fail203 "缺柜台视图读数（空表与读不了分不出来）"
 CNT203=$((CNT203 + 1))
 grep -qF '"na" if positions is None else len(positions)' qmt_gateway/qmt_internal_strategy.py \
@@ -24204,4 +24319,161 @@ fi
 
 [ "$B213_FAILED" = "0" ] || exit 1
 echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 在途占预算 + m_strRemark 首读 + 前缀负锁 + 字段族（m_nVolumeTraded/m_dOrderPrice），累计判定点 ${CNT213}）"
+echo ""
+
+# ---------------------------------------------------------------------------
+# §214 §20261119-BUDGET-RELEASE（owner 2026-11-19 第二组报障，两条）：
+#   ① 「挂单不会自己撤单，手动撤单后预算也没及时恢复（因为没有新的个股挂单）。
+#      我之前的设计是十分钟不成交会自动撤单，且计时结束以后资金拿最新的可用资金。」
+#   ② 「首买锚点的设计要改，即使清仓了也要 T+1 才清除。不然我的清仓票再买回来
+#      首买锚点就漂移了。」
+# 现场读数（广州载体 v109）把两条都落到了具体位置上：
+#   * 盒子那份产物烘的 `stale_order_sec` 是 **900**（repo 与 local_executor 兜底都是 600）——
+#     gz 上的 `local_executor_params.json` 是运行态文件，静态键被冻结在里面，热更新链
+#     从来不覆盖它 ⇒ 仓库改 600 也永远到不了盒子。修法＝仓库那份落成 `.base.json`，
+#     每次烘焙前"静态键以 base 为准、运行态键以 gz 为准"地合并（§PARAMS-STATIC-BASE）。
+#   * 手动撤单后三个会话账（sent / buy_intents / buy_amounts）没人清 ⇒ 同一只票当天
+#     再也发不出去、钱也一直占着。柜台 ORDER 表是唯一证据源（"该票今天全部已撤零成交"）。
+#   * 已投金额旧式只算 `traded×price` ⇒ 在途买单不占预算；改成柜台真值（已成按成交量、
+#     在途按未成余量）＋ 会话账只补柜台还没看到的那几只票。
+#   * 清仓删除 `real_positions` 那一行，锚点跟着消失 ⇒ 同日回买重新冻结，风险线漂移。
+echo "==> 214 §20261119-BUDGET-RELEASE（十分钟撤单 + 手动撤单释放 + 在途占预算 + 锚点 T+1）..."
+B214_FAILED=0
+fail214() {
+	echo "--- FAIL: §214 $*"
+	FAIL=1
+	B214_FAILED=1
+}
+CNT214=0
+ST214=qmt_gateway/qmt_internal_strategy.py
+HR214=scripts/carrier_hot_reload_gz.py
+RS214=deploy/gz-ubuntu/rsync_carrier_build.sh
+
+# ① 十分钟撤单：阈值真源 600（两个键），且载体兜底同值。
+CNT214=$((CNT214 + 1))
+V214="$(/usr/local/bin/python3 -c "import json;d=json.load(open('qmt_gateway/local_executor_params.json'))['params'];print(d.get('stale_order_sec'),d.get('t_stale_order_sec'))" 2>/dev/null || true)"
+[ "${V214:-}" = "600 600" ] || fail214 "烘参两枚陈旧阈值应为 600/600，实为 ${V214:-none}"
+CNT214=$((CNT214 + 1))
+grep -qE "'stale_order_sec': 600" qmt_gateway/local_executor.py || fail214 "载体兜底 stale_order_sec 未同步 600"
+CNT214=$((CNT214 + 1))
+grep -qE "'t_stale_order_sec': 600" qmt_gateway/local_executor.py || fail214 "载体兜底 t_stale_order_sec 未同步 600"
+
+# ② 撤单腿必须自报读数（静默与「没有陈旧单」原本同形，整下午不撤单就是这么被埋掉的）。
+CNT214=$((CNT214 + 1))
+grep -qF '"cancel_watch open=%d oldest_age=%.0f threshold=%.0f sweep_from=%s"' "$ST214" || fail214 "撤单腿缺 cancel_watch 读数行（看不出腿跑没跑）"
+CNT214=$((CNT214 + 1))
+grep -qF 'watch_key = "%s_%d" % (day, moment.hour)' "$ST214" || fail214 "cancel_watch 未按小时去重（每轮刷屏＝另一种噪音）"
+
+# ③ 手动撤单释放：函数在册、调用点在 run_round 且**早于**预算视图。
+CNT214=$((CNT214 + 1))
+grep -qF 'def _reconcile_session_intents(orders, day):' "$ST214" || fail214 "缺 _reconcile_session_intents（手动撤单不释放会话账）"
+CNT214=$((CNT214 + 1))
+grep -qF '_reconcile_session_intents(orders, day_key(moment))' "$ST214" || fail214 "run_round 未调用 _reconcile_session_intents"
+CNT214=$((CNT214 + 1))
+python3 - <<'PY214A' || fail214 "释放腿不在 run_round 内、或被挪到预算视图之后（本轮仍按旧账算钱）"
+import sys
+src = open('qmt_gateway/qmt_internal_strategy.py', encoding='utf-8').read()
+start = src.index('def run_round(ContextInfo, moment):')
+body = src[start:]
+call = body.index('_reconcile_session_intents(orders, day_key(moment))')
+budget = body.index('pending_rows = _pending_buy_rows(orders)')
+if not call < budget:
+    print('release=%d budget=%d' % (call, budget))
+    sys.exit(1)
+PY214A
+
+# ④ 释放的三条判据：三个账一起放 / 一次性按委托号 / 侧别必须是买单。
+CNT214=$((CNT214 + 1))
+grep -qF '_STATE["buy_amounts"].pop((day, sym), None)' "$ST214" || fail214 "释放未清 buy_amounts（钱一直占着＝owner 报的那一半）"
+CNT214=$((CNT214 + 1))
+grep -qF 'if _STATE.get("released_day") != day:' "$ST214" || fail214 "释放去重键未按交易日重置（跨日后旧委托号会挡住释放）"
+CNT214=$((CNT214 + 1))
+grep -qF '_STATE["released_orders"].update(fresh)' "$ST214" || fail214 "释放不是一次性的（新补的单会被旧已撤行再放一次 ⇒ 同票买两遍）"
+CNT214=$((CNT214 + 1))
+grep -qF 'if not all(str(r.get("side") or "") == "buy" for r in rows):' "$ST214" || fail214 "卖单已撤也能释放买单账（方向不匹配，fail-open）"
+
+# ⑤ 已投金额口径：柜台真值（在途按余量）＋ 会话账只补未见的票。
+CNT214=$((CNT214 + 1))
+grep -qF 'def _spent_buy_amount(orders, buy_prefixes, day):' "$ST214" || fail214 "缺 _spent_buy_amount（口径散在 build_context 里没法单独锁）"
+CNT214=$((CNT214 + 1))
+grep -qF 'spent = _spent_buy_amount(orders, buy_prefixes, day)' "$ST214" || fail214 "build_context 未走 _spent_buy_amount"
+CNT214=$((CNT214 + 1))
+grep -qF 'if entry[0] != day or _bare(entry[1]) in seen_symbols:' "$ST214" || fail214 "会话账与柜台真值会重复计入（同一笔钱算两次 ⇒ 该买的买不进）"
+
+# ⑥ §PARAMS-STATIC-BASE：静态旋钮的唯一真源是仓库那份 base，运行态只覆盖运行态键。
+CNT214=$((CNT214 + 1))
+grep -qF 'PARAMS_BASE_NAME = "local_executor_params.base.json"' "$HR214" || fail214 "缺静态真源文件名（热更新链读不到 base）"
+CNT214=$((CNT214 + 1))
+grep -qF 'def merge_static_params(runtime_doc, base_doc):' "$HR214" || fail214 "缺 merge_static_params（合并规则不可测）"
+CNT214=$((CNT214 + 1))
+grep -qF '"static_base": static_base_digest(),' "$HR214" || fail214 "base 指纹未进烘焙 sha（只改静态旋钮时不会重烘）"
+CNT214=$((CNT214 + 1))
+python3 - <<'PY214B' || fail214 "apply_static_params_base 必须在 rebuild_snapshots 之前（之后每一步读的是合并前的 params）"
+import sys
+src = open('scripts/carrier_hot_reload_gz.py', encoding='utf-8').read()
+app = src.index('    apply_static_params_base()')
+reb = src.index('        rebuild_snapshots(qc, rules, wl)')
+if not app < reb:
+    print('apply=%d rebuild=%d' % (app, reb))
+    sys.exit(1)
+PY214B
+CNT214=$((CNT214 + 1))
+python3 - <<'PY214C' || fail214 "静态旋钮被写进 RUNTIME_PARAM_KEYS（gz 冻结值会把仓库真源盖回去，900 事故重演）"
+import sys
+src = open('scripts/carrier_hot_reload_gz.py', encoding='utf-8').read()
+i = src.index('RUNTIME_PARAM_KEYS = frozenset((')
+block = src[i:src.index('))', i)]
+bad = [k for k in ('stale_order_sec', 't_stale_order_sec', 'close_sweep_from')
+       if '"%s"' % k in block]
+if bad:
+    print('runtime_owned=%s' % ','.join(bad))
+    sys.exit(1)
+PY214C
+CNT214=$((CNT214 + 1))
+grep -qF 'local_executor_params.base.json' "$RS214" || fail214 "rsync 未把仓库参数落成 .base.json（热更新链拿不到静态真源）"
+CNT214=$((CNT214 + 1))
+if grep -qF 'cp qmt_gateway/local_executor_params.json "$STAGE/qmt_gateway/local_executor_params.json"' "$RS214"; then
+	fail214 "仓库参数直接顶掉 gz 运行态文件（监视池/行业桶会被清空，11-12 实录）"
+fi
+
+# ⑦ §ANCHOR-T1：锚点簿（实盘表 + 纸面 map），清仓不删、跨日才重新冻结。
+CNT214=$((CNT214 + 1))
+grep -qF 'CREATE TABLE IF NOT EXISTS real_anchor_book' internal/store/anchor_book.go || fail214 "缺 real_anchor_book 建表（清仓即删行的老形态没被接住）"
+CNT214=$((CNT214 + 1))
+grep -qF 'func resolveOpenAnchorTx(' internal/store/anchor_book.go || fail214 "缺 resolveOpenAnchorTx（建行/复建不查锚点簿）"
+CNT214=$((CNT214 + 1))
+N214=$(grep -cF 'resolveOpenAnchorTx(tx, f.Code' internal/store/real_positions.go || true)
+[ "${N214:-0}" -ge 2 ] || fail214 "ApplyRealFill 只在 ${N214:-0} 个分支查锚点簿（新建与加仓必须都查）"
+# 清仓那一笔要把锚点按**今天**重登记一次（价不动）。没有这一笔的话"跨日持有 → 今天清仓 →
+# 今天回买"会被日键判成过期、锚点照样漂——owner 报的那句话在实盘侧只修一半。
+CNT214=$((CNT214 + 1))
+grep -qF 'keep anchor on clear %s' internal/store/real_positions.go \
+	|| fail214 "清仓写路径未重登记锚点簿（跨日持有后当天回买仍会漂）"
+CNT214=$((CNT214 + 1))
+grep -qF 'if newQty <= 0 && p.AnchorPrice > 0 {' internal/store/real_positions.go \
+	|| fail214 "锚点重登记未按\"清仓且有锚点\"设闸（减仓也刷日键 ⇒ 减仓日回买被当成同日）"
+CNT214=$((CNT214 + 1))
+grep -qF 'anchorBook map[string]anchorBookEntry' internal/paper/paper.go || fail214 "纸面账缺 anchorBook（清仓当天回买锚点会漂）"
+CNT214=$((CNT214 + 1))
+grep -qF 'AnchorBook: e.anchorBook,' internal/paper/paper.go || fail214 "纸面锚点簿未随状态落盘（中午重启即丢当天首买价）"
+CNT214=$((CNT214 + 1))
+grep -qF 'e.anchorBook = st.AnchorBook' internal/paper/paper.go || fail214 "纸面锚点簿未从状态恢复"
+CNT214=$((CNT214 + 1))
+grep -qF 'e.clearAnchorBookLocked(clearedCodes)' internal/paper/paper.go || fail214 "单池清盘未清锚点簿（重置后新仓带着上一本账的风险线）"
+
+# ⑧ 行为腿：载体（释放/在途/600s/读数行，23 例）+ 静态真源合并（6 例）+ 两本账锚点。
+PY214=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest \
+	tests/test_carrier_budget_release_20261119.py tests/test_hotreload_static_params.py -q 2>&1 || true )
+CNT214=$((CNT214 + 1))
+grep_q 'passed' PY214 || { echo "--- FAIL: §214 载体行为腿未跑满：$(printf '%s\n' "$PY214" | tail -8)"; B214_FAILED=1; }
+if grep_q 'failed' PY214; then
+	echo "--- FAIL: §214 载体行为腿有红：$(printf '%s\n' "$PY214" | tail -8)"
+	B214_FAILED=1
+fi
+CNT214=$((CNT214 + 1))
+G214=$( go test ./internal/store ./internal/paper -count=1 -run 'TestAnchorBook' 2>&1 || true )
+grep_q '^ok' G214 || { echo "--- FAIL: §214 锚点簿 Go 行为腿未过：$(printf '%s\n' "$G214" | tail -8)"; B214_FAILED=1; }
+
+[ "$B214_FAILED" = "0" ] || exit 1
+echo "ok - §214 §BUDGET-RELEASE 锁通过（600s 两键 + cancel_watch 读数 + 释放三账/一次性/侧别 + spent 口径 + base 合并四锁 + 锚点 T+1 七锁 + 两套行为腿，累计判定点 ${CNT214}）"
 echo ""

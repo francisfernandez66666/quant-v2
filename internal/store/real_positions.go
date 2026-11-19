@@ -959,6 +959,11 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	if err := d.ensureAnchorSourceColumn(); err != nil {
 		return err
 	}
+	// §ANCHOR-T1（owner 2026-11-19）：首买锚点簿惰性建表。清仓会删掉 real_positions 的那一行，
+	// 锚点必须留在本簿里才能"当天再买回来不漂移"——详见 anchor_book.go 的文件头。
+	if err := d.ensureAnchorBook(); err != nil {
+		return err
+	}
 	// §TRADE-LEDGER（2026-11-13）：台账表惰性建表——与 fills 同事务写，失败整体回滚
 	// （绝无「有台账无成交」半态，T12）。
 	if err := d.ensureTradeResults(); err != nil {
@@ -984,8 +989,10 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 
 	var p RealPosition
 	err = tx.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, user_id FROM real_positions WHERE ts_code=? AND (user_id='' OR user_id=?)`, f.Code, f.UserID).
-		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID, &p.UserID)
+		strategy, signal_id, user_id, COALESCE(anchor_price,0), COALESCE(anchor_source,'')
+		FROM real_positions WHERE ts_code=? AND (user_id='' OR user_id=?)`, f.Code, f.UserID).
+		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID,
+			&p.UserID, &p.AnchorPrice, &p.AnchorSource)
 	switch {
 	case err == sql.ErrNoRows:
 		// 首次成交：建仓（卖出空仓视为 no-op，仅记录 fills，不建行）。
@@ -1007,6 +1014,14 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 				amountWithFee = f.Price*float64(f.Qty) + f.Fee
 				buyCostPerShare = amountWithFee / float64(f.Qty)
 			}
+			// §ANCHOR-T1（owner 2026-11-19）：清仓当天再买回来，锚点沿用当天第一次建仓的那个价。
+			// 行没了不等于锚点没了——锚点簿按 (代码, 账号, 交易日) 记住它，只有跨到下一个交易日
+			// 才允许重新冻结（否则止盈/止损的分母会跟着第二次买入漂移）。
+			anchorPrice, anchorSource, aerr := resolveOpenAnchorTx(tx, f.Code, f.UserID,
+				buyCostPerShare, AnchorSourceFirstBuyOrder, f.TradedAt)
+			if aerr != nil {
+				return fmt.Errorf("resolve anchor %s: %w", f.Code, aerr)
+			}
 			// §A1（20260925EVE-W2）：成交回报路径**刻意不写 can_use_qty**——柜台可卖量的唯一权威
 			// 源是对账快照（下一轮 reconcile 落值），本地无权模拟柜台 T+1/冻结口径（"全靠本地
 			// 成交推算"正是本缺陷成因）。此处建行缺列= NULL=未知，闸自动退回本地推算，不误拦。
@@ -1018,8 +1033,8 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date, anchor_price, anchor_source)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				f.Code, f.Name, f.Qty, buyCostPerShare, amountWithFee, f.Price, "", f.SignalID,
-				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate, buyCostPerShare,
-				AnchorSourceFirstBuyOrder)
+				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate, anchorPrice,
+				anchorSource)
 		}
 	case err == nil:
 		now := time.Now().Format("2006-01-02 15:04:05")
@@ -1042,10 +1057,46 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			}
 			// §实盘账户隔离：加仓时一并回写 user_id，确保归属字段不被旧行残值覆盖。
 			// §修复 R8：加仓时若原持仓 name 为空，用本次成交的 name 回填。
+			// §ANCHOR-T1：本笔加仓的含费每股成本（只在"行上还没有锚点"时才会被用到——已有锚点
+			// 一律不改写，裁决二）。
+			addCostPerShare := f.Price
+			if f.Qty > 0 {
+				addCostPerShare = (f.Price*float64(f.Qty) + f.Fee) / float64(f.Qty)
+			}
 			_, err = tx.Exec(`UPDATE real_positions SET qty=?, cost_price=?, amount=?,
 				highest_price=?, updated_at=?, user_id=?, name=CASE WHEN name='' OR name IS NULL THEN ? ELSE name END
 				WHERE ts_code=? AND (user_id='' OR user_id=?)`,
 				newQty, newCost, newCost*float64(newQty), hi, now, ownerID, f.Name, f.Code, f.UserID)
+			if err == nil {
+				// §ANCHOR-T1：买入同时把锚点簿对齐到"这一行现在用的锚点"。
+				// 两种情形都要落：
+				//   ① 行上还没有锚点（对账快照建的行）→ 先看簿里当天有没有，再按本笔成交冻结；
+				//   ② 行上已有锚点（加仓）→ 原样登记进簿，供当天清仓后再买回来时沿用。
+				// 加仓**绝不改写**已有锚点（裁决二），这里只是把它抄进簿里。
+				// 判"有没有锚点"只看价不看来源：`anchor_price>0 且 anchor_source=''` 是历史
+				// 存量行的合法形态（来源不可证但风险线是真的），拿本笔成本去覆盖它正是 owner
+				// 报的那个"锚点漂移"。来源留空由读面判"不可证"，价一律不动。
+				anchorPrice, anchorSource := p.AnchorPrice, p.AnchorSource
+				if anchorPrice <= 0 {
+					anchorPrice, anchorSource, err = resolveOpenAnchorTx(tx, f.Code, ownerID,
+						addCostPerShare, AnchorSourceFirstBuyOrder, f.TradedAt)
+					if err == nil && anchorPrice > 0 {
+						if _, err = tx.Exec(`UPDATE real_positions SET anchor_price=?, anchor_source=?
+							WHERE ts_code=? AND (user_id='' OR user_id=?)`,
+							anchorPrice, anchorSource, f.Code, f.UserID); err != nil {
+							return fmt.Errorf("backfill anchor %s: %w", f.Code, err)
+						}
+					}
+				} else if err = freezeAnchorTx(tx, AnchorBookEntry{
+					TsCode:       f.Code,
+					UserID:       ownerID,
+					AnchorPrice:  anchorPrice,
+					AnchorSource: anchorSource,
+					AnchorDay:    anchorDayOf(f.TradedAt),
+				}); err != nil {
+					return err
+				}
+			}
 		} else {
 			newQty := p.Qty - f.Qty
 			if newQty < 0 {
@@ -1065,6 +1116,22 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			// 防止历史上 user_id 为空的持仓在减仓后仍以全局行形态存在）。
 			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=? WHERE ts_code=? AND (user_id='' OR user_id=?)`,
 				newQty, float64(newQty)*p.CostPrice, now, ownerID, f.Code, f.UserID)
+			// §ANCHOR-T1（owner 2026-11-19「清仓了也要 T+1 才清除」）：清仓这一笔要把锚点
+			// **按今天重登记一次**，价与来源原样不动。日键写成交日而不是"冻结日"是这条规则的
+			// 全部内容：持仓跨了几天以后再清仓，当天回买沿用的仍是这个仓的首买价（不漂移），
+			// 只有到下一个交易日才允许重新冻结。纸面侧 `rememberAnchorLocked` 一直是这个语义
+			// （Day 取 now），两本账必须同口径，否则对照表读起来像两个系统。
+			if newQty <= 0 && p.AnchorPrice > 0 {
+				if err = freezeAnchorTx(tx, AnchorBookEntry{
+					TsCode:       f.Code,
+					UserID:       ownerID,
+					AnchorPrice:  p.AnchorPrice,
+					AnchorSource: p.AnchorSource,
+					AnchorDay:    anchorDayOf(f.TradedAt),
+				}); err != nil {
+					return fmt.Errorf("keep anchor on clear %s: %w", f.Code, err)
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -1809,6 +1876,30 @@ func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// OrderDayByID 返回该委托号在本地已落行的日期前缀（YYYY-MM-DD）。
+//
+// §REPORT-STAMP（2026-11-19）：柜台委托号按会话递增、**跨日会复用**（现网 11-04 的
+// ext:1703…3673 与 11-19 的 1253/1285 同一号段），而 orders 的主键是 order_id。
+// 回报腿的插入是 `INSERT OR IGNORE`，于是"今天这笔同号单"被昨天那行吃掉、连一行都不落
+// （现网 11-19 的 9 笔真实委托只有 4 笔可见）。调用方据此给新一天的行换一个仍可读的键，
+// 失败方向必须是"两行都在"，不是"今天的消失"。
+// English: broker order ids repeat across days while `orders.order_id` is the primary key; the
+// report leg inserts with OR IGNORE, so a same-id collision silently drops today's row.
+func (d *DB) OrderDayByID(orderID string) (string, bool, error) {
+	var created string
+	err := d.db.QueryRow(`SELECT created_at FROM orders WHERE order_id=?`, orderID).Scan(&created)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if len(created) >= 10 {
+		return created[:10], true, nil
+	}
+	return created, true, nil
 }
 
 // RealOrders 返回全部实盘委托单（倒序）。

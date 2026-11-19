@@ -974,6 +974,78 @@ def _pending_buy_rows(orders):
     return out
 
 
+def _reconcile_session_intents(orders, day):
+    """Release same-day buy journals the counter has proved dead.
+
+    MANUAL-CANCEL-FIX (owner report 2026-11-19). Cancelling an unfilled order --
+    from this strategy's stale leg OR by hand in the client -- leaves three
+    session journals pointing at it: `sent` (order dedup), `buy_intents` (one
+    intent per symbol per day) and `buy_amounts` (the money charged to today's
+    budget). Only the auto-cancel path used to drop `sent`, so after a MANUAL
+    cancel the name stayed blocked for the whole day AND its money stayed
+    counted: the reported "cancel does nothing, no new order appears".
+
+    The proof standard matches `counter_codes` (owner ruling 2026-11-17): the
+    intent is dead only when the counter shows at least one row for that symbol
+    AND every row of it today is cancelled-without-fill. A symbol with NO row
+    yet stays journaled -- the ORDER table is seconds late, and dropping the
+    journal on "not visible yet" would double-buy the same intent.
+
+    RELEASE-BUDGET (same day, second half): one cancelled row releases the
+    journal ONCE. Without that counter the re-placed order would be released
+    again next round by the very rows that justified the first release (the new
+    ticket needs seconds to show up), and the same name would be bought twice.
+    The proof is the order id: a release consumes the cancelled ids it saw, and
+    an id-less row cannot prove novelty, so it releases nothing (fail-closed).
+    """
+    if _STATE.get("released_day") != day:
+        _STATE["released_day"] = day
+        _STATE["released_orders"] = set()
+    if "released_orders" not in _STATE:
+        _STATE["released_orders"] = set()
+    seen = {}
+    for row in orders or []:
+        sym = _bare((row or {}).get("symbol"))
+        if not sym:
+            continue
+        seen.setdefault(sym, []).append(row or {})
+    # One entry per SYMBOL (not per journal key): `sent` is keyed by short code
+    # and `buy_intents` by symbol, so iterating both lists would release the
+    # same name twice and report it under two different labels.
+    keys = {}
+    for entry in list(_STATE["sent"]):
+        if entry[0] == day:
+            keys.setdefault(entry[1], set()).add(entry[2])
+    for entry in list(_STATE["buy_intents"]):
+        if entry[0] == day:
+            keys.setdefault(entry[1], set())
+    released = []
+    for sym in sorted(keys):
+        rows = seen.get(_bare(sym))
+        if not rows or not all(bool(r.get("cancel_like")) for r in rows):
+            continue
+        # A SELL row that was cancelled proves nothing about the buy intent.
+        # An unproven side is treated the same way: releasing is the direction
+        # that allows a second buy, so an unknown side must not release.
+        if not all(str(r.get("side") or "") == "buy" for r in rows):
+            continue
+        fresh = [str(r.get("order_id") or "") for r in rows]
+        fresh = [oid for oid in fresh if oid and oid not in _STATE["released_orders"]]
+        if not fresh:
+            continue
+        _STATE["released_orders"].update(fresh)
+        shorts = keys.get(sym) or set()
+        for short in shorts:
+            _STATE["sent"].discard((day, sym, short))
+        _STATE["buy_intents"].discard((day, sym))
+        _STATE["buy_amounts"].pop((day, sym), None)
+        labels = sorted(short for short in shorts if short)
+        released.append(labels[0] if labels else _bare(sym))
+    if released:
+        _log("journal_release cancelled_unfilled=%s" % ",".join(sorted(set(released))[:8]))
+    return released
+
+
 def _pending_amount_for(symbol, pending_rows):
     """Money still working on the counter for THIS symbol (unfilled part)."""
     target = _bare(symbol)
@@ -2046,6 +2118,53 @@ def _series(payload, field, symbol):
         return []
 
 
+def _spent_buy_amount(orders, buy_prefixes, day):
+    """Today's committed buy money = counter truth + session journal, never both.
+
+    BUDGET-RELEASE (owner reports 2026-11-19, two halves):
+
+      * "pending orders occupy the budget" -- the unfilled remainder of a WORKING
+        buy is committed money, so a second signal cannot spend it again;
+      * "after a manual cancel the budget must come back" -- a terminal row
+        (filled / cancelled / rejected) contributes only what it actually
+        traded, so the cancel releases its remainder on the very next round.
+
+    The counter ORDER table is seconds late, so the session journal covers the
+    symbols it has not shown yet. Counting both would charge one intent twice;
+    counting neither would under-charge the round that just sent it. Before
+    2026-11-19 this function looked up the CURRENT symbol only, which is how a
+    cancelled order's amount stayed charged to that name for the whole day.
+
+    Side comes from the counter row (`_order_side`); the baked prefix list is
+    only a fallback for builds that do not expose the side field. An unproven
+    side is treated as a BUY: over-reserving only refuses buys, while
+    under-reserving is the overshoot this exists to stop.
+    """
+    spent = 0.0
+    seen_symbols = set()
+    for row in orders or []:
+        sym = _bare(row.get("symbol"))
+        if sym:
+            seen_symbols.add(sym)
+        side = str(row.get("side") or "")
+        if side and side != "buy":
+            continue
+        short = str(row.get("short_code") or "")
+        if not side and not any(short.startswith(prefix) for prefix in buy_prefixes):
+            continue
+        price = float(row.get("price") or 0.0)
+        spent += float(row.get("traded") or 0.0) * price
+        if row.get("terminal") is False:
+            remain = float(row.get("qty") or 0.0) - float(row.get("traded") or 0.0)
+            if remain > 0.0:
+                spent += remain * price
+    for entry, amount in list((_STATE.get("buy_amounts") or {}).items()):
+        if entry[0] != day or _bare(entry[1]) in seen_symbols:
+            continue
+        spent += float(amount or 0.0)
+    return spent
+
+
 def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     """Assemble the flat decision context for one symbol (counter truth only)."""
     tick = _tick_of(ContextInfo, symbol)
@@ -2062,21 +2181,7 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         code = codes.get(name)
         if code:
             buy_prefixes.add(str(code))
-    spent = 0.0
-    for row in orders or []:
-        # 2026-11-19: the side is the counter's own answer; the prefix list is
-        # only a fallback for rows whose side field this build does not expose.
-        side = str(row.get("side") or "")
-        if side and side != "buy":
-            continue
-        short = str(row.get("short_code") or "")
-        if not side and not any(short.startswith(prefix) for prefix in buy_prefixes):
-            continue
-        spent += row.get("traded", 0.0) * row.get("price", 0.0)
-    # 2026-11-10: the counter ORDER table is seconds late -- the session's own
-    # placed-but-not-yet-reported buys must count too (counter fills UNION
-    # session sends; neither alone is the day total).
-    spent += float(_STATE["buy_amounts"].get((day, symbol), 0.0) or 0.0)
+    spent = _spent_buy_amount(orders, buy_prefixes, day)
     # 2026-11-11 owner: bars come FROM QMT (download_history_data2 + get_market_data_ex)
     # so the ported form/ladder/factor tactics finally have their day-series inputs.
     # Derived features mirror the Go adapters (ma/vol windows over the last bars,
@@ -2766,6 +2871,10 @@ def run_round(ContextInfo, moment):
     # stays blocked exactly as before -- re-place is opened only for a cancelled,
     # unfilled order, never to re-buy a position that actually traded today.
     counter_codes = set(row["short_code"] for row in orders if not row.get("cancel_like"))
+    # MANUAL-CANCEL-FIX (2026-11-19): a cancelled-unfilled order must also stop
+    # blocking its symbol and stop being charged to today's budget, no matter
+    # who cancelled it. Runs BEFORE the budget view is built.
+    _reconcile_session_intents(orders, day_key(moment))
     positions = _positions()
     # P0-A (2026-11-17): whole-market subscribe ran in init; for builds where only
     # per-symbol works, subscribe the held names here (once/day) so the sell legs
@@ -3265,6 +3374,27 @@ def cancel_leg(orders, moment):
     done = []
     now = _now_ts()
     day = day_key(moment)
+    # CANCEL-WATCH (owner report 2026-11-19 "orders never cancel themselves"):
+    # one line per hour naming how many live rows exist, the oldest age and the
+    # threshold actually baked. The absence of such a line is why a whole
+    # afternoon of un-cancelled orders used to look like "the leg never ran":
+    # silence and "nothing was stale" were indistinguishable.
+    watch_key = "%s_%d" % (day, moment.hour)
+    if _STATE.get("cancel_watch_key") != watch_key:
+        _STATE["cancel_watch_key"] = watch_key
+        ages = []
+        open_rows = 0
+        for row in orders:
+            if row.get("terminal") is not False:
+                continue
+            open_rows += 1
+            try:
+                if row.get("order_time") is not None:
+                    ages.append(max(0.0, now - float(row.get("order_time"))))
+            except (TypeError, ValueError):
+                pass
+        _log("cancel_watch open=%d oldest_age=%.0f threshold=%.0f sweep_from=%s" % (
+            open_rows, max(ages) if ages else -1.0, stale_sec, str(sweep_from or "-")))
     for row in orders:
         oid = row.get("order_id") or ""
         if not oid or oid in _STATE["cancel_tried"]:

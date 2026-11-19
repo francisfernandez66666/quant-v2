@@ -814,8 +814,11 @@ func TestHandleQMTReportOrderMissingKeys(t *testing.T) {
 	if row == nil {
 		t.Fatal("手工单委托行应可查（此前静默丢弃形态）")
 	}
-	if row.SignalID != "ext:MANUAL-77" || row.Status != "已报" {
+	if row.SignalID != "ext:20260922:MANUAL-77" || row.Status != "已报" {
 		t.Fatalf("最小状态行键值不符: %+v", row)
+	}
+	if row.CreatedAt != "2026-09-22 10:00:00" {
+		t.Fatalf("缺 created_at 时应退回回报时刻并落完整时间戳（§REPORT-STAMP）, got %q", row.CreatedAt)
 	}
 	// 同单号后续 已成 → 单调推进（占位键幂等）
 	body2 := `{"type":"order","order_id":"MANUAL-77","code":"600000.SH","side":"买入","status":"已成","price":10,"qty":100,"at":"2026-09-22T10:05:00+08:00"}`

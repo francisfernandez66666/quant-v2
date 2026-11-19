@@ -576,6 +576,16 @@ type Engine struct {
 	// English: re-entry cooldown tracker (§R1.4, paper_r12). Records close time; the fill pre-check calls
 	// canReEnter to block re-buys inside the cooldown window after a full close. nil-safe.
 	reEntry *reEntryTracker
+	// anchorBook §ANCHOR-T1（owner 2026-11-19）首买锚点簿：code → 冻结的锚点（含它属于哪个交易日）。
+	// 为什么持仓对象上已经有 AnchorPrice 还要这一张表：清仓时持仓对象整条被删
+	// （sellAllLocked / ResetPool / 减到 0 后被下一次建仓覆盖），锚点跟着消失，于是
+	// 「当天清仓 → 当天再买回来」会把锚点重置成第二次买入的成本，止盈/止损的分母随之漂移。
+	// 规则只有一条：簿里那一行的交易日 == 本笔成交的交易日 ⇒ 沿用，否则按本笔成交重新冻结
+	// （这就是 owner 要的"清仓了也要 T+1 才清除"）。
+	// English: the first-buy anchor book — code → frozen anchor + the trading day it belongs to.
+	// Clearing a position deletes the position object, so a same-day re-buy would otherwise
+	// re-freeze the anchor at the new cost. Same day reuses; a new day re-freezes.
+	anchorBook map[string]anchorBookEntry
 	// §SIGNAL_CONTROLLER 20260917：买入确认状态机（discipline/buyConfirm/SetDiscipline）已整体迁出——
 	// 战法白名单、个股·板块黑名单与持续性确认窗由信号控制器（internal/signalctl）paper 通道
 	// 在 registry 分发前统一裁定；本引擎回归纯执行器（池/撮合/费率/上限），不再持有交易裁决状态。
@@ -838,8 +848,9 @@ func New(cfg Config, path string) *Engine {
 		extraPoolKeys:  make(map[string]bool),
 		positions:      make(map[string]*Position),
 		trimDone:       make(map[string]string),
-		pendingExits:   make(map[string]*PendingExit), // §T1-PARTIAL 残量退出意图表（load 时按盘重建）
-		reEntry:        newReEntryTracker(),           // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
+		pendingExits:   make(map[string]*PendingExit),    // §T1-PARTIAL 残量退出意图表（load 时按盘重建）
+		reEntry:        newReEntryTracker(),              // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
+		anchorBook:     make(map[string]anchorBookEntry), // §ANCHOR-T1 首买锚点簿（清仓当天回买不漂移）
 		lastBuyReject:  make(map[string]string),
 		// §SHORT-3 做空侧初始化：shortCash 预算仅在 ShortCapital>0 时开设（默认 0=关闭）。
 		// load() 若磁盘已有做空持仓则保留恢复值不覆盖（见 paper.go load）。
@@ -1066,6 +1077,12 @@ type persistedState struct {
 	// English: T-round ledger; must survive restarts, otherwise a round opened yesterday loses its
 	// obligation to pair today and the intraday layer / trimmed base silently goes unaccounted for.
 	TRounds []TRound `json:"t_rounds,omitempty"`
+	// AnchorBook §ANCHOR-T1（owner 2026-11-19）首买锚点簿：清仓当天再买回来要沿用同一个首买价，
+	// 而锚点是挂在持仓对象上的、清仓即删。跨重启必须保留（中午重启一次就把当天的首买价丢了）。
+	// 旧文件无此字段 → 空簿，行为与本批之前一致（下次建仓按当笔成交冻结）。
+	// English: the first-buy anchor book — survives restarts, otherwise a mid-day restart loses the
+	// same-day anchor and the re-buy freezes a drifted one.
+	AnchorBook map[string]anchorBookEntry `json:"anchor_book,omitempty"`
 }
 
 // tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
@@ -1108,6 +1125,8 @@ func (e *Engine) persist() {
 		PendingExits: e.pendingExits,
 		// §T-MODE 做 T 回转账随状态落盘（跨重启要能继续配对/收摊）
 		TRounds: e.tRounds,
+		// §ANCHOR-T1 首买锚点簿随状态落盘（清仓当天回买要沿用同一个首买价；中午重启也不能丢）
+		AnchorBook: e.anchorBook,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -1256,6 +1275,13 @@ func (e *Engine) load() {
 	// on the next round instead of vanishing silently.
 	if st.TRounds != nil {
 		e.tRounds = st.TRounds
+	}
+	// §ANCHOR-T1 恢复首买锚点簿（旧数据无此字段 → 空簿，行为与本批之前一致：
+	// 下次建仓按本笔成交冻结）。过期的行不在这里清——判据是"同一交易日才沿用"，
+	// 下一次建仓的写路径会顺手清掉更早的日子。
+	// English: restore the anchor book; stale days are pruned on the next freeze, not here.
+	if st.AnchorBook != nil {
+		e.anchorBook = st.AnchorBook
 	}
 	// §ANCHOR-FIRST W3 存量锚点回填：加载完成、持仓就位后立刻补一次（幂等，只有真的补了才落盘）。
 	// 放在 load 而不是启动期一次性迁移里：纸面账本是**按账号懒加载**的，启动时那些账本还没被读进来，
@@ -2207,6 +2233,9 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	}
 	e.poolPerf[poolKey].Cost += cost
 	totalCost := cost + fee
+	// §ANCHOR-T1（owner 2026-11-19）：清仓当天再买回来，锚点沿用当天第一次建仓的那个价。
+	// 持仓对象上"没有持仓"不等于"没有首买锚点"——簿里按交易日记着它，跨日才允许重新冻结。
+	anchorPrice, anchorSource, anchorAt := e.openAnchorLocked(code, totalCost/float64(qty), anchorSourceFirstLot, now)
 	e.positions[code] = &Position{
 		Code:         code,
 		Name:         name,
@@ -2220,9 +2249,10 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		FilledAt:     now,
 		Mark:         price,
 		// §ANCHOR-FIRST 建仓即冻结的锚点：与当刻 CostPrice 同值（含费），此后没有任何路径改写它。
-		AnchorPrice:  totalCost / float64(qty),
-		AnchorSource: anchorSourceFirstLot, // §DYN-T 建仓即首买价，来源可证（回填只处理 AnchorPrice=0 的存量行）
-		AnchorAt:     now,
+		// §ANCHOR-T1：取值来自锚点簿——当天清仓后再买回来时这里会拿回当天第一次建仓的价。
+		AnchorPrice:  anchorPrice,
+		AnchorSource: anchorSource, // §DYN-T 建仓即首买价，来源可证（回填只处理 AnchorPrice=0 的存量行）
+		AnchorAt:     anchorAt,
 		// §T1-PARTIAL 建仓即建层账：一笔建仓 = 一批，含费每股成本与锚点同源。
 		Lots: []PositionLot{{Qty: qty, Price: totalCost / float64(qty), FilledAt: now}},
 		// §C2 VWAP 偏差：只在采集到时计算；缺失保持 0。
@@ -2794,6 +2824,11 @@ func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason strin
 	// §T1-PARTIAL 层账按 FIFO 扣可卖批次，并刷新展示态（残量若仍含当日批次 → "部分可卖"）。
 	consumeSellableLots(p, sold, now)
 	p.refreshSellStatusLocked(now)
+	// §ANCHOR-T1：减到 0 的持仓对象可能还留在表里（还没被下一次建仓覆盖），也可能马上被删；
+	// 无论哪条路，先把锚点登记进簿——当天回买要沿用它。
+	if p.Qty <= 0 {
+		e.rememberAnchorLocked(p.Code, p.AnchorPrice, p.AnchorSource, p.AnchorAt, now)
+	}
 	e.trades = append(e.trades, Trade{
 		Code:         p.Code,
 		Name:         p.Name,
@@ -2869,6 +2904,10 @@ func (e *Engine) sellAllLocked(p *Position, price float64, reason string) (int, 
 	consumeSellableLots(p, p.Qty, now)
 	p.Lots = nil
 	p.Status = ""
+	// §ANCHOR-T1：清仓**不删锚点**——当天再买回来要沿用同一个首买价（跨日才允许重新冻结）。
+	// 这里显式登记一次是为了覆盖"从磁盘加载进来的老持仓"：那些行没有簿记录，清仓后再买
+	// 会重新冻结，锚点就漂了。
+	e.rememberAnchorLocked(p.Code, p.AnchorPrice, p.AnchorSource, p.AnchorAt, now)
 	delete(e.positions, p.Code)
 	// 清仓镜像（阶段1.2）：report 账对应记录同步平仓（pap_<code> 稳定键）。
 	// English: close mirror (unified books) — the report-book record closes in sync (stable key pap_<code>).
@@ -3123,6 +3162,9 @@ func (e *Engine) Reset() {
 	// "liquidate and restart clean" contract.
 	e.poolDiscipline = make(map[string]poolDiscipline)
 	e.reEntry = newReEntryTracker()
+	// §ANCHOR-T1：清盘是账本重开（不是市场行为），锚点簿一并清空——否则重置后新建的仓会带着
+	// 上一本账的首买价当风险线（"清盘了但止损线还是旧的"）。
+	e.anchorBook = make(map[string]anchorBookEntry)
 	// §SHORT-3 做空侧同步清盘：空头清零、池现金按预算重新开设（融券负债随持仓一并注销，
 	// 纸面无真实对手方）。
 	// English: §SHORT-3 — the global reset also liquidates the short book and re-funds the margin
@@ -3148,6 +3190,7 @@ func (e *Engine) ResetPool(key string) {
 	defer e.mu.Unlock()
 	proceeds := 0.0
 	closed := 0
+	var clearedCodes []string
 	for code, p := range e.positions {
 		if p.StrategyType == key {
 			// §修复 S6（2026-08-29）：清盘回补现金优先用估值价(Mark)，未估值(Mark<=0，盘后/
@@ -3165,6 +3208,8 @@ func (e *Engine) ResetPool(key string) {
 			// §T1-PARTIAL：本池清盘也注销该码的残量意图（池已清，意图不能再在次日替用户卖出重开的仓）。
 			// English: single-pool liquidation drops that code's residual intent for the same reason.
 			delete(e.pendingExits, code)
+			// §ANCHOR-T1：单池清盘同样是账本重开，锚点簿里这个码的旧行一并清掉。
+			clearedCodes = append(clearedCodes, code)
 			closed++
 			// 清盘镜像（阶段1.2）：report 账对应记录同步平仓（按估值价/成本价结算）。
 			// English: liquidation mirror (unified books) — the report-book record closes in sync
@@ -3176,6 +3221,7 @@ func (e *Engine) ResetPool(key string) {
 		e.pools[key] += proceeds
 		e.cash += proceeds
 	}
+	e.clearAnchorBookLocked(clearedCodes) // §ANCHOR-T1：清盘不是市场行为，旧锚点不许带进新账
 	if e.poolPerf[key] != nil {
 		// §P1-I 一致性：单池清盘后该池累计表现（含胜率计数/成本/已实现）整块归零，
 		// 此前只清了 Cost/Realized，WinRate 等派生计数残留导致清盘后统计失真。

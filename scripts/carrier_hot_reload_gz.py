@@ -81,6 +81,103 @@ BULLISH_MIN_SCORE = float(os.environ.get("BULLISH_MIN_SCORE", "60"))
 HOT_POOL_MAX = int(os.environ.get("HOT_POOL_MAX", "30"))
 SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "1000"))  # owner 2026-11-13：监视池上限 1000（裁决 10）
 
+# ---------------------------------------------------------------------------
+# §PARAMS-STATIC-BASE（2026-11-19）：静态旋钮与运行态字段分家。
+#
+# 为什么必须有这一层（现网实锤）：`qmt_gateway/local_executor_params.json` 自 11-12 起
+# 不再随 rsync 下发（要用 gz 上那份运行态：监视池/行业桶/预计算/锚点簿），于是**静态旋钮**
+# 也跟着冻在 gz 的旧副本上——11-19 烘出来的 `stale_order_sec=900`（仓库真源是 600）让
+# 10 分钟超时撤单永远不成立，`close_sweep_from` 也还停在 14:52（11-13 已裁到 14:50）。
+# 两处都不是代码缺陷，而是"同一枚数在两地各一份"。
+#
+# 分法：仓库那份（随 rsync 落成 `local_executor_params.base.json`）是**全部静态旋钮**的
+# 唯一真源；下面这组键是**运行态**（由本脚本 / pregen / sync_* 每轮重算写入），永远以
+# gz 现值为准。合并方向因此是「先取 base，再把运行态键盖回去」，且任何只存在于运行态
+# 文件里的新键都原样保留（宁可多留，不可像 11-12 那次把 600 池冲掉）。
+PARAMS_BASE_NAME = "local_executor_params.base.json"
+RUNTIME_PARAM_KEYS = frozenset((
+    "hot_pool", "precalc", "symbols", "t_anchor_book", "t_macro",
+    "concept_map", "industry_map", "live_rules", "risk_list_dynamic",
+))
+# 顶层（不在 params 内）的运行态键：版本号必须单调，不能被 base 里的旧值盖回去。
+RUNTIME_DOC_KEYS = frozenset(("strategy_version",))
+
+
+def merge_static_params(runtime_doc, base_doc):
+    """Overlay the shipped static base on one runtime params doc -> (merged, patched).
+
+    `patched` is [(key, runtime_value, base_value)] for the static keys the base
+    corrected; the caller prints it (ASCII, one line per key) so a silent
+    re-tune of a live strategy is never silent.
+
+    Kept pure (no file IO) on purpose: the box-side behaviour is tested in
+    qmt_gateway/tests/test_hotreload_static_params.py.
+    """
+    merged = json.loads(json.dumps(base_doc))
+    base_params = merged.get("params") or {}
+    runtime_params = (runtime_doc or {}).get("params") or {}
+    patched = []
+    for key in sorted(runtime_params):
+        if key in RUNTIME_PARAM_KEYS:
+            base_params[key] = runtime_params[key]
+            continue
+        if key not in base_params:
+            # A key the base does not know: it can only be runtime state that
+            # was added after this base was cut. Keeping it is the fail-safe
+            # direction (dropping it is how the 11-12 pool wipe happened).
+            base_params[key] = runtime_params[key]
+            continue
+        if base_params[key] != runtime_params[key]:
+            patched.append((key, runtime_params[key], base_params[key]))
+    merged["params"] = base_params
+    for key in RUNTIME_DOC_KEYS:
+        if isinstance(runtime_doc, dict) and key in runtime_doc:
+            merged[key] = runtime_doc[key]
+    return merged, patched
+
+
+def _params_base_path():
+    return os.path.join(BUILD_DIR, "qmt_gateway", PARAMS_BASE_NAME)
+
+
+def static_base_digest():
+    """Digest of the shipped base (empty when absent) — folded into the bake sha
+    so "only a static knob changed" still triggers a re-bake."""
+    try:
+        with open(_params_base_path(), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def apply_static_params_base():
+    """Merge the shipped static base into the runtime params file (in place).
+
+    Runs before every bake. Absent base = old deployment: keep the runtime copy
+    untouched and say so loudly (never a silent half-state).
+    """
+    base_path = _params_base_path()
+    runtime_path = os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_params.json")
+    if not os.path.exists(base_path):
+        print("HOTRELOAD_PARAMS_BASE_ABSENT file=%s action=keep_runtime_copy" % PARAMS_BASE_NAME)
+        return 0
+    try:
+        with open(runtime_path, encoding="utf-8") as fh:
+            runtime_doc = json.load(fh)
+        with open(base_path, encoding="utf-8") as fh:
+            base_doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die("params_base_unreadable:%s" % repr(exc)[:80])
+    merged, patched = merge_static_params(runtime_doc, base_doc)
+    for key, old, new in patched:
+        print("HOTRELOAD_PARAMS_STATIC_PATCH key=%s runtime=%s base=%s" % (
+            key, json.dumps(old, ensure_ascii=True)[:90], json.dumps(new, ensure_ascii=True)[:90]))
+    with open(runtime_path, "w", encoding="utf-8") as fh:
+        json.dump(merged, fh, ensure_ascii=True, indent=2)
+    print("HOTRELOAD_PARAMS_MERGED static_patched=%d" % len(patched))
+    return len(patched)
+
+
 
 def die(reason):
     """带 ASCII 锚的硬退出：HOTRELOAD_GZ_ABORT reason=...——任何烘焙前置失败
@@ -649,6 +746,10 @@ def main():
                           "signal_pool": signal_pool, "precalc": precalc_meta,
                           "buy_codes": sorted(extract_buy_codes()),
                           "t_bake": t_bake_digest,
+                          # §PARAMS-STATIC-BASE: a change to a static knob (or to
+                          # this base file itself) must re-bake, otherwise the box
+                          # keeps running the old number forever.
+                          "static_base": static_base_digest(),
                           "buckets": {"industry": len(_bp.get("industry_map") or {}),
                                       "concept": len(_bp.get("concept_map") or {}),
                                       "digest": hashlib.sha256(json.dumps(
@@ -662,6 +763,10 @@ def main():
         return 0
     print("HOTRELOAD_GZ payload sha=%s wl=%d bearish=%d bullish=%d" % (
         sha, len(wl), len(bearish), len(bullish)))
+
+    # 0) §PARAMS-STATIC-BASE：先把仓库那份静态真源合进运行态参数文件。
+    # 必须在快照/派生/烘焙之前——后面每一步读的都是这份 params。
+    apply_static_params_base()
 
     # 1) 快照重建 + 双派生（漂移各自 ABORT，绝不带病烘参）
     try:

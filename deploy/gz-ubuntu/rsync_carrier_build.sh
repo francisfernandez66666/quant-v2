@@ -24,10 +24,18 @@ FILES=(
   # qmt_gateway/local_executor_params.json 已移出清单（§PARAMS-RUNTIME-20261112）：
   # 它是 gz 运行态文件（hot reload 写监视池/pool、pregen 回填行业桶），rsync 每次用
   # 仓库旧副本覆盖会冲掉运行态（11-12 实录：600 池与 508 行业桶被一次 rsync 清空）。
-  # 云侧真源 = gz BUILD_DIR 上这份；仓库副本仅作本地构建默认值，不再下发。
+  # 云侧运行态真源 = gz BUILD_DIR 上这份。仓库副本**仍要下发**，但只落成 `.base.json`
+  # （见下面 §PARAMS-STATIC-BASE）：静态旋钮以仓库为准、运行态键以 gz 为准，两边各管一半。
   qmt_gateway/live_rules_snapshot.json
   qmt_gateway/strategy_switches_snapshot.json
 )
-tar -czf /tmp/carrier_build.tgz "${FILES[@]}"
+# §PARAMS-STATIC-BASE（2026-11-19）：仓库这份参数文件是**全部静态旋钮**的唯一真源，
+# 但要落成 `.base.json`——直接覆盖 `local_executor_params.json` 会冲掉 gz 上的运行态
+# （监视池/行业桶/预计算/锚点簿，11-12 实录）。改到本文件或任一静态旋钮后重跑本脚本。
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/qmt_gateway"
+cp qmt_gateway/local_executor_params.json "$STAGE/qmt_gateway/local_executor_params.base.json"
+tar -czf /tmp/carrier_build.tgz "${FILES[@]}" -C "$STAGE" qmt_gateway/local_executor_params.base.json
 scp -q /tmp/carrier_build.tgz gz:/tmp/carrier_build.tgz
 ssh gz "sudo -n mkdir -p /opt/quant/carrier_build && sudo -n tar -xzf /tmp/carrier_build.tgz -C /opt/quant/carrier_build && sudo -n chmod -R 755 /opt/quant/carrier_build && echo RSYNC_OK"
