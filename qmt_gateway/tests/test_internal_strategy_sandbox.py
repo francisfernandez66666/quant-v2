@@ -484,3 +484,141 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         sized_note = "cash=%.0f" % cap
         self.assertIn("cash=", sized_note)
 
+    # ---- 2026-11-19 owner rulings ----------------------------------------
+    def _sizing_ctx(self, cash=100000.0, **extra):
+        ctx = {"available_cash": cash, "daily_buy_total": 0.0,
+               "total_asset": 100000.0, "equity": 100000.0}
+        ctx.update(extra)
+        return ctx
+
+    def test_new_position_below_the_floor_is_topped_up(self):
+        """owner 2026-11-19: 1万是建仓底线，不足一万就补足一万（不是拒单）。"""
+        mod = self.mod
+        saved = mod._account_total_asset
+        mod._account_total_asset = lambda: 100000.0
+        try:
+            mod.PARAMS.update({"sizing_enabled": True, "min_cash_reserve": 0.0,
+                               "order_amount_cap": 1e9, "daily_buy_cap": 1e9,
+                               "min_order_amount": 10000.0,
+                               "per_trade_position_pct": 0.05,
+                               "per_trade_position_max_pct": 0.05,
+                               "max_total_position_pct": 1.0})
+            amount, reason, note = mod.sizing_cap(self._sizing_ctx(), {})
+            self.assertEqual(reason, "")
+            self.assertEqual(amount, 10000.0, "5%% 的动态额度被直接拒了，没有补到 1 万底线")
+            self.assertTrue(note.startswith("floor_topup:"), note)
+        finally:
+            mod._account_total_asset = saved
+
+    def test_floor_top_up_still_refuses_when_cash_cannot_pay(self):
+        """补底线只绕开 per_trade 那一顶；现金不够一万仍然拒（不许透支）。"""
+        mod = self.mod
+        saved = mod._account_total_asset
+        mod._account_total_asset = lambda: 100000.0
+        try:
+            mod.PARAMS.update({"sizing_enabled": True, "min_cash_reserve": 0.0,
+                               "order_amount_cap": 1e9, "daily_buy_cap": 1e9,
+                               "min_order_amount": 10000.0,
+                               "per_trade_position_pct": 0.05,
+                               "per_trade_position_max_pct": 0.05,
+                               "max_total_position_pct": 1.0})
+            amount, reason, _note = mod.sizing_cap(self._sizing_ctx(cash=4000.0), {})
+            self.assertIsNone(amount)
+            self.assertEqual(reason, "sizing_amount_unavailable")
+        finally:
+            mod._account_total_asset = saved
+
+    def test_add_intent_is_still_exempt_from_the_floor(self):
+        """Q7 不动：加仓/做T 腿不吃 1 万底线，也不再被补成 1 万。"""
+        mod = self.mod
+        saved = mod._account_total_asset
+        mod._account_total_asset = lambda: 100000.0
+        try:
+            mod.PARAMS.update({"sizing_enabled": True, "min_cash_reserve": 0.0,
+                               "order_amount_cap": 1e9, "daily_buy_cap": 1e9,
+                               "min_order_amount": 10000.0,
+                               "per_trade_position_pct": 0.05,
+                               "per_trade_position_max_pct": 0.05,
+                               "max_total_position_pct": 1.0})
+            amount, reason, _note = mod.sizing_cap(self._sizing_ctx(), {}, intent="add")
+            self.assertEqual(reason, "")
+            self.assertEqual(amount, 5000.0)
+        finally:
+            mod._account_total_asset = saved
+
+    # ---- ORDER table read (2026-11-19 P0) --------------------------------
+    def test_order_table_reads_m_str_remark_and_the_side(self):
+        """载体以前只读 m_strOrderRemark ⇒ 每一行都被当成"别人的单"丢掉。
+
+        本柜台的实证字段是 m_strRemark（qmt_bridge_strategy.py:714 用了几个月）。
+        """
+        mod = self.mod
+
+        class Row(object):
+            pass
+
+        buy = Row()
+        buy.m_strRemark = "%s-FC600000" % mod.STRATEGY_VERSION
+        buy.m_nOrderStatus = 50
+        buy.m_nOffsetFlag = 48          # buy, offset space
+        buy.m_strOrderSysID = "OID-B"
+        buy.m_strInstrumentID = "600000"
+        buy.m_nOrderVolume = 1000
+        buy.m_nTradedVolume = 0
+        buy.m_dLimitPrice = 10.0
+        sell = Row()
+        sell.m_strRemark = "%s-SL600001" % mod.STRATEGY_VERSION
+        sell.m_nOrderStatus = 50
+        sell.m_nOffsetFlag = 50         # sell, offset space
+        sell.m_strInstrumentID = "600001"
+        sell.m_nOrderVolume = 500
+        sell.m_nTradedVolume = 0
+        sell.m_dLimitPrice = 9.0
+
+        saved_rows = mod._counter_rows
+        mod._counter_rows = lambda table: [buy, sell] if table == "ORDER" else []
+        try:
+            rows, ok = mod._live_orders()
+        finally:
+            mod._counter_rows = saved_rows
+        self.assertTrue(ok)
+        self.assertEqual(len(rows), 2, "m_strRemark 里的短码没被认出来")
+        self.assertEqual(rows[0]["side"], "buy")
+        self.assertEqual(rows[1]["side"], "sell")
+        self.assertEqual(mod._STATE["order_raw"], 2)
+        self.assertEqual(mod._STATE["order_kept"], 2)
+
+        # Pending budget: the BUY reserves money, the SELL never does -- and the
+        # buy's short code ("FC...") is NOT in bake-time buy_signals ("PB"),
+        # which is exactly how five working FC buys stayed invisible today.
+        pending = mod._pending_buy_rows(rows)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["symbol"], "600000")
+        self.assertEqual(pending[0]["remain"], 1000)
+
+    def test_pending_rows_survive_a_restart_without_session_memory(self):
+        """重启后会话账清零，但在途单必须仍然占预算（owner 2026-11-19）。"""
+        mod = self.mod
+        rows = [{"symbol": "000001", "short_code": "FC000001", "side": "buy",
+                 "terminal": False, "qty": 1600, "traded": 0, "price": 8.0}]
+        pending = mod._pending_buy_rows(rows)
+        self.assertEqual(mod._pending_amount_for("000001.SZ", pending), 12800.0)
+        self.assertEqual(mod._pending_amount_for("000002", pending), 0.0)
+
+    # ---- floor top-up arithmetic (2026-11-19) -----------------------------
+    def test_floor_topup_qty_rounds_UP_to_reach_the_floor(self):
+        """10000 / 6.81 整手截断是 1400 股=9534，补底线要 1500 股。"""
+        qty = self.mod._floor_topup_qty(10000.0, 6.81, 100.0, 20000.0)
+        self.assertEqual(qty, 1500)
+        self.assertGreaterEqual(qty * 6.81, 10000.0)
+
+    def test_floor_topup_qty_refuses_when_the_ceiling_cannot_pay(self):
+        """天花板（现金/单笔帽/剩余额度）付不起底线 ⇒ None，绝不透支。"""
+        self.assertIsNone(self.mod._floor_topup_qty(10000.0, 6.81, 100.0, 9902.0))
+        self.assertIsNone(self.mod._floor_topup_qty(10000.0, 0.0, 100.0, 20000.0))
+        self.assertIsNone(self.mod._floor_topup_qty(0.0, 6.81, 100.0, 20000.0))
+
+    def test_floor_topup_qty_exact_multiples_are_left_alone(self):
+        """刚好整手够底线时不多买一手。"""
+        self.assertEqual(self.mod._floor_topup_qty(10000.0, 10.0, 100.0, 20000.0), 1000)
+

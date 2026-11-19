@@ -24130,3 +24130,67 @@ fi
 [ "$B212_FAILED" = "0" ] || exit 1
 echo "ok - §212 §PUBLISH-EXACT 锁通过（按版本名取件 + 缺失响亮失败 + 字典序负锁，累计判定点 ${CNT212}）"
 echo ""
+
+# ---------------------------------------------------------------------------
+# §213 §OWNER-20261119（owner 三条裁决：单票只算本票 / 1万是建仓底线要补足 / 在途单占预算）。
+# 事故链（同一天、同一条买入腿，三个独立缺陷叠加成「整天空仓」）：
+#   ① `_bucket_view` 的 stock_value 把**全簿**持仓加在一起，于是"任何一只持仓市值 ≥ 35%"
+#      就拒掉所有新名字——09:59:55 探针原文 single_stock=846（99156×35%=34705 减 002093 的
+#      33859 剩 846），938 条 skip 里 813 条是这个原因，直到 10:01:20 002093 卖掉才放行。
+#      Go 侧一直是按码取（engine.go:2058 / paper.go:1765-1773），单票帽是集中度底线不是总仓控制。
+#   ② 动态链的 per_trade 档（账面 99022×10%=9902）低于 min_order_amount=10000 ⇒ k≈0 的票
+#      恒被拒；owner 裁决"不足一万补足一万"（只绕过 per_trade 这一顶，其余硬帽仍全绑）。
+#   ③ ORDER 表读成 0 行（本轮另一条修复）使在途买单从不占预算：目标空间停在 49.5k 而实际
+#      已到 77.8k；顺带清旧单/去重也失去柜台证据（cancelled=[] 恒空、重启即重发同名买单）。
+echo "==> 213 §20261119-OWNER-RULINGS（单票只算本票 + 1万底线补足 + 在途买单占预算）..."
+B213_FAILED=0
+fail213() {
+	echo "--- FAIL: §213 $*"
+	FAIL=1
+	B213_FAILED=1
+}
+CNT213=0
+
+# ① 单票：stock_value 只累加本票（同码不同后缀也算本票）。
+CNT213=$((CNT213 + 1))
+grep -qF 'if _bare(sym) != target:' qmt_gateway/qmt_internal_strategy.py || fail213 "单票市值又回到全簿累加（任何一只大仓就会拒掉所有新名字）"
+# ② 行业/概念仍按全簿（那是"组"的帽，不是单票的）。
+CNT213=$((CNT213 + 1))
+grep -qF 'if industry_known and (PARAMS.get("industry_map") or {}).get(sym) == industry:' qmt_gateway/qmt_internal_strategy.py || fail213 "行业桶被误改成只算本票（组帽会失效）"
+# ③ 底线补足：sizing_cap 必须有 floor_topup 分支，且只绕开 per_trade 一顶。
+CNT213=$((CNT213 + 1))
+grep -qF 'hard = [v for k, v in caps.items() if k != "per_trade" and v is not None]' qmt_gateway/qmt_internal_strategy.py || fail213 "1万底线补足未绕开 per_trade（k≈0 的票仍会被 9902 拒掉）"
+CNT213=$((CNT213 + 1))
+grep -qF 'return floor, "", "floor_topup:%.2f" % allow' qmt_gateway/qmt_internal_strategy.py || fail213 "1万底线补足分支缺失或被改成拒单"
+# ④ 整手截断不许把补足后的额度又打回 1 万以下（10000/6.81 整手=9534）。
+CNT213=$((CNT213 + 1))
+grep -qF 'def _floor_topup_qty(floor, price, lot, ceiling):' qmt_gateway/qmt_internal_strategy.py || fail213 "整手补足助手缺失（补足后仍会按整手截断回 9534）"
+# ⑤ 在途买单占用预算：侧别从柜台行读，读不到时按"我方短码"兜底，卖出永不占预算。
+CNT213=$((CNT213 + 1))
+grep -qF 'def _order_side(item, op_buy=23, op_sell=24):' qmt_gateway/qmt_internal_strategy.py || fail213 "在途单侧别判据缺失（卖出单会被当成买单占预算）"
+CNT213=$((CNT213 + 1))
+grep -qF 'pending_buy_amount=0.0' qmt_gateway/qmt_internal_strategy.py || fail213 "单票桶未接在途买单金额（重启后在途单不再占单票空间）"
+# ⑥ 负锁：ORDER 表 remark 的**首个**读取字段必须是 m_strRemark（本柜台实证字段）。
+CNT213=$((CNT213 + 1))
+if ! grep -qE 'getattr\(item, "m_strRemark", None\),' qmt_gateway/qmt_internal_strategy.py; then
+	fail213 "ORDER remark 不再首读 m_strRemark（整表会被当别人的单丢掉 ⇒ 在途单 0 行）"
+fi
+# ⑦ 负锁：pending 单不许再按 bake-time buy_signals 前缀过滤（那是 PB，FC… 全被漏掉）。
+CNT213=$((CNT213 + 1))
+if grep -qE '^[[:space:]]*prefixes = set\(\)' qmt_gateway/qmt_internal_strategy.py; then
+	fail213 "在途单又按 buy_signals 前缀过滤（因子综合买入会再次不占预算）"
+fi
+
+# ⑧ 行为腿：三组用例（单票桶 / 底线补足 / ORDER 表读取与在途预算）+ 反证在用例内。
+PY213=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest \
+	tests/test_carrier_gates_20261110.py tests/test_internal_strategy_sandbox.py -q 2>&1 || true )
+CNT213=$((CNT213 + 1))
+grep_q 'passed' PY213 || { echo "--- FAIL: §213 载体行为腿未跑满：$(printf '%s\n' "$PY213" | tail -8)"; B213_FAILED=1; }
+if grep_q 'failed' PY213; then
+	echo "--- FAIL: §213 载体行为腿有红：$(printf '%s\n' "$PY213" | tail -8)"
+	B213_FAILED=1
+fi
+
+[ "$B213_FAILED" = "0" ] || exit 1
+echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 在途占预算 + m_strRemark 首读 + 前缀负锁，累计判定点 ${CNT213}）"
+echo ""

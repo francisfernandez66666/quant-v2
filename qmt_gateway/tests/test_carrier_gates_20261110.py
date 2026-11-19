@@ -148,14 +148,42 @@ class GateThreeStateTest(unittest.TestCase):
 
     # ---- concentration buckets -------------------------------------------
     def test_bucket_known(self):
+        """2026-11-19: stock_value is THIS name only; industry/cluster stay whole-book.
+
+        Owner ruling: "the single-name cap is about that name only". The old
+        assertion (`> 5000`) locked the whole-book sum that made every NEW name
+        refused while any holding sat above 35% (probe: equity 99156 x 35% =
+        34705 minus a 33859 holding left 846 -> sizing_amount_unavailable x813).
+        """
         positions = {"600000.SH": {"qty": 200.0, "market_value": 20000.0}}
         b = m._bucket_view("000001.SZ", positions, {"last_price": 10.0}, 5000.0)
         self.assertTrue(b["industry_known"])
         self.assertTrue(b["cluster_set"])
-        # stock_value = session 5000 + own 100*10 (held != symbol) ... 600000.SH mv=20000
-        self.assertGreater(b["stock_value"], 5000.0)
+        # A holding of ANOTHER name contributes nothing to this name's room.
+        self.assertEqual(b["stock_value"], 5000.0)
+        # ...while the group caps still see the whole book.
         self.assertGreater(b["industry_value"], 0.0)
         self.assertGreater(b["cluster_value"], 0.0)
+
+    def test_bucket_single_name_is_per_symbol(self):
+        """The held row of the SAME name DOES count (room = cap - own holding)."""
+        positions = {"000001": {"qty": 200.0, "market_value": 20000.0}}
+        b = m._bucket_view("000001.SZ", positions, {"last_price": 10.0}, 0.0)
+        self.assertEqual(b["stock_value"], 2000.0)  # mark = tick 10.0 x 200
+        # suffix differences must not hide the held row either way
+        b2 = m._bucket_view("000001", {"000001.SZ": {"qty": 200.0,
+                                                     "market_value": 20000.0}},
+                            {"last_price": 10.0}, 0.0)
+        self.assertEqual(b2["stock_value"], 2000.0)
+
+    def test_bucket_pending_buy_counts_toward_single_name(self):
+        """Counter-visible pending buys of this name occupy its single-name room."""
+        b = m._bucket_view("000001", {}, {"last_price": 10.0}, 0.0, 3000.0)
+        self.assertEqual(b["stock_value"], 3000.0)
+        # max(), not sum(): the same money must not be counted twice when both
+        # the session tally and the counter row describe the same send.
+        b2 = m._bucket_view("000001", {}, {"last_price": 10.0}, 4000.0, 3000.0)
+        self.assertEqual(b2["stock_value"], 4000.0)
 
     def test_bucket_unknown_industry(self):
         positions = {}

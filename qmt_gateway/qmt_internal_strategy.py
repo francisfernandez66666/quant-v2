@@ -358,6 +358,55 @@ def _order_submit_epoch(item):
     return midnight + float(order_sod)
 
 
+def _int_or(value, default=None):
+    """int(value) or default on TypeError/ValueError/None (never raises)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _order_side(item, op_buy=23, op_sell=24):
+    """One ORDER row's side: "buy" / "sell" / "" when unproven.
+
+    Same enum space the retired bridge proved on this box
+    (qmt_bridge_strategy.py:300-390): m_nDirection 48/0=buy 49/1=sell,
+    m_nOffsetFlag 48=buy 50=sell, m_nOrderType 23/1101=buy 24/1102=sell.
+    Reading the side is what lets pending BUY orders reserve budget without
+    charging SELL orders against cash (a sell frees cash, it never spends it).
+    An unproven side stays "" and the caller treats it as a buy -- over-
+    reserving money is the fail-closed direction.
+    """
+    votes = set()
+    # Build gate g2 forbids getattr(item, <loop variable>): every attribute name
+    # must be a literal so a reader can see exactly what this file depends on.
+    direction = _int_or(getattr(item, "m_nDirection", None))
+    if direction in (0, 48):
+        votes.add("buy")
+    elif direction in (1, 49, 50):
+        votes.add("sell")
+    offset = _int_or(getattr(item, "m_nOffsetFlag", None))
+    if offset == 48:
+        votes.add("buy")
+    elif offset == 50:
+        votes.add("sell")
+    offset_type = _int_or(getattr(item, "offset_type", None))
+    if offset_type == 48:
+        votes.add("buy")
+    elif offset_type == 50:
+        votes.add("sell")
+    if len(votes) == 1:
+        return votes.pop()
+    otype = _int_or(getattr(item, "m_nOrderType", None))
+    if otype is None:
+        otype = _int_or(getattr(item, "order_type", None))
+    if otype in (23, 1101) or (otype is not None and otype == op_buy):
+        return "buy"
+    if otype in (24, 1102) or (otype is not None and otype == op_sell):
+        return "sell"
+    return ""
+
+
 def _live_orders():
     """Today's OWN live orders, normalised -> (rows, ok).
 
@@ -365,32 +414,69 @@ def _live_orders():
     nothing at all. Rows carrying a foreign remark (no short code we recognise)
     are dropped -- another program's or a hand-placed order is not our asset to
     cancel, and counting it would also charge it against our daily budget.
+
+    2026-11-19 P0: the remark field order was WRONG. The proven shape on this
+    counter is m_strRemark (qmt_bridge_strategy.py:714, the bridge that traded
+    this account for months); this file asked m_strOrderRemark first and never
+    looked at m_strRemark at all. Every ORDER row therefore read remark="",
+    short_code_from_remark returned "", and the whole table was dropped as
+    "foreign" -- the live log printed `views pos=N ord=0` on all 279 rounds of
+    2026-11-19 (101 rounds on 11-18) while five buy orders sat working on the
+    counter. Two things died with it: pending buys never reserved any budget
+    (target room stayed wide open) and already_sent/stale-cancel had no counter
+    evidence at all. `order_raw`/`order_kept` are kept for the next diagnosis:
+    raw>0 with kept=0 is a field-name drift, raw=0 is a genuinely empty table.
     """
     raw = _counter_rows("ORDER")
     if raw is None:
         return [], False
+    _STATE["order_raw"] = len(raw)
     out = []
     codes = XT_STATUS_CODES
+    op_buy = _int_or(PARAMS.get("op_type_buy"), 23)
+    op_sell = _int_or(PARAMS.get("op_type_sell"), 24)
     for item in raw:
-        remark = str(_pick(getattr(item, "m_strOrderRemark", None), getattr(item, "order_remark", None), getattr(item, "remark", None)) or "")
+        remark = str(_pick(getattr(item, "m_strRemark", None),
+                           getattr(item, "m_strOrderRemark", None),
+                           getattr(item, "order_remark", None),
+                           getattr(item, "remark", None)) or "")
         short = short_code_from_remark(remark)
         if not short:
             continue
         status, terminal = normalize_order_status(
             _pick(getattr(item, "m_nOrderStatus", None), getattr(item, "order_status", None)), codes, TERMINAL_STATUSES)
+        traded = _to_float(_pick(getattr(item, "m_nTradedVolume", None), getattr(item, "traded_volume", None)), 0.0)
         out.append({
             "order_id": str(_pick(getattr(item, "m_strOrderSysID", None), getattr(item, "order_id", None)) or ""),
             "symbol": str(_pick(getattr(item, "m_strInstrumentID", None), getattr(item, "stock_code", None)) or ""),
             "remark": remark,
             "short_code": short,
+            "side": _order_side(item, op_buy, op_sell),
             "status": status,
             "terminal": terminal,
             "qty": _to_float(_pick(getattr(item, "m_nOrderVolume", None), getattr(item, "order_volume", None)), 0.0),
-            "traded": _to_float(_pick(getattr(item, "m_nTradedVolume", None), getattr(item, "traded_volume", None)), 0.0),
+            "traded": traded,
             "price": _to_float(_pick(getattr(item, "m_dLimitPrice", None), getattr(item, "price", None)), 0.0),
             "order_time": _order_submit_epoch(item),
-            "cancel_like": bool(terminal and _to_float(_pick(getattr(item, "m_nTradedVolume", None), getattr(item, "traded_volume", None)), 0.0) <= 0.0),
+            "cancel_like": bool(terminal and traded <= 0.0),
         })
+    _STATE["order_kept"] = len(out)
+    if raw and not out:
+        # raw rows but not one carries our wire remark: a field-name drift, not
+        # an empty table. Print the candidate values once (literal attributes
+        # only -- build gate g2 forbids dir()/getattr-with-a-variable) so the
+        # next build is a grep instead of another guess.
+        first = raw[0]
+        _warn_once("order_remark_drift",
+                   "ORDER table has %d rows but no remark parsed: m_strRemark=%s "
+                   "m_strOrderRemark=%s order_remark=%s remark=%s status=%s" % (
+                       len(raw),
+                       repr(_pick(getattr(first, "m_strRemark", None))),
+                       repr(_pick(getattr(first, "m_strOrderRemark", None))),
+                       repr(_pick(getattr(first, "order_remark", None))),
+                       repr(_pick(getattr(first, "remark", None))),
+                       repr(_pick(getattr(first, "m_nOrderStatus", None),
+                                  getattr(first, "order_status", None)))))
     return out, True
 
 
@@ -682,21 +768,48 @@ def _asset_guard_ok(total, cash, positions):
     return total <= floor * factor + (cash or 0.0) + mv
 
 
-def _bucket_view(symbol, positions, tick, session_buy_amount):
+def _bare(code):
+    """Bare 6-digit head of a code ("002093.SZ" -> "002093")."""
+    return str(code or "").split(".")[0]
+
+
+def _bucket_view(symbol, positions, tick, session_buy_amount, pending_buy_amount=0.0):
     """Fill the concentration buckets the sizing chain used to abstain on.
 
-    stock_value is ALWAYS computed (held marked price + this session's buys);
-    industry/cluster are known only when the baked ownership maps carry the
-    symbol -- an unknown bucket refuses the BUY at the gate (fail closed),
-    so here the unknown simply reports known=False.
+    stock_value is ALWAYS computed (THIS symbol's held value + this symbol's
+    pending/session buys); industry/cluster are known only when the baked
+    ownership maps carry the symbol -- an unknown bucket refuses the BUY at the
+    gate (fail closed), so here the unknown simply reports known=False.
+
+    2026-11-19 P0 (owner ruling "the single-name cap is about THAT name only"):
+    stock_value used to sum EVERY position in the book. The 09:59:55 probe line
+    proved it arithmetically -- equity 99156 x 35% = 34705, minus the whole book
+    (one 002093 row at 33859) left `single_stock=846`, so every NEW name was
+    refused with sizing_amount_unavailable (813 of 938 skips that round) until
+    the 002093 position happened to be sold at 10:01:20. Go has always been per
+    code (internal/engine/engine.go:2058 StockValue: stockVal[pureTsCode(code)],
+    internal/paper/paper.go:1765-1773) and docs/FIX_PLAN_VWAP_DYNSIZE_20261026.md
+    :401 says the single-name cap is a concentration backstop, NOT a total-
+    position control -- the total-position brake is target_room.
+
+    The industry/cluster legs stay whole-book on purpose: those caps are about
+    the GROUP, not one name.
     """
     price = tick.get("last_price")
-    stock_value = session_buy_amount or 0.0
+    target = _bare(symbol)
+    own_buy = float(session_buy_amount or 0.0)
+    if float(pending_buy_amount or 0.0) > own_buy:
+        # Same-round sends live only in session memory; counter-visible pending
+        # buys survive a restart. max() keeps both from double-counting.
+        own_buy = float(pending_buy_amount or 0.0)
+    stock_value = own_buy
     for sym, row in (positions or {}).items():
         qty = (row or {}).get("qty") or 0.0
         if qty <= 0.0:
             continue
-        mark = price if sym == symbol else ((row or {}).get("market_value") or 0.0) / qty
+        if _bare(sym) != target:
+            continue
+        mark = price or ((row or {}).get("market_value") or 0.0) / qty
         if not mark or mark <= 0.0:
             mark = (row or {}).get("cost") or 0.0
         stock_value += qty * mark
@@ -720,9 +833,9 @@ def _bucket_view(symbol, positions, tick, session_buy_amount):
             if cluster_set and (PARAMS.get("concept_map") or {}).get(sym) == concept:
                 concept_value += value
         if industry_known:
-            industry_value += session_buy_amount or 0.0
+            industry_value += own_buy
         if cluster_set:
-            concept_value += session_buy_amount or 0.0
+            concept_value += own_buy
     return {
         "stock_value": stock_value,
         "industry_known": industry_known,
@@ -802,32 +915,51 @@ def _trade_session_ok(moment=None):
 
 
 def _pending_buy_rows(orders):
-    """Open BUY orders that still reserve cash, in rules_sizing row shape.
+    """Open BUY orders that still reserve budget, in rules_sizing row shape.
 
-    Mirrors build_context's buy-prefix rule (baked signal_codes x buy_signals)
-    so only our own buy intents are counted. Terminal rows and fully traded
-    rows reserve nothing. Rules_sizing consumes qty/remain + price; see
-    rules_sizing.py:1099-1108 and :94-99 (the journal must be fed first).
+    2026-11-19 owner ruling "pending orders MUST occupy the budget". Two
+    defects kept this list empty all day:
+      * the ORDER table read as 0 rows (see _live_orders -- wrong remark field);
+      * even with rows, the filter only accepted the baked `buy_signals`
+        prefixes, which is `pullback_buy` -> "PB". Every factor_composite buy
+        ("FC...") that actually traded today was excluded by construction.
+    The side is now read from the counter row (_order_side) instead of guessed
+    from a prefix. An unproven side is treated as a BUY: over-reserving only
+    refuses buys, while under-reserving is the overshoot this exists to stop.
+    Terminal rows and fully traded rows reserve nothing.
     """
-    codes = PARAMS.get("signal_codes") or {}
-    prefixes = set()
-    for name in (PARAMS.get("buy_signals") or []):
-        code = codes.get(name)
-        if code:
-            prefixes.add(str(code))
+    known = set(str(v) for v in (PARAMS.get("signal_codes") or {}).values() if v)
     out = []
     for row in orders or []:
-        short = str((row or {}).get("short_code") or "")
-        if not any(short.startswith(prefix) for prefix in prefixes):
-            continue
         if (row or {}).get("terminal") is not False:
             continue
+        side = str((row or {}).get("side") or "")
+        if side == "sell":
+            continue
+        if not side:
+            # No side field on this build: fall back to "one of OUR signal
+            # short codes" so another program's dashed remark is still skipped.
+            short = str((row or {}).get("short_code") or "")
+            if not any(short.startswith(prefix) for prefix in known):
+                continue
         qty = float((row or {}).get("qty") or 0.0) - float((row or {}).get("traded") or 0.0)
         price = float((row or {}).get("price") or 0.0)
         if qty <= 0.0 or price <= 0.0:
             continue
-        out.append({"qty": qty, "remain": qty, "price": price})
+        out.append({"symbol": _bare((row or {}).get("symbol")),
+                    "qty": qty, "remain": qty, "price": price})
     return out
+
+
+def _pending_amount_for(symbol, pending_rows):
+    """Money still working on the counter for THIS symbol (unfilled part)."""
+    target = _bare(symbol)
+    total = 0.0
+    for row in pending_rows or []:
+        if str((row or {}).get("symbol") or "") != target:
+            continue
+        total += float((row or {}).get("remain") or 0.0) * float((row or {}).get("price") or 0.0)
+    return total
 
 
 def _pullback_limit_price(vwap, last_price):
@@ -845,6 +977,34 @@ def _pullback_limit_price(vwap, last_price):
     if target <= 0.0:
         return None
     return round(min(target, last_price), 2)
+
+
+def _floor_topup_qty(floor, price, lot, ceiling):
+    """Smallest whole-lot share count that reaches `floor`, capped by `ceiling`.
+
+    2026-11-19 owner ruling: "10000 is the FLOOR of opening a position -- if it
+    comes out under 10000, top it up to 10000." Two truncations used to make the
+    floor unreachable: the dynamic chain's per-trade band (10% of a 99022 book =
+    9902) and the whole-lot rounding (10000 / 6.81 -> 1400 shares = 9534). This
+    helper answers both with one number, and returns None when the ceiling cannot
+    pay for it -- the caller then abandons the order whole (never overdraw).
+
+    Lot grid: the counter only accepts multiples of `lot` (100 on this account),
+    so "exactly 10000" usually does not exist; the returned qty is the smallest
+    multiple of lot whose value is >= floor.
+    """
+    floor = _to_float(floor, 0.0)
+    price = _to_float(price, 0.0)
+    lot = _to_float(lot, 0.0)
+    ceiling = _to_float(ceiling, 0.0)
+    if floor <= 0.0 or price <= 0.0 or lot <= 0.0:
+        return None
+    qty = int(floor / price / lot) * int(lot)
+    if qty <= 0 or qty * price < floor - 1e-9:
+        qty += int(lot)
+    if qty * price > ceiling + 1e-6:
+        return None
+    return qty
 
 
 def _qmt_code(symbol):
@@ -1881,8 +2041,13 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
             buy_prefixes.add(str(code))
     spent = 0.0
     for row in orders or []:
+        # 2026-11-19: the side is the counter's own answer; the prefix list is
+        # only a fallback for rows whose side field this build does not expose.
+        side = str(row.get("side") or "")
+        if side and side != "buy":
+            continue
         short = str(row.get("short_code") or "")
-        if not any(short.startswith(prefix) for prefix in buy_prefixes):
+        if not side and not any(short.startswith(prefix) for prefix in buy_prefixes):
             continue
         spent += row.get("traded", 0.0) * row.get("price", 0.0)
     # 2026-11-10: the counter ORDER table is seconds late -- the session's own
@@ -2129,20 +2294,34 @@ def sizing_cap(ctx, positions, intent="new", pending_buys=None):
     amount floor (new-position shreds are what the floor exists to stop). For
     those intents the amount is min(buy_size_caps) WITHOUT the floor refusal;
     every other cap in the chain still binds.
+
+    2026-11-19 owner ruling ("10000 is the FLOOR of opening a position -- if it
+    comes out under 10000, top it up to 10000"): a NEW position that the dynamic
+    chain shreds below the floor is raised to the floor instead of refused. Only
+    the per-trade knob is bypassed by that top-up; every hard cap still binds
+    (cash, per-order cap, daily remaining, target room, industry / single-name /
+    cluster), so a 4000 cash line still refuses -- it must not overdraw.
+    The note "floor_topup:<allow>" carries the ceiling the top-up was checked
+    against, so the share-count rounding in run_round can add the one lot it
+    needs without crossing it.
     """
     if not bool(PARAMS.get("sizing_enabled", False)):
         return None, "sizing_disabled", ""
     sized = _sizing_view(ctx, positions, pending_buys)
-    if intent in ("add", "t_leg"):
-        caps = buy_size_caps(PARAMS, sized)
-        values = [v for v in caps.values() if v is not None]
-        if not values:
-            return None, "sizing_amount_unavailable", ""
-        return min(values), "", ""
-    amount = buy_size_amount(PARAMS, sized)
-    if amount is None:
-        return None, "sizing_amount_unavailable", ""
     caps = buy_size_caps(PARAMS, sized)
+    values = [v for v in caps.values() if v is not None]
+    if not values:
+        return None, "sizing_amount_unavailable", ""
+    amount = min(values)
+    if intent in ("add", "t_leg"):
+        return amount, "", ""
+    floor = float(PARAMS.get("min_order_amount", 0.0) or 0.0)
+    if floor > 0.0 and amount < floor:
+        hard = [v for k, v in caps.items() if k != "per_trade" and v is not None]
+        allow = min(hard) if hard else amount
+        if allow < floor:
+            return None, "sizing_amount_unavailable", ""
+        return floor, "", "floor_topup:%.2f" % allow
     binding = sorted([k for k, v in caps.items() if v is not None],
                      key=lambda k: caps[k])[:1]
     note = ""
@@ -2586,8 +2765,9 @@ def run_round(ContextInfo, moment):
     # empty (or unreadable). Without a readout those two states are indistinguishable
     # from the log -- and "no positions" versus "table refused" lead to opposite
     # conclusions. One short line per round names both tables and both money rows.
-    _log("views pos=%s ord=%d cash=%s eq=%s" % (
+    _log("views pos=%s ord=%d raw=%s kept=%s cash=%s eq=%s" % (
         "na" if positions is None else len(positions), len(orders),
+        _STATE.get("order_raw", "na"), _STATE.get("order_kept", "na"),
         "na" if cash_raw is None else "%.0f" % cash_raw,
         "na" if total is None else "%.0f" % total))
     # The count alone cannot answer "did the 13:0x orders actually fill?" -- a
@@ -2598,20 +2778,23 @@ def run_round(ContextInfo, moment):
         _log("held %s" % ",".join(
             "%sx%d" % (sym, int(_to_float(row.get("qty"), 0.0) or 0.0))
             for sym, row in list(positions.items())[:6]))
-    # 2026-11-13: open BUY orders reserve cash BEFORE the next order is sized
-    # (rules_sizing.py:94-99: a stale room is the same-round double-buy).
+    # Pending BUY orders occupy the TARGET budget (via _sizing_view pending_buys)
+    # and the concentration buckets -- NOT the cash line.
+    # 2026-11-19 correction: this used to subtract pending_amount from cash_raw
+    # as well. m_dAvailable is the counter's AVAILABLE cash and the counter has
+    # already frozen every working buy (proved on 2026-11-19: eq 99004 with five
+    # working buys left cash 21165, i.e. the frozen 77.8k was gone). Subtracting
+    # the pending amount a second time would double-count it -- with the ORDER
+    # table finally readable that would have refused every buy all afternoon.
     # Plus the owner's remaining-cash floor: keep total_asset x
     # min_cash_after_reserve_pct untouched by auto buys (no daily_buy_cap).
     pending_rows = _pending_buy_rows(orders)
-    pending_amount = 0.0
-    for row in pending_rows:
-        pending_amount += float(row["qty"]) * float(row["price"])
     reserve_floor = 0.0
     if total and total > 0.0:
         reserve_floor = total * float(PARAMS.get("min_cash_after_reserve_pct", 0.0))
     cash = None
     if cash_raw is not None:
-        cash = cash_raw - pending_amount - reserve_floor
+        cash = cash_raw - reserve_floor
         if cash < 0.0:
             cash = 0.0
     deals = _deals()
@@ -2896,8 +3079,11 @@ def run_round(ContextInfo, moment):
                 summary["skipped"].append({"short": short, "reason": "max_positions"})
                 continue
             session_amount = float(_STATE["buy_amounts"].get((day, symbol), 0.0) or 0.0)
+            # Pending buys of THIS symbol count toward its single-name room even
+            # after a client/strategy restart (session memory is gone, the counter
+            # is not) -- owner 2026-11-19 "pending orders occupy the budget".
             buckets = _bucket_view(symbol, positions, {"last_price": ctx.get("last_price")},
-                                   session_amount)
+                                   session_amount, _pending_amount_for(symbol, pending_rows))
             if not buckets["industry_known"] or not buckets["cluster_set"]:
                 # Baked ownership maps are a MUST-BAKE item (plan section 1.2):
                 # a symbol with no sector/concept bucket refuses the buy instead
@@ -2946,6 +3132,16 @@ def run_round(ContextInfo, moment):
                 if qty <= 0:
                     summary["skipped"].append({"short": short, "reason": "sizing_below_lot"})
                     continue
+                # 2026-11-19 owner floor ruling: when the cap was raised to the
+                # min-order floor, truncating to whole lots must not drop the
+                # order back under it (10000 / 6.81 -> 1400 shares = 9534).
+                # One extra lot, only if the ceiling the top-up was checked
+                # against still allows it.
+                if note.startswith("floor_topup"):
+                    ceiling = _to_float(note.split(":", 1)[-1], 0.0)
+                    topup = _floor_topup_qty(PARAMS.get("min_order_amount"), price, lot, ceiling)
+                    if topup is not None and topup > qty:
+                        qty = topup
                 signal = dict(signal)
                 signal["qty"] = qty
                 signal["amount"] = round(qty * price, 2)
@@ -2954,13 +3150,34 @@ def run_round(ContextInfo, moment):
             # Final min-order-amount gate (owner 11:05): NEW-position auto buys
             # only -- add / reduce / t_leg are exempt, but every gate above and
             # below still binds them. Judged on the FINAL share count, after the
-            # cash downgrade and the lot rounding, right before _place; a miss
-            # abandons the WHOLE order (no top-up, no shred).
+            # cash downgrade and the lot rounding, right before _place.
+            # 2026-11-19 owner ruling ("10000 is the FLOOR of opening a position;
+            # if it comes out under 10000, top it up to 10000"): this used to be a
+            # refusal, which is how a 9902 per-trade band (10% of 99022) plus lot
+            # truncation turned into "no new positions ever". The top-up raises the
+            # share count to the smallest whole-lot count that reaches the floor,
+            # and is bounded by the ceiling sizing_cap already cleared (sized_amount)
+            # -- so cash, per-order cap, daily remaining, target room and every
+            # concentration bucket still bind. Without a price/lot, or when the
+            # ceiling cannot pay the floor, the order is still abandoned whole.
             if intent == "new":
+                floor = float(PARAMS.get("min_order_amount", 0.0) or 0.0)
                 final_amount = float(signal.get("amount", 0.0))
-                if final_amount < float(PARAMS.get("min_order_amount", 0.0)):
-                    summary["skipped"].append({"short": short, "reason": "min_order_amount"})
-                    continue
+                if floor > 0.0 and final_amount < floor:
+                    lot = float(PARAMS.get("lot_size") or 0.0)
+                    ceiling = float(sized_amount or 0.0)
+                    if note.startswith("floor_topup"):
+                        ceiling = max(ceiling, _to_float(note.split(":", 1)[-1], 0.0))
+                    qty = _floor_topup_qty(floor, price, lot, ceiling)
+                    if qty is None:
+                        summary["skipped"].append({"short": short, "reason": "min_order_amount"})
+                        continue
+                    signal = dict(signal)
+                    signal["qty"] = qty
+                    signal["amount"] = round(qty * price, 2)
+                    summary.setdefault("sized", []).append(
+                        {"short": short, "qty": qty, "amount": signal["amount"],
+                         "cap": "floor_topup:%.2f" % ceiling})
             ok, why = _place(ContextInfo, signal)
             if ok:
                 _STATE["sent"].add((day, symbol, short))
@@ -2972,7 +3189,8 @@ def run_round(ContextInfo, moment):
                 # 2026-11-13: reserve this send IMMEDIATELY for the next symbol
                 # in the same round (the counter ORDER table is seconds late).
                 placed_amount = float(signal.get("amount", 0.0))
-                pending_rows.append({"qty": float(signal.get("qty") or 0.0),
+                pending_rows.append({"symbol": _bare(symbol),
+                                     "qty": float(signal.get("qty") or 0.0),
                                      "remain": float(signal.get("qty") or 0.0),
                                      "price": float(signal.get("price") or 0.0)})
                 if cash is not None:
