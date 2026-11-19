@@ -73,6 +73,10 @@ type OrderRequest struct {
 	// ignores it; the concentration gate uses it to net the buy leg out — but only after re-checking
 	// that the sellable base really covers the pairing, otherwise it charges the full amount.
 	IntradayT bool `json:"intraday_t,omitempty"`
+	// QuadrantDecision §FLOW-QUADRANT 四象限决策（由定权 Decision 带出，风控最后一道闸消费）。
+	// "block_buy"=禁抄底/禁加仓→拒单；空=不拦。网关不消费，只用于本地风控判定。
+	QuadrantDecision string `json:"quadrant_decision,omitempty"`
+	QuadrantReason   string `json:"quadrant_reason,omitempty"`
 }
 
 // OrderResult 下单返回（网关 → 首尔）。

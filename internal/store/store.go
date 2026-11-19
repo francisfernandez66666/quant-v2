@@ -429,6 +429,24 @@ func (d *DB) migrate() error {
 			ladder_height INTEGER DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 		)`,
+		// §FLOW-FACTOR-DAILY（2026-11-19 owner 裁决）：资金流/相对放量字段的**按日滚动留痕**。
+		// 每个交易日一条（主键 trade_date，重复 UPSERT 为最新一轮），存大盘/板块净流入百分比、
+		// 相对放量的 r_yest/r_ma5 与三项 delta。缺值存 NULL（NaN 弃权），聚合按 NULL 跳过，绝不当 0。
+		// 探针（今晚 QMT）回来后逐日写入，引擎装配 Regime 时按当日读取；跨日不复活、不累计。
+		// English: daily rolling record of flow/volume-surge fields — one row/day (PK trade_date,
+		// upserted), NULL for abstained values; the probe fills it per day and Regime reads today's row.
+		`CREATE TABLE IF NOT EXISTS flow_factor_daily (
+			trade_date TEXT PRIMARY KEY,
+			market_flow_pct REAL,
+			sector_flow_pct REAL,
+			r_yest REAL,
+			r_ma5 REAL,
+			flow_market_delta REAL,
+			flow_sector_delta REAL,
+			vol_surge_delta REAL,
+			source TEXT DEFAULT '',
+			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_state ON research_tasks(status, priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_chain ON research_tasks(chain_day)`,
 		// 研究窗口级断点（二期）：discover-factors 各阶段按窗口缓存装配产物（IC 行等），

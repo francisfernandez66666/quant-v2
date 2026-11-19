@@ -66,7 +66,11 @@ type SizingResult struct {
 	// "capped?", this answers "go check what".
 	MissingKeyDims []string `json:"missing_key_dims,omitempty"`
 	Downgrade      bool     `json:"downgrade,omitempty"`
-	Reasons        []string `json:"reasons,omitempty"`
+	// FlowBlend §FLOW-BLEND 后置金额乘子（0.80~1.20，默认 1.0=中性）。
+	// 三项（大盘/板块资金流、相对放量）合成后的**总幅度**恒定封顶 ±20%，
+	// 只在单笔金额占比出口乘，不进定权因子组（避免幂平均稀释/Cap 截断）。缺值=1.0。
+	FlowBlend float64  `json:"flow_blend,omitempty"`
+	Reasons   []string `json:"reasons,omitempty"`
 }
 
 // BuyScale 单笔金额缩放（新模型口径）＝ MarketScale × StockScale。
@@ -501,6 +505,16 @@ func sizingHardBlock(r Regime, sig combat_agent.Signal, cfg config.SizingConfig)
 	// 长假前最后一日禁止新开仓（owner 风险偏好项，默认关）。
 	if cfg.HolidayBlockNewOn() && isLongHolidayLastDay(r.Holiday) {
 		return true, "长假前最后一日禁止新开仓"
+	}
+	// §FLOW-QUADRANT 四象限硬闸（owner 裁决6）：禁抄底(熊+放量+posRel高)/禁加仓(牛+缩量+posRel高)。
+	// 量比字段 r.RYest/r.RMa5 为 NaN（探针未回/当日无数据）时 DecideQuadrant 归平量→Neutral，
+	// 硬闸 fail-open 不误伤；Reduce(减仓)是卖出动作，不在这里拦，走卖出侧独立通道。
+	qd := DecideQuadrant(QuadrantInput{
+		MarketState: r.MarketState, TotalPosPct: r.Account.TotalPosPct,
+		TargetPosPct: r.MaxPosPct, RYest: r.RYest, RMa5: r.RMa5,
+	})
+	if qd.Decision == QuadrantBlockBuy {
+		return true, "四象限硬闸(" + qd.Reason + ")"
 	}
 	return false, ""
 }

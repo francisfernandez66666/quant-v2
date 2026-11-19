@@ -87,6 +87,17 @@ type Regime struct {
 	// BaseStopLossPct 风险预算守恒的基准止损（配置的纪律止损，默认 6）。<=0 = 不可得 → 该上限弃权。
 	// English: the base stop used by the risk-budget cap; <=0 abstains.
 	BaseStopLossPct float64 `json:"base_stop_loss_pct,omitempty"`
+
+	// §FLOW-FACTOR-DAILY（2026-11-19）资金流/相对放量当日读数，由引擎从 flow_factor_daily 按北京
+	// 自然日装配。NaN=弃权（探针未回/当日无数据），四象限判据与后置 blend 都据此 fail-open。
+	// FlowDay 是这些读数所属交易日（YYYY-MM-DD），与 cntime.DayOf(AsOf) 同日才可信。
+	// English: today's flow/volume readings assembled from the daily table; NaN = abstain (fail-open).
+	FlowDay         string  `json:"flow_day,omitempty"`
+	RYest           float64 `json:"r_yest,omitempty"`            // v[-1]/v[-2]
+	RMa5            float64 `json:"r_ma5,omitempty"`             // v[-1]/mean(v[-6:-1])
+	FlowMarketDelta float64 `json:"flow_market_delta,omitempty"` // 大盘信号强度 ∈[-1,1]
+	FlowSectorDelta float64 `json:"flow_sector_delta,omitempty"` // 板块信号强度 ∈[-1,1]
+	VolSurgeDelta   float64 `json:"vol_surge_delta,omitempty"`   // 相对放量强度 ∈[-1,1]
 }
 
 // MacroEventView 单个宏观事件在本轮快照里的视图（已按交易日解析距离）。

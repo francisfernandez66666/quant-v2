@@ -23,6 +23,8 @@
     "prev_close",
     "price",
     "price_type",
+    "quadrant_decision",
+    "quadrant_reason",
     "qty",
     "side",
     "signal_id",
@@ -47,7 +49,9 @@
     "signal_vwap_premium_pct",
     "timeout_sec",
     "dynamic_budget",
-    "intraday_t"
+    "intraday_t",
+    "quadrant_decision",
+    "quadrant_reason"
   ],
   "source": "internal/trading/executor.go OrderRequest",
   "types": {
@@ -62,6 +66,8 @@
     "prev_close": "float64",
     "price": "float64",
     "price_type": "string",
+    "quadrant_decision": "string",
+    "quadrant_reason": "string",
     "qty": "int",
     "side": "string",
     "signal_id": "string",

@@ -1691,6 +1691,13 @@ func (e *Engine) atrRiskBudgetQty(sig combat_agent.Signal, price, riskPct float6
 type dynBudgetCtx struct {
 	MarketScale float64
 	StockScale  float64
+	// FlowBlend §FLOW-BLEND 后置金额乘子（0.80~1.20，默认 1.0）。定权层算、执行层用同一值；
+	// 0=未注入（兜底按 1.0，见 hasSplit/下文取值），不把"没传"当成缩额。
+	FlowBlend float64
+	// QuadrantDecision/Reason §FLOW-QUADRANT 四象限决策（由 Decision 带出，传给风控最后一道闸）。
+	// "block_buy"=禁抄底/禁加仓→拒单；空=不拦。
+	QuadrantDecision string
+	QuadrantReason   string
 	// MissingKeyInput 数据盲区标志（目标封顶半仓，且日内 T 层整体关闭，§1.5）。
 	MissingKeyInput bool
 	// MissingKeyDims §INDEX-BLIND：与上面那枚 bool 同组的"缺了哪几维"。
@@ -2004,7 +2011,13 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	if perTradeHi <= 0 {
 		perTradeHi = 0.30 // 与出厂默认同值；0/缺失一律按 30% 上限
 	}
-	perTradePct := signalctl.PerTradePct(marketScale, stockScale, perTradeLo, perTradeHi)
+	// §FLOW-BLEND：后置金额乘子（三项资金流/放量合成，恒定 ±20%）。ctx 未注入（老调用点/单测）
+	// 时 blend=1.0，PerTradePctBlend 与原 PerTradePct 逐字一致——零行为变更。
+	flowBlend := ctx.FlowBlend
+	if flowBlend <= 0 || math.IsNaN(flowBlend) {
+		flowBlend = 1.0
+	}
+	perTradePct := signalctl.PerTradePctBlend(marketScale, stockScale, perTradeLo, perTradeHi, flowBlend)
 	ceiling := sizingCfg.MaxTotalPositionPct
 	if ceiling <= 0 || ceiling > 1 {
 		ceiling = 1.0 // 天花板语义：>1 是配置手滑，钳到 1.0（总资产上限）
@@ -2688,6 +2701,9 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		TimeoutSec: entryTimeout,
 		// §DYN-SIZE-v3：标记本单由动态预算生成，让旧数量/每日/行业拒买闸让位。
 		DynamicBudget: dynamicBudget,
+		// §FLOW-QUADRANT：四象限决策透传给风控最后一道闸（block_buy→拒单；空/缺数据→不拦）。
+		QuadrantDecision: ctx.QuadrantDecision,
+		QuadrantReason:   ctx.QuadrantReason,
 	}
 	if si != nil {
 		req.CurrentPrice = si.Price

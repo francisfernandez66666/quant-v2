@@ -79,6 +79,11 @@ type LiveOrder struct {
 	// English: intraday round-trip marker. Only buy legs can be netted, and only after the
 	// sellable-base re-check inside checkConcentration; sell legs never add concentration anyway.
 	IntradayT bool
+
+	// QuadrantDecision §FLOW-QUADRANT 四象限决策（由定权层 Decision 带出，唯一最后一道硬拒买闸消费）。
+	// "block_buy"=禁抄底/禁加仓命中→拒单；空/其它=不拦。做空方向的单不会带 block_buy（定权层只判 buy&&做多）。
+	QuadrantDecision string
+	QuadrantReason   string
 }
 
 // Verdict 单笔下单的风控裁定。
@@ -419,6 +424,7 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 		run   func() string
 	}{
 		{"st", false, func() string { return g.checkST(o) }},                               // ST/退市股禁买
+		{"quadrant_block", true, func() string { return g.checkQuadrantBlock(o) }},         // §FLOW-QUADRANT 四象限硬拒买（必推告警）
 		{"blacklist", false, func() string { return g.checkBlacklist(cfg, o) }},            // 个股黑名单禁买
 		{"max_order_amount", true, func() string { return g.checkMaxOrderAmount(cfg, o) }}, // 单笔金额绝对帽
 		{"t1_sellable", false, func() string { // T+1 可卖量（含在途卖单）
@@ -481,6 +487,24 @@ func (g *Gate) verdict(gate, reason string, alert bool) *Verdict {
 // today 交易日的本地日期（北京时）。English: today's date in Beijing time.
 func (g *Gate) today() string {
 	return cntime.In(g.now()).Format("2006-01-02")
+}
+
+// checkQuadrantBlock §FLOW-QUADRANT 四象限硬拒买（最后一道统一执行闸）。
+// 定权层已把 DecideQuadrant 的 block_buy 带在 LiveOrder 上；这里只做执行兜底，不重算判据
+// （重算会与定权层漂移，且 gate 层拿不到量比全量）。仅买方向生效、卖出放行（敞口可退出）；
+// 做空方向的单定权层不会带 block_buy，故天然豁免。alert=true 命中必推。
+// English: final execution gate for the quadrant buy-block decided upstream; buy side only.
+func (g *Gate) checkQuadrantBlock(o LiveOrder) string {
+	if o.Side != SideBuy {
+		return ""
+	}
+	if o.QuadrantDecision == "block_buy" {
+		if o.QuadrantReason != "" {
+			return "四象限硬闸(" + o.QuadrantReason + ")"
+		}
+		return "四象限硬闸"
+	}
+	return ""
 }
 
 // checkST §GAP1.6 ST/退市风险股拒绝买入（仅买方向；卖出放行——已存在的风险敞口必须可退出）。

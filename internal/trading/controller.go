@@ -914,7 +914,9 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		PrevClose:     req.PrevClose,
 		DynamicBudget: req.DynamicBudget,
 		// §DYN-T 批 7：做 T 标记必须透传给风控（漏装＝集中度按全额拦 T 买腿，灰度账号稍集中就永远开不了 T）。
-		IntradayT: req.IntradayT,
+		IntradayT:        req.IntradayT,
+		QuadrantDecision: req.QuadrantDecision,
+		QuadrantReason:   req.QuadrantReason,
 	}
 	if v := c.gate.CheckLiveOrder(cfg, lo); !v.Pass {
 		return nil, fmt.Errorf("%s", v.Reason)

@@ -496,7 +496,8 @@ func (e *Engine) injectPaperSizing(uid string, pe *paper.Engine) {
 	lo, hi, ceiling := e.paperSizingParams(uid)
 	// sizingContextFor 带 10s 短窗缓存，同一轮里 T 参数与本次注入拿到的是同一个 MS/盲区读数。
 	ctx := e.sizingContextFor(uid)
-	pe.SetSizingContext(ctx.MS, lo, hi, ceiling, ctx.Missing, ctx.MissingDims)
+	// §FLOW-BLEND：T 层按账户级读数算 T 额度，不涉及逐票资金流/放量调节 → blend 中性 1.0。
+	pe.SetSizingContext(ctx.MS, lo, hi, ceiling, ctx.Missing, ctx.MissingDims, 1.0)
 }
 
 // wireTCallbacks 把读数回调接到引擎的真实数据源上（全部"取不到就说取不到"）。

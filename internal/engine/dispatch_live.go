@@ -86,6 +86,8 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 		// 目标仓位与单笔基准必须同源，且盲区标志还要供日内 T 层关闭使用（§1.5）。
 		e.autoPlaceScaled(buys[i], live, d.BuyScale, sizingOn,
 			dynBudgetCtx{MarketScale: d.MarketScale, StockScale: d.StockScale,
+				FlowBlend:        d.FlowBlend,
+				QuadrantDecision: d.QuadrantDecision, QuadrantReason: d.QuadrantReason,
 				MissingKeyInput: d.MissingKeyInput, MissingKeyDims: d.MissingKeyDims},
 			pol.Regime.SizeCfg)
 	}

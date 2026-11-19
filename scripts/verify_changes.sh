@@ -24785,3 +24785,255 @@ grep_q '^ok' G218 || { echo "--- FAIL: §218 云端反解行为腿未过：$(pri
 [ "$B218_FAILED" = "0" ] || exit 1
 echo "ok - §218 §CARRIER-ATTRIB 锁通过（备注中段规则号 + 末段短码 + fac_<数字> 白名单 + 云端优先反解且旧格式不破 + 三套行为腿，累计判定点 ${CNT218}）"
 echo ""
+
+echo "==> 219 §FLOW-QUADRANT（资金流/放量四象限中央决策）..."
+B219_FAILED=0
+fail219() {
+	echo "--- FAIL: §219 $*"
+	FAIL=1
+	B219_FAILED=1
+}
+CNT219=0
+QR219=internal/signalctl/flow_regime.go
+
+# ① 中央层存在且三态齐全（锚到定义行，禁裸词）。
+CNT219=$((CNT219 + 1))
+grep -qF 'func DecideQuadrant(in QuadrantInput) QuadrantDecision {' "$QR219" || fail219 "缺四象限中央决策函数"
+grep -qF 'func VolStateOf(rYest, rMa5 float64) string {' "$QR219" || fail219 "缺量态判据（放量/缩量/平量三态）"
+grep -qF 'func PosRelOf(totalPosPct, targetPosPct float64) float64 {' "$QR219" || fail219 "缺仓位相对档判据"
+grep -qE 'QuadrantBlockBuy[[:space:]]*=[[:space:]]*"block_buy"' "$QR219" || fail219 "缺拒买决策态"
+grep -qE 'QuadrantReduce[[:space:]]*=[[:space:]]*"reduce"' "$QR219" || fail219 "缺减仓决策态"
+grep -qE 'VolStateNeutral[[:space:]]*=[[:space:]]*"neutral"' "$QR219" || fail219 "缺平量态（原矩阵两态缺口未补）"
+
+# ② 阈值锁到赋值点（owner 定稿：放量1.2/1.0、缩量1.0/0.9、高档相对1.3）。
+# 注意：锚点用 [[:space:]]* 容忍 gofmt 的对齐空格，但锁定变量名+数值本身——
+# 早前写成 gofmt 前的多空格字面，永远匹配不到＝假绿，这里已修正。
+CNT219=$((CNT219 + 1))
+grep -qE 'rYesSurge[[:space:]]*=[[:space:]]*1\.2' "$QR219" || fail219 "放量昨比阈值不是1.2"
+grep -qE 'rMa5Surge[[:space:]]*=[[:space:]]*1\.0' "$QR219" || fail219 "放量均比阈值不是1.0"
+grep -qE 'rYesShrink[[:space:]]*=[[:space:]]*1\.0' "$QR219" || fail219 "缩量昨比阈值不是1.0"
+grep -qE 'rMa5Shrink[[:space:]]*=[[:space:]]*0\.9' "$QR219" || fail219 "缩量均比阈值不是0.9"
+grep -qE 'posRelHighLow[[:space:]]*=[[:space:]]*1\.3' "$QR219" || fail219 "高档相对阈值不是1.3（owner 裁决3相对口径）"
+
+# ③ 决策映射锁（三行case，锚到完整字面行）。
+CNT219=$((CNT219 + 1))
+grep -qF 'd.Decision, d.Reason = QuadrantReduce, "bull_surge_high_reduce"' "$QR219" || fail219 "牛+放量+高档未映射减仓"
+grep -qF 'd.Decision, d.Reason = QuadrantBlockBuy, "bull_shrink_high_noadd"' "$QR219" || fail219 "牛+缩量+高档未映射禁加仓"
+grep -qF 'd.Decision, d.Reason = QuadrantBlockBuy, "bear_surge_high_nobottom"' "$QR219" || fail219 "熊+放量+高档未映射禁抄底"
+
+# ④ 负锁：range 不进四象限、相对口径非绝对仓位、弃权不当放量。
+CNT219=$((CNT219 + 1))
+grep -qF 'if in.MarketState != "bull" && in.MarketState != "bear" {' "$QR219" || fail219 "range 未从四象限排除（应交做T联动）"
+if grep -qF 'TotalPosPct >= 0.7' "$QR219"; then fail219 "出现绝对仓位判据（owner 裁决3已废绝对70%）"; fi
+grep -qF 'return VolStateNeutral' "$QR219" || fail219 "量能弃权未归平量（未知当放量是危险失败模式）"
+
+# ⑤ 用例在册 + Go 行为腿（四组测试名锚定）。
+CNT219=$((CNT219 + 1))
+for t in TestDecideQuadrantEightCases TestPosRelUsesTargetNotAbsolute TestVolStateDoubleGate TestPosRelAbstain; do
+	grep -qF "func $t(" internal/signalctl/flow_regime_test.go || fail219 "缺用例 $t"
+done
+G219=$( go test ./internal/signalctl -count=1 -run 'TestDecideQuadrant|TestPosRel|TestVolState' 2>&1 || true )
+grep_q '^ok' G219 || { echo "--- FAIL: §219 行为腿未过：$(printf '%s\n' "$G219" | tail -8)"; B219_FAILED=1; }
+if grep_q 'FAIL' G219; then
+	echo "--- FAIL: §219 行为腿有红：$(printf '%s\n' "$G219" | tail -8)"
+	B219_FAILED=1
+fi
+
+[ "$B219_FAILED" = "0" ] || exit 1
+echo "ok - §219 §FLOW-QUADRANT 锁通过（中央层三态 + 阈值赋值点 + 三决策映射 + range豁免/相对口径/弃权负锁 + 行为腿，累计判定点 ${CNT219}）"
+echo ""
+
+echo "==> 220 §FLOW-BLEND（后置金额乘子：三项合成总幅度±20%）..."
+B220_FAILED=0
+fail220() {
+	echo "--- FAIL: §220 $*"
+	FAIL=1
+	B220_FAILED=1
+}
+CNT220=0
+FB220=internal/signalctl/flow_blend.go
+SZ220=internal/signalctl/sizing.go
+SC220=internal/signalctl/signalctl.go
+EG220=internal/engine/engine.go
+PP220=internal/paper/paper.go
+
+# ① 后置乘子核心：函数存在 + 幅度常量锁到赋值点。
+CNT220=$((CNT220 + 1))
+grep -qF 'func ApplyFlowBlend(res *SizingResult, sig combat_agent.Signal) {' "$FB220" || fail220 "缺后置 blend 合成函数"
+grep -qF 'func PerTradePctOfBlend(k, lo, hi, blend float64) float64 {' "$FB220" || fail220 "缺带 blend 的单笔占比函数"
+grep -qF 'func ComputeSizingWithBlend(r Regime, sig combat_agent.Signal) SizingResult {' "$FB220" || fail220 "缺带 blend 的对外入口（应包一层，不改 ComputeSizing）"
+grep -qE 'flowBlendPct[[:space:]]*=[[:space:]]*0\.20' "$FB220" || fail220 "总幅度不是20%"
+grep -qE 'flowBlendLo[[:space:]]*=[[:space:]]*0\.80' "$FB220" || fail220 "下限不是0.80"
+grep -qE 'flowBlendHi[[:space:]]*=[[:space:]]*1\.20' "$FB220" || fail220 "上限不是1.20"
+
+# ② 封顶锁：三项同向只到 ±20%，不累加（夹取两行 + 乘法单点）。
+CNT220=$((CNT220 + 1))
+grep -qF 'blend := 1.0 + flowBlendPct*b' "$FB220" || fail220 "blend 不是 1+Pct×合成delta"
+grep -qF 'if blend < flowBlendLo {' "$FB220" || fail220 "缺下限夹取"
+grep -qF 'if blend > flowBlendHi {' "$FB220" || fail220 "缺上限夹取"
+grep -qF 'eff *= blend' "$FB220" || fail220 "blend 未在 eff 上单点相乘（可能被二次计权）"
+
+# ③ 接线：Result/Decision/engine/paper 四处同源带出，缺一处就两本账漂移。
+CNT220=$((CNT220 + 1))
+grep -qF 'FlowBlend float64' "$SZ220" || fail220 "SizingResult 缺 FlowBlend 字段"
+grep -qF 'd.MarketScale, d.StockScale, d.FlowBlend, d.MissingKeyInput = res.MarketScale, res.StockScale, res.FlowBlend, res.MissingKeyInput' "$SC220" || fail220 "Decision 未与 MS/SS 同组带出 FlowBlend"
+grep -qF 'perTradePct := signalctl.PerTradePctBlend(marketScale, stockScale, perTradeLo, perTradeHi, flowBlend)' "$EG220" || fail220 "实盘金额出口没乘 blend"
+grep -qF 'perTradePct := signalctl.PerTradePctOfBlend(k, perTradeLo, perTradeHi, blend)' "$PP220" || fail220 "纸面金额出口没乘 blend（两本账会漂移）"
+
+# ④ 负锁：三项 delta 不进 power_mean 因子组（进了会被幂平均稀释/堆叠触顶），置信度不做 blend 缩放。
+CNT220=$((CNT220 + 1))
+if grep -qE 'mul\("(大盘净流入|板块净流入|相对放量)"' "$SZ220"; then fail220 "三项进了因子连乘链（应走后置 blend）"; fi
+if grep -qE 'Confidence.*flowBlend|flowBlend.*Confidence' "$FB220" "$SZ220"; then fail220 "置信度层被 blend 缩放（owner 裁决20%全在金额层）"; fi
+grep -qF 'res := ComputeSizing(r, sig)' "$FB220" || fail220 "ComputeSizingWithBlend 未复用原 ComputeSizing（Scale 逐字一致回归锁会破）"
+
+# ⑤ 用例在册 + Go 行为腿。
+CNT220=$((CNT220 + 1))
+for t in TestFlowBlendTotalCap TestFlowBlendNotStacked TestFlowBlendAbstain TestPerTradePctOfBlendCompat TestPerTradePctOfBlendPositive TestComputeSizingWithBlendNoDowngrade; do
+	grep -qF "func $t(" internal/signalctl/flow_blend_test.go || fail220 "缺用例 $t"
+done
+G220=$( go test ./internal/signalctl ./internal/paper ./internal/engine -count=1 2>&1 || true )
+grep_q '^ok' G220 || { echo "--- FAIL: §220 行为腿未过：$(printf '%s\n' "$G220" | tail -10)"; B220_FAILED=1; }
+if grep_q 'FAIL' G220; then
+	echo "--- FAIL: §220 行为腿有红：$(printf '%s\n' "$G220" | tail -10)"
+	B220_FAILED=1
+fi
+
+[ "$B220_FAILED" = "0" ] || exit 1
+echo "ok - §220 §FLOW-BLEND 锁通过（后置乘子+总幅度20%封顶+四处同源接线+不进因子组/不动置信度负锁+三包行为腿，累计判定点 ${CNT220}）"
+echo ""
+
+echo "==> 221 §QUADRANT-GATE（四象限硬拒买：定权算一次带出+执行最后一道闸）..."
+B221_FAILED=0
+fail221() {
+	echo "--- FAIL: §221 $*"
+	FAIL=1
+	B221_FAILED=1
+}
+CNT221=0
+QR221=internal/signalctl/flow_regime.go
+SZ221=internal/signalctl/sizing.go
+SC221=internal/signalctl/signalctl.go
+GT221=internal/risk/gate.go
+EG221=internal/engine/engine.go
+DL221=internal/engine/dispatch_live.go
+TC221=internal/trading/controller.go
+EX221=internal/trading/executor.go
+
+# ① 定权层：sizingHardBlock 消费 DecideQuadrant（数据 NaN→Neutral fail-open）。
+CNT221=$((CNT221 + 1))
+grep -qF 'qd := DecideQuadrant(QuadrantInput{' "$SZ221" || fail221 "sizingHardBlock 未消费四象限决策"
+grep -qF 'return true, "四象限硬闸(" + qd.Reason + ")"' "$SZ221" || fail221 "四象限 block_buy 未降级为 hold"
+grep -qF 'TargetPosPct: r.MaxPosPct, RYest: r.RYest, RMa5: r.RMa5,' "$SZ221" \
+	|| fail221 "判据输入没接 Regime 的目标档/量比字段（相对口径依赖这两条）"
+
+# ② Decision 无条件带出（与 MS/SS 同纪律），供执行闸共用。
+CNT221=$((CNT221 + 1))
+grep -qF 'd.QuadrantDecision, d.QuadrantReason = qd.Decision, qd.Reason' "$SC221" || fail221 "Decision 未带出四象限决策"
+
+# ③ 执行最后一道：gate checks 表项（alert=true 必推）+ 闸函数（仅买方向）。
+CNT221=$((CNT221 + 1))
+grep -qF 'func (g *Gate) checkQuadrantBlock(o LiveOrder) string {' "$GT221" || fail221 "缺执行层四象限闸函数"
+grep -qF '{"quadrant_block", true, func() string { return g.checkQuadrantBlock(o) }},' "$GT221" \
+	|| fail221 "checks 表缺 quadrant_block 项（最后一道闸没挂上=定权层被绕过时无人兜底）"
+grep -qF 'if o.Side != SideBuy {' "$GT221" || fail221 "四象限闸未限买方向（卖出敞口必须可退出）"
+
+# ④ 全链透传：Decision→ctx→OrderRequest→LiveOrder，缺一环闸就拿不到判据。
+CNT221=$((CNT221 + 1))
+grep -qF 'QuadrantDecision: d.QuadrantDecision, QuadrantReason: d.QuadrantReason,' "$DL221" || fail221 "dispatch 未把 Decision 决策带进 ctx"
+grep -qF 'QuadrantDecision: ctx.QuadrantDecision,' "$EG221" || fail221 "下单 req 未透传四象限决策"
+grep -qF 'QuadrantDecision: req.QuadrantDecision,' "$TC221" || fail221 "controller 未把 req 决策透传给 LiveOrder"
+grep -qF 'QuadrantDecision string `json:"quadrant_decision,omitempty"`' "$EX221" \
+	|| fail221 "OrderRequest 缺 quadrant_decision 字段"
+
+# ⑤ 契约 golden 登记（fields+ignored+types 三处都要，否则契约测试红）。
+CNT221=$((CNT221 + 1))
+grep -qF '"quadrant_decision"' qmt_gateway/contract/order_fields.json || fail221 "契约 golden 未登记 quadrant_decision"
+grep -qF '"quadrant_reason"' qmt_gateway/contract/order_fields.json || fail221 "契约 golden 未登记 quadrant_reason"
+
+# ⑥ 行为腿：signalctl 硬闸接线 + risk 三态 + store 按日表。
+CNT221=$((CNT221 + 1))
+for t in TestSizingHardBlockQuadrant TestFlowFreshSameDay TestFlowFreshCrossDay; do
+	grep -qF "func $t(" internal/signalctl/flow_freshness_test.go || fail221 "缺用例 $t"
+done
+G221A=$( go test ./internal/signalctl -count=1 -run 'TestSizingHardBlockQuadrant|TestFlowFresh' 2>&1 || true )
+grep_q '^ok' G221A || { echo "--- FAIL: §221 定权行为腿未过：$(printf '%s\n' "$G221A" | tail -6)"; B221_FAILED=1; }
+G221B=$( go test ./internal/risk -count=1 -run 'TestGateQuadrant' 2>&1 || true )
+grep_q '^ok' G221B || { echo "--- FAIL: §221 执行闸行为腿未过：$(printf '%s\n' "$G221B" | tail -6)"; B221_FAILED=1; }
+G221C=$( go test ./internal/store -count=1 -run 'TestFlowFactorDaily' 2>&1 || true )
+grep_q '^ok' G221C || { echo "--- FAIL: §221 store 按日表行为腿未过：$(printf '%s\n' "$G221C" | tail -6)"; B221_FAILED=1; }
+
+[ "$B221_FAILED" = "0" ] || exit 1
+echo "ok - §221 §QUADRANT-GATE 锁通过（定权判据+Decision带出+最后一道闸+全链透传+契约golden登记+三条行为腿，累计判定点 ${CNT221}）"
+echo ""
+
+echo "==> 222 §QUADRANT-REDUCE（四象限减仓提醒信号：只提醒不自动减仓）..."
+B222_FAILED=0
+fail222() {
+	echo "--- FAIL: §222 $*"
+	FAIL=1
+	B222_FAILED=1
+}
+CNT222=0
+QA222=internal/engine/flow_quadrant_alert.go
+
+# ① 减仓信号构造：SellLevel=减仓 + 提醒形态（探针数据未验证前不自动减仓——owner 口径）。
+CNT222=$((CNT222 + 1))
+grep -qF 'func quadrantReduceAlert(base combat_agent.Signal, reason string) combat_agent.Signal {' "$QA222" || fail222 "缺减仓信号构造函数"
+grep -qF 'alert.SellLevel = "减仓"' "$QA222" || fail222 "减仓信号未标减仓级"
+grep -qF 'alert.Direction = "提醒"' "$QA222" || fail222 "减仓信号不是提醒形态（自动减仓须等探针数据验证）"
+
+# ② 负锁：不自动执行半仓退出（等探针）。
+CNT222=$((CNT222 + 1))
+if grep -qE 'AutoSellAllSourcesOn|UnifiedSellSourceAction' "$QA222"; then fail222 "减仓信号不应自动触发执行（当前只提醒）"; fi
+
+# ③ 用例在册 + 行为腿。
+CNT222=$((CNT222 + 1))
+grep -qF 'func TestQuadrantReduceAlert(' internal/engine/flow_quadrant_alert_test.go || fail222 "缺用例 TestQuadrantReduceAlert"
+G222=$( go test ./internal/engine -count=1 -run 'TestQuadrantReduceAlert' 2>&1 || true )
+grep_q '^ok' G222 || { echo "--- FAIL: §222 行为腿未过：$(printf '%s\n' "$G222" | tail -6)"; B222_FAILED=1; }
+
+[ "$B222_FAILED" = "0" ] || exit 1
+echo "ok - §222 §QUADRANT-REDUCE 锁通过（减仓提醒构造+形态齐全+不自动执行负锁+行为腿，累计判定点 ${CNT222}）"
+echo ""
+
+echo "==> 223 §FLOW-FRESHNESS（资金流读数按北京自然日判新鲜+按日滚动留痕）..."
+B223_FAILED=0
+fail223() {
+	echo "--- FAIL: §223 $*"
+	FAIL=1
+	B223_FAILED=1
+}
+CNT223=0
+FF223=internal/signalctl/flow_freshness.go
+RG223=internal/signalctl/regime.go
+
+# ① 新鲜度判据：北京自然日同日可用/跨日丢弃，禁固定秒窗。
+CNT223=$((CNT223 + 1))
+grep -qF 'func FlowFresh(flowDay string, now time.Time) bool {' "$FF223" || fail223 "缺资金流新鲜度判据"
+grep -qF 'today := cntime.DayOf(now)' "$FF223" || fail223 "判据未走 cntime 北京日历（时区收口纪律）"
+grep -qF 'return flowDay == today' "$FF223" || fail223 "判据不是按日键等值（同日全天可用）"
+if grep -qE 'StaleSec[[:space:]]*[:=][[:space:]]*[0-9]' "$FF223"; then fail223 "出现固定秒窗赋值（外脑教训：稀疏帧会被误判过期）"; fi
+
+# ② Regime 字段与日键在位（NaN 弃权 fail-open）。
+CNT223=$((CNT223 + 1))
+grep -qF 'FlowDay         string' "$RG223" || fail223 "Regime 缺 FlowDay 日键"
+grep -qF 'RYest           float64' "$RG223" || fail223 "Regime 缺 RYest 量比字段"
+grep -qF 'RMa5            float64' "$RG223" || fail223 "Regime 缺 RMa5 量比字段"
+
+# ③ store 按日表在位（主键 trade_date + UPSERT）。
+CNT223=$((CNT223 + 1))
+grep -qF 'CREATE TABLE IF NOT EXISTS flow_factor_daily (' internal/store/store.go || fail223 "缺 flow_factor_daily 日表"
+grep -qF 'trade_date TEXT PRIMARY KEY,' internal/store/store.go || fail223 "日表主键不是 trade_date"
+grep -qF 'func (d *DB) UpsertFlowFactorDaily(r FlowFactorDailyRow) error {' internal/store/flow_factor_daily.go || fail223 "缺 UPSERT"
+
+# ④ 用例在册 + 行为腿。
+CNT223=$((CNT223 + 1))
+for t in TestFlowFactorDailyUpsert TestFlowFactorDailyDayKeyed TestFlowFactorDailyNaNAbstain; do
+	grep -qF "func $t(" internal/store/flow_factor_daily_test.go || fail223 "缺用例 $t"
+done
+G223=$( go test ./internal/store ./internal/signalctl -count=1 -run 'TestFlowFactorDaily|TestFlowFresh' 2>&1 || true )
+grep_q '^ok' G223 || { echo "--- FAIL: §223 行为腿未过：$(printf '%s\n' "$G223" | tail -8)"; B223_FAILED=1; }
+
+[ "$B223_FAILED" = "0" ] || exit 1
+echo "ok - §223 §FLOW-FRESHNESS 锁通过（北京日判新鲜+禁秒窗负锁+Regime字段+按日表UPSERT+行为腿，累计判定点 ${CNT223}）"
+echo ""

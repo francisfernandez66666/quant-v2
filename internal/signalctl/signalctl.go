@@ -94,9 +94,16 @@ type Decision struct {
 	// 否则"目标仓位按 A 算、单笔金额按 B 算"会让账本无法解释；而且执行层重算会二次触发行情读数。
 	// MissingKeyInput 同理由：数据盲区必须一路传到执行层，让 T 层也能据此关闭（§1.5）。
 	// English: the split reading travels on the decision so sizing and execution share one number.
-	MarketScale     float64 `json:"market_scale,omitempty"`
-	StockScale      float64 `json:"stock_scale,omitempty"`
-	MissingKeyInput bool    `json:"missing_key_input,omitempty"`
+	MarketScale float64 `json:"market_scale,omitempty"`
+	StockScale  float64 `json:"stock_scale,omitempty"`
+	// FlowBlend §FLOW-BLEND 后置金额乘子（0.80~1.20，默认 1.0）。与 MS/SS 同组无条件带出，
+	// 让执行层与定权层用同一个乘子（否则账本无法解释单笔金额差在哪）。
+	FlowBlend float64 `json:"flow_blend,omitempty"`
+	// QuadrantDecision / QuadrantReason §FLOW-QUADRANT 四象限决策结果（在 applySizing 算一次，
+	// 供执行层 gate.go 硬闸与减仓通道共用，避免三处各算各的漂移）。空串=Neutral/未触发。
+	QuadrantDecision string `json:"quadrant_decision,omitempty"`
+	QuadrantReason   string `json:"quadrant_reason,omitempty"`
+	MissingKeyInput  bool   `json:"missing_key_input,omitempty"`
 	// MissingKeyDims §INDEX-BLIND（2026-11-02）：与上面那枚 bool **同组**带出的维度清单
 	// （market_state / emotion_phase / index_change）。bool 只说"封顶了"，dims 才说"去查谁"——
 	// 分开传就等于允许其中一处漏掉，而漏掉的表现正是本批要消灭的"看得见结论、看不见原因"。
@@ -504,7 +511,14 @@ func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Polic
 	if !cfg.EnabledOn() {
 		return false // 总开关关：零行为变更
 	}
-	res := ComputeSizing(pol.Regime, sig)
+	res := ComputeSizingWithBlend(pol.Regime, sig)
+	// §FLOW-QUADRANT：四象限决策**无条件带出**（与 MS/SS 一条纪律），供执行层硬闸/减仓共用。
+	// 量比 NaN 时归 Neutral，零行为变更；这里算的结果与 sizingHardBlock 内部同源同判据。
+	qd := DecideQuadrant(QuadrantInput{
+		MarketState: pol.Regime.MarketState, TotalPosPct: pol.Regime.Account.TotalPosPct,
+		TargetPosPct: pol.Regime.MaxPosPct, RYest: pol.Regime.RYest, RMa5: pol.Regime.RMa5,
+	})
+	d.QuadrantDecision, d.QuadrantReason = qd.Decision, qd.Reason
 	if cfg.ShadowOn() {
 		// 影子模式：只留痕不改裁定（灰度观察期，先积累"会缩到多少"的分布再决定是否真拨）。
 		if res.Downgrade || res.Scale != 1.0 {
@@ -528,7 +542,7 @@ func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Polic
 	}
 	// §DYN-SIZE v4：拆分读数**无条件带出**（哪怕 Scale 恰好 1.0）——执行层的目标仓位与单笔基准
 	// 各自消费 MS/SS，用不到 BuyScale 的那条路径同样必须拿得到它们。
-	d.MarketScale, d.StockScale, d.MissingKeyInput = res.MarketScale, res.StockScale, res.MissingKeyInput
+	d.MarketScale, d.StockScale, d.FlowBlend, d.MissingKeyInput = res.MarketScale, res.StockScale, res.FlowBlend, res.MissingKeyInput
 	// §INDEX-BLIND：维度清单同样**无条件带出**（与 MS/SS 一条纪律），并做深拷贝——
 	// 决策对象会被多个消费方持有（执行层、快照落库、前端），共享底层数组就是互相写。
 	d.MissingKeyDims = append([]string(nil), res.MissingKeyDims...)

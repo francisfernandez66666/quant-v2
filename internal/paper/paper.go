@@ -1782,7 +1782,10 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 	// 旧的 `0.10 × MS×SS` 是二次计权（eff 里已经含 k），同一条信号纸面 6.7%、实盘 23%，
 	// 两本账的金额差 3 倍而各自的收益曲线都"正常"——那种漂移无法从读数上发现。
 	perTradeLo, perTradeHi := perTradeBandOf(e.sizingCtx)
-	perTradePct := signalctl.PerTradePctOf(k, perTradeLo, perTradeHi)
+	// §FLOW-BLEND：与实盘同一后置乘子。FlowBlend=0（未注入）时 PerTradePctOfBlend 回落 1.0，
+	// 与原 PerTradePctOf 逐字一致——老调用点/测试零行为变更。
+	blend := e.sizingCtx.FlowBlend
+	perTradePct := signalctl.PerTradePctOfBlend(k, perTradeLo, perTradeHi, blend)
 	e.sizingCtx.LastK = k // 只服务展示面（面板回显"这一轮实际按多少买"）
 	ind := ""
 	if e.industryOf != nil {
@@ -1956,6 +1959,9 @@ type paperSizingCtx struct {
 	// 同一条信号在两本账里买到差 3 倍的金额——纸面读数就无法用来解释实盘（§11.3 的"两套口径"禁忌）。
 	PerTradeLo float64
 	PerTradeHi float64
+	// FlowBlend §FLOW-BLEND 后置金额乘子（0.80~1.20，0=未注入按中性1.0）。
+	// 与实盘 Decision.FlowBlend 同源注入，保证两本账的单笔金额一致（否则纸面无法解释实盘）。
+	FlowBlend float64
 	// LastK 最近一笔信号带下来的合成因子 k（只服务展示面：面板要回显"这一轮实际按多少买"）。
 	// 0 = 还没见过任何带缩放的信号，展示面按中性 k=1.0 算并标注"最近一笔"。
 	LastK      float64
@@ -2010,10 +2016,11 @@ func perTradeBandOf(ctx paperSizingCtx) (lo, hi float64) {
 // 语义与"清单为空"并不总是一致（比如注入了但 dims 没算出来时不许悄悄放宽）。
 // English: dims is a mandatory trailing parameter — an optional setter or variadic would both
 // allow a silent miss, which is exactly the failure class this batch is closing.
-func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims []string) {
+func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims []string, flowBlend float64) {
 	e.mu.Lock()
 	e.sizingCtx = paperSizingCtx{MarketScale: ms, PerTradeLo: perTradeLo, PerTradeHi: perTradeHi,
-		Ceiling: ceiling, MissingKey: missingKey, MissingDims: append([]string(nil), missingDims...), Injected: true}
+		Ceiling: ceiling, MissingKey: missingKey, MissingDims: append([]string(nil), missingDims...),
+		FlowBlend: flowBlend, Injected: true}
 	e.mu.Unlock()
 }
 
