@@ -605,6 +605,61 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         self.assertEqual(mod._pending_amount_for("000001.SZ", pending), 12800.0)
         self.assertEqual(mod._pending_amount_for("000002", pending), 0.0)
 
+    def test_filled_order_is_not_read_as_a_cancelled_one(self):
+        """已成交单读成「撤单零成交」⇒ 同一短码会被重发（10:46 实锤的双买）。
+
+        本柜台实证字段族（qmt_bridge_strategy.py:707-715）：
+        量 m_nOrderVolume、已成 m_nVolumeTraded、价 m_dOrderPrice。
+        本文件曾读 m_nTradedVolume / m_dLimitPrice ⇒ 两者都回 0，于是 10:01 成交
+        900/1700 的两笔在 10:45 重启后变成 cancel_like，10:46 同码又买了一次。
+        """
+        mod = self.mod
+
+        class Row(object):
+            pass
+
+        filled = Row()
+        filled.m_strRemark = "%s-FC000034" % mod.STRATEGY_VERSION
+        filled.m_nOrderStatus = 56        # terminal on this counter
+        filled.m_nOffsetFlag = 48
+        filled.m_strOrderSysID = "OID-F"
+        filled.m_strInstrumentID = "000034"
+        filled.m_nOrderVolume = 900
+        filled.m_nVolumeTraded = 900      # proven field family
+        filled.m_dOrderPrice = 21.89
+        cancelled = Row()
+        cancelled.m_strRemark = "%s-FC000001" % mod.STRATEGY_VERSION
+        cancelled.m_nOrderStatus = 54
+        cancelled.m_nOffsetFlag = 48
+        cancelled.m_strOrderSysID = "OID-C"
+        cancelled.m_strInstrumentID = "000001"
+        cancelled.m_nOrderVolume = 1600
+        cancelled.m_nVolumeTraded = 0
+        cancelled.m_dOrderPrice = 12.07
+
+        saved_rows = mod._counter_rows
+        saved_terminal = mod.TERMINAL_STATUSES
+        saved_codes = mod.XT_STATUS_CODES
+        mod.XT_STATUS_CODES = {54: "已撤", 56: "已成"}
+        mod.TERMINAL_STATUSES = ("已撤", "已成", "废单")
+        mod._counter_rows = lambda table: [filled, cancelled] if table == "ORDER" else []
+        try:
+            rows, ok = mod._live_orders()
+        finally:
+            mod._counter_rows = saved_rows
+            mod.TERMINAL_STATUSES = saved_terminal
+            mod.XT_STATUS_CODES = saved_codes
+        self.assertTrue(ok)
+        self.assertEqual(len(rows), 2)
+        by_code = {r["short_code"]: r for r in rows}
+        f = by_code["FC000034"]
+        self.assertEqual(f["traded"], 900, "已成量读成 0（字段族不对 ⇒ 已成交会被当撤单）")
+        self.assertEqual(f["price"], 21.89, "委托价读成 0（字段族不对）")
+        self.assertFalse(f["cancel_like"], "已成单被判成「撤单零成交」⇒ 同码会被重发")
+        self.assertTrue(by_code["FC000001"]["cancel_like"], "零成交撤单应当允许同码重发")
+        # 已成交的买单不再占预算；零成交撤单也不占。
+        self.assertEqual(mod._pending_buy_rows(rows), [])
+
     # ---- floor top-up arithmetic (2026-11-19) -----------------------------
     def test_floor_topup_qty_rounds_UP_to_reach_the_floor(self):
         """10000 / 6.81 整手截断是 1400 股=9534，补底线要 1500 股。"""

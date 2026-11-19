@@ -24180,6 +24180,17 @@ CNT213=$((CNT213 + 1))
 if grep -qE '^[[:space:]]*prefixes = set\(\)' qmt_gateway/qmt_internal_strategy.py; then
 	fail213 "在途单又按 buy_signals 前缀过滤（因子综合买入会再次不占预算）"
 fi
+# ⑧ 字段族：已成量/委托价必须按本柜台实证族读（m_nVolumeTraded / m_dOrderPrice）。
+# 事故：读 m_nTradedVolume / m_dLimitPrice 双双回 0，于是 10:01 成交 900/1700 的两笔
+# 在 10:45 重启后变成「撤单零成交」，10:46 同码又买了一次（双买）。
+CNT213=$((CNT213 + 1))
+grep -qF 'getattr(item, "m_nVolumeTraded", None)' qmt_gateway/qmt_internal_strategy.py || fail213 "已成量不读 m_nVolumeTraded（已成交会被当成撤单零成交）"
+CNT213=$((CNT213 + 1))
+grep -qF 'getattr(item, "m_dOrderPrice", None)' qmt_gateway/qmt_internal_strategy.py || fail213 "委托价不读 m_dOrderPrice（价回 0 ⇒ 在途单照样不占预算）"
+CNT213=$((CNT213 + 1))
+if grep -qE '^[[:space:]]*traded = _to_float\(_pick\(getattr\(item, "m_nTradedVolume"' qmt_gateway/qmt_internal_strategy.py; then
+	fail213 "m_nTradedVolume 回潮（本柜台没有这个字段 ⇒ 双买）"
+fi
 
 # ⑧ 行为腿：三组用例（单票桶 / 底线补足 / ORDER 表读取与在途预算）+ 反证在用例内。
 PY213=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest \
@@ -24192,5 +24203,5 @@ if grep_q 'failed' PY213; then
 fi
 
 [ "$B213_FAILED" = "0" ] || exit 1
-echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 在途占预算 + m_strRemark 首读 + 前缀负锁，累计判定点 ${CNT213}）"
+echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 在途占预算 + m_strRemark 首读 + 前缀负锁 + 字段族（m_nVolumeTraded/m_dOrderPrice），累计判定点 ${CNT213}）"
 echo ""

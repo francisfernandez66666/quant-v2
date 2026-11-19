@@ -445,7 +445,25 @@ def _live_orders():
             continue
         status, terminal = normalize_order_status(
             _pick(getattr(item, "m_nOrderStatus", None), getattr(item, "order_status", None)), codes, TERMINAL_STATUSES)
-        traded = _to_float(_pick(getattr(item, "m_nTradedVolume", None), getattr(item, "traded_volume", None)), 0.0)
+        # 2026-11-19 P0 (live proof, second half): the field families here must
+        # match the ONE build that has actually traded this account for months --
+        # qmt_bridge_strategy.py:707-715. It reads
+        #     qty    m_nOrderVolume / order_volume / volume
+        #     filled m_nVolumeTraded / traded_volume / filled_volume
+        #     price  m_dOrderPrice / m_dPrice / price
+        # This file asked m_nTradedVolume (not a field on this counter) and
+        # m_dLimitPrice. Both came back 0, which is not a harmless readout: a
+        # FILLED order then looks exactly like "terminal with zero fill"
+        # (cancel_like), so (a) it is dropped from counter_codes and the same
+        # short code is re-bought as soon as session memory resets, and (b) its
+        # money never counts against the day budget. Observed live: 10:01
+        # FC000034/FC000690 filled 900/1700, then the 10:45 restart re-sent the
+        # same two names at 10:46 (100/300) because the filled rows looked
+        # cancelled. Fail direction is deliberately "unfilled": an unreadable
+        # traded count reserves money it may not need, never spends it twice.
+        traded = _to_float(_pick(getattr(item, "m_nVolumeTraded", None),
+                                 getattr(item, "traded_volume", None),
+                                 getattr(item, "filled_volume", None)), 0.0)
         out.append({
             "order_id": str(_pick(getattr(item, "m_strOrderSysID", None), getattr(item, "order_id", None)) or ""),
             "symbol": str(_pick(getattr(item, "m_strInstrumentID", None), getattr(item, "stock_code", None)) or ""),
@@ -454,9 +472,14 @@ def _live_orders():
             "side": _order_side(item, op_buy, op_sell),
             "status": status,
             "terminal": terminal,
-            "qty": _to_float(_pick(getattr(item, "m_nOrderVolume", None), getattr(item, "order_volume", None)), 0.0),
+            "qty": _to_float(_pick(getattr(item, "m_nOrderVolume", None),
+                                   getattr(item, "order_volume", None),
+                                   getattr(item, "volume", None)), 0.0),
             "traded": traded,
-            "price": _to_float(_pick(getattr(item, "m_dLimitPrice", None), getattr(item, "price", None)), 0.0),
+            "price": _to_float(_pick(getattr(item, "m_dOrderPrice", None),
+                                     getattr(item, "m_dPrice", None),
+                                     getattr(item, "m_dLimitPrice", None),
+                                     getattr(item, "price", None)), 0.0),
             "order_time": _order_submit_epoch(item),
             "cancel_like": bool(terminal and traded <= 0.0),
         })
