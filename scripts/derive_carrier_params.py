@@ -206,6 +206,17 @@ MAPPING = [
     ("flow_5d_scales", ("flow_5d_scales",), None),
     ("flow_bands", ("flow_bands",), None),
     ("flow_today_scales", ("flow_today_scales",), None),
+    # §FLOW-QUADRANT 2026-11-20：四象限/后置乘子的阈值同名直搬（真源是 signalctl 的
+    # flow_regime.go / flow_blend.go 常量块，经 derive_carrier_flow.go 只读导出）。
+    # 载体读的键名与 Go 语义一一对应，两边不许各写一份数。
+    ("flow_r_yest_surge", ("flow_r_yest_surge",), None),
+    ("flow_r_ma5_surge", ("flow_r_ma5_surge",), None),
+    ("flow_r_yest_shrink", ("flow_r_yest_shrink",), None),
+    ("flow_r_ma5_shrink", ("flow_r_ma5_shrink",), None),
+    ("flow_posrel_high", ("flow_posrel_high",), None),
+    ("flow_blend_pct", ("flow_blend_pct",), None),
+    ("flow_blend_lo", ("flow_blend_lo",), None),
+    ("flow_blend_hi", ("flow_blend_hi",), None),
     # -- 情绪相位阈值 -------------------------------------------------------
     ("emo_ice_limitup_max", ("emo_ice_limitup_max",), None),
     ("emo_ice_board_max", ("emo_ice_board_max",), None),
@@ -509,6 +520,12 @@ CARRIER_OWNED = {
     "industry_cap_pct": "needs-go-naming: 行业敞口帽在 Go 出厂为 0（＝关），不可当默认搬",
     "single_stock_cap_pct": "needs-go-naming: 同上（SingleStockValuePct 出厂 0）",
     "zero_amount": "math-constant: 规则层禁裸数字，预算算术的零元由这里给出；不是策略阈值，Go 无对应",
+    # §FLOW-SNAPSHOT（2026-11-20）：资金流快照的新鲜度上限（秒）。这不是策略阈值，
+    # 而是**投递契约**的读数：快照由 carrier_hot_reload_gz.bake_flow_snapshot 每 30 分钟
+    # 重算、只在 delta 实质变化时发布，所以"超过 45 分钟没收到新快照"意味着发布腿停了
+    # 或 delta 一直没动——两种情况下继续用旧读数都是伪造新鲜度。45＝30 的 1.5 倍，留一次
+    # 投递/重启余量。Go 侧没有对应常量（Go 的 flowMoneyTTL=60s 是引擎自己的取数节拍）。
+    "flow_snapshot_ttl_sec": "carrier-delivery: 资金流快照新鲜度上限（秒），见 §FLOW-SNAPSHOT",
     # §STRATEGY-SWITCH-SYNC（owner 11-06 裁决）：这三枚不是 Go 出厂默认，而是量化交易 tab
     # 的现网开关快照，由 scripts/sync_strategy_switches.py 单点派生进 params；derive 不产出值。
     "enabled_strategies": "snapshot-derived: 量化交易 tab 的战法白名单（auth.json#qmt.strategies），由 sync_strategy_switches.py 派生",

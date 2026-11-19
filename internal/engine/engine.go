@@ -4783,6 +4783,15 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// auto-buy caution / held alerts (single source of truth).
 	e.mu.RLock()
 	mState := e.lastMarketState
+	// §FLOW-QUADRANT 2026-11-20: the SAME state-machine reading that yields
+	// MarketState also yields the recommended max-position tier (bull 0.60 /
+	// range 0.35 / bear 0.15). The four-quadrant rule needs it as the posRel
+	// denominator (posRel = TotalPosPct / MaxPosPct) and it was the one column of
+	// market_risk_daily that stayed NULL, so posRel could never be computed and
+	// the quadrant silently degraded to Neutral every day. Read under the same
+	// lock as MarketState so the pair can never mismatch; 0 = state machine off
+	// = NULL (never a fabricated 0% target).
+	maxPosPct := e.lastMaxPosPct
 	e.mu.RUnlock()
 	if e.combatAgent != nil {
 		riskTier, riskReasons := e.combatAgent.ComputeAndSetRiskTier(emotionPhase, mState, riskUpRatio)
@@ -4802,6 +4811,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			Reasons:      strings.Join(riskReasons, "+"),
 			UpRatio:      nanPtr(riskUpRatio),
 			BreakRate:    nanPtr(riskBreakRate),
+			MaxPosPct:    posPctPtr(maxPosPct),
 			LimitUpCount: len(pool),
 			LadderHeight: maxLadder(pool),
 		})
@@ -7885,6 +7895,18 @@ func (e *Engine) persistRiskDailyToday(row store.MarketRiskDailyRow) {
 // English: maps NaN to nil for NULL persistence (missing = abstain, never a fake 0).
 func nanPtr(x float64) *float64 {
 	if x != x { // NaN
+		return nil
+	}
+	v := x
+	return &v
+}
+
+// posPctPtr 仓位档指针：<=0（状态机未启用/未算出）存 NULL，绝不当成 0% 目标仓位落库。
+// 为什么单独一枚而不是复用 nanPtr：0 在 nanPtr 里是合法值，而这里 0 的语义是"没有读数"，
+// 落成 0 会让下游 posRel 除零或把"未启用"读成"目标满仓为零"，两种都是伪造读数。
+// English: a 0/absent max-position tier is stored NULL, never as a fabricated 0%.
+func posPctPtr(x float64) *float64 {
+	if x != x || x <= 0 { // NaN or "state machine off"
 		return nil
 	}
 	v := x

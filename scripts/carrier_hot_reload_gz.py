@@ -29,6 +29,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 BUILD_DIR = os.environ.get("CARRIER_BUILD_DIR", "/opt/quant/carrier_build")
 DATA_DIR = os.environ.get("QUANT_DATA_DIR", "/var/lib/quant-trading-v2")
@@ -98,7 +99,17 @@ PARAMS_BASE_NAME = "local_executor_params.base.json"
 RUNTIME_PARAM_KEYS = frozenset((
     "hot_pool", "precalc", "symbols", "t_anchor_book", "t_macro",
     "concept_map", "industry_map", "live_rules", "risk_list_dynamic",
+    # §FLOW-SNAPSHOT：30 分钟重算的资金流快照（大盘/板块 delta + 市场状态/仓位档），
+    # 由 bake_flow_snapshot 每轮重算写入，永远是运行态而非静态旋钮。
+    "flow_snapshot",
 ))
+
+# §FLOW-SNAPSHOT（owner 2026-11-19/20 裁决 A）：资金流快照的重算节拍与"实质变化"阈值。
+# 30 分钟重算一次（发布只在 delta 实质变化时才发生——一次发布＝盒子客户端一次有序重启）；
+# 0.05 的量化步长≈净流入/成交额 0.15 个百分点，低于它的抖动不值得重启一次客户端。
+FLOW_SNAP_MIN_INTERVAL_SEC = float(os.environ.get("FLOW_SNAP_MIN_INTERVAL_SEC", "1800"))
+FLOW_SNAP_TOL = float(os.environ.get("FLOW_SNAP_TOL", "0.05"))
+FLOW_SNAP_ATTEMPT = os.path.join(BUILD_DIR, "qmt_gateway", "flow_snapshot_attempt.json")
 # 顶层（不在 params 内）的运行态键：版本号必须单调，不能被 base 里的旧值盖回去。
 RUNTIME_DOC_KEYS = frozenset(("strategy_version",))
 
@@ -529,6 +540,184 @@ def bake_t_macro():
     return out
 
 
+def _flow_snap_read_json(path, default):
+    """Read one small JSON state file; a missing/corrupt file yields the default."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def _flow_snap_quantize(value, step):
+    """Round a delta to a comparison grid so sub-threshold noise cannot churn.
+
+    Two jobs: (a) `changed` must mean "materially different", otherwise a sector
+    delta wobbling by 0.001 every 30 minutes would republish and restart the
+    box's QMT client for nothing; (b) the sha payload digest uses the SAME grid,
+    so "changed" and "sha changed" can never disagree (a digest that disagrees
+    with the change test is how a real update gets filed as NOTHING_TO_DO).
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return round(number / step) * step if step > 0 else number
+
+
+def flow_snapshot_digest(snapshot):
+    """Comparable fingerprint of a flow snapshot (baked_at deliberately excluded).
+
+    Returns "" when there is no usable snapshot, so "never baked" and "baked
+    empty" stay distinguishable from "baked and unchanged" in the log.
+    """
+    if not isinstance(snapshot, dict) or not snapshot.get("day"):
+        return ""
+    step = FLOW_SNAP_TOL
+    market = _flow_snap_quantize(snapshot.get("market_delta"), step)
+    sectors = snapshot.get("sector_delta") or {}
+    quantized = {}
+    if isinstance(sectors, dict):
+        for name, value in sectors.items():
+            q = _flow_snap_quantize(value, step)
+            if q is not None:
+                quantized[str(name)] = q
+    body = {
+        "day": str(snapshot.get("day") or ""),
+        "market": market,
+        "sector": quantized,
+        "state": snapshot.get("market_state"),
+        "max_pos_pct": _flow_snap_quantize(snapshot.get("max_pos_pct"), 0.01),
+    }
+    return hashlib.sha256(json.dumps(body, ensure_ascii=True, sort_keys=True)
+                          .encode()).hexdigest()[:16]
+
+
+def _read_flow_inputs(day_compact):
+    """Read today's money-flow readings from the research DB (read-only).
+
+    Deliberately re-uses what the Go engine already normalised rather than
+    re-implementing the EastMoney parse here:
+
+      * flow_factor_daily.market_flow_pct / flow_market_delta -- the engine's
+        60s market leg (index fflow through the box relay, FlowPctToDelta).
+      * sector_flow_daily.sector / delta -- the engine's per-board leg.
+      * market_risk_daily.market_state / max_pos_pct -- the state machine's
+        regime and its recommended max-position tier (the posRel denominator).
+
+    Two date spellings, on purpose: the flow tables are written with a dashed
+    `2006-01-02` key (cntime.DayOf) while market_risk_daily uses the compact
+    `20060102` one (data.TradingDayDate). Querying with the wrong shape returns
+    zero rows and would look exactly like "no flow today".
+    """
+    dashed = "%s-%s-%s" % (day_compact[0:4], day_compact[4:6], day_compact[6:8])
+    out = {"market_pct": None, "market_delta": None, "sectors": {},
+           "market_state": None, "max_pos_pct": None}
+    import sqlite3
+    conn = sqlite3.connect("file:%s?mode=ro" % HOTRELOAD_DB, uri=True, timeout=5)
+    try:
+        row = conn.execute(
+            "SELECT market_flow_pct, flow_market_delta FROM flow_factor_daily "
+            "WHERE trade_date=?", (dashed,)).fetchone()
+        if row:
+            if row[0] is not None:
+                out["market_pct"] = float(row[0])
+            if row[1] is not None:
+                out["market_delta"] = float(row[1])
+        for sector, delta in conn.execute(
+                "SELECT sector, delta FROM sector_flow_daily "
+                "WHERE trade_date=? AND delta IS NOT NULL", (dashed,)):
+            if sector:
+                out["sectors"][str(sector)] = float(delta)
+        row = conn.execute(
+            "SELECT market_state, max_pos_pct FROM market_risk_daily WHERE trade_date=?",
+            (day_compact,)).fetchone()
+        if row:
+            out["market_state"] = str(row[0]) if row[0] else None
+            if row[1] is not None and float(row[1]) > 0:
+                out["max_pos_pct"] = float(row[1])
+    finally:
+        conn.close()
+    return out
+
+
+def bake_flow_snapshot():
+    """§FLOW-SNAPSHOT: bake the 30-minute money-flow snapshot into the carrier.
+
+    Owner ruling 2026-11-19/20 (option A): the decision host recomputes the
+    market + per-sector flow readings every 30 minutes and publishes a carrier
+    ONLY when the deltas materially changed (a publish means an ordered restart
+    of the box's QMT client, so churn is the cost we are avoiding). Between
+    publishes the box keeps the previous snapshot, and the carrier abstains once
+    that snapshot is older than its TTL (45 min) or belongs to another day --
+    abstaining is the honest answer to "the flow reading is two hours old".
+
+    Returns (snapshot, changed). `snapshot` is what should be written into
+    params.flow_snapshot (the previous one is returned untouched when nothing
+    moved). `changed` drives manifest.intraday_priority.
+    """
+    now = time.time()
+    day_compact = datetime.datetime.now().astimezone().strftime("%Y%m%d")
+    try:
+        with open(os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_params.json"),
+                  encoding="utf-8") as fh:
+            current = ((json.load(fh) or {}).get("params") or {}).get("flow_snapshot")
+    except (OSError, ValueError):
+        current = None
+    state = _flow_snap_read_json(FLOW_SNAP_ATTEMPT, {})
+    last_attempt = float(state.get("at") or 0.0)
+    due = (not isinstance(current, dict)
+           or str(current.get("day") or "") != day_compact
+           or now - last_attempt >= FLOW_SNAP_MIN_INTERVAL_SEC)
+    if not due:
+        # Throttle: one recompute per half hour. The sha payload carries the
+        # digest, so an unchanged snapshot naturally yields NOTHING_TO_DO.
+        return current, False
+    try:
+        readings = _read_flow_inputs(day_compact)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable DB must not kill the bake
+        print("HOTRELOAD_FLOW_SNAPSHOT abstain reason=db_unreadable detail=%s"
+              % repr(exc)[:80])
+        readings = None
+    try:
+        with open(FLOW_SNAP_ATTEMPT, "w", encoding="utf-8") as fh:
+            json.dump({"at": now, "day": day_compact}, fh)
+    except OSError as exc:
+        print("HOTRELOAD_FLOW_SNAPSHOT_STATE_FAIL %s" % type(exc).__name__)
+    if not readings or (readings["market_delta"] is None and not readings["sectors"]):
+        # Nothing readable yet (pre-open, engine not running, relay down). Keep
+        # whatever is baked: a cross-day snapshot is already inert because the
+        # carrier checks the day, and a same-day one still has its own TTL.
+        print("HOTRELOAD_FLOW_SNAPSHOT abstain reason=no_readings day=%s" % day_compact)
+        return current, False
+    snapshot = {
+        "day": day_compact,
+        "baked_at": round(now, 3),
+        "market_delta": readings["market_delta"],
+        "market_flow_pct": readings["market_pct"],
+        "sector_delta": readings["sectors"],
+        "market_state": readings["market_state"],
+        "max_pos_pct": readings["max_pos_pct"],
+        "source": "cloud_flow_bake",
+    }
+    changed = flow_snapshot_digest(snapshot) != flow_snapshot_digest(current)
+    print("HOTRELOAD_FLOW_SNAPSHOT day=%s market_delta=%s sectors=%d state=%s max_pos=%s "
+          "changed=%d digest=%s" % (
+              day_compact,
+              "na" if snapshot["market_delta"] is None else "%.4f" % snapshot["market_delta"],
+              len(snapshot["sector_delta"]), snapshot["market_state"] or "-",
+              "na" if snapshot["max_pos_pct"] is None else "%.3f" % snapshot["max_pos_pct"],
+              1 if changed else 0, flow_snapshot_digest(snapshot)))
+    if not changed:
+        # Keep the OLD baked_at on purpose: republishing a byte-identical reading
+        # would restart the client for nothing, and refreshing the timestamp
+        # without a publish would be a freshness claim the box never received.
+        return current, False
+    return snapshot, True
+
+
 def extract_news_gate():
     """§NEWS-GATE（R10/R11/R12）：读当日资讯闸快照，返回 None=不可用作真源（回退旧规则）。
 
@@ -727,6 +916,11 @@ def main():
     t_bake_digest = hashlib.sha256(json.dumps(
         {"a": t_anchor_book, "m": t_macro, "c": T_SIGNAL_CODES}, ensure_ascii=True,
         sort_keys=True).encode()).hexdigest()[:16]
+    # §FLOW-SNAPSHOT：资金流快照（30 分钟节流重算；只有实质变化才换 digest）。
+    # 必须在 sha 之前算：否则"资金流变了但白名单没变"会被 sha 闸拦成 NOTHING_TO_DO，
+    # 盒子上永远拿不到新的 delta（与当日利空归因、T 锚点同一条纪律）。
+    flow_snapshot, flow_changed = bake_flow_snapshot()
+    flow_digest = flow_snapshot_digest(flow_snapshot)
     # §BUCKETS-SHA-20261112：行业/概念桶内容纳入 sha——桶由 pregen 的回填腿维护，
     # 桶变化必须触发重烘投递（否则 params 变了产物不变，盒子上永远拿不到桶）。
     # 注意：本脚本没有 PARAMS_PATH 常量（那是 pregen 的），params 走 BUILD_DIR 相对
@@ -746,6 +940,9 @@ def main():
                           "signal_pool": signal_pool, "precalc": precalc_meta,
                           "buy_codes": sorted(extract_buy_codes()),
                           "t_bake": t_bake_digest,
+                          # §FLOW-SNAPSHOT：资金流快照（量化后的可比指纹）纳入 sha——
+                          # 内容不变时 NOTHING_TO_DO（不重启客户端），变了就必须重烘投递。
+                          "flow_snapshot": flow_digest,
                           # §PARAMS-STATIC-BASE: a change to a static knob (or to
                           # this base file itself) must re-bake, otherwise the box
                           # keeps running the old number forever.
@@ -831,6 +1028,11 @@ def main():
     doc2["params"]["t_anchor_book"] = t_anchor_book
     doc2["params"]["t_macro"] = t_macro
     doc2["params"]["t_signal_codes"] = dict(T_SIGNAL_CODES)
+    # §FLOW-SNAPSHOT：写资金流快照（含 baked_at，供载体判 TTL）。没有可用快照时
+    # **不写空壳**——跨日的旧键由载体自己按 day 弃权，写一个空 dict 反而会抹掉
+    # 昨天那份仍可能被读的证据（跨日弃权已经够了）。
+    if isinstance(flow_snapshot, dict) and flow_snapshot.get("day"):
+        doc2["params"]["flow_snapshot"] = flow_snapshot
     json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 
@@ -904,7 +1106,7 @@ def main():
         # §INTRADAY-BUYSIG（2026-11-16 owner 拍板）：盘中新 buy 信号同样走 intraday——
         # 差分基准是**上次发布**（buy_signals_state.json 只在发布腿写回，NOTHING_TO_DO
         # 轮不写，否则一次空轮就会把新信号吃掉）；每次投递重启 1~2 分钟，同集合天然防抖。
-        "intraday_priority": bool(reversal_events) or bool(new_buys),
+        "intraday_priority": bool(reversal_events) or bool(new_buys) or bool(flow_changed),
     }
     json.dump(manifest, open(os.path.join(manifest_dir, "carrier_manifest.json"), "w",
                              encoding="utf-8"), ensure_ascii=True, indent=2)

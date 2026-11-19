@@ -418,7 +418,11 @@ func TestManualRealBookMergesBySource(t *testing.T) {
 		UpdatedAt: yesterday + " 14:55:00"}); err != nil {
 		t.Fatalf("seed stale account: %v", err)
 	}
-	if rr := manualPost(s, member, `{"positions":[{"ts_code":"600000.SH","qty":1000,"cost_price":8.5}],"available_cash":88000,"asof":"`+today+` 09:30:00"}`); rr.Code != http.StatusOK {
+	// ASOF-PAST 2026-11-20：这里以前写的是 today+" 09:30:00"，而"柜台接管后手动账让位"
+	// 的判据是 asof <= 接管时刻（manualAsofUsable）。于是这条用例在 09:30 之前跑必然假红
+	// （手动 asof 落在未来 ⇒ 接管指针比它早 ⇒ 手动账还在赢），11-20 04:0x 的整轮 go test
+	// 实测复现。改成 00:00:00 只把夹具钉到"今天且一定已过去"的时刻，判据与断言一字未改。
+	if rr := manualPost(s, member, `{"positions":[{"ts_code":"600000.SH","qty":1000,"cost_price":8.5}],"available_cash":88000,"asof":"`+today+` 00:00:00"}`); rr.Code != http.StatusOK {
 		t.Fatalf("manual post 应 200，got %d body=%s", rr.Code, rr.Body.String())
 	}
 	out := manualGetReal(t, s, member)
@@ -438,7 +442,7 @@ func TestManualRealBookMergesBySource(t *testing.T) {
 		t.Fatalf("持仓行应来自手动账，got %v", first["ts_code"])
 	}
 	// updated_at 必须跟着换成手动 asof：右上角那句"持仓数据截至"不能继续显示柜台回报时刻。
-	if first["updated_at"] != today+" 09:30:00" {
+	if first["updated_at"] != today+" 00:00:00" {
 		t.Fatalf("手动行的 updated_at 应等于手动 asof，got %v", first["updated_at"])
 	}
 	acc := out["account"].(map[string]interface{})

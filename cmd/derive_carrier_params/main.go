@@ -305,6 +305,12 @@ func collectPaperCost(c *collector) {
 // 这里同样只调导出函数。
 func collectSignalctl(c *collector) {
 	c.put("missing_key_target_cap", "internal/signalctl/sizing.go:MissingKeyTargetCap", signalctl.MissingKeyTargetCap())
+	// §FLOW-QUADRANT 2026-11-20：四象限/后置乘子的全部阈值从这里搬（零新数字，
+	// 逐条转调 signalctl 自己的常量块）。载体侧读的就是同一批键名。
+	const flowSrc = "internal/signalctl/derive_carrier_flow.go:FlowQuadrantCarrierKnobs"
+	for _, knob := range signalctl.FlowQuadrantCarrierKnobs() {
+		c.put(knob.Key, flowSrc, knob.Value)
+	}
 }
 
 // collectBoards 取分板块涨跌停幅度。

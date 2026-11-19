@@ -25637,3 +25637,104 @@ grep -qF '0.174884125' "$PB230" || fail230 "丢了中继与云端 delta 逐位�
 [ "$B230_FAILED" = "0" ] || exit 1
 echo "ok - §230 §PROBE-BOX-COMPAT 锁通过（stdout=None 守卫+hasattr 守卫+未守卫调用零处+两条行为腿判退出码+3.6 语法面三条负锁+只读纪律+实测口径在册，累计判定点 ${CNT230}）"
 echo ""
+
+echo "==> 231 §FLOW-QUADRANT（载体侧量比+净流入：三态双闸/快照新鲜度/唯一硬闸±20% blend/无阈值兜底/烘入腿在 sha 之前）..."
+B231_FAILED=0
+fail231() {
+	echo "--- FAIL: §231 $*"
+	FAIL=1
+	B231_FAILED=1
+}
+CNT231=0
+FS231=qmt_gateway/qmt_internal_strategy.py
+HR231=scripts/carrier_hot_reload_gz.py
+DF231=internal/signalctl/derive_carrier_flow.go
+T231=qmt_gateway/tests/test_carrier_flow_quadrant_20261120.py
+FST=$(cat "$FS231" || true)
+HRT=$(cat "$HR231" || true)
+DFT231=$(cat "$DF231" || true)
+PARAMS231=$(cat qmt_gateway/local_executor_params.json || true)
+
+# ① 四条腿都在册：载体取数/判断、云端烘参、Go 单点导出、行为用例。
+#    少一条的形态各不相同（载体少＝功能不存在；烘参少＝盒上永远弃权；导出少＝阈值抄两份；
+#    用例少＝没人能证明这三条）。
+CNT231=$((CNT231 + 1))
+[ -s "$FS231" ] || fail231 "载体模板不在册（${FS231}）"
+[ -s "$HR231" ] || fail231 "云端烘参脚本不在册（${HR231}）"
+[ -s "$DF231" ] || fail231 "Go 单点导出不在册（${DF231}）"
+[ -s "$T231" ] || fail231 "载体行为用例不在册（${T231}）"
+for name in _flow_param _finite_pos _vol_state_of _vol_ratio_state _flow_snapshot_state \
+            _quadrant_state _flow_round_prepare _flow_blend_for _sector_delta_for; do
+	grep_q "def ${name}(" FST F || fail231 "载体缺函数 ${name}（§FLOW-QUADRANT 的一条腿整条不在）"
+done
+for name in bake_flow_snapshot flow_snapshot_digest _read_flow_inputs; do
+	grep_q "def ${name}(" HRT F || fail231 "烘参腿缺函数 ${name}（盒上永远拿不到新 delta）"
+done
+
+# ② 阈值只有一处真源：Go 导出的那份文件里除了注释**不许有数字字面量**，
+#    参数文件必须逐键带上（缺键时载体弃权，不是回落 1.2）。
+CNT231=$((CNT231 + 1))
+NUM231=$(grep -vE '^\s*(//|/\*|\*)' "$DF231" 2>/dev/null | grep -cE '[0-9]+\.[0-9]+' || true)
+[ "${NUM231:-1}" = "0" ] || fail231 "导出侧出现数字字面量（阈值必须转调 Go 常量，不许在这里再写一遍）"
+for key in flow_r_yest_surge flow_r_ma5_surge flow_r_yest_shrink flow_r_ma5_shrink \
+           flow_posrel_high flow_blend_pct flow_blend_lo flow_blend_hi flow_snapshot_ttl_sec; do
+	grep_q "\"${key}\":" PARAMS231 F || fail231 "参数文件缺 ${key}（载体缺键即弃权，功能等于没上）"
+done
+grep_q "FlowQuadrantCarrierKnobs" DFT231 F || fail231 "导出函数不在（derive 拿不到这八枚数）"
+
+# ③ 反证方向的硬锁：载体里**不许**有阈值兜底常量。
+#    `PARAMS.get("flow_...", 1.2)` 这种写法在改 Go 常量那天会让载体继续按旧数交易，
+#    而两边看起来都对——这是本仓最贵的形状，所以判的是"零处"。
+CNT231=$((CNT231 + 1))
+FALLBACK231=$(printf '%s\n' "$FST" | grep -nE 'PARAMS\.get\("flow_[a-z0-9_]+",[[:space:]]*[-0-9]' | grep -v '^[0-9]*:#' || true)
+[ -z "$FALLBACK231" ] || fail231 "载体里出现 flow 阈值兜底常量：${FALLBACK231}"
+READS231=$(printf '%s\n' "$FST" | grep -c '_flow_param("' || true)
+[ "${READS231:-0}" -ge 5 ] || fail231 "阈值读数没有走 _flow_param（实得 ${READS231:-0} 处）"
+
+# ④ 弃权纪律在册：盘前 / 跨日 / 过期 / 缺键四条都必须有独立锚，
+#    折成一句"没数据"就会让"今天没有资金流"和"资金流说中性"同形。
+CNT231=$((CNT231 + 1))
+for anchor in vol_premarket vol_bad_history flow_snapshot_missing flow_snapshot_stale_day \
+              flow_snapshot_expired flow_knob_missing; do
+	grep_q "$anchor" FST F || fail231 "缺弃权锚 ${anchor}（缺数与"读数为中性"会变同形）"
+done
+
+# ⑤ 唯一硬闸只拦 new/add：range 态 T 必须照跑（owner 裁决），所以判据里必须带 intent。
+CNT231=$((CNT231 + 1))
+grep_q 'intent in ("new", "add") and _quadrant.get("block")' FST F \
+	|| fail231 "四象限硬闸的判据不在（或把 T 腿一起拦了——range 态 T 要照跑）"
+grep_q 'flow_quadrant_block' FST F || fail231 "硬闸跳过原因未落进 round_skips（盘后无法归因）"
+
+# ⑥ blend 落点：只乘 per_trade，且夹 0.5×equity（等价 Go PerTradePctOfBlend）。
+CNT231=$((CNT231 + 1))
+grep_q 'caps["per_trade"] = scaled' FST F || fail231 "blend 没有落在 per_trade 上（落错帽＝改的是另一条链）"
+grep_q 'scaled > base * 0.5' FST F || fail231 "缺 0.5×equity 上限（Go PerTradePctOfBlend 的那条硬边界）"
+SIZING_BODY231=$(printf '%s\n' "$FST" | sed -n '/^def sizing_cap/,/^def _rule_tag/p')
+OTHERBLEND231=$(printf '%s\n' "$SIZING_BODY231" | grep -nE 'caps\["[a-z_]+"\] = ' | grep -v 'per_trade' || true)
+[ -z "$OTHERBLEND231" ] || fail231 "sizing_cap 里改动了别的帽：${OTHERBLEND231}"
+
+# ⑦ 烘入腿必须在 sha 之前，并进 sha 载荷 + intraday_priority + 运行态键表。
+#    顺序错了的形态是"资金流变了但白名单没变 ⇒ NOTHING_TO_DO ⇒ 盒子永远拿不到新 delta"。
+CNT231=$((CNT231 + 1))
+SHA_LINE=$( { grep -n 'sha = hashlib.sha256(payload.encode()).hexdigest()' "$HR231" || true; } | head -1 | cut -d: -f1)
+BAKE_LINE=$( { grep -n 'flow_snapshot, flow_changed = bake_flow_snapshot()' "$HR231" || true; } | head -1 | cut -d: -f1)
+[ -n "$SHA_LINE" ] || fail231 "找不到烘参脚本的 sha 计算点（锚漂了＝这把顺序锁没有牙）"
+[ -n "$BAKE_LINE" ] || fail231 "找不到资金流快照的计算点（锚漂了 ＝这把顺序锁没有牙）"
+[ "${BAKE_LINE:-0}" -lt "${SHA_LINE:-0}" ] || fail231 "资金流快照没在 sha 之前算（${BAKE_LINE:-?} >= ${SHA_LINE:-?}）"
+grep_q '"flow_snapshot": flow_digest' HRT F || fail231 "资金流快照没进 sha 载荷（变了也不会重烘投递）"
+grep_q 'or bool(flow_changed)' HRT F || fail231 "实质变化没进 intraday_priority（盘中班次永远不会拉）"
+grep_q '"flow_snapshot",' HRT F || fail231 "flow_snapshot 未登记为运行态键（静态基座会把快照当旧值覆盖）"
+
+# ⑧ 行为腿：判**退出码**，不判输出文本（多包/多例时 "1 failed, 27 passed" 里也有 passed）。
+CNT231=$((CNT231 + 1))
+if command -v python3 >/dev/null 2>&1; then
+	FQ231_RC=0
+	python3 -m pytest "$T231" -q >/dev/null 2>&1 || FQ231_RC=$?
+	[ "$FQ231_RC" = "0" ] || fail231 "载体行为用例未过（退出码 ${FQ231_RC}）"
+else
+	echo "INFO - §231 无 python3，行为腿未跑（这份绿不含载体行为判定）"
+fi
+
+[ "$B231_FAILED" = "0" ] || exit 1
+echo "ok - §231 §FLOW-QUADRANT 锁通过（四腿在册+阈值单点无兜底+四类弃权锚+唯一硬闸只拦new/add+blend落点per_trade+烘入腿在sha之前+行为用例判退出码，累计判定点 ${CNT231}）"
+echo ""

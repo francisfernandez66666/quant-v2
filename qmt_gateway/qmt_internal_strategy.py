@@ -2151,6 +2151,12 @@ def _series(payload, field, symbol):
         data = getattr(entry, "close", None)
     elif field == "volume":
         data = getattr(entry, "volume", None)
+    elif field == "amount":
+        # FLOW-VOL-20261120: the relative-volume leg is denominated in traded
+        # AMOUNT (yuan), not share count -- the 11-19 box probe proved the
+        # index `volume` column is in LOTS while `amount` is in yuan, so the
+        # same-source ratio must read `amount` to stay unit-free.
+        data = getattr(entry, "amount", None)
     else:
         return []
     if data is None and isinstance(entry, dict):
@@ -2159,6 +2165,503 @@ def _series(payload, field, symbol):
         return [_to_float(item, 0.0) for item in list(data)]
     except TypeError:
         return []
+
+
+# ---------------------------------------------------------------------------
+# FLOW-QUADRANT / FLOW-BLEND (2026-11-20, owner ruling)
+# ---------------------------------------------------------------------------
+# Two readings feed (a) the single hard veto this carrier owns below the
+# strategy gates and (b) the post-composition amount multiplier:
+#
+#   * relative volume (surge / shrink / neutral) -- computed IN-CLIENT from the
+#     index daily bars. The 11-20 box probe proved `get_market_data_ex` serves
+#     close/volume/amount for 1d/1m/5m, that the index `volume` column is in
+#     LOTS while `amount` is in YUAN, and that the same source yields both. The
+#     ratio is therefore same-source and must NEVER be rescaled by 100 (x100 is
+#     only for cross-source reconciliation against cloud "shares" columns).
+#   * money flow (market delta + per-sector delta) -- BAKED by the decision
+#     host every 30 minutes, because this QMT build returns all eight money-flow
+#     columns as NaN (same probe). A missing / cross-day / older-than-TTL
+#     snapshot ABSTAINS: it is never folded into a fabricated zero.
+#
+# Thresholds mirror internal/signalctl/flow_regime.go (rYesSurge=1.2,
+# rMa5Surge=1.0, rYesShrink=1.0, rMa5Shrink=0.9, posRelHigh=1.3) and
+# internal/signalctl/flow_blend.go (three equal weights, renormalise on missing
+# items, clamp(1+0.20*b, 0.80, 1.20)). Every threshold is read from PARAMS with
+# NO fallback literal: derive_carrier_params.py writes them from the Go constants
+# (internal/signalctl/derive_carrier_flow.go), and an absent knob abstains instead
+# of silently re-using a hand-copied number. A second copy is how the box keeps
+# trading the old threshold the day someone re-tunes the real one.
+_FLOW_INDEX_CODES = ("000001.SH", "000300.SH")
+_FLOW_BARS_COUNT = 8           # 6 needed (today + T-1..T-5); two spare rows
+_FLOW_MINUTE_SCALE = 240.0     # A-share day = 120 AM + 120 PM trading minutes
+
+
+def _bar_day(stamp):
+    """YYYYMMDD out of a bar timestamp, or None (digit-only discipline).
+
+    Accepts "202611171430", "20261117143000", "2026-11-17 14:30:00" and any
+    datetime whose str() keeps the date in the leading digits. A stamp that
+    cannot prove its DATE is rejected: treating an unproven last bar as history
+    would splice an in-progress day into the baseline (a fabricated ratio), and
+    treating it as today would double-count. Abstaining is the only safe branch.
+    """
+    text = str(stamp)
+    for ch in text:
+        if not (ch.isdigit() or ch in "-: ."):
+            return None
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    return digits[0:8]
+
+
+def _index_amount_payload(ContextInfo, code, count):
+    """One index's daily bars (close/volume/amount), re-keyed to the bare code.
+
+    Both client signatures are tried, in the same order _hist_bars uses (the
+    keyword shape is the one the 2026-11-03 probe saw return a dict instead of
+    an ArgumentError). The single returned entry is re-keyed to the BARE code, so
+    a client that answers under `000001.SH` and one that answers under `000001`
+    are read identically -- otherwise one build would report "no index bars"
+    while the data is right there.
+    """
+    getter = getattr(ContextInfo, "get_market_data_ex", None)
+    if not callable(getter):
+        return None
+    fields = ["close", "volume", "amount"]
+    bare = _bare(code)
+    try:
+        payload = getter(fields, [code], period="1d", count=count)
+    except Exception:  # noqa: BLE001 - shape mismatch, try the legacy one
+        payload = None
+    if not isinstance(payload, dict):
+        try:
+            payload = getter(fields, [code], "1d", "", "", count, True, True)
+        except Exception:  # noqa: BLE001 - this build has no usable history
+            return None
+    if not isinstance(payload, dict):
+        return None
+    # Re-key ONLY this one entry, by the exact code we asked for. Deliberately
+    # NOT _rekey_payload: that helper derives the suffixed code from the bare
+    # one (_qmt_code), and for an INDEX `_qmt_code("000001")` guesses .SZ while
+    # the answer came back as 000001.SH -- the re-key would silently miss and
+    # report "no index bars" every round.
+    if bare != code and code in payload:
+        return {bare: payload.get(code)}
+    return payload
+
+
+def _trading_minutes_elapsed(moment):
+    """Elapsed A-share trading minutes (240 = 120 AM + 120 PM).
+
+    Byte-for-byte port of internal/combat_agent/intraday_ratio.go
+    (tradingMinutesElapsed): pre-open 0, lunch 120, after close 240. The volume
+    leg prorates today's cumulative amount by 240/elapsed, so elapsed<=0 must
+    abstain (prorating an auction print would inflate the ratio 240x).
+    """
+    minutes = moment.hour * 60 + moment.minute
+    am_start, am_end = 9 * 60 + 30, 11 * 60 + 30
+    pm_start, pm_end = 13 * 60, 15 * 60
+    if minutes < am_start:
+        return 0.0
+    if minutes <= am_end:
+        return float(minutes - am_start)
+    if minutes <= pm_start:
+        return 120.0
+    if minutes <= pm_end:
+        return 120.0 + float(minutes - pm_start)
+    return _FLOW_MINUTE_SCALE
+
+
+def _flow_param(key):
+    """One baked flow knob as a float; an absent/garbage key yields None (abstain).
+
+    Deliberately NO default value. Every one of these numbers has exactly one
+    home -- the Go constant, re-exported by internal/signalctl/derive_carrier_flow.go
+    and written into the parameter file by derive_carrier_params.py. Writing a
+    fallback here would be a second copy that keeps trading on the old number the
+    day someone re-tunes the real one (the "two books, both look right" defect).
+    An absent knob therefore abstains: volume leg -> neutral, quadrant -> Neutral,
+    blend -> 1.0. None of those change behaviour, and none of them invent a number.
+    """
+    value = PARAMS.get(key)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _vol_state_of(r_yest, r_ma5):
+    """surge / shrink / neutral from the two relative-volume gates.
+
+    Any unreadable or non-positive ratio -> neutral (never "unknown = surge"),
+    exactly like signalctl.VolStateOf. A missing baked knob also yields neutral:
+    without a threshold there is no defensible state, and "neutral" is the only
+    answer that neither blocks nor amplifies anything.
+    """
+    if r_yest is None or r_ma5 is None or r_yest <= 0 or r_ma5 <= 0:
+        return "neutral"
+    r_yes_surge = _flow_param("flow_r_yest_surge")
+    r_ma5_surge = _flow_param("flow_r_ma5_surge")
+    r_yes_shrink = _flow_param("flow_r_yest_shrink")
+    r_ma5_shrink = _flow_param("flow_r_ma5_shrink")
+    if None in (r_yes_surge, r_ma5_surge, r_yes_shrink, r_ma5_shrink):
+        return "neutral"
+    if r_yest > r_yes_surge and r_ma5 > r_ma5_surge:
+        return "surge"
+    if r_yest < r_yes_shrink and r_ma5 < r_ma5_shrink:
+        return "shrink"
+    return "neutral"
+
+
+def _finite_pos(value):
+    """A strictly positive finite float, or None (abstain).
+
+    NaN must not slip through a `<= 0` test: NaN compares False against every
+    bound, so a NaN amount would sail past the history check, poison both
+    ratios into NaN, and then `_vol_state_of` would report "neutral" -- i.e. a
+    missing reading would masquerade as a REAL flat-volume zero and be counted
+    into the blend at full weight. That is the "abstain = neutral" defect this
+    carrier exists to avoid, so the check is explicit.
+    """
+    number = _to_float(value, None)
+    if number is None:
+        return None
+    if not math.isfinite(number) or number <= 0.0:
+        return None
+    return number
+
+
+def _vol_ratio_state(ContextInfo, moment):
+    """Round-scoped relative-volume reading, or an honest abstain.
+
+    r_yest = prorated today / T-1 and r_ma5 = prorated today / mean(T-1..T-5)
+    (VolRatiosIntraday). Today comes from the last daily bar when that bar is
+    provably TODAY; otherwise the index tick's cumulative `amount` supplies it
+    and every bar is history. Fail-closed: pre-open, fewer than 5 history bars,
+    any non-positive amount, or an unprovable bar date -> reason is recorded and
+    every delta abstains. The cache is keyed by day+HHMM, so a 1000-name round
+    reads the index series once a minute, not once per symbol.
+    """
+    day = day_key(moment)
+    cache_key = "%s|%s" % (day, hhmm_now(moment))
+    cached = _STATE.get("vol_ratio_state")
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        return cached
+    state = {"key": cache_key, "r_yest": None, "r_ma5": None,
+             "vol_state": "neutral", "delta": None, "source": "", "reason": ""}
+    elapsed = _trading_minutes_elapsed(moment)
+    if elapsed <= 0.0:
+        state["reason"] = "vol_premarket"
+    else:
+        for code in _FLOW_INDEX_CODES:
+            payload = _index_amount_payload(ContextInfo, code, _FLOW_BARS_COUNT)
+            if not isinstance(payload, dict):
+                state["reason"] = "vol_no_bars:%s" % code
+                continue
+            bare = _bare(code)
+            amounts = _series(payload, "amount", bare)
+            if len(amounts) < 6:
+                state["reason"] = "vol_short_series:%s" % code
+                continue
+            entry = payload.get(bare, payload)
+            times = _bar_times(entry, len(amounts))
+            if times is None:
+                state["reason"] = "vol_no_timestamps:%s" % code
+                continue
+            last_day = _bar_day(times[-1])
+            if last_day is None:
+                state["reason"] = "vol_unparsed_timestamp:%s" % code
+                continue
+            if last_day == day:
+                today_raw = amounts[-1]
+                hist_raw = list(reversed(amounts[:-1]))
+                source = "%s:bar" % code
+            else:
+                tick = _tick_of(ContextInfo, code)
+                today_raw = tick.get("amount")
+                hist_raw = list(reversed(amounts))
+                source = "%s:tick" % code
+            today_amount = _finite_pos(today_raw)
+            if today_amount is None:
+                state["reason"] = "vol_no_today_amount:%s" % code
+                continue
+            if len(hist_raw) < 5:
+                state["reason"] = "vol_short_history:%s" % code
+                continue
+            hist = [_finite_pos(v) for v in hist_raw[:5]]
+            if any(v is None for v in hist):
+                state["reason"] = "vol_bad_history:%s" % code
+                continue
+            prorated = today_amount * (_FLOW_MINUTE_SCALE / elapsed)
+            r_yest = prorated / hist[0]
+            r_ma5 = prorated / (sum(hist) / 5.0)
+            state.update({"r_yest": r_yest, "r_ma5": r_ma5,
+                          "source": source, "reason": ""})
+            state["vol_state"] = _vol_state_of(r_yest, r_ma5)
+            if state["vol_state"] == "surge":
+                state["delta"] = 1.0
+            elif state["vol_state"] == "shrink":
+                state["delta"] = -1.0
+            else:
+                state["delta"] = 0.0
+            break
+    _STATE["vol_ratio_state"] = state
+    return state
+
+
+def _clamp_delta(value):
+    """Any JSON value -> a delta in [-1,1], or None (abstain)."""
+    if value is None:
+        return None
+    try:
+        delta = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(delta):
+        return None
+    if delta < -1.0:
+        return -1.0
+    if delta > 1.0:
+        return 1.0
+    return delta
+
+
+def _flow_snapshot_state(moment):
+    """Decode the baked money-flow snapshot, or abstain on any staleness.
+
+    Freshness is TWO gates, both required: the snapshot's Beijing day must equal
+    today, and its size must be younger than flow_snapshot_ttl_sec (default 45
+    min, the publisher re-bakes every 30). A missing key, a cross-day key or an
+    expired key leaves every delta None -> the blend renormalises and the hard
+    veto cannot fire. Cached by day+HHMM like the volume leg.
+    """
+    cache_key = "%s|%s" % (day_key(moment), hhmm_now(moment))
+    cached = _STATE.get("flow_snapshot_state")
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        return cached
+    state = {"key": cache_key, "market_delta": None, "sector_delta": {},
+             "market_state": None, "max_pos_pct": None, "source": "", "reason": ""}
+    snap = PARAMS.get("flow_snapshot")
+    if not isinstance(snap, dict):
+        state["reason"] = "flow_snapshot_missing"
+    elif str(snap.get("day") or "") != day_key(moment):
+        state["reason"] = "flow_snapshot_stale_day"
+    else:
+        baked_at = _to_float(snap.get("baked_at"), 0.0)
+        ttl = _to_float(PARAMS.get("flow_snapshot_ttl_sec"), 0.0) or 0.0
+        age = None
+        if baked_at > 0:
+            age = _now_ts() - baked_at
+            if age < 0:
+                # The baker lives on the decision host and the reader on the box,
+                # so a small NEGATIVE age only means the two clocks disagree by a
+                # few seconds. Treating that as "expired" would abstain all day on
+                # a skew the day check already guards against; clamp to 0 instead.
+                age = 0.0
+        if age is None:
+            state["reason"] = "flow_snapshot_no_timestamp"
+        elif ttl > 0 and age > ttl:
+            state["reason"] = "flow_snapshot_expired"
+        else:
+            state["market_delta"] = _clamp_delta(snap.get("market_delta"))
+            raw_sectors = snap.get("sector_delta")
+            sectors = {}
+            if isinstance(raw_sectors, dict):
+                for name, value in raw_sectors.items():
+                    delta = _clamp_delta(value)
+                    if delta is not None:
+                        sectors[str(name)] = delta
+            state["sector_delta"] = sectors
+            state["market_state"] = snap.get("market_state")
+            state["max_pos_pct"] = _to_float(snap.get("max_pos_pct"), None)
+            state["source"] = str(snap.get("source") or "")
+    _STATE["flow_snapshot_state"] = state
+    return state
+
+
+def _sector_delta_for(symbol, snap):
+    """Per-stock sector delta through the baked industry map (no map -> None)."""
+    table = snap.get("sector_delta") or {}
+    if not table:
+        return None
+    maps = PARAMS.get("industry_map") or {}
+    industry = maps.get(symbol)
+    if not industry:
+        industry = maps.get(_qmt_code(symbol))
+    if not industry:
+        industry = maps.get(_bare(symbol))
+    if not industry:
+        return None
+    return _clamp_delta(table.get(str(industry)))
+
+
+def _book_market_value(positions):
+    """Held market value from the counter rows (0 when nothing is readable)."""
+    total = 0.0
+    for _symbol, row in (positions or {}).items():
+        if not isinstance(row, dict):
+            continue
+        qty = _to_float(row.get("qty"), 0.0)
+        if qty <= 0.0:
+            continue
+        value = _to_float(row.get("market_value"), 0.0)
+        if value <= 0.0:
+            value = qty * _to_float(row.get("cost"), 0.0)
+        if value > 0.0:
+            total += value
+    return total
+
+
+def _quadrant_state(vol, snap, held, total):
+    """Four-quadrant decision (signalctl.DecideQuadrant) + the ONE hard gate.
+
+    owner ruling 2026-11-19/20: EVERY quadrant except "forbidden bottom-fishing"
+    lands in the amount blend, never in a hard gate. So `block` is TRUE only for
+    bear + surge + high posRel (posRel>=flow_posrel_high on the relative target
+    tier, never an absolute 70%). range / unknown state / unknown target ->
+    Neutral. The bull cases are still COMPUTED and reported (reduce / no-add)
+    so the readout shows why the blend moved, but they do not veto.
+    """
+    state = {"decision": "neutral", "reason": "neutral", "pos_rel": 0.0,
+             "vol_state": vol.get("vol_state") or "neutral", "block": False}
+    market_state = snap.get("market_state")
+    target = snap.get("max_pos_pct")
+    total_pct = None
+    if total is not None and total > 0 and held is not None:
+        total_pct = held / total
+    if total_pct is not None and target is not None and target > 0:
+        state["pos_rel"] = total_pct / target
+    else:
+        state["pos_rel"] = 0.0
+    if market_state not in ("bull", "bear"):
+        state["reason"] = "regime_not_quadrant"
+        return state
+    high = _flow_param("flow_posrel_high")
+    if high is None:
+        # No baked threshold = no defensible "high tier" answer. Neutral, and the
+        # reason names the missing knob instead of silently using 1.3.
+        state["reason"] = "flow_knob_missing"
+        return state
+    if state["pos_rel"] < high:
+        state["reason"] = "pos_not_high"
+        return state
+    vol_state = state["vol_state"]
+    if market_state == "bear" and vol_state == "surge":
+        state["decision"] = "block_buy"
+        state["reason"] = "bear_surge_high_nobottom"
+        state["block"] = True
+    elif market_state == "bull" and vol_state == "surge":
+        state["decision"] = "reduce"
+        state["reason"] = "bull_surge_high_reduce"
+    elif market_state == "bull" and vol_state == "shrink":
+        state["decision"] = "block_buy"
+        state["reason"] = "bull_shrink_high_noadd"
+    return state
+
+
+def _flow_round_prepare(ContextInfo, positions, total, moment):
+    """Compute the round-scoped flow readings ONCE (volume, snapshot, quadrant).
+
+    Called from run_round before any signal is judged; sizing_cap and the buy
+    gate read the cached result so a 1000-name round pays for one index read and
+    one snapshot decode. A missing ContextInfo (unit tests) still produces an
+    abstaining state instead of raising.
+    """
+    vol = {"vol_state": "neutral", "delta": None, "r_yest": None, "r_ma5": None,
+           "source": "", "reason": "flow_not_prepared"}
+    if ContextInfo is not None and moment is not None:
+        vol = _vol_ratio_state(ContextInfo, moment)
+    snap = _flow_snapshot_state(moment) if moment is not None else {"sector_delta": {}}
+    held = _book_market_value(positions)
+    quadrant = _quadrant_state(vol, snap, held, total)
+    _STATE["round_flow"] = {
+        "moment_key": ("%s|%s" % (day_key(moment), hhmm_now(moment))) if moment is not None else "",
+        "vol": vol, "snap": snap, "quadrant": quadrant,
+        "held": held, "total": total,
+    }
+    return _STATE["round_flow"]
+
+
+def _flow_blend_for(symbol, moment):
+    """Post-composition amount multiplier in [0.80,1.20]; 1.0 = zero change.
+
+    b = mean(available deltas among market / sector / volume), blend =
+    clamp(1 + 0.20*b, 0.80, 1.20). Missing items are DROPPED (renormalise), a
+    real zero is KEPT -- 0 means "flat volume" and skipping it would silently
+    give the remaining legs a bigger weight. All three missing -> 1.0, and
+    flow_blend_pct=0 is the operator's escape hatch (blend becomes exactly 1.0)
+    -- there is deliberately no second on/off switch that could disagree with it.
+    """
+    round_flow = _STATE.get("round_flow") or {}
+    key = ""
+    if moment is not None:
+        key = "%s|%s" % (day_key(moment), hhmm_now(moment))
+    if round_flow.get("moment_key") != key:
+        round_flow = {}
+    snap = round_flow.get("snap")
+    if not isinstance(snap, dict):
+        snap = _flow_snapshot_state(moment) if moment is not None else {"sector_delta": {}}
+    vol = round_flow.get("vol")
+    if not isinstance(vol, dict):
+        vol = {}
+    parts = []
+    market = snap.get("market_delta")
+    if market is not None:
+        parts.append(float(market))
+    sector = _sector_delta_for(symbol, snap)
+    if sector is not None:
+        parts.append(float(sector))
+    surge = vol.get("delta")
+    if surge is not None:
+        parts.append(float(surge))
+    if not parts:
+        return 1.0
+    total = sum(parts) / float(len(parts))
+    pct = _flow_param("flow_blend_pct")
+    lo = _flow_param("flow_blend_lo")
+    hi = _flow_param("flow_blend_hi")
+    if pct is None or lo is None or hi is None:
+        # No baked amplitude := no multiplier. 1.0 is the "zero behaviour change"
+        # answer, and it is NOT a fabricated reading: the blend simply does not run.
+        return 1.0
+    blend = 1.0 + pct * total
+    if blend < lo:
+        blend = lo
+    if blend > hi:
+        blend = hi
+    return blend
+
+
+def _flow_readout():
+    """One ASCII line naming both legs and the quadrant verdict (hourly).
+
+    Bounded on purpose: a per-round line would train the operator to ignore it.
+    An abstaining leg prints its reason, so "no flow today" is distinguishable
+    from "flow says neutral".
+    """
+    round_flow = _STATE.get("round_flow") or {}
+    vol = round_flow.get("vol") or {}
+    snap = round_flow.get("snap") or {}
+    quadrant = round_flow.get("quadrant") or {}
+    _log("flow vol_state=%s r_yest=%s r_ma5=%s src=%s reason=%s market_delta=%s sectors=%d "
+         "state=%s pos_rel=%.3f decision=%s qwhy=%s" % (
+             vol.get("vol_state") or "neutral",
+             "na" if vol.get("r_yest") is None else "%.4f" % float(vol.get("r_yest")),
+             "na" if vol.get("r_ma5") is None else "%.4f" % float(vol.get("r_ma5")),
+             vol.get("source") or "-", vol.get("reason") or "-",
+             "na" if snap.get("market_delta") is None else "%.4f" % float(snap.get("market_delta")),
+             len(snap.get("sector_delta") or {}),
+             snap.get("market_state") or "-",
+             float(quadrant.get("pos_rel") or 0.0),
+             quadrant.get("decision") or "neutral",
+             quadrant.get("reason") or "-"))
 
 
 def _spent_buy_amount(orders, buy_prefixes, day):
@@ -2289,6 +2792,16 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "fin_pit": pre.get("fin_pit"),
         "flow_today_pct": pre.get("flow_today_pct"),
         "flow_5d_pct": pre.get("flow_5d_pct"),
+        # SIZING-FLOW-ALIAS 2026-11-20: rules_sizing.SIZING_CTX_KEYS declares
+        # flow_ratio_today / flow_ratio_5d (the two names both Go sizing factors
+        # read), while this builder only ever wrote flow_today_pct / flow_5d_pct
+        # -- so the whole net-inflow factor leg was structurally abstaining on the
+        # box. The baked values are already PERCENT net-inflow rates over
+        # circulating market cap (pregen: MainNet / circ_mv * 100), exactly the
+        # unit the baked flow_*_scales bands expect, so this is an alias, not a
+        # conversion. Absent stays None = honest abstain (flow_factor.go:88-113).
+        "flow_ratio_today": pre.get("flow_today_pct"),
+        "flow_ratio_5d": pre.get("flow_5d_pct"),
         # C1 (2026-11-17): good_news_fade reads ctx["news_event"] as a DICT
         # {score, positive, propagation, day}; the R9 bearish gate at ~:1958 reads
         # the PRECALC news_event float directly (pre.get("news_event")), so the two
@@ -2497,6 +3010,33 @@ def sizing_cap(ctx, positions, intent="new", pending_buys=None):
         return None, "sizing_disabled", ""
     sized = _sizing_view(ctx, positions, pending_buys)
     caps = buy_size_caps(PARAMS, sized)
+    # FLOW-BLEND 2026-11-20: the four-quadrant reading lands on the AMOUNT, not
+    # on a gate (owner ruling). Multiplying per_trade here is the carrier-side
+    # equivalent of Go's ComputeSizingWithBlend wrapping the same chain: the
+    # ported rules_sizing.buy_size_caps stays byte-identical to its Go source
+    # (parity is the whole point of that file), and only this one cap is scaled.
+    # Everything else (cash / per-order / daily remaining / target room /
+    # industry / single name / cluster) still binds, so the blend can only make
+    # an order SMALLER or larger within +-20%, never bypass a hard cap.
+    # A negative blend can push the order under min_order_amount: that is NOT a
+    # bug, the floor top-up below then raises it back to the 10000 opening floor
+    # while still respecting every hard cap (a 4000-cash account still refuses).
+    if caps.get("per_trade") is not None:
+        blend = _flow_blend_for(ctx.get("symbol"), _STATE.get("round_moment"))
+        if blend != 1.0:
+            base = sized.get("total_asset")
+            if base is None:
+                base = sized.get("equity")
+            base = _to_float(base, 0.0)
+            scaled = float(caps["per_trade"]) * blend
+            # Go PerTradePctOfBlend clamps the share to [0, 0.5]; mirroring it on
+            # the AMOUNT keeps the two carriers on the same hard ceiling.
+            if base > 0.0 and scaled > base * 0.5:
+                scaled = base * 0.5
+            if scaled < 0.0:
+                scaled = 0.0
+            caps["per_trade"] = scaled
+            _STATE["flow_blend_note"] = "per_trade*%.4f" % blend
     values = [v for v in caps.values() if v is not None]
     if not values:
         return None, "sizing_amount_unavailable", ""
@@ -2843,9 +3383,13 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
                        "t_vwap_untrusted sym=%s why=%s volume=%s amount=%s last=%s" % (
                            symbol, vwap_why or "-", (tick or {}).get("volume"),
                            (tick or {}).get("amount"), px))
+        # The T layer's per-symbol context: only readings actually resolved above
+        # are copied in (None stays None -> rules_t abstains).
         c = {
             "symbol": symbol, "day": day, "hhmm": hhmm, "now_ts": now_ts,
             "trading_day": True,  # run_round already passed _trade_session_ok
+            # Raw price/VWAP/volume fields are carried verbatim so a future miss
+            # is diagnosable from the log instead of being inferred from a skip.
             "last_price": px, "position_qty": (row or {}).get("qty"),
             "vwap": vwap_value,
             "turnover_pct": turnover_pct,
@@ -3005,6 +3549,18 @@ def run_round(ContextInfo, moment):
     _probe_price_channels(ContextInfo, positions)
     cash_raw = _cash()
     total = _account_total_asset()
+    # FLOW-QUADRANT 2026-11-20 (owner ruling): compute this round's three flow
+    # readings ONCE -- relative volume from the index daily bars (in-client),
+    # the 30-minute baked money-flow snapshot, and the four-quadrant verdict.
+    # Everything downstream (the one hard veto below, the +-20% amount blend in
+    # sizing_cap) reads this cache, so a 1000-name round pays one index read and
+    # one snapshot decode, not one per symbol. A missing reading abstains; it
+    # never becomes a fabricated zero.
+    _flow_round_prepare(ContextInfo, positions, total, moment)
+    _flow_log_key = "%s_%d" % (day_key(moment), moment.hour)
+    if _STATE.get("flow_log_key") != _flow_log_key:
+        _STATE["flow_log_key"] = _flow_log_key
+        _flow_readout()
     # COUNTER-VIEW 2026-11-18 13:2x: the round stopped printing subscribe/probe
     # lines and the T leg stopped running, which can only mean `positions` read as
     # empty (or unreadable). Without a readout those two states are indistinguishable
@@ -3219,6 +3775,17 @@ def run_round(ContextInfo, moment):
                     # One buy intent per symbol per day (plan 1.3 item 1): a
                     # second live signal on the same name must not stack.
                     summary["skipped"].append({"short": short, "reason": "same_symbol_day"})
+                    continue
+                # FLOW-QUADRANT 2026-11-20: the ONLY hard veto this carrier takes
+                # from the four-quadrant reading is "do not fish the bottom"
+                # (bear market + volume surge + account already at/above its
+                # relative target tier). Every other quadrant is expressed in the
+                # amount blend, never as a gate. A range/unknown regime never
+                # blocks, and the T leg is intentionally exempt (it has its own
+                # t_allowed_by_sizing chain and must keep running in a range tape).
+                _quadrant = (_STATE.get("round_flow") or {}).get("quadrant") or {}
+                if intent in ("new", "add") and _quadrant.get("block"):
+                    summary["skipped"].append({"short": short, "reason": "flow_quadrant_block"})
                     continue
             if signal["side"] == "sell":
                 # Sell chain (tomorrow's 000520 disposal runs through here): the
