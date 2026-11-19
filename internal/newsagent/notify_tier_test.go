@@ -630,12 +630,17 @@ func TestNewsEventsStillPersisted(t *testing.T) {
 }
 
 // TestNoNewAlertRuleAdded §5A.1 前提 + §7 组⑨：通知增强**只调分级与文案**，
-// 不新增 metrics 规则——24 条（必推 15 / 日汇总 9）是四处文案等值锁盯着的数，
+// 不新增 metrics 规则——25 条（必推 16 / 日汇总 9）是四处文案等值锁盯着的数，
 // 顺手加第五条规则会把那些等值锁一起推红。
+//
+// 为什么基线从 24 抬到 25（2026-11-19 §SELL-UNDELIVERED）：那一条是 owner 早前裁定要加的
+// 资金路径规则（卖出意图未送达券商），不是通知增强顺手加的第 N 条。基线的意义是
+// "本轮改动不许悄悄增减规则数"，所以它必须跟着**上一个已裁定批次**一起抬——不抬就是红在
+// 自家计数上，抬错（无意多一条）同样会红，两种方向都拦。
 func TestNoNewAlertRuleAdded(t *testing.T) {
 	rules := metrics.DefaultAlertRules()
-	if len(rules) != 24 {
-		t.Fatalf("默认告警规则条数变了（%d ≠ 24）——通知增强不许把它变成第五条规则", len(rules))
+	if len(rules) != 25 {
+		t.Fatalf("默认告警规则条数变了（%d ≠ 25）——通知增强不许顺手增减规则（§SELL-UNDELIVERED 之后的基线）", len(rules))
 	}
 	cfg := metrics.DefaultAlertRouting()
 	if len(cfg.Routes) != len(rules) {
@@ -652,8 +657,9 @@ func TestNoNewAlertRuleAdded(t *testing.T) {
 			t.Errorf("规则 %s 的路由既不是必推也不是日汇总", r.Name)
 		}
 	}
-	if push != 15 || daily != 9 {
-		t.Fatalf("必推/日汇总条数变了：push=%d daily=%d（应为 15/9）", push, daily)
+	// 2026-11-19 §SELL-UNDELIVERED：push 15→16（那一条 p1 必推、不进静默域），daily 仍 9。
+	if push != 16 || daily != 9 {
+		t.Fatalf("必推/日汇总条数变了：push=%d daily=%d（应为 16/9）", push, daily)
 	}
 }
 
