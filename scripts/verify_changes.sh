@@ -24027,3 +24027,76 @@ grep_q 'passed' PY209B || { echo "--- FAIL: §209 旧 _go_admitted 兼容腿红�
 [ "$B209_FAILED" = "0" ] || exit 1
 echo "ok - §209 §20261118-GO-ADMIT-WIRING 锁通过（真接线+卖出豁免+switch_off降档+8例接线腿+旧兼容腿，累计判定点 ${CNT209}）"
 echo ""
+
+# ---------------------------------------------------------------------------
+# §210 §UNDEF-NAME（2026-11-19 P0）：载体产物里的「未定义全局名」。
+# 事故：CASH-PROBE 把函数形参名 `params` 当全局名裸用，每一轮撞上探针点就抛
+# NameError，handlebar 吞成 `round error swallowed` ⇒ 整轮在第一笔买入候选处中止，
+# 当天 73 次、零委托，卖出腿一并被截断（11-17/11-18 同口径均 0 次、86/95 条轮次正常）。
+# 语法完全合法、py_compile 抓不到，只有 symtable 才能看见：因此判据落在**产物**上
+# （源文件里的 rule_*/day_key 等名字由构建器注入，扫源文件会得到一堆假阳性）。
+echo "==> 210 §20261119-UNDEF-NAME（载体产物未定义全局名：裸 params 让整轮中止、当天零委托）..."
+B210_FAILED=0
+fail210() {
+	echo "--- FAIL: §210 $*"
+	FAIL=1
+	B210_FAILED=1
+}
+CNT210=0
+
+# ① 正锁：探针调用必须把真源 PARAMS 传进去。
+CNT210=$((CNT210 + 1))
+grep -qF '_probe_cash_line(short, sized_amount, why, note, ctx, PARAMS)' qmt_gateway/qmt_internal_strategy.py || fail210 "CASH-PROBE 未传 PARAMS（事故形状回潮）"
+# ② 负锁：裸 `params` 这一句不许重新出现（它不报错、只让整轮静默中止）。
+CNT210=$((CNT210 + 1))
+if grep -qF '_probe_cash_line(short, sized_amount, why, note, ctx, params)' qmt_gateway/qmt_internal_strategy.py; then
+	fail210 "裸 params 回潮（每轮 NameError ⇒ 当天零委托）"
+fi
+
+# ③ 行为腿：产物 symtable 静态锁 + 反证（2 例）。构建器在用例内部跑，产物缺失即红。
+PY210=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_undefined_names_20261119.py -q 2>&1 || true )
+CNT210=$((CNT210 + 1))
+grep_q '2 passed' PY210 || { echo "--- FAIL: §210 产物未定义全局名锁未跑满2例：$(printf '%s\n' "$PY210" | tail -8)"; B210_FAILED=1; }
+
+[ "$B210_FAILED" = "0" ] || exit 1
+echo "ok - §210 §UNDEF-NAME 锁通过（PARAMS 实参 + 裸 params 负锁 + 产物 symtable 2 例，累计判定点 ${CNT210}）"
+echo ""
+
+# ---------------------------------------------------------------------------
+# §211 §MANUAL-TAKEOVER（2026-11-19 P0）：跨日空仓兜底必须吃「被柜台接管」判据。
+# 事故：owner 11-11 10:33–10:35 连续「清仓 + 直接改资金」，manual_positions 变空表、
+# manual_account 留下 asof=2026-11-11 10:35:02。11-19 柜台（QMT 内置策略腿）恢复回报
+# 1 行持仓（002093 4900 股，09:30:43），账号级接管指针打在 09:36:27——但空仓兜底
+# 只看"有没有改账流水"，于是 PositionsUsable=true 且下发空表：屏上「没有持仓」，
+# 引擎按空仓出信号。判据形状与行级 manualAsofUsable 同一条边界：接管晚于 asof 即让位。
+echo "==> 211 §20261119-MANUAL-TAKEOVER（跨日空仓兜底吃接管判据：柜台恢复回报后不再下发空表）..."
+B211_FAILED=0
+fail211() {
+	echo "--- FAIL: §211 $*"
+	FAIL=1
+	B211_FAILED=1
+}
+CNT211=0
+
+# ① 正锁：空仓兜底必须把接管指针喂进 manualAsofUsable。
+CNT211=$((CNT211 + 1))
+grep -qF 'manualAsofUsable(asof, v.TakenOverAt, day)' internal/store/manual_book.go || fail211 "空仓兜底未吃接管判据（跨日空仓会压过当天柜台回报）"
+# ② 负锁：裸兜底（只看 asof 非空）不许回潮。
+CNT211=$((CNT211 + 1))
+if grep -qF 'ferr == nil && asof != "" {' internal/store/manual_book.go; then
+	fail211 "裸兜底回潮（忽略 taken_over_at ⇒ 屏上又变空表）"
+fi
+# ③ 单点：两个读面（引擎 resolver / 持仓页）都走 store.ManualBookViewFor，不许各处自己判。
+CNT211=$((CNT211 + 1))
+grep -qF 'view, err := st.ManualBookViewFor(uid, day)' internal/engine/manual_book_source.go || fail211 "引擎 resolver 不再走 ManualBookViewFor（选源分家）"
+CNT211=$((CNT211 + 1))
+grep -qF 'manualView, manualViewErr := db.ManualBookViewFor(uid, cntime.DayOf(cntime.Now()))' internal/server/qmt.go || fail211 "持仓页不再走 ManualBookViewFor（选源分家）"
+
+# ④ 行为腿：接管前的跨日空仓可用 → 接管后让位 → 接管后再改一笔重新可用。
+CNT211=$((CNT211 + 1))
+GT211=$( go test ./internal/store -run 'TestManualEmptyBookYieldAfterTakeover' -count=1 2>&1 || true )
+grep_q '^ok' GT211 || { echo "--- FAIL: §211 接管判据行为腿红：$(printf '%s\n' "$GT211" | tail -6)"; B211_FAILED=1; }
+
+[ "$B211_FAILED" = "0" ] || exit 1
+echo "ok - §211 §MANUAL-TAKEOVER 锁通过（接管判据 + 裸兜底负锁 + 两个读面单点 + 行为腿，累计判定点 ${CNT211}）"
+echo ""

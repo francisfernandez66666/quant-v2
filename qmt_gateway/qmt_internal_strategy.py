@@ -2924,7 +2924,14 @@ def run_round(ContextInfo, moment):
             # cap that refuses the order. Remove once the root cause is closed.
             if intent == "new" and _probe_cash_due():
                 _STATE["cash_probe_positions"] = positions
-                _probe_cash_line(short, sized_amount, why, note, ctx, params)
+                # 2026-11-19 P0 (live proof): this line used to pass the bare name
+                # `params` -- the parameter name of _probe_cash_line, never a module
+                # global. Every probe-eligible round therefore raised NameError and
+                # handlebar swallowed it as `round error swallowed`, aborting the WHOLE
+                # round at the first new-buy candidate: 73 aborts on 2026-11-19, zero
+                # orders all day, and the sell legs of the remaining symbols were cut
+                # off too. The baked strategy has exactly one parameter source: PARAMS.
+                _probe_cash_line(short, sized_amount, why, note, ctx, PARAMS)
             if sized_amount is None:
                 summary["skipped"].append({"short": short, "reason": why})
                 continue

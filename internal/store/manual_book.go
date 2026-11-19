@@ -590,8 +590,18 @@ func (d *DB) ManualBookViewFor(userID, day string) (ManualBookView, error) {
 	// English: an explicitly maintained EMPTY book is usable; otherwise closing the
 	// last position silently falls back to stale counter rows. "Maintained" is not
 	// day-scoped either: carried-over emptiness is still a fact about the book.
+	// 2026-11-19 P0（线上实证）：这条兜底也必须吃**接管**判据，否则"跨日携带的空仓"
+	// 会压过当天正在回报的柜台账。现场：owner 11-11 清仓留下空表 + set_cash 流水，
+	// 11-19 柜台（QMT 内置策略腿）已经回报 1 行持仓（当日 09:30:43），账号级接管指针也
+	// 打在 09:36——但读面/advisory 仍判 PositionsUsable=true 并下发空表，
+	// 屏幕上"没有持仓"，引擎按空仓出信号。接管时刻晚于 asof 的那本账，与行级判据
+	// （manualAsofUsable）同一条边界：被柜台接管之后不许再拿它当今天的账。
+	// English: the empty-book fallback must honour the takeover pointer too. A book that
+	// was superseded by the counter (taken_over_at > asof) may not keep claiming "explicitly
+	// maintained empty" -- that is what hid a live position on 2026-11-19.
 	if !v.PositionsUsable {
-		if asof, ferr := d.ManualLatestFlowAsof(userID, day); ferr == nil && asof != "" {
+		if asof, ferr := d.ManualLatestFlowAsof(userID, day); ferr == nil && asof != "" &&
+			manualAsofUsable(asof, v.TakenOverAt, day) {
 			v.PositionsUsable = true
 			v.PositionsAsOf = asof
 			v.PositionsCarried = manualAsofCarried(asof, day)

@@ -220,6 +220,59 @@ func TestManualEmptyBookCarriedAcrossDays(t *testing.T) {
 	}
 }
 
+// TestManualEmptyBookYieldAfterTakeover 2026-11-19 P0 事故回归：
+// 11-11 清仓留下的**跨日空仓**在柜台已经恢复回报（接管指针晚于 asof）之后必须让位。
+// 现场是 owner 账户：manual_positions 0 行 + set_cash 流水（asof 11-11），
+// 11-19 柜台回报 1 行持仓（当日 09:30:43）且账号级接管指针打在 09:36，
+// 读面仍下发空表 ⇒ 屏上"没有持仓"、引擎按空仓出信号。
+// 这条锁的是"空仓兜底也要吃接管判据"：删掉 manualAsofUsable(asof, TakenOverAt, day) 这一半，本用例必红。
+func TestManualEmptyBookYieldAfterTakeover(t *testing.T) {
+	db := manualTestDB(t)
+	uid := "u_empty_taken_over"
+	today := manualToday()
+	yesterday := manualDayOffset(-1)
+
+	// 昨日清仓：与 TestManualEmptyBookCarriedAcrossDays 同形，留下空表 + 改账流水证据。
+	if _, _, err := db.PutManualPositions(uid, []ManualPosition{{TsCode: "600000.SH", Qty: 1000}}, manualAsofOn(yesterday)); err != nil {
+		t.Fatalf("写昨日持仓: %v", err)
+	}
+	if err := db.PutManualAccount(uid, 30000, true, 0, manualAsofOn(yesterday)); err != nil {
+		t.Fatalf("写昨日资金: %v", err)
+	}
+	if _, err := db.AdjustManualBook(uid, ManualAdjustReq{
+		Op: ManualOpClose, TsCode: "600000.SH", Qty: 1000, Price: 9.5,
+		AsOf: manualAsofOn(yesterday), User: uid,
+	}, yesterday); err != nil {
+		t.Fatalf("昨日清仓改账: %v", err)
+	}
+	v, err := db.ManualBookViewFor(uid, today)
+	if err != nil {
+		t.Fatalf("ManualBookViewFor: %v", err)
+	}
+	if !v.PositionsUsable {
+		t.Fatal("接管前：昨日显式清仓的空仓今天仍应可用（跨日携带）")
+	}
+
+	// 柜台回报恢复 ⇒ 接管指针打在今天 09:36（晚于空仓的 asof）。
+	if _, err := db.MarkManualTakenOver(uid, today+" 09:36:00"); err != nil {
+		t.Fatalf("MarkManualTakenOver: %v", err)
+	}
+	v, _ = db.ManualBookViewFor(uid, today)
+	if v.PositionsUsable {
+		t.Fatalf("被柜台接管后的跨日空仓必须让位（否则屏上是空表、柜台有持仓），got usable=%v asof=%q taken_over=%q",
+			v.PositionsUsable, v.PositionsAsOf, v.TakenOverAt)
+	}
+
+	// 接管之后人又亲手改一笔（asof 晚于接管）⇒ 重新可用，判据只看时刻先后。
+	if _, _, err := db.PutManualPositions(uid, []ManualPosition{{TsCode: "600000.SH", Qty: 300}}, today+" 10:05:00"); err != nil {
+		t.Fatalf("接管后再改一笔: %v", err)
+	}
+	v, _ = db.ManualBookViewFor(uid, today)
+	if !v.PositionsUsable || len(v.Positions) != 1 || v.Positions[0].Qty != 300 {
+		t.Fatalf("接管后重新维护的行必须重新可用，got usable=%v rows=%+v", v.PositionsUsable, v.Positions)
+	}
+}
+
 // TestMarkManualTakenOverIdempotent 接管只打指针、不删行；同刻重放不长读数；更晚的接管覆盖更早的。
 func TestMarkManualTakenOverIdempotent(t *testing.T) {
 	db := manualTestDB(t)
