@@ -129,8 +129,16 @@ type Engine struct {
 	blindLogAt     time.Time        // §INDEX-BLIND 上次打 §DYN-BLIND 的时刻（60s 节流，防每轮刷屏）
 	idxTrendBroken bool             // 大盘趋势破位（日级缓存，止损两态判别用）
 	idxTrendDay    string           // idxTrendBroken 的缓存交易日
-	holidayDay     string           // 节前窗口读数缓存交易日
-	holidayProbe   data.HolidayWindowProbe
+	// §FLOW-FACTOR-DAILY 量比腿盘中缓存（方案 B 2026-11-19）：当日累计额盘中随指数日 K 更新，
+	// 故按 30s TTL 重取（对齐 indexChangePctNow），不再同日一次；资金流腿另走 store 当日行。
+	flowFactorAt     time.Time                 // 上次取数时刻（TTL 判据）
+	flowFactorVolRow *store.FlowFactorDailyRow // 当日量比腿读数（nil=取数失败/弃权）
+	flowFactorMu     sync.RWMutex              // 缓存自己的锁（不占 e.mu，装配路径只做点查）
+	// 可注入的指数量额序列源（nil→marketAPI.IndexAmountSeries）；单测注入桩数据离线跑通。
+	// today=北京今日（YYYY-MM-DD）：取数层据此把"末根非今日"的断更源判失败、继续降级。
+	indexAmountSeriesFn func(n int, today string) ([]data.IndexAmountDay, string, error)
+	holidayDay          string // 节前窗口读数缓存交易日
+	holidayProbe        data.HolidayWindowProbe
 	// regimeReadoutDay §DYN-SIZE 每日 shadow 读数去重（YYYYMMDD，每日一行）。
 	regimeReadoutDay string
 	// riskPoolReadoutDay §C6 跌停/炸板池影子读数去重（YYYYMMDD，每日一行）。
@@ -6767,6 +6775,8 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 	// 2~4. 指数 / 宏观 / 节前（各带缓存）——这三类读数与账号无关，全局缓存即可。
 	// 账号级的定权配置与账本读数由 regimeForAccount 叠加（paper 通道是逐账号的）。
 	e.fillIndexReadings(&r, now)
+	// §FLOW-FACTOR-DAILY：当日资金流/量比读数（lazy seed + 按日缓存；缺值 NaN 弃权）。
+	e.fillFlowReadings(&r, now)
 	e.fillMacroEvents(&r, now)
 	e.fillHoliday(&r, now)
 	return r
@@ -7122,6 +7132,132 @@ func (e *Engine) fillIndexReadings(r *signalctl.Regime, now time.Time) {
 		log.Printf("[engine] §BUG-INDEX 指数涨跌幅为 last-known-good（主链失败）：%.2f%%", pct)
 	}
 	r.IndexChangePct, r.IndexChangeDay = pct, day2
+}
+
+// fillFlowReadings §FLOW-FACTOR-DAILY 装配当日资金流/量比读数进 Regime（2026-11-19 方案 B）。
+//
+// 两块数据源互不覆盖（owner 裁决③"取数分两块，云端为主"）：
+//   - 量比腿：云端东财指数日 K（上证 1.000001 主、沪深300 1.000300 兜底），当日累计额
+//     按已流逝交易分钟折算全天 → 双比值 → 量态 → delta；盘中随累计量刷新，30s TTL 重取。
+//   - 资金流腿：flow_factor_daily 当日行的四列（探针/QMT/云端资金流回填的权威源），本函数只读不改。
+//   - 任一块缺值 → 对应字段 NaN 弃权（四象限/blend/硬闸 fail-open，零行为变更）。
+//
+// fail-closed：指数日 K 取数失败、最后一根非北京今日（断更）、盘前（折算会放大 240 倍）、
+// 历史不足 5 根——任一命中量比腿整体弃权，绝不拿全市场 SUM 兜底（方案 A 已作废）。
+// English: assemble today's flow/volume readings; volume leg from index daily K (30s TTL), money-flow
+// leg from the store row; NaN abstain on any failure.
+func (e *Engine) fillFlowReadings(r *signalctl.Regime, now time.Time) {
+	today := cntime.DayOf(now)
+	row := &store.FlowFactorDailyRow{TradeDate: today}
+
+	// 资金流腿：读当日行（有则取四列；读失败不动，保持 NaN 弃权）。
+	if e.d1Store != nil {
+		if stored, err := e.d1Store.GetFlowFactorDaily(today); err == nil && stored != nil {
+			row.MarketFlowPct, row.SectorFlowPct = stored.MarketFlowPct, stored.SectorFlowPct
+			row.FlowMarketDelta, row.FlowSectorDelta = stored.FlowMarketDelta, stored.FlowSectorDelta
+		}
+	}
+
+	// 量比腿：30s TTL 缓存（盘中当日累计额在变，不能同日一次）。
+	e.flowFactorMu.RLock()
+	cachedAt, cached := e.flowFactorAt, e.flowFactorVolRow
+	e.flowFactorMu.RUnlock()
+	if cached != nil && now.Sub(cachedAt) < flowFactorTTL && cached.TradeDate == today {
+		row.RYest, row.RMa5, row.VolSurgeDelta = cached.RYest, cached.RMa5, cached.VolSurgeDelta
+		applyFlowRow(r, row, today)
+		return
+	}
+
+	vol := e.seedFlowVolume(now)
+	e.flowFactorMu.Lock()
+	e.flowFactorAt, e.flowFactorVolRow = now, vol
+	e.flowFactorMu.Unlock()
+	if vol != nil {
+		row.RYest, row.RMa5, row.VolSurgeDelta = vol.RYest, vol.RMa5, vol.VolSurgeDelta
+		// 只写量比三列，不碰资金流四列（两块独立更新，互不盖 NULL）。
+		if e.d1Store != nil {
+			if uerr := e.d1Store.UpsertFlowVolumeOnly(*vol); uerr != nil {
+				log.Printf("[engine] §FLOW-FACTOR-DAILY 量比写库失败: %v", uerr)
+			}
+		}
+	}
+	// 两块都无有效读数 → 不装配，Regime 保持零值弃权（与旧实现"无源 return"一致，零行为变更）。
+	if row.RYest == nil && row.FlowMarketDelta == nil && row.FlowSectorDelta == nil {
+		return
+	}
+	applyFlowRow(r, row, today)
+}
+
+// flowFactorTTL 量比腿盘中取数缓存 TTL（对齐 indexChangePctNow 的 30s 短 TTL）。
+const flowFactorTTL = 30 * time.Second
+
+// seedFlowVolume 从云端指数日 K 算当日盘中量比（方案 B 的 seed 本体）。
+// 三源降级（东财 push2 → push2his 镜像 → 新浪指数日 K）由 IndexAmountSeries 内部完成，
+// 每源内上证主/沪深300兜底；当日根（末尾）必须日期=北京今日才折算；
+// 前面 5 根为完整历史日（必须早于今日）。任一条不满足 → nil（弃权）。
+// 单位自洽：一条序列整体来自一个源（东财 amount 元 / 新浪 volume 股），量比是同源相对值；
+// 绝不跨源混用、不碰实时腿量额。Source 标记实际来源供复盘诊断。
+func (e *Engine) seedFlowVolume(now time.Time) *store.FlowFactorDailyRow {
+	seriesFn := e.indexAmountSeriesFn
+	if seriesFn == nil && e.marketAPI != nil {
+		seriesFn = e.marketAPI.IndexAmountSeries
+	}
+	if seriesFn == nil {
+		return nil
+	}
+	today := cntime.DayOf(now)
+	series, label, err := seriesFn(6, today)
+	if err != nil || len(series) < 6 {
+		return nil // 三源两指数都取不到/不足 6 根/末根断更：弃权
+	}
+	last := series[len(series)-1]
+	if last.TradeDate != today {
+		return nil // 断更（日 K 最后一根不是今日）→ 弃权，绝不拿旧额冒充当日
+	}
+	// 历史 5 根按降序（T-1 在前）：从倒数第二根往前取 5 根。
+	hist := make([]float64, 5)
+	for i := 0; i < 5; i++ {
+		bar := series[len(series)-2-i]
+		if bar.TradeDate >= today {
+			return nil // 历史根混入当日 → 口径污染，弃权
+		}
+		hist[i] = bar.Amount
+	}
+	rYest, rMa5, ok := signalctl.VolRatiosIntraday(now, last.Amount, hist)
+	if !ok {
+		return nil
+	}
+	state := signalctl.VolStateOf(rYest, rMa5)
+	delta := signalctl.VolSurgeDeltaOf(state)
+	src := "index_"
+	if label != "" {
+		src += label + "_"
+	}
+	src += "intraday" // 如 index_em:000001.SH_intraday / index_sina:000300.SH_intraday
+	return &store.FlowFactorDailyRow{
+		TradeDate:     today,
+		RYest:         &rYest,
+		RMa5:          &rMa5,
+		VolSurgeDelta: &delta,
+		Source:        src,
+	}
+}
+
+// applyFlowRow 把一行日级读数填进 Regime；NULL→NaN（弃权口径与字段注释一致）。
+func applyFlowRow(r *signalctl.Regime, row *store.FlowFactorDailyRow, today string) {
+	r.FlowDay = today
+	r.RYest, r.RMa5 = nn2n(row.RYest), nn2n(row.RMa5)
+	r.FlowMarketDelta = nn2n(row.FlowMarketDelta)
+	r.FlowSectorDelta = nn2n(row.FlowSectorDelta)
+	r.VolSurgeDelta = nn2n(row.VolSurgeDelta)
+}
+
+// nn2n *float64→float64：nil（NULL 弃权）→ NaN；有值原样。English: NULL → NaN, else the value.
+func nn2n(p *float64) float64 {
+	if p == nil {
+		return math.NaN()
+	}
+	return *p
 }
 
 // indexChangePctNow 当日**上证指数**涨跌幅（30s 短 TTL + last-known-good）。

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/combat_agent"
 )
 
 // FlowFresh 资金流读数是否新鲜可用。flowDay 为读数日键（YYYY-MM-DD 或 YYYYMMDD），
@@ -36,4 +37,75 @@ func FreshFlowDay(flowDay string, now time.Time) string {
 		return cntime.DayOf(now)
 	}
 	return ""
+}
+
+// VolRatiosOfBars 由量能序列（**降序**，最新在前）算 owner 伪码的双比值：
+// r_yest = v[-1]/v[-2]（最新完整日 vs 前一日）、r_ma5 = v[-1]/mean(v[-6:-1])（vs 前5日均量）。
+// 不足 2 根算不出 r_yest、不足 6 根算不出 r_ma5 → ok=false 整体弃权（绝不拿不完整序列硬算）。
+// 零/负量能（停市异常）同样弃权。English: relative-volume ratios from a newest-first amount series.
+func VolRatiosOfBars(amounts []float64) (rYest, rMa5 float64, ok bool) {
+	if len(amounts) < 6 {
+		return 0, 0, false
+	}
+	last, prev := amounts[0], amounts[1]
+	if last <= 0 || prev <= 0 {
+		return 0, 0, false
+	}
+	sum := 0.0
+	for _, v := range amounts[1:6] {
+		if v <= 0 {
+			return 0, 0, false
+		}
+		sum += v
+	}
+	return last / prev, last / (sum / 5.0), true
+}
+
+// VolSurgeDeltaOf 量态 → 信号强度 delta（放量 +1 / 缩量 −1 / 平量 0），供后置 blend 消费。
+// English: maps the volume state to a [-1,1] delta for the flow blend.
+func VolSurgeDeltaOf(volState string) float64 {
+	switch volState {
+	case VolStateSurge:
+		return 1.0
+	case VolStateShrink:
+		return -1.0
+	default:
+		return 0.0
+	}
+}
+
+// VolRatiosIntraday 盘中口径的双量比（§FLOW-FACTOR-DAILY 2026-11-19 方案 B）：
+// 当日累计额 todayAmount（东财指数日 K 当根，盘中实时累计）按已流逝交易分钟折算全天等值后，
+// 与历史完整日序列 histAmounts（**降序**：T-1 在前）比出 r_yest / r_ma5。
+//
+// 折算口径与 240/elapsed 全仓同一把尺子（combat_agent.TradingMinutesElapsed），
+// 资产的量比折算与个股 IntradayVolumeRatio 逐字同源——不许再写第二份时段判定。
+// fail-closed：
+//   - 盘前/非交易时段（elapsed<=0）→ 弃权：集合竞价量折算会虚高 240 倍；
+//   - histAmounts < 5 根、或任一历史额 <=0、或 todayAmount<=0 → 弃权；
+//   - 折算后的量比绝不为负/NaN（调用方拿到 ok=false 就 NaN 弃权）。
+//
+// r_yest = 今日折算全天 / T-1；r_ma5 = 今日折算全天 / mean(T-1..T-5)。
+// English: intraday volume ratios — today's cumulative amount prorated to full-day, vs T-1 and 5-day mean.
+func VolRatiosIntraday(now time.Time, todayAmount float64, histAmounts []float64) (rYest, rMa5 float64, ok bool) {
+	if len(histAmounts) < 5 || todayAmount <= 0 {
+		return 0, 0, false
+	}
+	elapsed := combat_agent.TradingMinutesElapsed(now)
+	if elapsed <= 0 {
+		return 0, 0, false // 盘前折算会放大 240 倍，宁可弃权
+	}
+	prorated := todayAmount * (240.0 / elapsed)
+	prev := histAmounts[0]
+	if prev <= 0 {
+		return 0, 0, false
+	}
+	sum := 0.0
+	for _, v := range histAmounts[:5] {
+		if v <= 0 {
+			return 0, 0, false
+		}
+		sum += v
+	}
+	return prorated / prev, prorated / (sum / 5.0), true
 }

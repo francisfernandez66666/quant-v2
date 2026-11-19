@@ -115,3 +115,31 @@ func np(v sql.NullFloat64) *float64 {
 	f := v.Float64
 	return &f
 }
+
+// UpsertFlowVolumeOnly 只写「量比腿」三列（r_yest/r_ma5/vol_surge_delta）+ source/updated_at，
+// **不碰** market_flow_pct/sector_flow_pct/flow_market_delta/flow_sector_delta 四列。
+//
+// 为什么单独一个写口（§FLOW-FACTOR-DAILY 2026-11-19）：
+//   - 数据源分两块——量比腿走云端东财指数日 K（盘中每 30s 折算刷新），资金流腿等 QMT/云端资金流
+//     写入。两块各自更新，全字段 UpsertFlowFactorDaily 会互相把对方的值盖成 NULL。
+//   - 写入方是引擎 lazy seed（当日无行时插入，有行时只刷量比列），资金流列保持探针/资金流写入的原值。
+//
+// English: upsert only the volume-leg columns; never clobber the money-flow columns written by the other source.
+func (d *DB) UpsertFlowVolumeOnly(r FlowFactorDailyRow) error {
+	if r.TradeDate == "" {
+		return fmt.Errorf("flow_factor_daily: empty trade_date")
+	}
+	_, err := d.db.Exec(`INSERT INTO flow_factor_daily
+		(trade_date, r_yest, r_ma5, vol_surge_delta, source, updated_at)
+		VALUES (?,?,?,?,?,?)
+		ON CONFLICT(trade_date) DO UPDATE SET
+		  r_yest=excluded.r_yest, r_ma5=excluded.r_ma5,
+		  vol_surge_delta=excluded.vol_surge_delta, source=excluded.source,
+		  updated_at=excluded.updated_at`,
+		r.TradeDate, nnz(r.RYest), nnz(r.RMa5), nnz(r.VolSurgeDelta), r.Source,
+		time.Now().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return fmt.Errorf("flow_factor_daily volume-only upsert: %w", err)
+	}
+	return nil
+}

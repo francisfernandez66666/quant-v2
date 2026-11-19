@@ -94,11 +94,52 @@ func ApplyFlowBlend(res *SizingResult, sig combat_agent.Signal) {
 // （sizing.go:74-77、sizing_test.go:464），且统计类调用（engine.go:7289 / funds_today.go:103）
 // 不需要 blend。只有真正下单的 applySizing 改调本入口，影响面收敛到一条链。
 func ComputeSizingWithBlend(r Regime, sig combat_agent.Signal) SizingResult {
+	sig = withRegimeFlowDeltas(r, sig)
 	res := ComputeSizing(r, sig)
 	if !res.Downgrade {
 		ApplyFlowBlend(&res, sig)
 	}
 	return res
+}
+
+// withRegimeFlowDeltas 把 Regime 上的三项 delta 桥接进信号 Meta（拷贝，不污染原 sig）。
+// Regime 是全局日级读数的权威源（fillFlowReadings 装配），sig.Meta 是逐票拷贝面；
+// Meta 已有的键不覆盖（逐票信号显式给了值就以信号为准）。
+// 口径：NaN=弃权（无数据/探针未回），0=有效平量——平量必须计入合成（权重 1/3 贡献 0），
+// 当弃权跳过会让其余项 renormalize 后权重变大，量能维度就被静默放大了。
+func withRegimeFlowDeltas(r Regime, sig combat_agent.Signal) combat_agent.Signal {
+	pairs := []struct {
+		key string
+		v   float64
+	}{
+		{MetaFlowMarketDelta, r.FlowMarketDelta},
+		{MetaFlowSectorDelta, r.FlowSectorDelta},
+		{MetaVolSurgeDelta, r.VolSurgeDelta},
+	}
+	need := false
+	for _, p := range pairs {
+		if !math.IsNaN(p.v) {
+			if _, ok := sig.Meta[p.key]; !ok {
+				need = true
+			}
+		}
+	}
+	if !need {
+		return sig
+	}
+	m := make(map[string]float64, len(sig.Meta)+3)
+	for k, v := range sig.Meta {
+		m[k] = v
+	}
+	for _, p := range pairs {
+		if !math.IsNaN(p.v) {
+			if _, ok := m[p.key]; !ok {
+				m[p.key] = p.v
+			}
+		}
+	}
+	sig.Meta = m
+	return sig
 }
 
 // PerTradePctOfBlend 带后置 blend 的单笔占比：先按原口径算 eff，再乘 blend，

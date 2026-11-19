@@ -458,3 +458,168 @@ func (f *Fetcher) HubIndexQuote(code string) (*IndexLiveQuote, bool) {
 		Source:    IndexSourceBroker,
 	}, true
 }
+
+// IndexAmountDay 指数日 K 的一个"量能"读数（§FLOW-FACTOR-DAILY 量比腿专用）。
+//
+// 单位口径（改动前必读）：量比是**同源相对值**（今日/历史），分子分母必须来自同一源同一字段，
+// 绝不跨源混用。两个来源各用各的字段：
+//   - 东财日 K：Amount = 成交额（元，CSV 第 7 列原值，确定可核）；
+//   - 新浪指数日 K：Amount 字段为空，改用 Volume = 成交量（股）——新浪指数接口不返回 amount
+//     （2026-11-19 实测），量比用成交量同样成立（同源相对比，量纲自洽）。
+//   - 两源**不混用**：一条序列整体来自一个源；切换源时整条替换。
+//   - 绝不取实时腿的 f47/f48/hq.sinajs 量额（单位不可信，§INDEX-BLIND）。
+type IndexAmountDay struct {
+	TradeDate string  // 交易日 YYYY-MM-DD（按 cst 解析）
+	Amount    float64 // 量能标量：东财=成交额（元）；新浪=成交量（股），见 Source 区分
+}
+
+// IndexAmountSeries 取大盘指数量能序列（最近 n 根日 K），三源降级 + 每源上证主/沪深300 兜底。
+//
+// 降级顺序（改动前必读）：
+//  1. 东财 push2 主站（klineBySecID，amount 元）——已内建 push2delay 主机降级但 kline 路径被
+//     emFailoverPaths 显式排除（镜像对 kline 返 rc:102），故此处单独加 push2his 做"东财镜像"腿；
+//  2. 东财 push2his 镜像（同 secid / amount 元），取数格式与主站完全一致；
+//  3. 新浪指数日 K（indexMarketPrefix 白名单拼 sh000001/sh000300，用 volume 股）。
+//
+// 每个源内部：上证为主、取数失败或有效日不足 n 根则退沪深300；一个源两指数都不成就换下一个源。
+// **断更即换源**：today（北京今日 YYYY-MM-DD）非空时，末根日期必须等于 today 才算该源成功；
+// 返回旧数据的源（东财假活/断更）视为失败并继续降级到下一源——这是"东财失效靠新浪替补"的关键，
+// 否则旧序列会被当成功返回、上层只能整条弃权而拿不到新浪的当日根。today 为空则跳过此校验。
+// 三源全失败 → 返回 error，调用方 NaN 弃权（零行为变更）。
+// 返回**按日期升序**（最旧在前、最新在后），调用方用末尾一根当当日、前面当历史基准。
+//
+// English: index daily energy series with 3-source failover; a source whose last bar is stale is
+// treated as failed so the next source gets a chance (fake-live stale feed must not block failover).
+func (m *MarketAPI) IndexAmountSeries(n int, today string) ([]IndexAmountDay, string, error) {
+	if n <= 0 {
+		n = 6
+	}
+	want := n + 2 // 多取几根兜底（日 K 偶有缺行），最后再截 n 根
+	codes := []struct {
+		label string // 返回给调用方/日志的源标签
+		code  string // 裸指数码（各源自行拼 secid / 前缀）
+	}{
+		{"000001.SH", "000001"}, // 上证综指
+		{"000300.SH", "000300"}, // 沪深300
+	}
+	var lastErr error
+	// 按源降级：每个源内部再按 上证→沪深300 降级。
+	sources := []struct {
+		name  string
+		fetch func(code string, count int) ([]IndexAmountDay, error)
+	}{
+		{"em", func(code string, count int) ([]IndexAmountDay, error) {
+			return m.emIndexAmount(code, count, emPrimaryPush2Host)
+		}},
+		{"em_mirror", func(code string, count int) ([]IndexAmountDay, error) {
+			return m.emIndexAmount(code, count, "push2his.eastmoney.com")
+		}},
+		{"sina", m.sinaIndexAmount},
+	}
+	for _, src := range sources {
+		for _, c := range codes {
+			out, err := src.fetch(c.code, want)
+			if err != nil || len(out) < n {
+				lastErr = fmt.Errorf("index %s/%s series: %v (valid=%d<%d)", src.name, c.label, err, len(out), n)
+				continue
+			}
+			if len(out) > n {
+				out = out[len(out)-n:]
+			}
+			// 断更即换源：末根必须是今日的当日累计根，否则该源"假活"，继续降级。
+			if today != "" && out[len(out)-1].TradeDate != today {
+				lastErr = fmt.Errorf("index %s/%s series stale: last=%s want=%s", src.name, c.label, out[len(out)-1].TradeDate, today)
+				continue
+			}
+			label := src.name + ":" + c.label
+			return out, label, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("index amount series: no candidate")
+	}
+	return nil, "", lastErr
+}
+
+// emIndexAmount 从东财 kline 取指数日 K 的 amount（元）。host 可为 push2 主站或 push2his 镜像。
+// secid 用 indexSecID（上证→1.000001、沪深300→1.000300），绝不裸用 000001（那是平安银行）。
+func (m *MarketAPI) emIndexAmount(code string, count int, host string) ([]IndexAmountDay, error) {
+	sid := indexSecID(code)
+	url := fmt.Sprintf("https://%s/api/qt/stock/kline/get?secid=%s&klt=101&lmt=%d&fqt=%s", host, sid, count, klineFQT)
+	EastMoneyLimiter.Wait()
+	var resp *http.Response
+	var err error
+	if strings.Contains(host, "push2his") {
+		// push2his 走 doWithHeaders（它不在 emFailoverURLs 白名单，避免再被换回主站）。
+		resp, err = m.doWithHeaders(url, emReferer)
+	} else {
+		resp, err = m.getWithHeaders(url, emReferer)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("em index kline http: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("em index kline read: %v", err)
+	}
+	var raw struct {
+		Data struct {
+			KLines []string `json:"klines"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("em index kline json: %v", err)
+	}
+	klines, err := parseEastMoneyKLine(raw.Data.KLines)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IndexAmountDay, 0, len(klines))
+	for _, k := range klines {
+		if k.Amount > 0 {
+			out = append(out, IndexAmountDay{TradeDate: k.Date.Format("2006-01-02"), Amount: k.Amount})
+		}
+	}
+	return out, nil
+}
+
+// sinaIndexAmount 从新浪指数日 K 取量能序列（用 volume 股，指数接口不返 amount）。
+// 代码经 indexMarketPrefix 白名单拼 sh000001/sh000300——**不复用 GetSinaKLine**
+// （后者个股前缀函数会把 000001 拼成 sz000001=平安银行，§INDEX-BLIND 铁律）。
+func (m *MarketAPI) sinaIndexAmount(code string, count int) ([]IndexAmountDay, error) {
+	pfx, ok := indexMarketPrefix(code)
+	if !ok {
+		return nil, fmt.Errorf("sina index: code %q not in index whitelist", code)
+	}
+	symbol := pfx + stripSuffix(code) // sh000001 / sh000300
+	url := fmt.Sprintf("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=%s&scale=240&datalen=%d", symbol, count)
+	SinaLimiter.Wait()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sina index kline request: %v", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
+	req.Header.Set("Referer", "https://finance.sina.com.cn")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sina index kline http: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("sina index kline read: %v", err)
+	}
+	klines, err := parseSinaKLine(body)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IndexAmountDay, 0, len(klines))
+	for _, k := range klines {
+		// 指数日 K 新浪只给 volume（股），amount=0；用 volume 作量能标量。
+		if k.Volume > 0 {
+			out = append(out, IndexAmountDay{TradeDate: k.Date.Format("2006-01-02"), Amount: k.Volume})
+		}
+	}
+	return out, nil
+}

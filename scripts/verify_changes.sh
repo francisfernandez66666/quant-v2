@@ -25037,3 +25037,81 @@ grep_q '^ok' G223 || { echo "--- FAIL: §223 行为腿未过：$(printf '%s\n' "
 [ "$B223_FAILED" = "0" ] || exit 1
 echo "ok - §223 §FLOW-FRESHNESS 锁通过（北京日判新鲜+禁秒窗负锁+Regime字段+按日表UPSERT+行为腿，累计判定点 ${CNT223}）"
 echo ""
+
+echo "==> 226 §FLOW-VOLUME-B（量比腿方案 B：上证/沪深300 指数日 K 盘中折算，取代全市场 SUM）..."
+B226_FAILED=0
+fail226() {
+	echo "--- FAIL: §226 $*"
+	FAIL=1
+	B226_FAILED=1
+}
+CNT226=0
+IA226=internal/data/market_index.go
+FF226=internal/signalctl/flow_freshness.go
+FFDF226=internal/store/flow_factor_daily.go
+EN226=internal/engine/engine.go
+
+# ① data 层：三源降级（东财 push2 → push2his 镜像 → 新浪指数日 K），每源上证主/沪深300 兜底。
+CNT226=$((CNT226 + 1))
+grep -qF 'func (m *MarketAPI) IndexAmountSeries(n int, today string) ([]IndexAmountDay, string, error) {' "$IA226" || fail226 "缺指数量能序列函数"
+grep -qF '{"000001.SH", "000001"}' "$IA226" || fail226 "上证 000001 不是主码"
+grep -qF '{"000300.SH", "000300"}' "$IA226" || fail226 "沪深300 000300 不是兜底码"
+grep -qF '{"em", func(code string, count int)' "$IA226" || fail226 "缺东财主源降级腿"
+grep -qF '{"em_mirror", func(code string, count int)' "$IA226" || fail226 "缺东财 push2his 镜像腿"
+grep -qF 'push2his.eastmoney.com' "$IA226" || fail226 "镜像主机不是 push2his（push2delay 对 kline 返 rc:102）"
+grep -qF '{"sina", m.sinaIndexAmount}' "$IA226" || fail226 "缺新浪指数日 K 兜底腿"
+grep -qF 'func (m *MarketAPI) sinaIndexAmount(' "$IA226" || fail226 "缺新浪指数日 K 取数函数"
+grep -qF 'indexMarketPrefix(code)' "$IA226" || fail226 "新浪指数码未走白名单（000001 会拼成平安银行）"
+grep -qF 'k.Volume > 0' "$IA226" || fail226 "新浪指数日 K 应用 volume（股）做量能标量（无 amount 字段）"
+
+# ①a 断更即换源：末根必须=今日，否则判假活继续降级（东财假活断更时不挡新浪兜底）。
+CNT226=$((CNT226 + 1))
+grep -qF 'IndexAmountSeries(n int, today string)' "$IA226" || fail226 "取数层未接 today（断更无法判假活）"
+grep -qF 'out[len(out)-1].TradeDate != today' "$IA226" || fail226 "断更源未判失败（会挡住下游降级）"
+SERIESBLOCK=$( sed -n '/func (m \*MarketAPI) IndexAmountSeries/,/func (m \*MarketAPI) emIndexAmount/p' "$IA226" )
+printf '%s\n' "$SERIESBLOCK" | grep -qF 'continue' || fail226 "断更源未 continue 到下一候选"
+
+# ①b 负锁：绝不取实时腿量额 f47/f48/hq.sinajs（单位不可信，§INDEX-BLIND）。
+CNT226=$((CNT226 + 1))
+IABLOCK=$( sed -n '/func (m \*MarketAPI) IndexAmountSeries/,/func (m \*MarketAPI) emIndexAmount/p' "$IA226" )
+if printf '%s\n' "$IABLOCK" | grep -qE 'f47|f48|hq\.sinajs'; then fail226 "指数量比腿不得取实时腿量额（单位不可信）"; fi
+SINABLOCK=$( sed -n '/func (m \*MarketAPI) sinaIndexAmount/,/^}/p' "$IA226" )
+if printf '%s\n' "$SINABLOCK" | grep -qF 'hq.sinajs'; then fail226 "新浪兜底只走日 K，不碰实时腿量额"; fi
+if printf '%s\n' "$SINABLOCK" | grep -qF 'GetSinaKLine'; then fail226 "不得复用 GetSinaKLine（个股前缀会把 000001 拼成平安银行）"; fi
+
+# ② signalctl：盘中折算复用同一把尺子；盘前/历史不足 fail-closed。
+CNT226=$((CNT226 + 1))
+grep -qF 'func VolRatiosIntraday(now time.Time, todayAmount float64, histAmounts []float64)' "$FF226" || fail226 "缺盘中折算双比值函数"
+grep -qF 'combat_agent.TradingMinutesElapsed(now)' "$FF226" || fail226 "折算未复用全局 elapsed 尺子（不许写第二份时段判定）"
+grep -qF 'if elapsed <= 0 {' "$FF226" || fail226 "盘前未弃权（折算会放大 240 倍）"
+grep -qF 'if len(histAmounts) < 5' "$FF226" || fail226 "历史不足 5 根未弃权"
+
+# ③ store：只写量比三列，绝不碰资金流四列（两块独立更新）。
+CNT226=$((CNT226 + 1))
+grep -qF 'func (d *DB) UpsertFlowVolumeOnly(r FlowFactorDailyRow) error {' "$FFDF226" || fail226 "缺只写量比列的 UPSERT"
+VOLBLOCK=$( sed -n '/func (d \*DB) UpsertFlowVolumeOnly/,/^}/p' "$FFDF226" )
+if printf '%s\n' "$VOLBLOCK" | grep -qE 'market_flow_pct=excluded|flow_market_delta=excluded|flow_sector_delta=excluded'; then
+	fail226 "量比写口不得更新资金流列（会盖掉另一块数据源的值）"
+fi
+
+# ④ engine：末根日期=今日（断更弃权）、30s TTL、可注入取数缝、无源 fail-open。
+CNT226=$((CNT226 + 1))
+grep -qF 'if last.TradeDate != today {' "$EN226" || fail226 "未校验日 K 末根=北京今日（断更会拿旧额冒充当日）"
+grep -qF 'flowFactorTTL = 30 * time.Second' "$EN226" || fail226 "量比取数无 30s TTL（当日累计量盘中在变）"
+grep -qF 'indexAmountSeriesFn func(n int, today string) ([]data.IndexAmountDay, string, error)' "$EN226" || fail226 "缺可注入取数缝"
+grep -qF 'if row.RYest == nil && row.FlowMarketDelta == nil' "$EN226" || fail226 "两块无读数未 fail-open（应保持零值）"
+
+# ⑤ 负锁：方案 A（全市场 SUM 聚合）已作废，绝不许回退。
+CNT226=$((CNT226 + 1))
+if grep -qE 'func \(d \*DB\) MarketAmountSeries|daily_sum_seed|SUM\(amount\) FROM daily' "$FFDF226" "$EN226"; then
+	fail226 "方案 A（全市场 SUM 聚合）残留——已作废，必须走指数日 K"
+fi
+
+# ⑥ 行为腿：量比纯函数 + 装配接线 + store 写口。
+CNT226=$((CNT226 + 1))
+G226=$( go test ./internal/data ./internal/signalctl ./internal/engine ./internal/store -count=1 -run 'TestIndexAmountSeries|TestIndexAmountSeriesStaleSourceFailover|TestVolRatiosIntraday|TestFillFlowReadings|TestFlowFactorDaily' 2>&1 || true )
+grep_q '^ok' G226 || { echo "--- FAIL: §226 行为腿未过：$(printf '%s\n' "$G226" | tail -10)"; B226_FAILED=1; }
+
+[ "$B226_FAILED" = "0" ] || exit 1
+echo "ok - §226 §FLOW-VOLUME-B 锁通过（三源降级东财主/push2his镜像/新浪+断更即换源+每源上证主沪深300兜底+盘中折算 fail-closed+实时腿负锁+两块写口隔离+断更弃权+方案A负锁+行为腿，累计判定点 ${CNT226}）"
+echo ""
