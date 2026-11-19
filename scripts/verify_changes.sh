@@ -6489,7 +6489,7 @@ leg106 'engine 买入两闸（低价默认拦/负数关闭/压线阈值/碎单�
 #   len(DefaultAlertRules()) 派生，加一条规则不需要改测试），所以这里只做**说明同步**；
 #   真正的锁面是 §114 里那枚「说明里的条数必须等于源码派生条数」的等值锁——下次再加规则却忘了
 #   同步文案时，红的是这枚锁而不是读者的眼睛。
-leg106 'metrics 路由覆盖全规则（24 条：必推 15 / 日汇总 9）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
+leg106 'metrics 路由覆盖全规则（25 条：必推 16 / 日汇总 9）' ./internal/metrics/ 'TestRoutingCoversAllDefaultRules'
 leg106 'engine 零信号心跳（判据/成对反证/非实盘不落笔/接线）' ./internal/engine/ \
 	'TestSignalHeartbeatAgePredicate|TestFeedSignalHeartbeatZeroAndPinnedPair|TestFeedSignalHeartbeatNonLiveDoesNotWrite|TestSignalHeartbeatRuleRegisteredAndKeyAligned|TestRefreshStalenessFeedsSignalHeartbeat'
 leg106 'trading 已实现盈亏心跳（配对/孤儿卖出/非实盘不落笔/键名对齐）' ./internal/trading/ \
@@ -20200,11 +20200,11 @@ grep -qF '"friend_leg_unavailable": RoutePush' "$AR170" || fail170 "该规则没
 N170RULES=$(grep -cE '^\s+\{Name: "' "$AL170" || true)
 N170PUSH=$(grep -cE '[a-z_]+": *RoutePush' "$AR170" || true)
 N170DAILY=$(grep -cE '[a-z_]+": *RouteDaily' "$AR170" || true)
-[ "${N170RULES:-0}" -eq 24 ] || fail170 "规则实数 ${N170RULES}≠24"
+[ "${N170RULES:-0}" -eq 25 ] || fail170 "规则实数 ${N170RULES}≠25（§SELL-UNDELIVERED 起第 25 条；少一条说明规则被删或计数没同步）"
 [ $((N170PUSH + N170DAILY)) -eq "$N170RULES" ] || fail170 "分桶不闭合：必推 ${N170PUSH} + 日汇总 ${N170DAILY} ≠ 规则 ${N170RULES}"
 CNT170=$((CNT170 + 1))
 for f in "$AR170" "$MJ170"; do
-	grep -qE "现 24 条|24 条：必推 15|必推 15 条" "$f" || fail170 "${f} 的告警条数文案没同步到 24/15（这段文案被等值锁盯着，漂开就红在自家计数上）"
+	grep -qE "现 25 条|25 条：必推 16|必推 16 条|25 条规则全覆盖" "$f" || fail170 "${f} 的告警条数文案没同步到 25/16（这段文案被等值锁盯着，漂开就红在自家计数上）"
 done
 
 # ⑦ 用例在册（四份新测试 + 关键用例名）
@@ -24476,4 +24476,88 @@ grep_q '^ok' G214 || { echo "--- FAIL: §214 锚点簿 Go 行为腿未过：$(pr
 
 [ "$B214_FAILED" = "0" ] || exit 1
 echo "ok - §214 §BUDGET-RELEASE 锁通过（600s 两键 + cancel_watch 读数 + 释放三账/一次性/侧别 + spent 口径 + base 合并四锁 + 锚点 T+1 七锁 + 两套行为腿，累计判定点 ${CNT214}）"
+echo ""
+
+# ---------------------------------------------------------------------------
+# §215 §SELL-UNDELIVERED（2026-11-19，第 25 条告警：卖出意图未送达券商）：
+#   事实来源是 2026-11-17 的现场账：云端引擎自己发过 6 笔卖出（live.db.orders
+#   status=`发送失败`，08:30/09:10/09:30/09:35），而 `alert_router_state.json` 显示
+#   `order_fail_rate` 08:35 响过一次后被折进日汇总——因为 scoring_loop 在
+#   `externalBrain >= ChannelDown` 时把 order_fail_rate/uplink_stale 放进静默域。
+#   **通道断的那天，恰好是"卖不出去"最该叫人的那天。**
+#   本段钉四件事：规则五元组（gt 0 / For 0s / p1）、路由必推且永不被静默、量规真源
+#   只数「当日 + 本账号 + 卖出 + 发送失败」、以及读数腿不进任何资本动作。
+echo "==> 215 §SELL-UNDELIVERED（卖出未送达：必推且不随通道静默）..."
+B215_FAILED=0
+fail215() {
+	echo "--- FAIL: §215 $*"
+	FAIL=1
+	B215_FAILED=1
+}
+CNT215=0
+AL215=internal/metrics/alerter.go
+AR215=internal/metrics/alert_routing.go
+
+# ① 规则五元组逐字对（阈值放高或给宽限＝把裸敞口再开几分钟）。
+CNT215=$((CNT215 + 1))
+grep -qF '{Name: "sell_undelivered", Metric: "sell_undelivered_today", Op: "gt", Threshold: 0, For: "0s", Level: "p1"' "$AL215" \
+	|| fail215 "缺 sell_undelivered 规则或五元组被改（gt 0 / For 0s / p1 是「已落库的事实」口径）"
+# ② 路由显式必推（漏条目会掉进 DefaultRoute，改默认路由时被悄悄挪道）。
+CNT215=$((CNT215 + 1))
+grep -qF '"sell_undelivered":' "$AR215" || fail215 "路由表没有显式列出 sell_undelivered"
+grep -qE '^\s*"sell_undelivered":\s*RoutePush,' "$AR215" || fail215 "sell_undelivered 不是 RoutePush（通道断那天就没人被叫醒）"
+# ③ 负锁：静默域白名单里**不许**出现它（这条规则唯一的存在理由）。
+CNT215=$((CNT215 + 1))
+if grep -qE 'QuietAlertRules\(\[\]string\{[^}]*"sell_undelivered"' internal/engine/scoring_loop.go; then
+	fail215 "sell_undelivered 被放进了静默域（通道断那天它被静音＝裸敞口无人知）"
+fi
+# ④ 量规真源：当日 + 本账号 + 卖出 + 发送失败，四个维度一个都不许丢。
+CNT215=$((CNT215 + 1))
+grep -qF "side='卖出' AND status='发送失败'" internal/store/sell_undelivered.go \
+	|| fail215 "计数判据丢了方向/状态（多数一行是假警，少数一行是敞口无人知）"
+grep -qF 'WHERE user_id=? AND side=' internal/store/sell_undelivered.go \
+	|| fail215 "计数判据丢了 user_id（成员引擎会数到运营的失败单）"
+grep -qF 'substr(created_at,1,10)=?' internal/store/sell_undelivered.go \
+	|| fail215 "计数判据丢了当日界（昨天/前天的失败单会算进今天）"
+# ⑤ 日期归一必须拒绝非法格式（长度 8 不等于紧凑格式：`2026-1-9` 也是 8 字符）。
+CNT215=$((CNT215 + 1))
+grep -qF 'func normalizeOrderDayPrefix(day string) (string, error)' internal/store/sell_undelivered.go \
+	|| fail215 "日期归一助手缺失（YYYYMMDD / YYYY-MM-DD 两种调用方会一边查不到）"
+grep -qF 'allDigits(day)' internal/store/sell_undelivered.go \
+	|| fail215 "8 位日期未做全数字校验（`2026-1-9` 会拼出永假前缀 ⇒ 规则永远安静）"
+# ⑥ 读数腿：节拍跟随 signal_zero_session_sec（每轮打分顶部），且只读、不进资本动作。
+CNT215=$((CNT215 + 1))
+grep -qF 'e.feedSellUndeliveredGauge(now)' internal/engine/heartbeat.go \
+	|| fail215 "心跳没接 sell_undelivered 量规（规则永不触发）"
+grep -qF 'metrics.SetGauge("sell_undelivered_today", int64(n))' internal/engine/heartbeat.go \
+	|| fail215 "量规键名与规则 Metric 不同源（死规则）"
+if grep -nE 'PlaceOrder|CancelOrder|setTripped|Degrade' internal/engine/heartbeat.go | grep -qi 'sell_undelivered'; then
+	fail215 "读数腿越界（只报不断：不许碰下单/撤单/熔断/降级账）"
+fi
+# ⑦ 三处文案与实数派生等值（规则条数 25 / 必推 16 / 日汇总 9）。
+CNT215=$((CNT215 + 1))
+N215RULES=$(grep -cE '^\s+\{Name: "' "$AL215" || true)
+[ "${N215RULES:-0}" -eq 25 ] || fail215 "规则实数 ${N215RULES}≠25（加规则忘改计数＝红在自家账上）"
+N215PUSH=$(grep -cE '[a-z_]+": *RoutePush' "$AR215" || true)
+N215DAILY=$(grep -cE '[a-z_]+": *RouteDaily' "$AR215" || true)
+[ "${N215PUSH:-0}" -eq 16 ] || fail215 "必推实数 ${N215PUSH}≠16"
+[ $((N215PUSH + N215DAILY)) -eq "${N215RULES:-0}" ] || fail215 "分桶不闭合：${N215PUSH}+${N215DAILY}≠${N215RULES}"
+# ⑧ 用例在册（账本层四个维度 + 规则层五元组/路由/行为腿）。
+CNT215=$((CNT215 + 1))
+for f in internal/store/sell_undelivered_test.go internal/metrics/sell_undelivered_alert_test.go; do
+	[ -f "$f" ] || fail215 "缺回归用例 $f"
+done
+grep -qF 'TestRoutingCoversAllDefaultRules' internal/metrics/*_test.go \
+	|| fail215 "路由覆盖用例被删（那条等值锁是「加了规则忘了路由」的唯一守门人）"
+
+# ⑨ 行为腿（真跑：四个维度 + 日期两写法 + 非法日期 + 首轮即 fire / 成对销案）。
+CNT215=$((CNT215 + 1))
+G215=$( go test ./internal/store -count=1 -run 'TestCountSellUndelivered' 2>&1 || true )
+grep_q '^ok' G215 || { echo "--- FAIL: §215 账本层行为腿未过：$(printf '%s\n' "$G215" | tail -8)"; B215_FAILED=1; }
+CNT215=$((CNT215 + 1))
+M215=$( go test ./internal/metrics -count=1 -run 'TestSellUndelivered|TestRoutingCoversAllDefaultRules' 2>&1 || true )
+grep_q '^ok' M215 || { echo "--- FAIL: §215 规则层行为腿未过：$(printf '%s\n' "$M215" | tail -8)"; B215_FAILED=1; }
+
+[ "$B215_FAILED" = "0" ] || exit 1
+echo "ok - §215 §SELL-UNDELIVERED 锁通过（五元组 gt0/0s/p1 + 显式必推 + 静默域负锁 + 计数四维 + 日期归一 + 心跳接线 + 三处计数等值 + 用例在册 + 两套行为腿，累计判定点 ${CNT215}）"
 echo ""

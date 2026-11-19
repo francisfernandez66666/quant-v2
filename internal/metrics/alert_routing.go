@@ -126,15 +126,16 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 24 条：
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 25 条：
 // §0925EVE-A2 加入 halt_cancel_failed、§0925EVE-C1 加入实盘战法库闸两条、§0929HB-1/-2/-3
 // 加入三条"应有值缺失"型业务心跳、§0929HB-4 加入休市日增量型心跳＝第 19 条、
 // §P2-E（波 5）加入 settlement_not_verified＝第 20 条；§SUBSCRIPTION-A 改判 16 加入
 // broker_feed_unavailable＝第 21 条（券商行情出厂开之后的通畅自证腿，必推）；
 // §INDEX-BLIND（2026-11-02 owner 裁决 3）加入 market_data_blind（第 22 条，必推）与
 // market_data_stale（第 23 条，日汇总）＝关键读数盲区两档；
-// §FRIEND-LEG（2026-11-02）加入 friend_leg_unavailable＝第 24 条（远端执行腿可达性，必推）
-// ＝必推 15 条 / 日汇总 9 条，
+// §FRIEND-LEG（2026-11-02）加入 friend_leg_unavailable＝第 24 条（远端执行腿可达性，必推）；
+// §SELL-UNDELIVERED（2026-11-19）加入 sell_undelivered＝第 25 条（卖出意图未送达券商，必推、不进静默域）
+// ＝必推 16 条 / 日汇总 9 条，
 // 门禁 §106/§114 的文案与 RUNBOOK 的「业务心跳」条与 §3.7 运维卡同批同步——这段文案本身就被等值锁盯着），
 // alert_routing_test 有等值锁（路由条数 == 规则条数），漏一条即判红）。
 // English: factory routing table covering all DefaultAlertRules() entries.
@@ -155,8 +156,13 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			// 缺这条条目会掉进 DefaultRoute=RoutePush（凑巧同值），但路由表必须显式列出它——
 			// alert_routing_test 的等值锁盯"路由条数 == 规则条数"，门禁 §106 盯文案名。
 			"friend_leg_unavailable": RoutePush,
-			"uplink_stale":           RoutePush, // 网关→引擎上行回报停摆（§UPDLINK）
-			"sse_broadcast_skipped":  RoutePush, // SSE 广播锁超预算丢推送（§UPDLINK 同族）
+			// §SELL-UNDELIVERED（2026-11-19，第 25 条）：今日有卖出意图未送达券商 ⇒ 必推。
+			// 与 order_fail_rate 的区别写死在规则注释里：那条会被"外脑通道不可用"折进静默域，
+			// 而"止损没送到"恰恰和通道断同一天发生。路由显式列出它（同 friend_leg 的理由），
+			// 且 QuietAlertRules 的白名单里**不许**出现这个名字（§SELL-UNDELIVERED 有负锁）。
+			"sell_undelivered":      RoutePush,
+			"uplink_stale":          RoutePush, // 网关→引擎上行回报停摆（§UPDLINK）
+			"sse_broadcast_skipped": RoutePush, // SSE 广播锁超预算丢推送（§UPDLINK 同族）
 			// §0929HB-1/-2（2026-09-29 全量审计批 ⑪-4）：两条"缺失型"心跳都属"今天就要处理"——
 			// 零固化信号意味着当天决策面空转（收盘再知道已经晚了），已实现盈亏恒 0 意味着
 			// 亏损熔断闸当天放水。持续破线由评估器 Firing 态去重 + 30 分钟冷却窗挡刷屏，

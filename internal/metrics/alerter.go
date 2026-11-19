@@ -159,6 +159,18 @@ func DefaultAlertRules() []AlertRule {
 		// For=300s：那台机器重启客户端/瞬时断 overlay 都在一两分钟内自愈，与 broker_feed_unavailable
 		// 同口径给恢复窗。本条**只是读数**：不许在这里动下单判定、熔断语义或 /health.ok（owner 边界）。
 		{Name: "friend_leg_unavailable", Metric: "friend_leg_state", Op: "ge", Threshold: 2, For: "300s", Level: "p2", Message: "远端执行腿（朋友机器上的 QMT+网关）异常（值=2 腿连不上→查那台机器是否开机、QMT/网关进程是否起了、overlay 链路是否通；值=3 钥匙已撤但未触达→该账号当日不再推新单，按 RUNBOOK 手动停腿清待发，钱还在对面手上）：本读数只报不断，下单侧仍由熔断器与 kill-switch 各自说话"},
+		// HB-9 卖出意图未送达券商（§SELL-UNDELIVERED，第 25 条，owner 早前裁定「要加」，
+		// 2026-11-19 补齐；PLAN_SELL_BLIND §2.1/B3 的口径一字未改）。
+		// 为什么必须单独立一条而不是靠 order_fail_rate：后者在外脑通道断时会被折进静默域
+		// （scoring_loop 的静默域按"通道整体不可用"给 order_fail_rate/uplink_stale 降噪），
+		// 而 2026-11-17 的现场恰恰是"通道断 + 引擎自己发了 6 笔卖出全部 发送失败"，
+		// 那次 order_fail_rate 08:35 响过一次就沉了——通道断的那天正是"卖不出去"最该叫人的那天。
+		// 判据用 gt 0：卖出失败在正确状态下只有一个读数＝0；For=0s 不给宽限
+		// （不是取数抖动，是已经写进库的事实，等两分钟只会让敞口多开两分钟）。
+		// 量规 sell_undelivered_today 由 engine/heartbeat.go 每轮打分喂
+		// （store.CountSellUndelivered：当日 + 本账号 + side='卖出' + status='发送失败'）。
+		// 本条同样**只是读数**：不在这里、也不在心跳里动下单判定或熔断语义。
+		{Name: "sell_undelivered", Metric: "sell_undelivered_today", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "今日有卖出意图未送达券商（止损/止盈可能没执行，裸敞口还开着）：先看盒子网关 /health.live_ready 与内置策略的 sell_blind 读数，确认柜台是否收到委托；必要时人工处置。本条不随通道静默——通道断的那天正是它最该响的那天"},
 	}
 }
 

@@ -140,6 +140,7 @@ func (e *Engine) feedClosedDayPinnedGauge(now time.Time, tradingDay bool) {
 func (e *Engine) feedSignalHeartbeatGauge(now time.Time) {
 	tradingDay := data.IsTradingDay(now)
 	e.feedClosedDayPinnedGauge(now, tradingDay)
+	e.feedSellUndeliveredGauge(now)
 	if !data.IsActiveSession(now) || !tradingDay {
 		// 盘后/盘前/休市日：写 0 收案。本函数由 scoreCycle 顶部每轮调用（会话门禁之前），
 		// 所以这条收案一定会发生，不会把上午的读数留到晚上冒充故障。
@@ -167,4 +168,37 @@ func (e *Engine) feedSignalHeartbeatGauge(now time.Time) {
 		pinned = len(sb.List()) // signalStore 自带互斥，必须在 e.mu 之外调用
 	}
 	metrics.SetGauge("signal_zero_session_sec", signalHeartbeatAge(now, anchor, true, tradingDay, true, pinned))
+}
+
+// feedSellUndeliveredGauge 喂 §SELL-UNDELIVERED 量规 sell_undelivered_today。
+//
+// 为什么这条读数必须独立于 order_fail_rate：后者在外脑通道断时会被折进静默域
+// （scoring_loop 的静默域判定按"通道整体不可用"给 order_fail_rate/uplink_stale 降噪），
+// 而"卖不出去"恰恰最容易发生在通道断的那天——止损没执行＝裸敞口一直开着，
+// 它需要一条不随通道静默的 p1 必推规则（owner 早前裁定加入的第 25 条告警）。
+//
+// 口径（与 store.CountSellUndelivered 一字对齐）：当日 + 本账号 + side='卖出' + status='发送失败'。
+// 节拍与 signal_zero_session_sec 相同（每轮打分顶部一次），用途只是"把库里的事实搬到量规上"，
+// 不在本函数里做任何判定——规则比较（gt 0）由 metrics 包统一执行，两处各自判一套必漂移。
+//
+// 读不到（库未接 / SQL 错）时写 0：规则条件 gt 0 下 0 不触发，宁可这一段没有读数，
+// 也不让上一轮的旧数字一直挂着冒充"现在还有 3 笔卖不出去"。
+// English: feeds the sell_undelivered_today gauge (today + this account + side=sell + send-failed).
+func (e *Engine) feedSellUndeliveredGauge(now time.Time) {
+	e.mu.Lock()
+	rs := e.realStore
+	uid := e.userID
+	e.mu.Unlock()
+	if rs == nil {
+		// 本引擎没有接实盘账本（纸面/影子档）：结构上不可能有"卖出未送达"的委托行。
+		// 不写 0 的理由与 signal_zero_session_sec 的实盘门禁同源——不参与实盘的引擎
+		// 没有资格把别人的读数盖掉（SetGauge 无标签，进程内只有一个数）。
+		return
+	}
+	n, err := rs.CountSellUndelivered(data.TradingDayDate(now), uid)
+	if err != nil {
+		metrics.SetGauge("sell_undelivered_today", 0)
+		return
+	}
+	metrics.SetGauge("sell_undelivered_today", int64(n))
 }
