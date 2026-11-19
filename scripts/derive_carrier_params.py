@@ -526,6 +526,11 @@ CARRIER_OWNED = {
     # 或 delta 一直没动——两种情况下继续用旧读数都是伪造新鲜度。45＝30 的 1.5 倍，留一次
     # 投递/重启余量。Go 侧没有对应常量（Go 的 flowMoneyTTL=60s 是引擎自己的取数节拍）。
     "flow_snapshot_ttl_sec": "carrier-delivery: 资金流快照新鲜度上限（秒），见 §FLOW-SNAPSHOT",
+    # §FLOW-SECTOR-JOIN（2026-11-20）：板块逐票连接键（code -> **东财板块名**）。刻意与
+    # industry_map（证监会门类，供集中度桶用）分开：两套命名的交集为空，混用会"看起来接上了、
+    # 命中率恒 0"。云端生产者待 owner 裁（取板块成分那条路），在此之前载体弃权并在小时读数里
+    # 打 sector_hit=0/N。
+    "sector_map": "carrier-shape: 个股->东财板块名（板块资金流逐票注入的连接键），与 industry_map 刻意分家",
     # §STRATEGY-SWITCH-SYNC（owner 11-06 裁决）：这三枚不是 Go 出厂默认，而是量化交易 tab
     # 的现网开关快照，由 scripts/sync_strategy_switches.py 单点派生进 params；derive 不产出值。
     "enabled_strategies": "snapshot-derived: 量化交易 tab 的战法白名单（auth.json#qmt.strategies），由 sync_strategy_switches.py 派生",

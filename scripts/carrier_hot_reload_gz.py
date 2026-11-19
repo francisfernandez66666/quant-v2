@@ -102,6 +102,10 @@ RUNTIME_PARAM_KEYS = frozenset((
     # §FLOW-SNAPSHOT：30 分钟重算的资金流快照（大盘/板块 delta + 市场状态/仓位档），
     # 由 bake_flow_snapshot 每轮重算写入，永远是运行态而非静态旋钮。
     "flow_snapshot",
+    # §FLOW-SECTOR-JOIN：板块逐票连接键（code -> 东财板块名）。**必须是东财板块名**，
+    # 不能用 industry_map（证监会门类，与 sector_delta 的键交集为空）。今日云端还没有
+    # 生产者 ⇒ 载体弃权并把命中率打进小时读数；等 owner 裁决取板块成分的那条路后再填。
+    "sector_map",
 ))
 
 # §FLOW-SNAPSHOT（owner 2026-11-19/20 裁决 A）：资金流快照的重算节拍与"实质变化"阈值。

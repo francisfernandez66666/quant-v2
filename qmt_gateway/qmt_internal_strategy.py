@@ -2487,11 +2487,28 @@ def _flow_snapshot_state(moment):
 
 
 def _sector_delta_for(symbol, snap):
-    """Per-stock sector delta through the baked industry map (no map -> None)."""
+    """Per-stock sector delta through the baked `sector_map` (absent map -> None).
+
+    WHY A DEDICATED MAP, NOT `industry_map` (2026-11-20 live finding): the baked
+    `industry_map` holds the CSRC industry taxonomy (values like
+    "C39 computer/communication/electronics manufacturing", 79 distinct values,
+    from baostock / stocks.industry), while `sector_delta`'s keys are EastMoney
+    BOARD names straight out of `clist` f14. The two taxonomies have an EMPTY
+    intersection, so joining through `industry_map` would look wired and match
+    nothing -- a silent 0% leg, which is this repo's most expensive shape.
+    (`industry_map` keeps its real job: the concentration buckets.)
+
+    So the join key is a separate, purpose-built `sector_map` (code -> EM board
+    name). Until the decision host bakes one, this leg ABSTAINS (None) and the
+    blend renormalises onto market + volume; the hourly readout prints the
+    hit/miss tally so "0%" is visible instead of inferred.
+    """
     table = snap.get("sector_delta") or {}
     if not table:
         return None
-    maps = PARAMS.get("industry_map") or {}
+    maps = PARAMS.get("sector_map") or {}
+    if not maps:
+        return None
     industry = maps.get(symbol)
     if not industry:
         industry = maps.get(_qmt_code(symbol))
@@ -2500,6 +2517,25 @@ def _sector_delta_for(symbol, snap):
     if not industry:
         return None
     return _clamp_delta(table.get(str(industry)))
+
+
+def _bump_sector_tally(hit):
+    """Count one per-stock sector lookup into the HOURLY tally (diagnostics only).
+
+    Deliberately hour-scoped and accumulated across rounds: the readout line is
+    printed at the top of a round, before any sizing (and therefore before any
+    lookup), so a per-round counter would ALWAYS print 0/0 -- a fake reading that
+    looks like "the leg is dead" every single hour. The tally is reset by the
+    readout itself, so one line = "this hour, N of M names matched".
+    """
+    moment = _STATE.get("round_moment")
+    key = "" if moment is None else "%s_%d" % (day_key(moment), moment.hour)
+    tally = _STATE.get("flow_tally")
+    if not isinstance(tally, dict) or tally.get("hour") != key:
+        tally = {"hour": key, "hit": 0, "miss": 0}
+        _STATE["flow_tally"] = tally
+    field = "hit" if hit else "miss"
+    tally[field] = int(tally.get(field) or 0) + 1
 
 
 def _book_market_value(positions):
@@ -2618,6 +2654,11 @@ def _flow_blend_for(symbol, moment):
     sector = _sector_delta_for(symbol, snap)
     if sector is not None:
         parts.append(float(sector))
+        _bump_sector_tally(True)
+    elif snap.get("sector_delta"):
+        # Only a real miss (table present, this name unmatched) is counted; an
+        # empty table means "no sector flow today", which is a different fact.
+        _bump_sector_tally(False)
     surge = vol.get("delta")
     if surge is not None:
         parts.append(float(surge))
@@ -2650,14 +2691,24 @@ def _flow_readout():
     vol = round_flow.get("vol") or {}
     snap = round_flow.get("snap") or {}
     quadrant = round_flow.get("quadrant") or {}
+    # sector_hit/miss makes the per-stock sector join VISIBLE: a wired-but-never-
+    # matching leg prints 0/N every hour instead of quietly abstaining forever.
+    # The tally is the PREVIOUS hour's (this line is emitted before any lookup in
+    # this round); it is reset here so the next line reports one hour only.
+    tally = _STATE.get("flow_tally") or {}
+    hit = int(tally.get("hit") or 0)
+    miss = int(tally.get("miss") or 0)
+    _STATE["flow_tally"] = {"hour": "", "hit": 0, "miss": 0}
     _log("flow vol_state=%s r_yest=%s r_ma5=%s src=%s reason=%s market_delta=%s sectors=%d "
-         "state=%s pos_rel=%.3f decision=%s qwhy=%s" % (
+         "sector_hit=%d/%d state=%s pos_rel=%.3f decision=%s qwhy=%s" % (
              vol.get("vol_state") or "neutral",
              "na" if vol.get("r_yest") is None else "%.4f" % float(vol.get("r_yest")),
              "na" if vol.get("r_ma5") is None else "%.4f" % float(vol.get("r_ma5")),
              vol.get("source") or "-", vol.get("reason") or "-",
              "na" if snap.get("market_delta") is None else "%.4f" % float(snap.get("market_delta")),
              len(snap.get("sector_delta") or {}),
+             hit,
+             hit + miss,
              snap.get("market_state") or "-",
              float(quadrant.get("pos_rel") or 0.0),
              quadrant.get("decision") or "neutral",

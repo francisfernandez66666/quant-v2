@@ -25704,6 +25704,15 @@ CNT231=$((CNT231 + 1))
 grep_q 'intent in ("new", "add") and _quadrant.get("block")' FST F \
 	|| fail231 "四象限硬闸的判据不在（或把 T 腿一起拦了——range 态 T 要照跑）"
 grep_q 'flow_quadrant_block' FST F || fail231 "硬闸跳过原因未落进 round_skips（盘后无法归因）"
+# 板块逐票连接键必须是**专用** sector_map。现网实测 industry_map 是证监会门类
+# （C39…）、sector_delta 的键是东财板块名，两者交集为空 —— 用 industry_map 当连接键
+# 会"看起来接上了、命中率恒 0"，正是本仓最贵的静默。取函数体判，免得被注释里的同名词骗过。
+SECTBODY231=$(printf '%s\n' "$FST" | sed -n '/^def _sector_delta_for/,/^def _bump_sector_tally/p')
+grep_q 'PARAMS.get("sector_map")' SECTBODY231 F || fail231 "板块逐票腿没走专用 sector_map（连接键错了＝命中率恒 0）"
+if grep_q 'PARAMS.get("industry_map")' SECTBODY231 F; then
+	fail231 "板块逐票腿又去读 industry_map 了（证监会门类 ≠ 东财板块名，交集为空）"
+fi
+grep_q 'sector_hit=%d/%d' FST F || fail231 "小时读数没打板块命中率（0% 会变成静默弃权）"
 
 # ⑥ blend 落点：只乘 per_trade，且夹 0.5×equity（等价 Go PerTradePctOfBlend）。
 CNT231=$((CNT231 + 1))
@@ -25736,5 +25745,5 @@ else
 fi
 
 [ "$B231_FAILED" = "0" ] || exit 1
-echo "ok - §231 §FLOW-QUADRANT 锁通过（四腿在册+阈值单点无兜底+四类弃权锚+唯一硬闸只拦new/add+blend落点per_trade+烘入腿在sha之前+行为用例判退出码，累计判定点 ${CNT231}）"
+echo "ok - §231 §FLOW-QUADRANT 锁通过（四腿在册+阈值单点无兜底+四类弃权锚+唯一硬闸只拦new/add+板块连接键专用+blend落点per_trade+烘入腿在sha之前+行为用例判退出码，累计判定点 ${CNT231}）"
 echo ""

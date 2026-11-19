@@ -265,12 +265,26 @@ class CarrierFlowQuadrantTest(unittest.TestCase):
         self._round_flow(market=-1.0, sector=-1.0, vol_delta=-1.0)
         self.assertAlmostEqual(self.mod._flow_blend_for("600519", _MID_SESSION), 0.8, places=4)
 
-    def test_blend_sector_resolution_uses_industry_map(self):
-        self.mod.PARAMS["industry_map"] = {"600519": "银行"}
-        self._round_flow(market=None, sector={"银行": 1.0}, vol_delta=None)
+    def test_blend_sector_resolution_uses_sector_map(self):
+        """板块逐票腿走**专用** sector_map（东财板块名），不是 industry_map。"""
+        self.mod.PARAMS["sector_map"] = {"600519": "酿酒行业"}
+        self._round_flow(market=None, sector={"酿酒行业": 1.0}, vol_delta=None)
         self.assertAlmostEqual(self.mod._flow_blend_for("600519", _MID_SESSION), 1.2, places=4)
-        # 没有行业映射的票 ⇒ 板块腿弃权（renormalize），不是 0。
+        # 没有该票映射 ⇒ 板块腿弃权（renormalize），不是 0。
         self.assertAlmostEqual(self.mod._flow_blend_for("000001", _MID_SESSION), 1.0, places=4)
+
+    def test_industry_map_must_not_be_used_as_the_sector_join(self):
+        """反证：industry_map 是证监会行业（C39…），与东财板块名交集为空。
+
+        2026-11-20 现网实测：`industry_map` 79 个值全是 "C39计算机、通信和其他电子设备制造业"
+        这种门类，而 `sector_delta` 的键是 "半导体/软件开发" 这类东财板块名 —— 用
+        industry_map 当连接键会**看起来接上了、命中率恒 0**。这条锁保证没人再改回去。
+        """
+        self.mod.PARAMS.pop("sector_map", None)
+        self.mod.PARAMS["industry_map"] = {"600519": "C15酒、饮料和精制茶制造业"}
+        self._round_flow(market=None, sector={"C15酒、饮料和精制茶制造业": 1.0}, vol_delta=None)
+        # 即使键名"恰好"写得一样也不许命中：连接键只能是 sector_map。
+        self.assertAlmostEqual(self.mod._flow_blend_for("600519", _MID_SESSION), 1.0, places=4)
 
     def test_blend_pct_zero_is_the_off_switch(self):
         self.mod.PARAMS["flow_blend_pct"] = 0
