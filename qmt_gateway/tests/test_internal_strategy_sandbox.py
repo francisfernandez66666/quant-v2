@@ -553,6 +553,39 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         finally:
             mod._account_total_asset = saved
 
+    def test_cash_probe_prints_the_target_derivation(self):
+        """owner 2026-11-19：仓位帽要能"照着日志算出来"，不是靠人反推。
+
+        现场追问的原句是「为啥盒子今日仓位帽是 48.5%，给出计算过程」——而旧读数只打
+        caps=...，`target = base × min(MS, ceiling)`、`room = target − (held + pending)`
+        这四个输入一个都没打，于是只能猜。这条用例钉住：读数行必须同时带
+        base / ms / tgt / held / pend / room 六个数，且数值与同一套函数一致。
+        """
+        mod = self.mod
+        saved_asset = mod._account_total_asset
+        saved_log = mod._log
+        lines = []
+        mod._account_total_asset = lambda: 100000.0
+        mod._log = lambda text: lines.append(text)
+        mod._STATE["cash_probe_done"] = False
+        try:
+            mod.PARAMS.update({"sizing_enabled": True, "min_cash_reserve": 0.0,
+                               "order_amount_cap": 1e9, "daily_buy_cap": 1e9,
+                               "min_order_amount": 10000.0,
+                               "max_total_position_pct": 1.0,
+                               "per_trade_position_pct": 0.1,
+                               "per_trade_position_max_pct": 0.1})
+            ctx = self._sizing_ctx()
+            mod._probe_cash_line("FC0001", None, "hard_cap_below_floor", "", ctx, mod.PARAMS)
+        finally:
+            mod._account_total_asset = saved_asset
+            mod._log = saved_log
+        self.assertEqual(len(lines), 1, "probe 必须只打一行")
+        line = lines[0]
+        for token in ("base=", "ms=", "tgt=", "held=", "pend=", "room="):
+            self.assertIn(token, line, "读数行缺 %s（仓位帽就算不出来）: %s" % (token, line))
+        self.assertNotIn("na", line.split("base=")[1].split()[0], "base 读得到时不许打 na")
+
     def test_add_intent_is_still_exempt_from_the_floor(self):
         """Q7 不动：加仓/做T 腿不吃 1 万底线，也不再被补成 1 万。"""
         mod = self.mod

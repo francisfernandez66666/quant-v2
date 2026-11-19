@@ -972,3 +972,44 @@ def _params_keys_read(tree):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _vwap_ctx(**over):
+    """T 门的最小 ctx：有持仓、有锚点、有现价，只差 VWAP 各处来源。"""
+    ctx = {
+        "symbol": "000034.SZ",
+        "day": "20261119",
+        "weekday": 3,
+        "hhmm": "10:00",
+        "closed_days": set(),
+        "trading_day": True,
+        "last_price": 21.90,
+        "position_qty": 1000,
+        "available_cash": 30000.0,
+        "total_asset": 100000.0,
+        "holdings_value": 21900.0,
+        "positions_live": {},
+        "market_scale": 0.6,
+        "index_change_pct": 0.3,
+        "market_state": "range",
+        "t_anchor_ok_sources": ["first_buy_order"],
+        "position": {"qty": 1000, "cost": 21.0, "can_use": 1000,
+                     "anchor_price": 21.0, "anchor_source": "first_buy_order"},
+    }
+    ctx.update(over)
+    return ctx
+
+
+def test_t_vwap_prefers_the_explicit_field():
+    """§T-VWAP-WIRING：ctx 带 vwap（沙箱已经用 _vwap_of 做过单位校正）时优先用它。
+
+    现网 2026-11-19：T 的 base_ctx 不带 vwap / amount / volume ⇒ `_t_vwap_of` 退回 bars
+    （这台构建没有下载 API）⇒ 每一轮、每一只持仓都 `step0 vwap_untrustworthy`，T 全天零开腿。
+    """
+    params = {"t_anchor_ok_sources": ["first_buy_order"]}
+    ctx = _vwap_ctx(vwap=21.85)
+    assert rt._t_vwap_of(ctx) == 21.85
+    # 没有 vwap 时用累计额/量（两条腿都要在，缺一条就弃权）
+    assert rt._t_vwap_of(_vwap_ctx(amount=218500.0, volume=10000.0)) == 21.85
+    assert rt._t_vwap_of(_vwap_ctx(amount=218500.0)) is None
+    assert rt._t_vwap_of(_vwap_ctx()) is None
+

@@ -2396,18 +2396,35 @@ def _probe_cash_line(short, amount, why, note, ctx, params):
     opaque reason. Marks done for this round via the caller's flag."""
     _STATE["cash_probe_done"] = True
     cap = ""
+    basis = ""
     try:
         sized_view = _sizing_view(ctx, _STATE.get("cash_probe_positions") or {}, None)
         names = buy_size_caps(params, sized_view)
         cap = ",".join("%s=%s" % (k, "na" if v is None else "%.0f" % float(v))
                        for k, v in sorted(names.items()))
+        # 2026-11-19 owner asked: how is today's "48.5% position cap" computed? The caps line alone cannot
+        # answer that -- target = base * min(MarketScale, ceiling) and room = target -
+        # (held + pending) has FOUR inputs and none of them was printed. Print them so
+        # the derivation is arithmetic on the log line, not an inference.
+        # Pure readout: target_position/_sz_position_value are the SAME functions the
+        # decision used, and any failure here degrades to na (never blocks a round).
+        target = target_position(params, sized_view) or {}
+        held, pending, _bl, _sl, okv = _sz_position_value(sized_view)
+        basis = "base=%s ms=%s tgt=%s held=%s pend=%s room=%s" % (
+            "na" if target.get("total") is None else "%.0f" % float(target.get("total")),
+            "na" if target.get("market_scale") is None else "%.4f" % float(target.get("market_scale")),
+            "na" if target.get("target") is None else "%.0f" % float(target.get("target")),
+            "na" if (not okv or held is None) else "%.0f" % float(held),
+            "na" if (not okv or pending is None) else "%.0f" % float(pending),
+            "na" if target.get("room") is None else "%.0f" % float(target.get("room")))
     except Exception as exc:  # noqa: BLE001 - readout only, never a decision
-        cap = "err:%s" % repr(exc)[:60]
-    _log("cash_probe sym=%s amt=%s why=%s note=%s cash=%s eq=%s caps=%s" % (
+        cap = cap or "err:%s" % repr(exc)[:60]
+        basis = basis or "basis_err:%s" % repr(exc)[:60]
+    _log("cash_probe sym=%s amt=%s why=%s note=%s cash=%s eq=%s caps=%s %s" % (
         short, "na" if amount is None else "%.0f" % amount, why or "", note or "",
         "na" if (ctx or {}).get("available_cash") is None else "%.0f" % float(ctx.get("available_cash") or 0.0),
         "na" if (ctx or {}).get("total_asset") is None else "%.0f" % float(ctx.get("total_asset") or 0.0),
-        cap))
+        cap, basis))
 
 
 def sizing_cap(ctx, positions, intent="new", pending_buys=None):
@@ -2742,10 +2759,29 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
         row = pos_view.get(symbol) or {}
         tick = _tick_of(ContextInfo, symbol)
         px = (tick or {}).get("last_price")
+        # 2026-11-19 P0 (owner asked why the T leg never opened all day):
+        # the T ctx never carried the tick's cumulative amount/volume, so
+        # rules_t._t_vwap_of(ctx) had neither `vwap` nor `amount`/`volume` and
+        # fell back to `bars` -- which this build does not have (no downloader
+        # API) -- hence `step0 vwap_untrustworthy` for EVERY held name, every
+        # round, all day (live: 3-4 held names, 100% of rounds).
+        # Fix: hand the T layer the same sanity-checked VWAP the strategic leg
+        # uses (_vwap_of applies vwap_sanity_* + vwap_unit_candidates), plus the
+        # raw fields so a future miss is diagnosable from the log instead of
+        # being inferred.
+        vwap_value, vwap_why = (None, "no_tick") if not tick else _vwap_of(tick)
+        if vwap_value is None:
+            _warn_once("t_vwap:%s" % symbol,
+                       "t_vwap_untrusted sym=%s why=%s volume=%s amount=%s last=%s" % (
+                           symbol, vwap_why or "-", (tick or {}).get("volume"),
+                           (tick or {}).get("amount"), px))
         c = {
             "symbol": symbol, "day": day, "hhmm": hhmm, "now_ts": now_ts,
             "trading_day": True,  # run_round already passed _trade_session_ok
             "last_price": px, "position_qty": (row or {}).get("qty"),
+            "vwap": vwap_value,
+            "volume": (tick or {}).get("volume"),
+            "amount": (tick or {}).get("amount"),
             "available_cash": cash, "total_asset": t_total,
             "holdings_value": holdings_value,
             "positions_live": pos_view,

@@ -24290,6 +24290,30 @@ grep -qF 'return None, "sizing_amount_unavailable", ""' qmt_gateway/qmt_internal
 	|| fail213 "「一顶帽子都读不到」的 reason 丢了（那个分支才是真的算不出）"
 grep -qF 'test_no_readable_cap_still_reports_amount_unavailable' qmt_gateway/tests/test_internal_strategy_sandbox.py \
 	|| fail213 "缺负锁用例（两个 reason 分开后必须有一条断言「算不出」还是老标签）"
+# ④c 仓位帽要能照日志算出来（owner 2026-11-19「给出计算过程」）：
+# target = base × min(MS, ceiling)、room = target − (held + pending) 四个输入必须同屏。
+CNT213=$((CNT213 + 1))
+grep -qF 'base=%s ms=%s tgt=%s held=%s pend=%s room=%s' qmt_gateway/qmt_internal_strategy.py \
+	|| fail213 "cash_probe 不再打印 base/ms/tgt/held/pend/room（仓位帽又变成只能靠反推）"
+grep -qF 'test_cash_probe_prints_the_target_derivation' qmt_gateway/tests/test_internal_strategy_sandbox.py \
+	|| fail213 "缺「读数行必须带六个推导输入」的用例"
+# ④e T 腿的 VWAP 接线（2026-11-19 P0：T 一整天 0 开腿的真因）：
+# 现场 `t_round ... skips=step0 vwap_untrustworthy` 100% 命中，而 `_t_vwap_of` 的判据是
+# ctx.vwap 或 ctx.amount/volume —— T 的 base_ctx 三个都没传 ⇒ 退回 bars（这台构建没有下载 API）⇒ 恒 None。
+CNT213=$((CNT213 + 1))
+grep -qF 'vwap_value, vwap_why = (None, "no_tick") if not tick else _vwap_of(tick)' qmt_gateway/qmt_internal_strategy.py \
+	|| fail213 "T 的 ctx 不再带 VWAP（T 腿会退回 step0 vwap_untrustworthy）"
+grep -qF '"vwap": vwap_value,' qmt_gateway/qmt_internal_strategy.py \
+	|| fail213 "T ctx 缺 vwap 字段（rules_t 优先读它）"
+grep -qF '"amount": (tick or {}).get("amount"),' qmt_gateway/qmt_internal_strategy.py \
+	|| fail213 "T ctx 缺 amount（VWAP 的第二条腿）"
+grep -qF 't_vwap_untrusted sym=%s why=%s volume=%s amount=%s last=%s' qmt_gateway/qmt_internal_strategy.py \
+	|| fail213 "缺 T VWAP 的读数行（再出一次只能靠猜）"
+# ④d 该文件必须纯 ASCII（g1）：中文注释会让 GBK 终端把字节换成 '?'，构建器直接 ABORT。
+CNT213=$((CNT213 + 1))
+if LC_ALL=C grep -q '[^ -~	]' qmt_gateway/qmt_internal_strategy.py; then
+	fail213 "qmt_internal_strategy.py 出现非 ASCII 字节（g1_ascii：GBK 终端会把它们换成 '?'）"
+fi
 # ⑤ 在途买单占用预算：侧别从柜台行读，读不到时按"我方短码"兜底，卖出永不占预算。
 CNT213=$((CNT213 + 1))
 grep -qF 'def _order_side(item, op_buy=23, op_sell=24):' qmt_gateway/qmt_internal_strategy.py || fail213 "在途单侧别判据缺失（卖出单会被当成买单占预算）"
@@ -24328,7 +24352,7 @@ if grep_q 'failed' PY213; then
 fi
 
 [ "$B213_FAILED" = "0" ] || exit 1
-echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 拒绝原因分流（hard_cap_below_floor / sizing_amount_unavailable）+ 在途占预算 + m_strRemark 首读 + 前缀负锁 + 字段族（m_nVolumeTraded/m_dOrderPrice），累计判定点 ${CNT213}）"
+echo "ok - §213 §OWNER-RULINGS 锁通过（单票本票 + 组帽全簿 + 1万补足 + 整手补足 + 拒绝原因分流（hard_cap_below_floor / sizing_amount_unavailable）+ 仓位帽推导读数 + T 腿 VWAP 接线 + 纯 ASCII 负锁 + 在途占预算 + m_strRemark 首读 + 前缀负锁 + 字段族（m_nVolumeTraded/m_dOrderPrice），累计判定点 ${CNT213}）"
 echo ""
 
 # ---------------------------------------------------------------------------
