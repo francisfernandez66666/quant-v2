@@ -18,10 +18,17 @@ RestartSec=5
 LimitNOFILE=65535
 
 # 2 核 / 4GB 重定：quant 常态 200-400M，软限先回收，硬限留足余量给 research + caddy + 系统。
-MemoryHigh=900M
+# §MEM-20261119（现网事故）：软限 900M 低于 Go 堆的自然增长点 ⇒ 内核**持续回收**（swap 打满
+# 1987/1987、load 3.1、/api/config/qmt 单请求 48.9s、健康检查 10s 超时），而进程不退出、
+# systemd 的 Restart=always 也就不会拉起 —— 表现是"网页离线但服务 active"。
+# 两处并改：①软限抬到 1200M（不再贴着 Go 堆）；②给 Go 一个明确上限 GOMEMLIMIT=768MiB，
+# 让 GC 自己收（而不是靠内核 page reclaim 把堆换出去）。硬限仍 1400M（超了才 OOM，
+# 那时是真见顶，宁可重启也不要 48s 的假活）。
+MemoryHigh=1200M
 MemoryMax=1400M
 CPUQuota=150%
 Environment=GOMAXPROCS=2
+Environment=GOMEMLIMIT=768MiB
 
 Environment=TZ=Asia/Shanghai
 Environment=QUANT_ADDR=127.0.0.1:8081

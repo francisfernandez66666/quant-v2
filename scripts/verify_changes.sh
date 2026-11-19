@@ -24593,3 +24593,49 @@ grep_q '^ok' M215 || { echo "--- FAIL: §215 规则层行为腿未过：$(printf
 [ "$B215_FAILED" = "0" ] || exit 1
 echo "ok - §215 §SELL-UNDELIVERED 锁通过（五元组 gt0/0s/p1 + 显式必推 + 静默域负锁 + 计数四维 + 日期归一 + 心跳接线 + 三处计数等值 + 用例在册 + 历史行回填脚本（dry-run/唯一日/整体事务）+ 三套行为腿，累计判定点 ${CNT215}）"
 echo ""
+
+# ---------------------------------------------------------------------------
+# §216 §REGIME-SEED（2026-11-19 现网事故：定权读数只在异步流水线里写，5s 打分循环等不到它）：
+#   现象：`/api/...` 侧"半仓 + 关键读数缺失(缺:market_state|emotion_phase)"，而同一时刻
+#   `market_risk_daily` 当天那行写着 情绪=高潮 / 状态=range。
+#   根因：lastEmotionPhase / lastMarketState 的唯一写入点是异步 Run（8b 涨停池 → 状态机/情绪），
+#   而 5s 打分循环照常在这个空窗里出决策；`*Enabled` 又是配置说了算的真 ⇒ applyMissingKeyCap
+#   判盲区 ⇒ 目标封顶 50% 且当天不做 T。重启一次就有一段盲窗，上游超时则可能整天盲。
+#   修法：当天风险档快照做种子（只补空、只认当天、一天只读一次库、读不到保持空）。
+echo "==> 216 §REGIME-SEED（定权读数空窗：用当日风险档快照补种子）..."
+B216_FAILED=0
+fail216() {
+	echo "--- FAIL: §216 $*"
+	FAIL=1
+	B216_FAILED=1
+}
+CNT216=0
+EG216=internal/engine/engine.go
+
+# ① 字段与函数在册（种子缓存按交易日；没有它就会每 3s 查一次库）。
+CNT216=$((CNT216 + 1))
+grep -qF 'regimeSeedDay     string' "$EG216" || fail216 "缺 regimeSeedDay（种子缓存日键）"
+grep -qF 'func (e *Engine) todayRegimeSeed(now time.Time) (string, string) {' "$EG216" \
+	|| fail216 "缺 todayRegimeSeed（定权读数空窗的种子腿）"
+# ② 只认当天：区间查询带回来的别的日子一律拒收。
+CNT216=$((CNT216 + 1))
+grep -qF 'if row.TradeDate != day {' "$EG216" || fail216 "种子没按交易日过滤（昨天的情绪会给今天定权）"
+grep -qF 'ListMarketRiskDaily(day, day)' "$EG216" || fail216 "种子不是按当天区间取（区间写成开区间会带出历史行）"
+# ③ 只补空、绝不覆盖主循环刚算出的新值。
+CNT216=$((CNT216 + 1))
+grep -qF 'if r.EmotionPhase == "" || r.MarketState == "" {' "$EG216" || fail216 "种子无条件执行（会覆盖主动线新读数）"
+grep -qF 'if r.MarketState == "" {' "$EG216" || fail216 "市场状态那一维没有判空保护"
+# ④ 负锁：种子腿不许写 last*（那会让"补种子"变成"伪造主循环读数"，下一轮就无法区分新旧）。
+CNT216=$((CNT216 + 1))
+if awk '/func \(e \*Engine\) todayRegimeSeed/,/^}$/' "$EG216" | grep -qE 'e\.last(MarketState|EmotionPhase) *='; then
+	fail216 "种子腿写了 last* 字段（把补种子变成了伪造主循环读数）"
+fi
+# ⑤ 用例在册 + 行为腿（三条边界各一条）。
+CNT216=$((CNT216 + 1))
+[ -f internal/engine/regime_seed_20261119_test.go ] || fail216 "缺 §REGIME-SEED 回归用例"
+G216=$( go test ./internal/engine -count=1 -run 'TestRegimeSeed' 2>&1 || true )
+grep_q '^ok' G216 || { echo "--- FAIL: §216 行为腿未过：$(printf '%s\n' "$G216" | tail -8)"; B216_FAILED=1; }
+
+[ "$B216_FAILED" = "0" ] || exit 1
+echo "ok - §216 §REGIME-SEED 锁通过（字段/函数在册 + 只认当天 + 只补空 + 种子不写 last* 负锁 + 3 条行为腿，累计判定点 ${CNT216}）"
+echo ""

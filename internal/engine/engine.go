@@ -306,6 +306,17 @@ type Engine struct {
 	// consumed by the risk-tier synthesizer (B3).
 	lastMarketState string  // bull/range/bear（状态机关闭时为空串=不展示）
 	lastMaxPosPct   float64 // 状态机建议最大仓位比例（0=未启用）
+	// §REGIME-SEED（2026-11-19 现网事故）：这两个读数的**唯一写入点**是异步 `Run` 流水线
+	// （8b 涨停池 → MarketStateObserve / DetectEmotionPhaseV2），而 5s 打分循环照常在这之前
+	// 出决策 ⇒ 进程刚起、或异步那轮卡在上游超时（当天东财/同花顺多次 30s 超时）时，
+	// last* 是空串而 `*Enabled` 是配置说了算的真 ⇒ applyMissingKeyCap 判「盲区」⇒
+	// 目标封顶 50% + 当天不做 T。现网实测：13:41 重启后 250+ 条决策 MS=0.5，
+	// 而 market_risk_daily 当天那行明明写着 情绪=高潮 / 状态=range。
+	// 修法：**当天**已有风险档快照做种子（异步链路每天写一行），只在两维都空时读一次。
+	// 读不到就保持空——假数据比盲区更贵；跨日行**绝不**当种子（昨天的情绪不能给今天定权）。
+	regimeSeedDay     string // 已尝试过种子的交易日（YYYYMMDD；空=今天还没试）
+	regimeSeedEmotion string
+	regimeSeedState   string
 	// §W-09 T 专属行情读数：**与上面两个定权字段严格分家**。
 	// 理由（本批最重要的一条负锁，H18/门禁 #27 钉住）：`sizing.go` 的 stateFactor 只判断
 	// `MarketState == ""`、**不看 `MarketStateEnabled`**，所以只要 lastMarketState 非空，
@@ -6727,6 +6738,19 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 		r.RiskReasons = append([]string(nil), e.lastRiskReasons...)
 	}
 	e.mu.RUnlock()
+	// §REGIME-SEED（见字段处注释）：异步流水线还没跑完（或刚重启）时，用**当天**的风险档
+	// 快照把这两个维度补上。只在对应维为空时补，绝不覆盖主循环刚算出来的新值。
+	// English: seed the two sizing dimensions from today's persisted risk-tier row when the async
+	// pipeline has not produced them yet; never overwrite a value the main loop just computed.
+	if r.EmotionPhase == "" || r.MarketState == "" {
+		seedEmo, seedState := e.todayRegimeSeed(now)
+		if r.EmotionPhase == "" {
+			r.EmotionPhase = seedEmo
+		}
+		if r.MarketState == "" {
+			r.MarketState = seedState
+		}
+	}
 	r.EmotionEnabled = e.emotionConfigured()
 	r.MarketStateEnabled = e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState })
 	// §N6-RISK：Red 硬拦只由应急开关触发；默认走 tier_scales.Red 权重收束。
@@ -6738,6 +6762,63 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 	e.fillMacroEvents(&r, now)
 	e.fillHoliday(&r, now)
 	return r
+}
+
+// todayRegimeSeed 当天风险档快照里已有的情绪相位/市场状态（§REGIME-SEED，只读一次/日）。
+//
+// 为什么需要：`lastEmotionPhase` / `lastMarketState` 的唯一写入点在异步 `Run` 流水线，
+// 而 5s 打分循环不等它——重启后的头几分钟、或上游超时把某一轮拖到十几分钟时，
+// 定权读到的是空串 + "这一维配置说启用"，于是被判成数据盲区（目标封顶 50%、当天不做 T）。
+// 现网 2026-11-19 实测：13:41 重启后 250+ 条决策 MS=0.5，而当天 `market_risk_daily`
+// 那行写着 情绪=高潮 / 状态=range —— 读数其实在库里，只是没人去拿。
+//
+// 边界（三条，都不许放宽）：
+//  1. **只认当天**：跨日行绝不当种子（昨天的情绪不该给今天定权）；
+//  2. 只补空，不覆盖（调用方判空后再填）；
+//  3. 读失败/没有行 ⇒ 保持空，仍然按盲区走（假数据比盲区更贵）。
+//
+// English: one-read-per-day seed of the two sizing dimensions from today's risk-tier row.
+func (e *Engine) todayRegimeSeed(now time.Time) (string, string) {
+	day := data.TradingDayDate(now)
+	e.mu.RLock()
+	if e.regimeSeedDay == day {
+		emo, st := e.regimeSeedEmotion, e.regimeSeedState
+		e.mu.RUnlock()
+		return emo, st
+	}
+	store := e.d1Store
+	e.mu.RUnlock()
+	if store == nil {
+		// 没接研究库的引擎（纸面/影子档）读不到快照：缓存一个空结果，避免每 3s 空转。
+		e.mu.Lock()
+		e.regimeSeedDay, e.regimeSeedEmotion, e.regimeSeedState = day, "", ""
+		e.mu.Unlock()
+		return "", ""
+	}
+	emo, st := "", ""
+	rows, err := store.ListMarketRiskDaily(day, day)
+	if err != nil {
+		log.Printf("[engine] §REGIME-SEED 读取当日风险档失败（按盲区处理，不伪造）day=%s: %v", day, err)
+	}
+	for _, row := range rows {
+		if row.TradeDate != day {
+			continue // 兜底：区间查询理论上不会带出别的日子，真带出来也一律拒收
+		}
+		if row.Emotion != "" {
+			emo = row.Emotion
+		}
+		if row.MarketState != "" {
+			st = row.MarketState
+		}
+	}
+	e.mu.Lock()
+	e.regimeSeedDay, e.regimeSeedEmotion, e.regimeSeedState = day, emo, st
+	e.mu.Unlock()
+	if emo != "" || st != "" {
+		log.Printf("[engine] §REGIME-SEED 用当日风险档快照补定权读数：情绪=%q 状态=%q day=%s（异步流水线跑完前的空窗，不是新读数）",
+			emo, st, day)
+	}
+	return emo, st
 }
 
 // regimeForAccount §DYN-SIZE：在市场环境快照（全局缓存）之上叠加**账号级**读数——
