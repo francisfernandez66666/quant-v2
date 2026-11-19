@@ -168,7 +168,8 @@ GW_FILES="gateway.py store.py handler.py broker.py ids.py outbox_admin.py quote_
 close_gate.py leg_ops.py trading_calendar.py qmt_bridge.py qmt_bridge_strategy.py \
 config.bridge.example.json local_executor.py local_executor_params.json \
 qmt_internal_strategy.py report_uplink.py broker_reads.py carrier_updater.py \
-rules_form.py rules_ladder.py rules_factor.py rules_t.py rules_sizing.py"
+rules_form.py rules_ladder.py rules_factor.py rules_t.py rules_sizing.py \
+flow_proxy.py"
 FRIEND_FILES="ensure_friend_gateway_config.ps1 watchdog.ps1 install_tasks.ps1 enroll.ps1 \
 start_gateway.ps1 export_ledger.ps1 stop_leg.ps1 uninstall.ps1 config.xt.friend.template.json \
 install.ps1 uninstall_entry.bat export_ledger.bat install_entry.bat SETUP.txt \
@@ -184,6 +185,10 @@ install_local_executor.ps1 switch_execution_mode.ps1 switch_execution_mode.bat u
 SCRIPTS_FILES="build_local_executor.py derive_carrier_params.py \
 update_local_executor.ps1 update_qmt_strategy.ps1 update_local_executor.bat"
 # 门禁 §171 盯这两个变量的条目数与内容；改白名单必须同批改那里。
+#
+# §FLOW-MONEY（2026-11-19）：gateway.py 顶部 `import flow_proxy` 是**硬依赖**——
+# 不进包等于让朋友腿 import 期就崩（比"少个可选功能"严重得多）。该模块只做白名单中继
+# （上游 host/path 写死、参数逐项校验、带回 TTL 缓存），且只读、不含任何资本动作。
 #
 # §FRIEND-LOCAL 批 7 追加：本地执行器那条腿（QMT 之外的独立普通 Python 进程）
 #   * qmt_gateway/local_executor.py        执行器本体（纯 ASCII，规则层无裸数字）

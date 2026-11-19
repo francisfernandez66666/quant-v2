@@ -85,11 +85,15 @@ func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 // sectorRawItem is a raw JSON row of the EastMoney sector quote list,
 // corresponding to a diff entry of clist/get.
 type sectorRawItem struct {
-	Code       string  `json:"f12"`  // 板块代码（BKXXXX）
-	Name       string  `json:"f14"`  // 板块名称
-	ChangePct  float64 `json:"f3"`   // 涨跌幅（千分位，需归一化）
-	Amount     float64 `json:"f20"`  // 总市值（元）
-	NetInflow  float64 `json:"f62"`  // 主力净流入（元）
+	Code      string  `json:"f12"` // 板块代码（BKXXXX）
+	Name      string  `json:"f14"` // 板块名称
+	ChangePct float64 `json:"f3"`  // 涨跌幅（千分位，需归一化）
+	Amount    float64 `json:"f20"` // 总市值（元）
+	NetInflow float64 `json:"f62"` // 主力净流入（元）
+	// §FLOW-MONEY（2026-11-19）：f6=板块当日成交额（元），资金流归一分母（owner 裁决成交额口径）。
+	// 实测 8 板块 f62/f6×1e4 与东财自带的 f184（净占比万分比）逐个严格成立。
+	Turnover   float64 `json:"f6"`   // 板块当日成交额（元，f6）
+	FlowPctBps float64 `json:"f184"` // 主力净占比（万分比，f62/f6×10000，校验用）
 	VolumeRank int     `json:"f104"` // 成交量排名
 	LimitupCnt int     `json:"f105"` // 涨停家数
 }
@@ -1233,7 +1237,7 @@ func (m *MarketAPI) GetAuctionData(code string) (*StockInfo, error) {
 
 // sectorListFields 东方财富板块列表字段（精简版，兼容性好）。
 // sectorListFields is the compact EastMoney sector list field set.
-const sectorListFields = "f12,f14,f3,f20,f62,f104,f105,f184"
+const sectorListFields = "f12,f14,f3,f20,f62,f6,f104,f105,f184"
 
 // GetSectorList 获取东方财富行业板块行情列表。
 // 返回全量板块（约 86 个行业 + 概念更多），包含涨跌幅、成交额、涨停家数、主力净流入等。
@@ -1437,6 +1441,8 @@ func parseSectorList(body []byte) ([]SectorInfo, error) {
 			ChangePct:  cp,
 			Amount:     item.Amount,
 			NetInflow:  item.NetInflow,
+			Turnover:   item.Turnover,
+			FlowPctBps: item.FlowPctBps,
 			LimitupCnt: item.LimitupCnt,
 			VolumeRank: item.VolumeRank,
 		})

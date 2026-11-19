@@ -67,3 +67,70 @@ func TestFlowFactorDailyNaNAbstain(t *testing.T) {
 		t.Fatalf("非 NaN 应保留，实际 %+v", r.RMa5)
 	}
 }
+
+// TestTwoWritePoesDontClobber §FLOW-MONEY：资金流四列专用写口与量比三列专用写口互不覆盖。
+// 先写量比→再写资金流→量比仍在；再反向一次。全字段 Upsert 若被误用会互相盖 NULL（方案 B 红线）。
+func TestTwoWritePoesDontClobber(t *testing.T) {
+	db := testDB(t)
+	day := "2026-11-19"
+	rY, rM, vDelta := 1.3, 1.1, 1.0
+	if err := db.UpsertFlowVolumeOnly(FlowFactorDailyRow{
+		TradeDate: day, RYest: &rY, RMa5: &rM, VolSurgeDelta: &vDelta, Source: "index_em:000001.SH_intraday",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mPct, mDelta := 0.8, 0.5
+	if err := db.UpsertFlowMoneyOnly(FlowFactorDailyRow{
+		TradeDate: day, MarketFlowPct: &mPct, FlowMarketDelta: &mDelta, Source: "eastmoney_fflow",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := db.GetFlowFactorDaily(day)
+	if err != nil || row == nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if row.RYest == nil || *row.RYest != rY || row.VolSurgeDelta == nil || *row.VolSurgeDelta != vDelta {
+		t.Fatalf("资金流写口不得盖量比三列, got %+v", row)
+	}
+	if row.FlowMarketDelta == nil || *row.FlowMarketDelta != mDelta {
+		t.Fatalf("资金流列应已写入, got %+v", row)
+	}
+	// 反向：再写量比，资金流列仍在。
+	rY2 := 1.4
+	if err := db.UpsertFlowVolumeOnly(FlowFactorDailyRow{TradeDate: day, RYest: &rY2}); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = db.GetFlowFactorDaily(day)
+	if row.FlowMarketDelta == nil || *row.FlowMarketDelta != mDelta {
+		t.Fatalf("量比写口不得盖资金流列, got %+v", row)
+	}
+}
+
+// TestSectorFlowDailyRoundtrip §FLOW-MONEY 板块表：UPSERT 幂等 + 读回一致。
+func TestSectorFlowDailyRoundtrip(t *testing.T) {
+	db := testDB(t)
+	day, sector := "2026-11-19", "航空机场"
+	if err := db.UpsertSectorFlowDaily(SectorFlowDailyRow{
+		TradeDate: day, Sector: sector, NetInflow: 79545088, Amount: 3299859059, Delta: 0.7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := db.GetSectorFlowDaily(day, sector)
+	if err != nil || row == nil || row.Delta != 0.7 || row.Amount != 3299859059 {
+		t.Fatalf("板块读数应一致, got %+v err=%v", row, err)
+	}
+	// 覆盖写（同日同板块）幂等更新。
+	if err := db.UpsertSectorFlowDaily(SectorFlowDailyRow{
+		TradeDate: day, Sector: sector, NetInflow: 1, Amount: 10, Delta: -0.2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = db.GetSectorFlowDaily(day, sector)
+	if row == nil || row.Delta != -0.2 {
+		t.Fatalf("覆盖写应生效, got %+v", row)
+	}
+	// 无行 → (nil, nil)。
+	if row, err := db.GetSectorFlowDaily(day, "不存在板块"); err != nil || row != nil {
+		t.Fatalf("无行应 (nil,nil), got %+v err=%v", row, err)
+	}
+}

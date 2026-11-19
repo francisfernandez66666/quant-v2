@@ -599,6 +599,8 @@ func (m *MarketAPI) sinaIndexAmount(code string, count int) ([]IndexAmountDay, e
 	if err != nil {
 		return nil, fmt.Errorf("sina index kline request: %v", err)
 	}
+	// 与个股腿同一套反爬口径：新浪缺 UA/Referer 时回的是空体（不是 403），
+	// 那样会被判成"没数据"，把"被限流"误读成"指数没行情"。
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://finance.sina.com.cn")
 	resp, err := m.client.Do(req)
@@ -614,6 +616,8 @@ func (m *MarketAPI) sinaIndexAmount(code string, count int) ([]IndexAmountDay, e
 	if err != nil {
 		return nil, err
 	}
+	// 逐根转成量能序列：字段名仍叫 Amount，但**值来自 volume**（同源相对值口径，
+	// 量比是同一序列内部相除，与东财 amount 元那条不混用）。
 	out := make([]IndexAmountDay, 0, len(klines))
 	for _, k := range klines {
 		// 指数日 K 新浪只给 volume（股），amount=0；用 volume 作量能标量。

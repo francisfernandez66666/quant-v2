@@ -447,6 +447,18 @@ func (d *DB) migrate() error {
 			source TEXT DEFAULT '',
 			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 		)`,
+		// §FLOW-MONEY 板块日级资金流（2026-11-19，云端实现）：板块是逐票维度的信号
+		// （个股按所属行业查本表取 delta 注入 Signal.Meta），主键 (trade_date, sector)。
+		// sector 存东财行业板块名（与 GetStockIndustry 返回同串）；delta∈[-1,1] 缺值 NULL 弃权。
+		`CREATE TABLE IF NOT EXISTS sector_flow_daily (
+			trade_date TEXT NOT NULL,
+			sector TEXT NOT NULL,
+			net_inflow REAL,
+			amount REAL,
+			delta REAL,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+			PRIMARY KEY (trade_date, sector)
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_state ON research_tasks(status, priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_chain ON research_tasks(chain_day)`,
 		// 研究窗口级断点（二期）：discover-factors 各阶段按窗口缓存装配产物（IC 行等），

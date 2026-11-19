@@ -137,8 +137,23 @@ type Engine struct {
 	// 可注入的指数量额序列源（nil→marketAPI.IndexAmountSeries）；单测注入桩数据离线跑通。
 	// today=北京今日（YYYY-MM-DD）：取数层据此把"末根非今日"的断更源判失败、继续降级。
 	indexAmountSeriesFn func(n int, today string) ([]data.IndexAmountDay, string, error)
-	holidayDay          string // 节前窗口读数缓存交易日
-	holidayProbe        data.HolidayWindowProbe
+	// §FLOW-MONEY 资金流腿缓存（60s TTL，2026-11-19 云端实现）：大盘 delta 全局（写
+	// flow_factor_daily 走 Regime），板块 delta 逐票（内存 map 按行业名查，写 sector_flow_daily 留痕）。
+	flowMoneyAt    time.Time          // 上次资金流取数时刻（TTL 判据）
+	flowMoneyDay   string             // flowMoneyDelta 所属北京日（跨日重取）
+	flowMoneyMu    sync.RWMutex       // 资金流缓存锁
+	sectorDeltaDay string             // sectorDeltaMap 所属北京日（跨日作废）
+	sectorDeltaMap map[string]float64 // 板块名 → 当日资金流 delta∈[-1,1]（缺=该板块弃权）
+	// 可注入的资金流取数缝（nil→marketAPI 同名方法）；单测注入桩数据离线跑通。
+	indexMoneyFlowFn func() (*data.FlowDay, error)
+	sectorListFn     func() ([]data.SectorInfo, error)
+	// §FLOW-MONEY 资金路选 A（2026-11-19 owner 裁决）：广州对东财全族在 TLS 层被 RST，
+	// 盒子可达 ⇒ 优先经盒子 /flow/money 中继取数；未装配或中继失败才落回直连腿。
+	// 中继优先的理由不只是"能连上"：它带 TTL 缓存，能把"每轮给几百只票各取一次"的风暴
+	// 挡在盒子那一层，而不是原样搬到广州自己打东财（那样照样被 RST）。
+	flowProxy    *data.FlowProxy
+	holidayDay   string // 节前窗口读数缓存交易日
+	holidayProbe data.HolidayWindowProbe
 	// regimeReadoutDay §DYN-SIZE 每日 shadow 读数去重（YYYYMMDD，每日一行）。
 	regimeReadoutDay string
 	// riskPoolReadoutDay §C6 跌停/炸板池影子读数去重（YYYYMMDD，每日一行）。
@@ -847,6 +862,9 @@ func New(
 			log.Printf("[engine] 裁定留痕落盘绑定失败（降级纯内存环）: %v", err)
 		}
 	}
+	// §FLOW-MONEY（2026-11-19）：逐票板块资金流 delta 注入缝——个股按行业名查引擎的当日板块
+	// 缓存（fillFlowMoney 60s TTL 刷新）。板块腿是逐票维度，大盘/量比两腿走 Regime 全局值。
+	e.sigCtl.SetSectorDeltaFn(e.sectorDeltaFor)
 	e.syncMessages(nil, nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
 	// English: on startup, backfill the last persisted 8a/8b scores and the day's pinned signals so the
@@ -1302,8 +1320,19 @@ func (e *Engine) SetD1Store(d1Store *store.DB) {
 	e.mu.Unlock()
 }
 
-// QMTEnabled 实盘链路是否启用（qmt.enabled 热加载）。
-// English: QMTEnabled reports whether the live-trading chain is on (qmt.enabled hot-reloaded).
+// SetFlowProxy 注入盒子资金流中继客户端（§FLOW-MONEY 资金路选 A；nil＝不装配，走直连腿）。
+//
+// 为什么装配期一次注入、运行期只读：这条腿的唯一用途是"取数"，没有任何账号级差异
+// （secid 与板块列表全市场同一份），所以不需要逐账号构建，也不需要热更——地址与钥匙
+// 只在启动时读一次，与 feed 的装配姿势一致（两处必须同源，见 feedEndpoint）。
+// English: injects the box-side flow relay client; nil keeps the legacy direct EastMoney leg.
+func (e *Engine) SetFlowProxy(p *data.FlowProxy) {
+	e.mu.Lock()
+	e.flowProxy = p
+	e.mu.Unlock()
+}
+
+// QMTEnabled 实盘链路是否启用（qmt.enabled 热加载）。// English: QMTEnabled reports whether the live-trading chain is on (qmt.enabled hot-reloaded).
 func (e *Engine) QMTEnabled() bool {
 	e.mu.RLock()
 	c := e.qmtCtrl
@@ -7139,7 +7168,10 @@ func (e *Engine) fillIndexReadings(r *signalctl.Regime, now time.Time) {
 // 两块数据源互不覆盖（owner 裁决③"取数分两块，云端为主"）：
 //   - 量比腿：云端东财指数日 K（上证 1.000001 主、沪深300 1.000300 兜底），当日累计额
 //     按已流逝交易分钟折算全天 → 双比值 → 量态 → delta；盘中随累计量刷新，30s TTL 重取。
-//   - 资金流腿：flow_factor_daily 当日行的四列（探针/QMT/云端资金流回填的权威源），本函数只读不改。
+//   - 资金流腿（§FLOW-MONEY 云端实现，60s TTL）：大盘取东财 fflow（secid=1.000001）当日累计
+//     主力净额 ÷ 当日成交额 → delta，写 flow_factor_daily 四列（UpsertFlowMoneyOnly，不盖量比三列）；
+//     板块逐票——GetSectorList 的净流入/成交额 → 各板块 delta，写 sector_flow_daily + 内存缓存，
+//     逐票按行业名经 Controller.SetSectorDeltaFn 注入 Signal.Meta。
 //   - 任一块缺值 → 对应字段 NaN 弃权（四象限/blend/硬闸 fail-open，零行为变更）。
 //
 // fail-closed：指数日 K 取数失败、最后一根非北京今日（断更）、盘前（折算会放大 240 倍）、
@@ -7149,6 +7181,10 @@ func (e *Engine) fillIndexReadings(r *signalctl.Regime, now time.Time) {
 func (e *Engine) fillFlowReadings(r *signalctl.Regime, now time.Time) {
 	today := cntime.DayOf(now)
 	row := &store.FlowFactorDailyRow{TradeDate: today}
+
+	// §FLOW-MONEY 资金流腿：60s TTL 到期则取东财 fflow 实时值写库（大盘进 flow_factor_daily、
+	// 板块进 sector_flow_daily+内存缓存），再读当日行。盘前/取数失败自动弃权。
+	e.fillFlowMoney(now)
 
 	// 资金流腿：读当日行（有则取四列；读失败不动，保持 NaN 弃权）。
 	if e.d1Store != nil {
@@ -7241,6 +7277,193 @@ func (e *Engine) seedFlowVolume(now time.Time) *store.FlowFactorDailyRow {
 		VolSurgeDelta: &delta,
 		Source:        src,
 	}
+}
+
+// amountSeriesFnOrDefault 量能序列取数缝兜底：注入缝优先，nil 且 marketAPI 在位时用真源。
+// 测试注入桩时 marketAPI 为 nil 也安全（返回 nil，调用方按弃权处理）。
+func (e *Engine) amountSeriesFnOrDefault() func(n int, today string) ([]data.IndexAmountDay, string, error) {
+	if e.indexAmountSeriesFn != nil {
+		return e.indexAmountSeriesFn
+	}
+	if e.marketAPI != nil {
+		return e.marketAPI.IndexAmountSeries
+	}
+	return nil
+}
+
+// flowMoneyTTL 资金流腿盘中取数缓存 TTL（60s：fflow 分时与板块 clist 实时，无需更频）。
+const flowMoneyTTL = 60 * time.Second
+
+// fillFlowMoney §FLOW-MONEY 资金流腿刷新（2026-11-19 云端实现，owner 裁决：大盘+逐票板块，60s TTL）。
+//
+//   - 大盘：IndexMoneyFlowToday（fflow secid=1.000001 klt=1 末根=当日累计主力净额，元，**行日期必须
+//     =北京今日**——盘前/断更弃权）÷ 当日成交额（IndexAmountSeries 末根，同日同口径）→ FlowPctToDelta
+//     → UpsertFlowMoneyOnly（只写资金流四列，不盖量比三列）。
+//   - 板块：GetSectorList（clist f62 净流入 + f6 成交额，东财自归一 f184 交叉校验）→ 逐板块
+//     FlowPctToDelta → UpsertSectorFlowDaily 留痕 + 内存 map[name]delta 供逐票注入。
+//   - 全链 fail-closed：任一取数失败/日期不符 → 对应腿本轮弃权（不写库不清缓存），零行为变更。
+//
+// English: refresh the money-flow legs on a 60s TTL — index flow into flow_factor_daily (global),
+// sector flows into sector_flow_daily + an in-memory map for per-stock injection; abstain on any failure.
+func (e *Engine) fillFlowMoney(now time.Time) {
+	e.mu.RLock()
+	proxy := e.flowProxy
+	e.mu.RUnlock()
+	// marketAPI、两条取数缝与中继全空才跳过（测试注入桩时 marketAPI 为 nil 也必须能跑）。
+	if e.marketAPI == nil && e.indexMoneyFlowFn == nil && e.sectorListFn == nil && proxy == nil {
+		return
+	}
+	today := cntime.DayOf(now)
+	e.flowMoneyMu.RLock()
+	at, day := e.flowMoneyAt, e.flowMoneyDay
+	e.flowMoneyMu.RUnlock()
+	if day == today && now.Sub(at) < flowMoneyTTL {
+		return
+	}
+
+	// ① 大盘腿：当日累计主力净额 ÷ 当日成交额（同日同口径，缺任一即弃权）。
+	// 取数优先级：单测注入缝 → 盒子中继（资金路选 A）→ 直连东财。中继失败时**必须**
+	// 落回直连腿：广州对东财的 RST 是间歇性的（同日 ulist.np 成功过一次），一次失败
+	// 就整天弃权等于把间歇抖动放大成结构性缺数。
+	moneyFlowFn := e.indexMoneyFlowFn
+	if moneyFlowFn == nil {
+		direct := func() (*data.FlowDay, error) {
+			if e.marketAPI == nil {
+				return nil, fmt.Errorf("no market api")
+			}
+			return e.marketAPI.IndexMoneyFlowToday()
+		}
+		switch {
+		case proxy != nil && e.marketAPI != nil:
+			moneyFlowFn = func() (*data.FlowDay, error) {
+				fd, err := proxy.IndexMoneyFlowToday()
+				if err == nil && fd != nil {
+					return fd, nil
+				}
+				e.flowAlertOnce("flowproxy|index", func() {
+					log.Printf("[engine] §FLOW-MONEY 盒子中继大盘取数失败（落回直连腿）: %v", err)
+				})
+				return direct()
+			}
+		case proxy != nil:
+			moneyFlowFn = proxy.IndexMoneyFlowToday
+		default:
+			moneyFlowFn = direct
+		}
+	}
+	var mktPct, mktDelta *float64
+	if fd, err := moneyFlowFn(); err == nil && fd != nil {
+		if len(fd.Date) < 10 || fd.Date[:10] != today {
+			log.Printf("[engine] §FLOW-MONEY 大盘 fflow 日期非今日（%s），弃权", fd.Date)
+		} else if amtFn := e.amountSeriesFnOrDefault(); amtFn != nil {
+			if series, _, serr := amtFn(2, today); serr == nil && len(series) >= 2 {
+				amt := series[len(series)-1].Amount
+				d := signalctl.FlowPctToDelta(fd.MainNet, amt)
+				if !math.IsNaN(d) {
+					pct := fd.MainNet / amt * 100
+					mktPct, mktDelta = &pct, &d
+				}
+			}
+		}
+	}
+
+	// ② 板块腿：全市场行业板块净流入/成交额 → delta；单次遍历同时进内存缓存与留痕。
+	// 无成交/无净流入读数的板块 → 弃权（不进缓存不写库）；写库失败只打日志不影响消费面（内存为准）。
+	// 取数优先级同上：注入缝 → 盒子中继 → 直连东财（中继失败必须落回直连，理由同 ①）。
+	sectorFn := e.sectorListFn
+	if sectorFn == nil {
+		directSectors := func() ([]data.SectorInfo, error) {
+			if e.marketAPI == nil {
+				return nil, fmt.Errorf("no market api")
+			}
+			return e.marketAPI.GetSectorList()
+		}
+		switch {
+		case proxy != nil && e.marketAPI != nil:
+			sectorFn = func() ([]data.SectorInfo, error) {
+				list, err := proxy.SectorList("")
+				if err == nil && len(list) > 0 {
+					return list, nil
+				}
+				e.flowAlertOnce("flowproxy|sector", func() {
+					log.Printf("[engine] §FLOW-MONEY 盒子中继板块列表失败（落回直连腿）: %v", err)
+				})
+				return directSectors()
+			}
+		case proxy != nil:
+			sectorFn = func() ([]data.SectorInfo, error) { return proxy.SectorList("") }
+		default:
+			sectorFn = directSectors
+		}
+	}
+	secMap := map[string]float64{}
+	if sectors, err := sectorFn(); err == nil && len(sectors) > 0 {
+		for _, s := range sectors {
+			if s.Name == "" || s.Turnover <= 0 || s.NetInflow == 0 {
+				continue
+			}
+			d := signalctl.FlowPctToDelta(s.NetInflow, s.Turnover)
+			if math.IsNaN(d) {
+				continue
+			}
+			secMap[s.Name] = d
+			if e.d1Store != nil {
+				if uerr := e.d1Store.UpsertSectorFlowDaily(store.SectorFlowDailyRow{
+					TradeDate: today, Sector: s.Name, NetInflow: s.NetInflow, Amount: s.Turnover, Delta: d,
+				}); uerr != nil {
+					log.Printf("[engine] §FLOW-MONEY 板块写库失败 %s: %v", s.Name, uerr)
+				}
+			}
+		}
+	}
+
+	// ③ 大盘 delta 写库（资金流四列专用写口；量比三列不受影响）。
+	if e.d1Store != nil && (mktDelta != nil) {
+		if uerr := e.d1Store.UpsertFlowMoneyOnly(store.FlowFactorDailyRow{
+			TradeDate: today, MarketFlowPct: mktPct, FlowMarketDelta: mktDelta,
+			Source: "eastmoney_fflow",
+		}); uerr != nil {
+			log.Printf("[engine] §FLOW-MONEY 大盘写库失败: %v", uerr)
+		}
+	}
+
+	e.flowMoneyMu.Lock()
+	e.flowMoneyAt, e.flowMoneyDay = now, today
+	e.sectorDeltaDay, e.sectorDeltaMap = today, secMap
+	e.flowMoneyMu.Unlock()
+}
+
+// sectorDeltaFor 逐票板块 delta 解析（注入 Controller.sectorDeltaFn）：
+// 个股 → 行业名（GetStockIndustry，自带当日缓存）→ 当日板块 delta（内存 map，跨日作废）。
+// 任何一环缺失 → (0,false) 弃权（blend 缺项 renormalize，绝不猜 0）。
+func (e *Engine) sectorDeltaFor(code string) (float64, bool) {
+	if code == "" {
+		return 0, false
+	}
+	// 行业名解析复用 §DYN-SIZE-v3 的既有 industryFn 缝（非空优先，nil→marketAPI.GetStockIndustry）。
+	industryFn := e.industryFn
+	if industryFn == nil && e.marketAPI != nil {
+		industryFn = e.marketAPI.GetStockIndustry
+	}
+	if industryFn == nil {
+		return 0, false
+	}
+	name := industryFn(code)
+	if name == "" {
+		return 0, false
+	}
+	today := cntime.DayOf(time.Now())
+	e.flowMoneyMu.RLock()
+	day, m := e.sectorDeltaDay, e.sectorDeltaMap
+	e.flowMoneyMu.RUnlock()
+	if day != today || m == nil {
+		return 0, false
+	}
+	d, ok := m[name]
+	if !ok || math.IsNaN(d) {
+		return 0, false
+	}
+	return d, true
 }
 
 // applyFlowRow 把一行日级读数填进 Regime；NULL→NaN（弃权口径与字段注释一致）。

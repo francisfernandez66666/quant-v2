@@ -107,6 +107,8 @@ from ids import Idempotency  # noqa: E402
 from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
 from handler import ReportHandler, periodic_reconcile, is_active_trading_session  # noqa: E402
 from quote_feed import QuoteFeed  # noqa: E402
+# §FLOW-MONEY（2026-11-19）：决策机对东财全族不可达、盒子可达 ⇒ 由本机代取资金流。
+import flow_proxy  # noqa: E402
 
 # 模块级日志器
 log = logging.getLogger("qmt_gateway")
@@ -202,6 +204,9 @@ CONTRACT_IGNORED_FIELDS = {
     # §DYN-T（批7/W8-A）同样是"只随单留痕"的标记：日内回转的净额语义在首尔侧 risk.Gate 完成，
     # 网关不复算也不消费。声明集必须与 golden 同步（三点契约），漏一处就是双红。
     "intraday_t",
+    # §QUADRANT-GATE（2026-11-19 G4）：四象限判定与理由只随单留痕供复盘归因，
+    # 真正的拦截在首尔侧 risk.Gate（quadrant_block）；网关读取它等于把同一判据复算第二遍。
+    "quadrant_decision", "quadrant_reason",
 }
 
 # §SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）下单方向白名单：网关接单的唯一合法取值集。
@@ -1438,6 +1443,12 @@ class Gateway:
             # English: /state is a read-only face and must stay answerable after the broker
             # disconnects at close; capital actions remain gated below.
             return self._do_state()
+        if path == "/flow/money" and method == "GET":
+            # §FLOW-MONEY（2026-11-19，owner 裁决"资金路选 A"）：资金流只读中继。
+            # 放在连接闸之前与 /quotes、/orders、/state 同一姿势——它是纯数据面，
+            # 而最需要它的两个时段（盘前取历史、盘后取当日汇总）恰好都是 broker 未连的时段。
+            # 只读、不放行任何资本动作；上游与参数白名单在 flow_proxy 里写死。
+            return self._do_flow_money(request_handler)
         # §LEG-CONTRACT-GATE：拒单点只挡这两条资本动作，且**排在连接闸之前**——
         # 版本旧时先回"通道没连"会把处置方向带跑（去查链路），而真正的答案是"升版后重启"。
         # 拒的是 /order 与 /cancel：/health、/state、/orders、/settlement、/quotes 一律照常应答。
@@ -1453,6 +1464,57 @@ class Gateway:
         if path == "/cancel" and method == "POST":
             return self._do_cancel(body, getattr(request_handler, "_caller_uid", ""))
         return 404, {"ok": False, "err": "not found"}
+
+    def _do_flow_money(self, request_handler=None):
+        """§FLOW-MONEY 资金流只读中继：GET /flow/money?kind=fflow|clist&...
+
+        kind=fflow&secid=1.000001&klt=1|101&lmt=N → 东财 fflow（主力净额，元）
+        kind=clist&fs=m:90+t:2&fields=f12,f14,f6,f62&pn=1&pz=500 → 东财板块列表
+
+        为什么由盒子代取：广州对东财全族在 TLS 层被 RST（2026-11-19 实测，四条腿全断），
+        盒子实测可达。回传的是**上游原始 body**（upstream_body 字符串），广州侧复用既有
+        解析器（parseMoneyFlowHistory / parseSectorList），两边不会各长一份形状。
+        参数非法 → 400；上游不可用 → 502。绝不返回半截数据，也绝不把 0 当读数。
+        English: read-only fund-flow relay; the upstream body is passed through verbatim.
+        """
+        query = ""
+        if request_handler is not None:
+            query = urlparse(getattr(request_handler, "path", "") or "").query
+        q = parse_qs(query)
+
+        def one(name, default=""):
+            values = q.get(name)
+            return (values[0] if values else default).strip()
+
+        def as_int(name, default):
+            raw = one(name, str(default))
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                raise flow_proxy.FlowProxyError("bad %s: %r" % (name, raw))
+
+        kind = one("kind")
+        try:
+            if kind == "fflow":
+                payload = flow_proxy.relay_fflow(
+                    one("secid"), as_int("klt", 101), as_int("lmt", 5))
+            elif kind == "clist":
+                # fs 的白名单值是 `m:90+t:2`——`+` 在查询串里按 form 编码会被解成空格
+                # （手工 curl 就踩这个：parse_qs 给出 `m:90 t:2`，白名单直接拒）。
+                # fs 语义里没有真正的空格，所以把空格还原成 `+`，两种写法都收。
+                payload = flow_proxy.relay_clist(
+                    one("fs", "m:90+t:2").replace(" ", "+"),
+                    one("fields", "f12,f14,f6,f62"),
+                    as_int("pn", 1), as_int("pz", 500))
+            else:
+                raise flow_proxy.FlowProxyError("unknown kind: %r" % (kind,))
+        except flow_proxy.FlowProxyError as exc:
+            return 400, {"ok": False, "err": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — 上游抖动不能把网关打成 500
+            return 502, {"ok": False, "err": "upstream unavailable: %s" % exc}
+        if not payload.get("ok"):
+            return 502, payload
+        return 200, payload
 
     def _do_quotes(self, request_handler=None):
         """处理 GET /quotes?codes=600519.SH,600000.SH：Level-1 tick 只读查询（§ENH-5 批E）。

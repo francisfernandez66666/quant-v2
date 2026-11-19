@@ -85,6 +85,10 @@ type EngineOptions struct {
 	// English: §WS-G shadow-executor switch — when true the controller uses ShadowExecutor (decisions
 	// persisted to shadow_orders, echoed as accepted, never really placed) for full staging runs.
 	ShadowExec bool // 影子执行器（staging）
+	// FlowProxy §FLOW-MONEY 资金路选 A（2026-11-19 owner 裁决）：广州对东财全族 TLS 层被 RST，
+	// 盒子可达 ⇒ 资金流优先经盒子 /flow/money 中继取数，失败才落回直连腿。nil＝不装配。
+	// English: optional box-side flow relay; nil keeps the direct EastMoney leg.
+	FlowProxy *data.FlowProxy
 }
 
 // InitStage 引擎初始化进度阶段。
@@ -1235,6 +1239,8 @@ func (r *Registry) build(userID string) *Engine {
 		// so pushRealAdvice read 0 positions and the live SL/TP/auto-sell/M8 chain silently stopped.
 		e.SetQMT(ctrl, opts.RealStore)
 		e.SetD1Store(opts.D1Store)
+		// §FLOW-MONEY 资金路选 A：资金流优先走盒子中继（广州对东财被 RST）；nil 时走直连腿。
+		e.SetFlowProxy(opts.FlowProxy)
 		// §WMQ-1：共享引擎的 QMT 热同步源固定为本次装配账号（首建/管理员成员，与 FIX#11
 		// 契约的控制器归属一致）。旧实现缺此注入：共享引擎 userID=="" 时 syncAccountConfig
 		// 整体跳过，QueueConfigUpdate 永不入队、ApplyPendingConfig 永不消费、executor

@@ -25109,9 +25109,155 @@ fi
 
 # ⑥ 行为腿：量比纯函数 + 装配接线 + store 写口。
 CNT226=$((CNT226 + 1))
-G226=$( go test ./internal/data ./internal/signalctl ./internal/engine ./internal/store -count=1 -run 'TestIndexAmountSeries|TestIndexAmountSeriesStaleSourceFailover|TestVolRatiosIntraday|TestFillFlowReadings|TestFlowFactorDaily' 2>&1 || true )
-grep_q '^ok' G226 || { echo "--- FAIL: §226 行为腿未过：$(printf '%s\n' "$G226" | tail -10)"; B226_FAILED=1; }
+# 判据用退出码：多包 go test 里只要有一包通过就会打 "ok   ..."，按 '^ok' 判会把
+# "某包 FAIL"读成绿（§227 塞雷时实测同形，2026-11-19 同批修正）。
+G226_RC=0
+G226=$( go test ./internal/data ./internal/signalctl ./internal/engine ./internal/store -count=1 -run 'TestIndexAmountSeries|TestIndexAmountSeriesStaleSourceFailover|TestVolRatiosIntraday|TestFillFlowReadings|TestFlowFactorDaily' 2>&1 ) || G226_RC=$?
+if [ "${G226_RC}" != "0" ]; then
+	echo "--- FAIL: §226 行为腿未过（rc=${G226_RC}）：$(printf '%s\n' "$G226" | tail -10)"
+	B226_FAILED=1
+fi
 
 [ "$B226_FAILED" = "0" ] || exit 1
 echo "ok - §226 §FLOW-VOLUME-B 锁通过（三源降级东财主/push2his镜像/新浪+断更即换源+每源上证主沪深300兜底+盘中折算 fail-closed+实时腿负锁+两块写口隔离+断更弃权+方案A负锁+行为腿，累计判定点 ${CNT226}）"
+echo ""
+
+echo "==> 227 §FLOW-MONEY（资金流腿云端实现：大盘 fflow 全局 + 板块逐票，60s TTL）..."
+B227_FAILED=0
+fail227() {
+	echo "--- FAIL: §227 $*"
+	FAIL=1
+	B227_FAILED=1
+}
+CNT227=0
+FM227=internal/data/flow_money.go
+MK227=internal/data/market.go
+FF227=internal/signalctl/flow_freshness.go
+SG227=internal/signalctl/signalctl.go
+FFDF227=internal/store/flow_factor_daily.go
+ST227=internal/store/store.go
+EN227=internal/engine/engine.go
+
+# ① data：大盘/板块 fflow 取数，secid 显式（绝不裸码=平安银行）。
+CNT227=$((CNT227 + 1))
+grep -qF 'func (m *MarketAPI) MarketMoneyFlow(secid string, klt int, n int) ([]FlowDay, error) {' "$FM227" || fail227 "缺通用 fflow 取数函数"
+grep -qF 'indexSecID("000001")' "$FM227" || fail227 "大盘腿未用指数 secid（1.000001）"
+grep -qF '"90."+bkCode' "$FM227" || fail227 "板块腿 secid 前缀必须是 90."
+grep -qF 'func (m *MarketAPI) IndexMoneyFlowToday() (*FlowDay, error) {' "$FM227" || fail227 "缺大盘当日 fflow 函数"
+grep -qF 'func (m *MarketAPI) IndexMoneyFlowHistory(n int) ([]FlowDay, error) {' "$FM227" || fail227 "缺大盘 fflow 历史函数"
+
+# ② 板块成交额分母（f6）与净流入（f62）在 SectorInfo 上可解析。
+CNT227=$((CNT227 + 1))
+grep -qF 'Turnover   float64 `json:"f6"`' "$MK227" || fail227 "板块成交额 f6 未解析（归一分母缺失）"
+grep -qF 'Turnover float64 `json:"turnover,omitempty"`' internal/data/types.go || fail227 "SectorInfo 缺 Turnover"
+grep -qF 'f6,f104,f105,f184' "$MK227" || fail227 "板块列表 fields 未含 f6"
+
+# ③ 归一：成交额口径 3% 满档；delta∈[-1,1]；NaN 弃权。
+CNT227=$((CNT227 + 1))
+grep -qF 'func FlowPctToDelta(netInflow, amount float64) float64 {' "$FF227" || fail227 "缺资金流归一纯函数"
+grep -qF 'flowFullScalePct = 3.0' "$FF227" || fail227 "满档阈值不是 3%（与 flowBandOf strong_in 同基准）"
+
+# ④ store：资金流四列专用写口（负锁：不得更新量比三列）+ 板块表。
+CNT227=$((CNT227 + 1))
+grep -qF 'func (d *DB) UpsertFlowMoneyOnly(r FlowFactorDailyRow) error {' "$FFDF227" || fail227 "缺资金流专用写口"
+MONEYBLOCK=$( sed -n '/func (d \*DB) UpsertFlowMoneyOnly/,/^}/p' "$FFDF227" )
+if printf '%s\n' "$MONEYBLOCK" | grep -qE 'r_yest=excluded|r_ma5=excluded|vol_surge_delta=excluded'; then
+	fail227 "资金流写口不得更新量比三列（会盖掉量比腿的值）"
+fi
+grep -qF 'CREATE TABLE IF NOT EXISTS sector_flow_daily (' "$ST227" || fail227 "缺 sector_flow_daily 表"
+grep -qF 'PRIMARY KEY (trade_date, sector)' "$ST227" || fail227 "板块表主键不是 (trade_date, sector)"
+grep -qF 'func (d *DB) UpsertSectorFlowDaily(r SectorFlowDailyRow) error {' "$FFDF227" || fail227 "缺板块写口"
+
+# ⑤ signalctl：逐票板块注入缝 + applySizing 接线。
+CNT227=$((CNT227 + 1))
+grep -qF 'func (c *Controller) SetSectorDeltaFn(fn func(code string) (float64, bool)) {' "$SG227" || fail227 "缺板块注入缝 setter"
+grep -qF 'if fn != nil && sig.Code != "" {' "$SG227" || fail227 "applySizing 未接线板块注入"
+grep -qF 'sig = withMetaDelta(sig, MetaFlowSectorDelta, v)' "$SG227" || fail227 "板块 delta 未注入 MetaFlowSectorDelta"
+
+# ⑥ engine：60s TTL + fflow 日期=今日校验 + 缝 + 注入接线。
+CNT227=$((CNT227 + 1))
+grep -qF 'flowMoneyTTL = 60 * time.Second' "$EN227" || fail227 "资金流腿无 60s TTL"
+grep -qF 'fd.Date[:10] != today' "$EN227" || fail227 "大盘 fflow 未校验行日期=今日（盘前/断更弃权）"
+grep -qF 'e.sigCtl.SetSectorDeltaFn(e.sectorDeltaFor)' "$EN227" || fail227 "逐票板块注入未接线到 Controller"
+grep -qF 'Source: "eastmoney_fflow"' "$EN227" || fail227 "大盘腿 source 未如实标记"
+
+# ⑦ 盒子中继（资金路选 A）：上游 host/path 写死、参数逐项校验、今日腿分时主路+日K兜底、TTL 缓存。
+CNT227=$((CNT227 + 1))
+FP227=qmt_gateway/flow_proxy.py
+GW227=qmt_gateway/gateway.py
+grep -qF '_EM_FFLOW_INTRADAY = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"' "$FP227" || fail227 "缺当日分时上游（指数/板块都可用，今日腿主路）"
+grep -qF '_EM_FFLOW_DAILY = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"' "$FP227" || fail227 "缺逐日历史上游（历史腿）"
+grep -qF '_EM_CLIST = "https://push2.eastmoney.com/api/qt/clist/get"' "$FP227" || fail227 "缺板块列表上游"
+grep -qF 'def valid_secid(value):' "$FP227" || fail227 "缺 secid 白名单校验（secid 直拼 URL）"
+grep -qF '_CLIST_FS = ("m:90+t:2", "m:90+t:3")' "$FP227" || fail227 "clist fs 未收敛成白名单"
+grep -qF 'if klt == 1:' "$FP227" || fail227 "fflow 未按 klt 分流（1=当日分时 / 101=逐日历史）"
+grep -qF 'fallback_url = build_fflow_daily_url(secid, 101, 2)' "$FP227" || fail227 "今日腿缺日K兜底（盒子上 push2his 间歇断连）"
+grep -qF 'def _cached(key, ttl, producer):' "$FP227" || fail227 "缺 TTL 缓存（否则等于把上游风暴搬到盒子）"
+
+# ⑦a 负锁：白名单中继不许变成"任意 URL 出网跳板"；clist 参数面必须与生产腿逐字一致。
+CNT227=$((CNT227 + 1))
+if grep -qE 'def (build_fflow|build_clist|relay_fflow|relay_clist)_?[a-z_]*\([^)]*url' "$FP227"; then
+	fail227 "上游 URL 不得由外部传入（等于把盒子开放成出网跳板）"
+fi
+FPCODE=$( grep -v '^[[:space:]]*#' "$FP227" || true )
+if printf '%s\n' "$FPCODE" | grep -qE '[?&](fltt|invt|np)='; then
+	fail227 "clist 拼 URL 混入非生产参数（fltt/invt 让 f3/f184 差 100 倍，np=1 让 data.diff 变数组）"
+fi
+
+# ⑦b 网关路由：只读 /flow/money 必须在 broker 连接闸之前（盘前取历史、盘后取汇总都靠它）。
+CNT227=$((CNT227 + 1))
+grep -qF 'import flow_proxy' "$GW227" || fail227 "网关未 import flow_proxy"
+grep -qF 'path == "/flow/money" and method == "GET"' "$GW227" || fail227 "缺 /flow/money 只读路由"
+grep -qF 'def _do_flow_money(self, request_handler=None):' "$GW227" || fail227 "缺中继 handler"
+FLOWLN=$( grep -n 'path == "/flow/money" and method == "GET"' "$GW227" | head -1 | cut -d: -f1 || true )
+GATELN=$( grep -n 'if not self.active_broker.is_connected():' "$GW227" | head -1 | cut -d: -f1 || true )
+if [ -z "$FLOWLN" ] || [ -z "$GATELN" ] || [ "$FLOWLN" -ge "$GATELN" ]; then
+	fail227 "资金流中继路由必须排在 broker 连接闸之前（FLOW=${FLOWLN:-?} GATE=${GATELN:-?}）"
+fi
+grep -qF 'one("fs", "m:90+t:2").replace(" ", "+")' "$GW227" || fail227 "fs 提交形态未归一（parse_qs 会把 + 解成空格）"
+
+# ⑧ 决策机侧客户端：同一把在册钥匙、分页取全（拒绝半份）、今日腿 klt=1。
+CNT227=$((CNT227 + 1))
+FX227=internal/data/flow_proxy.go
+grep -qF 'func NewFlowProxy(baseURL, token string) *FlowProxy {' "$FX227" || fail227 "缺中继客户端构造器"
+grep -qF 'Authorization", "Bearer "+p.token' "$FX227" || fail227 "中继未带 Bearer（与 feed 同一把在册钥匙）"
+grep -qF 'func (p *FlowProxy) IndexMoneyFlowToday() (*FlowDay, error) {' "$FX227" || fail227 "缺大盘当日资金流（klt=1 分时末根）"
+grep -qF 'emMirrorMaxPageSize' "$FX227" || fail227 "板块分页未复用 100 页大小（上游 pz 硬顶）"
+grep -qF '绝不把部分结果当完整列表' "$FX227" || fail227 "板块分页缺「拒绝半份」判据（半截列表会静默缩小分母）"
+
+# ⑨ 装配：中继优先、失败落回直连、两侧都失败弃权；地址与钥匙与 feed 同源。
+CNT227=$((CNT227 + 1))
+grep -qF 'e.sigCtl.SetSectorDeltaFn(e.sectorDeltaFor)' "$EN227" || fail227 "逐票板块注入未接线到 Controller"
+grep -qF 'moneyFlowFn = proxy.IndexMoneyFlowToday' "$EN227" || fail227 "大盘腿未优先走盒子中继"
+grep -qF 'sectorFn = func() ([]data.SectorInfo, error) { return proxy.SectorList("") }' "$EN227" || fail227 "板块腿未优先走盒子中继"
+grep -qF '盒子中继大盘取数失败（落回直连腿）' "$EN227" || fail227 "中继失败未留痕即落回直连"
+grep -qF 'FlowProxy:          flowProxy,' cmd/quant/main.go || fail227 "main 未把中继装配进引擎"
+grep -qF 'data.NewFlowProxy(feedURL, feedToken)' cmd/quant/main.go || fail227 "中继地址/钥匙未与 feed 同源"
+
+# ⑩ 行为腿：Go 三条（客户端/偏好/落回）+ 网关 pytest（白名单/缓存/兜底/路由序）。
+CNT227=$((CNT227 + 1))
+# 判据用**退出码**：多包 go test 时只要有一个包通过就会打出 "ok   ..."，
+# 按 '^ok' 判会把"某包 FAIL"读成绿（本批塞雷当场踩到：分页截断用例红了、门禁仍绿）。
+G227_RC=0
+G227=$( go test ./internal/data ./internal/signalctl ./internal/store ./internal/engine -count=1 -run 'TestFlowPctToDelta|TestWithMetaDelta|TestApplySizingSectorDeltaInjected|TestSectorDeltaFnNilAbstains|TestTwoWritePoesDontClobber|TestSectorFlowDailyRoundtrip|TestFillFlowMoney|TestFlowProxy' 2>&1 ) || G227_RC=$?
+if [ "${G227_RC}" != "0" ]; then
+	echo "--- FAIL: §227 行为腿未过（rc=${G227_RC}）：$(printf '%s\n' "$G227" | tail -10)"
+	B227_FAILED=1
+fi
+# 判据用**退出码**而不是输出里的 "passed" 字样：pytest 失败时照样打
+# "1 failed, 12 passed"，按字样判会把红读成绿（本批塞雷当场踩到）。
+# 同时走 py_tests()：本机没有 pytest 时退回标准库 unittest，不许因缺库假失败。
+if command -v python3 >/dev/null 2>&1; then
+	GP227_RC=0
+	GP227=$( py_tests qmt_gateway/tests/test_flow_proxy.py 2>&1 ) || GP227_RC=$?
+	if [ "$GP227_RC" != "0" ]; then
+		echo "--- FAIL: §227 网关中继用例未过（rc=${GP227_RC}）：$(printf '%s\n' "$GP227" | tail -6)"
+		B227_FAILED=1
+	fi
+else
+	echo "INFO - §227 无 python3，网关中继用例未跑（这份绿不含那一段）"
+fi
+
+[ "$B227_FAILED" = "0" ] || exit 1
+echo "ok - §227 §FLOW-MONEY 锁通过（fflow secid显式+板块f6分母+3%满档归一+两写口隔离负锁+逐票注入缝+60sTTL+日期校验+盒子中继白名单/缓存/分时主路日K兜底+路由在连接闸前+客户端分页取全+中继优先失败落回直连+行为腿，累计判定点 ${CNT227}）"
 echo ""

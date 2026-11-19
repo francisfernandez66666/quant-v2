@@ -22,6 +22,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,6 +176,11 @@ type Controller struct {
 	// verdicts-YYYYMMDD.jsonl（按日自然轮转），重启经 AttachAudit 回灌当日环——
 	// 此前纯内存 512 环，quant 任何一次重启即丢"为何没成交"的拦截原因。
 	auditDir string
+	// §FLOW-MONEY（2026-11-19）逐票板块 delta 注入缝（nil=板块腿弃权，零行为变更）。
+	// 由 engine 注入：按信号个股代码查其所属行业板块的当日资金流 delta（引擎 60s TTL 缓存）。
+	// 板块是**逐票维度**的信号（各票板块不同），不能走全局 Regime——大盘腿走 Regime 全局值，
+	// 板块腿在此按票注入 Signal.Meta[MetaFlowSectorDelta]（withRegimeFlowDeltas 不覆盖已有键）。
+	sectorDeltaFn func(code string) (float64, bool)
 }
 
 // New 创建控制器（留痕环默认 512 条）。
@@ -511,6 +517,16 @@ func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Polic
 	if !cfg.EnabledOn() {
 		return false // 总开关关：零行为变更
 	}
+	// §FLOW-MONEY：逐票板块资金流 delta 注入（nil 缝=弃权；NaN=弃权；Meta 已有键不覆盖）。
+	// 大盘/量比两腿由 withRegimeFlowDeltas 从 Regime 桥接，板块腿是逐票维度在此单独注入。
+	c.mu.Lock()
+	fn := c.sectorDeltaFn
+	c.mu.Unlock()
+	if fn != nil && sig.Code != "" {
+		if v, ok := fn(sig.Code); ok && !math.IsNaN(v) {
+			sig = withMetaDelta(sig, MetaFlowSectorDelta, v)
+		}
+	}
 	res := ComputeSizingWithBlend(pol.Regime, sig)
 	// §FLOW-QUADRANT：四象限决策**无条件带出**（与 MS/SS 一条纪律），供执行层硬闸/减仓共用。
 	// 量比 NaN 时归 Neutral，零行为变更；这里算的结果与 sizingHardBlock 内部同源同判据。
@@ -639,4 +655,26 @@ func highConfThreshold(d config.DisciplineConfig) float64 {
 		return 85
 	}
 	return d.HighConfThreshold
+}
+
+// SetSectorDeltaFn §FLOW-MONEY 注入逐票板块 delta 解析器（nil=板块腿弃权）。
+// fn(code) 返回该票所属行业板块的当日资金流 delta∈[-1,1] 与是否可得；NaN 视为不可得。
+func (c *Controller) SetSectorDeltaFn(fn func(code string) (float64, bool)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sectorDeltaFn = fn
+}
+
+// withMetaDelta 拷贝 sig.Meta 并写入单个 delta 键（不覆盖已有键、不污染原 sig）。
+// English: copy-on-write single delta injection into the signal's Meta map.
+func withMetaDelta(sig combat_agent.Signal, key string, v float64) combat_agent.Signal {
+	m := make(map[string]float64, len(sig.Meta)+1)
+	for k, val := range sig.Meta {
+		m[k] = val
+	}
+	if _, ok := m[key]; !ok {
+		m[key] = v
+	}
+	sig.Meta = m
+	return sig
 }

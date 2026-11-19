@@ -151,6 +151,10 @@ type SectorInfo struct {
 	Gain2d     float64 `json:"gain_2d"`              // 两日涨幅（%）
 	EventDesc  string  `json:"event_desc,omitempty"` // 事件描述（D1 匹配结果，空时省略）
 	NetInflow  float64 `json:"net_inflow,omitempty"` // 主力净流入（东财口径，元）
+	// §FLOW-MONEY（2026-11-19）：板块当日成交额（元，f6）＝资金流归一分母；与净流入同响应同口径。
+	Turnover float64 `json:"turnover,omitempty"`
+	// FlowPctBps：主力净占比（万分比=f62/f6×10000，东财自归一）；仅作交叉校验，0=未解析按弃权。
+	FlowPctBps float64 `json:"flow_pct_bps,omitempty"`
 	// QuoteLegFailed §0925EVE-W3-J（B5）：行情腿（东财）本轮取数失败的显式标记。
 	// 背景：GetSectors 里同花顺只提供板块清单**结构**，涨跌幅/净流入/涨停数全靠东财回填；
 	// 东财腿挂掉时结构腿照常返回，这些字段全是零值——旧实现只 log 一行，零值继续往下游流，

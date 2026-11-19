@@ -7,6 +7,7 @@
 package signalctl
 
 import (
+	"math"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -108,4 +109,31 @@ func VolRatiosIntraday(now time.Time, todayAmount float64, histAmounts []float64
 		sum += v
 	}
 	return prorated / prev, prorated / (sum / 5.0), true
+}
+
+// flowFullScalePct 资金流归一满档百分比：净流入/成交额 达到 ±3% 时 delta 满档 ±1。
+// 与 flowBandOf 的 strong_in_pct=3 同基准（flow_factor.go:47-68），一套刻度两处共用。
+const flowFullScalePct = 3.0
+
+// FlowPctToDelta 资金流强度 → delta∈[-1,1]（owner 裁决：分母用**同期成交额**，规避市值口径歧义）。
+// pct = 净流入(元)/同期成交额(元)×100；delta = clamp(pct/3, -1, 1)。
+// 净流入/成交额任一非正值（取数失败/停市）→ NaN 弃权（绝不当 0 中性）。
+// English: money-flow strength to a [-1,1] delta prorated on the same-period turnover; 3% = full scale.
+func FlowPctToDelta(netInflow, amount float64) float64 {
+	if netInflow == 0 || amount <= 0 || math.IsNaN(netInflow) || math.IsNaN(amount) {
+		// netInflow==0 且 amount 正常时是"真零流入"（罕见但合法）→ 0 中性；其余 NaN 弃权。
+		if netInflow == 0 && amount > 0 && !math.IsNaN(amount) {
+			return 0
+		}
+		return math.NaN()
+	}
+	pct := netInflow / amount * 100
+	d := pct / flowFullScalePct
+	if d > 1 {
+		d = 1
+	}
+	if d < -1 {
+		d = -1
+	}
+	return d
 }

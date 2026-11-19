@@ -527,6 +527,19 @@ func run() int {
 	} else if rt.QMTFeedOn() {
 		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
 	}
+	// §FLOW-MONEY 资金路选 A（2026-11-19 owner 裁决）：广州对东财全族在 TLS 层被 RST
+	// （push2/push2his/push2delay 的 /api/qt/* 一律 Empty reply from server），盒子实测可达。
+	// 资金流因此优先经盒子 /flow/money 中继取数（同一把在册钥匙、同一个 gateway_url），
+	// 中继失败自动落回直连腿。地址与钥匙必须与 feed 同源——两处各读一份配置就会漂开。
+	var flowProxy *data.FlowProxy
+	if feedToken != "" && feedURL != "" {
+		if flowProxy = data.NewFlowProxy(feedURL, feedToken); flowProxy != nil {
+			log.Printf("[main] §FLOW-MONEY 资金流中继已装配: %s（凭据来源=%s；中继失败落回东财直连）",
+				feedURL, credFrom)
+		}
+	} else {
+		log.Printf("[main] §FLOW-MONEY 无可用网关地址/钥匙，资金流走东财直连腿（现网该腿被 RST，预计全天弃权）")
+	}
 	// §3.5 追加裁决 15：开关关着也要留痕——启动时打一份逐键状态清单，
 	// 让"这里有个功能、它没开"在日志里当场可见，而不是靠人记住这批上了哪些键。
 	logRuntimeSwitches(cfgMgr)
@@ -634,6 +647,7 @@ func run() int {
 		RealStore:          realStore,   // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
 		D1Store:            researchDB,  // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
 		ShadowExec:         isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
+		FlowProxy:          flowProxy,   // §FLOW-MONEY 资金路选 A：经盒子中继取资金流（失败落回直连）
 	})
 	srv.SetEngineRegistry(registry)
 	// §OBSERVABILITY：/api/usage 读取注册表当前 LLM 客户端的当日调用/token 用量（热更新后自动跟随）。
