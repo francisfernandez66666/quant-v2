@@ -36,7 +36,12 @@ func openAnchorForTest(t *testing.T, e *Engine, price float64, qty int, now time
 // TestAnchorBookSameDayRebuyKeepsFirstAnchor P1：同日清仓后回买，锚点不漂。
 func TestAnchorBookSameDayRebuyKeepsFirstAnchor(t *testing.T) {
 	e := partialTestEngine(t)
+	// 时间钉在**当日 10:30**：从 `time.Now()` 起步再 +1h，在 23:00 之后跑会把「同日回买」
+	// 跑成跨日（锚点理应重冻），于是同一条用例白天绿、深夜红。同类钉法见 paper_test.go 的固定锚点。
+	// English: pinned to 10:30 today — `time.Now()` + 1h crosses midnight after 23:00 and turns this
+	// same-day rebuy into a cross-day one, which would legitimately re-freeze the anchor.
 	now := time.Now()
+	now = time.Date(now.Year(), now.Month(), now.Day(), 10, 30, 0, 0, now.Location())
 	p := openAnchorForTest(t, e, 10, 1000, now)
 	firstAnchor := p.AnchorPrice
 	if firstAnchor <= 0 || firstAnchor != p.CostPrice {

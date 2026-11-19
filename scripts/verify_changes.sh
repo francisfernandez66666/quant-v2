@@ -15896,13 +15896,17 @@ BT130=internal/engine/dynbudget_b0_test.go
 # —— ① 单笔占比：单一实现点 + 调用点在位 + 旧的"基准×缩放"不得复活 ——
 grep -q 'func PerTradePct(marketScale, stockScale, lo, hi float64) float64' "$SZ130" ||
 	fail130 "signalctl.PerTradePct 不见（单笔区间的唯一实现点）：纸面与实盘会各写一份，两套口径迟早分家"
-grep -c 'signalctl\.PerTradePct(' "$EG130" | grep -q '^1$' ||
-	fail130 "engine 里 PerTradePct 的调用点不是恰好 1 处（多一处＝两个口径，少一处＝硬编码回来了）"
+grep -c 'signalctl\.PerTradePctBlend(' "$EG130" | grep -q '^1$' ||
+	fail130 "engine 里 PerTradePctBlend 的调用点不是恰好 1 处（多一处＝两个口径，少一处＝硬编码回来了）"
+# §FLOW-BLEND 起单笔占比的唯一出口是带 blend 的那个（blend=1.0 与原式逐字一致）；
+# 不带 blend 的老调用若回潮，就是绕过 §220 的后置金额合成，两套口径并存。
+[ "$(grep -c 'signalctl\.PerTradePct(' "$EG130" || true)" = "0" ] ||
+	fail130 "engine 里又出现了不带 blend 的 PerTradePct 调用（§FLOW-BLEND 之后唯一出口是 PerTradePctBlend）"
 grep -q 'Scale:             perTradePct,' "$EG130" ||
 	fail130 "ordbudget 的 Scale 不再是 eff（若写成 perTradePct * scale 就是二次计权：因子被乘两遍）"
 grep -q 'PerTradePositionMaxPct' internal/config/config.go ||
 	fail130 "配置缺 per_trade_position_max_pct（单笔上限没有配置面＝owner 改不了）"
-CNT130=$((CNT130 + 4))
+CNT130=$((CNT130 + 5))
 
 # —— ② 最小成交额闸：dynamic 下必须生效（负锁：不许再出现 !dynamicBudget 那个条件）——
 grep -q 'if minAmt := cfg.EffectiveMinOrderAmount(); minAmt > 0 && float64(qty)\*price < minAmt {' "$EG130" ||
@@ -15992,7 +15996,7 @@ rm -rf "$W130"
 
 echo "INFO - §130 覆盖面账：本段锁的是「信号仓」路径；纸面（paper）仍用固定 per_trade_position_pct（它的定权上下文里没有个股缩放通道），因此纸面单笔会小于实盘（实盘 eff 含 SS）——差异由 B5 对照实验落地时一并对齐，本批不顺手改（改纸面会把既有纸面对照读数整体挪位）。另：概念敞口闸（§C1-V2，默认 40%、影子开关沿用 nil=只留痕）本批只把它接通并加了四条行为腿，语义仍是「命中最大敞口概念检查、覆盖率<95% 弃权」。"
 [ "$B130_FAILED" = "0" ] || exit 1
-echo "ok - §130 §B0 碎单治理锁通过（静态 11 道 + 行为腿 ${B0N130} 条 + 反证 2 枚，累计判定点 ${CNT130}）"
+echo "ok - §130 §B0 碎单治理锁通过（静态 12 道 + 行为腿 ${B0N130} 条 + 反证 2 枚，累计判定点 ${CNT130}）"
 # ============================================================================
 # §131 §B6 VWAP 软回踩 v2 锁（owner 2026-10-27：默认 1%、直接生效、超时 120s）
 #
@@ -19383,7 +19387,7 @@ for tok in 'missing_key_dims' 'index_source' 'index_stale'; do
 	grep -qF "$tok" "$TL165" || fail165 "资金帧缺字段 ${tok}（前端要显示维度就只能再靠时间线反推）"
 done
 CNT165=$((CNT165 + 1))
-grep -qE 'func \(e \*Engine\) SetSizingContext\(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims \[\]string\)' internal/paper/paper.go || fail165 "SetSizingContext 没把 dims 做成必传参数（可选 setter 或可变参数都允许漏传，而「漏传」正是本批的靶子）"
+grep -qE 'func \(e \*Engine\) SetSizingContext\(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims \[\]string, flowBlend float64\)' internal/paper/paper.go || fail165 "SetSizingContext 没把 dims/flowBlend 做成必传参数（可选 setter 或可变参数都允许漏传，而「漏传」正是本批的靶子）"
 CNT165=$((CNT165 + 1))
 INJECT165=$(grep -rl 'SetSizingContext(' --include='*.go' internal | grep -v _test | sort | tr '\n' ' ' || true)
 [ "$INJECT165" = "internal/engine/intraday_t.go internal/paper/paper.go " ] || fail165 "纸面注入点不再是「调用一处 + 定义一处」（实测：${INJECT165}）——两处各注入一套就是 §F-3 漂移家族"
@@ -25069,15 +25073,15 @@ CNT226=$((CNT226 + 1))
 grep -qF 'IndexAmountSeries(n int, today string)' "$IA226" || fail226 "取数层未接 today（断更无法判假活）"
 grep -qF 'out[len(out)-1].TradeDate != today' "$IA226" || fail226 "断更源未判失败（会挡住下游降级）"
 SERIESBLOCK=$( sed -n '/func (m \*MarketAPI) IndexAmountSeries/,/func (m \*MarketAPI) emIndexAmount/p' "$IA226" )
-printf '%s\n' "$SERIESBLOCK" | grep -qF 'continue' || fail226 "断更源未 continue 到下一候选"
+grep_q 'continue' SERIESBLOCK F || fail226 "断更源未 continue 到下一候选"
 
 # ①b 负锁：绝不取实时腿量额 f47/f48/hq.sinajs（单位不可信，§INDEX-BLIND）。
 CNT226=$((CNT226 + 1))
 IABLOCK=$( sed -n '/func (m \*MarketAPI) IndexAmountSeries/,/func (m \*MarketAPI) emIndexAmount/p' "$IA226" )
-if printf '%s\n' "$IABLOCK" | grep -qE 'f47|f48|hq\.sinajs'; then fail226 "指数量比腿不得取实时腿量额（单位不可信）"; fi
+if grep_q 'f47|f48|hq\.sinajs' IABLOCK; then fail226 "指数量比腿不得取实时腿量额（单位不可信）"; fi
 SINABLOCK=$( sed -n '/func (m \*MarketAPI) sinaIndexAmount/,/^}/p' "$IA226" )
-if printf '%s\n' "$SINABLOCK" | grep -qF 'hq.sinajs'; then fail226 "新浪兜底只走日 K，不碰实时腿量额"; fi
-if printf '%s\n' "$SINABLOCK" | grep -qF 'GetSinaKLine'; then fail226 "不得复用 GetSinaKLine（个股前缀会把 000001 拼成平安银行）"; fi
+if grep_q 'hq.sinajs' SINABLOCK F; then fail226 "新浪兜底只走日 K，不碰实时腿量额"; fi
+if grep_q 'GetSinaKLine' SINABLOCK F; then fail226 "不得复用 GetSinaKLine（个股前缀会把 000001 拼成平安银行）"; fi
 
 # ② signalctl：盘中折算复用同一把尺子；盘前/历史不足 fail-closed。
 CNT226=$((CNT226 + 1))
@@ -25090,7 +25094,7 @@ grep -qF 'if len(histAmounts) < 5' "$FF226" || fail226 "历史不足 5 根未弃
 CNT226=$((CNT226 + 1))
 grep -qF 'func (d *DB) UpsertFlowVolumeOnly(r FlowFactorDailyRow) error {' "$FFDF226" || fail226 "缺只写量比列的 UPSERT"
 VOLBLOCK=$( sed -n '/func (d \*DB) UpsertFlowVolumeOnly/,/^}/p' "$FFDF226" )
-if printf '%s\n' "$VOLBLOCK" | grep -qE 'market_flow_pct=excluded|flow_market_delta=excluded|flow_sector_delta=excluded'; then
+if grep_q 'market_flow_pct=excluded|flow_market_delta=excluded|flow_sector_delta=excluded' VOLBLOCK; then
 	fail226 "量比写口不得更新资金流列（会盖掉另一块数据源的值）"
 fi
 
@@ -25161,7 +25165,7 @@ grep -qF 'flowFullScalePct = 3.0' "$FF227" || fail227 "满档阈值不是 3%（�
 CNT227=$((CNT227 + 1))
 grep -qF 'func (d *DB) UpsertFlowMoneyOnly(r FlowFactorDailyRow) error {' "$FFDF227" || fail227 "缺资金流专用写口"
 MONEYBLOCK=$( sed -n '/func (d \*DB) UpsertFlowMoneyOnly/,/^}/p' "$FFDF227" )
-if printf '%s\n' "$MONEYBLOCK" | grep -qE 'r_yest=excluded|r_ma5=excluded|vol_surge_delta=excluded'; then
+if grep_q 'r_yest=excluded|r_ma5=excluded|vol_surge_delta=excluded' MONEYBLOCK; then
 	fail227 "资金流写口不得更新量比三列（会盖掉量比腿的值）"
 fi
 grep -qF 'CREATE TABLE IF NOT EXISTS sector_flow_daily (' "$ST227" || fail227 "缺 sector_flow_daily 表"
@@ -25200,7 +25204,7 @@ if grep -qE 'def (build_fflow|build_clist|relay_fflow|relay_clist)_?[a-z_]*\([^)
 	fail227 "上游 URL 不得由外部传入（等于把盒子开放成出网跳板）"
 fi
 FPCODE=$( grep -v '^[[:space:]]*#' "$FP227" || true )
-if printf '%s\n' "$FPCODE" | grep -qE '[?&](fltt|invt|np)='; then
+if grep_q '[?&](fltt|invt|np)=' FPCODE; then
 	fail227 "clist 拼 URL 混入非生产参数（fltt/invt 让 f3/f184 差 100 倍，np=1 让 data.diff 变数组）"
 fi
 
@@ -25260,4 +25264,271 @@ fi
 
 [ "$B227_FAILED" = "0" ] || exit 1
 echo "ok - §227 §FLOW-MONEY 锁通过（fflow secid显式+板块f6分母+3%满档归一+两写口隔离负锁+逐票注入缝+60sTTL+日期校验+盒子中继白名单/缓存/分时主路日K兜底+路由在连接闸前+客户端分页取全+中继优先失败落回直连+行为腿，累计判定点 ${CNT227}）"
+echo ""
+echo "==> 228 §REPLAY-TRADES（实盘逐笔复盘：只读 + FIFO + 证据质量自证）..."
+B228_FAILED=0
+fail228() {
+	echo "--- FAIL: §228 $*"
+	FAIL=1
+	B228_FAILED=1
+}
+CNT228=0
+RP228=scripts/replay_trades_20261119.py
+
+# ① 在册 + 语法（脚本是复盘口径的唯一真源，缺件等于"复盘无据"）
+CNT228=$((CNT228 + 1))
+[ -s "$RP228" ] || fail228 "复盘脚本不在册（${RP228}）"
+python3 -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "$RP228" 2>/dev/null \
+	|| fail228 "复盘脚本语法不过"
+
+# ② 只读三件：mode=ro + query_only + 无写 SQL。
+# 复盘脚本会天天对着生产库跑，任何一次写都是把钱账改坏（且没人会预期它写）。
+CNT228=$((CNT228 + 1))
+grep -qF 'sqlite3.connect("file:%s?mode=ro" % path, uri=True)' "$RP228" \
+	|| fail228 "未用 mode=ro 打开库（只读第一道闸）"
+grep -qF 'PRAGMA query_only=1' "$RP228" || fail228 "未设 PRAGMA query_only（只读第二道闸）"
+if grep -qEi '(INSERT INTO|UPDATE [^"]* SET|DELETE FROM|CREATE TABLE|DROP TABLE|ALTER TABLE)' "$RP228"; then
+	fail228 "复盘脚本里出现写 SQL——复盘只许读"
+fi
+
+# ③ 不复用坏列 + 缺日期不猜。
+# `trade_results.realized_pnl` 现网有量级坏值（-19036720.0 对一笔 2000 股买入），
+# 引用它会把整份复盘读成事故；缺日期的成交按"今天"折进去则会凭空造出回合。
+CNT228=$((CNT228 + 1))
+if grep -qF 'FROM trade_results' "$RP228"; then
+	fail228 "读了 trade_results（realized_pnl 有量级坏值，必须自算 FIFO）"
+fi
+grep -qF "length(COALESCE(traded_at,'')) >= 10" "$RP228" || fail228 "缺日期成交未被排除"
+if grep -qE "COALESCE\(traded_at, *'[0-9]" "$RP228"; then
+	fail228 "给缺日期成交塞了默认日期（等于猜日期）"
+fi
+# SQL 侧挡住了还不够：`fill["traded_at"] or "2026-01-01"` 这种 Python 侧兜底日期
+# 同样会凭空造出回合，而在 SQL 里一个字都看不见——§228 塞雷实测：只锁 SQL 形态时这条雷不红。
+if grep -qE 'traded_at"\] *or *["'"'"']?[0-9]' "$RP228"; then
+	fail228 "Python 侧给缺日期成交塞了默认日期（等于猜日期）"
+fi
+
+# ④ FIFO 分键与滑点三条边界。
+# 跨账号混算会把两本账的盈亏加到一起；order_id 跨账纪元**会复用**（同号不同票），
+# 只按号 join 会产出 130996 bps 这种荒谬滑点（本批第一版实测踩到）。
+CNT228=$((CNT228 + 1))
+grep -qF 'by_key[(f.get("user_id") or "", seg6(f["code"]))]' "$RP228" \
+	|| fail228 "FIFO 未按(账号,票)分键（跨账号会混算）"
+grep -qF 'if o["code"] and o["code"] != seg6(f["code"]):' "$RP228" \
+	|| fail228 "滑点未校验票号（order_id 跨纪元会配到别的票）"
+grep -qF 'if o["side"] and o["side"] != f["side"]:' "$RP228" || fail228 "滑点未校验方向"
+grep -qF 'if abs(bps) > 2000.0:' "$RP228" || fail228 "滑点未剔除配错行（±20% 之外一律不算）"
+
+# ⑤ 行为腿：用 /tmp 里的两份 fixture 库跑一遍（不碰生产库）。
+# 判据锁的是三件事：FIFO 吃**最早**的 lot（100 元而非 -100 元）、
+# 缺日期卖出**不入账**（否则 trips 会变成 2）、盈亏含手续费（fee 1+1 → 98.00）。
+CNT228=$((CNT228 + 1))
+RP228_DIR="${TMPDIR:-/tmp}/replay228.$$"
+rm -rf "$RP228_DIR"
+mkdir -p "$RP228_DIR"
+python3 - "$RP228_DIR" <<'PY' >/dev/null
+import os, sqlite3, sys
+d = sys.argv[1]
+live = sqlite3.connect(os.path.join(d, "live.db"))
+live.executescript("""
+CREATE TABLE fills (id INTEGER PRIMARY KEY, order_id TEXT, code TEXT, side TEXT, price REAL,
+  qty INTEGER, amount REAL, traded_at TEXT, signal_id TEXT, user_id TEXT, fee REAL,
+  stamp_tax REAL, trade_id TEXT, market_vwap REAL, fill_vwap_premium_pct REAL, vwap_source TEXT);
+CREATE TABLE orders (order_id TEXT, price REAL, side TEXT, signal_id TEXT, intraday_t INTEGER,
+  status TEXT, code TEXT, qty INTEGER, created_at TEXT);
+CREATE TABLE signal_decisions (day TEXT, code TEXT, strategy_key TEXT, stage TEXT, qty INTEGER,
+  notional REAL, signal_id TEXT, capped_by TEXT, reason TEXT);
+CREATE TABLE real_positions (ts_code TEXT, name TEXT, qty INTEGER, cost_price REAL, amount REAL,
+  strategy TEXT, user_id TEXT, updated_at TEXT);
+CREATE TABLE real_equity_daily (user_id TEXT, day TEXT, equity REAL);
+""")
+rows = [
+    (1, "b1", "600000.SH", "买入", 10.0, 100, 1000.0, "2026-11-02 10:00:00",
+     "buy:600000:fac_160:20261102", "u1", 1.0, 0.0, "t1", 0.0, 0.0, ""),
+    (2, "b2", "600000.SH", "买入", 12.0, 100, 1200.0, "2026-11-03 10:00:00",
+     "buy:600000:fac_160:20261103", "u1", 1.0, 0.0, "t2", 0.0, 0.0, ""),
+    (3, "s1", "600000.SH", "卖出", 11.0, 100, 1100.0, "2026-11-05 10:00:00",
+     "sell:600000:减仓:20261105", "u1", 1.0, 0.0, "t3", 0.0, 0.0, ""),
+    (4, "s2", "600000.SH", "卖出", 9.0, 100, 900.0, "09:30:00",
+     "", "u1", 0.0, 0.0, "t4", 0.0, 0.0, ""),
+]
+live.executemany("INSERT INTO fills VALUES (%s)" % ",".join(["?"] * 16), rows)
+live.execute("INSERT INTO orders VALUES ('b1',10.0,'买入','buy:600000:fac_160:20261102',0,'已成','600000.SH',100,'2026-11-02 10:00:00')")
+live.execute("INSERT INTO orders VALUES ('s1',11.0,'卖出','sell:600000:减仓:20261105',0,'已成','600000.SH',100,'2026-11-02 10:00:00')")
+live.execute("INSERT INTO real_positions VALUES ('600000.SH','浦发银行',100,12.0,1200.0,'手动','u1','2026-11-06 15:30:00')")
+live.execute("INSERT INTO real_equity_daily VALUES ('u1','2026-11-02',50000.0)")
+live.execute("INSERT INTO real_equity_daily VALUES ('u1','2026-11-05',50100.0)")
+live.commit()
+trd = sqlite3.connect(os.path.join(d, "trading.db"))
+trd.executescript("CREATE TABLE daily (ts_code TEXT, trade_date TEXT, close REAL);")
+trd.execute("INSERT INTO daily VALUES ('600000.SH','20261105',11.0)")
+trd.commit()
+PY
+RP228_RC=0
+RP228_OUT=$( python3 "$RP228" --live-db "$RP228_DIR/live.db" --trading-db "$RP228_DIR/trading.db" \
+	--out-dir "$RP228_DIR/out" --all 2>&1 ) || RP228_RC=$?
+if [ "$RP228_RC" != "0" ]; then
+	echo "--- FAIL: §228 行为腿退出码 ${RP228_RC}：$(printf '%s\n' "$RP228_OUT" | tail -8)"
+	B228_FAILED=1
+else
+	# 100 股 10 元买入 → 11 元卖出，双边各 1 元手续费：11*100-1 - (10*100+1) = 98.00
+	grep_q 'trips=1 pnl=98.00 win=100.0%' RP228_OUT \
+		|| fail228 "FIFO 行为腿读数不符（应 trips=1/pnl=98.00/胜率100%：吃最早 lot、缺日期卖出不入账、含费）"
+	for f in REPLAY_TRADES.md replay_round_trips.csv replay_fills.csv replay_by_strategy.csv \
+		replay_unclosed.csv replay_slippage.csv replay_positions.csv; do
+		[ -s "$RP228_DIR/out/$f" ] || fail228 "行为腿未产出 ${f}"
+	done
+	grep -qF 'FIFO 残差' "$RP228_DIR/out/REPLAY_TRADES.md" || fail228 "报告缺「FIFO 残差」节（残差必须与真持仓并列）"
+fi
+rm -rf "$RP228_DIR"
+
+# ⑥ 口径锁定：报告必须自带证据质量节，且「不复用 realized_pnl」这句写在报告里。
+CNT228=$((CNT228 + 1))
+grep -qF '## 1. 证据质量' "$RP228" || fail228 "报告缺「证据质量」节（没有它，残差会被读成仓位）"
+grep -qF '**不采用**' "$RP228" || fail228 "报告未声明不采用 trade_results.realized_pnl"
+
+[ "$B228_FAILED" = "0" ] || exit 1
+echo "ok - §228 §REPLAY-TRADES 锁通过（只读三件+不读坏列+缺日期不猜+FIFO按账号票分键+滑点三条边界+行为腿含费与最早lot+证据质量节，累计判定点 ${CNT228}）"
+echo ""
+echo "==> 229 §TRADE-EVIDENCE（成交证据回填：只补日期 / 成交编号优先 / 歧义 fail-closed / 写前备份）..."
+B229_FAILED=0
+fail229() {
+	echo "--- FAIL: §229 $*"
+	FAIL=1
+	B229_FAILED=1
+}
+CNT229=0
+EV229=scripts/backfill_trade_evidence_20261119.py
+
+# ① 在册 + 语法：这枚脚本身就是「证据补不了」的判据，缺件等于缺口没有留痕。
+CNT229=$((CNT229 + 1))
+[ -s "$EV229" ] || fail229 "回填脚本不在册（${EV229}）"
+python3 -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "$EV229" 2>/dev/null \
+	|| fail229 "回填脚本语法不过"
+
+# ② 默认不写：清单腿只读，真写必须显式 --commit。
+# 这是钱账工具：一次"以为只是看看"的调用改掉 32 行成交日期，事后没人会预期它写过。
+CNT229=$((CNT229 + 1))
+grep -qF 'sqlite3.connect("file:%s?mode=ro" % path, uri=True)' "$EV229" \
+	|| fail229 "清单/演练腿未用 mode=ro 打开库"
+grep -qF 'PRAGMA query_only=1' "$EV229" || fail229 "清单/演练腿未设 PRAGMA query_only"
+grep -qF 'ap.add_argument("--commit", action="store_true"' "$EV229" \
+	|| fail229 "缺 --commit 显式开关（默认必须只是演练）"
+grep -qF 'DRY_RUN 未写库' "$EV229" || fail229 "演练路径没有明确读数（事后看不出到底写没写）"
+
+# ③ 只写 traded_at：交割单与库里金额有差异时只报告不修正。
+# 改金额是记账纠错、改日期是补证据——两件事混进同一条 UPDATE，事后分不出是谁改的。
+CNT229=$((CNT229 + 1))
+grep -qF "UPDATE fills SET traded_at=? WHERE id=? AND length(COALESCE(traded_at,''))<10" "$EV229" \
+	|| fail229 "回填 UPDATE 不是「只写 traded_at + 只碰缺日期行」"
+if grep -qE 'UPDATE fills SET [^"]*(price|qty|amount|fee|stamp_tax)[[:space:]]*=' "$EV229"; then
+	fail229 "回填改了价格/数量/金额/费用——证据回填只许补日期"
+fi
+
+# ④ 唯一匹配 + 歧义 fail-closed。
+# 「代码+方向+数量+价格」撞库天生可能命中同价同量的两笔；取第一条就是把 A 笔的日期贴到 B 笔上，
+# 而且事后完全看不出来（两行日期都"像对的"）——所以多候选必须拒绝，不能择优。
+CNT229=$((CNT229 + 1))
+grep -qF 'st_by_tid' "$EV229" || fail229 "未按成交编号建索引（券商成交编号是最硬的配对键）"
+grep -qF 'basis = "trade_id"' "$EV229" || fail229 "未把 trade_id 配对立为一等依据"
+grep -qF 'ambiguous.append' "$EV229" || fail229 "多候选未进歧义清单（等于静默取第一条）"
+grep -qF 'return 3' "$EV229" || fail229 "有歧义时未以退出码 3 失败关闭"
+
+# ⑤ 写前备份：钱账文件的写动作必须留下可回滚的副本。
+CNT229=$((CNT229 + 1))
+grep -qF 'src.backup(dst)' "$EV229" || fail229 "写库前未做 sqlite 在线备份"
+grep -qF '.bak-evidence-' "$EV229" || fail229 "备份文件名未带 evidence 标记（事后分不清是哪次动作的副本）"
+
+# ⑥ 行为腿：清单 / 演练不写 / 提交写入且幂等 / 歧义 fail-closed 四态。
+CNT229=$((CNT229 + 1))
+EV229_DIR="${TMPDIR:-/tmp}/evidence229.$$"
+rm -rf "$EV229_DIR"
+mkdir -p "$EV229_DIR"
+python3 - "$EV229_DIR" <<'PY229FIX' >/dev/null
+import os, sqlite3, sys
+d = sys.argv[1]
+c = sqlite3.connect(os.path.join(d, "live.db"))
+c.executescript("""
+CREATE TABLE fills (id INTEGER PRIMARY KEY, order_id TEXT, code TEXT, side TEXT, price REAL,
+  qty INTEGER, amount REAL, traded_at TEXT, signal_id TEXT, user_id TEXT, fee REAL,
+  stamp_tax REAL, serial TEXT, trade_id TEXT, market_vwap REAL, fill_vwap_premium_pct REAL,
+  vwap_source TEXT, vwap_as_of TEXT);
+CREATE TABLE real_positions (ts_code TEXT, name TEXT, qty INTEGER, cost_price REAL, amount REAL,
+  strategy TEXT, user_id TEXT, updated_at TEXT);
+CREATE TABLE trade_results (trade_id TEXT, day TEXT, user_id TEXT);
+""")
+# id=1/2 只有 HH:MM:SS（本次要补的两条）；id=3 已带日期（一条都不许动）
+rows = [
+    (1, "1", "002115.SZ", "买入", 9.52, 2000, 19040.0, "09:25:00", "", "u1", 0, 0, "", "T1", 0, 0, "", None),
+    (2, "2", "002115.SZ", "卖出", 9.00, 2000, 18000.0, "14:09:46", "", "u1", 0, 0, "", "T2", 0, 0, "", None),
+    (3, "3", "600000.SH", "买入", 10.0, 100, 1000.0, "2026-11-03 10:00:00", "", "u1", 1, 0, "", "T3", 0, 0, "", None),
+]
+c.executemany("INSERT INTO fills VALUES (" + ",".join("?" * 18) + ")", rows)
+c.execute("INSERT INTO real_positions VALUES ('600000.SH','浦发',100,10.0,1000.0,'x','u1','2026-11-19')")
+c.execute("INSERT INTO trade_results VALUES ('T3','2026-11-03','u1')")
+c.commit()
+PY229FIX
+cat > "$EV229_DIR/statement.csv" <<'CSV229'
+成交日期,证券代码,买卖标志,成交数量,成交均价,成交金额,成交编号,手续费,印花税
+2026-11-19,002115,买入,2000,9.52,19040.00,T1,5.0,0
+2026-11-19,002115,卖出,2000,9.00,18000.00,T2,5.0,18.0
+2026-11-03,600000,买入,100,10.00,1000.00,T3,5.0,0
+CSV229
+
+# ⑥a 清单：只读，且必须给出缺口口径算式（只有一个数字会被读成盈亏）
+EV229_RC=0
+EV229_OUT=$( python3 "$EV229" --db "$EV229_DIR/live.db" --inventory --out-dir "$EV229_DIR/out" 2>&1 ) || EV229_RC=$?
+if [ "$EV229_RC" != "0" ]; then
+	fail229 "清单腿退出码 ${EV229_RC}：$(printf '%s\n' "$EV229_OUT" | tail -5)"
+else
+	grep_q 'EVIDENCE_INVENTORY undated=2\(买 1/卖 1\)' EV229_OUT \
+		|| fail229 "清单读数不符（应有日期之外的缺日期行=2 买1卖1；已带日期的行不许算进去）"
+	[ -s "$EV229_DIR/out/evidence_gap.csv" ] || fail229 "清单未产出 evidence_gap.csv"
+	[ -s "$EV229_DIR/out/EVIDENCE_GAP.md" ] || fail229 "清单未产出 EVIDENCE_GAP.md"
+	grep -qF '缺口 = 全部买入 − 全部卖出 − 期末持仓' "$EV229_DIR/out/EVIDENCE_GAP.md" \
+		|| fail229 "缺口清单未给出口径算式（只给数字会被读成盈亏）"
+fi
+
+# ⑥b 演练：一个字节都不许写
+EV229_RC=0
+EV229_OUT=$( python3 "$EV229" --db "$EV229_DIR/live.db" --apply --file "$EV229_DIR/statement.csv" 2>&1 ) || EV229_RC=$?
+[ "$EV229_RC" = "0" ] || fail229 "演练退出码 ${EV229_RC}（应 0）"
+grep_q 'PLAN rows=2 commit=no\(dry-run\)' EV229_OUT || fail229 "演练未匹配到 2 条（成交编号配对失效）"
+grep_q 'DRY_RUN' EV229_OUT || fail229 "演练未打 DRY_RUN 读数"
+LEFT229=$( python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('select count(*) from fills where length(coalesce(traded_at,\\'\\'))<10').fetchone()[0])" "$EV229_DIR/live.db" )
+[ "$LEFT229" = "2" ] || fail229 "演练把库改了（缺日期行从 2 变成 ${LEFT229}）"
+
+# ⑥c 提交：写入 + 备份 + 幂等（补过的不再被当成待补）
+EV229_RC=0
+EV229_OUT=$( python3 "$EV229" --db "$EV229_DIR/live.db" --apply --file "$EV229_DIR/statement.csv" --commit 2>&1 ) || EV229_RC=$?
+[ "$EV229_RC" = "0" ] || fail229 "提交退出码 ${EV229_RC}"
+grep_q 'APPLIED updated=2 remaining_undated=0' EV229_OUT || fail229 "提交未写入 2 条（或剩余缺日期未归零）"
+ls "$EV229_DIR"/live.db.bak-evidence-* >/dev/null 2>&1 || fail229 "提交前未留下 live.db 备份"
+EV229_OUT=$( python3 "$EV229" --db "$EV229_DIR/live.db" --apply --file "$EV229_DIR/statement.csv" 2>&1 || true )
+grep_q 'PLAN_EMPTY' EV229_OUT || fail229 "复跑不幂等（补过的行又被当成待补）"
+KEEP229=$( python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('select traded_at from fills where id=3').fetchone()[0])" "$EV229_DIR/live.db" )
+[ "$KEEP229" = "2026-11-03 10:00:00" ] || fail229 "已有日期的行被改动了（${KEEP229}）"
+
+# ⑥d 歧义：清掉成交编号 ⇒ 指纹命中两条 ⇒ 必须 rc=3 且一条都不写
+python3 - "$EV229_DIR" <<'PY229AMB' >/dev/null
+import os, sqlite3, sys
+d = sys.argv[1]
+c = sqlite3.connect(os.path.join(d, "live.db"))
+c.execute("UPDATE fills SET traded_at='09:25:00', trade_id='' WHERE id=1")
+c.commit()
+with open(os.path.join(d, "amb.csv"), "w", encoding="utf-8") as fh:
+    fh.write("成交日期,证券代码,买卖标志,成交数量,成交均价,成交金额,成交编号\n")
+    fh.write("2026-11-19,002115,买入,2000,9.52,19040.00,\n")
+    fh.write("2026-11-20,002115,买入,2000,9.52,19040.00,\n")
+PY229AMB
+EV229_RC=0
+EV229_OUT=$( python3 "$EV229" --db "$EV229_DIR/live.db" --apply --file "$EV229_DIR/amb.csv" --commit 2>&1 ) || EV229_RC=$?
+[ "$EV229_RC" = "3" ] || fail229 "歧义未以退出码 3 失败关闭（实得 ${EV229_RC}）"
+grep_q 'AMBIGUOUS' EV229_OUT || fail229 "歧义未进清单"
+AMB229=$( python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('select count(*) from fills where length(coalesce(traded_at,\\'\\'))<10').fetchone()[0])" "$EV229_DIR/live.db" )
+[ "$AMB229" = "1" ] || fail229 "歧义场景下仍写了库（缺日期行 ${AMB229}，应仍为 1）"
+rm -rf "$EV229_DIR"
+
+[ "$B229_FAILED" = "0" ] || exit 1
+echo "ok - §229 §TRADE-EVIDENCE 锁通过（只补日期白名单+成交编号优先+歧义fail-closed+写前备份+演练不写+幂等+歧义不动，累计判定点 ${CNT229}）"
 echo ""
