@@ -24670,3 +24670,56 @@ grep_q '^ok' G216 || { echo "--- FAIL: §216 行为腿未过：$(printf '%s\n' "
 [ "$B216_FAILED" = "0" ] || exit 1
 echo "ok - §216 §REGIME-SEED 锁通过（字段/函数在册 + 只认当天 + 只补空 + 两个调用点 + 种子不写 last* 负锁 + 4 条行为腿，累计判定点 ${CNT216}）"
 echo ""
+
+# ---------------------------------------------------------------------------
+# §217 §TURNOVER-WIRING（2026-11-19 owner：补烘流通股本，让 T 的换手率闸真的能过）。
+#   现场：载体里 `turnover_pct` **零写入点**，而 `t_min_turnover_pct=1.5`
+#   ⇒ 每只票、每一轮都 `step0.5 turnover_unavailable` —— 一道永远不可能通过的闸，
+#   等于把整个 T 层静默关掉。流通股本本地库里没有（daily_basic 两列全 NULL、无 tushare token），
+#   只能用腾讯行情（本仓行情链本来就有这条腿）盘前烘一次。
+echo "==> 217 §TURNOVER-WIRING（流通股本烘入 + 载体换手率现算）..."
+B217_FAILED=0
+fail217() {
+	echo "--- FAIL: §217 $*"
+	FAIL=1
+	B217_FAILED=1
+}
+CNT217=0
+PG217=scripts/pregen_carrier_factors_gz.py
+QS217=qmt_gateway/qmt_internal_strategy.py
+
+# ① 烘焙腿在册：腾讯批量取 + 纯函数解析（可单测）。
+CNT217=$((CNT217 + 1))
+grep -qF 'def fetch_float_shares(symbols):' "$PG217" || fail217 "缺 fetch_float_shares（流通股本没人取）"
+grep -qF 'def parse_tencent_float_shares(payload):' "$PG217" || fail217 "缺解析纯函数（只能靠网络才能验证＝测不了）"
+grep -qF 'TENCENT_QUOTE = "http://qt.gtimg.cn/q="' "$PG217" || fail217 "腾讯行情入口被换掉（唯一可用的免费源）"
+# ①b 裸码补前缀 + 回键用裸码（首次真跑就栽在这里：with_float_shares 0/993）。
+grep -qF 'if text[0] in ("6", "9"):' "$PG217" || fail217 "裸 6 位码不再补交易所前缀（腾讯会回 v_pv_none_match）"
+grep -qF 'result.update({k.split(".")[0]: v for k, v in parse_tencent_float_shares(payload).items()})' "$PG217" \
+	|| fail217 "fetch 的回键不是裸码（precalc 用裸码取值 ⇒ 整表查不到）"
+# ② 两条证据腿 + 交叉校验：只读一个字段位会在板块/停牌时报错值。
+CNT217=$((CNT217 + 1))
+grep -qF 'shares = _num(72)' "$PG217" || fail217 "不再读 [72] 流通股本（腾讯实测字段位）"
+grep -qF 'derived = circ_mv_yi * 1e8 / price' "$PG217" || fail217 "缺「流通市值÷现价」推导腿（[72] 漂了就无从交叉校验）"
+grep -qF '> 0.10:' "$PG217" || fail217 "缺 10%% 交叉校验（字段位漂移会把总股本当流通股本）"
+# ③ 载体侧：换手率必须由 tick 额 + 烘入股本现算，且缺失时弃权（None）。
+CNT217=$((CNT217 + 1))
+grep -qF 'def _turnover_pct_of(tick, pre):' "$QS217" || fail217 "载体缺 _turnover_pct_of（换手率又变成零写入点）"
+grep -qF 'cap = prev * shares' "$QS217" || fail217 "换手率分母不是「昨收 × 流通股本」（单位会错）"
+grep -qF '"turnover_pct": turnover_pct,' "$QS217" || fail217 "T 的 ctx 没带 turnover_pct（闸仍然恒拒）"
+grep -qF 't_turnover_unavailable sym=%s float_shares=%s amount=%s prev=%s' "$QS217" || fail217 "缺换手率缺失读数行（再出一次只能靠猜）"
+# ④ 用例在册 + 行为腿（解析 5 例 / 载体 1 例）。
+CNT217=$((CNT217 + 1))
+[ -f qmt_gateway/tests/test_pregen_float_shares_20261119.py ] || fail217 "缺流通股本解析用例"
+grep -qF 'test_turnover_pct_is_computed_from_turnover_and_float_shares' qmt_gateway/tests/test_internal_strategy_sandbox.py \
+	|| fail217 "缺载体换手率用例（缺股本必须弃权那条也在里面）"
+PY217=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_pregen_float_shares_20261119.py tests/test_internal_strategy_sandbox.py -q 2>&1 || true )
+grep_q 'passed' PY217 || { echo "--- FAIL: §217 行为腿未跑满：$(printf '%s\n' "$PY217" | tail -8)"; B217_FAILED=1; }
+if grep_q 'failed' PY217; then
+	echo "--- FAIL: §217 行为腿有红：$(printf '%s\n' "$PY217" | tail -8)"
+	B217_FAILED=1
+fi
+
+[ "$B217_FAILED" = "0" ] || exit 1
+echo "ok - §217 §TURNOVER-WIRING 锁通过（腾讯批量取 + 纯函数解析 + 两条证据腿与 10% 交叉校验 + 载体现算与弃权 + 读数行 + 两套行为腿，累计判定点 ${CNT217}）"
+echo ""

@@ -1057,6 +1057,49 @@ def _pending_amount_for(symbol, pending_rows):
     return total
 
 
+def _turnover_pct_of(tick, pre):
+    """Today's turnover percent: cumulative amount / (prev_close * float_shares) * 100.
+
+    2026-11-19 owner: bake float shares so the T liquidity gate can actually run.
+    Until today the carrier never had `turnover_pct` at all (grep: zero writers),
+    so `t_min_turnover_pct=1.5` refused every name every round with
+    `turnover_unavailable` -- a gate that can never pass is a gate that silently
+    closed the whole T layer.
+
+    Inputs are deliberately narrow and every miss returns None (the gate then
+    keeps treating the name as "not passed", which is the honest direction):
+      * float_shares comes BAKED from the cloud (scripts/pregen_carrier_factors_gz.py,
+        Tencent quote fields); the sandbox cannot fetch it;
+      * prev_close comes from the tick, falling back to the baked precalc value;
+      * amount is the tick's cumulative turnover in yuan (same field the VWAP uses).
+    Units: amount(yuan) / (yuan-per-share * shares) = a pure ratio; x100 = percent.
+    """
+    try:
+        shares = float((pre or {}).get("float_shares") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if shares <= 0.0:
+        return None
+    tick = tick or {}
+    amount = tick.get("amount")
+    if amount is None:
+        amount = (pre or {}).get("amount")
+    prev = tick.get("prev_close")
+    if prev is None:
+        prev = (pre or {}).get("prev_close")
+    try:
+        amount = float(amount)
+        prev = float(prev)
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0.0 or prev <= 0.0:
+        return None
+    cap = prev * shares
+    if cap <= 0.0:
+        return None
+    return amount / cap * 100.0
+
+
 def _pullback_limit_price(vwap, last_price):
     """VWAP minus the baked pullback pct, never above the last price.
 
@@ -2769,6 +2812,13 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
         # uses (_vwap_of applies vwap_sanity_* + vwap_unit_candidates), plus the
         # raw fields so a future miss is diagnosable from the log instead of
         # being inferred.
+        pre_row = (PARAMS.get("precalc") or {}).get(str(symbol).split(".")[0]) or {}
+        turnover_pct = _turnover_pct_of(tick, pre_row)
+        if turnover_pct is None:
+            _warn_once("t_turnover:%s" % symbol,
+                       "t_turnover_unavailable sym=%s float_shares=%s amount=%s prev=%s" % (
+                           symbol, (pre_row or {}).get("float_shares"),
+                           (tick or {}).get("amount"), (tick or {}).get("prev_close")))
         vwap_value, vwap_why = (None, "no_tick") if not tick else _vwap_of(tick)
         if vwap_value is None:
             _warn_once("t_vwap:%s" % symbol,
@@ -2780,6 +2830,7 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
             "trading_day": True,  # run_round already passed _trade_session_ok
             "last_price": px, "position_qty": (row or {}).get("qty"),
             "vwap": vwap_value,
+            "turnover_pct": turnover_pct,
             "volume": (tick or {}).get("volume"),
             "amount": (tick or {}).get("amount"),
             "available_cash": cash, "total_asset": t_total,

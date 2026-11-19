@@ -1,0 +1,21 @@
+# quant-watchdog.service —「假活」看门狗的一次性执行单元（2026-11-19 事故止血件）。
+#
+# 用 oneshot 而不是常驻进程：看门狗自己崩了也不该影响 quant，
+# systemd 每次 timer 触发都会重新拉起一个干净进程（无状态，计数在 /run）。
+[Unit]
+Description=quant liveness watchdog (restart quant when /livez stops answering)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/quant-deploy/quant-watchdog.sh
+# 看门狗只做一件事（探活 + 必要时重启 quant），不读写业务数据目录。
+# sudo -n 由 /etc/sudoers.d/quant-watchdog 授予**单条**命令权限（见安装说明）。
+User=quant
+Group=quant
+# /run/quant-watchdog 由 systemd 创建并交给服务用户（/run 本身 root-only）。
+RuntimeDirectory=quant-watchdog
+RuntimeDirectoryMode=0755
+# oneshot 单元退出时默认会删掉 RuntimeDirectory —— 那会把"连续失败计数"一起删掉，
+# 阈值永远凑不满（看门狗变成只会打日志的摆设）。必须保留。
+RuntimeDirectoryPreserve=yes

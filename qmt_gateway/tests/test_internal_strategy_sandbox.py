@@ -553,6 +553,26 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         finally:
             mod._account_total_asset = saved
 
+    def test_turnover_pct_is_computed_from_turnover_and_float_shares(self):
+        """§TURNOVER-WIRING：换手率必须能被算出来，否则 T 的流动性闸永远拒。
+
+        现网 2026-11-19：载体里 `turnover_pct` **一个写入点都没有**（grep 零命中），
+        而 `t_min_turnover_pct=1.5` ⇒ 每一只票、每一轮都 `turnover_unavailable`。
+        这条用例同时钉住"缺流通股本时必须弃权（None），不许拿别的数凑"。
+        """
+        mod = self.mod
+        tick = {"amount": 840353122.19, "prev_close": 23.0, "last_price": 20.98}
+        # nominal: 840,353,122.19 / (23.0 * 849,147,841) * 100 ≈ 4.30%
+        pct = mod._turnover_pct_of(tick, {"float_shares": 849147841})
+        self.assertIsNotNone(pct)
+        self.assertAlmostEqual(pct, 840353122.19 / (23.0 * 849147841) * 100.0, places=6)
+        self.assertLess(abs(pct - 4.30), 0.05, "与腾讯行情给的换手率 4.54%% 同量级（差异来自时间点）")
+        # 缺流通股本 / 缺额 / 缺昨收 ⇒ 一律 None（闸按"未通过"处理，绝不伪造）
+        self.assertIsNone(mod._turnover_pct_of(tick, {}))
+        self.assertIsNone(mod._turnover_pct_of(tick, {"float_shares": 0}))
+        self.assertIsNone(mod._turnover_pct_of({"prev_close": 23.0}, {"float_shares": 1000}))
+        self.assertIsNone(mod._turnover_pct_of({"amount": 100.0}, {"float_shares": 1000}))
+
     def test_cash_probe_prints_the_target_derivation(self):
         """owner 2026-11-19：仓位帽要能"照着日志算出来"，不是靠人反推。
 

@@ -385,6 +385,107 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
     return out
 
 
+# ---------------------------------------------------------------------------
+# §TURNOVER-WIRING 2026-11-19（owner：补烘流通股本）：T 的换手率闸需要流通股本，
+# 而本地库里没有（trading.db.daily_basic.float_share 全 NULL、circ_mv 也全 NULL，
+# tushare 侧没 token）。腾讯行情是现成的、可用的（本仓行情链本来就有腾讯腿），
+# 一条请求可带 50 只票，字段里同时有**流通市值**与**流通股本**。
+# 只烘 float_shares（股），换手率由载体用「当日成交额 ÷ (昨收 × 流通股本)」现算——
+# 不烘换手率本身：那是盘中变量，烘成固定值等于给闸喂一个错的常数。
+TENCENT_QUOTE = "http://qt.gtimg.cn/q="
+TENCENT_BATCH = 50
+_TENCENT_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
+
+
+def _tencent_code(ts_code):
+    """`000034` / `000034.SZ` -> `sz000034`（腾讯要「小写交易所前缀 + 6 位码」）。
+
+    2026-11-19 首次真跑踩到的坑：params.symbols 里是**裸 6 位码**，旧实现原样拼进 URL
+    ⇒ 腾讯回 `v_pv_none_match`，整批解析为空，`float_shares` 一只都没烘进去（0/993）。
+    所以裸码必须按首位补前缀：6/9 沪、0/2/3 深、4/8 北交所。
+    """
+    text = str(ts_code or "").strip().upper()
+    if "." in text:
+        code, suffix = text.split(".", 1)
+        prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix, "sz")
+        return prefix + code
+    if len(text) == 6 and text.isdigit():
+        if text[0] in ("6", "9"):
+            return "sh" + text
+        if text[0] in ("4", "8"):
+            return "bj" + text
+        return "sz" + text
+    return text.lower()
+
+
+def parse_tencent_float_shares(payload):
+    """腾讯行情响应 -> {ts_code: float_shares(股)}。纯函数（拆出来才能单测）。
+
+    字段位（实测 sz000034，2026-11-19）：
+      [3] 现价、[38] 换手率、[44] 流通市值（亿）、[45] 总市值（亿）、
+      [72] 流通股本（股）、[73] 总股本（股）。
+    为什么两条路：不同板块/停牌/指数的字段位会漂，所以先认 [72]，再用
+    「流通市值 × 1e8 ÷ 现价」交叉校验（差 >10% 就认为 [72] 不是股本，改用推导值）；
+    两条都拿不到就**不烘**（载体侧继续保持弃权，绝不喂一个猜出来的股本）。
+    """
+    out = {}
+    for chunk in str(payload or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk.startswith("v_"):
+            continue
+        head, _, body = chunk.partition("=")
+        code = head[2:].strip()
+        fields = body.strip().strip('"').split("~")
+        if len(fields) < 46 or not code:
+            continue
+        ts_code = None
+        if code[:2] in ("sz", "sh", "bj") and code[2:].isdigit():
+            ts_code = code[2:] + ("." + code[:2].upper())
+        if ts_code is None:
+            continue
+
+        def _num(idx):
+            try:
+                return float(fields[idx])
+            except (IndexError, TypeError, ValueError):
+                return None
+
+        price = _num(3)
+        circ_mv_yi = _num(44)
+        shares = _num(72)
+        derived = None
+        if price and price > 0 and circ_mv_yi and circ_mv_yi > 0:
+            derived = circ_mv_yi * 1e8 / price
+        if shares and shares > 0:
+            if derived and abs(shares - derived) / derived > 0.10:
+                shares = derived
+        else:
+            shares = derived
+        if shares and shares > 0:
+            out[ts_code] = shares
+    return out
+
+
+def fetch_float_shares(symbols):
+    """批量取流通股本（腾讯，50 只/请求）。失败/缺字段一律跳过（返回 {} 也合法）。"""
+    result = {}
+    codes = [s for s in symbols if s]
+    for start in range(0, len(codes), TENCENT_BATCH):
+        batch = codes[start:start + TENCENT_BATCH]
+        url = TENCENT_QUOTE + ",".join(_tencent_code(c) for c in batch)
+        try:
+            req = urllib.request.Request(url, headers=_TENCENT_HEADERS)
+            with urllib.request.urlopen(req, timeout=REQ_TIMEOUT) as resp:
+                payload = resp.read().decode("gbk", errors="replace")
+        except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链，只少一份股本
+            print("PREGEN_FLOAT_SHARES_FAIL batch=%d %s" % (start // TENCENT_BATCH, type(exc).__name__))
+            continue
+        # 回键用**裸 6 位码**：params.symbols / precalc 的键都是裸码（带后缀查不到）。
+        result.update({k.split(".")[0]: v for k, v in parse_tencent_float_shares(payload).items()})
+        time.sleep(SLEEP_MS / 1000.0)
+    return result
+
+
 def fetch_lu_boards(day):
     """§LIMIT-BOARD 20261116（owner 拍板接入 lu_board3）：东财涨停池直拉
     （akshare stock_zt_pool_em 同源底层，无需 venv 依赖）→ {6位码: 连板数}。
@@ -723,6 +824,13 @@ def main():
             print("PREGEN_EMOTION_HIST none")
     except Exception as exc:  # noqa: BLE001
         print("PREGEN_EMOTION_HIST_FAIL %s" % type(exc).__name__)
+    # §TURNOVER-WIRING：流通股本每天取一次（腾讯，50 只/请求），写进每票 precalc。
+    float_shares_map = {}
+    try:
+        float_shares_map = fetch_float_shares(symbols)
+        print("PREGEN_FLOAT_SHARES codes=%d of=%d" % (len(float_shares_map), len(symbols)))
+    except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链
+        print("PREGEN_FLOAT_SHARES_FAIL %s" % type(exc).__name__)
     precalc, ok, failed = {}, 0, []
     for symbol in symbols:
         try:
@@ -745,6 +853,8 @@ def main():
             bakeables = bake_bakeables(symbol, params, lu_boards, market) if fact else {}
             if fact:
                 fact.update(bakeables)
+                if float_shares_map.get(symbol):
+                    fact["float_shares"] = float_shares_map[symbol]
                 precalc[symbol] = fact
                 ok += 1
             else:
@@ -752,6 +862,8 @@ def main():
                 bakeables = bake_bakeables(symbol, params, lu_boards, market)
                 if bakeables:
                     bakeables["src"] = "bake_only"
+                    if float_shares_map.get(symbol):
+                        bakeables["float_shares"] = float_shares_map[symbol]
                     precalc[symbol] = bakeables
                     ok += 1
                 else:

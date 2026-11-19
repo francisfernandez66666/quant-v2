@@ -138,6 +138,17 @@ run_probes() { # $1=读数文本；依赖全局 EXPECT_COMMIT
   else
     probe "readyz_json" 1 "code=${v:-missing} ok=${rd_ok:-missing} json=${rd_json:-missing} (SPA fallback or key mismatch)"
   fi
+
+  # 第 16 条探针（2026-11-19「假活」事故）：看门狗 timer 必须在位且在走。
+  # 事故形态是 quant 进程活着但所有 handler 卡死，systemd 的 Restart=always 不救 ⇒
+  # 站点离线近 10 分钟只能人工重启。判据只认「timer active + 最近跑过一次」，
+  # 不认它的执行结果（看门狗自己不重启才是常态）。
+  v="$(get WATCHDOG_TIMER)"
+  if [ "$v" = "active" ]; then
+    probe "watchdog_timer" 0 "state=$v"
+  else
+    probe "watchdog_timer" 1 "state=${v:-missing}（假活无人兜底：/livez 卡死只能人工重启）"
+  fi
 }
 
 summary() {
@@ -163,7 +174,8 @@ U3_QMT_ENABLED=false
 JOURNAL_ERRORS=0
 READYZ_CODE=503
 READYZ_IS_JSON=yes
-READYZ_OK=false"
+READYZ_OK=false
+WATCHDOG_TIMER=active"
   run_probes "$GREEN"
   GREEN_OK="$FAIL"
   PASS=0; FAIL=0; FAILED_IDS=""
@@ -203,6 +215,8 @@ fi
 emit HTTPS_HOME_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 https://quant-trading.top/ 2>/dev/null)"
 # §F3-20261114 /readyz 读数：状态码 + content-type 是否 JSON + body 的 ok 布尔。
 # 判据只消费布尔位与状态码，不回显 body（响应只含 5 个布尔 + build，无敏感字段）。
+WATCHDOG_TIMER="$(systemctl is-active quant-watchdog.timer 2>/dev/null || echo missing)"
+emit WATCHDOG_TIMER "$WATCHDOG_TIMER"
 READYZ_CODE="$(curl -ksS -o /tmp/readyz_deploy_probe.json -w '%{http_code}' --max-time 15 https://quant-trading.top/readyz 2>/dev/null)"
 emit READYZ_CODE "$READYZ_CODE"
 if head -c 1 /tmp/readyz_deploy_probe.json 2>/dev/null | grep -q '{' && curl -ksS -o /dev/null -w '%{content_type}' --max-time 15 https://quant-trading.top/readyz 2>/dev/null | grep -q 'application/json'; then

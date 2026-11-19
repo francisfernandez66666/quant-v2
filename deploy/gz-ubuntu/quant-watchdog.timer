@@ -1,0 +1,15 @@
+# quant-watchdog.timer — 每 2 分钟探活一次（2026-11-19 事故止血件）。
+#
+# 节拍理由：`/livez` 是纯内存探针（5s 超时），2 分钟一次的成本可忽略；
+# 连续 3 次失败（≈6 分钟）才重启 —— 比这更灵敏会把"一次 GC/一次慢查询"当成故障。
+[Unit]
+Description=Run the quant liveness watchdog every 2 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=quant-watchdog.service
+
+[Install]
+WantedBy=timers.target
