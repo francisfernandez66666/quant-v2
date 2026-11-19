@@ -553,6 +553,19 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         finally:
             mod._account_total_asset = saved
 
+    def test_rule_tag_only_accepts_fac_digits(self):
+        """载体侧的规则号白名单：只放 `fac_<数字>` 进备注，其它一律空串。
+
+        备注是幂等键的载体（`short_code_from_remark` 的最后一个连字符段），
+        塞进中文/空格/厂商号会让柜台比对与云端归因同时出错。
+        """
+        mod = self.mod
+        self.assertEqual(mod._rule_tag({"rule_id": "fac_160"}), "fac_160")
+        self.assertEqual(mod._rule_tag({"rule_id": " fac_7 "}), "fac_7")
+        for bad in ("fac_", "fac_x9", "fac_160_extra", "", None, "因子160", "FAC160"):
+            self.assertEqual(mod._rule_tag({"rule_id": bad}), "", "不该把 %r 写进备注" % (bad,))
+        self.assertEqual(mod._rule_tag(None), "")
+
     def test_turnover_pct_is_computed_from_turnover_and_float_shares(self):
         """§TURNOVER-WIRING：换手率必须能被算出来，否则 T 的流动性闸永远拒。
 

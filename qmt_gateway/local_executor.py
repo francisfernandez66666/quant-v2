@@ -618,14 +618,29 @@ def execution_mode_from(path):
     return mode
 
 
-def build_remark(short_code):
-    """Compose the broker remark for an order: <version>-<signal short code>.
+def build_remark(short_code, rule_tag=""):
+    """Compose the broker remark: <version>[-<rule tag>]-<signal short code>.
 
-    The version prefix makes the deployed artifact traceable; the short
-    code makes it idempotent. The remark is the only thing that survives a
-    restart, so it must carry both.
+    The version prefix makes the deployed artifact traceable; the short code
+    makes it idempotent; the optional rule tag says WHICH library rule fired
+    (`fac_160`), which is the only place that survives outside the strategy
+    process (2026-11-19 owner: attribute each fill to the exact factor rule id).
+
+    ORDER MATTERS: the short code must stay the LAST dash-separated segment,
+    because `short_code_from_remark` reads it with rsplit("-", 1)[-1] and that
+    value is the idempotency key matched against the counter's ORDER table.
+    Putting the tag in the middle keeps every existing reader working.
     """
-    return "%s-%s" % (STRATEGY_VERSION, short_code)
+    # ONE return (and one reference to the version constant) on purpose: build gate g4
+    # proves "the version actually reaches the remark" by looking for that constant in
+    # this function's body. Two return paths would let a regression break one of them
+    # while the gate stayed green -- a false green on the one field that makes an order
+    # traceable, which is worse than the duplication it saves.
+    parts = [STRATEGY_VERSION]
+    if rule_tag:
+        parts.append(rule_tag)
+    parts.append(short_code)
+    return "-".join(parts)
 
 
 def short_code_from_remark(remark):

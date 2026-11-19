@@ -2486,6 +2486,15 @@ var carrierSignalCodes = map[string]string{
 // after stripping the version prefix, empty when unknown.
 func carrierRemarkStrategy(remark string) string {
 	text := strings.TrimSpace(remark)
+	// §CARRIER-ATTRIB（2026-11-19 owner「归因到具体的战法号 160」）：载体从 v122 起会把
+	// 命中的因子规则号写进备注中段（`v121-20261119-fac_160-FC000034`），短码仍在**最后一段**
+	// （幂等键靠它）。规则号比短码精确一档（FC 只说明"因子综合"），所以优先返回它。
+	// 只认 `fac_<纯数字>`：备注是幂等键的载体，绝不解析任意字符串（中文/厂商号一律当噪声）。
+	// English: prefer the `fac_<digits>` segment the carrier now writes; it is one notch more
+	// precise than the FC short code, and anything else in the remark is noise.
+	if tag := carrierRemarkRuleTag(text); tag != "" {
+		return tag
+	}
 	// §REPORT-STAMP（2026-11-19）：备注形如 `v109-20261119-FC000034`——版本号自身带一个日期段，
 	// 所以**不能只剥第一个连字符**（旧实现剥完剩 `20261119-FC000034`，永远匹配不到信号短码，
 	// 于是载体成交的 signal_id 恒空、交易台账按战法归因全空）。这里按连字符逐段右剥，
@@ -2503,6 +2512,32 @@ func carrierRemarkStrategy(remark string) string {
 		}
 		if cand != "" {
 			return carrierSignalCodes[cand]
+		}
+	}
+	return ""
+}
+
+// carrierRemarkRuleTag 备注中段的因子规则号（`fac_160`），没有则空串。
+//
+// 判定只有一条：某一段是 `fac_` + 全数字。其余（版本段/日期段/短码段/任何怪串）一律跳过。
+func carrierRemarkRuleTag(remark string) string {
+	for _, seg := range strings.Split(remark, "-") {
+		if !strings.HasPrefix(seg, "fac_") {
+			continue
+		}
+		digits := seg[4:]
+		if digits == "" {
+			continue
+		}
+		ok := true
+		for i := 0; i < len(digits); i++ {
+			if digits[i] < '0' || digits[i] > '9' {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return seg
 		}
 	}
 	return ""

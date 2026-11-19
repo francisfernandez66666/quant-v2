@@ -24723,3 +24723,65 @@ fi
 [ "$B217_FAILED" = "0" ] || exit 1
 echo "ok - §217 §TURNOVER-WIRING 锁通过（腾讯批量取 + 纯函数解析 + 两条证据腿与 10% 交叉校验 + 载体现算与弃权 + 读数行 + 两套行为腿，累计判定点 ${CNT217}）"
 echo ""
+
+# ---------------------------------------------------------------------------
+# §218 §CARRIER-ATTRIB（2026-11-19 owner：物理机也要能归因到具体战法号，例如 fac_160）。
+#   现状：盒子只写 `FC`（factor_composite）——"哪条因子规则打的分"在 `rules_factor` 里
+#   早就带上来了（signal["rule_id"] = fac_160），却从没离开进程，于是台账只到"因子综合"。
+#   改法：备注变成 `<version>-fac_160-FC000034`——规则号进**中段**，短码仍是**最后一段**，
+#   因为 `short_code_from_remark` 用 rsplit("-",1)[-1] 取幂等键（放末尾会让 ORDER 表比对
+#   全部失配 ⇒ 同一笔单重复下）。云端 `carrierRemarkStrategy` 优先认 `fac_<数字>` 段。
+echo "==> 218 §CARRIER-ATTRIB（载体归因到具体因子号 fac_N）..."
+B218_FAILED=0
+fail218() {
+	echo "--- FAIL: §218 $*"
+	FAIL=1
+	B218_FAILED=1
+}
+CNT218=0
+LEX218=qmt_gateway/local_executor.py
+QS218=qmt_gateway/qmt_internal_strategy.py
+GO218=internal/server/qmt.go
+
+# ① 备注构造：规则号中段 + 短码末段（两条都要）。
+CNT218=$((CNT218 + 1))
+grep -qF 'def build_remark(short_code, rule_tag=""):' "$LEX218" || fail218 "build_remark 不再接受规则号"
+# 备注必须是「一条 return + 版本常量在列表首项」：这样 g4「版本必须进备注」只有一处
+# 可被破坏（两条 return 时，改坏其中一条 g4 照样绿——今天真被这枚假绿咬过）。
+grep -qF 'parts = [STRATEGY_VERSION]' "$LEX218" || fail218 "备注构造不再以版本常量开头（g4 会失去唯一的检查点）"
+grep -qF 'parts.append(rule_tag)' "$LEX218" || fail218 "规则号没进备注（归因回到只有 FC）"
+grep -qF 'parts.append(short_code)' "$LEX218" || fail218 "短码没进备注末段（幂等键失配）"
+grep -qF 'return "-".join(parts)' "$LEX218" || fail218 "备注不再是单条 return（g4 会变假绿）"
+grep -qF 'return text.rsplit("-", 1)[-1]' "$LEX218" || fail218 "short_code_from_remark 取法变了（幂等键解析必须仍取最后一段）"
+# ② 载体侧白名单：只放 fac_<纯数字>。
+CNT218=$((CNT218 + 1))
+grep -qF 'def _rule_tag(signal):' "$QS218" || fail218 "缺 _rule_tag（规则号出不了进程）"
+grep -qF 'if not digits or not digits.isdigit():' "$QS218" || fail218 "规则号没有数字白名单（中文/空格会进备注）"
+grep -qF 'remark = build_remark(signal["short_code"], _rule_tag(signal))' "$QS218" \
+	|| fail218 "下单点没把规则号传进备注"
+# ③ 云端反解：优先 fac_<数字>，旧格式继续能解。
+CNT218=$((CNT218 + 1))
+grep -qF 'func carrierRemarkRuleTag(remark string) string {' "$GO218" || fail218 "云端缺规则号反解"
+grep -qF 'if tag := carrierRemarkRuleTag(text); tag != "" {' "$GO218" || fail218 "云端没有优先认规则号"
+grep -qF 'if strings.HasPrefix(tail, code) && len(code) > len(cand) {' "$GO218" \
+	|| fail218 "旧格式（无规则号）的最长前缀匹配被删（存量成交会全部归因丢失）"
+# ④ 用例在册 + 三套行为腿。
+CNT218=$((CNT218 + 1))
+grep -qF 'test_rule_tag_sits_in_the_middle_and_keeps_the_short_code_last' qmt_gateway/tests/test_local_executor.py \
+	|| fail218 "缺备注构造用例"
+grep -qF 'test_rule_tag_only_accepts_fac_digits' qmt_gateway/tests/test_internal_strategy_sandbox.py \
+	|| fail218 "缺载体白名单用例"
+grep -qF 'carrierRemarkStrategy("v121-20261119-fac_160-FC000034")' internal/server/qmt_test.go \
+	|| fail218 "缺云端反解用例（新旧两种格式都要钉）"
+PY218=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_local_executor.py tests/test_internal_strategy_sandbox.py -q 2>&1 || true )
+grep_q 'passed' PY218 || { echo "--- FAIL: §218 载体行为腿未跑满：$(printf '%s\n' "$PY218" | tail -8)"; B218_FAILED=1; }
+if grep_q 'failed' PY218; then
+	echo "--- FAIL: §218 载体行为腿有红：$(printf '%s\n' "$PY218" | tail -8)"
+	B218_FAILED=1
+fi
+G218=$( go test ./internal/server -count=1 -run 'TestQMTReportRemarkAttribution' 2>&1 || true )
+grep_q '^ok' G218 || { echo "--- FAIL: §218 云端反解行为腿未过：$(printf '%s\n' "$G218" | tail -6)"; B218_FAILED=1; }
+
+[ "$B218_FAILED" = "0" ] || exit 1
+echo "ok - §218 §CARRIER-ATTRIB 锁通过（备注中段规则号 + 末段短码 + fac_<数字> 白名单 + 云端优先反解且旧格式不破 + 三套行为腿，累计判定点 ${CNT218}）"
+echo ""

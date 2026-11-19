@@ -541,6 +541,20 @@ class TestSignals(unittest.TestCase):
         for short in ("PB600000", "TP000001", "SL600000", "BK000001"):
             self.assertEqual(lex.short_code_from_remark(lex.build_remark(short)), short)
 
+    def test_rule_tag_sits_in_the_middle_and_keeps_the_short_code_last(self):
+        """§CARRIER-ATTRIB（2026-11-19 owner「归因到具体战法号 160」）。
+
+        备注形如 `<version>-fac_160-FC000034`：规则号进**中段**，短码仍是最后一段。
+        这不是排版洁癖——`short_code_from_remark` 用 rsplit("-",1)[-1] 取幂等键，
+        规则号若放末尾，柜台 ORDER 表比对会全部失配，同一笔单会被重复下。
+        """
+        remark = lex.build_remark("FC000034", "fac_160")
+        self.assertEqual(remark, lex.STRATEGY_VERSION + "-fac_160-FC000034")
+        self.assertEqual(lex.short_code_from_remark(remark), "FC000034")
+        # 不带规则号时逐字节维持旧格式（旧产物/旧柜台记录照旧能解析）。
+        self.assertEqual(lex.build_remark("FC000034"), lex.STRATEGY_VERSION + "-FC000034")
+        self.assertEqual(lex.short_code_from_remark(lex.build_remark("FC000034")), "FC000034")
+
 
 # ---------------------------------------------------------------------------
 # the fillable judgement (suspended / sealed limit board)

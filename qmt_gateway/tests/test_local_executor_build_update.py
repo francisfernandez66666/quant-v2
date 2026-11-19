@@ -176,8 +176,9 @@ class TestBuilderGatesBite(BuilderFixture):
     def test_g4_version_not_wired_into_the_remark_is_refused(self):
         """A version constant that no remark carries is decoration: the
         broker table could not be rebuilt from the remarks."""
-        bad = self.injected('return "%s-%s" % (STRATEGY_VERSION, short_code)',
-                            'return "%s-%s" % ("x", short_code)')
+        # 2026-11-19 §CARRIER-ATTRIB：build_remark 收敛成**一条 return**（拼 parts 列表），
+        # 这样 g4「版本必须进备注」只有一处可被破坏；注入锚点随之改到那一条上。
+        bad = self.injected('parts = [STRATEGY_VERSION]', 'parts = ["x"]')
         self.assertIn("g4_version_in_remark", self.fired_gates(bad))
 
     def test_g5_bare_number_in_a_rule_function_is_refused(self):

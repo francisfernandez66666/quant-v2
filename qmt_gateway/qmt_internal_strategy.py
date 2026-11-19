@@ -2528,6 +2528,24 @@ def sizing_cap(ctx, positions, intent="new", pending_buys=None):
     return amount, "", note
 
 
+def _rule_tag(signal):
+    """The attribution segment for the order remark: `fac_<digits>` or "".
+
+    2026-11-19 owner: the box could only say "factor_composite", not WHICH
+    factor (fac_160). The rule id was already on the signal (`rules_factor`
+    stamps it), it just never left the process. Only `fac_<digits>` is allowed
+    through: the remark is the idempotency key's carrier, so an arbitrary
+    string (Chinese, spaces, a vendor id) must never be spliced into it.
+    """
+    rule_id = str((signal or {}).get("rule_id") or "").strip()
+    if not rule_id.startswith("fac_"):
+        return ""
+    digits = rule_id[4:]
+    if not digits or not digits.isdigit():
+        return ""
+    return rule_id
+
+
 def _place(ContextInfo, signal):
     """One passorder attempt ladder. Returns (ok, reason).
 
@@ -2567,7 +2585,7 @@ def _place(ContextInfo, signal):
     allowed, why = _trade_session_ok()
     if not allowed:
         return False, why
-    remark = build_remark(signal["short_code"])
+    remark = build_remark(signal["short_code"], _rule_tag(signal))
     args = (op, int(PARAMS.get("order_type", 1101)), acct, code, pr_limit,
             float(signal["price"]), int(signal["qty"]))
     attempts = [

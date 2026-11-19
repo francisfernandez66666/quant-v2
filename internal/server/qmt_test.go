@@ -332,6 +332,21 @@ func TestQMTReportRemarkAttribution(t *testing.T) {
 	if got := carrierRemarkStrategy("v24-ZZ999999"); got != "" {
 		t.Fatalf("未知短码应返回空串, got %q", got)
 	}
+	// §CARRIER-ATTRIB（2026-11-19）：备注中段带因子规则号时，归因精确到 fac_160，
+	// 而短码仍在最后一段（存量解析器/幂等键都不破）。
+	if got := carrierRemarkStrategy("v121-20261119-fac_160-FC000034"); got != "fac_160" {
+		t.Fatalf("规则号应优先返回 fac_160, got %q", got)
+	}
+	if got := carrierRemarkStrategy("v121-20261119-FC000034"); got != "factor_composite" {
+		t.Fatalf("旧格式（无规则号）必须继续解析成 factor_composite, got %q", got)
+	}
+	// 噪声：非纯数字/空号/中文一律不认，退回短码归因（别把野串当战法名）。
+	if got := carrierRemarkStrategy("v1-fac_x9-FC000034"); got != "factor_composite" {
+		t.Fatalf("fac_x9 不是规则号，应退回短码归因, got %q", got)
+	}
+	if got := carrierRemarkStrategy("v1-fac_-FC000034"); got != "factor_composite" {
+		t.Fatalf("空号 fac_ 应退回短码归因, got %q", got)
+	}
 }
 
 // TestHandleTradeResultsEndpoint §TRADE-LEDGER 端点锁：台账读数按账号过滤、summary 按战法聚合。
