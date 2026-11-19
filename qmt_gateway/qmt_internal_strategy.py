@@ -2607,16 +2607,33 @@ def _flow_round_prepare(ContextInfo, positions, total, moment):
 
     Called from run_round before any signal is judged; sizing_cap and the buy
     gate read the cached result so a 1000-name round pays for one index read and
-    one snapshot decode. A missing ContextInfo (unit tests) still produces an
-    abstaining state instead of raising.
+    one snapshot decode.
+
+    NEVER RAISES, on purpose. This leg talks to the client (get_market_data_ex /
+    get_full_tick), and a readout leg that can abort the round is exactly how
+    2026-11-19 lost a whole day: a NameError inside a cash *probe* aborted every
+    round at the first buy candidate and took the sell legs with it. A broken
+    flow reading must therefore degrade to "abstain", never to "no trading".
     """
     vol = {"vol_state": "neutral", "delta": None, "r_yest": None, "r_ma5": None,
            "source": "", "reason": "flow_not_prepared"}
     if ContextInfo is not None and moment is not None:
-        vol = _vol_ratio_state(ContextInfo, moment)
-    snap = _flow_snapshot_state(moment) if moment is not None else {"sector_delta": {}}
-    held = _book_market_value(positions)
-    quadrant = _quadrant_state(vol, snap, held, total)
+        try:
+            vol = _vol_ratio_state(ContextInfo, moment)
+        except Exception as exc:  # noqa: BLE001 - a readout must never stop the round
+            _warn_once("flow_vol", "vol ratio raised: %s" % repr(exc)[:120])
+            vol = {"vol_state": "neutral", "delta": None, "r_yest": None, "r_ma5": None,
+                   "source": "", "reason": "vol_read_failed"}
+    snap = {"sector_delta": {}}
+    quadrant = {"decision": "neutral", "reason": "flow_not_prepared",
+                "pos_rel": 0.0, "vol_state": "neutral", "block": False}
+    try:
+        snap = _flow_snapshot_state(moment) if moment is not None else {"sector_delta": {}}
+        held = _book_market_value(positions)
+        quadrant = _quadrant_state(vol, snap, held, total)
+    except Exception as exc:  # noqa: BLE001 - same reason as above
+        _warn_once("flow_snap", "flow snapshot/quadrant raised: %s" % repr(exc)[:120])
+        held = 0.0
     _STATE["round_flow"] = {
         "moment_key": ("%s|%s" % (day_key(moment), hhmm_now(moment))) if moment is not None else "",
         "vol": vol, "snap": snap, "quadrant": quadrant,

@@ -469,5 +469,171 @@ class HotReloadFlowSnapshotTest(unittest.TestCase):
             (self.mod.BUILD_DIR, self.mod.HOTRELOAD_DB, self.mod.FLOW_SNAP_ATTEMPT) = keep
 
 
+class _CounterRow(object):
+    """柜台表行替身：只给判据要读的字段，其余留空让载体自己认"读不到"。"""
+
+    def __init__(self, **fields):
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+class _RoundContext(object):
+    """run_round 用的最小 ContextInfo：tick + 指数日K，其余一律空。"""
+
+    def __init__(self, ticks, index_amounts=None, stamps=None):
+        self._ticks = ticks
+        self._amounts = index_amounts or [100.0] * 7
+        self._stamps = stamps or ["20261112", "20261113", "20261116", "20261117",
+                                  "20261118", "20261119", "20261120"]
+
+    def get_full_tick(self, symbols):
+        return dict((s, self._ticks.get(s, {})) for s in symbols)
+
+    def get_market_data_ex(self, fields, codes, period="1d", count=0, *args, **kwargs):
+        out = {}
+        for code in codes:
+            out[code] = _FakeEntry(self._amounts, self._stamps)
+        return out
+
+
+class CarrierFlowRoundWiringTest(unittest.TestCase):
+    """接线锁：run_round 里那条腿**真的被调用**（不是"函数在产物里"）。
+
+    为什么必须跑真轮：本仓反复踩的形状是"模块在、没人问它"（移植规则、上行腿都栽过）。
+    这里钉三件事：① 每轮真的装配了 round_flow；② 每轮真的打了小时读数；
+    ③ 硬闸在 buy 分支里、且在 sizing 之前（放到 _place 之后就等于没有闸）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        rc, out, path = _build(cls.dir)
+        if rc != 0:
+            raise AssertionError("sandbox build failed: %s" % out[-800:])
+        cls.artifact_path = path
+        cls.mod = _load(path, "sandbox_flow_round_under_test")
+
+    def setUp(self):
+        # 每轮缓存按 day|HHMM 键存（同一分钟内复用），用例之间必须清掉，否则
+        # 第二条用例会读到第一条留下的弃权态——"这条腿坏了"和"缓存没清"就分不清了。
+        for key in ("round_flow", "vol_ratio_state", "flow_snapshot_state", "flow_tally"):
+            self.mod._STATE.pop(key, None)
+
+    def _run_round(self):
+        # 一轮"最干净的假柜台"：有资金、无持仓、无委托 ⇒ 买入链走得到判据、
+        # 卖出链无票可卖，于是这一轮只反映本批要测的那条腿。
+        mod = self.mod
+        symbol = (mod.PARAMS.get("symbols") or ["600000"])[0]
+        mod._SANDBOX_FNS.update({
+            "passorder": lambda *a: None,
+            "cancel": lambda *a: None,
+            "get_account": lambda *a: "8001",
+            "get_trade_detail_data": lambda acct, kind, table: (
+                [_CounterRow(m_dAvailable=500000.0, m_dBalance=500000.0,
+                             total_asset=500000.0)] if table == "ACCOUNT" else []),
+        })
+        mod._STATE.update({"acct": "8001", "acct_type": "", "ops": [], "cancel_tried": [],
+                           "warned": {}, "last_round": 0.0, "flow_log_key": ""})
+        logs = []
+        original = mod._log
+        mod._log = lambda text: logs.append(text)
+        try:
+            summary = mod.run_round(_RoundContext(
+                {symbol: {"last_price": 9.7, "prev_close": 10.0, "volume": 100000,
+                          "ask1": 9.71, "bid1": 9.7}}), _MID_SESSION)
+        finally:
+            mod._log = original
+        return summary, logs
+
+    def test_round_prepares_the_flow_readings(self):
+        self._run_round()
+        round_flow = self.mod._STATE.get("round_flow") or {}
+        self.assertTrue(round_flow, "run_round 没装配 round_flow ⇒ _flow_round_prepare 没被调用")
+        self.assertEqual(round_flow.get("moment_key"),
+                         "%s|%s" % (self.mod.day_key(_MID_SESSION),
+                                    self.mod.hhmm_now(_MID_SESSION)),
+                         "round_flow 的分钟键与本轮时刻不一致（传错 moment？）")
+        # 指数日K 是假数据（7 根全 100、末根=今日）⇒ 量比腿必须真的算出数：
+        # 10:30 elapsed=60 ⇒ 折算 ×4 ⇒ r_yest=r_ma5=4.0 ⇒ 放量。
+        # 这条同时证明"取的是 bar 而不是 tick"（source 后缀）与"折算真的做了"（4.0 而非 1.0）。
+        vol = round_flow.get("vol") or {}
+        self.assertEqual(vol.get("reason"), "", vol)
+        self.assertAlmostEqual(vol.get("r_yest"), 4.0, places=3)
+        self.assertEqual(vol.get("vol_state"), "surge", vol)
+        self.assertTrue(str(vol.get("source")).endswith(":bar"), vol)
+
+    def test_round_prints_the_hourly_flow_line(self):
+        _summary, logs = self._run_round()
+        lines = [line for line in logs if line.startswith("flow vol_state=")]
+        self.assertEqual(len(lines), 1, "小时读数没打（或打了两遍）：%s" % logs[:6])
+        self.assertIn("sector_hit=", lines[0])
+
+    def test_quadrant_gate_sits_inside_the_buy_branch_before_sizing(self):
+        src = open(self.artifact_path, encoding="utf-8").read()
+        body = src[src.index("def run_round("):src.index("def cancel_leg(")]
+        i_intent = body.index("intent = _intent_of(")
+        i_block = body.index('"flow_quadrant_block"')
+        i_sizing = body.index("sizing_cap(ctx, positions, intent")
+        self.assertLess(i_intent, i_block,
+                        "四象限硬闸没有落在 intent 算出之后（判据拿不到 new/add）")
+        self.assertLess(i_block, i_sizing,
+                        "四象限硬闸落在 sizing 之后：等于先算完额度再拦，闸形同虚设")
+
+    def test_a_raising_market_data_call_never_stops_the_round(self):
+        """只读腿抛异常必须降级成弃权，绝不许把整轮带走（11-19 那次全天零委托的形状）。"""
+        class _Boom(_RoundContext):
+            """日K 全是历史（无今日那根），于是量比腿去读指数 tick —— 那里炸。"""
+
+            def __init__(self, ticks):
+                super(_Boom, self).__init__(
+                    ticks, index_amounts=[100.0] * 6,
+                    stamps=["20261112", "20261113", "20261116", "20261117",
+                            "20261118", "20261119"])
+
+            def get_full_tick(self, symbols):
+                raise RuntimeError("client exploded")
+
+        # 同上：假柜台 + 客户端在 tick 读上炸；判的是"整轮活下来且该腿弃权"。
+        mod = self.mod
+        symbol = (mod.PARAMS.get("symbols") or ["600000"])[0]
+        mod._SANDBOX_FNS.update({
+            "passorder": lambda *a: None, "cancel": lambda *a: None,
+            "get_account": lambda *a: "8001",
+            "get_trade_detail_data": lambda acct, kind, table: (
+                [_CounterRow(m_dAvailable=500000.0, m_dBalance=500000.0,
+                             total_asset=500000.0)] if table == "ACCOUNT" else []),
+        })
+        mod._STATE.update({"acct": "8001", "acct_type": "", "ops": [], "cancel_tried": [],
+                           "warned": {}, "last_round": 0.0})
+        summary = mod.run_round(_Boom({symbol: {"last_price": 9.7, "prev_close": 10.0,
+                                                "volume": 100000, "ask1": 9.71,
+                                                "bid1": 9.7}}), _MID_SESSION)
+        self.assertIsInstance(summary, dict)
+        vol = (mod._STATE.get("round_flow") or {}).get("vol") or {}
+        # 读取链自己会把异常收成弃权（tick 读失败 → 无当日额），所以这里判的是
+        # "整轮活下来 + 该腿弃权"，而不是某一条具体 reason。
+        self.assertTrue(str(vol.get("reason")).startswith("vol_"), vol)
+        self.assertIsNone(vol.get("delta"), "读失败却给出了 delta（会把缺数算进 blend）")
+
+    def test_prepare_guard_turns_an_unexpected_exception_into_abstain(self):
+        """兜底那一层单独咬：量比腿真抛出来时，round_flow 必须是一份弃权态而不是异常。
+
+        上一条用例走的是"客户端异常被各层自己吞掉"的现实路径；这一条直接让
+        _vol_ratio_state 抛，验的是 _flow_round_prepare 自己的 try/except 还在。
+        """
+        mod = self.mod
+        saved = mod._vol_ratio_state
+        mod._vol_ratio_state = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            round_flow = mod._flow_round_prepare(object(), {}, 100000.0, _MID_SESSION)
+        finally:
+            mod._vol_ratio_state = saved
+        vol = round_flow.get("vol") or {}
+        self.assertEqual(vol.get("reason"), "vol_read_failed", vol)
+        self.assertIsNone(vol.get("delta"))
+        self.assertFalse((round_flow.get("quadrant") or {}).get("block"),
+                         "读失败时不许落硬闸（弃权方向必须是放行，不是拦）")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25695,7 +25695,7 @@ READS231=$(printf '%s\n' "$FST" | grep -c '_flow_param("' || true)
 #    折成一句"没数据"就会让"今天没有资金流"和"资金流说中性"同形。
 CNT231=$((CNT231 + 1))
 for anchor in vol_premarket vol_bad_history flow_snapshot_missing flow_snapshot_stale_day \
-              flow_snapshot_expired flow_knob_missing; do
+              flow_snapshot_expired flow_knob_missing vol_read_failed; do
 	grep_q "$anchor" FST F || fail231 "缺弃权锚 ${anchor}（缺数与"读数为中性"会变同形）"
 done
 
