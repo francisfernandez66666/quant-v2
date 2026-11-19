@@ -6742,15 +6742,7 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 	// 快照把这两个维度补上。只在对应维为空时补，绝不覆盖主循环刚算出来的新值。
 	// English: seed the two sizing dimensions from today's persisted risk-tier row when the async
 	// pipeline has not produced them yet; never overwrite a value the main loop just computed.
-	if r.EmotionPhase == "" || r.MarketState == "" {
-		seedEmo, seedState := e.todayRegimeSeed(now)
-		if r.EmotionPhase == "" {
-			r.EmotionPhase = seedEmo
-		}
-		if r.MarketState == "" {
-			r.MarketState = seedState
-		}
-	}
+	e.applyRegimeSeeds(&r, now)
 	r.EmotionEnabled = e.emotionConfigured()
 	r.MarketStateEnabled = e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState })
 	// §N6-RISK：Red 硬拦只由应急开关触发；默认走 tier_scales.Red 权重收束。
@@ -6762,6 +6754,30 @@ func (e *Engine) assembleRegime(now time.Time) signalctl.Regime {
 	e.fillMacroEvents(&r, now)
 	e.fillHoliday(&r, now)
 	return r
+}
+
+// applyRegimeSeeds 把当日风险档快照里的两维读数补进 r 的**空字段**（§REGIME-SEED）。
+//
+// 为什么单独抽出来：这条腿有**两个**调用点——assembleRegime（新装配）与 regimeForAccount
+// （overlayDynamicRegime 之后）。后者不是重复劳动：overlay 无条件用 last* 覆盖动态字段，
+// 而 last* 在异步流水线跑完前是空串，会把种子又抹掉（现网 14:01:42 打种子、14:01:43 仍报盲区）。
+// 只补空、绝不覆盖已有值；种子本身按日缓存，调用再密也只查一次库。
+// English: fills only the EMPTY dimensions from today's seeded risk-tier reading; must run
+// after the dynamic overlay or the overlay would wipe the seed right back to empty.
+func (e *Engine) applyRegimeSeeds(r *signalctl.Regime, now time.Time) {
+	if r == nil {
+		return
+	}
+	if r.EmotionPhase != "" && r.MarketState != "" {
+		return
+	}
+	seedEmo, seedState := e.todayRegimeSeed(now)
+	if r.EmotionPhase == "" {
+		r.EmotionPhase = seedEmo
+	}
+	if r.MarketState == "" {
+		r.MarketState = seedState
+	}
 }
 
 // todayRegimeSeed 当天风险档快照里已有的情绪相位/市场状态（§REGIME-SEED，只读一次/日）。
@@ -6835,6 +6851,10 @@ func (e *Engine) regimeForAccount(uid string) signalctl.Regime {
 	// English: §A1 — the 3s cache keeps only static/expensive readings; dynamic fields are
 	// overlaid from the latest last* on every call so dispatch never reuses stale risk state.
 	e.overlayDynamicRegime(&r)
+	// §REGIME-SEED 第二处（必须）：overlayDynamicRegime 无条件用 last* 覆盖动态字段，
+	// 而 last* 在异步流水线跑完前是空串 ⇒ 它会把 assembleRegime 刚补上的种子又抹掉。
+	// 现网实测（2026-11-19 14:01:42/43）：种子日志打了，紧接着仍报 dims 缺两维。
+	e.applyRegimeSeeds(&r, time.Now())
 	r.SizeCfg = e.sizingConfigFor(uid)
 	// §DYN-SIZE P5：两态止损偏移（只取市场态腿——逐持仓的个股/N形/做空豁免在 CheckPositionAlerts
 	// 侧各自判定；这里回答的是"今天新开仓的止损线会被放宽多少"，供风险预算守恒缩仓）。

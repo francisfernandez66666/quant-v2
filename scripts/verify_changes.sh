@@ -24623,8 +24623,15 @@ grep -qF 'if row.TradeDate != day {' "$EG216" || fail216 "种子没按交易日�
 grep -qF 'ListMarketRiskDaily(day, day)' "$EG216" || fail216 "种子不是按当天区间取（区间写成开区间会带出历史行）"
 # ③ 只补空、绝不覆盖主循环刚算出的新值。
 CNT216=$((CNT216 + 1))
-grep -qF 'if r.EmotionPhase == "" || r.MarketState == "" {' "$EG216" || fail216 "种子无条件执行（会覆盖主动线新读数）"
+grep -qF 'if r.EmotionPhase != "" && r.MarketState != "" {' "$EG216" || fail216 "两维都齐时的提前返回不见了（种子会无条件执行）"
+grep -qF 'if r.EmotionPhase == "" {' "$EG216" || fail216 "情绪那一维没有判空保护（会覆盖主循环新读数）"
 grep -qF 'if r.MarketState == "" {' "$EG216" || fail216 "市场状态那一维没有判空保护"
+# ③b 两个调用点都在册（overlay 之后那处是现网实测补的：只在 assembleRegime 补会被
+# overlayDynamicRegime 用空 last* 盖回去，现象是"种子日志打了、决策仍然半仓"）。
+CNT216=$((CNT216 + 1))
+CALL216=$(grep -c 'e.applyRegimeSeeds(&r, ' "$EG216" || true)
+[ "${CALL216:-0}" -eq 2 ] || fail216 "applyRegimeSeeds 调用点数 ${CALL216}≠2（assembleRegime + overlayDynamicRegime 之后各一次）"
+grep -qF 'e.overlayDynamicRegime(&r)' "$EG216" || fail216 "regimeForAccount 的 overlay 不见了（第二处补种子的前提）"
 # ④ 负锁：种子腿不许写 last*（那会让"补种子"变成"伪造主循环读数"，下一轮就无法区分新旧）。
 CNT216=$((CNT216 + 1))
 if awk '/func \(e \*Engine\) todayRegimeSeed/,/^}$/' "$EG216" | grep -qE 'e\.last(MarketState|EmotionPhase) *='; then
@@ -24633,9 +24640,9 @@ fi
 # ⑤ 用例在册 + 行为腿（三条边界各一条）。
 CNT216=$((CNT216 + 1))
 [ -f internal/engine/regime_seed_20261119_test.go ] || fail216 "缺 §REGIME-SEED 回归用例"
-G216=$( go test ./internal/engine -count=1 -run 'TestRegimeSeed' 2>&1 || true )
+G216=$( go test ./internal/engine -count=1 -run 'TestRegimeSeed|TestApplyRegimeSeeds' 2>&1 || true )
 grep_q '^ok' G216 || { echo "--- FAIL: §216 行为腿未过：$(printf '%s\n' "$G216" | tail -8)"; B216_FAILED=1; }
 
 [ "$B216_FAILED" = "0" ] || exit 1
-echo "ok - §216 §REGIME-SEED 锁通过（字段/函数在册 + 只认当天 + 只补空 + 种子不写 last* 负锁 + 3 条行为腿，累计判定点 ${CNT216}）"
+echo "ok - §216 §REGIME-SEED 锁通过（字段/函数在册 + 只认当天 + 只补空 + 两个调用点 + 种子不写 last* 负锁 + 4 条行为腿，累计判定点 ${CNT216}）"
 echo ""

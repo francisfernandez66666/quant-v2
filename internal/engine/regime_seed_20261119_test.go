@@ -19,6 +19,7 @@ import (
 
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 )
 
@@ -62,6 +63,31 @@ func TestRegimeSeedIgnoresOtherDays(t *testing.T) {
 	emo, st := e.todayRegimeSeed(now)
 	if emo != "" || st != "" {
 		t.Fatalf("昨天的行不许当今天的种子，got emotion=%q state=%q", emo, st)
+	}
+}
+
+// TestApplyRegimeSeedsFillsOnlyEmpty 只补空、不覆盖主循环刚算出的新值。
+//
+// 这条用例对应现网那条真实的覆盖：`overlayDynamicRegime` 用 last*（空）把种子抹掉，
+// 于是"种子打了日志但决策仍然半仓"。补完之后必须既能补空、又不能碰非空值。
+func TestApplyRegimeSeedsFillsOnlyEmpty(t *testing.T) {
+	e, db := newRegimeSeedEngine(t)
+	now := time.Date(2026, 11, 19, 14, 1, 0, 0, cntime.Loc)
+	if err := db.UpsertMarketRiskDaily(store.MarketRiskDailyRow{
+		TradeDate: data.TradingDayDate(now), Emotion: "高潮", MarketState: "range",
+	}); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	empty := signalctl.Regime{}
+	e.applyRegimeSeeds(&empty, now)
+	if empty.EmotionPhase != "高潮" || empty.MarketState != "range" {
+		t.Fatalf("空字段必须补种子，got emotion=%q state=%q", empty.EmotionPhase, empty.MarketState)
+	}
+	// 非空值绝不许被种子覆盖（主循环刚算出来的新读数优先）。
+	live := signalctl.Regime{EmotionPhase: "冰点", MarketState: "bear"}
+	e.applyRegimeSeeds(&live, now)
+	if live.EmotionPhase != "冰点" || live.MarketState != "bear" {
+		t.Fatalf("种子覆盖了主循环新读数：emotion=%q state=%q", live.EmotionPhase, live.MarketState)
 	}
 }
 
