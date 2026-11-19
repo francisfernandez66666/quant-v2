@@ -24550,7 +24550,29 @@ done
 grep -qF 'TestRoutingCoversAllDefaultRules' internal/metrics/*_test.go \
 	|| fail215 "路由覆盖用例被删（那条等值锁是「加了规则忘了路由」的唯一守门人）"
 
-# ⑨ 行为腿（真跑：四个维度 + 日期两写法 + 非法日期 + 首轮即 fire / 成对销案）。
+# ⑨ 历史行回填脚本（§REPORT-STAMP 的收尾腿：写生产库，默认必须只读）。
+# 生产 2026-11-19 13:09 首次实跑：13 条成交先补（今日 7 笔已成 + 拆单），反向再补 7 条委托，
+# 余下 32/30 条因证据缺失原样保留——「补不到就不补」是这条脚本的核心纪律。
+CNT215=$((CNT215 + 1))
+[ -f scripts/backfill_report_stamp_20261119.py ] || fail215 "缺历史行回填脚本（缺日期的时间戳只能靠逐行证据补）"
+grep -qF 'ap.add_argument("--apply", action="store_true"' scripts/backfill_report_stamp_20261119.py \
+	|| fail215 "回填脚本缺 --apply 开关（缺省必须 dry-run：它写的是生产库）"
+grep -qF 'BACKFILL_RESULT=DRYRUN' scripts/backfill_report_stamp_20261119.py \
+	|| fail215 "回填脚本没有 dry-run 收尾读数（不做任何证据链就动库时没人看得出）"
+grep -qF 'if days and len(days) == 1:' scripts/backfill_report_stamp_20261119.py \
+	|| fail215 "回填脚本不再要求「日期唯一」（跨日复用裸号时会把日子猜错）"
+grep -qF 'con.execute("BEGIN IMMEDIATE")' scripts/backfill_report_stamp_20261119.py \
+	|| fail215 "回填脚本没有整体事务（半途失败会留半态）"
+CNT215=$((CNT215 + 1))
+[ -f qmt_gateway/tests/test_backfill_report_stamp_20261119.py ] || fail215 "缺回填脚本回归用例"
+BT215=$( cd qmt_gateway && /usr/local/bin/python3 -m pytest tests/test_backfill_report_stamp_20261119.py -q 2>&1 || true )
+grep_q 'passed' BT215 || { echo "--- FAIL: §215 回填脚本行为腿未跑满：$(printf '%s\n' "$BT215" | tail -8)"; B215_FAILED=1; }
+if grep_q 'failed' BT215; then
+	echo "--- FAIL: §215 回填脚本行为腿有红：$(printf '%s\n' "$BT215" | tail -8)"
+	B215_FAILED=1
+fi
+
+# ⑩ 行为腿（真跑：四个维度 + 日期两写法 + 非法日期 + 首轮即 fire / 成对销案）。
 CNT215=$((CNT215 + 1))
 G215=$( go test ./internal/store -count=1 -run 'TestCountSellUndelivered' 2>&1 || true )
 grep_q '^ok' G215 || { echo "--- FAIL: §215 账本层行为腿未过：$(printf '%s\n' "$G215" | tail -8)"; B215_FAILED=1; }
@@ -24559,5 +24581,5 @@ M215=$( go test ./internal/metrics -count=1 -run 'TestSellUndelivered|TestRoutin
 grep_q '^ok' M215 || { echo "--- FAIL: §215 规则层行为腿未过：$(printf '%s\n' "$M215" | tail -8)"; B215_FAILED=1; }
 
 [ "$B215_FAILED" = "0" ] || exit 1
-echo "ok - §215 §SELL-UNDELIVERED 锁通过（五元组 gt0/0s/p1 + 显式必推 + 静默域负锁 + 计数四维 + 日期归一 + 心跳接线 + 三处计数等值 + 用例在册 + 两套行为腿，累计判定点 ${CNT215}）"
+echo "ok - §215 §SELL-UNDELIVERED 锁通过（五元组 gt0/0s/p1 + 显式必推 + 静默域负锁 + 计数四维 + 日期归一 + 心跳接线 + 三处计数等值 + 用例在册 + 历史行回填脚本（dry-run/唯一日/整体事务）+ 三套行为腿，累计判定点 ${CNT215}）"
 echo ""
