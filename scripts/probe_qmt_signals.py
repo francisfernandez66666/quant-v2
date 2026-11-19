@@ -17,6 +17,10 @@
    period LV1=transactioncount1d/1m、LV2=hftransactioncount*/l2transactioncount；
    get_market_data_ex + 先 download_history_data2。三个坑：
    ① netInflow*Amount 在 LV1 官方全 0，优先看 zjbyNetInflow / 成交量；
+      **2026-11-20 物理机实测补一条**：东莞证券 QMT 实盘端（XtItClient，非投研版）上
+      `transactioncount1d` / `tick` 两个 period 的八列**全部是 NaN**（列名齐全、值一个都没有），
+      所以"LV1 全 0"要读成"本客户端根本没有资金流数据"——净流入只能走盒子 /flow/money
+      中继取东财（见下方 §实测结论）；
    ② 迅投分档阈值自家口径，别和东财对数；③ 不带 Dx=当日累计、带 Dx=增量，
    **绝不做跨日同一时点相减**。
 3. **北向独立一套**：FFFFFF.SGT + northfinancechange1d/1m，或 get_north_finance_change('1d')；
@@ -31,9 +35,10 @@
 - 一次跑完不循环、不下单、不撤单、不落盘、不改任何配置。
 - **所有 print 行纯 ASCII**（GBK/SSH 回传会撕裂中文），中文只出现在注释里。
 
-## 用法（盒上 CPython 3.10~3.13，只读）
+## 用法（盒上只有 QMT 自带 CPython 3.6.8；文件头已带 3.6/pythonw 兼容垫）
 
-    python probe_qmt_signals.py                          # 两段全跑（默认）
+    "D:/东莞证券QMT实盘交易端/bin.x64/pythonw.exe" probe_qmt_signals.py   # 无控制台，输出需重定向
+    python3 probe_qmt_signals.py                          # 两段全跑（默认）
     python probe_qmt_signals.py --section flow           # 只跑资金流+北向
     python probe_qmt_signals.py --section vol            # 只跑相对放量
     python probe_qmt_signals.py --download --start 20261001 --end 20261119
@@ -44,11 +49,40 @@
   FLOW 段看 QPROBE FLOW_<标签>_<period>_flow_hits 是否出现 zjby*/netInflow*；
         _allzero_*=1 的金额列不可当信号；NORTH_* 看北向字段。
   VOL  段看 QPROBE VOL_<标签>_<basis>_r_yest / _r_ma5 / _is_vol 与 _has_suspendFlag。
+
+## 2026-11-20 物理机实测结论（东莞证券 QMT 实盘端，盒子 `D:/东莞证券QMT实盘交易端`）
+
+一、**外部 xtdata 通道不通，内部通道通**。`bin.x64/pythonw.exe`（CPython 3.6.8，xtquant 就在
+    `bin.x64/Lib/site-packages/xtquant`）里 import 一切正常，但 `get_market_data_ex` 一律抛
+    `无法连接xtquant服务，请检查QMT-投研版或QMT-极简版是否开启`（客户端未启动与已启动各测一次，
+    同一错误）⇒ XtItClient 不对外提供 xtdata service，量/净流入只能在**策略内**用 ContextInfo 取。
+二、**量：可用，且与云端同量纲（只需 ÷100）**。策略内 `ContextInfo.get_market_data_ex`
+    `1d`/`1m`/`5m` 三档的 `close/volume/amount` 全部有值：
+      · 指数 000001.SH 11-19 `amount=636,909,057,689`（元，与东财 index_daily 逐位一致）、
+        `volume=412,912,755`（**手**，×100 = 新浪 sh000001 的 41,291,275,500 股）；
+      · 个股 600519.SH `1m` 末根 `volume=1662`（手）、`amount=242,625,574`（元）
+        ⇒ 1662×100×1460.21 = 242,625,574，两种量纲自洽；
+      · 同一份日K可直接算出 r_yest / r_ma5（11-19 指数：`r_yest=0.979511`、`r_ma5=0.861360`）。
+三、**净流入：QMT 自己给不出**。`transactioncount1d`/`tick` 的 zjby*/netInflow* 八列全部 NaN
+    （列名在、值全无）⇒ 生产口径只能是盒子 `/flow/money` 中继东财，且该路已实测与云端同值
+    （11-18 主力净额 -3,411,456,000 → pct -0.524652 → delta -0.174884125，与 trading.db 落库
+    逐位一致）。归一公式见 internal/engine 的 `FlowPctToDelta`，两侧共用，不许各写一份。
 """
 import argparse
+import os
 import sys
 
-sys.stdout.reconfigure(line_buffering=True)
+# 盒子侧只能用 QMT 自带解释器（`bin.x64\pythonw.exe` = CPython 3.6.8，xtquant 就装在那棵树里），
+# 它有两个与桌面 Python 不同的形态，本脚本必须在两边都能跑：
+#   ① pythonw.exe 无控制台时 `sys.stdout` 可能是 None —— 直接 print 会抛 AttributeError；
+#   ② `stream.reconfigure()` 是 3.7+ 才有的方法，3.6 上不存在。
+# 这里只做兼容垫，不改变任何输出形态与判据（3.6 下用 -u 或显式 flush 兜住行缓冲）。
+# English: the box only has QMT's embedded CPython 3.6.8 (pythonw.exe, no console, no reconfigure);
+# both guards are compatibility shims only — output format and judgements are unchanged.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 # ---- FLOW 段常量 ----
 # (语义标签, 后缀式, 前缀式)。指数一律显式交易所；同时测两种写法。

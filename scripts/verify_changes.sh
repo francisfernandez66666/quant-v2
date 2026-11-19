@@ -25532,3 +25532,108 @@ rm -rf "$EV229_DIR"
 [ "$B229_FAILED" = "0" ] || exit 1
 echo "ok - §229 §TRADE-EVIDENCE 锁通过（只补日期白名单+成交编号优先+歧义fail-closed+写前备份+演练不写+幂等+歧义不动，累计判定点 ${CNT229}）"
 echo ""
+echo "==> 230 §PROBE-BOX-COMPAT（盒子探针：3.6/pythonw 兼容垫只做垫 + 行为腿判退出码 + 只读纪律 + 实测口径在册）..."
+B230_FAILED=0
+fail230() {
+	echo "--- FAIL: §230 $*"
+	FAIL=1
+	B230_FAILED=1
+}
+CNT230=0
+PB230=scripts/probe_qmt_signals.py
+
+# ① 在册 + 语法。
+# 这份探针是本轮"量/净流入能不能拿"的唯一取证工具，缺件或语法坏＝取证无据。
+CNT230=$((CNT230 + 1))
+[ -s "$PB230" ] || fail230 "物理机探针脚本不在册（${PB230}）"
+python3 -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "$PB230" 2>/dev/null \
+	|| fail230 "探针脚本语法不过"
+
+# ② 兼容垫两处。盒子只有 QMT 自带的 CPython 3.6.8（bin.x64/pythonw.exe），
+#    它没有控制台（stdout 可能是 None）也没有 3.7+ 的 reconfigure()；两处缺一，
+#    探针在盒上就是一行 AttributeError，而"盒上跑不起来"会被读成"盒上取不到数"。
+CNT230=$((CNT230 + 1))
+grep -qF 'if sys.stdout is None:' "$PB230" \
+	|| fail230 "缺 stdout=None 守卫（pythonw 无控制台时 print 会抛 AttributeError）"
+grep -qF 'sys.stdout = open(os.devnull, "w")' "$PB230" \
+	|| fail230 "stdout=None 守卫没真兜住（没有落到 devnull）"
+
+CNT230=$((CNT230 + 1))
+grep -qF 'if hasattr(sys.stdout, "reconfigure"):' "$PB230" \
+	|| fail230 "缺 reconfigure 的 hasattr 守卫（3.6 上根本没有这个方法）"
+UNGUARDED230=$( python3 - "$PB230" <<'PY230G'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+bad = 0
+for i, line in enumerate(lines):
+    s = line.strip()
+    if s.startswith("#") or "sys.stdout.reconfigure(" not in s:
+        continue
+    prev = lines[i - 1] if i else ""
+    if 'hasattr(sys.stdout' not in prev:
+        bad += 1
+print(bad)
+PY230G
+)
+[ "$UNGUARDED230" = "0" ] \
+	|| fail230 "有 ${UNGUARDED230} 处未守卫的 reconfigure 调用（3.6 上 AttributeError 打死整份探针）"
+
+# ③ 行为腿（判退出码，不判输出文本）。两条都用 `--help` 走完模块级垫 + argparse，
+#    在桌面 Python 上把盒子的两种形态复刻一遍：stdout 为 None、stdout 没有 reconfigure。
+CNT230=$((CNT230 + 1))
+if command -v python3 >/dev/null 2>&1; then
+	PB230_RC=0
+	PROBE230="$PB230" python3 -c '
+import os, runpy, sys
+sys.stdout = None
+sys.argv = [os.environ["PROBE230"], "--help"]
+runpy.run_path(os.environ["PROBE230"], run_name="__main__")
+' >/dev/null 2>&1 || PB230_RC=$?
+	[ "$PB230_RC" = "0" ] || fail230 "stdout=None 形态跑不起来（退出码 ${PB230_RC}）"
+
+	CNT230=$((CNT230 + 1))
+	PB230_RC=0
+	PROBE230="$PB230" python3 -c '
+import os, runpy, sys
+class _NoReconf(object):
+    def write(self, s):
+        pass
+    def flush(self):
+        pass
+sys.stdout = _NoReconf()
+sys.argv = [os.environ["PROBE230"], "--help"]
+runpy.run_path(os.environ["PROBE230"], run_name="__main__")
+' >/dev/null 2>&1 || PB230_RC=$?
+	[ "$PB230_RC" = "0" ] || fail230 "无 reconfigure 形态跑不起来（退出码 ${PB230_RC}；3.6 上就是这个形态）"
+else
+	echo "INFO - §230 无 python3，两条行为腿未跑（这份绿不含兼容垫的行为判定）"
+fi
+
+# ④ 3.6 语法面负锁：用量子运算符 / 3.9+ 的字符串方法写回来，桌面 Python 照样绿、盒上必炸。
+CNT230=$((CNT230 + 1))
+if grep -qF ':=' "$PB230"; then
+	fail230 "出现量子运算符 :=（3.8+ 语法，盒上 3.6 直接 SyntaxError）"
+fi
+if grep -qE 'removeprefix|removesuffix' "$PB230"; then
+	fail230 "出现 removeprefix/removesuffix（3.9+，盒上 3.6 没有）"
+fi
+if grep -qE '^from __future__ import annotations' "$PB230"; then
+	fail230 "出现 __future__ annotations（3.7+，盒上 3.6 不支持）"
+fi
+
+# ⑤ 只读纪律：探针只许读行情，任何交易会话/资本动作写进来都是 10-29 那次拖崩客户端的形态。
+CNT230=$((CNT230 + 1))
+if grep -qniE 'import[[:space:]]+xttrader|XtQuantTrader[[(]|passorder\(|order_stock\(|cancel_order_stock\(' "$PB230"; then
+	fail230 "探针里出现交易会话或资本动作（只读探针不许带下单/撤单能力）"
+fi
+
+# ⑥ 实测口径在册：11-20 那三条读数是"量要不要 ÷100 / 净流入该走哪条腿"的唯一证据，
+#    "顺手清理注释"删掉它，后人就得再上盒子重测一遍，还可能把量纲读反。
+CNT230=$((CNT230 + 1))
+grep -qF 'volume=412,912,755' "$PB230" || fail230 "丢了指数 volume 实测值（手，×100 = 新浪 41,291,275,500 股）"
+grep -qF '全部是 NaN' "$PB230" || fail230 "丢了 QMT 资金流八列全 NaN 的实测结论（会被读回'LV1 只是全 0'）"
+grep -qF '0.174884125' "$PB230" || fail230 "丢了中继与云端 delta 逐位一致的取证值"
+
+[ "$B230_FAILED" = "0" ] || exit 1
+echo "ok - §230 §PROBE-BOX-COMPAT 锁通过（stdout=None 守卫+hasattr 守卫+未守卫调用零处+两条行为腿判退出码+3.6 语法面三条负锁+只读纪律+实测口径在册，累计判定点 ${CNT230}）"
+echo ""
