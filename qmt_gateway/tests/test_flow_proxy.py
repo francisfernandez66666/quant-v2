@@ -170,6 +170,51 @@ class TestRelayAndCache(unittest.TestCase):
         self.assertEqual(diff[0]["f62"], -987654321.0)
 
 
+class TestSectorConstituentWhitelist(unittest.TestCase):
+    """§FLOW-SECTOR-JOIN（owner 2026-11-20 裁决 A）：白名单唯一新增面 `b:BKxxxx`。
+
+    为什么这组锁不能省：这条中继是盒子上**唯一一条主动出网**的腿，fs 一旦从"两档板块列表"
+    放宽成"任意字符串"，盒子立刻变成通用出网跳板（`fs=b:` 后面能接任何上游认识的选择器）。
+    所以只放行 `b:BK` + 2~6 位数字，其余一律 400；字段面仍只认生产腿那九个。
+    """
+
+    def setUp(self):
+        flow_proxy.clear_cache()
+
+    def test_sector_constituents_are_allowed(self):
+        for fs in ("b:BK0420", "b:BK0477", "b:BK10", "b:BK123456"):
+            url = flow_proxy.build_clist_url(fs, "f12,f14", 1, 100)
+            self.assertIn("fs=" + fs, url)
+            self.assertIn("fields=f12,f14", url)
+            # 参数面与生产腿逐字同形：多一个 np/fltt 就会把 diff 形状换掉。
+            for forbidden in ("fltt=", "invt=", "po=", "fid=", "np="):
+                self.assertNotIn(forbidden, url)
+
+    def test_relay_through_the_member_selector(self):
+        body = '{"rc":0,"data":{"total":1,"diff":[{"f12":"600519","f14":"贵州茅台"}]}}'
+        with mock.patch.object(flow_proxy, "fetch_upstream", return_value=(200, body)):
+            out = flow_proxy.relay_clist("b:BK0477", "f12,f14", 1, 100)
+        self.assertTrue(out["ok"])
+        self.assertEqual(flow_proxy.parse_body(out)["data"]["diff"][0]["f12"], "600519")
+
+    def test_everything_else_is_still_rejected(self):
+        # 负锁：个股市场 / 任意 b: 选择器 / 注入形态 / 空 BK 码，全部 400。
+        for fs in ("m:0+t:6", "m:1+t:2", "b:BK", "b:BKX1", "b:BK0420;rm -rf",
+                   "b:BK1234567", "b:90+t:2", "b:BK-0420", "BK0420", "b:bk0420"):
+            with self.assertRaises(flow_proxy.FlowProxyError, msg=repr(fs)):
+                flow_proxy.build_clist_url(fs, "f12,f14", 1, 100)
+            status, payload = _route("kind=clist&fs=%s&fields=f12,f14" % fs)
+            self.assertEqual(status, 400, fs)
+            self.assertFalse(payload["ok"], fs)
+
+    def test_member_query_rejects_unknown_fields(self):
+        # 成分查询的字段面仍只认生产腿那一组（未知字段一律拒，绝不静默丢弃后照打）。
+        with self.assertRaises(flow_proxy.FlowProxyError):
+            flow_proxy.build_clist_url("b:BK0420", "f12,f999", 1, 100)
+        with self.assertRaises(flow_proxy.FlowProxyError):
+            flow_proxy.build_clist_url("b:BK0420", "", 1, 100)
+
+
 class TestRouteMapping(unittest.TestCase):
     def setUp(self):
         flow_proxy.clear_cache()

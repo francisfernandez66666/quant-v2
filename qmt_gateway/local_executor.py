@@ -474,6 +474,7 @@ PARAMS = {
     't_min_remaining_position_pct': 50,
     't_min_spread_pct': 2,
     't_min_turnover_pct': 1.5,
+    't_min_turnover_tiers': [{'min_cap_yi': 500, 'pct': 0.4}, {'min_cap_yi': 100, 'pct': 0.6}, {'min_cap_yi': 0, 'pct': 1.5}],
     't_missing_key_input': False,
     't_mode': 'both',
     't_near_extreme_pct': 0.3,

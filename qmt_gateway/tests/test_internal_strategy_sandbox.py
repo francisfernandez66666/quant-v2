@@ -586,6 +586,47 @@ class TestSizingCapIsActuallyCalled(unittest.TestCase):
         self.assertIsNone(mod._turnover_pct_of({"prev_close": 23.0}, {"float_shares": 1000}))
         self.assertIsNone(mod._turnover_pct_of({"amount": 100.0}, {"float_shares": 1000}))
 
+    def test_float_mcap_yi_is_the_same_key_the_cloud_ladder_uses(self):
+        """§T-TURNOVER-TIER（owner 2026-11-20）：分档基座＝昨收 × 流通股本（亿元）。
+
+        这条用例钉的是"同一个键"：云端 `TMinTurnoverPctFor` 吃的是流通市值（亿元），
+        载体必须用**同一组输入**算出来（`prev_close × float_shares / 1e8`），否则两边
+        分档会各落一档——那比不分档更难查（读数都"正常"，只是门槛不同）。
+
+        三条纪律：
+          1. 只乘昨收与流通股本，不接 QMT 的 `FloatVolume`（同一笔账不许两个写口）；
+          2. 任一输入缺失/非正 ⇒ None（闸退回最严档，绝不因为看不见而放宽）；
+          3. 单位是**亿元**（÷1e8），不是元、不是万元——错一档等于分档整体失效。
+        """
+        mod = self.mod
+        tick = {"prev_close": 23.0, "last_price": 20.98}
+        pre = {"float_shares": 849147841}
+        yi = mod._float_mcap_yi_of(tick, pre)
+        self.assertIsNotNone(yi)
+        self.assertAlmostEqual(yi, 23.0 * 849147841 / 1e8, places=6)
+        # 量纲自检（错一位就会整体落错档）：23 元 × 8.49 亿股 ≈ 195 亿元，落在中间档，
+        # 不可能是 19,530 亿（说明少除一次）也不可能是 1.95（说明多除一次）。
+        self.assertGreater(yi, 100.0)
+        self.assertLess(yi, 500.0)
+        for bad_tick, bad_pre in (({}, pre),
+                                  ({"prev_close": 0}, pre),
+                                  (tick, {}),
+                                  (tick, {"float_shares": 0}),
+                                  (tick, {"float_shares": -1})):
+            self.assertIsNone(mod._float_mcap_yi_of(bad_tick, bad_pre))
+
+    def test_t_ctx_carries_the_float_cap_for_the_ladder(self):
+        """分档键必须真的进了 T 的 ctx——算得出但没接线，闸照样退回平铺值。
+
+        这条锁的是"接线"：`_t_pass_ctx`（或等价装配点）必须把 `float_mcap_yi` 放进
+        喂给 `rules_t` 的那份 ctx；只写一个 helper 而没人调用，等于没做（11-19 那次
+        `turnover_pct` 一个写入点都没有就是这个形状）。
+        """
+        src = open(self.artifact_path, "r", encoding="ascii").read()
+        self.assertIn('"float_mcap_yi"', src)
+        # 负锁：分档基座不许从 QMT 的 FloatVolume 抄一条（同一笔账两个写口必然漂）。
+        self.assertNotIn("FloatVolume", src)
+
     def test_cash_probe_prints_the_target_derivation(self):
         """owner 2026-11-19：仓位帽要能"照着日志算出来"，不是靠人反推。
 

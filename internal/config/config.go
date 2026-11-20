@@ -2249,10 +2249,23 @@ type TConfig struct {
 	// English: T-only regime gate switch (default true). Deliberately *bool so "unset" stays
 	// distinguishable from "explicitly off"; unrelated to enhance.market_state_enabled.
 	RegimeGateEnabled *bool    `json:"regime_gate_enabled,omitempty"`
-	MinAmountWan      *float64 `json:"min_amount_wan,omitempty"`     // 流动性前置：当日成交额（万元；0＝不设该条）
-	MinTurnoverPct    *float64 `json:"min_turnover_pct,omitempty"`   // 流动性前置：换手率（%；0＝不设该条）
-	MinListedDays     *float64 `json:"min_listed_days,omitempty"`    // 流动性前置：上市天数（0＝不设该条）
-	VWAPCheckTolPct   float64  `json:"vwap_check_tol_pct,omitempty"` // 分时均线主源与分钟链复算的允许偏差（%）
+	MinAmountWan      *float64 `json:"min_amount_wan,omitempty"`   // 流动性前置：当日成交额（万元；0＝不设该条）
+	MinTurnoverPct    *float64 `json:"min_turnover_pct,omitempty"` // 流动性前置：换手率（%；0＝不设该条）
+	MinListedDays     *float64 `json:"min_listed_days,omitempty"`  // 流动性前置：上市天数（0＝不设该条）
+	// MinTurnoverTiers §T-TURNOVER-TIER（owner 2026-11-20）：换手率门槛**按流通市值分档**。
+	// 大票的日常换手本来就低（500 亿以上日换手 0.3~0.5% 常见），一条 1.5% 的平铺线等于
+	// "只许小票做 T"——现网 `t_round skips=step0.5 turnover 0.69% < 1.50%` 就是这条线在拒
+	// 一只正常活跃的大票。分档后门槛随票的盘子走：500 亿以上 0.40%、100–500 亿 0.60%、
+	// 100 亿以下沿用 1.50%（小票行为**一个字节都没变**）。
+	// 语义优先级（不许反过来）：
+	//   * 显式配了 MinTurnoverPct（非 nil）⇒ 那枚平铺值就是全局口径，分档整块不生效
+	//     （存量手调过的账号不被悄悄改行为；0 仍合法＝不设该条）；
+	//   * 否则走本切片（缺省见 defaultTMinTurnoverTiers），按流通市值**从高到低**取第一个命中档；
+	//   * 流通市值读不到 ⇒ 退回平铺值（最严档 1.5%），fail-closed 而不是"读不到就放行"。
+	// English: §T-TURNOVER-TIER — turnover floor keyed by float market cap. An explicit
+	// min_turnover_pct wins and disables the ladder; unknown float cap falls back to the strictest spread.
+	MinTurnoverTiers []TTurnoverTier `json:"min_turnover_tiers,omitempty"`
+	VWAPCheckTolPct  float64         `json:"vwap_check_tol_pct,omitempty"` // 分时均线主源与分钟链复算的允许偏差（%）
 	// ForceUnwindAt 尾盘强制配平时刻（HHMM，默认 "1450"）：正 T 的买腿到点仍未配对 ⇒ 卖出等量
 	// 底仓回到原仓位，绝不把机动仓留过夜（机动仓的定义就是"当日买、当日平"）。
 	// 反 T 的卖腿到点仍未买回 ⇒ 按 Q8 收摊（不追买），所以这个时刻对它只是"停止新开"的界线。
@@ -2264,6 +2277,14 @@ type TConfig struct {
 	// fallbacks 是**非导出**的运行时诊断队列（不参与 JSON 序列化）：记录本轮被区间校验挡掉的键
 	// 与实际生效值。刻意不放 DefaultSizingConfig，也不落盘——它是"这一轮配置的生效情况"，不是配置本身。
 	fallbacks map[string]float64
+}
+
+// TTurnoverTier 一档换手率下限（§T-TURNOVER-TIER）：流通市值 ≥ MinCapYi（亿元，含端点）⇒ 用 Pct（%）。
+// 分档表按 MinCapYi **从高到低**排列，取第一个命中档；0 仍表示"这一档不设门槛"。
+// English: one turnover-floor tier keyed by float market cap (CNY 100M, inclusive lower bound).
+type TTurnoverTier struct {
+	MinCapYi float64 `json:"min_cap_yi"` // 该档起算流通市值（亿元）
+	Pct      float64 `json:"pct"`        // 这档的换手率下限（%）
 }
 
 // T 做 T 的出厂阈值（访问器兜底用；刻意不写进 DefaultSizingConfig，理由见 TConfig 注释）。
@@ -2408,6 +2429,16 @@ const (
 	// 它由竞价结构决定而非风险偏好，因此**不随"保护阈值改配置"一起放开**（方案 §8.4.4）。
 	tLastOpenAtHardTopHM = 1445
 )
+
+// defaultTMinTurnoverTiers §T-TURNOVER-TIER 出厂三档（owner 2026-11-20）：
+// 流通市值 ≥500 亿 ⇒ 0.40%；100–500 亿 ⇒ 0.60%；<100 亿 ⇒ 1.50%（＝旧平铺值，小票行为一字未改）。
+// 顺序**必须从高到低**：解析取"第一个 MinCapYi 命中"的档，倒序会让所有票都落到最低档。
+// English: factory turnover ladder, ordered high→low; the first matching tier wins.
+var defaultTMinTurnoverTiers = []TTurnoverTier{
+	{MinCapYi: 500, Pct: 0.40},
+	{MinCapYi: 100, Pct: 0.60},
+	{MinCapYi: 0, Pct: 1.50},
+}
 
 // tRange 一个键的合法区间（lo/hi 为**含端点**的可生效范围）。
 type tRange struct {
@@ -2617,6 +2648,10 @@ func (c *TConfig) TMinAmountWanOf() float64 {
 }
 
 // TMinTurnoverPctOf 流动性前置：换手率下限（%）。0 合法＝不设该条。
+//
+// §T-TURNOVER-TIER：当 MinTurnoverPct 为 nil 且分档表生效时，这个平铺值只是"最严档"
+// （市值读不到/分档全部越界时的兜底），实际门槛按票取 TMinTurnoverPctFor。
+// English: flat floor; with the ladder active it is the strictest fallback, not the only gate.
 func (c *TConfig) TMinTurnoverPctOf() float64 {
 	v := c.MinTurnoverPct
 	if v == nil {
@@ -2627,6 +2662,49 @@ func (c *TConfig) TMinTurnoverPctOf() float64 {
 		return defaultTMinTurnoverPct
 	}
 	return *v
+}
+
+// TMinTurnoverTiersOf 生效的分档表（§T-TURNOVER-TIER）。返回 nil 表示"走平铺值"：
+//   - 显式配了 MinTurnoverPct（含显式 0＝关掉这条门）⇒ 分档整块不生效，语义只认那枚平铺值；
+//   - 没配 ⇒ 用 MinTurnoverTiers，缺省即 defaultTMinTurnoverTiers。
+//
+// 分档表的合法性按**整表**判：任一档 MinCapYi<0 / Pct 越界 [0,25] / 未按市值降序 / 缺 0 档兜底，
+// 一律整表回落出厂档并记可观测回落——半张表比没有表更危险（会让一部分票拿到错的档）。
+// English: resolves the ladder; nil means "flat floor only". An invalid table falls back wholesale.
+func (c *TConfig) TMinTurnoverTiersOf() []TTurnoverTier {
+	if c.MinTurnoverPct != nil {
+		return nil
+	}
+	if len(c.MinTurnoverTiers) == 0 {
+		return defaultTMinTurnoverTiers
+	}
+	prev := math.Inf(1)
+	for _, t := range c.MinTurnoverTiers {
+		bad := math.IsNaN(t.MinCapYi) || math.IsNaN(t.Pct) ||
+			t.MinCapYi < 0 || t.Pct < 0 || t.Pct > 25 || t.MinCapYi > 1e7
+		if bad || t.MinCapYi >= prev {
+			c.noteFallback("min_turnover_tiers", defaultTMinTurnoverPct)
+			return defaultTMinTurnoverTiers
+		}
+		prev = t.MinCapYi
+	}
+	return c.MinTurnoverTiers
+}
+
+// TMinTurnoverPctFor 按流通市值（亿元）取该票的换手率下限（%）。
+// 市值读不到（≤0/NaN）⇒ 退回平铺值（最严档），fail-closed；分档为空同理。
+// English: turnover floor for one name's float cap (CNY 100M); unknown cap => strictest flat floor.
+func (c *TConfig) TMinTurnoverPctFor(mcapYi float64) float64 {
+	tiers := c.TMinTurnoverTiersOf()
+	if len(tiers) == 0 || math.IsNaN(mcapYi) || mcapYi <= 0 {
+		return c.TMinTurnoverPctOf()
+	}
+	for _, t := range tiers {
+		if mcapYi >= t.MinCapYi {
+			return t.Pct
+		}
+	}
+	return c.TMinTurnoverPctOf()
 }
 
 // TMinListedDaysOf 流动性前置：上市天数下限。0 合法＝不设该条。

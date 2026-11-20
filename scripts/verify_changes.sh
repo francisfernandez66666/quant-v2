@@ -25981,3 +25981,108 @@ fi
 [ "$B233_FAILED" = "0" ] || exit 1
 echo "ok - §233 §FLOW-DAILY-FIX/§ZERO-FRAME/§SIDE-VOCAB 锁通过（主机选择+三个必填参数+零帧闸在落库之前+unknown 不画 0+方向词表覆盖引擎枚举且不猜观点词+观察卡标签+行为腿判退出码，累计判定点 ${CNT233}）"
 echo ""
+
+echo "==> 234 §T-TURNOVER-TIER/§FLOW-SECTOR-JOIN（2026-11-20 owner 裁决：换手率按票分档 / 板块腿走 A 路）..."
+B234_FAILED=0
+fail234() {
+	echo "--- FAIL: §234 $*"
+	FAIL=1
+	B234_FAILED=1
+}
+CNT234=0
+CFG234=$(cat internal/config/config.go || true)
+PAPERT234=$(cat internal/paper/t_rounds.go || true)
+TLIVE234=$(cat internal/engine/intraday_t_live.go || true)
+TT234=$(cat qmt_gateway/rules_t.py || true)
+QS234=$(cat qmt_gateway/qmt_internal_strategy.py || true)
+FP234=$(cat qmt_gateway/flow_proxy.py || true)
+PSM234=$(cat scripts/pregen_sector_map_gz.py || true)
+HR234=$(cat scripts/carrier_hot_reload_gz.py || true)
+RSYNC234=$(cat deploy/gz-ubuntu/rsync_carrier_build.sh || true)
+TIT234=$(cat internal/engine/intraday_t.go || true)
+DERIVEGO234=$(cat cmd/derive_carrier_params/main.go || true)
+DERIVEPY234=$(cat scripts/derive_carrier_params.py || true)
+
+# ① 换手率分档（2a）：门槛随流通市值走，小票那一档必须仍等于旧平铺值。
+#    现场：`t_round skips=step0.5 turnover 0.69% < 1.50%` 整天出现——一条按小票标定的
+#    平铺线把正常活跃的大票永远挡在门外，T 腿等于只对小票开放。
+CNT234=$((CNT234 + 1))
+grep_q 'type TTurnoverTier struct {' CFG234 F || fail234 "缺 TTurnoverTier 结构（分档表无处安放）"
+grep_q 'MinCapYi float64 `json:"min_cap_yi"`' CFG234 F || fail234 "分档下限的线上键不是 min_cap_yi（载体按它读）"
+grep_q 'Pct      float64 `json:"pct"`' CFG234 F || fail234 "分档阈值的线上键不是 pct"
+grep_q 'var defaultTMinTurnoverTiers = []TTurnoverTier{' CFG234 F || fail234 "缺出厂三档"
+# 三档的**值与顺序**都要钉住：倒序会让所有票落进最低档（等于没分档），而把最小一档改成
+# 别的数就是悄悄改了小票的行为（旧平铺值 1.50 是 owner 认定的"小票就该这么严"）。
+grep_q '{MinCapYi: 500, Pct: 0.40},' CFG234 F || fail234 "出厂最高档不是 500 亿 / 0.40%"
+grep_q '{MinCapYi: 100, Pct: 0.60},' CFG234 F || fail234 "出厂中档不是 100 亿 / 0.60%"
+grep_q '{MinCapYi: 0, Pct: 1.50},' CFG234 F || fail234 "出厂最小档不是 0 亿 / 1.50%（小票行为被改）"
+grep_q 'func (c *TConfig) TMinTurnoverTiersOf() []TTurnoverTier {' CFG234 F || fail234 "缺分档解析访问器"
+grep_q 'func (c *TConfig) TMinTurnoverPctFor(mcapYi float64) float64 {' CFG234 F || fail234 "缺按市值取档的访问器"
+grep_q 'MinTurnoverTiers []TTurnoverTier `json:"min_turnover_tiers,omitempty"`' CFG234 F || fail234 "TConfig 没接 min_turnover_tiers（配不进来）"
+# 语义：显式平铺值必须让分档整块失效（存量手调账号行为不变，含显式 0＝关）。
+grep_q '	if c.MinTurnoverPct != nil {' CFG234 F || fail234 "显式平铺值时没有短路掉分档"
+grep_q 'if len(tiers) == 0 || math.IsNaN(mcapYi) || mcapYi <= 0 {' CFG234 F || fail234 "市值读不到没有退回平铺值（看不见会被读成放宽）"
+grep_q 'MinTurnoverTiers []config.TTurnoverTier' PAPERT234 F || fail234 "TParams 没接分档表（引擎算不出）"
+grep_q 'func (p TParams) TurnoverFloorPct(q *data.StockInfo) float64 {' PAPERT234 F || fail234 "缺 TurnoverFloorPct"
+grep_q 'cap, ok := data.FloatMarketCapOf(q)' PAPERT234 F || fail234 "分档基座不是 FloatMarketCapOf（会与云端各算一版）"
+grep_q 'if floor := p.TurnoverFloorPct(q); floor > 0 {' TLIVE234 F || fail234 "实盘腿没有改判分档（回潮成平铺值）"
+grep_q 'MinTurnoverTiers:        tc.TMinTurnoverTiersOf(),' TIT234 F || fail234 "引擎装配点没接分档表"
+
+# ② 载体侧（同一组输入、同一个键）：float_mcap_yi = 昨收 × 流通股本 / 1e8（亿元）。
+CNT234=$((CNT234 + 1))
+grep_q 'def _turnover_floor_of(params, ctx):' TT234 F || fail234 "载体缺 _turnover_floor_of（分档没落到闸上）"
+grep_q 'floor_turnover, floor_src = _turnover_floor_of(params, ctx)' TT234 F || fail234 "t_liquidity_gate 没调分档（仍走平铺值）"
+grep_q 'def _float_mcap_yi_of(tick, pre):' QS234 F || fail234 "载体缺 _float_mcap_yi_of"
+grep_q '"float_mcap_yi":' QS234 F || fail234 "T 的 ctx 没带 float_mcap_yi（算得出但没人用）"
+# 负锁：分档阈值不许在载体里长出第二份（阈值只有一个家：Go 常量 / config 缺省）。
+if grep_q '0\.40' TT234; then fail234 "载体里出现硬编码 0.40 分档阈值（阈值必须在 Go）"; fi
+if grep_q '0\.60' TT234; then fail234 "载体里出现硬编码 0.60 分档阈值（阈值必须在 Go）"; fi
+# 负锁：分档基座不许接 QMT 的 FloatVolume（同一笔账两个写口必然漂）。
+if grep_q 'FloatVolume' QS234; then fail234 "载体从 QMT FloatVolume 取流通股本（第二个写口）"; fi
+# 烘参：导出器与派生脚本都必须认这个键，否则盒上永远没有表。
+grep_q 'c.put("t_min_turnover_tiers"' DERIVEGO234 F || fail234 "导出器没出 t_min_turnover_tiers"
+grep_q '("t_min_turnover_tiers", ("t_min_turnover_tiers",), None),' DERIVEPY234 F || fail234 "派生脚本没映射 t_min_turnover_tiers"
+
+# ③ 板块逐票连接键（2b，owner 裁决 A）：白名单扩 `b:BK*` + 生产者 + 热更烘入。
+#    连接键只能认 sector_map（东财板块名）；industry_map 是证监会门类，交集为空。
+CNT234=$((CNT234 + 1))
+grep_q '_CLIST_MEMBER_FS_RE = re.compile(r"^b:BK\d{2,6}$")' FP234 F || fail234 "flow_proxy 没放行 b:BK 成分查询（板块成分取不到）"
+grep_q 'def valid_clist_fs(fs):' FP234 F || fail234 "缺 valid_clist_fs（白名单没有单点）"
+grep_q 'if not valid_clist_fs(fs):' FP234 F || fail234 "build_clist_url 没走 valid_clist_fs"
+# 负锁：旧的整元组判据不许回潮——它会把成分查询一起 400。
+if grep_q 'if fs not in _CLIST_FS:' FP234; then fail234 "fs 判据回潮成整元组比较（b:BK 会被 400）"; fi
+grep_q 'INDUSTRY_FS = "m:90+t:2"' PSM234 F || fail234 "生产者没取行业板块列表"
+grep_q 'CONCEPT_FS = "m:90+t:3"' PSM234 F || fail234 "生产者没取概念板块列表"
+grep_q 'MIN_BOARD_OK_PCT' PSM234 F || fail234 "生产者缺覆盖率闸（残表会覆盖好表）"
+grep_q 'MIN_STOCKS' PSM234 F || fail234 "生产者缺股票数闸"
+grep_q 'def load_sector_map():' HR234 F || fail234 "热更链没读板块连接键"
+grep_q 'sector_map_meta, sector_map = load_sector_map()' HR234 F || fail234 "热更链没有在 sha 之前读 sector_map（表变了不会重烘）"
+grep_q 'doc2["params"]["sector_map"] = sector_map' HR234 F || fail234 "sector_map 没烘进 params（盒上永远弃权）"
+grep_q 'scripts/pregen_sector_map_gz.py' RSYNC234 F || fail234 "生产者没进 rsync 清单（gz 上不存在这个文件）"
+# 负锁：载体连接键不许退到 industry_map（两套命名的交集为空 ⇒ 命中率恒 0）。
+if grep_q 'maps = PARAMS.get("industry_map")' QS234; then fail234 "板块腿回潮用 industry_map（交集为空、命中恒 0）"; fi
+grep_q 'maps = PARAMS.get("sector_map") or {}' QS234 F || fail234 "载体没按 sector_map 连接"
+
+# ④ 行为腿：判退出码，不判输出文本。
+CNT234=$((CNT234 + 1))
+if command -v go >/dev/null 2>&1; then
+	FIX234_RC=0
+	go test ./internal/config ./internal/engine ./internal/paper -count=1 \
+		-run 'TestTurnoverTier|TestTLiquidityTurnoverTier' >/dev/null 2>&1 || FIX234_RC=$?
+	[ "$FIX234_RC" = "0" ] || fail234 "Go 分档用例未过（退出码 ${FIX234_RC}）"
+else
+	echo "INFO - §234 无 go，Go 分档行为腿未跑（这份绿不含 Go 判定）"
+fi
+if command -v python3 >/dev/null 2>&1; then
+	PY234_RC=0
+	python3 -m pytest qmt_gateway/tests/test_rules_t.py qmt_gateway/tests/test_flow_proxy.py \
+		qmt_gateway/tests/test_pregen_sector_map.py qmt_gateway/tests/test_internal_strategy_sandbox.py \
+		-q >/dev/null 2>&1 || PY234_RC=$?
+	[ "$PY234_RC" = "0" ] || fail234 "载体/生产者用例未过（退出码 ${PY234_RC}）"
+else
+	echo "INFO - §234 无 python3，载体行为腿未跑"
+fi
+
+[ "$B234_FAILED" = "0" ] || exit 1
+echo "ok - §234 §T-TURNOVER-TIER/§FLOW-SECTOR-JOIN 锁通过（分档三档+显式平铺短路+市值缺失fail-closed+载体同一组输入+阈值无第二份+白名单只扩b:BK+生产者覆盖率闸+热更在sha前烘入+sector_map不许退成industry_map+行为腿判退出码，累计判定点 ${CNT234}）"
+echo ""

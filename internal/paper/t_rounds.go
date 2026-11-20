@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 )
 
@@ -215,7 +216,11 @@ type TParams struct {
 	// ── 流动性前置（§8.4.4b）──
 	MinAmountWan   float64
 	MinTurnoverPct float64
-	MinListedDays  float64
+	// MinTurnoverTiers §T-TURNOVER-TIER：换手率门槛按流通市值分档（空表＝只认上面那枚平铺值）。
+	// 分档表由 config 单点给出（含缺省三档），这里只做"取这一票的档"这件事。
+	// English: float-cap keyed turnover ladder (empty = flat floor only).
+	MinTurnoverTiers []config.TTurnoverTier
+	MinListedDays    float64
 	// IndexChangePct 本轮大盘涨跌幅%（NaN/0 由调用方决定语义）；FeeBufferPct 冻结款费用缓冲%。
 	IndexChangePct float64
 	FeeBufferPct   float64
@@ -952,6 +957,28 @@ func tRoundDirections(q *data.StockInfo, v float64, p TParams) (buy, sell bool) 
 	return buy, sell
 }
 
+// TurnoverFloorPct 该票的换手率下限（%，§T-TURNOVER-TIER）。
+// 有分档表且流通市值读得到 ⇒ 取该票那一档；市值读不到 ⇒ 退回平铺值（最严档），
+// 与"读数不可得按不过处理"同向，绝不因为读不到市值就放宽门槛。
+// English: turnover floor for one name; unknown float cap falls back to the flat (strictest) floor.
+func (p TParams) TurnoverFloorPct(q *data.StockInfo) float64 {
+	if len(p.MinTurnoverTiers) == 0 {
+		return p.MinTurnoverPct
+	}
+	mcapYi := 0.0
+	if cap, ok := data.FloatMarketCapOf(q); ok && cap > 0 {
+		mcapYi = cap / 1e8
+	}
+	if mcapYi > 0 {
+		for _, t := range p.MinTurnoverTiers {
+			if mcapYi >= t.MinCapYi {
+				return t.Pct
+			}
+		}
+	}
+	return p.MinTurnoverPct
+}
+
 // tLiquidityBlock 流动性前置（§8.4.4b）：任一读数不可得**按不过处理**。
 func (e *Engine) tLiquidityBlock(code string, q *data.StockInfo, p TParams) string {
 	if p.MinAmountWan > 0 {
@@ -962,12 +989,12 @@ func (e *Engine) tLiquidityBlock(code string, q *data.StockInfo, p TParams) stri
 			return fmt.Sprintf("当日成交额 %.0f 万 < %.0f 万", w, p.MinAmountWan)
 		}
 	}
-	if p.MinTurnoverPct > 0 {
+	if floor := p.TurnoverFloorPct(q); floor > 0 {
 		if q.Turnover <= 0 {
 			return "换手率读数不可得，按不过处理"
 		}
-		if q.Turnover < p.MinTurnoverPct {
-			return fmt.Sprintf("换手率 %.2f%% < %.2f%%", q.Turnover, p.MinTurnoverPct)
+		if q.Turnover < floor {
+			return fmt.Sprintf("换手率 %.2f%% < %.2f%%", q.Turnover, floor)
 		}
 	}
 	if strings.Contains(strings.ToUpper(q.Name), "ST") {

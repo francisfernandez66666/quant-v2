@@ -12,6 +12,7 @@ FILES=(
   scripts/carrier_hot_reload_gz.py
   scripts/gen_industry_buckets_gz.py
   scripts/pregen_carrier_factors_gz.py
+  scripts/pregen_sector_map_gz.py
   qmt_gateway/local_executor.py
   qmt_gateway/qmt_internal_strategy.py
   qmt_gateway/handler.py

@@ -255,6 +255,7 @@ MAPPING = [
     ("t_regime_gate_enabled", ("t_regime_gate_enabled",), None),
     ("t_min_amount_wan", ("t_min_amount_wan",), None),
     ("t_min_turnover_pct", ("t_min_turnover_pct",), None),
+    ("t_min_turnover_tiers", ("t_min_turnover_tiers",), None),
     ("t_min_listed_days", ("t_min_listed_days",), None),
     ("t_vwap_check_tol_pct", ("t_vwap_check_tol_pct",), None),
     ("t_commission_rate", ("t_commission_rate",), None),
@@ -528,8 +529,8 @@ CARRIER_OWNED = {
     "flow_snapshot_ttl_sec": "carrier-delivery: 资金流快照新鲜度上限（秒），见 §FLOW-SNAPSHOT",
     # §FLOW-SECTOR-JOIN（2026-11-20）：板块逐票连接键（code -> **东财板块名**）。刻意与
     # industry_map（证监会门类，供集中度桶用）分开：两套命名的交集为空，混用会"看起来接上了、
-    # 命中率恒 0"。云端生产者待 owner 裁（取板块成分那条路），在此之前载体弃权并在小时读数里
-    # 打 sector_hit=0/N。
+    # 命中率恒 0"。生产者是 scripts/pregen_sector_map_gz.py（经盒子中继逐板块取成分，
+    # 行业优先；当日文件由热更链读取并烘进 params；取不到即弃权）。
     "sector_map": "carrier-shape: 个股->东财板块名（板块资金流逐票注入的连接键），与 industry_map 刻意分家",
     # §STRATEGY-SWITCH-SYNC（owner 11-06 裁决）：这三枚不是 Go 出厂默认，而是量化交易 tab
     # 的现网开关快照，由 scripts/sync_strategy_switches.py 单点派生进 params；derive 不产出值。

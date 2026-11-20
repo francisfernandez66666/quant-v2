@@ -1100,6 +1100,41 @@ def _turnover_pct_of(tick, pre):
     return amount / cap * 100.0
 
 
+def _float_mcap_yi_of(tick, pre):
+    """Free-float market cap in CNY 100M (CNY 100M), or None when unreadable.
+
+    2026-11-20 (T-TURNOVER-TIER): the Turnover gate on the cloud side is now a
+    ladder keyed by float market cap (>=500100M -> 0.40%, 100-500100M -> 0.60%,
+    <100100M -> 1.50%). The carrier must compute the SAME key with the SAME
+    inputs it already uses for turnover_pct -- `prev_close * float_shares` --
+    otherwise the two sides would disagree on which tier a name sits in.
+      * float_shares is baked from the cloud (the sandbox cannot fetch it);
+      * prev_close comes from the tick, falling back to the baked precalc row;
+      * every miss is None, and rules_t then falls back to the strictest flat
+        floor rather than silently widening the gate.
+    """
+    try:
+        shares = float((pre or {}).get("float_shares") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if shares <= 0.0:
+        return None
+    tick = tick or {}
+    prev = tick.get("prev_close")
+    if prev is None:
+        prev = (pre or {}).get("prev_close")
+    try:
+        prev = float(prev)
+    except (TypeError, ValueError):
+        return None
+    if prev <= 0.0:
+        return None
+    cap = prev * shares
+    if cap <= 0.0:
+        return None
+    return cap / 1e8
+
+
 def _pullback_limit_price(vwap, last_price):
     """VWAP minus the baked pullback pct, never above the last price.
 
@@ -2499,9 +2534,12 @@ def _sector_delta_for(symbol, snap):
     (`industry_map` keeps its real job: the concentration buckets.)
 
     So the join key is a separate, purpose-built `sector_map` (code -> EM board
-    name). Until the decision host bakes one, this leg ABSTAINS (None) and the
-    blend renormalises onto market + volume; the hourly readout prints the
-    hit/miss tally so "0%" is visible instead of inferred.
+    name), produced daily on the decision host by
+    `scripts/pregen_sector_map_gz.py` (industry boards first, then concepts)
+    and baked into params by the hot-reload chain. When today's map is absent
+    or stale this leg ABSTAINS (None) and the blend renormalises onto market +
+    volume; the hourly readout prints the hit/miss tally so "0%" is visible
+    instead of inferred.
     """
     table = snap.get("sector_delta") or {}
     if not table:
@@ -3461,6 +3499,8 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
             "last_price": px, "position_qty": (row or {}).get("qty"),
             "vwap": vwap_value,
             "turnover_pct": turnover_pct,
+            # T-TURNOVER-TIER: same key the cloud ladder uses (prev_close * float_shares).
+            "float_mcap_yi": _float_mcap_yi_of(tick, pre_row),
             "volume": (tick or {}).get("volume"),
             "amount": (tick or {}).get("amount"),
             "available_cash": cash, "total_asset": t_total,

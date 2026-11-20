@@ -386,6 +386,33 @@ def load_precalc():
     return {"day": doc.get("day"), "count": len(precalc)}, precalc
 
 
+def load_sector_map():
+    """§FLOW-SECTOR-JOIN：读当日板块逐票连接键（code -> 东财板块名）。
+
+    返回 (meta, mapping)：跨日/缺失/空表 ⇒ (meta, None)。
+    与 precalc 同一纪律——跨日不留宿；这份表只影响"逐票板块 delta 能不能连上"，
+    所以缺当日就弃权（blend renormalize 到 大盘+量能），绝不用昨天的成分表冒充今天。
+    """
+    try:
+        with open("qmt_gateway/local_executor_sector_map.json", "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {"day": "", "count": 0}, None
+    today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
+    if str(doc.get("day") or "") != today:
+        return {"day": str(doc.get("day") or ""), "count": 0}, None
+    raw = doc.get("sector_map") or {}
+    if not isinstance(raw, dict) or not raw:
+        return {"day": doc.get("day"), "count": 0}, None
+    mapping = {}
+    for code, name in raw.items():
+        code = str(code or "").strip()
+        name = str(name or "").strip()
+        if len(code) == 6 and code.isdigit() and name:
+            mapping[code] = name
+    return {"day": doc.get("day"), "count": len(mapping)}, (mapping or None)
+
+
 def extract_bearish():
     """signals_today.json 的做空/利空归因 → 当日利空候选（空=保留上一版）。
 
@@ -888,6 +915,32 @@ def main():
     except Exception as exc:  # noqa: BLE001 - 补推失败不阻断热更
         print("HOTRELOAD_DATARETRY_FAIL %s" % repr(exc)[:100])
 
+    # §FLOW-SECTOR-JOIN（owner 2026-11-20 裁决 A）：板块逐票连接键当日缺失 ⇒ 补跑一次生产者。
+    # 生产者要经盒子中继逐板块取成分（几百次请求、分钟级），所以**限频 30 分钟**且失败不阻断
+    # 热更——今天取不到就弃权（blend renormalize 到 大盘+量能），绝不留宿昨天的成分表。
+    try:
+        _meta, _mapping = load_sector_map()
+        if not _mapping:
+            _retry_path = os.path.join(BUILD_DIR, "qmt_gateway", "sector_map_retry_ts")
+            _last = 0.0
+            if os.path.exists(_retry_path):
+                try:
+                    with open(_retry_path, "r", encoding="utf-8") as fh:
+                        _last = float(fh.read().strip() or 0)
+                except (OSError, ValueError):
+                    _last = 0.0
+            _now = datetime.datetime.now().astimezone().timestamp()
+            if _now - _last > 1800:
+                r = subprocess.run(["python3", "scripts/pregen_sector_map_gz.py"],
+                                   cwd=BUILD_DIR, capture_output=True, text=True, timeout=600)
+                with open(_retry_path, "w", encoding="utf-8") as fh:
+                    fh.write(str(_now))
+                tail = (r.stdout + r.stderr).strip().splitlines()
+                print("HOTRELOAD_SECTOR_MAP rc=%d %s" % (
+                    r.returncode, tail[-1] if tail else ""))
+    except Exception as exc:  # noqa: BLE001 - 取不到成分表不阻断热更
+        print("HOTRELOAD_SECTOR_MAP_FAIL %s" % repr(exc)[:100])
+
     qc, rules = load_live()
     wl = (qc.get("qmt", {}) or {}).get("strategies") or []
     if not wl:
@@ -913,6 +966,9 @@ def main():
         print("HOTRELOAD_NEWS_GATE_FALLBACK signals_filter neg=%d bullish=%d" % (len(bearish), len(bullish)))
     signal_pool = extract_signal_codes()
     precalc_meta, _precalc = load_precalc()
+    # §FLOW-SECTOR-JOIN：板块逐票连接键（当日文件；缺失 ⇒ 载体弃权并把命中率打进小时读数）。
+    # 在 sha 之前算：表变了必须触发重烘投递（与 precalc/锚点/资金流同一条纪律）。
+    sector_map_meta, sector_map = load_sector_map()
     # §LIVE-T-20261116：做 T 的首买锚点与宏观读数（外脑烘参，只读，不碰下单）。
     # 在 sha 之前算，确保任一变化都会触发重烘投递——否则盒子上永远拿不到新锚点/新宏观。
     t_anchor_book = bake_t_anchor_book()
@@ -942,6 +998,9 @@ def main():
                               reversal_events, ensure_ascii=True,
                               sort_keys=True).encode()).hexdigest()[:16],
                           "signal_pool": signal_pool, "precalc": precalc_meta,
+                          # §FLOW-SECTOR-JOIN：板块连接键的当日指纹纳入 sha——
+                          # 成分表申领的板块变了（或首次生成）就必须重烘。
+                          "sector_map": sector_map_meta,
                           "buy_codes": sorted(extract_buy_codes()),
                           "t_bake": t_bake_digest,
                           # §FLOW-SNAPSHOT：资金流快照（量化后的可比指纹）纳入 sha——
@@ -1026,6 +1085,12 @@ def main():
         doc2["params"]["precalc"] = precalc
     else:
         doc2["params"].pop("precalc", None)  # 过期因子绝不留宿：宁可弃权也不拿昨天的量比当今天的
+    # §FLOW-SECTOR-JOIN：板块逐票连接键（code -> 东财板块名）。**不是 industry_map**：
+    # 后者是证监会门类，与 sector_delta 的键交集为空（会用成一条恒 0% 的腿）。
+    if sector_map:
+        doc2["params"]["sector_map"] = sector_map
+    else:
+        doc2["params"].pop("sector_map", None)
     # §LIVE-T-20261116：外脑烘参——做 T 的锚点表 + 宏观读数。沙箱零外部输入，
     # 从柜台读不到 anchor，也没法自算 market_scale，只能靠这里烘进去。
     # 空表/空宏观是安全的：沙箱 t_gate_open 会 fail-closed 停开 T（不会瞎下）。

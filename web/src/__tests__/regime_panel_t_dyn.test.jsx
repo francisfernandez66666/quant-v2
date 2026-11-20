@@ -210,4 +210,20 @@ describe('§DYN-T 做 T 阈值：稀疏提交 / 单键补丁 / 越界拒绝', ()
     expect(body.sizing.t.vol_ratio_max).toBe(0)
     expect(body.sizing.t.regime_gate_enabled).toBe(false)
   })
+
+  // §T-TURNOVER-TIER（owner 2026-11-20）：门槛已改成"按流通市值分档"，面板必须说清两件事，
+  // 否则管理员会以为默认还是那条 1.5 的平铺线（现场正是这条线把大票整天挡在门外）：
+  //   ① 不填＝按分档走；② 填了任何值（含 0）＝整条门回到这个平铺值，分档不生效。
+  // 这里的断言只碰文案，不碰提交语义——稀疏提交仍由 T1/T2 守着。
+  it('T6 换手率下限的提示写明分档语义（不填走分档 / 填值回平铺）', async () => {
+    render(<RegimeConfigPanel />)
+    await settle()
+    await openFine()
+    const row = inputByLabel('流动性：换手率下限（%）').closest('div')
+    const hint = (row && row.textContent) || document.body.textContent || ''
+    expect(hint).toContain('按流通市值分档')
+    expect(hint).toContain('0.4')
+    expect(hint).toContain('1.5')
+    expect(hint).toContain('分档不生效')
+  })
 })

@@ -215,6 +215,9 @@ func collectTConfig(c *collector) {
 	c.put("t_regime_gate_enabled", src, tc.TRegimeGateEnabledOf())
 	c.put("t_min_amount_wan", src, tc.TMinAmountWanOf())
 	c.put("t_min_turnover_pct", src, tc.TMinTurnoverPctOf())
+	// §T-TURNOVER-TIER（owner 2026-11-20）：分档表与平铺值**同出 Go 一处真源**。
+	// 显式配了 min_turnover_pct 的账号这里得到 nil ⇒ 载体与云端同向地"只认平铺值"。
+	c.put("t_min_turnover_tiers", src, tc.TMinTurnoverTiersOf())
 	c.put("t_min_listed_days", src, tc.TMinListedDaysOf())
 	c.put("t_vwap_check_tol_pct", src, tc.TVWAPCheckTolPctOf())
 }

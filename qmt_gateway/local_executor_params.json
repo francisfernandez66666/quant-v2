@@ -2065,7 +2065,21 @@
     "flow_r_ma5_surge": 1,
     "flow_r_yest_shrink": 1,
     "flow_r_yest_surge": 1.2,
-    "flow_snapshot_ttl_sec": 2700
+    "flow_snapshot_ttl_sec": 2700,
+    "t_min_turnover_tiers": [
+      {
+        "min_cap_yi": 500,
+        "pct": 0.4
+      },
+      {
+        "min_cap_yi": 100,
+        "pct": 0.6
+      },
+      {
+        "min_cap_yi": 0,
+        "pct": 1.5
+      }
+    ]
   },
   "strategy_version": "v16-20261111",
   "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",

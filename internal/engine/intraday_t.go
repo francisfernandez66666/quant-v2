@@ -375,6 +375,7 @@ func (e *Engine) tParamsFor(uid string, tc config.TConfig, shadow bool) (paper.T
 		RoundStopPct:            tc.TRoundStopPctOf(),
 		MinAmountWan:            tc.TMinAmountWanOf(),
 		MinTurnoverPct:          tc.TMinTurnoverPctOf(),
+		MinTurnoverTiers:        tc.TMinTurnoverTiersOf(),
 		MinListedDays:           tc.TMinListedDaysOf(),
 	}
 	// §W-09 行情门：三个新键一次性接好，实盘与纸面同时生效（TParamsForAccount 也走这里）。

@@ -454,6 +454,66 @@ class GateOrderTests(unittest.TestCase):
         self.assertIn("sellable_qty_unavailable", reason)
 
 
+class TurnoverTierTests(unittest.TestCase):
+    """§T-TURNOVER-TIER（owner 2026-11-20）：换手率门槛按流通市值分档。
+
+    现场：盒上策略日志整天打 `t_round skips=step0.5 turnover 0.69% < 1.50%`——
+    一条按小票标定的平铺线把正常活跃的大票永远挡在门外。四条纪律：
+      1. 三档随流通市值走，且小票那一档就是旧平铺值（行为一个字都不改）；
+      2. 市值读不到 ⇒ 退回平铺值（最严档），"看不见"不许变成"放宽"；
+      3. 显式平铺值（tiers 为空/None）⇒ 整条门回到今天的样子；
+      4. skip 文案点名是哪一档，否则运维只能看到"被拦了"却不知道被哪条线拦。
+    """
+
+    # 与 Go 出厂档同值（真源 internal/config/defaultTMinTurnoverTiers，derive 烘进 params）。
+    TIERS = [{"min_cap_yi": 500, "pct": 0.4},
+             {"min_cap_yi": 100, "pct": 0.6},
+             {"min_cap_yi": 0, "pct": 1.5}]
+
+    def _blocked(self, mcap, turnover, tiers=None, **over):
+        p = params(t_min_turnover_tiers=self.TIERS if tiers is None else tiers, **over)
+        c = ctx(turnover_pct=turnover, float_mcap_yi=mcap)
+        return rt.t_liquidity_gate(p, c)
+
+    def test_big_cap_passes_at_the_069pct_reading_that_used_to_be_blocked(self):
+        # 600 亿 / 0.69%：现场被拦的那一档，现在按 0.40% 放行。
+        blocked, reason = self._blocked(600.0, 0.69)
+        self.assertFalse(blocked, reason)
+
+    def test_mid_cap_uses_the_middle_tier(self):
+        blocked, reason = self._blocked(121.9, 0.69)
+        self.assertFalse(blocked, reason)
+        blocked, reason = self._blocked(121.9, 0.55)  # < 0.60 仍拦，且点名 tier
+        self.assertTrue(blocked)
+        self.assertIn("0.60%", reason)
+        self.assertIn("tier", reason)
+
+    def test_small_cap_keeps_the_old_flat_floor(self):
+        blocked, reason = self._blocked(50.0, 0.69)
+        self.assertTrue(blocked)
+        self.assertIn("1.50%", reason)
+        # 小票跨过 1.50% 照样放行——分档只放宽大票，不收紧小票。
+        blocked, reason = self._blocked(50.0, 1.60)
+        self.assertFalse(blocked, reason)
+
+    def test_missing_market_cap_falls_back_to_the_strictest_arm(self):
+        # 读不到市值：0.69% 必须仍被拦，并如实点名是回落腿（不许当成某一档）。
+        blocked, reason = self._blocked(None, 0.69)
+        self.assertTrue(blocked)
+        self.assertIn("flat_no_mcap", reason)
+
+    def test_flat_config_ignores_the_ladder_entirely(self):
+        # 存量手调账号：显式 t_min_turnover_pct 生效时，分档整块不作用（大票照样被 1.5 拦）。
+        blocked, reason = self._blocked(600.0, 0.69, tiers=[])
+        self.assertTrue(blocked)
+        self.assertIn("1.50%", reason)
+        self.assertIn("flat", reason)
+
+    def test_explicit_zero_still_disables_the_gate(self):
+        blocked, _reason = self._blocked(50.0, 0.01, tiers=[], t_min_turnover_pct=0.0)
+        self.assertFalse(blocked)
+
+
 class CostLineTests(unittest.TestCase):
     """单笔 T 的成本线（docs/PLAN_T_COST_CALIB_20261027.md:128-130、IMPL:197）。"""
 

@@ -1146,7 +1146,7 @@ export default function RegimeConfigPanel() {
                 checked={!!form.tRegimeGate}
                 onChange={(v) => set({ tRegimeGate: !!v })} />
               <NumRow label="流动性：成交额下限（万元）" hint={`默认 3000；填 0＝不设该条。读数拿不到按「不过」处理`} value={form.tMinAmount} min={0} max={1000000} step={100} precision={0} onChange={(v) => set({ tMinAmount: v })} />
-              <NumRow label="流动性：换手率下限（%）" hint="默认 1.5；填 0＝不设该条" value={form.tMinTurnover} min={0} max={25} step={0.1} onChange={(v) => set({ tMinTurnover: v })} />
+              <NumRow label="流动性：换手率下限（%）" hint="默认按流通市值分档：≥500 亿 0.4 / 100–500 亿 0.6 / <100 亿 1.5；在此填非空值＝整条门回到这个平铺值（分档不生效），填 0＝不设该条" value={form.tMinTurnover} min={0} max={25} step={0.1} onChange={(v) => set({ tMinTurnover: v })} />
               <NumRow label="流动性：上市天数下限" hint="默认 60；填 0＝不设该条（次新日内波动不具可比性）" value={form.tMinListed} min={0} max={3650} step={1} precision={0} onChange={(v) => set({ tMinListed: v })} />
               <NumRow label="分时均线校验容差（%）" hint="默认 0.1：主源与分钟链复算差过该值即视为读数不可信，本轮不开腿" value={form.tVwapTol} min={0.05} max={1} step={0.05} onChange={(v) => set({ tVwapTol: v })} />
               <div style={hintStyle}>

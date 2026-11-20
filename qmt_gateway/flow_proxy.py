@@ -25,6 +25,7 @@ decision host (which EastMoney RSTs) can read flow data through the box (which c
 """
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -54,6 +55,10 @@ _FFLOW_FIELDS = "f51,f52,f53,f54,f55,f56"
 
 # 板块列表只放行两个市场与一组字段；多一个都不认（宁可 400，也不让参数面长出去）。
 _CLIST_FS = ("m:90+t:2", "m:90+t:3")  # 行业板块 / 概念板块
+# §FLOW-SECTOR-JOIN（owner 2026-11-20 裁决 A）：板块**成分股**查询 `fs=b:BKxxxx`。
+# 这是"扩白名单"的唯一新增面：只为 §FLOW-SECTOR-JOIN 的日级生产者提供成分表，
+# 不放行任何个股市场（`m:0+t:6` 之类仍然 400）。BK 码逐段校验，理由同 valid_secid。
+_CLIST_MEMBER_FS_RE = re.compile(r"^b:BK\d{2,6}$")
 _CLIST_FIELDS = ("f12", "f14", "f3", "f6", "f20", "f62", "f104", "f105", "f184")
 
 # 缓存 TTL：当日分时与板块列表 30s（与引擎 60s TTL 对齐，留一半余量）；
@@ -119,6 +124,13 @@ def build_fflow_url(secid, klt, lmt):
     return build_fflow_daily_url(secid, klt, lmt)
 
 
+def valid_clist_fs(fs):
+    """clist 的 fs 白名单：两档板块列表 + 一条板块成分（`b:BKxxxx`）。"""
+    if fs in _CLIST_FS:
+        return True
+    return bool(_CLIST_MEMBER_FS_RE.match(fs or ""))
+
+
 def build_clist_url(fs, fields, pn, pz):
     """拼 clist 上游 URL（fs 必须命中白名单，fields 必须是允许字段的子集）。
 
@@ -127,7 +139,7 @@ def build_clist_url(fs, fields, pn, pz):
     板块腿都不带 np=1）。参数面照抄生产腿，广州侧才不会拿到一份自己解析不了的 body。
     另：上游对 pz 有 100 的硬顶（pz=500 仍只回 100 条），所以分页必须按 100 逐页翻。
     """
-    if fs not in _CLIST_FS:
+    if not valid_clist_fs(fs):
         raise FlowProxyError("bad fs: %r" % (fs,))
     wanted = [f.strip() for f in (fields or "").split(",") if f.strip()]
     if not wanted:
@@ -244,7 +256,11 @@ def relay_fflow(secid, klt, lmt):
 
 
 def relay_clist(fs, fields, pn, pz):
-    """中继板块列表 clist：返回形状同 relay_fflow。"""
+    """中继板块列表 clist：返回形状同 relay_fflow。
+
+    fs 白名单：`m:90+t:2`（行业）/ `m:90+t:3`（概念）两档列表，以及 `b:BKxxxx`
+    （板块成分股，§FLOW-SECTOR-JOIN 的日级生产者用）。
+    """
     url = build_clist_url(fs, fields, pn, pz)
 
     def produce():

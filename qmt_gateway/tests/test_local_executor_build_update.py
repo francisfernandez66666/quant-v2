@@ -60,6 +60,10 @@ REPO = os.path.dirname(GW_DIR)
 BUILDER = os.path.join(REPO, "scripts", "build_local_executor.py")
 UPDATER = os.path.join(REPO, "scripts", "update_local_executor.ps1")
 sys.path.insert(0, os.path.join(REPO, "scripts"))
+# 规则模块自己住在 qmt_gateway/（构建器按源码路径读它），而有一条用例要 `import rules_form`
+# 直接比对声明清单。不把 GW_DIR 放进 sys.path 时，这条用例**只在别的测试文件先跑过**
+# 才会绿——顺序依赖的绿等于假绿（2026-11-20 收口时单跑本文件实测复现）。
+sys.path.insert(0, GW_DIR)
 
 import build_local_executor as builder  # noqa: E402
 

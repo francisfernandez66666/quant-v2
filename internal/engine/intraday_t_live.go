@@ -1364,12 +1364,12 @@ func (r *tLiveRound) liquidityBlock(code string, q *data.StockInfo) string {
 			return fmt.Sprintf("当日成交额 %.0f 万 < %.0f 万", w, p.MinAmountWan)
 		}
 	}
-	if p.MinTurnoverPct > 0 {
+	if floor := p.TurnoverFloorPct(q); floor > 0 {
 		if q.Turnover <= 0 {
 			return "换手率读数不可得，按不过处理"
 		}
-		if q.Turnover < p.MinTurnoverPct {
-			return fmt.Sprintf("换手率 %.2f%% < %.2f%%", q.Turnover, p.MinTurnoverPct)
+		if q.Turnover < floor {
+			return fmt.Sprintf("换手率 %.2f%% < %.2f%%", q.Turnover, floor)
 		}
 	}
 	if strings.Contains(strings.ToUpper(q.Name), "ST") {

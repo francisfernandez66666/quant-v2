@@ -825,6 +825,38 @@ def t_sell_cap_gate(params, ctx, cap_base):
     return False, _EMPTY
 
 
+def _turnover_floor_of(params, ctx):
+    """Turnover floor for this one name (%), T-TURNOVER-TIER (owner 2026-11-20).
+
+    The ladder is ordered high -> low by float market cap (CNY 100M) and the
+    FIRST matching tier wins. Two deliberate shapes:
+      * an explicit flat `t_min_turnover_pct` on the cloud side bakes
+        `t_min_turnover_tiers = None` => this whole helper lands on the flat
+        branch, so a hand-tuned account keeps its old behaviour byte for byte;
+      * a float cap we cannot read falls back to that same flat value, which is
+        the STRICTEST tier -- an unreadable reading must never loosen the gate
+        (same direction as `turnover_unavailable`).
+    Returns (floor_pct, source) so the skip line can say which arm fired.
+    """
+    flat = _param(params, "t_min_turnover_pct")
+    tiers = params.get("t_min_turnover_tiers") or []
+    if not tiers:
+        return flat, "flat"
+    mcap = _t__num(ctx.get("float_mcap_yi"))
+    if mcap is None or mcap <= _ZERO_F:
+        return flat, "flat_no_mcap"
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        floor = _t__num(tier.get("min_cap_yi"))
+        pct = _t__num(tier.get("pct"))
+        if floor is None or pct is None:
+            continue
+        if mcap >= floor:
+            return pct, "tier"
+    return flat, "flat_below_ladder"
+
+
 def t_liquidity_gate(params, ctx):
     """Liquidity prefilter (intraday_t_live.go:1328-1365): an unavailable reading FAILS.
 
@@ -837,13 +869,14 @@ def t_liquidity_gate(params, ctx):
             return True, "daily_amount_unavailable: treated as not passed"
         if amount / _WAN_TO_YUAN < floor_wan:
             return True, "daily_amount %.0f wan < %.0f wan" % (amount / _WAN_TO_YUAN, floor_wan)
-    floor_turnover = _param(params, "t_min_turnover_pct")
+    floor_turnover, floor_src = _turnover_floor_of(params, ctx)
     if floor_turnover > _ZERO_F:
         turnover = _t__num(ctx.get("turnover_pct"))
         if turnover is None or turnover <= _ZERO_F:
             return True, "turnover_unavailable: treated as not passed"
         if turnover < floor_turnover:
-            return True, "turnover %.2f%% < %.2f%%" % (turnover, floor_turnover)
+            return True, "turnover %.2f%% < %.2f%% (%s)" % (
+                turnover, floor_turnover, floor_src)
     name = str(ctx.get("name") or _EMPTY).upper()
     for marker in (_param(params, "t_st_markers") or []):
         if str(marker).upper() in name:
