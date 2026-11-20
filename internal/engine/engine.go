@@ -7321,6 +7321,42 @@ func (e *Engine) amountSeriesFnOrDefault() func(n int, today string) ([]data.Ind
 // flowMoneyTTL 资金流腿盘中取数缓存 TTL（60s：fflow 分时与板块 clist 实时，无需更频）。
 const flowMoneyTTL = 60 * time.Second
 
+// sectorAggMinBoards 板块聚合写库的最小样本数（§FLOW-SECTOR-AGG）。
+//
+// 为什么要有它：`sector_flow_pct / flow_sector_delta` 是"全市场板块"的聚合读数，
+// 但上游随时可能只回一小撮板块（中继抖动、分页半截）。拿 2 个板块的净额冒充全市场，
+// 会让 blend 的板块项**看着有值而方向是假的**——比 NULL 弃权贵得多。
+// 取 20 的依据：东财行业板块实测 496 个，20 是"连零头都不到"的量级，
+// 正常一轮远远超过，只有残缺回包才会掉到线下。
+const sectorAggMinBoards = 20
+
+// aggregateSectorFlow 把一轮板块读数压成两列聚合量的**纯函数**（无 IO、无锁）：
+//
+//	sector_flow_pct   = 净流入合计 ÷ 成交额合计 × 100   （与 market_flow_pct 同形态，可直接对比）
+//	flow_sector_delta = 各板块 delta 的**等权均值**并夹到 [-1,1]（"多数板块的强度"）
+//
+// 为什么 delta 不用同一个加权合计：合计口径与大盘腿高度重合（板块成分本就覆盖全市场），
+// 那样两列只是同一条腿的两种写法；等权均值才带"板块之间强弱是否一致"的结构信息。
+//
+// 弃权条件（任一命中即返回两个 nil ⇒ 库里落 NULL，blend 缺项 renormalize）：
+// 成交额合计 ≤0 / 样本 < sectorAggMinBoards / 结果为 NaN。绝不返回 0 冒充"中性"。
+func aggregateSectorFlow(netSum, amtSum, deltaSum float64, n int) (pct, delta *float64) {
+	if amtSum <= 0 || n < sectorAggMinBoards {
+		return nil, nil
+	}
+	p := netSum / amtSum * 100
+	d := deltaSum / float64(n)
+	if d > 1 {
+		d = 1
+	} else if d < -1 {
+		d = -1
+	}
+	if math.IsNaN(p) || math.IsNaN(d) {
+		return nil, nil
+	}
+	return &p, &d
+}
+
 // fillFlowMoney §FLOW-MONEY 资金流腿刷新（2026-11-19 云端实现，owner 裁决：大盘+逐票板块，60s TTL）。
 //
 //   - 大盘：IndexMoneyFlowToday（fflow secid=1.000001 klt=1 末根=当日累计主力净额，元，**行日期必须
@@ -7424,6 +7460,12 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 		}
 	}
 	secMap := map[string]float64{}
+	// §FLOW-SECTOR-AGG（owner 2026-11-20「看能不能拿到」）：板块腿的两列聚合量。
+	// netSum/amtSum 是**加权合计**（与大盘腿同形态，可直接对比）；
+	// deltaSum/nDelta 是**各板块 delta 的等权均值**（"多数板块的强度"）。
+	// 两者刻意不同口径：合计口径与大盘腿高度重合，等权均值才带结构信息。
+	var netSum, amtSum, deltaSum float64
+	var nDelta int
 	if sectors, err := sectorFn(); err == nil && len(sectors) > 0 {
 		for _, s := range sectors {
 			if s.Name == "" || s.Turnover <= 0 || s.NetInflow == 0 {
@@ -7434,6 +7476,10 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 				continue
 			}
 			secMap[s.Name] = d
+			netSum += s.NetInflow
+			amtSum += s.Turnover
+			deltaSum += d
+			nDelta++
 			if e.d1Store != nil {
 				if uerr := e.d1Store.UpsertSectorFlowDaily(store.SectorFlowDailyRow{
 					TradeDate: today, Sector: s.Name, NetInflow: s.NetInflow, Amount: s.Turnover, Delta: d,
@@ -7444,13 +7490,19 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 		}
 	}
 
-	// ③ 大盘 delta 写库（资金流四列专用写口；量比三列不受影响）。
-	if e.d1Store != nil && (mktDelta != nil) {
+	// 板块聚合 → flow_factor_daily 的 sector_flow_pct / flow_sector_delta。
+	// 抽成纯函数（aggregateSectorFlow）以便离线验算；样本不足一律弃权（NULL）。
+	secPct, secDelta := aggregateSectorFlow(netSum, amtSum, deltaSum, nDelta)
+
+	// ③ 大盘 + 板块聚合写库（资金流四列专用写口；量比三列不受影响）。
+	// 两条腿任一有值就写：板块拿到而大盘没拿到时，也要让板块腿留在账上（缺哪个就 NULL 哪个）。
+	if e.d1Store != nil && (mktDelta != nil || secDelta != nil) {
 		if uerr := e.d1Store.UpsertFlowMoneyOnly(store.FlowFactorDailyRow{
 			TradeDate: today, MarketFlowPct: mktPct, FlowMarketDelta: mktDelta,
+			SectorFlowPct: secPct, FlowSectorDelta: secDelta,
 			Source: "eastmoney_fflow",
 		}); uerr != nil {
-			log.Printf("[engine] §FLOW-MONEY 大盘写库失败: %v", uerr)
+			log.Printf("[engine] §FLOW-MONEY 大盘/板块写库失败: %v", uerr)
 		}
 	}
 

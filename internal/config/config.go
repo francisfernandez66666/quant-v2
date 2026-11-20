@@ -4021,6 +4021,16 @@ func (m *Manager) SetSchedulerHithinkKey(userID, key string) error {
 	if err := m.Save(); err != nil {
 		return err
 	}
+	// §HITHINK-KEY-SINGLE（owner 2026-11-20）：主进程内的 data.NewHithinkClient() 只读环境变量，
+	// 所以「保存即生效」还必须把新 key 写进进程环境——否则要重启 quant 才能让行情第一顺位/
+	// 涨停池/资金流快照用上新 key（用户视角就是"配了没用"）。空值表示撤销：一并清掉环境变量，
+	// 免得撤销后旧 key 仍被主进程持有。
+	// ⚠️ 字符串必须与 data.HithinkAPIKeyEnv 同值（config 不 import data，避免包循环；门禁有锁）。
+	if key == "" {
+		_ = os.Unsetenv("HITHINK_FINANCE_API_KEY")
+	} else {
+		_ = os.Setenv("HITHINK_FINANCE_API_KEY", key)
+	}
 	return nil
 }
 

@@ -26085,12 +26085,36 @@ if grep_q 'PARAMS.get("industry_map")' ENG234; then fail234 "云端板块腿回�
 # 负锁：跨日闸不许退化成"永真"（`!= ""` 这种写法等于放行昨天的表）。
 if grep_q 'doc.Day != ""' SMG234; then fail234 "跨日闸被改成永真（昨日表会冒充今天）"; fi
 
+# ③c 同花顺 key 单点（§HITHINK-KEY-SINGLE，owner 2026-11-20「把自动研究-设置里那个 key 当全部的
+#     hithink 设置」）：那个 key 历史上只注入给 hithink-sync 子进程，主进程内的
+#     `data.NewHithinkClient()` 只读 env ⇒ UI 配了 key，行情第一顺位/涨停池/资金流快照照样报"未启用"。
+CNT234=$((CNT234 + 1))
+CFGMGR234=$(cat internal/config/config.go || true)
+MAIN234=$(cat cmd/quant/main.go || true)
+HITHINK234=$(cat internal/data/hithink.go || true)
+grep_q 'os.Setenv("HITHINK_FINANCE_API_KEY", key)' CFGMGR234 F || fail234 "保存 key 没有发布到进程环境（配了不生效，仍要重启）"
+grep_q 'os.Unsetenv("HITHINK_FINANCE_API_KEY")' CFGMGR234 F || fail234 "撤销 key 没有清理环境变量（旧 key 仍被主进程持有）"
+grep_q 'strings.TrimSpace(cfgMgr.Get().Scheduler.HithinkKey)' MAIN234 F || fail234 "启动装配没有读配置里的 hithink key"
+grep_q 'if os.Getenv(data.HithinkAPIKeyEnv) == "" {' MAIN234 F || fail234 "启动注入没有让环境变量优先（运维通道会被配置覆盖）"
+grep_q 'HithinkAPIKeyEnv = "HITHINK_FINANCE_API_KEY"' HITHINK234 F || fail234 "data 包的键名常量被改动（config 那份也要同批改）"
+
+# ③d 板块聚合两列（§FLOW-SECTOR-AGG）：`sector_flow_pct` / `flow_sector_delta` 此前**没有写点**，
+#     恒 NULL ⇒ `withRegimeFlowDeltas` 板块兜底恒缺失，逐票没命中时整条板块腿弃权。
+CNT234=$((CNT234 + 1))
+grep_q 'func aggregateSectorFlow(netSum, amtSum, deltaSum float64, n int) (pct, delta *float64) {' ENG234 F || fail234 "缺板块聚合纯函数（两列没有口径）"
+grep_q 'const sectorAggMinBoards = 20' ENG234 F || fail234 "缺板块聚合最小样本数（残缺回包会冒充全市场）"
+grep_q 'SectorFlowPct: secPct, FlowSectorDelta: secDelta,' ENG234 F || fail234 "板块两列没有写进 flow_factor_daily"
+grep_q 'if e.d1Store != nil && (mktDelta != nil || secDelta != nil) {' ENG234 F || fail234 "大盘缺失时板块腿被一起丢掉了"
+# 负锁：板块两列不许拿大盘数值顶班（那两列就是"第二个大盘"，等于没修）。
+if grep_q 'SectorFlowPct: mktPct' ENG234; then fail234 "sector_flow_pct 用大盘数值顶班（两列变同一条腿）"; fi
+
+
 # ④ 行为腿：判退出码，不判输出文本。
 CNT234=$((CNT234 + 1))
 if command -v go >/dev/null 2>&1; then
 	FIX234_RC=0
 	go test ./internal/config ./internal/engine ./internal/paper ./internal/data -count=1 \
-		-run 'TestTurnoverTier|TestTLiquidityTurnoverTier|TestSectorMap|TestSectorDelta' >/dev/null 2>&1 || FIX234_RC=$?
+		-run 'TestTurnoverTier|TestTLiquidityTurnoverTier|TestSectorMap|TestSectorDelta|TestAggregateSectorFlow|TestSetSchedulerHithinkKey|TestHithinkKeyEnvName' >/dev/null 2>&1 || FIX234_RC=$?
 	[ "$FIX234_RC" = "0" ] || fail234 "Go 分档用例未过（退出码 ${FIX234_RC}）"
 else
 	echo "INFO - §234 无 go，Go 分档行为腿未跑（这份绿不含 Go 判定）"

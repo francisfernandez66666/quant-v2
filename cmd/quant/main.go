@@ -178,6 +178,22 @@ func run() int {
 	// 运营数据统一归属管理员：把管理员账号 ID 注入配置管理器，使量化/模拟盘/策略/D1/LLM/
 	// 做多空等配置与持仓/告警等数据系统级共享，后端按角色鉴权（子账号只读公开部分）。
 	cfgMgr.SetOperatorID(authMgr.AdminID())
+	// §HITHINK-KEY-SINGLE（owner 2026-11-20）：同花顺 key 的**唯一配置入口**是
+	// 「自动研究 → 设置」子 tab 里那一个（写进 `rules.scheduler.hithink_api_key`，
+	// 见 config.SetSchedulerHithinkKey 的双写）。但主进程内的 `data.NewHithinkClient()`
+	// 只读环境变量，历史上只有「拉起 hithink-sync 子进程」那条腿注入过 ⇒ 运营在 UI 里配了 key，
+	// 行情第一顺位、涨停池/资金流快照、交易日历那几条腿仍然拿不到（日志里表现为
+	// 「同花顺(新)未启用 / 环境变量 HITHINK_FINANCE_API_KEY 未设置」）。
+	// 这里在**装配之前**把它注入进程环境；已有环境变量（/etc/quant.env）优先——
+	// 运维通道不该被配置值覆盖。
+	if hk := strings.TrimSpace(cfgMgr.Get().Scheduler.HithinkKey); hk != "" {
+		if os.Getenv(data.HithinkAPIKeyEnv) == "" {
+			if err := os.Setenv(data.HithinkAPIKeyEnv, hk); err == nil {
+				log.Printf("[main] §HITHINK-KEY 已从配置注入 %s（len=%d，来源=自动研究-设置）",
+					data.HithinkAPIKeyEnv, len(hk))
+			}
+		}
+	}
 	// §DYN-GLOBAL（2026-10-24 owner 裁决一「dynamic 全局，legacy 开关账户级别」）一次性迁移：
 	// 出厂默认已抬成下发态，但面板物化过的存量载荷里躺着显式的 enabled=false / budget_mode=legacy，
 	// 只改代码默认会让这些账号**静默留在关闭态**。此处按"从未被碰过的旧安全形状"逐字归一，
