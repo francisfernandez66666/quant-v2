@@ -1,0 +1,17 @@
+# quant-sector-map.timer — 交易日 08:20 取一次板块连接键（§FLOW-SECTOR-JOIN，owner 2026-11-20）。
+#
+# 时间选在 **08:20**：必须早于 08:45 的第一轮载体热更（那一轮会把 params.sector_map 烘进产物），
+# 也要早于 08:55 的 PreOpen 拉取。取数本身要 5–8 分钟，08:20 起跑留足余量。
+# Persistent=true：机器在 08:20 关着就在开机后补跑一次（表是 day-keyed，跨日会自动失效，
+# 所以"补跑"这件事只会带来好处：有当日表就命中，没有就弃权）。
+[Unit]
+Description=Quant sector-map producer schedule (trading days 08:20)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:20:00
+Persistent=true
+AccuracySec=30s
+Unit=quant-sector-map.service
+
+[Install]
+WantedBy=timers.target

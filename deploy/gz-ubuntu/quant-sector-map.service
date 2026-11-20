@@ -1,0 +1,26 @@
+# quant-sector-map.service — 板块逐票连接键的日级生产者（§FLOW-SECTOR-JOIN，owner 2026-11-20）。
+#
+# 为什么要有独立的 unit 而不是继续只靠热更链的"当日缺失才补跑"：
+#   热更链只在**交易日 08:45–15:30** 触发、且要等"发现表缺失"才动手；一旦那天热更链本身
+#   没跑（服务异常、休市日、有人手工停过），`sector_map` 就整天缺失 ⇒ 载体与云端的逐票板块腿
+#   双双弃权，而两边读数都"正常"。独立 timer 让"取连接键"这件事有自己的名字与自己的失败记录。
+#
+# oneshot + 幂等：生产者自己保证"全量或弃权"（任一板块分页没凑齐 total 就丢弃该板块；
+# 覆盖率 <60% 或 <3000 只**不覆盖旧文件**并退出码 1），所以多跑一次不会写坏表。
+[Unit]
+Description=Quant sector-map producer (per-stock EastMoney board join key, day-keyed)
+After=network-online.target
+# 依赖盒子中继（10.77.0.2:8789）：WireGuard 断了这一步必然失败，重试交给下次 timer。
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/quant/carrier_build/scripts/pregen_sector_map_gz.py
+Environment=CARRIER_BUILD_DIR=/opt/quant/carrier_build
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+Environment=OWNER_UID=u_1785377969825355000
+# 496 个行业板块 + 554 个概念板块，逐板块取成分（含分页），实测 5–8 分钟。
+TimeoutStartSec=1500
+# 失败不是"系统故障"，是"今天这条腿弃权"：不要 Restart，也不要让 unit 停在 failed 刷告警，
+# 判读靠 SECTOR_MAP_RESULT=OK|ABORT 那一行与 journal。
+Restart=no

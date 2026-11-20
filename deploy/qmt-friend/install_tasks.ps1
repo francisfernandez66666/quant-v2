@@ -26,7 +26,8 @@
 # 用法：
 #   .\install_tasks.ps1                 # 只打印将要注册的六条
 #   .\install_tasks.ps1 -Apply          # 真注册（交互式，/IT）
-#   .\install_tasks.ps1 -Apply -RunAsSystem   # 无人值守机器：注册成 SYSTEM（会话注销也能跑）
+#   .\install_tasks.ps1 -Apply                # 注册成 SYSTEM（默认；会话注销也能跑）
+#   .\install_tasks.ps1 -Apply -Interactive   # 回到 /IT 语义（有桌面会话的机器）
 #   .\install_tasks.ps1 -Uninstall -Apply
 
 param(
@@ -43,11 +44,16 @@ param(
     # （当天 12:2x 起全部静默，13:35 网关进程消失，盘中 UAT 做不成）。
     # 实测：XtItClient.exe 在 SessionId=0 下存活并正常加载策略（v141/v142 都成功 re-init），
     # 所以这条路可用。默认仍走 /IT（有桌面会话时更贴近"谁登录谁拉起"），
-    # 无人值守的机器显式加 -RunAsSystem。
-    [switch]$RunAsSystem
+    # owner 2026-11-20 裁决：**默认就是 SYSTEM**（无人值守是常态；有桌面会话的机器加 -Interactive
+    # 才回 /IT）。理由：交互式会话一注销，所有 /IT 任务静默不执行，而现网那台机器长期无人值守。
+    [switch]$RunAsSystem = $true,
+    # 反向开关：想回到"谁登录谁拉起"的 /IT 语义时显式加它。
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Interactive) { $RunAsSystem = $false }
 
 if (-not $Watchdog) { $Watchdog = Join-Path $PSScriptRoot "watchdog.ps1" }
 if (-not (Test-Path $Watchdog)) {

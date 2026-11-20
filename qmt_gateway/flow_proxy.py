@@ -51,7 +51,11 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 _REFERER = "https://quote.eastmoney.com/"
 
 # 资金流字段：f51 日期 + f52 主力 / f53 小单 / f54 中单 / f55 大单 / f56 超大单（元）。
-_FFLOW_FIELDS = "f51,f52,f53,f54,f55,f56"
+# fields2 的第 7 列（f57 主力净占比）是给**历史回填**用的：上游不直接给当日成交额，
+# 但 f57 = 主力净额/成交额×100，回填脚本用它反推 amount 与 delta（一个商，不是第二套公式）。
+# 广州侧的解析器只按位置取前 6 列（parseMoneyFlowHistory 的 emFFlowRowFields），
+# 多出来的这一列对它无影响——这一点在加列前已核对过。
+_FFLOW_FIELDS = "f51,f52,f53,f54,f55,f56,f57"
 
 # 板块列表只放行两个市场与一组字段；多一个都不认（宁可 400，也不让参数面长出去）。
 _CLIST_FS = ("m:90+t:2", "m:90+t:3")  # 行业板块 / 概念板块

@@ -26121,7 +26121,8 @@ grep_q '            self.ensure_gateway()' CU234 F || fail234 "投递成功分�
 grep_q 'if self._gateway_listening():' CU234 F || fail234 "自愈没有先探端口（会重复起实例）"
 # 负锁：自愈必须走计划任务，不许在会话内直起（会话一断进程就没了——10-29 实证）。
 if grep_q 'Start-Process.*gateway' CU234; then fail234 "网关自愈改成会话内直起（会话结束即被杀）"; fi
-grep_q '[switch]$RunAsSystem' IT234 F || fail234 "装填器没有 SYSTEM 档（交互式会话注销后任务全停）"
+grep_q '[switch]$RunAsSystem = $true,' IT234 F || fail234 "SYSTEM 档不是默认（无人值守机器会退回 /IT）"
+grep_q '[switch]$Interactive' IT234 F || fail234 "缺 -Interactive 反向开关（想回 /IT 时没有出口）"
 grep_q 'if ($RunAsSystem) {' IT234 F || fail234 "SYSTEM 档的分支被短路（开关在、分支不生效＝形同虚设）"
 grep_q '$args1 += @("/RU", "SYSTEM", "/RL", "HIGHEST")' IT234 F || fail234 "SYSTEM 档没有落到 schtasks 参数面"
 # 负锁：SYSTEM 与 /IT 互斥，同一分支里同时给会直接注册失败。
@@ -26138,6 +26139,30 @@ grep_q 'data-testid="flow-sector-agg"' FFC234 F || fail234 "前端没有板块�
 grep_q '板块合计：今日无读数（弃权）' FFC234 F || fail234 "前端缺数时没有显式弃权文案"
 # 负锁：缺数时不许画 0（0 在资金流语境里是"板块中性"，是另一个意思）。
 if grep_q 'sector_known ? .*0\.00' FFC234; then fail234 "板块聚合缺数被画成 0.00"; fi
+
+# ③g 板块资金流**历史回填**（owner 2026-11-20「历史回填做了」）：长期被判"不可行"的依据
+#     （push2his 拒 90.BK*）在 2026-11-20 被实测推翻 —— 121 根日线可用。回填口径必须与引擎同源：
+#     amount/delta 都由上游自己的净占比（f57）反推，不是第二套公式。
+CNT234=$((CNT234 + 1))
+BF234=$(cat scripts/backfill_sector_flow_gz.py || true)
+grep_q 'FULL_SCALE_PCT = 3.0' BF234 F || fail234 "回填的满档口径不是 3%（与 FlowPctToDelta 漂开）"
+grep_q 'amount = net / (pct / 100.0)' BF234 F || fail234 "回填没有用上游净占比反推成交额（会写错量纲）"
+grep_q 'if date >= today:' BF234 F || fail234 "回填会覆盖今天（引擎现算的行被批量盖掉）"
+# 锚收在 SQL 字符串**首**：单看 `ON CONFLICT(...)` 会被注释里的同名片段骗过（本仓踩过）。
+grep_q '"VALUES (?,?,?,?,?) ON CONFLICT(trade_date, sector) DO UPDATE SET "' BF234 F || fail234 "回填不是幂等的（重跑会炸主键）"
+grep_q 'def save_state(state):' BF234 F || fail234 "回填没有断点续跑（496 板块中途断了要重来）"
+# 中继的 fields2 必须带 f57（第 7 列），否则回填拿不到占比、只能弃权。
+grep_q '_FFLOW_FIELDS = "f51,f52,f53,f54,f55,f56,f57"' FP234 F || fail234 "中继 fields2 没带 f57（回填拿不到净占比）"
+
+# ③h 板块连接键的独立生产者 timer（owner 2026-11-20「sector_map 独立 timer 做了」）：
+#     只靠热更链"缺失才补跑"时，那天热更链本身没跑就整天没有表，而两边读数都"正常"。
+CNT234=$((CNT234 + 1))
+SMT234=$(cat deploy/gz-ubuntu/quant-sector-map.timer || true)
+SMS234=$(cat deploy/gz-ubuntu/quant-sector-map.service || true)
+grep_q 'OnCalendar=Mon..Fri *-*-* 08:20:00' SMT234 F || fail234 "连接键 timer 不在 08:20（要早于 08:45 首轮热更）"
+grep_q 'Persistent=true' SMT234 F || fail234 "连接键 timer 没有 Persistent（错过就整天没有表）"
+grep_q 'ExecStart=/usr/bin/python3 /opt/quant/carrier_build/scripts/pregen_sector_map_gz.py' SMS234 F || fail234 "连接键 service 没跑生产者"
+grep_q 'TimeoutStartSec=1500' SMS234 F || fail234 "连接键 service 超时太短（实测 5–8 分钟）"
 
 # ④ 行为腿：判退出码，不判输出文本。
 CNT234=$((CNT234 + 1))
