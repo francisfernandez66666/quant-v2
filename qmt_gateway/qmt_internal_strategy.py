@@ -2916,6 +2916,12 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         # extras -> the dict still has score, and the rule declines on missing
         # propagation/day (honest), never on a fabricated value.
         "news_event": _news_event_obj(pre),
+        # NEWS-EVENT-LINEAR (owner 2026-11-20): the factor family needs the SIGNED D1 score as
+        # a float (-40..+40; positive=bullish, negative=bearish, absent=no event). The dict above
+        # stays for good_news_fade; the two must not share one key -- the scalar proxy would get a
+        # dict, fail _as_number and abstain forever, invisibly (which is how this factor never
+        # took part in scoring).
+        "news_event_score": pre.get("news_event"),
         "concept_heat": pre.get("concept_heat"),
         # LIMIT-BOARD (2026-11-16 owner): lu_board3/lu_board scalar proxies read
         # ctx["limit_board_count"] by input_key -- baked by pregen from the EM

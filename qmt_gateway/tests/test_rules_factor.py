@@ -653,15 +653,21 @@ class TestDeclineWhenInputMissing(unittest.TestCase):
         self.assertAlmostEqual(scored["details"]["DebtToAssets"], 0.7)  # (100-30)/100
 
     def test_news_event_has_no_proxy_until_a_band_is_baked(self):
-        """新闻/LLM 事件：沙箱里没有这条链，就算 ctx 塞了布尔也不许凭空打分。"""
+        """新闻/LLM 事件：代理腿只在"band 烘了 + ctx 真带 D1 分"时才存在，缺一仍弃权。
+
+        §NEWS-EVENT-LINEAR（2026-11-20）：输入键从 `news_event`（good_news_fade 的 dict）
+        改成 `news_event_score`（同一份 D1 分的 float 副本）——那两件事必须分开，
+        否则 scalar 代理拿到 dict 就永久弃权而读数上完全看不出来。
+        """
         rule = {"id": "fac_news", "name": "factor_composite", "factors": ["NewsEvent"],
                 "weights": {"NewsEvent": 1.0}, "directions": {"NewsEvent": 1},
                 "buy_threshold": 60.0}
         self.assertIsNone(rf.rule_factor_composite(params(factor_rules=[rule]),
-                                                   ctx(news_event=True)))
+                                                   ctx(news_event_score=30.0)))
         opted_in = params(factor_rules=[rule], scalar_bands={"NewsEvent": {"min": 0.0,
-                                                                           "max": 1.0}})
-        self.assertIsNotNone(rf.rule_factor_composite(opted_in, ctx(news_event=True)))
+                                                                           "max": 40.0}})
+        self.assertIsNotNone(rf.rule_factor_composite(opted_in, ctx(news_event_score=30.0)))
+        # dict 形状（good_news_fade 的）喂进来必须弃权，不许"猜一个数"。
 
     def test_no_bars_means_no_opinion(self):
         """Go factor.go:219：K 线不足 30 根判 nodata，这里同样只能弃权。"""
@@ -793,3 +799,65 @@ class TestFactorLibrary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# ---------------------------------------------------------------------------
+# (6) §NEWS-EVENT-LINEAR（owner 2026-11-20）：D1 分数带符号 [−40,+40]，正=利好
+# ---------------------------------------------------------------------------
+
+class TestNewsEventLinearBand(unittest.TestCase):
+    """`NewsEvent` 因子此前在载体上**从未参与打分**，而且读数上看不出来：
+
+    ctx["news_event"] 是给 good_news_fade 的 dict（score/positive/propagation/day），
+    而 scalar 代理把 dict 喂给 `_as_number` 必然失败 ⇒ 每条含 NewsEvent 的规则都
+    `input_absent`。同时 band 还按旧口径写着 [30,101)（那是 0..100 的新闻分），
+    与现在统一的 D1 [−40,+40] 完全对不上。
+
+    这组锁三件事：
+      1. 因子读的是 **float 副本** `news_event_score`（dict 仍归 good_news_fade）；
+      2. `mode=linear` 时按 [min,max] **线性归一**（保留强度），不是"命中/未命中"；
+      3. 负分（利空）与缺失必须落在 0 / 弃权，绝不因为"有值"就加分。
+    """
+
+    def _table(self, band):
+        rule = {"id": "fac_news", "name": "factor_composite", "factors": ["NewsEvent"],
+                "weights": {"NewsEvent": 1.0}, "directions": {"NewsEvent": 1},
+                "buy_threshold": 0.0}
+        return rule, params(factor_rules=[rule], scalar_bands={"NewsEvent": band})
+
+    def test_positive_d1_scales_linearly(self):
+        rule, table = self._table({"min": 0, "max": 40, "mode": "linear"})
+        full = rf.score_factor_rule(table, rule, ctx(news_event_score=40.0))
+        self.assertAlmostEqual(full["details"]["NewsEvent"], 1.0)
+        half = rf.score_factor_rule(table, rule, ctx(news_event_score=20.0))
+        self.assertAlmostEqual(half["details"]["NewsEvent"], 0.5)
+        # 20 分与 40 分不同权——这正是"线性"相对"二值"的意义（强度信息不许丢）。
+        self.assertNotAlmostEqual(half["details"]["NewsEvent"],
+                                  full["details"]["NewsEvent"])
+
+    def test_negative_d1_scores_zero_not_positive(self):
+        rule, table = self._table({"min": 0, "max": 40, "mode": "linear"})
+        scored = rf.score_factor_rule(table, rule, ctx(news_event_score=-25.0))
+        self.assertAlmostEqual(scored["details"]["NewsEvent"], 0.0,
+                               msg="利空（负 D1）不许因为落在区间外反而拿到正向分")
+
+    def test_missing_score_declines(self):
+        rule, table = self._table({"min": 0, "max": 40, "mode": "linear"})
+        self.assertIsNone(rf.rule_factor_composite(table, ctx(news_event_score=None)))
+
+    def test_dict_form_is_not_accepted_as_a_scalar(self):
+        """守卫：把 dict（good_news_fade 的形状）喂给因子腿必须弃权，不许"猜一个数"。"""
+        rule, table = self._table({"min": 0, "max": 40, "mode": "linear"})
+        scene = ctx(news_event={"score": 30.0, "positive": True,
+                                "propagation": True, "day": "20261120"})
+        self.assertIsNone(rf.rule_factor_composite(table, scene))
+
+    def test_default_band_is_still_a_threshold(self):
+        """零回归：没写 mode 的 band 仍是"区间内=1"（lu_board 那批二值门槛一个字不改）。"""
+        rule = {"id": "fac_lu", "name": "factor_composite", "factors": ["lu_board"],
+                "weights": {"lu_board": 1.0}, "directions": {"lu_board": 1},
+                "buy_threshold": 0.0}
+        table = params(factor_rules=[rule], scalar_bands={"lu_board": {"min": 2, "max": 100}})
+        self.assertAlmostEqual(
+            rf.score_factor_rule(table, rule, ctx(limit_board_count=3))["details"]["lu_board"], 1.0)
+        self.assertAlmostEqual(
+            rf.score_factor_rule(table, rule, ctx(limit_board_count=1))["details"]["lu_board"], 0.0)

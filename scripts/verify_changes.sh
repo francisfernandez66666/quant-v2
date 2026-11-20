@@ -26174,6 +26174,21 @@ grep_q 'Persistent=true' SMT234 F || fail234 "连接键 timer 没有 Persistent�
 grep_q 'ExecStart=/usr/bin/python3 /opt/quant/carrier_build/scripts/pregen_sector_map_gz.py' SMS234 F || fail234 "连接键 service 没跑生产者"
 grep_q 'TimeoutStartSec=1500' SMS234 F || fail234 "连接键 service 超时太短（实测 5–8 分钟）"
 
+# ③i §NEWS-EVENT-LINEAR（owner 2026-11-20）：D1 分数统一是带符号 [-40,+40]，正=利好、负=利空。
+#     旧口径两条结构性缺陷：① band 写着 [30,101)（0..100 的新闻分，与 D1 对不上，正分几乎永不命中）；
+#     ② 因子读的 `news_event` 是 good_news_fade 的 **dict** ⇒ scalar 代理 `_as_number` 必失败
+#     ⇒ 含 NewsEvent 的规则永远 input_absent，**而读数上没有任何报错**。
+CNT234=$((CNT234 + 1))
+RF234=$(cat qmt_gateway/rules_factor.py || true)
+PARAMS234=$(cat qmt_gateway/local_executor_params.json || true)
+grep_q '"input": "news_event_score"' RF234 F || fail234 "因子腿仍读 dict 键（永远 input_absent）"
+grep_q 'if band.get("mode") == "linear":' RF234 F || fail234 "缺线性归一分支（D1 是连续分，二值会丢强度）"
+grep_q '"news_event_score": pre.get("news_event"),' QS234 F || fail234 "ctx 没写 D1 分的 float 副本"
+grep_q '"mode": "linear"' PARAMS234 F || fail234 "params 的 NewsEvent 带不是线性口径"
+grep_q '"input": "news_event_score"' PARAMS234 F || fail234 "params 的 factor_defs.NewsEvent.input 没改（烘进载体的仍是旧键）"
+# 负锁：旧口径 [30,101) 不许留宿（那是 0..100 新闻分的带，与 D1 差一个量纲）。
+if grep_q '"min": 30,' PARAMS234; then fail234 "NewsEvent 带还是旧口径 min=30（D1 正分几乎永不命中）"; fi
+
 # ④ 行为腿：判退出码，不判输出文本。
 CNT234=$((CNT234 + 1))
 if command -v go >/dev/null 2>&1; then
@@ -26188,7 +26203,7 @@ if command -v python3 >/dev/null 2>&1; then
 	PY234_RC=0
 	python3 -m pytest qmt_gateway/tests/test_rules_t.py qmt_gateway/tests/test_flow_proxy.py \
 		qmt_gateway/tests/test_pregen_sector_map.py qmt_gateway/tests/test_internal_strategy_sandbox.py \
-		qmt_gateway/tests/test_carrier_updater.py \
+		qmt_gateway/tests/test_carrier_updater.py qmt_gateway/tests/test_rules_factor.py \
 		-q >/dev/null 2>&1 || PY234_RC=$?
 	[ "$PY234_RC" = "0" ] || fail234 "载体/生产者用例未过（退出码 ${PY234_RC}）"
 else

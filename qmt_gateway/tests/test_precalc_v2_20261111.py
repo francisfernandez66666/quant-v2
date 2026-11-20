@@ -102,10 +102,17 @@ def test_bake_only_when_price_volume_missing(research_db):
 
 
 def test_scalar_bands_factory_defaults():
-    """scalar_bands 出厂带 NewsEvent/ConceptHeat 评分带（D1 分数/利好池分的评分依据）。"""
+    """scalar_bands 出厂带 NewsEvent/ConceptHeat 评分带（D1 分数/利好池分的评分依据）。
+
+    §NEWS-EVENT-LINEAR（owner 2026-11-20）：D1 分数统一是**带符号 [-40,+40]**，
+    所以 NewsEvent 的带是 [0,40] + mode=linear（正分线性给分、负分归 0、缺键弃权），
+    不再是旧口径的 [30,101)（那是 0..100 的新闻分，与现在的 D1 完全对不上）。
+    """
     params = json.load(open(os.path.join(QG, "local_executor_params.json"), encoding="utf-8"))
     bands = (params.get("params") or {}).get("scalar_bands") or {}
-    assert bands.get("NewsEvent", {}).get("min") == 30
+    news = bands.get("NewsEvent") or {}
+    assert news.get("min") == 0 and news.get("max") == 40
+    assert news.get("mode") == "linear", "D1 是连续分，带必须是线性的（二值会丢掉强度）"
     assert bands.get("ConceptHeat", {}).get("min") == 0.6
 
 

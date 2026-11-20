@@ -231,8 +231,14 @@ FACTOR_LIBRARY = {
     # an external readout that no longer exists inside the sandbox.
     "ConceptHeat": {"kind": "scalar_proxy", "windows": [], "input": "concept_heat",
                     "direct": True, "missing_input": "concept heat ranking (external feed)"},
-    "NewsEvent": {"kind": "scalar_proxy", "windows": [], "input": "news_event",
-                  "direct": True, "missing_input": "news agent / LLM event scoring (external)"},
+    # NEWS-EVENT-LINEAR (owner 2026-11-20): the D1 score is now a SIGNED [-40,+40] value
+    # (positive = bullish, negative = bearish, 0/absent = no event). ctx["news_event"] is the
+    # dict shape good_news_fade needs ({score,positive,propagation,day}); the factor leg reads
+    # a FLOAT copy of the same score under `news_event_score`. They must not share one key:
+    # the scalar proxy would get a dict, fail _as_number and abstain forever -- which is exactly
+    # how this factor never took part in scoring on the box, with no error anywhere.
+    "NewsEvent": {"kind": "scalar_proxy", "windows": [], "input": "news_event_score",
+                  "direct": True, "missing_input": "news agent / LLM D1 score (external)"},
     "IndexChange": {"kind": "scalar_proxy", "windows": [], "input": "index_change_pct",
                     "direct": True, "missing_input": "index weight / benchmark leg (external)"},
     "IsLeader": {"kind": "scalar_proxy", "windows": [], "input": "is_leader",
@@ -1207,7 +1213,15 @@ def _scalar_score(params, fid, raw, spec):
     high = band.get("max")
     if low is None or high is None:
         return None
-    return {"score": float(float(low) <= number < float(high))}
+    low, high = float(low), float(high)
+    if band.get("mode") == "linear":
+        # Linear normalisation: [min,max] -> 0..1 (clamped at both ends), keeping the MAGNITUDE
+        # rather than only "inside/outside". Only bands that explicitly say mode=linear take this
+        # path -- the existing threshold bands (lu_board "2 boards or more" etc.) are untouched.
+        if high <= low:
+            return None
+        return {"score": clamp01((float(number) - low) / (high - low))}
+    return {"score": float(low <= number < float(high))}
 
 
 def _last_value(values):

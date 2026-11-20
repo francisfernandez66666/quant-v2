@@ -1060,7 +1060,7 @@
       "NewsEvent": {
         "kind": "scalar_proxy",
         "windows": [],
-        "input": "news_event",
+        "input": "news_event_score",
         "direct": true,
         "missing_input": "news agent / LLM event scoring (external)"
       },
@@ -1545,8 +1545,9 @@
     "require_trading_day": true,
     "scalar_bands": {
       "NewsEvent": {
-        "min": 30,
-        "max": 101
+        "min": 0,
+        "max": 40,
+        "mode": "linear"
       },
       "ConceptHeat": {
         "min": 0.6,
