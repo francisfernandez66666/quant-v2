@@ -31,6 +31,11 @@ type joinFix struct {
 	day string // 北京今日（YYYYMMDD，生产者的日期口径）
 }
 
+// newJoinFix 造一个最小引擎：只装板块连接键与当日板块 delta map，其余字段留零值。
+//
+// 为什么不用 New()：这条腿的判据只看「连接键 → 板块名 → delta」三步，用完整引擎会把
+// 行情源/DB/打分循环一起拖进来（测试会变成集成测试且慢一个数量级）；零值 Engine 里
+// 用到的两个字段（mu / flowMoneyMu）都是 sync 原语的零值，可直接用。
 func newJoinFix(t *testing.T, mapping map[string]string, fileDay string) *joinFix {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "sector_map.json")
