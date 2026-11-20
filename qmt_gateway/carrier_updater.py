@@ -101,6 +101,13 @@ GATEWAY_START_TASK = "QMTF-Gateway-Start"
 # sha 校验 + 原子写 + 写后重启网关；任何一步不成立就整体跳过并把原因打出来（绝不停在半态）。
 GATEWAY_SYNC_PATH = "/leg/gateway"
 GATEWAY_SYNC_FILES = ("flow_proxy.py",)
+# §CLIENT-REVIVE（2026-11-20）：投递脚本会 `Stop-Process XtItClient` 再 `schtasks /Run` 一个
+# **旧名字**（QMT-Ensure-Running）；名字对不上就被 try/catch 吞掉，于是客户端被杀后没人拉起
+# （17:03 投递 v146 现场：网关回来了、客户端一直 0）。这里在投递成功后补一次"进程不在就起"，
+# 走 QMTF-Client-Start（唯一合法拉起通道）。与网关那条不同：**必须存在性判断**，
+# 重复启动会撞 QMT 的 userdata 锁。
+CLIENT_PROCESS = "XtItClient.exe"
+CLIENT_START_TASK = "QMTF-Client-Start"
 
 def _ascii_text(text):
     """任何要打印的东西先过这道：非 ASCII 字节一律换成 '?'。
@@ -619,6 +626,8 @@ class CarrierUpdater:
             self.sync_gateway_files()
             # §CARRIER-GATEWAY-REVIVE：有序重启会停掉网关且不会自己拉回来，投递成功后补一步。
             self.ensure_gateway()
+            # §CLIENT-REVIVE：投递脚本杀客户端后用的是**旧任务名**，收盘后没人拉起。
+            self.ensure_client()
         else:
             rep.update(status="FAILED", reason=fail_reason)
             self.post_ack(ack_version, self._executor_ack_version(manifest), False, fail_reason)
@@ -763,6 +772,31 @@ class CarrierUpdater:
             return
         self._log("CARRIER_GATEWAY_SYNC action=applied files=%s" % ",".join(changed))
         self._stop_gateway()
+
+    def _client_running(self):
+        """XtItClient 是否在跑（tasklist 判名字，不做通信——它没有端口可探）。"""
+        try:
+            proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + CLIENT_PROCESS, "/NH"],
+                                  capture_output=True, timeout=20)
+        except Exception:  # noqa: BLE001
+            return False
+        text = (proc.stdout or b"").decode("utf-8", "replace") + \
+            (proc.stderr or b"").decode("utf-8", "replace")
+        return CLIENT_PROCESS.lower() in text.lower()
+
+    def ensure_client(self):
+        """客户端没在跑就拉起（已在跑则跳过——重复启动会撞 userdata 锁）。失败只记日志。"""
+        if sys.platform != "win32":
+            return
+        try:
+            if self._client_running():
+                self._log("CARRIER_CLIENT action=already")
+                return
+            proc = subprocess.run(["schtasks", "/Run", "/TN", CLIENT_START_TASK],
+                                  capture_output=True, text=True, timeout=30)
+            self._log("CARRIER_CLIENT action=start rc=%d" % proc.returncode)
+        except Exception as exc:  # noqa: BLE001 - 自愈失败不许把投递判红
+            self._log("CARRIER_CLIENT action=error reason=%s" % exc.__class__.__name__)
 
     def _stop_gateway(self):
         """停掉网关进程，让随后的 ensure_gateway 用**新文件**重新拉起。

@@ -65,7 +65,12 @@ param(
     [Parameter(Mandatory = $true)][string]$Source,
     [Parameter(Mandatory = $true)][string]$QmtPythonDir,
     [string]$StrategyFile = "local_strategy.py",
-    [string]$EnsureTaskName = "QMT-Ensure-Running",
+    # §CLIENT-REVIVE（2026-11-20 现场）：这里以前默认 `QMT-Ensure-Running` —— 那是 Windows
+    # 时代运营机的任务名；朋友包/现网叫 `QMTF-Client-Ensure`。名字对不上时 `schtasks /Change`
+    # 与 `/Run` 都会被 try/catch 吞成一行 warn，于是**客户端被本脚本杀掉后没人拉起**，
+    # 而日志里只有 RESTART 那行看起来"attempted"（今天 17:03 投递 v146 就是这样丢了客户端）。
+    # 新默认取现网那个名字；仍可由 carrier_ensure_task 覆盖。
+    [string]$EnsureTaskName = "QMTF-Client-Ensure",
     [string]$GatewayProcessName = "python",
     [string]$GatewayScriptMatch = "gateway.py",
     [string]$ExpectedVersion = "",

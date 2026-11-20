@@ -26133,6 +26133,14 @@ grep_q 'GATEWAY_PUBLISH_DIR = os.path.join("/opt/quant/friend-pkg", "gateway")' 
 if grep_q 'Start-Process.*gateway' CU234; then fail234 "网关自愈改成会话内直起（会话结束即被杀）"; fi
 grep_q '[switch]$RunAsSystem = $true,' IT234 F || fail234 "SYSTEM 档不是默认（无人值守机器会退回 /IT）"
 grep_q '[switch]$Interactive' IT234 F || fail234 "缺 -Interactive 反向开关（想回 /IT 时没有出口）"
+# §CLIENT-REVIVE（2026-11-20 现场：投递后网关回来了、客户端一直是 0）：投递脚本杀客户端后用
+# 的旧任务名（QMT-Ensure-Running）根本不存在，`schtasks /Run` 被 try/catch 吞成一行 warn。
+UQ234=$(cat scripts/update_qmt_strategy.ps1 || true)
+grep_q '[string]$EnsureTaskName = "QMTF-Client-Ensure",' UQ234 F || fail234 "投递脚本的 ensure 任务名不是现网那个（杀了客户端没人拉起）"
+if grep_q '[string]$EnsureTaskName = "QMT-Ensure-Running",' UQ234; then fail234 "投递脚本回潮到 Windows 时代的旧任务名"; fi
+grep_q 'CLIENT_START_TASK = "QMTF-Client-Start"' CU234 F || fail234 "缺客户端自愈的任务名"
+grep_q 'def ensure_client(self):' CU234 F || fail234 "缺 ensure_client（客户端被杀后没人拉起）"
+grep_q '            self.ensure_client()' CU234 F || fail234 "投递成功分支没有调客户端自愈"
 grep_q 'if ($RunAsSystem) {' IT234 F || fail234 "SYSTEM 档的分支被短路（开关在、分支不生效＝形同虚设）"
 grep_q '$args1 += @("/RU", "SYSTEM", "/RL", "HIGHEST")' IT234 F || fail234 "SYSTEM 档没有落到 schtasks 参数面"
 # 负锁：SYSTEM 与 /IT 互斥，同一分支里同时给会直接注册失败。
