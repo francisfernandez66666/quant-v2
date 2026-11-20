@@ -22,6 +22,9 @@ FILES=(
   qmt_gateway/rules_factor.py
   qmt_gateway/rules_t.py
   qmt_gateway/rules_sizing.py
+  # §GATEWAY-FILE-SYNC（2026-11-20）：网关侧脚本也要下发——热更链把它发到 Caddy 的
+  # /leg/gateway/ 静态面，盒子投递成功后按 sha 自检同步（否则改 flow_proxy 仍要手工 push）。
+  qmt_gateway/flow_proxy.py
   # qmt_gateway/local_executor_params.json 已移出清单（§PARAMS-RUNTIME-20261112）：
   # 它是 gz 运行态文件（hot reload 写监视池/pool、pregen 回填行业桶），rsync 每次用
   # 仓库旧副本覆盖会冲掉运行态（11-12 实录：600 池与 508 行业桶被一次 rsync 清空）。

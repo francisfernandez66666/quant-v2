@@ -54,6 +54,7 @@ update_qmt_strategy.ps1 (never bypassing it), acks the outcome, and prints one
 machine-readable CARRIER_UPDATE_RESULT line. ASCII output, key never printed.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -95,6 +96,11 @@ STATE_KEEP = 20
 # 这里在投递成功之后补一步自愈：端口在监听就跳过，不在就触发计划任务（会话内直起会随会话被杀）。
 GATEWAY_PORT = 8789
 GATEWAY_START_TASK = "QMTF-Gateway-Start"
+# §GATEWAY-FILE-SYNC（owner 2026-11-20）：网关侧脚本的静态发布面（与载体产物同一个 Caddy root）。
+# 改动前必读：这里同步的是**网关进程自己跑的代码**（flow_proxy.py 等），所以必须
+# sha 校验 + 原子写 + 写后重启网关；任何一步不成立就整体跳过并把原因打出来（绝不停在半态）。
+GATEWAY_SYNC_PATH = "/leg/gateway"
+GATEWAY_SYNC_FILES = ("flow_proxy.py",)
 
 def _ascii_text(text):
     """任何要打印的东西先过这道：非 ASCII 字节一律换成 '?'。
@@ -608,6 +614,9 @@ class CarrierUpdater:
             rep.update(status="OK", version=now_ver or want_version,
                        sha256=now_sha or want_sha, reason="applied")
             self.post_ack(ack_version, self._executor_ack_version(manifest), True, "applied")
+            # §GATEWAY-FILE-SYNC：网关侧脚本（flow_proxy.py 等）不在载体投递面里，
+            # 这里按静态清单自检并同步；有变化会先把网关停掉。
+            self.sync_gateway_files()
             # §CARRIER-GATEWAY-REVIVE：有序重启会停掉网关且不会自己拉回来，投递成功后补一步。
             self.ensure_gateway()
         else:
@@ -691,6 +700,86 @@ class CarrierUpdater:
         except OSError:
             pass  # 删不掉只是留了一份临时件，绝不因此把结论改掉
 
+
+    def _gateway_dir(self):
+        """网关目录：本文件所在目录（carrier_updater 与 flow_proxy 同目录）。"""
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def sync_gateway_files(self):
+        """按静态发布面的清单同步网关侧脚本，有变化则重启网关。
+
+        三条纪律：
+          1. **sha 不匹配就不落盘**（下载一半/被代理改写都比"旧版本"更危险）；
+          2. **原子写**（同目录临时文件 + os.replace，网关进程不会读到半个文件）；
+          3. **失败只记日志**：网关文件同步不是投递成功的前提，绝不影响 ack。
+        """
+        if not self.base_url or not self.token:
+            return
+        if sys.platform != "win32":
+            return
+        gdir = self._gateway_dir()
+        try:
+            status, raw = self._request("GET", self.base_url.rstrip("/") + GATEWAY_SYNC_PATH + "/manifest.json")
+            if status != 200:
+                self._log("CARRIER_GATEWAY_SYNC action=skip reason=manifest_status_%d" % status)
+                return
+            doc = json.loads(raw.decode("utf-8-sig", "replace"))
+            files = doc.get("files") or {}
+        except (ValueError, OSError) as exc:
+            self._log("CARRIER_GATEWAY_SYNC action=skip reason=%s" % exc.__class__.__name__)
+            return
+        changed = []
+        for name in GATEWAY_SYNC_FILES:
+            meta = files.get(name) or {}
+            want = str(meta.get("sha256") or "").lower()
+            if not want:
+                continue
+            local = os.path.join(gdir, name)
+            if _sha256_file(local).lower() == want:
+                continue
+            status, body = self._request("GET", self.base_url.rstrip("/") + GATEWAY_SYNC_PATH + "/" + name)
+            if status != 200 or not body:
+                self._log("CARRIER_GATEWAY_SYNC name=%s action=skip reason=download_%d" % (name, status))
+                continue
+            if hashlib.sha256(body).hexdigest().lower() != want:
+                self._log("CARRIER_GATEWAY_SYNC name=%s action=skip reason=sha_mismatch" % name)
+                continue
+            tmp = local + ".sync-tmp"
+            try:
+                with open(tmp, "wb") as fh:
+                    fh.write(body)
+                os.replace(tmp, local)
+            except OSError as exc:
+                self._log("CARRIER_GATEWAY_SYNC name=%s action=skip reason=write_%s" % (
+                    name, exc.__class__.__name__))
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                continue
+            changed.append(name)
+        if not changed:
+            self._log("CARRIER_GATEWAY_SYNC action=up_to_date")
+            return
+        self._log("CARRIER_GATEWAY_SYNC action=applied files=%s" % ",".join(changed))
+        self._stop_gateway()
+
+    def _stop_gateway(self):
+        """停掉网关进程，让随后的 ensure_gateway 用**新文件**重新拉起。
+
+        只认命令行里的 `gateway.py`：uplink / carrier_updater 自己都是别的入口，不会误杀。
+        用 -EncodedCommand 传 PowerShell（避免引号/码页问题，与 win_remote_exec.sh 同法）。
+        """
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
+              "Where-Object { $_.CommandLine -match 'gateway[.]py' } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+        try:
+            b64 = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+            subprocess.run([_default_ps_exe(), "-NoProfile", "-EncodedCommand", b64],
+                           capture_output=True, timeout=30)
+            self._log("CARRIER_GATEWAY_SYNC action=stopped_gateway")
+        except Exception as exc:  # noqa: BLE001 - 停不下来就只记日志（下次投递再试）
+            self._log("CARRIER_GATEWAY_SYNC action=stop_error reason=%s" % exc.__class__.__name__)
 
     def _gateway_listening(self):
         """8789 是否在监听（本机回环探测，1 秒超时，绝不阻塞投递收尾）。"""

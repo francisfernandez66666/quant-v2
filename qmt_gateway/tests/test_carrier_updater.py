@@ -961,5 +961,111 @@ class TestEnsureGatewayRevive(unittest.TestCase):
         self.assertEqual(cu.GATEWAY_START_TASK, "QMTF-Gateway-Start")
 
 
+class TestGatewayFileSync(unittest.TestCase):
+    """§GATEWAY-FILE-SYNC（owner 2026-11-20「flow_proxy.py 盒上文件更新自动化」）。
+
+    现场：网关侧脚本不在载体投递面里，每次改都得手工 push + 重启网关（`b:BK*` 白名单
+    就是这么修的，两次都要人记着）。现在投递成功后按静态清单自检并同步。
+
+    四条锁（第 2 条是这条腿的命门）：
+      1. 清单取不到 ⇒ 一个字节都不动（不是"没有更新"，是"不知道"）；
+      2. 下载回来的 sha 与清单不符 ⇒ **不落盘**（坏字节比旧版本贵得多）；
+      3. sha 一致 ⇒ 不重复写、不停网关（幂等，别把每 5 分钟的热更变成热重启）；
+      4. 真同步了 ⇒ 落盘 + 停网关（随后的 ensure_gateway 用新文件拉起）。
+    """
+
+    class _Fake(object):
+        base_url = "http://brain.invalid"
+        token = "tok"
+        platform = "win32"
+
+        def __init__(self, manifest_status, manifest_body, downloads):
+            self._manifest_status = manifest_status
+            self._manifest_body = manifest_body
+            self._downloads = downloads
+            self._log_lines = []
+            self.stopped = 0
+
+        def _request(self, method, url, body=None):
+            if url.endswith("/manifest.json"):
+                return self._manifest_status, self._manifest_body
+            for suffix, payload in self._downloads.items():
+                if url.endswith("/" + suffix):
+                    return 200, payload
+            return 404, b""
+
+        def _log(self, line):
+            self._log_lines.append(line)
+
+        def _gateway_dir(self):
+            return self._dir
+
+        def _stop_gateway(self):
+            self.stopped += 1
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _fake(self, manifest_status, manifest_body, downloads):
+        f = self._Fake(manifest_status, manifest_body, downloads)
+        f._dir = self.dir
+        return f
+
+    def test_manifest_unreadable_touches_nothing(self):
+        f = self._fake(404, b"", {})
+        with mock.patch.object(cu.sys, "platform", "win32"):
+            cu.CarrierUpdater.sync_gateway_files(f)
+        self.assertEqual(os.listdir(self.dir), [])
+        self.assertEqual(f.stopped, 0)
+        self.assertTrue(any("manifest_status_404" in ln for ln in f._log_lines), f._log_lines)
+
+    def test_mismatched_bytes_never_land(self):
+        body = b"print('new')\n"
+        good_sha = hashlib.sha256(b"print('other')\n").hexdigest()   # 清单说另一个 sha
+        manifest = json.dumps({"files": {"flow_proxy.py": {"sha256": good_sha}}}).encode()
+        f = self._fake(200, manifest, {"flow_proxy.py": body})
+        with mock.patch.object(cu.sys, "platform", "win32"):
+            cu.CarrierUpdater.sync_gateway_files(f)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "flow_proxy.py")),
+                         "sha 不符的字节不许进活路径")
+        self.assertEqual(f.stopped, 0)
+        self.assertTrue(any("sha_mismatch" in ln for ln in f._log_lines), f._log_lines)
+
+    def test_already_current_is_idempotent(self):
+        body = b"print('same')\n"
+        target = os.path.join(self.dir, "flow_proxy.py")
+        with open(target, "wb") as fh:
+            fh.write(body)
+        manifest = json.dumps({"files": {"flow_proxy.py": {
+            "sha256": hashlib.sha256(body).hexdigest()}}}).encode()
+        f = self._fake(200, manifest, {})
+        with mock.patch.object(cu.sys, "platform", "win32"):
+            cu.CarrierUpdater.sync_gateway_files(f)
+        self.assertEqual(f.stopped, 0, "内容一致时不许重启网关（会把热更变成热重启）")
+        self.assertTrue(any("up_to_date" in ln for ln in f._log_lines), f._log_lines)
+
+    def test_changed_file_lands_and_gateway_is_stopped(self):
+        body = b"print('new')\n"
+        manifest = json.dumps({"files": {"flow_proxy.py": {
+            "sha256": hashlib.sha256(body).hexdigest()}}}).encode()
+        f = self._fake(200, manifest, {"flow_proxy.py": body})
+        with mock.patch.object(cu.sys, "platform", "win32"):
+            cu.CarrierUpdater.sync_gateway_files(f)
+        with open(os.path.join(self.dir, "flow_proxy.py"), "rb") as fh:
+            self.assertEqual(fh.read(), body)
+        self.assertEqual(f.stopped, 1, "新文件落盘后必须停网关，否则仍跑旧代码")
+
+    def test_non_windows_is_a_noop(self):
+        f = self._fake(200, b'{"files":{}}', {})
+        with mock.patch.object(cu.sys, "platform", "darwin"):
+            cu.CarrierUpdater.sync_gateway_files(f)
+        self.assertEqual(f.stopped, 0)
+        self.assertEqual(os.listdir(self.dir), [])
+
+
 if __name__ == "__main__":
     unittest.main()

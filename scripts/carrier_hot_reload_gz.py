@@ -876,6 +876,62 @@ def run(cmd, cwd=None):
     return r
 
 
+
+# §GATEWAY-FILE-SYNC（owner 2026-11-20「flow_proxy.py 盒上文件更新自动化做了」）：
+# 网关侧脚本（flow_proxy.py 这类"盒上文件"）**不在载体投递面里**——载体投递只换策略文件，
+# 所以每次改网关文件都得手工 `win_remote_exec.sh push` 再重启网关（2026-11-20 就是这么修
+# `b:BK*` 白名单的，两次现场都要人记着）。这里把网关文件放进同一个静态发布面：
+#   <friend-pkg>/leg/gateway/<name>            （Caddy 直出，与载体产物同一个 root）
+#   <friend-pkg>/leg/gateway/manifest.json     （{name: {"sha256": ..., "size": ...}}）
+# 盒子侧 carrier_updater 投递成功后按这份清单自检并同步（见 qmt_gateway/carrier_updater.py）。
+# 幂等：内容没变就不重写（比较 sha），所以每 5 分钟一轮的热更不会把静态目录写成热的。
+GATEWAY_SYNC_FILES = ("flow_proxy.py",)
+# ⚠️ Caddy 的 `handle_path /leg/*` 会**剥掉 /leg 前缀**再用 root=/opt/quant/friend-pkg，
+# 所以磁盘路径是 `friend-pkg/gateway/...`，而 URL 是 `/leg/gateway/...`。多写一层 leg
+# 会让 URL 404（发布成功、取不到——本仓最贵的形状之一，改这里先读 Caddyfile）。
+GATEWAY_PUBLISH_DIR = os.path.join("/opt/quant/friend-pkg", "gateway")
+
+
+def publish_gateway_files():
+    """把网关侧脚本同步到静态发布面（幂等）。返回 [(name, sha256)] 供日志与排障。"""
+    out = []
+    os.makedirs(GATEWAY_PUBLISH_DIR, exist_ok=True)
+    index = {}
+    for name in GATEWAY_SYNC_FILES:
+        src = os.path.join(BUILD_DIR, "qmt_gateway", name)
+        if not os.path.isfile(src):
+            print("HOTRELOAD_GATEWAY_SYNC skip=%s reason=src_missing" % name)
+            continue
+        raw = open(src, "rb").read()
+        sha = hashlib.sha256(raw).hexdigest()
+        dst = os.path.join(GATEWAY_PUBLISH_DIR, name)
+        same = False
+        if os.path.isfile(dst):
+            same = hashlib.sha256(open(dst, "rb").read()).hexdigest() == sha
+        if not same:
+            tmp = dst + ".tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(raw)
+            os.replace(tmp, dst)
+        index[name] = {"sha256": sha, "size": len(raw)}
+        out.append((name, sha))
+        print("HOTRELOAD_GATEWAY_SYNC name=%s sha=%s changed=%s" % (name, sha[:16], not same))
+    try:
+        mpath = os.path.join(GATEWAY_PUBLISH_DIR, "manifest.json")
+        body = json.dumps({"files": index, "updated_at": int(time.time())},
+                          ensure_ascii=True, sort_keys=True)
+        old = ""
+        if os.path.isfile(mpath):
+            old = open(mpath, "r", encoding="utf-8").read()
+        if old.strip() != body.strip():
+            tmp = mpath + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.replace(tmp, mpath)
+    except OSError as exc:
+        print("HOTRELOAD_GATEWAY_SYNC manifest_fail=%s" % exc.__class__.__name__)
+    return out
+
 def main():
     """烘焙发布主流程：快照重建 → 双派生（漂移 ABORT）→ 利空归因/利好池/D1 资讯闸
     烘参 → 版本 bump → 10 闸构建 → 发布产物+manifest → SSH 兜底触发。sha 无变化
@@ -887,6 +943,13 @@ def main():
     if not os.path.isdir(BUILD_DIR):
         die("build_dir_missing:" + BUILD_DIR)
     os.chdir(BUILD_DIR)
+
+    # §GATEWAY-FILE-SYNC：网关侧脚本进静态发布面（幂等）。放在 sha 比对**之前**——否则
+    # "载体没变化"的轮次会 NOTHING_TO_DO 提前退出，网关文件永远同步不出去。
+    try:
+        publish_gateway_files()
+    except Exception as exc:  # noqa: BLE001 - 同步失败不许阻断载体烘焙
+        print("HOTRELOAD_GATEWAY_SYNC_FAIL %s" % exc.__class__.__name__)
 
     # §B 自动补推（2026-11-11 owner 要求）：precalc 缺当日 / 覆盖率<80% ⇒ 自动补跑一次
     # pregen（限频：每小时最多一次，重试时间戳落 precalc_retry_ts），失败不阻断热更

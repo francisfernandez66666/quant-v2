@@ -26119,6 +26119,16 @@ grep_q 'GATEWAY_START_TASK = "QMTF-Gateway-Start"' CU234 F || fail234 "投递后
 grep_q 'def ensure_gateway(self):' CU234 F || fail234 "缺投递后网关自愈"
 grep_q '            self.ensure_gateway()' CU234 F || fail234 "投递成功分支没有调网关自愈（投完 8789 仍是 0）"
 grep_q 'if self._gateway_listening():' CU234 F || fail234 "自愈没有先探端口（会重复起实例）"
+# §GATEWAY-FILE-SYNC（owner 2026-11-20）：网关侧脚本不在载体投递面里，必须走静态清单自检同步。
+grep_q 'GATEWAY_SYNC_PATH = "/leg/gateway"' CU234 F || fail234 "缺网关文件同步路径（改 flow_proxy 仍要手工 push）"
+grep_q 'def sync_gateway_files(self):' CU234 F || fail234 "缺 sync_gateway_files"
+grep_q '            self.sync_gateway_files()' CU234 F || fail234 "投递成功分支没有同步网关文件"
+grep_q 'if hashlib.sha256(body).hexdigest().lower() != want:' CU234 F || fail234 "下载字节没验 sha（坏字节会进活路径）"
+grep_q 'def _stop_gateway(self):' CU234 F || fail234 "同步后没停网关（新文件不生效，仍跑旧代码）"
+HR234B=$(cat scripts/carrier_hot_reload_gz.py || true)
+grep_q 'def publish_gateway_files():' HR234B F || fail234 "热更链没有发布网关文件（静态面永远是空的）"
+grep_q 'GATEWAY_PUBLISH_DIR = os.path.join("/opt/quant/friend-pkg", "gateway")' HR234B F || fail234 "网关文件的磁盘路径不对（Caddy 会剥 /leg 前缀，多一层就是 404）"
+# 负锁：同步失败不许影响投递结论（自愈不是前提）。
 # 负锁：自愈必须走计划任务，不许在会话内直起（会话一断进程就没了——10-29 实证）。
 if grep_q 'Start-Process.*gateway' CU234; then fail234 "网关自愈改成会话内直起（会话结束即被杀）"; fi
 grep_q '[switch]$RunAsSystem = $true,' IT234 F || fail234 "SYSTEM 档不是默认（无人值守机器会退回 /IT）"
