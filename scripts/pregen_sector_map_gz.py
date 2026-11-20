@@ -42,6 +42,11 @@ DATA_DIR = os.environ.get("QUANT_DATA_DIR", "/var/lib/quant-trading-v2")
 AUTH = os.environ.get("PREGEN_AUTH", os.path.join(DATA_DIR, "auth.json"))
 OWNER_UID = os.environ.get("OWNER_UID", "u_1785377969825355000")
 OUT_PATH = os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_sector_map.json")
+# §FLOW-SECTOR-JOIN 云端侧（2026-11-20）：**同一份表**也给决策机引擎用。
+# 云端的逐票板块腿历史上走 `GetStockIndustry`（东财直连 f127），而广州对东财在 TLS 层被 RST
+# ⇒ 恒取不到名字 ⇒ 那条腿恒弃权且读数上无报错。引擎读这份 `<DataDir>/sector_map.json`
+# （见 internal/data/sector_map.go），与载体共用同一个生产者，避免"载体接上了、云端没接"。
+ENGINE_OUT = os.path.join(DATA_DIR, "sector_map.json")
 
 # 上游分页大小：盒子中继与东财都对 pz 有 100 硬顶（实测 pz=500 仍只回 100），
 # 所以一次 100、按 total 逐页翻；页数硬顶防上游 total 异常时的无界请求。
@@ -256,6 +261,16 @@ def main():
     with open(tmp, "w", encoding="ascii") as fh:
         json.dump(doc, fh, ensure_ascii=True, sort_keys=True)
     os.replace(tmp, OUT_PATH)
+    # 云端引擎那份（§FLOW-SECTOR-JOIN）：写失败只警告，绝不因为数据目录权限把载体那份也拖掉
+    # （载体那份才是执行腿的输入；引擎那份是让云端逐票板块 delta 也活过来）。
+    try:
+        os.makedirs(os.path.dirname(ENGINE_OUT), exist_ok=True)
+        etmp = ENGINE_OUT + ".tmp"
+        with open(etmp, "w", encoding="ascii") as fh:
+            json.dump(doc, fh, ensure_ascii=True, sort_keys=True)
+        os.replace(etmp, ENGINE_OUT)
+    except OSError as exc:
+        print("SECTOR_MAP_ENGINE_WRITE_FAIL %s path=%s" % (exc.__class__.__name__, ENGINE_OUT))
     print("SECTOR_MAP_RESULT=OK day=%s count=%d boards_ok=%d boards_failed=%d path=%s" % (
         day, len(mapping), stats["boards_ok"], stats["boards_failed"], OUT_PATH))
     return 0

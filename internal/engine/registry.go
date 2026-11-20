@@ -1113,6 +1113,12 @@ func (r *Registry) build(userID string) *Engine {
 	if opts.SectorTopN > 0 {
 		e.SetSectorConstituentTopN(opts.SectorTopN)
 	}
+	// §FLOW-SECTOR-JOIN（2026-11-20）：逐票板块连接键。生产者的产出落在数据目录下
+	// （`<DataDir>/sector_map.json`，日级）；未装配时 sectorDeltaFor 退回东财直连
+	// （广州对它被 RST ⇒ 恒弃权，这正是本缝要修的那条腿）。
+	if opts.DataDir != "" {
+		e.SetSectorMap(data.NewSectorMapCache(filepath.Join(opts.DataDir, "sector_map.json")))
+	}
 	if opts.D1MaxRetries > 0 {
 		e.SetD1MaxRetries(opts.D1MaxRetries)
 	}

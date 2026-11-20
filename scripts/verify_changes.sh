@@ -26063,12 +26063,34 @@ grep_q 'scripts/pregen_sector_map_gz.py' RSYNC234 F || fail234 "生产者没进 
 if grep_q 'maps = PARAMS.get("industry_map")' QS234; then fail234 "板块腿回潮用 industry_map（交集为空、命中恒 0）"; fi
 grep_q 'maps = PARAMS.get("sector_map") or {}' QS234 F || fail234 "载体没按 sector_map 连接"
 
+# ③b 云端侧同一条腿（§FLOW-SECTOR-JOIN 的决策机一半）：广州对东财被 RST ⇒ `GetStockIndustry`
+#     恒返空 ⇒ 云端「个股→板块 delta」恒弃权且**没有任何报错**。修法是读生产者写进数据目录的
+#     同一份表（`<DataDir>/sector_map.json`），查不到才退回直连（零回归）。
+CNT234=$((CNT234 + 1))
+SMG234=$(cat internal/data/sector_map.go || true)
+ENG234=$(cat internal/engine/engine.go || true)
+REG234=$(cat internal/engine/registry.go || true)
+grep_q 'type SectorMapCache struct {' SMG234 F || fail234 "缺云端连接键缓存（SectorMapCache）"
+grep_q 'func (c *SectorMapCache) Lookup(code, today string) (string, bool) {' SMG234 F || fail234 "缺 Lookup（连接键的唯一查询口）"
+# 跨日整表弃权：板块成分每天变，错配的 delta 会贴到错的票上。
+grep_q 'if strings.TrimSpace(doc.Day) != today {' SMG234 F || fail234 "连接键没有跨日闸（昨日成分表会留宿）"
+grep_q 'func (e *Engine) SetSectorMap(c *data.SectorMapCache) {' ENG234 F || fail234 "引擎没有连接键装配缝"
+grep_q 'sectorMap *data.SectorMapCache' ENG234 F || fail234 "引擎没有 sectorMap 字段"
+grep_q 'if n, ok := sm.Lookup(code, cntime.DayCompactOf(now)); ok {' ENG234 F || fail234 "sectorDeltaFor 没有先查连接键（这条腿仍是死的）"
+grep_q 'e.SetSectorMap(data.NewSectorMapCache(filepath.Join(opts.DataDir, "sector_map.json")))' REG234 F || fail234 "注册表没有装配连接键（生产恒 nil ⇒ 恒弃权）"
+grep_q 'ENGINE_OUT = os.path.join(DATA_DIR, "sector_map.json")' PSM234 F || fail234 "生产者没写云端那份（引擎读不到）"
+grep_q 'os.replace(etmp, ENGINE_OUT)' PSM234 F || fail234 "生产者没有原子落盘云端那份"
+# 负锁：云端连接键不许拿 industry_map 顶班（证监会门类 vs 东财板块名，交集为空）。
+if grep_q 'PARAMS.get("industry_map")' ENG234; then fail234 "云端板块腿回潮用 industry_map"; fi
+# 负锁：跨日闸不许退化成"永真"（`!= ""` 这种写法等于放行昨天的表）。
+if grep_q 'doc.Day != ""' SMG234; then fail234 "跨日闸被改成永真（昨日表会冒充今天）"; fi
+
 # ④ 行为腿：判退出码，不判输出文本。
 CNT234=$((CNT234 + 1))
 if command -v go >/dev/null 2>&1; then
 	FIX234_RC=0
-	go test ./internal/config ./internal/engine ./internal/paper -count=1 \
-		-run 'TestTurnoverTier|TestTLiquidityTurnoverTier' >/dev/null 2>&1 || FIX234_RC=$?
+	go test ./internal/config ./internal/engine ./internal/paper ./internal/data -count=1 \
+		-run 'TestTurnoverTier|TestTLiquidityTurnoverTier|TestSectorMap|TestSectorDelta' >/dev/null 2>&1 || FIX234_RC=$?
 	[ "$FIX234_RC" = "0" ] || fail234 "Go 分档用例未过（退出码 ${FIX234_RC}）"
 else
 	echo "INFO - §234 无 go，Go 分档行为腿未跑（这份绿不含 Go 判定）"

@@ -82,6 +82,11 @@ type Engine struct {
 	// English: test seam for industry lookup used by the v3 dynamic budget; production leaves it nil
 	// and falls back to marketAPI.GetStockIndustry.
 	industryFn func(code string) string
+	// sectorMap §FLOW-SECTOR-JOIN 逐票板块连接键（code → 东财板块名，日级）。
+	// 与 industryFn 刻意分家：后者是证监会门类（集中度桶），与 sector_delta 的键交集为空。
+	// nil＝未装配 ⇒ sectorDeltaFor 退回 industryFn（今天的行为），绝不因此改判。
+	// English: per-stock sector join key (EastMoney board name); nil falls back to industryFn.
+	sectorMap *data.SectorMapCache
 	// clusterCache §T-COST B3 日收益序列的日级缓存（见 cluster_gate.go）。
 	// 独立锁：这里要发 SQL，不能把引擎主锁按在磁盘 IO 上。
 	// English: §T-COST B3 per-trading-day cache of daily returns; own lock because it does SQL.
@@ -584,6 +589,18 @@ func (e *Engine) SetSectorConstituentTopN(n int) {
 	if n > 0 {
 		e.sectorConstTopN = n
 	}
+	e.mu.Unlock()
+}
+
+// SetSectorMap 装配 §FLOW-SECTOR-JOIN 的逐票板块连接键（生产恒非 nil，单测可留空）。
+//
+// 为什么它是一个独立缝而不是复用 industryFn：industryFn 的口径是**证监会门类**
+// （供集中度桶），与 sector_delta 的键（东财板块名）交集为空 —— 拿它当连接键会得到
+// "看起来接上了、命中率恒 0"。连接键只认生产者产出的 sector_map。
+// English: installs the per-stock sector join key (code -> EastMoney board name); nil = abstain.
+func (e *Engine) SetSectorMap(c *data.SectorMapCache) {
+	e.mu.Lock()
+	e.sectorMap = c
 	e.mu.Unlock()
 }
 
@@ -7444,25 +7461,42 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 }
 
 // sectorDeltaFor 逐票板块 delta 解析（注入 Controller.sectorDeltaFn）：
-// 个股 → 行业名（GetStockIndustry，自带当日缓存）→ 当日板块 delta（内存 map，跨日作废）。
+//  1. **连接键优先取 `sector_map`**（生产者经盒子中继取的东财板块名，与 secMap 的键同源）；
+//  2. 表里没有这只票（或当日表缺失）才退回 `industryFn`（东财直连 `f127`，广州对它被 RST，
+//     所以生产环境这条兜底几乎总是空——保留它是为了"有直连的部署"零回归）。
+//
+// 为什么第一条必须存在：只用 industryFn 时，广州侧恒取不到名字 ⇒ 这条腿恒弃权，
+// 而读数上没有任何报错（blend 静默 renormalize 到两项）。11-20 现场即是此形态。
 // 任何一环缺失 → (0,false) 弃权（blend 缺项 renormalize，绝不猜 0）。
 func (e *Engine) sectorDeltaFor(code string) (float64, bool) {
 	if code == "" {
 		return 0, false
 	}
-	// 行业名解析复用 §DYN-SIZE-v3 的既有 industryFn 缝（非空优先，nil→marketAPI.GetStockIndustry）。
-	industryFn := e.industryFn
-	if industryFn == nil && e.marketAPI != nil {
-		industryFn = e.marketAPI.GetStockIndustry
+	now := time.Now()
+	// 1) 连接键：今日 sector_map 优先（同一份表载体也在用，避免两条腿各算一版）。
+	e.mu.RLock()
+	sm := e.sectorMap
+	e.mu.RUnlock()
+	name := ""
+	if sm != nil {
+		if n, ok := sm.Lookup(code, cntime.DayCompactOf(now)); ok {
+			name = n
+		}
 	}
-	if industryFn == nil {
-		return 0, false
+	// 2) 兜底：东财直连的 f127（非空优先；未装配时 nil→marketAPI.GetStockIndustry）。
+	if name == "" {
+		industryFn := e.industryFn
+		if industryFn == nil && e.marketAPI != nil {
+			industryFn = e.marketAPI.GetStockIndustry
+		}
+		if industryFn != nil {
+			name = industryFn(code)
+		}
 	}
-	name := industryFn(code)
 	if name == "" {
 		return 0, false
 	}
-	today := cntime.DayOf(time.Now())
+	today := cntime.DayOf(now)
 	e.flowMoneyMu.RLock()
 	day, m := e.sectorDeltaDay, e.sectorDeltaMap
 	e.flowMoneyMu.RUnlock()

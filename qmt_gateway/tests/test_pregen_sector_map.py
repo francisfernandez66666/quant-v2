@@ -162,12 +162,18 @@ class CoverageGateTest(unittest.TestCase):
         self.out = os.path.join(self.dir, "local_executor_sector_map.json")
         with open(self.out, "w", encoding="ascii") as fh:
             json.dump({"day": "20261119", "sector_map": {"600519": "旧表"}}, fh)
-        self.saved = (psm.OUT_PATH, psm.MIN_BOARD_OK_PCT, psm.MIN_STOCKS, psm.SLEEP_MS)
+        # ENGINE_OUT 也必须指到临时目录：它是云端引擎那份（<DataDir>/sector_map.json），
+        # 用例如果打真实路径就会往机器上写一份假表（本机是权限失败，容器里可能真写进 /var/lib）。
+        self.engine_out = os.path.join(self.dir, "data", "sector_map.json")
+        self.saved = (psm.OUT_PATH, psm.ENGINE_OUT, psm.MIN_BOARD_OK_PCT,
+                      psm.MIN_STOCKS, psm.SLEEP_MS)
         psm.OUT_PATH = self.out
+        psm.ENGINE_OUT = self.engine_out
         psm.SLEEP_MS = 0
 
     def tearDown(self):
-        psm.OUT_PATH, psm.MIN_BOARD_OK_PCT, psm.MIN_STOCKS, psm.SLEEP_MS = self.saved
+        (psm.OUT_PATH, psm.ENGINE_OUT, psm.MIN_BOARD_OK_PCT,
+         psm.MIN_STOCKS, psm.SLEEP_MS) = self.saved
 
     def test_low_coverage_aborts_and_leaves_the_old_file_untouched(self):
         before = open(self.out, "rb").read()
@@ -196,6 +202,10 @@ class CoverageGateTest(unittest.TestCase):
         self.assertEqual(len(doc["day"]), 8)          # YYYYMMDD，与 precalc 同一日期口径
         self.assertEqual(doc["sector_map"], mapping)
         self.assertEqual(doc["count"], 2)
+        # §FLOW-SECTOR-JOIN 云端侧：同一份表必须同时落到 <DataDir>/sector_map.json，
+        # 否则云端引擎那条腿仍读不到（载体接上、云端没接＝半条腿）。
+        self.assertTrue(os.path.exists(self.engine_out))
+        self.assertEqual(json.load(open(self.engine_out, encoding="ascii"))["sector_map"], mapping)
 
     def test_empty_board_list_aborts(self):
         with mock.patch.object(psm, "load_endpoint", return_value=("http://x", "t")), \
