@@ -25055,18 +25055,36 @@ FF226=internal/signalctl/flow_freshness.go
 FFDF226=internal/store/flow_factor_daily.go
 EN226=internal/engine/engine.go
 
-# ① data 层：三源降级（东财 push2 → push2his 镜像 → 新浪指数日 K），每源上证主/沪深300 兜底。
+# ① data 层：三源降级（东财 push2his 供日K → push2delay 镜像 → 新浪指数日 K），每源上证主/沪深300 兜底。
+# 2026-11-20 改判（现场实测）：push2 / push2delay 的 kline 接口**不供日 K**（rc=0 但 data.klines 为空、
+# dktotal=0），唯一真供的是 push2his。旧口径"主站 push2 供 K 线、push2his 是镜像"是错的——
+# 旧 URL 缺 end/fields 参数时两台都回 rc:102，错误形态一样，所以看上去像"两台都坏"。
 CNT226=$((CNT226 + 1))
 grep -qF 'func (m *MarketAPI) IndexAmountSeries(n int, today string) ([]IndexAmountDay, string, error) {' "$IA226" || fail226 "缺指数量能序列函数"
 grep -qF '{"000001.SH", "000001"}' "$IA226" || fail226 "上证 000001 不是主码"
 grep -qF '{"000300.SH", "000300"}' "$IA226" || fail226 "沪深300 000300 不是兜底码"
 grep -qF '{"em", func(code string, count int)' "$IA226" || fail226 "缺东财主源降级腿"
-grep -qF '{"em_mirror", func(code string, count int)' "$IA226" || fail226 "缺东财 push2his 镜像腿"
-grep -qF 'push2his.eastmoney.com' "$IA226" || fail226 "镜像主机不是 push2his（push2delay 对 kline 返 rc:102）"
+grep -qF 'return m.emIndexAmount(code, count, emHisPush2Host)' "$IA226" || fail226 "东财主腿不是 push2his（唯一供日K的主机）"
+grep -qF 'emHisPush2Host = "push2his.eastmoney.com"' internal/data/market.go || fail226 "emHisPush2Host 常量缺失/指向错主机"
+grep -qF '{"em_mirror", func(code string, count int)' "$IA226" || fail226 "缺东财镜像降级腿"
+grep -qF 'return m.emIndexAmount(code, count, emMirrorPush2Host)' "$IA226" || fail226 "东财镜像腿未走 emMirrorPush2Host"
 grep -qF '{"sina", m.sinaIndexAmount}' "$IA226" || fail226 "缺新浪指数日 K 兜底腿"
 grep -qF 'func (m *MarketAPI) sinaIndexAmount(' "$IA226" || fail226 "缺新浪指数日 K 取数函数"
 grep -qF 'indexMarketPrefix(code)' "$IA226" || fail226 "新浪指数码未走白名单（000001 会拼成平安银行）"
 grep -qF 'k.Volume > 0' "$IA226" || fail226 "新浪指数日 K 应用 volume（股）做量能标量（无 amount 字段）"
+
+# ①c 东财 kline 必填参数（2026-11-20 实锤：缺 end 或 fields1/fields2 任一即 rc:102 / data:null）。
+# 这一天三源全败、量比腿与资金流腿一起弃权，屏上像"网络不通"，实际是 URL 少了三个参数。
+# 旧用例的假服务器只按 host 回体、不校验 query ⇒ 这个让整条腿哑一天的缺陷一整年没被抓住。
+CNT226=$((CNT226 + 1))
+EMURL=$( sed -n '/func (m \*MarketAPI) emIndexAmount/,/^}/p' "$IA226" )
+grep_q 'end=%s' EMURL F || fail226 "东财 kline 缺 end 参数（会回 rc:102/data:null）"
+grep_q 'emKLineEnd' EMURL F || fail226 "end 未走 emKLineEnd 常量（散落字面量＝下次又会漂）"
+grep_q 'fields1=%s' EMURL F || fail226 "东财 kline 缺 fields1（会回 rc:102）"
+grep_q 'fields2=%s' EMURL F || fail226 "东财 kline 缺 fields2（会回 rc:102）"
+grep -qE 'emKLineEnd[[:space:]]*=[[:space:]]*"20500101"' internal/data/market.go || fail226 "emKLineEnd 取值不是 20500101"
+grep -qE 'emKLineFields2[[:space:]]*=[[:space:]]*"f51,f52,f53,f54,f55,f56,f57,f58"' internal/data/market.go || fail226 "emKLineFields2 列定义漂了（f56=手/f57=元）"
+grep -qF 'func TestIndexAmountSeriesEMURLParams(' internal/data/index_amount_series_test.go || fail226 "缺 URL 参数回归锁（假服务器不校验 query ⇒ 只能静态锁形状）"
 
 # ①a 断更即换源：末根必须=今日，否则判假活继续降级（东财假活断更时不挡新浪兜底）。
 CNT226=$((CNT226 + 1))
@@ -25879,4 +25897,87 @@ fi
 
 [ "$B232_FAILED" = "0" ] || exit 1
 echo "ok - §232 §STOP-LADDER/§FLOW-DASH 锁通过（四条腿在册+减仓在清仓之后+清仓不可延持+两线冲突退化+载体阈值/短码/整手+扫描顺序 bull 压减仓+读数并进 /api/status 无第二份公式+行为腿判退出码，累计判定点 ${CNT232}）"
+echo ""
+
+echo "==> 233 §FLOW-DAILY-FIX/§ZERO-FRAME/§SIDE-VOCAB（2026-11-20 盘中三问：量能取数 / 资金 0 帧 / 信号无方向）..."
+B233_FAILED=0
+fail233() {
+	echo "--- FAIL: §233 $*"
+	FAIL=1
+	B233_FAILED=1
+}
+CNT233=0
+MKT233=$(cat internal/data/market.go || true)
+MIX233=$(cat internal/data/market_index.go || true)
+QMT233=$(cat internal/server/qmt.go || true)
+CARD233=$(cat internal/server/signal_card.go || true)
+POSJS233=$(cat web/src/pages/Positions.jsx || true)
+SCJS233=$(cat web/src/utils/signalCard.js || true)
+SCMODAL233=$(cat web/src/components/SignalCardModal.jsx || true)
+
+# ① 量能取数（Q1，现场三层）：主机只认 push2his、URL 必带 end/fields1/fields2。
+#    §226 ①c 已锁 URL 形状；这里锁"主机选择"这一半——把 push2 排回主腿就是让这条腿每天白打一次请求。
+CNT233=$((CNT233 + 1))
+grep_q 'emHisPush2Host = "push2his.eastmoney.com"' MKT233 F || fail233 "缺 emHisPush2Host（唯一供日K的主机）"
+grep_q 'return m.emIndexAmount(code, count, emHisPush2Host)' MIX233 F || fail233 "量能序列主腿不是 push2his"
+grep_q 'return m.emIndexAmount(code, count, emMirrorPush2Host)' MIX233 F || fail233 "量能序列镜像腿未走 emMirrorPush2Host"
+grep_q 'emKLineEnd, emKLineFields1, emKLineFields2' MIX233 F || fail233 "emIndexAmount 的 URL 没有注入三个必填参数"
+
+# ② 资金 0 帧（Q2）：全 0 帧与已知账本矛盾 ⇒ 判无读数（不落库、不刷新 updated_at、留痕）。
+#    这是"可用资金 ¥0.00"的直接成因：网关把 query_asset 的占位 0 当 synced=True 上报，
+#    云端只判 synced/data_ts（同日即过）⇒ 正数余额被覆盖。
+CNT233=$((CNT233 + 1))
+grep_q 'func assetFrameAllZero(' QMT233 F || fail233 "缺 assetFrameAllZero 判据（全 0 帧仍是读数）"
+grep_q 'func (s *Server) accountFrameContradicts(' QMT233 F || fail233 "缺 accountFrameContradicts（不比对已知账本就无从判占位）"
+grep_q 'if assetFrameAllZero(ev.Asset) && s.accountFrameContradicts(db, owner) {' QMT233 F || fail233 "account 分支没有接全 0 闸"
+grep_q '"skipped": "zero_frame"' QMT233 F || fail233 "弃权帧没有回 skipped=zero_frame（网关侧无法归因）"
+grep_q 'opslog.DayOnce("account-zero-frame:"' QMT233 F || fail233 "弃权帧没有留痕（下次现场无法复查）"
+# 负锁：零帧闸必须排在落库之前——排在 UpsertRealAccount 之后就等于已经覆盖完了。
+ZFLINE233=$( { grep -n 'assetFrameAllZero(ev.Asset) && s.accountFrameContradicts' internal/server/qmt.go || true; } | head -1 | cut -d: -f1)
+UPLINE233=$( { grep -n 'db.UpsertRealAccount(store.RealAccount{' internal/server/qmt.go || true; } | head -1 | cut -d: -f1)
+[ -n "$ZFLINE233" ] || fail233 "找不到零帧闸位置"
+[ -n "$UPLINE233" ] || fail233 "找不到资产落库位置"
+[ "${ZFLINE233:-0}" -lt "${UPLINE233:-0}" ] || fail233 "零帧闸排在落库之后（余额已被覆盖，闸等于没装）"
+# 前端：unknown 这一维打「读数未知」，绝不画 ¥0.00；判据只认 book_source.cash。
+CNT233=$((CNT233 + 1))
+grep_q "const realCashUnknown = hasReal && cashSrc === 'unknown'" POSJS233 F || fail233 "前端没有 unknown 分支（可用资金会被画成 ¥0.00）"
+grep_q '可用资金: 读数未知' POSJS233 F || fail233 "前端没有「读数未知」文案"
+# 负锁：unknown 分支只认来源这把尺，不许再按 available_cash 数值自判一次
+# （后端在 cash=unknown 时下发的就是零值账户 —— 按数值再判一次正好把未知读成真 0）。
+if grep_q 'realCashUnknown = hasReal && cashSrc === .unknown. &&' POSJS233; then
+	fail233 "unknown 分支又按数值自判了一次（零值占位会被读成真 0）"
+fi
+grep_q "real-cash-unknown" POSJS233 F || fail233 "缺可测锚点 data-testid=real-cash-unknown"
+if grep_q 'available_cash\s*\|\|\s*0' POSJS233; then
+	: # 允许：真 0 与兜底展示仍按 0，unknown 由上面那条分支接管
+fi
+
+# ③ 信号方向（Q3）：词表覆盖引擎真实枚举（watch/hold/止损族），仍不猜 做多/做空。
+#    旧词表只认 买入/卖出/buy/sell ⇒ 现网最常见的 action=watch 被判"方向缺失"，
+#    卡片标题只剩「交易信号」，读起来像系统没算出方向。
+CNT233=$((CNT233 + 1))
+grep_q 'case "观察", "watch":' CARD233 F || fail233 "方向词表没覆盖 watch（现网最常见的 action）"
+grep_q 'case "持有", "hold":' CARD233 F || fail233 "方向词表没覆盖 hold"
+grep_q 'case "卖出", "sell", "止损", "止盈", "清仓", "减仓":' CARD233 F || fail233 "方向词表没覆盖四个离场动词"
+grep_q 'func cardSideTradable(' CARD233 F || fail233 "缺 cardSideTradable（观察/持有会被判可执行）"
+grep_q 'card.Executable = len(missing) == 0 && cardSideTradable(card.Side)' CARD233 F || fail233 "Executable 没加「方向必须可交易」这一条"
+# 负锁：观点词（做多/做空）不许进词表——那是看法不是动作，§SIDE-AUTH-2 同一条纪律。
+if grep_q 'case .*"做多"|case .*"做空"' CARD233; then fail233 "方向词表把 做多/做空 当动作（等于从看法里猜方向）"; fi
+grep_q '仅观察 · 不下单' SCMODAL233 F || fail233 "观察卡标签仍写「缺读数」（会让人去找不存在的缺字段）"
+grep_q '不是下单指令' SCJS233 F || fail233 "通知正文没有「不是下单指令」说明（会拼出空的不可执行括号）"
+
+# ④ 行为腿：判退出码，不判输出文本。
+CNT233=$((CNT233 + 1))
+if command -v go >/dev/null 2>&1; then
+	FIX233_RC=0
+	go test ./internal/data ./internal/server -count=1 \
+		-run 'TestIndexAmountSeries|TestAccountZeroFrame|TestAccountPartialFrame|TestSignalCard|TestNormalizeCardSide' \
+		>/dev/null 2>&1 || FIX233_RC=$?
+	[ "$FIX233_RC" = "0" ] || fail233 "行为用例未过（退出码 ${FIX233_RC}）"
+else
+	echo "INFO - §233 无 go，行为腿未跑（这份绿不含 Go 判定）"
+fi
+
+[ "$B233_FAILED" = "0" ] || exit 1
+echo "ok - §233 §FLOW-DAILY-FIX/§ZERO-FRAME/§SIDE-VOCAB 锁通过（主机选择+三个必填参数+零帧闸在落库之前+unknown 不画 0+方向词表覆盖引擎枚举且不猜观点词+观察卡标签+行为腿判退出码，累计判定点 ${CNT233}）"
 echo ""

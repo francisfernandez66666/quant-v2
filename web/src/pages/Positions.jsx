@@ -442,6 +442,18 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
   const displayAvailable = hasReal
     ? (realAccount && realAccount.available_cash != null ? realAccount.available_cash : 0)
     : availableBalance
+  // §ZERO-FRAME（2026-11-20 现网实录）：「可用资金 0」有两种完全不同的意思，屏上必须分开：
+  //   · 账上真的没钱（柜台报了 0）     ⇒ 打 ¥0.00；
+  //   · 这一维根本没有可用读数（unknown）⇒ 打「读数未知」，**不许画 0**。
+  // 现场症状：载体每隔约 30 分钟把一次 query_asset 全 0 的占位帧当成 synced=True 上报，
+  // 云端把它当新鲜真值覆盖余额，于是页面反复跳成 ¥0.00，几分钟后又恢复。
+  // 后端已加"全 0 帧＝无读数"闸；这里补第二半：过期的旧账在 30 分钟窗之后自然落 unknown，
+  // 前端必须如实说"不知道"，而不是把旧余额或 0 冒充成今天的可用资金。
+  // 判据只认后端单点装配的 book_source.cash（前端不自己再判一次新鲜度）。
+  // 后端在 cash=unknown 时下发的是零值账户 + 空 updated_at（见 handleRealPositions），
+  // 若这里再按 `available_cash > 0` 判一次，就会把"零值占位"读成"真 0"并把未知涂掉——
+  // 那正是本缺陷的形状，所以这里只认来源这一把尺。
+  const realCashUnknown = hasReal && cashSrc === 'unknown'
   // 实盘总盈亏：优先用 /api/qmt/trades 的 total_pnl（已实现+浮动）；未取到时按实盘持仓现价-成本×数量兜底
   //
   // §W7-G（2026-10-06 修复批 波 7，owner 裁决「不删兜底，只把口径说清 + 让兜底可见」）：
@@ -1465,7 +1477,11 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
                     </Tag>
                   )}
                 </div>
-                <div style={{ fontWeight: 600 }}>可用资金: ¥{displayAvailable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                <div style={{ fontWeight: 600 }}>
+                  {realCashUnknown
+                    ? <span data-testid="real-cash-unknown" title="资金维度当前没有可用读数（柜台帧过期或本账号没有柜台上报）。这里刻意不显示 ¥0.00——'不知道'与'没钱'是两件事，也绝不用上一次的余额冒充今天的可用资金。">可用资金: 读数未知</span>
+                    : <>可用资金: ¥{displayAvailable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</>}
+                </div>
               </>
             ) : (
               <>
@@ -1619,9 +1635,11 @@ export default function Positions({ showPaperTab = SHOW_PAPER_TAB }) {
             {qmtState.gateway_url && <span className="muted">网关 {qmtState.gateway_url}</span>}
             {realAccount && (
               <span style={{ color: 'var(--app-accent)', fontWeight: 600 }}>
-                可用资金 {realAccount.updated_at
-                  ? '¥' + (realAccount.available_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-                  : '—（网关未上报）'}
+                可用资金 {realCashUnknown
+                  ? '—（读数未知）'
+                  : realAccount.updated_at
+                    ? '¥' + (realAccount.available_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+                    : '—（网关未上报）'}
               </span>
             )}
             {/* 实盘资产总值（网关上报时显示） */}

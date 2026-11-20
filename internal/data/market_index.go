@@ -476,10 +476,15 @@ type IndexAmountDay struct {
 // IndexAmountSeries 取大盘指数量能序列（最近 n 根日 K），三源降级 + 每源上证主/沪深300 兜底。
 //
 // 降级顺序（改动前必读）：
-//  1. 东财 push2 主站（klineBySecID，amount 元）——已内建 push2delay 主机降级但 kline 路径被
-//     emFailoverPaths 显式排除（镜像对 kline 返 rc:102），故此处单独加 push2his 做"东财镜像"腿；
-//  2. 东财 push2his 镜像（同 secid / amount 元），取数格式与主站完全一致；
+//  1. 东财 push2his（**唯一供日 K 的主机**，amount 元）；2026-11-20 实测 push2/push2delay 的
+//     kline 接口只回 `data.klines: []`，把主站排在前面等于每轮白打一次请求；
+//  2. 东财 push2delay（同 secid / amount 元；今日虽空，留着作为 push2his 不可达时的机会腿）；
 //  3. 新浪指数日 K（indexMarketPrefix 白名单拼 sh000001/sh000300，用 volume 股）。
+//
+// 东财 kline 的**必填参数**（2026-11-20 实锤，缺一即 `rc:102 / data:null`）：
+// `end` + `fields1` + `fields2`。旧 URL 只带 secid/klt/lmt/fqt，三源里两条东财腿因此
+// 全部解析为空 → 量比腿整日弃权 → 资金流腿也拿不到当日成交额（同一条取数腿）。
+// 回归锁在 index_amount_series_test.go 的 TestIndexAmountSeriesEMURLParams。
 //
 // 每个源内部：上证为主、取数失败或有效日不足 n 根则退沪深300；一个源两指数都不成就换下一个源。
 // **断更即换源**：today（北京今日 YYYY-MM-DD）非空时，末根日期必须等于 today 才算该源成功；
@@ -509,10 +514,10 @@ func (m *MarketAPI) IndexAmountSeries(n int, today string) ([]IndexAmountDay, st
 		fetch func(code string, count int) ([]IndexAmountDay, error)
 	}{
 		{"em", func(code string, count int) ([]IndexAmountDay, error) {
-			return m.emIndexAmount(code, count, emPrimaryPush2Host)
+			return m.emIndexAmount(code, count, emHisPush2Host)
 		}},
 		{"em_mirror", func(code string, count int) ([]IndexAmountDay, error) {
-			return m.emIndexAmount(code, count, "push2his.eastmoney.com")
+			return m.emIndexAmount(code, count, emMirrorPush2Host)
 		}},
 		{"sina", m.sinaIndexAmount},
 	}
@@ -541,11 +546,17 @@ func (m *MarketAPI) IndexAmountSeries(n int, today string) ([]IndexAmountDay, st
 	return nil, "", lastErr
 }
 
-// emIndexAmount 从东财 kline 取指数日 K 的 amount（元）。host 可为 push2 主站或 push2his 镜像。
+// emIndexAmount 从东财 kline 取指数日 K 的 amount（元）。host 必须是**供日 K 的主机**（见
+// emHisPush2Host 的注释：只有 push2his 真给 klines）。
 // secid 用 indexSecID（上证→1.000001、沪深300→1.000300），绝不裸用 000001（那是平安银行）。
+//
+// URL 参数是**实测契约**，不是装饰：缺 `end` 或 `fields1/fields2` 任一，东财回
+// `{"rc":102,...,"data":null}`（2026-11-20 现场，主站与 push2his 同形）。这一天三源全败、
+// 量比腿与资金流腿一起弃权——表面像"网络不通"，实际是这一行少了三个参数。
 func (m *MarketAPI) emIndexAmount(code string, count int, host string) ([]IndexAmountDay, error) {
 	sid := indexSecID(code)
-	url := fmt.Sprintf("https://%s/api/qt/stock/kline/get?secid=%s&klt=101&lmt=%d&fqt=%s", host, sid, count, klineFQT)
+	url := fmt.Sprintf("https://%s/api/qt/stock/kline/get?secid=%s&klt=101&lmt=%d&fqt=%s&end=%s&fields1=%s&fields2=%s",
+		host, sid, count, klineFQT, emKLineEnd, emKLineFields1, emKLineFields2)
 	EastMoneyLimiter.Wait()
 	var resp *http.Response
 	var err error

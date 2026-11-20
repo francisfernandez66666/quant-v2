@@ -93,7 +93,7 @@ func TestSignalCardEachMissingFieldIsNamed(t *testing.T) {
 	}{
 		{"股票名", func(a *cardArgs) { a.name = "" }, CardFieldStockName},
 		{"代码", func(a *cardArgs) { a.code = "" }, CardFieldCode},
-		{"方向", func(a *cardArgs) { a.side = "watch" }, CardFieldSide},
+		{"方向", func(a *cardArgs) { a.side = "做多" }, CardFieldSide},
 		{"股数", func(a *cardArgs) { a.qtyKnown = false }, CardFieldQty},
 		{"参考价", func(a *cardArgs) { a.price = 0 }, CardFieldPrice},
 		{"策略/理由", func(a *cardArgs) { a.reason = "" }, CardFieldReason},
@@ -113,22 +113,46 @@ func TestSignalCardEachMissingFieldIsNamed(t *testing.T) {
 	}
 }
 
-// TestNormalizeCardSide ③：方向词表只认两组已知枚举，其它一律判缺（不猜多空）。
+// TestNormalizeCardSide ③：方向词表只认已知动作枚举，观点词/空串一律判缺（不猜多空）。
+// 2026-11-20：词表补齐引擎真实在发的 watch/hold 与四个离场动词——旧词表把最常见的
+// watch 判成"方向缺失"，卡片标题因此只剩「交易信号」。
 func TestNormalizeCardSide(t *testing.T) {
 	for in, want := range map[string]string{
 		"买入":    "买入",
 		"卖出":    "卖出",
 		" buy":  "买入",
 		"sell":  "卖出",
+		"watch": "观察",
+		"观察":    "观察",
+		"hold":  "持有",
+		"持有":    "持有",
+		"止损":    "卖出",
+		"止盈":    "卖出",
+		"清仓":    "卖出",
+		"减仓":    "卖出",
 		"做多":    "",
 		"做空":    "",
-		"清仓":    "",
-		"减仓":    "",
-		"watch": "",
 		"":      "",
 	} {
 		if got := normalizeCardSide(in); got != want {
 			t.Fatalf("normalizeCardSide(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+// TestSignalCardWatchIsNotExecutable ③b：观察/持有卡字段再齐也不可执行。
+// 方向从"缺失"变成"观察"之后，若只判 missing==0，一张观察卡会被标成可执行——
+// 那等于让人照着"观察"去下单。
+func TestSignalCardWatchIsNotExecutable(t *testing.T) {
+	for _, side := range []string{"watch", "hold"} {
+		a := defaultCardArgs()
+		a.side = side
+		c := a.build()
+		if len(c.Missing) != 0 {
+			t.Fatalf("side=%q 不该进缺失清单（词表已覆盖）: %v", side, c.Missing)
+		}
+		if c.Executable {
+			t.Fatalf("side=%q 的卡被误判为可执行：%+v", side, c)
 		}
 	}
 }

@@ -932,6 +932,41 @@ type qmtReportEvent struct {
 // English: retired fixed age window; freshness is now decided by Beijing calendar day.
 const qmtSnapshotMaxAge = 10 * time.Minute
 
+// assetFrameAllZero 判断一帧账户资产读数是否**全 0**（四个字段都没有非 0 值）。
+// 缺失的键按 0 处理：载体只发四个键，缺键不等于"有读数"。
+// English: true when every asset field is zero/absent (i.e. the frame carries no reading).
+func assetFrameAllZero(a map[string]float64) bool {
+	for _, k := range [...]string{"cash", "frozen_cash", "total_asset", "market_value"} {
+		if v, ok := a[k]; ok && v != 0 {
+			return false // 任何一项非 0（含负值＝透支/欠款）都是真读数
+		}
+	}
+	return true
+}
+
+// accountFrameContradicts 判断一帧全 0 的资产读数是否与我方**已知事实**冲突。
+//
+// 冲突＝本账号已有一笔正数资金读数，或账上还有 qty>0 的持仓。两种情形下"可用 0 + 总资产 0
+// + 市值 0"在数学上不可能同时成立，所以这帧只能是查询未同步时的占位值。
+// English: an all-zero asset frame contradicts a known positive balance or any held position.
+func (s *Server) accountFrameContradicts(db *store.DB, uid string) bool {
+	if db == nil {
+		return false
+	}
+	if prev, err := db.GetRealAccountOwn(uid); err == nil &&
+		(prev.AvailableCash > 0 || prev.TotalAsset > 0 || prev.MarketValue > 0) {
+		return true
+	}
+	if pos, err := db.RealPositionsForUser(uid); err == nil {
+		for i := range pos {
+			if pos[i].Qty > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // qmtReportFreshness 判定快照是否可信：显式 synced=false → 不可信；data_ts 可解析且过旧 → 不可信。
 // data_ts 缺失/不可解析按旧桥口径放行（向后兼容），由调用方的其余守卫兜底。
 // English: snapshot trust check — explicit synced=false or a parseable-but-stale data_ts is
@@ -1295,6 +1330,27 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		owner := uid
 		if len(ev.Asset) == 0 {
 			writeError(w, 400, "empty account asset")
+			return
+		}
+		// §ZERO-FRAME（2026-11-20 现网实录）：全 0 的资产帧不是读数。
+		//
+		// 现场：`账户资产上报 … 可用=0.00 冻结=0.00 总值=0.00 市值=0.00` 每 ~30 分钟出现一次，
+		// 每次都通过 qmtReportFreshness（synced=true、data_ts=当日），于是把 48,565.54 的可用资金
+		// 覆盖成 0；前端 10s 轮询必然撞上 ⇒ 页面上就是「可用资金 ¥0.00」。
+		// 成因在载体侧：`periodic_reconcile` 每 60s 把 `broker.query_asset()` 原样上报并把 synced
+		// 写死 True，而 QMT 会话重载/未同步时 query_stock_asset 返回全 0 的 XtAsset。
+		//
+		// 判据只问一件事：「这帧能不能当读数」。与已知账本矛盾（已有正数资金或仍有持仓）⇒ 弃权，
+		// 不落库、不刷新 updated_at，保留上一帧直到 30 分钟窗自然过期（过期后如实报「读数未知」，
+		// 绝不用旧余额冒充今天的可用资金）。本来就是空账 ⇒ 接受，那是真 0。
+		// English: an all-zero asset frame that contradicts the known book is treated as "no reading"
+		// (skipped, updated_at untouched) instead of overwriting a good balance with 0.
+		if assetFrameAllZero(ev.Asset) && s.accountFrameContradicts(db, owner) {
+			log.Printf("[trading] ⚠ account 全 0 帧与已知账本矛盾(用户=%s)，判弃权不落库（载体查询未同步的占位读数）", owner)
+			opslog.DayOnce("account-zero-frame:"+owner, func() {
+				opslog.Logf("quant", "账户资产全 0 帧（查询未同步的占位读数）用户=%s，本次不落库；保留上一帧直至 30 分钟窗过期", owner)
+			})
+			writeJSON(w, 200, map[string]interface{}{"ok": true, "skipped": "zero_frame"})
 			return
 		}
 		// §DYN-SIZE-v3 §8.7：未同步/停滞的资产快照不得刷新 updated_at——否则资金口径会被

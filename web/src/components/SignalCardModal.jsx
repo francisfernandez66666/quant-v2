@@ -136,7 +136,11 @@ export function SignalCard({ card, onDone }) {
         <strong>{c.side === MISSING_LABEL ? '交易信号' : '交易信号 · ' + c.side}</strong>
         {c.executable
           ? <Tag theme="success" variant="light-outline">可执行</Tag>
-          : <Tag theme="warning" variant="light-outline">弱提醒 · 缺读数</Tag>}
+          : (c.missing && c.missing.length > 0)
+            ? <Tag theme="warning" variant="light-outline">弱提醒 · 缺读数</Tag>
+            // 字段齐全但方向是观察/持有：没有"缺"可列，只是这张卡本来就不下单。
+            // 显示成"缺读数"会让人去找一个根本不存在的缺字段（2026-11-20）。
+            : <Tag theme="default" variant="light-outline">仅观察 · 不下单</Tag>}
       </div>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
         <tbody>

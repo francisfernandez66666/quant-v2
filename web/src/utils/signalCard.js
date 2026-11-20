@@ -161,8 +161,16 @@ export function cardTitle(c) {
 export function cardBody(c) {
   const qty = c.qty === MISSING_LABEL ? MISSING_LABEL : c.qty + ' 股'
   const price = c.price === MISSING_LABEL ? MISSING_LABEL : '¥' + c.price
-  return [c.code, c.stockName, qty, price, c.reason].join(' · ') +
-    (c.executable ? '' : ' ｜不可执行（' + c.missing.join('、') + '）')
+  // §SIDE-VOCAB（2026-11-20）：不可执行的原因可能**不是缺字段**——观察/持有卡八字段齐全，
+  // 但它本来就不是下单指令（后端 Executable 另要求方向是买入/卖出）。那种卡没有"缺什么"
+  // 可列，拼出「不可执行（）」会让人以为打印出错；这里只用动作本身说明它不可执行。
+  const missing = Array.isArray(c.missing) ? c.missing : []
+  let note = ''
+  if (!c.executable) {
+    note = missing.length > 0 ? ' ｜不可执行（' + missing.join('、') + '）'
+      : ' ｜不可执行（' + c.side + '，不是下单指令）'
+  }
+  return [c.code, c.stockName, qty, price, c.reason].join(' · ') + note
 }
 
 // dispatchCard 把一张卡派发到三条通道，返回每条通道的实际结果（供测试与"为什么没响"排查）。

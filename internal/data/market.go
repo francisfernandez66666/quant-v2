@@ -51,6 +51,21 @@ var cst = func() *time.Location {
 // The whole system standardizes on qfq; mixing with hfq/unadjusted corrupts MA/pct math.
 const klineFQT = "1"
 
+// 东财 kline 的**必填**查询参数（2026-11-20 实测契约，缺一即 rc:102 / data:null）：
+//   - end=20500101：取到"最新一根"；不给 end 时东财不返回序列（不是"默认到今天"）。
+//   - fields1：K 线元信息（code/market/name/decimal/dktotal/preKPrice）。
+//   - fields2：每根 CSV 的列定义，**顺序即解析顺序** f51..f58 =
+//     date,open,close,high,low,volume(手),amount(元),amplitude。
+//
+// 这三条只在指数量能腿（§FLOW-VOLUME-B）落地过实测读数；个股日 K 走 getEastMoneyKLine，
+// 那条腿的参数面另有历史口径（MA 第二源登记为已知缺口），本批不动它。
+// English: required EM kline query params — end + both field lists; omitting any yields rc:102.
+const (
+	emKLineEnd     = "20500101"
+	emKLineFields1 = "f1,f2,f3,f4,f5,f6"
+	emKLineFields2 = "f51,f52,f53,f54,f55,f56,f57,f58"
+)
+
 // ── 东方财富单点熔断参数 ──
 // 东财是当前板块/资金流/指数/IPO 等多类数据的唯一主源且无降级保护，
 // 连续失败达到阈值即进入熔断窗口，窗口内所有东财调用快速失败并触发既有降级/缓存路径，
@@ -456,6 +471,11 @@ func (m *MarketAPI) emRecord(scope string, err error) {
 const (
 	emPrimaryPush2Host = "push2.eastmoney.com"
 	emMirrorPush2Host  = "push2delay.eastmoney.com"
+	// emHisPush2Host 是**唯一**真的供日 K 的东财主机（2026-11-20 实测：push2 / push2delay 的
+	// `/api/qt/stock/kline/get` 回 `rc:0` 但 `data.klines` 为空、`dktotal:0`，push2his 才给 8 根）。
+	// 历史口径「主站 push2 供 K 线」是错的——旧 URL 缺 end/fields 参数时两边都回 rc:102，
+	// 错误形态一样，所以看上去像"两台都坏"，实际是一台根本不放 K 线。
+	emHisPush2Host = "push2his.eastmoney.com"
 )
 
 // emFailoverPaths 允许故障转移到镜像的 push2 路径白名单。

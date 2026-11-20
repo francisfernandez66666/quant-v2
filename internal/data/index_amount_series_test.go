@@ -1,6 +1,7 @@
-// index_amount_series_test.go — §FLOW-VOLUME-B 指数量能三源降级锁（2026-11-19）。
-// 验证：① 东财主站给 amount（元）；② 主站失败退 push2his 镜像；③ 两东财源失败退新浪（用 volume 股）；
-// ④ 三源全失败返回 error（调用方 NaN 弃权）；⑤ 每源内上证主、取不到退沪深300；⑥ 指数码不拼成平安银行。
+// index_amount_series_test.go — §FLOW-VOLUME-B 指数量能三源降级锁（2026-11-19；2026-11-20 补参数锁）。
+// 验证：① 东财 push2his 给 amount（元）；② 主腿失败退 push2delay 镜像；③ 两东财源失败退新浪（用 volume 股）；
+// ④ 三源全失败返回 error（调用方 NaN 弃权）；⑤ 每源内上证主、取不到退沪深300；⑥ 指数码不拼成平安银行；
+// ⑦ 东财 URL 必带 end/fields1/fields2（缺一即 rc:102 —— 2026-11-20 量比腿整日弃权的真因）。
 package data
 
 import (
@@ -37,7 +38,7 @@ func flowDays() []string {
 
 func TestIndexAmountSeriesPrimaryEM(t *testing.T) {
 	m, _ := newFakeMarket(t, map[string][]byte{
-		"push2.eastmoney.com": emKLineBody(flowDays(), 4e11),
+		"push2his.eastmoney.com": emKLineBody(flowDays(), 4e11),
 	}, true, true)
 	out, label, err := m.IndexAmountSeries(6, "2026-11-20")
 	if err != nil {
@@ -51,14 +52,38 @@ func TestIndexAmountSeriesPrimaryEM(t *testing.T) {
 	}
 }
 
+// TestIndexAmountSeriesEMURLParams 2026-11-20 现场回归锁：东财 kline 缺 `end` 或
+// `fields1/fields2` 任一即回 `rc:102 / data:null`，三源全败 ⇒ 量比腿与资金流腿一起弃权。
+// 这条锁钉的是 URL 形状本身（假服务器只按 host 回体，不校验参数——旧用例因此漏掉了这个
+// 让整条腿哑掉一天的缺陷）。
+func TestIndexAmountSeriesEMURLParams(t *testing.T) {
+	m, rt := newFakeMarket(t, map[string][]byte{
+		"push2his.eastmoney.com": emKLineBody(flowDays(), 4e11),
+	}, true, true)
+	if _, _, err := m.IndexAmountSeries(6, "2026-11-20"); err != nil {
+		t.Fatalf("东财主应成功: %v", err)
+	}
+	path := rt.lastPath("push2his.eastmoney.com")
+	for _, need := range []string{
+		"klt=101", "lmt=8", "fqt=1",
+		"end=20500101",
+		"fields1=f1,f2,f3,f4,f5,f6",
+		"fields2=f51,f52,f53,f54,f55,f56,f57,f58",
+	} {
+		if !strings.Contains(path, need) {
+			t.Fatalf("东财 kline 必填参数缺失 %q（缺这一项东财回 rc:102/data:null）\npath=%q", need, path)
+		}
+	}
+}
+
 func TestIndexAmountSeriesEMMirror(t *testing.T) {
 	m, rt := newFakeMarket(t, map[string][]byte{
-		"push2.eastmoney.com":    nil, // 主站 EOF
-		"push2his.eastmoney.com": emKLineBody(flowDays(), 3e11),
+		"push2his.eastmoney.com":   nil, // 主腿 EOF
+		"push2delay.eastmoney.com": emKLineBody(flowDays(), 3e11),
 	}, true, true)
 	out, label, err := m.IndexAmountSeries(6, "2026-11-20")
 	if err != nil {
-		t.Fatalf("push2his 镜像应兜底: %v", err)
+		t.Fatalf("push2delay 镜像应兜底: %v", err)
 	}
 	if len(out) != 6 {
 		t.Fatalf("镜像应给 6 根, got %d", len(out))
@@ -66,15 +91,15 @@ func TestIndexAmountSeriesEMMirror(t *testing.T) {
 	if label != "em_mirror:000001.SH" {
 		t.Fatalf("应标记 em_mirror, got %q", label)
 	}
-	if rt.hostHits("push2.eastmoney.com") == 0 || rt.hostHits("push2his.eastmoney.com") == 0 {
-		t.Fatalf("应先试主站再试镜像, hits=%+v", rt.hits)
+	if rt.hostHits("push2his.eastmoney.com") == 0 || rt.hostHits("push2delay.eastmoney.com") == 0 {
+		t.Fatalf("应先试主腿再试镜像, hits=%+v", rt.hits)
 	}
 }
 
 func TestIndexAmountSeriesSinaFallback(t *testing.T) {
 	m, rt := newFakeMarket(t, map[string][]byte{
-		"push2.eastmoney.com":       nil,
 		"push2his.eastmoney.com":    nil,
+		"push2delay.eastmoney.com":  nil,
 		"money.finance.sina.com.cn": sinaIndexKLineBody(flowDays(), 4.1e10),
 	}, true, true)
 	out, label, err := m.IndexAmountSeries(6, "2026-11-20")
@@ -100,8 +125,8 @@ func TestIndexAmountSeriesSinaFallback(t *testing.T) {
 func TestIndexAmountSeriesStaleSourceFailover(t *testing.T) {
 	staleDays := []string{"2026-11-11", "2026-11-12", "2026-11-13", "2026-11-16", "2026-11-17", "2026-11-19"}
 	m, _ := newFakeMarket(t, map[string][]byte{
-		"push2.eastmoney.com":       emKLineBody(staleDays, 4e11),           // 末根 11-19 ≠ 今日 11-20 → 假活
-		"push2his.eastmoney.com":    emKLineBody(staleDays, 3e11),           // 镜像同样断更
+		"push2his.eastmoney.com":    emKLineBody(staleDays, 4e11),           // 末根 11-19 ≠ 今日 11-20 → 假活
+		"push2delay.eastmoney.com":  emKLineBody(staleDays, 3e11),           // 镜像同样断更
 		"money.finance.sina.com.cn": sinaIndexKLineBody(flowDays(), 4.1e10), // 末根 11-20 = 今日
 	}, true, true)
 	out, label, err := m.IndexAmountSeries(6, "2026-11-20")
@@ -130,8 +155,8 @@ func TestIndexAmountSeriesCSI300Fallback(t *testing.T) {
 	// 这里让东财两 host 全失败，新浪 host 返回——首个候选 sh000001 也拿到同样的体（会成功），
 	// 故改用"上证 amount=0"的东财体触发不足、沪深300 体正常来验证降级形状。
 	m, _ := newFakeMarket(t, map[string][]byte{
-		"push2.eastmoney.com":       emKLineBody(flowDays(), 0), // amount=0 → 有效日不足，退沪深300
-		"push2his.eastmoney.com":    nil,
+		"push2his.eastmoney.com":    emKLineBody(flowDays(), 0), // amount=0 → 有效日不足，退沪深300
+		"push2delay.eastmoney.com":  nil,
 		"money.finance.sina.com.cn": sinaIndexKLineBody(flowDays(), 1.8e10),
 	}, true, true)
 	_, label, err := m.IndexAmountSeries(6, "2026-11-20")

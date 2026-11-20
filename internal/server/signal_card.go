@@ -160,23 +160,49 @@ func BuildSignalCard(signalID, code, name, side string, price float64, priceKind
 	// 可执行判定：缺**任一**字段即不可执行（§2.12「字段缺一不可」，缺股数只是最致命的那个）。
 	// 刻意不只判股数：只判股数的话，缺方向/缺代码的卡也会被标成"可执行"，
 	// 而那种卡在页面上与真卡长得一模一样。
-	card.Executable = len(missing) == 0
+	// 另加一条充分条件：方向必须是买入/卖出——观察/持有卡字段再齐也不是下单指令。
+	card.Executable = len(missing) == 0 && cardSideTradable(card.Side)
 	return card
 }
 
-// normalizeCardSide 方向词表：只认两组**已知枚举**的字面值
-// （柜台/消息中心用 买入/卖出，引擎内部 Signal.Action 用 buy/sell），其它一律判缺。
-// 为什么不做模糊归一（从"减仓/清仓/做多"里猜方向）：每加一条猜测就多一处"猜错方向"的机会，
-// 而方向是花真钱的字段——与 §SIDE-AUTH-2（下单方向必填、只接受 买入/卖出）同一条纪律。
+// normalizeCardSide 方向/动作词表：只认**已知枚举**的字面值，绝不从自由文本里猜多空。
+//
+// 2026-11-20 修（现网实读）：旧词表只认 买入/卖出/buy/sell，而引擎真实在发的 Action 里
+// 绝大多数是 `watch`（观察）——于是卡片「方向」天天打「数据缺失」、标题只剩光秃秃的
+// 「交易信号」，读起来像"系统没算出方向"，实际是词表没覆盖引擎自己的枚举
+// （internal/strategy/types.go 的 ActionBuy/Sell/Hold/Watch）。
+//
+// 新增的四档都是**无条件**动作词（不需要任何上下文就能定方向）：
+//   - 观察/watch ⇒ 观察（不交易，方向本就未定）
+//   - 持有/hold  ⇒ 持有
+//   - 止损/止盈/清仓/减仓 ⇒ 卖出（这些词只描述平多/减多，不存在"买入止损"）
+//
+// 仍然不认：做多/做空（那是**看法**不是动作，做多可以买也可以只是看）、空串、任何未知词。
+// 那三类的正确结果是"方向 数据缺失"，而不是让人照着猜。
+// English: direction vocabulary covers the engine's real action enums (buy/sell/hold/watch and the
+// exit verbs); it still refuses to infer a side from opinions like 做多/做空.
 func normalizeCardSide(side string) string {
 	switch strings.TrimSpace(side) {
 	case "买入", "buy":
 		return "买入"
-	case "卖出", "sell":
+	case "卖出", "sell", "止损", "止盈", "清仓", "减仓":
 		return "卖出"
+	case "持有", "hold":
+		return "持有"
+	case "观察", "watch":
+		return "观察"
 	default:
 		return ""
 	}
+}
+
+// cardSideTradable 该方向是否代表一笔**可执行**交易（只有买入/卖出两档）。
+//
+// 为什么单独一条：方向从"缺失"变成"观察"之后，一张 8 字段齐全的观察卡会顺手把
+// Executable 判成 true——那等于告诉用户"这张卡可以照着下单"。观察/持有是读数档，
+// 永远不可执行（§2.12 的"字段缺一不可"是必要条件，不是充分条件）。
+func cardSideTradable(side string) bool {
+	return side == "买入" || side == "卖出"
 }
 
 // cardExpiryAt 有效期时刻：今日（北京时间）15:00:00。

@@ -724,7 +724,9 @@ export default function Signals() {
                 { colKey: 'channel', title: '通道', width: 80, cell: ({ row }) => <Tag size="small" variant="light" theme={row.channel === 'manual' ? 'warning' : 'primary'}>{row.channel === 'manual' ? '手动' : row.channel === 'paper' ? '纸面' : '实盘'}</Tag> },
                 { colKey: 'strategy_key', title: '战法', width: 120, ellipsis: true },
                 // §TRADE-LIST（2026-11-11 owner）：必须写清楚买入还是卖出——方向取信号卡 side（买入/卖出）
-                { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => { const side = String(row.card?.side || ''); const isBuy = side.indexOf('买') >= 0; return <Tag size="small" variant="light" theme={isBuy ? 'danger' : 'success'}>{side || '—'}</Tag> } },
+                // §SIDE-VOCAB（2026-11-20）：词表补了 观察/持有（引擎真实在发的 action=watch）。
+                // 非买卖两档不许染成绿色（绿色在这里是"卖出"的意思），否则观察卡看着像一张卖单。
+                { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => { const side = String(row.card?.side || ''); const theme = side.indexOf('买') >= 0 ? 'danger' : side.indexOf('卖') >= 0 ? 'success' : 'default'; return <Tag size="small" variant="light" theme={theme}>{side || '—'}</Tag> } },
                 { colKey: 'qty', title: '股数', width: 80, cell: ({ row }) => `${Number(row.qty) || 0} 股` },
                 { colKey: 'price', title: '参考价', width: 90, cell: ({ row }) => row.price_kind === 'live' ? `¥${Number(row.price).toFixed(2)}` : '—' },
                 { colKey: 'money', title: '金额', width: 110, cell: ({ row }) => `¥${(Number(row.notional) || 0).toLocaleString('zh-CN', { maximumFractionDigits: 0 })}` },
