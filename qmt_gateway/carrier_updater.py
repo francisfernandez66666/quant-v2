@@ -88,6 +88,14 @@ ARTIFACT_URL_KEYS = ("artifact_url", "strategy_artifact_url", "strategy_url")
 STATE_KEEP = 20
 
 
+# §CARRIER-GATEWAY-REVIVE（2026-11-20 两次现场）：载体投递是**有序重启**——它先把网关停掉
+# （防 xt 重连风暴占满 writer 槽），投完却不会把网关拉回来。于是每次投递之后 8789 都是
+# listen=0，直到下一个 5 分钟的 GatewayEnsure 才恢复；如果那期间刚好需要中继（资金流/板块）
+# 或平台要看 /health，读面就是全超时。这两次都是人工补一次 Gateway-Start 才回来。
+# 这里在投递成功之后补一步自愈：端口在监听就跳过，不在就触发计划任务（会话内直起会随会话被杀）。
+GATEWAY_PORT = 8789
+GATEWAY_START_TASK = "QMTF-Gateway-Start"
+
 def _ascii_text(text):
     """任何要打印的东西先过这道：非 ASCII 字节一律换成 '?'。
 
@@ -600,6 +608,8 @@ class CarrierUpdater:
             rep.update(status="OK", version=now_ver or want_version,
                        sha256=now_sha or want_sha, reason="applied")
             self.post_ack(ack_version, self._executor_ack_version(manifest), True, "applied")
+            # §CARRIER-GATEWAY-REVIVE：有序重启会停掉网关且不会自己拉回来，投递成功后补一步。
+            self.ensure_gateway()
         else:
             rep.update(status="FAILED", reason=fail_reason)
             self.post_ack(ack_version, self._executor_ack_version(manifest), False, fail_reason)
@@ -680,6 +690,36 @@ class CarrierUpdater:
                 os.remove(path)
         except OSError:
             pass  # 删不掉只是留了一份临时件，绝不因此把结论改掉
+
+
+    def _gateway_listening(self):
+        """8789 是否在监听（本机回环探测，1 秒超时，绝不阻塞投递收尾）。"""
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        try:
+            return sock.connect_ex(("127.0.0.1", GATEWAY_PORT)) == 0
+        except OSError:
+            return False
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def ensure_gateway(self):
+        """投递成功后把网关拉回来（端口在监听就跳过）。失败只记日志，不影响 ack。"""
+        if sys.platform != "win32":
+            return  # 开发机/CI 上没有计划任务，这一步天然不适用
+        try:
+            if self._gateway_listening():
+                self._log("CARRIER_GATEWAY action=already port=%d" % GATEWAY_PORT)
+                return
+            proc = subprocess.run(["schtasks", "/Run", "/TN", GATEWAY_START_TASK],
+                                  capture_output=True, text=True, timeout=30)
+            self._log("CARRIER_GATEWAY action=start rc=%d" % proc.returncode)
+        except Exception as exc:  # noqa: BLE001 - 自愈失败不许把投递判红
+            self._log("CARRIER_GATEWAY action=error reason=%s" % exc.__class__.__name__)
 
     def _log(self, line):
         """所有出话都过 ASCII 这道，且永不打印钥匙。"""

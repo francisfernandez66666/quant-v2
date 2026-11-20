@@ -26109,6 +26109,24 @@ grep_q 'if e.d1Store != nil && (mktDelta != nil || secDelta != nil) {' ENG234 F 
 if grep_q 'SectorFlowPct: mktPct' ENG234; then fail234 "sector_flow_pct 用大盘数值顶班（两列变同一条腿）"; fi
 
 
+# ③e 运维自愈两条（2026-11-20 现场）：① 载体投递是**有序重启**，会停网关且不拉回来
+#     （v141/v142 两次都 listen=0，靠人工补 Gateway-Start）；② 交互式会话注销后所有 /IT 任务
+#     静默不执行，装填器必须能一键注册成 SYSTEM。
+CNT234=$((CNT234 + 1))
+CU234=$(cat qmt_gateway/carrier_updater.py || true)
+IT234=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
+grep_q 'GATEWAY_START_TASK = "QMTF-Gateway-Start"' CU234 F || fail234 "投递后自愈的任务名不对（改了名字这一步会静默失效）"
+grep_q 'def ensure_gateway(self):' CU234 F || fail234 "缺投递后网关自愈"
+grep_q '            self.ensure_gateway()' CU234 F || fail234 "投递成功分支没有调网关自愈（投完 8789 仍是 0）"
+grep_q 'if self._gateway_listening():' CU234 F || fail234 "自愈没有先探端口（会重复起实例）"
+# 负锁：自愈必须走计划任务，不许在会话内直起（会话一断进程就没了——10-29 实证）。
+if grep_q 'Start-Process.*gateway' CU234; then fail234 "网关自愈改成会话内直起（会话结束即被杀）"; fi
+grep_q '[switch]$RunAsSystem' IT234 F || fail234 "装填器没有 SYSTEM 档（交互式会话注销后任务全停）"
+grep_q 'if ($RunAsSystem) {' IT234 F || fail234 "SYSTEM 档的分支被短路（开关在、分支不生效＝形同虚设）"
+grep_q '$args1 += @("/RU", "SYSTEM", "/RL", "HIGHEST")' IT234 F || fail234 "SYSTEM 档没有落到 schtasks 参数面"
+# 负锁：SYSTEM 与 /IT 互斥，同一分支里同时给会直接注册失败。
+if grep_q '"/RU", "SYSTEM".*"/IT"' IT234; then fail234 "SYSTEM 档与 /IT 同时出现（schtasks 会报错）"; fi
+
 # ④ 行为腿：判退出码，不判输出文本。
 CNT234=$((CNT234 + 1))
 if command -v go >/dev/null 2>&1; then
@@ -26123,6 +26141,7 @@ if command -v python3 >/dev/null 2>&1; then
 	PY234_RC=0
 	python3 -m pytest qmt_gateway/tests/test_rules_t.py qmt_gateway/tests/test_flow_proxy.py \
 		qmt_gateway/tests/test_pregen_sector_map.py qmt_gateway/tests/test_internal_strategy_sandbox.py \
+		qmt_gateway/tests/test_carrier_updater.py \
 		-q >/dev/null 2>&1 || PY234_RC=$?
 	[ "$PY234_RC" = "0" ] || fail234 "载体/生产者用例未过（退出码 ${PY234_RC}）"
 else

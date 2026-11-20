@@ -25,7 +25,8 @@
 #
 # 用法：
 #   .\install_tasks.ps1                 # 只打印将要注册的六条
-#   .\install_tasks.ps1 -Apply          # 真注册
+#   .\install_tasks.ps1 -Apply          # 真注册（交互式，/IT）
+#   .\install_tasks.ps1 -Apply -RunAsSystem   # 无人值守机器：注册成 SYSTEM（会话注销也能跑）
 #   .\install_tasks.ps1 -Uninstall -Apply
 
 param(
@@ -35,7 +36,15 @@ param(
     [string]$PsExe       = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe",
     [string]$PythonExe   = "C:\Python312\python.exe",
     [switch]$Apply,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # §SYSTEM-TASKS（2026-11-20 现场）：置位时把任务注册成 SYSTEM（ServiceAccount, Highest）而不是
+    # 交互式（/IT）。为什么需要它：盒子的交互式会话一注销，**所有 /IT 任务都不再执行**——
+    # schtasks /Run 返回"成功"、LastRunTime 却冻结不动，网关/客户端随即停摆且无法自愈
+    # （当天 12:2x 起全部静默，13:35 网关进程消失，盘中 UAT 做不成）。
+    # 实测：XtItClient.exe 在 SessionId=0 下存活并正常加载策略（v141/v142 都成功 re-init），
+    # 所以这条路可用。默认仍走 /IT（有桌面会话时更贴近"谁登录谁拉起"），
+    # 无人值守的机器显式加 -RunAsSystem。
+    [switch]$RunAsSystem
 )
 
 $ErrorActionPreference = "Stop"
@@ -208,7 +217,12 @@ foreach ($j in $jobs) {
     # /ET 会把结束边界钉在注册当天，任务次日即不再触发（现网 11-16 装机后从未再跑）。
     if ($j.Ri) { $args1 += @("/RI", $j.Ri) }
     if ($j.Du) { $args1 += @("/DU", $j.Du) }
-    if ($j.It) { $args1 += "/IT" }   # 交互式：客户端必须有桌面会话
+    if ($RunAsSystem) {
+        # SYSTEM 与 /IT 互斥：schtasks 同时给这两个会直接报错，所以走一个分支。
+        $args1 += @("/RU", "SYSTEM", "/RL", "HIGHEST")
+    } elseif ($j.It) {
+        $args1 += "/IT"   # 交互式：客户端需要有桌面会话（会话注销时任务会静默不执行）
+    }
     $args1 += "/F"
     & schtasks @args1 | Out-Null
     if ($LASTEXITCODE -ne 0) {

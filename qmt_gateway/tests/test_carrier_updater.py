@@ -33,6 +33,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -897,6 +898,67 @@ class TestRunnerDecodeIsLenient(unittest.TestCase):
                       "ASCII 锚必须完整存活——判读全靠它")
         self.assertIn("localized:", out,
                       "整段被吞掉就是另一种失真：坏字节要替换，不是丢行")
+
+
+class TestEnsureGatewayRevive(unittest.TestCase):
+    """§CARRIER-GATEWAY-REVIVE（2026-11-20 两次现场）。
+
+    载体投递是**有序重启**：它先把网关停掉（防 xt 重连风暴占满 writer 槽），投完不会把网关
+    拉回来。两次投递（v141 / v142）之后 8789 都是 listen=0，都要人工补一次 Gateway-Start。
+    本组锁三件事：
+      1. 端口已在监听 ⇒ **一次都不许**再触发任务（幂等，别制造第二个实例）；
+      2. 端口不通 ⇒ 恰好触发一次 `QMTF-Gateway-Start`（唯一合法拉起通道，会话内直起会被杀）；
+      3. 非 Windows / 触发失败 ⇒ 只记日志、不抛（自愈失败不许把投递判红）。
+    """
+
+    class _Fake(object):
+        def __init__(self, listening):
+            self._listening = listening
+            self.lines = []
+
+        def _gateway_listening(self):
+            return self._listening
+
+        def _log(self, line):
+            self.lines.append(line)
+
+    def test_port_already_listening_skips_the_task(self):
+        fake = self._Fake(True)
+        with mock.patch.object(cu.sys, "platform", "win32"), \
+                mock.patch.object(cu.subprocess, "run") as run:
+            cu.CarrierUpdater.ensure_gateway(fake)
+        run.assert_not_called()
+        self.assertTrue(any("action=already" in ln for ln in fake.lines), fake.lines)
+
+    def test_port_down_runs_the_start_task_exactly_once(self):
+        fake = self._Fake(False)
+        with mock.patch.object(cu.sys, "platform", "win32"), \
+                mock.patch.object(cu.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            cu.CarrierUpdater.ensure_gateway(fake)
+        self.assertEqual(run.call_count, 1)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ["schtasks", "/Run", "/TN"])
+        self.assertEqual(argv[3], cu.GATEWAY_START_TASK)
+        self.assertTrue(any("action=start rc=0" in ln for ln in fake.lines), fake.lines)
+
+    def test_non_windows_is_a_noop(self):
+        fake = self._Fake(False)
+        with mock.patch.object(cu.sys, "platform", "darwin"), \
+                mock.patch.object(cu.subprocess, "run") as run:
+            cu.CarrierUpdater.ensure_gateway(fake)
+        run.assert_not_called()
+
+    def test_failure_never_raises(self):
+        fake = self._Fake(False)
+        with mock.patch.object(cu.sys, "platform", "win32"), \
+                mock.patch.object(cu.subprocess, "run", side_effect=OSError("boom")):
+            cu.CarrierUpdater.ensure_gateway(fake)   # 不抛
+        self.assertTrue(any("action=error" in ln for ln in fake.lines), fake.lines)
+
+    def test_task_name_matches_the_installer(self):
+        # 名字写错就等于"自愈"这一步永远静默不生效（不会报错，只会在日志里留一行 rc=1）。
+        self.assertEqual(cu.GATEWAY_START_TASK, "QMTF-Gateway-Start")
 
 
 if __name__ == "__main__":
