@@ -421,7 +421,7 @@ PARAMS = {
     'risk_list_static': ['000520.SZ'],
     'rule_arm': {'break_down': 'live', 'double_bump': 'shadow', 'dragon': 'live', 'dragon_return': 'shadow', 'factor_composite': 'live', 'good_news_fade': 'live', 'high_churn': 'live', 'leader_decay': 'live', 'leader_decay_v2': 'live', 'pattern_template': 'shadow'},
     'rule_side': 'sell',
-    'scalar_bands': {'NewsEvent': {'min': 0, 'max': 40, 'mode': 'linear'}, 'ConceptHeat': {'min': 0.6, 'max': 1.01}, 'lu_board': {'min': 2, 'max': 100}, 'lu_board3': {'min': 3, 'max': 100}, 'lu_early_seal': {'min': 0, 'max': 600}},
+    'scalar_bands': {'NewsEvent': {'min': 0, 'max': 40, 'mode': 'linear'}, 'ConceptHeat': {'min': 0, 'max': 100, 'mode': 'linear'}, 'lu_board': {'min': 2, 'max': 100}, 'lu_board3': {'min': 3, 'max': 100}, 'lu_early_seal': {'min': 0, 'max': 600}},
     'scale_cap': 1.15,
     'scale_floor': 0.15,
     'score_domain': {'divisor': 2, 'floor': 0, 'full': 100, 'shift': 1},

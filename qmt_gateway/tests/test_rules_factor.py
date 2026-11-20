@@ -861,3 +861,21 @@ class TestNewsEventLinearBand(unittest.TestCase):
             rf.score_factor_rule(table, rule, ctx(limit_board_count=3))["details"]["lu_board"], 1.0)
         self.assertAlmostEqual(
             rf.score_factor_rule(table, rule, ctx(limit_board_count=1))["details"]["lu_board"], 0.0)
+    def test_concept_heat_is_linear_over_the_0_to_100_scale(self):
+        """ConceptHeat 的量纲是 0~100（hot_pool score），不是 0..1。
+
+        旧带 [0.6,1.01) 在 0~100 上只命中"1 分"那一档：热度越高反而拿不到分（反向 bug）。
+        现在 [0,100] 线性：0→0、50→0.5、100→1。
+        """
+        rule, table = self._table({"min": 0, "max": 100, "mode": "linear"})
+        rule["factors"] = ["ConceptHeat"]
+        rule["weights"] = {"ConceptHeat": 1.0}
+        rule["directions"] = {"ConceptHeat": 1}
+        table = params(factor_rules=[rule],
+                       scalar_bands={"ConceptHeat": {"min": 0, "max": 100, "mode": "linear"}})
+        self.assertAlmostEqual(
+            rf.score_factor_rule(table, rule, ctx(concept_heat=100))["details"]["ConceptHeat"], 1.0)
+        self.assertAlmostEqual(
+            rf.score_factor_rule(table, rule, ctx(concept_heat=50))["details"]["ConceptHeat"], 0.5)
+        self.assertAlmostEqual(
+            rf.score_factor_rule(table, rule, ctx(concept_heat=0))["details"]["ConceptHeat"], 0.0)

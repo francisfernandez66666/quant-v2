@@ -113,7 +113,12 @@ def test_scalar_bands_factory_defaults():
     news = bands.get("NewsEvent") or {}
     assert news.get("min") == 0 and news.get("max") == 40
     assert news.get("mode") == "linear", "D1 是连续分，带必须是线性的（二值会丢掉强度）"
-    assert bands.get("ConceptHeat", {}).get("min") == 0.6
+    # ConceptHeat 喂的是 hot_pool.positive_codes 的 score，量纲是 **0~100**
+    # （carrier_hot_reload_gz: `s / 40 * 100`），不是 0..1；旧带 [0.6,1.01) 只让"1 分"的票命中、
+    # 高热度票反而不得分——一个反向 bug（owner 2026-11-20「ConceptHeat 也改成线性」）。
+    heat = bands.get("ConceptHeat") or {}
+    assert heat.get("min") == 0 and heat.get("max") == 100
+    assert heat.get("mode") == "linear"
 
 
 def test_bars_count_covers_mom60():

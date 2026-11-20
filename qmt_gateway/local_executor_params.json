@@ -1550,8 +1550,9 @@
         "mode": "linear"
       },
       "ConceptHeat": {
-        "min": 0.6,
-        "max": 1.01
+        "min": 0,
+        "max": 100,
+        "mode": "linear"
       },
       "lu_board": {
         "min": 2,

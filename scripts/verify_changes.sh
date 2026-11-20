@@ -26193,6 +26193,12 @@ grep_q '"input": "news_event_score"' RF234 F || fail234 "因子腿仍读 dict �
 grep_q 'if band.get("mode") == "linear":' RF234 F || fail234 "缺线性归一分支（D1 是连续分，二值会丢强度）"
 grep_q '"news_event_score": pre.get("news_event"),' QS234 F || fail234 "ctx 没写 D1 分的 float 副本"
 grep_q '"mode": "linear"' PARAMS234 F || fail234 "params 的 NewsEvent 带不是线性口径"
+# ConceptHeat（owner 2026-11-20「也改成线性」）：它喂的是 hot_pool score，量纲 **0~100**
+# （carrier_hot_reload_gz: `s / 40 * 100`）。旧带 [0.6,1.01) 在 0~100 上只命中"1 分"那一档——
+# 热度越高反而拿不到分，是个**反向 bug**，而且读数上看不出来。
+grep_q '"ConceptHeat": {' PARAMS234 F || fail234 "缺 ConceptHeat 带"
+grep_q '"max": 100,' PARAMS234 F || fail234 "ConceptHeat 上界不是 100（量纲是 0~100，不是 0..1）"
+if grep_q '"max": 1.01' PARAMS234; then fail234 "ConceptHeat 还是旧口径 0..1（在 0~100 上等于反向）"; fi
 grep_q '"input": "news_event_score"' PARAMS234 F || fail234 "params 的 factor_defs.NewsEvent.input 没改（烘进载体的仍是旧键）"
 # 负锁：旧口径 [30,101) 不许留宿（那是 0..100 新闻分的带，与 D1 差一个量纲）。
 if grep_q '"min": 30,' PARAMS234; then fail234 "NewsEvent 带还是旧口径 min=30（D1 正分几乎永不命中）"; fi
