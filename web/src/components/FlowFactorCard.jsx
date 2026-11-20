@@ -131,6 +131,20 @@ export default function FlowFactorCard({ flow }) {
               板块读数 {sectorCount === null ? '—' : `${sectorCount} 个`}
               {sectorCount === 0 ? '（板块逐票腿今日无数据，弃权）' : ''}
             </div>
+            {/* §FLOW-SECTOR-AGG（owner 2026-11-20）：板块聚合两列。
+                缺数一律显示"弃权"，绝不画 0 —— 0 在资金流语境里是"板块中性"，是另一个意思。 */}
+            <div className="muted" data-testid="flow-sector-agg" style={{ fontSize: 11, marginTop: 4 }}>
+              {flow.sector_known ? (
+                <>
+                  板块合计净流入 {fmtSignedPct(flow.sector_pct) ?? '—'}，等权强度{' '}
+                  {Number.isFinite(Number(flow.sector_delta))
+                    ? `${Number(flow.sector_delta) > 0 ? '+' : ''}${Number(flow.sector_delta).toFixed(2)}`
+                    : '—'}
+                </>
+              ) : (
+                <>板块合计：今日无读数（弃权）</>
+              )}
+            </div>
           </div>
 
           {/* 右：量能状态（放量/缩量/平量由 r_yest 与 r_ma5 双闸判出，阈值在后端） */}

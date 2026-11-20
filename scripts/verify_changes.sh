@@ -26127,6 +26127,18 @@ grep_q '$args1 += @("/RU", "SYSTEM", "/RL", "HIGHEST")' IT234 F || fail234 "SYST
 # 负锁：SYSTEM 与 /IT 互斥，同一分支里同时给会直接注册失败。
 if grep_q '"/RU", "SYSTEM".*"/IT"' IT234; then fail234 "SYSTEM 档与 /IT 同时出现（schtasks 会报错）"; fi
 
+# ③f 板块聚合的读面（后端 map 键 + 前端两态文案）：写进去但看不到，等于没拿到。
+CNT234=$((CNT234 + 1))
+FLOWST234=$(cat internal/server/flow_status.go || true)
+FFC234=$(cat web/src/components/FlowFactorCard.jsx || true)
+grep_q 'out["sector_known"] = true' FLOWST234 F || fail234 "读面没有 sector_known（前端只能猜）"
+grep_q 'out["sector_pct"] = row.SectorFlowPct' FLOWST234 F || fail234 "读面没下发 sector_pct"
+grep_q 'out["sector_delta"] = row.FlowSectorDelta' FLOWST234 F || fail234 "读面没下发 sector_delta"
+grep_q 'data-testid="flow-sector-agg"' FFC234 F || fail234 "前端没有板块聚合读数行"
+grep_q '板块合计：今日无读数（弃权）' FFC234 F || fail234 "前端缺数时没有显式弃权文案"
+# 负锁：缺数时不许画 0（0 在资金流语境里是"板块中性"，是另一个意思）。
+if grep_q 'sector_known ? .*0\.00' FFC234; then fail234 "板块聚合缺数被画成 0.00"; fi
+
 # ④ 行为腿：判退出码，不判输出文本。
 CNT234=$((CNT234 + 1))
 if command -v go >/dev/null 2>&1; then

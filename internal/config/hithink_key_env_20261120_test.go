@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
 )
 
 // hithinkKeyEnvForTest 与 data.HithinkAPIKeyEnv 同值。

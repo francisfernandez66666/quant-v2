@@ -54,6 +54,9 @@ func flowNullF(p *float64) float64 {
 //	r_ma5        今日折算量 / T-1..T-5 均量
 //	vol_delta    量态强度（+1/-1/0）
 //	sector_count 当日已烘入的板块读数行数（0=板块腿今天没数据，如实显示）
+//	sector_known 板块聚合两列是否有值（false ⇒ 前端显示"弃权"，不许画 0）
+//	sector_pct   板块净流入合计 ÷ 板块成交额合计 × 100（与 market_pct 同形态）
+//	sector_delta 各板块 delta 的等权均值 ∈[-1,1]（"多数板块的强度"）
 //	blend        三项 delta 的合成金额乘子预览（缺项 renormalize，±20% 封顶；全弃权=null）
 //	blend_ok     是否至少一条腿有效（false ⇒ 合成乘子不参与，前端显示"弃权"）
 //
@@ -101,6 +104,17 @@ func (s *Server) flowStatusReadout(now time.Time) map[string]interface{} {
 	// 板块腿覆盖度：0 行是如实读数（缺 sector_map 生产者时就是 0），不当作错误。
 	if n, cerr := s.researchDB.CountSectorFlowDaily(day); cerr == nil {
 		out["sector_count"] = n
+	}
+
+	// §FLOW-SECTOR-AGG（owner 2026-11-20）：板块聚合两列的读数面。
+	// 口径（写侧在 engine.aggregateSectorFlow）：
+	//   sector_pct   = 板块净流入合计 ÷ 板块成交额合计 × 100（与 market_pct 同形态，可直接对比）
+	//   sector_delta = 各板块 delta 的等权均值（"多数板块的强度"，与大盘腿刻意不同口径）
+	// 缺数一律 null + known=false —— 绝不折成 0（0 会被读成"板块中性"，那是另一个意思）。
+	if row.SectorFlowPct != nil || row.FlowSectorDelta != nil {
+		out["sector_known"] = true
+		out["sector_pct"] = row.SectorFlowPct
+		out["sector_delta"] = row.FlowSectorDelta
 	}
 
 	// 合成乘子预览：把三项 delta 原样递给 signalctl（缺项传 NaN ⇒ 弃权）。

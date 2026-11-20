@@ -74,6 +74,24 @@ describe('§FLOW-QUADRANT FlowFactorCard', () => {
     expect(screen.getByText(/板块读数 0 个（板块逐票腿今日无数据，弃权）/)).toBeTruthy()
   })
 
+
+  // §FLOW-SECTOR-AGG（owner 2026-11-20）：板块聚合两列的展示纪律 —— 有值报两位小数（带符号），
+  // 缺数只说"弃权"。0 在这里是"板块中性"的意思，绝不能拿它顶替"没有读数"。
+  it('板块聚合：有值时显示合计净流入与等权强度', () => {
+    render(<FlowFactorCard flow={{ ...FULL, sector_known: true, sector_pct: -2.345, sector_delta: -0.7 }} />)
+    const el = screen.getByTestId('flow-sector-agg')
+    expect(el.textContent).toContain('-2.35%')
+    expect(el.textContent).toContain('-0.70')
+  })
+
+  it('板块聚合：缺数时只说弃权，不画 0.00% / 0.00', () => {
+    render(<FlowFactorCard flow={{ ...FULL, sector_known: false }} />)
+    const el = screen.getByTestId('flow-sector-agg')
+    expect(el.textContent).toContain('弃权')
+    expect(el.textContent).not.toContain('0.00%')
+    expect(el.textContent).not.toContain('+0.00')
+  })
+
   it('缩量 / 平量各用各的文案（不折叠成同一句）', () => {
     render(<FlowFactorCard flow={{ ...FULL, vol_state: 'shrink', r_yest: 0.7, r_ma5: 0.8, vol_delta: -1 }} />)
     expect(screen.getByTestId('flow-vol-state').textContent).toBe('缩量')
