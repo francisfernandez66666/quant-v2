@@ -25747,3 +25747,136 @@ fi
 [ "$B231_FAILED" = "0" ] || exit 1
 echo "ok - §231 §FLOW-QUADRANT 锁通过（四腿在册+阈值单点无兜底+四类弃权锚+唯一硬闸只拦new/add+板块连接键专用+blend落点per_trade+烘入腿在sha之前+行为用例判退出码，累计判定点 ${CNT231}）"
 echo ""
+echo "==> 232 §STOP-LADDER/§FLOW-DASH（−3% 减仓 / −6% 清仓 双侧阶梯 + 做多信号只压减仓 + 首页净流入/量能读数并进 /api/status）..."
+B232_FAILED=0
+fail232() {
+	echo "--- FAIL: §232 $*"
+	FAIL=1
+	B232_FAILED=1
+}
+CNT232=0
+CFG232=$(cat internal/config/config.go || true)
+SELL232=$(cat internal/signalctl/sell.go || true)
+DISC232=$(cat internal/trading/discipline.go || true)
+ANCH232=$(cat internal/signalctl/anchor_shadow.go || true)
+LEX232=$(cat qmt_gateway/local_executor.py || true)
+PJ232=$(cat qmt_gateway/local_executor_params.json || true)
+STR232=$(cat qmt_gateway/qmt_internal_strategy.py || true)
+FLOW232=$(cat internal/server/flow_status.go || true)
+PREV232=$(cat internal/signalctl/flow_blend_preview.go || true)
+HND232=$(cat internal/server/handlers_fix.go || true)
+CARD232=$(cat web/src/components/FlowFactorCard.jsx || true)
+DASH232=$(cat web/src/pages/Dashboard.jsx || true)
+
+# ① 云端阶梯四条腿在册：配置键 / 卖出内核 / 纪律腿 / 锚点表。
+#    少一条的形态各不相同：配置缺键＝改不了数；内核缺档＝只有清仓没有减仓；
+#    纪律腿缺档＝旧观测腿读数与内核分叉；锚点缺价＝签认页看不到"哪一档先命中"。
+CNT232=$((CNT232 + 1))
+grep_q 'ReducePct float64 `json:"reduce_pct"`' CFG232 F || fail232 "纪律配置缺 ReducePct（云端改不了减仓线）"
+grep_q 'ReducePct:         3,' CFG232 F || fail232 "出厂默认不是 3（owner 裁决「3 个点减仓」）"
+grep_q 'SellLineReduce' SELL232 F || fail232 "卖出内核缺减仓线枚举"
+grep_q 'return "减仓线"' SELL232 F || fail232 "减仓线没有中文名（留痕/理由会露出数字枚举）"
+grep_q 'case p.reduce > 0 && pnl <= -p.reduce:' SELL232 F || fail232 "卖出内核缺减仓档判定"
+grep_q 'case SellLineReduce:' SELL232 F || fail232 "减仓线未接窗结算（半平那一步不存在）"
+grep_q 'LineReduce' DISC232 F || fail232 "纪律腿缺减仓线枚举"
+grep_q '} else if rd > 0 && pnl <= -rd {' DISC232 F || fail232 "纪律腿缺减仓档判定"
+grep_q 'row.ReducePriceByCost = in.EntryPrice * (1 - p.reduce/100)' ANCH232 F || fail232 "锚点表缺成本侧减仓价"
+grep_q 'row.ReducePriceByAnchor = in.AnchorPrice * (1 - p.reduce/100)' ANCH232 F || fail232 "锚点表缺锚点侧减仓价"
+
+# ② 顺序锁：减仓档必须排在清仓档**之后**。顺序反了（先判 −3 再判 −6）会让 −7% 的票
+#    只减半仓——这是最贵的一种"看起来在工作"（每天都有卖单，仓位却越跌越重）。
+CNT232=$((CNT232 + 1))
+SL_LINE232=$( { grep -n 'case pnl <= -p.sl:' internal/signalctl/sell.go || true; } | head -1 | cut -d: -f1)
+RD_LINE232=$( { grep -n 'case p.reduce > 0 && pnl <= -p.reduce:' internal/signalctl/sell.go || true; } | head -1 | cut -d: -f1)
+[ -n "$SL_LINE232" ] || fail232 "找不到清仓档锚点（这把顺序锁没有牙）"
+[ -n "$RD_LINE232" ] || fail232 "找不到减仓档锚点（这把顺序锁没有牙）"
+[ "${RD_LINE232:-0}" -gt "${SL_LINE232:-0}" ] || fail232 "减仓档排在清仓档之前（−7% 会只减半仓）"
+# 清仓线的窗结算必须**无条件**全平：做多信号可压过减仓，压不过清仓（owner 2026-11-20）。
+grep_q 'if st.Line == SellLineStopLoss {' SELL232 F || fail232 "清仓线缺无条件全平分支（做多信号会延持清仓）"
+grep_q '无条件全平（做多信号不延持）' SELL232 F || fail232 "清仓线处置理由不可归因（看不出是被哪条裁决拦下的）"
+# 负锁：清仓线**不许**再回到"半平"分支。判据取"清仓线出现处后 2 行内有没有 trim"——
+# 回到半平分支的形态就是 `case SellLineStopLoss:` 下挂一个 `d.Action = SellActionTrim`，
+# 那时 −7% 只会卖一半（且盘面看起来每天都有卖单）。
+STOPTRIM232=$(printf '%s\n' "$SELL232" | grep -A2 'SellLineStopLoss' | grep -c 'SellActionTrim' || true)
+[ "${STOPTRIM232:-1}" = "0" ] || fail232 "清仓线又长出了半平分支（−6% 会只减半仓）"
+# 第二颗牙：旧的"首触止损未深破减半仓"文案是半平口径的指纹，回来即意味着口径回退。
+if grep_q '首触止损未深破减半仓' SELL232 F; then
+	fail232 "清仓线回到了旧的半平口径（「首触止损未深破减半仓」文案复活）"
+fi
+
+# ③ 两线冲突的退化口径：减仓线必须严格轻于清仓线，撞线时**关掉该档**而不是夹成同一个数。
+#    夹成同一个数会让同一笔输入产出哪个动作取决于 case 顺序（半平/全平不可预测）。
+CNT232=$((CNT232 + 1))
+grep_q 'if p.reduce <= 0 || p.reduce >= p.sl {' SELL232 F || fail232 "卖出内核缺两线冲突退化（减仓线撞清仓线时档位不关）"
+grep_q 'if rd >= sl {' DISC232 F || fail232 "纪律腿缺两线冲突退化（同一份配置两处口径必须一致）"
+
+# ④ 载体参数与短码：阈值、比例、短码、内置链四处同源。
+#    短码撞车＝幂等键撞车（第一笔的委托备注会让第二笔永久静默），所以还要判"RD 只出现一次"。
+CNT232=$((CNT232 + 1))
+grep_q '"stop_loss_ratio": 0.94' PJ232 F || fail232 "载体清仓线不是 −6%（stop_loss_ratio 必须 0.94）"
+grep_q '"reduce_position_ratio": 0.97' PJ232 F || fail232 "载体缺减仓线阈值（reduce_position_ratio）"
+grep_q '"reduce_position_fraction": 0.5' PJ232 F || fail232 "载体缺减仓比例（reduce_position_fraction）"
+grep_q '"reduce_position": "RD"' PJ232 F || fail232 "载体缺减仓短码 RD（没有短码就没有当日幂等）"
+RD_N232=$(printf '%s\n' "$PJ232" | grep -c '"RD"' || true)
+[ "${RD_N232:-0}" = "1" ] || fail232 "短码 RD 出现 ${RD_N232:-0} 次（必须恰好 1 次：撞码会让另一条腿永久静默）"
+grep_q "'reduce_position'" LEX232 F || fail232 "载体内置链没登记 reduce_position（arm 判 off ⇒ 规则永远不跑）"
+
+# ⑤ 载体规则层：整手向下取整 + 不足一手弃权（不许卖出一个非整手数量）。
+CNT232=$((CNT232 + 1))
+grep_q 'def rule_reduce_position(params, ctx):' LEX232 F || fail232 "载体缺 rule_reduce_position"
+grep_q 'params["reduce_position_fraction"]' LEX232 F || fail232 "载体减仓比例没走参数（会变成硬编码 0.5）"
+grep_q 'params["reduce_position_ratio"]' LEX232 F || fail232 "载体减仓阈值没走参数"
+grep_q '// lot' LEX232 F || fail232 "载体减仓缺整手截断（会报出非整手数量）"
+grep_q 'not trimmed' LEX232 F || fail232 "载体减仓缺「不足一手即弃权」判据"
+
+# ⑥ 扫描顺序：bull 先算、清仓链（止盈/止损/破位）先判、减仓后判；
+#    做多信号压过减仓的实现是**当轮持有**（既不减也不加），所以 bull 必须被置空。
+CNT232=$((CNT232 + 1))
+BULL_LINE232=$( { grep -n 'bull = rule_pullback_buy(PARAMS, ctx)' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+RED_LINE232=$( { grep -n 'hit = rule_reduce_position(PARAMS, ctx)' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+BUY_LINE232=$( { grep -n 'if not signals and bull:' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+[ -n "$BULL_LINE232" ] || fail232 "找不到 bull 信号计算点（压过减仓那条腿没有输入）"
+[ -n "$RED_LINE232" ] || fail232 "找不到减仓调用点（载体阶梯只有清仓）"
+[ -n "$BUY_LINE232" ] || fail232 "找不到买入腿判据（bull 被吃掉后买入也一起没了）"
+[ "${BULL_LINE232:-0}" -lt "${RED_LINE232:-0}" ] || fail232 "bull 在减仓之后才算（压过减仓的判据拿不到信号）"
+[ "${RED_LINE232:-0}" -lt "${BUY_LINE232:-0}" ] || fail232 "买入腿排在减仓之前（减仓与买入会同轮双发）"
+grep_q 'rule_bull_override' STR232 F || fail232 "bull 压过减仓没有落 round_skips（盘后无法归因）"
+grep_q 'bull = None' STR232 F || fail232 "bull 没被置空（当轮既减仓又加仓，与「持有」口径相反）"
+
+# ⑦ Dashboard 读数：并进既有 /api/status（不新开路由 ⇒ 契约台账与 §115 计数一个字不动），
+#    量态与合成乘子都转调 signalctl 真源，展示层不许有第二份公式、不许把缺数画成 0。
+CNT232=$((CNT232 + 1))
+[ -s internal/server/flow_status.go ] || fail232 "读数装配文件不在册（internal/server/flow_status.go）"
+grep_q 'func (s *Server) flowStatusReadout(' FLOW232 F || fail232 "读数装配函数不在"
+grep_q 'signalctl.VolStateOf(' FLOW232 F || fail232 "量态没有转调 signalctl.VolStateOf（展示层另写了阈值）"
+grep_q 'signalctl.FlowBlendPreview(' FLOW232 F || fail232 "合成乘子没有转调 FlowBlendPreview"
+grep_q 'ApplyFlowBlend' PREV232 F || fail232 "预览入口没转调 ApplyFlowBlend（第二份公式）"
+grep_q '"flow": flowReadout,' HND232 F || fail232 "/api/status 没有下发 flow 键（前端拿不到读数）"
+# 负锁：装配层出现 `1+0.2*b` 形态即视为第二份公式（注释行先剔掉，免得被说明文字骗过）。
+NONFORMULA232=$(printf '%s\n' "$FLOW232" | grep -vE '^[[:space:]]*//' | grep -cE '1[[:space:]]*\+[[:space:]]*0?\.2' || true)
+[ "${NONFORMULA232:-1}" = "0" ] || fail232 "读数装配层出现 1+0.2*b（合成乘子只能有一处公式）"
+grep_q '今日无读数' CARD232 F || fail232 "前端卡片缺「今日无读数」这一态（缺数会被画成 0）"
+grep_q '<FlowFactorCard flow={status.flow} />' DASH232 F || fail232 "首页没挂读数卡（读数在接口里但没人看得见）"
+
+# ⑧ 行为腿：判**退出码**，不判输出文本（多例时 "1 failed, 27 passed" 里也有 passed）。
+CNT232=$((CNT232 + 1))
+if command -v go >/dev/null 2>&1; then
+	SL232_RC=0
+	go test ./internal/signalctl ./internal/trading -count=1 \
+		-run 'TestSellReduceWindowSettleTrim|TestSellStopLossWindowSettleClose|TestSellReduceDisabledWhenNotLighterThanStop|TestProbeStopLossClearLineClose|TestSellParamsFromConfig' \
+		>/dev/null 2>&1 || SL232_RC=$?
+	[ "$SL232_RC" = "0" ] || fail232 "阶梯行为用例未过（退出码 ${SL232_RC}）"
+else
+	echo "INFO - §232 无 go，阶梯行为腿未跑（这份绿不含 Go 阶梯判定）"
+fi
+if command -v python3 >/dev/null 2>&1; then
+	LEX232_RC=0
+	python3 -m pytest qmt_gateway/tests/test_local_executor.py -q >/dev/null 2>&1 || LEX232_RC=$?
+	[ "$LEX232_RC" = "0" ] || fail232 "载体阶梯用例未过（退出码 ${LEX232_RC}）"
+else
+	echo "INFO - §232 无 python3，载体阶梯行为腿未跑"
+fi
+
+[ "$B232_FAILED" = "0" ] || exit 1
+echo "ok - §232 §STOP-LADDER/§FLOW-DASH 锁通过（四条腿在册+减仓在清仓之后+清仓不可延持+两线冲突退化+载体阈值/短码/整手+扫描顺序 bull 压减仓+读数并进 /api/status 无第二份公式+行为腿判退出码，累计判定点 ${CNT232}）"
+echo ""

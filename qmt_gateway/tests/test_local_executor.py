@@ -151,6 +151,7 @@ class TestRuleLayerHasNoBareNumbers(unittest.TestCase):
             "daily_buy_cap", "min_order_amount", "no_cancel_windows",
             "no_new_order_windows", "max_ops_per_min", "pullback_ratio",
             "take_profit_ratio", "stop_loss_ratio", "breakdown_ratio",
+            "reduce_position_ratio", "reduce_position_fraction",
             "lot_size", "signal_codes", "symbol_head_len",
         ]
         for key in needed:
@@ -159,7 +160,8 @@ class TestRuleLayerHasNoBareNumbers(unittest.TestCase):
     def test_signal_codes_cover_every_rule_kind(self):
         """A signal kind with no short code cannot be keyed, and a missing
         key would silently drop the signal."""
-        kinds = ["pullback_buy", "take_profit", "stop_loss", "breakdown_sell"]
+        kinds = ["pullback_buy", "take_profit", "stop_loss", "breakdown_sell",
+                 "reduce_position"]
         for kind in kinds:
             self.assertIn(kind, lex.PARAMS["signal_codes"])
 
@@ -473,7 +475,8 @@ class TestSignals(unittest.TestCase):
     def test_no_signal_on_a_closed_day(self):
         p = params()
         for rule in (lex.rule_pullback_buy, lex.rule_take_profit,
-                     lex.rule_stop_loss, lex.rule_breakdown_sell):
+                     lex.rule_stop_loss, lex.rule_breakdown_sell,
+                     lex.rule_reduce_position):
             self.assertIsNone(rule(p, ctx(trading_day=False)))
 
     def test_take_profit(self):
@@ -496,6 +499,46 @@ class TestSignals(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal["kind"], "stop_loss")
         self.assertEqual(signal["side"], "sell")
+
+    # ---- STOP-LADDER 2026-11-20 (owner): -3% trims half, -6% clears all ----
+
+    def test_reduce_position_trims_half_at_minus_three(self):
+        """The first ladder step sells HALF (whole lots), not the position."""
+        p = params()
+        signal = lex.rule_reduce_position(p, ctx(last_price=9.65, position_qty=1000.0,
+                                                 position_cost=10.0))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["kind"], "reduce_position")
+        self.assertEqual(signal["side"], "sell")
+        self.assertEqual(signal["qty"], 500,
+                         "trim must be half the position, floor to whole lots")
+
+    def test_reduce_position_is_silent_above_its_line(self):
+        """-2.5% is above the -3% trim line: no signal (no proactive selling)."""
+        p = params()
+        self.assertIsNone(lex.rule_reduce_position(p, ctx(last_price=9.75,
+                                                          position_qty=1000.0,
+                                                          position_cost=10.0)))
+
+    def test_reduce_position_needs_a_whole_lot_to_trim(self):
+        """One lot cannot be halved: the trim stays silent, the clear line owns it."""
+        p = params()
+        self.assertIsNone(lex.rule_reduce_position(p, ctx(last_price=9.65,
+                                                          position_qty=100.0,
+                                                          position_cost=10.0)))
+
+    def test_stop_loss_is_the_clear_line_not_the_trim_line(self):
+        """-3.5% must NOT clear the position any more; -6.5% must."""
+        p = params()
+        self.assertIsNone(lex.rule_stop_loss(p, ctx(last_price=9.65,
+                                                    position_qty=1000.0,
+                                                    position_cost=10.0)),
+                          "the clear line must not fire at the trim step any more")
+        signal = lex.rule_stop_loss(p, ctx(last_price=9.35, position_qty=1000.0,
+                                           position_cost=10.0))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["qty"], 1000,
+                         "the clear line sells the WHOLE position")
 
     def test_breakdown_sell(self):
         p = params()

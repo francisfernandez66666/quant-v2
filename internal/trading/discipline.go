@@ -3,12 +3,13 @@
 // （不滚动重置），窗内持续有同向信号 → 跟随；窗结算仍无信号 → 按判定线离场。
 //
 // 判定线（全部后台可配，internal/config.DisciplineConfig）：
-//   - 止损线 −StopLossPct：浮亏达此值触发止损判定
+//   - 减仓线 −ReducePct（默认 3）：浮亏达此值先半平；做多信号可压过这一档
+//   - 止损线 −StopLossPct（默认 6）：§STOP-LADDER 起是**清仓线**，窗结算整仓离场，做多信号不延持
 //   - 止盈线 +TakeProfitPct：盈利达此值触发止盈判定
 //   - 移动止盈：突破止盈线后按 最高价 − MaxPullbackPct 动态上移；利润回落到 +15−(−6)=+21 必触发
 //   - 深破兜底：浮亏达 StopLossPct×DeepStopMult（默认 −12）触发深破判定，同样走观察窗
 //
-// 触发后：窗口内有同向信号 → 延持；无 → 全平（止损/止盈）或半平（减仓类）。
+// 触发后：窗口内有同向信号 → 延持；无 → 全平（清仓/止盈）或半平（减仓线）。
 //
 // §P0-C（2026-09-22 傍晚批，owner 裁决 2 = B 最小止血）：延持态（Settled 且未 Confirmed）
 // 过去在函数顶部被早退吞掉，一次延持即**终态失明**——该持仓之后每轮都不再被任何判定线评估
@@ -33,7 +34,7 @@ type DisciplineLine int
 const (
 	// LineNone 未命中任何判定线。
 	LineNone DisciplineLine = iota
-	// LineStopLoss 命中止损线（浮亏 ≥ StopLossPct）。
+	// LineStopLoss 命中止损线（浮亏 ≥ StopLossPct）——§STOP-LADDER 起本档是**清仓线**（默认 −6）。
 	LineStopLoss
 	// LineTakeProfit 命中止盈线（盈利 ≥ TakeProfitPct）。
 	LineTakeProfit
@@ -41,6 +42,11 @@ const (
 	LineTrail
 	// LineDeepBreach 命中深破兜底（浮亏 ≥ StopLossPct×DeepStopMult）。
 	LineDeepBreach
+	// LineReduce 命中减仓线（浮亏 ≥ ReducePct，默认 −3）——§STOP-LADDER 阶梯第一级，只半平。
+	// 追加在末尾保持既有枚举值不变（同上通道 SellLineReduce 的理由）。
+	// English: the trim step of the §STOP-LADDER (default −3%); appended last so no numeric
+	// value of the existing lines moves.
+	LineReduce
 )
 
 // DisciplineAction 裁决输出动作。
@@ -101,6 +107,15 @@ func probeDiscipline(st *PositionState, code string, entryPrice, highPrice, curP
 	if sl <= 0 {
 		sl = 6
 	}
+	// §STOP-LADDER 减仓线（owner 2026-11-20）：默认 −3% 只半平；必须严格轻于清仓线，
+	// 冲突（≥ sl）即该档不成立（rd=0），把"半平"和"全平"落在同一价位上会让动作取决于分支顺序。
+	rd := cfg.ReducePct
+	if rd <= 0 {
+		rd = 3
+	}
+	if rd >= sl {
+		rd = 0
+	}
 	tp := cfg.TakeProfitPct
 	if tp <= 0 {
 		tp = 15
@@ -142,11 +157,13 @@ func probeDiscipline(st *PositionState, code string, entryPrice, highPrice, curP
 			reason = "止盈离场"
 		case LineDeepBreach:
 			reason = "深破止损离场"
+		case LineReduce:
+			reason = "减仓线离场，减半仓"
 		}
 		d := &Decision{Code: code, Action: ActionClose, Line: st.Line, PnlPct: pnl, Reason: reason}
-		if st.Line == LineStopLoss && pnl > -2*sl {
+		// §STOP-LADDER：只有减仓线是半平；清仓线与深破一律全平（半平/全平不再按"未深破"推）。
+		if st.Line == LineReduce {
 			d.Action = ActionTrim
-			d.Reason = "首触止损未深破，减半仓"
 		}
 		return *st, d
 	}
@@ -177,6 +194,9 @@ func probeDiscipline(st *PositionState, code string, entryPrice, highPrice, curP
 			return *st, &Decision{Code: code, Action: ActionClose, Line: LineStopLoss, PnlPct: pnl, Reason: "触止损线且有利空/做空信号，硬止损"}
 		}
 		line = LineStopLoss
+	} else if rd > 0 && pnl <= -rd {
+		// §STOP-LADDER 第一级：−3% 减仓（窗结算才会半平；做多信号可压过本档，见结算段）。
+		line = LineReduce
 	} else if pnl >= tp {
 		// 止盈线：有做多信号 → 延持；无 → 进入观察窗。
 		if hasBull {
@@ -223,9 +243,14 @@ func probeDiscipline(st *PositionState, code string, entryPrice, highPrice, curP
 		st.Settled = true
 		// 止盈类窗口：有做多信号 → 延持；无 → 离场。
 		// 止损类窗口：有做空/利空信号 → 硬清；无 → 离场。
+		// §STOP-LADDER：减仓线属损失族，但它**可被做多信号压过**（信号强度高于减仓强度）——
+		// 清仓线/深破不被压过，维持原"看利空信号"的口径。
 		hold := hasBull
-		if st.Line == LineStopLoss || st.Line == LineDeepBreach {
+		switch st.Line {
+		case LineStopLoss, LineDeepBreach:
 			hold = hasBear
+		case LineReduce:
+			hold = hasBull
 		}
 		st.Confirmed = !hold
 		if hold {
@@ -239,9 +264,11 @@ func probeDiscipline(st *PositionState, code string, entryPrice, highPrice, curP
 			d.Reason = "止盈窗结算无信号，止盈离场"
 		case LineDeepBreach:
 			d.Reason = "深破窗结算无信号，止损离场"
+		case LineReduce:
+			d.Action = ActionTrim
+			d.Reason = "减仓窗结算无信号，减半仓"
 		default:
 			d.Reason = "止损窗结算无信号，止损离场"
-			d.Action = ActionTrim
 		}
 		return *st, d
 	}
@@ -250,10 +277,10 @@ func probeDiscipline(st *PositionState, code string, entryPrice, highPrice, curP
 		Reason: "观察窗内等待信号"}
 }
 
-// isLossLine 判定线是否属"损失族"（止损线 / 深破兜底）；反之为止盈类（止盈 / 移动止盈）。
-// English: whether a discipline line belongs to the loss family (stop-loss / deep breach).
+// isLossLine 判定线是否属"损失族"（减仓线 / 止损清仓线 / 深破兜底）；反之为止盈类（止盈 / 移动止盈）。
+// English: whether a discipline line belongs to the loss family (reduce / stop-loss / deep breach).
 func isLossLine(l DisciplineLine) bool {
-	return l == LineStopLoss || l == LineDeepBreach
+	return l == LineStopLoss || l == LineDeepBreach || l == LineReduce
 }
 
 // reevalAllowsSettle 延持态（Settled && !Confirmed）重新出钱的准入判据：本轮命中的判定线

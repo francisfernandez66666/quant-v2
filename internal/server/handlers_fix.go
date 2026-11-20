@@ -789,6 +789,11 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	now := time.Now()
+	// §FLOW-QUADRANT（2026-11-20）云端净流入 + 量能读数上屏（首页仪表盘）。
+	// 纯读面：只读当日 flow_factor_daily 一行 + 板块行数，缺数一律 null（弃权），绝不折成 0。
+	// 放在 /api/status 而不是新开路由：契约台账与 §115 派生计数一个字都不动。
+	// English: read-only flow/volume readout for the dashboard; no new route, no fake zeros.
+	flowReadout := s.flowStatusReadout(now)
 	// 交易时段判定统一走 data 包（含周末/休市）：9:15 集合竞价开盘，15:30 收盘后进入静默释放期。
 	// session 枚举：0=盘前 1=上午盘 2=午间 3=下午盘 4=盘后 5=休市。
 	// in_trade_time = 上午/下午交易时段；active = 完整活跃覆盖窗 9:15~15:30（首尔服务器此间活跃、其余静默释放性能）。
@@ -810,6 +815,10 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		// 不许把 nil 折成 ok（同 §M2 的 -1=未知 取向）。
 		"quote_feed":           quoteFeed,
 		"data_source_breakers": breakers,
+		// §FLOW-QUADRANT：云端净流入（market_pct/market_delta）+ 量能（vol_state/r_yest/r_ma5）
+		// + 合成金额乘子预览 + 板块读数行数。缺数一律 null 且 *_known=false——
+		// 前端据此显示"今日无读数（弃权）"，绝不画成 0 或"平量"。
+		"flow": flowReadout,
 		// §A7（20260918 审计批）：下发后端二进制 git 指纹。部署脚本对后端与前端 dist 用同一
 		// checkout 构建（deploy_seoul.sh LDFLAGS 同源），故该值即"服务端配套前端版本"；
 		// APK 内嵌 assets 的构建指纹与之比对不一致时顶栏横幅告警。未注入时为 "unknown"，

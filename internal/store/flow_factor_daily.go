@@ -216,3 +216,21 @@ func (d *DB) GetSectorFlowDaily(tradeDate, sector string) (*SectorFlowDailyRow, 
 	r.NetInflow, r.Amount, r.Delta = ni.Float64, amt.Float64, dl.Float64
 	return &r, nil
 }
+
+// CountSectorFlowDaily 统计某交易日已烘入的板块读数行数（读面用，不参与判定）。
+//
+// 为什么需要它：逐票板块腿的命中率在**载体**侧算（sector_hit=N/M），而云端这一侧的
+// "今天到底烘了几个板块"只在库里。仪表盘要能区分「板块腿今天有读数」与「今天一个都没有」——
+// 0 行是如实读数（现网因缺 sector_map 生产者就是 0），不是错误，但也绝不能画成"中性"。
+// English: count today's baked sector rows; 0 is an honest reading (no sector_map producer yet),
+// not an error and definitely not "neutral".
+func (d *DB) CountSectorFlowDaily(tradeDate string) (int, error) {
+	if tradeDate == "" {
+		return 0, fmt.Errorf("sector_flow_daily: empty trade_date")
+	}
+	var n int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM sector_flow_daily WHERE trade_date=?`, tradeDate).Scan(&n); err != nil {
+		return 0, fmt.Errorf("sector_flow_daily count: %w", err)
+	}
+	return n, nil
+}

@@ -348,12 +348,12 @@ func TestJudgeSellFlowWeightShortensWindow(t *testing.T) {
 func TestJudgeSellFlowWeightDisposalReason(t *testing.T) {
 	pol := Policy{Regime: flowRegime()}
 	c := New()
-	in := sellIn("600202", 9.3)
-	in.FlowRatio5D = -5 // 强出 → 12 分钟窗
+	in := sellIn("600202", 9.65) // −3.5%：减仓线（半平的那一档）
+	in.FlowRatio5D = -5          // 强出 → 12 分钟窗
 	if d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 0)); d != nil {
 		t.Fatalf("首触不应即卖，得 %+v", d)
 	}
-	// 12 分钟栅格结算点 10:06，无做多信号 → 处置（止损线首触未深破=半平）。
+	// 12 分钟栅格结算点 10:06，无做多信号 → 处置（减仓线=半平）。
 	d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 6))
 	if d == nil || d.Action != SellActionTrim {
 		t.Fatalf("窗结算应半平，得 %+v", d)

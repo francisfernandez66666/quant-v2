@@ -1299,8 +1299,20 @@ func (c QMTConfig) AnchorHardEnabled() bool {
 // 触发后进入固定观察窗（不滚动）：窗内持续有同向信号→跟随；窗结算仍无信号→离场。
 // 实盘与模拟盘统一严格执行；战法自带止盈止损降级为触发通知。
 type DisciplineConfig struct {
-	// 止损线（%）：浮亏达此值触发止损判定（默认 6）
+	// 止损线（%）：浮亏达此值触发止损判定（默认 6）。
+	// §STOP-LADDER（owner 2026-11-20 裁决）：本档是**清仓线**——窗结算无条件全平，
+	// 做多信号不得延持；减仓档见 ReducePct（默认 3）。
 	StopLossPct float64 `json:"stop_loss_pct"`
+	// ReducePct 减仓线（%）：浮亏达此值先减半仓（默认 3）。
+	// §STOP-LADDER（owner 2026-11-20 裁决：「3 个点减仓、6 个点清仓」，做多信号可压过**减仓**、
+	// 不压过清仓）：本档是阶梯的第一级，窗结算时若仍有新鲜做多信号则延持（信号强度压过减仓），
+	// 无信号才半平。必须严格轻于 StopLossPct——两线冲突（ReducePct ≥ StopLossPct）时本档不成立，
+	// 只走清仓线，宁可不清也不乱清。0 或缺键＝出厂默认 3（存量纪律快照没有该键，必须兜默认）。
+	// English: the trim step of the stop ladder (owner ruling 2026-11-20: trim at 3%, clear at 6%;
+	// a bull signal may override the trim but never the clear). Must be strictly lighter than
+	// StopLossPct — a conflicting pair disables this step entirely. Zero falls back to 3 because
+	// legacy per-account discipline snapshots lack the key.
+	ReducePct float64 `json:"reduce_pct"`
 	// 止盈线（%）：盈利达此值触发止盈判定（默认 15）
 	TakeProfitPct float64 `json:"take_profit_pct"`
 	// 移动止盈最大回撤（%）：突破止盈线后，按最高价-此值动态上移止盈点（默认 6）
@@ -5510,6 +5522,7 @@ var DefaultRules = &Rules{
 func DefaultDisciplineConfig() DisciplineConfig {
 	return DisciplineConfig{
 		StopLossPct:       6,
+		ReducePct:         3,
 		TakeProfitPct:     15,
 		MaxPullbackPct:    6,
 		DeepStopMult:      2,

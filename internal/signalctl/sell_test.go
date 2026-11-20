@@ -49,16 +49,17 @@ func stateOf(t *testing.T, c *Controller, code string) *sellState {
 	return s
 }
 
-// TestSellStopLossWindowSettleTrim 止损触线进入观察窗，窗结算无信号 → 半平（trim）。
+// TestSellReduceWindowSettleTrim §STOP-LADDER 第一级：减仓线（−3%）触线进入观察窗，
+// 窗结算无信号 → 半平（trim）；止损清仓线（−6%）则是整仓离场（见 TestSellStopLossWindowSettleClose）。
 // 09:30 锚定 15 分钟窗：10:00 首触 → 结算点 10:15。
-func TestSellStopLossWindowSettleTrim(t *testing.T) {
+func TestSellReduceWindowSettleTrim(t *testing.T) {
 	c := New()
-	in := sellIn("600001", 9.3) // -7% 触 −6 止损线
+	in := sellIn("600001", 9.65) // -3.5% 触 −3 减仓线（未到 −6 清仓线）
 	if d := judge(c, "600001", in, st(10, 0)); d != nil {
 		t.Fatalf("首触不应即卖，得 %+v", d)
 	}
 	s := stateOf(t, c, "600001")
-	if s.Line != SellLineStopLoss || !s.SettleStart.Equal(st(10, 15)) {
+	if s.Line != SellLineReduce || !s.SettleStart.Equal(st(10, 15)) {
 		t.Fatalf("首触锁定异常: %+v", s)
 	}
 	d := judge(c, "600001", in, st(10, 15))
@@ -75,6 +76,61 @@ func TestSellStopLossWindowSettleTrim(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("处置未留痕")
+	}
+}
+
+// TestSellStopLossWindowSettleClose §STOP-LADDER 第二级：清仓线（−6%）同样走观察窗（过滤插针），
+// 但窗结算**不看作多信号**——无条件整仓离场（owner 2026-11-20：信号强度可压过减仓，不压过清仓）。
+func TestSellStopLossWindowSettleClose(t *testing.T) {
+	c := New()
+	in := sellIn("600001c", 9.3) // -7% 触 −6 清仓线
+	if d := judge(c, "600001c", in, st(10, 0)); d != nil {
+		t.Fatalf("首触不应即卖，得 %+v", d)
+	}
+	if s := stateOf(t, c, "600001c"); s.Line != SellLineStopLoss || !s.SettleStart.Equal(st(10, 15)) {
+		t.Fatalf("清仓线首触锁定异常: %+v", s)
+	}
+	// 结算轮即使有新鲜做多信号也必须全平（这一档不给延持）。
+	inBull := in
+	inBull.Bull = freshBull(st(10, 15))
+	d := judge(c, "600001c", inBull, st(10, 15))
+	if d == nil || d.Action != SellActionClose || d.Line != SellLineStopLoss {
+		t.Fatalf("清仓线窗结算必须无条件全平，得 %+v", d)
+	}
+}
+
+// TestSellReduceDisabledWhenNotLighterThanStop §STOP-LADDER 两线冲突：减仓线必须**严格轻于**
+// 清仓线。撞线（reduce ≥ sl）时该档整个关掉（reduce=0），而不是夹成同一个数——半平与全平落在
+// 同一价位上，同一笔输入产出哪个动作就取决于 case 顺序（不可预测、不可复盘）。
+// 缺键/0 是另一件事：存量账号的纪律快照没有 reduce_pct，必须兜出厂默认 3（不是"关"）。
+func TestSellReduceDisabledWhenNotLighterThanStop(t *testing.T) {
+	cases := []struct {
+		name       string
+		reduce, sl float64
+		want       float64
+	}{
+		{"正常阶梯", 3, 6, 3},
+		{"撞线即关档", 6, 6, 0},
+		{"更重也关档", 8, 6, 0},
+		{"缺键兜默认", 0, 6, 3},
+	}
+	for _, c := range cases {
+		p := sellParamsOf(config.DisciplineConfig{ReducePct: c.reduce, StopLossPct: c.sl})
+		if p.reduce != c.want {
+			t.Fatalf("%s: reduce=%.2f（want %.2f）——半平/全平不许落在同一价位", c.name, p.reduce, c.want)
+		}
+	}
+	// 关档后的行为：−5% 既不到清仓线也不该有减仓档 ⇒ 不动作；−7% 走清仓线。
+	c := New()
+	pol := Policy{Discipline: config.DisciplineConfig{ReducePct: 6, StopLossPct: 6}}
+	if d := c.JudgeSell(ChannelLive, "u1", sellIn("600051", 9.5), pol, st(10, 0)); d != nil {
+		t.Fatalf("撞线关档后 −5%% 不该有任何处置，得 %+v", d)
+	}
+	if d := c.JudgeSell(ChannelLive, "u1", sellIn("600052", 9.3), pol, st(10, 0)); d != nil {
+		t.Fatalf("清仓线首触也不该即卖（仍走观察窗），得 %+v", d)
+	}
+	if s := stateOf(t, c, "600052"); s.Line != SellLineStopLoss {
+		t.Fatalf("−7%% 应锁清仓线（关档不等于关清仓），得 %v", s.Line)
 	}
 }
 
@@ -141,8 +197,8 @@ func TestSellBearSingleNoHardClear(t *testing.T) {
 		if d := judge(c, "600006", in, st(10, 0)); d != nil {
 			t.Fatalf("等级 %q 不应即时硬清，得 %+v", level, d)
 		}
-		// 窗结算：只有利空、没有做多 → 照常处置（trim），绝不因利空延持。
-		if d := judge(c, "600006", in, st(10, 15)); d == nil || d.Action != SellActionTrim {
+		// 窗结算：只有利空、没有做多 → 照常处置（清仓线=全平），绝不因利空延持。
+		if d := judge(c, "600006", in, st(10, 15)); d == nil || d.Action != SellActionClose {
 			t.Fatalf("等级 %q 窗结算应处置，得 %+v", level, d)
 		}
 	}
@@ -151,7 +207,7 @@ func TestSellBearSingleNoHardClear(t *testing.T) {
 // TestSellStaleBullNoExtend 边界⑥：做多信号超龄（默认 300s）按无信号，窗结算必处置。
 func TestSellStaleBullNoExtend(t *testing.T) {
 	c := New()
-	in := sellIn("600007", 9.3)
+	in := sellIn("600007", 9.65) // −3.5%：减仓线（可被做多信号延持的那一档）
 	if d := judge(c, "600007", in, st(10, 0)); d != nil {
 		t.Fatalf("首触不应处置，得 %+v", d)
 	}
@@ -164,10 +220,10 @@ func TestSellStaleBullNoExtend(t *testing.T) {
 	}
 	// 对照：同结算时刻，信号产出 10:11（4 分钟前 ≤ 5 分钟上限）→ 新鲜延持。
 	c2 := New()
-	if d := judge(c2, "600007b", sellIn("600007b", 9.3), st(10, 0)); d != nil {
+	if d := judge(c2, "600007b", sellIn("600007b", 9.65), st(10, 0)); d != nil {
 		t.Fatalf("对照轮首触不应处置，得 %+v", d)
 	}
-	in2 := sellIn("600007b", 9.3)
+	in2 := sellIn("600007b", 9.65)
 	in2.Bull = freshBull(st(10, 11))
 	if d := judge(c2, "600007b", in2, st(10, 15)); d != nil {
 		t.Fatalf("新鲜信号应延持，得 %+v", d)
@@ -178,7 +234,7 @@ func TestSellStaleBullNoExtend(t *testing.T) {
 // 下一格信号消失必须处置，绝不「一次延持永久失明」。
 func TestSellExtendThenSettleDisposes(t *testing.T) {
 	c := New()
-	in := sellIn("600008", 9.3)
+	in := sellIn("600008", 9.65)      // 减仓线：可被做多信号延持
 	judge(c, "600008", in, st(10, 0)) // 首触，结算点 10:15
 	// 10:15 结算遇新鲜做多 → 延持一格到 10:30。
 	in1 := in
@@ -202,7 +258,7 @@ func TestSellExtendThenSettleDisposes(t *testing.T) {
 // TestSellDeepBreachUnconditional 边界④：延持期跌破深破线（−12），窗结算无条件全平，无视做多信号。
 func TestSellDeepBreachUnconditional(t *testing.T) {
 	c := New()
-	in := sellIn("600009", 9.3)
+	in := sellIn("600009", 9.65) // 减仓线（可延持的那一档）
 	judge(c, "600009", in, st(10, 0))
 	inB := in
 	inB.Bull = freshBull(st(10, 15))
@@ -216,11 +272,11 @@ func TestSellDeepBreachUnconditional(t *testing.T) {
 	}
 	// 延持期利空升级双源 → 即时硬清同样生效（结算前当轮即拦）。
 	c2 := New()
-	judge(c2, "600010", sellIn("600010", 9.3), st(10, 0))
-	inHard := sellIn("600010", 9.3)
+	judge(c2, "600010", sellIn("600010", 9.65), st(10, 0))
+	inHard := sellIn("600010", 9.65)
 	inHard.Bull = freshBull(st(10, 15))
 	judge(c2, "600010", inHard, st(10, 15)) // 延持
-	bearNow := sellIn("600010", 9.0)
+	bearNow := sellIn("600010", 9.0)        // −10%：清仓线内 + 双源利空
 	bearNow.Bear = BearConfirm{Hit: true, Verified: BearVerifiedDual}
 	if d := judge(c2, "600010", bearNow, st(10, 20)); d == nil || d.Action != SellActionClose {
 		t.Fatalf("延持期触线+双源利空应即时硬清，得 %+v", d)
@@ -280,18 +336,18 @@ func TestSellTrailLine(t *testing.T) {
 // TestSellConfirmedReplay 已确认处置每轮重放（执行层幂等兜底），动作与首结论一致。
 func TestSellConfirmedReplay(t *testing.T) {
 	c := New()
-	in := sellIn("600013", 9.3)
+	in := sellIn("600013", 9.65)
 	judge(c, "600013", in, st(10, 0))
-	first := judge(c, "600013", in, st(10, 15)) // trim
+	first := judge(c, "600013", in, st(10, 15)) // trim（减仓线）
 	if first == nil {
 		t.Fatal("结算未出处置")
 	}
-	again := judge(c, "600013", sellIn("600013", 9.2), st(10, 20))
+	again := judge(c, "600013", sellIn("600013", 9.6), st(10, 20))
 	if again == nil || again.Action != SellActionTrim {
 		t.Fatalf("确认态重放应保持半平，得 %+v", again)
 	}
-	// 重放期间更深（−13% ≤ 深破）：已确认止损仍是 trim，深破只在未确认前升级线。
-	deep := judge(c, "600013", sellIn("600013", 8.7), st(10, 25))
+	// 重放期间更深（−12% ≤ 深破）：已确认的减仓仍是 trim，深破只在未确认前升级线。
+	deep := judge(c, "600013", sellIn("600013", 8.8), st(10, 25))
 	if deep == nil || deep.Action != SellActionTrim {
 		t.Fatalf("已确认处置不得被后续轮次改写，得 %+v", deep)
 	}
@@ -402,21 +458,21 @@ func TestSellPruneAndReset(t *testing.T) {
 func TestSellParamsFromConfig(t *testing.T) {
 	c := New()
 	pol := Policy{Discipline: config.DisciplineConfig{
-		StopLossPct: 3, TakeProfitPct: 8, MaxPullbackPct: 4, DeepStopMult: 3,
+		StopLossPct: 3, ReducePct: 1.5, TakeProfitPct: 8, MaxPullbackPct: 4, DeepStopMult: 3,
 		ExitConfirmMin: 30, TrailConfirmMin: 60, SellSignalMaxAgeSec: 60,
 	}}
-	// −5% 在自定义 −3 线下：触线。
-	if d := c.JudgeSell(ChannelLive, "u1", sellIn("600031", 9.5), pol, st(10, 0)); d != nil {
+	// −2.5% 落在自定义减仓线 −1.5%（未到清仓线 −3%）：触线。
+	if d := c.JudgeSell(ChannelLive, "u1", sellIn("600031", 9.75), pol, st(10, 0)); d != nil {
 		t.Fatalf("首触不应即卖，得 %+v", d)
 	}
 	// 信号产出已 5 分钟 > 60s 新鲜期 → 不延持，30 分钟窗（10:00→结算点 10:30）到点即判。
-	in := sellIn("600031", 9.5)
+	in := sellIn("600031", 9.75)
 	in.Bull = freshBull(st(10, 29))
 	if d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 34)); d == nil || d.Action != SellActionTrim {
 		t.Fatalf("超新鲜期信号不得延持（自定义 60s），得 %+v", d)
 	}
-	// 双源利空即时硬清在自定义 −3 线下同样生效。
-	in2 := sellIn("600032", 9.7) // −3% 触线
+	// 双源利空即时硬清在自定义清仓线 −3% 下同样生效。
+	in2 := sellIn("600032", 9.7) // −3% 触清仓线
 	in2.Bear = BearConfirm{Hit: true, Verified: BearVerifiedDual}
 	if d := c.JudgeSell(ChannelLive, "u1", in2, pol, st(10, 0)); d == nil || d.Action != SellActionClose {
 		t.Fatalf("自定义参数下双源利空应即时硬清，得 %+v", d)
@@ -441,12 +497,12 @@ func containsStr(s, sub string) bool {
 // decision ring; duplicate in-window rounds stay silent.
 func TestSellTransitionRecords(t *testing.T) {
 	c := New()
-	judge(c, "600041", sellIn("600041", 9.3), st(10, 0)) // 首触锁止损线 → hold ①
-	judge(c, "600041", sellIn("600041", 9.3), st(10, 5)) // 窗内重复轮 → 不留痕
-	ext := sellIn("600041", 9.3)
+	judge(c, "600041", sellIn("600041", 9.65), st(10, 0)) // 首触锁减仓线 → hold ①
+	judge(c, "600041", sellIn("600041", 9.65), st(10, 5)) // 窗内重复轮 → 不留痕
+	ext := sellIn("600041", 9.65)
 	ext.Bull = freshBull(st(10, 15))
-	judge(c, "600041", ext, st(10, 15))                   // 结算点延持 → hold ②
-	judge(c, "600041", sellIn("600041", 9.3), st(10, 30)) // 二次结算 trim → pass ③
+	judge(c, "600041", ext, st(10, 15))                    // 结算点延持 → hold ②
+	judge(c, "600041", sellIn("600041", 9.65), st(10, 30)) // 二次结算 trim → pass ③
 	var holds, passes int
 	for _, r := range c.Recent(20) {
 		if r.Stage != StageSell || r.Code != "600041" {

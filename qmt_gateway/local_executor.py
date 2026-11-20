@@ -103,7 +103,7 @@ PARAMS = {
     'break_down_kind': 'break_down',
     'breakdown_ratio': 0.96,
     'budget_mode': 'dynamic',
-    'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell'],
+    'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell', 'reduce_position'],
     'buy_confirm_min_gap_sec': 60,
     'buy_confirm_rounds': 2,
     'buy_room_guard': True,
@@ -413,6 +413,8 @@ PARAMS = {
     'pullback_ratio': 0.98,
     'quality_weight_clamp': [0.9, 1.1],
     'red_block_new_buy': False,
+    'reduce_position_fraction': 0.5,
+    'reduce_position_ratio': 0.97,
     'reprice_max_per_day': 2,
     'require_trading_day': True,
     'risk_list_dynamic': [],
@@ -426,7 +428,7 @@ PARAMS = {
     'sell_boost_level': 'L2',
     'session_gate_enabled': True,
     'session_windows': [['09:30', '11:30'], ['13:00', '14:52']],
-    'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP'},
+    'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP', 'reduce_position': 'RD'},
     'signal_gone_cancel_sec': 0,
     'single_stock_cap_pct': 35.0,
     'sizing_enabled': True,
@@ -435,7 +437,7 @@ PARAMS = {
     'sl_offset_risk_budget_keep': True,
     'stale_order_sec': 600,
     'state_scales': {'bear': 0.4, 'bull': 1, 'range': 0.7},
-    'stop_loss_ratio': 0.97,
+    'stop_loss_ratio': 0.94,
     'stoploss_guard_count': 4,
     'strategy_kind_to_go': {'dragon': 'dragon', 'double_bump': 'double_bump', 'dragon_return': 'dragon_return'},
     'symbol_head_len': 6,
@@ -993,7 +995,12 @@ def rule_take_profit(params, ctx):
 
 
 def rule_stop_loss(params, ctx):
-    """P0 stop-loss signal for a held position."""
+    """P0 stop-loss signal for a held position (the CLEAR step of the ladder).
+
+    STOP-LADDER 2026-11-20 (owner): this leg is the -6% clear-out line and it
+    closes the WHOLE position, unconditionally -- no bull signal may defer it
+    (signal strength outranks the trim step only, see rule_reduce_position).
+    """
     if not ctx.get("trading_day"):
         return None
     last = ctx.get("last_price")
@@ -1004,6 +1011,36 @@ def rule_stop_loss(params, ctx):
     if last > cost * params["stop_loss_ratio"]:
         return None
     return make_signal(params, ctx, "stop_loss", "sell", None, last, qty=qty)
+
+
+def rule_reduce_position(params, ctx):
+    """P0 trim signal: the FIRST step of the stop ladder (default -3%).
+
+    Owner ruling 2026-11-20: "3 points trim, 6 points clear". This leg sells
+    `reduce_position_fraction` of the position (whole lots only, floor); the
+    clear-out leg is rule_stop_loss. The caller skips this step when a fresh
+    bull signal is present (signal strength outranks the trim, never the
+    clear) -- that decision belongs to the round loop because "hold instead
+    of trim" is a round-level outcome, not a per-rule one.
+
+    Returns None when the remaining qty would not make a whole lot: a
+    position too small to halve stays with the clear-out leg rather than
+    paying a fee to sell nothing.
+    """
+    if not ctx.get("trading_day"):
+        return None
+    last = ctx.get("last_price")
+    cost = ctx.get("position_cost")
+    qty = ctx.get("position_qty")
+    if last is None or cost is None or not qty:
+        return None
+    if last > cost * params["reduce_position_ratio"]:
+        return None
+    lot = params["lot_size"]
+    trimmed = (int(int(qty) * params["reduce_position_fraction"]) // lot) * lot
+    if not trimmed:
+        return None
+    return make_signal(params, ctx, "reduce_position", "sell", None, last, qty=trimmed)
 
 
 def rule_breakdown_sell(params, ctx):

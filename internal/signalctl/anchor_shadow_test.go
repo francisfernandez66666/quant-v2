@@ -17,6 +17,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"quant-trading-v2/internal/config"
 )
 
 // TestCompareAnchorShiftedBasis 高位加仓的标准形态：成本 15.05 / 锚点 10.05 / 高点 14 / 现价 14。
@@ -175,6 +177,33 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatalf("序列化: %v", err)
 	}
 	return string(raw)
+}
+
+// TestCompareAnchorReduceLadder §STOP-LADDER：影子对照表必须同时给出**减仓线**价位与阈值，
+// 否则 owner 签认时只看到"清仓价"，看不到"先在哪一档减半"——而那正是这批改动的行为差。
+// 两个基准各算一遍（成本 / 首买锚），并锁住"两线冲突时该档留 0＝算不出来，不伪造"。
+func TestCompareAnchorReduceLadder(t *testing.T) {
+	in := SellInput{Code: "600519.SH", EntryPrice: 15.05, AnchorPrice: 10.05, HighPrice: 14, CurPrice: 14}
+	row := CompareAnchor(in, Policy{}, "live")
+	if row.ReducePct != 3 {
+		t.Fatalf("减仓线阈值应随行带出 3，实际 %v（读表的人不该再去猜用的是哪套纪律）", row.ReducePct)
+	}
+	if absDiff(row.ReducePriceByCost, 15.05*0.97) > 1e-9 {
+		t.Fatalf("成本侧减仓价应为 15.05×0.97，实际 %.4f", row.ReducePriceByCost)
+	}
+	if absDiff(row.ReducePriceByAnchor, 10.05*0.97) > 1e-9 {
+		t.Fatalf("锚点侧减仓价应为 10.05×0.97，实际 %.4f", row.ReducePriceByAnchor)
+	}
+	// 判线口径：−3.5% 落在减仓线（不是止损线，也不是"未触线"）。
+	if line := anchorLineAt(15.05, 15.05*0.965, 15.05, sellParamsOf(config.DisciplineConfig{})); line != SellLineReduce {
+		t.Fatalf("−3.5%% 应判减仓线，实际 %v", line)
+	}
+	// 两线冲突（ReducePct ≥ StopLossPct）⇒ 该档不成立：价位留 0（"算不出来"），阈值回 0。
+	row2 := CompareAnchor(in, Policy{Discipline: config.DisciplineConfig{ReducePct: 6, StopLossPct: 6}}, "live")
+	if row2.ReducePct != 0 || row2.ReducePriceByCost != 0 || row2.ReducePriceByAnchor != 0 {
+		t.Fatalf("撞线关档后不该给减仓价（留 0 表示算不出来），实际 pct=%v cost=%v anchor=%v",
+			row2.ReducePct, row2.ReducePriceByCost, row2.ReducePriceByAnchor)
+	}
 }
 
 func absDiff(a, b float64) float64 {

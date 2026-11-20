@@ -17,6 +17,7 @@ import { PriceCell, PctCell } from '../components/priceFormat.jsx' // §C7 行�
 import ExternalBrainTag from '../components/ExternalBrainTag.jsx' // §EXT-BRAIN-1104 外脑档位（还有没有手）
 import CarrierUpdatePanel from '../components/CarrierUpdatePanel.jsx' // §CARRIER-UPDATE 载体期望版/回执/人工触发
 import CarrierShadowPanel from '../components/CarrierShadowPanel.jsx' // §CARRIER-SHADOW 移植规则与引擎的按日对照（纯读数）
+import FlowFactorCard from '../components/FlowFactorCard.jsx' // §FLOW-QUADRANT 云端净流入 + 量能读数（纯读数）
 import { canLiveTrading } from '../utils/perm.js'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
@@ -403,6 +404,13 @@ export default function Dashboard() {
 
       {/* §Dashboard 情绪面板 A：当前相位徽章 + 30 日色带 + 涨停/连板/建议仓位三指标 */}
       <SentimentCard />
+
+      {/* §FLOW-QUADRANT（2026-11-20）：市场级净流入与量能读数。
+          数据来自 GET /api/status 的 flow 键（不新开路由，Dashboard 本就每 60s 拉一次）。
+          缺数由组件自己显示「弃权」——这里不兜底、不补 0，避免把未读数画成中性。 */}
+      <div style={{ marginBottom: 16 }}>
+        <FlowFactorCard flow={status.flow} />
+      </div>
 
       {/* 核心指标卡：强信号/观察中/静默/监控个股数量一目了然 */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>

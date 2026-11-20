@@ -25,7 +25,7 @@ func dtime(day, h, m int) time.Time {
 
 func TestW3cSameDayReplayStillWorks(t *testing.T) {
 	c := New()
-	in := sellIn("600031", 9.3) // -7% 触止损线
+	in := sellIn("600031", 9.65) // -3.5% 触减仓线（半平那一档）
 	if d := judge(c, "600031", in, dtime(21, 10, 0)); d != nil {
 		t.Fatalf("首触不应即卖：%+v", d)
 	}
@@ -42,7 +42,7 @@ func TestW3cSameDayReplayStillWorks(t *testing.T) {
 
 func TestW3cCrossDayConfirmationIsNotReplayed(t *testing.T) {
 	c := New()
-	in := sellIn("600032", 9.3)
+	in := sellIn("600032", 9.65)
 	judge(c, "600032", in, dtime(21, 10, 0))
 	if d := judge(c, "600032", in, dtime(21, 10, 15)); d == nil {
 		t.Fatal("前置：首日窗结算必须已确认")
@@ -58,7 +58,7 @@ func TestW3cCrossDayConfirmationIsNotReplayed(t *testing.T) {
 	}
 	// 复位即重裁：价格仍触线 → 重新锁线开窗（不裸奔、不再信旧结论）
 	s2 := stateOf(t, c, "600032")
-	if s2.Confirmed || s2.Settled || !s2.ConfirmedAt.IsZero() || s2.Line != SellLineStopLoss {
+	if s2.Confirmed || s2.Settled || !s2.ConfirmedAt.IsZero() || s2.Line != SellLineReduce {
 		t.Fatalf("过期确认后状态机应复位并重锁新线，实得 %+v", s2)
 	}
 	if s2.SettleStart.IsZero() || cntime.DayOf(s2.SettleStart) != "2026-09-22" {

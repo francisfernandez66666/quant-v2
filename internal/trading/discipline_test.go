@@ -22,24 +22,40 @@ func at(day, hh, mm int) time.Time {
 	return time.Date(2026, 9, 7, hh, mm, 0, 0, cntime.Loc)
 }
 
-// TestProbeStopLossWindow 跌穿止损线 → 进入观察窗；窗结算仍无信号 → 止损离场（不滚动）。
+// TestProbeStopLossWindow §STOP-LADDER 阶梯：减仓线（−3%）首触 → 观察窗；窗结算无信号 → 减半仓 trim。
+// 清仓线（−6%）那条见 TestProbeStopLossClearLineClose（做多信号不延持，整仓离场）。
 func TestProbeStopLossWindow(t *testing.T) {
 	cfg := testCfg()
 	entry := 100.0
-	// 首次探针：价格 94（-6%），触及止损线 → 锁定观察窗。
-	st, d := probeDiscipline(nil, "600000", entry, 100, 94, false, false, at(2026, 10, 30), cfg)
-	if st.Line != LineStopLoss || d == nil || d.Action != ActionConfirm {
-		t.Fatalf("首触止损线应进入观察窗, got line=%v action=%v", st.Line, d)
+	// 首次探针：价格 96.5（-3.5%），触及减仓线 → 锁定观察窗。
+	st, d := probeDiscipline(nil, "600000", entry, 100, 96.5, false, false, at(2026, 10, 30), cfg)
+	if st.Line != LineReduce || d == nil || d.Action != ActionConfirm {
+		t.Fatalf("首触减仓线应进入观察窗, got line=%v action=%v", st.Line, d)
 	}
 	// 窗口期内探针：仍在窗口，无信号 → 持续等待（未到结算点）。
-	_, d = probeDiscipline(&st, "600000", entry, 94, 94.5, false, false, at(2026, 10, 35), cfg)
+	_, d = probeDiscipline(&st, "600000", entry, 96.5, 96.6, false, false, at(2026, 10, 35), cfg)
 	if d != nil && d.Action == ActionClose {
 		t.Fatalf("窗口期未到结算点不应离场")
 	}
-	// 到结算点仍无信号 → 止损离场（未深破 → 减半仓 trim）。
-	_, d = probeDiscipline(&st, "600000", entry, 94.5, 93, false, false, at(2026, 10, 45), cfg)
+	// 到结算点仍无信号 → 减半仓（减仓线是阶梯第一级，只有这一档是半平）。
+	_, d = probeDiscipline(&st, "600000", entry, 96.6, 96.2, false, false, at(2026, 10, 45), cfg)
 	if d == nil || d.Action != ActionTrim {
 		t.Fatalf("窗结算无信号应减半仓止损离场, got %+v", d)
+	}
+}
+
+// TestProbeStopLossClearLineClose §STOP-LADDER 第二级：清仓线（−6%）窗结算整仓离场，
+// 且做多信号不得延持（owner 2026-11-20：信号强度可压过减仓，不压过清仓）。
+func TestProbeStopLossClearLineClose(t *testing.T) {
+	cfg := testCfg()
+	st, d := probeDiscipline(nil, "600001", 100, 100, 94, false, false, at(2026, 10, 30), cfg)
+	if st.Line != LineStopLoss || d == nil || d.Action != ActionConfirm {
+		t.Fatalf("首触清仓线应进入观察窗, got line=%v action=%v", st.Line, d)
+	}
+	// 结算轮即使有新鲜做多信号也全平（这一档没有延持）。
+	_, d = probeDiscipline(&st, "600001", 100, 94, 93, true, false, at(2026, 10, 45), cfg)
+	if d == nil || d.Action != ActionClose || d.Line != LineStopLoss {
+		t.Fatalf("清仓线窗结算必须无条件全平, got %+v", d)
 	}
 }
 

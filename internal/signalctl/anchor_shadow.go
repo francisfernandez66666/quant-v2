@@ -9,7 +9,7 @@
 // 因此本文件只做一件事：**同一笔持仓，用两个基准各算一遍线位，把差异列出来**。
 // 它不参与任何处置（sellProbe 一行都没读 AnchorPrice），也不写任何账。
 //
-// 判线口径与 sellProbe ② 分支同阈值、同顺序（深破 → 止损 → 止盈 → 移动止盈），但刻意**不含**
+// 判线口径与 sellProbe ② 分支同阈值、同顺序（深破 → 清仓 → 减仓 → 止盈 → 移动止盈），但刻意**不含**
 // 状态机那三条腿：观察窗/结算栅格、做多新鲜度延持、利空双源即时硬清。原因是这三条由跨轮状态
 // 决定，无状态复现它们只会造出一份"看起来更完整、实际对不上内核"的表。表上标注的是
 // 「本轮价格落在线的哪一侧」，正是切硬后每天第一个会变的量。
@@ -40,17 +40,20 @@ type AnchorShadowRow struct {
 
 	// ── 阈值（本账号生效纪律，两侧同一套，差别只在分母） ──
 	StopLossPct   float64 `json:"stop_loss_pct"`
+	ReducePct     float64 `json:"reduce_pct"` // §STOP-LADDER 减仓线（0=该档不成立）
 	TakeProfitPct float64 `json:"take_profit_pct"`
 	PullbackPct   float64 `json:"pullback_pct"`
 	DeepMult      float64 `json:"deep_mult"`
 
 	// ── 线位（价位）：切硬后每条线会挪到这里 ──
-	StopPriceByCost   float64 `json:"stop_price_by_cost"`
-	StopPriceByAnchor float64 `json:"stop_price_by_anchor"`
-	DeepPriceByCost   float64 `json:"deep_price_by_cost"`
-	DeepPriceByAnchor float64 `json:"deep_price_by_anchor"`
-	TakePriceByCost   float64 `json:"take_price_by_cost"`
-	TakePriceByAnchor float64 `json:"take_price_by_anchor"`
+	StopPriceByCost     float64 `json:"stop_price_by_cost"`
+	StopPriceByAnchor   float64 `json:"stop_price_by_anchor"`
+	ReducePriceByCost   float64 `json:"reduce_price_by_cost"` // §STOP-LADDER 减仓线价位
+	ReducePriceByAnchor float64 `json:"reduce_price_by_anchor"`
+	DeepPriceByCost     float64 `json:"deep_price_by_cost"`
+	DeepPriceByAnchor   float64 `json:"deep_price_by_anchor"`
+	TakePriceByCost     float64 `json:"take_price_by_cost"`
+	TakePriceByAnchor   float64 `json:"take_price_by_anchor"`
 
 	// ── 触线判定与资格（无状态口径，不含观察窗/延持/利空硬清） ──
 	// 判线用中文名而非枚举数字：这张表是给人签认的（Q10），`"line_by_cost": 1` 要对着源码才知道
@@ -80,6 +83,8 @@ func anchorLineAt(basis, cur, high float64, p sellParams) SellLine {
 		return SellLineDeepBreach
 	case pnl <= -p.sl:
 		return SellLineStopLoss
+	case p.reduce > 0 && pnl <= -p.reduce:
+		return SellLineReduce // §STOP-LADDER 减仓线（−3%）：与内核 ② 同阈值、同顺序
 	case pnl >= p.tp:
 		// 内核在这一支里还会先看 bullLive（有活跃做多信号则延持不下单），表只记线位。
 		if high > 0 && (high-cur)/high*100 >= p.pb {
@@ -129,6 +134,7 @@ func CompareAnchor(in SellInput, pol Policy, book string) AnchorShadowRow {
 		// 阈值回显：签认的人必须能在同一行看到"这条线是按哪套阈值算的"，
 		// 否则线位移动多少无从复核（阈值来自本账号生效纪律，两侧同一套）。
 		StopLossPct:   p.sl,
+		ReducePct:     p.reduce,
 		TakeProfitPct: p.tp,
 		PullbackPct:   p.pb,
 		DeepMult:      p.dm,
@@ -138,10 +144,14 @@ func CompareAnchor(in SellInput, pol Policy, book string) AnchorShadowRow {
 		row.ShiftPct = (in.AnchorPrice - in.EntryPrice) / in.EntryPrice * 100
 	}
 	// 线位：锚点未知时 ByAnchor 一侧留 0（不是"和成本一样"，是"算不出来"）。
+	// §STOP-LADDER 减仓线价位也一并在两侧各算一遍，owner 签认时能看到"哪一档先命中"。
 	if in.EntryPrice > 0 {
 		row.StopPriceByCost = in.EntryPrice * (1 - p.sl/100)
 		row.DeepPriceByCost = in.EntryPrice * (1 - p.sl*p.dm/100)
 		row.TakePriceByCost = in.EntryPrice * (1 + p.tp/100)
+		if p.reduce > 0 { // §STOP-LADDER 减仓线价位（该档不成立时留 0＝算不出来，不伪造）
+			row.ReducePriceByCost = in.EntryPrice * (1 - p.reduce/100)
+		}
 		row.TrailReadyByCost = anchorTrailReady(in.EntryPrice, in.HighPrice)
 		row.LineByCost = anchorLineAt(in.EntryPrice, in.CurPrice, high, p).String()
 		if in.CurPrice > 0 {
@@ -149,9 +159,13 @@ func CompareAnchor(in SellInput, pol Policy, book string) AnchorShadowRow {
 		}
 	}
 	if in.AnchorPrice > 0 {
+		// 锚点侧同一套线位（分母换成首买价）；减仓线只在生效时才写，留 0＝算不出来。
 		row.StopPriceByAnchor = in.AnchorPrice * (1 - p.sl/100)
 		row.DeepPriceByAnchor = in.AnchorPrice * (1 - p.sl*p.dm/100)
 		row.TakePriceByAnchor = in.AnchorPrice * (1 + p.tp/100)
+		if p.reduce > 0 {
+			row.ReducePriceByAnchor = in.AnchorPrice * (1 - p.reduce/100)
+		}
 		row.TrailReadyByAnchor = anchorTrailReady(in.AnchorPrice, in.HighPrice)
 		// 高点的回退基准仍取成本（账本里的 historical high 与成本同源播种），避免把
 		// "锚点未知时的高点口径"再造一个第三种说法。

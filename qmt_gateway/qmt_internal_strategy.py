@@ -3756,19 +3756,35 @@ def run_round(ContextInfo, moment):
     for symbol in symbols:
         ctx = build_context(ContextInfo, symbol, moment, orders, positions, cash)
         signals = []
+        # STOP-LADDER 2026-11-20 (owner): -3% trims half, -6% clears the whole
+        # position. Order is the risk order: take-profit, clear-out (stop_loss),
+        # breakdown, then the trim step. The trim is the ONLY step a fresh bull
+        # signal may override ("signal strength outranks the trim, never the
+        # clear"), and the override is a round-level HOLD: this symbol is
+        # neither trimmed nor added to this round -- which also keeps the
+        # pre-existing rule that a name down past the first ladder step never
+        # gets bought into on the same round.
+        bull = rule_pullback_buy(PARAMS, ctx)
         for rule in (rule_take_profit, rule_stop_loss, rule_breakdown_sell):
             hit = rule(PARAMS, ctx)
             if hit:
                 signals = [(hit, "live")]
                 break
         if not signals:
-            hit = rule_pullback_buy(PARAMS, ctx)
+            hit = rule_reduce_position(PARAMS, ctx)
             if hit:
-                signals = [(hit, "live")]
+                if bull:
+                    summary["skipped"].append({"short": hit["short_code"],
+                                               "reason": "rule_bull_override"})
+                    bull = None
+                else:
+                    signals = [(hit, "live")]
+        if not signals and bull:
+            signals = [(bull, "live")]
         if not signals:
             # Ported rules only get a turn when nothing live fired: the builtin
-            # four ARE today's behaviour, and a ported rule must not pre-empt
-            # them on the day it is armed.
+            # set IS today's behaviour, and a ported rule must not pre-empt it
+            # on the day it is armed.
             for kind in sorted(_PORTED_RULES):
                 fn, _src = _PORTED_RULES[kind]
                 try:

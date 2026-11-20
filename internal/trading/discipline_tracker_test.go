@@ -24,14 +24,14 @@ func trackerInput(positions []store.RealPosition, quotes map[string]*data.StockI
 	}
 }
 
-// TestTrackerStopLossWindowAndPrune 止损线 -6% → 首探针进入观察窗（持有/低，阻止加仓）；
+// TestTrackerStopLossWindowAndPrune 减仓线 -3% → 首探针进入观察窗（持有/低，阻止加仓）；
 // 窗结算仍无利空信号 → 减仓（半平，Source=discipline）；已平仓代码状态清理（重入从零开始）。
 func TestTrackerStopLossWindowAndPrune(t *testing.T) {
 	cfg := config.DefaultDisciplineConfig()
 	tr := NewDisciplineTracker()
 	pos := store.RealPosition{TsCode: "600000.SH", Name: "浦发", Qty: 1000, CostPrice: 100, HighestPrice: 100, Strategy: "龙头"}
 
-	quotes := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 94}} // -6%
+	quotes := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 96.5}} // -3.5% 减仓线
 	in := trackerInput([]store.RealPosition{pos}, quotes, nil, nil)
 	// 首探针：触及止损线 → 观察窗，产出 持有/低（阻止加仓/格局）。
 	advs := tr.ProbeAll(in, cfg)
@@ -42,16 +42,16 @@ func TestTrackerStopLossWindowAndPrune(t *testing.T) {
 	// 模拟时间推进到结算点 10:45（对齐 15min 边界）：仍无利空信号 → 减半仓止损离场。
 	// 通过直接改状态机的 FirstTouch/SettleStart 模拟（窗口逻辑本身由 discipline_test 覆盖）。
 	st := tr.states["600000"]
-	if st == nil || st.Line != LineStopLoss {
-		t.Fatalf("应已进入止损观察窗, got %+v", st)
+	if st == nil || st.Line != LineReduce {
+		t.Fatalf("应已进入减仓观察窗, got %+v", st)
 	}
 	st.SettleStart = at(2026, 10, 45) // 结算点置为已到
 	advs = tr.ProbeAll(in, cfg)
 	if len(advs) != 1 || advs[0].Action != "减仓" || advs[0].Level != "高" {
 		t.Fatalf("止损窗结算无信号应减仓半平, got %+v", advs)
 	}
-	if advs[0].RefPrice != 94 {
-		t.Fatalf("减仓建议 RefPrice 应为现价 94, got %.2f", advs[0].RefPrice)
+	if advs[0].RefPrice != 96.5 {
+		t.Fatalf("减仓建议 RefPrice 应为现价 96.5, got %.2f", advs[0].RefPrice)
 	}
 
 	// 持仓清空 → 状态清理（重入从零开始）。
@@ -96,7 +96,7 @@ func TestTrackerTimeWarpRealProbe(t *testing.T) {
 	cfg := config.DefaultDisciplineConfig()
 	tr := NewDisciplineTracker()
 	pos := store.RealPosition{TsCode: "600000.SH", Name: "浦发", Qty: 1000, CostPrice: 100, HighestPrice: 100}
-	quotes := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 94}}
+	quotes := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 96.5}} // -3.5% 减仓线
 	in := trackerInput([]store.RealPosition{pos}, quotes, nil, nil)
 	// 首探针：实时 now → 观察窗（ActionConfirm）。
 	advs := tr.ProbeAll(in, cfg)

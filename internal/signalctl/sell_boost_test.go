@@ -225,7 +225,7 @@ func TestSellBoostHalvesWindow(t *testing.T) {
 	pol := boostPol(r)
 
 	c := New()
-	in := sellIn("600101", 9.3) // -7% 触 −6 止损线
+	in := sellIn("600101", 9.65) // -3.5% 触 −3 减仓线
 	if d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 0)); d != nil {
 		t.Fatalf("首触不应即卖，得 %+v", d)
 	}
@@ -254,7 +254,7 @@ func TestSellBoostCancelsExtension(t *testing.T) {
 	pol := boostPol(r)
 
 	c := New()
-	in := sellIn("600102", 9.3)
+	in := sellIn("600102", 9.65) // -3.5% 触减仓线
 	if d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 0)); d != nil {
 		t.Fatalf("首触不应处置，得 %+v", d)
 	}
@@ -262,7 +262,7 @@ func TestSellBoostCancelsExtension(t *testing.T) {
 	in.Bull = freshBull(st(10, 5))
 	d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 5))
 	if d == nil || d.Action != SellActionTrim {
-		t.Fatalf("加权态应取消延持直接处置（止损线=半平），得 %+v", d)
+		t.Fatalf("加权态应取消延持直接处置（减仓线=半平），得 %+v", d)
 	}
 	if !strings.Contains(d.Reason, "卖出加权") || !strings.Contains(d.Reason, "取消延持") {
 		t.Fatalf("理由须可归因（含加权取消延持），得 %q", d.Reason)
@@ -278,7 +278,7 @@ func TestSellBoostCancelsExtension(t *testing.T) {
 	if d := c2.JudgeSell(ChannelLive, "u1", in, Policy{}, st(10, 0)); d != nil {
 		t.Fatalf("首触不应处置，得 %+v", d)
 	}
-	in2 := sellIn("600102", 9.3)
+	in2 := sellIn("600102", 9.65)
 	in2.Bull = freshBull(st(10, 15))
 	if d := c2.JudgeSell(ChannelLive, "u1", in2, Policy{}, st(10, 15)); d != nil {
 		t.Fatalf("未加权应延持，得 %+v", d)
@@ -331,7 +331,7 @@ func TestSellBoostL1KeepsKernelIntact(t *testing.T) {
 	pol := boostPol(r)
 
 	c := New()
-	in := sellIn("600104", 9.3)
+	in := sellIn("600104", 9.65)
 	if d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 0)); d != nil {
 		t.Fatalf("首触不应处置，得 %+v", d)
 	}
@@ -438,8 +438,8 @@ func nan() float64 { return math.NaN() }
 
 // ── 7. L3：trim→close 升级（owner 2026-10-16 授权） ──────────────────────────────
 
-// TestSellBoostL3EscalatesTrimToClose L3 核心锁：止损首触窗结算（无信号）由半平**升级为全平**
-// （trim→close）——"严买入宽卖出"的最高档，首触止损即整仓离场，不留半仓暴露。同输入在 L2 下
+// TestSellBoostL3EscalatesTrimToClose L3 核心锁：减仓线首触窗结算（无信号）由半平**升级为全平**
+// （trim→close）——"严买入宽卖出"的最高档，首触减仓线即整仓离场，不留半仓暴露。同输入在 L2 下
 // 必须仍是半平：两档共享判定面，只有 L3 加码（SellBoostEscalatesTrim 只对 L3 为真）。
 func TestSellBoostL3EscalatesTrimToClose(t *testing.T) {
 	r := boostL3Regime()
@@ -447,14 +447,14 @@ func TestSellBoostL3EscalatesTrimToClose(t *testing.T) {
 	pol := boostPol(r)
 
 	c := New()
-	in := sellIn("600201", 9.3) // -7% 触 −6 止损线
+	in := sellIn("600201", 9.65) // -3.5% 触 −3 减仓线（L3 升级那一档）
 	if d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 0)); d != nil {
 		t.Fatalf("首触不应处置，得 %+v", d)
 	}
 	// L2+ 观察窗减半（15→7 分钟）→ 10:05 栅格点结算，无信号 → 处置。
 	d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 5))
 	if d == nil || d.Action != SellActionClose {
-		t.Fatalf("L3 应把首触止损半平升级为全平，得 %+v", d)
+		t.Fatalf("L3 应把首触减仓半平升级为全平，得 %+v", d)
 	}
 	if !strings.Contains(d.Reason, "trim→close") || !strings.Contains(d.Reason, "L3卖出加权") {
 		t.Fatalf("理由须可归因（trim→close + 档位前缀），得 %q", d.Reason)
@@ -484,7 +484,7 @@ func TestSellBoostL3EscalatesUnderNoExtend(t *testing.T) {
 	pol := boostPol(r)
 
 	c := New()
-	in := sellIn("600202", 9.3)
+	in := sellIn("600202", 9.65)
 	if d := c.JudgeSell(ChannelLive, "u1", in, pol, st(10, 0)); d != nil {
 		t.Fatalf("首触不应处置，得 %+v", d)
 	}
@@ -504,8 +504,8 @@ func TestSellBoostL3EscalatesUnderNoExtend(t *testing.T) {
 	r2 := boostRegime() // L2
 	r2.RiskTier = combat_agent.RiskTierRed
 	c2 := New()
-	c2.JudgeSell(ChannelLive, "u1", sellIn("600202", 9.3), boostPol(r2), st(10, 0))
-	in2 := sellIn("600202", 9.3)
+	c2.JudgeSell(ChannelLive, "u1", sellIn("600202", 9.65), boostPol(r2), st(10, 0))
+	in2 := sellIn("600202", 9.65)
 	in2.Bull = freshBull(st(10, 5))
 	d2 := c2.JudgeSell(ChannelLive, "u1", in2, boostPol(r2), st(10, 5))
 	if d2 == nil || d2.Action != SellActionTrim {
@@ -522,7 +522,7 @@ func TestSellBoostL3ReplayKeepsFrozenAction(t *testing.T) {
 	l2.RiskTier = combat_agent.RiskTierYellow
 
 	c := New()
-	in := sellIn("600203", 9.3)
+	in := sellIn("600203", 9.65)
 	c.JudgeSell(ChannelLive, "u1", in, boostPol(l2), st(10, 0))
 	d1 := c.JudgeSell(ChannelLive, "u1", in, boostPol(l2), st(10, 5))
 	if d1 == nil || d1.Action != SellActionTrim {
@@ -540,17 +540,17 @@ func TestSellBoostL3ReplayKeepsFrozenAction(t *testing.T) {
 	l3 := boostL3Regime()
 	l3.RiskTier = combat_agent.RiskTierYellow
 	c2 := New()
-	c2.JudgeSell(ChannelLive, "u1", sellIn("600204", 9.3), boostPol(l3), st(10, 0))
-	if d := c2.JudgeSell(ChannelLive, "u1", sellIn("600204", 9.3), boostPol(l3), st(10, 5)); d == nil || d.Action != SellActionClose {
+	c2.JudgeSell(ChannelLive, "u1", sellIn("600204", 9.65), boostPol(l3), st(10, 0))
+	if d := c2.JudgeSell(ChannelLive, "u1", sellIn("600204", 9.65), boostPol(l3), st(10, 5)); d == nil || d.Action != SellActionClose {
 		t.Fatalf("L3 下应确认全平，得 %+v", d)
 	}
-	d3 := c2.JudgeSell(ChannelLive, "u1", sellIn("600204", 9.3), boostPol(boostRegime()), st(10, 10))
+	d3 := c2.JudgeSell(ChannelLive, "u1", sellIn("600204", 9.65), boostPol(boostRegime()), st(10, 10))
 	if d3 == nil || d3.Action != SellActionClose {
 		t.Fatalf("L3 确认的全平不因热切回 L2 而降级，得 %+v", d3)
 	}
 }
 
-// TestSellBoostL3ProfitLinesUnaffected L3 只升级"止损半平"这一条：止盈/移动止盈/深破的基准
+// TestSellBoostL3ProfitLinesUnaffected L3 只升级"减仓半平"这一条：止盈/移动止盈/深破的基准
 // 动作本来就是全平，加权不得改变它们（升级轴是单点的，不是"什么都往大改"）。
 func TestSellBoostL3ProfitLinesUnaffected(t *testing.T) {
 	r := boostL3Regime()

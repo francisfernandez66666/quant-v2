@@ -47,6 +47,8 @@
     "order_amount_cap": 20000.0,
     "poll_interval_sec": 5,
     "pullback_ratio": 0.98,
+    "reduce_position_fraction": 0.5,
+    "reduce_position_ratio": 0.97,
     "session_windows": [
       [
         "09:30",
@@ -75,10 +77,11 @@
       "pattern_template": "PT",
       "pullback_buy": "PB",
       "stop_loss": "SL",
-      "take_profit": "TP"
+      "take_profit": "TP",
+      "reduce_position": "RD"
     },
     "stale_order_sec": 600,
-    "stop_loss_ratio": 0.97,
+    "stop_loss_ratio": 0.94,
     "symbol_head_len": 6,
     "symbols": [
       "000417.SZ",
@@ -185,7 +188,8 @@
       "pullback_buy",
       "take_profit",
       "stop_loss",
-      "breakdown_sell"
+      "breakdown_sell",
+      "reduce_position"
     ],
     "ported_modules": [
       "rules_form",
@@ -2064,8 +2068,8 @@
     "flow_snapshot_ttl_sec": 2700
   },
   "strategy_version": "v16-20261111",
-  "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the four builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",
-  "_comment_ported_modules": "Names of the ported rule modules the builder must inline (rules_form/rules_ladder/rules_factor/rules_t/rules_sizing). Empty list = only the builtin four, i.e. today's behaviour. A name listed here whose file is missing, or whose registered kind has no short code in signal_codes, fails the build rather than publishing a smaller rule set.",
+  "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",
+  "_comment_ported_modules": "Names of the ported rule modules the builder must inline (rules_form/rules_ladder/rules_factor/rules_t/rules_sizing). Empty list = only the builtin set, i.e. today's behaviour. A name listed here whose file is missing, or whose registered kind has no short code in signal_codes, fails the build rather than publishing a smaller rule set.",
   "_comment_signal_codes_added": "\u7531 tools \u4e00\u6b21\u6027\u6309\u6a21\u5757 RULES \u8868\u751f\u6210\uff08\u77ed\u7801\u552f\u4e00\u6027\u5f53\u573a\u5224\uff09\uff0crule_arm \u5bf9\u65b0\u79fb\u690d\u89c4\u5219\u7f3a\u7701 shadow\uff1aP1 \u9608\u503c\u5fc5\u987b\u5148\u4e0e\u5f15\u64ce\u5bf9\u7167 >=5 \u4ea4\u6613\u65e5\u3002",
   "_comment_derived": "Written by scripts/derive_carrier_params.py --write. Three sources, in priority order: (1) the Go factory defaults, printed by cmd/derive_carrier_params and listed by --emit-derived-keys -- never hand-edit those, change the Go default and re-run; (2) aliases (t_direction_mode, the T-side window copies, breadth_missing_default) which rename an existing key and must never carry their own number; (3) qmt_gateway/rules_sizing.py SIZING_DEFAULTS rows for knobs the Go side has not exported a readout for yet -- each is registered with a reason in the script, and --check compares every overlapping row against Go. A key in none of the three is reported as DERIVE_UNHOUSED rather than quietly defaulted.",
   "_comment_universe": "params.symbols is the carrier's observation universe. Landed by scripts/derive_carrier_params.py --universe-from --write from the operator's watchlist/signal files; the repo default is two placeholder codes. The downlink package channel that would refresh this daily is not built, so re-run this command after any watchlist change you want the box to see."

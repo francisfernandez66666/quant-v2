@@ -5,9 +5,13 @@
 // 三态裁定 pass=处置（全平 close/半平 trim）、hold=观察窗内延持或等待、无结论=不动作，
 // 与买入共用同一留痕环（record/JSONL），"为什么没卖/为什么卖了"同端点可查。
 //
-// 裁决语义（owner 已拍板，§六/§七实施基准）：
-//   - 硬线判定：止损 −StopLossPct / 止盈 +TakeProfitPct / 移动止盈=最高价−MaxPullbackPct /
+// 裁决语义（owner 已拍板，§六/§七实施基准；§STOP-LADDER 2026-11-20 增补）：
+//   - 硬线判定：**减仓线 −ReducePct（默认 −3）** / **清仓线 −StopLossPct（默认 −6）** /
+//     止盈 +TakeProfitPct / 移动止盈=最高价−MaxPullbackPct /
 //     深破兜底=止损线×DeepStopMult（默认 −12）；
+//     阶梯语义（owner 2026-11-20「3 个点减仓、6 个点清仓」）：−3% 只半平，−6% 才整仓离场；
+//   - 信号强度（owner 同日裁决「信号强度高于止盈止损减仓强度」）：新鲜做多信号**可压过减仓线**
+//     （窗结算延持，最多 MaxExtends 次），**压不过清仓线与深破**——风险越深，豁免越少；
 //   - 触线≠即卖：首触锁定判定线与固定结算点（对齐 09:30 栅格，边界⑤不随价格波动滚动），
 //     窗结算时窗内有新鲜做多信号 → 延持一个窗长（信号在就拿着），无信号 → 处置；
 //   - 延持有次数上限（MaxExtends，出厂默认 2；owner 2026-10-12 裁决）：超限后即使信号仍在
@@ -52,6 +56,11 @@ const (
 	SellLineTrail
 	// SellLineDeepBreach 深破兜底（浮亏 ≥ StopLossPct×DeepStopMult）。
 	SellLineDeepBreach
+	// SellLineReduce 减仓线（浮亏 ≥ ReducePct，默认 −3）——§STOP-LADDER 阶梯的第一级。
+	// 刻意**追加在末尾**而不是插在 StopLoss 后面：枚举值只在本进程内存状态里流转，但把既有值
+	// 整体挪一位会让任何一处按数字落盘/对照的旧读数静默改义；追加则零迁移。
+	// English: the trim step of the §STOP-LADDER; appended last so no existing numeric value moves.
+	SellLineReduce
 )
 
 // String 判定线中文名（留痕/理由文案用）。
@@ -65,6 +74,8 @@ func (l SellLine) String() string {
 		return "移动止盈"
 	case SellLineDeepBreach:
 		return "深破兜底"
+	case SellLineReduce:
+		return "减仓线"
 	default:
 		return "未触线"
 	}
@@ -188,10 +199,15 @@ type sellKey struct {
 // 三者恒为零值时 sellProbe 行为与改造前**逐字一致**——这是基准态反证锁。
 type sellParams struct {
 	sl, tp, pb, dm float64
-	exitMin        int
-	trailMin       int
-	bullMaxAge     time.Duration
-	maxExt         int
+	// reduce §STOP-LADDER 减仓线（%）：浮亏达此值先半平（默认 3）。0=该档不成立（与清仓线冲突
+	// 或配置显式退化时），此时阶梯只剩止损清仓线与深破兜底。清仓线仍是 sl（默认 6）。
+	// English: the trim step (default 3%); zero disables the step entirely, leaving only the
+	// clear line (sl) and the deep-breach backstop.
+	reduce     float64
+	exitMin    int
+	trailMin   int
+	bullMaxAge time.Duration
+	maxExt     int
 	// ── §DYN-SIZE P2 卖出加权 ──
 	boost        string // L1/L2/L3（""=未命中）
 	noExtend     bool   // 取消延持（L2+）：窗结算时即使有新鲜做多信号也直接处置
@@ -205,9 +221,20 @@ type sellParams struct {
 
 // sellParamsOf 从纪律配置解析卖出裁决参数（缺省与 DefaultDisciplineConfig 同口径）。
 func sellParamsOf(cfg config.DisciplineConfig) sellParams {
-	p := sellParams{sl: 6, tp: 15, pb: 6, dm: 2, exitMin: 15, trailMin: 45, bullMaxAge: 5 * time.Minute, maxExt: 2}
+	p := sellParams{sl: 6, reduce: 3, tp: 15, pb: 6, dm: 2, exitMin: 15, trailMin: 45, bullMaxAge: 5 * time.Minute, maxExt: 2}
 	if cfg.StopLossPct > 0 {
 		p.sl = cfg.StopLossPct
+	}
+	if cfg.ReducePct > 0 {
+		p.reduce = cfg.ReducePct
+	}
+	// §STOP-LADDER 冲突/退化处理：减仓线必须严格轻于清仓线，否则第一级永远不会单独命中
+	// （价格先破清仓线就整仓走了）。此时把该档关掉而不是把两者夹成同一个数——"减半仓"与
+	// "全平"绝不能落在同一个价位上，那会让同一笔输入产出哪个动作取决于 case 顺序。
+	// English: a reduce line that is not strictly lighter than the clear line cannot exist on
+	// the ladder; disable the step instead of folding two different actions onto one price.
+	if p.reduce <= 0 || p.reduce >= p.sl {
+		p.reduce = 0
 	}
 	if cfg.TakeProfitPct > 0 {
 		p.tp = cfg.TakeProfitPct
@@ -496,6 +523,11 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 				Reason: bearWhy + evi}, ""
 		}
 		line = SellLineStopLoss
+	case p.reduce > 0 && pnl <= -p.reduce:
+		// §STOP-LADDER 第一级：−3% 减仓（不是清仓）。做多信号可压过这一级（窗结算延持），
+		// 但压不过上面那一级——owner 2026-11-20 裁决「信号强度高于止盈止损减仓强度」。
+		// English: §STOP-LADDER step 1 — trim at −3%; a bull signal may override this step only.
+		line = SellLineReduce
 	case pnl >= p.tp:
 		if bullLive {
 			return st, nil, "止盈线有活跃做多信号，延持" // 止盈延持不开窗（与旧口径一致）
@@ -568,6 +600,17 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 		return st, &SellDisposal{Code: in.Code, Action: SellActionClose, Line: st.Line, PnlPct: pnl, At: now,
 			Reason: "深破窗结算，无条件全平离场" + evi}, ""
 	}
+	// §STOP-LADDER 清仓线同样无条件全平：做多信号不压过清仓（owner 2026-11-20 裁决）。
+	// 为什么它仍走观察窗而不是触线即清——窗的作用是过滤盘中插针（首触锁定结算点），与"能不能
+	// 被信号延持"是两件事：插针过滤保留、信号豁免取消。
+	// English: §STOP-LADDER — the clear line settles unconditionally (a bull signal never overrides
+	// a clear); the window stays purely as the intrabar-spike filter it was introduced for.
+	if st.Line == SellLineStopLoss {
+		st.Settled, st.Confirmed = true, true
+		st.ConfirmedAt, st.ConfirmedAction = now, SellActionClose
+		return st, &SellDisposal{Code: in.Code, Action: SellActionClose, Line: st.Line, PnlPct: pnl, At: now,
+			Reason: "止损清仓线窗结算，无条件全平（做多信号不延持）" + evi}, ""
+	}
 	// 有新鲜做多信号 → 延持一个窗长（结算点沿固定栅格顺延一格）。
 	// 延持上限（owner 2026-10-12 裁决，MaxExtends 默认 2）：延持次数用尽后即使信号仍在，
 	// 也按无信号处置走下方处置开关（止损线→半平、止盈/移动止盈→全平）。000063 事故形态：
@@ -599,12 +642,12 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 	switch st.Line {
 	case SellLineTakeProfit, SellLineTrail:
 		d.Reason = "止盈窗结算无信号，止盈离场" + evi
-	case SellLineStopLoss:
+	case SellLineReduce:
 		if SellBoostEscalatesTrim(p.boost) {
-			d.Reason = "止损窗结算无信号，首触止损未深破升级全平（trim→close）" + evi
+			d.Reason = "减仓线窗结算无信号，首触减仓升级全平（trim→close）" + evi
 		} else {
 			d.Action = SellActionTrim
-			d.Reason = "止损窗结算无信号，首触止损未深破减半仓" + evi
+			d.Reason = "减仓线窗结算无信号，减半仓" + evi
 		}
 	default:
 		d.Reason = "止损窗结算无信号，止损离场" + evi
@@ -642,7 +685,8 @@ func confirmedReplay(st *sellState, code string, pnl float64, now time.Time, p s
 	action := st.ConfirmedAction
 	if action == "" { // 兜底：存量状态无固化动作时按线型回退
 		// L3 升级同样适用于这条兜底路（与窗结算确认口径一致：存量状态也不留半仓）。
-		if st.Line == SellLineStopLoss && pnl > -2*p.sl && !SellBoostEscalatesTrim(p.boost) {
+		// §STOP-LADDER：只有减仓线是半平；止损清仓线与深破一律全平。
+		if st.Line == SellLineReduce && !SellBoostEscalatesTrim(p.boost) {
 			action = SellActionTrim
 		} else {
 			action = SellActionClose
@@ -654,9 +698,11 @@ func confirmedReplay(st *sellState, code string, pnl float64, now time.Time, p s
 		d.Reason = "止盈离场（窗结算无信号）" + evi
 	case SellLineDeepBreach:
 		d.Reason = "深破止损离场" + evi
+	case SellLineStopLoss:
+		d.Reason = "止损清仓线离场" + evi
 	default:
 		if action == SellActionTrim {
-			d.Reason = "首触止损未深破，减半仓" + evi
+			d.Reason = "减仓线首触未清仓，减半仓" + evi
 		} else {
 			d.Reason = "止损离场" + evi
 		}
