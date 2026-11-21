@@ -58,8 +58,12 @@ type Scheduler struct {
 	statePath string // research_state.json 路径（展示兼容状态）
 	// nowFn 可注入时钟：测试用 setNow 替换。§flaky 修复——字段自身以 nowMu 保护，
 	// 此前后台排水 goroutine（tryStartNext 自驱）与测试改写 s.now 存在数据竞争。
-	nowMu sync.RWMutex // 保护 nowFn 的读写锁
+	nowMu sync.RWMutex // 保护 nowFn 与 nightBudgetUnit 的读写锁
 	nowFn func() time.Time
+	// nightBudgetUnit §TEST-SPEED 单夜预算"分钟数"换算真实时长的单位：生产恒 time.Minute，
+	// 让位等行为的分钟口径一个字节不改；单测注入秒级把 ~65s 的真实等待压到亚秒级。
+	// 与 nowFn 同受 nowMu 保护——runTask 在后台 goroutine 里读、测试主线程写，不能有数据竞争。
+	nightBudgetUnit time.Duration
 
 	mu            sync.Mutex          // 保护调度器状态的互斥锁
 	baseCtx       context.Context     // 服务级上下文（退出时取消当前子进程）
@@ -119,11 +123,12 @@ func New(dataDir, cfgPath, statePath string) *Scheduler {
 		statePath = filepath.Join(dataDir, "research_state.json")
 	}
 	return &Scheduler{
-		cfgPath:   cfgPath,
-		dataDir:   dataDir,
-		statePath: statePath,
-		nowFn:     time.Now,
-		failCool:  make(map[int64]time.Time),
+		cfgPath:         cfgPath,
+		dataDir:         dataDir,
+		statePath:       statePath,
+		nowFn:           time.Now,
+		nightBudgetUnit: time.Minute,
+		failCool:        make(map[int64]time.Time),
 	}
 }
 
@@ -145,6 +150,25 @@ func (s *Scheduler) setNow(f func() time.Time) {
 	s.nowMu.Lock()
 	defer s.nowMu.Unlock()
 	s.nowFn = f
+}
+
+// nightBudgetUnitOf 返回"一预算分钟"对应的真实时长（读侧经 nowMu 保护）。
+// 生产恒 time.Minute；零值兜底也是 time.Minute，避免零值 Scheduler 误用纳秒把任务秒杀。
+func (s *Scheduler) nightBudgetUnitOf() time.Duration {
+	s.nowMu.RLock()
+	defer s.nowMu.RUnlock()
+	if s.nightBudgetUnit <= 0 {
+		return time.Minute
+	}
+	return s.nightBudgetUnit
+}
+
+// setNightBudgetUnit 仅测试注入：把预算分钟换成秒级，缩短让位腿的真实等待。
+// 生产代码不得调用（生产路径 New() 初始化为 time.Minute，且无任何写入点）。
+func (s *Scheduler) setNightBudgetUnit(d time.Duration) {
+	s.nowMu.Lock()
+	defer s.nowMu.Unlock()
+	s.nightBudgetUnit = d
 }
 
 // SetAlertFunc §M14 注入告警通道（researchd 启动装配调用一次）：同因连败熔断挂起、

@@ -7,8 +7,10 @@
 //     本夜剩余预算，到点子进程被杀，终态走「让位」（queued+defer_day=下一夜、
 //     progress 保留、连败/累计两把熔断账都不动）而不是「失败」。
 //
-// 测试时钟说明：两腿都用注入时钟（周六盘后），但让位腿的 1 分钟预算截断发生在
-// context.WithTimeout 的**真实时间**上，故该腿实测 ~65s（预算按整数分钟，无更短档）；
+// 测试时钟说明：两腿都用注入时钟（周六盘后）。让位腿的 1 分钟预算截断原先发生在
+// context.WithTimeout 的**真实时间**上（预算按整数分钟×time.Minute，实测 ~65s）；
+// §TEST-SPEED 后经 setNightBudgetUnit 注入秒级单位，1 预算分钟＝1 秒真实时间，
+// 该腿从 ~65s 压到亚秒级——生产 New() 仍初始化为 time.Minute，分钟口径一字未改。
 // 夜账入账用的 started_at 是真实墙钟，与注入时钟跨日不齐属测试工件，断言刻意不碰
 // 夜账列（夜账翻页语义已由 store 层 TestNightBudgetLedgerPageFlip 钉死）。
 //
@@ -128,7 +130,7 @@ func TestNightcapHeadBudgetDefersAndReleasesQueue(t *testing.T) {
 	waitIdleAndSettle(t, s)
 }
 
-// TestNightcapBudgetCapYieldsTask §NIGHTCAP 运行侧预算截断（让位腿，实测 ~65s）：
+// TestNightcapBudgetCapYieldsTask §NIGHTCAP 运行侧预算截断（让位腿，注入秒级后 <2s）：
 // 低优任务本夜已占 NightCapDefaultMin-1 分钟（余 1 分钟 < 90 分钟单步超时）→ 实际可跑时长被夹到 1 分钟；
 // 长睡子进程到点被杀，终态必须是「让位」而不是「失败」：
 //   - status=yielded、行回 queued、defer_day=下一夜、error 写让位原因、progress 保留；
@@ -164,6 +166,9 @@ func TestNightcapBudgetCapYieldsTask(t *testing.T) {
 	base := cntime.Now()
 	clk := time.Date(base.Year(), base.Month(), base.Day(), 16, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s.setNow(func() time.Time { return clk })
+	// §TEST-SPEED：1 预算分钟＝1 秒真实时间（生产恒 60s，New() 初始化 time.Minute 不动）。
+	// 这样"余 1 分钟"的子进程截断在 1s 发生，让位腿不再整条拖 65s。
+	s.setNightBudgetUnit(time.Second)
 	today := cntime.DayCompactOf(clk)
 	tomorrow := cntime.DayCompactOf(clk.AddDate(0, 0, 1))
 
@@ -196,8 +201,9 @@ func TestNightcapBudgetCapYieldsTask(t *testing.T) {
 	}
 	go s.runTask(qdb, cfg, *tk)
 
-	// 预算 1 分钟真实到点 → 子进程被杀 → 终态走让位。waitFor 上限 90s 覆盖截断+收尾落库。
-	waitFor(t, 90*time.Second, func() bool {
+	// 预算 1 分钟真实到点（注入单位后＝1s）→ 子进程被杀 → 终态走让位。
+	// waitFor 上限 10s：覆盖截断+收尾落库仍有余量，但真挂死时 10s 即暴露（原 90s 太久）。
+	waitFor(t, 10*time.Second, func() bool {
 		cur, _ := qdb.GetResearchTask(id)
 		return cur != nil && cur.Status == store.TaskQueued && cur.DeferDay == tomorrow
 	}, "预算到点后任务应让位（回 queued+defer_day=下一夜）而不是失败/挂起")

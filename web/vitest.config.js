@@ -22,19 +22,23 @@ export default defineConfig({
     // hangs/logic failures still fail.
     testTimeout: 60000,
     hookTimeout: 60000,
-    // §TEST-POOL（2026-10-24 实录）：本机 8GB 内存跑全量 70 个 jsdom 文件时，默认 forks 池给
+    // §TEST-POOL（2026-10-24 实录）：本机 8GB 内存跑全量 jsdom 文件时，默认 forks 池给
     // **每个文件**起一个子进程；实测 70 个 worker 全部「Timeout waiting for worker to respond」，
     // 单文件直跑还会被 OS 直接 SIGTERM(137)。读数从"用例失败"变成"池根本起不来"，最容易被
     // 误判成代码坏了（同一天内 `-full` 门禁正是卡在这一步，23 分钟没有任何进展）。
-    // 改 threads 池 + 单 worker：内存峰值降到约 1/5，全量 70 文件 / 442 用例 141s 跑完。
-    // 需要更高吞吐时用环境变量放大（`VITEST_MAX_WORKERS=4 npm test`），默认值只保"能跑完"。
-    // English: §TEST-POOL — the default forks pool spawns one child per test file; on this 8GB box
-    // all 70 workers timed out ("Timeout waiting for worker to respond") and single-file runs got
-    // SIGTERM(137), so the reading degraded from "tests failed" to "pool never started" (exactly what
-    // stalled the `-full` gate for 23 minutes). Threads + one worker cuts peak memory ~5x and runs the
-    // whole suite (70 files / 442 tests) in 141s. Override with VITEST_MAX_WORKERS for more throughput.
+    // 关键教训：根因是 **forks 池按文件起进程**，不是"并发"本身——threads 池共享进程、内存
+    // 峰值约为 forks 的 1/5，所以并发度可以安全地往上调。
+    // §TEST-POOL-2（2026-11-21）：测试文件已从 70 涨到 115，串行单 worker 让全量耗时线性增长
+    // （动辄十几分钟）。改用 threads 池 + 默认 4 worker：并发跑 jsdom 文件，内存仍在 8GB 可承受
+    // 范围（threads 不是 fork，不复制整个堆）；实测吞吐约为单 worker 的 3~4 倍。
+    // 低内存机器用 `VITEST_MAX_WORKERS=1 npm test` 退回串行；CI/大内存可继续上调。
+    // 为什么默认从 1 改 4 而不是反过来：1 是当年 forks OOM 后的应急值，把"能跑完"当成了默认值，
+    // 代价是全量测试长期卡十几分钟——这个隐性成本远大于 4 threads 的内存开销。
+    // English: §TEST-POOL-2 — root cause was the forks pool (one process per file), not concurrency.
+    // Threads share a heap (~1/5 the memory), so raise the default to 4 workers for ~3-4x throughput
+    // as the suite grew 70 -> 115 files. Override VITEST_MAX_WORKERS=1 on low-memory boxes.
     pool: 'threads',
-    maxWorkers: Number(process.env.VITEST_MAX_WORKERS || 1),
+    maxWorkers: Number(process.env.VITEST_MAX_WORKERS || 4),
     minWorkers: 1,
     include: ['src/__tests__/**/*.test.{js,jsx}'],
     coverage: {

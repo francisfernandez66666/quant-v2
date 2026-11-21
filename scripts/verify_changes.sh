@@ -282,13 +282,61 @@ GATE_SECTIONS_PY="$GATE_ROOT_ABS/scripts/gate_sections.py"
 GATE_COLLECT_MAX_PASSES="${GATE_COLLECT_MAX_PASSES:-60}"
 
 GATE_ARG_COLLECT=0
+GATE_ARG_QUICK=0
 GATE_ARG_INNER=""
 for _gate_arg in "$@"; do
 	# 必须用 `if` 而不是 `[ x = y ] && VAR=1`：条件为假时整个赋值语句返回 1，`set -e` 下前言当场
 	# 裸死（§89 自指锁抓的就是这一族的第三种写法：末句条件语句＝静默退出、零读数）。
 	if [ "$_gate_arg" = "-collect" ]; then GATE_ARG_COLLECT=1; fi
 	if [ "$_gate_arg" = "-full" ]; then GATE_ARG_INNER="-full"; fi
+	if [ "$_gate_arg" = "-quick" ]; then GATE_ARG_QUICK=1; fi
 done
+
+# §TEST-QUICK（2026-11-21）-quick 快速回归：只跑派生段清单的**尾部 N 段**（默认 12，
+# 可用 GATE_QUICK_TAIL 覆盖）。为什么是显式选项而不是把默认改掉：
+#   默认模式跑全 227 段、四桶守恒是 owner 每轮复查的唯一门禁；把默认切成"只跑近期段"等于
+#   关掉历史段的锁——那正是本仓反复踩的"功能入库但门禁没登记"的同族（没验的段被当成验过的）。
+#   所以默认 / -full / -collect 一个字节不改，-quick 只是一条额外开的快速自查通道，
+#   它跑的段体由 gate_sections.py emit 原样装配（helper 前置搬运、heredoc 边界都走现成逻辑），
+#   绝不自己重写段判定——否则 quick 绿和默认绿不是同一套判据，快速通道就成了假信号源。
+# 段数从派生清单取、不写死：新增段自动进 quick 尾部，无需同步维护第二个数字。
+gate_quick_main() {
+	local work start rc tail_n total
+	tail_n="${GATE_QUICK_TAIL:-12}"
+	work=$(mktemp -d /tmp/gate-quick-XXXXXX 2>/dev/null || true)
+	if [ -z "$work" ] || [ ! -d "$work" ]; then
+		echo "--- FAIL: §TEST-QUICK 建不出临时目录（装配产物与日志都要落盘）"
+		return 1
+	fi
+	if [ ! -f "$GATE_SECTIONS_PY" ]; then
+		echo "--- FAIL: §TEST-QUICK 找不到装配器 ${GATE_SECTIONS_PY}"
+		return 1
+	fi
+	python3 "$GATE_SECTIONS_PY" sections "$GATE_SELF_ABS" > "$work/sections.txt" 2> "$work/sections.err" || true
+	total=$(awk -F'\t' '$1=="TOTAL"{print $2}' "$work/sections.txt")
+	# 取最后 tail_n 段的第一个段号：段号整串即身份（可能带字母后缀），不做数值比较。
+	start=$(awk -F'\t' -v n="$tail_n" '$1 ~ /^[0-9]+[a-z]?$/ {a[++c]=$1} END{if(c>0){k=c-n+1; if(k<1)k=1; print a[k]}}' "$work/sections.txt")
+	if [ -z "$start" ] || [ -z "$total" ]; then
+		echo "--- FAIL: §TEST-QUICK 派生不出段清单：$(head -1 "$work/sections.err" 2>/dev/null)"
+		return 1
+	fi
+	rc=0
+	python3 "$GATE_SECTIONS_PY" emit "$GATE_SELF_ABS" "$start" "$work/inner.sh" "$GATE_ROOT_ABS" 2> "$work/emit.err" || rc=$?
+	if [ "$rc" != "0" ]; then
+		echo "--- FAIL: §TEST-QUICK 装配失败（起点 §${start}）：$(head -1 "$work/emit.err" 2>/dev/null)"
+		return 1
+	fi
+	echo "==> [quick] 只跑尾部 ${tail_n} 段（§${start} 起，共 ${total} 段中的末段），段体由 emit 原样装配"
+	echo "==> [quick] 快速自查通道：绿灯不等于全量门禁通过，发版前仍须跑无参数的默认模式"
+	GATE_COLLECT_INNER=0 bash "$work/inner.sh" > "$work/log.txt" 2>&1 || rc=$?
+	cat "$work/log.txt"
+	if [ "$rc" != "0" ]; then
+		echo "--- FAIL: §TEST-QUICK 尾部段判红（起点 §${start}），完整日志：$work/log.txt"
+	else
+		echo "==> [quick] 尾部 ${tail_n} 段全绿（rc=0）；产物 $work"
+	fi
+	return "$rc"
+}
 
 # gate_kv <cls 文件> <键名> —— 从分类结果里取一个键值（制表符分列）。
 # 写成函数而不是每处 awk：四桶判定要读五六个键，散着写迟早有一处拼错键名（拼错＝空串＝假绿）。
@@ -457,6 +505,12 @@ gate_collect_main() {
 
 if [ "$GATE_ARG_COLLECT" = "1" ]; then
 	gate_collect_main
+	exit $?
+fi
+# §TEST-QUICK 快速通道优先级：-collect 之上、-full 之下都不冲突——-quick 单独用；
+# 组合 -quick -full 时 quick 先返回（quick 跑的尾部段已含最新行为腿，无需再叠全量）。
+if [ "$GATE_ARG_QUICK" = "1" ]; then
+	gate_quick_main
 	exit $?
 fi
 # <<< GATE-COLLECT-DRIVER
@@ -703,12 +757,14 @@ if [ "${1:-}" = "-full" ]; then
 	echo "==> 附加：QMT 网关 Python 全量单测（文件桥/保活/降级/清仓护栏/成交方向解析）..."
 	py_tests qmt_gateway/tests/
 	echo ""
-	echo "==> 附加：实时链路相关全量单测..."
+	# §TEST-MERGE（2026-11-21）：两组"附加全量单测"的包集合互不重叠、判定都靠 go test 退出码
+	# （set -e/pipefail 下任一批红即整轮退），合成**一条** go test＝少启动一次 Go 工具链，
+	# 判定粒度不变（原本也是"整批全绿/红"）。绝不合并段内逐条 -run 断言：那些是分 A/B/C/D/E
+	# 独立登记的判定点与文本锁，合并会失去逐点归属（见 §TEST-QUICK 同源纪律）。
+	echo "==> 附加：实时链路 + 回测增强全量单测（两组包已合并为一次 go test）..."
 	go test -count=1 ./internal/combat_agent/... ./internal/engine/... ./internal/llm/... ./internal/strategies/... ./internal/paper/... \
-		./internal/data/... ./internal/display/... ./internal/newsagent/... ./internal/signalarchive/... ./internal/e2e/ ./internal/server/ ./cmd/quant/...
-	echo ""
-	echo "==> 附加：回测增强全量单测（含回归短路）..."
-	go test -count=1 ./internal/config/... ./internal/btreplay/... ./internal/store/... ./internal/scheduler/... ./cmd/research/...
+		./internal/data/... ./internal/display/... ./internal/newsagent/... ./internal/signalarchive/... ./internal/e2e/ ./internal/server/ ./cmd/quant/... \
+		./internal/config/... ./internal/btreplay/... ./internal/store/... ./internal/scheduler/... ./cmd/research/...
 	echo ""
 	echo "==> 附加：前端回测增强 + 组件测试（vitest run）..."
 	( cd web && npm test )
@@ -26226,4 +26282,74 @@ fi
 
 [ "$B234_FAILED" = "0" ] || exit 1
 echo "ok - §234 §T-TURNOVER-TIER/§FLOW-SECTOR-JOIN 锁通过（分档三档+显式平铺短路+市值缺失fail-closed+载体同一组输入+阈值无第二份+白名单只扩b:BK+生产者覆盖率闸+热更在sha前烘入+sector_map不许退成industry_map+行为腿判退出码，累计判定点 ${CNT234}）"
+echo ""
+
+echo "==> 235 §TEST-SPEED（2026-11-21 测试提速批：-quick 快速通道 / -full 全量合并 / vitest 4 worker / nightcap 秒级预算）..."
+B235_FAILED=0
+fail235() {
+	echo "--- FAIL: §235 $*"
+	FAIL=1
+	B235_FAILED=1
+}
+CNT235=0
+GATE235=$(cat scripts/verify_changes.sh || true)
+VITESTCFG235=$(cat web/vitest.config.js || true)
+SCHED235=$(cat internal/scheduler/scheduler.go || true)
+WN235=$(cat internal/scheduler/worker_nightcap_test.go || true)
+
+# ① -quick 必须是显式选项：默认 / -full / -collect 语义一个字节不改（把默认切成"只跑近期段"
+#    等于关掉历史段的锁＝没验的段被当成验过的，与本仓反复踩的"门禁没登记"同族）。
+CNT235=$((CNT235 + 1))
+grep_q 'if \[ "\$_gate_arg" = "-quick" \]; then GATE_ARG_QUICK=1; fi' GATE235 F || fail235 "缺 -quick 显式参数解析"
+grep_q 'if \[ "\$GATE_ARG_QUICK" = "1" \]; then' GATE235 F || fail235 "缺 -quick 分发（解析了却不执行＝空开关）"
+if grep_q 'GATE_ARG_QUICK=1' GATE235; then
+	# 解析处置 1 是必须的；但默认变量初值必须是 0——否则不传参也走快速通道，等于关门。
+	grep_q 'GATE_ARG_QUICK=0' GATE235 F || fail235 "GATE_ARG_QUICK 默认不是 0（不传参就走快速通道＝历史段全不验）"
+fi
+
+# ② quick 的段体必须由 emit 原样装配，不许自己重写判定——否则 quick 绿和默认绿不是一套判据。
+CNT235=$((CNT235 + 1))
+grep_q 'python3 "\$GATE_SECTIONS_PY" emit "\$GATE_SELF_ABS" "\$start" "\$work/inner.sh"' GATE235 F || fail235 "quick 没走 emit 装配（自造判据＝假信号源）"
+grep_q 'GATE-SECTION-START' GATE235 F || fail235 "缺段标记来源（quick 跑的不是带标记的段体）"
+
+# ③ -full 两组全量包合并为**一条** go test（少一次 Go 工具链启动，判定仍靠退出码、粒度不变）。
+CNT235=$((CNT235 + 1))
+# 负锁：合并后不许再有第二条独立的全量 go test（否则没真合并）。
+if grep_q 'go test -count=1 ./internal/config/\.\.\. ./internal/btreplay/\.\.\.' GATE235; then
+	fail235 "-full 仍留第二条独立全量 go test（合并没生效）"
+fi
+# 合并后那条必须含两组代表包（实时链路的 engine + 回测链的 btreplay）。
+grep_q '\./internal/engine/\.\.\.' GATE235 F || fail235 "合并后的全量命令缺实时链路包"
+grep_q '\./internal/btreplay/\.\.\.' GATE235 F || fail235 "合并后的全量命令缺回测链包"
+
+# ④ vitest 默认 4 worker（原单 worker 是全量动辄十几分钟的元凶；保留 env 覆盖给低内存机）。
+CNT235=$((CNT235 + 1))
+grep_q "maxWorkers: Number(process.env.VITEST_MAX_WORKERS || 4)" VITESTCFG235 F || fail235 "vitest 默认 worker 不是 4"
+grep_q "pool: 'threads'" VITESTCFG235 F || fail235 "vitest 池不是 threads（退回 forks 会按文件起进程 OOM）"
+grep_q 'VITEST_MAX_WORKERS=1 npm test' VITESTCFG235 F || fail235 "缺低内存机回退说明"
+
+# ⑤ nightcap 秒级预算缝：生产默认 time.Minute，测试注入秒级；行为腿不再等 65s。
+CNT235=$((CNT235 + 1))
+grep_q 'nightBudgetUnit' SCHED235 F || fail235 "Scheduler 缺可注入预算单位字段"
+grep_q 's.setNightBudgetUnit(time.Second)' WN235 F || fail235 "nightcap 让位腿没注入秒级单位（仍等 65s）"
+if grep_q '故该腿实测 ~65s' WN235; then
+	fail235 "nightcap 注释仍留旧 65s 口径（注入秒级后应写亚秒级）"
+fi
+
+# ⑥ 行为腿：emit 从本段起点装配，尾体必须出现本段标记（quick 的段体真能被原样装配）。
+#    只装配不执行（执行会递归跑本段），判退出码而非输出文本。
+CNT235=$((CNT235 + 1))
+if command -v python3 >/dev/null 2>&1; then
+	Q235_RC=0
+	python3 scripts/gate_sections.py emit-one scripts/verify_changes.sh 235 /tmp/gate-quick-235-self.sh . >/dev/null 2>&1 || Q235_RC=$?
+	[ "$Q235_RC" = "0" ] || fail235 "本段 emit-one 装配失败（quick 依赖的装配链对本段失效，退出码 ${Q235_RC}）"
+	if [ -f /tmp/gate-quick-235-self.sh ]; then
+		BODY235=$(cat /tmp/gate-quick-235-self.sh)
+		grep_q 'GATE-SECTION-START 235' BODY235 F || fail235 "装配尾体缺 §235 标记（quick 跑的段体不可归属）"
+		rm -f /tmp/gate-quick-235-self.sh 2>/dev/null || true
+	fi
+fi
+
+[ "$B235_FAILED" = "0" ] || exit 1
+echo "ok - §235 §TEST-SPEED 锁通过（-quick 显式不改默认 + emit 原样装配 + -full 全量并一条 + vitest 4 worker 带回退 + nightcap 秒级预算，累计判定点 ${CNT235}）"
 echo ""

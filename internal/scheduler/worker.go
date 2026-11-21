@@ -1363,7 +1363,9 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		if capMin := nightCapMinutes(cfg); capMin > 0 {
 			today := cntime.DayCompactOf(s.nowTime())
 			if left := store.NightBudgetLeftMin(tk.NightUsedMin, tk.NightDay, today, capMin); left >= 0 {
-				if budget := time.Duration(left) * time.Minute; budget < timeout {
+				// §TEST-SPEED：预算分钟→真实时长经可注入单位换算。生产恒 time.Minute（分钟口径不变），
+				// 单测注入秒级把让位腿从 ~65s 压到亚秒级；单位只影响这条 timeout，不动夜账分钟记账。
+				if budget := time.Duration(left) * s.nightBudgetUnitOf(); budget < timeout {
 					timeout = budget
 					budgetCapped = true
 				}
