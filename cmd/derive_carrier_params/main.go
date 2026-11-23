@@ -471,14 +471,17 @@ func collectCarrierVocabulary(c *collector) {
 	c.put("t_cost_safety_multiplier", "internal/tcalib/tcalib.go:DefaultSafetyMul", tcalib.DefaultSafetyMul)
 }
 
-// collectCarrierShape 取载体形态三枚旋钮（§BOX-FIX-20261123）。
-// 值全部转调 internal/config 的只读访问器：卖出观察窗的轮数/秒数、云端仓位上限的保守折扣。
-// 这三枚数是策略语义，必须与载体共用一处真源；本函数只按名字打值，不产生任何数字。
+// collectCarrierShape 取载体形态旋钮（§BOX-FIX-20261123）。
+// 值全部转调 internal/config 的只读访问器：卖出观察窗的轮数/秒数、云端仓位上限的保守折扣，
+// 以及同票重发闸的价格改善幅度与当日次数上限。
+// 这几枚数是策略语义，必须与载体共用一处真源；本函数只按名字打值，不产生任何数字。
 func collectCarrierShape(c *collector) {
-	const src = "internal/config/carrier_knobs.go:CarrierSellConfirm/SellConfirmSec/MarketScaleCeilingMargin"
+	const src = "internal/config/carrier_knobs.go:CarrierSellConfirm/SellConfirmSec/MarketScaleCeilingMargin/BuyRetryImprovePct/BuyRetryMaxPerDay"
 	c.put("sell_confirm_rounds", src, config.CarrierSellConfirmRounds())
 	c.put("sell_confirm_sec", src, config.CarrierSellConfirmSec())
 	c.put("market_scale_ceiling_margin", src, config.CarrierMarketScaleCeilingMargin())
+	c.put("buy_retry_improve_pct", src, config.CarrierBuyRetryImprovePct())
+	c.put("buy_retry_max_per_day", src, config.CarrierBuyRetryMaxPerDay())
 }
 
 // sortedInterfaceKeys 把 map 的键排序后返回：导出顺序必须稳定，

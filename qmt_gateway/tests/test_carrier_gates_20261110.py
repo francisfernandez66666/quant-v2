@@ -35,6 +35,10 @@ def _reset_state():
     m._STATE["basis_day"] = ""
     m._STATE["sell_obs"] = {}
     m._STATE["sell_obs_day"] = ""
+    # §BUY-RETRY-GATE 2026-11-23: the per-(day, symbol) attempt journal is
+    # day-keyed state as well; a leaked attempt would refuse a legitimate buy.
+    m._STATE["buy_tries"] = {}
+    m._STATE["buy_tries_day"] = ""
 
 
 class _Row:

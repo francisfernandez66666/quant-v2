@@ -26372,6 +26372,7 @@ IT236=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
 CK236=$(cat internal/config/carrier_knobs.go || true)
 DERIVEGO236=$(cat cmd/derive_carrier_params/main.go || true)
 PARAMS236=$(cat qmt_gateway/local_executor_params.json || true)
+DERIVE236=$(cat scripts/derive_carrier_params.py || true)
 
 # ① 撤单 4 参：4s/4l 必须带 ContextInfo；3 参回潮即红。
 CNT236=$((CNT236 + 1))
@@ -26545,6 +26546,67 @@ else
 	echo "INFO - §236 无 python3，行为腿 B 未跑"
 fi
 
+# ⑬ 同票重发闸（2026-11-23 收盘后追加，owner 裁决「同一个票短时间内价格不反转就不要重复下单占用资金」）：
+#    000088 13:23–13:54 以同一个 4.56 连发四笔、笔笔 600 秒陈旧撤单零成交（当天最低 4.57）。
+#    撤单释放当日买意向保留（手动撤单必须能重来），但再发必须价格真的往下走且有当日次数上限。
+CNT236=$((CNT236 + 1))
+grep_q 'carrierBuyRetryImprovePct[[:space:]]+= 0\.2$' CK236 || fail236 "Go 侧重发改善幅度不是 0.2%"
+grep_q 'carrierBuyRetryMaxPerDay[[:space:]]+= 3$' CK236 || fail236 "Go 侧当日次数上限不是 3"
+grep_q 'func CarrierBuyRetryImprovePct() float64' CK236 F || fail236 "缺 CarrierBuyRetryImprovePct 访问器"
+grep_q 'func CarrierBuyRetryMaxPerDay() int' CK236 F || fail236 "缺 CarrierBuyRetryMaxPerDay 访问器"
+grep_q 'c.put("buy_retry_improve_pct", src, config.CarrierBuyRetryImprovePct())' DERIVEGO236 F || fail236 "导出器没取重发改善幅度"
+grep_q 'c.put("buy_retry_max_per_day", src, config.CarrierBuyRetryMaxPerDay())' DERIVEGO236 F || fail236 "导出器没取当日次数上限"
+grep_q '"buy_retry_improve_pct", ("buy_retry_improve_pct",)' DERIVE236 F || fail236 "派生表没登记 buy_retry_improve_pct"
+grep_q '"buy_retry_max_per_day", ("buy_retry_max_per_day",)' DERIVE236 F || fail236 "派生表没登记 buy_retry_max_per_day"
+grep_q '"buy_retry_improve_pct": 0.2' PARAMS236 F || fail236 "参数文件缺 buy_retry_improve_pct=0.2"
+grep_q '"buy_retry_max_per_day": 3' PARAMS236 F || fail236 "参数文件缺 buy_retry_max_per_day=3"
+grep_q 'def _buy_retry_gate(day, symbol, price):' QS236 F || fail236 "缺 _buy_retry_gate（同价重发循环无人拦）"
+grep_q 'def _buy_retry_record(day, symbol, price):' QS236 F || fail236 "缺 _buy_retry_record（发过的价没人记）"
+grep_q 'improve = PARAMS.get("buy_retry_improve_pct")' QS236 F || fail236 "重发闸没读 PARAMS 的改善幅度（第二本账）"
+grep_q 'max_n = PARAMS.get("buy_retry_max_per_day")' QS236 F || fail236 "重发闸没读 PARAMS 的次数上限"
+grep_q 'return "buy_retry_cap"' QS236 F || fail236 "缺 buy_retry_cap 读数"
+grep_q 'return "buy_retry_no_improve"' QS236 F || fail236 "缺 buy_retry_no_improve 读数"
+grep_q 'return "buy_retry_price_unknown"' QS236 F || fail236 "缺 buy_retry_price_unknown（看不见价必须 fail-closed）"
+grep_q '_retry_why = _buy_retry_gate(day, symbol, signal.get("price"))' QS236 F || fail236 "买入链没接重发闸"
+grep_q '_buy_retry_record(day, symbol, signal.get("price"))' QS236 F || fail236 "发单成功没记账"
+# 位置锁：闸必须在 _place 之前（发出去再拦就是空话）。
+RG236=$( { grep -n '_buy_retry_gate(day, symbol, signal.get("price"))' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+PL236=$( { grep -n 'ok, why = _place(ContextInfo, signal)' qmt_gateway/qmt_internal_strategy.py || true; } | tail -1 | cut -d: -f1)
+[ -n "$RG236" ] && [ -n "$PL236" ] || fail236 "找不到重发闸或 _place 的锚点"
+if [ -n "$RG236" ] && [ -n "$PL236" ] && [ "$RG236" -ge "$PL236" ]; then
+	fail236 "重发闸排在 _place 之后（发完才拦＝没有闸）"
+fi
+# T 腿豁免：闸外必须有 if intent != "t_leg":（T 有自己的账本，不许被这道闸拦住）。
+if [ -n "$RG236" ]; then
+	RGBODY236=$(sed -n "$((RG236-4)),$((RG236))p" qmt_gateway/qmt_internal_strategy.py 2>/dev/null || true)
+	grep_q 'if intent != "t_leg":' RGBODY236 F || fail236 "重发闸没有豁免 t_leg"
+fi
+# 负锁：撤单释放（_reconcile_session_intents）不许把重发闸的记忆一起清掉。
+REC236=$( { grep -n 'def _reconcile_session_intents(' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+[ -n "$REC236" ] || fail236 "找不到 _reconcile_session_intents"
+if [ -n "$REC236" ]; then
+	RECE236=$( { awk -v s="$REC236" 'NR>s && /^def /{print NR; exit}' qmt_gateway/qmt_internal_strategy.py || true; } )
+	[ -n "$RECE236" ] || RECE236=$(( $(wc -l < qmt_gateway/qmt_internal_strategy.py) + 1 ))
+	RECBODY236=$(sed -n "${REC236},$((RECE236-1))p" qmt_gateway/qmt_internal_strategy.py 2>/dev/null || true)
+	if grep_q 'buy_tries' RECBODY236 F; then
+		fail236 "撤单释放把重发闸一起清了（同价循环原样回来）"
+	fi
+fi
+
+# ⑭ 行为腿 C：同票重发闸（纯函数 + 接线静态锁）+ 三份按日状态复位的回放用例。
+CNT236=$((CNT236 + 1))
+if command -v python3 >/dev/null 2>&1; then
+	PY236C_RC=0
+	python3 -m pytest qmt_gateway/tests/test_internal_strategy_buy_retry_20261123.py \
+		qmt_gateway/tests/test_carrier_replay_20261110.py \
+		qmt_gateway/tests/test_carrier_gates_20261110.py \
+		qmt_gateway/tests/test_carrier_helper_locks_20261110.py \
+		-q >/dev/null 2>&1 || PY236C_RC=$?
+	[ "$PY236C_RC" = "0" ] || fail236 "载体行为腿 C 未过（退出码 ${PY236C_RC}）"
+else
+	echo "INFO - §236 无 python3，行为腿 C 未跑"
+fi
+
 [ "$B236_FAILED" = "0" ] || exit 1
-echo "ok - §236 §BOX-FIX-20261123 锁通过（撤单4参带ContextInfo+阶梯基座冻结成本+三处卖出观察窗且清仓线不被bull延后+导出归档近端窗口不搬(今天+昨天)且根外归档+单次遍历文件名剪枝+上行锁与T8重复窗口+客户端20s轮询+盒内指数与云端上限+申购行分类与diagnostic去重+两份ps1任务/归档口径+三旋钮单点同源，累计判定点 ${CNT236}）"
+echo "ok - §236 §BOX-FIX-20261123 锁通过（撤单4参带ContextInfo+阶梯基座冻结成本+三处卖出观察窗且清仓线不被bull延后+导出归档近端窗口不搬(今天+昨天)且根外归档+单次遍历文件名剪枝+上行锁与T8重复窗口+客户端20s轮询+盒内指数与云端上限+申购行分类与diagnostic去重+两份ps1任务/归档口径+旋钮单点同源+同票重发闸(价格不反转不重发,当日3次上限,t_leg豁免,撤单释放不清闸)，累计判定点 ${CNT236}）"
 echo ""

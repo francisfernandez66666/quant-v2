@@ -2084,7 +2084,9 @@
     ],
     "market_scale_ceiling_margin": 0.9,
     "sell_confirm_rounds": 2,
-    "sell_confirm_sec": 60
+    "sell_confirm_sec": 60,
+    "buy_retry_improve_pct": 0.2,
+    "buy_retry_max_per_day": 3
   },
   "strategy_version": "v16-20261111",
   "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",

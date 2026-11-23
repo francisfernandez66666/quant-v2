@@ -106,6 +106,8 @@ PARAMS = {
     'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell', 'reduce_position'],
     'buy_confirm_min_gap_sec': 60,
     'buy_confirm_rounds': 2,
+    'buy_retry_improve_pct': 0.2,
+    'buy_retry_max_per_day': 3,
     'buy_room_guard': True,
     'buy_signals': ['pullback_buy'],
     'close_sweep_from': '14:50',

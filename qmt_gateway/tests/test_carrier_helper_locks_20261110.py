@@ -50,6 +50,9 @@ class HelperLockTest(unittest.TestCase):
         self.mod._STATE["basis_day"] = ""
         self.mod._STATE["sell_obs"] = {}
         self.mod._STATE["sell_obs_day"] = ""
+        # §BUY-RETRY-GATE 2026-11-23: same day-keyed rule for the retry journal.
+        self.mod._STATE["buy_tries"] = {}
+        self.mod._STATE["buy_tries_day"] = ""
 
     # ---- dimension guard: the 11-06 pollution shape must refuse buys ----
     def test_asset_guard_refuses_polluted_total(self):

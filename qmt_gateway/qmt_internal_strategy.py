@@ -132,6 +132,13 @@ _STATE = {
     # dict resets on day change so no clock survives overnight.
     "sell_obs": {},
     "sell_obs_day": "",
+    # BUY-RETRY-GATE 2026-11-23: {(day, symbol): {"n": attempts, "price": last
+    # limit}}. A cancelled-unfilled buy may be re-sent, but only at a lower price
+    # and only `buy_retry_max_per_day` times (see _buy_retry_gate). Deliberately
+    # NOT released by _reconcile_session_intents: the cancel must reopen the
+    # intent, it must not reopen the same-price loop.
+    "buy_tries": {},
+    "buy_tries_day": "",
 }
 
 
@@ -840,6 +847,74 @@ def _confirm_sell(day, symbol, kind, now):
     entry["rounds"] = int(entry.get("rounds", 0)) + 1
     return (entry["rounds"] >= int(rounds)
             and (now - float(entry.get("since", now))) >= float(secs))
+
+
+def _buy_retry_gate(day, symbol, price):
+    """Same-symbol re-buy gate: no repeat order at a price the tape never took.
+
+    Owner ruling 2026-11-23: "for the same symbol, if the price has not reversed
+    within a short window, do not place another order that locks capital".
+    Live evidence that forced this: 000088 (Yantian Port) was re-sent at exactly
+    4.56 five times between 13:23 and 13:54 (3900 / 3800 / 3900 / 3800 shares),
+    each one stale-cancelled after 600 s with zero fills, while the day low was
+    4.57 -- the limit could never trade, so every retry only froze 17k-20k of
+    cash for another ten minutes.
+
+    The release of a cancelled-unfilled buy intent (see _reconcile_session_intents)
+    is CORRECT and stays: a manual cancel must be able to re-enter. What is wrong
+    is re-entering at the SAME price. So a retry is allowed only when
+
+      * the new limit is at least `buy_retry_improve_pct` below the last attempt
+        (the price actually came down -- that is a real pullback, not a loop), and
+      * this symbol has not already spent `buy_retry_max_per_day` attempts today.
+
+    The FIRST attempt of the day is always allowed (nothing to compare against),
+    and the T leg / sell legs never reach here. Missing config keys turn the gate
+    OFF with one warning (never silently disable the buy leg); an unreadable price
+    on a RETRY fails closed -- "cannot see the price" must not become "re-send".
+    """
+    improve = PARAMS.get("buy_retry_improve_pct")
+    max_n = PARAMS.get("buy_retry_max_per_day")
+    if improve is None or max_n is None:
+        _warn_once("buy_retry_cfg",
+                   "buy_retry_improve_pct/max_per_day missing: retry gate off")
+        return None
+    if _STATE.get("buy_tries_day") != day:
+        _STATE["buy_tries_day"] = day
+        _STATE["buy_tries"] = {}
+    tries = _STATE.setdefault("buy_tries", {})
+    entry = tries.get((day, symbol))
+    if entry is None:
+        return None
+    if int(entry.get("n", 0)) >= int(max_n):
+        return "buy_retry_cap"
+    last = entry.get("price")
+    try:
+        last = float(last)
+        cur = float(price)
+    except (TypeError, ValueError):
+        return "buy_retry_price_unknown"
+    if last <= 0.0 or cur <= 0.0:
+        return "buy_retry_price_unknown"
+    if cur > last * (1.0 - float(improve) / 100.0):
+        return "buy_retry_no_improve"
+    return None
+
+
+def _buy_retry_record(day, symbol, price):
+    """Charge one buy attempt to (day, symbol) after _place accepted it.
+
+    Recorded only on a successful send, so a refused attempt never lowers the
+    bar for the next one. Day rollover drops the whole table.
+    """
+    if _STATE.get("buy_tries_day") != day:
+        _STATE["buy_tries_day"] = day
+        _STATE["buy_tries"] = {}
+    tries = _STATE.setdefault("buy_tries", {})
+    entry = tries.get((day, symbol)) or {"n": 0, "price": None}
+    entry["n"] = int(entry.get("n", 0)) + 1
+    entry["price"] = price
+    tries[(day, symbol)] = entry
 
 
 def _day_loss_pct(deals, positions, day):
@@ -4404,10 +4479,23 @@ def run_round(ContextInfo, moment):
                     summary.setdefault("sized", []).append(
                         {"short": short, "qty": qty, "amount": signal["amount"],
                          "cap": "floor_topup:%.2f" % ceiling})
+            # BUY-RETRY-GATE 2026-11-23 (owner ruling "no repeat order without a
+            # price reversal"): a cancelled-unfilled buy may be re-sent, but only
+            # at a meaningfully lower limit and only a bounded number of times a
+            # day. 000088 sent 4.56 five times while the day low was 4.57, each
+            # one stale-cancelled 600 s later with zero fills -- 17k-20k of cash
+            # frozen for half an hour for nothing. t_leg is exempt: it runs its
+            # own journal and must keep trading the intraday band.
+            if intent != "t_leg":
+                _retry_why = _buy_retry_gate(day, symbol, signal.get("price"))
+                if _retry_why:
+                    summary["skipped"].append({"short": short, "reason": _retry_why})
+                    continue
             ok, why = _place(ContextInfo, signal)
             if ok:
                 _STATE["sent"].add((day, symbol, short))
                 if intent != "t_leg":
+                    _buy_retry_record(day, symbol, signal.get("price"))
                     # One buy intent per symbol per day (plan 1.3 item 1): the
                     # session registry, not the seconds-late ORDER table.
                     _STATE["buy_intents"].add((day, symbol))

@@ -279,12 +279,15 @@ MAPPING = [
     ("risk_day_loss_limit_pct", ("t_day_loss_limit_pct",), None),
     # 方向两个布尔 → 一个 mode 串（值不新造，串由 t_buy_first/t_sell_first 组）。
     ("__t_mode__", ("t_mode",), lambda _v, all_, cur, cur_tables: _t_mode(all_)),
-    # §BOX-FIX-20261123 载体形态三枚旋钮（真源 internal/config/carrier_knobs.go）。
-    # 卖出观察窗的轮数/秒数 + 云端仓位上限的保守折扣。Python 侧不写这三枚数，
-    # 缺键时 `_sz_p` / `_confirm_sell` 各自弃权或打告警，绝不静默取默认。
+    # §BOX-FIX-20261123 载体形态旋钮（真源 internal/config/carrier_knobs.go）。
+    # 卖出观察窗的轮数/秒数 + 云端仓位上限的保守折扣 + 同票重发闸的价格改善幅度与当日次数上限。
+    # Python 侧不写这几枚数，缺键时 `_sz_p` / `_confirm_sell` / `_buy_retry_gate`
+    # 各自弃权或打告警，绝不静默取默认。
     ("sell_confirm_rounds", ("sell_confirm_rounds",), None),
     ("sell_confirm_sec", ("sell_confirm_sec",), None),
     ("market_scale_ceiling_margin", ("market_scale_ceiling_margin",), None),
+    ("buy_retry_improve_pct", ("buy_retry_improve_pct",), None),
+    ("buy_retry_max_per_day", ("buy_retry_max_per_day",), None),
 ]
 
 # ---------------------------------------------------------------------------

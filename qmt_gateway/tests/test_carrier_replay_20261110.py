@@ -141,7 +141,12 @@ class ReplayTest(unittest.TestCase):
                            # §SELL-BASIS-FREEZE / §SELL-OBS-WINDOW 2026-11-23:
                            # day-keyed state must not leak between scenarios.
                            "basis": {}, "basis_day": "",
-                           "sell_obs": {}, "sell_obs_day": ""})
+                           "sell_obs": {}, "sell_obs_day": "",
+                           # §BUY-RETRY-GATE 2026-11-23: the per-(day, symbol)
+                           # attempt journal is day-keyed state too -- a scenario
+                           # that already sent one buy must not leak its attempt
+                           # into the next one (same day, same symbol).
+                           "buy_tries": {}, "buy_tries_day": ""})
         self.placed = []
         for name, fn in self._orig_rules.items():
             setattr(self.mod, name, fn)
