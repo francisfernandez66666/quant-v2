@@ -26538,6 +26538,7 @@ if command -v python3 >/dev/null 2>&1; then
 		qmt_gateway/tests/test_broker_reads.py \
 		qmt_gateway/tests/test_broker_reads_rebuild_20261110.py \
 		qmt_gateway/tests/test_rules_sizing.py \
+		qmt_gateway/tests/test_box_tasks_20261123.py \
 		-q >/dev/null 2>&1 || PY236B_RC=$?
 	[ "$PY236B_RC" = "0" ] || fail236 "载体行为腿 B 未过（退出码 ${PY236B_RC}）"
 else
@@ -26545,5 +26546,5 @@ else
 fi
 
 [ "$B236_FAILED" = "0" ] || exit 1
-echo "ok - §236 §BOX-FIX-20261123 锁通过（撤单4参带ContextInfo+阶梯基座冻结成本+三处卖出观察窗且清仓线不被bull延后+导出归档近端窗口不搬(今天+昨天)且根外归档+单次遍历文件名剪枝+上行锁与T8重复窗口+客户端20s轮询+盒内指数与云端上限+申购行分类与diagnostic去重+三旋钮单点同源，累计判定点 ${CNT236}）"
+echo "ok - §236 §BOX-FIX-20261123 锁通过（撤单4参带ContextInfo+阶梯基座冻结成本+三处卖出观察窗且清仓线不被bull延后+导出归档近端窗口不搬(今天+昨天)且根外归档+单次遍历文件名剪枝+上行锁与T8重复窗口+客户端20s轮询+盒内指数与云端上限+申购行分类与diagnostic去重+两份ps1任务/归档口径+三旋钮单点同源，累计判定点 ${CNT236}）"
 echo ""
