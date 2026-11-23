@@ -58,10 +58,20 @@ class _Fixture:
         self.tmp = tmp
         self.export_dir = os.path.join(tmp, "exports")
         os.makedirs(self.export_dir, exist_ok=True)
-        self.strategy_file = os.path.join(tmp, "installed_strategy.py")
+        self.strategy_file = os.path.join(tmp, "QMT", "python", "installed_strategy.py")
         self.executor_file = os.path.join(tmp, "local_executor.py")
+        os.makedirs(os.path.dirname(self.strategy_file), exist_ok=True)
         with open(self.strategy_file, "w", encoding="utf-8") as fh:
             fh.write('STRATEGY_VERSION = "v02-20261104"\n')
+        # §BOX-HEARTBEAT：心跳按 `<QMT_ROOT>/userdata/log/XtClient_FormulaOutput_*` 取日志
+        # 时间；夹具必须造出与真机同一套布局，否则心跳少两键而 golden 已声明三键
+        # （日志缺失时的"整键缺席"由 test_box_heartbeat_20261123.py 单独钉）。
+        self.strategy_log_dir = os.path.join(tmp, "QMT", "userdata", "log")
+        os.makedirs(self.strategy_log_dir, exist_ok=True)
+        self.strategy_log = os.path.join(self.strategy_log_dir, "XtClient_FormulaOutput_20261104.log")
+        with open(self.strategy_log, "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        os.utime(self.strategy_log, (FIXED_NOW - 30, FIXED_NOW - 30))
         with open(self.executor_file, "w", encoding="utf-8") as fh:
             fh.write('STRATEGY_VERSION = "v01-20261103"\nX = 1\n')
         if with_positions:
