@@ -26625,3 +26625,70 @@ fi
 [ "$B236_FAILED" = "0" ] || exit 1
 echo "ok - §236 §BOX-FIX-20261123 锁通过（撤单4参带ContextInfo+阶梯基座冻结成本+三处卖出观察窗且清仓线不被bull延后+导出归档近端窗口不搬(今天+昨天)且根外归档+单次遍历文件名剪枝+上行锁与T8重复窗口+客户端20s轮询+盒内指数与云端上限+申购行分类与diagnostic去重+两份ps1任务/归档口径+旋钮单点同源+同票重发闸(价格不反转不重发,当日3次上限,t_leg豁免,撤单释放不清闸)，累计判定点 ${CNT236}）"
 echo ""
+
+echo "==> 237 §BOX-HEARTBEAT（2026-11-23 owner 三问：QMT 开没开 / 自动交易在不在 / 连没连云端）..."
+B237_FAILED=0
+fail237() {
+	echo "--- FAIL: §237 $*"
+	FAIL=1
+	B237_FAILED=1
+}
+CNT237=0
+UP237=$(cat qmt_gateway/report_uplink.py || true)
+QMT237=$(cat internal/server/qmt.go || true)
+BH237=$(cat internal/server/box_heartbeat.go || true)
+LS237=$(cat internal/server/leg_status.go || true)
+FE237=$(cat web/src/components/CarrierUpdatePanel.jsx || true)
+DB237=$(cat web/src/pages/Dashboard.jsx || true)
+
+# ① 盒上采集：进程三态 + 策略日志快照；日志缺失整键缺席（missing≠empty）。
+CNT237=$((CNT237 + 1))
+grep_q 'def client_process_state(name=DEFAULT_CLIENT_PROCESS, runner=None):' UP237 F || fail237 "缺 client_process_state（进程三态没有单点）"
+grep_q 'def strategy_log_snapshot(strategy_file):' UP237 F || fail237 "缺 strategy_log_snapshot（策略日志时间没有读数源）"
+grep_q 'out["client_proc"] = client_process_state(self.client_process, self._proc_runner)' UP237 F || fail237 "心跳没带 client_proc"
+grep_q 'if snap is not None:' UP237 F || fail237 "日志缺失分支不在（会把心跳时间冒充日志时间）"
+grep_q 'out["strategy_log_age_sec"] = max(0, int(now_ts - snap[1]))' UP237 F || fail237 "心跳没带日志年龄"
+if grep_q 'out["strategy_log_at"] = _iso_beijing(now_ts)' UP237 F; then
+	fail237 "日志时间被心跳时刻顶班（读不到日志却报了一个新鲜时间）"
+fi
+
+# ② 云端落盘：heartbeat 事件接线 + 读面两分支都带 box_heartbeat。
+CNT237=$((CNT237 + 1))
+grep_q 'ClientProc        string `json:"client_proc,omitempty"`' QMT237 F || fail237 "qmtReportEvent 没接 client_proc"
+grep_q 's.recordBoxHeartbeat(uid, ev, cntime.Now())' QMT237 F || fail237 "heartbeat 分支没落盒子心跳"
+grep_q 'func (s *Server) recordBoxHeartbeat(uid string, ev qmtReportEvent, now time.Time) {' BH237 F || fail237 "缺 recordBoxHeartbeat"
+grep_q 'reason = "heartbeat_absent"' BH237 F || fail237 "没收到心跳必须 unknown/heartbeat_absent（不许折成 stopped）"
+if grep_q 'unreachable_marker_237' BH237 F; then
+	fail237 "不会发生"
+fi
+grep_q '"box_heartbeat":  heartbeat,' QMT237 F || fail237 "/api/qmt/state 的未接入分支没带 box_heartbeat"
+grep_q 'BoxHeartbeat: heartbeat}' QMT237 F || fail237 "/api/qmt/state 的已接入分支没带 box_heartbeat"
+grep_q 'BoxHeartbeat *boxHeartbeatReadout `json:"box_heartbeat"`' LS237 F || fail237 "state 信封缺 box_heartbeat 字段"
+
+# ③ 前端：一行只读读数 + 单点文案 + Dashboard 传参。
+CNT237=$((CNT237 + 1))
+grep_q 'export function boxHeartbeatText(hb)' FE237 F || fail237 "缺 boxHeartbeatText（文案没有单点）"
+grep_q 'data-testid="box-heartbeat"' FE237 F || fail237 "心跳行没有 testid（探针/用例无从定位）"
+grep_q 'heartbeat={qmtState.box_heartbeat}' DB237 F || fail237 "Dashboard 没把心跳读数传给面板"
+if grep_q '盒子心跳：读数未知（上行心跳未送达或账号目录未装配）' FE237 F; then
+	:
+else
+	fail237 "未知档必须显示读数未知（不许静默或折成进程结论）"
+fi
+
+# ④ 行为腿：Go 落盘/读面 + 盒上采集/组装。
+CNT237=$((CNT237 + 1))
+GO237_RC=0
+go test ./internal/server -run 'TestBoxHeartbeat|TestQMTStateSupersetOfStateSnapshot' -count=1 >/dev/null 2>&1 || GO237_RC=$?
+[ "$GO237_RC" = "0" ] || fail237 "云端行为腿未过（退出码 ${GO237_RC}）"
+if command -v python3 >/dev/null 2>&1; then
+	PY237_RC=0
+	python3 -m pytest qmt_gateway/tests/test_box_heartbeat_20261123.py -q >/dev/null 2>&1 || PY237_RC=$?
+	[ "$PY237_RC" = "0" ] || fail237 "盒上行为腿未过（退出码 ${PY237_RC}）"
+else
+	echo "INFO - §237 无 python3，盒上行为腿未跑"
+fi
+
+[ "$B237_FAILED" = "0" ] || exit 1
+echo "ok - §237 §BOX-HEARTBEAT 锁通过（心跳带进程三态与策略日志年龄、日志缺失整键缺席、云端心跳落盘/未知不折成 stopped、state 两分支下发、前端一行只读读数，累计判定点 ${CNT237}）"
+echo ""

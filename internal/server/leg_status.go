@@ -192,4 +192,7 @@ type qmtStateWithLeg struct {
 	LegStatus     *legStatus         `json:"leg_status"`
 	Carrier       *carrierReadout    `json:"carrier"`
 	CarrierShadow *carrierShadowView `json:"carrier_shadow"`
+	// §BOX-HEARTBEAT（2026-11-23）：第四枚纯增量观测——最近一次心跳带来的 XtItClient
+	// 三态与策略日志新鲜度。读不到时 known=false，前端只能显示「读数未知」。
+	BoxHeartbeat *boxHeartbeatReadout `json:"box_heartbeat"`
 }

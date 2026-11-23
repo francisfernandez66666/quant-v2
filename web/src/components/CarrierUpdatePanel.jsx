@@ -40,7 +40,32 @@ export function carrierStateText(state, known) {
   }
 }
 
-export default function CarrierUpdatePanel({ carrier }) {
+// §BOX-HEARTBEAT（2026-11-23）：盒子心跳一行的单点文案。
+// 现场（owner）：「我怎么知道我开没开 qmt 并开启自动交易，有没有连云端。」
+// 三件事按证据各说各的：进程三态 / 策略日志年龄 / 心跳年龄；读不到一律「读数未知」，
+// 绝不把"没收到心跳"折成"客户端没在跑"（missing≠empty）。
+export function boxHeartbeatText(hb) {
+  if (!hb || !hb.known) return '盒子心跳：读数未知（上行心跳未送达或账号目录未装配）'
+  const proc = hb.client_proc === 'running' ? '客户端 运行中'
+    : hb.client_proc === 'stopped' ? '客户端 未运行（查 QMTF-Client-Start）'
+      : '客户端 读数未知'
+  const log = typeof hb.strategy_log_age_sec === 'number'
+    ? '策略日志 ' + heartbeatAgeText(hb.strategy_log_age_sec)
+    : '策略日志 无读数'
+  const beat = typeof hb.age_sec === 'number'
+    ? '心跳 ' + heartbeatAgeText(hb.age_sec) : ''
+  return ['盒子心跳：' + proc, log, beat].filter(Boolean).join(' · ')
+}
+
+function heartbeatAgeText(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0))
+  if (s < 120) return s + ' 秒前'
+  const m = Math.round(s / 60)
+  if (m < 120) return m + ' 分钟前'
+  return Math.round(m / 60) + ' 小时前'
+}
+
+export default function CarrierUpdatePanel({ carrier, heartbeat }) {
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
   const [failed, setFailed] = useState(false)
@@ -119,6 +144,8 @@ export default function CarrierUpdatePanel({ carrier }) {
         </span>
       )}
       {!!lastAck && <span style={{ marginLeft: 8 }}>最近回执版 {lastAck}</span>}
+      {/* §BOX-HEARTBEAT：盒子活没活的一行只读读数（进程三态 / 策略日志年龄 / 心跳年龄）。 */}
+      <div data-testid="box-heartbeat" style={{ marginTop: 4 }}>{boxHeartbeatText(heartbeat)}</div>
       {/* tag="button" 是刻意的：TDesign 的 Button 在 disabled 时默认降级成 <div>——
           禁用的触发器就查无此钮（role 缺失），既骗过探针也骗过读屏用户。
           禁用态必须是**真实可发现的 disabled <button>**（用例锁的就是 getByRole('button').disabled）。 */}

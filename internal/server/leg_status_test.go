@@ -176,13 +176,21 @@ func TestQMTStateSupersetOfStateSnapshot(t *testing.T) {
 	}
 	// 超集判定二：多出来的键只许是这三枚已登记的观测键（不许顺手塞别的）。
 	// leg_status＝§EXT-BRAIN-UP 的上行腿读数；carrier＝§CARRIER-UPDATE 的载体清单读数；
-	// carrier_shadow＝§CARRIER-SHADOW 的载体影子对照读数（internal/server/carrier_shadow.go）。
-	// 三枚都是纯观测：加键要同批改这里，改这里要同批说清"谁消费它"。
-	allowedExtra := map[string]bool{"leg_status": true, "carrier": true, "carrier_shadow": true}
+	// carrier_shadow＝§CARRIER-SHADOW 的载体影子对照读数（internal/server/carrier_shadow.go）；
+	// box_heartbeat＝§BOX-HEARTBEAT 的盒子进程/策略日志读数（internal/server/box_heartbeat.go）。
+	// 都是纯观测：加键要同批改这里，改这里要同批说清"谁消费它"。
+	allowedExtra := map[string]bool{"leg_status": true, "carrier": true, "carrier_shadow": true,
+		"box_heartbeat": true}
 	for k := range wrapMap {
 		if _, ok := snapMap[k]; !ok && !allowedExtra[k] {
-			t.Errorf("state 响应多出了未登记的键 %q（本批只承诺 leg_status、carrier、carrier_shadow 三枚）", k)
+			t.Errorf("state 响应多出了未登记的键 %q（本批只承诺 leg_status、carrier、carrier_shadow、box_heartbeat 四枚）", k)
 		}
+	}
+	// §BOX-HEARTBEAT：未装配时必须是 null（键在位），与 carrier_shadow 同纪律。
+	if v, ok := wrapMap["box_heartbeat"]; !ok {
+		t.Error("box_heartbeat 键消失了（应为 null）——前端无从区分旧版本与读不出")
+	} else if v != nil {
+		t.Errorf("未显式装配时 box_heartbeat 应为 null，got %v", v)
 	}
 	// §CARRIER-SHADOW：包装体没显式给 carrier_shadow 时必须序列化成 null，
 	// 而不是整个键消失——前端据此分"这版后端没这个读数"与"读数说我不知道"两种形态，

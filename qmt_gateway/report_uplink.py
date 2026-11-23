@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import deque
@@ -312,6 +313,61 @@ def _event_hash(event):
     return _canonical_hash(event)
 
 
+# §BOX-HEARTBEAT（2026-11-23 owner：「我怎么知道我开没开 qmt、有没有连云端」）：
+# 心跳除了版本，再带两枚**只读**读数——XtItClient 进程三态 + 最近一份策略日志的 mtime。
+# 它们回答的是"盒子这台机器上交易终端还在不在、策略多久没说话了"；云端落一份
+# accounts/<uid>/box_heartbeat.json，前端只渲染，不参与任何判定。
+DEFAULT_CLIENT_PROCESS = "XtItClient.exe"
+STRATEGY_LOG_PREFIX = "XtClient_FormulaOutput_"
+
+
+def client_process_state(name=DEFAULT_CLIENT_PROCESS, runner=None):
+    """XtItClient 进程三态：running / stopped / unknown。
+
+    unknown 只给两种情形：非 Windows，或 tasklist 本身跑不起来。区分 stopped 与
+    unknown 很重要——"进程没了"要去拉起，"探测不了"要去查任务身份，两者不是同一步。
+    """
+    if sys.platform != "win32":
+        return "unknown"
+    run = runner or subprocess.run
+    try:
+        proc = run(["tasklist", "/FI", "IMAGENAME eq " + name, "/NH"],
+                   capture_output=True, timeout=20)
+    except Exception:  # noqa: BLE001 - 探测腿不许把心跳整条带走
+        return "unknown"
+    text = (proc.stdout or b"").decode("utf-8", "replace") + \
+        (proc.stderr or b"").decode("utf-8", "replace")
+    return "running" if name.lower() in text.lower() else "stopped"
+
+
+def strategy_log_snapshot(strategy_file):
+    """最近一份策略日志的 (path, mtime)，读不到返回 None。
+
+    路径从**已安装策略文件**推：`<QMT_ROOT>/python/<策略>.py` 的同级 `userdata/log/`。
+    不把安装目录写死在这里——同一套代码可能装在别的机器/别的盘符。
+    """
+    if not strategy_file:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(strategy_file)))
+    log_dir = os.path.join(root, "userdata", "log")
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return None
+    best = None
+    for name in names:
+        if not (name.startswith(STRATEGY_LOG_PREFIX) and name.endswith(".log")):
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if best is None or mtime > best[1]:
+            best = (path, mtime)
+    return best
+
+
 class ReportUplink:
     """上行客户端：读导出 → 组事件 → 去重 → POST → 只有 2xx 才推进"已报"账。
 
@@ -351,6 +407,10 @@ class ReportUplink:
         self.strategy_file = str(cfg.get("uplink_strategy_file") or "").strip()
         self.executor_file = str(cfg.get("uplink_executor_file") or
                                   os.path.join(os.path.dirname(self.config_path), "local_executor.py")).strip()
+        # §BOX-HEARTBEAT：进程名可配（换券商客户端时只改配置）；runner 仅供测试注入。
+        self.client_process = str(cfg.get("uplink_client_process")
+                                  or DEFAULT_CLIENT_PROCESS).strip()
+        self._proc_runner = None
         state_dir = str(cfg.get("uplink_state_dir") or os.path.dirname(self.config_path))
         self.state_path = os.path.join(state_dir, "uplink_state.json")
         # §CARRIER-SHADOW：执行器那本影子账的位置。三级兜底，全部指向**同一个**执行器写下的库：
@@ -864,17 +924,29 @@ class ReportUplink:
     def _build_heartbeat(self):
         """心跳带版本三件套：已装内置策略版本（进信封 strategy_version）+ 执行器/本模块
         自身版本与指纹（进 reason，ASCII 键值串）。策略文件读不到时 strategy_version 缺席
-        ——Go 的"空不覆盖已知"纪律保证这不会把已知的旧版本抹掉。"""
+        ——Go 的"空不覆盖已知"纪律保证这不会把已知的旧版本抹掉。
+
+        §BOX-HEARTBEAT（2026-11-23）：另带 `client_proc`（running/stopped/unknown）与
+        `strategy_log_at/strategy_log_age_sec`（最近一份 XtClient_FormulaOutput 日志的
+        mtime）。这两枚是 owner 要求"不用 RDP 也能知道 QMT 开没开、策略在不在说话"的
+        直接读数；日志读不到就整键缺席（missing≠empty：不许拿心跳时间冒充日志时间）。
+        """
         ver = read_version_constant(self.strategy_file) if self.strategy_file else ""
         if self.strategy_file and not ver:
             self._note_skip("strategy_version", "file_missing_or_no_constant")
         exec_ver = read_version_constant(self.executor_file)
         exec_fp = file_fingerprint(self.executor_file)
         own_fp = file_fingerprint(os.path.abspath(__file__))
+        now_ts = self._now_fn()
         out = self._base_event("heartbeat")
-        out["at"] = _iso_beijing(self._now_fn())
+        out["at"] = _iso_beijing(now_ts)
         if ver:
             out["strategy_version"] = ver
+        out["client_proc"] = client_process_state(self.client_process, self._proc_runner)
+        snap = strategy_log_snapshot(self.strategy_file)
+        if snap is not None:
+            out["strategy_log_at"] = _iso_beijing(snap[1])
+            out["strategy_log_age_sec"] = max(0, int(now_ts - snap[1]))
         parts = ["uplink_version=%s" % UPLINK_VERSION, "uplink_fingerprint=%s" % own_fp]
         if exec_ver:
             parts.append("executor_version=%s" % exec_ver)

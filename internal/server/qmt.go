@@ -901,6 +901,14 @@ type qmtReportEvent struct {
 	// English: §EXT-BRAIN-UP — version of the installed built-in strategy, reported by the
 	// box-local uplink process; answers "is the running build the installed build?".
 	StrategyVersion string `json:"strategy_version,omitempty"`
+	// §BOX-HEARTBEAT（2026-11-23）：心跳另带两枚只读读数——XtItClient 三态与最近一份
+	// 策略日志的 mtime/年龄。落到 accounts/<uid>/box_heartbeat.json，只经 /api/qmt/state
+	// 下发；不碰任何账本、不参与熔断（观测腿不许有钱的动作）。
+	// English: §BOX-HEARTBEAT — read-only liveness extras on the heartbeat; persisted to a
+	// per-account observation file and never booked.
+	ClientProc        string `json:"client_proc,omitempty"`
+	StrategyLogAt     string `json:"strategy_log_at,omitempty"`
+	StrategyLogAgeSec *int64 `json:"strategy_log_age_sec,omitempty"`
 	// Shadow §CARRIER-SHADOW（2026-11-05 载体影子对照批）：本地执行器（local_executor.py）在
 	// shadow 档算出的判定，由盒子普通进程（report_uplink.py）按"今天有行才报、没行一个都不发"
 	// 的口径上行（事件类型 carrier_shadow）。与 positions 同姿势——数组进信封一枚键，
@@ -1392,6 +1400,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	case "heartbeat":
 		// §ROBUST 上行心跳：last_report_at 已在 switch 前统一刷新——它就是心跳的全部意义
 		// （无交易时段证明 广州→首尔 回程连通），无任何账本副作用。
+		// §BOX-HEARTBEAT：顺带落一份进程/策略日志读数（只读观测文件，见 box_heartbeat.go）。
+		s.recordBoxHeartbeat(uid, ev, cntime.Now())
 	case "broker":
 		// §QMT-DUAL 通道切换事件（xt↔queued）：仅观察用，不动账本。旧实现没有本 case
 		// 导致 outbox 里的切换回报反复 400 重推刷屏（2026-09-11 生产实录）。
@@ -2126,6 +2136,8 @@ func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 	// 只读三张表、不参与任何判定；读不出时 Known=false + 原因，前端只能显示"读数未知"
 	// （绝不把"读不出"渲染成"今天没有影子决策"——那是 missing 折成 empty 的老形状）。
 	shadow := s.carrierShadowReadout(uid, parseCarrierShadowDays(r), cntime.Now())
+	// §BOX-HEARTBEAT：第四枚纯增量观测（进程三态/策略日志新鲜度），读不到即 known=false。
+	heartbeat := s.boxHeartbeatReadout(uid, cntime.Now())
 	ctrl := s.qmtCtrlFor(uid)
 	if ctrl == nil {
 		// 未接入实盘：保留旧字段形状，前端据此隐藏实盘区块。
@@ -2134,12 +2146,13 @@ func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 			"leg_status":     leg,
 			"carrier":        carrier,
 			"carrier_shadow": shadow,
+			"box_heartbeat":  heartbeat,
 		})
 		return
 	}
 	// 已接入：直接透出控制器健康快照（下行探测/上行回报新鲜度/熔断详情/资金等），附腿状态。
 	writeJSON(w, 200, qmtStateWithLeg{StateSnapshot: ctrl.Snapshot(), LegStatus: leg,
-		Carrier: carrier, CarrierShadow: shadow})
+		Carrier: carrier, CarrierShadow: shadow, BoxHeartbeat: heartbeat})
 }
 
 // handleQMTOrders 处理 GET /api/qmt/orders（admin）：当日实盘委托列表。

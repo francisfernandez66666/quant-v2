@@ -592,7 +592,7 @@ export default function Dashboard() {
               同样只在真的拿到过快照时才交给组件（qmtState=null 是"还没取到"，不是"未知"）；
               组件自己按 carrier.known / desired_ready 分形，未知绝不折成"已是最新"。
               这一行是纯读数＋人工触发，不参与任何熔断或资金判定。 */}
-          {qmtState && <CarrierUpdatePanel carrier={qmtState.carrier} />}
+          {qmtState && <CarrierUpdatePanel carrier={qmtState.carrier} heartbeat={qmtState.box_heartbeat} />}
           {/* §CARRIER-SHADOW：移植规则与引擎的按日对照贴在同一宿主行（同一份 /state 读数，
               不新开路由）。这块屏是「武装」按钮前面唯一的证据，纯读数、无任何动作；
               known=false 时组件自己显示「读数未知」，绝不显示 0 天。 */}
