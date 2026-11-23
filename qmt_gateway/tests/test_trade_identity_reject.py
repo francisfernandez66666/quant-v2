@@ -152,13 +152,16 @@ class TestReportFieldsContractIntact(unittest.TestCase):
         # 携带的「本轮跳过清单」——读数缺失不再云端静默，Go 只留痕不落账。有意新增。
         # §TRADE-LEDGER（2026-11-13）再补 remark：委托备注随成交/委托行上行——载体自闭环
         # 的唯一战法归因源（Go 反解短码补 signal_id）。有意新增。
+        # §BOX-HEARTBEAT（2026-11-23）再补 client_proc / strategy_log_at / strategy_log_age_sec：
+        # 心跳携带的 XtItClient 三态与最近策略日志 mtime/年龄（前端"QMT 开没开"那条读数）。
+        # 日志缺失时后两键按事实缺席（omitempty），契约面只登记"可能出现的并集"。有意新增。
         self.assertEqual(
             sorted(c["report_event_fields"]),
-            sorted(["amount", "asset", "at", "broker", "code", "created_at", "data_ts", "fee",
-                    "from", "name", "order_id", "positions", "price", "qty", "reason", "remark",
-                    "shadow", "side", "side_unverified", "signal_id", "skips", "stamp_tax",
-                    "status", "strategy_version", "synced", "trade_id", "traded_at", "type",
-                    "user_id"]))
+            sorted(["amount", "asset", "at", "broker", "client_proc", "code", "created_at",
+                    "data_ts", "fee", "from", "name", "order_id", "positions", "price", "qty",
+                    "reason", "remark", "shadow", "side", "side_unverified", "signal_id", "skips",
+                    "stamp_tax", "status", "strategy_log_age_sec", "strategy_log_at",
+                    "strategy_version", "synced", "trade_id", "traded_at", "type", "user_id"]))
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 
 
