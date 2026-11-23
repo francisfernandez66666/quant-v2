@@ -91,6 +91,84 @@ class BuyRetryGateTest(unittest.TestCase):
                         "缺配置必须留一行告警，不能静默")
 
 
+class BuyRetryCounterTest(unittest.TestCase):
+    """柜台当日委托表：重启后仍数得出同价重发（进程内 journal 会随投递清零）。
+
+    现场：000088 在 13:23/13:33/13:44/13:54 以同一个 4.56 连发四笔，中间经历
+    v159/v160/v162/v163 四次载体重启 —— 每次重启内存计数归零，闸就再放一笔。
+    柜台 ORDER 表跨重启存活，所以它才是"今天试过几次"的真源。
+    """
+
+    def setUp(self):
+        mod.PARAMS = {"buy_retry_improve_pct": 0.2, "buy_retry_max_per_day": 3}
+        mod._STATE.update({"buy_tries": {}, "buy_tries_day": "", "warned": {}})
+
+    @staticmethod
+    def _row(sym="000088.SZ", side="buy", traded=0.0, price=4.56, t=100.0):
+        return {"symbol": sym, "side": side, "traded": traded,
+                "price": price, "order_time": t}
+
+    def test_counter_blocks_same_price_after_reload(self):
+        """内存为空（刚重启），柜台那一笔 4.56 必须让同价重发被拦。"""
+        rows = [self._row(price=4.56)]
+        self.assertEqual(mod._buy_retry_gate(DAY, SYM, 4.56, rows),
+                         "buy_retry_no_improve")
+
+    def test_counter_latest_price_allows_real_pullback(self):
+        rows = [self._row(price=4.56)]
+        self.assertIsNone(mod._buy_retry_gate(DAY, SYM, 4.55, rows))
+
+    def test_filled_row_is_not_an_attempt(self):
+        """成交过的单是加仓，不是同价循环 —— 不许把它算成一次尝试。"""
+        rows = [self._row(price=4.56, traded=100.0)]
+        self.assertIsNone(mod._buy_retry_gate(DAY, SYM, 4.56, rows))
+
+    def test_sell_and_foreign_symbol_ignored(self):
+        rows = [self._row(side="sell", price=4.56),
+                self._row(sym="000009.SZ", price=4.56)]
+        self.assertIsNone(mod._buy_retry_gate(DAY, SYM, 4.56, rows))
+
+    def test_unreadable_counter_price_skipped(self):
+        """读不到价的行证明不了限价，跳过（但也不许当成 0 价）。"""
+        rows = [self._row(price=0.0)]
+        self.assertIsNone(mod._buy_retry_gate(DAY, SYM, 4.56, rows))
+
+    def test_counter_cap_after_reload(self):
+        """柜台三笔未成交买单 = 当日次数用满。"""
+        rows = [self._row(price=4.56, t=1), self._row(price=4.55, t=2),
+                self._row(price=4.54, t=3)]
+        self.assertEqual(mod._buy_retry_gate(DAY, SYM, 4.40, rows), "buy_retry_cap")
+
+    def test_counter_and_memory_take_max_not_sum(self):
+        """柜台行包含本进程发出的单，所以取 max —— 相加会把同一笔数两遍。"""
+        mod._buy_retry_record(DAY, SYM, 4.56)
+        mod._buy_retry_record(DAY, SYM, 4.55)
+        rows = [self._row(price=4.56, t=1), self._row(price=4.55, t=2)]
+        self.assertIsNone(mod._buy_retry_gate(DAY, SYM, 4.54, rows),
+                          "内存 2 笔 + 柜台同 2 笔仍是 2 笔，没到 3")
+        rows.append(self._row(price=4.57, t=0))
+        self.assertEqual(mod._buy_retry_gate(DAY, SYM, 4.54, rows), "buy_retry_cap",
+                         "柜台多出一笔重启前的 ⇒ 当日 3 笔用满")
+
+    def test_counter_uses_newest_row_price(self):
+        """最新一笔（order_time 最大）才是"上次限价"，与表顺序无关。"""
+        rows = [self._row(price=4.60, t=10), self._row(price=4.50, t=5)]
+        self.assertIsNone(mod._buy_retry_gate(DAY, SYM, 4.58, rows),
+                          "最新一笔是 4.60，4.58 已是真回调；按表序取 4.50 会误拦")
+
+    def test_counter_symbol_bare_match(self):
+        """柜台给 000088，信号给 000088.SZ —— 同一只票。"""
+        rows = [self._row(sym="000088", price=4.56)]
+        self.assertEqual(mod._buy_retry_gate(DAY, "000088.SZ", 4.56, rows),
+                         "buy_retry_no_improve")
+
+    def test_counter_returns_count_and_last_price(self):
+        rows = [self._row(price=4.56, t=1), self._row(price=4.55, t=2)]
+        n, px = mod._buy_retry_counter(DAY, SYM, rows)
+        self.assertEqual(n, 2)
+        self.assertAlmostEqual(px, 4.55)
+
+
 class BuyRetryWiringTest(unittest.TestCase):
     """静态接线：闸在 _place 之前、t_leg 豁免、只在发单成功后记账。"""
 
@@ -100,16 +178,23 @@ class BuyRetryWiringTest(unittest.TestCase):
 
     def test_gate_runs_before_place(self):
         src = self._src()
-        gate = src.index("_buy_retry_gate(day, symbol, signal.get(\"price\"))")
+        gate = src.index("_buy_retry_gate(day, symbol, signal.get(\"price\"), orders)")
         place = src.index("ok, why = _place(ContextInfo, signal)", gate - 4000)
         self.assertLess(gate, place, "闸必须排在 _place 之前")
 
     def test_gate_skips_t_leg(self):
         src = self._src()
-        gate = src.index("_buy_retry_gate(day, symbol, signal.get(\"price\"))")
+        gate = src.index("_buy_retry_gate(day, symbol, signal.get(\"price\"), orders)")
         window = src[max(0, gate - 400):gate]
         self.assertIn('if intent != "t_leg":', window,
                       "T 腿有自己的账本，不许被这道闸拦住")
+
+    def test_gate_gets_counter_orders(self):
+        """接线腿：柜台当日委托表必须真的喂进闸（否则重启后又清零）。"""
+        src = self._src()
+        self.assertIn("_buy_retry_gate(day, symbol, signal.get(\"price\"), orders)", src)
+        self.assertIn("n_ct, px_ct = _buy_retry_counter(day, symbol, orders)", src)
+        self.assertIn("n = max(int(entry.get(\"n\", 0) or 0), n_ct)", src)
 
     def test_record_only_after_success(self):
         src = self._src()

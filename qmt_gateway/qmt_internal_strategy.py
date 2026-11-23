@@ -136,7 +136,9 @@ _STATE = {
     # limit}}. A cancelled-unfilled buy may be re-sent, but only at a lower price
     # and only `buy_retry_max_per_day` times (see _buy_retry_gate). Deliberately
     # NOT released by _reconcile_session_intents: the cancel must reopen the
-    # intent, it must not reopen the same-price loop.
+    # intent, it must not reopen the same-price loop. This dict is only the
+    # in-process half; the counter's own today rows are merged in on every check
+    # (_buy_retry_counter), so a carrier reload cannot reset the count.
     "buy_tries": {},
     "buy_tries_day": "",
 }
@@ -849,7 +851,45 @@ def _confirm_sell(day, symbol, kind, now):
             and (now - float(entry.get("since", now))) >= float(secs))
 
 
-def _buy_retry_gate(day, symbol, price):
+def _buy_retry_counter(day, symbol, orders):
+    """Today's own UNFILLED buy attempts for `symbol`, read off the counter.
+
+    Restart-proof half of the retry gate. `_STATE` dies with the process, and
+    this strategy is reloaded on every carrier delivery (four times on
+    2026-11-23 alone: v159/v160/v162/v163). Each reload used to hand the name
+    one more free attempt at exactly the price that never traded -- the counter
+    showed 000088 re-sent at 4.56/4.57 eleven times, every one cancelled with
+    zero fill. The ORDER table survives a reload and `_live_orders` already
+    keeps only today's OWN rows, so it is the right evidence to consult.
+
+    A row with ANY fill is not an attempt: adding to a name that actually
+    traded is accumulation, not a loop. Returns (count, latest limit price);
+    an unreadable price is skipped (it proves nothing about the limit).
+    """
+    n = 0
+    last_px = 0.0
+    last_t = -1.0
+    for row in orders or []:
+        if _bare(row.get("symbol")) != _bare(symbol):
+            continue
+        if str(row.get("side") or "") != "buy":
+            continue
+        if _to_float(row.get("traded"), 0.0) > 0.0:
+            continue
+        px = _to_float(row.get("price"), 0.0)
+        if px <= 0.0:
+            continue
+        n += 1
+        t = _to_float(row.get("order_time"), 0.0)
+        # Newest row wins; on equal/unknown times the HIGHER limit wins so the
+        # reading does not depend on table order.
+        if t > last_t or (t == last_t and px > last_px):
+            last_px = px
+            last_t = t
+    return n, last_px
+
+
+def _buy_retry_gate(day, symbol, price, orders=None):
     """Same-symbol re-buy gate: no repeat order at a price the tape never took.
 
     Owner ruling 2026-11-23: "for the same symbol, if the price has not reversed
@@ -872,6 +912,11 @@ def _buy_retry_gate(day, symbol, price):
     and the T leg / sell legs never reach here. Missing config keys turn the gate
     OFF with one warning (never silently disable the buy leg); an unreadable price
     on a RETRY fails closed -- "cannot see the price" must not become "re-send".
+
+    Attempts are counted from BOTH the in-memory journal and the counter's own
+    today rows (see _buy_retry_counter): the journal is exact within one process
+    and the counter covers everything that happened before the current one
+    started, so a reload cannot reset the count to zero.
     """
     improve = PARAMS.get("buy_retry_improve_pct")
     max_n = PARAMS.get("buy_retry_max_per_day")
@@ -883,12 +928,16 @@ def _buy_retry_gate(day, symbol, price):
         _STATE["buy_tries_day"] = day
         _STATE["buy_tries"] = {}
     tries = _STATE.setdefault("buy_tries", {})
-    entry = tries.get((day, symbol))
-    if entry is None:
+    entry = tries.get((day, symbol)) or {}
+    n_ct, px_ct = _buy_retry_counter(day, symbol, orders)
+    n = max(int(entry.get("n", 0) or 0), n_ct)
+    if n <= 0:
         return None
-    if int(entry.get("n", 0)) >= int(max_n):
+    if n >= int(max_n):
         return "buy_retry_cap"
-    last = entry.get("price")
+    # The in-memory price is the last accepted send (fresher than the table,
+    # which lags by seconds); the counter price covers pre-restart attempts.
+    last = entry.get("price") or px_ct
     try:
         last = float(last)
         cur = float(price)
@@ -4487,7 +4536,7 @@ def run_round(ContextInfo, moment):
             # frozen for half an hour for nothing. t_leg is exempt: it runs its
             # own journal and must keep trading the intraday band.
             if intent != "t_leg":
-                _retry_why = _buy_retry_gate(day, symbol, signal.get("price"))
+                _retry_why = _buy_retry_gate(day, symbol, signal.get("price"), orders)
                 if _retry_why:
                     summary["skipped"].append({"short": short, "reason": _retry_why})
                     continue

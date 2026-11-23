@@ -26560,17 +26560,32 @@ grep_q '"buy_retry_improve_pct", ("buy_retry_improve_pct",)' DERIVE236 F || fail
 grep_q '"buy_retry_max_per_day", ("buy_retry_max_per_day",)' DERIVE236 F || fail236 "派生表没登记 buy_retry_max_per_day"
 grep_q '"buy_retry_improve_pct": 0.2' PARAMS236 F || fail236 "参数文件缺 buy_retry_improve_pct=0.2"
 grep_q '"buy_retry_max_per_day": 3' PARAMS236 F || fail236 "参数文件缺 buy_retry_max_per_day=3"
-grep_q 'def _buy_retry_gate(day, symbol, price):' QS236 F || fail236 "缺 _buy_retry_gate（同价重发循环无人拦）"
+grep_q 'def _buy_retry_gate(day, symbol, price, orders=None):' QS236 F || fail236 "缺 _buy_retry_gate（同价重发循环无人拦）"
 grep_q 'def _buy_retry_record(day, symbol, price):' QS236 F || fail236 "缺 _buy_retry_record（发过的价没人记）"
 grep_q 'improve = PARAMS.get("buy_retry_improve_pct")' QS236 F || fail236 "重发闸没读 PARAMS 的改善幅度（第二本账）"
 grep_q 'max_n = PARAMS.get("buy_retry_max_per_day")' QS236 F || fail236 "重发闸没读 PARAMS 的次数上限"
 grep_q 'return "buy_retry_cap"' QS236 F || fail236 "缺 buy_retry_cap 读数"
 grep_q 'return "buy_retry_no_improve"' QS236 F || fail236 "缺 buy_retry_no_improve 读数"
 grep_q 'return "buy_retry_price_unknown"' QS236 F || fail236 "缺 buy_retry_price_unknown（看不见价必须 fail-closed）"
-grep_q '_retry_why = _buy_retry_gate(day, symbol, signal.get("price"))' QS236 F || fail236 "买入链没接重发闸"
+grep_q '_retry_why = _buy_retry_gate(day, symbol, signal.get("price"), orders)' QS236 F || fail236 "买入链没接重发闸（或没把当日委托表喂给它）"
 grep_q '_buy_retry_record(day, symbol, signal.get("price"))' QS236 F || fail236 "发单成功没记账"
+# 重启不重置：柜台当日自己的未成交买单也是尝试次数（进程内 journal 会随投递重启清零，
+# 今天 v159/v160/v162/v163 四次重启各放过一笔同价 000088）。
+grep_q 'def _buy_retry_counter(day, symbol, orders):' QS236 F || fail236 "缺 _buy_retry_counter（重启后计数归零＝同价循环复活）"
+grep_q 'n_ct, px_ct = _buy_retry_counter(day, symbol, orders)' QS236 F || fail236 "重发闸没读柜台当日尝试"
+grep_q 'n = max(int(entry.get("n", 0) or 0), n_ct)' QS236 F || fail236 "柜台与进程内计数没合并（只认一半）"
+GB236=$( { grep -n '^def _buy_retry_gate(' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+[ -n "$GB236" ] || fail236 "找不到 _buy_retry_gate 定义"
+if [ -n "$GB236" ]; then
+	GE236=$( { awk -v s="$GB236" 'NR>s && /^def /{print NR; exit}' qmt_gateway/qmt_internal_strategy.py || true; } )
+	[ -n "$GE236" ] || GE236=$(( $(wc -l < qmt_gateway/qmt_internal_strategy.py) + 1 ))
+	GBODY236=$(sed -n "${GB236},$((GE236-1))p" qmt_gateway/qmt_internal_strategy.py 2>/dev/null || true)
+	if grep_q 'entry is None:' GBODY236 F; then
+		fail236 "闸体又回到只认进程内 journal 的早退（重启即清零）"
+	fi
+fi
 # 位置锁：闸必须在 _place 之前（发出去再拦就是空话）。
-RG236=$( { grep -n '_buy_retry_gate(day, symbol, signal.get("price"))' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+RG236=$( { grep -n '_buy_retry_gate(day, symbol, signal.get("price"), orders)' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
 PL236=$( { grep -n 'ok, why = _place(ContextInfo, signal)' qmt_gateway/qmt_internal_strategy.py || true; } | tail -1 | cut -d: -f1)
 [ -n "$RG236" ] && [ -n "$PL236" ] || fail236 "找不到重发闸或 _place 的锚点"
 if [ -n "$RG236" ] && [ -n "$PL236" ] && [ "$RG236" -ge "$PL236" ]; then
