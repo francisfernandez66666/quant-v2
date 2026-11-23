@@ -1074,22 +1074,46 @@ class TestEnsureClientRevive(unittest.TestCase):
     **Windows 时代的旧任务名** `QMT-Ensure-Running`；名字对不上就被 try/catch 吞成一行 warn，
     而日志里 RESTART 那行看起来仍然"attempted"。现网叫 `QMTF-Client-Ensure`。
 
-    三条锁：
-      1. 进程在跑 ⇒ 一次都不许再起（重复启动撞 QMT 的 userdata 锁）；
-      2. 进程不在 ⇒ 恰好触发一次 `QMTF-Client-Start`；
-      3. 失败只记日志、不抛（自愈失败不许把投递判红）。
+    §CLIENT-REVIVE-BOOT（2026-11-23）再加两条：`schtasks /Run` 的返回码只说明"任务已提交"
+    （09:40 那次 rc=267014 同样没拉起客户端），所以必须轮询等进程真的出现；
+    三态日志 already / start_ok / start_failed，最多重试一次。
     """
 
     class _Fake(object):
-        def __init__(self, running):
+        def __init__(self, running, appear_after=0):
             self._running = running
+            self._appear_after = appear_after  # 第几次 schtasks 之后进程出现；0=永不出 now
+            self._starts = 0
             self.lines = []
 
         def _client_running(self):
             return self._running
 
+        # 被 ensure_client 调到的两个真方法（fake 不是 CarrierUpdater 实例，显式转调）。
+        def _start_client_task(self):
+            return cu.CarrierUpdater._start_client_task(self)
+
+        def _wait_client(self, timeout_sec):
+            return cu.CarrierUpdater._wait_client(self, timeout_sec)
+
         def _log(self, line):
             self.lines.append(line)
+
+        def _on_start(self):
+            self._starts += 1
+            if self._appear_after and self._starts >= self._appear_after:
+                self._running = True
+
+    def _run(self, fake, side_effect=None):
+        with mock.patch.object(cu.sys, "platform", "win32"), \
+                mock.patch.object(cu, "CLIENT_POLL_SEC", 0), \
+                mock.patch.object(cu.subprocess, "run") as run:
+            if side_effect is not None:
+                run.side_effect = side_effect
+            else:
+                run.side_effect = lambda *a, **k: (fake._on_start(), mock.Mock(returncode=0))[1]
+            cu.CarrierUpdater.ensure_client(fake)
+        return run
 
     def test_running_client_is_left_alone(self):
         fake = self._Fake(True)
@@ -1099,25 +1123,37 @@ class TestEnsureClientRevive(unittest.TestCase):
         run.assert_not_called()
         self.assertTrue(any("action=already" in ln for ln in fake.lines), fake.lines)
 
-    def test_missing_client_is_started_once(self):
-        fake = self._Fake(False)
-        with mock.patch.object(cu.sys, "platform", "win32"), \
-                mock.patch.object(cu.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0)
-            cu.CarrierUpdater.ensure_client(fake)
+    def test_missing_client_is_started_and_waited_for(self):
+        fake = self._Fake(False, appear_after=1)
+        run = self._run(fake)
         self.assertEqual(run.call_count, 1)
         argv = run.call_args[0][0]
         self.assertEqual(argv[:3], ["schtasks", "/Run", "/TN"])
         self.assertEqual(argv[3], "QMTF-Client-Start")
         self.assertEqual(argv[3], cu.CLIENT_START_TASK)
-        self.assertTrue(any("action=start rc=0" in ln for ln in fake.lines), fake.lines)
+        self.assertTrue(any("action=start_ok" in ln for ln in fake.lines), fake.lines)
+        self.assertFalse(any("action=start_failed" in ln for ln in fake.lines), fake.lines)
+
+    def test_process_never_appears_retries_once_then_fails(self):
+        fake = self._Fake(False, appear_after=0)
+        run = self._run(fake)
+        self.assertEqual(run.call_count, cu.CLIENT_START_RETRIES + 1,
+                         "进程一直不出现必须重试一次（只判返回码的旧形状会被当成成功）")
+        self.assertTrue(any("action=start_failed" in ln for ln in fake.lines), fake.lines)
+
+    def test_second_attempt_can_succeed(self):
+        fake = self._Fake(False, appear_after=2)
+        run = self._run(fake)
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(any("action=start_ok rc=0 attempt=2" in ln for ln in fake.lines), fake.lines)
 
     def test_failure_never_raises(self):
         fake = self._Fake(False)
         with mock.patch.object(cu.sys, "platform", "win32"), \
+                mock.patch.object(cu, "CLIENT_POLL_SEC", 0), \
                 mock.patch.object(cu.subprocess, "run", side_effect=OSError("boom")):
             cu.CarrierUpdater.ensure_client(fake)
-        self.assertTrue(any("action=error" in ln for ln in fake.lines), fake.lines)
+        self.assertTrue(any("action=start_failed rc=-1" in ln for ln in fake.lines), fake.lines)
 
     def test_non_windows_is_a_noop(self):
         fake = self._Fake(False)

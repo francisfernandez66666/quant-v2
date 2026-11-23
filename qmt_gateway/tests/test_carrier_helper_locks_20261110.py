@@ -42,6 +42,15 @@ class HelperLockTest(unittest.TestCase):
         cls.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.mod)
 
+    def setUp(self):
+        # §SELL-BASIS-FREEZE 2026-11-23: day-keyed basis state must not leak
+        # between tests (the first sighting wins, so a stale basis would make
+        # the day-loss fuse read the wrong cost).
+        self.mod._STATE["basis"] = {}
+        self.mod._STATE["basis_day"] = ""
+        self.mod._STATE["sell_obs"] = {}
+        self.mod._STATE["sell_obs_day"] = ""
+
     # ---- dimension guard: the 11-06 pollution shape must refuse buys ----
     def test_asset_guard_refuses_polluted_total(self):
         """total=4M with cash=9k/mv=90k (the 11-06 target jump) => refuse."""
@@ -56,16 +65,16 @@ class HelperLockTest(unittest.TestCase):
     def test_day_loss_pct_sell_only_and_fail_closed(self):
         pos = {"600000.SH": {"qty": 1000, "cost": 10.0}}
         deals = [{"symbol": "600000.SH", "side": "buy", "price": 9.0, "qty": 500, "amount": 4500.0}]
-        pnl, ok = self.mod._day_loss_pct(deals, pos)
+        pnl, ok = self.mod._day_loss_pct(deals, pos, "2026-11-10")
         self.assertEqual((pnl, ok), (0.0, True), "buy fills alone never book pnl")
         sells = deals + [{"symbol": "600000.SH", "side": "sell", "price": 9.0, "qty": 500, "amount": 4500.0}]
-        pnl, ok = self.mod._day_loss_pct(sells, pos)
+        pnl, ok = self.mod._day_loss_pct(sells, pos, "2026-11-10")
         self.assertTrue(ok)
         self.assertAlmostEqual(pnl, (9.0 - 10.0) * 500.0)
         bad = [{"symbol": "UNHELD.SH", "side": "sell", "price": 9.0, "qty": 100, "amount": 900.0}]
-        self.assertEqual(self.mod._day_loss_pct(bad, pos), (None, False),
+        self.assertEqual(self.mod._day_loss_pct(bad, pos, "2026-11-10"), (None, False),
                          "a sell without a provable cost makes the fuse UNPROVABLE")
-        self.assertEqual(self.mod._day_loss_pct(None, pos), (None, False),
+        self.assertEqual(self.mod._day_loss_pct(None, pos, "2026-11-10"), (None, False),
                          "DEAL table unreadable => unprovable => buys decline")
 
     # ---- intent tags: never inferred from size ----

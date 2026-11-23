@@ -125,7 +125,7 @@ class SessionAndPricingTest(unittest.TestCase):
         self.mod._SANDBOX_FNS.update({"cancel": lambda *a: calls.append(a)})
         self.mod._account = lambda: "8001"
         self.mod._STATE["round_moment"] = datetime.datetime(2026, 11, 13, 0, 0)
-        ok, why = self.mod._cancel("12345")
+        ok, why = self.mod._cancel(None, "12345")
         self.assertFalse(ok)
         self.assertEqual(why, "outside_trading_session")
         self.assertEqual(calls, [])

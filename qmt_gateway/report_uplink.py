@@ -76,6 +76,19 @@ DEFAULT_QUEUE_MAX = 500
 DEFAULT_SENT_KEEP = 2000
 # 跳过原因清单的保留条数（missing≠empty 的"记因为什么没发"就落在这里）。
 DEFAULT_SKIP_KEEP = 50
+# §UPLINK-SINGLE-WALK（2026-11-23）：导出候选按文件名日期剪枝的天数。
+# 2 = 今天 + 昨天：跨零点前后的那一轮仍能读到昨天的收盘导出，而三天前的每分钟导出
+# （D:\qmt 实测 15.5 万个文件）连 stat 都不做。缺省写在模块常量里，配置可覆盖。
+DEFAULT_EXPORT_MAX_AGE_DAYS = 2
+# §UPLINK-NOISE（2026-11-23）：diagnostic 必须进"同内容只发一次"这条判据。
+# 运行时**所有事件类型都走去重**（见 run_once 的 seen 分支）——按类型分叉会让新类型默认
+# 逃过去重，那正是这枚噪音的成因；diagnostic 的内容按 (kind, reason) 集合收敛（_event_hash），
+# 所以状态不变就只发一次。
+# force（云端手动刷新）只放宽这三类；diagnostic 永远走去重，不被 force 重放。
+FORCE_REPOST_TYPES = ("positions", "account", "order")
+# §UPLINK-CADENCE（2026-11-23）：单轮互斥锁。计划任务用 IgnoreNew 静默拒绝重叠轮次
+# （0x800710E0，日志里完全无痕），锁文件把"这一轮没跑"变成看得见的一行。
+UPLINK_LOCK_NAME = ".uplink.lock"
 # §CARRIER-SHADOW 单事件行数：必须**严格小于** Go 侧 carrierShadowMaxRows(500)——
 # 那一侧超上限是整条 400（毒丸进死信），宁可在这里多切一刀，也不要让一天的判定全丢。
 DEFAULT_SHADOW_BATCH_ROWS = 200
@@ -283,6 +296,22 @@ def _canonical_hash(event):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _event_hash(event):
+    """去重判据；diagnostic 只看 (kind, reason) 集合，不看 count。
+
+    §UPLINK-NOISE（2026-11-23）：diagnostic 的 skip 条目带 count（累计次数），而 count
+    每轮都会变。若按全量内容哈希，同一状态会每轮都是"新事件"——那正是这条腿要消灭的
+    刷屏形状。所以这里把诊断的哈希收敛到"类别集合"：新增/消失一个 (kind, reason) 才重发。
+    """
+    if event.get("type") == "diagnostic":
+        skips = event.get("skips") or []
+        pairs = sorted([str(s.get("kind") or ""), str(s.get("reason") or "")] for s in skips)
+        blob = json.dumps({"type": "diagnostic", "user_id": event.get("user_id"),
+                           "skips": pairs}, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return _canonical_hash(event)
+
+
 class ReportUplink:
     """上行客户端：读导出 → 组事件 → 去重 → POST → 只有 2xx 才推进"已报"账。
 
@@ -315,6 +344,9 @@ class ReportUplink:
         # 配置了 uplink_fund_account 后，行里「资金账号」列不匹配的整行丢弃——三个目录
         # 里只认主账户自己的那份。缺省为空＝不过滤（单目录部署不需要）。
         self.fund_account = str(cfg.get("uplink_fund_account") or "").strip()
+        # §UPLINK-SINGLE-WALK（2026-11-23）：候选导出按文件名日期剪枝的天数（缺省今天+昨天）。
+        self.export_max_age_days = int(cfg.get("uplink_export_max_age_days")
+                                       or DEFAULT_EXPORT_MAX_AGE_DAYS)
         # 已安装内置策略文件（心跳版本的读取源）与执行器文件（自身指纹源）。
         self.strategy_file = str(cfg.get("uplink_strategy_file") or "").strip()
         self.executor_file = str(cfg.get("uplink_executor_file") or
@@ -341,6 +373,8 @@ class ReportUplink:
         # 运行态：重试队列（有界 FIFO）+ 各读数类别的半文件参照账本（跨轮保留上一份行数）。
         self._retry = deque()
         self._ledgers = {}
+        # §UPLINK-SINGLE-WALK：一轮只遍历一次导出树，四类读数共享同一份候选清单。
+        self._scan = None
         self._load_state()
 
     # ---------------- 状态文件（绝不写钥匙，测试逐字节钉死） ----------------
@@ -350,13 +384,32 @@ class ReportUplink:
         self.sent_hashes = []
         self.dead_hashes = []
         self.skips = []
+        # §UPLINK-NOISE（2026-11-23）：同一 (kind, reason) 只记一条、带 count 累计。
+        # 旧形状每条都带 `at` 时间戳 ⇒ diagnostic 事件每轮都是新哈希 ⇒ 每分钟一条噪音。
+        self._skip_index = {}
         self.stats = {"sent": 0, "dead": 0, "dropped_queue_overflow": 0, "net_fail": 0}
         try:
             with open(self.state_path, "rb") as fh:
                 doc = json.loads(fh.read().decode("utf-8", "replace"))
             self.sent_hashes = [str(h) for h in doc.get("sent_hashes") or []]
             self.dead_hashes = [str(h) for h in doc.get("dead_hashes") or []]
-            self.skips = list(doc.get("skips") or [])
+            # 旧状态文件里的 skip 条目带 `at`：读入时归一成 (kind, reason, count)，
+            # 不带时间戳——否则一次重启就把旧噪音原样带回来。
+            for item in doc.get("skips") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = (str(item.get("kind") or ""), str(item.get("reason") or ""))
+                try:
+                    n = int(item.get("count") or 1)
+                except (TypeError, ValueError):
+                    n = 1
+                entry = self._skip_index.get(key)
+                if entry is None:
+                    entry = {"kind": key[0], "reason": key[1], "count": n}
+                    self._skip_index[key] = entry
+                    self.skips.append(entry)
+                else:
+                    entry["count"] += n
             for k in self.stats:
                 self.stats[k] = int(doc.get("stats", {}).get(k) or 0)
         except OSError:
@@ -379,9 +432,22 @@ class ReportUplink:
         os.replace(tmp, self.state_path)
 
     def _note_skip(self, kind, reason):
-        """把"这一类为什么一个都没发"记进本地状态——missing≠empty 的可取证半边。"""
-        self.skips.append({"kind": kind, "reason": reason, "at": _iso_beijing(self._now_fn())})
-        self.skips = self.skips[-self.skip_keep:]
+        """把"这一类为什么一个都没发"记进本地状态——missing≠empty 的可取证半边。
+
+        §UPLINK-NOISE（2026-11-23）：同一 `(kind, reason)` 只记一条、count 累计。旧实现
+        每条都带 `at` 时间戳，于是 diagnostic 事件的内容每轮都不同（哈希永不重复），
+        只要本轮有任何 skip 就每分钟发一条——今天这类事件是纯噪音。
+        """
+        key = (kind, reason)
+        # 防御性：测试/夹具可能绕过 __init__ 直接构造实例（只设 skips），这里补一个空索引。
+        if getattr(self, "_skip_index", None) is None:
+            self._skip_index = {}
+        entry = self._skip_index.get(key)
+        if entry is None:
+            entry = {"kind": kind, "reason": reason, "count": 0}
+            self._skip_index[key] = entry
+            self.skips.append(entry)
+        entry["count"] += 1
 
     # ---------------- 事件构造（信封字段名逐字镜像 golden/report_fields.json） ----------------
     def _base_event(self, etype):
@@ -398,8 +464,15 @@ class ReportUplink:
         """
         if not self.export_roots:
             return None
-        hits = [e for e in broker_reads.discover_exports_recursive(
-            self.export_roots, self.export_roots) if e.kind == kind]
+        if self._scan is None:
+            # §UPLINK-SINGLE-WALK（2026-11-23）：一轮只遍历一次。四类读数各调一次
+            # discover_exports_recursive 会让同一棵 15.5 万文件的树被走四遍（本机 494 秒），
+            # 单轮比计划任务的 60 秒周期还长。这里按文件名日期剪枝后再走四道准入闸。
+            self._scan = broker_reads.discover_exports_recent(
+                self.export_roots, self.export_roots,
+                today=_day_beijing(self._now_fn()),
+                max_age_days=self.export_max_age_days)
+        hits = [e for e in self._scan if e.kind == kind]
         if not hits:
             return None
         # 2026-11-11 实锤（SGT 空壳顶掉 Stock 真账户）：HGT/SGT 港股通壳账户的
@@ -433,8 +506,11 @@ class ReportUplink:
         不匹配…），追加一条 diagnostic 观测事件——旧实现这些原因只躺在盒子本地状态里，
         云端完全静默，#5 的四候选根因因此迟迟无法定案。diagnostic 只观测不落账（Go 侧
         case diagnostic 只留痕），没有 skip 时整条不发（常态零噪音）。
+        2026-11-23 §UPLINK-NOISE：skip 清单按 (kind, reason) 去重且不带 `at`，diagnostic
+        进 dedupable 集合 ⇒ 状态不变就只发一次（旧形状每轮一个新时间戳，等于每分钟刷屏）。
         """
-        skips_before = len(self.skips)
+        # §UPLINK-SINGLE-WALK：每轮重置一次候选清单，四类读数共享同一份扫描结果。
+        self._scan = None
         events = []
         events.extend(self._build_positions_event())
         events.extend(self._build_account_event())
@@ -444,12 +520,14 @@ class ReportUplink:
         hb = self._build_heartbeat()
         if hb is not None:
             events.append(hb)
-        new_skips = self.skips[skips_before:]
-        if new_skips:
+        if self.skips:
+            # §UPLINK-NOISE（2026-11-23）：diagnostic 携带**当前全部**去重 skip（kind/reason/count），
+            # 不带 `at`。内容只在"类别集合变化"时才变（哈希对 count 不敏感，见 _event_hash），
+            # 所以状态不变就只发一次，而不是每分钟一条。
             events.append({
                 "type": "diagnostic",
                 "user_id": self.user_id,
-                "skips": new_skips,
+                "skips": [dict(s) for s in self.skips],
             })
         return events
 
@@ -594,6 +672,13 @@ class ReportUplink:
         events = []
         stamp = self._stamp_of(result)
         for row in rows:
+            biz = _row_business(row)
+            if biz:
+                # §UPLINK-NOISE（2026-11-23）：申购/配售/中签/红利/转股/回售行不是股票代码，
+                # 分类必须排在 normalize_code 之前，否则 754163（圣晖申购）每轮都记一条
+                # bad_code_row 噪音。这类行本来就不会被上报，"少报"的风险为零。
+                self._note_skip("orders", "subscription_row:%s" % (row.get("symbol"),))
+                continue
             code = normalize_code(row.get("symbol"))
             if not code:
                 self._note_skip("orders", "bad_code_row:%r" % (row.get("symbol"),))
@@ -643,6 +728,11 @@ class ReportUplink:
         events = []
         stamp = self._stamp_of(result)
         for row in rows:
+            biz = _row_business(row)
+            if biz:
+                # 红利/转股/回售这类非买卖成交行没有可交易代码，先分类再校验（与 orders 同口径）。
+                self._note_skip("fills", "subscription_row:%s" % (row.get("symbol"),))
+                continue
             code = normalize_code(row.get("symbol"))
             if not code:
                 self._note_skip("fills", "bad_code_row:%r" % (row.get("symbol"),))
@@ -834,12 +924,14 @@ class ReportUplink:
         for event in self.build_events():
             pending.append(event)
         for event in pending:
-            h = _canonical_hash(event)
-            dedupable = event.get("type") in ("positions", "account", "order")
-            if not (force and dedupable) and (h in self.sent_hashes or h in self.dead_hashes):
+            h = _event_hash(event)
+            # §UPLINK-NOISE：所有类型都走去重（含 diagnostic）；force 只放宽三类。
+            forceable = event.get("type") in FORCE_REPOST_TYPES
+            seen = h in self.sent_hashes or h in self.dead_hashes
+            if not (force and forceable) and seen:
                 report["skipped_dupe"] += 1
                 continue  # 同内容已定论（成功或死信），不重复占网络
-            if force and dedupable and (h in self.sent_hashes or h in self.dead_hashes):
+            if force and forceable and seen:
                 report["forced"] += 1
             outcome = self._post(event)
             if outcome == "sent":
@@ -904,6 +996,23 @@ def _side_word(v):
     return ""
 
 
+# §UPLINK-NOISE（2026-11-23）：非股票业务行。broker_reads 的 side 别名表包含「业务名称」，
+# 所以申购/配售这类行本来就带着业务词；旧实现把它们当普通行去 normalize_code，于是
+# 754163（圣晖申购）每轮都记一条 bad_code_row。分类必须排在代码校验之前。
+_SUBSCRIPTION_WORDS = ("申购", "配售", "中签", "红利", "转股", "回售")
+
+
+def _row_business(row):
+    """非股票业务行的业务词；普通买卖行返回空串（不猜、不兜底）。"""
+    text = str((row or {}).get("side") or "").strip()
+    if not text:
+        return ""
+    for word in _SUBSCRIPTION_WORDS:
+        if word in text:
+            return word
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 命令行入口（2026-11-04 补）
 #
@@ -929,6 +1038,85 @@ def _host_of(url):
     if "://" in text:
         text = text.split("://", 1)[1]
     return text.split("/", 1)[0]
+
+
+def _pid_alive(pid):
+    """pid 是否还活着（跨平台：os.kill(pid, 0) 只做存在性探测，不发信号）。"""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 存在但无权发信号 —— 视为活着（保守方向：别抢别人的锁）
+    except OSError:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def acquire_run_lock(state_dir, now_fn=time.time):
+    """§UPLINK-CADENCE（2026-11-23）：单轮互斥锁。返回 (acquired, path, info)。
+
+    为什么需要它：计划任务用 `MultipleInstances=IgnoreNew` 拒绝重叠轮次（0x800710E0），
+    被拒的那一轮在日志里**完全无痕**——今天"上行腿每 8~25 分钟才走一轮"迟迟无法定案
+    就是这个形状。拿锁失败会打 `UPLINK_RESULT=SKIP busy=1`，把静默拒绝变成一行读数。
+
+    锁内容是 `pid|epoch`。判"忙"的条件是**持有者 pid 还活着**；pid 已死（上次进程崩了）
+    视为陈旧锁，直接接管——否则一次崩溃会让这条腿永久停摆。
+    """
+    path = os.path.join(state_dir, UPLINK_LOCK_NAME)
+    now = now_fn()
+    info = {"busy": 0, "pid": 0, "age_sec": 0}
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        fd = None
+    except OSError:
+        return True, "", info  # 锁目录不可写：不因为拿不到锁就让整条腿停掉
+    if fd is None:
+        pid, age = 0, 0
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                pid_s, _, ts_s = fh.read().strip().partition("|")
+            pid = int(pid_s or 0)
+            ts = float(ts_s or 0)
+            age = int(max(0.0, now - ts)) if ts else 0
+        except (OSError, TypeError, ValueError):
+            pid, age = 0, 0
+        info.update({"pid": pid, "age_sec": age})
+        if pid and _pid_alive(pid):
+            info["busy"] = 1
+            return False, path, info
+        # 陈旧锁（pid 已死 / 内容坏了）：清掉再抢一次；抢不到就让步，绝不并发写。
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:
+            info["busy"] = 1
+            return False, path, info
+    try:
+        os.write(fd, ("%d|%d" % (os.getpid(), int(now))).encode("ascii"))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return True, path, info
+
+
+def release_run_lock(path):
+    """删掉自己持有的锁（失败无害：下一轮的陈旧锁判据会接管）。"""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def main(argv=None):
@@ -978,7 +1166,19 @@ def main(argv=None):
               % (1 if uplink.base_url else 0, 1 if uplink.token else 0))
         return 2
 
-    report = uplink.run_once(force=args.force)
+    # §UPLINK-CADENCE（2026-11-23）：单轮互斥。拿不到锁不是错误——是"上一轮还在跑"，
+    # 打一行 SKIP 并 exit 0（计划任务的 IgnoreNew 拒绝是静默的，这里把它变成可见读数）。
+    lock_path = ""
+    acquired, lock_path, lock_info = acquire_run_lock(
+        os.path.dirname(uplink.state_path) or ".", uplink._now_fn)
+    if not acquired:
+        print("UPLINK_RESULT=SKIP busy=1 pid=%d age_sec=%d"
+              % (lock_info.get("pid", 0), lock_info.get("age_sec", 0)))
+        return 0
+    try:
+        report = uplink.run_once(force=args.force)
+    finally:
+        release_run_lock(lock_path)
     print("UPLINK_RESULT=OK sent=%d retry=%d dead=%d skipped_dupe=%d forced=%d net_fail=%d drops=%d"
           % (report.get("sent", 0), report.get("retry", 0), report.get("dead", 0),
              report.get("skipped_dupe", 0), report.get("forced", 0),

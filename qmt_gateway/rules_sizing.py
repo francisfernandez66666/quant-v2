@@ -312,6 +312,11 @@ SIZING_CTX_KEYS = [
     "emotion_phase", "limit_up_count", "ladder_height", "market_state",
     "regime", "risk_tier", "index_change_pct", "index_source", "index_stale",
     "advancers", "decliners", "breadth_unknown", "macro_events", "holiday",
+    # BOX-SIZING-MARKET 2026-11-23: the cloud MarketScale as a ceiling (the box
+    # may compute its own index change, but never exceed the decision host, and
+    # it gives up a margin). Absent = no ceiling clamp (the local executor leg,
+    # which does not build this key).
+    "market_scale_ceiling",
     # broken_board_ratio is deliberately NOT read here: the Go phase ladder in
     # production use is the pool variant, which consumes the limit-up count and
     # the ladder height only (internal/data/emotion.go:99-133).
@@ -1018,6 +1023,14 @@ def market_scale(params, ctx):
     capped = _sz_clamp_group(aggregate, _sz_account_caps(params, ctx), params)
     dims = key_missing_dims(params, ctx)
     scale, _hit = apply_missing_key_cap(params, ctx, capped, dims)
+    # BOX-SIZING-MARKET 2026-11-23: the box may now compute index_change_pct
+    # itself, but it must never exceed the decision host (minus the baked
+    # margin). Absent ceiling (the local executor leg) -> no clamp, today's
+    # behaviour. The blind-spot cap already ran above, so this only ever makes
+    # the result MORE conservative.
+    ceiling = _sz_read(ctx, "market_scale_ceiling")
+    if ceiling is not None and scale > ceiling:
+        scale = ceiling
     return scale, dims
 
 

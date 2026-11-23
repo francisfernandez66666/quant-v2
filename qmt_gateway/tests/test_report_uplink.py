@@ -470,7 +470,8 @@ class TestEnvelopeShape(unittest.TestCase):
 
         旧实现 skip 原因只躺在盒子本地状态里、云端完全静默——#5 的四候选根因因此
         迟迟无法定案。锁三件事：①有 skip 才发（常态零噪音）；②键集与 golden 一致；
-        ③skips 里每条都带 kind/reason/at 且 kind 覆盖了缺文件的类别。
+        ③skips 里每条都带 kind/reason/count（**不带 at**：带时间戳的话每轮都是新哈希，
+        于是每分钟一条 —— 2026-11-23 §UPLINK-NOISE 修掉的正是这个形状）。
         """
         import tempfile
         tmp2 = tempfile.TemporaryDirectory()
@@ -489,8 +490,10 @@ class TestEnvelopeShape(unittest.TestCase):
             skips = diags[0]["skips"]
             self.assertTrue(skips, "diagnostic 不许发空清单（那等于没有信息量）")
             for s in skips:
-                self.assertTrue({"kind", "reason", "at"} <= set(s.keys()),
+                self.assertTrue({"kind", "reason", "count"} <= set(s.keys()),
                                 "skip 条目缺可取证字段: %r" % (s,))
+                self.assertNotIn("at", s,
+                                 "skip 带时间戳会让内容每轮都变（§UPLINK-NOISE）")
             self.assertTrue(any(s["kind"] == "positions" for s in skips),
                              "持仓类缺失必须出现在诊断里")
         finally:

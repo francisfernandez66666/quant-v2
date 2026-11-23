@@ -26353,3 +26353,197 @@ fi
 [ "$B235_FAILED" = "0" ] || exit 1
 echo "ok - §235 §TEST-SPEED 锁通过（-quick 显式不改默认 + emit 原样装配 + -full 全量并一条 + vitest 4 worker 带回退 + nightcap 秒级预算，累计判定点 ${CNT235}）"
 echo ""
+
+echo "==> 236 §BOX-FIX-20261123（2026-11-23 盒子现场九点：撤单4参 / 阶梯基座 / 观察窗 / 导出归档 / 上行单次遍历 / 上行节奏 / 客户端自启 / 恒50% / 申购噪音）..."
+B236_FAILED=0
+fail236() {
+	echo "--- FAIL: §236 $*"
+	FAIL=1
+	B236_FAILED=1
+}
+CNT236=0
+QS236=$(cat qmt_gateway/qmt_internal_strategy.py || true)
+RS236=$(cat qmt_gateway/rules_sizing.py || true)
+UP236=$(cat qmt_gateway/report_uplink.py || true)
+BR236=$(cat qmt_gateway/broker_reads.py || true)
+CU236=$(cat qmt_gateway/carrier_updater.py || true)
+ARCH236=$(cat deploy/qmt-win/archive_exports.ps1 || true)
+IT236=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
+CK236=$(cat internal/config/carrier_knobs.go || true)
+DERIVEGO236=$(cat cmd/derive_carrier_params/main.go || true)
+PARAMS236=$(cat qmt_gateway/local_executor_params.json || true)
+
+# ① 撤单 4 参：4s/4l 必须带 ContextInfo；3 参回潮即红。
+CNT236=$((CNT236 + 1))
+grep_q 'def _cancel(ContextInfo, order_id):' QS236 F || fail236 "缺 _cancel(ContextInfo, order_id) 签名（拿不到 ContextInfo 就永远发不出 4 参）"
+grep_q 'attempts.append(("4s", (oid, acct, "STOCK", ContextInfo)))' QS236 F || fail236 "4s 形状没带 ContextInfo（今日 24 次撤单全败的根因）"
+grep_q 'attempts.append(("4l", (oid, acct, "stock", ContextInfo)))' QS236 F || fail236 "4l 形状没带 ContextInfo"
+grep_q 'cancelled via %s id=%s' QS236 F || fail236 "缺 cancelled via 读数（撤单成功没有可归因的一行）"
+if grep_q '("4s", (oid, acct, "STOCK"))' QS236 F; then
+	fail236 "4s 又退回 3 参（这个 build 只认带 ContextInfo 的 4 参）"
+fi
+if grep_q '("4l", (oid, acct, "stock"))' QS236 F; then
+	fail236 "4l 又退回 3 参"
+fi
+
+# ② 阶梯基座：position_cost 走 _basis_of（冻结成本），不是柜台的裸 cost。
+CNT236=$((CNT236 + 1))
+grep_q 'def _basis_of(symbol, day, cost, qty):' QS236 F || fail236 "缺 _basis_of（阶梯基座没有单一真源）"
+grep_q '"position_cost": _basis_of(symbol, day, held.get("cost"), held.get("qty"))' QS236 F || fail236 "position_cost 没走 _basis_of（减仓后柜台重摊成本会抬高清仓线）"
+grep_q '"position_cost_raw": held.get("cost")' QS236 F || fail236 "缺 position_cost_raw 只读对照（现场无法核对两把尺子）"
+if grep_q '"position_cost": held.get("cost")' QS236 F; then
+	fail236 "position_cost 又直接用柜台 cost（000672 58 秒清仓的形态回潮）"
+fi
+
+# ③ 观察窗：stop_loss/breakdown/reduce 三处必须过 _confirm_sell；清仓线不被 bull 延后。
+CNT236=$((CNT236 + 1))
+grep_q 'def _confirm_sell(day, symbol, kind, now):' QS236 F || fail236 "缺 _confirm_sell（卖出观察窗不存在）"
+N236_OBS=$( { grep -cE '_confirm_sell\(day, symbol, .*now_ts\)' qmt_gateway/qmt_internal_strategy.py || true; } )
+[ "${N236_OBS:-0}" -ge 3 ] || fail236 "观察窗调用点少于 3（stop_loss/breakdown/reduce 必须都过它，实际 ${N236_OBS:-0}）"
+grep_q '"reason": "sell_confirm_pending"' QS236 F || fail236 "缺 sell_confirm_pending（等待确认会被读成没有卖出）"
+grep_q 'rounds = PARAMS.get("sell_confirm_rounds")' QS236 F || fail236 "观察窗轮数没读 PARAMS（阈值变成第二本账）"
+grep_q 'secs = PARAMS.get("sell_confirm_sec")' QS236 F || fail236 "观察窗秒数没读 PARAMS"
+# 负锁：清仓线永不被 bull 延后 —— stop_loss 分支体里不许出现 if bull:。
+SL236=$( { grep -n 'elif kind == "stop_loss":' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+BD236=$( { grep -n 'else:  # breakdown' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+[ -n "$SL236" ] || fail236 "找不到 stop_loss 分支"
+[ -n "$BD236" ] || fail236 "找不到 breakdown 分支"
+if [ -n "$SL236" ] && [ -n "$BD236" ]; then
+	SLBODY236=$(sed -n "${SL236},$((BD236-1))p" qmt_gateway/qmt_internal_strategy.py 2>/dev/null || true)
+	if grep_q 'if bull:' SLBODY236 F; then
+		fail236 "stop_loss 分支里出现 if bull（清仓线被做多信号延后＝§STOP-LADDER 明文禁止）"
+	fi
+fi
+
+# ④ 导出归档：硬编码根 / 今天不搬 / 归档根在根之外 / KeepDays；移动面只许导出 CSV。
+CNT236=$((CNT236 + 1))
+[ -s deploy/qmt-win/archive_exports.ps1 ] || fail236 "归档脚本不在册"
+grep_q '$FixedRoot = "D:\qmt"' ARCH236 F || fail236 "缺硬编码根（参数可被改成 C:\ 就会搬错盘）"
+grep_q 'if ($rootFull -ne $FixedRoot) {' ARCH236 F || fail236 "根不等于硬编码根时没有拒跑"
+grep_q 'if ($day -ge $keepFrom) {' ARCH236 F || fail236 "缺近端窗口日期闸（今天/昨天的导出会被搬走）"
+grep_q '$KeepActiveDays = 1' ARCH236 F || fail236 "近端窗口缺省不是 1（昨天会被 07:10 归档搬走，08:50 盘前无昨收快照）"
+grep_q '$keepFrom = $today.AddDays(-1 * $keepActive)' ARCH236 F || fail236 "近端窗口没按 KeepActiveDays 算"
+grep_q 'archive_inside_root' ARCH236 F || fail236 "缺归档根必须在 D:\qmt 之外的护栏"
+grep_q '$KeepDays = 3' ARCH236 F || fail236 "KeepDays 缺省不是 3"
+grep_q 'ARCHIVE_RESULT=OK' ARCH236 F || fail236 "缺 ARCHIVE_RESULT=OK 读数行"
+for bad236 in 'uplink_state.json' 'data.db' '.py'; do
+	if grep -qF -- "$bad236" deploy/qmt-win/archive_exports.ps1 2>/dev/null; then
+		fail236 "归档脚本出现账本/脚本名 ${bad236}（移动面只许导出 CSV）"
+	fi
+done
+
+# ⑤ 单次遍历：一轮只走一次，四类共享 _scan；负锁按类重扫。
+CNT236=$((CNT236 + 1))
+grep_q 'def discover_exports_recent(' BR236 F || fail236 "缺 discover_exports_recent（文件名日期剪枝不在发现层）"
+grep_q 'if day and day < cutoff:' BR236 F || fail236 "缺文件名日期剪枝（旧文件仍会被 stat）"
+grep_q 'if self._scan is None:' UP236 F || fail236 "_latest_export 没有轮级缓存（四类各走一遍 15.5 万文件）"
+grep_q 'self._scan = broker_reads.discover_exports_recent(' UP236 F || fail236 "扫描没走 discover_exports_recent"
+grep_q 'self._scan = None' UP236 F || fail236 "缺每轮重置（新导出会永远看不到）"
+if grep_q 'discover_exports_recursive(' UP236 F; then
+	fail236 "report_uplink 又调 discover_exports_recursive（按类重扫＝494 秒回潮）"
+fi
+
+# ⑥ 上行节奏：进程锁把静默拒绝变成读数；T8 改 DAILY+重复窗口；任务姿态补 StartWhenAvailable。
+CNT236=$((CNT236 + 1))
+grep_q 'UPLINK_RESULT=SKIP busy=1' UP236 F || fail236 "缺 UPLINK_RESULT=SKIP busy=1（重叠轮次又变回静默）"
+grep_q 'def acquire_run_lock(state_dir, now_fn=time.time):' UP236 F || fail236 "缺单轮互斥锁"
+grep_q 'def release_run_lock(path):' UP236 F || fail236 "缺锁释放（一次崩溃永久停摆）"
+grep_q '@{ Name = $T8; Sc = "DAILY"; St = "08:50"; Ri = 1; Du = "06:50"' IT236 F || fail236 "T8 不是 DAILY+RI1+DU06:50（/ET 会把结束边界钉在注册当天）"
+grep_q '$settings.StartWhenAvailable = $true' IT236 F || fail236 "缺 StartWhenAvailable（重启窗口错过的一跳不会补跑）"
+grep_q '$settings.MultipleInstances = "IgnoreNew"' IT236 F || fail236 "缺 MultipleInstances=IgnoreNew"
+if grep_q 'Name = $T8; Sc = "MINUTE"' IT236 F; then
+	fail236 "T8 又退回 MINUTE 形态"
+fi
+if grep -qF -- 'args1 += @("/ET"' deploy/qmt-friend/install_tasks.ps1 2>/dev/null; then
+	fail236 "install_tasks 又用 /ET 注册（结束边界钉在注册当天）"
+fi
+
+# ⑦ 客户端自启：20s 轮询确认进程真的出现；T1 开机触发；负锁只判 returncode。
+CNT236=$((CNT236 + 1))
+grep_q 'CLIENT_POLL_SEC = 20' CU236 F || fail236 "缺 20s 进程轮询预算"
+grep_q 'CLIENT_POLL_INTERVAL_SEC = 2' CU236 F || fail236 "缺轮询间隔"
+grep_q 'def _wait_client(self, timeout_sec):' CU236 F || fail236 "缺 _wait_client（只判 returncode 会漏掉进程没起来）"
+grep_q 'action=start_failed rc=' CU236 F || fail236 "缺 start_failed 三态读数"
+grep_q 'action=start_ok rc=' CU236 F || fail236 "缺 start_ok 三态读数"
+grep_q '@{ N = $T1; Boot = $true }' IT236 F || fail236 "T1 没有开机触发（11-23 09:55 开机后客户端没起来）"
+grep_q '$boot.Delay = "PT90S"' IT236 F || fail236 "缺开机延迟 90s"
+
+# ⑧ 恒 50%：盒内指数读数 + 云端上限 + 云端缺失退回盲区帽（缺失时给无界上限即激进缺陷）。
+CNT236=$((CNT236 + 1))
+grep_q 'def _index_change_pct(ContextInfo, moment):' QS236 F || fail236 "缺盒内指数涨跌读数"
+grep_q 'def _market_scale_ceiling():' QS236 F || fail236 "缺云端上限函数"
+grep_q 'out["market_scale_ceiling"] = _market_scale_ceiling()' QS236 F || fail236 "sizing_view 没接上限"
+grep_q '"market_scale_ceiling",' RS236 F || fail236 "SIZING_CTX_KEYS 没登记 market_scale_ceiling（读了也会被当未知键）"
+grep_q 'if ceiling is not None and scale > ceiling:' RS236 F || fail236 "market_scale 没有上限夹"
+grep_q 'margin = PARAMS.get("market_scale_ceiling_margin")' QS236 F || fail236 "上限折扣没读 PARAMS（第二本账）"
+grep_q '"missing_key_target_cap": 0.5' PARAMS236 F || fail236 "盲区帽不是 0.5（盒内取数不许放宽盲区帽）"
+MS236=$( { grep -n 'def _market_scale_ceiling' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+[ -n "$MS236" ] || fail236 "找不到 _market_scale_ceiling"
+if [ -n "$MS236" ]; then
+	MSE236=$( { awk -v s="$MS236" 'NR>s && /^def /{print NR; exit}' qmt_gateway/qmt_internal_strategy.py || true; } )
+	[ -n "$MSE236" ] || MSE236=$(( $(wc -l < qmt_gateway/qmt_internal_strategy.py) + 1 ))
+	MSBODY236=$(sed -n "${MS236},$((MSE236-1))p" qmt_gateway/qmt_internal_strategy.py 2>/dev/null || true)
+	grep_q 'return blind' MSBODY236 F || fail236 "上限函数缺失/过期时没退回盲区帽"
+	if grep_q 'return 1.0' MSBODY236 F; then
+		fail236 "上限函数在缺失/过期时给 return 1.0（无界上限＝激进缺陷）"
+	fi
+fi
+
+# ⑨ 申购噪音：业务行分类在 normalize_code 之前；diagnostic 去重且不带 at。
+CNT236=$((CNT236 + 1))
+grep_q '_SUBSCRIPTION_WORDS = ("申购", "配售", "中签", "红利", "转股", "回售")' UP236 F || fail236 "缺申购业务词表"
+grep_q 'def _row_business(row):' UP236 F || fail236 "缺 _row_business 分类"
+grep_q '"subscription_row:%s" % (row.get("symbol"),)' UP236 F || fail236 "缺 subscription_row 分类（申购行仍记 bad_code_row）"
+grep_q 'if event.get("type") == "diagnostic":' UP236 F || fail236 "diagnostic 没走专用哈希"
+grep_q '"skips": [dict(s) for s in self.skips],' UP236 F || fail236 "diagnostic 没携带去重后的 skip 清单"
+grep_q 'entry = {"kind": kind, "reason": reason, "count": 0}' UP236 F || fail236 "skip 条目不是 (kind,reason,count) 形状"
+if grep_q '"reason": reason, "at":' UP236 F; then
+	fail236 "skip 条目又带 at（内容每轮都变＝每分钟一条 diagnostic）"
+fi
+if grep_q 'DEDUPABLE_TYPES' UP236 F; then
+	fail236 "又出现按类型白名单去重（未登记的类型会漏发）"
+fi
+
+# ⑩ 参数真源：三枚新旋钮各只有一处家（Go 常量 → 导出器 → 参数文件），载体只读 PARAMS。
+CNT236=$((CNT236 + 1))
+grep_q 'carrierSellConfirmRounds[[:space:]]+= 2$' CK236 || fail236 "Go 侧观察窗轮数不是 2"
+grep_q 'carrierSellConfirmSec[[:space:]]+= 60\.0$' CK236 || fail236 "Go 侧观察窗秒数不是 60"
+grep_q 'carrierMarketScaleCeilingMargin[[:space:]]+= 0\.9$' CK236 || fail236 "Go 侧上限折扣不是 0.9"
+grep_q 'c.put("sell_confirm_rounds", src, config.CarrierSellConfirmRounds())' DERIVEGO236 F || fail236 "导出器没取观察窗轮数"
+grep_q 'c.put("sell_confirm_sec", src, config.CarrierSellConfirmSec())' DERIVEGO236 F || fail236 "导出器没取观察窗秒数"
+grep_q 'c.put("market_scale_ceiling_margin", src, config.CarrierMarketScaleCeilingMargin())' DERIVEGO236 F || fail236 "导出器没取上限折扣"
+grep_q '"sell_confirm_rounds": 2' PARAMS236 F || fail236 "参数文件缺 sell_confirm_rounds=2"
+grep_q '"sell_confirm_sec": 60' PARAMS236 F || fail236 "参数文件缺 sell_confirm_sec=60"
+grep_q '"market_scale_ceiling_margin": 0.9' PARAMS236 F || fail236 "参数文件缺 market_scale_ceiling_margin=0.9"
+
+# ⑪ 行为腿 A：撤单 4 参 / 卖出观察窗 / 盒内指数与上限——判退出码。
+CNT236=$((CNT236 + 1))
+if command -v python3 >/dev/null 2>&1; then
+	PY236A_RC=0
+	python3 -m pytest qmt_gateway/tests/test_internal_strategy_cancel_ctx_20261123.py \
+		qmt_gateway/tests/test_internal_strategy_sell_window_20261123.py \
+		qmt_gateway/tests/test_internal_strategy_index_sizing_20261123.py \
+		-q >/dev/null 2>&1 || PY236A_RC=$?
+	[ "$PY236A_RC" = "0" ] || fail236 "载体行为腿 A 未过（退出码 ${PY236A_RC}）"
+else
+	echo "INFO - §236 无 python3，行为腿 A 未跑（这份绿不含载体判定）"
+fi
+
+# ⑫ 行为腿 B：上行腿单次遍历/锁/噪音 + 导出发现剪枝 + 分档上限——判退出码。
+CNT236=$((CNT236 + 1))
+if command -v python3 >/dev/null 2>&1; then
+	PY236B_RC=0
+	python3 -m pytest qmt_gateway/tests/test_report_uplink_20261123.py \
+		qmt_gateway/tests/test_report_uplink.py \
+		qmt_gateway/tests/test_broker_reads.py \
+		qmt_gateway/tests/test_broker_reads_rebuild_20261110.py \
+		qmt_gateway/tests/test_rules_sizing.py \
+		-q >/dev/null 2>&1 || PY236B_RC=$?
+	[ "$PY236B_RC" = "0" ] || fail236 "载体行为腿 B 未过（退出码 ${PY236B_RC}）"
+else
+	echo "INFO - §236 无 python3，行为腿 B 未跑"
+fi
+
+[ "$B236_FAILED" = "0" ] || exit 1
+echo "ok - §236 §BOX-FIX-20261123 锁通过（撤单4参带ContextInfo+阶梯基座冻结成本+三处卖出观察窗且清仓线不被bull延后+导出归档近端窗口不搬(今天+昨天)且根外归档+单次遍历文件名剪枝+上行锁与T8重复窗口+客户端20s轮询+盒内指数与云端上限+申购行分类与diagnostic去重+三旋钮单点同源，累计判定点 ${CNT236}）"
+echo ""

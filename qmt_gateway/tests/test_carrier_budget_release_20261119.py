@@ -274,7 +274,10 @@ class StaleCancelTest(_SandboxBase):
     def run_cancel(self, orders):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            done = self.mod.cancel_leg(orders, _MID_SESSION)
+            # §BOX-CANCEL-CTX 2026-11-23: cancel_leg now takes ContextInfo first
+            # (this client only answers the 4-argument shape). None here = the
+            # 4-arg legs are skipped, 3/2-arg fallbacks still exercised.
+            done = self.mod.cancel_leg(None, orders, _MID_SESSION)
         return done, buf.getvalue()
 
     def test_threshold_is_ten_minutes_not_fifteen(self):

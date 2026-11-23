@@ -108,6 +108,12 @@ GATEWAY_SYNC_FILES = ("flow_proxy.py",)
 # 重复启动会撞 QMT 的 userdata 锁。
 CLIENT_PROCESS = "XtItClient.exe"
 CLIENT_START_TASK = "QMTF-Client-Start"
+# §CLIENT-REVIVE-BOOT（2026-11-23）：`schtasks /Run` 的返回码只说明"任务已提交"。
+# 现网 11-23 09:40 那次 rc=267014（0x41306 任务被终止）同样没有拉起客户端，旧实现
+# 把它当成"已触发"，日志里也没有第二行。所以启动后必须轮询等进程真的出现。
+CLIENT_POLL_SEC = 20
+CLIENT_POLL_INTERVAL_SEC = 2
+CLIENT_START_RETRIES = 1
 
 def _ascii_text(text):
     """任何要打印的东西先过这道：非 ASCII 字节一律换成 '?'。
@@ -784,19 +790,53 @@ class CarrierUpdater:
             (proc.stderr or b"").decode("utf-8", "replace")
         return CLIENT_PROCESS.lower() in text.lower()
 
-    def ensure_client(self):
-        """客户端没在跑就拉起（已在跑则跳过——重复启动会撞 userdata 锁）。失败只记日志。"""
-        if sys.platform != "win32":
-            return
+    def _start_client_task(self):
+        """触发 QMTF-Client-Start，返回返回码；调用失败返回 None（由调用方记日志）。"""
         try:
-            if self._client_running():
-                self._log("CARRIER_CLIENT action=already")
-                return
             proc = subprocess.run(["schtasks", "/Run", "/TN", CLIENT_START_TASK],
                                   capture_output=True, text=True, timeout=30)
-            self._log("CARRIER_CLIENT action=start rc=%d" % proc.returncode)
-        except Exception as exc:  # noqa: BLE001 - 自愈失败不许把投递判红
-            self._log("CARRIER_CLIENT action=error reason=%s" % exc.__class__.__name__)
+            return int(proc.returncode)
+        except Exception:  # noqa: BLE001 - 自愈失败不许把投递判红
+            return None
+
+    def _wait_client(self, timeout_sec):
+        """轮询等客户端进程出现；超时返回 False。
+
+        睡眠间隔与总窗都是模块常量（测试把它们置零，不必真睡 20 秒）。
+        """
+        deadline = time.time() + float(timeout_sec)
+        while True:
+            if self._client_running():
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(CLIENT_POLL_INTERVAL_SEC)
+
+    def ensure_client(self):
+        """客户端没在跑就拉起，并**等它真的出现**（§CLIENT-REVIVE-BOOT 2026-11-23）。
+
+        三态日志：`already`（进程在，跳过——重复启动会撞 QMT 的 userdata 锁）/
+        `start_ok`（进程确实出现了）/ `start_failed`（两次都没出现）。
+        旧实现只判 `schtasks /Run` 的返回码，rc=267014 也被当成"已触发"。
+        失败仍只记日志：自愈失败不许把投递判红。
+        """
+        if sys.platform != "win32":
+            return
+        if self._client_running():
+            self._log("CARRIER_CLIENT action=already")
+            return
+        last_rc = -1
+        for attempt in range(CLIENT_START_RETRIES + 1):
+            rc = self._start_client_task()
+            if rc is None:
+                self._log("CARRIER_CLIENT action=start_failed rc=-1 attempt=%d" % (attempt + 1))
+                return
+            last_rc = rc
+            if self._wait_client(CLIENT_POLL_SEC):
+                self._log("CARRIER_CLIENT action=start_ok rc=%d attempt=%d" % (rc, attempt + 1))
+                return
+        self._log("CARRIER_CLIENT action=start_failed rc=%d attempts=%d"
+                  % (last_rc, CLIENT_START_RETRIES + 1))
 
     def _stop_gateway(self):
         """停掉网关进程，让随后的 ensure_gateway 用**新文件**重新拉起。

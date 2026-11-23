@@ -362,7 +362,7 @@ class SandboxAccountResolutionTest(unittest.TestCase):
                                          "price": 10.0, "qty": 100, "short_code": "t1"})
         self.assertFalse(ok)
         self.assertIn("unproven", why)
-        ok2, why2 = self.mod._cancel("12345")
+        ok2, why2 = self.mod._cancel(None, "12345")
         self.assertFalse(ok2)
         self.assertIn("unproven", why2)
 

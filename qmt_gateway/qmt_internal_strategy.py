@@ -121,6 +121,17 @@ _STATE = {
     "buy_intents": set(),  # {(day, symbol), ...} buy intents sent this session
     "buy_amounts": {},   # {(day, symbol): amount} session buy total per symbol
     "buy_seen": {},      # {symbol: [epoch, ...]} Q1 confirm-window rounds
+    # SELL-BASIS-FREEZE 2026-11-23: {symbol: {"day", "cost", "qty"}}. The counter
+    # re-costs the REMAINING shares after every sell (it folds the realized loss
+    # into them), so the -3% trim itself moves the -6% clear line. The ladder
+    # measures against the cost we actually paid; a reduce freezes it.
+    "basis": {},
+    "basis_day": "",
+    # SELL-OBS-WINDOW 2026-11-23: {(day, symbol, kind): {"since", "rounds"}}.
+    # A sell trigger must hold for N rounds and S seconds before firing; the
+    # dict resets on day change so no clock survives overnight.
+    "sell_obs": {},
+    "sell_obs_day": "",
 }
 
 
@@ -747,12 +758,100 @@ def _intent_of(signal, held_qty):
     return "new"
 
 
-def _day_loss_pct(deals, positions):
+def _basis_of(symbol, day, cost, qty):
+    """Frozen per-day cost basis for the stop/reduce/take-profit ladder.
+
+    The counter re-costs the REMAINING shares after every sell: 2300 @12.5039
+    trimmed by 1100 @12.00 came back as 1200 @12.9658, and 58 seconds later the
+    -6% clear line fired on a stock only 4.4% below the ORIGINAL cost. The two
+    rungs must share one ruler, and that ruler is what we paid.
+
+    Rules (owner 2026-11-23): a LARGER position means new shares were bought, so
+    the counter's blended cost IS the real basis of the bigger lot -- adopt it.
+    A smaller or equal position is a reduce: freeze the cost, follow only the
+    share count. A new day (or the first sighting) reseeds from the counter. The
+    whole cache resets when the day changes so it never carries overnight.
+    """
+    if _STATE.get("basis_day") != day:
+        _STATE["basis_day"] = day
+        _STATE["basis"] = {}
+    qty = float(qty or 0.0)
+    try:
+        cost = float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        cost = None
+    if cost is not None and cost <= 0.0:
+        cost = None
+    cur = _STATE["basis"].get(symbol)
+    if cur is None:
+        cur = {"day": day, "cost": cost, "qty": qty}
+        _STATE["basis"][symbol] = cur
+        return cur["cost"]
+    if cost is not None and qty > cur.get("qty", 0.0):
+        cur["cost"] = cost
+        cur["qty"] = qty
+        return cur["cost"]
+    cur["qty"] = qty
+    return cur["cost"]
+
+
+def _sell_obs_clear(day, symbol, kind):
+    """Reset one trigger's observation clock (the line was crossed back)."""
+    obs = _STATE.get("sell_obs")
+    if isinstance(obs, dict):
+        obs.pop((day, symbol, kind), None)
+
+
+def _confirm_sell(day, symbol, kind, now):
+    """In-box sell observation window: a trigger must HOLD before it fires.
+
+    A single tick used to clear a whole position: 000672 went from a -3% trim to
+    a full clear in 58 seconds, and 000009 was cleared for being one cent under
+    MA5 x breakdown_ratio. This window is the box's own (the cloud sell leg
+    failed to deliver all day, so deferring to it would have done nothing). It
+    only
+    DELAYS the trigger -- direction and quantity (RD half / SL all / BK
+    available) are unchanged, and the clear line is still never extended by a
+    bull signal; the window is a confirmation, not a deferral.
+
+    Confirmed when the SAME (day, symbol, kind) has hit for at least
+    `sell_confirm_rounds` consecutive rounds AND at least `sell_confirm_sec`
+    seconds. Any round the trigger does not hit calls _sell_obs_clear, so a
+    pullback above the line restarts the clock (no separate "pullback %"
+    threshold -- the rule itself is the line). Missing config keys turn the
+    window OFF (today's behaviour) with one warning; it never silently disables
+    the whole sell leg.
+    """
+    rounds = PARAMS.get("sell_confirm_rounds")
+    secs = PARAMS.get("sell_confirm_sec")
+    if rounds is None or secs is None:
+        _warn_once("sell_confirm_cfg",
+                   "sell_confirm_rounds/sec missing: observation window off")
+        return True
+    if _STATE.get("sell_obs_day") != day:
+        _STATE["sell_obs_day"] = day
+        _STATE["sell_obs"] = {}
+    obs = _STATE.setdefault("sell_obs", {})
+    key = (day, symbol, kind)
+    entry = obs.get(key)
+    if entry is None:
+        obs[key] = {"since": now, "rounds": 1}
+        return False
+    entry["rounds"] = int(entry.get("rounds", 0)) + 1
+    return (entry["rounds"] >= int(rounds)
+            and (now - float(entry.get("since", now))) >= float(secs))
+
+
+def _day_loss_pct(deals, positions, day):
     """Realized day pnl as a fraction of nothing yet -- returns (pnl, ok).
 
-    Sell fills booked against the position's open price; a sell whose cost is
-    unreadable makes the whole reading UNPROVABLE (ok=False) and the caller
-    stops buying for the day rather than guessing the account is fine.
+    Sell fills booked against the position's FROZEN basis (see _basis_of), not
+    the counter's post-sell re-cost: the diluted number inflated every realized
+    loss after a trim, which made the day-loss fuse trip early. A sell whose
+    basis is unreadable makes the whole reading UNPROVABLE (ok=False) and the
+    caller stops buying for the day rather than guessing the account is fine.
+    A fully-cleared name still has its frozen basis, so its realized loss is now
+    provable instead of dropping the whole reading on an empty `held` row.
     """
     if deals is None:
         return None, False
@@ -760,8 +859,9 @@ def _day_loss_pct(deals, positions):
     for row in deals:
         if row.get("side") != "sell":
             continue
-        held = (positions or {}).get(row.get("symbol") or "") or {}
-        cost = held.get("cost")
+        symbol = row.get("symbol") or ""
+        held = (positions or {}).get(symbol) or {}
+        cost = _basis_of(symbol, day, held.get("cost"), held.get("qty"))
         if not cost or cost <= 0.0:
             return None, False
         pnl += (row.get("price", 0.0) - cost) * row.get("qty", 0.0)
@@ -2451,6 +2551,63 @@ def _vol_ratio_state(ContextInfo, moment):
     return state
 
 
+def _index_change_pct(ContextInfo, moment):
+    """Today's index change (%), computed IN-CLIENT from the index daily bars.
+
+    2026-11-23 BOX-SIZING-MARKET (owner ruling): the sizing chain sat at the 50%
+    blind-spot cap all day because `index_change_pct` was never a box reading
+    (precalc never baked it). The index daily-bar leg already works in this
+    client (the relative-volume leg uses it), so the same two-bar close ratio
+    yields a REAL reading -- not a default value. This is the ONE market
+    dimension reversed from "absent on purpose": breadth / macro / market_state
+    still abstain (no trustworthy in-box source; feeding a constant would be the
+    fail-open defect the 11-17 plan warns about).
+
+    Same-source relative value: close[-1]/close[-2]-1 on ONE series, never
+    rescaled by 100 (that x100 is only for cross-source share-count recon).
+    Fail-closed: fewer than 2 bars, a non-positive close, or a last bar whose
+    date is not TODAY -> None. The key then stays absent and the blind-spot cap
+    holds at 50% -- never "yesterday's move masquerading as today's". Cached per
+    day+HHMM so a 1000-name round reads the index once a minute.
+    """
+    day = day_key(moment)
+    cache_key = "%s|%s" % (day, hhmm_now(moment))
+    cached = _STATE.get("index_change_state")
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        return cached.get("value")
+    value = None
+    reason = ""
+    for code in _FLOW_INDEX_CODES:
+        payload = _index_amount_payload(ContextInfo, code, 4)
+        if not isinstance(payload, dict):
+            reason = "index_no_bars:%s" % code
+            continue
+        bare = _bare(code)
+        closes = _series(payload, "close", bare)
+        if len(closes) < 2:
+            reason = "index_short_series:%s" % code
+            continue
+        entry = payload.get(bare, payload)
+        times = _bar_times(entry, len(closes))
+        if times is None:
+            reason = "index_no_timestamps:%s" % code
+            continue
+        if _bar_day(times[-1]) != day:
+            reason = "index_last_bar_not_today:%s" % code
+            continue
+        last = _finite_pos(closes[-1])
+        prev = _finite_pos(closes[-2])
+        if last is None or prev is None:
+            reason = "index_bad_close:%s" % code
+            continue
+        value = (last / prev - 1.0) * 100.0
+        reason = ""
+        break
+    _STATE["index_change_state"] = {"key": cache_key, "value": value,
+                                    "reason": reason}
+    return value
+
+
 def _clamp_delta(value):
     """Any JSON value -> a delta in [-1,1], or None (abstain)."""
     if value is None:
@@ -2883,7 +3040,12 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "ref_price": ref if ref is not None else tick.get("prev_close"),
         "volume_ratio": ratio,
         "position_qty": held.get("qty"),
-        "position_cost": held.get("cost"),
+        # SELL-BASIS-FREEZE 2026-11-23: the ladder measures against the frozen
+        # basis, not the counter's post-sell re-cost (a trim used to move the
+        # clear line and clear the rest 58 seconds later). `position_cost_raw`
+        # is the counter's number, kept read-only so a log can reconcile them.
+        "position_cost": _basis_of(symbol, day, held.get("cost"), held.get("qty")),
+        "position_cost_raw": held.get("cost"),
         "can_use_qty": held.get("can_use"),
         "available_cash": cash,
         "daily_buy_total": spent,
@@ -2942,7 +3104,13 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "consec_boards": pre.get("consec_boards"),
         "afternoon_reseal": reseal,
         "up_stop": pre.get("up_stop"),
-        "index_change_pct": pre.get("index_change_pct"),
+        # BOX-SIZING-MARKET 2026-11-23: prefer the baked reading; when precalc
+        # has none (today's case) fall back to the in-box daily-bar reading so
+        # the sizing chain stops landing in the blind spot every single round.
+        "index_change_pct": (
+            pre.get("index_change_pct")
+            if pre.get("index_change_pct") is not None
+            else _index_change_pct(ContextInfo, moment)),
         "limit_up_count": pre.get("limit_up_count"),
         "limit_up_count_history": pre.get("limit_up_count_history"),
         "broken_board_ratio": pre.get("broken_board_ratio"),
@@ -3004,17 +3172,60 @@ def _account_total_asset():
     return None
 
 
+def _market_scale_ceiling():
+    """The CLOUD MarketScale as a ceiling for the box, minus a conservative 10%.
+
+    2026-11-23 BOX-SIZING-MARKET (owner ruling): the box may compute its own
+    index change now, but it must never be MORE aggressive than the decision
+    host, and it gives up a further margin (0.9). So ceiling = cloud_scale x
+    margin. The cloud reading is baked into PARAMS.t_macro by
+    carrier_hot_reload_gz.bake_t_macro (same snapshot the T leg already reads);
+    when it is missing or older than t_regime_stale_sec the ceiling collapses to
+    missing_key_target_cap (0.5) -- today's blind-spot level, so a stopped
+    delivery chain can never enlarge exposure. The margin has NO literal here:
+    it is a Go-sourced knob, and a missing key warns once and falls back to the
+    blind-spot cap (never an unbounded ceiling).
+    """
+    blind = PARAMS.get("missing_key_target_cap")
+    macro = PARAMS.get("t_macro") or {}
+    margin = PARAMS.get("market_scale_ceiling_margin")
+    if margin is None:
+        _warn_once("ms_ceiling_cfg",
+                   "market_scale_ceiling_margin missing: ceiling=blind-spot cap")
+        return blind
+    scale = macro.get("market_scale")
+    age = macro.get("asof_age_sec")
+    stale = PARAMS.get("t_regime_stale_sec")
+    if scale is None or age is None or stale is None:
+        return blind
+    try:
+        scale = float(scale)
+        age = float(age)
+        stale = float(stale)
+        margin = float(margin)
+    except (TypeError, ValueError):
+        return blind
+    if age > stale:
+        return blind
+    return scale * margin
+
+
 def _sizing_view(ctx, positions, pending_buys=None):
     """The account-level view the sizing chain needs on top of the per-symbol ctx.
 
     2026-11-10 rebuild: the buckets this view used to leave empty
     (stock_value / pending_buys / industry_known / cluster_set / the T legs)
     are exactly why every concentration cap abstained while the account went
-    to 98.9% one name. They are computed per round now (see _bucket_view);
-    market dims (emotion phase, breadth, index change) remain ABSENT on
-    purpose -- not computable from a tick-only sandbox, they land the round in
-    the blind spot, which caps the target at missing_key_target_cap. That is
-    the designed consequence of "no external data inside the sandbox".
+    to 98.9% one name. They are computed per round now (see _bucket_view).
+
+    MARKET DIMS 2026-11-23 (owner ruling): `index_change_pct` is no longer
+    absent -- it is computed in-client from the index daily bars (see
+    _index_change_pct) and a cloud-derived `market_scale_ceiling` bounds the
+    result. The OTHER market dimensions (breadth / macro / market_state / risk
+    tier) still abstain on purpose: there is no trustworthy in-box source, and
+    feeding a default would silently import the Go weights (the fail-open defect
+    the 11-17 plan warns about). Only the dimension we can actually READ was
+    reversed.
     """
     out = dict(ctx or {})
     out["total_asset"] = _account_total_asset()
@@ -3046,6 +3257,11 @@ def _sizing_view(ctx, positions, pending_buys=None):
     # the next order is sized, otherwise the same-round room is stale and the
     # account gets filled in one round. It was an empty list unconditionally.
     out["pending_buys"] = list(pending_buys or [])
+    # BOX-SIZING-MARKET 2026-11-23: the cloud reading bounds the box (never more
+    # aggressive), minus the conservative margin. rules_sizing.market_scale
+    # applies min(scale, ceiling); a missing/expired cloud snapshot lands the
+    # ceiling on the blind-spot cap, i.e. today's behaviour.
+    out["market_scale_ceiling"] = _market_scale_ceiling()
     return out
 
 
@@ -3280,13 +3496,23 @@ def _expect_suffix(symbol):
     return ""
 
 
-def _cancel(order_id):
+def _cancel(ContextInfo, order_id):
     """Cancel ladder, again copied from the working bridge.
 
     Documented shape is cancel(order_id:str, account_id, account_type,
     ContextInfo); the numeric two-arg shape is attempted only when the id is
     genuinely numeric -- building int(oid) up front once raised ValueError
     before any documented form ran, and a live order stayed live (10-29).
+
+    2026-11-23 BOX-CANCEL-CTX: the 4-argument shapes need the real
+    `ContextInfo` object -- this client answers every 3- and 2-argument shape
+    with `ArgumentError('Python argument types in None.None(str, ...')`. Before
+    this fix `_cancel` labelled two shapes "4s"/"4l" but only ever passed three
+    arguments, so 24 cancels in one day failed and the order stayed live. The
+    `2i` numeric leg stays OUTSIDE the loop on purpose (FIX-20261029-CANCELID:
+    int(oid) inside the list build would ValueError before any documented form
+    ran). When ContextInfo is None the 4-argument shapes are skipped and the
+    skip is logged -- never silently.
 
     2026-11-13 hard stop: cancelling outside the two cash sessions is refused
     just like placing, per owner ruling (both close at 14:52).
@@ -3304,9 +3530,15 @@ def _cancel(order_id):
     allowed, why = _trade_session_ok()
     if not allowed:
         return False, why
-    attempts = [("4s", (oid, acct, "STOCK")), ("4l", (oid, acct, "stock")),
-                ("3", (oid, acct, "STOCK")), ("2s", (oid, acct))]
     errs = []
+    attempts = []
+    if ContextInfo is not None:
+        attempts.append(("4s", (oid, acct, "STOCK", ContextInfo)))
+        attempts.append(("4l", (oid, acct, "stock", ContextInfo)))
+    else:
+        _log("cancel_ctx_missing id=%s: skipping 4-argument shapes" % ascii(oid))
+    attempts.append(("3", (oid, acct, "STOCK")))
+    attempts.append(("2s", (oid, acct)))
     for tag, shape in attempts:
         try:
             ca(*shape)
@@ -3321,7 +3553,9 @@ def _cancel(order_id):
         return True, "ok"
     except Exception as exc:
         errs.append("2i:%s" % repr(exc)[:60])
-    return False, "cancel failed: %s" % (" | ".join(errs[-2:]),)
+    # Keep every leg's error (at most 5): truncating to the last two made a day
+    # of "4s missing ctx" look like one repeated 3-argument failure.
+    return False, "cancel failed: %s" % (" | ".join(errs),)
 
 
 def _holdings_value(positions, price_of):
@@ -3573,7 +3807,7 @@ def _apply_t_action(ContextInfo, act, rnd, symbol, day, summary, t_actions, t_sk
         detail = act.get("detail") or {}
         oid = detail.get("order_id") or (detail.get("orders") or [{}])[0].get("order_id")
         if oid:
-            ok, why = _cancel(oid)
+            ok, why = _cancel(ContextInfo, oid)
             if ok:
                 t_actions["cancel"] += 1
                 summary["cancelled"].append(str(oid))
@@ -3724,7 +3958,7 @@ def run_round(ContextInfo, moment):
         # and an unprovable fuse means no buys this round (never "assume fine").
         _warn_once("deal_table", "DEAL table unreadable: buys decline this round")
     day = day_key(moment)
-    day_loss, loss_ok = _day_loss_pct(deals, positions)
+    day_loss, loss_ok = _day_loss_pct(deals, positions, day)
     day_loss_limit = None
     if loss_ok and total and total > 0.0:
         day_loss_limit = total * float(PARAMS.get("day_loss_limit_pct", 0.0)) / 100.0
@@ -3811,20 +4045,70 @@ def run_round(ContextInfo, moment):
         # pre-existing rule that a name down past the first ladder step never
         # gets bought into on the same round.
         bull = rule_pullback_buy(PARAMS, ctx)
-        for rule in (rule_take_profit, rule_stop_loss, rule_breakdown_sell):
+        # SELL-OBS-WINDOW 2026-11-23: the ladder still runs in risk order
+        # (take-profit, clear-out, breakdown) and still stops at the first hit,
+        # but stop_loss / breakdown / reduce must now HOLD for the observation
+        # window before they fire. take_profit keeps its old cadence (not this
+        # batch). A bull signal overrides the TRIM and the BREAKDOWN, never the
+        # CLEAR; every suppressed-or-pending trigger is named in the summary so
+        # "waiting" is never mistaken for "nothing to sell".
+        now_ts = _now_ts()
+        seen_kinds = set()
+        sell_hit = False
+        for kind, rule in (("take_profit", rule_take_profit),
+                           ("stop_loss", rule_stop_loss),
+                           ("breakdown", rule_breakdown_sell)):
             hit = rule(PARAMS, ctx)
-            if hit:
+            if not hit:
+                continue
+            sell_hit = True
+            seen_kinds.add(kind)
+            if kind == "take_profit":
                 signals = [(hit, "live")]
-                break
-        if not signals:
-            hit = rule_reduce_position(PARAMS, ctx)
-            if hit:
+            elif kind == "stop_loss":
+                # The clear line is never extended by a bull signal (STOP-LADDER
+                # 2026-11-20), but it still waits out the window.
+                if _confirm_sell(day, symbol, kind, now_ts):
+                    signals = [(hit, "live")]
+                else:
+                    # A pending CLEAR still blocks a same-round buy: "waiting to
+                    # confirm" must never be read as "nothing wrong, buy more".
+                    bull = None
+                    summary["skipped"].append({"short": hit["short_code"],
+                                               "reason": "sell_confirm_pending"})
+            else:  # breakdown
+                # BREAKDOWN is one of the two steps a bull signal may override
+                # (same family as the trim; the CLEAR is not): with a bull in
+                # hand the round simply holds and the window never opens.
                 if bull:
                     summary["skipped"].append({"short": hit["short_code"],
                                                "reason": "rule_bull_override"})
                     bull = None
-                else:
+                elif _confirm_sell(day, symbol, kind, now_ts):
                     signals = [(hit, "live")]
+                else:
+                    bull = None
+                    summary["skipped"].append({"short": hit["short_code"],
+                                               "reason": "sell_confirm_pending"})
+            break
+        if not sell_hit:
+            hit = rule_reduce_position(PARAMS, ctx)
+            if hit:
+                seen_kinds.add("reduce")
+                if bull:
+                    summary["skipped"].append({"short": hit["short_code"],
+                                               "reason": "rule_bull_override"})
+                    bull = None
+                elif _confirm_sell(day, symbol, "reduce", now_ts):
+                    signals = [(hit, "live")]
+                else:
+                    bull = None
+                    summary["skipped"].append({"short": hit["short_code"],
+                                               "reason": "sell_confirm_pending"})
+        # A sell kind that did not hit this round resets its clock.
+        for kind in ("stop_loss", "breakdown", "reduce"):
+            if kind not in seen_kinds:
+                _sell_obs_clear(day, symbol, kind)
         if not signals and bull:
             signals = [(bull, "live")]
         if not signals:
@@ -4153,12 +4437,12 @@ def run_round(ContextInfo, moment):
             _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summary)
         except Exception as exc:  # noqa: BLE001 -- T must never break the main round
             _warn_once("t_layer", "T layer raised: " + repr(exc)[:120])
-    cancelled = cancel_leg(orders, moment)
+    cancelled = cancel_leg(ContextInfo, orders, moment)
     summary["cancelled"] = cancelled
     return summary
 
 
-def cancel_leg(orders, moment):
+def cancel_leg(ContextInfo, orders, moment):
     """Stale-cancel + close sweep, with the same seven fail-closed gates as
     the local executor's leg (see local_executor.Executor.cancel_leg).
 
@@ -4225,7 +4509,7 @@ def cancel_leg(orders, moment):
         if _ops_budget_used() >= int(PARAMS.get("max_ops_per_min")):
             _warn_once("cancel_budget", "cancel leg out of frequency budget")
             break
-        ok, why = _cancel(oid)
+        ok, why = _cancel(ContextInfo, oid)
         if ok:
             _STATE["cancel_tried"].append(oid)
             done.append(oid)

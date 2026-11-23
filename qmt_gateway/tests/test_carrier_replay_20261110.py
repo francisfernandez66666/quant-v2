@@ -137,7 +137,11 @@ class ReplayTest(unittest.TestCase):
         mod._STATE.update({"acct": "8001", "acct_type": "", "ops": [],
                            "cancel_tried": [], "warned": {}, "last_round": 0.0,
                            "sent": set(), "buy_intents": set(),
-                           "buy_amounts": {}, "buy_seen": {}})
+                           "buy_amounts": {}, "buy_seen": {},
+                           # §SELL-BASIS-FREEZE / §SELL-OBS-WINDOW 2026-11-23:
+                           # day-keyed state must not leak between scenarios.
+                           "basis": {}, "basis_day": "",
+                           "sell_obs": {}, "sell_obs_day": ""})
         self.placed = []
         for name, fn in self._orig_rules.items():
             setattr(self.mod, name, fn)

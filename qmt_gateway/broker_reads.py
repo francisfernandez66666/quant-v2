@@ -361,6 +361,20 @@ def discover_exports(dir_glob, allowed_roots=None):
     return found
 
 
+def _walk_files(roots):
+    """白名单根目录下的全部文件路径（os.walk，跳过点目录）。"""
+    paths = []
+    for root in tuple(roots or []):
+        root = str(root)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                paths.append(os.path.join(dirpath, name))
+    return paths
+
+
 def discover_exports_recursive(roots, allowed_roots=None):
     """白名单根目录下的**递归**发现（2026-11-10，PLAN 1.3 第 12 项）。
 
@@ -373,15 +387,62 @@ def discover_exports_recursive(roots, allowed_roots=None):
     目录取舍——那由调用方按「资金账号」列过滤（report_uplink 侧），发现层
     只负责"把真实存在的文件都交出来"。
     """
+    return discover_exports(_walk_files(roots), allowed_roots)
+
+
+# 文件名里的交易日：QMT 导出形如 `Order-20261120_...csv` / `Account-20261120103000.csv`。
+# 只认合法月日，避免把版本号/委托号里的 8 位数字误当日期。
+_EXPORT_DATE_PAT = re.compile(r"(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])")
+
+
+def export_date_of(file_name):
+    """文件名里的 YYYYMMDD；解析不出返回空串。
+
+    空串的语义是"**证明不了**它旧"，调用方必须按"新"处理（fail-open 到"读它"）。
+    反过来把无日期文件当旧文件跳过，会让一份改了名的今日导出整天读不到——那是
+    比多 stat 几次贵得多的故障。
+    """
+    m = _EXPORT_DATE_PAT.search(os.path.basename(str(file_name or "")))
+    return "".join(m.groups()) if m else ""
+
+
+def _recent_cutoff(today, max_age_days):
+    """`YYYYMMDD` + 天数 → 最早可接受的文件名日期（含当天）。
+
+    max_age_days=2 ⇒ 今天与昨天。用 time.strptime/mktime 而不是 datetime：本模块
+    只 import 了 time，且北京时区没有夏令时，按 86400 秒平移是精确的。
+    """
+    days = int(max_age_days or 1)
+    if days < 1:
+        days = 1
+    try:
+        start = time.mktime(time.strptime(str(today), "%Y%m%d"))
+    except (ValueError, OverflowError):
+        return str(today or "")
+    return time.strftime("%Y%m%d", time.localtime(start - (days - 1) * 86400))
+
+
+def discover_exports_recent(roots, allowed_roots=None, today=None, max_age_days=2):
+    """§UPLINK-SINGLE-WALK（2026-11-23）：先按**文件名日期**剪枝，再走同一套四道准入闸。
+
+    为什么需要它：`D:\\qmt` 三个子目录合计 ≈15.5 万个文件（每分钟一份、从不清理），
+    report_uplink 一轮要对四类读数各走一遍 os.walk + realpath + stat，本机实测
+    494 秒。单轮比计划任务的 60 秒周期还长，于是每两轮就被 `IgnoreNew` 拒一次。
+
+    剪枝判据只用**纯字符串**（不 stat）：
+      * 文件名里能解析出 `YYYYMMDD` 且早于 `today-(max_age_days-1)` ⇒ 跳过；
+      * 解析不出日期 ⇒ **保留**（不能证明它旧，就按新处理——见 export_date_of）；
+      * 其余完全复用 `discover_exports` 的白名单/形态/扩展名/锁文件四道闸。
+    `today` 由调用方给（北京时间交易日，与 day-keyed 账本同一把尺子），缺省不剪枝。
+    """
+    cutoff = _recent_cutoff(today, max_age_days) if today else ""
     paths = []
-    for root in tuple(roots or []):
-        root = str(root)
-        if not os.path.isdir(root):
-            continue
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            for name in filenames:
-                paths.append(os.path.join(dirpath, name))
+    for full in _walk_files(roots):
+        if cutoff:
+            day = export_date_of(os.path.basename(full))
+            if day and day < cutoff:
+                continue
+        paths.append(full)
     return discover_exports(paths, allowed_roots)
 
 

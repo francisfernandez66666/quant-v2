@@ -5,26 +5,35 @@
 #   2) 10-29 实证——在 ssh/远程会话里直接 Start-Process 拉客户端，进程随会话被杀；
 #   3) 看门狗自己死了也要有人再把它叫起来（任务计划就是那个"守门人的守门人"）。
 #
-# 六个任务（名字固定，卸载按全部逐个删）：
-#   QMTF-Client-Ensure   盘中每 10 分钟 → watchdog -Mode ClientEnsure  （交易日/时段闸内判客户端在不在，掉了就补拉）
+# 九个任务（名字固定，卸载按全部逐个删）：
+#   QMTF-Client-Ensure   盘中每 3 分钟 → watchdog -Mode ClientEnsure  （交易日/时段闸内判客户端在不在，掉了就补拉）
 #                         §KEEPALIVE-20261112：原为 DAILY 08:35 单次，那一次若判交易日失败或客户端
 #                         晚于 08:35 才登录/崩掉，整天不再补拉 —— 11-12 现网即因此整天无 QMT、
 #                         网关 8789 closed、云端 external-brain-3 拒发所有买入单。
+#                         §CLIENT-REVIVE-BOOT（2026-11-23）：节拍 10 分钟 → 3 分钟（只是 Get-Process
+#                         一次，成本可忽略），另加开机触发器（Delay=PT90S）+ StartWhenAvailable ——
+#                         11-23 09:55 重启后没有任何东西拉起客户端，09:55:56 靠人工。
 #   QMTF-Client-Start    按需被调用    → 直接起 XtItClient.exe（/IT 交互式，客户端唯一合法拉起通道）
 #   QMTF-Gateway-Start   按需被调用    → 直接拉起 gateway.py（读 friend.env 注入 QUANT_GATEWAY_BIND/ALLOWED_IPS；
 #                                     无交易日闸门，纯拉起，装填器自证与看门狗兜底都走它）
 #   QMTF-Gateway-Ensure  每 5 分钟     → watchdog -Mode GatewayEnsure  （未监听才调 Gateway-Start，起前跑 profile-check）
 #   QMTF-Close           每 5 分钟     → watchdog -Mode Close          （脚本内部 15:30 前直接 retry，任务不必做时段判断）
-#   QMTF-Uplink          每 1 分钟     → report_run.ps1（report_uplink --once）（§WIRING-12 2026-11-17：
-#                         08:50–15:40 盘中把持仓/可用余额/委托/成交「变了才发」上行覆盖——
-#                         这是让手动 App 卖出在 1 分钟内回传云端的腿；运营机早有 QMTF-Uplink，
-#                         friend 包历史上缺这条，一对多回传缺一半。force 覆盖随 T5/T7 载体班次。）
+#   QMTF-Carrier-Update  每日 15:40    → carrier_run.ps1（carrier_updater --once）
+#   QMTF-Carrier-Update-Intraday  每日 09:30 起每 10 分钟 × 5h30m → carrier_run.ps1 -Intraday
+#   QMTF-Uplink          每日 08:50 起每 1 分钟 × 6h50m → report_run.ps1（report_uplink --once）
+#                         （§WIRING-12 2026-11-17：08:50–15:40 盘中把持仓/可用余额/委托/成交
+#                         「变了才发」上行覆盖——这是让手动 App 卖出在 1 分钟内回传云端的腿；
+#                         运营机早有 QMTF-Uplink，friend 包历史上缺这条，一对多回传缺一半。）
+#                         §UPLINK-CADENCE（2026-11-23）：原为 MINUTE + /ET 15:40，而 /ET 会把
+#                         EndBoundary 钉在注册当天（T7 在 11-18 踩过同一个坑）⇒ 改 DAILY + /RI 1 + /DU 06:50。
+#   QMTF-Export-Archive  每日 07:10    → archive_exports.ps1（§EXPORT-ARCHIVE 2026-11-23：
+#                         D:\qmt 导出按日归档，15.5 万文件 → 今日+昨日，上行腿单轮 494 秒的真因之一）
 #
 # 边界：本脚本只在**本机**注册/删除任务（B-N5：对广州零权限；不出现远程计算机名/PSRemoting）。
 # 缺省 **只打印不注册**（dry-run），必须显式 -Apply——与 ensure_friend_gateway_config.ps1 同纪律。
 #
 # 用法：
-#   .\install_tasks.ps1                 # 只打印将要注册的六条
+#   .\install_tasks.ps1                 # 只打印将要注册的九条
 #   .\install_tasks.ps1 -Apply          # 真注册（交互式，/IT）
 #   .\install_tasks.ps1 -Apply                # 注册成 SYSTEM（默认；会话注销也能跑）
 #   .\install_tasks.ps1 -Apply -Interactive   # 回到 /IT 语义（有桌面会话的机器）
@@ -36,6 +45,8 @@ param(
     [string]$QmtExe      = "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe",
     [string]$PsExe       = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe",
     [string]$PythonExe   = "C:\Python312\python.exe",
+    # §EXPORT-ARCHIVE（2026-11-23）：归档脚本路径（与本脚本同目录分发）。
+    [string]$ArchiveScript = "",
     [switch]$Apply,
     [switch]$Uninstall,
     # §SYSTEM-TASKS（2026-11-20 现场）：置位时把任务注册成 SYSTEM（ServiceAccount, Highest）而不是
@@ -60,6 +71,7 @@ if (-not (Test-Path $Watchdog)) {
     Write-Host "TASKS_RESULT=ABORT reason=no_watchdog path=$Watchdog"
     exit 2
 }
+if (-not $ArchiveScript) { $ArchiveScript = Join-Path $PSScriptRoot "archive_exports.ps1" }
 
 $T1 = "QMTF-Client-Ensure"
 $T2 = "QMTF-Client-Start"
@@ -90,6 +102,9 @@ $T7 = "QMTF-Carrier-Update-Intraday"
 # 朋友那 M 根腿只烘数据不下报（一对多回传缺一半）。这条每 1 分钟跑 report_uplink --once
 # （交易时段内、时段闸在 report_uplink/导出节奏里），把持仓/可用余额/委托/成交上行覆盖。
 $T8 = "QMTF-Uplink"
+# §EXPORT-ARCHIVE（2026-11-23）：D:\qmt 导出按日归档。07:10 刻意选在收盘导出全部落盘之后、
+# 08:35 pregen 之前——每天开工前把树收回到「今日+昨日」，上行腿与发现层都省两个数量级。
+$T9 = "QMTF-Export-Archive"
 
 function Tr($mode) {
     return ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Mode {2} -GatewayDir "{3}"' -f `
@@ -97,7 +112,7 @@ function Tr($mode) {
 }
 
 if ($Uninstall) {
-    foreach ($t in @($T1, $T2, $T3, $T4, $T5, $T6, $T7, $T8)) {
+    foreach ($t in @($T1, $T2, $T3, $T4, $T5, $T6, $T7, $T8, $T9)) {
         if (-not $Apply) {
             Write-Host ("WOULD_DELETE task={0}" -f $t)
             continue
@@ -109,9 +124,10 @@ if ($Uninstall) {
     exit 0
 }
 
-# 六条注册。schtasks 的 /TR 里嵌套引号只能按这种写法转义，PS 5.1 没有更干净的等价物。
+# 九条注册。schtasks 的 /TR 里嵌套引号只能按这种写法转义，PS 5.1 没有更干净的等价物。
 $jobs = @(
-    @{ Name = $T1; Sc = "MINUTE"; Mn = 10; St = "08:25"; Tr = (Tr "ClientEnsure"); It = $true },
+    # §CLIENT-REVIVE-BOOT（2026-11-23）：节拍 10 → 3 分钟（3 分钟一次 Get-Process 的成本可忽略）。
+    @{ Name = $T1; Sc = "MINUTE"; Mn = 3; St = "08:25"; Tr = (Tr "ClientEnsure"); It = $true },
     @{ Name = $T2; Sc = "ONCE";  St = "23:59"; Tr = ('"{0}"' -f $QmtExe); It = $true },
     @{ Name = $T3; Sc = "MINUTE"; Mn = 5; Tr = (Tr "GatewayEnsure"); It = $false },
     @{ Name = $T4; Sc = "MINUTE"; Mn = 5; Tr = (Tr "Close"); It = $false },
@@ -124,9 +140,15 @@ $jobs = @(
     @{ Name = $T7; Sc = "DAILY"; St = "09:30"; Ri = 10; Du = "05:30"; It = $false;
        Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Intraday' -f `
              $PsExe, (Join-Path $GatewayDir "carrier_run.ps1")) },
-    @{ Name = $T8; Sc = "MINUTE"; Mn = 1; St = "08:50"; Et = "15:40"; It = $false;
+    # §UPLINK-CADENCE（2026-11-23）：原 `Sc="MINUTE"; Mn=1; St="08:50"; Et="15:40"` ——
+    # /ET 会把 EndBoundary 钉在注册当天（T7 于 11-18 已踩过同一坑，T8 当时没改）。
+    # 改 DAILY + /RI 1 + /DU 06:50：08:50→15:40，每天重来，没有 EndBoundary。
+    @{ Name = $T8; Sc = "DAILY"; St = "08:50"; Ri = 1; Du = "06:50"; It = $false;
        Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f `
-             $PsExe, (Join-Path $GatewayDir "report_run.ps1")) }
+             $PsExe, (Join-Path $GatewayDir "report_run.ps1")) },
+    @{ Name = $T9; Sc = "DAILY"; St = "07:10"; It = $false;
+       Tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f `
+             $PsExe, $ArchiveScript) }
 )
 
 # carrier_run.ps1: short /TR wrapper for T5; python comes from friend.env (261-char /TR limit)
@@ -208,6 +230,12 @@ foreach ($j in $jobs) {
             exit 2
         }
     }
+    if ($j.Name -eq $T9) {
+        if (-not (Test-Path $ArchiveScript)) {
+            Write-Host "TASKS_RESULT=ABORT reason=no_archive_exports（归档腿缺脚本：注册了也是空跑）"
+            exit 2
+        }
+    }
     if (-not (Test-Path $QmtExe) -and $j.Name -eq $T2) {
         Write-Host "TASKS_RESULT=ABORT reason=no_qmt_exe（QMT 客户端路径不对，注册了也是空跑；装填器应先修 -QmtExe）"
         exit 2
@@ -217,7 +245,7 @@ foreach ($j in $jobs) {
     if ($j.Sc -eq "ONCE") { $args1 += @("/ST", $j.St, "/SD", (Get-Date -Format "yyyy/MM/dd")) }
     if ($j.Sc -eq "MINUTE") {
         $args1 += @("/MO", $j.Mn)
-        if ($j.St) { $args1 += @("/ST", $j.St) }   # 保活腿：08:25 起跑，之后每 10 分钟一轮
+        if ($j.St) { $args1 += @("/ST", $j.St) }   # 保活腿：08:25 起跑，之后每 3 分钟一轮
     }
     # §INTRADAY-TRIGGER-FIX（2026-11-18）：盘中窗口改成「DAILY + 重复窗口」而不是 MINUTE + /ET。
     # /ET 会把结束边界钉在注册当天，任务次日即不再触发（现网 11-16 装机后从未再跑）。
@@ -238,10 +266,56 @@ foreach ($j in $jobs) {
     Write-Host ("CREATED task={0}" -f $j.Name)
 }
 
-# 注册后复读自证：八个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
+# §UPLINK-CADENCE / §CLIENT-REVIVE-BOOT（2026-11-23）：注册后统一设置姿态。
+# 为什么必须补这一段：schtasks 没有设置 StartWhenAvailable / 电池策略的开关，而
+# 现网 XML 实读 StartWhenAvailable=false —— 重启窗口里错过的那一跳不会补跑（11-23 09:55
+# 开机后客户端一直没起来）。这里用 ScheduledTasks 模块逐条改，BootTrigger 只给保活腿。
+function Set-TaskPosture {
+    param([string]$Name, [switch]$BootTrigger)
+    $task = Get-ScheduledTask -TaskName $Name -ErrorAction Stop
+    $settings = $task.Settings
+    $settings.StartWhenAvailable = $true
+    $settings.MultipleInstances = "IgnoreNew"
+    $settings.DisallowStartIfOnBatteries = $false
+    $settings.StopIfGoingOnBatteries = $false
+    $triggers = @($task.Triggers)
+    $hasBoot = @($triggers | Where-Object { $_.CimClass.CimClassName -eq "MSFT_TaskBootTrigger" }).Count -gt 0
+    if ($BootTrigger -and -not $hasBoot) {
+        $boot = New-ScheduledTaskTrigger -AtStartup
+        $boot.Delay = "PT90S"   # 开机 90 秒后才试：太早会撞上客户端/网络的启动窗口
+        $triggers += $boot
+    }
+    Set-ScheduledTask -TaskName $Name -Settings $settings -Trigger $triggers | Out-Null
+    Write-Host ("TASK_POSTURE task={0} start_when_available=1 boot_trigger={1}" -f `
+        $Name, $(if ($BootTrigger) { 1 } else { 0 }))
+}
+
+if ($Apply) {
+    $posture = @(
+        @{ N = $T1; Boot = $true },
+        @{ N = $T2; Boot = $false },
+        @{ N = $T3; Boot = $false },
+        @{ N = $T4; Boot = $false },
+        @{ N = $T5; Boot = $false },
+        @{ N = $T6; Boot = $false },
+        @{ N = $T7; Boot = $false },
+        @{ N = $T8; Boot = $false },
+        @{ N = $T9; Boot = $false }
+    )
+    foreach ($p in $posture) {
+        try {
+            Set-TaskPosture -Name $p.N -BootTrigger:$p.Boot
+        } catch {
+            Write-Host ("TASKS_RESULT=ABORT reason=posture_failed task={0}" -f $p.N)
+            exit 2
+        }
+    }
+}
+
+# 注册后复读自证：九个名字必须在 schtasks 查询里逐个出现（写了不注册＝没有，§164 那批的"写了没跑"同形）
 if ($Apply) {
     $missing = @()
-    foreach ($n in @($T1, $T2, $T3, $T4, $T5, $T6, $T7, $T8)) {
+    foreach ($n in @($T1, $T2, $T3, $T4, $T5, $T6, $T7, $T8, $T9)) {
         $found = schtasks /Query /TN $n 2>$null
         if (-not $found) { $missing += $n }
     }
@@ -249,7 +323,7 @@ if ($Apply) {
         Write-Host ("TASKS_RESULT=ABORT reason=reread_missing tasks={0}" -f ($missing -join ","))
         exit 2
     }
-    Write-Host "TASKS_REREAD_MATCH=1 tasks=8"
+    Write-Host "TASKS_REREAD_MATCH=1 tasks=9"
 }
 
 Write-Host ("TASKS_RESULT={0}" -f $(if ($Apply) { "INSTALLED" } else { "DRYRUN" }))

@@ -98,6 +98,7 @@ func main() {
 	collectScoreScale(c)
 	collectFactorScoring(c)
 	collectCarrierVocabulary(c)
+	collectCarrierShape(c)
 
 	keys := make([]string, 0, len(c.params))
 	for k := range c.params {
@@ -468,6 +469,16 @@ func collectCarrierVocabulary(c *collector) {
 	// 成本安全倍数：min_spread_pct 的安全边际，真源是标定包那枚出厂默认。
 	// 载体用它乘成本线，Go 用它乘成本线（tcalib.Params.MinSpreadPct），同一枚数两处用。
 	c.put("t_cost_safety_multiplier", "internal/tcalib/tcalib.go:DefaultSafetyMul", tcalib.DefaultSafetyMul)
+}
+
+// collectCarrierShape 取载体形态三枚旋钮（§BOX-FIX-20261123）。
+// 值全部转调 internal/config 的只读访问器：卖出观察窗的轮数/秒数、云端仓位上限的保守折扣。
+// 这三枚数是策略语义，必须与载体共用一处真源；本函数只按名字打值，不产生任何数字。
+func collectCarrierShape(c *collector) {
+	const src = "internal/config/carrier_knobs.go:CarrierSellConfirm/SellConfirmSec/MarketScaleCeilingMargin"
+	c.put("sell_confirm_rounds", src, config.CarrierSellConfirmRounds())
+	c.put("sell_confirm_sec", src, config.CarrierSellConfirmSec())
+	c.put("market_scale_ceiling_margin", src, config.CarrierMarketScaleCeilingMargin())
 }
 
 // sortedInterfaceKeys 把 map 的键排序后返回：导出顺序必须稳定，

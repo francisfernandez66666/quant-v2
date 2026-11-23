@@ -21,10 +21,20 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 
+DAY = "2026-11-10"
+
+
 def _reset_state():
     # The rebuild added these session registries; keep tests isolated.
     for k in ("sent", "buy_intents", "buy_amounts", "buy_seen"):
         m._STATE[k] = set() if k in ("sent", "buy_intents") else {}
+    # §SELL-BASIS-FREEZE 2026-11-23: the frozen cost basis is day-keyed module
+    # state; without a reset one test's basis leaks into the next (the first
+    # sighting wins, so a later test would read the earlier cost).
+    m._STATE["basis"] = {}
+    m._STATE["basis_day"] = ""
+    m._STATE["sell_obs"] = {}
+    m._STATE["sell_obs_day"] = ""
 
 
 class _Row:
@@ -106,19 +116,19 @@ class GateThreeStateTest(unittest.TestCase):
 
     # ---- day-loss fuse ----------------------------------------------------
     def test_day_loss_unprovable_none(self):
-        pnl, ok = m._day_loss_pct(None, {})
+        pnl, ok = m._day_loss_pct(None, {}, DAY)
         self.assertIsNone(pnl)
         self.assertFalse(ok)
 
     def test_day_loss_cost_unreadable(self):
         deals = [{"symbol": "000001.SZ", "side": "sell", "price": 11.0, "qty": 100.0, "amount": 1100.0}]
-        pnl, ok = m._day_loss_pct(deals, {"000001.SZ": {"cost": 0.0}})
+        pnl, ok = m._day_loss_pct(deals, {"000001.SZ": {"cost": 0.0}}, DAY)
         self.assertIsNone(pnl)
         self.assertFalse(ok)
 
     def test_day_loss_provable(self):
         deals = [{"symbol": "000001.SZ", "side": "sell", "price": 11.0, "qty": 100.0, "amount": 1100.0}]
-        pnl, ok = m._day_loss_pct(deals, {"000001.SZ": {"cost": 10.0}})
+        pnl, ok = m._day_loss_pct(deals, {"000001.SZ": {"cost": 10.0}}, DAY)
         self.assertTrue(ok)
         self.assertEqual(pnl, (11.0 - 10.0) * 100.0)  # +100
 
@@ -127,7 +137,7 @@ class GateThreeStateTest(unittest.TestCase):
             {"symbol": "A", "side": "buy", "price": 5.0, "qty": 100.0, "amount": 500.0},
             {"symbol": "A", "side": "sell", "price": 11.0, "qty": 100.0, "amount": 1100.0},
         ]
-        pnl, ok = m._day_loss_pct(deals, {"A": {"cost": 10.0}})
+        pnl, ok = m._day_loss_pct(deals, {"A": {"cost": 10.0}}, DAY)
         self.assertTrue(ok)
         self.assertEqual(pnl, 100.0)  # buy row contributes nothing
 
