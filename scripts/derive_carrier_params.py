@@ -288,6 +288,26 @@ MAPPING = [
     ("market_scale_ceiling_margin", ("market_scale_ceiling_margin",), None),
     ("buy_retry_improve_pct", ("buy_retry_improve_pct",), None),
     ("buy_retry_max_per_day", ("buy_retry_max_per_day",), None),
+    # §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
+    # 真源 internal/config/carrier_knobs.go（两枚战法止盈点是转调：双凸读战法包常量、
+    # 龙回头读账号级策略出厂表 ×100 换成百分点）。Python 侧不写这几枚数。
+    ("tp_ladder_enabled", ("tp_ladder_enabled",), None),
+    ("tp_stage_half", ("tp_stage_half",), None),
+    ("tp_peak_arm_pct", ("tp_peak_arm_pct",), None),
+    ("tp_half_fraction", ("tp_half_fraction",), None),
+    ("tp_trail_half_retr_pct", ("tp_trail_half_retr_pct",), None),
+    ("tp_trail_clear_retr_pct", ("tp_trail_clear_retr_pct",), None),
+    ("tp_trail_half_retr_pct_20cm", ("tp_trail_half_retr_pct_20cm",), None),
+    ("tp_trail_clear_retr_pct_20cm", ("tp_trail_clear_retr_pct_20cm",), None),
+    ("tp_trail_half_retr_pct_30cm", ("tp_trail_half_retr_pct_30cm",), None),
+    ("tp_trail_clear_retr_pct_30cm", ("tp_trail_clear_retr_pct_30cm",), None),
+    ("tp_giveback_pp", ("tp_giveback_pp",), None),
+    ("tp_breakdown_trim_on_profit", ("tp_breakdown_trim_on_profit",), None),
+    ("tp_rebuy_block", ("tp_rebuy_block",), None),
+    ("tp_dragon_take_profit_pct", ("tp_dragon_take_profit_pct",), None),
+    ("tp_double_bump_take_profit_pct", ("tp_double_bump_take_profit_pct",), None),
+    ("tp_dragon_return_take_profit_pct", ("tp_dragon_return_take_profit_pct",), None),
+    ("tp_dragon_open_no_reseal_sec", ("tp_dragon_open_no_reseal_sec",), None),
 ]
 
 # ---------------------------------------------------------------------------
@@ -530,6 +550,10 @@ CARRIER_OWNED = {
     "industry_cap_pct": "needs-go-naming: 行业敞口帽在 Go 出厂为 0（＝关），不可当默认搬",
     "single_stock_cap_pct": "needs-go-naming: 同上（SingleStockValuePct 出厂 0）",
     "zero_amount": "math-constant: 规则层禁裸数字，预算算术的零元由这里给出；不是策略阈值，Go 无对应",
+    # §TP-LADDER-20261124：百分数基数。同样是"规则层禁裸数字"的产物——两段止盈把
+    # 峰值回撤与持仓盈亏都换算成百分点再和阈值比，换算系数必须有个家；它是单位常数，
+    # 不是策略阈值（阈值是 tp_* 那一族，真源 internal/config/carrier_knobs.go）。
+    "tp_pct_base": "math-constant: 百分点换算基数（100），规则层禁裸数字；单位常数，Go 无对应",
     # §FLOW-SNAPSHOT（2026-11-20）：资金流快照的新鲜度上限（秒）。这不是策略阈值，
     # 而是**投递契约**的读数：快照由 carrier_hot_reload_gz.bake_flow_snapshot 每 30 分钟
     # 重算、只在 delta 实质变化时发布，所以"超过 45 分钟没收到新快照"意味着发布腿停了

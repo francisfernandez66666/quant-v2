@@ -150,9 +150,18 @@ class TestRuleLayerHasNoBareNumbers(unittest.TestCase):
             "volume_ratio_min", "min_cash_reserve", "order_amount_cap",
             "daily_buy_cap", "min_order_amount", "no_cancel_windows",
             "no_new_order_windows", "max_ops_per_min", "pullback_ratio",
-            "take_profit_ratio", "stop_loss_ratio", "breakdown_ratio",
+            "stop_loss_ratio", "breakdown_ratio",
             "reduce_position_ratio", "reduce_position_fraction",
             "lot_size", "signal_codes", "symbol_head_len",
+            # §TP-LADDER-20261124：两段止盈的旋钮（`take_profit_ratio` 已退役，
+            # 全平腿删除；这里锁的是新阶梯真正读到的每一个键）。
+            "tp_ladder_enabled", "tp_stage_half", "tp_giveback_pp",
+            "tp_peak_arm_pct", "tp_trail_half_retr_pct",
+            "tp_trail_clear_retr_pct", "tp_trail_half_retr_pct_20cm",
+            "tp_trail_clear_retr_pct_20cm", "tp_trail_half_retr_pct_30cm",
+            "tp_trail_clear_retr_pct_30cm", "tp_breakdown_trim_on_profit",
+            "tp_dragon_open_no_reseal_sec", "tp_rebuy_block",
+            "t_bse_board_prefixes", "t_wide_board_prefixes",
         ]
         for key in needed:
             self.assertIn(key, lex.PARAMS, "PARAMS is missing %r" % key)
@@ -160,8 +169,8 @@ class TestRuleLayerHasNoBareNumbers(unittest.TestCase):
     def test_signal_codes_cover_every_rule_kind(self):
         """A signal kind with no short code cannot be keyed, and a missing
         key would silently drop the signal."""
-        kinds = ["pullback_buy", "take_profit", "stop_loss", "breakdown_sell",
-                 "reduce_position"]
+        kinds = ["pullback_buy", "take_profit", "take_profit_clear",
+                 "stop_loss", "breakdown_sell", "reduce_position"]
         for kind in kinds:
             self.assertIn(kind, lex.PARAMS["signal_codes"])
 
@@ -480,12 +489,27 @@ class TestSignals(unittest.TestCase):
             self.assertIsNone(rule(p, ctx(trading_day=False)))
 
     def test_take_profit(self):
+        """Stage 0 sells HALF at the strategy's own take-profit point.
+
+        §TP-LADDER-20261124 replaced the flat +5% full exit: +10% is now a
+        no-op for a 30-point position, +30% sells half. The plan has to be
+        present (`tp_known`) — a missing plan abstains rather than guessing.
+        """
         p = params()
-        signal = lex.rule_take_profit(p, ctx(last_price=11.0, position_qty=1000.0,
+        no_plan = lex.rule_take_profit(p, ctx(last_price=13.0, position_qty=1000.0,
                                               position_cost=10.0))
+        self.assertIsNone(no_plan, "no baked plan must abstain, never assume no TP point")
+        too_early = lex.rule_take_profit(p, ctx(last_price=11.0, position_qty=1000.0,
+                                                position_cost=10.0, tp_known=True,
+                                                tp_pct=30, tp_peak=11.0))
+        self.assertIsNone(too_early, "+10% must not fire a 30-point target")
+        signal = lex.rule_take_profit(p, ctx(last_price=13.0, position_qty=1000.0,
+                                             position_cost=10.0, tp_known=True,
+                                             tp_pct=30, tp_peak=13.0))
         self.assertIsNotNone(signal)
         self.assertEqual(signal["kind"], "take_profit")
         self.assertEqual(signal["side"], "sell")
+        self.assertEqual(signal["qty"], 500, "stage 0 sells half, never the whole position")
 
     def test_take_profit_needs_a_position(self):
         p = params()
@@ -555,11 +579,12 @@ class TestSignals(unittest.TestCase):
     def test_exit_wins_over_entry_on_the_same_symbol(self):
         """A name that must be sold is more urgent than buying anything."""
         p = params()
-        c = ctx(last_price=11.0, position_qty=1000.0, position_cost=10.0,
-                volume_ratio=5.0)
+        c = ctx(last_price=13.0, position_qty=1000.0, position_cost=10.0,
+                volume_ratio=5.0, tp_known=True, tp_pct=30, tp_peak=13.0)
         signals = lex.Executor(p, None, None, None).decide(c)
         self.assertEqual(len(signals), 1)
         self.assertEqual(signals[0]["kind"], "take_profit")
+        self.assertEqual(signals[0]["qty"], 500)
 
     def test_short_code_is_kind_plus_symbol_head(self):
         """The short code is the idempotency key: it must be stable for

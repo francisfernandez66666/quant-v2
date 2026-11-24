@@ -73,7 +73,11 @@ class TestAfternoonResealPure(unittest.TestCase):
 
     SYM = "000001.SZ"
     UP = 13.53
-    TOL = 0.005            # = params ld_seal_tolerance 0.995 的容差
+    # params.ld_seal_tolerance 是**乘子**（0.995，与 Go 的 shortSealTolerance 同一条尺子：
+    # close >= boardPx * 0.995 才算封住），不是回吐比例。2026-11-24 §TP-LADDER 复核时
+    # 发现这边原本按 0.005 传、公式又写成 up_stop*(1-tol)，于是阈值只剩板价的 0.5%
+    # ⇒ 任何午后有分钟K的票一律判"还封着"，leader_decay 下午永不卖。两侧统一成乘子。
+    TOL = 0.995            # = params ld_seal_tolerance（乘子）
 
     def test_reseal_after_1430_is_true(self):
         payload = {self.SYM: _Entry([12.0, 13.53, 13.53],
@@ -99,7 +103,7 @@ class TestAfternoonResealPure(unittest.TestCase):
 
     def test_tolerance_boundary(self):
         # 收盘刚好达 up*(1-tol) 算回封；差一分则不算。
-        edge = self.UP * (1.0 - self.TOL)
+        edge = self.UP * self.TOL
         hit = {self.SYM: _Entry([edge], ["202611171430"])}
         miss = {self.SYM: _Entry([edge - 0.01], ["202611171430"])}
         self.assertIs(mod._afternoon_reseal_from(hit, self.SYM, self.UP, self.TOL), True)

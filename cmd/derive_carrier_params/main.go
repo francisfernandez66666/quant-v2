@@ -482,6 +482,31 @@ func collectCarrierShape(c *collector) {
 	c.put("market_scale_ceiling_margin", src, config.CarrierMarketScaleCeilingMargin())
 	c.put("buy_retry_improve_pct", src, config.CarrierBuyRetryImprovePct())
 	c.put("buy_retry_max_per_day", src, config.CarrierBuyRetryMaxPerDay())
+	// §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
+	// 全部转调 internal/config/carrier_knobs.go 的访问器；本函数不产生任何数字。
+	const tpSrc = "internal/config/carrier_knobs.go:CarrierTP*"
+	c.put("tp_ladder_enabled", tpSrc, config.CarrierTPLadderEnabled())
+	c.put("tp_stage_half", tpSrc, config.CarrierTPStageHalf())
+	c.put("tp_half_fraction", tpSrc, config.CarrierTPHalfFraction())
+	c.put("tp_peak_arm_pct", tpSrc, config.CarrierTPPeakArmPct())
+	c.put("tp_trail_half_retr_pct", tpSrc, config.CarrierTPTrailHalfRetrPct())
+	c.put("tp_trail_clear_retr_pct", tpSrc, config.CarrierTPTrailClearRetrPct())
+	c.put("tp_trail_half_retr_pct_20cm", tpSrc, config.CarrierTPTrailHalfRetrPct20())
+	c.put("tp_trail_clear_retr_pct_20cm", tpSrc, config.CarrierTPTrailClearRetrPct20())
+	c.put("tp_trail_half_retr_pct_30cm", tpSrc, config.CarrierTPTrailHalfRetrPct30())
+	c.put("tp_trail_clear_retr_pct_30cm", tpSrc, config.CarrierTPTrailClearRetrPct30())
+	c.put("tp_giveback_pp", tpSrc, config.CarrierTPGivebackPP())
+	c.put("tp_breakdown_trim_on_profit", tpSrc, config.CarrierTPBreakdownTrimOnProfit())
+	c.put("tp_rebuy_block", tpSrc, config.CarrierTPRebuyBlock())
+	c.put("tp_dragon_take_profit_pct", tpSrc, config.CarrierTPDragonTakeProfitPct())
+	c.put("tp_dragon_open_no_reseal_sec", tpSrc, config.CarrierTPDragonOpenNoResealSec())
+	// 两枚战法止盈点是**转调**而非新数：双凸读战法包的出厂常量，龙回头读账号级策略出厂表
+	// 并把小数换成百分点（0.25 → 25）。账号里显式配过的值在烘参时优先，这里只烘兜底。
+	c.put("tp_double_bump_take_profit_pct",
+		"internal/strategies/double_bump:DefaultTakeProfitPct", double_bump.DefaultTakeProfitPct)
+	c.put("tp_dragon_return_take_profit_pct",
+		"internal/config/config.go:DefaultStrategyConfig().DragonReturn.TakeProfitPct*100",
+		config.CarrierTPDragonReturnTakeProfitPct())
 }
 
 // sortedInterfaceKeys 把 map 的键排序后返回：导出顺序必须稳定，

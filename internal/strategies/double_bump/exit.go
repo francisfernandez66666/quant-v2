@@ -14,6 +14,15 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// DefaultTakeProfitPct 双凸战法的出厂止盈点（百分点）。
+//
+// 2026-11-24 §TP-LADDER：这个 15 原来只作为 CheckExit 里的内联兜底存在，载体要同一枚数
+// （烘进 params.tp_double_bump_take_profit_pct）时无处可转调，只能人手抄一份——那正是
+// "第二本账"的形状。现在它是包内唯一一份：CheckExit 的兜底改用它，载体的导出腿也读它。
+// English: factory take-profit point for the double-bump tactic (points). Single home for the
+// number that used to be an inline fallback in CheckExit only.
+const DefaultTakeProfitPct = 15.0
+
 // CheckExit 判断双凸策略是否触发退出信号。
 // 按优先级依次检查多种退出条件，返回nil表示继续持有，返回ExitResult表示应该退出。
 //
@@ -95,7 +104,7 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strateg
 	// 止盈：浮盈达到 DoubleBumpTakeProfitPct（默认 15%）落袋（Take profit: unrealized gain ≥ DoubleBumpTakeProfitPct, default 15%）
 	tp := cfg.DoubleBumpTakeProfitPct
 	if tp <= 0 {
-		tp = 15
+		tp = DefaultTakeProfitPct
 	}
 	if pnlPct >= tp {
 		return &strategy.ExitResult{Reason: "双凸止盈", Priority: strategy.P2}

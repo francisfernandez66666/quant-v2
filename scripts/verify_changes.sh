@@ -26692,3 +26692,211 @@ fi
 [ "$B237_FAILED" = "0" ] || exit 1
 echo "ok - §237 §BOX-HEARTBEAT 锁通过（心跳带进程三态与策略日志年龄、日志缺失整键缺席、云端心跳落盘/未知不折成 stopped、state 两分支下发、前端一行只读读数，累计判定点 ${CNT237}）"
 echo ""
+echo "==> 238 §TP-LADDER（2026-11-24 owner 九条：卖半→跟峰值→龙头开板清；无影子期，实盘直上）..."
+B238_FAILED=0
+fail238() {
+	echo "--- FAIL: §238 $*"
+	FAIL=1
+	B238_FAILED=1
+}
+CNT238=0
+LE238=$(cat qmt_gateway/local_executor.py || true)
+ST238=$(cat qmt_gateway/qmt_internal_strategy.py || true)
+# 负锁必须判**代码**、不判散文：注释里为了讲清"别写成什么样"，常常原样引用那个错误式子，
+# 按整份文件 grep 就会把说明文字当成雷（本批第一次跑就是这么假红的）。
+ST238CODE=$( { python3 - <<'PYS' || true
+import io
+for line in io.open("qmt_gateway/qmt_internal_strategy.py", encoding="utf-8"):
+    if line.lstrip().startswith("#"):
+        continue
+    print(line.rstrip("\n"))
+PYS
+} )
+HR238=$(cat scripts/carrier_hot_reload_gz.py || true)
+QG238=$(cat internal/server/qmt.go || true)
+KNOB238=$(cat internal/config/carrier_knobs.go || true)
+DER238=$(cat cmd/derive_carrier_params/main.go || true)
+PYD238=$(cat scripts/derive_carrier_params.py || true)
+PJ238=$(cat qmt_gateway/local_executor_params.json || true)
+
+# ① 全平腿真的没了：`take_profit_ratio` 不在规则层默认表、也不在烘好的参数文件里；
+#    换上来的是两条腿（TP 卖半 / TT 清剩余），且都必须进 builtin_rules（无影子期）。
+CNT238=$((CNT238 + 1))
+if grep_q "'take_profit_ratio':" LE238 F; then
+	fail238 "规则层默认表里还留着 take_profit_ratio（全平腿会随默认值回来）"
+fi
+if grep_q '"take_profit_ratio"' PJ238 F; then
+	fail238 "参数文件里还留着 take_profit_ratio（盒子上会有一个没人读的数）"
+fi
+grep_q "'take_profit_clear'" LE238 F || fail238 "signal_codes 没有 take_profit_clear"
+grep_q "'builtin_rules': ['pullback_buy', 'take_profit', 'take_profit_clear'" LE238 F || fail238 "builtin_rules 没同时带两条止盈腿"
+grep_q '"take_profit_clear"' PJ238 F || fail238 "烘好的参数文件 builtin_rules 里没有 take_profit_clear"
+if grep_q "'take_profit_clear': 'shadow'" LE238 F; then
+	fail238 "清剩余那条腿落进 rule_arm 的影子档（owner：不要影子，要实盘）"
+fi
+# rule_arm_mode 的真正出口是参数文件里的 rule_arm 表：builtin_rules 只给"缺省 live"，
+# 一条 rule_arm['take_profit_clear']='shadow' 就能把整条阶梯重新关成影子而没人看得出来。
+ARM238=$( { python3 - <<'PYS' || true
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json"))["params"]
+arm = p.get("rule_arm") or {}
+print(",".join(k for k in ("take_profit", "take_profit_clear")
+               if arm.get(k) not in (None, "live")))
+PYS
+} )
+[ -z "$ARM238" ] || fail238 "止盈腿被 rule_arm 钉成影子/关（owner：不要影子）：${ARM238}"
+
+# ② Stage 0 只卖一半：走 _tp_half_qty，绝不出现整仓 qty。
+CNT238=$((CNT238 + 1))
+grep_q 'half = _tp_half_qty(params, qty)' LE238 F || fail238 "stage0 没有走半仓算术"
+grep_q 'def _tp_half_qty(params, qty):' LE238 F || fail238 "缺 _tp_half_qty"
+TPBODY238=$( { sed -n "/^def rule_take_profit(params, ctx):/,/^def rule_take_profit_clear(/p" qmt_gateway/local_executor.py || true; } )
+if grep_q 'qty=int(qty)' TPBODY238 F; then
+	fail238 "stage0 出现整仓卖出（那是 TT 清剩余的位置，不是 TP）"
+fi
+
+# ③ 弃权方向：没有烘入计划（tp_known 缺失）与手动仓一律不动手——两条腿都必须有。
+CNT238=$((CNT238 + 1))
+KNOWNC238=$( { grep -c 'if not ctx.get("tp_known"):' qmt_gateway/local_executor.py || true; } )
+[ "${KNOWNC238:-0}" -ge 2 ] || fail238 "tp_known 弃权没同时落在两条止盈腿上（当前 ${KNOWNC238:-0} 处）"
+MANUALC238=$( { grep -c 'if ctx.get("tp_manual"):' qmt_gateway/local_executor.py || true; } )
+[ "${MANUALC238:-0}" -ge 2 ] || fail238 "手动仓豁免没同时落在两条腿上（当前 ${MANUALC238:-0} 处）"
+
+# ④ 板宽三档 + 卖半整手算术（一手整卖 / 不足一手弃权）。
+CNT238=$((CNT238 + 1))
+grep_q 'def _tp_thresholds(params, symbol):' LE238 F || fail238 "缺 _tp_thresholds（板宽没有单点）"
+grep_q 't_bse_board_prefixes' LE238 F || fail238 "30cm 档没复用 t_bse_board_prefixes"
+grep_q 't_wide_board_prefixes' LE238 F || fail238 "20cm 档没复用 t_wide_board_prefixes"
+grep_q 'return {"half": params["tp_trail_half_retr_pct_30cm"]' LE238 F || fail238 "阈值没按板上回报（30cm 档缺）"
+grep_q 'return {"half": params["tp_trail_half_retr_pct_20cm"]' LE238 F || fail238 "阈值没按板上回报（20cm 档缺）"
+
+# ⑤ 破位腿：有浮盈只减半（000797 +2.2% 被整仓清是靶心）。
+CNT238=$((CNT238 + 1))
+grep_q 'tp_breakdown_trim_on_profit' LE238 F || fail238 "破位腿没有'有浮盈只减半'开关"
+
+# ⑥ 卖出链顺序：stop_loss → take_profit_clear → take_profit → breakdown；TT 走确认窗
+#    且 bull 不许延后清仓线；TP 不在确认窗内（卖半要快）。
+CNT238=$((CNT238 + 1))
+grep_q '("take_profit_clear", rule_take_profit_clear),' ST238 F || fail238 "卖出链里没有 take_profit_clear"
+CLEARPOS238=$( { grep -n '("take_profit_clear", rule_take_profit_clear),' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+TPPOS238B=$( { grep -n '("take_profit", rule_take_profit),' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+[ -n "$CLEARPOS238" ] && [ -n "$TPPOS238B" ] || fail238 "卖出链两条腿没同时出现"
+if [ -n "$CLEARPOS238" ] && [ -n "$TPPOS238B" ] && [ "$CLEARPOS238" -gt "$TPPOS238B" ]; then
+	fail238 "清剩余排在卖半之后（阶梯顺序倒置）"
+fi
+grep_q 'for kind in ("stop_loss", "take_profit_clear", "breakdown", "reduce"):' ST238 F || fail238 "_sell_obs_clear 的重置集合没带 take_profit_clear"
+
+# ⑦ 当日止盈过的票禁止再加仓/回买：闸在 intent 之后、flow_quadrant 之前，t_leg 豁免。
+CNT238=$((CNT238 + 1))
+REBUYBODY238=$( { awk '/if \(PARAMS.get\("tp_rebuy_block"\)/{f=1} f{print; if(/continue/){exit}}' qmt_gateway/qmt_internal_strategy.py || true; } )
+[ -n "$REBUYBODY238" ] || fail238 "没有 tp_rebuy_block 闸（按精确键名找不到那段 if）"
+grep_q 'PARAMS.get("tp_rebuy_block")' REBUYBODY238 F || fail238 "回买闸读的不是 PARAMS[\"tp_rebuy_block\"]（改名即失效，等于没有闸）"
+grep_q '_tp_fired(day, symbol, orders)' REBUYBODY238 F || fail238 "回买闸没有读当日止盈留痕（形同虚设）"
+grep_q 'continue' REBUYBODY238 F || fail238 "回买闸没有真正挡下这一笔（缺 continue）"
+grep_q 'intent in ("new", "add")' REBUYBODY238 F || fail238 "回买闸没有限定 new/add（T 腿会被一起挡掉）"
+REBUY238=$( { grep -n 'if (PARAMS.get("tp_rebuy_block")' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+QUAD238=$( { grep -n 'flow_quadrant_block' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+if [ -n "$REBUY238" ] && [ -n "$QUAD238" ] && [ "$REBUY238" -gt "$QUAD238" ]; then
+	fail238 "tp_rebuy_block 排在 flow_quadrant 之后（位置与设计不符）"
+fi
+
+# ⑧ 盒内三件事：计划按日键、峰值取 max、阶段取三个来源的最大值、短码必须 6 位。
+CNT238=$((CNT238 + 1))
+grep_q 'def _tp_plan_of(day, symbol):' ST238 F || fail238 "缺 _tp_plan_of"
+grep_q 'def _tp_peak_of(payload, symbol, plan):' ST238 F || fail238 "缺 _tp_peak_of"
+grep_q 'def _tp_stage_of(day, symbol, plan, orders):' ST238 F || fail238 "缺 _tp_stage_of"
+grep_q 'return len(rest) == 6 and rest.isdigit()' ST238 F || fail238 "短码判据放宽了（TP6005 会被当成 TP600519）"
+
+# ⑨ 龙头开板判据 fail-closed + 封板容忍是**乘子**（0.995），不是回吐比例。
+CNT238=$((CNT238 + 1))
+grep_q 'def _tp_open_no_reseal_from(payload, symbol, up_stop, secs, moment):' ST238 F || fail238 "缺 _tp_open_no_reseal_from"
+grep_q 'if tol <= 0.0 or tol > 1.0:' ST238 F || fail238 "封板乘子没有合法区间（缺读数会变成'封着'）"
+if grep_q 'up_stop * (1.0 - float(tol))' ST238CODE F; then
+	fail238 "封板判据又按 0.5% 算（阈值只剩板价的 0.5%，任何票都算封着）"
+fi
+if grep_q 'up_stop * (1.0 - tol)' ST238CODE F; then
+	fail238 "封板判据又按 0.5% 算（_tp_open_no_reseal_from）"
+fi
+
+# ⑩ 云端烘参：从 fills 重放（开仓日/战法/Stage）+ manual + 峰值 + 指纹不含峰值 + 在 sha 之前。
+CNT238=$((CNT238 + 1))
+grep_q 'def bake_tp_plan(qc=None):' HR238 F || fail238 "缺 bake_tp_plan"
+grep_q 'def tp_plan_digest(tp_plan):' HR238 F || fail238 "缺 tp_plan_digest"
+grep_q 'for k in ("strategy", "open_date", "stage", "manual", "tp_pct")' HR238 F || fail238 "指纹把峰值也算进去了（每个整点都会投递一次）"
+grep_q '"tp_plan": tp_digest' HR238 F || fail238 "tp_digest 没进 sha（新开仓/卖半不会触发重烘）"
+TPPOS238=$( { grep -n 'tp_plan = bake_tp_plan(qc)' scripts/carrier_hot_reload_gz.py || true; } | head -1 | cut -d: -f1)
+SHAPOS238=$( { grep -n 'payload = json.dumps({"wl": wl' scripts/carrier_hot_reload_gz.py || true; } | head -1 | cut -d: -f1)
+[ -n "$TPPOS238" ] || fail238 "主流程没调 bake_tp_plan"
+if [ -n "$TPPOS238" ] && [ -n "$SHAPOS238" ] && [ "$TPPOS238" -gt "$SHAPOS238" ]; then
+	fail238 "bake_tp_plan 排在 sha 之后（阶梯变了会被 sha 闸拦成 NOTHING_TO_DO）"
+fi
+grep_q 'doc2["params"]["tp_plan"] = tp_plan' HR238 F || fail238 "计划没写进发布载荷"
+
+# ⑪ 退役旋钮真的从盒子上消失，且不许扩成"base 缺什么就删什么"。
+CNT238=$((CNT238 + 1))
+grep_q 'RETIRED_PARAM_KEYS = frozenset(("take_profit_ratio",))' HR238 F || fail238 "RETIRED_PARAM_KEYS 没点名 take_profit_ratio"
+grep_q 'base_params.pop(key, None)' HR238 F || fail238 "退役键没有从 base 里 pop 掉"
+if grep_q 'if key not in base_params:' HR238 F && grep_q 'continue' HR238 F; then
+	:
+else
+	fail238 "base 不认识的新运行态键必须保留（11-12 600 池教训）"
+fi
+
+# ⑫ 云端归因：TT 登记 + 卖出补 `sell:<码>:<tp|tt>:<日>`，日键取成交时刻。
+CNT238=$((CNT238 + 1))
+grep_q '"TT": "take_profit_clear"' QG238 F || fail238 "carrierSignalCodes 没登记 TT"
+grep_q 'func carrierRemarkShortCode(remark string) string {' QG238 F || fail238 "缺 carrierRemarkShortCode"
+grep_q 'func carrierSellFillSignalID(code, leg, tradedAt string) string {' QG238 F || fail238 "缺 carrierSellFillSignalID（卖出归因没有单点）"
+DAYGA238=$( { sed -n "/^func carrierSellFillSignalID(/,/^}/p" internal/server/qmt.go || true; } )
+grep_q 'len(day) != 10' DAYGA238 F || fail238 "归因日键没有长度闸（坏日期会落脏键）"
+grep_q "day[7] != '-'" DAYGA238 F || fail238 "归因日键没有分隔符闸"
+if grep_q 'orders.cancel_reason = .sell:' QG238 F; then
+	fail238 "归因被写进 orders（orders 有 UNIQUE(user_id,signal_id)，历史买意向会撞键）"
+fi
+
+# ⑬ 真源一处：Go 常量 + 访问器 + derive 导出 + 参数文件 17 键 + tp_pct_base 登记为数学常数。
+CNT238=$((CNT238 + 1))
+grep_q 'carrierTPHalfFraction = 0.5' KNOB238 F || fail238 "半仓比例没有 Go 真源"
+grep_q 'func CarrierTPDragonOpenNoResealSec() float64' KNOB238 F || fail238 "龙头开板窗口没有访问器"
+grep_q 'c.put("tp_half_fraction"' DER238 F || fail238 "derive 没导出 tp_half_fraction"
+grep_q '"tp_pct_base"' PYD238 F || fail238 "tp_pct_base 没登记（会被当成无主键）"
+DB238=$(cat internal/strategies/double_bump/exit.go || true)
+grep_q 'const DefaultTakeProfitPct = 15.0' DB238 F || fail238 "双凸 15 点没有在战法包里命名"
+MISS238=$( { python3 - <<'PY' || true
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json"))["params"]
+need = ["tp_ladder_enabled", "tp_stage_half", "tp_half_fraction", "tp_peak_arm_pct",
+        "tp_trail_half_retr_pct", "tp_trail_clear_retr_pct",
+        "tp_trail_half_retr_pct_20cm", "tp_trail_clear_retr_pct_20cm",
+        "tp_trail_half_retr_pct_30cm", "tp_trail_clear_retr_pct_30cm",
+        "tp_giveback_pp", "tp_breakdown_trim_on_profit", "tp_rebuy_block",
+        "tp_dragon_take_profit_pct", "tp_dragon_open_no_reseal_sec",
+        "tp_dragon_return_take_profit_pct", "tp_double_bump_take_profit_pct",
+        "tp_pct_base"]
+print(",".join(k for k in need if k not in p))
+PY
+} )
+[ -z "$MISS238" ] || fail238 "参数文件缺键：${MISS238}"
+
+# ⑭ 行为腿：Go 旋钮/归因 + 载体阶梯/烘参/退役键/午后回封。
+CNT238=$((CNT238 + 1))
+GO238_RC=0
+go test ./internal/config ./internal/server -run 'TestTPKnobs|TestCarrierSignalCodes|TestCarrierRemarkShortCode|TestCarrierTPLegOfShort|TestCarrierSellFillSignalID' -count=1 >/dev/null 2>&1 || GO238_RC=$?
+[ "$GO238_RC" = "0" ] || fail238 "Go 行为腿未过（退出码 ${GO238_RC}）"
+if command -v python3 >/dev/null 2>&1; then
+	PY238_RC=0
+	python3 -m pytest qmt_gateway/tests/test_tp_ladder_20261124.py \
+		qmt_gateway/tests/test_hotreload_tp_plan.py \
+		qmt_gateway/tests/test_hotreload_static_params.py \
+		qmt_gateway/tests/test_afternoon_reseal_20261117.py \
+		qmt_gateway/tests/test_local_executor.py \
+		qmt_gateway/tests/test_derive_carrier_params.py \
+		-q >/dev/null 2>&1 || PY238_RC=$?
+	[ "$PY238_RC" = "0" ] || fail238 "载体行为腿未过（退出码 ${PY238_RC}）"
+else
+	echo "INFO - §238 无 python3，载体行为腿未跑"
+fi
+
+[ "$B238_FAILED" = "0" ] || exit 1
+echo "ok - §238 §TP-LADDER 锁通过（全平腿退役+卖半/清剩余两条腿实盘直上+板宽三档5/8与6/10+破位有浮盈只减半+当日止盈禁回买+t_leg豁免+盒内计划/峰值/阶段三读且短码6位严格+龙头开板fail-closed且封板判据用乘子+云端按成交重放并把手动仓标出+指纹不含峰值且在sha之前+退役键真删不扩通配+卖出成交归因 sell:码:tp|tt:日 取成交时刻，累计判定点 ${CNT238}）"
+echo ""

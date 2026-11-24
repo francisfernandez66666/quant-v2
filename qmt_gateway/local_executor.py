@@ -69,6 +69,7 @@ LOG = logging.getLogger("qmt_gateway.local_executor")
 # notice was printed, so a 5-minute restart cadence cannot flood the log.
 _CUTOVER_WARN_HOUR = -1
 
+
 # ==== BAKED PARAMS BEGIN ====
 STRATEGY_VERSION = "v16-20261111"
 PARAMS = {
@@ -103,7 +104,7 @@ PARAMS = {
     'break_down_kind': 'break_down',
     'breakdown_ratio': 0.96,
     'budget_mode': 'dynamic',
-    'builtin_rules': ['pullback_buy', 'take_profit', 'stop_loss', 'breakdown_sell', 'reduce_position'],
+    'builtin_rules': ['pullback_buy', 'take_profit', 'take_profit_clear', 'stop_loss', 'breakdown_sell', 'reduce_position'],
     'buy_confirm_min_gap_sec': 60,
     'buy_confirm_rounds': 2,
     'buy_retry_improve_pct': 0.2,
@@ -433,7 +434,7 @@ PARAMS = {
     'sell_confirm_sec': 60,
     'session_gate_enabled': True,
     'session_windows': [['09:30', '11:30'], ['13:00', '14:52']],
-    'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP', 'reduce_position': 'RD'},
+    'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP', 'reduce_position': 'RD', 'take_profit_clear': 'TT'},
     'signal_gone_cancel_sec': 0,
     'single_stock_cap_pct': 35.0,
     'sizing_enabled': True,
@@ -509,9 +510,26 @@ PARAMS = {
     't_vwap_check_tol_pct': 0.1,
     't_vwap_dev_pct': 0.8,
     't_wide_board_prefixes': ['30', '68'],
-    'take_profit_ratio': 1.05,
     'tier_red_default': 0.3,
     'tier_scales': {'Red': 0.3, 'Yellow': 0.6},
+    'tp_breakdown_trim_on_profit': True,
+    'tp_double_bump_take_profit_pct': 15,
+    'tp_dragon_open_no_reseal_sec': 900,
+    'tp_dragon_return_take_profit_pct': 25,
+    'tp_dragon_take_profit_pct': 30,
+    'tp_giveback_pp': 5,
+    'tp_half_fraction': 0.5,
+    'tp_ladder_enabled': True,
+    'tp_pct_base': 100.0,
+    'tp_peak_arm_pct': 0,
+    'tp_rebuy_block': True,
+    'tp_stage_half': 1,
+    'tp_trail_clear_retr_pct': 5,
+    'tp_trail_clear_retr_pct_20cm': 8,
+    'tp_trail_clear_retr_pct_30cm': 10,
+    'tp_trail_half_retr_pct': 3,
+    'tp_trail_half_retr_pct_20cm': 5,
+    'tp_trail_half_retr_pct_30cm': 6,
     'unmapped_strategies': ['n_shape'],
     'vol20_window': 20,
     'vol5_window': 5,
@@ -986,18 +1004,172 @@ def rule_pullback_buy(params, ctx):
     return make_signal(params, ctx, "pullback_buy", "buy", amount, last)
 
 
+# --- TP-LADDER 2026-11-24 (owner: two-stage take-profit, live) --------------
+#
+# Owner ruling: the flat +5% full exit is gone. Every position now exits in two
+# stages: sell HALF at its own strategy take-profit point (or, when a strategy
+# has none, half a peak-retrace step), then trail the REST under the peak and
+# clear it on a wider retrace. Prices come from the counter, thresholds come
+# from PARAMS -- the rule layer never writes a number.
+
+def _tp_retr_pct(params, peak, last):
+    """How far the price has come back from the peak, percent of the peak."""
+    if not peak or last is None:
+        return None
+    return (params["tp_pct_base"] * (float(peak) - float(last))) / float(peak)
+
+
+def _tp_pnl_pct(params, cost, price):
+    """Holding P&L in points: (price - cost) / cost * pct_base. None when unknown."""
+    if not cost or price is None:
+        return None
+    return (params["tp_pct_base"] * (float(price) - float(cost))) / float(cost)
+
+
+def _tp_thresholds(params, symbol):
+    """{"half": %, "clear": %} peak-retrace thresholds for this board.
+
+    Order is BSE 30cm -> wide 20cm -> main 10cm, and it must stay that way: the
+    BSE table is one-char ('4','8') plus '92', the wide table is two-char
+    ('30','68'). Checking wide first happens to work today, but the day someone
+    adds a bare '8' to the wide list every BSE name silently becomes 20cm.
+    `startswith` covers both widths without slicing (the rule layer may not
+    carry index literals either -- gate g5).
+    """
+    head = symbol_head(symbol, params["symbol_head_len"])
+    for prefix in (params.get("t_bse_board_prefixes") or []):
+        if head.startswith(str(prefix)):
+            return {"half": params["tp_trail_half_retr_pct_30cm"],
+                    "clear": params["tp_trail_clear_retr_pct_30cm"]}
+    for prefix in (params.get("t_wide_board_prefixes") or []):
+        if head.startswith(str(prefix)):
+            return {"half": params["tp_trail_half_retr_pct_20cm"],
+                    "clear": params["tp_trail_clear_retr_pct_20cm"]}
+    return {"half": params["tp_trail_half_retr_pct"],
+            "clear": params["tp_trail_clear_retr_pct"]}
+
+
+def _tp_half_qty(params, qty):
+    """Half of qty in whole lots; the FULL qty when half would not fill a lot.
+
+    Owner ruling 5: "if selling half is not a whole lot, sell everything".
+    None means the position cannot even make one lot -- the caller then leaves
+    it to the -6% clear line instead of paying a fee to sell nothing (same
+    stance as rule_reduce_position).
+    """
+    lot = params["lot_size"]
+    total = int(qty)
+    if total < lot:
+        return None
+    half = (int(total * params["tp_half_fraction"]) // lot) * lot
+    if not half:
+        return total
+    return half
+
+
 def rule_take_profit(params, ctx):
-    """P0 take-profit signal for a held position."""
+    """Stage 0 of the take-profit ladder: sell HALF, never the whole position.
+
+    Owner ruling 2026-11-24 (nine rulings, plan docs/PLAN_TP_LADDER_20261124.md):
+    the old flat `take_profit_ratio` full exit is GONE. Two triggers, two units:
+
+      * the position has its own strategy take-profit point (`tp_pct`, baked per
+        code): fire when the holding's P&L in POINTS reaches it. Dragon 30,
+        double-bump 15, dragon-return 25, everything else has none;
+      * it has none (the `fac_*` majority): the position arms only after its
+        PEAK P&L cleared `tp_peak_arm_pct`, then gives back `half_retr` percent
+        of the peak PRICE. That retrace is a percentage of the high, not a
+        point give-back -- the two are different rulers on purpose.
+
+    Manual positions and stage-1 positions never fire here.
+    """
     if not ctx.get("trading_day"):
         return None
+    if not params["tp_ladder_enabled"]:
+        return None
+    if not ctx.get("tp_known"):
+        return None
+    if ctx.get("tp_manual"):
+        return None
+    if ctx.get("tp_stage"):
+        return None
     last = ctx.get("last_price")
-    cost = ctx.get("position_cost")
     qty = ctx.get("position_qty")
-    if last is None or cost is None or not qty:
+    cost = ctx.get("position_cost")
+    peak = ctx.get("tp_peak")
+    if last is None or not qty or peak is None:
         return None
-    if last < cost * params["take_profit_ratio"]:
+    tp_pct = ctx.get("tp_pct")
+    if tp_pct is not None:
+        pnl = _tp_pnl_pct(params, cost, last)
+        if pnl is None:
+            return None
+        if pnl < float(tp_pct):
+            return None
+    else:
+        peak_pnl = _tp_pnl_pct(params, cost, peak)
+        retr = _tp_retr_pct(params, peak, last)
+        half_retr = _tp_thresholds(params, ctx.get("symbol"))["half"]
+        if peak_pnl is None or retr is None:
+            return None
+        if peak_pnl < params["tp_peak_arm_pct"]:
+            return None
+        if retr < half_retr:
+            return None
+    half = _tp_half_qty(params, qty)
+    if half is None:
         return None
-    return make_signal(params, ctx, "take_profit", "sell", None, last, qty=qty)
+    return make_signal(params, ctx, "take_profit", "sell", None, last, qty=half)
+
+
+def rule_take_profit_clear(params, ctx):
+    """Stage 1: clear what is left -- under the peak, or off the dragon board.
+
+    Two independent clear triggers, both decided here so the round loop stays a
+    dispatcher:
+
+      * dragon open-board (owner ruling 9 + 2026-11-24 clarification): the name
+        sealed the board today and has been off it for
+        `tp_dragon_open_no_reseal_sec` without re-sealing. NO 30% precondition
+        -- "the dragon is often already a tail when we buy it" -- so this fires
+        at any stage, profit or loss;
+      * stage-1 trail: after the half sale the rest follows the PEAK. With a
+        strategy target the ruler is give-back IN POINTS (`tp_giveback_pp`,
+        i.e. 30% -> 25%); without one it is a retrace of the peak PRICE
+        (`clear_retr`, 3%/5% on 10cm, 5%/8% on 20cm, 6%/10% on 30cm).
+    """
+    if not ctx.get("trading_day"):
+        return None
+    if not params["tp_ladder_enabled"]:
+        return None
+    if not ctx.get("tp_known"):
+        return None
+    if ctx.get("tp_manual"):
+        return None
+    last = ctx.get("last_price")
+    qty = ctx.get("position_qty")
+    cost = ctx.get("position_cost")
+    peak = ctx.get("tp_peak")
+    if last is None or not qty or peak is None:
+        return None
+    if ctx.get("tp_dragon_open_no_reseal"):
+        return make_signal(params, ctx, "take_profit_clear", "sell", None, last, qty=int(qty))
+    if ctx.get("tp_stage") != params["tp_stage_half"]:
+        return None
+    tp_pct = ctx.get("tp_pct")
+    if tp_pct is not None:
+        peak_pnl = _tp_pnl_pct(params, cost, peak)
+        pnl = _tp_pnl_pct(params, cost, last)
+        if peak_pnl is None or pnl is None:
+            return None
+        if peak_pnl - pnl < params["tp_giveback_pp"]:
+            return None
+    else:
+        retr = _tp_retr_pct(params, peak, last)
+        clear_retr = _tp_thresholds(params, ctx.get("symbol"))["clear"]
+        if retr is None or retr < clear_retr:
+            return None
+    return make_signal(params, ctx, "take_profit_clear", "sell", None, last, qty=int(qty))
 
 
 def rule_stop_loss(params, ctx):
@@ -1050,16 +1222,32 @@ def rule_reduce_position(params, ctx):
 
 
 def rule_breakdown_sell(params, ctx):
-    """P0 breakdown sell signal: the price lost its reference level."""
+    """P0 breakdown sell signal: the price lost its reference level.
+
+    Owner ruling 3 (2026-11-24): a profitable position must NOT be cleared by
+    this leg -- it trims half and leaves the rest to the take-profit ladder
+    (today's 000797 was cleared at +2.2% two minutes after an add). At a loss
+    the leg is unchanged: it still clears the whole position.
+
+    One-lot corner: `_tp_half_qty` returns the full qty when half is not a whole
+    lot (ruling 5), so a single-lot position in profit is sold whole. It has no
+    "halve" to choose from; the alternative would be to disable this leg for it.
+    """
     if not ctx.get("trading_day"):
         return None
     last = ctx.get("last_price")
     ref = ctx.get("ref_price")
     qty = ctx.get("position_qty")
+    cost = ctx.get("position_cost")
     if last is None or ref is None or not qty:
         return None
     if last > ref * params["breakdown_ratio"]:
         return None
+    if params["tp_breakdown_trim_on_profit"] and not ctx.get("tp_manual") and cost and last > cost:
+        half = _tp_half_qty(params, qty)
+        if half is None:
+            return None
+        return make_signal(params, ctx, "breakdown_sell", "sell", None, last, qty=half)
     return make_signal(params, ctx, "breakdown_sell", "sell", None, last, qty=qty)
 
 

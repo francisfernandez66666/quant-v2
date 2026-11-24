@@ -78,7 +78,8 @@
       "pullback_buy": "PB",
       "stop_loss": "SL",
       "take_profit": "TP",
-      "reduce_position": "RD"
+      "reduce_position": "RD",
+      "take_profit_clear": "TT"
     },
     "stale_order_sec": 600,
     "stop_loss_ratio": 0.94,
@@ -181,12 +182,12 @@
       "688130.SH",
       "920062.SH"
     ],
-    "take_profit_ratio": 1.05,
     "volume_ratio_min": 1.5,
     "close_sweep_from": "14:50",
     "builtin_rules": [
       "pullback_buy",
       "take_profit",
+      "take_profit_clear",
       "stop_loss",
       "breakdown_sell",
       "reduce_position"
@@ -2086,7 +2087,25 @@
     "sell_confirm_rounds": 2,
     "sell_confirm_sec": 60,
     "buy_retry_improve_pct": 0.2,
-    "buy_retry_max_per_day": 3
+    "buy_retry_max_per_day": 3,
+    "tp_pct_base": 100.0,
+    "tp_breakdown_trim_on_profit": true,
+    "tp_double_bump_take_profit_pct": 15,
+    "tp_dragon_open_no_reseal_sec": 900,
+    "tp_dragon_return_take_profit_pct": 25,
+    "tp_dragon_take_profit_pct": 30,
+    "tp_giveback_pp": 5,
+    "tp_ladder_enabled": true,
+    "tp_peak_arm_pct": 0,
+    "tp_rebuy_block": true,
+    "tp_stage_half": 1,
+    "tp_trail_clear_retr_pct": 5,
+    "tp_trail_clear_retr_pct_20cm": 8,
+    "tp_trail_clear_retr_pct_30cm": 10,
+    "tp_trail_half_retr_pct": 3,
+    "tp_trail_half_retr_pct_20cm": 5,
+    "tp_trail_half_retr_pct_30cm": 6,
+    "tp_half_fraction": 0.5
   },
   "strategy_version": "v16-20261111",
   "_comment_arm": "rule_arm maps a ported rule kind to 'shadow' | 'live' | 'off'. Default for anything not listed is 'off' (it computes nothing, spends nothing), and the builtin_rules above are always 'live' because that is today's behaviour. Why a knob at all instead of 'port it and it trades': the migration plan requires each re-calibrated rule to run in shadow against the Go engine for >=5 trading days first -- a threshold re-calibrated wrong changes the strategy's MEANING without changing any number a human would notice.",

@@ -98,6 +98,9 @@ SIGNAL_POOL_MAX = int(os.environ.get("SIGNAL_POOL_MAX", "1000"))  # owner 2026-1
 PARAMS_BASE_NAME = "local_executor_params.base.json"
 RUNTIME_PARAM_KEYS = frozenset((
     "hot_pool", "precalc", "symbols", "t_anchor_book", "t_macro",
+    # §TP-LADDER-20261124：每只持仓的止盈梯子起点（战法/开仓日/Stage/峰值/止盈点），
+    # 每轮由 bake_tp_plan 从 live.db 的成交重建——运行态，永远以本轮算出来的为准。
+    "tp_plan",
     "concept_map", "industry_map", "live_rules", "risk_list_dynamic",
     # §FLOW-SNAPSHOT：30 分钟重算的资金流快照（大盘/板块 delta + 市场状态/仓位档），
     # 由 bake_flow_snapshot 每轮重算写入，永远是运行态而非静态旋钮。
@@ -117,6 +120,13 @@ FLOW_SNAP_ATTEMPT = os.path.join(BUILD_DIR, "qmt_gateway", "flow_snapshot_attemp
 # 顶层（不在 params 内）的运行态键：版本号必须单调，不能被 base 里的旧值盖回去。
 RUNTIME_DOC_KEYS = frozenset(("strategy_version",))
 
+# §TP-LADDER-20261124：被**正式退役**的静态旋钮。合并方向本来是「base 里没有的新键原样保留
+# （宁可多留，不可像 11-12 那次把 600 池冲掉）」，那条纪律针对的是"运行态新增键"；一个被
+# owner 废掉的阈值必须真的从盒子上消失，否则 PARAMS 里躺着一个没人读的数，下一次改它的人
+# 会以为它还在生效（`take_profit_ratio=1.05` 全平腿就是 2026-11-24 那三笔误清仓的成因）。
+# 只删这里点名的键，绝不扩成"base 缺什么就删什么"。
+RETIRED_PARAM_KEYS = frozenset(("take_profit_ratio",))
+
 
 def merge_static_params(runtime_doc, base_doc):
     """Overlay the shipped static base on one runtime params doc -> (merged, patched).
@@ -133,6 +143,9 @@ def merge_static_params(runtime_doc, base_doc):
     runtime_params = (runtime_doc or {}).get("params") or {}
     patched = []
     for key in sorted(runtime_params):
+        if key in RETIRED_PARAM_KEYS:
+            # 退役旋钮：base 里没有、运行态里还留着的，一律不搬过去（见 RETIRED_PARAM_KEYS）。
+            continue
         if key in RUNTIME_PARAM_KEYS:
             base_params[key] = runtime_params[key]
             continue
@@ -144,6 +157,8 @@ def merge_static_params(runtime_doc, base_doc):
             continue
         if base_params[key] != runtime_params[key]:
             patched.append((key, runtime_params[key], base_params[key]))
+    for key in RETIRED_PARAM_KEYS:
+        base_params.pop(key, None)
     merged["params"] = base_params
     for key in RUNTIME_DOC_KEYS:
         if isinstance(runtime_doc, dict) and key in runtime_doc:
@@ -517,6 +532,243 @@ def bake_t_anchor_book():
         return {}
     print("HOTRELOAD_T_ANCHOR n=%d" % len(out))
     return out
+
+
+# §TP-LADDER-20261124：战法名 → 载体止盈点键（真源 internal/config/carrier_knobs.go）。
+# 没有列在这里的战法（factor_composite / high_churn / leader_decay / good_news_fade /
+# break_down / pattern_template）**本来就没有止盈点**——owner 裁决 1 要求它们也有出口，
+# 走的是"峰值回撤"那一档，不是硬凑一个数字进来。
+TP_PCT_KNOB_BY_STRATEGY = {
+    "dragon": "tp_dragon_take_profit_pct",
+    "double_bump": "tp_double_bump_take_profit_pct",
+    "dragon_return": "tp_dragon_return_take_profit_pct",
+}
+
+
+def _ts_code_of(code):
+    """6 位代码 → `daily.ts_code` 的写法（000001.SZ / 600519.SH / 830799.BJ）。"""
+    c = norm(code)
+    if len(c) != 6 or not c.isdigit():
+        return ""
+    if c[:2] == "92" or c[0] in ("4", "8"):
+        return c + ".BJ"
+    if c[0] in ("6", "9", "5"):
+        return c + ".SH"
+    return c + ".SZ"
+
+
+def _tp_explicit_pct(qc, strategy):
+    """账号里**显式写过**的止盈点（百分点），没写过返回 None。
+
+    判据是**键在不在**而不是值多少：纸面出厂表里 dragon=10 / double_bump=15，而载体
+    dragon 用的是 30（owner 裁决 9，与纸面刻意不同）——把出厂值读回来等于悄悄废掉那条裁决。
+    dragon_return 在配置里存的是**小数**（0.25），载体说的是百分点，这里只做一次单位换算。
+    """
+    strat = ((qc.get("rules") or {}).get("strategy") or {})
+    value = None
+    if strategy == "double_bump":
+        value = (strat.get("double_bump") or {}).get("double_bump_take_profit_pct")
+    elif strategy == "dragon_return":
+        value = (strat.get("dragon_return") or {}).get("take_profit_pct")
+        try:
+            if value is not None and float(value) <= 1.0:
+                value = float(value) * 100.0
+        except (TypeError, ValueError):
+            value = None
+    else:
+        value = (strat.get(strategy) or {}).get("take_profit_pct")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def bake_tp_plan(qc=None):
+    """§TP-LADDER-20261124：把「每只持仓的止盈梯子起点」从云端真源烘进载体。
+
+    载体没有磁盘（券商禁令）、每次投递都重载策略，柜台 POSITION 行又不带入场战法与
+    峰值 ⇒ 三件事只能云端算好：**入场战法**（决定止盈点）、**开仓日**（决定峰值窗口）、
+    **Stage**（卖过一半没有）。真源只有一处：live.db 的 fills——按时间正序模拟净头寸，
+    头寸从 0 变正的那一刻就是开仓日与战法（signal_id = buy:<码>:<战法>:<日>）；
+    成交里出现 sell:<码>:tp:<日> 即 Stage 1（§TP-LADDER 的 qmt.go 卖出补链写的）。
+
+    ⚠️ 不用 real_positions.signal_id/strategy/buy_date 判这两件事：对账快照建的行三列全空，
+    成交 UPDATE 分支也不写（实读 000680/000521/000415 全空，而成交明明是 buy:...:fac_160）。
+    它们只用来做两件事：确认"现在还持有"、以及给峰值补一个最高价读数。
+
+    峰值 = max(real_positions.highest_price, 开仓日至今的 daily.high)。
+    全量或弃权：库读不到 → 空表 ⇒ 载体整条阶梯弃权（fail-closed，绝不按 0 当真）。
+    """
+    today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
+    today_dash = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
+    tp_params = {}
+    try:
+        with open(os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_params.json"),
+                  encoding="utf-8") as fh:
+            tp_params = json.load(fh).get("params") or {}
+    except (OSError, ValueError):
+        tp_params = {}
+    if qc is None:
+        try:
+            qc, _rules = load_live()
+        except Exception as exc:  # noqa: BLE001 — 读不到配置只影响"显式值优先"
+            print("HOTRELOAD_TP_PLAN_CONFIG_MISS %s" % repr(exc)[:80])
+            qc = {}
+
+    # ---- 1) 按成交重建「现在这一轮建仓」：开仓日、战法、Stage ----
+    legs = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect("file:%s?mode=ro" % LIVE_DB, uri=True, timeout=5)
+        try:
+            cur = conn.execute(
+                "SELECT code, side, qty, traded_at, signal_id FROM fills "
+                "WHERE user_id=? ORDER BY traded_at, id", (OWNER_UID,))
+            for code, side, qty, traded_at, signal_id in cur:
+                c = norm(code)
+                if len(c) != 6 or not c.isdigit():
+                    continue
+                st = legs.setdefault(c, {"net": 0, "open": None, "strategy": "", "stage": 0})
+                try:
+                    q = int(qty or 0)
+                except (TypeError, ValueError):
+                    q = 0
+                if q <= 0:
+                    continue
+                if str(side) == "买入":
+                    if st["net"] <= 0:
+                        st["open"] = str(traded_at or "")[:10] or None
+                        st["strategy"] = _strategy_of_signal(signal_id)
+                        st["stage"] = 0
+                    st["net"] += q
+                else:
+                    st["net"] -= q
+                    if st["net"] <= 0:
+                        # 清仓：下一笔买入才算新一轮建仓，阶梯从 Stage 0 重来。
+                        st["net"] = 0
+                        st["open"] = None
+                        st["strategy"] = ""
+                        st["stage"] = 0
+                    elif _leg_of_signal(signal_id) == "tp":
+                        st["stage"] = 1
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — 库缺表/锁繁忙 → 空表，载体 fail-closed
+        print("HOTRELOAD_TP_PLAN_FALLBACK %s" % repr(exc)[:80])
+        return {}
+
+    # ---- 2) 现在真的还持有什么（real_positions）+ 峰值读数 ----
+    held = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect("file:%s?mode=ro" % LIVE_DB, uri=True, timeout=5)
+        try:
+            cur = conn.execute(
+                "SELECT ts_code, COALESCE(qty,0), COALESCE(highest_price,0) FROM real_positions "
+                "WHERE user_id=? AND COALESCE(qty,0)>0", (OWNER_UID,))
+            for code, qty, highest in cur:
+                held[norm(code)] = float(highest or 0)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        print("HOTRELOAD_TP_PLAN_HELD_FALLBACK %s" % repr(exc)[:80])
+        return {}
+
+    out = {}
+    manual = 0
+    unknown = 0
+    for code, highest in held.items():
+        st = legs.get(code) or {}
+        open_day = st.get("open")
+        strategy = st.get("strategy") or ""
+        if not open_day or st.get("net", 0) <= 0:
+            # 没有可归属的买入成交：手动仓 / 成交史被截断。owner 裁决 8 说手动仓不参与
+            # 止盈，方向是"不动它"，所以照实标 manual，载体据此两条腿都不过问。
+            manual += 1
+            out[code] = {"strategy": strategy, "open_date": open_day or "",
+                         "stage": 0, "peak": round(highest, 4) if highest > 0 else None,
+                         "tp_pct": None, "manual": True}
+            continue
+        tp_pct = _tp_explicit_pct(qc, strategy) if strategy else None
+        if tp_pct is None and strategy in TP_PCT_KNOB_BY_STRATEGY:
+            knob = TP_PCT_KNOB_BY_STRATEGY[strategy]
+            try:
+                tp_pct = float(tp_params.get(knob))
+            except (TypeError, ValueError):
+                tp_pct = None
+                unknown += 1
+                print("HOTRELOAD_TP_PLAN_WARN key=%s strategy=%s code=%s" % (knob, strategy, code))
+        peak = highest if highest > 0 else None
+        try:
+            import sqlite3
+            conn = sqlite3.connect("file:%s?mode=ro" % HOTRELOAD_DB, uri=True, timeout=5)
+            try:
+                row = conn.execute(
+                    "SELECT MAX(high) FROM daily WHERE ts_code=? AND trade_date>=? AND trade_date<=?",
+                    (_ts_code_of(code), open_day.replace("-", ""), today_dash.replace("-", ""))
+                ).fetchone()
+                if row and row[0] is not None and float(row[0]) > 0:
+                    daily_high = float(row[0])
+                    peak = daily_high if peak is None else max(peak, daily_high)
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 — 峰值缺一条腿只影响阶梯宽容度
+            print("HOTRELOAD_TP_PLAN_DAILY_MISS code=%s %s" % (code, repr(exc)[:60]))
+        out[code] = {"strategy": strategy, "open_date": open_day,
+                     "stage": int(st.get("stage") or 0),
+                     "peak": round(peak, 4) if peak else None,
+                     "tp_pct": tp_pct, "manual": False}
+    print("HOTRELOAD_TP_PLAN n=%d manual=%d unknown_tp=%d day=%s" % (
+        len(out), manual, unknown, today))
+    return {today: out} if out else {}
+
+
+def tp_plan_digest(tp_plan):
+    """Comparable fingerprint of the baked ladder plan (peak deliberately excluded).
+
+    Only the static triple per name goes into the digest: strategy (which picks
+    the take-profit point), open_date (which bounds the peak window) and stage
+    (half already sold). Peak moves every single day, so folding it in would
+    re-bake and therefore **restart the box client** on every timer tick; the
+    peak still travels in the payload, it just does not decide "changed".
+
+    Empty/absent plan -> "" so "never baked" and "baked empty" stay
+    distinguishable from "baked and unchanged" in the log.
+    """
+    if not isinstance(tp_plan, dict) or not tp_plan:
+        return ""
+    body = {}
+    for day, per in tp_plan.items():
+        if not isinstance(per, dict):
+            continue
+        body[str(day)] = {
+            str(code): {k: (row or {}).get(k)
+                        for k in ("strategy", "open_date", "stage", "manual", "tp_pct")}
+            for code, row in per.items()
+        }
+    if not body:
+        return ""
+    return hashlib.sha256(json.dumps(body, ensure_ascii=True, sort_keys=True)
+                          .encode()).hexdigest()[:16]
+
+
+def _strategy_of_signal(signal_id):
+    """`buy:<码>:<战法>:<日>` → 战法名（认不出返回空串，绝不猜）。"""
+    text = str(signal_id or "")
+    parts = text.split(":")
+    if len(parts) >= 3 and parts[0] == "buy":
+        return parts[2].strip()
+    return ""
+
+
+def _leg_of_signal(signal_id):
+    """`sell:<码>:<tp|tt>:<日>` → tp / tt（其他形态返回空串）。"""
+    text = str(signal_id or "")
+    parts = text.split(":")
+    if len(parts) >= 3 and parts[0] == "sell" and parts[2] in ("tp", "tt"):
+        return parts[2]
+    return ""
 
 
 def bake_t_macro():
@@ -1044,6 +1296,12 @@ def main():
     # 盒子上永远拿不到新的 delta（与当日利空归因、T 锚点同一条纪律）。
     flow_snapshot, flow_changed = bake_flow_snapshot()
     flow_digest = flow_snapshot_digest(flow_snapshot)
+    # §TP-LADDER-20261124：每只持仓的止盈梯子起点。同样在 sha 之前算——新开仓、
+    # "已经卖过一半"这两种变化都必须触发重烘，否则载体阶梯停在旧阶段（会把剩下的
+    # 一半再卖一次，或永远不卖）。sha 里只放**静态三元组**：峰值每天都在变，把它算进
+    # sha 会让每个整点都重烘投递，而一次投递＝客户端一次有序重启。
+    tp_plan = bake_tp_plan(qc)
+    tp_digest = tp_plan_digest(tp_plan)
     # §BUCKETS-SHA-20261112：行业/概念桶内容纳入 sha——桶由 pregen 的回填腿维护，
     # 桶变化必须触发重烘投递（否则 params 变了产物不变，盒子上永远拿不到桶）。
     # 注意：本脚本没有 PARAMS_PATH 常量（那是 pregen 的），params 走 BUILD_DIR 相对
@@ -1066,6 +1324,8 @@ def main():
                           "sector_map": sector_map_meta,
                           "buy_codes": sorted(extract_buy_codes()),
                           "t_bake": t_bake_digest,
+                          # §TP-LADDER-20261124：阶梯阶段指纹（不含峰值，见上）。
+                          "tp_plan": tp_digest,
                           # §FLOW-SNAPSHOT：资金流快照（量化后的可比指纹）纳入 sha——
                           # 内容不变时 NOTHING_TO_DO（不重启客户端），变了就必须重烘投递。
                           "flow_snapshot": flow_digest,
@@ -1159,6 +1419,7 @@ def main():
     # 空表/空宏观是安全的：沙箱 t_gate_open 会 fail-closed 停开 T（不会瞎下）。
     doc2["params"]["t_anchor_book"] = t_anchor_book
     doc2["params"]["t_macro"] = t_macro
+    doc2["params"]["tp_plan"] = tp_plan
     doc2["params"]["t_signal_codes"] = dict(T_SIGNAL_CODES)
     # §FLOW-SNAPSHOT：写资金流快照（含 baked_at，供载体判 TTL）。没有可用快照时
     # **不写空壳**——跨日的旧键由载体自己按 day 弃权，写一个空 dict 反而会抹掉

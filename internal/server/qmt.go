@@ -1305,6 +1305,17 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 					tradeDayOfTradedAt(tradedAt))
 			}
 		}
+		// §TP-LADDER-20261124 卖出成交补归因：载体卖出原来**恒为空 signal_id**
+		// （上面那条补链只认买入）⇒ 云端无从证明"这只票的另一半今天已经卖过"，
+		// 载体重启后阶梯退回 Stage 0，会把剩下的那一半再卖一次。TP（卖半）/TT（清剩余）
+		// 在这里补成 `sell:<码>:<tp|tt>:<日>`。只补 fills、不碰 orders（orders 有
+		// UNIQUE(user_id,signal_id)，且历史上已按买意向占位）；认不出短码就不补——
+		// 假归因比空归因更贵（会凭空造出一次没发生过的止盈，直接改阶梯阶段）。
+		if fillSignalID == "" && tradeSide == "卖出" && strings.TrimSpace(ev.Remark) != "" {
+			if short := carrierRemarkShortCode(ev.Remark); short != "" {
+				fillSignalID = carrierSellFillSignalID(ev.Code, carrierTPLegOfShort(short), tradedAt)
+			}
+		}
 		if err := db.ApplyRealFill(store.RealFill{
 			OrderID: ev.OrderID, Code: ev.Code, Side: tradeSide, Price: ev.Price,
 			Qty: ev.Qty, Amount: ev.Amount, TradedAt: tradedAt, SignalID: fillSignalID,
@@ -2544,6 +2555,10 @@ var carrierSignalCodes = map[string]string{
 	"HC": "high_churn", "LD": "leader_decay", "LD1": "leader_decay_v2",
 	"PT": "pattern_template", "PB": "pullback_buy", "SL": "stop_loss",
 	"TP": "take_profit",
+	// §TP-LADDER-20261124：止盈拆两段后多一个短码——TP 卖一半，TT 清剩余。
+	// 两者都必须在这里登记，否则载体卖出的成交反解不出战法名（§179 静态锁逐键核对
+	// local_executor_params.json 的 signal_codes，改名/漏登记会当场红）。
+	"TT": "take_profit_clear",
 	// factor_composite 家族（fac_*）共用 FC；n_shape 无短码（unapped，载体侧登记）。
 	"FC": "factor_composite",
 }
@@ -2584,6 +2599,95 @@ func carrierRemarkStrategy(remark string) string {
 		}
 	}
 	return ""
+}
+
+// carrierRemarkShortCode 从委托备注里取出**信号短码**（`v168-20261124-TP600519` → `TP600519`）。
+//
+// 与 carrierRemarkStrategy 共用同一张短码表，但返回短码本身而不是战法名：卖出成交的
+// 阶梯归因必须分清 TP（卖半）与 TT（清剩余），而两者在战法名上都属止盈家族。
+// 取第一条「短码 + 全数字」的连字符尾巴；认不出返回空串（未知不冒充）。
+func carrierRemarkShortCode(remark string) string {
+	text := strings.TrimSpace(remark)
+	for i := 0; i < len(text); i++ {
+		if i > 0 && text[i-1] != '-' {
+			continue
+		}
+		tail := text[i:]
+		best := ""
+		for code := range carrierSignalCodes {
+			if strings.HasPrefix(tail, code) && len(code) > len(best) {
+				best = code
+			}
+		}
+		if best == "" {
+			continue
+		}
+		rest := tail[len(best):]
+		if rest == "" {
+			continue
+		}
+		ok := true
+		for j := 0; j < len(rest); j++ {
+			if rest[j] < '0' || rest[j] > '9' {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return tail
+		}
+	}
+	return ""
+}
+
+// carrierTPLegOfShort 把止盈短码归到两条腿（tp = 卖一半 / tt = 清剩余）。
+// 其他短码返回空串——卖出成交的归因只在两条止盈腿上补，别的卖出不写假身份。
+func carrierTPLegOfShort(short string) string {
+	for code, name := range carrierSignalCodes {
+		if !strings.HasPrefix(short, code) {
+			continue
+		}
+		rest := short[len(code):]
+		if rest == "" {
+			continue
+		}
+		ok := true
+		for j := 0; j < len(rest); j++ {
+			if rest[j] < '0' || rest[j] > '9' {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		switch name {
+		case "take_profit":
+			return "tp"
+		case "take_profit_clear":
+			return "tt"
+		}
+	}
+	return ""
+}
+
+// carrierSellFillSignalID 拼卖出成交的阶梯归因键 `sell:<码>:<tp|tt>:<交易日>`。
+//
+// 单独成函数只为让"日键取自**成交时刻**"这件事能被单测钉住：跨日时段它是载体
+// 重启后回哪一档的唯一证据，若按服务器当天拼，昨天卖掉一半的票今天会被当成
+// Stage 0 再卖一半。日期形态不像 `YYYY-MM-DD` 时返回空串（不补归因），
+// 绝不写一个 `sell:600519:tp:10:01:51` 这种会把日键读面弄脏的键。
+// English: build the ladder attribution key for a carrier sell fill; empty when the
+// stamp is not a plain day, so a garbled day can never poison the replay.
+func carrierSellFillSignalID(code, leg, tradedAt string) string {
+	if code == "" || leg == "" {
+		return ""
+	}
+	day := tradeDayOfTradedAt(tradedAt)
+	if len(day) != 10 || day[4] != '-' || day[7] != '-' {
+		return ""
+	}
+	return fmt.Sprintf("sell:%s:%s:%s", code, leg, day)
 }
 
 // carrierRemarkRuleTag 备注中段的因子规则号（`fac_160`），没有则空串。

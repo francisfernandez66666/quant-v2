@@ -2251,7 +2251,12 @@ def _afternoon_reseal_from(payload, symbol, up_stop, tol):
     None = cannot prove (no bars / no timestamps / no limit price) => the
     caller skips the sell. True = a bar at/after 14:30 closed at/above the
     limit (within tol) => protective skip. False = bars exist, none resealed.
-    tol is the sealed-board tolerance fraction read from params.
+
+    `tol` is the sealed-board MULTIPLIER from params (`ld_seal_tolerance`
+    0.995), the same ruler the Go adapter uses (`close >= boardPx *
+    shortSealTolerance`). Until 2026-11-24 this line read `up_stop * (1.0 -
+    tol)`, i.e. 0.5% of the board price, so every name with afternoon bars
+    counted as "still sealed" and leader_decay could never sell after 14:30.
     """
     if not up_stop or up_stop <= 0:
         return None
@@ -2273,7 +2278,7 @@ def _afternoon_reseal_from(payload, symbol, up_stop, tol):
     times = _bar_times(entry, n)
     if times is None:                      # cannot prove timing -> fail closed
         return None
-    threshold = up_stop * (1.0 - float(tol))
+    threshold = up_stop * float(tol)
     for index in range(n):
         close = closes[index]
         if close is None:
@@ -2294,6 +2299,250 @@ def _afternoon_reseal(ContextInfo, symbol, tol, count):
         return None
     payload = _minute_bars_payload(ContextInfo, symbol, count)
     return _afternoon_reseal_from(payload, symbol, up_stop, tol)
+
+
+# --- TP-LADDER 2026-11-24 --------------------------------------------------
+# Two-stage take-profit, LIVE (owner: "I do not want shadow, I want live").
+#
+# The box can prove almost none of this by itself: it has no disk (broker ban),
+# session memory dies on every delivery, and the counter's POSITION row carries
+# neither the entry tactic nor the peak price. So the cloud bakes
+# `params.tp_plan` per position (strategy / open date / stage / peak /
+# take-profit point / manual flag) from its own fills+daily truth, and the box
+# merges in only what it CAN see: today's bars and today's own orders. No plan
+# for a held name => the ladder abstains (fail-closed), never "no take-profit
+# point", which would be read as "run the retrace ladder at once".
+
+def _tp_plan_of(day, symbol):
+    """Baked plan for this code today, or None when the cloud has not spoken."""
+    book = PARAMS.get("tp_plan")
+    if not isinstance(book, dict):
+        return None
+    per_day = book.get(str(day))
+    if not isinstance(per_day, dict):
+        return None
+    plan = per_day.get(_bare(symbol))
+    return plan if isinstance(plan, dict) else None
+
+
+def _tp_column(entry, name):
+    """One OHLC column as floats (literal attribute reads only, g2-safe)."""
+    values = None
+    if name == "high":
+        values = getattr(entry, "high", None)
+        if values is None and isinstance(entry, dict):
+            values = entry.get("high")
+    elif name == "close":
+        values = getattr(entry, "close", None)
+        if values is None and isinstance(entry, dict):
+            values = entry.get("close")
+    if values is None:
+        return None
+    try:
+        return [None if v is None else float(v) for v in list(values)]
+    except (TypeError, ValueError):
+        return None
+
+
+def _tp_secs_of_bar(stamp):
+    """Seconds since midnight from a bar stamp, or None when unparseable."""
+    text = str(stamp)
+    for ch in text:
+        if not (ch.isdigit() or ch in "-: ."):
+            return None
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 12:
+        hhmmss = digits[8:14]
+    elif len(digits) == 6:
+        hhmmss = digits
+    elif len(digits) == 4:
+        hhmmss = digits + "00"
+    else:
+        return None
+    try:
+        hour = int(hhmmss[0:2])
+        minute = int(hhmmss[2:4])
+        second = int(hhmmss[4:6]) if len(hhmmss) >= 6 else 0
+    except ValueError:
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 59:
+        return None
+    return hour * 3600 + minute * 60 + second
+
+
+def _tp_open_no_reseal_from(payload, symbol, up_stop, secs, moment):
+    """PURE: did the name seal the board today and then stay off it long enough?
+
+    Owner 2026-11-24: "the dragon is often already a tail when we buy it, it
+    can break the board the very next day, so judge it on sealed-then-opened
+    alone" -- there is NO take-profit precondition on this leg.
+
+    True requires all three to be provable from today's minute bars: at least
+    one bar reached the exact limit (high within the seal MULTIPLIER, the same
+    ruler `_afternoon_reseal_from` and the Go adapter use), the LAST bar is
+    below it, and at least `secs` seconds have passed since the last sealed
+    bar. Missing bars / timestamps / limit price -> None, and the caller does
+    not clear: never infer "not resealed" from a reading we do not have.
+    """
+    if not up_stop or up_stop <= 0 or moment is None:
+        return None
+    entry = payload.get(symbol, payload) if isinstance(payload, dict) else None
+    if entry is None:
+        return None
+    highs = _tp_column(entry, "high")
+    closes = _tp_column(entry, "close")
+    if not highs or not closes:
+        return None
+    n = min(len(highs), len(closes))
+    if n == 0:
+        return None
+    times = _bar_times(entry, n)
+    if times is None:
+        return None
+    tol = float(PARAMS.get("ld_seal_tolerance") or 0.0)
+    if tol <= 0.0 or tol > 1.0:
+        return None                          # no usable ruler -> fail closed
+    # `ld_seal_tolerance` is a MULTIPLIER on the board price (0.995), not a
+    # give-back ratio: the Go adapter tests `close >= boardPx * tol`. Writing
+    # `up_stop * (1.0 - tol)` here yields half a percent OF THE BOARD PRICE and
+    # silently marks every name with afternoon bars as "sealed today".
+    threshold = up_stop * tol
+    now_secs = moment.hour * 3600 + moment.minute * 60 + moment.second
+    last_seal = None
+    for index in range(n):
+        high = highs[index]
+        if high is None or high < threshold:
+            continue
+        stamp = _tp_secs_of_bar(times[index])
+        if stamp is None:
+            continue
+        if last_seal is None or stamp > last_seal:
+            last_seal = stamp
+    if last_seal is None:
+        return None
+    if closes[n - 1] is None or closes[n - 1] >= threshold:
+        return None
+    if now_secs - last_seal < float(secs):
+        return None
+    return True
+
+
+def _tp_peak_of(payload, symbol, plan):
+    """Peak price since the position opened: baked daily high vs today's bars."""
+    peak = None
+    if isinstance(plan, dict):
+        try:
+            baked = float(plan.get("peak") or 0.0)
+        except (TypeError, ValueError):
+            baked = 0.0
+        if baked > 0.0:
+            peak = baked
+    entry = payload.get(symbol, payload) if isinstance(payload, dict) else None
+    highs = _tp_column(entry, "high") if entry is not None else None
+    if highs:
+        today_high = None
+        for value in highs:
+            if value is None:
+                continue
+            if today_high is None or value > today_high:
+                today_high = value
+        if today_high is not None and (peak is None or today_high > peak):
+            peak = today_high
+    return peak
+
+
+def _short_is(short, code):
+    """True when `short` is exactly `code` + a full 6-digit code (TP600519).
+
+    The 6-digit requirement is what separates our own orders from a prefix
+    collision: `TP6005` is not a code we can ever emit, and counting it would
+    silently mark the ladder as fired for a name that never got one.
+    """
+    text = str(short or "")
+    code = str(code or "")
+    if not code or not text.startswith(code):
+        return False
+    rest = text[len(code):]
+    return len(rest) == 6 and rest.isdigit()
+
+
+def _tp_fired(day, symbol, orders):
+    """Did WE already send a take-profit order for this code today?
+
+    Counter evidence, ANY status: a cancelled TP did not sell, but it did open
+    the ladder, and re-firing it every round would loop. Same conservative
+    direction as _buy_retry_counter (which also counts unfilled attempts).
+    """
+    codes = PARAMS.get("signal_codes") or {}
+    wanted = []
+    for name in ("take_profit", "take_profit_clear"):
+        code = str(codes.get(name) or "")
+        if code:
+            wanted.append(code)
+    if not wanted:
+        return False
+    for row in orders or []:
+        if _bare(row.get("symbol")) != _bare(symbol):
+            continue
+        for code in wanted:
+            if _short_is(row.get("short_code"), code):
+                return True
+    return False
+
+
+def _tp_stage_of(day, symbol, plan, orders):
+    """0 = full position, 1 = half already sold (max of all three readings).
+
+    Three sources, deliberately max()ed: the baked plan (survives a delivery),
+    this process's own memory (best latency) and the counter's own rows (the
+    durable proof). Reading LOW would sell a second half at the take-profit
+    point; reading HIGH only defers the half sale to the next fresh position,
+    so the conservative direction is unambiguous.
+    """
+    stage = 0
+    if isinstance(plan, dict):
+        try:
+            stage = max(stage, int(plan.get("stage") or 0))
+        except (TypeError, ValueError):
+            pass
+    mem = _STATE.get("tp_stage_mem") or {}
+    remembered = mem.get((day, _bare(symbol)))
+    if remembered is not None:
+        try:
+            stage = max(stage, int(remembered))
+        except (TypeError, ValueError):
+            pass
+    if _tp_fired(day, symbol, orders):
+        stage = max(stage, int(PARAMS.get("tp_stage_half") or 0))
+    return stage
+
+
+def _tp_note_placed(day, symbol, short):
+    """Remember that the ladder fired here (cache only; the counter is proof)."""
+    codes = PARAMS.get("signal_codes") or {}
+    half = int(PARAMS.get("tp_stage_half") or 0)
+    mem = _STATE.setdefault("tp_stage_mem", {})
+    for name in ("take_profit", "take_profit_clear"):
+        code = str(codes.get(name) or "")
+        if code and _short_is(short, code):
+            mem[(day, _bare(symbol))] = half
+
+
+def _tp_readout():
+    """One ASCII line per hour naming the ladder's coverage.
+
+    `unknown` counts held names the cloud baked NO plan for. Those abstain from
+    the ladder whole (fail-closed), and this line is the only way to tell "the
+    ladder declined" from "the ladder was never armed" -- the same lesson as
+    bars_coverage and sector_hit.
+    """
+    tally = _STATE.get("tp_tally") or {}
+    _STATE["tp_tally"] = {"known": 0, "unknown": 0}
+    _log("tp_ladder enabled=%s covered=%d unknown=%d stage_half=%d no_reseal_sec=%.0f" % (
+        "on" if PARAMS.get("tp_ladder_enabled") else "off",
+        int(tally.get("known") or 0), int(tally.get("unknown") or 0),
+        int(PARAMS.get("tp_stage_half") or 0),
+        float(PARAMS.get("tp_dragon_open_no_reseal_sec") or 0.0)))
 
 
 def _mean_tail(values, n):
@@ -3142,10 +3391,33 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     # None -> the sell is skipped (owner ruling: never infer "not resealed"
     # from missing minute data). Non-held names keep the baked passthrough.
     reseal = pre.get("afternoon_reseal")
-    if held.get("qty") and reseal is None:
-        reseal = _afternoon_reseal(ContextInfo, symbol,
-                                   PARAMS.get("ld_seal_tolerance", 0.995),
-                                   PARAMS.get("bars_count", 80))
+    # TP-LADDER 2026-11-24: the plan, the peak and the dragon board reading are
+    # held-name work only (a handful of positions, never the 1000-name pool).
+    # ONE minute-bar read now serves both protective legs (afternoon reseal and
+    # the TP peak) and one instrument read serves both limit-up checks -- the
+    # old code did one full read per leg per name per round.
+    tp_plan = _tp_plan_of(day, symbol)
+    tp_peak = None
+    tp_dragon_open = None
+    tp_stage = 0
+    if held.get("qty"):
+        tp_bars = _minute_bars_payload(ContextInfo, symbol,
+                                       PARAMS.get("bars_count", 80))
+        up_stop = _instrument_up_stop(ContextInfo, symbol)
+        if reseal is None:
+            reseal = _afternoon_reseal_from(tp_bars, symbol, up_stop,
+                                            PARAMS.get("ld_seal_tolerance", 0.995))
+        tp_peak = _tp_peak_of(tp_bars, symbol, tp_plan)
+        tp_stage = _tp_stage_of(day, symbol, tp_plan, orders)
+        if isinstance(tp_plan, dict) and tp_plan.get("strategy") == "dragon":
+            tp_dragon_open = _tp_open_no_reseal_from(
+                tp_bars, symbol, up_stop,
+                PARAMS.get("tp_dragon_open_no_reseal_sec"), moment)
+        tally = _STATE.setdefault("tp_tally", {"known": 0, "unknown": 0})
+        if tp_plan:
+            tally["known"] = int(tally.get("known") or 0) + 1
+        else:
+            tally["unknown"] = int(tally.get("unknown") or 0) + 1
     return {
         "symbol": symbol,
         "day": day,
@@ -3170,6 +3442,16 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         # is the counter's number, kept read-only so a log can reconcile them.
         "position_cost": _basis_of(symbol, day, held.get("cost"), held.get("qty")),
         "position_cost_raw": held.get("cost"),
+        # TP-LADDER 2026-11-24: the baked per-position plan and what the box
+        # itself could add (today's peak, stage, dragon board). `tp_known` is
+        # false whenever the cloud baked no plan -- both TP legs then abstain
+        # whole instead of guessing "no take-profit point" from a missing key.
+        "tp_known": isinstance(tp_plan, dict),
+        "tp_pct": (tp_plan or {}).get("tp_pct") if isinstance(tp_plan, dict) else None,
+        "tp_peak": tp_peak,
+        "tp_stage": tp_stage,
+        "tp_manual": bool((tp_plan or {}).get("manual")) if isinstance(tp_plan, dict) else False,
+        "tp_dragon_open_no_reseal": tp_dragon_open,
         "can_use_qty": held.get("can_use"),
         "available_cash": cash,
         "daily_buy_total": spent,
@@ -4033,6 +4315,7 @@ def run_round(ContextInfo, moment):
     if _STATE.get("flow_log_key") != _flow_log_key:
         _STATE["flow_log_key"] = _flow_log_key
         _flow_readout()
+        _tp_readout()
     # COUNTER-VIEW 2026-11-18 13:2x: the round stopped printing subscribe/probe
     # lines and the T leg stopped running, which can only mean `positions` read as
     # empty (or unreadable). Without a readout those two states are indistinguishable
@@ -4179,8 +4462,9 @@ def run_round(ContextInfo, moment):
         now_ts = _now_ts()
         seen_kinds = set()
         sell_hit = False
-        for kind, rule in (("take_profit", rule_take_profit),
-                           ("stop_loss", rule_stop_loss),
+        for kind, rule in (("stop_loss", rule_stop_loss),
+                           ("take_profit_clear", rule_take_profit_clear),
+                           ("take_profit", rule_take_profit),
                            ("breakdown", rule_breakdown_sell)):
             hit = rule(PARAMS, ctx)
             if not hit:
@@ -4188,7 +4472,22 @@ def run_round(ContextInfo, moment):
             sell_hit = True
             seen_kinds.add(kind)
             if kind == "take_profit":
+                # Stage 0 fires at once: it sells HALF, and waiting on it only
+                # gives the peak away. (Old behaviour kept on purpose -- the
+                # observation window exists for full exits, not for a trim.)
                 signals = [(hit, "live")]
+            elif kind == "take_profit_clear":
+                # TP-LADDER 2026-11-24: same window as the clear-out line --
+                # a retrace that is one tick deep must not dump the rest. The
+                # bull signal does NOT extend it: the rest of a position
+                # follows its peak mechanically (owner ruling 4), and the
+                # dragon leg's "off the board" is not a judgement call either.
+                if _confirm_sell(day, symbol, kind, now_ts):
+                    signals = [(hit, "live")]
+                else:
+                    bull = None
+                    summary["skipped"].append({"short": hit["short_code"],
+                                               "reason": "sell_confirm_pending"})
             elif kind == "stop_loss":
                 # The clear line is never extended by a bull signal (STOP-LADDER
                 # 2026-11-20), but it still waits out the window.
@@ -4230,7 +4529,7 @@ def run_round(ContextInfo, moment):
                     summary["skipped"].append({"short": hit["short_code"],
                                                "reason": "sell_confirm_pending"})
         # A sell kind that did not hit this round resets its clock.
-        for kind in ("stop_loss", "breakdown", "reduce"):
+        for kind in ("stop_loss", "take_profit_clear", "breakdown", "reduce"):
             if kind not in seen_kinds:
                 _sell_obs_clear(day, symbol, kind)
         if not signals and bull:
@@ -4314,6 +4613,17 @@ def run_round(ContextInfo, moment):
                     # second live signal on the same name must not stack.
                     summary["skipped"].append({"short": short, "reason": "same_symbol_day"})
                     continue
+                # TP-REBUY-BLOCK 2026-11-24 (owner ruling 7): a name that took
+                # profit today is not re-entered today. The evidence is the
+                # counter's own rows, ANY status -- a cancelled TP never traded,
+                # but it did open the ladder, and the direction here is
+                # "do not chase a name we just sold into strength". The T leg
+                # is exempt: it carries its own sizing chain and is a round
+                # trip, not a re-entry.
+                if (PARAMS.get("tp_rebuy_block") and intent in ("new", "add")
+                        and _tp_fired(day, symbol, orders)):
+                    summary["skipped"].append({"short": short, "reason": "tp_rebuy_block"})
+                    continue
                 # FLOW-QUADRANT 2026-11-20: the ONLY hard veto this carrier takes
                 # from the four-quadrant reading is "do not fish the bottom"
                 # (bear market + volume surge + account already at/above its
@@ -4346,6 +4656,10 @@ def run_round(ContextInfo, moment):
                 ok, why = _place(ContextInfo, signal)
                 if ok:
                     _STATE["sent"].add((day, symbol, short))
+                    # TP-LADDER: a fired half-sale promotes the position to
+                    # stage 1 in session memory, so the SAME process does not
+                    # sell a second half if the plan has not been re-baked yet.
+                    _tp_note_placed(day, symbol, short)
                     summary["placed"].append(short)
                 else:
                     summary["skipped"].append({"short": short, "reason": why})
