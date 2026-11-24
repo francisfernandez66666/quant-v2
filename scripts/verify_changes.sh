@@ -26897,6 +26897,17 @@ else
 	echo "INFO - §238 无 python3，载体行为腿未跑"
 fi
 
+# ⑮ 小时读数：明天要盯的三条全在这一行上（unknown / dragon_open / blocked）。
+#    改字段名或删字段，等于把"阶梯没动手"和"阶梯弃权"重新合成同一个读数——
+#    这是 bars_coverage / sector_hit 那两次同样的教训。
+CNT238=$((CNT238 + 1))
+grep_q 'tp_ladder enabled=%s covered=%d unknown=%d stage1=%d dragon_open=%d' ST238 F || fail238 "tp_ladder 小时读数的字段被改名（明天没法判读）"
+grep_q 'blocked=%d peak_raised=%d no_reseal_sec=%.0f' ST238 F || fail238 "tp_ladder 缺 blocked / peak_raised 读数"
+grep_q '_tp_tally_bucket("unknown").add(symbol)' ST238 F || fail238 "unknown 计数没落在持仓分支（弃权不可见）"
+if grep_q 'tally\["known"\] = int' ST238 F; then
+	fail238 "读数退回按轮累加（covered 会显示成 40 而不是持仓数 4）"
+fi
+
 [ "$B238_FAILED" = "0" ] || exit 1
-echo "ok - §238 §TP-LADDER 锁通过（全平腿退役+卖半/清剩余两条腿实盘直上+板宽三档5/8与6/10+破位有浮盈只减半+当日止盈禁回买+t_leg豁免+盒内计划/峰值/阶段三读且短码6位严格+龙头开板fail-closed且封板判据用乘子+云端按成交重放并把手动仓标出+指纹不含峰值且在sha之前+退役键真删不扩通配+卖出成交归因 sell:码:tp|tt:日 取成交时刻，累计判定点 ${CNT238}）"
+echo "ok - §238 §TP-LADDER 锁通过（全平腿退役+卖半/清剩余两条腿实盘直上+板宽三档5/8与6/10+破位有浮盈只减半+当日止盈禁回买+t_leg豁免+盒内计划/峰值/阶段三读且短码6位严格+龙头开板fail-closed且封板判据用乘子+云端按成交重放并把手动仓标出+指纹不含峰值且在sha之前+退役键真删不扩通配+卖出成交归因 sell:码:tp|tt:日 取成交时刻+小时读数按持仓计数且弃权可见，累计判定点 ${CNT238}）"
 echo ""

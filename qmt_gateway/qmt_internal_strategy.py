@@ -2528,21 +2528,48 @@ def _tp_note_placed(day, symbol, short):
             mem[(day, _bare(symbol))] = half
 
 
+def _tp_tally_bucket(name):
+    """Per-hour SET of codes behind one ladder reading (positions only, tiny).
+
+    A set of codes -- not a counter -- because the hourly line is read as
+    "how many POSITIONS are in this state". A counter would multiply by the
+    number of rounds in the hour and make `covered` look like 40 on a 4-name
+    book, which is exactly the kind of number that gets misread as "the cloud
+    baked 40 plans".
+    """
+    tally = _STATE.setdefault("tp_tally", {})
+    bucket = tally.get(name)
+    if not isinstance(bucket, set):
+        bucket = set()
+        tally[name] = bucket
+    return bucket
+
+
 def _tp_readout():
     """One ASCII line per hour naming the ladder's coverage.
 
-    `unknown` counts held names the cloud baked NO plan for. Those abstain from
-    the ladder whole (fail-closed), and this line is the only way to tell "the
-    ladder declined" from "the ladder was never armed" -- the same lesson as
-    bars_coverage and sector_hit.
+    `unknown` counts held names the cloud baked NO plan for; `stage1` names
+    already sold half; `dragon_open` is the dragon leg's own reading (True =
+    off the board long enough to clear); `blocked` counts names refused by the
+    same-day re-buy gate; `peak_raised` counts names whose in-client peak beat
+    the baked one. `unknown` non-zero is the critical one: those names abstain
+    from the ladder whole (fail-closed) and this line is the only way to tell
+    "the ladder declined" from "the ladder was never armed" -- the same lesson
+    as bars_coverage and sector_hit.
     """
     tally = _STATE.get("tp_tally") or {}
-    _STATE["tp_tally"] = {"known": 0, "unknown": 0}
-    _log("tp_ladder enabled=%s covered=%d unknown=%d stage_half=%d no_reseal_sec=%.0f" % (
-        "on" if PARAMS.get("tp_ladder_enabled") else "off",
-        int(tally.get("known") or 0), int(tally.get("unknown") or 0),
-        int(PARAMS.get("tp_stage_half") or 0),
-        float(PARAMS.get("tp_dragon_open_no_reseal_sec") or 0.0)))
+    _STATE["tp_tally"] = {}
+
+    def _n(name):
+        bucket = tally.get(name)
+        return len(bucket) if isinstance(bucket, set) else 0
+
+    _log("tp_ladder enabled=%s covered=%d unknown=%d stage1=%d dragon_open=%d"
+         " blocked=%d peak_raised=%d no_reseal_sec=%.0f" % (
+             "on" if PARAMS.get("tp_ladder_enabled") else "off",
+             _n("known"), _n("unknown"), _n("stage1"), _n("dragon_open"),
+             _n("blocked"), _n("peak_raised"),
+             float(PARAMS.get("tp_dragon_open_no_reseal_sec") or 0.0)))
 
 
 def _mean_tail(values, n):
@@ -3413,11 +3440,23 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
             tp_dragon_open = _tp_open_no_reseal_from(
                 tp_bars, symbol, up_stop,
                 PARAMS.get("tp_dragon_open_no_reseal_sec"), moment)
-        tally = _STATE.setdefault("tp_tally", {"known": 0, "unknown": 0})
+        # TP-LADDER readout (plan section 6.2.9): every held name lands in
+        # exactly one of known/unknown, and the states that decide an exit get
+        # their own bucket so tomorrow's line answers "why did nothing sell".
         if tp_plan:
-            tally["known"] = int(tally.get("known") or 0) + 1
+            _tp_tally_bucket("known").add(symbol)
         else:
-            tally["unknown"] = int(tally.get("unknown") or 0) + 1
+            _tp_tally_bucket("unknown").add(symbol)
+        if tp_stage >= int(PARAMS.get("tp_stage_half") or 0):
+            _tp_tally_bucket("stage1").add(symbol)
+        if tp_dragon_open:
+            _tp_tally_bucket("dragon_open").add(symbol)
+        baked_peak = tp_plan.get("peak") if isinstance(tp_plan, dict) else None
+        try:
+            if tp_peak is not None and baked_peak is not None and float(tp_peak) > float(baked_peak):
+                _tp_tally_bucket("peak_raised").add(symbol)
+        except (TypeError, ValueError):
+            pass
     return {
         "symbol": symbol,
         "day": day,
@@ -4622,6 +4661,7 @@ def run_round(ContextInfo, moment):
                 # trip, not a re-entry.
                 if (PARAMS.get("tp_rebuy_block") and intent in ("new", "add")
                         and _tp_fired(day, symbol, orders)):
+                    _tp_tally_bucket("blocked").add(symbol)
                     summary["skipped"].append({"short": short, "reason": "tp_rebuy_block"})
                     continue
                 # FLOW-QUADRANT 2026-11-20: the ONLY hard veto this carrier takes

@@ -330,8 +330,18 @@ class TakeProfitLadderTest(unittest.TestCase):
 
     def test_hourly_readout_names_coverage(self):
         """The readout must say how many held names the cloud did NOT cover."""
+        # 小时行必须点名：covered（云端给了计划的持仓）/ unknown（弃权的那几只）/
+        # stage1（已卖过一半）/ dragon_open（龙头在板下够久）/ blocked（当日禁回买挡住）/
+        # peak_raised（盒内峰值抬过了烘入值）。unknown 非零＝那些票整条阶梯弃权。
         mod = self.mod
-        mod._STATE["tp_tally"] = {"known": 3, "unknown": 1}
+        mod._STATE["tp_tally"] = {
+            "known": {"000797.SZ", "000680.SZ", "000521.SZ"},
+            "unknown": {"000415.SZ"},
+            "stage1": {"000680.SZ"},
+            "dragon_open": set(),
+            "blocked": {"000678.SZ"},
+            "peak_raised": {"000797.SZ"},
+        }
         lines = []
         original = mod._log
         mod._log = lambda text: lines.append(text)
@@ -342,8 +352,23 @@ class TakeProfitLadderTest(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("covered=3", lines[0])
         self.assertIn("unknown=1", lines[0])
-        self.assertEqual(mod._STATE["tp_tally"], {"known": 0, "unknown": 0},
+        self.assertIn("stage1=1", lines[0])
+        self.assertIn("dragon_open=0", lines[0])
+        self.assertIn("blocked=1", lines[0])
+        self.assertIn("peak_raised=1", lines[0])
+        self.assertEqual(mod._STATE["tp_tally"], {},
                          "the tally resets with the line, otherwise it can never be read per hour")
+
+    def test_tally_bucket_counts_positions_not_rounds(self):
+        """A set of codes, not a counter: three rounds over one name still count 1."""
+        # 读数口径：小时行读的是"有几只持仓在这个状态"，不是"这个小时发生了几次"。
+        # 计数器会让 4 只持仓在 10 轮里显示 covered=40，读的人会以为云端烘了 40 份计划。
+        mod = self.mod
+        mod._STATE.pop("tp_tally", None)
+        for _ in range(3):
+            mod._tp_tally_bucket("unknown").add("000415.SZ")
+        self.assertEqual(len(mod._STATE["tp_tally"]["unknown"]), 1,
+                         "the line reads positions per hour; a counter would say 3")
 
 
 if __name__ == "__main__":
