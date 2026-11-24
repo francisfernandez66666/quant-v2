@@ -2469,10 +2469,23 @@ def _short_is(short, code):
 def _tp_fired(day, symbol, orders):
     """Did WE already send a take-profit order for this code today?
 
-    Counter evidence, ANY status: a cancelled TP did not sell, but it did open
-    the ladder, and re-firing it every round would loop. Same conservative
-    direction as _buy_retry_counter (which also counts unfilled attempts).
+    Two legs, deliberately ORed:
+
+    * this process's own sent set -- the counter's ORDER table lags by seconds,
+      which is long enough for a same-round add to slip in (sells are walked
+      before buys in `run_round`);
+    * counter evidence, ANY status -- a cancelled TP did not sell, but it did
+      open the ladder, and re-firing it every round would loop. Same
+      conservative direction as _buy_retry_counter (which also counts unfilled
+      attempts).
+
+    Owner ruling 7 ("no same-day add/re-buy after a take-profit") must hold
+    from the second the order goes out, not from the second the counter shows
+    it, so the memory leg is not an optimisation -- it is the correctness fix.
     """
+    fired = _STATE.get("tp_fired")
+    if isinstance(fired, set) and (day, _bare(symbol)) in fired:
+        return True
     codes = PARAMS.get("signal_codes") or {}
     wanted = []
     for name in ("take_profit", "take_profit_clear"):
@@ -2518,7 +2531,16 @@ def _tp_stage_of(day, symbol, plan, orders):
 
 
 def _tp_note_placed(day, symbol, short):
-    """Remember that the ladder fired here (cache only; the counter is proof)."""
+    """Remember that the ladder fired here (cache only; the counter is proof).
+
+    Writes two things, both day-keyed so a stale day can never leak in:
+
+    * `tp_stage_mem` -- Stage 1 in session memory, so the SAME process does not
+      sell a second half before the plan is re-baked;
+    * `tp_fired` -- the buy gate's memory leg (`_tp_fired`), which closes the
+      seconds-long window where the counter's ORDER row does not exist yet and
+      a same-round add could otherwise slip through.
+    """
     codes = PARAMS.get("signal_codes") or {}
     half = int(PARAMS.get("tp_stage_half") or 0)
     mem = _STATE.setdefault("tp_stage_mem", {})
@@ -2526,6 +2548,11 @@ def _tp_note_placed(day, symbol, short):
         code = str(codes.get(name) or "")
         if code and _short_is(short, code):
             mem[(day, _bare(symbol))] = half
+            fired = _STATE.get("tp_fired")
+            if not isinstance(fired, set):
+                fired = set()
+                _STATE["tp_fired"] = fired
+            fired.add((day, _bare(symbol)))
 
 
 def _tp_tally_bucket(name):

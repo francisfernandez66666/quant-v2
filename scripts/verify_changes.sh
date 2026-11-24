@@ -26794,6 +26794,12 @@ grep_q 'PARAMS.get("tp_rebuy_block")' REBUYBODY238 F || fail238 "回买闸读的
 grep_q '_tp_fired(day, symbol, orders)' REBUYBODY238 F || fail238 "回买闸没有读当日止盈留痕（形同虚设）"
 grep_q 'continue' REBUYBODY238 F || fail238 "回买闸没有真正挡下这一笔（缺 continue）"
 grep_q 'intent in ("new", "add")' REBUYBODY238 F || fail238 "回买闸没有限定 new/add（T 腿会被一起挡掉）"
+# 证据必须有两腿：柜台行（重启后仍在）与本进程记忆（柜台 ORDER 表秒级延迟内的同轮回买）。
+# 只留柜台那一腿时，卖出与买入在同一轮里走，闸在最需要它的那几秒是空的（§6.2.8）。
+FIREDBODY238=$( { awk '/def _tp_fired\(/{f=1} f{print; if(/^    return False/ && seen){exit} if(/for row in orders/){seen=1}}' qmt_gateway/qmt_internal_strategy.py || true; } )
+[ -n "$FIREDBODY238" ] || fail238 "找不到 _tp_fired 函数体（按签名取段失败）"
+grep_q '_STATE.get("tp_fired")' FIREDBODY238 F || fail238 "_tp_fired 没有本进程记忆腿（同轮回买在柜台行出现前可穿透）"
+grep_q 'for row in orders' FIREDBODY238 F || fail238 "_tp_fired 丢了柜台证据腿（重启后闸会失效）"
 REBUY238=$( { grep -n 'if (PARAMS.get("tp_rebuy_block")' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
 QUAD238=$( { grep -n 'flow_quadrant_block' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
 if [ -n "$REBUY238" ] && [ -n "$QUAD238" ] && [ "$REBUY238" -gt "$QUAD238" ]; then

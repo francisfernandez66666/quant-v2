@@ -293,6 +293,25 @@ class TakeProfitLadderTest(unittest.TestCase):
         mod._STATE["tp_stage_mem"] = {}
         self.assertEqual(mod._tp_stage_of(DAY, SYM, {"stage": 0}, []), 0)
 
+    def test_same_round_rebuy_is_blocked_before_the_counter_sees_it(self):
+        """Owner ruling 7 must hold from the second the order goes out.
+
+        The counter's ORDER table lags by seconds; sells are walked before buys
+        inside one round, so an "add" on the name we just take-profited would
+        slip through if `_tp_fired` only read `orders`. The in-process set is
+        the correctness leg, not an optimisation (plan §6.2.8).
+        """
+        mod = self.mod
+        self.assertFalse(mod._tp_fired(DAY, SYM, []))
+        mod._tp_note_placed(DAY, SYM, "TP600519")
+        self.assertTrue(mod._tp_fired(DAY, SYM, []), "同轮回买必须被本进程记忆挡住")
+        # day-keyed: tomorrow starts clean
+        self.assertFalse(mod._tp_fired("20261125", SYM, []))
+        # and it is the TP/TT codes that set it, not any short code
+        mod._STATE.clear()
+        mod._tp_note_placed(DAY, SYM, "BK600519")
+        self.assertFalse(mod._tp_fired(DAY, SYM, []))
+
     def test_other_short_codes_are_not_take_profit_evidence(self):
         mod = self.mod
         for short in ("BK600519", "SL600519", "RD600519", "PB600519", "TP6005"):
