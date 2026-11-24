@@ -147,6 +147,12 @@ class ReplayTest(unittest.TestCase):
                            # that already sent one buy must not leak its attempt
                            # into the next one (same day, same symbol).
                            "buy_tries": {}, "buy_tries_day": ""})
+        # §TP-LADDER 2026-11-24: `tp_fired` 是**当日**的止盈留痕（回买闸的证据腿）。
+        # s5c 在 600000 上发过一笔 TP 卖出，随后的 s6/s7 是**同一天同一只票**——
+        # 按 owner 裁决 7 本来就该被 `tp_rebuy_block` 挡下。用例要测的是别的闸，
+        # 所以这里像 basis/sell_obs/buy_tries 一样把它复位（这是夹具清理，不是放松断言，
+        # 那两条"当天止盈过不许回买"的行为由 test_tp_ladder_20261124.py 正面锁）。
+        mod._STATE.update({"tp_fired": set(), "tp_stage_mem": {}})
         self.placed = []
         for name, fn in self._orig_rules.items():
             setattr(self.mod, name, fn)
