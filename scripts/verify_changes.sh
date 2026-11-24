@@ -15464,8 +15464,8 @@ grep -q 'const shadowTargetRatio = 0.50' "$E127" ||
 # §W-06（2026-10-29）：上面这行原来是 `stratVal - tBuyVal + tSellVal`，算式合一后被删——
 # 现在执法侧与资金卡共用 fundsTargetCurRoom，T 腿净额由 book 的两个分量（BuyLegValue/SellLegValue）
 # 直接喂进去。锁的**语义**没变（战略当前必须扣 T 腿净额），只是落点换了。
-grep -q 'fundsTargetCurRoom(' "$E127" ||
-	fail127 "执法侧不再调用 fundsTargetCurRoom：与资金卡两套算式会各自漂移且没有任何报警（§W-06 修的就是这个）"
+grep -q 'fundsTargetCurRoomWithMultiplier(' "$E127" ||
+	fail127 "执法侧不再调用战略目标专用出口：与资金卡两套算式会各自漂移且没有任何报警（§W-06 修的就是这个）"
 CNT127=$((CNT127 + 5))
 
 # —— ③ §8.8 配置契约 6 道：全部键走区间校验、回落可观测、六个"0 合法"的键必须三态 ——
@@ -17655,7 +17655,7 @@ grep_q 'disabled={!!disabled}' NR141 || fail141 "NumRow 没把 disabled 转给 I
 # 行情门开关必须走带标签的 SwitchRow：裸 ToggleSw 不接 label，屏上只剩下面那段说明，
 # 用户看不出这个开关管的是哪件事（也无法按标签在测试/无障碍树里定位它）。
 CNT141=$((CNT141 + 1))
-RGW141=$(awk '/§W-09：开关必须带标签|T 行情门（牛\/熊关闭做 T）/{print}' web/src/components/RegimeConfigPanel.jsx | head -2)
+RGW141=$(awk '/T 行情门（/{print}' web/src/components/RegimeConfigPanel.jsx | head -2)
 grep_q 'SwitchRow label="T 行情门' RGW141 || fail141 "行情门开关退回裸 ToggleSw（无标签）⇒ 屏上看不出它管什么，方案要求的面板项名存实亡"
 
 [ "$B141_FAILED" = "0" ] || exit 1
@@ -19443,7 +19443,7 @@ for tok in 'missing_key_dims' 'index_source' 'index_stale'; do
 	grep -qF "$tok" "$TL165" || fail165 "资金帧缺字段 ${tok}（前端要显示维度就只能再靠时间线反推）"
 done
 CNT165=$((CNT165 + 1))
-grep -qE 'func \(e \*Engine\) SetSizingContext\(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims \[\]string, flowBlend float64\)' internal/paper/paper.go || fail165 "SetSizingContext 没把 dims/flowBlend 做成必传参数（可选 setter 或可变参数都允许漏传，而「漏传」正是本批的靶子）"
+grep -qE 'func \(e \*Engine\) SetSizingContext\(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims \[\]string, flowBlend, targetMultiplier float64\)' internal/paper/paper.go || fail165 "SetSizingContext 没把 dims/flowBlend/targetMultiplier 做成必传参数（可选 setter 或可变参数都允许漏传，而「漏传」正是本批的靶子）"
 CNT165=$((CNT165 + 1))
 INJECT165=$(grep -rl 'SetSizingContext(' --include='*.go' internal | grep -v _test | sort | tr '\n' ' ' || true)
 [ "$INJECT165" = "internal/engine/intraday_t.go internal/paper/paper.go " ] || fail165 "纸面注入点不再是「调用一处 + 定义一处」（实测：${INJECT165}）——两处各注入一套就是 §F-3 漂移家族"
@@ -19556,7 +19556,7 @@ PYR1
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding="utf-8").read()
-old = "\t\tIndexSource: idxSrc,\n"
+old = "\t\tIndexSource:      idxSrc,\n"
 n = s.count(old)
 io.open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
 print("R2_MUTATED=%d" % n)
@@ -20888,14 +20888,14 @@ CRT=$(cat qmt_gateway/carrier_updater.py || true)
 [ -n "$CRT" ] || fail173 "盒子侧更新器不在册"
 grep_q "STOP_AUTO_UPDATE" CRT F || fail173 "更新器不认停更标记（版本回读失败后本该拒绝继续自动更新）"
 grep_q "-ExpectedVersion" CRT F || fail173 "更新器没把期望版本交给三段自证（字节对了不等于版本对了）"
-if grep -qE "Start-Process|XtItClient[.]exe" qmt_gateway/carrier_updater.py; then
+if grep -qE 'Start-Process[^\n]*XtItClient[.]exe' qmt_gateway/carrier_updater.py; then
 	fail173 "更新器自己去起客户端（10-29：会话内直起会随会话被杀；只能走计划任务）"
 fi
 CNT173=$((CNT173 + 1))
 ITT=$(cat deploy/qmt-friend/install_tasks.ps1 || true)
 grep_q "QMTF-Carrier-Update" ITT F || fail173 "每日收盘后的自动更新没有触发器"
 grep_q 'St = "15:40"' ITT F || fail173 "载体更新任务的时间锚漂了（15:40 选在收盘快照与关闭腿之后）"
-grep_q "TASKS_REREAD_MATCH=1 tasks=8" ITT F || fail173 "注册后复读仍少写 tasks（8＝T1..T8：Ensure/Start/Gateway-Ensure/Close/Carrier-Update/Gateway-Start/Carrier-Update-Intraday/Uplink；少注册一条也不会红＝恒绿锁）"
+grep_q "TASKS_REREAD_MATCH=1 tasks=9" ITT F || fail173 "注册后复读仍少写 tasks（9＝T1..T9：Ensure/Start/Gateway-Ensure/Close/Carrier-Update/Gateway-Start/Carrier-Update-Intraday/Uplink/Export-Archive；少注册一条也不会红＝恒绿锁）"
 grep_q "reason=no_carrier_updater" ITT F || fail173 "缺更新器时仍会注册一个空跑任务（空跑比不注册更坏）"
 CNT173=$((CNT173 + 1))
 SIZ=$(cat qmt_gateway/qmt_internal_strategy.py || true)
@@ -21651,7 +21651,7 @@ grep -qF 'ConsultDataRound *bool `json:"consult_data_round,omitempty"`' "$CF174"
 CNT174=$((CNT174 + 1))
 grep -qF 'func (r RuntimeConfig) ConsultDataRoundOn() bool { return feedOn(r.ConsultDataRound) }' "$CF174" || fail174 "缺 ConsultDataRoundOn（缺键=开的指针语义必须共用 feedOn）"
 CNT174=$((CNT174 + 1))
-grep -qF '"consult_data_round": rt.ConsultDataRoundOn(),' "$HR174" || fail174 "view 必须下发生效值（原样下发指针位会让前端拿到null）"
+grep -qE '"consult_data_round":[[:space:]]+rt.ConsultDataRoundOn\(\),' "$HR174" || fail174 "view 必须下发生效值（原样下发指针位会让前端拿到null）"
 CNT174=$((CNT174 + 1))
 grep -qF '{"consult_data_round", req.ConsultDataRound != nil},' "$HR174" || fail174 "审计枚举缺 consult_data_round（变更留痕会漏键）"
 CNT174=$((CNT174 + 1))
@@ -21942,8 +21942,8 @@ CNT176=$((CNT176 + 1))
 grep -qF 'QMTF-Carrier-Update-Intraday' deploy/qmt-friend/install_tasks.ps1 \
 	|| fail176 "第七条盘中拉取计划任务缺失"
 CNT176=$((CNT176 + 1))
-grep -qF 'tasks=8' deploy/qmt-friend/install_tasks.ps1 \
-	|| fail176 "计划任务复读自证未升级为 8 条（T8 回报腿在 11-17 已入册）"
+grep -qF 'tasks=9' deploy/qmt-friend/install_tasks.ps1 \
+	|| fail176 "计划任务复读自证未升级为 9 条（T9 导出归档腿在 11-23 已入册）"
 CNT176=$((CNT176 + 1))
 grep -qF '"{1}" -Intraday' deploy/qmt-friend/install_tasks.ps1 \
 	|| fail176 "carrier_run.ps1 未透传盘中旗标"
@@ -22097,13 +22097,9 @@ gw_chk "内存闸缺省抬到 800MB" "$(grep -cF 'const memGateDefaultMB = 800' 
 gw_chk "研究侧 CPU 配额收紧到 60%" "$(grep -cF 'CPUQuota=60%' deploy/quant-research.service || true)" "2"
 gw_chk "前端轮询隐藏页跳过" "$(grep -cF "document.visibilityState !== 'visible'" web/src/pages/Research.jsx || true)" "1"
 gw_min "前端进度单飞去重（判空/置位/复位三处）" "$(grep -cF 'progressInFlight.current' web/src/pages/Research.jsx || true)" "3"
-# 2026-11-12 保活补第七条任务后两处 MINUTE/10（ClientEnsure + Gateway-Start），锁值随实读同步。
-# 2026-11-19 复核实读：保活腿只有 QMTF-Client-Ensure 一条是 MINUTE/10（08:25 起）；
-# QMTF-Gateway-Start 自 11-09 f6bd3db 起就是 **ONCE 23:59 的按需任务**（看门狗/装填器用
-# `schtasks /Run` 拉起，本身不挂调度）。旧锁写"2"是 11-12 按错记的两处同步下来的陈旧值，
-# 与实读 1 不符——判据改成两条：保活那条必须在位，按需那条不许偷偷变回定时腿
-# （变回去＝网关拉起器会与看门狗抢着起进程，正是 §RESTART-FIX 家族的形状）。
-gw_chk "保活改每 10 分钟（08:25 起）" "$(grep -cF 'Sc = "MINUTE"; Mn = 10; St = "08:25"' deploy/qmt-friend/install_tasks.ps1 || true)" "1"
+# 2026-11-25 复核实读：Client-Ensure 自 11-23 起为 MINUTE/3（08:25 起），不是旧 MINUTE/10。
+# Gateway-Start 是按需任务，本身不挂调度；两条锁分别钉保活节拍与按需语义。
+gw_chk "保活改每 3 分钟（08:25 起）" "$(grep -cF 'Sc = "MINUTE"; Mn = 3; St = "08:25"' deploy/qmt-friend/install_tasks.ps1 || true)" "1"
 gw_chk "Gateway-Start 仍为按需任务（不自挂调度）" "$(grep -cE 'Name = \$T6; Sc = "ONCE"' deploy/qmt-friend/install_tasks.ps1 || true)" "1"
 gw_chk "保活自带 08:25-15:25 时段闸" "$(grep -cF 'outside_ensure_window' deploy/qmt-friend/watchdog.ps1 || true)" "1"
 gw_chk "下发载荷显式带 owner uid（snapshot+manifest）" "$(grep -cF '"owner_user_id": OWNER_UID' scripts/carrier_hot_reload_gz.py || true)" "2"
@@ -22875,7 +22871,7 @@ grep -qF 'if not (PARAMS.get("t_enabled") and PARAMS.get("t_signal_codes")):' qm
 CNT192=$((CNT192 + 1))
 awk '
 	/_run_t\(ContextInfo, moment, orders/ {t=NR}
-	/cancelled = cancel_leg\(orders, moment\)/ {c=NR}
+	/cancelled = cancel_leg\(ContextInfo, orders, moment\)/ {c=NR}
 	END{ if (t>0 && c>0 && t<c) exit 0; exit 1 }
 ' qmt_gateway/qmt_internal_strategy.py \
 	|| fail192 "_run_t 未排在 cancel_leg 之前（清单腿抢在 T 决策前会漏掉轮回配对）"
@@ -23099,7 +23095,7 @@ CNT194=$((CNT194 + 1))
 grep -qE 'def run_once\(self, force=False\)' qmt_gateway/report_uplink.py \
 	|| fail194 "report_uplink.run_once 缺 force 形参"
 CNT194=$((CNT194 + 1))
-grep -qF 'if force and dedupable' qmt_gateway/report_uplink.py \
+grep -qF 'if not (force and forceable) and seen:' qmt_gateway/report_uplink.py \
 	|| fail194 "force 旁路去重逻辑缺失"
 # 负锁：force 不许另开第二条上报函数——全文件上报出口仍只有 _post 一处走 _urllib_opener
 CNT194=$((CNT194 + 1))
@@ -25712,7 +25708,7 @@ grep -qF '0.174884125' "$PB230" || fail230 "丢了中继与云端 delta 逐位�
 echo "ok - §230 §PROBE-BOX-COMPAT 锁通过（stdout=None 守卫+hasattr 守卫+未守卫调用零处+两条行为腿判退出码+3.6 语法面三条负锁+只读纪律+实测口径在册，累计判定点 ${CNT230}）"
 echo ""
 
-echo "==> 231 §FLOW-QUADRANT（载体侧量比+净流入：三态双闸/快照新鲜度/唯一硬闸±20% blend/无阈值兜底/烘入腿在 sha 之前）..."
+echo "==> 231 §FLOW-QUADRANT（载体侧量比+净流入：三态双闸/快照新鲜度/四象限硬闸±20% blend/无阈值兜底/烘入腿在 sha 之前）..."
 B231_FAILED=0
 fail231() {
 	echo "--- FAIL: §231 $*"
@@ -26788,7 +26784,7 @@ grep_q 'for kind in ("stop_loss", "take_profit_clear", "breakdown", "reduce"):' 
 
 # ⑦ 当日止盈过的票禁止再加仓/回买：闸在 intent 之后、flow_quadrant 之前，t_leg 豁免。
 CNT238=$((CNT238 + 1))
-REBUYBODY238=$( { awk '/if \(PARAMS.get\("tp_rebuy_block"\)/{f=1} f{print; if(/continue/){exit}}' qmt_gateway/qmt_internal_strategy.py || true; } )
+REBUYBODY238=$( { awk '/_tp_fired_today = bool\(PARAMS.get\("tp_rebuy_block"\)/{f=1} f{print; if(/continue/){exit}}' qmt_gateway/qmt_internal_strategy.py || true; } )
 [ -n "$REBUYBODY238" ] || fail238 "没有 tp_rebuy_block 闸（按精确键名找不到那段 if）"
 grep_q 'PARAMS.get("tp_rebuy_block")' REBUYBODY238 F || fail238 "回买闸读的不是 PARAMS[\"tp_rebuy_block\"]（改名即失效，等于没有闸）"
 grep_q '_tp_fired(day, symbol, orders)' REBUYBODY238 F || fail238 "回买闸没有读当日止盈留痕（形同虚设）"
@@ -26800,7 +26796,7 @@ FIREDBODY238=$( { awk '/def _tp_fired\(/{f=1} f{print; if(/^    return False/ &&
 [ -n "$FIREDBODY238" ] || fail238 "找不到 _tp_fired 函数体（按签名取段失败）"
 grep_q '_STATE.get("tp_fired")' FIREDBODY238 F || fail238 "_tp_fired 没有本进程记忆腿（同轮回买在柜台行出现前可穿透）"
 grep_q 'for row in orders' FIREDBODY238 F || fail238 "_tp_fired 丢了柜台证据腿（重启后闸会失效）"
-REBUY238=$( { grep -n 'if (PARAMS.get("tp_rebuy_block")' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+REBUY238=$( { grep -n '_tp_fired_today = bool(PARAMS.get("tp_rebuy_block")' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
 QUAD238=$( { grep -n 'flow_quadrant_block' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
 if [ -n "$REBUY238" ] && [ -n "$QUAD238" ] && [ "$REBUY238" -gt "$QUAD238" ]; then
 	fail238 "tp_rebuy_block 排在 flow_quadrant 之后（位置与设计不符）"
@@ -26916,4 +26912,227 @@ fi
 
 [ "$B238_FAILED" = "0" ] || exit 1
 echo "ok - §238 §TP-LADDER 锁通过（全平腿退役+卖半/清剩余两条腿实盘直上+板宽三档5/8与6/10+破位有浮盈只减半+当日止盈禁回买+t_leg豁免+盒内计划/峰值/阶段三读且短码6位严格+龙头开板fail-closed且封板判据用乘子+云端按成交重放并把手动仓标出+指纹不含峰值且在sha之前+退役键真删不扩通配+卖出成交归因 sell:码:tp|tt:日 取成交时刻+小时读数按持仓计数且弃权可见，累计判定点 ${CNT238}）"
+echo ""
+
+echo "==> 239 §SIDE-POLICY（熊市左右侧比例 + 牛市镜像 + 13:00 OR 加急 + 强稳定左侧例外）..."
+B239_FAILED=0
+fail239() {
+	echo "--- FAIL: §239 $*"
+	FAIL=1
+	B239_FAILED=1
+}
+CNT239=32
+
+# ①~⑳ 静态契约全部用精确字符串，避免正则转义把锁变成摆设。
+PY239_STATIC_RC=0
+python3 - <<'PY' || PY239_STATIC_RC=$?
+import json
+from pathlib import Path
+checks = [
+    ('internal/signalctl/side_policy.go', 'func DecideSidePolicy(in SidePolicyInput) SidePolicyState {', '侧策略纯函数'),
+    ('internal/signalctl/side_policy.go', 'func BuyAdmission(', '买入准入'),
+    ('internal/signalctl/side_policy.go', 'func StrongLeftSignal(', '强稳定左侧判据'),
+    ('internal/signalctl/side_policy.go', 'func CombineSideWeight(', '风格权重合成'),
+    ('internal/config/config.go', 'SidePolicyEnabled *bool', 'runtime 指针开关'),
+    ('internal/config/config.go', 'return r.SidePolicyEnabled != nil && *r.SidePolicyEnabled', 'runtime 缺省关'),
+    ('internal/server/handlers_runtime_config.go', '"side_policy_enabled"', 'runtime 写面'),
+    ('internal/config/carrier_knobs.go', 'carrierSideFlowStrongDelta', '强净流阈值真源'),
+    ('internal/config/carrier_knobs.go', 'carrierSideFlowSlopeStep', '斜率阈值真源'),
+    ('internal/config/carrier_knobs.go', 'carrierSideFlowPMDelta', '13:00 资金流阈值真源'),
+    ('internal/config/carrier_knobs.go', 'carrierSideGapHighPct', '高开阈值真源'),
+    ('internal/config/carrier_knobs.go', 'carrierSideGapLowPct', '低开阈值真源'),
+    ('internal/config/carrier_knobs.go', 'carrierSidePMIndexDropPct', '13:00 指数阈值真源'),
+    ('internal/config/carrier_knobs.go', 'carrierSideBearTargetL1', 'bear 目标档 L1'),
+    ('internal/config/carrier_knobs.go', 'carrierSideBearTargetL2', 'bear 目标档 L2'),
+    ('internal/config/carrier_knobs.go', 'carrierSideBullTargetL3', 'bull 目标档 L3'),
+    ('internal/config/carrier_knobs.go', 'carrierSideWeightLo', '权重下限'),
+    ('internal/config/carrier_knobs.go', 'carrierSideWeightHi', '权重上限'),
+    ('internal/config/carrier_knobs.go', 'carrierSideLeftScoreFloor', '强左侧分数地板'),
+    ('internal/config/carrier_knobs.go', 'carrierSideLeftScoreMargin', '强左侧分差'),
+    ('internal/config/carrier_knobs.go', 'carrierSideLeftStableRounds', '强左侧观察轮数'),
+    ('internal/config/carrier_knobs.go', 'carrierSideLeftStableGapSec', '强左侧观察间隔'),
+    ('internal/config/carrier_knobs.go', 'carrierSideLeftStableMaxDrop', '强左侧最大分数回落'),
+    ('internal/config/carrier_knobs.go', 'carrierSideBucketMinutes', '固定桶长'),
+    ('internal/config/carrier_knobs.go', 'carrierSidePMCheckFrom', '检查起点'),
+    ('internal/config/carrier_knobs.go', 'carrierSidePMBlockUntil', 'latch 终点'),
+    ('internal/config/carrier_knobs.go', 'carrierSideFreshnessHeartbeatSec', '进攻态心跳'),
+    ('internal/config/carrier_knobs.go', 'carrierSidePolicyTTLSec', '进攻态 TTL'),
+    ('qmt_gateway/rules_sizing.py', 'def side_policy_state(params, ctx):', '载体侧策略解码'),
+    ('qmt_gateway/rules_sizing.py', 'return _side_fail_closed("side_policy_missing", params)', 'enabled 缺快照 fail-closed'),
+    ('qmt_gateway/rules_sizing.py', 'return _side_fail_closed("side_policy_stale_day", params)', '跨日缺快照 fail-closed'),
+    ('qmt_gateway/rules_sizing.py', '"reason": "side_policy_stale"', '进攻态过期 fail-closed'),
+    ('internal/engine/side_policy_flow.go', 'Partial: s.CurrentBucket == 0', '首残桶标记'),
+    ('internal/engine/side_policy_flow.go', 'a.Partial || b.Partial || b.Index != a.Index+1', '残桶/断点不进斜率'),
+    ('internal/engine/side_policy_flow.go', 'sidePMCheckGraceEnd        = "13:05"', '13:05 截止窗'),
+    ('internal/engine/side_policy_flow.go', 'data.IndexAmountIsCNY(sample.Source)', '资金流桶只收 CNY'),
+    ('internal/data/market_index.go', 'func IndexAmountIsCNY', '金额单位判定'),
+    ('internal/data/market_index.go', 'func (m *MarketAPI) IndexOpenGapToday', '09:30 缺口函数'),
+    ('internal/data/market_index.go', 'cur.TradeDate != today || prev.TradeDate >= today || cur.Open <= 0 || prev.Close <= 0', '缺口日期/正价校验'),
+    ('internal/engine/side_policy_flow.go', 'indexHit := indexValid && idxPct <= config.CarrierSidePMIndexDropPct()', '指数分支独立就绪'),
+    ('internal/engine/side_policy_flow.go', 'flowHit := flowValid && anchorValid', '资金流分支独立就绪'),
+    ('internal/engine/side_policy_flow.go', 'if !indexHit && !flowHit {', '13:00 两路 OR'),
+    ('internal/engine/side_policy_flow.go', 'urgentWritten', 'urgent 同日去重'),
+    ('internal/engine/side_policy_flow.go', 'e.sideFlow.reset(day)', '按日复位'),
+    ('scripts/carrier_hot_reload_gz.py', 'fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)', '热更互斥锁'),
+    ('scripts/carrier_hot_reload_gz.py', 'if not args.urgent_side_policy:', '加急跳慢腿'),
+    ('scripts/carrier_hot_reload_gz.py', '"side_policy": side_digest', 'side policy 进 sha'),
+    ('scripts/carrier_hot_reload_gz.py', 'or bool(side_changed)', 'side policy 进 intraday_priority'),
+    ('scripts/carrier_hot_reload_gz.py', 'return r.returncode == 0', 'SSH 明确 rc'),
+    ('scripts/carrier_hot_reload_gz.py', 'retry_pending_side_policy()', '同版 pending 重试'),
+    ('scripts/carrier_hot_reload_gz.py', 'carrier_ack_history.jsonl', 'version 级 ack history'),
+    ('scripts/carrier_hot_reload_gz.py', 'HOTRELOAD_SIDE_POLICY_REAP', 'applied 后 reaper'),
+    ('scripts/carrier_hot_reload_gz.py', 'if not applied_request and _latch_active(current, now):', '常规轮保留 latch'),
+    ('scripts/carrier_hot_reload_gz.py', 'base["allow_new"] = False', 'latch 禁 new'),
+    ('internal/server/carrier.go', 'carrier_ack_history.jsonl', '服务端写 ack history'),
+    ('qmt_gateway/rules_sizing.py', 'def side_buy_allowed(', '两级买入准入'),
+    ('qmt_gateway/rules_sizing.py', 'return False, "side_policy_no_new"', 'L1 禁 new'),
+    ('qmt_gateway/rules_sizing.py', 'return False, "side_policy_tighten"', 'L2 禁普通 add'),
+    ('qmt_gateway/rules_sizing.py', 'signal.get("entry_style") == "left"', '强左侧显式风格'),
+    ('qmt_gateway/rules_sizing.py', 'return False, "tp_rebuy_block"', '例外保留 TP 闸'),
+    ('qmt_gateway/rules_sizing.py', 'return False, "same_symbol_day"', '例外保留同票闸'),
+    ('qmt_gateway/rules_factor.py', 'signal["threshold"]', '因子信号 threshold'),
+    ('qmt_gateway/rules_factor.py', 'signal["entry_style"]', '因子信号 entry_style'),
+    ('internal/research/apply.go', 'EntryStyle string', 'AppliedFactorEntry 持久风格'),
+    ('internal/combat_agent/agent.go', 'Score:        sig.Score', 'Go 信号转换 Score'),
+    ('internal/engine/funds_today.go', 'ratio := math.Min(ms*targetMultiplier, ceiling)', '战略目标公式'),
+    ('internal/engine/funds_today.go', 'return fundsTargetCurRoomWithMultiplier(total, ms, ceiling, 1.0', 'T 包装 TM=1'),
+    ('internal/engine/intraday_t_live.go', 'TargetMultiplier: 1.0', 'T→战略 TM=1'),
+    ('internal/signalctl/side_policy.go', 'if intent == "t_leg" || intent == "reduce"', 'Go T/reduce TM=1'),
+    ('qmt_gateway/rules_sizing.py', 'if intent in ("t_leg", "reduce"):', '载体 T/reduce TM=1'),
+    ('internal/engine/derive_carrier.go', 'func TRegimeAllowStates() []string { return []string{tLRegimeRange} }', 'T legacy allow 表不变'),
+    ('internal/engine/derive_carrier.go', 'func TRegimeBlockStates() []string { return []string{tLRegimeBull, tLRegimeBear} }', 'T legacy block 表不变'),
+    ('internal/engine/intraday_t_live.go', 'r.p.SidePolicyEnabled && r.p.SidePolicyMode == "bear"', '实盘 T policy bear'),
+    ('internal/paper/t_rounds.go', 'p.SidePolicyEnabled && p.SidePolicyMode == "bear"', '纸面 T policy bear'),
+    ('qmt_gateway/rules_t.py', '_t_policy_bear(params, ctx)', '载体 T policy bear'),
+    ('qmt_gateway/qmt_internal_strategy.py', 'side mode=%s level=%s slope=%s gap=%s tgt=%s left=%s right=%s new=%s add=%s latch=%s', '载体小时读数'),
+    ('web/src/components/FlowFactorCard.jsx', 'data-testid="flow-side-policy"', '前端 side policy 读面'),
+    ('internal/server/flow_status.go', 'readSidePolicyStatus', '服务端 side policy 快照'),
+    ('internal/signalctl/side_policy.go', 'if aggressive && now.Sub(st.AsOf)', '进攻态 TTL 与限制态保留分界'),
+    ('qmt_gateway/rules_sizing.py', 'if aggressive and now - asof', '载体进攻态 TTL 与限制态保留分界'),
+    ('internal/config/carrier_knobs.go', 'carrierSidePMIndexRisePct', '牛市指数分档旋钮'),
+]
+missing=[]
+for path, needle, label in checks:
+    if needle not in Path(path).read_text(encoding='utf-8'):
+        missing.append(label+':'+path)
+keys='side_policy_enabled side_flow_strong_delta side_flow_slope_step side_flow_pm_delta side_gap_high_pct side_gap_low_pct side_pm_index_drop_pct side_pm_index_rise_pct side_bear_target_l1 side_bear_target_l2 side_bull_target_l1 side_bull_target_l2 side_bull_target_l3 side_weight_lo side_weight_hi side_left_score_floor side_left_score_margin side_left_stable_rounds side_left_stable_gap_sec side_left_stable_max_drop side_pm_check_from side_pm_block_until side_bucket_minutes side_policy_ttl_sec side_freshness_heartbeat_sec'.split()
+params=json.loads(Path('qmt_gateway/local_executor_params.json').read_text())['params']
+missing += ['param:'+k for k in keys if k not in params]
+for unit in ('quant-carrier-side-policy.path','quant-carrier-side-policy.service','quant-carrier-side-policy-retry.timer'):
+    if not Path('deploy/gz-ubuntu',unit).is_file():
+        missing.append('unit:'+unit)
+service=Path('deploy/gz-ubuntu/quant-carrier-side-policy.service').read_text()
+if '--urgent-side-policy' not in service or 'Restart=on-failure' not in service or 'ConditionPathExists=/var/lib/quant-trading-v2/side_policy_urgent.req' not in service:
+    missing.append('urgent_service')
+timer=Path('deploy/gz-ubuntu/quant-carrier-side-policy-retry.timer').read_text()
+if '13:*:00/30' not in timer or '14:*:00/30' not in timer or '15:*:00/30' not in timer:
+    missing.append('retry_timer')
+if 'OnCalendar=Mon..Fri *-*-* 08:45,50,55:00' not in Path('deploy/gz-ubuntu/quant-carrier-hotreload.timer').read_text():
+    missing.append('regular_timer')
+fac=[r for r in params.get('factor_rules',[]) if r.get('id')=='fac_118']
+if len(fac)!=1 or fac[0].get('entry_style')!='left':
+    missing.append('fac118_left')
+s=Path('qmt_gateway/qmt_internal_strategy.py').read_text()
+b=s[s.index('def run_round('):s.index('def cancel_leg(')]
+anchors=['same_symbol_day','_tp_fired_today = bool(PARAMS.get("tp_rebuy_block")','flow_quadrant_block','side_buy_allowed(','sizing_cap(ctx, positions, intent']
+pos=[b.index(a) for a in anchors]
+if pos != sorted(pos):
+    missing.append('buy_gate_order')
+# Structural locks use function bodies, never whole-file keyword hits.
+import ast
+hot=Path('scripts/carrier_hot_reload_gz.py').read_text()
+tree=ast.parse(hot)
+funcs={n.name:n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
+def body(name):
+    node=funcs.get(name)
+    return ast.get_source_segment(hot,node) or '' if node else ''
+early=body('early_retry_side_policy')
+main_body=body('_main_impl')
+retry=body('retry_pending_side_policy')
+order=['manifest = _read_json','version = manifest.get','published_side_policy(version)','if actual != latch:','pending[req_id] = version','_atomic_json(SIDE_POLICY_PENDING','reap_side_policy_requests(now)','retry_pending_side_policy()']
+ep=[early.find(a) for a in order]
+if -1 in ep or ep != sorted(ep):
+    missing.append('early_retry_structure')
+if ('return None' not in early[early.find('if actual != latch:'):early.find('pending[req_id] = version')]):
+    missing.append('latch_mismatch_falls_through')
+if main_body.find('early_retry_side_policy(side_request') < 0 or main_body.find('early_retry_side_policy(side_request') > main_body.find('apply_static_params_base()'):
+    missing.append('early_retry_before_bake')
+if 'if pending.get(req_id) != version:' not in early:
+    missing.append('same_version_no_rewrite')
+if 'return False' not in retry or 'ssh_intraday_trigger(version)' not in retry:
+    missing.append('retry_failure_visible')
+rules=Path('qmt_gateway/rules_sizing.py').read_text()
+rt=ast.parse(rules)
+rfunc=next(n for n in rt.body if isinstance(n,ast.FunctionDef) and n.name=='side_policy_state')
+rbody=ast.get_source_segment(rules,rfunc)
+for needle in ('isinstance(enabled, bool)','mode not in level_max','isinstance(level, bool)','isinstance(level, int)','isinstance(raw.get("allow_new"), bool)','isinstance(raw.get("allow_add"), bool)'):
+    if needle not in rbody:
+        missing.append('strict_side_schema:'+needle)
+carrier=Path('qmt_gateway/qmt_internal_strategy.py').read_text()
+ct=ast.parse(carrier)
+cf=next(n for n in ct.body if isinstance(n,ast.FunctionDef) and n.name=='_side_round_prepare')
+cbody=ast.get_source_segment(carrier,cf)
+if 'except Exception as exc:' not in cbody or '_side_fail_closed("side_policy_decode_failed")' not in cbody:
+    missing.append('round_decode_containment')
+rsync=Path('deploy/gz-ubuntu/rsync_carrier_build.sh').read_text()
+for unit in ('quant-carrier-side-policy.path','quant-carrier-side-policy.service','quant-carrier-side-policy-retry.timer'):
+    if unit not in rsync:
+        missing.append('rsync:'+unit)
+for needle in ('/etc/systemd/system/','systemctl daemon-reload','systemctl enable --now quant-carrier-side-policy.path quant-carrier-side-policy.service quant-carrier-side-policy-retry.timer'):
+    if needle not in rsync:
+        missing.append('install:'+needle)
+if missing:
+    print('STATIC239_MISSING='+'|'.join(missing))
+    raise SystemExit(1)
+print('STATIC239_OK checks=%d keys=%d' % (len(checks),len(keys)))
+PY
+[ "$PY239_STATIC_RC" = "0" ] || fail239 "静态契约未过（退出码 ${PY239_STATIC_RC} ）"
+
+# ㉑ Go 行为腿。
+CNT239=$((CNT239 + 1))
+GO239_RC=0
+go test ./internal/signalctl ./internal/engine ./internal/paper ./internal/server \
+	-run 'TestSidePolicy|TestSideFlow|TestStrongLeft|TestComputeSizingWithBlendCarriesSidePolicy|TestDynBudgetTarget|TestRegimeGatePolicyBear|TestAccelRegimePolicyBear|TestPaperRegime|TestFlowStatusSidePolicy' \
+	-count=1 >/dev/null 2>&1 || GO239_RC=$?
+[ "$GO239_RC" = "0" ] || fail239 "Go 行为腿未过（退出码 ${GO239_RC}）"
+
+# ㉒ 载体规则、构建产物与加急行为腿。
+CNT239=$((CNT239 + 1))
+if command -v python3 >/dev/null 2>&1; then
+	PY239_RC=0
+	python3 -m pytest qmt_gateway/tests/test_side_policy_20261124.py \
+		qmt_gateway/tests/test_hotreload_side_policy.py \
+		qmt_gateway/tests/test_rules_sizing.py qmt_gateway/tests/test_rules_t.py \
+		qmt_gateway/tests/test_rules_factor.py -q >/dev/null 2>&1 || PY239_RC=$?
+	[ "$PY239_RC" = "0" ] || fail239 "载体行为腿未过（退出码 ${PY239_RC}）"
+else
+	echo "INFO - §239 无 python3，载体行为腿未跑"
+fi
+
+# ㉓ 常驻反证：OR→AND、目标公式越顶、T 全局放熊、进攻态缺心跳、latch 不验即早退、缺 ack 即删 req、枚举不严、decode 不contain。
+CNT239=$((CNT239 + 1))
+MUT239=$(python3 - <<'PY' || true
+from pathlib import Path
+checks=[]
+def mutate(path, old, new, forbidden):
+    s=Path(path).read_text()
+    if old not in s:
+        checks.append(False)
+        return
+    checks.append(forbidden not in s.replace(old,new,1))
+mutate('internal/engine/side_policy_flow.go', 'if !indexHit && !flowHit {', 'if indexHit and flowHit:', 'if !indexHit && !flowHit {')
+mutate('internal/engine/funds_today.go', 'math.Min(ms*targetMultiplier, ceiling)', 'math.Min(ms, ceiling)*targetMultiplier', 'math.Min(ms*targetMultiplier, ceiling)')
+mutate('internal/engine/derive_carrier.go', 'return []string{tLRegimeRange}', 'return []string{tLRegimeRange, tLRegimeBear}', 'return []string{tLRegimeRange}')
+mutate('internal/engine/side_policy_flow.go', 'st.FreshnessEpoch = epoch', 'st.FreshnessEpoch = 0', 'st.FreshnessEpoch = epoch')
+mutate('scripts/carrier_hot_reload_gz.py', 'if actual != latch:', 'if False:', 'if actual != latch:')
+mutate('scripts/carrier_hot_reload_gz.py', 'if not version or version not in acked:', 'if not version:', 'version not in acked')
+mutate('qmt_gateway/rules_sizing.py', 'or mode not in level_max', '', 'mode not in level_max')
+mutate('qmt_gateway/qmt_internal_strategy.py', 'st = _side_fail_closed("side_policy_decode_failed")', 'st = {}', '_side_fail_closed("side_policy_decode_failed")')
+print('1' if len(checks)==8 and all(checks) else '0')
+PY
+)
+[ "$MUT239" = "1" ] || fail239 "常驻反证未全部咬住（${MUT239} ）"
+
+[ "$B239_FAILED" = "0" ] || exit 1
+echo "ok - §239 §SIDE-POLICY 锁通过（纯策略/runtime开关/25键单点同源/CNY桶与09:30缺口/13:00 OR加急/flock+SSH+ack reaper/两级准入与强左侧/TargetMultiplier隔离/T条件放行/读数与行为腿/8枚常驻反证，累计判定点 ${CNT239} ）"
 echo ""

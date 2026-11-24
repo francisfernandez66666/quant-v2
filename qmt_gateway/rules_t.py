@@ -710,6 +710,15 @@ def t_gate_open(params, ctx):
     return True, "allowed %s" % direction
 
 
+def _t_policy_bear(params, ctx):
+    raw = params.get("side_policy")
+    if not params.get("side_policy_enabled") or not isinstance(raw, dict):
+        return False
+    if str(raw.get("day") or "") != str(ctx.get("day") or ""):
+        return False
+    return raw.get("mode") == "bear"
+
+
 def t_regime_gate(params, ctx):
     """Market-form gate (intraday_t_live.go:2153-2184): only a ranging market may trade T.
 
@@ -727,6 +736,8 @@ def t_regime_gate(params, ctx):
     if age is not None and age > _param(params, "t_regime_stale_sec"):
         return False, "regime_reading_stale %.0fs: abstain (never act on an old conclusion)" % age
     blocked_states = [str(item) for item in (_param(params, "t_regime_block_states") or [])]
+    if state == "bear" and _t_policy_bear(params, ctx):
+        return False, _EMPTY
     if state in blocked_states:
         return True, "step0 regime_gate: market state %s is not a range" % state
     if state in [str(item) for item in (_param(params, "t_regime_allow_states") or [])]:
@@ -1158,6 +1169,8 @@ def t_accel_reason(params, ctx, existing_round, legs, price):
     state = str(ctx.get("market_state") or _EMPTY)
     age = _t__num(ctx.get("market_state_age_sec"))
     if state and age is not None and age <= _param(params, "t_regime_stale_sec"):
+        if state == "bear" and _t_policy_bear(params, ctx):
+            return _EMPTY
         if state in [str(item) for item in (_param(params, "t_regime_block_states") or [])]:
             return "regime"
     return _EMPTY
@@ -1948,6 +1961,8 @@ T_PARAM_KEYS = [
     # market-form and volume gates (W-09)
     "t_regime_gate_enabled", "t_regime_stale_sec", "t_regime_block_states",
     "t_regime_allow_states", "t_vol_ratio_max",
+    # SIDE-POLICY: cloud snapshot enables the bear-only exception; legacy tables stay unchanged.
+    "side_policy_enabled", "side_policy",
     # intraday basis gates
     "t_vwap_dev_pct", "t_min_amplitude_pct", "t_near_extreme_pct", "t_limit_distance_pct",
     "t_vwap_check_tol_pct", "t_limit_pct_main", "t_limit_pct_wide", "t_limit_pct_st",

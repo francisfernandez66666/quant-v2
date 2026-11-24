@@ -1117,7 +1117,8 @@ func (r *tLiveRound) strategicAllowedQty(rnd *TRoundLive, price float64, qty int
 	sig := combat_agent.Signal{Code: rnd.Code, Name: rnd.Name, Direction: "做多", Action: "buy", Price: price}
 	allowed, _ := r.e.dynamicBuyQty(sig, price, 0, sc, r.ctrl,
 		dynBudgetCtx{MarketScale: r.p.MarketScale, StockScale: 1.0,
-			MissingKeyInput: r.p.MissingKeyInput, MissingKeyDims: r.p.MissingKeyDims})
+			TargetMultiplier: 1.0,
+			MissingKeyInput:  r.p.MissingKeyInput, MissingKeyDims: r.p.MissingKeyDims})
 	if allowed > qty {
 		allowed = qty
 	}
@@ -2202,7 +2203,12 @@ func (r *tLiveRound) regimeBlock() string {
 				r.p.MarketStateVotes, r.p.MarketStateVotesTotal, tRegimeMinVotes), "")
 		}
 		return ""
-	case tLRegimeBull, tLRegimeBear:
+	case tLRegimeBear:
+		if r.p.SidePolicyEnabled && r.p.SidePolicyMode == "bear" {
+			return ""
+		}
+		return fmt.Sprintf("行情门：市场状态=%s，非盘整行情不做 T", st)
+	case tLRegimeBull:
 		return fmt.Sprintf("行情门：市场状态=%s，非盘整行情不做 T", st)
 	case "":
 		r.st.noteBlock("step0", "行情门弃权：T 行情门已关（t.regime_gate_enabled=false）或读数从未产生，牛熊关闭 T 未生效", "")
@@ -2316,7 +2322,7 @@ func (r *tLiveRound) accelReason(rnd *TRoundLive, price float64) string {
 	// S3：行情翻转。与 regimeBlock 同一读数、同一新鲜度门（过期的 bear 不许拿来配平）。
 	st, at := r.p.MarketState, r.p.MarketStateAt
 	if st != "" && !at.IsZero() && r.now.Sub(at) <= tRegimeStale {
-		if st == "bull" || st == "bear" {
+		if st == "bull" || (st == "bear" && !(r.p.SidePolicyEnabled && r.p.SidePolicyMode == "bear")) {
 			return paper.TAccelRegime
 		}
 	}

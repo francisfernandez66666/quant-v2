@@ -643,6 +643,10 @@ type Engine struct {
 	// 为什么不进 Config：Config 是会落盘的账号规则，而 MS 是**本轮行情算出来的数**，
 	// 落盘就等于把某一时刻的市场读数固化成长期配置。
 	sizingCtx paperSizingCtx
+	// sidePolicy / sideAdmission 是引擎每轮注入的瞬态准入上下文；disabled 时零操作。
+	// 回调只提供裁定，不在纸面锁内反查纸面账本，避免自锁。
+	sidePolicy    signalctl.SidePolicyState
+	sideAdmission BuyAdmissionFunc
 	// nowFn 做 T 的时钟缝（nil ⇒ time.Now）。存在的理由只有一个：`RunIntradayT` 内部取"现在"
 	// 判断是否已到 14:50 尾盘强制配平线，取真实时间会让**全部正 T 用例在 14:50 之后必然变红**
 	// （force=true 直接跳过开腿）——白天绿、晚上红的测试等于没有测试。生产路径永远留 nil。
@@ -1416,7 +1420,65 @@ func (e *Engine) recordBuyRejectLocked(o Order, reason string) {
 	e.recordOrderLocked(o)
 }
 
-// OnSignals 消费一轮策略信号做自动撮合：仅做多 buy 信号，用实时快照价成交固定资金。
+// BuyAdmissionFunc 纸面自动买入准入回调；sameSymbolDay 由纸面自己的自动委托留痕得出，
+// TP 证据由引擎回调内部只读柜台，纸面执行器不猜测 Reason 文本。
+type BuyAdmissionFunc func(sig combat_agent.Signal, intent string, heldQty float64, sameSymbolDay bool, now time.Time) (bool, string)
+
+// SetSideAdmission 注入本轮侧策略与准入回调；手动买入/加仓不调用此入口。
+func (e *Engine) SetSideAdmission(st signalctl.SidePolicyState, admit BuyAdmissionFunc) {
+	e.mu.Lock()
+	e.sidePolicy, e.sideAdmission = st, admit
+	e.mu.Unlock()
+}
+
+// sideSameDayLocked 只认纸面自动买入意图；侧策略自己拒绝的订单尚未建立买入意图，不回流成
+// same_symbol_day，否则第一次 L1 拒绝会把后续真实原因改写成另一条硬闸。
+func (e *Engine) sideSameDayLocked(code string, now time.Time) bool {
+	day := cntime.DayCompactOf(now)
+	for _, o := range e.orders {
+		if o.Code != code || o.Side != "buy" || cntime.DayCompactOf(o.CreatedAt) != day {
+			continue
+		}
+		if o.Kind != "自动撮合" && o.Kind != "自动加仓" {
+			continue
+		}
+		if strings.HasPrefix(o.Reason, "side_policy_") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// sideAdmitLocked 在纸面撮合前按真实持仓区分新开/加仓，并注入逐票左右侧权重。
+func (e *Engine) sideAdmitLocked(s *combat_agent.Signal, now time.Time) (bool, string) {
+	if !e.sidePolicy.Enabled {
+		return true, ""
+	}
+	if e.sideAdmission == nil {
+		return false, "side_policy_evidence_unavailable"
+	}
+	heldQty := 0.0
+	if p := e.positions[s.Code]; p != nil && p.Qty > 0 {
+		heldQty = float64(p.Qty)
+	}
+	intent := "new"
+	if heldQty > 0 {
+		intent = "add"
+	}
+	if s.SideWeight <= 0 || math.IsNaN(s.SideWeight) {
+		weight := 1.0
+		if s.EntryStyle == "left" {
+			weight = e.sidePolicy.LeftWeight
+		} else if s.EntryStyle == "right" {
+			weight = e.sidePolicy.RightWeight
+		}
+		s.SideWeight = signalctl.CombineSideWeight(1, weight)
+	}
+	return e.sideAdmission(*s, intent, heldQty, e.sideSameDayLocked(s.Code, now), now)
+}
+
+// OnSignals 消费一轮策略信号做自动撮合：仅做多 buy 信号，用实时快照价成交固定金额。
 // 同一股票已持仓则跳过；达持仓上限跳过。行情缺失时跳过该信号（不伪造成交）。
 // 记录信号价作辅助参照 + 信号→成交延迟。
 // §SIGNAL_CONTROLLER 20260917：本函数只做执行——战法白名单/个股·板块黑名单/买入持续性
@@ -1461,6 +1523,14 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if s.Direction == "做空" || s.Action != "buy" {
 			continue
 		}
+		// 侧策略准入必须发生在任何资金动作（包括融券回补）之前；disabled 直接放行且不读证据。
+		if ok, reason := e.sideAdmitLocked(&s, now); !ok {
+			e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+				StrategyType: s.StrategyType, Side: "buy", Kind: "自动撮合",
+				SignalPrice: s.Price, Status: "rejected", CreatedAt: now}, reason)
+			log.Printf("[paper] 侧策略拒绝自动买入 %s(%s): %s", s.Code, s.Name, reason)
+			continue
+		}
 		// §SHORT-3 做多信号回补：该股存在融券空头时按现价买回平仓（T+1 未解禁则本轮跳过，
 		// 下轮探针重试）；不影响本笔多头买入撮合。
 		// English: §SHORT-3 — a bull buy signal covers any open short on the same code at the live
@@ -1468,15 +1538,16 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if _, isShort := e.shorts[s.Code]; isShort {
 			e.shortCoverLocked(s.Code, 0, "做多信号回补平仓", quotes, now)
 		}
-		if _, held := e.positions[s.Code]; held {
-			continue
+		addPos := e.positions[s.Code]
+		if addPos != nil && !e.sidePolicy.Enabled {
+			continue // 非侧策略保持既有“已持仓跳过”，手动加仓入口不受影响
 		}
 		// 自定义持仓上限：>0 时封顶；0（默认）不设限，持仓数由本金/现金余额自然决定。
 		// §R4 修复：此前 return 掐断整个循环——达上限后排在后面的买入/止损卖出信号被整体丢弃。
 		// 改为跳过该买单并留痕，继续处理后续信号。
 		// English: R4 fix — the cap used to `return`, aborting the whole loop and silently dropping
 		// every later buy AND stop-loss sell; now it skips this buy with an audit record and continues.
-		if !e.dynamicBudgetOn() && e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
+		if addPos == nil && !e.dynamicBudgetOn() && e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 			e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 				StrategyType: s.StrategyType, Side: "buy", Kind: "自动撮合",
 				SignalPrice: s.Price, Status: "rejected", CreatedAt: now},
@@ -1527,6 +1598,26 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 			log.Printf("[paper] 涨停拒买(自动) %s(%s) %.1f%%——封板股买单不撮合", s.Code, s.Name, q.ChangePct)
 			continue
 		}
+		if addPos != nil {
+			// 只有侧策略放行的合法 add 才进入自动链；默认关闭时仍在上面原样跳过。
+			addedQty, err := e.autoAddToPositionLocked(addPos, &s, price, now)
+			if err != nil {
+				e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+					StrategyType: addPos.StrategyType, Side: "buy", Kind: "自动加仓",
+					SignalPrice: s.Price, Status: "rejected", CreatedAt: now}, fmt.Sprintf("%v", err))
+				log.Printf("[paper] 自动加仓失败 %s(%s): %v", s.Code, s.Name, err)
+				continue
+			}
+			e.tShadowMirrorBuyLocked(s.Code, e.applyBuyPriceLocked(price), addedQty, now)
+			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+				StrategyType: addPos.StrategyType, Side: "buy", Kind: "自动加仓", SignalPrice: s.Price,
+				Price: price, Qty: addedQty, Status: "filled", Reason: s.Reason, CreatedAt: now})
+			if e.lastBuyReject != nil {
+				delete(e.lastBuyReject, s.Code)
+			}
+			e.mirrorOpenLocked(addPos)
+			continue
+		}
 		// 每池持仓上限（与全局上限解耦，可自定义）：该池已持仓数 ≥ 池上限时跳过该信号。
 		// 池上限 0 = 该池不单独设限（仅受全局上限约束）；Σ池上限 ≤ 全局上限（前端配置时守恒校验）。
 		// English: per-pool position cap (decoupled from the global cap, customizable) — skip the signal
@@ -1543,7 +1634,7 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// English: the in-engine buy-confirm state machine moved to the signal controller; signals
 		// reaching here are already admitted — pure execution.
 		qVWAP, _ := data.VWAPOf(q)
-		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, s.SizeScale, false, qVWAP); err != nil {
+		if err := e.fillLockedWithStyle(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, s.SizeScale, false, qVWAP, s.SideWeight); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 			// 订单留痕：买入被拒（现金不足/超上限/池上限/买不起一手）。
 			// English: order audit — the buy was rejected (cash short / cap / pool cap / can't afford a lot).
@@ -1758,6 +1849,12 @@ func (e *Engine) totalPaperEquityLocked() float64 {
 // English: paper dynamic budget — pool equity × scale, capped by whole-book 35% industry/stock
 // rooms and pool cash. maxQty carries a manual order's explicit share count as an upper bound.
 func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale float64, maxQty int) (int, *BudgetError) {
+	return e.dynamicPaperQtyStyleLocked(poolKey, code, price, sizeScale, maxQty, 0)
+}
+
+// dynamicPaperQtyStyleLocked 在账户级 FlowBlend 之上合成逐票 SideWeight，最终仍夹 0.80~1.20。
+// 原 dynamicPaperQtyLocked 签名保留给 T/手动/旧调用点，style=0 时逐字回到原金额路径。
+func (e *Engine) dynamicPaperQtyStyleLocked(poolKey, code string, price, sizeScale float64, maxQty int, sideWeight float64) (int, *BudgetError) {
 	base := e.poolEquityLocked(poolKey)
 	capEq := e.totalPaperEquityLocked()
 	if base <= 0 || capEq <= 0 || price <= 0 {
@@ -1784,7 +1881,7 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 	perTradeLo, perTradeHi := perTradeBandOf(e.sizingCtx)
 	// §FLOW-BLEND：与实盘同一后置乘子。FlowBlend=0（未注入）时 PerTradePctOfBlend 回落 1.0，
 	// 与原 PerTradePctOf 逐字一致——老调用点/测试零行为变更。
-	blend := e.sizingCtx.FlowBlend
+	blend := signalctl.CombineSideWeight(e.sizingCtx.FlowBlend, sideWeight)
 	perTradePct := signalctl.PerTradePctOfBlend(k, perTradeLo, perTradeHi, blend)
 	e.sizingCtx.LastK = k // 只服务展示面（面板回显"这一轮实际按多少买"）
 	ind := ""
@@ -1838,6 +1935,9 @@ func (e *Engine) dynamicPaperQtyLocked(poolKey, code string, price, sizeScale fl
 		ceiling = 1.0
 	}
 	targetRatio := ms
+	if e.sizingCtx.TargetMultiplier > 0 {
+		targetRatio = ms * e.sizingCtx.TargetMultiplier
+	}
 	if targetRatio > ceiling {
 		targetRatio = ceiling
 	}
@@ -1952,7 +2052,8 @@ func (e *Engine) emitSkipDecisionLocked(poolKey, code, reason string, base, cash
 
 // paperSizingCtx engine 每轮注入的定权上下文（见 Engine.sizingCtx）。
 type paperSizingCtx struct {
-	MarketScale float64 // 市场组读数（目标仓位与 T 额度由它派生）；0=未注入
+	MarketScale      float64 // 市场组读数（目标仓位与 T 额度由它派生）；0=未注入
+	TargetMultiplier float64 // 侧策略战略目标乘子；T 额度不消费
 	// PerTradeLo/PerTradeHi 单笔占比的动态区间（§B0：owner 2026-10-27 定 10%~30%）。
 	// 生效值 = signalctl.PerTradePctOf(k, lo, hi)，k = 信号上带下来的 BuyScale（= MS×SS）。
 	// 为什么纸面也要这条：两本账的单笔口径必须同源，否则纸面按 10%×MS×SS、实盘按 23%~26%，
@@ -2016,9 +2117,10 @@ func perTradeBandOf(ctx paperSizingCtx) (lo, hi float64) {
 // 语义与"清单为空"并不总是一致（比如注入了但 dims 没算出来时不许悄悄放宽）。
 // English: dims is a mandatory trailing parameter — an optional setter or variadic would both
 // allow a silent miss, which is exactly the failure class this batch is closing.
-func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims []string, flowBlend float64) {
+func (e *Engine) SetSizingContext(ms, perTradeLo, perTradeHi, ceiling float64, missingKey bool, missingDims []string, flowBlend, targetMultiplier float64) {
 	e.mu.Lock()
-	e.sizingCtx = paperSizingCtx{MarketScale: ms, PerTradeLo: perTradeLo, PerTradeHi: perTradeHi,
+	e.sizingCtx = paperSizingCtx{MarketScale: ms, TargetMultiplier: targetMultiplier,
+		PerTradeLo: perTradeLo, PerTradeHi: perTradeHi,
 		Ceiling: ceiling, MissingKey: missingKey, MissingDims: append([]string(nil), missingDims...),
 		FlowBlend: flowBlend, Injected: true}
 	e.mu.Unlock()
@@ -2102,6 +2204,14 @@ func (e *Engine) maxOrderAmountErrLocked(qty int, price, cash float64) error {
 // qty <= 0 auto-sizes to FixedAmount in whole lots, shrinking to the largest affordable lot on a
 // shortfall (skipping below one lot).
 func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string, confidence, sizeScale float64, manual bool, marketVWAP float64) error {
+	return e.fillLockedWithStyle(poolKey, code, name, strategy, signalPrice, signalAt, now, price, qty, reason, confidence, sizeScale, manual, marketVWAP, 0)
+}
+
+// fillLockedWithStyle 把逐票 SideWeight 透传到动态预算；旧 fillLocked 包装保持手动/T/旧测试零改动。
+func (e *Engine) fillLockedWithStyle(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string, confidence, sizeScale float64, manual bool, marketVWAP float64, sideWeight float64) error {
+	if !e.sidePolicy.Enabled {
+		sideWeight = 0 // disabled 时忽略信号可能携带的旧瞬态权重
+	}
 	// 每池持仓上限（与全局上限解耦，可自定义）：该池新开仓达到池上限即拒绝。
 	// 池上限 0 = 该池不单独设限；加仓（已持仓）不在此路径（走 addToPositionLocked）。
 	// English: per-pool position cap (decoupled from the global cap, customizable) — a new open in this
@@ -2139,7 +2249,7 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		if manual && qty > 0 {
 			maxQty = qty
 		}
-		q, berr := e.dynamicPaperQtyLocked(poolKey, code, price, sizeScale, maxQty)
+		q, berr := e.dynamicPaperQtyStyleLocked(poolKey, code, price, sizeScale, maxQty, sideWeight)
 		if q <= 0 {
 			// §F-4：把结构化拒绝原样往上抛（不再包成一句话），由 server 展开成 {error, detail}。
 			if berr == nil {
@@ -2160,6 +2270,7 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		if sizeScale > 0 && sizeScale != 1.0 {
 			amount *= sizeScale
 		}
+		amount *= signalctl.CombineSideWeight(1, sideWeight)
 		qty = int(amount/price/100) * 100
 	}
 	if qty <= 0 {
@@ -2473,6 +2584,32 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	return nil
 }
 
+// autoAddToPositionLocked 只供侧策略放行的自动 add；手动 Buy/BuyEx 仍走原入口，不擅自动。
+func (e *Engine) autoAddToPositionLocked(p *Position, s *combat_agent.Signal, price float64, now time.Time) (int, error) {
+	qty := 0
+	if e.dynamicBudgetOn() {
+		var berr *BudgetError
+		qty, berr = e.dynamicPaperQtyStyleLocked(p.StrategyType, s.Code, price, s.SizeScale, 0, s.SideWeight)
+		if berr != nil {
+			return 0, berr
+		}
+	} else {
+		amount := e.cfg.FixedAmount * e.applyPoolIRLocked(p.StrategyType)
+		if s.SizeScale > 0 && s.SizeScale != 1.0 {
+			amount *= s.SizeScale
+		}
+		amount *= signalctl.CombineSideWeight(1, s.SideWeight)
+		qty = int(amount/price/100) * 100
+	}
+	if qty <= 0 {
+		return 0, errLotTooSmall
+	}
+	if err := e.addToPositionModeLocked(p, s.Code, s.Name, s.Strategy, s.Price, price, qty, s.Reason, false, s.Confidence, now); err != nil {
+		return 0, err
+	}
+	return qty, nil
+}
+
 // addToPositionLocked 已持仓加仓：加权平均成本、追加买入记录、从该持仓所属战法池扣款（须持锁调用）。
 // 手动加仓归原持仓池（按持仓记录的 StrategyType；旧数据/空 = 其他池），与买入回池语义一致：
 // 加仓成本记入该池累计成本，卖出时收益仍记该池。
@@ -2482,6 +2619,13 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 // the buy-into-pool semantics: the add-on cost accrues to that pool's cumulative cost, and sale proceeds
 // still attribute to it.
 func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, signalPrice, price float64, qty int, reason string) error {
+	return e.addToPositionModeLocked(p, code, name, strategy, signalPrice, price, qty, reason, true, 1.0, time.Now())
+}
+
+// addToPositionModeLocked 统一手动/自动加仓账务；manual 仅保留手动既有纪律豁免，自动 add 按
+// 信号 confidence 与 dynamic 预算纪律执行，不能借手动加仓函数绕过自动链。
+func (e *Engine) addToPositionModeLocked(p *Position, code, name, strategy string, signalPrice, price float64, qty int,
+	reason string, manual bool, confidence float64, now time.Time) error {
 	if qty <= 0 {
 		return errLotTooSmall
 	}
@@ -2505,11 +2649,13 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	// §P1-I 分仓纪律一致性：手动加仓与首买、信号买入走同一套纪律——此前 addToPositionLocked
 	// 只 recordPoolBuy（记账）却跳过了冷却/日限/预算前置检查，导致同池加仓可绕过纪律闸门。
 	// 手动加仓 confidence=1.0，与手动买入一致不受评分门槛约束，但冷却/日限/预算仍生效。
-	if reason := e.checkPoolDisciplinePre(poolKey, 1.0, true); reason != "" {
+	if reason := e.checkPoolDisciplinePre(poolKey, confidence, manual); reason != "" {
 		return fmt.Errorf("%w: %s", errPoolDiscipline, reason)
 	}
-	if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
-		return fmt.Errorf("%w: %s", errPoolDiscipline, reason)
+	if manual || !e.dynamicBudgetOn() {
+		if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
+			return fmt.Errorf("%w: %s", errPoolDiscipline, reason)
+		}
 	}
 	// §C1 行业/概念敞口：加仓同样增加敞口，必须与首买同闸。
 	if ok, why := e.checkSectorExposureLocked(code, cost); !ok {
@@ -2536,13 +2682,13 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	// 的 FilledAt 被当成可卖；按批次记日之后，可卖量只认批次自己的日期。
 	// English: the lot is appended BEFORE Qty/Cost mutate (the seed path needs the pre-add quantity), and
 	// this is exactly what closes the T+1 leak — add-ons used to inherit the base lot's date.
-	p.addBuyLot(qty, (cost+fee)/float64(qty), time.Now())
+	p.addBuyLot(qty, (cost+fee)/float64(qty), now)
 	p.Cost += cost + fee
 	p.Qty += qty
 	p.CostPrice = p.Cost / float64(p.Qty)
 	p.Mark = price
 	// §T1-PARTIAL 展示态刷新：加仓之后当日买入的那部分立刻不可卖，账面上要如实标"部分可卖"。
-	p.refreshSellStatusLocked(time.Now())
+	p.refreshSellStatusLocked(now)
 	e.trades = append(e.trades, Trade{
 		Code:         code,
 		Name:         name,
@@ -2553,7 +2699,7 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 		SignalPrice:  signalPrice,
 		Qty:          qty,
 		Amount:       cost,
-		Time:         time.Now(),
+		Time:         now,
 		Fee:          fee,
 		Reason:       reason,
 	})

@@ -65,6 +65,8 @@ type FactorRule struct {
 	Directions map[string]int `json:"directions"`
 	// 触发阈值：复合分高于此值才产生买入信号
 	BuyThreshold float64 `json:"buy_threshold"`
+	// EntryStyle §SIDE-POLICY：left/right/unclassified；旧条目迁移时 fac_118=left，其余 unclassified。
+	EntryStyle string `json:"entry_style,omitempty"`
 	// 前瞻天数
 	Horizon int `json:"horizon"`
 	// 全样本 IR
@@ -87,9 +89,10 @@ type AppliedFactorEntry struct {
 	Weights      map[string]float64 `json:"weights"`       // factorID → 权重
 	Directions   map[string]int     `json:"directions"`    // factorID → 方向
 	BuyThreshold float64            `json:"buy_threshold"` // 触发阈值
-	Horizon      int                `json:"horizon"`       // 前瞻天数
-	IR           float64            `json:"ir"`            // 全样本 IR
-	Excess       float64            `json:"excess"`        // 回测超额（avg_excess）
+	EntryStyle   string             `json:"entry_style,omitempty"`
+	Horizon      int                `json:"horizon"` // 前瞻天数
+	IR           float64            `json:"ir"`      // 全样本 IR
+	Excess       float64            `json:"excess"`  // 回测超额（avg_excess）
 	// 效果监测（实盘运行累计）
 	SignalCount int     `json:"signal_count"` // 实盘触发信号数
 	Win         int     `json:"win"`          // 触发后 Horizon 日收益为正次数
@@ -252,6 +255,7 @@ func ApplyFactorRule(dataDir string, c *store.Candidate) error {
 		Weights:      payload.Weights,
 		Directions:   payload.Directions,
 		BuyThreshold: payload.BuyThreshold,
+		EntryStyle:   sideStyleForID("fac_" + strconv.FormatInt(c.ID, 10)),
 		Horizon:      c.Horizon,
 		IR:           c.IR,
 		Excess:       c.AvgExcess,
@@ -265,6 +269,27 @@ func ApplyFactorRule(dataDir string, c *store.Candidate) error {
 		entry.BuyThreshold = 70
 	}
 	return appendAppliedFactor(dataDir, entry)
+}
+
+func sideStyleForID(id string) string {
+	if id == "fac_118" {
+		return "left"
+	}
+	return "unclassified"
+}
+
+// migrateSideStyles 给旧因子规则补左右侧风格；首版只有 fac_118 是真实 scored-left 生产者。
+// 只做内存派生，不回写历史 applied_factors.json；新应用规则在下笔时持久化该字段。
+func migrateSideStyles(entries []AppliedFactorEntry) ([]AppliedFactorEntry, bool) {
+	changed := false
+	for i := range entries {
+		if entries[i].EntryStyle != "" {
+			continue
+		}
+		entries[i].EntryStyle = sideStyleForID(entries[i].ID)
+		changed = true
+	}
+	return entries, changed
 }
 
 // ListAppliedFactorRules 读取战法库 applied_factors.json，返回全部已应用因子战法（含禁用）。
@@ -295,6 +320,7 @@ func ListAppliedFactorRules(dataDir string) ([]AppliedFactorEntry, error) {
 		if err := json.Unmarshal(raw, &entries); err != nil {
 			return nil, err
 		}
+		entries, _ = migrateSideStyles(entries)
 		// §ADJ-BASIS-2 载入即打 stale 派生标记（并刷新失效计数指标）。
 		return markStaleAdjBasis(entries), nil
 	}
@@ -316,6 +342,7 @@ func ListAppliedFactorRules(dataDir string) ([]AppliedFactorEntry, error) {
 	if entry.BuyThreshold <= 0 {
 		entry.BuyThreshold = 70
 	}
+	entry.EntryStyle = "unclassified"
 	_ = saveAppliedFactors(dataDir, []AppliedFactorEntry{entry}) // 落盘迁移
 	return markStaleAdjBasis([]AppliedFactorEntry{entry}), nil
 }
@@ -340,6 +367,7 @@ func LoadAppliedFactorRule(dataDir string) (*FactorRule, error) {
 		return &FactorRule{
 			Factors: e.Factors, Weights: e.Weights, Directions: e.Directions,
 			BuyThreshold: e.BuyThreshold, Horizon: e.Horizon, IR: e.IR, Excess: e.Excess,
+			EntryStyle: e.EntryStyle,
 		}, nil
 	}
 	return nil, nil
@@ -375,7 +403,7 @@ func LoadEnabledFactorRules(dataDir string) ([]*factorstrat.ActiveRule, error) {
 			ID: e.ID, Name: e.Name, CandID: e.CandID,
 			Rule: factorstrat.Rule{
 				Factors: e.Factors, Weights: e.Weights, Directions: e.Directions,
-				BuyThreshold: e.BuyThreshold,
+				BuyThreshold: e.BuyThreshold, EntryStyle: e.EntryStyle,
 			},
 		})
 	}

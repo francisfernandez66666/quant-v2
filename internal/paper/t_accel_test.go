@@ -29,12 +29,19 @@ func TestPaperRegimeAndVolumeGate(t *testing.T) {
 		return e.tOpenBlockReason(code, q, p, cntime.DayCompactOf(now), now, 1e9)
 	}
 
-	// ① bear（新鲜）⇒ 不开新腿，理由含「行情门」。
+	// ① bear + side policy ⇒ 开腿放行；legacy bear 仍关闭。
 	e, q := newFix()
 	p := tParams()
 	p.MarketState, p.MarketStateAt = "bear", e.clockNow()
-	if why := block(e, q, p, e.clockNow()); !strings.Contains(why, "行情门") {
-		t.Fatalf("bear 行情应被形态门拦下，实得 %q", why)
+	p.SidePolicyEnabled, p.SidePolicyMode = true, "bear"
+	if why := block(e, q, p, e.clockNow()); strings.Contains(why, "行情门") {
+		t.Fatalf("policy bear 不应被形态门拦下，实得 %q", why)
+	}
+	eLegacy, qLegacy := newFix()
+	pLegacy := tParams()
+	pLegacy.MarketState, pLegacy.MarketStateAt = "bear", eLegacy.clockNow()
+	if why := block(eLegacy, qLegacy, pLegacy, eLegacy.clockNow()); !strings.Contains(why, "行情门") {
+		t.Fatalf("legacy bear 应被形态门拦下，实得 %q", why)
 	}
 
 	// ② range（新鲜）⇒ 形态门放行；量能正常时整条链应能走到开腿（不因形态门误拦）。

@@ -794,6 +794,8 @@ class TestFactorLibrary(unittest.TestCase):
         signal = rf.rule_factor_composite(table, ctx(bars=bars()))
         self.assertEqual(signal["rule_id"], "fac_mom")
         self.assertAlmostEqual(signal["score"], 50.0)
+        self.assertAlmostEqual(signal["threshold"], 40.0)
+        self.assertEqual(signal["entry_style"], "unclassified")
         self.assertIn("factor_composite", signal["reason"])
 
 

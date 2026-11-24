@@ -19,6 +19,7 @@ package engine
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -33,6 +34,7 @@ const buyReserveTTL = 2 * time.Minute
 type buyReserveEntry struct {
 	Amount float64   // 预占金额（元）
 	At     time.Time // 预占时刻（TTL 判据）
+	Code   string    // 本票纯代码；同轮 same_symbol_day 依据，空值保持旧预占测试形态
 }
 
 // budgetUID 预算归属账号：优先引擎绑定的 userID，缺省回退管理员成员。
@@ -54,6 +56,19 @@ func (e *Engine) budgetUID() string {
 // reserveBuyBudget 记一笔预占。signalID 与账号一起作键：共享引擎可能同时服务多个成员，
 // 不能把 A 账号的在途金额算到 B 账号头上。
 func (e *Engine) reserveBuyBudget(uid, signalID string, amount float64) {
+	code := ""
+	if strings.HasPrefix(signalID, "buy:") {
+		parts := strings.SplitN(signalID, ":", 3)
+		if len(parts) == 3 {
+			code = parts[1]
+		}
+	}
+	e.reserveBuyBudgetForCode(uid, signalID, amount, code)
+}
+
+// reserveBuyBudgetForCode 在金额预占同时记住本票；异步委托尚未落库时，同轮第二笔也能看到
+// same_symbol_day 意图。Code 为空只用于旧的无代码预占夹具，不参与同票判断。
+func (e *Engine) reserveBuyBudgetForCode(uid, signalID string, amount float64, code string) {
 	if e == nil || signalID == "" || amount <= 0 {
 		return
 	}
@@ -65,7 +80,29 @@ func (e *Engine) reserveBuyBudget(uid, signalID string, amount float64) {
 	if e.buyReserve == nil {
 		e.buyReserve = map[string]buyReserveEntry{}
 	}
-	e.buyReserve[uid+"|"+signalID] = buyReserveEntry{Amount: amount, At: time.Now()}
+	e.buyReserve[uid+"|"+signalID] = buyReserveEntry{Amount: amount, At: time.Now(), Code: pureTsCode(code)}
+}
+
+// reservedSymbolToday 判断同账号当日是否已有本票战略买入预占；TTL 过期条目不参与。
+func (e *Engine) reservedSymbolToday(uid, code, day string) bool {
+	if e == nil || uid == "" || code == "" {
+		return false
+	}
+	now := time.Now()
+	prefix := uid + "|"
+	code = pureTsCode(code)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for k, v := range e.buyReserve {
+		if now.Sub(v.At) >= buyReserveTTL {
+			delete(e.buyReserve, k)
+			continue
+		}
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix && v.Code == code && data.TradingDayDate(v.At) == day {
+			return true
+		}
+	}
+	return false
 }
 
 // releaseBuyBudget 释放预占（worker 完成或明确失败时调用，幂等）。
@@ -244,7 +281,8 @@ func (e *Engine) sendRoomGuard(uid string, amount float64, signalID string) (boo
 		if stt := e.tLiveFor(uid); stt != nil {
 			book = stt.bookValue(prices)
 		}
-		_, _, room, _ = fundsTargetCurRoom(total, ctx.MS, sc.MaxTotalPositionPct, positions, prices, pending, book)
+		_, _, room, _ = fundsTargetCurRoomWithMultiplier(total, ctx.MS, sc.MaxTotalPositionPct,
+			ctx.targetMultiplier(), positions, prices, pending, book)
 	}
 	others := e.reservedAmountExcept(uid, signalID)
 	limit, ok := sendRoomLimit(room, roomOK, others, cash, cashOK)

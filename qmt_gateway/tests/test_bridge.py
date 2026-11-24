@@ -116,16 +116,19 @@ class TestBridgeLoop(unittest.TestCase):
         _, pend = self._req("GET", "/dispatch/pending")
         self.assertEqual(pend["items"], [])  # 已全部取走执行
         _, state = self._req("GET", "/state")
+        # 首个被拒的 S1 仍留在委托表，不能按数组首行断言；精确取本轮 S2，避免顺序差异假红。
+        matched = [row for row in state["orders"] if row.get("signal_id") == "S2"]
+        self.assertEqual(len(matched), 1, state["orders"])
+        placed = matched[0]
         # §M-3（2026-09-22 修复批）口径确认：这里「已报」依然是对的，但**不再**是
         # 「无回执即已报」——dry-run 通道没有柜台可确认，桥侧 resolve_order_id 对
         # dry_run/无 signal_id 显式保持 last_resolve_confirmed=True，回报不带
         # order_confirmed=false；只有策略桥在 ORDER 表轮询窗口内真的没见到委托时才降级。
         # 也就是说：本断言锁的是"已确认/无柜台可确认 → 已报"，未确认分支由
         # TestM3OrderLegConfirmation 与 test_bridge_strategy_adapter 的新用例锁住。
-        self.assertEqual(state["orders"][0]["status"], "已报")
-        self.assertTrue(str(state["orders"][0]["order_id"]).startswith("DRYRUN-"),
-                        state["orders"][0]["order_id"])
-        self.assertEqual(state["orders"][0]["signal_id"], "S2")
+        self.assertEqual(placed["status"], "已报")
+        self.assertTrue(str(placed["order_id"]).startswith("DRYRUN-"), placed["order_id"])
+        self.assertEqual(placed["signal_id"], "S2")
 
     def test_rejected_order_reported_waste(self):
         """桥回报下单失败 → 委托置已废（dry-run 对空 signal/issues 的拒单路径）。"""

@@ -87,6 +87,9 @@ func TestFactorGenerateSignal(t *testing.T) {
 	if sig.Action != strategy.ActionBuy || sig.Priority != strategy.P1 {
 		t.Fatalf("高置信应为 P1 buy, got action=%v prio=%v", sig.Action, sig.Priority)
 	}
+	if sig.Score != 85 || sig.Threshold != 70 || sig.EntryStyle != "unclassified" {
+		t.Fatalf("侧策略字段应随默认规则带出, got %+v", sig)
+	}
 	sig2, _ := fs.GenerateSignal("600000", &strategy.Evaluation{Pass: false, Confidence: 0.3})
 	if sig2 != nil {
 		t.Fatalf("未 Pass 不应出信号")

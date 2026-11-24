@@ -1,0 +1,19 @@
+# quant-carrier-side-policy.service — 13:00 侧策略加急发布（oneshot，失败重试）。
+[Unit]
+Description=Quant carrier urgent side-policy bake and publish
+After=network-online.target
+ConditionPathExists=/var/lib/quant-trading-v2/side_policy_urgent.req
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/quant/carrier_build/scripts/carrier_hot_reload_gz.py --urgent-side-policy
+Environment=CARRIER_BUILD_DIR=/opt/quant/carrier_build
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+Environment=OWNER_UID=u_1785377969825355000
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

@@ -207,6 +207,9 @@ type TParams struct {
 	// MarketState bull/range/bear；""=T 行情门已关或读数从未产生 ⇒ **弃权**（不是拦）。
 	// 与 MarketScale 是两回事：MS 是"该买多少"的定权标量，表达不了"盘整还是趋势"。
 	MarketState string
+	// SidePolicyEnabled/Mode 仅用于 bear 条件放行；legacy 表保持不变。
+	SidePolicyEnabled bool
+	SidePolicyMode    string
 	// MarketStateAt 该读数的时刻（零值=从未写过）⇒ 新鲜度门用，过期按弃权处理。
 	MarketStateAt time.Time
 	// MarketStateVotes/Total 研判票数，**只进日志不做门**：票数不足时状态机已把结论降级成 range
@@ -1658,7 +1661,7 @@ func (e *Engine) accelReasonLocked(r *TRound, price float64, p TParams) string {
 	}
 	if p.MarketState != "" && !p.MarketStateAt.IsZero() &&
 		time.Since(p.MarketStateAt) <= tPaperRegimeStale {
-		if p.MarketState == "bull" || p.MarketState == "bear" {
+		if p.MarketState == "bull" || (p.MarketState == "bear" && !(p.SidePolicyEnabled && p.SidePolicyMode == "bear")) {
 			return TAccelRegime
 		}
 	}
@@ -1737,7 +1740,12 @@ func (e *Engine) tRegimeBlockReason(p TParams, now time.Time) string {
 				p.MarketStateVotes, p.MarketStateVotesTotal, tPaperRegimeMinVotes), "")
 		}
 		return ""
-	case "bull", "bear":
+	case "bear":
+		if p.SidePolicyEnabled && p.SidePolicyMode == "bear" {
+			return ""
+		}
+		return fmt.Sprintf("行情门：市场状态=%s，非盘整行情不做 T", st)
+	case "bull":
 		return fmt.Sprintf("行情门：市场状态=%s，非盘整行情不做 T", st)
 	case "":
 		e.tNoteBlockLocked("step0", "行情门弃权：T 行情门已关（t.regime_gate_enabled=false）或读数从未产生，牛熊关闭 T 未生效", "")

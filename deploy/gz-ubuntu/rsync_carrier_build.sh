@@ -32,6 +32,10 @@ FILES=(
   # （见下面 §PARAMS-STATIC-BASE）：静态旋钮以仓库为准、运行态键以 gz 为准，两边各管一半。
   qmt_gateway/live_rules_snapshot.json
   qmt_gateway/strategy_switches_snapshot.json
+  # §SIDE-POLICY：加急 path/service 与 13:00–15:30 重试 timer 同批下发。
+  deploy/gz-ubuntu/quant-carrier-side-policy.path
+  deploy/gz-ubuntu/quant-carrier-side-policy.service
+  deploy/gz-ubuntu/quant-carrier-side-policy-retry.timer
 )
 # §PARAMS-STATIC-BASE（2026-11-19）：仓库这份参数文件是**全部静态旋钮**的唯一真源，
 # 但要落成 `.base.json`——直接覆盖 `local_executor_params.json` 会冲掉 gz 上的运行态
@@ -42,4 +46,4 @@ mkdir -p "$STAGE/qmt_gateway"
 cp qmt_gateway/local_executor_params.json "$STAGE/qmt_gateway/local_executor_params.base.json"
 tar -czf /tmp/carrier_build.tgz "${FILES[@]}" -C "$STAGE" qmt_gateway/local_executor_params.base.json
 scp -q /tmp/carrier_build.tgz gz:/tmp/carrier_build.tgz
-ssh gz "sudo -n mkdir -p /opt/quant/carrier_build && sudo -n tar -xzf /tmp/carrier_build.tgz -C /opt/quant/carrier_build && sudo -n chmod -R 755 /opt/quant/carrier_build && echo RSYNC_OK"
+ssh gz "sudo -n mkdir -p /opt/quant/carrier_build && sudo -n tar -xzf /tmp/carrier_build.tgz -C /opt/quant/carrier_build && sudo -n chmod -R 755 /opt/quant/carrier_build && sudo -n install -m 644 /opt/quant/carrier_build/deploy/gz-ubuntu/quant-carrier-side-policy.path /opt/quant/carrier_build/deploy/gz-ubuntu/quant-carrier-side-policy.service /opt/quant/carrier_build/deploy/gz-ubuntu/quant-carrier-side-policy-retry.timer /etc/systemd/system/ && sudo -n systemctl daemon-reload && sudo -n systemctl enable --now quant-carrier-side-policy.path quant-carrier-side-policy.service quant-carrier-side-policy-retry.timer && sudo -n systemctl start --no-block quant-carrier-side-policy.service && echo RSYNC_OK"

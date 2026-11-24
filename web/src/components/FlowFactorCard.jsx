@@ -187,9 +187,26 @@ export default function FlowFactorCard({ flow }) {
     )
   }
 
+  const side = flow?.side_policy
+  const sideMode = side?.mode === 'bear' ? '熊市收紧' : side?.mode === 'bull' ? '牛市镜像' : side?.mode === 'range' ? '中性' : '未启用'
   return (
     <Card title="市场资金流与量能">
       <div data-testid="flow-factor-card">{body}</div>
+      <div className="muted" style={{ fontSize: 12, marginTop: 8 }} data-testid="flow-side-policy">
+        {!side?.known ? (
+          <>侧策略：未启用或无有效快照</>
+        ) : side.enabled === false || side.status === 'disabled' ? (
+          <>侧策略：未启用</>
+        ) : side.stale || side.status === 'stale' ? (
+          <>侧策略：弃权（快照缺失或过期，按 L1 禁新仓）</>
+        ) : (
+          <>
+            侧策略 {sideMode} · L{side.level} · new {side.allow_new ? '允许' : '禁'} · add {side.allow_add ? '允许' : '禁'}
+            {' · '}目标乘子 {Number.isFinite(Number(side.target_multiplier)) ? `×${Number(side.target_multiplier).toFixed(2)}` : '—'}
+            {side.latch_active ? ' · 13:00 禁新仓至 14:00' : ''}
+          </>
+        )}
+      </div>
     </Card>
   )
 }

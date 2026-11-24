@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"math"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
@@ -29,6 +31,89 @@ func newFlowStatusServer(t *testing.T) (*Server, *store.DB) {
 	}
 	t.Cleanup(func() { db.Close() })
 	return &Server{startTime: time.Now(), agg: &display.Aggregator{}, researchDB: db}, db
+}
+
+// TestFlowStatusSidePolicySnapshot 锁定首页侧策略快照的已知/缺失两态。
+func TestFlowStatusSidePolicySnapshot(t *testing.T) {
+	s, _ := newFlowStatusServer(t)
+	s.researchDir = t.TempDir()
+	now := time.Date(2026, 11, 24, 13, 0, 0, 0, cntime.Loc)
+	st := signalctl.SidePolicyState{Enabled: true, Day: "20261124", Mode: signalctl.SidePolicyBear, AsOf: now,
+		Level: 2, AllowNew: false, AllowAdd: false, TargetMultiplier: 0.7,
+		LeftWeight: 1, RightWeight: 0.8, Latch: signalctl.SidePolicyLatch{Kind: "no_new", Until: "14:00"},
+		LatchUntilUnix: now.Add(time.Hour).Unix(), Reason: "pm1300_latch"}
+	raw, _ := json.Marshal(st)
+	if err := os.WriteFile(filepath.Join(s.researchDir, "side_policy_latest.json"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := s.flowStatusReadout(now)
+	side, ok := got["side_policy"].(map[string]interface{})
+	if !ok || side["known"] != true || side["mode"] != "bear" || side["allow_new"] != false ||
+		side["latch_active"] != true || side["stale"] != false || side["status"] != "known" {
+		t.Fatalf("side policy readout mismatch: %+v", got["side_policy"])
+	}
+}
+
+func writeSidePolicySnapshot(t *testing.T, dir string, st signalctl.SidePolicyState) {
+	t.Helper()
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "side_policy_latest.json"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFlowStatusSidePolicyDisabledIsNotNeutralMultiplier 验证停用态不冒充中性仓位乘子。
+func TestFlowStatusSidePolicyDisabledIsNotNeutralMultiplier(t *testing.T) {
+	s, _ := newFlowStatusServer(t)
+	s.researchDir = t.TempDir()
+	now := time.Date(2026, 11, 24, 10, 30, 0, 0, cntime.Loc)
+	writeSidePolicySnapshot(t, s.researchDir, signalctl.SidePolicyState{
+		Enabled: false, Day: "20261124", Mode: signalctl.SidePolicyLegacy,
+		AllowNew: true, AllowAdd: true, TargetMultiplier: 1, LeftWeight: 1, RightWeight: 1,
+		Reason: "side_policy_disabled",
+	})
+	side := s.flowStatusReadout(now)["side_policy"].(map[string]interface{})
+	if side["known"] != true || side["enabled"] != false || side["status"] != "disabled" || side["stale"] != false {
+		t.Fatalf("disabled must be its own known state: %+v", side)
+	}
+	if _, exists := side["target_multiplier"]; exists {
+		t.Fatalf("disabled must not publish a neutral multiplier: %+v", side)
+	}
+}
+
+// TestFlowStatusSidePolicyStaleAndMissingAsOfAbstain 验证过期与缺时刻都回落 L1 禁新。
+func TestFlowStatusSidePolicyStaleAndMissingAsOfAbstain(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		asOf   time.Time
+		reason string
+	}{
+		{"expired", time.Time{}, "side_policy_stale"},
+		{"missing", time.Time{}, "side_policy_asof_missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newFlowStatusServer(t)
+			s.researchDir = t.TempDir()
+			now := time.Date(2026, 11, 24, 10, 30, 0, 0, cntime.Loc)
+			asOf := tc.asOf
+			if tc.name == "expired" {
+				asOf = now.Add(-time.Duration((config.CarrierSidePolicyTTLSec() + 1) * float64(time.Second)))
+			}
+			writeSidePolicySnapshot(t, s.researchDir, signalctl.SidePolicyState{
+				Enabled: true, Day: "20261124", Mode: signalctl.SidePolicyBull, AsOf: asOf,
+				Level: 2, AllowNew: true, AllowAdd: true, TargetMultiplier: 1.1,
+				LeftWeight: 1, RightWeight: 1, Reason: "bull_mirror",
+			})
+			side := s.flowStatusReadout(now)["side_policy"].(map[string]interface{})
+			if side["known"] != true || side["enabled"] != true || side["status"] != "stale" || side["stale"] != true ||
+				side["reason"] != tc.reason || side["level"] != 1 || side["allow_new"] != false || side["allow_add"] != true {
+				t.Fatalf("stale/missing AsOf must abstain to L1: %+v", side)
+			}
+		})
+	}
 }
 
 // fptr 取址小工具（写行时用）。

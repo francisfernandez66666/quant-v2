@@ -148,8 +148,14 @@ type Signal struct {
 	// （SellLevel carries the structured sell-point severity for short mode, where AlertType is the
 	// direction word 做空; the display layer maps the cap from this field instead of reason substrings.）
 	SellLevel  string  `json:"sell_level,omitempty"`
-	Price      float64 `json:"price"`         // 触发价格
-	Confidence float64 `json:"confidence"`    // 置信度（0~1）
+	Price      float64 `json:"price"`      // 触发价格
+	Confidence float64 `json:"confidence"` // 置信度（0~1）
+	// Score/Threshold/EntryStyle 仅供侧策略准入与决策留痕，不广播。
+	Score      float64 `json:"-"`
+	Threshold  float64 `json:"-"`
+	EntryStyle string  `json:"-"`
+	// SideWeight 逐票左右侧金额权重（0.80~1.20）；只在本轮自动买入链透传，不污染账户级 FlowBlend。
+	SideWeight float64 `json:"-"`
 	ATR        float64 `json:"atr,omitempty"` // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
 	// §C4 技术过滤输入（临时字段，不广播/不落盘）：由 combat_agent 在已有日 K 上计算。
 	// CloseVsMA 存 close/MA−1（负=收盘低于均线）；均线不足时为 0/缺失（弃权，不误拦）。

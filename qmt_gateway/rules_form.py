@@ -849,6 +849,7 @@ def _f_make_signal(params, ctx, kind, side, amount, price, qty=None):
         "price": float(price),
         "amount": None if amount is None else float(amount),
         "short_code": short,
+        "entry_style": "left" if kind == "pullback_buy" else ("right" if side == "buy" else "unclassified"),
     }
 
 

@@ -176,3 +176,26 @@ func TestUpdateAppliedFactorStats(t *testing.T) {
 		t.Fatalf("统计回写异常: %+v", entries[0])
 	}
 }
+
+// TestSideStyleMigration 旧规则内存派生风格：fac_118=left，其余=unclassified；不回写历史文件。
+func TestSideStyleMigration(t *testing.T) {
+	dir := t.TempDir()
+	raw := `[
+		{"id":"fac_118","name":"fac_118","enabled":true,"factors":["VMIN10","VSTD20"],"weights":{"VMIN10":0.1,"VSTD20":0.9},"directions":{"VMIN10":-1,"VSTD20":-1},"buy_threshold":70},
+		{"id":"fac_160","name":"fac_160","enabled":true,"factors":["Brk60"],"weights":{"Brk60":1},"directions":{"Brk60":1},"buy_threshold":70}
+	]`
+	if err := os.WriteFile(filepath.Join(dir, "applied_factors.json"), []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := ListAppliedFactorRules(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].EntryStyle != "left" || entries[1].EntryStyle != "unclassified" {
+		t.Fatalf("风格迁移错误: %+v", entries)
+	}
+	rules, err := LoadEnabledFactorRules(dir)
+	if err != nil || len(rules) != 2 || rules[0].EntryStyle != "left" || rules[1].EntryStyle != "unclassified" {
+		t.Fatalf("ActiveRule 透传错误: rules=%+v err=%v", rules, err)
+	}
+}

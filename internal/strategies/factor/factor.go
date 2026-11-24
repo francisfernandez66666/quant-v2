@@ -99,6 +99,8 @@ type Rule struct {
 	// BuyThreshold 触发买入的复合分阈值（0~100，默认 70）。
 	// English: composite threshold to fire a buy (0~100, default 70).
 	BuyThreshold float64
+	// EntryStyle left/right/unclassified；供侧策略分级，不改变因子打分。
+	EntryStyle string
 }
 
 // ActiveRule 一条已应用的因子战法规则（战法库中的一条），带独立 ID/名称与运行统计（效果监测）。
@@ -402,9 +404,15 @@ func (f *FactorStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	f.mu.Unlock()
 	ruleName := "因子战法"
 	candID := int64(0)
+	entryStyle := "unclassified"
+	threshold := factorDefaultBuyThreshold
 	if pe != nil && pe.rule != nil {
 		ruleName = pe.rule.Name
 		candID = pe.rule.CandID
+		entryStyle = pe.rule.EntryStyle
+		if pe.rule.BuyThreshold > 0 {
+			threshold = pe.rule.BuyThreshold
+		}
 		// 效果监测：该规则触发信号数 +1
 		pe.rule.SignalCount++
 	}
@@ -429,6 +437,9 @@ func (f *FactorStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		Priority: prio, Confidence: eval.Confidence,
 		StrategyName: ruleName,
 		Meta:         meta,
+		Score:        eval.TotalScore,
+		Threshold:    threshold,
+		EntryStyle:   entryStyle,
 		Reason:       ruleName + "触发: " + strconv.FormatFloat(eval.TotalScore, 'f', 2, 64),
 	}, nil
 }

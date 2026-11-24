@@ -482,6 +482,33 @@ func collectCarrierShape(c *collector) {
 	c.put("market_scale_ceiling_margin", src, config.CarrierMarketScaleCeilingMargin())
 	c.put("buy_retry_improve_pct", src, config.CarrierBuyRetryImprovePct())
 	c.put("buy_retry_max_per_day", src, config.CarrierBuyRetryMaxPerDay())
+	// §SIDE-POLICY-20261124：熊市左右侧比例与牛市镜像。逐键转调唯一真源，工具不产生新数。
+	const sideSrc = "internal/config/carrier_knobs.go:CarrierSide*"
+	c.put("side_policy_enabled", sideSrc, config.CarrierSidePolicyEnabledDefault())
+	c.put("side_flow_strong_delta", sideSrc, config.CarrierSideFlowStrongDelta())
+	c.put("side_flow_slope_step", sideSrc, config.CarrierSideFlowSlopeStep())
+	c.put("side_flow_pm_delta", sideSrc, config.CarrierSideFlowPMDelta())
+	c.put("side_gap_high_pct", sideSrc, config.CarrierSideGapHighPct())
+	c.put("side_gap_low_pct", sideSrc, config.CarrierSideGapLowPct())
+	c.put("side_pm_index_drop_pct", sideSrc, config.CarrierSidePMIndexDropPct())
+	c.put("side_pm_index_rise_pct", sideSrc, config.CarrierSidePMIndexRisePct())
+	c.put("side_bear_target_l1", sideSrc, config.CarrierSideBearTargetL1())
+	c.put("side_bear_target_l2", sideSrc, config.CarrierSideBearTargetL2())
+	c.put("side_bull_target_l1", sideSrc, config.CarrierSideBullTargetL1())
+	c.put("side_bull_target_l2", sideSrc, config.CarrierSideBullTargetL2())
+	c.put("side_bull_target_l3", sideSrc, config.CarrierSideBullTargetL3())
+	c.put("side_weight_lo", sideSrc, config.CarrierSideWeightLo())
+	c.put("side_weight_hi", sideSrc, config.CarrierSideWeightHi())
+	c.put("side_left_score_floor", sideSrc, config.CarrierSideLeftScoreFloor())
+	c.put("side_left_score_margin", sideSrc, config.CarrierSideLeftScoreMargin())
+	c.put("side_left_stable_rounds", sideSrc, config.CarrierSideLeftStableRounds())
+	c.put("side_left_stable_gap_sec", sideSrc, config.CarrierSideLeftStableGapSec())
+	c.put("side_left_stable_max_drop", sideSrc, config.CarrierSideLeftStableMaxDrop())
+	c.put("side_pm_check_from", sideSrc, config.CarrierSidePMCheckFrom())
+	c.put("side_pm_block_until", sideSrc, config.CarrierSidePMBlockUntil())
+	c.put("side_bucket_minutes", sideSrc, config.CarrierSideBucketMinutes())
+	c.put("side_policy_ttl_sec", sideSrc, config.CarrierSidePolicyTTLSec())
+	c.put("side_freshness_heartbeat_sec", sideSrc, config.CarrierSideFreshnessHeartbeatSec())
 	// §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
 	// 全部转调 internal/config/carrier_knobs.go 的访问器；本函数不产生任何数字。
 	const tpSrc = "internal/config/carrier_knobs.go:CarrierTP*"

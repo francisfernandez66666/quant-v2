@@ -41,6 +41,7 @@ from qmt_gateway import rules_sizing as rs
 
 def params(**overrides):
     knobs = dict(rs.SIZING_DEFAULTS)
+    knobs.setdefault("side_policy_enabled", False)
     knobs.update(overrides)
     return knobs
 
@@ -600,6 +601,82 @@ def test_buy_amount_declines_when_only_the_floor_survives():
 
 
 # ---------------------------------------------------------------------------
+# 8b. SIDE-POLICY admission / target multiplier
+# ---------------------------------------------------------------------------
+
+def side_snapshot(**overrides):
+    snap = {"day": "20261124", "asof_ts": 1000.0, "mode": "bear", "level": 1,
+            "allow_new": False, "allow_add": False, "target_multiplier": 0.85,
+            "left_weight": 1.0, "right_weight": 0.8, "latch_until_ts": 0.0}
+    snap.update(overrides)
+    return snap
+
+
+def side_ctx(**overrides):
+    ctx = base_ctx(day="20261124", now_ts=1100.0)
+    ctx.update(overrides)
+    return ctx
+
+
+def test_side_policy_disabled_is_legacy():
+    st = rs.side_policy_state(params(), side_ctx())
+    assert st["mode"] == "legacy" and st["allow_new"] and st["allow_add"]
+
+
+def test_side_policy_enabled_missing_state_fails_closed():
+    st = rs.side_policy_state(params(side_policy_enabled=True), side_ctx())
+    assert st["mode"] == "bear" and not st["allow_new"] and st["allow_add"]
+
+
+def test_side_policy_gate_matrix_and_strong_left():
+    knobs = params(side_policy_enabled=True, side_policy=side_snapshot())
+    ctx = side_ctx()
+    sig = {"entry_style": "left", "score": 85.0, "threshold": 70.0}
+    assert rs.side_buy_allowed(knobs, ctx, sig, "new", 0, False, False, True)[0] is False
+    assert rs.side_buy_allowed(knobs, ctx, sig, "add", 100, False, False, False)[0] is False
+    assert rs.side_buy_allowed(knobs, ctx, sig, "add", 100, False, False, True)[0] is True
+    assert rs.side_buy_allowed(knobs, ctx, sig, "add", 100, True, False, True)[1] == "tp_rebuy_block"
+    assert rs.side_buy_allowed(knobs, ctx, sig, "add", 100, False, True, True)[1] == "same_symbol_day"
+    assert rs.side_buy_allowed(knobs, ctx, sig, "t_leg", 100, True, True, False)[0] is True
+
+
+def test_side_policy_target_multiplier_only_strategic():
+    knobs = params(side_policy_enabled=True, side_policy=side_snapshot())
+    ctx = side_ctx(side_target_multiplier=rs.side_target_multiplier(knobs, side_ctx(), "new"))
+    target = rs.target_position(knobs, ctx)
+    assert target["target"] == 85000.0
+    assert rs.side_target_multiplier(knobs, side_ctx(), "t_leg") == 1.0
+
+
+def test_side_policy_style_weight_combines_and_caps():
+    knobs = params(side_policy_enabled=True, side_policy=side_snapshot())
+    assert rs.side_style_weight(knobs, side_ctx(), "right") == 0.8
+    assert rs.combine_side_weight(knobs, 1.2, 1.2) == 1.2
+    assert rs.combine_side_weight(knobs, 0.8, 0.8) == 0.8
+
+
+@pytest.mark.parametrize("field,value", [
+    ("mode", "BEAR"), ("mode", "legacy"), ("mode", True),
+    ("level", True), ("level", 1.0), ("level", -1), ("level", 3),
+    ("allow_new", 1), ("allow_add", "false"),
+    ("latch", []), ("latch", {"kind": "clear"}),
+])
+def test_side_policy_malformed_enums_and_bools_fail_closed(field, value):
+    st = rs.side_policy_state(params(side_policy_enabled=True,
+                                    side_policy=side_snapshot(**{field: value})), side_ctx())
+    assert st["mode"] == "bear" and st["level"] == 1
+    assert st["allow_new"] is False and st["allow_add"] is True
+    assert st["reason"].startswith("side_policy_bad_")
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", None])
+def test_side_policy_switch_requires_real_bool(value):
+    st = rs.side_policy_state(params(side_policy_enabled=value), side_ctx())
+    assert st["allow_new"] is False
+    assert st["reason"] == "side_policy_bad_switch"
+
+
+# ---------------------------------------------------------------------------
 # 9. the intraday T environment gate
 # ---------------------------------------------------------------------------
 
@@ -632,6 +709,13 @@ def test_t_shape_gate_closes_on_bull_and_bear_but_abstains_on_no_reading():
     assert rs.t_allowed_by_sizing(
         params(t_regime_gate_enabled=False),
         base_ctx(market_state="bear", market_state_age_sec=60)) is True
+
+
+def test_t_policy_bear_allowed_but_legacy_bear_still_blocked():
+    knobs = params(side_policy_enabled=True, side_policy=side_snapshot())
+    assert rs.t_allowed_by_sizing(knobs, side_ctx(market_state="bear", market_state_age_sec=60)) is True
+    assert rs.t_allowed_by_sizing(knobs, side_ctx(market_state="bull", market_state_age_sec=60)) is False
+    assert rs.t_allowed_by_sizing(params(), side_ctx(market_state="bear", market_state_age_sec=60)) is False
 
 
 def test_buy_direction_gate_uses_the_market_scale_floor():

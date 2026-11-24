@@ -377,6 +377,16 @@ class GateOrderTests(unittest.TestCase):
                                                       market_state_age_sec=5000.0))
         self.assertTrue(allowed, reason)  # 过期＝弃权：不许拿旧结论做动作
 
+    def test_policy_bear_is_allowed_without_changing_legacy_tables(self):
+        knobs = params(side_policy_enabled=True, side_policy={"day": DAY, "mode": "bear"})
+        blocked, reason = rt.t_regime_gate(knobs, ctx(market_state="bear"))
+        self.assertFalse(blocked, reason)
+        blocked, reason = rt.t_regime_gate(knobs, ctx(market_state="bull"))
+        self.assertTrue(blocked)
+        self.assertIn("regime_gate", reason)
+        blocked, _reason = rt.t_regime_gate(params(), ctx(market_state="bear"))
+        self.assertTrue(blocked)
+
     def test_cross_account_opposite_leg_blocks(self):
         allowed, reason = rt.t_gate_open(params(), ctx(opposite_leg_blocked=True))
         self.assertFalse(allowed)

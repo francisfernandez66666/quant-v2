@@ -50,7 +50,7 @@ func TestSizingContextMissingReasonDistinguishesNotInjected(t *testing.T) {
 // 不能与 E1 的"未注入"混为一谈。
 func TestSizingContextZeroAfterInjectionIsRealReading(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(0, 0.1, 0.3, 1, false, nil, 1.0) // 注入 ms=0
+	pe.SetSizingContext(0, 0.1, 0.3, 1, false, nil, 1.0, 1.0) // 注入 ms=0
 	rec := captureDecision(t, pe, "600000.SH")
 	if rec.MissingKeyInput != "market_scale_zero" {
 		t.Fatalf("注入 0 时 MissingKeyInput=%q，期望 market_scale_zero（与未注入必须区分）", rec.MissingKeyInput)
@@ -67,7 +67,7 @@ func TestSizingContextZeroAfterInjectionIsRealReading(t *testing.T) {
 // 断言的重点是 StockRoom > 0：这一条在改动前必红（三个字段从来没被赋值过）。
 func TestDecisionRecordCarriesRoomFields(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(1, 0.1, 0.3, 1, false, nil, 1.0)
+	pe.SetSizingContext(1, 0.1, 0.3, 1, false, nil, 1.0, 1.0)
 	rec := captureDecision(t, pe, "600000.SH")
 	if rec.StockRoom <= 0 {
 		t.Fatalf("配了单票 35%% 帽时 StockRoom 应 > 0（改动前恒 0 是静默假读数），实得 %v", rec.StockRoom)
@@ -80,12 +80,24 @@ func TestDecisionRecordCarriesRoomFields(t *testing.T) {
 // E1b：MissingKey 与未注入同时成立时，两个原因都要出现（逗号分隔），不许互相覆盖。
 func TestSizingContextReportsBothReasons(t *testing.T) {
 	pe := New(dynPaperConfig(100000), "")
-	pe.SetSizingContext(1, 0.1, 0.3, 1, true, nil, 1.0) // 注入但标了关键输入缺失
+	pe.SetSizingContext(1, 0.1, 0.3, 1, true, nil, 1.0, 1.0) // 注入但标了关键输入缺失
 	rec := captureDecision(t, pe, "600000.SH")
 	if !strings.Contains(rec.MissingKeyInput, "market_key_input") {
 		t.Fatalf("MissingKey=true 时原因里必须有 market_key_input，实得 %q", rec.MissingKeyInput)
 	}
 	if strings.Contains(rec.MissingKeyInput, "market_scale_not_injected") {
 		t.Fatalf("已注入过就不该再报未注入，实得 %q", rec.MissingKeyInput)
+	}
+}
+
+func TestPaperTargetMultiplierOnlyChangesStrategicTarget(t *testing.T) {
+	pe := New(dynPaperConfig(100000), "")
+	pe.SetSizingContext(1, 0.1, 0.3, 1, false, nil, 1.0, 0.2)
+	rec := captureDecision(t, pe, "600000.SH")
+	if rec.Target != 20000 {
+		t.Fatalf("paper strategic target must apply TM, got %.0f", rec.Target)
+	}
+	if rec.MarketScale != 1 {
+		t.Fatalf("MarketScale must remain unchanged, got %.3f", rec.MarketScale)
 	}
 }

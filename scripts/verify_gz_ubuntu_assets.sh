@@ -228,6 +228,43 @@ else
   ck "cutover_config_merge" 1 "config_rebuild_would_wipe_cutover_keys"
 fi
 
+# 10) §SIDE-POLICY 三件 unit 的同步、安装与启用链。部署脚本只准备安装；
+# 本机静态门禁不 SSH、不部署。加 --live 才从广州回读真实 active/enabled。
+SIDE_UNITS="quant-carrier-side-policy.path quant-carrier-side-policy.service quant-carrier-side-policy-retry.timer"
+SIDE_MISSING=0
+for unit in $SIDE_UNITS; do
+  has_file "deploy/gz-ubuntu/$unit" || SIDE_MISSING=1
+  has_text deploy/gz-ubuntu/rsync_carrier_build.sh "$unit" || SIDE_MISSING=1
+done
+if [ "$SIDE_MISSING" -eq 0 ] && has_text deploy/gz-ubuntu/rsync_carrier_build.sh '/etc/systemd/system/' \
+   && has_text deploy/gz-ubuntu/rsync_carrier_build.sh 'systemctl daemon-reload' \
+   && has_text deploy/gz-ubuntu/rsync_carrier_build.sh 'systemctl enable --now quant-carrier-side-policy.path quant-carrier-side-policy.service quant-carrier-side-policy-retry.timer'; then
+  ck "side_policy_units_install_chain" 0 "synced+installed+path_timer_enabled"
+else
+  ck "side_policy_units_install_chain" 1 "unit_sync_or_install_missing"
+fi
+if [ "${1:-}" = "--live" ]; then
+  for unit in $SIDE_UNITS; do
+    ENABLED="$(ssh gz "systemctl is-enabled $unit 2>/dev/null" 2>/dev/null || true)"
+    ACTIVE="$(ssh gz "systemctl is-active $unit 2>/dev/null" || true)"
+    if [ "$ENABLED" = "enabled" ]; then
+      ck "side_policy_enabled_$unit" 0 "state=$ENABLED"
+    else
+      ck "side_policy_enabled_$unit" 1 "state=${ENABLED:-unknown}"
+    fi
+    # oneshot service 无 req 时完成即 inactive 是正常终态；path/timer 必须 active。
+    if [ "$unit" = "quant-carrier-side-policy.service" ]; then
+      case "$ACTIVE" in active|inactive) ck "side_policy_active_$unit" 0 "oneshot_state=$ACTIVE" ;; *) ck "side_policy_active_$unit" 1 "state=${ACTIVE:-unknown}" ;; esac
+    elif [ "$ACTIVE" = "active" ]; then
+      ck "side_policy_active_$unit" 0 "state=$ACTIVE"
+    else
+      ck "side_policy_active_$unit" 1 "state=${ACTIVE:-unknown}"
+    fi
+  done
+else
+  echo "INFO|side_policy_live|not_run (pass --live to read gz active/enabled)"
+fi
+
 printf 'INFO|summary|pass=%s fail=%s failed=%s\n' "$PASS" "$FAIL" "${FAILED:-none}"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "ok - §GZ-UBUNTU 部署件口径门禁通过（$PASS 道静态锁 + 探针变异反证）"

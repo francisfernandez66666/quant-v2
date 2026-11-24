@@ -118,6 +118,12 @@ type Signal struct {
 	// strategy type hosts several independent rules (e.g. multiple factor strategies), so each signal's
 	// message-center dedup key stays distinct.
 	StrategyName string `json:"strategy_name,omitempty"`
+	// Score/Threshold/EntryStyle 仅供进程内侧策略准入；不广播，避免改订单/信号契约。
+	Score      float64 `json:"-"`
+	Threshold  float64 `json:"-"`
+	EntryStyle string  `json:"-"`
+	// SideWeight 逐票左右侧金额权重，仅供本轮 live/paper 自动买入透传；不广播、不落盘。
+	SideWeight float64 `json:"-"`
 }
 
 // SignalResult 批量信号结果。（SignalResult is a batch signal result.）

@@ -69,7 +69,7 @@ nightcap)
 	go test -count=1 ./internal/scheduler/ -run 'TestNightcapBudgetCapYieldsTask|TestNightcapHeadBudgetDefersAndReleasesQueue'
 	;;
 *)
-	echo "未知模式 $MODE（可选 go / web / nightcap）" >&2
+	echo "未知模式 ${MODE}（可选 go / web / nightcap）" >&2
 	usage
 	;;
 esac

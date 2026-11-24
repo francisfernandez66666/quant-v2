@@ -42,6 +42,8 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 	// §FLOW-FACTOR：把两个净流入率（当日/5 日）挂到买入信号（两侧开关都关时零操作）。
 	// 同位置准入之前——signalctl 的 flow5DFactor/flowTodayFactor 读的就是这两个字段。
 	e.annotateFlowFactors(buys, live)
+	// §SIDE-POLICY：逐票左右侧权重只挂信号瞬态字段，账户级 FlowBlend 保持独立。
+	e.annotateSideWeights(buys, now)
 	// §DYN-T 先把本轮买入信号记进消费账本：候选 B 要"比上一次该码回转结束更新的活跃信号"，
 	// 判定发生在纸面 T 驱动里，而那份账只能由引擎（唯一见过信号的地方）维护。
 	e.tRecordBuySignals(buys)
@@ -87,6 +89,7 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 		e.autoPlaceScaled(buys[i], live, d.BuyScale, sizingOn,
 			dynBudgetCtx{MarketScale: d.MarketScale, StockScale: d.StockScale,
 				FlowBlend:        d.FlowBlend,
+				TargetMultiplier: d.TargetMultiplier,
 				QuadrantDecision: d.QuadrantDecision, QuadrantReason: d.QuadrantReason,
 				MissingKeyInput: d.MissingKeyInput, MissingKeyDims: d.MissingKeyDims},
 			pol.Regime.SizeCfg)

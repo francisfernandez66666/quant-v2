@@ -41,6 +41,7 @@
         "VSTD20": -1
       },
       "buy_threshold": 70,
+      "entry_style": "left",
       "horizon": 10,
       "ir": 1.35320342492775,
       "excess": 0.0014130140513282624,

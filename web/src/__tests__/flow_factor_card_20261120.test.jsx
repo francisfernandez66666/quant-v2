@@ -121,6 +121,47 @@ describe('§FLOW-QUADRANT FlowFactorCard', () => {
     expect(blend.textContent).not.toContain('×1.00')
   })
 
+  it('侧策略快照：显示模式、准入、目标乘子与 13:00 latch', () => {
+    render(<FlowFactorCard flow={{ ...FULL, side_policy: {
+      known: true, enabled: true, stale: false, status: 'known',
+      mode: 'bear', level: 2, allow_new: false, allow_add: false,
+      target_multiplier: 0.7, latch_active: true,
+    } }} />)
+    const el = screen.getByTestId('flow-side-policy')
+    expect(el.textContent).toContain('熊市收紧')
+    expect(el.textContent).toContain('new 禁')
+    expect(el.textContent).toContain('add 禁')
+    expect(el.textContent).toContain('×0.70')
+    expect(el.textContent).toContain('14:00')
+  })
+
+  it('侧策略缺快照时明说未启用，不画默认乘子', () => {
+    render(<FlowFactorCard flow={FULL} />)
+    const el = screen.getByTestId('flow-side-policy')
+    expect(el.textContent).toContain('未启用')
+    expect(el.textContent).not.toContain('×1.00')
+  })
+
+  it('侧策略明确 disabled 时只显示未启用，不画 ×1.00', () => {
+    render(<FlowFactorCard flow={{ ...FULL, side_policy: {
+      known: true, enabled: false, stale: false, status: 'disabled', target_multiplier: 1,
+    } }} />)
+    const el = screen.getByTestId('flow-side-policy')
+    expect(el.textContent.trim()).toBe('侧策略：未启用')
+    expect(el.textContent).not.toContain('×1.00')
+  })
+
+  it('侧策略 stale 时显示弃权，不展示过期乘子', () => {
+    render(<FlowFactorCard flow={{ ...FULL, side_policy: {
+      known: true, enabled: true, stale: true, status: 'stale', mode: 'bull', level: 1,
+      allow_new: false, allow_add: true, target_multiplier: 1,
+    } }} />)
+    const el = screen.getByTestId('flow-side-policy')
+    expect(el.textContent).toContain('弃权')
+    expect(el.textContent).not.toContain('×1.00')
+    expect(el.textContent).not.toContain('牛市镜像')
+  })
+
   it('未知量态回落占位符「—」，绝不猜成平量', () => {
     expect(volStateLabel('surge')).toBe('放量')
     expect(volStateLabel('shrink')).toBe('缩量')

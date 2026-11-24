@@ -1141,7 +1141,7 @@ export default function RegimeConfigPanel() {
                 value={form.tVolRatioMax} min={0} max={6} step={0.1} onChange={(v) => set({ tVolRatioMax: v })} />
               {/* §W-09：开关必须带标签。原先写的是 <ToggleSw label=…>，而 ToggleSw 不接 label，
                   屏上只剩下面那段说明——用户看不出这个开关管的是哪一件事，也没法用标签把它找出来。 */}
-              <SwitchRow label="T 行情门（牛/熊关闭做 T）"
+              <SwitchRow label="T 行情门（bull 关闭，bear 按侧策略放行）"
                 hint="默认**开**：只认盘整（range）行情，牛/熊一律不开新腿，已开的腿立即配平回到开腿前。它与「市场状态机」那个全局开关是两件事——后者一开会让全账户仓位乘 state_scales（震荡 ×0.70、熊 ×0.40），所以 T 用自己的开关，不动那个。读数超过 15 分钟没更新时本门**弃权**（不会静默把 T 关掉）"
                 checked={!!form.tRegimeGate}
                 onChange={(v) => set({ tRegimeGate: !!v })} />

@@ -96,8 +96,22 @@ func ApplyFlowBlend(res *SizingResult, sig combat_agent.Signal) {
 func ComputeSizingWithBlend(r Regime, sig combat_agent.Signal) SizingResult {
 	sig = withRegimeFlowDeltas(r, sig)
 	res := ComputeSizing(r, sig)
+	res.TargetMultiplier = TargetMultiplierForIntent(r.SidePolicy, "new")
+	res.SidePolicyMode = string(r.SidePolicy.Mode)
+	res.SidePolicyLevel = r.SidePolicy.Level
+	style := 1.0
+	if r.SidePolicy.Enabled {
+		switch sig.EntryStyle {
+		case "left":
+			style = r.SidePolicy.LeftWeight
+		case "right":
+			style = r.SidePolicy.RightWeight
+		}
+	}
+	res.StyleWeight = style
 	if !res.Downgrade {
 		ApplyFlowBlend(&res, sig)
+		res.FlowBlend = CombineSideWeight(res.FlowBlend, style)
 	}
 	return res
 }

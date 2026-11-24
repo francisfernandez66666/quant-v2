@@ -98,6 +98,20 @@ func TestPerTradePctOfBlendPositive(t *testing.T) {
 }
 
 // TestComputeSizingWithBlendNoDowngrade 硬拦（情绪冰点）时不叠加 blend：被拒买的单不谈金额调节。
+// TestComputeSizingWithBlendIncludesSideStyleOnce 定权结果是最终金额乘子，风格权重只合成一次。
+func TestComputeSizingWithBlendIncludesSideStyleOnce(t *testing.T) {
+	r := Regime{FlowMarketDelta: math.NaN(), FlowSectorDelta: math.NaN(), VolSurgeDelta: math.NaN(),
+		SidePolicy: SidePolicyState{Enabled: true, Mode: SidePolicyBear,
+			LeftWeight: 1.2, RightWeight: 0.8}}
+	s := flowSig(map[string]float64{MetaFlowMarketDelta: -1})
+	s.EntryStyle = "left"
+	res := ComputeSizingWithBlend(r, s)
+	if math.Abs(res.FlowBlend-0.96) > 1e-9 || math.Abs(res.StyleWeight-1.2) > 1e-9 {
+		t.Fatalf("flow=.8 and left=1.2 must combine once to .96, got blend=%.4f style=%.4f",
+			res.FlowBlend, res.StyleWeight)
+	}
+}
+
 func TestComputeSizingWithBlendNoDowngrade(t *testing.T) {
 	s := flowSig(map[string]float64{MetaFlowMarketDelta: 1})
 	res := ComputeSizingWithBlend(Regime{EmotionPhase: phaseIce}, s)

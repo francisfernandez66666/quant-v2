@@ -149,6 +149,17 @@ type Engine struct {
 	flowMoneyMu    sync.RWMutex       // 资金流缓存锁
 	sectorDeltaDay string             // sectorDeltaMap 所属北京日（跨日作废）
 	sectorDeltaMap map[string]float64 // 板块名 → 当日资金流 delta∈[-1,1]（缺=该板块弃权）
+	// §SIDE-POLICY-20261124：固定 30 分钟资金流桶、09:30 缺口、13:00 加急 latch 与载体快照。
+	dataDir           string
+	sideMu            sync.RWMutex
+	sideFlow          sideFlowState
+	sideState         signalctl.SidePolicyState
+	sideLatestPath    string
+	sideUrgentReqPath string
+	sideLastWrite     time.Time
+	sideLastBody      string
+	// sideLeftObs 强左侧连续观察按日、通道、代码与规则分键；只在侧策略启用时记录。
+	sideLeftObs map[string][]signalctl.SideObservation
 	// 可注入的资金流取数缝（nil→marketAPI 同名方法）；单测注入桩数据离线跑通。
 	indexMoneyFlowFn func() (*data.FlowDay, error)
 	sectorListFn     func() ([]data.SectorInfo, error)
@@ -870,6 +881,14 @@ func New(
 		newsGatePrevD1:    make(map[string]float64),
 		newsGateStrikes:   make(map[string]int),
 		newsGateStrikeDir: make(map[string]string),
+		dataDir:           dataDir,
+		sideFlow:          newSideFlowState(),
+		sideState: signalctl.SidePolicyState{Mode: signalctl.SidePolicyLegacy, AllowNew: true, AllowAdd: true,
+			TargetMultiplier: 1, LeftWeight: 1, RightWeight: 1, Reason: "side_policy_disabled"},
+	}
+	if dataDir != "" {
+		e.sideLatestPath = filepath.Join(dataDir, "side_policy_latest.json")
+		e.sideUrgentReqPath = filepath.Join(dataDir, "side_policy_urgent.req")
 	}
 	// §D-2（GAP_VERIFY_20260917_PM）裁定留痕落盘：JSONL 按日轮转 + 启动回灌当日环，
 	// quant 重启不再丢"为何没成交"的拦截原因。dataDir 空（纯内存测试路径）自动跳过；
@@ -1597,6 +1616,8 @@ func (e *Engine) filterPaperAdmitted(uid string, sigs []combat_agent.Signal, now
 		return sigs
 	}
 	pol := e.paperSignalPolicy(uid)
+	// 逐票风格权重在准入后挂到瞬态字段，随后经 OnSignals/fillLocked 原样透传；disabled 零操作。
+	e.annotateSideWeights(sigs, now)
 	decisions := e.SignalCtl().Evaluate(signalctl.ChannelPaper, uid, sigs, pol, now)
 	// §SIZING-EVO R1：paper 通道同样落结构化快照（与 live 同源同口径，只换 Channel）。
 	e.evoRecordDecisions(pol, decisions, sigs, "paper", uid, now)
@@ -1613,6 +1634,166 @@ func (e *Engine) filterPaperAdmitted(uid string, sigs []combat_agent.Signal, now
 		out = append(out, s)
 	}
 	return out
+}
+
+// currentSidePolicy 返回买入执行可用的侧策略状态。开关关闭时零操作；开关已开但当日状态
+// 尚未装配时 fail-closed，不能把初始化中的 disabled 零值当成放行许可。
+func (e *Engine) currentSidePolicy(now time.Time) signalctl.SidePolicyState {
+	st := e.SidePolicySnapshot()
+	if !e.sidePolicyEnabled() {
+		return signalctl.SidePolicyState{Mode: signalctl.SidePolicyLegacy, AllowNew: true, AllowAdd: true,
+			TargetMultiplier: 1, LeftWeight: 1, RightWeight: 1, Reason: "side_policy_disabled"}
+	}
+	day := data.TradingDayDate(now)
+	if !st.Enabled || st.Day != day {
+		return signalctl.FailClosedSidePolicy(day, now, "side_policy_state_missing")
+	}
+	return signalctl.ApplySidePolicyFreshness(st, now)
+}
+
+// sideStyleWeight 只把逐票风格权重挂到信号瞬态字段；账户级 FlowBlend 不被改写。
+func (e *Engine) sideStyleWeight(sig combat_agent.Signal, now time.Time) float64 {
+	st := e.currentSidePolicy(now)
+	if !st.Enabled {
+		return 0
+	}
+	weight := 1.0
+	switch sig.EntryStyle {
+	case "left":
+		weight = st.LeftWeight
+	case "right":
+		weight = st.RightWeight
+	}
+	return signalctl.CombineSideWeight(1, weight)
+}
+
+func (e *Engine) annotateSideWeights(sigs []combat_agent.Signal, now time.Time) {
+	if !e.sidePolicyEnabled() {
+		return
+	}
+	for i := range sigs {
+		if sigs[i].Action == "buy" && sigs[i].Direction != "做空" {
+			sigs[i].SideWeight = e.sideStyleWeight(sigs[i], now)
+		}
+	}
+}
+
+// observeSideLeft 复刻载体同规则连续观察：间隔不足的重复轮不写入，跨日自动分键。
+func (e *Engine) observeSideLeft(channel string, sig combat_agent.Signal, now time.Time) bool {
+	if !e.sidePolicyEnabled() || sig.EntryStyle != "left" || sig.StrategyID == "" {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	day := data.TradingDayDate(now)
+	key := day + "|" + channel + "|" + pureTsCode(sig.Code) + "|" + sig.StrategyID
+	gap := time.Duration(config.CarrierSideLeftStableGapSec() * float64(time.Second))
+	e.sideMu.Lock()
+	defer e.sideMu.Unlock()
+	if e.sideLeftObs == nil {
+		e.sideLeftObs = make(map[string][]signalctl.SideObservation)
+	}
+	for k := range e.sideLeftObs {
+		if !strings.HasPrefix(k, day+"|") {
+			delete(e.sideLeftObs, k)
+		}
+	}
+	seen := e.sideLeftObs[key]
+	if len(seen) == 0 || now.Sub(seen[len(seen)-1].At) >= gap {
+		seen = append(seen, signalctl.SideObservation{At: now, Score: sig.Score})
+		if len(seen) > config.CarrierSideLeftStableRounds() {
+			seen = seen[len(seen)-config.CarrierSideLeftStableRounds():]
+		}
+		e.sideLeftObs[key] = seen
+	}
+	return signalctl.StrongLeftSignal(signalctl.SideSignal{EntryStyle: sig.EntryStyle, Score: sig.Score, Threshold: sig.Threshold},
+		1, false, seen, now)
+}
+
+// sideHardEvidence 只认真实委托留痕：同日战略买入任意状态都建立 same_symbol_day 意图；
+// TP/TT 卖出任意状态都建立 tp_rebuy_block。没有账本或读取失败时证据不可得，调用方必须拒绝。
+func (e *Engine) sideHardEvidence(uid, code, day string) (tpFired, sameSymbolDay, available bool) {
+	e.mu.RLock()
+	st := e.realStore
+	e.mu.RUnlock()
+	if st == nil || uid == "" {
+		return false, false, false
+	}
+	rows, err := st.RealOrdersForUser(uid)
+	if err != nil {
+		return false, false, false
+	}
+	code = pureTsCode(code)
+	for _, o := range rows {
+		if pureTsCode(o.Code) != code {
+			continue
+		}
+		if o.SignalID == fmt.Sprintf("sell:%s:tp:%s", code, day) || o.SignalID == fmt.Sprintf("sell:%s:tt:%s", code, day) {
+			tpFired = true
+		}
+		if strings.HasPrefix(o.SignalID, "buy:") && strings.HasSuffix(o.SignalID, ":"+day) {
+			sameSymbolDay = true
+		}
+	}
+	return tpFired, sameSymbolDay, true
+}
+
+// liveSideHeldQty 只把真实持仓数量当 held；在途买单不是持仓，不能借此取得 L2 强左侧例外。
+func (e *Engine) liveSideHeldQty(uid, code string) (float64, bool) {
+	book := e.accountBookFor(uid)
+	if book.PositionsErr != nil {
+		return 0, false
+	}
+	for _, p := range book.Positions {
+		if pureTsCode(p.TsCode) == pureTsCode(code) && p.Qty > 0 {
+			return float64(p.Qty), true
+		}
+	}
+	return 0, true
+}
+
+// admitSideBuy 是 live/paper 自动买入共同的执行侧准入。disabled 时不读账本、不记观察、
+// 不写权重，保持旧行为；enabled 时硬闸证据不可达一律 fail-closed。
+func (e *Engine) admitSideBuy(uid string, sig combat_agent.Signal, intent string, heldQty float64, heldKnown bool,
+	now time.Time, channel string, paperSameDay bool) (bool, string) {
+	st := e.currentSidePolicy(now)
+	if !st.Enabled {
+		return true, ""
+	}
+	if !heldKnown {
+		return false, "side_policy_position_unknown"
+	}
+	day := data.TradingDayDate(now)
+	tpFired, sameDay, evidenceOK := e.sideHardEvidence(uid, sig.Code, day)
+	if !evidenceOK {
+		return false, "side_policy_evidence_unavailable"
+	}
+	stable := e.observeSideLeft(channel, sig, now)
+	ok, reason := signalctl.BuyAdmission(st, intent, heldQty,
+		signalctl.SideSignal{EntryStyle: sig.EntryStyle, Score: sig.Score, Threshold: sig.Threshold},
+		tpFired, sameDay || paperSameDay || e.reservedSymbolToday(uid, sig.Code, day), stable)
+	if !ok {
+		e.mu.Lock()
+		if e.liveDecisions == nil {
+			e.liveDecisions = make(map[string]signalctl.Decision)
+		}
+		e.liveDecisions[liveDecisionKey(sig.Code, signalctl.StrategyKeyOf(sig))] = signalctl.Decision{
+			Channel: signalctl.Channel(channel), Account: uid, Verdict: signalctl.VerdictBlock,
+			Stage: "side_policy", Code: sig.Code, Name: sig.Name, Strategy: sig.Strategy,
+			SKey: signalctl.StrategyKeyOf(sig), Reason: reason, At: now,
+		}
+		e.mu.Unlock()
+	}
+	return ok, reason
+}
+
+// paperSideAdmission 给纸面执行器的同型回调；paperSameDay 来自纸面自己的自动委托留痕，
+// TP 仍只读实盘柜台证据，绝不从纸面 Reason 文本伪造 TP 来源。
+func (e *Engine) paperSideAdmission(uid string) paper.BuyAdmissionFunc {
+	return func(sig combat_agent.Signal, intent string, heldQty float64, sameDay bool, now time.Time) (bool, string) {
+		return e.admitSideBuy(uid, sig, intent, heldQty, true, now, "paper", sameDay)
+	}
 }
 
 // SignalVerdicts 返回本引擎信号控制器的最近裁定留痕（审计端点用）。
@@ -1748,6 +1929,8 @@ type dynBudgetCtx struct {
 	// FlowBlend §FLOW-BLEND 后置金额乘子（0.80~1.20，默认 1.0）。定权层算、执行层用同一值；
 	// 0=未注入（兜底按 1.0，见 hasSplit/下文取值），不把"没传"当成缩额。
 	FlowBlend float64
+	// TargetMultiplier 侧策略战略目标乘子；0=未注入=1.0，T 调用恒传 1.0。
+	TargetMultiplier float64
 	// QuadrantDecision/Reason §FLOW-QUADRANT 四象限决策（由 Decision 带出，传给风控最后一道闸）。
 	// "block_buy"=禁抄底/禁加仓→拒单；空=不拦。
 	QuadrantDecision string
@@ -1761,6 +1944,13 @@ type dynBudgetCtx struct {
 
 // hasSplit 是否带了有效拆分读数。
 func (c dynBudgetCtx) hasSplit() bool { return c.MarketScale > 0 && c.StockScale > 0 }
+
+func (c dynBudgetCtx) targetMultiplier() float64 {
+	if c.TargetMultiplier <= 0 || math.IsNaN(c.TargetMultiplier) {
+		return 1.0
+	}
+	return c.TargetMultiplier
+}
 
 // shadowTargetRatio 影子期的目标仓位读数基准（固定 50%）。
 // 影子模式的定义是"只留痕不执法"，但留痕必须有个可比较的目标值；用真实 MS 会让影子与正式
@@ -2083,8 +2273,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	// （执法 fail-closed 不买、卡片必须有读数），见 §W-06「另外两处差异」。
 	// 注意：marketScale 未做 min(ceiling) —— 这一步在函数里做（math.Min 只允许一处）。
 	out.PendingNote = pendingBuysNote(pend)
-	targetVal, curStrat, room, _ := fundsTargetCurRoom(
-		total, marketScale, ceiling, posByCode, posPrices, pend, book)
+	targetVal, curStrat, room, _ := fundsTargetCurRoomWithMultiplier(
+		total, marketScale, ceiling, ctx.targetMultiplier(), posByCode, posPrices, pend, book)
 	// §P0-5（2026-10-30）：扣掉"已定量、还没落库"的同轮预占。
 	// 不加这一句，同一轮的多笔信号会各自按同一份余额定量，合计穿透目标仓位
 	// （当天实测：三笔 52,497 对剩余 40,915，最终超目标 11,616）。
@@ -2270,6 +2460,15 @@ func (e *Engine) persistDynBuyDecision(sig combat_agent.Signal, d *dynBuyReadout
 	})
 }
 
+// executionFlowBlend 只负责标定权重归属：生产定权链已把风格权重合成进 FlowBlend，
+// legacy 未注入分支才补乘一次，避免同一笔金额在两层重复计权。
+func executionFlowBlend(ctx dynBudgetCtx, styleWeight float64) float64 {
+	if ctx.hasSplit() {
+		return ctx.FlowBlend
+	}
+	return signalctl.CombineSideWeight(ctx.FlowBlend, styleWeight)
+}
+
 // autoPlaceScaled §DYN-SIZE 执行层入口（带动态仓位缩放）。
 //
 // buyScale：信号控制器给出的缩放系数（0=未定权，按基准金额；1.0=中性）。
@@ -2298,6 +2497,29 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 		})
 		return
 	}
+	// §SIDE-POLICY：资金发送前的最后一道买入准入。持仓只认本票 Qty>0，在途买单不算 held；
+	// 硬闸证据不可得时明确拒绝，不用虚假的“当日无止盈”兜底放行。
+	uid := e.budgetUID()
+	if e.sidePolicyEnabled() {
+		heldQty, heldKnown := e.liveSideHeldQty(uid, sig.Code)
+		intent := "new"
+		if heldQty > 0 {
+			intent = "add"
+		}
+		if ok, reason := e.admitSideBuy(uid, sig, intent, heldQty, heldKnown, time.Now(), "live", false); !ok {
+			log.Printf("[qmt-gate] %s(%s) 自动买入跳过: %s", sig.Code, sig.Name, reason)
+			opslog.DayOnce("side-policy:"+reason+":"+sig.Code, func() {
+				opslog.Logf("quant", "侧策略自动买入跳过 %s(%s) 原因=%s", sig.Code, sig.Name, reason)
+			})
+			return
+		}
+		sig.SideWeight = e.sideStyleWeight(sig, time.Now())
+	} else {
+		sig.SideWeight = 0 // disabled 不允许外部瞬态旧值继续影响金额
+	}
+	// 定权分支的 Decision.FlowBlend 已含风格权重，执行层不得再乘一次；
+	// 只有未注入拆分读数的 legacy 分支才在这里补齐一次合成。
+	ctx.FlowBlend = executionFlowBlend(ctx, sig.SideWeight)
 	// §EXT-BRAIN-1104 外脑模式买入闸（11-05 券商断 QMT 内置策略的文件/网络之后的安全垫）。
 	// 口径：档 2（读不到柜台）/档 3（通道断）/档 4（显式影子态）时**只停开新仓**，
 	// 卖出腿（止损/止盈/清仓）原样走既有熔断链——再叠一层只会挡住本来该出的货。
@@ -2517,6 +2739,12 @@ func (e *Engine) autoPlaceScaled(sig combat_agent.Signal, live map[string]*data.
 				opslog.Logf("quant", "§DYN-SIZE 动态缩放 %s(%s) 预算=%.0f→%.0f 系数=%.3f 策略=%s/%s",
 					sig.Code, sig.Name, orig, amount, buyScale, sig.StrategyID, sig.Strategy)
 			})
+		}
+		// legacy 金额路径同样消费账户级 FlowBlend；逐票 StyleWeight 已在入口合成进 ctx。
+		if blend := ctx.FlowBlend; blend > 0 && !math.IsNaN(blend) && blend != 1.0 {
+			orig := amount
+			amount *= blend
+			log.Printf("[qmt] %s(%s) §FLOW-BLEND legacy 金额 %.0f→%.0f（系数%.3f）", sig.Code, sig.Name, orig, amount, blend)
 		}
 	}
 	// §MARKET_RISK_GATE P4 auto-buy 谨慎层（默认关闭，裁决④）：真金白银下单层的第二道风险闸——
@@ -7228,6 +7456,7 @@ func (e *Engine) fillFlowReadings(r *signalctl.Regime, now time.Time) {
 	if cached != nil && now.Sub(cachedAt) < flowFactorTTL && cached.TradeDate == today {
 		row.RYest, row.RMa5, row.VolSurgeDelta = cached.RYest, cached.RMa5, cached.VolSurgeDelta
 		applyFlowRow(r, row, today)
+		e.updateSidePolicy(now, r)
 		return
 	}
 
@@ -7244,11 +7473,14 @@ func (e *Engine) fillFlowReadings(r *signalctl.Regime, now time.Time) {
 			}
 		}
 	}
-	// 两块都无有效读数 → 不装配，Regime 保持零值弃权（与旧实现"无源 return"一致，零行为变更）。
+	// 两块都无有效读数时不装配既有量能/资金流字段，但侧策略仍须推进：
+	// 指数缺口可能独立有效，且全部关键输入缺失时必须在本地 fail-closed，不能随早退静默。
 	if row.RYest == nil && row.FlowMarketDelta == nil && row.FlowSectorDelta == nil {
+		e.updateSidePolicy(now, r)
 		return
 	}
 	applyFlowRow(r, row, today)
+	e.updateSidePolicy(now, r)
 }
 
 // flowFactorTTL 量比腿盘中取数缓存 TTL（对齐 indexChangePctNow 的 30s 短 TTL）。
@@ -7273,6 +7505,7 @@ func (e *Engine) seedFlowVolume(now time.Time) *store.FlowFactorDailyRow {
 	if err != nil || len(series) < 6 {
 		return nil // 三源两指数都取不到/不足 6 根/末根断更：弃权
 	}
+	e.observeSideGapSeries(now, series, today)
 	last := series[len(series)-1]
 	if last.TradeDate != today {
 		return nil // 断更（日 K 最后一根不是今日）→ 弃权，绝不拿旧额冒充当日
@@ -7419,12 +7652,15 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 		if len(fd.Date) < 10 || fd.Date[:10] != today {
 			log.Printf("[engine] §FLOW-MONEY 大盘 fflow 日期非今日（%s），弃权", fd.Date)
 		} else if amtFn := e.amountSeriesFnOrDefault(); amtFn != nil {
-			if series, _, serr := amtFn(2, today); serr == nil && len(series) >= 2 {
+			if series, label, serr := amtFn(2, today); serr == nil && len(series) >= 2 && data.IndexAmountIsCNY(label) {
 				amt := series[len(series)-1].Amount
 				d := signalctl.FlowPctToDelta(fd.MainNet, amt)
 				if !math.IsNaN(d) {
 					pct := fd.MainNet / amt * 100
 					mktPct, mktDelta = &pct, &d
+					e.sideMu.Lock()
+					e.sideFlow.observe(now, sideFlowSample{Net: fd.MainNet, Amount: amt, Source: label, At: now}, d)
+					e.sideMu.Unlock()
 				}
 			}
 		}

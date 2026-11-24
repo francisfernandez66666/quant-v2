@@ -337,6 +337,9 @@ type RuntimeConfig struct {
 	// It doubles consult call/token spend and adds serial latency, so it must be flip-able without
 	// a redeploy; every failure path silently falls back to the main answer.
 	ConsultDataRound *bool `json:"consult_data_round,omitempty"`
+	// SidePolicyEnabled §SIDE-POLICY-20261124：熊市左右侧比例总闸。nil=false；
+	// 显式 true 才启用新增准入、目标乘子、T bear 条件放行与加急发布。
+	SidePolicyEnabled *bool `json:"side_policy_enabled,omitempty"`
 	// IndexFallbackSources §INDEX-BLIND（2026-11-02 owner 裁决「出厂即开」）：大盘指数实时不再只吃东财一族，
 	// 主链失败后依次试新浪、腾讯的**指数专用**腿（指数字段位次与个股逐位相同，但市场前缀必须独立判定）。
 	// 成因是现网读数，不是设想：11-02 东财 push2/push2delay 对这台机器间歇 TLS 重置（EOF），
@@ -431,6 +434,11 @@ func (r RuntimeConfig) QuoteHubConsultOn() bool { return feedOn(r.QuoteHubConsul
 // English: whether the consult supplement round runs; same pointer semantics as the feed
 // switches (absent = on), but it only governs an extra LLM call, never quote assembly.
 func (r RuntimeConfig) ConsultDataRoundOn() bool { return feedOn(r.ConsultDataRound) }
+
+// SidePolicyEnabledOn 返回熊市左右侧策略是否启用；未配置=关，显式 true 才开。
+func (r RuntimeConfig) SidePolicyEnabledOn() bool {
+	return r.SidePolicyEnabled != nil && *r.SidePolicyEnabled
+}
 
 // IndexFallbackSourcesOn 指数实时是否允许多源兜底（缺省开，§INDEX-BLIND）。
 func (r RuntimeConfig) IndexFallbackSourcesOn() bool { return feedOn(r.IndexFallbackSources) }

@@ -21,12 +21,62 @@
 package server
 
 import (
+	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/signalctl"
 )
+
+// readSidePolicyStatus 只读侧策略快照，并在读面统一应用新鲜度闸。
+// known 只表示"当日快照可解析"；disabled/stale/known 三态由 enabled/stale/status 明确区分。
+func readSidePolicyStatus(dir, day string, now time.Time) map[string]interface{} {
+	out := map[string]interface{}{"known": false, "enabled": false, "stale": false, "status": "unknown"}
+	if dir == "" {
+		return out
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "side_policy_latest.json"))
+	if err != nil {
+		return out
+	}
+	var st signalctl.SidePolicyState
+	if json.Unmarshal(raw, &st) != nil || st.Day != strings.ReplaceAll(day, "-", "") {
+		return out
+	}
+	out["known"] = true
+	out["reason"] = st.Reason
+	if !st.Enabled {
+		// 未启用不是弃权，也不下发 neutral 乘子，避免前端把 ×1.00 画成"策略正在生效"。
+		out["status"] = "disabled"
+		out["mode"] = string(signalctl.SidePolicyLegacy)
+		return out
+	}
+	st = signalctl.ApplySidePolicyFreshness(st, now)
+	stale := st.Reason == "side_policy_stale" || st.Reason == "side_policy_asof_missing" || st.Reason == "side_policy_asof_invalid"
+	out["enabled"] = true
+	out["stale"] = stale
+	if stale {
+		out["status"] = "stale"
+	} else {
+		out["status"] = "known"
+	}
+	out["mode"] = string(st.Mode)
+	out["level"] = st.Level
+	out["allow_new"] = st.AllowNew
+	out["allow_add"] = st.AllowAdd
+	out["target_multiplier"] = st.TargetMultiplier
+	out["left_weight"] = st.LeftWeight
+	out["right_weight"] = st.RightWeight
+	out["slope_delta"] = st.SlopeDelta
+	out["gap_pct"] = st.GapPct
+	out["latch_active"] = st.Latch.Kind == "no_new" && st.LatchUntilUnix > now.Unix()
+	out["reason"] = st.Reason
+	return out
+}
 
 // flowNullF *float64 → float64：nil（SQL NULL / 弃权）→ NaN，其余原样。
 // 用 NaN 而不是 0 进 FlowBlendPreview，才能在预览里把"这条腿没读数"与"这条腿是平量"分开。
@@ -68,9 +118,10 @@ func flowNullF(p *float64) float64 {
 func (s *Server) flowStatusReadout(now time.Time) map[string]interface{} {
 	day := cntime.DayOf(now)
 	out := map[string]interface{}{
-		"available": s.researchDB != nil,
-		"day":       day,
-		"known":     false,
+		"available":   s.researchDB != nil,
+		"day":         day,
+		"known":       false,
+		"side_policy": readSidePolicyStatus(s.researchDir, day, now),
 	}
 	if s.researchDB == nil {
 		return out

@@ -21,8 +21,10 @@
 """
 
 import argparse
+import ast
 import base64
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -37,6 +39,13 @@ OWNER_UID = os.environ.get("OWNER_UID", "u_1785377969825355000")  # admin，物�
 CARRIER_DIR = os.environ.get("CARRIER_DIR", "/opt/quant/friend-pkg/carrier")
 STATE = os.environ.get("HOTRELOAD_STATE", "/var/lib/quant-trading-v2/carrier_hotreload_gz.sha")
 BASE_URL = os.environ.get("BASE_URL", "https://quant-trading.top")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+SIDE_POLICY_LATEST = os.path.join(DATA_DIR, "side_policy_latest.json")
+SIDE_POLICY_REQ = os.path.join(DATA_DIR, "side_policy_urgent.req")
+SIDE_POLICY_PENDING = os.path.join(DATA_DIR, "side_policy_urgent.pending.json")
+SIDE_POLICY_ACK = os.path.join(DATA_DIR, "side_policy_urgent.ack")
+CARRIER_ACK_HISTORY = os.path.join(DATA_DIR, "carrier_ack_history.jsonl")
+HOTRELOAD_LOCK = os.path.join(DATA_DIR, "carrier_hotreload.lock")
 
 AUTH = os.path.join(DATA_DIR, "auth.json")
 APPLIED = os.path.join(DATA_DIR, "applied_factors.json")
@@ -105,6 +114,8 @@ RUNTIME_PARAM_KEYS = frozenset((
     # §FLOW-SNAPSHOT：30 分钟重算的资金流快照（大盘/板块 delta + 市场状态/仓位档），
     # 由 bake_flow_snapshot 每轮重算写入，永远是运行态而非静态旋钮。
     "flow_snapshot",
+    # §SIDE-POLICY：云端侧策略快照（含 13:00 latch 与进攻态 freshness epoch）。
+    "side_policy",
     # §FLOW-SECTOR-JOIN：板块逐票连接键（code -> 东财板块名）。**必须是东财板块名**，
     # 不能用 industry_map（证监会门类，与 sector_delta 的键交集为空）。今日云端还没有
     # 生产者 ⇒ 载体弃权并把命中率打进小时读数；等 owner 裁决取板块成分的那条路后再填。
@@ -1057,7 +1068,7 @@ def ssh_intraday_trigger(ver):
                          "C:\\qmt\\quant-trading-v2\\qmt_gateway\\carrier_run.ps1")
     if not os.path.exists(key):
         print("HOTRELOAD_SSH_SKIP reason=no_key path=%s" % key)
-        return
+        return False
     ps = ('powershell -NoProfile -ExecutionPolicy Bypass -File "%s" -Intraday' % ps1)
     b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
@@ -1068,8 +1079,10 @@ def ssh_intraday_trigger(ver):
         tail = (r.stdout + r.stderr).strip().splitlines()
         print("HOTRELOAD_SSH_TRIGGER version=%s rc=%d %s" % (
             ver, r.returncode, tail[-1][:160] if tail else ""))
+        return r.returncode == 0
     except Exception as exc:  # noqa: BLE001 — 兜底腿失败不影响已发布产物
         print("HOTRELOAD_SSH_TRIGGER_FAIL version=%s %s" % (ver, repr(exc)[:120]))
+        return False
 
 
 def scrub(o):
@@ -1092,6 +1105,11 @@ def rebuild_snapshots(qc, rules, wl):
     now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     by = {r["id"]: r for r in rules if isinstance(r, dict) and r.get("id")}
     sel = [by[i] for i in wl if i in by]
+    # SIDE-POLICY compatibility migration: old applied_factors entries have no style.
+    # fac_118 is the single real scored-left producer; all others stay unclassified.
+    for rule in sel:
+        if not rule.get("entry_style"):
+            rule["entry_style"] = "left" if rule.get("id") == "fac_118" else "unclassified"
 
     d2 = json.load(open(os.path.join(qg, "strategy_switches_snapshot.json"), encoding="utf-8"))
     d2["enabled_strategies"] = wl
@@ -1184,12 +1202,203 @@ def publish_gateway_files():
         print("HOTRELOAD_GATEWAY_SYNC manifest_fail=%s" % exc.__class__.__name__)
     return out
 
-def main():
+def _read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def _atomic_json(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(value, fh, ensure_ascii=True, sort_keys=True, indent=2)
+    os.replace(tmp, path)
+
+
+def runtime_side_policy_enabled():
+    root = _read_json(CONFIG_PATH, {}) or {}
+    runtime = ((root.get("rules") or {}).get("runtime") or {})
+    return bool(runtime.get("side_policy_enabled"))
+
+
+def side_policy_digest(snapshot):
+    if not isinstance(snapshot, dict) or not snapshot.get("day"):
+        return ""
+    body = {k: snapshot.get(k) for k in (
+        "day", "enabled", "mode", "level", "allow_new", "allow_add",
+        "target_multiplier", "left_weight", "right_weight", "freshness_epoch", "reason")}
+    latch = snapshot.get("latch") or {}
+    body["latch"] = {k: latch.get(k) for k in ("kind", "until", "reason")}
+    return hashlib.sha256(json.dumps(body, ensure_ascii=True, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _latch_active(snapshot, now):
+    if not isinstance(snapshot, dict) or snapshot.get("day") != now.strftime("%Y%m%d"):
+        return False
+    latch = snapshot.get("latch") or {}
+    try:
+        return latch.get("kind") == "no_new" and float(snapshot.get("latch_until_ts") or latch.get("until_ts") or 0) > now.timestamp()
+    except (TypeError, ValueError):
+        return False
+
+
+def merge_side_policy(current, latest, request, now):
+    """Regular state plus sticky 13:00 latch; urgent request always wins until 14:00."""
+    base = dict(latest if isinstance(latest, dict) and latest else (current if isinstance(current, dict) else {}))
+    applied_request = False
+    if isinstance(request, dict) and request.get("day") == now.strftime("%Y%m%d") and request.get("kind") == "no_new":
+        until = request.get("until") or "14:00"
+        try:
+            hh, mm = [int(x) for x in until.split(":")]
+            until_ts = now.replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp()
+        except (TypeError, ValueError):
+            until_ts = now.replace(hour=14, minute=0, second=0, microsecond=0).timestamp()
+        if until_ts > now.timestamp():
+            base["latch"] = {"kind": "no_new", "until": until,
+                             "reason": request.get("reason") or "pm1300_urgent"}
+            base["latch_until_ts"] = until_ts
+            base["allow_new"] = False
+            base["reason"] = "pm1300_latch"
+            applied_request = True
+    if not applied_request and _latch_active(current, now):
+        base["latch"] = (current or {}).get("latch") or {}
+        base["latch_until_ts"] = (current or {}).get("latch_until_ts") or 0
+        base["allow_new"] = False
+        base["reason"] = "pm1300_latch"
+    return base
+
+
+def _ack_history():
+    out = []
+    try:
+        with open(CARRIER_ACK_HISTORY, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def reap_side_policy_requests(now=None):
+    now = now or datetime.datetime.now().astimezone()
+    pending = _read_json(SIDE_POLICY_PENDING, {}) or {}
+    request = _read_json(SIDE_POLICY_REQ, {}) or {}
+    if not pending or not request:
+        return False
+    acked = {str(row.get("version")) for row in _ack_history()
+             if row.get("ok") is True and str(row.get("version") or "")}
+    req_id = str(request.get("request_id") or "")
+    version = str(pending.get(req_id) or "")
+    if not version or version not in acked:
+        return False
+    ack = {"request_id": req_id, "version": version, "ok": True,
+           "at": now.isoformat(timespec="seconds")}
+    _atomic_json(SIDE_POLICY_ACK, ack)
+    # Persist the pending removal first. If either write fails, req remains the
+    # retry authority and a later round can safely repeat this idempotent reap.
+    pending.pop(req_id, None)
+    _atomic_json(SIDE_POLICY_PENDING, pending)
+    try:
+        os.remove(SIDE_POLICY_REQ)
+    except OSError:
+        pending[req_id] = version
+        _atomic_json(SIDE_POLICY_PENDING, pending)
+        raise
+    print("HOTRELOAD_SIDE_POLICY_REAP request_id=%s version=%s" % (req_id, version))
+    return True
+
+
+def retry_pending_side_policy():
+    pending = _read_json(SIDE_POLICY_PENDING, {}) or {}
+    request = _read_json(SIDE_POLICY_REQ, {}) or {}
+    req_id = str(request.get("request_id") or "")
+    version = str(pending.get(req_id) or "")
+    if not req_id or not version:
+        return False
+    ok = ssh_intraday_trigger(version)
+    print("HOTRELOAD_SIDE_POLICY_RETRY request_id=%s version=%s rc=%d" % (req_id, version, 0 if ok else 1))
+    return ok
+
+
+def side_request_latch(request):
+    """The exact four fields that must survive into the published payload."""
+    if not isinstance(request, dict):
+        return None
+    values = (request.get("day"), request.get("kind"),
+              request.get("until") or "14:00", request.get("reason") or "pm1300_urgent")
+    if not all(isinstance(value, str) and value for value in values):
+        return None
+    return values
+
+
+def published_side_policy(version):
+    """Read PARAMS from the exact published artifact without executing carrier code."""
+    if not isinstance(version, str) or not version or os.path.basename(version) != version:
+        return None
+    path = os.path.join(CARRIER_DIR, "qmt_internal_strategy_%s.py" % version)
+    tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not any(
+                isinstance(target, ast.Name) and target.id == "PARAMS" for target in node.targets):
+            continue
+        params = ast.literal_eval(node.value)
+        return params if isinstance(params, dict) else None
+    return None
+
+
+def early_retry_side_policy(request, now):
+    """Return None when the published payload lost this latch and must be rebaked."""
+    latch = side_request_latch(request)
+    req_id = str(request.get("request_id") or "") if isinstance(request, dict) else ""
+    if not latch or not req_id:
+        print("HOTRELOAD_SIDE_POLICY_REQUEST_INVALID")
+        return False
+    manifest_path = os.path.join(DATA_DIR, "accounts", OWNER_UID, "carrier_manifest.json")
+    manifest = _read_json(manifest_path, {}) or {}
+    version = manifest.get("strategy_version")
+    if not isinstance(version, str) or not version:
+        print("HOTRELOAD_SIDE_POLICY_MANIFEST_UNKNOWN request_id=%s" % req_id)
+        return False
+    try:
+        params = published_side_policy(version)
+    except (OSError, ValueError, SyntaxError) as exc:
+        print("HOTRELOAD_SIDE_POLICY_PAYLOAD_UNREADABLE version=%s error=%s" % (
+            version, exc.__class__.__name__))
+        return None
+    snapshot = params.get("side_policy") if isinstance(params, dict) else None
+    actual = None
+    if isinstance(snapshot, dict) and params.get("side_policy_enabled") is True:
+        row = snapshot.get("latch") or {}
+        candidate = (snapshot.get("day"), row.get("kind"), row.get("until"), row.get("reason"))
+        if all(isinstance(value, str) and value for value in candidate):
+            actual = candidate
+    if actual != latch:
+        print("HOTRELOAD_SIDE_POLICY_REBAKE request_id=%s version=%s reason=latch_mismatch" % (
+            req_id, version))
+        return None
+    pending = _read_json(SIDE_POLICY_PENDING, {}) or {}
+    if pending.get(req_id) != version:
+        pending[req_id] = version
+        _atomic_json(SIDE_POLICY_PENDING, pending)
+        print("HOTRELOAD_SIDE_POLICY_REBIND request_id=%s version=%s" % (req_id, version))
+    # An applied ACK may have arrived before this rebind; consume it before SSH.
+    if reap_side_policy_requests(now):
+        return True
+    return retry_pending_side_policy()
+
+
+def _main_impl():
     """烘焙发布主流程：快照重建 → 双派生（漂移 ABORT）→ 利空归因/利好池/D1 资讯闸
     烘参 → 版本 bump → 10 闸构建 → 发布产物+manifest → SSH 兜底触发。sha 无变化
     时 NOTHING_TO_DO 幂等空轮；--force 跳过 sha 比对（事故恢复/试点实测用）。"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true", help="skip sha compare")
+    ap.add_argument("--urgent-side-policy", action="store_true", help="process 13:00 side-policy request immediately")
     args = ap.parse_args()
 
     if not os.path.isdir(BUILD_DIR):
@@ -1203,58 +1412,59 @@ def main():
     except Exception as exc:  # noqa: BLE001 - 同步失败不许阻断载体烘焙
         print("HOTRELOAD_GATEWAY_SYNC_FAIL %s" % exc.__class__.__name__)
 
-    # §B 自动补推（2026-11-11 owner 要求）：precalc 缺当日 / 覆盖率<80% ⇒ 自动补跑一次
-    # pregen（限频：每小时最多一次，重试时间戳落 precalc_retry_ts），失败不阻断热更
-    # （pregen 自带 ntfy 通知与连续失败计数）。
-    try:
-        st_path = "qmt_gateway/precalc_status.json"
-        st = {}
-        if os.path.exists(st_path):
-            with open(st_path, "r", encoding="utf-8") as fh:
-                st = json.load(fh)
-        today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
-        stale = st.get("day") != today or int(st.get("coverage") or 0) < 80
-        retry_ts_path = "qmt_gateway/precalc_retry_ts"
-        last_retry = 0.0
-        if os.path.exists(retry_ts_path):
-            with open(retry_ts_path, "r", encoding="utf-8") as fh:
-                last_retry = float(fh.read().strip() or 0)
-        now_ts = datetime.datetime.now().astimezone().timestamp()
-        if stale and now_ts - last_retry > 3600:
-            r = subprocess.run(["python3", "scripts/pregen_carrier_factors_gz.py"],
-                               cwd=BUILD_DIR, capture_output=True, text=True, timeout=900)
-            with open(retry_ts_path, "w", encoding="utf-8") as fh:
-                fh.write(str(now_ts))
-            tail = (r.stdout + r.stderr).strip().splitlines()
-            print("HOTRELOAD_DATARETRY rc=%d %s" % (r.returncode, tail[0] if tail else ""))
-    except Exception as exc:  # noqa: BLE001 - 补推失败不阻断热更
-        print("HOTRELOAD_DATARETRY_FAIL %s" % repr(exc)[:100])
-
-    # §FLOW-SECTOR-JOIN（owner 2026-11-20 裁决 A）：板块逐票连接键当日缺失 ⇒ 补跑一次生产者。
-    # 生产者要经盒子中继逐板块取成分（几百次请求、分钟级），所以**限频 30 分钟**且失败不阻断
-    # 热更——今天取不到就弃权（blend renormalize 到 大盘+量能），绝不留宿昨天的成分表。
-    try:
-        _meta, _mapping = load_sector_map()
-        if not _mapping:
-            _retry_path = os.path.join(BUILD_DIR, "qmt_gateway", "sector_map_retry_ts")
-            _last = 0.0
-            if os.path.exists(_retry_path):
-                try:
-                    with open(_retry_path, "r", encoding="utf-8") as fh:
-                        _last = float(fh.read().strip() or 0)
-                except (OSError, ValueError):
-                    _last = 0.0
-            _now = datetime.datetime.now().astimezone().timestamp()
-            if _now - _last > 1800:
-                r = subprocess.run(["python3", "scripts/pregen_sector_map_gz.py"],
-                                   cwd=BUILD_DIR, capture_output=True, text=True, timeout=600)
-                with open(_retry_path, "w", encoding="utf-8") as fh:
-                    fh.write(str(_now))
+    if not args.urgent_side_policy:
+        # §B 自动补推（2026-11-11 owner 要求）：precalc 缺当日 / 覆盖率<80% ⇒ 自动补跑一次
+        # pregen（限频：每小时最多一次，重试时间戳落 precalc_retry_ts），失败不阻断热更
+        # （pregen 自带 ntfy 通知与连续失败计数）。
+        try:
+            st_path = "qmt_gateway/precalc_status.json"
+            st = {}
+            if os.path.exists(st_path):
+                with open(st_path, "r", encoding="utf-8") as fh:
+                    st = json.load(fh)
+            today = datetime.datetime.now().astimezone().strftime("%Y%m%d")
+            stale = st.get("day") != today or int(st.get("coverage") or 0) < 80
+            retry_ts_path = "qmt_gateway/precalc_retry_ts"
+            last_retry = 0.0
+            if os.path.exists(retry_ts_path):
+                with open(retry_ts_path, "r", encoding="utf-8") as fh:
+                    last_retry = float(fh.read().strip() or 0)
+            now_ts = datetime.datetime.now().astimezone().timestamp()
+            if stale and now_ts - last_retry > 3600:
+                r = subprocess.run(["python3", "scripts/pregen_carrier_factors_gz.py"],
+                                   cwd=BUILD_DIR, capture_output=True, text=True, timeout=900)
+                with open(retry_ts_path, "w", encoding="utf-8") as fh:
+                    fh.write(str(now_ts))
                 tail = (r.stdout + r.stderr).strip().splitlines()
-                print("HOTRELOAD_SECTOR_MAP rc=%d %s" % (
-                    r.returncode, tail[-1] if tail else ""))
-    except Exception as exc:  # noqa: BLE001 - 取不到成分表不阻断热更
-        print("HOTRELOAD_SECTOR_MAP_FAIL %s" % repr(exc)[:100])
+                print("HOTRELOAD_DATARETRY rc=%d %s" % (r.returncode, tail[0] if tail else ""))
+        except Exception as exc:  # noqa: BLE001 - 补推失败不阻断热更
+            print("HOTRELOAD_DATARETRY_FAIL %s" % repr(exc)[:100])
+
+        # §FLOW-SECTOR-JOIN（owner 2026-11-20 裁决 A）：板块逐票连接键当日缺失 ⇒ 补跑一次生产者。
+        # 生产者要经盒子中继逐板块取成分（几百次请求、分钟级），所以**限频 30 分钟**且失败不阻断
+        # 热更——今天取不到就弃权（blend renormalize 到 大盘+量能），绝不留宿昨天的成分表。
+        try:
+            _meta, _mapping = load_sector_map()
+            if not _mapping:
+                _retry_path = os.path.join(BUILD_DIR, "qmt_gateway", "sector_map_retry_ts")
+                _last = 0.0
+                if os.path.exists(_retry_path):
+                    try:
+                        with open(_retry_path, "r", encoding="utf-8") as fh:
+                            _last = float(fh.read().strip() or 0)
+                    except (OSError, ValueError):
+                        _last = 0.0
+                _now = datetime.datetime.now().astimezone().timestamp()
+                if _now - _last > 1800:
+                    r = subprocess.run(["python3", "scripts/pregen_sector_map_gz.py"],
+                                       cwd=BUILD_DIR, capture_output=True, text=True, timeout=600)
+                    with open(_retry_path, "w", encoding="utf-8") as fh:
+                        fh.write(str(_now))
+                    tail = (r.stdout + r.stderr).strip().splitlines()
+                    print("HOTRELOAD_SECTOR_MAP rc=%d %s" % (
+                        r.returncode, tail[-1] if tail else ""))
+        except Exception as exc:  # noqa: BLE001 - 取不到成分表不阻断热更
+            print("HOTRELOAD_SECTOR_MAP_FAIL %s" % repr(exc)[:100])
 
     qc, rules = load_live()
     wl = (qc.get("qmt", {}) or {}).get("strategies") or []
@@ -1296,6 +1506,22 @@ def main():
     # 盒子上永远拿不到新的 delta（与当日利空归因、T 锚点同一条纪律）。
     flow_snapshot, flow_changed = bake_flow_snapshot()
     flow_digest = flow_snapshot_digest(flow_snapshot)
+    # §SIDE-POLICY：常规轮读 latest；13:00 req 把 no-new latch 粘到 14:00。
+    runtime_side_enabled = runtime_side_policy_enabled()
+    current_side = (_read_json(os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_params.json"), {}) or {}).get("params", {}).get("side_policy") or {}
+    latest_side = _read_json(SIDE_POLICY_LATEST, {}) or {}
+    side_request = _read_json(SIDE_POLICY_REQ, {}) or {}
+    side_policy = merge_side_policy(current_side, latest_side, side_request, datetime.datetime.now().astimezone())
+    side_policy["enabled"] = runtime_side_enabled
+    side_digest = side_policy_digest(side_policy)
+    current_side_digest = side_policy_digest(current_side)
+    side_changed = side_digest != current_side_digest or bool(current_side.get("enabled")) != runtime_side_enabled
+    if side_request and not runtime_side_enabled:
+        try:
+            os.remove(SIDE_POLICY_REQ)
+        except OSError:
+            pass
+        side_request = {}
     # §TP-LADDER-20261124：每只持仓的止盈梯子起点。同样在 sha 之前算——新开仓、
     # "已经卖过一半"这两种变化都必须触发重烘，否则载体阶梯停在旧阶段（会把剩下的
     # 一半再卖一次，或永远不卖）。sha 里只放**静态三元组**：峰值每天都在变，把它算进
@@ -1329,6 +1555,8 @@ def main():
                           # §FLOW-SNAPSHOT：资金流快照（量化后的可比指纹）纳入 sha——
                           # 内容不变时 NOTHING_TO_DO（不重启客户端），变了就必须重烘投递。
                           "flow_snapshot": flow_digest,
+                          "side_policy": side_digest,
+                          "side_policy_enabled": runtime_side_enabled,
                           # §PARAMS-STATIC-BASE: a change to a static knob (or to
                           # this base file itself) must re-bake, otherwise the box
                           # keeps running the old number forever.
@@ -1341,9 +1569,31 @@ def main():
                                           ensure_ascii=True).encode()).hexdigest()[:16]}}, ensure_ascii=True)
     sha = hashlib.sha256(payload.encode()).hexdigest()
 
+    reap_side_policy_requests()
+    side_request = _read_json(SIDE_POLICY_REQ, {}) or {}
+    if side_request:
+        now = datetime.datetime.now().astimezone()
+        try:
+            hh, mm = [int(x) for x in str(side_request.get("until") or "14:00").split(":")]
+            until = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except (TypeError, ValueError):
+            until = now.replace(hour=14, minute=0, second=0, microsecond=0)
+        if (side_request.get("day") != now.strftime("%Y%m%d") or
+                until.timestamp() <= now.timestamp()):
+            # Expiry is a state transition: failure must be nonzero and leave req intact.
+            os.remove(SIDE_POLICY_REQ)
+            print("HOTRELOAD_SIDE_POLICY_EXPIRED request_id=%s" % side_request.get("request_id"))
+            side_request = {}
     if not args.force and os.path.exists(STATE) and open(STATE).read().strip() == sha:
-        print("HOTRELOAD_GZ_NOTHING_TO_DO sha=%s" % sha)
-        return 0
+        if side_request:
+            retry = early_retry_side_policy(side_request, datetime.datetime.now().astimezone())
+            if retry is not None:
+                return 0 if retry else 3
+            # Manifest advanced but its artifact does not carry this exact latch.
+            # Fall through to the normal bake; never supersede pending on version alone.
+        else:
+            print("HOTRELOAD_GZ_NOTHING_TO_DO sha=%s" % sha)
+            return 0
     print("HOTRELOAD_GZ payload sha=%s wl=%d bearish=%d bullish=%d" % (
         sha, len(wl), len(bearish), len(bullish)))
 
@@ -1426,6 +1676,8 @@ def main():
     # 昨天那份仍可能被读的证据（跨日弃权已经够了）。
     if isinstance(flow_snapshot, dict) and flow_snapshot.get("day"):
         doc2["params"]["flow_snapshot"] = flow_snapshot
+    doc2["params"]["side_policy_enabled"] = runtime_side_enabled
+    doc2["params"]["side_policy"] = side_policy
     json.dump(doc2, open("qmt_gateway/local_executor_params.json", "w", encoding="utf-8"),
               ensure_ascii=True, indent=2)
 
@@ -1499,7 +1751,7 @@ def main():
         # §INTRADAY-BUYSIG（2026-11-16 owner 拍板）：盘中新 buy 信号同样走 intraday——
         # 差分基准是**上次发布**（buy_signals_state.json 只在发布腿写回，NOTHING_TO_DO
         # 轮不写，否则一次空轮就会把新信号吃掉）；每次投递重启 1~2 分钟，同集合天然防抖。
-        "intraday_priority": bool(reversal_events) or bool(new_buys) or bool(flow_changed),
+        "intraday_priority": bool(reversal_events) or bool(new_buys) or bool(flow_changed) or bool(side_changed),
     }
     json.dump(manifest, open(os.path.join(manifest_dir, "carrier_manifest.json"), "w",
                              encoding="utf-8"), ensure_ascii=True, indent=2)
@@ -1510,16 +1762,43 @@ def main():
     except OSError as exc:
         print("HOTRELOAD_BUY_STATE_FAIL %s" % type(exc).__name__)
 
-    # §NEWS-GATE（R11）：盘中反转发布 → SSH 兜底立即触发盒子盘中拉取（不等 10 分钟班次）。
-    if reversal_events:
-        ssh_intraday_trigger(ver)
-
     with open(STATE, "w") as fh:
         fh.write(sha)
+    # §NEWS-GATE（R11）：盘中反转发布 → SSH 兜底立即触发盒子盘中拉取。
+    if reversal_events:
+        ssh_intraday_trigger(ver)
+    # §SIDE-POLICY：13:00 加急发布绑定 request_id→version，并立即拉盒子；失败保留 req 重试。
+    if side_request:
+        pending = _read_json(SIDE_POLICY_PENDING, {}) or {}
+        req_id = str(side_request.get("request_id") or "")
+        if req_id:
+            pending[req_id] = ver
+            _atomic_json(SIDE_POLICY_PENDING, pending)
+        if not ssh_intraday_trigger(ver):
+            print("HOTRELOAD_SIDE_POLICY_SSH_FAIL request_id=%s version=%s" % (req_id, ver))
+            return 3
     print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d bullish=%d pool=%d new_buys=%d" % (
         ver, sha_art, len(wl), len(bearish), len(top), len(doc2["params"].get("symbols") or []),
         len(new_buys)))
     return 0
+
+
+def main():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    lock = open(HOTRELOAD_LOCK, "a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("HOTRELOAD_GZ_LOCK_BUSY path=%s" % HOTRELOAD_LOCK)
+            return 75
+        return _main_impl()
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock.close()
 
 
 if __name__ == "__main__":

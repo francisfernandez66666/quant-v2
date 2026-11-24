@@ -116,6 +116,10 @@ SZ_NEUTRAL = 1
 SZ_NO_CAP = float("inf")  # also the +inf marker for readings
 SZ_CENTS = 100
 SZ_PERCENT = 100
+SIDE_LEVEL_L1 = 1
+SIDE_LEVEL_BEAR_MAX = 2
+SIDE_LEVEL_BULL_MAX = 3
+SIDE_LEVEL_RANGE_MAX = 0
 
 # Machine-readable dimension codes -- the same three strings the Go side puts
 # into JSON, alerts and the frontend tag (internal/signalctl/sizing.go:319-322).
@@ -287,6 +291,15 @@ SIZING_DEFAULTS = {
     "t_regime_gate_enabled": True,
     "t_regime_stale_sec": 900,
     "t_direction_mode": "both",
+    # -- SIDE-POLICY-20261124 -------------------------------------------------
+    # Only knobs consumed by this pure module live in SIZING_DEFAULTS. Market
+    # thresholds stay in the cloud snapshot; the remaining keys are declared by
+    # their actual consumer (qmt_internal_strategy / rules_t).
+    "side_policy_ttl_sec": 2700.0,
+    "side_weight_lo": 0.80,
+    "side_weight_hi": 1.20,
+    "side_left_score_floor": 80.0,
+    "side_left_score_margin": 10.0,
 }
 
 SIZING_PARAM_KEYS = sorted(SIZING_DEFAULTS)
@@ -337,6 +350,8 @@ SIZING_CTX_KEYS = [
     "market_state_enabled", "red_block_new_buy", "holiday_block_new",
     "flow_factor_enabled", "sl_offset_risk_budget_keep",
     "t_regime_gate_enabled", "market_state_age_sec",
+    # SIDE-POLICY: runtime snapshot + intent-specific strategic target multiplier
+    "day", "now_ts", "side_target_multiplier",
 ]
 
 # Signal kinds registered for the counter-remark idempotency check. This module
@@ -1126,6 +1141,134 @@ def _sz_position_value(ctx):
     return held, pending, buy_legs, sell_legs, True
 
 
+def _side_disabled():
+    return {"enabled": False, "mode": "legacy", "level": SZ_ABSTAIN, "allow_new": True,
+            "allow_add": True, "target_multiplier": SZ_NEUTRAL,
+            "left_weight": SZ_NEUTRAL, "right_weight": SZ_NEUTRAL,
+            "latch_active": False, "reason": "side_policy_disabled"}
+
+
+def _side_fail_closed(reason, params=None):
+    return {"enabled": True, "mode": "bear", "level": SIDE_LEVEL_L1, "allow_new": False,
+            "allow_add": True, "target_multiplier": SZ_NEUTRAL,
+            "left_weight": SZ_NEUTRAL, "right_weight": SZ_NEUTRAL,
+            "latch_active": False, "reason": reason}
+
+
+def side_policy_state(params, ctx):
+    """Decode the cloud side-policy snapshot; missing/corrupt enabled state fails closed."""
+    enabled = params.get("side_policy_enabled")
+    if not isinstance(enabled, bool):
+        return _side_fail_closed("side_policy_bad_switch", params)
+    if not enabled:
+        return _side_disabled()
+    raw = params.get("side_policy")
+    if not isinstance(raw, dict):
+        return _side_fail_closed("side_policy_missing", params)
+    day = str(ctx.get("day") or "")
+    if not day or not isinstance(raw.get("day"), str) or raw.get("day") != day:
+        return _side_fail_closed("side_policy_stale_day", params)
+    mode, level = raw.get("mode"), raw.get("level")
+    level_max = {"bear": SIDE_LEVEL_BEAR_MAX, "bull": SIDE_LEVEL_BULL_MAX,
+                 "range": SIDE_LEVEL_RANGE_MAX}
+    if (not isinstance(mode, str) or mode not in level_max or isinstance(level, bool) or
+            not isinstance(level, int) or level < SZ_ABSTAIN or level > level_max[mode]):
+        return _side_fail_closed("side_policy_bad_enum", params)
+    if not isinstance(raw.get("allow_new"), bool) or not isinstance(raw.get("allow_add"), bool):
+        return _side_fail_closed("side_policy_bad_bool", params)
+    latch = raw.get("latch")
+    if latch is not None and (not isinstance(latch, dict) or
+                              (latch.get("kind") not in (None, "no_new")) or
+                              any(not isinstance(latch.get(key), str) for key in ("until", "reason")
+                                  if latch.get(key) is not None)):
+        return _side_fail_closed("side_policy_bad_latch", params)
+    now = _sz_num(ctx.get("now_ts"))
+    asof = _sz_num(raw.get("asof_ts"))
+    target_multiplier = _sz_num(raw.get("target_multiplier"))
+    left_weight = _sz_num(raw.get("left_weight"))
+    right_weight = _sz_num(raw.get("right_weight"))
+    latch_until = _sz_num(raw.get("latch_until_ts"))
+    if None in (now, asof, target_multiplier, left_weight, right_weight, latch_until):
+        return _side_fail_closed("side_policy_bad_value", params)
+    st = dict(raw)
+    st["enabled"] = True
+    st["target_multiplier"] = target_multiplier
+    st["left_weight"] = left_weight
+    st["right_weight"] = right_weight
+    st["latch_until_ts"] = latch_until
+    st["latch_active"] = latch_until > now
+    aggressive = (st.get("mode") == "bull" or target_multiplier > SZ_NEUTRAL or
+                  left_weight > SZ_NEUTRAL or right_weight > SZ_NEUTRAL)
+    if now < asof:
+        return _side_fail_closed("side_policy_asof_invalid", params)
+    if aggressive and now - asof > float(_sz_p(params, "side_policy_ttl_sec")):
+        st.update({"mode": "bear", "level": SIDE_LEVEL_L1, "allow_new": False, "allow_add": True,
+                   "target_multiplier": SZ_NEUTRAL, "left_weight": SZ_NEUTRAL,
+                   "right_weight": SZ_NEUTRAL, "reason": "side_policy_stale"})
+    if st.get("latch_active"):
+        st["allow_new"] = False
+        st["reason"] = "pm1300_latch"
+    return st
+
+
+def side_target_multiplier(params, ctx, intent):
+    if intent in ("t_leg", "reduce"):
+        return SZ_NEUTRAL
+    st = side_policy_state(params, ctx)
+    if not st.get("enabled"):
+        return SZ_NEUTRAL
+    return float(st.get("target_multiplier") or SZ_NEUTRAL)
+
+
+def side_style_weight(params, ctx, entry_style):
+    st = side_policy_state(params, ctx)
+    if not st.get("enabled"):
+        return SZ_NEUTRAL
+    if entry_style == "left":
+        return float(st.get("left_weight") or SZ_NEUTRAL)
+    if entry_style == "right":
+        return float(st.get("right_weight") or SZ_NEUTRAL)
+    return SZ_NEUTRAL
+
+
+def combine_side_weight(params, flow_blend, style_weight):
+    lo = float(_sz_p(params, "side_weight_lo"))
+    hi = float(_sz_p(params, "side_weight_hi"))
+    return max(lo, min(hi, flow_blend * style_weight))
+
+
+def side_buy_allowed(params, ctx, signal, intent, held_qty, tp_fired, same_symbol_day, stable):
+    """Two-level admission plus the strong stable left-side add exception."""
+    if intent in ("t_leg", "reduce"):
+        return True, ""
+    if same_symbol_day:
+        return False, "same_symbol_day"
+    if tp_fired:
+        return False, "tp_rebuy_block"
+    st = side_policy_state(params, ctx)
+    if not st.get("enabled"):
+        return True, ""
+    if intent == "new":
+        if st.get("allow_new"):
+            return True, ""
+        return False, "side_policy_no_new"
+    if intent == "add":
+        if st.get("allow_add"):
+            return True, ""
+        try:
+            score = float(signal.get("score"))
+            threshold = float(signal.get("threshold"))
+        except (TypeError, ValueError):
+            return False, "side_policy_tighten"
+        need = max(float(_sz_p(params, "side_left_score_floor")),
+                   threshold + float(_sz_p(params, "side_left_score_margin")))
+        if (signal.get("entry_style") == "left" and held_qty > SZ_ABSTAIN and not tp_fired and
+                score >= need and stable):
+            return True, ""
+        return False, "side_policy_tighten"
+    return True, ""
+
+
 def target_position(params, ctx):
     """The account target layer plus this order's share.
 
@@ -1160,7 +1303,8 @@ def target_position(params, ctx):
     held, pending, buy_legs, sell_legs, ok = _sz_position_value(ctx)
     if not ok:
         return None
-    target = base * min(market, ceiling)
+    target_multiplier = _sz_num(ctx.get("side_target_multiplier")) or SZ_NEUTRAL
+    target = base * min(market * target_multiplier, ceiling)
     current = held + pending - buy_legs + sell_legs
     if current < SZ_ABSTAIN:
         current = SZ_NEUTRAL * SZ_ABSTAIN
@@ -1329,7 +1473,9 @@ def t_allowed_by_sizing(params, ctx):
                 # because "configured but unreadable" is not "not configured"
                 # (regimeBlock's default branch,
                 # internal/engine/intraday_t_live.go:2181-2182).
-                if str(state).strip() != "range":
+                side = side_policy_state(params, ctx)
+                policy_bear = bool(side.get("enabled")) and side.get("mode") == "bear"
+                if str(state).strip() != "range" and not (policy_bear and str(state).strip() == "bear"):
                     return False
     return True
 

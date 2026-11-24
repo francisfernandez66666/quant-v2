@@ -173,3 +173,108 @@ func CarrierTPDragonOpenNoResealSec() float64 { return carrierTPDragonOpenNoRese
 func CarrierTPDragonReturnTakeProfitPct() float64 {
 	return DefaultStrategyConfig().DragonReturn.TakeProfitPct * 100
 }
+
+// §SIDE-POLICY-20261124 熊市左右侧比例与牛市镜像剧本的载体出厂旋钮。
+// 数值只在此处定义，载体规则层必须从 PARAMS 读；缺键时按方案弃权，不写兜底常量。
+const (
+	carrierSidePolicyEnabledDefault  = false
+	carrierSideFlowStrongDelta       = 0.50
+	carrierSideFlowSlopeStep         = 0.15
+	carrierSideFlowPMDelta           = 0.20
+	carrierSideGapHighPct            = 1.00
+	carrierSideGapLowPct             = -1.00
+	carrierSidePMIndexDropPct        = -1.00
+	carrierSidePMIndexRisePct        = 1.00
+	carrierSideBearTargetL1          = 0.85
+	carrierSideBearTargetL2          = 0.70
+	carrierSideBullTargetL1          = 1.05
+	carrierSideBullTargetL2          = 1.10
+	carrierSideBullTargetL3          = 1.15
+	carrierSideWeightLo              = 0.80
+	carrierSideWeightHi              = 1.20
+	carrierSideLeftScoreFloor        = 80.0
+	carrierSideLeftScoreMargin       = 10.0
+	carrierSideLeftStableRounds      = 2
+	carrierSideLeftStableGapSec      = 60.0
+	carrierSideLeftStableMaxDrop     = 2.0
+	carrierSidePMCheckFrom           = "13:00"
+	carrierSidePMBlockUntil          = "14:00"
+	carrierSideBucketMinutes         = 30
+	carrierSidePolicyTTLSec          = 2700.0
+	carrierSideFreshnessHeartbeatSec = 1200.0
+)
+
+// CarrierSidePolicyEnabledDefault 返回侧策略总闸的出厂值；账号 runtime 显式值优先。
+func CarrierSidePolicyEnabledDefault() bool { return carrierSidePolicyEnabledDefault }
+
+// CarrierSideFlowStrongDelta 返回强净流入/强净流出的归一阈值。
+func CarrierSideFlowStrongDelta() float64 { return carrierSideFlowStrongDelta }
+
+// CarrierSideFlowSlopeStep 返回每 30 分钟斜率触发档。
+func CarrierSideFlowSlopeStep() float64 { return carrierSideFlowSlopeStep }
+
+// CarrierSideFlowPMDelta 返回 13:00 累计净流入强度变化阈值。
+func CarrierSideFlowPMDelta() float64 { return carrierSideFlowPMDelta }
+
+// CarrierSideGapHighPct 返回 09:30 高开阈值（百分点）。
+func CarrierSideGapHighPct() float64 { return carrierSideGapHighPct }
+
+// CarrierSideGapLowPct 返回 09:30 低开阈值（百分点）。
+func CarrierSideGapLowPct() float64 { return carrierSideGapLowPct }
+
+// CarrierSidePMIndexDropPct 返回 13:00 指数大跌阈值（百分点）。
+func CarrierSidePMIndexDropPct() float64 { return carrierSidePMIndexDropPct }
+
+// CarrierSidePMIndexRisePct 返回牛市镜像的指数大涨确认阈值（百分点）；只分档，不新增准入硬闸。
+func CarrierSidePMIndexRisePct() float64 { return carrierSidePMIndexRisePct }
+
+// CarrierSideBearTargetL1 返回 bear 收紧第一档目标乘子。
+func CarrierSideBearTargetL1() float64 { return carrierSideBearTargetL1 }
+
+// CarrierSideBearTargetL2 返回 bear 收紧第二档目标乘子。
+func CarrierSideBearTargetL2() float64 { return carrierSideBearTargetL2 }
+
+// CarrierSideBullTargetL1 返回 bull 放宽第一档目标乘子。
+func CarrierSideBullTargetL1() float64 { return carrierSideBullTargetL1 }
+
+// CarrierSideBullTargetL2 返回 bull 放宽第二档目标乘子。
+func CarrierSideBullTargetL2() float64 { return carrierSideBullTargetL2 }
+
+// CarrierSideBullTargetL3 返回 bull 放宽第三档目标乘子。
+func CarrierSideBullTargetL3() float64 { return carrierSideBullTargetL3 }
+
+// CarrierSideWeightLo 返回最终单笔权重下限。
+func CarrierSideWeightLo() float64 { return carrierSideWeightLo }
+
+// CarrierSideWeightHi 返回最终单笔权重上限。
+func CarrierSideWeightHi() float64 { return carrierSideWeightHi }
+
+// CarrierSideLeftScoreFloor 返回强左侧信号分数地板。
+func CarrierSideLeftScoreFloor() float64 { return carrierSideLeftScoreFloor }
+
+// CarrierSideLeftScoreMargin 返回强左侧超过规则阈值的最小分差。
+func CarrierSideLeftScoreMargin() float64 { return carrierSideLeftScoreMargin }
+
+// CarrierSideLeftStableRounds 返回强左侧连续观察轮数。
+func CarrierSideLeftStableRounds() int { return carrierSideLeftStableRounds }
+
+// CarrierSideLeftStableGapSec 返回强左侧最小观察间隔（秒）。
+func CarrierSideLeftStableGapSec() float64 { return carrierSideLeftStableGapSec }
+
+// CarrierSideLeftStableMaxDrop 返回强左侧连续观察允许的最大分数回落。
+func CarrierSideLeftStableMaxDrop() float64 { return carrierSideLeftStableMaxDrop }
+
+// CarrierSidePMCheckFrom 返回午后检查起点。
+func CarrierSidePMCheckFrom() string { return carrierSidePMCheckFrom }
+
+// CarrierSidePMBlockUntil 返回 no-new latch 终点。
+func CarrierSidePMBlockUntil() string { return carrierSidePMBlockUntil }
+
+// CarrierSideBucketMinutes 返回资金流固定桶长（分钟）。
+func CarrierSideBucketMinutes() int { return carrierSideBucketMinutes }
+
+// CarrierSidePolicyTTLSec 返回进攻态新鲜度 TTL（秒）。
+func CarrierSidePolicyTTLSec() float64 { return carrierSidePolicyTTLSec }
+
+// CarrierSideFreshnessHeartbeatSec 返回进攻态新鲜度心跳（秒）。
+func CarrierSideFreshnessHeartbeatSec() float64 { return carrierSideFreshnessHeartbeatSec }

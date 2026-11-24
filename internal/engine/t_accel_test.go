@@ -185,6 +185,23 @@ func TestAccelRegimeFlip(t *testing.T) {
 	}
 }
 
+// TestAccelRegimePolicyBearDoesNotFire 锁定 policy bear 不在入口刚放行就把在途腿配平。
+func TestAccelRegimePolicyBearDoesNotFire(t *testing.T) {
+	f, _ := accelFix(t, 10, 30)
+	rnd := buyRoundAt(f.now, 3*time.Minute, 1000, 10.0)
+	p := f.params(func(p *paper.TParams) {
+		p.RoundStopPct = 2.0
+		p.MarketState = "bear"
+		p.MarketStateAt = f.now.Add(-time.Minute)
+		p.SidePolicyEnabled = true
+		p.SidePolicyMode = "bear"
+	})
+	r := f.round(p, f.quotes())
+	if got := r.accelReason(rnd, 10.05); got != "" {
+		t.Fatalf("policy bear must not immediately pair, got %q", got)
+	}
+}
+
 func TestAccelRegimeStaleDoesNotFire(t *testing.T) {
 	f, _ := accelFix(t, 10, 30)
 	p := f.params(func(p *paper.TParams) {

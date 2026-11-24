@@ -485,6 +485,19 @@ func (s *Server) handleCarrierAckPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "persist carrier ack failed: "+err.Error())
 		return
 	}
+	// §SIDE-POLICY：按 version 追加回执历史，加急 reaper 不依赖会被迟到回执覆盖的 LastAck。
+	if s.researchDir != "" {
+		row := map[string]interface{}{"version": ver, "ok": *req.OK, "at": carrierStamp(now)}
+		if raw, err := json.Marshal(row); err == nil {
+			if fh, err := os.OpenFile(filepath.Join(s.researchDir, "carrier_ack_history.jsonl"),
+				os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+				_, _ = fh.Write(append(raw, '\n'))
+				_ = fh.Close()
+			} else {
+				log.Printf("[carrier] side-policy ack history append failed: %v", err)
+			}
+		}
+	}
 	note := ""
 	switch {
 	case stateChanged:

@@ -106,7 +106,7 @@ describe('§N-4 战法参数保存闸：读取失败禁保存 / 缺失必填 / �
     await settle()
     expect(getSaveButtonDisabled()).toBe(true)
     // 「重载」再失败一次：确认错误态可重入且依旧禁存（防只挡首帧、点一下就解禁的假闸）。
-    fireEvent.click(screen.getByRole('button', { name: /重载/ }))
+    fireEvent.click(screen.getAllByRole('button', { name: /重载/ })[0])
     await settle()
     fireEvent.click(getSaveButton())
     const api = await import('../api/index.js')

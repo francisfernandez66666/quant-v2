@@ -69,8 +69,14 @@ type SizingResult struct {
 	// FlowBlend §FLOW-BLEND 后置金额乘子（0.80~1.20，默认 1.0=中性）。
 	// 三项（大盘/板块资金流、相对放量）合成后的**总幅度**恒定封顶 ±20%，
 	// 只在单笔金额占比出口乘，不进定权因子组（避免幂平均稀释/Cap 截断）。缺值=1.0。
-	FlowBlend float64  `json:"flow_blend,omitempty"`
-	Reasons   []string `json:"reasons,omitempty"`
+	FlowBlend float64 `json:"flow_blend,omitempty"`
+	// TargetMultiplier 只作用于战略目标 room；MarketScale 与 T 额度不变。
+	TargetMultiplier float64 `json:"target_multiplier,omitempty"`
+	// SidePolicyMode/Level/StyleWeight 供决策留痕与执行层复盘。
+	SidePolicyMode  string   `json:"side_policy_mode,omitempty"`
+	SidePolicyLevel int      `json:"side_policy_level,omitempty"`
+	StyleWeight     float64  `json:"style_weight,omitempty"`
+	Reasons         []string `json:"reasons,omitempty"`
 }
 
 // BuyScale 单笔金额缩放（新模型口径）＝ MarketScale × StockScale。

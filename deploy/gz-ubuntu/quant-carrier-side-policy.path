@@ -1,0 +1,10 @@
+# quant-carrier-side-policy.path — 引擎写出 13:00 urgent req 时立即触发。
+[Unit]
+Description=Watch quant side-policy urgent request
+
+[Path]
+PathExists=/var/lib/quant-trading-v2/side_policy_urgent.req
+Unit=quant-carrier-side-policy.service
+
+[Install]
+WantedBy=paths.target

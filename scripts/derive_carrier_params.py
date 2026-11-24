@@ -288,6 +288,32 @@ MAPPING = [
     ("market_scale_ceiling_margin", ("market_scale_ceiling_margin",), None),
     ("buy_retry_improve_pct", ("buy_retry_improve_pct",), None),
     ("buy_retry_max_per_day", ("buy_retry_max_per_day",), None),
+    # §SIDE-POLICY-20261124：熊市左右侧比例与牛市镜像，Go 常量同名直搬。
+    ("side_policy_enabled", ("side_policy_enabled",), None),
+    ("side_flow_strong_delta", ("side_flow_strong_delta",), None),
+    ("side_flow_slope_step", ("side_flow_slope_step",), None),
+    ("side_flow_pm_delta", ("side_flow_pm_delta",), None),
+    ("side_gap_high_pct", ("side_gap_high_pct",), None),
+    ("side_gap_low_pct", ("side_gap_low_pct",), None),
+    ("side_pm_index_drop_pct", ("side_pm_index_drop_pct",), None),
+    ("side_pm_index_rise_pct", ("side_pm_index_rise_pct",), None),
+    ("side_bear_target_l1", ("side_bear_target_l1",), None),
+    ("side_bear_target_l2", ("side_bear_target_l2",), None),
+    ("side_bull_target_l1", ("side_bull_target_l1",), None),
+    ("side_bull_target_l2", ("side_bull_target_l2",), None),
+    ("side_bull_target_l3", ("side_bull_target_l3",), None),
+    ("side_weight_lo", ("side_weight_lo",), None),
+    ("side_weight_hi", ("side_weight_hi",), None),
+    ("side_left_score_floor", ("side_left_score_floor",), None),
+    ("side_left_score_margin", ("side_left_score_margin",), None),
+    ("side_left_stable_rounds", ("side_left_stable_rounds",), None),
+    ("side_left_stable_gap_sec", ("side_left_stable_gap_sec",), None),
+    ("side_left_stable_max_drop", ("side_left_stable_max_drop",), None),
+    ("side_pm_check_from", ("side_pm_check_from",), None),
+    ("side_pm_block_until", ("side_pm_block_until",), None),
+    ("side_bucket_minutes", ("side_bucket_minutes",), None),
+    ("side_policy_ttl_sec", ("side_policy_ttl_sec",), None),
+    ("side_freshness_heartbeat_sec", ("side_freshness_heartbeat_sec",), None),
     # §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
     # 真源 internal/config/carrier_knobs.go（两枚战法止盈点是转调：双凸读战法包常量、
     # 龙回头读账号级策略出厂表 ×100 换成百分点）。Python 侧不写这几枚数。
@@ -586,6 +612,7 @@ CARRIER_OWNED = {
     "news_weight_boost": "carrier-shape: 资讯因子加权系数（rules_factor NEWS_WEIGHT_FACTORS 消费），gz 烘焙链写入",
     "force_sell_boost": "snapshot-derived: 负分 D1 且当日持仓 → 卖出加速桶（carrier_hot_reload_gz 每次重算覆盖）",
     "news_gate": "snapshot-derived: 负分个股名单（分值闸双保险的名单面，carrier_hot_reload_gz 写入）",
+    "side_policy": "snapshot-derived: 熊市左右侧状态快照（含 13:00 latch/freshness epoch），carrier_hot_reload_gz 写入",
 }
 
 # ---------------------------------------------------------------------------

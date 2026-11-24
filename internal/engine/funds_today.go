@@ -66,8 +66,9 @@ const sizingCtxTTL = 10 * time.Second
 
 // sizingCtx 一份定权上下文：市场缩放、关键读数缺失标记、大盘指数涨跌。
 type sizingCtx struct {
-	MS      float64 // 市场缩放（目标仓位的乘数；<=0 视为尚未定权，回落 1.0）
-	Missing bool    // 关键市场读数缺失（数据盲区）：目标封顶半仓且当天不做 T
+	MS               float64 // 市场缩放（目标仓位的乘数；<=0 视为尚未定权，回落 1.0）
+	TargetMultiplier float64 // 侧策略战略目标乘子；T 额度不消费
+	Missing          bool    // 关键市场读数缺失（数据盲区）：目标封顶半仓且当天不做 T
 	// MissingDims 缺的是哪几维（signalctl.MissingDim* 机读码）。§INDEX-BLIND：
 	// 只有 Missing 的现场，操作者得自己猜"该去查状态机、情绪还是指数"——
 	// 11-02 那次三键里掉的是大盘指数，而这句话只能靠对时间线反推出来。
@@ -79,6 +80,13 @@ type sizingCtx struct {
 	IndexStale  bool
 	IndexPct    float64 // 大盘指数涨跌（%），T 的环境门用它
 	At          time.Time
+}
+
+func (c sizingCtx) targetMultiplier() float64 {
+	if c.TargetMultiplier <= 0 || math.IsNaN(c.TargetMultiplier) {
+		return 1.0
+	}
+	return c.TargetMultiplier
 }
 
 // sizingContextFor 取该账号的定权上下文（短窗缓存）。
@@ -111,13 +119,14 @@ func (e *Engine) sizingContextFor(uid string) sizingCtx {
 	idxSrc, idxStale := e.idxQuoteSrc, e.idxQuoteStale
 	e.mu.RUnlock()
 	c = sizingCtx{
-		MS:          ms,
-		Missing:     res.MissingKeyInput,
-		MissingDims: res.MissingKeyDims,
-		IndexSource: idxSrc,
-		IndexStale:  idxStale,
-		IndexPct:    r.IndexChangePct,
-		At:          time.Now(),
+		MS:               ms,
+		TargetMultiplier: signalctl.TargetMultiplierForIntent(r.SidePolicy, "new"),
+		Missing:          res.MissingKeyInput,
+		MissingDims:      res.MissingKeyDims,
+		IndexSource:      idxSrc,
+		IndexStale:       idxStale,
+		IndexPct:         r.IndexChangePct,
+		At:               time.Now(),
 	}
 	// 盲区必须当场出声：NaN 这条路径今天**一行日志都不打**（只有回退成功才打 §BUG-INDEX），
 	// 于是"整天封顶半仓"在日志里只留下"回退中"的尾巴，缺哪一维要靠对时间线反推。
@@ -195,10 +204,21 @@ func (e *Engine) blindAlertCode(c sizingCtx) int64 {
 func fundsTargetCurRoom(total, ms, ceiling float64,
 	positions map[string]store.RealPosition, prices map[string]float64,
 	pending []store.PendingBuy, book tLiveBook) (target, cur, room float64, ok bool) {
+	return fundsTargetCurRoomWithMultiplier(total, ms, ceiling, 1.0, positions, prices, pending, book)
+}
+
+// fundsTargetCurRoomWithMultiplier 是战略目标专用出口；T 仍调上面的 TM=1 包装。
+// target = total × min(MS × TM, ceiling)，TM 不参与单笔 MS×SS，也不进入 T 额度。
+func fundsTargetCurRoomWithMultiplier(total, ms, ceiling, targetMultiplier float64,
+	positions map[string]store.RealPosition, prices map[string]float64,
+	pending []store.PendingBuy, book tLiveBook) (target, cur, room float64, ok bool) {
 	if ceiling <= 0 || ceiling > 1 {
 		ceiling = 1.0
 	}
-	ratio := math.Min(ms, ceiling)
+	if targetMultiplier <= 0 || math.IsNaN(targetMultiplier) {
+		targetMultiplier = 1.0
+	}
+	ratio := math.Min(ms*targetMultiplier, ceiling)
 	target = total * ratio
 	var strat float64
 	for code, pos := range positions {
@@ -379,7 +399,8 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 
 	ctx := e.sizingContextFor(uid)
 	sc := e.sizingConfigFor(uid)
-	target, cur, room, _ := fundsTargetCurRoom(total, ctx.MS, sc.MaxTotalPositionPct, positions, prices, pending, book)
+	target, cur, room, _ := fundsTargetCurRoomWithMultiplier(total, ctx.MS, sc.MaxTotalPositionPct,
+		ctx.TargetMultiplier, positions, prices, pending, book)
 
 	// §P1-1（2026-10-30）：把"战略当前"里的在途买单单独拆出来（含最久一笔的状态/时长）。
 	// 事故当天 cur=58,838 而持仓只有 22,238，卡片上却看不出差额是谁占的。

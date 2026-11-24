@@ -243,3 +243,33 @@ func TestRuntimeConfigIndexKeys(t *testing.T) {
 		t.Fatalf("关掉降级链后实际段序应只剩东财, got %v", after["index_legs_actual"])
 	}
 }
+
+// TestRuntimeConfigSidePolicySwitch 验证总闸稀疏写入、热更声明与审计只点名本次键。
+func TestRuntimeConfigSidePolicySwitch(t *testing.T) {
+	s, admin, _ := newRuntimeTestServer(t)
+	if got := runtimeGet(t, s, admin)["side_policy_enabled"]; got != false {
+		t.Fatalf("side policy default must be off, got %v", got)
+	}
+	code, resp := runtimePost(t, s, admin, `{"side_policy_enabled":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("enable side policy should save, got %d resp=%v", code, resp)
+	}
+	got := runtimeGet(t, s, admin)
+	if got["side_policy_enabled"] != true {
+		t.Fatalf("side policy switch did not persist, got %v", got["side_policy_enabled"])
+	}
+	hot, _ := got["hot_keys"].([]any)
+	found := false
+	for _, v := range hot {
+		if toString(v) == "side_policy_enabled" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("side policy must be a hot key, got %v", hot)
+	}
+	changed, _ := resp["changed"].([]any)
+	if len(changed) != 1 || toString(changed[0]) != "side_policy_enabled" {
+		t.Fatalf("audit must name only side_policy_enabled, got %v", changed)
+	}
+}

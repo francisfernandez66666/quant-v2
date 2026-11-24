@@ -471,6 +471,8 @@ func (f *Fetcher) HubIndexQuote(code string) (*IndexLiveQuote, bool) {
 type IndexAmountDay struct {
 	TradeDate string  // 交易日 YYYY-MM-DD（按 cst 解析）
 	Amount    float64 // 量能标量：东财=成交额（元）；新浪=成交量（股），见 Source 区分
+	Open      float64 // 开盘价（元）；用于 09:30 缺口
+	Close     float64 // 收盘价（元）；前一根作为昨收
 }
 
 // IndexAmountSeries 取大盘指数量能序列（最近 n 根日 K），三源降级 + 每源上证主/沪深300 兜底。
@@ -546,6 +548,29 @@ func (m *MarketAPI) IndexAmountSeries(n int, today string) ([]IndexAmountDay, st
 	return nil, "", lastErr
 }
 
+// IndexAmountIsCNY 判断指数量能序列的成交额分母是否为元；新浪 volume 不能用于资金流归一。
+func IndexAmountIsCNY(label string) bool {
+	return strings.HasPrefix(label, "em:") || strings.HasPrefix(label, "em_mirror:")
+}
+
+// IndexOpenGapToday 返回北京今日指数首根 open 相对前一根 close 的缺口（百分点）。
+// 缺 open、非正价、末根非今日或前根不早于今日 ⇒ NaN 弃权。
+func (m *MarketAPI) IndexOpenGapToday(today string) (float64, error) {
+	series, _, err := m.IndexAmountSeries(2, today)
+	if err != nil {
+		return 0, err
+	}
+	if len(series) < 2 {
+		return 0, fmt.Errorf("index gap: short series")
+	}
+	prev, cur := series[len(series)-2], series[len(series)-1]
+	if cur.TradeDate != today || prev.TradeDate >= today || cur.Open <= 0 || prev.Close <= 0 {
+		return 0, fmt.Errorf("index gap: invalid bars prev=%s cur=%s open=%.4f prev_close=%.4f",
+			prev.TradeDate, cur.TradeDate, cur.Open, prev.Close)
+	}
+	return (cur.Open/prev.Close - 1) * 100, nil
+}
+
 // emIndexAmount 从东财 kline 取指数日 K 的 amount（元）。host 必须是**供日 K 的主机**（见
 // emHisPush2Host 的注释：只有 push2his 真给 klines）。
 // secid 用 indexSecID（上证→1.000001、沪深300→1.000300），绝不裸用 000001（那是平安银行）。
@@ -589,7 +614,8 @@ func (m *MarketAPI) emIndexAmount(code string, count int, host string) ([]IndexA
 	out := make([]IndexAmountDay, 0, len(klines))
 	for _, k := range klines {
 		if k.Amount > 0 {
-			out = append(out, IndexAmountDay{TradeDate: k.Date.Format("2006-01-02"), Amount: k.Amount})
+			out = append(out, IndexAmountDay{TradeDate: k.Date.Format("2006-01-02"), Amount: k.Amount,
+				Open: k.Open, Close: k.Close})
 		}
 	}
 	return out, nil
@@ -633,7 +659,8 @@ func (m *MarketAPI) sinaIndexAmount(code string, count int) ([]IndexAmountDay, e
 	for _, k := range klines {
 		// 指数日 K 新浪只给 volume（股），amount=0；用 volume 作量能标量。
 		if k.Volume > 0 {
-			out = append(out, IndexAmountDay{TradeDate: k.Date.Format("2006-01-02"), Amount: k.Volume})
+			out = append(out, IndexAmountDay{TradeDate: k.Date.Format("2006-01-02"), Amount: k.Volume,
+				Open: k.Open, Close: k.Close})
 		}
 	}
 	return out, nil

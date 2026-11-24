@@ -386,6 +386,9 @@ func (e *Engine) tParamsFor(uid string, tc config.TConfig, shadow bool) (paper.T
 	st, at, votes, votesTotal := e.tRegimeNow()
 	p.MarketState, p.MarketStateAt = st, at
 	p.MarketStateVotes, p.MarketStateVotesTotal = votes, votesTotal
+	// T 与战略买入共用同一新鲜度闸；runtime 关闭时旧 bear 快照不得继续放行 T 或抑制配平。
+	side := e.currentSidePolicy(e.nowTime())
+	p.SidePolicyEnabled, p.SidePolicyMode = side.Enabled, string(side.Mode)
 	// §8.8 三条硬纪律里的第③条：**回落后的实际生效值必须出声**。
 	// 越界值被 tClamp 挡掉是保护，但"保护悄悄生效"就是另一个缺陷——运维会一直以为自己配的那个数在跑
 	// （本仓历史上"配置写错被当成网络抖动"的亏吃过多次）。这里每轮排空一次队列并逐键打出来；
@@ -498,7 +501,9 @@ func (e *Engine) injectPaperSizing(uid string, pe *paper.Engine) {
 	// sizingContextFor 带 10s 短窗缓存，同一轮里 T 参数与本次注入拿到的是同一个 MS/盲区读数。
 	ctx := e.sizingContextFor(uid)
 	// §FLOW-BLEND：T 层按账户级读数算 T 额度，不涉及逐票资金流/放量调节 → blend 中性 1.0。
-	pe.SetSizingContext(ctx.MS, lo, hi, ceiling, ctx.Missing, ctx.MissingDims, 1.0)
+	pe.SetSizingContext(ctx.MS, lo, hi, ceiling, ctx.Missing, ctx.MissingDims, 1.0, ctx.TargetMultiplier)
+	now := e.nowTime()
+	pe.SetSideAdmission(e.currentSidePolicy(now), e.paperSideAdmission(uid))
 }
 
 // wireTCallbacks 把读数回调接到引擎的真实数据源上（全部"取不到就说取不到"）。

@@ -398,6 +398,7 @@ def make_signal(params, ctx, kind, side, amount, price, qty=None):
         "price": float(price),
         "amount": None if amount is None else float(amount),
         "short_code": short,
+        "entry_style": "left" if kind == "pullback_buy" else ("right" if side == "buy" else "unclassified"),
     }
 
 def _finite(value):
@@ -1532,6 +1533,11 @@ def _emit(params, ctx, kind, rule, scored):
     # as make_signal composed it -- that is the idempotency key.
     signal["rule_id"] = str((rule or {}).get("id") or "")
     signal["score"] = float(scored.get("score") or ZERO)
+    threshold = scored.get("threshold")
+    if threshold is None:
+        threshold = float((params.get("score_domain") or {}).get("full") or ZERO)
+    signal["threshold"] = float(threshold)
+    signal["entry_style"] = str((rule or {}).get("entry_style") or "unclassified")
     signal["reason"] = scored.get("reason") or ""
     return signal
 

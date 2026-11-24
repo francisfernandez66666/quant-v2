@@ -141,6 +141,9 @@ _STATE = {
     # (_buy_retry_counter), so a carrier reload cannot reset the count.
     "buy_tries": {},
     "buy_tries_day": "",
+    # SIDE-POLICY: {(day, symbol, rule_id): [(epoch, score)]}; only scored left rules qualify.
+    "side_left_seen": {},
+    "side_policy_last": {},
 }
 
 
@@ -715,6 +718,85 @@ def _buy_confirmed(symbol, now_ts):
     if seen[-1] - seen[-2] < gap:
         return False, "confirm_gap_pending"
     return True, ""
+
+
+def _side_left_stable(signal, ctx, now_ts):
+    """Require every retained left observation to be strong, stable and fresh."""
+    if signal.get("entry_style") != "left":
+        return False
+    score = _to_float(signal.get("score"), None)
+    threshold = _to_float(signal.get("threshold"), None)
+    now_ts = _to_float(now_ts, None)
+    rule_id = str(signal.get("rule_id") or "")
+    day = str(ctx.get("day") or "")
+    symbol = str(signal.get("symbol") or ctx.get("symbol") or "")
+    if (score is None or threshold is None or now_ts is None or not rule_id or
+            not day or not symbol or not math.isfinite(score) or
+            not math.isfinite(threshold) or not math.isfinite(now_ts)):
+        return False
+    # Missing or malformed stability knobs abstain; zero is not a safe default
+    # for a gate that can admit an extra buy in a tighten/bear regime.
+    try:
+        rounds_raw = PARAMS.get("side_left_stable_rounds")
+        rounds_float = float(rounds_raw)
+        if isinstance(rounds_raw, bool) or not math.isfinite(rounds_float) or not rounds_float.is_integer():
+            return False
+        rounds = int(rounds_float)
+        gap = float(PARAMS.get("side_left_stable_gap_sec"))
+        max_drop = float(PARAMS.get("side_left_stable_max_drop"))
+        floor = float(PARAMS.get("side_left_score_floor"))
+        margin = float(PARAMS.get("side_left_score_margin"))
+        freshness = float(PARAMS.get("side_freshness_heartbeat_sec"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (rounds < 1 or not all(math.isfinite(v) and v >= 0.0 for v in
+                              (gap, max_drop, floor, margin, freshness))):
+        return False
+    need = max(floor, threshold + margin)
+    key = (day, symbol, rule_id)
+    seen = _STATE["side_left_seen"].setdefault(key, [])
+    if not isinstance(seen, list):
+        return False
+    # A rapid repeat is not a new observation and must not bypass a score drop.
+    if seen:
+        last = seen[-1]
+        if not isinstance(last, (tuple, list)) or len(last) != 2:
+            return False
+        last_ts = _to_float(last[0], None)
+        last_score = _to_float(last[1], None)
+        if (last_ts is None or last_score is None or not math.isfinite(last_ts) or
+                not math.isfinite(last_score) or now_ts < last_ts):
+            return False
+        # A stale sequence cannot be revived by one new strong score: doing so
+        # would pair an hours-old high with the current round and grant L2.
+        if now_ts - last_ts > freshness:
+            return False
+        if now_ts - last_ts < gap:
+            if score < need or last_score - score > max_drop:
+                return False
+        else:
+            seen.append((now_ts, score))
+            del seen[:-rounds]
+    else:
+        seen.append((now_ts, score))
+        del seen[:-rounds]
+    if len(seen) < rounds:
+        return False
+    for i, item in enumerate(seen):
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            return False
+        at = _to_float(item[0], None)
+        value = _to_float(item[1], None)
+        if at is None or value is None or not math.isfinite(at) or not math.isfinite(value) or value < need:
+            return False
+        if i > 0:
+            prev_at = _to_float(seen[i-1][0], None)
+            prev_score = _to_float(seen[i-1][1], None)
+            if (prev_at is None or prev_score is None or not math.isfinite(prev_at) or
+                    not math.isfinite(prev_score) or at - prev_at < gap or prev_score - value > max_drop):
+                return False
+    latest_ts = _to_float(seen[-1][0], None)
+    return latest_ts is not None and math.isfinite(latest_ts) and now_ts - latest_ts <= freshness
 
 
 def _go_admitted(kind, rule_id=""):
@@ -3264,6 +3346,17 @@ def _flow_round_prepare(ContextInfo, positions, total, moment):
     return _STATE["round_flow"]
 
 
+def _side_round_prepare(moment):
+    """Decode the cloud side-policy snapshot once per round; never reads external data."""
+    try:
+        st = side_policy_state(PARAMS, {"day": day_key(moment), "now_ts": _now_ts()})
+    except Exception as exc:
+        _warn_once("side_policy_decode", "side policy decode raised: %s" % repr(exc)[:120])
+        st = _side_fail_closed("side_policy_decode_failed")
+    _STATE["side_policy_last"] = st
+    return st
+
+
 def _flow_blend_for(symbol, moment):
     """Post-composition amount multiplier in [0.80,1.20]; 1.0 = zero change.
 
@@ -3338,8 +3431,10 @@ def _flow_readout():
     hit = int(tally.get("hit") or 0)
     miss = int(tally.get("miss") or 0)
     _STATE["flow_tally"] = {"hour": "", "hit": 0, "miss": 0}
+    side = _STATE.get("side_policy_last") or {}
     _log("flow vol_state=%s r_yest=%s r_ma5=%s src=%s reason=%s market_delta=%s sectors=%d "
-         "sector_hit=%d/%d state=%s pos_rel=%.3f decision=%s qwhy=%s" % (
+         "sector_hit=%d/%d state=%s pos_rel=%.3f decision=%s qwhy=%s "
+         "side mode=%s level=%s slope=%s gap=%s tgt=%s left=%s right=%s new=%s add=%s latch=%s" % (
              vol.get("vol_state") or "neutral",
              "na" if vol.get("r_yest") is None else "%.4f" % float(vol.get("r_yest")),
              "na" if vol.get("r_ma5") is None else "%.4f" % float(vol.get("r_ma5")),
@@ -3351,7 +3446,17 @@ def _flow_readout():
              snap.get("market_state") or "-",
              float(quadrant.get("pos_rel") or 0.0),
              quadrant.get("decision") or "neutral",
-             quadrant.get("reason") or "-"))
+             quadrant.get("reason") or "-",
+             side.get("mode") or "legacy",
+             side.get("level") if side.get("level") is not None else "na",
+             "na" if side.get("slope_delta") is None else "%.4f" % float(side.get("slope_delta")),
+             "na" if side.get("gap_pct") is None else "%.4f" % float(side.get("gap_pct")),
+             "na" if side.get("target_multiplier") is None else "%.3f" % float(side.get("target_multiplier")),
+             "na" if side.get("left_weight") is None else "%.3f" % float(side.get("left_weight")),
+             "na" if side.get("right_weight") is None else "%.3f" % float(side.get("right_weight")),
+             side.get("allow_new") if side.get("allow_new") is not None else "na",
+             side.get("allow_add") if side.get("allow_add") is not None else "na",
+             side.get("latch_active") if side.get("latch_active") is not None else "na"))
 
 
 def _spent_buy_amount(orders, buy_prefixes, day):
@@ -3487,6 +3592,7 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     return {
         "symbol": symbol,
         "day": day,
+        "now_ts": _now_ts(),
         "weekday": moment.weekday(),
         "closed_days": set(PARAMS.get("closed_days") or []),
         "hhmm": hhmm_now(moment),
@@ -3809,6 +3915,7 @@ def sizing_cap(ctx, positions, intent="new", pending_buys=None):
     if not bool(PARAMS.get("sizing_enabled", False)):
         return None, "sizing_disabled", ""
     sized = _sizing_view(ctx, positions, pending_buys)
+    sized["side_target_multiplier"] = side_target_multiplier(PARAMS, sized, intent)
     caps = buy_size_caps(PARAMS, sized)
     # FLOW-BLEND 2026-11-20: the four-quadrant reading lands on the AMOUNT, not
     # on a gate (owner ruling). Multiplying per_trade here is the carrier-side
@@ -3823,6 +3930,8 @@ def sizing_cap(ctx, positions, intent="new", pending_buys=None):
     # while still respecting every hard cap (a 4000-cash account still refuses).
     if caps.get("per_trade") is not None:
         blend = _flow_blend_for(ctx.get("symbol"), _STATE.get("round_moment"))
+        style = side_style_weight(PARAMS, sized, ctx.get("entry_style"))
+        blend = combine_side_weight(PARAMS, blend, style)
         if blend != 1.0:
             base = sized.get("total_asset")
             if base is None:
@@ -4377,6 +4486,7 @@ def run_round(ContextInfo, moment):
     # one snapshot decode, not one per symbol. A missing reading abstains; it
     # never becomes a fabricated zero.
     _flow_round_prepare(ContextInfo, positions, total, moment)
+    _side_round_prepare(moment)
     _flow_log_key = "%s_%d" % (day_key(moment), moment.hour)
     if _STATE.get("flow_log_key") != _flow_log_key:
         _STATE["flow_log_key"] = _flow_log_key
@@ -4686,8 +4796,9 @@ def run_round(ContextInfo, moment):
                 # "do not chase a name we just sold into strength". The T leg
                 # is exempt: it carries its own sizing chain and is a round
                 # trip, not a re-entry.
-                if (PARAMS.get("tp_rebuy_block") and intent in ("new", "add")
-                        and _tp_fired(day, symbol, orders)):
+                _tp_fired_today = bool(PARAMS.get("tp_rebuy_block") and intent in ("new", "add")
+                                       and _tp_fired(day, symbol, orders))
+                if _tp_fired_today:
                     _tp_tally_bucket("blocked").add(symbol)
                     summary["skipped"].append({"short": short, "reason": "tp_rebuy_block"})
                     continue
@@ -4701,6 +4812,13 @@ def run_round(ContextInfo, moment):
                 _quadrant = (_STATE.get("round_flow") or {}).get("quadrant") or {}
                 if intent in ("new", "add") and _quadrant.get("block"):
                     summary["skipped"].append({"short": short, "reason": "flow_quadrant_block"})
+                    continue
+                _side_stable = _side_left_stable(signal, ctx, now_ts)
+                _side_ok, _side_why = side_buy_allowed(
+                    PARAMS, ctx, signal, intent, ctx.get("position_qty"), _tp_fired_today,
+                    (day, symbol) in _STATE["buy_intents"], _side_stable)
+                if not _side_ok:
+                    summary["skipped"].append({"short": short, "reason": _side_why})
                     continue
             if signal["side"] == "sell":
                 # Sell chain (tomorrow's 000520 disposal runs through here): the
@@ -4832,6 +4950,7 @@ def run_round(ContextInfo, moment):
             # cap stays baked as corroborating evidence only.
             # DYN-SIZE-IN-SANDBOX: the sizing chain is ANDed with the caps above,
             # never a replacement for them: it can only make this order smaller.
+            ctx["entry_style"] = signal.get("entry_style")
             sized_amount, why, note = sizing_cap(ctx, positions, intent, pending_rows)
             # CASH-PROBE 2026-11-18 (read-only, bounded): why every NEW buy is
             # sizing_amount_unavailable while cash/equity readouts look healthy.

@@ -1,0 +1,13 @@
+# quant-carrier-side-policy-retry.timer — 13:00–15:59 每 30 秒重试 SSH 并清理 applied req。
+[Unit]
+Description=Retry and reap urgent side-policy carrier publishes
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 13:*:00/30
+OnCalendar=Mon..Fri *-*-* 14:*:00/30
+OnCalendar=Mon..Fri *-*-* 15:*:00/30
+Persistent=true
+Unit=quant-carrier-side-policy.service
+
+[Install]
+WantedBy=timers.target

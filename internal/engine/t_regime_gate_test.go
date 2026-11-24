@@ -59,6 +59,26 @@ func TestRegimeGateBlocksBullBear(t *testing.T) {
 	}
 }
 
+// TestRegimeGatePolicyBearAllowed 验证 bear 条件放行且 legacy 行为不变。
+func TestRegimeGatePolicyBearAllowed(t *testing.T) {
+	_, r := regimeFix(t, 10, 30, func(p *paper.TParams, now time.Time) {
+		p.MarketState = "bear"
+		p.MarketStateAt = now.Add(-time.Minute)
+		p.SidePolicyEnabled = true
+		p.SidePolicyMode = "bear"
+	})
+	if why := r.regimeBlock(); why != "" {
+		t.Fatalf("policy bear should allow T entry, got %q", why)
+	}
+	_, r2 := regimeFix(t, 10, 30, func(p *paper.TParams, now time.Time) {
+		p.MarketState = "bear"
+		p.MarketStateAt = now.Add(-time.Minute)
+	})
+	if why := r2.regimeBlock(); why == "" {
+		t.Fatal("legacy bear must still block T")
+	}
+}
+
 // H2 空串 ⇒ 弃权放行（不是拦）。写成 fail-closed 会让默认配置下所有账号的 T 立刻全停。
 func TestRegimeGateAbstainsWhenMachineOff(t *testing.T) {
 	f, r := regimeFix(t, 10, 30, func(p *paper.TParams, now time.Time) {})

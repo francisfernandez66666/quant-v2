@@ -65,7 +65,7 @@ def derive(snapshot, params_doc):
         # （"因子战法#118"），json.loads 会把 \uXXXX 还原成真中文写进 BAKED 块。
         # 载体归因只用 rule["id"]，不用 name，所以派生时把 name 收敛成 id。
         item = {k: rule[k] for k in
-                ("factors", "weights", "directions", "buy_threshold") if k in rule}
+                ("factors", "weights", "directions", "buy_threshold", "entry_style") if k in rule}
         item["id"] = rid
         item["name"] = rid
         safe_rules.append(item)

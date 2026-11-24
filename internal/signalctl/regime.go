@@ -46,6 +46,8 @@ type Regime struct {
 	// MaxPosPct 状态机建议最大仓位比例（0=未启用）。**不参与定权连乘**（已由 MarketState 档位覆盖，
 	// 二次相乘属"同一风险双罚"，违反方案 §5 测试锁）；仅作 shadow 读数与既有 auto 谨慎层消费。
 	MaxPosPct float64 `json:"max_pos_pct,omitempty"`
+	// SidePolicy 熊市左右侧比例与牛市镜像；总闸关闭时 Enabled=false/Mode=legacy。
+	SidePolicy SidePolicyState `json:"side_policy,omitempty"`
 
 	// RiskTier 合成风险档：Red/Yellow/""（空=无档）。Red 默认走**权重收束**（tier_scales.Red），
 	// 只有 RedBlockNewBuy=true 时才硬拦新开仓（§N6-RISK owner 裁决：收束优先，不全拒）。
