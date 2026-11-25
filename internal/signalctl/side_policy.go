@@ -176,12 +176,20 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 
 	bearMode := strings.TrimSpace(in.MarketState) == "bear" || strongOut || worsening
 	bullMode := strings.TrimSpace(in.MarketState) == "bull" && strongIn && improving
-	// 2026-11-25 owner：开盘资金流/斜率还没凑齐"一轮"时，绝不落 range 满仓。
-	// 默认 bear L1（禁新仓；配合 bear AM ramp 0.30 ⇒ 当天只放 30% 动态仓位），
-	// 等牛熊数据齐、反转信号出现后再由加急烘入链立刻改剧本。
+	// 2026-11-25 owner 修正：开盘"默认熊市"只是数据未齐时的**临时剧本**，不是收紧——
+	// 允许 new/add，总动态仓位封在 35%（bear AM ramp 0.35 × TM 1.0）。
+	// 缺失的输入一律按弃权（绝不落 range 满仓）；数据齐后再由开盘/反转两条
+	// urgent req 链立刻重烘一次。
 	if !marketOK || !slopeOK {
-		cold := FailClosedSidePolicy(st.Day, in.Now, "side_policy_cold_start_bear")
-		cold.Latch = in.Latch
+		cold := SidePolicyState{
+			Enabled: true, Day: st.Day, Mode: SidePolicyBear, Level: 0,
+			AllowNew: true, AllowAdd: true, TargetMultiplier: 1.0,
+			LeftWeight: 1.0, RightWeight: 1.0, Latch: in.Latch,
+			Reason: "side_policy_cold_start_bear", AsOf: in.AsOf,
+		}
+		if !cold.AsOf.IsZero() {
+			cold.AsOfUnix = cold.AsOf.Unix()
+		}
 		cold.LatchUntilUnix = st.LatchUntilUnix
 		return cold
 	}

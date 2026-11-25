@@ -249,6 +249,8 @@ func TestSidePolicyPM1300StaleIndexDoesNotFire(t *testing.T) {
 	now := sideTestTime(13, 0)
 	setSideIndexCache(e, now, -2.0, true)
 	e.updateSidePolicy(now, &signalctl.Regime{MarketState: "bear"})
+	// 开盘首烘（cold_start_open）本来就会写一次 req；先消费掉，再验 PM 分支不被误触发。
+	_ = os.Remove(e.sideUrgentReqPath)
 	if _, err := os.Stat(e.sideUrgentReqPath); !os.IsNotExist(err) {
 		t.Fatalf("stale index must not fire urgent, err=%v", err)
 	}
@@ -259,6 +261,8 @@ func TestSidePolicyPM1300LateSampleDoesNotFire(t *testing.T) {
 	now := sideTestTime(13, 6)
 	setSideIndexCache(e, now, -2.0, false)
 	e.updateSidePolicy(now, &signalctl.Regime{MarketState: "bear"})
+	// 同上：先消费开盘首烘 req，再看 13:05 迟到样本是否另写 PM latch。
+	_ = os.Remove(e.sideUrgentReqPath)
 	if _, err := os.Stat(e.sideUrgentReqPath); !os.IsNotExist(err) {
 		t.Fatalf("sample after 13:05 must not create latch, err=%v", err)
 	}
@@ -270,6 +274,8 @@ func TestSidePolicyPM1300WaitsForMissingFlowBranch(t *testing.T) {
 	now := sideTestTime(13, 0)
 	setSideIndexCache(e, now, -0.5, false)
 	e.updateSidePolicy(now, &signalctl.Regime{MarketState: "bear"})
+	// 同上：先消费开盘首烘 req，避免把"cold_start_open 已写过"误读成 PM 分支触发。
+	_ = os.Remove(e.sideUrgentReqPath)
 	if _, err := os.Stat(e.sideUrgentReqPath); !os.IsNotExist(err) {
 		t.Fatalf("index branch alone must not finish checkpoint before flow branch is ready: %v", err)
 	}

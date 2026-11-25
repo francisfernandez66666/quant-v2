@@ -1124,7 +1124,7 @@ def test_side_time_ramp_neutral_modes_and_t_leg():
 def test_side_time_ramp_am_band():
     knobs = params()
     assert rs.side_time_ramp(knobs, _ramp_state("bull"), "09:45", 0) == 0.70
-    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "09:45", 0) == 0.30
+    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "09:45", 0) == 0.35
 
 
 def test_side_time_ramp_pm_without_latch():
@@ -1136,7 +1136,7 @@ def test_side_time_ramp_pm_without_latch():
 def test_side_time_ramp_pm_latch_holds_am_band():
     knobs = params()
     assert rs.side_time_ramp(knobs, _ramp_state("bull", latch=True), "13:30", 0) == 0.70
-    assert rs.side_time_ramp(knobs, _ramp_state("bear", latch=True), "13:30", 0) == 0.30
+    assert rs.side_time_ramp(knobs, _ramp_state("bear", latch=True), "13:30", 0) == 0.35
 
 
 def test_side_time_ramp_full_at_boundary_ignores_latch():
@@ -1157,7 +1157,7 @@ def test_side_time_ramp_invalid_table_falls_back_wholesale():
 
 def test_side_ramp_defaults_are_on_in_carrier_table():
     for key, expected in (("side_ramp_enabled", True), ("side_ramp_bull_am", 0.70),
-                          ("side_ramp_bull_pm", 1.00), ("side_ramp_bear_am", 0.30),
+                          ("side_ramp_bull_pm", 1.00), ("side_ramp_bear_am", 0.35),
                           ("side_ramp_bear_pm", 0.50), ("side_ramp_pm_check_at", "13:00"),
                           ("side_ramp_full_at", "14:00")):
         assert rs.SIZING_DEFAULTS[key] == expected

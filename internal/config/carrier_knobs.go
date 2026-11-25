@@ -219,8 +219,8 @@ const (
 	carrierSideRampOn     = true
 	carrierSideRampBullAM = 0.70
 	carrierSideRampBullPM = 1.00
-	// 2026-11-25 owner 修正：开盘默认熊市只放 30% 动态仓位（原 0.35）。
-	carrierSideRampBearAM    = 0.30
+	// 2026-11-25 owner 修正：开盘默认熊市放 35% 动态仓位（0.30 是中间稿，已放宽）。
+	carrierSideRampBearAM    = 0.35
 	carrierSideRampBearPM    = 0.50
 	carrierSideRampPMCheckAt = "13:00"
 	carrierSideRampFullAt    = "14:00"

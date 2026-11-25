@@ -45,11 +45,12 @@ type sideFlowState struct {
 	GapAt           time.Time
 	PMChecked       bool
 	UrgentWritten   bool
-	// 2026-11-25：开盘默认 bear，牛熊数据齐后若剧本翻成 bull，走 13:00 同一条
-	// urgent req 机制立刻烘入（不设 no_new latch）。每个交易日最多一次。
-	LastMode        signalctl.SidePolicyMode
-	ReversalWritten bool
-	Latch           signalctl.SidePolicyLatch
+	// 2026-11-25：开盘默认 bear，两条 urgent req 各当天最多一次——
+	// ① 开盘先烘一次（缺数按弃权）；② 数据齐后再烘一次（反转/确认）。
+	ColdStartBakeWritten bool
+	DataCompleteBaked    bool
+	LastMode             signalctl.SidePolicyMode
+	Latch                signalctl.SidePolicyLatch
 }
 
 func newSideFlowState() sideFlowState {
@@ -446,18 +447,23 @@ func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 	e.sideMu.Unlock()
 	e.writeSidePolicyLatest(st, now)
 
-	// 2026-11-25 owner：开盘默认 bear 只是"数据未齐"的临时剧本。资金流、斜率与指数
-	// 都齐了且剧本翻成 bull 时，立刻走 13:00 同一条 urgent req 链重烘下发；
-	// 这是**反转**，不粘 no_new latch（req kind=reversal，until 到收盘）。
+	// 2026-11-25 owner：两条 urgent req，各当天最多一次——
+	// ① 开盘先烘一次：不管数据齐不齐，先把"缺数按弃权 + 35% 动态仓位"的剧本推下去；
+	// ② 数据齐后再烘一次：这是反转/确认（bear/range/bull 都烘），别等 13:00 常规轮。
 	e.sideMu.RLock()
-	lastMode, reversalWritten := e.sideFlow.LastMode, e.sideFlow.ReversalWritten
+	coldDone, dataDone := e.sideFlow.ColdStartBakeWritten, e.sideFlow.DataCompleteBaked
 	e.sideMu.RUnlock()
-	if enabled && flowValid && indexValid && !math.IsNaN(slope) &&
-		st.Mode == signalctl.SidePolicyBull && lastMode != signalctl.SidePolicyBull &&
-		!reversalWritten {
-		if e.writeSideUrgentReq(now, "reversal_bear_to_bull", "reversal", "15:00") {
+	if enabled && !coldDone {
+		if e.writeSideUrgentReq(now, "cold_start_open", "reversal", "15:00") {
 			e.sideMu.Lock()
-			e.sideFlow.ReversalWritten = true
+			e.sideFlow.ColdStartBakeWritten = true
+			e.sideMu.Unlock()
+		}
+	}
+	if enabled && !dataDone && flowValid && indexValid && !math.IsNaN(slope) {
+		if e.writeSideUrgentReq(now, "data_complete_reversal", "reversal", "15:00") {
+			e.sideMu.Lock()
+			e.sideFlow.DataCompleteBaked = true
 			e.sideMu.Unlock()
 		}
 	}

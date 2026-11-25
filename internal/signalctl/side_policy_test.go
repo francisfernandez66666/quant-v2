@@ -170,7 +170,8 @@ func TestSidePolicyInvalidInputsAbstainAndPartialConfirmationDoesNotFlip(t *test
 	st = DecideSidePolicy(in)
 	// 2026-11-25 owner：资金流未齐 ⇒ 默认 bear L1（禁新仓），指数单腿绝不能
 	// 把剧本翻成 bull，也不能借"range"名义把动态仓位打满。
-	if st.Mode != SidePolicyBear || st.AllowNew || !st.AllowAdd {
+	// 2026-11-25 owner 修正：资金流未齐 ⇒ 冷启动 bear 剧本，但允许 new/add（35% 动态仓位）。
+	if st.Mode != SidePolicyBear || !st.AllowNew || !st.AllowAdd || st.TargetMultiplier != 1.0 {
 		t.Fatalf("single index rise must not flip mode or admission: %+v", st)
 	}
 }
@@ -454,8 +455,9 @@ func TestStrongRightRebuyFailsClosed(t *testing.T) {
 	}
 }
 
-// 2026-11-25 owner：开盘资金流/斜率没齐一轮时，不许落 range 放满动态仓位。
-// 默认 bear L1（禁新仓）+ bear AM ramp 0.30 ⇒ 上午只有 30% 动态仓位。
+// 2026-11-25 owner：开盘默认 bear 只是数据未齐的临时剧本——允许 new/add，
+// 总动态仓位封 35%（bear AM ramp 0.35 × TM 1.0）；缺失输入一律按弃权，
+// 绝不落 range 满仓。
 func TestColdStartDefaultsToBear(t *testing.T) {
 	now := time.Date(2026, 11, 25, 9, 35, 0, 0, time.FixedZone("CST", 8*3600))
 	cases := []SidePolicyInput{
@@ -467,9 +469,10 @@ func TestColdStartDefaultsToBear(t *testing.T) {
 	}
 	for i, in := range cases {
 		st := DecideSidePolicy(in)
-		if st.Mode != SidePolicyBear || st.Level != 1 || st.AllowNew || st.Reason != "side_policy_cold_start_bear" {
-			t.Fatalf("case %d: cold start got mode=%s level=%d new=%v reason=%s",
-				i, st.Mode, st.Level, st.AllowNew, st.Reason)
+		if st.Mode != SidePolicyBear || !st.AllowNew || !st.AllowAdd || st.TargetMultiplier != 1.0 ||
+			st.Reason != "side_policy_cold_start_bear" {
+			t.Fatalf("case %d: cold start got mode=%s new=%v add=%v tm=%v reason=%s",
+				i, st.Mode, st.AllowNew, st.AllowAdd, st.TargetMultiplier, st.Reason)
 		}
 	}
 }

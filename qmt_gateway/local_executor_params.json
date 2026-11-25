@@ -2133,7 +2133,7 @@
     "side_weight_hi": 1.2,
     "side_weight_lo": 0.8,
     "side_pm_index_rise_pct": 1,
-    "side_ramp_bear_am": 0.3,
+    "side_ramp_bear_am": 0.35,
     "side_ramp_bear_pm": 0.5,
     "side_ramp_bull_am": 0.7,
     "side_ramp_bull_pm": 1,

@@ -27464,7 +27464,7 @@ python3 - <<'PY' || fail240 "D7 七键三处不同源（§240 ⑨）"
 import json, pathlib, re, sys
 p = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
 need = {"side_ramp_enabled": True, "side_ramp_bull_am": 0.70, "side_ramp_bull_pm": 1.00,
-        "side_ramp_bear_am": 0.30, "side_ramp_bear_pm": 0.50,
+        "side_ramp_bear_am": 0.35, "side_ramp_bear_pm": 0.50,
         "side_ramp_pm_check_at": "13:00", "side_ramp_full_at": "14:00"}
 for k, v in need.items():
     assert p.get(k) == v, (k, p.get(k))
@@ -27632,7 +27632,7 @@ python3 -m pytest qmt_gateway/tests/test_t_leg_wiring_20261125.py -q -k 'gate_op
 echo "ok - §241 §T-LEG-WIRING 锁通过（十一判定点：F1 ctx 接线/F2 tick 四字段/F3 三档/F4 价差来源/F5 金额/F6 读数/F7 分母归因/派生注册/端到端开腿，累计判定点 ${CNT241}）"
 echo ""
 
-echo "==> 242 §COLD-START-AND-VOL（2026-11-25 owner 追加：开盘默认熊市30% + 反转即时烘入 + 缩量阈值）..."
+echo "==> 242 §COLD-START-AND-VOL（2026-11-25 owner 修正：开盘默认熊市35%允许新仓 + 开盘/数据齐双烘入 + 缩量阈值）..."
 B242_FAILED=0
 fail242() {
 	echo "--- FAIL: §242 $*"
@@ -27641,20 +27641,24 @@ fail242() {
 }
 CNT242=0
 
-# ① 资金流/斜率没齐一轮时不得落 range 满仓（默认 bear L1，配合 bear AM ramp 0.30）。
+# ① 资金流/斜率没齐一轮时不得落 range 满仓；冷启动是 bear 剧本但**允许 new/add**，
+#    总动态仓位封 35%（bear AM ramp 0.35 × TM 1.0），缺失输入一律按弃权。
 CNT242=$((CNT242 + 1))
 grep -qF 'st.Reason != "side_policy_cold_start_bear"' \
 	internal/signalctl/side_policy_test.go || \
 	fail242 "冷启动默认熊市缺行为锁（§242 ①）"
 GO242_RC=0
 go test ./internal/signalctl -run 'TestColdStartDefaultsToBear' -count=1 >/dev/null 2>&1 || GO242_RC=$?
-[ "$GO242_RC" = "0" ] || fail242 "冷启动没回 bear L1（§242 ①）"
+[ "$GO242_RC" = "0" ] || fail242 "冷启动没回 bear 允许新仓（§242 ①）"
 
-# ② 反转走同一条 urgent req 链，但 kind=reversal、不带 no_new latch。
+# ② 开盘/数据齐两条 urgent req，各当天最多一次，kind=reversal、不带 no_new latch。
 CNT242=$((CNT242 + 1))
-grep -qF 'e.writeSideUrgentReq(now, "reversal_bear_to_bull", "reversal", "15:00")' \
+grep -qF 'e.writeSideUrgentReq(now, "cold_start_open", "reversal", "15:00")' \
 	internal/engine/side_policy_flow.go || \
-	fail242 "牛熊反转没写 urgent req（§242 ②）"
+	fail242 "开盘首烘 urgent req 没接上（§242 ②）"
+grep -qF 'e.writeSideUrgentReq(now, "data_complete_reversal", "reversal", "15:00")' \
+	internal/engine/side_policy_flow.go || \
+	fail242 "数据齐反转烘入 urgent req 没接上（§242 ②）"
 grep -qF 'e.writeSideUrgentReq(now, reason, "no_new", config.CarrierSidePMBlockUntil())' \
 	internal/engine/side_policy_flow.go || \
 	fail242 "13:00 加急链被改动（§242 ②）"
@@ -27669,19 +27673,19 @@ GO242_RC=0
 go test ./internal/signalctl -run 'TestVolStateDoubleGate' -count=1 >/dev/null 2>&1 || GO242_RC=$?
 [ "$GO242_RC" = "0" ] || fail242 "0.79/0.92 仍被判平量（§242 ③）"
 
-# ④ 开盘 30% 动态仓位：bear AM ramp 三处同值 0.30。
+# ④ 开盘 35% 动态仓位：bear AM ramp 三处同值 0.35。
 CNT242=$((CNT242 + 1))
-python3 - <<'PY' || fail242 "bear AM 0.30 三处不同源（§242 ④）"
+python3 - <<'PY' || fail242 "bear AM 0.35 三处不同源（§242 ④）"
 import json, pathlib, re, sys
 p = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
-assert p.get("side_ramp_bear_am") == 0.30, p.get("side_ramp_bear_am")
+assert p.get("side_ramp_bear_am") == 0.35, p.get("side_ramp_bear_am")
 go = pathlib.Path("internal/config/carrier_knobs.go").read_text()
-assert re.search(r"carrierSideRampBearAM\s*=\s*0\.30", go)
+assert re.search(r"carrierSideRampBearAM\s*=\s*0\.35", go)
 sys.path.insert(0, str(pathlib.Path.cwd()))
 from qmt_gateway import rules_sizing as rs
-assert rs.SIZING_DEFAULTS["side_ramp_bear_am"] == 0.30
+assert rs.SIZING_DEFAULTS["side_ramp_bear_am"] == 0.35
 PY
 
 [ "$B242_FAILED" = "0" ] || exit 1
-echo "ok - §242 §COLD-START-AND-VOL 锁通过（冷启动默认 bear/反转 urgent req 无 latch/缩量0.95/开盘30%动态仓位，累计判定点 ${CNT242}）"
+echo "ok - §242 §COLD-START-AND-VOL 锁通过（冷启动 bear 允许新仓/开盘+数据齐双烘入/缩量0.95/开盘35%动态仓位，累计判定点 ${CNT242}）"
 echo ""

@@ -458,7 +458,7 @@ PARAMS = {
     'side_policy': {},
     'side_policy_enabled': False,
     'side_policy_ttl_sec': 2700,
-    'side_ramp_bear_am': 0.3,
+    'side_ramp_bear_am': 0.35,
     'side_ramp_bear_pm': 0.5,
     'side_ramp_bull_am': 0.7,
     'side_ramp_bull_pm': 1,

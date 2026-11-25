@@ -320,7 +320,7 @@ SIZING_DEFAULTS = {
     "side_ramp_enabled": True,
     "side_ramp_bull_am": 0.70,
     "side_ramp_bull_pm": 1.00,
-    "side_ramp_bear_am": 0.30,
+    "side_ramp_bear_am": 0.35,
     "side_ramp_bear_pm": 0.50,
     "side_ramp_pm_check_at": "13:00",
     "side_ramp_full_at": "14:00",
