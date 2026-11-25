@@ -7,7 +7,6 @@
 set -uo pipefail
 SRC="${QUANT_DATA_DIR:-/var/lib/quant-trading-v2}"
 OUT="${BACKUP_OUT_DIR:-/var/backups/quant}"
-KEEP_DAYS="${KEEP_DAYS:-7}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 WORK="$(mktemp -d /tmp/quant-backup.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -134,6 +133,9 @@ fi
 # 裸 cp 会被 WorkBuddy brokered-bin 文件策略拦截（win 包构建 11-08 实测），用绝对路径。
 /bin/cp "$WORK/SNAPSHOT_OK" "$OUT/SNAPSHOT_OK" 2>/dev/null || true
 /bin/cp "$WORK/MANIFEST.json" "$OUT/MANIFEST.json" 2>/dev/null || true
-find "$OUT" -maxdepth 1 -name 'quant-*.tar.gz' -mtime "+$KEEP_DAYS" -delete 2>/dev/null || true
-printf 'BACKUP_RESULT=OK file=%s bytes=%s accounts_files=%s tar_rc=%s live_service_writes=allowed keep_days=%s\n' \
-  "$ARCHIVE" "$(stat -c %s "$ARCHIVE")" "$ACCOUNTS" "$trc" "$KEEP_DAYS"
+# 2026-11-25 owner 裁决：只保留**一份有效全量备份**。新归档通过成员校验之后
+# 才删所有旧 tar；失败时旧档原样保留，绝不出现"新的没落成、旧的先没了"。
+# 不再按 KEEP_DAYS 留多份——daily 全量每份含 10GB 库快照，留 3 份就吃掉 12GB。
+find "$OUT" -maxdepth 1 -name 'quant-*.tar.gz' ! -name "$(basename "$ARCHIVE")" -delete 2>/dev/null || true
+printf 'BACKUP_RESULT=OK file=%s bytes=%s accounts_files=%s tar_rc=%s live_service_writes=allowed keep=latest_only\n' \
+  "$ARCHIVE" "$(stat -c %s "$ARCHIVE")" "$ACCOUNTS" "$trc"
