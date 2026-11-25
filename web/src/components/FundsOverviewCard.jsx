@@ -27,8 +27,8 @@ import * as api from '../api/index.js'
 import { canStrictAny, FUNDS_READ_PERMS } from '../utils/perm.js'
 
 import BlindTag from './BlindTag.jsx'
-import { sideRampHint } from '../utils/sideRamp.js'
-import { dynamicUsedPct, formatDynamicUsedProcess, formatTargetProcess } from '../utils/dynamicPosition.js'
+import { sideRampHint, rampModeLabel } from '../utils/sideRamp.js'
+import { dynamicUsedPct, formatDynamicUsedProcess, formatTargetProcess, formatSlotRatioProcess } from '../utils/dynamicPosition.js'
 
 /** 金额：千分位 + 两位小数；非法/缺失显示“—”。 */
 function money(v) {
@@ -216,6 +216,10 @@ export default function FundsOverviewCard() {
                 {/* 2026-11-25 owner：目标本身怎么算出来的也要看得见，四个因子同帧下发。 */}
                 <Row label="动态目标算式" hint="总资产 × min(MS×TM, 天花板) × 分时 ramp">
                   {formatTargetProcess(funds)}
+                </Row>
+                {/* 2026-11-25 owner 澄清：要的是"此刻放到几成"，不是"持有多少"。 */}
+                <Row label="当前时段动态额度" hint={funds ? rampModeLabel(funds.target_ramp_src) : '—'}>
+                  {formatSlotRatioProcess(funds)}
                 </Row>
                 {/* 2026-11-25 owner：动态额度用了多少要和目标摆在一起看，并且把算式摆出来。
                     口径 cur_strat ÷ target（不是占总资产）；>100% 画红，不能夹成 100%。 */}

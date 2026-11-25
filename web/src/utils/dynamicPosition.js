@@ -37,6 +37,27 @@ export function formatDynamicUsedPct(funds) {
 const num2 = (v) => v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 /**
+ * formatSlotRatioProcess 当前时段开放的动态额度比例（owner 2026-11-25 澄清）。
+ *
+ *	当前时段动态目标(target) ÷ 未分时段的战略额度(total × min(MS×TM, 天花板)) = 时段开放比例
+ *
+ * 熊市上午 35%、13:00 后 50%、14:00 满额 100% —— 这行直接回答"此刻能放到几成"，
+ * 与"当前持仓占了多少额度"是两件事，不能混成一条读数。
+ */
+export function formatSlotRatioProcess(funds) {
+  if (!funds || typeof funds !== 'object') return '—'
+  const total = Number(funds.total_asset)
+  const ms = Number(funds.market_scale)
+  const tm = Number(funds.target_multiplier)
+  const cap = Number(funds.target_ceiling)
+  const slot = Number(funds.target)
+  if (![total, ms, tm, cap, slot].every((v) => Number.isFinite(v)) || total <= 0 || cap <= 0 || slot <= 0) return '—'
+  const full = total * Math.min(ms * tm, cap)
+  if (full <= 0) return '—'
+  return `${num2(slot)} ÷ ${num2(full)} = ${((slot / full) * 100).toFixed(0)}%`
+}
+
+/**
  * formatDynamicUsedProcess 把算式本身也摆出来：当前战略 ÷ 本时段目标 = 百分比。
  * 只给结果会让人怀疑分母选错（占总资产还是占目标）；把两腿都画出来，
  * 使用者当场就能复核"171.4% 是 60000/35000 来的，不是 60000/100000"。

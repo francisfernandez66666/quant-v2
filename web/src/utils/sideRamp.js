@@ -19,6 +19,16 @@ const PM_SUFFIX = '，14:00 满额';
  * @param {object|null|undefined} funds /api/funds/today 的 live.funds
  * @returns {string} 空串＝不渲染（D7 关闭 / 已满额 / 读数缺失）
  */
+/** rampModeLabel 只给档位名，不加时间线后缀；供"时段开放比例"那行复用。 */
+export function rampModeLabel(src) {
+  const s = String(src || '')
+  if (s === 'ramp_bear_am') return '熊市上午档'
+  if (s === 'ramp_bear_pm') return '熊市下午档'
+  if (s === 'ramp_bull_am') return '牛市上午档'
+  if (s === 'ramp_bull_pm') return '牛市下午档'
+  return '满额档'
+}
+
 export function sideRampHint(funds) {
   const src = String((funds && funds.target_ramp_src) || '');
   const ramp = Number(funds && funds.target_ramp);

@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import FundsOverviewCard from '../components/FundsOverviewCard.jsx'
 import FlowFactorCard from '../components/FlowFactorCard.jsx'
-import { dynamicUsedPct, formatDynamicUsedPct, formatDynamicUsedProcess, formatTargetProcess } from '../utils/dynamicPosition.js'
+import { dynamicUsedPct, formatDynamicUsedPct, formatDynamicUsedProcess, formatTargetProcess, formatSlotRatioProcess } from '../utils/dynamicPosition.js'
 
 const mocks = vi.hoisted(() => ({
   fetchFundsToday: vi.fn(),
@@ -62,6 +62,14 @@ describe('dynamicUsedPct 单一口径', () => {
     expect(formatDynamicUsedProcess({ cur_strat: 60000, target: 35000 })).toBe('60,000.00 ÷ 35,000.00 = 171.4%')
   })
 
+  it('当前时段动态额度 = 本时段目标 ÷ 未分时段的战略额度', () => {
+    const funds = frame().live.funds
+    expect(formatSlotRatioProcess(funds)).toBe('35,000.00 ÷ 100,000.00 = 35%')
+    expect(formatSlotRatioProcess({ ...funds, target: 50000 })).toBe('50,000.00 ÷ 100,000.00 = 50%')
+    expect(formatSlotRatioProcess({ ...funds, target: 100000 })).toBe('100,000.00 ÷ 100,000.00 = 100%')
+    expect(formatSlotRatioProcess({ ...funds, target: 0 })).toBe('—')
+  })
+
   it('动态目标算式摆出四个因子，缺因子画「—」', () => {
     expect(formatTargetProcess(frame().live.funds)).toBe('100,000.00 × min(1.000 × 1.00, 1.00) × 0.35 = 35,000.00')
     expect(formatTargetProcess({ total_asset: 100000, market_scale: 1 })).toBe('—')
@@ -82,12 +90,15 @@ describe('两处上屏', () => {
     render(<FundsOverviewCard />)
     expect(await screen.findByText('已占用动态仓位')).toBeTruthy()
     expect(screen.getByText('60,000.00 ÷ 35,000.00 = 171.4%')).toBeTruthy()
+    expect(screen.getByText('当前时段动态额度')).toBeTruthy()
+    expect(screen.getByText('35,000.00 ÷ 100,000.00 = 35%')).toBeTruthy()
   })
 
   it('首页量能卡也显示同一个百分比', () => {
     const funds = frame().live.funds
     render(<FlowFactorCard flow={{ known: false }} funds={funds} />)
     expect(screen.getByTestId('flow-target-process').textContent).toContain('100,000.00 × min(1.000 × 1.00, 1.00) × 0.35 = 35,000.00')
+    expect(screen.getByTestId('flow-slot-ratio').textContent).toContain('当前时段动态额度 35,000.00 ÷ 100,000.00 = 35%（熊市上午档）')
     expect(screen.getByTestId('flow-dynamic-used').textContent).toContain('当前已占用动态仓位 60,000.00 ÷ 35,000.00 = 171.4%')
   })
 
