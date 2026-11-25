@@ -17554,7 +17554,10 @@ CNT141=$((CNT141 + 1))
 CNT141=$((CNT141 + 1))
 ! grep -q 'targetRatio' "$EG141" || fail141 "engine.go 又出现就地重算的目标占比 ⇒ 与资金卡两套算式（§W-06 修的就是这个）"
 CNT141=$((CNT141 + 1))
-[ "$(grep -c 'math.Min' internal/engine/funds_today.go)" = "1" ] || fail141 "min(MS, 天花板) 的实现不止一处 ⇒ 两处可各自漂移"
+# D7 2026-11-25：算式仍是单点，但 shape 变成 min(MS×TM, 天花板) × ramp；
+# 注释里也写了 math.Min，所以必须按精确赋值行判（整词 grep -c 会把注释算成第二处）。
+[ "$(grep -c 'ratio := math.Min(ms\*targetMultiplier, ceiling) \* ramp' internal/engine/funds_today.go)" = "1" ] \
+	|| fail141 "min(MS×TM, 天花板)×ramp 的单一出口不在 ⇒ 两处可各自漂移"
 
 # —— ⑫⑬ W-08 凭据覆盖面 / W-01 签名配置 ——
 CNT141=$((CNT141 + 1))
@@ -23252,7 +23255,9 @@ grep -qE 'def _t_equity_basis\(total, macro, stale_sec\)' "$ST197" || fail197 "�
 CNT197=$((CNT197 + 1))
 grep -qF '"total_asset": t_total' "$ST197" || fail197 "base_ctx total_asset 未走回退值 t_total"
 CNT197=$((CNT197 + 1))
-grep -qF 't_total = _t_equity_basis(total, macro, stale_sec)' "$ST197" || fail197 "_run_t 未接 _t_equity_basis"
+# F7 2026-11-25：分母改成带来源的版本（_src），旧的纯数值函数只作兼容外观。
+grep -qF 't_total, t_total_src = _t_equity_basis_src(total, macro, stale_sec)' "$ST197" \
+	|| fail197 "_run_t 未接 _t_equity_basis_src（分母归因会丢）"
 
 # ② 柜台优先负锁：total 非 None 分支必须先返回，不能被烘参覆盖。
 # Python 按缩进精确切函数体（无 C 风格 }）。
@@ -23260,7 +23265,7 @@ PB197="$(/usr/local/bin/python3 -c "
 lines=open('$ST197',encoding='utf-8').read().splitlines()
 out=[];inside=False
 for ln in lines:
-    if ln.startswith('def _t_equity_basis('):
+    if ln.startswith('def _t_equity_basis_src('):
         inside=True;out.append(ln);continue
     if inside:
         if ln and not ln[0].isspace():
@@ -23313,15 +23318,15 @@ CNT197=$((CNT197 + 1))
 grep -qF 'def _holdings_value(positions, price_of):' qmt_gateway/qmt_internal_strategy.py \
 	|| fail197 "缺 _holdings_value（持仓市值退化为 0，T 腿全天无分母）"
 CNT197=$((CNT197 + 1))
-grep -qF 'holdings_value = _holdings_value(' qmt_gateway/qmt_internal_strategy.py \
-	|| fail197 "_holdings_value 写了没人调（恒空读数）"
+grep -qF 'holdings_value, holdings_src = _holdings_value_src(' qmt_gateway/qmt_internal_strategy.py \
+	|| fail197 "_holdings_value_src 写了没人调（分母只剩一半、归因也丢）"
 CNT197=$((CNT197 + 1))
 if grep -qF '    holdings_value = 0.0' qmt_gateway/qmt_internal_strategy.py; then
 	fail197 "持仓市值回到恒 0.0 起点（那台盒子上 T 腿会再次死在同一道闸）"
 fi
 CNT197=$((CNT197 + 1))
-grep -qF '_log("t_denom equity=%s holdings=%.0f"' qmt_gateway/qmt_internal_strategy.py \
-	|| fail197 "没有 t_denom 读数（分母到底哪一半是 0，下次又只能猜）"
+grep -qF '_log("t_denom equity=%s holdings=%.0f src=%s/%s"' qmt_gateway/qmt_internal_strategy.py \
+	|| fail197 "没有 t_denom 带 src 的读数（分母是哪一半、来自哪条腿都看不见）"
 CNT197=$((CNT197 + 1))
 grep -qF 'self.mod._holdings_value' qmt_gateway/tests/test_wiring_selfcontained_20261117.py \
 	|| fail197 "缺持仓市值行为腿（三档优先级 + 缺价不造数）"
@@ -24861,14 +24866,14 @@ grep -qE 'QuadrantBlockBuy[[:space:]]*=[[:space:]]*"block_buy"' "$QR219" || fail
 grep -qE 'QuadrantReduce[[:space:]]*=[[:space:]]*"reduce"' "$QR219" || fail219 "缺减仓决策态"
 grep -qE 'VolStateNeutral[[:space:]]*=[[:space:]]*"neutral"' "$QR219" || fail219 "缺平量态（原矩阵两态缺口未补）"
 
-# ② 阈值锁到赋值点（owner 定稿：放量1.2/1.0、缩量1.0/0.9、高档相对1.3）。
+# ② 阈值锁到赋值点（放量1.2/1.0、缩量1.0/0.95〔2026-11-25 owner 修正〕、高档相对1.3）。
 # 注意：锚点用 [[:space:]]* 容忍 gofmt 的对齐空格，但锁定变量名+数值本身——
 # 早前写成 gofmt 前的多空格字面，永远匹配不到＝假绿，这里已修正。
 CNT219=$((CNT219 + 1))
 grep -qE 'rYesSurge[[:space:]]*=[[:space:]]*1\.2' "$QR219" || fail219 "放量昨比阈值不是1.2"
 grep -qE 'rMa5Surge[[:space:]]*=[[:space:]]*1\.0' "$QR219" || fail219 "放量均比阈值不是1.0"
 grep -qE 'rYesShrink[[:space:]]*=[[:space:]]*1\.0' "$QR219" || fail219 "缩量昨比阈值不是1.0"
-grep -qE 'rMa5Shrink[[:space:]]*=[[:space:]]*0\.9' "$QR219" || fail219 "缩量均比阈值不是0.9"
+grep -qE 'rMa5Shrink[[:space:]]*=[[:space:]]*0\.95' "$QR219" || fail219 "缩量均比阈值不是0.95（0.79/0.92必须判缩量）"
 grep -qE 'posRelHighLow[[:space:]]*=[[:space:]]*1\.3' "$QR219" || fail219 "高档相对阈值不是1.3（owner 裁决3相对口径）"
 
 # ③ 决策映射锁（三行case，锚到完整字面行）。
@@ -26824,7 +26829,7 @@ fi
 CNT238=$((CNT238 + 1))
 grep_q 'def bake_tp_plan(qc=None):' HR238 F || fail238 "缺 bake_tp_plan"
 grep_q 'def tp_plan_digest(tp_plan):' HR238 F || fail238 "缺 tp_plan_digest"
-grep_q 'for k in ("strategy", "open_date", "stage", "manual", "tp_pct")' HR238 F || fail238 "指纹把峰值也算进去了（每个整点都会投递一次）"
+grep_q 'for k in ("strategy", "open_date", "stage", "manual", "tp_pct",' HR238 F || fail238 "指纹把峰值也算进去了（每个整点都会投递一次）"
 grep_q '"tp_plan": tp_digest' HR238 F || fail238 "tp_digest 没进 sha（新开仓/卖半不会触发重烘）"
 TPPOS238=$( { grep -n 'tp_plan = bake_tp_plan(qc)' scripts/carrier_hot_reload_gz.py || true; } | head -1 | cut -d: -f1)
 SHAPOS238=$( { grep -n 'payload = json.dumps({"wl": wl' scripts/carrier_hot_reload_gz.py || true; } | head -1 | cut -d: -f1)
@@ -26910,6 +26915,127 @@ if grep_q 'tally\["known"\] = int' ST238 F; then
 	fail238 "读数退回按轮累加（covered 会显示成 40 而不是持仓数 4）"
 fi
 
+# ⑯ D1：rule_take_profit 的浮盈闸必须在场，且分母只算一次。
+#     "止盈不是止损"——水下交给 breakdown/reduce，两条 TP 腿都不许抢先。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D1 rule_take_profit 浮盈闸缺失/分母重复计算（§238 ⑯）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/local_executor.py").read_text(encoding="utf-8")
+m = re.search(r"^def rule_take_profit\(params, ctx\):.*?(?=^def |\Z)", s, re.M | re.S)
+body = m.group(0) if m else ""
+need = ('pnl_now = _tp_pnl_pct(', 'pnl_now <= params["zero_amount"]',
+        'if pnl_now < float(tp_pct):')
+assert all(x in body for x in need), "missing anchors: %s" % [x for x in need if x not in body]
+assert body.count('pnl_now = _tp_pnl_pct(') == 1, "pnl_now computed more than once"
+PY
+
+# ⑰ D1：龙头开板清仓排在浮盈闸之前（不要求"先涨到止盈点"）。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D1 龙头开板腿被挪到浮盈闸之后（§238 ⑰）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/local_executor.py").read_text(encoding="utf-8")
+m = re.search(r"^def rule_take_profit_clear\(.*?(?=^def |\Z)", s, re.M | re.S)
+body = m.group(0) if m else ""
+assert "tp_dragon_open_no_reseal" in body and "pnl_now = _tp_pnl_pct(" in body
+assert body.index("tp_dragon_open_no_reseal") < body.index("pnl_now = _tp_pnl_pct(")
+PY
+
+# ⑱ D1 负锁：两条腿都不许把零写回裸数字（PARAMS 才是唯一真源）。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D1 止盈腿出现裸零（§238 ⑱）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/local_executor.py").read_text(encoding="utf-8")
+for name in ("rule_take_profit", "rule_take_profit_clear"):
+    m = re.search(r"^def %s\(.*?(?=^def |\Z)" % name, s, re.M | re.S)
+    body = m.group(0) if m else ""
+    assert body, name
+    assert "<= 0)" not in body and "< 0.0" not in body, name
+PY
+
+# ⑲ D1 负锁：缺读数一律弃权，不许 null 静默放行。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D1 出现 null 静默放行形态（§238 ⑲）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/local_executor.py").read_text(encoding="utf-8")
+for name in ("rule_take_profit", "rule_take_profit_clear"):
+    m = re.search(r"^def %s\(.*?(?=^def |\Z)" % name, s, re.M | re.S)
+    assert "if pnl_now is not None and" not in (m.group(0) if m else ""), name
+PY
+
+# ⑳ D2：段重置三件套 + stage==0 硬前置 + 开仓价进载荷。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D2 bake_tp_plan 段重置三件套缺失（§238 ⑳）"
+import ast, pathlib
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+assert "TP_REBASE_SHARE_PCT = 50.0" in s
+tree = ast.parse(s)
+fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef)
+           and n.name == "bake_tp_plan"), None)
+body = ast.get_source_segment(s, fn) or "" if fn else ""
+for x in ('TP_REBASE_SHARE_PCT', 'st["stage"] == 0', 'st["open_price"]'):
+    assert x in body, x
+PY
+
+# ㉑ D2：digest 扩 open_price 一维，但 peak 每天在动，绝不能进 sha。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D2 digest 没含 open_price 或把 peak 算进 sha（§238 ㉑）"
+import ast, pathlib, re
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+tree = ast.parse(s)
+fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef)
+           and n.name == "tp_plan_digest"), None)
+body = ast.get_source_segment(s, fn) or "" if fn else ""
+m = re.search(r"for k in \((.*?)\)", body, re.S)
+keys = m.group(1) if m else ""
+assert '"open_price"' in keys, keys
+assert '"peak"' not in keys, keys
+PY
+
+# ㉒ D2 负锁：分母不许把开仓价写回 position_cost（两条链各走各的）。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D2 开仓价与柜台成本链被合并（§238 ㉒）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+bad = [l for l in s.splitlines() if 'ctx["position_cost"] =' in l and "open_price" in l]
+assert not bad, bad
+assert '"position_cost": _basis_of(' in s
+PY
+
+# ㉓ D3：Go 常量必须是精确赋值行（全文 grep 3.0 会把别的旋钮算进来）。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D3 carrierTPPeakArmPct 常量不是 3.0（§238 ㉓）"
+import pathlib
+lines = pathlib.Path("internal/config/carrier_knobs.go").read_text(encoding="utf-8").splitlines()
+assert len([l for l in lines if l == "\tcarrierTPPeakArmPct = 3.0"]) == 1
+PY
+grep_q "'tp_peak_arm_pct': 3," LE238 F || fail238 "D3 载体兜底表 tp_peak_arm_pct 不是 3（§238 ㉔）"
+CNT238=$((CNT238 + 1))
+
+# ㉕ D4：卖出链五段逐字按序（reduce 必须在 breakdown 之前拿到那一轮）。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D4 卖出链顺序错（§238 ㉕）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"for kind, rule in \((.*?)\):", s, re.S)
+seg = m.group(1) if m else ""
+need = ['("stop_loss", rule_stop_loss)', '("reduce", rule_reduce_position)',
+        '("take_profit_clear", rule_take_profit_clear)',
+        '("take_profit", rule_take_profit)', '("breakdown", rule_breakdown_sell)']
+pos = [seg.find(x) for x in need]
+assert all(p >= 0 for p in pos) and pos == sorted(pos), pos
+PY
+
+# ㉖ D4：后置的 rule_reduce_position 调用必须真删掉，链里恰好一处。
+CNT238=$((CNT238 + 1))
+python3 - <<'PY' || fail238 "D4 reduce 后置调用回潮或链里不止一处（§238 ㉖）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert s.count("rule_reduce_position(PARAMS") == 0
+assert s.count('("reduce", rule_reduce_position)') == 1
+assert s.index('("reduce", rule_reduce_position)') < \
+    s.index('("breakdown", rule_breakdown_sell)')
+PY
+
 [ "$B238_FAILED" = "0" ] || exit 1
 echo "ok - §238 §TP-LADDER 锁通过（全平腿退役+卖半/清剩余两条腿实盘直上+板宽三档5/8与6/10+破位有浮盈只减半+当日止盈禁回买+t_leg豁免+盒内计划/峰值/阶段三读且短码6位严格+龙头开板fail-closed且封板判据用乘子+云端按成交重放并把手动仓标出+指纹不含峰值且在sha之前+退役键真删不扩通配+卖出成交归因 sell:码:tp|tt:日 取成交时刻+小时读数按持仓计数且弃权可见，累计判定点 ${CNT238}）"
 echo ""
@@ -26921,7 +27047,9 @@ fail239() {
 	FAIL=1
 	B239_FAILED=1
 }
-CNT239=32
+# §17.7 写的是"交付后累计 42"：段内原有 3 处字面累加 + 本批 10 处新累加共 13，
+# 所以这里的起点必须写成 42-13=29，收尾打印才真的是 42（写 42 会打印成 55）。
+CNT239=29
 
 # ①~⑳ 静态契约全部用精确字符串，避免正则转义把锁变成摆设。
 PY239_STATIC_RC=0
@@ -26994,8 +27122,8 @@ checks = [
     ('qmt_gateway/rules_factor.py', 'signal["entry_style"]', '因子信号 entry_style'),
     ('internal/research/apply.go', 'EntryStyle string', 'AppliedFactorEntry 持久风格'),
     ('internal/combat_agent/agent.go', 'Score:        sig.Score', 'Go 信号转换 Score'),
-    ('internal/engine/funds_today.go', 'ratio := math.Min(ms*targetMultiplier, ceiling)', '战略目标公式'),
-    ('internal/engine/funds_today.go', 'return fundsTargetCurRoomWithMultiplier(total, ms, ceiling, 1.0', 'T 包装 TM=1'),
+    ('internal/engine/funds_today.go', 'ratio := math.Min(ms*targetMultiplier, ceiling) * ramp', '战略目标公式（ramp 乘在 min 之外）'),
+    ('internal/engine/funds_today.go', 'return fundsTargetCurRoomWithScales(total, ms, ceiling, 1.0, 1.0', 'T 包装 TM=1/ramp=1'),
     ('internal/engine/intraday_t_live.go', 'TargetMultiplier: 1.0', 'T→战略 TM=1'),
     ('internal/signalctl/side_policy.go', 'if intent == "t_leg" || intent == "reduce"', 'Go T/reduce TM=1'),
     ('qmt_gateway/rules_sizing.py', 'if intent in ("t_leg", "reduce"):', '载体 T/reduce TM=1'),
@@ -27015,14 +27143,14 @@ missing=[]
 for path, needle, label in checks:
     if needle not in Path(path).read_text(encoding='utf-8'):
         missing.append(label+':'+path)
-keys='side_policy_enabled side_flow_strong_delta side_flow_slope_step side_flow_pm_delta side_gap_high_pct side_gap_low_pct side_pm_index_drop_pct side_pm_index_rise_pct side_bear_target_l1 side_bear_target_l2 side_bull_target_l1 side_bull_target_l2 side_bull_target_l3 side_weight_lo side_weight_hi side_left_score_floor side_left_score_margin side_left_stable_rounds side_left_stable_gap_sec side_left_stable_max_drop side_pm_check_from side_pm_block_until side_bucket_minutes side_policy_ttl_sec side_freshness_heartbeat_sec'.split()
+keys='side_policy_enabled side_flow_strong_delta side_flow_slope_step side_flow_pm_delta side_gap_high_pct side_gap_low_pct side_pm_index_drop_pct side_pm_index_rise_pct side_bear_target_l1 side_bear_target_l2 side_bull_target_l1 side_bull_target_l2 side_bull_target_l3 side_weight_lo side_weight_hi side_left_score_floor side_left_score_margin side_left_stable_rounds side_left_stable_gap_sec side_left_stable_max_drop side_pm_check_from side_pm_block_until side_bucket_minutes side_policy_ttl_sec side_freshness_heartbeat_sec side_right_rebuy_enabled side_right_rebuy_margin'.split()
 params=json.loads(Path('qmt_gateway/local_executor_params.json').read_text())['params']
 missing += ['param:'+k for k in keys if k not in params]
 for unit in ('quant-carrier-side-policy.path','quant-carrier-side-policy.service','quant-carrier-side-policy-retry.timer'):
     if not Path('deploy/gz-ubuntu',unit).is_file():
         missing.append('unit:'+unit)
 service=Path('deploy/gz-ubuntu/quant-carrier-side-policy.service').read_text()
-if '--urgent-side-policy' not in service or 'Restart=on-failure' not in service or 'ConditionPathExists=/var/lib/quant-trading-v2/side_policy_urgent.req' not in service:
+if '--urgent-side-policy' not in service or 'Restart=on-failure' not in service or 'ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req' not in service:
     missing.append('urgent_service')
 timer=Path('deploy/gz-ubuntu/quant-carrier-side-policy-retry.timer').read_text()
 if '13:*:00/30' not in timer or '14:*:00/30' not in timer or '15:*:00/30' not in timer:
@@ -27133,6 +27261,427 @@ PY
 )
 [ "$MUT239" = "1" ] || fail239 "常驻反证未全部咬住（${MUT239} ）"
 
+# ㉝ D6-c：烘焙器读账号目录，四条 SIDE_POLICY_* 都经同一个路径函数。
+CNT239=$((CNT239 + 1))
+python3 - <<'PY' || fail239 "D6-c 烘焙器没读 accounts/<uid>（§239 ㉝）"
+import pathlib, re
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+# 必须钉在 _SIDE_ACCT_DIR 的赋值行上：同一串在 manifest_dir 还有一处，
+# 只判全文命中会让模块级路径被改回根目录而门禁仍然绿（塞雷实测）。
+assert '_SIDE_ACCT_DIR = os.path.join(DATA_DIR, "accounts", OWNER_UID)' in s
+for name in ("LATEST", "REQ", "PENDING", "ACK"):
+    assert re.search(r"SIDE_POLICY_%s = _side_state_path\(" % name, s), name
+PY
+
+# ㉞ D6-c：缺快照必须烘出**完整**的 bear/L1（allow_add 也为 False），且可诊断。
+CNT239=$((CNT239 + 1))
+python3 - <<'PY' || fail239 "D6-c 缺快照没 fail-closed 或缺诊断键（§239 ㉞）"
+import ast, pathlib
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+tree = ast.parse(s)
+fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef)
+           and n.name == "merge_side_policy"), None)
+body = ast.get_source_segment(s, fn) or "" if fn else ""
+for x in ('side_policy_state_missing', '"allow_add": False',
+          '"asof_ts"', '"latch_until_ts"'):
+    assert x in body, x
+PY
+
+# ㉟ D6-c：读面也认账号目录（根目录只做迁移期兜底）。
+CNT239=$((CNT239 + 1))
+FLOWST239=$(cat internal/server/flow_status.go || true)
+grep_q 'filepath.Join(s.researchDir, "accounts", uid)' FLOWST239 F || \
+	fail239 "D6-c flow_status 没读 accounts/<uid>（§239 ㉟）"
+GO239C_RC=0
+go test ./internal/server -run 'TestFlowStatusSidePolicy' -count=1 >/dev/null 2>&1 || GO239C_RC=$?
+[ "$GO239C_RC" = "0" ] || fail239 "D6-c 读面行为腿未过（§239 ㉟）"
+
+# ㊱ D6-c：systemd .path/.service 都用账号 glob（旧的单条 .req 断言已在静态块同批改）。
+CNT239=$((CNT239 + 1))
+GLOB239='ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req'
+UNITP239=$(cat deploy/gz-ubuntu/quant-carrier-side-policy.path || true)
+UNITS239=$(cat deploy/gz-ubuntu/quant-carrier-side-policy.service || true)
+grep_q "PathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req" UNITP239 F || \
+	fail239 "D6-c .path 没盯账号目录（§239 ㊱）"
+grep_q "$GLOB239" UNITS239 F || \
+	fail239 "D6-c .service 条件没改成账号 glob（§239 ㊱）"
+
+# ㊲ D6-a Go 判据在场：极强右侧只认 right/分数/阈值/开关，数值真源在 carrier_knobs.go。
+CNT239=$((CNT239 + 1))
+python3 - <<'PY' || fail239 "D6-a Go 强右侧判据缺失（§239 ㊲）"
+import pathlib, re
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+assert "func strongRightRebuy(sig SideSignal) bool {" in s
+m = re.search(r"func strongRightRebuy\(sig SideSignal\) bool \{.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+for x in ("config.CarrierSideRightRebuyEnabled()", "config.CarrierSideRightRebuyMargin()"):
+    assert x in body, x
+knobs = pathlib.Path("internal/config/carrier_knobs.go").read_text(encoding="utf-8")
+assert "carrierSideRightRebuyOn" in knobs and "carrierSideRightRebuyMargin" in knobs
+PY
+
+# ㊳ D6-a：tpFired 块只"跳过这一条拒绝"，绝不允许 return true 直接放行。
+CNT239=$((CNT239 + 1))
+python3 - <<'PY' || fail239 "D6-a tpFired 块出现 return true（§239 ㊳）"
+import pathlib, re
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+m = re.search(r"if tpFired \{(.*?)\n\t\}", s, re.S)
+body = m.group(1) if m else ""
+for x in ('intent != "new"', "strongRightRebuy(sig)", '"tp_rebuy_block"'):
+    assert x in body, x
+# 注释里为了讲清"不是怎么写的"会原样引用错误形态，负锁只判代码（§238 同纪律）。
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+assert "return true" not in code
+PY
+
+# ㊴ D6-a：sameSymbolDay 在 tpFired 之前、tpFired 在 switch intent 之前（串联非顶替）。
+CNT239=$((CNT239 + 1))
+python3 - <<'PY' || fail239 "D6-a tpFired 块位置错（§239 ㊴）"
+import pathlib, re
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+m = re.search(r"func BuyAdmission\(.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+pos = [body.index(x) for x in ("if sameSymbolDay", "if tpFired", "switch intent")]
+assert pos == sorted(pos), pos
+PY
+
+# ㊵ D6-a 载体同形 + 六例行为腿（与 Go 互为镜像）。
+CNT239=$((CNT239 + 1))
+python3 - <<'PY' || fail239 "D6-a 载体 _strong_right_rebuy 判据缺失（§239 ㊵）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/rules_sizing.py").read_text(encoding="utf-8")
+assert "def _strong_right_rebuy(params, signal):" in s
+m = re.search(r"def _strong_right_rebuy\(params, signal\):.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+for x in ("side_right_rebuy_enabled", "side_right_rebuy_margin"):
+    assert x in body, x
+PY
+PY239A_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_sizing.py -q -k 'strong_right_rebuy' \
+	>/dev/null 2>&1 || PY239A_RC=$?
+[ "$PY239A_RC" = "0" ] || fail239 "D6-a 载体行为腿未过（§239 ㊵）"
+
+# ㊶ D6-a：bear L1 绝不因为极强右侧 + 当日止盈过而放行（Go/载体同用例名）。
+CNT239=$((CNT239 + 1))
+GO239L1_RC=0
+go test ./internal/signalctl -run 'TestBearL1NeverReleasesNew' -count=1 \
+	>/dev/null 2>&1 || GO239L1_RC=$?
+PY239L1_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_sizing.py -q -k 'bear_l1_never_releases_new' \
+	>/dev/null 2>&1 || PY239L1_RC=$?
+[ "$GO239L1_RC" = "0" ] && [ "$PY239L1_RC" = "0" ] || \
+	fail239 "D6-a bear L1 行为腿未过（§239 ㊶）"
+
+# ㊷ D6-a：两键在烘好的参数文件与载体兜底表同值，derive 必须零未安家。
+CNT239=$((CNT239 + 1))
+python3 - <<'PY' || fail239 "D6-a 两键派生/兜底不同源（§239 ㊷）"
+import json, pathlib, subprocess
+p = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
+assert p.get("side_right_rebuy_enabled") is True
+assert p.get("side_right_rebuy_margin") == 15
+fb = pathlib.Path("qmt_gateway/local_executor.py").read_text(encoding="utf-8")
+assert "'side_right_rebuy_enabled': True," in fb
+assert "'side_right_rebuy_margin': 15," in fb
+out = subprocess.run(["python3", "scripts/derive_carrier_params.py", "--check"],
+                     capture_output=True, text=True)
+assert out.returncode == 0 and "DERIVE_UNHOUSED=0" in out.stdout, out.stdout[-300:]
+PY
+
 [ "$B239_FAILED" = "0" ] || exit 1
-echo "ok - §239 §SIDE-POLICY 锁通过（纯策略/runtime开关/25键单点同源/CNY桶与09:30缺口/13:00 OR加急/flock+SSH+ack reaper/两级准入与强左侧/TargetMultiplier隔离/T条件放行/读数与行为腿/8枚常驻反证，累计判定点 ${CNT239} ）"
+echo "ok - §239 §SIDE-POLICY 锁通过（纯策略/runtime开关/27键单点同源/CNY桶与09:30缺口/13:00 OR加急/flock+SSH+ack reaper/两级准入与强左侧/TargetMultiplier隔离/T条件放行/极强右侧回买只解 tp_rebuy_block，bear L1 不动/快照路径按账号目录/读数与行为腿/8枚常驻反证，累计判定点 ${CNT239} ）"
+echo ""
+
+echo "==> 240 §SIDE-RAMP（2026-11-25 D7：牛熊分档释放动态仓位；ramp 只乘战略目标）..."
+B240_FAILED=0
+fail240() {
+	echo "--- FAIL: §240 $*"
+	FAIL=1
+	B240_FAILED=1
+}
+CNT240=0
+
+# ① Go 纯函数在场；六格真值表全部来自 config，函数体内不写第二张表。
+CNT240=$((CNT240 + 1))
+python3 - <<'PY' || fail240 "Go SideTimeRamp 真源不纯（§240 ①）"
+import pathlib, re
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+assert "func SideTimeRamp(st SidePolicyState, now time.Time) float64 {" in s
+m = re.search(r"func rampTableOf\(\) rampTable \{.*?\n\}", s, re.S)
+table = m.group(0) if m else ""
+for getter in ("CarrierSideRampBullAM", "CarrierSideRampBullPM", "CarrierSideRampBearAM",
+               "CarrierSideRampBearPM", "CarrierSideRampPMCheckAt", "CarrierSideRampFullAt"):
+    assert "config.%s()" % getter in table, getter
+m = re.search(r"func SideTimeRampWithSource\(.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+for literal in ("0.70", "0.35", "0.50", "13:00", "14:00"):
+    assert literal not in code, literal
+PY
+
+# ②③④⑤⑥ 五段行为：中性态 / 上午档 / 13:00 无 latch / 13:00 有 latch / 14:00 无条件满额。
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/signalctl -run 'TestSideTimeRampOffForNonDirectionalModes' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+[ "$GO240_RC" = "0" ] || fail240 "中性态不回 1.0（§240 ②）"
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/signalctl -run 'TestSideTimeRampAMBand' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+[ "$GO240_RC" = "0" ] || fail240 "上午档不对（§240 ③）"
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/signalctl -run 'TestSideTimeRampPMWithoutLatch' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+[ "$GO240_RC" = "0" ] || fail240 "13:00 无 latch 未释放（§240 ④）"
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/signalctl -run 'TestSideTimeRampPMChecksLatchAndHoldsAM' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+[ "$GO240_RC" = "0" ] || fail240 "13:00 latch 没守住上午档（§240 ⑤）"
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/signalctl -run 'TestSideTimeRampFullReleaseIgnoresLatch' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+[ "$GO240_RC" = "0" ] || fail240 "14:00 边界没无条件满额（§240 ⑥）"
+
+# ⑦ 目标算式：ramp 乘在 min(ms*TM, ceiling) **之外**（100000×0.8×0.35=28000）。
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/engine -run 'TestTargetRampArithmetic' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+PY240_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_sizing.py -q -k 'target_position_ramp_outside_ceiling' \
+	>/dev/null 2>&1 || PY240_RC=$?
+[ "$GO240_RC" = "0" ] && [ "$PY240_RC" = "0" ] || fail240 "ramp 被吞进天花板 clamp（§240 ⑦）"
+
+# ⑧ T/reduce 中性：算式 80000，且装配点把 TimeRamp 硬钉 1.0。
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/engine -run 'TestTRampNeutral' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+[ "$GO240_RC" = "0" ] || fail240 "T 包装吃了 ramp（§240 ⑧）"
+TLIVE240=$(cat internal/engine/intraday_t_live.go || true)
+grep_q 'TargetMultiplier: 1.0, TimeRamp: 1.0,' TLIVE240 F || \
+	fail240 "T 装配点没把 TimeRamp 钉成 1.0（§240 ⑧）"
+
+# ⑨ 默认开：参数文件 / Go 常量 / 载体兜底表三处同值。
+CNT240=$((CNT240 + 1))
+python3 - <<'PY' || fail240 "D7 七键三处不同源（§240 ⑨）"
+import json, pathlib, re, sys
+p = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
+need = {"side_ramp_enabled": True, "side_ramp_bull_am": 0.70, "side_ramp_bull_pm": 1.00,
+        "side_ramp_bear_am": 0.30, "side_ramp_bear_pm": 0.50,
+        "side_ramp_pm_check_at": "13:00", "side_ramp_full_at": "14:00"}
+for k, v in need.items():
+    assert p.get(k) == v, (k, p.get(k))
+knobs = pathlib.Path("internal/config/carrier_knobs.go").read_text(encoding="utf-8")
+assert re.search(r"carrierSideRampOn\s*=\s*true", knobs)
+sys.path.insert(0, str(pathlib.Path.cwd()))
+from qmt_gateway import rules_sizing as rs
+for k, v in need.items():
+    assert rs.SIZING_DEFAULTS.get(k) == v, (k, rs.SIZING_DEFAULTS.get(k))
+    assert k in rs.SIZING_PARAM_KEYS, k
+PY
+
+# ⑩ 非法表整表回落：Go 表校验 + 载体整表回落出厂档。
+CNT240=$((CNT240 + 1))
+GO240_RC=0
+go test ./internal/signalctl -run 'TestSideTimeRampTableValidity' -count=1 >/dev/null 2>&1 || GO240_RC=$?
+PY240_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_sizing.py -q -k 'side_time_ramp_invalid_table' \
+	>/dev/null 2>&1 || PY240_RC=$?
+[ "$GO240_RC" = "0" ] && [ "$PY240_RC" = "0" ] || fail240 "非法表没有整表回落（§240 ⑩）"
+
+[ "$B240_FAILED" = "0" ] || exit 1
+echo "ok - §240 §SIDE-RAMP 锁通过（十判定点：真源单一/五段行为/目标乘在天花板外/T中性/三处默认开/非法表整表回落，累计判定点 ${CNT240}）"
+echo ""
+
+echo "==> 241 §T-LEG-WIRING（2026-11-25 F1–F7：ctx 接线/成本线/分母归因/端到端开腿）..."
+B241_FAILED=0
+fail241() {
+	echo "--- FAIL: §241 $*"
+	FAIL=1
+	B241_FAILED=1
+}
+CNT241=0
+
+# ① F1：新腿分支先 book.context_for 再 t_round_state，不许裸 base_ctx 直喂。
+CNT241=$((CNT241 + 1))
+python3 - <<'PY' || fail241 "T 新腿分支绕过 context_for（§241 ①）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"def _run_t\(.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+assert "book.context_for(" in body
+tail = body.index("t_round_state(PARAMS, ctx, None)")
+window = body[:tail].splitlines()[-6:]
+assert any("book.context_for(" in line for line in window), window
+lines = body.splitlines()
+for i, line in enumerate(lines[:-1]):
+    if line.strip() == "ctx = base_ctx(symbol)":
+        assert "t_round_state(" not in lines[i + 1]
+PY
+
+# ② F2：base_ctx 带四个 tick 读数（结构 + 行为）。
+CNT241=$((CNT241 + 1))
+python3 - <<'PY' || fail241 "base_ctx 缺 tick 四字段（§241 ②）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"    def base_ctx\(symbol\):.*?\n        return c", s, re.S)
+body = m.group(0) if m else ""
+for key in ("prev_close", "high", "low", "volume_ratio"):
+    assert '"%s"' % key in body, key
+PY
+PY241_RC=0
+python3 -m pytest qmt_gateway/tests/test_t_leg_wiring_20261125.py -q -k 'base_ctx' \
+	>/dev/null 2>&1 || PY241_RC=$?
+[ "$PY241_RC" = "0" ] || fail241 "base_ctx 行为腿未过（§241 ②）"
+
+# ③④⑤ F3：覆盖不足显式关 / 达标开 / 覆盖缺失点名 cov=na。
+CNT241=$((CNT241 + 1))
+python3 -m pytest qmt_gateway/tests/test_rules_t.py -q -k 'test_auto_off_below_the_coverage_floor' \
+	>/dev/null 2>&1 || fail241 "F3-a 覆盖不足没显式关闸（§241 ③）"
+CNT241=$((CNT241 + 1))
+python3 -m pytest qmt_gateway/tests/test_rules_t.py -q -k 'test_auto_on_once_coverage_reaches_the_floor' \
+	>/dev/null 2>&1 || fail241 "F3-b 覆盖达标没开闸（§241 ④）"
+CNT241=$((CNT241 + 1))
+python3 - <<'PY' || fail241 "F3-c 覆盖缺失静默放行（§241 ⑤）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/rules_t.py").read_text(encoding="utf-8")
+m = re.search(r"def t_listed_days_floor\(params, ctx\):.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+# `cov=na` 是运行期拼出来的（shown="na"），静态锁认拼装那一行，不许回潮成 `pass`。
+assert 'shown = "na" if cov is None' in body and '"off(auto cov=%s)"' in body
+assert "t_listed_days_auto" in body
+assert "if cov is None: pass" not in body
+PY
+PY241_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_t.py -q -k 'test_missing_coverage_is_still_a_and_says_so' \
+	>/dev/null 2>&1 || PY241_RC=$?
+[ "$PY241_RC" = "0" ] || fail241 "F3-c 行为腿未过（§241 ⑤）"
+
+# ⑥ F4：expected_spread 只从 PARAMS 取，不许在成本门里现算 |price-vwap|/vwap。
+CNT241=$((CNT241 + 1))
+python3 - <<'PY' || fail241 "F4 价差又从 vwap 现算（§241 ⑥）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert '"expected_spread_pct": PARAMS.get("t_min_spread_pct")' in s
+r = pathlib.Path("qmt_gateway/rules_t.py").read_text(encoding="utf-8")
+m = re.search(r"def t_cost_gate\(params, ctx\):.*?(?=\ndef )", r, re.S)
+body = m.group(0) if m else ""
+assert "expected_spread_pct" in body
+assert not ("abs(" in body and "vwap" in body)
+PY
+
+# ⑦ F5：两条 T 腿金额从 _t_leg_value 取，不许 setdefault 回 0.0。
+CNT241=$((CNT241 + 1))
+python3 - <<'PY' || fail241 "F5 T 腿金额写死 0（§241 ⑦）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"def _sizing_view\(.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+for side in ("buy", "sell"):
+    assert 'out["t_%s_leg_value"] = _t_leg_value("%s",' % (side, side) in body, side
+    assert not re.search(r't_%s_leg_value.*setdefault\(.*0\.0' % side, body)
+PY
+PY241_RC=0
+python3 -m pytest qmt_gateway/tests/test_t_leg_wiring_20261125.py -q -k 'sizing_view_no_longer_hardcodes' \
+	>/dev/null 2>&1 || PY241_RC=$?
+[ "$PY241_RC" = "0" ] || fail241 "F5 行为腿未过（§241 ⑦）"
+
+# ⑧ F6：三处读数（anchored/missing、src=、空分支的 _log）都在。
+CNT241=$((CNT241 + 1))
+python3 - <<'PY' || fail241 "F6 读数缺字段（§241 ⑧）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert "t_round actions=%s anchored=%d/missing=%d" in s
+assert "t_denom equity=%s holdings=%.0f src=%s/%s" in s
+assert "anchored=0" in s and "no_provable_anchor" in s
+PY
+PY241_RC=0
+python3 -m pytest qmt_gateway/tests/test_t_leg_wiring_20261125.py -q -k 'readout' \
+	>/dev/null 2>&1 || PY241_RC=$?
+[ "$PY241_RC" = "0" ] || fail241 "F6 读数行为腿未过（§241 ⑧）"
+
+# ⑨ F7：分母三态归因（counter / baked / none）各有行为证据。
+CNT241=$((CNT241 + 1))
+PY241_RC=0
+python3 -m pytest qmt_gateway/tests/test_t_leg_wiring_20261125.py -q -k 'denominator_attribution_three_states' \
+	>/dev/null 2>&1 || PY241_RC=$?
+[ "$PY241_RC" = "0" ] || fail241 "F7 分母三态未过（§241 ⑨）"
+
+# ⑩ F3 两键派生 + 注册清单。
+CNT241=$((CNT241 + 1))
+python3 - <<'PY' || fail241 "F3 两键派生/注册缺失（§241 ⑩）"
+import json, pathlib
+p = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
+for key in ("t_listed_days_auto", "t_listed_days_coverage_min_pct"):
+    assert key in p, key
+r = pathlib.Path("qmt_gateway/rules_t.py").read_text(encoding="utf-8")
+assert "T_PARAM_KEYS" in r
+for key in ("t_listed_days_auto", "t_listed_days_coverage_min_pct"):
+    assert '"%s"' % key in r, key
+PY
+PY241_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_t.py -q -k 'both_new_knobs_are_registered' \
+	>/dev/null 2>&1 || PY241_RC=$?
+[ "$PY241_RC" = "0" ] || fail241 "F3 键注册行为腿未过（§241 ⑩）"
+
+# ⑪ 端到端：真实 ctx 走 t_gate_open 必须到 open，而不是任何 step* 弃权。
+CNT241=$((CNT241 + 1))
+PY241_RC=0
+python3 -m pytest qmt_gateway/tests/test_t_leg_wiring_20261125.py -q -k 'gate_open_reaches_an_open' \
+	>/dev/null 2>&1 || PY241_RC=$?
+[ "$PY241_RC" = "0" ] || fail241 "T 端到端开腿未过（§241 ⑪）"
+
+[ "$B241_FAILED" = "0" ] || exit 1
+echo "ok - §241 §T-LEG-WIRING 锁通过（十一判定点：F1 ctx 接线/F2 tick 四字段/F3 三档/F4 价差来源/F5 金额/F6 读数/F7 分母归因/派生注册/端到端开腿，累计判定点 ${CNT241}）"
+echo ""
+
+echo "==> 242 §COLD-START-AND-VOL（2026-11-25 owner 追加：开盘默认熊市30% + 反转即时烘入 + 缩量阈值）..."
+B242_FAILED=0
+fail242() {
+	echo "--- FAIL: §242 $*"
+	FAIL=1
+	B242_FAILED=1
+}
+CNT242=0
+
+# ① 资金流/斜率没齐一轮时不得落 range 满仓（默认 bear L1，配合 bear AM ramp 0.30）。
+CNT242=$((CNT242 + 1))
+grep -qF 'st.Reason != "side_policy_cold_start_bear"' \
+	internal/signalctl/side_policy_test.go || \
+	fail242 "冷启动默认熊市缺行为锁（§242 ①）"
+GO242_RC=0
+go test ./internal/signalctl -run 'TestColdStartDefaultsToBear' -count=1 >/dev/null 2>&1 || GO242_RC=$?
+[ "$GO242_RC" = "0" ] || fail242 "冷启动没回 bear L1（§242 ①）"
+
+# ② 反转走同一条 urgent req 链，但 kind=reversal、不带 no_new latch。
+CNT242=$((CNT242 + 1))
+grep -qF 'e.writeSideUrgentReq(now, "reversal_bear_to_bull", "reversal", "15:00")' \
+	internal/engine/side_policy_flow.go || \
+	fail242 "牛熊反转没写 urgent req（§242 ②）"
+grep -qF 'e.writeSideUrgentReq(now, reason, "no_new", config.CarrierSidePMBlockUntil())' \
+	internal/engine/side_policy_flow.go || \
+	fail242 "13:00 加急链被改动（§242 ②）"
+PY242_RC=0
+python3 -m pytest qmt_gateway/tests/test_hotreload_side_policy.py -q -k 'SideReversalReqTest' \
+	>/dev/null 2>&1 || PY242_RC=$?
+[ "$PY242_RC" = "0" ] || fail242 "载体反转 req 行为腿未过（§242 ②）"
+
+# ③ 缩量双闸 0.95：0.79/0.92 必须判缩量，不能写平量。
+CNT242=$((CNT242 + 1))
+GO242_RC=0
+go test ./internal/signalctl -run 'TestVolStateDoubleGate' -count=1 >/dev/null 2>&1 || GO242_RC=$?
+[ "$GO242_RC" = "0" ] || fail242 "0.79/0.92 仍被判平量（§242 ③）"
+
+# ④ 开盘 30% 动态仓位：bear AM ramp 三处同值 0.30。
+CNT242=$((CNT242 + 1))
+python3 - <<'PY' || fail242 "bear AM 0.30 三处不同源（§242 ④）"
+import json, pathlib, re, sys
+p = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
+assert p.get("side_ramp_bear_am") == 0.30, p.get("side_ramp_bear_am")
+go = pathlib.Path("internal/config/carrier_knobs.go").read_text()
+assert re.search(r"carrierSideRampBearAM\s*=\s*0\.30", go)
+sys.path.insert(0, str(pathlib.Path.cwd()))
+from qmt_gateway import rules_sizing as rs
+assert rs.SIZING_DEFAULTS["side_ramp_bear_am"] == 0.30
+PY
+
+[ "$B242_FAILED" = "0" ] || exit 1
+echo "ok - §242 §COLD-START-AND-VOL 锁通过（冷启动默认 bear/反转 urgent req 无 latch/缩量0.95/开盘30%动态仓位，累计判定点 ${CNT242}）"
 echo ""

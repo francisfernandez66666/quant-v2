@@ -466,6 +466,69 @@ def parse_tencent_float_shares(payload):
     return out
 
 
+def fetch_listed_days(day):
+    """F3 2026-11-25: 上市天数（baostock query_stock_basic.ipoDate）-> {6位码: 天数}。
+
+    为什么需要：`t_min_listed_days=60`（新股不做的风控）在全仓没有任何生产者
+    ——云端 `stocks.list_date` 实测覆盖 **0/5546**（2026-11-25 直读），
+    于是 `rules_t.t_liquidity_gate` 每轮返回 `listed_days_unavailable`，
+    11-23 的 255 轮 / 11-24 的 270 轮 T 腿全部倒在这条闸上。
+
+    owner 2026-11-25 裁决：**先 A（闸关）后 B（数据覆盖≥95% 自动切 B）**。
+    切换判据是**数据覆盖**，所以生产者必须先存在，B 档才有机会自动生效。
+
+    源已实测（2026-11-25，gz）：`bs.query_stock_basic()` 返回 9061 行，
+    字段 `code/code_name/ipoDate/outDate/type/status`，`type=='1'` 是股票
+    （`2` 是指数——`sh.000001` 是上证指数，不过滤会把 000001 写成 1991 年）。
+    一次全量调用即可，不需要逐票请求。
+
+    纪律：库缺失/登录失败/解析失败一律返回 `{}`（缺源不阻断主链，与
+    `fetch_float_shares` 同一条）；`ipoDate` 为空的行跳过，绝不发明一个天数。
+    """
+    try:
+        import baostock as bs  # noqa: F401 - 可选依赖，缺了就是"没有这一维"
+    except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链
+        print("PREGEN_LISTED_DAYS_FAIL import %s" % type(exc).__name__)
+        return {}
+    try:
+        today = datetime.strptime(str(day), "%Y%m%d")
+    except (TypeError, ValueError):
+        print("PREGEN_LISTED_DAYS_FAIL bad_day=%s" % day)
+        return {}
+    out = {}
+    try:
+        login = bs.login()
+        if str(getattr(login, "error_code", "1")) != "0":
+            print("PREGEN_LISTED_DAYS_FAIL login %s" % getattr(login, "error_msg", ""))
+            return {}
+        rs = bs.query_stock_basic()
+        while rs.error_code == "0" and rs.next():
+            row = dict(zip(rs.fields, rs.get_row_data()))
+            if str(row.get("type") or "") != "1":
+                continue  # 指数/其它：`sh.000001` 与平安银行同码，混进来就是错的天数
+            ipo = str(row.get("ipoDate") or "")
+            if not ipo:
+                continue
+            try:
+                days = (today - datetime.strptime(ipo, "%Y-%m-%d")).days
+            except ValueError:
+                continue
+            if days < 0:
+                continue
+            code = str(row.get("code") or "").split(".")[-1]
+            if len(code) == 6 and code.isdigit():
+                out[code] = days
+    except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链
+        print("PREGEN_LISTED_DAYS_FAIL query %s" % type(exc).__name__)
+        return {}
+    finally:
+        try:
+            bs.logout()
+        except Exception:  # noqa: BLE001 - 登出失败无关结果
+            pass
+    return out
+
+
 def fetch_float_shares(symbols):
     """批量取流通股本（腾讯，50 只/请求）。失败/缺字段一律跳过（返回 {} 也合法）。"""
     result = {}
@@ -831,6 +894,17 @@ def main():
         print("PREGEN_FLOAT_SHARES codes=%d of=%d" % (len(float_shares_map), len(symbols)))
     except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链
         print("PREGEN_FLOAT_SHARES_FAIL %s" % type(exc).__name__)
+    # F3 2026-11-25：上市天数（静态字段，一天取一次全市场）。载体 `t_min_listed_days`
+    # 闸靠它，覆盖率达到 `t_listed_days_coverage_min_pct`(95%) 才会自动从 A 档切 B 档。
+    listed_days_map = {}
+    try:
+        listed_days_map = fetch_listed_days(day)
+        covered = sum(1 for s in symbols if listed_days_map.get(s) is not None)
+        pct = (100.0 * covered / len(symbols)) if symbols else 0.0
+        print("PREGEN_LISTED_DAYS codes=%d of=%d pct=%.1f"
+              % (len(listed_days_map), len(symbols), pct))
+    except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链
+        print("PREGEN_LISTED_DAYS_FAIL %s" % type(exc).__name__)
     precalc, ok, failed = {}, 0, []
     for symbol in symbols:
         try:
@@ -855,6 +929,10 @@ def main():
                 fact.update(bakeables)
                 if float_shares_map.get(symbol):
                     fact["float_shares"] = float_shares_map[symbol]
+                # F3 2026-11-25：上市天数（静态字段）。载体 t_liquidity_gate 读它；
+                # 缺失即 A 档（闸显式关）并在读数里点名，绝不静默放行。
+                if listed_days_map.get(symbol) is not None:
+                    fact["listed_days"] = listed_days_map[symbol]
                 precalc[symbol] = fact
                 ok += 1
             else:
@@ -864,6 +942,8 @@ def main():
                     bakeables["src"] = "bake_only"
                     if float_shares_map.get(symbol):
                         bakeables["float_shares"] = float_shares_map[symbol]
+                    if listed_days_map.get(symbol) is not None:
+                        bakeables["listed_days"] = listed_days_map[symbol]
                     precalc[symbol] = bakeables
                     ok += 1
                 else:

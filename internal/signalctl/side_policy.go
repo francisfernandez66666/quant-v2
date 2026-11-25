@@ -176,6 +176,15 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 
 	bearMode := strings.TrimSpace(in.MarketState) == "bear" || strongOut || worsening
 	bullMode := strings.TrimSpace(in.MarketState) == "bull" && strongIn && improving
+	// 2026-11-25 owner：开盘资金流/斜率还没凑齐"一轮"时，绝不落 range 满仓。
+	// 默认 bear L1（禁新仓；配合 bear AM ramp 0.30 ⇒ 当天只放 30% 动态仓位），
+	// 等牛熊数据齐、反转信号出现后再由加急烘入链立刻改剧本。
+	if !marketOK || !slopeOK {
+		cold := FailClosedSidePolicy(st.Day, in.Now, "side_policy_cold_start_bear")
+		cold.Latch = in.Latch
+		cold.LatchUntilUnix = st.LatchUntilUnix
+		return cold
+	}
 	switch {
 	case bearMode:
 		st.Mode, st.Reason = SidePolicyBear, "bear_regime"
@@ -316,6 +325,103 @@ func TargetMultiplierForIntent(st SidePolicyState, intent string) float64 {
 	return st.TargetMultiplier
 }
 
+// rampTable 分时释放的出厂表（D7 2026-11-25）。
+//
+// 全部来自 carrier_knobs.go → derive，本文件不写第二个数字。表不合法（缺键/非正/
+// 越界/时刻解析失败）⇒ **整表**回落这里，绝不半张表生效（与 §T-TURNOVER-TIER
+// 的"整表回落出厂档"同一条纪律）。
+type rampTable struct {
+	BullAM, BullPM, BearAM, BearPM float64
+	PMCheckAt, FullAt              string
+}
+
+func rampTableOf() rampTable {
+	return rampTable{
+		BullAM:    config.CarrierSideRampBullAM(),
+		BullPM:    config.CarrierSideRampBullPM(),
+		BearAM:    config.CarrierSideRampBearAM(),
+		BearPM:    config.CarrierSideRampBearPM(),
+		PMCheckAt: config.CarrierSideRampPMCheckAt(),
+		FullAt:    config.CarrierSideRampFullAt(),
+	}
+}
+
+// rampTableValid 一档都不许漏：任何一个值非正或 >1 就整表作废。
+func (t rampTable) valid() bool {
+	for _, v := range []float64{t.BullAM, t.BullPM, t.BearAM, t.BearPM} {
+		if !finiteSide(v) || v <= 0 || v > 1 {
+			return false
+		}
+	}
+	for _, s := range []string{t.PMCheckAt, t.FullAt} {
+		if _, err := time.Parse("15:04", s); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// SideTimeRamp D7：把"今天允许持有 MS 派生目标的百分之几"算成一个无量纲因子。
+//
+// 表全部来自 PARAMS（carrier_knobs.go → derive），本函数不写任何数字。
+//
+//	mode ∉ {bull,bear}（range / legacy / 关闭）⇒ 1.0，即今天的行为；
+//	now >= full_at                          ⇒ 1.0（无条件，不查 latch）；
+//	now <  pm_check_at                      ⇒ AM 档；
+//	pm_check_at <= now < full_at            ⇒ latch 活跃则保持 AM 档，否则 PM 档。
+//
+// ⚠️ 刻意保留的一个巧合：latch.Until = 14:00 与 full_at = 14:00 是同一个时刻，
+// 于是"坏信号"对最终目标的影响只在 13:00–14:00 这一个小时内有效。这是 owner 的
+// 原话"14:00 后不管有没有都释放剩余"，不是 bug。
+func SideTimeRamp(st SidePolicyState, now time.Time) float64 {
+	f, _ := SideTimeRampWithSource(st, now)
+	return f
+}
+
+// SideTimeRampWithSource 同 SideTimeRamp，另返回一档的来源名（供资金帧 target_ramp_src）。
+func SideTimeRampWithSource(st SidePolicyState, now time.Time) (float64, string) {
+	if !config.CarrierSideRampEnabled() {
+		return 1.0, "ramp_off"
+	}
+	if !st.Enabled || (st.Mode != SidePolicyBull && st.Mode != SidePolicyBear) {
+		return 1.0, "ramp_off"
+	}
+	t := rampTableOf()
+	if !t.valid() {
+		// 表不合法 ⇒ 不释放（1.0 = D7 之前的行为）。
+		// 注意 Go 侧没有"第二份出厂表"可回落：数值的唯一家就是 carrier_knobs.go，
+		// 它本身坏了就没有第三个真源。方向取"不缩"是安全的（不因坏读数砍仓）。
+		// 载体侧不同：rules_sizing.SIZING_DEFAULTS 是独立的出厂表，那边做**整表**回落。
+		return 1.0, "ramp_off"
+	}
+	hhmm := hhmmSide(now)
+	if hhmm >= t.FullAt {
+		return 1.0, "ramp_full"
+	}
+	bull := st.Mode == SidePolicyBull
+	am, pm := t.BearAM, t.BearPM
+	if bull {
+		am, pm = t.BullAM, t.BullPM
+	}
+	if hhmm < t.PMCheckAt {
+		if bull {
+			return am, "ramp_bull_am"
+		}
+		return am, "ramp_bear_am"
+	}
+	// 13:00–14:00：latch 活跃 ⇒ 保持上午档（"暂不释放剩余"）。
+	if latchActiveSide(st.Latch, now) {
+		if bull {
+			return am, "ramp_bull_am"
+		}
+		return am, "ramp_bear_am"
+	}
+	if bull {
+		return pm, "ramp_bull_pm"
+	}
+	return pm, "ramp_bear_pm"
+}
+
 // CombineSideWeight 把现有 flow blend 与风格权重合成后夹在同一个 ±20% 边界内。
 func CombineSideWeight(flowBlend, styleWeight float64) float64 {
 	if !finiteSide(flowBlend) || flowBlend <= 0 {
@@ -373,6 +479,26 @@ func StrongLeftSignal(sig SideSignal, heldQty float64, tpFired bool, obs []SideO
 	return !now.IsZero() && now.Sub(tail[len(tail)-1].At) <= time.Duration(config.CarrierSideFreshnessHeartbeatSec()*float64(time.Second))
 }
 
+// strongRightRebuy 极强右侧回买：右侧入场 + 分数比门槛高出
+// CarrierSideRightRebuyMargin 个点。不要求"稳定"——稳定性是左侧的概念，
+// 右侧买点要的是强度；缺任一枚读数一律不放行。
+//
+// D6-a 2026-11-25（owner：「极强的一次买入机会出现，可以重新买入」）：它**只**
+// 解除 tp_rebuy_block 这一条。same_symbol_day 与 bear L1 的 side_policy_no_new
+// 都排在它外面/后面，穿透不出去（§239 ㊳/㊴/㊶ 三枚锁盯着这件事）。
+func strongRightRebuy(sig SideSignal) bool {
+	if sig.EntryStyle != "right" {
+		return false
+	}
+	if !finiteSide(sig.Score) || !finiteSide(sig.Threshold) || sig.Threshold <= 0 {
+		return false
+	}
+	if !config.CarrierSideRightRebuyEnabled() {
+		return false
+	}
+	return sig.Score >= sig.Threshold+config.CarrierSideRightRebuyMargin()
+}
+
 // BuyAdmission 执行两级准入；sameSymbolDay 与 tpFired 是外部硬闸，例外不能穿透。
 func BuyAdmission(st SidePolicyState, intent string, heldQty float64, sig SideSignal, tpFired, sameSymbolDay, stable bool) (bool, string) {
 	if intent == "t_leg" || intent == "reduce" {
@@ -382,7 +508,13 @@ func BuyAdmission(st SidePolicyState, intent string, heldQty float64, sig SideSi
 		return false, "same_symbol_day"
 	}
 	if tpFired {
-		return false, "tp_rebuy_block"
+		// Owner 2026-11-25（D6-a）：极强右侧买点可以重买当天止盈过的票。
+		// 刻意写成"只跳过这一条拒绝"而不是 return true —— L1/L2 与 same_symbol_day
+		// 都在外面，穿透不出去（§239 有负锁）。只对 intent == "new" 生效：
+		// add 已有左侧例外，再开一条右侧门等于把 L2 改成"任一侧、分数够"。
+		if intent != "new" || !strongRightRebuy(sig) {
+			return false, "tp_rebuy_block"
+		}
 	}
 	if !st.Enabled {
 		return true, ""

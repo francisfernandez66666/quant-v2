@@ -2,7 +2,7 @@
 //
 // 三条：① 牛/熊×放量/缩量×高仓位各自的决策正确；② 低/中仓位、平量、range、弃权一律 Neutral
 // （反证：把高档判据写成绝对仓位，则熊市 bear 目标 15% 下永远不触发，用例2会红）；
-// ③ 缩量双闸门：单一闸门不满足时归平量，不误判（owner 暂定 r_yest<1.0 且 r_ma5<0.9）。
+// ③ 缩量双闸门：单一闸门不满足时归平量，不误判（owner 2026-11-25 修正 r_yest<1.0 且 r_ma5<0.95）。
 package signalctl
 
 import (
@@ -56,8 +56,10 @@ func TestVolStateDoubleGate(t *testing.T) {
 		want string
 	}{
 		{"双满足→缩量", 0.9, 0.8, VolStateShrink},
+		{"11-25现场0.79/0.92→缩量", 0.79, 0.92, VolStateShrink},
 		{"昨比不满足→平量", 1.1, 0.8, VolStateNeutral},
 		{"均比不满足→平量", 0.9, 1.1, VolStateNeutral},
+		{"均比=0.95边界→平量", 0.9, 0.95, VolStateNeutral},
 		{"双满足放量→放量", 1.5, 1.3, VolStateSurge},
 		{"只昨比放量→平量", 1.5, 0.8, VolStateNeutral},
 		{"NaN弃权→平量", math.NaN(), 0.8, VolStateNeutral},

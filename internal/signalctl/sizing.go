@@ -72,6 +72,11 @@ type SizingResult struct {
 	FlowBlend float64 `json:"flow_blend,omitempty"`
 	// TargetMultiplier 只作用于战略目标 room；MarketScale 与 T 额度不变。
 	TargetMultiplier float64 `json:"target_multiplier,omitempty"`
+	// TimeRamp D7（2026-11-25）：动态目标的分时释放因子（0.35/0.50/0.70/1.00）。
+	// 它乘在 min(MS×TM, 天花板) **之外**，只决定"此刻放出多少"，不改规模语义；
+	// T 额度与单笔基础比例都不消费它（fundsTargetCurRoom 恒 1.0）。
+	// English: time-of-day release factor on the MS-derived target (D7).
+	TimeRamp float64 `json:"time_ramp,omitempty"`
 	// SidePolicyMode/Level/StyleWeight 供决策留痕与执行层复盘。
 	SidePolicyMode  string   `json:"side_policy_mode,omitempty"`
 	SidePolicyLevel int      `json:"side_policy_level,omitempty"`

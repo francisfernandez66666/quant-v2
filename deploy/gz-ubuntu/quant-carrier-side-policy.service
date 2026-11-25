@@ -1,8 +1,9 @@
 # quant-carrier-side-policy.service — 13:00 侧策略加急发布（oneshot，失败重试）。
+# D6-c 2026-11-25：条件同样改成账号 glob（引擎按账号落盘，见 .path 注释）。
 [Unit]
 Description=Quant carrier urgent side-policy bake and publish
 After=network-online.target
-ConditionPathExists=/var/lib/quant-trading-v2/side_policy_urgent.req
+ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req
 
 [Service]
 Type=oneshot

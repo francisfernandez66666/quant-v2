@@ -1034,3 +1034,142 @@ def test_cluster_cap_can_be_switched_off_by_an_explicit_zero():
     knobs = params(cluster_cap_pct=0.0)
     caps = rs.buy_size_caps(knobs, base_ctx(cluster_set=True, cluster_value=0.0))
     assert caps["cluster"] is None
+
+
+# ---------------------------------------------------------------------------
+# D6-a 2026-11-25：极强右侧买点只解当天止盈回买闸（owner 裁决 ④）
+#
+# 逃生口只松 `tp_fired` 这一条：same_symbol_day、bear L1 的 no_new 都必须
+# 继续拦在它外面。这里六例与 Go 的 side_policy_test.go 七例互为镜像。
+# ---------------------------------------------------------------------------
+
+def _right_sig(score=85.0, threshold=70.0):
+    return {"entry_style": "right", "score": score, "threshold": threshold}
+
+
+def test_strong_right_rebuy_needs_right_style_and_full_margin():
+    knobs = params()
+    assert rs._strong_right_rebuy(knobs, _right_sig()) is True
+    assert rs._strong_right_rebuy(knobs, _right_sig(score=84.9)) is False
+    left = _right_sig()
+    left["entry_style"] = "left"
+    assert rs._strong_right_rebuy(knobs, left) is False
+
+
+def test_strong_right_rebuy_abstains_on_any_missing_reading():
+    knobs = params()
+    assert rs._strong_right_rebuy(knobs, {"entry_style": "right"}) is False
+    assert rs._strong_right_rebuy(knobs, {"entry_style": "right", "score": 95.0}) is False
+    assert rs._strong_right_rebuy(knobs, _right_sig(threshold=0)) is False
+    assert rs._strong_right_rebuy(knobs, _right_sig(score=float("nan"))) is False
+
+
+def test_strong_right_rebuy_only_releases_new_intent():
+    # 快照本身两边都放行，这样 tp_rebuy_block 是唯一在场的闸门。
+    knobs = params(side_policy_enabled=True,
+                   side_policy=side_snapshot(allow_new=True, allow_add=True))
+    ctx = side_ctx()
+    assert rs.side_buy_allowed(knobs, ctx, _right_sig(), "new", 0, True, False, False)[0] is True
+    assert rs.side_buy_allowed(knobs, ctx, _right_sig(), "add", 100, True, False, False)[1] == \
+        "tp_rebuy_block"
+
+
+def test_strong_right_rebuy_cannot_bypass_same_symbol_day():
+    knobs = params(side_policy_enabled=True,
+                   side_policy=side_snapshot(allow_new=True, allow_add=True))
+    assert rs.side_buy_allowed(knobs, side_ctx(), _right_sig(), "new", 0,
+                               True, True, False)[1] == "same_symbol_day"
+
+
+def test_bear_l1_never_releases_new():
+    # 与 Go 的 TestBearL1NeverReleasesNew 同名同义：极强右侧 + 当日止盈过，
+    # 在 bear L1 依旧只能得到 side_policy_no_new。
+    knobs = params(side_policy_enabled=True, side_policy=side_snapshot())
+    got = rs.side_buy_allowed(knobs, side_ctx(), _right_sig(), "new", 0,
+                              True, False, False)
+    assert got == (False, "side_policy_no_new")
+
+
+def test_strong_right_rebuy_can_be_switched_off():
+    knobs = params(side_right_rebuy_enabled=False)
+    assert rs._strong_right_rebuy(knobs, _right_sig()) is False
+    knobs = params(side_policy_enabled=True, side_right_rebuy_enabled=False,
+                   side_policy=side_snapshot(allow_new=True, allow_add=True))
+    assert rs.side_buy_allowed(knobs, side_ctx(), _right_sig(), "new", 0,
+                               True, False, False)[1] == "tp_rebuy_block"
+
+
+# ---------------------------------------------------------------------------
+# D7 2026-11-25：动态仓位按牛熊分时段释放（ramp 只乘战略目标，不进 T 额度）
+#
+# 与 Go 的 side_ramp_test.go 同八行真值表；缺读数/非法表一律回落到整表
+# 出厂值，绝不"挑一格自己算"。
+# ---------------------------------------------------------------------------
+
+def _ramp_state(mode="bull", latch=False):
+    st = side_snapshot(mode=mode)
+    st["enabled"] = True
+    st["latch_active"] = latch
+    return st
+
+
+def test_side_time_ramp_neutral_modes_and_t_leg():
+    knobs = params()
+    assert rs.side_time_ramp(knobs, _ramp_state("range"), "09:45", 0) == 1.0
+    assert rs.side_time_ramp(knobs, None, "09:45", 0) == 1.0
+    assert rs.side_time_ramp(params(side_ramp_enabled=False), _ramp_state(), "09:45", 0) == 1.0
+    assert rs.side_time_ramp(knobs, _ramp_state(), "09:45", 0, "t_leg") == 1.0
+
+
+def test_side_time_ramp_am_band():
+    knobs = params()
+    assert rs.side_time_ramp(knobs, _ramp_state("bull"), "09:45", 0) == 0.70
+    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "09:45", 0) == 0.30
+
+
+def test_side_time_ramp_pm_without_latch():
+    knobs = params()
+    assert rs.side_time_ramp(knobs, _ramp_state("bull"), "13:30", 0) == 1.00
+    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "13:30", 0) == 0.50
+
+
+def test_side_time_ramp_pm_latch_holds_am_band():
+    knobs = params()
+    assert rs.side_time_ramp(knobs, _ramp_state("bull", latch=True), "13:30", 0) == 0.70
+    assert rs.side_time_ramp(knobs, _ramp_state("bear", latch=True), "13:30", 0) == 0.30
+
+
+def test_side_time_ramp_full_at_boundary_ignores_latch():
+    knobs = params()
+    assert rs.side_time_ramp(knobs, _ramp_state("bull", latch=True), "14:00", 0) == 1.0
+    assert rs.side_time_ramp(knobs, _ramp_state("bear", latch=True), "14:01", 0) == 1.0
+
+
+def test_side_time_ramp_invalid_table_falls_back_wholesale():
+    # 一格非法 ⇒ 整表弃权，回落出厂 ramp（1.0），不许留半张表。
+    knobs = params(side_ramp_bull_am=1.7)
+    assert rs.side_time_ramp(knobs, _ramp_state("bull"), "09:45", 0) == 1.0
+    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "13:30", 0) == 1.0
+    knobs = params(side_ramp_full_at=None)
+    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "13:30", 0) == 1.0
+    assert rs.side_time_ramp_src(knobs, _ramp_state("bear"), "13:30", 0) == "ramp_off"
+
+
+def test_side_ramp_defaults_are_on_in_carrier_table():
+    for key, expected in (("side_ramp_enabled", True), ("side_ramp_bull_am", 0.70),
+                          ("side_ramp_bull_pm", 1.00), ("side_ramp_bear_am", 0.30),
+                          ("side_ramp_bear_pm", 0.50), ("side_ramp_pm_check_at", "13:00"),
+                          ("side_ramp_full_at", "14:00")):
+        assert rs.SIZING_DEFAULTS[key] == expected
+        assert key in rs.SIZING_PARAM_KEYS
+
+
+def test_target_position_ramp_outside_ceiling():
+    """与 Go TestTargetRampArithmetic 同义：ramp 只放目标，不改 MS/TM 语义。"""
+    knobs = params(side_policy_enabled=True, side_policy=side_snapshot())
+    full = rs.target_position(knobs, side_ctx(side_target_multiplier=1.0,
+                                              side_time_ramp=1.0))["target"]
+    third = rs.target_position(knobs, side_ctx(side_target_multiplier=1.0,
+                                               side_time_ramp=0.35))["target"]
+    assert full > 0
+    assert third == pytest.approx(full * 0.35)

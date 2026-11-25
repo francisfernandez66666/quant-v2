@@ -533,8 +533,15 @@ def _to_float(value, default):
         return default
 
 
-def _t_equity_basis(total, macro, stale_sec):
-    """T cap-base equity: the counter reading, else a FRESH baked fallback.
+def _t_equity_basis_src(total, macro, stale_sec):
+    """F7 2026-11-25: T cap-base equity AND which leg produced it -> (value, src).
+
+    `src` is one of `counter` / `baked` / `none` and is printed on the `t_denom`
+    line every round. Reason (plan section 10 F7): 46 of 58 rounds on 2026-11-24
+    stopped at `step0 equity_or_holdings_value_unavailable`, and BOTH fallback
+    legs existed -- so the missing half was the ATTRIBUTION, not the value.
+    Without `src=` a number that came from a stale bake and a number the counter
+    really said look the same on the log, and the next fix guesses.
 
     T-EQUITY-FALLBACK 2026-11-17: this broker's ACCOUNT table does not fill
     m_dBalance intraday, so `total` (from _account_total_asset) is None and
@@ -552,24 +559,31 @@ def _t_equity_basis(total, macro, stale_sec):
     """
     if total is not None:
         t = _to_float(total, None)
-        return t if t is not None and t > 0.0 else None
+        if t is not None and t > 0.0:
+            return t, "counter"
+        return None, "none"
     _macro = macro if isinstance(macro, dict) else {}
     baked = _to_float(_macro.get("total_asset"), None)
     if baked is None or baked <= 0.0:
         _warn_once("t_equity_no_denominator",
                    "no counter equity and no baked total_asset: T stays closed")
-        return None
+        return None, "none"
     window = _to_float(stale_sec, 0.0)
     if window is None or window <= 0.0:
-        return None  # no defined freshness window -> do not trust a baked number
+        return None, "none"  # no freshness window -> do not trust a baked number
     age = _to_float(_macro.get("asof_age_sec"), None)
     if age is None:
         _warn_once("t_equity_baked_age", "baked total_asset has no age: fail closed")
-        return None
+        return None, "none"
     if age > window:
         _warn_once("t_equity_baked_stale", "baked total_asset is stale: fail closed")
-        return None
-    return baked
+        return None, "none"
+    return baked, "baked"
+
+
+def _t_equity_basis(total, macro, stale_sec):
+    """Value-only face of `_t_equity_basis_src` (the 2026-11-17 callers)."""
+    return _t_equity_basis_src(total, macro, stale_sec)[0]
 
 
 def _positions():
@@ -1205,6 +1219,11 @@ def _now_ts():
     guessed old).
     """
     return time.time()
+
+
+def _hhmm_now():
+    """Wall clock 'HH:MM' (D7 readout only; the strategy's own clock)."""
+    return datetime.now().strftime("%H:%M")
 
 
 def _trade_session_ok(moment=None):
@@ -2748,12 +2767,21 @@ def _ref_and_volume(ContextInfo, symbol, tick):
     # the volume-ratio gates become computable with tick data alone. A symbol NOT
     # covered by precalc keeps the old honest fallback (ref=prev_close, ratio
     # abstains): we never invent a number. Warn once per PROCESS either way.
-    precalc = (PARAMS.get("precalc") or {}).get(symbol) or {}
+    #
+    # F2 2026-11-25: the table is keyed by the BARE 6-digit code (pregen writes
+    # `precalc[symbol]` from the bare scan list), while every caller here passes
+    # `600000.SH` -- so the lookup below silently missed for EVERY symbol and the
+    # volume ratio abstained all day (the 11-24 log line was
+    # `step0 volume_ratio_unavailable` on 100% of rounds). Try the bare code
+    # FIRST, then the exact symbol: accepting both shapes is what makes the
+    # earlier strategic-side call sites keep working unchanged.
+    precalc = PARAMS.get("precalc") or {}
+    pre_row = precalc.get(_bare(symbol)) or precalc.get(symbol) or {}
     prev_close = tick.get("prev_close")
-    if precalc:
-        ref = precalc.get("ma_ref") or prev_close
+    if pre_row:
+        ref = pre_row.get("ma_ref") or prev_close
         volume = tick.get("volume")
-        base = precalc.get("vol_ma5")
+        base = pre_row.get("vol_ma5")
         ratio = (volume / base) if (volume and base) else None
         _warn_once("hist_precalc",
                    "no history series from this build: using params.precalc factors")
@@ -2954,7 +2982,7 @@ def _vol_state_of(r_yest, r_ma5):
     r_yes_surge = _flow_param("flow_r_yest_surge")
     r_ma5_surge = _flow_param("flow_r_ma5_surge")
     r_yes_shrink = _flow_param("flow_r_yest_shrink")
-    r_ma5_shrink = _flow_param("flow_r_ma5_shrink")
+    r_ma5_shrink = _flow_param("flow_r_ma5_shrink")  # 0.95 since 2026-11-25 (was 0.9)
     if None in (r_yes_surge, r_ma5_surge, r_yes_shrink, r_ma5_shrink):
         return "neutral"
     if r_yest > r_yes_surge and r_ma5 > r_ma5_surge:
@@ -3434,7 +3462,7 @@ def _flow_readout():
     side = _STATE.get("side_policy_last") or {}
     _log("flow vol_state=%s r_yest=%s r_ma5=%s src=%s reason=%s market_delta=%s sectors=%d "
          "sector_hit=%d/%d state=%s pos_rel=%.3f decision=%s qwhy=%s "
-         "side mode=%s level=%s slope=%s gap=%s tgt=%s left=%s right=%s new=%s add=%s latch=%s" % (
+         "side mode=%s level=%s slope=%s gap=%s tgt=%s left=%s right=%s new=%s add=%s latch=%s ramp=%s" % (
              vol.get("vol_state") or "neutral",
              "na" if vol.get("r_yest") is None else "%.4f" % float(vol.get("r_yest")),
              "na" if vol.get("r_ma5") is None else "%.4f" % float(vol.get("r_ma5")),
@@ -3456,7 +3484,10 @@ def _flow_readout():
              "na" if side.get("right_weight") is None else "%.3f" % float(side.get("right_weight")),
              side.get("allow_new") if side.get("allow_new") is not None else "na",
              side.get("allow_add") if side.get("allow_add") is not None else "na",
-             side.get("latch_active") if side.get("latch_active") is not None else "na"))
+             side.get("latch_active") if side.get("latch_active") is not None else "na",
+             # D7: the cell that released today's target (ramp_off when D7 is off).
+             "na" if side.get("mode") not in ("bull", "bear") else
+             "%.2f" % side_time_ramp(PARAMS, side, _hhmm_now(), _now_ts())))
 
 
 def _spent_buy_amount(orders, buy_prefixes, day):
@@ -3624,6 +3655,12 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "tp_stage": tp_stage,
         "tp_manual": bool((tp_plan or {}).get("manual")) if isinstance(tp_plan, dict) else False,
         "tp_dragon_open_no_reseal": tp_dragon_open,
+        # D2 2026-11-25: the baked open price of the CURRENT accumulation segment.
+        # Only the two take-profit legs measure against it (local_executor
+        # `_tp_cost_of`); position_cost above stays the counter's frozen basis for
+        # stop_loss / reduce_position -- the two chains must keep separate
+        # denominators, never overwrite one with the other.
+        "tp_open_price": (tp_plan or {}).get("open_price") if isinstance(tp_plan, dict) else None,
         "can_use_qty": held.get("can_use"),
         "available_cash": cash,
         "daily_buy_total": spent,
@@ -3788,6 +3825,65 @@ def _market_scale_ceiling():
     return scale * margin
 
 
+def _t_leg_value(side, day=""):
+    """F5 2026-11-25: money tied up in TODAY's unpaired T legs of one side.
+
+    Same arithmetic as the Go side (internal/engine/tlive_state.go bookValue):
+    filled quantity x current price, falling back to the leg's own fill price
+    when no tick is available -- never to zero, because a zero here inflates the
+    strategic room, which is the dangerous direction (the same money would be
+    spendable by the strategic buy leg AND by the T leg).
+
+    The reading comes from `_STATE["t_leg_snapshot"]`, written once per round by
+    _run_t from the book it rebuilt. A snapshot carrying another day counts as
+    "no T legs today": the rounds are day-keyed and must not leak across
+    midnight (a stale buy leg would otherwise reserve cash forever).
+    """
+    snap = _STATE.get("t_leg_snapshot") or {}
+    if not day:
+        moment = _STATE.get("round_moment")
+        day = day_key(moment) if moment is not None else ""
+    if not day or str(snap.get("day") or "") != str(day):
+        return 0.0
+    return _to_float(snap.get(side), 0.0) or 0.0
+
+
+def _t_leg_values(book, day, price_of):
+    """F5: today's OPEN T legs as money, per side -> {"day","buy","sell"}.
+
+    Only legs that actually traded count (filled x price): an intent that never
+    filled has not committed any money, and counting it would shrink the
+    strategic room for no reason. Direction comes from the round record, never
+    from a guess about the remark.
+    """
+    buy = 0.0
+    sell = 0.0
+    for rnd in (book.rounds.values() if book is not None else []):
+        if not isinstance(rnd, dict):
+            continue
+        if str(rnd.get("status") or "") != T_STATE_OPEN:
+            continue
+        if day and rnd.get("day") and str(rnd.get("day")) != str(day):
+            continue
+        symbol = rnd.get("symbol") or ""
+        px = _to_float(price_of(symbol), 0.0) or 0.0
+        direction = str(rnd.get("direction") or "")
+        # Rebuilt rounds carry buy_*/sell_*; a round built in-process by
+        # new_round only carries first_*/pair_*, where "first" is the direction's
+        # opening side. Read both shapes so the money is never silently zero.
+        if direction == T_DIR_BUY_FIRST:
+            qty = _to_float(rnd.get("buy_filled", rnd.get("first_filled")), 0.0) or 0.0
+            price = px if px > 0.0 else (
+                _to_float(rnd.get("buy_price", rnd.get("first_price", rnd.get("decision_price"))), 0.0) or 0.0)
+            buy += qty * price
+        elif direction == T_DIR_SELL_FIRST:
+            qty = _to_float(rnd.get("sell_filled", rnd.get("first_filled")), 0.0) or 0.0
+            price = px if px > 0.0 else (
+                _to_float(rnd.get("sell_price", rnd.get("first_price", rnd.get("decision_price"))), 0.0) or 0.0)
+            sell += qty * price
+    return {"day": day, "buy": buy, "sell": sell}
+
+
 def _sizing_view(ctx, positions, pending_buys=None):
     """The account-level view the sizing chain needs on top of the per-symbol ctx.
 
@@ -3820,11 +3916,14 @@ def _sizing_view(ctx, positions, pending_buys=None):
         entry["price"] = price
         live.append(entry)
     out["positions_live"] = live
-    # T legs: this carrier does not place T legs itself (t orchestration is a
-    # separate batch), so both are honestly zero -- never absent, which the
-    # target layer would read as an unprovable account.
-    out.setdefault("t_buy_leg_value", 0.0)
-    out.setdefault("t_sell_leg_value", 0.0)
+    # T legs: F5 2026-11-25 -- these used to be hardcoded zeros because the
+    # carrier placed no T legs at all. It does now (_run_t below), so a zero
+    # would be a LIE in the dangerous direction: the strategic buy leg would
+    # see the cash already spent on an unpaired T buy leg as free room and
+    # spend it twice. The value comes from the per-round snapshot _run_t
+    # writes; a snapshot from another day reads as zero (rounds are day-keyed).
+    out["t_buy_leg_value"] = _t_leg_value("buy", out.get("day") or "")
+    out["t_sell_leg_value"] = _t_leg_value("sell", out.get("day") or "")
     bucket = out.get("bucket_view") or {}
     for key in ("stock_value", "industry_known", "industry_value",
                 "cluster_set", "cluster_value"):
@@ -3840,6 +3939,15 @@ def _sizing_view(ctx, positions, pending_buys=None):
     # applies min(scale, ceiling); a missing/expired cloud snapshot lands the
     # ceiling on the blind-spot cap, i.e. today's behaviour.
     out["market_scale_ceiling"] = _market_scale_ceiling()
+    # D7 2026-11-25: inject the time-of-day release factor HERE, not in sizing_cap,
+    # because this view has two callers -- the cash_probe readout line and the
+    # order path -- and only injecting here puts the same number on both.
+    # side_time_ramp is a pure PARAMS read; a failure would be a rules bug, not a
+    # missing reading, so it is not wrapped in try/except (the readout caller
+    # already degrades to na).
+    out["side_time_ramp"] = side_time_ramp(
+        PARAMS, _STATE.get("side_policy_last") or {},
+        out.get("hhmm") or _hhmm_now(), _now_ts(), intent="new")
     return out
 
 
@@ -3872,13 +3980,16 @@ def _probe_cash_line(short, amount, why, note, ctx, params):
         # decision used, and any failure here degrades to na (never blocks a round).
         target = target_position(params, sized_view) or {}
         held, pending, _bl, _sl, okv = _sz_position_value(sized_view)
-        basis = "base=%s ms=%s tgt=%s held=%s pend=%s room=%s" % (
+        basis = "base=%s ms=%s tgt=%s held=%s pend=%s room=%s ramp=%s ramp_src=%s" % (
             "na" if target.get("total") is None else "%.0f" % float(target.get("total")),
             "na" if target.get("market_scale") is None else "%.4f" % float(target.get("market_scale")),
             "na" if target.get("target") is None else "%.0f" % float(target.get("target")),
             "na" if (not okv or held is None) else "%.0f" % float(held),
             "na" if (not okv or pending is None) else "%.0f" % float(pending),
-            "na" if target.get("room") is None else "%.0f" % float(target.get("room")))
+            "na" if target.get("room") is None else "%.0f" % float(target.get("room")),
+            "na" if target.get("time_ramp") is None else "%.2f" % float(target.get("time_ramp")),
+            side_time_ramp_src(params, _STATE.get("side_policy_last") or {},
+                               sized_view.get("hhmm"), _now_ts()))
     except Exception as exc:  # noqa: BLE001 - readout only, never a decision
         cap = cap or "err:%s" % repr(exc)[:60]
         basis = basis or "basis_err:%s" % repr(exc)[:60]
@@ -3916,6 +4027,10 @@ def sizing_cap(ctx, positions, intent="new", pending_buys=None):
         return None, "sizing_disabled", ""
     sized = _sizing_view(ctx, positions, pending_buys)
     sized["side_target_multiplier"] = side_target_multiplier(PARAMS, sized, intent)
+    # D7: T and reduce are never shrunk by the ramp (same precedent as
+    # rules_sizing.side_target_multiplier returning neutral for those intents).
+    if intent in ("t_leg", "reduce"):
+        sized["side_time_ramp"] = SZ_NEUTRAL
     caps = buy_size_caps(PARAMS, sized)
     # FLOW-BLEND 2026-11-20: the four-quadrant reading lands on the AMOUNT, not
     # on a gate (owner ruling). Multiplying per_trade here is the carrier-side
@@ -4178,6 +4293,233 @@ def _holdings_value(positions, price_of):
     return total
 
 
+def _holdings_value_src(positions, price_of):
+    """F7 2026-11-25: `_holdings_value` plus WHICH leg carried the sum -> (value, src).
+
+    Same three legs, same order of trust; the only addition is the attribution
+    (`mv` / `cost` / `last` / `none`) printed on the `t_denom` line. `none` is
+    the reading that matters: it means no leg produced a number for ANY held
+    row, which is a different defect from "the sum is small".
+    """
+    total = 0.0
+    legs = set()
+    for symbol, row in (positions or {}).items():
+        item = row or {}
+        qty = _to_float(item.get("qty"), 0.0) or 0.0
+        if qty <= 0.0:
+            continue
+        mv = _to_float(item.get("market_value"), 0.0) or 0.0
+        if mv > 0.0:
+            total += mv
+            legs.add("mv")
+            continue
+        cost = _to_float(item.get("cost"), 0.0) or 0.0
+        if cost > 0.0:
+            total += cost * qty
+            legs.add("cost")
+            continue
+        last = _to_float(price_of(symbol), 0.0) or 0.0
+        if last > 0.0:
+            total += last * qty
+            legs.add("last")
+    # Highest-priority leg that actually contributed: a mixed book reports the
+    # strongest one, so `src=mv` never hides a cost-basis row.
+    for name in ("mv", "cost", "last"):
+        if name in legs:
+            return total, name
+    return total, "none"
+
+
+def _listed_days_coverage():
+    """F3 2026-11-25: share of the baked universe that carries `listed_days` (0..100).
+
+    Denominator is the precalc table itself -- the universe the box can actually
+    look at. `params.symbols` would make the number depend on the scan list
+    rather than on the data, and a code missing from precalc has no reading of
+    any kind. None (precalc absent) is NOT 0%: the caller must stay in the
+    explicit-off A mode either way, but the log line has to tell the two apart.
+    """
+    pre = PARAMS.get("precalc")
+    if not isinstance(pre, dict) or not pre:
+        return None
+    have = 0
+    for row in pre.values():
+        if isinstance(row, dict) and _to_float(row.get("listed_days"), None) is not None:
+            have += 1
+    return 100.0 * have / float(len(pre))
+
+
+def _strategic_room_of(ctx, positions, pending_rows):
+    """F5 2026-11-25: money the strategic target still allows -> room or None.
+
+    Same chain the strategic buy leg uses (`_sizing_view` -> `target_position`),
+    never a second formula: room = target - held - pending. None on any failure,
+    which `t_open_qty` turns into `strategic_room_or_frozen_cash_unavailable`
+    (fail closed). A zero would be worse than None here: the T buy leg would read
+    "the strategy has no room" and then spend the strategy's budget anyway.
+    """
+    try:
+        target = target_position(PARAMS, _sizing_view(ctx, positions, pending_rows)) or {}
+    except Exception:  # noqa: BLE001 - a reading must never take the round down
+        return None
+    return target.get("room")
+
+
+def _discipline_stop_loss_pct():
+    """F5: the clear line as a PERCENT distance, from the one baked ratio.
+
+    `stop_loss_ratio` is 0.94 on this account (= -6%). rules_t.stop_line_distance
+    wants percentage POINTS, so the conversion happens exactly here, once. An
+    out-of-range ratio returns None: the T sell leg then declines to judge the
+    distance to a risk line it cannot locate.
+    """
+    ratio = _to_float(PARAMS.get("stop_loss_ratio"), None)
+    if ratio is None or ratio <= 0.0 or ratio >= 1.0:
+        return None
+    return (1.0 - ratio) * 100.0
+
+
+def _strategic_busy_for(orders, symbol, day):
+    """F5: does a strategic verdict or working order own this name right now?
+
+    Two legs, exactly like `_spent_buy_amount` (the money path's own source):
+      * the counter ORDER table -- a working BUY on this symbol (an unproven side
+        counts as BUY: over-blocking the T leg costs nothing, under-blocking lets
+        the T leg buy into the strategic order and doubles the exposure);
+      * the session journal `_STATE["sent"]` -- the ORDER table is seconds late,
+        so the round that just sent the strategic buy is invisible there.
+    T short codes are excluded on both legs: the T leg asking the question must
+    not answer "yes" with its own order.
+    """
+    t_codes = set(str(v) for v in (PARAMS.get("t_signal_codes") or {}).values())
+    for row in orders or []:
+        if not isinstance(row, dict):
+            continue
+        if _bare(row.get("symbol")) != _bare(symbol):
+            continue
+        short = str(row.get("short_code") or "")
+        if short in t_codes:
+            continue
+        side = str(row.get("side") or "")
+        if side and side != "buy":
+            continue
+        if not side and not short:
+            continue
+        if row.get("terminal") is False:
+            return True
+    for entry in _STATE.get("sent") or ():
+        try:
+            s_day, s_sym, s_short = entry
+        except (TypeError, ValueError):
+            continue
+        if s_day != day or _bare(s_sym) != _bare(symbol):
+            continue
+        if s_short in t_codes:
+            continue
+        return True
+    return False
+
+
+def _t_opposite_leg_blocked(book, orders, symbol, day, ctx):
+    """F5: is a leg pointing the OTHER way already on this name today?
+
+    In-box analogue of the Go cross-account exclusion (intraday_t_live.go:1265-1270,
+    tlive_state.go:470-518): two opposite legs on one name at the same time is the
+    broker's wash shape, and a single account must not create one either. Direction
+    comes from `t_direction` -- the very function the gate uses -- because a second
+    formula here would answer a different question than the one being gated.
+
+    An open round on the symbol already trips `t_has_open_leg`; this exists for the
+    rows the round book could NOT rebuild (unknown legs), which is exactly the state
+    where "no round" does not mean "no leg at the counter".
+    """
+    try:
+        buy, sell = t_direction(PARAMS, ctx)
+    except Exception:  # noqa: BLE001 - unreadable direction -> nothing to block
+        return False
+    if buy == sell:
+        return False  # both false: no direction; both true: t_direction never does this
+    our_side = "buy" if buy else "sell"
+    other = "sell" if buy else "buy"
+    t_codes = set(str(v) for v in (PARAMS.get("t_signal_codes") or {}).values())
+    for rnd in (book.rounds.values() if book is not None else []):
+        if not isinstance(rnd, dict) or str(rnd.get("status") or "") != T_STATE_OPEN:
+            continue
+        if _bare(rnd.get("symbol")) != _bare(symbol):
+            continue
+        if day and rnd.get("day") and str(rnd.get("day")) != str(day):
+            continue
+        first = "buy" if str(rnd.get("direction") or "") == T_DIR_BUY_FIRST else "sell"
+        if first != our_side:
+            return True
+    for row in orders or []:
+        if not isinstance(row, dict):
+            continue
+        if _bare(row.get("symbol")) != _bare(symbol):
+            continue
+        if str(row.get("short_code") or "") not in t_codes:
+            continue
+        if str(row.get("side") or "") != other:
+            continue
+        if row.get("terminal") is False:
+            return True
+    return False
+
+
+def _tp_pct_of(day, symbol):
+    """F5: the strategy's own take-profit point for this name, from the baked plan.
+
+    Returns None when the cloud baked no plan (or no tp_pct in it): the sell-side
+    distance gate then judges the stop line only, which is the fail-closed side.
+    """
+    plan = _tp_plan_of(day, symbol)
+    if not isinstance(plan, dict):
+        return None
+    return _to_float(plan.get("tp_pct"), None)
+
+
+def _round_signal_of(symbol, day, side):
+    """F5: this round's live, not-yet-sent signal short code for one side, or ''.
+
+    The T leg's candidate-B test (rules_t.t_signal_gate) asks "is there a FRESH
+    buy signal on this name that nobody has consumed?". In the carrier the only
+    place that knows is the signal loop of the current round, which records its
+    live hits in `_STATE["round_signals"]` (see run_round). A short code already
+    in `_STATE["sent"]` is NOT fresh: that intent has been placed this session,
+    and a second leg on the same verdict is exactly what the gate forbids.
+    """
+    book = _STATE.get("round_signals") or {}
+    if str(book.get("day") or "") != str(day or ""):
+        return ""
+    entry = (book.get(side) or {}).get(_bare(symbol)) or ""
+    if not entry:
+        return ""
+    if (day, symbol, entry) in (_STATE.get("sent") or ()):
+        return ""
+    return entry
+
+
+def _log_t_cost(symbol, ctx, qty):
+    """F4 2026-11-25: one line naming the T cost line and the expected spread.
+
+    `required` comes from t_cost_gate's own detail (the fee model + safety
+    multiplier), `expected` is the designed pair spread the ctx carries. Both
+    numbers are printed on a PASS as well as on a refusal: an open with no cost
+    line in the log would be indistinguishable from a gate that is not wired.
+    """
+    try:
+        _ok, _why, detail = t_cost_gate(PARAMS, dict(ctx or {}, t_plan_qty=int(qty or 0)))
+    except Exception:  # noqa: BLE001 - readout only, never a decision
+        return
+    required = (detail or {}).get("required_spread_pct")
+    expected = (detail or {}).get("expected_spread_pct")
+    if required is None or expected is None:
+        return
+    _log("t_cost sym=%s %s required=%.2f%% expected=%.2f%%" % (
+        symbol, "cost_line_ok" if _ok else "cost_line_not_met",
+        float(required), float(expected)))
+
+
 def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summary):
     """LIVE-T-20261116: drive the intraday round-trip (zuo T) layer from the counter.
 
@@ -4248,6 +4590,11 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
         entry["symbol"] = symbol
         pos_view[symbol] = entry
     if not pos_view:
+        # F6 2026-11-25: this used to return WITHOUT printing anything, so a
+        # round in which no holding carried a baked anchor looked exactly like a
+        # round that never ran ("the T leg looks dead"). Name both counts and the
+        # reason; the anchored/missing pair is also printed on the final line.
+        _log("t_round anchored=0/missing=%d reason=no_provable_anchor" % len(positions or {}))
         return  # no provable anchor on any holding -> nothing may open a T leg
 
     now_ts = _now_ts()
@@ -4260,7 +4607,9 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
     # 2026-11-18 13:1x: on THIS broker neither market_value nor cost is present (both
     # default 0.0), so the sum was 0 and the T leg died on its quota denominator.
     # _holdings_value adds the last-price leg as the final fallback, per symbol.
-    holdings_value = _holdings_value(
+    # F7 2026-11-25: the same sum, plus WHICH leg produced it (`mv`/`cost`/`last`/
+    # `none`) -- the attribution is what the t_denom line below prints.
+    holdings_value, holdings_src = _holdings_value_src(
         positions, lambda sym: (_tick_of(ContextInfo, sym) or {}).get("last_price"))
 
     book = TRoundBook(PARAMS)
@@ -4269,6 +4618,12 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
     except Exception as exc:  # noqa: BLE001 -- rebuild must not take the round down
         _warn_once("t_rebuild", "T rebuild failed: " + repr(exc)[:100])
         return
+    # F5 2026-11-25: publish today's OPEN T legs as money, for the strategic
+    # sizing chain (`_t_leg_value`). Written every round -- including the rounds
+    # where no leg is open, as explicit zeros -- so a snapshot can never outlive
+    # its day: the reader compares the day key and reads a stale one as zero.
+    _STATE["t_leg_snapshot"] = _t_leg_values(
+        book, day, lambda sym: (_tick_of(ContextInfo, sym) or {}).get("last_price"))
 
     t_actions = {"open": 0, "balance": 0, "cancel": 0, "close": 0, "hold": 0}
     t_skips = {}
@@ -4276,12 +4631,24 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
     # T-EQUITY-FALLBACK 2026-11-17: counter equity first, else a fresh baked
     # total_asset (see _t_equity_basis). Only feeds the T ctx -- the strategic
     # buy sizing / cash-reserve paths are untouched.
-    t_total = _t_equity_basis(total, macro, stale_sec)
+    t_total, t_total_src = _t_equity_basis_src(total, macro, stale_sec)
     # 2026-11-18: the denominator pair is what decides whether ANY T leg can be
     # sized (`t_cap_base` = min of the two). Printing them once per round turns
     # "step0 equity_or_holdings_value_unavailable" from a dead end into a number.
-    _log("t_denom equity=%s holdings=%.0f" % (
-        "none" if t_total is None else "%.0f" % t_total, holdings_value))
+    # F7 2026-11-25: `src=<equity>/<holdings>` names WHICH leg produced each half
+    # (counter|baked|none / mv|cost|last|none). 46 of 58 rounds on 2026-11-24 died
+    # here and the two numbers alone could not say whether the bake was stale, the
+    # counter silent, or the position table empty -- three different fixes.
+    _log("t_denom equity=%s holdings=%.0f src=%s/%s" % (
+        "none" if t_total is None else "%.0f" % t_total, holdings_value,
+        t_total_src, holdings_src))
+
+    # F2/F4/F5 2026-11-25: the per-round readings every T ctx below shares.
+    # Computed ONCE per round (not per symbol) so 4-6 held names cannot pay for
+    # the same scan once per name.
+    pending_rows = _pending_buy_rows(orders)
+    listed_cov = _listed_days_coverage()
+    stop_pct = _discipline_stop_loss_pct()
 
     def base_ctx(symbol):
         row = pos_view.get(symbol) or {}
@@ -4310,6 +4677,12 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
                        "t_vwap_untrusted sym=%s why=%s volume=%s amount=%s last=%s" % (
                            symbol, vwap_why or "-", (tick or {}).get("volume"),
                            (tick or {}).get("amount"), px))
+        # F2 2026-11-25: the volume ratio MUST come from the strategic leg's own
+        # function -- a second formula would answer a different question than the
+        # one the strategic gate already answers, and the two would drift the
+        # first time either threshold moves. _ref_and_volume is that function
+        # (rules_sizing's pullback + volume gates read the same ratio).
+        _ref_px, vol_ratio = _ref_and_volume(ContextInfo, symbol, tick or {})
         # The T layer's per-symbol context: only readings actually resolved above
         # are copied in (None stays None -> rules_t abstains).
         c = {
@@ -4324,6 +4697,14 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
             "float_mcap_yi": _float_mcap_yi_of(tick, pre_row),
             "volume": (tick or {}).get("volume"),
             "amount": (tick or {}).get("amount"),
+            # F2 2026-11-25: the direction / amplitude / volume-ratio gates read
+            # these four and `base_ctx` never supplied them, so `t_direction`
+            # could not answer and 0.6 could not judge. The tick already has all
+            # four; nothing new is computed except the ratio (see above).
+            "prev_close": (tick or {}).get("prev_close"),
+            "high": (tick or {}).get("high"),
+            "low": (tick or {}).get("low"),
+            "volume_ratio": vol_ratio,
             "available_cash": cash, "total_asset": t_total,
             "holdings_value": holdings_value,
             "positions_live": pos_view,
@@ -4333,7 +4714,33 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
             "market_state_age_sec": macro.get("market_state_age_sec"),
             "initial_capital": float(PARAMS.get("initial_capital", 0) or 0),
             "t_has_open_leg": bool(book.open_for(symbol, day)),
+            # F3 2026-11-25: listed days + the coverage that decides A vs B.
+            # The floor itself is decided in rules_t.t_listed_days_floor (one
+            # home); here only the two readings are supplied.
+            "listed_days": (pre_row or {}).get("listed_days"),
+            "listed_days_coverage_pct": listed_cov,
+            # F4 2026-11-25: the cost gate needs a designed expected spread. The
+            # deviation |price-vwap| is deliberately NOT reused: it is already the
+            # entry gate, and one quantity cannot answer both "is it cheap enough"
+            # and "does it cover the cost".
+            "expected_spread_pct": PARAMS.get("t_min_spread_pct"),
+            # F5 2026-11-25: the state-class keys. Without them steps 1.5 / 5 / 6 /
+            # 7 / 9 either abstained or -- worse -- were silently satisfied.
+            "orders_today": orders,
+            "fills_today": deals,
+            "strategic_busy": _strategic_busy_for(orders, symbol, day),
+            "discipline_stop_loss_pct": stop_pct,
+            # The strategy's own take-profit point, from the baked ladder plan --
+            # the same number the TP legs sell at, never a second definition.
+            "discipline_take_profit_pct": _tp_pct_of(day, symbol),
         }
+        # The remaining keys are derived from the finished ctx (the direction check
+        # inside the opposite-leg test needs last_price + vwap) or from a chain
+        # that wants a full ctx (the strategic room).
+        c["opposite_leg_blocked"] = _t_opposite_leg_blocked(book, orders, symbol, day, c)
+        c["fresh_buy_signal_id"] = _round_signal_of(symbol, day, "buy")
+        c["active_sell_verdict"] = bool(_round_signal_of(symbol, day, "sell"))
+        c["strategic_room"] = _strategic_room_of(c, positions, pending_rows)
         return c
 
     # (a) in-flight rounds first: reconcile / pair / close (never stack a new leg)
@@ -4343,8 +4750,11 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
         symbol = rnd.get("symbol") or ""
         if symbol not in pos_view:
             continue  # no provable anchor baked -> hands off
-        ctx = base_ctx(symbol)
-        ctx["positions_live"] = book.context_for(ctx, symbol)
+        # F1 2026-11-25: `context_for` must wrap the WHOLE ctx, not just
+        # positions_live. The old form overwrote positions_live with a dict of
+        # book readings, so the in-flight branch handed t_round_state a
+        # positions table that was not a positions table.
+        ctx = book.context_for(base_ctx(symbol), symbol)
         try:
             act = t_round_state(PARAMS, ctx, rnd)
         except Exception as exc:  # noqa: BLE001
@@ -4356,7 +4766,14 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
     for symbol, row in pos_view.items():
         if book.open_for(symbol, day):
             continue
-        ctx = base_ctx(symbol)
+        # F1 2026-11-25 (the highest-priority item in the plan): the new-leg
+        # branch used the BARE base_ctx. Two caps died silently because of it --
+        # `t_rounds_used` was absent, so t_max_rounds=1 never counted a round
+        # (unlimited rounds per name per day), and `t_frozen_cash` was absent, so
+        # t_open_qty refused every buy leg with
+        # strategic_room_or_frozen_cash_unavailable. context_for supplies the
+        # book's facts; base_ctx supplies the market's.
+        ctx = book.context_for(base_ctx(symbol), symbol)
         try:
             act = t_round_state(PARAMS, ctx, None)
         except Exception as exc:  # noqa: BLE001
@@ -4367,11 +4784,23 @@ def _run_t(ContextInfo, moment, orders, positions, deals, cash, total, day, summ
             why = str(act.get("reason") or "hold")
             t_skips[why] = t_skips.get(why, 0) + 1
             continue
+        # F4 2026-11-25: name the cost line on EVERY open decision, not only on
+        # a refusal. With the current numbers (2% designed pair spread vs a
+        # ~0.26% cost line) this gate essentially always passes -- which is
+        # correct, and exactly why "the gate is passing" and "the gate was never
+        # wired" must not look the same in the log. t_cost_gate is pure, so
+        # re-running it here on the same ctx + the chosen qty adds no state.
+        _log_t_cost(symbol, ctx, act.get("qty"))
         _apply_t_action(ContextInfo, act, None, symbol, day, summary, t_actions, t_skips)
 
     # one bounded log line per round, ASCII only (GBK console safety)
-    _log("t_round actions=%s skips=%s rebuilt=%d unknown=%d" % (
+    # F6 2026-11-25: `anchored/missing` -- how many holdings carried a provable
+    # baked anchor out of how many the counter reported. `missing>0` with
+    # `anchored=0` is the "no T leg at all" shape, and it is now visible on the
+    # same line as the actions instead of only in the early-return branch.
+    _log("t_round actions=%s anchored=%d/missing=%d skips=%s rebuilt=%d unknown=%d" % (
         ",".join("%s=%d" % (k, v) for k, v in sorted(t_actions.items())),
+        len(pos_view), max(0, len(positions or {}) - len(pos_view)),
         ",".join("%s=%d" % (k, v) for k, v in sorted(t_skips.items())[:6]),
         len(rebuilt), len(unknown)))
 
@@ -4628,17 +5057,26 @@ def run_round(ContextInfo, moment):
         # pre-existing rule that a name down past the first ladder step never
         # gets bought into on the same round.
         bull = rule_pullback_buy(PARAMS, ctx)
-        # SELL-OBS-WINDOW 2026-11-23: the ladder still runs in risk order
-        # (take-profit, clear-out, breakdown) and still stops at the first hit,
-        # but stop_loss / breakdown / reduce must now HOLD for the observation
-        # window before they fire. take_profit keeps its old cadence (not this
-        # batch). A bull signal overrides the TRIM and the BREAKDOWN, never the
-        # CLEAR; every suppressed-or-pending trigger is named in the summary so
-        # "waiting" is never mistaken for "nothing to sell".
+        # SELL-OBS-WINDOW 2026-11-23: the ladder runs in risk order and stops at
+        # the first hit, but stop_loss / breakdown / reduce must HOLD for the
+        # observation window before they fire. take_profit keeps its old cadence
+        # (not this batch). A bull signal overrides the TRIM and the BREAKDOWN,
+        # never the CLEAR; every suppressed-or-pending trigger is named in the
+        # summary so "waiting" is never mistaken for "nothing to sell".
+        # STOP-LADDER 2026-11-25 (D4): the tuple below IS the priority order --
+        #   1 stop_loss          clear-out line
+        #   2 reduce_position    -3% trim (the only step a bull signal may defer)
+        #   3 take_profit_clear  protects profit only (D1: abstains underwater)
+        #   4 take_profit        Stage-0 half sale (same: abstains underwater)
+        #   5 breakdown          last, so the -3% trim always gets one turn first
+        # Live 2026-11-25: 000680 was -3.8% AND met the breakdown condition in the
+        # same round; with breakdown first the trim never ran and the whole
+        # position was dumped (TP half -> BK clear, no RD in between).
         now_ts = _now_ts()
         seen_kinds = set()
         sell_hit = False
         for kind, rule in (("stop_loss", rule_stop_loss),
+                           ("reduce", rule_reduce_position),
                            ("take_profit_clear", rule_take_profit_clear),
                            ("take_profit", rule_take_profit),
                            ("breakdown", rule_breakdown_sell)):
@@ -4675,10 +5113,13 @@ def run_round(ContextInfo, moment):
                     bull = None
                     summary["skipped"].append({"short": hit["short_code"],
                                                "reason": "sell_confirm_pending"})
-            else:  # breakdown
-                # BREAKDOWN is one of the two steps a bull signal may override
-                # (same family as the trim; the CLEAR is not): with a bull in
-                # hand the round simply holds and the window never opens.
+            elif kind in ("breakdown", "reduce"):
+                # BREAKDOWN and the -3% TRIM are the two steps a bull signal may
+                # override (same family; the CLEAR is not): with a bull in hand
+                # the round simply holds and the window never opens. D4
+                # 2026-11-25: the trim now rides this branch verbatim instead of
+                # a trailing call after the loop -- one branch, one observation
+                # window, so the two legs can never drift apart.
                 if bull:
                     summary["skipped"].append({"short": hit["short_code"],
                                                "reason": "rule_bull_override"})
@@ -4690,20 +5131,6 @@ def run_round(ContextInfo, moment):
                     summary["skipped"].append({"short": hit["short_code"],
                                                "reason": "sell_confirm_pending"})
             break
-        if not sell_hit:
-            hit = rule_reduce_position(PARAMS, ctx)
-            if hit:
-                seen_kinds.add("reduce")
-                if bull:
-                    summary["skipped"].append({"short": hit["short_code"],
-                                               "reason": "rule_bull_override"})
-                    bull = None
-                elif _confirm_sell(day, symbol, "reduce", now_ts):
-                    signals = [(hit, "live")]
-                else:
-                    bull = None
-                    summary["skipped"].append({"short": hit["short_code"],
-                                               "reason": "sell_confirm_pending"})
         # A sell kind that did not hit this round resets its clock.
         for kind in ("stop_loss", "take_profit_clear", "breakdown", "reduce"):
             if kind not in seen_kinds:
@@ -4758,6 +5185,18 @@ def run_round(ContextInfo, moment):
                 summary["skipped"].append({"short": signal["short_code"],
                                            "reason": "rule_" + mode})
                 continue
+            # F5 2026-11-25: record this round's LIVE signal per (symbol, side)
+            # so the T leg can answer "is there a fresh verdict on this name?"
+            # with a reading instead of a guess (rules_t.t_signal_gate's
+            # candidate B, and the sell-side veto). Only the first hit per side
+            # is kept: the T leg needs existence, not a list.
+            _rs = _STATE.get("round_signals")
+            if not isinstance(_rs, dict) or str(_rs.get("day") or "") != str(day):
+                _rs = {"day": day, "buy": {}, "sell": {}}
+                _STATE["round_signals"] = _rs
+            _side = str(signal.get("side") or "")
+            if _side in ("buy", "sell"):
+                _rs[_side].setdefault(_bare(symbol), str(signal["short_code"]))
             short = signal["short_code"]
             # NEWS-GATE (owner ruling R10) sell acceleration: force_sell_boost
             # (negative-D1 holdings) SELLS are exempt from the same-day

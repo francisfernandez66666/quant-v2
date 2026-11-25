@@ -256,7 +256,7 @@ PARAMS = {
     'flow_blend_pct': 0.2,
     'flow_factor_enabled': True,
     'flow_posrel_high': 1.3,
-    'flow_r_ma5_shrink': 0.9,
+    'flow_r_ma5_shrink': 0.95,
     'flow_r_ma5_surge': 1,
     'flow_r_yest_shrink': 1,
     'flow_r_yest_surge': 1.2,
@@ -458,6 +458,15 @@ PARAMS = {
     'side_policy': {},
     'side_policy_enabled': False,
     'side_policy_ttl_sec': 2700,
+    'side_ramp_bear_am': 0.3,
+    'side_ramp_bear_pm': 0.5,
+    'side_ramp_bull_am': 0.7,
+    'side_ramp_bull_pm': 1,
+    'side_ramp_enabled': True,
+    'side_ramp_full_at': '14:00',
+    'side_ramp_pm_check_at': '13:00',
+    'side_right_rebuy_enabled': True,
+    'side_right_rebuy_margin': 15,
     'side_weight_hi': 1.2,
     'side_weight_lo': 0.8,
     'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP', 'reduce_position': 'RD', 'take_profit_clear': 'TT'},
@@ -494,6 +503,8 @@ PARAMS = {
     't_limit_pct_st': 4.9,
     't_limit_pct_star': 19.9,
     't_limit_pct_wide': 19.9,
+    't_listed_days_auto': True,
+    't_listed_days_coverage_min_pct': 95,
     't_market_plunge_pct': -2,
     't_max_rounds': 1,
     't_min_amount_wan': 3000,
@@ -547,7 +558,7 @@ PARAMS = {
     'tp_half_fraction': 0.5,
     'tp_ladder_enabled': True,
     'tp_pct_base': 100.0,
-    'tp_peak_arm_pct': 0,
+    'tp_peak_arm_pct': 3,
     'tp_rebuy_block': True,
     'tp_stage_half': 1,
     'tp_trail_clear_retr_pct': 5,
@@ -1052,6 +1063,29 @@ def _tp_pnl_pct(params, cost, price):
     return (params["tp_pct_base"] * (float(price) - float(cost))) / float(cost)
 
 
+def _tp_cost_of(params, ctx):
+    """Cost denominator for the take-profit legs: baked open price, else counter.
+
+    Owner 2026-11-25 (D2): the ladder is rebuilt from the CURRENT accumulation
+    segment and bakes `open_price` alongside it, so P&L must be measured against
+    that price. A 100-share leftover from six weeks ago must not become the
+    denominator of today's position (live case: 000521 open_date 2026-10-12).
+
+    Only the two take-profit legs use this. rule_stop_loss / rule_reduce_position
+    keep `position_cost` (the counter's frozen basis, _basis_of) on purpose --
+    changing the stop ladder's denominator is a separate decision.
+    """
+    baked = ctx.get("tp_open_price")
+    if baked is not None:
+        try:
+            v = float(baked)
+        except (TypeError, ValueError):
+            v = None
+        if v is not None and v > params["zero_amount"]:
+            return v
+    return ctx.get("position_cost")
+
+
 def _tp_thresholds(params, symbol):
     """{"half": %, "clear": %} peak-retrace thresholds for this board.
 
@@ -1121,16 +1155,22 @@ def rule_take_profit(params, ctx):
         return None
     last = ctx.get("last_price")
     qty = ctx.get("position_qty")
-    cost = ctx.get("position_cost")
     peak = ctx.get("tp_peak")
     if last is None or not qty or peak is None:
         return None
+    # Owner 2026-11-25 (D1): this leg exists to PROTECT PROFIT ALREADY MADE.
+    # While the position is underwater a peak retrace is not a take-profit
+    # problem at all -- that is the -3% trim / -6% clear ladder
+    # (rule_reduce_position / rule_stop_loss). Live 2026-11-25: peaks of
+    # +1.49% / +1.47% / +2.88% fired half-sales at -2.56% / -3.81% / -1.65%.
+    # A missing cost makes the leg abstain, the same direction as stop_loss.
+    cost = _tp_cost_of(params, ctx)
+    pnl_now = _tp_pnl_pct(params, cost, last)
+    if pnl_now is None or pnl_now <= params["zero_amount"]:
+        return None
     tp_pct = ctx.get("tp_pct")
     if tp_pct is not None:
-        pnl = _tp_pnl_pct(params, cost, last)
-        if pnl is None:
-            return None
-        if pnl < float(tp_pct):
+        if pnl_now < float(tp_pct):
             return None
     else:
         peak_pnl = _tp_pnl_pct(params, cost, peak)
@@ -1174,21 +1214,27 @@ def rule_take_profit_clear(params, ctx):
         return None
     last = ctx.get("last_price")
     qty = ctx.get("position_qty")
-    cost = ctx.get("position_cost")
     peak = ctx.get("tp_peak")
     if last is None or not qty or peak is None:
         return None
     if ctx.get("tp_dragon_open_no_reseal"):
         return make_signal(params, ctx, "take_profit_clear", "sell", None, last, qty=int(qty))
+    # Owner 2026-11-25 (D1): the stage-1 trail leg protects profit too, for the
+    # same reason as rule_take_profit. The dragon open-board leg above has
+    # already returned, so it is never subject to this gate (owner ruling 9:
+    # "the dragon is often already a tail when we buy it").
+    cost = _tp_cost_of(params, ctx)
+    pnl_now = _tp_pnl_pct(params, cost, last)
+    if pnl_now is None or pnl_now <= params["zero_amount"]:
+        return None
     if ctx.get("tp_stage") != params["tp_stage_half"]:
         return None
     tp_pct = ctx.get("tp_pct")
     if tp_pct is not None:
         peak_pnl = _tp_pnl_pct(params, cost, peak)
-        pnl = _tp_pnl_pct(params, cost, last)
-        if peak_pnl is None or pnl is None:
+        if peak_pnl is None:
             return None
-        if peak_pnl - pnl < params["tp_giveback_pp"]:
+        if peak_pnl - pnl_now < params["tp_giveback_pp"]:
             return None
     else:
         retr = _tp_retr_pct(params, peak, last)

@@ -18,7 +18,9 @@
 # built sandbox artifact (a template-level grep cannot see the product).
 import importlib.util
 import json
+import re
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -105,6 +107,11 @@ class TakeProfitLadderTest(unittest.TestCase):
         with open(PARAMS_PATH, encoding="utf-8") as fh:
             cls.params_doc = json.load(fh)
 
+    @classmethod
+    def tearDownClass(cls):
+        # 清掉 sandbox 构建产物；这批策略副本带假持仓/假成交，不进任何真库。
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
     def setUp(self):
         self.mod.PARAMS.clear()
         self.mod.PARAMS.update(self.baked_params)
@@ -174,13 +181,15 @@ class TakeProfitLadderTest(unittest.TestCase):
 
     def test_twenty_centimeter_clear_line(self):
         params = self.mod.PARAMS
-        base = dict(symbol=SYM_20CM, tp_pct=None, position_cost=10.0, tp_peak=10.5,
+        # D1 2026-11-25：清仓腿只在**浮盈**时接管。20cm 的 8% 回撤必须落在一个
+        # 仍浮盈的价位上（成本 10、峰值 12 = +20%），否则测到的是 -3%/-6% 阶梯。
+        base = dict(symbol=SYM_20CM, tp_pct=None, position_cost=10.0, tp_peak=12.0,
                     tp_stage=params["tp_stage_half"])
-        # (10.5-9.71)/10.5 = 7.52% < 8% -> hold
+        # (12.0-11.1)/12.0 = 7.50% < 8% -> hold
         self.assertIsNone(self.mod.rule_take_profit_clear(
-            params, ctx(last_price=9.71, **base)))
-        # (10.5-9.65)/10.5 = 8.10% >= 8% -> clear
-        hit = self.mod.rule_take_profit_clear(params, ctx(last_price=9.65, **base))
+            params, ctx(last_price=11.1, **base)))
+        # (12.0-11.0)/12.0 = 8.33% >= 8% -> clear (still +10.0% in the money)
+        hit = self.mod.rule_take_profit_clear(params, ctx(last_price=11.0, **base))
         self.assertEqual(hit["kind"], "take_profit_clear")
         self.assertEqual(hit["qty"], 1000)
 
@@ -392,3 +401,167 @@ class TakeProfitLadderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# D1 2026-11-25：两条止盈腿只在**浮盈**时接管（owner：「止盈不是止损」）
+#
+# 现场（盒上实读）：三只票的峰值只有 +1.49% / +1.47% / +2.88%，却在 -2.56% /
+# -3.81% / -1.65% 的价位各被卖掉一半。它们不是止盈，是被破位/止损该管的事，
+# 结果被一条"回撤即卖"的腿抢了先——于是一个正在亏钱的仓位被削掉一半，
+# 而真正该在 -3%/-6% 出手的阶梯还没轮到。
+#
+# 判据只有一句：`pnl_now > zero_amount` 才许这两条腿动手。分母来自
+# `_tp_cost_of`（D2 烘的 open_price 优先，回落柜台 position_cost）。
+# 唯一的例外是龙头开板腿：它先 return，因此不受这条闸管
+# （owner 原话「龙头很可能买入时已经是龙尾巴」，不许再要求"先涨到 30%"）。
+# ---------------------------------------------------------------------------
+class TakeProfitProfitOnlyGateTest(TakeProfitLadderTest):
+    """D1：两条止盈腿在浮亏时一律弃权；龙头开板腿例外。"""
+
+    def test_half_leg_abstains_underwater(self):
+        params = self.mod.PARAMS
+        # 峰值 +1.47%、当前 -3.81%：旧行为会在这里卖一半（现场原样）。
+        base = dict(position_cost=10.0, tp_pct=None, tp_peak=10.147)
+        self.assertIsNone(self.mod.rule_take_profit(params, ctx(last_price=9.619, **base)))
+
+    def test_clear_leg_abstains_underwater(self):
+        params = self.mod.PARAMS
+        # Stage 1（已卖过一半）也一样：这一条腿保护的是"已经赚到的"，不是"少亏"。
+        base = dict(position_cost=10.0, tp_pct=None, tp_peak=10.147,
+                    tp_stage=params["tp_stage_half"])
+        self.assertIsNone(self.mod.rule_take_profit_clear(params, ctx(last_price=9.619, **base)))
+
+    def test_gate_boundary_is_exactly_break_even(self):
+        """`pnl_now > zero_amount`：刚好等于成本（0 点）**不放行**，一分钱浮盈才放行。
+
+        取"严格大于"而不是 `>=`：0 点浮盈谈不上"保护利润"，而 0.01% 已经是真钱。
+        """
+        params = self.mod.PARAMS
+        base = dict(position_cost=10.0, tp_pct=None, tp_peak=10.5)
+        # 恰好在成本：不给。
+        self.assertIsNone(self.mod.rule_take_profit(params, ctx(last_price=10.0, **base)))
+        # 高一分钱（+0.1 点），且峰值回撤已过 3% ⇒ 给。
+        hit = self.mod.rule_take_profit(params, ctx(last_price=10.01, **base))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["qty"], 500)
+
+    def test_dragon_open_board_leg_is_exempt_from_the_profit_gate(self):
+        """龙头开板腿在任何盈亏下都清（owner 裁决 9），这是**唯一**的例外。"""
+        params = self.mod.PARAMS
+        for price in (9.0, 10.0, 13.0):
+            hit = self.mod.rule_take_profit_clear(
+                params, ctx(tp_dragon_open_no_reseal=True, last_price=price,
+                            position_cost=10.0, tp_peak=10.1, tp_pct=None))
+            self.assertIsNotNone(hit, "price=%s" % price)
+            self.assertEqual(hit["qty"], 1000)
+
+    def test_missing_cost_abstains_instead_of_assuming_profit(self):
+        # 成本读不到 ⇒ 弃权（与 stop_loss 同方向：看不见 ≠ 可以卖）。
+        params = self.mod.PARAMS
+        base = dict(position_cost=None, tp_pct=None, tp_peak=10.5)
+        self.assertIsNone(self.mod.rule_take_profit(params, ctx(last_price=10.01, **base)))
+
+    def test_baked_open_price_is_the_denominator(self):
+        """D2 烘的 open_price 优先于柜台成本：分母换人，判据不变。
+
+        成本 10.00、现价 10.02（+0.2 点）在柜面看是浮盈；但这一段建仓价是 9.00，
+        真实浮盈 +11.3%，峰值 11.0 回撤 8.9% ⇒ 该卖。反例（用柜台成本）会弃权。
+        """
+        params = self.mod.PARAMS
+        # 建仓价 9.00、峰值 9.30（+3.3 点，刚过 arm 档）、现价 9.01（+0.11 点，
+        # 距峰值回撤 3.1% ≥ 3%）。两个分母给出**相反**的结论，正是这条锁的意义。
+        base = dict(position_cost=10.0, tp_pct=None, tp_peak=9.30)
+        self.assertIsNone(self.mod.rule_take_profit(params, ctx(last_price=9.01, **base)),
+                          "on the counter basis 9.01 is a loss -> the leg must abstain")
+        hit = self.mod.rule_take_profit(params, ctx(last_price=9.01, tp_open_price=9.0, **base))
+        self.assertIsNotNone(hit, "the baked open price must be the denominator")
+        self.assertEqual(hit["qty"], 500)
+
+    def test_stop_ladder_keeps_the_counter_cost(self):
+        """刻意不做的一件事：止损/减仓**不**跟着换分母。
+
+        `position_cost` 是 `_basis_of` 冻结的当日基座（加仓才采纳新成本），
+        换掉它等于把 -3%/-6% 两条线整条挪走——那是另一个决定，不在 D1/D2 里。
+        """
+        params = self.mod.PARAMS
+        # 建仓价 9.0（+11%），柜台基座 10.0（+2%）：-3%/-6% 必须按柜台算。
+        hit = self.mod.rule_reduce_position(
+            params, ctx(last_price=9.75, position_cost=10.0, tp_open_price=9.0))
+        self.assertIsNone(hit, "at 9.75 the counter basis is only -2.5% -> above the trim line")
+        hit = self.mod.rule_reduce_position(
+            params, ctx(last_price=9.69, position_cost=10.0, tp_open_price=9.0))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["kind"], "reduce_position")
+
+
+# ---------------------------------------------------------------------------
+# D4 2026-11-25：卖出链的顺序
+#
+# 现场：000680 在同一轮里既满足 -3% 减半、又满足破位。旧顺序把 breakdown 排在
+# reduce 前面 ⇒ 减仓腿一次都没轮到，整仓被清（TP 半仓 → BK 清仓，中间没有 RD）。
+# 新顺序 stop_loss → reduce → take_profit_clear → take_profit → breakdown
+# 保证"最先命中的那条是风险最严重的那条，但同级里先给减仓一次机会"。
+#
+# 这五条锁两类事：① 元组的**顺序**（顺序就是判据本身）；② 减仓腿走的是与破位腿
+# **同一个**分支（同一道观察窗），而不是循环后面那次补刀。
+# ---------------------------------------------------------------------------
+class SellChainOrderTest(TakeProfitLadderTest):
+    """D4：卖出链顺序与减仓腿的分支归属。"""
+
+    @classmethod
+    def setUpClass(cls):
+        super(SellChainOrderTest, cls).setUpClass()
+        with open(os.path.join(REPO, "qmt_gateway", "qmt_internal_strategy.py"),
+                  encoding="utf-8") as fh:
+            cls.template = fh.read()
+
+    def _chain_tuple(self):
+        """把卖出链那个元组从模板里抠出来（顺序就是判据）。"""
+        marker = "for kind, rule in ("
+        start = self.template.index(marker)
+        body = self.template[start:self.template.index("):", start)]
+        # 第一个条目与 `for` 在同一行，所以不能按"行首是 ("来筛。
+        return re.findall(r'\("([a-z_]+)", rule_[a-z_]+\)', body)
+
+    def test_chain_order_is_risk_first_then_trim(self):
+        self.assertEqual(self._chain_tuple(),
+                         ["stop_loss", "reduce", "take_profit_clear", "take_profit", "breakdown"])
+
+    def test_trim_rides_the_breakdown_branch(self):
+        """减仓腿必须与破位腿共用分支：同一道观察窗、同一句 bull 覆盖。"""
+        self.assertIn('elif kind in ("breakdown", "reduce"):', self.template)
+
+    def test_no_trailing_trim_after_the_loop(self):
+        """旧的补刀形状（循环之后 `if not sell_hit: rule_reduce_position`）不许回潮。
+
+        它的问题是"看起来减仓也在跑"，实际只有在前面五条全都没命中时才轮到，
+        与破位同轮命中时永远不会执行——正是 000680 那天的形状。
+        """
+        self.assertNotIn("if not sell_hit:", self.template)
+
+    def test_reduce_and_breakdown_can_hit_the_same_round(self):
+        """行为腿：一只 -3.8% 且跌破参考价的票，两条腿**同时**成立。
+
+        这条是顺序锁的意义所在：只要它们会同轮命中，元组顺序就决定当天是
+        "减半"还是"清仓"，不是风格问题。
+        """
+        params = self.mod.PARAMS
+        both = ctx(last_price=9.50, position_cost=10.0, ref_price=10.0,
+                   tp_pct=None, tp_peak=9.8)
+        reduce_hit = self.mod.rule_reduce_position(params, both)
+        breakdown_hit = self.mod.rule_breakdown_sell(params, both)
+        self.assertIsNotNone(reduce_hit, "at -3.8% the trim must be armed")
+        self.assertIsNotNone(breakdown_hit, "and the reference was lost in the same round")
+        self.assertEqual(reduce_hit["kind"], "reduce_position")
+        self.assertEqual(breakdown_hit["kind"], "breakdown_sell")
+
+    def test_stop_clear_still_precedes_everything(self):
+        """清仓线永远第一：-6% 命中时不许被前面的减仓腿抢走（那是更严重的风险）。"""
+        params = self.mod.PARAMS
+        deep = ctx(last_price=9.3, position_cost=10.0, ref_price=10.0,
+                   tp_pct=None, tp_peak=9.8)
+        self.assertIsNotNone(self.mod.rule_stop_loss(params, deep))
+        order = self._chain_tuple()
+        self.assertEqual(order[0], "stop_loss")
+        self.assertLess(order.index("stop_loss"), order.index("reduce"))

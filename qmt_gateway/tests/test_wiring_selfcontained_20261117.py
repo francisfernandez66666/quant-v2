@@ -316,8 +316,9 @@ class THoldingsValue20261118(unittest.TestCase):
     def test_baked_artifact_wires_the_helper_into_the_t_round(self):
         text = open(self.mod.__file__, encoding="utf-8", errors="replace").read()
         self.assertIn("def _holdings_value(positions, price_of):", text)
-        self.assertIn("holdings_value = _holdings_value(", text)
-        self.assertIn('_log("t_denom equity=%s holdings=%.0f"', text)
+        # F7 2026-11-25：接线改成带来源的 _src 版本，t_denom 也多打一段 src=。
+        self.assertIn("holdings_value, holdings_src = _holdings_value_src(", text)
+        self.assertIn('_log("t_denom equity=%s holdings=%.0f src=%s/%s"', text)
 
 
 if __name__ == "__main__":

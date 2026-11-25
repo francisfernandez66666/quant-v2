@@ -94,6 +94,11 @@ BASE_PARAMS = {
     "t_min_amount_wan": 3000.0,
     "t_min_turnover_pct": 1.5,
     "t_min_listed_days": 60.0,
+    # F3 2026-11-25：A/B 两档的切换判据（owner 裁决「先 A 后 B」）。
+    # 缺这两枚键 t_listed_days_floor 会直接 KeyError——刻意不设兜底，
+    # 因为"闸该不该开"是 owner 的裁决，不是载体可以自己猜的数。
+    "t_listed_days_auto": True,
+    "t_listed_days_coverage_min_pct": 95.0,
     "t_st_markers": ["ST"],
     # 额度 / 整手 / 现金
     "lot_size": 100,
@@ -290,10 +295,20 @@ class GateOrderTests(unittest.TestCase):
 
     def test_liquidity_and_volume_readings_decline_when_missing(self):
         # "读不到"一律按不过：流动性三项与量能一项各自点名（intraday_t_live.go:1328-1365 / 2194）。
-        for field in ("amount", "turnover_pct", "listed_days"):
+        # F3 2026-11-25：`listed_days` 是**唯一**例外，而且只在 A 档例外——owner 裁决
+        # 「先 A（闸关）后 B（数据覆盖≥95% 自动切）」。A 档下"读不到"通过不是放宽，
+        # 是这条门整条没开（tag 会写成 off(auto cov=..)）；B 档下它照旧按不过。
+        for field in ("amount", "turnover_pct"):
             blocked, reason = rt.t_liquidity_gate(params(), ctx(**{field: None}))
             self.assertTrue(blocked, field)
             self.assertIn("unavailable", reason)
+        blocked, reason = rt.t_liquidity_gate(params(), ctx(listed_days=None))
+        self.assertFalse(blocked, reason)  # A 档：闸显式关，缺读数不拦
+        blocked, reason = rt.t_liquidity_gate(
+            params(), ctx(listed_days=None, listed_days_coverage_pct=99.0))
+        self.assertTrue(blocked, "B 档：覆盖够了闸就开，缺读数必须拦")
+        self.assertIn("listed_days_unavailable", reason)
+        self.assertIn("on(cov=99%)", reason)
         blocked, reason = rt.t_volume_gate(params(), ctx(volume_ratio=None))
         self.assertTrue(blocked)
         self.assertIn("volume_ratio_unavailable", reason)
@@ -522,6 +537,53 @@ class TurnoverTierTests(unittest.TestCase):
     def test_explicit_zero_still_disables_the_gate(self):
         blocked, _reason = self._blocked(50.0, 0.01, tiers=[], t_min_turnover_pct=0.0)
         self.assertFalse(blocked)
+
+
+class ListedDaysTierTests(unittest.TestCase):
+    """F3 2026-11-25：上市天数门先 A 后 B，切换判据是**数据覆盖**（owner 裁决）。
+
+    为什么不是"观察几天再开"：`list_date` 是静态字段，一次回填就永久有效，观察期没有意义，
+    真正的判据只能是"这份数据到底覆盖了多少票"。所以三档：A（覆盖不足 ⇒ 闸显式关）、
+    B（覆盖达标 ⇒ 闸开）、覆盖读数缺失（⇒ 仍算 A，但必须在 tag 里点名，不许静默放行）。
+    """
+
+    def test_auto_off_below_the_coverage_floor(self):
+        # A 档：覆盖 12% < 95% ⇒ 闸关，`listed_days` 读不到也放行；tag 必须说明是"自动关"。
+        floor, tag = rt.t_listed_days_floor(params(), ctx(listed_days_coverage_pct=12.0))
+        self.assertEqual(floor, 0.0)
+        self.assertIn("off(auto cov=12%)", tag)
+        blocked, _why = rt.t_liquidity_gate(
+            params(), ctx(listed_days=None, listed_days_coverage_pct=12.0))
+        self.assertFalse(blocked)
+
+    def test_auto_on_once_coverage_reaches_the_floor(self):
+        # B 档：覆盖 98% ⇒ 闸开；5 天的新股必须被拦，且 reason 带 tag（能看出是 B 档）。
+        floor, tag = rt.t_listed_days_floor(params(), ctx(listed_days_coverage_pct=98.0))
+        self.assertEqual(floor, 60.0)
+        self.assertIn("on(cov=98%)", tag)
+        blocked, reason = rt.t_liquidity_gate(
+            params(), ctx(listed_days=5, listed_days_coverage_pct=98.0))
+        self.assertTrue(blocked)
+        self.assertIn("listed 5 days < 60 days", reason)
+        self.assertIn("on(cov=98%)", reason)
+
+    def test_missing_coverage_is_still_a_and_says_so(self):
+        # 覆盖读数缺失 ⇒ 仍是 A 档（看不见≠许可），但 tag 必须是 `cov=na` 而不是假装 0%。
+        floor, tag = rt.t_listed_days_floor(params(), ctx(listed_days_coverage_pct=None))
+        self.assertEqual(floor, 0.0)
+        self.assertIn("cov=na", tag)
+
+    def test_fixed_mode_ignores_coverage(self):
+        # 显式关掉自动档（存量手调账号）：覆盖再低也照旧按固定门判 ⇒ tag=on(fixed)。
+        floor, tag = rt.t_listed_days_floor(
+            params(t_listed_days_auto=False), ctx(listed_days_coverage_pct=1.0))
+        self.assertEqual(floor, 60.0)
+        self.assertEqual(tag, "on(fixed)")
+
+    def test_both_new_knobs_are_registered(self):
+        # 装配侧唯一知道自己少配了的地方就是这张清单（漏一条＝现场 KeyError）。
+        for key in ("t_listed_days_auto", "t_listed_days_coverage_min_pct"):
+            self.assertIn(key, rt.T_PARAM_KEYS)
 
 
 class CostLineTests(unittest.TestCase):

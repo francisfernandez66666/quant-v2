@@ -1,9 +1,12 @@
 # quant-carrier-side-policy.path — 引擎写出 13:00 urgent req 时立即触发。
+# D6-c 2026-11-25：引擎按账号落盘（accounts/<uid>/），这里用 glob 而不是硬编码 uid
+# （OWNER_UID 已在 .service 里写过一次，再写第二次就是两本账；"哪条请求有效"由
+# 请求体自己的 day/kind/until 判定，多触发一次只是幂等 oneshot）。
 [Unit]
 Description=Watch quant side-policy urgent request
 
 [Path]
-PathExists=/var/lib/quant-trading-v2/side_policy_urgent.req
+PathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req
 Unit=quant-carrier-side-policy.service
 
 [Install]

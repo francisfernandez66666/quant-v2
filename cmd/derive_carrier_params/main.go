@@ -220,6 +220,13 @@ func collectTConfig(c *collector) {
 	// 显式配了 min_turnover_pct 的账号这里得到 nil ⇒ 载体与云端同向地"只认平铺值"。
 	c.put("t_min_turnover_tiers", src, tc.TMinTurnoverTiersOf())
 	c.put("t_min_listed_days", src, tc.TMinListedDaysOf())
+	// §T-LEG-F3-20261125（owner 2026-11-25「先 A 后 B」）：上市天数闸按数据覆盖自动切换。
+	// 两个值都住在 internal/config/carrier_knobs.go（与 side_ramp_* 同一先例），
+	// 因为它们是**载体侧的运行策略**而不是账号级 T 配置——账号级 t_min_listed_days
+	// 仍然是"B 档一旦打开时的门槛"，两者语义不同，不能合并成一个键。
+	const f3src = "internal/config/carrier_knobs.go:carrierTListedDays*"
+	c.put("t_listed_days_auto", f3src, config.CarrierTListedDaysAuto())
+	c.put("t_listed_days_coverage_min_pct", f3src, config.CarrierTListedDaysCoverageMinPct())
 	c.put("t_vwap_check_tol_pct", src, tc.TVWAPCheckTolPctOf())
 }
 
@@ -509,6 +516,17 @@ func collectCarrierShape(c *collector) {
 	c.put("side_bucket_minutes", sideSrc, config.CarrierSideBucketMinutes())
 	c.put("side_policy_ttl_sec", sideSrc, config.CarrierSidePolicyTTLSec())
 	c.put("side_freshness_heartbeat_sec", sideSrc, config.CarrierSideFreshnessHeartbeatSec())
+	// D6-a 2026-11-25：极强右侧回买（只解 tp_rebuy_block）。margin 是分数点不是百分比。
+	c.put("side_right_rebuy_enabled", sideSrc, config.CarrierSideRightRebuyEnabled())
+	c.put("side_right_rebuy_margin", sideSrc, config.CarrierSideRightRebuyMargin())
+	// D7 2026-11-25：动态目标的分时释放阶梯（乘在 MS 派生目标上）。
+	c.put("side_ramp_enabled", sideSrc, config.CarrierSideRampEnabled())
+	c.put("side_ramp_bull_am", sideSrc, config.CarrierSideRampBullAM())
+	c.put("side_ramp_bull_pm", sideSrc, config.CarrierSideRampBullPM())
+	c.put("side_ramp_bear_am", sideSrc, config.CarrierSideRampBearAM())
+	c.put("side_ramp_bear_pm", sideSrc, config.CarrierSideRampBearPM())
+	c.put("side_ramp_pm_check_at", sideSrc, config.CarrierSideRampPMCheckAt())
+	c.put("side_ramp_full_at", sideSrc, config.CarrierSideRampFullAt())
 	// §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
 	// 全部转调 internal/config/carrier_knobs.go 的访问器；本函数不产生任何数字。
 	const tpSrc = "internal/config/carrier_knobs.go:CarrierTP*"

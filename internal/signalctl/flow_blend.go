@@ -16,6 +16,7 @@ package signalctl
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"quant-trading-v2/internal/combat_agent"
 )
@@ -97,6 +98,8 @@ func ComputeSizingWithBlend(r Regime, sig combat_agent.Signal) SizingResult {
 	sig = withRegimeFlowDeltas(r, sig)
 	res := ComputeSizing(r, sig)
 	res.TargetMultiplier = TargetMultiplierForIntent(r.SidePolicy, "new")
+	// D7 2026-11-25：分时释放只压战略目标 room，不改 MarketScale、单笔比例与 T 额度。
+	res.TimeRamp = SideTimeRamp(r.SidePolicy, time.Now())
 	res.SidePolicyMode = string(r.SidePolicy.Mode)
 	res.SidePolicyLevel = r.SidePolicy.Level
 	style := 1.0

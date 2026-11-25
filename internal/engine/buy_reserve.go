@@ -281,8 +281,10 @@ func (e *Engine) sendRoomGuard(uid string, amount float64, signalID string) (boo
 		if stt := e.tLiveFor(uid); stt != nil {
 			book = stt.bookValue(prices)
 		}
-		_, _, room, _ = fundsTargetCurRoomWithMultiplier(total, ctx.MS, sc.MaxTotalPositionPct,
-			ctx.targetMultiplier(), positions, prices, pending, book)
+		// D7：预留空间也走同一个三乘子出口，避免"下单闸看见的目标"与
+		// 资金帧看见的目标不是同一份（TM 与 ramp 都必须传齐）。
+		_, _, room, _ = fundsTargetCurRoomWithScales(total, ctx.MS, sc.MaxTotalPositionPct,
+			ctx.targetMultiplier(), ctx.timeRamp(), positions, prices, pending, book)
 	}
 	others := e.reservedAmountExcept(uid, signalID)
 	limit, ok := sendRoomLimit(room, roomOK, others, cash, cashOK)

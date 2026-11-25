@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -271,5 +272,89 @@ func TestStatusPayloadCarriesFlow(t *testing.T) {
 	}
 	if v, exists := m["market_pct"]; exists && v != nil {
 		t.Fatalf("今日无行时 market_pct 必须是 JSON null，实际 %v", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D6-c 2026-11-25：侧策略快照改读**账号**目录（并保留根目录兜底）
+//
+// 现场：`side_policy_latest.json` 曾写在数据根目录，而发版后写点搬到
+// `accounts/<uid>/`。如果读面只认一个目录，迁移期必然出现"发布成功、页面显示未知"
+// ——那是最难判的一类，因为两边都正常工作。
+// ---------------------------------------------------------------------------
+
+func writeSidePolicyFixture(t *testing.T, dir, day string, st signalctl.SidePolicyState) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "side_policy_latest.json"), raw, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func liveSideFixture(day string, now time.Time) signalctl.SidePolicyState {
+	return signalctl.SidePolicyState{
+		Enabled: true, Day: strings.ReplaceAll(day, "-", ""),
+		Mode: signalctl.SidePolicyBear, Level: 2,
+		AllowNew: false, AllowAdd: true,
+		TargetMultiplier: 0.70, LeftWeight: 0.8, RightWeight: 0.8,
+		Reason: "bear_l2", AsOf: now, AsOfUnix: now.Unix(),
+	}
+}
+
+func TestReadSidePolicyStatusPrefersTheAccountDir(t *testing.T) {
+	root := t.TempDir()
+	acct := filepath.Join(root, "accounts", "u_1")
+	now := time.Date(2026, 11, 25, 10, 30, 0, 0, time.FixedZone("CST", 8*3600))
+	// 根目录放一份旧日期的（迁移残留），账号目录放当日的：必须读账号那份。
+	writeSidePolicyFixture(t, root, "2026-11-24", signalctl.SidePolicyState{Enabled: true, Day: "20261124"})
+	writeSidePolicyFixture(t, acct, "2026-11-25", liveSideFixture("2026-11-25", now))
+	out := readSidePolicyStatus(acct, root, "2026-11-25", now)
+	if ok, _ := out["known"].(bool); !ok {
+		t.Fatalf("account-dir snapshot must be read, got %+v", out)
+	}
+	if out["status"] != "known" || out["mode"] != string(signalctl.SidePolicyBear) {
+		t.Fatalf("want known/bear from the account dir, got %+v", out)
+	}
+	if lvl, _ := out["level"].(int); lvl != 2 {
+		t.Fatalf("level must travel, got %+v", out)
+	}
+}
+
+func TestReadSidePolicyStatusFallsBackToTheRootDir(t *testing.T) {
+	root := t.TempDir()
+	acct := filepath.Join(root, "accounts", "u_1") // 不存在
+	now := time.Date(2026, 11, 25, 10, 30, 0, 0, time.FixedZone("CST", 8*3600))
+	writeSidePolicyFixture(t, root, "2026-11-25", liveSideFixture("2026-11-25", now))
+	out := readSidePolicyStatus(acct, root, "2026-11-25", now)
+	if ok, _ := out["known"].(bool); !ok {
+		t.Fatalf("root-dir fallback must be read, got %+v", out)
+	}
+	if out["status"] != "known" {
+		t.Fatalf("want known via fallback, got %+v", out)
+	}
+}
+
+func TestReadSidePolicyStatusUnknownWhenBothDirsAreEmpty(t *testing.T) {
+	root := t.TempDir()
+	acct := filepath.Join(root, "accounts", "u_1")
+	now := time.Date(2026, 11, 25, 10, 30, 0, 0, time.FixedZone("CST", 8*3600))
+	out := readSidePolicyStatus(acct, root, "2026-11-25", now)
+	if ok, _ := out["known"].(bool); ok || out["status"] != "unknown" {
+		t.Fatalf("missing snapshot must be unknown (never a neutral known), got %+v", out)
+	}
+	// 跨日快照同样不算 known：day-keyed 的文件拿错日期等于"今天没读数"。
+	writeSidePolicyFixture(t, acct, "2026-11-24", liveSideFixture("2026-11-24", now))
+	if out := readSidePolicyStatus(acct, root, "2026-11-25", now); out["known"].(bool) {
+		t.Fatalf("yesterday's snapshot must not be reported as today's, got %+v", out)
+	}
+	// 空 dir（无数据目录）也不许 panic。
+	if out := readSidePolicyStatus("", "", "2026-11-25", now); out["known"].(bool) {
+		t.Fatalf("empty dir must be unknown, got %+v", out)
 	}
 }

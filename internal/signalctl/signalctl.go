@@ -102,9 +102,13 @@ type Decision struct {
 	FlowBlend float64 `json:"flow_blend,omitempty"`
 	// TargetMultiplier/SidePolicyMode/Level/StyleWeight 仅供战略目标与侧策略复盘。
 	TargetMultiplier float64 `json:"target_multiplier,omitempty"`
-	SidePolicyMode   string  `json:"side_policy_mode,omitempty"`
-	SidePolicyLevel  int     `json:"side_policy_level,omitempty"`
-	StyleWeight      float64 `json:"style_weight,omitempty"`
+	// TimeRamp D7（2026-11-25）：与 TargetMultiplier 同组带出的分时释放因子，
+	// 让执行层与定权层用同一个 ramp（否则目标仓位在两处各算一次，账本无法解释）。
+	// English: time-of-day release factor travelling with the side-policy multiplier.
+	TimeRamp        float64 `json:"time_ramp,omitempty"`
+	SidePolicyMode  string  `json:"side_policy_mode,omitempty"`
+	SidePolicyLevel int     `json:"side_policy_level,omitempty"`
+	StyleWeight     float64 `json:"style_weight,omitempty"`
 	// QuadrantDecision / QuadrantReason §FLOW-QUADRANT 四象限决策结果（在 applySizing 算一次，
 	// 供执行层 gate.go 硬闸与减仓通道共用，避免三处各算各的漂移）。空串=Neutral/未触发。
 	QuadrantDecision string `json:"quadrant_decision,omitempty"`
@@ -566,6 +570,8 @@ func (c *Controller) applySizing(d *Decision, sig combat_agent.Signal, pol Polic
 	d.MarketScale, d.StockScale, d.FlowBlend, d.MissingKeyInput = res.MarketScale, res.StockScale, res.FlowBlend, res.MissingKeyInput
 	d.TargetMultiplier, d.SidePolicyMode, d.SidePolicyLevel, d.StyleWeight =
 		res.TargetMultiplier, res.SidePolicyMode, res.SidePolicyLevel, res.StyleWeight
+	// D7：ramp 与 TargetMultiplier 同一条纪律无条件带出，执行层不重算。
+	d.TimeRamp = res.TimeRamp
 	// §INDEX-BLIND：维度清单同样**无条件带出**（与 MS/SS 一条纪律），并做深拷贝——
 	// 决策对象会被多个消费方持有（执行层、快照落库、前端），共享底层数组就是互相写。
 	d.MissingKeyDims = append([]string(nil), res.MissingKeyDims...)

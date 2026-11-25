@@ -90,6 +90,8 @@ func (e *Engine) dispatchLiveSource(buys []combat_agent.Signal, live map[string]
 			dynBudgetCtx{MarketScale: d.MarketScale, StockScale: d.StockScale,
 				FlowBlend:        d.FlowBlend,
 				TargetMultiplier: d.TargetMultiplier,
+				// D7：把定权阶段算出的分时释放因子带到下单闸，别在这里重新算一遍。
+				TimeRamp:         d.TimeRamp,
 				QuadrantDecision: d.QuadrantDecision, QuadrantReason: d.QuadrantReason,
 				MissingKeyInput: d.MissingKeyInput, MissingKeyDims: d.MissingKeyDims},
 			pol.Regime.SizeCfg)

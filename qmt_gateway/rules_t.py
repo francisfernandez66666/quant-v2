@@ -868,6 +868,32 @@ def _turnover_floor_of(params, ctx):
     return flat, "flat_below_ladder"
 
 
+def t_listed_days_floor(params, ctx):
+    """F3 2026-11-25 (owner ruling: A first, B once the data covers) -> (floor, tag).
+
+    A = the gate is explicitly OFF (floor 0) while `listed_days_coverage_pct` is
+    below the minimum; B = the gate is ON with the configured floor. The switch is
+    driven by DATA COVERAGE, not by a calendar: list_date is a static field, so a
+    one-time backfill is permanent and an observation period would mean nothing.
+
+    The tag names BOTH states (`off(auto cov=12%)` / `on(cov=98%)`) because "off
+    because we cannot see it" and "off because somebody turned it off" are the same
+    floor and must not read the same on the log line. An unreadable coverage also
+    stays in A -- invisible is not permission.
+
+    English: A = gate off, B = gate on, switched by data coverage; both states named.
+    """
+    floor_days = _param(params, "t_min_listed_days")
+    if not _flag(params, "t_listed_days_auto"):
+        return floor_days, "on(fixed)"
+    cov = _t__num(ctx.get("listed_days_coverage_pct"))
+    need = _param(params, "t_listed_days_coverage_min_pct")
+    if cov is None or cov < need:
+        shown = "na" if cov is None else "%.0f%%" % cov
+        return _ZERO_F, "off(auto cov=%s)" % shown
+    return floor_days, "on(cov=%.0f%%)" % cov
+
+
 def t_liquidity_gate(params, ctx):
     """Liquidity prefilter (intraday_t_live.go:1328-1365): an unavailable reading FAILS.
 
@@ -892,14 +918,14 @@ def t_liquidity_gate(params, ctx):
     for marker in (_param(params, "t_st_markers") or []):
         if str(marker).upper() in name:
             return True, "ST_or_delisting_name: no intraday round trip"
-    floor_days = _param(params, "t_min_listed_days")
+    floor_days, days_tag = t_listed_days_floor(params, ctx)
     if floor_days > _ZERO_F:
         days = _t__num(ctx.get("listed_days"))
         if days is None or days <= _ZERO_F:
-            return True, "listed_days_unavailable: treated as not passed"
+            return True, "listed_days_unavailable: treated as not passed (%s)" % days_tag
         if days < floor_days:
-            return True, "listed %d days < %.0f days (a fresh name's range makes the gate void)" % (
-                int(days), floor_days)
+            return True, "listed %d days < %.0f days (a fresh name's range makes the gate void) (%s)" % (
+                int(days), floor_days, days_tag)
     return False, _EMPTY
 
 
@@ -1971,6 +1997,8 @@ T_PARAM_KEYS = [
     "t_stop_guard_pct", "t_round_stop_pct", "t_anchor_ok_sources",
     # liquidity prefilter
     "t_min_amount_wan", "t_min_turnover_pct", "t_min_listed_days", "t_st_markers",
+    # F3 2026-11-25: listed-days gate switched by data coverage (A off -> B on)
+    "t_listed_days_auto", "t_listed_days_coverage_min_pct",
     # quota, lots, cash
     "lot_size", "t_min_base_keep_qty", "t_min_remaining_position_pct", "t_fee_buffer_pct",
     # cost line (docs/PLAN_T_COST_CALIB_20261027.md:128-130, docs/IMPL_T_COST_CALIB_20261027.md:197)

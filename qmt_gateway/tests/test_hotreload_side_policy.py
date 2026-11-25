@@ -4,6 +4,7 @@ import datetime
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -24,6 +25,7 @@ class HotReloadSidePolicyTest(unittest.TestCase):
     def setUp(self):
         self.mod = load_module()
         self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.mod.DATA_DIR = self.dir
         self.mod.CONFIG_PATH = os.path.join(self.dir, "config.json")
         self.mod.SIDE_POLICY_LATEST = os.path.join(self.dir, "side_policy_latest.json")
@@ -32,6 +34,13 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         self.mod.SIDE_POLICY_ACK = os.path.join(self.dir, "side_policy_urgent.ack")
         self.mod.CARRIER_ACK_HISTORY = os.path.join(self.dir, "carrier_ack_history.jsonl")
         self.now = datetime.datetime(2026, 11, 24, 13, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+
+    def _rules_sizing(self):
+        path = os.path.join(REPO, "qmt_gateway", "rules_sizing.py")
+        spec = importlib.util.spec_from_file_location("rules_sizing_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
 
     def snap(self, **over):
         base = {"day": "20261124", "enabled": True, "mode": "bear", "level": 1,
@@ -73,11 +82,40 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         self.assertFalse(merged["allow_new"])
         self.assertEqual(merged["latch"]["reason"], "pm1300_flow_drop")
 
-    def test_empty_latest_does_not_erase_current_state(self):
+    def test_missing_latest_fails_closed_with_complete_state(self):
+        """D6-c 2026-11-25：读不到当日快照 = 「看不见」，不是「策略是空的」。
+
+        旧行为是把 current（上一次的旧态）当基准继续用，于是页面上的 `{'enabled': True}`
+        与「真的有熊市快照」长得一模一样。现在必须 fail-closed：禁 new、禁 add，
+        并且 reason 点名是缺读数。
+
+        形状要求（这条是重点）：**必须是完整合法态**。只给 day/allow_new/allow_add
+        的半份 dict 会落进 rules_sizing._side_fail_closed()，而它的 allow_add 是 True
+        （L1 语义）⇒「读不到」会反手变成「可以加仓」，reason 还会被改写成 bad_value。
+        """
         current = self.snap(allow_new=True, target_multiplier=0.7)
         merged = self.mod.merge_side_policy(current, {}, {}, self.now)
-        self.assertEqual(merged["target_multiplier"], 0.7)
         self.assertEqual(merged["mode"], "bear")
+        self.assertEqual(merged["level"], 1)
+        self.assertFalse(merged["allow_new"])
+        self.assertFalse(merged["allow_add"])
+        self.assertEqual(merged["target_multiplier"], 1.0)
+        self.assertEqual(merged["reason"], "side_policy_state_missing")
+        self.assertEqual(merged["day"], self.now.strftime("%Y%m%d"))
+        # 完整合法态的七枚必需键必须在场（少了就落进 _side_fail_closed）。
+        for key in ("enabled", "day", "mode", "level", "allow_new", "allow_add",
+                    "target_multiplier", "asof_ts", "latch_until_ts"):
+            self.assertIn(key, merged)
+        # 且必须真的被载体规则层认成"限制态"而不是"坏读数"。
+        rules_sizing = self._rules_sizing()
+        params = {"side_policy_enabled": True, "side_policy": merged,
+                  "side_policy_ttl_sec": 2700.0}
+        ctx = {"day": self.now.strftime("%Y%m%d"), "now_ts": self.now.timestamp()}
+        st = rules_sizing.side_policy_state(params, ctx)
+        self.assertTrue(st["enabled"])
+        self.assertFalse(st["allow_new"])
+        self.assertFalse(st["allow_add"])
+        self.assertEqual(st["reason"], "side_policy_state_missing")
 
     def test_request_retained_until_matching_applied_ack(self):
         req = {"request_id": "r1", "day": "20261124", "kind": "no_new"}
@@ -297,7 +335,11 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         service = open(os.path.join(base, "quant-carrier-side-policy.service"), encoding="utf-8").read()
         self.assertIn("--urgent-side-policy", service)
         self.assertIn("Restart=on-failure", service)
-        self.assertIn("ConditionPathExists=/var/lib/quant-trading-v2/side_policy_urgent.req", service)
+        # D6-c 2026-11-25：引擎按账号落盘 ⇒ 条件与监视都改成 glob（不许再硬编码 uid）。
+        self.assertIn("ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req", service)
+        path_unit = open(os.path.join(base, "quant-carrier-side-policy.path"), encoding="utf-8").read()
+        self.assertIn("PathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req", path_unit)
+        self.assertNotIn("PathExists=/var/lib/quant-trading-v2/side_policy_urgent.req", path_unit)
         # 系统日历的秒级 /30 只重复当前分钟；小时通配才是真正的每 30 秒重试窗。
         timer = open(os.path.join(base, "quant-carrier-side-policy-retry.timer"), encoding="utf-8").read()
         for hour in ("13", "14", "15"):
@@ -307,3 +349,97 @@ class HotReloadSidePolicyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    # ------------------------------------------------------------------
+    # D6-c 2026-11-25 第二半：发版后写点搬到 accounts/<uid>/，读面必须跟着走
+    # ------------------------------------------------------------------
+    def test_state_path_prefers_the_account_dir_and_falls_back(self):
+        """三态：账号目录有 ⇒ 用账号那份；只在根目录 ⇒ 用根那份；都没有 ⇒ 用账号路径（写点）。
+
+        为什么"都没有"要返回账号路径而不是根路径：这个函数的返回值有三处是**写入**用途
+        （.req 的创建、pending 的落盘、ack 的清理）。返回根路径等于在迁移后又往旧位置写，
+        于是一次发版能造出两份互不相认的状态文件。
+        """
+        acct = os.path.join(self.dir, "accounts", "u_owner")
+        os.makedirs(acct, exist_ok=True)
+        self.mod._SIDE_ACCT_DIR = acct
+        self.mod.DATA_DIR = self.dir
+
+        # ① 都没有 ⇒ 用账号路径（写点）。
+        self.assertEqual(self.mod._side_state_path("side_policy_urgent.req"),
+                         os.path.join(acct, "side_policy_urgent.req"))
+        # ② 只有根目录有 ⇒ 读根那份（跨版本过渡期不能把旧状态当"没有"）。
+        with open(os.path.join(self.dir, "side_policy_latest.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        self.assertEqual(self.mod._side_state_path("side_policy_latest.json"),
+                         os.path.join(self.dir, "side_policy_latest.json"))
+        # ③ 账号目录也有 ⇒ 账号那份赢（新写点优先）。
+        with open(os.path.join(acct, "side_policy_latest.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        self.assertEqual(self.mod._side_state_path("side_policy_latest.json"),
+                         os.path.join(acct, "side_policy_latest.json"))
+
+    def test_urgent_unit_watches_the_account_dir_glob(self):
+        """systemd 的路径条件必须用 glob：账号 UID 不是常量，写死一个 UID 会在换账号后静默失效。
+
+        `PathExistsGlob` 是 .path 的触发判据、`ConditionPathExistsGlob` 是 .service 的启动条件，
+        两者少一个就变成"req 一直堆着没人烤"（加急发布最需要它的时候失效）。
+        """
+        deploy = os.path.join(REPO, "deploy", "gz-ubuntu")
+        with open(os.path.join(deploy, "quant-carrier-side-policy.path"), encoding="utf-8") as fh:
+            path_unit = fh.read()
+        with open(os.path.join(deploy, "quant-carrier-side-policy.service"), encoding="utf-8") as fh:
+            svc_unit = fh.read()
+        glob = "accounts/*/side_policy_urgent.req"
+        self.assertIn("PathExistsGlob=/var/lib/quant-trading-v2/%s" % glob, path_unit)
+        self.assertIn("ConditionPathExistsGlob=/var/lib/quant-trading-v2/%s" % glob, svc_unit)
+        # 负锁：写死单个 UID 或退回根目录都算回潮。
+        for unit in (path_unit, svc_unit):
+            self.assertNotIn("/var/lib/quant-trading-v2/side_policy_urgent.req", unit)
+            self.assertNotIn("/accounts/u_1785377969825355000/", unit)
+
+
+class SideReversalReqTest(unittest.TestCase):
+    """2026-11-25：牛熊反转走同一条 urgent req 链，但**不许**粘 13:00 的 no_new latch。
+
+    开盘默认 bear 只是数据未齐的临时剧本；数据齐了翻成 bull 时若还带 latch，
+    页面显示"允许"而盒子上新仓全被挡，等于反转白烘。
+    """
+
+    def setUp(self):
+        self.mod = load_module()
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.mod.SIDE_POLICY_LATEST = os.path.join(self.dir, "side_policy_latest.json")
+
+    def test_reversal_req_publishes_bull_without_latch(self):
+        now = datetime.datetime(2026, 11, 25, 10, 15,
+                                tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+        day = "20261125"
+        current = {"day": day, "enabled": True, "mode": "bear", "level": 1,
+                   "allow_new": False, "allow_add": True, "target_multiplier": 1.0,
+                   "left_weight": 1.0, "right_weight": 1.0, "reason": "side_policy_cold_start_bear",
+                   "asof_ts": now.timestamp(), "latch_until_ts": 0}
+        latest = dict(current, mode="bull", level=1, allow_new=True,
+                      target_multiplier=1.2, reason="bull_mirror")
+        req = {"request_id": "%s-reversal-reversal_bear_to_bull" % day, "day": day,
+               "kind": "reversal", "until": "15:00", "reason": "reversal_bear_to_bull"}
+        merged = self.mod.merge_side_policy(current, latest, req, now)
+        self.assertEqual(merged["mode"], "bull")
+        self.assertTrue(merged["allow_new"])
+        latch = merged.get("latch") or {}
+        self.assertNotEqual(latch.get("kind"), "no_new")
+
+    def test_pm_no_new_req_still_latches(self):
+        now = datetime.datetime(2026, 11, 25, 13, 1,
+                                tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+        day = "20261125"
+        base = {"day": day, "enabled": True, "mode": "bull", "level": 1,
+                "allow_new": True, "allow_add": True, "target_multiplier": 1.0,
+                "left_weight": 1.0, "right_weight": 1.0, "reason": "bull_mirror",
+                "asof_ts": now.timestamp(), "latch_until_ts": 0}
+        req = {"request_id": "%s-no_new-pm1300_both" % day, "day": day,
+               "kind": "no_new", "until": "14:00", "reason": "pm1300_both"}
+        merged = self.mod.merge_side_policy(base, base, req, now)
+        self.assertEqual((merged.get("latch") or {}).get("kind"), "no_new")
+        self.assertFalse(merged["allow_new"])

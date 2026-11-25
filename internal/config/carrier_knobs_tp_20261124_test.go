@@ -78,9 +78,10 @@ func TestTPKnobsOwnersRulings(t *testing.T) {
 	if got := cfg.CarrierTPDragonOpenNoResealSec(); got != 900.0 {
 		t.Fatalf("dragon open-board window must be 900s, got %v", got)
 	}
-	// 没有战法止盈点的票：峰值站上成本即可启动阶梯（0＝不额外要求浮盈）。
-	if got := cfg.CarrierTPPeakArmPct(); got != 0.0 {
-		t.Fatalf("peak arm threshold is a P&L point floor; expected 0 (peak on cost), got %v", got)
+	// D3 2026-11-25（owner 裁决 ①）：没有战法止盈点的票也不是"站上成本就卖"，
+	// 要先有 3 个百分点的浮盈才武装峰值回撤腿——止盈不是止损，水下交给 reduce/breakdown。
+	if got := cfg.CarrierTPPeakArmPct(); got != 3.0 {
+		t.Fatalf("peak arm threshold must be 3 P&L points (owner ruling 2026-11-25), got %v", got)
 	}
 	// 三条 owner 裁决的开关缺省必须开着——它们是替 owner 定的默认行为，不是灰度。
 	if !cfg.CarrierTPLadderEnabled() || !cfg.CarrierTPBreakdownTrimOnProfit() || !cfg.CarrierTPRebuyBlock() {

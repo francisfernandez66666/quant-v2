@@ -1117,8 +1117,9 @@ func (r *tLiveRound) strategicAllowedQty(rnd *TRoundLive, price float64, qty int
 	sig := combat_agent.Signal{Code: rnd.Code, Name: rnd.Name, Direction: "做多", Action: "buy", Price: price}
 	allowed, _ := r.e.dynamicBuyQty(sig, price, 0, sc, r.ctrl,
 		dynBudgetCtx{MarketScale: r.p.MarketScale, StockScale: 1.0,
-			TargetMultiplier: 1.0,
-			MissingKeyInput:  r.p.MissingKeyInput, MissingKeyDims: r.p.MissingKeyDims})
+			// D7：T 腿既不消费 TargetMultiplier 也不消费分时 ramp，两者都显式钉 1.0。
+			TargetMultiplier: 1.0, TimeRamp: 1.0,
+			MissingKeyInput: r.p.MissingKeyInput, MissingKeyDims: r.p.MissingKeyDims})
 	if allowed > qty {
 		allowed = qty
 	}

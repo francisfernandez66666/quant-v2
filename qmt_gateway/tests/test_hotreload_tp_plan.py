@@ -20,6 +20,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -46,27 +47,30 @@ CLOSED = "000009"
 def _live_db(path):
     """One live.db with just the three tables bake_tp_plan reads."""
     conn = sqlite3.connect(path)
+    # D2（2026-11-25）起 bake_tp_plan 还要读 price 当止盈 pnl 的分母，夹具必须同形，
+    # 否则整条 SELECT 抛 "no such column" 被 fail-closed 吞成空计划（假红）。
     conn.execute("CREATE TABLE fills (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT,"
-                 " code TEXT, side TEXT, qty INTEGER, traded_at TEXT, signal_id TEXT)")
+                 " code TEXT, side TEXT, qty INTEGER, traded_at TEXT, signal_id TEXT,"
+                 " price REAL)")
     conn.execute("CREATE TABLE real_positions (user_id TEXT, ts_code TEXT, qty INTEGER,"
                  " highest_price REAL)")
     conn.execute("CREATE TABLE daily (ts_code TEXT, trade_date TEXT, high REAL)")
     rows = [
         # 龙头：11-20 建仓，今天卖掉一半（TP）⇒ Stage 1。
-        ("buy:%s:dragon:%s" % (DRAGON, OPEN_DASH), DRAGON, "买入", 1000, OPEN_DASH + " 09:35:00"),
-        ("sell:%s:tp:%s" % (DRAGON, TODAY_DASH), DRAGON, "卖出", 500, TODAY_DASH + " 10:12:00"),
+        ("buy:%s:dragon:%s" % (DRAGON, OPEN_DASH), DRAGON, "买入", 1000, OPEN_DASH + " 09:35:00", 12.0),
+        ("sell:%s:tp:%s" % (DRAGON, TODAY_DASH), DRAGON, "卖出", 500, TODAY_DASH + " 10:12:00", 13.0),
         # 双凸：今天新建仓，还没卖过。
         ("buy:%s:double_bump:%s" % (DOUBLE_BUMP, TODAY_DASH), DOUBLE_BUMP, "买入", 600,
-         TODAY_DASH + " 09:41:00"),
+         TODAY_DASH + " 09:41:00", 21.0),
         # 因子综合（没有战法止盈点）。
-        ("buy:%s:fac_160:%s" % (FAC, OPEN_DASH), FAC, "买入", 1100, OPEN_DASH + " 10:02:00"),
+        ("buy:%s:fac_160:%s" % (FAC, OPEN_DASH), FAC, "买入", 1100, OPEN_DASH + " 10:02:00", 9.0),
         # 已清仓：买入 + 全部卖出，不得出现在计划里。
-        ("buy:%s:fac_160:%s" % (CLOSED, OPEN_DASH), CLOSED, "买入", 800, OPEN_DASH + " 09:50:00"),
-        ("sell:%s:tt:%s" % (CLOSED, TODAY_DASH), CLOSED, "卖出", 800, TODAY_DASH + " 09:31:00"),
+        ("buy:%s:fac_160:%s" % (CLOSED, OPEN_DASH), CLOSED, "买入", 800, OPEN_DASH + " 09:50:00", 8.0),
+        ("sell:%s:tt:%s" % (CLOSED, TODAY_DASH), CLOSED, "卖出", 800, TODAY_DASH + " 09:31:00", 8.5),
     ]
-    for signal_id, code, side, qty, at in rows:
-        conn.execute("INSERT INTO fills (user_id, code, side, qty, traded_at, signal_id)"
-                     " VALUES (?,?,?,?,?,?)", ("u_owner", code, side, qty, at, signal_id))
+    for signal_id, code, side, qty, at, price in rows:
+        conn.execute("INSERT INTO fills (user_id, code, side, qty, traded_at, signal_id, price)"
+                     " VALUES (?,?,?,?,?,?,?)", ("u_owner", code, side, qty, at, signal_id, price))
     for code, qty, high in ((DRAGON, 500, 12.5), (DOUBLE_BUMP, 600, 21.0),
                             (FAC, 1100, 9.2), (MANUAL, 2100, 8.8)):
         conn.execute("INSERT INTO real_positions VALUES (?,?,?,?)", ("u_owner", code, qty, high))
@@ -84,6 +88,7 @@ class TestBakeTPPlan(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         os.makedirs(os.path.join(self.dir, "qmt_gateway"))
         self.params_path = os.path.join(self.dir, "qmt_gateway",
                                         "local_executor_params.json")

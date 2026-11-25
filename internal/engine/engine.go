@@ -1931,6 +1931,8 @@ type dynBudgetCtx struct {
 	FlowBlend float64
 	// TargetMultiplier 侧策略战略目标乘子；0=未注入=1.0，T 调用恒传 1.0。
 	TargetMultiplier float64
+	// TimeRamp D7 分时释放因子；0=未注入=1.0，T 调用恒传 1.0（结构上不缩 T 额度）。
+	TimeRamp float64
 	// QuadrantDecision/Reason §FLOW-QUADRANT 四象限决策（由 Decision 带出，传给风控最后一道闸）。
 	// "block_buy"=禁抄底/禁加仓→拒单；空=不拦。
 	QuadrantDecision string
@@ -1950,6 +1952,14 @@ func (c dynBudgetCtx) targetMultiplier() float64 {
 		return 1.0
 	}
 	return c.TargetMultiplier
+}
+
+// timeRamp D7 分时释放因子；0/NaN/Inf 一律 1.0（未注入 = 今天的行为）。
+func (c dynBudgetCtx) timeRamp() float64 {
+	if c.TimeRamp <= 0 || math.IsNaN(c.TimeRamp) || math.IsInf(c.TimeRamp, 0) {
+		return 1.0
+	}
+	return c.TimeRamp
 }
 
 // shadowTargetRatio 影子期的目标仓位读数基准（固定 50%）。
@@ -2273,8 +2283,8 @@ func (e *Engine) dynamicBuyQty(sig combat_agent.Signal, price, buyScale float64,
 	// （执法 fail-closed 不买、卡片必须有读数），见 §W-06「另外两处差异」。
 	// 注意：marketScale 未做 min(ceiling) —— 这一步在函数里做（math.Min 只允许一处）。
 	out.PendingNote = pendingBuysNote(pend)
-	targetVal, curStrat, room, _ := fundsTargetCurRoomWithMultiplier(
-		total, marketScale, ceiling, ctx.targetMultiplier(), posByCode, posPrices, pend, book)
+	targetVal, curStrat, room, _ := fundsTargetCurRoomWithScales(
+		total, marketScale, ceiling, ctx.targetMultiplier(), ctx.timeRamp(), posByCode, posPrices, pend, book)
 	// §P0-5（2026-10-30）：扣掉"已定量、还没落库"的同轮预占。
 	// 不加这一句，同一轮的多笔信号会各自按同一份余额定量，合计穿透目标仓位
 	// （当天实测：三笔 52,497 对剩余 40,915，最终超目标 11,616）。

@@ -80,8 +80,13 @@ const (
 	// 也必须有个家；与 -3% 减仓的 reduce_position_fraction 刻意分开——两个 0.5 是两条腿，
 	// 调其中一条不该顺手改掉另一条。
 	carrierTPHalfFraction = 0.5
-	// 无战法止盈点的票启动阶梯所需的最低**峰值浮盈**（百分点）。0＝只要峰值站上成本即可。
-	carrierTPPeakArmPct = 0.0
+	// 无战法止盈点的票启动阶梯所需的最低**峰值浮盈**（百分点）。
+	// 0＝只要峰值站上成本即可；D1 生效前的 0 会让峰值只涨 1.5% 的票武装（11-25 现场：
+	// 000415/000680/000735 峰值 +1.49/+1.47/+2.88 个点，在浮亏 2.6~3.8 个点时被卖半）。
+	// 3.0 与最低档 half_retr（10cm 的 3%）对齐：D1 生效后它在三种板宽上都不 binding，
+	// 但写 3 能让"回撤 3% 卖一半"这条口径在参数文件里看得见，且将来若 D1 判据被放宽，
+	// 它还会是一条独立的锁（写 0 就不会）。
+	carrierTPPeakArmPct = 3.0
 	// 10cm 主板：峰值回落 3% 卖一半、5% 清剩余（owner 裁决 2）。
 	carrierTPTrailHalfRetrPct  = 3.0
 	carrierTPTrailClearRetrPct = 5.0
@@ -202,6 +207,23 @@ const (
 	carrierSideBucketMinutes         = 30
 	carrierSidePolicyTTLSec          = 2700.0
 	carrierSideFreshnessHeartbeatSec = 1200.0
+	// D6-a 2026-11-25：极强右侧回买。margin 是**分数点**（阈值 + 15 分），不是百分比。
+	// owner 2026-11-25 裁决「极强选 A，默认开」⇒ On = true（显式写 false 才是退路）。
+	// 它只解 tp_rebuy_block 这一条：same_symbol_day 与 bear L1 的 side_policy_no_new
+	// 都排在它外面/后面，穿透不出去（§239 有负锁）。
+	carrierSideRightRebuyOn     = true
+	carrierSideRightRebuyMargin = 15.0
+	// D7 2026-11-25：动态目标的分时释放阶梯。owner 2026-11-25 裁决「默认开」⇒ On = true。
+	// 数值全是「MS 派生目标的百分比」，单位是倍率（0.70 = 70%），不是百分数。
+	// full_at 之后一律 1.0；pm_check_at 之前走 AM 档；两者之间 latch 活跃则保持 AM 档。
+	carrierSideRampOn     = true
+	carrierSideRampBullAM = 0.70
+	carrierSideRampBullPM = 1.00
+	// 2026-11-25 owner 修正：开盘默认熊市只放 30% 动态仓位（原 0.35）。
+	carrierSideRampBearAM    = 0.30
+	carrierSideRampBearPM    = 0.50
+	carrierSideRampPMCheckAt = "13:00"
+	carrierSideRampFullAt    = "14:00"
 )
 
 // CarrierSidePolicyEnabledDefault 返回侧策略总闸的出厂值；账号 runtime 显式值优先。
@@ -278,3 +300,58 @@ func CarrierSidePolicyTTLSec() float64 { return carrierSidePolicyTTLSec }
 
 // CarrierSideFreshnessHeartbeatSec 返回进攻态新鲜度心跳（秒）。
 func CarrierSideFreshnessHeartbeatSec() float64 { return carrierSideFreshnessHeartbeatSec }
+
+// CarrierSideRightRebuyEnabled 返回 D6-a 极强右侧回买总闸（缺省开，显式 false 才是退路）。
+// English: master switch for the strong-right-entry rebuy escape hatch (D6-a).
+func CarrierSideRightRebuyEnabled() bool { return carrierSideRightRebuyOn }
+
+// CarrierSideRightRebuyMargin 返回 D6-a 的"极强"分差（**分数点**，不是百分比）。
+// English: score margin above the rule threshold that counts as "extremely strong".
+func CarrierSideRightRebuyMargin() float64 { return carrierSideRightRebuyMargin }
+
+// CarrierSideRampEnabled 返回 D7 分时释放总闸（缺省开，显式 false 才是退路）。
+// English: master switch for the time-of-day release ramp (D7).
+func CarrierSideRampEnabled() bool { return carrierSideRampOn }
+
+// CarrierSideRampBullAM 返回牛市上午档（MS 派生目标的百分比，倍率）。
+// English: bull morning ramp factor (fraction of the MS-derived target).
+func CarrierSideRampBullAM() float64 { return carrierSideRampBullAM }
+
+// CarrierSideRampBullPM 返回牛市 13:00 无坏信号后的档位。
+// English: bull post-13:00 factor when no bad signal is latched.
+func CarrierSideRampBullPM() float64 { return carrierSideRampBullPM }
+
+// CarrierSideRampBearAM 返回熊市上午档。
+// English: bear morning ramp factor.
+func CarrierSideRampBearAM() float64 { return carrierSideRampBearAM }
+
+// CarrierSideRampBearPM 返回熊市 13:00 无坏信号后的档位（上午档 + 15 个点）。
+// English: bear post-13:00 factor when no bad signal is latched.
+func CarrierSideRampBearPM() float64 { return carrierSideRampBearPM }
+
+// CarrierSideRampPMCheckAt 返回午后检查起点（HH:MM）。
+// English: afternoon check start time.
+func CarrierSideRampPMCheckAt() string { return carrierSideRampPMCheckAt }
+
+// CarrierSideRampFullAt 返回无条件满额时刻（HH:MM）。
+// English: time after which the ramp is 1.0 unconditionally.
+func CarrierSideRampFullAt() string { return carrierSideRampFullAt }
+
+// §T-LEG-F3-20261125 上市天数闸的自动切换旋钮（owner 2026-11-25 裁决「先 A 后 B」）。
+//
+// A 档 = 闸显式关（floor 0），B 档 = 闸开（floor = t_min_listed_days）。
+// 切换判据是**数据覆盖**：`list_date` 是静态字段，补一次就永远对，
+// 所以"观察期"在数据侧没有意义（方案 §10 F3）。覆盖读不到 ⇒ 留在 A 档并在
+// 读数里点名（`off(auto cov=na)`）——看不见不等于放行。
+const (
+	carrierTListedDaysAuto           = true
+	carrierTListedDaysCoverageMinPct = 95.0
+)
+
+// CarrierTListedDaysAuto 返回上市天数闸是否按数据覆盖自动切换（缺省开）。
+// English: whether the listed-days gate is switched by data coverage.
+func CarrierTListedDaysAuto() bool { return carrierTListedDaysAuto }
+
+// CarrierTListedDaysCoverageMinPct 返回切到 B 档所需的最小 list_date 覆盖率（%）。
+// English: minimum list_date coverage (percent) required to enable the gate.
+func CarrierTListedDaysCoverageMinPct() float64 { return carrierTListedDaysCoverageMinPct }

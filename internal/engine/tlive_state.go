@@ -162,6 +162,10 @@ type tLiveFunds struct {
 	Room        float64 `json:"room"`         // 战略剩余空间
 	MarketScale float64 `json:"market_scale"` // 本轮市场缩放（0=尚未定权）
 	MissingKey  bool    `json:"missing_key_input"`
+	// TargetRamp / TargetRampSrc D7（2026-11-25）动态目标的分时释放因子与档位名。
+	// 前端在目标仓位旁渲染一行小字；关闭时 TargetRampSrc="ramp_off" 且不渲染。
+	TargetRamp    float64 `json:"target_ramp,omitempty"`
+	TargetRampSrc string  `json:"target_ramp_src,omitempty"`
 	// MissingKeyDims §INDEX-BLIND（2026-11-02）：缺的到底是哪几维（机读码 market_state /
 	// emotion_phase / index_change）。只有 MissingKey 的那一天，值班的人面对的是
 	// "封顶半仓 + 不做 T"这句结论，却要自己判断该去查状态机、情绪还是指数——

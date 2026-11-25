@@ -40,12 +40,32 @@ CARRIER_DIR = os.environ.get("CARRIER_DIR", "/opt/quant/friend-pkg/carrier")
 STATE = os.environ.get("HOTRELOAD_STATE", "/var/lib/quant-trading-v2/carrier_hotreload_gz.sha")
 BASE_URL = os.environ.get("BASE_URL", "https://quant-trading.top")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
-SIDE_POLICY_LATEST = os.path.join(DATA_DIR, "side_policy_latest.json")
-SIDE_POLICY_REQ = os.path.join(DATA_DIR, "side_policy_urgent.req")
-SIDE_POLICY_PENDING = os.path.join(DATA_DIR, "side_policy_urgent.pending.json")
-SIDE_POLICY_ACK = os.path.join(DATA_DIR, "side_policy_urgent.ack")
 CARRIER_ACK_HISTORY = os.path.join(DATA_DIR, "carrier_ack_history.jsonl")
 HOTRELOAD_LOCK = os.path.join(DATA_DIR, "carrier_hotreload.lock")
+
+# §SIDE-POLICY-PATH 2026-11-25（D6-c）：引擎自 §W-03 起按账号落盘
+# （registry.go:1028 acctDir = DataDir/accounts/<uid>），而这条链一直读根目录
+# ⇒ 侧策略快照永远读不到 ⇒ 每日烘出 {'enabled': True} 的无 day 空态 ⇒ 载体整天
+# fail-closed（11-25 现场：928~946 skips/round、slope=na gap=na）。与上面 SIGNALS_TODAY
+# 同族缺陷、同一种修法：账号目录优先，根目录兜底（跨版本过渡期根目录可能还有旧文件）。
+#
+# 注意：这四条**必须是模块常量**（import 期求值）而不是函数调用点现场算——
+# qmt_gateway/tests/test_hotreload_side_policy.py 会在运行期改写它们；
+# 而 carrier_hot_reload_gz.py 每次运行都是新进程（systemd oneshot / timer），
+# 所以 import 期求值就是"每次运行重新判一次"，不会冻结。
+_SIDE_ACCT_DIR = os.path.join(DATA_DIR, "accounts", OWNER_UID)
+
+
+def _side_state_path(name):
+    """账号目录优先、根目录兜底（返回绝对路径）。"""
+    acct = os.path.join(_SIDE_ACCT_DIR, name)
+    return acct if os.path.exists(acct) else os.path.join(DATA_DIR, name)
+
+
+SIDE_POLICY_LATEST = _side_state_path("side_policy_latest.json")
+SIDE_POLICY_REQ = _side_state_path("side_policy_urgent.req")
+SIDE_POLICY_PENDING = _side_state_path("side_policy_urgent.pending.json")
+SIDE_POLICY_ACK = _side_state_path("side_policy_urgent.ack")
 
 AUTH = os.path.join(DATA_DIR, "auth.json")
 APPLIED = os.path.join(DATA_DIR, "applied_factors.json")
@@ -555,6 +575,14 @@ TP_PCT_KNOB_BY_STRATEGY = {
     "dragon_return": "tp_dragon_return_take_profit_pct",
 }
 
+# D2 2026-11-25：一笔买入只有在「它自己占买入后净头寸的 >= 这个百分比」时，才把
+# 阶梯重置为这笔买入。用途是把六周前 100 股零头造成的假 open_date 打断（现场：
+# 000521 open_date 2026-10-12、峰值取到 5.21，而当天真实的段是 11-24 起 4.33）；
+# 正常的加仓（500 加到 1500 = 33%）不重置，所以阶梯不会被每次加仓清零。
+# 与 pregen_sector_map_gz.py 的 MIN_BOARD_OK_PCT 同族：这是烘焙器的结构常量，
+# 不是规则层阈值，不进 carrier_knobs.go。
+TP_REBASE_SHARE_PCT = 50.0
+
 
 def _ts_code_of(code):
     """6 位代码 → `daily.ts_code` 的写法（000001.SZ / 600519.SH / 830799.BJ）。"""
@@ -634,13 +662,14 @@ def bake_tp_plan(qc=None):
         conn = sqlite3.connect("file:%s?mode=ro" % LIVE_DB, uri=True, timeout=5)
         try:
             cur = conn.execute(
-                "SELECT code, side, qty, traded_at, signal_id FROM fills "
+                "SELECT code, side, qty, traded_at, signal_id, price FROM fills "
                 "WHERE user_id=? ORDER BY traded_at, id", (OWNER_UID,))
-            for code, side, qty, traded_at, signal_id in cur:
+            for code, side, qty, traded_at, signal_id, price in cur:
                 c = norm(code)
                 if len(c) != 6 or not c.isdigit():
                     continue
-                st = legs.setdefault(c, {"net": 0, "open": None, "strategy": "", "stage": 0})
+                st = legs.setdefault(c, {"net": 0, "open": None, "strategy": "",
+                                         "stage": 0, "open_price": None})
                 try:
                     q = int(qty or 0)
                 except (TypeError, ValueError):
@@ -648,11 +677,23 @@ def bake_tp_plan(qc=None):
                 if q <= 0:
                     continue
                 if str(side) == "买入":
-                    if st["net"] <= 0:
+                    net_after = st["net"] + q
+                    # D2 2026-11-25：段重置两条判据——
+                    #   ① 净头寸从 0 起来（清仓后重建，原行为）；
+                    #   ② 这笔买入本身就是当前头寸的主体（零头被打断）。
+                    # `stage == 0` 是硬约束：Stage 1 之后的大额加仓**不许**把阶梯
+                    # 打回 Stage 0，否则同一只票当天会被再卖一次半仓。
+                    if st["stage"] == 0 and (st["net"] <= 0 or
+                                             q * 100.0 >= net_after * TP_REBASE_SHARE_PCT):
                         st["open"] = str(traded_at or "")[:10] or None
                         st["strategy"] = _strategy_of_signal(signal_id)
                         st["stage"] = 0
-                    st["net"] += q
+                        # 分母只在该段第一笔（或主体那笔）上写；同段后续加仓不覆盖。
+                        try:
+                            st["open_price"] = float(price) if price else None
+                        except (TypeError, ValueError):
+                            st["open_price"] = None
+                    st["net"] = net_after
                 else:
                     st["net"] -= q
                     if st["net"] <= 0:
@@ -661,6 +702,7 @@ def bake_tp_plan(qc=None):
                         st["open"] = None
                         st["strategy"] = ""
                         st["stage"] = 0
+                        st["open_price"] = None
                     elif _leg_of_signal(signal_id) == "tp":
                         st["stage"] = 1
         finally:
@@ -699,7 +741,7 @@ def bake_tp_plan(qc=None):
             manual += 1
             out[code] = {"strategy": strategy, "open_date": open_day or "",
                          "stage": 0, "peak": round(highest, 4) if highest > 0 else None,
-                         "tp_pct": None, "manual": True}
+                         "tp_pct": None, "manual": True, "open_price": None}
             continue
         tp_pct = _tp_explicit_pct(qc, strategy) if strategy else None
         if tp_pct is None and strategy in TP_PCT_KNOB_BY_STRATEGY:
@@ -729,7 +771,10 @@ def bake_tp_plan(qc=None):
         out[code] = {"strategy": strategy, "open_date": open_day,
                      "stage": int(st.get("stage") or 0),
                      "peak": round(peak, 4) if peak else None,
-                     "tp_pct": tp_pct, "manual": False}
+                     "tp_pct": tp_pct, "manual": False,
+                     # D2：段起点价（止盈 pnl 的分母）。缺则载体回落 position_cost。
+                     "open_price": (round(float(st.get("open_price")), 4)
+                                    if st.get("open_price") else None)}
     print("HOTRELOAD_TP_PLAN n=%d manual=%d unknown_tp=%d day=%s" % (
         len(out), manual, unknown, today))
     return {today: out} if out else {}
@@ -738,11 +783,13 @@ def bake_tp_plan(qc=None):
 def tp_plan_digest(tp_plan):
     """Comparable fingerprint of the baked ladder plan (peak deliberately excluded).
 
-    Only the static triple per name goes into the digest: strategy (which picks
-    the take-profit point), open_date (which bounds the peak window) and stage
-    (half already sold). Peak moves every single day, so folding it in would
-    re-bake and therefore **restart the box client** on every timer tick; the
-    peak still travels in the payload, it just does not decide "changed".
+    The static tuple per name goes into the digest: strategy (which picks the
+    take-profit point), open_date (which bounds the peak window), stage (half
+    already sold) and open_price (D2 2026-11-25: the denominator of the
+    take-profit P&L, which only moves when the accumulation segment is
+    rebuilt). Peak moves every single day, so folding it in would re-bake and
+    therefore **restart the box client** on every timer tick; the peak still
+    travels in the payload, it just does not decide "changed".
 
     Empty/absent plan -> "" so "never baked" and "baked empty" stay
     distinguishable from "baked and unchanged" in the log.
@@ -755,7 +802,8 @@ def tp_plan_digest(tp_plan):
             continue
         body[str(day)] = {
             str(code): {k: (row or {}).get(k)
-                        for k in ("strategy", "open_date", "stage", "manual", "tp_pct")}
+                        for k in ("strategy", "open_date", "stage", "manual", "tp_pct",
+                                  "open_price")}
             for code, row in per.items()
         }
     if not body:
@@ -1245,8 +1293,32 @@ def _latch_active(snapshot, now):
 
 
 def merge_side_policy(current, latest, request, now):
-    """Regular state plus sticky 13:00 latch; urgent request always wins until 14:00."""
-    base = dict(latest if isinstance(latest, dict) and latest else (current if isinstance(current, dict) else {}))
+    """Regular state plus sticky 13:00 latch; urgent request always wins until 14:00.
+
+    §SIDE-POLICY-PATH (D6-c 2026-11-25): `latest` missing / stale means "we could
+    not read today's state", NOT "the policy is empty". The direction must be
+    fail-closed (no `new`, no `add`) and the reason must say so -- otherwise the
+    read-out `{'enabled': True}` looks exactly like a real bear snapshot.
+
+    The fallback MUST be a COMPLETE state that passes rules_sizing.side_policy_state
+    field by field. A half snapshot (just day/allow_new/allow_add) hits bad_enum /
+    bad_value and falls into _side_fail_closed(), whose allow_add is True (L1
+    semantics) -- so "cannot read the state" would flip back to "may add", and the
+    reason would be replaced by bad_value. Both directions wrong at once.
+    """
+    if not isinstance(latest, dict) or latest.get("day") != now.strftime("%Y%m%d"):
+        base = {
+            "enabled": True,
+            "day": now.strftime("%Y%m%d"),
+            "mode": "bear", "level": 1,
+            "allow_new": False, "allow_add": False,
+            "target_multiplier": 1.0, "left_weight": 1.0, "right_weight": 1.0,
+            "asof_ts": now.timestamp(), "latch_until_ts": 0.0,
+            "reason": "side_policy_state_missing",
+        }
+        print("HOTRELOAD_SIDE_POLICY_MISSING path=%s day=%s" % (SIDE_POLICY_LATEST, base["day"]))
+    else:
+        base = dict(latest)
     applied_request = False
     if isinstance(request, dict) and request.get("day") == now.strftime("%Y%m%d") and request.get("kind") == "no_new":
         until = request.get("until") or "14:00"

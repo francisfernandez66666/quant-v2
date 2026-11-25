@@ -32,14 +32,37 @@ import (
 	"quant-trading-v2/internal/signalctl"
 )
 
+// sidePolicyStateDir 侧策略快照的**账号**目录。
+//
+// 引擎自 §W-03 起按账号落盘（registry.go:1028 acctDir = DataDir/accounts/<uid>），
+// 而读面以前直接吃 s.researchDir（数据根目录）⇒ 恒 unknown，与"策略没启用"在页面上同形
+// （D6-c 2026-11-25）。这里返回账号目录；根目录那份由调用方当兜底再试一次。
+func (s *Server) sidePolicyStateDir() string {
+	if s.researchDir == "" {
+		return ""
+	}
+	uid := ""
+	if s.cfg != nil {
+		uid = s.cfg.OperatorID()
+	}
+	if uid == "" {
+		return s.researchDir
+	}
+	return filepath.Join(s.researchDir, "accounts", uid)
+}
+
 // readSidePolicyStatus 只读侧策略快照，并在读面统一应用新鲜度闸。
 // known 只表示"当日快照可解析"；disabled/stale/known 三态由 enabled/stale/status 明确区分。
-func readSidePolicyStatus(dir, day string, now time.Time) map[string]interface{} {
+// fallbackDir 非空时在 dir 读不到的情况下再试一次（跨版本过渡期根目录可能还有旧文件）。
+func readSidePolicyStatus(dir, fallbackDir, day string, now time.Time) map[string]interface{} {
 	out := map[string]interface{}{"known": false, "enabled": false, "stale": false, "status": "unknown"}
 	if dir == "" {
 		return out
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "side_policy_latest.json"))
+	if err != nil && fallbackDir != "" && fallbackDir != dir {
+		raw, err = os.ReadFile(filepath.Join(fallbackDir, "side_policy_latest.json"))
+	}
 	if err != nil {
 		return out
 	}
@@ -121,7 +144,7 @@ func (s *Server) flowStatusReadout(now time.Time) map[string]interface{} {
 		"available":   s.researchDB != nil,
 		"day":         day,
 		"known":       false,
-		"side_policy": readSidePolicyStatus(s.researchDir, day, now),
+		"side_policy": readSidePolicyStatus(s.sidePolicyStateDir(), s.researchDir, day, now),
 	}
 	if s.researchDB == nil {
 		return out

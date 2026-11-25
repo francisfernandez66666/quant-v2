@@ -3,6 +3,7 @@ package signalctl
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -167,7 +168,9 @@ func TestSidePolicyInvalidInputsAbstainAndPartialConfirmationDoesNotFlip(t *test
 	in.IndexChangePct = config.CarrierSidePMIndexRisePct()
 	in.FlowValid = false
 	st = DecideSidePolicy(in)
-	if st.Mode == SidePolicyBull || !st.AllowNew || !st.AllowAdd {
+	// 2026-11-25 owner：资金流未齐 ⇒ 默认 bear L1（禁新仓），指数单腿绝不能
+	// 把剧本翻成 bull，也不能借"range"名义把动态仓位打满。
+	if st.Mode != SidePolicyBear || st.AllowNew || !st.AllowAdd {
 		t.Fatalf("single index rise must not flip mode or admission: %+v", st)
 	}
 }
@@ -329,5 +332,144 @@ func TestComputeSizingWithBlendCarriesSidePolicy(t *testing.T) {
 	}
 	if res.FlowBlend < config.CarrierSideWeightLo() || res.FlowBlend > config.CarrierSideWeightHi() {
 		t.Fatalf("combined blend must stay capped, got %.3f", res.FlowBlend)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D6-a 2026-11-25：极强右侧回买（owner：「极强的一次买入机会出现，可以重新买入」）
+//
+// 这七枚锁的是一个**只解一条闸**的例外，所以每一条都在问同一个问题：
+// 「它解掉的是 tp_rebuy_block，还是顺手把别的闸也解了？」
+// 允许多解一条，就等于当天把同一只票买两次（止盈过的票原价回买是最常见的亏钱形状）。
+// ---------------------------------------------------------------------------
+
+// sideBullState 造一个 L1（只禁 new、放行 add）的牛市状态：
+// 这样"tp_rebuy_block 被解掉"与"side_policy_no_new 仍在"能同时观察到。
+func sideBullL1State() SidePolicyState {
+	return SidePolicyState{
+		Enabled: true, Mode: SidePolicyBull, Level: 1,
+		AllowNew: true, AllowAdd: true,
+		TargetMultiplier: config.CarrierSideBullTargetL1(),
+		LeftWeight:       1.0, RightWeight: 1.0,
+		Reason: "bull_l1",
+	}
+}
+
+// ⑪ 极强右侧 + new + 当天止盈过 + sameSymbolDay=false ⇒ 放行。
+// 这是 owner 要的那一次「重新买入」，也是这一批唯一放宽的行为。
+func TestStrongRightRebuyReleasesTPBlockForNew(t *testing.T) {
+	st := sideBullL1State()
+	sig := SideSignal{EntryStyle: "right", Score: 85, Threshold: 70}
+	// 门槛 + margin：判据是"高出多少"，不是"绝对值多少"——阈值 90 时 85 分不算极强。
+	ok, why := BuyAdmission(st, "new", 0, sig, true, false, false)
+	if !ok {
+		t.Fatalf("strong right rebuy must be admitted, got why=%s", why)
+	}
+	if !strongRightRebuy(sig) {
+		t.Fatal("strongRightRebuy helper disagrees with BuyAdmission")
+	}
+}
+
+// ⑫ 分数只差一分就不算极强：门槛必须真的被用上，不许写成 >= Threshold。
+func TestStrongRightRebuyNeedsTheMargin(t *testing.T) {
+	sig := SideSignal{EntryStyle: "right", Score: 70 + config.CarrierSideRightRebuyMargin() - 0.5, Threshold: 70}
+	if strongRightRebuy(sig) {
+		t.Fatalf("score %.1f must stay below threshold+margin", sig.Score)
+	}
+	if ok, why := BuyAdmission(sideBullL1State(), "new", 0, sig, true, false, false); ok || why != "tp_rebuy_block" {
+		t.Fatalf("sub-margin score must keep the TP block, got ok=%v why=%s", ok, why)
+	}
+}
+
+// ⑬ 左侧入场再强也不走这条：稳定性是左侧的概念，右侧买点要的是强度。
+// （强左侧已有自己的 add 例外，混用会让"左侧 add"变成"任一侧 new"。）
+func TestStrongRightRebuyRejectsLeftStyle(t *testing.T) {
+	sig := SideSignal{EntryStyle: "left", Score: 99, Threshold: 70}
+	if strongRightRebuy(sig) {
+		t.Fatal("left style must never take the right-side escape hatch")
+	}
+	if ok, why := BuyAdmission(sideBullL1State(), "new", 0, sig, true, false, true); ok || why != "tp_rebuy_block" {
+		t.Fatalf("left style must keep the TP block, got ok=%v why=%s", ok, why)
+	}
+}
+
+// ⑭ 只对 intent == "new"：add 的例外是强左侧那条，右侧不许再开一扇门
+// （否则 L2 会退化成"任一侧、分数够"）。
+func TestStrongRightRebuyOnlyForNewIntent(t *testing.T) {
+	sig := SideSignal{EntryStyle: "right", Score: 99, Threshold: 70}
+	if ok, why := BuyAdmission(sideBullL1State(), "add", 100, sig, true, false, false); ok || why != "tp_rebuy_block" {
+		t.Fatalf("add intent must keep the TP block, got ok=%v why=%s", ok, why)
+	}
+}
+
+// ⑮ same_symbol_day 排在 tpFired 外面：同一天已经买过的票，极强也不用再买一次。
+// 这是"当天不许重复下单"这条硬闸，与止盈无关。
+func TestStrongRightRebuyCannotBypassSameSymbolDay(t *testing.T) {
+	sig := SideSignal{EntryStyle: "right", Score: 99, Threshold: 70}
+	if ok, why := BuyAdmission(sideBullL1State(), "new", 0, sig, true, true, false); ok || why != "same_symbol_day" {
+		t.Fatalf("same_symbol_day must win over the rebuy hatch, got ok=%v why=%s", ok, why)
+	}
+}
+
+// ⑯ 熊市 L1 禁 new 仍然生效：例外只解 tp_rebuy_block，解不掉侧策略自己的准入。
+// 这一枚是 §239 ㊳ 的 Go 侧对应物——bear 当天绝不因为"分数高"就放开新开仓。
+func TestBearL1NeverReleasesNew(t *testing.T) {
+	bear := SidePolicyState{
+		Enabled: true, Mode: SidePolicyBear, Level: 1,
+		AllowNew: false, AllowAdd: true,
+		TargetMultiplier: config.CarrierSideBearTargetL1(),
+		LeftWeight:       config.CarrierSideWeightLo(),
+		RightWeight:      config.CarrierSideWeightLo(),
+		Reason:           "bear_l1",
+	}
+	strongest := SideSignal{EntryStyle: "right", Score: 100, Threshold: 60}
+	// 没止盈过也一样被拦：这条闸与 tpFired 无关。
+	if ok, why := BuyAdmission(bear, "new", 0, strongest, false, false, false); ok || why != "side_policy_no_new" {
+		t.Fatalf("bear L1 must block new, got ok=%v why=%s", ok, why)
+	}
+	// 止盈过时也绝不允许一路放行。注意这里的 why 会是 `side_policy_no_new` 而不是
+	// `tp_rebuy_block`：D6-a 的例外只是**穿过**了止盈那条闸，紧接着就撞上 bear L1 自己
+	// 的准入闸 ⇒ 说明两层是串联的、不是互相顶替的（谁先说"不"都算拦下）。
+	if ok, why := BuyAdmission(bear, "new", 0, strongest, true, false, false); ok ||
+		(why != "tp_rebuy_block" && why != "side_policy_no_new") {
+		t.Fatalf("bear L1 + tpFired must block, got ok=%v why=%s", ok, why)
+	}
+}
+
+// ⑰ 开关与读数缺失都要 fail-closed：关掉 D6-a ⇒ 例外消失；
+// 缺 score / 缺 threshold / threshold<=0 ⇒ 一律不放行（"看不见"不许变成"可以买"）。
+func TestStrongRightRebuyFailsClosed(t *testing.T) {
+	if !config.CarrierSideRightRebuyEnabled() {
+		t.Skip("D6-a is shipped ON (owner 2026-11-25); this test documents the OFF direction")
+	}
+	for name, sig := range map[string]SideSignal{
+		"missing_score":     {EntryStyle: "right", Threshold: 70},
+		"missing_threshold": {EntryStyle: "right", Score: 99},
+		"zero_threshold":    {EntryStyle: "right", Score: 99, Threshold: 0},
+		"empty_style":       {Score: 99, Threshold: 70},
+	} {
+		if strongRightRebuy(sig) {
+			t.Fatalf("%s must fail closed", name)
+		}
+	}
+}
+
+// 2026-11-25 owner：开盘资金流/斜率没齐一轮时，不许落 range 放满动态仓位。
+// 默认 bear L1（禁新仓）+ bear AM ramp 0.30 ⇒ 上午只有 30% 动态仓位。
+func TestColdStartDefaultsToBear(t *testing.T) {
+	now := time.Date(2026, 11, 25, 9, 35, 0, 0, time.FixedZone("CST", 8*3600))
+	cases := []SidePolicyInput{
+		// 指数缺口有读数，但资金流腿未回（fflow 熔断时的现场形状）。
+		{Enabled: true, Now: now, AsOf: now, IndexValid: true, GapPct: -0.46},
+		// 资金流刚回但斜率还没凑够两桶。
+		{Enabled: true, Now: now, AsOf: now, FlowValid: true, MarketDelta: 0.3,
+			SlopeDelta: math.NaN(), IndexValid: true},
+	}
+	for i, in := range cases {
+		st := DecideSidePolicy(in)
+		if st.Mode != SidePolicyBear || st.Level != 1 || st.AllowNew || st.Reason != "side_policy_cold_start_bear" {
+			t.Fatalf("case %d: cold start got mode=%s level=%d new=%v reason=%s",
+				i, st.Mode, st.Level, st.AllowNew, st.Reason)
+		}
 	}
 }

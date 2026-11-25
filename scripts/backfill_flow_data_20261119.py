@@ -8,7 +8,7 @@
 #   2. 东财 fflow daykline（本机实测可达，klt=101）：大盘逐日主力净额（元）→ 配 baostock 当日
 #      成交额 → market_flow_pct / flow_market_delta。
 #   3. 量比历史：baostock amount 降序序列 → r_yest/r_ma5（阈值与 signalctl 同口径：放量
-#      r_yest>1.2 且 r_ma5>1.0；缩量 r_yest<1.0 且 r_ma5<0.9；平量 0）→ vol_surge_delta。
+#      r_yest>1.2 且 r_ma5>1.0；缩量 r_yest<1.0 且 r_ma5<0.95（2026-11-25 修正）；平量 0）→ vol_surge_delta。
 #
 # 用法：
 #   本机生成： python3 scripts/backfill_flow_data_20261119.py generate --out /tmp/flow_backfill.json

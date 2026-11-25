@@ -120,6 +120,13 @@ SIDE_LEVEL_L1 = 1
 SIDE_LEVEL_BEAR_MAX = 2
 SIDE_LEVEL_BULL_MAX = 3
 SIDE_LEVEL_RANGE_MAX = 0
+# D7 clock-cell shape facts (the SHAPE of 'HH:MM', not a tunable threshold):
+# function bodies in this layer may hold zero numeric literals, so these live
+# here exactly like SZ_CENTS above.
+SZ_CLOCK_LEN = 5
+SZ_CLOCK_DIGITS = 2
+SZ_CLOCK_HOUR_MAX = 23
+SZ_CLOCK_MINUTE_MAX = 59
 
 # Machine-readable dimension codes -- the same three strings the Go side puts
 # into JSON, alerts and the frontend tag (internal/signalctl/sizing.go:319-322).
@@ -300,6 +307,23 @@ SIZING_DEFAULTS = {
     "side_weight_hi": 1.20,
     "side_left_score_floor": 80.0,
     "side_left_score_margin": 10.0,
+    # D6-a 2026-11-25: strong-right rebuy (lifts tp_rebuy_block only).
+    # Default MUST be True -- owner ruling "extremely strong: option A, on by
+    # default"; an explicit false is the way back. This default has to match
+    # carrierSideRightRebuyOn verbatim: a Go-only constant would leave _sz_p
+    # returning None here, bool(None)=False, and the two sides would disagree.
+    "side_right_rebuy_enabled": True,
+    "side_right_rebuy_margin": 15.0,
+    # D7 2026-11-25: time-of-day release ramp on the MS-derived target. Every
+    # number is a FRACTION of that target (0.70 = 70%), not a percentage;
+    # after full_at the factor is 1.0 unconditionally.
+    "side_ramp_enabled": True,
+    "side_ramp_bull_am": 0.70,
+    "side_ramp_bull_pm": 1.00,
+    "side_ramp_bear_am": 0.30,
+    "side_ramp_bear_pm": 0.50,
+    "side_ramp_pm_check_at": "13:00",
+    "side_ramp_full_at": "14:00",
 }
 
 SIZING_PARAM_KEYS = sorted(SIZING_DEFAULTS)
@@ -352,6 +376,8 @@ SIZING_CTX_KEYS = [
     "t_regime_gate_enabled", "market_state_age_sec",
     # SIDE-POLICY: runtime snapshot + intent-specific strategic target multiplier
     "day", "now_ts", "side_target_multiplier",
+    # D7: the release factor injected by _sizing_view (strategic target only)
+    "side_time_ramp",
 ]
 
 # Signal kinds registered for the counter-remark idempotency check. This module
@@ -1220,6 +1246,104 @@ def side_target_multiplier(params, ctx, intent):
     return float(st.get("target_multiplier") or SZ_NEUTRAL)
 
 
+# D7 2026-11-25: the time-of-day release table read through literal keys (the
+# build gate's knob ledger greps for the literal reads, so a loop over a tuple
+# would make all six keys look undeclared and unread).
+
+
+def _ramp_clock_ok(s):
+    """HH:MM only. String comparison is enough for ordering (zero padded), so no
+    datetime import is needed inside the sandbox."""
+    if not isinstance(s, str) or len(s) != SZ_CLOCK_LEN:
+        return False
+    hh, sep, mm = s.partition(":")
+    if sep != ":" or len(hh) != SZ_CLOCK_DIGITS or len(mm) != SZ_CLOCK_DIGITS:
+        return False
+    if not (hh.isdigit() and mm.isdigit()):
+        return False
+    return int(hh) <= SZ_CLOCK_HOUR_MAX and int(mm) <= SZ_CLOCK_MINUTE_MAX
+
+
+def _ramp_table(params):
+    """The whole table or nothing -- never half of one.
+
+    Every cell is a declared knob (SIZING_DEFAULTS owns the factory values, and a
+    missing key is a build error by contract). One illegal cell drops the whole
+    table back to 1.0, because a half-applied table would release more than the
+    owner signed off while still looking plausible on the readout.
+    """
+    bull_am = _sz_num(_sz_p(params, "side_ramp_bull_am"))
+    bull_pm = _sz_num(_sz_p(params, "side_ramp_bull_pm"))
+    bear_am = _sz_num(_sz_p(params, "side_ramp_bear_am"))
+    bear_pm = _sz_num(_sz_p(params, "side_ramp_bear_pm"))
+    pm_check_at = _sz_p(params, "side_ramp_pm_check_at")
+    full_at = _sz_p(params, "side_ramp_full_at")
+    vals = []
+    for v in (bull_am, bull_pm, bear_am, bear_pm):
+        if v is None or v <= SZ_ABSTAIN or v > SZ_NEUTRAL:
+            return None
+        vals.append(v)
+    if not (_ramp_clock_ok(pm_check_at) and _ramp_clock_ok(full_at)):
+        return None
+    return tuple(vals) + (pm_check_at, full_at)
+
+
+def side_time_ramp(params, st, hhmm, now_ts, intent="new"):
+    """D7 time-of-day release factor (Go: internal/signalctl/side_policy.go SideTimeRamp).
+
+    Returns 0<ramp<=1. mode not in {bull,bear} -> 1.0 (range is where the T leg
+    lives; D7 must never shrink it). T and reduce are neutral for the same reason
+    side_target_multiplier is: they do not consume the strategic target.
+
+    now >= full_at is unconditional 1.0 and does NOT consult the latch: the latch
+    until and full_at are both 14:00 by design, so a bad 13:00 signal can only
+    hold the target down for that one hour.
+    """
+    ramp, _src = _side_ramp_of(params, st, hhmm, intent)
+    return ramp
+
+
+def side_time_ramp_src(params, st, hhmm, now_ts, intent="new"):
+    """Same value plus the cell name, for the cash_probe readout (ramp_src=...).
+
+    Two functions instead of one tuple return keeps side_time_ramp's signature the
+    one the plan and the Go side share.
+    """
+    _ramp, src = _side_ramp_of(params, st, hhmm, intent)
+    return src
+
+
+def _side_ramp_of(params, st, hhmm, intent):
+    if intent in ("t_leg", "reduce"):
+        return SZ_NEUTRAL, "ramp_off"
+    if not bool(_sz_p(params, "side_ramp_enabled")):
+        return SZ_NEUTRAL, "ramp_off"
+    st = st or {}
+    if not st.get("enabled"):
+        return SZ_NEUTRAL, "ramp_off"
+    mode = st.get("mode")
+    if mode not in ("bull", "bear"):
+        return SZ_NEUTRAL, "ramp_off"
+    table = _ramp_table(params)
+    if table is None:
+        return SZ_NEUTRAL, "ramp_off"
+    bull_am, bull_pm, bear_am, bear_pm, pm_check_at, full_at = table
+    clock = hhmm if _ramp_clock_ok(hhmm) else ""
+    if not clock:
+        return SZ_NEUTRAL, "ramp_off"
+    if clock >= full_at:
+        return SZ_NEUTRAL, "ramp_full"
+    bull = mode == "bull"
+    am = bull_am if bull else bear_am
+    pm = bull_pm if bull else bear_pm
+    tag = "ramp_bull_" if bull else "ramp_bear_"
+    if clock < pm_check_at:
+        return am, tag + "am"
+    if st.get("latch_active"):
+        return am, tag + "am"
+    return pm, tag + "pm"
+
+
 def side_style_weight(params, ctx, entry_style):
     st = side_policy_state(params, ctx)
     if not st.get("enabled"):
@@ -1237,6 +1361,30 @@ def combine_side_weight(params, flow_blend, style_weight):
     return max(lo, min(hi, flow_blend * style_weight))
 
 
+def _strong_right_rebuy(params, signal):
+    """D6-a: strong-right rebuy (Go: internal/signalctl/side_policy.go strongRightRebuy).
+
+    Lifts tp_rebuy_block and nothing else. `side_right_rebuy_enabled` defaults to
+    True (owner 2026-11-25); that default must also live in the carrier fallback
+    table (local_executor.py, the same table as tp_*) because _sz_p reads PARAMS
+    merged with it -- a Go-only constant makes bool(None) False on the carrier and
+    the two implementations diverge. An explicit false is the way back.
+
+    Stability is NOT required: stability is a left-side concept (strongLeftScore
+    plus StableLeftSignal), a right-side entry is about strength. Any missing
+    reading abstains (fail-closed).
+    """
+    if not bool(_sz_p(params, "side_right_rebuy_enabled")):
+        return False
+    if (signal or {}).get("entry_style") != "right":
+        return False
+    score = _sz_num((signal or {}).get("score"))
+    threshold = _sz_num((signal or {}).get("threshold"))
+    if score is None or threshold is None or threshold <= SZ_ABSTAIN:
+        return False
+    return score >= threshold + float(_sz_p(params, "side_right_rebuy_margin"))
+
+
 def side_buy_allowed(params, ctx, signal, intent, held_qty, tp_fired, same_symbol_day, stable):
     """Two-level admission plus the strong stable left-side add exception."""
     if intent in ("t_leg", "reduce"):
@@ -1244,7 +1392,13 @@ def side_buy_allowed(params, ctx, signal, intent, held_qty, tp_fired, same_symbo
     if same_symbol_day:
         return False, "same_symbol_day"
     if tp_fired:
-        return False, "tp_rebuy_block"
+        # D6-a 2026-11-25: an extremely strong right-side entry may rebuy a name
+        # that already took profit today. Skip ONLY this rejection -- never
+        # return True: same_symbol_day is above and side_policy_no_new is below,
+        # so the hatch cannot pierce either. Only for intent == "new" (add
+        # already has its own left-side exception).
+        if intent != "new" or not _strong_right_rebuy(params, signal):
+            return False, "tp_rebuy_block"
     st = side_policy_state(params, ctx)
     if not st.get("enabled"):
         return True, ""
@@ -1304,7 +1458,12 @@ def target_position(params, ctx):
     if not ok:
         return None
     target_multiplier = _sz_num(ctx.get("side_target_multiplier")) or SZ_NEUTRAL
-    target = base * min(market * target_multiplier, ceiling)
+    # D7: the ramp multiplies OUTSIDE min(ms*tm, ceiling) -- it decides how much
+    # of today's target is released right now, it never redefines the size.
+    ramp = _sz_num(ctx.get("side_time_ramp"))
+    if ramp is None or ramp <= SZ_ABSTAIN:
+        ramp = SZ_NEUTRAL
+    target = base * min(market * target_multiplier, ceiling) * ramp
     current = held + pending - buy_legs + sell_legs
     if current < SZ_ABSTAIN:
         current = SZ_NEUTRAL * SZ_ABSTAIN
@@ -1331,6 +1490,7 @@ def target_position(params, ctx):
         "stock_scale": stock,
         "ceiling": ceiling,
         "target": target,
+        "time_ramp": ramp,
         "current": current,
         "room": room,
         "per_trade_pct": share,

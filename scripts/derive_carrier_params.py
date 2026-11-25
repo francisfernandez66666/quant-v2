@@ -257,6 +257,9 @@ MAPPING = [
     ("t_min_turnover_pct", ("t_min_turnover_pct",), None),
     ("t_min_turnover_tiers", ("t_min_turnover_tiers",), None),
     ("t_min_listed_days", ("t_min_listed_days",), None),
+    # §T-LEG-F3-20261125：上市天数闸按数据覆盖自动切换（A 关 / B 开）。
+    ("t_listed_days_auto", ("t_listed_days_auto",), None),
+    ("t_listed_days_coverage_min_pct", ("t_listed_days_coverage_min_pct",), None),
     ("t_vwap_check_tol_pct", ("t_vwap_check_tol_pct",), None),
     ("t_commission_rate", ("t_commission_rate",), None),
     ("t_min_commission", ("t_min_commission",), None),
@@ -314,6 +317,17 @@ MAPPING = [
     ("side_bucket_minutes", ("side_bucket_minutes",), None),
     ("side_policy_ttl_sec", ("side_policy_ttl_sec",), None),
     ("side_freshness_heartbeat_sec", ("side_freshness_heartbeat_sec",), None),
+    # D6-a / D7 2026-11-25（owner 当日裁决）：极强右侧回买 + 分时释放阶梯。
+    # 数值全部住在 internal/config/carrier_knobs.go，这里只按名直搬。
+    ("side_right_rebuy_enabled", ("side_right_rebuy_enabled",), None),
+    ("side_right_rebuy_margin", ("side_right_rebuy_margin",), None),
+    ("side_ramp_enabled", ("side_ramp_enabled",), None),
+    ("side_ramp_bull_am", ("side_ramp_bull_am",), None),
+    ("side_ramp_bull_pm", ("side_ramp_bull_pm",), None),
+    ("side_ramp_bear_am", ("side_ramp_bear_am",), None),
+    ("side_ramp_bear_pm", ("side_ramp_bear_pm",), None),
+    ("side_ramp_pm_check_at", ("side_ramp_pm_check_at",), None),
+    ("side_ramp_full_at", ("side_ramp_full_at",), None),
     # §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
     # 真源 internal/config/carrier_knobs.go（两枚战法止盈点是转调：双凸读战法包常量、
     # 龙回头读账号级策略出厂表 ×100 换成百分点）。Python 侧不写这几枚数。

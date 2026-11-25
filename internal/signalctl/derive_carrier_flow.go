@@ -22,7 +22,7 @@ type CarrierFlowKnob struct {
 // 载体侧的键名与 Go 侧语义一一对应：
 //
 //	flow_r_yest_surge / flow_r_ma5_surge   放量双闸（VolStateOf）
-//	flow_r_yest_shrink / flow_r_ma5_shrink 缩量双闸（更严：昨比<1.0 且 五日均比<0.9）
+//	flow_r_yest_shrink / flow_r_ma5_shrink 缩量双闸（昨比<1.0 且 五日均比<0.95；2026-11-25 修正）
 //	flow_posrel_high                       posRel 高档线（相对目标仓位，非绝对 70%）
 //	flow_blend_pct / _lo / _hi             后置金额乘子幅度与硬边界（合成后总幅度）
 //

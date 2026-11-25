@@ -31,6 +31,7 @@ import { canStrictAny } from '../utils/perm.js'
 // 后者只读**自己账号**的 funds 帧（handler 按请求者取账），拿不到别人的钱。
 const FUNDS_READ_PERMS = ['funds_admin', 'quant_trade']
 import BlindTag from './BlindTag.jsx'
+import { sideRampHint } from '../utils/sideRamp.js'
 
 /** 金额：千分位 + 两位小数；非法/缺失显示“—”。 */
 function money(v) {
@@ -50,6 +51,21 @@ function pct(v) {
 function hhmmss(v) {
   const s = String(v || '').replace('T', ' ')
   return s.length >= 19 ? s.slice(11, 19) : s.slice(0, 8)
+}
+
+/**
+ * targetHint 目标仓位那行的 hint：MS 读数 + D7 释放档位（D7 关闭/已满额时不拼）。
+ *
+ * 为什么两段拼在一起而不是各占一行：MS 与 ramp 是**同一个目标的两次乘法**
+ * （target = 总资产 × min(MS×TM, 天花板) × ramp），分开显示会让操作人以为是两件事。
+ * ramp 文案来自 utils/sideRamp.js，本组件不持有档位数字。
+ */
+function targetHint(funds) {
+  const ms = funds && Number(funds.market_scale) > 0
+    ? `MS ${Number(funds.market_scale).toFixed(3)}`
+    : 'MS 未注入'
+  const ramp = sideRampHint(funds)
+  return ramp ? `${ms} · ${ramp}` : ms
 }
 
 /**
@@ -197,7 +213,7 @@ export default function FundsOverviewCard() {
                 <Row label="冻结资金">{money(frozen)}</Row>
                 <Row label="总资产">{money(total)}</Row>
                 <Row label="持仓市值">{money(mv)}</Row>
-                <Row label="目标仓位" hint={funds && Number(funds.market_scale) > 0 ? `MS ${Number(funds.market_scale).toFixed(3)}` : 'MS 未注入'}>
+                <Row label="目标仓位" hint={targetHint(funds)}>
                   {funds ? money(funds.target) : '—'}
                 </Row>
                 <Row label="当前战略仓位" hint="底仓 + 在途买单 − 正T买腿 + 反T卖腿">{funds ? money(funds.cur_strat) : '—'}</Row>

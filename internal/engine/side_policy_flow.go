@@ -45,11 +45,16 @@ type sideFlowState struct {
 	GapAt           time.Time
 	PMChecked       bool
 	UrgentWritten   bool
+	// 2026-11-25：开盘默认 bear，牛熊数据齐后若剧本翻成 bull，走 13:00 同一条
+	// urgent req 机制立刻烘入（不设 no_new latch）。每个交易日最多一次。
+	LastMode        signalctl.SidePolicyMode
+	ReversalWritten bool
 	Latch           signalctl.SidePolicyLatch
 }
 
 func newSideFlowState() sideFlowState {
-	return sideFlowState{CurrentBucket: -1, MorningAnchor: math.NaN(), GapPct: math.NaN()}
+	return sideFlowState{CurrentBucket: -1, MorningAnchor: math.NaN(), GapPct: math.NaN(),
+		LastMode: signalctl.SidePolicyBear}
 }
 
 func (s *sideFlowState) reset(day string) {
@@ -342,15 +347,16 @@ func (e *Engine) writeSidePolicyLatest(st signalctl.SidePolicyState, now time.Ti
 	e.sideLastWrite = now
 }
 
-// writeSideUrgentReq 写入 13:00 加急请求，同日由调用方保证只触发一次。
-func (e *Engine) writeSideUrgentReq(now time.Time, reason string) bool {
+// writeSideUrgentReq 写加急请求。13:00 用 no_new（带 latch）；牛熊反转用
+// reversal（不带 latch，只让热更链按最新快照立刻重烘）。同日每类由调用方去重。
+func (e *Engine) writeSideUrgentReq(now time.Time, reason, kind, until string) bool {
 	if e.sideUrgentReqPath == "" {
 		return false
 	}
 	day := data.TradingDayDate(now.In(cntime.Loc))
 	req := map[string]interface{}{
-		"request_id": fmt.Sprintf("%s-pm1300-%s", day, reason),
-		"day":        day, "kind": "no_new", "until": config.CarrierSidePMBlockUntil(),
+		"request_id": fmt.Sprintf("%s-%s-%s", day, kind, reason),
+		"day":        day, "kind": kind, "until": until,
 		"reason": reason, "created_at": now.In(cntime.Loc).Format(time.RFC3339),
 	}
 	body, err := json.Marshal(req)
@@ -440,6 +446,25 @@ func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 	e.sideMu.Unlock()
 	e.writeSidePolicyLatest(st, now)
 
+	// 2026-11-25 owner：开盘默认 bear 只是"数据未齐"的临时剧本。资金流、斜率与指数
+	// 都齐了且剧本翻成 bull 时，立刻走 13:00 同一条 urgent req 链重烘下发；
+	// 这是**反转**，不粘 no_new latch（req kind=reversal，until 到收盘）。
+	e.sideMu.RLock()
+	lastMode, reversalWritten := e.sideFlow.LastMode, e.sideFlow.ReversalWritten
+	e.sideMu.RUnlock()
+	if enabled && flowValid && indexValid && !math.IsNaN(slope) &&
+		st.Mode == signalctl.SidePolicyBull && lastMode != signalctl.SidePolicyBull &&
+		!reversalWritten {
+		if e.writeSideUrgentReq(now, "reversal_bear_to_bull", "reversal", "15:00") {
+			e.sideMu.Lock()
+			e.sideFlow.ReversalWritten = true
+			e.sideMu.Unlock()
+		}
+	}
+	e.sideMu.Lock()
+	e.sideFlow.LastMode = st.Mode
+	e.sideMu.Unlock()
+
 	// 未启用或当日已处理过 checkpoint 时，不再重复写加急请求。
 	if !enabled || pmChecked || urgentWritten {
 		return
@@ -478,7 +503,7 @@ func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 	e.sideState = st
 	e.sideMu.Unlock()
 	e.writeSidePolicyLatest(st, now)
-	if !e.writeSideUrgentReq(now, reason) {
+	if !e.writeSideUrgentReq(now, reason, "no_new", config.CarrierSidePMBlockUntil()) {
 		return
 	}
 	e.sideMu.Lock()
