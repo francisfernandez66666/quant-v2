@@ -15,6 +15,7 @@
 // missing values render as an explicit abstain, never as 0.0% / "flat".
 import React from 'react'
 import { Card, Tag } from 'tdesign-react'
+import { dynamicUsedPct, formatDynamicUsedProcess } from '../utils/dynamicPosition.js'
 
 // 后端 signalctl 的量态枚举 → 文案与配色。键必须与 Go 侧 VolState* 常量逐字一致。
 // 放量用「涨色」（与 blend 的正向强度同向），缩量用「跌色」，平量走中性灰。
@@ -69,9 +70,10 @@ function Metric({ label, value, tone, hint }) {
 
 /**
  * 资金流 / 量能读数卡。
- * @param {{flow?: object}} props flow = GET /api/status 的 flow 子对象（可能尚未取到）
+ * @param {{flow?: object, funds?: object}} props flow = GET /api/status 的 flow 子对象；
+ *        funds = /api/funds/today 的 live.funds，只用来显示「已占用动态仓位」一项。
  */
-export default function FlowFactorCard({ flow }) {
+export default function FlowFactorCard({ flow, funds }) {
   // 三种"不画数"的形态各自成句，绝不合并成同一句：
   //   ① flow 缺省 = 接口还没返回；② available=false = 服务端读数库没接线；
   //   ③ known=false = 接线了但今天还没烘出任何一行。
@@ -189,9 +191,18 @@ export default function FlowFactorCard({ flow }) {
 
   const side = flow?.side_policy
   const sideMode = side?.mode === 'bear' ? '熊市收紧' : side?.mode === 'bull' ? '牛市镜像' : side?.mode === 'range' ? '中性' : '未启用'
+  const usedPct = dynamicUsedPct(funds)
   return (
     <Card title="市场资金流与量能">
       <div data-testid="flow-factor-card">{body}</div>
+      {/* 2026-11-25 owner：首页也要看到当前时段动态额度用了多少，且把算式摆出来可复核。 */}
+      <div className="muted" style={{ fontSize: 12, marginTop: 8 }} data-testid="flow-dynamic-used">
+        当前已占用动态仓位{' '}
+        <b style={{ color: usedPct !== null && usedPct > 100 ? 'var(--app-danger, #d54941)' : 'inherit' }}>
+          {formatDynamicUsedProcess(funds)}
+        </b>
+        {' '}（当前战略 ÷ 本时段目标，&gt;100% 表示超出动态额度）
+      </div>
       <div className="muted" style={{ fontSize: 12, marginTop: 8 }} data-testid="flow-side-policy">
         {!side?.known ? (
           <>侧策略：未启用或无有效快照</>

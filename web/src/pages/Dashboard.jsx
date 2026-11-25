@@ -18,7 +18,7 @@ import ExternalBrainTag from '../components/ExternalBrainTag.jsx' // §EXT-BRAIN
 import CarrierUpdatePanel from '../components/CarrierUpdatePanel.jsx' // §CARRIER-UPDATE 载体期望版/回执/人工触发
 import CarrierShadowPanel from '../components/CarrierShadowPanel.jsx' // §CARRIER-SHADOW 移植规则与引擎的按日对照（纯读数）
 import FlowFactorCard from '../components/FlowFactorCard.jsx' // §FLOW-QUADRANT 云端净流入 + 量能读数（纯读数）
-import { canLiveTrading } from '../utils/perm.js'
+import { canLiveTrading, canStrictAny, FUNDS_READ_PERMS } from '../utils/perm.js'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
 function ipoCountdown(c) {
@@ -93,6 +93,8 @@ export default function Dashboard() {
   const [signals, setSignals] = useState([])
   // 引擎/扫描整体状态（含 uptime、scan_stats 等）
   const [status, setStatus] = useState({})
+  // 2026-11-25：首页量能卡要显示「已占用动态仓位」；与资金卡同接口、同 10s 节奏。
+  const [fundFrame, setFundFrame] = useState(null)
   // §OBSERVABILITY：管理员可见的 LLM 当日用量 + 前端错误聚合（/api/usage）。
   const [usage, setUsage] = useState(null)
   // 最新资讯与宏观日历事件
@@ -281,6 +283,27 @@ export default function Dashboard() {
     load()
   }
 
+  // 2026-11-25：首页量能卡新增「已占用动态仓位」。读面权限与资金卡严格一致；
+  // 测试里的 api mock 可能没有这个方法，缺方法就静默不画，不让纯展示卡变成报错源。
+  useEffect(() => {
+    if (typeof api.fetchFundsToday !== 'function' || !canStrictAny(FUNDS_READ_PERMS)) return undefined
+    let alive = true
+    const loadFunds = async () => {
+      try {
+        const res = await api.fetchFundsToday()
+        if (alive) { setFundFrame(res); clearLoadFail('funds_today') }
+      } catch (e) {
+        if (alive && !(api.isForbidden && api.isForbidden(e))) {
+          markLoadFail('funds_today', e && e.message ? e.message : '资金帧读取失败')
+        }
+      }
+    }
+    loadFunds()
+    // §0926E2E-17A：Dashboard 不设亚 60s 轮询，与主轮询同频。
+    const fundsTimer = setInterval(loadFunds, 60000)
+    return () => { alive = false; clearInterval(fundsTimer) }
+  }, [])
+
   // 页面挂载：加载数据、启动定时刷新、订阅 SSE、监听可见性变化；卸载时清理
   useEffect(() => {
     load()
@@ -409,7 +432,7 @@ export default function Dashboard() {
           数据来自 GET /api/status 的 flow 键（不新开路由，Dashboard 本就每 60s 拉一次）。
           缺数由组件自己显示「弃权」——这里不兜底、不补 0，避免把未读数画成中性。 */}
       <div style={{ marginBottom: 16 }}>
-        <FlowFactorCard flow={status.flow} />
+        <FlowFactorCard flow={status.flow} funds={fundFrame && fundFrame.live && fundFrame.live.funds} />
       </div>
 
       {/* 核心指标卡：强信号/观察中/静默/监控个股数量一目了然 */}

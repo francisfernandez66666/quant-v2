@@ -33,6 +33,10 @@ export function canStrictAny(perms) {
   return (perms || []).some((p) => canStrict(p))
 }
 
+// FUNDS_READ_PERMS — /api/funds/today 的读判据（§MULTI-ACCT-B 批5，与后端 strictAnyPerms 对齐）。
+// 页面不许自写这两个字面量（§MULTI-ACCT-B Q6 静态锁），单点放这里。
+export const FUNDS_READ_PERMS = ['funds_admin', 'quant_trade']
+
 // LIVE_TRAADING_PERMS — 「能看/能管自己的实盘」的两枚位（单点真源，勿在页面里各抄一份）。
 // trading_admin＝运营级（含勘误/通道切换/人工改判/结算/风险闸），quant_trade＝只有自己的账；
 // 页面级入口用这一档，**运营专属**的读写口仍必须单独判 canStrict('trading_admin')。

@@ -24,14 +24,11 @@
 import React, { useEffect, useState } from 'react'
 import { Button, Card, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
-import { canStrictAny } from '../utils/perm.js'
+import { canStrictAny, FUNDS_READ_PERMS } from '../utils/perm.js'
 
-// FUNDS_READ_PERMS — 今日资金一帧的读判据（§MULTI-ACCT-B 批5，与后端路由严格对齐）：
-// GET /api/funds/today 放行条件是「funds_admin 或 quant_trade」——
-// 后者只读**自己账号**的 funds 帧（handler 按请求者取账），拿不到别人的钱。
-const FUNDS_READ_PERMS = ['funds_admin', 'quant_trade']
 import BlindTag from './BlindTag.jsx'
 import { sideRampHint } from '../utils/sideRamp.js'
+import { dynamicUsedPct, formatDynamicUsedProcess } from '../utils/dynamicPosition.js'
 
 /** 金额：千分位 + 两位小数；非法/缺失显示“—”。 */
 function money(v) {
@@ -215,6 +212,18 @@ export default function FundsOverviewCard() {
                 <Row label="持仓市值">{money(mv)}</Row>
                 <Row label="目标仓位" hint={targetHint(funds)}>
                   {funds ? money(funds.target) : '—'}
+                </Row>
+                {/* 2026-11-25 owner：动态额度用了多少要和目标摆在一起看，并且把算式摆出来。
+                    口径 cur_strat ÷ target（不是占总资产）；>100% 画红，不能夹成 100%。 */}
+                <Row label="已占用动态仓位" hint="当前战略 ÷ 本时段目标，>100% 即超目标">
+                  {(() => {
+                    const used = dynamicUsedPct(funds)
+                    return (
+                      <span style={{ color: used !== null && used > 100 ? 'var(--app-danger, #d54941)' : 'inherit' }}>
+                        {formatDynamicUsedProcess(funds)}
+                      </span>
+                    )
+                  })()}
                 </Row>
                 <Row label="当前战略仓位" hint="底仓 + 在途买单 − 正T买腿 + 反T卖腿">{funds ? money(funds.cur_strat) : '—'}</Row>
                 {/* §P1-3（2026-10-30）：把「战略当前」拆开显示。事故当天卡片只有一个总数，
