@@ -34,6 +34,8 @@ export function formatDynamicUsedPct(funds) {
   return pct === null ? '—' : `${pct.toFixed(1)}%`
 }
 
+const num2 = (v) => v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
 /**
  * formatDynamicUsedProcess 把算式本身也摆出来：当前战略 ÷ 本时段目标 = 百分比。
  * 只给结果会让人怀疑分母选错（占总资产还是占目标）；把两腿都画出来，
@@ -45,6 +47,26 @@ export function formatDynamicUsedProcess(funds) {
   const target = Number(funds.target)
   const pct = dynamicUsedPct(funds)
   if (pct === null) return '—'
-  const num = (v) => v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  return `${num(cur)} ÷ ${num(target)} = ${pct.toFixed(1)}%`
+  return `${num2(cur)} ÷ ${num2(target)} = ${pct.toFixed(1)}%`
+}
+
+/**
+ * formatTargetProcess 展示动态目标是怎么来的（2026-11-25 owner 追加）。
+ *
+ *	target = 总资产 × min(MS × TM, 天花板) × 分时 ramp
+ *
+ * 四个因子必须与后端 fundsTargetCurRoomWithScales 同源（同帧下发）：
+ *   total_asset / market_scale / target_multiplier / target_ceiling / target_ramp。
+ * 任一因子缺失或非法 ⇒ 画「—」，绝不用 1.0 猜——那会把"没数据"伪装成"没有缩放"。
+ */
+export function formatTargetProcess(funds) {
+  if (!funds || typeof funds !== 'object') return '—'
+  const total = Number(funds.total_asset)
+  const ms = Number(funds.market_scale)
+  const tm = Number(funds.target_multiplier)
+  const cap = Number(funds.target_ceiling)
+  const ramp = Number(funds.target_ramp)
+  if (![total, ms, tm, cap, ramp].every((v) => Number.isFinite(v)) || total <= 0 || cap <= 0) return '—'
+  const eff = Math.min(ms * tm, cap)
+  return `${num2(total)} × min(${ms.toFixed(3)} × ${tm.toFixed(2)}, ${cap.toFixed(2)}) × ${ramp.toFixed(2)} = ${num2(total * eff * ramp)}`
 }

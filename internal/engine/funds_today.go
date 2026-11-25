@@ -476,6 +476,8 @@ func (e *Engine) publishSignalFunds(uid string, quotes map[string]*data.StockInf
 		f.CurStrat = cur
 		f.Room = room
 		f.MarketScale = ctx.MS
+		f.TargetMultiplier = ctx.TargetMultiplier
+		f.TargetCeiling = sc.MaxTotalPositionPct
 		f.TargetRamp = ctx.timeRamp()
 		f.TargetRampSrc = ctx.RampSource
 		f.IndexPct = ctx.IndexPct // §LIVE-T-20261116：大盘涨跌同帧烘给物理机 T 方向门

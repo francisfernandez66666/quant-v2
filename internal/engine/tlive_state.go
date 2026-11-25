@@ -161,7 +161,12 @@ type tLiveFunds struct {
 	CurStrat    float64 `json:"cur_strat"`    // 战略当前数（持仓 − 正T买腿 + 反T卖腿 + 战略在途）
 	Room        float64 `json:"room"`         // 战略剩余空间
 	MarketScale float64 `json:"market_scale"` // 本轮市场缩放（0=尚未定权）
-	MissingKey  bool    `json:"missing_key_input"`
+	// TargetMultiplier / TargetCeiling 2026-11-25：把动态目标的算式因子烘进同一帧。
+	// target = total × min(MS × TM, 天花板) × ramp；前端要把这一步摆出来给人复核，
+	// 不能只给 target 让人反推——那是第二份口径，且反推不出 TM 与天花板各自是谁。
+	TargetMultiplier float64 `json:"target_multiplier,omitempty"`
+	TargetCeiling    float64 `json:"target_ceiling,omitempty"`
+	MissingKey       bool    `json:"missing_key_input"`
 	// TargetRamp / TargetRampSrc D7（2026-11-25）动态目标的分时释放因子与档位名。
 	// 前端在目标仓位旁渲染一行小字；关闭时 TargetRampSrc="ramp_off" 且不渲染。
 	TargetRamp    float64 `json:"target_ramp,omitempty"`

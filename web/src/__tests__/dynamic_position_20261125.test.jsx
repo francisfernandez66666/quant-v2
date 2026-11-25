@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import FundsOverviewCard from '../components/FundsOverviewCard.jsx'
 import FlowFactorCard from '../components/FlowFactorCard.jsx'
-import { dynamicUsedPct, formatDynamicUsedPct, formatDynamicUsedProcess } from '../utils/dynamicPosition.js'
+import { dynamicUsedPct, formatDynamicUsedPct, formatDynamicUsedProcess, formatTargetProcess } from '../utils/dynamicPosition.js'
 
 const mocks = vi.hoisted(() => ({
   fetchFundsToday: vi.fn(),
@@ -37,7 +37,11 @@ function frame(funds = {}) {
         target: 35000,
         cur_strat: 60000,
         room: 0,
-        market_scale: 0.8,
+        market_scale: 1.0,
+        target_multiplier: 1.0,
+        target_ceiling: 1.0,
+        target_ramp: 0.35,
+        target_ramp_src: 'ramp_bear_am',
         ...funds,
       },
     },
@@ -56,6 +60,11 @@ describe('dynamicUsedPct 单一口径', () => {
     expect(dynamicUsedPct({ cur_strat: 60000, target: 35000, total_asset: 100000 })).toBeCloseTo(171.428, 2)
     expect(formatDynamicUsedPct({ cur_strat: 60000, target: 35000 })).toBe('171.4%')
     expect(formatDynamicUsedProcess({ cur_strat: 60000, target: 35000 })).toBe('60,000.00 ÷ 35,000.00 = 171.4%')
+  })
+
+  it('动态目标算式摆出四个因子，缺因子画「—」', () => {
+    expect(formatTargetProcess(frame().live.funds)).toBe('100,000.00 × min(1.000 × 1.00, 1.00) × 0.35 = 35,000.00')
+    expect(formatTargetProcess({ total_asset: 100000, market_scale: 1 })).toBe('—')
   })
 
   it('缺帧/缺数/目标非正一律弃权，绝不画 0%', () => {
@@ -78,6 +87,7 @@ describe('两处上屏', () => {
   it('首页量能卡也显示同一个百分比', () => {
     const funds = frame().live.funds
     render(<FlowFactorCard flow={{ known: false }} funds={funds} />)
+    expect(screen.getByTestId('flow-target-process').textContent).toContain('100,000.00 × min(1.000 × 1.00, 1.00) × 0.35 = 35,000.00')
     expect(screen.getByTestId('flow-dynamic-used').textContent).toContain('当前已占用动态仓位 60,000.00 ÷ 35,000.00 = 171.4%')
   })
 

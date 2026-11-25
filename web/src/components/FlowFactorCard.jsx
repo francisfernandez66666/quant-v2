@@ -15,7 +15,7 @@
 // missing values render as an explicit abstain, never as 0.0% / "flat".
 import React from 'react'
 import { Card, Tag } from 'tdesign-react'
-import { dynamicUsedPct, formatDynamicUsedProcess } from '../utils/dynamicPosition.js'
+import { dynamicUsedPct, formatDynamicUsedProcess, formatTargetProcess } from '../utils/dynamicPosition.js'
 
 // 后端 signalctl 的量态枚举 → 文案与配色。键必须与 Go 侧 VolState* 常量逐字一致。
 // 放量用「涨色」（与 blend 的正向强度同向），缩量用「跌色」，平量走中性灰。
@@ -195,8 +195,11 @@ export default function FlowFactorCard({ flow, funds }) {
   return (
     <Card title="市场资金流与量能">
       <div data-testid="flow-factor-card">{body}</div>
-      {/* 2026-11-25 owner：首页也要看到当前时段动态额度用了多少，且把算式摆出来可复核。 */}
-      <div className="muted" style={{ fontSize: 12, marginTop: 8 }} data-testid="flow-dynamic-used">
+      {/* 2026-11-25 owner：首页也要看见动态目标是怎么来的，再看见额度用了多少。 */}
+      <div className="muted" style={{ fontSize: 12, marginTop: 8 }} data-testid="flow-target-process">
+        动态目标 {formatTargetProcess(funds)}（总资产 × min(MS×TM, 天花板) × 分时 ramp）
+      </div>
+      <div className="muted" style={{ fontSize: 12, marginTop: 4 }} data-testid="flow-dynamic-used">
         当前已占用动态仓位{' '}
         <b style={{ color: usedPct !== null && usedPct > 100 ? 'var(--app-danger, #d54941)' : 'inherit' }}>
           {formatDynamicUsedProcess(funds)}
