@@ -1341,6 +1341,11 @@ def _side_ramp_of(params, st, hhmm, intent):
         return am, tag + "am"
     if st.get("latch_active"):
         return am, tag + "am"
+    # SIDE-PM-GATE 2026-11-26: 13:00-14:00 is a DATA event, not a clock event.
+    # Mirror of the Go side: without a `pm_release` confirmation the carrier keeps
+    # the AM ramp (bear 0.35) and the source name says why it is not 0.50.
+    if not st.get("pm_release"):
+        return am, tag + "am_pm_pending"
     return pm, tag + "pm"
 
 

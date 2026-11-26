@@ -1106,10 +1106,13 @@ def test_strong_right_rebuy_can_be_switched_off():
 # 出厂值，绝不"挑一格自己算"。
 # ---------------------------------------------------------------------------
 
-def _ramp_state(mode="bull", latch=False):
+def _ramp_state(mode="bull", latch=False, confirmed=False):
     st = side_snapshot(mode=mode)
     st["enabled"] = True
     st["latch_active"] = latch
+    # 2026-11-26 P5: 13:00-14:00 needs a `pm_release` confirmation; without it the
+    # carrier keeps the AM band (mirror of the Go pmGate).
+    st["pm_release"] = confirmed
     return st
 
 
@@ -1129,14 +1132,24 @@ def test_side_time_ramp_am_band():
 
 def test_side_time_ramp_pm_without_latch():
     knobs = params()
-    assert rs.side_time_ramp(knobs, _ramp_state("bull"), "13:30", 0) == 1.00
-    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "13:30", 0) == 0.50
+    assert rs.side_time_ramp(knobs, _ramp_state("bull", confirmed=True), "13:30", 0) == 1.00
+    assert rs.side_time_ramp(knobs, _ramp_state("bear", confirmed=True), "13:30", 0) == 0.50
+
+
+def test_side_time_ramp_pm_pending_holds_am_band():
+    # 2026-11-26 P5: 13:00 is a data event. No `pm_release` => AM band, and the
+    # source name must distinguish "waiting for data" from "bad signal" (latch).
+    knobs = params()
+    assert rs.side_time_ramp(knobs, _ramp_state("bull"), "13:30", 0) == 0.70
+    assert rs.side_time_ramp(knobs, _ramp_state("bear"), "13:30", 0) == 0.35
+    assert rs.side_time_ramp_src(knobs, _ramp_state("bear"), "13:30", 0) == "ramp_bear_am_pm_pending"
+    assert rs.side_time_ramp_src(knobs, _ramp_state("bear", latch=True), "13:30", 0) == "ramp_bear_am"
 
 
 def test_side_time_ramp_pm_latch_holds_am_band():
     knobs = params()
-    assert rs.side_time_ramp(knobs, _ramp_state("bull", latch=True), "13:30", 0) == 0.70
-    assert rs.side_time_ramp(knobs, _ramp_state("bear", latch=True), "13:30", 0) == 0.35
+    assert rs.side_time_ramp(knobs, _ramp_state("bull", latch=True, confirmed=True), "13:30", 0) == 0.70
+    assert rs.side_time_ramp(knobs, _ramp_state("bear", latch=True, confirmed=True), "13:30", 0) == 0.35
 
 
 def test_side_time_ramp_full_at_boundary_ignores_latch():

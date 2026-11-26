@@ -234,6 +234,8 @@ func TestSidePolicyPM1300FlowIndependentUrgent(t *testing.T) {
 	e.sideFlow.Last = &sideFlowSample{Net: -100, Amount: 1000, Source: "em:000001.SH", At: now}
 	e.sideFlow.MorningAnchor = -0.1
 	e.sideFlow.MorningAnchorAt = sideTestTime(11, 29)
+	// §14.8：13:00 的 pmDelta 只做同源差值，锚必须记下是哪条腿写的。
+	e.sideFlow.MorningAnchorSource = "em:000001.SH"
 	e.updateSidePolicy(now, &signalctl.Regime{MarketState: "bear", FlowMarketDelta: -0.5})
 	if _, err := os.Stat(e.sideUrgentReqPath); err != nil {
 		t.Fatalf("flow-only hit must write urgent req: %v", err)
@@ -288,6 +290,8 @@ func TestSidePolicyPM1300WaitsForMissingFlowBranch(t *testing.T) {
 	e.sideFlow.Last = &sideFlowSample{Net: -100, Amount: 1000, Source: "em:000001.SH", At: now}
 	e.sideFlow.MorningAnchor = -0.1
 	e.sideFlow.MorningAnchorAt = sideTestTime(11, 29)
+	// §14.8：13:00 的 pmDelta 只做同源差值，锚必须记下是哪条腿写的。
+	e.sideFlow.MorningAnchorSource = "em:000001.SH"
 	e.updateSidePolicy(now, &signalctl.Regime{MarketState: "bear", FlowMarketDelta: -0.5})
 	if _, err := os.Stat(e.sideUrgentReqPath); err != nil {
 		t.Fatalf("flow branch arriving later must still trigger urgent req: %v", err)

@@ -527,6 +527,18 @@ func collectCarrierShape(c *collector) {
 	c.put("side_ramp_bear_pm", sideSrc, config.CarrierSideRampBearPM())
 	c.put("side_ramp_pm_check_at", sideSrc, config.CarrierSideRampPMCheckAt())
 	c.put("side_ramp_full_at", sideSrc, config.CarrierSideRampFullAt())
+	// §BUY-PENDING-ENTRY-20261126：买入侧在途/确认窗/追刀闸四枚（owner 2026-11-26 裁决）。
+	const buySrc = "internal/config/carrier_knobs.go:CarrierOpenBuys/BuyConfirm/EntryPullback"
+	c.put("open_buys_grace_sec", buySrc, config.CarrierOpenBuysGraceSec())
+	c.put("buy_confirm_min_span_sec", buySrc, config.CarrierBuyConfirmMinSpanSec())
+	c.put("buy_confirm_reset_sec", buySrc, config.CarrierBuyConfirmResetSec())
+	c.put("entry_pullback_chase_guard", buySrc, config.CarrierEntryPullbackChaseGuard())
+	// §SIDE-FLOW-PROXY-20261126：资金流替补与早释五枚。
+	c.put("side_flow_proxy_enabled", sideSrc, config.CarrierSideFlowProxyEnabled())
+	c.put("side_flow_proxy_after_rounds", sideSrc, config.CarrierSideFlowProxyAfterRounds())
+	c.put("side_inflow_reversal_enabled", sideSrc, config.CarrierSideInflowReversalEnabled())
+	c.put("side_inflow_vol_min", sideSrc, config.CarrierSideInflowVolMin())
+	c.put("side_inflow_fade_delta", sideSrc, config.CarrierSideInflowFadeDelta())
 	// §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
 	// 全部转调 internal/config/carrier_knobs.go 的访问器；本函数不产生任何数字。
 	const tpSrc = "internal/config/carrier_knobs.go:CarrierTP*"

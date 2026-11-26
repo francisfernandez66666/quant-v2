@@ -222,6 +222,13 @@ export default function FlowFactorCard({ flow, funds }) {
             侧策略 {sideMode} · L{side.level} · new {side.allow_new ? '允许' : '禁'} · add {side.allow_add ? '允许' : '禁'}
             {' · '}目标乘子 {Number.isFinite(Number(side.target_multiplier)) ? `×${Number(side.target_multiplier).toFixed(2)}` : '—'}
             {side.latch_active ? ' · 13:00 禁新仓至 14:00' : ''}
+            {/* 2026-11-26 §SIDE-FLOW-PROXY：侧策略实际用的样本来源。market_delta 的 0 是合法
+                中性值，绝不能靠"数字等于 0"反推有没有读数——只看后端的 market_delta_known。 */}
+            <span data-testid="flow-side-delta">
+              {side.market_delta_known === true
+                ? ` · 侧样本 ${Number.isFinite(Number(side.market_delta)) ? Number(side.market_delta).toFixed(2) : '—'}${side.delta_source ? `（${side.delta_source}）` : ''}`
+                : ' · 侧样本读数未知'}
+            </span>
           </>
         )}
       </div>

@@ -843,7 +843,9 @@ def gate_ported_rule_knobs(artifact):
 # 自己声明的 *_PARAM_KEYS，这些键没有声明腿——2026-11-16 实盘就是因此带着缺 session_windows
 # 的 v38 上线、开盘后每轮 session_windows_missing 零成交（仓库改了 params，但 11-12 起
 # params.json 已移出 rsync 清单，gz 运行态那份没人补）。构建器必须自己挡住这种产物。
-FAIL_CLOSED_PARAMS = ("session_windows", "buy_confirm_rounds", "buy_confirm_min_gap_sec")
+FAIL_CLOSED_PARAMS = ("session_windows", "buy_confirm_rounds", "buy_confirm_min_gap_sec",
+                      "buy_confirm_min_span_sec", "buy_confirm_reset_sec",
+                      "entry_pullback_chase_guard")
 
 
 def gate_fail_closed_params(artifact):

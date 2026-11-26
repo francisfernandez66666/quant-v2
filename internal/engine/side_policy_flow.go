@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -21,6 +22,10 @@ type sideFlowSample struct {
 	Amount float64
 	Source string
 	At     time.Time
+	// §SIDE-FLOW-PROXY 2026-11-26：本轮归一后的 delta（-1..1）。
+	// 存在的理由：读面与 flowValid 只能凭**样本**判断"这一轮有没有读数"；
+	// 借 regime.FlowMarketDelta 的有限性会把"今天写过一次库"误当成"这一轮有数"。
+	Delta float64
 }
 
 type sideFlowBucket struct {
@@ -51,6 +56,18 @@ type sideFlowState struct {
 	DataCompleteBaked    bool
 	LastMode             signalctl.SidePolicyMode
 	Latch                signalctl.SidePolicyLatch
+	// §SIDE-FLOW-PROXY 2026-11-26：大盘腿连续失败 → 切板块合计 → 当日锁定。
+	ProxyMiss   int
+	ProxyLocked bool
+	// §SIDE-INFLOW-EARLY 2026-11-26：当日早释/回落各最多一次（两个 bool，不加旋钮）。
+	InflowReleased bool
+	InflowFaded    bool
+	// §SIDE-FLOW-PROXY 2026-11-26（§14.8）：上午锚由哪条腿写下。13:00 的 pmDelta
+	// 只在同源时才做差——大盘腿的锚减板块合计的当期值是"跨源差值"，不是趋势。
+	MorningAnchorSource string
+	// §SIDE-PM-GATE 2026-11-26：13:00 那一档一旦被"数据齐全"确认过，当日粘滞。
+	PMReleaseLatched bool
+	PMReleaseWritten bool
 }
 
 func newSideFlowState() sideFlowState {
@@ -169,6 +186,9 @@ func (s *sideFlowState) observe(now time.Time, sample sideFlowSample, marketDelt
 	if !validSideSample(sample) || !data.IndexAmountIsCNY(sample.Source) {
 		return
 	}
+	// 必须写在**任何分支之前**：下面的换源分支会直接 return，
+	// 晚一行就会让"锁定替补的那一轮"丢掉 delta（flowValid 立刻 false）。
+	sample.Delta = marketDelta
 	now = now.In(cntime.Loc)
 	day := data.TradingDayDate(now)
 	if s.Day != day {
@@ -222,6 +242,8 @@ func (s *sideFlowState) observe(now time.Time, sample sideFlowSample, marketDelt
 	if now.Hour() == 11 && now.Minute() >= 0 && now.Minute() < 30 && !math.IsNaN(marketDelta) {
 		s.MorningAnchor = marketDelta
 		s.MorningAnchorAt = now
+		// §14.8：记下这条锚属于哪条腿，13:00 只做同源差值。
+		s.MorningAnchorSource = sample.Source
 	}
 }
 
@@ -371,6 +393,60 @@ func (e *Engine) writeSideUrgentReq(now time.Time, reason, kind, until string) b
 	return true
 }
 
+// finiteSideFloat §SIDE-FLOW-PROXY 2026-11-26：engine 侧的有限值判据（signalctl 的同名工具未导出）。
+func finiteSideFloat(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// sampleSideFlow 是 sideFlow.observe 的**唯一**调用点（2026-11-26 §SIDE-FLOW-PROXY）。
+//
+// 三条纪律：
+//  1. 大盘腿成功且未锁定 ⇒ 用大盘样本；
+//  2. 大盘腿连续失败 side_flow_proxy_after_rounds 轮 ⇒ 切板块合计并**当日锁定**；
+//     锁定后即使大盘腿恢复也**不切回**——observe 在换源时会清空桶历史（两个分母不能相减），
+//     源抖动 = 桶永远合不上 = slope 永远 NaN，那正是今天 11:00 之后仍回 35% 的第二个成因。
+//  3. 两条腿都没有 ⇒ 不采样。样本自然过期 ⇒ flowValid=false ⇒ 冷启动 bear（fail-closed）。
+func (e *Engine) sampleSideFlow(now time.Time, mkt sideFlowSample, mktOK bool,
+	netSum, amtSum float64, nBoards int) {
+	// 总闸读数：生产恒走 config 的编译期常量；引擎字段只在测试里注入 false，
+	// 用来钉住"关掉替补腿就回到旧行为（大盘腿失败即不采样）"这条退路。
+	proxyOn := config.CarrierSideFlowProxyEnabled()
+	if e.sideProxyEnabledFn != nil {
+		proxyOn = e.sideProxyEnabledFn()
+	}
+	after := config.CarrierSideFlowProxyAfterRounds()
+	if after < 1 {
+		after = 1
+	}
+	e.sideMu.Lock()
+	defer e.sideMu.Unlock()
+	if mktOK && !e.sideFlow.ProxyLocked {
+		e.sideFlow.ProxyMiss = 0
+		e.sideFlow.observe(now, mkt, mkt.Delta)
+		return
+	}
+	if !proxyOn {
+		return
+	}
+	// 替补样本必须是**累计净额 / 累计成交额**（与大盘腿同形），closeBucket 的差分
+	// 口径才不用改；delta 由同一个 FlowPctToDelta 归一（÷3 再夹 ±1）。
+	proxyDelta := signalctl.FlowPctToDelta(netSum, amtSum)
+	if nBoards < sectorAggMinBoards || math.IsNaN(proxyDelta) {
+		if !e.sideFlow.ProxyLocked {
+			e.sideFlow.ProxyMiss++
+		}
+		return
+	}
+	if !e.sideFlow.ProxyLocked {
+		e.sideFlow.ProxyMiss++
+		if e.sideFlow.ProxyMiss < after {
+			return
+		}
+		e.sideFlow.ProxyLocked = true
+	}
+	e.sideFlow.observe(now, sideFlowSample{
+		Net: netSum, Amount: amtSum, Source: "em:sector_agg", At: now,
+	}, proxyDelta)
+}
+
 // updateSidePolicy 在资金流/指数读数装配后调用；13:00 两路独立就绪，任一命中立即写 req。
 func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 	now = now.In(cntime.Loc)
@@ -388,7 +464,10 @@ func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 	slope := e.sideFlow.slopeDelta()
 	buckets := e.sideFlow.bucketDeltas()
 	morningAnchor, morningAt := e.sideFlow.MorningAnchor, e.sideFlow.MorningAnchorAt
+	morningSrc := e.sideFlow.MorningAnchorSource
 	pmChecked, urgentWritten := e.sideFlow.PMChecked, e.sideFlow.UrgentWritten
+	released, faded := e.sideFlow.InflowReleased, e.sideFlow.InflowFaded
+	pmReleaseLatched := e.sideFlow.PMReleaseLatched
 	e.sideMu.Unlock()
 
 	// 缺口只参与权重/剧本，不单独触发资金安全硬闸。
@@ -396,33 +475,52 @@ func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 	idxPct, idxDay, idxStale := e.indexChangePctNow(now)
 	indexValid := !math.IsNaN(idxPct) && !math.IsInf(idxPct, 0) && !idxStale && idxDay == day
 	marketDelta := math.NaN()
+	deltaSource := ""
 	flowValid := false
 	asOf := now
-	if regime != nil && !math.IsNaN(regime.FlowMarketDelta) && !math.IsInf(regime.FlowMarketDelta, 0) {
-		marketDelta = regime.FlowMarketDelta
-		e.sideMu.RLock()
-		last := e.sideFlow.Last
-		e.sideMu.RUnlock()
-		if last != nil {
-			asOf = last.At
+	e.sideMu.RLock()
+	last := e.sideFlow.Last
+	e.sideMu.RUnlock()
+	// 样本是唯一的新鲜度真源：regime 里的有限值只说明"今天写过库"，
+	// 不代表这一轮有读数（observe 停一轮，90 s 后样本就过期）。
+	sampleFresh := last != nil && data.IndexAmountIsCNY(last.Source) &&
+		!last.At.IsZero() && now.Sub(last.At) <= 90*time.Second
+	if sampleFresh {
+		asOf = last.At
+		if strings.HasPrefix(last.Source, "em:sector_agg") {
+			// 替补源：delta 只能来自样本本身。regime 那份是大盘腿的，
+			// 混用等于"读 A 的数、贴 B 的标签"。
+			if finiteSideFloat(last.Delta) {
+				marketDelta, deltaSource = last.Delta, "sector_agg"
+			}
+		} else if regime != nil && finiteSideFloat(regime.FlowMarketDelta) {
+			marketDelta, deltaSource = regime.FlowMarketDelta, "index"
 		}
-		flowValid = last != nil && data.IndexAmountIsCNY(last.Source) && now.Sub(last.At) <= 90*time.Second
 	}
-	if !flowValid {
-		marketDelta = math.NaN()
-	}
+	flowValid = sampleFresh && !math.IsNaN(marketDelta)
 	anchorValid := !math.IsNaN(morningAnchor) && !morningAt.IsZero() &&
-		morningAt.Hour() == 11 && morningAt.Minute() < 30 && data.TradingDayDate(morningAt) == day
+		morningAt.Hour() == 11 && morningAt.Minute() < 30 && data.TradingDayDate(morningAt) == day &&
+		// §14.8：锚与当期必须同源，否则 13:00 的 pmDelta 是跨源差值，不是趋势。
+		last != nil && morningSrc == last.Source
 	pmDelta := math.NaN()
 	if flowValid && anchorValid {
 		pmDelta = marketDelta - morningAnchor
+	}
+	// §SIDE-INFLOW-EARLY 2026-11-26：量态与 blend 用的是同一个真源
+	// （signalctl.VolSurgeDeltaOf：放量 +1 / 缩量 -1 / 平量 0），不另算一遍。
+	volSurge, volValid := math.NaN(), false
+	if regime != nil && finiteSideFloat(regime.VolSurgeDelta) {
+		volSurge, volValid = regime.VolSurgeDelta, true
 	}
 	st := signalctl.DecideSidePolicy(signalctl.SidePolicyInput{
 		Enabled: enabled, MarketState: regimeMarketState(regime), MarketDelta: marketDelta,
 		SlopeDelta: slope, BucketDeltas: buckets, GapPct: gap, IndexChangePct: idxPct,
 		PMFlowIntensityDelta: pmDelta, IndexValid: indexValid, FlowValid: flowValid,
 		PMAnchorValid: anchorValid, Latch: latch, AsOf: asOf, Now: now,
+		VolSurgeDelta: volSurge, VolValid: volValid,
+		InflowReleased: released, InflowFaded: faded, PMReleaseLatched: pmReleaseLatched,
 	})
+	st.DeltaSource = deltaSource
 	if enabled && !flowValid && !indexValid && math.IsNaN(slope) && !gapValid {
 		st = signalctl.FailClosedSidePolicy(day, now, "side_policy_input_missing")
 	}
@@ -439,6 +537,41 @@ func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 		st.AsOf = time.Time{}
 	}
 	st = signalctl.ApplySidePolicyFreshness(st, now)
+
+	// 当轮刚翻面的三个标记：只用于"要不要写一次加急"，不进任何状态。
+	releasedNow, fadedNow, pmReleaseNow := false, false, false
+	// §SIDE-INFLOW-EARLY 状态机：当日早释/回落各最多一次。
+	if enabled && flowValid {
+		e.sideMu.Lock()
+		if st.Reason == "inflow_reversal_early" && !e.sideFlow.InflowReleased {
+			e.sideFlow.InflowReleased = true
+			releasedNow = true
+		}
+		if e.sideFlow.InflowReleased && !e.sideFlow.InflowFaded &&
+			!math.IsNaN(marketDelta) && marketDelta < config.CarrierSideInflowFadeDelta() {
+			e.sideFlow.InflowFaded = true
+			fadedNow = true
+		}
+		e.sideMu.Unlock()
+	}
+	// §SIDE-PM-GATE：确认过就当日粘滞——下午读数抖动不许让 PM 档反复翻面
+	// （每次翻面都改 digest ⇒ 一次客户端有序重启）。
+	e.sideMu.Lock()
+	if st.PMRelease && !e.sideFlow.PMReleaseLatched {
+		e.sideFlow.PMReleaseLatched = true
+		pmReleaseNow = true
+	}
+	pmWritten := e.sideFlow.PMReleaseWritten
+	e.sideMu.Unlock()
+	// range 的 ramp 恒 1.0，这一档对它不起作用 ⇒ 不为它多烘一次（多一次客户端重启）。
+	if pmReleaseNow && !pmWritten &&
+		(st.Mode == signalctl.SidePolicyBear || st.Mode == signalctl.SidePolicyBull) {
+		if e.writeSideUrgentReq(now, "pm_release", "reversal", "15:00") {
+			e.sideMu.Lock()
+			e.sideFlow.PMReleaseWritten = true
+			e.sideMu.Unlock()
+		}
+	}
 	if regime != nil {
 		regime.SidePolicy = st
 	}
@@ -460,7 +593,16 @@ func (e *Engine) updateSidePolicy(now time.Time, regime *signalctl.Regime) {
 			e.sideMu.Unlock()
 		}
 	}
-	if enabled && !dataDone && flowValid && indexValid && !math.IsNaN(slope) {
+	if releasedNow {
+		e.writeSideUrgentReq(now, "inflow_reversal_early", "reversal", "15:00")
+	}
+	// owner 2026-11-26：收回也加急（"该收紧的时候不要等下一班"）。
+	// 安全的前提是 InflowFaded 当日粘性 ⇒ 一天最多一次，不存在"收回→再放开→再收回"。
+	if fadedNow {
+		e.writeSideUrgentReq(now, "inflow_fade", "reversal", "15:00")
+	}
+	if enabled && !dataDone && !releasedNow && !released &&
+		flowValid && indexValid && !math.IsNaN(slope) {
 		if e.writeSideUrgentReq(now, "data_complete_reversal", "reversal", "15:00") {
 			e.sideMu.Lock()
 			e.sideFlow.DataCompleteBaked = true

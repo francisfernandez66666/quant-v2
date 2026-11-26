@@ -337,6 +337,73 @@ func CarrierSideRampPMCheckAt() string { return carrierSideRampPMCheckAt }
 // English: time after which the ramp is 1.0 unconditionally.
 func CarrierSideRampFullAt() string { return carrierSideRampFullAt }
 
+// §BUY-PENDING-ENTRY-20261126 买入侧四枚（owner 2026-11-26 裁决）。
+// 起因是 2026-11-26 09:33 两笔买入合计 39,198 超出动态目标 21,173：
+// 柜台 ORDER 行尺寸字段未填时被整行丢弃 ⇒ 第二笔拿不到"已占用"。
+// 四枚都只影响**买入侧准入**，不碰卖出链、不碰 T 腿额度。
+const (
+	// 进程内买单账：柜台连行都还没有时，等这么久才允许判死（秒）。
+	carrierOpenBuysGraceSec = 120.0
+	// 确认窗的最小**真实时间跨度**（秒）。轮数够了但时间没到，继续等。
+	carrierBuyConfirmMinSpanSec = 180.0
+	// 信号断档超过这么久 ⇒ 确认窗从零开始（秒）。
+	carrierBuyConfirmResetSec = 300.0
+	// last <= vwap×(1-pct) 时跳过本笔（不追刀）。缺省开；显式 false 是退路。
+	carrierEntryPullbackChaseGuard = true
+)
+
+// §SIDE-FLOW-PROXY-20261126 资金流替补与早释五枚（owner 2026-11-26 裁决）。
+// 起因是 2026-11-26 大盘 fflow 腿间歇失败 ⇒ sideFlow 样本 90 s 后过期 ⇒
+// 侧策略整天回 cold_start_bear ⇒ 动态目标被压在 35%。
+const (
+	// 大盘腿弃权时用「板块合计净流入」当替补样本。
+	carrierSideFlowProxyEnabled = true
+	// 大盘腿连续失败几轮后锁定替补（当日不切回，防源抖动清桶）。
+	carrierSideFlowProxyAfterRounds = 2
+	// 冷启动期「净流入 + 放量」早释腿总闸。
+	carrierSideInflowReversalEnabled = true
+	// 放量下限（vol_surge_delta ≥ 1.0 即放量态，与 VolSurgeDeltaOf 同源）。
+	carrierSideInflowVolMin = 1.0
+	// 释放后净流入跌破此值 ⇒ 当日回落（不再释放）。
+	carrierSideInflowFadeDelta = 0.20
+)
+
+// CarrierOpenBuysGraceSec 返回进程内买单账的判死等待秒数。
+// English: seconds a process-local open-buy entry may wait before it is considered dead.
+func CarrierOpenBuysGraceSec() float64 { return carrierOpenBuysGraceSec }
+
+// CarrierBuyConfirmMinSpanSec 返回买入确认窗的最小真实时间跨度（秒）。
+// English: minimum wall-clock span (seconds) for the two-round buy confirmation window.
+func CarrierBuyConfirmMinSpanSec() float64 { return carrierBuyConfirmMinSpanSec }
+
+// CarrierBuyConfirmResetSec 返回确认窗断档重置秒数。
+// English: signal gap (seconds) after which the confirmation window restarts from zero.
+func CarrierBuyConfirmResetSec() float64 { return carrierBuyConfirmResetSec }
+
+// CarrierEntryPullbackChaseGuard 返回"不追刀"闸是否生效。
+// English: skip the buy when the last price is already below the pullback target.
+func CarrierEntryPullbackChaseGuard() bool { return carrierEntryPullbackChaseGuard }
+
+// CarrierSideFlowProxyEnabled 返回资金流替补腿总闸。
+// English: use the sector-aggregate inflow as a stand-in when the market leg fails.
+func CarrierSideFlowProxyEnabled() bool { return carrierSideFlowProxyEnabled }
+
+// CarrierSideFlowProxyAfterRounds 返回大盘腿连续失败几轮后锁定替补。
+// English: consecutive market-leg failures before the proxy source is latched for the day.
+func CarrierSideFlowProxyAfterRounds() int { return carrierSideFlowProxyAfterRounds }
+
+// CarrierSideInflowReversalEnabled 返回冷启动期早释腿总闸。
+// English: master switch for the cold-start early-release leg.
+func CarrierSideInflowReversalEnabled() bool { return carrierSideInflowReversalEnabled }
+
+// CarrierSideInflowVolMin 返回早释所需的放量下限（vol_surge_delta）。
+// English: minimum volume-surge delta required by the early-release leg.
+func CarrierSideInflowVolMin() float64 { return carrierSideInflowVolMin }
+
+// CarrierSideInflowFadeDelta 返回释放后回落的净流入阈值。
+// English: normalized inflow level below which the early release is taken back.
+func CarrierSideInflowFadeDelta() float64 { return carrierSideInflowFadeDelta }
+
 // §T-LEG-F3-20261125 上市天数闸的自动切换旋钮（owner 2026-11-25 裁决「先 A 后 B」）。
 //
 // A 档 = 闸显式关（floor 0），B 档 = 闸开（floor = t_min_listed_days）。

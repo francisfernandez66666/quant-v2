@@ -53,15 +53,19 @@ func TestFinaCacheCarriesReportPeriod(t *testing.T) {
 func TestFinaCacheMissingDatesAreUnknownNotZero(t *testing.T) {
 	// ann_date 缺失（旧装载行）：字段留空串=「不可知」，下游新鲜度闸按不可知处理，
 	// 绝不能伪造成一个日期把"不可知"伪装成"很新"或"很旧"。
+	// 2026-11-26 修正：报告期不能再写死 20260331——M-7 新鲜度闸（240 天）在今天
+	// 正好把那一行判成"过旧停用"，于是本例在断言字段之前就拿到 nil（夹具假红）。
+	// 用当前日期减 30 天造一行"足够新"的报告期，本例要钉的始终是"披露日空串=不可知"。
+	endDate := time.Now().Add(-30 * 24 * time.Hour).Format("20060102")
 	db := openFinaDB(t, []map[string]any{
-		{"ts_code": "000001.SZ", "end_date": "20260331", "roe": 3.3},
+		{"ts_code": "000001.SZ", "end_date": endDate, "roe": 3.3},
 	})
 	got := newFinaCache(db).Lookup("000001.SZ")
 	if got == nil {
 		t.Fatalf("Lookup 返回 nil")
 	}
-	if got.EndDate != "20260331" {
-		t.Fatalf("end_date 应透传：got %q", got.EndDate)
+	if got.EndDate != endDate {
+		t.Fatalf("end_date 应透传：got %q want %q", got.EndDate, endDate)
 	}
 	if got.AnnDate != "" {
 		t.Fatalf("披露日缺失必须是空串（不可知），got %q", got.AnnDate)

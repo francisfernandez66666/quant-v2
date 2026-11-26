@@ -57,6 +57,10 @@ class GateThreeStateTest(unittest.TestCase):
         m.PARAMS = {
             "buy_confirm_rounds": 2,
             "buy_confirm_min_gap_sec": 60,
+            # 2026-11-26 P2: rounds alone are not a time span. Both knobs are
+            # required by _buy_confirmed; a missing one refuses every buy.
+            "buy_confirm_min_span_sec": 180,
+            "buy_confirm_reset_sec": 300,
             "vwap_sanity_lo": 0.5,
             "vwap_sanity_hi": 2.0,
             "risk_list_static": ["000520.SZ"],
@@ -76,9 +80,29 @@ class GateThreeStateTest(unittest.TestCase):
     def test_buy_confirmed_pass(self):
         ok, why = m._buy_confirmed("000001.SZ", 1000.0)
         self.assertFalse(ok)  # only 1 round seen yet
+        # 2026-11-26 P2: the second observation satisfies rounds=2 but only
+        # spans 70 s, which is exactly the shape that put 002009 on the book
+        # at 14.01. It must still refuse, and say why.
         ok, why = m._buy_confirmed("000001.SZ", 1000.0 + 70.0)
+        self.assertFalse(ok)
+        self.assertEqual(why, "confirm_span_60_of_180")
+        ok, why = m._buy_confirmed("000001.SZ", 1000.0 + 180.0)
         self.assertTrue(ok)
         self.assertEqual(why, "")
+
+    def test_buy_confirmed_restarts_after_signal_gone(self):
+        m._buy_confirmed("X", 1000.0)
+        # > reset (300 s) with no observation: the old stamp is not evidence of
+        # persistent observation, so the window starts over instead of counting.
+        ok, why = m._buy_confirmed("X", 1000.0 + 301.0)
+        self.assertFalse(ok)
+        self.assertEqual(why, "confirm_restart")
+
+    def test_buy_confirmed_span_missing_refuses(self):
+        del m.PARAMS["buy_confirm_min_span_sec"]
+        ok, why = m._buy_confirmed("X", 1000.0)
+        self.assertFalse(ok)
+        self.assertEqual(why, "buy_confirm_span_missing")
 
     def test_buy_confirmed_not_enough_rounds(self):
         ok, why = m._buy_confirmed("X", 1000.0)

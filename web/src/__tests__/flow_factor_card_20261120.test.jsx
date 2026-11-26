@@ -135,6 +135,29 @@ describe('§FLOW-QUADRANT FlowFactorCard', () => {
     expect(el.textContent).toContain('14:00')
   })
 
+  it('侧策略样本来源：known 才画数值与来源，缺数绝画成中性 0.00', () => {
+    render(<FlowFactorCard flow={{ ...FULL, side_policy: {
+      known: true, enabled: true, stale: false, status: 'known',
+      mode: 'bear', level: 0, allow_new: true, allow_add: true, target_multiplier: 1,
+      market_delta_known: true, market_delta: 0, delta_source: 'sector_agg',
+    } }} />)
+    const el = screen.getByTestId('flow-side-delta')
+    // 0 是合法中性值，但必须带来源标出来；不能因为"等于 0"就当成没读数。
+    expect(el.textContent).toContain('0.00')
+    expect(el.textContent).toContain('sector_agg')
+  })
+
+  it('侧策略 marker 缺失时明说读数未知，不画 0.00', () => {
+    render(<FlowFactorCard flow={{ ...FULL, side_policy: {
+      known: true, enabled: true, stale: false, status: 'known',
+      mode: 'bear', level: 0, allow_new: true, allow_add: true, target_multiplier: 1,
+      market_delta: 0, delta_source: '',
+    } }} />)
+    const el = screen.getByTestId('flow-side-delta')
+    expect(el.textContent).toContain('读数未知')
+    expect(el.textContent).not.toContain('0.00')
+  })
+
   it('侧策略缺快照时明说未启用，不画默认乘子', () => {
     render(<FlowFactorCard flow={FULL} />)
     const el = screen.getByTestId('flow-side-policy')

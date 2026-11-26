@@ -45,6 +45,14 @@ type SidePolicyInput struct {
 	Latch                SidePolicyLatch
 	AsOf                 time.Time
 	Now                  time.Time
+	// §SIDE-INFLOW-EARLY 2026-11-26：量态与"当日已释放/已回落"。
+	// VolSurgeDelta 与 blend 用的是同一个真源（signalctl.VolSurgeDeltaOf：放量 +1 / 缩量 -1 / 平量 0）。
+	VolSurgeDelta  float64
+	VolValid       bool
+	InflowReleased bool
+	InflowFaded    bool
+	// §SIDE-PM-GATE 2026-11-26：13:00 那一档是否已被"数据齐全"确认过（engine 侧当日粘滞）。
+	PMReleaseLatched bool
 }
 
 // SidePolicyState 是市场级输出；个股级强左侧例外再由 BuyAdmission 判定。
@@ -68,6 +76,11 @@ type SidePolicyState struct {
 	AsOfUnix             int64           `json:"asof_ts,omitempty"`
 	LatchUntilUnix       int64           `json:"latch_until_ts"`
 	FreshnessEpoch       int64           `json:"freshness_epoch,omitempty"`
+	// §SIDE-FLOW-PROXY 2026-11-26：这条腿到底用了哪份数（index / sector_agg）。
+	// 零值是"没有读数"，所以"有没有值"只能靠它判——market_delta 的 0 是合法中性值。
+	DeltaSource string `json:"delta_source,omitempty"`
+	// §SIDE-PM-GATE 2026-11-26：13:00 那一档今天是否已被"数据齐全"确认过。
+	PMRelease bool `json:"pm_release,omitempty"`
 }
 
 // SideSignal 是准入层需要的最小信号字段；不依赖订单 remark 或账户意图推断。
@@ -180,7 +193,21 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 	// 允许 new/add，总动态仓位封在 35%（bear AM ramp 0.35 × TM 1.0）。
 	// 缺失的输入一律按弃权（绝不落 range 满仓）；数据齐后再由开盘/反转两条
 	// urgent req 链立刻重烘一次。
+	// §SIDE-INFLOW-EARLY 2026-11-26：量态与早释判据。
+	// 阈值 side_inflow_vol_min = 1.0 与 VolSurgeDeltaOf 的放量档逐字同源，不新造"放量"定义。
+	volSurge := in.VolValid && finiteSide(in.VolSurgeDelta) &&
+		in.VolSurgeDelta >= config.CarrierSideInflowVolMin()
+	// 维持：只要求净流入没掉回中性以下。量能会自然衰减，当持续条件会让它白天反复翻面。
+	earlyHold := in.InflowReleased && !in.InflowFaded && marketOK &&
+		in.MarketDelta >= config.CarrierSideInflowFadeDelta()
+
 	if !marketOK || !slopeOK {
+		// 09:30–11:00 斜率成不了桶时，只要"净流入 + 放量"已成立就该放开，
+		// 而不是继续按"缺数"压到 35%（今天 09:30–11:00 就是这个形状）。
+		if config.CarrierSideInflowReversalEnabled() &&
+			(earlyHold || (!in.InflowFaded && strongIn && volSurge && indexOK)) {
+			return earlyRangeState(in, "inflow_reversal_early", st.LatchUntilUnix)
+		}
 		cold := SidePolicyState{
 			Enabled: true, Day: st.Day, Mode: SidePolicyBear, Level: 0,
 			AllowNew: true, AllowAdd: true, TargetMultiplier: 1.0,
@@ -191,6 +218,16 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 			cold.AsOfUnix = cold.AsOf.Unix()
 		}
 		cold.LatchUntilUnix = st.LatchUntilUnix
+		// §SIDE-PM-GATE 2026-11-26：13:00 已经由"三项读数齐全"确认过的下午，
+		// 不该因为 13:20 读数抖一轮就退回 0.35（每次翻面都改 digest ⇒ 一次客户端重启）。
+		// 冷启动分支原本会把它丢掉（返回的是新构造的 cold），这里显式带上粘性位。
+		cold.PMRelease = in.PMReleaseLatched
+		// 顺手修掉一处：latch 在冷启动分支里也必须生效（原代码直接 AllowNew: true，
+		// 13:00 那一刻若斜率仍缺，no-new 锁会被静默丢掉）。
+		if latchActiveSide(in.Latch, in.Now) {
+			cold.AllowNew = false
+			cold.Reason = "pm1300_latch"
+		}
 		return cold
 	}
 	switch {
@@ -264,6 +301,28 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 		}
 	}
 
+	// §SIDE-INFLOW-EARLY 2026-11-26：已释放的当日不再被 bear 收回。
+	// 净流入仍在（≥ fade）就维持 range 100%；只有真实恶化或 13:00 latch 才允许收回。
+	// 位置是硬约束：必须在这整段 bear/bull 明细之后、末尾 latch 段之前。
+	if config.CarrierSideInflowReversalEnabled() && earlyHold &&
+		st.Mode == SidePolicyBear && !worsening && !latchActiveSide(st.Latch, in.Now) {
+		st.Mode, st.Level = SidePolicyRange, 0
+		st.TargetMultiplier = 1.0
+		st.AllowNew, st.AllowAdd = true, true
+		// 与早释用同一个串：digest 含 reason，换串 = 盒子客户端再重启一次。
+		st.Reason = "inflow_reversal_early"
+	}
+
+	// §SIDE-PM-GATE 2026-11-26：13:00 那一档从"时钟事件"改成"数据事件"。
+	// 赋值只能在这里：switch 之前 st.Mode 还是构造字面量里的 range，判不出档位；
+	// 而 range 的 ramp 恒 1.0，翻面对它没有行为效果却会改 digest ⇒ 白多一次客户端重启。
+	pmGate := hhmmSide(in.Now) >= config.CarrierSideRampPMCheckAt()
+	if (st.Mode == SidePolicyBear || st.Mode == SidePolicyBull) && pmGate &&
+		(in.PMReleaseLatched ||
+			(marketOK && indexOK && in.PMAnchorValid && !latchActiveSide(st.Latch, in.Now))) {
+		st.PMRelease = true
+	}
+
 	if latchActiveSide(st.Latch, in.Now) {
 		st.AllowNew = false
 		st.Reason = "pm1300_latch"
@@ -273,6 +332,35 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 		if !in.AsOf.IsZero() {
 			st.FreshnessEpoch = in.AsOf.Unix() / int64(config.CarrierSideFreshnessHeartbeatSec())
 		}
+	}
+	return st
+}
+
+// earlyRangeState §SIDE-INFLOW-EARLY 的唯一出口：range + 100%。
+//
+// 为什么是 range 而不是 bull：bull 要 slope 确认"改善"（今天 11:00 前根本没有斜率），
+// 且 bull AM 只放 70%；range 的 ramp 恒 1.0 —— 这正是"净流入 + 放量已成立，
+// 不该再按缺数收紧"的语义。它不是"看多"，是"数据未齐但不该压着"。
+func earlyRangeState(in SidePolicyInput, reason string, latchUntil int64) SidePolicyState {
+	st := SidePolicyState{
+		Enabled: true, Day: in.Now.Format("20060102"), Mode: SidePolicyRange, Level: 0,
+		AllowNew: true, AllowAdd: true, TargetMultiplier: 1.0,
+		LeftWeight: 1.0, RightWeight: 1.0, Latch: in.Latch,
+		Reason: reason, AsOf: in.AsOf, LatchUntilUnix: latchUntil,
+	}
+	if !st.AsOf.IsZero() {
+		st.AsOfUnix = st.AsOf.Unix()
+	}
+	if finiteSide(in.MarketDelta) {
+		st.MarketDelta = in.MarketDelta
+	}
+	if in.FlowValid && finiteSide(in.SlopeDelta) {
+		st.SlopeDelta = in.SlopeDelta
+	}
+	// 13:00 latch 必须压过早释：no-new 是钱路径上的硬闸，不能被一条资金流读数穿透。
+	if latchActiveSide(in.Latch, in.Now) {
+		st.AllowNew = false
+		st.Reason = "pm1300_latch"
 	}
 	return st
 }
@@ -418,11 +506,19 @@ func SideTimeRampWithSource(st SidePolicyState, now time.Time) (float64, string)
 		return am, "ramp_bear_am"
 	}
 	// 13:00–14:00：latch 活跃 ⇒ 保持上午档（"暂不释放剩余"）。
+	// §SIDE-PM-GATE 2026-11-26：latch 之外还要求"下午读数已被确认"——
+	// 没确认就留在上午档，来源名必须与 latch 可分（等数据 vs 有坏信号）。
 	if latchActiveSide(st.Latch, now) {
 		if bull {
 			return am, "ramp_bull_am"
 		}
 		return am, "ramp_bear_am"
+	}
+	if !st.PMRelease {
+		if bull {
+			return am, "ramp_bull_am_pm_pending"
+		}
+		return am, "ramp_bear_am_pm_pending"
 	}
 	if bull {
 		return pm, "ramp_bull_pm"

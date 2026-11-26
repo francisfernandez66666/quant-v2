@@ -141,6 +141,14 @@ _STATE = {
     # (_buy_retry_counter), so a carrier reload cannot reset the count.
     "buy_tries": {},
     "buy_tries_day": "",
+    # 2026-11-26 P1: {(day, symbol): {"qty", "price", "short", "at"}}. Written
+    # the instant a strategic buy is accepted, released only on counter proof.
+    # The ORDER table lags by seconds AND can show a row with no size, so it
+    # cannot be the only source; session memory alone cannot survive a reload.
+    # The merge takes the MAX of the two per symbol (never the sum -- they
+    # describe the same ticket).
+    "open_buys": {},
+    "open_buys_day": "",
     # SIDE-POLICY: {(day, symbol, rule_id): [(epoch, score)]}; only scored left rules qualify.
     "side_left_seen": {},
     "side_policy_last": {},
@@ -487,6 +495,13 @@ def _live_orders():
         traded = _to_float(_pick(getattr(item, "m_nVolumeTraded", None),
                                  getattr(item, "traded_volume", None),
                                  getattr(item, "filled_volume", None)), 0.0)
+        qty = _to_float(_pick(getattr(item, "m_nOrderVolume", None),
+                              getattr(item, "order_volume", None),
+                              getattr(item, "volume", None)), 0.0)
+        price = _to_float(_pick(getattr(item, "m_dOrderPrice", None),
+                                getattr(item, "m_dPrice", None),
+                                getattr(item, "m_dLimitPrice", None),
+                                getattr(item, "price", None)), 0.0)
         out.append({
             "order_id": str(_pick(getattr(item, "m_strOrderSysID", None), getattr(item, "order_id", None)) or ""),
             "symbol": str(_pick(getattr(item, "m_strInstrumentID", None), getattr(item, "stock_code", None)) or ""),
@@ -495,18 +510,34 @@ def _live_orders():
             "side": _order_side(item, op_buy, op_sell),
             "status": status,
             "terminal": terminal,
-            "qty": _to_float(_pick(getattr(item, "m_nOrderVolume", None),
-                                   getattr(item, "order_volume", None),
-                                   getattr(item, "volume", None)), 0.0),
+            "qty": qty,
             "traded": traded,
-            "price": _to_float(_pick(getattr(item, "m_dOrderPrice", None),
-                                     getattr(item, "m_dPrice", None),
-                                     getattr(item, "m_dLimitPrice", None),
-                                     getattr(item, "price", None)), 0.0),
+            "price": price,
+            # 2026-11-26 P0: a freshly accepted order shows up in the ORDER
+            # table BEFORE its size fields are populated (live: 000009 at
+            # 09:32:44 had a row but reserved nothing). "Read as 0" and "not
+            # filled in yet" are the same shape here, and treating it as 0 is
+            # the fail-OPEN direction: the next signal then spends the same
+            # money. Mark it instead of letting the consumer guess.
+            "size_unknown": bool(qty <= 0.0 or price <= 0.0),
             "order_time": _order_submit_epoch(item),
             "cancel_like": bool(terminal and traded <= 0.0),
         })
     _STATE["order_kept"] = len(out)
+    if raw and out and any(row["size_unknown"] for row in out):
+        # 2026-11-26 P0: `kept>0` does NOT mean the sizes are readable. Print
+        # the candidate field families once so the next build is a grep.
+        first = raw[0]
+        _warn_once("order_size_drift",
+                   "ORDER row size unreadable: qty=%s/%s/%s price=%s/%s/%s/%s status=%s" % (
+                       repr(getattr(first, "m_nOrderVolume", None)),
+                       repr(getattr(first, "order_volume", None)),
+                       repr(getattr(first, "volume", None)),
+                       repr(getattr(first, "m_dOrderPrice", None)),
+                       repr(getattr(first, "m_dPrice", None)),
+                       repr(getattr(first, "m_dLimitPrice", None)),
+                       repr(getattr(first, "price", None)),
+                       repr(getattr(first, "m_nOrderStatus", None))))
     if raw and not out:
         # raw rows but not one carries our wire remark: a field-name drift, not
         # an empty table. Print the candidate values once (literal attributes
@@ -716,6 +747,18 @@ def _buy_confirmed(symbol, now_ts):
     """
     rounds = int(PARAMS.get("buy_confirm_rounds", 2))
     gap = float(PARAMS.get("buy_confirm_min_gap_sec", 60))
+    # 2026-11-26 P2: a ROUND count is not a TIME span. With rounds=2/gap=60 the
+    # window closed at 60 s, and 002009 was bought at 14.01 on the second
+    # observation of a 40-second-old signal. Require both: N observations AND a
+    # real span of at least `span` seconds.
+    span = _to_float(PARAMS.get("buy_confirm_min_span_sec"), None)
+    reset = _to_float(PARAMS.get("buy_confirm_reset_sec"), None)
+    if span is None or reset is None or span <= 0.0 or reset <= 0.0:
+        # A missing knob must not silently restore the 60-second window that
+        # put 14.01 on the book -- refuse and say so.
+        _warn_once("buy_confirm_span",
+                   "buy_confirm_min_span_sec/reset_sec missing: buys refused")
+        return False, "buy_confirm_span_missing"
     seen = _STATE["buy_seen"].setdefault(symbol, [])
     # CONFIRM-FIX-20261112: the old code appended EVERY round's timestamp, so
     # with the ~6s round cadence the last two observations were always ~6s
@@ -723,14 +766,29 @@ def _buy_confirmed(symbol, now_ts):
     # confirm_gap_pending forever (14:17 box log). Fixed: only record an
     # observation once the gap since the LAST RECORDED one has elapsed; each
     # recorded observation then advances the count.
+    # 2026-11-26 P2: the signal dropped off the candidate list -- an old
+    # observation is not "persistent observation", so the window restarts
+    # instead of counting. This check MUST come before the gap check or a
+    # restart reads as "gap pending" and the log lies about why.
+    if seen and now_ts - seen[-1] > reset:
+        del seen[:]
+        return False, "confirm_restart"
     if seen and now_ts - seen[-1] < gap:
         return False, "confirm_gap_pending"
     seen.append(now_ts)
-    del seen[:-rounds]
+    # 2026-11-26 P2: the old `del seen[:-rounds]` kept exactly two stamps, so
+    # seen[-1]-seen[0] was always one gap and the span could never be reached.
+    # Keep everything inside the reset window instead.
+    keep_from = now_ts - (reset + span)
+    seen[:] = [t for t in seen if t >= keep_from]
     if len(seen) < rounds:
         return False, "confirm_rounds_%d_of_%d" % (len(seen), rounds)
-    if seen[-1] - seen[-2] < gap:
-        return False, "confirm_gap_pending"
+    elapsed = seen[-1] - seen[0]
+    if elapsed < span:
+        # Bucketed to 30 s on purpose: an exact number would mint a new reason
+        # string every round, and `round_skips` only prints the top 12 -- the
+        # money reasons would be crowded out by this one.
+        return False, "confirm_span_%d_of_%d" % (int(elapsed // 30) * 30, int(span))
     return True, ""
 
 
@@ -1262,6 +1320,107 @@ def _trade_session_ok(moment=None):
     return True, "ok"
 
 
+def _open_buys_roll(day):
+    """Day rollover drops the whole journal (never a clock across midnight)."""
+    if _STATE.get("open_buys_day") != day:
+        _STATE["open_buys_day"] = day
+        _STATE["open_buys"] = {}
+
+
+def _open_buys_record(day, symbol, qty, price, short):
+    """One accepted strategic buy -> one reservation. Called ONLY after _place."""
+    _open_buys_roll(day)
+    qty = _to_float(qty, 0.0)
+    price = _to_float(price, 0.0)
+    if qty <= 0.0 or price <= 0.0:
+        return
+    _STATE["open_buys"][(day, _bare(symbol))] = {
+        "qty": qty, "price": price, "short": str(short or ""), "at": _now_ts()}
+
+
+def _open_buys_release(day, symbol):
+    _STATE["open_buys"].pop((day, _bare(symbol)), None)
+
+
+def _open_buys_settle(day, orders):
+    """Drop entries the counter has proved dead.
+
+    Two proofs, both required: the symbol HAS a row today (so "not visible yet"
+    is not evidence), and no row of it is still working. A grace window covers
+    the seconds between _place and the table, and the case where the row never
+    lands at all. Same posture as _reconcile_session_intents -- do NOT simplify
+    this to `if not rows: release`, that drops the reservation in the first two
+    seconds after the order, which is exactly when it is needed.
+    """
+    grace = _to_float(PARAMS.get("open_buys_grace_sec"), 0.0)
+    seen = {}
+    for row in orders or []:
+        sym = _bare((row or {}).get("symbol"))
+        if sym:
+            seen.setdefault(sym, []).append(row or {})
+    now = _now_ts()
+    for key in list((_STATE.get("open_buys") or {}).keys()):
+        entry_day, sym = key
+        if entry_day != day:
+            _STATE["open_buys"].pop(key, None)
+            continue
+        rows = seen.get(sym)
+        if rows:
+            if not any(r.get("terminal") is False for r in rows):
+                _STATE["open_buys"].pop(key, None)
+            continue
+        entry = _STATE["open_buys"].get(key) or {}
+        if grace > 0.0 and now - _to_float(entry.get("at"), 0.0) >= grace:
+            _STATE["open_buys"].pop(key, None)
+
+
+def _open_buys_merge(day, counter_rows):
+    """Counter rows + journal, one row per symbol, MAX of the two amounts.
+
+    Both sides are folded to AMOUNT before the comparison. The counter side is
+    (shares, price) and the journal side is (qty, price); comparing a share
+    count against a money amount would silently let the smaller unit win, and
+    the two are not the same ticket anyway -- they describe the SAME order, so
+    the rule is MAX, never SUM.
+    """
+    loose = []
+    by_symbol = {}
+    for row in counter_rows or []:
+        row = dict(row or {})
+        sym = str(row.get("symbol") or "")
+        if not sym:
+            # No symbol: it cannot be merged with anything, but it must NOT be
+            # dropped -- an unattributed working buy still occupies money.
+            # Keep it verbatim so every consumer sees the original shape.
+            loose.append(row)
+            continue
+        slot = by_symbol.get(sym)
+        if slot is None:
+            by_symbol[sym] = row
+            continue
+        # Two working tickets on the SAME symbol: within one source the money
+        # adds up (that is two real orders, not one ticket seen twice). Fold
+        # BOTH sides to AMOUNT first: a sized row is (shares, price) while an
+        # unreadable one already carries (amount, 1.0) -- summing "shares"
+        # across those two units would multiply the money by the share price.
+        slot_amt = float(slot.get("remain") or 0.0) * float(slot.get("price") or 0.0)
+        row_amt = float(row.get("remain") or 0.0) * float(row.get("price") or 0.0)
+        total = slot_amt + row_amt
+        by_symbol[sym] = {"symbol": sym, "qty": total, "remain": total, "price": 1.0}
+    for (entry_day, sym), entry in (_STATE.get("open_buys") or {}).items():
+        if entry_day != day:
+            continue
+        amount = float((entry or {}).get("qty") or 0.0) * float((entry or {}).get("price") or 0.0)
+        slot = by_symbol.get(sym)
+        current = 0.0 if slot is None else float(slot.get("remain") or 0.0) * float(slot.get("price") or 0.0)
+        if amount <= current:
+            continue
+        # The journal amount wins: one row worth exactly that money. price=1.0
+        # keeps `remain * price` equal to the amount the callers read.
+        by_symbol[sym] = {"symbol": sym, "qty": amount, "remain": amount, "price": 1.0}
+    return loose + list(by_symbol.values())
+
+
 def _pending_buy_rows(orders):
     """Open BUY orders that still reserve budget, in rules_sizing row shape.
 
@@ -1293,10 +1452,30 @@ def _pending_buy_rows(orders):
         qty = float((row or {}).get("qty") or 0.0) - float((row or {}).get("traded") or 0.0)
         price = float((row or {}).get("price") or 0.0)
         if qty <= 0.0 or price <= 0.0:
+            # A fully traded row (qty>0, price>0, remain 0) is genuinely empty;
+            # only a row whose SIZE FIELDS are unreadable must reserve. That
+            # distinction comes from _live_orders, which sees the raw object.
+            if not bool((row or {}).get("size_unknown")):
+                continue
+            # 2026-11-26 P0: DO NOT DROP. A working buy whose size cannot be
+            # read still occupies money -- the counter has frozen it (live
+            # 09:33:05: cash 81366 -> 61777 while this list stayed empty).
+            # Reserve the single-order cap, which is the most this ticket can
+            # consume; over-reserving only refuses buys, under-reserving is
+            # exactly the 39,198 overshoot this exists to stop. If even the cap
+            # is unreadable the build gate g10 has already refused to publish.
+            cap = _to_float(PARAMS.get("order_amount_cap"), 0.0)
+            if cap <= 0.0:
+                cap = _to_float(PARAMS.get("min_order_amount"), 0.0)
+            if cap <= 0.0:
+                continue
+            out.append({"symbol": _bare((row or {}).get("symbol")),
+                        "qty": cap, "remain": cap, "price": 1.0,
+                        "size_unknown": True})
             continue
         out.append({"symbol": _bare((row or {}).get("symbol")),
                     "qty": qty, "remain": qty, "price": price})
-    return out
+    return _open_buys_merge(day_key(now_cn()), out)
 
 
 def _reconcile_session_intents(orders, day):
@@ -1364,6 +1543,7 @@ def _reconcile_session_intents(orders, day):
             _STATE["sent"].discard((day, sym, short))
         _STATE["buy_intents"].discard((day, sym))
         _STATE["buy_amounts"].pop((day, sym), None)
+        _open_buys_release(day, sym)
         labels = sorted(short for short in shorts if short)
         released.append(labels[0] if labels else _bare(sym))
     if released:
@@ -3462,7 +3642,8 @@ def _flow_readout():
     side = _STATE.get("side_policy_last") or {}
     _log("flow vol_state=%s r_yest=%s r_ma5=%s src=%s reason=%s market_delta=%s sectors=%d "
          "sector_hit=%d/%d state=%s pos_rel=%.3f decision=%s qwhy=%s "
-         "side mode=%s level=%s slope=%s gap=%s tgt=%s left=%s right=%s new=%s add=%s latch=%s ramp=%s" % (
+         "side mode=%s level=%s slope=%s gap=%s tgt=%s left=%s right=%s new=%s add=%s latch=%s "
+         "ramp=%s ramp_src=%s pmrel=%s mdelta=%s dsrc=%s" % (
              vol.get("vol_state") or "neutral",
              "na" if vol.get("r_yest") is None else "%.4f" % float(vol.get("r_yest")),
              "na" if vol.get("r_ma5") is None else "%.4f" % float(vol.get("r_ma5")),
@@ -3487,7 +3668,19 @@ def _flow_readout():
              side.get("latch_active") if side.get("latch_active") is not None else "na",
              # D7: the cell that released today's target (ramp_off when D7 is off).
              "na" if side.get("mode") not in ("bull", "bear") else
-             "%.2f" % side_time_ramp(PARAMS, side, _hhmm_now(), _now_ts())))
+             "%.2f" % side_time_ramp(PARAMS, side, _hhmm_now(), _now_ts()),
+             # SIDE-PM-GATE 2026-11-26: which cell produced that ramp. "waiting for
+             # data" (ramp_bear_am_pm_pending) and "bad signal" (ramp_bear_am with a
+             # latch) need different fixes; one number cannot tell them apart.
+             "na" if side.get("mode") not in ("bull", "bear") else
+             side_time_ramp_src(PARAMS, side, _hhmm_now(), _now_ts()),
+             # 1 only when the 13:00 tier was confirmed by data (not by the clock).
+             1 if side.get("pm_release") else 0,
+             # SIDE-FLOW-PROXY 2026-11-26: the sample the side policy actually used.
+             # A zero is a LEGAL neutral reading, so the source cell below is what
+             # says whether a reading existed at all.
+             "na" if side.get("market_delta") is None else "%.4f" % float(side.get("market_delta")),
+             side.get("delta_source") or "-"))
 
 
 def _spent_buy_amount(orders, buy_prefixes, day):
@@ -3960,7 +4153,7 @@ def _probe_cash_due():
     return (seq - 1) % _PROBE_ROUND_EVERY == 0 and not _STATE.get("cash_probe_done")
 
 
-def _probe_cash_line(short, amount, why, note, ctx, params):
+def _probe_cash_line(short, amount, why, note, ctx, params, pending_rows=None):
     """CASH-PROBE readout (read-only): name the exact sizing verdict and the
     money caps it was built from, so 'sizing_amount_unavailable' stops being an
     opaque reason. Marks done for this round via the caller's flag."""
@@ -3968,7 +4161,12 @@ def _probe_cash_line(short, amount, why, note, ctx, params):
     cap = ""
     basis = ""
     try:
-        sized_view = _sizing_view(ctx, _STATE.get("cash_probe_positions") or {}, None)
+        # 2026-11-26 P0: pass the REAL pending list. It used to be None, so
+        # `pend=` always printed 0 and a reader could not tell "nothing working"
+        # from "the probe cannot see it" -- exactly the confusion that hid the
+        # 2026-11-26 overshoot.
+        sized_view = _sizing_view(ctx, _STATE.get("cash_probe_positions") or {},
+                                  pending_rows)
         names = buy_size_caps(params, sized_view)
         cap = ",".join("%s=%s" % (k, "na" if v is None else "%.0f" % float(v))
                        for k, v in sorted(names.items()))
@@ -4890,6 +5088,10 @@ def run_round(ContextInfo, moment):
     # blocking its symbol and stop being charged to today's budget, no matter
     # who cancelled it. Runs BEFORE the budget view is built.
     _reconcile_session_intents(orders, day_key(moment))
+    # 2026-11-26 P1: the process-local buy journal follows the same day key and
+    # is settled against the counter every round (two proofs, see the function).
+    _open_buys_roll(day_key(moment))
+    _open_buys_settle(day_key(moment), orders)
     positions = _positions()
     # P0-A (2026-11-17): whole-market subscribe ran in init; for builds where only
     # per-symbol works, subscribe the held names here (once/day) so the sell legs
@@ -4926,9 +5128,16 @@ def run_round(ContextInfo, moment):
     # empty (or unreadable). Without a readout those two states are indistinguishable
     # from the log -- and "no positions" versus "table refused" lead to opposite
     # conclusions. One short line per round names both tables and both money rows.
-    _log("views pos=%s ord=%d raw=%s kept=%s cash=%s eq=%s" % (
+    # 2026-11-26 P0: `ord=` counts ROWS, not readable sizes. A working buy whose
+    # size fields have not been filled in yet is reserved at the single-order cap,
+    # so szunk>0 means today's spend is systematically below what the caps allow
+    # (deliberate fail-closed). Non-zero here is the reading that explains it.
+    szunk = sum(1 for row in orders
+                if row.get("terminal") is False and row.get("size_unknown")
+                and str(row.get("side") or "") != "sell")
+    _log("views pos=%s ord=%d raw=%s kept=%s szunk=%s cash=%s eq=%s" % (
         "na" if positions is None else len(positions), len(orders),
-        _STATE.get("order_raw", "na"), _STATE.get("order_kept", "na"),
+        _STATE.get("order_raw", "na"), _STATE.get("order_kept", "na"), szunk,
         "na" if cash_raw is None else "%.0f" % cash_raw,
         "na" if total is None else "%.0f" % total))
     # The count alone cannot answer "did the 13:0x orders actually fill?" -- a
@@ -5338,6 +5547,25 @@ def run_round(ContextInfo, moment):
             # order would rest above the market and lift the ask immediately.
             new_price = None
             if str(PARAMS.get("entry_price_mode") or "") == "vwap_pullback":
+                pct = float(PARAMS.get("vwap_pullback_pct", 0.0))
+                target = vwap * (1.0 - pct / 100.0)
+                # 2026-11-26 P2: min(target, last) turned "wait for a 0.7% dip"
+                # into "buy whatever the falling price is". When the market is
+                # already BELOW the pullback target, the dip has run past us --
+                # skip this round instead of lifting the ask into a collapse
+                # (live: 002009 bought at 14.01, target 14.03, -2.1% an hour
+                # later). Default ON; an explicit false restores the old cap.
+                # The comparison is against the MARKET price, not the signal's
+                # limit: a signal limit that already sits under the target is a
+                # better entry, not a chase (replay fixtures carry price=9.7
+                # with last=10.0 -- blocking that would refuse every patient
+                # limit order and only keep the ones that chase).
+                _last = _to_float(ctx.get("last_price"), None)
+                if PARAMS.get("entry_pullback_chase_guard", True) and _last is not None \
+                        and target > 0.0 and _last <= target:
+                    summary["skipped"].append({"short": short,
+                                               "reason": "vwap_pullback_passed"})
+                    continue
                 new_price = _pullback_limit_price(vwap, price)
             if new_price and new_price < price:
                 lot = float(PARAMS.get("lot_size") or 0.0)
@@ -5406,7 +5634,7 @@ def run_round(ContextInfo, moment):
                 # round at the first new-buy candidate: 73 aborts on 2026-11-19, zero
                 # orders all day, and the sell legs of the remaining symbols were cut
                 # off too. The baked strategy has exactly one parameter source: PARAMS.
-                _probe_cash_line(short, sized_amount, why, note, ctx, PARAMS)
+                _probe_cash_line(short, sized_amount, why, note, ctx, PARAMS, pending_rows)
             if sized_amount is None:
                 summary["skipped"].append({"short": short, "reason": why})
                 continue
@@ -5488,6 +5716,12 @@ def run_round(ContextInfo, moment):
                     # session registry, not the seconds-late ORDER table.
                     _STATE["buy_intents"].add((day, symbol))
                     _STATE["buy_amounts"][(day, symbol)] = session_amount + float(signal.get("amount", 0.0))
+                    # 2026-11-26 P1: also reserve in the process journal. The
+                    # ORDER table is seconds late AND can show a row with no
+                    # size, so the counter alone let a second signal spend the
+                    # same money (live 09:33: 39,198 against a 21,173 target).
+                    _open_buys_record(day, symbol, signal.get("qty"),
+                                      signal.get("price"), short)
                 # 2026-11-13: reserve this send IMMEDIATELY for the next symbol
                 # in the same round (the counter ORDER table is seconds late).
                 placed_amount = float(signal.get("amount", 0.0))

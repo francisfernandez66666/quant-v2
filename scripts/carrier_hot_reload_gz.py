@@ -1274,9 +1274,13 @@ def runtime_side_policy_enabled():
 def side_policy_digest(snapshot):
     if not isinstance(snapshot, dict) or not snapshot.get("day"):
         return ""
+    # §SIDE-PM-GATE 2026-11-26: `pm_release` must be part of the digest, otherwise
+    # the 13:00 false->true flip never changes the sha and the box keeps the AM
+    # ramp until the next regular round (or forever, on a quiet afternoon).
     body = {k: snapshot.get(k) for k in (
         "day", "enabled", "mode", "level", "allow_new", "allow_add",
-        "target_multiplier", "left_weight", "right_weight", "freshness_epoch", "reason")}
+        "target_multiplier", "left_weight", "right_weight", "freshness_epoch",
+        "pm_release", "reason")}
     latch = snapshot.get("latch") or {}
     body["latch"] = {k: latch.get(k) for k in ("kind", "until", "reason")}
     return hashlib.sha256(json.dumps(body, ensure_ascii=True, sort_keys=True).encode()).hexdigest()[:16]
@@ -1453,10 +1457,13 @@ def early_retry_side_policy(request, now):
         print("HOTRELOAD_SIDE_POLICY_REBAKE request_id=%s version=%s reason=latch_mismatch" % (
             req_id, version))
         return None
+    # §SIDE-POLICY-PENDING 2026-11-26 (plan 19.7 item 1): pending is a ONE-KEY
+    # binding, not an accumulator. Only the id currently named in the req file can
+    # ever be reaped/retried, so a stale key would linger forever and make the
+    # read-out look like a stuck request.
     pending = _read_json(SIDE_POLICY_PENDING, {}) or {}
-    if pending.get(req_id) != version:
-        pending[req_id] = version
-        _atomic_json(SIDE_POLICY_PENDING, pending)
+    if pending != {req_id: version}:
+        _atomic_json(SIDE_POLICY_PENDING, {req_id: version})
         print("HOTRELOAD_SIDE_POLICY_REBIND request_id=%s version=%s" % (req_id, version))
     # An applied ACK may have arrived before this rebind; consume it before SSH.
     if reap_side_policy_requests(now):
@@ -1841,11 +1848,10 @@ def _main_impl():
         ssh_intraday_trigger(ver)
     # §SIDE-POLICY：13:00 加急发布绑定 request_id→version，并立即拉盒子；失败保留 req 重试。
     if side_request:
-        pending = _read_json(SIDE_POLICY_PENDING, {}) or {}
         req_id = str(side_request.get("request_id") or "")
         if req_id:
-            pending[req_id] = ver
-            _atomic_json(SIDE_POLICY_PENDING, pending)
+            # §SIDE-POLICY-PENDING 2026-11-26 (plan 19.7 item 1): one key only.
+            _atomic_json(SIDE_POLICY_PENDING, {req_id: ver})
         if not ssh_intraday_trigger(ver):
             print("HOTRELOAD_SIDE_POLICY_SSH_FAIL request_id=%s version=%s" % (req_id, ver))
             return 3

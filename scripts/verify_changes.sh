@@ -20696,7 +20696,7 @@ grep_q "def gate_sandbox_loads" BLT F || fail173 "g7 装载自证不见了（五
 grep_q "def gate_sandbox_imports" BLT F || fail173 "g6 沙箱导入闸不见了"
 grep_q "def gate_pported_short_codes_unique" BLT F || fail173 "g8 短码唯一闸不见了（两条规则共用一个备注码＝第一条永久压住第二条）"
 grep_q "def gate_fail_closed_params" BLT F || fail173 "g10 fail-closed 参数闸不见了：11-16 实盘就是带着缺 session_windows 的 v38 开盘零成交（g9 只管移植模块声明的旋钮，这些顶层键没有声明腿）"
-grep_q 'FAIL_CLOSED_PARAMS = ("session_windows", "buy_confirm_rounds", "buy_confirm_min_gap_sec")' BLT F || fail173 "g10 的 fail-closed 键表变了：载体直接读且缺了就拒单的键必须逐枚在册"
+grep_q 'FAIL_CLOSED_PARAMS = ("session_windows", "buy_confirm_rounds", "buy_confirm_min_gap_sec",' BLT F || fail173 "g10 的 fail-closed 键表变了：载体直接读且缺了就拒单的键必须逐枚在册"
 grep_q 'fail_closed_params_empty=session_windows' BLT F || fail173 "g10 只查键存在不查空列表：session_windows=[] 与缺键同样是 fail-closed 全拒"
 grep_q '("g10_fail_closed_params", gate_fail_closed_params' BLT F || fail173 "g10 闸没注册进闸表（函数写了但没跑＝摆设）"
 grep_q 'SANDBOX_ALLOWED_IMPORTS = {"builtins", "datetime", "hashlib", "math", "time"}' BLT F || fail173 "沙箱允许导入面与登记值不一致（这里唯一可放宽的是纯算术 math；os/sys/sqlite3/网络一律不许进）"
@@ -23710,7 +23710,7 @@ grep -qF 'd1d_sfx=%d' qmt_gateway/qmt_internal_strategy.py || fail203 "探针没
 CNT203=$((CNT203 + 1))
 # 2026-11-19：这行读数在 §213 批补了 raw/kept 两栏（ORDER 表"读不到"与"读到 0 行"原本同形），
 # 锁随形同步——判据还是那件事（一行同时点名两张表与两行钱），不是放松。
-grep -qF '_log("views pos=%s ord=%d raw=%s kept=%s cash=%s eq=%s"' qmt_gateway/qmt_internal_strategy.py \
+grep -qF '_log("views pos=%s ord=%d raw=%s kept=%s szunk=%s cash=%s eq=%s"' qmt_gateway/qmt_internal_strategy.py \
 	|| fail203 "缺柜台视图读数（空表与读不了分不出来）"
 CNT203=$((CNT203 + 1))
 grep -qF '"na" if positions is None else len(positions)' qmt_gateway/qmt_internal_strategy.py \
@@ -27143,7 +27143,7 @@ missing=[]
 for path, needle, label in checks:
     if needle not in Path(path).read_text(encoding='utf-8'):
         missing.append(label+':'+path)
-keys='side_policy_enabled side_flow_strong_delta side_flow_slope_step side_flow_pm_delta side_gap_high_pct side_gap_low_pct side_pm_index_drop_pct side_pm_index_rise_pct side_bear_target_l1 side_bear_target_l2 side_bull_target_l1 side_bull_target_l2 side_bull_target_l3 side_weight_lo side_weight_hi side_left_score_floor side_left_score_margin side_left_stable_rounds side_left_stable_gap_sec side_left_stable_max_drop side_pm_check_from side_pm_block_until side_bucket_minutes side_policy_ttl_sec side_freshness_heartbeat_sec side_right_rebuy_enabled side_right_rebuy_margin'.split()
+keys='side_policy_enabled side_flow_strong_delta side_flow_slope_step side_flow_pm_delta side_gap_high_pct side_gap_low_pct side_pm_index_drop_pct side_pm_index_rise_pct side_bear_target_l1 side_bear_target_l2 side_bull_target_l1 side_bull_target_l2 side_bull_target_l3 side_weight_lo side_weight_hi side_left_score_floor side_left_score_margin side_left_stable_rounds side_left_stable_gap_sec side_left_stable_max_drop side_pm_check_from side_pm_block_until side_bucket_minutes side_policy_ttl_sec side_freshness_heartbeat_sec side_right_rebuy_enabled side_right_rebuy_margin side_flow_proxy_enabled side_flow_proxy_after_rounds side_inflow_reversal_enabled side_inflow_vol_min side_inflow_fade_delta'.split()
 params=json.loads(Path('qmt_gateway/local_executor_params.json').read_text())['params']
 missing += ['param:'+k for k in keys if k not in params]
 for unit in ('quant-carrier-side-policy.path','quant-carrier-side-policy.service','quant-carrier-side-policy-retry.timer'):
@@ -27430,7 +27430,8 @@ go test ./internal/signalctl -run 'TestSideTimeRampAMBand' -count=1 >/dev/null 2
 CNT240=$((CNT240 + 1))
 GO240_RC=0
 go test ./internal/signalctl -run 'TestSideTimeRampPMWithoutLatch' -count=1 >/dev/null 2>&1 || GO240_RC=$?
-[ "$GO240_RC" = "0" ] || fail240 "13:00 无 latch 未释放（§240 ④）"
+# 2026-11-26 §SIDE-PM-GATE：13:00 不是到点就放——先确认（PMRelease）再放 PM 档。
+[ "$GO240_RC" = "0" ] || fail240 "13:00 数据确认 + 无 latch 未释放 PM 档（§240 ④）"
 CNT240=$((CNT240 + 1))
 GO240_RC=0
 go test ./internal/signalctl -run 'TestSideTimeRampPMChecksLatchAndHoldsAM' -count=1 >/dev/null 2>&1 || GO240_RC=$?
@@ -27688,4 +27689,541 @@ PY
 
 [ "$B242_FAILED" = "0" ] || exit 1
 echo "ok - §242 §COLD-START-AND-VOL 锁通过（冷启动 bear 允许新仓/开盘+数据齐双烘入/缩量0.95/开盘35%动态仓位，累计判定点 ${CNT242}）"
+echo ""
+echo "==> 243 §BUY-PENDING-ENTRY（2026-11-26：在途买单占额度 / 进程内账 / 确认窗跨度 / 追刀闸）..."
+B243_FAILED=0
+fail243() {
+	echo "--- FAIL: §243 $*"
+	FAIL=1
+	B243_FAILED=1
+}
+CNT243=0
+
+# ① P0-a 行上标 size_unknown（静态 + 行为）
+CNT243=$((CNT243 + 1))
+grep -qF '"size_unknown": bool(qty <= 0.0 or price <= 0.0),' \
+	qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "ORDER 行不再标 size_unknown（读不到与真的是 0 又同形了）"
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_pending_budget_20261126.py -q \
+	-k 'size_unknown_is_marked' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "size_unknown 行为腿未过（§243 ①）"
+
+# ② P0-b 尺寸读不到必须预占（静态 + 行为 + 负锁）
+CNT243=$((CNT243 + 1))
+python3 - <<'PY' || fail243 "尺寸读不到又被丢掉了（§243 ②）"
+import re, pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"def _pending_buy_rows\(orders\):.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+assert body, "function not found"
+# 预占三件必须同时在场：单笔帽、兜底底限、以及 size_unknown 标记。
+assert 'PARAMS.get("order_amount_cap")' in body
+assert 'PARAMS.get("min_order_amount")' in body
+assert '"size_unknown": True' in body
+# 负锁：`qty <= 0.0 or price <= 0.0` 之后紧跟着裸 continue 就是回潮。
+assert not re.search(r"if qty <= 0\.0 or price <= 0\.0:\s*\n\s*continue", body)
+PY
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_pending_budget_20261126.py -q \
+	-k 'unreadable_size_reserves_the_cap' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "预占行为腿未过（§243 ②）"
+
+# ③ P0-c 尺寸漂移诊断（静态）
+CNT243=$((CNT243 + 1))
+grep -qF '_warn_once("order_size_drift",' qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "缺尺寸漂移诊断（下次只剩一个猜测）"
+grep -qF 'repr(getattr(first, "m_nOrderVolume", None))' qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "诊断没打字段家族（探针价值为零）"
+
+# ④ P0-d cash_probe 的 pend= 必须是真值（静态 + 行为）
+CNT243=$((CNT243 + 1))
+python3 - <<'PY' || fail243 "cash_probe 仍传 None（pend= 长期骗人，§243 ④）"
+import re, pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"def _probe_cash_line\(.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+assert body, "_probe_cash_line not found"
+assert "pending_rows=None" in body, "signature not updated"
+assert "pending_rows)" in body
+assert '_STATE.get("cash_probe_positions") or {}, None)' not in body
+PY
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_pending_budget_20261126.py -q \
+	-k 'cash_probe_reports_pending' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "cash_probe 行为腿未过（§243 ④）"
+
+# ⑤ P1-a 进程内账在册且按日重置
+CNT243=$((CNT243 + 1))
+grep -qF '"open_buys": {},' qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "缺 open_buys 进程内账"
+grep -qF 'def _open_buys_roll(day):' qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "缺 _open_buys_roll（跨日不清 ⇒ 昨天的单占今天的钱）"
+grep -qF 'if _STATE.get("open_buys_day") != day:' qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "进程内账未按交易日重置"
+
+# ⑥ P1-b 下单即记（锚在买入成功块内）
+CNT243=$((CNT243 + 1))
+python3 - <<'PY' || fail243 "下单后没有写进程内账（§243 ⑥）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+start = s.index("def run_round(ContextInfo, moment):")
+body = s[start:]
+place = body.index("_open_buys_record(day, symbol,")
+sent = body.index('_STATE["buy_intents"].add((day, symbol))')
+if not place > sent:
+    raise SystemExit("record is not after the successful-send block")
+# 必须在同一个 `if ok:` 分支内：T 腿不能记账（它有自己的一本账）。
+assert 'if intent != "t_leg":' in body[sent - 400:place]
+PY
+
+# ⑦ P1-c 跨来源取 max，不许求和（行为腿）
+CNT243=$((CNT243 + 1))
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_pending_budget_20261126.py -q \
+	-k 'journal_and_counter_take_max' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "柜台+进程内账相加了（同一张单算两遍，§243 ⑦）"
+
+# ⑧ P1-d 释放必须两条证明
+CNT243=$((CNT243 + 1))
+python3 - <<'PY' || fail243 "释放判据不完整（§243 ⑧）"
+import re, pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"def _open_buys_settle\(day, orders\):.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+assert body
+# 有行才算证据；没有行必须等宽限。
+assert "rows = seen.get(sym)" in body
+assert "if rows:" in body
+assert 'if grace > 0.0 and now - _to_float(entry.get("at"), 0.0) >= grace:' in body
+# 负锁：`if not rows:` 直接 pop 会把下单后头两秒的预占放掉。
+assert not re.search(r"if not rows:\s*\n\s*_STATE\[\"open_buys\"\]\.pop", body)
+PY
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_pending_budget_20261126.py -q \
+	-k 'settle_needs_counter_proof' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "释放行为腿未过（§243 ⑧）"
+
+# ⑨ P1-e 撤单释放同批清账
+CNT243=$((CNT243 + 1))
+grep -qF '_open_buys_release(day, sym)' qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "手动撤单释放没清进程内账（钱一直占着）"
+
+# ⑩ P2-a 确认窗跨度在册（静态 + 负锁）
+CNT243=$((CNT243 + 1))
+python3 - <<'PY' || fail243 "确认窗仍按轮数（§243 ⑩）"
+import re, pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+m = re.search(r"def _buy_confirmed\(symbol, now_ts\):.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+assert body
+assert 'PARAMS.get("buy_confirm_min_span_sec")' in body
+assert 'PARAMS.get("buy_confirm_reset_sec")' in body
+assert 'confirm_span_%d_of_%d' in body
+assert 'confirm_restart' in body
+# 负锁只看代码行：注释里提到旧写法是解释，不是回潮。
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+assert "del seen[:-rounds]" not in code
+PY
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_entry_guard_20261126.py -q \
+	-k 'span_not_rounds' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "确认窗行为腿未过（§243 ⑩）"
+
+# ⑪ P2-a' 断档重置（行为腿）
+CNT243=$((CNT243 + 1))
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_entry_guard_20261126.py -q \
+	-k 'stale_signal_restarts' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "断档后仍按旧观察放行（§243 ⑪）"
+
+# ⑫ P2-b 追刀闸（静态 + 行为 + 负锁）
+CNT243=$((CNT243 + 1))
+python3 - <<'PY' || fail243 "追刀闸缺失或位置错（§243 ⑫）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+start = s.index("def run_round(ContextInfo, moment):")
+body = s[start:]
+guard = body.index('reason": "vwap_pullback_passed"')
+call = body.index("_pullback_limit_price(vwap, price)")
+if not guard < call:
+    raise SystemExit("guard must run BEFORE the limit price is computed")
+assert 'PARAMS.get("entry_pullback_chase_guard", True)' in body
+PY
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_entry_guard_20261126.py -q \
+	-k 'below_target_is_skipped' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "追刀闸行为腿未过（§243 ⑫）"
+
+# ⑬ 4 枚旋钮三处同源
+CNT243=$((CNT243 + 1))
+python3 - <<'PY' || fail243 "旋钮三处不同源（§243 ⑬）"
+import json, pathlib, re
+p = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
+want = {"open_buys_grace_sec": 120.0, "buy_confirm_min_span_sec": 180.0,
+        "buy_confirm_reset_sec": 300.0, "entry_pullback_chase_guard": True}
+for k, v in want.items():
+    assert p.get(k) == v, (k, p.get(k), v)
+go = pathlib.Path("internal/config/carrier_knobs.go").read_text(encoding="utf-8")
+for name, lit in (("carrierOpenBuysGraceSec", "120.0"),
+                  ("carrierBuyConfirmMinSpanSec", "180.0"),
+                  ("carrierBuyConfirmResetSec", "300.0")):
+    assert re.search(r"%s\s*=\s*%s" % (name, re.escape(lit)), go), name
+assert re.search(r"carrierEntryPullbackChaseGuard\s*=\s*true", go)
+der = pathlib.Path("scripts/derive_carrier_params.py").read_text(encoding="utf-8")
+for k in want:
+    assert '("%s", ("%s",), None)' % (k, k) in der, k
+PY
+
+# ⑭ FAIL_CLOSED_PARAMS 与 views 两处旧锁同步
+CNT243=$((CNT243 + 1))
+grep -qF 'FAIL_CLOSED_PARAMS = ("session_windows", "buy_confirm_rounds", "buy_confirm_min_gap_sec",' \
+	scripts/build_local_executor.py || \
+	fail243 "g10 键表没扩（缺键的产物仍可发布）"
+grep -qF '"buy_confirm_min_span_sec", "buy_confirm_reset_sec",' scripts/build_local_executor.py || \
+	fail243 "g10 缺确认窗两键"
+grep -qF '"entry_pullback_chase_guard")' scripts/build_local_executor.py || \
+	fail243 "g10 缺追刀闸"
+grep -qF 'szunk=%s' qmt_gateway/qmt_internal_strategy.py || \
+	fail243 "views 读数没加 szunk（读不到与没有又同形）"
+
+# ⑮ 端到端复现今天的两轮（行为腿，最重要的一条）
+CNT243=$((CNT243 + 1))
+PY243_RC=0
+python3 -m pytest qmt_gateway/tests/test_internal_strategy_pending_budget_20261126.py -q \
+	-k 'replay_20261126_second_order_refused' >/dev/null 2>&1 || PY243_RC=$?
+[ "$PY243_RC" = "0" ] || fail243 "11-26 复现腿未过：第二笔仍能拿到满额（§243 ⑮）"
+
+[ "$B243_FAILED" = "0" ] || exit 1
+echo "ok - §243 §BUY-PENDING-ENTRY 锁通过（在途占额/进程内账/取max/释放证明/确认窗跨度/断档/追刀闸/三处同源/g10/端到端，累计判定点 ${CNT243}）"
+echo ""
+
+echo "==> 244 §SIDE-FLOW-PROXY / §SIDE-INFLOW-EARLY（2026-11-26：板块合计替补 / 净流入+放量早释）..."
+B244_FAILED=0
+fail244() {
+	echo "--- FAIL: §244 $*"
+	FAIL=1
+	B244_FAILED=1
+}
+CNT244=0
+
+# ① P3-a 样本带 delta，且写在所有分支之前
+CNT244=$((CNT244 + 1))
+python3 - <<'PY' || fail244 "样本 delta 丢了（flowValid 只能回头借 regime 的缓存值，§244 ①）"
+import re, pathlib
+s = pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+assert re.search(r"type sideFlowSample struct \{[^}]*\bDelta\s+float64", s, re.S)
+m = re.search(r"func \(s \*sideFlowState\) observe\(.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+assert body, "observe not found"
+# 赋值必须在**第一个分支**之前：换源分支会 return，晚一行就丢。
+i_assign = body.find("sample.Delta = marketDelta")
+i_first_if = body.find("if s.Last != nil && s.Last.Source != sample.Source")
+assert i_assign > 0 and i_first_if > i_assign, "delta assignment must precede the source-change branch"
+PY
+
+# ② P3-b 采样与两条腿解耦（唯一调用点 + 顺序）
+CNT244=$((CNT244 + 1))
+python3 - <<'PY' || fail244 "observe 仍绑在大盘腿分支里（§244 ②）"
+import re, pathlib
+s = pathlib.Path("internal/engine/engine.go").read_text(encoding="utf-8")
+m = re.search(r"func \(e \*Engine\) fillFlowMoney\(.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+assert body, "fillFlowMoney not found"
+assert body.count("sideFlow.observe(") == 0, "observe must live in sampleSideFlow only"
+i_sector = body.find("sectorFn()")
+i_sample = body.find("e.sampleSideFlow(")
+assert i_sample > 0 and i_sector > 0 and i_sample > i_sector, "sample must follow the sector leg"
+assert "sampleSideFlow(" in pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+PY
+
+# ③ P3-c 大盘腿失败必须切替补（静态 + 行为腿）
+CNT244=$((CNT244 + 1))
+grep -qF 'ProxyLocked = true' internal/engine/side_policy_flow.go || \
+	fail244 "替补不锁定（源抖动会反复清桶）"
+grep -qF 'e.sideFlow.ProxyMiss++' internal/engine/side_policy_flow.go || \
+	fail244 "替补缺连续失败计数"
+PY244_RC=0
+go test ./internal/engine -run 'TestSideFlowProxy' -count=1 >/dev/null 2>&1 || PY244_RC=$?
+[ "$PY244_RC" = "0" ] || fail244 "替补行为腿未过（§244 ③）"
+
+# ④ P3-d 源锁定后不切回（行为腿）
+CNT244=$((CNT244 + 1))
+PY244_RC=0
+go test ./internal/engine -run 'TestSideFlowProxyStaysLocked' -count=1 >/dev/null 2>&1 || PY244_RC=$?
+[ "$PY244_RC" = "0" ] || fail244 "锁定后又被大盘腿切回（桶历史被清空，§244 ④）"
+
+# ⑤ P3-e flowValid 由样本驱动（静态 + 负锁）
+CNT244=$((CNT244 + 1))
+python3 - <<'PY' || fail244 "flowValid 又借 regime 的有限性（§244 ⑤）"
+import re, pathlib
+s = pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+m = re.search(r"func \(e \*Engine\) updateSidePolicy\(.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+assert body, "updateSidePolicy not found"
+assert "sampleFresh :=" in body
+assert "flowValid = sampleFresh && !math.IsNaN(marketDelta)" in body
+# 负锁：不许出现"regime 有限就置 flowValid"的旧形状。
+assert not re.search(r"flowValid = last != nil && data\.IndexAmountIsCNY", body)
+# regime 的读取必须在 sampleFresh 之内（前面出现即回潮）。
+i_regime = body.find("regime.FlowMarketDelta")
+i_sample = body.find("sampleFresh :=")
+assert i_sample > 0 and (i_regime < 0 or i_regime > i_sample), "regime read precedes sample freshness"
+# §14.8：上午锚必须记来源，且只与同源样本比较（跨源差值会把 13:00 的 flowHit 判歪）。
+assert "MorningAnchorSource" in body, "anchor source not recorded"
+assert "morningSrc == last.Source" in body, "anchor compared across sources"
+PY
+
+# ⑥ P3-f 替补不写库（负锁）
+CNT244=$((CNT244 + 1))
+python3 - <<'PY' || fail244 "替补值被写进 flow_factor_daily（DB 列不再诚实，§244 ⑥）"
+import re, pathlib
+s = pathlib.Path("internal/engine/engine.go").read_text(encoding="utf-8")
+m = re.search(r"func \(e \*Engine\) fillFlowMoney\(.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+i_up = body.find("UpsertFlowMoneyOnly(")
+assert i_up > 0, "write point missing"
+head = body[:i_up]
+assert "sector_agg" not in head, "proxy label must not reach the DB write"
+assert "secPct, secDelta := aggregateSectorFlow(" in body, "sector pct must still come from aggregateSectorFlow"
+PY
+
+# ⑦ P3-g delta_source 三处到位且不进 sha
+CNT244=$((CNT244 + 1))
+grep -qF 'DeltaSource string `json:"delta_source,omitempty"`' internal/signalctl/side_policy.go || \
+	fail244 "State 缺 delta_source"
+grep -qF 'out["delta_source"] = st.DeltaSource' internal/server/flow_status.go || \
+	fail244 "读面没下发 delta_source"
+grep -qF 'out["market_delta_known"] = st.DeltaSource != ""' internal/server/flow_status.go || \
+	fail244 "读面缺 market_delta_known（0 会被读成中性）"
+# 前端也只认 known 标志，不许靠"数字等于 0"反推有没有读数。
+grep -qF 'side.market_delta_known === true' web/src/components/FlowFactorCard.jsx || \
+	fail244 "前端侧样本读面没认 market_delta_known（§14.5）"
+python3 - <<'PY' || fail244 "delta_source 进了 side_policy_digest（每次变化都重启盒子，§244 ⑦）"
+import re, pathlib
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+m = re.search(r"def side_policy_digest\(snapshot\):.*?\n\n", s, re.S)
+body = m.group(0) if m else ""
+assert body and "delta_source" not in body
+PY
+
+# ⑧ P4-a 早释判据在册（静态）
+CNT244=$((CNT244 + 1))
+python3 - <<'PY' || fail244 "早释判据缺件（§244 ⑧）"
+import pathlib
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+for needle in (
+    "in.VolSurgeDelta >= config.CarrierSideInflowVolMin()",
+    "in.MarketDelta >= config.CarrierSideInflowFadeDelta()",
+    "(!in.InflowFaded && strongIn && volSurge && indexOK)",
+    '"inflow_reversal_early"',
+    "func earlyRangeState(",
+):
+    assert needle in s, needle
+# 触发条件必须复用 strongIn，不许另写一遍表达式（同一判据两个漂移点）。
+assert "inflowEarly :=" not in s, "duplicate strong-inflow expression"
+# 维持分支必须只在 bear 上改写（不许把 bull 往下压）。
+assert "st.Mode == SidePolicyBear && !worsening" in s
+PY
+
+# ⑨ P4-b 当日一次（行为腿，engine 侧）
+CNT244=$((CNT244 + 1))
+PY244_RC=0
+go test ./internal/engine -run 'TestSideInflowUrgentOncePerDay' -count=1 >/dev/null 2>&1 || PY244_RC=$?
+[ "$PY244_RC" = "0" ] || fail244 "早释不是当日一次（会反复重启，§244 ⑨）"
+
+# ⑩ P4-c 回落闸 + 回落加急（行为腿 + 静态）
+CNT244=$((CNT244 + 1))
+PY244_RC=0
+go test ./internal/signalctl -run 'TestSideInflowFadeDropsBackToBear' -count=1 >/dev/null 2>&1 || PY244_RC=$?
+[ "$PY244_RC" = "0" ] || fail244 "回落闸失效（跌破 fade 仍释放，§244 ⑩）"
+go test ./internal/engine -run 'TestSideInflowFadeUrgentOncePerDay' -count=1 >/dev/null 2>&1 || PY244_RC=$?
+[ "$PY244_RC" = "0" ] || fail244 "回落加急不是当日一次（§244 ⑩）"
+python3 - <<'PY' || fail244 "回落加急缺件（§244 ⑩）"
+import pathlib
+s = pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+for needle in ("e.sideFlow.InflowFaded = true", "fadedNow = true",
+               'e.writeSideUrgentReq(now, "inflow_fade", "reversal", "15:00")'):
+    assert needle in s, needle
+PY
+
+# ⑪ P4-d latch 压过早释（行为腿）
+CNT244=$((CNT244 + 1))
+PY244_RC=0
+go test ./internal/signalctl -run 'TestSideInflowEarlyRespectsLatch' -count=1 >/dev/null 2>&1 || PY244_RC=$?
+[ "$PY244_RC" = "0" ] || fail244 "13:00 latch 被早释穿透（§244 ⑪）"
+
+# ⑫ P4-e 5 枚旋钮三处同源 + §239 键清单
+CNT244=$((CNT244 + 1))
+python3 - <<'PY' || fail244 "5 枚侧策略旋钮没三处同源（§244 ⑫）"
+import json, pathlib
+knobs = ["side_flow_proxy_enabled", "side_flow_proxy_after_rounds",
+         "side_inflow_reversal_enabled", "side_inflow_vol_min", "side_inflow_fade_delta"]
+derive = pathlib.Path("cmd/derive_carrier_params/main.go").read_text(encoding="utf-8")
+mapping = pathlib.Path("scripts/derive_carrier_params.py").read_text(encoding="utf-8")
+params = json.loads(pathlib.Path("qmt_gateway/local_executor_params.json").read_text())["params"]
+for k in knobs:
+    assert k in params, "params missing " + k
+    assert '"%s"' % k in derive, "derive missing " + k
+    assert '"%s"' % k in mapping, "mapping missing " + k
+# §239 的 side_* 键清单同批追加，否则那一段自己红。
+gate = pathlib.Path("scripts/verify_changes.sh").read_text(encoding="utf-8")
+i = gate.find("keys='side_policy_enabled")
+assert i > 0
+line = gate[i:gate.find("\n", i)]
+for k in knobs:
+    assert k in line, "§239 key list missing " + k
+PY
+
+# ⑬ pending 只保留当前 req（静态 + 负锁）
+CNT244=$((CNT244 + 1))
+python3 - <<'PY' || fail244 "pending 又变回累加（孤儿键永久驻留，§244 ⑬）"
+import re, pathlib
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+# 两处写入点都必须是"整键替换"（发布腿 ver / 重绑腿 version）。
+assert s.count("_atomic_json(SIDE_POLICY_PENDING, {req_id: ver})") == 1, "publish write is not replace-style"
+assert s.count("_atomic_json(SIDE_POLICY_PENDING, {req_id: version})") == 1, "rebind write is not replace-style"
+# 负锁：重绑腿不许写成累加；reap 里的 pop 回填是另一形态，不在此列。
+m = re.search(r"def early_retry_side_policy\(.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+assert body, "early_retry_side_policy not found"
+assert "pending[req_id] = version" not in body, "accumulating write is back (rebind)"
+PY
+
+[ "$B244_FAILED" = "0" ] || exit 1
+echo "ok - §244 §SIDE-FLOW-PROXY / §SIDE-INFLOW-EARLY 锁通过（样本带 delta/两腿解耦/替补锁定/不切回/样本驱动 flowValid/不写库/三处读面/早释判据/当日一次/回落加急/latch 优先/5 枚同源/pending 整键，累计判定点 ${CNT244}）"
+echo ""
+
+echo "==> 245 §SIDE-PM-GATE（2026-11-26 P5：13:00 档必须由数据齐全确认，不再到点自动放）..."
+B245_FAILED=0
+fail245() {
+	echo "--- FAIL: §245 $*"
+	FAIL=1
+	B245_FAILED=1
+}
+CNT245=0
+
+# ① 状态位与输入位在册（含 json 键名）
+CNT245=$((CNT245 + 1))
+python3 - <<'PY' || fail245 "PMRelease 字段缺件（§245 ①）"
+import re, pathlib
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+assert re.search(r"PMReleaseLatched\s+bool", s), "input flag missing"
+assert re.search(r'PMRelease\s+bool\s+`json:"pm_release,omitempty"`', s), "state flag/json missing"
+PY
+
+# ② 判据复用 side_ramp_pm_check_at，不写第二个 13:00
+CNT245=$((CNT245 + 1))
+python3 - <<'PY' || fail245 "pmGate 没复用 side_ramp_pm_check_at（§245 ②）"
+import re, pathlib
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+assert "pmGate := hhmmSide(in.Now) >= config.CarrierSideRampPMCheckAt()" in s
+m = re.search(r"pmGate := .*", s)
+assert m and "13:00" not in m.group(0), "second literal 13:00"
+# 三条读数 + 无 latch 必须同时在场（缺一条都会让"缺数"变成"释放"）。
+i = s.find("pmGate := hhmmSide(in.Now)")
+block = s[i:i + 700]
+for needle in ("st.Mode == SidePolicyBear || st.Mode == SidePolicyBull", "pmGate &&",
+               "in.PMReleaseLatched ||", "marketOK", "indexOK", "in.PMAnchorValid",
+               "!latchActiveSide(st.Latch, in.Now)", "st.PMRelease = true"):
+    assert needle in block, needle
+PY
+
+# ③ ramp 的 13:00 段要求 st.PMRelease，且 latch 判在前面（坏信号优先归因）
+CNT245=$((CNT245 + 1))
+python3 - <<'PY' || fail245 "13:00 档仍会到点自动放（§245 ③）"
+import re, pathlib
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+m = re.search(r"func SideTimeRampWithSource\(.*?\n\}", s, re.S)
+body = m.group(0) if m else ""
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+assert 'if !st.PMRelease {' in code, "PMRelease gate missing"
+assert '"ramp_bear_am_pm_pending"' in code and '"ramp_bull_am_pm_pending"' in code
+i_latch = code.find("latchActiveSide(st.Latch, now)")
+i_rel = code.find("if !st.PMRelease {")
+assert 0 < i_latch < i_rel, "latch must be judged before pm_release"
+PY
+
+# ④ 行为腿：未确认守上午档 / 已确认才放 PM / 三项缺一不放 / 粘性位跨冷启动与 fail-closed
+CNT245=$((CNT245 + 1))
+GO245_RC=0
+go test ./internal/signalctl -run 'TestSideTimeRampPMPendingHoldsAM|TestSideTimeRampPMWithoutLatch|TestSidePMGateNeedsAllThree|TestSidePMReleaseLatchedSticky|TestSidePMReleaseSurvivesColdStart|TestSidePMReleaseSurvivesFailClosed' \
+	-count=1 >/dev/null 2>&1 || GO245_RC=$?
+[ "$GO245_RC" = "0" ] || fail245 "13:00 档行为腿未过（§245 ④）"
+
+# ⑤ engine 侧：当日粘性 + 一次加急 + 只在 bear/bull 烘（静态）
+CNT245=$((CNT245 + 1))
+python3 - <<'PY' || fail245 "粘性/加急缺件（§245 ⑤）"
+import re, pathlib
+s = pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+assert re.search(r"PMReleaseLatched\s+bool", s), "latched flag missing"
+assert re.search(r"PMReleaseWritten\s+bool", s), "written flag missing"
+assert s.count('"pm_release"') == 1, "pm_release req reason must appear exactly once"
+assert 'e.writeSideUrgentReq(now, "pm_release", "reversal", "15:00")' in s
+assert "st.Mode == signalctl.SidePolicyBear || st.Mode == signalctl.SidePolicyBull" in s
+# 负锁：粘性位不许被写回 false（那会让 13:00 档在下午反复开关）。
+assert "PMReleaseLatched = false" not in s
+PY
+
+# ⑥ engine 行为腿：当日一次 / range 不烘 / 确认后不回落
+CNT245=$((CNT245 + 1))
+GO245_RC=0
+go test ./internal/engine -run 'TestSidePMReleaseUrgentOncePerDay|TestSidePMReleaseSkipsRangeMode|TestSidePMReleaseStaysLatched' \
+	-count=1 >/dev/null 2>&1 || GO245_RC=$?
+[ "$GO245_RC" = "0" ] || fail245 "P5 的 engine 行为腿未过（§245 ⑥）"
+
+# ⑦ 载体镜像：缺键 fail-closed，且来源名可分
+CNT245=$((CNT245 + 1))
+python3 - <<'PY' || fail245 "载体没要求 pm_release（§245 ⑦）"
+import re, pathlib
+s = pathlib.Path("qmt_gateway/rules_sizing.py").read_text(encoding="utf-8")
+m = re.search(r"def _side_ramp_of\(params, st, hhmm, intent\):.*?(?=\ndef )", s, re.S)
+body = m.group(0) if m else ""
+assert body, "_side_ramp_of not found"
+assert 'if not st.get("pm_release"):' in body
+assert '"am_pm_pending"' in body
+i_latch = body.find('if st.get("latch_active"):')
+i_rel = body.find('if not st.get("pm_release"):')
+assert 0 < i_latch < i_rel, "latch must be judged before pm_release (carrier)"
+PY
+PY245_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_sizing.py -q -k 'side_time_ramp_pm_pending or side_time_ramp_pm_without_latch' \
+	>/dev/null 2>&1 || PY245_RC=$?
+[ "$PY245_RC" = "0" ] || fail245 "载体 13:00 档行为腿未过（§245 ⑦）"
+
+# ⑧ digest 加 pm_release，delta_source 仍不进
+CNT245=$((CNT245 + 1))
+python3 - <<'PY' || fail245 "pm_release 没进 sha（盒子永远拿不到这一位，§245 ⑧）"
+import re, pathlib
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+m = re.search(r"def side_policy_digest\(snapshot\):.*?\n\n", s, re.S)
+body = m.group(0) if m else ""
+assert body, "side_policy_digest not found"
+assert '"pm_release"' in body
+assert "delta_source" not in body
+PY
+
+# ⑨ 读面两处（云端 /api/status + 盒上小时行）
+CNT245=$((CNT245 + 1))
+grep -qF 'out["pm_release"] = st.PMRelease' internal/server/flow_status.go || \
+	fail245 "云端读面没下发 pm_release（§245 ⑨）"
+grep -qF 'pmrel=' qmt_gateway/qmt_internal_strategy.py || \
+	fail245 "盒上小时行没有 pmrel=（§245 ⑨）"
+
+# ⑩ 冷启动分支只许带粘性位，不许自己算释放（缺数不许变成释放）
+CNT245=$((CNT245 + 1))
+python3 - <<'PY' || fail245 "冷启动分支自己算了 PMRelease（缺数变成释放，§245 ⑩）"
+import pathlib
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+i = s.find("cold := SidePolicyState{")
+assert i > 0, "cold start block not found"
+block = s[i:s.find("return cold", i)]
+# 只许照抄上一轮的粘性位；不许在这里出现任何读数判据或直接置 true。
+assert "cold.PMRelease = in.PMReleaseLatched" in block, "sticky bit not carried"
+assert "cold.PMRelease = true" not in block, "cold start must not release the PM tier"
+assert "marketOK" not in block and "indexOK" not in block, "cold start must not derive release"
+PY
+
+[ "$B245_FAILED" = "0" ] || exit 1
+echo "ok - §245 §SIDE-PM-GATE 锁通过（字段在册/判据复用/ramp 要求确认位/latch 优先/粘性+一次加急/载体镜像/digest 含 pm_release/两处读面/冷启动只带粘性，累计判定点 ${CNT245}）"
 echo ""

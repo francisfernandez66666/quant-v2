@@ -142,6 +142,9 @@ type Engine struct {
 	// 可注入的指数量额序列源（nil→marketAPI.IndexAmountSeries）；单测注入桩数据离线跑通。
 	// today=北京今日（YYYY-MM-DD）：取数层据此把"末根非今日"的断更源判失败、继续降级。
 	indexAmountSeriesFn func(n int, today string) ([]data.IndexAmountDay, string, error)
+	// §SIDE-FLOW-PROXY 替补腿总闸的可注入读数（nil→config 编译期常量 true）。
+	// 仅测试注入 false 钉住"关掉替补腿 ⇒ 大盘腿失败即不采样"的旧行为退路；生产不写这个字段。
+	sideProxyEnabledFn func() bool
 	// §FLOW-MONEY 资金流腿缓存（60s TTL，2026-11-19 云端实现）：大盘 delta 全局（写
 	// flow_factor_daily 走 Regime），板块 delta 逐票（内存 map 按行业名查，写 sector_flow_daily 留痕）。
 	flowMoneyAt    time.Time          // 上次资金流取数时刻（TTL 判据）
@@ -7658,6 +7661,8 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 		}
 	}
 	var mktPct, mktDelta *float64
+	mktSample := sideFlowSample{}
+	mktOK := false
 	if fd, err := moneyFlowFn(); err == nil && fd != nil {
 		if len(fd.Date) < 10 || fd.Date[:10] != today {
 			log.Printf("[engine] §FLOW-MONEY 大盘 fflow 日期非今日（%s），弃权", fd.Date)
@@ -7668,9 +7673,10 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 				if !math.IsNaN(d) {
 					pct := fd.MainNet / amt * 100
 					mktPct, mktDelta = &pct, &d
-					e.sideMu.Lock()
-					e.sideFlow.observe(now, sideFlowSample{Net: fd.MainNet, Amount: amt, Source: label, At: now}, d)
-					e.sideMu.Unlock()
+					// Delta 必须在**构造时**就带上：observe 只从第三参重新赋值，
+					// 而 sampleSideFlow 的大盘分支传的就是 mkt.Delta（同一个数，两处同源）。
+					mktSample = sideFlowSample{Net: fd.MainNet, Amount: amt, Source: label, At: now, Delta: d}
+					mktOK = true
 				}
 			}
 		}
@@ -7740,7 +7746,10 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 	// 抽成纯函数（aggregateSectorFlow）以便离线验算；样本不足一律弃权（NULL）。
 	secPct, secDelta := aggregateSectorFlow(netSum, amtSum, deltaSum, nDelta)
 
-	// ③ 大盘 + 板块聚合写库（资金流四列专用写口；量比三列不受影响）。
+	// ③ 侧策略采样：**两条腿之后、单一调用点**（§SIDE-FLOW-PROXY 2026-11-26）。
+	e.sampleSideFlow(now, mktSample, mktOK, netSum, amtSum, nDelta)
+
+	// ④ 大盘 + 板块聚合写库（资金流四列专用写口；量比三列不受影响）。
 	// 两条腿任一有值就写：板块拿到而大盘没拿到时，也要让板块腿留在账上（缺哪个就 NULL 哪个）。
 	if e.d1Store != nil && (mktDelta != nil || secDelta != nil) {
 		if uerr := e.d1Store.UpsertFlowMoneyOnly(store.FlowFactorDailyRow{

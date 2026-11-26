@@ -20,7 +20,9 @@ sys.path.insert(0, os.path.join(REPO, "qmt_gateway"))
 BUILDER = os.path.join(REPO, "scripts", "build_local_executor.py")
 
 _T1 = datetime(2026, 11, 10, 9, 33, 0)
-_T2 = datetime(2026, 11, 10, 9, 35, 0)   # >= buy_confirm_min_gap_sec after _T1
+# 2026-11-26 P2: the confirm window now needs a real TIME span, not just two
+# rounds. 09:36:00 is exactly buy_confirm_min_span_sec (180 s) after _T1.
+_T2 = datetime(2026, 11, 10, 9, 36, 0)
 
 
 def build_sandbox(out_dir):

@@ -96,6 +96,15 @@ func readSidePolicyStatus(dir, fallbackDir, day string, now time.Time) map[strin
 	out["right_weight"] = st.RightWeight
 	out["slope_delta"] = st.SlopeDelta
 	out["gap_pct"] = st.GapPct
+	// §SIDE-FLOW-PROXY 2026-11-26：这条腿到底用了哪份数，必须在读面上说清。
+	// market_delta 的零值是**合法中性值**，所以"有没有读数"只能靠 delta_source 判——
+	// 直接下发 0 会让运维把"没读到"看成"资金流中性"，那是本仓反复踩过的画 0 坑。
+	out["market_delta"] = st.MarketDelta
+	out["market_delta_known"] = st.DeltaSource != ""
+	out["delta_source"] = st.DeltaSource
+	// §SIDE-PM-GATE 2026-11-26：13:00 那一档今天是否已被"数据齐全"确认过。
+	// false 且时刻已过 13:00 ⇒ 载体仍按上午档压着（不是缺数，是没确认）。
+	out["pm_release"] = st.PMRelease
 	out["latch_active"] = st.Latch.Kind == "no_new" && st.LatchUntilUnix > now.Unix()
 	out["reason"] = st.Reason
 	return out

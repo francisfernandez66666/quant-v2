@@ -328,6 +328,18 @@ MAPPING = [
     ("side_ramp_bear_pm", ("side_ramp_bear_pm",), None),
     ("side_ramp_pm_check_at", ("side_ramp_pm_check_at",), None),
     ("side_ramp_full_at", ("side_ramp_full_at",), None),
+    # §BUY-PENDING-ENTRY-20261126 买入侧四枚（owner 2026-11-26 裁决）：
+    # 进程内买单账判死等待 / 确认窗最小时间跨度 / 断档重置 / 不追刀闸。
+    ("open_buys_grace_sec", ("open_buys_grace_sec",), None),
+    ("buy_confirm_min_span_sec", ("buy_confirm_min_span_sec",), None),
+    ("buy_confirm_reset_sec", ("buy_confirm_reset_sec",), None),
+    ("entry_pullback_chase_guard", ("entry_pullback_chase_guard",), None),
+    # §SIDE-FLOW-PROXY-20261126 资金流替补与早释五枚（owner 2026-11-26 裁决）。
+    ("side_flow_proxy_enabled", ("side_flow_proxy_enabled",), None),
+    ("side_flow_proxy_after_rounds", ("side_flow_proxy_after_rounds",), None),
+    ("side_inflow_reversal_enabled", ("side_inflow_reversal_enabled",), None),
+    ("side_inflow_vol_min", ("side_inflow_vol_min",), None),
+    ("side_inflow_fade_delta", ("side_inflow_fade_delta",), None),
     # §TP-LADDER-20261124 两段式止盈阶梯（owner 2026-11-24 九条裁决）。
     # 真源 internal/config/carrier_knobs.go（两枚战法止盈点是转调：双凸读战法包常量、
     # 龙回头读账号级策略出厂表 ×100 换成百分点）。Python 侧不写这几枚数。

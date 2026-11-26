@@ -33,6 +33,15 @@ func rampAt(hhmm string) time.Time {
 	return t
 }
 
+// rampStateConfirmed 造一个"13:00 已由数据齐全确认"的状态（§SIDE-PM-GATE）。
+// 刻意不复用 rampState()：那条是"未确认"，③④⑤ 的 latch 用例必须站在"本可以释放"的
+// 前提上，否则摘掉 latch 判据也不会红（空过的锁）。
+func rampStateConfirmed(mode SidePolicyMode) SidePolicyState {
+	st := rampState(mode)
+	st.PMRelease = true
+	return st
+}
+
 // rampState 造一个"总闸开着、模式指定"的市场状态。
 func rampState(mode SidePolicyMode) SidePolicyState {
 	return SidePolicyState{
@@ -82,14 +91,14 @@ func TestSideTimeRampAMBand(t *testing.T) {
 // ③ 13:00–14:00 + latch 活跃 ⇒ 保持 AM 档。这是 owner「下午有坏信号就先别释放」
 // 的唯一落点；写成"latch 只在 13:00 那一刻算数"会让它事实上永不生效。
 func TestSideTimeRampPMChecksLatchAndHoldsAM(t *testing.T) {
-	st := rampState(SidePolicyBull)
+	st := rampStateConfirmed(SidePolicyBull)
 	st.Latch = SidePolicyLatch{Kind: "no_new", Until: "14:00", Reason: "pm_weak"}
 	v, src := SideTimeRampWithSource(st, rampAt("13:30"))
 	if v != config.CarrierSideRampBullAM() || src != "ramp_bull_am" {
 		t.Fatalf("latch active got %v/%s want %v/ramp_bull_am", v, src, config.CarrierSideRampBullAM())
 	}
 	// 熊市镜像：上午 0.35，下午坏信号 ⇒ 仍然 0.35。
-	bear := rampState(SidePolicyBear)
+	bear := rampStateConfirmed(SidePolicyBear)
 	bear.Latch = SidePolicyLatch{Kind: "no_new", Until: "14:00"}
 	if v, src := SideTimeRampWithSource(bear, rampAt("13:30")); v != config.CarrierSideRampBearAM() || src != "ramp_bear_am" {
 		t.Fatalf("bear latch active got %v/%s", v, src)
@@ -98,29 +107,48 @@ func TestSideTimeRampPMChecksLatchAndHoldsAM(t *testing.T) {
 
 // ④ 同区间 latch 不活跃 ⇒ PM 档。
 func TestSideTimeRampPMWithoutLatch(t *testing.T) {
-	if v, src := SideTimeRampWithSource(rampState(SidePolicyBull), rampAt("13:30")); v != config.CarrierSideRampBullPM() || src != "ramp_bull_pm" {
+	if v, src := SideTimeRampWithSource(rampStateConfirmed(SidePolicyBull), rampAt("13:30")); v != config.CarrierSideRampBullPM() || src != "ramp_bull_pm" {
 		t.Fatalf("bull PM got %v/%s want %v/ramp_bull_pm", v, src, config.CarrierSideRampBullPM())
 	}
-	if v, src := SideTimeRampWithSource(rampState(SidePolicyBear), rampAt("13:30")); v != config.CarrierSideRampBearPM() || src != "ramp_bear_pm" {
+	if v, src := SideTimeRampWithSource(rampStateConfirmed(SidePolicyBear), rampAt("13:30")); v != config.CarrierSideRampBearPM() || src != "ramp_bear_pm" {
 		t.Fatalf("bear PM got %v/%s want %v/ramp_bear_pm", v, src, config.CarrierSideRampBearPM())
 	}
 	// 过期 latch（Until 已过）不算活跃：13:30 时 Until=13:15 必须落到 PM 档。
-	st := rampState(SidePolicyBull)
+	st := rampStateConfirmed(SidePolicyBull)
 	st.Latch = SidePolicyLatch{Kind: "no_new", Until: "13:15"}
 	if v, src := SideTimeRampWithSource(st, rampAt("13:30")); v != config.CarrierSideRampBullPM() || src != "ramp_bull_pm" {
 		t.Fatalf("expired latch got %v/%s want PM", v, src)
 	}
 	// 非 no_new 的 latch（例如加急发布的其它 kind）不参与这一层。
-	other := rampState(SidePolicyBull)
+	other := rampStateConfirmed(SidePolicyBull)
 	other.Latch = SidePolicyLatch{Kind: "tighten", Until: "14:00"}
 	if v, _ := SideTimeRampWithSource(other, rampAt("13:30")); v != config.CarrierSideRampBullPM() {
 		t.Fatalf("kind!=no_new latch got %v want PM", v)
 	}
 }
 
+// ④b §SIDE-PM-GATE：13:00 是数据事件。没有 pm_release ⇒ 保持 AM 档，
+// 且来源名必须与 latch 可分（"等数据" vs "有坏信号"，处置方向相反）。
+func TestSideTimeRampPMPendingHoldsAM(t *testing.T) {
+	if v, src := SideTimeRampWithSource(rampState(SidePolicyBear), rampAt("13:30")); v != config.CarrierSideRampBearAM() || src != "ramp_bear_am_pm_pending" {
+		t.Fatalf("bear pending got %v/%s want %v/ramp_bear_am_pm_pending", v, src, config.CarrierSideRampBearAM())
+	}
+	if v, src := SideTimeRampWithSource(rampState(SidePolicyBull), rampAt("13:30")); v != config.CarrierSideRampBullAM() || src != "ramp_bull_am_pm_pending" {
+		t.Fatalf("bull pending got %v/%s want %v/ramp_bull_am_pm_pending", v, src, config.CarrierSideRampBullAM())
+	}
+	// 确认位不能提前放：10:00 仍是 AM 档。
+	if v, src := SideTimeRampWithSource(rampStateConfirmed(SidePolicyBear), rampAt("10:00")); v != config.CarrierSideRampBearAM() || src != "ramp_bear_am" {
+		t.Fatalf("before pm_check_at got %v/%s", v, src)
+	}
+	// 14:00 之后无条件 1.0：未确认也一样（D7 原语义一字不改）。
+	if v, src := SideTimeRampWithSource(rampState(SidePolicyBear), rampAt("14:30")); v != 1.0 || src != "ramp_full" {
+		t.Fatalf("after full_at got %v/%s want 1.0/ramp_full", v, src)
+	}
+}
+
 // ⑤ full_at 之后无条件 1.0：latch 还在也不许压着（owner：「14:00 后不管有没有都释放剩余」）。
 func TestSideTimeRampFullReleaseIgnoresLatch(t *testing.T) {
-	st := rampState(SidePolicyBear)
+	st := rampStateConfirmed(SidePolicyBear)
 	st.Latch = SidePolicyLatch{Kind: "no_new", Until: "14:00"}
 	for _, hhmm := range []string{"14:00", "14:30", "14:59"} {
 		v, src := SideTimeRampWithSource(st, rampAt(hhmm))
@@ -134,25 +162,32 @@ func TestSideTimeRampFullReleaseIgnoresLatch(t *testing.T) {
 func TestSideTimeRampSourcesAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
 	cases := []struct {
-		mode SidePolicyMode
-		at   string
+		mode      SidePolicyMode
+		at        string
+		confirmed bool
 	}{
-		{SidePolicyBull, "09:45"},
-		{SidePolicyBull, "13:30"},
-		{SidePolicyBear, "09:45"},
-		{SidePolicyBear, "13:30"},
-		{SidePolicyBull, "14:30"},
-		{SidePolicyRange, "10:00"},
+		{SidePolicyBull, "09:45", false},
+		{SidePolicyBull, "13:30", true},
+		{SidePolicyBear, "09:45", false},
+		{SidePolicyBear, "13:30", true},
+		// §SIDE-PM-GATE：未确认的 PM 档必须是一个**独立**来源名。
+		{SidePolicyBear, "13:30", false},
+		{SidePolicyBull, "14:30", false},
+		{SidePolicyRange, "10:00", false},
 	}
 	for _, c := range cases {
-		_, src := SideTimeRampWithSource(rampState(c.mode), rampAt(c.at))
+		st := rampState(c.mode)
+		if c.confirmed {
+			st = rampStateConfirmed(c.mode)
+		}
+		_, src := SideTimeRampWithSource(st, rampAt(c.at))
 		if src == "" {
 			t.Fatalf("mode=%s at=%s produced an empty source", c.mode, c.at)
 		}
 		seen[src] = true
 	}
-	if len(seen) != 6 {
-		t.Fatalf("expected 6 distinct source names, got %d: %v", len(seen), seen)
+	if len(seen) != 7 {
+		t.Fatalf("expected 7 distinct source names, got %d: %v", len(seen), seen)
 	}
 }
 
