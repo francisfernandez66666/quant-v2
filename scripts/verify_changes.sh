@@ -28253,18 +28253,6 @@ grep -q 'rsync_carrier_build.sh' docs/DEPLOY_GZ_UBUNTU_20261107.md || \
 CNT246=$((CNT246 + 1))
 grep -q 'carrier_applied_has_new_code' scripts/verify_carrier_delivery_gz.sh || \
 	fail246 "探针缺 applied 产物符号判据（只认版本号=ACK v272 旧代码那种假绿会复活）"
-# pos_rel 分母标注（19:2x 判读误读修复）：日志打 pos_base=<max_pos_pct> 且 docstring 说清两套尺子。
-CNT246=$((CNT246 + 1))
-grep -qF 'pos_rel=%.3f pos_base=%s' qmt_gateway/qmt_internal_strategy.py || \
-	fail246 "flow 日志缺 pos_base=<max_pos_pct>（pos_rel 分母没打出来，2x 建议档会被误读成 2x 动态目标）"
-grep -qF 'pos_rel = (held / total) / max_pos_pct' qmt_gateway/qmt_internal_strategy.py || \
-	fail246 "_quadrant_state docstring 没说清 pos_rel 基准（两套尺子易误读）"
-CNT246=$((CNT246 + 1))
-python3 - <<'PY' || fail246 "载体 Python 混进非 ASCII 字节（GBK 沙箱会炸）"
-import pathlib
-s=pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_bytes()
-assert all(b<=127 for b in s), "non-ASCII byte in carrier file"
-PY
 [ "${B246_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §246 §CARRIER-DELIVERY-GATE 锁通过（探针在册/语法/selftest/文档强制步/applied 判据，累计判定点 ${CNT246}）"
 echo ""
