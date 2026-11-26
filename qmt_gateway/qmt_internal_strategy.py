@@ -3476,6 +3476,15 @@ def _quadrant_state(vol, snap, held, total):
     tier, never an absolute 70%). range / unknown state / unknown target ->
     Neutral. The bull cases are still COMPUTED and reported (reduce / no-add)
     so the readout shows why the blend moved, but they do not veto.
+
+    2026-11-26 readout clarity: pos_rel = (held / total) / max_pos_pct. The
+    denominator is the market-state suggested tier (flow_snapshot.max_pos_pct,
+    live 0.35), NOT the dynamic target (tgt=base*min(ms*tm,ceiling)*ramp) and
+    NOT max_total_position_pct. So pos_rel~2.0 means "exposure is 2x the 35%
+    suggestion", NOT "2x the dynamic target". It only feeds the four-quadrant
+    high-tier gate; the position BRAKE is target_room on the sizing side.
+    The flow log prints pos_base=<max_pos_pct> beside pos_rel so the reader
+    never has to guess which denominator produced the number.
     """
     state = {"decision": "neutral", "reason": "neutral", "pos_rel": 0.0,
              "vol_state": vol.get("vol_state") or "neutral", "block": False}
@@ -3640,8 +3649,11 @@ def _flow_readout():
     miss = int(tally.get("miss") or 0)
     _STATE["flow_tally"] = {"hour": "", "hit": 0, "miss": 0}
     side = _STATE.get("side_policy_last") or {}
+    # 2026-11-26: print the DENOMINATOR of pos_rel (max_pos_pct, the state-machine
+    # suggested tier) beside it. Without this, pos_rel~2.0 reads as "2x the dynamic
+    # target" -- it is actually 2x the 0.35 suggestion. Pure ASCII for the GBK box.
     _log("flow vol_state=%s r_yest=%s r_ma5=%s src=%s reason=%s market_delta=%s sectors=%d "
-         "sector_hit=%d/%d state=%s pos_rel=%.3f decision=%s qwhy=%s "
+         "sector_hit=%d/%d state=%s pos_rel=%.3f pos_base=%s decision=%s qwhy=%s "
          "side mode=%s level=%s slope=%s gap=%s tgt=%s left=%s right=%s new=%s add=%s latch=%s "
          "ramp=%s ramp_src=%s pmrel=%s mdelta=%s dsrc=%s" % (
              vol.get("vol_state") or "neutral",
@@ -3654,6 +3666,7 @@ def _flow_readout():
              hit + miss,
              snap.get("market_state") or "-",
              float(quadrant.get("pos_rel") or 0.0),
+             "na" if snap.get("max_pos_pct") is None else "%.2f" % float(snap.get("max_pos_pct")),
              quadrant.get("decision") or "neutral",
              quadrant.get("reason") or "-",
              side.get("mode") or "legacy",
