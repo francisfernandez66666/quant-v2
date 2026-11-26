@@ -27435,7 +27435,8 @@ go test ./internal/signalctl -run 'TestSideTimeRampPMWithoutLatch' -count=1 >/de
 CNT240=$((CNT240 + 1))
 GO240_RC=0
 go test ./internal/signalctl -run 'TestSideTimeRampPMChecksLatchAndHoldsAM' -count=1 >/dev/null 2>&1 || GO240_RC=$?
-[ "$GO240_RC" = "0" ] || fail240 "13:00 latch 没守住上午档（§240 ⑤）"
+# 2026-11-26 §SIDE-PM-GATE：latch 或未确认，两者都守上午档。
+[ "$GO240_RC" = "0" ] || fail240 "13:00 latch 或未确认都没守住上午档（§240 ⑤）"
 CNT240=$((CNT240 + 1))
 GO240_RC=0
 go test ./internal/signalctl -run 'TestSideTimeRampFullReleaseIgnoresLatch' -count=1 >/dev/null 2>&1 || GO240_RC=$?

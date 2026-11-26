@@ -228,6 +228,25 @@ class UnreadableSizeTest(_Base):
                    "size_unknown": False}]
         self.assertEqual(mod._pending_buy_rows(filled), [])
 
+    def test_size_unknown_without_cap_still_reserves_floor(self):
+        """P0-b 退路：连 order_amount_cap 都缺时按 min_order_amount 预占，绝不当 0 丢。"""
+        mod = self.mod
+        saved = mod.PARAMS.get("order_amount_cap")
+        mod.PARAMS["order_amount_cap"] = 0.0
+        try:
+            rows = [{"symbol": "000009", "short_code": "FC000009", "side": "buy",
+                     "terminal": False, "qty": 0.0, "traded": 0.0, "price": 0.0,
+                     "size_unknown": True}]
+            pending = mod._pending_buy_rows(rows)
+            self.assertEqual(len(pending), 1, "缺 cap 时把读不到尺寸的买单丢了")
+            self.assertEqual(pending[0]["remain"], mod.PARAMS["min_order_amount"],
+                             "缺 cap 时没有回落到 min_order_amount")
+        finally:
+            if saved is None:
+                mod.PARAMS.pop("order_amount_cap", None)
+            else:
+                mod.PARAMS["order_amount_cap"] = saved
+
     def test_cash_probe_reports_pending(self):
         """P0-d：`pend=` 必须是真值（它长期打 0，把人引到"没有在途单"上）。"""
         mod = self.mod
