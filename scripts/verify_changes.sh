@@ -28228,3 +28228,31 @@ PY
 [ "$B245_FAILED" = "0" ] || exit 1
 echo "ok - §245 §SIDE-PM-GATE 锁通过（字段在册/判据复用/ramp 要求确认位/latch 优先/粘性+一次加急/载体镜像/digest 含 pm_release/两处读面/冷启动只带粘性，累计判定点 ${CNT245}）"
 echo ""
+
+# ── §246 §CARRIER-DELIVERY-GATE（2026-11-26 owner 令「以后发版程序必须带上 qmt 文件重烘」）──
+# 云端发版 ≠ 载体上线。本段把「发版后必须跑载体投递 + 载体验收探针」钉成门禁：
+# 探针脚本在册 + 语法 + 自检全绿 + 部署文档含强制步骤（改坏任何一处即红）。
+fail246() {
+	echo "--- FAIL: §246 $*"
+	FAIL=1
+}
+CNT246=0
+echo "==> 246 §CARRIER-DELIVERY-GATE（发版必须带 qmt 重烘：探针在册/自检/文档强制步骤）..."
+CNT246=$((CNT246 + 1))
+[ -f scripts/verify_carrier_delivery_gz.sh ] || fail246 "载体验收探针脚本不在册（scripts/verify_carrier_delivery_gz.sh）"
+CNT246=$((CNT246 + 1))
+bash -n scripts/verify_carrier_delivery_gz.sh || fail246 "载体验收探针语法错"
+CNT246=$((CNT246 + 1))
+bash scripts/verify_carrier_delivery_gz.sh --selftest >/dev/null 2>&1 || fail246 "载体验收探针 --selftest 不绿（防恒绿假探针被拆）"
+CNT246=$((CNT246 + 1))
+grep -q 'verify_carrier_delivery_gz.sh' docs/DEPLOY_GZ_UBUNTU_20261107.md || \
+	fail246 "部署文档没把载体探针写进验收步骤（发版流程缺强制载体步）"
+grep -q 'rsync_carrier_build.sh' docs/DEPLOY_GZ_UBUNTU_20261107.md || \
+	fail246 "部署文档缺 rsync_carrier_build.sh 强制步（云端发版≠载体上线）"
+# 探针判据本体在册（防判据被掏空只剩壳）：
+CNT246=$((CNT246 + 1))
+grep -q 'carrier_applied_has_new_code' scripts/verify_carrier_delivery_gz.sh || \
+	fail246 "探针缺 applied 产物符号判据（只认版本号=ACK v272 旧代码那种假绿会复活）"
+[ "${B246_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §246 §CARRIER-DELIVERY-GATE 锁通过（探针在册/语法/selftest/文档强制步/applied 判据，累计判定点 ${CNT246}）"
+echo ""
