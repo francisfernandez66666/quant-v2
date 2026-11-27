@@ -1013,3 +1013,140 @@ class TestNewBarsFactors(unittest.TestCase):
         """kind 没登记在 _BAR_KINDS 时 factor_input 返回 None——静默弃权的经典形状。"""
         self.assertIn("reversal", rf._BAR_KINDS)
         self.assertIn("ts_rank_vol", rf._BAR_KINDS)
+
+
+class TestFactorDefsDoubleWrite(unittest.TestCase):
+    """P3（2026-11-27）：烘参 `factor_defs` 必须覆盖源码 `FACTOR_LIBRARY` 的每一枚因子。
+
+    为什么这条要单独钉（这是本轮真漏过一轮的缺口）：`factor_input` 读的是
+    `params["factor_defs"]`（有就用它，没有才退回 `FACTOR_LIBRARY`），而
+    `scripts/derive_carrier_params.py` 对 `factor_defs` 走 `kept=file` ——
+    参数文件里已经有的表**不会被模块模板更新**。于是"源码加了因子、烘参表没跟"
+    在 `--check` 上是绿的（file 优先、`CHANGED_TOTAL=0`），运行时却
+    `spec=None → return None`，整条规则静默 `input_absent`。
+    `stom_21` / `cmra` / `flow_resid` / `fin_series` 正是这样漏过一轮的：
+    源码、pregen、`build_context` 三处都接了，唯独烘参表里没有它们。
+    """
+
+    def _baked(self):
+        import json
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "local_executor_params.json"), encoding="utf-8") as handle:
+            return (json.load(handle).get("params") or {}).get("factor_defs") or {}
+
+    def test_baked_factor_defs_cover_source_library(self):
+        baked = self._baked()
+        missing = sorted(set(rf.FACTOR_LIBRARY) - set(baked))
+        self.assertEqual(missing, [],
+                         "烘参 factor_defs 缺源码因子（运行时会静默弃权）：%s" % missing)
+
+    def test_baked_definitions_agree_with_source(self):
+        """同一枚因子在源码与烘参里 kind / input 必须一致。
+
+        只查"键在不在"不够：把 kind 从 `scalar_proxy` 改成 `series` 会让
+        `factor_input` 走另一条分派，而两边都不报错——分数只是悄悄换了个算法。
+        """
+        baked = self._baked()
+        for fid, spec in sorted(baked.items()):
+            source = rf.FACTOR_LIBRARY.get(fid)
+            self.assertIsNotNone(source, "烘参里有源码不认识的因子 %s" % fid)
+            self.assertEqual(spec.get("kind"), source.get("kind"), "%s kind 漂移" % fid)
+            self.assertEqual(spec.get("input"), source.get("input"), "%s input 漂移" % fid)
+
+
+class TestFactorRevival(unittest.TestCase):
+    """P1（2026-11-27）：`fac_172`–`fac_185` 从"永不参与"变成"真能打分"。
+
+    §F1 之前 `emo_max_board` / `emo_blast_cnt` 的输入恒 None，`fac_172` 这类规则
+    只会静默 declined，读数上完全看不出来。本类直接拿**真实烘参里的 14 条规则**
+    逐条打分（不是自己捏的规则），断言：
+      (1) 一份"什么都齐"的 ctx 下 14 条都不再 declined（复活）；
+      (2) 强情绪盘下 `fac_172` 真的 fire（score>=threshold）；
+      (3) 摘掉 `ladder_height_history` 后 decline 的 reason 点名那枚 input
+          ——"键名写对了、装配没写"正是上一轮缺陷的形状。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "local_executor_params.json"), encoding="utf-8") as handle:
+            cls.baked = json.load(handle)["params"]
+        cls.rules = {r["id"]: r for r in cls.baked.get("factor_rules") or []}
+        cls.p1_ids = ["fac_%d" % n for n in range(172, 186)]
+
+    def _rich_ctx(self, **overrides):
+        """一份把所有 P1 依赖都喂满的 ctx（缺什么由用例自己摘）。"""
+        base = ctx(
+            ladder_height_history=[3.0, 4.0, 5.0, 6.0, 6.0] * 4,
+            broken_board_count_history=[5.0, 4.0, 3.0, 2.0, 1.0] * 4,
+            broken_board_ratio_history=[0.10, 0.05, 0.20, 0.08, 0.12] * 4,
+            limit_up_count_history=[40.0, 50.0, 60.0, 70.0, 80.0] * 4,
+            limit_board_count=4.0,
+            broken_board_ratio=0.12,
+            broken_board_count=1.0,
+            ladder_height=6.0,
+            flow_today_pct=1.2,
+            flow_5d_pct=2.0,
+            news_event_score=30.0,
+            concept_heat=70.0,
+            index_change_pct=1.0,
+            is_leader=True,
+            first_seal_minute=60.0,
+            turnover_series=[1.0 + 0.1 * i for i in range(25)],
+            total_share_series=[1.0e9] * 20,
+        )
+        base.update(overrides)
+        return base
+
+    def test_all_p1_rules_score_with_a_full_context(self):
+        """14 条规则逐条打分：都不许 declined，且至少有一枚因子真的打上了分。"""
+        scene = self._rich_ctx()
+        for rid in self.p1_ids:
+            rule = self.rules.get(rid)
+            self.assertIsNotNone(rule, "烘参里没有 %s" % rid)
+            res = rf.score_factor_rule(self.baked, rule, scene)
+            self.assertFalse(res["declined"], "%s 在满 ctx 下仍 declined：%s"
+                             % (rid, res.get("reason")))
+            self.assertTrue(res["details"], "%s 一枚因子都没打上分" % rid)
+            self.assertGreaterEqual(float(res["score"]), 0.0, rid)
+            self.assertLessEqual(float(res["score"]), 100.0, rid)
+
+    def test_fac_172_fires_on_a_strong_emotional_tape(self):
+        """最高板抬升 + 炸板数递减＝情绪最强，fac_172 必须 fire。
+
+        分位口径是"历史里严格低于最新值的那部分占比"（Go factor.go:512），
+        所以两枚都要**越过全部历史**才拿满分：最高板末值 7 > 历史最大 6、
+        炸板数末值 1 < 历史最小 2。
+        """
+        rule = self.rules["fac_172"]
+        scene = self._rich_ctx(
+            ladder_height_history=[3.0, 4.0, 5.0, 6.0, 6.0] * 3 + [3.0, 4.0, 5.0, 6.0, 7.0],
+            broken_board_count_history=[5.0, 4.0, 3.0, 2.0, 2.0] * 3 + [5.0, 4.0, 3.0, 2.0, 1.0],
+        )
+        res = rf.score_factor_rule(self.baked, rule, scene)
+        self.assertFalse(res["declined"])
+        self.assertAlmostEqual(res["details"]["emo_max_board"], 1.0)
+        # details 存的是**分位原值**（方向在复合时生效）：炸板数末值最小 ⇒ 0.0，
+        # 方向 −1 把它改写成 1.0 的贡献。
+        self.assertAlmostEqual(res["details"]["emo_blast_cnt"], 0.0)
+        self.assertTrue(res["pass"], "强情绪盘下 fac_172 没 fire：%s" % res)
+        self.assertAlmostEqual(float(res["score"]), 100.0)
+
+    def test_fac_172_names_the_missing_history_when_unwired(self):
+        """摘掉 §F1 透传的那一枚键：decline 必须点名 emo_max_board（不是笼统弃权）。"""
+        rule = self.rules["fac_172"]
+        scene = self._rich_ctx()
+        scene.pop("ladder_height_history")
+        res = rf.score_factor_rule(self.baked, rule, scene)
+        self.assertTrue(res["declined"])
+        self.assertEqual(res["reason"], "input_absent:emo_max_board")
+
+    def test_fac_175_fires_when_both_flow_legs_are_fresh(self):
+        """P3 flow 双源接上后，FlowToday/Flow5d 必须都在带内满分。"""
+        rule = self.rules["fac_175"]
+        res = rf.score_factor_rule(self.baked, rule, self._rich_ctx())
+        self.assertFalse(res["declined"])
+        self.assertAlmostEqual(res["details"]["FlowToday"], 1.0)
+        self.assertAlmostEqual(res["details"]["Flow5d"], 1.0)
+        self.assertTrue(res["pass"])

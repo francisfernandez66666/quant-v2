@@ -28657,14 +28657,25 @@ assert "FLOW_FRESH_DAYS" in s
 PY
 
 # ④ 载体侧：四个新 input 键真进 build_context 与因子库（stom_21/cmra/flow_resid 走 scalar）
+#    并且**烘参 factor_defs 必须覆盖源码 FACTOR_LIBRARY**——这一条是本轮真漏过一轮的命门：
+#    derive 对 factor_defs 走 kept=file，源码加因子不会更新参数文件，--check 仍然是绿的
+#    （file 优先 ⇒ CHANGED_TOTAL=0），而 factor_input 读 params["factor_defs"]，
+#    缺条目就是 spec=None → None → 整条规则静默 input_absent。只查源码的锁抓不到它。
 CNT252=$((CNT252 + 1))
-python3 - <<'PY' || fail252 "载体侧新键没装配（§252 ④）"
-import sys, pathlib
+python3 - <<'PY' || fail252 "载体侧新键没装配 / 烘参 factor_defs 漂移（§252 ④）"
+import sys, pathlib, json
 sys.path.insert(0, "qmt_gateway")
 import rules_factor as rf
 for fid in ("stom_21", "cmra", "flow_resid"):
     assert fid in rf.FACTOR_LIBRARY, fid
     assert rf.FACTOR_LIBRARY[fid]["kind"] == "scalar_proxy", fid
+baked = (json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8"))
+         .get("params") or {}).get("factor_defs") or {}
+missing = sorted(set(rf.FACTOR_LIBRARY) - set(baked))
+assert not missing, "烘参 factor_defs 缺源码因子（运行时会静默弃权）：%s" % missing
+for fid in ("stom_21", "cmra", "flow_resid", "fin_series", "vwap_dev"):
+    assert fid in baked, "factor_defs missing %s" % fid
+    assert baked[fid]["kind"] == rf.FACTOR_LIBRARY[fid]["kind"], "%s kind drifted" % fid
 s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
 start = s.index("def build_context(")
 end = s.index("\ndef ", start + 10)

@@ -40,6 +40,11 @@ LIVE_TACTIC_CTX_INPUTS = {
     "up_stop", "index_change_pct", "limit_up_count", "limit_up_count_history",
     "broken_board_ratio", "broken_board_count", "broken_board_ratio_history",
     "broken_board_count_history", "ladder_height_history",
+    # P2/P3（2026-11-27）：盒内自算 + 云端烘参的五个新输入。白名单是**单向**契约
+    # （白名单里的每个键都必须在 build_context 里真装配），所以这里登记即等于
+    # 断言"这五条腿真的接上了"——此前 stom_21/cmra/flow_resid/fin_series 只烘不接，
+    # 会像 §F1 那两条历史一样静默 input_absent。
+    "vwap_dev", "stom_21", "cmra", "flow_resid", "fin_series",
     "seal_amount_ratio", "first_seal_minute", "sector_limit_up_drop_pct",
     "emotion_phase", "emotion_day",
 }

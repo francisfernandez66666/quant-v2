@@ -1051,6 +1051,34 @@
         "direct": true,
         "missing_input": "eastmoney main-force net inflow, 5 day"
       },
+      "stom_21": {
+        "kind": "scalar_proxy",
+        "windows": [],
+        "input": "stom_21",
+        "direct": true,
+        "missing_input": "21-session turnover panel (cloud bake)"
+      },
+      "cmra": {
+        "kind": "scalar_proxy",
+        "windows": [],
+        "input": "cmra",
+        "direct": true,
+        "missing_input": "252-session close panel (cloud bake)"
+      },
+      "flow_resid": {
+        "kind": "scalar_proxy",
+        "windows": [],
+        "input": "flow_resid",
+        "direct": true,
+        "missing_input": "board net-inflow z (cloud bake)"
+      },
+      "fin_series": {
+        "kind": "series",
+        "windows": [],
+        "input": "fin_series",
+        "direct": true,
+        "missing_input": "point-in-time ROE history (cloud bake)"
+      },
       "ConceptHeat": {
         "kind": "scalar_proxy",
         "windows": [],
