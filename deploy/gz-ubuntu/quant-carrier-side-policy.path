@@ -1,12 +1,17 @@
 # quant-carrier-side-policy.path — 引擎写出 13:00 urgent req 时立即触发。
-# D6-c 2026-11-25：引擎按账号落盘（accounts/<uid>/），这里用 glob 而不是硬编码 uid
-# （OWNER_UID 已在 .service 里写过一次，再写第二次就是两本账；"哪条请求有效"由
-# 请求体自己的 day/kind/until 判定，多触发一次只是幂等 oneshot）。
+# D6-c 2026-11-25：引擎按账号落盘（accounts/<uid>/），所以路径必须落在账号目录里。
+# 2026-11-27 收口（现场：路径单元 10 分钟内 unit-start-limit-hit）：这里原来写的是
+# `accounts/*/side_policy_urgent.req` 的 glob，而本链只服务 OWNER_UID 那一个账号
+# （carrier_manifest 是**按账号**读写的，见 internal/server/carrier.go）。别的账号
+# （现场是 facai2026）写出自己的 req 后，本链永远不消费它 ⇒ PathExistsGlob 一直成立
+# ⇒ 每 0.06 秒重触发一次 service，直到 systemd 的启动限流把 .path 打成 failed。
+# 现在只盯 OWNER 那一条，uid 与 .service 的 `Environment=OWNER_UID=` **同源**
+# （门禁 §239 有一把等值锁：两处 uid 必须逐字相同，改一处漏另一处会红）。
 [Unit]
 Description=Watch quant side-policy urgent request
 
 [Path]
-PathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req
+PathExists=/var/lib/quant-trading-v2/accounts/u_1785377969825355000/side_policy_urgent.req
 Unit=quant-carrier-side-policy.service
 
 [Install]

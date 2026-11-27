@@ -57,15 +57,26 @@ _SIDE_ACCT_DIR = os.path.join(DATA_DIR, "accounts", OWNER_UID)
 
 
 def _side_state_path(name):
-    """账号目录优先、根目录兜底（返回绝对路径）。"""
+    """账号目录优先、根目录兜底（返回绝对路径）。
+
+    2026-11-27 收口：兜底只在**根目录那份真的存在**时生效。旧写法 `acct if exists else root`
+    在"两份都没有"时返回根目录——而本函数的返回值有三处是**写入**用途（req/pending/ack），
+    新交易日的第一个写点会落进根目录，下一个进程又按账号目录读，于是同一份状态分成两本账。
+    """
     acct = os.path.join(_SIDE_ACCT_DIR, name)
-    return acct if os.path.exists(acct) else os.path.join(DATA_DIR, name)
+    if os.path.exists(acct):
+        return acct
+    root = os.path.join(DATA_DIR, name)
+    return root if os.path.exists(root) else acct
 
 
 SIDE_POLICY_LATEST = _side_state_path("side_policy_latest.json")
 SIDE_POLICY_REQ = _side_state_path("side_policy_urgent.req")
 SIDE_POLICY_PENDING = _side_state_path("side_policy_urgent.pending.json")
 SIDE_POLICY_ACK = _side_state_path("side_policy_urgent.ack")
+# §SIDE-POLICY-DEFER 2026-11-27：盒子明确跳过盘中投递（intraday_skip_no_priority）时，
+# 同一份请求的版本记在这里，重试轮不再重烘（见 side_policy_deferred_ok 头注）。
+SIDE_POLICY_DEFERRED = _side_state_path("side_policy_urgent.deferred.json")
 
 AUTH = os.path.join(DATA_DIR, "auth.json")
 APPLIED = os.path.join(DATA_DIR, "applied_factors.json")
@@ -1108,7 +1119,12 @@ def ssh_intraday_trigger(ver):
     直接经 WG 直连盒子触发一次 carrier_run.ps1 -Intraday（owner 裁决：计划任务主通道、
     计划任务失败走 SSH——本函数与盘中班次互为冗余，updater 的 intraday 闸与幂等哈希
     保证重复触发不会重复重启：已同版本时 up_to_date 直接返回）。
-    失败仅日志不阻断（下一班计划任务仍会接住）。"""
+    失败仅日志不阻断（下一班计划任务仍会接住）。
+
+    返回 (ok, tail)：tail 是盒子最后一行输出。**必须把 tail 带回去**——盒子在
+    `intraday_priority=false` 时会回 `CARRIER_UPDATE_RESULT=OK reason=intraday_skip_no_priority`
+    （rc=0 但一个字节都没拉），把它当成"已送达"会让加急请求永远等不到 ACK
+    （2026-11-27 现场：30 秒一轮、每轮 2 分钟烘焙、版本号涨到 v2063，盒子整天没收到）。"""
     key = os.environ.get("BOX_SSH_KEY", "/home/ubuntu/.ssh/win_admin")
     user = os.environ.get("BOX_SSH_USER", "57516")
     host = os.environ.get("BOX_SSH_HOST", "10.77.0.2")
@@ -1116,7 +1132,7 @@ def ssh_intraday_trigger(ver):
                          "C:\\qmt\\quant-trading-v2\\qmt_gateway\\carrier_run.ps1")
     if not os.path.exists(key):
         print("HOTRELOAD_SSH_SKIP reason=no_key path=%s" % key)
-        return False
+        return False, "no_key"
     ps = ('powershell -NoProfile -ExecutionPolicy Bypass -File "%s" -Intraday' % ps1)
     b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
@@ -1125,12 +1141,73 @@ def ssh_intraday_trigger(ver):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         tail = (r.stdout + r.stderr).strip().splitlines()
-        print("HOTRELOAD_SSH_TRIGGER version=%s rc=%d %s" % (
-            ver, r.returncode, tail[-1][:160] if tail else ""))
-        return r.returncode == 0
+        last = tail[-1][:160] if tail else ""
+        print("HOTRELOAD_SSH_TRIGGER version=%s rc=%d %s" % (ver, r.returncode, last))
+        return r.returncode == 0, last
     except Exception as exc:  # noqa: BLE001 — 兜底腿失败不影响已发布产物
         print("HOTRELOAD_SSH_TRIGGER_FAIL version=%s %s" % (ver, repr(exc)[:120]))
+        return False, repr(exc)[:120]
+
+
+def side_policy_deferred_ok():
+    """§SIDE-POLICY-DEFER：这份请求是否已经"发布完成但盒子明确跳过"，本轮不必再烘。
+
+    判据三条同时成立才挂起：① req 文件在册且四字段 latch 齐全；② deferred 里记着同一个
+    request_id 且 latch 逐字相同；③ 那个版本还没有 ACK。任何一条不成立就照旧走完整流程
+    （新请求 / latch 变了 / 盒子真应用了），**绝不把"挂起"当"已送达"**。
+    这不是省事：盒子 `intraday_priority=false` 时盘中一律跳过，重烘只会每 30 秒烧 2 分钟
+    CPU 并把版本号推高，而盒子一次也收不到。"""
+    request = _read_json(SIDE_POLICY_REQ, {}) or {}
+    latch = side_request_latch(request)
+    req_id = str(request.get("request_id") or "")
+    if not latch or not req_id:
         return False
+    entry = (_read_json(SIDE_POLICY_DEFERRED, {}) or {}).get(req_id) or {}
+    if [str(x) for x in (entry.get("latch") or [])] != list(latch):
+        return False
+    acked = {str(row.get("version")) for row in _ack_history()
+             if row.get("ok") is True and str(row.get("version") or "")}
+    if str(entry.get("version") or "") in acked:
+        return False
+    print("HOTRELOAD_SIDE_POLICY_DEFERRED request_id=%s version=%s reason=%s" % (
+        req_id, entry.get("version"), entry.get("reason") or "intraday_skip_no_priority"))
+    return True
+
+
+def _clear_side_policy_req(req_id):
+    """撤掉"已经处理完"的那份 req（只撤 request_id 相同的，不能顺手删更新的请求）。
+
+    为什么必须撤：`.path` 是 `PathExists=`（level-triggered），只要文件在，systemd 就会在
+    每次 service 退出后立刻再触发一次；不撤的话 10 分钟就能把 `.path` 打成
+    unit-start-limit-hit（2026-11-27 现场 13:27:05）。"""
+    current = _read_json(SIDE_POLICY_REQ, {}) or {}
+    if str(current.get("request_id") or "") != str(req_id):
+        return
+    try:
+        os.remove(SIDE_POLICY_REQ)
+    except OSError:
+        pass
+    pending = _read_json(SIDE_POLICY_PENDING, {}) or {}
+    if req_id in pending:
+        pending.pop(req_id, None)
+        _atomic_json(SIDE_POLICY_PENDING, pending)
+
+
+def mark_side_policy_deferred(req_id, version, request, reason):
+    """记下"已发布但盒子跳过"的那一版，供下一轮短路。空 req_id 不写（无主记录会赖着）。
+
+    除了落账本，这里还要把**这一份 req 撤掉**：盒子已明确跳过，产物也已经发布，
+    请求的使命到此为止（盒子按自己的班次在开盘前 / 15:40 拉取）。"""
+    if not req_id:
+        return
+    latch = [str(x) for x in (side_request_latch(request) or [])]
+    _atomic_json(SIDE_POLICY_DEFERRED, {
+        req_id: {"version": str(version), "latch": latch,
+                 "reason": str(reason or "intraday_skip_no_priority"),
+                 "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}})
+    _clear_side_policy_req(req_id)
+    print("HOTRELOAD_SIDE_POLICY_PARK request_id=%s version=%s reason=%s" % (
+        req_id, version, reason or "intraday_skip_no_priority"))
 
 
 def scrub(o):
@@ -1387,6 +1464,12 @@ def reap_side_policy_requests(now=None):
     # retry authority and a later round can safely repeat this idempotent reap.
     pending.pop(req_id, None)
     _atomic_json(SIDE_POLICY_PENDING, pending)
+    # §SIDE-POLICY-DEFER：ACK 到了 ⇒ 挂起记录必须一起清掉，否则同一个 request_id
+    # 的下一份请求会被这条陈旧挂起短路（看起来"已处理"，实际一次都没投）。
+    deferred = _read_json(SIDE_POLICY_DEFERRED, {}) or {}
+    if req_id in deferred:
+        deferred.pop(req_id, None)
+        _atomic_json(SIDE_POLICY_DEFERRED, deferred)
     try:
         os.remove(SIDE_POLICY_REQ)
     except OSError:
@@ -1404,8 +1487,14 @@ def retry_pending_side_policy():
     version = str(pending.get(req_id) or "")
     if not req_id or not version:
         return False
-    ok = ssh_intraday_trigger(version)
-    print("HOTRELOAD_SIDE_POLICY_RETRY request_id=%s version=%s rc=%d" % (req_id, version, 0 if ok else 1))
+    ok, tail = ssh_intraday_trigger(version)
+    print("HOTRELOAD_SIDE_POLICY_RETRY request_id=%s version=%s rc=%d" % (
+        req_id, version, 0 if ok else 1))
+    # 盒子明确跳过盘中投递 ⇒ 这不是失败，是"已发布、等收盘那一次"。挂起后本轮即结束，
+    # 下一轮由 side_policy_deferred_ok 短路，不再重烘（否则 30 秒一轮、每轮 2 分钟 CPU）。
+    if ok and "intraday_skip" in (tail or ""):
+        mark_side_policy_deferred(req_id, version, request, tail)
+        return True
     return ok
 
 
@@ -1491,6 +1580,26 @@ def _main_impl():
     if not os.path.isdir(BUILD_DIR):
         die("build_dir_missing:" + BUILD_DIR)
     os.chdir(BUILD_DIR)
+
+    # §SIDE-POLICY-DEFER 2026-11-27（现场：加急请求整天重烘）：盒子在
+    # `intraday_priority=false` 时对盘中投递一律 `intraday_skip_no_priority`（rc=0 但
+    # 一个字节都没拉），ACK 永远不来 ⇒ 重试定时器每 30 秒拉一轮、每轮 2 分钟烘焙，
+    # 版本号一路涨到 v2063 而盒子一次没收到。已明确跳过且 latch 未变的请求在这里短路，
+    # 收盘后（15:40 盒子日常拉取）自然落地；ACK 到达或请求变更即解除。
+    #
+    # 同一处还挡住第二种空转（13:21 现场）：重试定时器每 30 秒的 `--urgent-side-policy`
+    # 在没有请求时也会走完整烘焙（sha 随买点/利好池漂移 ⇒ 每轮都烘、每轮都投，
+    # 盒子客户端被反复重启）。加急通道**没有请求就该立即空转退出**，日常轮询归 5 分钟那个 timer。
+    if args.urgent_side_policy:
+        side_req = _read_json(SIDE_POLICY_REQ, {}) or {}
+        if not side_req:
+            print("HOTRELOAD_SIDE_POLICY_IDLE reason=no_request")
+            return 0
+        if side_policy_deferred_ok():
+            # 同一份请求被引擎重写（进程重启后 urgentWritten 的内存去重丢失）时，
+            # 这里再撤一次 req，否则 PathExists 会让 service 反复触发到启动限流。
+            _clear_side_policy_req(str(side_req.get("request_id") or ""))
+            return 0
 
     # §GATEWAY-FILE-SYNC：网关侧脚本进静态发布面（幂等）。放在 sha 比对**之前**——否则
     # "载体没变化"的轮次会 NOTHING_TO_DO 提前退出，网关文件永远同步不出去。
@@ -1860,9 +1969,13 @@ def _main_impl():
         if req_id:
             # §SIDE-POLICY-PENDING 2026-11-26 (plan 19.7 item 1): one key only.
             _atomic_json(SIDE_POLICY_PENDING, {req_id: ver})
-        if not ssh_intraday_trigger(ver):
+        ok, tail = ssh_intraday_trigger(ver)
+        if not ok:
             print("HOTRELOAD_SIDE_POLICY_SSH_FAIL request_id=%s version=%s" % (req_id, ver))
             return 3
+        # §SIDE-POLICY-DEFER：跳过 ≠ 送达。记下这一版，重试轮不再重烘。
+        if "intraday_skip" in (tail or ""):
+            mark_side_policy_deferred(req_id, ver, side_request, tail)
     print("HOTRELOAD_GZ_PUBLISHED version=%s sha=%s wl=%d bearish=%d bullish=%d pool=%d new_buys=%d" % (
         ver, sha_art, len(wl), len(bearish), len(top), len(doc2["params"].get("symbols") or []),
         len(new_buys)))

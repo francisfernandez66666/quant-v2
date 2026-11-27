@@ -1,9 +1,12 @@
 # quant-carrier-side-policy.service — 13:00 侧策略加急发布（oneshot，失败重试）。
-# D6-c 2026-11-25：条件同样改成账号 glob（引擎按账号落盘，见 .path 注释）。
+# D6-c 2026-11-25：引擎按账号落盘（accounts/<uid>/），条件必须落在账号目录里。
+# 2026-11-27：由 glob 收窄成 OWNER_UID 一条——本链只发布 owner 的 carrier
+# （manifest 按账号读写），别的账号的 req 永远不会被消费，glob 会让 service
+# 被无限重触发。条件里的 uid 与 `Environment=OWNER_UID=` 必须逐字相同（§239 等值锁）。
 [Unit]
 Description=Quant carrier urgent side-policy bake and publish
 After=network-online.target
-ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req
+ConditionPathExists=/var/lib/quant-trading-v2/accounts/u_1785377969825355000/side_policy_urgent.req
 
 [Service]
 Type=oneshot

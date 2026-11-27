@@ -32,6 +32,8 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         self.mod.SIDE_POLICY_REQ = os.path.join(self.dir, "side_policy_urgent.req")
         self.mod.SIDE_POLICY_PENDING = os.path.join(self.dir, "side_policy_urgent.pending.json")
         self.mod.SIDE_POLICY_ACK = os.path.join(self.dir, "side_policy_urgent.ack")
+        # §SIDE-POLICY-DEFER 2026-11-27：盒子跳过盘中投递的挂起账本。
+        self.mod.SIDE_POLICY_DEFERRED = os.path.join(self.dir, "side_policy_urgent.deferred.json")
         self.mod.CARRIER_ACK_HISTORY = os.path.join(self.dir, "carrier_ack_history.jsonl")
         self.now = datetime.datetime(2026, 11, 24, 13, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
 
@@ -136,13 +138,13 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         proc = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
                 mock.patch.object(self.mod.subprocess, "run", return_value=proc) as run:
-            self.assertTrue(self.mod.ssh_intraday_trigger("v180-20261124"))
+            self.assertEqual(self.mod.ssh_intraday_trigger("v180-20261124"), (True, ""))
         encoded = run.call_args.args[0][-1]
         self.assertIn("-Intraday", base64.b64decode(encoded).decode("utf-16-le"))
         proc.returncode = 1
         with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
                 mock.patch.object(self.mod.subprocess, "run", return_value=proc):
-            self.assertFalse(self.mod.ssh_intraday_trigger("v180-20261124"))
+            self.assertEqual(self.mod.ssh_intraday_trigger("v180-20261124"), (False, ""))
 
     def test_atomic_latest_write_failure_preserves_previous_file(self):
         self.mod._atomic_json(self.mod.SIDE_POLICY_LATEST, self.snap())
@@ -156,9 +158,102 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         self.mod._atomic_json(self.mod.SIDE_POLICY_REQ, {"request_id": "r1"})
         self.mod._atomic_json(self.mod.SIDE_POLICY_PENDING, {"r1": "v180-20261124"})
         calls = []
-        self.mod.ssh_intraday_trigger = lambda ver: calls.append(ver) or False
+        self.mod.ssh_intraday_trigger = lambda ver: calls.append(ver) or (False, "")
         self.assertFalse(self.mod.retry_pending_side_policy())
         self.assertEqual(calls, ["v180-20261124"])
+
+    # §SIDE-POLICY-DEFER 2026-11-27 现场：盒子 `intraday_priority=false` ⇒ 盘中投递一律
+    # `intraday_skip_no_priority`（rc=0、一个字节都没拉）⇒ ACK 永远不来 ⇒ 重试定时器每
+    # 30 秒拉一轮、每轮 2 分钟烘焙，版本号一路涨（当天 v2063）而盒子一次没收到。
+    # 跳过必须记成"已发布、等收盘那一次"，重试轮短路；ACK 到达或 latch 变更即解除。
+    def _skip_tail(self):
+        return "CARRIER_UPDATE_RESULT=OK version=v180-20261124 reason=intraday_skip_no_priority"
+
+    def _defer_req(self, reason="cold_start_open", until="15:00"):
+        return {"request_id": "r1", "day": "20261124", "kind": "reversal",
+                "until": until, "reason": reason}
+
+    def test_ssh_skip_parks_request_instead_of_retrying_forever(self):
+        req = self._defer_req()
+        self.mod._atomic_json(self.mod.SIDE_POLICY_REQ, req)
+        self.mod._atomic_json(self.mod.SIDE_POLICY_PENDING, {"r1": "v180-20261124"})
+        self.mod.ssh_intraday_trigger = mock.Mock(return_value=(True, self._skip_tail()))
+        self.assertTrue(self.mod.retry_pending_side_policy())
+        deferred = self.mod._read_json(self.mod.SIDE_POLICY_DEFERRED)
+        self.assertEqual(deferred["r1"]["version"], "v180-20261124")
+        self.assertEqual(deferred["r1"]["latch"], ["20261124", "reversal", "15:00", "cold_start_open"])
+        # 请求已被撤掉（盒子跳过 ⇒ 产物等它自己的班次），pending 也一起清；
+        # 不撤的话 systemd 的 PathExists 会在每次退出后立刻重触发，直到启动限流。
+        self.assertFalse(os.path.exists(self.mod.SIDE_POLICY_REQ))
+        self.assertEqual(self.mod._read_json(self.mod.SIDE_POLICY_PENDING), {})
+
+    def test_deferred_short_circuits_urgent_run_without_bake_or_ssh(self):
+        req = self._defer_req()
+        self.mod._atomic_json(self.mod.SIDE_POLICY_REQ, req)
+        self.mod._atomic_json(self.mod.SIDE_POLICY_DEFERRED, {
+            "r1": {"version": "v180-20261124",
+                   "latch": ["20261124", "reversal", "15:00", "cold_start_open"],
+                   "reason": "intraday_skip_no_priority"}})
+        build = tempfile.mkdtemp()
+        os.makedirs(os.path.join(build, "qmt_gateway"))
+        self.addCleanup(shutil.rmtree, build, ignore_errors=True)
+        self.mod.BUILD_DIR = build
+        patches = {"publish_gateway_files": mock.Mock(),
+                   "apply_static_params_base": mock.Mock(side_effect=RuntimeError("bake reached"))}
+        for name, value in patches.items():
+            patcher = mock.patch.object(self.mod, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.mod.ssh_intraday_trigger = mock.Mock()
+        with mock.patch.object(sys, "argv", ["hotreload", "--urgent-side-policy"]):
+            self.assertEqual(self.mod._main_impl(), 0)
+        self.assertFalse(patches["apply_static_params_base"].called)
+        self.assertFalse(patches["publish_gateway_files"].called)
+        self.assertFalse(self.mod.ssh_intraday_trigger.called)
+        # 短路同时撤掉被重写的 req（PathExists 是 level-triggered，不撤会反复触发）。
+        self.assertFalse(os.path.exists(self.mod.SIDE_POLICY_REQ))
+
+    def test_urgent_without_request_is_idle_and_never_bakes(self):
+        """没有加急请求时，`--urgent-side-policy` 必须立即空转退出。
+
+        现场（13:21）：重试定时器每 30 秒拉一次 `--urgent-side-policy`，即使 req 已被
+        reaper 清掉也照跑完整烘焙——sha 随买点/利好池漂移，于是每轮 2 分钟烘焙 + 每轮
+        投递，盒子客户端被反复重启。加急通道只服务加急请求。"""
+        build = tempfile.mkdtemp()
+        os.makedirs(os.path.join(build, "qmt_gateway"))
+        self.addCleanup(shutil.rmtree, build, ignore_errors=True)
+        self.mod.BUILD_DIR = build
+        self.assertFalse(os.path.exists(self.mod.SIDE_POLICY_REQ))
+        patches = {"publish_gateway_files": mock.Mock(),
+                   "apply_static_params_base": mock.Mock(side_effect=RuntimeError("bake reached"))}
+        for name, value in patches.items():
+            patcher = mock.patch.object(self.mod, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with mock.patch.object(sys, "argv", ["hotreload", "--urgent-side-policy"]):
+            self.assertEqual(self.mod._main_impl(), 0)
+        self.assertFalse(patches["apply_static_params_base"].called)
+        self.assertFalse(patches["publish_gateway_files"].called)
+
+    def test_deferred_does_not_cover_a_changed_latch(self):
+        self.mod._atomic_json(self.mod.SIDE_POLICY_REQ, self._defer_req(reason="pm1300_index_drop"))
+        self.mod._atomic_json(self.mod.SIDE_POLICY_DEFERRED, {
+            "r1": {"version": "v180-20261124",
+                   "latch": ["20261124", "reversal", "15:00", "cold_start_open"]}})
+        self.assertFalse(self.mod.side_policy_deferred_ok())
+
+    def test_deferred_released_once_the_box_acks_that_version(self):
+        self.mod._atomic_json(self.mod.SIDE_POLICY_REQ, self._defer_req())
+        self.mod._atomic_json(self.mod.SIDE_POLICY_PENDING, {"r1": "v180-20261124"})
+        self.mod._atomic_json(self.mod.SIDE_POLICY_DEFERRED, {
+            "r1": {"version": "v180-20261124",
+                   "latch": ["20261124", "reversal", "15:00", "cold_start_open"]}})
+        with open(self.mod.CARRIER_ACK_HISTORY, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"version": "v180-20261124", "ok": True}) + "\n")
+        self.assertFalse(self.mod.side_policy_deferred_ok())
+        self.assertTrue(self.mod.reap_side_policy_requests(self.now))
+        self.assertEqual(self.mod._read_json(self.mod.SIDE_POLICY_DEFERRED), {})
+        self.assertFalse(os.path.exists(self.mod.SIDE_POLICY_REQ))
 
     # _early_fixture 构造 SHA 相同的早退夹具，区分待发 latch 与已发布载荷。
     def _early_fixture(self, latch=True, pending_version="v179-20261124"):
@@ -223,7 +318,7 @@ class HotReloadSidePolicyTest(unittest.TestCase):
     def test_real_sha_early_branch_rebinds_manifest_without_bump(self):
         req, version, patches = self._early_fixture()
         calls = []
-        self.mod.ssh_intraday_trigger = lambda ver: calls.append(ver) or True
+        self.mod.ssh_intraday_trigger = lambda ver: calls.append(ver) or (True, "")
         with mock.patch.object(sys, "argv", ["hotreload", "--urgent-side-policy"]):
             self.assertEqual(self.mod._main_impl(), 0)
         self.assertEqual(calls, [version])
@@ -233,7 +328,7 @@ class HotReloadSidePolicyTest(unittest.TestCase):
 
     def test_real_sha_early_branch_rebakes_when_manifest_lost_latch(self):
         self._early_fixture(latch=False)
-        self.mod.ssh_intraday_trigger = mock.Mock(return_value=True)
+        self.mod.ssh_intraday_trigger = mock.Mock(return_value=(True, ""))
         with mock.patch.object(sys, "argv", ["hotreload", "--urgent-side-policy"]):
             with self.assertRaisesRegex(RuntimeError, "bake reached"):
                 self.mod._main_impl()
@@ -260,7 +355,7 @@ class HotReloadSidePolicyTest(unittest.TestCase):
     def test_pending_write_failure_keeps_req_and_does_not_ssh(self):
         self._early_fixture()
         calls = []
-        self.mod.ssh_intraday_trigger = lambda ver: calls.append(ver) or True
+        self.mod.ssh_intraday_trigger = lambda ver: calls.append(ver) or (True, "")
         with mock.patch.object(sys, "argv", ["hotreload", "--urgent-side-policy"]):
             with mock.patch.object(self.mod, "_atomic_json", side_effect=OSError("readonly")):
                 with self.assertRaises(OSError):
@@ -272,7 +367,7 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         _req, version, _patches = self._early_fixture()
         with open(self.mod.CARRIER_ACK_HISTORY, "w") as fh:
             fh.write(json.dumps({"version": version, "ok": True}) + "\n")
-        self.mod.ssh_intraday_trigger = mock.Mock(return_value=True)
+        self.mod.ssh_intraday_trigger = mock.Mock(return_value=(True, ""))
         with mock.patch.object(sys, "argv", ["hotreload", "--urgent-side-policy"]):
             self.assertEqual(self.mod._main_impl(), 0)
         self.assertFalse(self.mod.ssh_intraday_trigger.called)
@@ -335,20 +430,20 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         service = open(os.path.join(base, "quant-carrier-side-policy.service"), encoding="utf-8").read()
         self.assertIn("--urgent-side-policy", service)
         self.assertIn("Restart=on-failure", service)
-        # D6-c 2026-11-25：引擎按账号落盘 ⇒ 条件与监视都改成 glob（不许再硬编码 uid）。
-        self.assertIn("ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req", service)
+        # 2026-11-27：由 glob 收窄成 OWNER_UID 一条（别的账号的 req 本链永不消费，
+        # glob 会让 .path 每 0.06 秒重触发直到 unit-start-limit-hit）。uid 与 .service
+        # 的 Environment=OWNER_UID= 必须逐字相同，见下面的等值锁。
+        self.assertIn("ConditionPathExists=/var/lib/quant-trading-v2/accounts/u_1785377969825355000/side_policy_urgent.req", service)
         path_unit = open(os.path.join(base, "quant-carrier-side-policy.path"), encoding="utf-8").read()
-        self.assertIn("PathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req", path_unit)
-        self.assertNotIn("PathExists=/var/lib/quant-trading-v2/side_policy_urgent.req", path_unit)
+        self.assertIn("PathExists=/var/lib/quant-trading-v2/accounts/u_1785377969825355000/side_policy_urgent.req", path_unit)
+        self.assertNotIn("PathExistsGlob=", path_unit)
+        self.assertNotIn("ConditionPathExistsGlob=", service)
         # 系统日历的秒级 /30 只重复当前分钟；小时通配才是真正的每 30 秒重试窗。
         timer = open(os.path.join(base, "quant-carrier-side-policy-retry.timer"), encoding="utf-8").read()
         for hour in ("13", "14", "15"):
             self.assertIn("OnCalendar=Mon..Fri *-*-* %s:*:00/30" % hour, timer)
         self.assertNotIn("13:00:00/30", timer)
 
-
-if __name__ == "__main__":
-    unittest.main()
 
     # ------------------------------------------------------------------
     # D6-c 2026-11-25 第二半：发版后写点搬到 accounts/<uid>/，读面必须跟着走
@@ -379,24 +474,32 @@ if __name__ == "__main__":
         self.assertEqual(self.mod._side_state_path("side_policy_latest.json"),
                          os.path.join(acct, "side_policy_latest.json"))
 
-    def test_urgent_unit_watches_the_account_dir_glob(self):
-        """systemd 的路径条件必须用 glob：账号 UID 不是常量，写死一个 UID 会在换账号后静默失效。
+    def test_urgent_unit_watches_only_the_owner_account(self):
+        """systemd 的路径条件必须与 .service 的 OWNER_UID 同源，且**不许**用 glob。
 
-        `PathExistsGlob` 是 .path 的触发判据、`ConditionPathExistsGlob` 是 .service 的启动条件，
-        两者少一个就变成"req 一直堆着没人烤"（加急发布最需要它的时候失效）。
+        为什么从 glob 收窄（2026-11-27 现场）：`carrier_manifest` 是按账号读写的
+        （`internal/server/carrier.go`），本链只发布 OWNER 那一个账号；别的账号
+        （现场是 facai2026）写出自己的 req 后永远没人消费 ⇒ `PathExistsGlob` 一直成立
+        ⇒ 每 0.06 秒重触发一次 service，10 分钟内就把 `.path` 打成 unit-start-limit-hit。
+        负锁两枚：glob 回潮、路径退回根目录，任一命中即红。
         """
         deploy = os.path.join(REPO, "deploy", "gz-ubuntu")
         with open(os.path.join(deploy, "quant-carrier-side-policy.path"), encoding="utf-8") as fh:
             path_unit = fh.read()
         with open(os.path.join(deploy, "quant-carrier-side-policy.service"), encoding="utf-8") as fh:
             svc_unit = fh.read()
-        glob = "accounts/*/side_policy_urgent.req"
-        self.assertIn("PathExistsGlob=/var/lib/quant-trading-v2/%s" % glob, path_unit)
-        self.assertIn("ConditionPathExistsGlob=/var/lib/quant-trading-v2/%s" % glob, svc_unit)
-        # 负锁：写死单个 UID 或退回根目录都算回潮。
+        import re
+        owner = re.search(r"^Environment=OWNER_UID=(\S+)$", svc_unit, re.M)
+        self.assertIsNotNone(owner, "service 缺 Environment=OWNER_UID=")
+        uid = owner.group(1)
+        want = "/var/lib/quant-trading-v2/accounts/%s/side_policy_urgent.req" % uid
+        self.assertIn("PathExists=%s" % want, path_unit)
+        self.assertIn("ConditionPathExists=%s" % want, svc_unit)
+        # 负锁：glob 与根目录路径都不许回潮。
         for unit in (path_unit, svc_unit):
+            self.assertNotIn("side_policy_urgent.req\nPathExistsGlob", unit)
+            self.assertNotIn("PathExistsGlob=", unit)
             self.assertNotIn("/var/lib/quant-trading-v2/side_policy_urgent.req", unit)
-            self.assertNotIn("/accounts/u_1785377969825355000/", unit)
 
 
 class SideReversalReqTest(unittest.TestCase):
@@ -444,3 +547,7 @@ class SideReversalReqTest(unittest.TestCase):
         merged = self.mod.merge_side_policy(base, base, req, now)
         self.assertEqual((merged.get("latch") or {}).get("kind"), "no_new")
         self.assertFalse(merged["allow_new"])
+
+
+if __name__ == "__main__":
+    unittest.main()

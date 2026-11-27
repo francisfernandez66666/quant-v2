@@ -27152,8 +27152,22 @@ for unit in ('quant-carrier-side-policy.path','quant-carrier-side-policy.service
     if not Path('deploy/gz-ubuntu',unit).is_file():
         missing.append('unit:'+unit)
 service=Path('deploy/gz-ubuntu/quant-carrier-side-policy.service').read_text()
-if '--urgent-side-policy' not in service or 'Restart=on-failure' not in service or 'ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req' not in service:
-    missing.append('urgent_service')
+pathu=Path('deploy/gz-ubuntu/quant-carrier-side-policy.path').read_text()
+# 2026-11-27：由 glob 收窄成 OWNER_UID 一条（别的账号的 req 本链永不消费，
+# glob 会把 .path 每 0.06 秒重触发直到 unit-start-limit-hit）。uid 两处必须同源。
+import re as _re239
+_owner239=_re239.search(r'^Environment=OWNER_UID=(\S+)$', service, _re239.M)
+if not _owner239:
+    missing.append('urgent_service_owner_uid')
+else:
+    _want239='/var/lib/quant-trading-v2/accounts/%s/side_policy_urgent.req' % _owner239.group(1)
+    if ('--urgent-side-policy' not in service or 'Restart=on-failure' not in service
+            or ('ConditionPathExists=' + _want239) not in service):
+        missing.append('urgent_service')
+    if ('PathExists=' + _want239) not in pathu:
+        missing.append('urgent_path_owner_scoped')
+if 'PathExistsGlob=' in pathu or 'ConditionPathExistsGlob=' in service:
+    missing.append('urgent_unit_glob_back')
 timer=Path('deploy/gz-ubuntu/quant-carrier-side-policy-retry.timer').read_text()
 if '13:*:00/30' not in timer or '14:*:00/30' not in timer or '15:*:00/30' not in timer:
     missing.append('retry_timer')
@@ -27179,18 +27193,36 @@ def body(name):
 early=body('early_retry_side_policy')
 main_body=body('_main_impl')
 retry=body('retry_pending_side_policy')
-order=['manifest = _read_json','version = manifest.get','published_side_policy(version)','if actual != latch:','pending[req_id] = version','_atomic_json(SIDE_POLICY_PENDING','reap_side_policy_requests(now)','retry_pending_side_policy()']
+# 2026-11-27：pending 自 §244 起是"整键替换"（`pending != {req_id: version}` 比较 +
+# `_atomic_json(..., {req_id: version})` 整写），旧的累加式 `pending[req_id] = version` 已退役；
+# 这把锁跟着收口形状走，判据仍是"重绑发生在 SSH 之前、ACK 先消费"。
+order=['manifest = _read_json','version = manifest.get','published_side_policy(version)','if actual != latch:','if pending != {req_id: version}:','_atomic_json(SIDE_POLICY_PENDING','reap_side_policy_requests(now)','retry_pending_side_policy()']
 ep=[early.find(a) for a in order]
 if -1 in ep or ep != sorted(ep):
     missing.append('early_retry_structure')
-if ('return None' not in early[early.find('if actual != latch:'):early.find('pending[req_id] = version')]):
+if ('return None' not in early[early.find('if actual != latch:'):early.find('if pending != {req_id: version}:')]):
     missing.append('latch_mismatch_falls_through')
 if main_body.find('early_retry_side_policy(side_request') < 0 or main_body.find('early_retry_side_policy(side_request') > main_body.find('apply_static_params_base()'):
     missing.append('early_retry_before_bake')
-if 'if pending.get(req_id) != version:' not in early:
+if 'if pending != {req_id: version}:' not in early:
     missing.append('same_version_no_rewrite')
 if 'return False' not in retry or 'ssh_intraday_trigger(version)' not in retry:
     missing.append('retry_failure_visible')
+# §SIDE-POLICY-DEFER 2026-11-27：盒子 `intraday_skip_no_priority` 时"跳过≠送达"。
+# 五处必须同时在场，少一处就回到"每 30 秒 2 分钟烘焙、版本号空涨、盒子整天收不到"的现场。
+if 'SIDE_POLICY_DEFERRED = _side_state_path("side_policy_urgent.deferred.json")' not in hot:
+    missing.append('defer_ledger_path')
+if 'def side_policy_deferred_ok(' not in hot or 'def mark_side_policy_deferred(' not in hot:
+    missing.append('defer_helpers')
+if 'HOTRELOAD_SIDE_POLICY_IDLE reason=no_request' not in main_body:
+    missing.append('urgent_idle_without_request')
+if main_body.find('side_policy_deferred_ok()') < 0 or main_body.find('side_policy_deferred_ok()') > main_body.find('apply_static_params_base()'):
+    missing.append('defer_short_circuit_before_bake')
+if '"intraday_skip" in (tail or "")' not in retry:
+    missing.append('retry_parks_on_skip')
+reap=body('reap_side_policy_requests')
+if 'deferred.pop(req_id, None)' not in reap:
+    missing.append('ack_clears_deferred')
 rules=Path('qmt_gateway/rules_sizing.py').read_text()
 rt=ast.parse(rules)
 rfunc=next(n for n in rt.body if isinstance(n,ast.FunctionDef) and n.name=='side_policy_state')
@@ -27298,15 +27330,21 @@ GO239C_RC=0
 go test ./internal/server -run 'TestFlowStatusSidePolicy' -count=1 >/dev/null 2>&1 || GO239C_RC=$?
 [ "$GO239C_RC" = "0" ] || fail239 "D6-c 读面行为腿未过（§239 ㉟）"
 
-# ㊱ D6-c：systemd .path/.service 都用账号 glob（旧的单条 .req 断言已在静态块同批改）。
+# ㊱ D6-c：.path/.service 都只盯 OWNER 那一条（2026-11-27 由 glob 收窄：别的账号的
+# req 本链永不消费，glob 会让 .path 每 0.06 秒重触发直到 unit-start-limit-hit）。
 CNT239=$((CNT239 + 1))
-GLOB239='ConditionPathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req'
 UNITP239=$(cat deploy/gz-ubuntu/quant-carrier-side-policy.path || true)
 UNITS239=$(cat deploy/gz-ubuntu/quant-carrier-side-policy.service || true)
-grep_q "PathExistsGlob=/var/lib/quant-trading-v2/accounts/*/side_policy_urgent.req" UNITP239 F || \
-	fail239 "D6-c .path 没盯账号目录（§239 ㊱）"
-grep_q "$GLOB239" UNITS239 F || \
-	fail239 "D6-c .service 条件没改成账号 glob（§239 ㊱）"
+OWN239=$(printf '%s\n' "$UNITS239" | sed -n 's/^Environment=OWNER_UID=//p' | head -1)
+[ -n "$OWN239" ] || fail239 "D6-c .service 缺 Environment=OWNER_UID=（§239 ㊱）"
+grep_q "PathExists=/var/lib/quant-trading-v2/accounts/${OWN239}/side_policy_urgent.req" UNITP239 F || \
+	fail239 "D6-c .path 没盯 OWNER 账号目录（§239 ㊱）"
+grep_q "ConditionPathExists=/var/lib/quant-trading-v2/accounts/${OWN239}/side_policy_urgent.req" UNITS239 F || \
+	fail239 "D6-c .service 条件与 .path 的 uid 不同源（§239 ㊱）"
+UNITS239_ALL="$UNITP239$UNITS239"
+if grep_q 'PathExistsGlob=' UNITS239_ALL F; then
+	fail239 "D6-c 账号 glob 回潮（§239 ㊱：会把 .path 打成 unit-start-limit-hit）"
+fi
 
 # ㊲ D6-a Go 判据在场：极强右侧只认 right/分数/阈值/开关，数值真源在 carrier_knobs.go。
 CNT239=$((CNT239 + 1))
