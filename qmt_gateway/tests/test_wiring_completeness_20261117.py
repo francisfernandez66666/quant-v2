@@ -13,6 +13,7 @@
 # English: structural contract that build_context assembles every ctx input the live
 # tactics/factors need. Not "all keys any rule reads" (many are runtime-injected); this
 # is the reviewed live-tactic input set, each with a real source.
+import datetime
 import os
 import re
 import subprocess
@@ -38,6 +39,7 @@ LIVE_TACTIC_CTX_INPUTS = {
     "limit_board_count", "is_leader", "ladder_height", "consec_boards", "afternoon_reseal",
     "up_stop", "index_change_pct", "limit_up_count", "limit_up_count_history",
     "broken_board_ratio", "broken_board_count", "broken_board_ratio_history",
+    "broken_board_count_history", "ladder_height_history",
     "seal_amount_ratio", "first_seal_minute", "sector_limit_up_drop_pct",
     "emotion_phase", "emotion_day",
 }
@@ -63,6 +65,27 @@ def _build_context_keys():
     return set(re.findall(r'^\s*"([a-z_0-9]+)":', body, re.M))
 
 
+def _build_and_load():
+    """跑真构建器产沙箱产物再 load 成模块（行为腿只能对"真产物"取证）。"""
+    import importlib.util
+    out_dir = tempfile.mkdtemp()
+    proc = subprocess.run([sys.executable, BUILDER, "--target", "sandbox",
+                           "--out-dir", out_dir],
+                          capture_output=True, text=True, cwd=REPO)
+    if proc.returncode != 0:
+        raise AssertionError("sandbox build failed: %s" % (proc.stdout + proc.stderr)[-800:])
+    path = ""
+    for token in proc.stdout.replace("\n", " ").split():
+        if token.startswith("artifact="):
+            path = token.split("=", 1)[1]
+    if not path:
+        raise AssertionError("sandbox build printed no artifact= line")
+    spec = importlib.util.spec_from_file_location("wiring_completeness_artifact", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class WiringCompleteness20261117(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -77,6 +100,136 @@ class WiringCompleteness20261117(unittest.TestCase):
         # 防止有人把白名单清空让上一条恒绿。
         self.assertGreaterEqual(len(LIVE_TACTIC_CTX_INPUTS), 30,
                                 "契约键集被缩小到失去意义")
+
+
+class PrecalcHistoryPassthrough20261127(unittest.TestCase):
+    """§F1（2026-11-27）行为腿：两个情绪历史键必须真的从 precalc 流到 ctx。
+
+    为什么不能只做 grep 锁：本缺陷的形状正是"键名写对了、装配没写"——
+    pregen 早就烘了 ladder_height_history / broken_board_count_history，
+    build_context 的字典字面量里却从来没有它们，于是 emo_max_board /
+    emo_blast_cnt 的 input 恒 None、整条规则静默 declined，读数上完全看不出来。
+    所以这里跑真产物、真调 build_context，断言**值**相等而不是键存在。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _build_and_load()
+
+    # §F1：把两条历史塞进 precalc，真跑产物里的 build_context，断言值逐位透传。
+    def test_precalc_history_keys_reach_build_context(self):
+        mod = self.mod
+        symbol = "600000.SH"
+        ladder_hist = [3.0, 4.0, 2.0, 5.0, 3.0]
+        broken_hist = [11.0, 9.0, 14.0, 8.0, 12.0]
+        saved = mod.PARAMS
+        try:
+            table = dict(saved)
+            precalc = dict(table.get("precalc") or {})
+            row = dict(precalc.get(symbol) or {})
+            row["ladder_height_history"] = ladder_hist
+            row["broken_board_count_history"] = broken_hist
+            precalc[symbol] = row
+            table["precalc"] = precalc
+            mod.PARAMS = table
+
+            class _NoTick(object):
+                """没有任何行情/历史读数：precalc 透传腿必须自己把值带出来。"""
+
+                def get_full_tick(self, codes):
+                    return {}
+
+            ctx = mod.build_context(_NoTick(), symbol,
+                                    datetime.datetime(2026, 11, 27, 10, 15, 0),
+                                    [], {}, 100000.0)
+            self.assertEqual(ctx.get("ladder_height_history"), ladder_hist,
+                             "ladder_height_history 没流到 ctx（emo_max_board 会恒弃权）")
+            self.assertEqual(ctx.get("broken_board_count_history"), broken_hist,
+                             "broken_board_count_history 没流到 ctx（emo_blast_cnt 会恒弃权）")
+        finally:
+            mod.PARAMS = saved
+
+    def test_absent_precalc_keeps_the_keys_none(self):
+        """缺 precalc 时两键仍是 None：只增透传，不许把"没有读数"变成 0/空表。"""
+        mod = self.mod
+        saved = mod.PARAMS
+        try:
+            table = dict(saved)
+            precalc = dict(table.get("precalc") or {})
+            precalc.pop("600000.SH", None)
+            table["precalc"] = precalc
+            mod.PARAMS = table
+
+            class _NoTick(object):
+                def get_full_tick(self, codes):
+                    return {}
+
+            ctx = mod.build_context(_NoTick(), "600000.SH",
+                                    datetime.datetime(2026, 11, 27, 10, 15, 0),
+                                    [], {}, 100000.0)
+            self.assertIsNone(ctx.get("ladder_height_history"))
+            self.assertIsNone(ctx.get("broken_board_count_history"))
+        finally:
+            mod.PARAMS = saved
+
+
+class VwapDevWiring20261127(unittest.TestCase):
+    """P2（2026-11-27）行为腿：vwap_dev 必须由盒内 tick 现算，单位是百分比。
+
+    为什么钉在真产物上：`_vwap_of` 自带量纲自纠与 sanity 带，vwap_dev 又只是它的
+    一层派生。用桩替掉 `_vwap_of` 就测不到"这条腿在盒上到底会不会出数"——而这
+    正是它存在的全部意义（盒内拿不到 1m K，只能靠 tick 累计额/量）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _build_and_load()
+
+    def _ctx_with_tick(self, tick):
+        mod = self.mod
+        symbol = "600000.SH"
+
+        class _Tick(object):
+            def get_full_tick(self, codes):
+                return {code: tick for code in codes}
+
+        return mod.build_context(_Tick(), symbol,
+                                 datetime.datetime(2026, 11, 27, 10, 15, 0),
+                                 [], {}, 100000.0)
+
+    def test_price_above_vwap_reads_positive_percent(self):
+        # 1000 股 × 10.00 = 10000 元累计额，现价 10.50 ⇒ 高于 VWAP 5%
+        ctx = self._ctx_with_tick({"lastPrice": 10.5, "lastClose": 10.0,
+                                   "volume": 1000.0, "amount": 10000.0})
+        self.assertAlmostEqual(ctx.get("vwap_dev"), 5.0, places=6)
+
+    def test_price_below_vwap_reads_negative_percent(self):
+        ctx = self._ctx_with_tick({"lastPrice": 9.5, "lastClose": 10.0,
+                                   "volume": 1000.0, "amount": 10000.0})
+        self.assertAlmostEqual(ctx.get("vwap_dev"), -5.0, places=6)
+
+    def test_no_tick_keeps_it_none(self):
+        """没有 tick 时必须是 None（诚实弃权），不是 0（0 会被读成"正好在 VWAP"）。"""
+        mod = self.mod
+        saved = mod.PARAMS
+        try:
+            table = dict(saved)
+            precalc = dict(table.get("precalc") or {})
+            precalc.pop("600000.SH", None)
+            table["precalc"] = precalc
+            mod.PARAMS = table
+
+            class _NoTick(object):
+                def get_full_tick(self, codes):
+                    return {}
+
+            ctx = mod.build_context(_NoTick(), "600000.SH",
+                                    datetime.datetime(2026, 11, 27, 10, 15, 0),
+                                    [], {}, 100000.0)
+            self.assertIsNone(ctx.get("vwap_dev"))
+        finally:
+            mod.PARAMS = saved
+
 
 
 if __name__ == "__main__":

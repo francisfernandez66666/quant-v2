@@ -36,7 +36,11 @@ cfg=[c for c in auth.get(\"configs\",[]) if c.get(\"key\")==\"quant_config_json_
 qc=json.loads(cfg[\"value\"])
 af=json.load(open(\"/var/lib/quant-trading-v2/applied_factors.json\"))
 wl=qc.get(\"qmt\",{}).get(\"strategies\") or []
-rules=[r for r in (af if isinstance(af,list) else af.get(\"rules\",[])) if r.get(\"id\") in wl]
+# §P5-ENABLED 2026-11-27: a disabled library rule must leave the live whitelist too.
+entries=[r for r in (af if isinstance(af,list) else af.get(\"rules\",[])) if r.get(\"id\")]
+off={r[\"id\"] for r in entries if r.get(\"enabled\",True) is False}
+wl=[i for i in wl if i not in off]
+rules=[r for r in entries if r.get(\"id\") in wl]
 print(json.dumps({\"wl\":wl,\"rules\":rules,\"uid\":cfg.get(\"user_id\")},ensure_ascii=False))
 '") || { echo "HOTRELOAD_ABORT reason=ssh_pull_failed" >&2; exit 1; }
 

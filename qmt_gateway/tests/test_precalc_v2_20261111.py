@@ -8,6 +8,7 @@
   3. scalar_bands 出厂带 NewsEvent/ConceptHeat（D1 分数/利好池强度的评分带）。
 数据全部用临时 SQLite 造（不碰真实研究库），跑完即清理（owner：清理掉测试数据）。
 """
+import datetime
 import json
 import os
 import sqlite3
@@ -46,10 +47,16 @@ def research_db(tmp_path, monkeypatch):
     conn.close()
     flowp = tmp_path / "moneyflow"
     flowp.mkdir()
-    flow = {"saved_at": "2026-11-11T15:05:48+08:00", "days": [
-        {"Date": "2026-11-07", "MainNet": -47401832},
-        {"Date": "2026-11-10", "MainNet": -37376221},
-        {"Date": "2026-11-11", "MainNet": 12000000}]}
+    # §P3 2026-11-27：个股资金流加了新鲜度闸（末根必须在最近 FLOW_FRESH_DAYS 个自然日内），
+    # 所以夹具的三根日期要**跟着今天走**，否则这条用例会随时间漂成"资金流腿弃权"的假红。
+    # 三根间隔不变（4 天 / 1 天 / 今天），断言的仍是"今日净流入为正、5 日合计更小"。
+    today = datetime.date.today()
+    def _d(offset):
+        return (today - datetime.timedelta(days=offset)).isoformat()
+    flow = {"saved_at": today.isoformat() + "T15:05:48+08:00", "days": [
+        {"Date": _d(4), "MainNet": -47401832},
+        {"Date": _d(1), "MainNet": -37376221},
+        {"Date": _d(0), "MainNet": 12000000}]}
     (flowp / "600580.json").write_text(json.dumps(flow), encoding="utf-8")
     monkeypatch.setattr(P, "LOCAL_DB", dbp)
     monkeypatch.setattr(P, "FLOW_DIR", str(flowp))

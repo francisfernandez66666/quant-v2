@@ -731,6 +731,35 @@ func resolveBacktestRef(id int64) (string, int64) {
 // its summary lands in result_text for the frontend's backtest tab.
 func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
 	ruleID := r.PathValue("id")
+	// §P4-ALL 2026-11-27（PLAN_FACTOR_FIX_P0_20261126 §5）：全量重测所有战法。
+	// 回测数据源是审批固化的 applied_factors.json / applied_patterns.json，与单条规则回放
+	// 同一套 ruleEvalAdapter，所以这里只是把 `--strategy all` 那个既有入口接到 HTTP：
+	// payload kind="all" → run-task 的 btreplay.Options.Strategy="all"（因子+形态+内置五形态）。
+	// refID=0：批量任务没有单一规则归属，幂等键就落在 (backtest_strategy, 0) 上——
+	// 连点两次只会有一条活跃任务，不会把整晚 CPU 排成队列。
+	if strings.EqualFold(strings.TrimSpace(ruleID), "all") {
+		q := r.URL.Query()
+		payload := map[string]any{"kind": "all", "start": "20230801"}
+		if v := q.Get("start"); v != "" {
+			payload["start"] = v
+		}
+		if v := q.Get("end"); v != "" {
+			payload["end"] = v
+		}
+		if v, err := strconv.Atoi(q.Get("maxstocks")); err == nil && v > 0 {
+			payload["maxstocks"] = v
+		}
+		if q.Get("quality") == "true" || q.Get("quality") == "1" {
+			payload["quality"] = true
+		}
+		id, _, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, 0, payload)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 202, map[string]any{"status": "queued", "kind": "all", "task_id": id})
+		return
+	}
 	kind, num, ok := parseLibraryRuleID(ruleID)
 	if !ok {
 		writeError(w, 400, "无效规则 ID（fac_<n>/pat_<n> 或内置战法名）")

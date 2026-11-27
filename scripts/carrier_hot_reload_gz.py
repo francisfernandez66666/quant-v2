@@ -1152,6 +1152,14 @@ def rebuild_snapshots(qc, rules, wl):
     qg = os.path.join(BUILD_DIR, "qmt_gateway")
     now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     by = {r["id"]: r for r in rules if isinstance(r, dict) and r.get("id")}
+    # §P5-ENABLED 2026-11-27（PLAN_FACTOR_FIX_P0_20261126 §6 / owner D7）：战法库的
+    # `enabled` 开关以前只管研究引擎与回测，**没有**同步进实盘白名单派生链——停用的战法
+    # 在载体里仍参与最佳规则竞争。这里在**快照重建**处过滤（不动 sync_strategy_switches
+    # 的 derive()：那里 ② 要求"规则表里的每条都在白名单"，只滤规则不滤白名单会自相矛盾）。
+    # 停用即从实盘白名单剔除：两条腿一起滤，allow 与 factor_rules 才自洽。
+    disabled = {rid for rid, rule in by.items()
+                if isinstance(rule, dict) and rule.get("enabled", True) is False}
+    wl = [rid for rid in wl if rid not in disabled]
     sel = [by[i] for i in wl if i in by]
     # SIDE-POLICY compatibility migration: old applied_factors entries have no style.
     # fac_118 is the single real scored-left producer; all others stay unclassified.

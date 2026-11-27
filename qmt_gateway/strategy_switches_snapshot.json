@@ -1,7 +1,7 @@
 {
   "_comment": "\u91cf\u5316\u4ea4\u6613 tab \u6218\u6cd5\u5f00\u5173 + \u5df2\u5ba1\u6279\u56e0\u5b50\u89c4\u5219\u7684\u73b0\u7f51\u5feb\u7167\u3002params \u7684 enabled_strategies/factor_rules \u7531\u672c\u6587\u4ef6\u6d3e\u751f\uff1b\u6539\u5f00\u5173\u5fc5\u987b\u91cd\u8dd1 scripts/sync_strategy_switches.py\uff0c\u4e0d\u8981\u5728 params \u91cc\u624b\u6539\u3002",
-  "captured_at": "2026-11-10T15:05:00+08:00",
-  "source": "gz:/var/lib/quant-trading-v2/auth.json + applied_factors.json (fresh pull 15:05)",
+  "captured_at": "2026-11-27T10:55:02+08:00",
+  "source": "gz auth.json+applied_factors.json (carrier_hot_reload_gz)",
   "enabled_strategies": [
     "dragon",
     "n_shape",
@@ -19,7 +19,21 @@
     "fac_156",
     "fac_160",
     "fac_163",
-    "fac_162"
+    "fac_162",
+    "fac_172",
+    "fac_173",
+    "fac_174",
+    "fac_175",
+    "fac_176",
+    "fac_177",
+    "fac_178",
+    "fac_179",
+    "fac_180",
+    "fac_181",
+    "fac_182",
+    "fac_183",
+    "fac_184",
+    "fac_185"
   ],
   "factor_rules": [
     {
@@ -66,6 +80,7 @@
         "VSTD20": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 10,
       "ir": 1.342697965127352,
       "excess": 0.006453593046222632,
@@ -111,6 +126,7 @@
         "VolSurge5": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.9883016762331999,
       "excess": 0,
@@ -151,6 +167,7 @@
         "VolSurge5": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 10,
       "ir": 0.9937341097234296,
       "excess": 0.0011728339269175402,
@@ -197,6 +214,7 @@
         "VolSurge5": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.9894890315198249,
       "excess": 0.0007514196798304429,
@@ -243,6 +261,7 @@
         "VolSurge5": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.9758609700234222,
       "excess": 0.005926915018044505,
@@ -289,6 +308,7 @@
         "VolSurge5": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 1.017681212982167,
       "excess": 0.0011694998049495958,
@@ -320,6 +340,7 @@
         "VSTD20": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 10,
       "ir": 1.3470116712681393,
       "excess": 0.0005703475750753782,
@@ -360,6 +381,7 @@
         "lu_board3": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.8650337803051504,
       "excess": 0,
@@ -394,6 +416,7 @@
         "VSTD20": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.8570858151519516,
       "excess": 0.004742718945952542,
@@ -425,6 +448,7 @@
         "VSTD20": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.8507520381105635,
       "excess": 0.0008608553608783275,
@@ -459,6 +483,7 @@
         "lu_board3": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.8505974470376946,
       "excess": -0.002275100175415022,
@@ -493,6 +518,7 @@
         "lu_board3": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.8543626909798725,
       "excess": 0,
@@ -524,6 +550,7 @@
         "VolSurge5": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.9098863035482037,
       "excess": 0.0006682830078871995,
@@ -558,6 +585,7 @@
         "lu_board3": -1
       },
       "buy_threshold": 70,
+      "entry_style": "unclassified",
       "horizon": 5,
       "ir": 0.9100204411026779,
       "excess": -0.004069037296940686,
@@ -566,7 +594,412 @@
       "loss": 0,
       "cum_return": 0,
       "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_172",
+      "name": "\u56e0\u5b50\u6218\u6cd5#172",
+      "enabled": true,
+      "candidate_id": 172,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "emo_max_board",
+        "emo_blast_cnt"
+      ],
+      "weights": {
+        "emo_blast_cnt": 0.5,
+        "emo_max_board": 0.5
+      },
+      "directions": {
+        "emo_blast_cnt": -1,
+        "emo_max_board": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_173",
+      "name": "\u56e0\u5b50\u6218\u6cd5#173",
+      "enabled": true,
+      "candidate_id": 173,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "emo_blast_rate",
+        "emo_chg5"
+      ],
+      "weights": {
+        "emo_blast_rate": 0.5,
+        "emo_chg5": 0.5
+      },
+      "directions": {
+        "emo_blast_rate": -1,
+        "emo_chg5": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_174",
+      "name": "\u56e0\u5b50\u6218\u6cd5#174",
+      "enabled": true,
+      "candidate_id": 174,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "lu_reblast_low",
+        "lu_board3"
+      ],
+      "weights": {
+        "lu_board3": 0.5,
+        "lu_reblast_low": 0.5
+      },
+      "directions": {
+        "lu_board3": 1,
+        "lu_reblast_low": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_175",
+      "name": "\u56e0\u5b50\u6218\u6cd5#175",
+      "enabled": true,
+      "candidate_id": 175,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "Flow5d",
+        "FlowToday"
+      ],
+      "weights": {
+        "Flow5d": 0.6,
+        "FlowToday": 0.4
+      },
+      "directions": {
+        "Flow5d": 1,
+        "FlowToday": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_176",
+      "name": "\u56e0\u5b50\u6218\u6cd5#176",
+      "enabled": true,
+      "candidate_id": 176,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "NewsEvent",
+        "ConceptHeat"
+      ],
+      "weights": {
+        "ConceptHeat": 0.5,
+        "NewsEvent": 0.5
+      },
+      "directions": {
+        "ConceptHeat": 1,
+        "NewsEvent": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_177",
+      "name": "\u56e0\u5b50\u6218\u6cd5#177",
+      "enabled": true,
+      "candidate_id": 177,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "IndexChange",
+        "ConceptHeat"
+      ],
+      "weights": {
+        "ConceptHeat": 0.5,
+        "IndexChange": 0.5
+      },
+      "directions": {
+        "ConceptHeat": 1,
+        "IndexChange": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_178",
+      "name": "\u56e0\u5b50\u6218\u6cd5#178",
+      "enabled": true,
+      "candidate_id": 178,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "IsLeader",
+        "lu_early_seal"
+      ],
+      "weights": {
+        "IsLeader": 0.5,
+        "lu_early_seal": 0.5
+      },
+      "directions": {
+        "IsLeader": 1,
+        "lu_early_seal": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_179",
+      "name": "\u56e0\u5b50\u6218\u6cd5#179",
+      "enabled": true,
+      "candidate_id": 179,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "FlowToday",
+        "emo_chg5"
+      ],
+      "weights": {
+        "FlowToday": 0.5,
+        "emo_chg5": 0.5
+      },
+      "directions": {
+        "FlowToday": 1,
+        "emo_chg5": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_180",
+      "name": "\u56e0\u5b50\u6218\u6cd5#180",
+      "enabled": true,
+      "candidate_id": 180,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "Mom10"
+      ],
+      "weights": {
+        "Mom10": 1
+      },
+      "directions": {
+        "Mom10": -1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_181",
+      "name": "\u56e0\u5b50\u6218\u6cd5#181",
+      "enabled": true,
+      "candidate_id": 181,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "Mom20"
+      ],
+      "weights": {
+        "Mom20": 1
+      },
+      "directions": {
+        "Mom20": -1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_182",
+      "name": "\u56e0\u5b50\u6218\u6cd5#182",
+      "enabled": true,
+      "candidate_id": 182,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "RSI14",
+        "STO20"
+      ],
+      "weights": {
+        "RSI14": 0.5,
+        "STO20": 0.5
+      },
+      "directions": {
+        "RSI14": 1,
+        "STO20": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_183",
+      "name": "\u56e0\u5b50\u6218\u6cd5#183",
+      "enabled": true,
+      "candidate_id": 183,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "VSTD20",
+        "LnMktCap"
+      ],
+      "weights": {
+        "LnMktCap": 0.5,
+        "VSTD20": 0.5
+      },
+      "directions": {
+        "LnMktCap": 1,
+        "VSTD20": -1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_184",
+      "name": "\u56e0\u5b50\u6218\u6cd5#184",
+      "enabled": true,
+      "candidate_id": 184,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "Mom5",
+        "VSTD20"
+      ],
+      "weights": {
+        "Mom5": 0.5,
+        "VSTD20": 0.5
+      },
+      "directions": {
+        "Mom5": -1,
+        "VSTD20": -1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
+    },
+    {
+      "id": "fac_185",
+      "name": "\u56e0\u5b50\u6218\u6cd5#185",
+      "enabled": true,
+      "candidate_id": 185,
+      "applied_at": "2026-11-27 10:53:11",
+      "factors": [
+        "RSI14",
+        "BBI",
+        "VMIN10"
+      ],
+      "weights": {
+        "BBI": 0.3,
+        "RSI14": 0.4,
+        "VMIN10": 0.3
+      },
+      "directions": {
+        "BBI": 1,
+        "RSI14": 1,
+        "VMIN10": 1
+      },
+      "buy_threshold": 70,
+      "entry_style": "unclassified",
+      "horizon": 5,
+      "ir": 0,
+      "excess": 0,
+      "signal_count": 0,
+      "win": 0,
+      "loss": 0,
+      "cum_return": 0,
+      "adj_basis": "hfq-forward-fill-1"
     }
   ],
-  "pattern_rules": []
+  "pattern_rules": [],
+  "owner_user_id": "u_1785377969825355000",
+  "user_id": "u_1785377969825355000"
 }

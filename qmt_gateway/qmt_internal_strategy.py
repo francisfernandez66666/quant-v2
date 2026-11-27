@@ -3769,6 +3769,15 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
     today_vol_vs_5d = (tick_volume / vol5) if (tick_volume and vol5) else None
     _STATE.setdefault("bars_cov", {})[symbol] = 1 if bars else 0
     pre = (PARAMS.get("precalc") or {}).get(symbol) or {}
+    # P2 2026-11-27: vwap_dev -- today's price versus the session VWAP, in
+    # PERCENT. The baked band is in percent too (-3.0 == 3% below VWAP), so the
+    # unit must not drift to a ratio. A missing or suspect VWAP (the same
+    # _vwap_of the buy-price gate uses) leaves it None: the scalar proxy then
+    # declines, which is the honest answer -- never a fabricated 0.
+    _vwap_now, _vwap_note = _vwap_of(tick)
+    vwap_dev = None
+    if _vwap_now and _vwap_now > 0.0 and tick.get("last_price"):
+        vwap_dev = (float(tick.get("last_price")) / float(_vwap_now) - 1.0) * 100.0
     # AFTERNOON-RESEAL (2026-11-17): compute the protective reading in-client
     # for HELD names only (leader_decay fires on positions). Failed reads stay
     # None -> the sell is skipped (owner ruling: never infer "not resealed"
@@ -3878,6 +3887,19 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         # conversion. Absent stays None = honest abstain (flow_factor.go:88-113).
         "flow_ratio_today": pre.get("flow_today_pct"),
         "flow_ratio_5d": pre.get("flow_5d_pct"),
+        # P3 2026-11-27: board-level net-inflow z-score (cloud bake). A DIFFERENT
+        # leg from the two per-stock keys above: flow_resid ranks the board, they
+        # rank the name. Absent stays None = honest abstain.
+        "flow_resid": pre.get("flow_resid"),
+        # P3 2026-11-27: 21-session turnover log-sum and the 252-day cumulative
+        # log-return span. Both are scalars baked from panels the sandbox has no
+        # access to (daily_basic / daily history beyond the 80 baked bars).
+        "stom_21": pre.get("stom_21"),
+        "cmra": pre.get("cmra"),
+        # P3 2026-11-27: last six DISCLOSED ROE prints (oldest-last). The pregen
+        # applies the ann_date look-ahead guard before choosing them, so a report
+        # announced after the bake day can never leak into "today".
+        "fin_series": pre.get("fin_series"),
         # C1 (2026-11-17): good_news_fade reads ctx["news_event"] as a DICT
         # {score, positive, propagation, day}; the R9 bearish gate at ~:1958 reads
         # the PRECALC news_event float directly (pre.get("news_event")), so the two
@@ -3906,6 +3928,11 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         # "abstain=allow" defect that filled the account at 98.9%.
         "is_leader": pre.get("is_leader"),
         "ladder_height": pre.get("ladder_height"),
+        # F1 fix 2026-11-27: pregen already bakes ladder_height_history (see the
+        # section-200 double-write lock) but this dict literal never carried it, so
+        # emo_max_board saw input=None and the whole rule was declined. Pass-through
+        # only: still None when precalc is missing (honest abstention).
+        "ladder_height_history": pre.get("ladder_height_history"),
         # CONSEC-BOARDS 2026-11-17: leader_decay_v2's OTHER protective reading --
         # per-stock consecutive limit-ups before today, baked from daily+stk_limit
         # (pool ladder_height is NOT a substitute). Absent = honest decline.
@@ -3924,6 +3951,9 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "broken_board_ratio": pre.get("broken_board_ratio"),
         "broken_board_count": pre.get("broken_board_count"),
         "broken_board_ratio_history": pre.get("broken_board_ratio_history"),
+        # F1 fix 2026-11-27: same as ladder_height_history -- emo_blast_cnt saw
+        # input=None because this key was never wired. Pass-through only.
+        "broken_board_count_history": pre.get("broken_board_count_history"),
         "seal_amount_ratio": pre.get("seal_amount_ratio"),
         "first_seal_minute": pre.get("first_seal_minute"),
         "sector_limit_up_drop_pct": pre.get("sector_limit_up_drop_pct"),
@@ -3932,6 +3962,9 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         # was aggregated from); carried so a reader can see the emotion scalar is a
         # prior-session baseline, not a live intraday count.
         "emotion_day": pre.get("emotion_day"),
+        # P2 2026-11-27: live tick-derived VWAP deviation in PERCENT (see the
+        # computation above). None whenever no trustworthy VWAP exists.
+        "vwap_dev": vwap_dev,
     }
 
 
@@ -4637,6 +4670,7 @@ def _t_opposite_leg_blocked(book, orders, symbol, day, ctx):
         return False
     if buy == sell:
         return False  # both false: no direction; both true: t_direction never does this
+    # Only one direction can be set; map it to the side names the round book uses.
     our_side = "buy" if buy else "sell"
     other = "sell" if buy else "buy"
     t_codes = set(str(v) for v in (PARAMS.get("t_signal_codes") or {}).values())

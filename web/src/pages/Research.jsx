@@ -1154,6 +1154,18 @@ export default function Research() {
       startLibPoll()
     } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
   }
+  async function doLibraryBacktestAll() {
+  // §P4-ALL 2026-11-27：一键全量重测所有战法（因子规则 + 形态规则 + 内置五形态）。
+  // 后端 library/{id}/backtest 的 id 传 "all" 即入队一条 backtest_strategy(kind=all)，
+  // 与 CLI `research backtest-strategy --strategy all` 走同一条 btreplay 执行路径。
+    if (!(await confirmDialog('全量重测所有战法？（因子规则+形态规则+内置五形态，盘后执行，耗时较长）'))) return
+    try {
+      await api.backtestLibraryRule('all', { start: btStart.trim(), end: btEnd.trim(), quality: true })
+      setActiveTab('backtests')
+      await loadBacktests()
+      startLibPoll()
+    } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
+  }
   function startLibPoll() {
   // 启动战法库回测轮询（定时刷新任务状态）
     if (libPollTimer.current) return
@@ -1645,10 +1657,13 @@ export default function Research() {
               {/* 操作按钮组：启停/回测/详情/删除（仅审批权限可见） */}
               {canApprove && (
                 <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <Button size="small" theme="primary" variant="outline" onClick={() => toggleLibrary(s)}>{s.enabled ? '停用' : '启用'}</Button>
+                  <Button size="small" theme="primary" variant="outline" title="停用后该战法退出实盘白名单（下次载体重投生效）" onClick={() => toggleLibrary(s)}>{s.enabled ? '停用' : '启用'}</Button>
                   <Button size="small" theme="warning" onClick={() => doLibraryBacktest(s)}>回测此战法</Button>
                   <Button size="small" variant="outline" onClick={() => selectStrategy('rule:' + s.id)}>{expanded ? '收起详情' : '详情'}</Button>
                   <Button size="small" theme="danger" onClick={() => removeLibrary(s)}>删除</Button>
+                  {/* §P5 2026-11-27：启停不再只是研究侧开关——停用的战法会从载体实盘白名单里摘掉
+                      （carrier_hot_reload 重建快照时按 enabled 过滤），但生效时机是下一次载体重投。 */}
+                  <span style={{ fontSize: 11, color: 'var(--app-muted)' }}>停用/启用会同步实盘白名单，下次载体重投生效</span>
                 </div>
               )}
               {/* 展开态：显示该战法最近一次回测报告文本 */}
@@ -2220,6 +2235,7 @@ export default function Research() {
                   ...btCandidates.map((c) => ({ label: `#${c.id} ${c.kind === 'pattern' ? '形态战法' : '因子战法'}（${c.kind === 'pattern' ? ('触发 ' + (c.triggers ?? '规则')) : ('IC ' + fmt(c.ic_mean) + '，IR ' + fmt(c.ir))}）`, value: c.id })),
                 ]} />
                 <Button theme="warning" disabled={btPickId === 0} onClick={() => doBacktestById(btPickId)}>发起全量回测</Button>
+                <Button theme="primary" variant="outline" onClick={doLibraryBacktestAll}>全量重测所有战法</Button>
                 <Button theme="default" variant="outline" loading={btLoading} onClick={loadBacktests}>刷新列表</Button>
               </div>
               <div style={{ marginTop: 8, fontSize: 12, color: 'var(--app-muted)' }}>

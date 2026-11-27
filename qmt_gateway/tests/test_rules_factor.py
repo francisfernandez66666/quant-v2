@@ -881,3 +881,135 @@ class TestNewsEventLinearBand(unittest.TestCase):
             rf.score_factor_rule(table, rule, ctx(concept_heat=50))["details"]["ConceptHeat"], 0.5)
         self.assertAlmostEqual(
             rf.score_factor_rule(table, rule, ctx(concept_heat=0))["details"]["ConceptHeat"], 0.0)
+
+
+class TestCtxKeysAndZeroWeight(unittest.TestCase):
+    """§F2 / §F3（2026-11-27）：CTX_KEYS 派生一致 + 0 权重因子不否决整条规则。"""
+
+    def test_ctx_keys_matches_factor_library(self):
+        """CTX_KEYS 必须等于「全部因子 input + 5 个下单闸键」，且每个键都真被 build_context 装配。"""
+        derived = {e["input"] for e in rf.FACTOR_LIBRARY.values()} | set(rf.ORDER_GATE_CTX_KEYS)
+        self.assertEqual(sorted(derived - set(rf.CTX_KEYS)), [], "CTX_KEYS 漏登记")
+        self.assertEqual(sorted(set(rf.CTX_KEYS) - derived), [], "CTX_KEYS 陈旧")
+        from test_wiring_completeness_20261117 import _build_context_keys
+        bc = _build_context_keys()
+        self.assertEqual(sorted(set(rf.CTX_KEYS) - bc), [],
+                         "CTX_KEYS 里有 build_context 未装配的键")
+
+    def _rule(self, factors, weights, directions):
+        return {"id": "fac_zw", "name": "factor_composite", "factors": factors,
+                "weights": weights, "directions": directions, "buy_threshold": 0.0}
+
+    def test_zero_weight_factor_does_not_veto_the_rule(self):
+        """fac_154 形状：DebtToAssets 权重 0 且缺 fin_pit，规则必须按剩余因子打分。"""
+        rule = self._rule(["VSTD20", "DebtToAssets"],
+                          {"VSTD20": 1.0, "DebtToAssets": 0.0},
+                          {"VSTD20": 1, "DebtToAssets": -1})
+        table = params(factor_rules=[rule])
+        res = rf.score_factor_rule(table, rule, ctx(bars=bars()))
+        self.assertFalse(res["declined"], "0 权重因子把整条规则拖成了 declined")
+        self.assertIn("VSTD20", res["details"])
+        self.assertNotIn("DebtToAssets", res["details"])
+
+    def test_all_zero_weights_still_yields_no_signal(self):
+        """全 0 权重：沿用既有 no_usable_factor 分支（declined=False 但 pass=False）。
+
+        这个形状在 §F3 之前之后逐字节相同：used 只累计真的打上分的权重，0 权重
+        不会让 used 变正，下游照旧读成"无信号"。本用例钉的是"短路没有把这条
+        既有语义改掉"，不是新语义。
+        """
+        rule = self._rule(["VSTD20"], {"VSTD20": 0.0}, {"VSTD20": 1})
+        table = params(factor_rules=[rule])
+        res = rf.score_factor_rule(table, rule, ctx(bars=bars()))
+        self.assertFalse(res["declined"])
+        self.assertFalse(res["pass"])
+        self.assertEqual(res["reason"], "no_usable_factor")
+        self.assertEqual(res["score"], 0.0)
+
+    def test_nonzero_weight_missing_input_still_declines(self):
+        rule = self._rule(["VSTD20", "DebtToAssets"],
+                          {"VSTD20": 1.0, "DebtToAssets": 0.3},
+                          {"VSTD20": 1, "DebtToAssets": -1})
+        table = params(factor_rules=[rule])
+        res = rf.score_factor_rule(table, rule, ctx(bars=bars()))
+        self.assertTrue(res["declined"])
+        self.assertTrue(res["reason"].startswith("input_absent:"))
+
+
+class TestNewBarsFactors(unittest.TestCase):
+    """P2（2026-11-27）：盒内自算的 4 枚新因子。
+
+    为什么这四枚要单独钉：它们的存在意义就是"不依赖任何烘参面板也能打分"——
+    Rev5/Rev10/tsrank_vol5 只吃日K，vwap_dev 只吃 tick。任何一枚退回
+    "缺面板即弃权"，P1 里依赖它的规则就会静默变成哑巴，而读数上看不出区别。
+    """
+
+    def _rule(self, fid, direction=1, threshold=50.0):
+        return {"id": "fac_%s" % fid, "name": "factor_composite", "factors": [fid],
+                "weights": {fid: 1.0}, "directions": {fid: direction},
+                "buy_threshold": threshold}
+
+    def _score(self, rule, scene, **table_overrides):
+        table = params(factor_rules=[rule], **table_overrides)
+        return rf.score_factor_rule(table, rule, scene)
+
+    def test_rev10_scores_a_falling_name_above_a_rising_one(self):
+        """Rev10 的取负写在实现里：跌得越多分越高，涨得越多分越低。"""
+        def falling(index):
+            return 100.0 if index < 35 else 90.0
+
+        def rising(index):
+            return 100.0 if index < 35 else 110.0
+
+        rule = self._rule("Rev10", threshold=60.0)
+        down = self._score(rule, ctx(bars=bars(count=40, price_fn=falling)))
+        up = self._score(rule, ctx(bars=bars(count=40, price_fn=rising)))
+        self.assertFalse(down["declined"])
+        self.assertFalse(up["declined"])
+        self.assertGreater(down["details"]["Rev10"], 0.8,
+                           "末期下跌没有换算成高分（取负写反了？）")
+        self.assertLess(up["details"]["Rev10"], 0.2,
+                        "末期上涨没有换算成低分（取负写反了？）")
+        self.assertTrue(down["pass"])
+        self.assertFalse(up["pass"])
+
+    def test_rev5_and_rev10_are_separate_windows(self):
+        """两枚因子必须是不同窗口，否则'短反转'与'中反转'会读成同一个数。"""
+        self.assertEqual(rf.FACTOR_LIBRARY["Rev5"]["windows"], [5])
+        self.assertEqual(rf.FACTOR_LIBRARY["Rev10"]["windows"], [10])
+
+    def test_tsrank_vol5_puts_a_volume_spike_at_the_top(self):
+        """末日放量 → 时序排名 1.0；末日缩量 → 0 附近。"""
+        spike = bars(count=10, volume=100.0)
+        spike[-1]["volume"] = 300.0
+        rule = self._rule("tsrank_vol5")
+        hot = self._score(rule, ctx(bars=spike))
+        self.assertFalse(hot["declined"])
+        self.assertAlmostEqual(hot["details"]["tsrank_vol5"], 1.0)
+
+        dry = bars(count=10, volume=300.0)
+        dry[-1]["volume"] = 100.0
+        cold = self._score(rule, ctx(bars=dry))
+        self.assertFalse(cold["declined"])
+        self.assertAlmostEqual(cold["details"]["tsrank_vol5"], 0.0)
+
+    def test_vwap_dev_is_linear_inside_the_baked_band(self):
+        """单位是百分比：band {-3,+3} 上 +1.5 → 0.75，不是 0.5。"""
+        rule = self._rule("vwap_dev")
+        band = {"vwap_dev": {"min": -3.0, "max": 3.0, "mode": "linear"}}
+        hot = self._score(rule, ctx(vwap_dev=1.5), scalar_bands=band)
+        self.assertFalse(hot["declined"])
+        self.assertAlmostEqual(hot["details"]["vwap_dev"], 0.75)
+        self.assertTrue(hot["pass"])
+
+    def test_vwap_dev_declines_without_a_reading_or_a_band(self):
+        """缺 tick 读数 / 缺 band 都必须弃权——绝不把'没有 VWAP'当 0 分参与复合。"""
+        rule = self._rule("vwap_dev")
+        band = {"vwap_dev": {"min": -3.0, "max": 3.0, "mode": "linear"}}
+        self.assertTrue(self._score(rule, ctx(), scalar_bands=band)["declined"])
+        self.assertTrue(self._score(rule, ctx(vwap_dev=1.5))["declined"])
+
+    def test_new_bar_kinds_are_registered(self):
+        """kind 没登记在 _BAR_KINDS 时 factor_input 返回 None——静默弃权的经典形状。"""
+        self.assertIn("reversal", rf._BAR_KINDS)
+        self.assertIn("ts_rank_vol", rf._BAR_KINDS)

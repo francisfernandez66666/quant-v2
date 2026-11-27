@@ -140,6 +140,18 @@ FACTOR_LIBRARY = {
     "Alpha4": {"kind": "alpha4", "windows": [9], "input": BARS_INPUT},
     "Alpha12": {"kind": "alpha12", "windows": [1], "input": BARS_INPUT},
     "Alpha101": {"kind": "alpha101", "windows": [], "input": BARS_INPUT},
+    # --- P2 (2026-11-27) in-box alpha additions: every one of these reads ONLY
+    #     the day bars the client already downloads, so it can never be dead for
+    #     lack of a baked panel. They are new ids, not replacements: no existing
+    #     rule or approved factor changes meaning.
+    # Short-horizon reversal, alpha158 REV5/REV10 shape: the NEGATION lives in
+    # the implementation, so a rule always uses direction +1 (a name that fell
+    # over the window scores high). Doing the negation here, once, stops the
+    # "negative twice = momentum again" silent swap.
+    "Rev5": {"kind": "reversal", "windows": [5], "input": BARS_INPUT},
+    "Rev10": {"kind": "reversal", "windows": [10], "input": BARS_INPUT},
+    # Time-series rank of today's volume inside its own 5-day window (0..1).
+    "tsrank_vol5": {"kind": "ts_rank_vol", "windows": [5], "input": BARS_INPUT},
 
     # ------------------------------------------------------------------
     # DECLINE BY DESIGN: everything below has no input inside the sandbox.
@@ -227,6 +239,27 @@ FACTOR_LIBRARY = {
                   "direct": True, "missing_input": "eastmoney main-force net inflow, today"},
     "Flow5d": {"kind": "scalar_proxy", "windows": [], "input": "flow_5d_pct",
                "direct": True, "missing_input": "eastmoney main-force net inflow, 5 day"},
+    # P3 2026-11-27 (owner D2, bands approved): three new scalars the cloud now
+    # bakes from data the sandbox cannot reach. Each is a plain scalar_proxy --
+    # a band plus a value in ctx, nothing else -- so a missing bake declines the
+    # factor instead of scoring a fabricated 0.
+    #   stom_21   = sum of ln(1 + turnover%) over the last 21 sessions (activity)
+    #   cmra      = max-min of the 252-day cumulative log return (trend span)
+    #   flow_resid= z-score of the board's net-inflow rate vs its own 20 sessions
+    #               (board-level proxy; flow_today_pct/flow_5d_pct stay the
+    #               per-stock leg -- the two must not be mixed up)
+    "stom_21": {"kind": "scalar_proxy", "windows": [], "input": "stom_21",
+                "direct": True, "missing_input": "21-session turnover panel (cloud bake)"},
+    "cmra": {"kind": "scalar_proxy", "windows": [], "input": "cmra",
+             "direct": True, "missing_input": "252-session close panel (cloud bake)"},
+    "flow_resid": {"kind": "scalar_proxy", "windows": [], "input": "flow_resid",
+                   "direct": True, "missing_input": "board net-inflow z (cloud bake)"},
+    # P3 2026-11-27: the last six DISCLOSED quarterly ROE prints, oldest-last.
+    # A real series (percentile), so it needs no band -- but it does need the
+    # ann_date look-ahead guard in the pregen, or a report announced after the
+    # bake day would leak into "today".
+    "fin_series": {"kind": "series", "windows": [], "input": "fin_series",
+                   "direct": True, "missing_input": "point-in-time ROE history (cloud bake)"},
     # concept heat / news / LLM event / index leg / leadership: same story --
     # an external readout that no longer exists inside the sandbox.
     "ConceptHeat": {"kind": "scalar_proxy", "windows": [], "input": "concept_heat",
@@ -243,6 +276,16 @@ FACTOR_LIBRARY = {
                     "direct": True, "missing_input": "index weight / benchmark leg (external)"},
     "IsLeader": {"kind": "scalar_proxy", "windows": [], "input": "is_leader",
                  "direct": True, "missing_input": "sector leadership ranking (external)"},
+    # P2 2026-11-27: today's price versus the session VWAP, in PERCENT. The
+    # reading is computed inside build_context from the tick's cumulative
+    # amount/volume (the same _vwap_of the buy-price gate uses), so it exists
+    # only when a real tick does -- a missing/suspect VWAP leaves the key None
+    # and the rule declines instead of scoring a fabricated 0. The baked band
+    # is in percent too (-3.0 == 3% below VWAP); the unit must not drift to a
+    # ratio, or every value would sit at the very bottom of the band.
+    "vwap_dev": {"kind": "scalar_proxy", "windows": [], "input": "vwap_dev",
+                 "direct": True,
+                 "missing_input": "session VWAP (tick cumulative amount/volume)"},
 }
 
 # NEWS-GATE (owner ruling 2026-11-12, R1/R5): news-family factors are weighted
@@ -697,6 +740,62 @@ def _f_momentum(cols, windows):
     return out
 
 
+def _f_reversal(cols, windows):
+    """Negated n-day LOG return (alpha158 REV5/REV10 shape), P2 2026-11-27.
+
+    out[i] = -ln(close[i] / close[i-n]). A name that fell over the window gets a
+    POSITIVE reading, so a rule on this factor always uses direction +1. The
+    negation is done exactly once, here: putting it in the rule direction as
+    well would silently turn short-horizon reversal back into momentum.
+    Fewer than n bars, or a non-positive price, stays NaN (the percentile then
+    drops the factor out instead of scoring it zero).
+    """
+    close = _close(cols)
+    span = int(windows[0])
+    out = _nan_list(len(close))
+    for index in range(len(close)):
+        if index < span:
+            continue
+        here, before = close[index], close[index - span]
+        if here > ZERO and before > ZERO:
+            out[index] = -(math.log(here / before))
+    return out
+
+
+def _f_ts_rank_vol(cols, windows):
+    """Time-series rank of today's volume inside its own n-day window (0..1).
+
+    Rank = (# strictly smaller volumes in the window) / (n - 1), so a volume
+    spike lands near 1 and a dried-up tape near 0 -- the same "rank inside its
+    own history" idea as time_series_percentile, but computed per bar so the
+    percentile layer above can still rank the resulting series. Fewer than n
+    bars, or a NaN volume inside the window, stays NaN.
+    """
+    volume = cols["volume"]
+    span = int(windows[0])
+    out = _nan_list(len(volume))
+    if span < 2:
+        return out
+    for index in range(len(volume)):
+        if index + 1 < span:
+            continue
+        window = volume[index - span + 1:index + 1]
+        bad = False
+        for item in window:
+            if math.isnan(item):
+                bad = True
+                break
+        if bad:
+            continue
+        here = window[-1]
+        below = 0
+        for item in window[:-1]:
+            if item < here:
+                below += 1
+        out[index] = float(below) / float(span - 1)
+    return out
+
+
 def _f_realized_vol(cols, windows):
     return rolling_std(log_returns(_close(cols)), windows[0])
 
@@ -978,11 +1077,34 @@ def _f_turnover_std(cols, windows, series):
     return rolling_std(series, windows[0])
 
 
+def _series_on_bars(series, size):
+    """Most-recent-first panel -> bar-aligned list (NaN padded at the FRONT).
+
+    P3 2026-11-27: every baked panel is written newest-first (the pregen SQL is
+    `ORDER BY trade_date DESC`), while the bar axis is oldest-first and is ~80
+    long against a 20-slot panel. Aligning by raw index therefore did two
+    things at once: it paired today's reading with the OLDEST bar, and it left
+    the newest slots NaN so _last_value returned NaN and the factor silently
+    declined. That is the structural dead link behind LnMktCap/EP_ttm/BP/
+    SP_ttm/CFP_ttm/DP: all six could never score, and nothing in the readout
+    said so. Here series[0] lands on the LAST bar.
+    """
+    out = _nan_list(size)
+    count = len(series)
+    for offset in range(count):
+        index = size - 1 - offset
+        if index < 0:
+            break
+        out[index] = series[offset]
+    return out
+
+
 def _f_ln_mktcap(cols, windows, series):
     close = cols["close"]
+    shares = _series_on_bars(series, len(close))
     out = _nan_list(len(close))
     for index in range(len(close)):
-        share = series[index] if index < len(series) else NAN
+        share = shares[index]
         if math.isnan(share) or close[index] <= ZERO or share <= ZERO:
             continue
         out[index] = math.log(close[index] * share)
@@ -1000,9 +1122,10 @@ def _f_raw_series(cols, windows, series):
 
 
 def _f_valuation(cols, windows, series, reciprocal):
+    values = _series_on_bars(series, len(cols["close"]))
     out = _nan_list(len(cols["close"]))
     for index in range(len(out)):
-        value = series[index] if index < len(series) else NAN
+        value = values[index]
         if math.isnan(value):
             continue
         if reciprocal:
@@ -1015,6 +1138,8 @@ def _f_valuation(cols, windows, series, reciprocal):
 
 _BAR_KINDS = {
     "momentum": _f_momentum,
+    "reversal": _f_reversal,
+    "ts_rank_vol": _f_ts_rank_vol,
     "realized_vol": _f_realized_vol,
     "amplitude": _f_amplitude,
     "atr_ratio": _f_atr_ratio,
@@ -1317,6 +1442,15 @@ def score_factor_rule(params, rule, ctx, cols=None):
     used = ZERO
     details = {}
     for fid in factors:
+        # F3 fix (2026-11-27 owner D1): a zero-weight factor contributes nothing to
+        # the composite and must NOT veto the whole rule through a missing input.
+        # Go (factor.go:330-350) only drops that factor (NaN percentile) out of
+        # `used`; it never refuses the rule. Short-circuiting before factor_input
+        # is equivalent. The only live sample is fac_154 / DebtToAssets (weight 0),
+        # which used to drag the whole rule to declined whenever fin_pit was absent.
+        weight = weights.get(fid, default_weight)
+        if weight == ZERO:
+            continue
         entry = factor_input(params, ctx, fid, cols)
         if entry is None:
             return {"declined": True, "reason": "input_absent:%s" % (fid,),
@@ -1329,7 +1463,6 @@ def score_factor_rule(params, rule, ctx, cols=None):
             pct = time_series_percentile(entry.get("values"), min_samples)
             if pct is None:
                 continue  # Go: NaN percentile -> the factor drops out of the composite
-        weight = weights.get(fid, default_weight)
         direction = directions.get(fid, default_direction)
         contrib = float(weight)
         # NEWS-GATE (owner ruling 2026-11-12, R1/R5): news factors weigh heavier.
@@ -1618,20 +1751,18 @@ FACTOR_PARAM_KEYS = [
     "symbol_head_len",
 ]
 
-# The ctx fields this module consumes. Everything absent is a DECLINE, never a
-# zero: a zero would keep the Go weight in play on a factor that was never read.
-CTX_KEYS = [
-    "available_cash",
-    "bars",
-    "concept_heat",
-    "daily_buy_total",
-    "fin_pit",
-    "flow_5d_pct",
-    "flow_today_pct",
-    "last_price",
-    "news_event",
-    "symbol",
-    "trading_day",
-    "turnover_series",
-    "valuation_series",
-]
+# Order-gate ctx keys read directly by rules_factor outside the factor loop
+# (symbol for attribution, trading_day gate, last_price / available_cash /
+# daily_buy_total for the budget gate).
+ORDER_GATE_CTX_KEYS = frozenset({
+    "symbol", "trading_day", "last_price", "available_cash", "daily_buy_total",
+})
+
+# The ctx fields this module consumes. F2 fix (2026-11-27 owner D5): DERIVED from
+# the FACTOR_LIBRARY inputs (+ the 5 order-gate keys) instead of hand-maintained.
+# The old literal list had drifted so far it missed news_event_score /
+# index_change_pct / is_leader / every *_history key, so the wiring source of
+# truth was not trustworthy. Everything absent is a DECLINE, never a zero.
+CTX_KEYS = sorted(
+    {entry["input"] for entry in FACTOR_LIBRARY.values()} | ORDER_GATE_CTX_KEYS
+)

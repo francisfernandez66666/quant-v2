@@ -44,7 +44,10 @@ class PregenWiringB(unittest.TestCase):
             if "circ_mv" in s:
                 return [(5000.0,)]
             if "FROM fina_indicator" in s:
-                return [(0.5, 12.0, 12.0, 6.0, 30.0, 8.0, 40.0, 5.0)]
+                # §P3 2026-11-27：财务档改 10 列（尾部加 ann_date,end_date），
+                # bake 侧按有效公告日过滤后才取最新一档（前视闸）。
+                return [(0.5, 12.0, 12.0, 6.0, 30.0, 8.0, 40.0, 5.0,
+                         "20261031", "20260930")]
             if "FROM d1_scores" in s:
                 # §D1-LEVEL：带 level（个股级），测 news_propagation=False 烘值。
                 return [(35.0, "2026-11-16", "个股")]  # score, date, level
@@ -152,14 +155,15 @@ class PregenWiringB(unittest.TestCase):
     def test_fetch_market_history_orders_old_to_new_and_ratio_math(self):
         m = self.mod
         orig_q = m._q
-        # 故意返回 DESC（新→旧），函数须翻成旧→新；炸板表只有两天有行，另一天缺→该天炸板按 0 计。
+        # 故意返回 DESC（新→旧），函数须翻成旧→新；炸板表只有两天有行，缺的那天
+        # **整条炸板序列跳过**（§F4 2026-11-27：绝不补 0 冒充"没人炸板"）。
         def q(sql, args):
             s = " ".join(sql.split())
             if "FROM ths_limit_up_daily" in s and "GROUP BY trade_date" in s:
                 # (trade_date, count, max_continue_cnt) —— 路线B 要烘连板高度历史
                 return [("20261116", 30, 5), ("20261115", 20, 3), ("20261114", 10, 2)]
             if "FROM ths_break_pool_daily" in s and "GROUP BY trade_date" in s:
-                return [("20261116", 10), ("20261114", 2)]  # 20261115 缺行 -> break 0
+                return [("20261116", 10), ("20261114", 2)]  # 20261115 缺行 -> 该天不烘炸板
             return None
         m._q = q
         try:
@@ -168,18 +172,62 @@ class PregenWiringB(unittest.TestCase):
             m._q = orig_q
         self.assertIsNotNone(h)
         self.assertEqual(h["limit_up_count_history"], [10.0, 20.0, 30.0])  # old->new
-        # 20261116: 10/(30+10)=0.25; 20261115: 0/(20+0)=0; 20261114: 2/(10+2)=0.1667
-        self.assertAlmostEqual(h["broken_board_ratio_history"][2], 0.25, places=6)
-        self.assertEqual(h["broken_board_ratio_history"][1], 0.0)
-        self.assertAlmostEqual(h["broken_board_ratio_history"][0], 2.0 / 12.0, places=6)
-        # latest-session scalars + as-of day
+        # 炸板序列只剩真有行的两天：20261114 2/(10+2)、20261116 10/(30+10)。
+        self.assertEqual(h["broken_board_count_history"], [2.0, 10.0])
+        self.assertEqual(h["broken_board_ratio_history"], [round(2.0 / 12.0, 6), 0.25])
+        # latest-session scalars + as-of day（最新一天有行 ⇒ 标量照烘）
         self.assertEqual(h["broken_board_count"], 10.0)
         self.assertAlmostEqual(h["broken_board_ratio"], 0.25, places=6)
         self.assertEqual(h["emotion_day"], "20261116")
-        # 路线B：连板高度历史 + 炸板家数历史也须烘出（old->new）
+        # 路线B：连板高度历史也须烘出（old->new，涨停池有自己的行就保留）
         self.assertEqual(h["ladder_height_history"], [2.0, 3.0, 5.0])
-        self.assertEqual(h["broken_board_count_history"], [2.0, 0.0, 10.0])
         self.assertEqual(h["ladder_height"], 5.0)
+
+    def test_fetch_market_history_stale_break_pool_is_not_zero_filled(self):
+        """§F4 2026-11-27：炸板池表停更（现网自 20261117 起无新行）时的形状。
+
+        真实现场：涨停池 fresh 到当天、炸板池停在 7 个交易日前。旧实现把缺行补 0，
+        `broken_board_ratio_history` 尾部就是一串编出来的 0.0，而 emo_blast_rate 方向 -1
+        会把假 0 读成"历史最低炸板率"→ 分位 0 → 反向满分贡献，新规则 fac_173 反而更容易
+        过阈值。这条用例钉住三件事：炸板序列只含真实日、最新一天缺行时两个标量不烘、
+        涨停池那条序列仍然 fresh。
+        """
+        m = self.mod
+        orig_q = m._q
+        printed = []
+
+        def q(sql, args):
+            s = " ".join(sql.split())
+            if "FROM ths_limit_up_daily" in s and "GROUP BY trade_date" in s:
+                return [("20261127", 68, 5), ("20261126", 57, 4), ("20261117", 36, 3)]
+            if "FROM ths_break_pool_daily" in s and "GROUP BY trade_date" in s:
+                return [("20261117", 20)]  # 之后 7 个交易日全缺行
+            return None
+
+        m._q = q
+        try:
+            import builtins
+            real_print = builtins.print
+            builtins.print = lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+            try:
+                h = m.fetch_market_history("20261127", lookback=20)
+            finally:
+                builtins.print = real_print
+        finally:
+            m._q = orig_q
+        self.assertIsNotNone(h)
+        # 涨停池 fresh：三天都在
+        self.assertEqual(h["limit_up_count_history"], [36.0, 57.0, 68.0])
+        self.assertEqual(h["emotion_day"], "20261127")
+        # 炸板序列只有真实的那一天，绝不出现编出来的 0.0
+        self.assertEqual(h["broken_board_count_history"], [20.0])
+        self.assertEqual(h["broken_board_ratio_history"], [round(20.0 / 56.0, 6)])
+        # 最新一天缺行 ⇒ 两个标量整键缺席（消费侧 None 弃权，而不是 0）
+        self.assertNotIn("broken_board_count", h)
+        self.assertNotIn("broken_board_ratio", h)
+        # 陈旧要留痕：烘焙日志必须点名两个 as-of 的差距
+        self.assertTrue(any("PREGEN_BLAST_STALE" in line for line in printed),
+                        "炸板池停更时须打 PREGEN_BLAST_STALE，实际输出=%r" % (printed,))
 
     def test_fetch_market_history_returns_none_when_pool_table_empty(self):
         # 盘前池未同步 / 表不存在：_q 返回 None/空 ⇒ 整个历史 None，绝不烘一个 0 序列。

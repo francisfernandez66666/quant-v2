@@ -1313,6 +1313,7 @@ def side_time_ramp_src(params, st, hhmm, now_ts, intent="new"):
     return src
 
 
+# Resolve the intraday release ramp: (multiplier, source). T/reduce are always 1.0.
 def _side_ramp_of(params, st, hhmm, intent):
     if intent in ("t_leg", "reduce"):
         return SZ_NEUTRAL, "ramp_off"

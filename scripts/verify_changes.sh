@@ -20826,7 +20826,9 @@ if command -v go >/dev/null 2>&1; then
 	grep_q '"live_rules"' LIVE_PJT F || fail173 "载体 params 里没有 live_rules 块（现网规则没烘进去）"
 	LIVE_OUT=$(python3 scripts/sync_live_rules.py --check 2>&1 || true)
 	grep_q "LIVE_RULES_RESULT=OK" LIVE_OUT F || fail173 "现网规则派生对账未过：${LIVE_OUT##*$'\n'}"
-	grep_q "LIVE_RULES_STRATEGIES=17" LIVE_OUT F || fail173 "现网打开的战法没随包（17 枚白名单对不上；2026-11-10 v06 白名单 17 项实弹，2026-11-14 复核实读）"
+	# 白名单数量随 P1 复活批上调：2026-11-10 v06 是 17 项实弹，2026-11-27 落 fac_172–fac_185
+	# 十四条后现网 31 项（与 strategy_switches_snapshot.json / auth.json 三处同源）。
+	grep_q "LIVE_RULES_STRATEGIES=31" LIVE_OUT F || fail173 "现网打开的战法没随包（31 枚白名单对不上；2026-11-27 P1 复活批后实读，含 fac_172–fac_185）"
 	echo "   [§173 ⑩c] 现网规则随包：$(printf '%s\n' "$LIVE_OUT" | grep -E 'LIVE_RULES_SECTIONS|LIVE_RULES_FACTORS' | tr '\n' ' ')"
 	# 参数文件与 Go 必须逐键同源（这条就是"没有手抄"的可执行定义）
 	grep_q "DERIVE_CHANGED_TOTAL=0" DERIVE_OUT F || fail173 "参数文件与 Go 出厂值不一致（先跑 --write；别改 Go 去迁就一个抄错的数）"
@@ -28255,4 +28257,550 @@ grep -q 'carrier_applied_has_new_code' scripts/verify_carrier_delivery_gz.sh || 
 	fail246 "探针缺 applied 产物符号判据（只认版本号=ACK v272 旧代码那种假绿会复活）"
 [ "${B246_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §246 §CARRIER-DELIVERY-GATE 锁通过（探针在册/语法/selftest/文档强制步/applied 判据，累计判定点 ${CNT246}）"
+echo ""
+
+# ── §247 §F1-CTX-HISTORY（2026-11-27 P0：连板高度 / 炸板家数两条历史必须进 build_context）──
+# 现场：precalc 早烘了 ladder_height_history / broken_board_count_history（§PERCENTILE-SERIES
+# 2026-11-17 就双写），但 build_context 的字面字典从没透传它们 ⇒ emo_max_board / emo_blast_cnt
+# 的 factor_input 拿到 None ⇒ 引用它们的规则恒 input_absent（"没接线"伪装成"没数据"）。
+# 本段钉住两行透传 + 接线用例，防以后改字典时又漏。
+echo "==> 247 §F1-CTX-HISTORY（2026-11-27 P0：两条情绪历史透传 + 接线用例）..."
+fail247() {
+	echo "--- FAIL: §247 $*"
+	FAIL=1
+	B247_FAILED=1
+}
+CNT247=0
+
+# ① 两行透传逐字在位（键名必须与 pre.get 的参数同名，防改成写死常量/错键）
+CNT247=$((CNT247 + 1))
+python3 - <<'PY' || fail247 "两条历史没透传（§247 ①）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+for key in ("ladder_height_history", "broken_board_count_history"):
+    needle = '"%s": pre.get("%s"),' % (key, key)
+    assert needle in s, "missing pass-through: %s" % needle
+# 负锁：不许出现"补 0 顶班"（缺读必须保持 None）
+for bad in ('"ladder_height_history": pre.get("ladder_height_history") or []',
+            '"broken_board_count_history": pre.get("broken_board_count_history") or []'):
+    assert bad not in s, "missing reading must stay None, not []: %s" % bad
+PY
+
+# ② 透传位置在 build_context 的返回字典里（不是别的函数里的同名字符串）
+CNT247=$((CNT247 + 1))
+python3 - <<'PY' || fail247 "透传不在 build_context 的返回字典里（§247 ②）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+start = s.index("def build_context(")
+end = s.index("\ndef ", start + 10)
+body = s[start:end]
+for key in ("ladder_height_history", "broken_board_count_history"):
+    assert '"%s": pre.get("%s")' % (key, key) in body, key
+PY
+
+# ③ 接线用例在册且绿（LIVE_TACTIC_CTX_INPUTS 含两键 + 产物 build_context 真装配）
+CNT247=$((CNT247 + 1))
+grep -q '"broken_board_count_history", "ladder_height_history"' qmt_gateway/tests/test_wiring_completeness_20261117.py || \
+	fail247 "LIVE_TACTIC_CTX_INPUTS 没登记两条历史（§247 ③）"
+PY247_RC=0
+python3 -m pytest qmt_gateway/tests/test_wiring_completeness_20261117.py -q >/dev/null 2>&1 || PY247_RC=$?
+[ "$PY247_RC" = "0" ] || fail247 "接线完整性用例未过（§247 ③）"
+
+# ④ 载体源码仍是纯 ASCII（两行注释是英文；中文注释会让 GBK 终端静默换成 ?）
+CNT247=$((CNT247 + 1))
+python3 - <<'PY' || fail247 "载体源出现非 ASCII 字节（§247 ④）"
+import pathlib
+for name in ("qmt_gateway/qmt_internal_strategy.py", "qmt_gateway/rules_factor.py"):
+    data = pathlib.Path(name).read_bytes()
+    bad = [(i, b) for i, b in enumerate(data) if b > 127]
+    assert not bad, "%s has %d non-ASCII bytes (first at %d)" % (name, len(bad), bad[0][0])
+PY
+
+[ "${B247_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §247 §F1-CTX-HISTORY 锁通过（两行透传在 build_context 内/接线用例在册且绿/载体纯 ASCII，累计判定点 ${CNT247}）"
+echo ""
+
+# ── §248 §F2-CTX-KEYS（2026-11-27 P0：CTX_KEYS 必须由因子库派生，不许再手写清单）──
+# 现场：CTX_KEYS 是一张手写列表，新增因子时没人同步 ⇒ 新增的 input 键既不在白名单也没人验，
+# 接线缺失只能等"规则恒弃权"这种哑故障。改成「因子库 input 全集 ∪ 5 个下单闸键」派生。
+echo "==> 248 §F2-CTX-KEYS（2026-11-27 P0：CTX_KEYS 由因子库派生 + 与 build_context 对账）..."
+fail248() {
+	echo "--- FAIL: §248 $*"
+	FAIL=1
+	B248_FAILED=1
+}
+CNT248=0
+
+# ① 派生表达式在册（两个来源缺一不可）
+CNT248=$((CNT248 + 1))
+python3 - <<'PY' || fail248 "CTX_KEYS 不是派生的（§248 ①）"
+import pathlib
+s = pathlib.Path("qmt_gateway/rules_factor.py").read_text(encoding="utf-8")
+assert 'CTX_KEYS = sorted(' in s, "derived assignment missing"
+assert '{entry["input"] for entry in FACTOR_LIBRARY.values()} | ORDER_GATE_CTX_KEYS' in s, \
+    "derivation must union factor inputs with the order-gate keys"
+PY
+
+# ② 负锁：不许回潮成手写清单（`CTX_KEYS = [` 或 `CTX_KEYS = set([`）
+CNT248=$((CNT248 + 1))
+python3 - <<'PY' || fail248 "CTX_KEYS 回潮成手写清单（§248 ②）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/rules_factor.py").read_text(encoding="utf-8")
+assert not re.search(r"^CTX_KEYS\s*=\s*[\[\{]", s, re.M), "hand-written CTX_KEYS literal is back"
+PY
+
+# ③ 下单闸键恰好 5 枚（多一枚等于偷偷放宽规则层可见面，少一枚会让闸门读不到）
+CNT248=$((CNT248 + 1))
+python3 - <<'PY' || fail248 "下单闸键集合被改动（§248 ③）"
+import sys, pathlib
+sys.path.insert(0, "qmt_gateway")
+import rules_factor as rf
+want = {"symbol", "trading_day", "last_price", "available_cash", "daily_buy_total"}
+assert set(rf.ORDER_GATE_CTX_KEYS) == want, sorted(rf.ORDER_GATE_CTX_KEYS)
+derived = {e["input"] for e in rf.FACTOR_LIBRARY.values()} | set(rf.ORDER_GATE_CTX_KEYS)
+assert set(rf.CTX_KEYS) == derived, "CTX_KEYS drifted from the derived set"
+PY
+
+# ④ 双向对账用例在册且绿（CTX_KEYS ⊆ build_context 装配键）
+CNT248=$((CNT248 + 1))
+PY248_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_factor.py -q -k 'ctx_keys' >/dev/null 2>&1 || PY248_RC=$?
+[ "$PY248_RC" = "0" ] || fail248 "CTX_KEYS 对账用例未过（§248 ④）"
+
+[ "${B248_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §248 §F2-CTX-KEYS 锁通过（派生式在册/无手写回潮/闸键 5 枚/双向对账用例绿，累计判定点 ${CNT248}）"
+echo ""
+
+# ── §249 §F3-ZERO-WEIGHT（2026-11-27 owner D1：权重 0 的因子不许否决整条规则）──
+# 现场：fac_154 的 DebtToAssets 权重 0（owner 明确不要这一腿），但沙箱只要 factor_input
+# 拿不到 fin_pit 就整条 decline ⇒ 剩下 5 枚因子算出来也不参与打分。Go（factor.go）只把那
+# 一腿从分母里剔掉、从不拒绝整条规则；沙箱对齐它。
+echo "==> 249 §F3-ZERO-WEIGHT（2026-11-27 D1：0 权重因子在 factor_input 之前跳过）..."
+fail249() {
+	echo "--- FAIL: §249 $*"
+	FAIL=1
+	B249_FAILED=1
+}
+CNT249=0
+
+# ① 结构锁：`if weight == ZERO:` 必须排在 `factor_input(` 之前（不是"某处出现过"）
+CNT249=$((CNT249 + 1))
+python3 - <<'PY' || fail249 "0 权重短路不在 factor_input 之前（§249 ①）"
+import pathlib
+s = pathlib.Path("qmt_gateway/rules_factor.py").read_text(encoding="utf-8")
+start = s.index("def score_factor_rule(")
+end = s.index("\ndef ", start + 10)
+body = s[start:end]
+i_w = body.index("if weight == ZERO:")
+i_f = body.index("factor_input(")
+assert 0 < i_w < i_f, "zero-weight short-circuit must precede factor_input"
+# 短路必须是 continue（continue 才等价于 Go 的"这一腿不进分母"；return 会退化成整条弃权）
+tail = body[i_w:i_w + 200].split("\n")
+assert any(line.strip() == "continue" for line in tail[:4]), tail[:4]
+PY
+
+# ② 负锁：不许把"全部权重为 0"变成 pass（那是把规则改成恒买）
+CNT249=$((CNT249 + 1))
+python3 - <<'PY' || fail249 "全 0 权重分支被改成 pass（§249 ②）"
+import pathlib
+s = pathlib.Path("qmt_gateway/rules_factor.py").read_text(encoding="utf-8")
+assert '"reason": "no_usable_factor", "score": ZERO' in s
+i = s.index('"reason": "no_usable_factor"')
+assert '"pass": False' in s[i:i + 120], "all-zero-weight must stay pass=False"
+PY
+
+# ③ 行为腿 3 例：0 权重不否决 / 全 0 权重仍无信号 / 非 0 权重缺输入仍弃权
+CNT249=$((CNT249 + 1))
+PY249_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_factor.py -q \
+	-k 'zero_weight_factor_does_not_veto or all_zero_weights or nonzero_weight_missing_input' \
+	>/dev/null 2>&1 || PY249_RC=$?
+[ "$PY249_RC" = "0" ] || fail249 "0 权重行为腿未过（§249 ③）"
+
+[ "${B249_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §249 §F3-ZERO-WEIGHT 锁通过（短路在 factor_input 之前且 continue/全 0 权重仍无信号/三例行为腿绿，累计判定点 ${CNT249}）"
+echo ""
+
+# ── §250 §P1-REVIVAL（2026-11-27 P1：14 条闲置因子规则 fac_172–fac_185 必须在册且可打分）──
+# 施工时 gz research_candidates 的 MAX(id) 是 171（方案里写的 fac_164–fac_177 是错的），
+# 所以真实 id 是 fac_172–fac_185。本段钉三件事：① 14 条规则在烘参 + 白名单 + 快照三处同时
+# 在册（缺一处就是"审批了但盒子不跑"或"盒子跑但开关没开"）；② 每条引用的因子都在
+# factor_defs / FACTOR_LIBRARY 里（否则整条静默 decline）；③ 产物里真能逐条打分不抛异常。
+echo "==> 250 §P1-REVIVAL（2026-11-27 P1：fac_172–fac_185 三处在册 + 因子可解析 + 逐条可打分）..."
+fail250() {
+	echo "--- FAIL: §250 $*"
+	FAIL=1
+	B250_FAILED=1
+}
+CNT250=0
+
+# ① 14 个 id 在烘参 factor_rules / enabled_strategies 与快照两条腿上同时在册
+CNT250=$((CNT250 + 1))
+python3 - <<'PY' || fail250 "14 条规则没三处在册（§250 ①）"
+import json
+ids = ["fac_%d" % n for n in range(172, 186)]
+doc = json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8"))
+p = doc["params"]
+have = [r.get("id") for r in p.get("factor_rules") or []]
+missing = [i for i in ids if i not in have]
+assert not missing, "missing in params.factor_rules: %s" % missing
+wl = p.get("enabled_strategies") or []
+missing = [i for i in ids if i not in wl]
+assert not missing, "missing in params.enabled_strategies: %s" % missing
+snap = json.load(open("qmt_gateway/strategy_switches_snapshot.json", encoding="utf-8"))
+for key in ("enabled_strategies", "factor_rules"):
+    got = snap.get(key) or []
+    got_ids = [x if isinstance(x, str) else x.get("id") for x in got]
+    missing = [i for i in ids if i not in got_ids]
+    assert not missing, "missing in snapshot.%s: %s" % (key, missing)
+# 负锁：方案里那批错 id 不许回潮（fac_164 已是历史条目，不许再出现在快照里当"新规则"）
+assert not [i for i in ("fac_164", "fac_171") if i in wl], "stale id range is back in the whitelist"
+PY
+
+# ② 每条规则形状齐全（factors/weights/directions/buy_threshold），且引用的因子都在 factor_defs
+CNT250=$((CNT250 + 1))
+python3 - <<'PY' || fail250 "规则形状或因子引用缺件（§250 ②）"
+import json
+ids = ["fac_%d" % n for n in range(172, 186)]
+p = json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8"))["params"]
+by = {r["id"]: r for r in p["factor_rules"]}
+defs = set((p.get("factor_defs") or {}).keys())
+for rid in ids:
+    rule = by[rid]
+    # 载体归因只用 id，派生器把显示名收敛成 id（见 sync_strategy_switches.derive 的注释）。
+    assert rule.get("name") in (rid, "factor_composite"), (rid, rule.get("name"))
+    factors = rule.get("factors") or []
+    assert factors, "%s has no factors" % rid
+    for factor in factors:
+        assert factor in defs, "%s references unknown factor_defs entry %s" % (rid, factor)
+    for key in ("weights", "directions"):
+        table = rule.get(key) or {}
+        for factor in factors:
+            assert factor in table, "%s missing %s for %s" % (rid, key, factor)
+    assert 0 < float(rule.get("buy_threshold", 0)) <= 100, "%s bad buy_threshold" % rid
+PY
+
+# ③ 行为腿：产物里 14 条逐条打分不抛异常（规则形状真能被评分链消费）
+CNT250=$((CNT250 + 1))
+python3 - <<'PY' || fail250 "产物里 14 条规则逐条打分失败（§250 ③）"
+import importlib.util, math, os, subprocess, sys, tempfile
+out = tempfile.mkdtemp()
+proc = subprocess.run([sys.executable, "scripts/build_local_executor.py", "--target", "sandbox",
+                       "--out-dir", out], capture_output=True, text=True)
+assert proc.returncode == 0, proc.stdout + proc.stderr
+art = ""
+for tok in proc.stdout.replace("\n", " ").split():
+    if tok.startswith("artifact="):
+        art = tok.split("=", 1)[1]
+assert art and os.path.exists(art), "artifact not found"
+spec = importlib.util.spec_from_file_location("sandbox_artifact_p1", art)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+rules = {r["id"]: r for r in mod.PARAMS.get("factor_rules") or []}
+ids = ["fac_%d" % n for n in range(172, 186)]
+assert all(i in rules for i in ids), "artifact dropped rules"
+bars = []
+price = 10.0
+for i in range(60):
+    price = price * (1.0 + (0.01 if i > 45 else 0.0))
+    bars.append({"time": 20260101 + i, "open": price, "high": price + 0.1,
+                 "low": price - 0.1, "close": price, "volume": 1000.0 + i,
+                 "amount": (1000.0 + i) * price})
+ctx = {"symbol": "600000.SH", "trading_day": "20261127", "last_price": price,
+       "bars": bars, "available_cash": 100000.0, "daily_buy_total": 0.0}
+for rid in ids:
+    scored = mod.score_factor_rule(mod.PARAMS, rules[rid], ctx)
+    assert isinstance(scored, dict), rid
+    assert "pass" in scored and "score" in scored and "declined" in scored, rid
+    if not scored["declined"]:
+        assert 0.0 <= float(scored["score"]) <= 100.0, (rid, scored["score"])
+PY
+
+[ "${B250_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §250 §P1-REVIVAL 锁通过（14 id 三处在册/错 id 未回潮/形状与因子引用齐全/产物逐条可打分，累计判定点 ${CNT250}）"
+echo ""
+
+# ── §251 §P2-BARS-FACTORS（2026-11-27 P2：盒内新算 Rev5/Rev10/tsrank_vol5/vwap_dev）──
+# 四条新因子必须在规则层（FACTOR_LIBRARY + _BAR_KINDS + 打分函数）、烘参（factor_defs）、
+# 上下文（build_context 的 vwap_dev）三处同源；vwap_dev 的单位是百分比，与 band 同尺度。
+echo "==> 251 §P2-BARS-FACTORS（2026-11-27 P2：四个盒内因子源码/烘参/装配三处同源）..."
+fail251() {
+	echo "--- FAIL: §251 $*"
+	FAIL=1
+	B251_FAILED=1
+}
+CNT251=0
+
+# ① 规则层：四个因子登记 + 两种新 bar kind + 两个打分函数
+CNT251=$((CNT251 + 1))
+python3 - <<'PY' || fail251 "规则层四个因子没登记全（§251 ①）"
+import sys
+sys.path.insert(0, "qmt_gateway")
+import rules_factor as rf
+for fid, kind in (("Rev5", "reversal"), ("Rev10", "reversal"),
+                  ("tsrank_vol5", "ts_rank_vol"), ("vwap_dev", "scalar_proxy")):
+    assert fid in rf.FACTOR_LIBRARY, "%s missing from FACTOR_LIBRARY" % fid
+    assert rf.FACTOR_LIBRARY[fid]["kind"] == kind, (fid, rf.FACTOR_LIBRARY[fid]["kind"])
+assert rf._BAR_KINDS.get("reversal") is rf._f_reversal
+assert rf._BAR_KINDS.get("ts_rank_vol") is rf._f_ts_rank_vol
+assert rf.FACTOR_LIBRARY["Rev5"]["windows"] == [5]
+assert rf.FACTOR_LIBRARY["Rev10"]["windows"] == [10]
+assert rf.FACTOR_LIBRARY["tsrank_vol5"]["windows"] == [5]
+assert rf.FACTOR_LIBRARY["vwap_dev"]["input"] == "vwap_dev"
+PY
+
+# ② 烘参：factor_defs 四个 kind 与规则层同名同 kind；vwap_dev 的 band 是 linear 且尺度对齐百分比
+CNT251=$((CNT251 + 1))
+python3 - <<'PY' || fail251 "烘参没跟上四个新因子（§251 ②）"
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8"))["params"]
+defs = p["factor_defs"]
+for fid, kind in (("Rev5", "reversal"), ("Rev10", "reversal"),
+                  ("tsrank_vol5", "ts_rank_vol"), ("vwap_dev", "scalar_proxy")):
+    assert fid in defs, "%s missing from factor_defs" % fid
+    assert defs[fid]["kind"] == kind, (fid, defs[fid])
+band = (p.get("scalar_bands") or {}).get("vwap_dev")
+assert band, "vwap_dev band missing"
+assert band.get("mode") == "linear", band
+# 单位是百分比（现网批准 -3.0..3.0），band 若退化成 0..1 就是量纲错档
+assert float(band["min"]) <= -1.0 and float(band["max"]) >= 1.0, band
+PY
+
+# ③ 装配：build_context 用 tick 的累计额/量算 vwap，并按百分比输出（不是小数）
+CNT251=$((CNT251 + 1))
+python3 - <<'PY' || fail251 "build_context 的 vwap_dev 装配不对（§251 ③）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+start = s.index("def build_context(")
+end = s.index("\ndef ", start + 10)
+body = s[start:end]
+assert "vwap_dev = (float(tick.get(\"last_price\")) / float(_vwap_now) - 1.0) * 100.0" in body, \
+    "vwap_dev must be a percent reading"
+assert '"vwap_dev": vwap_dev,' in body
+# 负锁：没有 VWAP 时必须留 None（不许写 0 —— 0 是"正好在均价上"，另一回事）
+i = body.index("vwap_dev = None")
+assert "vwap_dev = 0" not in body, "missing vwap must stay None, not 0"
+PY
+
+# ④ 行为腿 5 例：反转方向 / 两个窗口不混 / 量能时序分位 / vwap_dev 线性 / 缺读数与缺 band 弃权
+CNT251=$((CNT251 + 1))
+PY251_RC=0
+python3 -m pytest qmt_gateway/tests/test_rules_factor.py -q \
+	-k 'rev10_scores or rev5_and_rev10 or tsrank_vol5 or vwap_dev_is_linear or vwap_dev_declines or new_bar_kinds' \
+	>/dev/null 2>&1 || PY251_RC=$?
+[ "$PY251_RC" = "0" ] || fail251 "P2 行为腿未过（§251 ④）"
+
+[ "${B251_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §251 §P2-BARS-FACTORS 锁通过（规则层四因子/烘参 kind 与 band/装配按百分比/五例行为腿绿，累计判定点 ${CNT251}）"
+echo ""
+
+# ── §252 §P3-PREGEN-SERIES（2026-11-27 P3：云端烘新面板 + 两条结构性修复）──
+# 三件事：① 面板是"新→旧"而 K 线是"旧→新"，按裸下标对齐会让六个估值/市值因子结构性死掉
+# （_series_on_bars 修正）；② 财报公告日缺失时按 end_date+120 天兜底（不许整条丢）；
+# ③ stom_21 / cmra / flow_resid 三条新序列烘进 precalc（板块 map + 双源资金流）。
+echo "==> 252 §P3-PREGEN-SERIES（2026-11-27 P3：序列对齐/公告日兜底/新面板与双源资金流）..."
+fail252() {
+	echo "--- FAIL: §252 $*"
+	FAIL=1
+	B252_FAILED=1
+}
+CNT252=0
+
+# ① 对齐修复：_series_on_bars 定义在册，且被市值与估值两条腿同时调用（其余腿是纯 K 线）
+CNT252=$((CNT252 + 1))
+python3 - <<'PY' || fail252 "_series_on_bars 没接进市值/估值两条腿（§252 ①）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/rules_factor.py").read_text(encoding="utf-8")
+assert "def _series_on_bars(series, size):" in s
+for fn in ("_f_ln_mktcap", "_f_valuation"):
+    m = re.search(r"def %s\(.*?(?=\ndef )" % fn, s, re.S)
+    assert m, fn
+    assert "_series_on_bars(" in m.group(0), "%s must align the baked panel onto bars" % fn
+# 负锁：不许再出现"直接用 series 当 bars 长度"的老写法（zip(close, series) 那种裸配）
+assert "zip(close, series)" not in s, "raw zip alignment is back"
+PY
+
+# ② 公告日兜底：常量 + 归一化（tushare 混用 20261031 与 2026-10-31）+ 未来公告不外泄
+CNT252=$((CNT252 + 1))
+python3 - <<'PY' || fail252 "公告日兜底缺件（§252 ②）"
+import pathlib, re
+s = pathlib.Path("scripts/pregen_carrier_factors_gz.py").read_text(encoding="utf-8")
+assert re.search(r"^ANN_FALLBACK_DAYS = int\(os\.environ\.get\(\"PREGEN_ANN_FALLBACK_DAYS\", \"120\"\)\)", s, re.M)
+m = re.search(r"def _effective_ann\(ann_date, end_date\):.*?(?=\ndef )", s, re.S)
+assert m, "_effective_ann not found"
+body = m.group(0)
+assert '"-"' in body or "'-'" in body, "dash normalization missing"
+assert '"/"' in body or "'/'" in body, "slash normalization missing"
+assert "ANN_FALLBACK_DAYS" in body, "fallback window not used"
+PY
+
+# ③ 三条新序列 + 板块 map + 双源资金流在册（含 main() 接线两处）
+CNT252=$((CNT252 + 1))
+python3 - <<'PY' || fail252 "新面板/板块 map/资金流双源缺件（§252 ③）"
+import pathlib, re
+s = pathlib.Path("scripts/pregen_carrier_factors_gz.py").read_text(encoding="utf-8")
+assert "def load_sector_map(max_age_days=None):" in s
+assert "def fetch_sector_flow_map(day):" in s
+assert "def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares=None, day=None):" in s
+for key in ("stom_21", "cmra", "fin_series", "total_share_series"):
+    assert '"%s"' % key in s, key
+# main() 必须真的把两份外部读数塞进 market（只定义不接线＝永远弃权）
+assert "smap, smap_day = load_sector_map()" in s
+assert 'market["sector_map"] = smap' in s
+assert "sflow = fetch_sector_flow_map(day)" in s
+assert 'market["sector_flow"] = {"boards": sflow}' in s
+assert "PREGEN_SECTOR_FLOW day=" in s
+assert "PREGEN_SECTOR_FLOW_FAIL" in s
+# 双源：个股资金流新鲜优先，陈旧才回落板块代理，两条都缺就整块不烘
+assert 'flow_src' in s and 'flow_src_day' in s
+assert "FLOW_FRESH_DAYS" in s
+PY
+
+# ④ 载体侧：四个新 input 键真进 build_context 与因子库（stom_21/cmra/flow_resid 走 scalar）
+CNT252=$((CNT252 + 1))
+python3 - <<'PY' || fail252 "载体侧新键没装配（§252 ④）"
+import sys, pathlib
+sys.path.insert(0, "qmt_gateway")
+import rules_factor as rf
+for fid in ("stom_21", "cmra", "flow_resid"):
+    assert fid in rf.FACTOR_LIBRARY, fid
+    assert rf.FACTOR_LIBRARY[fid]["kind"] == "scalar_proxy", fid
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+start = s.index("def build_context(")
+end = s.index("\ndef ", start + 10)
+body = s[start:end]
+for key in ("fin_series", "stom_21", "cmra", "flow_resid"):
+    assert '"%s":' % key in body, "build_context missing %s" % key
+PY
+
+# ⑤ 行为腿：P3 新序列 11 例 + 老接线用例（fina 十列/序列形状）仍绿
+CNT252=$((CNT252 + 1))
+PY252_RC=0
+python3 -m pytest qmt_gateway/tests/test_pregen_new_series_20261127.py qmt_gateway/tests/test_pregen_wiring_b_20261117.py -q \
+	>/dev/null 2>&1 || PY252_RC=$?
+[ "$PY252_RC" = "0" ] || fail252 "P3 行为腿未过（§252 ⑤）"
+
+[ "${B252_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §252 §P3-PREGEN-SERIES 锁通过（对齐修复接两腿/公告日兜底/新面板+板块 map+双源/载体装配/行为腿绿，累计判定点 ${CNT252}）"
+echo ""
+
+# ── §253 §P4-LIBRARY-ALL（2026-11-27 P4：战法库"全量重测"走既有 all 入口，不新开通道）──
+# 以前只能逐条点重测；全量要 N 次点击。这里把 `--strategy all` 那个既有 CLI 入口接到
+# HTTP：ruleID=="all" 时 payload kind=all、ref_id=0（幂等键），响应 202 + task_id。
+echo "==> 253 §P4-LIBRARY-ALL（2026-11-27 P4：all 分支 + 幂等 ref_id=0 + 前端入口 + 用例）..."
+fail253() {
+	echo "--- FAIL: §253 $*"
+	FAIL=1
+	B253_FAILED=1
+}
+CNT253=0
+
+# ① Go：all 分支在 handleLibraryBacktest 内，kind=all + ref_id=0 + 202
+CNT253=$((CNT253 + 1))
+python3 - <<'PY' || fail253 "library.go 的 all 分支缺件（§253 ①）"
+import pathlib, re
+s = pathlib.Path("internal/server/library.go").read_text(encoding="utf-8")
+start = s.index("func (s *Server) handleLibraryBacktest(")
+end = s.index("\nfunc ", start + 10)
+body = s[start:end]
+assert 'if strings.EqualFold(strings.TrimSpace(ruleID), "all") {' in body
+assert '"kind": "all"' in body
+# 幂等键：批量任务没有单一规则归属，refID 必须钉 0（不是候选 ID、也不是 -1）
+assert "s.enqueueBacktestTask(store.TaskBacktestStrategy, 0, payload)" in body
+assert "writeJSON(w, 202," in body
+assert '"kind": "all", "task_id": id' in body
+# 顺序锁：all 分支必须在单条规则解析之前（否则 "all" 会被当成 id 去查库判 400）
+i_all = body.index('strings.EqualFold(strings.TrimSpace(ruleID), "all")')
+i_single = body.index("parseLibraryRuleID(ruleID)")
+assert i_all < i_single, "all branch must precede the single-rule parse"
+PY
+
+# ② 前端：入口在册且走既有 api（不新开 api 函数名）
+CNT253=$((CNT253 + 1))
+grep -qF "async function doLibraryBacktestAll()" web/src/pages/Research.jsx || \
+	fail253 "前端没有全量重测入口（§253 ②）"
+grep -qF "backtestLibraryRule('all'" web/src/pages/Research.jsx || \
+	fail253 "全量入口没走既有的 backtestLibraryRule('all')（§253 ②）"
+
+# ③ 行为腿：入队 + 幂等（单活跃任务）+ 单条路径不受影响
+CNT253=$((CNT253 + 1))
+GO253_RC=0
+go test ./internal/server -run 'TestLibraryBacktestAll' -count=1 >/dev/null 2>&1 || GO253_RC=$?
+[ "$GO253_RC" = "0" ] || fail253 "all 分支行为腿未过（§253 ③）"
+
+# ④ 前端行为腿：确认后才发、id 必须是字符串 "all"、取消一次都不发
+CNT253=$((CNT253 + 1))
+VT253=$( cd web && env -u NODE_OPTIONS npx vitest run src/__tests__/library_backtest_all.test.jsx 2>&1 || true )
+if ! printf '%s' "$VT253" | grep -q "2 passed"; then
+	echo "$VT253" | tail -20
+	fail253 "前端全量重测入口行为腿未过（§253 ④）"
+fi
+
+[ "${B253_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §253 §P4-LIBRARY-ALL 锁通过（all 分支在前/202+幂等/前端入口/Go+前端行为腿绿，累计判定点 ${CNT253}）"
+echo ""
+
+# ── §254 §P5-ENABLED-FILTER（2026-11-27 owner D7：战法库停用要同步出实盘白名单）──
+# 现场：`enabled` 只影响研究引擎与回测，停用的战法在载体里仍参与最佳规则竞争。
+# 过滤点刻意放在**两处快照重建**（gz 主链 + Mac 备用链），不动 sync_strategy_switches.derive()
+# ——那里 ② 要求"规则表每条都在白名单"，只滤规则不滤白名单会自相矛盾。
+echo "==> 254 §P5-ENABLED-FILTER（2026-11-27 D7：两条快照重建链同时滤 enabled=false）..."
+fail254() {
+	echo "--- FAIL: §254 $*"
+	FAIL=1
+	B254_FAILED=1
+}
+CNT254=0
+
+# ① gz 主链：disabled 集合 + 两条腿都滤（且 sel 在 wl 过滤之后构建）
+CNT254=$((CNT254 + 1))
+python3 - <<'PY' || fail254 "gz 快照重建没滤 enabled（§254 ①）"
+import pathlib, re
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+m = re.search(r"def rebuild_snapshots\(qc, rules, wl\):.*?(?=\ndef )", s, re.S)
+assert m, "rebuild_snapshots not found"
+body = m.group(0)
+assert 'rule.get("enabled", True) is False' in body
+assert "wl = [rid for rid in wl if rid not in disabled]" in body
+i_f = body.index("wl = [rid for rid in wl if rid not in disabled]")
+i_sel = body.index("sel = [by[i] for i in wl if i in by]")
+assert i_f < i_sel, "sel must be built from the filtered whitelist"
+PY
+
+# ② Mac 备用链：off 集合 + 白名单过滤（这段在 ssh 的双引号参数里，判据要认转义形态）
+CNT254=$((CNT254 + 1))
+python3 - <<'PY' || fail254 "Mac 备用链没滤 enabled（§254 ②）"
+import pathlib
+s = pathlib.Path("scripts/carrier_hot_reload.sh").read_text(encoding="utf-8")
+assert r'off={r[\"id\"] for r in entries if r.get(\"enabled\",True) is False}' in s
+assert r'wl=[i for i in wl if i not in off]' in s
+# 负锁：不许出现"读完 applied_factors 又整份覆盖 af"的重复行（2026-11-27 施工时删过一条）
+assert s.count("af=json.load(") == 1
+PY
+
+# ③ 负锁：derive() 里不许出现 enabled 过滤（D7 明确把过滤放在快照重建，不在派生器）
+CNT254=$((CNT254 + 1))
+python3 - <<'PY' || fail254 "enabled 过滤跑到 derive() 里去了（§254 ③）"
+import pathlib, re
+s = pathlib.Path("scripts/sync_strategy_switches.py").read_text(encoding="utf-8")
+m = re.search(r"def derive\(snapshot, params_doc\):.*?(?=\ndef )", s, re.S)
+assert m, "derive not found"
+body = m.group(0)
+assert '"enabled"' not in body and "'enabled'" not in body, \
+    "derive() must stay enabled-agnostic (filtering there breaks rule_not_allowed)"
+PY
+
+# ④ 前端：开关语义要在页面上说清（停用会同步实盘白名单）
+CNT254=$((CNT254 + 1))
+grep -qF "停用/启用会同步实盘白名单" web/src/pages/Research.jsx || \
+	fail254 "前端没说明 enabled 会同步实盘白名单（§254 ④）"
+
+# ⑤ 行为腿 3 例：停用两腿同出 / 重新启用来回 / Mac 链静态
+CNT254=$((CNT254 + 1))
+PY254_RC=0
+python3 -m pytest qmt_gateway/tests/test_carrier_enabled_filter_20261127.py -q >/dev/null 2>&1 || PY254_RC=$?
+[ "$PY254_RC" = "0" ] || fail254 "P5 行为腿未过（§254 ⑤）"
+
+[ "${B254_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §254 §P5-ENABLED-FILTER 锁通过（gz 两腿/ Mac 链/ derive 不许过滤/前端提示/三例行为腿绿，累计判定点 ${CNT254}）"
 echo ""

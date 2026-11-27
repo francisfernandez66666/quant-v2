@@ -19,6 +19,8 @@ vi.mock('../api/index.js', () => ({
   isForbidden: (e) => !!(e && e.status === 403),
 }))
 
+// 造一份 /api/funds/today 的资金帧：默认字段取 11-25 盘中实读形状，
+// 用例只覆盖自己要断言的那几枚（day/at 固定，避免时钟漂移让用例隔天变红）。
 function frame(funds = {}) {
   return {
     day: '2026-11-25',

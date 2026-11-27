@@ -412,6 +412,7 @@ class SideReversalReqTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.mod.SIDE_POLICY_LATEST = os.path.join(self.dir, "side_policy_latest.json")
 
+    # 反转加急：没粘 latch 也要能发 bull req（否则数据齐了但盘面翻转永远推不出去）。
     def test_reversal_req_publishes_bull_without_latch(self):
         now = datetime.datetime(2026, 11, 25, 10, 15,
                                 tzinfo=datetime.timezone(datetime.timedelta(hours=8)))

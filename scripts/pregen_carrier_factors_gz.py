@@ -29,11 +29,12 @@ carrier_hot_reload_gz.py 会把它并进 params["precalc"]（当日新鲜才并�
   * 载体侧消费本文件时**绝不回退成"发明一个数"**——缺 precalc 的票维持弃权。
 """
 import json
+import math
 import os
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BUILD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # /opt/quant/carrier_build
 PARAMS_PATH = os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_params.json")
@@ -62,6 +63,21 @@ MAX_CODES = int(os.environ.get("PREGEN_MAX_CODES", "0"))
 SERIES_BARS_N = int(os.environ.get("PREGEN_SERIES_BARS", "80"))
 SERIES_PRICE_SCALE = 1000
 MIN_SEQ_BARS = 5   # 少于 5 根的序列没有因子价值，不烘（如实缺）
+
+# §P3-FACTOR-FIX 2026-11-27（PLAN_FACTOR_FIX_P0_20261126 §4）：
+# ① ann_date 前视回退（owner D3）：报告期公告日为空时用 end_date + 120 天估计，
+#    **不整行丢弃**——否则盘前会把尚未披露的报告当成已知（前视偏差），或者干脆
+#    少掉一期财务。
+ANN_FALLBACK_DAYS = int(os.environ.get("PREGEN_ANN_FALLBACK_DAYS", "120"))
+# ② 个股资金流 json 的新鲜窗：末根日期距今超过这个天数就判"不新鲜"，改用板块代理。
+#    注意 pregen 是**盘前**跑的，"今日"的个股资金流结构上不可能存在，所以判据是
+#    "最近若干个自然日内"而不是"必须是今天"；代理来源会在 flow_src 里如实标注。
+FLOW_FRESH_DAYS = int(os.environ.get("PREGEN_FLOW_FRESH_DAYS", "5"))
+# ③ 板块连接键（sector_map）是**结构表**不是日读数：板块成分不会每天大改，
+#    但也不能拿一张很旧的表冒充。超过这个天数就不烘板块代理（宁可弃权）。
+SECTOR_MAP_MAX_AGE_DAYS = int(os.environ.get("PREGEN_SECTOR_MAP_MAX_AGE_DAYS", "10"))
+# ④ 板块资金流残差窗口（与 rules_factor 的 flow_resid 语义一致：最新一日对前 20 日）。
+SECTOR_FLOW_WINDOW = int(os.environ.get("PREGEN_SECTOR_FLOW_WINDOW", "20"))
 
 
 def fetch_klines(symbol):
@@ -208,16 +224,119 @@ def _ts_code(symbol):
     return s
 
 
-def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
+def _effective_ann(ann_date, end_date):
+    """D3（owner 2026-11-27）：公告日为空 ⇒ end_date + 120 天，**不丢整行**。
+
+    为什么不是"严格按 ann_date 过滤、空的丢掉"：丢一行等于少一期财务，而多算
+    一行未披露的报告是**前视偏差**（拿未来数据打分，回测会好看、实盘会打脸）。
+    两个错误方向里，回退口径是保守的那个——120 天是 A 股年报/半年报/季报的
+    法定披露上限附近，估计值只会把"可用"往后推，不会提前。
+    English: fall back to end_date + 120 days when ann_date is empty (never drop).
+    """
+    text = str(ann_date or "").strip().replace("-", "").replace("/", "")
+    if text:
+        return text[:8]
+    tail = str(end_date or "").strip().replace("-", "").replace("/", "")
+    if not tail:
+        return ""
+    try:
+        stamp = datetime.strptime(tail[:8], "%Y%m%d") + timedelta(days=ANN_FALLBACK_DAYS)
+    except ValueError:
+        return ""
+    return stamp.strftime("%Y%m%d")
+
+
+def load_sector_map(max_age_days=None):
+    """个股 -> 东财板块名（生产者 scripts/pregen_sector_map_gz.py 的产物）。
+
+    返回 (mapping, day)。表缺失/损坏/超龄一律返回 ({}, None)：板块代理是
+    **回退腿**，缺了就是缺了，绝不拿一张很旧的表冒充今天的成分。
+    """
+    limit = SECTOR_MAP_MAX_AGE_DAYS if max_age_days is None else int(max_age_days)
+    path = os.path.join(BUILD_DIR, "qmt_gateway", "local_executor_sector_map.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}, None
+    mapping = doc.get("sector_map") or {}
+    day = str(doc.get("day") or "")
+    if not mapping or len(day) != 8 or not day.isdigit():
+        return {}, None
+    try:
+        age = (datetime.now().astimezone().date()
+               - datetime.strptime(day, "%Y%m%d").date()).days
+    except ValueError:
+        return {}, None
+    if age > limit:
+        print("PREGEN_SECTOR_MAP_STALE day=%s age_days=%d limit=%d" % (day, age, limit))
+        return {}, None
+    return mapping, day
+
+
+def fetch_sector_flow_map(day):
+    """板块资金流标量（sector_flow_daily）：{sector: {pct, pct5, z, day}}。
+
+    口径（与 rules_factor 的 flow_resid / FlowToday 完全同尺度）：
+      pct  = net_inflow / amount * 100          最新一日净流入率（%）
+      pct5 = 近 5 日净流入合计 / 成交额合计 * 100
+      z    = (pct - 前 20 日均值) / 标准差       残差 z（样本 < 8 就不给）
+    只读、按板块聚合；缺表/缺行返回 {}（诚实弃权，绝不编 0——0 是"板块中性"，
+    与"没有读数"是两件事）。
+    """
+    sql = ("SELECT sector, trade_date, net_inflow, amount FROM sector_flow_daily "
+           "WHERE trade_date >= (SELECT MIN(trade_date) FROM ("
+           "  SELECT DISTINCT trade_date FROM sector_flow_daily "
+           "  ORDER BY trade_date DESC LIMIT ?))")
+    rows = _q(sql, (SECTOR_FLOW_WINDOW + 5,)) or []
+    buckets = {}
+    for sector, trade_day, net, amount in rows:
+        if sector is None or not amount or float(amount) <= 0.0:
+            continue
+        try:
+            rate = float(net or 0.0) / float(amount) * 100.0
+        except (TypeError, ValueError):
+            continue
+        buckets.setdefault(sector, []).append((str(trade_day), rate, float(net or 0.0), float(amount)))
+    out = {}
+    for sector, items in buckets.items():
+        items.sort(key=lambda row: row[0])
+        latest_day, latest_rate = items[-1][0], items[-1][1]
+        tail5 = items[-5:]
+        amount5 = sum(row[3] for row in tail5)
+        pct5 = (sum(row[2] for row in tail5) / amount5 * 100.0) if amount5 > 0 else None
+        history = [row[1] for row in items[-(SECTOR_FLOW_WINDOW + 1):-1]]
+        resid = None
+        if len(history) >= 8:
+            mean = sum(history) / float(len(history))
+            var = sum((value - mean) ** 2 for value in history) / float(len(history))
+            if var > 0:
+                resid = (latest_rate - mean) / (var ** 0.5)
+        entry = {"pct": round(latest_rate, 6), "day": latest_day}
+        if pct5 is not None:
+            entry["pct5"] = round(pct5, 6)
+        if resid is not None:
+            entry["z"] = round(resid, 6)
+        out[sector] = entry
+    return out
+
+
+def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares=None, day=None):
     """§PRECALC v2（2026-11-11 owner 定案）：QMT 直取价量（bars），**QMT 拿不到的才烘**——
     估值序列/换手序列（daily_basic，当日新鲜）、财务分位（fina_indicator 最新档）、
-    资金流（moneyflow_history MainNet/circ_mv）、新闻事件=D1 分数（scalar_proxy 带值）、
+    资金流（个股 json 优先 / 板块代理回退）、新闻事件=D1 分数（scalar_proxy 带值）、
     概念热度=当日利好池强度分（同为 scalar_proxy）。形态逐一对齐 rules_factor 的消费端：
     valuation_series={"pe_ttm":[..],..}（_field_series 面板）、fin_pit={"eps":..}（_pit_value）、
-    flow/heat 标量（_scalar_score + params.scalar_bands）。缺源的字段如实缺省（绝不编造）。"""
+    flow/heat 标量（_scalar_score + params.scalar_bands）。缺源的字段如实缺省（绝不编造）。
+
+    §P3-FACTOR-FIX 2026-11-27 新增（PLAN_FACTOR_FIX_P0_20261126 §4.2）：
+      stom_21 / cmra / flow_resid / fin_series 四个新标量；total_share_series 改用腾讯
+      流通股本（daily_basic.total_share 现网全 NULL，LnMktCap 结构性死）；个股资金流
+      不新鲜时用板块净流入率代理（flow_src 如实标注来源）。"""
     ts = _ts_code(symbol)
     out = {}
     n = BAKE_SERIES_N
+    bake_day = str(day or datetime.now().astimezone().strftime("%Y%m%d"))
     # §WIRING-B 2026-11-17：valuation 面板补齐 pcf_ttm/dv_ttm（旧只 SELECT pe/pb/ps ⇒
     # CFP_ttm 权重 0.299 与 DP 的 fac_ 规则恒 declined），并带 total_share 喂 LnMktCap。
     # daily_basic 列都已建且 fresh 11-16，纯加列、不改源。
@@ -238,16 +357,36 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
         tos = [r[6] for r in rows if r[6] is not None]
         if tos:
             out["turnover_series"] = tos
+        # §P3 2026-11-27：total_share 现网**全 NULL**（daily_basic 实测 COUNT(total_share)=0），
+        # 旧写法于是从不烘 total_share_series ⇒ LnMktCap 结构性死。真列有值时仍以真列为准
+        # （那才是"总市值"口径），否则回退 main() 已取到的腾讯**流通股本**（976/997 覆盖）。
+        # 口径变化要在注释里写明：回退腿烘出来的 LnMktCap 是**流通市值**对数，不是总市值
+        # 对数——同一条腿、同一个量级，但口径不同。
+        # 烘成同值序列（不是单元素）：percentile 至少要 5 个样本，单元素会被判样本不足。
         tsh = [r[7] for r in rows if r[7] is not None]
         if tsh:
             out["total_share_series"] = tsh
-    fin = _q("SELECT eps,roe,roe_waa,roa,grossprofit_margin,netprofit_margin,"
-             "debt_to_assets,yoy_or FROM fina_indicator WHERE ts_code=? "
-             "ORDER BY end_date DESC LIMIT 1", (ts,))
-    if fin and fin[0]:
+        elif float_shares:
+            out["total_share_series"] = [float(float_shares)] * n
+    # §P3 2026-11-27（owner D3）：财务档加 ann_date 前视闸。旧写法 ORDER BY end_date
+    # DESC LIMIT 1 直接把"最近报告期"当已知——盘前会把尚未披露的报告算进来（前视偏差）。
+    # 现在取 40 期、按有效公告日（空则 end_date+120）过滤后取最新一档，并顺带烘
+    # fin_series（最近 6 个已披露报告期的 roe，最旧在前——percentile 读末位为最新）。
+    fin_rows = _q("SELECT eps,roe,roe_waa,roa,grossprofit_margin,netprofit_margin,"
+                  "debt_to_assets,yoy_or,ann_date,end_date FROM fina_indicator "
+                  "WHERE ts_code=? ORDER BY end_date DESC LIMIT 40", (ts,)) or []
+    disclosed = []
+    for row in fin_rows:
+        if len(row) < 10:
+            continue
+        ann = _effective_ann(row[8], row[9])
+        if ann and ann <= bake_day:
+            disclosed.append(row)
+    if disclosed:
+        fin = disclosed[0]
         cols = ["eps", "roe", "roe_waa", "roa", "grossprofit_margin",
                 "netprofit_margin", "debt_to_assets", "yoy_or"]
-        pit = {c: v for c, v in zip(cols, fin[0]) if v is not None}
+        pit = {c: v for c, v in zip(cols, fin[:8]) if v is not None}
         # §FIN-ALIAS 20261116：factor_defs 的 financial 家族读 fin_pit["gross_margin"]
         # /["net_margin"]（factor_defs GrossMargin.field=gross_margin），而 tushare
         # 列名是 grossprofit_margin/netprofit_margin——键名错位让 GrossMargin/NetMargin
@@ -258,7 +397,33 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
             pit["net_margin"] = pit["netprofit_margin"]
         if pit:
             out["fin_pit"] = pit
+        # fin_series：最近 6 个**已披露**报告期的 roe，最旧在前。
+        # 少于 2 期不烘（percentile 至少要 5 个样本，这里只保证形状正确；样本不足
+        # 时 rules_factor 的 time_series_percentile 会自己弃权）。
+        roes = [row[1] for row in disclosed if row[1] is not None][:6]
+        if len(roes) >= 2:
+            out["fin_series"] = list(reversed([float(v) for v in roes]))
     code6 = symbol.split(".")[0]
+    # §P3 2026-11-27（owner D2 已批准带值）：两枚盒内拿不到的标量。
+    #   stom_21 = Σ ln(1 + 换手率%/100)，最近 21 个交易日 —— "活跃度"的累计量
+    #   cmra    = 最近 253 根收盘的累计对数收益极差 —— "趋势跨度"
+    # 都只烘**标量**，不烘 253 根序列（体积换不来信息：消费端要的就是极差）。
+    trs = _q("SELECT turnover_rate FROM daily_basic WHERE ts_code=? AND turnover_rate IS NOT NULL "
+             "ORDER BY trade_date DESC LIMIT 21", (ts,)) or []
+    if len(trs) >= 21:
+        out["stom_21"] = round(sum(math.log(1.0 + float(r[0]) / 100.0)
+                                   for r in trs if r[0] is not None), 6)
+    closes = [float(r[0]) for r in (_q(
+        "SELECT close FROM daily WHERE ts_code=? AND trade_date<=? AND close>0 "
+        "ORDER BY trade_date DESC LIMIT 253", (ts, bake_day)) or []) if r and r[0]]
+    if len(closes) >= 253:
+        # 累计对数收益的基准取最旧一根；极差对基准的常数平移不敏感，口径稳定。
+        base = closes[-1]
+        acc, cum = 0.0, []
+        for value in reversed(closes):
+            acc += math.log(value / base)
+            cum.append(acc)
+        out["cmra"] = round(max(cum) - min(cum), 6)
     flow_path = os.path.join(FLOW_DIR, code6 + ".json")
     circ = _q("SELECT circ_mv FROM daily_basic WHERE ts_code=? AND circ_mv IS NOT NULL "
               "ORDER BY trade_date DESC LIMIT 1", (ts,))
@@ -266,15 +431,55 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None):
         flow_doc = json.load(open(flow_path, encoding="utf-8")) if os.path.exists(flow_path) else None
     except (OSError, ValueError):
         flow_doc = None
+    stock_flow_done = False
     if flow_doc and isinstance(flow_doc.get("days"), list) and flow_doc["days"]:
         days = flow_doc["days"][-5:]
         mains = [float(d.get("MainNet") or 0) for d in days]
-        if circ and circ[0] and circ[0][0]:
-            cap = float(circ[0][0]) * 10000.0  # circ_mv 万元 -> 元
+        last_day = str(days[-1].get("Date") or "").replace("-", "")[:8]
+        # 新鲜度：pregen 是盘前跑的，"今日"的个股资金流结构上不存在 ⇒ 判据是
+        # "末根在最近 FLOW_FRESH_DAYS 个自然日内"，不是"必须是今天"。
+        fresh = False
+        if len(last_day) == 8 and last_day.isdigit():
+            try:
+                age = (datetime.strptime(bake_day, "%Y%m%d").date()
+                       - datetime.strptime(last_day, "%Y%m%d").date()).days
+                fresh = 0 <= age <= FLOW_FRESH_DAYS
+            except ValueError:
+                fresh = False
+        if fresh:
+            # 分母：circ_mv 现网全 NULL（旧写法因此从不烘 flow_*），改用
+            # 流通股本 × 最新收盘（与 LnMktCap 同源）；两者都缺才回退 circ_mv。
+            cap = 0.0
+            if float_shares and closes:
+                cap = float(float_shares) * closes[0]
+            elif circ and circ[0] and circ[0][0]:
+                cap = float(circ[0][0]) * 10000.0  # circ_mv 万元 -> 元
             if cap > 0:
                 out["flow_today_pct"] = round(mains[-1] / cap * 100.0, 4)
                 if len(mains) >= 2:
                     out["flow_5d_pct"] = round(sum(mains) / cap * 100.0, 4)
+                out["flow_src"] = "stock"
+                out["flow_src_day"] = last_day
+                stock_flow_done = True
+    # 第二源（板块级回退）：个股资金流不新鲜时，用该股所属板块的净流入率代理。
+    # flow_resid 是**板块级** z 分（与个股级 flow_today_pct/flow_5d_pct 分属两条腿），
+    # 与个股腿是否新鲜无关，只要有板块表就烘。两源都不许"编 0"：都缺就不烘键。
+    # market 允许为 None（老调用方/用例只传 params_doc）：缺板块上下文就是"没有板块腿"，
+    # 不是崩溃点——沿用本文件一贯的"缺数弃权"口径。
+    market = market or {}
+    sector_flow = market.get("sector_flow") or {}
+    boards = sector_flow.get("boards") or {}
+    sector_name = (market.get("sector_map") or {}).get(code6)
+    entry = boards.get(sector_name) if sector_name else None
+    if isinstance(entry, dict):
+        if not stock_flow_done:
+            out["flow_today_pct"] = entry["pct"]
+            if entry.get("pct5") is not None:
+                out["flow_5d_pct"] = entry["pct5"]
+            out["flow_src"] = "sector"
+            out["flow_src_day"] = entry.get("day")
+        if entry.get("z") is not None:
+            out["flow_resid"] = entry["z"]
     # §D1-LEVEL 2026-11-17：带出当日新闻级别，烘 news_propagation（good_news_fade 的
     # dict 四元组缺的就是这枚）。D1 日更只记当天，旧行 level 空串=未知→不烘（诚实弃权）。
     d1 = _q("SELECT score, date, level FROM d1_scores WHERE code=? ORDER BY created_at DESC LIMIT 1",
@@ -599,8 +804,15 @@ def fetch_market_history(day, lookback=20):
 
     缺表 / 无行 / 盘前池未同步 ⇒ 返回 None：消费侧 rules_factor 见 None 即 scalar_proxy
     弃权（绝不补 0 冒充"今天没人炸板"——0 与缺读在分档里语义不同，同 seal 纪律）。
+    **逐日缺行同样不补 0**（§F4 2026-11-27）：炸板池表某天没有行时，那一天整条炸板序列
+    跳过，序列变短但每个值都是真的；最新一天缺行则连 broken_board_count/ratio 两个标量
+    都不烘（消费侧见 None 弃权）。原先的 `br_by_day.get(d, 0)` 把「表停更」写成「没人
+    炸板」，而 ths_break_pool_daily 自 20261117 起就没有新行 ⇒ 序列尾部 7 个 0.0 是编的：
+    emo_blast_rate（方向 -1）会把假 0 读成"历史最低炸板率"，分位 0 反向改写成满分贡献，
+    新规则 fac_173 因此在没有真实炸板数据时反而更容易过阈值——这是钱路径上的假读数。
     English: per-session market emotion series read from the engine's own authoritative
     pool tables; None on any gap so consumers decline honestly rather than score a 0.
+    A day missing from the break-pool table is skipped, never filled with a fabricated 0.
     """
     # §PERCENTILE-SERIES 2026-11-17（owner 路线B）：补 MAX(continue_cnt) 得每日最高连板，
     # 连同炸板家数都烘成 history 序列，供 emo_max_board/emo_blast_cnt 走原生 percentile。
@@ -613,34 +825,46 @@ def fetch_market_history(day, lookback=20):
                  "WHERE trade_date<=? GROUP BY trade_date "
                  "ORDER BY trade_date DESC LIMIT ?", (day, lookback)) or []
     br_by_day = {str(r[0]): int(r[1]) for r in br_rows if r and r[0] is not None}
-    sessions = []  # (trade_date, limit_cnt, max_board, break_cnt) 旧→新
+    sessions = []  # (trade_date, limit_cnt, max_board, break_cnt|None) 旧→新
     for r in reversed(list(lu_rows)):
         d = str(r[0])
         lc = int(r[1]) if r[1] is not None else 0
         mb = int(r[2]) if len(r) > 2 and r[2] is not None else 0
-        bc = br_by_day.get(d, 0)
-        sessions.append((d, lc, mb, bc))
+        # §F4：缺行的那天留 None，绝不补 0（详见函数头注释：假 0 会被 emo_blast_rate
+        # 当成"历史最低炸板率"并反向拿满分）。
+        sessions.append((d, lc, mb, br_by_day.get(d)))
     if not sessions:
         return None
     lu_hist = [float(s[1]) for s in sessions]
     board_hist = [float(s[2]) for s in sessions]
-    blast_cnt_hist = [float(s[3]) for s in sessions]
+    blast_sessions = [s for s in sessions if s[3] is not None]
+    blast_cnt_hist = [float(s[3]) for s in blast_sessions]
     ratio_hist = []
-    for (_d, lc, _mb, bc) in sessions:
+    for (_d, lc, _mb, bc) in blast_sessions:
         denom = lc + bc
         ratio_hist.append(round(bc / float(denom), 6) if denom > 0 else 0.0)
-    last_d, last_lc, last_mb, last_bc = sessions[-1]
-    denom = last_lc + last_bc
-    return {
+    last_d, _last_lc, last_mb, _last_bc = sessions[-1]
+    out = {
         "limit_up_count_history": lu_hist,
         "ladder_height_history": board_hist,
         "broken_board_count_history": blast_cnt_hist,
         "broken_board_ratio_history": ratio_hist,
-        "broken_board_count": float(last_bc),
-        "broken_board_ratio": round(last_bc / float(denom), 6) if denom > 0 else 0.0,
         "ladder_height": float(last_mb),
         "emotion_day": last_d,
     }
+    if blast_sessions:
+        blast_d, blast_lc, _blast_mb, blast_bc = blast_sessions[-1]
+        if blast_d != last_d:
+            # 两表 as-of 不同步：炸板序列仍用真实日（上面已烘），但 broken_board_count/ratio
+            # 是"最近一交易日"的标量，绝不能拿 7 个交易日前的值冒充今天 ⇒ 整键不烘，
+            # 消费侧见 None 弃权。把差距打进烘焙日志，别让停更静默。
+            print("PREGEN_BLAST_STALE limit_day=%s blast_day=%s sessions=%d/%d"
+                  % (last_d, blast_d, len(blast_sessions), len(sessions)))
+        else:
+            denom = blast_lc + blast_bc
+            out["broken_board_count"] = float(blast_bc)
+            out["broken_board_ratio"] = round(blast_bc / float(denom), 6) if denom > 0 else 0.0
+    return out
 
 
 def fetch_sector_drop_map(day):
@@ -905,6 +1129,22 @@ def main():
               % (len(listed_days_map), len(symbols), pct))
     except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链
         print("PREGEN_LISTED_DAYS_FAIL %s" % type(exc).__name__)
+    # §P3 2026-11-27：板块连接键 + 板块资金流标量。两条都是**回退腿**：
+    #   sector_map   —— 个股 -> 东财板块名（生产者 pregen_sector_map_gz.py 的产物，超过
+    #                   SECTOR_MAP_MAX_AGE_DAYS 天就整表弃权，不拿旧成分冒充今天）
+    #   sector_flow  —— 板块净流入率/5 日率/残差 z（读 sector_flow_daily 当日新鲜行）
+    # 缺任一条都不阻断主链：个股资金流新鲜时走个股腿，否则 flow_* 键干脆不烘。
+    try:
+        smap, smap_day = load_sector_map()
+        if smap:
+            market["sector_map"] = smap
+        sflow = fetch_sector_flow_map(day)
+        if sflow:
+            market["sector_flow"] = {"boards": sflow}
+        print("PREGEN_SECTOR_FLOW day=%s map_day=%s map=%s boards=%s"
+              % (day, smap_day, len(smap), len(sflow)))
+    except Exception as exc:  # noqa: BLE001 - 缺源不阻断主链
+        print("PREGEN_SECTOR_FLOW_FAIL %s" % type(exc).__name__)
     precalc, ok, failed = {}, 0, []
     for symbol in symbols:
         try:
@@ -924,7 +1164,8 @@ def main():
                 if fact:
                     fact["data_day"] = data_day
                     fact["src"] = src
-            bakeables = bake_bakeables(symbol, params, lu_boards, market) if fact else {}
+            bakeables = bake_bakeables(symbol, params, lu_boards, market,
+                                       float_shares=float_shares_map.get(symbol), day=day) if fact else {}
             if fact:
                 fact.update(bakeables)
                 if float_shares_map.get(symbol):
@@ -937,7 +1178,8 @@ def main():
                 ok += 1
             else:
                 # 价量缺失也可能只是 hithink 单票失败：bakeables 仍值得烘（估值/财务/D1）
-                bakeables = bake_bakeables(symbol, params, lu_boards, market)
+                bakeables = bake_bakeables(symbol, params, lu_boards, market,
+                                           float_shares=float_shares_map.get(symbol), day=day)
                 if bakeables:
                     bakeables["src"] = "bake_only"
                     if float_shares_map.get(symbol):

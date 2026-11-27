@@ -1078,6 +1078,34 @@
         "input": "is_leader",
         "direct": true,
         "missing_input": "sector leadership ranking (external)"
+      },
+      "Rev5": {
+        "kind": "reversal",
+        "windows": [
+          5
+        ],
+        "input": "bars"
+      },
+      "Rev10": {
+        "kind": "reversal",
+        "windows": [
+          10
+        ],
+        "input": "bars"
+      },
+      "tsrank_vol5": {
+        "kind": "ts_rank_vol",
+        "windows": [
+          5
+        ],
+        "input": "bars"
+      },
+      "vwap_dev": {
+        "kind": "scalar_proxy",
+        "windows": [],
+        "input": "vwap_dev",
+        "direct": true,
+        "missing_input": "session VWAP (tick cumulative amount/volume)"
       }
     },
     "factor_rules": [
@@ -1110,6 +1138,7 @@
           "VSTD20": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_117",
         "name": "fac_117"
       },
@@ -1145,6 +1174,7 @@
           "VolSurge5": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_136",
         "name": "fac_136"
       },
@@ -1174,6 +1204,7 @@
           "VolSurge5": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_131",
         "name": "fac_131"
       },
@@ -1209,6 +1240,7 @@
           "VolSurge5": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_137",
         "name": "fac_137"
       },
@@ -1244,6 +1276,7 @@
           "VolSurge5": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_123",
         "name": "fac_123"
       },
@@ -1279,6 +1312,7 @@
           "VolSurge5": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_150",
         "name": "fac_150"
       },
@@ -1299,6 +1333,7 @@
           "VSTD20": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_153",
         "name": "fac_153"
       },
@@ -1328,6 +1363,7 @@
           "lu_board3": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_154",
         "name": "fac_154"
       },
@@ -1351,6 +1387,7 @@
           "VSTD20": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_155",
         "name": "fac_155"
       },
@@ -1371,6 +1408,7 @@
           "VSTD20": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_157",
         "name": "fac_157"
       },
@@ -1394,6 +1432,7 @@
           "lu_board3": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_156",
         "name": "fac_156"
       },
@@ -1417,6 +1456,7 @@
           "lu_board3": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_160",
         "name": "fac_160"
       },
@@ -1437,6 +1477,7 @@
           "VolSurge5": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_163",
         "name": "fac_163"
       },
@@ -1460,8 +1501,258 @@
           "lu_board3": -1
         },
         "buy_threshold": 70,
+        "entry_style": "unclassified",
         "id": "fac_162",
         "name": "fac_162"
+      },
+      {
+        "factors": [
+          "emo_max_board",
+          "emo_blast_cnt"
+        ],
+        "weights": {
+          "emo_blast_cnt": 0.5,
+          "emo_max_board": 0.5
+        },
+        "directions": {
+          "emo_blast_cnt": -1,
+          "emo_max_board": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_172",
+        "name": "fac_172"
+      },
+      {
+        "factors": [
+          "emo_blast_rate",
+          "emo_chg5"
+        ],
+        "weights": {
+          "emo_blast_rate": 0.5,
+          "emo_chg5": 0.5
+        },
+        "directions": {
+          "emo_blast_rate": -1,
+          "emo_chg5": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_173",
+        "name": "fac_173"
+      },
+      {
+        "factors": [
+          "lu_reblast_low",
+          "lu_board3"
+        ],
+        "weights": {
+          "lu_board3": 0.5,
+          "lu_reblast_low": 0.5
+        },
+        "directions": {
+          "lu_board3": 1,
+          "lu_reblast_low": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_174",
+        "name": "fac_174"
+      },
+      {
+        "factors": [
+          "Flow5d",
+          "FlowToday"
+        ],
+        "weights": {
+          "Flow5d": 0.6,
+          "FlowToday": 0.4
+        },
+        "directions": {
+          "Flow5d": 1,
+          "FlowToday": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_175",
+        "name": "fac_175"
+      },
+      {
+        "factors": [
+          "NewsEvent",
+          "ConceptHeat"
+        ],
+        "weights": {
+          "ConceptHeat": 0.5,
+          "NewsEvent": 0.5
+        },
+        "directions": {
+          "ConceptHeat": 1,
+          "NewsEvent": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_176",
+        "name": "fac_176"
+      },
+      {
+        "factors": [
+          "IndexChange",
+          "ConceptHeat"
+        ],
+        "weights": {
+          "ConceptHeat": 0.5,
+          "IndexChange": 0.5
+        },
+        "directions": {
+          "ConceptHeat": 1,
+          "IndexChange": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_177",
+        "name": "fac_177"
+      },
+      {
+        "factors": [
+          "IsLeader",
+          "lu_early_seal"
+        ],
+        "weights": {
+          "IsLeader": 0.5,
+          "lu_early_seal": 0.5
+        },
+        "directions": {
+          "IsLeader": 1,
+          "lu_early_seal": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_178",
+        "name": "fac_178"
+      },
+      {
+        "factors": [
+          "FlowToday",
+          "emo_chg5"
+        ],
+        "weights": {
+          "FlowToday": 0.5,
+          "emo_chg5": 0.5
+        },
+        "directions": {
+          "FlowToday": 1,
+          "emo_chg5": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_179",
+        "name": "fac_179"
+      },
+      {
+        "factors": [
+          "Mom10"
+        ],
+        "weights": {
+          "Mom10": 1
+        },
+        "directions": {
+          "Mom10": -1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_180",
+        "name": "fac_180"
+      },
+      {
+        "factors": [
+          "Mom20"
+        ],
+        "weights": {
+          "Mom20": 1
+        },
+        "directions": {
+          "Mom20": -1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_181",
+        "name": "fac_181"
+      },
+      {
+        "factors": [
+          "RSI14",
+          "STO20"
+        ],
+        "weights": {
+          "RSI14": 0.5,
+          "STO20": 0.5
+        },
+        "directions": {
+          "RSI14": 1,
+          "STO20": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_182",
+        "name": "fac_182"
+      },
+      {
+        "factors": [
+          "VSTD20",
+          "LnMktCap"
+        ],
+        "weights": {
+          "LnMktCap": 0.5,
+          "VSTD20": 0.5
+        },
+        "directions": {
+          "LnMktCap": 1,
+          "VSTD20": -1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_183",
+        "name": "fac_183"
+      },
+      {
+        "factors": [
+          "Mom5",
+          "VSTD20"
+        ],
+        "weights": {
+          "Mom5": 0.5,
+          "VSTD20": 0.5
+        },
+        "directions": {
+          "Mom5": -1,
+          "VSTD20": -1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_184",
+        "name": "fac_184"
+      },
+      {
+        "factors": [
+          "RSI14",
+          "BBI",
+          "VMIN10"
+        ],
+        "weights": {
+          "BBI": 0.3,
+          "RSI14": 0.4,
+          "VMIN10": 0.3
+        },
+        "directions": {
+          "BBI": 1,
+          "RSI14": 1,
+          "VMIN10": 1
+        },
+        "buy_threshold": 70,
+        "entry_style": "unclassified",
+        "id": "fac_185",
+        "name": "fac_185"
       }
     ],
     "factor_thresholds": {},
@@ -1567,6 +1858,45 @@
       "lu_early_seal": {
         "min": 0,
         "max": 600
+      },
+      "vwap_dev": {
+        "min": -3.0,
+        "max": 3.0,
+        "mode": "linear"
+      },
+      "stom_21": {
+        "min": 0.11,
+        "max": 1.79,
+        "mode": "linear"
+      },
+      "cmra": {
+        "min": 0.36,
+        "max": 1.38,
+        "mode": "linear"
+      },
+      "flow_resid": {
+        "min": -2.6,
+        "max": 2.0,
+        "mode": "linear"
+      },
+      "Flow5d": {
+        "min": -1.0,
+        "max": 2.0,
+        "mode": "linear"
+      },
+      "FlowToday": {
+        "min": -0.5,
+        "max": 1.2,
+        "mode": "linear"
+      },
+      "IndexChange": {
+        "min": -2.0,
+        "max": 1.5,
+        "mode": "linear"
+      },
+      "IsLeader": {
+        "min": 0,
+        "max": 1
       }
     },
     "score_domain": {
@@ -1651,7 +1981,21 @@
       "fac_156",
       "fac_160",
       "fac_163",
-      "fac_162"
+      "fac_162",
+      "fac_172",
+      "fac_173",
+      "fac_174",
+      "fac_175",
+      "fac_176",
+      "fac_177",
+      "fac_178",
+      "fac_179",
+      "fac_180",
+      "fac_181",
+      "fac_182",
+      "fac_183",
+      "fac_184",
+      "fac_185"
     ],
     "unmapped_strategies": [
       "n_shape"
@@ -1672,8 +2016,8 @@
       "dragon_return": "dragon_return"
     },
     "live_rules": {
-      "captured_at": "2026-11-10T15:05:00+08:00",
-      "source": "gz:/var/lib/quant-trading-v2/auth.json (fresh pull 15:05)",
+      "captured_at": "2026-11-27T11:25:38+08:00",
+      "source": "gz:/var/lib/quant-trading-v2/auth.json+applied_factors.json (whitelist+factors re-pulled 2026-11-27 after P1 seed; other sections keep the 2026-11-10 export values)",
       "account_key": "quant_config_json_v1",
       "account_user_id": "u_1785377969825355000",
       "enabled_strategies": [
@@ -1693,7 +2037,21 @@
         "fac_156",
         "fac_160",
         "fac_163",
-        "fac_162"
+        "fac_162",
+        "fac_172",
+        "fac_173",
+        "fac_174",
+        "fac_175",
+        "fac_176",
+        "fac_177",
+        "fac_178",
+        "fac_179",
+        "fac_180",
+        "fac_181",
+        "fac_182",
+        "fac_183",
+        "fac_184",
+        "fac_185"
       ],
       "applied_factor_ids": [
         "fac_1",
@@ -1718,7 +2076,21 @@
         "fac_156",
         "fac_160",
         "fac_163",
-        "fac_162"
+        "fac_162",
+        "fac_172",
+        "fac_173",
+        "fac_174",
+        "fac_175",
+        "fac_176",
+        "fac_177",
+        "fac_178",
+        "fac_179",
+        "fac_180",
+        "fac_181",
+        "fac_182",
+        "fac_183",
+        "fac_184",
+        "fac_185"
       ],
       "qmt": {
         "enabled": true,
@@ -1745,7 +2117,21 @@
           "fac_156",
           "fac_160",
           "fac_163",
-          "fac_162"
+          "fac_162",
+          "fac_172",
+          "fac_173",
+          "fac_174",
+          "fac_175",
+          "fac_176",
+          "fac_177",
+          "fac_178",
+          "fac_179",
+          "fac_180",
+          "fac_181",
+          "fac_182",
+          "fac_183",
+          "fac_184",
+          "fac_185"
         ],
         "timeout_sec": 10,
         "subscription_recognize": false,

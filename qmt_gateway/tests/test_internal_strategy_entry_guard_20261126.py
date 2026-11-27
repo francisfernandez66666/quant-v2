@@ -126,6 +126,8 @@ class _Base(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.dir, ignore_errors=True)
 
+    # 每条用例都从一份干净的 PARAMS 起跑：入口闸/额度闸的键逐条覆盖，
+    # 免得上一条用例写进去的开关漏到下一条（PARAMS 是模块级字典，共享即串味）。
     def setUp(self):
         mod = self.mod
         mod.PARAMS.clear()

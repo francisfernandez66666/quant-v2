@@ -30,6 +30,8 @@ func TestCarrierPendingKnobs(t *testing.T) {
 	}
 }
 
+// TestCarrierSideFlowProxyKnobs 钉住 side_flow_proxy 的出厂值是「开」：
+// 这条腿缺省关闭时载体拿不到板块合计替补，净流入腿会在板块缺口那天整天弃权。
 func TestCarrierSideFlowProxyKnobs(t *testing.T) {
 	if !CarrierSideFlowProxyEnabled() {
 		t.Fatal("side_flow_proxy must default on")

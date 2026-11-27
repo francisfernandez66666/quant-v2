@@ -298,6 +298,7 @@ class GateEndToEnd(unittest.TestCase):
         self.params = _real_params()
         self.params.update({"t_enabled": True, "t_shadow": False})
 
+    # 一份「开盘后 10:30、有 tick 四字段、有持仓」的最小 ctx；用例只覆盖自己要改的那几枚。
     def _ctx(self, **over):
         base = {
             "symbol": SYMBOL, "day": DAY, "hhmm": "10:30", "trading_day": True,

@@ -1,6 +1,6 @@
 {
-  "captured_at": "2026-11-10T15:05:00+08:00",
-  "source": "gz:/var/lib/quant-trading-v2/auth.json (fresh pull 15:05)",
+  "captured_at": "2026-11-27T11:25:38+08:00",
+  "source": "gz:/var/lib/quant-trading-v2/auth.json+applied_factors.json (whitelist+factors re-pulled 2026-11-27 after P1 seed; other sections keep the 2026-11-10 export values)",
   "configs": [
     {
       "user_id": "u_1785377969825355000",
@@ -272,7 +272,21 @@
             "fac_156",
             "fac_160",
             "fac_163",
-            "fac_162"
+            "fac_162",
+            "fac_172",
+            "fac_173",
+            "fac_174",
+            "fac_175",
+            "fac_176",
+            "fac_177",
+            "fac_178",
+            "fac_179",
+            "fac_180",
+            "fac_181",
+            "fac_182",
+            "fac_183",
+            "fac_184",
+            "fac_185"
           ],
           "timeout_sec": 10,
           "subscription_recognize": false,
@@ -447,6 +461,20 @@
     "fac_156",
     "fac_160",
     "fac_163",
-    "fac_162"
+    "fac_162",
+    "fac_172",
+    "fac_173",
+    "fac_174",
+    "fac_175",
+    "fac_176",
+    "fac_177",
+    "fac_178",
+    "fac_179",
+    "fac_180",
+    "fac_181",
+    "fac_182",
+    "fac_183",
+    "fac_184",
+    "fac_185"
   ]
 }
