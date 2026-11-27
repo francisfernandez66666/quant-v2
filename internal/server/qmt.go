@@ -2550,6 +2550,7 @@ func (s *Server) handleQMTBrokerSwitch(w http.ResponseWriter, r *http.Request) {
 // signal_codes 烘参；§179 静态锁逐键核对两侧一致，改烘参必须同批改这里）。
 // English: carrier short-code → strategy mapping, gate-locked against the baked params.
 var carrierSignalCodes = map[string]string{
+	// 2026-11-27：BK 仅用于反解历史委托备注，破位腿已退役，烘参里不再有 breakdown_sell。
 	"BD": "break_down", "BK": "breakdown_sell", "DB": "double_bump",
 	"D": "dragon", "DR": "dragon_return", "GN": "good_news_fade",
 	"HC": "high_churn", "LD": "leader_decay", "LD1": "leader_decay_v2",

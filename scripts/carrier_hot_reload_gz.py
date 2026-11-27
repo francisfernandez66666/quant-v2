@@ -1951,6 +1951,8 @@ def _main_impl():
         die("bake_failed2 version=%s" % ver)
     arts = [f for f in os.listdir(out_dir) if f.startswith("qmt_internal_strategy_")]
     if not arts:
+        # §BAKE-CHAIN 2026-11-27：这条出口也在版本 bump 之后，必须同样撤版本号。
+        restore_params_version(orig_ver, params_path)
         die("artifact_missing")
     # §PUBLISH-EXACT-20261119：必须按**本次版本名**取产物，绝不按字典序兜底。
     # 现场：v99 之后版本涨到 v104，`sorted(arts)[-1]` 因为 '9' > '1' 又拿回 v99，

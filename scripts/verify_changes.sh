@@ -29092,7 +29092,7 @@ lines = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf
 assert sum("def restore_params_version(" in ln for ln in lines) == 1
 calls = [i for i, ln in enumerate(lines) if "restore_params_version(orig_ver" in ln]
 assert calls, "restore_params_version call missing"
-for marker in ('die("bake_failed2', 'die("artifact_version_not_baked'):
+for marker in ('die("bake_failed2', 'die("artifact_missing', 'die("artifact_version_not_baked'):
     hits = [i for i, ln in enumerate(lines) if marker in ln]
     assert len(hits) == 1, (marker, hits)
     assert any(hits[0] - 3 <= c < hits[0] for c in calls), \
