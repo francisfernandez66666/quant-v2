@@ -509,10 +509,29 @@ class TestArtifactShape(BuilderFixture):
         self.assertIn("params", doc)
         self.assertTrue(doc["params"])
         self.assertIn("strategy_version", doc)
-        # 2–3 位：热更新链的版本自增会越过 v99（见 build_local_executor.VERSION_RE 头注）。
-        self.assertTrue(re.match(r"^v\d{2,3}-\d{8}$", doc["strategy_version"]))
+        # 2–6 位：热更新链的版本自增会越过 v99 与 v999（见 build_local_executor.VERSION_RE 头注）。
+        self.assertTrue(re.match(r"^v\d{2,6}-\d{8}$", doc["strategy_version"]))
         self.assertEqual(doc["params"], self.params)
         self.assertEqual(doc["strategy_version"], self.version)
+
+    def test_version_regex_accepts_four_digits(self):
+        """§VERSION-WIDTH 2026-11-27：4 位版本必须能过。
+
+        现网实录：计数器越过 v999 后（当天 v2058）`VERSION_RE` 仍只认 2–3 位
+        ⇒ 热更链每轮 `BUILD_RESULT=ABORT reason=params_invalid
+        detail=strategy_version_missing_or_bad`，而链**先写版本再烘焙**，
+        于是 30 秒一次重启、版本一路涨、盒子整天收不到新载体（restart 1054）。
+        这条用例钉的是"宽度够用"，不是某个具体数字：2/3/4/5/6 位都放行，
+        7 位与坏形状（缺横线、缺日期、非 v 前缀）仍拒。
+        """
+        for version in ("v16-20261127", "v999-20261127", "v2058-20261127",
+                        "v9999-20261127", "v123456-20261127"):
+            self.assertTrue(builder.VERSION_RE.match(version),
+                            "%s must be a valid strategy_version" % version)
+        for version in ("v1-20261127", "v1234567-20261127", "2058-20261127",
+                        "v2058_20261127", "v2058-2026-11-27", ""):
+            self.assertFalse(builder.VERSION_RE.match(version),
+                             "%s must be rejected" % version)
 
 
 # ---------------------------------------------------------------------------

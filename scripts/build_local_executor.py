@@ -346,7 +346,11 @@ FSTRING_RE = re.compile(r"""\bf["']""")
 # strategy_version_missing_or_bad`，而热更新链**先写版本再烘焙**，于是每轮又 +1、
 # 又失败（今天 09:0x 起连续失败并涨到 v103），盒子再也收不到新载体。
 # 版本号在载体里是自证用的不透明字符串（备注只放 short code），没有两位数的契约。
-VERSION_RE = re.compile(r"^v\d{2,3}-\d{8}$")
+# 2026-11-27 同一个坑第二次踩到：计数器越过 v999（当天已到 v2058）⇒ 4 位又被拒，
+# 热更链从 09:3x 起连续 ABORT（restart 1054 次）、盒子一整天收不到新载体。
+# 这次不再"补一档"：直接放到 2–6 位，并把"4 位必须能过"写成行为用例
+# （test_local_executor_build_update.py），避免第三次在 v9999 上翻车。
+VERSION_RE = re.compile(r"^v\d{2,6}-\d{8}$")
 VERSION_CONST = "STRATEGY_VERSION"
 REMARK_BUILDER = "build_remark"
 
