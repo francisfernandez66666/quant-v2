@@ -51,6 +51,36 @@ func TestPerfMetricsDrawdownAndSharpe(t *testing.T) {
 	}
 }
 
+// TestPerfMetricsNoOverflowOnManyTrades §FIX-PERF 2026-11-28：20 万笔 +0.5% 的
+// 高频回放不得再把年化/卡玛溢出成 +Inf，也不得因单笔全亏把 MDD 永久钉成 100%。
+func TestPerfMetricsNoOverflowOnManyTrades(t *testing.T) {
+	const tradeN = 200000
+	pnls := make([]float64, tradeN)
+	dates := make([]string, tradeN)
+	days := dateSpanN("20230801", 1000)
+	for i := range pnls {
+		pnls[i] = 0.5
+		dates[i] = days[i%len(days)]
+	}
+	_, mdd, annual, calmar := perfMetrics(pnls, dates)
+	if math.IsInf(annual, 0) || math.IsNaN(annual) {
+		t.Fatalf("annual must be finite, got %v", annual)
+	}
+	if math.IsInf(calmar, 0) || math.IsNaN(calmar) {
+		t.Fatalf("calmar must be finite, got %v", calmar)
+	}
+	if mdd >= 100 {
+		t.Fatalf("monotonic series must not have 100%% MDD, got %.2f", mdd)
+	}
+
+	// 单笔 -100% 只让净值归零，不能把整条单调上升曲线误判成别的形状。
+	_, mdd2, ann2, _ := perfMetrics([]float64{-100, 0.5, 0.5},
+		[]string{"20250101", "20250102", "20250103"})
+	if mdd2 != 100 || ann2 != -100 {
+		t.Fatalf("bankruptcy: mdd=%.2f annual=%.2f", mdd2, ann2)
+	}
+}
+
 // TestPerfMetricsEdge 验证绩效指标边界（空序列/单点等）。
 func TestPerfMetricsEdge(t *testing.T) {
 	if s, mdd, a, c := perfMetrics(nil, nil); s != 0 || mdd != 0 || a != 0 || c != 0 {

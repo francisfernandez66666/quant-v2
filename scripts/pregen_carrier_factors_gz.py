@@ -373,20 +373,24 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares
     # 现在取 40 期、按有效公告日（空则 end_date+120）过滤后取最新一档，并顺带烘
     # fin_series（最近 6 个已披露报告期的 roe，最旧在前——percentile 读末位为最新）。
     fin_rows = _q("SELECT eps,roe,roe_waa,roa,grossprofit_margin,netprofit_margin,"
-                  "debt_to_assets,yoy_or,ann_date,end_date FROM fina_indicator "
+                  "debt_to_assets,yoy_or,yoy_net_profit,ann_date,end_date FROM fina_indicator "
                   "WHERE ts_code=? ORDER BY end_date DESC LIMIT 40", (ts,)) or []
     disclosed = []
     for row in fin_rows:
-        if len(row) < 10:
+        if len(row) < 11:
             continue
-        ann = _effective_ann(row[8], row[9])
+        ann = _effective_ann(row[9], row[10])
         if ann and ann <= bake_day:
             disclosed.append(row)
     if disclosed:
         fin = disclosed[0]
         cols = ["eps", "roe", "roe_waa", "roa", "grossprofit_margin",
-                "netprofit_margin", "debt_to_assets", "yoy_or"]
-        pit = {c: v for c, v in zip(cols, fin[:8]) if v is not None}
+                "netprofit_margin", "debt_to_assets", "yoy_or", "yoy_net_profit"]
+        # 2026-11-27 wiring: factor_defs.YoyNetProfit reads fin_pit["yoy_net_profit"],
+        # but the old SELECT never fetched that column (21416 non-null rows in the
+        # live DB) -- the leg was structurally absent. Fetch it and let the same
+        # point-in-time ann_date gate decide whether it is known.
+        pit = {c: v for c, v in zip(cols, fin[:9]) if v is not None}
         # §FIN-ALIAS 20261116：factor_defs 的 financial 家族读 fin_pit["gross_margin"]
         # /["net_margin"]（factor_defs GrossMargin.field=gross_margin），而 tushare
         # 列名是 grossprofit_margin/netprofit_margin——键名错位让 GrossMargin/NetMargin
@@ -403,6 +407,51 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares
         roes = [row[1] for row in disclosed if row[1] is not None][:6]
         if len(roes) >= 2:
             out["fin_series"] = list(reversed([float(v) for v in roes]))
+        # 2026-11-27 wiring: factor_defs.SUE reads fin_pit["single_quarter_ni_yoy"],
+        # a field no tushare table carries. Derive it from the cumulative
+        # n_income_attr_p panel in income: single quarter = Qn - Q(n-1), then
+        # YoY against the same quarter one year earlier. Only disclosed reports
+        # (same ann_date gate as the rest of fin_pit) may contribute.
+        ann_by_end = {}
+        for row in fin_rows:
+            if len(row) >= 11:
+                ann_by_end[str(row[10])] = _effective_ann(row[9], row[10])
+        inc_rows = _q("SELECT end_date,n_income_attr_p FROM income "
+                      "WHERE ts_code=? ORDER BY end_date DESC LIMIT 16", (ts,)) or []
+        cum = {}
+        for end_date, val in inc_rows:
+            ann = ann_by_end.get(str(end_date))
+            if ann and ann <= bake_day and val is not None:
+                cum[str(end_date)] = float(val)
+        for end_date in sorted(cum, reverse=True):
+            year, month = int(end_date[:4]), int(end_date[4:6])
+            q = (month - 1) // 3 + 1
+            if q < 1 or q > 4:
+                continue
+            # Same-quarter lookup uses the report end month/day from the panel,
+            # not a fabricated 31st: find any prior-year row with the same MMDD.
+            prev_same = None
+            if prev_same is None:
+                for k, v in cum.items():
+                    if k[:4] == str(year - 1) and k[4:] == end_date[4:]:
+                        prev_same = v
+                        break
+            if q == 1:
+                single = cum[end_date]
+            else:
+                prev_cum = None
+                for k, v in cum.items():
+                    if k[:4] == str(year) and (int(k[4:6]) - 1) // 3 + 1 == q - 1:
+                        prev_cum = v
+                        break
+                if prev_cum is None:
+                    continue
+                single = cum[end_date] - prev_cum
+            if prev_same in (None, 0.0) or single is None:
+                continue
+            out.setdefault("fin_pit", {})["single_quarter_ni_yoy"] = round(
+                (single / abs(prev_same) - 1.0) * 100.0, 4)
+            break
     code6 = symbol.split(".")[0]
     # §P3 2026-11-27（owner D2 已批准带值）：两枚盒内拿不到的标量。
     #   stom_21 = Σ ln(1 + 换手率%/100)，最近 21 个交易日 —— "活跃度"的累计量
@@ -525,6 +574,24 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares
     # §WIRING-B 2026-11-17：把"做了一半"的情绪/涨停池类读数补齐（全部从已拉/新鲜数据派生，
     # 不另开多日扫描，避免烘错值污染买入判定）。market 由 main() 算一次传入。
     market = market or {}
+    # 2026-11-27 wiring: hot_pool.bullish only covers ~30/997 codes, so the
+    # ConceptHeat leg of fac_176/177 abstained for almost every stock. Fall back
+    # to a LOCAL proxy with an explicit source label: percentile rank of the
+    # stock's board net-inflow rate among all boards in sector_flow_daily.
+    # This is NOT the external concept ranking; it is marked as a proxy so the
+    # semantic drift is visible instead of silently pretending to be the feed.
+    if out.get("concept_heat") is None:
+        _boards = ((market.get("sector_flow") or {}).get("boards") or {})
+        _bname = (market.get("sector_map") or {}).get(code6)
+        _entry = _boards.get(_bname) if _bname else None
+        if isinstance(_entry, dict) and _entry.get("pct") is not None:
+            _vals = sorted(float(v.get("pct")) for v in _boards.values()
+                           if isinstance(v, dict) and v.get("pct") is not None)
+            if len(_vals) >= 20:
+                _pct = float(_entry["pct"])
+                out["concept_heat"] = round(
+                    sum(1 for x in _vals if x < _pct) * 100.0 / len(_vals), 2)
+                out["concept_heat_src"] = "sector_flow_proxy"
     # 全市场涨停家数 + 当日最高连板（lu_boards 已含每票连板数，max/len 直取，无需回看历史）。
     if "limit_up_count" in market:
         out["limit_up_count"] = market["limit_up_count"]
@@ -577,10 +644,17 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares
               "WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1", (ts,))
     if seal and seal[0] and seal[0][0] is not None and int(seal[0][0]) >= 1:
         fst, max_seal = seal[0][1], seal[0][2]
-        if circ and circ[0] and circ[0][0] and max_seal and float(max_seal) > 0:
+        # 2026-11-27 wiring: circ_mv is all NULL in daily_basic, so the peak-seal
+        # leg never baked seal_amount_ratio (0/997 coverage). Fall back to the
+        # same流通市值 denominator already used by flow: tencent float_shares
+        # x latest close. Same unit (yuan), same band, no invented zero.
+        cap_yuan = 0.0
+        if circ and circ[0] and circ[0][0]:
             cap_yuan = float(circ[0][0]) * 10000.0
-            if cap_yuan > 0:
-                out["seal_amount_ratio"] = round(float(max_seal) / cap_yuan, 6)
+        elif float_shares and float_shares > 0 and closes:
+            cap_yuan = float(float_shares) * float(closes[0])
+        if cap_yuan > 0 and max_seal and float(max_seal) > 0:
+            out["seal_amount_ratio"] = round(float(max_seal) / cap_yuan, 6)
         if fst and len(str(fst)) >= 4 and ":" in str(fst):
             try:
                 hh, mm = str(fst).split(":")[0], str(fst).split(":")[1]

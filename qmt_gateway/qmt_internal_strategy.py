@@ -3299,6 +3299,31 @@ def _vol_ratio_state(ContextInfo, moment):
     return state
 
 
+def _baked_index_change_pct():
+    """Cloud-baked index change (%), only while the baked snapshot is fresh.
+
+    The 2026-11-27 factor wiring audit found params.t_macro.index_change_pct was
+    baked on the brain but never read by build_context, so the IndexChange leg
+    of fac_177 always abstained on a box round that had no index daily bar yet.
+    This is a SECOND source, not a replacement for the in-client reading: the
+    cloud snapshot is stale by construction after the bake, so reuse the
+    existing t_regime_stale_sec freshness gate (900s) and abstain when older.
+    Never fabricate 0: absent means the factor declines honestly.
+    """
+    macro = PARAMS.get("t_macro") or {}
+    value = macro.get("index_change_pct")
+    age = macro.get("asof_age_sec")
+    if value is None or age is None:
+        return None
+    try:
+        limit = float(PARAMS.get("t_regime_stale_sec", 900))
+        if float(age) < 0 or float(age) > limit:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _index_change_pct(ContextInfo, moment):
     """Today's index change (%), computed IN-CLIENT from the index daily bars.
 
@@ -3976,7 +4001,9 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "index_change_pct": (
             pre.get("index_change_pct")
             if pre.get("index_change_pct") is not None
-            else _index_change_pct(ContextInfo, moment)),
+            else (_baked_index_change_pct()
+                  if _baked_index_change_pct() is not None
+                  else _index_change_pct(ContextInfo, moment))),
         "limit_up_count": pre.get("limit_up_count"),
         "limit_up_count_history": pre.get("limit_up_count_history"),
         "broken_board_ratio": pre.get("broken_board_ratio"),
