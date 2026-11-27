@@ -64,6 +64,23 @@ class TestMergeStaticParams(unittest.TestCase):
         merged, _ = hr.merge_static_params(runtime, base)
         self.assertEqual(merged["strategy_version"], "v109-20261119")
 
+    def test_retired_knobs_do_not_survive_the_merge(self):
+        """2026-11-27：破位腿两枚旋钮与短码退役后不许从运行态混回产物。"""
+        base = _doc({"stale_order_sec": 600,
+                     "builtin_rules": ["take_profit", "reduce_position"],
+                     "signal_codes": {"break_down": "BD", "reduce_position": "RD"}})
+        runtime = _doc({"stale_order_sec": 600,
+                        "breakdown_ratio": 0.96,
+                        "tp_breakdown_trim_on_profit": True,
+                        "builtin_rules": ["take_profit", "breakdown_sell"],
+                        "signal_codes": {"breakdown_sell": "BK"}})
+        merged, _ = hr.merge_static_params(runtime, base)
+        params = merged["params"]
+        self.assertNotIn("breakdown_ratio", params)
+        self.assertNotIn("tp_breakdown_trim_on_profit", params)
+        self.assertNotIn("breakdown_sell", params["builtin_rules"])
+        self.assertNotIn("breakdown_sell", params["signal_codes"])
+
     def test_m4_base_digest_changes_when_file_changes(self):
         # sha 载荷要能感知"只改了静态旋钮"：base 内容变 -> digest 变。
         import tempfile

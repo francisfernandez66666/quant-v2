@@ -125,7 +125,7 @@ class ReplayTest(unittest.TestCase):
         # test's stubs.
         cls._orig_rules = {name: getattr(cls.mod, name)
                            for name in ("rule_pullback_buy", "rule_take_profit",
-                                        "rule_stop_loss", "rule_breakdown_sell")}
+                                        "rule_stop_loss")}
         cls._orig_cap = cls.mod.PARAMS.get("order_amount_cap")
 
     # 每个用例前把柜台桩、行情与账户映射复位到同一基线，避免用例间相互污染。

@@ -79,14 +79,14 @@ func TestTPKnobsOwnersRulings(t *testing.T) {
 		t.Fatalf("dragon open-board window must be 900s, got %v", got)
 	}
 	// D3 2026-11-25（owner 裁决 ①）：没有战法止盈点的票也不是"站上成本就卖"，
-	// 要先有 3 个百分点的浮盈才武装峰值回撤腿——止盈不是止损，水下交给 reduce/breakdown。
+	// 要先有 3 个百分点的浮盈才武装峰值回撤腿——止盈不是止损，水下交给 reduce。
 	if got := cfg.CarrierTPPeakArmPct(); got != 3.0 {
 		t.Fatalf("peak arm threshold must be 3 P&L points (owner ruling 2026-11-25), got %v", got)
 	}
-	// 三条 owner 裁决的开关缺省必须开着——它们是替 owner 定的默认行为，不是灰度。
-	if !cfg.CarrierTPLadderEnabled() || !cfg.CarrierTPBreakdownTrimOnProfit() || !cfg.CarrierTPRebuyBlock() {
-		t.Fatalf("ladder/trim/rebuy-block must all default on: %v/%v/%v",
-			cfg.CarrierTPLadderEnabled(), cfg.CarrierTPBreakdownTrimOnProfit(), cfg.CarrierTPRebuyBlock())
+	// 2026-11-27：破位腿退役，其"浮盈只减半"旋钮随之下线；余下两条开关仍默认开。
+	if !cfg.CarrierTPLadderEnabled() || !cfg.CarrierTPRebuyBlock() {
+		t.Fatalf("ladder/rebuy-block must both default on: %v/%v",
+			cfg.CarrierTPLadderEnabled(), cfg.CarrierTPRebuyBlock())
 	}
 }
 

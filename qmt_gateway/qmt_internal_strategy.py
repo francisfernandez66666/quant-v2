@@ -965,25 +965,27 @@ def _sell_obs_clear(day, symbol, kind):
         obs.pop((day, symbol, kind), None)
 
 
-def _confirm_sell(day, symbol, kind, now):
+def _confirm_sell(day, symbol, kind, now, last, rebound=True):
     """In-box sell observation window: a trigger must HOLD before it fires.
 
-    A single tick used to clear a whole position: 000672 went from a -3% trim to
-    a full clear in 58 seconds, and 000009 was cleared for being one cent under
-    MA5 x breakdown_ratio. This window is the box's own (the cloud sell leg
-    failed to deliver all day, so deferring to it would have done nothing). It
-    only
-    DELAYS the trigger -- direction and quantity (RD half / SL all / BK
-    available) are unchanged, and the clear line is still never extended by a
-    bull signal; the window is a confirmation, not a deferral.
+    Two gates, both must pass:
+      1) the SAME (day, symbol, kind) hit for `sell_confirm_rounds` consecutive
+         rounds AND at least `sell_confirm_sec` seconds;
+      2) (when `rebound` is True) the price did NOT bounce
+         `sell_confirm_rebound_pct` off the LOW seen inside the window.
 
-    Confirmed when the SAME (day, symbol, kind) has hit for at least
-    `sell_confirm_rounds` consecutive rounds AND at least `sell_confirm_sec`
-    seconds. Any round the trigger does not hit calls _sell_obs_clear, so a
-    pullback above the line restarts the clock (no separate "pullback %"
-    threshold -- the rule itself is the line). Missing config keys turn the
-    window OFF (today's behaviour) with one warning; it never silently disables
-    the whole sell leg.
+    Owner ruling 2026-11-27: "if it bounces 0.7% off the window low, do not
+    sell -- reset and wait for it to fall back". A bounce restarts the clock
+    but KEEPS the running low, so falling back to the low re-arms it; a new low
+    always re-arms it (a downtrend never gets stuck).
+
+    `take_profit_clear` passes rebound=False: the rest of a position follows
+    its peak mechanically (owner ruling 2026-11-24 #4), a bounce must not turn
+    that into a discretionary hold.
+
+    Missing `sell_confirm_rounds/sec` turns the WHOLE window off (old
+    behaviour, one warning). A missing `sell_confirm_rebound_pct` turns only
+    the rebound gate off (one warning) -- it never silently disables the window.
     """
     rounds = PARAMS.get("sell_confirm_rounds")
     secs = PARAMS.get("sell_confirm_sec")
@@ -998,11 +1000,40 @@ def _confirm_sell(day, symbol, kind, now):
     key = (day, symbol, kind)
     entry = obs.get(key)
     if entry is None:
-        obs[key] = {"since": now, "rounds": 1}
+        obs[key] = {"since": now, "rounds": 1, "low": last, "why": "pending"}
         return False
+    low = entry.get("low")
+    if last is not None and (low is None or last < low):
+        low = last
+        entry["low"] = low
+    reb = None
+    if rebound:
+        reb = PARAMS.get("sell_confirm_rebound_pct")
+        if reb is None:
+            _warn_once("sell_confirm_rebound_cfg",
+                       "sell_confirm_rebound_pct missing: rebound gate off")
+        elif float(reb) > 0 and last is not None and low and low > 0:
+            # 0 turns the gate OFF (never "always bounced"); a missing key does
+            # the same. Only a positive threshold can defer a sell.
+            if last >= low * (1.0 + float(reb) / 100.0):
+                # Bounced off the window low: delay, KEEP the low, restart the
+                # clock. Falling back to the low re-arms it; a new low does too.
+                obs[key] = {"since": now, "rounds": 1, "low": low,
+                            "why": "rebound"}
+                return False
     entry["rounds"] = int(entry.get("rounds", 0)) + 1
-    return (entry["rounds"] >= int(rounds)
-            and (now - float(entry.get("since", now))) >= float(secs))
+    confirmed = (entry["rounds"] >= int(rounds)
+                 and (now - float(entry.get("since", now))) >= float(secs))
+    entry["why"] = "pending" if not confirmed else ""
+    return confirmed
+
+
+def _sell_pending_reason(day, symbol, kind):
+    """Name WHY a trigger is still waiting (clock vs a bounce off the low)."""
+    entry = (_STATE.get("sell_obs") or {}).get((day, symbol, kind)) or {}
+    if entry.get("why") == "rebound":
+        return "sell_confirm_rebound"
+    return "sell_confirm_pending"
 
 
 def _buy_retry_counter(day, symbol, orders):
@@ -5224,7 +5255,7 @@ def run_round(ContextInfo, moment):
     if positions is not None:
         held_symbols = len([1 for row in positions.values() if (row or {}).get("qty", 0.0) > 0.0])
     # P0-B sell_blind (2026-11-17): a held position with NO last_price makes the
-    # stop_loss/take_profit/breakdown legs return None silently -- "no trigger"
+    # stop_loss/take_profit legs return None silently -- "no trigger"
     # and "cannot see price" looked identical, so a whole day of blindness was
     # invisible. Name it, hourly-deduped so it never becomes round_skips noise
     # (4 rows / 5s would train the operator to ignore real alerts). This is the
@@ -5293,36 +5324,33 @@ def run_round(ContextInfo, moment):
         signals = []
         # STOP-LADDER 2026-11-20 (owner): -3% trims half, -6% clears the whole
         # position. Order is the risk order: take-profit, clear-out (stop_loss),
-        # breakdown, then the trim step. The trim is the ONLY step a fresh bull
-        # signal may override ("signal strength outranks the trim, never the
-        # clear"), and the override is a round-level HOLD: this symbol is
-        # neither trimmed nor added to this round -- which also keeps the
-        # pre-existing rule that a name down past the first ladder step never
-        # gets bought into on the same round.
+        # then the trim step. The trim is the ONLY step a fresh bull signal may
+        # override ("signal strength outranks the trim, never the clear"), and
+        # the override is a round-level HOLD: this symbol is neither trimmed nor
+        # added to this round -- which also keeps the pre-existing rule that a
+        # name down past the first ladder step never gets bought into on the
+        # same round.
         bull = rule_pullback_buy(PARAMS, ctx)
         # SELL-OBS-WINDOW 2026-11-23: the ladder runs in risk order and stops at
-        # the first hit, but stop_loss / breakdown / reduce must HOLD for the
-        # observation window before they fire. take_profit keeps its old cadence
-        # (not this batch). A bull signal overrides the TRIM and the BREAKDOWN,
-        # never the CLEAR; every suppressed-or-pending trigger is named in the
-        # summary so "waiting" is never mistaken for "nothing to sell".
+        # the first hit, but stop_loss / take_profit_clear / reduce must HOLD
+        # for the observation window before they fire. take_profit keeps its old
+        # cadence (not this batch). A bull signal overrides the TRIM only, never
+        # the CLEAR; every suppressed-or-pending trigger is named in the summary
+        # so "waiting" is never mistaken for "nothing to sell".
         # STOP-LADDER 2026-11-25 (D4): the tuple below IS the priority order --
         #   1 stop_loss          clear-out line
         #   2 reduce_position    -3% trim (the only step a bull signal may defer)
         #   3 take_profit_clear  protects profit only (D1: abstains underwater)
         #   4 take_profit        Stage-0 half sale (same: abstains underwater)
-        #   5 breakdown          last, so the -3% trim always gets one turn first
-        # Live 2026-11-25: 000680 was -3.8% AND met the breakdown condition in the
-        # same round; with breakdown first the trim never ran and the whole
-        # position was dumped (TP half -> BK clear, no RD in between).
+        # 2026-11-27: the price-breakdown leg (BK) was retired by owner ruling ("my factor strategies are the ones waiting for a breakdown"); it used to sit last.
         now_ts = _now_ts()
+        last = ctx.get("last_price")
         seen_kinds = set()
         sell_hit = False
         for kind, rule in (("stop_loss", rule_stop_loss),
                            ("reduce", rule_reduce_position),
                            ("take_profit_clear", rule_take_profit_clear),
-                           ("take_profit", rule_take_profit),
-                           ("breakdown", rule_breakdown_sell)):
+                           ("take_profit", rule_take_profit)):
             hit = rule(PARAMS, ctx)
             if not hit:
                 continue
@@ -5339,51 +5367,49 @@ def run_round(ContextInfo, moment):
                 # bull signal does NOT extend it: the rest of a position
                 # follows its peak mechanically (owner ruling 4), and the
                 # dragon leg's "off the board" is not a judgement call either.
-                if _confirm_sell(day, symbol, kind, now_ts):
+                if _confirm_sell(day, symbol, kind, now_ts, last, rebound=False):
                     signals = [(hit, "live")]
                 else:
                     bull = None
                     summary["skipped"].append({"short": hit["short_code"],
-                                               "reason": "sell_confirm_pending"})
+                                               "reason": _sell_pending_reason(day, symbol, kind)})
             elif kind == "stop_loss":
                 # The clear line is never extended by a bull signal (STOP-LADDER
                 # 2026-11-20), but it still waits out the window.
-                if _confirm_sell(day, symbol, kind, now_ts):
+                if _confirm_sell(day, symbol, kind, now_ts, last):
                     signals = [(hit, "live")]
                 else:
                     # A pending CLEAR still blocks a same-round buy: "waiting to
                     # confirm" must never be read as "nothing wrong, buy more".
                     bull = None
                     summary["skipped"].append({"short": hit["short_code"],
-                                               "reason": "sell_confirm_pending"})
-            elif kind in ("breakdown", "reduce"):
-                # BREAKDOWN and the -3% TRIM are the two steps a bull signal may
-                # override (same family; the CLEAR is not): with a bull in hand
-                # the round simply holds and the window never opens. D4
-                # 2026-11-25: the trim now rides this branch verbatim instead of
-                # a trailing call after the loop -- one branch, one observation
-                # window, so the two legs can never drift apart.
+                                               "reason": _sell_pending_reason(day, symbol, kind)})
+            elif kind == "reduce":
+                # The -3% TRIM is the one step a bull signal may override (the
+                # CLEAR is not): with a bull in hand the round simply holds and
+                # the window never opens. D4 2026-11-25: the trim owns this
+                # branch verbatim instead of a trailing call after the loop.
                 if bull:
                     summary["skipped"].append({"short": hit["short_code"],
                                                "reason": "rule_bull_override"})
                     bull = None
-                elif _confirm_sell(day, symbol, kind, now_ts):
+                elif _confirm_sell(day, symbol, kind, now_ts, last):
                     signals = [(hit, "live")]
                 else:
                     bull = None
                     summary["skipped"].append({"short": hit["short_code"],
-                                               "reason": "sell_confirm_pending"})
+                                               "reason": _sell_pending_reason(day, symbol, kind)})
             break
-        # A sell kind that did not hit this round resets its clock.
-        for kind in ("stop_loss", "take_profit_clear", "breakdown", "reduce"):
-            if kind not in seen_kinds:
-                _sell_obs_clear(day, symbol, kind)
         if not signals and bull:
             signals = [(bull, "live")]
         if not signals:
             # Ported rules only get a turn when nothing live fired: the builtin
             # set IS today's behaviour, and a ported rule must not pre-empt it
             # on the day it is armed.
+            # 2026-11-27 (owner R4): collect hits first, then decide, so a
+            # pending sell can block every buy regardless of rule name order.
+            _ported_hits = []
+            _sell_pending = False
             for kind in sorted(_PORTED_RULES):
                 fn, _src = _PORTED_RULES[kind]
                 try:
@@ -5392,22 +5418,41 @@ def run_round(ContextInfo, moment):
                     # A rule that raises is not a rule that found nothing: name it.
                     _warn_once("rule_raise:%s" % kind, "rule %s raised %s" % (kind, repr(exc)[:100]))
                     continue
-                if hit:
-                    # GO-ADMIT-WIRING 2026-11-18 (owner approved plan A): the
-                    # runtime whitelist check via _go_admitted (see its
-                    # docstring). Only LIVE BUYS are gated: a BUY that cannot
-                    # prove its tab-owned id is demoted to "switch_off" --
-                    # computed, counted, observable as skipped reason
-                    # rule_switch_off, never placed. SELL signals are exempt:
-                    # the Go whitelist only gates the BUY dispatch
-                    # (scoring_loop.go dispatchLive takes buys only; exits run
-                    # the sell-judge/fuse chain), so gating sells here would
-                    # blind every live exit leg.
-                    _mode = rule_arm_mode(PARAMS, kind)
-                    if _mode == "live" and str(hit.get("side") or "") == "buy":
-                        if not _go_admitted(kind, rule_id=hit.get("rule_id")):
-                            _mode = "switch_off"
-                    signals.append((hit, _mode))
+                if not hit:
+                    continue
+                _mode = rule_arm_mode(PARAMS, kind)
+                _side = str(hit.get("side") or "")
+                if _mode == "live" and _side == "buy":
+                    if not _go_admitted(kind, rule_id=hit.get("rule_id")):
+                        _mode = "switch_off"
+                if _mode == "live" and _side == "sell":
+                    # 2026-11-27 (owner R4): ported sells used to place on the
+                    # round they fired -- no window, no bounce check. They now
+                    # ride the SAME window as the builtin sell ladder.
+                    seen_kinds.add(kind)
+                    if not _confirm_sell(day, symbol, kind, now_ts, last):
+                        _sell_pending = True
+                        summary["skipped"].append(
+                            {"short": hit["short_code"],
+                             "reason": _sell_pending_reason(day, symbol, kind)})
+                        continue
+                _ported_hits.append((kind, hit, _mode))
+            for _kind, _hit, _mode in _ported_hits:
+                if _sell_pending and str(_hit.get("side") or "") == "buy":
+                    # "waiting to confirm a sell" must never be read as
+                    # "nothing wrong, buy more" (same rule as bull = None).
+                    summary["skipped"].append(
+                        {"short": _hit["short_code"],
+                         "reason": "sell_pending_blocks_buy"})
+                    continue
+                signals.append((_hit, _mode))
+        # A sell kind that did not hit this round resets its clock.
+        # 2026-11-27: MUST run after the ported-rule loop, otherwise every
+        # ported sell loses its clock before it can be confirmed.
+        for kind in (("stop_loss", "take_profit_clear", "reduce") +
+                     tuple(sorted(_PORTED_RULES))):
+            if kind not in seen_kinds:
+                _sell_obs_clear(day, symbol, kind)
         # BUDGET-GATE (2026-11-16 owner): the rules layer marks ctx when a factor
         # composite PASSED but entry_amount was None (full position + reserve
         # floor) -- aggregate per round here; the hourly log beside data_health
@@ -5885,7 +5930,7 @@ def init(ContextInfo):
     if not counter_api or not _fn("passorder"):
         _log("WARN trade surface unavailable: this build will place nothing")
     # SUBSCRIBE-FIX (2026-11-16, P0): the sell legs (stop_loss/take_profit/
-    # breakdown_sell) read ctx.last_price from get_full_tick, and get_full_tick
+    # reduce_position) read ctx.last_price from get_full_tick, and get_full_tick
     # returns an EMPTY dict for symbols that were never subscribed on this
     # client -- live evidence: round_skips no_price=2 EVERY round, and held
     # symbol 002115 sat at -5.46% (stop line -3%) with the sell leg blind until

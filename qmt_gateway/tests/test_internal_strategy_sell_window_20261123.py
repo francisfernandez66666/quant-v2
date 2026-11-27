@@ -3,12 +3,12 @@
 # 现场两起：
 #   000672：-3% 减半（09:31:12）→ 剩余 1200 股成本被柜台改写成 12.9658 →
 #           58 秒后 -7.53% 命中清仓线（09:31:57）⇒ 一跳清仓。
-#   000009：10:13 只因低于 MA5×0.96 一分钱就被 breakdown 清掉。
+#   000009：10:13 只因低于 MA5×0.96 一分钱就被已退役的破位腿清掉。
 #
 # 两处根因分别落成两个机制：
 #   §SELL-BASIS-FREEZE：阶梯基座用**我们真正付出的成本**（_basis_of），减仓后冻结成本、
 #     只跟数量；跨日重置。柜台重新摊薄剩余股的成本不再抬高清仓线。
-#   §SELL-OBS-WINDOW：stop_loss / breakdown / reduce 必须连续命中 ≥N 轮且 ≥S 秒才放单；
+#   §SELL-OBS-WINDOW：stop_loss / take_profit_clear / reduce 必须连续命中 ≥N 轮且 ≥S 秒才放单；
 #     take_profit 不在本批；清仓线永不被 bull 信号延后；观察窗只推迟时机，不改方向与数量。
 #
 # English: locks for the in-box sell observation window and the frozen cost basis.
@@ -36,40 +36,40 @@ class ConfirmSellWindowTest(unittest.TestCase):
         mod._STATE.update({"sell_obs": {}, "sell_obs_day": "", "warned": {}})
 
     def test_first_hit_is_pending(self):
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0, 9.0))
 
     def test_rounds_met_but_seconds_not(self):
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0))
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0, 9.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0, 9.0))
 
     def test_both_met_fires(self):
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0))
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0))
-        self.assertTrue(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1061.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0, 9.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0, 9.0))
+        self.assertTrue(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1061.0, 9.0))
 
     def test_clear_restarts_the_clock(self):
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0))
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0, 9.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0, 9.0))
         mod._sell_obs_clear("20261123", "000672.SZ", "stop_loss")
         # 重新命中：轮数与起点都从 0 开始，不能靠"刚才那两轮"放行。
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1100.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1100.0, 9.0))
 
     def test_day_change_resets_everything(self):
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0))
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0))
-        self.assertFalse(mod._confirm_sell("20261124", "000672.SZ", "stop_loss", 1061.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0, 9.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0, 9.0))
+        self.assertFalse(mod._confirm_sell("20261124", "000672.SZ", "stop_loss", 1061.0, 9.0))
 
     def test_kinds_are_independent(self):
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0))
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "breakdown", 1000.0))
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0))
-        self.assertTrue(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1061.0))
-        # breakdown 自己那本钟只走了 2 轮 / 30 秒 ⇒ 不能跟着 stop_loss 一起放行。
-        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "breakdown", 1030.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0, 9.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "take_profit_clear", 1000.0, 9.0))
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1030.0, 9.0))
+        self.assertTrue(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1061.0, 9.0))
+        # take_profit_clear 自己那本钟只走了 2 轮 / 30 秒 ⇒ 不能跟着 stop_loss 一起放行。
+        self.assertFalse(mod._confirm_sell("20261123", "000672.SZ", "take_profit_clear", 1030.0, 9.0))
 
     def test_missing_config_turns_window_off(self):
         mod.PARAMS = {}
-        self.assertTrue(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0))
+        self.assertTrue(mod._confirm_sell("20261123", "000672.SZ", "stop_loss", 1000.0, 9.0))
         self.assertTrue(mod._STATE["warned"].get("sell_confirm_cfg"),
                         "缺配置必须留一行告警，不能静默")
 
@@ -190,7 +190,6 @@ class SellWindowBehaviorTest(unittest.TestCase):
         m._place = lambda ctx, signal: (self.placed.append(signal) or True, "")
         m.rule_pullback_buy = lambda p, c: None
         m.rule_take_profit = lambda p, c: None
-        m.rule_breakdown_sell = lambda p, c: None
         m.rule_reduce_position = lambda p, c: None
         m.rule_no_new_order_window = lambda p, c: (True, "")
         m.rule_ops_frequency_ok = lambda p, c: True
@@ -237,21 +236,6 @@ class SellWindowBehaviorTest(unittest.TestCase):
         self.assertEqual(len(self.placed), 1, "bull 信号把清仓延后了：%s" % summary)
         self.assertEqual(self.placed[0]["side"], "sell")
 
-    def test_bull_overrides_breakdown(self):
-        self.mod.rule_stop_loss = lambda p, c: None
-        self.mod.rule_breakdown_sell = lambda p, c: dict(
-            self.stop_hit, short_code="BK000001")
-        self.mod.rule_pullback_buy = lambda p, c: {"side": "buy", "symbol": self.symbol,
-                                                   "short_code": "PB000001", "qty": 100,
-                                                   "price": 9.0, "amount": 900.0}
-        self._round()
-        self.now = 1010.0
-        self._round()
-        self.now = 1061.0
-        summary = self._round()
-        self.assertEqual(self.placed, [], "bull 没能压过 breakdown：%s" % summary)
-        self.assertTrue([s for s in summary["skipped"] if s["reason"] == "rule_bull_override"],
-                        summary)
 
     def test_take_profit_is_not_in_the_window(self):
         self.mod.rule_stop_loss = lambda p, c: None

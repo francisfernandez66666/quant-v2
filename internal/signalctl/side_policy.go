@@ -201,13 +201,17 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 	earlyHold := in.InflowReleased && !in.InflowFaded && marketOK &&
 		in.MarketDelta >= config.CarrierSideInflowFadeDelta()
 
-	if !marketOK || !slopeOK {
-		// 09:30–11:00 斜率成不了桶时，只要"净流入 + 放量"已成立就该放开，
-		// 而不是继续按"缺数"压到 35%（今天 09:30–11:00 就是这个形状）。
-		if config.CarrierSideInflowReversalEnabled() &&
-			(earlyHold || (!in.InflowFaded && strongIn && volSurge && indexOK)) {
-			return earlyRangeState(in, "inflow_reversal_early", st.LatchUntilUnix)
-		}
+	// 2026-11-27 §SIDE-FLOW-FALLBACK：早释是有读数时的优先出口，必须在冷启动之前。
+	// earlyHold / strongIn 自身都带 marketOK，所以这段放在 !marketOK 之前也不会
+	// 成为"曾经释放过就盲持"的粘性出口——真缺数时两个条件都假，照旧落冷启动。
+	if config.CarrierSideInflowReversalEnabled() &&
+		(earlyHold || (!in.InflowFaded && strongIn && volSurge && indexOK)) {
+		return earlyRangeState(in, "inflow_reversal_early", st.LatchUntilUnix)
+	}
+	// 真正缺数才走冷启动。过去 `!marketOK || !slopeOK` 把"有读数但没斜率"也当缺数，
+	// 上午大半天即使板块合计 +2%、市场态 range 也被压成 35%。斜率缺失只让
+	// worsening/improving 为假，直接进入下面的 switch 拿 range/bear_regime。
+	if !marketOK {
 		cold := SidePolicyState{
 			Enabled: true, Day: st.Day, Mode: SidePolicyBear, Level: 0,
 			AllowNew: true, AllowAdd: true, TargetMultiplier: 1.0,
@@ -218,12 +222,7 @@ func DecideSidePolicy(in SidePolicyInput) SidePolicyState {
 			cold.AsOfUnix = cold.AsOf.Unix()
 		}
 		cold.LatchUntilUnix = st.LatchUntilUnix
-		// §SIDE-PM-GATE 2026-11-26：13:00 已经由"三项读数齐全"确认过的下午，
-		// 不该因为 13:20 读数抖一轮就退回 0.35（每次翻面都改 digest ⇒ 一次客户端重启）。
-		// 冷启动分支原本会把它丢掉（返回的是新构造的 cold），这里显式带上粘性位。
 		cold.PMRelease = in.PMReleaseLatched
-		// 顺手修掉一处：latch 在冷启动分支里也必须生效（原代码直接 AllowNew: true，
-		// 13:00 那一刻若斜率仍缺，no-new 锁会被静默丢掉）。
 		if latchActiveSide(in.Latch, in.Now) {
 			cold.AllowNew = false
 			cold.Reason = "pm1300_latch"

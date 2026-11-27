@@ -7746,6 +7746,19 @@ func (e *Engine) fillFlowMoney(now time.Time) {
 	// 抽成纯函数（aggregateSectorFlow）以便离线验算；样本不足一律弃权（NULL）。
 	secPct, secDelta := aggregateSectorFlow(netSum, amtSum, deltaSum, nDelta)
 
+	// §SIDE-FLOW-FALLBACK 2026-11-27：只要本轮聚合有效，就把落库口径的板块合计
+	// 记进侧策略缓存——与走哪条腿、写库是否成功无关。写库失败只打日志，别把缓存也弄丢。
+	// 聚合无效（nBoards<20 / NaN）时**不许**写：那会用垃圾覆盖上一次的有效读数。
+	if secPct != nil && finiteSideFloat(*secDelta) && finiteSideFloat(netSum) && finiteSideFloat(amtSum) {
+		aggDelta := signalctl.FlowPctToDelta(netSum, amtSum)
+		if finiteSideFloat(aggDelta) {
+			e.sideMu.Lock()
+			e.sideFlow.AggDelta, e.sideFlow.AggNet, e.sideFlow.AggAmount = aggDelta, netSum, amtSum
+			e.sideFlow.AggAt = now
+			e.sideMu.Unlock()
+		}
+	}
+
 	// ③ 侧策略采样：**两条腿之后、单一调用点**（§SIDE-FLOW-PROXY 2026-11-26）。
 	e.sampleSideFlow(now, mktSample, mktOK, netSum, amtSum, nDelta)
 

@@ -469,10 +469,19 @@ func TestColdStartDefaultsToBear(t *testing.T) {
 	}
 	for i, in := range cases {
 		st := DecideSidePolicy(in)
-		if st.Mode != SidePolicyBear || !st.AllowNew || !st.AllowAdd || st.TargetMultiplier != 1.0 ||
-			st.Reason != "side_policy_cold_start_bear" {
-			t.Fatalf("case %d: cold start got mode=%s new=%v add=%v tm=%v reason=%s",
-				i, st.Mode, st.AllowNew, st.AllowAdd, st.TargetMultiplier, st.Reason)
+		// 2026-11-27 F1：case 0 仍是真缺数（bear/35%）；case 1 有读数但没斜率，
+		// 不再误判成冷启动，按 range_regime 走（AllowNew/Add 与 TM 不变）。
+		if i == 0 {
+			if st.Mode != SidePolicyBear || !st.AllowNew || !st.AllowAdd || st.TargetMultiplier != 1.0 ||
+				st.Reason != "side_policy_cold_start_bear" {
+				t.Fatalf("case %d: cold start got mode=%s new=%v add=%v tm=%v reason=%s",
+					i, st.Mode, st.AllowNew, st.AllowAdd, st.TargetMultiplier, st.Reason)
+			}
+			continue
+		}
+		if st.Mode != SidePolicyRange || st.Reason != "range_regime" || !st.AllowNew || !st.AllowAdd {
+			t.Fatalf("case %d: flow without slope must be range_regime, got mode=%s new=%v add=%v reason=%s",
+				i, st.Mode, st.AllowNew, st.AllowAdd, st.Reason)
 		}
 	}
 }

@@ -486,6 +486,8 @@ func collectCarrierShape(c *collector) {
 	const src = "internal/config/carrier_knobs.go:CarrierSellConfirm/SellConfirmSec/MarketScaleCeilingMargin/BuyRetryImprovePct/BuyRetryMaxPerDay"
 	c.put("sell_confirm_rounds", src, config.CarrierSellConfirmRounds())
 	c.put("sell_confirm_sec", src, config.CarrierSellConfirmSec())
+	// 2026-11-27：反弹闸阈值必须和载体观察窗共用同一个 Go 真源，避免参数文件另立一本账。
+	c.put("sell_confirm_rebound_pct", src, config.CarrierSellConfirmReboundPct())
 	c.put("market_scale_ceiling_margin", src, config.CarrierMarketScaleCeilingMargin())
 	c.put("buy_retry_improve_pct", src, config.CarrierBuyRetryImprovePct())
 	c.put("buy_retry_max_per_day", src, config.CarrierBuyRetryMaxPerDay())
@@ -514,6 +516,9 @@ func collectCarrierShape(c *collector) {
 	c.put("side_pm_check_from", sideSrc, config.CarrierSidePMCheckFrom())
 	c.put("side_pm_block_until", sideSrc, config.CarrierSidePMBlockUntil())
 	c.put("side_bucket_minutes", sideSrc, config.CarrierSideBucketMinutes())
+	// 2026-11-27：板块备选新鲜度与失败计数时间窗都从 Go 真源导出，参数文件不许再立第二本账。
+	c.put("side_agg_max_age_sec", sideSrc, config.CarrierSideAggMaxAgeSec())
+	c.put("side_proxy_miss_window_sec", sideSrc, config.CarrierSideProxyMissWindowSec())
 	c.put("side_policy_ttl_sec", sideSrc, config.CarrierSidePolicyTTLSec())
 	c.put("side_freshness_heartbeat_sec", sideSrc, config.CarrierSideFreshnessHeartbeatSec())
 	// D6-a 2026-11-25：极强右侧回买（只解 tp_rebuy_block）。margin 是分数点不是百分比。
@@ -553,7 +558,6 @@ func collectCarrierShape(c *collector) {
 	c.put("tp_trail_half_retr_pct_30cm", tpSrc, config.CarrierTPTrailHalfRetrPct30())
 	c.put("tp_trail_clear_retr_pct_30cm", tpSrc, config.CarrierTPTrailClearRetrPct30())
 	c.put("tp_giveback_pp", tpSrc, config.CarrierTPGivebackPP())
-	c.put("tp_breakdown_trim_on_profit", tpSrc, config.CarrierTPBreakdownTrimOnProfit())
 	c.put("tp_rebuy_block", tpSrc, config.CarrierTPRebuyBlock())
 	c.put("tp_dragon_take_profit_pct", tpSrc, config.CarrierTPDragonTakeProfitPct())
 	c.put("tp_dragon_open_no_reseal_sec", tpSrc, config.CarrierTPDragonOpenNoResealSec())

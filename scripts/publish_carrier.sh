@@ -46,7 +46,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$VERSION" ]] || { echo "CARRIER_PUBLISH_ABORT reason=version_required" >&2; exit 2; }
-if ! [[ "$VERSION" =~ ^v[0-9]{2}-[0-9]{8}$ ]]; then
+# 版本宽度必须与 build_local_executor.VERSION_RE / test_local_executor_build_update.py 同源（2–6 位）。
+# 热更计数器越过 v99、v999 后会出现 4 位以上版本；手工发布口若只认 2 位，就会出现
+# "热更链能烘、手工发布拒绝"的两本账。该正则与另外两处由 §256 门禁逐字比对。
+if ! [[ "$VERSION" =~ ^v[0-9]{2,6}-[0-9]{8}$ ]]; then
   echo "CARRIER_PUBLISH_ABORT reason=bad_version_shape want=vNN-YYYYMMDD got=$VERSION" >&2; exit 2
 fi
 

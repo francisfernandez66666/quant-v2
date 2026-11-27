@@ -119,7 +119,7 @@ BASE_PARAMS = {
     "t_terminal_status_codes": ["53", "54", "56", "57"],
     "t_cancelled_status_tokens": ["cancel", "revoke"],
     "symbol_head_len": 6,
-    "signal_codes": {"breakdown_sell": "BK", "pullback_buy": "PB",
+    "signal_codes": {"pullback_buy": "PB",
                      "stop_loss": "SL", "take_profit": "TP"},
     "t_signal_codes": {"t_buy_first": "TB", "t_buy_first_pair": "TS",
                        "t_sell_first": "XB", "t_sell_pair": "XS",

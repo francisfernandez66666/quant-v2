@@ -150,7 +150,7 @@ class TestRuleLayerHasNoBareNumbers(unittest.TestCase):
             "volume_ratio_min", "min_cash_reserve", "order_amount_cap",
             "daily_buy_cap", "min_order_amount", "no_cancel_windows",
             "no_new_order_windows", "max_ops_per_min", "pullback_ratio",
-            "stop_loss_ratio", "breakdown_ratio",
+            "stop_loss_ratio",
             "reduce_position_ratio", "reduce_position_fraction",
             "lot_size", "signal_codes", "symbol_head_len",
             # §TP-LADDER-20261124：两段止盈的旋钮（`take_profit_ratio` 已退役，
@@ -159,8 +159,10 @@ class TestRuleLayerHasNoBareNumbers(unittest.TestCase):
             "tp_peak_arm_pct", "tp_trail_half_retr_pct",
             "tp_trail_clear_retr_pct", "tp_trail_half_retr_pct_20cm",
             "tp_trail_clear_retr_pct_20cm", "tp_trail_half_retr_pct_30cm",
-            "tp_trail_clear_retr_pct_30cm", "tp_breakdown_trim_on_profit",
+            "tp_trail_clear_retr_pct_30cm",
             "tp_dragon_open_no_reseal_sec", "tp_rebuy_block",
+            # 2026-11-27：反弹闸阈值必须烘进 PARAMS，否则观察窗只剩轮数+秒数。
+            "sell_confirm_rebound_pct",
             "t_bse_board_prefixes", "t_wide_board_prefixes",
         ]
         for key in needed:
@@ -170,7 +172,7 @@ class TestRuleLayerHasNoBareNumbers(unittest.TestCase):
         """A signal kind with no short code cannot be keyed, and a missing
         key would silently drop the signal."""
         kinds = ["pullback_buy", "take_profit", "take_profit_clear",
-                 "stop_loss", "breakdown_sell", "reduce_position"]
+                 "stop_loss", "reduce_position"]
         for kind in kinds:
             self.assertIn(kind, lex.PARAMS["signal_codes"])
 
@@ -484,8 +486,7 @@ class TestSignals(unittest.TestCase):
     def test_no_signal_on_a_closed_day(self):
         p = params()
         for rule in (lex.rule_pullback_buy, lex.rule_take_profit,
-                     lex.rule_stop_loss, lex.rule_breakdown_sell,
-                     lex.rule_reduce_position):
+                     lex.rule_stop_loss, lex.rule_reduce_position):
             self.assertIsNone(rule(p, ctx(trading_day=False)))
 
     def test_take_profit(self):
@@ -563,18 +564,6 @@ class TestSignals(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal["qty"], 1000,
                          "the clear line sells the WHOLE position")
-
-    def test_breakdown_sell(self):
-        p = params()
-        signal = lex.rule_breakdown_sell(p, ctx(last_price=9.0, ref_price=10.0,
-                                                 position_qty=1000.0, position_cost=10.0))
-        self.assertIsNotNone(signal)
-        self.assertEqual(signal["kind"], "breakdown_sell")
-
-    def test_breakdown_sell_needs_a_position(self):
-        p = params()
-        self.assertIsNone(lex.rule_breakdown_sell(p, ctx(last_price=9.0, ref_price=10.0,
-                                                          position_qty=0.0)))
 
     def test_exit_wins_over_entry_on_the_same_symbol(self):
         """A name that must be sold is more urgent than buying anything."""

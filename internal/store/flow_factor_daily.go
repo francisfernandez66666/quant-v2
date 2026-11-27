@@ -37,11 +37,14 @@ func (d *DB) UpsertFlowFactorDaily(r FlowFactorDailyRow) error {
 		 flow_market_delta, flow_sector_delta, vol_surge_delta, source, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(trade_date) DO UPDATE SET
-		  market_flow_pct=excluded.market_flow_pct, sector_flow_pct=excluded.sector_flow_pct,
-		  r_yest=excluded.r_yest, r_ma5=excluded.r_ma5,
-		  flow_market_delta=excluded.flow_market_delta, flow_sector_delta=excluded.flow_sector_delta,
-		  vol_surge_delta=excluded.vol_surge_delta, source=excluded.source,
-		  updated_at=excluded.updated_at`,
+		  market_flow_pct=COALESCE(excluded.market_flow_pct, flow_factor_daily.market_flow_pct),
+		  sector_flow_pct=COALESCE(excluded.sector_flow_pct, flow_factor_daily.sector_flow_pct),
+		  r_yest=COALESCE(excluded.r_yest, flow_factor_daily.r_yest),
+		  r_ma5=COALESCE(excluded.r_ma5, flow_factor_daily.r_ma5),
+		  flow_market_delta=COALESCE(excluded.flow_market_delta, flow_factor_daily.flow_market_delta),
+		  flow_sector_delta=COALESCE(excluded.flow_sector_delta, flow_factor_daily.flow_sector_delta),
+		  vol_surge_delta=COALESCE(excluded.vol_surge_delta, flow_factor_daily.vol_surge_delta),
+		  source=excluded.source, updated_at=excluded.updated_at`,
 		r.TradeDate, nnz(r.MarketFlowPct), nnz(r.SectorFlowPct),
 		nnz(r.RYest), nnz(r.RMa5), nnz(r.FlowMarketDelta), nnz(r.FlowSectorDelta),
 		nnz(r.VolSurgeDelta), r.Source,
@@ -133,8 +136,10 @@ func (d *DB) UpsertFlowVolumeOnly(r FlowFactorDailyRow) error {
 		(trade_date, r_yest, r_ma5, vol_surge_delta, source, updated_at)
 		VALUES (?,?,?,?,?,?)
 		ON CONFLICT(trade_date) DO UPDATE SET
-		  r_yest=excluded.r_yest, r_ma5=excluded.r_ma5,
-		  vol_surge_delta=excluded.vol_surge_delta, source=excluded.source,
+		  r_yest=COALESCE(excluded.r_yest, flow_factor_daily.r_yest),
+		  r_ma5=COALESCE(excluded.r_ma5, flow_factor_daily.r_ma5),
+		  vol_surge_delta=COALESCE(excluded.vol_surge_delta, flow_factor_daily.vol_surge_delta),
+		  source=excluded.source,
 		  updated_at=excluded.updated_at`,
 		r.TradeDate, nnz(r.RYest), nnz(r.RMa5), nnz(r.VolSurgeDelta), r.Source,
 		time.Now().Format("2006-01-02 15:04:05"))
@@ -157,8 +162,10 @@ func (d *DB) UpsertFlowMoneyOnly(r FlowFactorDailyRow) error {
 		(trade_date, market_flow_pct, sector_flow_pct, flow_market_delta, flow_sector_delta, source, updated_at)
 		VALUES (?,?,?,?,?,?,?)
 		ON CONFLICT(trade_date) DO UPDATE SET
-		  market_flow_pct=excluded.market_flow_pct, sector_flow_pct=excluded.sector_flow_pct,
-		  flow_market_delta=excluded.flow_market_delta, flow_sector_delta=excluded.flow_sector_delta,
+		  market_flow_pct=COALESCE(excluded.market_flow_pct, flow_factor_daily.market_flow_pct),
+		  sector_flow_pct=COALESCE(excluded.sector_flow_pct, flow_factor_daily.sector_flow_pct),
+		  flow_market_delta=COALESCE(excluded.flow_market_delta, flow_factor_daily.flow_market_delta),
+		  flow_sector_delta=COALESCE(excluded.flow_sector_delta, flow_factor_daily.flow_sector_delta),
 		  source=excluded.source, updated_at=excluded.updated_at`,
 		r.TradeDate, nnz(r.MarketFlowPct), nnz(r.SectorFlowPct),
 		nnz(r.FlowMarketDelta), nnz(r.FlowSectorDelta), r.Source,

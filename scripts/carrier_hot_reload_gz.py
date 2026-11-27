@@ -106,7 +106,7 @@ T_ROUNDS_LIVE = os.path.join(DATA_DIR, "accounts", OWNER_UID, "t_rounds_live.jso
 # 因此不会各说各话；读不到时才用这张兜底表。
 T_ANCHOR_OK_SOURCES = ("first_buy_order", "first_lot", "cost_fallback")
 # §LIVE-T-20261116：T 腿幂等短码表（owner 装填动作，离线确认过：
-# 五个码互不为前缀、且不与现有 signal_codes 的 BD/BK/D/DB/DR/FC/GN/HC/LD/LD1/PB/PT/SL/TP 冲突；
+# 五个码互不为前缀、且不与现有 signal_codes 的 BD/D/DB/DR/FC/GN/HC/LD/LD1/PB/PT/SL/TP 冲突；
 # 'X' 前缀战略腿未使用）。空表即 T 腿 fail-closed 不出单——这里装填即解锁。
 # 经环境变量可覆盖，改码前必须重跑 rules_t.t_short_code_check 与 g8 唯一闸。
 T_SIGNAL_CODES = json.loads(os.environ.get(
@@ -167,7 +167,11 @@ RUNTIME_DOC_KEYS = frozenset(("strategy_version",))
 # owner 废掉的阈值必须真的从盒子上消失，否则 PARAMS 里躺着一个没人读的数，下一次改它的人
 # 会以为它还在生效（`take_profit_ratio=1.05` 全平腿就是 2026-11-24 那三笔误清仓的成因）。
 # 只删这里点名的键，绝不扩成"base 缺什么就删什么"。
-RETIRED_PARAM_KEYS = frozenset(("take_profit_ratio",))
+RETIRED_PARAM_KEYS = frozenset((
+    "take_profit_ratio",
+    # §SELL-LEG-RETIRE-20261127：破位腿退役，两枚旋钮不许在盒子上留宿。
+    "breakdown_ratio", "tp_breakdown_trim_on_profit",
+))
 
 
 def merge_static_params(runtime_doc, base_doc):
@@ -246,6 +250,12 @@ def apply_static_params_base():
             key, json.dumps(old, ensure_ascii=True)[:90], json.dumps(new, ensure_ascii=True)[:90]))
     with open(runtime_path, "w", encoding="utf-8") as fh:
         json.dump(merged, fh, ensure_ascii=True, indent=2)
+    # 2026-11-27：把"这次真被摘掉的名字"打出来，退役是否落地不必翻产物猜。
+    # 判据只用合并前后的键集之差，不改函数签名，merge_static_params 仍是纯函数。
+    _before = set((runtime_doc.get("params") or {}))
+    _after = set(merged.get("params") or {})
+    print("HOTRELOAD_PARAMS_RETIRED keys=%s"
+          % (",".join(sorted(_before - _after)) or "-"))
     print("HOTRELOAD_PARAMS_MERGED static_patched=%d" % len(patched))
     return len(patched)
 
@@ -256,6 +266,29 @@ def die(reason):
     （快照漂移/同步失败/闸门红）都必须走这里点名成因，绝不带病继续发布。"""
     print("HOTRELOAD_GZ_ABORT reason=%s" % reason)
     sys.exit(1)
+
+
+def restore_params_version(ver, params_path="qmt_gateway/local_executor_params.json"):
+    """烘焙失败后只把 strategy_version 恢复到失败前的值（2026-11-27 §BAKE-CHAIN）。
+
+    热更链是「先写版本再烘焙」：崩一处就把版本号永久推进一格，30 秒重试会越跑越远，
+    永远不自愈。本函数只改这一个字段——入参路径必须与主流程 bump 用的是同一份文件，
+    绝不整份回写 doc（那份 doc2 已把静态旋钮烘好，整份回滚会把烘参一起撤掉）。
+    写回走同目录临时文件 + os.replace，避免半截 JSON 被下一轮读到。
+    """
+    try:
+        with open(params_path, "r", encoding="utf-8") as fh:
+            doc_v = json.load(fh)
+        doc_v["strategy_version"] = ver
+        tmp = params_path + ".restore.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc_v, fh, ensure_ascii=True, indent=2)
+        os.replace(tmp, params_path)
+        print("HOTRELOAD_VERSION_RESTORED version=%s" % ver)
+        return True
+    except (OSError, ValueError, KeyError) as exc:
+        print("HOTRELOAD_VERSION_RESTORE_FAILED detail=%s" % repr(exc)[:80])
+        return False
 
 
 def norm(code):
@@ -1895,6 +1928,9 @@ def _main_impl():
     out_dir = "/var/lib/quant-trading-v2/carrier_build_out"
     doc = json.load(open(params_path, encoding="utf-8"))
     cur = doc.get("strategy_version") or "v00-19700101"
+    # §BAKE-CHAIN 2026-11-27：只存版本串用于失败回滚；不能把整份 doc 留着回写——
+    # :1820 的 doc2 已经把静态旋钮烘进这份文件，整份回滚会把烘参一起撤掉。
+    orig_ver = cur
     nn = int(str(cur).split("-")[0][1:])
     day = datetime.date.today().strftime("%Y%m%d")
     ver = "v%02d-%s" % (nn + 1, day)
@@ -1910,6 +1946,8 @@ def _main_impl():
     r = run(["python3", "scripts/build_local_executor.py", "--target", "sandbox",
              "--out-dir", out_dir])
     if r.returncode != 0:
+        # 构建失败：把本轮 bump 的版本号撤回，下一轮重试仍用同一个版本号。
+        restore_params_version(orig_ver, params_path)
         die("bake_failed2 version=%s" % ver)
     arts = [f for f in os.listdir(out_dir) if f.startswith("qmt_internal_strategy_")]
     if not arts:
@@ -1922,6 +1960,8 @@ def _main_impl():
     # the older buggy artifact once the counter crosses v99 -> v100.
     art_path = os.path.join(out_dir, "qmt_internal_strategy_%s.py" % ver)
     if not os.path.exists(art_path):
+        # 产物名与本次版本对不上：同样要撤版本号，否则下一轮又推进一格。
+        restore_params_version(orig_ver, params_path)
         die("artifact_version_not_baked version=%s" % ver)
     sha_art = hashlib.sha256(open(art_path, "rb").read()).hexdigest()
 

@@ -288,6 +288,8 @@ MAPPING = [
     # 各自弃权或打告警，绝不静默取默认。
     ("sell_confirm_rounds", ("sell_confirm_rounds",), None),
     ("sell_confirm_sec", ("sell_confirm_sec",), None),
+    # 2026-11-27：反弹闸阈值从 Go 真源 derive 到烘参；只改 Go 不改这里会造成双账。
+    ("sell_confirm_rebound_pct", ("sell_confirm_rebound_pct",), None),
     ("market_scale_ceiling_margin", ("market_scale_ceiling_margin",), None),
     ("buy_retry_improve_pct", ("buy_retry_improve_pct",), None),
     ("buy_retry_max_per_day", ("buy_retry_max_per_day",), None),
@@ -315,6 +317,9 @@ MAPPING = [
     ("side_pm_check_from", ("side_pm_check_from",), None),
     ("side_pm_block_until", ("side_pm_block_until",), None),
     ("side_bucket_minutes", ("side_bucket_minutes",), None),
+    # 2026-11-27：落库板块合计的 age 上限与失败计数时间窗，真源在 carrier_knobs.go。
+    ("side_agg_max_age_sec", ("side_agg_max_age_sec",), None),
+    ("side_proxy_miss_window_sec", ("side_proxy_miss_window_sec",), None),
     ("side_policy_ttl_sec", ("side_policy_ttl_sec",), None),
     ("side_freshness_heartbeat_sec", ("side_freshness_heartbeat_sec",), None),
     # D6-a / D7 2026-11-25（owner 当日裁决）：极强右侧回买 + 分时释放阶梯。
@@ -354,7 +359,6 @@ MAPPING = [
     ("tp_trail_half_retr_pct_30cm", ("tp_trail_half_retr_pct_30cm",), None),
     ("tp_trail_clear_retr_pct_30cm", ("tp_trail_clear_retr_pct_30cm",), None),
     ("tp_giveback_pp", ("tp_giveback_pp",), None),
-    ("tp_breakdown_trim_on_profit", ("tp_breakdown_trim_on_profit",), None),
     ("tp_rebuy_block", ("tp_rebuy_block",), None),
     ("tp_dragon_take_profit_pct", ("tp_dragon_take_profit_pct",), None),
     ("tp_double_bump_take_profit_pct", ("tp_double_bump_take_profit_pct",), None),
@@ -625,7 +629,6 @@ CARRIER_OWNED = {
     "max_ops_per_min": "carrier-shape: 执行器自身的节流，Go 无对应",
     "ops_window_sec": "carrier-shape: 同上",
     "poll_interval_sec": "carrier-shape: 本地进程轮询节拍",
-    "breakdown_ratio": "carrier-shape: 载体形态规则的内部参数",
     "pullback_ratio": "carrier-shape: 同上",
     "ma_window": "carrier-shape: 同上",
     "ma_period": "carrier-shape: 同上",

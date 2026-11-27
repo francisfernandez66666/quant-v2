@@ -46,8 +46,8 @@ func TestSideInflowEarlyReleasesRange(t *testing.T) {
 // TestSideInflowEarlyNeedsVolume 平量（vol=0）不构成"净流入 + 放量"。
 func TestSideInflowEarlyNeedsVolume(t *testing.T) {
 	st := DecideSidePolicy(earlyInput(0.55, 0))
-	if st.Mode != SidePolicyBear || st.Reason != "side_policy_cold_start_bear" {
-		t.Fatalf("flat volume must stay cold-start bear, got mode=%s reason=%s", st.Mode, st.Reason)
+	if st.Reason == "inflow_reversal_early" || st.Mode != SidePolicyRange || st.Reason != "range_regime" {
+		t.Fatalf("flat volume must not early-release; with valid flow and no slope it goes range_regime, got mode=%s reason=%s", st.Mode, st.Reason)
 	}
 }
 
@@ -55,8 +55,8 @@ func TestSideInflowEarlyNeedsVolume(t *testing.T) {
 func TestSideInflowEarlyNeedsIndex(t *testing.T) {
 	in := earlyInput(0.55, 1.0)
 	in.IndexValid = false
-	if st := DecideSidePolicy(in); st.Mode != SidePolicyBear {
-		t.Fatalf("missing index must keep bear, got %s (%s)", st.Mode, st.Reason)
+	if st := DecideSidePolicy(in); st.Reason == "inflow_reversal_early" || st.Mode != SidePolicyRange {
+		t.Fatalf("missing index must block early release, got %s (%s)", st.Mode, st.Reason)
 	}
 }
 
@@ -64,8 +64,8 @@ func TestSideInflowEarlyNeedsIndex(t *testing.T) {
 func TestSideInflowFadedBlocksRelease(t *testing.T) {
 	in := earlyInput(0.55, 1.0)
 	in.InflowFaded = true
-	if st := DecideSidePolicy(in); st.Mode != SidePolicyBear {
-		t.Fatalf("faded day must not release again, got %s (%s)", st.Mode, st.Reason)
+	if st := DecideSidePolicy(in); st.Reason == "inflow_reversal_early" || st.Mode != SidePolicyRange {
+		t.Fatalf("faded day must not release again; with valid flow it falls through to range_regime, got %s (%s)", st.Mode, st.Reason)
 	}
 }
 

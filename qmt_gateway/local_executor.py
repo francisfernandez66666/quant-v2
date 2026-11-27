@@ -102,9 +102,8 @@ PARAMS = {
     'breadth_missing_scale': 0.9,
     'breadth_scales': {'low': 0.7, 'mid': 0.85, 'high': 1.0},
     'break_down_kind': 'break_down',
-    'breakdown_ratio': 0.96,
     'budget_mode': 'dynamic',
-    'builtin_rules': ['pullback_buy', 'take_profit', 'take_profit_clear', 'stop_loss', 'breakdown_sell', 'reduce_position'],
+    'builtin_rules': ['pullback_buy', 'take_profit', 'take_profit_clear', 'stop_loss', 'reduce_position'],
     'buy_confirm_min_gap_sec': 60,
     'buy_confirm_min_span_sec': 180,
     'buy_confirm_reset_sec': 300,
@@ -434,10 +433,12 @@ PARAMS = {
     'scale_floor': 0.15,
     'score_domain': {'divisor': 2, 'floor': 0, 'full': 100, 'shift': 1},
     'sell_boost_level': 'L2',
+    'sell_confirm_rebound_pct': 0.7,
     'sell_confirm_rounds': 2,
     'sell_confirm_sec': 60,
     'session_gate_enabled': True,
     'session_windows': [['09:30', '11:30'], ['13:00', '14:52']],
+    'side_agg_max_age_sec': 900,
     'side_bear_target_l1': 0.85,
     'side_bear_target_l2': 0.7,
     'side_bucket_minutes': 30,
@@ -467,6 +468,7 @@ PARAMS = {
     'side_policy': {},
     'side_policy_enabled': False,
     'side_policy_ttl_sec': 2700,
+    'side_proxy_miss_window_sec': 600,
     'side_ramp_bear_am': 0.35,
     'side_ramp_bear_pm': 0.5,
     'side_ramp_bull_am': 0.7,
@@ -478,7 +480,7 @@ PARAMS = {
     'side_right_rebuy_margin': 15,
     'side_weight_hi': 1.2,
     'side_weight_lo': 0.8,
-    'signal_codes': {'break_down': 'BD', 'breakdown_sell': 'BK', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP', 'reduce_position': 'RD', 'take_profit_clear': 'TT'},
+    'signal_codes': {'break_down': 'BD', 'double_bump': 'DB', 'dragon': 'D', 'dragon_return': 'DR', 'factor_composite': 'FC', 'good_news_fade': 'GN', 'high_churn': 'HC', 'leader_decay': 'LD', 'leader_decay_v2': 'LD1', 'pattern_template': 'PT', 'pullback_buy': 'PB', 'stop_loss': 'SL', 'take_profit': 'TP', 'reduce_position': 'RD', 'take_profit_clear': 'TT'},
     'signal_gone_cancel_sec': 0,
     'single_stock_cap_pct': 35.0,
     'sizing_enabled': True,
@@ -558,7 +560,6 @@ PARAMS = {
     't_wide_board_prefixes': ['30', '68'],
     'tier_red_default': 0.3,
     'tier_scales': {'Red': 0.3, 'Yellow': 0.6},
-    'tp_breakdown_trim_on_profit': True,
     'tp_double_bump_take_profit_pct': 15,
     'tp_dragon_open_no_reseal_sec': 900,
     'tp_dragon_return_take_profit_pct': 25,
@@ -1300,36 +1301,6 @@ def rule_reduce_position(params, ctx):
     if not trimmed:
         return None
     return make_signal(params, ctx, "reduce_position", "sell", None, last, qty=trimmed)
-
-
-def rule_breakdown_sell(params, ctx):
-    """P0 breakdown sell signal: the price lost its reference level.
-
-    Owner ruling 3 (2026-11-24): a profitable position must NOT be cleared by
-    this leg -- it trims half and leaves the rest to the take-profit ladder
-    (today's 000797 was cleared at +2.2% two minutes after an add). At a loss
-    the leg is unchanged: it still clears the whole position.
-
-    One-lot corner: `_tp_half_qty` returns the full qty when half is not a whole
-    lot (ruling 5), so a single-lot position in profit is sold whole. It has no
-    "halve" to choose from; the alternative would be to disable this leg for it.
-    """
-    if not ctx.get("trading_day"):
-        return None
-    last = ctx.get("last_price")
-    ref = ctx.get("ref_price")
-    qty = ctx.get("position_qty")
-    cost = ctx.get("position_cost")
-    if last is None or ref is None or not qty:
-        return None
-    if last > ref * params["breakdown_ratio"]:
-        return None
-    if params["tp_breakdown_trim_on_profit"] and not ctx.get("tp_manual") and cost and last > cost:
-        half = _tp_half_qty(params, qty)
-        if half is None:
-            return None
-        return make_signal(params, ctx, "breakdown_sell", "sell", None, last, qty=half)
-    return make_signal(params, ctx, "breakdown_sell", "sell", None, last, qty=qty)
 
 
 def make_signal(params, ctx, kind, side, amount, price, qty=None):
@@ -2678,7 +2649,7 @@ class Executor(object):
         different facts -- conflating them is how a shadow rule starts spending.
         """
         out = []
-        for rule in (rule_take_profit, rule_stop_loss, rule_breakdown_sell):
+        for rule in (rule_take_profit, rule_stop_loss):
             signal = rule(self.params, ctx)
             if signal:
                 out.append((signal, "live"))

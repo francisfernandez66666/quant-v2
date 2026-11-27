@@ -11,11 +11,12 @@ package config
 // §BOX-FIX-20261123 载体形态旋钮的出厂值。
 //
 // 口径说明：
-//   - 卖出观察窗（sell_confirm_rounds / sell_confirm_sec）：一个卖出触发必须连续命中
-//     至少 2 轮、且持续至少 60 秒才允许真的发单。今日 000672 从 -3% 减半到 -6% 清仓
-//     只隔 58 秒、000009 只因低于 MA5×0.96 一分钱就被清掉——都是"一跳清仓"。
-//     观察窗只推迟**时机**，不改变方向与数量（RD 半仓 / SL 全清 / BK 可用量）。
-//     云端 `exit_confirm_min=15` 是另一条腿（云端卖出）的口径，刻意不复用、不换算。
+//   - 卖出观察窗（sell_confirm_rounds / sell_confirm_sec / sell_confirm_rebound_pct）：一个卖出
+//     触发必须连续命中至少 2 轮、持续至少 60 秒，且现价未较窗口内最低点反弹 0.7 个百分点
+//     才允许真的发单。2026-11-27 owner 裁决：反弹即重置计时但保留最低点，跌回去才重新计数。
+//     今日 000672 从 -3% 减半到 -6% 清仓只隔 58 秒、000009 只因低于 MA5×0.96 一分钱就被清掉
+//     ——都是"一跳清仓"。观察窗只推迟时机，不改变方向与数量（RD 半仓 / SL 全清）。
+//     云端 exit_confirm_min=15 是另一条腿（云端卖出）的口径，刻意不复用、不换算。
 //   - 上限折扣（market_scale_ceiling_margin）：盒子自算的 market_scale 不得高于外脑
 //     读数，且再让 10%（owner 2026-11-23 裁决用 71.5% 那一档：外脑 0.7946 × 0.9 =
 //     0.7152）。外脑读数缺失/过期时盒子退回盲区帽（missing_key_target_cap），
@@ -26,8 +27,11 @@ package config
 //     笔笔零成交（当天最低 4.57），把 1.7~2 万资金锁了半小时——这就是这条闸要关掉的形态：
 //     撤单释放当日买意向是对的（手动撤单必须能重来），但"价格没反转就照原价再发"不是。
 const (
-	carrierSellConfirmRounds        = 2
-	carrierSellConfirmSec           = 60.0
+	carrierSellConfirmRounds = 2
+	carrierSellConfirmSec    = 60.0
+	// 反弹闸：观察窗内价格较最低点反弹 ≥ 该百分点就不放行（重置计时，等跌回去）。
+	// English: bounce off the window low (percentage points) that defers a sell.
+	carrierSellConfirmReboundPct    = 0.7
 	carrierMarketScaleCeilingMargin = 0.9
 	// 再发一次必须比上一次的限价低这么多（百分比）。0.2% 在 4~10 元区间约等于"至少低一跳"，
 	// 既不放过同价重发，也不会把正常回调挡在门外。
@@ -43,6 +47,10 @@ func CarrierSellConfirmRounds() int { return carrierSellConfirmRounds }
 // CarrierSellConfirmSec 返回卖出观察窗的确认秒数（持续命中多少秒才放行）。
 // English: seconds a sell trigger must hold before firing.
 func CarrierSellConfirmSec() float64 { return carrierSellConfirmSec }
+
+// CarrierSellConfirmReboundPct 返回观察窗的反弹闸阈值（百分点）。
+// English: rebound (percentage points) off the window low that defers a sell.
+func CarrierSellConfirmReboundPct() float64 { return carrierSellConfirmReboundPct }
 
 // CarrierMarketScaleCeilingMargin 返回盒子自算 market_scale 相对外脑读数的保守折扣。
 // English: conservative discount applied to the cloud MarketScale ceiling.
@@ -100,8 +108,6 @@ const (
 	carrierTPTrailClearRetrPct30 = 10.0
 	// 有战法止盈点的票：Stage 1 允许从峰值浮盈回吐这么多**百分点**才清（30→25）。
 	carrierTPGivebackPP = 5.0
-	// 裁决 3：破位腿在有浮盈时只减半，不再整仓清（今天 000797 +2.2% 被 BK 全清是靶心）。
-	carrierTPBreakdownTrimOnProfit = true
 	// 裁决 7：当日已触发过止盈（TP/TT）的票，当天禁止再加仓/回买。
 	carrierTPRebuyBlock = true
 	// 裁决 9：龙头止盈点兜底 30%（与纸面的 dragon.TakeProfitPct 出厂 10 刻意不同——
@@ -156,10 +162,6 @@ func CarrierTPTrailClearRetrPct30() float64 { return carrierTPTrailClearRetrPct3
 // English: peak-P&L give-back (points) allowed before clearing the rest.
 func CarrierTPGivebackPP() float64 { return carrierTPGivebackPP }
 
-// CarrierTPBreakdownTrimOnProfit 返回破位腿"有浮盈只减半"是否生效。
-// English: should a profitable breakdown trim instead of clearing?
-func CarrierTPBreakdownTrimOnProfit() bool { return carrierTPBreakdownTrimOnProfit }
-
 // CarrierTPRebuyBlock 返回"当日止盈过的票禁止再买"是否生效。
 // English: block same-day re-buys of a name that took profit today.
 func CarrierTPRebuyBlock() bool { return carrierTPRebuyBlock }
@@ -182,29 +184,35 @@ func CarrierTPDragonReturnTakeProfitPct() float64 {
 // §SIDE-POLICY-20261124 熊市左右侧比例与牛市镜像剧本的载体出厂旋钮。
 // 数值只在此处定义，载体规则层必须从 PARAMS 读；缺键时按方案弃权，不写兜底常量。
 const (
-	carrierSidePolicyEnabledDefault  = false
-	carrierSideFlowStrongDelta       = 0.50
-	carrierSideFlowSlopeStep         = 0.15
-	carrierSideFlowPMDelta           = 0.20
-	carrierSideGapHighPct            = 1.00
-	carrierSideGapLowPct             = -1.00
-	carrierSidePMIndexDropPct        = -1.00
-	carrierSidePMIndexRisePct        = 1.00
-	carrierSideBearTargetL1          = 0.85
-	carrierSideBearTargetL2          = 0.70
-	carrierSideBullTargetL1          = 1.05
-	carrierSideBullTargetL2          = 1.10
-	carrierSideBullTargetL3          = 1.15
-	carrierSideWeightLo              = 0.80
-	carrierSideWeightHi              = 1.20
-	carrierSideLeftScoreFloor        = 80.0
-	carrierSideLeftScoreMargin       = 10.0
-	carrierSideLeftStableRounds      = 2
-	carrierSideLeftStableGapSec      = 60.0
-	carrierSideLeftStableMaxDrop     = 2.0
-	carrierSidePMCheckFrom           = "13:00"
-	carrierSidePMBlockUntil          = "14:00"
-	carrierSideBucketMinutes         = 30
+	carrierSidePolicyEnabledDefault = false
+	carrierSideFlowStrongDelta      = 0.50
+	carrierSideFlowSlopeStep        = 0.15
+	carrierSideFlowPMDelta          = 0.20
+	carrierSideGapHighPct           = 1.00
+	carrierSideGapLowPct            = -1.00
+	carrierSidePMIndexDropPct       = -1.00
+	carrierSidePMIndexRisePct       = 1.00
+	carrierSideBearTargetL1         = 0.85
+	carrierSideBearTargetL2         = 0.70
+	carrierSideBullTargetL1         = 1.05
+	carrierSideBullTargetL2         = 1.10
+	carrierSideBullTargetL3         = 1.15
+	carrierSideWeightLo             = 0.80
+	carrierSideWeightHi             = 1.20
+	carrierSideLeftScoreFloor       = 80.0
+	carrierSideLeftScoreMargin      = 10.0
+	carrierSideLeftStableRounds     = 2
+	carrierSideLeftStableGapSec     = 60.0
+	carrierSideLeftStableMaxDrop    = 2.0
+	carrierSidePMCheckFrom          = "13:00"
+	carrierSidePMBlockUntil         = "14:00"
+	carrierSideBucketMinutes        = 30
+	// 落库板块合计作为侧策略备选读数时的最大 age（秒）。
+	// 超过它就重新 fail-closed 到冷启动；900=15 分钟，是 owner 推荐口径的保守默认。
+	carrierSideAggMaxAgeSec = 900
+	// 大盘腿失败计数的时间窗（秒）。成功不清零，只让窗口过期淘汰旧失败；
+	// 否则 50% 占空比的时通时断会让"连续失败 2 轮"永远锁不上（2026-11-27 事故 E）。
+	carrierSideProxyMissWindowSec    = 600
 	carrierSidePolicyTTLSec          = 2700.0
 	carrierSideFreshnessHeartbeatSec = 1200.0
 	// D6-a 2026-11-25：极强右侧回买。margin 是**分数点**（阈值 + 15 分），不是百分比。
@@ -294,6 +302,12 @@ func CarrierSidePMBlockUntil() string { return carrierSidePMBlockUntil }
 
 // CarrierSideBucketMinutes 返回资金流固定桶长（分钟）。
 func CarrierSideBucketMinutes() int { return carrierSideBucketMinutes }
+
+// CarrierSideAggMaxAgeSec 返回落库板块合计备选读数的最大 age（秒）。
+func CarrierSideAggMaxAgeSec() int { return carrierSideAggMaxAgeSec }
+
+// CarrierSideProxyMissWindowSec 返回大盘腿失败计数的时间窗（秒）。
+func CarrierSideProxyMissWindowSec() int { return carrierSideProxyMissWindowSec }
 
 // CarrierSidePolicyTTLSec 返回进攻态新鲜度 TTL（秒）。
 func CarrierSidePolicyTTLSec() float64 { return carrierSidePolicyTTLSec }

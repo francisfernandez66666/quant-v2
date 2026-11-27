@@ -114,7 +114,8 @@ func TestSideFlowProxyDisabledKeepsOldBehaviour(t *testing.T) {
 	}
 }
 
-// TestSideFlowProxySkipsThinBoards 样本数不足 sectorAggMinBoards ⇒ 不采样、不锁定。
+// TestSideFlowProxySkipsThinBoards 样本数不足 sectorAggMinBoards ⇒ 不采样；
+// 但 2026-11-27 起失败次数仍按时间窗累计（锁定替补源，不制造假样本）。
 func TestSideFlowProxySkipsThinBoards(t *testing.T) {
 	e := proxyEngine(t)
 	for i := 0; i < 5; i++ {
@@ -123,8 +124,8 @@ func TestSideFlowProxySkipsThinBoards(t *testing.T) {
 	e.sideMu.RLock()
 	last, locked, miss := e.sideFlow.Last, e.sideFlow.ProxyLocked, e.sideFlow.ProxyMiss
 	e.sideMu.RUnlock()
-	if locked || miss < 5 || last == nil || last.Source != "em:000001.SH" {
-		t.Fatalf("thin boards must abstain, got locked=%v miss=%d last=%+v", locked, miss, last)
+	if !locked || miss < 2 || last == nil || last.Source != "em:000001.SH" {
+		t.Fatalf("thin boards must not sample but still count misses, got locked=%v miss=%d last=%+v", locked, miss, last)
 	}
 }
 

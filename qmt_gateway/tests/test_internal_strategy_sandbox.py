@@ -86,9 +86,11 @@ class SandboxArtifactTest(unittest.TestCase):
     def test_rule_layer_is_actually_injected(self):
         """两个载体共用一份规则实现：产物里必须真有那些函数。"""
         for name in ("rule_pullback_buy", "rule_take_profit", "rule_stop_loss",
-                     "rule_breakdown_sell", "rule_no_cancel_window", "rule_ops_frequency_ok",
+                     "rule_no_cancel_window", "rule_ops_frequency_ok",
                      "normalize_order_status", "build_remark", "short_code_from_remark"):
             self.assertTrue(hasattr(self.mod, name), "规则层函数 %s 没进产物" % name)
+        self.assertFalse(hasattr(self.mod, "rule_breakdown_sell"),
+                         "退役的破位腿又进了产物")
 
     def test_remark_carries_the_baked_version(self):
         self.assertTrue(self.mod.STRATEGY_VERSION.startswith("v"))

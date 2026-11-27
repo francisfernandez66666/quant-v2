@@ -248,31 +248,6 @@ class TakeProfitLadderTest(unittest.TestCase):
         self.assertIsNone(self.mod.rule_take_profit_clear(
             params, ctx(tp_manual=True, tp_stage=1, last_price=9.0)))
 
-    # ---- ⑧ 破位腿：有浮盈只减半 -------------------------------------------
-    def test_breakdown_trims_half_when_in_profit(self):
-        params = self.mod.PARAMS
-        base = dict(last_price=9.5, ref_price=10.0, position_cost=9.3)
-        hit = self.mod.rule_breakdown_sell(params, ctx(**base))
-        self.assertEqual(hit["qty"], 500, "+2.2% must not be cleared whole (000797 target)")
-
-    def test_breakdown_still_clears_at_a_loss(self):
-        params = self.mod.PARAMS
-        hit = self.mod.rule_breakdown_sell(
-            params, ctx(last_price=9.5, ref_price=10.0, position_cost=9.8))
-        self.assertEqual(hit["qty"], 1000)
-
-    def test_breakdown_never_trims_a_manual_position(self):
-        params = self.mod.PARAMS
-        hit = self.mod.rule_breakdown_sell(
-            params, ctx(last_price=9.5, ref_price=10.0, position_cost=9.3, tp_manual=True))
-        self.assertEqual(hit["qty"], 1000)
-
-    def test_breakdown_one_lot_in_profit_sells_whole(self):
-        params = self.mod.PARAMS
-        hit = self.mod.rule_breakdown_sell(
-            params, ctx(last_price=9.5, ref_price=10.0, position_cost=9.3, position_qty=100))
-        self.assertEqual(hit["qty"], 100)
-
     # ---- ⑨ 盒内可证的三件事 -----------------------------------------------
     def test_plan_reading(self):
         mod = self.mod
@@ -526,35 +501,25 @@ class SellChainOrderTest(TakeProfitLadderTest):
 
     def test_chain_order_is_risk_first_then_trim(self):
         self.assertEqual(self._chain_tuple(),
-                         ["stop_loss", "reduce", "take_profit_clear", "take_profit", "breakdown"])
+                         ["stop_loss", "reduce", "take_profit_clear", "take_profit"])
 
-    def test_trim_rides_the_breakdown_branch(self):
-        """减仓腿必须与破位腿共用分支：同一道观察窗、同一句 bull 覆盖。"""
-        self.assertIn('elif kind in ("breakdown", "reduce"):', self.template)
+    def test_trim_has_its_own_branch(self):
+        """破位腿退役后，减仓腿独占 bull 覆盖分支（§SELL-LEG-RETIRE 2026-11-27）。"""
+        self.assertIn('elif kind == "reduce":', self.template)
+        self.assertNotIn('elif kind in ("breakdown", "reduce"):', self.template)
 
     def test_no_trailing_trim_after_the_loop(self):
-        """旧的补刀形状（循环之后 `if not sell_hit: rule_reduce_position`）不许回潮。
-
-        它的问题是"看起来减仓也在跑"，实际只有在前面五条全都没命中时才轮到，
-        与破位同轮命中时永远不会执行——正是 000680 那天的形状。
-        """
+        """旧的补刀形状（循环之后 `if not sell_hit: rule_reduce_position`）不许回潮。"""
         self.assertNotIn("if not sell_hit:", self.template)
 
-    def test_reduce_and_breakdown_can_hit_the_same_round(self):
-        """行为腿：一只 -3.8% 且跌破参考价的票，两条腿**同时**成立。
-
-        这条是顺序锁的意义所在：只要它们会同轮命中，元组顺序就决定当天是
-        "减半"还是"清仓"，不是风格问题。
-        """
+    def test_reduce_still_fires_when_the_reference_is_lost(self):
+        """破位腿不在了，-3.8% 的减仓照旧命中，不再看参考价。"""
         params = self.mod.PARAMS
         both = ctx(last_price=9.50, position_cost=10.0, ref_price=10.0,
                    tp_pct=None, tp_peak=9.8)
         reduce_hit = self.mod.rule_reduce_position(params, both)
-        breakdown_hit = self.mod.rule_breakdown_sell(params, both)
         self.assertIsNotNone(reduce_hit, "at -3.8% the trim must be armed")
-        self.assertIsNotNone(breakdown_hit, "and the reference was lost in the same round")
         self.assertEqual(reduce_hit["kind"], "reduce_position")
-        self.assertEqual(breakdown_hit["kind"], "breakdown_sell")
 
     def test_stop_clear_still_precedes_everything(self):
         """清仓线永远第一：-6% 命中时不许被前面的减仓腿抢走（那是更严重的风险）。"""

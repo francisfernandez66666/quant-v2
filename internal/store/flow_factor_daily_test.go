@@ -134,3 +134,36 @@ func TestSectorFlowDailyRoundtrip(t *testing.T) {
 		t.Fatalf("无行应 (nil,nil), got %+v err=%v", row, err)
 	}
 }
+
+// TestFlowMoneyColumnsNeverClobberedByNaN 2026-11-27 缺陷 C：板块有值、大盘没值的那一轮
+// 不能把上一轮的大盘好读数改成 NULL。两个写口都改成 COALESCE 后，这条才成立。
+func TestFlowMoneyColumnsNeverClobberedByNaN(t *testing.T) {
+	db := testDB(t)
+	day := "2026-11-27"
+	goodPct, goodDelta := 1.2258, 0.4086
+	if err := db.UpsertFlowMoneyOnly(FlowFactorDailyRow{
+		TradeDate: day, MarketFlowPct: &goodPct, FlowMarketDelta: &goodDelta,
+		Source: "eastmoney_fflow",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	nan := math.NaN()
+	sector := 1.994
+	if err := db.UpsertFlowMoneyOnly(FlowFactorDailyRow{
+		TradeDate: day, MarketFlowPct: &nan, FlowMarketDelta: &nan,
+		SectorFlowPct: &sector, Source: "eastmoney_fflow",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := db.GetFlowFactorDaily(day)
+	if err != nil || r == nil {
+		t.Fatalf("读到空: %v", err)
+	}
+	if r.MarketFlowPct == nil || math.Abs(*r.MarketFlowPct-goodPct) > 1e-9 ||
+		r.FlowMarketDelta == nil || math.Abs(*r.FlowMarketDelta-goodDelta) > 1e-9 {
+		t.Fatalf("大盘列不能被 NaN 写口擦掉, got %+v", r)
+	}
+	if r.SectorFlowPct == nil || math.Abs(*r.SectorFlowPct-sector) > 1e-9 {
+		t.Fatalf("板块列应照常更新, got %+v", r.SectorFlowPct)
+	}
+}

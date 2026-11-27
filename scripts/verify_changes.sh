@@ -26399,19 +26399,20 @@ if grep_q '"position_cost": held.get("cost")' QS236 F; then
 	fail236 "position_cost 又直接用柜台 cost（000672 58 秒清仓的形态回潮）"
 fi
 
-# ③ 观察窗：stop_loss/breakdown/reduce 三处必须过 _confirm_sell；清仓线不被 bull 延后。
+# ③ 观察窗：stop_loss/take_profit_clear/reduce 三处必须过 _confirm_sell；清仓线不被 bull 延后。
+# 2026-11-27 R6：原锚 `else:  # breakdown` 在 11-25 D4 重排后就不存在，§236 ③ 一直是红的。
 CNT236=$((CNT236 + 1))
-grep_q 'def _confirm_sell(day, symbol, kind, now):' QS236 F || fail236 "缺 _confirm_sell（卖出观察窗不存在）"
-N236_OBS=$( { grep -cE '_confirm_sell\(day, symbol, .*now_ts\)' qmt_gateway/qmt_internal_strategy.py || true; } )
-[ "${N236_OBS:-0}" -ge 3 ] || fail236 "观察窗调用点少于 3（stop_loss/breakdown/reduce 必须都过它，实际 ${N236_OBS:-0}）"
-grep_q '"reason": "sell_confirm_pending"' QS236 F || fail236 "缺 sell_confirm_pending（等待确认会被读成没有卖出）"
+grep_q 'def _confirm_sell(day, symbol, kind, now, last, rebound=True):' QS236 F || fail236 "缺 _confirm_sell 六参签名（观察窗不存在或反弹闸未接）"
+N236_OBS=$( { grep -cE '_confirm_sell\(day, symbol, kind, now_ts' qmt_gateway/qmt_internal_strategy.py || true; } )
+[ "${N236_OBS:-0}" -ge 3 ] || fail236 "观察窗调用点少于 3（stop_loss/take_profit_clear/reduce 必须都过它，实际 ${N236_OBS:-0}）"
+grep_q '"reason": _sell_pending_reason' QS236 F || fail236 "缺等待原因分家（反弹与秒数未到被读成同一件事）"
 grep_q 'rounds = PARAMS.get("sell_confirm_rounds")' QS236 F || fail236 "观察窗轮数没读 PARAMS（阈值变成第二本账）"
 grep_q 'secs = PARAMS.get("sell_confirm_sec")' QS236 F || fail236 "观察窗秒数没读 PARAMS"
 # 负锁：清仓线永不被 bull 延后 —— stop_loss 分支体里不许出现 if bull:。
 SL236=$( { grep -n 'elif kind == "stop_loss":' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
-BD236=$( { grep -n 'else:  # breakdown' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+BD236=$( { grep -n 'elif kind == "reduce":' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
 [ -n "$SL236" ] || fail236 "找不到 stop_loss 分支"
-[ -n "$BD236" ] || fail236 "找不到 breakdown 分支"
+[ -n "$BD236" ] || fail236 "找不到 reduce 分支"
 if [ -n "$SL236" ] && [ -n "$BD236" ]; then
 	SLBODY236=$(sed -n "${SL236},$((BD236-1))p" qmt_gateway/qmt_internal_strategy.py 2>/dev/null || true)
 	if grep_q 'if bull:' SLBODY236 F; then
@@ -26773,21 +26774,37 @@ grep_q 't_wide_board_prefixes' LE238 F || fail238 "20cm 档没复用 t_wide_boar
 grep_q 'return {"half": params["tp_trail_half_retr_pct_30cm"]' LE238 F || fail238 "阈值没按板上回报（30cm 档缺）"
 grep_q 'return {"half": params["tp_trail_half_retr_pct_20cm"]' LE238 F || fail238 "阈值没按板上回报（20cm 档缺）"
 
-# ⑤ 破位腿：有浮盈只减半（000797 +2.2% 被整仓清是靶心）。
+# ⑤ 破位腿（BK）已退役：函数、清单、旋钮三处都不许回潮（owner 2026-11-27 R1）。
 CNT238=$((CNT238 + 1))
-grep_q 'tp_breakdown_trim_on_profit' LE238 F || fail238 "破位腿没有'有浮盈只减半'开关"
+if grep_q 'rule_breakdown_sell' LE238 F || grep_q 'rule_breakdown_sell' ST238 F; then
+	fail238 "退役的破位腿 rule_breakdown_sell 回潮"
+fi
+python3 - <<'PY' || fail238 "破位腿退役不彻底（§238 ⑤）"
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json"))["params"]
+assert "breakdown_sell" not in (p.get("builtin_rules") or []), p.get("builtin_rules")
+assert "breakdown_sell" not in (p.get("signal_codes") or {}), p.get("signal_codes")
+assert "breakdown_ratio" not in p
+assert "tp_breakdown_trim_on_profit" not in p
+PY
 
-# ⑥ 卖出链顺序：stop_loss → take_profit_clear → take_profit → breakdown；TT 走确认窗
+# ⑥ 卖出链顺序：stop_loss → reduce → take_profit_clear → take_profit；TT 走确认窗
 #    且 bull 不许延后清仓线；TP 不在确认窗内（卖半要快）。
 CNT238=$((CNT238 + 1))
-grep_q '("take_profit_clear", rule_take_profit_clear),' ST238 F || fail238 "卖出链里没有 take_profit_clear"
-CLEARPOS238=$( { grep -n '("take_profit_clear", rule_take_profit_clear),' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
-TPPOS238B=$( { grep -n '("take_profit", rule_take_profit),' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+grep_q '("take_profit_clear", rule_take_profit_clear)' ST238 F || fail238 "卖出链里没有 take_profit_clear"
+CLEARPOS238=$( { grep -n '("take_profit_clear", rule_take_profit_clear)' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
+TPPOS238B=$( { grep -n '("take_profit", rule_take_profit)' qmt_gateway/qmt_internal_strategy.py || true; } | head -1 | cut -d: -f1)
 [ -n "$CLEARPOS238" ] && [ -n "$TPPOS238B" ] || fail238 "卖出链两条腿没同时出现"
 if [ -n "$CLEARPOS238" ] && [ -n "$TPPOS238B" ] && [ "$CLEARPOS238" -gt "$TPPOS238B" ]; then
 	fail238 "清剩余排在卖半之后（阶梯顺序倒置）"
 fi
-grep_q 'for kind in ("stop_loss", "take_profit_clear", "breakdown", "reduce"):' ST238 F || fail238 "_sell_obs_clear 的重置集合没带 take_profit_clear"
+grep_q 'for kind in (("stop_loss", "take_profit_clear", "reduce") +' ST238 F \
+  || fail238 "_sell_obs_clear 的重置集合没扩到移植腿（§3.3.1）"
+grep_q 'tuple(sorted(_PORTED_RULES))' ST238 F \
+  || fail238 "_sell_obs_clear 没覆盖移植腿 kind"
+if grep_q '"breakdown", "reduce"):' ST238 F; then
+  fail238 "重置集合里还有 breakdown（破位腿退役后这个 kind 永不存在）"
+fi
 
 # ⑦ 当日止盈过的票禁止再加仓/回买：闸在 intent 之后、flow_quadrant 之前，t_leg 豁免。
 CNT238=$((CNT238 + 1))
@@ -26843,7 +26860,12 @@ grep_q 'doc2["params"]["tp_plan"] = tp_plan' HR238 F || fail238 "计划没写进
 
 # ⑪ 退役旋钮真的从盒子上消失，且不许扩成"base 缺什么就删什么"。
 CNT238=$((CNT238 + 1))
-grep_q 'RETIRED_PARAM_KEYS = frozenset(("take_profit_ratio",))' HR238 F || fail238 "RETIRED_PARAM_KEYS 没点名 take_profit_ratio"
+python3 - <<'PY' || fail238 "RETIRED_PARAM_KEYS 没点名 take_profit_ratio"
+import importlib.util, pathlib
+spec=importlib.util.spec_from_file_location('hr238', pathlib.Path('scripts/carrier_hot_reload_gz.py'))
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert 'take_profit_ratio' in m.RETIRED_PARAM_KEYS
+PY
 grep_q 'base_params.pop(key, None)' HR238 F || fail238 "退役键没有从 base 里 pop 掉"
 if grep_q 'if key not in base_params:' HR238 F && grep_q 'continue' HR238 F; then
 	:
@@ -26878,7 +26900,7 @@ need = ["tp_ladder_enabled", "tp_stage_half", "tp_half_fraction", "tp_peak_arm_p
         "tp_trail_half_retr_pct", "tp_trail_clear_retr_pct",
         "tp_trail_half_retr_pct_20cm", "tp_trail_clear_retr_pct_20cm",
         "tp_trail_half_retr_pct_30cm", "tp_trail_clear_retr_pct_30cm",
-        "tp_giveback_pp", "tp_breakdown_trim_on_profit", "tp_rebuy_block",
+        "tp_giveback_pp", "tp_rebuy_block",
         "tp_dragon_take_profit_pct", "tp_dragon_open_no_reseal_sec",
         "tp_dragon_return_take_profit_pct", "tp_double_bump_take_profit_pct",
         "tp_pct_base"]
@@ -27022,7 +27044,7 @@ m = re.search(r"for kind, rule in \((.*?)\):", s, re.S)
 seg = m.group(1) if m else ""
 need = ['("stop_loss", rule_stop_loss)', '("reduce", rule_reduce_position)',
         '("take_profit_clear", rule_take_profit_clear)',
-        '("take_profit", rule_take_profit)', '("breakdown", rule_breakdown_sell)']
+        '("take_profit", rule_take_profit)']
 pos = [seg.find(x) for x in need]
 assert all(p >= 0 for p in pos) and pos == sorted(pos), pos
 PY
@@ -27034,12 +27056,11 @@ import pathlib
 s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
 assert s.count("rule_reduce_position(PARAMS") == 0
 assert s.count('("reduce", rule_reduce_position)') == 1
-assert s.index('("reduce", rule_reduce_position)') < \
-    s.index('("breakdown", rule_breakdown_sell)')
+assert s.count('rule_breakdown_sell') == 0
 PY
 
 [ "$B238_FAILED" = "0" ] || exit 1
-echo "ok - §238 §TP-LADDER 锁通过（全平腿退役+卖半/清剩余两条腿实盘直上+板宽三档5/8与6/10+破位有浮盈只减半+当日止盈禁回买+t_leg豁免+盒内计划/峰值/阶段三读且短码6位严格+龙头开板fail-closed且封板判据用乘子+云端按成交重放并把手动仓标出+指纹不含峰值且在sha之前+退役键真删不扩通配+卖出成交归因 sell:码:tp|tt:日 取成交时刻+小时读数按持仓计数且弃权可见，累计判定点 ${CNT238}）"
+echo "ok - §238 §TP-LADDER 锁通过（全平腿退役+破位腿BK整条退役+卖半/清剩余两条腿实盘直上+板宽三档5/8与6/10+当日止盈禁回买+t_leg豁免+盒内计划/峰值/阶段三读且短码6位严格+龙头开板fail-closed且封板判据用乘子+云端按成交重放并把手动仓标出+指纹不含峰值且在sha之前+退役键真删不扩通配+卖出成交归因 sell:码:tp|tt:日 取成交时刻+小时读数按持仓计数且弃权可见，累计判定点 ${CNT238}）"
 echo ""
 
 echo "==> 239 §SIDE-POLICY（熊市左右侧比例 + 牛市镜像 + 13:00 OR 加急 + 强稳定左侧例外）..."
@@ -28852,4 +28873,374 @@ python3 -m pytest qmt_gateway/tests/test_carrier_enabled_filter_20261127.py -q >
 
 [ "${B254_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §254 §P5-ENABLED-FILTER 锁通过（gz 两腿/ Mac 链/ derive 不许过滤/前端提示/三例行为腿绿，累计判定点 ${CNT254}）"
+echo ""
+
+# ── §255 §SELL-REBOUND（2026-11-27：BK 退役 + 观察窗反弹闸 + 移植腿接窗）──
+# 现场：普路通 -0.4% 被 BK 整仓清、卖后反弹 1.5%；特一药业止损确认只等 60 秒不看反弹。
+# 本段钉住三件事：BK 整条退役；观察窗加反弹闸且原因分家；移植腿卖出接进同一道窗。
+echo "==> 255 §SELL-REBOUND（BK 退役 / 反弹闸 / 移植腿接窗 / 读数分家）..."
+fail255() {
+	echo "--- FAIL: §255 $*"
+	FAIL=1
+	B255_FAILED=1
+}
+CNT255=0
+QS255=$(cat qmt_gateway/qmt_internal_strategy.py || true)
+KNOB255=$(cat internal/config/carrier_knobs.go || true)
+DER255=$(cat cmd/derive_carrier_params/main.go || true)
+PYD255=$(cat scripts/derive_carrier_params.py || true)
+
+# ① 六参签名：第五参是现价，第六参决定该腿是否吃反弹闸。
+CNT255=$((CNT255 + 1))
+grep_q 'def _confirm_sell(day, symbol, kind, now, last, rebound=True):' QS255 F \
+  || fail255 "_confirm_sell 签名不是六参（§255 ①）"
+
+# ② 四参旧调用不许回潮。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "四参 _confirm_sell 调用回潮（§255 ②）"
+import pathlib, re
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert not re.search(r"_confirm_sell\([^)\n]*,\s*now_ts\s*\)", s), s
+PY
+
+# ③ 四处调用：take_profit_clear 显式 rebound=False，另外三处走默认反弹闸。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "观察窗四处调用不齐（§255 ③）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert s.count("_confirm_sell(day, symbol, kind, now_ts, last") == 4
+assert s.count("_confirm_sell(day, symbol, kind, now_ts, last, rebound=False)") == 1
+PY
+
+# ④ 函数体五锚：阈值来自 PARAMS、反弹只重置、最低点保留、原因记账、缺键告警。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "_confirm_sell 函数体缺锚（§255 ④）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+body = s.split("def _confirm_sell(", 1)[1].split("\ndef _sell_pending_reason(", 1)[0]
+for token in ('PARAMS.get("sell_confirm_rebound_pct")',
+              'elif float(reb) > 0 and last is not None and low and low > 0:',
+              'entry["low"] = low', 'obs[key] = {"since": now, "rounds": 1, "low": low,',
+              '_warn_once("sell_confirm_rebound_cfg"'):
+    assert token in body, token
+PY
+
+# ⑤ 单一写点 + 0 关闸（不是恒反弹、也不是停机）。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "反弹闸写点或关闸语义错（§255 ⑤）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert s.count('entry["low"] = low') == 1
+assert s.count('"why": "rebound"') == 1
+assert s.count('float(reb) > 0') == 1
+PY
+
+# ⑥ 两种"没卖"必须分家。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "等待原因没分家（§255 ⑥）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+body = s.split("def _sell_pending_reason(", 1)[1].split("\ndef ", 1)[0]
+assert 'entry.get("why") == "rebound"' in body
+assert '"sell_confirm_rebound"' in body and '"sell_confirm_pending"' in body
+PY
+
+# ⑦ 五处 skipped 都走原因函数，裸串不许回潮。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "skipped 里仍有裸 sell_confirm_pending（§255 ⑦）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert s.count('"reason": _sell_pending_reason(day, symbol, kind)') >= 4
+assert '"reason": "sell_confirm_pending"' not in s
+PY
+
+# ⑧ 移植腿两段式：先收齐命中，再统一决定；确认点在 append 之前。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "移植腿两段式接线失效（§255 ⑧）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+for token in ('_ported_hits = []', '_sell_pending = False', '_sell_pending = True',
+              'for kind in sorted(_PORTED_RULES):', 'signals.append((_hit, _mode))'):
+    assert token in s, token
+i_loop = s.index("for kind in sorted(_PORTED_RULES):")
+i_confirm = s.index("_confirm_sell(day, symbol, kind, now_ts, last)", i_loop)
+i_append = s.index("signals.append((_hit, _mode))")
+assert i_loop < i_confirm < i_append, (i_loop, i_confirm, i_append)
+PY
+
+# ⑨ 清除循环必须在移植腿之后（否则移植腿的钟每轮被清，窗口永不确认）。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "_sell_obs_clear 顺序锁失效（§255 ⑨）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+i_ported = s.index("for kind in sorted(_PORTED_RULES):")
+i_clear = s.index('for kind in (("stop_loss", "take_profit_clear", "reduce") +')
+assert i_clear > i_ported, (i_clear, i_ported)
+assert "tuple(sorted(_PORTED_RULES))" in s
+PY
+
+# ⑩ 待确认卖出只拦同轮买单，且守卫必须写在 pending 之后。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "sell_pending_blocks_buy 守卫失效（§255 ⑩）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+needle = 'if _sell_pending and str(_hit.get("side") or "") == "buy":'
+assert needle in s
+assert s.index(needle) > s.index("_sell_pending = True")
+assert '"reason": "sell_pending_blocks_buy"' in s
+PY
+
+# ⑪ 新旋钮 Go 真源唯一。
+CNT255=$((CNT255 + 1))
+grep_q 'carrierSellConfirmReboundPct' KNOB255 F || fail255 "Go 真源缺反弹阈值（§255 ⑪）"
+grep_q 'func CarrierSellConfirmReboundPct() float64' KNOB255 F || fail255 "反弹阈值缺访问器（§255 ⑪）"
+if grep_q 'CarrierTPBreakdownTrimOnProfit' KNOB255 F; then
+	fail255 "退役的破位腿旋钮访问器回潮（§255 ⑪）"
+fi
+
+# ⑫ derive + 参数文件同源。
+CNT255=$((CNT255 + 1))
+grep_q 'c.put("sell_confirm_rebound_pct", src, config.CarrierSellConfirmReboundPct())' DER255 F \
+  || fail255 "derive 没导出 sell_confirm_rebound_pct（§255 ⑫）"
+grep_q '("sell_confirm_rebound_pct", ("sell_confirm_rebound_pct",), None),' PYD255 F \
+  || fail255 "Python 烘参映射缺反弹阈值（§255 ⑫）"
+python3 - <<'PY' || fail255 "参数文件反弹阈值不是 0.7（§255 ⑫）"
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json"))["params"]
+assert p.get("sell_confirm_rebound_pct") == 0.7, p.get("sell_confirm_rebound_pct")
+PY
+
+# ⑬ 退役键登记。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "退役键没登记（§255 ⑬）"
+import importlib.util, pathlib
+p = pathlib.Path("scripts/carrier_hot_reload_gz.py")
+spec = importlib.util.spec_from_file_location("hr255", p)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+assert "breakdown_ratio" in m.RETIRED_PARAM_KEYS
+assert "tp_breakdown_trim_on_profit" in m.RETIRED_PARAM_KEYS
+PY
+
+# ⑭ 行为腿：16 例（反弹闸 + 移植腿接窗 + BK 退役）。
+CNT255=$((CNT255 + 1))
+PY255_RC=0
+python3 -m pytest qmt_gateway/tests/test_sell_confirm_rebound_20261127.py -q -p no:randomly >/dev/null 2>&1 || PY255_RC=$?
+[ "$PY255_RC" = "0" ] || fail255 "反弹闸行为腿未过（§255 ⑭）"
+
+# ⑮ 负锁：不许给任何移植腿开豁免（owner：龙头战法也进观察窗）。
+CNT255=$((CNT255 + 1))
+python3 - <<'PY' || fail255 "豁免名单回潮（§255 ⑮）"
+import pathlib
+s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
+assert "_SELL_WINDOW_EXEMPT" not in s
+seg = s.split("for kind in sorted(_PORTED_RULES):", 1)[1].split("signals.append((_hit, _mode))", 1)[0]
+assert "if kind in" not in seg, seg[:400]
+PY
+
+[ "${B255_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §255 §SELL-REBOUND 锁通过（BK 退役/六参签名/四处调用/函数体五锚/原因分家/移植腿两段式/清除顺序/Go+烘参同源/退役键/16 例行为腿/零豁免，累计判定点 ${CNT255}）"
+echo ""
+
+# ── §256 §BAKE-CHAIN（2026-11-27：版本宽度三处同源 + 失败回滚）──
+# 现场：版本越过 v999 后构建器只认 2–3 位，热更链每 30 秒 ABORT 且版本号继续 +1；
+# 构建失败时版本号已落盘、不回滚就永久漂移。两处都是"看代码全对、现场永远不生效"。
+echo "==> 256 §BAKE-CHAIN（版本宽度三处同源 / 失败回滚 / 负锁）..."
+fail256() {
+	echo "--- FAIL: §256 $*"
+	FAIL=1
+	B256_FAILED=1
+}
+CNT256=0
+
+# ① 三处正则同源：构建器 / 行为用例 / 手工发布口，必须都接受 2–6 位。
+CNT256=$((CNT256 + 1))
+python3 - <<'PY' || fail256 "三处版本正则没有同源到 2–6 位（§256 ①）"
+import pathlib, re
+root = pathlib.Path(".")
+b = (root / "scripts/build_local_executor.py").read_text(encoding="utf-8")
+t = (root / "qmt_gateway/tests/test_local_executor_build_update.py").read_text(encoding="utf-8")
+p = (root / "scripts/publish_carrier.sh").read_text(encoding="utf-8")
+def grab(s, pat, label):
+    m = re.search(pat, s)
+    assert m, label + " pattern not found"
+    return m.group(1)
+pb = grab(b, r"VERSION_RE\s*=\s*re\.compile\(r[\"']([^\"']+)[\"']\)", "builder")
+pt = grab(t, r"self\.assertTrue\(re\.match\(r[\"']([^\"']+)[\"']", "test")
+pp = grab(p, r"\[\[ \"\$VERSION\" =~ (\^v\[0-9\]\{2,6\}-\[0-9\]\{8\}\$) \]\]", "publish")
+valid = ("v99-20260101", "v999-20260101", "v2072-20260101",
+         "v100000-20260101")
+invalid = ("v1-20260101", "v1000000-20260101", "v2072_20260101")
+for label, pat in (("builder", pb), ("test", pt), ("publish", pp)):
+    for v in valid:
+        assert re.fullmatch(pat, v), (label, v, "must pass")
+    for v in invalid:
+        assert not re.fullmatch(pat, v), (label, v, "must be rejected")
+PY
+
+# ② 行为腿：4 位版本真能烘、失败后参数文件逐字节复原（scripts/tests 新用例）。
+CNT256=$((CNT256 + 1))
+PY256_RC=0
+python3 -m pytest scripts/tests/test_build_version_20261127.py -q -p no:randomly >/dev/null 2>&1 || PY256_RC=$?
+[ "$PY256_RC" = "0" ] || fail256 "4 位烘焙 / 失败回滚行为腿未过（§256 ②）"
+
+# ③ 回滚函数 + 两条失败出口：restore 行号必须小于对应 die 行号（不是只数次数）。
+CNT256=$((CNT256 + 1))
+python3 - <<'PY' || fail256 "失败回滚没接在两条 die 出口之前（§256 ③）"
+import pathlib
+lines = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8").splitlines()
+assert sum("def restore_params_version(" in ln for ln in lines) == 1
+calls = [i for i, ln in enumerate(lines) if "restore_params_version(orig_ver" in ln]
+assert calls, "restore_params_version call missing"
+for marker in ('die("bake_failed2', 'die("artifact_version_not_baked'):
+    hits = [i for i, ln in enumerate(lines) if marker in ln]
+    assert len(hits) == 1, (marker, hits)
+    assert any(hits[0] - 3 <= c < hits[0] for c in calls), \
+        "restore must run immediately before " + marker
+PY
+
+# ④ 负锁：doc2 的版本快照不能被挪到 bump 之后写，否则回滚失效。
+CNT256=$((CNT256 + 1))
+python3 - <<'PY' || fail256 "doc/doc2 写盘顺序负锁失效（§256 ④）"
+import pathlib
+s = pathlib.Path("scripts/carrier_hot_reload_gz.py").read_text(encoding="utf-8")
+assert s.count("json.dump(doc,") == 1, s.count("json.dump(doc,")
+assert s.count("json.dump(doc2,") == 1, s.count("json.dump(doc2,")
+i_doc = s.index("json.dump(doc,")
+i_doc2 = s.index("json.dump(doc2,")
+assert i_doc2 < i_doc, "doc2 must be written BEFORE the version bump"
+PY
+
+[ "${B256_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §256 §BAKE-CHAIN 锁通过（三处正则同源/4 位行为腿/两条失败回滚/写盘顺序负锁，累计判定点 ${CNT256}）"
+echo ""
+
+# ── §257 §SIDE-FLOW-FALLBACK（2026-11-27：落库板块合计兜底 + 时间窗失败计数 + 缺斜率不算缺数）──
+# 现场：clist 熔断时唯一活着的 `sector_flow_pct=2.83` 没人读；大盘腿时通时断让
+# 连续失败计数永远清零；`|| !slopeOK` 把"有读数没斜率"压成 35%；失败写库把好读数擦成 NULL。
+echo "==> 257 §SIDE-FLOW-FALLBACK（落库聚合三级降级 / 时间窗计数 / 闸门只看 marketOK / COALESCE）..."
+fail257() {
+	echo "--- FAIL: §257 $*"
+	FAIL=1
+	B257_FAILED=1
+}
+CNT257=0
+FL257=$(cat internal/engine/side_policy_flow.go || true)
+EG257=$(cat internal/engine/engine.go || true)
+SP257=$(cat internal/signalctl/side_policy.go || true)
+ST257=$(cat internal/store/flow_factor_daily.go || true)
+KNOB257=$(cat internal/config/carrier_knobs.go || true)
+DER257=$(cat cmd/derive_carrier_params/main.go || true)
+PYD257=$(cat scripts/derive_carrier_params.py || true)
+
+# ① 四字段与写点：紧跟聚合之后、在 secPct 有效分支内、不在 d1Store 块内。
+CNT257=$((CNT257 + 1))
+python3 - <<'PY' || fail257 "落库聚合缓存字段或写点错（§257 ①）"
+import re, pathlib
+s = pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+for field in ("AggDelta", "AggNet", "AggAmount", "AggAt"):
+    assert field in s, field
+e = pathlib.Path("internal/engine/engine.go").read_text(encoding="utf-8")
+i_agg = e.index("aggregateSectorFlow(netSum, amtSum, deltaSum, nDelta)")
+i_write = e.index("e.sideFlow.AggDelta, e.sideFlow.AggNet, e.sideFlow.AggAmount")
+assert i_write > i_agg
+seg = e[i_agg:i_write]
+assert "if secPct != nil" in seg, "缓存写点必须在 secPct 有效分支内"
+assert "if e.d1Store != nil" not in seg, "缓存写点不能在 d1Store 块内"
+PY
+
+# ② sampleSideFlow 三级顺序：大盘 → 本轮 clist → 落库缓存，三级都不中才弃权。
+CNT257=$((CNT257 + 1))
+python3 - <<'PY' || fail257 "三级降级顺序错（§257 ②）"
+import pathlib
+s = pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+body = s.split("func (e *Engine) sampleSideFlow(", 1)[1].split("\n}\n", 1)[0]
+i_mkt = body.index("if mktOK && !e.sideFlow.ProxyLocked")
+i_clist = body.index("proxyDelta := signalctl.FlowPctToDelta(netSum, amtSum)")
+i_cache = body.index("sectorAggMinBoards || math.IsNaN(proxyDelta)")
+i_wait = body.index("e.sideFlow.ProxyMiss++")
+assert i_mkt < i_clist < i_cache, (i_mkt, i_clist, i_cache)
+assert i_wait > i_mkt
+assert "Source: \"em:sector_agg\", At: now" in body
+PY
+
+# ③ 落库聚合 Source 与替补腿同字面量，且带 em: 前缀。
+CNT257=$((CNT257 + 1))
+python3 - <<'PY' || fail257 "Source 字面量不同源或缺 em: 前缀（§257 ③）"
+import pathlib
+s = "\n".join(p.read_text(encoding="utf-8") for p in (
+    pathlib.Path("internal/engine/engine.go"),
+    pathlib.Path("internal/engine/side_policy_flow.go")))
+assert s.count('"em:sector_agg"') >= 2
+assert "em:sector_agg_persisted" not in s
+assert "Source: \"sector_agg\"" not in s
+PY
+
+# ④ 两个新旋钮三处同源。
+CNT257=$((CNT257 + 1))
+python3 - <<'PY' || fail257 "两个新旋钮三处不同源（§257 ④）"
+import pathlib
+files = [pathlib.Path("internal/config/carrier_knobs.go"),
+         pathlib.Path("cmd/derive_carrier_params/main.go"),
+         pathlib.Path("scripts/derive_carrier_params.py")]
+texts = [p.read_text(encoding="utf-8") for p in files]
+pairs = (("carrierSideAggMaxAgeSec", "side_agg_max_age_sec"),
+         ("carrierSideProxyMissWindowSec", "side_proxy_miss_window_sec"))
+for go_name, key in pairs:
+    assert "func " + go_name.replace("carrier", "Carrier", 1) + "()" in texts[0], go_name
+    assert key in texts[1], (str(files[1]), key)
+    assert key in texts[2], (str(files[2]), key)
+PY
+python3 - <<'PY' || fail257 "参数文件两个旋钮不同值（§257 ④）"
+import json
+p = json.load(open("qmt_gateway/local_executor_params.json"))["params"]
+assert p.get("side_agg_max_age_sec") == 900, p.get("side_agg_max_age_sec")
+assert p.get("side_proxy_miss_window_sec") == 600, p.get("side_proxy_miss_window_sec")
+PY
+
+# ⑤ ProxyMiss 时间窗：成功不清零，只有一处 ++，窗口起点与判据在册。
+CNT257=$((CNT257 + 1))
+python3 - <<'PY' || fail257 "ProxyMiss 计数语义错（§257 ⑤）"
+import pathlib
+s = pathlib.Path("internal/engine/side_policy_flow.go").read_text(encoding="utf-8")
+assert "ProxyMiss = 0" not in s.replace("ProxyMiss, e.sideFlow.ProxyMiss = now, 0", "")
+assert "e.sideFlow.ProxyMiss++" in s
+assert s.count("e.sideFlow.ProxyMiss++") == 1
+assert "ProxyMissFirst time.Time" in s
+assert "now.Sub(e.sideFlow.ProxyMissFirst) > window" in s
+PY
+
+# ⑥ 闸门只看 marketOK：早释上移、冷启动块内不再带 slopeOK、无粘性出口。
+CNT257=$((CNT257 + 1))
+python3 - <<'PY' || fail257 "闸门形状错（§257 ⑥）"
+import pathlib
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+assert "if !marketOK || !slopeOK {" not in s
+assert "if !marketOK {" in s
+i_cold = s.index("side_policy_cold_start_bear")
+i_early = s.index("return earlyRangeState(in, \"inflow_reversal_early\", st.LatchUntilUnix)")
+assert i_early < i_cold, (i_early, i_cold)
+PY
+
+# ⑦ COALESCE 防擦除：两个写口四列/三列同形，裸 excluded 赋值不许回潮。
+CNT257=$((CNT257 + 1))
+python3 - <<'PY' || fail257 "COALESCE 防擦除失效（§257 ⑦）"
+import pathlib
+s = pathlib.Path("internal/store/flow_factor_daily.go").read_text(encoding="utf-8")
+for col in ("market_flow_pct", "sector_flow_pct", "flow_market_delta", "flow_sector_delta",
+            "r_yest", "r_ma5", "vol_surge_delta"):
+    assert "COALESCE(excluded.%s, flow_factor_daily.%s)" % (col, col) in s, col
+import re
+assert not re.search(r"SET\s+market_flow_pct=excluded", s)
+assert not re.search(r"\br_yest=excluded\.r_yest", s)
+PY
+
+# ⑧ 行为腿：Go 7 例 + store 1 例 + 烘入链 7 例。
+CNT257=$((CNT257 + 1))
+GO257_RC=0
+go test ./internal/engine ./internal/signalctl ./internal/store -run 'TestFallback|TestFlowMoneyColumnsNeverClobberedByNaN|TestSideFlowProxyStaysLocked' -count=1 >/dev/null 2>&1 || GO257_RC=$?
+[ "$GO257_RC" = "0" ] || fail257 "资金流兜底 Go 行为腿未过（§257 ⑧）"
+
+[ "${B257_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §257 §SIDE-FLOW-FALLBACK 锁通过（落库三级降级/同源 Source/两旋钮同源/时间窗计数/闸门只看 marketOK/COALESCE/8 例行为腿，累计判定点 ${CNT257}）"
 echo ""

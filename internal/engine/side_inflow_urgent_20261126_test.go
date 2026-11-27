@@ -84,13 +84,13 @@ func TestSideInflowFadeSetsFlag(t *testing.T) {
 	if !faded {
 		t.Fatal("inflow below fade must set InflowFaded")
 	}
-	if st := e.SidePolicySnapshot(); st.Mode != signalctl.SidePolicyBear {
-		t.Fatalf("faded day must fall back to bear, got %s (%s)", st.Mode, st.Reason)
+	if st := e.SidePolicySnapshot(); st.Reason == "inflow_reversal_early" || st.Mode != signalctl.SidePolicyRange {
+		t.Fatalf("faded day must not early-release; with valid flow it falls through to range_regime, got %s (%s)", st.Mode, st.Reason)
 	}
 	_ = os.Remove(e.sideUrgentReqPath)
 	now = sideTestTime(10, 32)
 	e.updateSidePolicy(now, flowRound(e, now, 0.80, 1.0))
-	if st := e.SidePolicySnapshot(); st.Mode != signalctl.SidePolicyBear || st.Reason == "inflow_reversal_early" {
+	if st := e.SidePolicySnapshot(); st.Mode != signalctl.SidePolicyRange || st.Reason == "inflow_reversal_early" {
 		t.Fatalf("faded day must never release again, got %s (%s)", st.Mode, st.Reason)
 	}
 	if req := readUrgentReq(t, e); req != nil {

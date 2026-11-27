@@ -56,9 +56,18 @@ type sideFlowState struct {
 	DataCompleteBaked    bool
 	LastMode             signalctl.SidePolicyMode
 	Latch                signalctl.SidePolicyLatch
-	// §SIDE-FLOW-PROXY 2026-11-26：大盘腿连续失败 → 切板块合计 → 当日锁定。
-	ProxyMiss   int
-	ProxyLocked bool
+	// §SIDE-FLOW-PROXY 2026-11-26：大盘腿失败（时间窗内计数）→ 切板块合计 → 当日锁定。
+	// ProxyMissFirst 是 2026-11-27 修的窗口起点：成功不清零，只让时间淘汰旧失败，
+	// 否则时通时断（50% 占空比）下"连续 2 次"永远锁不上。
+	ProxyMiss      int
+	ProxyMissFirst time.Time
+	ProxyLocked    bool
+	// §SIDE-FLOW-FALLBACK 2026-11-27：最后一次**有效**板块合计的落库口径缓存。
+	// 只在 aggregateSectorFlow 有效时写；三条腿都不中时按 age 上限决定能否继续用。
+	AggDelta  float64
+	AggNet    float64
+	AggAmount float64
+	AggAt     time.Time
 	// §SIDE-INFLOW-EARLY 2026-11-26：当日早释/回落各最多一次（两个 bool，不加旋钮）。
 	InflowReleased bool
 	InflowFaded    bool
@@ -400,10 +409,13 @@ func finiteSideFloat(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0
 //
 // 三条纪律：
 //  1. 大盘腿成功且未锁定 ⇒ 用大盘样本；
-//  2. 大盘腿连续失败 side_flow_proxy_after_rounds 轮 ⇒ 切板块合计并**当日锁定**；
-//     锁定后即使大盘腿恢复也**不切回**——observe 在换源时会清空桶历史（两个分母不能相减），
-//     源抖动 = 桶永远合不上 = slope 永远 NaN，那正是今天 11:00 之后仍回 35% 的第二个成因。
-//  3. 两条腿都没有 ⇒ 不采样。样本自然过期 ⇒ flowValid=false ⇒ 冷启动 bear（fail-closed）。
+//  2. 大盘腿在 side_proxy_miss_window_sec 时间窗内失败 side_flow_proxy_after_rounds 次
+//     ⇒ 切板块合计并**当日锁定**；成功不清零，锁定后即使大盘腿恢复也不切回——
+//     observe 在换源时会清空桶历史（两个分母不能相减），源抖动 = 桶永远合不上 =
+//     slope 永远 NaN，那正是 2026-11-27 11:00 之后仍回 35% 的第二个成因。
+//  3. 本轮 clist 熔断但最后一次有效板块合计仍在 side_agg_max_age_sec 内 ⇒
+//     用那份缓存造同源自样本（`em:sector_agg`），不弃权；超龄或从未有效 ⇒ 不采样。
+//     样本自然过期 ⇒ flowValid=false ⇒ 冷启动 bear（fail-closed）。
 func (e *Engine) sampleSideFlow(now time.Time, mkt sideFlowSample, mktOK bool,
 	netSum, amtSum float64, nBoards int) {
 	// 总闸读数：生产恒走 config 的编译期常量；引擎字段只在测试里注入 false，
@@ -416,31 +428,47 @@ func (e *Engine) sampleSideFlow(now time.Time, mkt sideFlowSample, mktOK bool,
 	if after < 1 {
 		after = 1
 	}
+	window := time.Duration(config.CarrierSideProxyMissWindowSec()) * time.Second
+	aggMaxAge := time.Duration(config.CarrierSideAggMaxAgeSec()) * time.Second
 	e.sideMu.Lock()
 	defer e.sideMu.Unlock()
 	if mktOK && !e.sideFlow.ProxyLocked {
-		e.sideFlow.ProxyMiss = 0
+		// 成功不清零 ProxyMiss：时通时断时"连续失败"永远达不到阈值。
 		e.sideFlow.observe(now, mkt, mkt.Delta)
 		return
 	}
 	if !proxyOn {
 		return
 	}
-	// 替补样本必须是**累计净额 / 累计成交额**（与大盘腿同形），closeBucket 的差分
-	// 口径才不用改；delta 由同一个 FlowPctToDelta 归一（÷3 再夹 ±1）。
+	// 走到这里说明本轮大盘腿没成功（或已锁定替补）：无论 clist 是否有效，
+	// 都按时间窗记一次失败。计数只有这一处，避免"两本账"。
+	if !e.sideFlow.ProxyLocked {
+		if e.sideFlow.ProxyMissFirst.IsZero() || now.Sub(e.sideFlow.ProxyMissFirst) > window {
+			e.sideFlow.ProxyMissFirst, e.sideFlow.ProxyMiss = now, 0
+		}
+		e.sideFlow.ProxyMiss++
+		if e.sideFlow.ProxyMiss >= after {
+			e.sideFlow.ProxyLocked = true
+		}
+	}
+	// 本轮 clist 聚合无效 ⇒ 用最后一次有效板块合计（落库口径）兜底；
+	// 超龄 / 从未有效 ⇒ 不采样，样本自然过期后 fail-closed。
 	proxyDelta := signalctl.FlowPctToDelta(netSum, amtSum)
 	if nBoards < sectorAggMinBoards || math.IsNaN(proxyDelta) {
-		if !e.sideFlow.ProxyLocked {
-			e.sideFlow.ProxyMiss++
+		aggDelta := signalctl.FlowPctToDelta(e.sideFlow.AggNet, e.sideFlow.AggAmount)
+		fresh := !e.sideFlow.AggAt.IsZero() && now.Sub(e.sideFlow.AggAt) <= aggMaxAge &&
+			finiteSideFloat(e.sideFlow.AggDelta) && finiteSideFloat(aggDelta) &&
+			e.sideFlow.AggAmount > 0 && math.Abs(aggDelta-e.sideFlow.AggDelta) < 1e-9
+		if fresh {
+			e.sideFlow.observe(now, sideFlowSample{
+				Net: e.sideFlow.AggNet, Amount: e.sideFlow.AggAmount,
+				Source: "em:sector_agg", At: now, Delta: e.sideFlow.AggDelta,
+			}, e.sideFlow.AggDelta)
 		}
 		return
 	}
 	if !e.sideFlow.ProxyLocked {
-		e.sideFlow.ProxyMiss++
-		if e.sideFlow.ProxyMiss < after {
-			return
-		}
-		e.sideFlow.ProxyLocked = true
+		return
 	}
 	e.sideFlow.observe(now, sideFlowSample{
 		Net: netSum, Amount: amtSum, Source: "em:sector_agg", At: now,
