@@ -1,8 +1,9 @@
 # quant-moneyflow.timer — 交易日 15:35 采一次个股资金流（§REPLAY-INPUTS 档 3b）。
 #
-# Mon..Fri 只是第一层；**是不是交易日由程序自己判**（非交易日拿不到当日行，落 no_data 并写标记），
-# 所以长假期间这条 unit 会正常跑完并留下"partial/failed"标记——
-# 这是刻意的：标记必须"有结论"，夜间链才不会白等到兜底时限（方案 §5.2）。
+# Mon..Fri 只是第一层；**是不是交易日由程序自己判**（`data.IsTradingDay`）：
+# 非交易日 append 腿在打上游之前就返回，落 `not_trading_day` 标记并照常写 `moneyflow_run.json`
+# ——这是刻意的（2026-11-28 首跑实读）：标记必须"有结论"，夜间链才不会白等到兜底时限（方案 §5.2）；
+# 同时它也**不伪造当日行**（拿不到的行不写 0）。
 [Unit]
 Description=Daily per-stock money-flow collection (Mon..Fri after close)
 
