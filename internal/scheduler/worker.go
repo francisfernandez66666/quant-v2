@@ -520,6 +520,13 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	if !NightlyEligible(s.nowTime(), cfg) && next.Status != store.TaskPreempted {
 		return
 	}
+	// §MONEYFLOW-GATE（2026-11-28 档 3b）：吃个股资金流的步骤等当日采集标记，
+	// 过兜底时限照排。位置在 NightlyEligible 之后、§NIGHTCAP 预算闸之前——
+	// 放在预算闸之后会让"等采集"这段时间把当夜预算误算进占用（先判能不能跑，再记账）。
+	if allow, gateReason := s.flowGateAllows(next, cfg, s.nowTime()); !allow {
+		s.noteFlowGateWait(next.ID, next.Type, gateReason)
+		return
+	}
 	// §NIGHTCAP（2026-10-14）单夜占用闸（队首侧）：低优先级任务本夜剩余预算不足起跑
 	// （MinNightStartMin 分钟）时不再认领——直接写 defer_day 让位，本夜剩余时间交给后面的
 	// 链任务。不设这把闸的话，出队查询每 30s 都会把同一条取回来，队首后面的任务一条也

@@ -42,6 +42,11 @@ const (
 	CatSentiment                  // 情绪（涨停/炸板/连板高度市场状态）
 	// CatLimit §ENH-A 涨停微结构（单票连板/封单/炸板/首封时间——同花顺三池按日对齐）。
 	CatLimit
+	// CatMarket §REPLAY-INPUTS 2026-11-28 市场级标量（基准指数涨跌幅/个股资金流双分位/
+	// 板块净流入横截面分位/龙头代理分位）。与 CatSentiment 分开是因为语义不同：
+	// 情绪列是"市场温度"，本类是"资金与相对强弱"，且它们走**绝对带打分**而不是时序分位
+	// （见 market_scalar.go 的 ScalarScore）。
+	CatMarket
 )
 
 // CategoryName 返回类别中文名。
@@ -65,6 +70,8 @@ func (c Category) CategoryName() string {
 		return "情绪"
 	case CatLimit:
 		return "涨停微结构"
+	case CatMarket:
+		return "市场级标量"
 	}
 	return "未知"
 }
@@ -117,6 +124,23 @@ type StockSeries struct {
 	SealAmtRatio []float64 // 峰值封单额/流通市值（非涨停日 0；流通市值缺失 NaN）
 	BreakCnt     []float64 // 当日开板（炸板）次数（炸板池 open_times；无记录 0）
 	FirstSealMin []float64 // 首封时间（当日 0 点起分钟数，如 09:35=575；非涨停日 NaN）
+
+	// §REPLAY-INPUTS 2026-11-28（档 2/档 3）：市场级标量列。**缺失整列 NaN，绝不写 0**——
+	// 0 在这些量纲里都是"一条方向可能相反的真读数"（分位 0＝最弱、涨跌幅 0＝平盘、净流入 0＝中性），
+	// 而因子层的弃权语义依赖 NaN：scoreRule 读到 NaN 就 continue，读到 0 会参与打分。
+	// 命名与载体 params.factor_defs 的 input 逐字对齐（方案 §2.2/§4）：
+	// 同名列必须同义，不同义的代理一律另起名字（见 SectorFlowQuantile / SectorGainRank 注释）。
+	IndexChange        []float64 // 基准指数当日涨跌幅（%），与载体 index_change_pct 同口径
+	FlowToday          []float64 // 主力净流入 **占成交额**（%）＝上游 f57，与大盘腿/板块腿同一把尺
+	Flow5d             []float64 // 近 5 个**连续**交易日累计净流入 / 累计成交额 ×100（%）；不足或断日 NaN
+	FlowCapToday       []float64 // 主力净流入 **占流通市值**（%）＝原公式，另开一列避免与上面混量纲
+	FlowCap5d          []float64 // 近 5 日累计净流入 / 流通市值 ×100（%）
+	SectorFlowQuantile []float64 // 所属板块当日净流入率的**全市场板块横截面分位**（0..100）
+	// ↑ 这是**代理**，与载体的 ConceptHeat（利好池 LLM 热度分）**不是同一个量**，
+	//   所以刻意不叫 ConceptHeat：同名不同义会让回测结论被当成实盘行为（方案 §2.2 第 1 条）。
+	SectorGainRank []float64 // 同板块内当日涨幅分位（0..1），龙头**代理**
+	// ↑ 载体的 is_leader 是布尔（是不是板块前二），这里是连续分位——同样刻意不同名。
+	//   布尔走的是"门槛 band + bool 特例"，分位走 linear band，两者共用一个 ID 必然算错。
 }
 
 // Len 返回序列长度。
@@ -125,6 +149,95 @@ func (s *StockSeries) Len() int {
 		return 0
 	}
 	return len(s.Dates)
+}
+
+// floatColumns 列出全部数值列的可寻址指针。
+//
+// 为什么要有这张清单而不是在每个使用点手写：StockSeries 有 30+ 列，任何"逐列处理"的
+// 逻辑（截断视图、对齐校验、覆盖率统计）只要有一处漏列，表现就是那一列**静默不参与**——
+// 本仓的 `_series_on_bars` 事故就是这个形状（六条估值腿永远 NaN，读数上一切正常）。
+// 有了单点清单，新增一列只需要在这里加一行，所有逐列逻辑自动覆盖。
+func (s *StockSeries) floatColumns() []*[]float64 {
+	return []*[]float64{
+		&s.CloseHfq, &s.CloseRaw, &s.Open, &s.High, &s.Low, &s.Vol, &s.Amount,
+		&s.Turnover, &s.PeTTM, &s.Pb, &s.PsTTM, &s.PcfTTM, &s.DvTTM,
+		&s.TotalShare, &s.IsST, &s.Eps, &s.D1,
+		&s.Roe, &s.GrossMargin, &s.NetMargin, &s.DebtToAssets,
+		&s.YoyNetProfit, &s.SingleQuarterNIYoy,
+		&s.EmoLimitUp, &s.EmoBreakCnt, &s.EmoMaxBoard, &s.EmoBlastRate,
+		&s.LimitBoard, &s.SealAmtRatio, &s.BreakCnt, &s.FirstSealMin,
+		&s.IndexChange, &s.FlowToday, &s.Flow5d, &s.FlowCapToday, &s.FlowCap5d,
+		&s.SectorFlowQuantile, &s.SectorGainRank,
+	}
+}
+
+// UpTo 返回只看前 i+1 个交易日（[0, i]）的**视图**：结构体值拷贝 + 各列切片头截断，
+// 不复制任何底层数组，所以一次调用的代价是 O(列数) 而不是 O(列数×长度)。
+//
+// 为什么是视图而不是"把 asofIdx 一路传进 scoreRule/percentile"（方案 §1.2 第 1 条）：
+// scoreRule 同时服务实盘 Evaluate()，改它的签名要么动钱路径、要么在每个下游 helper 再传一层。
+// 视图让"只看过去"这件事在**入口**完成一次，下游一行不用改。
+//
+// i 越界按边界钳制（不 panic）；列长度不足 n 时保持原样——那说明该列本来没装，
+// 让因子层按 NaN 弃权，绝不在视图里凭空补出一段零（补零＝"有读数"，是假读数）。
+//
+// ★ 视图与本体**共享底层数组**：调用方写视图的任何一格等于写缓存本体。
+// 纪律是"视图只读"，任何需要改值的场景必须显式克隆（见 StockSeries.CloneColumn）。
+//
+// English: a zero-copy as-of view over the first i+1 sessions. The view shares the backing
+// arrays with the cache, so it must be treated as read-only.
+func (s *StockSeries) UpTo(i int) *StockSeries {
+	if s == nil {
+		return nil
+	}
+	n := i + 1
+	if n < 0 {
+		n = 0
+	}
+	if n > len(s.Dates) {
+		n = len(s.Dates)
+	}
+	out := *s
+	out.Dates = s.Dates[:n]
+	for _, col := range out.floatColumns() {
+		if col == nil || *col == nil {
+			continue
+		}
+		if len(*col) >= n {
+			*col = (*col)[:n]
+		}
+	}
+	return &out
+}
+
+// CloneColumn 把某一列**深拷贝**出来，供确实需要改写单日读数的调用方使用
+// （例：只有当日 D1 分而没有整列时）。返回的切片与本体不共享内存，改它不影响缓存。
+// 列不存在（未装配）返回 nil，调用方按"该因子弃权"处理，不许自己造长度。
+func (s *StockSeries) CloneColumn(name string) []float64 {
+	if s == nil {
+		return nil
+	}
+	var src []float64
+	switch name {
+	case "D1":
+		src = s.D1
+	case "CloseHfq":
+		src = s.CloseHfq
+	case "CloseRaw":
+		src = s.CloseRaw
+	case "Amount":
+		src = s.Amount
+	case "Turnover":
+		src = s.Turnover
+	default:
+		return nil
+	}
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]float64, len(src))
+	copy(out, src)
+	return out
 }
 
 // Def 单个因子的定义与计算函数。

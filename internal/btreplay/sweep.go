@@ -288,6 +288,8 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		for code, kls := range klines {
 			o.applyMinuteScope(ad, tsOfCode[code]) // §MINUTE-K：与 backtestStock 同一口径注入点
 			o.applyFinaScope(ad, tsOfCode[code])   // §B2：与 backtestStock 同一口径注入点（含兜底兄弟）
+			o.applySeriesScope(ad, tsOfCode[code]) // §REPLAY-INPUTS 档 1：与 §B2 同一注入点，漏一处即跨股串台
+			// §B2：与 backtestStock 同一口径注入点（含兜底兄弟）
 			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code], sc)...)
 		}
 		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })
@@ -625,6 +627,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	// §B2-FINA 收尾读数：扫参的触发预算同样吃了"判定日可见"财报，行数口径与非扫参回放一致，
 	// 引用网格数字的人要能在同一屏看到财务腿的覆盖规模（只回显、不判红）。
 	log.Printf("%s", o.finaSrc.String())
+	log.Printf("%s", o.seriesSrc.String()) // §REPLAY-INPUTS 档 1 读数
 
 	fmt.Printf("==============================================\n")
 	return nil
@@ -723,7 +726,9 @@ func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data
 		// minuteSrc 为 nil 时 applyMinuteScope 会清空 scope——动量照常走已声明的日线近似，
 		// 其它适配器不实现 minuteMACDScoped、零影响。
 		o.applyMinuteScope(ad, tsOfCode[code])
-		o.applyFinaScope(ad, tsOfCode[code]) // §B2：复核链路同注入（B6 教训：漏一处就串一台）
+		o.applyFinaScope(ad, tsOfCode[code])   // §B2：复核链路同注入（B6 教训：漏一处就串一台）
+		o.applySeriesScope(ad, tsOfCode[code]) // §REPLAY-INPUTS 档 1：与 §B2 同一注入点，漏一处即跨股串台
+		// §B2：复核链路同注入（B6 教训：漏一处就串一台）
 		indByDate := industryChg[code]
 		trades := o.backtestStock(code, kls, ad, indByDate)
 		for _, t := range trades {

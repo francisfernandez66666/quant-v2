@@ -37,6 +37,7 @@ import (
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	factorlib "quant-trading-v2/internal/factor"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategies/double_bump"
@@ -935,6 +936,15 @@ type Options struct {
 	// poolNote §B4-PIT 运行期池口径读数（collect 装配一次，非配置项）：本轮股票池到底是不是
 	// 时点口径、降级时为什么降级——随报告首行出门，引用数字的人与前提同屏。
 	poolNote string
+	// seriesSrc §REPLAY-INPUTS 2026-11-28（档 1）：整段序列一次装配的来源（nil=未启用）。
+	// 装配点与 finaSrc 同一处（collect 里 newFinaProvider 旁边），注入点与 applyFinaScope 同一批
+	// 调用点——两处分开写迟早漏一处，漏的那处表现是"这条腿今天没参与而读数看着正常"。
+	seriesSrc *seriesSource
+	// marketNote §REPLAY-INPUTS 报告头一行：本轮"市场级输入"到底接上了什么、哪些是代理、
+	// 哪些带值还没标定。引用回测数字的人必须先看到前提——
+	// "fac_176 的 ConceptHeat 其实是板块净流入代理"这种事实如果只在源码注释里，
+	// 三个月后审批表上没人想得到（§CONCEPT-HEAT-LINEAR 的教训就是这个形状）。
+	marketNote string
 	// finaSrc §B2 运行期财务输入源（collect/runSweep 各装配一次，非配置项）：
 	// 因子规则回放逐股喂"判定日可见"的财报（与实盘 finaCache 同一份裁决函数）。
 	// nil＝不喂（财务腿按缺失计入），§B2-FINA 读数行会如实说"未装配"。装配点见 applyFinaScope。
@@ -1077,11 +1087,26 @@ type ruleEvalAdapter struct {
 	// Evaluate 拿到的 md.Fina 与升级前逐字节一致（Fina 恒 nil → 财务因子按 NaN 跳过成分）。
 	finaSrc  *finaProvider
 	finaCode string
+
+	// §REPLAY-INPUTS 2026-11-28（档 1）：整段序列一次装配的输入面。
+	// src=nil 或 series=nil 时**回落下面的旧 K 线路径**（逐日 seriesFromKLines），
+	// 行为与升级前逐字节一致——这样"输入面没接上"是可回退的降级，不是坏掉。
+	// 回落计数随报告头出门（assemble_fallback=），绝不静默：静默的表现是
+	// 情绪/市场级腿一整天不参与而数字看着正常，正是 fac_172 那批规则的原始症状。
+	src    *seriesSource
+	series *factorlib.StockSeries
 }
 
 // setFinaScope 实现 finaScoped：逐股装配财务输入源与当前票代码（装配点每次换票都调）。
 func (a *ruleEvalAdapter) setFinaScope(p *finaProvider, tsCode string) {
 	a.finaSrc, a.finaCode = p, tsCode
+}
+
+// setSeriesScope 实现 seriesScoped：换票时取该票的整段序列（同票重复调用是常量时间）。
+// 取不到（装配失败 / src 为空）就把 series 置空 ⇒ Trigger 自动回落旧路径。
+func (a *ruleEvalAdapter) setSeriesScope(src *seriesSource, tsCode string) {
+	a.src = src
+	a.series = src.useStock(tsCode)
 }
 
 // Name 返回规则显示名（如"因子战法#1"/"形态战法#2"），作为回测报告的分组键。
@@ -1114,7 +1139,31 @@ func (a *ruleEvalAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (ma
 	var eval *strategy.Evaluation
 	var err error
 	if a.fs != nil {
-		eval, err = a.fs.Evaluate("", md)
+		// §REPLAY-INPUTS 档 1：优先走"整段序列 + as-of 索引"，情绪/涨停微结构/市场级标量
+		// 从此在回放里有输入（旧路径的 StockMarketData 里压根没有这些列）。
+		// 判定日在序列里找不到（停牌/区间外）⇒ 回落旧路径并计数，
+		// 绝不"用序列最后一根"顶班——那是拿区间末尾的读数给中间某天打分（前视）。
+		idx := -1
+		if a.src != nil && a.series != nil {
+			idx = a.src.asIndexOf(last.Date)
+		}
+		switch {
+		case idx >= 0:
+			a.src.hits++
+			eval, err = a.fs.EvaluateSeries("", a.series, idx)
+		default:
+			// 回落旧路径。计数只在 src 存在时做——src=nil 是"本轮回放没启用整段装配"
+			// （既有测试与旧调用方都是这个形态），拿 nil 接收器去加计数就是 panic，
+			// 而"只读观测腿不许有停机权限"是本仓的铁律（11-19 那次只读探针带走整轮）。
+			if a.src != nil {
+				if a.series == nil {
+					a.src.assembleFallback++ // 整段没装配上（换票失败）
+				} else {
+					a.src.skips++ // 装配上了但今天这根不在序列里
+				}
+			}
+			eval, err = a.fs.Evaluate("", md)
+		}
 	} else {
 		eval, err = a.ps.Evaluate("", md)
 	}
@@ -1761,6 +1810,10 @@ func (o *Options) Run() error {
 	if o.poolNote != "" {
 		fmt.Printf("%s\n", o.poolNote)
 	}
+	// §REPLAY-INPUTS：市场级输入的前提与代理身份与池口径同出口（不新开一段读者要翻的说明）。
+	if o.marketNote != "" {
+		fmt.Printf("%s\n", o.marketNote)
+	}
 	printReports(summaries, stockCount)
 	return nil
 }
@@ -1945,6 +1998,10 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 	// English: §B2 — attach the per-day point-in-time financial source once per collect; an empty
 	// fina_indicator is a legitimate not-yet-loaded state surfaced via the readout line, never silent.
 	o.finaSrc = newFinaProvider(db)
+	// §REPLAY-INPUTS 档 1：整段序列一次装配（含市场级面板）。
+	// 与 finaSrc 同一装配点——两处分开写迟早漏一处（§MINUTE-K/§B2 的装配点教训）。
+	o.seriesSrc = newSeriesSource(db, o.Start, o.End, o.DBPath)
+	o.marketNote = o.seriesSrc.marketNote()
 
 	// §P2 参数扫参模式：触发一次性预计算 + 逐组合廉价模拟统一出场（见 sweep.go）。
 	// English: sweep mode — pre-compute triggers once, then cheaply simulate each param combo.
@@ -1989,6 +2046,8 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 			o.applyMinuteScope(ad, tsCode)
 			// §B2 财务输入逐股注入（含兜底兄弟，见 applyFinaScope 的 B6 教训注释）。
 			o.applyFinaScope(ad, tsCode)
+			// §REPLAY-INPUTS 档 1：与财务同一个注入点（含兜底兄弟），换票时取该票整段序列。
+			o.applySeriesScope(ad, tsCode)
 			// §Risk-1 单位自校：tushare 口径库 amount=千元，均价带判定后归一（仅增强模式）
 			if o.slip != nil && fixAmountScale(klines) {
 				amountFixed++
@@ -2023,6 +2082,8 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 	log.Printf("%s", o.minuteCoverageNote())
 	// §B2-FINA 收尾读数：这一轮因子判定到底有多少票吃到了"判定日可见"的财报（只回显、不判红）。
 	log.Printf("%s", o.finaSrc.String())
+	// §REPLAY-INPUTS 档 1 读数：装配票数 / assemble_fallback / 面板缺失清单。
+	log.Printf("%s", o.seriesSrc.String())
 	return summaries, ids, len(codes), nil
 }
 

@@ -328,6 +328,20 @@ func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries)
 				continue
 			}
 			pct = clamp01(last / 40)
+		} else if factorlib.IsScalarFactor(fid) {
+			// §REPLAY-INPUTS 2026-11-28（档 2）：市场级标量走**绝对带打分**，绝不进 percentile。
+			// 位置是硬约束：必须在 D1Event 之后、isFinancialFactor 之前——
+			// 门禁 §259 ③ 用 AST 抽本函数体比两个索引，挪位即红。
+			// 为什么不能让标量腿落进下面的 percentile：指数涨 1.2% 是绝对尺度，
+			// 折成"该序列自己 900 天里的分位"会在趋势市里天天读成高分（载体侧同取向，
+			// rules_factor._scalar_score 也只在带内归一、从不排分位）。
+			last := vals[len(vals)-1]
+			pct = factorlib.ScalarScore(fid, last)
+			if math.IsNaN(pct) {
+				// 无带（未标定）或无读数 ⇒ 该因子弃权：不进 used、不进 total。
+				// 折成 0 等于把"这条腿没数据"当成"这条腿给了最低分"，方向是反的。
+				continue
+			}
 		} else if isFinancialFactor(df) {
 			last := vals[len(vals)-1]
 			if math.IsNaN(last) {

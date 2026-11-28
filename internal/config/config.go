@@ -440,6 +440,15 @@ func (r RuntimeConfig) SidePolicyEnabledOn() bool {
 	return r.SidePolicyEnabled != nil && *r.SidePolicyEnabled
 }
 
+// MoneyflowGateGraceHHMM 夜间链等个股资金流采集标记的**兜底时限**（北京时 HH:MM）。
+//
+// 这是保险丝，不是排程时刻：采集器 15:35 起一轮（现网派生估算 25–40 分钟，
+// 锚点=quant-sector-map 同量级实测 5–8 分钟/1050 次中继请求），到 17:00 仍没有当日标记
+// 就照常放行研究并留痕 moneyflow_gate_timeout。
+// 没有这把保险丝的后果：中继抖一次 → 采集没写标记 → 当晚研究整晚不出队。
+// 真源只有这一处，调度器不得内联第二个钟点（方案 §5.3 / §261 ⑪ 负锁）。
+const MoneyflowGateGraceHHMM = "17:00"
+
 // IndexFallbackSourcesOn 指数实时是否允许多源兜底（缺省开，§INDEX-BLIND）。
 func (r RuntimeConfig) IndexFallbackSourcesOn() bool { return feedOn(r.IndexFallbackSources) }
 
@@ -1450,6 +1459,16 @@ type SchedulerConfig struct {
 	// 字段保留仅为兼容存量 config.json / 账号级规则投影（解析不报错），写 true 也不再生效。
 	// English: deprecated — the all-day bypass is retired; kept only for config compatibility.
 	AllDayResearch bool `json:"all_day_research"`
+	// MoneyflowGateEnabled §REPLAY-INPUTS 2026-11-28（档 3b）：夜间链里"吃个股资金流的步骤"
+	// 是否等当日采集标记（moneyflow_run.json）再出队。**指针位、缺键＝开**。
+	//
+	// 为什么挂在 rules.scheduler 而不是 rules.runtime：调度器进程（quant-research）
+	// 只装载 SchedulerConfig，读不到 RuntimeConfig——放错层的结果是"配置页能改、
+	// 运行时永远读默认"，这种死键本仓已经登记过（根级 qmt 死键、all_day_research）。
+	// 为什么缺键=开：这条闸的方向是"晚一点跑研究"，而默认不等会让 fac_175/179
+	// 每天拿昨天的资金流末行测出看着正常的数字（与 §BUY-ROOM-GUARD 同取向：
+	// 缺陷修复不是新功能）。显式 false 是回滚出口（方案 §9）。
+	MoneyflowGateEnabled *bool `json:"moneyflow_gate_enabled,omitempty"`
 	// MaxQueuedTasks §QUEUE-CAP-20261112：自动夜间链入队前的队列深度上限（0=用默认 20）。
 	// 超过上限就不排当晚新链并留痕，防止任务无限堆积拖慢前端与 researchd 启动扫描。
 	// English: cap on queued research tasks before a new nightly chain is enqueued.
@@ -1519,6 +1538,10 @@ type SchedulerConfig struct {
 	// 夜间自动寻优开关（默认 true，推荐制）
 	OptimizeEnabled bool `json:"optimize_enabled"`
 }
+
+// MoneyflowGateOn 夜间链是否等当日个股资金流采集标记（缺键=开，显式 false 才关）。
+// 语义与行情四键同款 feedOn：config.json 里没有这个键＝开。
+func (c SchedulerConfig) MoneyflowGateOn() bool { return feedOn(c.MoneyflowGateEnabled) }
 
 // DiscoverConfig 因子/形态发现 + B4 回测 + 护栏参数（rules.nightly.discover）。
 // 2026-09-05 多轮自动发现：每夜按 variants 个变体任务 × 每变体 top_n 个排他最优组合产出互异候选。

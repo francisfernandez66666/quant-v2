@@ -59,6 +59,11 @@ type Scheduler struct {
 	// nowFn 可注入时钟：测试用 setNow 替换。§flaky 修复——字段自身以 nowMu 保护，
 	// 此前后台排水 goroutine（tryStartNext 自驱）与测试改写 s.now 存在数据竞争。
 	nowMu sync.RWMutex // 保护 nowFn 与 nightBudgetUnit 的读写锁
+	// flowGateNoted §MONEYFLOW-GATE 已打过"等待留痕"的任务键集合（taskID|reason）。
+	// tick 每 30s 会重复命中同一原因，不去重就会把真正有用的日志埋掉
+	// （与载体侧 _note_skip 按 (kind,reason) 去重带 count 同一取向）。
+	flowGateNoted map[string]bool
+
 	nowFn func() time.Time
 	// nightBudgetUnit §TEST-SPEED 单夜预算"分钟数"换算真实时长的单位：生产恒 time.Minute，
 	// 让位等行为的分钟口径一个字节不改；单测注入秒级把 ~65s 的真实等待压到亚秒级。
@@ -282,6 +287,11 @@ type SchedulerStatus struct {
 	Reason          string `json:"reason"`              // 人类可读的"当前为何未出队"原因
 	// §0926E2E-15：tick panic 累计隔离次数（0 时整字段省略，不给既有消费方加噪声）。
 	TickPanics int64 `json:"tick_panics,omitempty"`
+	// §MONEYFLOW-GATE 2026-11-28（档 3b）：夜间链是否在等当日个股资金流采集标记。
+	// 三键全部 omitempty——旧前端/旧读数消费方看不到新键时行为不变。
+	MoneyflowGateOn     bool   `json:"moneyflow_gate_on,omitempty"`
+	MoneyflowMarkerDay  string `json:"moneyflow_marker_day,omitempty"`
+	MoneyflowMarkerStat string `json:"moneyflow_marker_status,omitempty"`
 }
 
 // writeStatus 把调度可见性快照落盘（scheduler_status.json），供 quant API 读取后前端展示。
@@ -310,6 +320,13 @@ func (s *Scheduler) writeStatus(cfg config.SchedulerConfig, now time.Time) {
 		BusyTask:        busyTask,
 		TickPanics:      s.tickPanics.Load(), // §0926E2E-15 panic 隔离计数随快照对外可见
 	}
+	// §MONEYFLOW-GATE：采集闸状态随快照出门（前端与运维都要能看到"研究是被这道闸压着"，
+	// 而不是"调度器卡住了"——两者处置完全不同：前者等半小时，后者查进程）。
+	st.MoneyflowGateOn = cfg.MoneyflowGateOn()
+	if run, ok := readMoneyflowRun(dirOfDB(cfg)); ok {
+		st.MoneyflowMarkerDay = run.Day
+		st.MoneyflowMarkerStat = runMarkerStatus(run, ok)
+	}
 	switch {
 	case !cfg.Enabled:
 		st.Reason = "调度器已禁用(enabled=false)：请检查 config.json 的 rules.scheduler.enabled"
@@ -327,7 +344,14 @@ func (s *Scheduler) writeStatus(cfg config.SchedulerConfig, now time.Time) {
 		// 其余情况：开库看队列是否有可出队任务（区分"队列为空"与"异常未认领"）。
 		if db := s.openStore(cfg); db != nil {
 			if t, err := db.DequeueHighestTask(); err == nil && t != nil {
-				st.Reason = "可出队（队列有任务待执行）"
+				// §MONEYFLOW-GATE：队首是"吃资金流的步骤"且当日标记没到 ⇒ 如实报"在等采集"，
+				// 而不是"可出队"（后者会让人以为调度器坏了，实际是这道新闸在起作用）。
+				if allow, gateReason := s.flowGateAllows(t, cfg, now); !allow {
+					st.Reason = fmt.Sprintf("等个股资金流采集完成（队首 #%d(%s)：%s；过 %s 兜底时限后自动放行）",
+						t.ID, t.Type, gateReason, config.MoneyflowGateGraceHHMM)
+				} else {
+					st.Reason = "可出队（队列有任务待执行）"
+				}
 			} else {
 				st.Reason = "队列为空（无可执行任务）"
 			}

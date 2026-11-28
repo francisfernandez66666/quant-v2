@@ -21,6 +21,20 @@ import (
 // （Assemble builds one stock's research series over [start,end] from the store DB.
 // Financial fields are point-in-time aligned to each bar via ann_date.）
 func Assemble(db *store.DB, code, start, end string) (*factor.StockSeries, error) {
+	return AssembleWithPanels(db, code, start, end, nil)
+}
+
+// AssembleWithPanels 带市场级面板的装配（§REPLAY-INPUTS 2026-11-28）。
+//
+// 与 `Assemble` 的唯一区别是末尾多一段 `fillMarketLegs`：把 D1 / 指数涨跌幅 /
+// 个股资金流双分母 / 板块净流入分位 / 龙头代理分位填进 StockSeries 的八个新列。
+// 为什么不直接改 `Assemble` 的签名：它还有三个既有调用方（B3 扫参、IC 计算、咨询富化），
+// 改签名等于逼这些调用方去装面板——它们只需要价量与财务。
+// 传 nil 面板是合法形态：价量财务照装，市场级八列保持 NaN，相关因子腿按弃权运行（fail-closed）。
+//
+// English: same assembly plus the eight market-level columns; a nil panel leaves them NaN
+// so the dependent factor legs abstain instead of scoring a fabricated neutral value.
+func AssembleWithPanels(db *store.DB, code, start, end string, p *Panels) (*factor.StockSeries, error) {
 	hfq, err := db.HfqBars(code, start, end)
 	if err != nil {
 		return nil, err
@@ -149,6 +163,8 @@ func Assemble(db *store.DB, code, start, end string) (*factor.StockSeries, error
 			}
 		}
 	}
+	// §REPLAY-INPUTS 2026-11-28：市场级八列（档 2/档 3）。读不到就留 NaN，由因子层弃权。
+	fillMarketLegs(db, s, code, start, end, p)
 	return s, nil
 }
 
@@ -258,6 +274,18 @@ func fillSlices(s *factor.StockSeries, n int) {
 	s.DebtToAssets = make([]float64, n)
 	s.YoyNetProfit = make([]float64, n)
 	s.SingleQuarterNIYoy = make([]float64, n)
+	// §REPLAY-INPUTS 2026-11-28 新增七列 + D1 列必须在这里分配并**先填 NaN**。
+	// 为什么强调"先填 NaN"：Go 的 make 给出的是 0，而 0 在这七列里都是一条真读数
+	// （涨跌幅 0＝平盘、分位 0＝最弱、净流入 0＝中性）。装配层只写有读数的格子，
+	// 剩下的必须是 NaN，否则"腿没接上"会被读成"今天全是中性"。
+	s.D1 = make([]float64, n)
+	s.IndexChange = make([]float64, n)
+	s.FlowToday = make([]float64, n)
+	s.Flow5d = make([]float64, n)
+	s.FlowCapToday = make([]float64, n)
+	s.FlowCap5d = make([]float64, n)
+	s.SectorFlowQuantile = make([]float64, n)
+	s.SectorGainRank = make([]float64, n)
 	for i := 0; i < n; i++ {
 		s.Open[i], s.High[i], s.Low[i], s.CloseHfq[i] = math.NaN(), math.NaN(), math.NaN(), math.NaN()
 		s.CloseRaw[i] = math.NaN()
@@ -270,5 +298,11 @@ func fillSlices(s *factor.StockSeries, n int) {
 		s.YoyNetProfit[i], s.SingleQuarterNIYoy[i] = math.NaN(), math.NaN()
 		s.EmoLimitUp[i], s.EmoBreakCnt[i] = math.NaN(), math.NaN()
 		s.EmoMaxBoard[i], s.EmoBlastRate[i] = math.NaN(), math.NaN()
+		// §REPLAY-INPUTS 八列市场级输入同样先铺 NaN（缺数＝弃权，不是中性）。
+		s.D1[i] = math.NaN()
+		s.IndexChange[i] = math.NaN()
+		s.FlowToday[i], s.Flow5d[i] = math.NaN(), math.NaN()
+		s.FlowCapToday[i], s.FlowCap5d[i] = math.NaN(), math.NaN()
+		s.SectorFlowQuantile[i], s.SectorGainRank[i] = math.NaN(), math.NaN()
 	}
 }

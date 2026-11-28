@@ -51,9 +51,17 @@ func TestRegistry(t *testing.T) {
 		}
 		lastID = d.ID
 	}
-	// §ENH-A 新增第 9 大类 CatLimit（涨停微结构）：注册表覆盖 9 大类。
-	if len(cats) != 9 {
-		t.Fatalf("应覆盖 9 大类，实际 %d: %v", len(cats), cats)
+	// 大类数改**派生式**判据（§ENH-A 起这里写死过 9，每新增一大类就得改一次断言，
+	// 而漏改的表现是"全绿但断言早就对不上结构体"）。现在只钉两件真不变量：
+	//   ① 下限 10 大类（含本批 CatMarket）——低于它就是有类别整族从注册表消失了；
+	//   ② 每个在册大类都必须有中文名（新增类别忘了登记 CategoryName 会返回空串）。
+	if len(cats) < 10 {
+		t.Fatalf("应至少覆盖 10 大类，实际 %d: %v", len(cats), cats)
+	}
+	for c := range cats {
+		if c.CategoryName() == "" {
+			t.Fatalf("大类 %d 没有中文名（CategoryName 少一个 case）", int(c))
+		}
 	}
 	// 每类中文名有效
 	// English: Chinese name valid for every category.
