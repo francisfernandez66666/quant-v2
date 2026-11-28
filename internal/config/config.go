@@ -5329,6 +5329,11 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 	if v, ok := cfgBool(m, "optimize_enabled"); ok {
 		out.OptimizeEnabled = v
 	}
+	// §MONEYFLOW-GATE（2026-11-28）：显式 false 是文档承诺的回滚出口，
+	// 但本函数是逐键覆盖而非 json.Unmarshal——漏解析会让「关闸」永远不生效（缺键=开）。
+	if v, ok := cfgBool(m, "moneyflow_gate_enabled"); ok {
+		out.MoneyflowGateEnabled = &v
+	}
 	if v, ok := cfgStr(m, "research_bin"); ok && v != "" {
 		out.ResearchBin = v
 	}

@@ -30309,6 +30309,25 @@ GO_RC=0
 go test ./internal/scheduler -run 'TestNoTimeLimitBacktestScope|TestNoTimeLimitBacktestSkipsNightcap|TestNightcapHeadBudgetDefersAndReleasesQueue|TestNightcapBudgetCapYieldsTask' -count=1 >/dev/null 2>&1 || GO_RC=$?
 [ "$GO_RC" = "0" ] || fail264 "调度器行为腿未过（§264 ④）"
 
+# ⑤ 跨入交易时段仍要让位（既有「交易时段开始」抢占链不许被豁免拆掉）：
+#    免时限只免「时间上限」，不免「时段退避」。同时锁住 moneyflow_gate_enabled 显式 false
+#    能被逐键解析（否则测试夹具/回滚出口都失效）。
+CNT264=$((CNT264 + 1))
+python3 - <<'PY' || fail264 "交易时段退避链或资金流闸回滚出口缺失（§264 ⑤）"
+import pathlib
+s = pathlib.Path("internal/scheduler/scheduler.go").read_text(encoding="utf-8")
+assert 's.preemptCurrent("交易时段开始")' in s, "tickInner 必须在交易窗口抢占当前任务"
+w = pathlib.Path("internal/scheduler/worker.go").read_text(encoding="utf-8")
+assert "case preempted:" in w and "status = store.TaskPreempted" in w, "抢占终态必须落 preempted"
+assert "db.RequeueAfterPreemption(tk.ID)" in w, "抢占后必须自动回队、下个可用时段续跑"
+c = pathlib.Path("internal/config/config.go").read_text(encoding="utf-8")
+assert 'cfgBool(m, "moneyflow_gate_enabled")' in c, "显式关闸键未被逐键解析"
+PY
+CNT264=$((CNT264 + 1))
+GO_RC=0
+go test ./internal/scheduler -run 'TestNoTimeLimitBacktestYieldsAtTradingWindow' -count=1 >/dev/null 2>&1 || GO_RC=$?
+[ "$GO_RC" = "0" ] || fail264 "跨交易时段让位腿未过（§264 ⑥）"
+
 [ "${B264_FAILED:-0}" = "0" ] || exit 1
-echo "ok - §264 §NO-TIME-LIMIT-BACKTEST 锁通过（白名单/两道闸/WithCancel+看门狗/行为腿，累计判定点 ${CNT264}）"
+echo "ok - §264 §NO-TIME-LIMIT-BACKTEST 锁通过（白名单/两道闸/WithCancel+看门狗/行为腿/交易时段让位，累计判定点 ${CNT264}）"
 echo ""
