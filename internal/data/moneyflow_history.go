@@ -46,6 +46,14 @@ type FlowDay struct {
 	MediumNet     float64 // 中单净额（元）
 	LargeNet      float64 // 大单净额（元）
 	SuperLargeNet float64 // 超大单净额（元）
+	// MainPct §REPLAY-INPUTS 2026-11-28：上游 f57＝主力净额/成交额×100（%）。
+	// 为什么重要：**成交额分母不用反推**，上游已经算好了——
+	// 自己除一次就多一个"分母为 0/缺失"的分支，而载体侧的 flow_today_pct 正是这样
+	// 在一个键里混了两种量纲的（方案 §0.5 探针 3）。
+	// HasMainPct 区分"上游没给这一列"与"给了 0"：直连腿的 fields2 只请求到 f56（6 列），
+	// 中继腿请求到 f57（7 列），同一份解析器两种报文都要能读，缺列必须显式标记。
+	MainPct    float64
+	HasMainPct bool
 }
 
 // SumMainNet 近 N 日主力净额累计（元）。行数不足按已有行计（消费方自行判定是否够用）。
@@ -95,14 +103,23 @@ func parseMoneyFlowHistory(body []byte, code string) ([]FlowDay, error) {
 			// 非数字（上游 null/占位）→ 整体弃权，绝不把缺数当 0。
 			return nil, fmt.Errorf("eastmoney: moneyflow-history row %d (%s) non-numeric field", i, date)
 		}
-		out = append(out, FlowDay{
+		day := FlowDay{
 			Date:          date,
 			MainNet:       main,
 			SmallNet:      small,
 			MediumNet:     medium,
 			LargeNet:      large,
 			SuperLargeNet: superLarge,
-		})
+		}
+		// 第 7 列（f57 净占比）**可选**：前 6 列不齐仍然整条报文弃权（§FIX-9e 原纪律不变），
+		// 但第 7 列缺席只是"没有占比"，不能让已经拿到的净额作废——
+		// 直连腿请求的就是 6 列，把它改成硬要求会让既有链路集体弃权。
+		if len(parts) > emFFlowRowFields {
+			if pct, okP := parseFlowNum(parts[emFFlowRowFields]); okP {
+				day.MainPct, day.HasMainPct = pct, true
+			}
+		}
+		out = append(out, day)
 	}
 	return out, nil
 }

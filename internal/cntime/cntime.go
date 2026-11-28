@@ -8,7 +8,10 @@
 // timezone assumptions broke gates by 8h on UTC hosts; route all wall-clock semantics here.
 package cntime
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Loc 北京时间（Asia/Shanghai；tzdata 缺失时退回固定 +08:00，语义不变）。
 var Loc = func() *time.Location {
@@ -29,6 +32,39 @@ func DayOf(t time.Time) string { return In(t).Format("2006-01-02") }
 
 // DayCompactOf 北京日期 YYYYMMDD（交易日分桶/chain_day）。
 func DayCompactOf(t time.Time) string { return In(t).Format("20060102") }
+
+// CompactDay 把一个**日期字符串**归一成 YYYYMMDD；形状不认识就返回空串（绝不猜）。
+//
+// §REPLAY-INPUTS 2026-11-28：本仓同时存在两种日尺——`daily/index_daily/stk_limit/stocks.list_date`
+// 是紧凑 `20261127`，而 `flow_factor_daily/sector_flow_daily/d1_scores` 与东财上游 f51 是横线
+// `2026-11-27`。这个差异已经造成过三次"查错形状 ⇒ 永远今天没数、且不报错"的事故
+// （AGENTS 里 §FLOW-SECTOR-JOIN、§FACTOR-FIX、§BOX-FIX 各一处）。取向：
+//   - **只在写入边界调用一次**，库里同一张表绝不两种形态并存；
+//   - 空串是"读不懂"而不是"等于 0"——调用方必须显式弃权，不许拿零值继续算。
+//
+// English: normalizes a date string to YYYYMMDD; returns "" for anything unrecognized so
+// callers abstain instead of silently comparing against a zero-shaped key.
+func CompactDay(s string) string {
+	t := strings.TrimSpace(s)
+	if len(t) == 8 {
+		for i := 0; i < 8; i++ {
+			if t[i] < '0' || t[i] > '9' {
+				return ""
+			}
+		}
+		return t
+	}
+	if len(t) == 10 && t[4] == '-' && t[7] == '-' {
+		digits := t[:4] + t[5:7] + t[8:10]
+		for i := 0; i < 8; i++ {
+			if digits[i] < '0' || digits[i] > '9' {
+				return ""
+			}
+		}
+		return digits
+	}
+	return ""
+}
 
 // CalendarLookaheadDays 交易日历回写窗口的未来延伸天数。
 //

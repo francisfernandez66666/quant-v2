@@ -134,6 +134,10 @@ tools/indep_cloud_evidence_*/
 /dataload
 /fixturecapture
 /commentcheck
+# §REPLAY-INPUTS 2026-11-28 档 3b：个股资金流采集器（cmd/backfill_stock_moneyflow）的
+# 本机产物名；云端落位名是 /opt/quant/stockmoneyflow（unit 里写死），两个名字都别裸提交。
+/backfill_stock_moneyflow
+/stockmoneyflow
 /pydata
 /backtest_params.json.bak*
 

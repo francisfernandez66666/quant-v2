@@ -459,6 +459,75 @@ func (d *DB) migrate() error {
 			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
 			PRIMARY KEY (trade_date, sector)
 		)`,
+		// §REPLAY-INPUTS 2026-11-28（方案 PLAN_FACTOR_REPLAY_INPUTS_PIT_20261128 §3.2）：
+		// 本批四张新表的 trade_date **一律紧凑 YYYYMMDD，与 daily/index_daily 同形**。
+		// 理由不是习惯而是形状：这四张表都要和 `daily` 做逐日对齐（资金流要验"连续 5 个交易日"、
+		// 龙头分位要按交易日排、流通股本要按日取），拼法不统一就等于在每个读点各写一次转换——
+		// 本仓已栽过三次（flow_factor_daily 是横线、sector_map.json 的 day 是紧凑，
+		// 查错形状的表现是"永远今天没数"且**不报错**）。
+		// ⇒ **上游带横线的日期（东财 f51 "2026-11-27"）只在写入边界归一一次**，库里不留两种形态。
+		//
+		// 个股主力净流入日频档（长期数据，owner 2026-11-28 定位）：
+		// **只存原子量**——main_net（元）与上游直接给的 main_pct（f57＝净额/成交额×100），
+		// amount 由这两者反推（pct=0/缺 ⇒ NULL）；四个单量档一并留着（将来做拆单/资金结构因子用）。
+		// **比率一律不进表**：一旦把比值落库，日后改分母就得重刷历史，且"哪条腿算的"查不回来。
+		// 上游是 120 根滚动窗口（实测 2026-11-28），所以这张表只能靠天天追加变成长期资产。
+		`CREATE TABLE IF NOT EXISTS stock_moneyflow_daily (
+			ts_code TEXT NOT NULL,
+			trade_date TEXT NOT NULL,
+			main_net REAL,
+			main_pct REAL,
+			amount REAL,
+			small_net REAL,
+			medium_net REAL,
+			large_net REAL,
+			super_large_net REAL,
+			source TEXT NOT NULL,
+			fetched_at TEXT NOT NULL,
+			PRIMARY KEY (ts_code, trade_date)
+		) WITHOUT ROWID`,
+		// 流通股本**按日**留痕（方案 §3.2）：曾经写成"一票一行 + asof 快照"，那是错的——
+		// 用今天的股本去算三个月前的净流入率，遇到解禁/定增就污染，且事后无从复核。
+		// 现网 daily_basic 的 float_share/total_share/circ_mv **全表 0 行有值**
+		// （日更走 baostock，映射里根本没这些列，2026-11-28 实测），所以本表只能从今天起攒，
+		// 首版种子取自 precalc 的腾讯 float_shares 快照；缺行 ⇒ 占流通市值口径整条腿弃权。
+		`CREATE TABLE IF NOT EXISTS stock_float_share_daily (
+			ts_code TEXT NOT NULL,
+			trade_date TEXT NOT NULL,
+			float_share REAL NOT NULL,
+			source TEXT NOT NULL,
+			PRIMARY KEY (ts_code, trade_date)
+		) WITHOUT ROWID`,
+		// 逐票板块归属**历史化**（方案 §2.2 第 6 条）：以前只有 sector_map.json 当日快照，
+		// 于是"龙头分位/板块分位"永远只能在快照当天之后有效——拿单日快照回填 2023 年的归属
+		// 就是前视偏差。生产者已每天产一份，本表只是把那份**存下来**，一天一条、跨日不覆盖。
+		`CREATE TABLE IF NOT EXISTS sector_map_daily (
+			trade_date TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			sector TEXT NOT NULL,
+			sector_type TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (trade_date, ts_code)
+		) WITHOUT ROWID`,
+		// 市场级龙头代理分位（方案 §2.2 第 4 条）。**必须由预计算表算，不在逐股 Assemble 里算**——
+		// Assemble 是逐股函数，拿不到全市场截面。sector 列一起存：审计要能回答
+		// "这个分位是在哪个板块里算出来的"，只存一个 float 事后无法复核。
+		// 主键顺序是 (ts_code, trade_date) 而不是反过来：读侧永远是「某票的区间」（逐股装配），
+		// 主键前缀必须落在 ts_code 上，否则每只票退化成全表扫；按日的覆盖率统计另建索引。
+		`CREATE TABLE IF NOT EXISTS leader_rank_daily (
+			ts_code TEXT NOT NULL,
+			trade_date TEXT NOT NULL,
+			sector TEXT NOT NULL DEFAULT '',
+			pct_chg REAL,
+			gain_rank REAL,
+			PRIMARY KEY (ts_code, trade_date)
+		) WITHOUT ROWID`,
+		`CREATE INDEX IF NOT EXISTS idx_sflow_date ON stock_moneyflow_daily(trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_sectormap_date ON sector_map_daily(trade_date)`,
+		// 逐票装配的主查询形状是「某票的一段日期区间」（与 leader_rank/股本/资金流一致），
+		// 主键前缀落在 trade_date 上走不到这个形状 ⇒ 单建一条 ts_code 前缀索引。
+		// 漏了它不会报错，只会让 4309 只票的装配各扫一遍表（实测形态是"回放凭空多十几分钟"）。
+		`CREATE INDEX IF NOT EXISTS idx_sectormap_code ON sector_map_daily(ts_code, trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_leaderrank_date ON leader_rank_daily(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_state ON research_tasks(status, priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_chain ON research_tasks(chain_day)`,
 		// 研究窗口级断点（二期）：discover-factors 各阶段按窗口缓存装配产物（IC 行等），
@@ -1680,6 +1749,19 @@ func TableColumns(table string) []string {
 		// §MINUTE-K：列名与日线家族保持同一写法（vol/amount 小写），但**没有** trade_date/复权列——
 		// 分钟行的时间身份就是 ts 本身（北京时间墙钟），复权口径则刻意不入表（见建表注释）。
 		return []string{"ts_code", "scale", "ts", "open", "high", "low", "close", "vol", "amount"}
+	// §REPLAY-INPUTS 2026-11-28 四张新表的写入面白名单（与建表列逐字一致）。
+	// 漏登记的后果不是"报错拒绝"而是更难查的形状：TableColumns 返回 nil ⇒
+	// 调用方拿到空列清单 ⇒ InsertRows 报"列清单为空"；而在已建表的环境里它会退化成
+	// PRAGMA 校验，把"忘了登记白名单"混成"列名非法"，排障方向一开始就错。
+	case "stock_moneyflow_daily":
+		return []string{"ts_code", "trade_date", "main_net", "main_pct", "amount",
+			"small_net", "medium_net", "large_net", "super_large_net", "source", "fetched_at"}
+	case "stock_float_share_daily":
+		return []string{"ts_code", "trade_date", "float_share", "source"}
+	case "sector_map_daily":
+		return []string{"trade_date", "ts_code", "sector", "sector_type"}
+	case "leader_rank_daily":
+		return []string{"trade_date", "ts_code", "sector", "pct_chg", "gain_rank"}
 	}
 	return nil
 }

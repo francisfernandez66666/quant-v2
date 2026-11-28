@@ -1030,14 +1030,9 @@ func (e *Engine) realSoldOrOpenQtyToday(realStore *store.DB, userID, tsCode stri
 // pureTsCode 剥离交易所后缀，返回纯数字代码。
 // 例如：600519.SH → 600519，000001.SZ → 000001，430047.BJ → 430047。
 // 用于构建幂等键（signal_id）和比对持仓代码。
-func pureTsCode(tsCode string) string {
-	for _, suf := range []string{".SH", ".SZ", ".BJ"} {
-		if i := strings.LastIndex(tsCode, suf); i > 0 {
-			return tsCode[:i]
-		}
-	}
-	return tsCode
-}
+// §REPLAY-INPUTS 2026-11-28：实现收进 store.PureCode 单点（本仓曾有三份同职能实现），
+// 这里保留函数名与语义**一字未改**——实盘幂等键的构造点全在本地，改语义等于换键。
+func pureTsCode(tsCode string) string { return store.PureCode(tsCode) }
 
 // sellRealPosition 通过控制器对单一实盘持仓下卖出单。行情缺失时跳过（宁可不卖不以错价报单）。
 // §P1-4（2026-09-15）：卖出单注入 CurrentPrice/PrevClose 行情上下文——此前只填 StalenessMs，
