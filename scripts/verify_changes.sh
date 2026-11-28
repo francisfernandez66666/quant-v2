@@ -30413,3 +30413,54 @@ go test ./internal/backtest -run 'TestSynthesizeEventsSkipsNullIndustry|TestSynt
 [ "${B266_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §266 §BT-NULL-INDUSTRY 锁通过（COALESCE/空板块跳过/行为腿，累计判定点 ${CNT266}）"
 echo ""
+
+# ── §267 §INDUSTRY-BACKFILL（2026-11-28 owner：不能只跳过 NULL，要把能查到的行业真值写回）──
+echo "==> 267 §INDUSTRY-BACKFILL（多源只补缺 / 不覆盖既有 / 幂等回填）..."
+fail267() {
+	echo "--- FAIL: §267 $*"
+	FAIL=1
+	B267_FAILED=1
+}
+CNT267=0
+
+CNT267=$((CNT267 + 1))
+python3 - <<'PY' || fail267 "回填脚本缺关键锚（§267 ①）"
+import pathlib
+p = pathlib.Path("scripts/backfill_stock_industry_gz.py")
+assert p.exists(), "缺 scripts/backfill_stock_industry_gz.py"
+s = p.read_text(encoding="utf-8")
+assert "WHERE ts_code=? AND (industry IS NULL OR industry='')" in s, "UPDATE 不得覆盖已有行业"
+assert "INDUSTRY_BACKFILL_RESULT before=" in s, "缺锚行读数"
+assert "from gen_industry_buckets_gz import" in s, "行业源必须与集中度桶同源"
+assert "try:" in s and "except Exception" in s, "单源失败不得拖垮回填"
+PY
+CNT267=$((CNT267 + 1))
+python3 - <<'PY' || fail267 "回填行为腿未过（§267 ②）"
+import importlib.util, os, sqlite3, sys, tempfile
+spec = importlib.util.spec_from_file_location(
+    "backfill_stock_industry_gz", "scripts/backfill_stock_industry_gz.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.src_baostock = lambda: ({"600000": "stub行业"}, "stub")
+def _boom(): raise RuntimeError("source down")
+mod.src_em = _boom
+mod.src_xq = lambda miss: ({}, "xq")
+fd, path = tempfile.mkstemp(prefix="indbf-", suffix=".db"); os.close(fd)
+db = sqlite3.connect(path)
+db.execute("CREATE TABLE stocks(ts_code TEXT, name TEXT, industry TEXT)")
+db.executemany("INSERT INTO stocks VALUES(?,?,?)", [
+    ("600000.SH", "已有缺", None), ("600001.SH", "已有行业", "既有行业"), ("999999.SZ", "查不到", None)])
+db.commit(); db.close()
+old = sys.argv; sys.argv = ["prog", "--db", path]
+rc = mod.main(); sys.argv = old
+db = sqlite3.connect(path)
+rows = dict(db.execute("SELECT ts_code, industry FROM stocks")); db.close()
+assert rc == 0, "回填应成功, rc=%d" % rc
+assert rows["600000.SH"] == "stub行业", "缺行业未补: %r" % rows["600000.SH"]
+assert rows["600001.SH"] == "既有行业", "已有行业被覆盖: %r" % rows["600001.SH"]
+assert rows["999999.SZ"] is None, "查不到的行业不得编造: %r" % rows["999999.SZ"]
+PY
+
+[ "${B267_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §267 §INDUSTRY-BACKFILL 锁通过（锚行/不覆盖/单源降级/行为腿，累计判定点 ${CNT267}）"
+echo ""
