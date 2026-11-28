@@ -12,6 +12,15 @@ func nan() float64 { return math.NaN() }
 // isNaN 判断是否为 NaN（缺失/无效值统一标记）。
 func isNaN(v float64) bool { return math.IsNaN(v) }
 
+// FactorDayStats 某因子在面板上的日级覆盖与横截面变差（诊断读数，不做判定）。
+//
+// ValueDays=0 ⇒ 装配里根本没有输入（全 NaN）；VaryingDays=0 且 ValueDays>0 ⇒
+// 有值但当日常数 ⇒ 横截面 IC 结构性为 0（IndexChange 这类市场级常量就是这一档）。
+type FactorDayStats struct {
+	ValueDays   int // 至少有一个非 NaN 值的日数
+	VaryingDays int // 当日出现 ≥2 个不同非 NaN 值的日数
+}
+
 // ICRow 单日横截面 IC 结果。
 type ICRow struct {
 	Date string  // 重平衡日期

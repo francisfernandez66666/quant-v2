@@ -215,5 +215,51 @@ class CoverageGateTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
 
 
+class FailureReadoutTest(unittest.TestCase):
+    """边界 5（2026-11-28 收口批）：失败读数必须带 HTTP 状态码，且瞬时失败要重试。
+
+    现场：11-27 08:20 定时器 `SECTOR_MAP_RESULT=ABORT reason=board_list_failed:HTTPError`
+    1 秒内失败，而当天手工重跑是 `OK boards_ok=1057 stocks=5662` —— 是瞬时抖动。
+    旧读数把 `code` 吞掉，"钥匙被拒 / 路径不存在 / 上游 503"三种处置完全不同却同形；
+    旧 unit 又写死 `Restart=no` ⇒ 一次抖动等于整天没有连接键、`ExecStartPost` 的存档步也不跑。
+    """
+
+    def test_describe_keeps_http_status_code(self):
+        import urllib.error
+        exc = urllib.error.HTTPError("http://x", 503, "Service Unavailable", None, None)
+        self.assertIn("503", psm.describe(exc))
+        self.assertIn("HTTPError", psm.describe(exc))
+
+    def test_describe_without_code_stays_short(self):
+        self.assertEqual(psm.describe(RuntimeError("boom")), "RuntimeError")
+
+    def test_with_retry_retries_then_succeeds(self):
+        import urllib.error
+        calls = []
+        saved = psm.time.sleep
+        psm.time.sleep = lambda *_: None
+        try:
+            def fn():
+                calls.append(1)
+                if len(calls) < 3:
+                    raise urllib.error.URLError("flaky")
+                return "ok"
+            self.assertEqual(psm.with_retry("t", fn, attempts=3, base_sleep=0), "ok")
+        finally:
+            psm.time.sleep = saved
+        self.assertEqual(len(calls), 3)
+
+    def test_with_retry_raises_the_last_error(self):
+        saved = psm.time.sleep
+        psm.time.sleep = lambda *_: None
+        try:
+            def fn():
+                raise ValueError("permanent")
+            with self.assertRaises(ValueError):
+                psm.with_retry("t", fn, attempts=2, base_sleep=0)
+        finally:
+            psm.time.sleep = saved
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -672,6 +673,35 @@ func (d *DB) SectorSnapshotsForCode(code, end string) ([]SectorSnapshot, error) 
 		out = append(out, SectorSnapshot{Day: day, Sector: sector})
 	}
 	return out, rows.Err()
+}
+
+// SectorSnapshotFallbackForCode 返回该票 **end 之后最早的一份**归属快照（as-of 向前回填用）。
+//
+// 为什么需要它（2026-11-28 现场，形态＝"腿在但永远说不"）：
+// `SectorSnapshotsForCode(code, end)` 的 `trade_date<=end` 边界在"快照只有一天"的现网形态下
+// 会把整段历史判成"这票没有板块归属"——样本内窗口（发现用 70% 分位，约 2026-09 前）整体早于
+// 唯一那份 20261124 快照 ⇒ ④ 段整块跳过 ⇒ `SectorFlowQuantile` 全 NaN ⇒ 预筛里一行 IC 都没有，
+// 而 `sector_flow_daily` 明明有 123 天数据、`sector_map_daily` 与它 76 个板块全交集。
+//
+// 口径来自 owner 2026-11-28 裁决 2：板块归属是**缓慢变化的维度**，固化一份快照即可，
+// 因此"整段早于首份快照"时允许借最近的一份（回填格数由读侧计入报告头，绝不静默）。
+// 只回**一份**（最早的），不把未来所有快照都搬过来——借多份会让 as-of 序列在历史段里来回跳。
+func (d *DB) SectorSnapshotFallbackForCode(code, end string) (SectorSnapshot, bool, error) {
+	e := cntime.CompactDay(end)
+	if e == "" {
+		return SectorSnapshot{}, false, fmt.Errorf("store: SectorSnapshotFallbackForCode 日尺不可认 %q", end)
+	}
+	var day, sector string
+	err := d.db.QueryRow(`SELECT trade_date, sector FROM sector_map_daily
+		WHERE ts_code=? AND trade_date>? AND TRIM(COALESCE(sector,''))<>''
+		ORDER BY trade_date ASC LIMIT 1`, code, e).Scan(&day, &sector)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SectorSnapshot{}, false, nil
+	}
+	if err != nil {
+		return SectorSnapshot{}, false, err
+	}
+	return SectorSnapshot{Day: day, Sector: sector}, true, nil
 }
 
 // SectorFlowRange 读区间内逐 (日, 板块) 的净流入与成交额，供装配层算**横截面分位**。

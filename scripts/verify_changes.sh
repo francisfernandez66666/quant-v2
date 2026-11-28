@@ -30226,9 +30226,34 @@ PY
 # ⑥ 行为腿：两条新锁必须真跑（静态锚证明不了"装出来有读数"）。
 CNT263=$((CNT263 + 1))
 RESEARCH_RC=0
-go test ./internal/research -run 'TestBuildPanelsCarriesMarketColumns|TestDiscoveryResumeKeyCarriesPanelAssembly|TestSectorMapAsOfSnapshot' -count=1 >/dev/null 2>&1 || RESEARCH_RC=$?
-[ "$RESEARCH_RC" = "0" ] || fail263 "研究侧三条行为腿未过（§263 ⑥）"
+go test ./internal/research -run 'TestBuildPanelsCarriesMarketColumns|TestDiscoveryResumeKeyCarriesPanelAssembly|TestSectorMapAsOfSnapshot|TestSectorMapSnapshotAfterWindow|TestDiscoverySectorQuantileSurvivesLateSnapshot|TestFactorCoverageSplitsBlindCauses' -count=1 >/dev/null 2>&1 || RESEARCH_RC=$?
+[ "$RESEARCH_RC" = "0" ] || fail263 "研究侧行为腿未过（§263 ⑥）"
+
+# ⑦ 归属 as-of 的**向前回填**（2026-11-28 收口批，现场形态＝"腿在但永远说不"）：
+#    发现只用样本内 70% 窗口，整段早于唯一那份快照日 ⇒ `trade_date<=end` 回 0 行
+#    ⇒ ④ 段整块跳过 ⇒ SectorFlowQuantile 全 NaN ⇒ 预筛把它判成"装配没输入"。
+#    现网实测：sector_flow_daily 123 天、板块名 76/76 全交集，而预筛 `无IC行` 里就有它。
+CNT263=$((CNT263 + 1))
+python3 - <<'PY' || fail263 "归属向前回填缺失（§263 ⑦）"
+import pathlib
+s = pathlib.Path("internal/store/replay_inputs.go").read_text(encoding="utf-8")
+assert "func (d *DB) SectorSnapshotFallbackForCode(code, end string) (SectorSnapshot, bool, error)" in s, \
+    "缺 SectorSnapshotFallbackForCode（整段早于首份快照时无处可借）"
+assert "trade_date>?" in s, "回填查询必须取 end 之后最早的一份"
+m = pathlib.Path("internal/research/market_legs.go").read_text(encoding="utf-8")
+assert "SectorSnapshotFallbackForCode(code, end)" in m, "装配层没在「整段早于首份快照」时借最早一份"
+assert "len(snaps) == 0" in m, "回填必须只在没有任何 <=end 快照时触发（有快照时不许借未来）"
+# 负锁：SectorSnapshotsForCode 自己的 end 边界不许被放宽（放宽＝把未来快照混进 as-of 序列）
+st = s.index("func (d *DB) SectorSnapshotsForCode(")
+body = s[st:s.index("\n}\n", st)]
+assert "trade_date<=?" in body, "SectorSnapshotsForCode 的 end 边界被放宽（as-of 会读到未来）"
+# 诊断读数：无 IC 行的两种成因（全 NaN / 当日常数列）必须分家，否则每次都去查装配。
+w = pathlib.Path("internal/research/windowed.go").read_text(encoding="utf-8")
+assert "[discover] 预筛诊断 %s" in w, "预筛诊断行缺失（常数列与全 NaN 会继续同形）"
+assert "func blindStatParts(" in w, "blindStatParts 缺失"
+assert "func FactorCoverage(" in w, "FactorCoverage 缺失"
+PY
 
 [ "${B263_FAILED:-0}" = "0" ] || exit 1
-echo "ok - §263 §DISCOVER-PANELS 锁通过（装配带面板正负两向/B4 回测同口径/断点口径位位置/预筛读数/归属 as-of 与回填计数/三条行为腿，累计判定点 ${CNT263}）"
+echo "ok - §263 §DISCOVER-PANELS 锁通过（装配带面板正负两向/B4 回测同口径/断点口径位位置/预筛读数/归属 as-of 与回填计数/归属向前回填与诊断读数/行为腿，累计判定点 ${CNT263}）"
 echo ""

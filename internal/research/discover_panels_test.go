@@ -16,6 +16,7 @@ package research
 
 import (
 	"math"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -153,6 +154,140 @@ func TestBuildPanelsCarriesMarketColumns(t *testing.T) {
 	}
 	if math.IsNaN(s.SectorGainRank[3]) || s.SectorGainRank[3] != 0.92 {
 		t.Fatalf("龙头分位是逐票查预计算表，无面板时也必须有读数（得 %v）", s.SectorGainRank[3])
+	}
+}
+
+// TestDiscoverySectorQuantileSurvivesLateSnapshot 锁 2026-11-28 现场的端到端形态：
+// **快照只有一天、且晚于整个发现窗口**时，SectorFlowQuantile 仍必须产出 IC 行。
+//
+// 现场读数：`sector_flow_daily` 123 天、`sector_map_daily` 76 个板块与它 76/76 全交集，
+// 而 200 票样本的预筛是 `无IC行=[IndexChange,FlowCapToday,FlowCap5d,SectorFlowQuantile]`。
+// 根因不是数据：发现只用样本内 70% 窗口（约 2026-09 前），整段早于唯一那份 20261124 快照，
+// `SectorSnapshotsForCode(code, end)` 的 `trade_date<=end` 边界因此回 0 行 ⇒ ④ 段整块跳过。
+// 这条用例用"窗口整段早于快照"的夹具直接复现，并锁住两条边界：
+//   - 有归属的票必须算出 IC 行（借最早一份快照回填）；
+//   - 没有归属的票仍必须全 NaN（回填不是"随便给个板块"，不许把连接键的缺失也补上）。
+func TestDiscoverySectorQuantileSurvivesLateSnapshot(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "disc-sector.db"))
+	if err != nil {
+		t.Fatalf("开库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	const days = 12
+	codes := []string{"600001.SH", "600002.SH", "600003.SH", "600004.SH", "600005.SH", "600006.SH"}
+	sectors := []string{"白酒", "白酒", "医药", "医药", "银行", "银行"}
+	rows := make([]map[string]any, 0, len(codes)*days)
+	for k, code := range codes {
+		for i := 0; i < days; i++ {
+			p := float64(100+k*10) + float64(i)*(1.0+float64(k)*0.3)
+			rows = append(rows, map[string]any{
+				"ts_code": code, "trade_date": legsCompact(i), "open": p, "high": p + 1, "low": p - 1,
+				"close": p, "pre_close": p - 1, "change": 1.0, "pct_chg": 1.0 + float64(k)*0.2,
+				"vol": 10000.0, "amount": p * 10000.0, "source": "baostock",
+			})
+		}
+	}
+	// 第 7 只票故意不给归属（负锁：回填的是连接键，不是"人人都有板块"）
+	const orphan = "600007.SH"
+	for i := 0; i < days; i++ {
+		p := float64(300 + i)
+		rows = append(rows, map[string]any{
+			"ts_code": orphan, "trade_date": legsCompact(i), "open": p, "high": p + 1, "low": p - 1,
+			"close": p, "pre_close": p - 1, "change": 1.0, "pct_chg": 0.5,
+			"vol": 10000.0, "amount": p * 10000.0, "source": "baostock",
+		})
+	}
+	if _, err := db.InsertRows("daily", store.TableColumns("daily"), rows); err != nil {
+		t.Fatalf("写日线失败: %v", err)
+	}
+
+	// 归属只存**最后一天**（第 11 日），而发现窗口只到第 8 日 ⇒ 现网形态
+	sm := make(map[string]string, len(codes))
+	for k, code := range codes {
+		sm[code] = sectors[k]
+	}
+	if _, err := db.UpsertSectorMapDay(legsCompact(days-1), sm, nil); err != nil {
+		t.Fatalf("存档板块归属失败: %v", err)
+	}
+	// 板块资金流第 3–6 日（分位只在这几天算得出）
+	flowRows := make([]map[string]any, 0, 12)
+	for _, d := range []int{3, 4, 5, 6} {
+		flowRows = append(flowRows,
+			map[string]any{"trade_date": cntime.DayOf(legsDay(d)), "sector": "白酒", "net_inflow": 30.0, "amount": 100.0, "delta": 0.1},
+			map[string]any{"trade_date": cntime.DayOf(legsDay(d)), "sector": "医药", "net_inflow": 20.0, "amount": 100.0, "delta": 0.07},
+			map[string]any{"trade_date": cntime.DayOf(legsDay(d)), "sector": "银行", "net_inflow": 10.0, "amount": 100.0, "delta": 0.03},
+		)
+	}
+	if _, err := db.InsertRows("sector_flow_daily", []string{"trade_date", "sector", "net_inflow", "amount", "delta"}, flowRows); err != nil {
+		t.Fatalf("写板块资金流失败: %v", err)
+	}
+
+	def, ok := factor.Get("SectorFlowQuantile")
+	if !ok {
+		t.Fatal("SectorFlowQuantile 未注册")
+	}
+	// 窗口 0..8 整段早于快照日 11
+	panels, err := BuildPanels(db, codes, legsCompact(0), legsCompact(8), []factor.Def{def})
+	if err != nil || len(panels) != len(codes) {
+		t.Fatalf("BuildPanels 应装配 %d 只票，得 %d err=%v", len(codes), len(panels), err)
+	}
+	rowsIC := ICByDate(panels, "SectorFlowQuantile", 1, 3)
+	if len(rowsIC) == 0 {
+		t.Fatal("窗口整段早于唯一一份归属快照时，SectorFlowQuantile 也必须产出 IC 行" +
+			"（0 行＝又退回了只看 trade_date<=end 的查询，预筛会把它判成「装配没输入」）")
+	}
+	if got := panels[0].Series.SectorFlowQuantile[3]; math.IsNaN(got) {
+		t.Fatalf("有归属的票第 3 日必须算出分位（得 NaN）")
+	}
+	// 负锁：没有归属行的票不许凭空得到一个板块
+	orphanPanels, err := BuildPanels(db, []string{orphan}, legsCompact(0), legsCompact(8), []factor.Def{def})
+	if err != nil || len(orphanPanels) != 1 {
+		t.Fatalf("孤儿票装配失败: %v", err)
+	}
+	for i, v := range orphanPanels[0].Series.SectorFlowQuantile {
+		if !math.IsNaN(v) {
+			t.Fatalf("没有归属行的票第 %d 日必须 NaN（不许把缺失的连接键也回填），得 %v", i, v)
+		}
+	}
+}
+
+// TestFactorCoverageSplitsBlindCauses 锁诊断读数：无 IC 行的两种成因必须分得开。
+//
+// IndexChange 是每日全市场同一个常数 ⇒ 有值但"变差 0 日"，横截面 IC 结构性为 0；
+// 装配漏了面板的因子则是"全 NaN"。两者在「无 IC 行」这一个读数下同形，
+// 而处置方向相反（一个去修装配、一个是预期行为）。
+func TestFactorCoverageSplitsBlindCauses(t *testing.T) {
+	// 三日、三只票：A 每天给同一个数（常数列），B 每天给不同的数（有变差）
+	panels := make([]*Panel, 0, 3)
+	for k := 0; k < 3; k++ {
+		s := &factor.StockSeries{Dates: []string{"20260301", "20260302", "20260303"}}
+		panels = append(panels, &Panel{
+			Code:   string(rune('A' + k)),
+			Series: s,
+			Factors: map[string][]float64{
+				"Const": {1.0, 1.0, 1.0},
+				"Vary":  {float64(k), float64(k) * 2, float64(k) * 3},
+				"Empty": {math.NaN(), math.NaN(), math.NaN()},
+			},
+		})
+	}
+	if got := FactorCoverage(panels, "Const"); got.ValueDays != 3 || got.VaryingDays != 0 {
+		t.Fatalf("常数列应为 有值3日/变差0日，得 %+v", got)
+	}
+	if got := FactorCoverage(panels, "Vary"); got.ValueDays != 3 || got.VaryingDays != 3 {
+		t.Fatalf("变差列应为 有值3日/变差3日，得 %+v", got)
+	}
+	if got := FactorCoverage(panels, "Empty"); got.ValueDays != 0 || got.VaryingDays != 0 {
+		t.Fatalf("全 NaN 列应为 0/0，得 %+v", got)
+	}
+	parts := blindStatParts([]string{"Const", "Empty"}, map[string]FactorDayStats{
+		"Const": {ValueDays: 3, VaryingDays: 0},
+		"Empty": {ValueDays: 0, VaryingDays: 0},
+	})
+	joined := strings.Join(parts, " ")
+	if !strings.Contains(joined, "Const=有值3日/变差0日") || !strings.Contains(joined, "Empty=全NaN") {
+		t.Fatalf("诊断读数必须把「常数列」与「全 NaN」分家，得 %q", joined)
 	}
 }
 

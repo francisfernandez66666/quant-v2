@@ -35,6 +35,12 @@ User=quant
 Group=quant
 # 496 个行业板块 + 554 个概念板块，逐板块取成分（含分页），实测 5–8 分钟。
 TimeoutStartSec=1500
-# 失败不是"系统故障"，是"今天这条腿弃权"：不要 Restart，也不要让 unit 停在 failed 刷告警，
-# 判读靠 SECTOR_MAP_RESULT=OK|ABORT 那一行与 journal。
-Restart=no
+# ★ 失败要重试（2026-11-28 收口批改判，依据是 11-27 08:20 的实录）：
+# 那天 `SECTOR_MAP_RESULT=ABORT reason=board_list_failed:HTTPError` 在 0 秒内失败，
+# 而同一条命令当天手工重跑是 OK（boards_ok=1057 stocks=5662）——**瞬时**失败（中继/WG/上游抖），
+# 不是"这条腿今天没数"。旧注释写"不要 Restart"，代价是整天没有连接键、且 ExecStartPost 的
+# 存档步（sector_map_daily / leader_rank_daily）也一起不跑 ⇒ 历史归属永远只有一天。
+# 生产者本身"全量或弃权"（残表不覆盖旧文件），所以重试不会写坏任何东西。
+# 脚本内部另有 3 次 board-list 重试（20s/40s 退避），这里再兜一层进程级重启。
+Restart=on-failure
+RestartSec=180

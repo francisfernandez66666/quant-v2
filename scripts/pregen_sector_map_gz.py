@@ -69,6 +69,40 @@ def die(reason):
     sys.exit(1)
 
 
+def describe(exc):
+    """异常 → 可读的一行归因（**必须带 HTTP 状态码**）。
+
+    2026-11-27 08:20 现场：`SECTOR_MAP_RESULT=ABORT reason=board_list_failed:HTTPError`
+    ——类名把 `code`（401/404/502/503…）整个吞掉了，而"钥匙被拒""路径不存在""上游 503"
+    三种情况的处置完全不同（补钥匙 / 换路径 / 等它自己恢复）。这一行是这条腿唯一的失败读数，
+    丢掉状态码等于让下一次排障从零开始。
+    """
+    code = getattr(exc, "code", None)
+    if code:
+        return "%s:%s" % (exc.__class__.__name__, code)
+    return exc.__class__.__name__
+
+
+def with_retry(label, fn, attempts=3, base_sleep=20):
+    """对**瞬时**失败重试（中继/WG/上游抖一下很常见，见 2026-11-27 08:20 实录）。
+
+    只重试到 attempts 次；最后一次的异常照原样抛出，由调用方 die。
+    幂等性由调用方保证（board_rows 只读、clist_pages 要么完整要么抛错）。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except (urllib.error.URLError, RuntimeError, ValueError, OSError) as exc:
+            last = exc
+            if i + 1 < attempts:
+                print("SECTOR_MAP_RETRY step=%s attempt=%d/%d err=%s" % (
+                    label, i + 1, attempts, describe(exc)))
+                sys.stdout.flush()
+                time.sleep(base_sleep * (i + 1))
+    raise last
+
+
 def load_endpoint():
     """从运营账号在册快照取（gateway_url, token）。
 
@@ -208,7 +242,7 @@ def build_map(base, token, industry, concept):
             except (urllib.error.URLError, RuntimeError, ValueError, OSError) as exc:
                 stats["boards_failed"] += 1
                 if len(stats["failed_codes"]) < 12:
-                    stats["failed_codes"].append("%s:%s" % (bk_code, exc.__class__.__name__))
+                    stats["failed_codes"].append("%s:%s" % (bk_code, describe(exc)))
                 continue
             if not codes:
                 stats["boards_failed"] += 1
@@ -227,10 +261,10 @@ def main():
     day = datetime.now().astimezone().strftime("%Y%m%d")
     base, token = load_endpoint()
     try:
-        industry = board_rows(base, token, INDUSTRY_FS)
-        concept = board_rows(base, token, CONCEPT_FS)
+        industry = with_retry("board_list_industry", lambda: board_rows(base, token, INDUSTRY_FS))
+        concept = with_retry("board_list_concept", lambda: board_rows(base, token, CONCEPT_FS))
     except (urllib.error.URLError, RuntimeError, ValueError, OSError) as exc:
-        die("board_list_failed:%s" % exc.__class__.__name__)
+        die("board_list_failed:%s" % describe(exc))
     if not industry and not concept:
         die("board_list_empty")
     print("SECTOR_MAP_BOARDS industry=%d concept=%d" % (len(industry), len(concept)))

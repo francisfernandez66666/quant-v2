@@ -280,6 +280,34 @@ func windowDefs(ids []string) []factor.Def {
 	return defs
 }
 
+// blindStatParts 把"无 IC 行"因子的诊断压成一行读数（成因分家，不做判定）。
+//
+// 三档含义（读的人据此决定下一步动作）：
+//   - 全NaN(装配没输入)        → 查装配/数据面，这是接线缺陷；
+//   - 有值N日/变差0日(常数列)  → 横截面 IC 结构性为 0，属预期（IndexChange 这类市场级常量）；
+//   - 有值N日/变差N日          → 有变差却没有一行 IC ⇒ 多半是前瞻收益/样本闸（读数弱，不是没接）。
+func blindStatParts(blind []string, stats map[string]FactorDayStats) []string {
+	if len(blind) == 0 || len(stats) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(blind))
+	for _, fid := range blind {
+		st, ok := stats[fid]
+		if !ok {
+			continue // 命中断点跳过的窗口没有面板 ⇒ 不编一个数
+		}
+		switch {
+		case st.ValueDays == 0:
+			parts = append(parts, fid+"=全NaN(装配没输入)")
+		case st.VaryingDays == 0:
+			parts = append(parts, fmt.Sprintf("%s=有值%d日/变差0日(当日常数列,横截面IC结构性为0)", fid, st.ValueDays))
+		default:
+			parts = append(parts, fmt.Sprintf("%s=有值%d日/变差%d日(读数弱,查样本闸/前瞻收益)", fid, st.ValueDays, st.VaryingDays))
+		}
+	}
+	return parts
+}
+
 // briefIDs 把一组 ID 压成一行读数（超过 n 个截断并注明总数）。
 // 读数里点名"哪些因子没进候选池"比只打"通过 3/40"有用得多：前者能直接指认接线断在哪一层。
 func briefIDs(ids []string, n int) string {
@@ -408,11 +436,69 @@ func windowCompositeIC(db *store.DB, codes []string, factors []string, weights m
 	return all
 }
 
+// FactorCoverage 统计某因子在面板集合上的"看得见"程度（诊断读数用）。
+//
+// 为什么需要它（2026-11-28 现场）：预筛只报"无 IC 行"，而无 IC 行有两种完全不同的成因——
+//
+//	① 装配里没有输入 ⇒ 整列 NaN（接线缺陷，要先查 BuildPanels 有没有带面板）；
+//	② 有输入但当日横截面**没有变差** ⇒ 结构性不可能有横截面 IC（如 IndexChange 是每日全市场
+//	   同一个常数、SectorFlowQuantile 在同板块内共享一个值）。
+//
+// 两者在"无 IC 行"这一个读数下同形，而处置方向完全相反（一个去修装配，一个是预期行为）。
+// 这一层只回答"值有多少、变差有多少"，不做任何判定——判据仍归调用方。
+//
+// English: per-factor day-level coverage/variation stats, used only to tell "no input at all"
+// apart from "input exists but has no cross-sectional variation" (the latter can never yield IC).
+func FactorCoverage(panels []*Panel, factorID string) FactorDayStats {
+	type dayStat struct {
+		first float64
+		has   bool
+		vary  bool
+	}
+	acc := make(map[string]*dayStat)
+	for _, p := range panels {
+		col, ok := p.Factors[factorID]
+		if !ok || p.Series == nil {
+			continue
+		}
+		for i, d := range p.Series.Dates {
+			if i >= len(col) {
+				break
+			}
+			v := col[i]
+			if isNaN(v) {
+				continue
+			}
+			st := acc[d]
+			if st == nil {
+				st = &dayStat{}
+				acc[d] = st
+			}
+			if !st.has {
+				st.first, st.has = v, true
+			} else if v != st.first {
+				st.vary = true
+			}
+		}
+	}
+	var out FactorDayStats
+	for _, st := range acc {
+		if st.has {
+			out.ValueDays++
+		}
+		if st.vary {
+			out.VaryingDays++
+		}
+	}
+	return out
+}
+
 // windowICByAllFactors 每窗口只装配一次（含全部候选因子），算出窗口内**所有**因子的
 // 单因子 IC 行（预筛阶段，装配次数从「因子数×窗口数」降到「窗口数」）。
-// 断点 stage="pre"；prog 上报窗口完成进度。English: single-factor pre-screen per window;
-// checkpoint stage "pre", progress reported per window.
-func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min int, chunks [][2]string, dates []string, ck *winCkpt, prog *stageProgress) map[string][]ICRow {
+// 断点 stage="pre"；prog 上报窗口完成进度。stats 非 nil 时顺带累计"无 IC 行"因子的
+// 覆盖/变差诊断（只在真的装配过的窗口上算；命中断点跳过的窗口没有面板，不补算）。
+// English: single-factor pre-screen per window; checkpoint stage "pre", progress reported per window.
+func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min int, chunks [][2]string, dates []string, ck *winCkpt, prog *stageProgress, stats map[string]FactorDayStats) map[string][]ICRow {
 	out := make(map[string][]ICRow, len(fids))
 	if len(fids) == 0 {
 		return out
@@ -455,6 +541,20 @@ func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min in
 			}
 			winAll[fid] = kept
 		}
+		// 诊断：本窗一行 IC 都没算出来的因子，记下"有值多少日 / 有变差多少日"。
+		// 只对盲因子算，正常因子一次都不多扫——全市场窗口里这是纯额外成本。
+		if stats != nil {
+			for _, fid := range fids {
+				if len(winAll[fid]) > 0 {
+					continue
+				}
+				st := FactorCoverage(panels, fid)
+				acc := stats[fid]
+				acc.ValueDays += st.ValueDays
+				acc.VaryingDays += st.VaryingDays
+				stats[fid] = acc
+			}
+		}
 		ck.save(w, winAll)
 		prog.tick()
 	}
@@ -486,7 +586,7 @@ func WindowFactorIC(db *store.DB, codes []string, start, end string, fids []stri
 	chunks := windowChunks(dates, windowDays)
 	// §ADJ-BASIS：去重用的逐因子 IC 同样是从 HfqBars 装配出来的面板，口径位必须在 key 里。
 	ck := &winCkpt{db: db, resumeKey: "pfac-dedup:" + start + ":" + end + adjBasisTag, stage: "dedup"}
-	return windowICByAllFactors(db, codes, fids, h, min, chunks, dates, ck, newStageProgress(0, 1, len(chunks)))
+	return windowICByAllFactors(db, codes, fids, h, min, chunks, dates, ck, newStageProgress(0, 1, len(chunks)), nil)
 }
 
 // windowCompositeIR 返回全区间复合 |IR|（窗口分块，断点 stage 含权重标识）。
@@ -862,7 +962,8 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 	// 进度带 5%–35%。English: single-factor pre-screen (progress band 5–35%), in-sample only.
 	var pre []string
 	preCk := &winCkpt{db: db, resumeKey: rkBase, stage: "pre"}
-	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1], preCk, newStageProgress(5, 35, len(inChunks)))
+	blindStats := make(map[string]FactorDayStats)
+	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1], preCk, newStageProgress(5, 35, len(inChunks)), blindStats)
 	for _, fid := range opts.Factors {
 		rows := allIC[fid]
 		if len(rows) < opts.MinDays {
@@ -888,6 +989,12 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		}
 		log.Printf("[discover] 预筛 通过=%d/%d 无IC行=%d %v（无 IC 行=结构性弃权：先查该因子在装配里有没有输入；"+
 			"市场级因子看 BuildPanels 是否带面板）", len(pre), len(opts.Factors), len(blind), briefIDs(blind, 12))
+		// §PANEL-READOUT 第二行：把"无 IC 行"的两种成因分家（2026-11-28 现场：IndexChange 是
+		// 每日全市场常量 ⇒ 横截面 IC 结构性为 0；而 SectorFlowQuantile 全 NaN 是真接线缺陷）。
+		// 折成一行会让人每次都去查装配，方向反了。判据只报事实，不下结论。
+		if parts := blindStatParts(blind, blindStats); len(parts) > 0 {
+			log.Printf("[discover] 预筛诊断 %s", strings.Join(parts, " "))
+		}
 	}
 	if len(pre) == 0 {
 		return empty("预筛后无有效因子")

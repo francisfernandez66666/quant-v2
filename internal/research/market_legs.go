@@ -145,6 +145,16 @@ func fillMarketLegs(db *store.DB, s *factor.StockSeries, code, start, end string
 	//    回填格数记进 Panels（报告头 `sector_map=`），方向是"看得见"，不是"偷偷放宽"。
 	if p != nil {
 		snaps, err := db.SectorSnapshotsForCode(code, end)
+		// ★ 整段早于该票首份快照（现网"只有单日快照"的必然形态，2026-11-28 现场）：
+		// 带 `trade_date<=end` 边界的查询在这里回 0 行，④ 段被整块跳过 ⇒ 分位列全 NaN
+		// ⇒ 预筛"无 IC 行"，而 sector_flow_daily 有 123 天、板块名 76/76 全交集。
+		// 借**最早的一份**未来快照回填（owner 裁决 2：归属是缓慢变化的维度），
+		// 回填格数照常计入 Panels（报告头 `sector_map_backfill=`），方向是"看得见"。
+		if err == nil && len(snaps) == 0 {
+			if fb, ok, ferr := db.SectorSnapshotFallbackForCode(code, end); ferr == nil && ok {
+				snaps = []store.SectorSnapshot{fb}
+			}
+		}
 		if err == nil && len(snaps) > 0 {
 			cur := 0
 			for i, d := range s.Dates {

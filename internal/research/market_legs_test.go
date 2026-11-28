@@ -284,6 +284,57 @@ func TestSectorMapAsOfSnapshot(t *testing.T) {
 	}
 }
 
+// TestSectorMapSnapshotAfterWindow 锁 2026-11-28 现场那一条"腿在但永远说不"：
+// 快照只有一天、且那一天**晚于整个装配窗口**时（发现用样本内 70% 分位，窗口整段早于快照日），
+// 带 `trade_date<=end` 边界的查询回 0 行 ⇒ ④ 段被整块跳过 ⇒ 分位列全 NaN ⇒ 预筛"无 IC 行"。
+// 现网读数就是这条：sector_flow_daily 123 天、板块名 76/76 全交集，SectorFlowQuantile 却一行 IC 都没有。
+//
+// 断言三件：窗口内**有资金流的日子**必须算出分位（借最早的一份未来快照）、
+// 回填格数等于整窗格数（看得见前视）、以及边界仍然生效（end 之后不许有第二份被借进来）。
+func TestSectorMapSnapshotAfterWindow(t *testing.T) {
+	db := newLegsDB(t)
+	const code = "600519.SH"
+	// 快照只在第 9 日（晚于本次装配窗口 0..5）
+	if _, err := db.UpsertSectorMapDay(legsCompact(9), map[string]string{code: "白酒"}, nil); err != nil {
+		t.Fatalf("存档板块归属失败: %v", err)
+	}
+	flowRows := []map[string]any{
+		{"trade_date": cntime.DayOf(legsDay(3)), "sector": "白酒", "net_inflow": 30.0, "amount": 100.0, "delta": 0.1},
+		{"trade_date": cntime.DayOf(legsDay(3)), "sector": "银行", "net_inflow": 10.0, "amount": 100.0, "delta": 0.05},
+		{"trade_date": cntime.DayOf(legsDay(3)), "sector": "医药", "net_inflow": 20.0, "amount": 100.0, "delta": 0.08},
+	}
+	if _, err := db.InsertRows("sector_flow_daily", []string{"trade_date", "sector", "net_inflow", "amount", "delta"}, flowRows); err != nil {
+		t.Fatalf("写板块资金流失败: %v", err)
+	}
+
+	start, end := legsCompact(0), legsCompact(5)
+	p := LoadPanels(db, start, end)
+	if got := p.SectorQuantileDayCount(); got != 1 {
+		t.Fatalf("板块分位面板应有 1 天（第 3 日），得 %d", got)
+	}
+	s, err := AssembleWithPanels(db, code, start, end, p)
+	if err != nil || s == nil {
+		t.Fatalf("带面板装配失败: %v", err)
+	}
+	if s.SectorFlowQuantile[3] != 100 {
+		t.Fatalf("整窗早于快照日时也必须借最早一份快照算出分位（得 %v；NaN 表示回退到了只看 <=end 的查询）",
+			s.SectorFlowQuantile[3])
+	}
+	if !math.IsNaN(s.SectorFlowQuantile[4]) {
+		t.Fatalf("没有板块资金流的日期仍必须 NaN，得 %v", s.SectorFlowQuantile[4])
+	}
+	if got := p.SectorBackfillCells(); got != 6 {
+		t.Fatalf("整窗 6 格都是借用未来快照，回填格数应为 6，得 %d", got)
+	}
+	// 边界仍生效：end 之后才有的快照不许被"提前"当成更早的一份（这里只借最早那一份）
+	if fb, ok, err := db.SectorSnapshotFallbackForCode(code, legsCompact(5)); err != nil || !ok || fb.Day != legsCompact(9) {
+		t.Fatalf("回填快照必须是 end 之后最早的那一份（%s），得 %+v ok=%v err=%v", legsCompact(9), fb, ok, err)
+	}
+	if _, ok, err := db.SectorSnapshotFallbackForCode("999999.SH", legsCompact(5)); err != nil || ok {
+		t.Fatalf("没有快照的票必须回 ok=false（不许编一个板块名），得 ok=%v err=%v", ok, err)
+	}
+}
+
 func TestMarketLegsWithNilPanelsStillAssembles(t *testing.T) {
 	db := newLegsDB(t)
 	s, err := AssembleWithPanels(db, "600519.SH", legsCompact(0), legsCompact(11), nil)
