@@ -34,10 +34,26 @@ type Panel struct {
 }
 
 // BuildPanel 装配单只股票并计算指定因子的值。
+//
+// ★ 必须带市场级面板（owner 2026-11-28：「不能接线因子做完了，不拿去回测挖掘新战法」）。
+// 不带面板时 IndexChange / FlowToday / Flow5d / FlowCapToday / FlowCap5d / SectorFlowQuantile /
+// SectorGainRank 七列**结构性全 NaN**，于是自动研究（discover-factors 的单因子预筛与贪心选择）
+// 永远看不见它们——七枚因子在册、在打分、却一条新战法都挖不出来，而读数上一切正常
+// （预筛只是"没进候选池"，不会报错）。批量装配请走 BuildPanels：那里只载一次面板，
+// 这里单票版自己载一次，避免 4000 只票各读一遍 D1 / 板块资金流。
+//
 // English: BuildPanel assembles one stock and computes the given factors.
-// （BuildPanel assembles one stock and computes the given factors.）
+// It must carry the market-level panels, otherwise the seven §REPLAY-INPUTS columns are all NaN
+// and automated discovery can never select them (no error is raised — the factors simply never
+// enter the candidate pool).
 func BuildPanel(db *store.DB, code, start, end string, defs []factor.Def) (*Panel, error) {
-	series, err := Assemble(db, code, start, end)
+	return BuildPanelWithMarket(db, code, start, end, defs, LoadPanels(db, start, end))
+}
+
+// BuildPanelWithMarket 同上，但复用调用方已装配好的市场级面板（批量装配的唯一正确姿势）。
+// English: same as BuildPanel but reuses the caller's market panels (the only correct batch shape).
+func BuildPanelWithMarket(db *store.DB, code, start, end string, defs []factor.Def, mp *Panels) (*Panel, error) {
+	series, err := AssembleWithPanels(db, code, start, end, mp)
 	if err != nil {
 		return nil, err
 	}
@@ -57,12 +73,24 @@ func BuildPanel(db *store.DB, code, start, end string, defs []factor.Def) (*Pane
 }
 
 // BuildPanels 装配一批股票的因子面板（股票无行情时跳过并记录）。
+//
+// 市场级面板在这里**只载一次**再逐票复用：这是"新因子真的进了研究"的唯一入口。
+// 逐票各载一次会把 D1 与板块资金流读 4000 遍（2 核 4G / researchd 500M 配额下直接拖死），
+// 而不载则七枚新因子全 NaN、自动研究永远挖不到它们（见 BuildPanel 注释）。
+//
 // English: BuildPanels assembles panels for many stocks, skipping those without data.
-// （BuildPanels assembles panels for many stocks, skipping those without data.）
+// The market panels are loaded exactly once and reused for every stock — this is the only place
+// that makes the §REPLAY-INPUTS factors visible to automated discovery.
 func BuildPanels(db *store.DB, codes []string, start, end string, defs []factor.Def) ([]*Panel, error) {
+	return BuildPanelsWithMarket(db, codes, start, end, defs, LoadPanels(db, start, end))
+}
+
+// BuildPanelsWithMarket 批量装配并复用调用方已装配好的市场级面板。
+// English: batch assembly reusing the caller's market panels.
+func BuildPanelsWithMarket(db *store.DB, codes []string, start, end string, defs []factor.Def, mp *Panels) ([]*Panel, error) {
 	var panels []*Panel
 	for _, code := range codes {
-		p, err := BuildPanel(db, code, start, end, defs)
+		p, err := BuildPanelWithMarket(db, code, start, end, defs, mp)
 		if err != nil {
 			// 无行情/区间外股票跳过
 			// English: skip stocks without market data / outside the range.

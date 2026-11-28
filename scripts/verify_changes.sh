@@ -30128,3 +30128,107 @@ PY
 [ "${B262_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §262 §REPLAY-INTEGRATION 锁通过（整树编译/改动包全测/日尺两条行为腿/注释双闸/两载体构建/三派生链四零/混量纲不回潮/日尺同源，累计判定点 ${CNT262}）"
 echo ""
+
+# ── §263 §DISCOVER-PANELS（2026-11-28：自动研究必须带市场级面板 + 归属 as-of + 断点口径位）──
+# 现场形态（owner 裁决原文：「不能接线因子做完了，不拿去回测挖掘新战法」）：
+# 七枚新因子在册、在打分、载体也烘好了，但 discover-factors 的装配走的是不带面板的 `Assemble`
+# ⇒ D1 / IndexChange / SectorFlowQuantile 三列**结构性全 NaN** ⇒ 预筛里一行 IC 都没有
+# ⇒ 永远进不了候选池、一条新战法都挖不出来，而整条链照常跑完、日志里一个错都不报。
+# 本段锁四件事：装配带面板（正负两向）/ 断点键带装配口径位 / 预筛读数行在位 / 行为腿在册。
+echo "==> 263 §DISCOVER-PANELS（研究装配带面板 / 断点口径位 / 预筛读数 / 归属 as-of）..."
+fail263() {
+	echo "--- FAIL: §263 $*"
+	FAIL=1
+	B263_FAILED=1
+}
+CNT263=0
+
+# ① 批量与单票装配都必须带面板（正锁），且批量必须"只载一次"再复用。
+CNT263=$((CNT263 + 1))
+python3 - <<'PY' || fail263 "BuildPanel/BuildPanels 没带市场级面板（§263 ①）"
+import pathlib
+s = pathlib.Path("internal/research/panel.go").read_text(encoding="utf-8")
+code = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("//"))
+assert "func BuildPanel(db *store.DB, code, start, end string, defs []factor.Def) (*Panel, error) {" in code
+assert "return BuildPanelWithMarket(db, code, start, end, defs, LoadPanels(db, start, end))" in code, \
+    "单票版没走带面板的实现"
+assert "func BuildPanels(db *store.DB, codes []string, start, end string, defs []factor.Def) ([]*Panel, error) {" in code
+assert "return BuildPanelsWithMarket(db, codes, start, end, defs, LoadPanels(db, start, end))" in code, \
+    "批量版没走带面板的实现"
+# 批量里必须**只载一次**面板：逐票 LoadPanels 会把 D1/板块资金流读 4000 遍（researchd 500M 配额下直接拖死）。
+st = code.index("func BuildPanelsWithMarket(")
+body = code[st:code.index("\nfunc ", st + 10)]
+assert "LoadPanels(" not in body, "BuildPanelsWithMarket 内部又载面板＝逐票重载"
+assert "BuildPanelWithMarket(" in body, "BuildPanelsWithMarket 没转调单票带面板实现"
+PY
+
+# ② 带面板的实现必须转调 AssembleWithPanels；负锁：研究装配面不许再出现裸 Assemble。
+CNT263=$((CNT263 + 1))
+python3 - <<'PY' || fail263 "研究装配退回裸 Assemble（§263 ②）"
+import pathlib
+s = pathlib.Path("internal/research/panel.go").read_text(encoding="utf-8")
+code = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("//"))
+assert "series, err := AssembleWithPanels(db, code, start, end, mp)" in code, \
+    "BuildPanelWithMarket 没用 AssembleWithPanels（七列会全 NaN）"
+assert "Assemble(db, code, start, end)" not in code, "研究装配面又出现裸 Assemble（市场级列全 NaN）"
+# B4 全链路回测同一口径：chain.go 的批量装配也必须带面板。
+c = pathlib.Path("internal/backtest/chain.go").read_text(encoding="utf-8")
+cc = "\n".join(l for l in c.splitlines() if not l.lstrip().startswith("//"))
+assert "mp := research.LoadPanels(db, start, end)" in cc, "B4 回测批量装配没载面板"
+assert "research.AssembleWithPanels(db, code, start, end, mp)" in cc, "B4 回测没用带面板装配"
+assert "research.Assemble(db, code, start, end)" not in cc, "B4 回测退回裸 Assemble"
+PY
+
+# ③ 断点键必须带装配口径位，且必须排在复权口径位之前（TrimSuffix 造旧键那条锁依赖它）。
+CNT263=$((CNT263 + 1))
+python3 - <<'PY' || fail263 "发现断点键缺面板口径位（§263 ③）"
+import pathlib
+w = pathlib.Path("internal/research/windowed.go").read_text(encoding="utf-8")
+st = w.index("func discoveryResumeKey(")
+body = w[st:w.index("\n}\n", st)]
+# 顺序判据必须剥注释再判：这条锁的说明注释里就写着两个名字（按原始文本判会把好代码判红）。
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+assert "panelAssemblyTag" in code, "断点键没带面板装配口径位（修好装配仍会命中全 NaN 的旧断点）"
+assert code.index("panelAssemblyTag") < code.index("adjBasisTag"), \
+    "口径位必须排在 adjBasisTag 之前（TrimSuffix(adjBasisTag) 造旧键的锁会变哑）"
+p = pathlib.Path("internal/research/panels.go").read_text(encoding="utf-8")
+assert 'const panelAssemblyTag = "mp' in p, "panelAssemblyTag 常量缺失/改名"
+PY
+
+# ④ 预筛读数行必须在位：这是唯一能当场分辨"没有读数"与"读数弱"的地方。
+CNT263=$((CNT263 + 1))
+python3 - <<'PY' || fail263 "预筛读数行缺失（§263 ④）"
+import pathlib
+w = pathlib.Path("internal/research/windowed.go").read_text(encoding="utf-8")
+assert "[discover] 预筛 通过=%d/%d 无IC行=%d" in w, "预筛读数行缺失（新因子被结构性弃权时无从指认）"
+assert "func briefIDs(" in w, "briefIDs 缺失"
+PY
+
+# ⑤ 归属 as-of：store 侧必须给快照序列（不是铺满自然日的映射）+ 交易日清单来自 daily；
+#    装配侧必须做 as-of 线性扫描并计回填格数；报告头必须带 sector_map_backfill。
+CNT263=$((CNT263 + 1))
+python3 - <<'PY' || fail263 "板块归属 as-of 口径缺失（§263 ⑤）"
+import pathlib
+s = pathlib.Path("internal/store/replay_inputs.go").read_text(encoding="utf-8")
+assert "func (d *DB) SectorSnapshotsForCode(code, end string) ([]SectorSnapshot, error)" in s
+assert "ORDER BY trade_date ASC" in s, "快照序列必须升序（as-of 扫描依赖它）"
+assert "func (d *DB) TradeDaysBetween(start, end string) ([]string, error)" in s
+assert "SELECT DISTINCT trade_date FROM daily" in s, "交易日清单必须来自 daily（日历日会造出假截面）"
+m = pathlib.Path("internal/research/market_legs.go").read_text(encoding="utf-8")
+assert "SectorSnapshotsForCode(code, end)" in m, "装配层没走快照序列"
+assert "p.noteSectorBackfill()" in m, "回填格数没计数（前视会变成隐形）"
+b = pathlib.Path("internal/btreplay/series_input.go").read_text(encoding="utf-8")
+assert "sector_map_backfill=%d" in b, "报告头缺 sector_map_backfill 读数"
+d = pathlib.Path("cmd/dataload/replay_inputs.go").read_text(encoding="utf-8")
+assert "as_of=%v backfill_days=%d" in d, "leader-rank 读数缺 as_of/backfill_days"
+PY
+
+# ⑥ 行为腿：两条新锁必须真跑（静态锚证明不了"装出来有读数"）。
+CNT263=$((CNT263 + 1))
+RESEARCH_RC=0
+go test ./internal/research -run 'TestBuildPanelsCarriesMarketColumns|TestDiscoveryResumeKeyCarriesPanelAssembly|TestSectorMapAsOfSnapshot' -count=1 >/dev/null 2>&1 || RESEARCH_RC=$?
+[ "$RESEARCH_RC" = "0" ] || fail263 "研究侧三条行为腿未过（§263 ⑥）"
+
+[ "${B263_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §263 §DISCOVER-PANELS 锁通过（装配带面板正负两向/B4 回测同口径/断点口径位位置/预筛读数/归属 as-of 与回填计数/三条行为腿，累计判定点 ${CNT263}）"
+echo ""

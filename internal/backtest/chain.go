@@ -512,10 +512,15 @@ func shiftDate(s string, d int) (string, error) {
 }
 
 // assembleAll 装配一批股票并预计算规则因子。
+//
+// ★ 市场级面板只载一次（§REPLAY-INPUTS，2026-11-28）：不带面板时七枚新因子列全 NaN，
+// B4 全链路回测与自动研究就永远"看不见"它们——候选战法里的新因子会被静默弃权，
+// 而回测读数照常产出（这就是"接线做完了但没拿去用"的现场形态）。
 func assembleAll(db *store.DB, codes []string, start, end string, rule SignalRule) (map[string]*stockData, error) {
 	out := make(map[string]*stockData, len(codes))
+	mp := research.LoadPanels(db, start, end)
 	for _, code := range codes {
-		series, err := research.Assemble(db, code, start, end)
+		series, err := research.AssembleWithPanels(db, code, start, end, mp)
 		if err != nil {
 			continue
 		}

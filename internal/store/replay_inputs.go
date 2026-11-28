@@ -510,6 +510,33 @@ func (d *DB) FloatSharesForCodeRange(code, start, end string) (map[string]float6
 	return out, rows.Err()
 }
 
+// TradeDaysBetween 区间内 daily 出现过的交易日（升序、紧凑）。
+//
+// 用于"按交易日遍历"的横截面预计算（龙头分位的 as-of 回填）：交易日清单必须来自行情本身，
+// 不能用日历日——休市日没有截面，硬算等于把上一日的涨跌幅重复写一遍，
+// 而 `leader_rank_daily` 上多出来的那些行在回放里会被当成真读数。
+func (d *DB) TradeDaysBetween(start, end string) ([]string, error) {
+	s, e := cntime.CompactDay(start), cntime.CompactDay(end)
+	if s == "" || e == "" {
+		return nil, fmt.Errorf("store: TradeDaysBetween 日尺不可认 %q..%q", start, end)
+	}
+	rows, err := d.db.Query(`SELECT DISTINCT trade_date FROM daily
+		WHERE trade_date BETWEEN ? AND ? ORDER BY trade_date ASC`, s, e)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var day string
+		if err := rows.Scan(&day); err != nil {
+			return nil, err
+		}
+		out = append(out, day)
+	}
+	return out, rows.Err()
+}
+
 // SectorMapDaysBetween 库里有哪些归属快照日（升序、紧凑）。
 // 只回日期清单，装配层据此决定"as-of 到哪一份"——把选择权留在读侧，
 // 生产者的职责只是每天存一份。
@@ -536,7 +563,7 @@ func (d *DB) SectorMapDaysBetween(start, end string) ([]string, error) {
 }
 
 // SectorMapRowsOn 取某一日快照的全部 (ts_code → 板块名)。
-// 供"当日截面"类生产者用（如龙头分位预计算）；逐票装配请走 SectorMapForCodeRange（走索引）。
+// 供"当日截面"类生产者用（如龙头分位预计算）；逐票装配请走 SectorSnapshotsForCode（走索引）。
 func (d *DB) SectorMapRowsOn(day string) (map[string]string, error) {
 	compact := cntime.CompactDay(day)
 	if compact == "" {
@@ -602,30 +629,47 @@ func (d *DB) SectorMapOnDay(day string) (map[string]string, error) {
 	return d.SectorMapRowsOn(day)
 }
 
+// SectorSnapshot 一只票的一条板块归属快照（trade_date 紧凑）。
+type SectorSnapshot struct {
+	Day    string
+	Sector string
+}
+
+// SectorSnapshotsForCode 返回该票截至 end 的**全部**板块归属快照（按日升序）。
+//
+// 为什么返回快照序列而不是"逐日映射"：调用方手里才有交易日清单（StockSeries.Dates），
+// 在这里按自然日铺开会把周末与停牌日也铺出来——806 日 × 5662 票的一张表能在回放进程里
+// 吃掉几百 MB，而 researchd 的配额是 500M（MemoryHigh）。as-of 解析交给调用方，
+// 一次线性扫描即可（见 research.fillMarketLegs ④）。
+//
+// ★ owner 2026-11-28 裁决：板块归属是**缓慢变化的维度**，固化一份、每天更新一份即可。
+// 因此"早于首份快照的日期"允许回填首份（否则 sector_flow_daily 那 126 天里只有
+// 最后几天能接上连接键，"腿接上了"在读数上等于没接）。回填格数由读侧计入报告头，
+// 不静默——方案 §10 裁决 2。
+//
 // 为什么逐票查而不是把全表读进内存：一年快照 ≈ 250 日 × 5662 只 ≈ 140 万条，
-// 在 2 核 4G、researchd 只有 500M 配额（MemoryHigh）的机器上，
-// 让回放进程为了一张连接键表吃 200 MB 是把别的腿挤死。
 // 主键前缀 (ts_code, trade_date) 已建索引（idx_sectormap_code），单票一次查询只回几十~几百行。
-func (d *DB) SectorMapForCodeRange(code, start, end string) (map[string]string, error) {
-	s, e := cntime.CompactDay(start), cntime.CompactDay(end)
-	if s == "" || e == "" {
-		return nil, fmt.Errorf("store: SectorMapForCodeRange 日尺不可认 %q..%q", start, end)
+func (d *DB) SectorSnapshotsForCode(code, end string) ([]SectorSnapshot, error) {
+	e := cntime.CompactDay(end)
+	if e == "" {
+		return nil, fmt.Errorf("store: SectorSnapshotsForCode 日尺不可认 %q", end)
 	}
 	rows, err := d.db.Query(`SELECT trade_date, sector FROM sector_map_daily
-		WHERE ts_code=? AND trade_date BETWEEN ? AND ?`, code, s, e)
+		WHERE ts_code=? AND trade_date<=? ORDER BY trade_date ASC`, code, e)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make(map[string]string)
+	var out []SectorSnapshot
 	for rows.Next() {
 		var day, sector string
 		if err := rows.Scan(&day, &sector); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(sector) != "" {
-			out[day] = sector
+		if strings.TrimSpace(sector) == "" {
+			continue // 空板块名不是"没有板块"，但它当连接键必然 miss，与缺行同形
 		}
+		out = append(out, SectorSnapshot{Day: day, Sector: sector})
 	}
 	return out, rows.Err()
 }

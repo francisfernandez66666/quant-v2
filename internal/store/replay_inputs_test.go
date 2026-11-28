@@ -167,6 +167,57 @@ func TestSectorMapAsOfAgeWindow(t *testing.T) {
 	}
 }
 
+// TestSectorSnapshotsForCodeAndTradeDays 锁 §REPLAY-INPUTS 归属 as-of 的**读侧**契约：
+// 逐票返回的是"快照序列"（升序、逐条带板块名），而不是铺满自然日的映射；
+// 交易日清单来自 daily 而不是日历日。两件事分开，装配层才能一次线性扫描完成 as-of。
+func TestSectorSnapshotsForCodeAndTradeDays(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.UpsertSectorMapDay("20261124", map[string]string{"600519.SH": "白酒", "600000.SH": "银行"}, nil); err != nil {
+		t.Fatalf("存档 20261124 失败: %v", err)
+	}
+	if _, err := db.UpsertSectorMapDay("20261127", map[string]string{"600519.SH": "食品饮料", "600000.SH": "银行"}, nil); err != nil {
+		t.Fatalf("存档 20261127 失败: %v", err)
+	}
+
+	snaps, err := db.SectorSnapshotsForCode("600519.SH", "20261130")
+	if err != nil || len(snaps) != 2 {
+		t.Fatalf("应回两份快照，得 %d err=%v", len(snaps), err)
+	}
+	if snaps[0].Day != "20261124" || snaps[0].Sector != "白酒" ||
+		snaps[1].Day != "20261127" || snaps[1].Sector != "食品饮料" {
+		t.Fatalf("快照必须按日升序且逐条带板块名，得 %+v", snaps)
+	}
+	// end 边界必须生效：end=20261125 ⇒ 只剩第一份（否则装配层会读到"未来"的那一份而不自知）
+	if snaps, err := db.SectorSnapshotsForCode("600519.SH", "20261125"); err != nil || len(snaps) != 1 {
+		t.Fatalf("end 边界必须生效，得 %d err=%v", len(snaps), err)
+	}
+	// 没有归属是合法态（不是失败）：空切片 + 无错，装配层据此留 NaN
+	if snaps, err := db.SectorSnapshotsForCode("999999.SH", "20261130"); err != nil || len(snaps) != 0 {
+		t.Fatalf("不存在的票应返回空且无错，得 %d err=%v", len(snaps), err)
+	}
+	if _, err := db.SectorSnapshotsForCode("600519.SH", "坏日期"); err == nil {
+		t.Fatal("日尺不认识必须报错（静默返回空会让整条腿无声弃权）")
+	}
+
+	// 交易日清单来自 daily 本身：只在 20261125 与 20261127 有行情 ⇒ 只回这两天
+	rows := []map[string]any{
+		{"ts_code": "600519.SH", "trade_date": "20261125", "open": 1.0, "high": 1.0, "low": 1.0,
+			"close": 1.0, "pre_close": 1.0, "change": 0.0, "pct_chg": 0.0, "vol": 1.0, "amount": 1.0, "source": "baostock"},
+		{"ts_code": "600519.SH", "trade_date": "20261127", "open": 1.0, "high": 1.0, "low": 1.0,
+			"close": 1.0, "pre_close": 1.0, "change": 0.0, "pct_chg": 0.0, "vol": 1.0, "amount": 1.0, "source": "baostock"},
+	}
+	if _, err := db.InsertRows("daily", TableColumns("daily"), rows); err != nil {
+		t.Fatalf("写 daily 失败: %v", err)
+	}
+	days, err := db.TradeDaysBetween("20261124", "20261130")
+	if err != nil {
+		t.Fatalf("读交易日失败: %v", err)
+	}
+	if len(days) != 2 || days[0] != "20261125" || days[1] != "20261127" {
+		t.Fatalf("交易日清单必须来自 daily 且升序（不许用日历日），得 %v", days)
+	}
+}
+
 func TestLeaderRankDayAndMissing(t *testing.T) {
 	db := testDB(t)
 	rows := []LeaderRankRow{

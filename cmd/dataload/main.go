@@ -69,6 +69,10 @@ func main() {
 	// 一次把四只都补齐）；只有刻意重刷全历史才需要显式给 --index-start。
 	indexStart := flag.String("index-start", "", "index 子命令起始日 YYYYMMDD（空＝自动取各指数库内最小末行日）")
 	mapPath := flag.String("map", "", "sector-map 子命令的输入 JSON（生产者产出的 sector_map.json）")
+	// §REPLAY-INPUTS 2026-11-28（owner 裁决 2）：板块归属是缓慢变化的维度，
+	// 固化一份、每天更新一份即可。as-of 档让 leader_rank_daily 能覆盖历史窗，
+	// 否则只有"真有快照的那几天"（现网 = 1 天）。
+	leaderAsOf := flag.Bool("leader-as-of", false, "leader-rank 按交易日遍历、板块归属取 ≤ 当日的最近快照（早于首份则回填首份）")
 	flag.Parse()
 
 	args := flag.Args()
@@ -165,7 +169,7 @@ func main() {
 		// `cmd/dataload` 已经有一整套（开库/日尺/InsertRows 白名单/量纲归一/断点），
 		// 再开第六枚二进制等于把这些纪律复制一份——本仓"第二本账"的教训就是这个形状。
 		// 输入只有库里已有的两张表，**不打任何外网**，可以在任何时段安全重跑。
-		if err := runLeaderRank(db, *start, *end); err != nil {
+		if err := runLeaderRank(db, *start, *end, *leaderAsOf); err != nil {
 			log.Fatalf("leader-rank 失败: %v", err)
 		}
 	case "meta-dates":

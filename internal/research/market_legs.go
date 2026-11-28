@@ -134,14 +134,28 @@ func fillMarketLegs(db *store.DB, s *factor.StockSeries, code, start, end string
 		}
 	}
 
-	// ④ 板块净流入横截面分位（代理）：先取该股逐日的板块归属，再查面板算好的当日分位。
+	// ④ 板块净流入横截面分位（代理）：先解析该股逐日的板块归属，再查面板算好的当日分位。
 	//    归属没命中 ⇒ 整格 NaN。绝不许把"查不到板块"折算成分位 0——0 是"全市场最弱"，
 	//    是一条方向相反的真读数（载体那条腿当年就是因为 dict 当成标量，整条腿静默弃权）。
+	//
+	//    ★ as-of 解析（owner 2026-11-28 裁决 2）：板块归属是**缓慢变化的维度**，
+	//    现网只有单日快照时，早于首份快照的日期回填首份、晚于末份的日期沿用末份。
+	//    不做这一步的现场形态：sector_flow_daily 有 126 天，而连接键只有 1 天能命中
+	//    ⇒ 分位腿覆盖率 0.8%，读数上完全看不出是"接上了还是没接"。
+	//    回填格数记进 Panels（报告头 `sector_map=`），方向是"看得见"，不是"偷偷放宽"。
 	if p != nil {
-		sectorByDay, err := db.SectorMapForCodeRange(code, start, end)
-		if err == nil && len(sectorByDay) > 0 {
+		snaps, err := db.SectorSnapshotsForCode(code, end)
+		if err == nil && len(snaps) > 0 {
+			cur := 0
 			for i, d := range s.Dates {
-				if v, ok := p.SectorQuantileOn(d, sectorByDay[d]); ok {
+				// 推进到"最后一个 ≤ 当日"的快照；当日早于首份时 cur 停在 0（= 回填首份）。
+				for cur+1 < len(snaps) && snaps[cur+1].Day <= d {
+					cur++
+				}
+				if snaps[cur].Day > d {
+					p.noteSectorBackfill() // 用了"未来"的快照 ⇒ 前视回填，计数留痕
+				}
+				if v, ok := p.SectorQuantileOn(d, snaps[cur].Sector); ok {
 					s.SectorFlowQuantile[i] = v
 				}
 			}

@@ -233,6 +233,57 @@ func TestMarketLegsPanelsAndProxies(t *testing.T) {
 	}
 }
 
+// TestSectorMapAsOfSnapshot 锁定 owner 2026-11-28 裁决 2：板块归属是缓慢变化的维度，
+// 单份快照要能 as-of 到后面的交易日（否则 sector_flow_daily 那 126 天里只有快照当天接得上）。
+//
+// 三条断言各锁一种形态：
+//   - 快照日之后的日子，归属沿用最近一份快照 ⇒ 分位有值（旧实现这里是 NaN）；
+//   - 早于首份快照的日子回填首份，但当天没有板块资金流 ⇒ 仍然 NaN（回填的是连接键，不是读数）；
+//   - 回填格数必须能被读数看见（报告头 `sector_map_backfill=`），不许静默用前视。
+func TestSectorMapAsOfSnapshot(t *testing.T) {
+	db := newLegsDB(t)
+	const code = "600519.SH"
+	start, end := legsCompact(0), legsCompact(11)
+
+	// 归属只在第 3 日存档一份（模拟现网"只有单日快照"）
+	if _, err := db.UpsertSectorMapDay(legsCompact(3), map[string]string{code: "白酒"}, nil); err != nil {
+		t.Fatalf("存档板块归属失败: %v", err)
+	}
+	// 板块资金流在第 3 日与第 6 日各有一组（分位只在有资金流的日子才算得出）
+	flowRows := make([]map[string]any, 0, 6)
+	for _, d := range []int{3, 6} {
+		flowRows = append(flowRows,
+			map[string]any{"trade_date": cntime.DayOf(legsDay(d)), "sector": "白酒", "net_inflow": 30.0, "amount": 100.0, "delta": 0.1},
+			map[string]any{"trade_date": cntime.DayOf(legsDay(d)), "sector": "银行", "net_inflow": 10.0, "amount": 100.0, "delta": 0.05},
+			map[string]any{"trade_date": cntime.DayOf(legsDay(d)), "sector": "医药", "net_inflow": 20.0, "amount": 100.0, "delta": 0.08},
+		)
+	}
+	if _, err := db.InsertRows("sector_flow_daily", []string{"trade_date", "sector", "net_inflow", "amount", "delta"}, flowRows); err != nil {
+		t.Fatalf("写板块资金流失败: %v", err)
+	}
+
+	p := LoadPanels(db, start, end)
+	s, err := AssembleWithPanels(db, code, start, end, p)
+	if err != nil || s == nil {
+		t.Fatalf("带面板装配失败: %v", err)
+	}
+	if s.SectorFlowQuantile[3] != 100 {
+		t.Fatalf("快照当日分位应为 100，得 %v", s.SectorFlowQuantile[3])
+	}
+	// ★ 第 6 日没有归属行，但 as-of 到第 3 日那份快照 ⇒ 必须算出分位（旧实现是 NaN）
+	if s.SectorFlowQuantile[6] != 100 {
+		t.Fatalf("快照之后的日子必须 as-of 沿用最近一份归属（得 %v；NaN 表示又退回了逐日精确匹配）", s.SectorFlowQuantile[6])
+	}
+	// 早于首份快照的日子：连接键回填了，但当天没有板块资金流 ⇒ 仍必须 NaN
+	if !math.IsNaN(s.SectorFlowQuantile[0]) {
+		t.Fatalf("没有板块资金流的日期必须 NaN（回填的是连接键，不是读数），得 %v", s.SectorFlowQuantile[0])
+	}
+	// 回填格数要能被读数看见：第 0/1/2 日共 3 格借用了"未来"的快照
+	if got := p.SectorBackfillCells(); got != 3 {
+		t.Fatalf("回填格数应为 3（第 0/1/2 日），得 %d——这个数必须进报告头，否则前视是隐形的", got)
+	}
+}
+
 func TestMarketLegsWithNilPanelsStillAssembles(t *testing.T) {
 	db := newLegsDB(t)
 	s, err := AssembleWithPanels(db, "600519.SH", legsCompact(0), legsCompact(11), nil)

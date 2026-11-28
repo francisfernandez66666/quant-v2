@@ -224,12 +224,14 @@ func (s *seriesSource) marketNote() string {
 	d1Days, idxSrc := 0, "-"
 	// 未标定名单从因子层取，不在这里再抄一遍 ID 清单（两份名单必然漂）。
 	sectorDays, miss := 0, "[]"
+	backfill := int64(0)
 	if s.panels != nil {
 		d1Days = s.panels.D1DayCount()
 		if v := s.panels.IndexSource(); v != "" {
 			idxSrc = v
 		}
 		sectorDays = s.panels.SectorQuantileDayCount()
+		backfill = s.panels.SectorBackfillCells()
 		miss = fmt.Sprint(s.panels.Missing())
 	}
 	return fmt.Sprintf(
@@ -237,9 +239,11 @@ func (s *seriesSource) marketNote() string {
 			"leader_src=sector_gain_rank flow_mode=seed120+daily(缺则弃权) "+
 			"band_calibrated=provisional(%s) "+
 			"assemble_fallback=%d panel_missing=%s "+
+			"sector_map_backfill=%d(归属按 as-of 固化快照；>0 表示借用了未来快照的格数) "+
 			"stock_flow day=%s codes=%d coverage=%.1f%% gate=%s",
 		d1Days, idxSrc, sectorDays,
 		strings.Join(factorlib.ProvisionalBandKeys(), ","), s.assembleFallback, miss,
+		backfill,
 		s.flowDayText(), s.flowCodes, s.flowCoverage, s.flowGateText())
 }
 

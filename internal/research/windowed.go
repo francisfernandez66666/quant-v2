@@ -247,9 +247,14 @@ func discoveryResumeKey(start, end string, horizon, minStocks, winDays int, fids
 		ex = append(ex, strings.Join(s, "+"))
 	}
 	sort.Strings(ex)
-	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s|x%s%s",
+	// §PANEL-ASSEMBLY（2026-11-28）：市场级面板装配口径位必须进键——否则"七枚新因子列当时全 NaN"
+	// 那份断点会被修好之后的发现复用，新因子仍然进不了候选池（修了等于没修）。
+	// 位置刻意放在 adjBasisTag 之前：`TestCkptRotationOnBasisBump` 靠 TrimSuffix(adjBasisTag)
+	// 构造旧键，口径位排在它后面会让那条锁当场变哑。
+	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s|x%s|%s|%s",
 		start, end, horizon, minStocks, winDays,
-		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10], strings.Join(ex, ","), adjBasisTag)
+		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10], strings.Join(ex, ","),
+		panelAssemblyTag, adjBasisTag)
 }
 
 // windowDays 每个窗口包含的交易日数。越小峰值内存越低、但装配次数越多（越慢）。
@@ -273,6 +278,18 @@ func windowDefs(ids []string) []factor.Def {
 		}
 	}
 	return defs
+}
+
+// briefIDs 把一组 ID 压成一行读数（超过 n 个截断并注明总数）。
+// 读数里点名"哪些因子没进候选池"比只打"通过 3/40"有用得多：前者能直接指认接线断在哪一层。
+func briefIDs(ids []string, n int) string {
+	if n <= 0 {
+		n = 8
+	}
+	if len(ids) <= n {
+		return "[" + strings.Join(ids, ",") + "]"
+	}
+	return "[" + strings.Join(ids[:n], ",") + fmt.Sprintf(",…+%d]", len(ids)-n)
 }
 
 // windowChunks 把交易日列表切成若干窗口（每窗口最多 winDays 天）。
@@ -857,10 +874,24 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		}
 		pre = append(pre, fid)
 	}
+	// §PANEL-READOUT（2026-11-28）：预筛的"看见 / 没看见"必须落进任务日志。
+	// 市场级因子在装配不带面板时是**结构性全 NaN** ⇒ 一行 IC 都没有、永远进不了候选池，
+	// 而整条链照常跑完、候选照常产出、日志里一个错都不报（"接线做完了但不拿去挖战法"的现场形态）。
+	// 这一行是唯一能当场分辨"没有读数"与"读数弱"的地方，别省：
+	// 无IC行>0 且这些 ID 全是新接线因子 ⇒ 先查装配（BuildPanels 是否带面板），不是因子无效。
+	if len(pre) < len(opts.Factors) {
+		var blind []string
+		for _, fid := range opts.Factors {
+			if len(allIC[fid]) == 0 {
+				blind = append(blind, fid)
+			}
+		}
+		log.Printf("[discover] 预筛 通过=%d/%d 无IC行=%d %v（无 IC 行=结构性弃权：先查该因子在装配里有没有输入；"+
+			"市场级因子看 BuildPanels 是否带面板）", len(pre), len(opts.Factors), len(blind), briefIDs(blind, 12))
+	}
 	if len(pre) == 0 {
 		return empty("预筛后无有效因子")
 	}
-
 	// §WD-1 后段进度透出（36–99%）：贪心 / 坐标上升权重优化 / 分段泛化三个阶段原先既不写进度行、
 	// 也无窗口断点，而调度器看门狗只认"发现进度 xx%"行 → 静默数小时被判停滞 kill
 	//（2026-09-20 广州 #268 实录：~336min 的真实计算被 320min 阈值反复误杀成死循环）。

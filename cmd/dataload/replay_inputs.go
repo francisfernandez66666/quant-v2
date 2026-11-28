@@ -222,87 +222,151 @@ const leaderRankMinSectorPeers = 3
 //
 // 分位定义：rank/(n-1)×1.0，rank 为"板块内涨幅严格小于自己的只数"（同价并列取同名次，
 // 不做随机 tie-break——回放必须可复现）。
-func runLeaderRank(db *store.DB, start, end string) error {
+//
+// 两种遍历口径（owner 2026-11-28 裁决 2）：
+//
+//	精确档（asOf=false）：只算库里真有 sector_map_daily 快照的那些日子。
+//	                     归属表一天一份时，覆盖率就等于快照天数（现网 = 1 天）。
+//	as-of 档（asOf=true）：按 daily 的交易日遍历，归属取"≤ 当日 的最近一份快照"；
+//	                     早于首份快照的日期回填首份（板块归属是缓慢变化的维度）。
+//	                     这是让 SectorGainRank 在历史窗里真正有读数的唯一办法，
+//	                     前视的性质由回放报告头 `sector_map_backfill=` 如实带出。
+func runLeaderRank(db *store.DB, start, end string, asOf bool) error {
 	s, e := cntime.CompactDay(start), cntime.CompactDay(end)
 	if s == "" || e == "" {
 		return fmt.Errorf("日尺不可认 start=%q end=%q", start, end)
 	}
-	days, err := db.SectorMapDaysBetween(s, e)
+	snapDays, err := db.SectorMapDaysBetween(s, e)
 	if err != nil {
 		return fmt.Errorf("读板块归属日期清单失败: %w", err)
 	}
-	if len(days) == 0 {
+	if len(snapDays) == 0 {
 		return fmt.Errorf("库里没有 sector_map_daily（先跑 sector-map 存档；无归属表就没有板块截面可算）")
 	}
-	written, skippedDays := 0, 0
+
+	// 要遍历的日子：精确档＝快照日；as-of 档＝全部交易日（归属按 as-of 解析）。
+	days := snapDays
+	if asOf {
+		tradeDays, err := db.TradeDaysBetween(s, e)
+		if err != nil {
+			return fmt.Errorf("读交易日清单失败: %w", err)
+		}
+		if len(tradeDays) == 0 {
+			return fmt.Errorf("区间 %s..%s 内 daily 没有任何交易日", s, e)
+		}
+		days = tradeDays
+	}
+
+	var (
+		written, skippedDays int
+		curSnap              = -1
+		member               map[string]string
+		backfillDays         int
+	)
 	for _, day := range days {
-		member, err := db.SectorMapOnDay(day)
-		if err != nil || len(member) == 0 {
-			skippedDays++
-			log.Printf("[dataload] leader-rank %s 归属为空/读取失败，整日跳过: %v", day, err)
-			continue
-		}
-		cross, err := db.DailyPctChgOn(day)
-		if err != nil || len(cross) == 0 {
-			skippedDays++
-			log.Printf("[dataload] leader-rank %s 当日无行情，整日跳过: %v", day, err)
-			continue
-		}
-		// 按板块分桶（同一天、同一板块的全体可比票）
-		boards := make(map[string][]string)
-		for code, pct := range cross {
-			sector := member[code]
-			if sector == "" || pct[1] == 1 {
-				continue // 没归属 / 降级行（涨跌幅不可信）都不进桶，也不能给自己算分位
+		// as-of 档：把生效快照推进到"最后一个 ≤ 当日"；早于首份时停在首份（回填）。
+		if asOf {
+			for curSnap+1 < len(snapDays) && snapDays[curSnap+1] <= day {
+				curSnap++
+				member = nil // 换快照才重载，避免每日一次全表读
 			}
-			boards[sector] = append(boards[sector], code)
-		}
-		batch := make([]store.LeaderRankRow, 0, len(cross))
-		for sector, codes := range boards {
-			if len(codes) < leaderRankMinSectorPeers {
-				continue // 板块太瘦算不出有意义的位次 ⇒ 整板块不写（票在该日按 NaN 弃权）
+			if curSnap < 0 {
+				curSnap = 0
+				member = nil
+				backfillDays++
+			} else if snapDays[curSnap] > day {
+				backfillDays++
 			}
-			vals := make([]float64, 0, len(codes))
-			for _, c := range codes {
-				vals = append(vals, cross[c][0])
-			}
-			sorted := append([]float64(nil), vals...)
-			sort.Float64s(sorted)
-			for i, c := range codes {
-				v := vals[i]
-				// rank = 严格小于 v 的只数（并列同分，可复现；不做 index-of-first 的随机性）
-				rank := sort.SearchFloat64s(sorted, v)
-				last := rank
-				for last < len(sorted) && sorted[last] == v {
-					last++
+			if member == nil {
+				m, err := db.SectorMapOnDay(snapDays[curSnap])
+				if err != nil || len(m) == 0 {
+					skippedDays++
+					log.Printf("[dataload] leader-rank %s 快照 %s 归属为空/读取失败，整日跳过: %v", day, snapDays[curSnap], err)
+					continue
 				}
-				// 并列时取区间中点，避免"同涨幅两票一个 0 一个 1"这种顺序依赖
-				pos := float64(rank) + float64(last-rank-1)/2.0
-				batch = append(batch, store.LeaderRankRow{
-					TsCode: c, TradeDate: day, Sector: sector,
-					PctChg: v, HasPctChg: true,
-					GainRank: pos / float64(len(codes)-1), HasRank: true,
-				})
+				member = m
 			}
+		} else {
+			m, err := db.SectorMapOnDay(day)
+			if err != nil || len(m) == 0 {
+				skippedDays++
+				log.Printf("[dataload] leader-rank %s 归属为空/读取失败，整日跳过: %v", day, err)
+				continue
+			}
+			member = m
 		}
-		if len(batch) == 0 {
+		n, ok, err := writeLeaderRankDay(db, day, member)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			skippedDays++
 			log.Printf("[dataload] leader-rank %s 无满足最少票数的板块，整日跳过", day)
 			continue
 		}
-		n, err := db.UpsertLeaderRankDay(batch)
-		if err != nil {
-			return fmt.Errorf("写 leader_rank_daily %s: %w", day, err)
-		}
-		written += int(n)
-		log.Printf("[dataload] leader-rank %s 板块=%d 写入=%d", day, len(boards), n)
+		written += n
 	}
 	if written == 0 {
 		return fmt.Errorf("整个区间一条龙头分位都没写出（跳过 %d 日）——归属表与行情对不上，先查 sector_map_daily", skippedDays)
 	}
-	fmt.Printf("LEADER_RANK_RESULT=OK days=%d written=%d skipped_days=%d min_peers=%d\n",
-		len(days), written, skippedDays, leaderRankMinSectorPeers)
+	fmt.Printf("LEADER_RANK_RESULT=OK days=%d written=%d skipped_days=%d min_peers=%d as_of=%v backfill_days=%d\n",
+		len(days), written, skippedDays, leaderRankMinSectorPeers, asOf, backfillDays)
 	return nil
+}
+
+// writeLeaderRankDay 算某一日的板块内涨幅分位并落库。ok=false 表示当日没有可写的板块。
+func writeLeaderRankDay(db *store.DB, day string, member map[string]string) (int, bool, error) {
+	cross, err := db.DailyPctChgOn(day)
+	if err != nil || len(cross) == 0 {
+		log.Printf("[dataload] leader-rank %s 当日无行情，整日跳过: %v", day, err)
+		return 0, false, nil
+	}
+	// 按板块分桶（同一天、同一板块的全体可比票）
+	boards := make(map[string][]string)
+	for code, pct := range cross {
+		sector := member[code]
+		if sector == "" || pct[1] == 1 {
+			continue // 没归属 / 降级行（涨跌幅不可信）都不进桶，也不能给自己算分位
+		}
+		boards[sector] = append(boards[sector], code)
+	}
+	batch := make([]store.LeaderRankRow, 0, len(cross))
+	for sector, codes := range boards {
+		if len(codes) < leaderRankMinSectorPeers {
+			continue // 板块太瘦算不出有意义的位次 ⇒ 整板块不写（票在该日按 NaN 弃权）
+		}
+		vals := make([]float64, 0, len(codes))
+		for _, c := range codes {
+			vals = append(vals, cross[c][0])
+		}
+		sorted := append([]float64(nil), vals...)
+		sort.Float64s(sorted)
+		for i, c := range codes {
+			v := vals[i]
+			// rank = 严格小于 v 的只数（并列同分，可复现；不做 index-of-first 的随机性）
+			rank := sort.SearchFloat64s(sorted, v)
+			last := rank
+			for last < len(sorted) && sorted[last] == v {
+				last++
+			}
+			// 并列时取区间中点，避免"同涨幅两票一个 0 一个 1"这种顺序依赖
+			pos := float64(rank) + float64(last-rank-1)/2.0
+			batch = append(batch, store.LeaderRankRow{
+				TsCode: c, TradeDate: day, Sector: sector,
+				PctChg: v, HasPctChg: true,
+				GainRank: pos / float64(len(codes)-1), HasRank: true,
+			})
+		}
+	}
+	if len(batch) == 0 {
+		return 0, false, nil
+	}
+	n, err := db.UpsertLeaderRankDay(batch)
+	if err != nil {
+		return 0, false, fmt.Errorf("写 leader_rank_daily %s: %w", day, err)
+	}
+	log.Printf("[dataload] leader-rank %s 板块=%d 写入=%d", day, len(boards), n)
+	return int(n), true, nil
 }
 
 // ── 小工具：覆盖率读数格式化（只为把"写前/写后"打进日志，别把 map 直接 %v 出来）──

@@ -25,6 +25,7 @@ package research
 import (
 	"math"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -54,12 +55,37 @@ type Panels struct {
 	// d1Days 库里 D1 覆盖的日期数（实测现网只有 67 天 ⇒ 引用 NewsEvent 的规则
 	// 只在这段窗口上有完整输入，结论不得外推成全窗口）。
 	d1Days int
+	// sectorBackfill 板块归属"回填"格数：当日早于该票首份 sector_map 快照、
+	// 只能借用未来快照的格数（owner 2026-11-28 裁决 2：归属是缓慢变化的维度）。
+	// 单日快照回放历史时这个数会很大，报告头必须如实带出来——"用了前视"要能看见。
+	sectorBackfill atomic.Int64
+}
+
+// noteSectorBackfill 累加回填格数（装配目前串行，但计数用原子是为了将来并行化时
+// 这行读数不变成竞态——读数错比没有读数更难查）。
+func (p *Panels) noteSectorBackfill() { p.sectorBackfill.Add(1) }
+
+// SectorBackfillCells 回填格数（报告头读数用）。
+func (p *Panels) SectorBackfillCells() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.sectorBackfill.Load()
 }
 
 // sectorQuantileMinBoards 一天里至少要有这么多个可比板块，才认为"当日分位"成立。
 // 只有一块时它既是最强也是最弱（分位 0/100 全凭它自己是唯一的样本），
 // 那种"有值但方向是假的"比 NaN 弃权更坏——与 §FLOW-SECTOR-AGG 的样本闸同取向。
 const sectorQuantileMinBoards = 2
+
+// panelAssemblyTag 市场级面板装配口径位（拼进发现断点键）。
+//
+// 为什么必须进断点键：断点缓存键原本只含区间/参数/股票池/复权口径，**不含"面板装了什么"**。
+// 2026-11-28 之前 discover 的装配走的是不带面板的 Assemble ⇒ 七枚新因子列全 NaN，
+// 那些"没有 IC 行"的结论已经被写进窗口断点。若不换键，修好装配之后的第一晚仍会命中旧断点、
+// 继续认为这些因子没有读数——**修了等于没修**，而且从日志上看不出任何异常。
+// 改动市场级列的语义（新增/改名/换量纲/as-of 口径变化）都必须 bump 这一位。
+const panelAssemblyTag = "mp2"
 
 // LoadPanels 一次性装配市场级面板。任何一块读不到都不返回错误——
 // 面板缺失的后果是对应因子腿 NaN 弃权，而不是整轮回放跑不了。
