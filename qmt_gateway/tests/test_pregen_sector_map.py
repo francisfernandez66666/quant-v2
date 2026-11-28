@@ -234,6 +234,7 @@ class FailureReadoutTest(unittest.TestCase):
         self.assertEqual(psm.describe(RuntimeError("boom")), "RuntimeError")
 
     def test_with_retry_retries_then_succeeds(self):
+        # 前两次抛 URLError（模拟中继抖动），第三次成功 ⇒ 必须重试到成功，且退避走注入的 no-op sleep。
         import urllib.error
         calls = []
         saved = psm.time.sleep
