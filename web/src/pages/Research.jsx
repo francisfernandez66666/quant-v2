@@ -414,9 +414,22 @@ export default function Research() {
       '样本外IR': /样本外IR=(-?\d+\.?\d*)/,
       反推超额: /反推超额=(-?\d+\.?\d*)/,
     }
+    // §B4-FRESH-EXCESS（2026-11-28 owner）：B4 回测每次回填都会追加一个新的
+    // `最新回测超额=`，reason 是追加式文本，因此必须取**最后一次**；取第一次会永远显示
+    // 首次回测的老数字（现场「战法1 固定 16.4%」就是这么来的）。
+    if (key === '最新回测超额') {
+      const all = reason.match(/最新回测超额=(-?\d+\.?\d*)/g) || []
+      if (!all.length) return null
+      return parseFloat(all[all.length - 1].split('=')[1])
+    }
     const m = reason.match(pats[key])
     // 常量 m：局部定义
     return m ? parseFloat(m[1]) : null
+  }
+  // 详情条目的「多赚 X%」：B4 真回测有值就用最新回测超额；没有才回退发现阶段的反推超额。
+  function latestExcess(c) {
+    const fresh = parseReason(c, '最新回测超额')
+    return fresh === null ? parseReason(c, '反推超额') : fresh
   }
   function fmtPct(v) {
   // 将 0~1 比率格式化为百分比字符串
@@ -432,7 +445,7 @@ export default function Research() {
     // 常量 insample：局部定义
     const outsample = parseReason(c, '样本外IR')
     // 常量 outsample：局部定义
-    const gen = parseReason(c, '反推超额')
+    const gen = latestExcess(c)
     // 常量 gen：局部定义
     const thr = 0.3
     // 常量 thr：局部定义
@@ -449,7 +462,7 @@ export default function Research() {
     // 常量 insample：局部定义
     const outsample = parseReason(c, '样本外IR')
     // 常量 outsample：局部定义
-    const gen = parseReason(c, '反推超额')
+    const gen = latestExcess(c)
     // 常量 gen：局部定义
     const lines = []
     // 常量 lines：局部定义
@@ -612,6 +625,9 @@ export default function Research() {
   async function refetchCandidatesAfterAction() {
     await loadData()
     await loadProgress()
+    // §STATUS-TOGGLE：审批/驳回会改战法库（apply/remove + 热重载），候选列表刷新了但
+    // 战法库不刷就会出现「候选已驳回、库里还在跑」的假象（后端已同步移除，前端得跟上）。
+    await loadLibrary()
   }
 
   // 审批并通过接口应用某条研究候选（写回后端并热更新状态），权限不足时回退
@@ -1514,7 +1530,7 @@ export default function Research() {
               }
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>样本内测试</span><span>前一段历史回放：IR {fmt(parseReason(c, '样本内IR'))}</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>样本外测试</span><span>另一段没用过的历史回放：IR {fmt(parseReason(c, '样本外IR'))}</span></div>
-              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>反推超额</span><span>高分股比全市场平均多赚 {fmtPct(parseReason(c, '反推超额'))}</span></div>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }} title={parseReason(c, '最新回测超额') === null ? '发现阶段反推值，尚未跑 B4 回测' : 'B4 全链路回测最新回填值'}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>超额收益</span><span>高分股比全市场平均多赚 {fmtPct(latestExcess(c))}</span></div>
               {/* §RFIX-4 口径统一：候选 ir 字段自 2026-09-19 起存「样本内IR」（与 reason 同源，
                   §RFIX-2 方向拟合后恒为可解释带符号值）；旧数据行仍为优化器口径，以 reason 为准 */}
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>样本内 IR</span><span>{fmt(c.ir)}（参考，历史行以命中原因标注为准）</span></div>
@@ -1577,13 +1593,14 @@ export default function Research() {
           </div>
         )}
 
-        {canApprove && c.status === 'proposed' && (
-          // 审批操作区：仅在待审批状态且有权限时渲染
+        {canApprove && (
+          // §STATUS-TOGGLE（2026-11-28 owner）：已通过/已驳回也要能互改——新回测结果出来后
+          // 用户要能据新数据翻转决策。后端 approve 幂等、reject 会同步从战法库移除，
+          // 所以这里不再把按钮限制在 proposed 状态。
           <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-            {/* 三个核心决策按钮：应用 / 灰度观察 / 驳回 */}
-            <Button theme="primary" size="small" onClick={() => doApprove(c)}>审批并应用</Button>
+            <Button theme="primary" size="small" onClick={() => doApprove(c)}>{c.status === 'proposed' ? '审批并应用' : '改通过并应用'}</Button>
             <Button theme="warning" size="small" onClick={() => doGrayscale(c)}>灰度观察</Button>
-            <Button theme="danger" size="small" onClick={() => doReject(c)}>驳回</Button>
+            <Button theme="danger" size="small" onClick={() => doReject(c)}>{c.status === 'proposed' ? '驳回' : '改驳回'}</Button>
             {c.kind === 'factor' && (
               // 因子候选：发起/重跑全链路回测，按钮带 loading
               <Button theme="warning" size="small" loading={!!backtestLoading[c.id]} onClick={() => doBacktest(c)}>

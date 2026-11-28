@@ -30331,3 +30331,85 @@ go test ./internal/scheduler -run 'TestNoTimeLimitBacktestYieldsAtTradingWindow'
 [ "${B264_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §264 §NO-TIME-LIMIT-BACKTEST 锁通过（白名单/两道闸/WithCancel+看门狗/行为腿/交易时段让位，累计判定点 ${CNT264}）"
 echo ""
+
+# ── §265 §APPROVAL-TOGGLE（2026-11-28 owner：修「固定 16.4%」+ 已审批战法状态互改）──
+# 现场形态：候选详情的「多赚 X%」恒取 reason 中 discovery 阶段的 `反推超额=`（0.1637），
+# B4 回测回填后永远不刷新；同时候选一旦 approved/rejected，前端不再渲染审批按钮，
+# 用户拿到新回测结果也改不了状态。本段锁：最新回测超额权威键 / 状态互改后端同步战法库 /
+# 前端按钮不门控 + 审批后刷新战法库 / 两侧行为腿。
+echo "==> 265 §APPROVAL-TOGGLE（最新回测超额 / 状态互改 / 库同步）..."
+fail265() {
+	echo "--- FAIL: §265 $*"
+	FAIL=1
+	B265_FAILED=1
+}
+CNT265=0
+
+# ① B4 回填写入权威键，前端优先取且取最后一次（reason 是追加式文本，取第一次必陈旧）。
+CNT265=$((CNT265 + 1))
+python3 - <<'PY' || fail265 "最新回测超额权威键缺失（§265 ①）"
+import pathlib
+a = pathlib.Path("cmd/research/auto.go").read_text(encoding="utf-8")
+assert "最新回测超额=%.4f" in a, "B4 回填没有写权威键"
+r = pathlib.Path("web/src/pages/Research.jsx").read_text(encoding="utf-8")
+assert "function latestExcess(c)" in r, "前端缺 latestExcess 出口"
+assert "all[all.length - 1]" in r, "必须取 reason 中最后一次回填值"
+assert "title={parseReason(c, '最新回测超额') === null" in r, "读数来源没有在界面说明"
+PY
+
+# ② 已通过改驳回必须同步摘库；审批后前端必须刷新战法库。
+CNT265=$((CNT265 + 1))
+python3 - <<'PY' || fail265 "状态互改库同步缺失（§265 ②）"
+import pathlib
+s = pathlib.Path("internal/server/research.go").read_text(encoding="utf-8")
+st = s.index('case "reject":')
+body = s[st:s.index('case "grayscale":', st)]
+assert "c.Status == \"applied\" || c.Status == \"approved\"" in body
+assert "RemoveAppliedFactorRule" in body and "RemoveAppliedPatternRule" in body
+assert "s.reloadLibraries()" in body, "驳回后必须热重载，不能只改文件"
+r = pathlib.Path("web/src/pages/Research.jsx").read_text(encoding="utf-8")
+assert "canApprove && c.status === 'proposed' && (" not in r, "审批按钮仍被 proposed 门控"
+assert "改驳回" in r and "改通过并应用" in r
+st = r.index("async function refetchCandidatesAfterAction()")
+assert "await loadLibrary()" in r[st:st+400], "审批后没刷新战法库"
+PY
+
+# ③ 行为腿：后端状态互改 + 前端契约锁。
+CNT265=$((CNT265 + 1))
+GO_RC=0
+go test ./internal/server -run 'TestCandidateStatusToggleApprovedRejected' -count=1 >/dev/null 2>&1 || GO_RC=$?
+[ "$GO_RC" = "0" ] || fail265 "状态互改行为腿未过（§265 ③）"
+CNT265=$((CNT265 + 1))
+FE_RC=0
+(cd web && npx vitest run src/__tests__/status_toggle_contract.test.jsx >/dev/null 2>&1) || FE_RC=$?
+[ "$FE_RC" = "0" ] || fail265 "前端契约腿未过（§265 ④）"
+
+[ "${B265_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §265 §APPROVAL-TOGGLE 锁通过（权威键/库同步/状态互改行为腿/前端契约腿，累计判定点 ${CNT265}）"
+echo ""
+
+# ── §266 §BT-NULL-INDUSTRY（2026-11-28 生产首跑：候选 B4 被 NULL industry 整批打断）──
+echo "==> 266 §BT-NULL-INDUSTRY（区间查询 COALESCE / 合成跳过空板块 / 行为腿）..."
+fail266() {
+	echo "--- FAIL: §266 $*"
+	FAIL=1
+	B266_FAILED=1
+}
+CNT266=0
+
+CNT266=$((CNT266 + 1))
+python3 - <<'PY' || fail266 "事件合成 NULL industry 未归一（§266 ①）"
+import pathlib
+s = pathlib.Path("internal/store/backtest.go").read_text(encoding="utf-8")
+assert s.count("COALESCE(s.industry, '')") >= 2, "两个区间查询都要归一 NULL industry"
+e = pathlib.Path("internal/backtest/events.go").read_text(encoding="utf-8")
+assert 'rows[i].Industry != ""' in e, "合成侧必须跳过空板块（否则产出恒零入选的假事件）"
+PY
+CNT266=$((CNT266 + 1))
+GO_RC=0
+go test ./internal/backtest -run 'TestSynthesizeEventsSkipsNullIndustry|TestSynthesizeEvents' -count=1 >/dev/null 2>&1 || GO_RC=$?
+[ "$GO_RC" = "0" ] || fail266 "NULL industry 行为腿未过（§266 ②）"
+
+[ "${B266_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §266 §BT-NULL-INDUSTRY 锁通过（COALESCE/空板块跳过/行为腿，累计判定点 ${CNT266}）"
+echo ""

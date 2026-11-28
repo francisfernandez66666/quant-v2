@@ -1165,7 +1165,11 @@ func cmdBacktestCandidate(db *store.DB, args []string) {
 		if err := db.UpdateCandidateAvgExcess(c.ID, avgExcess); err != nil {
 			log.Fatalf("回填 avg_excess 失败: %v", err)
 		}
-		reason := fmt.Sprintf(" B4事件=%d 入选=%d 平均超额=%.4f（已回填）", rep.TotalEvents, rep.TotalPicks, avgExcess)
+		// §B4-FRESH-EXCESS（2026-11-28 owner）：候选详情里的「多赚 X%」此前恒取 reason 里的
+		// `反推超额=`（发现阶段反推值，永不更新），B4 真回测回填后仍显示老数字，用户无从判断
+		// 结果是否已刷新。这里把本次 B4 超额另起一个权威键，前端优先取它、旧键只作缺测兜底。
+		reason := fmt.Sprintf(" B4事件=%d 入选=%d 平均超额=%.4f（已回填） 最新回测超额=%.4f",
+			rep.TotalEvents, rep.TotalPicks, avgExcess, avgExcess)
 		// C3b 事件数护栏：事件不足 → Reason 标注统计意义弱，前端提示。
 		if *minBtEvents > 0 && rep.TotalEvents < *minBtEvents {
 			reason += fmt.Sprintf(" 事件不足(%d<%d) 统计意义弱", rep.TotalEvents, *minBtEvents)

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"quant-trading-v2/internal/store"
 	"strconv"
+	"strings"
 
 	"quant-trading-v2/internal/factor"
 	"quant-trading-v2/internal/research"
@@ -589,6 +590,32 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 			log.Printf("[research] 候选 #%d 审批并应用完成 kind=%s", id, c.Kind)
 		}
 	case "reject":
+		// §STATUS-TOGGLE（2026-11-28 owner）：已通过/已应用的候选改驳回时，必须同步从
+		// 战法库移除，否则候选显示「已驳回」而实盘白名单仍在跑——幽灵战法比状态滞后更危险。
+		// 库里本来就没有该条目（手工删过）时视为已收敛，仍允许落驳回态。
+		if c.Status == "applied" || c.Status == "approved" {
+			if s.researchDir == "" {
+				writeError(w, 503, "研究库未接入")
+				return
+			}
+			libID := "fac_" + strconv.FormatInt(id, 10)
+			if c.Kind == "pattern" {
+				libID = "pat_" + strconv.FormatInt(id, 10)
+			}
+			if c.Kind == "factor" || c.Kind == "pattern" {
+				var remErr error
+				if c.Kind == "pattern" {
+					remErr = research.RemoveAppliedPatternRule(s.researchDir, libID)
+				} else {
+					remErr = research.RemoveAppliedFactorRule(s.researchDir, libID)
+				}
+				if remErr != nil && !strings.Contains(remErr.Error(), "不存在") {
+					writeError(w, 500, "从战法库移除失败(状态未变更): "+remErr.Error())
+					return
+				}
+				reloadErr = s.reloadLibraries()
+			}
+		}
 		if err := s.researchDB.UpdateCandidateStatus(id, "rejected"); err != nil {
 			writeError(w, 500, err.Error())
 			return

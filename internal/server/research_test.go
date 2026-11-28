@@ -388,3 +388,62 @@ func TestCandidateBacktestRouting(t *testing.T) {
 		}
 	}
 }
+
+// TestCandidateStatusToggleApprovedRejected §STATUS-TOGGLE（2026-11-28 owner）：
+// 已通过（applied）改驳回必须同步把战法从库里摘掉，驳回后再改通过必须重新写回库。
+// 只改候选状态不动库会留下「已驳回但实盘白名单还在跑」的幽灵战法。
+func TestCandidateStatusToggleApprovedRejected(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	cid, err := db.SaveCandidate(&store.Candidate{
+		Kind: "factor", Status: "proposed", Factors: `["Mom20"]`,
+		Weights: `{"weights":{"Mom20":1},"directions":{"Mom20":1},"buy_threshold":70}`,
+		Horizon: 5, IR: 0.3,
+	})
+	if err != nil || cid <= 0 {
+		t.Fatalf("SaveCandidate: %v", err)
+	}
+	libraryCount := func() int {
+		rr := httptest.NewRecorder()
+		s.handleResearchLibrary(rr, httptest.NewRequest(http.MethodGet, "/api/research/library", nil))
+		var resp struct {
+			Library []any `json:"library"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("解析战法库失败: %v", err)
+		}
+		return len(resp.Library)
+	}
+	act := func(action string) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/research/candidates/"+itoa(cid)+"/"+action, nil)
+		req.SetPathValue("id", itoa(cid))
+		if action == "approve" {
+			s.handleResearchApprove(rr, req)
+		} else {
+			s.handleResearchReject(rr, req)
+		}
+		if rr.Code != 200 {
+			t.Fatalf("%s 失败 code=%d body=%s", action, rr.Code, rr.Body.String())
+		}
+	}
+	status := func() string {
+		c, err := db.CandidateByID(cid)
+		if err != nil || c == nil {
+			t.Fatalf("读取候选失败: %v", err)
+		}
+		return c.Status
+	}
+
+	act("approve")
+	if status() != "applied" || libraryCount() != 1 {
+		t.Fatalf("approve: status=%s count=%d", status(), libraryCount())
+	}
+	act("reject")
+	if status() != "rejected" || libraryCount() != 0 {
+		t.Fatalf("改驳回后应 rejected 且库 0 条, got status=%s count=%d", status(), libraryCount())
+	}
+	act("approve")
+	if status() != "applied" || libraryCount() != 1 {
+		t.Fatalf("驳回再改通过应 applied 且库 1 条, got status=%s count=%d", status(), libraryCount())
+	}
+}

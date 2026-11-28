@@ -77,13 +77,15 @@ type LimitUpCountRow struct {
 // English: range-scan limit-up counts per (date, industry) in ONE indexed query — the per-day
 // loop cost ~8.8s random I/O per day (~2h total) on the small VPS; this returns in seconds.
 func (d *DB) LimitUpCountsRange(start, end string) ([]LimitUpCountRow, error) {
-	rows, err := d.db.Query(`SELECT dv.trade_date, s.industry, COUNT(*) AS cnt
+	// §BT-NULL-INDUSTRY（2026-11-28 生产首跑）：stocks.industry 允许 NULL（新股/退市股未归类），
+	// 直接 Scan 进 string 会整条 B4 回测炸掉。归一为空串，交给 SynthesizeEvents 跳过。
+	rows, err := d.db.Query(`SELECT dv.trade_date, COALESCE(s.industry, '') AS industry, COUNT(*) AS cnt
 		FROM daily dv
 		JOIN stk_limit l ON l.ts_code = dv.ts_code AND l.trade_date = dv.trade_date
 		JOIN stocks s ON s.ts_code = dv.ts_code
 		WHERE dv.trade_date >= ? AND dv.trade_date <= ?
 		  AND dv.close >= l.up_limit * 0.995 AND dv.close > 0
-		GROUP BY dv.trade_date, s.industry
+		GROUP BY dv.trade_date, COALESCE(s.industry, '')
 		ORDER BY dv.trade_date ASC, cnt DESC`, start, end)
 	if err != nil {
 		return nil, err
@@ -102,11 +104,11 @@ func (d *DB) LimitUpCountsRange(start, end string) ([]LimitUpCountRow, error) {
 
 // LimitUpCountsByIndustry 限制UpCounts按Industry（DB方法）。
 func (d *DB) LimitUpCountsByIndustry(date string) (map[string]int, error) {
-	rows, err := d.db.Query(`SELECT s.industry, COUNT(*) FROM daily dv
+	rows, err := d.db.Query(`SELECT COALESCE(s.industry, ''), COUNT(*) FROM daily dv
 		JOIN stk_limit l ON l.ts_code = dv.ts_code AND l.trade_date = dv.trade_date
 		JOIN stocks s ON s.ts_code = dv.ts_code
 		WHERE dv.trade_date = ? AND dv.close >= l.up_limit * 0.995 AND dv.close > 0
-		GROUP BY s.industry`, date)
+		GROUP BY COALESCE(s.industry, '')`, date)
 	if err != nil {
 		return nil, err
 	}

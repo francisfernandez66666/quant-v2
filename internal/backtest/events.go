@@ -36,7 +36,9 @@ func SynthesizeEvents(db *store.DB, start, end string, minLimitUps, maxPerDay in
 		}
 		var hits []pair
 		for i < len(rows) && rows[i].Date == d {
-			if rows[i].Count >= minLimitUps {
+			// 未归类股票（industry IS NULL → COALESCE 空串）不构成板块事件；
+			// 放行会让 IndustryConstituents 查不到成分股，产出一个恒零入选的假事件。
+			if rows[i].Count >= minLimitUps && rows[i].Industry != "" {
 				hits = append(hits, pair{rows[i].Industry, rows[i].Count})
 			}
 			i++
