@@ -30257,3 +30257,58 @@ PY
 [ "${B263_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §263 §DISCOVER-PANELS 锁通过（装配带面板正负两向/B4 回测同口径/断点口径位位置/预筛读数/归属 as-of 与回填计数/归属向前回填与诊断读数/行为腿，累计判定点 ${CNT263}）"
 echo ""
+
+# ── §264 §NO-TIME-LIMIT-BACKTEST（2026-11-28 owner 裁决：周末/盘后等非交易时段跑回测不设时间限制）──
+# owner 原话：「周末和其他非交易时段，跑回测不用设时间限制」+「做成代码常驻规则」
+# +「而且是 researchd 的全局调度配置」。落地口径：scheduler 全局规则，按任务类型白名单
+# 豁免回测类（candidate/nightly/strategy），发现类与交易时段保持原闸；保留停滞看门狗兜底。
+echo "==> 264 §NO-TIME-LIMIT-BACKTEST（非交易时段回测无时限 / 仅回测类 / 看门狗保留）..."
+fail264() {
+	echo "--- FAIL: §264 $*"
+	FAIL=1
+	B264_FAILED=1
+}
+CNT264=0
+
+# ① 豁免判定：白名单只含三种回测类型，时段复用 NightlyEligible（不另写钟点公式）。
+CNT264=$((CNT264 + 1))
+python3 - <<'PY' || fail264 "豁免判定缺失或白名单 broadening 到发现类（§264 ①）"
+import pathlib
+s = pathlib.Path("internal/scheduler/worker.go").read_text(encoding="utf-8")
+st = s.index("func noTimeLimitBacktest(")
+body = s[st:s.index("\n}\n", st)]
+for k in ("store.TaskBacktestCandidate", "store.TaskBacktestNightly", "store.TaskBacktestStrategy"):
+    assert k in body, "白名单漏 " + k
+assert "NightlyEligible(now, cfg)" in body, "时段判定必须复用 NightlyEligible"
+assert "store.TaskDiscoverFactors" not in body, "发现类不得被豁免（会独占唯一消费槽）"
+PY
+
+# ② 队首预算闸与运行侧预算截断都必须被豁免跳过（两处，缺一即半截规则）。
+CNT264=$((CNT264 + 1))
+python3 - <<'PY' || fail264 "nightcap 两道闸未同时跳过（§264 ②）"
+import pathlib
+s = pathlib.Path("internal/scheduler/worker.go").read_text(encoding="utf-8")
+assert 'if next.Priority == "low" && !noTimeLimitBacktest(next.Type, s.nowTime(), cfg) {' in s, \
+    "队首 defer 闸未被豁免"
+assert 'if !noTimeLimit && tk.Priority == "low" {' in s, "运行侧预算截断未被豁免"
+PY
+
+# ③ 无时限用 WithCancel（不是塞一个很大的 WithTimeout），且看门狗 6h 保留。
+CNT264=$((CNT264 + 1))
+python3 - <<'PY' || fail264 "无时限实现或看门狗保留缺失（§264 ③）"
+import pathlib
+s = pathlib.Path("internal/scheduler/worker.go").read_text(encoding="utf-8")
+assert "runCtx, cancel = context.WithCancel(base)" in s, "无时限回测必须用 WithCancel"
+assert "runCtx, cancel = context.WithTimeout(base, timeout)" in s, "其他任务必须仍受时间上限"
+assert "stallSecs = 6 * 60 * 60" in s, "无时限不等于无护栏：6h 停滞看门狗必须保留"
+PY
+
+# ④ 行为腿：豁免范围 / 交易时段不放开 / 超预算回测照跑且发现仍顺延（两向）。
+CNT264=$((CNT264 + 1))
+GO_RC=0
+go test ./internal/scheduler -run 'TestNoTimeLimitBacktestScope|TestNoTimeLimitBacktestSkipsNightcap|TestNightcapHeadBudgetDefersAndReleasesQueue|TestNightcapBudgetCapYieldsTask' -count=1 >/dev/null 2>&1 || GO_RC=$?
+[ "$GO_RC" = "0" ] || fail264 "调度器行为腿未过（§264 ④）"
+
+[ "${B264_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §264 §NO-TIME-LIMIT-BACKTEST 锁通过（白名单/两道闸/WithCancel+看门狗/行为腿，累计判定点 ${CNT264}）"
+echo ""

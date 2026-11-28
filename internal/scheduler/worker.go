@@ -479,6 +479,23 @@ func nightCapMinutes(cfg config.SchedulerConfig) int {
 	return cfg.PerTaskNightMaxMin
 }
 
+// noTimeLimitBacktest §NO-TIME-LIMIT-BACKTEST（2026-11-28 owner 裁决）：
+// 周末、节假日、交易日盘后/盘前等非交易时段跑回测，**不设执行时间上限**——
+// 候选 B4 / 夜间批量回填 / 战法库全量回放都是离线批活，跑到自然结束才有可比数据；
+// 用「单步超时」或「单夜占用上限」把它们截断，得到的是半截样本，比慢一点危害大得多。
+// 只放开**回测类**任务：发现/优化类仍受原闸约束，避免一条长任务独占唯一消费槽。
+// 非交易时段的判定直接复用 NightlyEligible（已含盘前门 + 交易窗口），不另写钟点公式。
+// English: during non-trading windows backtest tasks get no execution deadline and no
+// nightly budget cap; discovery/other task kinds keep the original guards.
+func noTimeLimitBacktest(kind string, now time.Time, cfg config.SchedulerConfig) bool {
+	switch kind {
+	case store.TaskBacktestCandidate, store.TaskBacktestNightly, store.TaskBacktestStrategy:
+	default:
+		return false
+	}
+	return NightlyEligible(now, cfg)
+}
+
 // tryStartNext 空闲则出队下一个任务并启动（带盘后门控+内存总闸）。任务完成后的自驱排水入口，
 // 不依赖 30s tick，长队列可在夜班窗口内连续消费。
 // English: dequeues and starts the next task when idle (after-hours + memory gated). Self-draining.
@@ -534,7 +551,7 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	// English: §NIGHTCAP head-side budget gate — when a low-priority task has less than
 	// MinNightStartMin minutes of night budget left, defer it instead of claiming; 'high'
 	// (manual urgent) tasks are never capped.
-	if next.Priority == "low" {
+	if next.Priority == "low" && !noTimeLimitBacktest(next.Type, s.nowTime(), cfg) {
 		if capMin := nightCapMinutes(cfg); capMin > 0 {
 			today := cntime.DayCompactOf(s.nowTime())
 			if left := store.NightBudgetLeftMin(next.NightUsedMin, next.NightDay, today, capMin); left < store.MinNightStartMin {
@@ -1345,6 +1362,10 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		fail(err.Error())
 		return
 	}
+	noTimeLimit := noTimeLimitBacktest(tk.Type, s.nowTime(), cfg)
+	if noTimeLimit {
+		log.Printf("[scheduler] 任务 #%d(%s) 非交易时段回测：按 owner 裁决不设执行时间上限（停滞看门狗保留）", tk.ID, tk.Type)
+	}
 	timeout := time.Duration(cfg.StepTimeoutMin) * time.Minute
 	if timeout <= 0 {
 		timeout = 90 * time.Minute
@@ -1362,11 +1383,12 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	// min(单步超时, 本夜剩余预算)。低优先级链任务再也吃不光整夜——到点子进程被杀，
 	// 终态走"让位"而不是"失败"（budgetCapped 标记在下面终态判定里分流）：
 	// progress/断点缓存保留，defer_day 写下一夜，两把熔断账都不动。
+	// §NO-TIME-LIMIT-BACKTEST：非交易时段的回测类任务整段跳过——owner 裁决回测跑完才有数据基础。
 	// English: §NIGHTCAP caps the *effective* per-run duration at the remaining night budget
 	// for low-priority tasks; the terminal-state router treats an expiry of that budget as a
 	// planned yield, not a failure.
 	budgetCapped := false
-	if tk.Priority == "low" {
+	if !noTimeLimit && tk.Priority == "low" {
 		if capMin := nightCapMinutes(cfg); capMin > 0 {
 			today := cntime.DayCompactOf(s.nowTime())
 			if left := store.NightBudgetLeftMin(tk.NightUsedMin, tk.NightDay, today, capMin); left >= 0 {
@@ -1379,7 +1401,15 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			}
 		}
 	}
-	runCtx, cancel := context.WithTimeout(base, timeout)
+	// 无时限回测用 WithCancel 而非超时 context：WithTimeout 即便塞进极大 Duration 也仍是
+	// 「时间限制」，且会污染终态判定（deadline exceeded 被当成超时）。
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	if noTimeLimit {
+		runCtx, cancel = context.WithCancel(base)
+	} else {
+		runCtx, cancel = context.WithTimeout(base, timeout)
+	}
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, bin, args...)
 	cmd.Dir = dirOfDB(cfg)
@@ -1623,7 +1653,11 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		store.TaskDiscoverFactors:  true, store.TaskDiscoverPatterns: true,
 	}
 	stallSecs := 30 * 60
-	if tk.Priority != "high" {
+	if noTimeLimit {
+		// 无时限不等于无护栏：仍留 6h 停滞看门狗，真卡死的任务不能永久霸占唯一槽位。
+		// 正常回测每 10% 事件打一行「回测进度」，6h 无输出才是真异常。
+		stallSecs = 6 * 60 * 60
+	} else if tk.Priority != "high" {
 		// low 夜间任务：以单步硬超时的 2/3 为停滞阈值。
 		// §质控全量回放：TaskBacktestStrategy 单步已放宽至 6h，停滞阈值随其 2/3
 		// （4h）联动，不再硬编码 120min——全市场质控池回放合法耗时可达数小时，

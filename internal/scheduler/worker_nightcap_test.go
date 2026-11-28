@@ -7,6 +7,9 @@
 //     本夜剩余预算，到点子进程被杀，终态走「让位」（queued+defer_day=下一夜、
 //     progress 保留、连败/累计两把熔断账都不动）而不是「失败」。
 //
+// §NO-TIME-LIMIT-BACKTEST（2026-11-28）适配：两腿都改用 discover_factors 作被预算闸
+// 约束的任务——新规则下周末回测类任务不受 nightcap 约束，继续用回测类会让这两条
+// 预算闸用例失去被测对象（不是把闸拆掉，是换一个仍在闸内的类型来验）。
 // 测试时钟说明：两腿都用注入时钟（周六盘后）。让位腿的 1 分钟预算截断原先发生在
 // context.WithTimeout 的**真实时间**上（预算按整数分钟×time.Minute，实测 ~65s）；
 // §TEST-SPEED 后经 setNightBudgetUnit 注入秒级单位，1 预算分钟＝1 秒真实时间，
@@ -82,13 +85,13 @@ func TestNightcapHeadBudgetDefersAndReleasesQueue(t *testing.T) {
 	}
 	defer qdb.Close()
 	aID, err := qdb.EnqueueResearchTask(&store.ResearchTask{
-		Type: store.TaskBacktestCandidate, RefID: 201, Priority: "low", Payload: `{}`,
+		Type: store.TaskDiscoverFactors, RefID: 201, Priority: "low", Payload: `{}`,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	bID, err := qdb.EnqueueResearchTask(&store.ResearchTask{
-		Type: store.TaskBacktestCandidate, RefID: 202, Priority: "low", Payload: `{}`,
+		Type: store.TaskDiscoverFactors, RefID: 202, Priority: "low", Payload: `{}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +181,7 @@ func TestNightcapBudgetCapYieldsTask(t *testing.T) {
 	}
 	defer qdb.Close()
 	id, err := qdb.EnqueueResearchTask(&store.ResearchTask{
-		Type: store.TaskBacktestCandidate, RefID: 301, Priority: "low", Payload: `{}`,
+		Type: store.TaskDiscoverFactors, RefID: 301, Priority: "low", Payload: `{}`,
 	})
 	if err != nil {
 		t.Fatal(err)
