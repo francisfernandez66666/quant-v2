@@ -239,6 +239,29 @@ FACTOR_LIBRARY = {
                   "direct": True, "missing_input": "eastmoney main-force net inflow, today"},
     "Flow5d": {"kind": "scalar_proxy", "windows": [], "input": "flow_5d_pct",
                "direct": True, "missing_input": "eastmoney main-force net inflow, 5 day"},
+    # REPLAY-INPUTS 2026-11-28 (owner ruling Q3): the two flow keys are SPLIT by denominator.
+    #   FlowToday / Flow5d        -> main net inflow / TURNOVER AMOUNT * 100  (same ruler as the
+    #                                market leg and the sector leg, and as flow_factor_daily).
+    #   FlowCapToday / FlowCap5d  -> main net inflow / FLOAT MARKET CAP * 100 (the pre-split
+    #                                formula, kept on purpose so it stays usable later).
+    # Until 2026-11-28 BOTH denominators were written into the SINGLE key flow_today_pct
+    # (stock leg used market cap, sector fallback used turnover) while one band scored them
+    # together -- the exact "band written on the wrong scale" shape. Two keys, two units.
+    # NO scalar_bands entry for these two on purpose: an uncalibrated band must abstain
+    # (rule declines) instead of scoring on an invented scale. The carrier's _scalar_score
+    # already returns None when no band exists for the factor id; the Go side mirrors that
+    # (internal/factor/market_scalar.go has no band for FlowCapToday/FlowCap5d either).
+    # BOOLEANS, NOT NUMBERS (why this comment sits here): the sibling IsLeader band is
+    # {min:0,max:1} WITHOUT mode=linear, and _scalar_score special-cases bool. A numeric 1
+    # there evaluates `0 <= 1 < 1` -> False -> a silent 0 score forever. Any new continuous
+    # reading MUST register mode=linear; never reuse IsLeader's threshold shape for one.
+    "FlowCapToday": {"kind": "scalar_proxy", "windows": [], "input": "flow_cap_today_pct",
+                     "direct": True,
+                     "missing_input": "main net inflow / float market cap (needs stock_moneyflow_daily "
+                                      "+ float shares; Beijing Exchange codes have no flow rows upstream)"},
+    "FlowCap5d": {"kind": "scalar_proxy", "windows": [], "input": "flow_cap_5d_pct",
+                  "direct": True,
+                  "missing_input": "5-session cumulative main net inflow / float market cap"},
     # P3 2026-11-27 (owner D2, bands approved): three new scalars the cloud now
     # bakes from data the sandbox cannot reach. Each is a plain scalar_proxy --
     # a band plus a value in ctx, nothing else -- so a missing bake declines the

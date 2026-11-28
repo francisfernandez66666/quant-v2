@@ -57,17 +57,24 @@ func main() {
 	finStart := flag.Int("fin-start", 2020, "财务起始年份")
 	finEnd := flag.Int("fin-end", time.Now().Year(), "财务结束年份")
 	withDelisted := flag.Bool("with-delisted", false, "§WS-D D-2 拉取已退市/暂停上市股票（list_status=L,D,P），消除回测幸存者偏差")
+	// §REPLAY-INPUTS 2026-11-28（档 2 前置）：`index` 子命令的两个专用参数。
+	// 为什么不复用 --start：--start 的缺省是 20200101，"没传"与"想从 2020 重刷"两种意图
+	// 在同一个字符串上分不开。补尾段缺口时正确起点是"各指数里最早的那个末行日"（现网实测
+	// 000300/000001 止于 20261118、000852/000905 止于 20261106 ⇒ 应从 20261106 起，
+	// 一次把四只都补齐）；只有刻意重刷全历史才需要显式给 --index-start。
+	indexStart := flag.String("index-start", "", "index 子命令起始日 YYYYMMDD（空＝自动取各指数库内最小末行日）")
+	mapPath := flag.String("map", "", "sector-map 子命令的输入 JSON（生产者产出的 sector_map.json）")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 1 {
 		// 子命令清单必须与下面的 switch 同面：旧文案只列到 amount-check，
 		// 让人以为 hithink-sync/ths-backfill 不存在只能去读源码——文案过时比缺失更难查。
-		log.Fatalf("用法: dataload [flags] <full|daily|meta-dates|finance|bars ts_code|verify|amount-check|hithink-sync|ths-backfill|minute-sync|pool-probe>")
+		log.Fatalf("用法: dataload [flags] <full|daily|meta-dates|finance|bars ts_code|verify|amount-check|hithink-sync|ths-backfill|minute-sync|pool-probe|index|sector-map|leader-rank>")
 	}
 	cmd := args[0]
 
-	if (cmd == "full" || cmd == "daily") && *provider == "tushare" && *token == "" {
+	if (cmd == "full" || cmd == "daily" || cmd == "index") && *provider == "tushare" && *token == "" {
 		log.Fatalf("--provider tushare 需要 --token")
 	}
 
@@ -127,6 +134,34 @@ func main() {
 		}
 		if err != nil {
 			log.Fatalf("daily 失败: %v", err)
+		}
+	case "index":
+		// §REPLAY-INPUTS 档 2 前置（2026-11-28）：只补 index_daily 的尾段缺口。
+		// 为什么要单开子命令而不是让人跑 `full`：现网实测四只指数分别止于 20261118 / 20261106，
+		// 要补的只是最近 9 个交易日；而 `full` 会把元数据 + 全市场逐票日线 + 复权 + 涨跌停整链
+		// 重跑一遍（800 万行级），为了 36 行去跑 full 属于"用推倒库的方式补一个洞"。
+		// 两条 provider 都能拨：baostock 走 pydata 的 index_kline（amount 已是元），
+		// tushare 走 IndexDaily（amount 千元，由 loadIndex 内写侧归一）。
+		if err := runIndexGap(db, bsClient, *provider, *token, *indexStart, *start, *end); err != nil {
+			log.Fatalf("index 失败: %v", err)
+		}
+	case "sector-map":
+		// §REPLAY-INPUTS 档 2 前置：把生产者当日产出的 sector_map.json 存档成历史表
+		// （sector_map_daily），让板块归属从"只有今天一份快照"变成可回溯的时间序列——
+		// 否则龙头/板块分位永远只能在快照当天之后有效，拿单日快照回填历史就是前视。
+		// 由 quant-sector-map.service 的 ExecStartPost 调用（一份数据、两个消费者，
+		// **不新开一次 5–8 分钟的板块遍历抓取**）。
+		if err := runSectorMapArchive(db, *mapPath); err != nil {
+			log.Fatalf("sector-map 失败: %v", err)
+		}
+	case "leader-rank":
+		// §REPLAY-INPUTS 档 2：龙头代理分位的当日横截面预计算（sector_map_daily × daily.pct_chg）。
+		// 为什么不是 cmd/leader_rank_daily 独立二进制（v3 原写法）：写 trading.db 的活儿在
+		// `cmd/dataload` 已经有一整套（开库/日尺/InsertRows 白名单/量纲归一/断点），
+		// 再开第六枚二进制等于把这些纪律复制一份——本仓"第二本账"的教训就是这个形状。
+		// 输入只有库里已有的两张表，**不打任何外网**，可以在任何时段安全重跑。
+		if err := runLeaderRank(db, *start, *end); err != nil {
+			log.Fatalf("leader-rank 失败: %v", err)
 		}
 	case "meta-dates":
 		// §B4-META 一次性回填上市/退市元数据（baostock stock_basic 全表，单调用非逐票）。

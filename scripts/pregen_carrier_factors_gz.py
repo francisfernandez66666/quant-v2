@@ -73,6 +73,12 @@ ANN_FALLBACK_DAYS = int(os.environ.get("PREGEN_ANN_FALLBACK_DAYS", "120"))
 #    注意 pregen 是**盘前**跑的，"今日"的个股资金流结构上不可能存在，所以判据是
 #    "最近若干个自然日内"而不是"必须是今天"；代理来源会在 flow_src 里如实标注。
 FLOW_FRESH_DAYS = int(os.environ.get("PREGEN_FLOW_FRESH_DAYS", "5"))
+# FLOW_WINDOW 资金流窗口天数（5 日档）。判据与 Go 侧 internal/research/market_legs.go 的
+# flowWindowSessions 同义——**两处不许各自改数**（改了载体与回放就是两个窗口在打分）。
+FLOW_WINDOW = 5
+# FLOW_CAP_ROUND 占流通市值那一档的小数位。它必须是 8（见写点注释）：
+# 这个量纲是 1e-5 级，4 位精度会把绝大多数票烘成 0.0 —— 旧写法就栽在这里。
+FLOW_CAP_ROUND = 8
 # ③ 板块连接键（sector_map）是**结构表**不是日读数：板块成分不会每天大改，
 #    但也不能拿一张很旧的表冒充。超过这个天数就不烘板块代理（宁可弃权）。
 SECTOR_MAP_MAX_AGE_DAYS = int(os.environ.get("PREGEN_SECTOR_MAP_MAX_AGE_DAYS", "10"))
@@ -473,6 +479,71 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares
             acc += math.log(value / base)
             cum.append(acc)
         out["cmra"] = round(max(cum) - min(cum), 6)
+    # §REPLAY-INPUTS 2026-11-28（档 3/档 4）：资金流输入**优先读库**。
+    # 原来只读 `<DataDir>/moneyflow_history/<code>.json`——那是引擎"偶然碰到某只票才缓存"的副产品
+    # （现网实测 2870 个文件里 68.1% 的末根已超过 5 天），既不是采集也没有覆盖率。
+    # 现在唯一写口是 `quant-moneyflow.service`（15:35 timer，上游 120 根滚动窗口），
+    # json 只作**旧库尚未回填时的兜底**：它没有 f57 净占比，因此只能支撑"占流通市值"那一条腿，
+    # 绝不能拿它去填 flow_today_pct——那会把"占成交额"的键写成另一种量纲（本批要消灭的缺陷）。
+    # 先落一个 False：库路径命中后置 True，下面的 json 兜底与板块兜底都**只在还没数时**才写。
+    # 这个顺序不能颠倒——被后面的 `stock_flow_done = False` 抹掉的话，
+    # 板块腿会覆盖刚拿到的个股读数，而两边代码各自看起来都完全正确。
+    stock_flow_done = False
+    # ── 库路径（首选）：stock_moneyflow_daily 由 15:35 的 systemd timer 天天追加 ──
+    # 判据分两层，各管各的，不许互相顶班：
+    #   当日档：取"不晚于烘参日的最后一行"，再按 FLOW_FRESH_DAYS 判新鲜——
+    #     与 json 路径同语义（盘前跑时"今日"结构上不存在，判据只能是末根账龄而不是必须今天）。
+    #   5 日档：要求那 5 天是该股**自己的连续交易日**（daily 序列）且每天都有行、成交额都在。
+    #     中间断一天还硬算，等于拿 6 日窗口的比率冒充 5 日窗口——数值正常、语义已变。
+    try:
+        flow_rows = _q(
+            "SELECT trade_date, main_net, main_pct, amount FROM stock_moneyflow_daily "
+            "WHERE ts_code=? AND trade_date<=? ORDER BY trade_date DESC LIMIT %d" % FLOW_WINDOW,
+            (ts, bake_day)) or []
+        session_days = [str(r[0]) for r in (_q(
+            "SELECT trade_date FROM daily WHERE ts_code=? AND trade_date<=? "
+            "ORDER BY trade_date DESC LIMIT %d" % FLOW_WINDOW, (ts, bake_day)) or [])]
+    except TypeError:
+        flow_rows, session_days = [], []
+    have = {str(r[0]): r for r in flow_rows}
+    if have:
+        newest = max(have.keys())
+        fresh = False
+        try:
+            age = (datetime.strptime(bake_day, "%Y%m%d").date()
+                   - datetime.strptime(newest, "%Y%m%d").date()).days
+            fresh = 0 <= age <= FLOW_FRESH_DAYS
+        except ValueError:
+            fresh = False
+        if fresh:
+            row = have[newest]
+            if row[2] is not None:
+                out["flow_today_pct"] = round(float(row[2]), 4)
+            window = [d for d in session_days if d <= newest][:FLOW_WINDOW]
+            if len(window) == FLOW_WINDOW and all(d in have for d in window):
+                nets = [float(have[d][1] or 0.0) for d in window]
+                amts = [have[d][3] for d in window]
+                if all(a is not None and float(a) > 0 for a in amts):
+                    out["flow_5d_pct"] = round(
+                        sum(nets) / sum(float(a) for a in amts) * 100.0, 4)
+            cap_den = 0.0
+            if float_shares and closes:
+                cap_den = float(float_shares) * closes[0]
+            elif circ and circ[0] and circ[0][0]:
+                cap_den = float(circ[0][0]) * 10000.0  # circ_mv 万元 -> 元
+            if cap_den > 0:
+                # ★ 精度必须是 8 位，不是沿用上面那两条的 4 位：
+                #   占流通市值这个量纲天生是 1e-5 级（5000 万净额 / 1.2e10 市值 ≈ 4.2e-4 %）。
+                #   旧写法 round(...,4) 会把绝大多数票**直接压成 0.0**——现网实测确实如此，
+                #   于是 band(-0.5..1.2) 把它恒定读成 0.29 分，这条腿实际上一直在给常数。
+                #   这是本批新抓到的成因（除了 68% 末根陈旧之外的第二个"腿在但等于没用"）。
+                out["flow_cap_today_pct"] = round(float(row[1] or 0.0) / cap_den * 100.0, FLOW_CAP_ROUND)
+                if "flow_5d_pct" in out:
+                    out["flow_cap_5d_pct"] = round(sum(nets) / cap_den * 100.0, FLOW_CAP_ROUND)
+            out["flow_src"] = "stock_db"
+            out["flow_src_day"] = newest
+            stock_flow_done = True
+
     flow_path = os.path.join(FLOW_DIR, code6 + ".json")
     circ = _q("SELECT circ_mv FROM daily_basic WHERE ts_code=? AND circ_mv IS NOT NULL "
               "ORDER BY trade_date DESC LIMIT 1", (ts,))
@@ -480,7 +551,6 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares
         flow_doc = json.load(open(flow_path, encoding="utf-8")) if os.path.exists(flow_path) else None
     except (OSError, ValueError):
         flow_doc = None
-    stock_flow_done = False
     if flow_doc and isinstance(flow_doc.get("days"), list) and flow_doc["days"]:
         days = flow_doc["days"][-5:]
         mains = [float(d.get("MainNet") or 0) for d in days]
@@ -503,13 +573,20 @@ def bake_bakeables(symbol, params_doc, lu_boards=None, market=None, float_shares
                 cap = float(float_shares) * closes[0]
             elif circ and circ[0] and circ[0][0]:
                 cap = float(circ[0][0]) * 10000.0  # circ_mv 万元 -> 元
-            if cap > 0:
-                out["flow_today_pct"] = round(mains[-1] / cap * 100.0, 4)
+            # §REPLAY-INPUTS 拆两键（owner 2026-11-28 裁决 Q3）：
+            #   flow_today_pct / flow_5d_pct   = 主力净额 ÷ **成交额** ×100（与大盘腿、板块腿同一把尺）
+            #   flow_cap_today_pct / flow_cap_5d_pct = 主力净额 ÷ **流通市值** ×100（原公式，留档备后续）
+            # 本 json 分支只有净额、没有占比，因此**只写 cap 那一侧**；
+            # 占成交额那一侧交给下面的库路径或板块兜底腿，绝不拿另一种量纲冒充。
+            if cap > 0 and "flow_cap_today_pct" not in out:
+                # 同上：cap 量纲要 8 位精度，4 位会把绝大多数票压成 0。
+                out["flow_cap_today_pct"] = round(mains[-1] / cap * 100.0, FLOW_CAP_ROUND)
                 if len(mains) >= 2:
-                    out["flow_5d_pct"] = round(sum(mains) / cap * 100.0, 4)
-                out["flow_src"] = "stock"
+                    out["flow_cap_5d_pct"] = round(sum(mains) / cap * 100.0, FLOW_CAP_ROUND)
+                out["flow_src"] = "stock_json_cap_only"
                 out["flow_src_day"] = last_day
-                stock_flow_done = True
+                # json 只有净额、没有占比 ⇒ 占成交额那一侧仍无读数，
+                # 所以**不置 stock_flow_done**：板块兜底仍可去补 flow_today_pct（同一量纲）。
     # 第二源（板块级回退）：个股资金流不新鲜时，用该股所属板块的净流入率代理。
     # flow_resid 是**板块级** z 分（与个股级 flow_today_pct/flow_5d_pct 分属两条腿），
     # 与个股腿是否新鲜无关，只要有板块表就烘。两源都不许"编 0"：都缺就不烘键。

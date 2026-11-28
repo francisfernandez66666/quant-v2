@@ -35,10 +35,15 @@ SCHEMA = """
 CREATE TABLE daily_basic (
     ts_code TEXT, trade_date TEXT, pe_ttm REAL, pb REAL, ps_ttm REAL,
     pcf_ttm REAL, dv_ttm REAL, turnover_rate REAL, total_share REAL, circ_mv REAL);
+-- §REPLAY-INPUTS 2026-11-28 修夹具漂移：bc0c365 给 pregen 的财务查询加了
+-- yoy_net_profit，但这张测试表没有该列 ⇒ 查询报错被 _q 的 except 吞成 None，
+-- 整个财务块静默跳过，表现是 fin_pit/fin_series 两个键凭空不见（KeyError）。
+-- 这类"吞错的只读 helper + 漂移的夹具 schema"组合会让测试红得毫无指向，
+-- 所以补列的同时在下面注释里写清成因。
 CREATE TABLE fina_indicator (
     ts_code TEXT, end_date TEXT, ann_date TEXT, eps REAL, roe REAL, roe_waa REAL,
     roa REAL, grossprofit_margin REAL, netprofit_margin REAL,
-    debt_to_assets REAL, yoy_or REAL);
+    debt_to_assets REAL, yoy_or REAL, yoy_net_profit REAL);
 CREATE TABLE daily (ts_code TEXT, trade_date TEXT, close REAL);
 CREATE TABLE sector_flow_daily (
     sector TEXT, trade_date TEXT, net_inflow REAL, amount REAL);
@@ -112,13 +117,14 @@ class PregenNewSeries20261127(unittest.TestCase):
         return (TS_CODE, day, 10.0, 1.2, 2.0, 30.0, 2.5, turnover, total_share, circ_mv)
 
     def _fin_row(self, end_date, ann_date, roe, eps=0.5):
-        return (TS_CODE, end_date, ann_date, eps, roe, roe, 6.0, 30.0, 8.0, 40.0, 5.0)
+        # 12 列（含 yoy_net_profit）：与上面建表逐位对齐
+        return (TS_CODE, end_date, ann_date, eps, roe, roe, 6.0, 30.0, 8.0, 40.0, 5.0, 5.0)
 
     # ---- ① ann_date 前视闸 ------------------------------------------------
     def test_ann_fallback_keeps_undisclosed_out(self):
         # 20260930 + 120 天 = 20270128 > 20261127 ⇒ 尚未披露，不许算进来；
         # 20260630 + 120 天 = 20261028 ≤ 20261127 ⇒ 已披露，采纳。
-        self._exec("INSERT INTO fina_indicator VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+        self._exec("INSERT INTO fina_indicator VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
             self._fin_row("20260930", None, 9.0),          # 未披露（回退日仍在未来）
             self._fin_row("20260630", None, 8.0),          # 回退日已过 ⇒ 最新可采纳
             self._fin_row("20260331", "20260428", 7.0),    # 显式公告日
@@ -131,7 +137,7 @@ class PregenNewSeries20261127(unittest.TestCase):
 
     def test_ann_date_with_dashes_is_normalized(self):
         # tushare 两种日期形态混排（20261031 / 2026-10-31），切片前必须先归一。
-        self._exec("INSERT INTO fina_indicator VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+        self._exec("INSERT INTO fina_indicator VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
             self._fin_row("2026-09-30", "2026-10-31", 6.5),
         ])
         out = self._bake(day=BAKE_DAY)
@@ -189,15 +195,28 @@ class PregenNewSeries20261127(unittest.TestCase):
             json.dump(doc, fh)
 
     def test_stock_flow_wins_when_fresh(self):
+        """json 缓存新鲜时烘出来的是**占流通市值**那一档（§REPLAY-INPUTS 2026-11-28 拆键后）。
+
+        本用例原来断言的是 `flow_today_pct == 5.0`——那是拆键**之前**的形状：
+        同一个键里，个股腿写的是"净额/流通市值"、板块兜底腿写的是"净额/成交额"，
+        两种量纲吃同一条 band（owner 2026-11-28 裁决 Q3 要求拆开）。
+        json 缓存只有净额、没有 f57 占比 ⇒ 它**只能**支撑占流通市值那一侧，
+        所以数值仍是 5.0/15.0（算术一字未动），只是落在了 flow_cap_* 两个键上；
+        占成交额那一侧交给库路径（stock_moneyflow_daily，带 main_pct）或板块兜底腿。
+        见 tests/test_pregen_stock_flow_20261128.py 对库路径与两档并存的完整锁。
+        """
         self._exec("INSERT INTO daily_basic VALUES (?,?,?,?,?,?,?,?,?,?)",
                    [self._basic_row("20261126", total_share=None, circ_mv=None)])
         self._exec("INSERT INTO daily VALUES (?,?,?)", [(TS_CODE, "20261126", 10.0)])
         self._write_flow("2026-11-26", [1e7, 2e7, 3e7, 4e7, 5e7])
         out = self._bake(day=BAKE_DAY, float_shares=1e8)
         # cap = 流通股本 1e8 × 收盘 10 = 1e9；末根 5e7 ⇒ 5%；五日 1.5e8 ⇒ 15%
-        self.assertEqual(out["flow_src"], "stock")
-        self.assertAlmostEqual(out["flow_today_pct"], 5.0, places=4)
-        self.assertAlmostEqual(out["flow_5d_pct"], 15.0, places=4)
+        self.assertEqual(out["flow_src"], "stock_json_cap_only")
+        self.assertAlmostEqual(out["flow_cap_today_pct"], 5.0, places=4)
+        self.assertAlmostEqual(out["flow_cap_5d_pct"], 15.0, places=4)
+        # 占成交额那一侧 json 给不出 ⇒ 绝不冒充（有值就等于编数）
+        self.assertNotIn("flow_today_pct", out)
+        self.assertNotIn("flow_5d_pct", out)
         self.assertEqual(out["flow_src_day"], "20261126")
 
     def test_sector_proxy_when_stock_flow_is_stale(self):

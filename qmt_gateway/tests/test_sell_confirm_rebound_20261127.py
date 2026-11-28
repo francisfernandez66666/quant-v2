@@ -41,6 +41,8 @@ class _FakeContext(object):
 _MID_SESSION = datetime(2026, 11, 27, 10, 30)
 
 
+# 直接加载构建产物（而不是仓库源文件）：本批断言的是「烘进沙箱的那一份」的行为，
+# 读源码只能证明我写了，不能证明它进了产物。
 def _load_sandbox(out_dir):
     builder = os.path.join(REPO, "scripts", "build_local_executor.py")
     proc = subprocess.run([sys.executable, builder, "--target", "sandbox",
@@ -147,6 +149,8 @@ class ReboundRoundTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.dir, ignore_errors=True)
 
+    # 每例都从 PARAMS 快照起步并逐键改：观察窗的等待状态挂在模块进程内，
+    # 不清就会把上一例的时刻带进下一例——那是假绿的一种。
     def setUp(self):
         m = self.mod
         self.symbol = "000001.SZ"

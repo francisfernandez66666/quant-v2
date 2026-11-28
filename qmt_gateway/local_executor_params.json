@@ -1048,6 +1048,20 @@
         "direct": true,
         "missing_input": "eastmoney main-force net inflow, 5 day"
       },
+      "FlowCapToday": {
+        "kind": "scalar_proxy",
+        "windows": [],
+        "input": "flow_cap_today_pct",
+        "direct": true,
+        "missing_input": "main net inflow / float market cap (cloud bake; scalar_band pending owner calibration)"
+      },
+      "FlowCap5d": {
+        "kind": "scalar_proxy",
+        "windows": [],
+        "input": "flow_cap_5d_pct",
+        "direct": true,
+        "missing_input": "5-session cumulative main net inflow / float market cap (band pending)"
+      },
       "stom_21": {
         "kind": "scalar_proxy",
         "windows": [],

@@ -187,6 +187,8 @@ class HotReloadSidePolicyTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.mod.SIDE_POLICY_REQ))
         self.assertEqual(self.mod._read_json(self.mod.SIDE_POLICY_PENDING), {})
 
+    # 挂起即短路：加急通道判「该等」时必须立刻返回，既不烘焙也不 ssh ——
+    # 留着往下走的表现是「空转几十秒还顺手投了一次盒」。
     def test_deferred_short_circuits_urgent_run_without_bake_or_ssh(self):
         req = self._defer_req()
         self.mod._atomic_json(self.mod.SIDE_POLICY_REQ, req)

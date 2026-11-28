@@ -16,6 +16,15 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 /opt/quant/carrier_build/scripts/pregen_sector_map_gz.py
+# §REPLAY-INPUTS 2026-11-28（档 2 前置）：当日这份归属表**顺手存档成历史**，
+# 再按归属算当日龙头代理分位（写 leader_rank_daily）。
+# 为什么挂在这里而不是新开一条 timer：生产者已经付过一次 5–8 分钟的中继成本，
+# 再开一条去重抓一遍等于重复付费；而"归属只有当日一份快照"正是板块/龙头分位
+# 历史只能从今天起攒的原因（方案 §2.2 第 6 条）。
+# 两步都在库内运算、不打外网，任何时刻重跑都安全；用 `ExecStartPost=-` 前缀容错：
+# Post 失败不把本 unit 判红（上面那份 json 才是载体烘参的输入，不能被下游步骤连坐）。
+ExecStartPost=-/opt/quant/dataload --db /var/lib/quant-trading-v2/trading.db sector-map
+ExecStartPost=-/opt/quant/dataload --db /var/lib/quant-trading-v2/trading.db leader-rank
 Environment=CARRIER_BUILD_DIR=/opt/quant/carrier_build
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
 Environment=OWNER_UID=u_1785377969825355000

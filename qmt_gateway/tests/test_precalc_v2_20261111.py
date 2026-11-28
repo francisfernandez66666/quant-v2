@@ -35,11 +35,13 @@ def research_db(tmp_path, monkeypatch):
         conn.execute("INSERT INTO daily_basic VALUES (:c, :d, 51.8, 3.5, 2.7, 12.4, 2.6, 8.4,"
                      " 91000.0, 210000)",
                      {"c": "600580.SH", "d": "2026%02d01" % (i + 1)})
+    # §REPLAY-INPUTS 2026-11-28：补 yoy_net_profit 列（pregen 的查询在 bc0c365 起带这一列，
+    # 表里没有 ⇒ _q 吞错返回 None ⇒ fin_pit 整块缺席，用例以 KeyError 收场）。
     conn.execute("CREATE TABLE fina_indicator (ts_code TEXT, end_date TEXT, ann_date TEXT,"
                  " eps REAL, roe REAL, roe_waa REAL, roa REAL, grossprofit_margin REAL,"
-                 " netprofit_margin REAL, debt_to_assets REAL, yoy_or REAL)")
+                 " netprofit_margin REAL, debt_to_assets REAL, yoy_or REAL, yoy_net_profit REAL)")
     conn.execute("INSERT INTO fina_indicator VALUES ('600580.SH','20260930','20261028',"
-                 "0.19,1.36,1.30,0.86,25.70,4.41,60.1,12.3)")
+                 "0.19,1.36,1.30,0.86,25.70,4.41,60.1,12.3,9.9)")
     conn.execute("CREATE TABLE d1_scores (date TEXT, code TEXT, score REAL, blocked INT,"
                  " reason TEXT, created_at TEXT)")
     conn.execute("INSERT INTO d1_scores VALUES ('20261111','600580','18.0',0,'电机事件','2026-11-11 15:06')")
@@ -78,9 +80,19 @@ def test_bake_bakeables_shapes_align_consumers(research_db):
     assert len(out["turnover_series"]) == 20
     # 财务分位：_pit_value 按字段取最新档
     assert out["fin_pit"]["roe"] == pytest.approx(1.36)
-    # 资金流标量：MainNet/流通市值（今日为净流入 -> 正）
-    assert out["flow_today_pct"] > 0
-    assert out["flow_5d_pct"] < out["flow_today_pct"]
+    # 资金流标量（§REPLAY-INPUTS 2026-11-28 拆两键，owner 裁决 Q3）：
+    #   flow_today_pct/flow_5d_pct = 主力净额 ÷ **成交额**（与大盘腿、板块腿同一把尺）
+    #   flow_cap_today_pct/flow_cap_5d_pct = 主力净额 ÷ **流通市值**（原公式，留档）
+    # 本夹具只有引擎缓存 json（仅 MainNet，没有占比/成交额），因此 cap 那一侧有读数、
+    # 占成交额那一侧**必须缺席**——拿另一种量纲填进 flow_today_pct 就是本批要消灭的缺陷。
+    cap = 210000 * 10000.0  # daily_basic.circ_mv（万元）→ 元，与 pregen 同一处换算
+    today_net = 12000000.0
+    five_net = -47401832.0 - 37376221.0 + today_net
+    assert out["flow_cap_today_pct"] == pytest.approx(today_net / cap * 100.0)
+    assert out["flow_cap_5d_pct"] == pytest.approx(five_net / cap * 100.0)
+    assert out["flow_src"] == "stock_json_cap_only"
+    assert "flow_today_pct" not in out
+    assert "flow_5d_pct" not in out
     # 新闻事件 = D1 分数（非 blocked 原值），概念热度 = 利好池强度分
     assert out["news_event"] == pytest.approx(18.0)
     assert out["concept_heat"] == pytest.approx(0.94)

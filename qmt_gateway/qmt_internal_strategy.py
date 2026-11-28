@@ -3931,16 +3931,30 @@ def build_context(ContextInfo, symbol, moment, orders, positions, cash):
         "turnover_series": pre.get("turnover_series"),
         "total_share_series": pre.get("total_share_series"),
         "fin_pit": pre.get("fin_pit"),
+        # REPLAY-INPUTS 2026-11-28 (owner ruling Q3): the flow keys are SPLIT by
+        # denominator instead of one key carrying two units.
+        #   flow_today_pct / flow_5d_pct        = net inflow / TURNOVER AMOUNT * 100
+        #   flow_cap_today_pct / flow_cap_5d_pct = net inflow / FLOAT MARKET CAP * 100
+        # Before this batch the stock leg baked the MARKET-CAP unit while the sector
+        # fallback baked the TURNOVER unit into the SAME key (pregen lines 502-527),
+        # and one band scored both. The split removes that; the pre-split formula
+        # survives under the *_cap_* names so it stays usable later.
         "flow_today_pct": pre.get("flow_today_pct"),
         "flow_5d_pct": pre.get("flow_5d_pct"),
+        "flow_cap_today_pct": pre.get("flow_cap_today_pct"),
+        "flow_cap_5d_pct": pre.get("flow_cap_5d_pct"),
         # SIZING-FLOW-ALIAS 2026-11-20: rules_sizing.SIZING_CTX_KEYS declares
         # flow_ratio_today / flow_ratio_5d (the two names both Go sizing factors
         # read), while this builder only ever wrote flow_today_pct / flow_5d_pct
         # -- so the whole net-inflow factor leg was structurally abstaining on the
-        # box. The baked values are already PERCENT net-inflow rates over
-        # circulating market cap (pregen: MainNet / circ_mv * 100), exactly the
-        # unit the baked flow_*_scales bands expect, so this is an alias, not a
-        # conversion. Absent stays None = honest abstain (flow_factor.go:88-113).
+        # box. These are ALIASES, not conversions (same unit, same number).
+        # WHICH unit they now alias matters: after the split above they follow
+        # flow_today_pct = net / TURNOVER * 100. That is the unit the sizing bands
+        # mostly saw in practice anyway -- on the live box 68.1% of the per-stock
+        # flow caches were stale (>5 days, measured 2026-11-28), so the sector
+        # fallback (already turnover-based) was the dominant supplier. Keeping the
+        # alias on the turnover unit therefore does NOT move the sizing scale for
+        # the names that actually had readings; a market-cap unit would have.
         "flow_ratio_today": pre.get("flow_today_pct"),
         "flow_ratio_5d": pre.get("flow_5d_pct"),
         # P3 2026-11-27: board-level net-inflow z-score (cloud bake). A DIFFERENT
