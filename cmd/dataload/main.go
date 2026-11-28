@@ -38,8 +38,13 @@ import (
 // defaultDB 默认研究库路径（与引擎配置目录一致）。
 var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.db")
 
-// indexCodes 基准/风格指数（超出基准收益用）。
-var indexCodes = []string{"000300.SH", "000905.SH", "000852.SH"}
+// indexCodes 需要装载的指数日线集合（基准/风格 + 上证综指）。
+// ★ 这份清单是**唯一**真源：`indexGapCodes`（补洞判据）与 baostock 腿都从它派生，
+// 两边各写一份就会漂成"判据要求 000001.SH、装载腿从来不拉它"——2026-11-28 部署首跑
+// 实测到的就是这个形状：`dataload index` 永远报 `仍缺 000001.SH`，而装载日志里连一行
+// 000001.SH 都没有（不是失败，是根本没请求）。
+// 000001.SH 是上证综指：`IndexChange` 大盘腿与指数兜底都会读它，库里同样要连续。
+var indexCodes = []string{"000001.SH", "000300.SH", "000905.SH", "000852.SH"}
 
 // main 数据装载入口：解析 flags 与子命令，按 provider 分派到 baostock/tushare 实现，
 // 并完成库打开、校验与各子命令的错误处理。

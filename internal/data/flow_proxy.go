@@ -18,6 +18,7 @@ package data
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +26,15 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrFlowNoData 上游**明确没有这只/这段数据**（东财 rc=100/102，典型是已退市或长期停牌）。
+//
+// 为什么必须是独立哨兵：盒子中继把"上游 rc=100"包成 HTTP 502，与真正的中继故障
+// （超时、鉴权、隧道断）在状态码上同形。2026-11-28 首采实测踩到这一点——
+// 连号退市票（000003/000013/000015/000022/000043…）被逐只记成"中继失败"，
+// 攒到连续 20 只就把整轮 seed 中止在 3.6% 覆盖。**结构性没有 ≠ 抖动**：
+// 前者该进 state（下一轮别再问），后者才该重试。
+var ErrFlowNoData = errors.New("flow proxy: upstream has no data (rc=100/102)")
 
 // flowRelayEnvelope 是盒子 /flow/money 的响应外壳：upstream_body 是东财原始 body 字符串。
 type flowRelayEnvelope struct {
@@ -80,6 +90,11 @@ func (p *FlowProxy) relay(query url.Values) ([]byte, error) {
 		return nil, fmt.Errorf("flow proxy: read: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// 先判"上游明确没有数据"，再判中继故障：盒子对 rc=100/102 回 502，
+		// 不在这里分开的话，连号退市票会把采集器推进"连续失败"闸（见 ErrFlowNoData 注释）。
+		if flowUpstreamNoData(body) {
+			return nil, ErrFlowNoData
+		}
 		return nil, fmt.Errorf("flow proxy: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var env flowRelayEnvelope
@@ -87,12 +102,35 @@ func (p *FlowProxy) relay(query url.Values) ([]byte, error) {
 		return nil, fmt.Errorf("flow proxy: decode envelope: %v", err)
 	}
 	if !env.OK {
+		if flowUpstreamNoData(body) {
+			return nil, ErrFlowNoData
+		}
 		return nil, fmt.Errorf("flow proxy: upstream not ok (status=%d err=%s)", env.UpstreamStatus, env.Err)
 	}
 	if strings.TrimSpace(env.UpstreamBody) == "" {
 		return nil, fmt.Errorf("flow proxy: empty upstream body")
 	}
 	return []byte(env.UpstreamBody), nil
+}
+
+// flowUpstreamNoData 判断中继响应里上游 body 是不是"明确没有数据"（东财 rc=100/102）。
+// 只认这两个 rc：rc=0 但 data=null 的形态留给解析器按"空序列"处理，
+// 免得把"今天还没定型"误判成"这只票永久没有"。
+func flowUpstreamNoData(raw []byte) bool {
+	var env flowRelayEnvelope
+	if json.Unmarshal(raw, &env) != nil {
+		return false
+	}
+	if strings.TrimSpace(env.UpstreamBody) == "" {
+		return false
+	}
+	var up struct {
+		RC int `json:"rc"`
+	}
+	if json.Unmarshal([]byte(env.UpstreamBody), &up) != nil {
+		return false
+	}
+	return up.RC == 100 || up.RC == 102
 }
 
 // IndexMoneyFlow 经中继取 fflow 序列（secid 必须显式：大盘 1.000001、板块 90.BKxxxx）。

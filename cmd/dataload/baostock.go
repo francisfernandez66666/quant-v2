@@ -17,8 +17,10 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
-// bsIndexCodes 基准/风格指数（baostock 代码，与 Tushare 格式不同：sh.000300 等）。
+// bsIndexCodes 基准/风格指数 + 上证综指（baostock 代码，与 Tushare 格式不同：sh.000300 等）。
+// 与 `indexCodes` 必须同集合：判据侧要求四只都到目标日，装载侧少一只就是永远 PARTIAL。
 var bsIndexCodes = []struct{ code, name string }{
+	{"sh.000001", "000001.SH"}, // 上证综指（IndexChange 大盘腿）
 	{"sh.000300", "000300.SH"}, // 沪深300
 	{"sh.000905", "000905.SH"}, // 中证500
 	{"sh.000852", "000852.SH"}, // 中证1000

@@ -29,6 +29,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -148,14 +149,30 @@ func runDryRun(dbPath, gateway, tokenFile, configPath, codesFile string, sample 
 	// 抽样统计三件事：深度分布（min/max）、列宽（有没有 f57）、失败样本原文。
 	// 只抽样不写库——**一个字节都不落**（含标记），理由见函数头的 ★ 注。
 	maxRows, minRows, colsSeen := 0, 1<<30, ""
+	// ★ 第二返回值是 **isBSE（true＝跳过）**，不是 ok（2026-11-28 部署首跑抓到：
+	// 这里曾写成 `if !ok { continue }`，于是把每一只正常票都当成"该跳过"，
+	// 抽样 20 只一个请求都没发，读数却显示 `sampled=20`——这种"看起来跑过了"的假读数
+	// 正是本轮要消灭的形状）。
+	probed := 0
 	for _, code := range codes[:n] {
-		secid, ok := relaySecID(code)
-		if !ok {
+		secid, isBSE := relaySecID(code)
+		if isBSE || secid == "" {
 			continue
 		}
+		probed++
 		series, err := proxy.IndexMoneyFlow(secid, 101, 0)
 		if err != nil {
+			// rc=100/102 是"上游明确没有这只"（退市/长期停牌），不是失败：
+			// 干跑要把这两类分开报，否则连号退市票会让人以为中继坏了。
+			if errors.Is(err, data.ErrFlowNoData) {
+				fmt.Printf("MONEYFLOW_DRYRUN code=%s NO_DATA\n", code)
+				continue
+			}
 			fmt.Printf("MONEYFLOW_DRYRUN code=%s FAIL %v\n", code, err)
+			continue
+		}
+		if len(series) == 0 {
+			fmt.Printf("MONEYFLOW_DRYRUN code=%s NO_DATA(empty)\n", code)
 			continue
 		}
 		if len(series) > maxRows {
@@ -174,8 +191,14 @@ func runDryRun(dbPath, gateway, tokenFile, configPath, codesFile string, sample 
 		fmt.Printf("MONEYFLOW_DRYRUN code=%s rows=%d last_date=%s has_pct=%v\n",
 			code, len(series), series[len(series)-1].Date, series[len(series)-1].HasMainPct)
 	}
-	fmt.Printf("MONEYFLOW_DRYRUN_SUM rows_min=%d rows_max=%d cols=%s expect_depth=%d\n",
-		minRows, maxRows, colsSeen, upstreamDepth)
+	if probed == 0 {
+		return fmt.Errorf("抽样 %d 只没有一只能推出 secid（清单形状不对？）", n)
+	}
+	if minRows == 1<<30 {
+		minRows = 0
+	}
+	fmt.Printf("MONEYFLOW_DRYRUN_SUM probed=%d rows_min=%d rows_max=%d cols=%s expect_depth=%d\n",
+		probed, minRows, maxRows, colsSeen, upstreamDepth)
 	if maxRows < upstreamDepth {
 		// 上游深度不足不等于失败（新上市票本来就短），但**全体都短**说明中继在截断，
 		// 那就不能按"首采拿满 120 根"来规划——读数必须显形，不能悄悄降级。
@@ -395,7 +418,13 @@ func fetchOne(proxy *data.FlowProxy, db *store.DB, mode, code, secid string) (in
 	today := cntime.DayCompactOf(cntime.Now())
 	series, err := proxy.IndexMoneyFlow(secid, 101, 0)
 	if err != nil {
-		// 逐日历史整条不通 ⇒ 中继/上游问题，不落 state（明天再来）。
+		// 上游明确没有这只（东财 rc=100/102，典型是退市/长期停牌）⇒ no_data 并落 state，
+		// 下一轮不再重复问。**与中继抖动必须分开**：2026-11-28 首采实测，连号退市票
+		// 被误记成中继失败，攒到 20 只就把整轮 seed 中止在 3.6% 覆盖。
+		if errors.Is(err, data.ErrFlowNoData) {
+			return 0, fetchNoData
+		}
+		// 其余（超时/鉴权/隧道断）才是中继问题，不落 state（明天再来）。
 		return 0, fetchRelayError
 	}
 	if len(series) == 0 {

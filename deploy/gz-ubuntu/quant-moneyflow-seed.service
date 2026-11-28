@@ -17,8 +17,11 @@ Wants=network-online.target
 Type=oneshot
 # 同一个 flock（-n）：首采绝不能与 15:35 的日常采集并发——两条各打 5100 次上游，
 # 而且两份 state 会各写各的：后写那份把前一份记的 no_data 覆盖掉，等于白跳过。
-ExecStart=/usr/bin/flock -n /run/quant-moneyflow.lock /opt/quant/stockmoneyflow --db /var/lib/quant-trading-v2/trading.db --mode=seed --gateway-url http://10.77.0.2:8789 --token-file /etc/quant/moneyflow_relay_token --state /var/lib/quant-trading-v2/moneyflow_state.json --marker /var/lib/quant-trading-v2/moneyflow_run.json --rate 4 --concurrency 2 --seed-float-share-from-precalc /opt/quant/carrier_build/qmt_gateway/local_executor_precalc.json
+ExecStart=/usr/bin/flock -n /var/lib/quant-trading-v2/quant-moneyflow.lock /opt/quant/stockmoneyflow --db /var/lib/quant-trading-v2/trading.db --mode=seed --gateway-url http://10.77.0.2:8789 --token-file /etc/quant/moneyflow_relay_token --state /var/lib/quant-trading-v2/moneyflow_state.json --marker /var/lib/quant-trading-v2/moneyflow_run.json --rate 4 --concurrency 2 --seed-float-share-from-precalc /opt/quant/carrier_build/qmt_gateway/local_executor_precalc.json
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+# 与 append 腿同一个理由：trading.db 是 WAL 模式，root 写会留下 root 属主的 -wal/-shm。
+User=quant
+Group=quant
 CPUQuota=30%
 MemoryHigh=300M
 MemoryMax=400M

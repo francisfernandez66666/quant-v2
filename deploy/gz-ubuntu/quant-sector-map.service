@@ -28,6 +28,11 @@ ExecStartPost=-/opt/quant/dataload --db /var/lib/quant-trading-v2/trading.db lea
 Environment=CARRIER_BUILD_DIR=/opt/quant/carrier_build
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
 Environment=OWNER_UID=u_1785377969825355000
+# ★ 必须以 quant 身份跑（2026-11-28 部署时实读补上）：trading.db 是 **WAL** 模式，
+# 以 root 打开写会在同目录留下 root 属主的 -wal/-shm，之后 quant / quant-research
+# （都跑 quant 身份）再写同一份库就会 EACCES。carrier_build 与数据目录本就都是 quant 属主。
+User=quant
+Group=quant
 # 496 个行业板块 + 554 个概念板块，逐板块取成分（含分页），实测 5–8 分钟。
 TimeoutStartSec=1500
 # 失败不是"系统故障"，是"今天这条腿弃权"：不要 Restart，也不要让 unit 停在 failed 刷告警，

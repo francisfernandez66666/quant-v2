@@ -11,6 +11,7 @@ package data
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,43 @@ func TestFlowProxyErrorShapes(t *testing.T) {
 				t.Fatalf("错误应指明成因 %q, got %v", tc.wantSub, err)
 			}
 		})
+	}
+}
+
+// TestFlowProxyClassifiesUpstreamNoData 上游 rc=100/102（退市/长期停牌）必须归成 ErrFlowNoData。
+//
+// 现场（2026-11-28 首采）：盒子把 rc=100 包成 HTTP 502，与真中继故障同形；
+// 连号退市票被逐只记成"中继失败"，攒到 20 只就把整轮 seed 中止在 3.6% 覆盖。
+// 这条锁钉的是"结构性没有 ≠ 抖动"这个分界。
+func TestFlowProxyClassifiesUpstreamNoData(t *testing.T) {
+	noData := `{"ok":false,"upstream_status":200,"upstream_body":"{\"rc\":100,\"data\":null}","src":"eastmoney_fflow"}`
+	srv, _ := testFlowServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(noData))
+	})
+	p := NewFlowProxy(srv.URL, "tok")
+	if _, err := p.IndexMoneyFlow("0.000003", 101, 0); !errors.Is(err, ErrFlowNoData) {
+		t.Fatalf("rc=100 必须归成 ErrFlowNoData, got %v", err)
+	}
+
+	// 真中继故障（上游不可达，没有 rc）不许被误判成 no_data——否则这些票会被永久记进 state。
+	relayErr := `{"ok":false,"err":"upstream unavailable"}`
+	srv2, _ := testFlowServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(relayErr))
+	})
+	p2 := NewFlowProxy(srv2.URL, "tok")
+	if _, err := p2.IndexMoneyFlow("0.000003", 101, 0); err == nil || errors.Is(err, ErrFlowNoData) {
+		t.Fatalf("真中继故障不许归成 no_data, got %v", err)
+	}
+
+	// 200 + ok=false + rc=100 同一判定（盒子不同版本可能用 200 回 ok=false）。
+	srv3, _ := testFlowServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(noData))
+	})
+	p3 := NewFlowProxy(srv3.URL, "tok")
+	if _, err := p3.IndexMoneyFlow("0.000003", 101, 0); !errors.Is(err, ErrFlowNoData) {
+		t.Fatalf("ok=false + rc=100 也必须归成 ErrFlowNoData, got %v", err)
 	}
 }
 

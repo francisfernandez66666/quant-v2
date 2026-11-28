@@ -30,10 +30,11 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
-// indexGapCodes 需要补尾段的指数集合。含 000001.SH：
-// 它不在 indexCodes（超额基准用）里，但 `IndexChange` 的读侧与大盘腿都会碰到它，
-// 库里同样停在 20261118，一起补掉省得下次又发现半截。
-var indexGapCodes = []string{"000001.SH", "000300.SH", "000905.SH", "000852.SH"}
+// indexGapCodes 需要补尾段的指数集合——**直接引用 indexCodes 这一份真源**。
+// 曾经这里手写了第二份（含 000001.SH），而装载腿（bsIndexCodes / loadIndex）只拉三只，
+// 于是 `dataload index` 的结构性结局是"永远 PARTIAL"，而日志里根本看不到 000001.SH
+// 失败——它压根没被请求。两份清单合成一份后这类漂移不可能再发生。
+var indexGapCodes = indexCodes
 
 // runIndexGap 补 index_daily 尾段，并在写前/写后各读一次覆盖率自证。
 //

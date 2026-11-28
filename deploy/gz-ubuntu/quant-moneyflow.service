@@ -38,8 +38,14 @@ Type=oneshot
 # flock -n：日常那一腿与人工补跑/首采共用同一把锁（`/run/quant-moneyflow.lock`）。
 # 用 -n（拿不到锁就立刻失败）而不是排队等待：两条同时在跑 = 5100 只 ×2 次打同一条
 # 盒子中继，把自家 IP 推进东财风控的代价，远大于『今天这一趟不跑』。
-ExecStart=/usr/bin/flock -n /run/quant-moneyflow.lock /opt/quant/stockmoneyflow --db /var/lib/quant-trading-v2/trading.db --mode=append --gateway-url http://10.77.0.2:8789 --token-file /etc/quant/moneyflow_relay_token --state /var/lib/quant-trading-v2/moneyflow_state.json --marker /var/lib/quant-trading-v2/moneyflow_run.json --rate 4 --concurrency 2
+ExecStart=/usr/bin/flock -n /var/lib/quant-trading-v2/quant-moneyflow.lock /opt/quant/stockmoneyflow --db /var/lib/quant-trading-v2/trading.db --mode=append --gateway-url http://10.77.0.2:8789 --token-file /etc/quant/moneyflow_relay_token --state /var/lib/quant-trading-v2/moneyflow_state.json --marker /var/lib/quant-trading-v2/moneyflow_run.json --rate 4 --concurrency 2
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+# ★ 必须以 quant 身份跑（2026-11-28 部署时实读补上）：trading.db 是 **WAL** 模式，
+# 以 root 打开写会在同目录留下 root 属主的 `trading.db-wal`/`-shm`，
+# 之后 quant / quant-research（都跑 quant 身份）再写同一份库就会 EACCES。
+# 锁文件因此也不能放 /run（root 属主、非 root 不可建），改放数据目录。
+User=quant
+Group=quant
 CPUQuota=30%
 MemoryHigh=300M
 MemoryMax=400M

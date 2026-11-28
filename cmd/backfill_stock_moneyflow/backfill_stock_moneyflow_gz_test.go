@@ -447,6 +447,25 @@ func TestFetchOneRelayErrorWhenEnvelopeFails(t *testing.T) {
 	}
 }
 
+// TestFetchOneClassifiesUpstreamNoDataAsNoData 上游 rc=100/102（退市/长期停牌）必须是 no_data，
+// 不是 relay_error。现场（2026-11-28 首采）：连号退市票被误记成中继失败，攒到 20 只整轮中止。
+func TestFetchOneClassifiesUpstreamNoDataAsNoData(t *testing.T) {
+	db := newTestDB(t)
+	noData := `{"ok":false,"upstream_status":200,"upstream_body":"{\"rc\":100,\"data\":null}","src":"eastmoney_fflow"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(noData))
+	}))
+	t.Cleanup(srv.Close)
+	proxy := newProxyForTest(srv.URL)
+	if _, kind := fetchOne(proxy, db, "seed", "000003.SZ", "0.000003"); kind != fetchNoData {
+		t.Fatalf("rc=100 必须是 no_data（可落 state，下一轮别再问），得 %v", kind)
+	}
+	if n, _ := db.StockFlowSeries("000003.SZ", "20991231", 5); len(n) != 0 {
+		t.Fatalf("no_data 不得落行，得 %+v", n)
+	}
+}
+
 // newProxyForTest 用桩服务构造**真实的中继客户端**（不造替身：
 // 替身会绕过信封解包/状态码/钥匙校验这一整层，而那层正是现网出过事的地方）。
 // 钥匙只在本测试进程内出现，绝不落盘、绝不打进日志。

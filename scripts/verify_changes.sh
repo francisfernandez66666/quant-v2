@@ -29752,9 +29752,62 @@ PY
 CNT260=$((CNT260 + 1))
 GO260B_RC=0
 go test ./cmd/backfill_stock_moneyflow ./internal/research ./internal/store ./internal/data \
-	-run 'TestFetchOne|TestSeed|TestAppend|TestRelaySecID|TestCollectTargets|TestValidateMode|TestState|TestMarker|TestMarketLegs|TestStockMoneyFlow|TestStockFlow|TestFloatShareDaily|TestSectorMapAsOf|TestLeaderRank|TestIndexDailyCoverage' -count=1 \
+	-run 'TestFetchOne|TestSeed|TestAppend|TestRelaySecID|TestCollectTargets|TestValidateMode|TestState|TestMarker|TestMarketLegs|TestStockMoneyFlow|TestStockFlow|TestFloatShareDaily|TestSectorMapAsOf|TestLeaderRank|TestIndexDailyCoverage|TestFlowProxy' -count=1 \
 	>/dev/null 2>&1 || GO260B_RC=$?
 [ "$GO260B_RC" = "0" ] || fail260 "档 3 行为腿未全绿（§260 ⑭）"
+
+# ⑮ dry-run 的跳过判据必须用 **isBSE**，不许用取反的 ok
+# （2026-11-28 部署首跑实测：写成 `if !ok { continue }` 时，每一只正常票都被当成"该跳过"，
+#   `sampled=20` 却一个请求都没发、cols 空 ⇒ 读数看着跑过了，实际零覆盖）。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "dry-run 抽样把正常票当北交所跳过（§260 ⑮）"
+import pathlib
+s = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go").read_text(encoding="utf-8")
+st = s.index("func runDryRun(")
+body = s[st:s.index("\nfunc ", st + 10)]
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+assert "isBSE || secid" in code, "dry-run 没按 isBSE 跳过（第二返回值是 isBSE，不是 ok）"
+assert "!ok" not in code, "dry-run 又回到取反 ok 的判据（会把每只正常票跳过）"
+assert "probed" in code, "抽样请求数没落读数（零请求与零覆盖会读成同一件事）"
+PY
+
+# ⑯ 指数清单只有一份真源（判据要的每只都必须真被装载）。
+# 2026-11-28 部署首跑实测：判据要 000001.SH、装载腿只拉三只 ⇒ `dataload index` 结构性永远 PARTIAL。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "指数清单漂成两份（判据要的指数没被装载）（§260 ⑯）"
+import pathlib, re
+main = pathlib.Path("cmd/dataload/main.go").read_text(encoding="utf-8")
+bao = pathlib.Path("cmd/dataload/baostock.go").read_text(encoding="utf-8")
+rep = pathlib.Path("cmd/dataload/replay_inputs.go").read_text(encoding="utf-8")
+m = re.search(r"var indexCodes = \[\]string\{([^}]*)\}", main)
+assert m, "indexCodes 真源不在"
+codes = set(re.findall(r'"([0-9]{6}\.[A-Z]{2})"', m.group(1)))
+assert "000001.SH" in codes, "indexCodes 少了 000001.SH（IndexChange 大盘腿要它）"
+bseg = bao[bao.index("var bsIndexCodes"):]
+bseg = bseg[:bseg.index("\n\n")]
+bnames = set(re.findall(r'"([0-9]{6}\.[A-Z]{2})"', bseg))
+assert bnames == codes, "bsIndexCodes=%s 与 indexCodes=%s 不同集合（装载腿少拉一只＝判据永远 PARTIAL）" % (sorted(bnames), sorted(codes))
+assert re.search(r"var indexGapCodes\s*=\s*indexCodes", rep), \
+    "indexGapCodes 又手写了第二份（必须直接引用 indexCodes）"
+PY
+
+# ⑰ 上游 rc=100/102（退市/长期停牌）必须是 no_data，不许并进 relay_error。
+# 2026-11-28 首采实测：连号退市票被误记成中继失败，攒到连续 20 只整轮 seed 中止在 3.6% 覆盖。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "rc=100 未与中继抖动分开（§260 ⑰）"
+import pathlib
+fp = pathlib.Path("internal/data/flow_proxy.go").read_text(encoding="utf-8")
+cm = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go").read_text(encoding="utf-8")
+assert "var ErrFlowNoData" in fp, "缺 ErrFlowNoData 哨兵（rc=100 与真中继故障无法区分）"
+assert "flowUpstreamNoData(body)" in fp, "中继未把 rc=100/102 归成 ErrFlowNoData"
+assert "up.RC == 100 || up.RC == 102" in fp, "rc 判定面不完整"
+assert "errors.Is(err, data.ErrFlowNoData)" in cm, "采集器没把 ErrFlowNoData 映射成 no_data"
+# 负锁：fetchOne 里 rc=100 不许再落回 fetchRelayError 那条分支之前被吞掉。
+st = cm.index("func fetchOne(")
+body = cm[st:cm.index("\nfunc ", st + 10)]
+assert body.index("data.ErrFlowNoData") < body.index("fetchRelayError"), \
+    "ErrFlowNoData 必须判在 fetchRelayError 之前"
+PY
 
 [ "${B260_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §260 §STOCK-FLOW-COLLECT 锁通过（两表/主键/Go 采集/两模式/只走中继/full 拒/BSE 跳过/幂等/只存原子量/f57 兼容/双分母/跨语言等值/行为腿绿，累计判定点 ${CNT260}）"
@@ -29802,8 +29855,15 @@ assert "Persistent=true" in t, "漏跑不补＝长期数据永久缺天"
 assert "TimeoutStartSec=3000" in s
 assert "Restart=no" in s, "失败就重打上游只会更糟"
 assert "--mode=append" in s and "--mode=seed" not in s
+# trading.db 是 WAL 模式：以 root 打开写会在同目录留下 root 属主的 -wal/-shm，
+# 之后 quant/quant-research（都跑 quant 身份）再写同一份库就 EACCES。
+# 2026-11-28 部署实读补上；锁文件因此也不能放 /run（非 root 不可建）。
+assert "User=quant" in s and "Group=quant" in s, "moneyflow.service 没跑 quant 身份（WAL 库会被 root 写坏属主）"
+assert "/var/lib/quant-trading-v2/quant-moneyflow.lock" in s, "锁文件放 /run 时非 root 无法创建"
 seed = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow-seed.service").read_text(encoding="utf-8")
 assert "--mode=seed" in seed
+assert "User=quant" in seed and "Group=quant" in seed, "seed.service 同样必须跑 quant 身份"
+assert "/var/lib/quant-trading-v2/quant-moneyflow.lock" in seed, "seed 与 append 必须共用同一把锁"
 PY
 
 # ③ 配额三键 + 钥匙只从文件读（不经命令行、不经对话、不进日志）。
@@ -29824,7 +29884,10 @@ python3 - <<'PY' || fail261 "两个 unit 没共用同一把 flock（§261 ④）
 import pathlib
 a = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow.service").read_text(encoding="utf-8")
 b = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow-seed.service").read_text(encoding="utf-8")
-assert "flock -n /run/quant-moneyflow.lock" in a and "flock -n /run/quant-moneyflow.lock" in b
+# 锁路径必须在**数据目录**（`/var/lib/...`，quant 可写），不能放 `/run`：
+# 2026-11-28 部署实读，service 以 quant 身份跑，`/run` 下非 root 建不了锁文件。
+assert "flock -n /var/lib/quant-trading-v2/quant-moneyflow.lock" in a and \
+    "flock -n /var/lib/quant-trading-v2/quant-moneyflow.lock" in b, "两腿锁路径必须同一把且在数据目录"
 assert a.count("ExecStart=") == 1 and b.count("ExecStart=") == 1
 PY
 
