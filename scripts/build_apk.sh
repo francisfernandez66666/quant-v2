@@ -60,10 +60,10 @@ if [ -z "$ANDROID_SDK" ] || [ ! -d "$ANDROID_SDK/platforms" ]; then
     exit 1
 fi
 echo "[2/5] Android SDK: $ANDROID_SDK"
-# 写入 local.properties 供 Gradle 定位 SDK
-cat > "$APP_DIR/mobile/local.properties" <<EOF
-sdk.dir=$ANDROID_SDK
-EOF
+# 写入 local.properties 供 Gradle 定位 SDK。
+# 用 printf 而非 here-doc：本机 bash 3.2 的 here-doc 临时文件会落在 /var/tmp，
+# 沙箱收紧时建完无法 unlink，直接报 "cannot create temp file for here document"。
+printf 'sdk.dir=%s\n' "$ANDROID_SDK" > "$APP_DIR/mobile/local.properties"
 
 # ── 3. 前端构建 + 拷入 assets/ 根 ──
 echo "[3/5] 构建前端并拷入 assets/..."
@@ -76,19 +76,27 @@ echo "[3/5] 构建前端并拷入 assets/..."
 MK="$APP_DIR/web/dist/BUILD_COMMIT"
 APK_SHA="$( [ -f "$MK" ] && tr -d '\r\n' < "$MK" || echo "" )"
 HEAD_SHA="$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-echo "      APK 内嵌前端指纹 = ${APK_SHA:-缺失}（本地 HEAD = ${HEAD_SHA}）"
+# 期望指纹默认取本地 HEAD；显式给 BUILD_COMMIT 时以它为准。
+# 为什么要留这个覆盖口：APK 要对付的是**线上后端**的 build_commit，不是本地 HEAD。
+# 实录（2026-11-28）：线上已部署 e27bdf0，本地 HEAD 又多了两笔纯测试/注释提交（1252ef9），
+# 若硬拿 HEAD 当期望值，打包必然失败，唯一"解法"变成回退 checkout —— 为了打 APK 动源码版本，
+# 既不必要也容易把在跑的任务带沟里。vite.config.js 本来就吃同名环境变量，这里同源读取即可。
+EXPECT_SHA="${BUILD_COMMIT:-$HEAD_SHA}"
+echo "      APK 内嵌前端指纹 = ${APK_SHA:-缺失}（期望 = ${EXPECT_SHA}，本地 HEAD = ${HEAD_SHA}）"
 case "$APK_SHA" in
   ""|dev|unknown)
     echo "      [!] 指纹为哨兵值/缺失：不参与版本比对（不会弹横幅），但也就失去了漂移自检。" ;;
   *)
-    if [ "$APK_SHA" != "$HEAD_SHA" ]; then
-      echo "      X APK 内嵌指纹与 HEAD 不一致 —— 装到手机后必然出现「前端与服务器版本不一致」横幅。"
-      echo "        请先提交代码、再重新运行本脚本（顺序：commit → build）。"
+    if [ "$APK_SHA" != "$EXPECT_SHA" ]; then
+      echo "      X APK 内嵌指纹与期望版本不一致 —— 装到手机后必然出现「前端与服务器版本不一致」横幅。"
+      echo "        常规修复：先提交代码、再重新运行本脚本（顺序：commit → build）；"
+      echo "        要对齐已上线的旧版本：显式传 BUILD_COMMIT=<服务器版本> 重跑本脚本。"
       exit 1
     fi ;;
 esac
 
-rm -rf "$APP_DIR/mobile/app/src/main/assets"
+# 直接覆盖拷贝，不先 rm -rf：本机批量删除守卫（>50 文件）会拦住清目录，
+# 而 index.html 每次都会被新产物覆盖，残留旧 chunk 只是多占一点包体积，不影响加载。
 mkdir -p "$APP_DIR/mobile/app/src/main/assets"
 cp -R "$APP_DIR/web/dist/." "$APP_DIR/mobile/app/src/main/assets/"
 echo "      assets/ 共 $(find "$APP_DIR/mobile/app/src/main/assets" -type f | wc -l | tr -d ' ') 个文件"
