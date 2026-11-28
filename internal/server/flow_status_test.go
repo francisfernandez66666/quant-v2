@@ -358,3 +358,76 @@ func TestReadSidePolicyStatusUnknownWhenBothDirsAreEmpty(t *testing.T) {
 		t.Fatalf("empty dir must be unknown, got %+v", out)
 	}
 }
+
+// TestFlowStatusStockFlowReadout 锁定个股资金流读数六键的三态（§REPLAY-INPUTS 档 3b）。
+//
+// 这条腿最容易出的错不是"报错"，而是"停更了却看着正常"：ths_* 静默停更一年多就是这个形状。
+// 所以三件事必须分开报——表里没数据（known=false）、今天没采（codes=0）、采集器未跑（status 缺席），
+// 而且**当日没有 flow_factor_daily 行时也必须照常报**（盘前/非交易日正是最需要看到停更的时候）。
+func TestFlowStatusStockFlowReadout(t *testing.T) {
+	s, db := newFlowStatusServer(t)
+	s.researchDir = t.TempDir()
+
+	// ① 表在但从没采过：known=false，且不编造 day/codes/coverage 三键。
+	got := s.flowStatusReadout(time.Now())
+	if got["stock_flow_known"] != false {
+		t.Fatalf("空表必须 stock_flow_known=false，实际 %+v", got["stock_flow_known"])
+	}
+	for _, k := range []string{"stock_flow_day", "stock_flow_codes", "stock_flow_coverage_pct"} {
+		if _, exists := got[k]; exists {
+			t.Fatalf("空表不许给出 %s（缺数被编造成读数）", k)
+		}
+	}
+	if _, exists := got["stock_flow_run_status"]; exists {
+		t.Fatalf("采集器没跑过时不许给 run_status，实际 %v", got["stock_flow_run_status"])
+	}
+
+	// ② 有行 + 可采池：六键齐全，day 回横线形态，覆盖率 = codes/total*100。
+	if _, err := db.UpsertStockListings([]store.StockListing{
+		{TsCode: "600519.SH", Name: "贵州茅台"},
+		{TsCode: "000001.SZ", Name: "平安银行"},
+		{TsCode: "920001.BJ", Name: "北交所样例"}, // 北交所不进分母
+	}); err != nil {
+		t.Fatalf("写入股票清单失败: %v", err)
+	}
+	if _, err := db.UpsertStockMoneyFlow([]store.StockFlowRow{
+		{TsCode: "600519.SH", TradeDate: "20261127", MainNet: 1e8, HasMainNet: true,
+			MainPct: 5.5, HasMainPct: true, Amount: 2e9, HasAmount: true, Source: "eastmoney_fflow_relay_seed"},
+	}); err != nil {
+		t.Fatalf("写入个股资金流失败: %v", err)
+	}
+	// 采集器标记：有结论才报（finished_at 走 RFC3339）。
+	now := time.Date(2026, 11, 28, 16, 0, 0, 0, cntime.Loc)
+	mark := `{"day":"20261127","status":"ok","finished_at":"2026-11-28T15:40:00+08:00"}`
+	if err := os.WriteFile(filepath.Join(s.researchDir, "moneyflow_run.json"), []byte(mark), 0644); err != nil {
+		t.Fatalf("写采集标记失败: %v", err)
+	}
+
+	got = s.flowStatusReadout(now)
+	if got["stock_flow_known"] != true {
+		t.Fatalf("有行时 stock_flow_known 必须为 true，实际 %+v", got)
+	}
+	if got["stock_flow_day"] != "2026-11-27" {
+		t.Fatalf("stock_flow_day 必须回横线形态，实际 %v", got["stock_flow_day"])
+	}
+	if got["stock_flow_codes"] != 1 {
+		t.Fatalf("stock_flow_codes 应为 1，实际 %v", got["stock_flow_codes"])
+	}
+	if got["stock_flow_total"] != 2 {
+		t.Fatalf("分母必须排除北交所（2 只），实际 %v", got["stock_flow_total"])
+	}
+	if pct, _ := got["stock_flow_coverage_pct"].(float64); pct != 50 {
+		t.Fatalf("覆盖率应为 50%%，实际 %v", got["stock_flow_coverage_pct"])
+	}
+	if got["stock_flow_run_status"] != "ok" {
+		t.Fatalf("采集状态必须照报，实际 %v", got["stock_flow_run_status"])
+	}
+	if age, _ := got["stock_flow_run_age_sec"].(float64); age != 1200 {
+		t.Fatalf("采集龄应为 1200 秒（16:00-15:40），实际 %v", got["stock_flow_run_age_sec"])
+	}
+	// ③ 当日没有 flow_factor_daily 行（本用例从未写入）时，上面六键仍必须在场——
+	//    早退分支吞掉采集器读数，等于"最该看停更的那天看不见"。
+	if got["known"] != false {
+		t.Fatalf("无 flow_factor_daily 行时 known 仍须 false，实际 %v", got["known"])
+	}
+}

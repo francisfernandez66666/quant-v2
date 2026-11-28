@@ -147,6 +147,35 @@ func flowNullF(p *float64) float64 {
 // 拿它当"净流入的来源"会撒谎。来源归因留给日志与库里的原始行，展示层不猜。
 //
 // now 由调用方传入（测试注入固定时刻，生产走 time.Now()）。
+// readMoneyflowRunAge 读采集完成标记的"距今多久 + 什么结论"。
+// 读不到返回 ok=false（前端显示"采集器未跑"），**不返回一个 0 秒的假新鲜**。
+func readMoneyflowRunAge(dir string, now time.Time) (float64, string, bool) {
+	if dir == "" {
+		return 0, "", false
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "moneyflow_run.json"))
+	if err != nil {
+		return 0, "", false
+	}
+	var mk struct {
+		Day        string `json:"day"`
+		Status     string `json:"status"`
+		FinishedAt string `json:"finished_at"`
+	}
+	if json.Unmarshal(raw, &mk) != nil || mk.Day == "" {
+		return 0, "", false
+	}
+	t, perr := time.Parse(time.RFC3339, mk.FinishedAt)
+	if perr != nil {
+		return 0, mk.Status, true // 有结论但时刻解析不动：age 不下发，状态照报
+	}
+	age := now.Sub(t).Seconds()
+	if age < 0 {
+		age = 0 // 钟差（盒子/云端不同步）不许把"未来"读成负数龄
+	}
+	return age, mk.Status, true
+}
+
 func (s *Server) flowStatusReadout(now time.Time) map[string]interface{} {
 	day := cntime.DayOf(now)
 	out := map[string]interface{}{
@@ -158,6 +187,10 @@ func (s *Server) flowStatusReadout(now time.Time) map[string]interface{} {
 	if s.researchDB == nil {
 		return out
 	}
+	// §REPLAY-INPUTS 档 3b：个股资金流覆盖率与采集器新鲜度**先**填。
+	// 刻意排在 flow_factor_daily 的早退分支之前：那张表在盘前/非交易日没有行，
+	// 若把采集器读数挂在它后面，停更告警会在"最该看的那几天"整块消失。
+	s.fillStockFlowReadout(out, now)
 	row, err := s.researchDB.GetFlowFactorDaily(day)
 	if err != nil || row == nil {
 		// 读失败与"今天没有行"在展示上同形（都是无读数），但 known 必须为 false——
@@ -209,4 +242,40 @@ func (s *Server) flowStatusReadout(now time.Time) map[string]interface{} {
 		out["blend"] = blend
 	}
 	return out
+}
+
+// fillStockFlowReadout 填个股资金流（长期日频）的覆盖率与采集器新鲜度六键。
+//
+// 为什么单独一个函数、而且调用点在 flow_factor_daily 的早退之前：这张表只有一个
+// systemd timer 在写，一旦停更，表现不是报错而是"fac_175/179 用旧数据算出看着正常的分"
+// ——ths_* 静默停更一年多就是这个形状（AGENTS 实录）。所以停更必须在**没有当日
+// flow_factor_daily 行**的那些天也照常喊疼。
+//
+// 缺数一律不画 0：`codes=0`（表在但今天没采）、"表没建/从没采过"（`stock_flow_known=false`）、
+// "采集器未跑"（`stock_flow_run_status` 缺席）是三件事，前端分三句文案。
+func (s *Server) fillStockFlowReadout(out map[string]interface{}, now time.Time) {
+	if last, err := s.researchDB.MaxStockFlowDay(); err == nil && last != "" {
+		// 库里是紧凑形态，展示层给带横线的（前端日期一律这个形状）。
+		dashed := last
+		if len(last) == 8 {
+			dashed = last[:4] + "-" + last[4:6] + "-" + last[6:]
+		}
+		out["stock_flow_day"] = dashed
+		if n, cerr := s.researchDB.CountStockFlowCodes(last); cerr == nil {
+			out["stock_flow_codes"] = n
+		}
+		if total, terr := s.researchDB.CountCollectableCodes(); terr == nil && total > 0 {
+			out["stock_flow_total"] = total
+			if codes, ok := out["stock_flow_codes"].(int); ok {
+				out["stock_flow_coverage_pct"] = float64(codes) / float64(total) * 100.0
+			}
+		}
+		out["stock_flow_known"] = true
+	} else {
+		out["stock_flow_known"] = false
+	}
+	if age, status, ok := readMoneyflowRunAge(s.researchDir, now); ok {
+		out["stock_flow_run_age_sec"] = age
+		out["stock_flow_run_status"] = status
+	}
 }

@@ -148,6 +148,30 @@ export default function FlowFactorCard({ flow, funds }) {
                 <>板块合计：今日无读数（弃权）</>
               )}
             </div>
+            {/* §REPLAY-INPUTS 2026-11-28（档 3b）：个股资金流是长期日频表，唯一写口是
+                15:35 的 systemd timer。停更的表现不是报错，而是"fac_175/179 用旧数算出
+                看着正常的分"——所以覆盖率与采集器新鲜度必须在这一行自己喊出来。
+                三态分开：有读数 / 表里根本没数（known=false）/ 采集器没跑（run_age 缺）。
+                known=true 但 codes=0 也按弃权处理——0 只会被读成"今天采过、净流人为 0"，
+                而实际含义是"这张表当天没有任何一行"，那是采集器故障不是市场读数。 */}
+            <div className="muted" data-testid="flow-stock-agg" style={{ fontSize: 11, marginTop: 4 }}>
+              {flow.stock_flow_known && Number(flow.stock_flow_codes) > 0 ? (
+                <>
+                  个股资金流 {flow.stock_flow_day || '—'}：{Number(flow.stock_flow_codes) || 0} 只
+                  {Number.isFinite(Number(flow.stock_flow_coverage_pct))
+                    ? `（覆盖 ${Number(flow.stock_flow_coverage_pct).toFixed(1)}%）`
+                    : ''}
+                  {Number.isFinite(Number(flow.stock_flow_run_age_sec))
+                    ? ` · 采集器 ${Math.round(Number(flow.stock_flow_run_age_sec) / 60)} 分钟前`
+                    : ''}
+                  {flow.stock_flow_run_status && flow.stock_flow_run_status !== 'ok'
+                    ? ` · 本轮 ${flow.stock_flow_run_status}`
+                    : ''}
+                </>
+              ) : (
+                <>个股资金流：今日无读数（弃权）</>
+              )}
+            </div>
           </div>
 
           {/* 右：量能状态（放量/缩量/平量由 r_yest 与 r_ma5 双闸判出，阈值在后端） */}

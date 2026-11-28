@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
 )
 
 // SidePolicyMode 市场剧本；legacy 表示总闸关闭，逐字回到旧行为。
@@ -383,7 +384,14 @@ func ApplySidePolicyFreshness(st SidePolicyState, now time.Time) SidePolicyState
 		reason = "side_policy_asof_missing"
 	} else if now.IsZero() || st.AsOf.After(now) {
 		reason = "side_policy_asof_invalid"
-	} else if st.Day != "" && st.Day != now.Format("20060102") {
+	} else if st.Day != "" && st.Day != data.TradingDayDate(now) {
+		// §REPLAY-INPUTS 2026-11-28 修正：这里原来是 `now.Format("20060102")`（**日历日**），
+		// 而写入口（DecideSidePolicy / 载体烘焙 / 测试夹具）一律用 `data.TradingDayDate(now)`
+		// （**交易日**，周末与节假日回滚到上一交易日）。两把尺只在交易日相等——
+		// 后果是休市日任何状态都被判 stale_day 回落 L1，且现网看不出来；
+		// internal/engine 两条用例（TestLiveSideStrongLeft… / TestLiveLegacyStyle…）
+		// 在周末必红就是这条暴露出来的（2026-11-28 实测复现并定性）。
+		// 取向：**日判据与写入口同源**，而不是让夹具去迁就日历日——后者等于把缺陷藏进测试里。
 		reason = "side_policy_stale_day"
 	}
 	if reason != "" {

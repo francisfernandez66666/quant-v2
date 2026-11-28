@@ -1,0 +1,27 @@
+# quant-moneyflow-seed.service — 一次性首采（§REPLAY-INPUTS 档 3b，**不进 timer**）。
+#
+# 与 append 的区别只有一个：`--mode=seed` 每票取 `klt=101&lmt=0` → 拿满上游 120 根，
+# 并**跳过当日行**（当日归 append 腿，两个写口同一天互盖就是两本账）。
+#
+# 为什么不挂 timer：误触发一次就是 5100 次上游请求。首采一生只跑一次，
+# 由运维显式 `systemctl start quant-moneyflow-seed.service`，跑完读 MONEYFLOW_RUN 一行收尾。
+# 先干跑自证形状（方案 §10 探针 d）：
+#   /opt/quant/stockmoneyflow --db ... --dry-run --sample 20 --gateway-url http://10.77.0.2:8789 --token-file /etc/quant/moneyflow_relay_token
+# 期望每票 rows≈120、cols=7；若中继只回 6 列（无 f57），成交额分母就没来源，先修中继再采。
+[Unit]
+Description=Quant per-stock money-flow one-time seed backfill (120 sessions per stock)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 同一个 flock（-n）：首采绝不能与 15:35 的日常采集并发——两条各打 5100 次上游，
+# 而且两份 state 会各写各的：后写那份把前一份记的 no_data 覆盖掉，等于白跳过。
+ExecStart=/usr/bin/flock -n /run/quant-moneyflow.lock /opt/quant/stockmoneyflow --db /var/lib/quant-trading-v2/trading.db --mode=seed --gateway-url http://10.77.0.2:8789 --token-file /etc/quant/moneyflow_relay_token --state /var/lib/quant-trading-v2/moneyflow_state.json --marker /var/lib/quant-trading-v2/moneyflow_run.json --rate 4 --concurrency 2 --seed-float-share-from-precalc /opt/quant/carrier_build/qmt_gateway/local_executor_precalc.json
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+CPUQuota=30%
+MemoryHigh=300M
+MemoryMax=400M
+# 首采是 append 的量（≈5100 次请求），但每票回 120 根、落库量大，给 90 分钟。
+TimeoutStartSec=5400
+Restart=no

@@ -1950,6 +1950,16 @@ export default function Research() {
           <span style={{ color: 'var(--app-muted)', marginLeft: 8 }}>
             （北京时间 {schedStatus.beijing_now} · 交易时段={schedStatus.in_trading_window ? '是' : '否'} · 内存可用 {schedStatus.mem_avail_mb}MB · 闸门={schedStatus.mem_gate_open ? '开' : '关'} · 槽位={schedStatus.busy ? '占用' : '空闲'}）
           </span>
+          {/* §REPLAY-INPUTS 档 3b：夜间链有没有在等个股资金流采集，必须在这一行看得见。
+              只留在 researchd 日志里的形态是"今晚零产出，第二天没人知道是闸拦的还是队列坏了"。
+              键缺席（旧 researchd 未升级）时整行不渲染——不拿 undefined 冒充"关"。 */}
+          {('moneyflow_gate_on' in schedStatus) && (
+            <div data-testid="moneyflow-gate" style={{ color: 'var(--app-muted)', marginTop: 4 }}>
+              资金流采集闸={schedStatus.moneyflow_gate_on ? '开' : '关'}
+              {' · '}今日采集标记
+              ={schedStatus.moneyflow_marker_day ? `${schedStatus.moneyflow_marker_day}（${schedStatus.moneyflow_marker_status || '无状态'}）` : '无（未跑或读不到）'}
+            </div>
+          )}
         </div>
       )}
 

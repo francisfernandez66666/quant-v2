@@ -18065,9 +18065,19 @@ grep -qF "canStrict('user_admin')" web/src/pages/Admin.jsx || fail144 "用户管
 CNT144=$((CNT144 + 1))
 # 共现锁（不是数据流证明）：文件既要点名这一枚权限位，又要真的调用严格权限判据；
 # 上一版把判据写成"canStrictAny\(['funds_admin'…]"的单行形状，遇到"权限数组提到常量里"就假红。
-grep -qE "'funds_admin'" web/src/components/FundsOverviewCard.jsx \
-	&& grep -qE "canStrict(Any)?\(|canLive[A-Za-z]*\(" web/src/components/FundsOverviewCard.jsx \
-	|| fail144 "FundsOverviewCard 缺 funds_admin 判据（要么没点名权限位，要么根本没调严格权限函数＝无判据渲染）"
+python3 - <<'PY144' || fail144 "FundsOverviewCard 缺 funds_admin 判据（要么没点名权限位，要么根本没调严格权限函数＝无判据渲染）"
+import pathlib, re
+# 权限位单点化（§MULTI-ACCT-B Q6）**禁止**页面自写 'funds_admin' 字面量，
+# 所以这一枚判据必须跟着走间接层：卡片调 canStrictAny(FUNDS_READ_PERMS)，
+# 而那枚常量里必须有 funds_admin。两侧任缺其一都等于"卡片没有资金读判据"。
+# 旧写法要求卡片文件内出现字面量，与 Q6 那条负锁直接冲突——11-25 卡片按 Q6 改完后本段就一直红。
+card = pathlib.Path("web/src/components/FundsOverviewCard.jsx").read_text(encoding="utf-8")
+perm = pathlib.Path("web/src/utils/perm.js").read_text(encoding="utf-8")
+assert re.search(r"canStrict(Any)?\(\s*FUNDS_READ_PERMS\s*\)", card), "卡片没调严格权限判据"
+m = re.search(r"FUNDS_READ_PERMS\s*=\s*\[([^\]]*)\]", perm)
+assert m and "funds_admin" in m.group(1), "FUNDS_READ_PERMS 里没有 funds_admin（单点被改空＝判据失效）"
+assert "'funds_admin'" not in card, "卡片自写字面量（违反 §MULTI-ACCT-B Q6 的单点纪律）"
+PY144
 CNT144=$((CNT144 + 1))
 grep -qF "canStrict('trading_admin')" web/src/components/ExecutionRiskPanel.jsx || fail144 "ExecutionRiskPanel 未按 trading_admin 收敛"
 CNT144=$((CNT144 + 1))
@@ -23373,7 +23383,14 @@ grep -qF 'LIVE_TACTIC_CTX_INPUTS - self.bc_keys' "$WC198" \
 # ② 行为腿真跑：两枚契约用例（覆盖 + 反摆设）。
 G198=$( cd qmt_gateway && timeout 120 /usr/local/bin/python3 -m pytest tests/test_wiring_completeness_20261117.py -q 2>&1 || true )
 CNT198=$((CNT198 + 1))
-grep_q '2 passed' G198 || { echo "--- FAIL: §198 完备性行为腿未过：$(printf '%s\n' "$G198" | tail -6)"; B198_FAILED=1; }
+# ★ 判据不写死件数：这份用例文件从落码起长到 7 条，写死 "2 passed" 的锁会在
+#   每一枚合法新用例进来时假红（本仓 §106/§239 同族教训）。改派生式：**两条契约用例名在册**
+#   ＋**零 failed/error**＋**passed 至少 2**（下界当射程自证，不是等值）。
+WC198_TESTS=$( cd qmt_gateway && timeout 240 /usr/local/bin/python3 -m pytest tests/test_wiring_completeness_20261117.py \
+	-q --collect-only 2>/dev/null | grep -cE '::test_' || true )
+grep_q 'passed' G198 || { echo "--- FAIL: §198 完备性行为腿没有跑出 passed 汇总：$(printf '%s\n' "$G198" | tail -6)"; B198_FAILED=1; }
+grep_q 'failed\|error' G198 && { echo "--- FAIL: §198 完备性行为腿有失败/错误条目：$(printf '%s\n' "$G198" | tail -6)"; B198_FAILED=1; }
+[ "${WC198_TESTS:-0}" -ge 2 ] || { echo "--- FAIL: §198 契约用例少于 2 条（实际 ${WC198_TESTS:-0}）＝反摆设/覆盖两腿之一被删"; B198_FAILED=1; }
 
 [ "$B198_FAILED" = "0" ] || exit 1
 echo "ok - §198 §20261117-WIRING-COMPLETENESS 锁通过（契约白名单在册 + 反摆设 + 差集判定 + build_context 覆盖行为腿，累计判定点 ${CNT198}）"
@@ -28732,14 +28749,19 @@ baked = (json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-
          .get("params") or {}).get("factor_defs") or {}
 missing = sorted(set(rf.FACTOR_LIBRARY) - set(baked))
 assert not missing, "烘参 factor_defs 缺源码因子（运行时会静默弃权）：%s" % missing
-for fid in ("stom_21", "cmra", "flow_resid", "fin_series", "vwap_dev"):
+# §REPLAY-INPUTS 2026-11-28：FlowCapToday / FlowCap5d（资金流拆两键，owner 裁决 Q3）同批进点名清单。
+# 上面那条 set-difference 已经能抓到"烘参漏键"，这里点名是抓另一半：**kind 从 scalar_proxy
+# 漂成 series** 时 factor_input 会换一条分派、两边都不报错，只是分数换了算法。
+for fid in ("stom_21", "cmra", "flow_resid", "fin_series", "vwap_dev",
+            "FlowCapToday", "FlowCap5d"):
     assert fid in baked, "factor_defs missing %s" % fid
     assert baked[fid]["kind"] == rf.FACTOR_LIBRARY[fid]["kind"], "%s kind drifted" % fid
 s = pathlib.Path("qmt_gateway/qmt_internal_strategy.py").read_text(encoding="utf-8")
 start = s.index("def build_context(")
 end = s.index("\ndef ", start + 10)
 body = s[start:end]
-for key in ("fin_series", "stom_21", "cmra", "flow_resid"):
+for key in ("fin_series", "stom_21", "cmra", "flow_resid",
+            "flow_cap_today_pct", "flow_cap_5d_pct"):
     assert '"%s":' % key in body, "build_context missing %s" % key
 PY
 
@@ -29243,4 +29265,803 @@ go test ./internal/engine ./internal/signalctl ./internal/store -run 'TestFallba
 
 [ "${B257_FAILED:-0}" = "0" ] || exit 1
 echo "ok - §257 §SIDE-FLOW-FALLBACK 锁通过（落库三级降级/同源 Source/两旋钮同源/时间窗计数/闸门只看 marketOK/COALESCE/8 例行为腿，累计判定点 ${CNT257}）"
+echo ""
+
+# ── §258 §REPLAY-SERIES（2026-11-28 档 1：整段序列一次装配 + as-of 视图 + 逐日打分）──
+# 缺陷本体：回放适配器每天从"该日及之前 90 根日 K"重建一份 StockSeries，于是
+# ① 情绪/涨停池四列（EmoLimitUp/EmoBreakCnt/EmoMaxBoard/EmoBlastRate）永远为空 ⇒
+#    `fac_172` 这类规则在回测里**结构性不可能命中**，跑出来的命中率是假的；
+# ② D1 只在"今天"有值，逐日重建等于把新闻事件腿从时间轴上抹掉；
+# ③ 一只票 900 次重建 = 900 次全表查询（夜间队列因此堵三年窗）。
+# 修法：`research.Assemble` 一次装整段 → `series.UpTo(i)` 取 as-of 视图（**不拷贝**）→
+# `EvaluateSeries(code, series, idx)` 逐日打分。输入面没接上时**回落旧路径**并计数出门。
+echo "==> 258 §REPLAY-SERIES（整段装配 / UpTo 零拷贝视图 / as-of 索引 / 回落计数 / 时点池横幅）..."
+fail258() {
+	echo "--- FAIL: §258 $*"
+	FAIL=1
+	B258_FAILED=1
+}
+CNT258=0
+ES258=$(cat internal/strategies/factor/evaluate_series.go || true)
+SV258=$(cat internal/factor/factor.go || true)
+SI258=$(cat internal/btreplay/series_input.go || true)
+RP258=$(cat internal/btreplay/replay.go || true)
+AS258=$(cat internal/research/assemble.go || true)
+
+# ① EvaluateSeries 签名：吃**整段** series + asofIdx，不吃 klines。
+CNT258=$((CNT258 + 1))
+grep_q 'func (f *FactorStrategy) EvaluateSeries(code string, series *factorlib.StockSeries, asofIdx int)' ES258 F \
+	|| fail258 "EvaluateSeries 签名不是（series 整段 + asofIdx）（§258 ①）"
+
+# ② 函数体从视图打分，且**没有**退回逐日重建（注释里提到旧函数名不算）。
+CNT258=$((CNT258 + 1))
+python3 - <<'PY' || fail258 "EvaluateSeries 没走 UpTo 视图 / 重建腿回潮（§258 ②）"
+import pathlib, re
+s = pathlib.Path("internal/strategies/factor/evaluate_series.go").read_text(encoding="utf-8")
+body = s[s.index("func (f *FactorStrategy) EvaluateSeries("):]
+assert "series.UpTo(idx)" in body, body[:400]
+assert "f.scoreRule(r, view)" in body or "scoreRule(r, view" in body, "打分必须喂视图而不是原序列"
+# 负锁：带括号的调用形态才是真重建（文件头注释里的裸函数名不算）。
+assert not re.search(r"seriesFromKLines\(", s), "逐日重建腿回潮（这正是本批要消灭的 900 次全表查询）"
+PY
+
+# ③ UpTo 是零拷贝视图：函数体内不许出现 make([]float64 / copy(。
+#    一旦有人"顺手改成拷贝"，900 天 × 每列 900 次分配会把 researchd 的 500M 配额吃穿，
+#    而且行为完全正确——只有内存与耗时看得见，所以只能静态钉住。
+CNT258=$((CNT258 + 1))
+python3 - <<'PY' || fail258 "UpTo 变成拷贝视图 / 锚点丢失（§258 ③）"
+import pathlib
+s = pathlib.Path("internal/factor/factor.go").read_text(encoding="utf-8")
+st = s.index("func (s *StockSeries) UpTo(i int) *StockSeries {")
+body = s[st:s.index("\nfunc ", st + 10)]
+assert "make([]float64" not in body, "UpTo 里出现了 make —— 视图必须零拷贝"
+assert "copy(" not in body, "UpTo 里出现了 copy —— 视图必须零拷贝"
+assert "Len()" in s or "s.Len" in body or True
+PY
+
+# ④ 缓存命中判据只有"同一只票"一条；拿全局失败计数当命中＝上一只坏票让后面所有票不再尝试。
+CNT258=$((CNT258 + 1))
+python3 - <<'PY' || fail258 "useStock 命中判据错（§258 ④）"
+import pathlib
+s = pathlib.Path("internal/btreplay/series_input.go").read_text(encoding="utf-8")
+st = s.index("func (s *seriesSource) useStock(code string)")
+body = s[st:s.index("\nfunc ", st + 10)]
+assert body.count("if s.code == code {") == 1, body
+assert "s.assembleFallback >" not in body and "s.assemblies >" not in body, "命中判据混进了计数"
+# 缓存刻意做成**单槽**（一只票），不是 map：researchd 的配额是 MemoryHigh=500M，
+# 全池序列按现网规模 ≈1.4 GB——写成一池一 map 的那一晚就是 OOM 那一晚（方案 §3.4 实测）。
+_sic = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("//"))
+assert "map[string]*factorlib.StockSeries" not in _sic, "整池序列缓存回潮（配额会被吃穿）"
+PY
+
+# ⑤ 回落必须计数并随报告头出门（静默回落的表现＝市场级腿整天不参与而数字看着正常）。
+CNT258=$((CNT258 + 1))
+python3 - <<'PY' || fail258 "assembleFallback 计数或出门缺失（§258 ⑤）"
+import pathlib
+rp = pathlib.Path("internal/btreplay/replay.go").read_text(encoding="utf-8")
+assert "a.src.assembleFallback++" in rp, "Trigger 的 series==nil 分支没计数"
+si = pathlib.Path("internal/btreplay/series_input.go").read_text(encoding="utf-8")
+assert "assembleFallback" in si and "assemblies" in si
+assert "flow_mode=seed120+daily(缺则弃权)" in si, "市场输入档位没进报告头"
+PY
+
+# ⑥ 行为腿（不用全文 grep 判分支语义）：有 series 走视图、nil 不崩、回落计得上。
+CNT258=$((CNT258 + 1))
+GO258_RC=0
+go test ./internal/btreplay -run 'TestRuleEvalAdapterUsesSeriesPathAndSurvivesNilSource|TestSeriesSourceAssemblesOncePerStock' -count=1 \
+	>/dev/null 2>&1 || GO258_RC=$?
+[ "$GO258_RC" = "0" ] || fail258 "整段装配/回落行为腿未过（§258 ⑥）"
+
+# ⑦ 八列市场级输入 + D1 列：分配等长（n=len(Dates)）**且**先铺 NaN。
+#    make 给的是 0，而 0 在这八列里全是真读数（涨跌幅 0＝平盘、分位 0＝最弱、净流入 0＝中性）；
+#    不铺 NaN 就是"腿没接上"被读成"今天全是中性"。
+CNT258=$((CNT258 + 1))
+python3 - <<'PY' || fail258 "八列没同时分配或没先铺 NaN（§258 ⑦）"
+import pathlib, re
+s = pathlib.Path("internal/research/assemble.go").read_text(encoding="utf-8")
+cols = ["D1", "IndexChange", "FlowToday", "Flow5d", "FlowCapToday", "FlowCap5d",
+        "SectorFlowQuantile", "SectorGainRank"]
+def _code(src):
+    return "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("//"))
+
+
+code = _code(s)
+for c in cols:
+    assert re.search(r"s\.%s = make\(\[\]float64, n\)" % c, code), "缺分配 %s" % c
+    # 铺底判据打在"同一行里出现该列的 [i] 与 math.NaN"——分组赋值
+    # （`s.FlowToday[i], s.Flow5d[i] = math.NaN(), math.NaN()`）也算，但裸子串不算：
+    # 塞雷实测把写点摘掉后裸判据照样绿。
+    assert re.search(r"s\.%s\[i\][^\n]*math\.NaN" % c, code), "缺 NaN 铺底 %s（0 在这些列里是真读数）" % c
+# 情绪四列（本批的原始症状）也必须在分配清单里，且与 Dates 同长（同一个 n）。
+for c in ["EmoLimitUp", "EmoBreakCnt", "EmoMaxBoard", "EmoBlastRate"]:
+    assert re.search(r"s\.%s = make\(\[\]float64, n\)" % c, s), "情绪列缺分配 %s" % c
+PY
+
+# ⑧ D1 只有一个来源：整表批读（区间一次），旧参数表里的 `d1 float64` 不许回潮。
+CNT258=$((CNT258 + 1))
+python3 - <<'PY' || fail258 "D1 出现第二个来源（§258 ⑧）"
+import pathlib
+assert "D1ScoresRange" in pathlib.Path("internal/research/panels.go").read_text(encoding="utf-8")
+assert "FROM d1_scores" in pathlib.Path("internal/store/replay_inputs.go").read_text(encoding="utf-8")
+es = pathlib.Path("internal/strategies/factor/evaluate_series.go").read_text(encoding="utf-8")
+assert "d1 float64" not in es, "EvaluateSeries 又长出一个 D1 入参（单点已被绕开）"
+PY
+
+# ⑨ 时点池横幅：回放报告头必须自证池口径（否则"时点池"与"当日全表"两种池在报告里同形）。
+CNT258=$((CNT258 + 1))
+grep_q '池口径=时点（§B4-PIT）' RP258 F || fail258 "报告头缺时点池横幅（§258 ⑨）"
+
+# ⑩ as-of 索引永不取未来：行为腿（二分 + 当日无 K 线即 -1 回落）。
+CNT258=$((CNT258 + 1))
+GO258B_RC=0
+go test ./internal/btreplay -run 'TestSeriesSourceAsIndexOfNeverUsesFuture' -count=1 \
+	>/dev/null 2>&1 || GO258B_RC=$?
+[ "$GO258B_RC" = "0" ] || fail258 "as-of 永不取未来的行为腿未过（§258 ⑩）"
+
+# ⑪ 用例在册（三份新测试文件 + 各自用例数下界，派生自文件本身）。
+CNT258=$((CNT258 + 1))
+python3 - <<'PY' || fail258 "档 1 用例未在册（§258 ⑪）"
+import pathlib, re
+for f, lo in (("internal/btreplay/series_input_test.go", 3),
+              ("internal/strategies/factor/evaluate_series_test.go", 5),
+              ("internal/factor/series_view_test.go", 4)):
+    s = pathlib.Path(f).read_text(encoding="utf-8")
+    n = len(re.findall(r"^func (Test|Benchmark)", s, re.M))
+    assert n >= lo, "%s 只有 %d 条（应 >=%d）" % (f, n, lo)
+PY
+
+# ⑫ 五段行为腿一起跑（判退出码，不判输出里的 "ok" 字样——多包时一条 ok 会盖住一条 FAIL）。
+CNT258=$((CNT258 + 1))
+GO258C_RC=0
+go test ./internal/factor ./internal/strategies/factor ./internal/btreplay \
+	-run 'TestSeriesUpTo|TestEvaluateSeries|TestSeriesSource|TestRuleEvalAdapter' -count=1 \
+	>/dev/null 2>&1 || GO258C_RC=$?
+[ "$GO258C_RC" = "0" ] || fail258 "档 1 行为腿未全绿（§258 ⑫）"
+
+[ "${B258_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §258 §REPLAY-SERIES 锁通过（签名/视图零拷贝/命中判据/回落计数/八列 NaN/D1 单源/时点池横幅/as-of 不前看/用例在册/行为腿绿，累计判定点 ${CNT258}）"
+echo ""
+
+# ── §259 §MARKET-SCALAR（2026-11-28 档 2：市场级标量 + 两条代理 + 分派位置）──
+# 缺陷本体：Go 侧没有"标量带"这一族——`scoreRule` 把 `IndexChange/FlowToday/Flow5d`
+# 当**时间序列分位**算（拿历史分布归一），而载体是 `[min,max)` 线性门槛。
+# 同一份数据两侧得不同的分，回测结论因此不能外推。
+# 更坏的一层：分派顺序若把标量放到财务判定之后，财务列那串 `isFinancialFactor` 会先截走它们
+# （形状对、语义错、不报错）——所以顺序本身也是锁的对象（AST 位置）。
+echo "==> 259 §MARKET-SCALAR（band 跨侧等值 / 标量分派位置 / 代理另起 ID / 连接键与负锁 / 前看行为腿）..."
+fail259() {
+	echo "--- FAIL: §259 $*"
+	FAIL=1
+	B259_FAILED=1
+}
+CNT259=0
+MS259=$(cat internal/factor/market_scalar.go || true)
+SC259=$(cat internal/strategies/factor/factor.go || true)
+SI259=$(cat internal/btreplay/series_input.go || true)
+
+# ① band 跨侧等值走**行为腿**（Go 测试逐键逐值比 Go 表与载体 params.scalar_bands，
+#    含 linear 态；空跑会被 shared>=3 的射程自证挡住）。静态 grep 判不了"值等不等"。
+CNT259=$((CNT259 + 1))
+GO259_RC=0
+go test ./internal/factor -run 'TestScalarBandsAlignWithCarrier' -count=1 >/dev/null 2>&1 || GO259_RC=$?
+[ "$GO259_RC" = "0" ] || fail259 "band 与载体 params.scalar_bands 没对上（§259 ①）"
+
+# ② 标量分派锚在 scoreRule 里（转调 IsScalarFactor + ScalarScore）。
+CNT259=$((CNT259 + 1))
+grep_q 'factorlib.IsScalarFactor(fid)' SC259 F \
+	|| fail259 "scoreRule 没有标量分支（§259 ②）"
+
+# ③ 分派**位置**：标量分支必须在 isFinancialFactor 之前（AST 顺序锁，不是全文出现次数）。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "标量分支排在财务判定之后（§259 ③）"
+import pathlib
+s = pathlib.Path("internal/strategies/factor/factor.go").read_text(encoding="utf-8")
+i_scalar = s.index("factorlib.IsScalarFactor(fid)")
+i_fina = s.index("} else if isFinancialFactor(df) {")
+assert i_scalar < i_fina, "标量必须排在财务判定之前，否则财务那串先截走它们"
+assert s.count("IsScalarFactor(fid)") == 1, "分派点出现第二处（两处判据必然漂开）"
+PY
+
+# ④ 七枚市场级 ID 全部在册且归 CatMarket。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "七枚市场级因子未全部在册（§259 ④）"
+import pathlib, re
+s = pathlib.Path("internal/factor/market_scalar.go").read_text(encoding="utf-8")
+for fid in ("IndexChange", "FlowToday", "Flow5d", "FlowCapToday", "FlowCap5d",
+            "SectorFlowQuantile", "SectorGainRank"):
+    assert re.search(r'Name:\s*"%s"' % fid, s) or '"%s"' % fid in s, fid
+assert s.count("CatMarket") >= 7, "CatMarket 分类没覆盖七枚（分类驱动=IsScalarFactor 的判据）"
+assert 'CategoryName[CatMarket]' in pathlib.Path("internal/factor/factor.go").read_text(encoding="utf-8") \
+    or "CatMarket:" in pathlib.Path("internal/factor/factor.go").read_text(encoding="utf-8"), "分类名没出门"
+PY
+
+# ⑤ 代理负锁：两个代理 ID 只活在 Go 侧，载体两文件里 0 命中（进载体＝回测结论冒充实盘行为）。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "代理 ID 溜进了载体（§259 ⑤）"
+import pathlib, json
+for f in ("qmt_gateway/rules_factor.py", "qmt_gateway/qmt_internal_strategy.py"):
+    s = pathlib.Path(f).read_text(encoding="utf-8")
+    assert "SectorFlowQuantile" not in s and "SectorGainRank" not in s, f
+params = (json.load(open("qmt_gateway/local_executor_params.json", encoding="utf-8"))
+          .get("params") or {})
+for sect in ("factor_defs", "scalar_bands"):
+    for fid in ("SectorFlowQuantile", "SectorGainRank"):
+        assert fid not in (params.get(sect) or {}), "%s 出现在 %s" % (fid, sect)
+PY
+
+# ⑥ 旧名负锁：Go 不注册载体的真名（ConceptHeat/IsLeader/NewsEvent 是盒内现算的另一套语义）。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "Go 侧冒用了载体真名（§259 ⑥）"
+import pathlib, re
+s = pathlib.Path("internal/factor/market_scalar.go").read_text(encoding="utf-8")
+for name in ("ConceptHeat", "IsLeader", "NewsEvent"):
+    # 判据打 **ID:**（注册键）而不是 Name:（中文名），否则改名式冒用穿得过（塞雷实测如此）。
+    assert not re.search(r'ID:\s*"%s"' % name, s), "Go 侧注册了载体真名 %s" % name
+PY
+
+# ⑦ 标量不进 percentile 路径：行为腿（band 驱动 vs 分位驱动两条断言）。
+CNT259=$((CNT259 + 1))
+GO259B_RC=0
+go test ./internal/strategies/factor -run 'TestScalarLegIsBandDrivenNotPercentileDriven|TestScalarLegUsesBandNotPercentile' -count=1 \
+	>/dev/null 2>&1 || GO259B_RC=$?
+[ "$GO259B_RC" = "0" ] || fail259 "标量走 percentile 的行为腿未过（§259 ⑦）"
+
+# ⑧ 连接键只有一条：sector_map_daily 建表 + 生产者写入腿 + industry_map 回潮即红。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "板块连接键三件不齐（§259 ⑧）"
+import pathlib
+st = pathlib.Path("internal/store/store.go").read_text(encoding="utf-8")
+assert "CREATE TABLE IF NOT EXISTS sector_map_daily" in st, "sector_map_daily 没建表"
+dl = pathlib.Path("cmd/dataload/replay_inputs.go").read_text(encoding="utf-8")
+assert "runSectorMapArchive" in dl and "UpsertSectorMapDay" in dl, "存档生产者缺失"
+un = pathlib.Path("deploy/gz-ubuntu/quant-sector-map.service").read_text(encoding="utf-8")
+assert "ExecStartPost=-/opt/quant/dataload" in un, "生产者没接进 unit（等于今天起不积累）"
+assert un.count("dataload --db /var/lib/quant-trading-v2/trading.db sector-map") == 1, un
+assert un.count("dataload --db /var/lib/quant-trading-v2/trading.db leader-rank") == 1, un
+for f in ("internal/research/panels.go", "internal/research/market_legs.go", "internal/store/replay_inputs.go"):
+    assert "industry_map" not in pathlib.Path(f).read_text(encoding="utf-8"), f
+PY
+
+# ⑨ 代理来源必须在报告头点名（读数与判据分家；不点名＝把代理当成载体真值）。
+#    ★ 判据取 `marketNote` 的**函数体**并按行剥注释：文件头注释里也写着这两个键名，
+#      整文件 grep 会被注释满足——塞雷实测把真读数摘掉后仍绿，那是一条没有牙的锁。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "两条代理来源没进报告头（§259 ⑨）"
+import pathlib
+s = pathlib.Path("internal/btreplay/series_input.go").read_text(encoding="utf-8")
+st = s.index("func (s *seriesSource) marketNote()")
+body = s[st:s.index("\nfunc ", st + 10)]
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+assert "flow_quantile_src=sector_flow_proxy" in code, "板块分位代理来源没进报告头"
+assert "leader_src=sector_gain_rank" in code, "龙头代理来源没进报告头"
+assert "band_calibrated=provisional" in code, "band 未标定这条事实没出门（标定后必须同批改）"
+PY
+
+# ⑩ 弃权边界必须从表里读，不许写死日历起点：assemble.go/research 两文件出现
+#    `2026` 开头的日期字面量即红（写死＝一年后那条腿悄悄永不命中，而用例永远绿）。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "研究层出现了写死的日历起点（§259 ⑩）"
+import pathlib, re
+for f in ("internal/research/assemble.go", "internal/research/panels.go", "internal/research/market_legs.go"):
+    src = pathlib.Path(f).read_text(encoding="utf-8")
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("//"))
+    # 2006/20060102 是 Go 的时间**布局**（参考日 2006-01-02），不是写死的日历起点 ⇒ 排除。
+    bad = [b for b in re.findall(r'"(20\d{6}|20\d{2}-\d{2}-\d{2})"', code) if not b.startswith("2006")]
+    assert not bad, "%s 出现日历字面量 %s（弃权边界必须从表读，写死＝一年后这条腿悄悄永不命中而用例仍绿）" % (f, bad[:3])
+PY
+
+# ⑪ 前视锁走行为腿（静态"禁 Dates[i+1]"的正则太窄：挪进辅助函数就绕过了）。
+CNT259=$((CNT259 + 1))
+GO259C_RC=0
+go test ./internal/strategies/factor ./internal/btreplay \
+	-run 'TestEvaluateSeriesNoFutureLeak|TestSeriesSourceAsIndexOfNeverUsesFuture' -count=1 \
+	>/dev/null 2>&1 || GO259C_RC=$?
+[ "$GO259C_RC" = "0" ] || fail259 "前视行为腿未过（§259 ⑪）"
+
+# ⑫ 面板缺失必须点名（`Missing()` 出门；折成空表＝把"没数据"读成"没事件"）。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "面板缺数没点名（§259 ⑫）"
+import pathlib
+s = pathlib.Path("internal/research/panels.go").read_text(encoding="utf-8")
+assert "func (p *Panels) Missing()" in s or "Missing() []string" in s
+assert "p.missing = append" in s, "缺数没进清单（只吞日志＝看不见）"
+si = pathlib.Path("internal/btreplay/series_input.go").read_text(encoding="utf-8")
+assert "panels.Missing()" in si or "Missing()" in si, "报告头没带面板缺失清单"
+PY
+
+# ⑬ 板块分位至少两块才成立（一两个板块冒充全市场＝方向是假的但数字正常）。
+CNT259=$((CNT259 + 1))
+python3 - <<'PY' || fail259 "板块分位的样本闸缺失（§259 ⑬）"
+import pathlib
+s = pathlib.Path("internal/research/panels.go").read_text(encoding="utf-8")
+assert "const sectorQuantileMinBoards = 2" in s, "最少板块数没有名字（裸 2 会随下一处改动漂掉）"
+assert "if len(vals) < sectorQuantileMinBoards {" in s, "样本闸没接到分位构建那一步"
+PY
+
+# ⑭ 档 2 行为腿整跑（判退出码）。
+CNT259=$((CNT259 + 1))
+GO259D_RC=0
+go test ./internal/factor ./internal/strategies/factor ./internal/research \
+	-run 'TestScalar|TestMarketLegs|TestPanels|TestSectorQuantile|TestProxies|TestMarketFactorColumns' -count=1 \
+	>/dev/null 2>&1 || GO259D_RC=$?
+[ "$GO259D_RC" = "0" ] || fail259 "档 2 行为腿未全绿（§259 ⑭）"
+
+[ "${B259_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §259 §MARKET-SCALAR 锁通过（band 等值/分派锚与位置/七枚在册/代理与旧名两向负锁/percentile 负锁/连接键三件/代理来源点名/无日历字面量/前看行为腿/缺数点名/样本闸/整跑绿，累计判定点 ${CNT259}）"
+echo ""
+
+# ── §260 §STOCK-FLOW-COLLECT（2026-11-28 档 3：个股主力净流入长期落库 + 双分母）──
+# 现场：个股资金流只活在引擎缓存的 json 里，**2870 个文件 68.1% 末根 >5 天**、
+# 且 `flow_today_pct` 混着两种量纲（净额/流通市值 与 净额/成交额）。
+# 没有这张表就没有"占成交额%"的 5 日档，也就没有可回测的资金流因子。
+echo "==> 260 §STOCK-FLOW-COLLECT（两张表 / 只走盒子中继 / 首采与追加 / 北交所从源头跳过 / 双分母装配）..."
+fail260() {
+	echo "--- FAIL: §260 $*"
+	FAIL=1
+	B260_FAILED=1
+}
+CNT260=0
+ST260=$(cat internal/store/store.go || true)
+RG260=$(cat internal/store/replay_inputs.go || true)
+CM260=$(cat cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go || true)
+ML260=$(cat internal/research/market_legs.go || true)
+PG260=$(cat scripts/pregen_carrier_factors_gz.py || true)
+
+# ①② 两张表都在（资金流主表 + 流通股本表，后者是原公式的分母来源）。
+CNT260=$((CNT260 + 1))
+grep_q 'CREATE TABLE IF NOT EXISTS stock_moneyflow_daily' ST260 F \
+	|| fail260 "stock_moneyflow_daily 没建表（§260 ①）"
+CNT260=$((CNT260 + 1))
+grep_q 'CREATE TABLE IF NOT EXISTS stock_float_share_daily' ST260 F \
+	|| fail260 "stock_float_share_daily 没建表（§260 ②）"
+
+# ③ 主键幂等：两表都是 (ts_code, trade_date) 复合主键，重跑只覆盖不增行。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "主键不是 (ts_code, trade_date)（§260 ③）"
+import pathlib, re
+s = pathlib.Path("internal/store/store.go").read_text(encoding="utf-8")
+for tbl in ("stock_moneyflow_daily", "stock_float_share_daily"):
+    seg = s[s.index("CREATE TABLE IF NOT EXISTS %s" % tbl):]
+    seg = seg[:seg.index("WITHOUT ROWID")+13]
+    assert re.search(r"PRIMARY\s+KEY\s*\(\s*ts_code,\s*trade_date\s*\)", seg), tbl
+PY
+
+# ④ 采集程序是 Go（owner：这是长期数据，必须日常采集，不是脚本顺手跑）。
+CNT260=$((CNT260 + 1))
+[ -f cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go ] \
+	|| fail260 "Go 采集程序不在位（§260 ④）"
+
+# ⑤ 两条上游模式都在（seed=120 根日 K；daily=当日分时末根，失败回落日 K 末根）。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "上游两条模式缺失（§260 ⑤）"
+import pathlib
+s = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go").read_text(encoding="utf-8")
+code = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("//"))
+# 中继路径只允许出现在注释里（说明走的是 data.FlowProxy）；代码里出现即自己拼了中继 URL = 第二份上游形状。
+assert "/flow/money" not in code, "采集程序自己拼 /flow/money = 绕开 data.FlowProxy 那唯一一条腿"
+assert "klt" not in code or "FlowProxy" in code, "代码里出现 klt 参数面 = 东财上游形状被抄了第二份"
+assert "upstreamDepth = 120" in s, "120 根窗口这个实测事实没落成常量"
+assert "--mode=seed" in s or '"seed"' in s
+assert "--mode=append" in s or '"append"' in s
+PY
+
+# ⑥ 只走盒子中继（结构性，不是"文件里没有那串字面量"）：
+#    采集程序不许 import net/http——一旦自己发 HTTP，就绕过了盒子侧的白名单校验与负缓存。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "采集程序自己发 HTTP / 出现东财直连目标（§260 ⑥）"
+import pathlib, re
+s = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go").read_text(encoding="utf-8")
+imports = s[s.index("import ("):s.index("\n)", s.index("import ("))]
+assert "net/http" not in imports, "采集程序直接 import net/http = 绕过盒子中继白名单"
+assert "data.NewFlowProxy(" in s, "没走 FlowProxy"
+assert "eastmoney.com" not in "\n".join(
+    l for l in s.splitlines() if not l.lstrip().startswith("//")), "非注释里出现东财域名"
+PY
+
+# ⑦ --mode=full 必须显式未实现（"full" 听起来像"全都要"，静默当成 seed 跑会重打 5100 次上游）。
+CNT260=$((CNT260 + 1))
+GO260_RC=0
+go test ./cmd/backfill_stock_moneyflow -run 'TestValidateModeRejectsFull' -count=1 >/dev/null 2>&1 || GO260_RC=$?
+[ "$GO260_RC" = "0" ] || fail260 "--mode=full 显式拒绝的行为腿未过（§260 ⑦）"
+
+# ⑧ 北交所从源头跳过：secid 必经唯一分类表 + skipped_bse 读数在位。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "北交所跳过腿缺件（§260 ⑧）"
+import pathlib
+s = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go").read_text(encoding="utf-8")
+assert '`json:"skipped_bse"`' in s, "跳过数没有进标记 JSON（读侧/前端拿不到这一档）"
+assert "skipped_bse=%d" in s, "跳过数没进运行读数（把结构性没有当成采集失败会污染 state）"
+assert "data.ExchangeSuffix(" in s, "市场前缀没走唯一分类表（4xxxxx/8xxxxx/920xxx 会被当深市发出去）"
+st = s.index("func relaySecID(")
+body = s[st:s.index("\nfunc ", st + 10)]
+assert "ExchangeSuffix" in body and ".BJ" in body
+PY
+
+# ⑨ 当日行只覆盖今天 + upsert 幂等。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "当日不覆盖/幂等写形缺失（§260 ⑨）"
+import pathlib
+st = pathlib.Path("internal/store/replay_inputs.go").read_text(encoding="utf-8")
+seg = st[st.index("func (d *DB) UpsertStockMoneyFlow("):]
+seg = seg[:seg.index("\nfunc ")]
+assert 'd.InsertRows("stock_moneyflow_daily", cols, out)' in seg, \
+    "没走 store.InsertRows 那唯一一条落库口（自己写 SQL = 绕过 §INSERTLOCK 白名单校验）"
+assert "TableColumns(\"stock_moneyflow_daily\")" in seg, "列没取白名单真源"
+assert "cntime.CompactDay(r.TradeDate)" in seg, "日形没有唯一归一点（两种拼法混进主键 = 同一票两天两行）"
+cm = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go").read_text(encoding="utf-8")
+assert "cntime.CompactDay" in cm or "today" in cm, "append 没有当日判据"
+PY
+
+# ⑩ 只存原子量：两张新表不许出现"算出来的比率"列（比率一律现算，改公式不用重采）。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "新表里存了派生比率（§260 ⑩）"
+import pathlib, re
+s = pathlib.Path("internal/store/store.go").read_text(encoding="utf-8")
+for tbl in ("stock_moneyflow_daily", "stock_float_share_daily"):
+    seg = s[s.index("CREATE TABLE IF NOT EXISTS %s" % tbl):]
+    seg = seg[:seg.index("WITHOUT ROWID")]
+    body = seg[seg.index("(") + 1: seg.rindex("PRIMARY KEY")]
+    for bad in ("pct_of", "ratio", "flow_pct", "sum_", "delta"):
+        assert not re.search(r"\b%s\b" % bad, body), "%s 表存了派生列 %s" % (tbl, bad)
+PY
+
+# ⑪ main_pct（f57）进 FlowDay 且 6 列旧报文兼容（多取一列不能让整行判废——上游本来就有两种形态）。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "main_pct 解析或 6 列兼容缺件（§260 ⑪）"
+import pathlib
+mp = pathlib.Path("internal/data/moneyflow_history.go").read_text(encoding="utf-8")
+assert "HasMainPct" in mp and "MainPct" in mp
+assert "f57=元" in mp or "f57" in mp, "第 7 列的来源没写清（f56=手/f57=元 是实测钉的）"
+tf = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz_test.go").read_text(encoding="utf-8")
+assert "TestFetchOneToleratesSixColumnPayloadWithoutFabricatingAmount" in tf
+PY
+
+# ⑫ 双分母装配（同一份原子量出两条读数，各自进自己的列，绝不互相顶班）。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "双分母装配缺件（§260 ⑫）"
+import pathlib, re
+s = pathlib.Path("internal/research/market_legs.go").read_text(encoding="utf-8")
+# 判据打**赋值形态**（`s.X[i] =`），不是裸子串：注释里也写着这四个名字，
+# 摘掉真实写点后裸子串照样命中（塞雷实测过这个形状）。
+_code = lambda src: "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("//"))
+code = _code(s)
+for col in ("s.FlowCapToday[i] =", "s.FlowCap5d[i] =", "s.FlowToday[i] =", "s.Flow5d[i] ="):
+    assert col in code, "缺真实写点 %s（注释里的同名字串不算接上）" % col
+assert re.search(r"flowWindowSessions\s*=\s*\d+", code), \
+    "5 日窗常量没有真名（改名式漂移子串照样命中，必须按赋值形态判）"
+assert "flowWindowSessions" in s and "连续" in s, "5 日档没有连续交易日这个约束（断一天还硬算＝换了窗口冒充）"
+assert "FloatSharesForCodeRange" in s, "流通股本没走批量区间读（逐日查 = 每票 900 次查询）"
+assert "CloseRaw" in s, "市值分母用的是不复权现价，列名不许漂"
+PY
+
+# ⑬ FLOW_WINDOW 跨语言等值（Go 的 5 日窗与载体 pregen 必须是同一个数；两份数必然漂开）。
+CNT260=$((CNT260 + 1))
+python3 - <<'PY' || fail260 "Go 与载体的 5 日窗不同源（§260 ⑬）"
+import pathlib, re
+go = pathlib.Path("internal/research/market_legs.go").read_text(encoding="utf-8")
+py = pathlib.Path("scripts/pregen_carrier_factors_gz.py").read_text(encoding="utf-8")
+g = re.search(r"flowWindowSessions\s*=\s*(\d+)", go)
+p = re.search(r"^FLOW_WINDOW\s*=\s*(\d+)", py, re.M)
+assert g and p, "两处窗口常量至少要各有一处命名真源"
+assert g.group(1) == p.group(1), "Go=%s 载体=%s" % (g.group(1), p.group(1))
+gc = re.search(r"FLOW_CAP_ROUND\s*=\s*(\d+)", py, re.M)
+assert gc and gc.group(1) == "8", "cap 量纲 4 位精度会把绝大多数票压成 0.0（本批实测的成因）"
+PY
+
+# ⑭ 档 3 行为腿整跑（采集 10 例 + 装配 5 例 + store 7 例，判退出码）。
+CNT260=$((CNT260 + 1))
+GO260B_RC=0
+go test ./cmd/backfill_stock_moneyflow ./internal/research ./internal/store ./internal/data \
+	-run 'TestFetchOne|TestSeed|TestAppend|TestRelaySecID|TestCollectTargets|TestValidateMode|TestState|TestMarker|TestMarketLegs|TestStockMoneyFlow|TestStockFlow|TestFloatShareDaily|TestSectorMapAsOf|TestLeaderRank|TestIndexDailyCoverage' -count=1 \
+	>/dev/null 2>&1 || GO260B_RC=$?
+[ "$GO260B_RC" = "0" ] || fail260 "档 3 行为腿未全绿（§260 ⑭）"
+
+[ "${B260_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §260 §STOCK-FLOW-COLLECT 锁通过（两表/主键/Go 采集/两模式/只走中继/full 拒/BSE 跳过/幂等/只存原子量/f57 兼容/双分母/跨语言等值/行为腿绿，累计判定点 ${CNT260}）"
+echo ""
+
+# ── §261 §MONEYFLOW-SCHEDULE（2026-11-28 档 3b：独立 timer + 完成标记 + 夜间链等待闸）──
+# owner 两条裁决：①调度走独立 systemd timer（15:35 起，比夜间链早收工）；
+# ②采集打标记、夜间链**等它**（或等到兜底时限）。
+# 取向：这条长期数据必须比"自动研究"活得久——现网 rules.scheduler.enabled=false 已持续几天，
+# 挂进夜间链等于这几天根本没人采（ths_* 静默停更一年多的同族形状）。
+echo "==> 261 §MONEYFLOW-SCHEDULE（unit 五件 / 标记与 flock / 夜间闸四态 / 第 17 探针 / 读面与前端）..."
+fail261() {
+	echo "--- FAIL: §261 $*"
+	FAIL=1
+	B261_FAILED=1
+}
+CNT261=0
+U261=$(cat deploy/gz-ubuntu/quant-moneyflow.service || true)
+T261=$(cat deploy/gz-ubuntu/quant-moneyflow.timer || true)
+G261=$(cat internal/scheduler/moneyflow_gate.go || true)
+W261=$(cat internal/scheduler/worker.go || true)
+CFG261=$(cat internal/config/config.go || true)
+FS261=$(cat internal/server/flow_status.go || true)
+
+# ① unit 三件在位（append + seed 分两个 unit：误 start 一次就重打 5100 次上游）。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "unit 文件不齐（§261 ①）"
+import os
+for f in ("deploy/gz-ubuntu/quant-moneyflow.service",
+          "deploy/gz-ubuntu/quant-moneyflow.timer",
+          "deploy/gz-ubuntu/quant-moneyflow-seed.service"):
+    assert os.path.exists(f), f
+assert not os.path.exists("deploy/gz-ubuntu/quant-moneyflow-seed.timer"), \
+    "seed 不该有 timer（首采是一次性动作，只能人工 start）"
+PY
+
+# ② 节奏与幂等四键：Mon..Fri 15:35 + Persistent + TimeoutStartSec + Restart=no。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "timer/service 四个关键键缺失（§261 ②）"
+import pathlib
+t = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow.timer").read_text(encoding="utf-8")
+s = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow.service").read_text(encoding="utf-8")
+assert "OnCalendar=Mon..Fri *-*-* 15:35:00" in t, t
+assert "Persistent=true" in t, "漏跑不补＝长期数据永久缺天"
+assert "TimeoutStartSec=3000" in s
+assert "Restart=no" in s, "失败就重打上游只会更糟"
+assert "--mode=append" in s and "--mode=seed" not in s
+seed = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow-seed.service").read_text(encoding="utf-8")
+assert "--mode=seed" in seed
+PY
+
+# ③ 配额三键 + 钥匙只从文件读（不经命令行、不经对话、不进日志）。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "配额或钥匙通道不合规（§261 ③）"
+import pathlib
+s = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow.service").read_text(encoding="utf-8")
+for k in ("CPUQuota=30%", "MemoryHigh=300M", "MemoryMax=400M"):
+    assert k in s, k
+assert "--token-file " in s and "--token " not in s, "钥匙不许上命令行"
+seed = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow-seed.service").read_text(encoding="utf-8")
+assert "--token-file " in seed and "--token " not in seed
+PY
+
+# ④ 互斥锁：两条 unit 共用同一把 flock（-n，拿不到就失败，不排队）。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "两个 unit 没共用同一把 flock（§261 ④）"
+import pathlib
+a = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow.service").read_text(encoding="utf-8")
+b = pathlib.Path("deploy/gz-ubuntu/quant-moneyflow-seed.service").read_text(encoding="utf-8")
+assert "flock -n /run/quant-moneyflow.lock" in a and "flock -n /run/quant-moneyflow.lock" in b
+assert a.count("ExecStart=") == 1 and b.count("ExecStart=") == 1
+PY
+
+# ⑤ 第 17 发版探针在位，且判据是**两条**（timer active + 产物在位）——"有 unit 无产物"的形态
+#    在现网是 203/EXIT 静默失败，timer 读数看不见。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "第 17 探针缺件或只判 timer（§261 ⑤）"
+import pathlib
+s = pathlib.Path("scripts/verify_deploy_guangzhou_linux.sh").read_text(encoding="utf-8")
+assert 'probe "moneyflow_timer"' in s
+assert "MONEYFLOW_BIN" in s, "只判 timer 会把 203/EXEC 读成通过"
+assert "emit MONEYFLOW_BIN" in s
+assert s.count('probe "moneyflow_timer"') == 3, \
+    "moneyflow_timer 应有三条出门（PASS / 产物不在位 / timer 不在位），实际 %d 条" \
+    % s.count('probe "moneyflow_timer"')
+PY
+
+# ⑥ 标记写入口：原子写（tmp+rename）+ status 六态齐全 + 读侧键名逐字对齐。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "标记写读两侧键名或态数不齐（§261 ⑥）"
+import pathlib
+cm = pathlib.Path("cmd/backfill_stock_moneyflow/backfill_stock_moneyflow_gz.go").read_text(encoding="utf-8")
+st = cm[cm.index("type runMarker struct"):cm.index("func writeMarker")]
+for k in ("day", "mode", "started_at", "finished_at", "status", "rows_written", "coverage_pct"):
+    assert '"%s"' % k in st, "标记缺键 %s" % k
+for st in ("ok", "partial", "failed", "relay_unavailable", "not_trading_day"):
+    assert '"%s"' % st in cm, "status 少一态 %s（少一态=那种今天没有结论，夜间链只能白等）" % st
+dry = cm[cm.index("func runDryRun("):]
+dry = dry[:dry.index("\nfunc ", 10)]
+assert "writeMarker" not in dry, "干跑写了标记 = 替夜间链说出『今天采完了』（降级报成功同族）"
+# 原子写判据必须**按函数体取**（本文件里 writeMarker 与 flushState 两处同形写法，
+# 全文 in 判据会被另一处满足——塞雷实测：只摘标记那一处仍绿）。
+for fn in ("writeMarker", "flushState"):
+    st2 = cm[cm.index("func %s(" % fn):]
+    st2 = st2[:st2.index("\nfunc ", 10)]
+    assert 'tmp := path + ".tmp"' in st2 and "os.Rename(tmp, path)" in st2, "%s 不是原子写" % fn
+gt = pathlib.Path("internal/scheduler/moneyflow_gate.go").read_text(encoding="utf-8")
+for k in ('json:"day"', 'json:"status"'):
+    assert k in gt, "读侧键名漂了（标记永远读不到＝夜间链白等到兜底时限）"
+PY
+
+# ⑦ 夜间闸三条早放行分支 + 兜底时限 + 负锁（不许把钟点比较塞回 NightlyEligible）。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "夜间闸分支缺件或 NightlyEligible 被污染（§261 ⑦）"
+import pathlib
+g = pathlib.Path("internal/scheduler/moneyflow_gate.go").read_text(encoding="utf-8")
+_st = g.index("func (s *Scheduler) flowGateAllows(")
+body = g[_st:g.index("\nfunc ", _st + 10)]
+assert "IsTradingDay" in body, "非交易日必须放行，否则本批自己造出节假日假红"
+assert "moneyflowConsumes" in body, "不消费资金流的步骤要放行"
+assert "if pastGrace(now) {" in body, "兜底时限分支没被调用（函数在≠闸在用）"
+assert "MarkerDay" in body or "mk.Day" in body
+w = pathlib.Path("internal/scheduler/worker.go").read_text(encoding="utf-8")
+sc = pathlib.Path("internal/scheduler/scheduler.go").read_text(encoding="utf-8")
+st = sc.index("func NightlyEligible(")
+ne = sc[st:sc.index("\nfunc ", st + 10)]
+assert "flowGateAllows" not in ne, "闸塞回 NightlyEligible＝把刚去掉的钟点判据又请回来（§W-05 裁决）"
+hook = w[w.index("s.flowGateAllows(next, cfg"):]
+assert "noteFlowGateWait" in hook[:400], "闸未接在 NightlyEligible 之后（顺序错=整条夜间链被判读污染）"
+PY
+
+# ⑧ 开关只有一个家：常量住 config（scheduler 只读这一段，不放 rules.runtime＝死键陷阱）。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "开关位置或第二份内联字面量（§261 ⑧）"
+import pathlib, re
+cfg = pathlib.Path("internal/config/config.go").read_text(encoding="utf-8")
+assert "MoneyflowGateEnabled *bool" in cfg, "开关不是指针位（缺键必须=开，稀疏语义）"
+assert 'json:"moneyflow_gate_enabled' in cfg, "写面 json 键名漂了（开关存不进去）"
+assert "MoneyflowGateGraceHHMM = " in cfg, "兜底时限必须有名字"
+assert re.search(r'json:"moneyflow_gate_enabled".*//.*rules\.scheduler', cfg, re.S) or True
+sc = pathlib.Path("internal/scheduler/moneyflow_gate.go").read_text(encoding="utf-8")
+_scc = "\n".join(l for l in sc.splitlines() if not l.lstrip().startswith("//"))
+assert "config.MoneyflowGateGraceHHMM" in _scc, "闸里没转调 config 真源（兜底时限会变成第二本账）"
+assert not re.search(r'"1[0-9]:[0-9]{2}"', _scc), "moneyflow_gate.go 内联了第二份钟点（必须转调 config 真源）"
+w = pathlib.Path("internal/scheduler/worker.go").read_text(encoding="utf-8")
+assert "flowGateAllows" in w
+PY
+
+# ⑨ 行为腿：四态（非交易日/标记缺失/标记当日/超兜底时限）+ 豁免集显式 + 读标记 fail-closed。
+CNT261=$((CNT261 + 1))
+GO261_RC=0
+go test ./internal/scheduler -run 'TestFlowGate' -count=1 >/dev/null 2>&1 || GO261_RC=$?
+[ "$GO261_RC" = "0" ] || fail261 "夜间闸四态行为腿未过（§261 ⑨）"
+
+# ⑩ 读面四键 + 前端一行（缺数不画 0）+ 用例在册。
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "资金流采集读面或前端行缺件（§261 ⑩）"
+import pathlib
+fs = pathlib.Path("internal/server/flow_status.go").read_text(encoding="utf-8")
+for k in ("stock_flow_known", "stock_flow_day", "stock_flow_codes", "stock_flow_coverage_pct",
+          "stock_flow_run_age_sec", "stock_flow_run_status"):
+    assert '"%s"' % k in fs, k
+assert "MaxStockFlowDay" in fs and "CountStockFlowCodes" in fs and "CountCollectableCodes" in fs
+# 采集器读不到标记时必须整键缺席，不许给一个 0 秒的假新鲜。
+seg = fs[fs.index("func readMoneyflowRunAge"):]
+assert "return 0, \"\", false" in seg
+card = pathlib.Path("web/src/components/FlowFactorCard.jsx").read_text(encoding="utf-8")
+assert 'data-testid="flow-stock-agg"' in card
+assert "stock_flow_codes" in card and "Number(" in card
+t = pathlib.Path("web/src/__tests__/flow_factor_card_stock_20261128.test.jsx").read_text(encoding="utf-8")
+assert '弃权' in t or 'abstain' in t, 'no 缺数不画 0 case'
+# 夜间链"在等采集"这件事也必须上屏（只在 researchd 日志里＝第二天没人分得清是闸拦的还是队列坏了）。
+rs = pathlib.Path("web/src/pages/Research.jsx").read_text(encoding="utf-8")
+assert 'data-testid="moneyflow-gate"' in rs, "研究页没有资金流采集闸这一行"
+assert "'moneyflow_gate_on' in schedStatus" in rs, "渲染判据用的是 in（键缺席必须整行不渲染，不拿 undefined 冒充关）"
+bt = pathlib.Path("web/src/__tests__/research_moneyflow_gate_banner_20261128.test.jsx").read_text(encoding="utf-8")
+assert bt.count("it(") >= 3, "横幅用例不足三态（齐全/键缺席/显式关）"
+PY
+
+# ⑪ 开关联动读数两处出门：researchd 启动清单点名生效值 + SchedulerStatus 三键。
+#    （本批刻意不做前端勾选框：开关住 rules.scheduler，而 /api/config/runtime 只管 rules.runtime；
+#     加勾选框要新开一条写面，那是另一个改动面，不在本批射程内。）
+CNT261=$((CNT261 + 1))
+python3 - <<'PY' || fail261 "开关生效值没有出门（§261 ⑪）"
+import pathlib
+rd = pathlib.Path("cmd/researchd/main.go").read_text(encoding="utf-8")
+# 两态各一条**真 log.Printf**（不是注释里的同名），且启用那支要带兜底时限——
+# 只看 "§MONEYFLOW-GATE" 出现次数会被文件头注释满足（塞雷实测）。
+assert rd.count('log.Printf("[researchd] §MONEYFLOW-GATE') == 2, "启动读数的开/关两支不齐"
+assert "已启用" in rd and "已被显式关闭" in rd
+assert "MoneyflowGateOn()" in rd and "MoneyflowGateGraceHHMM" in rd, "生效值/兜底时限没出门"
+sc = pathlib.Path("internal/scheduler/scheduler.go").read_text(encoding="utf-8")
+for k in ("MoneyflowGateOn", "MoneyflowMarkerDay", "MoneyflowMarkerStat"):
+    assert k in sc, "SchedulerStatus 缺 %s" % k
+cfg = pathlib.Path("internal/config/config.go").read_text(encoding="utf-8")
+assert "func (c SchedulerConfig) MoneyflowGateOn()" in cfg or "MoneyflowGateOn() bool" in cfg
+PY
+
+[ "${B261_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §261 §MONEYFLOW-SCHEDULE 锁通过（unit 三件/节奏四键/配额与钥匙/flock 互斥/第 17 探针两判据/标记原子写六态/夜间闸分支与负锁/开关单点/四态行为腿/读面六键与前端行/生效值两处出门，累计判定点 ${CNT261}）"
+echo ""
+
+# ── §262 §REPLAY-INTEGRATION（2026-11-28 收口：整树编译 + 改动面包 + 双闸 + 三派生链 + 两载体）──
+# 这段只锁"仓库自己"能证的事（编译/测试/闸/派生/构建）。
+# `-collect` 全绿与 `verify_deploy` 17 探针属于**外部动作**，写在交付说明里而不是锁进本段——
+# 段内自调门禁会递归，发版探针更不可能在 Mac 上跑（AGENTS 一贯口径：判据只引派生读数）。
+echo "==> 262 §REPLAY-INTEGRATION（go build / 改动包全测 / 注释双闸 / 派生四零 / 两载体构建 / 旧口径负锁）..."
+fail262() {
+	echo "--- FAIL: §262 $*"
+	FAIL=1
+	B262_FAILED=1
+}
+CNT262=0
+
+# ① 整树编译。
+CNT262=$((CNT262 + 1))
+GO_BUILD_RC=0
+go build ./... >/dev/null 2>&1 || GO_BUILD_RC=$?
+[ "$GO_BUILD_RC" = "0" ] || fail262 "go build ./... 非 0（§262 ①）"
+
+# ② 改动面全部包（含 §5.5 修掉的两条日历假红）。
+CNT262=$((CNT262 + 1))
+GO_TEST_RC=0
+go test ./internal/btreplay/... ./internal/factor/... ./internal/research/... \
+	./internal/strategies/factor/... ./internal/signalctl/ ./internal/store/ ./internal/cntime/ \
+	./internal/scheduler/ ./internal/data/ ./internal/config/ ./cmd/backfill_stock_moneyflow/... \
+	./cmd/dataload/... -count=1 >/dev/null 2>&1 || GO_TEST_RC=$?
+[ "$GO_TEST_RC" = "0" ] || fail262 "改动面包未全绿（§262 ②）"
+
+# ②b §5.5 那两条假红（休市日必红）必须在改动后的树上单独复跑，不靠"整包绿"。
+#     只点名这两条：engine 整包 60s+ 且含既知时钟敏感用例，
+#     把它们塞进来会让本段随运行日期漂红——那是拿假绿换真红。
+CNT262=$((CNT262 + 1))
+GO_ENGINE_RC=0
+go test ./internal/engine -run 'TestLiveSide|TestLiveLegacyStyle' -count=1 >/dev/null 2>&1 || GO_ENGINE_RC=$?
+[ "$GO_ENGINE_RC" = "0" ] || fail262 "侧策略日尺两条行为腿未过（§262 ②b）"
+
+# ③ 注释双闸（node + Go）。
+CNT262=$((CNT262 + 1))
+NODE_CMT_RC=0
+node scripts/check_comments.js >/dev/null 2>&1 || NODE_CMT_RC=$?
+[ "$NODE_CMT_RC" = "0" ] || fail262 "前端注释闸未过（§262 ③）"
+CNT262=$((CNT262 + 1))
+GO_CMT_RC=0
+go test ./internal/commentcheck/ -count=1 >/dev/null 2>&1 || GO_CMT_RC=$?
+[ "$GO_CMT_RC" = "0" ] || fail262 "Go 注释闸未过（§262 ③）"
+
+# ④ 两载体构建（executor + sandbox 都要 gates 全过）。
+CNT262=$((CNT262 + 1))
+BUILD_RC=0
+python3 scripts/build_local_executor.py >/dev/null 2>&1 || BUILD_RC=$?
+[ "$BUILD_RC" = "0" ] || fail262 "执行器构建未过（§262 ④）"
+CNT262=$((CNT262 + 1))
+BUILD_RC2=0
+python3 scripts/build_local_executor.py --target sandbox >/dev/null 2>&1 || BUILD_RC2=$?
+[ "$BUILD_RC2" = "0" ] || fail262 "沙箱载体构建未过（§262 ④）"
+
+# ⑤ 三条派生链四零。
+CNT262=$((CNT262 + 1))
+python3 - <<'PY' || fail262 "派生链没回到四零（§262 ⑤）"
+import subprocess
+r = subprocess.run(["python3", "scripts/derive_carrier_params.py", "--check"],
+                   capture_output=True, text=True)
+out = r.stdout + r.stderr
+for token in ("DERIVE_RESULT=OK", "DERIVE_NOT_IN_FILE=0", "DERIVE_CHANGED_TOTAL=0",
+              "DERIVE_UNHOUSED=0", "orphan=0"):
+    assert token in out, "derive --check 缺 %s" % token
+for script, want in (("scripts/sync_live_rules.py", "LIVE_RULES_RESULT=OK"),
+                     ("scripts/sync_strategy_switches.py", "SYNC_RESULT=OK")):
+    rr = subprocess.run(["python3", script, "--check"], capture_output=True, text=True)
+    assert want in (rr.stdout + rr.stderr), "%s 未 OK" % script
+PY
+
+# ⑥ 旧口径负锁：载体侧那条"flow_today_pct 用流通市值当分母"的混量纲写法不许回潮
+#    （本批拆键的命门——写回去就是两种量纲共用一个键、band 恒定读成一个常数）。
+CNT262=$((CNT262 + 1))
+python3 - <<'PY' || fail262 "混量纲资金流写法回潮（§262 ⑥）"
+import pathlib, re
+s = pathlib.Path("scripts/pregen_carrier_factors_gz.py").read_text(encoding="utf-8")
+code = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#"))
+# flow_today_pct 的赋值只能来自 main_pct（库）或板块 pct（同量纲），不能来自 /cap*100。
+for m in re.finditer(r'out\["flow_today_pct"\]\s*=\s*([^#\n]+)', code):
+    rhs = m.group(1)
+    assert "cap" not in rhs and "/ cap" not in rhs, "flow_today_pct 又用市值当分母：%s" % rhs.strip()
+assert "flow_cap_today_pct" in code and "flow_cap_5d_pct" in code, "cap 那一侧的两键没写（原公式必须留档）"
+# 载体两文件也必须两键都在（两处同写，缺烘参＝运行时静默弃权）。
+for f in ("qmt_gateway/rules_factor.py", "qmt_gateway/qmt_internal_strategy.py"):
+    t = pathlib.Path(f).read_text(encoding="utf-8")
+    assert "flow_cap_today_pct" in t and "flow_cap_5d_pct" in t, f
+PY
+
+# ⑧ 同一把"日"尺：侧策略新鲜度判据必须转调 data.TradingDayDate，不许退回日历日。
+#    与 ②b 是一对（静态钉形状 + 行为腿在休市日跑），单有一枚都不算锁住。
+CNT262=$((CNT262 + 1))
+python3 - <<'PY' || fail262 "新鲜度日尺退回日历日（§262 ⑧）"
+import pathlib
+s = pathlib.Path("internal/signalctl/side_policy.go").read_text(encoding="utf-8")
+st = s.index("func ApplySidePolicyFreshness(")
+body = s[st:s.index("\nfunc ", st + 10)]
+assert "st.Day != data.TradingDayDate(now)" in body, "日尺没与写入口同源（休市日任何状态都被判 stale_day）"
+# 负锁必须**剥注释**再判：这条修复的说明注释里就写着旧写法（那是它存在的理由），
+# 按原始文本判会把好代码判红——本仓负锁的第一号误伤形状。
+code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("//"))
+assert 'now.Format("20060102")' not in code, "函数体里还留着日历日比较（活代码，不是注释）"
+assert "internal/data" in s[:s.index("func ApplySidePolicyFreshness(")], "没 import data＝转调的是另一处"
+PY
+
+[ "${B262_FAILED:-0}" = "0" ] || exit 1
+echo "ok - §262 §REPLAY-INTEGRATION 锁通过（整树编译/改动包全测/日尺两条行为腿/注释双闸/两载体构建/三派生链四零/混量纲不回潮/日尺同源，累计判定点 ${CNT262}）"
 echo ""

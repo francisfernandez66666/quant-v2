@@ -66,6 +66,16 @@ func main() {
 		log.Printf("[researchd] 数据源路由按默认装配（旧表 baostock），继续启动: %v", err)
 	}
 
+	// §MONEYFLOW-GATE 启动点名（2026-11-28 档 3b）：这道闸默认开，"默认开"这件事必须自己说出口。
+	// 否则表现是"研究怎么每晚 17:00 才开始跑"而无人知道是新闸——本仓反复出事的方向就是
+	// "出厂开的东西没人宣布"（行情四键、N1 令牌继承告警都是靠启动清单才被认出来的）。
+	if sc := config.LoadSchedulerConfig(filepath.Join(dataDir, "config.json")); sc.MoneyflowGateOn() {
+		log.Printf("[researchd] §MONEYFLOW-GATE 已启用：资金流消费步骤等当日采集标记（兜底 %s 放行）",
+			config.MoneyflowGateGraceHHMM)
+	} else {
+		log.Printf("[researchd] §MONEYFLOW-GATE 已被显式关闭（rules.scheduler.moneyflow_gate_enabled=false）：夜间链不等采集")
+	}
+
 	sch := scheduler.New(dataDir, "", "")
 
 	// §M14（2026-09-22）同因连败熔断告警接线：researchd 此前无任何推送通道（PushGateway

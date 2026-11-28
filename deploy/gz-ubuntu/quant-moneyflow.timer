@@ -1,0 +1,16 @@
+# quant-moneyflow.timer — 交易日 15:35 采一次个股资金流（§REPLAY-INPUTS 档 3b）。
+#
+# Mon..Fri 只是第一层；**是不是交易日由程序自己判**（非交易日拿不到当日行，落 no_data 并写标记），
+# 所以长假期间这条 unit 会正常跑完并留下"partial/failed"标记——
+# 这是刻意的：标记必须"有结论"，夜间链才不会白等到兜底时限（方案 §5.2）。
+[Unit]
+Description=Daily per-stock money-flow collection (Mon..Fri after close)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:35:00
+# 机器睡过/服务停过导致漏跑：开机补一次（长期数据最怕"缺一天补不回来"）。
+Persistent=true
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

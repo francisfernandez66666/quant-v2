@@ -1,0 +1,50 @@
+# quant-moneyflow.service — §REPLAY-INPUTS 2026-11-28（档 3b）：个股主力净流入的日频采集器。
+#
+# 为什么是独立 unit 而不是挂进夜间研究链（owner 2026-11-28 裁决"调度走独立 systemd timer"）：
+#   这份数据只有一个消费者是"自动研究"，但它本身必须比研究活得久——
+#   现网 `rules.scheduler.enabled=false`（自动研究暂停）已经持续了几天，
+#   挂在夜间链里等于这条长期数据这几天根本没人采。
+#   同一个理由现网已有先例：quant-sector-map.service 的注释写着
+#   "独立 timer 让取连接键这件事有自己的名字与自己的失败记录"。
+#
+# 为什么必须天天采（不是"想起来再跑一次"）：
+#   东财个股资金流日线是 **120 根滚动窗口**（2026-11-28 实测：lmt=0 与 lmt=1000 都回 120 根，
+#   窗口 20260604..20261127）。往后每拖一个交易日，最早那天就永久不可得。
+#   所以这张表的价值 = 从今天开始的连续追加。
+#
+# 15:35 的取法：收盘 15:00，东财当日主力净额盘后定型；15:35 起既避开发型中的空值，
+# 又不与 side-policy 的 13:00–15:59 每 30 秒重试尾段抢同一条中继。
+# 采集耗时派生自现网同量级锚点（sector-map：1050 个板块含分页实测 5–8 分钟）
+# ⇒ ≈5100 只约 25–40 分钟，在夜间链兜底时限（config.MoneyflowGateGraceHHMM=17:00）之内。
+#
+# ★ 产物名：二进制由 `go build -o /opt/quant/stockmoneyflow ./cmd/backfill_stock_moneyflow`
+#   编出（目录名与落位名不同，见 docs/DEPLOY_GZ_UBUNTU_20261107.md §3）。发版必须带上这一枚——
+#   只 enable timer 而不落产物，systemd 每次触发都 203/EXEC，`is-active` 那条读数还是绿的。
+#   第 17 探针因此同时判 timer 与产物在位（§261 ⑤）。
+#
+# 配额常驻：这台机器只有 2 核 4G，quant / quant-research / pydata 都在跑。
+# 采集是 I/O 密集（瓶颈在盒子中继），给它 CPU 上限不影响时长，但能防止它和打分循环抢核。
+[Unit]
+Description=Quant per-stock money-flow collector (EastMoney fflow daykline via box relay)
+After=network-online.target
+# 依赖盒子中继（10.77.0.2:8789）：WireGuard 断了这一步必然失败，交给下一次 timer 重试。
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --mode=append 只写"当日"一行；首采满 120 根走 quant-moneyflow-seed.service（人工 start，
+# **不进 timer**——误 start 一次会重打 5100 次上游请求，分成两个 unit 后 timer 只能指到 append）。
+# 钥匙只从文件读（0600，root 属主）：**不经命令行、不经对话、不进日志**（程序只打长度）。
+# flock -n：日常那一腿与人工补跑/首采共用同一把锁（`/run/quant-moneyflow.lock`）。
+# 用 -n（拿不到锁就立刻失败）而不是排队等待：两条同时在跑 = 5100 只 ×2 次打同一条
+# 盒子中继，把自家 IP 推进东财风控的代价，远大于『今天这一趟不跑』。
+ExecStart=/usr/bin/flock -n /run/quant-moneyflow.lock /opt/quant/stockmoneyflow --db /var/lib/quant-trading-v2/trading.db --mode=append --gateway-url http://10.77.0.2:8789 --token-file /etc/quant/moneyflow_relay_token --state /var/lib/quant-trading-v2/moneyflow_state.json --marker /var/lib/quant-trading-v2/moneyflow_run.json --rate 4 --concurrency 2
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+CPUQuota=30%
+MemoryHigh=300M
+MemoryMax=400M
+# 5100 只 × 限速 4/s ≈ 21 分钟，给到 50 分钟冗余；到点由 systemd 收走，不靠脚本自杀。
+TimeoutStartSec=3000
+# 失败不是"系统坏了"，是"今天这条腿弃权"：不 Restart（重打上游只会更糟）。
+# 判读靠 journal 里的 MONEYFLOW_RUN 一行与 moneyflow_run.json 的 status。
+Restart=no

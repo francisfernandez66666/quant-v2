@@ -149,6 +149,27 @@ run_probes() { # $1=读数文本；依赖全局 EXPECT_COMMIT
   else
     probe "watchdog_timer" 1 "state=${v:-missing}（假活无人兜底：/livez 卡死只能人工重启）"
   fi
+
+  # 第 17 条探针（2026-11-28 §REPLAY-INPUTS 档 3b）：个股资金流采集 timer 必须在位且在走。
+  # 这张表是**长期数据**且上游只给 120 根滚动窗口——漏一天就永久少一天，
+  # 而它的失效形态不是报错，是"fac_175/179 用旧数据算出看着正常的分"
+  # （ths_* 静默停更一年多就是这个形状）。所以"装没装 timer"必须进发版判据，
+  # 而不是等三个月后有人问"资金流历史怎么只有两周"。
+  #
+  # ★ 判据是**两条**而不是一条：timer active **且** unit 里 ExecStart 指的那个二进制真的在位。
+  #   本仓吃过三次"有 unit 无产物"（AGENTS「有脚本无调度」同族）：unit enable 了、
+  #   `is-active` 绿着，但 systemd 每次触发都 203/EXEC，journal 里安静地躺着失败。
+  #   timer 读数看不见这件事，只有把产物在位性并进同一条判据，才看得见这种漏装。
+  v="$(get MONEYFLOW_TIMER)"
+  bin="$(get MONEYFLOW_BIN)"
+  if [ "$bin" != "yes" ]; then
+    probe "moneyflow_timer" 1 "state=${v:-missing} binary=no（/opt/quant/stockmoneyflow 不在位：timer 每天 203/EXEC，长期数据一条都不落库）"
+  elif [ "$v" = "active" ] || [ "$v" = "activating" ]; then
+    nm="$(get MONEYFLOW_NEXT)"
+    probe "moneyflow_timer" 0 "state=$v binary=yes next=${nm:-unknown}"
+  else
+    probe "moneyflow_timer" 1 "state=${v:-missing} binary=${bin}（个股资金流采集器未挂载：长期数据从今天起就在缺天）"
+  fi
 }
 
 summary() {
@@ -175,7 +196,10 @@ JOURNAL_ERRORS=0
 READYZ_CODE=503
 READYZ_IS_JSON=yes
 READYZ_OK=false
-WATCHDOG_TIMER=active"
+WATCHDOG_TIMER=active
+MONEYFLOW_TIMER=active
+MONEYFLOW_NEXT=n/a
+MONEYFLOW_BIN=yes"
   run_probes "$GREEN"
   GREEN_OK="$FAIL"
   PASS=0; FAIL=0; FAILED_IDS=""
@@ -217,6 +241,13 @@ emit HTTPS_HOME_CODE "$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 h
 # 判据只消费布尔位与状态码，不回显 body（响应只含 5 个布尔 + build，无敏感字段）。
 WATCHDOG_TIMER="$(systemctl is-active quant-watchdog.timer 2>/dev/null || echo missing)"
 emit WATCHDOG_TIMER "$WATCHDOG_TIMER"
+# §REPLAY-INPUTS 档 3b：采集 timer 在位性 + 下一次触发时刻（只读，不改任何东西）。
+MONEYFLOW_TIMER="$(systemctl is-active quant-moneyflow.timer 2>/dev/null || echo missing)"
+emit MONEYFLOW_TIMER "$MONEYFLOW_TIMER"
+MONEYFLOW_NEXT="$(systemctl list-timers quant-moneyflow.timer --no-pager --no-legend 2>/dev/null | head -1 | awk '{print $6}')"
+emit MONEYFLOW_NEXT "${MONEYFLOW_NEXT:-none}"
+# 产物在位性（第 17 探针的第二条判据）：只判 -x，不执行它（执行会真打上游）。
+if [ -x /opt/quant/stockmoneyflow ]; then emit MONEYFLOW_BIN yes; else emit MONEYFLOW_BIN no; fi
 READYZ_CODE="$(curl -ksS -o /tmp/readyz_deploy_probe.json -w '%{http_code}' --max-time 15 https://quant-trading.top/readyz 2>/dev/null)"
 emit READYZ_CODE "$READYZ_CODE"
 if head -c 1 /tmp/readyz_deploy_probe.json 2>/dev/null | grep -q '{' && curl -ksS -o /dev/null -w '%{content_type}' --max-time 15 https://quant-trading.top/readyz 2>/dev/null | grep -q 'application/json'; then
